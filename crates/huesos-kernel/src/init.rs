@@ -76,6 +76,7 @@ pub fn syscall_init() {
     huesos_syscalls::set_exit_fn(crate::scheduler::exit_current_task);
     huesos_syscalls::set_debug_write_fn(debug_write);
     huesos_syscalls::set_process_create_fn(crate::process::create_suspended_process);
+    huesos_syscalls::set_vmar_map_fn(crate::process::map_vmo_into_vmar);
 }
 
 extern "C" fn handle_syscall(frame: &mut huesos_arch::syscall::SyscallFrame) {

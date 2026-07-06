@@ -5,11 +5,12 @@ use alloc::boxed::Box;
 use alloc::sync::Arc;
 use huesos_arch::gdt;
 use huesos_arch::paging::{flags, AddressSpace};
-use huesos_object::KernelObject;
+use huesos_abi::{vmar_flags, ErrorCode, VmarMapArgs};
 use huesos_elf::{Loader, SegmentFlags};
-use huesos_object::{Process, Vmar};
-use x86_64::structures::paging::{Page, PageTableFlags, Size4KiB};
-use x86_64::VirtAddr;
+use huesos_object::{KernelObject, KernelObjectExt};
+use huesos_object::{Process, Vmar, VmarMapping};
+use x86_64::structures::paging::{Page, PageTableFlags, PhysFrame, Size4KiB};
+use x86_64::{PhysAddr, VirtAddr};
 
 /// Top of the initial user stack (grows down from here).
 const USER_STACK_TOP: u64 = 0x0000_7fff_ff00_0000;
@@ -103,6 +104,133 @@ pub fn create_suspended_process(
     *process.address_space.lock() = Some(Box::new(runtime) as Box<dyn core::any::Any + Send + Sync>);
 
     Ok((process, root_vmar))
+}
+
+
+const PAGE_SIZE: u64 = 4096;
+const ALL_VMAR_FLAGS: u32 = vmar_flags::READ
+    | vmar_flags::WRITE
+    | vmar_flags::EXECUTE
+    | vmar_flags::USER
+    | vmar_flags::SPECIFIC;
+
+/// Map a VMO into a process root VMAR at a fixed userspace address.
+///
+/// First-cut VMAR policy is deliberately strict: page-aligned VMO offsets,
+/// page-aligned fixed addresses, root VMAR only, user mappings only, and no
+/// W+X pages. Later commits can add child VMAR allocation and first-fit
+/// address selection without changing the ABI shape.
+pub fn map_vmo_into_vmar(
+    vmar: &Vmar,
+    vmo: &huesos_object::Vmo,
+    args: VmarMapArgs,
+) -> Result<u64, ErrorCode> {
+    validate_vmar_map_args(vmar, vmo, args)?;
+
+    let process_obj = huesos_object::lookup_object(vmar.process()).ok_or(ErrorCode::BadHandle)?;
+    let process = process_obj
+        .downcast_ref::<Process>()
+        .ok_or(ErrorCode::WrongType)?;
+
+    let mut runtime_guard = process.address_space.lock();
+    let runtime = runtime_guard
+        .as_mut()
+        .and_then(|runtime| runtime.downcast_mut::<ProcessRuntime>())
+        .ok_or(ErrorCode::BadHandle)?;
+
+    // Root-VMAR-only MVP: child VMAR allocation exists in the object shape,
+    // but the syscall API to create child VMARs is intentionally deferred.
+    if runtime.root_vmar.koid() != vmar.koid() {
+        return Err(ErrorCode::NotSupported);
+    }
+
+    let page_flags = page_flags_from_vmar_flags(args.flags)?;
+    let first_vmo_page = (args.vmo_offset / PAGE_SIZE) as usize;
+    let page_count = (args.len / PAGE_SIZE) as usize;
+
+    // Validate all backing frames before mutating page tables, so ordinary
+    // userspace argument errors do not leave partial mappings behind.
+    for i in 0..page_count {
+        if vmo.frame_at(first_vmo_page + i).is_none() {
+            return Err(ErrorCode::InvalidArgs);
+        }
+    }
+
+    for i in 0..page_count {
+        let frame_phys = vmo.frame_at(first_vmo_page + i).ok_or(ErrorCode::InvalidArgs)?;
+        let page: Page<Size4KiB> =
+            Page::containing_address(VirtAddr::new(args.addr + i as u64 * PAGE_SIZE));
+        let frame: PhysFrame<Size4KiB> =
+            PhysFrame::containing_address(PhysAddr::new(frame_phys));
+        runtime.address_space.map_user_page(page, frame, page_flags);
+    }
+
+    vmar.record_mapping(VmarMapping {
+        base: args.addr,
+        size: args.len,
+        vmo: vmo.koid(),
+        flags: args.flags,
+    })
+    .map_err(|_| ErrorCode::Busy)?;
+
+    Ok(args.addr)
+}
+
+fn validate_vmar_map_args(
+    vmar: &Vmar,
+    vmo: &huesos_object::Vmo,
+    args: VmarMapArgs,
+) -> Result<(), ErrorCode> {
+    if args.len == 0
+        || args.addr % PAGE_SIZE != 0
+        || args.len % PAGE_SIZE != 0
+        || args.vmo_offset % PAGE_SIZE != 0
+    {
+        return Err(ErrorCode::InvalidArgs);
+    }
+
+    if args.flags & !ALL_VMAR_FLAGS != 0
+        || args.flags & vmar_flags::USER == 0
+        || args.flags & vmar_flags::SPECIFIC == 0
+        || args.flags & (vmar_flags::READ | vmar_flags::WRITE | vmar_flags::EXECUTE) == 0
+    {
+        return Err(ErrorCode::InvalidArgs);
+    }
+
+    if args.flags & vmar_flags::WRITE != 0 && args.flags & vmar_flags::EXECUTE != 0 {
+        return Err(ErrorCode::InvalidArgs);
+    }
+
+    let end_offset = args
+        .vmo_offset
+        .checked_add(args.len)
+        .ok_or(ErrorCode::InvalidArgs)?;
+    if end_offset > vmo.size() as u64 {
+        return Err(ErrorCode::InvalidArgs);
+    }
+
+    if !vmar.contains_range(args.addr, args.len) {
+        return Err(ErrorCode::InvalidArgs);
+    }
+    if vmar.overlaps_existing(args.addr, args.len) {
+        return Err(ErrorCode::Busy);
+    }
+
+    Ok(())
+}
+
+fn page_flags_from_vmar_flags(flags: u32) -> Result<PageTableFlags, ErrorCode> {
+    let mut pt_flags = PageTableFlags::PRESENT;
+    if flags & vmar_flags::USER != 0 {
+        pt_flags |= PageTableFlags::USER_ACCESSIBLE;
+    }
+    if flags & vmar_flags::WRITE != 0 {
+        pt_flags |= PageTableFlags::WRITABLE;
+    }
+    if flags & vmar_flags::EXECUTE == 0 {
+        pt_flags |= PageTableFlags::NO_EXECUTE;
+    }
+    Ok(pt_flags)
 }
 
 /// Load `elf_bytes` into a brand new address space and prepare a process
