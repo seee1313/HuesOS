@@ -85,6 +85,26 @@ pub struct SpawnedProcess {
     pub cr3: u64,
 }
 
+
+/// Create a suspended process with an empty address space and a root VMAR.
+///
+/// This is the kernel-side implementation behind the `ProcessCreate` syscall.
+/// It intentionally does not create threads, map ELF segments, or start
+/// execution; those are separate VMAR/thread syscalls in the approved launch
+/// model.
+pub fn create_suspended_process(
+    name: &str,
+) -> Result<(Arc<Process>, Arc<Vmar>), huesos_abi::ErrorCode> {
+    let process = Process::new(if name.is_empty() { "process" } else { name });
+    huesos_object::register_object(process.clone());
+
+    let runtime = ProcessRuntime::new(process.koid());
+    let root_vmar = Arc::clone(&runtime.root_vmar);
+    *process.address_space.lock() = Some(Box::new(runtime) as Box<dyn core::any::Any + Send + Sync>);
+
+    Ok((process, root_vmar))
+}
+
 /// Load `elf_bytes` into a brand new address space and prepare a process
 /// object ready to hand to the scheduler.
 pub fn spawn_from_elf(name: &str, elf_bytes: &[u8]) -> SpawnedProcess {

@@ -12,6 +12,7 @@
 
 extern crate alloc;
 
+use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 use huesos_abi::{ErrorCode, FramebufferBlitArgs, FramebufferInfo, HandleValue, INVALID_HANDLE};
@@ -28,6 +29,13 @@ static EXIT_FN: Mutex<Option<fn(i64) -> !>> = Mutex::new(None);
 /// Global debug-write callback (set by kernel to point at the serial writer).
 static DEBUG_WRITE_FN: Mutex<Option<fn(&[u8])>> = Mutex::new(None);
 
+/// Kernel callback type used by the syscall layer to create a suspended process.
+pub type ProcessCreateFn =
+    fn(&str) -> Result<(Arc<huesos_object::Process>, Arc<huesos_object::Vmar>), ErrorCode>;
+
+/// Global process-create callback (set by the kernel process layer).
+static PROCESS_CREATE_FN: Mutex<Option<ProcessCreateFn>> = Mutex::new(None);
+
 /// Set the yield function. Called once by kernel init.
 pub fn set_yield_fn(f: fn()) {
     *YIELD_FN.lock() = Some(f);
@@ -41,6 +49,11 @@ pub fn set_exit_fn(f: fn(i64) -> !) {
 /// Set the debug-write function. Called once by kernel init.
 pub fn set_debug_write_fn(f: fn(&[u8])) {
     *DEBUG_WRITE_FN.lock() = Some(f);
+}
+
+/// Set the process-create function. Called once by kernel init.
+pub fn set_process_create_fn(f: ProcessCreateFn) {
+    *PROCESS_CREATE_FN.lock() = Some(f);
 }
 
 /// Dispatch a syscall by number. This is architecture-independent; the
@@ -80,7 +93,13 @@ pub fn dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> Syscal
         S::DebugWrite => sys_debug_write(a1 as *const u8, a2 as usize),
         S::FramebufferInfo => sys_framebuffer_info(a1 as *mut FramebufferInfo),
         S::FramebufferBlit => sys_framebuffer_blit(a1 as *const FramebufferBlitArgs),
-        S::ProcessCreate | S::ProcessWait | S::ThreadCreate | S::ThreadStart | S::VmarMap => {
+        S::ProcessCreate => sys_process_create(
+            a1 as *const u8,
+            a2 as usize,
+            a3 as *mut HandleValue,
+            a4 as *mut HandleValue,
+        ),
+        S::ProcessWait | S::ThreadCreate | S::ThreadStart | S::VmarMap => {
             Err(ErrorCode::NotSupported)
         }
     }
@@ -89,6 +108,48 @@ pub fn dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> Syscal
 fn sys_nop() -> SyscallResult {
     Ok(0)
 }
+
+
+const MAX_PROCESS_NAME_LEN: usize = 64;
+
+fn sys_process_create(
+    name_ptr: *const u8,
+    name_len: usize,
+    out_process: *mut HandleValue,
+    out_root_vmar: *mut HandleValue,
+) -> SyscallResult {
+    if out_process.is_null() || out_root_vmar.is_null() || name_len > MAX_PROCESS_NAME_LEN {
+        return Err(ErrorCode::InvalidArgs);
+    }
+    if name_len > 0 && name_ptr.is_null() {
+        return Err(ErrorCode::InvalidArgs);
+    }
+
+    let name = if name_len == 0 {
+        "process"
+    } else {
+        let bytes = unsafe { core::slice::from_raw_parts(name_ptr, name_len) };
+        core::str::from_utf8(bytes).map_err(|_| ErrorCode::InvalidArgs)?
+    };
+
+    let create = (*PROCESS_CREATE_FN.lock()).ok_or(ErrorCode::NotSupported)?;
+    let (process, root_vmar) = create(name)?;
+
+    let caller = current_proc()?;
+    let process_handle = caller
+        .handles
+        .add(Handle::new(process.koid(), Rights::DEFAULT));
+    let root_vmar_handle = caller
+        .handles
+        .add(Handle::new(root_vmar.koid(), Rights::DEFAULT));
+
+    unsafe {
+        *out_process = process_handle;
+        *out_root_vmar = root_vmar_handle;
+    }
+    Ok(0)
+}
+
 
 fn current_proc() -> Result<alloc::sync::Arc<huesos_object::Process>, ErrorCode> {
     huesos_object::current_process().ok_or(ErrorCode::BadHandle)
