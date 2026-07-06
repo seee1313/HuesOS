@@ -23,6 +23,8 @@ migration so implementation work stays explicit and reviewable.
 - `ProcessCreate` returns current `Rights::DEFAULT` handles for both the process and root VMAR.
 - Empty process names are allowed and become `process`; non-empty names are UTF-8 and capped at 64 bytes.
 - `ProcessWait` remains `NotSupported` until the Port/blocking wait model is implemented.
+- `ThreadCreate` creates suspended thread objects associated with a process.
+- `ThreadStart` installs the child bootstrap channel endpoint at handle 1, returns the parent endpoint, and schedules the new user task.
 - Work must be split into small commits.
 
 ## Immediate open decisions before code changes
