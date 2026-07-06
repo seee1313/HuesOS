@@ -1,0 +1,11 @@
+[package]
+name = "huesos-hal"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+huesos-arch = { path = "../huesos-arch" }
+spin = { workspace = true }
+log = { workspace = true }

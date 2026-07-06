@@ -1,0 +1,14 @@
+[build]
+target = "x86_64-huesos.json"
+
+[target.x86_64-huesos]
+rustflags = [
+    "-C", "link-arg=-Tscripts/linker.ld",
+    "-C", "link-arg=-no-pie",
+    "-C", "relocation-model=static",
+]
+
+[unstable]
+build-std = ["core", "compiler_builtins", "alloc"]
+build-std-features = ["compiler-builtins-mem"]
+json-target-spec = true

@@ -1,0 +1,18 @@
+[package]
+name = "huesos-arch"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+spin = { workspace = true }
+x86_64 = { workspace = true }
+uart_16550 = { workspace = true }
+pic8259 = { workspace = true }
+bitflags = { workspace = true }
+bit_field = { workspace = true }
+static_assertions = { workspace = true }
+huesos-pmm = { path = "../huesos-pmm" }
+
+log = { workspace = true }

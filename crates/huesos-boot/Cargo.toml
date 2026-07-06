@@ -1,0 +1,17 @@
+[package]
+name = "huesos-boot"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "huesos-boot"
+path = "src/main.rs"
+
+[dependencies]
+huesos-kernel = { path = "../huesos-kernel" }
+huesos-arch = { path = "../huesos-arch" }
+huesos-pmm = { path = "../huesos-pmm" }
+limine = { workspace = true }
+log = { workspace = true }

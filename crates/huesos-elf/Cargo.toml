@@ -1,0 +1,10 @@
+[package]
+name = "huesos-elf"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+xmas-elf = "0.9"
+log = { workspace = true }

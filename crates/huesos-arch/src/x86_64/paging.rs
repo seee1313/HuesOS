@@ -1,0 +1,178 @@
+//! Paging: kernel address space + per-process page table management.
+//!
+//! Frame allocation is backed by `huesos-pmm`'s bitmap allocator (a real
+//! physical memory manager fed from the Limine memory map), not a hardcoded
+//! bump range.
+
+use spin::Mutex;
+use x86_64::registers::control::{Cr3, Cr3Flags};
+use x86_64::structures::paging::{
+    FrameAllocator, FrameDeallocator, Mapper, OffsetPageTable, Page, PageTable, PageTableFlags,
+    PhysFrame, Size4KiB,
+};
+use x86_64::{PhysAddr, VirtAddr};
+
+/// Higher-half direct map offset, fixed once at boot.
+static HHDM_OFFSET: Mutex<u64> = Mutex::new(0);
+
+/// Kernel's own mapper over the bootloader-provided top-level table.
+static KERNEL_PAGE_TABLE: Mutex<Option<OffsetPageTable<'static>>> = Mutex::new(None);
+
+/// Frame allocator adapter over `huesos-pmm`.
+pub struct PmmFrameAllocator;
+
+unsafe impl FrameAllocator<Size4KiB> for PmmFrameAllocator {
+    fn allocate_frame(&mut self) -> Option<PhysFrame<Size4KiB>> {
+        huesos_pmm::alloc_frame()
+            .ok()
+            .map(|addr| PhysFrame::containing_address(PhysAddr::new(addr)))
+    }
+}
+
+impl FrameDeallocator<Size4KiB> for PmmFrameAllocator {
+    unsafe fn deallocate_frame(&mut self, frame: PhysFrame<Size4KiB>) {
+        huesos_pmm::free_frame(frame.start_address().as_u64());
+    }
+}
+
+/// Initialize paging with `phys_offset` from Limine HHDM.
+///
+/// # Safety
+/// `phys_offset` must be a valid higher-half direct map covering all
+/// physical memory, and the PMM must already be initialized.
+pub unsafe fn init(phys_offset: VirtAddr) {
+    *HHDM_OFFSET.lock() = phys_offset.as_u64();
+    let level_4_table = unsafe { active_level_4_table(phys_offset) };
+    *KERNEL_PAGE_TABLE.lock() = Some(OffsetPageTable::new(level_4_table, phys_offset));
+}
+
+unsafe fn active_level_4_table(phys_offset: VirtAddr) -> &'static mut PageTable {
+    let (level_4_frame, _) = Cr3::read();
+    let phys = level_4_frame.start_address();
+    let virt = phys_offset + phys.as_u64();
+    unsafe { &mut *virt.as_mut_ptr() }
+}
+
+/// Translate a physical address to a kernel-accessible virtual address via
+/// the HHDM.
+pub fn phys_to_virt(phys: u64) -> VirtAddr {
+    VirtAddr::new(*HHDM_OFFSET.lock() + phys)
+}
+
+/// Map `page` to `frame` with `flags` in the *kernel* address space.
+pub fn map_page(page: Page<Size4KiB>, frame: PhysFrame<Size4KiB>, flags: PageTableFlags) {
+    let mut guard = KERNEL_PAGE_TABLE.lock();
+    let mapper = guard.as_mut().expect("page table not initialized");
+    unsafe {
+        mapper
+            .map_to(page, frame, flags, &mut PmmFrameAllocator)
+            .expect("kernel map_to failed")
+            .flush();
+    }
+}
+
+/// Allocate a fresh physical frame and map it at `page` in the kernel
+/// address space. Returns the physical frame allocated.
+pub fn map_new_page(page: Page<Size4KiB>, flags: PageTableFlags) -> PhysFrame<Size4KiB> {
+    let frame = PmmFrameAllocator
+        .allocate_frame()
+        .expect("out of physical memory");
+    map_page(page, frame, flags);
+    frame
+}
+
+/// A process's private top-level page table (PML4), sharing the kernel's
+/// higher-half mappings but with an independent lower half for userspace.
+pub struct AddressSpace {
+    pml4_frame: PhysFrame<Size4KiB>,
+}
+
+impl AddressSpace {
+    /// Create a new address space that inherits kernel mappings (so that
+    /// syscalls/interrupts keep working after a `CR3` switch) but starts
+    /// with an empty user half.
+    pub fn new() -> Self {
+        let pml4_frame = PmmFrameAllocator
+            .allocate_frame()
+            .expect("out of memory allocating PML4");
+        let virt = phys_to_virt(pml4_frame.start_address().as_u64());
+        let new_table: &mut PageTable = unsafe { &mut *virt.as_mut_ptr() };
+        new_table.zero();
+
+        // Copy the upper half (kernel space, indices 256..512) from the
+        // currently active table so kernel code/data/heap stay mapped.
+        let (current_frame, _) = Cr3::read();
+        let current_virt = phys_to_virt(current_frame.start_address().as_u64());
+        let current_table: &PageTable = unsafe { &*current_virt.as_ptr() };
+        for i in 256..512 {
+            new_table[i] = current_table[i].clone();
+        }
+
+        Self { pml4_frame }
+    }
+
+    /// Map a page into this address space (user-accessible).
+    pub fn map_user_page(
+        &self,
+        page: Page<Size4KiB>,
+        frame: PhysFrame<Size4KiB>,
+        flags: PageTableFlags,
+    ) {
+        let virt = phys_to_virt(self.pml4_frame.start_address().as_u64());
+        let table: &mut PageTable = unsafe { &mut *virt.as_mut_ptr() };
+        let phys_offset = VirtAddr::new(*HHDM_OFFSET.lock());
+        let mut mapper = unsafe { OffsetPageTable::new(table, phys_offset) };
+        unsafe {
+            mapper
+                .map_to(page, frame, flags, &mut PmmFrameAllocator)
+                .expect("user map_to failed")
+                .flush();
+        }
+    }
+
+    /// Allocate a fresh frame and map it into this address space.
+    pub fn map_new_user_page(
+        &self,
+        page: Page<Size4KiB>,
+        flags: PageTableFlags,
+    ) -> PhysFrame<Size4KiB> {
+        let frame = PmmFrameAllocator.allocate_frame().expect("out of memory");
+        self.map_user_page(page, frame, flags);
+        frame
+    }
+
+    /// Physical address of this address space's PML4, suitable for CR3.
+    pub fn phys_addr(&self) -> PhysAddr {
+        self.pml4_frame.start_address()
+    }
+
+    /// Switch the CPU to this address space.
+    ///
+    /// # Safety
+    /// The address space must contain valid kernel mappings (so interrupts
+    /// keep working) and must outlive the switch.
+    pub unsafe fn activate(&self) {
+        unsafe {
+            Cr3::write(self.pml4_frame, Cr3Flags::empty());
+        }
+    }
+}
+
+impl Default for AddressSpace {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Common page flag combinations.
+pub mod flags {
+    use x86_64::structures::paging::PageTableFlags as F;
+
+    /// Kernel read/write, not user accessible.
+    pub const KERNEL_RW: F = F::from_bits_truncate(F::PRESENT.bits() | F::WRITABLE.bits());
+    /// User read/write.
+    pub const USER_RW: F =
+        F::from_bits_truncate(F::PRESENT.bits() | F::WRITABLE.bits() | F::USER_ACCESSIBLE.bits());
+    /// User read/execute (no write) — for code pages.
+    pub const USER_RX: F = F::from_bits_truncate(F::PRESENT.bits() | F::USER_ACCESSIBLE.bits());
+}

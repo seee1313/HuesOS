@@ -1,0 +1,10 @@
+[package]
+name = "huesos-pmm"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+spin = { workspace = true }
+log = { workspace = true }

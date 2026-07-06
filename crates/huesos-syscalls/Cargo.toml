@@ -1,0 +1,13 @@
+[package]
+name = "huesos-syscalls"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+huesos-object = { path = "../huesos-object" }
+huesos-arch = { path = "../huesos-arch" }
+bitflags = { workspace = true }
+spin = { workspace = true }
+log = { workspace = true }

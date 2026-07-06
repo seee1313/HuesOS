@@ -1,0 +1,46 @@
+[workspace]
+members = [
+    "crates/huesos-boot",
+    "crates/huesos-arch",
+    "crates/huesos-hal",
+    "crates/huesos-object",
+    "crates/huesos-syscalls",
+    "crates/huesos-kernel",
+    "crates/huesos-elf",
+    "crates/huesos-pmm",
+]
+resolver = "2"
+# NOTE: crates/huesos-userspace/init is intentionally NOT a member of this
+# workspace. It targets ring3 userspace (different linker script / load
+# address) and is built as a wholly separate `cargo` invocation from
+# huesos-kernel's build.rs, then embedded into the kernel with
+# `include_bytes!`. See crates/huesos-kernel/build.rs.
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["HuesOS Team"]
+license = "MIT"
+
+[workspace.dependencies]
+spin = "0.9"
+bitflags = "2.6"
+bit_field = "0.10"
+lock_api = "0.4"
+log = "0.4"
+static_assertions = "1.1"
+x86_64 = "0.15"
+uart_16550 = "0.3"
+pic8259 = "0.11"
+limine = "0.6"
+linked_list_allocator = "0.10"
+
+[profile.dev]
+opt-level = 1
+overflow-checks = true
+lto = false
+
+[profile.release]
+opt-level = 3
+lto = true
+panic = "abort"
