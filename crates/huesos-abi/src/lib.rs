@@ -213,6 +213,16 @@ pub mod rights {
 }
 
 
+
+/// Lowest userspace virtual address accepted by the root VMAR. The first
+/// 64 KiB stay unmapped as a low/null-pointer guard.
+pub const USER_ASPACE_BASE: u64 = 0x0000_0000_0001_0000;
+/// Exclusive upper bound of the canonical lower-half userspace address
+/// space used by HuesOS root VMARs.
+pub const USER_ASPACE_END: u64 = 0x0000_8000_0000_0000;
+/// Size of the root userspace VMAR.
+pub const USER_ASPACE_SIZE: u64 = USER_ASPACE_END - USER_ASPACE_BASE;
+
 /// VMAR mapping flags for [`Syscall::VmarMap`].
 pub mod vmar_flags {
     /// Map pages readable from userspace.
