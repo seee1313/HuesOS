@@ -174,6 +174,24 @@ impl HandleTable {
         t.push(Some(handle));
         idx
     }
+    /// Insert a handle at an exact handle value. Fails if `value` is invalid
+    /// or already occupied.
+    pub fn insert_at(&self, value: HandleValue, handle: Handle) -> Result<(), Handle> {
+        if value == INVALID_HANDLE {
+            return Err(handle);
+        }
+        let mut t = self.table.lock();
+        while t.len() <= value as usize {
+            t.push(None);
+        }
+        let slot = &mut t[value as usize];
+        if slot.is_some() {
+            return Err(handle);
+        }
+        *slot = Some(handle);
+        Ok(())
+    }
+
     /// Get handle by value.
     pub fn get(&self, value: HandleValue) -> Option<Handle> {
         if value == INVALID_HANDLE {
@@ -968,6 +986,17 @@ mod tests {
         let thread = Thread::new_for_process("worker", Koid(123));
         assert_eq!(thread.process(), Koid(123));
         assert_eq!(*thread.task_id.lock(), None);
+    }
+
+
+    #[test]
+    fn handle_table_can_insert_at_fixed_slot() {
+        let table = HandleTable::new();
+        let h = Handle::new(Koid(7), Rights::DEFAULT);
+        assert!(table.insert_at(3, h).is_ok());
+        assert_eq!(table.get(3), Some(h));
+        assert!(table.insert_at(3, h).is_err());
+        assert!(table.insert_at(INVALID_HANDLE, h).is_err());
     }
 
     #[test]
