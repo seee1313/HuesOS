@@ -6,9 +6,14 @@
   (pinned via `rust-toolchain.toml`, so `rustup` will fetch the right
   version automatically once you run any `cargo`/`rustc` command in this
   repo)
-- **QEMU** with UEFI support
-- **OVMF** UEFI firmware
+- **QEMU** (`qemu-system-x86_64`)
 - **xorriso** and **mtools** for ISO generation
+
+Note: **you do not need to separately install OVMF UEFI firmware** — a
+known-good OVMF build is vendored in this repo (see
+[Vendored dependencies](#vendored-dependencies) below), specifically to
+avoid the "which of the five different paths/filenames does my distro use
+for OVMF" problem across Debian/Ubuntu/Arch/Fedora/macOS.
 
 ### Install Rust nightly
 
@@ -20,24 +25,39 @@ rustup component add rust-src llvm-tools-preview rustfmt --toolchain nightly
 (The pinned `rust-toolchain.toml` in this repo will select the right
 toolchain automatically inside the project directory.)
 
-### Install QEMU & OVMF
+### Install QEMU
 
 **Debian/Ubuntu:**
 ```bash
-sudo apt install qemu-system-x86 ovmf xorriso mtools
+sudo apt install qemu-system-x86 xorriso mtools
 ```
 
 **Arch Linux:**
 ```bash
-sudo pacman -S qemu-full edk2-ovmf xorriso mtools
+sudo pacman -S qemu-full xorriso mtools
 ```
 
 **macOS:**
 ```bash
 brew install qemu xorriso mtools
 ```
-(OVMF firmware images need to be sourced separately on macOS, e.g. via the
-`qemu` formula's bundled EDK2 or a manual download.)
+
+## Vendored dependencies
+
+Two small third-party binary dependencies are vendored directly in this
+repository so that `make build`, `make iso`, and `make run` all work
+immediately after `git clone`, with no extra downloads and no dependence
+on how any particular OS distribution packages them:
+
+- [`third_party/limine/`](../third_party/limine) — prebuilt Limine
+  bootloader binaries (BSD-licensed)
+- [`third_party/ovmf/`](../third_party/ovmf) — a combined OVMF UEFI
+  firmware image (BSD-2-Clause-Patent licensed)
+
+Both directories have their own `README.md` documenting provenance,
+license, and how to refresh them with a newer version. Both can be
+overridden without touching the vendored copies: `LIMINE_BIN=/path` for
+Limine, `OVMF_PATH=/path/to/OVMF.fd` for the firmware.
 
 ### Limine
 
@@ -123,5 +143,7 @@ different target). If you see this for a *different* crate, check that
 crate's `Cargo.toml`.
 
 ### QEMU shows no serial output
-Check that OVMF was actually found — `scripts/run.sh` searches a few common
-paths and will print an error naming which ones it tried if none exist.
+This shouldn't happen with the vendored OVMF image, but if you set
+`OVMF_PATH` to a custom firmware file, double check it actually exists —
+`scripts/run.sh` will print a clear error naming the missing path
+otherwise, rather than silently falling back to something else.

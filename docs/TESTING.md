@@ -58,10 +58,10 @@ part of the pipeline.
 ### GDB Debugging
 
 ```bash
-make build
+make build && make iso
 qemu-system-x86_64 \
     -machine q35 -cpu qemu64 -m 256M \
-    -bios /usr/share/ovmf/OVMF.fd \
+    -bios third_party/ovmf/OVMF.fd \
     -cdrom build/huesos.iso \
     -serial stdio -s -S
 
@@ -86,8 +86,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: rustup toolchain install nightly --component rust-src,llvm-tools-preview
-      - run: sudo apt-get update && sudo apt-get install -y qemu-system-x86 ovmf xorriso mtools
-      - run: git clone --branch v9.x-binary --depth 1 https://github.com/limine-bootloader/limine.git ~/limine-bin
+      - run: sudo apt-get update && sudo apt-get install -y qemu-system-x86 xorriso mtools
+      # Note: no OVMF or Limine install/clone step needed — both are
+      # vendored in third_party/, see docs/BUILD.md#vendored-dependencies.
       - run: make build
       - run: make test
       - run: make iso

@@ -1,5 +1,11 @@
 #!/usr/bin/env bash
 # Boot the HuesOS ISO in QEMU under UEFI (OVMF).
+#
+# The OVMF firmware image is vendored directly in this repo under
+# third_party/ovmf/, so this always uses the same known-good firmware
+# regardless of the host distro's OVMF package layout (which varies a lot:
+# Debian/Ubuntu, Arch, and Fedora all install to different paths, some
+# split CODE/VARS into separate files, etc). Set OVMF_PATH to override.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -8,28 +14,16 @@ cd "$REPO_ROOT"
 
 PROFILE="${1:-debug}"
 ISO="build/huesos.iso"
+OVMF="${OVMF_PATH:-third_party/ovmf/OVMF.fd}"
 
 if [ ! -f "$ISO" ]; then
     echo "error: $ISO not found. Run 'make iso' (or 'make iso PROFILE=$PROFILE') first." >&2
     exit 1
 fi
 
-# Try a handful of common OVMF firmware locations across distros.
-OVMF_CANDIDATES=(
-    "/usr/share/ovmf/OVMF.fd"
-    "/usr/share/OVMF/OVMF_CODE.fd"
-    "/usr/share/OVMF/OVMF_CODE_4M.fd"
-    "/usr/share/qemu/OVMF.fd"
-)
-OVMF=""
-for c in "${OVMF_CANDIDATES[@]}"; do
-    if [ -f "$c" ]; then
-        OVMF="$c"
-        break
-    fi
-done
-if [ -z "$OVMF" ]; then
-    echo "error: could not find an OVMF UEFI firmware image. Install 'ovmf'." >&2
+if [ ! -f "$OVMF" ]; then
+    echo "error: OVMF firmware not found at $OVMF" >&2
+    echo "       (set OVMF_PATH=/path/to/OVMF.fd to use a different one)" >&2
     exit 1
 fi
 
