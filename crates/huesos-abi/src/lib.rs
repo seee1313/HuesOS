@@ -1,0 +1,237 @@
+//! # HuesOS ABI
+//!
+//! The single source of truth for the kernel<->userspace syscall boundary:
+//! syscall numbers, error codes, and any plain-old-data structs passed by
+//! value across `syscall`/`sysret`.
+//!
+//! This crate is deliberately tiny, `no_std`, `#![no_builtins]`-friendly,
+//! and has **zero dependencies** on either `huesos-kernel` or any
+//! userspace runtime. Both `huesos-syscalls` (the kernel-side dispatcher)
+//! and `libcanvas` (the userspace-side safe wrapper library) depend on
+//! this crate instead of hand-copying magic numbers into two places that
+//! could silently drift out of sync — which is exactly the kind of bug
+//! that would otherwise show up as "works until someone reorders an enum".
+
+#![no_std]
+#![warn(missing_docs)]
+
+/// Syscall number enumeration. The numeric value (not the variant name) is
+/// what actually crosses the ABI boundary in `rax`, so **never remove or
+/// reorder a variant** — only ever append new ones. Removing a syscall
+/// that shipped means leaving its number permanently retired (turn it
+/// into `Reserved`-style dead entry in the dispatcher) rather than reusing
+/// it for something else.
+#[repr(u64)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Syscall {
+    /// No-op; always succeeds. Useful for latency measurement / liveness
+    /// checks.
+    Nop = 0,
+    /// Create a VMO (a block of anonymous memory) of a given size.
+    VmoCreate = 1,
+    /// Close a handle, releasing this process's reference to whatever
+    /// object it named.
+    HandleClose = 2,
+    /// Duplicate a handle, optionally with reduced rights.
+    HandleDuplicate = 3,
+    /// Yield the current thread's remaining time slice cooperatively.
+    Yield = 4,
+    /// Read bytes from a VMO.
+    VmoRead = 5,
+    /// Write bytes to a VMO.
+    VmoWrite = 6,
+    /// Create a connected pair of channel endpoints.
+    ChannelCreate = 7,
+    /// Write a message to a channel.
+    ChannelWrite = 8,
+    /// Read a message from a channel (non-blocking).
+    ChannelRead = 9,
+    /// Exit the current process with a status code. Never returns.
+    ProcessExit = 10,
+    /// Write raw bytes to the kernel debug log (serial console). An MVP
+    /// substitute for a real console/VFS-backed stdout.
+    DebugWrite = 11,
+    /// Query framebuffer geometry (width/height/pitch/bpp/color masks).
+    FramebufferInfo = 12,
+    /// Copy (blit) a rectangular region from a VMO into the real
+    /// framebuffer. This is the *only* way userspace ever touches actual
+    /// video memory — it never gets a mapping of the framebuffer itself,
+    /// only this narrow, bounds-checked copy operation.
+    FramebufferBlit = 13,
+}
+
+impl Syscall {
+    /// Total number of defined syscalls (i.e. one past the highest
+    /// currently-assigned number). The dispatcher uses this to reject
+    /// obviously-out-of-range numbers before a `match`.
+    pub const COUNT: u64 = 14;
+
+    /// Convert a raw syscall number back into a [`Syscall`], if valid.
+    pub const fn from_raw(n: u64) -> Option<Self> {
+        Some(match n {
+            0 => Self::Nop,
+            1 => Self::VmoCreate,
+            2 => Self::HandleClose,
+            3 => Self::HandleDuplicate,
+            4 => Self::Yield,
+            5 => Self::VmoRead,
+            6 => Self::VmoWrite,
+            7 => Self::ChannelCreate,
+            8 => Self::ChannelWrite,
+            9 => Self::ChannelRead,
+            10 => Self::ProcessExit,
+            11 => Self::DebugWrite,
+            12 => Self::FramebufferInfo,
+            13 => Self::FramebufferBlit,
+            _ => return None,
+        })
+    }
+}
+
+/// Syscall error codes (subset of the `zx_status_t` design: small negative
+/// integers, `0` reserved for "not an error"/success at the raw ABI
+/// level).
+#[repr(i32)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ErrorCode {
+    /// Invalid argument (null pointer, zero length where one is required,
+    /// value out of the accepted range, etc).
+    InvalidArgs = -10,
+    /// The handle value does not name any object owned by this process.
+    BadHandle = -11,
+    /// The handle names an object, but not of the type this syscall
+    /// expects (e.g. passing a Channel handle to a VMO syscall).
+    WrongType = -12,
+    /// The handle's rights don't permit this operation.
+    AccessDenied = -13,
+    /// Out of memory (physical frames exhausted, or a requested size
+    /// exceeds an enforced limit).
+    NoMemory = -14,
+    /// The resource is busy; try again.
+    Busy = -15,
+    /// A non-blocking call would have to block to complete (e.g. reading
+    /// an empty channel) — not a real error, just "nothing to do yet".
+    ShouldWait = -16,
+    /// Not found.
+    NotFound = -17,
+    /// No framebuffer is available on this system.
+    NoFramebuffer = -18,
+    /// This syscall number is not recognized by this kernel build.
+    NotSupported = -19,
+}
+
+impl ErrorCode {
+    /// Convert a raw (negative) return value back into an [`ErrorCode`],
+    /// if it matches a known code. Positive/zero values are successful
+    /// results, not errors — callers should check sign before calling this.
+    pub const fn from_raw(n: i64) -> Option<Self> {
+        Some(match n {
+            -10 => Self::InvalidArgs,
+            -11 => Self::BadHandle,
+            -12 => Self::WrongType,
+            -13 => Self::AccessDenied,
+            -14 => Self::NoMemory,
+            -15 => Self::Busy,
+            -16 => Self::ShouldWait,
+            -17 => Self::NotFound,
+            -18 => Self::NoFramebuffer,
+            -19 => Self::NotSupported,
+            _ => return None,
+        })
+    }
+
+    /// Human-readable description, safe to print from either kernel or
+    /// userspace context (`no_std`, no allocation).
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::InvalidArgs => "invalid arguments",
+            Self::BadHandle => "bad handle",
+            Self::WrongType => "wrong handle type",
+            Self::AccessDenied => "access denied",
+            Self::NoMemory => "out of memory",
+            Self::Busy => "resource busy",
+            Self::ShouldWait => "would block",
+            Self::NotFound => "not found",
+            Self::NoFramebuffer => "no framebuffer available",
+            Self::NotSupported => "syscall not supported",
+        }
+    }
+}
+
+/// Userspace handle value (an opaque index into the calling process's
+/// handle table — meaningless outside that process).
+pub type HandleValue = u32;
+/// Reserved value meaning "no handle" / invalid handle.
+pub const INVALID_HANDLE: HandleValue = 0;
+
+/// Rights bitmask, mirrored from `huesos-object::Rights` numerically (kept
+/// here too so userspace doesn't need to depend on the kernel-only object
+/// crate just to duplicate a handle with reduced rights).
+pub mod rights {
+    /// May duplicate this handle.
+    pub const DUPLICATE: u32 = 1 << 0;
+    /// May transfer this handle to another process via a channel.
+    pub const TRANSFER: u32 = 1 << 1;
+    /// May read from the underlying object.
+    pub const READ: u32 = 1 << 2;
+    /// May write to the underlying object.
+    pub const WRITE: u32 = 1 << 3;
+    /// May execute/map-executable the underlying object.
+    pub const EXECUTE: u32 = 1 << 4;
+    /// May map the underlying object into an address space.
+    pub const MAP: u32 = 1 << 5;
+    /// Duplicate with the exact same rights as the source handle.
+    pub const SAME_RIGHTS: u32 = 1 << 31;
+}
+
+/// Framebuffer geometry and pixel format, as returned by
+/// [`Syscall::FramebufferInfo`]. `#[repr(C)]` and plain-old-data so it can
+/// be copied byte-for-byte across the syscall boundary via a pointer.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct FramebufferInfo {
+    /// Width in pixels.
+    pub width: u32,
+    /// Height in pixels.
+    pub height: u32,
+    /// Bytes per scanline (may be larger than `width * bytes_per_pixel`
+    /// due to alignment padding — always use this, never assume tightly
+    /// packed rows).
+    pub pitch: u32,
+    /// Bits per pixel (typically 32).
+    pub bpp: u16,
+    /// Number of bits in the red channel.
+    pub red_mask_size: u8,
+    /// Bit position of the red channel's least significant bit.
+    pub red_mask_shift: u8,
+    /// Number of bits in the green channel.
+    pub green_mask_size: u8,
+    /// Bit position of the green channel's least significant bit.
+    pub green_mask_shift: u8,
+    /// Number of bits in the blue channel.
+    pub blue_mask_size: u8,
+    /// Bit position of the blue channel's least significant bit.
+    pub blue_mask_shift: u8,
+}
+
+/// Arguments for [`Syscall::FramebufferBlit`], passed by pointer (the
+/// syscall ABI only has 5 register-sized argument slots, and this needs
+/// more fields than that comfortably fits).
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct FramebufferBlitArgs {
+    /// Handle to a VMO containing the source pixel data, tightly packed
+    /// (no per-row padding) in the same pixel format `FramebufferInfo`
+    /// describes.
+    pub vmo: HandleValue,
+    /// Byte offset into the VMO where pixel data starts.
+    pub vmo_offset: u64,
+    /// Width, in pixels, of the source rectangle within the VMO.
+    pub src_width: u32,
+    /// Height, in pixels, of the source rectangle within the VMO.
+    pub src_height: u32,
+    /// Destination X coordinate on the real framebuffer.
+    pub dst_x: u32,
+    /// Destination Y coordinate on the real framebuffer.
+    pub dst_y: u32,
+}
