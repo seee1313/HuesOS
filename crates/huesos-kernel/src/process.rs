@@ -1,12 +1,13 @@
 //! Process creation: builds a fresh address space, loads an ELF binary into
 //! it via `huesos-elf`, and spawns a scheduler task that jumps to ring3.
 
-use alloc::sync::Arc;
 use alloc::boxed::Box;
-use huesos_arch::paging::{flags, AddressSpace};
+use alloc::sync::Arc;
 use huesos_arch::gdt;
+use huesos_arch::paging::{flags, AddressSpace};
+use huesos_object::KernelObject;
 use huesos_elf::{Loader, SegmentFlags};
-use huesos_object::Process;
+use huesos_object::{Process, Vmar};
 use x86_64::structures::paging::{Page, PageTableFlags, Size4KiB};
 use x86_64::VirtAddr;
 
@@ -14,6 +15,42 @@ use x86_64::VirtAddr;
 const USER_STACK_TOP: u64 = 0x0000_7fff_ff00_0000;
 /// Size of the initial user stack.
 const USER_STACK_SIZE: u64 = 4096 * 16;
+
+
+/// Kernel-owned runtime state for a process.
+///
+/// Stored behind `huesos_object::Process::address_space` as `Box<dyn Any>`
+/// so the object crate stays architecture-independent while the kernel can
+/// still keep the real x86_64 page-table owner alive for as long as the
+/// process object lives.
+pub struct ProcessRuntime {
+    /// Real process address space.
+    pub address_space: AddressSpace,
+    /// Root VMAR object for this address space.
+    pub root_vmar: Arc<Vmar>,
+}
+
+impl ProcessRuntime {
+    /// Create an empty runtime and register its root VMAR object.
+    pub fn new(process_koid: huesos_object::Koid) -> Self {
+        let address_space = AddressSpace::new();
+        let root_vmar = Vmar::new_root(
+            process_koid,
+            huesos_abi::USER_ASPACE_BASE,
+            huesos_abi::USER_ASPACE_SIZE,
+        );
+        huesos_object::register_object(root_vmar.clone());
+        Self {
+            address_space,
+            root_vmar,
+        }
+    }
+
+    /// CR3 value for scheduling this process.
+    pub fn cr3(&self) -> u64 {
+        self.address_space.phys_addr().as_u64()
+    }
+}
 
 /// Adapter that lets `huesos-elf::load` map pages into a real
 /// `huesos_arch::paging::AddressSpace`.
@@ -51,10 +88,13 @@ pub struct SpawnedProcess {
 /// Load `elf_bytes` into a brand new address space and prepare a process
 /// object ready to hand to the scheduler.
 pub fn spawn_from_elf(name: &str, elf_bytes: &[u8]) -> SpawnedProcess {
-    let aspace = AddressSpace::new();
+    let process = Process::new(name);
+    let runtime = ProcessRuntime::new(process.koid());
 
     let loaded = {
-        let mut loader = KernelLoader { aspace: &aspace };
+        let mut loader = KernelLoader {
+            aspace: &runtime.address_space,
+        };
         huesos_elf::load(elf_bytes, &mut loader).expect("failed to load userspace ELF")
     };
 
@@ -63,28 +103,21 @@ pub fn spawn_from_elf(name: &str, elf_bytes: &[u8]) -> SpawnedProcess {
     let mut addr = stack_bottom;
     while addr < USER_STACK_TOP {
         let page: Page<Size4KiB> = Page::containing_address(VirtAddr::new(addr));
-        aspace.map_new_user_page(page, flags::USER_RW | PageTableFlags::NO_EXECUTE);
+        runtime
+            .address_space
+            .map_new_user_page(page, flags::USER_RW | PageTableFlags::NO_EXECUTE);
         addr += 4096;
     }
 
-    let process = Process::new(name);
-    *process.address_space.lock() = Some(Box::new(()) as Box<dyn core::any::Any + Send + Sync>);
+    let cr3 = runtime.cr3();
+    *process.address_space.lock() = Some(Box::new(runtime) as Box<dyn core::any::Any + Send + Sync>);
 
     SpawnedProcess {
         process,
         entry_point: loaded.entry_point,
         user_rsp: USER_STACK_TOP - 32, // leave a little red-zone-ish slack
-        cr3: aspace_leak_phys(aspace),
+        cr3,
     }
-}
-
-/// Leak the `AddressSpace` (its PML4 frame must outlive the process; the MVP
-/// doesn't yet reclaim process address spaces on exit) and return the
-/// physical address of its PML4 for CR3.
-fn aspace_leak_phys(aspace: AddressSpace) -> u64 {
-    let phys = aspace.phys_addr().as_u64();
-    core::mem::forget(aspace);
-    phys
 }
 
 /// Entry trampoline installed as a task's initial resume address (via
