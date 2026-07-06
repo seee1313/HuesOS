@@ -82,7 +82,7 @@ fn build_userspace_program(
         .env_remove("RUSTFLAGS")
         .env_remove("CARGO_ENCODED_RUSTFLAGS")
         .args(["build", "--release"]);
-    for (key, value) in extra_env {
+    for &(key, value) in extra_env {
         command.env(key, value);
     }
 
