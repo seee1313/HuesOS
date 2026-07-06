@@ -431,6 +431,9 @@ fn sys_handle_duplicate(handle: HandleValue, rights: u32, out: *mut HandleValue)
 }
 
 fn sys_yield() -> SyscallResult {
+    // Copy the callback out before calling it. `yield_now` context-switches
+    // away and does not return until this task is scheduled again; holding a
+    // spinlock across that switch deadlocks the next task that tries to yield.
     let yield_fn = *YIELD_FN.lock();
     if let Some(f) = yield_fn {
         f();
@@ -522,6 +525,8 @@ fn sys_channel_read(
 }
 
 fn sys_process_exit(code: i64) -> SyscallResult {
+    // Same rule as `sys_yield`: never hold a callback mutex across a
+    // scheduler transition / non-returning exit path.
     let exit_fn = *EXIT_FN.lock();
     if let Some(f) = exit_fn {
         f(code);
