@@ -2,8 +2,9 @@
 
 ## Unit Tests (Host)
 
-Crates with hardware-independent logic (`huesos-pmm`, `huesos-elf`) have
-real unit tests that run on the host, not just in QEMU:
+Crates with hardware-independent logic (`huesos-pmm`, `huesos-elf`,
+`huesos-object`) have real unit tests that run on the host, not just in
+QEMU:
 
 ```bash
 make test
@@ -16,10 +17,17 @@ This runs, e.g.:
   verifies alignment helpers, and — if `crates/huesos-userspace/init` has
   been built at least once — loads the *real* `huesos-init` ELF binary and
   checks its entry point and mapped pages.
+- `huesos-object`: sets up a fake PMM + phys-to-virt translator (the same
+  way `huesos-pmm`'s own tests do) to exercise `Vmo` read/write round-trips
+  and out-of-memory handling (`Vmo::new`/`set_size` must return `Err`, not
+  panic, when physical memory runs out — this used to panic the whole
+  kernel), `HandleTable` slot reuse, and — as a regression test for a real
+  bug that shipped once — that `Channel::pair()` actually delivers messages
+  to the *peer*, not back to the sender.
 
 Crates that are fundamentally tied to real hardware state (`huesos-arch`,
-`huesos-kernel`, `huesos-object`'s VMO physical-frame paths) are exercised
-live by booting in QEMU instead (see below) rather than mocked on the host.
+`huesos-kernel`'s process/scheduler machinery) are exercised live by
+booting in QEMU instead (see below) rather than mocked on the host.
 
 ## Integration Test: Full Boot (QEMU)
 

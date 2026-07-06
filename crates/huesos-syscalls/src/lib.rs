@@ -125,11 +125,23 @@ fn current_proc() -> Result<alloc::sync::Arc<huesos_object::Process>, SyscallErr
     huesos_object::current_process().ok_or(SyscallError::BadHandle)
 }
 
+/// Upper bound on a single VMO's size (4 GiB). This is *not* a real memory
+/// accounting/quota system (see the Job resource-limits roadmap item) — it
+/// exists purely to reject obviously-bogus sizes (e.g. a userspace bug
+/// passing `usize::MAX`) before they reach `Vec::with_capacity`, which
+/// would otherwise abort the whole kernel with a "capacity overflow" panic
+/// while trying to allocate a frame-address array sized for an
+/// astronomical page count, rather than cleanly failing the syscall.
+const MAX_VMO_SIZE: usize = 4 * 1024 * 1024 * 1024;
+
 fn sys_vmo_create(size: usize, out_handle: *mut HandleValue) -> SyscallResult {
     if out_handle.is_null() || size == 0 {
         return Err(SyscallError::InvalidArgs);
     }
-    let vmo = huesos_object::Vmo::new(size);
+    if size > MAX_VMO_SIZE {
+        return Err(SyscallError::NoMemory);
+    }
+    let vmo = huesos_object::Vmo::new(size).map_err(|_| SyscallError::NoMemory)?;
     let koid = vmo.koid();
     huesos_object::register_object(vmo);
     let proc = current_proc()?;

@@ -274,22 +274,38 @@ const PAGE_SIZE: usize = 4096;
 impl Vmo {
     /// Create a VMO covering at least `size` bytes, backed by freshly
     /// allocated, zeroed physical frames.
-    pub fn new(size: usize) -> Arc<Self> {
+    ///
+    /// Returns `Err(())` if the host is out of physical memory, instead of
+    /// panicking: a userspace process requesting an oversized VMO (or many
+    /// processes collectively exhausting memory) is an entirely ordinary,
+    /// expected condition that must surface as a syscall error
+    /// (`SyscallError::NoMemory`), not take down the whole kernel. Any
+    /// frames already allocated before the failure are freed back to the
+    /// PMM before returning, so a failed allocation never leaks memory.
+    pub fn new(size: usize) -> Result<Arc<Self>, ()> {
         let koid = alloc_koid();
         let page_count = size.div_ceil(PAGE_SIZE).max(1);
         let mut frames = Vec::with_capacity(page_count);
         for _ in 0..page_count {
-            let frame = huesos_pmm::alloc_frame().expect("VMO: out of physical memory");
+            let frame = match huesos_pmm::alloc_frame() {
+                Ok(f) => f,
+                Err(_) => {
+                    for f in frames {
+                        huesos_pmm::free_frame(f);
+                    }
+                    return Err(());
+                }
+            };
             let virt = phys_to_virt(frame) as *mut u8;
             unsafe { core::ptr::write_bytes(virt, 0, PAGE_SIZE) };
             frames.push(frame);
         }
-        Arc::new(Self {
+        Ok(Arc::new(Self {
             koid,
             name: Mutex::new(String::new()),
             size: Mutex::new(size),
             frames: Mutex::new(frames),
-        })
+        }))
     }
 
     /// Number of 4 KiB pages backing this VMO.
@@ -361,20 +377,33 @@ impl Vmo {
 
     /// Grow the VMO to `new_size` bytes, allocating new physical frames as
     /// needed. Shrinking is not supported in the MVP.
-    pub fn set_size(&self, new_size: usize) {
+    ///
+    /// Returns `Err(())` on out-of-memory instead of panicking (see
+    /// [`Vmo::new`]'s docs for why). On failure, the VMO is left at
+    /// whatever size it successfully grew to before running out of frames
+    /// (still fully valid/usable at that smaller size) rather than in some
+    /// half-initialized state.
+    pub fn set_size(&self, new_size: usize) -> Result<(), ()> {
         let mut size = self.size.lock();
         if new_size <= *size {
-            return;
+            return Ok(());
         }
         let mut frames = self.frames.lock();
         let needed_pages = new_size.div_ceil(PAGE_SIZE);
         while frames.len() < needed_pages {
-            let frame = huesos_pmm::alloc_frame().expect("VMO: out of physical memory");
+            let frame = match huesos_pmm::alloc_frame() {
+                Ok(f) => f,
+                Err(_) => {
+                    *size = frames.len() * PAGE_SIZE;
+                    return Err(());
+                }
+            };
             let virt = phys_to_virt(frame) as *mut u8;
             unsafe { core::ptr::write_bytes(virt, 0, PAGE_SIZE) };
             frames.push(frame);
         }
         *size = new_size;
+        Ok(())
     }
 }
 
@@ -630,4 +659,127 @@ pub fn init() {
     let root = Job::root();
     *ROOT_JOB.lock() = Some(root.clone());
     register_object(root);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    extern crate std;
+    use std::vec;
+
+    // Like huesos-pmm's own tests, these run against the real global PMM
+    // and phys_to_virt state, so they're serialized with a lock and each
+    // sets up a fresh PMM backed by a real heap buffer treated as if
+    // address 0 were that buffer's address (hhdm_offset = buffer's addr,
+    // phys_to_virt = identity + hhdm_offset).
+    static TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn with_fresh_env<R>(total_bytes: u64, f: impl FnOnce() -> R) -> R {
+        let _guard = TEST_LOCK.lock();
+        let mut backing = vec![0u8; total_bytes as usize];
+        let hhdm_offset = backing.as_mut_ptr() as u64;
+        let regions = [huesos_pmm::MemoryRegion {
+            base: 0,
+            length: total_bytes,
+            usable: true,
+        }];
+        unsafe {
+            huesos_pmm::init(&regions, hhdm_offset);
+        }
+        // `set_phys_to_virt` only accepts a plain `fn` (no captures), so we
+        // route the per-test hhdm_offset through a static instead of a
+        // closure.
+        TEST_HHDM_OFFSET.store(hhdm_offset, Ordering::SeqCst);
+        set_phys_to_virt(|phys| TEST_HHDM_OFFSET.load(Ordering::SeqCst) + phys);
+        f()
+    }
+
+    static TEST_HHDM_OFFSET: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn vmo_create_read_write_roundtrip() {
+        with_fresh_env(1024 * 1024, || {
+            let vmo = Vmo::new(100).expect("small VMO should always succeed");
+            let payload = b"hello vmo";
+            let written = vmo.write(0, payload);
+            assert_eq!(written, payload.len());
+
+            let mut readback = [0u8; 9];
+            let read = vmo.read(0, &mut readback);
+            assert_eq!(read, payload.len());
+            assert_eq!(&readback, payload);
+        });
+    }
+
+    #[test]
+    fn vmo_create_fails_gracefully_on_oom_instead_of_panicking() {
+        // A tiny backing pool: a handful of frames plus whatever the PMM's
+        // own bitmap consumes. Requesting a VMO far bigger than that must
+        // return Err, not panic/abort the process (which, in the real
+        // kernel, means "not take down the whole machine").
+        with_fresh_env(huesos_pmm::FRAME_SIZE * 4, || {
+            let huge = Vmo::new(1024 * 1024 * 1024); // 1 GiB, way more than 4 frames
+            assert!(huge.is_err(), "oversized VMO allocation should fail cleanly");
+
+            // The PMM must not have leaked partial allocations from the
+            // failed attempt: we should still be able to allocate whatever
+            // frames were actually available.
+            let free_before = huesos_pmm::free_frames();
+            assert!(free_before > 0, "failed VMO::new must not leak frames");
+        });
+    }
+
+    #[test]
+    fn vmo_set_size_grows_and_fails_gracefully_on_oom() {
+        with_fresh_env(huesos_pmm::FRAME_SIZE * 8, || {
+            let vmo = Vmo::new(4096).expect("initial small VMO should succeed");
+            assert_eq!(vmo.size(), 4096);
+
+            // Grow within available memory.
+            vmo.set_size(3 * 4096).expect("growing within budget should succeed");
+            assert_eq!(vmo.size(), 3 * 4096);
+
+            // Now try to grow far beyond what's left; must fail cleanly,
+            // not panic, and must leave the VMO at a consistent (if
+            // smaller-than-requested) size rather than corrupt state.
+            let result = vmo.set_size(10 * 1024 * 1024);
+            assert!(result.is_err());
+            assert!(vmo.size() >= 3 * 4096, "size must not regress below what succeeded");
+        });
+    }
+
+    #[test]
+    fn handle_table_reserves_slot_zero_as_invalid() {
+        let table = HandleTable::new();
+        let h = Handle::new(Koid(42), Rights::DEFAULT);
+        let hv = table.add(h);
+        assert_ne!(hv, INVALID_HANDLE, "first real handle must not be INVALID_HANDLE (0)");
+        assert_eq!(table.get(hv), Some(h));
+        assert_eq!(table.get(INVALID_HANDLE), None);
+    }
+
+    #[test]
+    fn handle_table_reuses_freed_slots() {
+        let table = HandleTable::new();
+        let h1 = table.add(Handle::new(Koid(1), Rights::DEFAULT));
+        let _h2 = table.add(Handle::new(Koid(2), Rights::DEFAULT));
+        table.remove(h1);
+        let h3 = table.add(Handle::new(Koid(3), Rights::DEFAULT));
+        assert_eq!(h3, h1, "freed handle slots should be reused, not leaked");
+    }
+
+    #[test]
+    fn channel_pair_delivers_messages_to_the_peer_not_the_sender() {
+        let (a, b) = Channel::pair();
+        a.send(ChannelMessage {
+            data: alloc::vec![1, 2, 3],
+            handles: Vec::new(),
+        });
+        // The regression this guards against: sys_channel_create used to
+        // create two disconnected Channel::new() objects instead of a real
+        // pair, so a message sent on `a` was never visible on `b`.
+        assert!(a.recv().is_none(), "a must not receive its own message");
+        let msg = b.recv().expect("b must receive what a sent");
+        assert_eq!(msg.data, alloc::vec![1, 2, 3]);
+    }
 }
