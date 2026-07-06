@@ -82,7 +82,7 @@ pub fn syscall_init() {
 }
 
 fn handle_irq_event(irq: u8, data: u64) {
-    if let Some(interrupt) = huesos_object::lookup_interrupt_by_irq(irq) {
+    for interrupt in huesos_object::lookup_interrupts_by_irq(irq) {
         interrupt.signal(huesos_abi::PORT_PACKET_INTERRUPT, data);
     }
 }

@@ -223,7 +223,10 @@ static OBJECT_REGISTRY: Mutex<BTreeMap<Koid, Arc<dyn KernelObject>>> = Mutex::ne
 /// `Arc<Process>` rather than a type-erased object reference.
 static PROCESS_REGISTRY: Mutex<BTreeMap<Koid, Arc<Process>>> = Mutex::new(BTreeMap::new());
 /// Typed interrupt registry indexed by IRQ number for fast IRQ bridge lookup.
-static INTERRUPT_REGISTRY: Mutex<BTreeMap<u8, Arc<Interrupt>>> = Mutex::new(BTreeMap::new());
+/// Multiple userspace interrupt objects may observe the same IRQ during the
+/// migration window (e.g. DriverManager diagnostics plus a temporary terminal
+/// keyboard consumer), so each IRQ maps to a fanout list.
+static INTERRUPT_REGISTRY: Mutex<BTreeMap<u8, Vec<Arc<Interrupt>>>> = Mutex::new(BTreeMap::new());
 
 /// Register a kernel object globally.
 pub fn register_object(obj: Arc<dyn KernelObject>) {
@@ -252,13 +255,19 @@ pub fn lookup_process(koid: Koid) -> Option<Arc<Process>> {
 pub fn register_interrupt(interrupt: Arc<Interrupt>) {
     INTERRUPT_REGISTRY
         .lock()
-        .insert(interrupt.irq(), interrupt.clone());
+        .entry(interrupt.irq())
+        .or_insert_with(Vec::new)
+        .push(interrupt.clone());
     register_object(interrupt);
 }
 
-/// Lookup an interrupt object by IRQ number.
-pub fn lookup_interrupt_by_irq(irq: u8) -> Option<Arc<Interrupt>> {
-    INTERRUPT_REGISTRY.lock().get(&irq).cloned()
+/// Lookup all interrupt objects registered for an IRQ number.
+pub fn lookup_interrupts_by_irq(irq: u8) -> Vec<Arc<Interrupt>> {
+    INTERRUPT_REGISTRY
+        .lock()
+        .get(&irq)
+        .cloned()
+        .unwrap_or_else(Vec::new)
 }
 
 /// Remove an object from the global registry (called on final handle close
@@ -267,9 +276,11 @@ pub fn lookup_interrupt_by_irq(irq: u8) -> Option<Arc<Interrupt>> {
 pub fn unregister_object(koid: Koid) {
     OBJECT_REGISTRY.lock().remove(&koid);
     PROCESS_REGISTRY.lock().remove(&koid);
-    INTERRUPT_REGISTRY
-        .lock()
-        .retain(|_, interrupt| interrupt.koid() != koid);
+    let mut interrupts = INTERRUPT_REGISTRY.lock();
+    for list in interrupts.values_mut() {
+        list.retain(|interrupt| interrupt.koid() != koid);
+    }
+    interrupts.retain(|_, list| !list.is_empty());
 }
 
 /// Current process (set by the scheduler on every context switch).
