@@ -15,7 +15,9 @@ extern crate alloc;
 use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
-use huesos_abi::{ErrorCode, FramebufferBlitArgs, FramebufferInfo, HandleValue, INVALID_HANDLE};
+use huesos_abi::{
+    ErrorCode, FramebufferBlitArgs, FramebufferInfo, HandleValue, VmarMapArgs, INVALID_HANDLE,
+};
 use huesos_object::{Handle, KernelObject, KernelObjectExt, Rights};
 use spin::Mutex;
 
@@ -32,9 +34,14 @@ static DEBUG_WRITE_FN: Mutex<Option<fn(&[u8])>> = Mutex::new(None);
 /// Kernel callback type used by the syscall layer to create a suspended process.
 pub type ProcessCreateFn =
     fn(&str) -> Result<(Arc<huesos_object::Process>, Arc<huesos_object::Vmar>), ErrorCode>;
+/// Kernel callback type used by the syscall layer to map a VMO into a VMAR.
+pub type VmarMapFn =
+    fn(&huesos_object::Vmar, &huesos_object::Vmo, VmarMapArgs) -> Result<u64, ErrorCode>;
 
 /// Global process-create callback (set by the kernel process layer).
 static PROCESS_CREATE_FN: Mutex<Option<ProcessCreateFn>> = Mutex::new(None);
+/// Global VMAR-map callback (set by the kernel process layer).
+static VMAR_MAP_FN: Mutex<Option<VmarMapFn>> = Mutex::new(None);
 
 /// Set the yield function. Called once by kernel init.
 pub fn set_yield_fn(f: fn()) {
@@ -54,6 +61,11 @@ pub fn set_debug_write_fn(f: fn(&[u8])) {
 /// Set the process-create function. Called once by kernel init.
 pub fn set_process_create_fn(f: ProcessCreateFn) {
     *PROCESS_CREATE_FN.lock() = Some(f);
+}
+
+/// Set the VMAR-map function. Called once by kernel init.
+pub fn set_vmar_map_fn(f: VmarMapFn) {
+    *VMAR_MAP_FN.lock() = Some(f);
 }
 
 /// Dispatch a syscall by number. This is architecture-independent; the
@@ -99,9 +111,8 @@ pub fn dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> Syscal
             a3 as *mut HandleValue,
             a4 as *mut HandleValue,
         ),
-        S::ProcessWait | S::ThreadCreate | S::ThreadStart | S::VmarMap => {
-            Err(ErrorCode::NotSupported)
-        }
+        S::VmarMap => sys_vmar_map(a1 as *const VmarMapArgs),
+        S::ProcessWait | S::ThreadCreate | S::ThreadStart => Err(ErrorCode::NotSupported),
     }
 }
 
@@ -150,6 +161,38 @@ fn sys_process_create(
     Ok(0)
 }
 
+
+
+fn sys_vmar_map(args_ptr: *const VmarMapArgs) -> SyscallResult {
+    if args_ptr.is_null() {
+        return Err(ErrorCode::InvalidArgs);
+    }
+    let args = unsafe { core::ptr::read_unaligned(args_ptr) };
+
+    let proc = current_proc()?;
+    let vmar_handle = proc.handles.get(args.vmar).ok_or(ErrorCode::BadHandle)?;
+    if !vmar_handle.has_rights(Rights::WRITE) {
+        return Err(ErrorCode::AccessDenied);
+    }
+    let vmo_handle = proc.handles.get(args.vmo).ok_or(ErrorCode::BadHandle)?;
+    if !vmo_handle.has_rights(Rights::MAP) {
+        return Err(ErrorCode::AccessDenied);
+    }
+
+    let vmar_obj = huesos_object::lookup_object(vmar_handle.koid).ok_or(ErrorCode::BadHandle)?;
+    let vmar = vmar_obj
+        .downcast_ref::<huesos_object::Vmar>()
+        .ok_or(ErrorCode::WrongType)?;
+
+    let vmo_obj = huesos_object::lookup_object(vmo_handle.koid).ok_or(ErrorCode::BadHandle)?;
+    let vmo = vmo_obj
+        .downcast_ref::<huesos_object::Vmo>()
+        .ok_or(ErrorCode::WrongType)?;
+
+    let map = (*VMAR_MAP_FN.lock()).ok_or(ErrorCode::NotSupported)?;
+    let mapped = map(vmar, vmo, args)?;
+    Ok(mapped as i64)
+}
 
 fn current_proc() -> Result<alloc::sync::Arc<huesos_object::Process>, ErrorCode> {
     huesos_object::current_process().ok_or(ErrorCode::BadHandle)
