@@ -33,11 +33,13 @@ roadmap covers what's next, roughly in priority order.
 ## Short Term
 
 ### 4. Multiple/dynamic userspace processes
-- **Current**: exactly one embedded userspace binary (`huesos-init`),
-  loaded once at boot.
-- **Needed**: a `ProcessCreate`/`ProcessSpawn` syscall so `init` can launch
-  further processes from VMOs (e.g. received over a channel from a future
-  VFS), not just the kernel spawning a single hardcoded binary.
+- **Current**: MVP split launch exists (`ProcessCreate`, `VmarMap`,
+  `ThreadCreate`, `ThreadStart`) and init can launch embedded child ELF
+  images through `libcanvas::process::spawn_elf`.
+- **Needed**: finish the process lifecycle around this path: blocking waits
+  or port signals for exit, teardown/reaping, richer handle-transfer
+  semantics, and eventually loading ELF images from a VFS instead of
+  build-time `include_bytes!`.
 
 ### 5. Handle transfer semantics
 - **Current**: `ChannelWrite` copies `Handle` values into the message but

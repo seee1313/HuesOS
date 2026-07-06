@@ -40,9 +40,10 @@ This isn't a style preference — it's a real safety boundary:
   access to kernel memory, no access to other processes' memory, and no
   direct hardware access — everything happens through syscalls, mediated
   by `libcanvas`.
-- There is currently **no dynamic process spawning syscall** — see
-  [Adding a new program](#adding-a-new-program-to-the-build) below for how
-  a program actually gets onto a booted system today.
+- Dynamic process launch is available through `libcanvas::process::spawn_elf`,
+  backed by `ProcessCreate`, `VmarMap`, `ThreadCreate`, and `ThreadStart`.
+  There is still no filesystem-backed program namespace: init embeds child
+  ELF bytes at build time and launches them explicitly.
 
 ## Minimal example
 
@@ -191,29 +192,22 @@ cargo build --release
 
 ## Adding a new program to the build
 
-There is currently **one** embedded userspace program: `huesos-init`,
-built by `huesos-kernel`'s `build.rs` and baked into the kernel image via
-`include_bytes!` (see that file's doc comment for exactly how). This is
-intentional MVP scope — there's no dynamic process-spawning syscall yet
-(no `ProcessSpawn`/`ProcessCreate`), so "the kernel embeds one binary and
-runs it" is the whole story today.
+The kernel still embeds only `huesos-init` directly. `huesos-kernel`'s
+`build.rs` now also builds child userspace programs such as
+`huesos-driver-manager` and `huesos-terminal`, then passes their ELF paths
+into init at compile time. Init embeds those bytes and launches them with
+`libcanvas::process::spawn_elf`.
 
-To experiment with your own program, you have two options:
+To add a program today:
 
-- **Easiest: edit `huesos-init` directly.** Its `_start` is exactly the
-  kind of code you'd write for any other HuesOS program — replace its
-  body with your own logic.
-- **Cleaner: add a sibling crate and point `build.rs` at it.** Create
-  `crates/huesos-userspace/your-program/` with the same shape as `init/`
-  (`Cargo.toml`, `.cargo/config.toml`, `src/main.rs`), then edit
-  `crates/huesos-kernel/build.rs` to build and `include_bytes!` your
-  binary instead of (or in addition to — you'd need a second
-  `include_bytes!` and a way to pick which one `spawn_init_process`
-  loads) `huesos-init`'s.
+1. Create `crates/huesos-userspace/your-program/` with the same shape as
+   `driver-manager/` or `terminal/`.
+2. Teach `crates/huesos-kernel/build.rs` to build it and pass its binary
+   path to init.
+3. Add an `include_bytes!(env!("...") )` in init and call
+   `libcanvas::process::spawn_elf`.
 
-Real multi-process support (a `ProcessSpawn` syscall, a way to load
-arbitrary VMO-backed ELF images at runtime rather than only at kernel
-build time) is tracked in `docs/ROADMAP.md`.
+Filesystem-backed discovery/loading is still future work.
 
 ## Common mistakes (and what happens when you make them)
 
