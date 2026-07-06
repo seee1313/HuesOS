@@ -78,13 +78,23 @@ pub enum Syscall {
     /// the operation needs more fields than the 5-register syscall ABI can
     /// comfortably carry.
     VmarMap = 18,
+    /// Create a Port object, a non-blocking userspace-visible event queue.
+    PortCreate = 19,
+    /// Read one packet from a Port object. Returns `ErrorCode::ShouldWait`
+    /// if no packet is queued.
+    PortRead = 20,
+    /// Create an Interrupt object for a kernel IRQ bridge. The first
+    /// implementation supports IRQ1 (keyboard) only.
+    InterruptCreate = 21,
+    /// Bind an Interrupt object to a Port so IRQ events enqueue Port packets.
+    InterruptBindPort = 22,
 }
 
 impl Syscall {
     /// Total number of defined syscalls (i.e. one past the highest
     /// currently-assigned number). The dispatcher uses this to reject
     /// obviously-out-of-range numbers before a `match`.
-    pub const COUNT: u64 = 19;
+    pub const COUNT: u64 = 23;
 
     /// Convert a raw syscall number back into a [`Syscall`], if valid.
     pub const fn from_raw(n: u64) -> Option<Self> {
@@ -108,6 +118,10 @@ impl Syscall {
             16 => Self::ThreadCreate,
             17 => Self::ThreadStart,
             18 => Self::VmarMap,
+            19 => Self::PortCreate,
+            20 => Self::PortRead,
+            21 => Self::InterruptCreate,
+            22 => Self::InterruptBindPort,
             _ => return None,
         })
     }
@@ -296,6 +310,25 @@ pub struct FramebufferBlitArgs {
     pub dst_x: u32,
     /// Destination Y coordinate on the real framebuffer.
     pub dst_y: u32,
+}
+
+
+/// Port packet type for interrupt notifications.
+pub const PORT_PACKET_INTERRUPT: u32 = 1;
+
+/// Fixed-size event packet returned by [`Syscall::PortRead`].
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct PortPacket {
+    /// User-supplied key associated with the event source when it was bound
+    /// to the Port.
+    pub key: u64,
+    /// Packet type. See `PORT_PACKET_*` constants.
+    pub packet_type: u32,
+    /// Status code associated with the packet source. Zero means success.
+    pub status: i32,
+    /// Source-specific payload words.
+    pub data: [u64; 4],
 }
 
 /// Arguments for [`Syscall::VmarMap`], passed by pointer because mapping a
