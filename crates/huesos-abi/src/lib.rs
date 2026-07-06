@@ -58,13 +58,33 @@ pub enum Syscall {
     /// video memory — it never gets a mapping of the framebuffer itself,
     /// only this narrow, bounds-checked copy operation.
     FramebufferBlit = 13,
+    /// Create a suspended userspace process object and its root VMAR.
+    ///
+    /// Skeleton ABI for the approved Zircon-like launch path: the process is
+    /// created first, memory is mapped into its root VMAR separately, then a
+    /// thread is created and started explicitly.
+    ProcessCreate = 14,
+    /// Query/wait for a process exit code. Until blocking waits land, the
+    /// implementation is expected to return `ErrorCode::ShouldWait` while
+    /// the process is still running.
+    ProcessWait = 15,
+    /// Create a suspended thread object in an existing process.
+    ThreadCreate = 16,
+    /// Start a suspended thread at an entry point/stack pointer. The kernel
+    /// creates the child bootstrap channel endpoint as handle 1 in the child
+    /// process and returns the parent endpoint to the caller.
+    ThreadStart = 17,
+    /// Map a VMO into a VMAR. Arguments are passed via `VmarMapArgs` because
+    /// the operation needs more fields than the 5-register syscall ABI can
+    /// comfortably carry.
+    VmarMap = 18,
 }
 
 impl Syscall {
     /// Total number of defined syscalls (i.e. one past the highest
     /// currently-assigned number). The dispatcher uses this to reject
     /// obviously-out-of-range numbers before a `match`.
-    pub const COUNT: u64 = 14;
+    pub const COUNT: u64 = 19;
 
     /// Convert a raw syscall number back into a [`Syscall`], if valid.
     pub const fn from_raw(n: u64) -> Option<Self> {
@@ -83,6 +103,11 @@ impl Syscall {
             11 => Self::DebugWrite,
             12 => Self::FramebufferInfo,
             13 => Self::FramebufferBlit,
+            14 => Self::ProcessCreate,
+            15 => Self::ProcessWait,
+            16 => Self::ThreadCreate,
+            17 => Self::ThreadStart,
+            18 => Self::VmarMap,
             _ => return None,
         })
     }
@@ -163,6 +188,9 @@ impl ErrorCode {
 pub type HandleValue = u32;
 /// Reserved value meaning "no handle" / invalid handle.
 pub const INVALID_HANDLE: HandleValue = 0;
+/// Initial bootstrap channel handle number installed in a newly-started
+/// child process by `Syscall::ThreadStart`.
+pub const BOOTSTRAP_HANDLE: HandleValue = 1;
 
 /// Rights bitmask, mirrored from `huesos-object::Rights` numerically (kept
 /// here too so userspace doesn't need to depend on the kernel-only object
@@ -234,4 +262,27 @@ pub struct FramebufferBlitArgs {
     pub dst_x: u32,
     /// Destination Y coordinate on the real framebuffer.
     pub dst_y: u32,
+}
+
+/// Arguments for [`Syscall::VmarMap`], passed by pointer because mapping a
+/// VMO needs more than the syscall ABI's five register-sized arguments.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct VmarMapArgs {
+    /// Handle to the target VMAR.
+    pub vmar: HandleValue,
+    /// Handle to the VMO being mapped.
+    pub vmo: HandleValue,
+    /// Byte offset into the VMO.
+    pub vmo_offset: u64,
+    /// Requested destination virtual address. A future implementation may
+    /// interpret zero as "kernel chooses" unless an explicit fixed-address
+    /// flag is defined for `flags`.
+    pub addr: u64,
+    /// Mapping length in bytes.
+    pub len: u64,
+    /// Mapping options/permissions. The exact bit layout is intentionally
+    /// left to the VMAR implementation commit so this skeleton only reserves
+    /// the ABI shape, not final policy.
+    pub flags: u32,
 }

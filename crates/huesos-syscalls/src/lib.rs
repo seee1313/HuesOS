@@ -80,6 +80,9 @@ pub fn dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> Syscal
         S::DebugWrite => sys_debug_write(a1 as *const u8, a2 as usize),
         S::FramebufferInfo => sys_framebuffer_info(a1 as *mut FramebufferInfo),
         S::FramebufferBlit => sys_framebuffer_blit(a1 as *const FramebufferBlitArgs),
+        S::ProcessCreate | S::ProcessWait | S::ThreadCreate | S::ThreadStart | S::VmarMap => {
+            Err(ErrorCode::NotSupported)
+        }
     }
 }
 
