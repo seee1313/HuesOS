@@ -2,6 +2,10 @@
 # Boot the HuesOS ISO in QEMU under UEFI (OVMF).
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+cd "$REPO_ROOT"
+
 PROFILE="${1:-debug}"
 ISO="build/huesos.iso"
 

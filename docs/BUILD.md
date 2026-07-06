@@ -39,14 +39,20 @@ brew install qemu xorriso mtools
 (OVMF firmware images need to be sourced separately on macOS, e.g. via the
 `qemu` formula's bundled EDK2 or a manual download.)
 
-### Fetch Limine
+### Limine
 
-The build scripts expect a binary Limine release checked out at
-`~/limine-bin` (override with `LIMINE_BIN=/path/to/limine`):
+The prebuilt Limine binaries needed to make a bootable ISO (bootloader
+stages, `BOOTX64.EFI`, etc.) are **vendored directly in this repository**
+under [`third_party/limine/`](../third_party/limine), so there is nothing
+to download separately — `make iso` works right after cloning.
+
+If you want to use a different/newer Limine release instead, point
+`LIMINE_BIN` at it:
 
 ```bash
 git clone --branch v9.x-binary --depth 1 \
-    https://github.com/limine-bootloader/limine.git ~/limine-bin
+    https://github.com/limine-bootloader/limine.git /tmp/limine-bin
+LIMINE_BIN=/tmp/limine-bin make iso
 ```
 
 ## Build
