@@ -3,6 +3,7 @@
 
 use alloc::boxed::Box;
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 use huesos_arch::gdt;
 use huesos_arch::paging::{flags, AddressSpace};
 use huesos_abi::{vmar_flags, ErrorCode, VmarMapArgs};
@@ -274,16 +275,36 @@ pub fn spawn_from_elf(name: &str, elf_bytes: &[u8]) -> SpawnedProcess {
 /// process's real entry point and never return (the `iretq` inside
 /// `enter_userspace` does that).
 ///
-/// Reads the target RIP/RSP out of thread-local-ish statics set by
-/// `spawn_user_thread` just before scheduling, since `Context::new` only
-/// supports a plain `fn() -> !` with no arguments.
-pub static PENDING_ENTRY: spin::Mutex<Option<(u64, u64)>> = spin::Mutex::new(None);
+/// Reads the target RIP/RSP out of per-task pending-entry records set by
+/// `spawn_user_thread` just before the task is inserted into the scheduler.
+/// `Context::new` only supports a plain `fn() -> !` with no arguments, so
+/// the trampoline resolves its own task id and consumes the corresponding
+/// pending record on first run.
+struct PendingUserEntry {
+    task_id: u64,
+    entry: u64,
+    rsp: u64,
+}
+
+static PENDING_USER_ENTRIES: spin::Mutex<Vec<PendingUserEntry>> = spin::Mutex::new(Vec::new());
+
+/// Queue the first userspace RIP/RSP pair for a just-created scheduler task.
+pub fn queue_user_entry(task_id: u64, entry: u64, rsp: u64) {
+    PENDING_USER_ENTRIES.lock().push(PendingUserEntry { task_id, entry, rsp });
+}
+
+fn take_user_entry(task_id: u64) -> Option<(u64, u64)> {
+    let mut entries = PENDING_USER_ENTRIES.lock();
+    let pos = entries.iter().position(|pending| pending.task_id == task_id)?;
+    let pending = entries.swap_remove(pos);
+    Some((pending.entry, pending.rsp))
+}
 
 /// Trampoline used as the initial RIP for user tasks.
 pub extern "C" fn user_entry_trampoline() -> ! {
-    let (entry, rsp) = PENDING_ENTRY
-        .lock()
-        .take()
+    let task_id = crate::scheduler::current_task_id()
+        .expect("user_entry_trampoline invoked without a current task id");
+    let (entry, rsp) = take_user_entry(task_id)
         .expect("user_entry_trampoline invoked without a pending entry");
 
     let sel = gdt::selectors();
