@@ -54,9 +54,10 @@ All of the above is exercised live by `huesos-init` on every boot — now
 built entirely against `libcanvas`, not raw syscalls — which creates a
 VMO, writes to it, reads it back, creates a channel pair, sends/receives a
 message, then launches the userspace DriverManager and framebuffer
-terminal skeletons as child processes. The terminal paints the framebuffer
-from userspace via `Canvas`. Historical framebuffer test output is shown
-in `tools/fontgen/qemu_screenshot.png`.
+terminal as child processes. The terminal paints the framebuffer from
+userspace via `Canvas` and runs a built-in mini shell with internal
+commands only. Historical framebuffer test output is shown in
+`tools/fontgen/qemu_screenshot.png`.
 
 ## Known Limitations
 

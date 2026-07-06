@@ -27,9 +27,11 @@ migration so implementation work stays explicit and reviewable.
 - `ThreadStart` installs the child bootstrap channel endpoint at handle 1, returns the parent endpoint, and schedules the new user task.
 - `libcanvas::process::spawn_elf` is the userspace static-ELF launcher used by init.
 - Kernel build now builds `driver-manager` and `terminal`, embeds their ELF bytes into init, and embeds only init into the kernel.
-- Current DriverManager/terminal are skeleton services: DriverManager sends a ready message, binds keyboard IRQ1 to a userspace Port via an Interrupt object, and logs raw scancode packets; terminal paints a framebuffer banner and parks.
+- DriverManager sends a ready message, binds keyboard IRQ1 to a userspace Port via an Interrupt object, and logs raw scancode packets.
+- Terminal now runs a built-in framebuffer mini shell with internal commands only. Lexing uses `logos`, parsing uses a `Peekable` token iterator, and the shell builds an AST before dispatch.
 - First Port/Interrupt ABI is non-blocking: `PortCreate`, `PortRead`, `InterruptCreate`, and `InterruptBindPort`.
 - The first IRQ bridge supports keyboard IRQ1 only; packets use `PORT_PACKET_INTERRUPT` with data `[irq, scancode, count, 0]`.
+- During the migration window, IRQ bridge interrupts fan out to multiple userspace consumers so DriverManager diagnostics and the temporary terminal keyboard consumer can coexist. The next cleanup step is replacing terminal's direct IRQ consumer with a DriverManager keyboard-service IPC protocol.
 - Work must be split into small commits.
 
 ## Immediate open decisions before code changes
