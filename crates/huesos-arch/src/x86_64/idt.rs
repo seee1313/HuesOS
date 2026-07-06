@@ -103,6 +103,7 @@ extern "x86-interrupt" fn keyboard_handler(_stack_frame: InterruptStackFrame) {
     unsafe {
         super::interrupts::PICS.lock().notify_end_of_interrupt(33);
     }
+    crate::x86_64::irq_callback::emit(1, scancode as u64);
 }
 
 fn print_hex(v: u64) {
