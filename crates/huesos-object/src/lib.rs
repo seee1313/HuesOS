@@ -222,6 +222,8 @@ static OBJECT_REGISTRY: Mutex<BTreeMap<Koid, Arc<dyn KernelObject>>> = Mutex::ne
 /// Typed process registry for kernel subsystems that must hold an owning
 /// `Arc<Process>` rather than a type-erased object reference.
 static PROCESS_REGISTRY: Mutex<BTreeMap<Koid, Arc<Process>>> = Mutex::new(BTreeMap::new());
+/// Typed interrupt registry indexed by IRQ number for fast IRQ bridge lookup.
+static INTERRUPT_REGISTRY: Mutex<BTreeMap<u8, Arc<Interrupt>>> = Mutex::new(BTreeMap::new());
 
 /// Register a kernel object globally.
 pub fn register_object(obj: Arc<dyn KernelObject>) {
@@ -245,12 +247,29 @@ pub fn lookup_process(koid: Koid) -> Option<Arc<Process>> {
     PROCESS_REGISTRY.lock().get(&koid).cloned()
 }
 
+/// Register an interrupt in both the type-erased object registry and the
+/// typed IRQ registry.
+pub fn register_interrupt(interrupt: Arc<Interrupt>) {
+    INTERRUPT_REGISTRY
+        .lock()
+        .insert(interrupt.irq(), interrupt.clone());
+    register_object(interrupt);
+}
+
+/// Lookup an interrupt object by IRQ number.
+pub fn lookup_interrupt_by_irq(irq: u8) -> Option<Arc<Interrupt>> {
+    INTERRUPT_REGISTRY.lock().get(&irq).cloned()
+}
+
 /// Remove an object from the global registry (called on final handle close
 /// in a full refcounted implementation; for the MVP this is invoked
 /// explicitly by `ProcessExit`/object-specific teardown).
 pub fn unregister_object(koid: Koid) {
     OBJECT_REGISTRY.lock().remove(&koid);
     PROCESS_REGISTRY.lock().remove(&koid);
+    INTERRUPT_REGISTRY
+        .lock()
+        .retain(|_, interrupt| interrupt.koid() != koid);
 }
 
 /// Current process (set by the scheduler on every context switch).
@@ -686,11 +705,18 @@ pub struct Port {
 }
 
 /// A packet queued to a port.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PortPacket {
     /// Key used to identify the source.
     pub key: u64,
-    /// Payload bytes.
-    pub payload: Vec<u8>,
+    /// Packet type. Mirrors `huesos_abi::PORT_PACKET_*` values at the syscall
+    /// boundary without making this arch-independent crate depend on the ABI
+    /// crate.
+    pub packet_type: u32,
+    /// Status associated with this event.
+    pub status: i32,
+    /// Fixed-size source-specific payload.
+    pub data: [u64; 4],
 }
 
 impl Port {
@@ -719,6 +745,83 @@ impl Port {
 impl KernelObject for Port {
     fn object_type(&self) -> ObjectType {
         ObjectType::Port
+    }
+    fn koid(&self) -> Koid {
+        self.koid
+    }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
+
+/// Binding from an interrupt object to a port.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct InterruptBinding {
+    /// Destination port koid.
+    pub port: Koid,
+    /// User-supplied key copied into queued packets.
+    pub key: u64,
+}
+
+/// Interrupt — userspace-visible IRQ bridge object.
+pub struct Interrupt {
+    koid: Koid,
+    irq: u8,
+    binding: Mutex<Option<InterruptBinding>>,
+    count: AtomicU64,
+}
+
+impl Interrupt {
+    /// Create a new interrupt object for `irq`.
+    pub fn new(irq: u8) -> Arc<Self> {
+        Arc::new(Self {
+            koid: alloc_koid(),
+            irq,
+            binding: Mutex::new(None),
+            count: AtomicU64::new(0),
+        })
+    }
+
+    /// IRQ number represented by this object.
+    pub const fn irq(&self) -> u8 {
+        self.irq
+    }
+
+    /// Bind this interrupt to `port` with a user-supplied `key`.
+    pub fn bind_port(&self, port: Koid, key: u64) {
+        *self.binding.lock() = Some(InterruptBinding { port, key });
+    }
+
+    /// Signal this interrupt and queue a packet to the bound port, if any.
+    pub fn signal(&self, packet_type: u32, data0: u64) {
+        let count = self.count.fetch_add(1, Ordering::Relaxed) + 1;
+        let Some(binding) = *self.binding.lock() else {
+            return;
+        };
+        let Some(port_obj) = lookup_object(binding.port) else {
+            return;
+        };
+        let Some(port) = port_obj.downcast_ref::<Port>() else {
+            return;
+        };
+        port.queue(PortPacket {
+            key: binding.key,
+            packet_type,
+            status: 0,
+            data: [self.irq as u64, data0, count, 0],
+        });
+    }
+
+    /// Number of times this interrupt object has been signalled.
+    pub fn count(&self) -> u64 {
+        self.count.load(Ordering::Relaxed)
+    }
+}
+
+impl KernelObject for Interrupt {
+    fn object_type(&self) -> ObjectType {
+        ObjectType::Interrupt
     }
     fn koid(&self) -> Koid {
         self.koid
@@ -970,6 +1073,27 @@ mod tests {
     }
 
 
+
+
+    #[test]
+    fn interrupt_signal_queues_port_packet() {
+        let port = Port::new();
+        let port_koid = port.koid();
+        register_object(port.clone());
+
+        let interrupt = Interrupt::new(1);
+        interrupt.bind_port(port_koid, 0xabc);
+        interrupt.signal(1, 0x1e);
+
+        let packet = port.read().expect("interrupt should queue one packet");
+        assert_eq!(packet.key, 0xabc);
+        assert_eq!(packet.packet_type, 1);
+        assert_eq!(packet.data[0], 1);
+        assert_eq!(packet.data[1], 0x1e);
+        assert_eq!(packet.data[2], 1);
+
+        unregister_object(port_koid);
+    }
 
     #[test]
     fn register_process_populates_typed_registry() {
