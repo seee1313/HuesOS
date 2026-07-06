@@ -1,0 +1,9 @@
+[package]
+name = "libcanvas"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+huesos-abi = { path = "../../huesos-abi" }
+
+[workspace]
