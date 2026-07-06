@@ -36,20 +36,35 @@ and [docs/ROADMAP.md](docs/ROADMAP.md) for what's next.
 - ✅ VMOs backed by real physical page frames (not a `Vec<u8>` placeholder)
 - ✅ Channel IPC with real connected pairs (`Channel::pair()`)
 - ✅ PS/2 keyboard driver (scancode set 1 → ASCII) and PIT timer driver
+- ✅ Real framebuffer driver (`huesos-fb`): pixel/rect/text/blit
+  primitives, bounds-checked against untrusted userspace input
+- ✅ `libcanvas`: a safe, `ntdll`/`libc`-style userspace syscall library —
+  application code never writes `asm!("syscall")` directly; every syscall
+  is a typed, `Result`-returning wrapper with RAII handle lifetimes.
+  Userspace draws to the screen via a VMO-backed `Canvas` + a
+  bounds-checked `FramebufferBlit` syscall — it never gets a mapping of
+  real video memory.
 
-All of the above is exercised live by `huesos-init` on every boot: it
-performs real `syscall` instructions from ring3 to create a VMO, write to
-it, read it back, create a channel pair, send/receive a message, and exit
-cleanly — verified in QEMU/OVMF in both debug and release builds.
+All of the above is exercised live by `huesos-init` on every boot — now
+built entirely against `libcanvas`, not raw syscalls — which creates a
+VMO, writes to it, reads it back, creates a channel pair, sends/receives a
+message, draws a color-bar test pattern + text to the real screen via
+`Canvas`, and exits cleanly. Verified in QEMU/OVMF in both debug and
+release builds; see `tools/fontgen/qemu_screenshot.png` for an actual
+screenshot of the framebuffer test output.
 
 ## Known Limitations
 
 - Single core only (no SMP / APIC — see roadmap)
-- No filesystem, no drivers beyond keyboard/serial/PIT
+- No filesystem, no drivers beyond keyboard/serial/PIT/framebuffer
 - Exited process address spaces / kernel task stacks are not yet reclaimed
   (a "zombie reaper" is future work)
+- No dynamic process spawning — exactly one userspace program
+  (`huesos-init`) is embedded into the kernel image at build time; see
+  [docs/USERSPACE.md](docs/USERSPACE.md) for what that means in practice
 - No dynamic loading, no relocations (static ELF executables only)
 - Rights enforcement exists but isn't exhaustively audited
+- Framebuffer text is ASCII-only (no Unicode shaping, by design)
 
 ## Quick Start
 
@@ -66,6 +81,13 @@ make run PROFILE=release
 # Host-side unit tests (crates with hardware-independent logic)
 make test
 ```
+
+## Writing Your Own Userspace Program
+
+See [docs/USERSPACE.md](docs/USERSPACE.md) — the short version: depend on
+`libcanvas`, never call `syscall` yourself, and look at
+`crates/huesos-userspace/init/src/main.rs` for a complete working example
+(VMOs, channels, and framebuffer drawing).
 
 ## Architecture
 
@@ -93,12 +115,17 @@ HuesOS/
 │   ├── huesos-hal         # Hardware abstraction (thin, grows with drivers)
 │   ├── huesos-pmm         # Physical memory manager (bitmap frame allocator)
 │   ├── huesos-object      # Kernel objects: VMO, Channel, Process, Job, handles/rights
+│   ├── huesos-abi         # Shared kernel<->userspace ABI: syscall numbers, error codes
+│   ├── huesos-fb          # Framebuffer driver: pixel/rect/text/blit primitives
 │   ├── huesos-syscalls    # Syscall dispatch table
 │   ├── huesos-elf         # ELF64 loader
 │   ├── huesos-kernel      # Scheduler, process/thread mgmt, init sequence
 │   └── huesos-userspace/
+│       ├── libcanvas      # Safe userspace syscall library (the only sanctioned way in)
 │       └── init           # Real ring3 userspace program (separate target)
 ├── scripts/               # QEMU runner, ISO builder, Limine config
+├── tools/fontgen/         # 8x8 bitmap font generator for huesos-fb/libcanvas
+├── third_party/           # Vendored Limine + OVMF binaries (see their READMEs)
 ├── docs/                  # Documentation
 ├── x86_64-huesos.json     # Kernel target spec (ELF, higher-half)
 └── Makefile
