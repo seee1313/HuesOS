@@ -6,20 +6,24 @@ migration so implementation work stays explicit and reviewable.
 ## Approved direction
 
 - Start from the hard-microkernel foundation first, not from a large terminal-only patch.
-- Add dynamic userspace launching via `ProcessSpawn` from an ELF image supplied by `init`.
+- Add dynamic userspace launching through a Zircon-like split model: `ProcessCreate`, VMAR mapping, `ThreadCreate`, and `ThreadStart`.
 - Keep only kernel IRQ bridge/stubs in the kernel for early migration; driver policy/state machines live in userspace.
 - The first terminal is a framebuffer text terminal with keyboard input.
 - `init` is responsible for launching programs and services.
-- Userspace drivers are managed by a separate `DriverManager`, not directly supervised by `init`.
+- `DriverManager` owns userspace driver lifecycle and service discovery; terminal waits for keyboard/framebuffer services from `DriverManager`.
+- Child processes receive only one bootstrap capability at startup: handle 1 is the bootstrap channel endpoint.
+- Process exit observation is part of the launch ABI via `ProcessWait`/exit-code query semantics.
+- IRQ delivery will be modeled with interrupt objects plus ports.
+- The framebuffer driver will move to userspace through a mapped framebuffer capability, not through permanent kernel blit logic.
 - Work must be split into small commits.
 
 ## Immediate open decisions before code changes
 
 These are intentionally left unresolved until the project owner approves them:
 
-1. Exact `ProcessSpawn` ABI shape and which handles the child receives.
+1. Exact VMAR permission/options bit layout for `VmarMap`.
 2. How `init` discovers/embeds child ELF images.
-3. `DriverManager` launch order, service protocol, and restart policy.
-4. Exact kernel IRQ bridge API.
-5. Framebuffer handoff model for a userspace framebuffer driver.
+3. `DriverManager` service protocol and concrete driver restart policy.
+4. Exact Port/Interrupt syscall set and packet layout.
+5. Exact framebuffer mapping rights and handoff lifetime rules.
 6. Terminal command/input protocol.
