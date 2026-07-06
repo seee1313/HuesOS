@@ -42,6 +42,14 @@ pub enum ElfLoadError {
     ParseError(&'static str),
     /// The ELF is not a supported class/type (must be 64-bit executable).
     Unsupported(&'static str),
+    /// A `PT_LOAD` segment's `(offset, file_size)` describes a byte range
+    /// that extends past the end of the actual file data. This is *not* a
+    /// hypothetical: any hand-written or slightly-off linker script,
+    /// truncated file transfer, or plain bug in a from-scratch userspace
+    /// program is enough to trigger it, and it must come back as a normal
+    /// load error rather than an out-of-bounds slice panic that would take
+    /// down the whole kernel just for trying to load a bad binary.
+    SegmentOutOfBounds,
 }
 
 /// Result of successfully loading an ELF binary.
@@ -100,10 +108,31 @@ fn load_segment<L: Loader>(
     let file_size = ph.file_size() as usize;
     let mem_size = ph.mem_size();
 
+    // A well-formed PT_LOAD segment always has file_size <= mem_size (the
+    // file only ever provides *initial* contents; anything beyond
+    // file_size up to mem_size is BSS-style zero-fill). Reject anything
+    // else up front rather than let later arithmetic silently do the
+    // wrong thing.
+    if file_size as u64 > mem_size {
+        return Err(ElfLoadError::SegmentOutOfBounds);
+    }
+
+    // Bounds-check the claimed file range against the actual file data
+    // *before* slicing into it. `file_off + file_size` on attacker- or
+    // corruption-controlled values could also overflow `usize` on a
+    // pathological input, so check with checked arithmetic rather than a
+    // plain `+`.
+    let file_end = file_off
+        .checked_add(file_size)
+        .ok_or(ElfLoadError::SegmentOutOfBounds)?;
+    if file_end > file_data.len() {
+        return Err(ElfLoadError::SegmentOutOfBounds);
+    }
+
     let page_start = align_down(vaddr_start, PAGE_SIZE);
     let page_end = align_up(vaddr_start + mem_size, PAGE_SIZE);
 
-    let segment_bytes = &file_data[file_off..file_off + file_size];
+    let segment_bytes = &file_data[file_off..file_end];
 
     let mut page = page_start;
     while page < page_end {
@@ -189,6 +218,96 @@ mod tests {
         let mut loader = FakeLoader::new();
         let result = load(&[0, 1, 2, 3], &mut loader);
         assert!(matches!(result, Err(ElfLoadError::ParseError(_))));
+    }
+
+    /// Hand-assemble a minimal, otherwise-valid ELF64 ET_EXEC file with a
+    /// single `PT_LOAD` program header, so we can exercise the segment
+    /// bounds-checking added after a real out-of-bounds-slice panic bug.
+    /// `ph_offset`/`ph_filesz` are deliberately parameterized so tests can
+    /// pass in "lies" that a corrupted or hand-rolled linker script could
+    /// plausibly produce.
+    fn build_minimal_elf(ph_offset: u32, ph_filesz: u32, ph_memsz: u32, total_len: usize) -> alloc::vec::Vec<u8> {
+        let mut buf = alloc::vec![0u8; total_len.max(64 + 56)];
+
+        // e_ident
+        buf[0..4].copy_from_slice(b"\x7fELF");
+        buf[4] = 2; // ELFCLASS64
+        buf[5] = 1; // ELFDATA2LSB
+        buf[6] = 1; // EV_CURRENT
+
+        // ELF64 header (Ehdr), little-endian.
+        buf[16..18].copy_from_slice(&2u16.to_le_bytes()); // e_type = ET_EXEC
+        buf[18..20].copy_from_slice(&0x3Eu16.to_le_bytes()); // e_machine = x86-64
+        buf[20..24].copy_from_slice(&1u32.to_le_bytes()); // e_version
+        buf[24..32].copy_from_slice(&0x400050u64.to_le_bytes()); // e_entry
+        buf[32..40].copy_from_slice(&64u64.to_le_bytes()); // e_phoff (right after Ehdr)
+        buf[40..48].copy_from_slice(&0u64.to_le_bytes()); // e_shoff
+        buf[48..52].copy_from_slice(&0u32.to_le_bytes()); // e_flags
+        buf[52..54].copy_from_slice(&64u16.to_le_bytes()); // e_ehsize
+        buf[54..56].copy_from_slice(&56u16.to_le_bytes()); // e_phentsize
+        buf[56..58].copy_from_slice(&1u16.to_le_bytes()); // e_phnum = 1
+        buf[58..60].copy_from_slice(&0u16.to_le_bytes()); // e_shentsize
+        buf[60..62].copy_from_slice(&0u16.to_le_bytes()); // e_shnum
+        buf[62..64].copy_from_slice(&0u16.to_le_bytes()); // e_shstrndx
+
+        // Program header (Phdr) at offset 64.
+        let ph = 64usize;
+        buf[ph..ph + 4].copy_from_slice(&1u32.to_le_bytes()); // p_type = PT_LOAD
+        buf[ph + 4..ph + 8].copy_from_slice(&5u32.to_le_bytes()); // p_flags = R+X
+        buf[ph + 8..ph + 16].copy_from_slice(&(ph_offset as u64).to_le_bytes()); // p_offset
+        buf[ph + 16..ph + 24].copy_from_slice(&0x400000u64.to_le_bytes()); // p_vaddr
+        buf[ph + 24..ph + 32].copy_from_slice(&0x400000u64.to_le_bytes()); // p_paddr
+        buf[ph + 32..ph + 40].copy_from_slice(&(ph_filesz as u64).to_le_bytes()); // p_filesz
+        buf[ph + 40..ph + 48].copy_from_slice(&(ph_memsz as u64).to_le_bytes()); // p_memsz
+        buf[ph + 48..ph + 56].copy_from_slice(&0x1000u64.to_le_bytes()); // p_align
+
+        buf
+    }
+
+    #[test]
+    fn accepts_well_formed_minimal_elf() {
+        // Sanity check for the hand-built ELF helper itself: a segment
+        // whose claimed file range genuinely fits within the file must
+        // still load successfully.
+        let elf = build_minimal_elf(/* ph_offset */ 128, /* filesz */ 16, /* memsz */ 16, 256);
+        let mut loader = FakeLoader::new();
+        let loaded = load(&elf, &mut loader).expect("well-formed minimal ELF should load");
+        assert_eq!(loaded.entry_point, 0x400050);
+    }
+
+    #[test]
+    fn rejects_segment_extending_past_end_of_file() {
+        // p_offset + p_filesz reaches past the actual file length: this
+        // used to panic with an out-of-bounds slice index instead of
+        // returning a clean error.
+        let elf = build_minimal_elf(/* ph_offset */ 128, /* filesz */ 1000, /* memsz */ 1000, 256);
+        let mut loader = FakeLoader::new();
+        let result = load(&elf, &mut loader);
+        assert!(
+            matches!(result, Err(ElfLoadError::SegmentOutOfBounds)),
+            "expected SegmentOutOfBounds, got {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn rejects_filesz_greater_than_memsz() {
+        // A segment claiming more file-backed bytes than its total memory
+        // size is never valid (file_size must be <= mem_size).
+        let elf = build_minimal_elf(/* ph_offset */ 128, /* filesz */ 64, /* memsz */ 32, 256);
+        let mut loader = FakeLoader::new();
+        let result = load(&elf, &mut loader);
+        assert!(matches!(result, Err(ElfLoadError::SegmentOutOfBounds)));
+    }
+
+    #[test]
+    fn rejects_offset_overflow_without_panicking() {
+        // p_offset near usize::MAX combined with a nonzero filesz must be
+        // rejected via checked arithmetic, not wrap around / panic.
+        let elf = build_minimal_elf(u32::MAX, 16, 16, 256);
+        let mut loader = FakeLoader::new();
+        let result = load(&elf, &mut loader);
+        assert!(matches!(result, Err(ElfLoadError::SegmentOutOfBounds)));
     }
 
     #[test]
