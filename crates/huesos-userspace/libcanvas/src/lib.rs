@@ -69,6 +69,7 @@ pub mod vmo;
 
 pub use handle::Handle;
 pub use channel::Channel;
+pub use process::{Process, Thread, Vmar};
 pub use vmo::Vmo;
 
 /// Re-exported so application code can match on specific failure reasons
