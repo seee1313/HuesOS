@@ -20,6 +20,9 @@ migration so implementation work stays explicit and reviewable.
 - First VMAR implementation is root-VMAR mapping only; child VMAR allocation/tree APIs come later.
 - `VmarMap` is strict fixed-address mapping only: callers must set `SPECIFIC`.
 - Process runtime state is stored behind `Process.address_space` as a kernel-side `ProcessRuntime` via `Box<dyn Any>`.
+- `ProcessCreate` returns current `Rights::DEFAULT` handles for both the process and root VMAR.
+- Empty process names are allowed and become `process`; non-empty names are UTF-8 and capped at 64 bytes.
+- `ProcessWait` remains `NotSupported` until the Port/blocking wait model is implemented.
 - Work must be split into small commits.
 
 ## Immediate open decisions before code changes
