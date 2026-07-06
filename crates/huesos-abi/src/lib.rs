@@ -58,13 +58,43 @@ pub enum Syscall {
     /// video memory — it never gets a mapping of the framebuffer itself,
     /// only this narrow, bounds-checked copy operation.
     FramebufferBlit = 13,
+    /// Create a suspended userspace process object and its root VMAR.
+    ///
+    /// Skeleton ABI for the approved Zircon-like launch path: the process is
+    /// created first, memory is mapped into its root VMAR separately, then a
+    /// thread is created and started explicitly.
+    ProcessCreate = 14,
+    /// Query/wait for a process exit code. Until blocking waits land, the
+    /// implementation is expected to return `ErrorCode::ShouldWait` while
+    /// the process is still running.
+    ProcessWait = 15,
+    /// Create a suspended thread object in an existing process.
+    ThreadCreate = 16,
+    /// Start a suspended thread at an entry point/stack pointer. The kernel
+    /// creates the child bootstrap channel endpoint as handle 1 in the child
+    /// process and returns the parent endpoint to the caller.
+    ThreadStart = 17,
+    /// Map a VMO into a VMAR. Arguments are passed via `VmarMapArgs` because
+    /// the operation needs more fields than the 5-register syscall ABI can
+    /// comfortably carry.
+    VmarMap = 18,
+    /// Create a Port object, a non-blocking userspace-visible event queue.
+    PortCreate = 19,
+    /// Read one packet from a Port object. Returns `ErrorCode::ShouldWait`
+    /// if no packet is queued.
+    PortRead = 20,
+    /// Create an Interrupt object for a kernel IRQ bridge. The first
+    /// implementation supports IRQ1 (keyboard) only.
+    InterruptCreate = 21,
+    /// Bind an Interrupt object to a Port so IRQ events enqueue Port packets.
+    InterruptBindPort = 22,
 }
 
 impl Syscall {
     /// Total number of defined syscalls (i.e. one past the highest
     /// currently-assigned number). The dispatcher uses this to reject
     /// obviously-out-of-range numbers before a `match`.
-    pub const COUNT: u64 = 14;
+    pub const COUNT: u64 = 23;
 
     /// Convert a raw syscall number back into a [`Syscall`], if valid.
     pub const fn from_raw(n: u64) -> Option<Self> {
@@ -83,6 +113,15 @@ impl Syscall {
             11 => Self::DebugWrite,
             12 => Self::FramebufferInfo,
             13 => Self::FramebufferBlit,
+            14 => Self::ProcessCreate,
+            15 => Self::ProcessWait,
+            16 => Self::ThreadCreate,
+            17 => Self::ThreadStart,
+            18 => Self::VmarMap,
+            19 => Self::PortCreate,
+            20 => Self::PortRead,
+            21 => Self::InterruptCreate,
+            22 => Self::InterruptBindPort,
             _ => return None,
         })
     }
@@ -163,6 +202,9 @@ impl ErrorCode {
 pub type HandleValue = u32;
 /// Reserved value meaning "no handle" / invalid handle.
 pub const INVALID_HANDLE: HandleValue = 0;
+/// Initial bootstrap channel handle number installed in a newly-started
+/// child process by `Syscall::ThreadStart`.
+pub const BOOTSTRAP_HANDLE: HandleValue = 1;
 
 /// Rights bitmask, mirrored from `huesos-object::Rights` numerically (kept
 /// here too so userspace doesn't need to depend on the kernel-only object
@@ -182,6 +224,40 @@ pub mod rights {
     pub const MAP: u32 = 1 << 5;
     /// Duplicate with the exact same rights as the source handle.
     pub const SAME_RIGHTS: u32 = 1 << 31;
+}
+
+
+
+/// Lowest userspace virtual address accepted by the root VMAR. The first
+/// 64 KiB stay unmapped as a low/null-pointer guard.
+pub const USER_ASPACE_BASE: u64 = 0x0000_0000_0001_0000;
+/// Exclusive upper bound of the canonical lower-half userspace address
+/// space used by HuesOS root VMARs.
+pub const USER_ASPACE_END: u64 = 0x0000_8000_0000_0000;
+/// Size of the root userspace VMAR.
+pub const USER_ASPACE_SIZE: u64 = USER_ASPACE_END - USER_ASPACE_BASE;
+
+
+/// Top of the initial stack used by the userspace process launcher.
+pub const USER_STACK_TOP: u64 = 0x0000_7fff_ff00_0000;
+/// Size of the initial userspace stack mapped by the userspace process launcher.
+pub const USER_STACK_SIZE: u64 = 4096 * 16;
+
+/// VMAR mapping flags for [`Syscall::VmarMap`].
+pub mod vmar_flags {
+    /// Map pages readable from userspace.
+    pub const READ: u32 = 1 << 0;
+    /// Map pages writable from userspace.
+    pub const WRITE: u32 = 1 << 1;
+    /// Map pages executable from userspace.
+    pub const EXECUTE: u32 = 1 << 2;
+    /// Mapping is user-accessible. This is explicit even though VMARs are
+    /// userspace address-space objects, so the permission contract is clear
+    /// at the ABI boundary.
+    pub const USER: u32 = 1 << 3;
+    /// Use the exact virtual address in `VmarMapArgs.addr`. The first VMAR
+    /// implementation requires this flag for every mapping.
+    pub const SPECIFIC: u32 = 1 << 4;
 }
 
 /// Framebuffer geometry and pixel format, as returned by
@@ -234,4 +310,44 @@ pub struct FramebufferBlitArgs {
     pub dst_x: u32,
     /// Destination Y coordinate on the real framebuffer.
     pub dst_y: u32,
+}
+
+
+/// Port packet type for interrupt notifications.
+pub const PORT_PACKET_INTERRUPT: u32 = 1;
+
+/// Fixed-size event packet returned by [`Syscall::PortRead`].
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct PortPacket {
+    /// User-supplied key associated with the event source when it was bound
+    /// to the Port.
+    pub key: u64,
+    /// Packet type. See `PORT_PACKET_*` constants.
+    pub packet_type: u32,
+    /// Status code associated with the packet source. Zero means success.
+    pub status: i32,
+    /// Source-specific payload words.
+    pub data: [u64; 4],
+}
+
+/// Arguments for [`Syscall::VmarMap`], passed by pointer because mapping a
+/// VMO needs more than the syscall ABI's five register-sized arguments.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct VmarMapArgs {
+    /// Handle to the target VMAR.
+    pub vmar: HandleValue,
+    /// Handle to the VMO being mapped.
+    pub vmo: HandleValue,
+    /// Byte offset into the VMO.
+    pub vmo_offset: u64,
+    /// Requested destination virtual address. The first implementation is
+    /// strict fixed-address mapping: callers must set `vmar_flags::SPECIFIC`
+    /// and provide a page-aligned address inside the target VMAR.
+    pub addr: u64,
+    /// Mapping length in bytes.
+    pub len: u64,
+    /// Mapping options/permissions from [`vmar_flags`].
+    pub flags: u32,
 }

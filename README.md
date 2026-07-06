@@ -33,8 +33,13 @@ and [docs/ROADMAP.md](docs/ROADMAP.md) for what's next.
 - ✅ A real ring3 userspace process (`huesos-init`) launched via `iretq`,
   built as a genuinely separate target/executable and embedded into the
   kernel image at build time
+- ✅ MVP dynamic userspace launch path: init embeds child ELF images,
+  creates processes/root VMARs, maps VMOs, creates threads, starts them,
+  and receives bootstrap channels
 - ✅ VMOs backed by real physical page frames (not a `Vec<u8>` placeholder)
 - ✅ Channel IPC with real connected pairs (`Channel::pair()`)
+- ✅ PS/2 keyboard IRQ bridge to userspace via Interrupt objects + Ports
+  (DriverManager can receive raw scancode packets)
 - ✅ PS/2 keyboard driver (scancode set 1 → ASCII) and PIT timer driver
 - ✅ Real framebuffer driver (`huesos-fb`): pixel/rect/text/blit
   primitives, bounds-checked against untrusted userspace input
@@ -48,10 +53,10 @@ and [docs/ROADMAP.md](docs/ROADMAP.md) for what's next.
 All of the above is exercised live by `huesos-init` on every boot — now
 built entirely against `libcanvas`, not raw syscalls — which creates a
 VMO, writes to it, reads it back, creates a channel pair, sends/receives a
-message, draws a color-bar test pattern + text to the real screen via
-`Canvas`, and exits cleanly. Verified in QEMU/OVMF in both debug and
-release builds; see `tools/fontgen/qemu_screenshot.png` for an actual
-screenshot of the framebuffer test output.
+message, then launches the userspace DriverManager and framebuffer
+terminal skeletons as child processes. The terminal paints the framebuffer
+from userspace via `Canvas`. Historical framebuffer test output is shown
+in `tools/fontgen/qemu_screenshot.png`.
 
 ## Known Limitations
 
@@ -59,9 +64,9 @@ screenshot of the framebuffer test output.
 - No filesystem, no drivers beyond keyboard/serial/PIT/framebuffer
 - Exited process address spaces / kernel task stacks are not yet reclaimed
   (a "zombie reaper" is future work)
-- No dynamic process spawning — exactly one userspace program
-  (`huesos-init`) is embedded into the kernel image at build time; see
-  [docs/USERSPACE.md](docs/USERSPACE.md) for what that means in practice
+- Dynamic process launch exists as an MVP (`ProcessCreate`/`VmarMap`/
+  `ThreadCreate`/`ThreadStart`), but there is still no filesystem/initrd
+  program namespace and no process teardown/wait-based supervision yet
 - No dynamic loading, no relocations (static ELF executables only)
 - Rights enforcement exists but isn't exhaustively audited
 - Framebuffer text is ASCII-only (no Unicode shaping, by design)

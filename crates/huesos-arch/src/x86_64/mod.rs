@@ -5,6 +5,7 @@ pub mod cpu;
 pub mod gdt;
 mod idt;
 pub mod interrupts;
+pub mod irq_callback;
 pub mod keyboard;
 pub mod paging;
 pub mod pit;

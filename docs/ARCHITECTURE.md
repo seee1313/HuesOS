@@ -131,7 +131,9 @@ architecture-independent `huesos_syscalls::dispatch`, and `sysret`s back.
 Current syscalls: `Nop`, `VmoCreate`, `HandleClose`, `HandleDuplicate`,
 `Yield`, `VmoRead`, `VmoWrite`, `ChannelCreate`, `ChannelWrite`,
 `ChannelRead`, `ProcessExit`, `DebugWrite`, `FramebufferInfo`,
-`FramebufferBlit`. The canonical, versioned list lives in
+`FramebufferBlit`, `ProcessCreate`, `ProcessWait`, `ThreadCreate`,
+`ThreadStart`, `VmarMap`, `PortCreate`, `PortRead`, `InterruptCreate`,
+`InterruptBindPort`. The canonical, versioned list lives in
 `huesos-abi::Syscall` — both `huesos-syscalls`' dispatcher and
 `libcanvas`' wrappers are generated against that one enum, so adding a
 syscall means updating one shared crate, not keeping two copies in sync

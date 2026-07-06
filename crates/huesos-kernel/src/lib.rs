@@ -145,13 +145,12 @@ fn spawn_init_process() {
     dbg_num(spawned.cr3);
     dbg("\n");
 
-    *process::PENDING_ENTRY.lock() = Some((spawned.entry_point, spawned.user_rsp));
-
     let name = *b"init\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0";
     let id = scheduler::spawn_user_thread(
         &name,
         spawned.process,
-        process::user_entry_trampoline,
+        spawned.entry_point,
+        spawned.user_rsp,
         spawned.cr3,
     );
     dbg("spawn_init_process: task spawned, id=");

@@ -75,6 +75,16 @@ pub fn syscall_init() {
     huesos_syscalls::set_yield_fn(crate::scheduler::yield_now);
     huesos_syscalls::set_exit_fn(crate::scheduler::exit_current_task);
     huesos_syscalls::set_debug_write_fn(debug_write);
+    huesos_syscalls::set_process_create_fn(crate::process::create_suspended_process);
+    huesos_syscalls::set_vmar_map_fn(crate::process::map_vmo_into_vmar);
+    huesos_syscalls::set_thread_start_fn(crate::process::start_thread);
+    huesos_arch::irq_callback::set_irq_callback(handle_irq_event);
+}
+
+fn handle_irq_event(irq: u8, data: u64) {
+    if let Some(interrupt) = huesos_object::lookup_interrupt_by_irq(irq) {
+        interrupt.signal(huesos_abi::PORT_PACKET_INTERRUPT, data);
+    }
 }
 
 extern "C" fn handle_syscall(frame: &mut huesos_arch::syscall::SyscallFrame) {

@@ -81,6 +81,8 @@ pub enum ObjectType {
     Job = 6,
     /// Interrupt object.
     Interrupt = 7,
+    /// Virtual memory address region.
+    Vmar = 8,
     /// Generic / unknown.
     Unknown = 0xFF,
 }
@@ -172,6 +174,24 @@ impl HandleTable {
         t.push(Some(handle));
         idx
     }
+    /// Insert a handle at an exact handle value. Fails if `value` is invalid
+    /// or already occupied.
+    pub fn insert_at(&self, value: HandleValue, handle: Handle) -> Result<(), Handle> {
+        if value == INVALID_HANDLE {
+            return Err(handle);
+        }
+        let mut t = self.table.lock();
+        while t.len() <= value as usize {
+            t.push(None);
+        }
+        let slot = &mut t[value as usize];
+        if slot.is_some() {
+            return Err(handle);
+        }
+        *slot = Some(handle);
+        Ok(())
+    }
+
     /// Get handle by value.
     pub fn get(&self, value: HandleValue) -> Option<Handle> {
         if value == INVALID_HANDLE {
@@ -199,10 +219,22 @@ impl Default for HandleTable {
 
 /// Global object registry (koid -> Arc<dyn KernelObject>).
 static OBJECT_REGISTRY: Mutex<BTreeMap<Koid, Arc<dyn KernelObject>>> = Mutex::new(BTreeMap::new());
+/// Typed process registry for kernel subsystems that must hold an owning
+/// `Arc<Process>` rather than a type-erased object reference.
+static PROCESS_REGISTRY: Mutex<BTreeMap<Koid, Arc<Process>>> = Mutex::new(BTreeMap::new());
+/// Typed interrupt registry indexed by IRQ number for fast IRQ bridge lookup.
+static INTERRUPT_REGISTRY: Mutex<BTreeMap<u8, Arc<Interrupt>>> = Mutex::new(BTreeMap::new());
 
 /// Register a kernel object globally.
 pub fn register_object(obj: Arc<dyn KernelObject>) {
     OBJECT_REGISTRY.lock().insert(obj.koid(), obj);
+}
+
+/// Register a process in both the type-erased object registry and the typed
+/// process registry.
+pub fn register_process(process: Arc<Process>) {
+    PROCESS_REGISTRY.lock().insert(process.koid(), process.clone());
+    register_object(process);
 }
 
 /// Lookup a kernel object by koid.
@@ -210,11 +242,34 @@ pub fn lookup_object(koid: Koid) -> Option<Arc<dyn KernelObject>> {
     OBJECT_REGISTRY.lock().get(&koid).cloned()
 }
 
+/// Lookup a process by koid, returning a typed owning reference.
+pub fn lookup_process(koid: Koid) -> Option<Arc<Process>> {
+    PROCESS_REGISTRY.lock().get(&koid).cloned()
+}
+
+/// Register an interrupt in both the type-erased object registry and the
+/// typed IRQ registry.
+pub fn register_interrupt(interrupt: Arc<Interrupt>) {
+    INTERRUPT_REGISTRY
+        .lock()
+        .insert(interrupt.irq(), interrupt.clone());
+    register_object(interrupt);
+}
+
+/// Lookup an interrupt object by IRQ number.
+pub fn lookup_interrupt_by_irq(irq: u8) -> Option<Arc<Interrupt>> {
+    INTERRUPT_REGISTRY.lock().get(&irq).cloned()
+}
+
 /// Remove an object from the global registry (called on final handle close
 /// in a full refcounted implementation; for the MVP this is invoked
 /// explicitly by `ProcessExit`/object-specific teardown).
 pub fn unregister_object(koid: Koid) {
     OBJECT_REGISTRY.lock().remove(&koid);
+    PROCESS_REGISTRY.lock().remove(&koid);
+    INTERRUPT_REGISTRY
+        .lock()
+        .retain(|_, interrupt| interrupt.koid() != koid);
 }
 
 /// Current process (set by the scheduler on every context switch).
@@ -419,6 +474,150 @@ impl KernelObject for Vmo {
     }
 }
 
+
+/// A VMAR mapping record: a VMO range mapped into a process address space.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct VmarMapping {
+    /// Mapped virtual base address.
+    pub base: u64,
+    /// Mapping length in bytes.
+    pub size: u64,
+    /// Backing VMO koid.
+    pub vmo: Koid,
+    /// ABI mapping flags used when the mapping was created.
+    pub flags: u32,
+}
+
+/// A child VMAR range reserved inside a parent VMAR.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct VmarChild {
+    /// Child VMAR koid.
+    pub koid: Koid,
+    /// Child virtual base address.
+    pub base: u64,
+    /// Child VMAR size in bytes.
+    pub size: u64,
+}
+
+/// VMAR — a userspace virtual-memory address region.
+///
+/// The first implementation uses only a process root VMAR for fixed-address
+/// ELF/stack mappings, but the object already records child ranges so the
+/// later VMAR tree API can enforce non-overlap without changing the object
+/// shape.
+pub struct Vmar {
+    koid: Koid,
+    name: Mutex<String>,
+    process: Koid,
+    base: u64,
+    size: u64,
+    mappings: Mutex<Vec<VmarMapping>>,
+    children: Mutex<Vec<VmarChild>>,
+}
+
+impl Vmar {
+    /// Create a root VMAR for `process` covering `[base, base + size)`.
+    pub fn new_root(process: Koid, base: u64, size: u64) -> Arc<Self> {
+        Arc::new(Self {
+            koid: alloc_koid(),
+            name: Mutex::new(String::from("root")),
+            process,
+            base,
+            size,
+            mappings: Mutex::new(Vec::new()),
+            children: Mutex::new(Vec::new()),
+        })
+    }
+
+    /// Process koid this VMAR belongs to.
+    pub const fn process(&self) -> Koid {
+        self.process
+    }
+
+    /// VMAR base address.
+    pub const fn base(&self) -> u64 {
+        self.base
+    }
+
+    /// VMAR size in bytes.
+    pub const fn size(&self) -> u64 {
+        self.size
+    }
+
+    /// Exclusive VMAR end address, or `None` on overflow.
+    pub const fn end(&self) -> Option<u64> {
+        self.base.checked_add(self.size)
+    }
+
+    /// Return whether `[base, base + size)` is fully inside this VMAR.
+    pub fn contains_range(&self, base: u64, size: u64) -> bool {
+        let Some(end) = base.checked_add(size) else {
+            return false;
+        };
+        let Some(vmar_end) = self.end() else {
+            return false;
+        };
+        size > 0 && base >= self.base && end <= vmar_end
+    }
+
+    /// Return whether `[base, base + size)` overlaps an existing mapping or
+    /// child VMAR range.
+    pub fn overlaps_existing(&self, base: u64, size: u64) -> bool {
+        let mappings = self.mappings.lock();
+        if mappings
+            .iter()
+            .any(|m| ranges_overlap(base, size, m.base, m.size))
+        {
+            return true;
+        }
+        drop(mappings);
+
+        self.children
+            .lock()
+            .iter()
+            .any(|c| ranges_overlap(base, size, c.base, c.size))
+    }
+
+    /// Record a mapping if it is inside this VMAR and does not overlap any
+    /// existing mapping/child range.
+    pub fn record_mapping(&self, mapping: VmarMapping) -> Result<(), ()> {
+        if !self.contains_range(mapping.base, mapping.size)
+            || self.overlaps_existing(mapping.base, mapping.size)
+        {
+            return Err(());
+        }
+        self.mappings.lock().push(mapping);
+        Ok(())
+    }
+
+    /// Return a snapshot of known mappings.
+    pub fn mappings(&self) -> Vec<VmarMapping> {
+        self.mappings.lock().clone()
+    }
+}
+
+impl KernelObject for Vmar {
+    fn object_type(&self) -> ObjectType {
+        ObjectType::Vmar
+    }
+    fn koid(&self) -> Koid {
+        self.koid
+    }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
+fn ranges_overlap(a_base: u64, a_size: u64, b_base: u64, b_size: u64) -> bool {
+    let Some(a_end) = a_base.checked_add(a_size) else {
+        return true;
+    };
+    let Some(b_end) = b_base.checked_add(b_size) else {
+        return true;
+    };
+    a_size == 0 || b_size == 0 || (a_base < b_end && b_base < a_end)
+}
+
 /// Channel — one endpoint of a bidirectional IPC pipe.
 ///
 /// A channel pair (created together via [`Channel::pair`]) shares two
@@ -506,11 +705,18 @@ pub struct Port {
 }
 
 /// A packet queued to a port.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PortPacket {
     /// Key used to identify the source.
     pub key: u64,
-    /// Payload bytes.
-    pub payload: Vec<u8>,
+    /// Packet type. Mirrors `huesos_abi::PORT_PACKET_*` values at the syscall
+    /// boundary without making this arch-independent crate depend on the ABI
+    /// crate.
+    pub packet_type: u32,
+    /// Status associated with this event.
+    pub status: i32,
+    /// Fixed-size source-specific payload.
+    pub data: [u64; 4],
 }
 
 impl Port {
@@ -539,6 +745,83 @@ impl Port {
 impl KernelObject for Port {
     fn object_type(&self) -> ObjectType {
         ObjectType::Port
+    }
+    fn koid(&self) -> Koid {
+        self.koid
+    }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
+
+/// Binding from an interrupt object to a port.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct InterruptBinding {
+    /// Destination port koid.
+    pub port: Koid,
+    /// User-supplied key copied into queued packets.
+    pub key: u64,
+}
+
+/// Interrupt — userspace-visible IRQ bridge object.
+pub struct Interrupt {
+    koid: Koid,
+    irq: u8,
+    binding: Mutex<Option<InterruptBinding>>,
+    count: AtomicU64,
+}
+
+impl Interrupt {
+    /// Create a new interrupt object for `irq`.
+    pub fn new(irq: u8) -> Arc<Self> {
+        Arc::new(Self {
+            koid: alloc_koid(),
+            irq,
+            binding: Mutex::new(None),
+            count: AtomicU64::new(0),
+        })
+    }
+
+    /// IRQ number represented by this object.
+    pub const fn irq(&self) -> u8 {
+        self.irq
+    }
+
+    /// Bind this interrupt to `port` with a user-supplied `key`.
+    pub fn bind_port(&self, port: Koid, key: u64) {
+        *self.binding.lock() = Some(InterruptBinding { port, key });
+    }
+
+    /// Signal this interrupt and queue a packet to the bound port, if any.
+    pub fn signal(&self, packet_type: u32, data0: u64) {
+        let count = self.count.fetch_add(1, Ordering::Relaxed) + 1;
+        let Some(binding) = *self.binding.lock() else {
+            return;
+        };
+        let Some(port_obj) = lookup_object(binding.port) else {
+            return;
+        };
+        let Some(port) = port_obj.downcast_ref::<Port>() else {
+            return;
+        };
+        port.queue(PortPacket {
+            key: binding.key,
+            packet_type,
+            status: 0,
+            data: [self.irq as u64, data0, count, 0],
+        });
+    }
+
+    /// Number of times this interrupt object has been signalled.
+    pub fn count(&self) -> u64 {
+        self.count.load(Ordering::Relaxed)
+    }
+}
+
+impl KernelObject for Interrupt {
+    fn object_type(&self) -> ObjectType {
+        ObjectType::Interrupt
     }
     fn koid(&self) -> Koid {
         self.koid
@@ -581,6 +864,7 @@ impl KernelObject for Job {
 pub struct Thread {
     koid: Koid,
     name: Mutex<String>,
+    process: Koid,
     /// Scheduler task id this Thread object corresponds to.
     pub task_id: Mutex<Option<u64>>,
 }
@@ -588,11 +872,22 @@ pub struct Thread {
 impl Thread {
     /// Create a thread object (not yet bound to a scheduler task).
     pub fn new(name: &str) -> Arc<Self> {
+        Self::new_for_process(name, Koid::INVALID)
+    }
+
+    /// Create a suspended thread object associated with `process`.
+    pub fn new_for_process(name: &str, process: Koid) -> Arc<Self> {
         Arc::new(Self {
             koid: alloc_koid(),
             name: Mutex::new(String::from(name)),
+            process,
             task_id: Mutex::new(None),
         })
+    }
+
+    /// Process this thread belongs to.
+    pub const fn process(&self) -> Koid {
+        self.process
     }
 }
 
@@ -746,6 +1041,86 @@ mod tests {
             assert!(result.is_err());
             assert!(vmo.size() >= 3 * 4096, "size must not regress below what succeeded");
         });
+    }
+
+
+    #[test]
+    fn vmar_rejects_out_of_range_and_overlapping_mappings() {
+        let vmar = Vmar::new_root(Koid(1), 0x10000, 0x10000);
+        let first = VmarMapping {
+            base: 0x12000,
+            size: 0x2000,
+            vmo: Koid(2),
+            flags: 0,
+        };
+        assert!(vmar.record_mapping(first).is_ok());
+
+        let overlap = VmarMapping {
+            base: 0x13000,
+            size: 0x1000,
+            vmo: Koid(3),
+            flags: 0,
+        };
+        assert!(vmar.record_mapping(overlap).is_err());
+
+        let outside = VmarMapping {
+            base: 0x1f000,
+            size: 0x2000,
+            vmo: Koid(4),
+            flags: 0,
+        };
+        assert!(vmar.record_mapping(outside).is_err());
+    }
+
+
+
+
+    #[test]
+    fn interrupt_signal_queues_port_packet() {
+        let port = Port::new();
+        let port_koid = port.koid();
+        register_object(port.clone());
+
+        let interrupt = Interrupt::new(1);
+        interrupt.bind_port(port_koid, 0xabc);
+        interrupt.signal(1, 0x1e);
+
+        let packet = port.read().expect("interrupt should queue one packet");
+        assert_eq!(packet.key, 0xabc);
+        assert_eq!(packet.packet_type, 1);
+        assert_eq!(packet.data[0], 1);
+        assert_eq!(packet.data[1], 0x1e);
+        assert_eq!(packet.data[2], 1);
+
+        unregister_object(port_koid);
+    }
+
+    #[test]
+    fn register_process_populates_typed_registry() {
+        let process = Process::new("typed-registry-test");
+        let koid = process.koid();
+        register_process(process);
+        assert!(lookup_process(koid).is_some());
+        unregister_object(koid);
+        assert!(lookup_process(koid).is_none());
+    }
+
+    #[test]
+    fn thread_records_owning_process() {
+        let thread = Thread::new_for_process("worker", Koid(123));
+        assert_eq!(thread.process(), Koid(123));
+        assert_eq!(*thread.task_id.lock(), None);
+    }
+
+
+    #[test]
+    fn handle_table_can_insert_at_fixed_slot() {
+        let table = HandleTable::new();
+        let h = Handle::new(Koid(7), Rights::DEFAULT);
+        assert!(table.insert_at(3, h).is_ok());
+        assert_eq!(table.get(3), Some(h));
+        assert!(table.insert_at(3, h).is_err());
+        assert!(table.insert_at(INVALID_HANDLE, h).is_err());
     }
 
     #[test]

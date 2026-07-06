@@ -63,17 +63,25 @@ pub mod debug;
 pub mod framebuffer;
 mod font8x8;
 pub mod handle;
+pub mod interrupt;
+pub mod port;
 pub mod process;
 mod raw;
 pub mod vmo;
 
 pub use handle::Handle;
 pub use channel::Channel;
+pub use interrupt::Interrupt;
+pub use port::Port;
+pub use process::{Process, Thread, Vmar};
 pub use vmo::Vmo;
 
 /// Re-exported so application code can match on specific failure reasons
 /// (`use libcanvas::ErrorCode;`) without depending on `huesos-abi` directly.
-pub use huesos_abi::ErrorCode;
+pub use huesos_abi::{
+    vmar_flags, ErrorCode, PortPacket, BOOTSTRAP_HANDLE, PORT_PACKET_INTERRUPT, USER_STACK_SIZE,
+    USER_STACK_TOP,
+};
 
 /// Result type used throughout `libcanvas`: every fallible syscall wrapper
 /// returns this instead of a raw negative `i64`.

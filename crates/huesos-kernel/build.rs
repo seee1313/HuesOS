@@ -1,59 +1,108 @@
-//! Builds the userspace `huesos-init` binary as a separate `cargo`
-//! invocation (different target: ring3, low load address) and exposes its
-//! path to the kernel via the `HUESOS_INIT_PATH` env var, so `huesos-kernel`
-//! can `include_bytes!` it directly into the kernel image.
+//! Builds HuesOS userspace binaries as separate `cargo` invocations
+//! (different target: ring3, low load address) and exposes their paths to
+//! the kernel/init build.
 //!
-//! This keeps the userspace program out of the kernel's own workspace/target
-//! (it needs a different linker script and target spec) while still
-//! producing a single bootable kernel binary with `init` baked in — no
-//! initrd/module-loading machinery needed for the MVP.
+//! `huesos-init` remains the only binary embedded directly in the kernel.
+//! The next-stage userspace services are embedded into `init` so init can
+//! create processes, map VMARs, create threads, and start them itself via
+//! the new Zircon-like launch ABI.
 
 use std::env;
-use std::path::PathBuf;
+use std::ffi::OsStr;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn main() {
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
-    // crates/huesos-kernel -> crates/huesos-userspace/init
-    let userspace_dir = manifest_dir
-        .parent()
-        .unwrap()
-        .join("huesos-userspace")
-        .join("init");
-
-    println!("cargo:rerun-if-changed={}", userspace_dir.join("src").display());
-    println!(
-        "cargo:rerun-if-changed={}",
-        userspace_dir.parent().unwrap().join("user_linker.ld").display()
-    );
-
+    let userspace_root = manifest_dir.parent().unwrap().join("huesos-userspace");
     let profile = "release";
 
-    // Use a fixed CARGO/RUSTUP env so this nested cargo invocation doesn't
-    // inherit target-dir/RUSTFLAGS meant for the kernel build.
-    let status = Command::new(env::var("CARGO").unwrap_or_else(|_| "cargo".into()))
-        .current_dir(&userspace_dir)
+    track_userspace_inputs(&userspace_root);
+
+    let driver_manager = build_userspace_program(
+        &userspace_root,
+        "driver-manager",
+        "huesos-driver-manager",
+        profile,
+        &[],
+    );
+    let terminal = build_userspace_program(
+        &userspace_root,
+        "terminal",
+        "huesos-terminal",
+        profile,
+        &[],
+    );
+    let init = build_userspace_program(
+        &userspace_root,
+        "init",
+        "huesos-init",
+        profile,
+        &[
+            ("HUESOS_DRIVER_MANAGER_PATH", driver_manager.as_os_str()),
+            ("HUESOS_TERMINAL_PATH", terminal.as_os_str()),
+        ],
+    );
+
+    println!("cargo:rustc-env=HUESOS_INIT_PATH={}", init.display());
+}
+
+fn track_userspace_inputs(userspace_root: &Path) {
+    for program in ["init", "driver-manager", "terminal"] {
+        println!(
+            "cargo:rerun-if-changed={}",
+            userspace_root.join(program).join("src").display()
+        );
+        println!(
+            "cargo:rerun-if-changed={}",
+            userspace_root.join(program).join("Cargo.toml").display()
+        );
+    }
+    println!(
+        "cargo:rerun-if-changed={}",
+        userspace_root.join("libcanvas").join("src").display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        userspace_root.join("user_linker.ld").display()
+    );
+}
+
+fn build_userspace_program(
+    userspace_root: &Path,
+    dir_name: &str,
+    bin_name: &str,
+    profile: &str,
+    extra_env: &[(&str, &OsStr)],
+) -> PathBuf {
+    let program_dir = userspace_root.join(dir_name);
+    let mut command = Command::new(env::var("CARGO").unwrap_or_else(|_| "cargo".into()));
+    command
+        .current_dir(&program_dir)
         .env_remove("RUSTFLAGS")
         .env_remove("CARGO_ENCODED_RUSTFLAGS")
-        .args(["build", "--release"])
-        .status()
-        .expect("failed to invoke cargo for huesos-init userspace build");
-
-    if !status.success() {
-        panic!("building huesos-init userspace binary failed");
+        .args(["build", "--release"]);
+    for &(key, value) in extra_env {
+        command.env(key, value);
     }
 
-    let bin_path = userspace_dir
+    let status = command
+        .status()
+        .unwrap_or_else(|_| panic!("failed to invoke cargo for {bin_name} userspace build"));
+    if !status.success() {
+        panic!("building {bin_name} userspace binary failed");
+    }
+
+    let bin_path = program_dir
         .join("target")
         .join("x86_64-huesos-userspace")
         .join(profile)
-        .join("huesos-init");
+        .join(bin_name);
 
     assert!(
         bin_path.exists(),
         "expected userspace binary at {}",
         bin_path.display()
     );
-
-    println!("cargo:rustc-env=HUESOS_INIT_PATH={}", bin_path.display());
+    bin_path
 }

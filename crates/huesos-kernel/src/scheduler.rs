@@ -144,12 +144,20 @@ pub fn spawn_kernel_thread(name: &[u8; 32], entry: extern "C" fn() -> !) -> u64 
 pub fn spawn_user_thread(
     name: &[u8; 32],
     process: Arc<Process>,
-    entry_trampoline: extern "C" fn() -> !,
+    entry_point: u64,
+    user_rsp: u64,
     cr3: u64,
 ) -> u64 {
     with_scheduler(|s| {
         let id = s.tasks.len() as u64;
-        let task = Task::new_user(id, *name, process, entry_trampoline, cr3);
+        crate::process::queue_user_entry(id, entry_point, user_rsp);
+        let task = Task::new_user(
+            id,
+            *name,
+            process,
+            crate::process::user_entry_trampoline,
+            cr3,
+        );
         s.add_task(task)
     })
 }

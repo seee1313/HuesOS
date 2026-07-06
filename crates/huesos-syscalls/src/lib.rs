@@ -12,9 +12,13 @@
 
 extern crate alloc;
 
+use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
-use huesos_abi::{ErrorCode, FramebufferBlitArgs, FramebufferInfo, HandleValue, INVALID_HANDLE};
+use huesos_abi::{
+    ErrorCode, FramebufferBlitArgs, FramebufferInfo, HandleValue, PortPacket, VmarMapArgs,
+    BOOTSTRAP_HANDLE, INVALID_HANDLE,
+};
 use huesos_object::{Handle, KernelObject, KernelObjectExt, Rights};
 use spin::Mutex;
 
@@ -27,6 +31,22 @@ static YIELD_FN: Mutex<Option<fn()>> = Mutex::new(None);
 static EXIT_FN: Mutex<Option<fn(i64) -> !>> = Mutex::new(None);
 /// Global debug-write callback (set by kernel to point at the serial writer).
 static DEBUG_WRITE_FN: Mutex<Option<fn(&[u8])>> = Mutex::new(None);
+
+/// Kernel callback type used by the syscall layer to create a suspended process.
+pub type ProcessCreateFn =
+    fn(&str) -> Result<(Arc<huesos_object::Process>, Arc<huesos_object::Vmar>), ErrorCode>;
+/// Kernel callback type used by the syscall layer to map a VMO into a VMAR.
+pub type VmarMapFn =
+    fn(&huesos_object::Vmar, &huesos_object::Vmo, VmarMapArgs) -> Result<u64, ErrorCode>;
+/// Kernel callback type used by the syscall layer to start a suspended thread.
+pub type ThreadStartFn = fn(&huesos_object::Thread, u64, u64) -> Result<u64, ErrorCode>;
+
+/// Global process-create callback (set by the kernel process layer).
+static PROCESS_CREATE_FN: Mutex<Option<ProcessCreateFn>> = Mutex::new(None);
+/// Global VMAR-map callback (set by the kernel process layer).
+static VMAR_MAP_FN: Mutex<Option<VmarMapFn>> = Mutex::new(None);
+/// Global thread-start callback (set by the kernel scheduler/process layer).
+static THREAD_START_FN: Mutex<Option<ThreadStartFn>> = Mutex::new(None);
 
 /// Set the yield function. Called once by kernel init.
 pub fn set_yield_fn(f: fn()) {
@@ -41,6 +61,21 @@ pub fn set_exit_fn(f: fn(i64) -> !) {
 /// Set the debug-write function. Called once by kernel init.
 pub fn set_debug_write_fn(f: fn(&[u8])) {
     *DEBUG_WRITE_FN.lock() = Some(f);
+}
+
+/// Set the process-create function. Called once by kernel init.
+pub fn set_process_create_fn(f: ProcessCreateFn) {
+    *PROCESS_CREATE_FN.lock() = Some(f);
+}
+
+/// Set the VMAR-map function. Called once by kernel init.
+pub fn set_vmar_map_fn(f: VmarMapFn) {
+    *VMAR_MAP_FN.lock() = Some(f);
+}
+
+/// Set the thread-start function. Called once by kernel init.
+pub fn set_thread_start_fn(f: ThreadStartFn) {
+    *THREAD_START_FN.lock() = Some(f);
 }
 
 /// Dispatch a syscall by number. This is architecture-independent; the
@@ -80,11 +115,221 @@ pub fn dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> Syscal
         S::DebugWrite => sys_debug_write(a1 as *const u8, a2 as usize),
         S::FramebufferInfo => sys_framebuffer_info(a1 as *mut FramebufferInfo),
         S::FramebufferBlit => sys_framebuffer_blit(a1 as *const FramebufferBlitArgs),
+        S::ProcessCreate => sys_process_create(
+            a1 as *const u8,
+            a2 as usize,
+            a3 as *mut HandleValue,
+            a4 as *mut HandleValue,
+        ),
+        S::ThreadCreate => sys_thread_create(
+            a1 as HandleValue,
+            a2 as *const u8,
+            a3 as usize,
+            a4 as *mut HandleValue,
+        ),
+        S::ThreadStart => sys_thread_start(
+            a1 as HandleValue,
+            a2,
+            a3,
+            a4 as *mut HandleValue,
+        ),
+        S::VmarMap => sys_vmar_map(a1 as *const VmarMapArgs),
+        S::PortCreate => sys_port_create(a1 as *mut HandleValue),
+        S::PortRead => sys_port_read(a1 as HandleValue, a2 as *mut PortPacket),
+        S::InterruptCreate => sys_interrupt_create(a1 as u32, a2 as *mut HandleValue),
+        S::InterruptBindPort => sys_interrupt_bind_port(
+            a1 as HandleValue,
+            a2 as HandleValue,
+            a3,
+        ),
+        S::ProcessWait => Err(ErrorCode::NotSupported),
     }
 }
 
 fn sys_nop() -> SyscallResult {
     Ok(0)
+}
+
+
+const MAX_PROCESS_NAME_LEN: usize = 64;
+
+fn sys_process_create(
+    name_ptr: *const u8,
+    name_len: usize,
+    out_process: *mut HandleValue,
+    out_root_vmar: *mut HandleValue,
+) -> SyscallResult {
+    if out_process.is_null() || out_root_vmar.is_null() || name_len > MAX_PROCESS_NAME_LEN {
+        return Err(ErrorCode::InvalidArgs);
+    }
+    if name_len > 0 && name_ptr.is_null() {
+        return Err(ErrorCode::InvalidArgs);
+    }
+
+    let name = if name_len == 0 {
+        "process"
+    } else {
+        let bytes = unsafe { core::slice::from_raw_parts(name_ptr, name_len) };
+        core::str::from_utf8(bytes).map_err(|_| ErrorCode::InvalidArgs)?
+    };
+
+    let create = (*PROCESS_CREATE_FN.lock()).ok_or(ErrorCode::NotSupported)?;
+    let (process, root_vmar) = create(name)?;
+
+    let caller = current_proc()?;
+    let process_handle = caller
+        .handles
+        .add(Handle::new(process.koid(), Rights::DEFAULT));
+    let root_vmar_handle = caller
+        .handles
+        .add(Handle::new(root_vmar.koid(), Rights::DEFAULT));
+
+    unsafe {
+        *out_process = process_handle;
+        *out_root_vmar = root_vmar_handle;
+    }
+    Ok(0)
+}
+
+
+
+
+fn sys_thread_create(
+    process_handle: HandleValue,
+    name_ptr: *const u8,
+    name_len: usize,
+    out_thread: *mut HandleValue,
+) -> SyscallResult {
+    if out_thread.is_null() || name_len > MAX_PROCESS_NAME_LEN {
+        return Err(ErrorCode::InvalidArgs);
+    }
+    if name_len > 0 && name_ptr.is_null() {
+        return Err(ErrorCode::InvalidArgs);
+    }
+
+    let name = if name_len == 0 {
+        "thread"
+    } else {
+        let bytes = unsafe { core::slice::from_raw_parts(name_ptr, name_len) };
+        core::str::from_utf8(bytes).map_err(|_| ErrorCode::InvalidArgs)?
+    };
+
+    let caller = current_proc()?;
+    let process_h = caller
+        .handles
+        .get(process_handle)
+        .ok_or(ErrorCode::BadHandle)?;
+    if !process_h.has_rights(Rights::WRITE) {
+        return Err(ErrorCode::AccessDenied);
+    }
+
+    let process_obj = huesos_object::lookup_object(process_h.koid).ok_or(ErrorCode::BadHandle)?;
+    let process = process_obj
+        .downcast_ref::<huesos_object::Process>()
+        .ok_or(ErrorCode::WrongType)?;
+
+    let thread = huesos_object::Thread::new_for_process(name, process.koid());
+    let thread_koid = thread.koid();
+    huesos_object::register_object(thread);
+    let thread_handle = caller
+        .handles
+        .add(Handle::new(thread_koid, Rights::DEFAULT));
+
+    unsafe {
+        *out_thread = thread_handle;
+    }
+    Ok(0)
+}
+
+
+fn sys_thread_start(
+    thread_handle: HandleValue,
+    entry: u64,
+    stack: u64,
+    out_parent_bootstrap: *mut HandleValue,
+) -> SyscallResult {
+    if entry < huesos_abi::USER_ASPACE_BASE
+        || entry >= huesos_abi::USER_ASPACE_END
+        || stack < huesos_abi::USER_ASPACE_BASE
+        || stack >= huesos_abi::USER_ASPACE_END
+        || out_parent_bootstrap.is_null()
+    {
+        return Err(ErrorCode::InvalidArgs);
+    }
+
+    let caller = current_proc()?;
+    let thread_h = caller
+        .handles
+        .get(thread_handle)
+        .ok_or(ErrorCode::BadHandle)?;
+    if !thread_h.has_rights(Rights::WRITE) {
+        return Err(ErrorCode::AccessDenied);
+    }
+
+    let thread_obj = huesos_object::lookup_object(thread_h.koid).ok_or(ErrorCode::BadHandle)?;
+    let thread = thread_obj
+        .downcast_ref::<huesos_object::Thread>()
+        .ok_or(ErrorCode::WrongType)?;
+
+    if thread.task_id.lock().is_some() {
+        return Err(ErrorCode::Busy);
+    }
+
+    let child_process =
+        huesos_object::lookup_process(thread.process()).ok_or(ErrorCode::BadHandle)?;
+
+    let (parent_bootstrap, child_bootstrap) = huesos_object::Channel::pair();
+    let parent_koid = parent_bootstrap.koid();
+    let child_koid = child_bootstrap.koid();
+    huesos_object::register_object(parent_bootstrap);
+    huesos_object::register_object(child_bootstrap);
+
+    child_process
+        .handles
+        .insert_at(BOOTSTRAP_HANDLE, Handle::new(child_koid, Rights::DEFAULT))
+        .map_err(|_| ErrorCode::Busy)?;
+
+    let start = (*THREAD_START_FN.lock()).ok_or(ErrorCode::NotSupported)?;
+    let task_id = start(thread, entry, stack)?;
+
+    let parent_handle = caller
+        .handles
+        .add(Handle::new(parent_koid, Rights::DEFAULT));
+    unsafe {
+        *out_parent_bootstrap = parent_handle;
+    }
+    Ok(task_id as i64)
+}
+
+fn sys_vmar_map(args_ptr: *const VmarMapArgs) -> SyscallResult {
+    if args_ptr.is_null() {
+        return Err(ErrorCode::InvalidArgs);
+    }
+    let args = unsafe { core::ptr::read_unaligned(args_ptr) };
+
+    let proc = current_proc()?;
+    let vmar_handle = proc.handles.get(args.vmar).ok_or(ErrorCode::BadHandle)?;
+    if !vmar_handle.has_rights(Rights::WRITE) {
+        return Err(ErrorCode::AccessDenied);
+    }
+    let vmo_handle = proc.handles.get(args.vmo).ok_or(ErrorCode::BadHandle)?;
+    if !vmo_handle.has_rights(Rights::MAP) {
+        return Err(ErrorCode::AccessDenied);
+    }
+
+    let vmar_obj = huesos_object::lookup_object(vmar_handle.koid).ok_or(ErrorCode::BadHandle)?;
+    let vmar = vmar_obj
+        .downcast_ref::<huesos_object::Vmar>()
+        .ok_or(ErrorCode::WrongType)?;
+
+    let vmo_obj = huesos_object::lookup_object(vmo_handle.koid).ok_or(ErrorCode::BadHandle)?;
+    let vmo = vmo_obj
+        .downcast_ref::<huesos_object::Vmo>()
+        .ok_or(ErrorCode::WrongType)?;
+
+    let map = (*VMAR_MAP_FN.lock()).ok_or(ErrorCode::NotSupported)?;
+    let mapped = map(vmar, vmo, args)?;
+    Ok(mapped as i64)
 }
 
 fn current_proc() -> Result<alloc::sync::Arc<huesos_object::Process>, ErrorCode> {
@@ -294,6 +539,101 @@ fn sys_debug_write(buf: *const u8, len: usize) -> SyscallResult {
         f(slice);
     }
     Ok(len as i64)
+}
+
+
+fn sys_port_create(out: *mut HandleValue) -> SyscallResult {
+    if out.is_null() {
+        return Err(ErrorCode::InvalidArgs);
+    }
+    let port = huesos_object::Port::new();
+    let koid = port.koid();
+    huesos_object::register_object(port);
+    let proc = current_proc()?;
+    let handle = proc.handles.add(Handle::new(koid, Rights::DEFAULT));
+    unsafe {
+        *out = handle;
+    }
+    Ok(0)
+}
+
+fn sys_port_read(port_handle: HandleValue, out: *mut PortPacket) -> SyscallResult {
+    if out.is_null() {
+        return Err(ErrorCode::InvalidArgs);
+    }
+    let proc = current_proc()?;
+    let h = proc.handles.get(port_handle).ok_or(ErrorCode::BadHandle)?;
+    if !h.has_rights(Rights::READ) {
+        return Err(ErrorCode::AccessDenied);
+    }
+    let obj = huesos_object::lookup_object(h.koid).ok_or(ErrorCode::BadHandle)?;
+    let port = obj
+        .downcast_ref::<huesos_object::Port>()
+        .ok_or(ErrorCode::WrongType)?;
+    let packet = port.read().ok_or(ErrorCode::ShouldWait)?;
+    unsafe {
+        *out = PortPacket {
+            key: packet.key,
+            packet_type: packet.packet_type,
+            status: packet.status,
+            data: packet.data,
+        };
+    }
+    Ok(0)
+}
+
+const KEYBOARD_IRQ: u32 = 1;
+
+fn sys_interrupt_create(irq: u32, out: *mut HandleValue) -> SyscallResult {
+    if out.is_null() {
+        return Err(ErrorCode::InvalidArgs);
+    }
+    if irq != KEYBOARD_IRQ {
+        return Err(ErrorCode::NotSupported);
+    }
+
+    let interrupt = huesos_object::Interrupt::new(irq as u8);
+    let koid = interrupt.koid();
+    huesos_object::register_interrupt(interrupt);
+
+    let proc = current_proc()?;
+    let handle = proc.handles.add(Handle::new(koid, Rights::DEFAULT));
+    unsafe {
+        *out = handle;
+    }
+    Ok(0)
+}
+
+fn sys_interrupt_bind_port(
+    interrupt_handle: HandleValue,
+    port_handle: HandleValue,
+    key: u64,
+) -> SyscallResult {
+    let proc = current_proc()?;
+    let interrupt_h = proc
+        .handles
+        .get(interrupt_handle)
+        .ok_or(ErrorCode::BadHandle)?;
+    if !interrupt_h.has_rights(Rights::WRITE) {
+        return Err(ErrorCode::AccessDenied);
+    }
+    let port_h = proc.handles.get(port_handle).ok_or(ErrorCode::BadHandle)?;
+    if !port_h.has_rights(Rights::WRITE) {
+        return Err(ErrorCode::AccessDenied);
+    }
+
+    let interrupt_obj = huesos_object::lookup_object(interrupt_h.koid).ok_or(ErrorCode::BadHandle)?;
+    let interrupt = interrupt_obj
+        .downcast_ref::<huesos_object::Interrupt>()
+        .ok_or(ErrorCode::WrongType)?;
+
+    let port_obj = huesos_object::lookup_object(port_h.koid).ok_or(ErrorCode::BadHandle)?;
+    let port = port_obj
+        .downcast_ref::<huesos_object::Port>()
+        .ok_or(ErrorCode::WrongType)?;
+
+    interrupt.bind_port(port.koid(), key);
+    Ok(0)
 }
 
 fn sys_framebuffer_info(out: *mut FramebufferInfo) -> SyscallResult {
