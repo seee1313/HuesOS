@@ -212,6 +212,24 @@ pub mod rights {
     pub const SAME_RIGHTS: u32 = 1 << 31;
 }
 
+
+/// VMAR mapping flags for [`Syscall::VmarMap`].
+pub mod vmar_flags {
+    /// Map pages readable from userspace.
+    pub const READ: u32 = 1 << 0;
+    /// Map pages writable from userspace.
+    pub const WRITE: u32 = 1 << 1;
+    /// Map pages executable from userspace.
+    pub const EXECUTE: u32 = 1 << 2;
+    /// Mapping is user-accessible. This is explicit even though VMARs are
+    /// userspace address-space objects, so the permission contract is clear
+    /// at the ABI boundary.
+    pub const USER: u32 = 1 << 3;
+    /// Use the exact virtual address in `VmarMapArgs.addr`; without this,
+    /// a future implementation may choose a suitable address and return it.
+    pub const SPECIFIC: u32 = 1 << 4;
+}
+
 /// Framebuffer geometry and pixel format, as returned by
 /// [`Syscall::FramebufferInfo`]. `#[repr(C)]` and plain-old-data so it can
 /// be copied byte-for-byte across the syscall boundary via a pointer.
@@ -281,8 +299,6 @@ pub struct VmarMapArgs {
     pub addr: u64,
     /// Mapping length in bytes.
     pub len: u64,
-    /// Mapping options/permissions. The exact bit layout is intentionally
-    /// left to the VMAR implementation commit so this skeleton only reserves
-    /// the ABI shape, not final policy.
+    /// Mapping options/permissions from [`vmar_flags`].
     pub flags: u32,
 }

@@ -132,8 +132,7 @@ impl Thread {
 impl Vmar {
     /// Map `vmo` into this VMAR.
     ///
-    /// `flags` is intentionally raw until the VMAR implementation commit
-    /// finalizes the permission/options bit layout.
+    /// `flags` is a bitmask from [`huesos_abi::vmar_flags`].
     pub fn map(
         &self,
         vmo: &Vmo,
