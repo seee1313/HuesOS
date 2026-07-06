@@ -111,8 +111,14 @@ pub fn dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> Syscal
             a3 as *mut HandleValue,
             a4 as *mut HandleValue,
         ),
+        S::ThreadCreate => sys_thread_create(
+            a1 as HandleValue,
+            a2 as *const u8,
+            a3 as usize,
+            a4 as *mut HandleValue,
+        ),
         S::VmarMap => sys_vmar_map(a1 as *const VmarMapArgs),
-        S::ProcessWait | S::ThreadCreate | S::ThreadStart => Err(ErrorCode::NotSupported),
+        S::ProcessWait | S::ThreadStart => Err(ErrorCode::NotSupported),
     }
 }
 
@@ -162,6 +168,54 @@ fn sys_process_create(
 }
 
 
+
+
+fn sys_thread_create(
+    process_handle: HandleValue,
+    name_ptr: *const u8,
+    name_len: usize,
+    out_thread: *mut HandleValue,
+) -> SyscallResult {
+    if out_thread.is_null() || name_len > MAX_PROCESS_NAME_LEN {
+        return Err(ErrorCode::InvalidArgs);
+    }
+    if name_len > 0 && name_ptr.is_null() {
+        return Err(ErrorCode::InvalidArgs);
+    }
+
+    let name = if name_len == 0 {
+        "thread"
+    } else {
+        let bytes = unsafe { core::slice::from_raw_parts(name_ptr, name_len) };
+        core::str::from_utf8(bytes).map_err(|_| ErrorCode::InvalidArgs)?
+    };
+
+    let caller = current_proc()?;
+    let process_h = caller
+        .handles
+        .get(process_handle)
+        .ok_or(ErrorCode::BadHandle)?;
+    if !process_h.has_rights(Rights::WRITE) {
+        return Err(ErrorCode::AccessDenied);
+    }
+
+    let process_obj = huesos_object::lookup_object(process_h.koid).ok_or(ErrorCode::BadHandle)?;
+    let process = process_obj
+        .downcast_ref::<huesos_object::Process>()
+        .ok_or(ErrorCode::WrongType)?;
+
+    let thread = huesos_object::Thread::new_for_process(name, process.koid());
+    let thread_koid = thread.koid();
+    huesos_object::register_object(thread);
+    let thread_handle = caller
+        .handles
+        .add(Handle::new(thread_koid, Rights::DEFAULT));
+
+    unsafe {
+        *out_thread = thread_handle;
+    }
+    Ok(0)
+}
 
 fn sys_vmar_map(args_ptr: *const VmarMapArgs) -> SyscallResult {
     if args_ptr.is_null() {
