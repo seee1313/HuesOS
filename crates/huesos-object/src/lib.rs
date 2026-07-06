@@ -727,6 +727,7 @@ impl KernelObject for Job {
 pub struct Thread {
     koid: Koid,
     name: Mutex<String>,
+    process: Koid,
     /// Scheduler task id this Thread object corresponds to.
     pub task_id: Mutex<Option<u64>>,
 }
@@ -734,11 +735,22 @@ pub struct Thread {
 impl Thread {
     /// Create a thread object (not yet bound to a scheduler task).
     pub fn new(name: &str) -> Arc<Self> {
+        Self::new_for_process(name, Koid::INVALID)
+    }
+
+    /// Create a suspended thread object associated with `process`.
+    pub fn new_for_process(name: &str, process: Koid) -> Arc<Self> {
         Arc::new(Self {
             koid: alloc_koid(),
             name: Mutex::new(String::from(name)),
+            process,
             task_id: Mutex::new(None),
         })
+    }
+
+    /// Process this thread belongs to.
+    pub const fn process(&self) -> Koid {
+        self.process
     }
 }
 
@@ -921,6 +933,14 @@ mod tests {
             flags: 0,
         };
         assert!(vmar.record_mapping(outside).is_err());
+    }
+
+
+    #[test]
+    fn thread_records_owning_process() {
+        let thread = Thread::new_for_process("worker", Koid(123));
+        assert_eq!(thread.process(), Koid(123));
+        assert_eq!(*thread.task_id.lock(), None);
     }
 
     #[test]
