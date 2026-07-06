@@ -14,9 +14,9 @@ use x86_64::structures::paging::{Page, PageTableFlags, PhysFrame, Size4KiB};
 use x86_64::{PhysAddr, VirtAddr};
 
 /// Top of the initial user stack (grows down from here).
-const USER_STACK_TOP: u64 = 0x0000_7fff_ff00_0000;
+const USER_STACK_TOP: u64 = huesos_abi::USER_STACK_TOP;
 /// Size of the initial user stack.
-const USER_STACK_SIZE: u64 = 4096 * 16;
+const USER_STACK_SIZE: u64 = huesos_abi::USER_STACK_SIZE;
 
 
 /// Kernel-owned runtime state for a process.

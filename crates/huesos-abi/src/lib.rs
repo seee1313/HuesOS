@@ -223,6 +223,12 @@ pub const USER_ASPACE_END: u64 = 0x0000_8000_0000_0000;
 /// Size of the root userspace VMAR.
 pub const USER_ASPACE_SIZE: u64 = USER_ASPACE_END - USER_ASPACE_BASE;
 
+
+/// Top of the initial stack used by the userspace process launcher.
+pub const USER_STACK_TOP: u64 = 0x0000_7fff_ff00_0000;
+/// Size of the initial userspace stack mapped by the userspace process launcher.
+pub const USER_STACK_SIZE: u64 = 4096 * 16;
+
 /// VMAR mapping flags for [`Syscall::VmarMap`].
 pub mod vmar_flags {
     /// Map pages readable from userspace.
