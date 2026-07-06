@@ -25,6 +25,9 @@ migration so implementation work stays explicit and reviewable.
 - `ProcessWait` remains `NotSupported` until the Port/blocking wait model is implemented.
 - `ThreadCreate` creates suspended thread objects associated with a process.
 - `ThreadStart` installs the child bootstrap channel endpoint at handle 1, returns the parent endpoint, and schedules the new user task.
+- `libcanvas::process::spawn_elf` is the userspace static-ELF launcher used by init.
+- Kernel build now builds `driver-manager` and `terminal`, embeds their ELF bytes into init, and embeds only init into the kernel.
+- Current DriverManager/terminal are skeleton services: DriverManager sends a ready message and parks; terminal paints a framebuffer banner and parks.
 - Work must be split into small commits.
 
 ## Immediate open decisions before code changes
