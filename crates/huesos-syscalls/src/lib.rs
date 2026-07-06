@@ -16,7 +16,8 @@ use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 use huesos_abi::{
-    ErrorCode, FramebufferBlitArgs, FramebufferInfo, HandleValue, VmarMapArgs, INVALID_HANDLE,
+    ErrorCode, FramebufferBlitArgs, FramebufferInfo, HandleValue, VmarMapArgs, BOOTSTRAP_HANDLE,
+    INVALID_HANDLE,
 };
 use huesos_object::{Handle, KernelObject, KernelObjectExt, Rights};
 use spin::Mutex;
@@ -37,11 +38,15 @@ pub type ProcessCreateFn =
 /// Kernel callback type used by the syscall layer to map a VMO into a VMAR.
 pub type VmarMapFn =
     fn(&huesos_object::Vmar, &huesos_object::Vmo, VmarMapArgs) -> Result<u64, ErrorCode>;
+/// Kernel callback type used by the syscall layer to start a suspended thread.
+pub type ThreadStartFn = fn(&huesos_object::Thread, u64, u64) -> Result<u64, ErrorCode>;
 
 /// Global process-create callback (set by the kernel process layer).
 static PROCESS_CREATE_FN: Mutex<Option<ProcessCreateFn>> = Mutex::new(None);
 /// Global VMAR-map callback (set by the kernel process layer).
 static VMAR_MAP_FN: Mutex<Option<VmarMapFn>> = Mutex::new(None);
+/// Global thread-start callback (set by the kernel scheduler/process layer).
+static THREAD_START_FN: Mutex<Option<ThreadStartFn>> = Mutex::new(None);
 
 /// Set the yield function. Called once by kernel init.
 pub fn set_yield_fn(f: fn()) {
@@ -66,6 +71,11 @@ pub fn set_process_create_fn(f: ProcessCreateFn) {
 /// Set the VMAR-map function. Called once by kernel init.
 pub fn set_vmar_map_fn(f: VmarMapFn) {
     *VMAR_MAP_FN.lock() = Some(f);
+}
+
+/// Set the thread-start function. Called once by kernel init.
+pub fn set_thread_start_fn(f: ThreadStartFn) {
+    *THREAD_START_FN.lock() = Some(f);
 }
 
 /// Dispatch a syscall by number. This is architecture-independent; the
@@ -117,8 +127,14 @@ pub fn dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> Syscal
             a3 as usize,
             a4 as *mut HandleValue,
         ),
+        S::ThreadStart => sys_thread_start(
+            a1 as HandleValue,
+            a2,
+            a3,
+            a4 as *mut HandleValue,
+        ),
         S::VmarMap => sys_vmar_map(a1 as *const VmarMapArgs),
-        S::ProcessWait | S::ThreadStart => Err(ErrorCode::NotSupported),
+        S::ProcessWait => Err(ErrorCode::NotSupported),
     }
 }
 
@@ -215,6 +231,66 @@ fn sys_thread_create(
         *out_thread = thread_handle;
     }
     Ok(0)
+}
+
+
+fn sys_thread_start(
+    thread_handle: HandleValue,
+    entry: u64,
+    stack: u64,
+    out_parent_bootstrap: *mut HandleValue,
+) -> SyscallResult {
+    if entry < huesos_abi::USER_ASPACE_BASE
+        || entry >= huesos_abi::USER_ASPACE_END
+        || stack < huesos_abi::USER_ASPACE_BASE
+        || stack >= huesos_abi::USER_ASPACE_END
+        || out_parent_bootstrap.is_null()
+    {
+        return Err(ErrorCode::InvalidArgs);
+    }
+
+    let caller = current_proc()?;
+    let thread_h = caller
+        .handles
+        .get(thread_handle)
+        .ok_or(ErrorCode::BadHandle)?;
+    if !thread_h.has_rights(Rights::WRITE) {
+        return Err(ErrorCode::AccessDenied);
+    }
+
+    let thread_obj = huesos_object::lookup_object(thread_h.koid).ok_or(ErrorCode::BadHandle)?;
+    let thread = thread_obj
+        .downcast_ref::<huesos_object::Thread>()
+        .ok_or(ErrorCode::WrongType)?;
+
+    if thread.task_id.lock().is_some() {
+        return Err(ErrorCode::Busy);
+    }
+
+    let child_process =
+        huesos_object::lookup_process(thread.process()).ok_or(ErrorCode::BadHandle)?;
+
+    let (parent_bootstrap, child_bootstrap) = huesos_object::Channel::pair();
+    let parent_koid = parent_bootstrap.koid();
+    let child_koid = child_bootstrap.koid();
+    huesos_object::register_object(parent_bootstrap);
+    huesos_object::register_object(child_bootstrap);
+
+    child_process
+        .handles
+        .insert_at(BOOTSTRAP_HANDLE, Handle::new(child_koid, Rights::DEFAULT))
+        .map_err(|_| ErrorCode::Busy)?;
+
+    let start = (*THREAD_START_FN.lock()).ok_or(ErrorCode::NotSupported)?;
+    let task_id = start(thread, entry, stack)?;
+
+    let parent_handle = caller
+        .handles
+        .add(Handle::new(parent_koid, Rights::DEFAULT));
+    unsafe {
+        *out_parent_bootstrap = parent_handle;
+    }
+    Ok(task_id as i64)
 }
 
 fn sys_vmar_map(args_ptr: *const VmarMapArgs) -> SyscallResult {

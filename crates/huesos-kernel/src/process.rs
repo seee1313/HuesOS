@@ -234,6 +234,49 @@ fn page_flags_from_vmar_flags(flags: u32) -> Result<PageTableFlags, ErrorCode> {
     Ok(pt_flags)
 }
 
+
+/// Start a suspended userspace thread.
+///
+/// The syscall layer owns bootstrap-channel creation and installs the child
+/// endpoint before calling this function; this function only validates the
+/// target process runtime, creates the scheduler task, and records the task
+/// id on the thread object.
+pub fn start_thread(
+    thread: &huesos_object::Thread,
+    entry: u64,
+    stack: u64,
+) -> Result<u64, ErrorCode> {
+    if entry < huesos_abi::USER_ASPACE_BASE
+        || entry >= huesos_abi::USER_ASPACE_END
+        || stack < huesos_abi::USER_ASPACE_BASE
+        || stack >= huesos_abi::USER_ASPACE_END
+    {
+        return Err(ErrorCode::InvalidArgs);
+    }
+
+    if thread.task_id.lock().is_some() {
+        return Err(ErrorCode::Busy);
+    }
+
+    let process = huesos_object::lookup_process(thread.process()).ok_or(ErrorCode::BadHandle)?;
+    let cr3 = {
+        let mut runtime_guard = process.address_space.lock();
+        let runtime = runtime_guard
+            .as_mut()
+            .and_then(|runtime| runtime.downcast_mut::<ProcessRuntime>())
+            .ok_or(ErrorCode::BadHandle)?;
+        runtime.cr3()
+    };
+
+    let mut task_name = [0u8; 32];
+    let label = b"user-thread";
+    task_name[..label.len()].copy_from_slice(label);
+
+    let task_id = crate::scheduler::spawn_user_thread(&task_name, process, entry, stack, cr3);
+    *thread.task_id.lock() = Some(task_id);
+    Ok(task_id)
+}
+
 /// Load `elf_bytes` into a brand new address space and prepare a process
 /// object ready to hand to the scheduler.
 pub fn spawn_from_elf(name: &str, elf_bytes: &[u8]) -> SpawnedProcess {
