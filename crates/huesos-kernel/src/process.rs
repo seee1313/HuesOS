@@ -98,7 +98,7 @@ pub fn create_suspended_process(
     name: &str,
 ) -> Result<(Arc<Process>, Arc<Vmar>), huesos_abi::ErrorCode> {
     let process = Process::new(if name.is_empty() { "process" } else { name });
-    huesos_object::register_object(process.clone());
+    huesos_object::register_process(process.clone());
 
     let runtime = ProcessRuntime::new(process.koid());
     let root_vmar = Arc::clone(&runtime.root_vmar);
@@ -238,6 +238,7 @@ fn page_flags_from_vmar_flags(flags: u32) -> Result<PageTableFlags, ErrorCode> {
 /// object ready to hand to the scheduler.
 pub fn spawn_from_elf(name: &str, elf_bytes: &[u8]) -> SpawnedProcess {
     let process = Process::new(name);
+    huesos_object::register_process(process.clone());
     let runtime = ProcessRuntime::new(process.koid());
 
     let loaded = {
