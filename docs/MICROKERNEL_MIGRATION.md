@@ -18,7 +18,7 @@ migration so implementation work stays explicit and reviewable.
 - Initial VMAR map flags are `READ`, `WRITE`, `EXECUTE`, `USER`, and `SPECIFIC`.
 - Root VMAR uses a 64 KiB low guard and spans `[0x0000_0000_0001_0000, 0x0000_8000_0000_0000)`.
 - First VMAR implementation is root-VMAR mapping only; child VMAR allocation/tree APIs come later.
-- `VmarMap` is strict fixed-address mapping only: callers must set `SPECIFIC`.
+- `VmarMap` is strict fixed-address mapping only: callers must set `SPECIFIC`; the MVP implementation is page-aligned, root-VMAR-only, user-only, non-W+X, and maps existing VMO frames into the target process address space.
 - Process runtime state is stored behind `Process.address_space` as a kernel-side `ProcessRuntime` via `Box<dyn Any>`.
 - `ProcessCreate` returns current `Rights::DEFAULT` handles for both the process and root VMAR.
 - Empty process names are allowed and become `process`; non-empty names are UTF-8 and capped at 64 bytes.
