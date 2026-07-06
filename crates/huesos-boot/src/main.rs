@@ -98,6 +98,12 @@ pub unsafe extern "C" fn kmain_entry() -> ! {
             height: fb.height,
             pitch: fb.pitch,
             bpp: fb.bpp,
+            red_mask_size: fb.red_mask_size,
+            red_mask_shift: fb.red_mask_shift,
+            green_mask_size: fb.green_mask_size,
+            green_mask_shift: fb.green_mask_shift,
+            blue_mask_size: fb.blue_mask_size,
+            blue_mask_shift: fb.blue_mask_shift,
         });
 
     let boot_info = BootInfo {

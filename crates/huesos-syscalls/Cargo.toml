@@ -8,6 +8,8 @@ license.workspace = true
 [dependencies]
 huesos-object = { path = "../huesos-object" }
 huesos-arch = { path = "../huesos-arch" }
+huesos-abi = { path = "../huesos-abi" }
+huesos-fb = { path = "../huesos-fb" }
 bitflags = { workspace = true }
 spin = { workspace = true }
 log = { workspace = true }

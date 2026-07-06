@@ -1,0 +1,10 @@
+[package]
+name = "huesos-fb"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+spin = { workspace = true }
+huesos-abi = { path = "../huesos-abi" }

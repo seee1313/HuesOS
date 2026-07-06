@@ -8,6 +8,8 @@ members = [
     "crates/huesos-kernel",
     "crates/huesos-elf",
     "crates/huesos-pmm",
+    "crates/huesos-abi",
+    "crates/huesos-fb",
 ]
 resolver = "2"
 # NOTE: crates/huesos-userspace/init is intentionally NOT a member of this

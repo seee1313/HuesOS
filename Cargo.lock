@@ -27,6 +27,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "413d67b29ef1021b4d60f4aa1e925ca031751e213832b4b1d588fae623c05c60"
 
 [[package]]
+name = "huesos-abi"
+version = "0.1.0"
+
+[[package]]
 name = "huesos-arch"
 version = "0.1.0"
 dependencies = [
@@ -61,6 +65,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "huesos-fb"
+version = "0.1.0"
+dependencies = [
+ "huesos-abi",
+ "spin",
+]
+
+[[package]]
 name = "huesos-hal"
 version = "0.1.0"
 dependencies = [
@@ -73,8 +85,10 @@ dependencies = [
 name = "huesos-kernel"
 version = "0.1.0"
 dependencies = [
+ "huesos-abi",
  "huesos-arch",
  "huesos-elf",
+ "huesos-fb",
  "huesos-hal",
  "huesos-object",
  "huesos-pmm",
@@ -108,7 +122,9 @@ name = "huesos-syscalls"
 version = "0.1.0"
 dependencies = [
  "bitflags 2.13.0",
+ "huesos-abi",
  "huesos-arch",
+ "huesos-fb",
  "huesos-object",
  "log",
  "spin",

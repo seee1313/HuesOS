@@ -43,6 +43,18 @@ pub struct FramebufferInfo {
     pub pitch: u64,
     /// Bits per pixel.
     pub bpp: u16,
+    /// Red channel bit count.
+    pub red_mask_size: u8,
+    /// Red channel LSB bit position.
+    pub red_mask_shift: u8,
+    /// Green channel bit count.
+    pub green_mask_size: u8,
+    /// Green channel LSB bit position.
+    pub green_mask_shift: u8,
+    /// Blue channel bit count.
+    pub blue_mask_size: u8,
+    /// Blue channel LSB bit position.
+    pub blue_mask_shift: u8,
 }
 
 /// Everything the bootloader hands off to `kmain`, architecture/bootloader
@@ -77,6 +89,7 @@ pub unsafe fn kmain(boot_info: BootInfo) -> ! {
 
     init::heap_init();
     init::object_init();
+    init::framebuffer_init(boot_info.framebuffer);
     huesos_hal::init();
 
     init::syscall_init();

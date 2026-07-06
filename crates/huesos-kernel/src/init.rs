@@ -48,6 +48,24 @@ pub fn object_init() {
     huesos_object::set_phys_to_virt(|phys| huesos_arch::paging::phys_to_virt(phys).as_u64());
 }
 
+/// Initialize the framebuffer driver from bootloader-provided geometry, if
+/// any was available.
+pub fn framebuffer_init(fb: Option<crate::FramebufferInfo>) {
+    huesos_fb::init(fb.map(|fb| huesos_fb::FramebufferConfig {
+        addr: fb.addr,
+        width: fb.width as u32,
+        height: fb.height as u32,
+        pitch: fb.pitch as u32,
+        bpp: fb.bpp,
+        red_mask_size: fb.red_mask_size,
+        red_mask_shift: fb.red_mask_shift,
+        green_mask_size: fb.green_mask_size,
+        green_mask_shift: fb.green_mask_shift,
+        blue_mask_size: fb.blue_mask_size,
+        blue_mask_shift: fb.blue_mask_shift,
+    }));
+}
+
 /// Wire up the syscall trampoline (STAR/LSTAR/SFMASK) and the
 /// architecture-independent dispatcher it calls into.
 pub fn syscall_init() {
