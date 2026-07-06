@@ -1,0 +1,101 @@
+//! Port and interrupt bridge syscalls.
+
+use huesos_abi::{ErrorCode, HandleValue, PortPacket};
+use huesos_object::{Handle, KernelObject, KernelObjectExt, Rights};
+
+use crate::{util::current_proc, SyscallResult};
+
+pub(crate) fn sys_port_create(out: *mut HandleValue) -> SyscallResult {
+    if out.is_null() {
+        return Err(ErrorCode::InvalidArgs);
+    }
+    let port = huesos_object::Port::new();
+    let koid = port.koid();
+    huesos_object::register_object(port);
+    let proc = current_proc()?;
+    let handle = proc.handles.add(Handle::new(koid, Rights::DEFAULT));
+    unsafe {
+        *out = handle;
+    }
+    Ok(0)
+}
+
+pub(crate) fn sys_port_read(port_handle: HandleValue, out: *mut PortPacket) -> SyscallResult {
+    if out.is_null() {
+        return Err(ErrorCode::InvalidArgs);
+    }
+    let proc = current_proc()?;
+    let h = proc.handles.get(port_handle).ok_or(ErrorCode::BadHandle)?;
+    if !h.has_rights(Rights::READ) {
+        return Err(ErrorCode::AccessDenied);
+    }
+    let obj = huesos_object::lookup_object(h.koid).ok_or(ErrorCode::BadHandle)?;
+    let port = obj
+        .downcast_ref::<huesos_object::Port>()
+        .ok_or(ErrorCode::WrongType)?;
+    let packet = port.read().ok_or(ErrorCode::ShouldWait)?;
+    unsafe {
+        *out = PortPacket {
+            key: packet.key,
+            packet_type: packet.packet_type,
+            status: packet.status,
+            data: packet.data,
+        };
+    }
+    Ok(0)
+}
+
+const KEYBOARD_IRQ: u32 = 1;
+
+pub(crate) fn sys_interrupt_create(irq: u32, out: *mut HandleValue) -> SyscallResult {
+    if out.is_null() {
+        return Err(ErrorCode::InvalidArgs);
+    }
+    if irq != KEYBOARD_IRQ {
+        return Err(ErrorCode::NotSupported);
+    }
+
+    let interrupt = huesos_object::Interrupt::new(irq as u8);
+    let koid = interrupt.koid();
+    huesos_object::register_interrupt(interrupt);
+
+    let proc = current_proc()?;
+    let handle = proc.handles.add(Handle::new(koid, Rights::DEFAULT));
+    unsafe {
+        *out = handle;
+    }
+    Ok(0)
+}
+
+pub(crate) fn sys_interrupt_bind_port(
+    interrupt_handle: HandleValue,
+    port_handle: HandleValue,
+    key: u64,
+) -> SyscallResult {
+    let proc = current_proc()?;
+    let interrupt_h = proc
+        .handles
+        .get(interrupt_handle)
+        .ok_or(ErrorCode::BadHandle)?;
+    if !interrupt_h.has_rights(Rights::WRITE) {
+        return Err(ErrorCode::AccessDenied);
+    }
+    let port_h = proc.handles.get(port_handle).ok_or(ErrorCode::BadHandle)?;
+    if !port_h.has_rights(Rights::WRITE) {
+        return Err(ErrorCode::AccessDenied);
+    }
+
+    let interrupt_obj =
+        huesos_object::lookup_object(interrupt_h.koid).ok_or(ErrorCode::BadHandle)?;
+    let interrupt = interrupt_obj
+        .downcast_ref::<huesos_object::Interrupt>()
+        .ok_or(ErrorCode::WrongType)?;
+
+    let port_obj = huesos_object::lookup_object(port_h.koid).ok_or(ErrorCode::BadHandle)?;
+    let port = port_obj
+        .downcast_ref::<huesos_object::Port>()
+        .ok_or(ErrorCode::WrongType)?;
+
+    interrupt.bind_port(port.koid(), key);
+    Ok(0)
+}
