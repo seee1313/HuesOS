@@ -24,11 +24,12 @@ roadmap covers what's next, roughly in priority order.
   frames to `huesos-pmm`) and the task's kernel stack.
 
 ### 3. Blocking syscalls / wait primitives
-- **Current**: `ChannelRead` returns `ShouldWait` immediately if empty;
-  there's no way for a thread to actually block until data arrives.
+- **Current**: `ChannelRead` and `PortRead` return `ShouldWait`
+  immediately if empty; keyboard IRQ1 can already queue non-blocking
+  interrupt packets to a userspace Port.
 - **Needed**: real blocking (park the task, wake it from the IRQ/syscall
-  path that delivers the awaited event) plus `Port`-based multiplexed
-  waiting (the `Port` object exists but isn't wired to anything yet).
+  path that delivers the awaited event) plus Port-based multiplexed waits
+  instead of polling/yield loops.
 
 ## Short Term
 

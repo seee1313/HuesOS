@@ -38,6 +38,8 @@ and [docs/ROADMAP.md](docs/ROADMAP.md) for what's next.
   and receives bootstrap channels
 - ✅ VMOs backed by real physical page frames (not a `Vec<u8>` placeholder)
 - ✅ Channel IPC with real connected pairs (`Channel::pair()`)
+- ✅ PS/2 keyboard IRQ bridge to userspace via Interrupt objects + Ports
+  (DriverManager can receive raw scancode packets)
 - ✅ PS/2 keyboard driver (scancode set 1 → ASCII) and PIT timer driver
 - ✅ Real framebuffer driver (`huesos-fb`): pixel/rect/text/blit
   primitives, bounds-checked against untrusted userspace input
