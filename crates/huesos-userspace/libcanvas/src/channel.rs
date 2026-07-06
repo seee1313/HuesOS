@@ -13,6 +13,16 @@ pub const DEFAULT_MAX_MESSAGE: usize = 4096;
 #[derive(Debug)]
 pub struct Channel(Handle);
 
+
+/// Take ownership of the process bootstrap channel endpoint installed by
+/// `ThreadStart` at [`huesos_abi::BOOTSTRAP_HANDLE`].
+///
+/// Only call this once in a freshly-started child process; it wraps a fixed
+/// raw handle number and will close that handle on drop.
+pub fn bootstrap() -> Channel {
+    unsafe { Channel::from_raw(huesos_abi::BOOTSTRAP_HANDLE) }
+}
+
 impl Channel {
     /// Wrap a raw handle known to name a Channel endpoint.
     ///
