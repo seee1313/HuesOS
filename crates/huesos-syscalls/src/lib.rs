@@ -431,7 +431,8 @@ fn sys_handle_duplicate(handle: HandleValue, rights: u32, out: *mut HandleValue)
 }
 
 fn sys_yield() -> SyscallResult {
-    if let Some(f) = *YIELD_FN.lock() {
+    let yield_fn = *YIELD_FN.lock();
+    if let Some(f) = yield_fn {
         f();
     }
     Ok(0)
@@ -521,7 +522,8 @@ fn sys_channel_read(
 }
 
 fn sys_process_exit(code: i64) -> SyscallResult {
-    if let Some(f) = *EXIT_FN.lock() {
+    let exit_fn = *EXIT_FN.lock();
+    if let Some(f) = exit_fn {
         f(code);
     }
     // No exit handler registered: park forever rather than UB.
