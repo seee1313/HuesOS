@@ -44,11 +44,20 @@ pub struct Task {
 
 impl Task {
     /// Create the idle task (no real stack, never preempted away from).
+    ///
+    /// Uses the *current* CR3 (the kernel's own address space) rather than
+    /// `Context::zero()`'s cr3=0: this task's context is only ever a
+    /// placeholder until the first context switch overwrites it with the
+    /// real suspended kmain state, but if a switch *back into* task 0 ever
+    /// happened before that first switch (or if `cr3` were otherwise never
+    /// updated — see the note on `context_switch` for why that's not
+    /// actually guaranteed), loading `cr3=0` would immediately triple-fault
+    /// the machine (there is no valid page table at physical address 0).
     pub fn new_idle(id: u64, name: [u8; 32]) -> Self {
         Self {
             id,
             name,
-            context: Context::zero(),
+            context: Context::zero_with_cr3(current_cr3()),
             kernel_stack: Vec::new(),
             kind: TaskKind::Kernel,
             finished: core::sync::atomic::AtomicBool::new(false),
@@ -109,7 +118,19 @@ impl Task {
 
     /// Top-of-stack address for this task's kernel stack (used to program
     /// TSS.RSP0 / the syscall kernel stack when this task is scheduled).
+    ///
+    /// Returns `0` for tasks with no real kernel stack (the idle task):
+    /// `Vec::as_ptr()` on an empty, never-allocated `Vec` returns a
+    /// dangling-but-well-aligned sentinel pointer (not a null pointer), so
+    /// without this explicit check the scheduler would happily program
+    /// TSS.RSP0 with that bogus, non-zero address whenever it switched to
+    /// idle — a real kernel stack corruption bug waiting to be triggered
+    /// the first time idle takes an interrupt/syscall from ring3-adjacent
+    /// state before switching away again.
     pub fn kernel_stack_top(&self) -> u64 {
+        if self.kernel_stack.is_empty() {
+            return 0;
+        }
         unsafe { self.kernel_stack.as_ptr().add(self.kernel_stack.len()) as u64 }
     }
 }

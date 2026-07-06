@@ -87,10 +87,11 @@ fn aspace_leak_phys(aspace: AddressSpace) -> u64 {
     phys
 }
 
-/// Entry trampoline installed as a task's `context.rip`. Runs once, in
-/// ring0, immediately after the scheduler first switches to this task; its
-/// job is to jump into ring3 at the process's real entry point and never
-/// return (the `iretq` inside `enter_userspace` does that).
+/// Entry trampoline installed as a task's initial resume address (via
+/// `Context::new`). Runs once, in ring0, immediately after the scheduler
+/// first switches to this task; its job is to jump into ring3 at the
+/// process's real entry point and never return (the `iretq` inside
+/// `enter_userspace` does that).
 ///
 /// Reads the target RIP/RSP out of thread-local-ish statics set by
 /// `spawn_user_thread` just before scheduling, since `Context::new` only
