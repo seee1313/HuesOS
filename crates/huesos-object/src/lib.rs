@@ -201,10 +201,20 @@ impl Default for HandleTable {
 
 /// Global object registry (koid -> Arc<dyn KernelObject>).
 static OBJECT_REGISTRY: Mutex<BTreeMap<Koid, Arc<dyn KernelObject>>> = Mutex::new(BTreeMap::new());
+/// Typed process registry for kernel subsystems that must hold an owning
+/// `Arc<Process>` rather than a type-erased object reference.
+static PROCESS_REGISTRY: Mutex<BTreeMap<Koid, Arc<Process>>> = Mutex::new(BTreeMap::new());
 
 /// Register a kernel object globally.
 pub fn register_object(obj: Arc<dyn KernelObject>) {
     OBJECT_REGISTRY.lock().insert(obj.koid(), obj);
+}
+
+/// Register a process in both the type-erased object registry and the typed
+/// process registry.
+pub fn register_process(process: Arc<Process>) {
+    PROCESS_REGISTRY.lock().insert(process.koid(), process.clone());
+    register_object(process);
 }
 
 /// Lookup a kernel object by koid.
@@ -212,11 +222,17 @@ pub fn lookup_object(koid: Koid) -> Option<Arc<dyn KernelObject>> {
     OBJECT_REGISTRY.lock().get(&koid).cloned()
 }
 
+/// Lookup a process by koid, returning a typed owning reference.
+pub fn lookup_process(koid: Koid) -> Option<Arc<Process>> {
+    PROCESS_REGISTRY.lock().get(&koid).cloned()
+}
+
 /// Remove an object from the global registry (called on final handle close
 /// in a full refcounted implementation; for the MVP this is invoked
 /// explicitly by `ProcessExit`/object-specific teardown).
 pub fn unregister_object(koid: Koid) {
     OBJECT_REGISTRY.lock().remove(&koid);
+    PROCESS_REGISTRY.lock().remove(&koid);
 }
 
 /// Current process (set by the scheduler on every context switch).
@@ -935,6 +951,17 @@ mod tests {
         assert!(vmar.record_mapping(outside).is_err());
     }
 
+
+
+    #[test]
+    fn register_process_populates_typed_registry() {
+        let process = Process::new("typed-registry-test");
+        let koid = process.koid();
+        register_process(process);
+        assert!(lookup_process(koid).is_some());
+        unregister_object(koid);
+        assert!(lookup_process(koid).is_none());
+    }
 
     #[test]
     fn thread_records_owning_process() {
