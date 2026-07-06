@@ -9,6 +9,7 @@ path = "src/main.rs"
 
 [dependencies]
 libcanvas = { path = "../libcanvas" }
+logos = { version = "0.16.1", default-features = false, features = ["export_derive"] }
 
 [profile.release]
 opt-level = 1
