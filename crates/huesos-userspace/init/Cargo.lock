@@ -3,5 +3,19 @@
 version = 4
 
 [[package]]
+name = "huesos-abi"
+version = "0.1.0"
+
+[[package]]
 name = "huesos-init"
 version = "0.1.0"
+dependencies = [
+ "libcanvas",
+]
+
+[[package]]
+name = "libcanvas"
+version = "0.1.0"
+dependencies = [
+ "huesos-abi",
+]

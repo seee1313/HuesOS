@@ -324,7 +324,17 @@ mod tests {
 
         let mut loader = FakeLoader::new();
         let loaded = load(&bytes, &mut loader).expect("failed to load real init binary");
-        assert_eq!(loaded.entry_point, 0x400050);
+        // The exact entry point address depends on the userspace linker
+        // script's load address plus wherever the linker placed `_start`
+        // within it, which shifts as huesos-init/libcanvas grow — so we
+        // check that it lands in the expected *region* (the user_linker.ld
+        // base) rather than pinning an exact byte offset that would need
+        // updating every time the userspace binary's code size changes.
+        assert!(
+            (0x400000..0x500000).contains(&loaded.entry_point),
+            "entry point {:#x} outside expected load region",
+            loaded.entry_point
+        );
         assert!(loaded.highest_addr > 0x400000);
         assert!(
             !loader.pages.is_empty(),

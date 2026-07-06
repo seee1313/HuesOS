@@ -8,6 +8,7 @@ name = "huesos-init"
 path = "src/main.rs"
 
 [dependencies]
+libcanvas = { path = "../libcanvas" }
 
 [profile.release]
 opt-level = 1
