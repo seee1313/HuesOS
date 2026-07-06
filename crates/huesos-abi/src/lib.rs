@@ -225,8 +225,8 @@ pub mod vmar_flags {
     /// userspace address-space objects, so the permission contract is clear
     /// at the ABI boundary.
     pub const USER: u32 = 1 << 3;
-    /// Use the exact virtual address in `VmarMapArgs.addr`; without this,
-    /// a future implementation may choose a suitable address and return it.
+    /// Use the exact virtual address in `VmarMapArgs.addr`. The first VMAR
+    /// implementation requires this flag for every mapping.
     pub const SPECIFIC: u32 = 1 << 4;
 }
 
@@ -293,9 +293,9 @@ pub struct VmarMapArgs {
     pub vmo: HandleValue,
     /// Byte offset into the VMO.
     pub vmo_offset: u64,
-    /// Requested destination virtual address. A future implementation may
-    /// interpret zero as "kernel chooses" unless an explicit fixed-address
-    /// flag is defined for `flags`.
+    /// Requested destination virtual address. The first implementation is
+    /// strict fixed-address mapping: callers must set `vmar_flags::SPECIFIC`
+    /// and provide a page-aligned address inside the target VMAR.
     pub addr: u64,
     /// Mapping length in bytes.
     pub len: u64,

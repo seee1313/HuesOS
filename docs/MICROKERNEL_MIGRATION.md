@@ -16,14 +16,18 @@ migration so implementation work stays explicit and reviewable.
 - IRQ delivery will be modeled with interrupt objects plus ports.
 - The framebuffer driver will move to userspace through a mapped framebuffer capability, not through permanent kernel blit logic.
 - Initial VMAR map flags are `READ`, `WRITE`, `EXECUTE`, `USER`, and `SPECIFIC`.
+- First VMAR implementation is root-VMAR mapping only; child VMAR allocation/tree APIs come later.
+- `VmarMap` is strict fixed-address mapping only: callers must set `SPECIFIC`.
+- Process runtime state is stored behind `Process.address_space` as a kernel-side `ProcessRuntime` via `Box<dyn Any>`.
 - Work must be split into small commits.
 
 ## Immediate open decisions before code changes
 
 These are intentionally left unresolved until the project owner approves them:
 
-1. How `init` discovers/embeds child ELF images.
-2. `DriverManager` service protocol and concrete driver restart policy.
-3. Exact Port/Interrupt syscall set and packet layout.
-4. Exact framebuffer mapping rights and handoff lifetime rules.
-5. Terminal command/input protocol.
+1. Exact Fuchsia-like root VMAR base/size/guard constants.
+2. How `init` discovers/embeds child ELF images.
+3. `DriverManager` service protocol and concrete driver restart policy.
+4. Exact Port/Interrupt syscall set and packet layout.
+5. Exact framebuffer mapping rights and handoff lifetime rules.
+6. Terminal command/input protocol.
