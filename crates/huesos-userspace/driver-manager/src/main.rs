@@ -33,7 +33,7 @@ pub extern "C" fn _start() -> ! {
         let _ = bootstrap.write(b"driver-manager:degraded");
     }
 
-    manager.run();
+    manager.run(bootstrap);
 }
 
 #[panic_handler]
