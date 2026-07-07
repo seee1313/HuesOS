@@ -30,6 +30,15 @@ pub struct ChannelMessage {
     pub handles: Vec<Handle>,
 }
 
+/// Reason a channel message could not be received into caller-provided buffers.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ChannelRecvError {
+    /// Byte buffer is too small for the next queued message.
+    BytesTooSmall,
+    /// Handle buffer is too small for the next queued message.
+    HandlesTooSmall,
+}
+
 impl Channel {
     /// Create a connected pair of channel endpoints. Writing to one and
     /// reading from the other (or vice versa) delivers messages correctly.
@@ -72,6 +81,26 @@ impl Channel {
         } else {
             Some(q.remove(0))
         }
+    }
+
+    /// Receive only if the caller-provided byte/handle capacities can hold
+    /// the next queued message. The message remains queued on size errors.
+    pub fn recv_if_fits(
+        &self,
+        byte_capacity: usize,
+        handle_capacity: usize,
+    ) -> Result<Option<ChannelMessage>, ChannelRecvError> {
+        let mut q = self.inbox.lock();
+        let Some(msg) = q.first() else {
+            return Ok(None);
+        };
+        if msg.data.len() > byte_capacity {
+            return Err(ChannelRecvError::BytesTooSmall);
+        }
+        if msg.handles.len() > handle_capacity {
+            return Err(ChannelRecvError::HandlesTooSmall);
+        }
+        Ok(Some(q.remove(0)))
     }
 }
 
