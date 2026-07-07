@@ -72,6 +72,12 @@ commands only. Historical framebuffer test output is shown in
 - Rights enforcement exists but isn't exhaustively audited
 - Framebuffer text is ASCII-only (no Unicode shaping, by design)
 
+
+## Hardware Compatibility
+
+See [docs/HARDWARE.md](docs/HARDWARE.md) for real-machine smoke-test notes.
+Current reported bare-metal success includes an MSI Modern 15 B5M laptop.
+
 ## Quick Start
 
 ```bash

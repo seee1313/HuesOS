@@ -63,6 +63,13 @@ check recent changes to `huesos-arch::gdt`/`paging`/`syscall`/`context_switch`
 or `huesos-kernel::process`/`scheduler` first, since that's the most fragile
 part of the pipeline.
 
+
+## Real Hardware Smoke Tests
+
+Real-machine reports are tracked in [HARDWARE.md](HARDWARE.md). The first
+recorded successful laptop smoke test is an MSI Modern 15 B5M with an AMD
+Ryzen 5 5625U / Radeon integrated graphics platform.
+
 ### GDB Debugging
 
 ```bash
