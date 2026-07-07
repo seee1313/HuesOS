@@ -53,11 +53,12 @@ and [docs/ROADMAP.md](docs/ROADMAP.md) for what's next.
 All of the above is exercised live by `huesos-init` on every boot — now
 built entirely against `libcanvas`, not raw syscalls — which creates a
 VMO, writes to it, reads it back, creates a channel pair, sends/receives a
-message, then launches the userspace DriverManager and framebuffer
-terminal as child processes. The terminal paints the framebuffer from
-userspace via `Canvas` and runs a built-in mini shell with internal
-commands only. Historical framebuffer test output is shown in
-`tools/fontgen/qemu_screenshot.png`.
+message, mirrors init progress logs to the framebuffer until handing the
+screen to the terminal, then launches the userspace DriverManager and
+framebuffer terminal as child processes. The terminal paints the
+framebuffer from userspace via `Canvas` and runs a built-in mini shell
+with internal commands only. Historical framebuffer test output is shown
+in `tools/fontgen/qemu_screenshot.png`.
 
 ## Known Limitations
 
