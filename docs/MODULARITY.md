@@ -73,5 +73,5 @@ keep using `libcanvas::process::*`.
 - `supervisor.rs` — DriverHost launch and heartbeat/status polling.
 
 `crates/huesos-userspace/driver-host-input/` is the first DriverHost process.
-It hosts the MVP keyboard service, binds IRQ1 to a Port, and reports
+It hosts the DriverManager-managed MVP keyboard service, binds IRQ1 to a Port, and reports
 readiness/heartbeats to DriverManager.
