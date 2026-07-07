@@ -61,3 +61,17 @@ central syscall dispatch table.
 
 The top-level `process.rs` remains a facade so existing userspace code can
 keep using `libcanvas::process::*`.
+
+## Userspace driver stack
+
+`crates/huesos-userspace/driver-manager/src/` is split into:
+
+- `main.rs` — DriverManager entrypoint and init bootstrap response.
+- `manifest.rs` — static DriverHost/service/capability manifest table.
+- `registry.rs` — fixed-size service registry and service state.
+- `protocol.rs` — bootstrap/status/heartbeat message constants.
+- `supervisor.rs` — DriverHost launch and heartbeat/status polling.
+
+`crates/huesos-userspace/driver-host-input/` is the first DriverHost process.
+It hosts the MVP keyboard service, binds IRQ1 to a Port, and reports
+readiness/heartbeats to DriverManager.
