@@ -32,6 +32,9 @@ migration so implementation work stays explicit and reviewable.
 - First Port/Interrupt ABI is non-blocking: `PortCreate`, `PortRead`, `InterruptCreate`, and `InterruptBindPort`.
 - The first IRQ bridge supports keyboard IRQ1 only; packets use `PORT_PACKET_INTERRUPT` with data `[irq, scancode, count, 0]`.
 - During the migration window, IRQ bridge interrupts fan out to multiple userspace consumers so DriverManager diagnostics and the temporary terminal keyboard consumer can coexist. The next cleanup step is replacing terminal's direct IRQ consumer with a DriverManager keyboard-service IPC protocol.
+- DriverManager now owns a static Rust manifest table and launches an `input-host` DriverHost process.
+- `input-host` owns the DriverManager-managed keyboard IRQ binding, reports `service:keyboard:ready`, and sends heartbeat messages back to DriverManager over its bootstrap channel.
+- DriverManager registers the `keyboard` service from DriverHost readiness messages and reports ready to init only after the mandatory input service comes online.
 - Work must be split into small commits.
 
 ## Immediate open decisions before code changes

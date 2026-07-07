@@ -19,12 +19,19 @@ fn main() {
 
     track_userspace_inputs(&userspace_root);
 
+    let input_driver_host = build_userspace_program(
+        &userspace_root,
+        "driver-host-input",
+        "huesos-driver-host-input",
+        profile,
+        &[],
+    );
     let driver_manager = build_userspace_program(
         &userspace_root,
         "driver-manager",
         "huesos-driver-manager",
         profile,
-        &[],
+        &[("HUESOS_INPUT_DRIVER_HOST_PATH", input_driver_host.as_os_str())],
     );
     let terminal = build_userspace_program(
         &userspace_root,
@@ -48,7 +55,7 @@ fn main() {
 }
 
 fn track_userspace_inputs(userspace_root: &Path) {
-    for program in ["init", "driver-manager", "terminal"] {
+    for program in ["init", "driver-manager", "driver-host-input", "terminal"] {
         println!(
             "cargo:rerun-if-changed={}",
             userspace_root.join(program).join("src").display()
