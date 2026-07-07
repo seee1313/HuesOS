@@ -23,7 +23,8 @@ mod util;
 mod vmo;
 
 use huesos_abi::{
-    ErrorCode, FramebufferBlitArgs, FramebufferInfo, HandleValue, PortPacket, VmarMapArgs,
+    ChannelReadEtcArgs, ErrorCode, FramebufferBlitArgs, FramebufferInfo, HandleValue, PortPacket,
+    VmarMapArgs,
 };
 
 pub use callbacks::{
@@ -69,6 +70,7 @@ pub fn dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> Syscal
         S::ChannelRead => {
             channel::sys_channel_read(a1 as HandleValue, a2 as *mut u8, a3 as u32, a4 as *mut u32)
         }
+        S::ChannelReadEtc => channel::sys_channel_read_etc(a1 as *const ChannelReadEtcArgs),
         S::ProcessExit => process::sys_process_exit(a1 as i64),
         S::DebugWrite => debug::sys_debug_write(a1 as *const u8, a2 as usize),
         S::FramebufferInfo => framebuffer::sys_framebuffer_info(a1 as *mut FramebufferInfo),
