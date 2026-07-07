@@ -160,8 +160,7 @@ impl KeyboardDecoder {
         let byte = table.get(scancode as usize).copied().unwrap_or(0);
         match byte {
             0 => None,
-            b'
-' => Some(KeyEvent::Enter),
+            b'\n' => Some(KeyEvent::Enter),
             8 => Some(KeyEvent::Backspace),
             byte => Some(KeyEvent::Char(byte)),
         }
@@ -169,17 +168,15 @@ impl KeyboardDecoder {
 }
 
 const SET1_LOWER: [u8; 58] = [
-    0, 27, b'1', b'2', b'3', b'4', b'5', b'6', b'7', b'8', b'9', b'0', b'-', b'=', 8, b'	', b'q',
-    b'w', b'e', b'r', b't', b'y', b'u', b'i', b'o', b'p', b'[', b']', b'
-', 0, b'a', b's', b'd',
-    b'f', b'g', b'h', b'j', b'k', b'l', b';', b''', b'`', 0, b'\', b'z', b'x', b'c', b'v', b'b',
+    0, 27, b'1', b'2', b'3', b'4', b'5', b'6', b'7', b'8', b'9', b'0', b'-', b'=', 8, b'\t', b'q',
+    b'w', b'e', b'r', b't', b'y', b'u', b'i', b'o', b'p', b'[', b']', b'\n', 0, b'a', b's', b'd',
+    b'f', b'g', b'h', b'j', b'k', b'l', b';', b'\'', b'`', 0, b'\\', b'z', b'x', b'c', b'v', b'b',
     b'n', b'm', b',', b'.', b'/', 0, b'*', 0, b' ',
 ];
 
 const SET1_UPPER: [u8; 58] = [
-    0, 27, b'!', b'@', b'#', b'$', b'%', b'^', b'&', b'*', b'(', b')', b'_', b'+', 8, b'	', b'Q',
-    b'W', b'E', b'R', b'T', b'Y', b'U', b'I', b'O', b'P', b'{', b'}', b'
-', 0, b'A', b'S', b'D',
+    0, 27, b'!', b'@', b'#', b'$', b'%', b'^', b'&', b'*', b'(', b')', b'_', b'+', 8, b'\t', b'Q',
+    b'W', b'E', b'R', b'T', b'Y', b'U', b'I', b'O', b'P', b'{', b'}', b'\n', 0, b'A', b'S', b'D',
     b'F', b'G', b'H', b'J', b'K', b'L', b':', b'"', b'~', 0, b'|', b'Z', b'X', b'C', b'V', b'B',
     b'N', b'M', b'<', b'>', b'?', 0, b'*', 0, b' ',
 ];
