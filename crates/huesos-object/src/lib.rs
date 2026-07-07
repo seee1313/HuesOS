@@ -22,7 +22,7 @@ mod thread;
 mod vmar;
 mod vmo;
 
-pub use channel::{Channel, ChannelMessage};
+pub use channel::{Channel, ChannelMessage, ChannelRecvError};
 pub use handle::{Handle, HandleTable, HandleValue, Rights, INVALID_HANDLE};
 pub use interrupt::{Interrupt, InterruptBinding};
 pub use job::Job;

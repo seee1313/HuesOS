@@ -1,25 +1,39 @@
 //! Terminal shell runtime and keyboard event loop.
 
 use crate::commands::execute_line;
-use crate::keyboard::{Key, KeyboardDecoder};
 use crate::screen::Screen;
-use libcanvas::{ErrorCode, Interrupt, Port, PORT_PACKET_INTERRUPT};
+use libcanvas::{Channel, ErrorCode};
 
 const INPUT_MAX: usize = 128;
-const KEY_TERMINAL_KEYBOARD: u64 = 0x5445_524d_4b42_4451; // "TERMKBDQ"-ish.
 
 /// Running terminal shell.
 pub struct Shell {
     screen: Screen,
     input: [u8; INPUT_MAX],
     input_len: usize,
-    keyboard: KeyboardDecoder,
-    port: Port,
+    keyboard: Channel,
+}
+
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Key {
+    Char(u8),
+    Backspace,
+    Enter,
+}
+
+fn decode_keyboard_event(msg: &[u8]) -> Option<Key> {
+    match msg {
+        [b'c', byte] => Some(Key::Char(*byte)),
+        b"enter" => Some(Key::Enter),
+        b"backspace" => Some(Key::Backspace),
+        _ => None,
+    }
 }
 
 impl Shell {
-    /// Create shell screen and bind keyboard IRQ packets to this terminal.
-    pub fn new() -> libcanvas::Result<Self> {
+    /// Create shell screen using an already-open keyboard service channel.
+    pub fn new(keyboard: Channel) -> Self {
         let mut screen = Screen::new();
         screen.clear();
         screen.write_line("HuesOS Terminal");
@@ -27,41 +41,30 @@ impl Shell {
         screen.write_line("keyboard input: userspace Interrupt + Port bridge");
         screen.write_line("");
 
-        let port = Port::create()?;
-        let keyboard_irq = Interrupt::keyboard()?;
-        keyboard_irq.bind_port(&port, KEY_TERMINAL_KEYBOARD)?;
-        // Keep the interrupt object alive for this terminal lifetime. Later,
-        // DriverManager will own this and hand out a keyboard service channel.
-        core::mem::forget(keyboard_irq);
-
         let mut shell = Self {
             screen,
             input: [0; INPUT_MAX],
             input_len: 0,
-            keyboard: KeyboardDecoder::new(),
-            port,
+            keyboard,
         };
         shell.prompt();
         shell.screen.render();
-        Ok(shell)
+        shell
     }
 
     /// Run the shell forever.
     pub fn run(&mut self) -> ! {
+        let mut buf = [0u8; 16];
         loop {
-            match self.port.read() {
-                Ok(packet)
-                    if packet.packet_type == PORT_PACKET_INTERRUPT
-                        && packet.key == KEY_TERMINAL_KEYBOARD =>
-                {
-                    if let Some(key) = self.keyboard.feed(packet.data[1] as u8) {
+            match self.keyboard.read_into(&mut buf) {
+                Ok(n) => {
+                    if let Some(key) = decode_keyboard_event(&buf[..n]) {
                         self.handle_key(key);
                     }
                 }
-                Ok(_) => {}
                 Err(ErrorCode::ShouldWait) => libcanvas::process::yield_now(),
                 Err(e) => {
-                    self.screen.write_str("terminal: keyboard port error: ");
+                    self.screen.write_str("terminal: keyboard service error: ");
                     self.screen.write_line(e.as_str());
                     self.screen.render();
                     libcanvas::process::yield_now();

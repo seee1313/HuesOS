@@ -12,6 +12,7 @@ pub static INPUT_DRIVER_HOST_ELF: &[u8] = include_bytes!(env!("HUESOS_INPUT_DRIV
 pub struct DriverManager {
     registry: ServiceRegistry,
     input_host: Option<ManagedHost>,
+    registry_channel: Option<Channel>,
     heartbeat_count: u64,
 }
 
@@ -28,6 +29,7 @@ impl DriverManager {
         Self {
             registry,
             input_host: None,
+            registry_channel: None,
             heartbeat_count: 0,
         }
     }
@@ -53,8 +55,10 @@ impl DriverManager {
     }
 
     /// Main supervision loop.
-    pub fn run(&mut self) -> ! {
+    pub fn run(&mut self, init_bootstrap: Channel) -> ! {
         loop {
+            self.poll_init_bootstrap(&init_bootstrap);
+            self.poll_registry_requests();
             self.poll_input_host();
             libcanvas::process::yield_now();
         }
@@ -84,6 +88,76 @@ impl DriverManager {
             libcanvas::process::yield_now();
         }
         println!("[driver-manager] input DriverHost did not become ready in time");
+    }
+
+
+    fn poll_init_bootstrap(&mut self, init_bootstrap: &Channel) {
+        let mut buf = [0u8; 64];
+        loop {
+            match init_bootstrap.read_channel_handle(&mut buf) {
+                Ok((n, channel)) if &buf[..n] == protocol::REGISTRY_CHANNEL.as_bytes() => {
+                    println!("[driver-manager] received service registry channel from init");
+                    self.registry_channel = Some(channel);
+                }
+                Ok((_n, _channel)) => println!("[driver-manager] unknown bootstrap handle message"),
+                Err(ErrorCode::ShouldWait) => return,
+                Err(e) => {
+                    // Plain heartbeat/control messages may arrive without handles later.
+                    if e != ErrorCode::InvalidArgs {
+                        println!("[driver-manager] bootstrap read failed: {}", e.as_str());
+                    }
+                    return;
+                }
+            }
+        }
+    }
+
+    fn poll_registry_requests(&mut self) {
+        let mut buf = [0u8; 64];
+        loop {
+            let Some(registry) = self.registry_channel.as_ref() else {
+                return;
+            };
+            match registry.read_into(&mut buf) {
+                Ok(n) if &buf[..n] == protocol::OPEN_KEYBOARD.as_bytes() => self.open_keyboard_service(),
+                Ok(_) => println!("[driver-manager] unknown registry request"),
+                Err(ErrorCode::ShouldWait) => return,
+                Err(e) => {
+                    println!("[driver-manager] registry read failed: {}", e.as_str());
+                    return;
+                }
+            }
+        }
+    }
+
+    fn open_keyboard_service(&mut self) {
+        if !self.keyboard_ready() {
+            println!("[driver-manager] keyboard service requested before ready");
+            return;
+        }
+        let Some(input_host) = self.input_host.as_ref() else {
+            return;
+        };
+        let Some(registry) = self.registry_channel.as_ref() else {
+            return;
+        };
+        match Channel::pair() {
+            Ok((client_end, driver_end)) => {
+                if let Err(e) = input_host
+                    .bootstrap
+                    .write_handle(protocol::ATTACH_KEYBOARD_CLIENT.as_bytes(), driver_end.into_handle())
+                {
+                    println!("[driver-manager] failed to attach keyboard client: {}", e.as_str());
+                    return;
+                }
+                if let Err(e) = registry.write_handle(protocol::KEYBOARD_CHANNEL.as_bytes(), client_end.into_handle()) {
+                    println!("[driver-manager] failed to return keyboard channel: {}", e.as_str());
+                    return;
+                }
+                println!("[driver-manager] opened keyboard service channel for client");
+            }
+            Err(e) => println!("[driver-manager] failed to create keyboard service channel: {}", e.as_str()),
+        }
     }
 
     fn poll_input_host(&mut self) {

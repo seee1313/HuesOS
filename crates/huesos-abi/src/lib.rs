@@ -88,13 +88,15 @@ pub enum Syscall {
     InterruptCreate = 21,
     /// Bind an Interrupt object to a Port so IRQ events enqueue Port packets.
     InterruptBindPort = 22,
+    /// Read channel bytes and receive transferred handles.
+    ChannelReadEtc = 23,
 }
 
 impl Syscall {
     /// Total number of defined syscalls (i.e. one past the highest
     /// currently-assigned number). The dispatcher uses this to reject
     /// obviously-out-of-range numbers before a `match`.
-    pub const COUNT: u64 = 23;
+    pub const COUNT: u64 = 24;
 
     /// Convert a raw syscall number back into a [`Syscall`], if valid.
     pub const fn from_raw(n: u64) -> Option<Self> {
@@ -122,6 +124,7 @@ impl Syscall {
             20 => Self::PortRead,
             21 => Self::InterruptCreate,
             22 => Self::InterruptBindPort,
+            23 => Self::ChannelReadEtc,
             _ => return None,
         })
     }
@@ -312,6 +315,28 @@ pub struct FramebufferBlitArgs {
     pub dst_y: u32,
 }
 
+
+
+/// Arguments for [`Syscall::ChannelReadEtc`], passed by pointer because the
+/// syscall needs byte and handle buffers plus actual-count outputs.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct ChannelReadEtcArgs {
+    /// Channel handle to read from.
+    pub channel: HandleValue,
+    /// Destination byte buffer.
+    pub bytes: *mut u8,
+    /// Capacity of `bytes`.
+    pub bytes_capacity: u32,
+    /// Actual number of bytes copied.
+    pub out_bytes: *mut u32,
+    /// Destination handle buffer.
+    pub handles: *mut HandleValue,
+    /// Capacity of `handles`.
+    pub handles_capacity: u32,
+    /// Actual number of handles received.
+    pub out_handles: *mut u32,
+}
 
 /// Port packet type for interrupt notifications.
 pub const PORT_PACKET_INTERRUPT: u32 = 1;

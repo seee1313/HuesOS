@@ -38,6 +38,8 @@ pub extern "C" fn _start() -> ! {
         read_ready_message(&mut logger, "driver-manager", channel);
     }
 
+    let registry_pair = create_driver_manager_registry_channel(&mut logger, &driver_manager);
+
     init_logln!(
         logger,
         "[init] framebuffer log handoff: starting terminal service"
@@ -47,6 +49,7 @@ pub extern "C" fn _start() -> ! {
     let terminal = launch_service(&mut logger, "terminal", TERMINAL_ELF);
     if let Some((_, channel)) = &terminal {
         read_ready_message(&mut logger, "terminal", channel);
+        send_terminal_registry_channel(&mut logger, channel, registry_pair);
     }
 
     init_logln!(
@@ -56,6 +59,49 @@ pub extern "C" fn _start() -> ! {
     loop {
         let _keep_services_alive = (&driver_manager, &terminal);
         libcanvas::process::yield_now();
+    }
+}
+
+
+fn create_driver_manager_registry_channel(
+    logger: &mut InitLogger,
+    driver_manager: &Option<(Process, Channel)>,
+) -> Option<Channel> {
+    let Some((_, dm_bootstrap)) = driver_manager else {
+        return None;
+    };
+    match Channel::pair() {
+        Ok((terminal_end, dm_end)) => {
+            match dm_bootstrap.write_handle(b"registry-channel", dm_end.into_handle()) {
+                Ok(()) => {
+                    init_logln!(logger, "[init] passed registry channel to DriverManager");
+                    Some(terminal_end)
+                }
+                Err(e) => {
+                    init_logln!(logger, "[init] failed to pass registry channel: {}", e.as_str());
+                    None
+                }
+            }
+        }
+        Err(e) => {
+            init_logln!(logger, "[init] failed to create registry channel: {}", e.as_str());
+            None
+        }
+    }
+}
+
+fn send_terminal_registry_channel(
+    logger: &mut InitLogger,
+    terminal_bootstrap: &Channel,
+    registry: Option<Channel>,
+) {
+    let Some(registry) = registry else {
+        init_logln!(logger, "[init] no DriverManager registry channel for terminal");
+        return;
+    };
+    match terminal_bootstrap.write_handle(b"driver-manager-registry", registry.into_handle()) {
+        Ok(()) => init_logln!(logger, "[init] passed DriverManager registry to terminal"),
+        Err(e) => init_logln!(logger, "[init] failed to pass registry to terminal: {}", e.as_str()),
     }
 }
 
