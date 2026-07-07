@@ -9,8 +9,8 @@ we can track which firmware/GPU/CPU combinations have booted beyond QEMU.
 ### MSI Modern 15 B5M
 
 - **Report date**: 2026-07-07
-- **Result**: HuesOS booted and the tested userspace flow reportedly worked
-  normally.
+- **Result**: HuesOS booted and all tested functionality reportedly worked
+  normally, including PS/2 keyboard input.
 - **Machine**: Micro-Star International Modern 15 B5M, revision 1.0
 - **Mainboard**: Micro-Star MS-15HK, revision 1.0
 - **Firmware**: American Megatrends UEFI `E15HKAMS.109`, dated 2023-09-22
@@ -30,13 +30,13 @@ Observed HuesOS-relevant coverage from this report:
 - Limine framebuffer handoff is usable on this AMD integrated GPU laptop.
 - The current boot-to-userspace path is not QEMU-only.
 - No failure was reported for the init / DriverManager / terminal smoke flow.
+- PS/2 keyboard input worked on real hardware, including the current keyboard
+  driver / IRQ bridge path used by the terminal shell.
 
 Unknown / not yet recorded for this machine:
 
 - Secure Boot state.
 - Exact HuesOS framebuffer mode selected by Limine.
-- Whether PS/2 keyboard input in the framebuffer shell was exercised on this
-  machine specifically.
 - Whether repeated warm/cold boots were tested.
 
 When adding another hardware result, include firmware version, CPU/GPU,
