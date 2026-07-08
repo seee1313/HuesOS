@@ -5,7 +5,7 @@
 
 #![no_std]
 
-use core::ptr::NonNull;
+
 
 /// Interface for the underlying block device (e.g., RAM disk from HBI, Disk Drive).
 pub trait BlockDevice {
@@ -183,8 +183,8 @@ impl<'a, D: BlockDevice> FatFileSystem<'a, D> {
     }
 
     fn find_entry_in_root(&self, name: &str) -> Result<DirectoryEntry, DriverError> {
-        let mut sector = 0;
-        let root_sectors = if self.is_fat32 {
+        let _sector = 0;
+        let _root_sectors = if self.is_fat32 {
             // In FAT32, root is a cluster chain. For MVP, we assume it starts at cluster 2.
             let root_cluster = self.bpb.root_cluster;
             // We'll just check the first sector of the root cluster for the MVP.
