@@ -103,8 +103,7 @@ fn fs_request(filesystem: Option<&Channel>, op: &str, path: &str, screen: &mut S
         match filesystem.read_into(&mut response) {
             Ok(n) => {
                 if let Ok(text) = core::str::from_utf8(&response[..n]) {
-                    for line in text.split('
-') {
+                    for line in text.split('\n') {
                         if !line.is_empty() {
                             screen.write_line(line);
                         }
