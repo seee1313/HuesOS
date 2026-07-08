@@ -236,16 +236,22 @@ impl<'a, D: BlockDevice> FatFileSystem<'a, D> {
 
         while remaining > 0 && cluster != 0 && cluster < 0x0FFFFFF8 {
             let sector = self.cluster_to_sector(cluster);
-            let mut sector_buf = [0u8; 512];
-            self.device.read_sector(sector, &mut sector_buf)?;
+            let sectors_per_cluster = self.bpb.sectors_per_cluster as u32;
 
-            let copy_len = core::cmp::min(remaining, 512);
-            if bytes_read + copy_len > buf.len() {
-                break;
+            for s in 0..sectors_per_cluster {
+                if remaining == 0 { break; }
+                let mut sector_buf = [0u8; 512];
+                self.device.read_sector(sector + s, &mut sector_buf)?;
+
+                let copy_len = core::cmp::min(remaining, 512);
+                if bytes_read + copy_len > buf.len() {
+                    remaining = 0;
+                    break;
+                }
+                buf[bytes_read..bytes_read + copy_len].copy_from_slice(&sector_buf[..copy_len]);
+                bytes_read += copy_len;
+                remaining -= copy_len;
             }
-            buf[bytes_read..bytes_read + copy_len].copy_from_slice(&sector_buf[..copy_len]);
-            bytes_read += copy_len;
-            remaining -= copy_len;
 
             cluster = self.get_next_cluster(cluster)?;
         }
