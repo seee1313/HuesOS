@@ -5,8 +5,10 @@ use spin::Mutex;
 
 use huesos_alloc::{BuddyAllocator, SlabAllocator, BuddyProvider, AllocError};
 
+pub const BUDDY_ORDER: usize = 20;
+
 pub struct KernelAllocator {
-    buddy: BuddyAllocator<10>,
+    buddy: BuddyAllocator<BUDDY_ORDER>,
     slab: SlabAllocator,
 }
 
@@ -40,7 +42,7 @@ impl KernelAllocator {
     }
 }
 
-struct BuddyWrapper<'a> { buddy: &'a mut BuddyAllocator<10> }
+struct BuddyWrapper<'a> { buddy: &'a mut BuddyAllocator<BUDDY_ORDER> }
 
 impl<'a> BuddyProvider for BuddyWrapper<'a> {
     fn allocate_page(&mut self) -> Result<usize, AllocError> { self.buddy.allocate(1) }
