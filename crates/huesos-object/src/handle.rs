@@ -35,7 +35,7 @@ bitflags! {
         /// Default rights for most objects.
         const DEFAULT = Self::READ.bits() | Self::WRITE.bits() | Self::DUPLICATE.bits() | Self::TRANSFER.bits();
         /// Default rights for VMOs.
-        const DEFAULT_VMO = Self::READ.bits() | Self::WRITE.bits() | Self::MAP.bits() | Self::DUPLICATE.bits();
+        const DEFAULT_VMO = Self::READ.bits() | Self::WRITE.bits() | Self::MAP.bits() | Self::DUPLICATE.bits() | Self::TRANSFER.bits();
     }
 }
 
