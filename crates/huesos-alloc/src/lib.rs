@@ -30,8 +30,6 @@ struct FreeBlock {
 }
 
 impl<const ORDER: usize> BuddyAllocator<ORDER> {
-    /// Create a new BuddyAllocator. 
-    /// base_addr must be aligned to (2^ORDER * page_size).
     pub unsafe fn new(base_addr: usize, total_pages: usize, page_size: usize) -> Self {
         let mut allocator = Self {
             free_lists: [None; ORDER],
@@ -86,7 +84,7 @@ impl<const ORDER: usize> BuddyAllocator<ORDER> {
         for i in order..ORDER {
             if let Some(block) = self.pop_free_block(i) {
                 for j in (order..i).rev() {
-                    let size = (1 << j) * 4096; 
+                    let size = (1 << j) * 4096;
                     let buddy = (block as usize + size) as *mut FreeBlock;
                     self.push_free_block(j, buddy);
                 }
@@ -235,7 +233,9 @@ impl SlabCache {
         for slab in &mut self.slabs {
             if let Some(s) = slab {
                 if !s.is_full() {
-                    return Ok(s.pop_slot().expect("Slab said not full but pop failed"));
+                    if let Some(ptr) = s.pop_slot() {
+                        return Ok(ptr);
+                    }
                 }
             }
         }
@@ -243,7 +243,7 @@ impl SlabCache {
         let page = buddy.allocate_page()?;
         unsafe {
             let mut new_slab = Slab::new(page, self.slot_size, 1);
-            let ptr = new_slab.pop_slot().expect("New slab empty");
+            let ptr = new_slab.pop_slot().ok_or(AllocError::OutOfMemory)?;
             
             let slot_idx = self.slabs.iter().position(|s| s.is_none()).ok_or(AllocError::OutOfMemory)?;
             self.slabs[slot_idx] = Some(new_slab);
@@ -292,16 +292,13 @@ impl SlabAllocator {
     }
 
     pub unsafe fn deallocate(&mut self, ptr: usize, size: usize) {
-        let idx = Self::get_cache_idx(size).expect("Invalid size for dealloc");
-        self.caches[idx].deallocate(ptr);
+        if let Some(idx) = Self::get_cache_idx(size) {
+            self.caches[idx].deallocate(ptr);
+        }
     }
 }
 
-// SAFETY: The raw pointer based free lists are only accessed under the protection
-// of spin::Mutex in the kernel. For the static GLOBAL_ALLOCATOR we declare
-// Send + Sync because the kernel is currently single-CPU and all access
-// is serialized by the Mutex. In future SMP we will need proper per-CPU or
-// lock-free design.
+// SAFETY notes for kernel use
 unsafe impl<const ORDER: usize> Send for BuddyAllocator<ORDER> {}
 unsafe impl<const ORDER: usize> Sync for BuddyAllocator<ORDER> {}
 

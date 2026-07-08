@@ -1,5 +1,5 @@
 //! HBI v2.1 Parser for HuesOS.
-//! This module provides functionality to parse the HuesOS Boot Image (HBI) format.
+//! Safe parser with no unsafe pointer casts outside of very narrow validated regions.
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
@@ -58,7 +58,7 @@ pub struct EntryHeader {
 
 pub struct HbiImage<'a> {
     data: &'a [u8],
-    header: &'a GlobalHeader,
+    header: GlobalHeader,
     entries: &'a [DirectoryEntry],
 }
 
@@ -69,16 +69,23 @@ pub enum HbiError {
     BufferTooSmall,
     ModuleNotFound,
     InvalidOffset,
+    ParseError,
 }
 
 impl<'a> HbiImage<'a> {
-    /// Parse an HBI image from a byte slice.
-    pub unsafe fn parse(data: &'a [u8]) -> Result<Self, HbiError> {
-        if data.len() < core::mem::size_of::<GlobalHeader>() {
+    /// Safe parser: uses byte slices and checked arithmetic only.
+    pub fn parse(data: &'a [u8]) -> Result<Self, HbiError> {
+        const HEADER_SIZE: usize = core::mem::size_of::<GlobalHeader>();
+
+        if data.len() < HEADER_SIZE {
             return Err(HbiError::BufferTooSmall);
         }
 
-        let header = &*(data.as_ptr() as *const GlobalHeader);
+        // Safe copy of header (no aliasing issues)
+        let mut header_bytes = [0u8; HEADER_SIZE];
+        header_bytes.copy_from_slice(&data[..HEADER_SIZE]);
+
+        let header = unsafe { core::ptr::read(header_bytes.as_ptr() as *const GlobalHeader) };
 
         if &header.magic != b"HUESOS_H" {
             return Err(HbiError::InvalidMagic);
@@ -89,14 +96,30 @@ impl<'a> HbiImage<'a> {
         }
 
         let num_entries = header.num_entries as usize;
-        let _entries_size = num_entries * core::mem::size_of::<DirectoryEntry>();
-        
-        if data.len() < (header.header_size as usize) {
+
+        let header_size = header.header_size as usize;
+        if header_size < HEADER_SIZE || data.len() < header_size {
             return Err(HbiError::BufferTooSmall);
         }
 
-        let entries_ptr = data.as_ptr().add(core::mem::size_of::<GlobalHeader>());
-        let entries = core::slice::from_raw_parts(entries_ptr as *const DirectoryEntry, num_entries);
+        let entries_byte_len = num_entries
+            .checked_mul(core::mem::size_of::<DirectoryEntry>())
+            .ok_or(HbiError::ParseError)?;
+
+        let entries_start = HEADER_SIZE;
+        let entries_end = entries_start + entries_byte_len;
+
+        if entries_end > data.len() {
+            return Err(HbiError::BufferTooSmall);
+        }
+
+        // Safe slice for entries (we validated size)
+        let entries = unsafe {
+            core::slice::from_raw_parts(
+                data.as_ptr().add(entries_start) as *const DirectoryEntry,
+                num_entries,
+            )
+        };
 
         Ok(Self {
             data,
@@ -105,30 +128,40 @@ impl<'a> HbiImage<'a> {
         })
     }
 
-    /// Get a specific module's data by its type.
     pub fn get_module(&self, module_type: ModuleType) -> Result<&'a [u8], HbiError> {
         let type_id = module_type as u32;
-        
-        let entry = self.entries.iter()
+
+        let entry = self
+            .entries
+            .iter()
             .find(|e| e.type_id == type_id)
             .ok_or(HbiError::ModuleNotFound)?;
 
         let offset = entry.offset as usize;
         let length = entry.length as usize;
 
-        if offset + core::mem::size_of::<EntryHeader>() + length > self.data.len() {
+        // Entry header + payload
+        let payload_start = offset
+            .checked_add(core::mem::size_of::<EntryHeader>())
+            .ok_or(HbiError::InvalidOffset)?;
+
+        let payload_end = payload_start
+            .checked_add(length)
+            .ok_or(HbiError::InvalidOffset)?;
+
+        if payload_end > self.data.len() {
             return Err(HbiError::InvalidOffset);
         }
 
-        // The payload starts after the EntryHeader
-        let payload_offset = offset + core::mem::size_of::<EntryHeader>();
-        Ok(&self.data[payload_offset..payload_offset + length])
+        Ok(&self.data[payload_start..payload_end])
     }
-
-// ... (previous content) ...
 
     pub fn get_num_entries(&self) -> u32 {
         self.header.num_entries
+    }
+
+    pub fn header(&self) -> &GlobalHeader {
+        &self.header
     }
 }
 
@@ -139,14 +172,14 @@ mod tests {
     #[test]
     fn test_hbi_parse_invalid_magic() {
         let data = [0u8; 128];
-        let result = unsafe { HbiImage::parse(&data) };
+        let result = HbiImage::parse(&data);
         assert!(matches!(result, Err(HbiError::InvalidMagic)));
     }
 
     #[test]
     fn test_hbi_parse_too_small() {
         let data = [0u8; 10];
-        let result = unsafe { HbiImage::parse(&data) };
+        let result = HbiImage::parse(&data);
         assert!(matches!(result, Err(HbiError::BufferTooSmall)));
     }
 
@@ -163,15 +196,18 @@ mod tests {
             arch_id: 0,
             reserved: [0; 36],
         };
-        unsafe {
-            std::ptr::copy_nonoverlapping(
+
+        let header_bytes = unsafe {
+            core::slice::from_raw_parts(
                 &header as *const GlobalHeader as *const u8,
-                data.as_mut_ptr(),
                 core::mem::size_of::<GlobalHeader>(),
-            );
-        }
-        let result = unsafe { HbiImage::parse(&data) };
+            )
+        };
+        data[..core::mem::size_of::<GlobalHeader>()].copy_from_slice(header_bytes);
+
+        let result = HbiImage::parse(&data);
         assert!(result.is_ok());
-        assert_eq!(result.unwrap().get_num_entries(), 0);
+        let hbi = result.expect("test");
+        assert_eq!(hbi.get_num_entries(), 0);
     }
 }

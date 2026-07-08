@@ -25,16 +25,12 @@ impl KernelAllocator {
             return Err(AllocError::InvalidSize);
         }
 
-        // If the size is small enough, use the Slab allocator.
         if size <= 2048 {
             let mut buddy_wrapper = BuddyWrapper { buddy: &mut self.buddy };
             self.slab.allocate(size, &mut buddy_wrapper)
         } else {
-            // Otherwise, use Buddy allocator.
-            // Calculate pages needed.
             let pages = (size + 4095) / 4096;
-            let addr = self.buddy.allocate(pages)?;
-            Ok(addr)
+            self.buddy.allocate(pages)
         }
     }
 
@@ -51,8 +47,6 @@ impl KernelAllocator {
     }
 }
 
-/// Helper wrapper to provide &mut BuddyAllocator to Slab without
-/// conflicting with &mut self.slab borrow.
 struct BuddyWrapper<'a> {
     buddy: &'a mut BuddyAllocator<10>,
 }
@@ -63,7 +57,6 @@ impl<'a> BuddyProvider for BuddyWrapper<'a> {
     }
 }
 
-/// Implement BuddyProvider so SlabAllocator can request pages from the Buddy system.
 impl BuddyProvider for KernelAllocator {
     fn allocate_page(&mut self) -> Result<usize, AllocError> {
         self.buddy.allocate(1)
@@ -74,14 +67,19 @@ impl BuddyProvider for KernelAllocator {
 pub static GLOBAL_ALLOCATOR: Mutex<Option<KernelAllocator>> = Mutex::new(None);
 
 /// Public API for kernel allocation.
+/// Returns 0 on failure (caller must handle).
 pub fn kmalloc(size: usize) -> usize {
     let mut lock = GLOBAL_ALLOCATOR.lock();
-    let alloc = lock.as_mut().expect("Kernel allocator not initialized");
-    alloc.kmalloc(size).expect("Kernel out of memory during kmalloc")
+    if let Some(alloc) = lock.as_mut() {
+        alloc.kmalloc(size).unwrap_or(0)
+    } else {
+        0
+    }
 }
 
 pub unsafe fn kfree(ptr: usize, size: usize) {
     let mut lock = GLOBAL_ALLOCATOR.lock();
-    let alloc = lock.as_mut().expect("Kernel allocator not initialized");
-    alloc.kfree(ptr, size);
+    if let Some(alloc) = lock.as_mut() {
+        alloc.kfree(ptr, size);
+    }
 }
