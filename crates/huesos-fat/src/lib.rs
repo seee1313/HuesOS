@@ -206,9 +206,9 @@ impl<'a, D: BlockDevice> FatFileSystem<'a, D> {
             // FAT16: Root directory is at a fixed location.
             let root_start = self.data_offset();
             let root_entries = self.bpb.root_ent_count as u32;
-            let root_sectors = (root_entries * 32 + 511) / 512;
+            let _root_sectors = (root_entries * 32 + 511) / 512;
             
-            for s in 0..root_sectors {
+            for s in 0.._root_sectors {
                 let mut buf = [0u8; 512];
                 self.device.read_sector(root_start + s, &mut buf)?;
                 let entries = unsafe {
