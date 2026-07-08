@@ -73,9 +73,9 @@ impl<P: PageProvider> ScudoAllocator<P> {
         let class = SIZE_CLASSES.iter().find(|&&s| s >= size)?;
         let class_size = *class;
 
-        // simplified: just allocate a page with a guard page
-        // In reality, we would use slabs.
-        let ptr = self.page_provider.allocate_pages(2)?; // Page + Guard
+        // simplified: allocate enough pages for the size class plus one guard page.
+        let pages_needed = class_size.div_ceil(4096);
+        let ptr = self.page_provider.allocate_pages(pages_needed + 1)?;
         
         // Protect the second page as Guard Page
         unsafe {
