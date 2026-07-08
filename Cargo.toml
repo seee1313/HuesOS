@@ -13,14 +13,19 @@ members = [
     "crates/huesos-alloc",
     "crates/huesos-user-alloc",
     "crates/huesos-fat",
-    "tools/hbi-gen",
 ]
 resolver = "2"
+exclude = ["tools"]
+default-members = ["crates/huesos-kernel"]
+
 # NOTE: crates/huesos-userspace/init is intentionally NOT a member of this
 # workspace. It targets ring3 userspace (different linker script / load
 # address) and is built as a wholly separate `cargo` invocation from
 # huesos-kernel's build.rs, then embedded into the kernel with
 # `include_bytes!`. See crates/huesos-kernel/build.rs.
+#
+# We also exclude "tools/" (hbi-gen etc.) because they depend on clap/anstyle
+# which require std and would break no_std kernel builds.
 
 [workspace.package]
 version = "0.1.0"
