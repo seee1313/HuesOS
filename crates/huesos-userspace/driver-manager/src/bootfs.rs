@@ -57,7 +57,6 @@ impl BootFs {
     /// Write a newline-separated listing of files under `prefix` into `out`.
     pub fn list_text(&self, prefix: &str, out: &mut [u8]) -> libcanvas::Result<usize> {
         let mut writer = ByteWriter::new(out);
-        writer.write_str("ok\n");
         let mut idx = 0;
         while idx < self.file_count {
             let entry = self.read_raw_entry(idx)?;
