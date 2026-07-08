@@ -81,7 +81,7 @@ pub struct EntryHeader {
 pub struct HbiImage<'a> {
     data: &'a [u8],
     header: GlobalHeader,
-    entries: &'a [DirectoryEntry],
+    entries: alloc::vec::Vec<DirectoryEntry>,
 }
 
 /// Errors that can occur while parsing an HBI image.
@@ -112,11 +112,8 @@ impl<'a> HbiImage<'a> {
             return Err(HbiError::BufferTooSmall);
         }
 
-        // Copy header bytes safely
-        let mut header_bytes = [0u8; HEADER_SIZE];
-        header_bytes.copy_from_slice(&data[..HEADER_SIZE]);
-
-        let header = unsafe { core::ptr::read(header_bytes.as_ptr() as *const GlobalHeader) };
+        // Read header via unaligned read to avoid UB on arbitrary byte slices.
+        let header = unsafe { core::ptr::read_unaligned(data.as_ptr() as *const GlobalHeader) };
 
         if &header.magic != b"HUESOS_H" {
             return Err(HbiError::InvalidMagic);
@@ -144,12 +141,16 @@ impl<'a> HbiImage<'a> {
             return Err(HbiError::BufferTooSmall);
         }
 
-        let entries = unsafe {
-            core::slice::from_raw_parts(
-                data.as_ptr().add(entries_start) as *const DirectoryEntry,
-                num_entries,
-            )
-        };
+        // Read each directory entry with an unaligned read.
+        let mut entries = alloc::vec::Vec::with_capacity(num_entries);
+        let entry_size = core::mem::size_of::<DirectoryEntry>();
+        for i in 0..num_entries {
+            let off = entries_start + i * entry_size;
+            let entry = unsafe {
+                core::ptr::read_unaligned(data.as_ptr().add(off) as *const DirectoryEntry)
+            };
+            entries.push(entry);
+        }
 
         Ok(Self {
             data,
@@ -223,8 +224,8 @@ mod tests {
             version: 0x0002_0001,
             flags: 0,
             num_entries: 0,
-            header_size: 64,
-            image_size: 64,
+            header_size: core::mem::size_of::<GlobalHeader>() as u32,
+            image_size: core::mem::size_of::<GlobalHeader>() as u64,
             arch_id: 0,
             reserved: [0; 36],
         };
