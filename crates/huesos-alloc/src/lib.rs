@@ -37,7 +37,7 @@ impl<const ORDER: usize> BuddyAllocator<ORDER> {
 
         while remaining_pages > 0 {
             let mut order = ORDER - 1;
-            while order > 0 && (remaining_pages < (1 << order) || (current_offset / page_size) % (1 << order) != 0) {
+            while order > 0 && (remaining_pages < (1 << order) || current_offset % (1 << order) != 0) {
                 order -= 1;
             }
 
