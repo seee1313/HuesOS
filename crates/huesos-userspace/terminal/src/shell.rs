@@ -12,6 +12,7 @@ pub struct Shell {
     input: [u8; INPUT_MAX],
     input_len: usize,
     keyboard: Channel,
+    filesystem: Option<Channel>,
 }
 
 
@@ -33,7 +34,7 @@ fn decode_keyboard_event(msg: &[u8]) -> Option<Key> {
 
 impl Shell {
     /// Create shell screen using an already-open keyboard service channel.
-    pub fn new(keyboard: Channel) -> Self {
+    pub fn new(keyboard: Channel, filesystem: Option<Channel>) -> Self {
         let mut screen = Screen::new();
         screen.clear();
         screen.write_line("HuesOS Terminal");
@@ -46,6 +47,7 @@ impl Shell {
             input: [0; INPUT_MAX],
             input_len: 0,
             keyboard,
+            filesystem,
         };
         shell.prompt();
         shell.screen.render();
@@ -91,7 +93,7 @@ impl Shell {
             Key::Enter => {
                 self.screen.newline();
                 let line = core::str::from_utf8(&self.input[..self.input_len]).unwrap_or("");
-                execute_line(line, &mut self.screen);
+                execute_line(line, &mut self.screen, self.filesystem.as_ref());
                 self.input_len = 0;
                 self.prompt();
             }
