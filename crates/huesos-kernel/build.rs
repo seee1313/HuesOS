@@ -11,6 +11,7 @@ use std::env;
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::fs;
 
 fn main() {
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
@@ -40,6 +41,7 @@ fn main() {
         profile,
         &[],
     );
+    let bootfs = build_bootfs_image(&manifest_dir, &input_driver_host, &terminal);
     let init = build_userspace_program(
         &userspace_root,
         "init",
@@ -48,6 +50,7 @@ fn main() {
         &[
             ("HUESOS_DRIVER_MANAGER_PATH", driver_manager.as_os_str()),
             ("HUESOS_TERMINAL_PATH", terminal.as_os_str()),
+            ("HUESOS_BOOTFS_PATH", bootfs.as_os_str()),
         ],
     );
 
@@ -112,4 +115,69 @@ fn build_userspace_program(
         bin_path.display()
     );
     bin_path
+}
+
+
+struct BootFsFile {
+    path: &'static str,
+    data: Vec<u8>,
+}
+
+fn build_bootfs_image(manifest_dir: &Path, input_driver_host: &Path, terminal: &Path) -> PathBuf {
+    let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
+    let bootfs_path = out_dir.join("huesos.bootfs");
+    let files = vec![
+        BootFsFile {
+            path: "/welcome.txt",
+            data: b"Welcome to HuesOS BOOTFS\nTry: ls /, ls /manifests, cat /welcome.txt\n".to_vec(),
+        },
+        BootFsFile {
+            path: "/manifests/input-host.hdriver",
+            data: b"name=input-host\nkind=driver-host\nprovides=keyboard\nirq=1\nioport=0x60:1\nioport=0x64:1\nelf=/drivers/input-host.elf\nheartbeat=true\n".to_vec(),
+        },
+        BootFsFile {
+            path: "/drivers/input-host.elf",
+            data: fs::read(input_driver_host).expect("failed to read input DriverHost ELF"),
+        },
+        BootFsFile {
+            path: "/bin/terminal.elf",
+            data: fs::read(terminal).expect("failed to read terminal ELF"),
+        },
+    ];
+    write_bootfs(&bootfs_path, &files);
+    println!("cargo:rerun-if-changed={}", manifest_dir.join("build.rs").display());
+    bootfs_path
+}
+
+fn write_bootfs(path: &Path, files: &[BootFsFile]) {
+    const MAGIC: &[u8; 8] = b"HBOOTFS1";
+    const HEADER_SIZE: usize = 16;
+    const ENTRY_SIZE: usize = 212;
+    const PATH_SIZE: usize = 192;
+
+    let mut image = Vec::new();
+    image.extend_from_slice(MAGIC);
+    image.extend_from_slice(&(files.len() as u32).to_le_bytes());
+    image.extend_from_slice(&0u32.to_le_bytes());
+
+    let entries_offset = HEADER_SIZE;
+    let data_offset = entries_offset + files.len() * ENTRY_SIZE;
+    image.resize(data_offset, 0);
+
+    let mut cursor = data_offset as u64;
+    for (idx, file) in files.iter().enumerate() {
+        assert!(file.path.starts_with('/'), "BOOTFS path must be absolute: {}", file.path);
+        assert!(file.path.len() < PATH_SIZE, "BOOTFS path too long: {}", file.path);
+        let entry = entries_offset + idx * ENTRY_SIZE;
+        image[entry..entry + file.path.len()].copy_from_slice(file.path.as_bytes());
+        image[entry + PATH_SIZE..entry + PATH_SIZE + 8].copy_from_slice(&cursor.to_le_bytes());
+        image[entry + PATH_SIZE + 8..entry + PATH_SIZE + 16]
+            .copy_from_slice(&(file.data.len() as u64).to_le_bytes());
+        image[entry + PATH_SIZE + 16..entry + PATH_SIZE + 20].copy_from_slice(&0u32.to_le_bytes());
+        image[entry + PATH_SIZE + 20..entry + PATH_SIZE + 24].copy_from_slice(&0u32.to_le_bytes());
+        image.extend_from_slice(&file.data);
+        cursor += file.data.len() as u64;
+    }
+
+    fs::write(path, image).expect("failed to write BOOTFS image");
 }
