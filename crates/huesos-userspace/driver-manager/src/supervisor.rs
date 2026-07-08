@@ -1,9 +1,10 @@
 //! DriverHost launch/supervision loop.
 
+use crate::fs_service::FileSystemService;
 use crate::manifest::INPUT_HOST;
 use crate::protocol;
 use crate::registry::{ServiceRegistry, ServiceState};
-use libcanvas::{println, Channel, ErrorCode, Process};
+use libcanvas::{println, Channel, ErrorCode, Process, Vmo};
 
 /// Input DriverHost ELF bytes embedded into DriverManager by build.rs.
 pub static INPUT_DRIVER_HOST_ELF: &[u8] = include_bytes!(env!("HUESOS_INPUT_DRIVER_HOST_PATH"));
@@ -13,6 +14,7 @@ pub struct DriverManager {
     registry: ServiceRegistry,
     input_host: Option<ManagedHost>,
     registry_channel: Option<Channel>,
+    fs: FileSystemService,
     heartbeat_count: u64,
 }
 
@@ -30,6 +32,7 @@ impl DriverManager {
             registry,
             input_host: None,
             registry_channel: None,
+            fs: FileSystemService::new(),
             heartbeat_count: 0,
         }
     }
@@ -59,6 +62,7 @@ impl DriverManager {
         loop {
             self.poll_init_bootstrap(&init_bootstrap);
             self.poll_registry_requests();
+            self.fs.poll();
             self.poll_input_host();
             libcanvas::process::yield_now();
         }
@@ -94,12 +98,16 @@ impl DriverManager {
     fn poll_init_bootstrap(&mut self, init_bootstrap: &Channel) {
         let mut buf = [0u8; 64];
         loop {
-            match init_bootstrap.read_channel_handle(&mut buf) {
-                Ok((n, channel)) if &buf[..n] == protocol::REGISTRY_CHANNEL.as_bytes() => {
+            match init_bootstrap.read_handle(&mut buf) {
+                Ok((n, handle)) if &buf[..n] == protocol::REGISTRY_CHANNEL.as_bytes() => {
                     println!("[driver-manager] received service registry channel from init");
-                    self.registry_channel = Some(channel);
+                    self.registry_channel = Some(Channel::from_handle(handle));
                 }
-                Ok((_n, _channel)) => println!("[driver-manager] unknown bootstrap handle message"),
+                Ok((n, handle)) if &buf[..n] == protocol::BOOTFS_VMO.as_bytes() => {
+                    println!("[driver-manager] received BOOTFS VMO from init");
+                    self.fs.install_bootfs(Vmo::from_handle(handle));
+                }
+                Ok((_n, _handle)) => println!("[driver-manager] unknown bootstrap handle message"),
                 Err(ErrorCode::ShouldWait) => return,
                 Err(e) => {
                     // Plain heartbeat/control messages may arrive without handles later.
@@ -120,6 +128,7 @@ impl DriverManager {
             };
             match registry.read_into(&mut buf) {
                 Ok(n) if &buf[..n] == protocol::OPEN_KEYBOARD.as_bytes() => self.open_keyboard_service(),
+                Ok(n) if &buf[..n] == protocol::OPEN_FILESYSTEM.as_bytes() => self.open_filesystem_service(),
                 Ok(_) => println!("[driver-manager] unknown registry request"),
                 Err(ErrorCode::ShouldWait) => return,
                 Err(e) => {
@@ -128,6 +137,14 @@ impl DriverManager {
                 }
             }
         }
+    }
+
+
+    fn open_filesystem_service(&mut self) {
+        let Some(registry) = self.registry_channel.as_ref() else {
+            return;
+        };
+        self.fs.open_for_registry(registry);
     }
 
     fn open_keyboard_service(&mut self) {

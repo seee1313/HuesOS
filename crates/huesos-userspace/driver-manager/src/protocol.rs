@@ -21,3 +21,10 @@ pub const OPEN_KEYBOARD: &str = "open:keyboard";
 pub const KEYBOARD_CHANNEL: &str = "service:keyboard:channel";
 /// DriverManager tells input-host about a new keyboard client channel.
 pub const ATTACH_KEYBOARD_CLIENT: &str = "keyboard-client";
+
+/// Init passes the BOOTFS image as a VMO handle with this message.
+pub const BOOTFS_VMO: &str = "bootfs-vmo";
+/// Client asks DriverManager to open FileSystemService.
+pub const OPEN_FILESYSTEM: &str = "open:filesystem";
+/// DriverManager responds with a FileSystemService channel.
+pub const FILESYSTEM_CHANNEL: &str = "service:filesystem:channel";

@@ -23,6 +23,7 @@ macro_rules! init_logln {
 
 static DRIVER_MANAGER_ELF: &[u8] = include_bytes!(env!("HUESOS_DRIVER_MANAGER_PATH"));
 static TERMINAL_ELF: &[u8] = include_bytes!(env!("HUESOS_TERMINAL_PATH"));
+static BOOTFS_IMAGE: &[u8] = include_bytes!(env!("HUESOS_BOOTFS_PATH"));
 
 #[unsafe(no_mangle)]
 pub extern "C" fn _start() -> ! {
@@ -36,6 +37,7 @@ pub extern "C" fn _start() -> ! {
 
     if let Some((_, channel)) = &driver_manager {
         read_ready_message(&mut logger, "driver-manager", channel);
+        send_bootfs_vmo(&mut logger, channel);
     }
 
     let registry_pair = create_driver_manager_registry_channel(&mut logger, &driver_manager);
@@ -62,6 +64,29 @@ pub extern "C" fn _start() -> ! {
     }
 }
 
+
+
+fn send_bootfs_vmo(logger: &mut InitLogger, dm_bootstrap: &Channel) {
+    let Ok(vmo) = Vmo::create(BOOTFS_IMAGE.len() as u64) else {
+        init_logln!(logger, "[init] failed to create BOOTFS VMO");
+        return;
+    };
+    match vmo.write(0, BOOTFS_IMAGE) {
+        Ok(written) if written == BOOTFS_IMAGE.len() => {}
+        Ok(written) => {
+            init_logln!(logger, "[init] short BOOTFS VMO write: {} bytes", written);
+            return;
+        }
+        Err(e) => {
+            init_logln!(logger, "[init] failed to write BOOTFS VMO: {}", e.as_str());
+            return;
+        }
+    }
+    match dm_bootstrap.write_handle(b"bootfs-vmo", vmo.into_handle()) {
+        Ok(()) => init_logln!(logger, "[init] passed BOOTFS VMO to DriverManager"),
+        Err(e) => init_logln!(logger, "[init] failed to pass BOOTFS VMO: {}", e.as_str()),
+    }
+}
 
 fn create_driver_manager_registry_channel(
     logger: &mut InitLogger,

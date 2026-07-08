@@ -12,6 +12,24 @@ use huesos_abi::{HandleValue, Syscall, INVALID_HANDLE};
 pub struct Vmo(Handle);
 
 impl Vmo {
+    /// Wrap a raw handle known to name a VMO.
+    ///
+    /// # Safety
+    /// `raw` must be an owned VMO handle in this process.
+    pub unsafe fn from_raw(raw: HandleValue) -> Self {
+        Self(unsafe { Handle::from_raw(raw) })
+    }
+
+    /// Build a VMO from an owned generic handle.
+    pub fn from_handle(handle: Handle) -> Self {
+        Self(handle)
+    }
+
+    /// Consume this VMO and return the underlying generic handle.
+    pub fn into_handle(self) -> Handle {
+        self.0
+    }
+
     /// Create a new VMO of at least `size` bytes, zero-filled.
     pub fn create(size: u64) -> crate::Result<Self> {
         let mut out: HandleValue = INVALID_HANDLE;

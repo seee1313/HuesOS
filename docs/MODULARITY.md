@@ -72,6 +72,12 @@ keep using `libcanvas::process::*`.
 - `protocol.rs` — bootstrap/status/heartbeat message constants.
 - `supervisor.rs` — DriverHost launch and heartbeat/status polling.
 
+
+The DriverManager also owns the first filesystem service modules:
+
+- `bootfs.rs` — parser for the RAM-resident BOOTFS archive.
+- `fs_service.rs` — Channel-facing FileSystemService (`LIST`, `CAT`, `STAT`).
+
 `crates/huesos-userspace/driver-host-input/` is the first DriverHost process.
 It hosts the DriverManager-managed MVP keyboard service, binds IRQ1 to a Port, and reports
 readiness/heartbeats to DriverManager.

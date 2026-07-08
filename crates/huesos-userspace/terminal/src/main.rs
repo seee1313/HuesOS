@@ -25,7 +25,8 @@ pub extern "C" fn _start() -> ! {
     let bootstrap = libcanvas::channel::bootstrap();
     let _ = bootstrap.write(b"terminal:ready");
 
-    let keyboard = match wait_for_keyboard_service(&bootstrap) {
+    let registry = wait_for_registry(&bootstrap);
+    let keyboard = match open_service(&registry, b"open:keyboard", b"service:keyboard:channel") {
         Ok(channel) => channel,
         Err(e) => {
             println!("[terminal] failed to open keyboard service: {}", e.as_str());
@@ -34,26 +35,30 @@ pub extern "C" fn _start() -> ! {
             }
         }
     };
+    let filesystem = open_service(&registry, b"open:filesystem", b"service:filesystem:channel").ok();
 
-    let mut shell = Shell::new(keyboard);
+    let mut shell = Shell::new(keyboard, filesystem);
     shell.run();
 }
 
-fn wait_for_keyboard_service(bootstrap: &Channel) -> libcanvas::Result<Channel> {
+fn wait_for_registry(bootstrap: &Channel) -> Channel {
     let mut buf = [0u8; 64];
-    let registry = loop {
+    loop {
         match bootstrap.read_channel_handle(&mut buf) {
-            Ok((n, channel)) if &buf[..n] == b"driver-manager-registry" => break channel,
+            Ok((n, channel)) if &buf[..n] == b"driver-manager-registry" => return channel,
             Ok((_n, _channel)) => println!("[terminal] ignored unknown bootstrap handle message"),
             Err(ErrorCode::ShouldWait) | Err(ErrorCode::InvalidArgs) => libcanvas::process::yield_now(),
-            Err(e) => return Err(e),
+            Err(e) => println!("[terminal] registry wait failed: {}", e.as_str()),
         }
-    };
+    }
+}
 
-    registry.write(b"open:keyboard")?;
+fn open_service(registry: &Channel, request: &[u8], response: &[u8]) -> libcanvas::Result<Channel> {
+    let mut buf = [0u8; 64];
+    registry.write(request)?;
     loop {
         match registry.read_channel_handle(&mut buf) {
-            Ok((n, channel)) if &buf[..n] == b"service:keyboard:channel" => return Ok(channel),
+            Ok((n, channel)) if &buf[..n] == response => return Ok(channel),
             Ok((_n, _channel)) => println!("[terminal] ignored unknown registry handle message"),
             Err(ErrorCode::ShouldWait) | Err(ErrorCode::InvalidArgs) => libcanvas::process::yield_now(),
             Err(e) => return Err(e),
