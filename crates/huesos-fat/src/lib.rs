@@ -3,6 +3,8 @@
 
 #![no_std]
 
+extern crate alloc;
+
 pub trait BlockDevice {
     fn read_sector(&self, sector: u32, buf: &mut [u8]) -> Result<(), DriverError>;
     fn write_sector(&self, sector: u32, buf: &[u8]) -> Result<(), DriverError>;
@@ -102,7 +104,13 @@ impl<'a, D: BlockDevice> FatFileSystem<'a, D> {
     }
 
     fn data_offset(&self) -> u32 {
-        self.fat_offset() + (self.bpb.num_fats as u32 * self.sectors_per_fat())
+        let root_sectors = if self.is_fat32 {
+            0
+        } else {
+            ((self.bpb.root_ent_count as u32 * 32) + (self.bpb.bytes_per_sector as u32 - 1))
+                / self.bpb.bytes_per_sector as u32
+        };
+        self.fat_offset() + (self.bpb.num_fats as u32 * self.sectors_per_fat()) + root_sectors
     }
 
     pub fn cluster_to_sector(&self, cluster: u32) -> u32 {
@@ -151,8 +159,12 @@ impl<'a, D: BlockDevice> FatFileSystem<'a, D> {
         Err(DriverError::FileNotFound) // caller should have used full path to file
     }
 
+    fn root_dir_offset(&self) -> u32 {
+        self.fat_offset() + (self.bpb.num_fats as u32 * self.sectors_per_fat())
+    }
+
     fn find_entry_in_fat16_root(&self, name: &str) -> Result<DirectoryEntry, DriverError> {
-        let root_start = self.data_offset();
+        let root_start = self.root_dir_offset();
         let root_entries = self.bpb.root_ent_count as u32;
         let root_sectors = (root_entries * 32 + 511) / 512;
 
@@ -286,9 +298,9 @@ mod tests {
     use super::*;
     use spin::Mutex;
 
-    struct RamDisk { data: Mutex<[u8; 20*1024]>, sector_size: u32 }
+    struct RamDisk { data: Mutex<[u8; 40*1024]>, sector_size: u32 }
     impl RamDisk {
-        fn new() -> Self { Self { data: Mutex::new([0u8; 20*1024]), sector_size: 512 } }
+        fn new() -> Self { Self { data: Mutex::new([0u8; 40*1024]), sector_size: 512 } }
         fn write_sector(&self, sec: u32, b: &[u8]) {
             let mut d = self.data.lock();
             let start = (sec as usize) * 512;
@@ -313,8 +325,86 @@ mod tests {
     }
 
     #[test]
-    fn test_mount() {
+    fn test_mount_invalid_sector_size() {
         let d = RamDisk::new();
         assert!(FatFileSystem::mount(&d).is_err());
+    }
+
+    #[test]
+    fn test_read_file_multi_sector_cluster() {
+        let d = RamDisk::new();
+
+        // Build a minimal FAT16 image: 2 sectors per cluster.
+        let mut bpb = FatBpb {
+            jump: [0xEB, 0x3C, 0x90],
+            oem_name: *b"MSDOS5.0",
+            bytes_per_sector: 512,
+            sectors_per_cluster: 2,
+            reserved_sectors: 1,
+            num_fats: 1,
+            root_ent_count: 16,
+            total_sectors_16: 20,
+            media_type: 0xF0,
+            fat_size_16: 1,
+            sectors_per_track: 1,
+            head_count: 1,
+            hidden_sectors: 0,
+            total_sectors_32: 0,
+            fat_size_32: 0,
+            ext_flags: 0,
+            fs_version: 0,
+            root_cluster: 0,
+            fs_info_sector: 0,
+            backup_boot_sector: 0,
+            reserved: [0; 12],
+            boot_signature: [0; 440],
+        };
+        let bpb_bytes = unsafe {
+            core::slice::from_raw_parts(&bpb as *const FatBpb as *const u8, 512)
+        };
+        d.write_sector(0, bpb_bytes);
+
+        // FAT16 table (sector 1): entry0 = 0xFFF0, entry1 = 0xFFFF, entry2 = 0xFFFF
+        let mut fat = [0u8; 512];
+        fat[0..2].copy_from_slice(&0xFFF0u16.to_le_bytes());
+        fat[2..4].copy_from_slice(&0xFFFFu16.to_le_bytes());
+        fat[4..6].copy_from_slice(&0xFFFFu16.to_le_bytes());
+        d.write_sector(1, &fat);
+
+        // Root directory (sector 2): one entry for TEST.TXT
+        let mut root = [0u8; 512];
+        let entry = DirectoryEntry {
+            name: *b"TEST    ",
+            ext: *b"TXT",
+            attr: 0x00,
+            reserved: 0,
+            create_time_tenth: 0,
+            create_time: 0,
+            create_date: 0,
+            last_access_date: 0,
+            first_cluster_hi: 0,
+            write_time: 0,
+            write_date: 0,
+            first_cluster_lo: 2,
+            file_size: 600,
+        };
+        let entry_bytes = unsafe {
+            core::slice::from_raw_parts(&entry as *const DirectoryEntry as *const u8, 32)
+        };
+        root[0..32].copy_from_slice(entry_bytes);
+        d.write_sector(2, &root);
+
+        // Data cluster 2 starts at sector 3 (data_offset = 1 + 1 + 1 = 3)
+        let data1 = [0xABu8; 512];
+        let mut data2 = [0x00u8; 512];
+        data2[0..88].fill(0xAB);
+        d.write_sector(3, &data1);
+        d.write_sector(4, &data2);
+
+        let fs = FatFileSystem::mount(&d).unwrap();
+        let mut buf = [0u8; 1024];
+        let n = fs.read_file("TEST.TXT", &mut buf).unwrap();
+        assert_eq!(n, 600);
+        assert!(buf[..600].iter().all(|&b| b == 0xAB));
     }
 }
