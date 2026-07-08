@@ -207,7 +207,7 @@ mod tests {
 
         let result = HbiImage::parse(&data);
         assert!(result.is_ok());
-        let hbi = result.expect("test");
+        let hbi = result.unwrap_or_else(|_| panic!("test hbi parse failed"));
         assert_eq!(hbi.get_num_entries(), 0);
     }
 }
