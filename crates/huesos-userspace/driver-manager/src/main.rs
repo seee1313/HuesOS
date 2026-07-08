@@ -27,7 +27,6 @@ pub extern "C" fn _start() -> ! {
     let bootstrap = libcanvas::channel::bootstrap();
 
     let mut manager = DriverManager::new();
-    manager.start_driver_hosts();
 
     if manager.keyboard_ready() {
         let _ = bootstrap.write(b"driver-manager:ready");

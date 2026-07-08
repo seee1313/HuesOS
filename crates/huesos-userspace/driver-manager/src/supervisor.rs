@@ -6,9 +6,6 @@ use crate::protocol;
 use crate::registry::{ServiceRegistry, ServiceState};
 use libcanvas::{println, Channel, ErrorCode, Process, Vmo};
 
-/// Input DriverHost ELF bytes embedded into DriverManager by build.rs.
-pub static INPUT_DRIVER_HOST_ELF: &[u8] = include_bytes!(env!("HUESOS_INPUT_DRIVER_HOST_PATH"));
-
 /// DriverManager runtime.
 pub struct DriverManager {
     registry: ServiceRegistry,
@@ -16,6 +13,7 @@ pub struct DriverManager {
     registry_channel: Option<Channel>,
     fs: FileSystemService,
     heartbeat_count: u64,
+    bootfs_loaded: bool,
 }
 
 struct ManagedHost {
@@ -34,22 +32,76 @@ impl DriverManager {
             registry_channel: None,
             fs: FileSystemService::new(),
             heartbeat_count: 0,
+            bootfs_loaded: false,
         }
     }
 
     /// Launch all MVP DriverHosts and wait until mandatory services are ready.
     pub fn start_driver_hosts(&mut self) {
-        self.describe_manifest();
-        match libcanvas::process::spawn_elf(INPUT_HOST.name, INPUT_DRIVER_HOST_ELF) {
+        let bootfs = match self.fs.bootfs() {
+            Some(b) => b,
+            None => {
+                println!("[driver-manager] cannot start drivers: BOOTFS not loaded");
+                return;
+            }
+        };
+
+        let vmo = match self.fs.vmo() {
+            Some(v) => v,
+            None => return,
+        };
+
+        // 1. Read the manifest for input-host.
+        let mut manifest_buf = [0u8; 1024];
+        let manifest_path = "/manifests/input-host.hdriver";
+        let n = match bootfs.read_file(manifest_path, &mut manifest_buf) {
+            Ok(n) => n,
+            Err(e) => {
+                println!("[driver-manager] failed to read manifest {}: {}", manifest_path, e.as_str());
+                return;
+            }
+        };
+
+        let manifest = match crate::manifest::parse_hdriver(&manifest_buf[..n]) {
+            Some(m) => m,
+            None => {
+                println!("[driver-manager] failed to parse manifest {}", manifest_path);
+                return;
+            }
+        };
+
+        println!(
+            "[driver-manager] manifest loaded: host={} elf={}",
+            manifest.name_as_str(),
+            manifest.elf_path_as_str()
+        );
+
+        // 2. Find the ELF in BOOTFS.
+        let elf_path = manifest.elf_path_as_str();
+        let entry = match bootfs.get_entry(elf_path) {
+            Ok(Some(e)) => e,
+            _ => {
+                println!("[driver-manager] ELF not found in BOOTFS: {}", elf_path);
+                return;
+            }
+        };
+
+        // 3. Launch DriverHost from VMO.
+        match libcanvas::process::spawn_elf_from_vmo(
+            manifest.name_as_str(),
+            vmo,
+            entry.offset,
+            entry.len,
+        ) {
             Ok((process, bootstrap)) => {
-                println!("[driver-manager] launched DriverHost {}", INPUT_HOST.name);
+                println!("[driver-manager] launched DriverHost {} from BOOTFS", manifest.name_as_str());
                 self.input_host = Some(ManagedHost { process, bootstrap });
                 self.wait_for_input_host_ready();
             }
             Err(e) => {
                 println!(
                     "[driver-manager] failed to launch DriverHost {}: {}",
-                    INPUT_HOST.name,
+                    manifest.name_as_str(),
                     e.as_str()
                 );
                 self.registry.mark_failed("keyboard");
@@ -106,6 +158,8 @@ impl DriverManager {
                 Ok((n, handle)) if &buf[..n] == protocol::BOOTFS_VMO.as_bytes() => {
                     println!("[driver-manager] received BOOTFS VMO from init");
                     self.fs.install_bootfs(Vmo::from_handle(handle));
+                    self.bootfs_loaded = true;
+                    self.start_driver_hosts();
                 }
                 Ok((_n, _handle)) => println!("[driver-manager] unknown bootstrap handle message"),
                 Err(ErrorCode::ShouldWait) => return,

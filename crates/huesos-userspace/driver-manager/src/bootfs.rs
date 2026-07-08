@@ -9,7 +9,7 @@ const PATH_SIZE: usize = 192;
 
 /// BOOTFS archive backed by a transferred VMO.
 pub struct BootFs {
-    vmo: Vmo,
+    pub vmo: Vmo,
     file_count: u32,
 }
 
@@ -33,7 +33,7 @@ impl BootFs {
 
     /// Read a file into `out`, returning bytes copied.
     pub fn read_file(&self, path: &str, out: &mut [u8]) -> libcanvas::Result<usize> {
-        let Some(entry) = self.find(path)? else {
+        let Some(entry) = self.get_entry(path)? else {
             return Err(libcanvas::ErrorCode::NotFound);
         };
         let to_read = (entry.len as usize).min(out.len());
@@ -42,7 +42,7 @@ impl BootFs {
 
     /// Write a text stat response for `path` into `out`.
     pub fn stat_text(&self, path: &str, out: &mut [u8]) -> libcanvas::Result<usize> {
-        let Some(entry) = self.find(path)? else {
+        let Some(entry) = self.get_entry(path)? else {
             return Err(libcanvas::ErrorCode::NotFound);
         };
         let mut writer = ByteWriter::new(out);
@@ -71,7 +71,8 @@ impl BootFs {
         Ok(writer.len())
     }
 
-    fn find(&self, path: &str) -> libcanvas::Result<Option<Entry>> {
+    /// Find a file's offset and length in the archive.
+    pub fn get_entry(&self, path: &str) -> libcanvas::Result<Option<Entry>> {
         let needle = path.as_bytes();
         let mut idx = 0;
         while idx < self.file_count {

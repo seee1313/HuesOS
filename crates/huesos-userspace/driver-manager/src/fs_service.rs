@@ -30,6 +30,14 @@ impl FileSystemService {
         }
     }
 
+    pub fn bootfs(&self) -> Option<&BootFs> {
+        self.bootfs.as_ref()
+    }
+
+    pub fn vmo(&self) -> Option<&Vmo> {
+        self.bootfs.as_ref().map(|b| &b.vmo)
+    }
+
     pub fn open_for_registry(&mut self, registry: &Channel) {
         match Channel::pair() {
             Ok((client_end, server_end)) => {
