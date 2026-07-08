@@ -142,14 +142,20 @@ impl Channel {
         Ok((actual_bytes as usize, actual_handles as usize))
     }
 
-    /// Read a message that is expected to contain one transferred Channel handle.
-    pub fn read_channel_handle(&self, buf: &mut [u8]) -> crate::Result<(usize, Channel)> {
+    /// Read a message that is expected to contain one transferred generic handle.
+    pub fn read_handle(&self, buf: &mut [u8]) -> crate::Result<(usize, Handle)> {
         let mut handles = [INVALID_HANDLE; 1];
         let (bytes, num_handles) = self.read_etc(buf, &mut handles)?;
         if num_handles != 1 {
             return Err(crate::ErrorCode::InvalidArgs);
         }
-        Ok((bytes, Channel::from_handle(unsafe { Handle::from_raw(handles[0]) })))
+        Ok((bytes, unsafe { Handle::from_raw(handles[0]) }))
+    }
+
+    /// Read a message that is expected to contain one transferred Channel handle.
+    pub fn read_channel_handle(&self, buf: &mut [u8]) -> crate::Result<(usize, Channel)> {
+        let (bytes, handle) = self.read_handle(buf)?;
+        Ok((bytes, Channel::from_handle(handle)))
     }
 
     /// Read a message into a fixed-size on-stack buffer
