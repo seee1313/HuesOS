@@ -46,7 +46,7 @@ impl BootFs {
             return Err(libcanvas::ErrorCode::NotFound);
         };
         let mut writer = ByteWriter::new(out);
-        writer.write_str("ok path=");
+        writer.write_str("path=");
         writer.write_str(path);
         writer.write_str(" size=");
         writer.write_u64(entry.len);
