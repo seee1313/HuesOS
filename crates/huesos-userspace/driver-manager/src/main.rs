@@ -9,6 +9,8 @@
 #![no_std]
 #![no_main]
 
+mod bootfs;
+mod fs_service;
 mod manifest;
 mod protocol;
 mod registry;
