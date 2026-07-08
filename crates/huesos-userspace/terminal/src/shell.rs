@@ -39,7 +39,7 @@ impl Shell {
         screen.clear();
         screen.write_line("HuesOS Terminal");
         screen.write_line("userspace mini shell: type 'help' and press Enter");
-        screen.write_line("keyboard input: userspace Interrupt + Port bridge");
+        screen.write_line("keyboard input: DriverManager keyboard service");
         screen.write_line("");
 
         let mut shell = Self {
