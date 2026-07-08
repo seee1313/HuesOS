@@ -222,6 +222,7 @@ name = "huesos-kernel"
 version = "0.1.0"
 dependencies = [
  "huesos-abi",
+ "huesos-alloc",
  "huesos-arch",
  "huesos-elf",
  "huesos-fb",
