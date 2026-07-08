@@ -24,7 +24,7 @@ pub enum DriverError {
 
 #[repr(C, packed)]
 #[derive(Debug, Clone, Copy)]
-pub struct FatBpb { /* ... same fields as before ... */
+pub struct FatBpb {
     pub jump: [u8; 3],
     pub oem_name: [u8; 8],
     pub bytes_per_sector: u16,
@@ -35,20 +35,18 @@ pub struct FatBpb { /* ... same fields as before ... */
     pub total_sectors_16: u16,
     pub media_type: u8,
     pub fat_size_16: u16,
-    pub sectors_per_fat_16: u16,
     pub sectors_per_track: u16,
     pub head_count: u16,
     pub hidden_sectors: u32,
     pub total_sectors_32: u32,
     pub fat_size_32: u32,
-    pub sectors_per_fat_32: u32,
     pub ext_flags: u32,
     pub fs_version: u32,
     pub root_cluster: u32,
     pub fs_info_sector: u32,
     pub backup_boot_sector: u32,
     pub reserved: [u8; 12],
-    pub boot_signature: [u8; 512 - 0x40],
+    pub boot_signature: [u8; 512 - 72],
 }
 
 #[repr(C, packed)]
@@ -100,7 +98,7 @@ impl<'a, D: BlockDevice> FatFileSystem<'a, D> {
     fn fat_offset(&self) -> u32 { self.bpb.reserved_sectors as u32 }
 
     fn sectors_per_fat(&self) -> u32 {
-        if self.is_fat32 { self.bpb.sectors_per_fat_32 } else { self.bpb.sectors_per_fat_16 as u32 }
+        if self.is_fat32 { self.bpb.fat_size_32 } else { self.bpb.fat_size_16 as u32 }
     }
 
     fn data_offset(&self) -> u32 {
