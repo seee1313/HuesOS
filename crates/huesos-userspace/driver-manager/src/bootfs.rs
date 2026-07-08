@@ -4,7 +4,7 @@ use libcanvas::Vmo;
 
 const MAGIC: &[u8; 8] = b"HBOOTFS1";
 const HEADER_SIZE: u64 = 16;
-const ENTRY_SIZE: u64 = 212;
+const ENTRY_SIZE: u64 = 216;
 const PATH_SIZE: usize = 192;
 
 /// BOOTFS archive backed by a transferred VMO.

@@ -152,7 +152,7 @@ fn build_bootfs_image(manifest_dir: &Path, input_driver_host: &Path, terminal: &
 fn write_bootfs(path: &Path, files: &[BootFsFile]) {
     const MAGIC: &[u8; 8] = b"HBOOTFS1";
     const HEADER_SIZE: usize = 16;
-    const ENTRY_SIZE: usize = 212;
+    const ENTRY_SIZE: usize = 216;
     const PATH_SIZE: usize = 192;
 
     let mut image = Vec::new();

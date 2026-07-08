@@ -52,7 +52,7 @@ BootFsHeader
   file_count  = u32
   reserved    = u32
 
-BootFsEntry[file_count]
+BootFsEntry[file_count] (216 bytes)
   path[192]   = UTF-8 path, NUL-padded
   offset      = u64, absolute byte offset from start of image
   len         = u64
