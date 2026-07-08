@@ -5,7 +5,6 @@
 
 use core::option::Option;
 use core::result::Result;
-use core::iter::Iterator;
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum AllocError {
@@ -13,14 +12,11 @@ pub enum AllocError {
     InvalidSize,
 }
 
-// =============================================================================
-// BUDDY ALLOCATOR
-// =============================================================================
-
 /// A Buddy Allocator that manages memory in power-of-two blocks.
 pub struct BuddyAllocator<const ORDER: usize> {
     free_lists: [Option<*mut FreeBlock>; ORDER],
     base_addr: usize,
+    #[allow(dead_code)]
     total_pages: usize,
 }
 
@@ -210,10 +206,6 @@ impl Slab {
     pub fn is_full(&self) -> bool {
         self.used_slots == self.total_slots
     }
-
-    pub fn is_empty(&self) -> bool {
-        self.used_slots == 0
-    }
 }
 
 pub struct SlabCache {
@@ -243,13 +235,14 @@ impl SlabCache {
         let page = buddy.allocate_page()?;
         unsafe {
             let mut new_slab = Slab::new(page, self.slot_size, 1);
-            let ptr = new_slab.pop_slot().ok_or(AllocError::OutOfMemory)?;
-            
-            let slot_idx = self.slabs.iter().position(|s| s.is_none()).ok_or(AllocError::OutOfMemory)?;
-            self.slabs[slot_idx] = Some(new_slab);
-            
-            Ok(ptr)
+            if let Some(ptr) = new_slab.pop_slot() {
+                if let Some(slot_idx) = self.slabs.iter().position(|s| s.is_none()) {
+                    self.slabs[slot_idx] = Some(new_slab);
+                    return Ok(ptr);
+                }
+            }
         }
+        Err(AllocError::OutOfMemory)
     }
 
     pub unsafe fn deallocate(&mut self, ptr: usize) {
@@ -298,7 +291,6 @@ impl SlabAllocator {
     }
 }
 
-// SAFETY notes for kernel use
 unsafe impl<const ORDER: usize> Send for BuddyAllocator<ORDER> {}
 unsafe impl<const ORDER: usize> Sync for BuddyAllocator<ORDER> {}
 

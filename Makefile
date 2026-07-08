@@ -1,10 +1,10 @@
 PROFILE ?= debug
 CARGO_FLAGS := $(if $(filter release,$(PROFILE)),--release,)
 
-# Build only the kernel crate explicitly.
-# This prevents accidental compilation of dev tools (clap, anstyle, etc.)
-# that pull in std when building for the no_std x86_64-huesos target.
-CARGO_BUILD := cargo build -p huesos-kernel $(CARGO_FLAGS)
+# Build the boot crate (which produces the final kernel ELF "huesos-boot").
+# We build explicitly with -p to avoid pulling in dev tools (clap etc.)
+# that require std and break no_std kernel builds.
+CARGO_BUILD := cargo build -p huesos-boot $(CARGO_FLAGS)
 
 ISO := build/huesos.iso
 

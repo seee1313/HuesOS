@@ -1,13 +1,19 @@
 //! HBI v2.1 Parser for HuesOS.
 //! Safe parser with no unsafe pointer casts outside of very narrow validated regions.
 
+/// Types of modules that can be present in an HBI image.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
 pub enum ModuleType {
+    /// The kernel ELF binary.
     Kernel = 1,
+    /// Boot filesystem image.
     Bootfs = 2,
+    /// Kernel command line.
     Cmdline = 3,
+    /// Platform-specific data (device tree like).
     Platform = 4,
+    /// Unknown module type.
     Unknown,
 }
 
@@ -23,28 +29,43 @@ impl From<u32> for ModuleType {
     }
 }
 
+/// Global header of an HBI image.
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct GlobalHeader {
+    /// Magic bytes: "HUESOS_H".
     pub magic: [u8; 8],
+    /// Version of the HBI format (currently 0x0002_0001).
     pub version: u32,
+    /// Flags (reserved for future use).
     pub flags: u32,
+    /// Number of directory entries that follow the header.
     pub num_entries: u32,
+    /// Total size of the header section (including this header).
     pub header_size: u32,
+    /// Total size of the entire HBI image.
     pub image_size: u64,
+    /// Architecture identifier.
     pub arch_id: u32,
+    /// Reserved for future use.
     pub reserved: [u8; 36],
 }
 
+/// Directory entry describing one module inside the HBI image.
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct DirectoryEntry {
+    /// Module type (see [`ModuleType`]).
     pub type_id: u32,
+    /// Offset from the start of the image to the module data.
     pub offset: u32,
+    /// Length of the module data (after the per-module EntryHeader).
     pub length: u32,
+    /// Flags for this entry.
     pub flags: u32,
 }
 
+/// Per-module header that immediately precedes the payload.
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct EntryHeader {
@@ -56,24 +77,34 @@ pub struct EntryHeader {
     pub reserved: u32,
 }
 
+/// Parsed HBI image.
 pub struct HbiImage<'a> {
     data: &'a [u8],
     header: GlobalHeader,
     entries: &'a [DirectoryEntry],
 }
 
+/// Errors that can occur while parsing an HBI image.
 #[derive(Debug)]
 pub enum HbiError {
+    /// Magic bytes did not match.
     InvalidMagic,
+    /// Unsupported HBI version.
     UnsupportedVersion,
+    /// Input buffer too small for the declared header.
     BufferTooSmall,
+    /// Requested module was not present.
     ModuleNotFound,
+    /// Offset/length in directory entry was invalid.
     InvalidOffset,
+    /// Generic parse error (e.g. arithmetic overflow).
     ParseError,
 }
 
 impl<'a> HbiImage<'a> {
-    /// Safe parser: uses byte slices and checked arithmetic only.
+    /// Parse an HBI image from a byte slice.
+    ///
+    /// This function is safe and performs all necessary size checks.
     pub fn parse(data: &'a [u8]) -> Result<Self, HbiError> {
         const HEADER_SIZE: usize = core::mem::size_of::<GlobalHeader>();
 
@@ -81,7 +112,7 @@ impl<'a> HbiImage<'a> {
             return Err(HbiError::BufferTooSmall);
         }
 
-        // Safe copy of header (no aliasing issues)
+        // Copy header bytes safely
         let mut header_bytes = [0u8; HEADER_SIZE];
         header_bytes.copy_from_slice(&data[..HEADER_SIZE]);
 
@@ -113,7 +144,6 @@ impl<'a> HbiImage<'a> {
             return Err(HbiError::BufferTooSmall);
         }
 
-        // Safe slice for entries (we validated size)
         let entries = unsafe {
             core::slice::from_raw_parts(
                 data.as_ptr().add(entries_start) as *const DirectoryEntry,
@@ -128,6 +158,7 @@ impl<'a> HbiImage<'a> {
         })
     }
 
+    /// Get the raw payload of a module by type.
     pub fn get_module(&self, module_type: ModuleType) -> Result<&'a [u8], HbiError> {
         let type_id = module_type as u32;
 
@@ -140,7 +171,6 @@ impl<'a> HbiImage<'a> {
         let offset = entry.offset as usize;
         let length = entry.length as usize;
 
-        // Entry header + payload
         let payload_start = offset
             .checked_add(core::mem::size_of::<EntryHeader>())
             .ok_or(HbiError::InvalidOffset)?;
@@ -156,10 +186,12 @@ impl<'a> HbiImage<'a> {
         Ok(&self.data[payload_start..payload_end])
     }
 
+    /// Number of directory entries in this image.
     pub fn get_num_entries(&self) -> u32 {
         self.header.num_entries
     }
 
+    /// Reference to the parsed global header.
     pub fn header(&self) -> &GlobalHeader {
         &self.header
     }
@@ -207,7 +239,7 @@ mod tests {
 
         let result = HbiImage::parse(&data);
         assert!(result.is_ok());
-        let hbi = result.unwrap_or_else(|_| panic!("test hbi parse failed"));
+        let hbi = result.unwrap();
         assert_eq!(hbi.get_num_entries(), 0);
     }
 }

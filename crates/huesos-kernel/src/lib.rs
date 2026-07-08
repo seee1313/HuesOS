@@ -71,42 +71,34 @@ pub struct BootInfo<'a> {
 /// Called exactly once by the bootloader entry point, with a valid stack
 /// and the HHDM already mapped.
 pub unsafe fn kmain(boot_info: BootInfo) -> ! {
-    unsafe {
-        huesos_arch::init_early();
-    }
+    huesos_arch::init_early();
 
-    unsafe {
-        init::pmm_init(boot_info.memory_regions, boot_info.hhdm_offset);
-    }
+    init::pmm_init(boot_info.memory_regions, boot_info.hhdm_offset);
 
     let phys_offset = huesos_arch::VirtAddr::new(boot_info.hhdm_offset);
-    unsafe {
-        huesos_arch::init_paging(phys_offset);
-    }
+    huesos_arch::init_paging(phys_offset);
 
     init::heap_init();
     init::object_init();
-    
+
     if let Some(hbi_data) = boot_info.hbi_image {
-        unsafe {
-            match boot::hbi::HbiImage::parse(hbi_data) {
-                Ok(hbi) => {
-                    dbg("HBI v2.1 parsed successfully. Entries: ");
-                    dbg_num(hbi.get_num_entries() as u64);
-                    dbg("\n");
-                    
-                    if let Ok(plat_data) = hbi.get_module(boot::hbi::ModuleType::Platform) {
-                        let platform = boot::platform::PlatformData::new(plat_data);
-                        if let Some(cpu_count) = platform.get_u64(boot::platform::PlatformProperty::CpuCount) {
-                            dbg("Platform: CPU count = ");
-                            dbg_num(cpu_count);
-                            dbg("\n");
-                        }
+        match boot::hbi::HbiImage::parse(hbi_data) {
+            Ok(hbi) => {
+                dbg("HBI v2.1 parsed successfully. Entries: ");
+                dbg_num(hbi.get_num_entries() as u64);
+                dbg("\n");
+
+                if let Ok(plat_data) = hbi.get_module(boot::hbi::ModuleType::Platform) {
+                    let platform = boot::platform::PlatformData::new(plat_data);
+                    if let Some(cpu_count) = platform.get_u64(boot::platform::PlatformProperty::CpuCount) {
+                        dbg("Platform: CPU count = ");
+                        dbg_num(cpu_count);
+                        dbg("\n");
                     }
                 }
-                Err(e) => {
-                    dbg("Failed to parse HBI image\n");
-                }
+            }
+            Err(_e) => {
+                dbg("Failed to parse HBI image\n");
             }
         }
     }

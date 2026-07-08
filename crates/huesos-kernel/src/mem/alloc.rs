@@ -67,7 +67,8 @@ impl BuddyProvider for KernelAllocator {
 pub static GLOBAL_ALLOCATOR: Mutex<Option<KernelAllocator>> = Mutex::new(None);
 
 /// Public API for kernel allocation.
-/// Returns 0 on failure (caller must handle).
+///
+/// Returns 0 on failure.
 pub fn kmalloc(size: usize) -> usize {
     let mut lock = GLOBAL_ALLOCATOR.lock();
     if let Some(alloc) = lock.as_mut() {
@@ -77,6 +78,10 @@ pub fn kmalloc(size: usize) -> usize {
     }
 }
 
+/// Free previously allocated memory.
+///
+/// # Safety
+/// The pointer must have been allocated by `kmalloc` with the same size.
 pub unsafe fn kfree(ptr: usize, size: usize) {
     let mut lock = GLOBAL_ALLOCATOR.lock();
     if let Some(alloc) = lock.as_mut() {
