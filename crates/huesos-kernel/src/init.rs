@@ -35,9 +35,11 @@ pub fn heap_init() {
     }
 
     unsafe {
-        super::ALLOCATOR
-            .lock()
-            .init(HEAP_VIRT_START as *mut u8, HEAP_SIZE);
+        let allocator = crate::mem::alloc::KernelAllocator::new(
+            HEAP_VIRT_START as usize,
+            page_count
+        );
+        *crate::mem::alloc::GLOBAL_ALLOCATOR.lock() = Some(allocator);
     }
 }
 

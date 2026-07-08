@@ -12,12 +12,10 @@ pub mod init;
 pub mod process;
 pub mod scheduler;
 pub mod task;
+pub mod mem;
+pub mod boot;
 
-use linked_list_allocator::LockedHeap;
-
-/// Kernel heap allocator.
-#[global_allocator]
-static ALLOCATOR: LockedHeap = LockedHeap::empty();
+pub use huesos_pmm::MemoryRegion;
 
 /// Kernel version.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -26,9 +24,6 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// build time (see `build.rs`). Avoids needing a bootloader module/initrd
 /// mechanism for the MVP: the kernel *is* the "initrd".
 pub static INIT_BINARY: &[u8] = include_bytes!(env!("HUESOS_INIT_PATH"));
-
-/// A single bootloader-reported physical memory region.
-pub use huesos_pmm::MemoryRegion;
 
 /// Framebuffer info handed off from the bootloader, if one was available.
 #[derive(Clone, Copy)]
@@ -66,6 +61,8 @@ pub struct BootInfo<'a> {
     pub memory_regions: &'a [MemoryRegion],
     /// Framebuffer info, if the bootloader provided one.
     pub framebuffer: Option<FramebufferInfo>,
+    /// HBI v2.1 boot image, if provided.
+    pub hbi_image: Option<&'a [u8]>,
 }
 
 /// Architecture-independent kernel main.
@@ -89,6 +86,31 @@ pub unsafe fn kmain(boot_info: BootInfo) -> ! {
 
     init::heap_init();
     init::object_init();
+    
+    if let Some(hbi_data) = boot_info.hbi_image {
+        unsafe {
+            match boot::hbi::HbiImage::parse(hbi_data) {
+                Ok(hbi) => {
+                    dbg("HBI v2.1 parsed successfully. Entries: ");
+                    dbg_num(hbi.get_num_entries() as u64);
+                    dbg("\n");
+                    
+                    if let Ok(plat_data) = hbi.get_module(boot::hbi::ModuleType::Platform) {
+                        let platform = boot::platform::PlatformData::new(plat_data);
+                        if let Some(cpu_count) = platform.get_u64(boot::platform::PlatformProperty::CpuCount) {
+                            dbg("Platform: CPU count = ");
+                            dbg_num(cpu_count);
+                            dbg("\n");
+                        }
+                    }
+                }
+                Err(e) => {
+                    dbg("Failed to parse HBI image\n");
+                }
+            }
+        }
+    }
+
     init::framebuffer_init(boot_info.framebuffer);
     huesos_hal::init();
 

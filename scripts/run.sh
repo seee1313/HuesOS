@@ -35,4 +35,5 @@ exec qemu-system-x86_64 \
     -cdrom "$ISO" \
     -net none \
     -serial stdio \
+    -display none \
     -no-reboot -no-shutdown
