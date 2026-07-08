@@ -89,7 +89,7 @@ impl<'a> HbiImage<'a> {
         }
 
         let num_entries = header.num_entries as usize;
-        let entries_size = num_entries * core::mem::size_of::<DirectoryEntry>();
+        let _entries_size = num_entries * core::mem::size_of::<DirectoryEntry>();
         
         if data.len() < (header.header_size as usize) {
             return Err(HbiError::BufferTooSmall);
