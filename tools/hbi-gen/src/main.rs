@@ -1,7 +1,7 @@
 use clap::Parser;
 use crc32fast::Hasher;
 use std::fs::{self, File};
-use std::io::{Read, Write, BufWriter};
+use std::io::{Write, BufWriter};
 use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
@@ -74,14 +74,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let platform_data = fs::read(&args.platform)?;
 
     let payloads = [
-        (TYPE_KERNEL, &kernel_data, FLAG_REQUIRED | FLAG_CRITICAL | FLAG_EXECUTABLE, 0),
-        (TYPE_BOOTFS, &bootfs_data, FLAG_REQUIRED | FLAG_CRITICAL, 0),
+        (TYPE_KERNEL, kernel_data.as_slice(), FLAG_REQUIRED | FLAG_CRITICAL | FLAG_EXECUTABLE, 0),
+        (TYPE_BOOTFS, bootfs_data.as_slice(), FLAG_REQUIRED | FLAG_CRITICAL, 0),
         (TYPE_CMDLINE, cmdline_data.as_bytes(), 0, 0),
-        (TYPE_PLATFORM, &platform_data, FLAG_REQUIRED | FLAG_CRITICAL, 0),
+        (TYPE_PLATFORM, platform_data.as_slice(), FLAG_REQUIRED | FLAG_CRITICAL, 0),
     ];
 
     let num_entries = payloads.len() as u32;
-    let header_size = 64 + (num_entries as usize * 16);
+    let header_size = core::mem::size_of::<GlobalHeader>()
+        + (num_entries as usize * core::mem::size_of::<DirectoryEntry>());
     let mut current_offset = align_up(header_size as u64, 8);
     let mut directory = Vec::new();
 
@@ -117,14 +118,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     unsafe {
         let header_ptr = &global_header as *const GlobalHeader as *const u8;
-        let header_slice = std::slice::from_raw_parts(header_ptr, 64);
+        let header_slice = std::slice::from_raw_parts(header_ptr, core::mem::size_of::<GlobalHeader>());
         writer.write_all(header_slice)?;
     }
 
     for entry in &directory {
         unsafe {
             let entry_ptr = entry as *const DirectoryEntry as *const u8;
-            let entry_slice = std::slice::from_raw_parts(entry_ptr, 16);
+            let entry_slice = std::slice::from_raw_parts(entry_ptr, core::mem::size_of::<DirectoryEntry>());
             writer.write_all(entry_slice)?;
         }
     }
@@ -146,7 +147,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         unsafe {
             let eh_ptr = &entry_header as *const EntryHeader as *const u8;
-            let eh_slice = std::slice::from_raw_parts(eh_ptr, 16);
+            let eh_slice = std::slice::from_raw_parts(eh_ptr, core::mem::size_of::<EntryHeader>());
             writer.write_all(eh_slice)?;
         }
 
