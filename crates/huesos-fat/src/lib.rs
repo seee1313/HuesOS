@@ -91,7 +91,7 @@ impl<'a, D: BlockDevice> FatFileSystem<'a, D> {
         let mut boot = [0u8; 512];
         device.read_sector(0, &mut boot)?;
 
-        let bpb = unsafe { core::ptr::read(boot.as_ptr() as *const FatBpb) };
+        let bpb = unsafe { core::ptr::read_unaligned(boot.as_ptr() as *const FatBpb) };
         if bpb.bytes_per_sector != 512 { return Err(DriverError::InvalidFat); }
 
         Ok(Self { device, bpb, is_fat32: bpb.fat_size_16 == 0 })
@@ -124,7 +124,7 @@ impl<'a, D: BlockDevice> FatFileSystem<'a, D> {
             0
         };
 
-        let mut components = path.split('/').filter(|c| !c.is_empty());
+        let components = path.split('/').filter(|c| !c.is_empty());
 
         // For FAT16 we start from fixed root
         let mut is_root_special = !self.is_fat32;
@@ -164,7 +164,7 @@ impl<'a, D: BlockDevice> FatFileSystem<'a, D> {
 
             for i in 0..(512 / 32) {
                 let entry = unsafe {
-                    core::ptr::read(buf.as_ptr().add(i * 32) as *const DirectoryEntry)
+                    core::ptr::read_unaligned(buf.as_ptr().add(i * 32) as *const DirectoryEntry)
                 };
                 if !entry.is_free() && !entry.is_volume_label() && self.name_matches(&entry, name) {
                     return Ok(entry);
@@ -187,7 +187,7 @@ impl<'a, D: BlockDevice> FatFileSystem<'a, D> {
 
                 for i in 0..(512 / 32) {
                     let entry = unsafe {
-                        core::ptr::read(buf.as_ptr().add(i * 32) as *const DirectoryEntry)
+                        core::ptr::read_unaligned(buf.as_ptr().add(i * 32) as *const DirectoryEntry)
                     };
                     if !entry.is_free() && !entry.is_volume_label() && self.name_matches(&entry, name) {
                         return Ok(entry);
