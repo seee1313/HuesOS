@@ -57,7 +57,8 @@ message, mirrors init progress logs to the framebuffer until handing the
 screen to the terminal, then launches the userspace DriverManager and
 framebuffer terminal as child processes. DriverManager now starts an
 `input-host` DriverHost, registers the keyboard service from its readiness
-messages, and monitors heartbeat messages. The terminal paints the
+messages, mounts a RAM BOOTFS image as FileSystemService, and monitors
+heartbeat messages. The terminal paints the
 framebuffer from userspace via `Canvas` and runs a built-in mini shell
 with internal commands only. Historical framebuffer test output is shown
 in `tools/fontgen/qemu_screenshot.png`.

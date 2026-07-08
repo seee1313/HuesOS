@@ -35,6 +35,7 @@ migration so implementation work stays explicit and reviewable.
 - DriverManager now owns a static Rust manifest table and launches an `input-host` DriverHost process.
 - `input-host` owns the DriverManager-managed keyboard IRQ binding, reports `service:keyboard:ready`, and sends heartbeat messages back to DriverManager over its bootstrap channel.
 - DriverManager registers the `keyboard` service from DriverHost readiness messages and reports ready to init only after the mandatory input service comes online.
+- DriverManager now mounts BOOTFS as a FileSystemService and terminal can use `ls`, `cat`, and `stat` through DriverManager's service registry.
 - Work must be split into small commits.
 
 ## Immediate open decisions before code changes
