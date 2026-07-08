@@ -27,7 +27,8 @@ impl KernelAllocator {
 
         // If the size is small enough, use the Slab allocator.
         if size <= 2048 {
-            self.slab.allocate(size, &mut self)
+            let mut buddy_wrapper = BuddyWrapper { buddy: &mut self.buddy };
+            self.slab.allocate(size, &mut buddy_wrapper)
         } else {
             // Otherwise, use Buddy allocator.
             // Calculate pages needed.
@@ -47,6 +48,18 @@ impl KernelAllocator {
             let pages = (size + 4095) / 4096;
             self.buddy.deallocate(ptr, pages);
         }
+    }
+}
+
+/// Helper wrapper to provide &mut BuddyAllocator to Slab without
+/// conflicting with &mut self.slab borrow.
+struct BuddyWrapper<'a> {
+    buddy: &'a mut BuddyAllocator<10>,
+}
+
+impl<'a> BuddyProvider for BuddyWrapper<'a> {
+    fn allocate_page(&mut self) -> Result<usize, AllocError> {
+        self.buddy.allocate(1)
     }
 }
 

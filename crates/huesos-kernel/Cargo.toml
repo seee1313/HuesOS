@@ -15,6 +15,7 @@ huesos-pmm = { path = "../huesos-pmm" }
 huesos-elf = { path = "../huesos-elf" }
 huesos-fb = { path = "../huesos-fb" }
 huesos-abi = { path = "../huesos-abi" }
+huesos-alloc = { path = "../huesos-alloc" }
 spin = { workspace = true }
 log = { workspace = true }
 linked_list_allocator = { workspace = true }

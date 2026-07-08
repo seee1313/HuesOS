@@ -296,3 +296,20 @@ impl SlabAllocator {
         self.caches[idx].deallocate(ptr);
     }
 }
+
+// SAFETY: The raw pointer based free lists are only accessed under the protection
+// of spin::Mutex in the kernel. For the static GLOBAL_ALLOCATOR we declare
+// Send + Sync because the kernel is currently single-CPU and all access
+// is serialized by the Mutex. In future SMP we will need proper per-CPU or
+// lock-free design.
+unsafe impl<const ORDER: usize> Send for BuddyAllocator<ORDER> {}
+unsafe impl<const ORDER: usize> Sync for BuddyAllocator<ORDER> {}
+
+unsafe impl Send for Slab {}
+unsafe impl Sync for Slab {}
+
+unsafe impl Send for SlabCache {}
+unsafe impl Sync for SlabCache {}
+
+unsafe impl Send for SlabAllocator {}
+unsafe impl Sync for SlabAllocator {}
