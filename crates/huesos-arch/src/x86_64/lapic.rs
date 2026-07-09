@@ -130,3 +130,11 @@ pub fn timer_stop() {
     write_reg(REG_LVT_TIMER, 0x0001_0000); // masked
     write_reg(REG_TIMER_INIT_COUNT, 0);
 }
+
+/// Send a reschedule IPI to `dest_apic_id`.
+/// Uses the timer vector (0x20) to trigger a scheduler tick on the target CPU.
+pub fn ipi_reschedule(dest_apic_id: u8) {
+    unsafe {
+        send_ipi(dest_apic_id, 0x20, IpiDelivery::Fixed);
+    }
+}

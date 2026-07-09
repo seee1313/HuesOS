@@ -44,8 +44,17 @@ pub unsafe fn init_paging(phys_offset: crate::VirtAddr) {
     }
 }
 
-/// Final stage: enable interrupts, start the PIT, ready for scheduling.
+/// Final stage: enable interrupts, start the LAPIC timer, ready for scheduling.
 pub fn init_late() {
     interrupts::init();
-    pit::init(100); // 100 Hz scheduler tick
+    // LAPIC timer: ~100 Hz with divider 16.
+    // TODO: calibrate against PIT/TSC for real hardware.
+    unsafe {
+        lapic::timer_init(
+            lapic::TimerDivide::Div16,
+            lapic::TimerMode::Periodic,
+            0x20000,
+            0x20,
+        );
+    }
 }
