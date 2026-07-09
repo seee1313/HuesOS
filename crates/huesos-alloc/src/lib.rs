@@ -3,6 +3,8 @@
 
 #![no_std]
 
+extern crate alloc;
+
 use core::option::Option;
 use core::result::Result;
 
@@ -242,3 +244,43 @@ unsafe impl Send for SlabCache {}
 unsafe impl Sync for SlabCache {}
 unsafe impl Send for SlabAllocator {}
 unsafe impl Sync for SlabAllocator {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_buddy_allocate_deallocate() {
+        let mut mem = alloc::vec![0u8; 8 * 4096];
+        let base = mem.as_mut_ptr() as usize;
+        let mut allocator = unsafe { BuddyAllocator::<4>::new(base, 8, 4096) };
+        let a = allocator.allocate(1).unwrap();
+        let b = allocator.allocate(2).unwrap();
+        let c = allocator.allocate(4).unwrap();
+        assert!(a != 0);
+        assert!(b != 0);
+        assert!(c != 0);
+        unsafe {
+            allocator.deallocate(a, 1);
+            allocator.deallocate(b, 2);
+            allocator.deallocate(c, 4);
+        }
+        // After full deallocation we should be able to allocate the whole range again.
+        let d = allocator.allocate(8).unwrap();
+        assert_eq!(d, base);
+    }
+
+    #[test]
+    fn test_buddy_non_power_of_two_pages() {
+        // 5 pages should be split into 4 + 1.
+        let mut mem = alloc::vec![0u8; 5 * 4096];
+        let base = mem.as_mut_ptr() as usize;
+        let mut allocator = unsafe { BuddyAllocator::<4>::new(base, 5, 4096) };
+        let a = allocator.allocate(4).unwrap();
+        assert_eq!(a, base);
+        let b = allocator.allocate(1).unwrap();
+        assert_eq!(b, base + 4 * 4096);
+        // No more memory.
+        assert!(allocator.allocate(1).is_err());
+    }
+}
