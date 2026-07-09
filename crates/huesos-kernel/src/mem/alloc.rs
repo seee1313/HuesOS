@@ -78,5 +78,6 @@ unsafe impl GlobalAlloc for KernelGlobalAlloc {
     }
 }
 
+#[cfg(not(test))]
 #[global_allocator]
 pub static ALLOCATOR: KernelGlobalAlloc = KernelGlobalAlloc;

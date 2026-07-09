@@ -1,12 +1,16 @@
 //! x86_64-specific implementation.
 
+pub mod acpi;
+pub mod ap_boot;
 pub mod context_switch;
 pub mod cpu;
+pub mod cpu_local;
 pub mod gdt;
-mod idt;
+pub mod idt;
 pub mod interrupts;
 pub mod irq_callback;
 pub mod keyboard;
+pub mod lapic;
 pub mod paging;
 pub mod pit;
 pub mod serial;
@@ -28,6 +32,10 @@ pub unsafe fn init_early() {
     }
     gdt::init();
     idt::init();
+
+    // Set up per-CPU locals for the BSP (LAPIC ID = 0 until LAPIC is initialized).
+    let cpu_local = unsafe { cpu_local::alloc_cpu_local(0) };
+    unsafe { cpu_local::init_gs_base(cpu_local) };
 }
 
 /// Second-stage architecture init: paging must have the PMM ready.
@@ -41,8 +49,29 @@ pub unsafe fn init_paging(phys_offset: crate::VirtAddr) {
     }
 }
 
-/// Final stage: enable interrupts, start the PIT, ready for scheduling.
+/// Final stage: enable interrupts, start the LAPIC timer, ready for scheduling.
+///
+/// Uses the shared timer initial-count if the BSP already calibrated during
+/// SMP bring-up; otherwise calibrates now. APs never call this — they start
+/// their own timers from the shared count inside `ap_entry`.
 pub fn init_late() {
     interrupts::init();
-    pit::init(100); // 100 Hz scheduler tick
+    let initial_count = {
+        let shared = lapic::timer_initial_count();
+        if shared != 0 {
+            shared
+        } else {
+            let c = lapic::calibrate_timer();
+            lapic::set_timer_initial_count(c);
+            c
+        }
+    };
+    unsafe {
+        lapic::timer_init(
+            lapic::TimerDivide::Div16,
+            lapic::TimerMode::Periodic,
+            initial_count,
+            0x20,
+        );
+    }
 }

@@ -43,14 +43,6 @@ pub type SyscallHandler = extern "C" fn(&mut SyscallFrame);
 #[unsafe(no_mangle)]
 pub static mut HUESOS_SYSCALL_HANDLER: usize = 0;
 
-/// Scratch space to stash the user RSP for the duration of the syscall
-/// (single core MVP: one slot is enough).
-#[unsafe(no_mangle)]
-pub static mut HUESOS_SYSCALL_USER_RSP: u64 = 0;
-/// Kernel stack to switch to for the duration of the syscall.
-#[unsafe(no_mangle)]
-pub static mut HUESOS_SYSCALL_KERNEL_RSP: u64 = 0;
-
 /// Register the Rust syscall dispatcher that the asm trampoline calls into.
 pub fn set_handler(handler: SyscallHandler) {
     unsafe {
@@ -62,7 +54,8 @@ pub fn set_handler(handler: SyscallHandler) {
 /// updated by the scheduler whenever the current task changes.
 pub fn set_kernel_stack(rsp: u64) {
     unsafe {
-        HUESOS_SYSCALL_KERNEL_RSP = rsp;
+        let ptr = crate::cpu_local::cpu_local_ptr();
+        (*ptr).kernel_rsp = rsp;
     }
 }
 
@@ -107,9 +100,9 @@ global_asm!(
     ".global syscall_entry",
     "syscall_entry:",
     // Swap to kernel stack, remembering the user one.
-    "mov [rip + HUESOS_SYSCALL_USER_RSP], rsp",
-    "mov rsp, [rip + HUESOS_SYSCALL_KERNEL_RSP]",
-    "push qword ptr [rip + HUESOS_SYSCALL_USER_RSP]", // user_rsp
+    "mov gs:[40], rsp",
+    "mov rsp, gs:[48]",
+    "push qword ptr gs:[40]", // user_rsp
     "push r11",   // user_rflags
     "push rcx",   // user_rip
     "push r8",    // arg5

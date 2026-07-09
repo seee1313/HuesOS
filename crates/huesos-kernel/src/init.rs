@@ -3,8 +3,48 @@ use huesos_pmm::MemoryRegion;
 const HEAP_SIZE: usize = 128 * 1024 * 1024;
 const HEAP_VIRT_START: u64 = 0xffff_ff00_0000_0000;
 
+/// Limine memmap types that base revision 3 does *not* put into the HHDM,
+/// but that firmware tables (RSDP/XSDT/MADT/…) live in. Matches the Limine
+/// protocol constants; we hardcode the values so huesos-kernel does not
+/// depend on the limine crate.
+const MEMMAP_ACPI_RECLAIMABLE: u64 = 2;
+const MEMMAP_ACPI_NVS: u64 = 3;
+/// Some Limine builds also expose this as type 8 (ACPI tables / mapped reserved).
+const MEMMAP_ACPI_TABLES_OR_MAPPED_RESERVED: u64 = 8;
+
 pub unsafe fn pmm_init(regions: &[MemoryRegion], hhdm_offset: u64) {
     unsafe { huesos_pmm::init(regions, hhdm_offset); }
+}
+
+/// Map firmware / ACPI physical ranges into the HHDM so early ACPI walks
+/// (and anything else that does `hhdm + phys`) can touch them.
+///
+/// Also maps a small window around the RSDP address itself, in case the
+/// firmware put it in a region whose type we don't classify above.
+pub fn map_firmware_tables(regions: &[MemoryRegion], rsdp_addr: Option<u64>) {
+    for r in regions {
+        // Do NOT map general RESERVED: that includes MMIO (LAPIC/IOAPIC/PCI)
+        // and a WB map of the LAPIC page would make later NO_CACHE remap a
+        // no-op (PageAlreadyMapped) and hang on ICR writes under TCG.
+        let needs_map = matches!(
+            r.kind,
+            MEMMAP_ACPI_RECLAIMABLE
+                | MEMMAP_ACPI_NVS
+                | MEMMAP_ACPI_TABLES_OR_MAPPED_RESERVED
+        );
+        if needs_map && r.length > 0 {
+            // ACPI tables are tiny; cap so a mis-typed region cannot explode.
+            let len = core::cmp::min(r.length, 4 * 1024 * 1024);
+            huesos_arch::paging::map_hhdm_range(r.base, len);
+        }
+    }
+
+    if let Some(rsdp) = rsdp_addr {
+        // Always cover the RSDP page (and a couple of neighbours) even if
+        // its memmap type was unexpected.
+        let page = rsdp & !0xfff;
+        huesos_arch::paging::map_hhdm_range(page.saturating_sub(0x1000), 0x3000);
+    }
 }
 
 pub fn heap_init() {
@@ -29,6 +69,9 @@ pub fn heap_init() {
 pub fn object_init() {
     huesos_object::init();
     huesos_object::set_phys_to_virt(|p| huesos_arch::paging::phys_to_virt(p).as_u64());
+    huesos_object::set_cpu_id_callback(|| {
+        (unsafe { huesos_arch::cpu_local::current_lapic_id() } as usize)
+    });
 }
 
 pub fn framebuffer_init(fb: Option<crate::FramebufferInfo>) {

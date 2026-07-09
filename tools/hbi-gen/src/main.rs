@@ -99,7 +99,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             flags: *flags,
         });
 
-        current_offset += 16 + align_up(length as u64, 8);
+        // EntryHeader is 24 bytes (6 × u32). Must match size_of::<EntryHeader>()
+        // and the kernel parser in huesos-kernel::boot::hbi.
+        current_offset += core::mem::size_of::<EntryHeader>() as u64
+            + align_up(length as u64, 8);
     }
 
     let file = File::create(&args.output)?;

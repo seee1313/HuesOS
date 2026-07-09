@@ -13,6 +13,7 @@ extern crate alloc;
 pub mod init;
 pub mod process;
 pub mod scheduler;
+pub mod smp;
 pub mod task;
 pub mod mem;
 pub mod boot;
@@ -43,17 +44,41 @@ pub struct BootInfo<'a> {
     pub memory_regions: &'a [MemoryRegion],
     pub framebuffer: Option<FramebufferInfo>,
     pub hbi_image: Option<&'a [u8]>,
+    pub rsdp_addr: Option<u64>,
 }
 
 pub unsafe fn kmain(boot_info: BootInfo) -> ! {
     huesos_arch::init_early();
     init::pmm_init(boot_info.memory_regions, boot_info.hhdm_offset);
 
+    // Protect the HBI image from being overwritten by the PMM!
+    if let Some(hbi_data) = boot_info.hbi_image {
+        let phys_addr = hbi_data.as_ptr() as u64 - boot_info.hhdm_offset;
+        let length = hbi_data.len() as u64;
+        huesos_pmm::reserve_range(phys_addr, length);
+        
+        use core::fmt::Write;
+        let mut writer = huesos_arch::serial::SerialWriter;
+        let _ = writeln!(
+            &mut writer,
+            "[PMM] Reserved HBI image: phys_addr={:#x}, length={}",
+            phys_addr, length
+        );
+    }
+
     let phys_offset = huesos_arch::VirtAddr::new(boot_info.hhdm_offset);
     huesos_arch::init_paging(phys_offset);
 
+    // Limine base revision 3 leaves ACPI/reserved regions out of the HHDM.
+    // Map them now so RSDP / XSDT / MADT walks don't #PF.
+    init::map_firmware_tables(boot_info.memory_regions, boot_info.rsdp_addr);
+
     init::heap_init();
     init::object_init();
+
+    if let Some(rsdp) = boot_info.rsdp_addr {
+        smp::bringup_aps(rsdp, boot_info.hhdm_offset);
+    }
 
     if let Some(hbi_data) = boot_info.hbi_image {
         if let Ok(hbi) = boot::hbi::HbiImage::parse(hbi_data) {
@@ -69,9 +94,14 @@ pub unsafe fn kmain(boot_info: BootInfo) -> ! {
     scheduler::init();
     huesos_arch::init_late();
 
+    // APs finished local init during bringup_aps and are spinning on the
+    // run-gate; release them now that the timer callback + PIC are live.
+    smp::release_aps();
+
     log_boot_banner(&boot_info);
     spawn_init_process();
 
+    // BSP idle: same as APs — timer IRQ drives the scheduler.
     loop { huesos_arch::hlt(); }
 }
 

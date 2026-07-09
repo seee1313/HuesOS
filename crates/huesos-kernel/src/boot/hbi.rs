@@ -201,6 +201,7 @@ impl<'a> HbiImage<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::vec;
 
     #[test]
     fn test_hbi_parse_invalid_magic() {

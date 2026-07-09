@@ -34,7 +34,7 @@ pub(crate) use registry::phys_to_virt;
 pub use registry::{
     current_process, lookup_interrupts_by_irq, lookup_object, lookup_process, register_interrupt,
     register_object, register_process, root_job, set_current_process, set_phys_to_virt,
-    unregister_object,
+    set_cpu_id_callback, unregister_object,
 };
 pub use thread::Thread;
 pub use vmar::{Vmar, VmarChild, VmarMapping};
@@ -73,6 +73,7 @@ mod tests {
             base: 0,
             length: total_bytes,
             usable: true,
+            kind: 0,
         }];
         unsafe {
             huesos_pmm::init(&regions, hhdm_offset);

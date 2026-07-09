@@ -89,6 +89,12 @@ extern "x86-interrupt" fn double_fault_handler(
 }
 
 extern "x86-interrupt" fn timer_handler(_stack_frame: InterruptStackFrame) {
+    // BSP and APs drive the scheduler from the *local* APIC timer (vector
+    // 0x20). EOI the LAPIC first so the next tick can fire on this CPU.
+    super::lapic::eoi();
+    // Also EOI the 8259 PIC: on the BSP the firmware path may still route
+    // IRQ0 through the PIC in parallel with the LAPIC timer. Harmless on
+    // APs (no PIC IRQ pending).
     unsafe {
         super::interrupts::PICS.lock().notify_end_of_interrupt(32);
     }

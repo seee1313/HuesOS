@@ -3,7 +3,7 @@
 
 use core::panic::PanicInfo;
 
-use limine::request::{FramebufferRequest, HhdmRequest, MemmapRequest};
+use limine::request::{FramebufferRequest, HhdmRequest, MemmapRequest, RsdpRequest, ModulesRequest, StackSizeRequest};
 use limine::{BaseRevision, RequestsEndMarker, RequestsStartMarker};
 
 use huesos_pmm::MemoryRegion;
@@ -26,12 +26,24 @@ static HHDM_REQUEST: HhdmRequest = HhdmRequest::new();
 static MEMMAP_REQUEST: MemmapRequest = MemmapRequest::new();
 
 #[used]
+#[unsafe(link_section = ".requests")]
+static RSDP_REQUEST: RsdpRequest = RsdpRequest::new();
+
+#[used]
 #[unsafe(link_section = ".requests_start_marker")]
 static _START_MARKER: RequestsStartMarker = RequestsStartMarker::new();
 
 #[used]
 #[unsafe(link_section = ".requests_end_marker")]
 static _END_MARKER: RequestsEndMarker = RequestsEndMarker::new();
+
+#[used]
+#[unsafe(link_section = ".requests")]
+static MODULES_REQUEST: ModulesRequest = ModulesRequest::new();
+
+#[used]
+#[unsafe(link_section = ".requests")]
+static STACK_SIZE_REQUEST: StackSizeRequest = StackSizeRequest::new(1024 * 1024); // 1 MiB stack
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn kmain_entry() -> ! {
@@ -47,15 +59,23 @@ pub unsafe extern "C" fn kmain_entry() -> ! {
     let entries = memmap_response.entries();
 
     const MAX_REGIONS: usize = 128;
-    let mut regions = [MemoryRegion { base: 0, length: 0, usable: false }; MAX_REGIONS];
+    let mut regions = [MemoryRegion {
+        base: 0,
+        length: 0,
+        usable: false,
+        kind: 0,
+    }; MAX_REGIONS];
     let mut region_count = 0usize;
 
     for entry in entries.iter() {
-        if region_count >= MAX_REGIONS { break; }
+        if region_count >= MAX_REGIONS {
+            break;
+        }
         regions[region_count] = MemoryRegion {
             base: entry.base,
             length: entry.length,
             usable: entry.type_ == limine::memmap::MEMMAP_USABLE,
+            kind: entry.type_,
         };
         region_count += 1;
     }
@@ -77,11 +97,19 @@ pub unsafe extern "C" fn kmain_entry() -> ! {
             blue_mask_shift: fb.blue_mask_shift,
         });
 
+    let rsdp_addr = RSDP_REQUEST.response().map(|r| r.address as u64);
+
+    let hbi_image = MODULES_REQUEST
+        .response()
+        .and_then(|r| r.modules().first().copied())
+        .map(|file| file.data());
+
     let boot_info = BootInfo {
         hhdm_offset,
         memory_regions: &regions[..region_count],
         framebuffer,
-        hbi_image: None,
+        hbi_image,
+        rsdp_addr,
     };
 
     kmain(boot_info)
