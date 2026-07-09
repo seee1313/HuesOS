@@ -169,3 +169,16 @@ impl KernelObject for Vmo {
         self
     }
 }
+
+impl Drop for Vmo {
+    fn drop(&mut self) {
+        // Return every physical frame to the PMM. Safe because Arc drops
+        // only when the last handle/reference is gone and no mapping still
+        // owns a live Arc (mappings hold koids, not Arcs — frames stay
+        // valid until VMO is fully unreferenced).
+        let frames = core::mem::take(&mut *self.frames.lock());
+        for f in frames {
+            huesos_pmm::free_frame(f);
+        }
+    }
+}
