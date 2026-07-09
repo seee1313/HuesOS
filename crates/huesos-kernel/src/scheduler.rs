@@ -160,13 +160,35 @@ pub fn current_task_id() -> Option<u64> {
     sched.current_task().map(|t| t.id)
 }
 
+/// Find a CPU that is currently idle (only the idle task is present).
+fn find_idle_cpu() -> Option<u8> {
+    for i in 0..MAX_CPUS {
+        let sched = unsafe { &*PER_CPU_SCHEDULERS[i].0.get() };
+        if sched.tasks.len() == 1 {
+            // Only idle task — this CPU is idle.
+            return Some(i as u8);
+        }
+    }
+    None
+}
+
+/// If there is an idle CPU, send it a reschedule IPI so it picks up
+/// the newly added task.
+fn maybe_wake_idle_cpu() {
+    if let Some(cpu) = find_idle_cpu() {
+        huesos_arch::lapic::ipi_reschedule(cpu);
+    }
+}
+
 /// Spawn a new kernel thread on the current CPU.
 pub fn spawn_kernel_thread(name: &[u8; 32], entry: extern "C" fn() -> !) -> u64 {
-    with_scheduler(|s| {
+    let id = with_scheduler(|s| {
         let id = s.tasks.len() as u64;
         let task = Task::new_kernel(id, *name, entry);
         s.add_task(task)
-    })
+    });
+    maybe_wake_idle_cpu();
+    id
 }
 
 /// Spawn a new userspace task bound to `process`, whose first execution
@@ -178,7 +200,7 @@ pub fn spawn_user_thread(
     user_rsp: u64,
     cr3: u64,
 ) -> u64 {
-    with_scheduler(|s| {
+    let id = with_scheduler(|s| {
         let id = s.tasks.len() as u64;
         crate::process::queue_user_entry(id, entry_point, user_rsp);
         let task = Task::new_user(
@@ -189,7 +211,9 @@ pub fn spawn_user_thread(
             cr3,
         );
         s.add_task(task)
-    })
+    });
+    maybe_wake_idle_cpu();
+    id
 }
 
 /// Mark the currently running task as finished (won't be scheduled again)
