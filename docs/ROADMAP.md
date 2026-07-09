@@ -1,18 +1,34 @@
 # HuesOS Roadmap
 
-The MVP boot-to-userspace pipeline (Limine → PMM → paging → scheduler →
-ring3 → syscalls → VMO/Channel IPC) is working and verified in QEMU. This
-roadmap covers what's next, roughly in priority order.
+The MVP boot-to-userspace pipeline (Limine → PMM → paging → SMP-aware
+scheduler → ring3 → syscalls → VMO/Channel IPC) is working and verified in
+QEMU (`-smp 1` and `-smp 2`). This roadmap covers what's next, roughly in
+priority order.
+
+## Done (recent)
+
+### SMP / LAPIC (core path) — verified in QEMU
+- MADT parse, INIT-SIPI-SIPI trampoline (stack + far jmp into long mode,
+  `EFER.NXE`)
+- Per-CPU GDT/TSS/IDT, `CpuLocal` via `GS_BASE`, per-CPU scheduler + idle
+- Shared LAPIC timer calibration (BSP vs PIT); APs reuse the count
+- LAPIC EOI on vector 0x20; PIC EOI retained for keyboard path
+- Online-CPU load balancing; IPI reschedule on remote spawn
+- Per-CPU STAR/LSTAR/SFMASK (user tasks may run on APs without `#UD`)
+- HHDM base-rev-3 fixes: map ACPI tables; identity-map low trampoline
+  pages; LAPIC MMIO mapped uncached
+
+### HBI / FAT / alloc hardening
+- HBI v2.1 gen/parser `EntryHeader` stride alignment (24 bytes)
+- FAT BPB field widths + FAT16 EOC thresholds
+- Buddy allocator stores and uses `page_size`
 
 ## Immediate
 
-### 1. SMP / LAPIC / IOAPIC
-- **Current**: single core, legacy PIC + PIT only.
-- **Needed**: parse MADT, start APs via INIT-SIPI-SIPI, per-CPU
-  GDT/TSS/IDT, LAPIC timer, IOAPIC interrupt routing.
-- **Why deferred**: the MVP scope explicitly kept PIC/single-core to focus
-  effort on getting a real, correct ring3 pipeline working first — adding
-  SMP before that was solid would have multiplied debugging surface area.
+### 1. IOAPIC interrupt routing
+- **Current**: LAPIC timer on all CPUs; keyboard still via legacy PIC path.
+- **Needed**: full IOAPIC programming, IRQ remapping for multi-core IRQs,
+  drop reliance on 8259 for anything that can go through IOAPIC.
 
 ### 2. Process/task teardown
 - **Current**: `ProcessExit` marks a task "finished" so the scheduler skips
@@ -49,10 +65,9 @@ roadmap covers what's next, roughly in priority order.
 - **Needed**: proper move semantics matching the `TRANSFER` right.
 
 ### 6. Real VFS + drivers in userspace
-- A VFS server process handling `open`/`read`/`write` via IPC, with
-  filesystem and device drivers (starting with something like a virtio
-  block device under QEMU) living in userspace processes rather than the
-  kernel.
+- BOOTFS is live as a RAM archive; `huesos-fat` exists as a library.
+- **Needed**: virtio-block (or similar) + FAT/other backends behind
+  FileSystemService; load DriverHosts from FS instead of build embeds.
 
 ## Medium Term
 
@@ -63,23 +78,21 @@ roadmap covers what's next, roughly in priority order.
 ### 8. Networking
 - virtio-net driver + a userspace TCP/IP stack.
 
-### 9. Userspace runtime
-- A `no_std` runtime/libc-equivalent for userspace programs (the current
-  `huesos-init` hand-rolls raw `syscall` asm; anything beyond a proof of
-  concept needs a proper syscall wrapper library).
+### 9. Scheduler polish
+- Work-stealing, better AP timer calibration without PIT races, fair
+  migration, and serial-log interleaving cleanup under SMP.
 
 ## Long Term
 
 - KASLR, SMAP/SMEP, other hardening.
 - Self-hosting toolchain.
 
-## Explicitly Out of Scope for This MVP
+## Explicitly Out of Scope for the Original MVP
 
-These were deliberately excluded to keep the MVP's surface area
-achievable and verifiable in one pass — see the "Known Limitations"
-section of the README:
+These were deliberately excluded to keep the first MVP's surface area
+achievable — several are now partially landed (SMP, BOOTFS, FAT lib):
 
-- Any filesystem or persistent storage
+- ~~SMP~~ → core path done; IOAPIC still open
+- Any filesystem on real block devices
 - Networking
-- More than a keyboard/serial/PIT driver
-- SMP
+- Full process teardown / wait

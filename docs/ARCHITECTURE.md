@@ -11,8 +11,8 @@ interaction and hands off a fully set up long-mode environment).
 ## Design Principles
 
 1. **Minimal Kernel** — Drivers, filesystems, and network stack are meant to
-   live in userspace (only a keyboard/serial/PIT driver live in-kernel today,
-   as a bootstrap necessity).
+   live in userspace (only bootstrap keyboard/serial/timer paths live
+   in-kernel today).
 2. **Capability-Based Security** — Resources are accessed through handles
    with rights (`huesos-object::Rights`).
 3. **Message-Passing IPC** — Channels are the primary IPC primitive.
@@ -20,168 +20,153 @@ interaction and hands off a fully set up long-mode environment).
    page tables and reach the kernel exclusively via the `syscall`
    instruction.
 5. **One sanctioned syscall entry point in userspace** — application code
-   never issues `syscall` itself; it goes through `libcanvas`, which owns
-   the one audited `asm!("syscall")` trampoline and translates the ABI
-   (shared with the kernel via `huesos-abi`) into safe, typed, RAII-managed
-   Rust. See [docs/USERSPACE.md](USERSPACE.md).
+   never issues `syscall` itself; it goes through `libcanvas`. See
+   [docs/USERSPACE.md](USERSPACE.md).
+6. **SMP-aware from the kernel up** — every CPU has its own GDT/TSS,
+   scheduler, and syscall MSRs; work is only placed on online CPUs.
 
 ## Crate Structure
 
 ```
 crates/
-├── huesos-boot        # Limine ELF entry point, memory map / HHDM handoff
-├── huesos-arch        # x86_64: GDT/TSS, IDT, paging, syscall trampoline, PIT, PS/2, serial
+├── huesos-boot        # Limine ELF entry point, memmap / HHDM / modules handoff
+├── huesos-arch        # x86_64: GDT/TSS, IDT, paging, SMP, LAPIC, syscall, serial
 ├── huesos-hal         # Thin hardware abstraction layer
 ├── huesos-pmm         # Physical memory manager (bitmap frame allocator)
+├── huesos-alloc       # Buddy + slab kernel allocator (no_std)
+├── huesos-fat         # FAT16/32 library (no_std; not yet the production VFS)
 ├── huesos-object      # Kernel objects: Vmo, Channel, Process, Thread, Job, Handle/Rights
-├── huesos-abi         # Shared kernel<->userspace ABI: syscall numbers (Syscall enum),
-│                      # error codes (ErrorCode), and any plain-old-data structs (e.g.
-│                      # FramebufferInfo) passed by value across the syscall boundary.
-│                      # Zero dependencies on either the kernel or a userspace runtime,
-│                      # specifically so huesos-syscalls (kernel) and libcanvas
-│                      # (userspace) can't drift out of sync with each other.
-├── huesos-fb          # Framebuffer driver: pixel/rect/text/blit primitives, bounds-
-│                      # checked against untrusted userspace-controlled blit input
-├── huesos-syscalls    # Syscall number table + dispatch
-├── huesos-elf         # ELF64 loader (PT_LOAD segment mapping)
-├── huesos-kernel      # Scheduler, process/thread management, init sequence
+├── huesos-abi         # Shared kernel<->userspace ABI (syscall numbers, errors)
+├── huesos-fb          # Framebuffer driver (bounds-checked blit)
+├── huesos-syscalls    # Syscall dispatch
+├── huesos-elf         # ELF64 loader
+├── huesos-kernel      # Scheduler (Fair/Deadline), SMP, process/thread, HBI parse
 └── huesos-userspace/
-    ├── libcanvas      # Safe userspace syscall library — the only place userspace
-    │                  # code is allowed to reach the kernel from (own target)
-    └── init           # Real ring3 userspace program (own target + linker script)
+    ├── libcanvas      # Safe userspace syscall library
+    ├── init           # ring3 init
+    ├── driver-manager # userspace driver supervisor + BOOTFS FS service
+    └── ...            # driver hosts / terminal
 ```
+
+Tools (outside the no_std workspace): `tools/hbi-gen` builds HBI v2.1 images.
 
 ## Boot Flow
 
-1. **Limine** parses `huesos-boot`'s ELF headers, maps it into the higher
-   half (`0xffffffff80000000`+), sets up long mode + a stack, and jumps to
-   `kmain_entry` (the linker script's `ENTRY`).
-2. `kmain_entry` validates the Limine base revision, reads the HHDM offset
-   and physical memory map from Limine's request/response protocol, and
-   calls into `huesos_kernel::kmain` with an architecture-agnostic
-   `BootInfo`.
-3. `huesos_arch::init_early()`: serial console, `EFER.NXE` (required before
-   any `NO_EXECUTE` page table flag is used), GDT/TSS, IDT.
-4. PMM init: bitmap allocator built from the real memory map.
-5. Paging init: kernel `OffsetPageTable` wired up over the bootloader's page
-   tables via the HHDM.
-6. Heap init: kernel heap is mapped through *real* page tables (not assumed
-   pre-mapped), then handed to `linked_list_allocator`.
-7. Object subsystem init: root job created, phys-to-virt translator wired up
-   for VMOs.
-8. Syscall init: STAR/LSTAR/SFMASK MSRs programmed, `syscall`/`sysret`
-   enabled, dispatcher registered.
-9. Scheduler init: idle task created, timer callback registered.
-10. `huesos_arch::init_late()`: PIC unmasked, PIT programmed to 100 Hz,
-    interrupts enabled.
-11. `huesos-init` (embedded via `include_bytes!` at kernel build time) is
-    loaded through the ELF loader into a fresh address space, and a user
-    task is spawned.
-12. On its first scheduling, the user task's trampoline performs a real
-    `iretq` into ring3 at the loaded entry point.
-13. Kernel idle-loops (`hlt`) while the scheduler preempts between the idle
-    task and any live user/kernel tasks.
+1. **Limine** maps `huesos-boot` into the higher half (`0xffffffff80000000`+),
+   sets up long mode + a stack (1 MiB requested), and jumps to `kmain_entry`.
+   Optional **HBI** image is loaded as a Limine module.
+2. `kmain_entry` validates base revision **3**, reads HHDM offset, memory
+   map (including raw `kind` types), framebuffer, RSDP, and HBI module.
+3. `huesos_arch::init_early()`: serial, `EFER.NXE`, BSP GDT/TSS, IDT,
+   `CpuLocal` + `GS_BASE`.
+4. PMM init from the memory map; **HBI physical range reserved**.
+5. Paging init over Limine's tables via the HHDM.
+6. **`map_firmware_tables`**: map ACPI reclaimable/NVS/table regions (and a
+   window around the RSDP) into the HHDM — base rev 3 does *not* map these
+   by default. General RESERVED is intentionally **not** bulk-mapped (would
+   WB-map LAPIC/MMIO).
+7. Heap init (128 MiB buddy+slab at `0xffff_ff00_0000_0000`).
+8. Object subsystem init; phys-to-virt + CPU-id callbacks.
+9. **SMP bring-up** (if RSDP/MADT present):
+   - Program LAPIC base (HHDM + **NO_CACHE**); calibrate timer once on BSP.
+   - INIT-SIPI-SIPI; AP trampoline at phys `0x8000` with identity+HHDM maps
+     for low memory; AP sets stack, enables LME|NXE, jumps to `ap_entry`.
+   - APs: per-CPU GDT/TSS, IDT load, **syscall MSR init**, scheduler init,
+     signal ready, wait on `APS_MAY_RUN`.
+10. Parse HBI (if present); framebuffer / HAL / **syscall_init** (BSP MSRs +
+    global handler); **BSP scheduler::init** (marks CPU online).
+11. `init_late`: PIC setup, LAPIC timer start (shared calibrated count), STI.
+12. **`smp::release_aps`**: APs start their LAPIC timers, STI, HLT idle.
+13. Spawn `huesos-init`; BSP and APs idle on `hlt` while timer IRQs drive
+    per-CPU scheduling.
+
+## SMP Model
+
+| Piece | Location / notes |
+|-------|------------------|
+| CpuLocal | `huesos-arch::cpu_local`, GS_BASE |
+| Per-CPU GDT/TSS | `PerCpuGdt` (APs); BSP uses static GDT early |
+| Per-CPU scheduler | `PER_CPU_SCHEDULERS[lapic_id]`, spinlock |
+| Online mask | `ONLINE_CPUS` — spawn only onto online CPUs |
+| Timer | LAPIC periodic vector `0x20`; EOI LAPIC (+ PIC for legacy) |
+| IPI | `ipi_reschedule` wakes remote idle CPUs on spawn |
+| Syscall | STAR/LSTAR/SFMASK **per CPU** |
+
+### Limine base revision 3 mapping rules (important)
+
+For base revision ≥ 3, HHDM covers only certain memmap types (usable,
+bootloader-reclaimable, executable+modules, framebuffer) — **not** general
+reserved/ACPI/MMIO — and there is **no** unconditional low 4 GiB identity
+map. The kernel therefore:
+
+- Maps ACPI-related ranges + RSDP window via `map_hhdm_range`
+- Maps LAPIC MMIO with `PRESENT|WRITABLE|NO_CACHE` (and `update_flags` if a
+  page was already present)
+- Identity-maps the first 64 KiB for the AP trampoline / `ApBootInfo`
 
 ## Memory Model
 
-- **Physical Memory**: tracked by `huesos-pmm`'s bitmap allocator, built
-  from Limine's memory map. `reserve_range` protects regions (e.g. the
-  bitmap's own storage) from being handed out.
-- **Higher Half Direct Map (HHDM)**: all physical memory is accessible at
-  `hhdm_offset + phys_addr` for kernel-side access (e.g. VMO page contents).
-- **Per-process address spaces** (`huesos_arch::paging::AddressSpace`): each
-  process gets a fresh PML4 that clones the kernel's upper-half entries
-  (256..512) so kernel code/interrupts/syscalls keep working after a CR3
-  switch, with an independent, isolated lower half for user mappings.
-- **VMOs**: backed by real 4 KiB physical frames (`huesos_object::Vmo`), not
-  a `Vec<u8>` — can be mapped directly into a process's page tables.
+- **Physical Memory**: `huesos-pmm` bitmap; `reserve_range` protects HBI,
+  bitmap storage, etc.
+- **HHDM**: `hhdm_offset + phys` for kernel access where mapped.
+- **Per-process address spaces**: fresh PML4, kernel upper half cloned
+  (indices 256..512).
+- **Kernel heap**: buddy (`huesos-alloc::BuddyAllocator`, stores `page_size`)
+  + slab; exposed as `GlobalAlloc` after `heap_init`.
+- **VMOs**: real 4 KiB physical frames.
+
+## HBI (HuesOS Boot Image) v2.1
+
+On-disk layout (generator: `tools/hbi-gen`, parser:
+`huesos-kernel::boot::hbi`):
+
+- Global header (`HUESOS_H`, version `0x0002_0001`)
+- Directory entries (`type_id`, `offset`, `length`, `flags`)
+- Per-module `EntryHeader` (**24 bytes** = 6×`u32`) + payload + 8-byte pad
+
+`hbi-gen` must advance the payload cursor by `size_of::<EntryHeader>()`, not
+a hardcoded 16 — otherwise every module after the first is mis-sliced.
 
 ## Object System
 
 Every kernel resource is an **object** with a unique `Koid`:
 
 | Type      | Purpose                          |
-|-----------|-----------------------------------|
+|-----------|----------------------------------|
 | Vmo       | Physical memory pages            |
 | Process   | Address space + handle table     |
 | Thread    | Execution context                |
 | Job       | Group of processes (hierarchy)   |
 | Channel   | IPC endpoint (message passing)   |
 | Port      | Waitset (multiplex waiting)      |
+| Interrupt | Userspace IRQ bridge             |
 
-Objects implement `KernelObject: Any`, registered in a global
-`Koid -> Arc<dyn KernelObject>` map, and downcast safely to their concrete
-type via `KernelObjectExt::downcast_ref::<T>()`.
-
-Objects are referenced by **handles** with **rights** (read, write, map,
-transfer, destroy, etc.), stored per-process in a `HandleTable`.
+Objects implement `KernelObject: Any`, live in a global registry, and are
+referenced by **handles** with **rights**.
 
 ## Syscalls
 
-Invoked via the real `syscall` instruction (not a software interrupt):
+Invoked via real `syscall` (not a software interrupt). Canonical numbers
+live in `huesos-abi::Syscall`. Current surface includes VMO/Channel/handle
+ops, process/thread/VMAR launch, Port/Interrupt, framebuffer info/blit,
+yield/exit/debug write.
 
-- `rax` — syscall number (in), return value (out)
-- `rdi`, `rsi`, `rdx`, `r10`, `r8` — arguments (`r10` instead of `rcx`,
-  since `syscall` clobbers `rcx`/`r11`)
+## Scheduler
 
-The asm trampoline (`huesos_arch::syscall::syscall_entry`) swaps to a
-per-task kernel stack, marshals registers into a `SyscallFrame`, calls the
-architecture-independent `huesos_syscalls::dispatch`, and `sysret`s back.
-
-Current syscalls: `Nop`, `VmoCreate`, `HandleClose`, `HandleDuplicate`,
-`Yield`, `VmoRead`, `VmoWrite`, `ChannelCreate`, `ChannelWrite`,
-`ChannelRead`, `ProcessExit`, `DebugWrite`, `FramebufferInfo`,
-`FramebufferBlit`, `ProcessCreate`, `ProcessWait`, `ThreadCreate`,
-`ThreadStart`, `VmarMap`, `PortCreate`, `PortRead`, `InterruptCreate`,
-`InterruptBindPort`. The canonical, versioned list lives in
-`huesos-abi::Syscall` — both `huesos-syscalls`' dispatcher and
-`libcanvas`' wrappers are generated against that one enum, so adding a
-syscall means updating one shared crate, not keeping two copies in sync
-by hand. An unrecognized syscall number returns
-`ErrorCode::NotSupported` rather than being silently ignored or causing
-undefined behavior.
+- **Fair**: CFS-like virtual runtime in a rank-balanced WAVL tree
+- **Deadline**: capacity/period with EDF priority over Fair
+- Preemption from LAPIC timer (~100 Hz after Div16 calibration)
+- Cross-core spawn uses online-CPU least-loaded placement + reschedule IPI
 
 ## Framebuffer & Graphics
 
-`huesos-fb` owns the real framebuffer memory Limine hands off (a plain
-kernel-virtual pointer via the HHDM — see `FramebufferConfig`). It exposes
-`set_pixel`/`fill_rect`/`draw_text`/`blit`, all of which clip to the real
-screen bounds before touching memory.
-
-Userspace never gets a mapping of that memory. Instead:
-
-1. `libcanvas::framebuffer::Canvas::new*` creates an ordinary VMO sized to
-   hold pixel data in the framebuffer's native format (queried via the
-   `FramebufferInfo` syscall).
-2. Drawing (`set_pixel`/`fill_rect`/`draw_text`) happens entirely within
-   that VMO, using `VmoRead`/`VmoWrite` syscalls — no new syscall
-   surface, no special privilege needed.
-3. `Canvas::present()` issues a single `FramebufferBlit` syscall, passing
-   a `FramebufferBlitArgs` struct (by pointer — it doesn't fit in the
-   syscall ABI's 5 register slots) naming the source VMO, its logical
-   size, and a destination offset.
-4. The kernel's `sys_framebuffer_blit` handler treats every field of that
-   struct as untrusted: it reads the args by value (not through a live
-   pointer, in case another thread mutates it mid-syscall), rejects
-   implausible `src_width`/`src_height` before sizing any buffer, only
-   ever reads as many bytes from the VMO as the VMO actually has (never
-   trusting the claimed size beyond that), and clips the destination
-   rectangle to the real framebuffer's bounds before `huesos-fb::blit`
-   ever writes a byte of video memory.
-
-Text rendering (both kernel-side and in `libcanvas::framebuffer::Canvas`)
-uses an embedded 8x8 bitmap font (`tools/fontgen/generate_font.py`
-regenerates it), English/ASCII printable range only (0x20–0x7E) — a scope
-decision, not an oversight; see `docs/USERSPACE.md`.
+`huesos-fb` owns Limine's framebuffer. Userspace draws into a VMO-backed
+`Canvas` and presents via bounds-checked `FramebufferBlit`. No raw video
+mapping is given to userspace.
 
 ## Security Model
 
-- **No global namespaces** — processes acquire resources via handles from
-  parents or channels.
-- **Rights are checked** on every syscall that touches a handle (see
-  `huesos-syscalls`).
-- **W^X on user pages**: code pages are mapped without `WRITABLE`, data/stack
-  pages are mapped without executable permission (`NO_EXECUTE`, which
-  requires `EFER.NXE` — see boot flow above).
-- **Jobs** exist as a container concept but don't yet enforce quotas
-  (roadmap item).
+- No global namespaces — capabilities via handles.
+- Rights checked on handle-touching syscalls.
+- W^X on user pages (`NO_EXECUTE` requires `EFER.NXE` on **every** CPU).
+- Jobs exist but do not yet enforce quotas.

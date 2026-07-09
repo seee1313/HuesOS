@@ -3,79 +3,100 @@
 **HuesOS** is an x86_64 microkernel operating system written in Rust,
 inspired by Google Zircon (Fuchsia). It boots exclusively via UEFI (via
 Limine) and has a **real, verified boot-to-userspace pipeline**: it loads
-via Limine, sets up paging/heap/scheduler, loads a ring3 ELF process, and
-that process performs actual `syscall` instructions to exercise VMOs and
-Channel IPC.
+via Limine, sets up paging/heap/SMP-aware scheduler, loads a ring3 ELF
+process, and that process performs actual `syscall` instructions to
+exercise VMOs and Channel IPC — including multi-core bring-up under QEMU
+`-smp 2`.
 
-## Status: MVP
+## Status: MVP + SMP
 
-This is a minimum viable microkernel, not a production OS. It proves out
-the full pipeline end-to-end with no stubs in the paths it exercises, but
-scope is intentionally narrow — see [Known Limitations](#known-limitations)
-and [docs/ROADMAP.md](docs/ROADMAP.md) for what's next.
+This is still a minimum viable microkernel, not a production OS. It proves
+out the full pipeline end-to-end with no stubs in the paths it exercises.
+SMP (INIT-SIPI-SIPI, per-CPU GDT/TSS/IDT/scheduler, LAPIC timer, load
+balance) is now verified in QEMU. Scope remains intentionally narrow —
+see [Known Limitations](#known-limitations) and
+[docs/ROADMAP.md](docs/ROADMAP.md) for what's next.
 
 ## Verified Working
 
-- ✅ UEFI boot via Limine (real Limine protocol 0.6.5, base revision 3)
+- ✅ UEFI boot via Limine (protocol 0.6.5, **base revision 3**)
+- ✅ **HBI v2.1** boot image packaging (`tools/hbi-gen` + `scripts/mkhbi.sh`)
+  loaded as a Limine module; kernel parser in `huesos-kernel::boot::hbi`
 - ✅ Physical memory manager: bitmap frame allocator over the real Limine
-  memory map (not a hardcoded range)
+  memory map (not a hardcoded range); HBI image protected via `reserve_range`
 - ✅ Paging: per-process address spaces (independent PML4, shared kernel
   upper half), kernel heap mapped through real page tables
+- ✅ **HHDM base-rev-3 awareness**: ACPI/firmware tables and low AP trampoline
+  pages are explicitly mapped (rev 3 does not put reserved/ACPI/MMIO into
+  the HHDM and dropped the unconditional low 4 GiB identity map)
 - ✅ GDT/TSS with real ring0/ring3 segments, IDT with page fault / GPF /
   double fault handlers
-- ✅ Real `syscall`/`sysret` fast path (STAR/LSTAR/SFMASK), not a software
-  interrupt gate
-- ✅ Preemptive round-robin scheduler (PIT-driven, 100 Hz) that context
-  switches address spaces (CR3) and kernel stacks (TSS.RSP0) correctly
-  between kernel and userspace tasks
+- ✅ Real `syscall`/`sysret` fast path (STAR/LSTAR/SFMASK), programmed
+  **per logical CPU** (critical for user tasks migrated to APs)
+- ✅ **SMP**: MADT parse, INIT-SIPI-SIPI, per-CPU GDT/TSS/IDT/CpuLocal
+  (GS_BASE), per-CPU scheduler with idle task, shared LAPIC timer
+  calibration, LAPIC EOI on vector 0x20, online-CPU load balancing, IPI
+  reschedule on remote spawn
+- ✅ Scheduler: Fair (CFS-like WAVL-tree) + Deadline (EDF) policies, not
+  just plain round-robin
+- ✅ Buddy + slab kernel heap (`huesos-alloc`, 128 MiB heap, `page_size`-aware)
+- ✅ FAT16/32 driver crate (`huesos-fat`) with correct on-disk BPB layout
+  and FAT16-aware end-of-chain
 - ✅ ELF64 loader (`huesos-elf`) that maps `PT_LOAD` segments into a fresh
   address space
-- ✅ A real ring3 userspace process (`huesos-init`) launched via `iretq`,
-  built as a genuinely separate target/executable and embedded into the
-  kernel image at build time
-- ✅ MVP dynamic userspace launch path: init embeds child ELF images,
-  creates processes/root VMARs, maps VMOs, creates threads, starts them,
-  and receives bootstrap channels
-- ✅ VMOs backed by real physical page frames (not a `Vec<u8>` placeholder)
+- ✅ Real ring3 userspace process (`huesos-init`) launched via `iretq`,
+  built as a separate target and embedded at build time
+- ✅ Dynamic userspace launch: init embeds child ELF images, creates
+  processes/root VMARs, maps VMOs, creates threads, starts them, and
+  receives bootstrap channels
+- ✅ VMOs backed by real physical page frames
 - ✅ Channel IPC with real connected pairs (`Channel::pair()`)
 - ✅ PS/2 keyboard IRQ bridge to userspace via Interrupt objects + Ports
-  (DriverManager can receive raw scancode packets)
-- ✅ PS/2 keyboard driver (scancode set 1 → ASCII) and PIT timer driver
-- ✅ Real framebuffer driver (`huesos-fb`): pixel/rect/text/blit
-  primitives, bounds-checked against untrusted userspace input
-- ✅ `libcanvas`: a safe, `ntdll`/`libc`-style userspace syscall library —
-  application code never writes `asm!("syscall")` directly; every syscall
-  is a typed, `Result`-returning wrapper with RAII handle lifetimes.
-  Userspace draws to the screen via a VMO-backed `Canvas` + a
-  bounds-checked `FramebufferBlit` syscall — it never gets a mapping of
-  real video memory.
+- ✅ Real framebuffer driver (`huesos-fb`) + `libcanvas` (safe syscall lib;
+  userspace never maps raw video memory)
 
-All of the above is exercised live by `huesos-init` on every boot — now
-built entirely against `libcanvas`, not raw syscalls — which creates a
-VMO, writes to it, reads it back, creates a channel pair, sends/receives a
-message, mirrors init progress logs to the framebuffer until handing the
-screen to the terminal, then launches the userspace DriverManager and
-framebuffer terminal as child processes. DriverManager now starts an
-`input-host` DriverHost, registers the keyboard service from its readiness
-messages, mounts a RAM BOOTFS image as FileSystemService, and monitors
-heartbeat messages. The terminal paints the
-framebuffer from userspace via `Canvas` and runs a built-in mini shell
-with internal commands only. Historical framebuffer test output is shown
-in `tools/fontgen/qemu_screenshot.png`.
+All of the above is exercised live by `huesos-init` on every boot — built
+against `libcanvas` — which creates a VMO, does a channel round-trip,
+mirrors logs to the framebuffer, then launches DriverManager and the
+framebuffer terminal. DriverManager starts an `input-host` DriverHost,
+registers the keyboard service, mounts a RAM BOOTFS image as
+FileSystemService, and monitors heartbeats. The terminal paints via
+`Canvas` and runs a built-in mini shell.
+
+### QEMU multi-core smoke (expected)
+
+```text
+[HuesOS] Bootloader handed over control
+[PMM] Reserved HBI image: ...
+[SMP] MADT parsed 2 CPUs found
+[SMP] LAPIC timer count=...
+[SMP] Booting AP 1
+[SMP] AP 1 online (waiting for release)
+[SMP] AP 1 ready
+[SMP] bringup done, APs ready=1
+HBI v2.1 parsed. Entries: 0x4
+[SMP] APs released to run
+[SMP] AP 1 scheduling
+HuesOS v0.1.0 on CPU 0
+[init] hello from ring3 userspace, via libcanvas
+[init] VMO read/write round-trip OK
+[init] channel IPC round-trip OK
+... driver-manager / terminal ready ...
+```
+
+Default `scripts/run.sh` uses `-smp 2`.
 
 ## Known Limitations
 
-- Single core only (no SMP / APIC — see roadmap)
-- No filesystem, no drivers beyond keyboard/serial/PIT/framebuffer
+- No IOAPIC routing yet (LAPIC timer + legacy PIC keyboard path only)
+- No filesystem on real block devices yet (BOOTFS is RAM; FAT crate is
+  library-ready, not wired as the production VFS backend)
 - Exited process address spaces / kernel task stacks are not yet reclaimed
-  (a "zombie reaper" is future work)
-- Dynamic process launch exists as an MVP (`ProcessCreate`/`VmarMap`/
-  `ThreadCreate`/`ThreadStart`), but there is still no filesystem/initrd
-  program namespace and no process teardown/wait-based supervision yet
-- No dynamic loading, no relocations (static ELF executables only)
+  (zombie reaper is future work)
+- Dynamic process launch is MVP: no full process wait/reap supervision
+- No dynamic loading / relocations (static ELF only)
 - Rights enforcement exists but isn't exhaustively audited
 - Framebuffer text is ASCII-only (no Unicode shaping, by design)
-
 
 ## Hardware Compatibility
 
@@ -88,7 +109,7 @@ Current reported bare-metal success includes an MSI Modern 15 B5M laptop.
 # Build the kernel (also builds and embeds the userspace init binary)
 make build
 
-# Build + package a bootable ISO + run in QEMU (UEFI/OVMF)
+# Build + package a bootable ISO + run in QEMU (UEFI/OVMF, 2 CPUs)
 make run
 
 # Release build
@@ -107,7 +128,8 @@ See [docs/USERSPACE.md](docs/USERSPACE.md) — the short version: depend on
 
 ## Architecture
 
-See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for detailed design.
+See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for detailed design
+(including SMP, HBI, HHDM base-rev-3 mapping rules, and allocators).
 
 ## Building
 
@@ -115,7 +137,8 @@ See [docs/BUILD.md](docs/BUILD.md) for prerequisites and build instructions.
 
 ## Testing
 
-See [docs/TESTING.md](docs/TESTING.md) for unit tests, integration tests, and CI setup.
+See [docs/TESTING.md](docs/TESTING.md) for unit tests, multi-core QEMU
+expectations, and CI setup.
 
 ## Roadmap
 
@@ -126,22 +149,28 @@ See [docs/ROADMAP.md](docs/ROADMAP.md) for planned improvements.
 ```
 HuesOS/
 ├── crates/
-│   ├── huesos-boot        # Limine ELF entry point
-│   ├── huesos-arch        # x86_64 primitives: GDT/TSS, IDT, paging, syscall, PIT, PS/2
+│   ├── huesos-boot        # Limine ELF entry point, memmap / modules / HBI handoff
+│   ├── huesos-arch        # x86_64: GDT/TSS, IDT, paging, SMP, LAPIC, syscall, serial
 │   ├── huesos-hal         # Hardware abstraction (thin, grows with drivers)
 │   ├── huesos-pmm         # Physical memory manager (bitmap frame allocator)
+│   ├── huesos-alloc       # Buddy + slab kernel allocator
+│   ├── huesos-fat         # FAT16/32 filesystem library (no_std)
 │   ├── huesos-object      # Kernel objects: VMO, Channel, Process, Job, handles/rights
 │   ├── huesos-abi         # Shared kernel<->userspace ABI: syscall numbers, error codes
 │   ├── huesos-fb          # Framebuffer driver: pixel/rect/text/blit primitives
 │   ├── huesos-syscalls    # Syscall dispatch table
 │   ├── huesos-elf         # ELF64 loader
-│   ├── huesos-kernel      # Scheduler, process/thread mgmt, init sequence
+│   ├── huesos-kernel      # Scheduler (Fair/Deadline), SMP, process/thread, HBI parse
 │   └── huesos-userspace/
 │       ├── libcanvas      # Safe userspace syscall library (the only sanctioned way in)
-│       └── init           # Real ring3 userspace program (separate target)
-├── scripts/               # QEMU runner, ISO builder, Limine config
-├── tools/fontgen/         # 8x8 bitmap font generator for huesos-fb/libcanvas
-├── third_party/           # Vendored Limine + OVMF binaries (see their READMEs)
+│       ├── init           # Real ring3 userspace init
+│       ├── driver-manager # Userspace driver supervisor + BOOTFS FS service
+│       └── ...            # driver hosts / terminal
+├── scripts/               # QEMU runner, ISO builder, HBI packager, Limine config
+├── tools/
+│   ├── hbi-gen            # HBI v2.1 image generator
+│   └── fontgen/           # 8x8 bitmap font generator
+├── third_party/           # Vendored Limine + OVMF binaries
 ├── docs/                  # Documentation
 ├── x86_64-huesos.json     # Kernel target spec (ELF, higher-half)
 └── Makefile

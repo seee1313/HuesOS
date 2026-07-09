@@ -99,6 +99,10 @@ make iso            # debug
 make iso-release    # release
 ```
 
+`make iso` also builds `tools/hbi-gen` and packages `build/huesos.hbi`
+(HBI v2.1) via `scripts/mkhbi.sh`, then embeds kernel + HBI into the ISO
+per `scripts/limine.conf` (`module_path` for the HBI).
+
 Output: `build/huesos.iso` — a hybrid BIOS+UEFI bootable ISO built with
 Limine.
 
@@ -111,9 +115,18 @@ make run PROFILE=release
 
 This launches QEMU with:
 - Q35 chipset, OVMF UEFI firmware
+- **2 CPUs** (`-smp 2` in `scripts/run.sh`) — SMP path is the default
 - 256 MB RAM
-- Serial console on stdio (you'll see kernel + userspace `init` output
-  directly in your terminal)
+- Serial console on stdio (kernel + userspace `init` / driver-manager /
+  terminal output)
+
+To force uniprocessor for comparison:
+
+```bash
+qemu-system-x86_64 -machine q35 -cpu qemu64 -smp 1 -m 256M \
+  -bios third_party/ovmf/OVMF.fd -cdrom build/huesos.iso \
+  -serial stdio -display none -no-reboot -no-shutdown
+```
 
 ## Run on Real Hardware
 
