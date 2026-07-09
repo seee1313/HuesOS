@@ -51,6 +51,21 @@ pub unsafe fn kmain(boot_info: BootInfo) -> ! {
     huesos_arch::init_early();
     init::pmm_init(boot_info.memory_regions, boot_info.hhdm_offset);
 
+    // Protect the HBI image from being overwritten by the PMM!
+    if let Some(hbi_data) = boot_info.hbi_image {
+        let phys_addr = hbi_data.as_ptr() as u64 - boot_info.hhdm_offset;
+        let length = hbi_data.len() as u64;
+        huesos_pmm::reserve_range(phys_addr, length);
+        
+        use core::fmt::Write;
+        let mut writer = huesos_arch::serial::SerialWriter;
+        let _ = writeln!(
+            &mut writer,
+            "[PMM] Reserved HBI image: phys_addr={:#x}, length={}",
+            phys_addr, length
+        );
+    }
+
     let phys_offset = huesos_arch::VirtAddr::new(boot_info.hhdm_offset);
     huesos_arch::init_paging(phys_offset);
 
