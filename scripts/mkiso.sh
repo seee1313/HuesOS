@@ -33,11 +33,15 @@ for f in limine-bios.sys limine-bios-cd.bin limine-uefi-cd.bin BOOTX64.EFI BOOTI
     fi
 done
 
+# Generate HBI image
+bash scripts/mkhbi.sh "$PROFILE"
+
 rm -rf "$ISO_DIR"
 mkdir -p "$ISO_DIR/boot/limine"
 mkdir -p "$ISO_DIR/EFI/BOOT"
 
 cp "$KERNEL" "$ISO_DIR/boot/huesos-boot"
+cp "build/huesos.hbi" "$ISO_DIR/boot/huesos.hbi"
 cp "scripts/limine.conf" "$ISO_DIR/boot/limine/limine.conf"
 cp "$LIMINE_BIN/limine-bios.sys" "$ISO_DIR/boot/limine/"
 cp "$LIMINE_BIN/limine-bios-cd.bin" "$ISO_DIR/boot/limine/"
