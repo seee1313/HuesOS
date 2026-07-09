@@ -5,12 +5,14 @@ use alloc::vec::Vec;
 use core::any::Any;
 use spin::Mutex;
 
+use crate::wait::{self, WaitQueue};
 use crate::{alloc_koid, KernelObject, Koid, ObjectType};
 
 /// Port — wait queue for async events.
 pub struct Port {
     koid: Koid,
     packets: Mutex<Vec<PortPacket>>,
+    waiters: WaitQueue,
 }
 
 /// A packet queued to a port.
@@ -34,12 +36,16 @@ impl Port {
         Arc::new(Self {
             koid: alloc_koid(),
             packets: Mutex::new(Vec::new()),
+            waiters: WaitQueue::new(),
         })
     }
-    /// Queue a packet.
+
+    /// Queue a packet and wake one blocked reader.
     pub fn queue(&self, packet: PortPacket) {
         self.packets.lock().push(packet);
+        self.waiters.wake_one();
     }
+
     /// Read a packet (non-blocking, FIFO order).
     pub fn read(&self) -> Option<PortPacket> {
         let mut q = self.packets.lock();
@@ -47,6 +53,16 @@ impl Port {
             None
         } else {
             Some(q.remove(0))
+        }
+    }
+
+    /// Blocking read: park until a packet is available.
+    pub fn read_blocking(&self) -> PortPacket {
+        loop {
+            if let Some(p) = self.read() {
+                return p;
+            }
+            wait::park_on(&self.waiters);
         }
     }
 }
