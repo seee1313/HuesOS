@@ -4,7 +4,7 @@ use alloc::vec::Vec;
 use bitflags::bitflags;
 use spin::Mutex;
 
-use crate::Koid;
+use crate::{note_handle_close, note_handle_open, Koid};
 
 bitflags! {
     /// Capability rights on a Handle.
@@ -79,6 +79,13 @@ impl HandleTable {
     /// Add a handle, return its value. Value 0 is reserved as
     /// [`INVALID_HANDLE`], so real handles start at 1.
     pub fn add(&self, handle: Handle) -> HandleValue {
+        note_handle_open(handle.koid);
+        self.add_existing(handle)
+    }
+
+    /// Insert a handle that is already accounted for in the global handle
+    /// count (e.g. received via channel transfer).
+    pub fn add_existing(&self, handle: Handle) -> HandleValue {
         let mut t = self.table.lock();
         if t.is_empty() {
             t.push(None); // reserve slot 0
@@ -107,6 +114,7 @@ impl HandleTable {
         if slot.is_some() {
             return Err(handle);
         }
+        note_handle_open(handle.koid);
         *slot = Some(handle);
         Ok(())
     }
@@ -118,8 +126,17 @@ impl HandleTable {
         }
         self.table.lock().get(value as usize).copied().flatten()
     }
-    /// Remove handle.
+    /// Remove handle and drop the handle-table reference (may free object).
     pub fn remove(&self, value: HandleValue) -> Option<Handle> {
+        let h = self.remove_keep_alive(value)?;
+        note_handle_close(h.koid);
+        Some(h)
+    }
+
+    /// Remove handle from the table without adjusting the global handle
+    /// count — used when the handle is transferred into a channel message
+    /// (still "alive", just not in this table).
+    pub fn remove_keep_alive(&self, value: HandleValue) -> Option<Handle> {
         if value == INVALID_HANDLE {
             return None;
         }
@@ -133,7 +150,9 @@ impl HandleTable {
     pub fn clear(&self) {
         let mut t = self.table.lock();
         for slot in t.iter_mut() {
-            *slot = None;
+            if let Some(h) = slot.take() {
+                note_handle_close(h.koid);
+            }
         }
     }
 }

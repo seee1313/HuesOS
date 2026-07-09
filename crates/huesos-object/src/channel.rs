@@ -36,6 +36,16 @@ pub struct ChannelMessage {
     pub handles: Vec<Handle>,
 }
 
+impl Drop for ChannelMessage {
+    fn drop(&mut self) {
+        // If the message is discarded (peer closed, buffer dropped), release
+        // the handle-count holds that kept objects alive in flight.
+        for h in self.handles.drain(..) {
+            crate::note_handle_close(h.koid);
+        }
+    }
+}
+
 /// Reason a channel message could not be received into caller-provided buffers.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ChannelRecvError {
@@ -108,6 +118,26 @@ impl Channel {
                 return msg;
             }
             wait::park_on(self.readers.as_ref());
+        }
+    }
+
+    /// Blocking receive with timeout in scheduler ticks (`0` = forever).
+    /// Returns `None` if the timeout expires with no message.
+    pub fn recv_blocking_timeout(&self, timeout_ticks: u64) -> Option<ChannelMessage> {
+        use wait::ParkResult;
+        if timeout_ticks == 0 {
+            return Some(self.recv_blocking());
+        }
+        loop {
+            if let Some(msg) = self.recv() {
+                return Some(msg);
+            }
+            match wait::park_on_timeout(self.readers.as_ref(), timeout_ticks) {
+                ParkResult::Woken => continue,
+                ParkResult::TimedOut => {
+                    return self.recv();
+                }
+            }
         }
     }
 
