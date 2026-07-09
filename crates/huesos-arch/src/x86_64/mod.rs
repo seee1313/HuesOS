@@ -1,5 +1,7 @@
 //! x86_64-specific implementation.
 
+pub mod acpi;
+pub mod ap_boot;
 pub mod context_switch;
 pub mod cpu;
 pub mod gdt;
@@ -7,6 +9,7 @@ mod idt;
 pub mod interrupts;
 pub mod irq_callback;
 pub mod keyboard;
+pub mod lapic;
 pub mod paging;
 pub mod pit;
 pub mod serial;

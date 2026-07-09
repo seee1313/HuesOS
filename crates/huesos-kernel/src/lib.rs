@@ -43,6 +43,7 @@ pub struct BootInfo<'a> {
     pub memory_regions: &'a [MemoryRegion],
     pub framebuffer: Option<FramebufferInfo>,
     pub hbi_image: Option<&'a [u8]>,
+    pub rsdp_addr: Option<u64>,
 }
 
 pub unsafe fn kmain(boot_info: BootInfo) -> ! {

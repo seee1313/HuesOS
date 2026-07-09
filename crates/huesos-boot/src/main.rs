@@ -3,7 +3,7 @@
 
 use core::panic::PanicInfo;
 
-use limine::request::{FramebufferRequest, HhdmRequest, MemmapRequest};
+use limine::request::{FramebufferRequest, HhdmRequest, MemmapRequest, RsdpRequest};
 use limine::{BaseRevision, RequestsEndMarker, RequestsStartMarker};
 
 use huesos_pmm::MemoryRegion;
@@ -24,6 +24,10 @@ static HHDM_REQUEST: HhdmRequest = HhdmRequest::new();
 #[used]
 #[unsafe(link_section = ".requests")]
 static MEMMAP_REQUEST: MemmapRequest = MemmapRequest::new();
+
+#[used]
+#[unsafe(link_section = ".requests")]
+static RSDP_REQUEST: RsdpRequest = RsdpRequest::new();
 
 #[used]
 #[unsafe(link_section = ".requests_start_marker")]
@@ -77,11 +81,14 @@ pub unsafe extern "C" fn kmain_entry() -> ! {
             blue_mask_shift: fb.blue_mask_shift,
         });
 
+    let rsdp_addr = RSDP_REQUEST.response().map(|r| r.address as u64);
+
     let boot_info = BootInfo {
         hhdm_offset,
         memory_regions: &regions[..region_count],
         framebuffer,
         hbi_image: None,
+        rsdp_addr,
     };
 
     kmain(boot_info)

@@ -91,6 +91,64 @@ pub fn set_kernel_stack(stack_top: VirtAddr) {
     }
 }
 
+/// Per-CPU GDT + TSS bundle. Each CPU must have its own instance so that
+/// `set_kernel_stack` is race-free under SMP.
+pub struct PerCpuGdt {
+    pub table: &'static GlobalDescriptorTable,
+    pub selectors: Selectors,
+    tss_ptr: *mut TaskStateSegment,
+}
+
+impl PerCpuGdt {
+    /// Create a fresh GDT + TSS for the current CPU.
+    /// The GDT and TSS are leaked to `'static` so that `Descriptor::tss_segment`
+    /// is satisfied and the selectors remain valid forever.
+    pub fn new() -> Self {
+        let tss = alloc::boxed::Box::leak(alloc::boxed::Box::new(TaskStateSegment::new()));
+        tss.interrupt_stack_table[DOUBLE_FAULT_IST_INDEX as usize] = {
+            static mut STACK: [u8; IST_STACK_SIZE] = [0; IST_STACK_SIZE];
+            let stack_start = VirtAddr::from_ptr(core::ptr::addr_of!(STACK));
+            stack_start + IST_STACK_SIZE as u64
+        };
+        let tss_ptr: *mut TaskStateSegment = tss;
+        let mut gdt = alloc::boxed::Box::new(GlobalDescriptorTable::new());
+        let kernel_code = gdt.append(Descriptor::kernel_code_segment());
+        let kernel_data = gdt.append(Descriptor::kernel_data_segment());
+        let user_data = gdt.append(Descriptor::user_data_segment());
+        let user_code = gdt.append(Descriptor::user_code_segment());
+        let tss_sel = gdt.append(Descriptor::tss_segment(tss));
+        let table = alloc::boxed::Box::leak(gdt);
+        Self {
+            table,
+            selectors: Selectors {
+                kernel_code,
+                kernel_data,
+                user_data,
+                user_code,
+                tss: tss_sel,
+            },
+            tss_ptr,
+        }
+    }
+
+    /// Load this GDT into the current CPU and update segment registers.
+    pub fn load(&self) {
+        self.table.load();
+        unsafe {
+            CS::set_reg(self.selectors.kernel_code);
+            DS::set_reg(self.selectors.kernel_data);
+            ES::set_reg(self.selectors.kernel_data);
+            SS::set_reg(self.selectors.kernel_data);
+            load_tss(self.selectors.tss);
+        }
+    }
+
+    /// Update RSP0 in this CPU's TSS.
+    pub fn set_kernel_stack(&self, stack_top: VirtAddr) {
+        unsafe { (*self.tss_ptr).privilege_stack_table[0] = stack_top; }
+    }
+}
+
 /// Load GDT and update segment registers.
 pub fn init() {
     GDT.0.load();

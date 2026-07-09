@@ -6,6 +6,8 @@
 #![feature(abi_x86_interrupt)]
 #![warn(missing_docs)]
 
+extern crate alloc;
+
 mod x86_64;
 pub use x86_64::*;
 
