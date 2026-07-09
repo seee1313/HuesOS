@@ -2,6 +2,7 @@
 
 use crate::commands::execute_line;
 use crate::screen::Screen;
+use crate::snake;
 use libcanvas::{Channel, ErrorCode};
 
 const INPUT_MAX: usize = 128;
@@ -15,17 +16,23 @@ pub struct Shell {
     filesystem: Option<Channel>,
 }
 
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Key {
     Char(u8),
     Backspace,
     Enter,
+    Esc,
 }
 
 fn decode_keyboard_event(msg: &[u8]) -> Option<Key> {
     match msg {
-        [b'c', byte] => Some(Key::Char(*byte)),
+        [b'c', byte] => {
+            if *byte == 27 {
+                Some(Key::Esc)
+            } else {
+                Some(Key::Char(*byte))
+            }
+        }
         b"enter" => Some(Key::Enter),
         b"backspace" => Some(Key::Backspace),
         _ => None,
@@ -38,8 +45,8 @@ impl Shell {
         let mut screen = Screen::new();
         screen.clear();
         screen.write_line("HuesOS Terminal");
-        screen.write_line("userspace mini shell: type 'help' and press Enter");
-        screen.write_line("keyboard input: DriverManager keyboard service");
+        screen.write_line("userspace mini shell — type 'help', try 'snake'");
+        screen.write_line("keyboard: DriverManager keyboard service");
         screen.write_line("");
 
         let mut shell = Self {
@@ -64,7 +71,9 @@ impl Shell {
                         self.handle_key(key);
                     }
                 }
-                Err(ErrorCode::ShouldWait) => libcanvas::process::yield_now(),
+                Err(ErrorCode::ShouldWait) | Err(ErrorCode::TimedOut) => {
+                    libcanvas::process::yield_now();
+                }
                 Err(e) => {
                     self.screen.write_str("terminal: keyboard service error: ");
                     self.screen.write_line(e.as_str());
@@ -90,14 +99,37 @@ impl Shell {
                     self.screen.backspace();
                 }
             }
+            Key::Esc => {
+                // Clear current input line.
+                while self.input_len > 0 {
+                    self.input_len -= 1;
+                    self.screen.backspace();
+                }
+            }
             Key::Enter => {
                 self.screen.newline();
                 let line = core::str::from_utf8(&self.input[..self.input_len]).unwrap_or("");
-                execute_line(line, &mut self.screen, self.filesystem.as_ref());
+                if line.trim() == "snake" {
+                    // Fullscreen TUI; redraw shell when it returns.
+                    snake::run(&self.keyboard);
+                    self.redraw_after_game();
+                } else {
+                    execute_line(line, &mut self.screen, self.filesystem.as_ref());
+                    self.input_len = 0;
+                    self.prompt();
+                }
                 self.input_len = 0;
-                self.prompt();
             }
         }
+        self.screen.render();
+    }
+
+    fn redraw_after_game(&mut self) {
+        self.screen.clear();
+        self.screen.write_line("HuesOS Terminal");
+        self.screen.write_line("back from snake — type 'help' or 'snake'");
+        self.screen.write_line("");
+        self.prompt();
         self.screen.render();
     }
 

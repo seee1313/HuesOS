@@ -443,7 +443,11 @@ pub fn spawn_user_thread(
     cr3: u64,
 ) -> u64 {
     huesos_arch::interrupts::disable();
-    let cpu = find_best_cpu();
+    // Prefer the caller's CPU for userspace launches. Early boot services
+    // spawned by init must not be stranded on an AP that is still settling
+    // under QEMU TCG (missing ready handshake). Kernel threads may still
+    // use find_best_cpu for load balance.
+    let cpu = cpu_id();
     let mut guard = PER_CPU_SCHEDULERS[cpu].lock();
     let id = ((cpu as u64) << 32) | (guard.tasks.len() as u64);
     crate::process::queue_user_entry(id, entry_point, user_rsp);
