@@ -3,6 +3,19 @@
 //! syscalls (TSS.RSP0) when hopping between kernel and userspace tasks.
 //!
 //! SMP-aware: each CPU has its own scheduler instance accessed via LAPIC ID.
+//!
+//! Advanced Scheduling Modes:
+//! 1. Fair Scheduling (Default out of the box):
+//!    - CFS-like scheduling sorted by virtual completion time (vruntime).
+//!    - Tasks stored in a custom balanced WAVL-tree.
+//!    - Higher weight tasks grow vruntime slower and get proportionally more CPU time.
+//! 2. Deadline Scheduling:
+//!    - Guaranteed CPU time (capacity) per period.
+//!    - High priority: always executed before any Fair tasks.
+//!    - Multi-task deadline scheduled via Earliest Deadline First (EDF).
+
+#[path = "scheduler/wavl.rs"]
+pub mod wavl;
 
 use crate::task::{Task, TaskKind};
 use alloc::sync::Arc;
@@ -14,6 +27,29 @@ use x86_64::VirtAddr;
 
 /// Maximum number of CPUs supported.
 pub const MAX_CPUS: usize = 64;
+
+/// Scheduling policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SchedPolicy {
+    /// Fair (CFS-like) scheduling.
+    Fair {
+        /// Task weight (nice level equivalent).
+        weight: u64,
+        /// Virtual runtime in tick-scaling.
+        vruntime: u64,
+    },
+    /// Deadline real-time scheduling.
+    Deadline {
+        /// Execution capacity in ticks per period.
+        capacity: u64,
+        /// Period in ticks.
+        period: u64,
+        /// Remaining budget in current period.
+        remaining_budget: u64,
+        /// Absolute tick when current period ends.
+        deadline: u64,
+    },
+}
 
 /// Wrapper needed because `UnsafeCell<T>` is never `Sync` regardless of
 /// `T`; we provide the `Sync` impl ourselves since all accesses to the
@@ -27,6 +63,8 @@ static PER_CPU_SCHEDULERS: [SchedulerCell; MAX_CPUS] =
 struct Scheduler {
     tasks: Vec<Task>,
     current: usize,
+    fair_queue: wavl::WavlTree,
+    ticks: u64,
 }
 
 impl Scheduler {
@@ -34,12 +72,21 @@ impl Scheduler {
         Self {
             tasks: Vec::new(),
             current: 0,
+            fair_queue: wavl::WavlTree::new(),
+            ticks: 0,
         }
     }
 
     fn add_task(&mut self, task: Task) -> u64 {
         let id = task.id;
+        let idx = self.tasks.len();
+        let policy = task.sched_policy;
         self.tasks.push(task);
+        if idx > 0 {
+            if let SchedPolicy::Fair { vruntime, .. } = policy {
+                self.fair_queue.insert(vruntime, id);
+            }
+        }
         id
     }
 
@@ -55,29 +102,87 @@ impl Scheduler {
         }
     }
 
-    /// Pick the next non-finished task in round-robin order. Always leaves
-    /// task 0 (idle) as a fallback so we never run out of runnable tasks.
-    fn next_runnable(&self) -> usize {
-        let len = self.tasks.len();
-        for step in 1..=len {
-            let idx = (self.current + step) % len;
-            if idx == 0 || !self.tasks[idx].finished.load(Ordering::Relaxed) {
-                return idx;
+    fn tick(&mut self) {
+        self.ticks += 1;
+
+        // 1. Release Deadline tasks whose period has ended
+        for idx in 1..self.tasks.len() {
+            let t = &mut self.tasks[idx];
+            if t.finished.load(Ordering::Relaxed) {
+                continue;
+            }
+            if let SchedPolicy::Deadline {
+                capacity,
+                period,
+                remaining_budget,
+                deadline,
+            } = &mut t.sched_policy
+            {
+                if self.ticks >= *deadline {
+                    *deadline = self.ticks + *period;
+                    *remaining_budget = *capacity;
+                }
             }
         }
-        0
-    }
 
-    fn tick(&mut self) {
-        let len = self.tasks.len();
-        if len <= 1 {
-            return;
+        // 2. Update stats for currently running task
+        if self.current > 0 {
+            let curr_task = &mut self.tasks[self.current];
+            let task_id = curr_task.id;
+            let finished = curr_task.finished.load(Ordering::Relaxed);
+
+            match &mut curr_task.sched_policy {
+                SchedPolicy::Fair { weight, vruntime } => {
+                    let delta = (1024 * 1000) / (*weight).max(1);
+                    *vruntime += delta;
+                    if !finished {
+                        // Re-insert into Fair queue
+                        self.fair_queue.insert(*vruntime, task_id);
+                    }
+                }
+                SchedPolicy::Deadline { remaining_budget, .. } => {
+                    *remaining_budget = remaining_budget.saturating_sub(1);
+                }
+            }
         }
+
+        // 3. Pick the next task to run
+        let mut next_idx = 0;
+
+        // Try Deadline tasks first (Earliest Deadline First)
+        let mut best_deadline = u64::MAX;
+        for idx in 1..self.tasks.len() {
+            let t = &self.tasks[idx];
+            if t.finished.load(Ordering::Relaxed) {
+                continue;
+            }
+            if let SchedPolicy::Deadline {
+                remaining_budget,
+                deadline,
+                ..
+            } = t.sched_policy
+            {
+                if remaining_budget > 0 && deadline < best_deadline {
+                    best_deadline = deadline;
+                    next_idx = idx;
+                }
+            }
+        }
+
+        // If no Deadline task is ready, schedule from Fair queue
+        if next_idx == 0 {
+            if let Some(task_id) = self.fair_queue.pop_min() {
+                next_idx = (task_id & 0xFFFFFFFF) as usize;
+            }
+        }
+
         let old_index = self.current;
-        self.current = self.next_runnable();
-        if self.current == old_index {
+        if next_idx == old_index {
+            // Keep running the same task
             return;
         }
+
+        self.current = next_idx;
         self.apply_task_environment(self.current);
 
         let (old_ptr, new_ptr): (*mut Task, *const Task) = {
@@ -86,8 +191,7 @@ impl Scheduler {
             (old, new)
         };
 
-        // Safety: interrupts are disabled by the caller; pointers are into
-        // a Vec that outlives this call.
+        // Safety: interrupts are disabled; pointers point to active Vec
         unsafe {
             huesos_arch::context_switch::context_switch(
                 &mut (*old_ptr).context,
@@ -160,34 +264,59 @@ pub fn current_task_id() -> Option<u64> {
     sched.current_task().map(|t| t.id)
 }
 
-/// Find a CPU that is currently idle (only the idle task is present).
-fn find_idle_cpu() -> Option<u8> {
+/// Find the best CPU to spawn a task on (online CPU with fewest tasks).
+fn find_best_cpu() -> usize {
+    let mut best_cpu = 0;
+    let mut min_tasks = usize::MAX;
+
     for i in 0..MAX_CPUS {
         let sched = unsafe { &*PER_CPU_SCHEDULERS[i].0.get() };
-        if sched.tasks.len() == 1 {
-            // Only idle task — this CPU is idle.
-            return Some(i as u8);
+        let count = sched.tasks.len();
+        if count >= 1 && count < min_tasks {
+            min_tasks = count;
+            best_cpu = i;
         }
     }
-    None
+    best_cpu
 }
 
-/// If there is an idle CPU, send it a reschedule IPI so it picks up
-/// the newly added task.
-fn maybe_wake_idle_cpu() {
-    if let Some(cpu) = find_idle_cpu() {
-        huesos_arch::lapic::ipi_reschedule(cpu);
+/// Set the scheduling policy for a task by its ID.
+pub fn set_sched_policy(task_id: u64, policy: SchedPolicy) {
+    huesos_arch::interrupts::disable();
+    let cpu = (task_id >> 32) as usize;
+    let idx = (task_id & 0xFFFFFFFF) as usize;
+    if cpu < MAX_CPUS {
+        let sched = unsafe { &mut *PER_CPU_SCHEDULERS[cpu].0.get() };
+        if let Some(task) = sched.tasks.get_mut(idx) {
+            // Remove from fair queue if it was there
+            if let SchedPolicy::Fair { vruntime, .. } = task.sched_policy {
+                sched.fair_queue.remove(vruntime, task_id);
+            }
+
+            task.sched_policy = policy;
+
+            // Re-insert into fair queue if the new policy is Fair
+            if let SchedPolicy::Fair { vruntime, .. } = policy {
+                sched.fair_queue.insert(vruntime, task_id);
+            }
+        }
     }
+    huesos_arch::interrupts::enable();
 }
 
-/// Spawn a new kernel thread on the current CPU.
+/// Spawn a new kernel thread.
 pub fn spawn_kernel_thread(name: &[u8; 32], entry: extern "C" fn() -> !) -> u64 {
-    let id = with_scheduler(|s| {
-        let id = s.tasks.len() as u64;
-        let task = Task::new_kernel(id, *name, entry);
-        s.add_task(task)
-    });
-    maybe_wake_idle_cpu();
+    huesos_arch::interrupts::disable();
+    let cpu = find_best_cpu();
+    let sched = unsafe { &mut *PER_CPU_SCHEDULERS[cpu].0.get() };
+    let id = ((cpu as u64) << 32) | (sched.tasks.len() as u64);
+    let task = Task::new_kernel(id, *name, entry);
+    sched.add_task(task);
+    huesos_arch::interrupts::enable();
+
+    if cpu != cpu_id() {
+        huesos_arch::lapic::ipi_reschedule(cpu as u8);
+    }
     id
 }
 
@@ -200,19 +329,24 @@ pub fn spawn_user_thread(
     user_rsp: u64,
     cr3: u64,
 ) -> u64 {
-    let id = with_scheduler(|s| {
-        let id = s.tasks.len() as u64;
-        crate::process::queue_user_entry(id, entry_point, user_rsp);
-        let task = Task::new_user(
-            id,
-            *name,
-            process,
-            crate::process::user_entry_trampoline,
-            cr3,
-        );
-        s.add_task(task)
-    });
-    maybe_wake_idle_cpu();
+    huesos_arch::interrupts::disable();
+    let cpu = find_best_cpu();
+    let sched = unsafe { &mut *PER_CPU_SCHEDULERS[cpu].0.get() };
+    let id = ((cpu as u64) << 32) | (sched.tasks.len() as u64);
+    crate::process::queue_user_entry(id, entry_point, user_rsp);
+    let task = Task::new_user(
+        id,
+        *name,
+        process,
+        crate::process::user_entry_trampoline,
+        cr3,
+    );
+    sched.add_task(task);
+    huesos_arch::interrupts::enable();
+
+    if cpu != cpu_id() {
+        huesos_arch::lapic::ipi_reschedule(cpu as u8);
+    }
     id
 }
 
