@@ -28,6 +28,8 @@ priority order.
 - Blocking `ChannelRead` / `PortRead` (flag arg) and blocking `ProcessWait`
 - Handle transfer-on-write already landed earlier; documented
 - `Vmo` Drop frees physical frames; exit path frees kernel stacks via reaper
+- `AddressSpace::destroy` frees owned user frames + private page tables
+- Process teardown clears handle table; driver-host input uses blocking Port
 
 ## Immediate
 
@@ -37,8 +39,9 @@ priority order.
   drop reliance on 8259 for anything that can go through IOAPIC.
 
 ### 2. Process/task teardown (partial)
-- **Current**: kernel stacks reaped; VMO frames freed on last Arc drop.
-  Page tables / handle tables still not fully walked on exit.
+- **Current**: kernel stacks reaped; VMO frames on Drop; address space
+  destroy + handle clear on exit. Still no full object-refcount GC for
+  every koid still held only by the global registry.
 - **Needed**: a "zombie" list + reaper task (or reference-counted teardown
   triggered once nothing can reference the task anymore) that frees the
   process's `AddressSpace` (walking all 4 page table levels and returning
