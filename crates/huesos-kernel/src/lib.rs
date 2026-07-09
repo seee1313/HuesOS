@@ -13,6 +13,7 @@ extern crate alloc;
 pub mod init;
 pub mod process;
 pub mod scheduler;
+pub mod smp;
 pub mod task;
 pub mod mem;
 pub mod boot;
@@ -55,6 +56,10 @@ pub unsafe fn kmain(boot_info: BootInfo) -> ! {
 
     init::heap_init();
     init::object_init();
+
+    if let Some(rsdp) = boot_info.rsdp_addr {
+        smp::bringup_aps(rsdp, boot_info.hhdm_offset);
+    }
 
     if let Some(hbi_data) = boot_info.hbi_image {
         if let Ok(hbi) = boot::hbi::HbiImage::parse(hbi_data) {
