@@ -32,6 +32,9 @@ run-release: iso-release
 
 test:
 	cargo test -p huesos-elf -p huesos-pmm -p huesos-object -p huesos-fb --target x86_64-unknown-linux-gnu -Z build-std=
+	mv .cargo/config.toml .cargo/config.toml.bak && \
+	cargo +nightly test -p huesos-fat -p huesos-alloc --target x86_64-unknown-linux-gnu && \
+	mv .cargo/config.toml.bak .cargo/config.toml
 
 clean:
 	cargo clean
