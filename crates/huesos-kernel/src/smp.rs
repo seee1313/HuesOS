@@ -68,6 +68,8 @@ pub fn bringup_aps(rsdp_addr: u64, hhdm_offset: u64) {
         let stack_top = unsafe { AP_STACKS[ap_index].as_ptr().add(AP_STACKS[ap_index].len()) as u64 };
         log_line("[SMP] Booting AP ");
         log_num(cpu.apic_id as u64);
+        log_line(" stack_top=");
+        log_num(stack_top);
         log_line("\n");
 
         unsafe {
@@ -98,7 +100,14 @@ pub unsafe extern "C" fn ap_entry() -> ! {
 
     // Load per-CPU GDT.
     let gdt = huesos_arch::gdt::PerCpuGdt::new();
-    gdt.load();
+    let gdt_static = alloc::boxed::Box::leak(alloc::boxed::Box::new(gdt));
+    gdt_static.load();
+
+    // Register it in AP's CpuLocal!
+    unsafe {
+        let ptr = huesos_arch::cpu_local::cpu_local_ptr();
+        (*ptr).gdt = gdt_static as *mut huesos_arch::gdt::PerCpuGdt as *mut ();
+    }
 
     // Initialize per-CPU scheduler.
     crate::scheduler::init();
