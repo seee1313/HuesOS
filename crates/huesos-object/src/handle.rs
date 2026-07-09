@@ -128,6 +128,14 @@ impl HandleTable {
             .get_mut(value as usize)
             .and_then(|h| h.take())
     }
+
+    /// Drop every handle slot (process teardown).
+    pub fn clear(&self) {
+        let mut t = self.table.lock();
+        for slot in t.iter_mut() {
+            *slot = None;
+        }
+    }
 }
 
 impl Default for HandleTable {

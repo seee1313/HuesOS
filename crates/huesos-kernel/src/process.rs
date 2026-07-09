@@ -57,7 +57,7 @@ impl ProcessRuntime {
 /// Adapter that lets `huesos-elf::load` map pages into a real
 /// `huesos_arch::paging::AddressSpace`.
 struct KernelLoader<'a> {
-    aspace: &'a AddressSpace,
+    aspace: &'a mut AddressSpace,
 }
 
 impl<'a> Loader for KernelLoader<'a> {
@@ -282,11 +282,11 @@ pub fn start_thread(
 pub fn spawn_from_elf(name: &str, elf_bytes: &[u8]) -> SpawnedProcess {
     let process = Process::new(name);
     huesos_object::register_process(process.clone());
-    let runtime = ProcessRuntime::new(process.koid());
+    let mut runtime = ProcessRuntime::new(process.koid());
 
     let loaded = {
         let mut loader = KernelLoader {
-            aspace: &runtime.address_space,
+            aspace: &mut runtime.address_space,
         };
         huesos_elf::load(elf_bytes, &mut loader).expect("failed to load userspace ELF")
     };
@@ -368,4 +368,34 @@ pub extern "C" fn user_entry_trampoline() -> ! {
     unsafe {
         huesos_arch::context_switch::enter_userspace(entry, rsp, user_cs, user_ss, 0x202);
     }
+}
+
+
+
+impl ProcessRuntime {
+    /// Destroy the address space and drop the root VMAR registration.
+    pub fn destroy(self) {
+        let root_koid = self.root_vmar.koid();
+        // Safety: caller must ensure no CPU still has this CR3 loaded.
+        unsafe {
+            self.address_space.destroy();
+        }
+        huesos_object::unregister_object(root_koid);
+    }
+}
+
+/// Tear down process resources after exit: free page tables / owned frames,
+/// clear the handle table, leave the Process object itself for ProcessWait
+/// until its last handle is closed.
+///
+/// # Safety
+/// No task may still run with this process's CR3.
+pub fn teardown_process(process: &Process) {
+    if let Some(any) = process.address_space.lock().take() {
+        match any.downcast::<ProcessRuntime>() {
+            Ok(runtime) => runtime.destroy(),
+            Err(_) => {}
+        }
+    }
+    process.handles.clear();
 }

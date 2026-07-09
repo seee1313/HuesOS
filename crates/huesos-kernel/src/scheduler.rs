@@ -478,6 +478,7 @@ pub fn exit_current_task(code: i64) -> ! {
     }
     if let Some(proc) = process_to_signal {
         proc.set_exit_code(code);
+        PROCESS_TEARDOWN.lock().push(proc);
     }
     if let Some(id) = reap_id {
         REAP_QUEUE.lock().push(id);
@@ -500,6 +501,10 @@ pub fn exit_current_task(code: i64) -> ! {
 
 /// Task ids waiting for kernel-stack reclamation.
 static REAP_QUEUE: spin::Mutex<alloc::vec::Vec<u64>> = spin::Mutex::new(alloc::vec::Vec::new());
+
+/// Processes waiting for address-space / handle-table teardown.
+static PROCESS_TEARDOWN: spin::Mutex<alloc::vec::Vec<alloc::sync::Arc<huesos_object::Process>>> =
+    spin::Mutex::new(alloc::vec::Vec::new());
 
 /// Drain finished tasks' kernel stacks (frames stay until process Arc drops).
 /// Safe to call from a low-priority path; currently invoked from the BSP
@@ -527,5 +532,14 @@ pub fn reap_finished_tasks() {
                 task.kernel_stack = alloc::vec::Vec::new();
             }
         }
+    }
+
+    // Tear down exited processes (page tables, owned frames, handles).
+    let procs = {
+        let mut q = PROCESS_TEARDOWN.lock();
+        core::mem::take(&mut *q)
+    };
+    for proc in procs {
+        crate::process::teardown_process(&proc);
     }
 }
