@@ -111,10 +111,20 @@ impl Channel {
 
     /// Blocking read: park the thread until a message is available.
     pub fn read_into_blocking(&self, buf: &mut [u8]) -> crate::Result<usize> {
-        self.read_into_flags(buf, true)
+        self.read_into_mode(buf, 1)
+    }
+
+    /// Blocking read with timeout in kernel scheduler ticks.
+    pub fn read_into_timeout(&self, buf: &mut [u8], ticks: u64) -> crate::Result<usize> {
+        let mode = if ticks == 0 { 1 } else { ticks.max(2) };
+        self.read_into_mode(buf, mode)
     }
 
     fn read_into_flags(&self, buf: &mut [u8], block: bool) -> crate::Result<usize> {
+        self.read_into_mode(buf, if block { 1 } else { 0 })
+    }
+
+    fn read_into_mode(&self, buf: &mut [u8], wait_mode: u64) -> crate::Result<usize> {
         let mut actual: u32 = 0;
         let ret = unsafe {
             raw::syscall5(
@@ -123,7 +133,7 @@ impl Channel {
                 buf.as_mut_ptr() as u64,
                 buf.len() as u64,
                 &mut actual as *mut u32 as u64,
-                if block { 1 } else { 0 },
+                wait_mode,
             )
         };
         raw::decode(ret)?;

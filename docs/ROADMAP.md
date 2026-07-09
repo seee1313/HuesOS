@@ -30,6 +30,8 @@ priority order.
 - `Vmo` Drop frees physical frames; exit path frees kernel stacks via reaper
 - `AddressSpace::destroy` frees owned user frames + private page tables
 - Process teardown clears handle table; driver-host input uses blocking Port
+- Global handle-count GC: last close unregisters object (Vmo Drop, etc.)
+- Timed waits: `ChannelRead`/`PortRead` mode `>=2` = timeout in ticks + `TimedOut`
 
 ## Immediate
 
@@ -38,18 +40,18 @@ priority order.
 - **Needed**: full IOAPIC programming, IRQ remapping for multi-core IRQs,
   drop reliance on 8259 for anything that can go through IOAPIC.
 
-### 2. Process/task teardown (partial)
-- **Current**: kernel stacks reaped; VMO frames on Drop; address space
-  destroy + handle clear on exit. Still no full object-refcount GC for
-  every koid still held only by the global registry.
+### 2. Process/task teardown (mostly done)
+- **Current**: stacks reaped; VMO frames on Drop; AS destroy; handle clear;
+  last-handle unregisters from global registry. Residual: objects held only
+  by kernel internals without a handle path.
 - **Needed**: a "zombie" list + reaper task (or reference-counted teardown
   triggered once nothing can reference the task anymore) that frees the
   process's `AddressSpace` (walking all 4 page table levels and returning
   frames to `huesos-pmm`) and the task's kernel stack.
 
-### 3. Blocking syscalls / wait primitives (partial)
-- **Current**: Channel/Port can block via flag; ProcessWait blocks on exit.
-- **Needed**: multiplexed multi-object wait, timeouts, interruptible cancels.
+### 3. Blocking syscalls / wait primitives (mostly done)
+- **Current**: Channel/Port block + tick timeouts (`TimedOut`); ProcessWait.
+- **Needed**: multiplexed multi-object wait / cancel.
 
 ## Short Term
 

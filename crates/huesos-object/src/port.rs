@@ -58,11 +58,28 @@ impl Port {
 
     /// Blocking read: park until a packet is available.
     pub fn read_blocking(&self) -> PortPacket {
+        self.read_blocking_timeout(0).expect("infinite wait")
+    }
+
+    /// Blocking read with timeout in scheduler ticks (`0` = forever).
+    pub fn read_blocking_timeout(&self, timeout_ticks: u64) -> Option<PortPacket> {
+        use wait::ParkResult;
+        if timeout_ticks == 0 {
+            loop {
+                if let Some(p) = self.read() {
+                    return Some(p);
+                }
+                wait::park_on(&self.waiters);
+            }
+        }
         loop {
             if let Some(p) = self.read() {
-                return p;
+                return Some(p);
             }
-            wait::park_on(&self.waiters);
+            match wait::park_on_timeout(&self.waiters, timeout_ticks) {
+                ParkResult::Woken => continue,
+                ParkResult::TimedOut => return self.read(),
+            }
         }
     }
 }

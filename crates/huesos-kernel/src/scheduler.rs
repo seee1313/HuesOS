@@ -259,7 +259,11 @@ pub fn init() {
         let cpu = cpu_id();
         let mut guard = PER_CPU_SCHEDULERS[cpu].lock();
         let switch_context = guard.tick();
+        let ticks_now = guard.ticks;
         drop(guard); // Release the lock before performing context switch!
+
+        // Wake any waiters whose timeout expired.
+        huesos_object::wait::notify_tick(ticks_now);
 
         if let Some((old_ptr, new_ptr)) = switch_context {
             // Safety: interrupts are disabled; pointers point to active Vec
@@ -352,6 +356,13 @@ pub fn wake_task(task_id: u64) {
 pub fn current_task_id() -> Option<u64> {
     let guard = PER_CPU_SCHEDULERS[cpu_id()].lock();
     guard.current_task().map(|t| t.id)
+}
+
+/// Monotonic BSP-ish tick counter for wait timeouts (sum of local ticks is
+/// fine; we use the current CPU's scheduler ticks).
+pub fn global_ticks() -> u64 {
+    let guard = PER_CPU_SCHEDULERS[cpu_id()].lock();
+    guard.ticks
 }
 
 /// Find the best CPU to spawn a task on (online CPU with fewest tasks).

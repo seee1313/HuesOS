@@ -116,6 +116,8 @@ impl DriverManager {
             self.poll_registry_requests();
             self.fs.poll();
             self.poll_input_host();
+            // Multi-channel poll: cannot block on one fd without starving others.
+            // Yield cooperatively; hot IRQ path is already blocking in the host.
             libcanvas::process::yield_now();
         }
     }
@@ -136,12 +138,31 @@ impl DriverManager {
     }
 
     fn wait_for_input_host_ready(&mut self) {
-        for _ in 0..4096 {
+        // ~5s at 100Hz ticks if host is silent; still poll other events.
+        for _ in 0..500 {
             self.poll_input_host();
             if self.keyboard_ready() {
                 return;
             }
-            libcanvas::process::yield_now();
+            // Timed park via host bootstrap if present (100 ticks ~ 1s).
+            if let Some(host) = self.input_host.as_ref() {
+                let mut buf = [0u8; 64];
+                match host.bootstrap.read_into_timeout(&mut buf, 100) {
+                    Ok(n) if n > 0 => {
+                        // Re-process through poll path next iteration.
+                        self.poll_input_host();
+                    }
+                    Ok(_) | Err(ErrorCode::TimedOut) | Err(ErrorCode::ShouldWait) => {}
+                    Err(e) => {
+                        println!(
+                            "[driver-manager] input host wait failed: {}",
+                            e.as_str()
+                        );
+                    }
+                }
+            } else {
+                libcanvas::process::yield_now();
+            }
         }
         println!("[driver-manager] input DriverHost did not become ready in time");
     }

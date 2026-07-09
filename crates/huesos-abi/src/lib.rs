@@ -154,6 +154,8 @@ pub enum ErrorCode {
     /// A non-blocking call would have to block to complete (e.g. reading
     /// an empty channel) — not a real error, just "nothing to do yet".
     ShouldWait = -16,
+    /// A timed wait expired without the condition becoming true.
+    TimedOut = -20,
     /// Not found.
     NotFound = -17,
     /// No framebuffer is available on this system.
@@ -175,6 +177,7 @@ impl ErrorCode {
             -14 => Self::NoMemory,
             -15 => Self::Busy,
             -16 => Self::ShouldWait,
+            -20 => Self::TimedOut,
             -17 => Self::NotFound,
             -18 => Self::NoFramebuffer,
             -19 => Self::NotSupported,
@@ -193,6 +196,7 @@ impl ErrorCode {
             Self::NoMemory => "out of memory",
             Self::Busy => "resource busy",
             Self::ShouldWait => "would block",
+            Self::TimedOut => "timed out",
             Self::NotFound => "not found",
             Self::NoFramebuffer => "no framebuffer available",
             Self::NotSupported => "syscall not supported",

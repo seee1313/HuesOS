@@ -104,6 +104,7 @@ pub fn syscall_init() {
         crate::scheduler::park_current,
         crate::scheduler::wake_task,
     );
+    huesos_object::wait::set_ticks_fn(crate::scheduler::global_ticks);
 }
 
 fn handle_irq(irq: u8, d: u64) {
