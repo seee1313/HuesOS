@@ -47,6 +47,7 @@ impl CpuLocal {
 
 static_assertions::const_assert_eq!(core::mem::offset_of!(CpuLocal, user_rsp), 40);
 static_assertions::const_assert_eq!(core::mem::offset_of!(CpuLocal, kernel_rsp), 48);
+static_assertions::const_assert_eq!(core::mem::size_of::<CpuLocal>(), 56);
 
 static mut CPU_LOCALS: [CpuLocal; MAX_CPUS] = [CpuLocal::empty(); MAX_CPUS];
 static CPU_LOCAL_NEXT: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
