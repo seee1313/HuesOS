@@ -3,7 +3,7 @@
 
 use core::panic::PanicInfo;
 
-use limine::request::{FramebufferRequest, HhdmRequest, MemmapRequest, RsdpRequest, ModulesRequest};
+use limine::request::{FramebufferRequest, HhdmRequest, MemmapRequest, RsdpRequest, ModulesRequest, StackSizeRequest};
 use limine::{BaseRevision, RequestsEndMarker, RequestsStartMarker};
 
 use huesos_pmm::MemoryRegion;
@@ -40,6 +40,10 @@ static _END_MARKER: RequestsEndMarker = RequestsEndMarker::new();
 #[used]
 #[unsafe(link_section = ".requests")]
 static MODULES_REQUEST: ModulesRequest = ModulesRequest::new();
+
+#[used]
+#[unsafe(link_section = ".requests")]
+static STACK_SIZE_REQUEST: StackSizeRequest = StackSizeRequest::new(1024 * 1024); // 1 MiB stack
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn kmain_entry() -> ! {
