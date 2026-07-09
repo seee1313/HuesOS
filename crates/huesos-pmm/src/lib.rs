@@ -25,6 +25,10 @@ pub struct MemoryRegion {
     pub length: u64,
     /// Whether this region is usable general-purpose RAM.
     pub usable: bool,
+    /// Raw bootloader memory-map type (Limine `MEMMAP_*` values).
+    /// Used by the kernel to map ACPI/reserved ranges that base revision 3
+    /// leaves out of the HHDM. Zero when unknown.
+    pub kind: u64,
 }
 
 /// Errors returned by the PMM.
@@ -247,6 +251,7 @@ mod tests {
             base: 0,
             length: total_bytes,
             usable: true,
+            kind: 0,
         }];
         unsafe {
             init(&regions, hhdm_offset);

@@ -59,15 +59,23 @@ pub unsafe extern "C" fn kmain_entry() -> ! {
     let entries = memmap_response.entries();
 
     const MAX_REGIONS: usize = 128;
-    let mut regions = [MemoryRegion { base: 0, length: 0, usable: false }; MAX_REGIONS];
+    let mut regions = [MemoryRegion {
+        base: 0,
+        length: 0,
+        usable: false,
+        kind: 0,
+    }; MAX_REGIONS];
     let mut region_count = 0usize;
 
     for entry in entries.iter() {
-        if region_count >= MAX_REGIONS { break; }
+        if region_count >= MAX_REGIONS {
+            break;
+        }
         regions[region_count] = MemoryRegion {
             base: entry.base,
             length: entry.length,
             usable: entry.type_ == limine::memmap::MEMMAP_USABLE,
+            kind: entry.type_,
         };
         region_count += 1;
     }

@@ -69,6 +69,10 @@ pub unsafe fn kmain(boot_info: BootInfo) -> ! {
     let phys_offset = huesos_arch::VirtAddr::new(boot_info.hhdm_offset);
     huesos_arch::init_paging(phys_offset);
 
+    // Limine base revision 3 leaves ACPI/reserved regions out of the HHDM.
+    // Map them now so RSDP / XSDT / MADT walks don't #PF.
+    init::map_firmware_tables(boot_info.memory_regions, boot_info.rsdp_addr);
+
     init::heap_init();
     init::object_init();
 

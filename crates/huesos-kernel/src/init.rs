@@ -3,8 +3,49 @@ use huesos_pmm::MemoryRegion;
 const HEAP_SIZE: usize = 128 * 1024 * 1024;
 const HEAP_VIRT_START: u64 = 0xffff_ff00_0000_0000;
 
+/// Limine memmap types that base revision 3 does *not* put into the HHDM,
+/// but that firmware tables (RSDP/XSDT/MADT/…) live in. Matches the Limine
+/// protocol constants; we hardcode the values so huesos-kernel does not
+/// depend on the limine crate.
+const MEMMAP_RESERVED: u64 = 1;
+const MEMMAP_ACPI_RECLAIMABLE: u64 = 2;
+const MEMMAP_ACPI_NVS: u64 = 3;
+/// Some Limine builds also expose this as type 8 (ACPI tables / mapped reserved).
+const MEMMAP_ACPI_TABLES_OR_MAPPED_RESERVED: u64 = 8;
+
 pub unsafe fn pmm_init(regions: &[MemoryRegion], hhdm_offset: u64) {
     unsafe { huesos_pmm::init(regions, hhdm_offset); }
+}
+
+/// Map firmware / ACPI physical ranges into the HHDM so early ACPI walks
+/// (and anything else that does `hhdm + phys`) can touch them.
+///
+/// Also maps a small window around the RSDP address itself, in case the
+/// firmware put it in a region whose type we don't classify above.
+pub fn map_firmware_tables(regions: &[MemoryRegion], rsdp_addr: Option<u64>) {
+    for r in regions {
+        let needs_map = matches!(
+            r.kind,
+            MEMMAP_RESERVED
+                | MEMMAP_ACPI_RECLAIMABLE
+                | MEMMAP_ACPI_NVS
+                | MEMMAP_ACPI_TABLES_OR_MAPPED_RESERVED
+        );
+        if needs_map && r.length > 0 {
+            // Cap per-region mapping so a huge RESERVED hole (e.g. MMIO at
+            // 0xe0000000, 256 MiB) does not burn page-table frames. ACPI
+            // tables are tiny; 4 MiB per region is plenty.
+            let len = core::cmp::min(r.length, 4 * 1024 * 1024);
+            huesos_arch::paging::map_hhdm_range(r.base, len);
+        }
+    }
+
+    if let Some(rsdp) = rsdp_addr {
+        // Always cover the RSDP page (and a couple of neighbours) even if
+        // its memmap type was unexpected.
+        let page = rsdp & !0xfff;
+        huesos_arch::paging::map_hhdm_range(page.saturating_sub(0x1000), 0x3000);
+    }
 }
 
 pub fn heap_init() {

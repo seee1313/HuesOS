@@ -73,6 +73,7 @@ mod tests {
             base: 0,
             length: total_bytes,
             usable: true,
+            kind: 0,
         }];
         unsafe {
             huesos_pmm::init(&regions, hhdm_offset);
