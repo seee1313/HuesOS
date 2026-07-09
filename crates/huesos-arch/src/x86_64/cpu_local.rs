@@ -45,8 +45,11 @@ impl CpuLocal {
     }
 }
 
+static_assertions::const_assert_eq!(core::mem::offset_of!(CpuLocal, user_rsp), 40);
+static_assertions::const_assert_eq!(core::mem::offset_of!(CpuLocal, kernel_rsp), 48);
+
 static mut CPU_LOCALS: [CpuLocal; MAX_CPUS] = [CpuLocal::empty(); MAX_CPUS];
-static mut CPU_LOCAL_NEXT: usize = 0;
+static CPU_LOCAL_NEXT: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 
 /// Allocate and initialize a `CpuLocal` for the current CPU.
 /// Returns a mutable reference valid for `'static`.
@@ -54,8 +57,7 @@ static mut CPU_LOCAL_NEXT: usize = 0;
 /// # Safety
 /// Must be called exactly once per CPU, before `init_gs_base`.
 pub unsafe fn alloc_cpu_local(lapic_id: u32) -> &'static mut CpuLocal {
-    let idx = CPU_LOCAL_NEXT;
-    CPU_LOCAL_NEXT += 1;
+    let idx = CPU_LOCAL_NEXT.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
     assert!(idx < MAX_CPUS, "too many CPUs");
     let ptr = &raw mut CPU_LOCALS[idx];
     unsafe {
