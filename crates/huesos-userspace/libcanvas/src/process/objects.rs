@@ -50,12 +50,8 @@ impl Process {
         ))
     }
 
-    /// Query the process exit code.
-    ///
-    /// Returns `Ok(None)` while the process is still running. A future
-    /// blocking implementation can keep this wrapper and change only the
-    /// kernel side once ports/waits are available.
-    pub fn wait_exit(&self) -> crate::Result<Option<i64>> {
+    /// Block until the process exits and return its exit code.
+    pub fn wait_exit(&self) -> crate::Result<i64> {
         let mut code: i64 = 0;
         let ret = unsafe {
             raw::syscall2(
@@ -64,11 +60,8 @@ impl Process {
                 &mut code as *mut i64 as u64,
             )
         };
-        match raw::decode(ret) {
-            Ok(_) => Ok(Some(code)),
-            Err(crate::ErrorCode::ShouldWait) => Ok(None),
-            Err(e) => Err(e),
-        }
+        raw::decode(ret)?;
+        Ok(code)
     }
 
     /// Borrow the underlying process handle.

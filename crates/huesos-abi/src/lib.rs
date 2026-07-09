@@ -44,7 +44,7 @@ pub enum Syscall {
     ChannelCreate = 7,
     /// Write a message to a channel.
     ChannelWrite = 8,
-    /// Read a message from a channel (non-blocking).
+    /// Read a message from a channel. `arg5 != 0` requests blocking wait.
     ChannelRead = 9,
     /// Exit the current process with a status code. Never returns.
     ProcessExit = 10,
@@ -64,8 +64,8 @@ pub enum Syscall {
     /// created first, memory is mapped into its root VMAR separately, then a
     /// thread is created and started explicitly.
     ProcessCreate = 14,
-    /// Query/wait for a process exit code. Until blocking waits land, the
-    /// implementation is expected to return `ErrorCode::ShouldWait` while
+    /// Wait for a process exit code (blocking). Writes `i64` at `arg2`.
+    /// Legacy note: older kernels returned `ShouldWait` while
     /// the process is still running.
     ProcessWait = 15,
     /// Create a suspended thread object in an existing process.
@@ -80,7 +80,7 @@ pub enum Syscall {
     VmarMap = 18,
     /// Create a Port object, a non-blocking userspace-visible event queue.
     PortCreate = 19,
-    /// Read one packet from a Port object. Returns `ErrorCode::ShouldWait`
+    /// Read one packet from a Port. `arg3 != 0` blocks. Returns `ShouldWait`
     /// if no packet is queued.
     PortRead = 20,
     /// Create an Interrupt object for a kernel IRQ bridge. The first

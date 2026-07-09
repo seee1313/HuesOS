@@ -81,6 +81,7 @@ pub(crate) fn sys_channel_read(
     buf: *mut u8,
     len: u32,
     out_actual: *mut u32,
+    block: bool,
 ) -> SyscallResult {
     if buf.is_null() || out_actual.is_null() {
         return Err(ErrorCode::InvalidArgs);
@@ -94,7 +95,11 @@ pub(crate) fn sys_channel_read(
     let ch = obj
         .downcast_ref::<huesos_object::Channel>()
         .ok_or(ErrorCode::WrongType)?;
-    let msg = ch.recv().ok_or(ErrorCode::ShouldWait)?;
+    let msg = if block {
+        ch.recv_blocking()
+    } else {
+        ch.recv().ok_or(ErrorCode::ShouldWait)?
+    };
     let to_copy = msg.data.len().min(len as usize);
     unsafe {
         core::ptr::copy_nonoverlapping(msg.data.as_ptr(), buf, to_copy);
@@ -104,7 +109,7 @@ pub(crate) fn sys_channel_read(
 }
 
 
-pub(crate) fn sys_channel_read_etc(args_ptr: *const ChannelReadEtcArgs) -> SyscallResult {
+pub(crate) fn sys_channel_read_etc(args_ptr: *const ChannelReadEtcArgs, block: bool) -> SyscallResult {
     if args_ptr.is_null() {
         return Err(ErrorCode::InvalidArgs);
     }
@@ -128,11 +133,21 @@ pub(crate) fn sys_channel_read_etc(args_ptr: *const ChannelReadEtcArgs) -> Sysca
     let ch = obj
         .downcast_ref::<huesos_object::Channel>()
         .ok_or(ErrorCode::WrongType)?;
-    let msg = match ch.recv_if_fits(args.bytes_capacity as usize, args.handles_capacity as usize) {
-        Ok(Some(msg)) => msg,
-        Ok(None) => return Err(ErrorCode::ShouldWait),
-        Err(ChannelRecvError::BytesTooSmall | ChannelRecvError::HandlesTooSmall) => {
-            return Err(ErrorCode::InvalidArgs)
+    let msg = if block {
+        match ch.recv_if_fits_blocking(args.bytes_capacity as usize, args.handles_capacity as usize)
+        {
+            Ok(msg) => msg,
+            Err(ChannelRecvError::BytesTooSmall | ChannelRecvError::HandlesTooSmall) => {
+                return Err(ErrorCode::InvalidArgs)
+            }
+        }
+    } else {
+        match ch.recv_if_fits(args.bytes_capacity as usize, args.handles_capacity as usize) {
+            Ok(Some(msg)) => msg,
+            Ok(None) => return Err(ErrorCode::ShouldWait),
+            Err(ChannelRecvError::BytesTooSmall | ChannelRecvError::HandlesTooSmall) => {
+                return Err(ErrorCode::InvalidArgs)
+            }
         }
     };
 

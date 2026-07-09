@@ -209,3 +209,25 @@ pub(crate) fn sys_process_exit(code: i64) -> SyscallResult {
         huesos_arch::hlt();
     }
 }
+
+
+pub(crate) fn sys_process_wait(handle: HandleValue, out_code: *mut i64) -> SyscallResult {
+    if out_code.is_null() {
+        return Err(ErrorCode::InvalidArgs);
+    }
+    let proc = current_proc()?;
+    let h = proc.handles.get(handle).ok_or(ErrorCode::BadHandle)?;
+    if !h.has_rights(Rights::READ) {
+        return Err(ErrorCode::AccessDenied);
+    }
+    let target = huesos_object::lookup_process(h.koid).ok_or(ErrorCode::WrongType)?;
+    loop {
+        if let Some(code) = target.exit_code() {
+            unsafe {
+                *out_code = code;
+            }
+            return Ok(0);
+        }
+        huesos_object::wait::park_on(&target.exit_waiters);
+    }
+}

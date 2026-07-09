@@ -22,12 +22,22 @@ impl Port {
     /// Read one queued event packet. Non-blocking: returns
     /// `ErrorCode::ShouldWait` if the Port is empty.
     pub fn read(&self) -> crate::Result<PortPacket> {
+        self.read_flags(false)
+    }
+
+    /// Blocking read: park until a packet is queued.
+    pub fn read_blocking(&self) -> crate::Result<PortPacket> {
+        self.read_flags(true)
+    }
+
+    fn read_flags(&self, block: bool) -> crate::Result<PortPacket> {
         let mut packet = PortPacket::default();
         let ret = unsafe {
-            raw::syscall2(
+            raw::syscall3(
                 Syscall::PortRead,
                 self.0.raw() as u64,
                 &mut packet as *mut PortPacket as u64,
+                if block { 1 } else { 0 },
             )
         };
         raw::decode(ret)?;

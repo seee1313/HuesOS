@@ -67,10 +67,16 @@ pub fn dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> Syscal
             a4 as *const HandleValue,
             a5 as u32,
         ),
-        S::ChannelRead => {
-            channel::sys_channel_read(a1 as HandleValue, a2 as *mut u8, a3 as u32, a4 as *mut u32)
+        S::ChannelRead => channel::sys_channel_read(
+            a1 as HandleValue,
+            a2 as *mut u8,
+            a3 as u32,
+            a4 as *mut u32,
+            a5 != 0,
+        ),
+        S::ChannelReadEtc => {
+            channel::sys_channel_read_etc(a1 as *const ChannelReadEtcArgs, a2 != 0)
         }
-        S::ChannelReadEtc => channel::sys_channel_read_etc(a1 as *const ChannelReadEtcArgs),
         S::ProcessExit => process::sys_process_exit(a1 as i64),
         S::DebugWrite => debug::sys_debug_write(a1 as *const u8, a2 as usize),
         S::FramebufferInfo => framebuffer::sys_framebuffer_info(a1 as *mut FramebufferInfo),
@@ -92,13 +98,15 @@ pub fn dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> Syscal
         }
         S::VmarMap => process::sys_vmar_map(a1 as *const VmarMapArgs),
         S::PortCreate => port_interrupt::sys_port_create(a1 as *mut HandleValue),
-        S::PortRead => port_interrupt::sys_port_read(a1 as HandleValue, a2 as *mut PortPacket),
+        S::PortRead => {
+            port_interrupt::sys_port_read(a1 as HandleValue, a2 as *mut PortPacket, a3 != 0)
+        }
         S::InterruptCreate => {
             port_interrupt::sys_interrupt_create(a1 as u32, a2 as *mut HandleValue)
         }
         S::InterruptBindPort => {
             port_interrupt::sys_interrupt_bind_port(a1 as HandleValue, a2 as HandleValue, a3)
         }
-        S::ProcessWait => Err(ErrorCode::NotSupported),
+        S::ProcessWait => process::sys_process_wait(a1 as HandleValue, a2 as *mut i64),
     }
 }

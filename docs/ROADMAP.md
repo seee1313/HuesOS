@@ -23,6 +23,12 @@ priority order.
 - FAT BPB field widths + FAT16 EOC thresholds
 - Buddy allocator stores and uses `page_size`
 
+### Blocking waits + reaper (feature/wait-reaper-stability)
+- Wait queues + `park`/`wake` hooks from the scheduler
+- Blocking `ChannelRead` / `PortRead` (flag arg) and blocking `ProcessWait`
+- Handle transfer-on-write already landed earlier; documented
+- `Vmo` Drop frees physical frames; exit path frees kernel stacks via reaper
+
 ## Immediate
 
 ### 1. IOAPIC interrupt routing
@@ -30,22 +36,17 @@ priority order.
 - **Needed**: full IOAPIC programming, IRQ remapping for multi-core IRQs,
   drop reliance on 8259 for anything that can go through IOAPIC.
 
-### 2. Process/task teardown
-- **Current**: `ProcessExit` marks a task "finished" so the scheduler skips
-  it, but its kernel stack, user address space (PML4 + all mapped frames),
-  and handle table are never freed.
+### 2. Process/task teardown (partial)
+- **Current**: kernel stacks reaped; VMO frames freed on last Arc drop.
+  Page tables / handle tables still not fully walked on exit.
 - **Needed**: a "zombie" list + reaper task (or reference-counted teardown
   triggered once nothing can reference the task anymore) that frees the
   process's `AddressSpace` (walking all 4 page table levels and returning
   frames to `huesos-pmm`) and the task's kernel stack.
 
-### 3. Blocking syscalls / wait primitives
-- **Current**: `ChannelRead` and `PortRead` return `ShouldWait`
-  immediately if empty; keyboard IRQ1 can already queue non-blocking
-  interrupt packets to a userspace Port.
-- **Needed**: real blocking (park the task, wake it from the IRQ/syscall
-  path that delivers the awaited event) plus Port-based multiplexed waits
-  instead of polling/yield loops.
+### 3. Blocking syscalls / wait primitives (partial)
+- **Current**: Channel/Port can block via flag; ProcessWait blocks on exit.
+- **Needed**: multiplexed multi-object wait, timeouts, interruptible cancels.
 
 ## Short Term
 
