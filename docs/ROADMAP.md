@@ -23,6 +23,16 @@ priority order.
 - FAT BPB field widths + FAT16 EOC thresholds
 - Buddy allocator stores and uses `page_size`
 
+### Blocking waits + reaper (feature/wait-reaper-stability)
+- Wait queues + `park`/`wake` hooks from the scheduler
+- Blocking `ChannelRead` / `PortRead` (flag arg) and blocking `ProcessWait`
+- Handle transfer-on-write already landed earlier; documented
+- `Vmo` Drop frees physical frames; exit path frees kernel stacks via reaper
+- `AddressSpace::destroy` frees owned user frames + private page tables
+- Process teardown clears handle table; driver-host input uses blocking Port
+- Global handle-count GC: last close unregisters object (Vmo Drop, etc.)
+- Timed waits: `ChannelRead`/`PortRead` mode `>=2` = timeout in ticks + `TimedOut`
+
 ## Immediate
 
 ### 1. IOAPIC interrupt routing
@@ -30,22 +40,18 @@ priority order.
 - **Needed**: full IOAPIC programming, IRQ remapping for multi-core IRQs,
   drop reliance on 8259 for anything that can go through IOAPIC.
 
-### 2. Process/task teardown
-- **Current**: `ProcessExit` marks a task "finished" so the scheduler skips
-  it, but its kernel stack, user address space (PML4 + all mapped frames),
-  and handle table are never freed.
+### 2. Process/task teardown (mostly done)
+- **Current**: stacks reaped; VMO frames on Drop; AS destroy; handle clear;
+  last-handle unregisters from global registry. Residual: objects held only
+  by kernel internals without a handle path.
 - **Needed**: a "zombie" list + reaper task (or reference-counted teardown
   triggered once nothing can reference the task anymore) that frees the
   process's `AddressSpace` (walking all 4 page table levels and returning
   frames to `huesos-pmm`) and the task's kernel stack.
 
-### 3. Blocking syscalls / wait primitives
-- **Current**: `ChannelRead` and `PortRead` return `ShouldWait`
-  immediately if empty; keyboard IRQ1 can already queue non-blocking
-  interrupt packets to a userspace Port.
-- **Needed**: real blocking (park the task, wake it from the IRQ/syscall
-  path that delivers the awaited event) plus Port-based multiplexed waits
-  instead of polling/yield loops.
+### 3. Blocking syscalls / wait primitives (mostly done)
+- **Current**: Channel/Port block + tick timeouts (`TimedOut`); ProcessWait.
+- **Needed**: multiplexed multi-object wait / cancel.
 
 ## Short Term
 

@@ -9,6 +9,9 @@ use crate::{Interrupt, Job, KernelObject, Koid, Process};
 
 /// Global object registry (koid -> Arc<dyn KernelObject>).
 static OBJECT_REGISTRY: Mutex<BTreeMap<Koid, Arc<dyn KernelObject>>> = Mutex::new(BTreeMap::new());
+/// Number of live process handles referring to each koid. When this hits
+/// zero, the registry Arc is dropped so object Drop (e.g. Vmo frames) runs.
+static HANDLE_COUNTS: Mutex<BTreeMap<Koid, u32>> = Mutex::new(BTreeMap::new());
 /// Typed process registry for kernel subsystems that must hold an owning
 /// `Arc<Process>` rather than a type-erased object reference.
 static PROCESS_REGISTRY: Mutex<BTreeMap<Koid, Arc<Process>>> = Mutex::new(BTreeMap::new());
@@ -18,9 +21,40 @@ static PROCESS_REGISTRY: Mutex<BTreeMap<Koid, Arc<Process>>> = Mutex::new(BTreeM
 /// keyboard consumer), so each IRQ maps to a fanout list.
 static INTERRUPT_REGISTRY: Mutex<BTreeMap<u8, Vec<Arc<Interrupt>>>> = Mutex::new(BTreeMap::new());
 
-/// Register a kernel object globally.
+/// Register a kernel object globally. Handle count starts at 0; the first
+/// [`note_handle_open`] (from `HandleTable::add`) makes it reachable.
 pub fn register_object(obj: Arc<dyn KernelObject>) {
-    OBJECT_REGISTRY.lock().insert(obj.koid(), obj);
+    let koid = obj.koid();
+    OBJECT_REGISTRY.lock().insert(koid, obj);
+    HANDLE_COUNTS.lock().entry(koid).or_insert(0);
+}
+
+/// A process handle table now references `koid`.
+pub fn note_handle_open(koid: Koid) {
+    if !koid.is_valid() {
+        return;
+    }
+    let mut counts = HANDLE_COUNTS.lock();
+    *counts.entry(koid).or_insert(0) += 1;
+}
+
+/// A process handle table no longer references `koid`. If the count reaches
+/// zero, remove the object from the global registry (running Drop).
+pub fn note_handle_close(koid: Koid) {
+    if !koid.is_valid() {
+        return;
+    }
+    let mut counts = HANDLE_COUNTS.lock();
+    let entry = counts.entry(koid).or_insert(0);
+    if *entry > 0 {
+        *entry -= 1;
+    }
+    if *entry == 0 {
+        counts.remove(&koid);
+        drop(counts);
+        // Last handle: drop registry Arc.
+        unregister_object(koid);
+    }
 }
 
 /// Register a process in both the type-erased object registry and the typed

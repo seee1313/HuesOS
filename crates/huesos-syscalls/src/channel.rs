@@ -67,7 +67,8 @@ pub(crate) fn sys_channel_write(
         transferred.push(inner_h);
     }
     for hv in raw_handles {
-        let _ = proc.handles.remove(hv);
+        // Keep handle-count alive while the capability is in-flight in the message.
+        let _ = proc.handles.remove_keep_alive(hv);
     }
     ch.send(huesos_object::ChannelMessage {
         data,
@@ -81,6 +82,7 @@ pub(crate) fn sys_channel_read(
     buf: *mut u8,
     len: u32,
     out_actual: *mut u32,
+    wait_mode: u64,
 ) -> SyscallResult {
     if buf.is_null() || out_actual.is_null() {
         return Err(ErrorCode::InvalidArgs);
@@ -94,7 +96,14 @@ pub(crate) fn sys_channel_read(
     let ch = obj
         .downcast_ref::<huesos_object::Channel>()
         .ok_or(ErrorCode::WrongType)?;
-    let msg = ch.recv().ok_or(ErrorCode::ShouldWait)?;
+    // 0 = nonblock, 1 = forever, >=2 = timeout in scheduler ticks
+    let msg = match wait_mode {
+        0 => ch.recv().ok_or(ErrorCode::ShouldWait)?,
+        1 => ch.recv_blocking(),
+        ticks => ch
+            .recv_blocking_timeout(ticks)
+            .ok_or(ErrorCode::TimedOut)?,
+    };
     let to_copy = msg.data.len().min(len as usize);
     unsafe {
         core::ptr::copy_nonoverlapping(msg.data.as_ptr(), buf, to_copy);
@@ -104,7 +113,7 @@ pub(crate) fn sys_channel_read(
 }
 
 
-pub(crate) fn sys_channel_read_etc(args_ptr: *const ChannelReadEtcArgs) -> SyscallResult {
+pub(crate) fn sys_channel_read_etc(args_ptr: *const ChannelReadEtcArgs, wait_mode: u64) -> SyscallResult {
     if args_ptr.is_null() {
         return Err(ErrorCode::InvalidArgs);
     }
@@ -128,11 +137,22 @@ pub(crate) fn sys_channel_read_etc(args_ptr: *const ChannelReadEtcArgs) -> Sysca
     let ch = obj
         .downcast_ref::<huesos_object::Channel>()
         .ok_or(ErrorCode::WrongType)?;
-    let msg = match ch.recv_if_fits(args.bytes_capacity as usize, args.handles_capacity as usize) {
-        Ok(Some(msg)) => msg,
-        Ok(None) => return Err(ErrorCode::ShouldWait),
-        Err(ChannelRecvError::BytesTooSmall | ChannelRecvError::HandlesTooSmall) => {
-            return Err(ErrorCode::InvalidArgs)
+    let mut msg = if wait_mode == 0 {
+        match ch.recv_if_fits(args.bytes_capacity as usize, args.handles_capacity as usize) {
+            Ok(Some(msg)) => msg,
+            Ok(None) => return Err(ErrorCode::ShouldWait),
+            Err(ChannelRecvError::BytesTooSmall | ChannelRecvError::HandlesTooSmall) => {
+                return Err(ErrorCode::InvalidArgs)
+            }
+        }
+    } else {
+        // Blocking (timeout ignored for read_etc MVP — use ChannelRead for timed waits).
+        match ch.recv_if_fits_blocking(args.bytes_capacity as usize, args.handles_capacity as usize)
+        {
+            Ok(msg) => msg,
+            Err(ChannelRecvError::BytesTooSmall | ChannelRecvError::HandlesTooSmall) => {
+                return Err(ErrorCode::InvalidArgs)
+            }
         }
     };
 
@@ -143,14 +163,17 @@ pub(crate) fn sys_channel_read_etc(args_ptr: *const ChannelReadEtcArgs) -> Sysca
         *args.out_bytes = msg.data.len() as u32;
     }
 
-    for (i, handle) in msg.handles.iter().copied().enumerate() {
-        let hv = proc.handles.add(handle);
+    let n_handles = msg.handles.len();
+    // Take handles so ChannelMessage::Drop does not release their counts.
+    let transferred = core::mem::take(&mut msg.handles);
+    for (i, handle) in transferred.into_iter().enumerate() {
+        let hv = proc.handles.add_existing(handle);
         unsafe {
             *args.handles.add(i) = hv;
         }
     }
     unsafe {
-        *args.out_handles = msg.handles.len() as u32;
+        *args.out_handles = n_handles as u32;
     }
     Ok(0)
 }

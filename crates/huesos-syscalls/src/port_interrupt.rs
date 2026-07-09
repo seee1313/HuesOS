@@ -20,7 +20,11 @@ pub(crate) fn sys_port_create(out: *mut HandleValue) -> SyscallResult {
     Ok(0)
 }
 
-pub(crate) fn sys_port_read(port_handle: HandleValue, out: *mut PortPacket) -> SyscallResult {
+pub(crate) fn sys_port_read(
+    port_handle: HandleValue,
+    out: *mut PortPacket,
+    wait_mode: u64,
+) -> SyscallResult {
     if out.is_null() {
         return Err(ErrorCode::InvalidArgs);
     }
@@ -33,7 +37,14 @@ pub(crate) fn sys_port_read(port_handle: HandleValue, out: *mut PortPacket) -> S
     let port = obj
         .downcast_ref::<huesos_object::Port>()
         .ok_or(ErrorCode::WrongType)?;
-    let packet = port.read().ok_or(ErrorCode::ShouldWait)?;
+    // 0 = nonblock, 1 = forever, >=2 = timeout ticks
+    let packet = match wait_mode {
+        0 => port.read().ok_or(ErrorCode::ShouldWait)?,
+        1 => port.read_blocking(),
+        ticks => port
+            .read_blocking_timeout(ticks)
+            .ok_or(ErrorCode::TimedOut)?,
+    };
     unsafe {
         *out = PortPacket {
             key: packet.key,

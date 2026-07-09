@@ -13,7 +13,6 @@ use libcanvas::{println, ErrorCode, Interrupt, Port, PORT_PACKET_INTERRUPT};
 
 const KEY_KEYBOARD: u64 = 1;
 const ATTACH_KEYBOARD_CLIENT: &[u8] = b"keyboard-client";
-const HEARTBEAT_EVERY_IDLE_POLLS: u32 = 1024;
 const HEARTBEAT_EVERY_SCANCODES: u64 = 32;
 
 #[unsafe(no_mangle)]
@@ -49,14 +48,18 @@ fn setup_keyboard_irq_bridge() -> libcanvas::Result<Port> {
 }
 
 fn run_driver_loop(port: Port, bootstrap: libcanvas::Channel) -> ! {
-    let mut idle_polls = 0u32;
     let mut keyboard_client: Option<libcanvas::Channel> = None;
     let mut decoder = KeyboardDecoder::new();
+    let mut ticks = 0u64;
     loop {
+        // Non-blocking bootstrap poll (attach client messages).
         poll_bootstrap(&bootstrap, &mut keyboard_client);
-        match port.read() {
-            Ok(packet) if packet.packet_type == PORT_PACKET_INTERRUPT && packet.key == KEY_KEYBOARD => {
-                idle_polls = 0;
+
+        // Block until the next keyboard IRQ packet — no yield-spin.
+        match port.read_blocking() {
+            Ok(packet)
+                if packet.packet_type == PORT_PACKET_INTERRUPT && packet.key == KEY_KEYBOARD =>
+            {
                 let irq = packet.data[0];
                 let scancode = packet.data[1] as u8;
                 let count = packet.data[2];
@@ -67,19 +70,12 @@ fn run_driver_loop(port: Port, bootstrap: libcanvas::Channel) -> ! {
                 if let Some(event) = decoder.feed(scancode) {
                     send_keyboard_event(&keyboard_client, event);
                 }
-                if count % HEARTBEAT_EVERY_SCANCODES == 0 {
+                ticks = ticks.wrapping_add(1);
+                if count % HEARTBEAT_EVERY_SCANCODES == 0 || ticks % 64 == 0 {
                     let _ = bootstrap.write(b"heartbeat:input");
                 }
             }
             Ok(_) => {}
-            Err(ErrorCode::ShouldWait) => {
-                idle_polls = idle_polls.wrapping_add(1);
-                if idle_polls >= HEARTBEAT_EVERY_IDLE_POLLS {
-                    idle_polls = 0;
-                    let _ = bootstrap.write(b"heartbeat:input");
-                }
-                libcanvas::process::yield_now();
-            }
             Err(e) => {
                 println!("[driver-host:input] port read failed: {}", e.as_str());
                 let _ = bootstrap.write(b"driver-host:input:error");
