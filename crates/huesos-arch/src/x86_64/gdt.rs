@@ -83,11 +83,15 @@ pub fn selectors() -> &'static Selectors {
 /// Update RSP0 in the TSS. Called by the scheduler when switching tasks so
 /// that the next ring3->ring0 transition lands on the correct kernel stack.
 pub fn set_kernel_stack(stack_top: VirtAddr) {
-    // Safety: TSS is a `Lazy` — we get away with interior mutability via a
-    // raw pointer since only one CPU touches it in this single-core MVP.
-    let tss_ptr = &*TSS as *const TaskStateSegment as *mut TaskStateSegment;
     unsafe {
-        (*tss_ptr).privilege_stack_table[0] = stack_top;
+        let cpu_local_ptr = crate::cpu_local::cpu_local_ptr();
+        if !cpu_local_ptr.is_null() && !(*cpu_local_ptr).gdt.is_null() {
+            let per_cpu_gdt = &mut *((*cpu_local_ptr).gdt as *mut PerCpuGdt);
+            per_cpu_gdt.set_kernel_stack(stack_top);
+        } else {
+            let tss_ptr = &*TSS as *const TaskStateSegment as *mut TaskStateSegment;
+            (*tss_ptr).privilege_stack_table[0] = stack_top;
+        }
     }
 }
 
@@ -151,13 +155,14 @@ impl PerCpuGdt {
 
 /// Load GDT and update segment registers.
 pub fn init() {
-    GDT.0.load();
-    let sel = selectors();
+    let gdt = PerCpuGdt::new();
+    let gdt_static = alloc::boxed::Box::leak(alloc::boxed::Box::new(gdt));
+    gdt_static.load();
+    
     unsafe {
-        CS::set_reg(sel.kernel_code);
-        DS::set_reg(sel.kernel_data);
-        ES::set_reg(sel.kernel_data);
-        SS::set_reg(sel.kernel_data);
-        load_tss(sel.tss);
+        let ptr = crate::cpu_local::cpu_local_ptr();
+        if !ptr.is_null() {
+            (*ptr).gdt = gdt_static as *mut PerCpuGdt as *mut ();
+        }
     }
 }
