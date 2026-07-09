@@ -14,14 +14,20 @@ pub const MAX_CPUS: usize = 64;
 pub struct CpuLocal {
     /// Self-pointer at offset 0 — allows `mov %gs:0, %rax` to recover the struct.
     pub self_ptr: *mut CpuLocal,
-    /// LAPIC ID of this CPU.
+    /// LAPIC ID of this CPU (offset 8).
     pub lapic_id: u32,
-    /// Current task ID (updated by scheduler on context switch).
+    /// Padding to align current_task_id to 16-byte boundary (offset 12).
+    pub _padding: u32,
+    /// Current task ID (updated by scheduler on context switch, offset 16).
     pub current_task_id: u64,
-    /// Pointer to this CPU's scheduler (kernel-managed).
+    /// Pointer to this CPU's scheduler (kernel-managed, offset 24).
     pub scheduler: *mut (),
-    /// Pointer to this CPU's GDT/TSS bundle.
+    /// Pointer to this CPU's GDT/TSS bundle (offset 32).
     pub gdt: *mut (),
+    /// Scratch space for user RSP during syscall (offset 40).
+    pub user_rsp: u64,
+    /// Kernel RSP for syscall handling (offset 48).
+    pub kernel_rsp: u64,
 }
 
 impl CpuLocal {
@@ -29,9 +35,12 @@ impl CpuLocal {
         Self {
             self_ptr: core::ptr::null_mut(),
             lapic_id: 0,
+            _padding: 0,
             current_task_id: 0,
             scheduler: core::ptr::null_mut(),
             gdt: core::ptr::null_mut(),
+            user_rsp: 0,
+            kernel_rsp: 0,
         }
     }
 }
