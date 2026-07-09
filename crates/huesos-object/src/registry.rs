@@ -38,8 +38,13 @@ pub fn note_handle_open(koid: Koid) {
     *counts.entry(koid).or_insert(0) += 1;
 }
 
-/// A process handle table no longer references `koid`. If the count reaches
-/// zero, remove the object from the global registry (running Drop).
+/// A process handle table no longer references `koid`.
+///
+/// Counts are tracked for diagnostics and future GC, but we intentionally
+/// **do not** auto-unregister at zero: channel transfers, in-flight messages,
+/// and kernel-held Arcs (scheduler tasks, process registry) make "zero table
+/// handles" an unreliable signal. Explicit teardown paths call
+/// [`unregister_object`] when it is actually safe.
 pub fn note_handle_close(koid: Koid) {
     if !koid.is_valid() {
         return;
@@ -51,9 +56,6 @@ pub fn note_handle_close(koid: Koid) {
     }
     if *entry == 0 {
         counts.remove(&koid);
-        drop(counts);
-        // Last handle: drop registry Arc.
-        unregister_object(koid);
     }
 }
 

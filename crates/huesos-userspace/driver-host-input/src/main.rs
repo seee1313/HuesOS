@@ -50,16 +50,18 @@ fn setup_keyboard_irq_bridge() -> libcanvas::Result<Port> {
 fn run_driver_loop(port: Port, bootstrap: libcanvas::Channel) -> ! {
     let mut keyboard_client: Option<libcanvas::Channel> = None;
     let mut decoder = KeyboardDecoder::new();
-    let mut ticks = 0u64;
+    let mut idle = 0u32;
     loop {
-        // Non-blocking bootstrap poll (attach client messages).
+        // Always service bootstrap first so attach/ready paths stay live.
         poll_bootstrap(&bootstrap, &mut keyboard_client);
 
-        // Block until the next keyboard IRQ packet — no yield-spin.
-        match port.read_blocking() {
+        // Non-blocking port read. Full park/block is still too sharp under
+        // SMP+TCG for the only IRQ consumer during bring-up.
+        match port.read() {
             Ok(packet)
                 if packet.packet_type == PORT_PACKET_INTERRUPT && packet.key == KEY_KEYBOARD =>
             {
+                idle = 0;
                 let irq = packet.data[0];
                 let scancode = packet.data[1] as u8;
                 let count = packet.data[2];
@@ -70,12 +72,19 @@ fn run_driver_loop(port: Port, bootstrap: libcanvas::Channel) -> ! {
                 if let Some(event) = decoder.feed(scancode) {
                     send_keyboard_event(&keyboard_client, event);
                 }
-                ticks = ticks.wrapping_add(1);
-                if count % HEARTBEAT_EVERY_SCANCODES == 0 || ticks % 64 == 0 {
+                if count % HEARTBEAT_EVERY_SCANCODES == 0 {
                     let _ = bootstrap.write(b"heartbeat:input");
                 }
             }
             Ok(_) => {}
+            Err(ErrorCode::ShouldWait) | Err(ErrorCode::TimedOut) => {
+                idle = idle.wrapping_add(1);
+                if idle >= 1024 {
+                    idle = 0;
+                    let _ = bootstrap.write(b"heartbeat:input");
+                }
+                libcanvas::process::yield_now();
+            }
             Err(e) => {
                 println!("[driver-host:input] port read failed: {}", e.as_str());
                 let _ = bootstrap.write(b"driver-host:input:error");

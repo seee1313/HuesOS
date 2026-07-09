@@ -148,7 +148,7 @@ fn read_ready_message(logger: &mut InitLogger, name: &str, channel: &Channel) {
     // Cooperative poll with a high attempt budget. Under SMP the service may
     // be scheduled much later; avoid timed-park here (timeout arming is still
     // young) so a stuck waiter cannot freeze init.
-    for _ in 0..20_000 {
+    for _ in 0..8_000 {
         match channel.read_into(&mut buf) {
             Ok(n) => {
                 let msg = core::str::from_utf8(&buf[..n]).unwrap_or("<non-utf8>");
