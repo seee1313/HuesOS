@@ -3,6 +3,7 @@
 //! syscalls (TSS.RSP0) when hopping between kernel and userspace tasks.
 //!
 //! SMP-aware: each CPU has its own scheduler instance accessed via LAPIC ID.
+//! Protected by spinlocks to prevent cross-core race conditions.
 //!
 //! Advanced Scheduling Modes:
 //! 1. Fair Scheduling (Default out of the box):
@@ -20,13 +21,15 @@ pub mod wavl;
 use crate::task::{Task, TaskKind};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::cell::UnsafeCell;
 use core::sync::atomic::Ordering;
 use huesos_object::Process;
 use x86_64::VirtAddr;
 
 /// Maximum number of CPUs supported.
 pub const MAX_CPUS: usize = 64;
+
+/// Saved CPU context for a task.
+pub type SchedContext = huesos_arch::context_switch::Context;
 
 /// Scheduling policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -51,14 +54,8 @@ pub enum SchedPolicy {
     },
 }
 
-/// Wrapper needed because `UnsafeCell<T>` is never `Sync` regardless of
-/// `T`; we provide the `Sync` impl ourselves since all accesses to the
-/// inner `Scheduler` happen with interrupts disabled.
-struct SchedulerCell(UnsafeCell<Scheduler>);
-unsafe impl Sync for SchedulerCell {}
-
-static PER_CPU_SCHEDULERS: [SchedulerCell; MAX_CPUS] =
-    [const { SchedulerCell(UnsafeCell::new(Scheduler::new())) }; MAX_CPUS];
+static PER_CPU_SCHEDULERS: [spin::Mutex<Scheduler>; MAX_CPUS] =
+    [const { spin::Mutex::new(Scheduler::new()) }; MAX_CPUS];
 
 struct Scheduler {
     tasks: Vec<Task>,
@@ -102,7 +99,7 @@ impl Scheduler {
         }
     }
 
-    fn tick(&mut self) {
+    fn tick(&mut self) -> Option<(*mut SchedContext, *const SchedContext)> {
         self.ticks += 1;
 
         // 1. Release Deadline tasks whose period has ended
@@ -179,25 +176,16 @@ impl Scheduler {
         let old_index = self.current;
         if next_idx == old_index {
             // Keep running the same task
-            return;
+            return None;
         }
 
         self.current = next_idx;
         self.apply_task_environment(self.current);
 
-        let (old_ptr, new_ptr): (*mut Task, *const Task) = {
-            let old = &mut self.tasks[old_index] as *mut Task;
-            let new = &self.tasks[self.current] as *const Task;
-            (old, new)
-        };
+        let old_ptr = &raw mut self.tasks[old_index].context;
+        let new_ptr = &raw const self.tasks[self.current].context;
 
-        // Safety: interrupts are disabled; pointers point to active Vec
-        unsafe {
-            huesos_arch::context_switch::context_switch(
-                &mut (*old_ptr).context,
-                &(*new_ptr).context,
-            );
-        }
+        Some((old_ptr, new_ptr))
     }
 
     fn current_task(&self) -> Option<&Task> {
@@ -210,14 +198,6 @@ fn cpu_id() -> usize {
     (unsafe { huesos_arch::cpu_local::current_lapic_id() } as usize).min(MAX_CPUS - 1)
 }
 
-/// Get a mutable reference to the current CPU's scheduler.
-///
-/// # Safety
-/// Interrupts must be disabled by the caller.
-unsafe fn current_scheduler() -> &'static mut Scheduler {
-    &mut *PER_CPU_SCHEDULERS[cpu_id()].0.get()
-}
-
 /// Register the current CPU's scheduler pointer in its `CpuLocal`.
 ///
 /// # Safety
@@ -227,41 +207,55 @@ unsafe fn register_scheduler_ptr(sched: *mut Scheduler) {
     unsafe { (*ptr).scheduler = sched as *mut () };
 }
 
-/// RAII-ish helper: disable interrupts, run `f` with exclusive scheduler
-/// access, re-enable interrupts.
-fn with_scheduler<R>(f: impl FnOnce(&mut Scheduler) -> R) -> R {
-    huesos_arch::interrupts::disable();
-    let sched = unsafe { current_scheduler() };
-    let r = f(sched);
-    huesos_arch::interrupts::enable();
-    r
-}
-
 /// Initialize the scheduler for the current CPU and register the timer callback.
 /// Called once per CPU.
 pub fn init() {
-    let sched = unsafe { current_scheduler() };
-    unsafe { register_scheduler_ptr(sched) };
-    sched.add_task(Task::new_idle(
+    let cpu = cpu_id();
+    let mut guard = PER_CPU_SCHEDULERS[cpu].lock();
+    unsafe { register_scheduler_ptr(&mut *guard) };
+    guard.add_task(Task::new_idle(
         0,
         *b"idle\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0",
     ));
+    drop(guard);
 
     huesos_arch::timer_callback::set_timer_callback(&|| {
-        let sched = unsafe { current_scheduler() };
-        sched.tick();
+        huesos_arch::interrupts::disable();
+        let cpu = cpu_id();
+        let mut guard = PER_CPU_SCHEDULERS[cpu].lock();
+        let switch_context = guard.tick();
+        drop(guard); // Release the lock before performing context switch!
+
+        if let Some((old_ptr, new_ptr)) = switch_context {
+            // Safety: interrupts are disabled; pointers point to active Vec
+            unsafe {
+                huesos_arch::context_switch::context_switch(old_ptr, new_ptr);
+            }
+        }
+        huesos_arch::interrupts::enable();
     });
 }
 
 /// Yield the current task (cooperative).
 pub fn yield_now() {
-    with_scheduler(|s| s.tick());
+    huesos_arch::interrupts::disable();
+    let cpu = cpu_id();
+    let mut guard = PER_CPU_SCHEDULERS[cpu].lock();
+    let switch_context = guard.tick();
+    drop(guard); // Release the lock before performing context switch!
+
+    if let Some((old_ptr, new_ptr)) = switch_context {
+        unsafe {
+            huesos_arch::context_switch::context_switch(old_ptr, new_ptr);
+        }
+    }
+    huesos_arch::interrupts::enable();
 }
 
 /// Get current task id for debugging.
 pub fn current_task_id() -> Option<u64> {
-    let sched = unsafe { &*PER_CPU_SCHEDULERS[cpu_id()].0.get() };
-    sched.current_task().map(|t| t.id)
+    let guard = PER_CPU_SCHEDULERS[cpu_id()].lock();
+    guard.current_task().map(|t| t.id)
 }
 
 /// Find the best CPU to spawn a task on (online CPU with fewest tasks).
@@ -270,8 +264,8 @@ fn find_best_cpu() -> usize {
     let mut min_tasks = usize::MAX;
 
     for i in 0..MAX_CPUS {
-        let sched = unsafe { &*PER_CPU_SCHEDULERS[i].0.get() };
-        let count = sched.tasks.len();
+        let guard = PER_CPU_SCHEDULERS[i].lock();
+        let count = guard.tasks.len();
         if count >= 1 && count < min_tasks {
             min_tasks = count;
             best_cpu = i;
@@ -286,19 +280,25 @@ pub fn set_sched_policy(task_id: u64, policy: SchedPolicy) {
     let cpu = (task_id >> 32) as usize;
     let idx = (task_id & 0xFFFFFFFF) as usize;
     if cpu < MAX_CPUS {
-        let sched = unsafe { &mut *PER_CPU_SCHEDULERS[cpu].0.get() };
-        if let Some(task) = sched.tasks.get_mut(idx) {
-            // Remove from fair queue if it was there
-            if let SchedPolicy::Fair { vruntime, .. } = task.sched_policy {
-                sched.fair_queue.remove(vruntime, task_id);
+        let mut guard = PER_CPU_SCHEDULERS[cpu].lock();
+        
+        let mut old_policy = None;
+        if let Some(task) = guard.tasks.get(idx) {
+            old_policy = Some(task.sched_policy);
+        }
+        
+        if let Some(old_policy_val) = old_policy {
+            if let SchedPolicy::Fair { vruntime, .. } = old_policy_val {
+                guard.fair_queue.remove(vruntime, task_id);
             }
+        }
 
+        if let Some(task) = guard.tasks.get_mut(idx) {
             task.sched_policy = policy;
+        }
 
-            // Re-insert into fair queue if the new policy is Fair
-            if let SchedPolicy::Fair { vruntime, .. } = policy {
-                sched.fair_queue.insert(vruntime, task_id);
-            }
+        if let SchedPolicy::Fair { vruntime, .. } = policy {
+            guard.fair_queue.insert(vruntime, task_id);
         }
     }
     huesos_arch::interrupts::enable();
@@ -308,10 +308,11 @@ pub fn set_sched_policy(task_id: u64, policy: SchedPolicy) {
 pub fn spawn_kernel_thread(name: &[u8; 32], entry: extern "C" fn() -> !) -> u64 {
     huesos_arch::interrupts::disable();
     let cpu = find_best_cpu();
-    let sched = unsafe { &mut *PER_CPU_SCHEDULERS[cpu].0.get() };
-    let id = ((cpu as u64) << 32) | (sched.tasks.len() as u64);
+    let mut guard = PER_CPU_SCHEDULERS[cpu].lock();
+    let id = ((cpu as u64) << 32) | (guard.tasks.len() as u64);
     let task = Task::new_kernel(id, *name, entry);
-    sched.add_task(task);
+    guard.add_task(task);
+    drop(guard);
     huesos_arch::interrupts::enable();
 
     if cpu != cpu_id() {
@@ -331,8 +332,8 @@ pub fn spawn_user_thread(
 ) -> u64 {
     huesos_arch::interrupts::disable();
     let cpu = find_best_cpu();
-    let sched = unsafe { &mut *PER_CPU_SCHEDULERS[cpu].0.get() };
-    let id = ((cpu as u64) << 32) | (sched.tasks.len() as u64);
+    let mut guard = PER_CPU_SCHEDULERS[cpu].lock();
+    let id = ((cpu as u64) << 32) | (guard.tasks.len() as u64);
     crate::process::queue_user_entry(id, entry_point, user_rsp);
     let task = Task::new_user(
         id,
@@ -341,7 +342,8 @@ pub fn spawn_user_thread(
         crate::process::user_entry_trampoline,
         cr3,
     );
-    sched.add_task(task);
+    guard.add_task(task);
+    drop(guard);
     huesos_arch::interrupts::enable();
 
     if cpu != cpu_id() {
@@ -354,12 +356,24 @@ pub fn spawn_user_thread(
 /// and switch away from it. Never returns.
 pub fn exit_current_task(_code: i64) -> ! {
     huesos_arch::interrupts::disable();
-    let sched = unsafe { current_scheduler() };
-    if let Some(task) = sched.tasks.get(sched.current) {
-        task.finished.store(true, Ordering::Relaxed);
+    let cpu = cpu_id();
+    {
+        let mut guard = PER_CPU_SCHEDULERS[cpu].lock();
+        let current_idx = guard.current;
+        if let Some(task) = guard.tasks.get_mut(current_idx) {
+            task.finished.store(true, Ordering::Relaxed);
+        }
     }
     loop {
-        sched.tick();
+        let mut guard = PER_CPU_SCHEDULERS[cpu].lock();
+        let switch_context = guard.tick();
+        drop(guard); // Release the lock before performing context switch!
+
+        if let Some((old_ptr, new_ptr)) = switch_context {
+            unsafe {
+                huesos_arch::context_switch::context_switch(old_ptr, new_ptr);
+            }
+        }
         huesos_arch::interrupts::enable();
         huesos_arch::hlt();
         huesos_arch::interrupts::disable();
