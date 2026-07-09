@@ -21,6 +21,7 @@ mod registry;
 mod thread;
 mod vmar;
 mod vmo;
+pub mod wait;
 
 pub use channel::{Channel, ChannelMessage, ChannelRecvError};
 pub use handle::{Handle, HandleTable, HandleValue, Rights, INVALID_HANDLE};
@@ -39,6 +40,7 @@ pub use registry::{
 pub use thread::Thread;
 pub use vmar::{Vmar, VmarChild, VmarMapping};
 pub use vmo::Vmo;
+pub use wait::{set_scheduler_hooks, TaskId, WaitQueue};
 
 /// Initialize root job and kernel objects. Does not set up the
 /// phys-to-virt translator; call [`set_phys_to_virt`] separately once
