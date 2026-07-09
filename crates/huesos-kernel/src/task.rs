@@ -40,6 +40,8 @@ pub struct Task {
     pub kind: TaskKind,
     /// Set once the task has exited; the scheduler skips finished tasks.
     pub finished: core::sync::atomic::AtomicBool,
+    /// Set while the task is parked on a wait queue (blocking syscall).
+    pub blocked: core::sync::atomic::AtomicBool,
     /// Scheduling policy.
     pub sched_policy: crate::scheduler::SchedPolicy,
 }
@@ -63,6 +65,7 @@ impl Task {
             kernel_stack: Vec::new(),
             kind: TaskKind::Kernel,
             finished: core::sync::atomic::AtomicBool::new(false),
+            blocked: core::sync::atomic::AtomicBool::new(false),
             sched_policy: crate::scheduler::SchedPolicy::Fair { weight: 1024, vruntime: 0 },
         }
     }
@@ -86,6 +89,7 @@ impl Task {
             kernel_stack: stack,
             kind: TaskKind::Kernel,
             finished: core::sync::atomic::AtomicBool::new(false),
+            blocked: core::sync::atomic::AtomicBool::new(false),
             sched_policy: crate::scheduler::SchedPolicy::Fair { weight: 1024, vruntime: 0 },
         }
     }
@@ -117,6 +121,7 @@ impl Task {
             kernel_stack: stack,
             kind: TaskKind::User { process },
             finished: core::sync::atomic::AtomicBool::new(false),
+            blocked: core::sync::atomic::AtomicBool::new(false),
             sched_policy: crate::scheduler::SchedPolicy::Fair { weight: 1024, vruntime: 0 },
         }
     }

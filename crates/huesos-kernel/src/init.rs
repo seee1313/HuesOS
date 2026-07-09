@@ -98,6 +98,12 @@ pub fn syscall_init() {
     huesos_syscalls::set_vmar_map_fn(crate::process::map_vmo_into_vmar);
     huesos_syscalls::set_thread_start_fn(crate::process::start_thread);
     huesos_arch::irq_callback::set_irq_callback(handle_irq);
+
+    huesos_object::set_scheduler_hooks(
+        crate::scheduler::current_task_id,
+        crate::scheduler::park_current,
+        crate::scheduler::wake_task,
+    );
 }
 
 fn handle_irq(irq: u8, d: u64) {

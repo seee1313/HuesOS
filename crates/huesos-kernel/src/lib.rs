@@ -101,8 +101,11 @@ pub unsafe fn kmain(boot_info: BootInfo) -> ! {
     log_boot_banner(&boot_info);
     spawn_init_process();
 
-    // BSP idle: same as APs — timer IRQ drives the scheduler.
-    loop { huesos_arch::hlt(); }
+    // BSP idle: timer IRQ drives the scheduler; opportunistically reap.
+    loop {
+        crate::scheduler::reap_finished_tasks();
+        huesos_arch::hlt();
+    }
 }
 
 fn log_boot_banner(boot_info: &BootInfo) {
