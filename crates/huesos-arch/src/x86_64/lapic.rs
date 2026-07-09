@@ -9,7 +9,19 @@ use core::sync::atomic::{AtomicU64, Ordering};
 static LAPIC_BASE: AtomicU64 = AtomicU64::new(0);
 
 /// Program the LAPIC base address (called once after MADT parsing).
+///
+/// Also ensures the 4 KiB MMIO page is present in the HHDM. Limine base
+/// revision 3 does not map reserved/MMIO ranges, so without this the first
+/// `write_reg` in [`init`] page-faults on `0xfee000f0` (SVR).
 pub unsafe fn set_base(phys: u32, hhdm_offset: u64) {
+    // LAPIC is MMIO: must be uncacheable. WB mapping can hang IPI delivery
+    // status polls forever (writes never reach the device).
+    use x86_64::structures::paging::PageTableFlags;
+    crate::x86_64::paging::map_hhdm_range_flags(
+        phys as u64,
+        0x1000,
+        PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::NO_CACHE,
+    );
     LAPIC_BASE.store(hhdm_offset + phys as u64, Ordering::Relaxed);
 }
 
@@ -75,19 +87,21 @@ pub enum IpiDelivery {
 /// # Safety
 /// Must not be called before `set_base`.
 pub unsafe fn send_ipi(dest_apic_id: u8, vector: u8, delivery: IpiDelivery) {
-    // Wait for Delivery Status bit (bit 12) to clear.
-    while read_reg(REG_ICR_LOW) & 0x1000 != 0 {
+    // Brief wait for Delivery Status (bit 12). Never spin forever: a stuck
+    // DS bit must not brick BSP boot.
+    for _ in 0..50_000 {
+        if read_reg(REG_ICR_LOW) & 0x1000 == 0 {
+            break;
+        }
         core::hint::spin_loop();
     }
 
-    // Write destination to ICR_HIGH.
     write_reg(REG_ICR_HIGH, (dest_apic_id as u32) << 24);
 
-    // Write command to ICR_LOW.
     let mut cmd = (vector as u32) | (delivery as u32);
-    // Level=assert (bit 14) for INIT and STARTUP.
-    if matches!(delivery, IpiDelivery::Init | IpiDelivery::Startup) {
-        cmd |= 0x4000;
+    // INIT requires Level=Assert (bit 14). SIPI is edge-triggered.
+    if matches!(delivery, IpiDelivery::Init) {
+        cmd |= 1 << 14;
     }
     write_reg(REG_ICR_LOW, cmd);
 }
