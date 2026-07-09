@@ -1,17 +1,23 @@
 //! SMP bring-up and AP entry point.
 
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-/// Number of CPUs that have successfully entered the Rust AP entry point.
+/// Number of CPUs that have successfully entered the Rust AP entry point
+/// and finished local init (scheduler + timer + STI).
 static AP_READY_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+/// Gate: APs wait here until the BSP has finished `init_late` (PIC + timer
+/// callback registered, shared timer count published). Prevents APs from
+/// taking IRQ32 before the timer callback is installed.
+static APS_MAY_RUN: AtomicBool = AtomicBool::new(false);
 
 /// Stacks allocated for APs (one per CPU beyond BSP). Kept alive for the
 /// lifetime of the kernel so APs never lose their stacks.
 static mut AP_STACKS: Vec<Vec<u8>> = Vec::new();
 
 /// How long the BSP waits for each AP to report ready (rough microseconds).
-const AP_READY_TIMEOUT_US: u32 = 100_000; // 0.1 s wall-clock-ish under TCG
+const AP_READY_TIMEOUT_US: u32 = 200_000;
 
 /// Parse ACPI MADT, discover CPUs, and bring up all APs.
 /// Called once on the BSP after paging and heap are ready.
@@ -19,12 +25,13 @@ pub fn bringup_aps(rsdp_addr: u64, hhdm_offset: u64) {
     let madt = unsafe { huesos_arch::acpi::parse_madt(rsdp_addr, |p| p + hhdm_offset) };
 
     let Some(madt) = madt else {
-        // No ACPI / MADT — fall back to the standard xAPIC MMIO base so the
-        // BSP timer path in `init_late` still works.
         unsafe {
             huesos_arch::lapic::set_base(0xfee0_0000, hhdm_offset);
             huesos_arch::lapic::init();
         }
+        // Still calibrate so init_late / APs (none) share a count.
+        let c = huesos_arch::lapic::calibrate_timer();
+        huesos_arch::lapic::set_timer_initial_count(c);
         log_line("[SMP] no MADT, LAPIC at default 0xfee00000\n");
         return;
     };
@@ -33,11 +40,17 @@ pub fn bringup_aps(rsdp_addr: u64, hhdm_offset: u64) {
     log_num(madt.cpu_count as u64);
     log_line(" CPUs found\n");
 
-    // ALWAYS program LAPIC for the BSP (timer + EOI), even on single-core.
     unsafe {
         huesos_arch::lapic::set_base(madt.local_apic_phys, hhdm_offset);
         huesos_arch::lapic::init();
     }
+
+    // Calibrate once on the BSP *before* APs start. APs reuse this count.
+    let count = huesos_arch::lapic::calibrate_timer();
+    huesos_arch::lapic::set_timer_initial_count(count);
+    log_line("[SMP] LAPIC timer count=");
+    log_num(count as u64);
+    log_line("\n");
 
     let bsp_lapic_id = huesos_arch::lapic::id();
     unsafe {
@@ -49,7 +62,6 @@ pub fn bringup_aps(rsdp_addr: u64, hhdm_offset: u64) {
         return;
     }
 
-    // Allocate a stack for each AP (64 KiB).
     let ap_count = madt.cpu_count - 1;
     let mut stacks = alloc::vec::Vec::with_capacity(ap_count);
     for _ in 0..ap_count {
@@ -59,7 +71,6 @@ pub fn bringup_aps(rsdp_addr: u64, hhdm_offset: u64) {
         AP_STACKS = stacks;
     }
 
-    // Copy trampoline once (also installs HHDM + identity maps for 0x7000/0x8000).
     unsafe {
         huesos_arch::ap_boot::copy_trampoline();
     }
@@ -96,7 +107,7 @@ pub fn bringup_aps(rsdp_addr: u64, hhdm_offset: u64) {
             );
         }
 
-        // Wait until the AP either reports ready or we time out.
+        // Wait until the AP finished local init (before the run-gate).
         let mut waited = 0u32;
         while AP_READY_COUNT.load(Ordering::Relaxed) == ready_before
             && waited < AP_READY_TIMEOUT_US
@@ -126,6 +137,18 @@ pub fn bringup_aps(rsdp_addr: u64, hhdm_offset: u64) {
     log_line("\n");
 }
 
+/// Called by the BSP after `scheduler::init` + `init_late` so APs may start
+/// their LAPIC timers and enter the idle loop with IF=1.
+pub fn release_aps() {
+    APS_MAY_RUN.store(true, Ordering::SeqCst);
+    log_line("[SMP] APs released to run\n");
+}
+
+/// Number of APs that completed local init.
+pub fn ap_ready_count() -> usize {
+    AP_READY_COUNT.load(Ordering::Relaxed)
+}
+
 /// Rust entry point called by the AP trampoline.
 ///
 /// # Safety
@@ -141,7 +164,7 @@ pub unsafe extern "C" fn ap_entry() -> ! {
         huesos_arch::cpu_local::init_gs_base(cpu_local);
     }
 
-    // Per-CPU GDT/TSS (heap is already up on the BSP).
+    // Per-CPU GDT/TSS.
     let gdt = huesos_arch::gdt::PerCpuGdt::new();
     let gdt_static = alloc::boxed::Box::leak(alloc::boxed::Box::new(gdt));
     gdt_static.load();
@@ -151,44 +174,52 @@ pub unsafe extern "C" fn ap_entry() -> ! {
         (*ptr).gdt = gdt_static as *mut huesos_arch::gdt::PerCpuGdt as *mut ();
     }
 
-    // Load the shared IDT (same as BSP).
-    // idt::init just reloads IDTR; safe to call again.
-    // (No public re-export of a "load only" helper — init is idempotent.)
-
-    // Shared IDT — without this IDTR is still the zeroed real-mode default
-    // and the first exception on the AP triple-faults the machine.
+    // Shared IDT (without this IDTR is still the real-mode zero default).
     huesos_arch::idt::init();
 
+    // Program STAR/LSTAR/SFMASK on this CPU. Syscall MSRs are per-logical-CPU;
+    // without this, a userspace task migrated here #UD's on the first `syscall`.
+    let s = &gdt_static.selectors;
+    huesos_arch::syscall::init(s.kernel_code, s.kernel_data, s.user_code, s.user_data);
+    // Handler pointer is global and already set by the BSP in syscall_init().
+
+    // Per-CPU scheduler + idle task + (shared) timer callback registration.
     crate::scheduler::init();
 
-    // Bring the LAPIC timer up but keep it masked: unmasking + STI before
-    // the BSP has finished init_late races the shared timer path. The BSP
-    // can enable AP timers later; for bring-up we only need "online".
-    const AP_TIMER_INIT: u32 = 10_000_000;
-    unsafe {
-        huesos_arch::lapic::timer_init(
-            huesos_arch::lapic::TimerDivide::Div16,
-            huesos_arch::lapic::TimerMode::Periodic,
-            AP_TIMER_INIT,
-            0x20,
-        );
-        // Mask LVT timer (bit 16) so we do not take IRQ32 without a stable path.
-        // timer_init currently unmasks; re-mask via a zero init count + mask.
-        huesos_arch::lapic::timer_stop();
-    }
-
-    // Stay with interrupts disabled on the AP for now. HLT with IF=0 is fine;
-    // the AP is parked until a future IPI/unmask path wakes it.
+    // Signal "local init done" so the BSP can proceed; then wait for the
+    // run-gate before unmasking the timer / STI.
     AP_READY_COUNT.fetch_add(1, Ordering::SeqCst);
 
     log_line("[SMP] AP ");
     log_num(lapic_id as u64);
-    log_line(" online\n");
+    log_line(" online (waiting for release)\n");
 
-    loop {
-        // IF=0: HLT still waits for NMI/INIT/reset, not maskable IRQs.
-        // Use a pause loop so we do not depend on NMIs.
+    while !APS_MAY_RUN.load(Ordering::SeqCst) {
         core::hint::spin_loop();
+    }
+
+    // Start the local APIC timer with the BSP-calibrated count.
+    let initial = huesos_arch::lapic::timer_initial_count().max(1_000_000);
+    unsafe {
+        huesos_arch::lapic::timer_init(
+            huesos_arch::lapic::TimerDivide::Div16,
+            huesos_arch::lapic::TimerMode::Periodic,
+            initial,
+            0x20,
+        );
+    }
+
+    log_line("[SMP] AP ");
+    log_num(lapic_id as u64);
+    log_line(" scheduling\n");
+
+    huesos_arch::interrupts::enable();
+
+    // Idle loop: HLT waits for the next LAPIC timer IRQ / reschedule IPI.
+    // The timer handler runs the per-CPU scheduler tick and may context-switch
+    // this idle task onto a real workload that was load-balanced here.
+    loop {
+        huesos_arch::hlt();
     }
 }
 

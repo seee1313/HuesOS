@@ -94,9 +94,14 @@ pub unsafe fn kmain(boot_info: BootInfo) -> ! {
     scheduler::init();
     huesos_arch::init_late();
 
+    // APs finished local init during bringup_aps and are spinning on the
+    // run-gate; release them now that the timer callback + PIC are live.
+    smp::release_aps();
+
     log_boot_banner(&boot_info);
     spawn_init_process();
 
+    // BSP idle: same as APs — timer IRQ drives the scheduler.
     loop { huesos_arch::hlt(); }
 }
 

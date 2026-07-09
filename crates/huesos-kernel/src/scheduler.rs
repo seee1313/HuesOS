@@ -31,6 +31,26 @@ use x86_64::VirtAddr;
 /// Maximum number of CPUs supported.
 pub const MAX_CPUS: usize = 64;
 
+/// Bitmask of CPUs that have finished scheduler init and may receive tasks.
+/// Bit N set => CPU with LAPIC-id N is online for load-balancing.
+static ONLINE_CPUS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Mark the current CPU as online for task placement.
+pub fn mark_cpu_online() {
+    let id = cpu_id();
+    if id < 64 {
+        ONLINE_CPUS.fetch_or(1u64 << id, Ordering::SeqCst);
+    }
+}
+
+/// True if the given LAPIC id has a live scheduler ready for work.
+pub fn is_cpu_online(cpu: usize) -> bool {
+    if cpu >= 64 {
+        return false;
+    }
+    (ONLINE_CPUS.load(Ordering::SeqCst) & (1u64 << cpu)) != 0
+}
+
 /// Saved CPU context for a task.
 pub type SchedContext = huesos_arch::context_switch::Context;
 
@@ -263,12 +283,17 @@ pub fn current_task_id() -> Option<u64> {
 
 /// Find the best CPU to spawn a task on (online CPU with fewest tasks).
 fn find_best_cpu() -> usize {
-    let mut best_cpu = 0;
+    let mut best_cpu = cpu_id();
     let mut min_tasks = usize::MAX;
+    let mask = ONLINE_CPUS.load(Ordering::SeqCst);
 
     for i in 0..MAX_CPUS {
+        if (mask & (1u64 << i)) == 0 {
+            continue;
+        }
         let guard = PER_CPU_SCHEDULERS[i].lock();
         let count = guard.tasks.len();
+        // Prefer the least-loaded online CPU that already has at least an idle task.
         if count >= 1 && count < min_tasks {
             min_tasks = count;
             best_cpu = i;
