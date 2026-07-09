@@ -24,6 +24,12 @@ pub enum DriverError {
     InvalidPath,
 }
 
+/// BIOS Parameter Block layout matching the on-disk FAT12/16/32 boot sector.
+///
+/// Common BPB ends at `total_sectors_32` (offset 36). FAT32-specific fields
+/// follow with the sizes mandated by the Microsoft FAT specification:
+/// `ext_flags`/`fs_version` are u16, `fs_info_sector`/`backup_boot_sector`
+/// are u16. Incorrect widths shift `root_cluster` and break FAT32 mounts.
 #[repr(C, packed)]
 #[derive(Debug, Clone, Copy)]
 pub struct FatBpb {
@@ -41,14 +47,17 @@ pub struct FatBpb {
     pub head_count: u16,
     pub hidden_sectors: u32,
     pub total_sectors_32: u32,
+    // --- FAT32 extended BPB (also present, zeroed, on FAT16 images) ---
     pub fat_size_32: u32,
-    pub ext_flags: u32,
-    pub fs_version: u32,
+    pub ext_flags: u16,
+    pub fs_version: u16,
     pub root_cluster: u32,
-    pub fs_info_sector: u32,
-    pub backup_boot_sector: u32,
+    pub fs_info_sector: u16,
+    pub backup_boot_sector: u16,
     pub reserved: [u8; 12],
-    pub boot_signature: [u8; 512 - 72],
+    /// Remainder of the 512-byte boot sector (drive number, boot code, 0x55AA, ...).
+    /// Offset of this field is 64; size is 512 - 64 = 448.
+    pub boot_signature: [u8; 512 - 64],
 }
 
 #[repr(C, packed)]
@@ -357,7 +366,7 @@ mod tests {
             fs_info_sector: 0,
             backup_boot_sector: 0,
             reserved: [0; 12],
-            boot_signature: [0; 440],
+            boot_signature: [0; 448],
         };
         let bpb_bytes = unsafe {
             core::slice::from_raw_parts(&bpb as *const FatBpb as *const u8, 512)
