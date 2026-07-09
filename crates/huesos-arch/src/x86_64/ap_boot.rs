@@ -27,13 +27,30 @@ pub struct ApBootInfo {
     pub entry_point: u64,
 }
 
+/// Ensure low-memory pages used for AP bring-up are reachable.
+///
+/// Limine base revision 3 dropped the unconditional identity map of the
+/// first 4 GiB. We need:
+/// - HHDM mappings so the BSP can `memcpy` the trampoline / write ApBootInfo
+/// - true identity mappings (`virt == phys`) so the trampoline, *after*
+///   enabling paging with the kernel CR3, can still load RSP/entry from
+///   absolute addresses 0x7008 / 0x7010.
+fn map_ap_low_pages() {
+    crate::x86_64::paging::map_hhdm_range(AP_BOOT_INFO_PHYS, 0x1000);
+    crate::x86_64::paging::map_hhdm_range(AP_TRAMPOLINE_PHYS, 0x2000);
+    crate::x86_64::paging::map_identity_range(AP_BOOT_INFO_PHYS, 0x1000);
+    crate::x86_64::paging::map_identity_range(AP_TRAMPOLINE_PHYS, 0x2000);
+}
+
 /// Copy the AP trampoline from the kernel image to low memory.
 ///
 /// # Safety
-/// Must be called on the BSP before any SIPI is sent.
+/// Must be called on the BSP before any SIPI is sent. Paging/HHDM mapper
+/// must already be initialized.
 pub unsafe fn copy_trampoline() {
+    map_ap_low_pages();
     let src = ap_trampoline_start as *const u8;
-    let dst = AP_TRAMPOLINE_PHYS as *mut u8;
+    let dst = crate::x86_64::paging::phys_to_virt(AP_TRAMPOLINE_PHYS).as_mut_ptr::<u8>();
     let size = ap_trampoline_end as *const () as usize - ap_trampoline_start as *const () as usize;
     core::ptr::copy_nonoverlapping(src, dst, size);
 }
@@ -41,33 +58,34 @@ pub unsafe fn copy_trampoline() {
 /// Boot AP `apic_id` with the given stack and Rust entry point.
 ///
 /// # Safety
-/// Must be called on the BSP with interrupts disabled. The stack must be
-/// valid and mapped in the kernel address space.
+/// Must be called on the BSP. The stack must be valid and mapped in the
+/// kernel address space. Does not wait for the AP to come online.
 pub unsafe fn boot_ap(apic_id: u8, stack_top: u64, entry_point: u64) {
     copy_trampoline();
 
-    let info = AP_BOOT_INFO_PHYS as *mut ApBootInfo;
+    // Write ApBootInfo through the HHDM — physical 0x7000 is not identity-mapped
+    // for ordinary kernel code under base revision 3.
+    let info = crate::x86_64::paging::phys_to_virt(AP_BOOT_INFO_PHYS).as_mut_ptr::<ApBootInfo>();
     (*info).cr3 = x86_64::registers::control::Cr3::read().0.start_address().as_u64();
     (*info).stack_top = stack_top;
     (*info).entry_point = entry_point;
 
-    // INIT IPI
+    // INIT IPI (assert).
     crate::lapic::send_ipi(apic_id, 0, crate::lapic::IpiDelivery::Init);
 
-    // ~10 ms delay (spin loop; calibrated roughly for QEMU @ 2-3 GHz)
-    for _ in 0..10_000_000 {
+    // Short settle. QEMU TCG is slow enough that a huge spin here
+    // makes the whole BSP look hung under a 30s timeout.
+    for _ in 0..50_000 {
         core::hint::spin_loop();
     }
 
-    // STARTUP IPI
+    // SIPI: vector = physical page of trampoline (0x8000 >> 12 = 8).
     let vector = (AP_TRAMPOLINE_PHYS >> 12) as u8;
     crate::lapic::send_ipi(apic_id, vector, crate::lapic::IpiDelivery::Startup);
 
-    // ~200 µs delay
-    for _ in 0..200_000 {
+    // Second SIPI for legacy compatibility (Intel SDM).
+    for _ in 0..10_000 {
         core::hint::spin_loop();
     }
-
-    // Second STARTUP IPI (required by Intel spec for compatibility)
     crate::lapic::send_ipi(apic_id, vector, crate::lapic::IpiDelivery::Startup);
 }
