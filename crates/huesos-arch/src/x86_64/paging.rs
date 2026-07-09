@@ -143,9 +143,15 @@ fn map_phys_range(
         unsafe {
             match mapper.map_to(page, frame, flags, &mut PmmFrameAllocator) {
                 Ok(flush) => flush.flush(),
-                Err(x86_64::structures::paging::mapper::MapToError::PageAlreadyMapped(_)) => {}
+                Err(x86_64::structures::paging::mapper::MapToError::PageAlreadyMapped(_)) => {
+                    // Page present (e.g. Limine left it WB). Force the flags
+                    // we want — critical for LAPIC NO_CACHE.
+                    let _ = mapper.update_flags(page, flags).map(|f| f.flush());
+                }
                 Err(x86_64::structures::paging::mapper::MapToError::ParentEntryHugePage) => {}
-                Err(_) => {}
+                Err(_) => {
+                    // Best-effort: leave unmapped; caller will observe the #PF.
+                }
             }
         }
         phys = phys.saturating_add(4096);

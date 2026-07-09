@@ -82,28 +82,54 @@ pub enum IpiDelivery {
     Startup = 0x0000_0600,
 }
 
+/// Rough microsecond busy-wait. Not cycle-accurate; good enough for
+/// INIT-SIPI settle times under QEMU TCG / KVM.
+pub fn delay_us(us: u32) {
+    // Pure CPU spin — no MMIO. Keep the multiplier modest so TCG does not
+    // spend tens of seconds here.
+    let iters = (us as u64).saturating_mul(50).max(50);
+    for _ in 0..iters {
+        core::hint::spin_loop();
+    }
+}
+
+fn wait_icr_idle() {
+    // Delivery Status (bit 12). Cap hard: every iteration is an MMIO load,
+    // and under QEMU TCG those are *extremely* expensive. A few hundred
+    // polls is plenty on real HW and on KVM; on TCG we must not spin 200k.
+    for _ in 0..256 {
+        if read_reg(REG_ICR_LOW) & 0x1000 == 0 {
+            return;
+        }
+        core::hint::spin_loop();
+    }
+}
+
 /// Send an IPI to `dest_apic_id`.
 ///
 /// # Safety
 /// Must not be called before `set_base`.
 pub unsafe fn send_ipi(dest_apic_id: u8, vector: u8, delivery: IpiDelivery) {
-    // Brief wait for Delivery Status (bit 12). Never spin forever: a stuck
-    // DS bit must not brick BSP boot.
-    for _ in 0..50_000 {
-        if read_reg(REG_ICR_LOW) & 0x1000 == 0 {
-            break;
-        }
-        core::hint::spin_loop();
-    }
-
+    wait_icr_idle();
     write_reg(REG_ICR_HIGH, (dest_apic_id as u32) << 24);
 
     let mut cmd = (vector as u32) | (delivery as u32);
-    // INIT requires Level=Assert (bit 14). SIPI is edge-triggered.
+    // INIT requires Level=Assert (bit 14) and Trigger=Level (bit 15).
+    // SIPI is edge-triggered; level bits must be clear.
     if matches!(delivery, IpiDelivery::Init) {
-        cmd |= 1 << 14;
+        cmd |= (1 << 14) | (1 << 15);
     }
     write_reg(REG_ICR_LOW, cmd);
+}
+
+/// INIT IPI with Level=Assert | Trigger=Level (Intel SDM INIT-SIPI-SIPI).
+pub unsafe fn send_init_assert(dest_apic_id: u8) {
+    send_ipi(dest_apic_id, 0, IpiDelivery::Init);
+}
+
+/// SIPI with startup vector = physical page of the trampoline.
+pub unsafe fn send_startup(dest_apic_id: u8, vector: u8) {
+    send_ipi(dest_apic_id, vector, IpiDelivery::Startup);
 }
 
 /// APIC timer divide values.
