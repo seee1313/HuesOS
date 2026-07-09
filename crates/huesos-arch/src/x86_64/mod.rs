@@ -6,7 +6,7 @@ pub mod context_switch;
 pub mod cpu;
 pub mod cpu_local;
 pub mod gdt;
-mod idt;
+pub mod idt;
 pub mod interrupts;
 pub mod irq_callback;
 pub mod keyboard;
