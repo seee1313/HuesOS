@@ -13,7 +13,36 @@ const MAX_LEN: usize = GRID_W * GRID_H;
 const CELL: u32 = 16;
 const MARGIN_X: u32 = 40;
 const MARGIN_Y: u32 = 48;
-const TICK_YIELDS: u32 = 12; // ~game speed under cooperative yield
+
+// --- pacing (classic Snake feel) ------------------------------------------
+// Typical desktop ports run ~10–15 snake steps per second (e.g. Pygame
+// tutorials use clock.tick(10..15)). We don't have a wall-clock API, so we
+// approximate one "frame quantum" as: one cooperative yield (usually lands
+// on the next LAPIC tick, ~10 ms at 100 Hz) plus a short spin so a no-op
+// yield can't make the game turbo.
+//
+// BASE_STEP_QUANTA = 10  →  ~10 steps/s at start
+// every 4 food: −1 quantum, floor MIN_STEP_QUANTA = 5  →  ~20 steps/s cap
+const BASE_STEP_QUANTA: u32 = 10;
+const MIN_STEP_QUANTA: u32 = 5;
+/// Busy-wait iterations after each yield (~microseconds–ms depending on host).
+const SPIN_AFTER_YIELD: u32 = 80_000;
+
+/// How many frame quanta between snake moves for the current score.
+fn step_period_quanta(score: u32) -> u32 {
+    let faster = score / 4;
+    BASE_STEP_QUANTA.saturating_sub(faster).max(MIN_STEP_QUANTA)
+}
+
+/// One pacing quantum: yield to the scheduler, then a soft spin.
+fn frame_quantum() {
+    libcanvas::process::yield_now();
+    let mut i = 0u32;
+    while i < SPIN_AFTER_YIELD {
+        core::hint::spin_loop();
+        i = i.wrapping_add(1);
+    }
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Dir {
@@ -50,7 +79,7 @@ pub fn run(keyboard: &Channel) {
     let mut food = Point { x: 10, y: 8 };
     let mut phase = Phase::Playing;
     let mut score = 0u32;
-    let mut tick = 0u32;
+    let mut quanta = 0u32;
     let mut rng = 0xA5A5_1234u32;
 
     reset(&mut body, &mut len, &mut dir, &mut pending, &mut food, &mut score, &mut phase, &mut rng);
@@ -58,7 +87,8 @@ pub fn run(keyboard: &Channel) {
 
     let mut buf = [0u8; 16];
     loop {
-        // Drain keyboard (non-blocking) every frame.
+        // Drain keyboard (non-blocking) every quantum so input feels snappy
+        // even when the snake itself only moves ~10 times per second.
         loop {
             match keyboard.read_into(&mut buf) {
                 Ok(n) => {
@@ -66,6 +96,7 @@ pub fn run(keyboard: &Channel) {
                         match phase {
                             Phase::Playing => match action {
                                 Action::Dir(d) => {
+                                    // Only accept turns that are not a 180° reverse.
                                     if !is_opposite(dir, d) {
                                         pending = d;
                                     }
@@ -85,6 +116,7 @@ pub fn run(keyboard: &Channel) {
                                         &mut phase,
                                         &mut rng,
                                     );
+                                    quanta = 0;
                                     draw(&canvas, &body, len, food, phase, score);
                                 }
                                 Action::Esc => return,
@@ -93,18 +125,16 @@ pub fn run(keyboard: &Channel) {
                         }
                     }
                 }
-                Err(ErrorCode::ShouldWait) => break,
-                Err(_) => {
-                    libcanvas::process::yield_now();
-                    break;
-                }
+                Err(ErrorCode::ShouldWait) | Err(ErrorCode::TimedOut) => break,
+                Err(_) => break,
             }
         }
 
         if phase == Phase::Playing {
-            tick = tick.wrapping_add(1);
-            if tick >= TICK_YIELDS {
-                tick = 0;
+            quanta = quanta.wrapping_add(1);
+            let period = step_period_quanta(score);
+            if quanta >= period {
+                quanta = 0;
                 dir = pending;
                 if !step(&mut body, &mut len, dir, &mut food, &mut score, &mut rng) {
                     phase = Phase::GameOver;
@@ -113,7 +143,8 @@ pub fn run(keyboard: &Channel) {
             }
         }
 
-        libcanvas::process::yield_now();
+        // One paced quantum per loop iteration (~classic 10–15 steps/s).
+        frame_quantum();
     }
 }
 
@@ -258,7 +289,7 @@ fn draw(
     let _ = canvas.draw_text(
         MARGIN_X,
         32,
-        "WASD/HJKL move  |  Esc quit",
+        "WASD/HJKL move  |  Esc quit  |  speeds up as you eat",
         140,
         160,
         180,
