@@ -17,6 +17,10 @@ pub enum AllocError {
 pub struct BuddyAllocator<const ORDER: usize> {
     free_lists: [Option<*mut FreeBlock>; ORDER],
     base_addr: usize,
+    /// Page size in bytes used for buddy address arithmetic.
+    /// Previously allocate/deallocate hardcoded 4096 even when `new` was
+    /// given a different page_size, which corrupts the free lists.
+    page_size: usize,
     #[allow(dead_code)]
     total_pages: usize,
 }
@@ -31,6 +35,7 @@ impl<const ORDER: usize> BuddyAllocator<ORDER> {
         let mut allocator = Self {
             free_lists: [None; ORDER],
             base_addr,
+            page_size,
             total_pages,
         };
 
@@ -51,6 +56,11 @@ impl<const ORDER: usize> BuddyAllocator<ORDER> {
         }
 
         allocator
+    }
+
+    #[inline]
+    fn order_bytes(&self, order: usize) -> usize {
+        (1usize << order) * self.page_size
     }
 
     fn push_free_block(&mut self, order: usize, ptr: *mut FreeBlock) {
@@ -74,7 +84,7 @@ impl<const ORDER: usize> BuddyAllocator<ORDER> {
         for i in order..ORDER {
             if let Some(block) = self.pop_free_block(i) {
                 for j in (order..i).rev() {
-                    let size = (1 << j) * 4096;
+                    let size = self.order_bytes(j);
                     let buddy = (block as usize + size) as *mut FreeBlock;
                     self.push_free_block(j, buddy);
                 }
@@ -92,7 +102,7 @@ impl<const ORDER: usize> BuddyAllocator<ORDER> {
         let mut current_order = order;
 
         while current_order < ORDER - 1 {
-            let block_size = (1 << current_order) * 4096;
+            let block_size = self.order_bytes(current_order);
             let buddy_offset = (current_ptr as usize - self.base_addr) ^ block_size;
             let buddy_ptr = (self.base_addr + buddy_offset) as *mut FreeBlock;
 
