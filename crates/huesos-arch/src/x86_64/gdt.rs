@@ -155,14 +155,13 @@ impl PerCpuGdt {
 
 /// Load GDT and update segment registers.
 pub fn init() {
-    let gdt = PerCpuGdt::new();
-    let gdt_static = alloc::boxed::Box::leak(alloc::boxed::Box::new(gdt));
-    gdt_static.load();
-    
+    GDT.0.load();
+    let sel = selectors();
     unsafe {
-        let ptr = crate::cpu_local::cpu_local_ptr();
-        if !ptr.is_null() {
-            (*ptr).gdt = gdt_static as *mut PerCpuGdt as *mut ();
-        }
+        CS::set_reg(sel.kernel_code);
+        DS::set_reg(sel.kernel_data);
+        ES::set_reg(sel.kernel_data);
+        SS::set_reg(sel.kernel_data);
+        load_tss(sel.tss);
     }
 }
