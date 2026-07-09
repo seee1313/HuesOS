@@ -103,13 +103,13 @@ pub unsafe extern "C" fn ap_entry() -> ! {
     // Initialize per-CPU scheduler.
     crate::scheduler::init();
 
-    // Start LAPIC timer (~100 Hz, divider 16).
-    // TODO: calibrate against PIT/TSC for real hardware.
+    // Calibrate and start LAPIC timer (~100 Hz, divider 16).
+    let initial_count = huesos_arch::lapic::calibrate_timer();
     unsafe {
         huesos_arch::lapic::timer_init(
             huesos_arch::lapic::TimerDivide::Div16,
             huesos_arch::lapic::TimerMode::Periodic,
-            0x20000,
+            initial_count,
             0x20,
         );
     }

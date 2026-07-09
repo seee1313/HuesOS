@@ -52,13 +52,12 @@ pub unsafe fn init_paging(phys_offset: crate::VirtAddr) {
 /// Final stage: enable interrupts, start the LAPIC timer, ready for scheduling.
 pub fn init_late() {
     interrupts::init();
-    // LAPIC timer: ~100 Hz with divider 16.
-    // TODO: calibrate against PIT/TSC for real hardware.
+    let initial_count = lapic::calibrate_timer();
     unsafe {
         lapic::timer_init(
             lapic::TimerDivide::Div16,
             lapic::TimerMode::Periodic,
-            0x20000,
+            initial_count,
             0x20,
         );
     }

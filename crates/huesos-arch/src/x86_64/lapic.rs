@@ -131,6 +131,51 @@ pub fn timer_stop() {
     write_reg(REG_TIMER_INIT_COUNT, 0);
 }
 
+/// Calibrate the LAPIC timer against the PIT.
+/// Returns the initial count value for ~100 Hz periodic timer.
+pub fn calibrate_timer() -> u32 {
+    use x86_64::instructions::port::Port;
+
+    let saved = x86_64::instructions::interrupts::are_enabled();
+    x86_64::instructions::interrupts::disable();
+
+    // PIT channel 0: one-shot (mode 0), lobyte/hibyte, ~50 ms.
+    let mut cmd: Port<u8> = Port::new(0x43);
+    let mut data0: Port<u8> = Port::new(0x40);
+    const DIVIDER: u16 = 59_659; // 50 ms @ 1.193182 MHz
+
+    unsafe {
+        cmd.write(0x30); // channel 0, lobyte/hibyte, mode 0
+        data0.write((DIVIDER & 0xFF) as u8);
+        data0.write((DIVIDER >> 8) as u8);
+    }
+
+    // LAPIC: start counting down from max.
+    write_reg(REG_TIMER_DIVIDE, TimerDivide::Div16 as u32);
+    write_reg(REG_LVT_TIMER, 0x0001_0000); // masked
+    write_reg(REG_TIMER_INIT_COUNT, 0xFFFFFFFF);
+
+    // Poll PIT until count reaches 0.
+    loop {
+        unsafe { cmd.write(0x00); } // latch
+        let lo = unsafe { data0.read() } as u16;
+        let hi = unsafe { data0.read() } as u16;
+        if ((hi << 8) | lo) == 0 {
+            break;
+        }
+    }
+
+    let lapic_cur = read_reg(REG_TIMER_CUR_COUNT);
+    let ticks_50ms = 0xFFFFFFFFu32 - lapic_cur;
+
+    if saved {
+        x86_64::instructions::interrupts::enable();
+    }
+
+    // 100 Hz = 10 ms period = 50 ms / 5.
+    ticks_50ms / 5
+}
+
 /// Send a reschedule IPI to `dest_apic_id`.
 /// Uses the timer vector (0x20) to trigger a scheduler tick on the target CPU.
 pub fn ipi_reschedule(dest_apic_id: u8) {
