@@ -29,6 +29,9 @@ pub fn heap_init() {
 pub fn object_init() {
     huesos_object::init();
     huesos_object::set_phys_to_virt(|p| huesos_arch::paging::phys_to_virt(p).as_u64());
+    huesos_object::set_cpu_id_callback(|| {
+        (unsafe { huesos_arch::cpu_local::current_lapic_id() } as usize)
+    });
 }
 
 pub fn framebuffer_init(fb: Option<crate::FramebufferInfo>) {

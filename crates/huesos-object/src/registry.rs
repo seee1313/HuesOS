@@ -75,17 +75,34 @@ pub fn unregister_object(koid: Koid) {
     interrupts.retain(|_, list| !list.is_empty());
 }
 
-/// Current process (set by the scheduler on every context switch).
-static CURRENT_PROCESS: Mutex<Option<Arc<Process>>> = Mutex::new(None);
+/// Current process per CPU core (set by the scheduler on every context switch).
+static PER_CPU_PROCESSES: Mutex<[Option<Arc<Process>>; 64]> = Mutex::new([const { None }; 64]);
+
+static CPU_ID_CALLBACK: Mutex<Option<fn() -> usize>> = Mutex::new(None);
+
+/// Register a callback to retrieve the current CPU ID.
+pub fn set_cpu_id_callback(f: fn() -> usize) {
+    *CPU_ID_CALLBACK.lock() = Some(f);
+}
+
+fn current_cpu() -> usize {
+    if let Some(f) = *CPU_ID_CALLBACK.lock() {
+        f()
+    } else {
+        0
+    }
+}
 
 /// Set the current process.
 pub fn set_current_process(p: Arc<Process>) {
-    *CURRENT_PROCESS.lock() = Some(p);
+    let cpu = current_cpu().min(63);
+    PER_CPU_PROCESSES.lock()[cpu] = Some(p);
 }
 
 /// Get the current process.
 pub fn current_process() -> Option<Arc<Process>> {
-    CURRENT_PROCESS.lock().clone()
+    let cpu = current_cpu().min(63);
+    PER_CPU_PROCESSES.lock()[cpu].clone()
 }
 
 /// Root job (set during object init).
