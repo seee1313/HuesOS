@@ -175,6 +175,10 @@ pub fn map_new_page(page: Page<Size4KiB>, flags: PageTableFlags) -> PhysFrame<Si
 /// higher-half mappings but with an independent lower half for userspace.
 pub struct AddressSpace {
     pml4_frame: PhysFrame<Size4KiB>,
+    /// User pages allocated via [`Self::map_new_user_page`] (e.g. stacks).
+    /// Freed on [`Self::destroy`]. Frames mapped from VMOs are *not* listed
+    /// here — the VMO owns those and frees them on Drop.
+    owned_frames: alloc::vec::Vec<u64>,
 }
 
 impl AddressSpace {
@@ -198,12 +202,17 @@ impl AddressSpace {
             new_table[i] = current_table[i].clone();
         }
 
-        Self { pml4_frame }
+        Self {
+            pml4_frame,
+            owned_frames: alloc::vec::Vec::new(),
+        }
     }
 
     /// Map a page into this address space (user-accessible).
+    ///
+    /// Does **not** take ownership of `frame` (VMO-backed mappings).
     pub fn map_user_page(
-        &self,
+        &mut self,
         page: Page<Size4KiB>,
         frame: PhysFrame<Size4KiB>,
         flags: PageTableFlags,
@@ -221,12 +230,14 @@ impl AddressSpace {
     }
 
     /// Allocate a fresh frame and map it into this address space.
+    /// The frame is owned by this address space and freed in [`Self::destroy`].
     pub fn map_new_user_page(
-        &self,
+        &mut self,
         page: Page<Size4KiB>,
         flags: PageTableFlags,
     ) -> PhysFrame<Size4KiB> {
         let frame = PmmFrameAllocator.allocate_frame().expect("out of memory");
+        self.owned_frames.push(frame.start_address().as_u64());
         self.map_user_page(page, frame, flags);
         frame
     }
@@ -246,6 +257,77 @@ impl AddressSpace {
             Cr3::write(self.pml4_frame, Cr3Flags::empty());
         }
     }
+
+    /// Tear down the user half of this address space and free owned frames
+    /// plus intermediate page-table frames. Kernel upper-half entries are
+    /// shared clones and are not freed.
+    ///
+    /// # Safety
+    /// No CPU may still have this PML4 loaded in CR3 (switch away first).
+    pub unsafe fn destroy(mut self) {
+        let pml4_phys = self.pml4_frame.start_address().as_u64();
+        let pml4: &mut PageTable =
+            unsafe { &mut *phys_to_virt(pml4_phys).as_mut_ptr::<PageTable>() };
+
+        // Only the lower half is private to this process.
+        for i in 0..256 {
+            let entry = &pml4[i];
+            if entry.is_unused() {
+                continue;
+            }
+            let flags = entry.flags();
+            if flags.contains(PageTableFlags::HUGE_PAGE) {
+                // Unexpected in our mapper path; free if we own it.
+                let addr = entry.addr().as_u64();
+                if let Some(pos) = self.owned_frames.iter().position(|&f| f == addr) {
+                    self.owned_frames.swap_remove(pos);
+                    huesos_pmm::free_frame(addr);
+                }
+            } else {
+                unsafe {
+                    free_page_table_recursive(entry.addr().as_u64(), 3, &mut self.owned_frames);
+                }
+            }
+            pml4[i].set_unused();
+        }
+
+        for f in self.owned_frames.drain(..) {
+            huesos_pmm::free_frame(f);
+        }
+        huesos_pmm::free_frame(pml4_phys);
+        // Forget self fields so Drop doesn't double-free (we consumed frames).
+        core::mem::forget(self);
+    }
+}
+
+/// Recursively free a PDPT (level=3), PD (2), or PT (1).
+/// User data frames are only freed if present in `owned`.
+/// Intermediate page-table frames are always freed (they were allocated by
+/// `map_to` via the PMM and are private to this address space).
+unsafe fn free_page_table_recursive(table_phys: u64, level: u8, owned: &mut alloc::vec::Vec<u64>) {
+    let table: &mut PageTable =
+        unsafe { &mut *phys_to_virt(table_phys).as_mut_ptr::<PageTable>() };
+    for i in 0..512 {
+        if table[i].is_unused() {
+            continue;
+        }
+        let flags = table[i].flags();
+        let addr = table[i].addr().as_u64();
+        if level == 1 || flags.contains(PageTableFlags::HUGE_PAGE) {
+            // Leaf data frame: free only if we own it (stack pages, etc.).
+            if let Some(pos) = owned.iter().position(|&f| f == addr) {
+                owned.swap_remove(pos);
+                huesos_pmm::free_frame(addr);
+            }
+        } else {
+            // Intermediate table: recurse (frees `addr` itself at the end).
+            unsafe {
+                free_page_table_recursive(addr, level - 1, owned);
+            }
+        }
+        table[i].set_unused();
+    }
+    huesos_pmm::free_frame(table_phys);
 }
 
 impl Default for AddressSpace {
