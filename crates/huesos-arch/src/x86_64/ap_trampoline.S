@@ -17,7 +17,8 @@ ap_trampoline_start:
 
     # Load GDT with 32-bit base (operand-size override 0x66)
     .byte 0x66
-    lgdt [ap_gdt_desc - ap_trampoline_start + 0x8000]
+    .set ap_gdt_desc_addr, (ap_gdt_desc - ap_trampoline_start + 0x8000)
+    lgdt [ap_gdt_desc_addr]
 
     # Enable protected mode (CR0.PE = 1)
     mov eax, cr0
@@ -61,7 +62,8 @@ ap_prot_mode:
 
     # Far jump to 64-bit mode via RETF
     push 0x18
-    push dword ptr (ap_long_mode - ap_trampoline_start + 0x8000)
+    .set ap_long_mode_addr, (ap_long_mode - ap_trampoline_start + 0x8000)
+    push dword ptr (ap_long_mode_addr)
     retf
 
 .code64
