@@ -35,6 +35,13 @@ pub fn bringup_aps(rsdp_addr: u64, hhdm_offset: u64) {
         huesos_arch::lapic::init();
     }
 
+    // Update BSP cpu_local with real LAPIC ID.
+    let bsp_lapic_id = huesos_arch::lapic::id();
+    unsafe {
+        let ptr = huesos_arch::cpu_local::cpu_local_ptr();
+        (*ptr).lapic_id = bsp_lapic_id;
+    }
+
     // Allocate a stack for each AP.
     let ap_count = madt.cpu_count - 1;
     let mut stacks = alloc::vec::Vec::with_capacity(ap_count);
@@ -84,6 +91,11 @@ pub unsafe extern "C" fn ap_entry() -> ! {
     // Initialize local APIC (base already set by BSP via MMIO).
     huesos_arch::lapic::init();
 
+    // Set up per-CPU locals for this AP.
+    let lapic_id = huesos_arch::lapic::id();
+    let cpu_local = unsafe { huesos_arch::cpu_local::alloc_cpu_local(lapic_id) };
+    unsafe { huesos_arch::cpu_local::init_gs_base(cpu_local) };
+
     // Load per-CPU GDT.
     let gdt = huesos_arch::gdt::PerCpuGdt::new();
     gdt.load();
@@ -108,7 +120,7 @@ pub unsafe extern "C" fn ap_entry() -> ! {
     AP_READY_COUNT.fetch_add(1, Ordering::Relaxed);
 
     log_line("[SMP] AP ");
-    log_num(huesos_arch::lapic::id() as u64);
+    log_num(lapic_id as u64);
     log_line(" online\n");
 
     // Idle loop.

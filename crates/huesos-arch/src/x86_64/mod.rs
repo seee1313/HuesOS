@@ -4,6 +4,7 @@ pub mod acpi;
 pub mod ap_boot;
 pub mod context_switch;
 pub mod cpu;
+pub mod cpu_local;
 pub mod gdt;
 mod idt;
 pub mod interrupts;
@@ -31,6 +32,10 @@ pub unsafe fn init_early() {
     }
     gdt::init();
     idt::init();
+
+    // Set up per-CPU locals for the BSP (LAPIC ID = 0 until LAPIC is initialized).
+    let cpu_local = unsafe { cpu_local::alloc_cpu_local(0) };
+    unsafe { cpu_local::init_gs_base(cpu_local) };
 }
 
 /// Second-stage architecture init: paging must have the PMM ready.

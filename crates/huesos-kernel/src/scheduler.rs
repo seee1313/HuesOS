@@ -101,9 +101,9 @@ impl Scheduler {
     }
 }
 
-/// Return the LAPIC ID of the current CPU, clamped to MAX_CPUS.
+/// Return the LAPIC ID of the current CPU via GS_BASE, clamped to MAX_CPUS.
 fn cpu_id() -> usize {
-    (huesos_arch::lapic::id() as usize).min(MAX_CPUS - 1)
+    (unsafe { huesos_arch::cpu_local::current_lapic_id() } as usize).min(MAX_CPUS - 1)
 }
 
 /// Get a mutable reference to the current CPU's scheduler.
@@ -112,6 +112,15 @@ fn cpu_id() -> usize {
 /// Interrupts must be disabled by the caller.
 unsafe fn current_scheduler() -> &'static mut Scheduler {
     &mut *PER_CPU_SCHEDULERS[cpu_id()].0.get()
+}
+
+/// Register the current CPU's scheduler pointer in its `CpuLocal`.
+///
+/// # Safety
+/// Must be called once per CPU after `cpu_local::init_gs_base`.
+unsafe fn register_scheduler_ptr(sched: *mut Scheduler) {
+    let ptr = huesos_arch::cpu_local::cpu_local_ptr();
+    unsafe { (*ptr).scheduler = sched as *mut () };
 }
 
 /// RAII-ish helper: disable interrupts, run `f` with exclusive scheduler
@@ -128,6 +137,7 @@ fn with_scheduler<R>(f: impl FnOnce(&mut Scheduler) -> R) -> R {
 /// Called once per CPU.
 pub fn init() {
     let sched = unsafe { current_scheduler() };
+    unsafe { register_scheduler_ptr(sched) };
     sched.add_task(Task::new_idle(
         0,
         *b"idle\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0",
