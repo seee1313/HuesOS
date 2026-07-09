@@ -4,9 +4,14 @@
 #![allow(missing_docs)]
 
 use core::ptr::{read_volatile, write_volatile};
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 static LAPIC_BASE: AtomicU64 = AtomicU64::new(0);
+
+/// Shared LAPIC timer initial-count for ~100 Hz (Div16), calibrated once on
+/// the BSP against the PIT and reused by every AP so they do not race the
+/// PIT or invent wildly different tick rates.
+static TIMER_INITIAL_COUNT: AtomicU32 = AtomicU32::new(0);
 
 /// Program the LAPIC base address (called once after MADT parsing).
 ///
@@ -64,8 +69,24 @@ pub fn id() -> u32 {
 }
 
 /// Send End-Of-Interrupt to the local APIC.
+///
+/// No-op if [`set_base`] has not been called yet (avoids writing through a
+/// null HHDM pointer during very early boot).
 pub fn eoi() {
+    if base() == 0 {
+        return;
+    }
     write_reg(REG_EOI, 0);
+}
+
+/// Store the BSP-calibrated LAPIC timer initial count for all CPUs.
+pub fn set_timer_initial_count(count: u32) {
+    TIMER_INITIAL_COUNT.store(count.max(1), Ordering::Relaxed);
+}
+
+/// Read the shared LAPIC timer initial count (0 if not calibrated yet).
+pub fn timer_initial_count() -> u32 {
+    TIMER_INITIAL_COUNT.load(Ordering::Relaxed)
 }
 
 /// Initialize the local APIC: enable it and set the spurious vector.

@@ -50,9 +50,22 @@ pub unsafe fn init_paging(phys_offset: crate::VirtAddr) {
 }
 
 /// Final stage: enable interrupts, start the LAPIC timer, ready for scheduling.
+///
+/// Uses the shared timer initial-count if the BSP already calibrated during
+/// SMP bring-up; otherwise calibrates now. APs never call this — they start
+/// their own timers from the shared count inside `ap_entry`.
 pub fn init_late() {
     interrupts::init();
-    let initial_count = lapic::calibrate_timer();
+    let initial_count = {
+        let shared = lapic::timer_initial_count();
+        if shared != 0 {
+            shared
+        } else {
+            let c = lapic::calibrate_timer();
+            lapic::set_timer_initial_count(c);
+            c
+        }
+    };
     unsafe {
         lapic::timer_init(
             lapic::TimerDivide::Div16,
