@@ -145,14 +145,19 @@ fn launch_service(logger: &mut InitLogger, name: &str, elf: &[u8]) -> Option<(Pr
 
 fn read_ready_message(logger: &mut InitLogger, name: &str, channel: &Channel) {
     let mut buf = [0u8; 64];
-    for _ in 0..2000 {
+    // Cooperative poll with a high attempt budget. Under SMP the service may
+    // be scheduled much later; avoid timed-park here (timeout arming is still
+    // young) so a stuck waiter cannot freeze init.
+    for _ in 0..20_000 {
         match channel.read_into(&mut buf) {
             Ok(n) => {
                 let msg = core::str::from_utf8(&buf[..n]).unwrap_or("<non-utf8>");
                 init_logln!(logger, "[init] {} says {}", name, msg);
                 return;
             }
-            Err(ErrorCode::ShouldWait) => libcanvas::process::yield_now(),
+            Err(ErrorCode::ShouldWait) | Err(ErrorCode::TimedOut) => {
+                libcanvas::process::yield_now();
+            }
             Err(e) => {
                 init_logln!(
                     logger,
