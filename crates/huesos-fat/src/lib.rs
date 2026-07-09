@@ -196,7 +196,7 @@ impl<'a, D: BlockDevice> FatFileSystem<'a, D> {
     fn find_entry_in_dir(&self, dir_cluster: u32, name: &str) -> Result<DirectoryEntry, DriverError> {
         let mut cluster = dir_cluster;
 
-        while cluster != 0 && cluster < 0x0FFFFFF8 {
+        while !self.is_end_of_chain(cluster) {
             let sector = self.cluster_to_sector(cluster);
             let sectors_per_cluster = self.bpb.sectors_per_cluster as u32;
 
@@ -253,7 +253,7 @@ impl<'a, D: BlockDevice> FatFileSystem<'a, D> {
         let mut cluster = entry.first_cluster();
         let mut remaining = entry.file_size as usize;
 
-        while remaining > 0 && cluster != 0 && cluster < 0x0FFFFFF8 {
+        while remaining > 0 && !self.is_end_of_chain(cluster) {
             let sector = self.cluster_to_sector(cluster);
             let sectors_per_cluster = self.bpb.sectors_per_cluster as u32;
 
@@ -279,6 +279,23 @@ impl<'a, D: BlockDevice> FatFileSystem<'a, D> {
     }
 
     // ==================== FAT CHAIN HELPERS ====================
+
+    /// True for free (0), reserved, or end-of-chain markers.
+    ///
+    /// FAT16 EOC is `0xFFF8..=0xFFFF`; FAT32 EOC is `0x0FFFFFF8..=0x0FFFFFFF`
+    /// (top nibble ignored on disk, but we only store the low 28 bits here).
+    /// The previous code used the FAT32 threshold for both, so a FAT16 EOC
+    /// value like `0xFFFF` was treated as a valid data cluster.
+    fn is_end_of_chain(&self, cluster: u32) -> bool {
+        if cluster < 2 {
+            return true;
+        }
+        if self.is_fat32 {
+            cluster >= 0x0FFF_FFF8
+        } else {
+            cluster >= 0xFFF8
+        }
+    }
 
     fn get_next_cluster(&self, cluster: u32) -> Result<u32, DriverError> {
         let bytes_per_sec = self.bpb.bytes_per_sector as u32;
