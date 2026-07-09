@@ -4,6 +4,8 @@
 //!
 //! SMP-aware: each CPU has its own scheduler instance accessed via LAPIC ID.
 //! Protected by spinlocks to prevent cross-core race conditions.
+//! Task structures are individually heap-allocated (Boxed) to guarantee
+//! stable memory addresses and prevent dangling pointers during resizes.
 //!
 //! Advanced Scheduling Modes:
 //! 1. Fair Scheduling (Default out of the box):
@@ -21,6 +23,7 @@ pub mod wavl;
 use crate::task::{Task, TaskKind};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use alloc::boxed::Box;
 use core::sync::atomic::Ordering;
 use huesos_object::Process;
 use x86_64::VirtAddr;
@@ -58,7 +61,7 @@ static PER_CPU_SCHEDULERS: [spin::Mutex<Scheduler>; MAX_CPUS] =
     [const { spin::Mutex::new(Scheduler::new()) }; MAX_CPUS];
 
 struct Scheduler {
-    tasks: Vec<Task>,
+    tasks: Vec<Box<Task>>,
     current: usize,
     fair_queue: wavl::WavlTree,
     ticks: u64,
@@ -78,7 +81,7 @@ impl Scheduler {
         let id = task.id;
         let idx = self.tasks.len();
         let policy = task.sched_policy;
-        self.tasks.push(task);
+        self.tasks.push(Box::new(task));
         if idx > 0 {
             if let SchedPolicy::Fair { vruntime, .. } = policy {
                 self.fair_queue.insert(vruntime, id);
@@ -182,14 +185,14 @@ impl Scheduler {
         self.current = next_idx;
         self.apply_task_environment(self.current);
 
-        let old_ptr = &raw mut self.tasks[old_index].context;
-        let new_ptr = &raw const self.tasks[self.current].context;
+        let old_ptr = &raw mut (*self.tasks[old_index]).context;
+        let new_ptr = &raw const (*self.tasks[self.current]).context;
 
         Some((old_ptr, new_ptr))
     }
 
     fn current_task(&self) -> Option<&Task> {
-        self.tasks.get(self.current)
+        self.tasks.get(self.current).map(|t| &**t)
     }
 }
 
