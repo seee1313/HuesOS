@@ -304,13 +304,23 @@ pub fn park_current() {
         let idx = guard.current;
         if let Some(task) = guard.tasks.get_mut(idx) {
             task.blocked.store(true, Ordering::SeqCst);
-            // Remove from fair tree so tick will not pick us.
             if let SchedPolicy::Fair { vruntime, .. } = task.sched_policy {
                 let id = task.id;
                 guard.fair_queue.remove(vruntime, id);
             }
         }
-        let switch_context = guard.tick();
+        // Prefer tick(); if it declines to switch (edge case), force idle.
+        let switch_context = guard.tick().or_else(|| {
+            if guard.current == 0 || guard.tasks.len() <= 1 {
+                return None;
+            }
+            let old = guard.current;
+            guard.current = 0;
+            guard.apply_task_environment(0);
+            let old_ptr = &raw mut (*guard.tasks[old]).context;
+            let new_ptr = &raw const (*guard.tasks[0]).context;
+            Some((old_ptr, new_ptr))
+        });
         drop(guard);
         if let Some((old_ptr, new_ptr)) = switch_context {
             unsafe {
@@ -322,6 +332,11 @@ pub fn park_current() {
 }
 
 /// Wake a previously parked task. Safe to call from IRQ context (port queue).
+///
+/// Always clears `blocked` and ensures the task is on the fair runqueue.
+/// This closes the lost-wakeup race where `wake` arrived after enqueue but
+/// before `park_current` set `blocked=true` (swap would early-return and the
+/// subsequent park would sleep forever).
 pub fn wake_task(task_id: u64) {
     let cpu = (task_id >> 32) as usize;
     if cpu >= MAX_CPUS {
@@ -332,18 +347,19 @@ pub fn wake_task(task_id: u64) {
     let Some(task) = guard.tasks.get_mut(idx) else {
         return;
     };
-    if !task.blocked.swap(false, Ordering::SeqCst) {
-        // Already runnable.
-        return;
-    }
     if task.finished.load(Ordering::Relaxed) {
+        task.blocked.store(false, Ordering::SeqCst);
         return;
     }
+    task.blocked.store(false, Ordering::SeqCst);
     if let SchedPolicy::Fair { vruntime, .. } = task.sched_policy {
-        guard.fair_queue.insert(vruntime, task_id);
+        // insert is idempotent enough if we remove first (wavl may allow dup — remove first)
+        let id = task.id;
+        let vr = vruntime;
+        guard.fair_queue.remove(vr, id);
+        guard.fair_queue.insert(vr, id);
     }
     drop(guard);
-    // Nudge the target CPU if remote.
     if cpu != cpu_id() {
         huesos_arch::lapic::ipi_reschedule(cpu as u8);
     }

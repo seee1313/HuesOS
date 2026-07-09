@@ -6,6 +6,10 @@ use crate::protocol;
 use crate::registry::{ServiceRegistry, ServiceState};
 use libcanvas::{println, Channel, ErrorCode, Process, Vmo};
 
+/// Fallback embedded DriverHost image (same binary packaged into BOOTFS).
+/// Prefer this over spawn_elf_from_vmo until VMO-backed launch is fully solid.
+static INPUT_HOST_ELF: &[u8] = include_bytes!(env!("HUESOS_INPUT_DRIVER_HOST_PATH"));
+
 /// DriverManager runtime.
 pub struct DriverManager {
     registry: ServiceRegistry,
@@ -86,15 +90,31 @@ impl DriverManager {
             }
         };
 
-        // 3. Launch DriverHost from VMO.
-        match libcanvas::process::spawn_elf_from_vmo(
-            manifest.name_as_str(),
-            vmo,
-            entry.offset,
-            entry.len,
-        ) {
+        // 3. Launch DriverHost.
+        // Prefer the build-time embedded ELF (reliable). Fall back to BOOTFS VMO
+        // launch if embedding is unavailable for some reason.
+        let launched = libcanvas::process::spawn_elf(manifest.name_as_str(), INPUT_HOST_ELF).or_else(
+            |e| {
+                println!(
+                    "[driver-manager] embedded launch failed ({}), trying BOOTFS VMO",
+                    e.as_str()
+                );
+                let _ = entry; // used only for VMO path
+                let _ = vmo;
+                libcanvas::process::spawn_elf_from_vmo(
+                    manifest.name_as_str(),
+                    vmo,
+                    entry.offset,
+                    entry.len,
+                )
+            },
+        );
+        match launched {
             Ok((process, bootstrap)) => {
-                println!("[driver-manager] launched DriverHost {} from BOOTFS", manifest.name_as_str());
+                println!(
+                    "[driver-manager] launched DriverHost {}",
+                    manifest.name_as_str()
+                );
                 self.input_host = Some(ManagedHost { process, bootstrap });
                 self.wait_for_input_host_ready();
             }
@@ -138,31 +158,14 @@ impl DriverManager {
     }
 
     fn wait_for_input_host_ready(&mut self) {
-        // ~5s at 100Hz ticks if host is silent; still poll other events.
-        for _ in 0..500 {
+        // Cooperative poll only — do not timed-park (can eat ready messages
+        // or hang if park/wake races). Host sends ready then stays alive.
+        for _ in 0..20_000 {
             self.poll_input_host();
             if self.keyboard_ready() {
                 return;
             }
-            // Timed park via host bootstrap if present (100 ticks ~ 1s).
-            if let Some(host) = self.input_host.as_ref() {
-                let mut buf = [0u8; 64];
-                match host.bootstrap.read_into_timeout(&mut buf, 100) {
-                    Ok(n) if n > 0 => {
-                        // Re-process through poll path next iteration.
-                        self.poll_input_host();
-                    }
-                    Ok(_) | Err(ErrorCode::TimedOut) | Err(ErrorCode::ShouldWait) => {}
-                    Err(e) => {
-                        println!(
-                            "[driver-manager] input host wait failed: {}",
-                            e.as_str()
-                        );
-                    }
-                }
-            } else {
-                libcanvas::process::yield_now();
-            }
+            libcanvas::process::yield_now();
         }
         println!("[driver-manager] input DriverHost did not become ready in time");
     }
