@@ -957,7 +957,7 @@ fn draw(
     };
     let _ = canvas.draw_text(MARGIN_X, 12, title, 200, 230, 255);
     let mut score_buf = [0u8; 24];
-    let score_txt = format_score(&mut score_buf, score);
+    let score_txt = format_labeled_u32(&mut score_buf, "Score: ", score);
     let _ = canvas.draw_text(MARGIN_X + 220, 12, score_txt, 180, 220, 160);
 
     let help = if hard {
@@ -981,7 +981,7 @@ fn draw(
     // Golden apple active text
     if let Some(gf) = gold_food {
         let mut gold_buf = [0u8; 24];
-        let gold_txt = format_gold_ttl(&mut gold_buf, gf.ttl);
+        let gold_txt = format_labeled_u32(&mut gold_buf, "Gold Apple: ", gf.ttl);
         let _ = canvas.draw_text(MARGIN_X + 340, 28, gold_txt, 255, 215, 0);
     }
 
@@ -1119,16 +1119,17 @@ fn fill_cell(canvas: &Canvas, x: u8, y: u8, r: u8, g: u8, b: u8) {
     let _ = canvas.fill_rect(px, py, CELL - 2, CELL - 2, r, g, b);
 }
 
-fn format_score(buf: &mut [u8], mut score: u32) -> &str {
-    let prefix = b"Score: ";
+/// Write `"<label><value>"` into `buf` and return the UTF-8 slice.
+/// no_std / no_alloc friendly — used for HUD text on the framebuffer.
+fn format_labeled_u32<'a>(buf: &'a mut [u8], label: &str, mut value: u32) -> &'a str {
     let mut i = 0;
-    for &c in prefix {
+    for &c in label.as_bytes() {
         if i < buf.len() {
             buf[i] = c;
             i += 1;
         }
     }
-    if score == 0 {
+    if value == 0 {
         if i < buf.len() {
             buf[i] = b'0';
             i += 1;
@@ -1136,9 +1137,9 @@ fn format_score(buf: &mut [u8], mut score: u32) -> &str {
     } else {
         let mut tmp = [0u8; 10];
         let mut n = 0;
-        while score > 0 && n < tmp.len() {
-            tmp[n] = b'0' + (score % 10) as u8;
-            score /= 10;
+        while value > 0 && n < tmp.len() {
+            tmp[n] = b'0' + (value % 10) as u8;
+            value /= 10;
             n += 1;
         }
         while n > 0 && i < buf.len() {
@@ -1147,36 +1148,5 @@ fn format_score(buf: &mut [u8], mut score: u32) -> &str {
             i += 1;
         }
     }
-    core::str::from_utf8(&buf[..i]).unwrap_or("Score: ?")
-}
-
-fn format_gold_ttl(buf: &mut [u8], mut score: u32) -> &str {
-    let prefix = b"Gold Apple: ";
-    let mut i = 0;
-    for &c in prefix {
-        if i < buf.len() {
-            buf[i] = c;
-            i += 1;
-        }
-    }
-    if score == 0 {
-        if i < buf.len() {
-            buf[i] = b'0';
-            i += 1;
-        }
-    } else {
-        let mut tmp = [0u8; 10];
-        let mut n = 0;
-        while score > 0 && n < tmp.len() {
-            tmp[n] = b'0' + (score % 10) as u8;
-            score /= 10;
-            n += 1;
-        }
-        while n > 0 && i < buf.len() {
-            n -= 1;
-            buf[i] = tmp[n];
-            i += 1;
-        }
-    }
-    core::str::from_utf8(&buf[..i]).unwrap_or("Gold Apple: ?")
+    core::str::from_utf8(&buf[..i]).unwrap_or("?")
 }
