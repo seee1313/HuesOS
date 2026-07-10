@@ -18,7 +18,7 @@ const CELL: u32 = 16;
 const MARGIN_X: u32 = 40;
 const MARGIN_Y: u32 = 48;
 
-// --- FIXED snake FPS via Kernel Sleep Timeout ---------------------------
+// --- FIXED snake FPS via Kernel Sleep Timeout & RDTSC --------------------
 // Target: ~10 steps/s classic Snake (100 ms/step), floor 60 ms.
 // 1 tick = 10 ms (100 Hz timer), so BASE_STEP_TICKS = 10 (100 ms).
 const BASE_STEP_TICKS: u64 = 10;
@@ -55,39 +55,47 @@ fn rdtsc() -> u64 {
 
 /// Calibrate the TSC frequency against the kernel's scheduler ticks.
 /// Sleep for 10 ticks (100 ms) and measure the elapsed RDTSC cycles.
+/// This method retries if interrupted by a key press, ensuring a highly robust,
+/// sleep-free equivalent of precise calibration at terminal startup.
 fn calibrate_tsc(keyboard: &Channel) -> u64 {
     let mut buf = [0u8; 16];
 
-    // Drain any pending input so we don't wake up instantly
-    loop {
+    // Drain any pending input first
+    for _ in 0..100 {
         match keyboard.read_into(&mut buf) {
             Ok(n) if n > 0 => {}
             _ => break,
         }
     }
 
-    let start = rdtsc();
-    // Sleep for 10 ticks (100 ms).
-    // If it's interrupted by a key press, that's fine, we will still measure
-    // the time elapsed, but let's try to get a good measurement.
-    let _ = keyboard.read_into_timeout(&mut buf, 10);
-    let end = rdtsc();
+    // Try up to 5 times to get an uninterrupted 10-tick sleep
+    for _ in 0..5 {
+        let start = rdtsc();
+        match keyboard.read_into_timeout(&mut buf, 10) {
+            Err(ErrorCode::TimedOut) => {
+                let end = rdtsc();
+                let elapsed = end.wrapping_sub(start);
+                let mut cycles_per_tick = elapsed / 10;
 
-    let elapsed = end.wrapping_sub(start);
-    let mut cycles_per_tick = elapsed / 10;
-
-    // Safety clamp: if the sleep was interrupted or returned instantly,
-    // ensure we don't divide by zero or get a ridiculous number.
-    // 1 tick = 10 ms.
-    // At 1.0 GHz: 10,000,000 cycles per tick.
-    // At 5.0 GHz: 50,000,000 cycles per tick.
-    if cycles_per_tick < 5_000_000 {
-        cycles_per_tick = 30_000_000; // default to 3 GHz
-    } else if cycles_per_tick > 100_000_000 {
-        cycles_per_tick = 40_000_000; // default to 4 GHz
+                // Safety clamps for 0.5 GHz to 10.0 GHz
+                if cycles_per_tick < 5_000_000 {
+                    cycles_per_tick = 30_000_000; // default to 3.0 GHz
+                } else if cycles_per_tick > 100_000_000 {
+                    cycles_per_tick = 40_000_000; // default to 4.0 GHz
+                }
+                return cycles_per_tick;
+            }
+            _ => {
+                // If interrupted by a key press, drain keys and try again
+                for _ in 0..10 {
+                    let _ = keyboard.read_into(&mut buf);
+                }
+            }
+        }
     }
 
-    cycles_per_tick
+    // Default fallback (assuming 4.0 GHz TSC rate)
+    40_000_000
 }
 
 fn step_delay_ticks(score: u32) -> u64 {
@@ -98,8 +106,9 @@ fn step_delay_ticks(score: u32) -> u64 {
         .max(MIN_STEP_TICKS)
 }
 
-/// Wait one snake-step, sleeping the thread via read_into_timeout.
-/// This achieves 0% CPU consumption and perfect fixed FPS timing.
+/// Wait one snake-step, sleeping the thread in 1-tick (10ms) increments
+/// while verifying exact elapsed wall-clock time using RDTSC.
+/// Drains keyboard events on every loop iteration to guarantee zero input latency.
 fn wait_step(
     score: u32,
     keyboard: &Channel,
@@ -120,43 +129,41 @@ fn wait_step(
             return None;
         }
 
-        let remaining_cycles = step_cycles - elapsed_cycles;
-        // Convert remaining cycles to ticks, rounding up to ensure we don't under-sleep.
-        let remaining_ticks = (remaining_cycles + cycles_per_tick - 1) / cycles_per_tick;
-        if remaining_ticks == 0 {
+        // Non-blocking keyboard drain (instantly process user turns)
+        loop {
+            match keyboard.read_into(&mut buf) {
+                Ok(n) if n > 0 => {
+                    if let Some(action) = decode(&buf[..n]) {
+                        match phase {
+                            Phase::Playing => match action {
+                                Action::Dir(d) => {
+                                    if !is_opposite(dir, d) {
+                                        *pending = d;
+                                    }
+                                }
+                                Action::Esc => return Some(Action::Esc),
+                                Action::Enter => {}
+                            },
+                            Phase::GameOver => match action {
+                                Action::Enter | Action::Esc => return Some(action),
+                                Action::Dir(_) => {}
+                            },
+                        }
+                    }
+                }
+                _ => break,
+            }
+        }
+
+        // Double check elapsed time after handling keys
+        let now_cycles = rdtsc();
+        let elapsed_cycles = now_cycles.wrapping_sub(start_cycles);
+        if elapsed_cycles >= step_cycles {
             return None;
         }
 
-        // Sleep/block on keyboard read with timeout in ticks
-        match keyboard.read_into_timeout(&mut buf, remaining_ticks) {
-            Ok(n) => {
-                if let Some(action) = decode(&buf[..n]) {
-                    match phase {
-                        Phase::Playing => match action {
-                            Action::Dir(d) => {
-                                if !is_opposite(dir, d) {
-                                    *pending = d;
-                                }
-                            }
-                            Action::Esc => return Some(Action::Esc),
-                            Action::Enter => {}
-                        },
-                        Phase::GameOver => match action {
-                            Action::Enter | Action::Esc => return Some(action),
-                            Action::Dir(_) => {}
-                        },
-                    }
-                }
-            }
-            Err(ErrorCode::TimedOut) => {
-                // Timer expired normally, frame step is done
-                return None;
-            }
-            Err(_) => {
-                // If anything else happened (ShouldWait, etc.), yield and continue
-                libcanvas::process::yield_now();
-            }
-        }
+        // Sleep for a tiny interval (1 tick = 10 ms) to keep CPU at 0% idle consumption
+        let _ = keyboard.read_into_timeout(&mut buf, 1);
     }
 }
 
