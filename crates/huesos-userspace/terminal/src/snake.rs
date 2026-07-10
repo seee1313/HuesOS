@@ -242,6 +242,9 @@ struct Bullet {
     pos: Point,
     dir: Dir,
     alive: bool,
+    /// Accumulated slowdown: the bullet skips this many upcoming steps.
+    /// Grows by 1 every time the bullet punches through a regular apple.
+    slow: u8,
 }
 
 #[derive(Clone, Copy)]
@@ -293,6 +296,7 @@ pub fn run(keyboard: &Channel, hard: bool) {
         pos: Point { x: 0, y: 0 },
         dir: Dir::Right,
         alive: false,
+        slow: 0,
     }; MAX_BULLETS];
     let mut rocket = Rocket {
         pos: Point { x: 0, y: 0 },
@@ -409,7 +413,16 @@ pub fn run(keyboard: &Channel, hard: bool) {
 
         // 3) Tick hazards
         if hard && phase == Phase::Playing {
-            if !tick_hazards(&mut bombs, &mut bullets, &mut rocket, &body, len, &mut rng) {
+            if !tick_hazards(
+                &mut bombs,
+                &mut bullets,
+                &mut rocket,
+                &body,
+                len,
+                &mut rng,
+                &mut food,
+                &mut gold_food,
+            ) {
                 phase = Phase::GameOver;
             }
         }
@@ -793,6 +806,7 @@ fn fire_ak(rng: &mut u32, body: &[Point; MAX_LEN], bullets: &mut [Bullet; MAX_BU
         b.pos = p;
         b.dir = dir;
         b.alive = true;
+        b.slow = 0;
         placed += 1;
     }
 }
@@ -833,6 +847,8 @@ fn tick_hazards(
     body: &[Point; MAX_LEN],
     len: usize,
     rng: &mut u32,
+    food: &mut Point,
+    gold_food: &mut Option<GoldFood>,
 ) -> bool {
     // Bombs: countdown and explode
     for b in bombs.iter_mut() {
@@ -855,24 +871,66 @@ fn tick_hazards(
         }
     }
 
-    // Bullets fly one cell per step
-    for b in bullets.iter_mut() {
-        if !b.alive {
+    // Bullets fly one cell per step, unless they are cooling down after
+    // punching through an apple. Each pierced apple adds +1 tick of skip
+    // to the cumulative `slow` counter, so a bullet that eats many apples
+    // eventually grinds to a near-halt (but never dies from cooldown alone).
+    //
+    // Interaction rules (see PR notes):
+    //   * Regular apple  -> bullet keeps flying, apple respawns,   slow += 1
+    //   * Gold apple     -> bullet dies, gold apple survives (armor)
+    //   * Snake body     -> bullet dies, snake dies (game over)
+    //   * Board edge     -> bullet dies
+    //
+    // We iterate by index because respawning a pierced apple needs to call
+    // spawn_food(..., bullets, ...) which conflicts with an iter_mut()
+    // borrow on the bullets slice. A snapshot copy lets us pass the bullet
+    // positions into spawn_food while still mutating `bullets` here.
+    for i in 0..bullets.len() {
+        if !bullets[i].alive {
             continue;
         }
-        if on_snake(body, len, b.pos) {
-            b.alive = false;
+        // Snake standing where the bullet already is? That still kills.
+        if on_snake(body, len, bullets[i].pos) {
+            bullets[i].alive = false;
             return false;
         }
-        match step_point(b.pos, b.dir) {
+        // Cooldown: skip this step's movement but keep the bullet alive.
+        if bullets[i].slow > 0 {
+            bullets[i].slow -= 1;
+            continue;
+        }
+        match step_point(bullets[i].pos, bullets[i].dir) {
             Some(np) => {
-                b.pos = np;
-                if on_snake(body, len, b.pos) {
-                    b.alive = false;
+                bullets[i].pos = np;
+                if on_snake(body, len, bullets[i].pos) {
+                    bullets[i].alive = false;
                     return false;
                 }
+                // Gold apple acts as armor: bullet dies, apple survives.
+                if let Some(gf) = *gold_food {
+                    if gf.pos.x == bullets[i].pos.x && gf.pos.y == bullets[i].pos.y {
+                        bullets[i].alive = false;
+                        continue;
+                    }
+                }
+                // Regular apple: pierce through, respawn it, accumulate slow.
+                if food.x == bullets[i].pos.x && food.y == bullets[i].pos.y {
+                    let bullets_snapshot = *bullets;
+                    *food = spawn_food(
+                        body,
+                        len,
+                        rng,
+                        bombs,
+                        &bullets_snapshot,
+                        rocket,
+                        *gold_food,
+                        None,
+                    );
+                    bullets[i].slow = bullets[i].slow.saturating_add(1);
+                }
             }
-            None => b.alive = false,
+            None => bullets[i].alive = false,
         }
     }
 
