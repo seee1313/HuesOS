@@ -137,7 +137,13 @@ fn wait_step(
                         match phase {
                             Phase::Playing => match action {
                                 Action::Dir(d) => {
-                                    if !is_opposite(dir, d) {
+                                    // Reject a turn that would reverse either the
+                                    // committed direction OR an already-queued one.
+                                    // Without the second check, pressing Up then
+                                    // Down within a single step while moving Right
+                                    // would accept Down (not opposite to Right) and
+                                    // the snake would eat its own neck next tick.
+                                    if !is_opposite(dir, d) && !is_opposite(*pending, d) {
                                         *pending = d;
                                     }
                                 }
