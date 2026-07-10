@@ -18,10 +18,18 @@ const CELL: u32 = 16;
 const MARGIN_X: u32 = 40;
 const MARGIN_Y: u32 = 48;
 
-// Pacing (~10 steps/s base, mild speed-up with score).
-const BASE_STEP_QUANTA: u32 = 10;
-const MIN_STEP_QUANTA: u32 = 5;
-const SPIN_AFTER_YIELD: u32 = 80_000;
+// --- FIXED snake FPS via RDTSC busy-wait ---------------------------------
+// Real hardware: if only one userspace task is ready, `yield_now` returns
+// almost immediately → "count yields" = light-speed (seen on MSI Ryzen).
+// Fix: one snake step = fixed wall-ish delay measured with RDTSC.
+//
+// We assume a *high* TSC rate (4 GHz). On slower chips the game is a bit
+// slower (safer). Target: ~10 steps/s classic Snake (100 ms/step), floor 60 ms.
+const ASSUMED_TSC_HZ: u64 = 4_000_000_000;
+/// Fixed base delay between snake moves (~10 FPS).
+const BASE_STEP_MS: u64 = 100;
+/// Fastest pace after eating many apples (~16 FPS).
+const MIN_STEP_MS: u64 = 60;
 
 // Hard-mode events.
 const MAX_BOMBS: usize = 6;
@@ -36,17 +44,85 @@ const BOMB_R_LARGE: i16 = 2;
 /// Kalash: bullets advance every snake step.
 const KALASH_BURST: usize = 5;
 
-fn step_period_quanta(score: u32) -> u32 {
-    let faster = score / 4;
-    BASE_STEP_QUANTA.saturating_sub(faster).max(MIN_STEP_QUANTA)
+#[inline]
+fn rdtsc() -> u64 {
+    let lo: u32;
+    let hi: u32;
+    // SAFETY: rdtsc is unprivileged on long-mode x86_64 with default CR4.
+    unsafe {
+        core::arch::asm!(
+            "rdtsc",
+            out("eax") lo,
+            out("edx") hi,
+            options(nomem, nostack, preserves_flags)
+        );
+    }
+    ((hi as u64) << 32) | (lo as u64)
 }
 
-fn frame_quantum() {
-    libcanvas::process::yield_now();
-    let mut i = 0u32;
-    while i < SPIN_AFTER_YIELD {
+fn step_delay_cycles(score: u32) -> u64 {
+    // Mild speed-up: every 5 food, −5 ms, never below MIN_STEP_MS.
+    let faster_ms = (score as u64 / 5) * 5;
+    let ms = BASE_STEP_MS.saturating_sub(faster_ms).max(MIN_STEP_MS);
+    // cycles = Hz * ms / 1000
+    ASSUMED_TSC_HZ.saturating_mul(ms) / 1000
+}
+
+/// Wait one snake-step, polling the keyboard the whole time so turns stay
+/// responsive. Returns `Some(Esc)` if the player quits mid-wait.
+fn wait_step(
+    score: u32,
+    keyboard: &Channel,
+    dir: Dir,
+    pending: &mut Dir,
+    phase: Phase,
+) -> Option<Action> {
+    let need = step_delay_cycles(score);
+    let start = rdtsc();
+    let mut buf = [0u8; 16];
+    let mut last_yield = start;
+
+    loop {
+        // Keyboard (non-blocking drain).
+        loop {
+            match keyboard.read_into(&mut buf) {
+                Ok(n) => {
+                    if let Some(action) = decode(&buf[..n]) {
+                        match phase {
+                            Phase::Playing => match action {
+                                Action::Dir(d) => {
+                                    if !is_opposite(dir, d) {
+                                        *pending = d;
+                                    }
+                                }
+                                Action::Esc => return Some(Action::Esc),
+                                Action::Enter => {}
+                            },
+                            Phase::GameOver => match action {
+                                Action::Enter | Action::Esc => return Some(action),
+                                Action::Dir(_) => {}
+                            },
+                        }
+                    }
+                }
+                Err(ErrorCode::ShouldWait) | Err(ErrorCode::TimedOut) => break,
+                Err(_) => break,
+            }
+        }
+
+        let now = rdtsc();
+        if now.wrapping_sub(start) >= need {
+            // Play nice with other tasks once per step.
+            libcanvas::process::yield_now();
+            return None;
+        }
+        // Occasional yield so SMP/other processes aren't starved for 100ms.
+        if now.wrapping_sub(last_yield) > ASSUMED_TSC_HZ / 200 {
+            // ~5 ms
+            libcanvas::process::yield_now();
+            last_yield = rdtsc();
+        }
         core::hint::spin_loop();
-        i = i.wrapping_add(1);
     }
 }
 
@@ -119,7 +195,6 @@ pub fn run(keyboard: &Channel, hard: bool) {
     let mut food = Point { x: 10, y: 8 };
     let mut phase = Phase::Playing;
     let mut score = 0u32;
-    let mut quanta = 0u32;
     let mut rng = 0xC0FF_EE42u32;
 
     let mut bombs = [Bomb {
@@ -140,7 +215,7 @@ pub fn run(keyboard: &Channel, hard: bool) {
     };
     let mut banner = EventBanner::None;
     let mut banner_ttl: u32 = 0;
-    /// Pending event to fire right after eating (when score hits 2,4,6…).
+    // Pending event to fire right after eating (when score hits 2,4,6…).
     let mut pending_event = false;
 
     reset(
@@ -163,122 +238,107 @@ pub fn run(keyboard: &Channel, hard: bool) {
         &canvas, hard, &body, len, food, phase, score, &bombs, &bullets, &rocket, banner,
     );
 
-    let mut buf = [0u8; 16];
     loop {
-        // Keyboard
-        loop {
-            match keyboard.read_into(&mut buf) {
-                Ok(n) => {
-                    if let Some(action) = decode(&buf[..n]) {
-                        match phase {
-                            Phase::Playing => match action {
-                                Action::Dir(d) => {
-                                    if !is_opposite(dir, d) {
-                                        pending = d;
-                                    }
-                                }
-                                Action::Esc => return,
-                                Action::Enter => {}
-                            },
-                            Phase::GameOver => match action {
-                                Action::Enter => {
-                                    reset(
-                                        &mut body,
-                                        &mut len,
-                                        &mut dir,
-                                        &mut pending,
-                                        &mut food,
-                                        &mut score,
-                                        &mut phase,
-                                        &mut rng,
-                                        &mut bombs,
-                                        &mut bullets,
-                                        &mut rocket,
-                                        &mut banner,
-                                        &mut banner_ttl,
-                                        &mut pending_event,
-                                    );
-                                    quanta = 0;
-                                    draw(
-                                        &canvas, hard, &body, len, food, phase, score, &bombs,
-                                        &bullets, &rocket, banner,
-                                    );
-                                }
-                                Action::Esc => return,
-                                Action::Dir(_) => {}
-                            },
-                        }
+        // Wait one paced step (~110 ms base), polling keys the whole time.
+        if let Some(action) = wait_step(score, keyboard, dir, &mut pending, phase) {
+            match phase {
+                Phase::Playing => {
+                    // Only Esc is returned from wait_step in Playing.
+                    if matches!(action, Action::Esc) {
+                        return;
                     }
                 }
-                Err(ErrorCode::ShouldWait) | Err(ErrorCode::TimedOut) => break,
-                Err(_) => break,
+                Phase::GameOver => match action {
+                    Action::Enter => {
+                        reset(
+                            &mut body,
+                            &mut len,
+                            &mut dir,
+                            &mut pending,
+                            &mut food,
+                            &mut score,
+                            &mut phase,
+                            &mut rng,
+                            &mut bombs,
+                            &mut bullets,
+                            &mut rocket,
+                            &mut banner,
+                            &mut banner_ttl,
+                            &mut pending_event,
+                        );
+                        draw(
+                            &canvas, hard, &body, len, food, phase, score, &bombs, &bullets,
+                            &rocket, banner,
+                        );
+                        continue;
+                    }
+                    Action::Esc => return,
+                    Action::Dir(_) => {}
+                },
             }
         }
 
-        if phase == Phase::Playing {
-            quanta = quanta.wrapping_add(1);
-            if quanta >= step_period_quanta(score) {
-                quanta = 0;
-                dir = pending;
+        if phase != Phase::Playing {
+            // Game over: keep polling via wait_step (uses same delay so Esc/Enter
+            // stay responsive without spinning the CPU flat-out).
+            continue;
+        }
 
-                // 1) Move snake
-                if !step(
-                    &mut body,
-                    &mut len,
-                    dir,
-                    &mut food,
-                    &mut score,
-                    &mut rng,
-                    hard,
-                    &mut pending_event,
-                ) {
-                    phase = Phase::GameOver;
-                }
+        dir = pending;
 
-                // 2) Spawn hard-mode event after every 2 apples
-                if hard && pending_event && phase == Phase::Playing {
-                    pending_event = false;
-                    spawn_event(
-                        &mut rng,
-                        &body,
-                        len,
-                        &mut bombs,
-                        &mut bullets,
-                        &mut rocket,
-                        &mut banner,
-                        &mut banner_ttl,
-                    );
-                }
+        // 1) Move snake
+        if !step(
+            &mut body,
+            &mut len,
+            dir,
+            &mut food,
+            &mut score,
+            &mut rng,
+            hard,
+            &mut pending_event,
+        ) {
+            phase = Phase::GameOver;
+        }
 
-                // 3) Tick hazards
-                if hard && phase == Phase::Playing {
-                    if !tick_hazards(
-                        &mut bombs,
-                        &mut bullets,
-                        &mut rocket,
-                        &body,
-                        len,
-                        &mut rng,
-                    ) {
-                        phase = Phase::GameOver;
-                    }
-                }
+        // 2) Spawn hard-mode event after every 2 apples
+        if hard && pending_event && phase == Phase::Playing {
+            pending_event = false;
+            spawn_event(
+                &mut rng,
+                &body,
+                len,
+                &mut bombs,
+                &mut bullets,
+                &mut rocket,
+                &mut banner,
+                &mut banner_ttl,
+            );
+        }
 
-                if banner_ttl > 0 {
-                    banner_ttl -= 1;
-                    if banner_ttl == 0 {
-                        banner = EventBanner::None;
-                    }
-                }
-
-                draw(
-                    &canvas, hard, &body, len, food, phase, score, &bombs, &bullets, &rocket,
-                    banner,
-                );
+        // 3) Tick hazards
+        if hard && phase == Phase::Playing {
+            if !tick_hazards(
+                &mut bombs,
+                &mut bullets,
+                &mut rocket,
+                &body,
+                len,
+                &mut rng,
+            ) {
+                phase = Phase::GameOver;
             }
         }
 
-        frame_quantum();
+        if banner_ttl > 0 {
+            banner_ttl -= 1;
+            if banner_ttl == 0 {
+                banner = EventBanner::None;
+            }
+        }
+
+        draw(
+            &canvas, hard, &body, len, food, phase, score, &bombs, &bullets, &rocket, banner,
+        );
     }
 }
 
