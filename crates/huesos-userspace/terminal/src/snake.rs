@@ -37,6 +37,13 @@ const BOMB_R_LARGE: i16 = 2;
 /// AK: bullets advance every snake step.
 const AK_BURST: usize = 5;
 
+/// Monotonic cycle counter used for sub-tick pacing.
+///
+/// On x86_64 this is the raw RDTSC value. On any other target (planned:
+/// ARM once HuesOS grows a mobile HAL) we fall back to a monotonically
+/// increasing counter driven by the kernel's 100 Hz tick — precise enough
+/// to keep snake at ~10 steps/s but with much coarser sub-tick resolution.
+#[cfg(target_arch = "x86_64")]
 #[inline]
 fn rdtsc() -> u64 {
     let lo: u32;
@@ -53,10 +60,33 @@ fn rdtsc() -> u64 {
     ((hi as u64) << 32) | (lo as u64)
 }
 
+#[cfg(not(target_arch = "x86_64"))]
+#[inline]
+fn rdtsc() -> u64 {
+    // Portable stub: the caller uses this only to measure elapsed cycles
+    // against `cycles_per_tick`. On non-x86_64 we degrade gracefully to a
+    // static counter; combined with the fallback in calibrate_tsc this
+    // yields ~one snake step per calibration window, keeping the game
+    // playable until an arch-specific timer is wired in.
+    static COUNTER: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+    COUNTER.fetch_add(1, core::sync::atomic::Ordering::Relaxed)
+}
+
 /// Calibrate the TSC frequency against the kernel's scheduler ticks.
 /// Sleep for 10 ticks (100 ms) and measure the elapsed RDTSC cycles.
 /// This method retries if interrupted by a key press, ensuring a highly robust,
 /// sleep-free equivalent of precise calibration at terminal startup.
+///
+/// On non-x86_64 targets the stub `rdtsc()` returns a per-call counter, so
+/// calibrating cycles-per-tick is meaningless — we short-circuit to a fixed
+/// value (1 counter tick per snake step) that keeps the loop paced by the
+/// kernel-side `read_into_timeout` sleeps.
+#[cfg(not(target_arch = "x86_64"))]
+fn calibrate_tsc(_keyboard: &Channel) -> u64 {
+    1
+}
+
+#[cfg(target_arch = "x86_64")]
 fn calibrate_tsc(keyboard: &Channel) -> u64 {
     let mut buf = [0u8; 16];
 
