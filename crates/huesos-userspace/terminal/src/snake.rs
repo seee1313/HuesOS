@@ -492,12 +492,20 @@ fn step(
         }
     }
 
-    let mut i = *len - 1;
-    while i > 0 {
-        body[i] = body[i - 1];
-        i -= 1;
+    // Guard against a zero-length body: `*len - 1` would underflow.
+    // Today `reset()` seeds len=3 and it only grows, but this keeps
+    // `step()` safe if a future caller ever runs it with an empty body.
+    if *len > 0 {
+        let mut i = *len - 1;
+        while i > 0 {
+            body[i] = body[i - 1];
+            i -= 1;
+        }
+        body[0] = next;
+    } else {
+        body[0] = next;
+        *len = 1;
     }
-    body[0] = next;
 
     if eat {
         *food = spawn_food(body, *len, rng, bombs, bullets, rocket, *gold_food);
