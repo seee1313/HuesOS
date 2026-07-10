@@ -3,7 +3,7 @@
 //! Classic: `snake` — normal pace, no hazards.
 //! Hard:    `snake hard` — every 2 apples a random event:
 //!   1) Bombs (small / large blast radius)
-//!   2) Kalash short burst across a row/col
+//!   2) AK short burst across a row/col
 //!   3) Homing rocket that chases the head for ~3s
 //!
 //! Controls: WASD/HJKL, Enter restart, Esc quit to shell.
@@ -34,8 +34,8 @@ const BOMB_FUSE_SMALL: u32 = 12;
 const BOMB_FUSE_LARGE: u32 = 16;
 const BOMB_R_SMALL: i16 = 1;
 const BOMB_R_LARGE: i16 = 2;
-/// Kalash: bullets advance every snake step.
-const KALASH_BURST: usize = 5;
+/// AK: bullets advance every snake step.
+const AK_BURST: usize = 5;
 
 #[inline]
 fn rdtsc() -> u64 {
@@ -225,7 +225,7 @@ struct Rocket {
 enum EventBanner {
     None,
     Bombs,
-    Kalash,
+    Ak,
     Rocket,
 }
 
@@ -657,10 +657,10 @@ fn spawn_event(
             }
         }
         1 => {
-            // Kalash burst from a board edge toward the head row/col
-            *banner = EventBanner::Kalash;
+            // AK burst from a board edge toward the head row/col
+            *banner = EventBanner::Ak;
             *banner_ttl = 14;
-            fire_kalash(rng, body, bullets);
+            fire_ak(rng, body, bullets);
         }
         _ => {
             // Homing rocket near opposite side of head
@@ -718,7 +718,7 @@ fn place_bomb(
     }
 }
 
-fn fire_kalash(rng: &mut u32, body: &[Point; MAX_LEN], bullets: &mut [Bullet; MAX_BULLETS]) {
+fn fire_ak(rng: &mut u32, body: &[Point; MAX_LEN], bullets: &mut [Bullet; MAX_BULLETS]) {
     let head = body[0];
     *rng = rng.wrapping_mul(22695477).wrapping_add(1);
     // Prefer horizontal or vertical sweep through the head.
@@ -749,7 +749,7 @@ fn fire_kalash(rng: &mut u32, body: &[Point; MAX_LEN], bullets: &mut [Bullet; MA
 
     let mut placed = 0usize;
     for b in bullets.iter_mut() {
-        if placed >= KALASH_BURST {
+        if placed >= AK_BURST {
             break;
         }
         if b.alive {
@@ -971,7 +971,7 @@ fn draw(
     let banner_txt = match banner {
         EventBanner::None => "",
         EventBanner::Bombs => "!! BOMBS INCOMING !!",
-        EventBanner::Kalash => "!! KALASH BURST !!",
+        EventBanner::Ak => "!! AK BURST !!",
         EventBanner::Rocket => "!! HOMING ROCKET !!",
     };
     if !banner_txt.is_empty() {
