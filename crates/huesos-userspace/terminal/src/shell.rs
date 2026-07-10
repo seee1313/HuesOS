@@ -45,7 +45,7 @@ impl Shell {
         let mut screen = Screen::new();
         screen.clear();
         screen.write_line("HuesOS Terminal");
-        screen.write_line("userspace mini shell — type 'help', try 'snake'");
+        screen.write_line("userspace mini shell — try 'snake' or 'snake hard'");
         screen.write_line("keyboard: DriverManager keyboard service");
         screen.write_line("");
 
@@ -109,13 +109,13 @@ impl Shell {
             Key::Enter => {
                 self.screen.newline();
                 let line = core::str::from_utf8(&self.input[..self.input_len]).unwrap_or("");
-                if line.trim() == "snake" {
-                    // Fullscreen TUI; redraw shell when it returns.
-                    snake::run(&self.keyboard);
-                    self.redraw_after_game();
+                let trimmed = line.trim();
+                if trimmed == "snake" || trimmed == "snake hard" {
+                    let hard = trimmed.ends_with("hard");
+                    snake::run(&self.keyboard, hard);
+                    self.redraw_after_game(hard);
                 } else {
                     execute_line(line, &mut self.screen, self.filesystem.as_ref());
-                    self.input_len = 0;
                     self.prompt();
                 }
                 self.input_len = 0;
@@ -124,10 +124,16 @@ impl Shell {
         self.screen.render();
     }
 
-    fn redraw_after_game(&mut self) {
+    fn redraw_after_game(&mut self, hard: bool) {
         self.screen.clear();
         self.screen.write_line("HuesOS Terminal");
-        self.screen.write_line("back from snake — type 'help' or 'snake'");
+        if hard {
+            self.screen
+                .write_line("back from snake HARD — try 'snake' or 'snake hard'");
+        } else {
+            self.screen
+                .write_line("back from snake — try 'snake' or 'snake hard'");
+        }
         self.screen.write_line("");
         self.prompt();
         self.screen.render();
