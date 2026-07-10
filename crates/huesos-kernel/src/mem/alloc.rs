@@ -1,7 +1,7 @@
 #![allow(dead_code)]
 
 use core::alloc::{GlobalAlloc, Layout};
-use spin::Mutex;
+use huesos_arch::IrqSafeTicketLock;
 
 use huesos_alloc::{BuddyAllocator, SlabAllocator, BuddyProvider, AllocError};
 
@@ -62,7 +62,7 @@ pub unsafe fn kfree(ptr: usize, size: usize) {
     if let Some(a) = lock.as_mut() { a.kfree(ptr, size); }
 }
 
-pub static GLOBAL_ALLOCATOR: Mutex<Option<KernelAllocator>> = Mutex::new(None);
+pub static GLOBAL_ALLOCATOR: IrqSafeTicketLock<Option<KernelAllocator>> = IrqSafeTicketLock::new(None);
 
 pub struct KernelGlobalAlloc;
 

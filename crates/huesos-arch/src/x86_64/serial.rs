@@ -1,10 +1,10 @@
 //! Serial port (COM1) driver using the `uart_16550` crate.
 
 use core::fmt;
-use spin::Mutex;
 use uart_16550::SerialPort;
+use crate::IrqSafeTicketLock;
 
-static SERIAL: Mutex<SerialPort> = Mutex::new(unsafe { SerialPort::new(0x3F8) });
+static SERIAL: IrqSafeTicketLock<SerialPort> = IrqSafeTicketLock::new(unsafe { SerialPort::new(0x3F8) });
 
 /// Initialize COM1 to 115200 8N1.
 pub fn init() {

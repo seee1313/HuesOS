@@ -1,8 +1,8 @@
 //! Global timer tick callback to avoid arch -> kernel dependency.
 
-use spin::Mutex;
+use crate::IrqSafeTicketLock;
 
-static TIMER_CALLBACK: Mutex<Option<&'static (dyn Fn() + Send + Sync)>> = Mutex::new(None);
+static TIMER_CALLBACK: IrqSafeTicketLock<Option<&'static (dyn Fn() + Send + Sync)>> = IrqSafeTicketLock::new(None);
 
 /// Set the timer tick callback. Should be called by kernel once.
 pub fn set_timer_callback(f: &'static (dyn Fn() + Send + Sync)) {

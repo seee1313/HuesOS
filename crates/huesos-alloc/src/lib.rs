@@ -15,11 +15,9 @@ pub enum AllocError {
 }
 
 pub struct BuddyAllocator<const ORDER: usize> {
-    free_lists: [Option<*mut FreeBlock>; ORDER],
+    // Raw pointer to head of free list. null = empty.
+    free_lists: [*mut FreeBlock; ORDER],
     base_addr: usize,
-    /// Page size in bytes used for buddy address arithmetic.
-    /// Previously allocate/deallocate hardcoded 4096 even when `new` was
-    /// given a different page_size, which corrupts the free lists.
     page_size: usize,
     #[allow(dead_code)]
     total_pages: usize,
@@ -27,13 +25,13 @@ pub struct BuddyAllocator<const ORDER: usize> {
 
 #[repr(C)]
 struct FreeBlock {
-    next: Option<*mut FreeBlock>,
+    next: *mut FreeBlock,
 }
 
 impl<const ORDER: usize> BuddyAllocator<ORDER> {
     pub unsafe fn new(base_addr: usize, total_pages: usize, page_size: usize) -> Self {
         let mut allocator = Self {
-            free_lists: [None; ORDER],
+            free_lists: [core::ptr::null_mut(); ORDER],
             base_addr,
             page_size,
             total_pages,
@@ -49,6 +47,7 @@ impl<const ORDER: usize> BuddyAllocator<ORDER> {
             }
 
             let block_ptr = (base_addr + current_offset * page_size) as *mut FreeBlock;
+            debug_assert_eq!(block_ptr as usize % (1 << order), 0, "block not aligned to its order");
             allocator.push_free_block(order, block_ptr);
 
             current_offset += 1 << order;
@@ -64,14 +63,26 @@ impl<const ORDER: usize> BuddyAllocator<ORDER> {
     }
 
     fn push_free_block(&mut self, order: usize, ptr: *mut FreeBlock) {
+        let end = self.base_addr + self.total_pages * self.page_size;
+        debug_assert!((ptr as usize) >= self.base_addr, "ptr below base");
+        debug_assert!((ptr as usize) < end, "ptr above end");
+        debug_assert_eq!((ptr as usize) % self.page_size, 0, "ptr not page-aligned");
+        debug_assert_eq!((ptr as usize) % (1 << order), 0, "ptr not aligned to order {}", order);
         unsafe {
             (*ptr).next = self.free_lists[order];
-            self.free_lists[order] = Some(ptr);
+            self.free_lists[order] = ptr;
         }
     }
 
     fn pop_free_block(&mut self, order: usize) -> Option<*mut FreeBlock> {
-        let ptr = self.free_lists[order]?;
+        let ptr = self.free_lists[order];
+        if ptr.is_null() {
+            return None;
+        }
+        let end = self.base_addr + self.total_pages * self.page_size;
+        debug_assert!((ptr as usize) >= self.base_addr, "popped ptr below base");
+        debug_assert!((ptr as usize) < end, "popped ptr above end");
+        debug_assert_eq!((ptr as usize) % (1 << order), 0, "popped ptr not aligned to order {}", order);
         unsafe { self.free_lists[order] = (*ptr).next; }
         Some(ptr)
     }
@@ -83,12 +94,23 @@ impl<const ORDER: usize> BuddyAllocator<ORDER> {
 
         for i in order..ORDER {
             if let Some(block) = self.pop_free_block(i) {
+                // Standard buddy split: push LOWER buddy, continue with UPPER buddy.
+                let mut current = block;
                 for j in (order..i).rev() {
                     let size = self.order_bytes(j);
-                    let buddy = (block as usize + size) as *mut FreeBlock;
-                    self.push_free_block(j, buddy);
+                    // Lower buddy is at `current`, upper buddy is at `current + size`.
+                    let upper = (current as usize + size) as *mut FreeBlock;
+                    debug_assert!((upper as usize) >= self.base_addr, "upper buddy below base at order {}", j);
+                    debug_assert!((upper as usize) < self.base_addr + self.total_pages * self.page_size, "upper buddy above end at order {}", j);
+                    debug_assert_eq!((upper as usize) % (1 << j), 0, "upper buddy not aligned to order {}", j);
+                    // Push LOWER buddy (current) onto free list
+                    self.push_free_block(j, current);
+                    // Continue splitting the UPPER buddy
+                    current = upper;
                 }
-                return Ok(block as usize);
+                let result = current as usize;
+                debug_assert_eq!(result % (1 << order), 0, "result not aligned to requested order");
+                return Ok(result);
             }
         }
         Err(AllocError::OutOfMemory)
@@ -98,6 +120,10 @@ impl<const ORDER: usize> BuddyAllocator<ORDER> {
         let order = pages.next_power_of_two().trailing_zeros() as usize;
         if order >= ORDER { return; }
 
+        debug_assert!(ptr >= self.base_addr, "dealloc ptr below base");
+        debug_assert!(ptr < self.base_addr + self.total_pages * self.page_size, "dealloc ptr above end");
+        debug_assert_eq!(ptr % (1 << order), 0, "dealloc ptr not aligned to order {}", order);
+
         let mut current_ptr = ptr as *mut FreeBlock;
         let mut current_order = order;
 
@@ -105,6 +131,10 @@ impl<const ORDER: usize> BuddyAllocator<ORDER> {
             let block_size = self.order_bytes(current_order);
             let buddy_offset = (current_ptr as usize - self.base_addr) ^ block_size;
             let buddy_ptr = (self.base_addr + buddy_offset) as *mut FreeBlock;
+
+            debug_assert!((buddy_ptr as usize) >= self.base_addr, "dealloc buddy below base at order {}", current_order);
+            debug_assert!((buddy_ptr as usize) < self.base_addr + self.total_pages * self.page_size, "dealloc buddy above end at order {}", current_order);
+            debug_assert_eq!((buddy_ptr as usize) % (1 << current_order), 0, "dealloc buddy not aligned");
 
             if self.is_block_free(current_order, buddy_ptr) {
                 self.remove_free_block(current_order, buddy_ptr);
@@ -119,22 +149,24 @@ impl<const ORDER: usize> BuddyAllocator<ORDER> {
 
     fn is_block_free(&self, order: usize, ptr: *mut FreeBlock) -> bool {
         let mut curr = self.free_lists[order];
-        while let Some(node) = curr {
-            if node == ptr { return true; }
-            unsafe { curr = (*node).next; }
+        while !curr.is_null() {
+            if curr == ptr { return true; }
+            unsafe { curr = (*curr).next; }
         }
         false
     }
 
     fn remove_free_block(&mut self, order: usize, ptr: *mut FreeBlock) {
-        let mut curr = &mut self.free_lists[order];
-        while let Some(node) = *curr {
+        let mut curr = &mut self.free_lists[order] as *mut *mut FreeBlock;
+        while unsafe { !(*curr).is_null() } {
+            let node = unsafe { *curr };
             if node == ptr {
                 unsafe { *curr = (*node).next; }
                 return;
             }
-            unsafe { curr = &mut (*node).next; }
+            unsafe { curr = &mut (*node).next as *mut *mut FreeBlock; }
         }
+        debug_assert!(false, "remove_free_block: buddy not found in free list at order {}", order);
     }
 }
 
@@ -275,14 +307,12 @@ mod tests {
             allocator.deallocate(b, 2);
             allocator.deallocate(c, 4);
         }
-        // After full deallocation we should be able to allocate the whole range again.
         let d = allocator.allocate(8).unwrap();
         assert_eq!(d, base);
     }
 
     #[test]
     fn test_buddy_non_power_of_two_pages() {
-        // 5 pages should be split into 4 + 1.
         let mut mem = alloc::vec![0u8; 5 * 4096];
         let base = mem.as_mut_ptr() as usize;
         let mut allocator = unsafe { BuddyAllocator::<4>::new(base, 5, 4096) };
@@ -290,7 +320,6 @@ mod tests {
         assert_eq!(a, base);
         let b = allocator.allocate(1).unwrap();
         assert_eq!(b, base + 4 * 4096);
-        // No more memory.
         assert!(allocator.allocate(1).is_err());
     }
 }

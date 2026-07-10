@@ -1,12 +1,16 @@
 //! # HuesOS Architecture Layer
 //!
-//! Architecture-specific primitives: interrupts, paging, segmentation, ports.
+//! Architecture-specific primitives: interrupts, paging, segmentation, ports,
+//! and SMP-safe synchronization.
 
 #![no_std]
 #![feature(abi_x86_interrupt)]
 #![warn(missing_docs)]
 
 extern crate alloc;
+
+mod sync;
+pub use sync::{IrqSafeTicketLock, IrqSafeRawSpinlock, RawSpinlock, TicketLock};
 
 mod x86_64;
 pub use x86_64::*;
