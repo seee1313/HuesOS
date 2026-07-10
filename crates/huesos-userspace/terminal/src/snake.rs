@@ -424,7 +424,7 @@ fn reset(
     *score = 0;
     *phase = Phase::Playing;
     *gold_food = None;
-    *food = spawn_food(body, *len, rng, bombs, bullets, rocket, *gold_food);
+    *food = spawn_food(body, *len, rng, bombs, bullets, rocket, *gold_food, None);
     for b in bombs.iter_mut() {
         b.alive = false;
     }
@@ -514,16 +514,16 @@ fn step(
     }
 
     if eat {
-        *food = spawn_food(body, *len, rng, bombs, bullets, rocket, *gold_food);
+        *food = spawn_food(body, *len, rng, bombs, bullets, rocket, *gold_food, None);
 
         // 20% chance to spawn a Golden Apple (Gold Food)
         *rng = rng.wrapping_mul(1664525).wrapping_add(1013904223);
         if gold_food.is_none() && (*rng % 5 == 0) {
-            let mut gp = spawn_food(body, *len, rng, bombs, bullets, rocket, None);
-            if gp.x == food.x && gp.y == food.y {
-                gp.x = (gp.x + 3) % GRID_W as u8;
-                gp.y = (gp.y + 3) % GRID_H as u8;
-            }
+            // Pass the freshly respawned regular apple as `avoid` so the gold
+            // apple can never overlap it. Previously we relied on a
+            // `(+3, +3) % GRID` fallback that could land on the snake, a
+            // bomb, or a bullet.
+            let gp = spawn_food(body, *len, rng, bombs, bullets, rocket, None, Some(*food));
             *gold_food = Some(GoldFood {
                 pos: gp,
                 ttl: 30, // 30 steps active
@@ -555,6 +555,9 @@ fn spawn_food(
     bullets: &[Bullet; MAX_BULLETS],
     rocket: &Rocket,
     gold_food: Option<GoldFood>,
+    // Extra cell to avoid — used when spawning a gold apple to keep it off
+    // the freshly respawned regular apple.
+    avoid: Option<Point>,
 ) -> Point {
     for _ in 0..512 {
         *rng = rng.wrapping_mul(1664525).wrapping_add(1013904223);
@@ -590,6 +593,13 @@ fn spawn_food(
         if free {
             if let Some(gf) = gold_food {
                 if gf.pos.x == x && gf.pos.y == y {
+                    free = false;
+                }
+            }
+        }
+        if free {
+            if let Some(a) = avoid {
+                if a.x == x && a.y == y {
                     free = false;
                 }
             }
