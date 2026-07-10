@@ -27,7 +27,7 @@ fn execute_command(command: CommandAst, screen: &mut Screen, filesystem: Option<
             screen.write_line("  pwd         show current pseudo-directory");
             screen.write_line("  whoami      show current user identity");
             screen.write_line("  snake       classic TUI snake");
-            screen.write_line("  snake hard  snake + bombs / AK / rocket every 2 apples");
+            screen.write_line("  snake hard  snake + bombs / kalash / rocket every 2 apples");
             screen.write_line("  ast ...     parse and print command AST summary");
             screen.write_line("  ls [path]   list BOOTFS files");
             screen.write_line("  cat <path>  print BOOTFS file");

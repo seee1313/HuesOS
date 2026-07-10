@@ -1,4 +1,4 @@
 [toolchain]
-channel = "nightly-2026-03-01"
+channel = "nightly"
 components = ["rust-src", "llvm-tools-preview", "rustfmt"]
 targets = ["x86_64-unknown-none"]
