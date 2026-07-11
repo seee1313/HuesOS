@@ -5,14 +5,13 @@ use huesos_object::{Handle, KernelObject, KernelObjectExt, Rights};
 
 use crate::{
     callbacks::{EXIT_FN, PROCESS_CREATE_FN, THREAD_START_FN, VMAR_MAP_FN, YIELD_FN},
+    user_memory,
     util::current_proc,
     SyscallResult,
 };
 
 pub(crate) fn sys_yield() -> SyscallResult {
-    // Copy the callback out before calling it. `yield_now` context-switches
-    // away and does not return until this task is scheduled again; holding a
-    // spinlock across that switch deadlocks the next task that tries to yield.
+    // Never hold a callback mutex across a context switch.
     let yield_fn = *YIELD_FN.lock();
     if let Some(f) = yield_fn {
         f();
@@ -28,18 +27,18 @@ pub(crate) fn sys_process_create(
     out_process: *mut HandleValue,
     out_root_vmar: *mut HandleValue,
 ) -> SyscallResult {
-    if out_process.is_null() || out_root_vmar.is_null() || name_len > MAX_PROCESS_NAME_LEN {
+    if name_len > MAX_PROCESS_NAME_LEN || out_process == out_root_vmar {
         return Err(ErrorCode::InvalidArgs);
     }
-    if name_len > 0 && name_ptr.is_null() {
-        return Err(ErrorCode::InvalidArgs);
-    }
+    user_memory::validate_write(out_process)?;
+    user_memory::validate_write(out_root_vmar)?;
 
+    let name_storage;
     let name = if name_len == 0 {
         "process"
     } else {
-        let bytes = unsafe { core::slice::from_raw_parts(name_ptr, name_len) };
-        core::str::from_utf8(bytes).map_err(|_| ErrorCode::InvalidArgs)?
+        name_storage = user_memory::copy_from_user(name_ptr, name_len)?;
+        core::str::from_utf8(&name_storage).map_err(|_| ErrorCode::InvalidArgs)?
     };
 
     let create = (*PROCESS_CREATE_FN.lock()).ok_or(ErrorCode::NotSupported)?;
@@ -53,10 +52,8 @@ pub(crate) fn sys_process_create(
         .handles
         .add(Handle::new(root_vmar.koid(), Rights::DEFAULT));
 
-    unsafe {
-        *out_process = process_handle;
-        *out_root_vmar = root_vmar_handle;
-    }
+    user_memory::write_value(out_process, &process_handle)?;
+    user_memory::write_value(out_root_vmar, &root_vmar_handle)?;
     Ok(0)
 }
 
@@ -66,18 +63,17 @@ pub(crate) fn sys_thread_create(
     name_len: usize,
     out_thread: *mut HandleValue,
 ) -> SyscallResult {
-    if out_thread.is_null() || name_len > MAX_PROCESS_NAME_LEN {
+    if name_len > MAX_PROCESS_NAME_LEN {
         return Err(ErrorCode::InvalidArgs);
     }
-    if name_len > 0 && name_ptr.is_null() {
-        return Err(ErrorCode::InvalidArgs);
-    }
+    user_memory::validate_write(out_thread)?;
 
+    let name_storage;
     let name = if name_len == 0 {
         "thread"
     } else {
-        let bytes = unsafe { core::slice::from_raw_parts(name_ptr, name_len) };
-        core::str::from_utf8(bytes).map_err(|_| ErrorCode::InvalidArgs)?
+        name_storage = user_memory::copy_from_user(name_ptr, name_len)?;
+        core::str::from_utf8(&name_storage).map_err(|_| ErrorCode::InvalidArgs)?
     };
 
     let caller = current_proc()?;
@@ -101,9 +97,7 @@ pub(crate) fn sys_thread_create(
         .handles
         .add(Handle::new(thread_koid, Rights::DEFAULT));
 
-    unsafe {
-        *out_thread = thread_handle;
-    }
+    user_memory::write_value(out_thread, &thread_handle)?;
     Ok(0)
 }
 
@@ -117,10 +111,10 @@ pub(crate) fn sys_thread_start(
         || entry >= huesos_abi::USER_ASPACE_END
         || stack < huesos_abi::USER_ASPACE_BASE
         || stack >= huesos_abi::USER_ASPACE_END
-        || out_parent_bootstrap.is_null()
     {
         return Err(ErrorCode::InvalidArgs);
     }
+    user_memory::validate_write(out_parent_bootstrap)?;
 
     let caller = current_proc()?;
     let thread_h = caller
@@ -160,17 +154,12 @@ pub(crate) fn sys_thread_start(
     let parent_handle = caller
         .handles
         .add(Handle::new(parent_koid, Rights::DEFAULT));
-    unsafe {
-        *out_parent_bootstrap = parent_handle;
-    }
+    user_memory::write_value(out_parent_bootstrap, &parent_handle)?;
     Ok(task_id as i64)
 }
 
 pub(crate) fn sys_vmar_map(args_ptr: *const VmarMapArgs) -> SyscallResult {
-    if args_ptr.is_null() {
-        return Err(ErrorCode::InvalidArgs);
-    }
-    let args = unsafe { core::ptr::read_unaligned(args_ptr) };
+    let args = user_memory::read_value(args_ptr)?;
 
     let proc = current_proc()?;
     let vmar_handle = proc.handles.get(args.vmar).ok_or(ErrorCode::BadHandle)?;
@@ -198,23 +187,19 @@ pub(crate) fn sys_vmar_map(args_ptr: *const VmarMapArgs) -> SyscallResult {
 }
 
 pub(crate) fn sys_process_exit(code: i64) -> SyscallResult {
-    // Same rule as `sys_yield`: never hold a callback mutex across a
-    // scheduler transition / non-returning exit path.
     let exit_fn = *EXIT_FN.lock();
     if let Some(f) = exit_fn {
         f(code);
     }
-    // No exit handler registered: park forever rather than UB.
     loop {
         huesos_arch::hlt();
     }
 }
 
-
 pub(crate) fn sys_process_wait(handle: HandleValue, out_code: *mut i64) -> SyscallResult {
-    if out_code.is_null() {
-        return Err(ErrorCode::InvalidArgs);
-    }
+    // Validate before parking so a bad pointer cannot consume a wakeup and
+    // fault only after the target has exited.
+    user_memory::validate_write(out_code)?;
     let proc = current_proc()?;
     let h = proc.handles.get(handle).ok_or(ErrorCode::BadHandle)?;
     if !h.has_rights(Rights::READ) {
@@ -223,9 +208,7 @@ pub(crate) fn sys_process_wait(handle: HandleValue, out_code: *mut i64) -> Sysca
     let target = huesos_object::lookup_process(h.koid).ok_or(ErrorCode::WrongType)?;
     loop {
         if let Some(code) = target.exit_code() {
-            unsafe {
-                *out_code = code;
-            }
+            user_memory::write_value(out_code, &code)?;
             return Ok(0);
         }
         huesos_object::wait::park_on(&target.exit_waiters);

@@ -8,7 +8,7 @@ name = "huesos-init"
 path = "src/main.rs"
 
 [dependencies]
-libcanvas = { path = "../libcanvas" }
+libcanvas = { path = "../libcanvas", features = ["kernel-smoke-tests"] }
 
 [profile.release]
 opt-level = 1
