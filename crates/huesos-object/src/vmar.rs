@@ -8,6 +8,15 @@ use spin::Mutex;
 
 use crate::{alloc_koid, KernelObject, Koid, ObjectType};
 
+/// VMAR bookkeeping failure.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum VmarError {
+    /// Mapping lies outside this VMAR or has an invalid/overflowing range.
+    InvalidRange,
+    /// Mapping overlaps an existing mapping or child VMAR.
+    Overlap,
+}
+
 /// A VMAR mapping record: a VMO range mapped into a process address space.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct VmarMapping {
@@ -113,11 +122,12 @@ impl Vmar {
 
     /// Record a mapping if it is inside this VMAR and does not overlap any
     /// existing mapping/child range.
-    pub fn record_mapping(&self, mapping: VmarMapping) -> Result<(), ()> {
-        if !self.contains_range(mapping.base, mapping.size)
-            || self.overlaps_existing(mapping.base, mapping.size)
-        {
-            return Err(());
+    pub fn record_mapping(&self, mapping: VmarMapping) -> Result<(), VmarError> {
+        if !self.contains_range(mapping.base, mapping.size) {
+            return Err(VmarError::InvalidRange);
+        }
+        if self.overlaps_existing(mapping.base, mapping.size) {
+            return Err(VmarError::Overlap);
         }
         self.mappings.lock().push(mapping);
         Ok(())

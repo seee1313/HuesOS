@@ -18,6 +18,7 @@ PATTERNS = {
     "unsafe_blocks": re.compile(r"\bunsafe\s*\{"),
     "unsafe_functions": re.compile(r"\bunsafe\s+fn\b"),
     "unsafe_impls": re.compile(r"\bunsafe\s+impl\b"),
+    "static_mut": re.compile(r"^\s*(?:pub(?:\([^)]*\))?\s+)?static\s+mut\b", re.MULTILINE),
     "unwrap_calls": re.compile(r"\.unwrap\s*\("),
     "expect_calls": re.compile(r"\.expect\s*\("),
     "panic_macros": re.compile(r"\bpanic!\s*\("),

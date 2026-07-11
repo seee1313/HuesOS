@@ -15,8 +15,15 @@ const MEMMAP_ACPI_NVS: u64 = 3;
 /// Some Limine builds also expose this as type 8 (ACPI tables / mapped reserved).
 const MEMMAP_ACPI_TABLES_OR_MAPPED_RESERVED: u64 = 8;
 
+/// Initialize the physical frame allocator from the boot memory map.
+///
+/// # Safety
+/// `regions` must remain readable for the call and every usable physical range
+/// must be accessible through the supplied HHDM offset.
 pub unsafe fn pmm_init(regions: &[MemoryRegion], hhdm_offset: u64) {
-    unsafe { huesos_pmm::init(regions, hhdm_offset); }
+    unsafe {
+        huesos_pmm::init(regions, hhdm_offset);
+    }
 }
 
 /// Map firmware / ACPI physical ranges into the HHDM so early ACPI walks
@@ -31,9 +38,7 @@ pub fn map_firmware_tables(regions: &[MemoryRegion], rsdp_addr: Option<u64>) {
         // no-op (PageAlreadyMapped) and hang on ICR writes under TCG.
         let needs_map = matches!(
             r.kind,
-            MEMMAP_ACPI_RECLAIMABLE
-                | MEMMAP_ACPI_NVS
-                | MEMMAP_ACPI_TABLES_OR_MAPPED_RESERVED
+            MEMMAP_ACPI_RECLAIMABLE | MEMMAP_ACPI_NVS | MEMMAP_ACPI_TABLES_OR_MAPPED_RESERVED
         );
         if needs_map && r.length > 0 {
             // ACPI tables are tiny; cap so a mis-typed region cannot explode.
@@ -81,11 +86,17 @@ pub fn framebuffer_init(fb: Option<crate::FramebufferInfo>) {
     if let Some(f) = fb {
         use huesos_fb::FramebufferConfig;
         huesos_fb::init(Some(FramebufferConfig {
-            addr: f.addr, width: f.width as u32, height: f.height as u32,
-            pitch: f.pitch as u32, bpp: f.bpp,
-            red_mask_size: f.red_mask_size, red_mask_shift: f.red_mask_shift,
-            green_mask_size: f.green_mask_size, green_mask_shift: f.green_mask_shift,
-            blue_mask_size: f.blue_mask_size, blue_mask_shift: f.blue_mask_shift,
+            addr: f.addr,
+            width: f.width as u32,
+            height: f.height as u32,
+            pitch: f.pitch as u32,
+            bpp: f.bpp,
+            red_mask_size: f.red_mask_size,
+            red_mask_shift: f.red_mask_shift,
+            green_mask_size: f.green_mask_size,
+            green_mask_shift: f.green_mask_shift,
+            blue_mask_size: f.blue_mask_size,
+            blue_mask_shift: f.blue_mask_shift,
         }));
     }
 }
@@ -120,11 +131,16 @@ fn handle_irq(irq: u8, d: u64) {
 
 extern "C" fn handle_syscall(f: &mut huesos_arch::syscall::SyscallFrame) {
     let r = huesos_syscalls::dispatch(f.num, f.arg1, f.arg2, f.arg3, f.arg4, f.arg5);
-    f.num = match r { Ok(v) => v as u64, Err(e) => e as i32 as i64 as u64 };
+    f.num = match r {
+        Ok(v) => v as u64,
+        Err(e) => e as i32 as i64 as u64,
+    };
 }
 
 fn debug_write(b: &[u8]) {
     use core::fmt::Write;
     let mut w = huesos_arch::serial::SerialWriter;
-    for &c in b { let _ = w.write_char(c as char); }
+    for &c in b {
+        let _ = w.write_char(c as char);
+    }
 }

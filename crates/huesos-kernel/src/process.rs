@@ -4,12 +4,12 @@
 use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use huesos_abi::{vmar_flags, ErrorCode, VmarMapArgs};
 use huesos_arch::gdt;
 use huesos_arch::paging::{flags, AddressSpace};
-use huesos_abi::{vmar_flags, ErrorCode, VmarMapArgs};
 use huesos_elf::{Loader, SegmentFlags};
 use huesos_object::{KernelObject, KernelObjectExt};
-use huesos_object::{Process, Vmar, VmarMapping};
+use huesos_object::{Process, Vmar, VmarError, VmarMapping};
 use x86_64::structures::paging::{Page, PageTableFlags, PhysFrame, Size4KiB};
 use x86_64::{PhysAddr, VirtAddr};
 
@@ -17,7 +17,6 @@ use x86_64::{PhysAddr, VirtAddr};
 const USER_STACK_TOP: u64 = huesos_abi::USER_STACK_TOP;
 /// Size of the initial user stack.
 const USER_STACK_SIZE: u64 = huesos_abi::USER_STACK_SIZE;
-
 
 /// Kernel-owned runtime state for a process.
 ///
@@ -87,7 +86,6 @@ pub struct SpawnedProcess {
     pub cr3: u64,
 }
 
-
 /// Create a suspended process with an empty address space and a root VMAR.
 ///
 /// This is the kernel-side implementation behind the `ProcessCreate` syscall.
@@ -102,11 +100,11 @@ pub fn create_suspended_process(
 
     let runtime = ProcessRuntime::new(process.koid());
     let root_vmar = Arc::clone(&runtime.root_vmar);
-    *process.address_space.lock() = Some(Box::new(runtime) as Box<dyn core::any::Any + Send + Sync>);
+    *process.address_space.lock() =
+        Some(Box::new(runtime) as Box<dyn core::any::Any + Send + Sync>);
 
     Ok((process, root_vmar))
 }
-
 
 const PAGE_SIZE: u64 = 4096;
 const ALL_VMAR_FLAGS: u32 = vmar_flags::READ
@@ -158,11 +156,12 @@ pub fn map_vmo_into_vmar(
     }
 
     for i in 0..page_count {
-        let frame_phys = vmo.frame_at(first_vmo_page + i).ok_or(ErrorCode::InvalidArgs)?;
+        let frame_phys = vmo
+            .frame_at(first_vmo_page + i)
+            .ok_or(ErrorCode::InvalidArgs)?;
         let page: Page<Size4KiB> =
             Page::containing_address(VirtAddr::new(args.addr + i as u64 * PAGE_SIZE));
-        let frame: PhysFrame<Size4KiB> =
-            PhysFrame::containing_address(PhysAddr::new(frame_phys));
+        let frame: PhysFrame<Size4KiB> = PhysFrame::containing_address(PhysAddr::new(frame_phys));
         runtime.address_space.map_user_page(page, frame, page_flags);
     }
 
@@ -172,7 +171,10 @@ pub fn map_vmo_into_vmar(
         vmo: vmo.koid(),
         flags: args.flags,
     })
-    .map_err(|_| ErrorCode::Busy)?;
+    .map_err(|error| match error {
+        VmarError::InvalidRange => ErrorCode::InvalidArgs,
+        VmarError::Overlap => ErrorCode::Busy,
+    })?;
 
     Ok(args.addr)
 }
@@ -183,9 +185,9 @@ fn validate_vmar_map_args(
     args: VmarMapArgs,
 ) -> Result<(), ErrorCode> {
     if args.len == 0
-        || args.addr % PAGE_SIZE != 0
-        || args.len % PAGE_SIZE != 0
-        || args.vmo_offset % PAGE_SIZE != 0
+        || !args.addr.is_multiple_of(PAGE_SIZE)
+        || !args.len.is_multiple_of(PAGE_SIZE)
+        || !args.vmo_offset.is_multiple_of(PAGE_SIZE)
     {
         return Err(ErrorCode::InvalidArgs);
     }
@@ -234,7 +236,6 @@ fn page_flags_from_vmar_flags(flags: u32) -> Result<PageTableFlags, ErrorCode> {
     Ok(pt_flags)
 }
 
-
 /// Start a suspended userspace thread.
 ///
 /// The syscall layer owns bootstrap-channel creation and installs the child
@@ -246,11 +247,8 @@ pub fn start_thread(
     entry: u64,
     stack: u64,
 ) -> Result<u64, ErrorCode> {
-    if entry < huesos_abi::USER_ASPACE_BASE
-        || entry >= huesos_abi::USER_ASPACE_END
-        || stack < huesos_abi::USER_ASPACE_BASE
-        || stack >= huesos_abi::USER_ASPACE_END
-    {
+    let userspace = huesos_abi::USER_ASPACE_BASE..huesos_abi::USER_ASPACE_END;
+    if !userspace.contains(&entry) || !userspace.contains(&stack) {
         return Err(ErrorCode::InvalidArgs);
     }
 
@@ -303,7 +301,8 @@ pub fn spawn_from_elf(name: &str, elf_bytes: &[u8]) -> SpawnedProcess {
     }
 
     let cr3 = runtime.cr3();
-    *process.address_space.lock() = Some(Box::new(runtime) as Box<dyn core::any::Any + Send + Sync>);
+    *process.address_space.lock() =
+        Some(Box::new(runtime) as Box<dyn core::any::Any + Send + Sync>);
 
     SpawnedProcess {
         process,
@@ -336,12 +335,18 @@ static PENDING_USER_ENTRIES: spin::Mutex<Vec<PendingUserEntry>> = spin::Mutex::n
 
 /// Queue the first userspace RIP/RSP pair for a just-created scheduler task.
 pub fn queue_user_entry(task_id: u64, entry: u64, rsp: u64) {
-    PENDING_USER_ENTRIES.lock().push(PendingUserEntry { task_id, entry, rsp });
+    PENDING_USER_ENTRIES.lock().push(PendingUserEntry {
+        task_id,
+        entry,
+        rsp,
+    });
 }
 
 fn take_user_entry(task_id: u64) -> Option<(u64, u64)> {
     let mut entries = PENDING_USER_ENTRIES.lock();
-    let pos = entries.iter().position(|pending| pending.task_id == task_id)?;
+    let pos = entries
+        .iter()
+        .position(|pending| pending.task_id == task_id)?;
     let pending = entries.swap_remove(pos);
     Some((pending.entry, pending.rsp))
 }
@@ -350,8 +355,8 @@ fn take_user_entry(task_id: u64) -> Option<(u64, u64)> {
 pub extern "C" fn user_entry_trampoline() -> ! {
     let task_id = crate::scheduler::current_task_id()
         .expect("user_entry_trampoline invoked without a current task id");
-    let (entry, rsp) = take_user_entry(task_id)
-        .expect("user_entry_trampoline invoked without a pending entry");
+    let (entry, rsp) =
+        take_user_entry(task_id).expect("user_entry_trampoline invoked without a pending entry");
 
     let sel = gdt::selectors();
     let user_cs = (sel.user_code.0 as u64) | 3; // RPL=3
@@ -371,8 +376,6 @@ pub extern "C" fn user_entry_trampoline() -> ! {
         huesos_arch::context_switch::enter_userspace(entry, rsp, user_cs, user_ss, 0x202);
     }
 }
-
-
 
 impl ProcessRuntime {
     /// Destroy the address space and drop the root VMAR registration.
@@ -394,9 +397,8 @@ impl ProcessRuntime {
 /// No task may still run with this process's CR3.
 pub fn teardown_process(process: &Process) {
     if let Some(any) = process.address_space.lock().take() {
-        match any.downcast::<ProcessRuntime>() {
-            Ok(runtime) => runtime.destroy(),
-            Err(_) => {}
+        if let Ok(runtime) = any.downcast::<ProcessRuntime>() {
+            runtime.destroy();
         }
     }
     process.handles.clear();

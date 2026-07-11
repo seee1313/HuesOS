@@ -70,10 +70,10 @@ unsafe extern "C" {
 #[unsafe(no_mangle)]
 pub extern "C" fn _start() -> ! {
     libcanvas::println!("[doom] HuesOS DoomGeneric starting (Freedoom Phase 1)");
-    let arg0 = b"doom\0".as_ptr() as *mut u8;
-    let arg1 = b"-iwad\0".as_ptr() as *mut u8;
-    let arg2 = b"freedoom1.wad\0".as_ptr() as *mut u8;
-    let arg3 = b"-nosound\0".as_ptr() as *mut u8;
+    let arg0 = c"doom".as_ptr() as *mut u8;
+    let arg1 = c"-iwad".as_ptr() as *mut u8;
+    let arg2 = c"freedoom1.wad".as_ptr() as *mut u8;
+    let arg3 = c"-nosound".as_ptr() as *mut u8;
     let mut argv = [arg0, arg1, arg2, arg3];
     // SAFETY: argv points to four NUL-terminated static strings and remains
     // valid for DoomGeneric's process lifetime.
@@ -167,7 +167,7 @@ pub extern "C" fn DG_DrawFrame() {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn DG_SleepMs(ms: u32) {
-    let ticks = ((ms as u64 + 9) / 10).max(1);
+    let ticks = (ms as u64).div_ceil(10).max(1);
     let deadline = DG_GetTicksMs().saturating_add((ticks * 10) as u32);
     while (DG_GetTicksMs().wrapping_sub(deadline) as i32) < 0 {
         libcanvas::process::yield_now();
@@ -181,8 +181,13 @@ pub extern "C" fn DG_GetTicksMs() -> u32 {
         .wrapping_mul(10) as u32
 }
 
+/// Poll one DoomGeneric keyboard event.
+///
+/// # Safety
+/// DoomGeneric must pass two live writable output pointers for the complete
+/// duration of this callback.
 #[unsafe(no_mangle)]
-pub extern "C" fn DG_GetKey(pressed: *mut i32, key: *mut u8) -> i32 {
+pub unsafe extern "C" fn DG_GetKey(pressed: *mut i32, key: *mut u8) -> i32 {
     if pressed.is_null() || key.is_null() {
         return 0;
     }
@@ -244,8 +249,13 @@ pub extern "C" fn hues_wad_len() -> usize {
     FREEDOOM_WAD.len()
 }
 
+/// Copy bytes from the embedded IWAD into a C caller buffer.
+///
+/// # Safety
+/// `output` must be writable for `length` bytes or null. The function bounds
+/// the actual copy to the embedded WAD length.
 #[unsafe(no_mangle)]
-pub extern "C" fn hues_wad_read(offset: usize, output: *mut u8, length: usize) -> usize {
+pub unsafe extern "C" fn hues_wad_read(offset: usize, output: *mut u8, length: usize) -> usize {
     if output.is_null() || offset >= FREEDOOM_WAD.len() {
         return 0;
     }
@@ -254,8 +264,12 @@ pub extern "C" fn hues_wad_read(offset: usize, output: *mut u8, length: usize) -
     count
 }
 
+/// Forward a C debug byte range to the HuesOS debug channel.
+///
+/// # Safety
+/// `text` must be readable for `length` bytes or null.
 #[unsafe(no_mangle)]
-pub extern "C" fn hues_debug(text: *const u8, length: usize) {
+pub unsafe extern "C" fn hues_debug(text: *const u8, length: usize) {
     if text.is_null() || length == 0 {
         return;
     }

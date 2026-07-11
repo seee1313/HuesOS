@@ -18,6 +18,11 @@ static TIMER_INITIAL_COUNT: AtomicU32 = AtomicU32::new(0);
 /// Also ensures the 4 KiB MMIO page is present in the HHDM. Limine base
 /// revision 3 does not map reserved/MMIO ranges, so without this the first
 /// `write_reg` in [`init`] page-faults on `0xfee000f0` (SVR).
+///
+/// # Safety
+/// `phys` must be the LAPIC MMIO base reported by validated MADT/MSR state,
+/// and `hhdm_offset` must name the active direct map. Call exactly once before
+/// any LAPIC register access.
 pub unsafe fn set_base(phys: u32, hhdm_offset: u64) {
     // LAPIC is MMIO: must be uncacheable. WB mapping can hang IPI delivery
     // status polls forever (writes never reach the device).
@@ -144,11 +149,19 @@ pub unsafe fn send_ipi(dest_apic_id: u8, vector: u8, delivery: IpiDelivery) {
 }
 
 /// INIT IPI with Level=Assert | Trigger=Level (Intel SDM INIT-SIPI-SIPI).
+///
+/// # Safety
+/// LAPIC MMIO must be initialized and `dest_apic_id` must identify a CPU that
+/// may legally receive the AP bootstrap sequence.
 pub unsafe fn send_init_assert(dest_apic_id: u8) {
     send_ipi(dest_apic_id, 0, IpiDelivery::Init);
 }
 
 /// SIPI with startup vector = physical page of the trampoline.
+///
+/// # Safety
+/// LAPIC MMIO must be initialized; `vector` must address a prepared low-memory
+/// trampoline page and the destination CPU must already have received INIT.
 pub unsafe fn send_startup(dest_apic_id: u8, vector: u8) {
     send_ipi(dest_apic_id, vector, IpiDelivery::Startup);
 }
@@ -221,7 +234,9 @@ pub fn calibrate_timer() -> u32 {
 
     // Poll PIT until count reaches 0.
     loop {
-        unsafe { cmd.write(0x00); } // latch
+        unsafe {
+            cmd.write(0x00);
+        } // latch
         let lo = unsafe { data0.read() } as u16;
         let hi = unsafe { data0.read() } as u16;
         if ((hi << 8) | lo) == 0 {

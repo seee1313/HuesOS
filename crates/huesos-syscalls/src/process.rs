@@ -107,11 +107,8 @@ pub(crate) fn sys_thread_start(
     stack: u64,
     out_parent_bootstrap: *mut HandleValue,
 ) -> SyscallResult {
-    if entry < huesos_abi::USER_ASPACE_BASE
-        || entry >= huesos_abi::USER_ASPACE_END
-        || stack < huesos_abi::USER_ASPACE_BASE
-        || stack >= huesos_abi::USER_ASPACE_END
-    {
+    let userspace = huesos_abi::USER_ASPACE_BASE..huesos_abi::USER_ASPACE_END;
+    if !userspace.contains(&entry) || !userspace.contains(&stack) {
         return Err(ErrorCode::InvalidArgs);
     }
     user_memory::validate_write(out_parent_bootstrap)?;
@@ -210,10 +207,7 @@ pub(crate) fn sys_process_wait(handle: HandleValue, out_code: *mut i64) -> Sysca
     }
 }
 
-pub(crate) fn sys_process_get_exit_code(
-    handle: HandleValue,
-    out_code: *mut i64,
-) -> SyscallResult {
+pub(crate) fn sys_process_get_exit_code(handle: HandleValue, out_code: *mut i64) -> SyscallResult {
     user_memory::validate_write(out_code)?;
     let target = process_for_wait(handle)?;
     let code = target.exit_code().ok_or(ErrorCode::ShouldWait)?;

@@ -84,7 +84,7 @@ pub fn register_interrupt(interrupt: Arc<Interrupt>) {
     INTERRUPT_REGISTRY
         .lock()
         .entry(interrupt.irq())
-        .or_insert_with(Vec::new)
+        .or_default()
         .push(interrupt.clone());
     register_object(interrupt);
 }
@@ -157,7 +157,8 @@ pub(crate) fn set_root_job(root: Arc<Job>) {
 /// Callback used to translate a physical address into a kernel-accessible
 /// virtual address (the HHDM). Injected by the kernel at init time so that
 /// `huesos-object` doesn't need to depend on `huesos-arch` directly.
-static PHYS_TO_VIRT: Mutex<Option<fn(u64) -> u64>> = Mutex::new(None);
+type PhysToVirtFn = fn(u64) -> u64;
+static PHYS_TO_VIRT: Mutex<Option<PhysToVirtFn>> = Mutex::new(None);
 
 /// Register the physical-to-virtual translator. Must be called once during
 /// kernel init, after paging is set up.

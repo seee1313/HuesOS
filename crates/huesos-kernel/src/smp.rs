@@ -14,7 +14,7 @@ static APS_MAY_RUN: AtomicBool = AtomicBool::new(false);
 
 /// Stacks allocated for APs (one per CPU beyond BSP). Kept alive for the
 /// lifetime of the kernel so APs never lose their stacks.
-static mut AP_STACKS: Vec<Vec<u8>> = Vec::new();
+static AP_STACKS: spin::Once<Vec<Vec<u8>>> = spin::Once::new();
 
 /// How long the BSP waits for each AP to report ready (rough microseconds).
 const AP_READY_TIMEOUT_US: u32 = 200_000;
@@ -67,9 +67,7 @@ pub fn bringup_aps(rsdp_addr: u64, hhdm_offset: u64) {
     for _ in 0..ap_count {
         stacks.push(alloc::vec![0u8; 4096 * 16]);
     }
-    unsafe {
-        AP_STACKS = stacks;
-    }
+    let ap_stacks = AP_STACKS.call_once(|| stacks);
 
     unsafe {
         huesos_arch::ap_boot::copy_trampoline();
@@ -87,11 +85,8 @@ pub fn bringup_aps(rsdp_addr: u64, hhdm_offset: u64) {
             break;
         }
 
-        let stack_top = unsafe {
-            AP_STACKS[ap_index]
-                .as_ptr()
-                .add(AP_STACKS[ap_index].len()) as u64
-        };
+        let stack = &ap_stacks[ap_index];
+        let stack_top = stack.as_ptr().wrapping_add(stack.len()) as u64;
 
         log_line("[SMP] Booting AP ");
         log_num(cpu.apic_id as u64);
@@ -100,17 +95,12 @@ pub fn bringup_aps(rsdp_addr: u64, hhdm_offset: u64) {
         let ready_before = AP_READY_COUNT.load(Ordering::Relaxed);
 
         unsafe {
-            huesos_arch::ap_boot::boot_ap(
-                cpu.apic_id,
-                stack_top,
-                ap_entry as *const () as u64,
-            );
+            huesos_arch::ap_boot::boot_ap(cpu.apic_id, stack_top, ap_entry as *const () as u64);
         }
 
         // Wait until the AP finished local init (before the run-gate).
         let mut waited = 0u32;
-        while AP_READY_COUNT.load(Ordering::Relaxed) == ready_before
-            && waited < AP_READY_TIMEOUT_US
+        while AP_READY_COUNT.load(Ordering::Relaxed) == ready_before && waited < AP_READY_TIMEOUT_US
         {
             huesos_arch::lapic::delay_us(100);
             waited += 100;

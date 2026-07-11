@@ -66,7 +66,10 @@ impl Task {
             kind: TaskKind::Kernel,
             finished: core::sync::atomic::AtomicBool::new(false),
             blocked: core::sync::atomic::AtomicBool::new(false),
-            sched_policy: crate::scheduler::SchedPolicy::Fair { weight: 1024, vruntime: 0 },
+            sched_policy: crate::scheduler::SchedPolicy::Fair {
+                weight: 1024,
+                vruntime: 0,
+            },
         }
     }
 
@@ -77,7 +80,10 @@ impl Task {
         let cr3 = current_cr3();
         // Reserve 8 bytes at the very top for the return address when the
         // thread function eventually `ret`s.
-        let context = Context::new(entry, unsafe { stack_top.sub(8) }, cr3);
+        // SAFETY: `stack` owns USER_KERNEL_STACK_SIZE writable bytes and is
+        // stored in the Task for the complete context lifetime. Reserving the
+        // top word leaves room for the thread-return sentinel below.
+        let context = unsafe { Context::new(entry, stack_top.sub(8), cr3) };
         unsafe {
             let ret_slot = (stack_top as *mut u64).sub(1);
             *ret_slot = thread_exit as *const () as u64;
@@ -90,7 +96,10 @@ impl Task {
             kind: TaskKind::Kernel,
             finished: core::sync::atomic::AtomicBool::new(false),
             blocked: core::sync::atomic::AtomicBool::new(false),
-            sched_policy: crate::scheduler::SchedPolicy::Fair { weight: 1024, vruntime: 0 },
+            sched_policy: crate::scheduler::SchedPolicy::Fair {
+                weight: 1024,
+                vruntime: 0,
+            },
         }
     }
 
@@ -109,7 +118,9 @@ impl Task {
     ) -> Self {
         let mut stack = alloc::vec![0u8; USER_KERNEL_STACK_SIZE];
         let stack_top = unsafe { stack.as_mut_ptr().add(stack.len()) };
-        let context = Context::new(entry_trampoline, unsafe { stack_top.sub(8) }, cr3);
+        // SAFETY: the Task retains this writable stack for its full lifetime;
+        // the top word is reserved for the return sentinel.
+        let context = unsafe { Context::new(entry_trampoline, stack_top.sub(8), cr3) };
         unsafe {
             let ret_slot = (stack_top as *mut u64).sub(1);
             *ret_slot = thread_exit as *const () as u64;
@@ -122,7 +133,10 @@ impl Task {
             kind: TaskKind::User { process },
             finished: core::sync::atomic::AtomicBool::new(false),
             blocked: core::sync::atomic::AtomicBool::new(false),
-            sched_policy: crate::scheduler::SchedPolicy::Fair { weight: 1024, vruntime: 0 },
+            sched_policy: crate::scheduler::SchedPolicy::Fair {
+                weight: 1024,
+                vruntime: 0,
+            },
         }
     }
 

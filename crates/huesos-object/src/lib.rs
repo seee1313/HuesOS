@@ -35,11 +35,11 @@ pub(crate) use registry::phys_to_virt;
 pub use registry::{
     current_process, lookup_interrupts_by_irq, lookup_object, lookup_process, note_handle_close,
     note_handle_open, register_interrupt, register_object, register_process, root_job,
-    set_current_process, set_phys_to_virt, set_cpu_id_callback, unregister_object,
+    set_cpu_id_callback, set_current_process, set_phys_to_virt, unregister_object,
 };
 pub use thread::Thread;
-pub use vmar::{Vmar, VmarChild, VmarMapping};
-pub use vmo::Vmo;
+pub use vmar::{Vmar, VmarChild, VmarError, VmarMapping};
+pub use vmo::{Vmo, VmoError};
 pub use wait::{set_scheduler_hooks, TaskId, WaitQueue};
 
 /// Initialize root job and kernel objects. Does not set up the

@@ -11,6 +11,7 @@
 //! 4: user code (ring3)
 //! 5-6: TSS (takes two GDT slots on x86_64)
 
+use core::cell::UnsafeCell;
 use spin::Lazy;
 use x86_64::instructions::segmentation::{Segment, CS, DS, ES, SS};
 use x86_64::instructions::tables::load_tss;
@@ -26,19 +27,34 @@ pub const PRIVILEGE_STACK_SIZE: usize = 4096 * 16;
 /// Index of the double-fault IST stack inside the TSS.
 pub const DOUBLE_FAULT_IST_INDEX: u16 = 0;
 
+/// Fixed early-boot stack storage with explicit interior mutability.
+///
+/// The BSP owns these stacks exclusively. APs allocate separate stacks after
+/// the heap is available, so no two CPUs can write the same stack memory.
+struct StaticStack<const N: usize>(UnsafeCell<[u8; N]>);
+
+// SAFETY: each instance is assigned to one CPU and is never exposed as a Rust
+// reference. Hardware uses only the raw address recorded in that CPU's TSS.
+unsafe impl<const N: usize> Sync for StaticStack<N> {}
+
+impl<const N: usize> StaticStack<N> {
+    const fn new() -> Self {
+        Self(UnsafeCell::new([0; N]))
+    }
+
+    fn top(&'static self) -> VirtAddr {
+        VirtAddr::from_ptr(self.0.get()) + N as u64
+    }
+}
+
+static BSP_IST_STACK: StaticStack<IST_STACK_SIZE> = StaticStack::new();
+static BSP_PRIVILEGE_STACK: StaticStack<PRIVILEGE_STACK_SIZE> = StaticStack::new();
+
 static TSS: Lazy<TaskStateSegment> = Lazy::new(|| {
     let mut tss = TaskStateSegment::new();
-    tss.interrupt_stack_table[DOUBLE_FAULT_IST_INDEX as usize] = {
-        static mut STACK: [u8; IST_STACK_SIZE] = [0; IST_STACK_SIZE];
-        let stack_start = VirtAddr::from_ptr(core::ptr::addr_of!(STACK));
-        stack_start + IST_STACK_SIZE as u64
-    };
+    tss.interrupt_stack_table[DOUBLE_FAULT_IST_INDEX as usize] = BSP_IST_STACK.top();
     // RSP0: kernel stack loaded automatically on ring3->ring0 interrupts/syscalls.
-    tss.privilege_stack_table[0] = {
-        static mut STACK: [u8; PRIVILEGE_STACK_SIZE] = [0; PRIVILEGE_STACK_SIZE];
-        let stack_start = VirtAddr::from_ptr(core::ptr::addr_of!(STACK));
-        stack_start + PRIVILEGE_STACK_SIZE as u64
-    };
+    tss.privilege_stack_table[0] = BSP_PRIVILEGE_STACK.top();
     tss
 });
 
@@ -98,9 +114,18 @@ pub fn set_kernel_stack(stack_top: VirtAddr) {
 /// Per-CPU GDT + TSS bundle. Each CPU must have its own instance so that
 /// `set_kernel_stack` is race-free under SMP.
 pub struct PerCpuGdt {
+    /// Leaked, permanently pinned descriptor table loaded by this CPU.
     pub table: &'static GlobalDescriptorTable,
+    /// Segment selectors belonging to `table`.
     pub selectors: Selectors,
+    /// Pinned TSS updated only by the owning CPU's scheduler.
     tss_ptr: *mut TaskStateSegment,
+}
+
+impl Default for PerCpuGdt {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl PerCpuGdt {
@@ -109,11 +134,9 @@ impl PerCpuGdt {
     /// is satisfied and the selectors remain valid forever.
     pub fn new() -> Self {
         let tss = alloc::boxed::Box::leak(alloc::boxed::Box::new(TaskStateSegment::new()));
-        tss.interrupt_stack_table[DOUBLE_FAULT_IST_INDEX as usize] = {
-            static mut STACK: [u8; IST_STACK_SIZE] = [0; IST_STACK_SIZE];
-            let stack_start = VirtAddr::from_ptr(core::ptr::addr_of!(STACK));
-            stack_start + IST_STACK_SIZE as u64
-        };
+        let ist_stack = alloc::boxed::Box::leak(alloc::boxed::Box::new([0u8; IST_STACK_SIZE]));
+        tss.interrupt_stack_table[DOUBLE_FAULT_IST_INDEX as usize] =
+            VirtAddr::from_ptr(ist_stack.as_ptr()) + IST_STACK_SIZE as u64;
         let tss_ptr: *mut TaskStateSegment = tss;
         let mut gdt = alloc::boxed::Box::new(GlobalDescriptorTable::new());
         let kernel_code = gdt.append(Descriptor::kernel_code_segment());
@@ -149,7 +172,9 @@ impl PerCpuGdt {
 
     /// Update RSP0 in this CPU's TSS.
     pub fn set_kernel_stack(&self, stack_top: VirtAddr) {
-        unsafe { (*self.tss_ptr).privilege_stack_table[0] = stack_top; }
+        unsafe {
+            (*self.tss_ptr).privilege_stack_table[0] = stack_top;
+        }
     }
 }
 

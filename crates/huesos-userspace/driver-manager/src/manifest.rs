@@ -64,7 +64,11 @@ impl DynamicDriverHostManifest {
             irq_count: 0,
             io_ports: [IoPortRange { base: 0, len: 0 }; 8],
             io_port_count: 0,
-            services: [ServiceManifestDynamic { name: [0; 32], name_len: 0, required: false }; 8],
+            services: [ServiceManifestDynamic {
+                name: [0; 32],
+                name_len: 0,
+                required: false,
+            }; 8],
             service_count: 0,
         }
     }
@@ -114,26 +118,24 @@ pub fn parse_hdriver(data: &[u8]) -> Option<DynamicDriverHostManifest> {
                     if let Some(colon_pos) = val.iter().position(|&b| b == b':') {
                         let base_str = core::str::from_utf8(&val[..colon_pos]).ok()?;
                         let len_str = core::str::from_utf8(&val[colon_pos + 1..]).ok()?;
-                        
-                        let base = if base_str.starts_with("0x") {
-                            u16::from_str_radix(&base_str[2..], 16).ok()?
+
+                        let base = if let Some(hex) = base_str.strip_prefix("0x") {
+                            u16::from_str_radix(hex, 16).ok()?
                         } else {
                             base_str.parse::<u16>().ok()?
                         };
                         let len = len_str.parse::<u16>().ok()?;
-                        
+
                         manifest.io_ports[manifest.io_port_count] = IoPortRange { base, len };
                         manifest.io_port_count += 1;
                     }
                 }
-            } else if key == b"provides" {
-                if manifest.service_count < 8 {
-                    let len = val.len().min(32);
-                    manifest.services[manifest.service_count].name[..len].copy_from_slice(&val[..len]);
-                    manifest.services[manifest.service_count].name_len = len;
-                    manifest.services[manifest.service_count].required = true; // Default to required
-                    manifest.service_count += 1;
-                }
+            } else if key == b"provides" && manifest.service_count < 8 {
+                let len = val.len().min(32);
+                manifest.services[manifest.service_count].name[..len].copy_from_slice(&val[..len]);
+                manifest.services[manifest.service_count].name_len = len;
+                manifest.services[manifest.service_count].required = true;
+                manifest.service_count += 1;
             }
         }
 

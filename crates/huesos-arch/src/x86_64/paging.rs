@@ -94,7 +94,7 @@ pub fn map_hhdm_range(phys_base: u64, length: u64) {
 
 /// Like [`map_hhdm_range`], but with explicit page flags (e.g. `NO_CACHE` for MMIO).
 pub fn map_hhdm_range_flags(phys_base: u64, length: u64, flags: PageTableFlags) {
-    map_phys_range(phys_base, length, flags, |phys| phys_to_virt(phys));
+    map_phys_range(phys_base, length, flags, phys_to_virt);
 }
 
 /// Identity-map `[phys_base, phys_base + length)` so `virt == phys`.
@@ -108,7 +108,7 @@ pub fn map_identity_range(phys_base: u64, length: u64) {
         phys_base,
         length,
         PageTableFlags::PRESENT | PageTableFlags::WRITABLE,
-        |phys| VirtAddr::new(phys),
+        VirtAddr::new,
     );
 }
 
@@ -122,11 +122,7 @@ fn map_phys_range(
         return;
     }
     let start = phys_base & !0xfff;
-    let end = phys_base
-        .checked_add(length)
-        .unwrap_or(u64::MAX)
-        .saturating_add(0xfff)
-        & !0xfff;
+    let end = phys_base.saturating_add(length).saturating_add(0xfff) & !0xfff;
 
     let mut guard = KERNEL_PAGE_TABLE.lock();
     let mapper = guard.as_mut().expect("page table not initialized");

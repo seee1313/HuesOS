@@ -284,6 +284,20 @@ fn run_monotonic_clock_check(logger: &mut InitLogger) {
     }
 }
 
+fn wait_process_exit(process: &Process) -> libcanvas::Result<i64> {
+    // Early boot must not park init on a still-maturing cross-process wait
+    // queue: a missed wake would prevent every later service from launching.
+    // Cooperative polling keeps scheduler progress explicit and is bounded so
+    // a broken probe degrades diagnostics instead of hanging the boot forever.
+    for _ in 0..100_000 {
+        if let Some(code) = process.poll_exit()? {
+            return Ok(code);
+        }
+        libcanvas::process::yield_now();
+    }
+    Err(ErrorCode::TimedOut)
+}
+
 fn run_shutdown_authorization_check(logger: &mut InitLogger) {
     let Ok((process, bootstrap)) = libcanvas::process::spawn_elf("shutdown-probe", FAULT_PROBE_ELF)
     else {
@@ -295,7 +309,7 @@ fn run_shutdown_authorization_check(logger: &mut InitLogger) {
         return;
     }
     drop(bootstrap);
-    match process.wait_exit() {
+    match wait_process_exit(&process) {
         Ok(0) => init_logln!(
             logger,
             "[init] shutdown authorization OK (unprivileged caller denied)"
@@ -337,7 +351,7 @@ fn run_fault_isolation_check(logger: &mut InitLogger) {
             return;
         }
         drop(bootstrap);
-        match process.wait_exit() {
+        match wait_process_exit(&process) {
             Ok(code) if code == expected => {}
             Ok(code) => {
                 init_logln!(

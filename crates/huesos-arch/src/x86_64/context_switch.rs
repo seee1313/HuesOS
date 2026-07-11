@@ -61,14 +61,13 @@ impl Context {
     /// `stack_top`, in the given address space (`cr3`), the first time it
     /// is switched into.
     ///
-    /// `stack_top` must be 16-byte aligned and point *just past* the last
-    /// valid byte of the stack; at least `FRAME_SIZE` bytes below it must
-    /// be valid, writable memory (this function writes a synthetic saved
-    /// register frame there matching exactly what `context_switch`'s save
-    /// half would have produced, so that resuming a brand new task goes
-    /// through the exact same code path as resuming one that has actually
-    /// run before).
-    pub fn new(entry: extern "C" fn() -> !, stack_top: *mut u8, cr3: u64) -> Self {
+    /// # Safety
+    ///
+    /// `stack_top` must be aligned for `u64`, point just past a live writable
+    /// stack allocation, and leave at least `FRAME_SIZE` bytes below it. The
+    /// allocation must outlive every switch into this context and must not be
+    /// concurrently accessed while the task is suspended.
+    pub unsafe fn new(entry: extern "C" fn() -> !, stack_top: *mut u8, cr3: u64) -> Self {
         // Layout, from `stack_top` growing down (must match the push order
         // in `context_switch`'s save half, and be unwound in the exact
         // reverse order by its restore half):
@@ -155,11 +154,11 @@ global_asm!(
     ".global enter_userspace",
     "enter_userspace:",
     // Args (SysV): rdi = user_rip, rsi = user_rsp, rdx = user_cs, rcx = user_ss, r8 = user_rflags
-    "push rcx",         // SS
-    "push rsi",         // RSP
-    "push r8",          // RFLAGS
-    "push rdx",         // CS
-    "push rdi",         // RIP
+    "push rcx", // SS
+    "push rsi", // RSP
+    "push r8",  // RFLAGS
+    "push rdx", // CS
+    "push rdi", // RIP
     "xor rax, rax",
     "xor rbx, rbx",
     "xor rcx, rcx",
