@@ -78,6 +78,101 @@ impl Canvas {
         self.info.height
     }
 
+    /// Number of tightly-packed bytes backing this Canvas.
+    pub fn byte_len(&self) -> usize {
+        self.info.pitch as usize * self.info.height as usize
+    }
+
+    /// Whether the fast userspace raster path can write this Canvas format.
+    pub fn supports_buffered_raster(&self) -> bool {
+        self.bytes_per_pixel == 4
+    }
+
+    /// Fill a caller-provided packed shadow buffer without any syscall.
+    pub fn clear_shadow(
+        &self,
+        shadow: &mut [u8],
+        r: u8,
+        g: u8,
+        b: u8,
+    ) -> crate::Result<()> {
+        let len = self.byte_len();
+        if !self.supports_buffered_raster() || shadow.len() < len {
+            return Err(crate::ErrorCode::InvalidArgs);
+        }
+        let pixel = self.pack_color(r, g, b).to_le_bytes();
+        for output in shadow[..len].chunks_exact_mut(4) {
+            output.copy_from_slice(&pixel);
+        }
+        Ok(())
+    }
+
+    /// Rasterize text directly into a packed shadow buffer without issuing
+    /// per-pixel VMO writes.
+    pub fn draw_text_to_shadow(
+        &self,
+        shadow: &mut [u8],
+        x: u32,
+        y: u32,
+        text: &str,
+        r: u8,
+        g: u8,
+        b: u8,
+        font: TextFont,
+    ) -> crate::Result<()> {
+        let len = self.byte_len();
+        if !self.supports_buffered_raster() || shadow.len() < len {
+            return Err(crate::ErrorCode::InvalidArgs);
+        }
+        let pixel = self.pack_color(r, g, b).to_le_bytes();
+        let scale = if font == TextFont::Tty8x16 { 2 } else { 1 };
+        let mut cursor_x = x;
+        for ch in text.chars() {
+            let glyph = crate::font8x8::glyph(ch).unwrap_or(&[0xff; 8]);
+            for (source_y, bits) in glyph.iter().enumerate() {
+                for repeat in 0..scale {
+                    let output_y = y + source_y as u32 * scale + repeat;
+                    if output_y >= self.info.height {
+                        continue;
+                    }
+                    for column in 0..8u32 {
+                        if bits & (1 << column) == 0 {
+                            continue;
+                        }
+                        let output_x = cursor_x + column;
+                        if output_x >= self.info.width {
+                            continue;
+                        }
+                        let offset = output_y as usize * self.info.pitch as usize
+                            + output_x as usize * 4;
+                        shadow[offset..offset + 4].copy_from_slice(&pixel);
+                    }
+                }
+            }
+            cursor_x = cursor_x.saturating_add(8);
+        }
+        Ok(())
+    }
+
+    /// Upload a complete packed shadow buffer in bounded 1 MiB transfers.
+    pub fn upload_shadow(&self, shadow: &[u8]) -> crate::Result<()> {
+        let len = self.byte_len();
+        if shadow.len() < len {
+            return Err(crate::ErrorCode::InvalidArgs);
+        }
+        const CHUNK: usize = 1024 * 1024;
+        let mut offset = 0usize;
+        while offset < len {
+            let end = (offset + CHUNK).min(len);
+            let written = self.vmo.write(offset as u64, &shadow[offset..end])?;
+            if written != end - offset {
+                return Err(crate::ErrorCode::InvalidArgs);
+            }
+            offset = end;
+        }
+        Ok(())
+    }
+
     #[inline]
     fn pack_color(&self, r: u8, g: u8, b: u8) -> u32 {
         let c = &self.info;
