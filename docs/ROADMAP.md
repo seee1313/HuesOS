@@ -7,6 +7,16 @@ priority order.
 
 ## Done (recent)
 
+### TTY font + DoomGeneric/Freedoom userspace port
+- Custom TTY-style 8×16 default font; original 8×8 retained as compact mode
+- GPL-2.0 DoomGeneric isolated as a separate process; MIT kernel unchanged
+- BSD-licensed Freedoom Phase 1 with pinned SHA-256
+- Purpose-built freestanding C compatibility layer, no Linux/POSIX syscall ABI
+- Canvas video, monotonic game timing, transferred keyboard service Channel
+- Bounded large-ELF VMO copies, inactive-child page-table mapping optimization,
+  SysV entry-stack alignment, and per-CPU SSE enablement
+- First stable release is silent; privileged PC Speaker SFX remains next
+
 ### Monotonic clock, full-screen Snake, and orderly shutdown
 - Hardware-timer monotonic syscall unaffected by yields or online CPU count
 - Snake pacing moved entirely off RDTSC to 100 Hz monotonic deadlines

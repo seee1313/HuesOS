@@ -8,6 +8,7 @@
   repo)
 - **QEMU** (`qemu-system-x86_64`)
 - **xorriso** and **mtools** for ISO generation
+- **GCC** (freestanding C objects for the separate DoomGeneric userspace port)
 
 Note: **you do not need to separately install OVMF UEFI firmware** — a
 known-good OVMF build is vendored in this repo (see
@@ -29,17 +30,17 @@ toolchain automatically inside the project directory.)
 
 **Debian/Ubuntu:**
 ```bash
-sudo apt install qemu-system-x86 xorriso mtools
+sudo apt install qemu-system-x86 xorriso mtools gcc
 ```
 
 **Arch Linux:**
 ```bash
-sudo pacman -S qemu-full xorriso mtools
+sudo pacman -S qemu-full xorriso mtools gcc
 ```
 
 **macOS:**
 ```bash
-brew install qemu xorriso mtools
+brew install qemu xorriso mtools gcc
 ```
 
 ## Vendored dependencies
@@ -123,7 +124,7 @@ This launches QEMU with:
 To force uniprocessor for comparison:
 
 ```bash
-qemu-system-x86_64 -machine q35 -cpu qemu64 -smp 1 -m 256M \
+qemu-system-x86_64 -machine q35 -cpu qemu64 -smp 1 -m 512M \
   -bios third_party/ovmf/OVMF.fd -cdrom build/huesos.iso \
   -serial stdio -display none -no-reboot -no-shutdown
 ```

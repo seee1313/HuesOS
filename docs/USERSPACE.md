@@ -114,6 +114,11 @@ unmapped pointer or executing an invalid opcode) terminates the complete
 process, not the kernel. A supervisor receives a stable negative status from
 `Process::wait_exit`; see [FAULTS_AND_PANIC.md](FAULTS_AND_PANIC.md).
 
+Canvas text defaults to `TextFont::Tty8x16`; callers that require the original
+compact glyphs can use `draw_text_with_font(..., TextFont::Compact8x8)`.
+Software renderers can upload packed frames with `Canvas::write_bytes` before a
+single `present_at`.
+
 `libcanvas::system::monotonic_ticks()` returns the kernel's 100 Hz monotonic
 clock. It is suitable for deadlines and animation pacing; do not calibrate
 `RDTSC` for portable timing. `libcanvas::system::shutdown()` exists for init,
