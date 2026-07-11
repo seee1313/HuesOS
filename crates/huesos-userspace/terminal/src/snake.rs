@@ -942,14 +942,16 @@ enum Action {
 
 fn decode(msg: &[u8]) -> Option<Action> {
     match msg {
-        [b'c', b] => match *b {
+        [b'k', 1, b] | [b'c', b] => match *b {
             b'w' | b'W' | b'k' | b'K' => Some(Action::Dir(Dir::Up)),
             b's' | b'S' | b'j' | b'J' => Some(Action::Dir(Dir::Down)),
             b'a' | b'A' | b'h' | b'H' => Some(Action::Dir(Dir::Left)),
             b'd' | b'D' | b'l' | b'L' => Some(Action::Dir(Dir::Right)),
             27 => Some(Action::Esc),
+            b'\n' => Some(Action::Enter),
             _ => None,
         },
+        [b'k', 0, _] => None,
         b"enter" => Some(Action::Enter),
         b"backspace" => None,
         _ => None,
