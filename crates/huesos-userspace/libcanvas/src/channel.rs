@@ -44,6 +44,14 @@ impl Channel {
         self.0
     }
 
+    /// Duplicate this endpoint with the same rights. Both wrappers refer to
+    /// the same channel inbox; use this to lend a service channel to a child
+    /// while retaining ownership in the parent.
+    pub fn duplicate(&self) -> crate::Result<Channel> {
+        let handle = self.0.duplicate(huesos_abi::rights::SAME_RIGHTS)?;
+        Ok(Channel::from_handle(handle))
+    }
+
     /// Create a connected pair of channel endpoints. Sending on one is
     /// received on the other, and vice versa.
     pub fn pair() -> crate::Result<(Channel, Channel)> {

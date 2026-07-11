@@ -31,7 +31,7 @@ exec qemu-system-x86_64 \
     -machine q35 \
     -cpu qemu64 \
     -smp 2 \
-    -m 256M \
+    -m 512M \
     -bios "$OVMF" \
     -cdrom "$ISO" \
     -net none \
