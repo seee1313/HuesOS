@@ -7,6 +7,13 @@ priority order.
 
 ## Done (recent)
 
+### Buffered terminal renderer / post-game stall fix
+- Root cause isolated to per-pixel/per-scanline VMO syscalls during Terminal repaint
+- Static 16 MiB userspace shadow framebuffer; no per-frame heap allocation
+- Local glyph rasterization + bounded 1 MiB uploads + one present
+- Removed duplicate post-Snake terminal render
+- Doom Q-exit regression restores Terminal in 60–80 ms under QEMU TCG
+
 ### TTY font + DoomGeneric/Freedoom userspace port
 - Custom TTY-style 8×16 default font; original 8×8 retained as compact mode
 - GPL-2.0 DoomGeneric isolated as a separate process; MIT kernel unchanged

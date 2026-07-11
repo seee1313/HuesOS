@@ -150,6 +150,11 @@ and compact modes.
 
 See [DOOM.md](DOOM.md) and [TTY_FONT.md](TTY_FONT.md).
 
+The post-game repaint regression launches Doom, exits with Q, captures Terminal
+after two seconds, and requires its small text palette with no panic. Buffered
+render validation measured 6–8 ticks under QEMU TCG. See
+[TERMINAL_RENDERING.md](TERMINAL_RENDERING.md).
+
 ## Kernel Panic Screen Test
 
 Normal images never panic intentionally. To exercise the fatal path, build an

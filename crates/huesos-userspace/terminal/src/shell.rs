@@ -195,7 +195,6 @@ impl Shell {
         self.screen.write_line("Type 'help' to list available commands.");
         self.screen.write_line("");
         self.prompt();
-        self.screen.render();
     }
 
     fn prompt(&mut self) {
