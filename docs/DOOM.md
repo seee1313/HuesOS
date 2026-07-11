@@ -69,9 +69,11 @@ The first port maps:
 | Enter | Confirm |
 | Escape | Menu |
 
-The early keyboard service publishes press events only. The Doom adapter emits
-a matching synthetic release on the following poll, preventing permanently
-stuck keys while preserving keyboard repeat.
+The early keyboard service publishes make events only. The Doom adapter keeps
+a key logically down for eight monotonic ticks (80 ms), extends that deadline
+on hardware repeat, and then emits a synthetic release. Releasing on the very
+next `DG_GetKey` poll was sufficient for menus but happened before
+`G_BuildTiccmd` sampled gameplay input, which made movement appear broken.
 
 ## SIMD and stack ABI
 

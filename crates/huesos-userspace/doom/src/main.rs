@@ -16,7 +16,14 @@ static mut CANVAS: Option<Canvas> = None;
 static mut KEYBOARD: Option<Channel> = None;
 static mut PRESENT_X: u32 = 0;
 static mut PRESENT_Y: u32 = 0;
-static mut PENDING_RELEASE: Option<u8> = None;
+// The keyboard service currently reports make events only. Keep a Doom key
+// logically held for several scheduler ticks so gameplay samples it as down;
+// releasing it on the very next DG_GetKey poll works in menus but is too fast
+// for G_BuildTiccmd and produces no player movement.
+static mut HELD_KEY: Option<u8> = None;
+static mut RELEASE_AT: u64 = 0;
+static mut QUEUED_PRESS: Option<u8> = None;
+const KEY_HOLD_TICKS: u64 = 8;
 
 unsafe extern "C" {
     fn doomgeneric_Create(argc: i32, argv: *mut *mut u8);
@@ -91,27 +98,63 @@ pub extern "C" fn DG_GetTicksMs() -> u32 {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn DG_GetKey(pressed: *mut i32, key: *mut u8) -> i32 {
+    let now = libcanvas::system::monotonic_ticks().unwrap_or(0);
+
     unsafe {
-        if let Some(value) = PENDING_RELEASE.take() {
-            *pressed = 0;
+        if let Some(value) = QUEUED_PRESS.take() {
+            HELD_KEY = Some(value);
+            RELEASE_AT = now.saturating_add(KEY_HOLD_TICKS);
+            *pressed = 1;
             *key = value;
             return 1;
         }
     }
 
     let mut message = [0u8; 16];
-    let result = unsafe { KEYBOARD.as_ref() }.and_then(|channel| match channel.read_into(&mut message) {
+    let incoming = unsafe { KEYBOARD.as_ref() }.and_then(|channel| match channel.read_into(&mut message) {
         Ok(n) => decode_key(&message[..n]),
         Err(ErrorCode::ShouldWait | ErrorCode::TimedOut) => None,
         Err(_) => None,
     });
-    let Some(value) = result else { return 0 };
+
     unsafe {
-        *pressed = 1;
-        *key = value;
-        PENDING_RELEASE = Some(value);
+        if let Some(value) = incoming {
+            match HELD_KEY {
+                Some(held) if held == value => {
+                    // Hardware repeat extends the hold without generating a
+                    // second key-down event.
+                    RELEASE_AT = now.saturating_add(KEY_HOLD_TICKS);
+                    return 0;
+                }
+                Some(held) => {
+                    // Release the previous key first; deliver the new press on
+                    // the next poll to preserve event ordering.
+                    HELD_KEY = None;
+                    QUEUED_PRESS = Some(value);
+                    *pressed = 0;
+                    *key = held;
+                    return 1;
+                }
+                None => {
+                    HELD_KEY = Some(value);
+                    RELEASE_AT = now.saturating_add(KEY_HOLD_TICKS);
+                    *pressed = 1;
+                    *key = value;
+                    return 1;
+                }
+            }
+        }
+
+        if let Some(held) = HELD_KEY {
+            if now >= RELEASE_AT {
+                HELD_KEY = None;
+                *pressed = 0;
+                *key = held;
+                return 1;
+            }
+        }
     }
-    1
+    0
 }
 
 fn decode_key(message: &[u8]) -> Option<u8> {
