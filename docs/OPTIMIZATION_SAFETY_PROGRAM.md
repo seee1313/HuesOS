@@ -100,6 +100,33 @@ Key results:
   `UnsafeCell` boundary for its synchronous single-thread callback model;
 - added null checks and explicit safety contracts to Doom FFI outputs.
 
+### Clippy and mutable-static checkpoint
+
+Current post-Clippy metrics are 185 unsafe blocks, 46 unsafe functions, 24
+unsafe impls, and one `static mut` declaration. The small increase from the
+first checkpoint is intentional: functions that dereference caller-owned raw
+pointers are now correctly marked unsafe, and implicit unsafe operations inside
+unsafe functions became explicit reviewed blocks. Relative to baseline, unsafe
+blocks remain down by 43 (18.9%).
+
+The sole remaining `static mut` is the foreign DoomGeneric
+`DG_ScreenBuffer` symbol; first-party Rust mutable-static storage is zero.
+
+- added Clippy to the pinned Rust toolchain and a `make clippy` gate covering
+  the workspace plus every standalone userspace/driver crate with `-D warnings`;
+- removed first-party Rust `static mut` storage from GDT stacks, AP stacks,
+  CPU-local slots, syscall publication, Doom state, and Terminal shadow memory;
+- retained only the foreign DoomGeneric `DG_ScreenBuffer` declaration, whose
+  ownership is controlled by the C engine and accessed through an FFI safety
+  contract;
+- fixed `TicketLock::try_lock`, which previously consumed a ticket on failure
+  and could permanently stall every later lock waiter;
+- replaced Clippy-reported unit error types with typed framebuffer/VMO/VMAR
+  errors and improved propagation to syscall status codes;
+- moved early init probe waits from a potentially missed blocking wake to
+  bounded cooperative process polling so a failed diagnostic cannot prevent
+  Terminal startup.
+
 ## Work packages
 
 ### P0 — correctness and resource lifecycle
