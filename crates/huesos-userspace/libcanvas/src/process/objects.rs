@@ -64,6 +64,23 @@ impl Process {
         Ok(code)
     }
 
+    /// Query process completion without blocking.
+    pub fn poll_exit(&self) -> crate::Result<Option<i64>> {
+        let mut code = 0i64;
+        let ret = unsafe {
+            raw::syscall2(
+                Syscall::ProcessGetExitCode,
+                self.0.raw() as u64,
+                &mut code as *mut i64 as u64,
+            )
+        };
+        match raw::decode(ret) {
+            Ok(_) => Ok(Some(code)),
+            Err(crate::ErrorCode::ShouldWait) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
     /// Borrow the underlying process handle.
     pub fn handle(&self) -> &Handle {
         &self.0

@@ -71,6 +71,7 @@ pub extern "C" fn _start() -> ! {
     );
     let mut supervisor_message = [0u8; 64];
     let mut supervisor_handles = [0u32; 1];
+    let mut doom_process: Option<Process> = None;
     loop {
         let _keep_services_alive = &driver_manager;
         if let Some((_, channel)) = &terminal {
@@ -87,7 +88,13 @@ pub extern "C" fn _start() -> ! {
                 }
                 Ok((n, 1)) if &supervisor_message[..n] == b"system:launch-doom" => {
                     let handle = unsafe { libcanvas::Handle::from_raw(supervisor_handles[0]) };
-                    launch_doom(&mut logger, channel, Channel::from_handle(handle));
+                    if doom_process.is_none() {
+                        doom_process =
+                            launch_doom(&mut logger, channel, Channel::from_handle(handle));
+                    } else {
+                        init_logln!(logger, "[init] Doom is already running");
+                        let _ = channel.write(b"doom:error:busy");
+                    }
                 }
                 Ok(_) | Err(ErrorCode::ShouldWait) | Err(ErrorCode::TimedOut) => {}
                 Err(error) => init_logln!(
@@ -96,25 +103,42 @@ pub extern "C" fn _start() -> ! {
                     error.as_str()
                 ),
             }
+
+            let doom_exit = doom_process
+                .as_ref()
+                .and_then(|process| process.poll_exit().ok().flatten());
+            if let Some(code) = doom_exit {
+                init_logln!(logger, "[init] Doom exited with status {}", code);
+                doom_process = None;
+                let _ = channel.write(b"doom:exited");
+            }
         }
         libcanvas::process::yield_now();
     }
 }
 
 
-fn launch_doom(logger: &mut InitLogger, terminal: &Channel, keyboard: Channel) {
+fn launch_doom(
+    logger: &mut InitLogger,
+    terminal: &Channel,
+    keyboard: Channel,
+) -> Option<Process> {
     init_logln!(logger, "[init] launching DoomGeneric/Freedoom");
-    let result = (|| -> libcanvas::Result<()> {
-        let (_process, bootstrap) = libcanvas::process::spawn_elf("doom", DOOM_ELF)?;
+    let result = (|| -> libcanvas::Result<Process> {
+        let (process, bootstrap) = libcanvas::process::spawn_elf("doom", DOOM_ELF)?;
         init_logln!(logger, "[init] Doom process created; passing keyboard");
         bootstrap.write_handle(b"keyboard", keyboard.into_handle())?;
         init_logln!(logger, "[init] Doom keyboard passed; process running");
         terminal.write(b"doom:started")?;
-        Ok(())
+        Ok(process)
     })();
-    if let Err(error) = result {
-        init_logln!(logger, "[init] Doom launch failed: {}", error.as_str());
-        let _ = terminal.write(b"doom:error");
+    match result {
+        Ok(process) => Some(process),
+        Err(error) => {
+            init_logln!(logger, "[init] Doom launch failed: {}", error.as_str());
+            let _ = terminal.write(b"doom:error");
+            None
+        }
     }
 }
 
