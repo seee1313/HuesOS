@@ -10,6 +10,10 @@ pub(crate) static YIELD_FN: Mutex<Option<fn()>> = Mutex::new(None);
 pub(crate) static EXIT_FN: Mutex<Option<fn(i64) -> !>> = Mutex::new(None);
 /// Global debug-write callback (set by kernel to point at the serial writer).
 pub(crate) static DEBUG_WRITE_FN: Mutex<Option<fn(&[u8])>> = Mutex::new(None);
+/// Global monotonic-clock callback.
+pub(crate) static CLOCK_FN: Mutex<Option<fn() -> u64>> = Mutex::new(None);
+/// Global privileged shutdown callback.
+pub(crate) static SHUTDOWN_FN: Mutex<Option<fn() -> Result<(), ErrorCode>>> = Mutex::new(None);
 
 /// Kernel callback type used by the syscall layer to create a suspended process.
 pub type ProcessCreateFn =
@@ -40,6 +44,16 @@ pub fn set_exit_fn(f: fn(i64) -> !) {
 /// Set the debug-write function. Called once by kernel init.
 pub fn set_debug_write_fn(f: fn(&[u8])) {
     *DEBUG_WRITE_FN.lock() = Some(f);
+}
+
+/// Set the monotonic clock source. Called once by kernel init.
+pub fn set_clock_fn(f: fn() -> u64) {
+    *CLOCK_FN.lock() = Some(f);
+}
+
+/// Set the privileged orderly-shutdown callback. Called once by kernel init.
+pub fn set_shutdown_fn(f: fn() -> Result<(), ErrorCode>) {
+    *SHUTDOWN_FN.lock() = Some(f);
 }
 
 /// Set the process-create function. Called once by kernel init.

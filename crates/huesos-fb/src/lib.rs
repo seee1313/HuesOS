@@ -260,6 +260,25 @@ pub fn panic_render(args: core::fmt::Arguments<'_>) {
     let _ = console.write_fmt(args);
 }
 
+/// Display the final orderly-shutdown screen without allocating.
+pub fn shutdown_render() {
+    let Some(config) = *PANIC_FRAMEBUFFER.lock() else {
+        return;
+    };
+    let mut framebuffer = Framebuffer { config };
+    let width = framebuffer.config.width;
+    let height = framebuffer.config.height;
+    framebuffer.fill_rect(0, 0, width, height, 5, 10, 20);
+
+    let title = "HuesOS has been safely halted";
+    let message = "It is now safe to power off your computer.";
+    let title_x = width.saturating_sub(title.len() as u32 * 8) / 2;
+    let message_x = width.saturating_sub(message.len() as u32 * 8) / 2;
+    let center_y = height.saturating_sub(24) / 2;
+    framebuffer.draw_text(title_x, center_y, title, 120, 210, 255);
+    framebuffer.draw_text(message_x, center_y + 20, message, 255, 255, 255);
+}
+
 /// Whether a framebuffer is available at all.
 pub fn is_available() -> bool {
     FRAMEBUFFER.lock().is_some()
@@ -333,6 +352,8 @@ mod tests {
     extern crate std;
     use std::vec;
     use std::vec::Vec;
+
+    static GLOBAL_FB_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     // Tests drive `Framebuffer` directly against a plain heap buffer
     // standing in for MMIO/framebuffer memory — the struct's methods never
@@ -445,6 +466,7 @@ mod tests {
 
     #[test]
     fn panic_renderer_uses_red_background_and_white_text() {
+        let _serial = GLOBAL_FB_TEST_LOCK.lock().unwrap();
         let mut backing = vec![0u8; 320 * 200 * 4];
         init(Some(FramebufferConfig {
             addr: backing.as_mut_ptr(),
@@ -472,6 +494,37 @@ mod tests {
         }
         assert!(red > 320 * 200 / 2);
         assert!(white > 100);
+    }
+
+    #[test]
+    fn shutdown_renderer_uses_dark_background_and_visible_text() {
+        let _serial = GLOBAL_FB_TEST_LOCK.lock().unwrap();
+        let mut backing = vec![0u8; 640 * 240 * 4];
+        init(Some(FramebufferConfig {
+            addr: backing.as_mut_ptr(),
+            width: 640,
+            height: 240,
+            pitch: 640 * 4,
+            bpp: 32,
+            red_mask_size: 8,
+            red_mask_shift: 16,
+            green_mask_size: 8,
+            green_mask_shift: 8,
+            blue_mask_size: 8,
+            blue_mask_shift: 0,
+        }));
+        shutdown_render();
+
+        let dark = backing
+            .chunks_exact(4)
+            .filter(|pixel| (pixel[2], pixel[1], pixel[0]) == (5, 10, 20))
+            .count();
+        let bright = backing
+            .chunks_exact(4)
+            .filter(|pixel| pixel[2] > 100 && pixel[1] > 180 && pixel[0] > 200)
+            .count();
+        assert!(dark > 640 * 240 / 2);
+        assert!(bright > 100);
     }
 
     fn alloc_vec() -> Vec<u8> {

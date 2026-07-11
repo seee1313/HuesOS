@@ -9,6 +9,8 @@ use super::fault::{FaultInfo, FaultKind};
 
 /// IPI vector used to freeze non-owner CPUs during a kernel panic.
 pub const PANIC_STOP_VECTOR: u8 = 0xF1;
+/// IPI vector used for an orderly system-wide software halt.
+pub const SHUTDOWN_STOP_VECTOR: u8 = 0xF2;
 static PANIC_STOPPED_CPUS: AtomicUsize = AtomicUsize::new(0);
 
 /// Number of peer CPUs that acknowledged the panic-stop IPI.
@@ -58,6 +60,7 @@ static IDT: Lazy<InterruptDescriptorTable> = Lazy::new(|| {
     idt[32].set_handler_fn(timer_handler);
     idt[33].set_handler_fn(keyboard_handler);
     idt[PANIC_STOP_VECTOR].set_handler_fn(panic_stop_handler);
+    idt[SHUTDOWN_STOP_VECTOR].set_handler_fn(shutdown_stop_handler);
     idt
 });
 
@@ -116,6 +119,15 @@ extern "x86-interrupt" fn double_fault_handler(frame: InterruptStackFrame, error
 extern "x86-interrupt" fn panic_stop_handler(_frame: InterruptStackFrame) {
     super::interrupts::disable();
     PANIC_STOPPED_CPUS.fetch_add(1, Ordering::Release);
+    super::lapic::eoi();
+    loop {
+        crate::hlt();
+    }
+}
+
+extern "x86-interrupt" fn shutdown_stop_handler(_frame: InterruptStackFrame) {
+    super::interrupts::disable();
+    super::lapic::timer_stop();
     super::lapic::eoi();
     loop {
         crate::hlt();

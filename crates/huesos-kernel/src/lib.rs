@@ -13,6 +13,7 @@ extern crate alloc;
 pub mod init;
 pub mod process;
 pub mod scheduler;
+pub mod shutdown;
 pub mod smp;
 pub mod task;
 pub mod mem;
@@ -24,6 +25,12 @@ pub use huesos_pmm::MemoryRegion;
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 pub static INIT_BINARY: &[u8] = include_bytes!(env!("HUESOS_INIT_PATH"));
+static INIT_PROCESS_KOID: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
+pub(crate) fn init_process_koid() -> u64 {
+    INIT_PROCESS_KOID.load(core::sync::atomic::Ordering::Acquire)
+}
 
 #[derive(Clone, Copy)]
 pub struct FramebufferInfo {
@@ -135,7 +142,13 @@ fn log_boot_banner(boot_info: &BootInfo) {
 }
 
 fn spawn_init_process() {
+    use huesos_object::KernelObject;
+
     let spawned = process::spawn_from_elf("init", INIT_BINARY);
+    INIT_PROCESS_KOID.store(
+        spawned.process.koid().0,
+        core::sync::atomic::Ordering::Release,
+    );
     let name = *b"init\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0";
     let _ = scheduler::spawn_user_thread(
         &name, spawned.process, spawned.entry_point, spawned.user_rsp, spawned.cr3,

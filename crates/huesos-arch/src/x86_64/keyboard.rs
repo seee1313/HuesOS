@@ -111,3 +111,28 @@ pub fn read_char() -> Option<u8> {
 pub fn bytes_received() -> usize {
     BYTES_RECEIVED.load(Ordering::Relaxed)
 }
+
+/// Quiesce both PS/2 interfaces before the kernel halts the machine.
+///
+/// 8042 command `0xAD` disables the first port and `0xA7` disables the second.
+/// These commands do not cut system power; they prevent new keyboard/mouse
+/// traffic while the orderly software-shutdown screen remains displayed.
+pub fn prepare_shutdown() {
+    use x86_64::instructions::port::Port;
+
+    let mut status: Port<u8> = Port::new(0x64);
+    let mut command: Port<u8> = Port::new(0x64);
+    for value in [0xADu8, 0xA7u8] {
+        // Input-buffer-full (status bit 1) must clear before a controller
+        // command is accepted. Bound the poll so broken/non-PS2 hardware
+        // cannot hang shutdown.
+        for _ in 0..100_000 {
+            let ready = unsafe { status.read() } & 0x02 == 0;
+            if ready {
+                unsafe { command.write(value) };
+                break;
+            }
+            core::hint::spin_loop();
+        }
+    }
+}
