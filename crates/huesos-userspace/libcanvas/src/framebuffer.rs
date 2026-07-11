@@ -18,7 +18,7 @@ use huesos_abi::{FramebufferBlitArgs, FramebufferInfo, Syscall};
 /// boot).
 pub fn info() -> crate::Result<FramebufferInfo> {
     let mut info = FramebufferInfo::default();
-    let ret = unsafe { raw::syscall1(Syscall::FramebufferInfo, &mut info as *mut _ as u64) };
+    let ret = raw::syscall1(Syscall::FramebufferInfo, &mut info as *mut _ as u64);
     raw::decode(ret)?;
     Ok(info)
 }
@@ -89,13 +89,7 @@ impl Canvas {
     }
 
     /// Fill a caller-provided packed shadow buffer without any syscall.
-    pub fn clear_shadow(
-        &self,
-        shadow: &mut [u8],
-        r: u8,
-        g: u8,
-        b: u8,
-    ) -> crate::Result<()> {
+    pub fn clear_shadow(&self, shadow: &mut [u8], r: u8, g: u8, b: u8) -> crate::Result<()> {
         let len = self.byte_len();
         if !self.supports_buffered_raster() || shadow.len() < len {
             return Err(crate::ErrorCode::InvalidArgs);
@@ -143,8 +137,8 @@ impl Canvas {
                         if output_x >= self.info.width {
                             continue;
                         }
-                        let offset = output_y as usize * self.info.pitch as usize
-                            + output_x as usize * 4;
+                        let offset =
+                            output_y as usize * self.info.pitch as usize + output_x as usize * 4;
                         shadow[offset..offset + 4].copy_from_slice(&pixel);
                     }
                 }
@@ -201,7 +195,16 @@ impl Canvas {
 
     /// Fill an axis-aligned rectangle with a solid color. Clips to the
     /// canvas bounds.
-    pub fn fill_rect(&self, x: u32, y: u32, w: u32, h: u32, r: u8, g: u8, b: u8) -> crate::Result<()> {
+    pub fn fill_rect(
+        &self,
+        x: u32,
+        y: u32,
+        w: u32,
+        h: u32,
+        r: u8,
+        g: u8,
+        b: u8,
+    ) -> crate::Result<()> {
         let packed = self.pack_color(r, g, b);
         let bytes = packed.to_le_bytes();
         let bpp = self.bytes_per_pixel as usize;
@@ -315,8 +318,7 @@ impl Canvas {
             dst_x,
             dst_y,
         };
-        let ret =
-            unsafe { raw::syscall1(Syscall::FramebufferBlit, &args as *const _ as u64) };
+        let ret = raw::syscall1(Syscall::FramebufferBlit, &args as *const _ as u64);
         raw::decode(ret)?;
         Ok(())
     }

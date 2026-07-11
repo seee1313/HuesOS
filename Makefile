@@ -8,7 +8,7 @@ CARGO_BUILD := cargo build -p huesos-boot $(CARGO_FLAGS)
 
 ISO := build/huesos.iso
 
-.PHONY: all build build-release run run-release iso iso-release clean fmt test
+.PHONY: all build build-release run run-release iso iso-release clean fmt test audit
 
 all: build
 
@@ -32,8 +32,11 @@ run-release: iso-release
 
 test:
 	cargo test -p huesos-elf -p huesos-pmm -p huesos-object -p huesos-fb \
-		-p huesos-syscalls -p huesos-fat -p huesos-alloc \
+		-p huesos-syscalls -p huesos-fat -p huesos-alloc -p huesos-kernel \
 		--target x86_64-unknown-linux-gnu -Z build-std=
+
+audit:
+	python3 tools/audit-safety.py
 
 clean:
 	cargo clean

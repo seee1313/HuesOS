@@ -6,6 +6,7 @@
 //! into the architecture-independent dispatcher, restore, and `sysret` back.
 
 use core::arch::global_asm;
+use core::sync::atomic::{AtomicUsize, Ordering};
 use x86_64::registers::control::{Efer, EferFlags};
 use x86_64::registers::model_specific::{LStar, SFMask, Star};
 use x86_64::registers::rflags::RFlags;
@@ -41,13 +42,16 @@ pub type SyscallHandler = extern "C" fn(&mut SyscallFrame);
 
 /// Global syscall handler function pointer, set by the kernel at init.
 #[unsafe(no_mangle)]
-pub static mut HUESOS_SYSCALL_HANDLER: usize = 0;
+pub static HUESOS_SYSCALL_HANDLER: AtomicUsize = AtomicUsize::new(0);
 
 /// Register the Rust syscall dispatcher that the asm trampoline calls into.
+///
+/// Release ordering publishes all kernel initialization that precedes handler
+/// installation before APs are allowed to issue syscalls. The assembly entry
+/// performs a plain aligned load after the AP release gate; the value is never
+/// changed again during normal operation.
 pub fn set_handler(handler: SyscallHandler) {
-    unsafe {
-        HUESOS_SYSCALL_HANDLER = handler as usize;
-    }
+    HUESOS_SYSCALL_HANDLER.store(handler as usize, Ordering::Release);
 }
 
 /// Set the kernel stack pointer used while servicing a syscall. Must be
@@ -75,7 +79,9 @@ pub fn init(
     Star::write(user_code, user_data, kernel_code, kernel_data)
         .expect("invalid STAR segment layout");
 
-    LStar::write(x86_64::VirtAddr::new(syscall_entry as *const () as usize as u64));
+    LStar::write(x86_64::VirtAddr::new(
+        syscall_entry as *const () as usize as u64,
+    ));
 
     // Mask interrupts (IF) during syscall entry until we've swapped stacks.
     SFMask::write(RFlags::INTERRUPT_FLAG | RFlags::DIRECTION_FLAG | RFlags::TRAP_FLAG);
@@ -103,28 +109,28 @@ global_asm!(
     "mov gs:[40], rsp",
     "mov rsp, gs:[48]",
     "push qword ptr gs:[40]", // user_rsp
-    "push r11",   // user_rflags
-    "push rcx",   // user_rip
-    "push r8",    // arg5
-    "push r10",   // arg4
-    "push rdx",   // arg3
-    "push rsi",   // arg2
-    "push rdi",   // arg1
-    "push rax",   // num
+    "push r11",               // user_rflags
+    "push rcx",               // user_rip
+    "push r8",                // arg5
+    "push r10",               // arg4
+    "push rdx",               // arg3
+    "push rsi",               // arg2
+    "push rdi",               // arg1
+    "push rax",               // num
     "mov rdi, rsp",
     "mov rax, [rip + HUESOS_SYSCALL_HANDLER]",
     "test rax, rax",
     "jz 2f",
     "call rax",
     "2:",
-    "pop rax",    // num (unused after call but keep stack balanced)
+    "pop rax", // num (unused after call but keep stack balanced)
     "pop rdi",
     "pop rsi",
     "pop rdx",
     "pop r10",
     "pop r8",
-    "pop rcx",    // user_rip
-    "pop r11",    // user_rflags
-    "pop rsp",    // restore user rsp last
+    "pop rcx", // user_rip
+    "pop r11", // user_rflags
+    "pop rsp", // restore user rsp last
     "sysretq",
 );

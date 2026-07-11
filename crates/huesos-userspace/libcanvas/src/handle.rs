@@ -47,14 +47,12 @@ impl Handle {
     /// copy this handle's rights exactly.
     pub fn duplicate(&self, rights: u32) -> crate::Result<Handle> {
         let mut out: HandleValue = INVALID_HANDLE;
-        let ret = unsafe {
-            raw::syscall3(
-                Syscall::HandleDuplicate,
-                self.0 as u64,
-                rights as u64,
-                &mut out as *mut HandleValue as u64,
-            )
-        };
+        let ret = raw::syscall3(
+            Syscall::HandleDuplicate,
+            self.0 as u64,
+            rights as u64,
+            &mut out as *mut HandleValue as u64,
+        );
         raw::decode(ret)?;
         Ok(unsafe { Handle::from_raw(out) })
     }
@@ -63,9 +61,7 @@ impl Handle {
 impl Drop for Handle {
     fn drop(&mut self) {
         if self.0 != INVALID_HANDLE {
-            unsafe {
-                let _ = raw::syscall1(Syscall::HandleClose, self.0 as u64);
-            }
+            let _ = raw::syscall1(Syscall::HandleClose, self.0 as u64);
         }
     }
 }

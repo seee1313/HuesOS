@@ -13,9 +13,11 @@ pub fn write_bytes(bytes: &[u8]) {
         return;
     }
     let chunk = &bytes[..bytes.len().min(4096)];
-    unsafe {
-        let _ = raw::syscall2(Syscall::DebugWrite, chunk.as_ptr() as u64, chunk.len() as u64);
-    }
+    let _ = raw::syscall2(
+        Syscall::DebugWrite,
+        chunk.as_ptr() as u64,
+        chunk.len() as u64,
+    );
 }
 
 /// Write a `&str` to the kernel debug log.

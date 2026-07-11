@@ -70,13 +70,12 @@ pub extern "C" fn _start() -> ! {
         "[init] service launch complete; parking as init supervisor"
     );
     let mut supervisor_message = [0u8; 64];
-    let mut supervisor_handles = [0u32; 1];
     let mut doom_process: Option<Process> = None;
     loop {
         let _keep_services_alive = &driver_manager;
         if let Some((_, channel)) = &terminal {
-            match channel.read_etc(&mut supervisor_message, &mut supervisor_handles) {
-                Ok((n, 0)) if &supervisor_message[..n] == b"system:shutdown" => {
+            match channel.read_optional_handle(&mut supervisor_message) {
+                Ok((n, None)) if &supervisor_message[..n] == b"system:shutdown" => {
                     init_logln!(logger, "[init] terminal requested orderly shutdown");
                     if let Err(error) = libcanvas::system::shutdown() {
                         init_logln!(
@@ -86,8 +85,7 @@ pub extern "C" fn _start() -> ! {
                         );
                     }
                 }
-                Ok((n, 1)) if &supervisor_message[..n] == b"system:launch-doom" => {
-                    let handle = unsafe { libcanvas::Handle::from_raw(supervisor_handles[0]) };
+                Ok((n, Some(handle))) if &supervisor_message[..n] == b"system:launch-doom" => {
                     if doom_process.is_none() {
                         doom_process =
                             launch_doom(&mut logger, channel, Channel::from_handle(handle));
@@ -117,12 +115,7 @@ pub extern "C" fn _start() -> ! {
     }
 }
 
-
-fn launch_doom(
-    logger: &mut InitLogger,
-    terminal: &Channel,
-    keyboard: Channel,
-) -> Option<Process> {
+fn launch_doom(logger: &mut InitLogger, terminal: &Channel, keyboard: Channel) -> Option<Process> {
     init_logln!(logger, "[init] launching DoomGeneric/Freedoom");
     let result = (|| -> libcanvas::Result<Process> {
         let (process, bootstrap) = libcanvas::process::spawn_elf("doom", DOOM_ELF)?;
@@ -179,13 +172,21 @@ fn create_driver_manager_registry_channel(
                     Some(terminal_end)
                 }
                 Err(e) => {
-                    init_logln!(logger, "[init] failed to pass registry channel: {}", e.as_str());
+                    init_logln!(
+                        logger,
+                        "[init] failed to pass registry channel: {}",
+                        e.as_str()
+                    );
                     None
                 }
             }
         }
         Err(e) => {
-            init_logln!(logger, "[init] failed to create registry channel: {}", e.as_str());
+            init_logln!(
+                logger,
+                "[init] failed to create registry channel: {}",
+                e.as_str()
+            );
             None
         }
     }
@@ -197,12 +198,19 @@ fn send_terminal_registry_channel(
     registry: Option<Channel>,
 ) {
     let Some(registry) = registry else {
-        init_logln!(logger, "[init] no DriverManager registry channel for terminal");
+        init_logln!(
+            logger,
+            "[init] no DriverManager registry channel for terminal"
+        );
         return;
     };
     match terminal_bootstrap.write_handle(b"driver-manager-registry", registry.into_handle()) {
         Ok(()) => init_logln!(logger, "[init] passed DriverManager registry to terminal"),
-        Err(e) => init_logln!(logger, "[init] failed to pass registry to terminal: {}", e.as_str()),
+        Err(e) => init_logln!(
+            logger,
+            "[init] failed to pass registry to terminal: {}",
+            e.as_str()
+        ),
     }
 }
 
@@ -272,17 +280,12 @@ fn run_monotonic_clock_check(logger: &mut InitLogger) {
             "[init] monotonic clock FAILED (measured {} ticks)",
             elapsed
         ),
-        Err(error) => init_logln!(
-            logger,
-            "[init] monotonic clock FAILED ({})",
-            error.as_str()
-        ),
+        Err(error) => init_logln!(logger, "[init] monotonic clock FAILED ({})", error.as_str()),
     }
 }
 
 fn run_shutdown_authorization_check(logger: &mut InitLogger) {
-    let Ok((process, bootstrap)) =
-        libcanvas::process::spawn_elf("shutdown-probe", FAULT_PROBE_ELF)
+    let Ok((process, bootstrap)) = libcanvas::process::spawn_elf("shutdown-probe", FAULT_PROBE_ELF)
     else {
         init_logln!(logger, "[init] shutdown authorization FAILED (launch)");
         return;

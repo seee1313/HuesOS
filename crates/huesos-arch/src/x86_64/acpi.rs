@@ -1,5 +1,26 @@
-//! Minimal ACPI parser: RSDP -> RSDT/XSDT -> MADT.
-//! Extracts Local APIC IDs and I/O APIC info for SMP bring-up.
+//! Minimal, defensive ACPI discovery for SMP bootstrap.
+//!
+//! The parser follows `RSDP -> RSDT/XSDT -> MADT` and extracts only the data
+//! required before userspace drivers exist: enabled Local APIC identifiers,
+//! the Local APIC MMIO base, and I/O APIC descriptors. It deliberately does
+//! not interpret AML or provide a general ACPI namespace.
+//!
+//! ## Memory model
+//!
+//! Firmware tables are packed byte streams. Their physical addresses are not
+//! guaranteed to satisfy Rust alignment, so this module never creates a
+//! reference to an ACPI structure. Every header/field is copied by value with
+//! `read_unaligned`. Table lengths, arithmetic, entry sizes, and parser work
+//! are bounded before advancing a cursor.
+//!
+//! The boot layer maps ACPI reclaimable/NVS ranges into the HHDM before calling
+//! this parser. That mapping lifetime is the central unsafe precondition; once
+//! established, malformed firmware should produce `None`, not Rust UB.
+//!
+//! ## Concurrency
+//!
+//! Parsing runs once on the BSP before AP scheduling begins and mutates no
+//! global state. The returned fixed-capacity arrays are owned by the caller.
 
 #![allow(missing_docs)]
 
@@ -86,114 +107,176 @@ impl MadtInfo {
 }
 
 /// Parse the RSDP and walk tables to find the MADT.
-/// `phys_to_virt` must translate a physical address to a kernel-accessible
-/// virtual address (e.g. via HHDM).
+///
+/// `phys_to_virt` translates a physical address to a kernel-accessible
+/// virtual address. Firmware structures are packed and are therefore always
+/// copied with `read_unaligned`; creating references to them would be UB when
+/// firmware chooses a naturally unaligned address.
 ///
 /// # Safety
-/// `rsdp_phys` must point to a valid RSDP in physical memory.
-pub unsafe fn parse_madt(
-    rsdp_phys: u64,
-    phys_to_virt: impl Fn(u64) -> u64,
-) -> Option<MadtInfo> {
+/// `rsdp_phys` and every physical address returned by ACPI must be mapped for
+/// at least the validated table length by `phys_to_virt`. The caller establishes
+/// this from the bootloader memory map before parsing.
+pub unsafe fn parse_madt(rsdp_phys: u64, phys_to_virt: impl Fn(u64) -> u64) -> Option<MadtInfo> {
     let rsdp_virt = phys_to_virt(rsdp_phys);
-    parse_madt_from_root(rsdp_virt, phys_to_virt)
+    // SAFETY: guaranteed by this function's caller contract; the helper makes
+    // an unaligned value copy and never creates a firmware-memory reference.
+    unsafe { parse_madt_from_root(rsdp_virt, phys_to_virt) }
+}
+
+/// Copy a packed firmware value from an already mapped virtual address.
+///
+/// # Safety
+/// `[address, address + size_of::<T>())` must be readable mapped memory.
+/// Marker for packed ACPI values whose every bit pattern is valid.
+///
+/// Keeping this trait private prevents a future parser change from using the
+/// generic reader for references, `bool`, enums, or other types where arbitrary
+/// firmware bytes could create an invalid Rust value.
+trait FirmwarePod: Copy {}
+impl FirmwarePod for u8 {}
+impl FirmwarePod for u32 {}
+impl FirmwarePod for u64 {}
+impl FirmwarePod for RsdpV1 {}
+impl FirmwarePod for RsdpV2Ext {}
+impl FirmwarePod for SdtHeader {}
+
+unsafe fn read_firmware<T: FirmwarePod>(address: u64) -> T {
+    // SAFETY: delegated to the caller; unaligned access is intentional and T
+    // is restricted to plain data with no invalid bit patterns.
+    unsafe { core::ptr::read_unaligned(address as *const T) }
 }
 
 unsafe fn parse_madt_from_root(
     rsdp_virt: u64,
     phys_to_virt: impl Fn(u64) -> u64,
 ) -> Option<MadtInfo> {
-    let rsdp = unsafe { &*(rsdp_virt as *const RsdpV1) };
-
+    // SAFETY: parse_madt contract covers the fixed RSDP prefix.
+    let rsdp: RsdpV1 = unsafe { read_firmware(rsdp_virt) };
     if &rsdp.signature != b"RSD PTR " {
         return None;
     }
 
-    let (ptr_base, entry_size, entries): (u64, usize, usize) = if rsdp.revision >= 2 {
-        let ext = unsafe { &*((rsdp_virt + size_of::<RsdpV1>() as u64) as *const RsdpV2Ext) };
-        let xsdt_virt = phys_to_virt(ext.xsdt_addr);
-        let xsdt_hdr = unsafe { &*(xsdt_virt as *const SdtHeader) };
-        let n = (xsdt_hdr.length as usize - size_of::<SdtHeader>()) / 8;
-        (xsdt_virt + size_of::<SdtHeader>() as u64, 8, n)
+    let (ptr_base, entry_size, entries) = if rsdp.revision >= 2 {
+        // SAFETY: ACPI 2+ guarantees the extension after the v1 prefix.
+        let ext: RsdpV2Ext =
+            unsafe { read_firmware(rsdp_virt.checked_add(size_of::<RsdpV1>() as u64)?) };
+        if ext.length < (size_of::<RsdpV1>() + size_of::<RsdpV2Ext>()) as u32 {
+            return None;
+        }
+        let table = phys_to_virt(ext.xsdt_addr);
+        // SAFETY: root table header is covered by the ACPI mapping contract.
+        let header: SdtHeader = unsafe { read_firmware(table) };
+        if &header.signature != b"XSDT" {
+            return None;
+        }
+        let payload = (header.length as usize).checked_sub(size_of::<SdtHeader>())?;
+        (
+            table.checked_add(size_of::<SdtHeader>() as u64)?,
+            8usize,
+            payload / 8,
+        )
     } else {
-        let rsdt_virt = phys_to_virt(rsdp.rsdt_addr as u64);
-        let rsdt_hdr = unsafe { &*(rsdt_virt as *const SdtHeader) };
-        let n = (rsdt_hdr.length as usize - size_of::<SdtHeader>()) / 4;
-        (rsdt_virt + size_of::<SdtHeader>() as u64, 4, n)
+        let table = phys_to_virt(rsdp.rsdt_addr as u64);
+        // SAFETY: root table header is covered by the ACPI mapping contract.
+        let header: SdtHeader = unsafe { read_firmware(table) };
+        if &header.signature != b"RSDT" {
+            return None;
+        }
+        let payload = (header.length as usize).checked_sub(size_of::<SdtHeader>())?;
+        (
+            table.checked_add(size_of::<SdtHeader>() as u64)?,
+            4usize,
+            payload / 4,
+        )
     };
 
-    for i in 0..entries {
-        let addr = if entry_size == 8 {
-            let ptr = (ptr_base + (i * 8) as u64) as *const u64;
-            unsafe { *ptr }
-        } else {
-            let ptr = (ptr_base + (i * 4) as u64) as *const u32;
-            (unsafe { *ptr }) as u64
+    // A corrupt firmware length must not turn boot into an unbounded table
+    // walk even when the enclosing mapped region is large.
+    if entries > 4096 {
+        return None;
+    }
+
+    for index in 0..entries {
+        let entry_address = ptr_base.checked_add((index * entry_size) as u64)?;
+        // SAFETY: the root table length validated the complete entry array.
+        let physical = unsafe {
+            if entry_size == 8 {
+                read_firmware::<u64>(entry_address)
+            } else {
+                read_firmware::<u32>(entry_address) as u64
+            }
         };
-        let sdt_virt = phys_to_virt(addr);
-        let hdr = unsafe { &*(sdt_virt as *const SdtHeader) };
-        if &hdr.signature == b"APIC" {
-            return parse_madt_entries(sdt_virt, hdr.length);
+        let table = phys_to_virt(physical);
+        // SAFETY: each SDT address is firmware-owned mapped memory.
+        let header: SdtHeader = unsafe { read_firmware(table) };
+        if header.length < size_of::<SdtHeader>() as u32 {
+            continue;
+        }
+        if &header.signature == b"APIC" {
+            // SAFETY: header.length bounds the parser and the ACPI mapping
+            // contract covers the advertised table.
+            return unsafe { parse_madt_entries(table, header.length) };
         }
     }
     None
 }
 
 unsafe fn parse_madt_entries(madt_virt: u64, length: u32) -> Option<MadtInfo> {
+    const MADT_FIXED_BYTES: usize = size_of::<SdtHeader>() + 8;
+    if (length as usize) < MADT_FIXED_BYTES {
+        return None;
+    }
+    let table_end = madt_virt.checked_add(length as u64)?;
+    let lapic_address = madt_virt.checked_add(size_of::<SdtHeader>() as u64)?;
+
     let mut info = MadtInfo::empty();
+    // SAFETY: the fixed MADT body length was validated above.
+    info.local_apic_phys = unsafe { read_firmware::<u32>(lapic_address) };
 
-    // Local APIC address is at offset 36 in MADT (after standard 36-byte SDT header).
-    let lapic_addr_ptr = (madt_virt + size_of::<SdtHeader>() as u64) as *const u32;
-    info.local_apic_phys = unsafe { *lapic_addr_ptr };
-
-    let entries_start = madt_virt + size_of::<SdtHeader>() as u64 + 8;
-    let entries_end = madt_virt + length as u64;
-    let mut cursor = entries_start;
-
-    while cursor + 2 <= entries_end {
-        let entry_type = unsafe { *(cursor as *const u8) };
-        let entry_len = unsafe { *((cursor + 1) as *const u8) } as u64;
-        if entry_len == 0 {
-            break;
+    let mut cursor = madt_virt.checked_add(MADT_FIXED_BYTES as u64)?;
+    while cursor.checked_add(2)? <= table_end {
+        // SAFETY: the two-byte entry prefix is inside the validated table.
+        let entry_type = unsafe { read_firmware::<u8>(cursor) };
+        let entry_len = unsafe { read_firmware::<u8>(cursor + 1) } as u64;
+        if entry_len < 2 {
+            return None;
+        }
+        let next = cursor.checked_add(entry_len)?;
+        if next > table_end {
+            return None;
         }
 
         match entry_type {
-            0 => {
-                // Processor Local APIC
-                if cursor + 8 <= entries_end && info.cpu_count < 64 {
-                    let acpi_id = unsafe { *((cursor + 2) as *const u8) };
-                    let apic_id = unsafe { *((cursor + 3) as *const u8) };
-                    let flags = unsafe { *((cursor + 4) as *const u32) };
-                    if flags & 1 != 0 {
-                        // CPU enabled
-                        info.cpus[info.cpu_count] = Some(CpuInfo {
-                            acpi_id,
-                            apic_id,
-                            flags,
-                        });
-                        info.cpu_count += 1;
-                    }
+            0 if entry_len >= 8 && info.cpu_count < info.cpus.len() => {
+                // SAFETY: entry_len validates all Local APIC fields.
+                let acpi_id = unsafe { read_firmware::<u8>(cursor + 2) };
+                let apic_id = unsafe { read_firmware::<u8>(cursor + 3) };
+                let flags = unsafe { read_firmware::<u32>(cursor + 4) };
+                if flags & 1 != 0 {
+                    info.cpus[info.cpu_count] = Some(CpuInfo {
+                        acpi_id,
+                        apic_id,
+                        flags,
+                    });
+                    info.cpu_count += 1;
                 }
             }
-            1 => {
-                // I/O APIC
-                if cursor + 12 <= entries_end && info.io_apic_count < 8 {
-                    let id = unsafe { *((cursor + 2) as *const u8) };
-                    let address = unsafe { *((cursor + 4) as *const u32) };
-                    let gsi_base = unsafe { *((cursor + 8) as *const u32) };
-                    info.io_apics[info.io_apic_count] = Some(IoApicInfo {
-                        id,
-                        address,
-                        gsi_base,
-                    });
-                    info.io_apic_count += 1;
-                }
+            1 if entry_len >= 12 && info.io_apic_count < info.io_apics.len() => {
+                // SAFETY: entry_len validates all I/O APIC fields.
+                let id = unsafe { read_firmware::<u8>(cursor + 2) };
+                let address = unsafe { read_firmware::<u32>(cursor + 4) };
+                let gsi_base = unsafe { read_firmware::<u32>(cursor + 8) };
+                info.io_apics[info.io_apic_count] = Some(IoApicInfo {
+                    id,
+                    address,
+                    gsi_base,
+                });
+                info.io_apic_count += 1;
             }
             _ => {}
         }
-
-        cursor += entry_len;
+        cursor = next;
     }
-
     Some(info)
 }
