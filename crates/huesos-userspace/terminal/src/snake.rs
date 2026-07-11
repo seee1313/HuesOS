@@ -14,119 +14,54 @@ use libcanvas::{Channel, ErrorCode};
 const GRID_W: usize = 32;
 const GRID_H: usize = 18;
 const MAX_LEN: usize = GRID_W * GRID_H;
-const CELL: u32 = 16;
-const MARGIN_X: u32 = 40;
-const MARGIN_Y: u32 = 48;
+const HUD_HEIGHT: u32 = 58;
+const EDGE_PAD: u32 = 8;
 
-// --- FIXED snake FPS via Kernel Sleep Timeout & RDTSC --------------------
-// Target: ~10 steps/s classic Snake (100 ms/step), floor 60 ms.
-// 1 tick = 10 ms (100 Hz timer), so BASE_STEP_TICKS = 10 (100 ms).
+#[derive(Clone, Copy)]
+struct Layout {
+    cell: u32,
+    board_x: u32,
+    board_y: u32,
+    board_w: u32,
+    board_h: u32,
+}
+
+impl Layout {
+    fn fullscreen(canvas: &Canvas) -> Self {
+        let available_w = canvas.width().saturating_sub(EDGE_PAD * 2);
+        let available_h = canvas
+            .height()
+            .saturating_sub(HUD_HEIGHT + EDGE_PAD);
+        let cell = (available_w / GRID_W as u32)
+            .min(available_h / GRID_H as u32)
+            .max(1);
+        let board_w = cell * GRID_W as u32;
+        let board_h = cell * GRID_H as u32;
+        Self {
+            cell,
+            board_x: canvas.width().saturating_sub(board_w) / 2,
+            board_y: HUD_HEIGHT,
+            board_w,
+            board_h,
+        }
+    }
+}
+
+// Snake pace is expressed only in kernel monotonic 100 Hz ticks. Never use
+// RDTSC here: TSC frequency, virtualization and power management differ across
+// devices and made identical builds run at different speeds.
 const BASE_STEP_TICKS: u64 = 10;
 const MIN_STEP_TICKS: u64 = 6;
 
-// Hard-mode events.
+// Hard-mode event limits and lifetimes, all expressed in snake steps.
 const MAX_BOMBS: usize = 6;
 const MAX_BULLETS: usize = 16;
-/// ~3 seconds of rocket chase at ~10 steps/s.
 const ROCKET_LIFE_STEPS: u32 = 30;
-/// Bomb fuse in snake steps.
 const BOMB_FUSE_SMALL: u32 = 12;
 const BOMB_FUSE_LARGE: u32 = 16;
 const BOMB_R_SMALL: i16 = 1;
 const BOMB_R_LARGE: i16 = 2;
-/// AK: bullets advance every snake step.
 const AK_BURST: usize = 5;
-
-/// Monotonic cycle counter used for sub-tick pacing.
-///
-/// On x86_64 this is the raw RDTSC value. On any other target (planned:
-/// ARM once HuesOS grows a mobile HAL) we fall back to a monotonically
-/// increasing counter driven by the kernel's 100 Hz tick — precise enough
-/// to keep snake at ~10 steps/s but with much coarser sub-tick resolution.
-#[cfg(target_arch = "x86_64")]
-#[inline]
-fn rdtsc() -> u64 {
-    let lo: u32;
-    let hi: u32;
-    // SAFETY: rdtsc is unprivileged on long-mode x86_64 with default CR4.
-    unsafe {
-        core::arch::asm!(
-            "rdtsc",
-            out("eax") lo,
-            out("edx") hi,
-            options(nomem, nostack, preserves_flags)
-        );
-    }
-    ((hi as u64) << 32) | (lo as u64)
-}
-
-#[cfg(not(target_arch = "x86_64"))]
-#[inline]
-fn rdtsc() -> u64 {
-    // Portable stub: the caller uses this only to measure elapsed cycles
-    // against `cycles_per_tick`. On non-x86_64 we degrade gracefully to a
-    // static counter; combined with the fallback in calibrate_tsc this
-    // yields ~one snake step per calibration window, keeping the game
-    // playable until an arch-specific timer is wired in.
-    static COUNTER: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-    COUNTER.fetch_add(1, core::sync::atomic::Ordering::Relaxed)
-}
-
-/// Calibrate the TSC frequency against the kernel's scheduler ticks.
-/// Sleep for 10 ticks (100 ms) and measure the elapsed RDTSC cycles.
-/// This method retries if interrupted by a key press, ensuring a highly robust,
-/// sleep-free equivalent of precise calibration at terminal startup.
-///
-/// On non-x86_64 targets the stub `rdtsc()` returns a per-call counter, so
-/// calibrating cycles-per-tick is meaningless — we short-circuit to a fixed
-/// value (1 counter tick per snake step) that keeps the loop paced by the
-/// kernel-side `read_into_timeout` sleeps.
-#[cfg(not(target_arch = "x86_64"))]
-fn calibrate_tsc(_keyboard: &Channel) -> u64 {
-    1
-}
-
-#[cfg(target_arch = "x86_64")]
-fn calibrate_tsc(keyboard: &Channel) -> u64 {
-    let mut buf = [0u8; 16];
-
-    // Drain any pending input first
-    for _ in 0..100 {
-        match keyboard.read_into(&mut buf) {
-            Ok(n) if n > 0 => {}
-            _ => break,
-        }
-    }
-
-    // Try up to 5 times to get an uninterrupted 10-tick sleep
-    for _ in 0..5 {
-        let start = rdtsc();
-        match keyboard.read_into_timeout(&mut buf, 10) {
-            Err(ErrorCode::TimedOut) => {
-                let end = rdtsc();
-                let elapsed = end.wrapping_sub(start);
-                let mut cycles_per_tick = elapsed / 10;
-
-                // Safety clamps for 0.5 GHz to 10.0 GHz
-                if cycles_per_tick < 5_000_000 {
-                    cycles_per_tick = 30_000_000; // default to 3.0 GHz
-                } else if cycles_per_tick > 100_000_000 {
-                    cycles_per_tick = 40_000_000; // default to 4.0 GHz
-                }
-                return cycles_per_tick;
-            }
-            _ => {
-                // If interrupted by a key press, drain keys and try again
-                for _ in 0..10 {
-                    let _ = keyboard.read_into(&mut buf);
-                }
-            }
-        }
-    }
-
-    // Default fallback (assuming 4.0 GHz TSC rate)
-    40_000_000
-}
 
 fn step_delay_ticks(score: u32) -> u64 {
     // Mild speed-up: every 5 food, -1 tick/10 ms, never below MIN_STEP_TICKS.
@@ -136,70 +71,69 @@ fn step_delay_ticks(score: u32) -> u64 {
         .max(MIN_STEP_TICKS)
 }
 
-/// Wait one snake-step, sleeping the thread in 1-tick (10ms) increments
-/// while verifying exact elapsed wall-clock time using RDTSC.
-/// Drains keyboard events on every loop iteration to guarantee zero input latency.
+/// Wait one snake step against the kernel monotonic clock. Keyboard events
+/// may wake the channel early, but they never advance the game clock.
 fn wait_step(
     score: u32,
     keyboard: &Channel,
     dir: Dir,
     pending: &mut Dir,
     phase: Phase,
-    cycles_per_tick: u64,
 ) -> Option<Action> {
     let step_ticks = step_delay_ticks(score);
-    let step_cycles = step_ticks * cycles_per_tick;
-    let start_cycles = rdtsc();
+    let start = libcanvas::system::monotonic_ticks().unwrap_or(0);
+    let deadline = start.saturating_add(step_ticks);
+    let mut fallback_elapsed = 0u64;
     let mut buf = [0u8; 16];
 
     loop {
-        let now_cycles = rdtsc();
-        let elapsed_cycles = now_cycles.wrapping_sub(start_cycles);
-        if elapsed_cycles >= step_cycles {
-            return None;
-        }
-
-        // Non-blocking keyboard drain (instantly process user turns)
         loop {
             match keyboard.read_into(&mut buf) {
                 Ok(n) if n > 0 => {
-                    if let Some(action) = decode(&buf[..n]) {
-                        match phase {
-                            Phase::Playing => match action {
-                                Action::Dir(d) => {
-                                    // Reject a turn that would reverse either the
-                                    // committed direction OR an already-queued one.
-                                    // Without the second check, pressing Up then
-                                    // Down within a single step while moving Right
-                                    // would accept Down (not opposite to Right) and
-                                    // the snake would eat its own neck next tick.
-                                    if !is_opposite(dir, d) && !is_opposite(*pending, d) {
-                                        *pending = d;
-                                    }
-                                }
-                                Action::Esc => return Some(Action::Esc),
-                                Action::Enter => {}
-                            },
-                            Phase::GameOver => match action {
-                                Action::Enter | Action::Esc => return Some(action),
-                                Action::Dir(_) => {}
-                            },
-                        }
+                    if let Some(result) = apply_input(&buf[..n], dir, pending, phase) {
+                        return Some(result);
                     }
                 }
                 _ => break,
             }
         }
 
-        // Double check elapsed time after handling keys
-        let now_cycles = rdtsc();
-        let elapsed_cycles = now_cycles.wrapping_sub(start_cycles);
-        if elapsed_cycles >= step_cycles {
-            return None;
+        match libcanvas::system::monotonic_ticks() {
+            Ok(now) if now >= deadline => return None,
+            Ok(_) => {}
+            Err(_) if fallback_elapsed >= step_ticks => return None,
+            Err(_) => {}
         }
 
-        // Sleep for a tiny interval (1 tick = 10 ms) to keep CPU at 0% idle consumption
-        let _ = keyboard.read_into_timeout(&mut buf, 1);
+        match keyboard.read_into_timeout(&mut buf, 1) {
+            Ok(n) if n > 0 => {
+                if let Some(result) = apply_input(&buf[..n], dir, pending, phase) {
+                    return Some(result);
+                }
+            }
+            Err(ErrorCode::TimedOut) => fallback_elapsed = fallback_elapsed.saturating_add(1),
+            _ => {}
+        }
+    }
+}
+
+fn apply_input(msg: &[u8], dir: Dir, pending: &mut Dir, phase: Phase) -> Option<Action> {
+    let action = decode(msg)?;
+    match phase {
+        Phase::Playing => match action {
+            Action::Dir(next) => {
+                if !is_opposite(dir, next) && !is_opposite(*pending, next) {
+                    *pending = next;
+                }
+                None
+            }
+            Action::Esc => Some(Action::Esc),
+            Action::Enter => None,
+        },
+        Phase::GameOver => match action {
+            Action::Enter | Action::Esc => Some(action),
+            Action::Dir(_) => None,
+        },
     }
 }
 
@@ -274,7 +208,7 @@ pub fn run(keyboard: &Channel, hard: bool) {
         return;
     };
 
-    let cycles_per_tick = calibrate_tsc(keyboard);
+    let layout = Layout::fullscreen(&canvas);
 
     let mut body = [Point { x: 0, y: 0 }; MAX_LEN];
     let mut len = 0usize;
@@ -326,13 +260,13 @@ pub fn run(keyboard: &Channel, hard: bool) {
         &mut pending_event,
     );
     draw(
-        &canvas, hard, &body, len, food, gold_food, phase, score, &bombs, &bullets, &rocket, banner,
+        &canvas, &layout, hard, &body, len, food, gold_food, phase, score, &bombs, &bullets,
+        &rocket, banner,
     );
 
     loop {
         // Wait one paced step, polling keys the whole time via blocking timeouts.
-        if let Some(action) = wait_step(score, keyboard, dir, &mut pending, phase, cycles_per_tick)
-        {
+        if let Some(action) = wait_step(score, keyboard, dir, &mut pending, phase) {
             match phase {
                 Phase::Playing => {
                     // Only Esc is returned from wait_step in Playing.
@@ -360,8 +294,8 @@ pub fn run(keyboard: &Channel, hard: bool) {
                             &mut pending_event,
                         );
                         draw(
-                            &canvas, hard, &body, len, food, gold_food, phase, score, &bombs,
-                            &bullets, &rocket, banner,
+                            &canvas, &layout, hard, &body, len, food, gold_food, phase, score,
+                            &bombs, &bullets, &rocket, banner,
                         );
                         continue;
                     }
@@ -435,8 +369,8 @@ pub fn run(keyboard: &Channel, hard: bool) {
         }
 
         draw(
-            &canvas, hard, &body, len, food, gold_food, phase, score, &bombs, &bullets, &rocket,
-            banner,
+            &canvas, &layout, hard, &body, len, food, gold_food, phase, score, &bombs, &bullets,
+            &rocket, banner,
         );
     }
 }
@@ -1024,6 +958,7 @@ fn decode(msg: &[u8]) -> Option<Action> {
 
 fn draw(
     canvas: &Canvas,
+    layout: &Layout,
     hard: bool,
     body: &[Point; MAX_LEN],
     len: usize,
@@ -1036,24 +971,27 @@ fn draw(
     rocket: &Rocket,
     banner: EventBanner,
 ) {
-    let _ = canvas.fill_rect(0, 0, canvas.width(), canvas.height(), 8, 12, 20);
+    // Layered full-screen background and HUD panel.
+    let _ = canvas.fill_rect(0, 0, canvas.width(), canvas.height(), 4, 8, 16);
+    let _ = canvas.fill_rect(0, 0, canvas.width(), HUD_HEIGHT, 10, 24, 40);
+    let _ = canvas.fill_rect(0, HUD_HEIGHT - 2, canvas.width(), 2, 40, 150, 180);
 
     let title = if hard {
         "HuesOS Snake  [HARD]"
     } else {
         "HuesOS Snake"
     };
-    let _ = canvas.draw_text(MARGIN_X, 12, title, 200, 230, 255);
+    let _ = canvas.draw_text(layout.board_x, 12, title, 200, 230, 255);
     let mut score_buf = [0u8; 24];
     let score_txt = format_labeled_u32(&mut score_buf, "Score: ", score);
-    let _ = canvas.draw_text(MARGIN_X + 220, 12, score_txt, 180, 220, 160);
+    let _ = canvas.draw_text(layout.board_x + 220, 12, score_txt, 180, 220, 160);
 
     let help = if hard {
         "WASD move | Esc quit | every 2 apples: random hazard"
     } else {
         "WASD/HJKL move | Esc quit | try: snake hard"
     };
-    let _ = canvas.draw_text(MARGIN_X, 28, help, 140, 160, 180);
+    let _ = canvas.draw_text(layout.board_x, 28, help, 140, 160, 180);
 
     // Event banner
     let banner_txt = match banner {
@@ -1063,28 +1001,62 @@ fn draw(
         EventBanner::Rocket => "!! HOMING ROCKET !!",
     };
     if !banner_txt.is_empty() {
-        let _ = canvas.draw_text(MARGIN_X + 320, 12, banner_txt, 255, 180, 80);
+        let _ = canvas.draw_text(layout.board_x + 320, 12, banner_txt, 255, 180, 80);
     }
 
     // Golden apple active text
     if let Some(gf) = gold_food {
         let mut gold_buf = [0u8; 24];
         let gold_txt = format_labeled_u32(&mut gold_buf, "Gold Apple: ", gf.ttl);
-        let _ = canvas.draw_text(MARGIN_X + 340, 28, gold_txt, 255, 215, 0);
+        let _ = canvas.draw_text(layout.board_x + 340, 28, gold_txt, 255, 215, 0);
     }
 
-    let board_w = GRID_W as u32 * CELL;
-    let board_h = GRID_H as u32 * CELL;
+    let board_w = layout.board_w;
+    let board_h = layout.board_h;
     let _ = canvas.fill_rect(
-        MARGIN_X.saturating_sub(2),
-        MARGIN_Y.saturating_sub(2),
+        layout.board_x.saturating_sub(4),
+        layout.board_y.saturating_sub(4),
+        board_w + 8,
+        board_h + 8,
+        55,
+        190,
+        205,
+    );
+    let _ = canvas.fill_rect(
+        layout.board_x.saturating_sub(2),
+        layout.board_y.saturating_sub(2),
         board_w + 4,
         board_h + 4,
-        30,
-        40,
-        55,
+        8,
+        20,
+        32,
     );
-    let _ = canvas.fill_rect(MARGIN_X, MARGIN_Y, board_w, board_h, 12, 18, 28);
+    let _ = canvas.fill_rect(layout.board_x, layout.board_y, board_w, board_h, 7, 14, 24);
+
+    // Sparse grid guides retain a clean look while making the enlarged board
+    // readable on high-resolution displays.
+    for x in (4..GRID_W).step_by(4) {
+        let _ = canvas.fill_rect(
+            layout.board_x + x as u32 * layout.cell,
+            layout.board_y,
+            1,
+            board_h,
+            12,
+            27,
+            39,
+        );
+    }
+    for y in (3..GRID_H).step_by(3) {
+        let _ = canvas.fill_rect(
+            layout.board_x,
+            layout.board_y + y as u32 * layout.cell,
+            board_w,
+            1,
+            12,
+            27,
+            39,
+        );
+    }
 
     // Faint red highlight for bomb blast radius when fuse is low
     for b in bombs.iter() {
@@ -1102,9 +1074,11 @@ fn draw(
                     let ry = b.pos.y as i16 + dy;
                     if rx >= 0 && rx < GRID_W as i16 && ry >= 0 && ry < GRID_H as i16 {
                         if rx as u8 != b.pos.x || ry as u8 != b.pos.y {
-                            let px = MARGIN_X + rx as u32 * CELL + 4;
-                            let py = MARGIN_Y + ry as u32 * CELL + 4;
-                            let _ = canvas.fill_rect(px, py, CELL - 8, CELL - 8, 120, 30, 30);
+                            let inset = (layout.cell / 4).max(1);
+                            let px = layout.board_x + rx as u32 * layout.cell + inset;
+                            let py = layout.board_y + ry as u32 * layout.cell + inset;
+                            let size = layout.cell.saturating_sub(inset * 2).max(1);
+                            let _ = canvas.fill_rect(px, py, size, size, 120, 30, 30);
                         }
                     }
                 }
@@ -1113,15 +1087,15 @@ fn draw(
     }
 
     // Normal Food
-    fill_cell(canvas, food.x, food.y, 220, 80, 80);
+    fill_cell(canvas, layout, food.x, food.y, 220, 80, 80);
 
     // Gold Food
     if let Some(gf) = gold_food {
         let flash = gf.ttl <= 10 && (gf.ttl % 2 == 0);
         if flash {
-            fill_cell(canvas, gf.pos.x, gf.pos.y, 100, 80, 0);
+            fill_cell(canvas, layout, gf.pos.x, gf.pos.y, 100, 80, 0);
         } else {
-            fill_cell(canvas, gf.pos.x, gf.pos.y, 255, 215, 0);
+            fill_cell(canvas, layout, gf.pos.x, gf.pos.y, 255, 215, 0);
         }
     }
 
@@ -1134,16 +1108,16 @@ fn draw(
         match b.kind {
             BombKind::Small => {
                 if flash {
-                    fill_cell(canvas, b.pos.x, b.pos.y, 255, 200, 40);
+                    fill_cell(canvas, layout, b.pos.x, b.pos.y, 255, 200, 40);
                 } else {
-                    fill_cell(canvas, b.pos.x, b.pos.y, 60, 60, 70);
+                    fill_cell(canvas, layout, b.pos.x, b.pos.y, 60, 60, 70);
                 }
             }
             BombKind::Large => {
                 if flash {
-                    fill_cell(canvas, b.pos.x, b.pos.y, 255, 80, 40);
+                    fill_cell(canvas, layout, b.pos.x, b.pos.y, 255, 80, 40);
                 } else {
-                    fill_cell(canvas, b.pos.x, b.pos.y, 40, 40, 50);
+                    fill_cell(canvas, layout, b.pos.x, b.pos.y, 40, 40, 50);
                 }
             }
         }
@@ -1152,45 +1126,46 @@ fn draw(
     // Bullets (bright yellow/orange streaks)
     for b in bullets.iter() {
         if b.alive {
-            fill_cell(canvas, b.pos.x, b.pos.y, 255, 220, 60);
+            fill_cell(canvas, layout, b.pos.x, b.pos.y, 255, 220, 60);
         }
     }
 
     // Rocket (magenta diamond-ish block)
     if rocket.alive {
-        fill_cell(canvas, rocket.pos.x, rocket.pos.y, 220, 60, 220);
+        fill_cell(canvas, layout, rocket.pos.x, rocket.pos.y, 220, 60, 220);
     }
 
     // Snake with an elegant gradient from bright mint green to deep forest blue-green
     for i in 0..len {
         if i == 0 {
-            fill_cell(canvas, body[i].x, body[i].y, 50, 240, 140);
+            fill_cell(canvas, layout, body[i].x, body[i].y, 50, 240, 140);
         } else {
             let r = 50 - (30 * i / len) as u8;
             let g = 200 - (100 * i / len) as u8;
             let b = 150 - (90 * i / len) as u8;
-            fill_cell(canvas, body[i].x, body[i].y, r, g, b);
+            fill_cell(canvas, layout, body[i].x, body[i].y, r, g, b);
         }
     }
 
     if phase == Phase::GameOver {
-        let _ = canvas.fill_rect(MARGIN_X, MARGIN_Y + board_h / 2 - 28, board_w, 56, 0, 0, 0);
+        let overlay_y = layout.board_y + board_h.saturating_sub(72) / 2;
+        let _ = canvas.fill_rect(layout.board_x, overlay_y, board_w, 72, 18, 4, 10);
         let lose = if hard {
             "You lost at snake! (HARD)"
         } else {
             "You lost at snake!"
         };
         let _ = canvas.draw_text(
-            MARGIN_X + 24,
-            MARGIN_Y + board_h / 2 - 20,
+            layout.board_x + 24,
+            layout.board_y + board_h / 2 - 20,
             lose,
             255,
             120,
             120,
         );
         let _ = canvas.draw_text(
-            MARGIN_X + 24,
-            MARGIN_Y + board_h / 2,
+            layout.board_x + 24,
+            layout.board_y + board_h / 2,
             "Enter = play again    Esc = shell",
             220,
             220,
@@ -1201,10 +1176,27 @@ fn draw(
     let _ = canvas.present();
 }
 
-fn fill_cell(canvas: &Canvas, x: u8, y: u8, r: u8, g: u8, b: u8) {
-    let px = MARGIN_X + x as u32 * CELL + 1;
-    let py = MARGIN_Y + y as u32 * CELL + 1;
-    let _ = canvas.fill_rect(px, py, CELL - 2, CELL - 2, r, g, b);
+fn fill_cell(canvas: &Canvas, layout: &Layout, x: u8, y: u8, r: u8, g: u8, b: u8) {
+    let inset = (layout.cell / 10).max(1);
+    let px = layout.board_x + x as u32 * layout.cell + inset;
+    let py = layout.board_y + y as u32 * layout.cell + inset;
+    let size = layout.cell.saturating_sub(inset * 2).max(1);
+    let _ = canvas.fill_rect(px, py, size, size, r, g, b);
+
+    // Small highlight gives food, hazards and body segments depth at any
+    // resolution without changing collision geometry.
+    if size >= 8 {
+        let highlight = (size / 5).max(2);
+        let _ = canvas.fill_rect(
+            px + inset,
+            py + inset,
+            highlight,
+            highlight,
+            r.saturating_add(28),
+            g.saturating_add(28),
+            b.saturating_add(28),
+        );
+    }
 }
 
 /// Write `"<label><value>"` into `buf` and return the UTF-8 slice.

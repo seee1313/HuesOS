@@ -39,7 +39,9 @@ pub extern "C" fn _start() -> ! {
 
     run_vmo_check(&mut logger);
     run_channel_check(&mut logger);
+    run_monotonic_clock_check(&mut logger);
     run_fault_isolation_check(&mut logger);
+    run_shutdown_authorization_check(&mut logger);
 
     let driver_manager = launch_service(&mut logger, "driver-manager", DRIVER_MANAGER_ELF);
 
@@ -66,8 +68,29 @@ pub extern "C" fn _start() -> ! {
         logger,
         "[init] service launch complete; parking as init supervisor"
     );
+    let mut supervisor_message = [0u8; 64];
     loop {
-        let _keep_services_alive = (&driver_manager, &terminal);
+        let _keep_services_alive = &driver_manager;
+        if let Some((_, channel)) = &terminal {
+            match channel.read_into(&mut supervisor_message) {
+                Ok(n) if &supervisor_message[..n] == b"system:shutdown" => {
+                    init_logln!(logger, "[init] terminal requested orderly shutdown");
+                    if let Err(error) = libcanvas::system::shutdown() {
+                        init_logln!(
+                            logger,
+                            "[init] shutdown request rejected: {}",
+                            error.as_str()
+                        );
+                    }
+                }
+                Ok(_) | Err(ErrorCode::ShouldWait) | Err(ErrorCode::TimedOut) => {}
+                Err(error) => init_logln!(
+                    logger,
+                    "[init] terminal supervisor channel error: {}",
+                    error.as_str()
+                ),
+            }
+        }
         libcanvas::process::yield_now();
     }
 }
@@ -178,6 +201,68 @@ fn read_ready_message(logger: &mut InitLogger, name: &str, channel: &Channel) {
         }
     }
     init_logln!(logger, "[init] {} did not send ready message yet", name);
+}
+
+fn run_monotonic_clock_check(logger: &mut InitLogger) {
+    let result = (|| -> libcanvas::Result<u64> {
+        let (_tx, rx) = Channel::pair()?;
+        let start = libcanvas::system::monotonic_ticks()?;
+        let mut byte = [0u8; 1];
+        match rx.read_into_timeout(&mut byte, 10) {
+            Err(ErrorCode::TimedOut) => {}
+            Ok(_) => return Err(ErrorCode::Busy),
+            Err(error) => return Err(error),
+        }
+        Ok(libcanvas::system::monotonic_ticks()?.saturating_sub(start))
+    })();
+
+    match result {
+        Ok(elapsed) if (9..=12).contains(&elapsed) => init_logln!(
+            logger,
+            "[init] monotonic clock OK (10-tick wait measured {} ticks)",
+            elapsed
+        ),
+        Ok(elapsed) => init_logln!(
+            logger,
+            "[init] monotonic clock FAILED (measured {} ticks)",
+            elapsed
+        ),
+        Err(error) => init_logln!(
+            logger,
+            "[init] monotonic clock FAILED ({})",
+            error.as_str()
+        ),
+    }
+}
+
+fn run_shutdown_authorization_check(logger: &mut InitLogger) {
+    let Ok((process, bootstrap)) =
+        libcanvas::process::spawn_elf("shutdown-probe", FAULT_PROBE_ELF)
+    else {
+        init_logln!(logger, "[init] shutdown authorization FAILED (launch)");
+        return;
+    };
+    if bootstrap.write(b"shutdown").is_err() {
+        init_logln!(logger, "[init] shutdown authorization FAILED (command)");
+        return;
+    }
+    drop(bootstrap);
+    match process.wait_exit() {
+        Ok(0) => init_logln!(
+            logger,
+            "[init] shutdown authorization OK (unprivileged caller denied)"
+        ),
+        Ok(code) => init_logln!(
+            logger,
+            "[init] shutdown authorization FAILED (exit code {})",
+            code
+        ),
+        Err(error) => init_logln!(
+            logger,
+            "[init] shutdown authorization FAILED ({})",
+            error.as_str()
+        ),
+    }
 }
 
 fn run_fault_isolation_check(logger: &mut InitLogger) {

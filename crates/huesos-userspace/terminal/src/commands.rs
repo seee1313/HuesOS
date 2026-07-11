@@ -32,6 +32,7 @@ fn execute_command(command: CommandAst, screen: &mut Screen, filesystem: Option<
             screen.write_line("  ls [path]   list BOOTFS files");
             screen.write_line("  cat <path>  print BOOTFS file");
             screen.write_line("  stat <path> show BOOTFS file metadata");
+            screen.write_line("  shutdown    safely halt HuesOS (no ACPI)");
         }
         "clear" | "cls" => screen.clear(),
         "echo" => {
@@ -58,6 +59,7 @@ fn execute_command(command: CommandAst, screen: &mut Screen, filesystem: Option<
             // Handled in Shell::handle_key (`snake` / `snake hard`).
             screen.write_line("snake: use 'snake' or 'snake hard' from the prompt");
         }
+        "shutdown" => screen.write_line("shutdown: request is handled by the shell supervisor path"),
         "exit" => screen.write_line("exit: init-supervised shell cannot exit yet"),
         _ => {
             screen.write_str("unknown command: ");

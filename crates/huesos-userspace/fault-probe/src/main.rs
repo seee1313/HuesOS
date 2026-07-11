@@ -20,6 +20,10 @@ pub extern "C" fn _start() -> ! {
         b"opcode" => trigger_invalid_opcode(),
         b"gpf" => trigger_general_protection(),
         b"divide" => trigger_divide_error(),
+        b"shutdown" => match libcanvas::system::shutdown() {
+            Err(libcanvas::ErrorCode::AccessDenied) => libcanvas::process::exit(0),
+            _ => libcanvas::process::exit(95),
+        },
         _ => libcanvas::process::exit(97),
     }
 }
