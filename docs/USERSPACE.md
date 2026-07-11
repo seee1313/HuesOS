@@ -109,6 +109,11 @@ a Channel message carries at most 64 KiB and 64 handles; debug writes carry at
 most 4 KiB. Split larger application transfers into multiple calls. See
 [USER_MEMORY.md](USER_MEMORY.md) for the kernel-side contract.
 
+An unhandled CPU exception in an application (for example dereferencing an
+unmapped pointer or executing an invalid opcode) terminates the complete
+process, not the kernel. A supervisor receives a stable negative status from
+`Process::wait_exit`; see [FAULTS_AND_PANIC.md](FAULTS_AND_PANIC.md).
+
 ### Memory (VMOs)
 
 ```rust
