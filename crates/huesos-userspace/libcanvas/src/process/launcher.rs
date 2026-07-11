@@ -14,20 +14,36 @@ use super::{Process, Thread, Vmar};
 /// a bootstrap channel installed as handle 1 in the child.
 pub fn spawn_elf(name: &str, elf: &[u8]) -> crate::Result<(Process, Channel)> {
     let image = elf::parse_elf(elf).ok_or(crate::ErrorCode::InvalidArgs)?;
+    if name == "doom" {
+        crate::println!("[doom-launch] ELF parsed, creating process");
+    }
     let (process, root_vmar) = Process::create(name)?;
 
     let mut i = 0;
     while i < image.phnum {
         let ph = elf::read_program_header(elf, image, i).ok_or(crate::ErrorCode::InvalidArgs)?;
         if ph.ty == PT_LOAD {
+            if name == "doom" {
+                crate::println!("[doom-launch] mapping PT_LOAD {}", i);
+            }
             map_load_segment(&root_vmar, elf, ph)?;
+            if name == "doom" {
+                crate::println!("[doom-launch] mapped PT_LOAD {}", i);
+            }
         }
         i += 1;
     }
 
+    if name == "doom" {
+        crate::println!("[doom-launch] mapping stack and starting thread");
+    }
     map_initial_stack(&root_vmar)?;
     let thread = Thread::create(&process, "main")?;
-    let bootstrap = thread.start(image.entry, huesos_abi::USER_STACK_TOP - 32)?;
+    // iretq enters directly, so synthesize SysV's post-call alignment.
+    let bootstrap = thread.start(image.entry, huesos_abi::USER_STACK_TOP - 40)?;
+    if name == "doom" {
+        crate::println!("[doom-launch] thread started");
+    }
     Ok((process, bootstrap))
 }
 
@@ -53,7 +69,7 @@ pub fn spawn_elf_from_vmo(name: &str, vmo: &Vmo, offset: u64, _len: u64) -> crat
 
     map_initial_stack(&root_vmar)?;
     let thread = Thread::create(&process, "main")?;
-    let bootstrap = thread.start(image.entry, huesos_abi::USER_STACK_TOP - 32)?;
+    let bootstrap = thread.start(image.entry, huesos_abi::USER_STACK_TOP - 40)?;
     Ok((process, bootstrap))
 }
 
@@ -87,9 +103,19 @@ fn map_load_segment(root_vmar: &Vmar, elf: &[u8], ph: ProgramHeader) -> crate::R
         let file_start = ph.offset as usize;
         let file_end = file_end as usize;
         let vmo_file_offset = ph.vaddr - page_start;
-        let written = vmo.write(vmo_file_offset, &elf[file_start..file_end])?;
-        if written != ph.filesz as usize {
-            return Err(crate::ErrorCode::InvalidArgs);
+        // The kernel intentionally caps one VMO transfer at 1 MiB. Large
+        // static assets (for example Freedoom's IWAD in the Doom ELF) must be
+        // copied in bounded chunks rather than weakening that syscall limit.
+        const CHUNK: usize = 1024 * 1024;
+        let mut copied = 0usize;
+        let source = &elf[file_start..file_end];
+        while copied < source.len() {
+            let end = (copied + CHUNK).min(source.len());
+            let written = vmo.write(vmo_file_offset + copied as u64, &source[copied..end])?;
+            if written != end - copied {
+                return Err(crate::ErrorCode::InvalidArgs);
+            }
+            copied = end;
         }
     }
 

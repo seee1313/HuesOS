@@ -46,8 +46,8 @@ impl Shell {
         let mut screen = Screen::new();
         screen.clear();
         screen.write_line("HuesOS Terminal");
-        screen.write_line("userspace mini shell — try 'snake' or 'snake hard'");
-        screen.write_line("keyboard: DriverManager keyboard service");
+        screen.write_line("Type 'help' to list available commands.");
+        screen.write_line("TTY 8x16 font active; use 'font compact' for the original font.");
         screen.write_line("");
 
         let mut shell = Self {
@@ -112,7 +112,9 @@ impl Shell {
                 self.screen.newline();
                 let line = core::str::from_utf8(&self.input[..self.input_len]).unwrap_or("");
                 let trimmed = line.trim();
-                if trimmed == "snake" || trimmed == "snake hard" {
+                if trimmed == "doom" {
+                    self.run_doom();
+                } else if trimmed == "snake" || trimmed == "snake hard" {
                     let hard = trimmed.ends_with("hard");
                     snake::run(&self.keyboard, hard);
                     self.redraw_after_game(hard);
@@ -126,6 +128,44 @@ impl Shell {
             }
         }
         self.screen.render();
+    }
+
+    fn run_doom(&mut self) {
+        self.screen.clear();
+        self.screen.write_line("Launching DOOM (Freedoom Phase 1)...");
+        self.screen.write_line("Controls: arrows/WASD, Ctrl fire, Space use, Esc menu");
+        self.screen.render();
+
+        let result = (|| -> libcanvas::Result<()> {
+            let keyboard = self.keyboard.duplicate()?;
+            self.supervisor
+                .write_handle(b"system:launch-doom", keyboard.into_handle())?;
+            let mut response = [0u8; 64];
+            let n = self.supervisor.read_into_blocking(&mut response)?;
+            if response[..n].starts_with(b"doom:started") {
+                // Doom owns the duplicated keyboard endpoint and framebuffer.
+                // Stay quiescent so the shell cannot consume its input or
+                // overwrite its frames. Process supervision/return-to-shell is
+                // the next lifecycle step for this first port.
+                loop {
+                    libcanvas::process::yield_now();
+                }
+            }
+            Err(libcanvas::ErrorCode::InvalidArgs)
+        })();
+
+        self.screen.clear();
+        self.screen.write_line("HuesOS Terminal");
+        match result {
+            Ok(()) => self.screen.write_line("DOOM exited."),
+            Err(error) => {
+                self.screen.write_str("DOOM launch failed: ");
+                self.screen.write_line(error.as_str());
+            }
+        }
+        self.screen.write_line("Type 'help' to list available commands.");
+        self.screen.write_line("");
+        self.prompt();
     }
 
     fn request_shutdown(&mut self) {
@@ -145,12 +185,11 @@ impl Shell {
         self.screen.clear();
         self.screen.write_line("HuesOS Terminal");
         if hard {
-            self.screen
-                .write_line("back from snake HARD — try 'snake' or 'snake hard'");
+            self.screen.write_line("Returned from Snake hard mode.");
         } else {
-            self.screen
-                .write_line("back from snake — try 'snake' or 'snake hard'");
+            self.screen.write_line("Returned from Snake.");
         }
+        self.screen.write_line("Type 'help' to list available commands.");
         self.screen.write_line("");
         self.prompt();
         self.screen.render();

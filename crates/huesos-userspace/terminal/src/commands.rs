@@ -26,6 +26,7 @@ fn execute_command(command: CommandAst, screen: &mut Screen, filesystem: Option<
             screen.write_line("  drivers     show driver migration state");
             screen.write_line("  pwd         show current pseudo-directory");
             screen.write_line("  whoami      show current user identity");
+            screen.write_line("  doom        launch DOOM with Freedoom Phase 1");
             screen.write_line("  snake       classic TUI snake");
             screen.write_line("  snake hard  snake + bombs / AK / rocket every 2 apples");
             screen.write_line("  ast ...     parse and print command AST summary");
@@ -33,6 +34,8 @@ fn execute_command(command: CommandAst, screen: &mut Screen, filesystem: Option<
             screen.write_line("  cat <path>  print BOOTFS file");
             screen.write_line("  stat <path> show BOOTFS file metadata");
             screen.write_line("  shutdown    safely halt HuesOS (no ACPI)");
+            screen.write_line("  font tty    use default TTY-style 8x16 font");
+            screen.write_line("  font compact use original HuesOS 8x8 font");
         }
         "clear" | "cls" => screen.clear(),
         "echo" => {
@@ -55,11 +58,31 @@ fn execute_command(command: CommandAst, screen: &mut Screen, filesystem: Option<
         "pwd" => screen.write_line("/"),
         "whoami" => screen.write_line("huesos"),
         "ast" => print_ast(command, screen),
+        "doom" => screen.write_line("doom: launch is handled by the shell runtime"),
         "snake" => {
             // Handled in Shell::handle_key (`snake` / `snake hard`).
             screen.write_line("snake: use 'snake' or 'snake hard' from the prompt");
         }
         "shutdown" => screen.write_line("shutdown: request is handled by the shell supervisor path"),
+        "font" => {
+            if command.argc == 0 {
+                let name = screen.font_name();
+                screen.write_str("active font: ");
+                screen.write_line(name);
+            } else {
+                match command.args[0] {
+                    "tty" => {
+                        screen.use_tty_font();
+                        screen.write_line("font: TTY-style 8x16");
+                    }
+                    "compact" => {
+                        screen.use_compact_font();
+                        screen.write_line("font: original HuesOS 8x8");
+                    }
+                    _ => screen.write_line("usage: font tty|compact"),
+                }
+            }
+        }
         "exit" => screen.write_line("exit: init-supervised shell cannot exit yet"),
         _ => {
             screen.write_str("unknown command: ");

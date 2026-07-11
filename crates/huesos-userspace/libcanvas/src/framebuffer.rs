@@ -23,6 +23,16 @@ pub fn info() -> crate::Result<FramebufferInfo> {
     Ok(info)
 }
 
+/// Built-in text font selection.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TextFont {
+    /// TTY-style 8x16 font (default). Each source bitmap row is expanded to
+    /// two scanlines, giving classic VGA console proportions.
+    Tty8x16,
+    /// Original compact 8x8 HuesOS font.
+    Compact8x8,
+}
+
 /// An off-screen drawing surface, backed by a VMO, matching the real
 /// framebuffer's pixel format. Draw into it with `set_pixel`/`fill_rect`/
 /// `draw_text`, then call [`Canvas::present`] to blit it to the screen.
@@ -129,34 +139,70 @@ impl Canvas {
     /// entirely within the VMO the caller already owns (no new syscall
     /// needed) — see `crate::font8x8`.
     pub fn draw_text(&self, x: u32, y: u32, text: &str, r: u8, g: u8, b: u8) -> crate::Result<()> {
+        self.draw_text_with_font(x, y, text, r, g, b, TextFont::Tty8x16)
+    }
+
+    /// Draw text with an explicit built-in font. The original HuesOS font is
+    /// retained as [`TextFont::Compact8x8`].
+    pub fn draw_text_with_font(
+        &self,
+        x: u32,
+        y: u32,
+        text: &str,
+        r: u8,
+        g: u8,
+        b: u8,
+        font: TextFont,
+    ) -> crate::Result<()> {
         let mut cx = x;
         for ch in text.chars() {
             if ch == '\n' {
                 continue;
             }
-            self.draw_glyph(cx, y, ch, r, g, b)?;
+            self.draw_glyph(cx, y, ch, r, g, b, font)?;
             cx += 8;
         }
         Ok(())
     }
 
-    fn draw_glyph(&self, x: u32, y: u32, ch: char, r: u8, g: u8, b: u8) -> crate::Result<()> {
+    fn draw_glyph(
+        &self,
+        x: u32,
+        y: u32,
+        ch: char,
+        r: u8,
+        g: u8,
+        b: u8,
+        font: TextFont,
+    ) -> crate::Result<()> {
         let bitmap = crate::font8x8::glyph(ch).unwrap_or(&[0xFF; 8]);
+        let vertical_scale = match font {
+            TextFont::Tty8x16 => 2,
+            TextFont::Compact8x8 => 1,
+        };
         for (row, bits) in bitmap.iter().enumerate() {
-            let py = y + row as u32;
-            if py >= self.info.height {
-                break;
-            }
-            for col in 0..8u32 {
-                if bits & (1 << col) != 0 {
-                    let px = x + col;
-                    if px < self.info.width {
-                        self.set_pixel(px, py, r, g, b)?;
+            for scaled_row in 0..vertical_scale {
+                let py = y + row as u32 * vertical_scale + scaled_row;
+                if py >= self.info.height {
+                    break;
+                }
+                for col in 0..8u32 {
+                    if bits & (1 << col) != 0 {
+                        let px = x + col;
+                        if px < self.info.width {
+                            self.set_pixel(px, py, r, g, b)?;
+                        }
                     }
                 }
             }
         }
         Ok(())
+    }
+
+    /// Replace bytes in the canvas backing VMO. Intended for software
+    /// renderers such as Doom that already produce packed framebuffer pixels.
+    pub fn write_bytes(&self, offset: u64, bytes: &[u8]) -> crate::Result<usize> {
+        self.vmo.write(offset, bytes)
     }
 
     /// Blit this entire canvas onto the real framebuffer at `(0, 0)`.

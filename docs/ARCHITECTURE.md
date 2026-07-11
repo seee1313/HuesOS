@@ -185,6 +185,14 @@ LAPIC interrupt. Cooperative scheduling operations never update it. This keeps
 time stable under different workloads and prevents an SMP system from running
 clocks N times faster with N CPUs.
 
+## Large Userspace Programs and Doom
+
+The process launcher copies large ELF segments to VMOs in bounded 1 MiB
+transfers. Child page-table construction does not flush the current process TLB
+for each mapping because the child CR3 has never been active. Initial RSP uses
+SysV post-call alignment, and every CPU enables x87/SSE execution for the
+separate GPL DoomGeneric process. See [DOOM.md](DOOM.md).
+
 ## Orderly Shutdown
 
 Shutdown is a root-supervisor operation. Terminal sends an IPC request to init;

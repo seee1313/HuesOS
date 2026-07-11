@@ -1,0 +1,9 @@
+DoomGeneric vendored source
+Upstream: https://github.com/ozkl/doomgeneric
+Commit: dcb7a8dbc7a16ce3dda29382ac9aae9d77d21284
+License: GPL-2.0-only (see LICENSE)
+
+HuesOS compiles this as the separate `huesos-doom` userspace program. It is
+not linked into the MIT kernel or native Rust libraries. Platform integration
+and the purpose-built compatibility libc live under
+`crates/huesos-userspace/doom/`.

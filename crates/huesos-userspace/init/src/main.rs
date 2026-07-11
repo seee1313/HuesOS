@@ -23,6 +23,7 @@ macro_rules! init_logln {
 
 static DRIVER_MANAGER_ELF: &[u8] = include_bytes!(env!("HUESOS_DRIVER_MANAGER_PATH"));
 static TERMINAL_ELF: &[u8] = include_bytes!(env!("HUESOS_TERMINAL_PATH"));
+static DOOM_ELF: &[u8] = include_bytes!(env!("HUESOS_DOOM_PATH"));
 static FAULT_PROBE_ELF: &[u8] = include_bytes!(env!("HUESOS_FAULT_PROBE_PATH"));
 static BOOTFS_IMAGE: &[u8] = include_bytes!(env!("HUESOS_BOOTFS_PATH"));
 
@@ -69,11 +70,12 @@ pub extern "C" fn _start() -> ! {
         "[init] service launch complete; parking as init supervisor"
     );
     let mut supervisor_message = [0u8; 64];
+    let mut supervisor_handles = [0u32; 1];
     loop {
         let _keep_services_alive = &driver_manager;
         if let Some((_, channel)) = &terminal {
-            match channel.read_into(&mut supervisor_message) {
-                Ok(n) if &supervisor_message[..n] == b"system:shutdown" => {
+            match channel.read_etc(&mut supervisor_message, &mut supervisor_handles) {
+                Ok((n, 0)) if &supervisor_message[..n] == b"system:shutdown" => {
                     init_logln!(logger, "[init] terminal requested orderly shutdown");
                     if let Err(error) = libcanvas::system::shutdown() {
                         init_logln!(
@@ -82,6 +84,10 @@ pub extern "C" fn _start() -> ! {
                             error.as_str()
                         );
                     }
+                }
+                Ok((n, 1)) if &supervisor_message[..n] == b"system:launch-doom" => {
+                    let handle = unsafe { libcanvas::Handle::from_raw(supervisor_handles[0]) };
+                    launch_doom(&mut logger, channel, Channel::from_handle(handle));
                 }
                 Ok(_) | Err(ErrorCode::ShouldWait) | Err(ErrorCode::TimedOut) => {}
                 Err(error) => init_logln!(
@@ -96,6 +102,21 @@ pub extern "C" fn _start() -> ! {
 }
 
 
+fn launch_doom(logger: &mut InitLogger, terminal: &Channel, keyboard: Channel) {
+    init_logln!(logger, "[init] launching DoomGeneric/Freedoom");
+    let result = (|| -> libcanvas::Result<()> {
+        let (_process, bootstrap) = libcanvas::process::spawn_elf("doom", DOOM_ELF)?;
+        init_logln!(logger, "[init] Doom process created; passing keyboard");
+        bootstrap.write_handle(b"keyboard", keyboard.into_handle())?;
+        init_logln!(logger, "[init] Doom keyboard passed; process running");
+        terminal.write(b"doom:started")?;
+        Ok(())
+    })();
+    if let Err(error) = result {
+        init_logln!(logger, "[init] Doom launch failed: {}", error.as_str());
+        let _ = terminal.write(b"doom:error");
+    }
+}
 
 fn send_bootfs_vmo(logger: &mut InitLogger, dm_bootstrap: &Channel) {
     let Ok(vmo) = Vmo::create(BOOTFS_IMAGE.len() as u64) else {
