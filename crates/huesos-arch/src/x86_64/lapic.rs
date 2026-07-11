@@ -188,6 +188,9 @@ pub unsafe fn timer_init(divide: TimerDivide, mode: TimerMode, initial_count: u3
 
 /// Stop the APIC timer.
 pub fn timer_stop() {
+    if base() == 0 {
+        return;
+    }
     write_reg(REG_LVT_TIMER, 0x0001_0000); // masked
     write_reg(REG_TIMER_INIT_COUNT, 0);
 }
@@ -235,6 +238,20 @@ pub fn calibrate_timer() -> u32 {
 
     // 100 Hz = 10 ms period = 50 ms / 5.
     ticks_50ms / 5
+}
+
+/// Send a fixed-vector IPI to every CPU except the caller.
+///
+/// Used by the fatal panic path. This is best-effort: before LAPIC setup there
+/// are no running APs to stop, so an unavailable LAPIC is a harmless no-op.
+pub fn broadcast_excluding_self(vector: u8) {
+    if base() == 0 {
+        return;
+    }
+    wait_icr_idle();
+    // Destination shorthand 0b11 = all excluding self, fixed delivery.
+    write_reg(REG_ICR_LOW, vector as u32 | (0b11 << 18));
+    wait_icr_idle();
 }
 
 /// Send a reschedule IPI to `dest_apic_id`.

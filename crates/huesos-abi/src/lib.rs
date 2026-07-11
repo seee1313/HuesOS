@@ -213,6 +213,21 @@ pub const INVALID_HANDLE: HandleValue = 0;
 /// child process by `Syscall::ThreadStart`.
 pub const BOOTSTRAP_HANDLE: HandleValue = 1;
 
+/// Stable process exit codes used when the kernel terminates a process after
+/// an unhandled ring-3 CPU exception.
+pub mod fault_exit {
+    /// User page fault (#PF).
+    pub const PAGE_FAULT: i64 = -0x1001;
+    /// User general-protection fault (#GP).
+    pub const GENERAL_PROTECTION: i64 = -0x1002;
+    /// User invalid opcode (#UD).
+    pub const INVALID_OPCODE: i64 = -0x1003;
+    /// User divide error (#DE).
+    pub const DIVIDE_ERROR: i64 = -0x1004;
+    /// User alignment check (#AC).
+    pub const ALIGNMENT_CHECK: i64 = -0x1005;
+}
+
 /// Rights bitmask, mirrored from `huesos-object::Rights` numerically (kept
 /// here too so userspace doesn't need to depend on the kernel-only object
 /// crate just to duplicate a handle with reduced rights).

@@ -194,12 +194,70 @@ impl Framebuffer {
 }
 
 static FRAMEBUFFER: Mutex<Option<Framebuffer>> = Mutex::new(None);
+// Dedicated copy used only by the fatal path. Normal drawing never takes this
+// lock, so a panic that interrupted framebuffer code cannot deadlock on the
+// ordinary framebuffer mutex.
+static PANIC_FRAMEBUFFER: Mutex<Option<FramebufferConfig>> = Mutex::new(None);
 
 /// Initialize the framebuffer driver with geometry handed off by the
 /// bootloader. A no-op (leaves the driver "unavailable") if `config` is
 /// `None`, e.g. on a system Limine couldn't find a framebuffer for.
 pub fn init(config: Option<FramebufferConfig>) {
+    *PANIC_FRAMEBUFFER.lock() = config;
     *FRAMEBUFFER.lock() = config.map(|config| Framebuffer { config });
+}
+
+struct PanicConsole {
+    framebuffer: Framebuffer,
+    x: u32,
+    y: u32,
+}
+
+impl core::fmt::Write for PanicConsole {
+    fn write_str(&mut self, text: &str) -> core::fmt::Result {
+        for ch in text.chars() {
+            if ch == '\n' {
+                self.x = 16;
+                self.y = self.y.saturating_add(10);
+                continue;
+            }
+            if self.x.saturating_add(8) > self.framebuffer.config.width {
+                self.x = 16;
+                self.y = self.y.saturating_add(10);
+            }
+            if self.y.saturating_add(8) > self.framebuffer.config.height {
+                break;
+            }
+            self.framebuffer.draw_glyph(self.x, self.y, ch, 255, 255, 255);
+            self.x = self.x.saturating_add(8);
+        }
+        Ok(())
+    }
+}
+
+/// Replace the screen with the non-allocating fatal panic console.
+///
+/// The renderer uses a dedicated framebuffer configuration copy and therefore
+/// does not acquire the normal drawing lock. It is intended to be called once
+/// by the CPU that won the kernel panic-owner election.
+pub fn panic_render(args: core::fmt::Arguments<'_>) {
+    use core::fmt::Write;
+
+    let Some(config) = *PANIC_FRAMEBUFFER.lock() else {
+        return;
+    };
+    let mut console = PanicConsole {
+        framebuffer: Framebuffer { config },
+        x: 16,
+        y: 16,
+    };
+    let width = console.framebuffer.config.width;
+    let height = console.framebuffer.config.height;
+    console
+        .framebuffer
+        .fill_rect(0, 0, width, height, 150, 0, 0);
+    let _ = console.write_str("HuesOS KERNEL PANIC\n\n");
+    let _ = console.write_fmt(args);
 }
 
 /// Whether a framebuffer is available at all.
@@ -383,6 +441,37 @@ mod tests {
         assert!(font8x8::glyph('~').is_some());
         assert!(font8x8::glyph(' ').is_some());
         assert!(font8x8::glyph('\u{1F600}').is_none(), "non-ASCII must return None");
+    }
+
+    #[test]
+    fn panic_renderer_uses_red_background_and_white_text() {
+        let mut backing = vec![0u8; 320 * 200 * 4];
+        init(Some(FramebufferConfig {
+            addr: backing.as_mut_ptr(),
+            width: 320,
+            height: 200,
+            pitch: 320 * 4,
+            bpp: 32,
+            red_mask_size: 8,
+            red_mask_shift: 16,
+            green_mask_size: 8,
+            green_mask_shift: 8,
+            blue_mask_size: 8,
+            blue_mask_shift: 0,
+        }));
+        panic_render(format_args!("CPU: 0\nException: TEST\n"));
+
+        let mut red = 0usize;
+        let mut white = 0usize;
+        for pixel in backing.chunks_exact(4) {
+            match (pixel[2], pixel[1], pixel[0]) {
+                (150, 0, 0) => red += 1,
+                (255, 255, 255) => white += 1,
+                _ => {}
+            }
+        }
+        assert!(red > 320 * 200 / 2);
+        assert!(white > 100);
     }
 
     fn alloc_vec() -> Vec<u8> {

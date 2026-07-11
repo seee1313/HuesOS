@@ -38,9 +38,19 @@ impl Process {
         })
     }
 
-    /// Human-readable process name.
+    /// Human-readable process name as an owned string.
     pub fn name(&self) -> String {
         self.name.lock().clone()
+    }
+
+    /// Copy the process name into caller-owned storage without allocating.
+    /// Returns the number of bytes copied. Fatal/fault diagnostics use this
+    /// path so reporting a userspace exception cannot itself fail on OOM.
+    pub fn copy_name(&self, output: &mut [u8]) -> usize {
+        let name = self.name.lock();
+        let count = name.len().min(output.len());
+        output[..count].copy_from_slice(&name.as_bytes()[..count]);
+        count
     }
 
     /// Record the exit code and wake anyone blocked in ProcessWait.

@@ -208,6 +208,15 @@ mod tests {
     }
 
     #[test]
+    fn process_name_can_be_copied_without_allocation() {
+        let process = Process::new("fault-reporter");
+        let mut buffer = [0u8; 8];
+        let count = process.copy_name(&mut buffer);
+        assert_eq!(count, 8);
+        assert_eq!(&buffer, b"fault-re");
+    }
+
+    #[test]
     fn thread_records_owning_process() {
         let thread = Thread::new_for_process("worker", Koid(123));
         assert_eq!(thread.process(), Koid(123));

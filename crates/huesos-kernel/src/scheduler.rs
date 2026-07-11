@@ -25,7 +25,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use alloc::boxed::Box;
 use core::sync::atomic::Ordering;
-use huesos_object::Process;
+use huesos_object::{KernelObject, Process};
 use x86_64::VirtAddr;
 
 /// Maximum number of CPUs supported.
@@ -530,6 +530,81 @@ pub fn exit_current_task(code: i64) -> ! {
     }
 }
 
+/// Terminate every thread belonging to the current userspace process and
+/// switch away from the faulting thread. This is used for unhandled ring-3
+/// exceptions: continuing sibling threads in a potentially corrupted address
+/// space would violate process isolation.
+pub fn terminate_current_process(code: i64) -> ! {
+    huesos_arch::interrupts::disable();
+    let current_cpu = cpu_id();
+    let process = {
+        let guard = PER_CPU_SCHEDULERS[current_cpu].lock();
+        guard.current_task().and_then(|task| match &task.kind {
+            TaskKind::User { process } => Some(Arc::clone(process)),
+            TaskKind::Kernel => None,
+        })
+    };
+
+    let Some(process) = process else {
+        panic!("terminate_current_process called without a userspace process");
+    };
+    process.set_exit_code(code);
+    let process_koid = process.koid();
+
+    for cpu in 0..MAX_CPUS {
+        let mut guard = PER_CPU_SCHEDULERS[cpu].lock();
+        for idx in 0..guard.tasks.len() {
+            let matched = match &guard.tasks[idx].kind {
+                TaskKind::User { process } => process.koid() == process_koid,
+                TaskKind::Kernel => false,
+            };
+            if !matched {
+                continue;
+            }
+            let (id, fair_key) = {
+                let task = &mut guard.tasks[idx];
+                task.finished.store(true, Ordering::SeqCst);
+                task.blocked.store(false, Ordering::SeqCst);
+                let fair_key = match task.sched_policy {
+                    SchedPolicy::Fair { vruntime, .. } => Some(vruntime),
+                    SchedPolicy::Deadline { .. } => None,
+                };
+                (task.id, fair_key)
+            };
+            if let Some(vruntime) = fair_key {
+                guard.fair_queue.remove(vruntime, id);
+            }
+            REAP_QUEUE.lock().push(id);
+        }
+    }
+
+    PROCESS_TEARDOWN.lock().push(Arc::clone(&process));
+    for cpu in 0..MAX_CPUS {
+        if cpu != current_cpu && is_cpu_online(cpu) {
+            huesos_arch::lapic::ipi_reschedule(cpu as u8);
+        }
+    }
+
+    switch_away_from_finished(current_cpu)
+}
+
+fn switch_away_from_finished(cpu: usize) -> ! {
+    loop {
+        let mut guard = PER_CPU_SCHEDULERS[cpu].lock();
+        let switch_context = guard.tick();
+        drop(guard);
+
+        if let Some((old_ptr, new_ptr)) = switch_context {
+            unsafe {
+                huesos_arch::context_switch::context_switch(old_ptr, new_ptr);
+            }
+        }
+        huesos_arch::interrupts::enable();
+        huesos_arch::hlt();
+        huesos_arch::interrupts::disable();
+    }
+}
+
 /// Task ids waiting for kernel-stack reclamation.
 static REAP_QUEUE: spin::Mutex<alloc::vec::Vec<u64>> = spin::Mutex::new(alloc::vec::Vec::new());
 
@@ -571,6 +646,20 @@ pub fn reap_finished_tasks() {
         core::mem::take(&mut *q)
     };
     for proc in procs {
-        crate::process::teardown_process(&proc);
+        let koid = proc.koid();
+        let still_current = (0..MAX_CPUS).any(|cpu| {
+            let guard = PER_CPU_SCHEDULERS[cpu].lock();
+            guard.current_task().is_some_and(|task| match &task.kind {
+                TaskKind::User { process } => process.koid() == koid,
+                TaskKind::Kernel => false,
+            })
+        });
+        if still_current {
+            // A remote CPU has not yet taken its reschedule IPI. Never destroy
+            // page tables while that CPU can still have the process CR3 live.
+            PROCESS_TEARDOWN.lock().push(proc);
+        } else {
+            crate::process::teardown_process(&proc);
+        }
     }
 }
