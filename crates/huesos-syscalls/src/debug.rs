@@ -2,15 +2,15 @@
 
 use huesos_abi::ErrorCode;
 
-use crate::{callbacks::DEBUG_WRITE_FN, SyscallResult};
+use crate::{callbacks::DEBUG_WRITE_FN, user_memory, SyscallResult};
 
 pub(crate) fn sys_debug_write(buf: *const u8, len: usize) -> SyscallResult {
-    if buf.is_null() || len == 0 || len > 4096 {
+    if len == 0 || len > 4096 {
         return Err(ErrorCode::InvalidArgs);
     }
-    let slice = unsafe { core::slice::from_raw_parts(buf, len) };
+    let bytes = user_memory::copy_from_user(buf, len)?;
     if let Some(f) = *DEBUG_WRITE_FN.lock() {
-        f(slice);
+        f(&bytes);
     }
     Ok(len as i64)
 }

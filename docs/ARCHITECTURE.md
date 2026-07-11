@@ -151,6 +151,14 @@ live in `huesos-abi::Syscall`. Current surface includes VMO/Channel/handle
 ops, process/thread/VMAR launch, Port/Interrupt, framebuffer info/blit,
 yield/exit/debug write.
 
+Raw caller pointers are never dereferenced by individual syscall handlers.
+`huesos-syscalls::user_memory` validates ABI bounds plus every active
+page-table level (`PRESENT`, `USER_ACCESSIBLE`, and `WRITABLE` for outputs),
+then performs the only audited raw copies. Argument records are snapshotted
+once, and blocking/dequeueing calls preflight outputs before side effects.
+See [USER_MEMORY.md](USER_MEMORY.md) for the complete contract, limits, review
+checklist, and the required upgrade before VMAR unmap/protect is introduced.
+
 ## Scheduler
 
 - **Fair**: CFS-like virtual runtime in a rank-balanced WAVL tree
@@ -167,6 +175,11 @@ mapping is given to userspace.
 ## Security Model
 
 - No global namespaces — capabilities via handles.
-- Rights checked on handle-touching syscalls.
+- Rights checked on handle-touching syscalls; handle duplication can only
+  preserve or reduce rights, never add rights absent from the source.
 - W^X on user pages (`NO_EXECUTE` requires `EFER.NXE` on **every** CPU).
-- Jobs exist but do not yet enforce quotas.
+- Syscall user pointers are range-checked and page-table-checked before an
+  audited copy; kernel-half pointers and supervisor-only mappings are rejected.
+- Per-call transfer limits bound attacker-controlled temporary allocations.
+- Jobs exist but do not yet enforce aggregate quotas.
+- SMEP/SMAP and fault-recoverable copies remain future hardening.

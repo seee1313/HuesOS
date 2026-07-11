@@ -95,6 +95,20 @@ with `let _ =` if you genuinely don't care about failure in some spot (the
 example program above only ignores results in the framebuffer test where
 failing to draw isn't fatal to the program's purpose).
 
+### Pointer safety and transfer limits
+
+`libcanvas` passes pointers to userspace buffers as part of the syscall ABI,
+but the kernel never trusts or directly dereferences them. It validates the
+complete lower-half address range and effective page-table permissions, then
+copies through its audited user-memory layer. Invalid, unmapped, read-only
+output, overflowing, and kernel-half ranges return `ErrorCode::InvalidArgs`
+instead of faulting the kernel.
+
+Calls are intentionally bounded: one VMO read/write transfers at most 1 MiB;
+a Channel message carries at most 64 KiB and 64 handles; debug writes carry at
+most 4 KiB. Split larger application transfers into multiple calls. See
+[USER_MEMORY.md](USER_MEMORY.md) for the kernel-side contract.
+
 ### Memory (VMOs)
 
 ```rust
@@ -123,12 +137,11 @@ let (buf, n) = rx.read()?;
 assert_eq!(&buf[..n], b"ping");
 ```
 
-`Channel::read`/`read_into` are **non-blocking**: if no message is queued
-yet, they return `Err(ErrorCode::ShouldWait)` immediately rather than
-blocking the calling thread. There is no blocking wait primitive yet
-(see the kernel's `Port` object in the roadmap) — if you need to wait for
-a message, poll with `libcanvas::process::yield_now()` between attempts
-for now.
+`Channel::read`/`read_into` are **non-blocking**: if no message is queued,
+they return `Err(ErrorCode::ShouldWait)`. Use `read_into_blocking` to park the
+current task until a message arrives, or `read_into_timeout` for a scheduler-
+tick deadline. Ports likewise provide `read`, `read_blocking`, and
+`read_timeout`; blocking waits do not require a userspace yield-spin loop.
 
 ### Graphics (the framebuffer)
 

@@ -94,12 +94,7 @@ pub fn map_hhdm_range(phys_base: u64, length: u64) {
 
 /// Like [`map_hhdm_range`], but with explicit page flags (e.g. `NO_CACHE` for MMIO).
 pub fn map_hhdm_range_flags(phys_base: u64, length: u64, flags: PageTableFlags) {
-    map_phys_range(
-        phys_base,
-        length,
-        flags,
-        |phys| phys_to_virt(phys),
-    );
+    map_phys_range(phys_base, length, flags, |phys| phys_to_virt(phys));
 }
 
 /// Identity-map `[phys_base, phys_base + length)` so `virt == phys`.
@@ -159,6 +154,59 @@ fn map_phys_range(
             break;
         }
     }
+}
+
+/// Check whether a 4 KiB page in the currently active address space is
+/// accessible from ring 3 with the requested access.
+///
+/// The walk checks the effective permissions at every page-table level, not
+/// only the leaf PTE: x86 requires `PRESENT` and `USER_ACCESSIBLE` throughout
+/// the walk, and a write is permitted only when every traversed entry is
+/// `WRITABLE`. 1 GiB and 2 MiB huge-page leaves are supported even though
+/// HuesOS currently maps ordinary userspace with 4 KiB pages.
+///
+/// This function deliberately validates only page-table permissions. ABI
+/// policy such as the null guard and the upper userspace bound belongs to the
+/// syscall user-copy layer.
+pub fn active_user_page_accessible(addr: VirtAddr, write: bool) -> bool {
+    fn permits(flags: PageTableFlags, write: bool) -> bool {
+        flags.contains(PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE)
+            && (!write || flags.contains(PageTableFlags::WRITABLE))
+    }
+
+    fn table_at(phys: PhysAddr) -> &'static PageTable {
+        // Page-table frames are ordinary RAM and are therefore reachable
+        // through the HHDM established during early paging initialization.
+        unsafe { &*phys_to_virt(phys.as_u64()).as_ptr::<PageTable>() }
+    }
+
+    let (p4_frame, _) = Cr3::read();
+    let p4 = table_at(p4_frame.start_address());
+    let p4e = &p4[addr.p4_index()];
+    if !permits(p4e.flags(), write) || p4e.flags().contains(PageTableFlags::HUGE_PAGE) {
+        return false;
+    }
+
+    let p3 = table_at(p4e.addr());
+    let p3e = &p3[addr.p3_index()];
+    if !permits(p3e.flags(), write) {
+        return false;
+    }
+    if p3e.flags().contains(PageTableFlags::HUGE_PAGE) {
+        return true;
+    }
+
+    let p2 = table_at(p3e.addr());
+    let p2e = &p2[addr.p2_index()];
+    if !permits(p2e.flags(), write) {
+        return false;
+    }
+    if p2e.flags().contains(PageTableFlags::HUGE_PAGE) {
+        return true;
+    }
+
+    let p1 = table_at(p2e.addr());
+    permits(p1[addr.p1_index()].flags(), write)
 }
 
 /// Allocate a fresh physical frame and map it at `page` in the kernel
@@ -305,8 +353,7 @@ impl AddressSpace {
 /// Intermediate page-table frames are always freed (they were allocated by
 /// `map_to` via the PMM and are private to this address space).
 unsafe fn free_page_table_recursive(table_phys: u64, level: u8, owned: &mut alloc::vec::Vec<u64>) {
-    let table: &mut PageTable =
-        unsafe { &mut *phys_to_virt(table_phys).as_mut_ptr::<PageTable>() };
+    let table: &mut PageTable = unsafe { &mut *phys_to_virt(table_phys).as_mut_ptr::<PageTable>() };
     for i in 0..512 {
         if table[i].is_unused() {
             continue;

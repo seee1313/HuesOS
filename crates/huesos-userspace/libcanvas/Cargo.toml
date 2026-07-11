@@ -3,6 +3,11 @@ name = "libcanvas"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+default = []
+# Boot-time negative syscall probes used by huesos-init/QEMU smoke tests.
+kernel-smoke-tests = []
+
 [dependencies]
 huesos-abi = { path = "../../huesos-abi" }
 

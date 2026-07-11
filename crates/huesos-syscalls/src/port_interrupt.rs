@@ -3,20 +3,16 @@
 use huesos_abi::{ErrorCode, HandleValue, PortPacket};
 use huesos_object::{Handle, KernelObject, KernelObjectExt, Rights};
 
-use crate::{util::current_proc, SyscallResult};
+use crate::{user_memory, util::current_proc, SyscallResult};
 
 pub(crate) fn sys_port_create(out: *mut HandleValue) -> SyscallResult {
-    if out.is_null() {
-        return Err(ErrorCode::InvalidArgs);
-    }
+    user_memory::validate_write(out)?;
     let port = huesos_object::Port::new();
     let koid = port.koid();
     huesos_object::register_object(port);
     let proc = current_proc()?;
     let handle = proc.handles.add(Handle::new(koid, Rights::DEFAULT));
-    unsafe {
-        *out = handle;
-    }
+    user_memory::write_value(out, &handle)?;
     Ok(0)
 }
 
@@ -25,9 +21,8 @@ pub(crate) fn sys_port_read(
     out: *mut PortPacket,
     wait_mode: u64,
 ) -> SyscallResult {
-    if out.is_null() {
-        return Err(ErrorCode::InvalidArgs);
-    }
+    // Validate before a blocking wait and before consuming a queued packet.
+    user_memory::validate_write(out)?;
     let proc = current_proc()?;
     let h = proc.handles.get(port_handle).ok_or(ErrorCode::BadHandle)?;
     if !h.has_rights(Rights::READ) {
@@ -37,7 +32,6 @@ pub(crate) fn sys_port_read(
     let port = obj
         .downcast_ref::<huesos_object::Port>()
         .ok_or(ErrorCode::WrongType)?;
-    // 0 = nonblock, 1 = forever, >=2 = timeout ticks
     let packet = match wait_mode {
         0 => port.read().ok_or(ErrorCode::ShouldWait)?,
         1 => port.read_blocking(),
@@ -45,23 +39,20 @@ pub(crate) fn sys_port_read(
             .read_blocking_timeout(ticks)
             .ok_or(ErrorCode::TimedOut)?,
     };
-    unsafe {
-        *out = PortPacket {
-            key: packet.key,
-            packet_type: packet.packet_type,
-            status: packet.status,
-            data: packet.data,
-        };
-    }
+    let packet = PortPacket {
+        key: packet.key,
+        packet_type: packet.packet_type,
+        status: packet.status,
+        data: packet.data,
+    };
+    user_memory::write_value(out, &packet)?;
     Ok(0)
 }
 
 const KEYBOARD_IRQ: u32 = 1;
 
 pub(crate) fn sys_interrupt_create(irq: u32, out: *mut HandleValue) -> SyscallResult {
-    if out.is_null() {
-        return Err(ErrorCode::InvalidArgs);
-    }
+    user_memory::validate_write(out)?;
     if irq != KEYBOARD_IRQ {
         return Err(ErrorCode::NotSupported);
     }
@@ -72,9 +63,7 @@ pub(crate) fn sys_interrupt_create(irq: u32, out: *mut HandleValue) -> SyscallRe
 
     let proc = current_proc()?;
     let handle = proc.handles.add(Handle::new(koid, Rights::DEFAULT));
-    unsafe {
-        *out = handle;
-    }
+    user_memory::write_value(out, &handle)?;
     Ok(0)
 }
 

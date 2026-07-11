@@ -293,8 +293,10 @@ mod tests {
 
     #[test]
     fn test_buddy_allocate_deallocate() {
-        let mut mem = alloc::vec![0u8; 8 * 4096];
-        let base = mem.as_mut_ptr() as usize;
+        // Vec only guarantees byte alignment. The production heap is page
+        // aligned, so over-allocate and align the host-test backing explicitly.
+        let mut mem = alloc::vec![0u8; 9 * 4096];
+        let base = (mem.as_mut_ptr() as usize + 4095) & !4095;
         let mut allocator = unsafe { BuddyAllocator::<4>::new(base, 8, 4096) };
         let a = allocator.allocate(1).unwrap();
         let b = allocator.allocate(2).unwrap();
@@ -313,8 +315,8 @@ mod tests {
 
     #[test]
     fn test_buddy_non_power_of_two_pages() {
-        let mut mem = alloc::vec![0u8; 5 * 4096];
-        let base = mem.as_mut_ptr() as usize;
+        let mut mem = alloc::vec![0u8; 6 * 4096];
+        let base = (mem.as_mut_ptr() as usize + 4095) & !4095;
         let mut allocator = unsafe { BuddyAllocator::<4>::new(base, 5, 4096) };
         let a = allocator.allocate(4).unwrap();
         assert_eq!(a, base);

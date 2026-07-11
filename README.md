@@ -33,6 +33,9 @@ see [Known Limitations](#known-limitations) and
   double fault handlers
 - ✅ Real `syscall`/`sysret` fast path (STAR/LSTAR/SFMASK), programmed
   **per logical CPU** (critical for user tasks migrated to APs)
+- ✅ Hardened userspace-copy boundary: full lower-half range and active
+  page-table permission validation on every pointer-bearing syscall; no direct
+  caller-pointer dereferences in syscall handlers; bounded temporary transfers
 - ✅ **SMP**: MADT parse, INIT-SIPI-SIPI, per-CPU GDT/TSS/IDT/CpuLocal
   (GS_BASE), per-CPU scheduler with idle task, shared LAPIC timer
   calibration, LAPIC EOI on vector 0x20, online-CPU load balancing, IPI
@@ -91,11 +94,15 @@ Default `scripts/run.sh` uses `-smp 2`.
 - No IOAPIC routing yet (LAPIC timer + legacy PIC keyboard path only)
 - No filesystem on real block devices yet (BOOTFS is RAM; FAT crate is
   library-ready, not wired as the production VFS backend)
-- Exited process address spaces / kernel task stacks are not yet reclaimed
-  (zombie reaper is future work)
-- Dynamic process launch is MVP: no full process wait/reap supervision
+- Exited-process address spaces and kernel stacks are reaped, but finished task
+  metadata is retained and the global object registry still needs a complete
+  strong/weak-reference lifecycle (ordinary last-handle close does not yet
+  unregister every object)
+- Dynamic process launch and blocking `ProcessWait` work, but supervision,
+  cancellation, and multi-object waits remain MVP-level
 - No dynamic loading / relocations (static ELF only)
-- Rights enforcement exists but isn't exhaustively audited
+- Capability rights are enforced on current handle syscalls, but object
+  lifetime/resource quota enforcement is not yet complete
 - Framebuffer text is ASCII-only (no Unicode shaping, by design)
 
 ## Hardware Compatibility
@@ -129,7 +136,9 @@ See [docs/USERSPACE.md](docs/USERSPACE.md) — the short version: depend on
 ## Architecture
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for detailed design
-(including SMP, HBI, HHDM base-rev-3 mapping rules, and allocators).
+(including SMP, HBI, HHDM base-rev-3 mapping rules, and allocators). The
+security contract for every pointer-bearing syscall is documented separately
+in [docs/USER_MEMORY.md](docs/USER_MEMORY.md).
 
 ## Building
 

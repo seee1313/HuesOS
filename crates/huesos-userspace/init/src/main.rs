@@ -30,6 +30,12 @@ pub extern "C" fn _start() -> ! {
     let mut logger = InitLogger::new();
     init_logln!(logger, "[init] hello from ring3 userspace, via libcanvas");
 
+    if libcanvas::diagnostics::user_pointer_guard_smoke_test() {
+        init_logln!(logger, "[init] user pointer guard smoke OK");
+    } else {
+        init_logln!(logger, "[init] user pointer guard smoke FAILED");
+    }
+
     run_vmo_check(&mut logger);
     run_channel_check(&mut logger);
 
