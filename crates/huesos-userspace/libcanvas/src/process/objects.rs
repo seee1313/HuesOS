@@ -34,15 +34,13 @@ impl Process {
 
         let mut process: HandleValue = INVALID_HANDLE;
         let mut root_vmar: HandleValue = INVALID_HANDLE;
-        let ret = unsafe {
-            raw::syscall4(
-                Syscall::ProcessCreate,
-                name.as_ptr() as u64,
-                name.len() as u64,
-                &mut process as *mut HandleValue as u64,
-                &mut root_vmar as *mut HandleValue as u64,
-            )
-        };
+        let ret = raw::syscall4(
+            Syscall::ProcessCreate,
+            name.as_ptr() as u64,
+            name.len() as u64,
+            &mut process as *mut HandleValue as u64,
+            &mut root_vmar as *mut HandleValue as u64,
+        );
         raw::decode(ret)?;
         Ok((
             Self(unsafe { Handle::from_raw(process) }),
@@ -53,13 +51,11 @@ impl Process {
     /// Block until the process exits and return its exit code.
     pub fn wait_exit(&self) -> crate::Result<i64> {
         let mut code: i64 = 0;
-        let ret = unsafe {
-            raw::syscall2(
-                Syscall::ProcessWait,
-                self.0.raw() as u64,
-                &mut code as *mut i64 as u64,
-            )
-        };
+        let ret = raw::syscall2(
+            Syscall::ProcessWait,
+            self.0.raw() as u64,
+            &mut code as *mut i64 as u64,
+        );
         raw::decode(ret)?;
         Ok(code)
     }
@@ -67,13 +63,11 @@ impl Process {
     /// Query process completion without blocking.
     pub fn poll_exit(&self) -> crate::Result<Option<i64>> {
         let mut code = 0i64;
-        let ret = unsafe {
-            raw::syscall2(
-                Syscall::ProcessGetExitCode,
-                self.0.raw() as u64,
-                &mut code as *mut i64 as u64,
-            )
-        };
+        let ret = raw::syscall2(
+            Syscall::ProcessGetExitCode,
+            self.0.raw() as u64,
+            &mut code as *mut i64 as u64,
+        );
         match raw::decode(ret) {
             Ok(_) => Ok(Some(code)),
             Err(crate::ErrorCode::ShouldWait) => Ok(None),
@@ -99,15 +93,13 @@ impl Thread {
         }
 
         let mut thread: HandleValue = INVALID_HANDLE;
-        let ret = unsafe {
-            raw::syscall4(
-                Syscall::ThreadCreate,
-                process.handle().raw() as u64,
-                name.as_ptr() as u64,
-                name.len() as u64,
-                &mut thread as *mut HandleValue as u64,
-            )
-        };
+        let ret = raw::syscall4(
+            Syscall::ThreadCreate,
+            process.handle().raw() as u64,
+            name.as_ptr() as u64,
+            name.len() as u64,
+            &mut thread as *mut HandleValue as u64,
+        );
         raw::decode(ret)?;
         Ok(Self(unsafe { Handle::from_raw(thread) }))
     }
@@ -119,15 +111,13 @@ impl Thread {
     /// parent endpoint to the caller.
     pub fn start(&self, entry: u64, stack: u64) -> crate::Result<Channel> {
         let mut parent_bootstrap: HandleValue = INVALID_HANDLE;
-        let ret = unsafe {
-            raw::syscall4(
-                Syscall::ThreadStart,
-                self.0.raw() as u64,
-                entry,
-                stack,
-                &mut parent_bootstrap as *mut HandleValue as u64,
-            )
-        };
+        let ret = raw::syscall4(
+            Syscall::ThreadStart,
+            self.0.raw() as u64,
+            entry,
+            stack,
+            &mut parent_bootstrap as *mut HandleValue as u64,
+        );
         raw::decode(ret)?;
         Ok(unsafe { Channel::from_raw(parent_bootstrap) })
     }
@@ -158,7 +148,7 @@ impl Vmar {
             len,
             flags,
         };
-        let ret = unsafe { raw::syscall1(Syscall::VmarMap, &args as *const _ as u64) };
+        let ret = raw::syscall1(Syscall::VmarMap, &args as *const _ as u64);
         raw::decode(ret).map(|mapped| mapped as u64)
     }
 

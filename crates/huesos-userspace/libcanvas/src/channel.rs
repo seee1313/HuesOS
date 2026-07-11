@@ -13,7 +13,6 @@ pub const DEFAULT_MAX_MESSAGE: usize = 4096;
 #[derive(Debug)]
 pub struct Channel(Handle);
 
-
 /// Take ownership of the process bootstrap channel endpoint installed by
 /// `ThreadStart` at [`huesos_abi::BOOTSTRAP_HANDLE`].
 ///
@@ -57,13 +56,11 @@ impl Channel {
     pub fn pair() -> crate::Result<(Channel, Channel)> {
         let mut h0: HandleValue = INVALID_HANDLE;
         let mut h1: HandleValue = INVALID_HANDLE;
-        let ret = unsafe {
-            raw::syscall2(
-                Syscall::ChannelCreate,
-                &mut h0 as *mut HandleValue as u64,
-                &mut h1 as *mut HandleValue as u64,
-            )
-        };
+        let ret = raw::syscall2(
+            Syscall::ChannelCreate,
+            &mut h0 as *mut HandleValue as u64,
+            &mut h1 as *mut HandleValue as u64,
+        );
         raw::decode(ret)?;
         Ok((
             Channel(unsafe { Handle::from_raw(h0) }),
@@ -75,16 +72,14 @@ impl Channel {
     /// wrapper yet — see `huesos-abi::Syscall::ChannelWrite`'s lower-level
     /// handle-array parameters if you need that).
     pub fn write(&self, data: &[u8]) -> crate::Result<()> {
-        let ret = unsafe {
-            raw::syscall5(
-                Syscall::ChannelWrite,
-                self.0.raw() as u64,
-                data.as_ptr() as u64,
-                data.len() as u64,
-                0, // no handles array
-                0, // num_handles = 0
-            )
-        };
+        let ret = raw::syscall5(
+            Syscall::ChannelWrite,
+            self.0.raw() as u64,
+            data.as_ptr() as u64,
+            data.len() as u64,
+            0, // no handles array
+            0, // num_handles = 0
+        );
         raw::decode(ret)?;
         Ok(())
     }
@@ -94,16 +89,14 @@ impl Channel {
     pub fn write_handle(&self, data: &[u8], handle: Handle) -> crate::Result<()> {
         let raw_handle = handle.into_raw();
         let handles = [raw_handle];
-        let ret = unsafe {
-            raw::syscall5(
-                Syscall::ChannelWrite,
-                self.0.raw() as u64,
-                data.as_ptr() as u64,
-                data.len() as u64,
-                handles.as_ptr() as u64,
-                handles.len() as u64,
-            )
-        };
+        let ret = raw::syscall5(
+            Syscall::ChannelWrite,
+            self.0.raw() as u64,
+            data.as_ptr() as u64,
+            data.len() as u64,
+            handles.as_ptr() as u64,
+            handles.len() as u64,
+        );
         raw::decode(ret)?;
         Ok(())
     }
@@ -134,16 +127,14 @@ impl Channel {
 
     fn read_into_mode(&self, buf: &mut [u8], wait_mode: u64) -> crate::Result<usize> {
         let mut actual: u32 = 0;
-        let ret = unsafe {
-            raw::syscall5(
-                Syscall::ChannelRead,
-                self.0.raw() as u64,
-                buf.as_mut_ptr() as u64,
-                buf.len() as u64,
-                &mut actual as *mut u32 as u64,
-                wait_mode,
-            )
-        };
+        let ret = raw::syscall5(
+            Syscall::ChannelRead,
+            self.0.raw() as u64,
+            buf.as_mut_ptr() as u64,
+            buf.len() as u64,
+            &mut actual as *mut u32 as u64,
+            wait_mode,
+        );
         raw::decode(ret)?;
         Ok(actual as usize)
     }
@@ -165,19 +156,37 @@ impl Channel {
             handles_capacity: handles.len() as u32,
             out_handles: &mut actual_handles as *mut u32,
         };
-        let ret = unsafe { raw::syscall1(Syscall::ChannelReadEtc, &args as *const _ as u64) };
+        let ret = raw::syscall1(Syscall::ChannelReadEtc, &args as *const _ as u64);
         raw::decode(ret)?;
         Ok((actual_bytes as usize, actual_handles as usize))
     }
 
-    /// Read a message that is expected to contain one transferred generic handle.
-    pub fn read_handle(&self, buf: &mut [u8]) -> crate::Result<(usize, Handle)> {
+    /// Read bytes plus zero or one transferred handle.
+    ///
+    /// This is the safe replacement for applications calling [`read_etc`]
+    /// and constructing an owned [`Handle`] from its raw output. Ownership is
+    /// created exactly once only when the kernel reports one received handle.
+    pub fn read_optional_handle(&self, buf: &mut [u8]) -> crate::Result<(usize, Option<Handle>)> {
         let mut handles = [INVALID_HANDLE; 1];
         let (bytes, num_handles) = self.read_etc(buf, &mut handles)?;
-        if num_handles != 1 {
-            return Err(crate::ErrorCode::InvalidArgs);
+        match num_handles {
+            0 => Ok((bytes, None)),
+            1 => {
+                // SAFETY: ChannelReadEtc returned this value as a newly owned
+                // handle in the caller's handle table. The local array is the
+                // sole place where that ownership is converted to RAII.
+                Ok((bytes, Some(unsafe { Handle::from_raw(handles[0]) })))
+            }
+            _ => Err(crate::ErrorCode::InvalidArgs),
         }
-        Ok((bytes, unsafe { Handle::from_raw(handles[0]) }))
+    }
+
+    /// Read a message that is expected to contain one transferred generic handle.
+    pub fn read_handle(&self, buf: &mut [u8]) -> crate::Result<(usize, Handle)> {
+        let (bytes, handle) = self.read_optional_handle(buf)?;
+        handle
+            .map(|handle| (bytes, handle))
+            .ok_or(crate::ErrorCode::InvalidArgs)
     }
 
     /// Read a message that is expected to contain one transferred Channel handle.

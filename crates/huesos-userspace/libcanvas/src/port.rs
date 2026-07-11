@@ -12,9 +12,7 @@ impl Port {
     /// Create a new Port event queue.
     pub fn create() -> crate::Result<Self> {
         let mut out: HandleValue = INVALID_HANDLE;
-        let ret = unsafe {
-            raw::syscall1(Syscall::PortCreate, &mut out as *mut HandleValue as u64)
-        };
+        let ret = raw::syscall1(Syscall::PortCreate, &mut out as *mut HandleValue as u64);
         raw::decode(ret)?;
         Ok(Self(unsafe { Handle::from_raw(out) }))
     }
@@ -42,14 +40,12 @@ impl Port {
 
     fn read_mode(&self, wait_mode: u64) -> crate::Result<PortPacket> {
         let mut packet = PortPacket::default();
-        let ret = unsafe {
-            raw::syscall3(
-                Syscall::PortRead,
-                self.0.raw() as u64,
-                &mut packet as *mut PortPacket as u64,
-                wait_mode,
-            )
-        };
+        let ret = raw::syscall3(
+            Syscall::PortRead,
+            self.0.raw() as u64,
+            &mut packet as *mut PortPacket as u64,
+            wait_mode,
+        );
         raw::decode(ret)?;
         Ok(packet)
     }

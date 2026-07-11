@@ -2,28 +2,64 @@
 
 #![no_std]
 #![no_main]
-// DoomGeneric invokes all platform callbacks synchronously on its one game
-// thread. These globals are initialized once in DG_Init and never accessed
-// concurrently; wrapping them in a locking runtime would add no safety here.
-#![allow(static_mut_refs)]
 
+use core::cell::UnsafeCell;
 use core::panic::PanicInfo;
 use libcanvas::framebuffer::Canvas;
 use libcanvas::{Channel, ErrorCode};
 
 static FREEDOOM_WAD: &[u8] = include_bytes!("../../../../third_party/freedoom/freedoom1.wad");
-static mut CANVAS: Option<Canvas> = None;
-static mut KEYBOARD: Option<Channel> = None;
-static mut OUTPUT_WIDTH: u32 = 640;
-static mut OUTPUT_HEIGHT: u32 = 400;
-static mut OUTPUT_BPP: u32 = 4;
 
 const DOOM_WIDTH: usize = 640;
 const DOOM_HEIGHT: usize = 400;
 const SCALE_CHUNK_SIZE: usize = 1024 * 1024;
-// One reusable 1 MiB staging area keeps fullscreen scaling to a handful of
-// bounded VMO writes per frame instead of one syscall per destination row.
-static mut SCALE_CHUNK: [u8; SCALE_CHUNK_SIZE] = [0; SCALE_CHUNK_SIZE];
+
+struct DoomState {
+    canvas: Option<Canvas>,
+    keyboard: Option<Channel>,
+    output_width: u32,
+    output_height: u32,
+    output_bpp: u32,
+    scale_chunk: [u8; SCALE_CHUNK_SIZE],
+}
+
+impl DoomState {
+    const fn new() -> Self {
+        Self {
+            canvas: None,
+            keyboard: None,
+            output_width: 640,
+            output_height: 400,
+            output_bpp: 4,
+            scale_chunk: [0; SCALE_CHUNK_SIZE],
+        }
+    }
+}
+
+/// Interior-mutable state for DoomGeneric's synchronous platform callbacks.
+///
+/// DoomGeneric invokes every `DG_*` callback on its sole game thread and does
+/// not re-enter a callback before it returns. Keeping the unsafe cell private
+/// lets the rest of the adapter use ordinary references without `static mut`.
+struct SingleThreadState(UnsafeCell<DoomState>);
+
+// SAFETY: the process has one thread and DoomGeneric's callback contract is
+// synchronous/non-reentrant. No reference produced by `with` escapes it.
+unsafe impl Sync for SingleThreadState {}
+
+impl SingleThreadState {
+    const fn new() -> Self {
+        Self(UnsafeCell::new(DoomState::new()))
+    }
+
+    fn with<R>(&self, operation: impl FnOnce(&mut DoomState) -> R) -> R {
+        // SAFETY: justified by the type-level single-thread/non-reentrant
+        // invariant above. The mutable borrow is scoped to this call.
+        unsafe { operation(&mut *self.0.get()) }
+    }
+}
+
+static STATE: SingleThreadState = SingleThreadState::new();
 
 unsafe extern "C" {
     fn doomgeneric_Create(argc: i32, argv: *mut *mut u8);
@@ -39,8 +75,12 @@ pub extern "C" fn _start() -> ! {
     let arg2 = b"freedoom1.wad\0".as_ptr() as *mut u8;
     let arg3 = b"-nosound\0".as_ptr() as *mut u8;
     let mut argv = [arg0, arg1, arg2, arg3];
+    // SAFETY: argv points to four NUL-terminated static strings and remains
+    // valid for DoomGeneric's process lifetime.
     unsafe { doomgeneric_Create(argv.len() as i32, argv.as_mut_ptr()) };
     loop {
+        // SAFETY: Create completed engine initialization; Tick is called from
+        // this one thread exactly as required by DoomGeneric.
         unsafe { doomgeneric_Tick() };
     }
 }
@@ -48,28 +88,26 @@ pub extern "C" fn _start() -> ! {
 #[unsafe(no_mangle)]
 pub extern "C" fn DG_Init() {
     if let Ok(info) = libcanvas::framebuffer::info() {
-        unsafe {
-            OUTPUT_WIDTH = info.width;
-            OUTPUT_HEIGHT = info.height;
-            OUTPUT_BPP = (info.bpp as u32).div_ceil(8);
-            // Doom's packed adapter currently targets the normal 32-bpp UEFI
-            // framebuffer. Keep a 640x400 fallback for unusual pixel formats.
-            CANVAS = if OUTPUT_BPP == 4 {
+        STATE.with(|state| {
+            state.output_width = info.width;
+            state.output_height = info.height;
+            state.output_bpp = (info.bpp as u32).div_ceil(8);
+            state.canvas = if state.output_bpp == 4 {
                 Canvas::new_fullscreen().ok()
             } else {
-                OUTPUT_WIDTH = 640;
-                OUTPUT_HEIGHT = 400;
-                OUTPUT_BPP = 4;
+                state.output_width = 640;
+                state.output_height = 400;
+                state.output_bpp = 4;
                 Canvas::new(640, 400).ok()
             };
-        }
+        });
     }
     let bootstrap = libcanvas::channel::bootstrap();
     let mut message = [0u8; 32];
     loop {
         match bootstrap.read_channel_handle(&mut message) {
             Ok((n, channel)) if &message[..n] == b"keyboard" => {
-                unsafe { KEYBOARD = Some(channel) };
+                STATE.with(|state| state.keyboard = Some(channel));
                 break;
             }
             Ok(_) | Err(ErrorCode::ShouldWait | ErrorCode::TimedOut | ErrorCode::InvalidArgs) => {
@@ -83,25 +121,32 @@ pub extern "C" fn DG_Init() {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn DG_DrawFrame() {
-    unsafe {
-        let Some(canvas) = CANVAS.as_ref() else { return };
-        if DG_ScreenBuffer.is_null() || OUTPUT_BPP != 4 {
+    // SAFETY: DoomGeneric owns a valid 640x400 screen buffer after Create and
+    // calls DrawFrame synchronously while it remains allocated.
+    let source_ptr = unsafe { DG_ScreenBuffer };
+    if source_ptr.is_null() {
+        return;
+    }
+    let source = unsafe { core::slice::from_raw_parts(source_ptr, DOOM_WIDTH * DOOM_HEIGHT) };
+
+    STATE.with(|state| {
+        let Some(canvas) = state.canvas.as_ref() else {
+            return;
+        };
+        if state.output_bpp != 4 {
             return;
         }
-
-        let width = OUTPUT_WIDTH as usize;
-        let height = OUTPUT_HEIGHT as usize;
+        let width = state.output_width as usize;
+        let height = state.output_height as usize;
         let row_bytes = width.saturating_mul(4);
         if width == 0 || height == 0 || row_bytes > SCALE_CHUNK_SIZE {
             return;
         }
         let rows_per_chunk = (SCALE_CHUNK_SIZE / row_bytes).max(1);
-        let source = core::slice::from_raw_parts(DG_ScreenBuffer, DOOM_WIDTH * DOOM_HEIGHT);
-
         let mut first_y = 0usize;
         while first_y < height {
             let rows = rows_per_chunk.min(height - first_y);
-            let output = &mut SCALE_CHUNK[..rows * row_bytes];
+            let output = &mut state.scale_chunk[..rows * row_bytes];
             for local_y in 0..rows {
                 let dst_y = first_y + local_y;
                 let src_y = dst_y * DOOM_HEIGHT / height;
@@ -117,7 +162,7 @@ pub extern "C" fn DG_DrawFrame() {
             first_y += rows;
         }
         let _ = canvas.present();
-    }
+    });
 }
 
 #[unsafe(no_mangle)]
@@ -131,18 +176,30 @@ pub extern "C" fn DG_SleepMs(ms: u32) {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn DG_GetTicksMs() -> u32 {
-    libcanvas::system::monotonic_ticks().unwrap_or(0).wrapping_mul(10) as u32
+    libcanvas::system::monotonic_ticks()
+        .unwrap_or(0)
+        .wrapping_mul(10) as u32
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn DG_GetKey(pressed: *mut i32, key: *mut u8) -> i32 {
+    if pressed.is_null() || key.is_null() {
+        return 0;
+    }
     let mut message = [0u8; 16];
-    let event = unsafe { KEYBOARD.as_ref() }.and_then(|channel| match channel.read_into(&mut message) {
-        Ok(n) => decode_key(&message[..n]),
-        Err(ErrorCode::ShouldWait | ErrorCode::TimedOut) => None,
-        Err(_) => None,
+    let event = STATE.with(|state| {
+        state
+            .keyboard
+            .as_ref()
+            .and_then(|channel| match channel.read_into(&mut message) {
+                Ok(n) => decode_key(&message[..n]),
+                Err(ErrorCode::ShouldWait | ErrorCode::TimedOut) => None,
+                Err(_) => None,
+            })
     });
-    let Some((is_pressed, value)) = event else { return 0 };
+    let Some((is_pressed, value)) = event else {
+        return 0;
+    };
 
     // Q is a HuesOS emergency return-to-terminal shortcut. Doom's normal
     // Escape/menu quit path still works, but this guarantees supervisors can
@@ -152,6 +209,8 @@ pub extern "C" fn DG_GetKey(pressed: *mut i32, key: *mut u8) -> i32 {
         libcanvas::process::exit(0);
     }
 
+    // SAFETY: both output pointers were checked non-null above and are supplied
+    // by DoomGeneric as writable stack locals for the duration of this call.
     unsafe {
         *pressed = is_pressed as i32;
         *key = value;
@@ -160,7 +219,9 @@ pub extern "C" fn DG_GetKey(pressed: *mut i32, key: *mut u8) -> i32 {
 }
 
 fn decode_key(message: &[u8]) -> Option<(bool, u8)> {
-    let [b'k', state, raw] = message else { return None };
+    let [b'k', state, raw] = message else {
+        return None;
+    };
     let key = match *raw {
         b'w' | b'W' => 0xad,
         b's' | b'S' => 0xaf,
@@ -179,11 +240,15 @@ fn decode_key(message: &[u8]) -> Option<(bool, u8)> {
 pub extern "C" fn DG_SetWindowTitle(_title: *const u8) {}
 
 #[unsafe(no_mangle)]
-pub extern "C" fn hues_wad_len() -> usize { FREEDOOM_WAD.len() }
+pub extern "C" fn hues_wad_len() -> usize {
+    FREEDOOM_WAD.len()
+}
 
 #[unsafe(no_mangle)]
 pub extern "C" fn hues_wad_read(offset: usize, output: *mut u8, length: usize) -> usize {
-    if output.is_null() || offset >= FREEDOOM_WAD.len() { return 0; }
+    if output.is_null() || offset >= FREEDOOM_WAD.len() {
+        return 0;
+    }
     let count = length.min(FREEDOOM_WAD.len() - offset);
     unsafe { core::ptr::copy_nonoverlapping(FREEDOOM_WAD.as_ptr().add(offset), output, count) };
     count
@@ -191,13 +256,19 @@ pub extern "C" fn hues_wad_read(offset: usize, output: *mut u8, length: usize) -
 
 #[unsafe(no_mangle)]
 pub extern "C" fn hues_debug(text: *const u8, length: usize) {
-    if text.is_null() || length == 0 { return; }
+    if text.is_null() || length == 0 {
+        return;
+    }
     let bytes = unsafe { core::slice::from_raw_parts(text, length) };
-    if let Ok(text) = core::str::from_utf8(bytes) { libcanvas::debug::write_str(text); }
+    if let Ok(text) = core::str::from_utf8(bytes) {
+        libcanvas::debug::write_str(text);
+    }
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn hues_exit(code: i32) -> ! { libcanvas::process::exit(code as i64) }
+pub extern "C" fn hues_exit(code: i32) -> ! {
+    libcanvas::process::exit(code as i64)
+}
 
 #[panic_handler]
 fn panic(_info: &PanicInfo) -> ! {

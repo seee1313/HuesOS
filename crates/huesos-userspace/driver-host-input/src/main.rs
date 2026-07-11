@@ -65,10 +65,16 @@ fn run_driver_loop(port: Port, bootstrap: libcanvas::Channel) -> ! {
                 let irq = packet.data[0];
                 let scancode = packet.data[1] as u8;
                 let count = packet.data[2];
-                println!(
-                    "[driver-host:input] irq={} scancode={:#x} count={}",
-                    irq, scancode, count
-                );
+                // Serial output is orders of magnitude slower than IRQ event
+                // delivery, especially on real UART hardware. Log the first
+                // few events and exponentially sparse milestones instead of
+                // issuing a DebugWrite syscall for every make/break byte.
+                if count <= 3 || count.is_power_of_two() {
+                    println!(
+                        "[driver-host:input] irq={} scancode={:#x} count={}",
+                        irq, scancode, count
+                    );
+                }
                 if let Some(event) = decoder.feed(scancode) {
                     send_keyboard_event(&keyboard_client, event);
                 }
@@ -94,7 +100,10 @@ fn run_driver_loop(port: Port, bootstrap: libcanvas::Channel) -> ! {
     }
 }
 
-fn poll_bootstrap(bootstrap: &libcanvas::Channel, keyboard_client: &mut Option<libcanvas::Channel>) {
+fn poll_bootstrap(
+    bootstrap: &libcanvas::Channel,
+    keyboard_client: &mut Option<libcanvas::Channel>,
+) {
     let mut buf = [0u8; 64];
     loop {
         match bootstrap.read_channel_handle(&mut buf) {
@@ -157,10 +166,7 @@ impl KeyboardDecoder {
         if byte == 0 {
             None
         } else {
-            Some(KeyEvent {
-                key: byte,
-                pressed,
-            })
+            Some(KeyEvent { key: byte, pressed })
         }
     }
 }

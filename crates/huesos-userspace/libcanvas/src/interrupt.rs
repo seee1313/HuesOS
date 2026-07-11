@@ -18,13 +18,11 @@ impl Interrupt {
     /// The current kernel implementation supports [`KEYBOARD_IRQ`] only.
     pub fn create(irq: u32) -> crate::Result<Self> {
         let mut out: HandleValue = INVALID_HANDLE;
-        let ret = unsafe {
-            raw::syscall2(
-                Syscall::InterruptCreate,
-                irq as u64,
-                &mut out as *mut HandleValue as u64,
-            )
-        };
+        let ret = raw::syscall2(
+            Syscall::InterruptCreate,
+            irq as u64,
+            &mut out as *mut HandleValue as u64,
+        );
         raw::decode(ret)?;
         Ok(Self(unsafe { Handle::from_raw(out) }))
     }
@@ -36,14 +34,12 @@ impl Interrupt {
 
     /// Bind interrupt notifications to `port` using `key`.
     pub fn bind_port(&self, port: &Port, key: u64) -> crate::Result<()> {
-        let ret = unsafe {
-            raw::syscall3(
-                Syscall::InterruptBindPort,
-                self.0.raw() as u64,
-                port.handle().raw() as u64,
-                key,
-            )
-        };
+        let ret = raw::syscall3(
+            Syscall::InterruptBindPort,
+            self.0.raw() as u64,
+            port.handle().raw() as u64,
+            key,
+        );
         raw::decode(ret)?;
         Ok(())
     }

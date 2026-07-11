@@ -33,13 +33,11 @@ impl Vmo {
     /// Create a new VMO of at least `size` bytes, zero-filled.
     pub fn create(size: u64) -> crate::Result<Self> {
         let mut out: HandleValue = INVALID_HANDLE;
-        let ret = unsafe {
-            raw::syscall2(
-                Syscall::VmoCreate,
-                size,
-                &mut out as *mut HandleValue as u64,
-            )
-        };
+        let ret = raw::syscall2(
+            Syscall::VmoCreate,
+            size,
+            &mut out as *mut HandleValue as u64,
+        );
         raw::decode(ret)?;
         Ok(Self(unsafe { Handle::from_raw(out) }))
     }
@@ -51,15 +49,13 @@ impl Vmo {
         if data.is_empty() {
             return Ok(0);
         }
-        let ret = unsafe {
-            raw::syscall4(
-                Syscall::VmoWrite,
-                self.0.raw() as u64,
-                offset,
-                data.as_ptr() as u64,
-                data.len() as u64,
-            )
-        };
+        let ret = raw::syscall4(
+            Syscall::VmoWrite,
+            self.0.raw() as u64,
+            offset,
+            data.as_ptr() as u64,
+            data.len() as u64,
+        );
         raw::decode(ret).map(|n| n as usize)
     }
 
@@ -69,15 +65,13 @@ impl Vmo {
         if buf.is_empty() {
             return Ok(0);
         }
-        let ret = unsafe {
-            raw::syscall4(
-                Syscall::VmoRead,
-                self.0.raw() as u64,
-                offset,
-                buf.as_mut_ptr() as u64,
-                buf.len() as u64,
-            )
-        };
+        let ret = raw::syscall4(
+            Syscall::VmoRead,
+            self.0.raw() as u64,
+            offset,
+            buf.as_mut_ptr() as u64,
+            buf.len() as u64,
+        );
         raw::decode(ret).map(|n| n as usize)
     }
 
