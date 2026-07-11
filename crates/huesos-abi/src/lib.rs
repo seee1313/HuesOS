@@ -95,13 +95,16 @@ pub enum Syscall {
     /// Request an orderly system shutdown. Kernel policy restricts this to
     /// the root userspace supervisor.
     SystemShutdown = 25,
+    /// Query a process exit code without blocking. Returns `ShouldWait` while
+    /// the process is still running.
+    ProcessGetExitCode = 26,
 }
 
 impl Syscall {
     /// Total number of defined syscalls (i.e. one past the highest
     /// currently-assigned number). The dispatcher uses this to reject
     /// obviously-out-of-range numbers before a `match`.
-    pub const COUNT: u64 = 26;
+    pub const COUNT: u64 = 27;
 
     /// Convert a raw syscall number back into a [`Syscall`], if valid.
     pub const fn from_raw(n: u64) -> Option<Self> {
@@ -132,6 +135,7 @@ impl Syscall {
             23 => Self::ChannelReadEtc,
             24 => Self::ClockGetMonotonic,
             25 => Self::SystemShutdown,
+            26 => Self::ProcessGetExitCode,
             _ => return None,
         })
     }
