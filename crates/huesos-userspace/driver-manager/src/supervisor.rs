@@ -42,6 +42,7 @@ impl DriverManager {
 
     /// Launch all MVP DriverHosts and wait until mandatory services are ready.
     pub fn start_driver_hosts(&mut self) {
+        self.describe_manifest();
         let bootfs = match self.fs.bootfs() {
             Some(b) => b,
             None => {
@@ -61,7 +62,11 @@ impl DriverManager {
         let n = match bootfs.read_file(manifest_path, &mut manifest_buf) {
             Ok(n) => n,
             Err(e) => {
-                println!("[driver-manager] failed to read manifest {}: {}", manifest_path, e.as_str());
+                println!(
+                    "[driver-manager] failed to read manifest {}: {}",
+                    manifest_path,
+                    e.as_str()
+                );
                 return;
             }
         };
@@ -69,7 +74,10 @@ impl DriverManager {
         let manifest = match crate::manifest::parse_hdriver(&manifest_buf[..n]) {
             Some(m) => m,
             None => {
-                println!("[driver-manager] failed to parse manifest {}", manifest_path);
+                println!(
+                    "[driver-manager] failed to parse manifest {}",
+                    manifest_path
+                );
                 return;
             }
         };
@@ -93,8 +101,8 @@ impl DriverManager {
         // 3. Launch DriverHost.
         // Prefer the build-time embedded ELF (reliable). Fall back to BOOTFS VMO
         // launch if embedding is unavailable for some reason.
-        let launched = libcanvas::process::spawn_elf(manifest.name_as_str(), INPUT_HOST_ELF).or_else(
-            |e| {
+        let launched = libcanvas::process::spawn_elf(manifest.name_as_str(), INPUT_HOST_ELF)
+            .or_else(|e| {
                 println!(
                     "[driver-manager] embedded launch failed ({}), trying BOOTFS VMO",
                     e.as_str()
@@ -107,8 +115,7 @@ impl DriverManager {
                     entry.offset,
                     entry.len,
                 )
-            },
-        );
+            });
         match launched {
             Ok((process, bootstrap)) => {
                 println!(
@@ -155,6 +162,21 @@ impl DriverManager {
             INPUT_HOST.irqs.len(),
             INPUT_HOST.io_ports.len()
         );
+        for service in INPUT_HOST.services {
+            println!(
+                "[driver-manager] capability: service={} required={}",
+                service.name, service.required as u8
+            );
+        }
+        for irq in INPUT_HOST.irqs {
+            println!("[driver-manager] capability: irq={}", irq);
+        }
+        for range in INPUT_HOST.io_ports {
+            println!(
+                "[driver-manager] capability: io={:#x}+{}",
+                range.base, range.len
+            );
+        }
     }
 
     fn wait_for_input_host_ready(&mut self) {
@@ -169,7 +191,6 @@ impl DriverManager {
         }
         println!("[driver-manager] input DriverHost did not become ready in time");
     }
-
 
     fn poll_init_bootstrap(&mut self, init_bootstrap: &Channel) {
         let mut buf = [0u8; 64];
@@ -205,8 +226,12 @@ impl DriverManager {
                 return;
             };
             match registry.read_into(&mut buf) {
-                Ok(n) if &buf[..n] == protocol::OPEN_KEYBOARD.as_bytes() => self.open_keyboard_service(),
-                Ok(n) if &buf[..n] == protocol::OPEN_FILESYSTEM.as_bytes() => self.open_filesystem_service(),
+                Ok(n) if &buf[..n] == protocol::OPEN_KEYBOARD.as_bytes() => {
+                    self.open_keyboard_service()
+                }
+                Ok(n) if &buf[..n] == protocol::OPEN_FILESYSTEM.as_bytes() => {
+                    self.open_filesystem_service()
+                }
                 Ok(_) => println!("[driver-manager] unknown registry request"),
                 Err(ErrorCode::ShouldWait) => return,
                 Err(e) => {
@@ -216,7 +241,6 @@ impl DriverManager {
             }
         }
     }
-
 
     fn open_filesystem_service(&mut self) {
         let Some(registry) = self.registry_channel.as_ref() else {
@@ -238,20 +262,32 @@ impl DriverManager {
         };
         match Channel::pair() {
             Ok((client_end, driver_end)) => {
-                if let Err(e) = input_host
-                    .bootstrap
-                    .write_handle(protocol::ATTACH_KEYBOARD_CLIENT.as_bytes(), driver_end.into_handle())
-                {
-                    println!("[driver-manager] failed to attach keyboard client: {}", e.as_str());
+                if let Err(e) = input_host.bootstrap.write_handle(
+                    protocol::ATTACH_KEYBOARD_CLIENT.as_bytes(),
+                    driver_end.into_handle(),
+                ) {
+                    println!(
+                        "[driver-manager] failed to attach keyboard client: {}",
+                        e.as_str()
+                    );
                     return;
                 }
-                if let Err(e) = registry.write_handle(protocol::KEYBOARD_CHANNEL.as_bytes(), client_end.into_handle()) {
-                    println!("[driver-manager] failed to return keyboard channel: {}", e.as_str());
+                if let Err(e) = registry.write_handle(
+                    protocol::KEYBOARD_CHANNEL.as_bytes(),
+                    client_end.into_handle(),
+                ) {
+                    println!(
+                        "[driver-manager] failed to return keyboard channel: {}",
+                        e.as_str()
+                    );
                     return;
                 }
                 println!("[driver-manager] opened keyboard service channel for client");
             }
-            Err(e) => println!("[driver-manager] failed to create keyboard service channel: {}", e.as_str()),
+            Err(e) => println!(
+                "[driver-manager] failed to create keyboard service channel: {}",
+                e.as_str()
+            ),
         }
     }
 
@@ -266,7 +302,10 @@ impl DriverManager {
                 Ok(n) => self.handle_input_host_message(&buf[..n]),
                 Err(ErrorCode::ShouldWait) => return,
                 Err(e) => {
-                    println!("[driver-manager] input host channel read failed: {}", e.as_str());
+                    println!(
+                        "[driver-manager] input host channel read failed: {}",
+                        e.as_str()
+                    );
                     return;
                 }
             }
@@ -277,7 +316,11 @@ impl DriverManager {
         if msg == protocol::INPUT_HOST_STARTING.as_bytes() {
             println!("[driver-manager] input DriverHost starting");
         } else if msg == protocol::KEYBOARD_SERVICE_READY.as_bytes() {
-            println!("[driver-manager] registered service keyboard from input-host");
+            let owner = self.registry.owner("keyboard").unwrap_or("unknown-host");
+            println!(
+                "[driver-manager] registered service keyboard from {}",
+                owner
+            );
             self.registry.mark_online("keyboard");
         } else if msg == protocol::INPUT_HOST_READY.as_bytes() {
             println!("[driver-manager] input DriverHost ready");
@@ -288,7 +331,7 @@ impl DriverManager {
             println!("[driver-manager] input DriverHost reported error");
         } else if msg == protocol::INPUT_HEARTBEAT.as_bytes() {
             self.heartbeat_count += 1;
-            if self.heartbeat_count <= 3 || self.heartbeat_count % 64 == 0 {
+            if self.heartbeat_count <= 3 || self.heartbeat_count.is_multiple_of(64) {
                 println!("[driver-manager] input heartbeat #{}", self.heartbeat_count);
             }
         } else {

@@ -48,6 +48,15 @@ impl ServiceRegistry {
         }
     }
 
+    /// Return the manifest owner for a registered service.
+    pub fn owner(&self, name: &str) -> Option<&'static str> {
+        self.services
+            .iter()
+            .flatten()
+            .find(|service| service.name == name)
+            .map(|service| service.host)
+    }
+
     /// Mark a service online.
     pub fn mark_online(&mut self, name: &str) {
         self.set_state(name, ServiceState::Online);

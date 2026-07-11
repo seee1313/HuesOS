@@ -22,18 +22,25 @@ pub struct Vmo {
 
 const PAGE_SIZE: usize = 4096;
 
+/// VMO allocation/resize failure.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum VmoError {
+    /// Physical memory could not satisfy the requested page count.
+    OutOfMemory,
+}
+
 impl Vmo {
     /// Create a VMO covering at least `size` bytes, backed by freshly
     /// allocated, zeroed physical frames.
     ///
-    /// Returns `Err(())` if the host is out of physical memory, instead of
+    /// Returns [`VmoError::OutOfMemory`] if the host is out of physical memory, instead of
     /// panicking: a userspace process requesting an oversized VMO (or many
     /// processes collectively exhausting memory) is an entirely ordinary,
     /// expected condition that must surface as a syscall error
     /// (`SyscallError::NoMemory`), not take down the whole kernel. Any
     /// frames already allocated before the failure are freed back to the
     /// PMM before returning, so a failed allocation never leaks memory.
-    pub fn new(size: usize) -> Result<Arc<Self>, ()> {
+    pub fn new(size: usize) -> Result<Arc<Self>, VmoError> {
         let koid = alloc_koid();
         let page_count = size.div_ceil(PAGE_SIZE).max(1);
         let mut frames = Vec::with_capacity(page_count);
@@ -44,7 +51,7 @@ impl Vmo {
                     for f in frames {
                         huesos_pmm::free_frame(f);
                     }
-                    return Err(());
+                    return Err(VmoError::OutOfMemory);
                 }
             };
             let virt = phys_to_virt(frame) as *mut u8;
@@ -129,12 +136,12 @@ impl Vmo {
     /// Grow the VMO to `new_size` bytes, allocating new physical frames as
     /// needed. Shrinking is not supported in the MVP.
     ///
-    /// Returns `Err(())` on out-of-memory instead of panicking (see
+    /// Returns [`VmoError::OutOfMemory`] instead of panicking (see
     /// [`Vmo::new`]'s docs for why). On failure, the VMO is left at
     /// whatever size it successfully grew to before running out of frames
     /// (still fully valid/usable at that smaller size) rather than in some
     /// half-initialized state.
-    pub fn set_size(&self, new_size: usize) -> Result<(), ()> {
+    pub fn set_size(&self, new_size: usize) -> Result<(), VmoError> {
         let mut size = self.size.lock();
         if new_size <= *size {
             return Ok(());
@@ -146,7 +153,7 @@ impl Vmo {
                 Ok(f) => f,
                 Err(_) => {
                     *size = frames.len() * PAGE_SIZE;
-                    return Err(());
+                    return Err(VmoError::OutOfMemory);
                 }
             };
             let virt = phys_to_virt(frame) as *mut u8;

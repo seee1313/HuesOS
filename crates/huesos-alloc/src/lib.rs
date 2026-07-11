@@ -29,6 +29,11 @@ struct FreeBlock {
 }
 
 impl<const ORDER: usize> BuddyAllocator<ORDER> {
+    /// Construct a buddy allocator over caller-owned memory.
+    ///
+    /// # Safety
+    /// The complete range must be writable, page-aligned, exclusively owned by
+    /// this allocator, and remain valid until all allocations are released.
     pub unsafe fn new(base_addr: usize, total_pages: usize, page_size: usize) -> Self {
         let mut allocator = Self {
             free_lists: [core::ptr::null_mut(); ORDER],
@@ -42,12 +47,18 @@ impl<const ORDER: usize> BuddyAllocator<ORDER> {
 
         while remaining_pages > 0 {
             let mut order = ORDER - 1;
-            while order > 0 && (remaining_pages < (1 << order) || current_offset % (1 << order) != 0) {
+            while order > 0
+                && (remaining_pages < (1 << order) || current_offset % (1 << order) != 0)
+            {
                 order -= 1;
             }
 
             let block_ptr = (base_addr + current_offset * page_size) as *mut FreeBlock;
-            debug_assert_eq!(block_ptr as usize % (1 << order), 0, "block not aligned to its order");
+            debug_assert_eq!(
+                block_ptr as usize % (1 << order),
+                0,
+                "block not aligned to its order"
+            );
             allocator.push_free_block(order, block_ptr);
 
             current_offset += 1 << order;
@@ -67,7 +78,12 @@ impl<const ORDER: usize> BuddyAllocator<ORDER> {
         debug_assert!((ptr as usize) >= self.base_addr, "ptr below base");
         debug_assert!((ptr as usize) < end, "ptr above end");
         debug_assert_eq!((ptr as usize) % self.page_size, 0, "ptr not page-aligned");
-        debug_assert_eq!((ptr as usize) % (1 << order), 0, "ptr not aligned to order {}", order);
+        debug_assert_eq!(
+            (ptr as usize) % (1 << order),
+            0,
+            "ptr not aligned to order {}",
+            order
+        );
         unsafe {
             (*ptr).next = self.free_lists[order];
             self.free_lists[order] = ptr;
@@ -82,15 +98,26 @@ impl<const ORDER: usize> BuddyAllocator<ORDER> {
         let end = self.base_addr + self.total_pages * self.page_size;
         debug_assert!((ptr as usize) >= self.base_addr, "popped ptr below base");
         debug_assert!((ptr as usize) < end, "popped ptr above end");
-        debug_assert_eq!((ptr as usize) % (1 << order), 0, "popped ptr not aligned to order {}", order);
-        unsafe { self.free_lists[order] = (*ptr).next; }
+        debug_assert_eq!(
+            (ptr as usize) % (1 << order),
+            0,
+            "popped ptr not aligned to order {}",
+            order
+        );
+        unsafe {
+            self.free_lists[order] = (*ptr).next;
+        }
         Some(ptr)
     }
 
     pub fn allocate(&mut self, pages: usize) -> Result<usize, AllocError> {
-        if pages == 0 { return Err(AllocError::InvalidSize); }
+        if pages == 0 {
+            return Err(AllocError::InvalidSize);
+        }
         let order = pages.next_power_of_two().trailing_zeros() as usize;
-        if order >= ORDER { return Err(AllocError::OutOfMemory); }
+        if order >= ORDER {
+            return Err(AllocError::OutOfMemory);
+        }
 
         for i in order..ORDER {
             if let Some(block) = self.pop_free_block(i) {
@@ -100,29 +127,62 @@ impl<const ORDER: usize> BuddyAllocator<ORDER> {
                     let size = self.order_bytes(j);
                     // Lower buddy is at `current`, upper buddy is at `current + size`.
                     let upper = (current as usize + size) as *mut FreeBlock;
-                    debug_assert!((upper as usize) >= self.base_addr, "upper buddy below base at order {}", j);
-                    debug_assert!((upper as usize) < self.base_addr + self.total_pages * self.page_size, "upper buddy above end at order {}", j);
-                    debug_assert_eq!((upper as usize) % (1 << j), 0, "upper buddy not aligned to order {}", j);
+                    debug_assert!(
+                        (upper as usize) >= self.base_addr,
+                        "upper buddy below base at order {}",
+                        j
+                    );
+                    debug_assert!(
+                        (upper as usize) < self.base_addr + self.total_pages * self.page_size,
+                        "upper buddy above end at order {}",
+                        j
+                    );
+                    debug_assert_eq!(
+                        (upper as usize) % (1 << j),
+                        0,
+                        "upper buddy not aligned to order {}",
+                        j
+                    );
                     // Push LOWER buddy (current) onto free list
                     self.push_free_block(j, current);
                     // Continue splitting the UPPER buddy
                     current = upper;
                 }
                 let result = current as usize;
-                debug_assert_eq!(result % (1 << order), 0, "result not aligned to requested order");
+                debug_assert_eq!(
+                    result % (1 << order),
+                    0,
+                    "result not aligned to requested order"
+                );
                 return Ok(result);
             }
         }
         Err(AllocError::OutOfMemory)
     }
 
+    /// Return a block previously produced by [`Self::allocate`].
+    ///
+    /// # Safety
+    /// `ptr` must be live, uniquely allocated by this instance, and `pages`
+    /// must match the original request. Double-free or mismatched size corrupts
+    /// the embedded free list.
     pub unsafe fn deallocate(&mut self, ptr: usize, pages: usize) {
         let order = pages.next_power_of_two().trailing_zeros() as usize;
-        if order >= ORDER { return; }
+        if order >= ORDER {
+            return;
+        }
 
         debug_assert!(ptr >= self.base_addr, "dealloc ptr below base");
-        debug_assert!(ptr < self.base_addr + self.total_pages * self.page_size, "dealloc ptr above end");
-        debug_assert_eq!(ptr % (1 << order), 0, "dealloc ptr not aligned to order {}", order);
+        debug_assert!(
+            ptr < self.base_addr + self.total_pages * self.page_size,
+            "dealloc ptr above end"
+        );
+        debug_assert_eq!(
+            ptr % (1 << order),
+            0,
+            "dealloc ptr not aligned to order {}",
+            order
+        );
 
         let mut current_ptr = ptr as *mut FreeBlock;
         let mut current_order = order;
@@ -132,13 +192,29 @@ impl<const ORDER: usize> BuddyAllocator<ORDER> {
             let buddy_offset = (current_ptr as usize - self.base_addr) ^ block_size;
             let buddy_ptr = (self.base_addr + buddy_offset) as *mut FreeBlock;
 
-            debug_assert!((buddy_ptr as usize) >= self.base_addr, "dealloc buddy below base at order {}", current_order);
-            debug_assert!((buddy_ptr as usize) < self.base_addr + self.total_pages * self.page_size, "dealloc buddy above end at order {}", current_order);
-            debug_assert_eq!((buddy_ptr as usize) % (1 << current_order), 0, "dealloc buddy not aligned");
+            debug_assert!(
+                (buddy_ptr as usize) >= self.base_addr,
+                "dealloc buddy below base at order {}",
+                current_order
+            );
+            debug_assert!(
+                (buddy_ptr as usize) < self.base_addr + self.total_pages * self.page_size,
+                "dealloc buddy above end at order {}",
+                current_order
+            );
+            debug_assert_eq!(
+                (buddy_ptr as usize) % (1 << current_order),
+                0,
+                "dealloc buddy not aligned"
+            );
 
             if self.is_block_free(current_order, buddy_ptr) {
                 self.remove_free_block(current_order, buddy_ptr);
-                current_ptr = if (current_ptr as usize) < (buddy_ptr as usize) { current_ptr } else { buddy_ptr };
+                current_ptr = if (current_ptr as usize) < (buddy_ptr as usize) {
+                    current_ptr
+                } else {
+                    buddy_ptr
+                };
                 current_order += 1;
             } else {
                 break;
@@ -150,8 +226,12 @@ impl<const ORDER: usize> BuddyAllocator<ORDER> {
     fn is_block_free(&self, order: usize, ptr: *mut FreeBlock) -> bool {
         let mut curr = self.free_lists[order];
         while !curr.is_null() {
-            if curr == ptr { return true; }
-            unsafe { curr = (*curr).next; }
+            if curr == ptr {
+                return true;
+            }
+            unsafe {
+                curr = (*curr).next;
+            }
         }
         false
     }
@@ -161,12 +241,20 @@ impl<const ORDER: usize> BuddyAllocator<ORDER> {
         while unsafe { !(*curr).is_null() } {
             let node = unsafe { *curr };
             if node == ptr {
-                unsafe { *curr = (*node).next; }
+                unsafe {
+                    *curr = (*node).next;
+                }
                 return;
             }
-            unsafe { curr = &mut (*node).next as *mut *mut FreeBlock; }
+            unsafe {
+                curr = &mut (*node).next as *mut *mut FreeBlock;
+            }
         }
-        debug_assert!(false, "remove_free_block: buddy not found in free list at order {}", order);
+        debug_assert!(
+            false,
+            "remove_free_block: buddy not found in free list at order {}",
+            order
+        );
     }
 }
 
@@ -180,33 +268,63 @@ pub struct Slab {
 }
 
 #[repr(C)]
-pub struct SlabSlot { pub next: Option<*mut SlabSlot> }
+pub struct SlabSlot {
+    pub next: Option<*mut SlabSlot>,
+}
 
 impl Slab {
+    /// Build a slab over freshly allocated pages.
+    ///
+    /// # Safety
+    /// The page range must be writable, exclusively owned, suitably aligned,
+    /// and large enough for every generated slot pointer.
     pub unsafe fn new(page_start: usize, slot_size: usize, total_pages: usize) -> Self {
         let total_slots = (total_pages * 4096) / slot_size;
-        let mut slab = Self { page_start, slot_size, free_list: None, used_slots: 0, total_slots };
+        let mut slab = Self {
+            page_start,
+            slot_size,
+            free_list: None,
+            used_slots: 0,
+            total_slots,
+        };
         for i in 0..total_slots {
             let p = (page_start + i * slot_size) as *mut SlabSlot;
-            slab.push_slot(p);
+            unsafe { slab.push_slot(p) };
         }
         slab
     }
-    pub fn push_slot(&mut self, slot: *mut SlabSlot) {
-        unsafe { (*slot).next = self.free_list; self.free_list = Some(slot); }
+    /// Link a valid free slot into this slab.
+    ///
+    /// # Safety
+    /// `slot` must be aligned, writable, inside this slab, and not currently
+    /// present in the free list.
+    unsafe fn push_slot(&mut self, slot: *mut SlabSlot) {
+        unsafe {
+            (*slot).next = self.free_list;
+            self.free_list = Some(slot);
+        }
     }
     pub fn pop_slot(&mut self) -> Option<usize> {
         let slot = self.free_list?;
-        unsafe { self.free_list = (*slot).next; }
+        unsafe {
+            self.free_list = (*slot).next;
+        }
         self.used_slots += 1;
         Some(slot as usize)
     }
+    /// Return one live slot to this slab.
+    ///
+    /// # Safety
+    /// `ptr` must identify a currently allocated slot in this slab and must
+    /// not have been freed already.
     pub unsafe fn free_slot(&mut self, ptr: usize) {
         let p = ptr as *mut SlabSlot;
-        self.push_slot(p);
+        unsafe { self.push_slot(p) };
         self.used_slots -= 1;
     }
-    pub fn is_full(&self) -> bool { self.used_slots == self.total_slots }
+    pub fn is_full(&self) -> bool {
+        self.used_slots == self.total_slots
+    }
 }
 
 pub struct SlabCache {
@@ -216,13 +334,16 @@ pub struct SlabCache {
 
 impl SlabCache {
     pub fn new(slot_size: usize) -> Self {
-        Self { slot_size, slabs: [const { None }; 16] }
+        Self {
+            slot_size,
+            slabs: [const { None }; 16],
+        }
     }
     pub fn allocate<B: BuddyProvider>(&mut self, buddy: &mut B) -> Result<usize, AllocError> {
-        for s in &mut self.slabs {
-            if let Some(slab) = s {
-                if !slab.is_full() {
-                    if let Some(p) = slab.pop_slot() { return Ok(p); }
+        for slab in self.slabs.iter_mut().flatten() {
+            if !slab.is_full() {
+                if let Some(pointer) = slab.pop_slot() {
+                    return Ok(pointer);
                 }
             }
         }
@@ -238,14 +359,17 @@ impl SlabCache {
         }
         Err(AllocError::OutOfMemory)
     }
+    /// Return a slot to the slab that owns its address.
+    ///
+    /// # Safety
+    /// `ptr` must be a live slot allocated by this cache. The caller must
+    /// prevent double-free and size-class mismatch.
     pub unsafe fn deallocate(&mut self, ptr: usize) {
-        for s in &mut self.slabs {
-            if let Some(slab) = s {
-                let end = slab.page_start + slab.total_slots * slab.slot_size;
-                if ptr >= slab.page_start && ptr < end {
-                    slab.free_slot(ptr);
-                    return;
-                }
+        for slab in self.slabs.iter_mut().flatten() {
+            let end = slab.page_start + slab.total_slots * slab.slot_size;
+            if ptr >= slab.page_start && ptr < end {
+                unsafe { slab.free_slot(ptr) };
+                return;
             }
         }
     }
@@ -259,21 +383,40 @@ pub struct SlabAllocator {
     pub caches: [SlabCache; 8],
 }
 
+impl Default for SlabAllocator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SlabAllocator {
     pub fn new() -> Self {
         let sizes = [16, 32, 64, 128, 256, 512, 1024, 2048];
-        Self { caches: sizes.map(SlabCache::new) }
+        Self {
+            caches: sizes.map(SlabCache::new),
+        }
     }
     fn get_cache_idx(size: usize) -> Option<usize> {
-        [16,32,64,128,256,512,1024,2048].iter().position(|&s| s >= size)
+        [16, 32, 64, 128, 256, 512, 1024, 2048]
+            .iter()
+            .position(|&s| s >= size)
     }
-    pub fn allocate<B: BuddyProvider>(&mut self, size: usize, buddy: &mut B) -> Result<usize, AllocError> {
+    pub fn allocate<B: BuddyProvider>(
+        &mut self,
+        size: usize,
+        buddy: &mut B,
+    ) -> Result<usize, AllocError> {
         let idx = Self::get_cache_idx(size).ok_or(AllocError::InvalidSize)?;
         self.caches[idx].allocate(buddy)
     }
+    /// Return an allocation to its size-class cache.
+    ///
+    /// # Safety
+    /// `ptr` must be live and `size` must select the same cache used during
+    /// allocation. The pointer must not be freed more than once.
     pub unsafe fn deallocate(&mut self, ptr: usize, size: usize) {
         if let Some(idx) = Self::get_cache_idx(size) {
-            self.caches[idx].deallocate(ptr);
+            unsafe { self.caches[idx].deallocate(ptr) };
         }
     }
 }

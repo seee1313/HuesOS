@@ -3,11 +3,13 @@
 
 use core::panic::PanicInfo;
 
-use limine::request::{FramebufferRequest, HhdmRequest, MemmapRequest, RsdpRequest, ModulesRequest, StackSizeRequest};
+use limine::request::{
+    FramebufferRequest, HhdmRequest, MemmapRequest, ModulesRequest, RsdpRequest, StackSizeRequest,
+};
 use limine::{BaseRevision, RequestsEndMarker, RequestsStartMarker};
 
+use huesos_kernel::{kmain, BootInfo, FramebufferInfo};
 use huesos_pmm::MemoryRegion;
-use huesos_kernel::{BootInfo, FramebufferInfo, kmain};
 
 #[used]
 #[unsafe(link_section = ".requests")]
@@ -45,9 +47,17 @@ static MODULES_REQUEST: ModulesRequest = ModulesRequest::new();
 #[unsafe(link_section = ".requests")]
 static STACK_SIZE_REQUEST: StackSizeRequest = StackSizeRequest::new(1024 * 1024); // 1 MiB stack
 
+/// Limine entry point for the BSP.
+///
+/// # Safety
+/// Limine must invoke this symbol once with its documented base revision,
+/// active long-mode page tables, stack, and response structures still valid.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn kmain_entry() -> ! {
-    assert!(BASE_REVISION.is_supported(), "unsupported Limine base revision");
+    assert!(
+        BASE_REVISION.is_supported(),
+        "unsupported Limine base revision"
+    );
 
     huesos_arch::serial::init();
     log_line("[HuesOS] Bootloader handed over control");
@@ -55,7 +65,9 @@ pub unsafe extern "C" fn kmain_entry() -> ! {
     let hhdm_offset = HHDM_REQUEST.response().map(|r| r.offset).unwrap_or(0);
     assert!(hhdm_offset != 0, "Limine did not provide an HHDM offset");
 
-    let memmap_response = MEMMAP_REQUEST.response().expect("Limine did not provide a memory map");
+    let memmap_response = MEMMAP_REQUEST
+        .response()
+        .expect("Limine did not provide a memory map");
     let entries = memmap_response.entries();
 
     const MAX_REGIONS: usize = 128;

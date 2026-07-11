@@ -19,6 +19,13 @@ mod font8x8;
 use huesos_abi::FramebufferInfo as AbiFramebufferInfo;
 use spin::Mutex;
 
+/// Framebuffer operation failure.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FramebufferError {
+    /// No framebuffer was supplied by the boot environment.
+    Unavailable,
+}
+
 /// Raw framebuffer geometry as received from the bootloader.
 #[derive(Clone, Copy)]
 pub struct FramebufferConfig {
@@ -111,7 +118,9 @@ impl Framebuffer {
         }
     }
 
-    fn fill_rect(&mut self, x: u32, y: u32, w: u32, h: u32, r: u8, g: u8, b: u8) {
+    fn fill_rect(&mut self, rect: (u32, u32, u32, u32), color: (u8, u8, u8)) {
+        let (x, y, w, h) = rect;
+        let (r, g, b) = color;
         let packed = self.pack_color(r, g, b);
         let x_end = (x.saturating_add(w)).min(self.config.width);
         let y_end = (y.saturating_add(h)).min(self.config.height);
@@ -228,7 +237,8 @@ impl core::fmt::Write for PanicConsole {
             if self.y.saturating_add(8) > self.framebuffer.config.height {
                 break;
             }
-            self.framebuffer.draw_glyph(self.x, self.y, ch, 255, 255, 255);
+            self.framebuffer
+                .draw_glyph(self.x, self.y, ch, 255, 255, 255);
             self.x = self.x.saturating_add(8);
         }
         Ok(())
@@ -255,7 +265,7 @@ pub fn panic_render(args: core::fmt::Arguments<'_>) {
     let height = console.framebuffer.config.height;
     console
         .framebuffer
-        .fill_rect(0, 0, width, height, 150, 0, 0);
+        .fill_rect((0, 0, width, height), (150, 0, 0));
     let _ = console.write_str("HuesOS KERNEL PANIC\n\n");
     let _ = console.write_fmt(args);
 }
@@ -268,7 +278,7 @@ pub fn shutdown_render() {
     let mut framebuffer = Framebuffer { config };
     let width = framebuffer.config.width;
     let height = framebuffer.config.height;
-    framebuffer.fill_rect(0, 0, width, height, 5, 10, 20);
+    framebuffer.fill_rect((0, 0, width, height), (5, 10, 20));
 
     let title = "HuesOS has been safely halted";
     let message = "It is now safe to power off your computer.";
@@ -314,7 +324,7 @@ pub fn set_pixel(x: u32, y: u32, r: u8, g: u8, b: u8) {
 /// framebuffer's bounds; a rectangle entirely off-screen is a silent no-op.
 pub fn fill_rect(x: u32, y: u32, w: u32, h: u32, r: u8, g: u8, b: u8) {
     if let Some(fb) = FRAMEBUFFER.lock().as_mut() {
-        fb.fill_rect(x, y, w, h, r, g, b);
+        fb.fill_rect((x, y, w, h), (r, g, b));
     }
 }
 
@@ -337,10 +347,16 @@ pub fn draw_text(x: u32, y: u32, text: &str, r: u8, g: u8, b: u8) {
 /// beyond, regardless of what `src_w`/`src_h` claim), and the destination
 /// rectangle is clipped to the real framebuffer bounds before any write
 /// happens.
-pub fn blit(dst_x: u32, dst_y: u32, src_w: u32, src_h: u32, src: &[u8]) -> Result<(), ()> {
+pub fn blit(
+    dst_x: u32,
+    dst_y: u32,
+    src_w: u32,
+    src_h: u32,
+    src: &[u8],
+) -> Result<(), FramebufferError> {
     let mut guard = FRAMEBUFFER.lock();
     let Some(fb) = guard.as_mut() else {
-        return Err(());
+        return Err(FramebufferError::Unavailable);
     };
     fb.blit(dst_x, dst_y, src_w, src_h, src);
     Ok(())
@@ -412,7 +428,7 @@ mod tests {
         let (backing, mut fb) = make_test_fb(8, 8, 8 * 4);
         // Rectangle partially off both edges; must not panic and must only
         // paint the on-screen portion.
-        fb.fill_rect(5, 5, 100, 100, 10, 20, 30);
+        fb.fill_rect((5, 5, 100, 100), (10, 20, 30));
         assert_eq!(read_pixel(&backing, &fb, 5, 5), (10, 20, 30));
         assert_eq!(read_pixel(&backing, &fb, 7, 7), (10, 20, 30));
         assert_eq!(read_pixel(&backing, &fb, 4, 4), (0, 0, 0)); // just outside the rect
@@ -453,7 +469,10 @@ mod tests {
         let (_backing, mut fb) = make_test_fb(16, 16, 16 * 4);
         let src = vec![1u8, 2, 3, 4]; // one pixel's worth, claiming far more
         let rows = fb.blit(0, 0, 10, 10, &src);
-        assert_eq!(rows, 0, "must not report rows copied from an undersized buffer");
+        assert_eq!(
+            rows, 0,
+            "must not report rows copied from an undersized buffer"
+        );
     }
 
     #[test]
@@ -461,7 +480,10 @@ mod tests {
         assert!(font8x8::glyph('A').is_some());
         assert!(font8x8::glyph('~').is_some());
         assert!(font8x8::glyph(' ').is_some());
-        assert!(font8x8::glyph('\u{1F600}').is_none(), "non-ASCII must return None");
+        assert!(
+            font8x8::glyph('\u{1F600}').is_none(),
+            "non-ASCII must return None"
+        );
     }
 
     #[test]

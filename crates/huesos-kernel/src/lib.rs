@@ -10,23 +10,22 @@
 
 extern crate alloc;
 
+pub mod boot;
 pub mod init;
+pub mod mem;
+pub mod panic;
 pub mod process;
 pub mod scheduler;
 pub mod shutdown;
 pub mod smp;
 pub mod task;
-pub mod mem;
-pub mod panic;
-pub mod boot;
 
 pub use huesos_pmm::MemoryRegion;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 pub static INIT_BINARY: &[u8] = include_bytes!(env!("HUESOS_INIT_PATH"));
-static INIT_PROCESS_KOID: core::sync::atomic::AtomicU64 =
-    core::sync::atomic::AtomicU64::new(0);
+static INIT_PROCESS_KOID: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 pub(crate) fn init_process_koid() -> u64 {
     INIT_PROCESS_KOID.load(core::sync::atomic::Ordering::Acquire)
@@ -55,6 +54,12 @@ pub struct BootInfo<'a> {
     pub rsdp_addr: Option<u64>,
 }
 
+/// Enter the kernel core from the boot protocol adapter.
+///
+/// # Safety
+/// Call exactly once on the BSP in x86_64 long mode. Every pointer/range in
+/// `boot_info` must remain valid through early initialization and describe the
+/// active HHDM, firmware tables, framebuffer, modules, and memory map.
 pub unsafe fn kmain(boot_info: BootInfo) -> ! {
     huesos_arch::init_early();
     init::pmm_init(boot_info.memory_regions, boot_info.hhdm_offset);
@@ -64,7 +69,7 @@ pub unsafe fn kmain(boot_info: BootInfo) -> ! {
         let phys_addr = hbi_data.as_ptr() as u64 - boot_info.hhdm_offset;
         let length = hbi_data.len() as u64;
         huesos_pmm::reserve_range(phys_addr, length);
-        
+
         use core::fmt::Write;
         let mut writer = huesos_arch::serial::SerialWriter;
         let _ = writeln!(
@@ -82,9 +87,7 @@ pub unsafe fn kmain(boot_info: BootInfo) -> ! {
     init::map_firmware_tables(boot_info.memory_regions, boot_info.rsdp_addr);
 
     init::heap_init();
-    let panic_test_requested = boot_info
-        .hbi_image
-        .is_some_and(cmdline_requests_panic_test);
+    let panic_test_requested = boot_info.hbi_image.is_some_and(cmdline_requests_panic_test);
     init::object_init();
 
     if let Some(rsdp) = boot_info.rsdp_addr {
@@ -128,7 +131,12 @@ pub unsafe fn kmain(boot_info: BootInfo) -> ! {
 fn log_boot_banner(boot_info: &BootInfo) {
     use core::fmt::Write;
     let mut writer = huesos_arch::serial::SerialWriter;
-    let _ = writeln!(&mut writer, "HuesOS v{} on CPU {}", VERSION, huesos_arch::cpu::current_id());
+    let _ = writeln!(
+        &mut writer,
+        "HuesOS v{} on CPU {}",
+        VERSION,
+        huesos_arch::cpu::current_id()
+    );
     let _ = writeln!(
         &mut writer,
         "PMM: {}/{} frames ({} MiB)",
@@ -151,7 +159,11 @@ fn spawn_init_process() {
     );
     let name = *b"init\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0";
     let _ = scheduler::spawn_user_thread(
-        &name, spawned.process, spawned.entry_point, spawned.user_rsp, spawned.cr3,
+        &name,
+        spawned.process,
+        spawned.entry_point,
+        spawned.user_rsp,
+        spawned.cr3,
     );
 }
 
@@ -191,9 +203,7 @@ fn handle_user_fault(info: huesos_arch::fault::FaultInfo) -> ! {
         huesos_arch::fault::FaultKind::InvalidOpcode => huesos_abi::fault_exit::INVALID_OPCODE,
         huesos_arch::fault::FaultKind::DivideError => huesos_abi::fault_exit::DIVIDE_ERROR,
         huesos_arch::fault::FaultKind::AlignmentCheck => huesos_abi::fault_exit::ALIGNMENT_CHECK,
-        huesos_arch::fault::FaultKind::DoubleFault => {
-            crate::panic::from_cpu_fault(info)
-        }
+        huesos_arch::fault::FaultKind::DoubleFault => crate::panic::from_cpu_fault(info),
     };
 
     let mut writer = huesos_arch::serial::SerialWriter;

@@ -21,9 +21,9 @@
 pub mod wavl;
 
 use crate::task::{Task, TaskKind};
+use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use alloc::boxed::Box;
 use core::sync::atomic::Ordering;
 use huesos_object::{KernelObject, Process};
 use x86_64::VirtAddr;
@@ -36,8 +36,7 @@ pub const MAX_CPUS: usize = 64;
 static ONLINE_CPUS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 /// Hardware-timer-driven monotonic clock. Only CPU 0 advances it, so SMP does
 /// not make time run faster. Cooperative yields never affect this clock.
-static MONOTONIC_TICKS: core::sync::atomic::AtomicU64 =
-    core::sync::atomic::AtomicU64::new(0);
+static MONOTONIC_TICKS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 /// Mark the current CPU as online for task placement.
 pub fn mark_cpu_online() {
@@ -85,6 +84,9 @@ static PER_CPU_SCHEDULERS: [spin::Mutex<Scheduler>; MAX_CPUS] =
     [const { spin::Mutex::new(Scheduler::new()) }; MAX_CPUS];
 
 struct Scheduler {
+    // Box keeps Context addresses stable while other tasks are appended and
+    // the Vec reallocates during a suspended context switch.
+    #[allow(clippy::vec_box)]
     tasks: Vec<Box<Task>>,
     current: usize,
     fair_queue: wavl::WavlTree,
@@ -152,12 +154,8 @@ impl Scheduler {
         // 2. Update stats for currently running task
         if self.current > 0 {
             let task_id = self.tasks[self.current].id;
-            let finished = self.tasks[self.current]
-                .finished
-                .load(Ordering::Relaxed);
-            let blocked = self.tasks[self.current]
-                .blocked
-                .load(Ordering::Relaxed);
+            let finished = self.tasks[self.current].finished.load(Ordering::Relaxed);
+            let blocked = self.tasks[self.current].blocked.load(Ordering::Relaxed);
 
             match &mut self.tasks[self.current].sched_policy {
                 SchedPolicy::Fair { weight, vruntime } => {
@@ -167,7 +165,9 @@ impl Scheduler {
                         self.fair_queue.insert(*vruntime, task_id);
                     }
                 }
-                SchedPolicy::Deadline { remaining_budget, .. } => {
+                SchedPolicy::Deadline {
+                    remaining_budget, ..
+                } => {
                     *remaining_budget = remaining_budget.saturating_sub(1);
                 }
             }
@@ -221,8 +221,8 @@ impl Scheduler {
         self.current = next_idx;
         self.apply_task_environment(self.current);
 
-        let old_ptr = &raw mut (*self.tasks[old_index]).context;
-        let new_ptr = &raw const (*self.tasks[self.current]).context;
+        let old_ptr = &raw mut self.tasks[old_index].context;
+        let new_ptr = &raw const self.tasks[self.current].context;
 
         Some((old_ptr, new_ptr))
     }
@@ -323,8 +323,8 @@ pub fn park_current() {
             let old = guard.current;
             guard.current = 0;
             guard.apply_task_environment(0);
-            let old_ptr = &raw mut (*guard.tasks[old]).context;
-            let new_ptr = &raw const (*guard.tasks[0]).context;
+            let old_ptr = &raw mut guard.tasks[old].context;
+            let new_ptr = &raw const guard.tasks[0].context;
             Some((old_ptr, new_ptr))
         });
         drop(guard);
@@ -371,9 +371,6 @@ pub fn wake_task(task_id: u64) {
     }
 }
 
-/// Mark current task finished, set process exit code, enqueue for reaping,
-/// and switch away. Never returns.
-
 /// Get current task id for debugging.
 pub fn current_task_id() -> Option<u64> {
     let guard = PER_CPU_SCHEDULERS[cpu_id()].lock();
@@ -392,11 +389,11 @@ fn find_best_cpu() -> usize {
     let mut min_tasks = usize::MAX;
     let mask = ONLINE_CPUS.load(Ordering::SeqCst);
 
-    for i in 0..MAX_CPUS {
+    for (i, scheduler) in PER_CPU_SCHEDULERS.iter().enumerate() {
         if (mask & (1u64 << i)) == 0 {
             continue;
         }
-        let guard = PER_CPU_SCHEDULERS[i].lock();
+        let guard = scheduler.lock();
         let count = guard.tasks.len();
         // Prefer the least-loaded online CPU that already has at least an idle task.
         if count >= 1 && count < min_tasks {
@@ -414,16 +411,14 @@ pub fn set_sched_policy(task_id: u64, policy: SchedPolicy) {
     let idx = (task_id & 0xFFFFFFFF) as usize;
     if cpu < MAX_CPUS {
         let mut guard = PER_CPU_SCHEDULERS[cpu].lock();
-        
+
         let mut old_policy = None;
         if let Some(task) = guard.tasks.get(idx) {
             old_policy = Some(task.sched_policy);
         }
-        
-        if let Some(old_policy_val) = old_policy {
-            if let SchedPolicy::Fair { vruntime, .. } = old_policy_val {
-                guard.fair_queue.remove(vruntime, task_id);
-            }
+
+        if let Some(SchedPolicy::Fair { vruntime, .. }) = old_policy {
+            guard.fair_queue.remove(vruntime, task_id);
         }
 
         if let Some(task) = guard.tasks.get_mut(idx) {
@@ -556,8 +551,8 @@ pub fn terminate_current_process(code: i64) -> ! {
     process.set_exit_code(code);
     let process_koid = process.koid();
 
-    for cpu in 0..MAX_CPUS {
-        let mut guard = PER_CPU_SCHEDULERS[cpu].lock();
+    for scheduler in &PER_CPU_SCHEDULERS {
+        let mut guard = scheduler.lock();
         for idx in 0..guard.tasks.len() {
             let matched = match &guard.tasks[idx].kind {
                 TaskKind::User { process } => process.koid() == process_koid,

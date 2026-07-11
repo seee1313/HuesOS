@@ -10,19 +10,19 @@ use spin::Mutex;
 /// Scheduler task identifier (matches `Task::id`).
 pub type TaskId = u64;
 
-static CURRENT_TASK_FN: Mutex<Option<fn() -> Option<TaskId>>> = Mutex::new(None);
-static PARK_FN: Mutex<Option<fn()>> = Mutex::new(None);
-static WAKE_FN: Mutex<Option<fn(TaskId)>> = Mutex::new(None);
+type CurrentTaskFn = fn() -> Option<TaskId>;
+type ParkFn = fn();
+type WakeFn = fn(TaskId);
+
+static CURRENT_TASK_FN: Mutex<Option<CurrentTaskFn>> = Mutex::new(None);
+static PARK_FN: Mutex<Option<ParkFn>> = Mutex::new(None);
+static WAKE_FN: Mutex<Option<WakeFn>> = Mutex::new(None);
 /// Monotonic tick counter (scheduler ticks), for wait timeouts.
 static TICKS_FN: Mutex<Option<fn() -> u64>> = Mutex::new(None);
 
 /// Register scheduler hooks. Called once from kernel init after the
 /// scheduler exists.
-pub fn set_scheduler_hooks(
-    current_task: fn() -> Option<TaskId>,
-    park: fn(),
-    wake: fn(TaskId),
-) {
+pub fn set_scheduler_hooks(current_task: fn() -> Option<TaskId>, park: fn(), wake: fn(TaskId)) {
     *CURRENT_TASK_FN.lock() = Some(current_task);
     *PARK_FN.lock() = Some(park);
     *WAKE_FN.lock() = Some(wake);
@@ -69,7 +69,7 @@ impl WaitQueue {
     /// Enqueue `task` if not already waiting.
     pub fn enqueue(&self, task: TaskId) {
         let mut w = self.waiters.lock();
-        if !w.iter().any(|&t| t == task) {
+        if !w.contains(&task) {
             w.push(task);
         }
     }

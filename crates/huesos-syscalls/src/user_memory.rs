@@ -26,7 +26,7 @@ pub(crate) fn validate_range(addr: u64, len: usize, write: bool) -> Result<(), E
     if len == 0 {
         return Ok(());
     }
-    if addr < USER_ASPACE_BASE || addr >= USER_ASPACE_END {
+    if !(USER_ASPACE_BASE..USER_ASPACE_END).contains(&addr) {
         return Err(ErrorCode::InvalidArgs);
     }
     let end = addr.checked_add(len as u64).ok_or(ErrorCode::InvalidArgs)?;

@@ -82,11 +82,15 @@ impl DirectoryEntry {
     pub fn is_free(&self) -> bool {
         self.name[0] == 0x00 || self.name[0] == 0xE5
     }
-    pub fn is_directory(&self) -> bool { (self.attr & 0x10) != 0 }
+    pub fn is_directory(&self) -> bool {
+        (self.attr & 0x10) != 0
+    }
     pub fn first_cluster(&self) -> u32 {
         ((self.first_cluster_hi as u32) << 16) | (self.first_cluster_lo as u32)
     }
-    pub fn is_volume_label(&self) -> bool { (self.attr & 0x08) != 0 }
+    pub fn is_volume_label(&self) -> bool {
+        (self.attr & 0x08) != 0
+    }
 }
 
 pub struct FatFileSystem<'a, D: BlockDevice> {
@@ -101,23 +105,34 @@ impl<'a, D: BlockDevice> FatFileSystem<'a, D> {
         device.read_sector(0, &mut boot)?;
 
         let bpb = unsafe { core::ptr::read_unaligned(boot.as_ptr() as *const FatBpb) };
-        if bpb.bytes_per_sector != 512 { return Err(DriverError::InvalidFat); }
+        if bpb.bytes_per_sector != 512 {
+            return Err(DriverError::InvalidFat);
+        }
 
-        Ok(Self { device, bpb, is_fat32: bpb.fat_size_16 == 0 })
+        Ok(Self {
+            device,
+            bpb,
+            is_fat32: bpb.fat_size_16 == 0,
+        })
     }
 
-    fn fat_offset(&self) -> u32 { self.bpb.reserved_sectors as u32 }
+    fn fat_offset(&self) -> u32 {
+        self.bpb.reserved_sectors as u32
+    }
 
     fn sectors_per_fat(&self) -> u32 {
-        if self.is_fat32 { self.bpb.fat_size_32 } else { self.bpb.fat_size_16 as u32 }
+        if self.is_fat32 {
+            self.bpb.fat_size_32
+        } else {
+            self.bpb.fat_size_16 as u32
+        }
     }
 
     fn data_offset(&self) -> u32 {
         let root_sectors = if self.is_fat32 {
             0
         } else {
-            ((self.bpb.root_ent_count as u32 * 32) + (self.bpb.bytes_per_sector as u32 - 1))
-                / self.bpb.bytes_per_sector as u32
+            (self.bpb.root_ent_count as u32 * 32).div_ceil(self.bpb.bytes_per_sector as u32)
         };
         self.fat_offset() + (self.bpb.num_fats as u32 * self.sectors_per_fat()) + root_sectors
     }
@@ -130,7 +145,9 @@ impl<'a, D: BlockDevice> FatFileSystem<'a, D> {
 
     /// Walks the path and returns the final DirectoryEntry.
     pub fn find_entry(&self, path: &str) -> Result<DirectoryEntry, DriverError> {
-        if path.is_empty() { return Err(DriverError::InvalidPath); }
+        if path.is_empty() {
+            return Err(DriverError::InvalidPath);
+        }
 
         let mut current_cluster = if self.is_fat32 {
             self.bpb.root_cluster
@@ -145,7 +162,9 @@ impl<'a, D: BlockDevice> FatFileSystem<'a, D> {
         let mut is_root_special = !self.is_fat32;
 
         for component in components {
-            if component.len() > 255 { return Err(DriverError::PathTooLong); }
+            if component.len() > 255 {
+                return Err(DriverError::PathTooLong);
+            }
 
             let entry = if is_root_special {
                 self.find_entry_in_fat16_root(component)?
@@ -175,7 +194,7 @@ impl<'a, D: BlockDevice> FatFileSystem<'a, D> {
     fn find_entry_in_fat16_root(&self, name: &str) -> Result<DirectoryEntry, DriverError> {
         let root_start = self.root_dir_offset();
         let root_entries = self.bpb.root_ent_count as u32;
-        let root_sectors = (root_entries * 32 + 511) / 512;
+        let root_sectors = (root_entries * 32).div_ceil(512);
 
         for s in 0..root_sectors {
             let mut buf = [0u8; 512];
@@ -193,7 +212,11 @@ impl<'a, D: BlockDevice> FatFileSystem<'a, D> {
         Err(DriverError::FileNotFound)
     }
 
-    fn find_entry_in_dir(&self, dir_cluster: u32, name: &str) -> Result<DirectoryEntry, DriverError> {
+    fn find_entry_in_dir(
+        &self,
+        dir_cluster: u32,
+        name: &str,
+    ) -> Result<DirectoryEntry, DriverError> {
         let mut cluster = dir_cluster;
 
         while !self.is_end_of_chain(cluster) {
@@ -208,7 +231,10 @@ impl<'a, D: BlockDevice> FatFileSystem<'a, D> {
                     let entry = unsafe {
                         core::ptr::read_unaligned(buf.as_ptr().add(i * 32) as *const DirectoryEntry)
                     };
-                    if !entry.is_free() && !entry.is_volume_label() && self.name_matches(&entry, name) {
+                    if !entry.is_free()
+                        && !entry.is_volume_label()
+                        && self.name_matches(&entry, name)
+                    {
                         return Ok(entry);
                     }
                 }
@@ -258,7 +284,9 @@ impl<'a, D: BlockDevice> FatFileSystem<'a, D> {
             let sectors_per_cluster = self.bpb.sectors_per_cluster as u32;
 
             for s in 0..sectors_per_cluster {
-                if remaining == 0 { break; }
+                if remaining == 0 {
+                    break;
+                }
                 let mut sector_buf = [0u8; 512];
                 self.device.read_sector(sector + s, &mut sector_buf)?;
 
@@ -310,9 +338,9 @@ impl<'a, D: BlockDevice> FatFileSystem<'a, D> {
         self.device.read_sector(fat_sec, &mut buf)?;
 
         let next = if self.is_fat32 {
-            u32::from_le_bytes([buf[off], buf[off+1], buf[off+2], buf[off+3]])
+            u32::from_le_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]])
         } else {
-            u16::from_le_bytes([buf[off], buf[off+1]]) as u32
+            u16::from_le_bytes([buf[off], buf[off + 1]]) as u32
         };
 
         Ok(next)
@@ -324,30 +352,42 @@ mod tests {
     use super::*;
     use spin::Mutex;
 
-    struct RamDisk { data: Mutex<[u8; 40*1024]>, sector_size: u32 }
+    struct RamDisk {
+        data: Mutex<[u8; 40 * 1024]>,
+        sector_size: u32,
+    }
     impl RamDisk {
-        fn new() -> Self { Self { data: Mutex::new([0u8; 40*1024]), sector_size: 512 } }
+        fn new() -> Self {
+            Self {
+                data: Mutex::new([0u8; 40 * 1024]),
+                sector_size: 512,
+            }
+        }
         fn write_sector(&self, sec: u32, b: &[u8]) {
             let mut d = self.data.lock();
             let start = (sec as usize) * 512;
-            d[start..start+512].copy_from_slice(b);
+            d[start..start + 512].copy_from_slice(b);
         }
     }
     impl BlockDevice for RamDisk {
         fn read_sector(&self, sec: u32, buf: &mut [u8]) -> Result<(), DriverError> {
             let d = self.data.lock();
-            let start = (sec as usize)*512;
-            if start + 512 > d.len() { return Err(DriverError::InvalidSector); }
-            buf.copy_from_slice(&d[start..start+512]);
+            let start = (sec as usize) * 512;
+            if start + 512 > d.len() {
+                return Err(DriverError::InvalidSector);
+            }
+            buf.copy_from_slice(&d[start..start + 512]);
             Ok(())
         }
         fn write_sector(&self, sec: u32, buf: &[u8]) -> Result<(), DriverError> {
             let mut d = self.data.lock();
-            let start = (sec as usize)*512;
-            d[start..start+512].copy_from_slice(buf);
+            let start = (sec as usize) * 512;
+            d[start..start + 512].copy_from_slice(buf);
             Ok(())
         }
-        fn sector_size(&self) -> u32 { self.sector_size }
+        fn sector_size(&self) -> u32 {
+            self.sector_size
+        }
     }
 
     #[test]
@@ -385,9 +425,8 @@ mod tests {
             reserved: [0; 12],
             boot_signature: [0; 448],
         };
-        let bpb_bytes = unsafe {
-            core::slice::from_raw_parts(&bpb as *const FatBpb as *const u8, 512)
-        };
+        let bpb_bytes =
+            unsafe { core::slice::from_raw_parts(&bpb as *const FatBpb as *const u8, 512) };
         d.write_sector(0, bpb_bytes);
 
         // FAT16 table (sector 1): entry0 = 0xFFF0, entry1 = 0xFFFF, entry2 = 0xFFFF

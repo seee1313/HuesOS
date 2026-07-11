@@ -29,9 +29,7 @@ struct Layout {
 impl Layout {
     fn fullscreen(canvas: &Canvas) -> Self {
         let available_w = canvas.width().saturating_sub(EDGE_PAD * 2);
-        let available_h = canvas
-            .height()
-            .saturating_sub(HUD_HEIGHT + EDGE_PAD);
+        let available_h = canvas.height().saturating_sub(HUD_HEIGHT + EDGE_PAD);
         let cell = (available_w / GRID_W as u32)
             .min(available_h / GRID_H as u32)
             .max(1);
@@ -346,8 +344,9 @@ pub fn run(keyboard: &Channel, hard: bool) {
         }
 
         // 3) Tick hazards
-        if hard && phase == Phase::Playing {
-            if !tick_hazards(
+        if hard
+            && phase == Phase::Playing
+            && !tick_hazards(
                 &mut bombs,
                 &mut bullets,
                 &mut rocket,
@@ -356,9 +355,9 @@ pub fn run(keyboard: &Channel, hard: bool) {
                 &mut rng,
                 &mut food,
                 &mut gold_food,
-            ) {
-                phase = Phase::GameOver;
-            }
+            )
+        {
+            phase = Phase::GameOver;
         }
 
         if banner_ttl > 0 {
@@ -375,6 +374,10 @@ pub fn run(keyboard: &Channel, hard: bool) {
     }
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "no_std game state uses explicit fixed-capacity buffers; aggregation is tracked separately"
+)]
 fn reset(
     body: &mut [Point; MAX_LEN],
     len: &mut usize,
@@ -414,6 +417,10 @@ fn reset(
     *pending_event = false;
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "no_std game state uses explicit fixed-capacity buffers; aggregation is tracked separately"
+)]
 fn step(
     body: &mut [Point; MAX_LEN],
     len: &mut usize,
@@ -444,8 +451,8 @@ fn step(
         x: nx as u8,
         y: ny as u8,
     };
-    for i in 0..*len {
-        if body[i].x == next.x && body[i].y == next.y {
+    for segment in body.iter().take(*len) {
+        if segment.x == next.x && segment.y == next.y {
             return false;
         }
     }
@@ -464,7 +471,7 @@ fn step(
             *len += 1;
         }
         *score = score.saturating_add(1);
-        if hard && *score % 2 == 0 {
+        if hard && (*score).is_multiple_of(2) {
             *pending_event = true;
         }
     } else if eat_gold {
@@ -495,7 +502,7 @@ fn step(
 
         // 20% chance to spawn a Golden Apple (Gold Food)
         *rng = rng.wrapping_mul(1664525).wrapping_add(1013904223);
-        if gold_food.is_none() && (*rng % 5 == 0) {
+        if gold_food.is_none() && (*rng).is_multiple_of(5) {
             // Pass the freshly respawned regular apple as `avoid` so the gold
             // apple can never overlap it. Previously we relied on a
             // `(+3, +3) % GRID` fallback that could land on the snake, a
@@ -524,6 +531,10 @@ fn step(
     true
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "no_std game state uses explicit fixed-capacity buffers; aggregation is tracked separately"
+)]
 fn spawn_food(
     body: &[Point; MAX_LEN],
     len: usize,
@@ -542,8 +553,8 @@ fn spawn_food(
         let y = ((*rng >> 16) as usize % GRID_H) as u8;
 
         let mut free = true;
-        for i in 0..len {
-            if body[i].x == x && body[i].y == y {
+        for segment in body.iter().take(len) {
+            if segment.x == x && segment.y == y {
                 free = false;
                 break;
             }
@@ -599,15 +610,16 @@ fn is_opposite(a: Dir, b: Dir) -> bool {
     )
 }
 
-fn on_snake(body: &[Point; MAX_LEN], len: usize, p: Point) -> bool {
-    for i in 0..len {
-        if body[i].x == p.x && body[i].y == p.y {
-            return true;
-        }
-    }
-    false
+fn on_snake(body: &[Point; MAX_LEN], len: usize, point: Point) -> bool {
+    body.iter()
+        .take(len)
+        .any(|segment| segment.x == point.x && segment.y == point.y)
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "no_std game state uses explicit fixed-capacity buffers; aggregation is tracked separately"
+)]
 fn spawn_event(
     rng: &mut u32,
     body: &[Point; MAX_LEN],
@@ -774,6 +786,10 @@ fn step_point(p: Point, d: Dir) -> Option<Point> {
 }
 
 /// Tick bombs/bullets/rocket. Returns false if snake dies.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "no_std game state uses explicit fixed-capacity buffers; aggregation is tracked separately"
+)]
 fn tick_hazards(
     bombs: &mut [Bomb; MAX_BOMBS],
     bullets: &mut [Bullet; MAX_BULLETS],
@@ -924,14 +940,11 @@ fn tick_hazards(
 }
 
 fn blast_hits_snake(center: Point, radius: i16, body: &[Point; MAX_LEN], len: usize) -> bool {
-    for i in 0..len {
-        let dx = body[i].x as i16 - center.x as i16;
-        let dy = body[i].y as i16 - center.y as i16;
-        if dx.abs() <= radius && dy.abs() <= radius {
-            return true;
-        }
-    }
-    false
+    body.iter().take(len).any(|segment| {
+        let dx = segment.x as i16 - center.x as i16;
+        let dy = segment.y as i16 - center.y as i16;
+        dx.abs() <= radius && dy.abs() <= radius
+    })
 }
 
 enum Action {
@@ -958,6 +971,10 @@ fn decode(msg: &[u8]) -> Option<Action> {
     }
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "no_std game state uses explicit fixed-capacity buffers; aggregation is tracked separately"
+)]
 fn draw(
     canvas: &Canvas,
     layout: &Layout,
@@ -1074,14 +1091,17 @@ fn draw(
                 for dy in -r..=r {
                     let rx = b.pos.x as i16 + dx;
                     let ry = b.pos.y as i16 + dy;
-                    if rx >= 0 && rx < GRID_W as i16 && ry >= 0 && ry < GRID_H as i16 {
-                        if rx as u8 != b.pos.x || ry as u8 != b.pos.y {
-                            let inset = (layout.cell / 4).max(1);
-                            let px = layout.board_x + rx as u32 * layout.cell + inset;
-                            let py = layout.board_y + ry as u32 * layout.cell + inset;
-                            let size = layout.cell.saturating_sub(inset * 2).max(1);
-                            let _ = canvas.fill_rect(px, py, size, size, 120, 30, 30);
-                        }
+                    if rx >= 0
+                        && rx < GRID_W as i16
+                        && ry >= 0
+                        && ry < GRID_H as i16
+                        && (rx as u8 != b.pos.x || ry as u8 != b.pos.y)
+                    {
+                        let inset = (layout.cell / 4).max(1);
+                        let px = layout.board_x + rx as u32 * layout.cell + inset;
+                        let py = layout.board_y + ry as u32 * layout.cell + inset;
+                        let size = layout.cell.saturating_sub(inset * 2).max(1);
+                        let _ = canvas.fill_rect(px, py, size, size, 120, 30, 30);
                     }
                 }
             }
@@ -1138,14 +1158,14 @@ fn draw(
     }
 
     // Snake with an elegant gradient from bright mint green to deep forest blue-green
-    for i in 0..len {
-        if i == 0 {
-            fill_cell(canvas, layout, body[i].x, body[i].y, 50, 240, 140);
+    for (index, segment) in body.iter().take(len).enumerate() {
+        if index == 0 {
+            fill_cell(canvas, layout, segment.x, segment.y, 50, 240, 140);
         } else {
-            let r = 50 - (30 * i / len) as u8;
-            let g = 200 - (100 * i / len) as u8;
-            let b = 150 - (90 * i / len) as u8;
-            fill_cell(canvas, layout, body[i].x, body[i].y, r, g, b);
+            let r = 50 - (30 * index / len) as u8;
+            let g = 200 - (100 * index / len) as u8;
+            let b = 150 - (90 * index / len) as u8;
+            fill_cell(canvas, layout, segment.x, segment.y, r, g, b);
         }
     }
 
