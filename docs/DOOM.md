@@ -28,8 +28,10 @@ Terminal duplicates its keyboard service Channel and transfers it to init with
 maps its segments in bounded 1 MiB VMO transfers, starts its initial thread,
 and forwards the keyboard handle through the child bootstrap channel.
 
-Terminal then remains quiescent so it neither consumes Doom keyboard events nor
-overwrites Doom frames.
+Terminal then blocks on its supervisor channel so it neither consumes Doom
+keyboard events nor overwrites Doom frames. Init retains the process handle and
+polls `ProcessGetExitCode`; when Doom exits normally (or through the Q safety
+shortcut), init sends `doom:exited` and terminal redraws its prompt.
 
 ## Freestanding libc compatibility layer
 
@@ -68,12 +70,14 @@ The first port maps:
 | E | Use/open |
 | Enter | Confirm |
 | Escape | Menu |
+| Q | Immediate safe return to terminal |
 
-The early keyboard service publishes make events only. The Doom adapter keeps
-a key logically down for eight monotonic ticks (80 ms), extends that deadline
-on hardware repeat, and then emits a synthetic release. Releasing on the very
-next `DG_GetKey` poll was sufficient for menus but happened before
-`G_BuildTiccmd` sampled gameplay input, which made movement appear broken.
+The keyboard service now publishes unified three-byte events containing the
+logical key plus an explicit pressed/released flag. Doom forwards those real
+make/break transitions to `DG_GetKey`, so held movement and simultaneous game
+tics no longer depend on guessed release delays. Terminal and Snake ignore
+release events while retaining backward compatibility with the old text event
+format.
 
 ## SIMD and stack ABI
 
