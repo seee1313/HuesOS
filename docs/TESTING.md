@@ -138,7 +138,8 @@ and captures title/game PPM frames. Assertions:
 
 - serial contains Doom startup, WAD initialization and `I_InitGraphics`;
 - no `user-fault process=doom` and no kernel panic;
-- captured frame contains more than 100 colors;
+- captured frame contains more than 100 colors and Doom pixels cover the full
+  framebuffer rather than only a centered 640×400 rectangle;
 - title and gameplay captures differ substantially;
 - terminal does not consume the transferred keyboard Channel.
 
