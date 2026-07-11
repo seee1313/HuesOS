@@ -200,12 +200,7 @@ pub(crate) fn sys_process_wait(handle: HandleValue, out_code: *mut i64) -> Sysca
     // Validate before parking so a bad pointer cannot consume a wakeup and
     // fault only after the target has exited.
     user_memory::validate_write(out_code)?;
-    let proc = current_proc()?;
-    let h = proc.handles.get(handle).ok_or(ErrorCode::BadHandle)?;
-    if !h.has_rights(Rights::READ) {
-        return Err(ErrorCode::AccessDenied);
-    }
-    let target = huesos_object::lookup_process(h.koid).ok_or(ErrorCode::WrongType)?;
+    let target = process_for_wait(handle)?;
     loop {
         if let Some(code) = target.exit_code() {
             user_memory::write_value(out_code, &code)?;
@@ -213,4 +208,26 @@ pub(crate) fn sys_process_wait(handle: HandleValue, out_code: *mut i64) -> Sysca
         }
         huesos_object::wait::park_on(&target.exit_waiters);
     }
+}
+
+pub(crate) fn sys_process_get_exit_code(
+    handle: HandleValue,
+    out_code: *mut i64,
+) -> SyscallResult {
+    user_memory::validate_write(out_code)?;
+    let target = process_for_wait(handle)?;
+    let code = target.exit_code().ok_or(ErrorCode::ShouldWait)?;
+    user_memory::write_value(out_code, &code)?;
+    Ok(0)
+}
+
+fn process_for_wait(
+    handle: HandleValue,
+) -> Result<alloc::sync::Arc<huesos_object::Process>, ErrorCode> {
+    let proc = current_proc()?;
+    let h = proc.handles.get(handle).ok_or(ErrorCode::BadHandle)?;
+    if !h.has_rights(Rights::READ) {
+        return Err(ErrorCode::AccessDenied);
+    }
+    huesos_object::lookup_process(h.koid).ok_or(ErrorCode::WrongType)
 }

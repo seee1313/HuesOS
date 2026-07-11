@@ -108,5 +108,8 @@ pub fn dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> Syscal
         S::ProcessWait => process::sys_process_wait(a1 as HandleValue, a2 as *mut i64),
         S::ClockGetMonotonic => system::sys_clock_get_monotonic(),
         S::SystemShutdown => system::sys_system_shutdown(),
+        S::ProcessGetExitCode => {
+            process::sys_process_get_exit_code(a1 as HandleValue, a2 as *mut i64)
+        }
     }
 }
