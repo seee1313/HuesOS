@@ -11,6 +11,7 @@ const PIT_FREQUENCY: u32 = 1_193_182;
 
 /// Program the PIT to fire IRQ0 at `hz` times per second.
 pub fn init(hz: u32) {
+    let hz = hz.max(1);
     let divisor = (PIT_FREQUENCY / hz).clamp(1, u16::MAX as u32) as u16;
 
     let mut cmd: Port<u8> = Port::new(0x43);
@@ -18,7 +19,7 @@ pub fn init(hz: u32) {
 
     unsafe {
         // Channel 0, lobyte/hibyte access, mode 3 (square wave), binary.
-        cmd.write(0b00_11_011_0u8);
+        cmd.write(0b0011_0110_u8);
         data0.write((divisor & 0xFF) as u8);
         data0.write((divisor >> 8) as u8);
     }

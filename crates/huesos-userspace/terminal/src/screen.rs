@@ -1,5 +1,6 @@
 //! Framebuffer-backed text screen.
 
+use core::cell::UnsafeCell;
 use libcanvas::framebuffer::{Canvas, TextFont};
 
 const ROWS: usize = 44;
@@ -9,7 +10,25 @@ const LEFT_MARGIN: u32 = 16;
 const TOP_MARGIN: u32 = 16;
 /// Covers up to 2560×1600 at 32 bpp without heap allocation.
 const SHADOW_CAPACITY: usize = 16 * 1024 * 1024;
-static mut TERMINAL_SHADOW: [u8; SHADOW_CAPACITY] = [0; SHADOW_CAPACITY];
+
+struct TerminalShadow(UnsafeCell<[u8; SHADOW_CAPACITY]>);
+
+// SAFETY: Terminal is a single-threaded process and rendering is synchronous;
+// no shadow-buffer borrow can overlap another render call.
+unsafe impl Sync for TerminalShadow {}
+
+impl TerminalShadow {
+    const fn new() -> Self {
+        Self(UnsafeCell::new([0; SHADOW_CAPACITY]))
+    }
+
+    fn with<R>(&self, operation: impl FnOnce(&mut [u8; SHADOW_CAPACITY]) -> R) -> R {
+        // SAFETY: guaranteed by the single-threaded render invariant above.
+        unsafe { operation(&mut *self.0.get()) }
+    }
+}
+
+static TERMINAL_SHADOW: TerminalShadow = TerminalShadow::new();
 
 /// Simple fixed-size text screen backed by a `Canvas`.
 pub struct Screen {
@@ -131,44 +150,36 @@ impl Screen {
         };
 
         if canvas.supports_buffered_raster() && canvas.byte_len() <= SHADOW_CAPACITY {
-            // SAFETY: Terminal has one thread and render calls never overlap.
-            // Use a raw-pointer slice to avoid creating a reference directly
-            // from a mutable static.
-            let shadow = unsafe {
-                core::slice::from_raw_parts_mut(
-                    core::ptr::addr_of_mut!(TERMINAL_SHADOW) as *mut u8,
-                    SHADOW_CAPACITY,
-                )
-            };
-            if canvas.clear_shadow(shadow, 5, 8, 16).is_ok() {
+            let rendered = TERMINAL_SHADOW.with(|shadow| {
+                if canvas.clear_shadow(shadow, 5, 8, 16).is_err() {
+                    return false;
+                }
                 let mut row = 0;
                 while row < ROWS {
                     let len = line_len(&self.cells[row]);
-                    if len > 0 {
-                        if let Ok(text) = core::str::from_utf8(&self.cells[row][..len]) {
-                            let color = if row == self.row {
-                                (180, 240, 180)
-                            } else {
-                                (180, 220, 255)
-                            };
-                            let _ = canvas.draw_text_to_shadow(
-                                shadow,
-                                LEFT_MARGIN,
-                                TOP_MARGIN + row as u32 * LINE_HEIGHT,
-                                text,
-                                color.0,
-                                color.1,
-                                color.2,
-                                self.font,
-                            );
-                        }
+                    if let Ok(text) = core::str::from_utf8(&self.cells[row][..len]) {
+                        let color = if row == self.row {
+                            (180, 240, 180)
+                        } else {
+                            (180, 220, 255)
+                        };
+                        let _ = canvas.draw_text_to_shadow(
+                            shadow,
+                            LEFT_MARGIN,
+                            TOP_MARGIN + row as u32 * LINE_HEIGHT,
+                            text,
+                            color.0,
+                            color.1,
+                            color.2,
+                            self.font,
+                        );
                     }
                     row += 1;
                 }
-                if canvas.upload_shadow(shadow).is_ok() {
-                    let _ = canvas.present();
-                    return;
-                }
+                canvas.upload_shadow(shadow).is_ok() && canvas.present().is_ok()
+            });
+            if rendered {
+                return;
             }
         }
 

@@ -135,7 +135,7 @@ pub unsafe fn current_lapic_id() -> u32 {
     let id: u32;
     unsafe {
         asm!(
-            "mov {out}, gs:[{offset}]",
+            "mov {out:e}, gs:[{offset}]",
             out = out(reg) id,
             offset = in(reg) core::mem::size_of::<*mut CpuLocal>(),
             options(nomem, nostack),

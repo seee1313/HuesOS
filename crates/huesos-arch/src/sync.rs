@@ -12,7 +12,7 @@
 use core::cell::UnsafeCell;
 use core::hint::spin_loop;
 use core::ops::{Deref, DerefMut};
-use core::sync::atomic::{AtomicU32, AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use x86_64::instructions::interrupts;
 
 /// Raw spinlock without interrupt disabling.
@@ -24,17 +24,20 @@ pub struct RawSpinlock {
 impl RawSpinlock {
     /// Create a new unlocked spinlock.
     pub const fn new() -> Self {
-        Self { locked: AtomicBool::new(false) }
+        Self {
+            locked: AtomicBool::new(false),
+        }
     }
 
     /// Acquire the lock, spinning until available.
     /// Uses Acquire ordering to synchronize with Release in unlock.
     pub fn lock(&self) {
         // Fast path: try to acquire with compare_exchange
-        while self.locked.compare_exchange_weak(
-            false, true,
-            Ordering::Acquire, Ordering::Relaxed
-        ).is_err() {
+        while self
+            .locked
+            .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
             // Spin until the lock appears free, then retry
             while self.locked.load(Ordering::Relaxed) {
                 spin_loop();
@@ -44,10 +47,9 @@ impl RawSpinlock {
 
     /// Try to acquire the lock without spinning.
     pub fn try_lock(&self) -> bool {
-        self.locked.compare_exchange(
-            false, true,
-            Ordering::Acquire, Ordering::Relaxed
-        ).is_ok()
+        self.locked
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_ok()
     }
 
     /// Release the lock.
@@ -57,6 +59,14 @@ impl RawSpinlock {
     }
 }
 
+impl Default for RawSpinlock {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// SAFETY: RawSpinlock contains only an atomic flag; protected data lives in
+// the higher-level lock wrapper and is accessed after Acquire synchronization.
 unsafe impl Send for RawSpinlock {}
 unsafe impl Sync for RawSpinlock {}
 
@@ -71,7 +81,9 @@ pub struct IrqSafeRawSpinlock {
 impl IrqSafeRawSpinlock {
     /// Create a new unlocked interrupt-safe spinlock.
     pub const fn new() -> Self {
-        Self { inner: RawSpinlock::new() }
+        Self {
+            inner: RawSpinlock::new(),
+        }
     }
 
     /// Acquire the lock and disable interrupts on this CPU.
@@ -81,7 +93,10 @@ impl IrqSafeRawSpinlock {
         let was_enabled = interrupts::are_enabled();
         interrupts::disable();
         self.inner.lock();
-        IrqSafeRawSpinlockGuard { lock: &self.inner, was_enabled }
+        IrqSafeRawSpinlockGuard {
+            lock: &self.inner,
+            was_enabled,
+        }
     }
 
     /// Try to acquire without spinning, with interrupt disabling.
@@ -89,15 +104,28 @@ impl IrqSafeRawSpinlock {
         let was_enabled = interrupts::are_enabled();
         interrupts::disable();
         if self.inner.try_lock() {
-            Some(IrqSafeRawSpinlockGuard { lock: &self.inner, was_enabled })
+            Some(IrqSafeRawSpinlockGuard {
+                lock: &self.inner,
+                was_enabled,
+            })
         } else {
             // Restore interrupt state on failure
-            if was_enabled { interrupts::enable(); }
+            if was_enabled {
+                interrupts::enable();
+            }
             None
         }
     }
 }
 
+impl Default for IrqSafeRawSpinlock {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// SAFETY: synchronization is delegated to RawSpinlock; interrupt state is
+// local CPU state restored by the guard and is not shared memory.
 unsafe impl Send for IrqSafeRawSpinlock {}
 unsafe impl Sync for IrqSafeRawSpinlock {}
 
@@ -110,7 +138,9 @@ pub struct IrqSafeRawSpinlockGuard<'a> {
 impl<'a> Drop for IrqSafeRawSpinlockGuard<'a> {
     fn drop(&mut self) {
         self.lock.unlock();
-        if self.was_enabled { interrupts::enable(); }
+        if self.was_enabled {
+            interrupts::enable();
+        }
     }
 }
 
@@ -145,15 +175,17 @@ impl TicketLock {
 
     /// Try to acquire the lock without spinning.
     pub fn try_lock(&self) -> bool {
-        let my_ticket = self.next_ticket.fetch_add(1, Ordering::Relaxed);
-        if self.now_serving.load(Ordering::Acquire) == my_ticket {
-            true
-        } else {
-            // Put our ticket back (not perfectly fair but avoids starvation)
-            // In practice, just spin briefly or return false
-            // For simplicity, we don't rollback - caller should use lock()
-            false
-        }
+        let serving = self.now_serving.load(Ordering::Acquire);
+        // Acquire only if no ticket is queued. Unlike fetch_add, a failed CAS
+        // does not abandon a ticket that would permanently stall the queue.
+        self.next_ticket
+            .compare_exchange(
+                serving,
+                serving.wrapping_add(1),
+                Ordering::Acquire,
+                Ordering::Relaxed,
+            )
+            .is_ok()
     }
 
     /// Release the lock and serve the next ticket.
@@ -173,6 +205,14 @@ impl TicketLock {
     }
 }
 
+impl Default for TicketLock {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// SAFETY: both fields are atomics and the ticket protocol establishes mutual
+// exclusion plus Acquire/Release synchronization.
 unsafe impl Send for TicketLock {}
 unsafe impl Sync for TicketLock {}
 
@@ -186,7 +226,10 @@ pub struct IrqSafeTicketLock<T> {
 impl<T> IrqSafeTicketLock<T> {
     /// Create a new interrupt-safe ticket lock protecting `data`.
     pub const fn new(data: T) -> Self {
-        Self { lock: TicketLock::new(), data: UnsafeCell::new(data) }
+        Self {
+            lock: TicketLock::new(),
+            data: UnsafeCell::new(data),
+        }
     }
 
     /// Acquire the lock, disabling interrupts on this CPU.
@@ -195,7 +238,11 @@ impl<T> IrqSafeTicketLock<T> {
         let was_enabled = interrupts::are_enabled();
         interrupts::disable();
         self.lock.lock();
-        IrqSafeTicketLockGuard { lock: &self.lock, was_enabled, data: self }
+        IrqSafeTicketLockGuard {
+            lock: &self.lock,
+            was_enabled,
+            data: self,
+        }
     }
 
     /// Try to acquire without spinning.
@@ -204,10 +251,16 @@ impl<T> IrqSafeTicketLock<T> {
         interrupts::disable();
         // For ticket lock, try_lock is not trivial; simplified to full lock
         self.lock.lock();
-        Some(IrqSafeTicketLockGuard { lock: &self.lock, was_enabled, data: self })
+        Some(IrqSafeTicketLockGuard {
+            lock: &self.lock,
+            was_enabled,
+            data: self,
+        })
     }
 }
 
+// SAFETY: access to T is serialized by TicketLock. Requiring T: Send permits
+// ownership to move between CPUs while the guard enforces exclusive mutation.
 unsafe impl<T: Send> Send for IrqSafeTicketLock<T> {}
 unsafe impl<T: Send> Sync for IrqSafeTicketLock<T> {}
 
@@ -222,7 +275,9 @@ pub struct IrqSafeTicketLockGuard<'a, T> {
 impl<'a, T> Drop for IrqSafeTicketLockGuard<'a, T> {
     fn drop(&mut self) {
         self.lock.unlock();
-        if self.was_enabled { interrupts::enable(); }
+        if self.was_enabled {
+            interrupts::enable();
+        }
     }
 }
 
