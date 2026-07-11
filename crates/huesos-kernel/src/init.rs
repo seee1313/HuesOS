@@ -1,6 +1,9 @@
 use huesos_pmm::MemoryRegion;
 
-const HEAP_SIZE: usize = 128 * 1024 * 1024;
+// 64 MiB leaves enough physical memory on the default 256 MiB machine for
+// large userspace programs (notably the Doom/Freedoom image) while retaining
+// ample kernel allocator headroom.
+const HEAP_SIZE: usize = 64 * 1024 * 1024;
 const HEAP_VIRT_START: u64 = 0xffff_ff00_0000_0000;
 
 /// Limine memmap types that base revision 3 does *not* put into the HHDM,

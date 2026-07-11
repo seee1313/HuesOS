@@ -270,10 +270,15 @@ impl AddressSpace {
         let phys_offset = VirtAddr::new(*HHDM_OFFSET.lock());
         let mut mapper = unsafe { OffsetPageTable::new(table, phys_offset) };
         unsafe {
+            // AddressSpace mappings are constructed for a non-active child
+            // CR3. Flushing the caller's current TLB for every child page is
+            // both unnecessary and catastrophically slow for large static
+            // programs such as Doom. The first CR3 load establishes a clean
+            // TLB context for these entries.
             mapper
                 .map_to(page, frame, flags, &mut PmmFrameAllocator)
                 .expect("user map_to failed")
-                .flush();
+                .ignore();
         }
     }
 

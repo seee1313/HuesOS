@@ -1,6 +1,6 @@
 //! Framebuffer-backed text screen.
 
-use libcanvas::framebuffer::Canvas;
+use libcanvas::framebuffer::{Canvas, TextFont};
 
 const ROWS: usize = 44;
 const COLS: usize = 96;
@@ -14,6 +14,7 @@ pub struct Screen {
     cells: [[u8; COLS]; ROWS],
     row: usize,
     col: usize,
+    font: TextFont,
 }
 
 impl Screen {
@@ -24,6 +25,7 @@ impl Screen {
             cells: [[b' '; COLS]; ROWS],
             row: 0,
             col: 0,
+            font: TextFont::Tty8x16,
         }
     }
 
@@ -101,6 +103,24 @@ impl Screen {
         }
     }
 
+    /// Select the default TTY-style 8x16 font.
+    pub fn use_tty_font(&mut self) {
+        self.font = TextFont::Tty8x16;
+    }
+
+    /// Select the original compact HuesOS 8x8 font.
+    pub fn use_compact_font(&mut self) {
+        self.font = TextFont::Compact8x8;
+    }
+
+    /// Human-readable active font name.
+    pub fn font_name(&self) -> &'static str {
+        match self.font {
+            TextFont::Tty8x16 => "tty 8x16",
+            TextFont::Compact8x8 => "compact 8x8",
+        }
+    }
+
     /// Present the current text buffer to the framebuffer.
     pub fn render(&self) {
         let Some(canvas) = &self.canvas else {
@@ -117,13 +137,14 @@ impl Screen {
                     } else {
                         (180, 220, 255)
                     };
-                    let _ = canvas.draw_text(
+                    let _ = canvas.draw_text_with_font(
                         LEFT_MARGIN,
                         TOP_MARGIN + row as u32 * LINE_HEIGHT,
                         text,
                         color.0,
                         color.1,
                         color.2,
+                        self.font,
                     );
                 }
             }

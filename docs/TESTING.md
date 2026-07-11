@@ -126,6 +126,29 @@ privileged syscall authorization, PS/2 quiescing, SMP halt messages, absence of
 Kernel Panic, and the final dark/cyan/white framebuffer. See
 [SHUTDOWN.md](SHUTDOWN.md) and [SNAKE.md](SNAKE.md).
 
+## TTY Font and Doom Tests
+
+The terminal boot screen must show `Type 'help' to list available commands.` in
+the default 8×16 TTY mode. `font compact` switches to the original 8×8 glyphs
+without changing cursor/scrollback state.
+
+The Doom release test boots QEMU with 512 MiB, injects `doom`, waits for
+DoomGeneric/Freedoom initialization, presses Enter and movement/fire/use keys,
+and captures title/game PPM frames. Assertions:
+
+- serial contains Doom startup, WAD initialization and `I_InitGraphics`;
+- no `user-fault process=doom` and no kernel panic;
+- captured frame contains more than 100 colors;
+- title and gameplay captures differ substantially;
+- terminal does not consume the transferred keyboard Channel.
+
+The recorded release soak produced 156, 164, and 149 colors in title/game/late
+frames, with more than 500,000 changed bytes between gameplay captures. The
+font switch integration produced 9,615 changed framebuffer bytes between TTY
+and compact modes.
+
+See [DOOM.md](DOOM.md) and [TTY_FONT.md](TTY_FONT.md).
+
 ## Kernel Panic Screen Test
 
 Normal images never panic intentionally. To exercise the fatal path, build an
@@ -153,7 +176,7 @@ B5M (AMD Ryzen 5 5625U).
 ```bash
 make build && make iso
 qemu-system-x86_64 \
-    -machine q35 -cpu qemu64 -smp 2 -m 256M \
+    -machine q35 -cpu qemu64 -smp 2 -m 512M \
     -bios third_party/ovmf/OVMF.fd \
     -cdrom build/huesos.iso \
     -serial stdio -s -S
@@ -188,7 +211,7 @@ jobs:
       - name: Boot smoke test (2 CPUs)
         run: |
           timeout 45 qemu-system-x86_64 \
-            -machine q35 -cpu qemu64 -smp 2 -m 256M \
+            -machine q35 -cpu qemu64 -smp 2 -m 512M \
             -bios third_party/ovmf/OVMF.fd \
             -cdrom build/huesos.iso \
             -net none -serial stdio -display none \

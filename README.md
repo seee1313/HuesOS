@@ -64,6 +64,10 @@ see [Known Limitations](#known-limitations) and
   shutdown-stop IPI, permanent CPU halt, and a final safe-to-power-off screen
 - ✅ Full-screen Snake paced by the kernel monotonic clock (no RDTSC/device-
   frequency dependency), with resolution-adaptive layout and refreshed visuals
+- ✅ TTY-style 8×16 default terminal font with the original 8×8 font retained
+  as `font compact`
+- ✅ DoomGeneric userspace port with Freedoom Phase 1, custom non-POSIX libc,
+  Canvas video, Channel keyboard input, and monotonic timing (silent first cut)
 
 All of the above is exercised live by `huesos-init` on every boot — built
 against `libcanvas` — which creates a VMO, does a channel round-trip,
@@ -148,8 +152,10 @@ security contract for every pointer-bearing syscall is documented separately
 in [docs/USER_MEMORY.md](docs/USER_MEMORY.md). Exception containment and the
 non-rebooting red panic screen are specified in
 [docs/FAULTS_AND_PANIC.md](docs/FAULTS_AND_PANIC.md). See
-[docs/SHUTDOWN.md](docs/SHUTDOWN.md) for the non-ACPI halt protocol and
-[docs/SNAKE.md](docs/SNAKE.md) for deterministic game timing/fullscreen layout.
+[docs/SHUTDOWN.md](docs/SHUTDOWN.md) for the non-ACPI halt protocol,
+[docs/SNAKE.md](docs/SNAKE.md) for deterministic game timing/fullscreen layout,
+[docs/TTY_FONT.md](docs/TTY_FONT.md) for terminal font modes, and
+[docs/DOOM.md](docs/DOOM.md) for the GPL userspace game port.
 
 ## Building
 
@@ -198,4 +204,7 @@ HuesOS/
 
 ## License
 
-MIT
+HuesOS kernel and native Rust crates are MIT. The separately built DoomGeneric
+userspace program is GPL-2.0-only; Freedoom Phase 1 assets are BSD 3-Clause.
+See `third_party/doomgeneric/LICENSE`, `third_party/freedoom/LICENSE.txt`, and
+[docs/DOOM.md](docs/DOOM.md).

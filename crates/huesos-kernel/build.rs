@@ -34,6 +34,13 @@ fn main() {
         profile,
         &[("HUESOS_INPUT_DRIVER_HOST_PATH", input_driver_host.as_os_str())],
     );
+    let doom = build_userspace_program(
+        &userspace_root,
+        "doom",
+        "huesos-doom",
+        profile,
+        &[],
+    );
     let terminal = build_userspace_program(
         &userspace_root,
         "terminal",
@@ -57,6 +64,7 @@ fn main() {
         &[
             ("HUESOS_DRIVER_MANAGER_PATH", driver_manager.as_os_str()),
             ("HUESOS_TERMINAL_PATH", terminal.as_os_str()),
+            ("HUESOS_DOOM_PATH", doom.as_os_str()),
             ("HUESOS_FAULT_PROBE_PATH", fault_probe.as_os_str()),
             ("HUESOS_BOOTFS_PATH", bootfs.as_os_str()),
         ],
@@ -71,6 +79,7 @@ fn track_userspace_inputs(userspace_root: &Path) {
         "driver-manager",
         "driver-host-input",
         "terminal",
+        "doom",
         "fault-probe",
     ] {
         println!(

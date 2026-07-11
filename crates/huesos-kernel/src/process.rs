@@ -308,7 +308,9 @@ pub fn spawn_from_elf(name: &str, elf_bytes: &[u8]) -> SpawnedProcess {
     SpawnedProcess {
         process,
         entry_point: loaded.entry_point,
-        user_rsp: USER_STACK_TOP - 32, // leave a little red-zone-ish slack
+        // SysV x86_64 function entry expects RSP % 16 == 8 (as if a call
+        // pushed a return address). iretq does not push one into user memory.
+        user_rsp: USER_STACK_TOP - 40,
         cr3,
     }
 }
