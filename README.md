@@ -155,7 +155,10 @@ non-rebooting red panic screen are specified in
 [docs/SHUTDOWN.md](docs/SHUTDOWN.md) for the non-ACPI halt protocol,
 [docs/SNAKE.md](docs/SNAKE.md) for deterministic game timing/fullscreen layout,
 [docs/TTY_FONT.md](docs/TTY_FONT.md) for terminal font modes, and
-[docs/DOOM.md](docs/DOOM.md) for the GPL userspace game port.
+[docs/DOOM.md](docs/DOOM.md) for the GPL userspace game port. The ongoing
+hardening effort is tracked in
+[docs/OPTIMIZATION_SAFETY_PROGRAM.md](docs/OPTIMIZATION_SAFETY_PROGRAM.md) and
+[docs/UNSAFE_AUDIT.md](docs/UNSAFE_AUDIT.md).
 
 ## Building
 
