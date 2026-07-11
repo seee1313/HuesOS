@@ -51,9 +51,12 @@ There are no host file descriptors or Linux syscalls.
 
 ## Video
 
-DoomGeneric produces a 640×400 packed 32-bit buffer. The HuesOS adapter writes
-it to a Canvas VMO and presents it centered on the physical framebuffer. Timing
-uses `ClockGetMonotonic`; no POSIX clocks are involved.
+DoomGeneric produces a 640×400 packed 32-bit buffer. The HuesOS adapter scales
+it with nearest-neighbor sampling to the complete physical framebuffer, so
+laptop-native modes no longer show a small centered window. A reusable 1 MiB
+staging buffer groups many destination rows into each bounded VMO write; the
+adapter does not issue one syscall per scanline. Timing uses
+`ClockGetMonotonic`; no POSIX clocks are involved.
 
 Large child address spaces are created without flushing the current process TLB
 for every page. A fresh child CR3 cannot have stale entries, and eliminating

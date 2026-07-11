@@ -14,8 +14,16 @@ use libcanvas::{Channel, ErrorCode};
 static FREEDOOM_WAD: &[u8] = include_bytes!("../../../../third_party/freedoom/freedoom1.wad");
 static mut CANVAS: Option<Canvas> = None;
 static mut KEYBOARD: Option<Channel> = None;
-static mut PRESENT_X: u32 = 0;
-static mut PRESENT_Y: u32 = 0;
+static mut OUTPUT_WIDTH: u32 = 640;
+static mut OUTPUT_HEIGHT: u32 = 400;
+static mut OUTPUT_BPP: u32 = 4;
+
+const DOOM_WIDTH: usize = 640;
+const DOOM_HEIGHT: usize = 400;
+const SCALE_CHUNK_SIZE: usize = 1024 * 1024;
+// One reusable 1 MiB staging area keeps fullscreen scaling to a handful of
+// bounded VMO writes per frame instead of one syscall per destination row.
+static mut SCALE_CHUNK: [u8; SCALE_CHUNK_SIZE] = [0; SCALE_CHUNK_SIZE];
 
 unsafe extern "C" {
     fn doomgeneric_Create(argc: i32, argv: *mut *mut u8);
@@ -41,9 +49,19 @@ pub extern "C" fn _start() -> ! {
 pub extern "C" fn DG_Init() {
     if let Ok(info) = libcanvas::framebuffer::info() {
         unsafe {
-            PRESENT_X = info.width.saturating_sub(640) / 2;
-            PRESENT_Y = info.height.saturating_sub(400) / 2;
-            CANVAS = Canvas::new(640, 400).ok();
+            OUTPUT_WIDTH = info.width;
+            OUTPUT_HEIGHT = info.height;
+            OUTPUT_BPP = (info.bpp as u32).div_ceil(8);
+            // Doom's packed adapter currently targets the normal 32-bpp UEFI
+            // framebuffer. Keep a 640x400 fallback for unusual pixel formats.
+            CANVAS = if OUTPUT_BPP == 4 {
+                Canvas::new_fullscreen().ok()
+            } else {
+                OUTPUT_WIDTH = 640;
+                OUTPUT_HEIGHT = 400;
+                OUTPUT_BPP = 4;
+                Canvas::new(640, 400).ok()
+            };
         }
     }
     let bootstrap = libcanvas::channel::bootstrap();
@@ -67,10 +85,38 @@ pub extern "C" fn DG_Init() {
 pub extern "C" fn DG_DrawFrame() {
     unsafe {
         let Some(canvas) = CANVAS.as_ref() else { return };
-        if DG_ScreenBuffer.is_null() { return; }
-        let pixels = core::slice::from_raw_parts(DG_ScreenBuffer as *const u8, 640 * 400 * 4);
-        let _ = canvas.write_bytes(0, pixels);
-        let _ = canvas.present_at(PRESENT_X, PRESENT_Y);
+        if DG_ScreenBuffer.is_null() || OUTPUT_BPP != 4 {
+            return;
+        }
+
+        let width = OUTPUT_WIDTH as usize;
+        let height = OUTPUT_HEIGHT as usize;
+        let row_bytes = width.saturating_mul(4);
+        if width == 0 || height == 0 || row_bytes > SCALE_CHUNK_SIZE {
+            return;
+        }
+        let rows_per_chunk = (SCALE_CHUNK_SIZE / row_bytes).max(1);
+        let source = core::slice::from_raw_parts(DG_ScreenBuffer, DOOM_WIDTH * DOOM_HEIGHT);
+
+        let mut first_y = 0usize;
+        while first_y < height {
+            let rows = rows_per_chunk.min(height - first_y);
+            let output = &mut SCALE_CHUNK[..rows * row_bytes];
+            for local_y in 0..rows {
+                let dst_y = first_y + local_y;
+                let src_y = dst_y * DOOM_HEIGHT / height;
+                let dst_row = &mut output[local_y * row_bytes..(local_y + 1) * row_bytes];
+                for dst_x in 0..width {
+                    let src_x = dst_x * DOOM_WIDTH / width;
+                    let pixel = source[src_y * DOOM_WIDTH + src_x].to_le_bytes();
+                    let offset = dst_x * 4;
+                    dst_row[offset..offset + 4].copy_from_slice(&pixel);
+                }
+            }
+            let _ = canvas.write_bytes((first_y * row_bytes) as u64, output);
+            first_y += rows;
+        }
+        let _ = canvas.present();
     }
 }
 
