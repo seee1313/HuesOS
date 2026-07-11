@@ -116,25 +116,17 @@ fn send_keyboard_event(client: &Option<libcanvas::Channel>, event: KeyEvent) {
     let Some(client) = client.as_ref() else {
         return;
     };
-    match event {
-        KeyEvent::Char(byte) => {
-            let msg = [b'c', byte];
-            let _ = client.write(&msg);
-        }
-        KeyEvent::Enter => {
-            let _ = client.write(b"enter");
-        }
-        KeyEvent::Backspace => {
-            let _ = client.write(b"backspace");
-        }
-    }
+    // Unified event protocol: 'k', pressed(1/0), logical ASCII/control code.
+    // Consumers that only need text ignore releases; games receive true hold
+    // duration instead of guessing a synthetic key-up deadline.
+    let msg = [b'k', event.pressed as u8, event.key];
+    let _ = client.write(&msg);
 }
 
 #[derive(Clone, Copy)]
-enum KeyEvent {
-    Char(u8),
-    Backspace,
-    Enter,
+struct KeyEvent {
+    key: u8,
+    pressed: bool,
 }
 
 struct KeyboardDecoder {
@@ -158,16 +150,17 @@ impl KeyboardDecoder {
             }
             _ => {}
         }
-        if scancode & 0x80 != 0 {
-            return None;
-        }
+        let pressed = scancode & 0x80 == 0;
+        let index = (scancode & 0x7f) as usize;
         let table = if self.shift { &SET1_UPPER } else { &SET1_LOWER };
-        let byte = table.get(scancode as usize).copied().unwrap_or(0);
-        match byte {
-            0 => None,
-            b'\n' => Some(KeyEvent::Enter),
-            8 => Some(KeyEvent::Backspace),
-            byte => Some(KeyEvent::Char(byte)),
+        let byte = table.get(index).copied().unwrap_or(0);
+        if byte == 0 {
+            None
+        } else {
+            Some(KeyEvent {
+                key: byte,
+                pressed,
+            })
         }
     }
 }

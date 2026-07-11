@@ -27,13 +27,14 @@ enum Key {
 
 fn decode_keyboard_event(msg: &[u8]) -> Option<Key> {
     match msg {
-        [b'c', byte] => {
-            if *byte == 27 {
-                Some(Key::Esc)
-            } else {
-                Some(Key::Char(*byte))
-            }
-        }
+        [b'k', 1, 27] => Some(Key::Esc),
+        [b'k', 1, b'\n'] => Some(Key::Enter),
+        [b'k', 1, 8] => Some(Key::Backspace),
+        [b'k', 1, byte] => Some(Key::Char(*byte)),
+        // Releases are intentionally ignored by the line editor.
+        [b'k', 0, _] => None,
+        // Compatibility with an older input host during rolling updates.
+        [b'c', byte] => Some(if *byte == 27 { Key::Esc } else { Key::Char(*byte) }),
         b"enter" => Some(Key::Enter),
         b"backspace" => Some(Key::Backspace),
         _ => None,
@@ -133,7 +134,7 @@ impl Shell {
     fn run_doom(&mut self) {
         self.screen.clear();
         self.screen.write_line("Launching DOOM (Freedoom Phase 1)...");
-        self.screen.write_line("Controls: arrows/WASD, Ctrl fire, Space use, Esc menu");
+        self.screen.write_line("Controls: WASD move, F fire, E use, Esc menu, Q quit");
         self.screen.render();
 
         let result = (|| -> libcanvas::Result<()> {
@@ -142,16 +143,18 @@ impl Shell {
                 .write_handle(b"system:launch-doom", keyboard.into_handle())?;
             let mut response = [0u8; 64];
             let n = self.supervisor.read_into_blocking(&mut response)?;
-            if response[..n].starts_with(b"doom:started") {
-                // Doom owns the duplicated keyboard endpoint and framebuffer.
-                // Stay quiescent so the shell cannot consume its input or
-                // overwrite its frames. Process supervision/return-to-shell is
-                // the next lifecycle step for this first port.
-                loop {
-                    libcanvas::process::yield_now();
+            if !response[..n].starts_with(b"doom:started") {
+                return Err(libcanvas::ErrorCode::InvalidArgs);
+            }
+            // Doom owns the duplicated keyboard endpoint and framebuffer.
+            // Block only on the supervisor channel; init polls process state
+            // and sends doom:exited after normal menu quit or the Q shortcut.
+            loop {
+                let n = self.supervisor.read_into_blocking(&mut response)?;
+                if response[..n].starts_with(b"doom:exited") {
+                    return Ok(());
                 }
             }
-            Err(libcanvas::ErrorCode::InvalidArgs)
         })();
 
         self.screen.clear();
