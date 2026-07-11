@@ -16,6 +16,7 @@ pub mod scheduler;
 pub mod smp;
 pub mod task;
 pub mod mem;
+pub mod panic;
 pub mod boot;
 
 pub use huesos_pmm::MemoryRegion;
@@ -74,6 +75,9 @@ pub unsafe fn kmain(boot_info: BootInfo) -> ! {
     init::map_firmware_tables(boot_info.memory_regions, boot_info.rsdp_addr);
 
     init::heap_init();
+    let panic_test_requested = boot_info
+        .hbi_image
+        .is_some_and(cmdline_requests_panic_test);
     init::object_init();
 
     if let Some(rsdp) = boot_info.rsdp_addr {
@@ -89,6 +93,8 @@ pub unsafe fn kmain(boot_info: BootInfo) -> ! {
     }
 
     init::framebuffer_init(boot_info.framebuffer);
+    huesos_arch::fault::set_kernel_fault_handler(crate::panic::from_cpu_fault);
+    huesos_arch::fault::set_user_fault_handler(handle_user_fault);
     huesos_hal::init();
     init::syscall_init();
     scheduler::init();
@@ -97,6 +103,10 @@ pub unsafe fn kmain(boot_info: BootInfo) -> ! {
     // APs finished local init during bringup_aps and are spinning on the
     // run-gate; release them now that the timer callback + PIC are live.
     smp::release_aps();
+
+    if panic_test_requested {
+        panic!("intentional panic requested by HBI cmdline panic_test=1");
+    }
 
     log_boot_banner(&boot_info);
     spawn_init_process();
@@ -130,6 +140,64 @@ fn spawn_init_process() {
     let _ = scheduler::spawn_user_thread(
         &name, spawned.process, spawned.entry_point, spawned.user_rsp, spawned.cr3,
     );
+}
+
+fn cmdline_requests_panic_test(hbi_data: &[u8]) -> bool {
+    use crate::boot::hbi::{HbiImage, ModuleType};
+
+    let Ok(image) = HbiImage::parse(hbi_data) else {
+        return false;
+    };
+    let Ok(cmdline) = image.get_module(ModuleType::Cmdline) else {
+        return false;
+    };
+    cmdline
+        .split(|byte| byte.is_ascii_whitespace())
+        .any(|argument| argument == b"panic_test=1")
+}
+
+fn handle_user_fault(info: huesos_arch::fault::FaultInfo) -> ! {
+    use core::fmt::Write;
+    use huesos_object::KernelObject;
+
+    let mut name_storage = [0u8; 64];
+    let (process_koid, name_length) = huesos_object::current_process()
+        .map(|process| (process.koid().0, process.copy_name(&mut name_storage)))
+        .unwrap_or((0, 0));
+    let process_name = if name_length == 0 {
+        "<unknown>"
+    } else {
+        core::str::from_utf8(&name_storage[..name_length]).unwrap_or("<non-utf8>")
+    };
+    let task_id = scheduler::current_task_id().unwrap_or(u64::MAX);
+    let code = match info.kind {
+        huesos_arch::fault::FaultKind::PageFault => huesos_abi::fault_exit::PAGE_FAULT,
+        huesos_arch::fault::FaultKind::GeneralProtection => {
+            huesos_abi::fault_exit::GENERAL_PROTECTION
+        }
+        huesos_arch::fault::FaultKind::InvalidOpcode => huesos_abi::fault_exit::INVALID_OPCODE,
+        huesos_arch::fault::FaultKind::DivideError => huesos_abi::fault_exit::DIVIDE_ERROR,
+        huesos_arch::fault::FaultKind::AlignmentCheck => huesos_abi::fault_exit::ALIGNMENT_CHECK,
+        huesos_arch::fault::FaultKind::DoubleFault => {
+            crate::panic::from_cpu_fault(info)
+        }
+    };
+
+    let mut writer = huesos_arch::serial::SerialWriter;
+    let _ = writeln!(
+        writer,
+        "[user-fault] process={} koid={} task={} cpu={} reason={} rip={:#x} address={:#x} error={:#x} action=terminate-process code={}",
+        process_name,
+        process_koid,
+        task_id,
+        huesos_arch::cpu::current_id(),
+        info.kind.as_str(),
+        info.instruction_pointer,
+        info.fault_address,
+        info.error_code,
+        code,
+    );
+    scheduler::terminate_current_process(code)
 }
 
 fn dbg(msg: &str) {

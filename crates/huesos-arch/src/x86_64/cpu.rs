@@ -1,8 +1,9 @@
 //! CPU primitives.
 
-/// Get the local APIC ID (simplified: always 0 on UP).
+/// Read the initial xAPIC identifier from CPUID leaf 1.
 pub fn apic_id() -> u32 {
-    0
+    let leaf = core::arch::x86_64::__cpuid(1);
+    (leaf.ebx >> 24) & 0xff
 }
 
 /// Get current CPU id.

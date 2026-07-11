@@ -1,22 +1,55 @@
-//! Interrupt Descriptor Table.
+//! Interrupt Descriptor Table and privilege-aware exception dispatch.
 
+use core::sync::atomic::{AtomicUsize, Ordering};
+use spin::Lazy;
 use x86_64::registers::control::Cr2;
 use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame, PageFaultErrorCode};
-use spin::Lazy;
 
-fn dprint(msg: &str) {
-    use core::fmt::Write;
-    let mut w = crate::serial::SerialWriter;
-    let _ = w.write_str(msg);
+use super::fault::{FaultInfo, FaultKind};
+
+/// IPI vector used to freeze non-owner CPUs during a kernel panic.
+pub const PANIC_STOP_VECTOR: u8 = 0xF1;
+static PANIC_STOPPED_CPUS: AtomicUsize = AtomicUsize::new(0);
+
+/// Number of peer CPUs that acknowledged the panic-stop IPI.
+pub fn panic_stopped_cpus() -> usize {
+    PANIC_STOPPED_CPUS.load(Ordering::Acquire)
+}
+
+fn fault_info(
+    kind: FaultKind,
+    frame: &InterruptStackFrame,
+    error_code: u64,
+    fault_address: u64,
+) -> FaultInfo {
+    FaultInfo {
+        kind,
+        instruction_pointer: frame.instruction_pointer.as_u64(),
+        stack_pointer: frame.stack_pointer.as_u64(),
+        rflags: frame.cpu_flags.bits(),
+        code_segment: frame.code_segment.0 as u64,
+        error_code,
+        fault_address,
+    }
+}
+
+fn dispatch(info: FaultInfo) -> ! {
+    if info.from_userspace() {
+        super::fault::user_fault(info)
+    } else {
+        super::fault::kernel_fault(info)
+    }
 }
 
 static IDT: Lazy<InterruptDescriptorTable> = Lazy::new(|| {
     let mut idt = InterruptDescriptorTable::new();
+    idt.divide_error.set_handler_fn(divide_error_handler);
     idt.breakpoint.set_handler_fn(breakpoint_handler);
     idt.invalid_opcode.set_handler_fn(invalid_opcode_handler);
     idt.general_protection_fault
         .set_handler_fn(general_protection_fault_handler);
     idt.page_fault.set_handler_fn(page_fault_handler);
+    idt.alignment_check.set_handler_fn(alignment_check_handler);
     unsafe {
         idt.double_fault
             .set_handler_fn(double_fault_handler)
@@ -24,6 +57,7 @@ static IDT: Lazy<InterruptDescriptorTable> = Lazy::new(|| {
     }
     idt[32].set_handler_fn(timer_handler);
     idt[33].set_handler_fn(keyboard_handler);
+    idt[PANIC_STOP_VECTOR].set_handler_fn(panic_stop_handler);
     idt
 });
 
@@ -32,69 +66,64 @@ pub fn init() {
     IDT.load();
 }
 
-extern "x86-interrupt" fn breakpoint_handler(_stack_frame: InterruptStackFrame) {
-    dprint("[idt] BREAKPOINT\n");
+extern "x86-interrupt" fn divide_error_handler(frame: InterruptStackFrame) {
+    dispatch(fault_info(FaultKind::DivideError, &frame, 0, 0));
 }
 
-extern "x86-interrupt" fn invalid_opcode_handler(stack_frame: InterruptStackFrame) {
-    dprint("[idt] INVALID OPCODE at ");
-    print_hex(stack_frame.instruction_pointer.as_u64());
-    dprint("\n");
-    loop {
-        crate::hlt();
-    }
+extern "x86-interrupt" fn breakpoint_handler(_frame: InterruptStackFrame) {
+    // INT3 is deliberately non-fatal for now. A debugger hook can replace
+    // this behavior later; returning resumes immediately after the trap.
+    crate::serial::emergency_write("[idt] BREAKPOINT\n");
+}
+
+extern "x86-interrupt" fn invalid_opcode_handler(frame: InterruptStackFrame) {
+    dispatch(fault_info(FaultKind::InvalidOpcode, &frame, 0, 0));
 }
 
 extern "x86-interrupt" fn general_protection_fault_handler(
-    stack_frame: InterruptStackFrame,
+    frame: InterruptStackFrame,
     error_code: u64,
 ) {
-    dprint("[idt] GENERAL PROTECTION FAULT code=");
-    print_hex(error_code);
-    dprint(" rip=");
-    print_hex(stack_frame.instruction_pointer.as_u64());
-    dprint(" cs=");
-    print_hex(stack_frame.code_segment.0 as u64);
-    dprint("\n");
-    loop {
-        crate::hlt();
-    }
+    dispatch(fault_info(
+        FaultKind::GeneralProtection,
+        &frame,
+        error_code,
+        0,
+    ));
 }
 
 extern "x86-interrupt" fn page_fault_handler(
-    stack_frame: InterruptStackFrame,
+    frame: InterruptStackFrame,
     error_code: PageFaultErrorCode,
 ) {
-    let addr = Cr2::read();
-    dprint("[idt] PAGE FAULT addr=");
-    print_hex(addr.map(|a| a.as_u64()).unwrap_or(0xdead_dead));
-    dprint(" code=");
-    print_hex(error_code.bits());
-    dprint(" rip=");
-    print_hex(stack_frame.instruction_pointer.as_u64());
-    dprint("\n");
+    let address = Cr2::read().map(|a| a.as_u64()).unwrap_or(0);
+    dispatch(fault_info(
+        FaultKind::PageFault,
+        &frame,
+        error_code.bits(),
+        address,
+    ));
+}
+
+extern "x86-interrupt" fn alignment_check_handler(frame: InterruptStackFrame, error_code: u64) {
+    dispatch(fault_info(FaultKind::AlignmentCheck, &frame, error_code, 0));
+}
+
+extern "x86-interrupt" fn double_fault_handler(frame: InterruptStackFrame, error_code: u64) -> ! {
+    super::fault::kernel_fault(fault_info(FaultKind::DoubleFault, &frame, error_code, 0));
+}
+
+extern "x86-interrupt" fn panic_stop_handler(_frame: InterruptStackFrame) {
+    super::interrupts::disable();
+    PANIC_STOPPED_CPUS.fetch_add(1, Ordering::Release);
+    super::lapic::eoi();
     loop {
         crate::hlt();
     }
 }
 
-extern "x86-interrupt" fn double_fault_handler(
-    stack_frame: InterruptStackFrame,
-    _error_code: u64,
-) -> ! {
-    dprint("[idt] DOUBLE FAULT rip=");
-    print_hex(stack_frame.instruction_pointer.as_u64());
-    dprint("\n");
-    loop {}
-}
-
 extern "x86-interrupt" fn timer_handler(_stack_frame: InterruptStackFrame) {
-    // BSP and APs drive the scheduler from the *local* APIC timer (vector
-    // 0x20). EOI the LAPIC first so the next tick can fire on this CPU.
     super::lapic::eoi();
-    // Also EOI the 8259 PIC: on the BSP the firmware path may still route
-    // IRQ0 through the PIC in parallel with the LAPIC timer. Harmless on
-    // APs (no PIC IRQ pending).
     unsafe {
         super::interrupts::PICS.lock().notify_end_of_interrupt(32);
     }
@@ -110,20 +139,4 @@ extern "x86-interrupt" fn keyboard_handler(_stack_frame: InterruptStackFrame) {
         super::interrupts::PICS.lock().notify_end_of_interrupt(33);
     }
     crate::x86_64::irq_callback::emit(1, scancode as u64);
-}
-
-fn print_hex(v: u64) {
-    let mut buf = [0u8; 18];
-    buf[0] = b'0';
-    buf[1] = b'x';
-    for i in 0..16 {
-        let nibble = (v >> ((15 - i) * 4)) & 0xF;
-        buf[2 + i] = match nibble {
-            0..=9 => b'0' + nibble as u8,
-            _ => b'a' + (nibble as u8 - 10),
-        };
-    }
-    if let Ok(s) = core::str::from_utf8(&buf) {
-        dprint(s);
-    }
 }

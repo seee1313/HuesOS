@@ -53,6 +53,12 @@ PMM: ... frames (... MiB)
 [init] user pointer guard smoke OK
 [init] VMO read/write round-trip OK
 [init] channel IPC round-trip OK
+[fault-probe] triggering page
+[user-fault] process=fault-probe ... reason=PAGE FAULT ... code=-4097
+[fault-probe] triggering opcode
+[fault-probe] triggering gpf
+[fault-probe] triggering divide
+[init] user fault isolation OK (#PF/#UD/#GP/#DE contained)
 [init] launched driver-manager
 ...
 [terminal] started in userspace
@@ -99,6 +105,23 @@ The complete regression matrix to retain and expand is:
 
 All invalid cases must return `InvalidArgs` without a kernel exception or
 consuming a queued message/event. See [USER_MEMORY.md](USER_MEMORY.md).
+
+## Kernel Panic Screen Test
+
+Normal images never panic intentionally. To exercise the fatal path, build an
+HBI whose command-line module contains `panic_test=1`, boot it with QEMU, and
+capture serial plus a monitor `screendump`. The assertions are:
+
+- serial contains `HuesOS KERNEL PANIC`, the intentional panic message, CPU,
+  CR3, `Stopped peer CPUs: 1` under `-smp 2`, and
+  `system halted; no automatic reboot`;
+- no userspace process starts;
+- QEMU remains running until the external test timeout/quit;
+- the captured framebuffer is predominantly RGB `(150, 0, 0)` and contains
+  white text pixels.
+
+The exact safety model and expected output are documented in
+[FAULTS_AND_PANIC.md](FAULTS_AND_PANIC.md).
 
 ## Real Hardware Smoke Tests
 

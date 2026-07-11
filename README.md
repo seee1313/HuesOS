@@ -36,6 +36,9 @@ see [Known Limitations](#known-limitations) and
 - ✅ Hardened userspace-copy boundary: full lower-half range and active
   page-table permission validation on every pointer-bearing syscall; no direct
   caller-pointer dereferences in syscall handlers; bounded temporary transfers
+- ✅ Privilege-aware fault isolation: unhandled Ring 3 exceptions terminate the
+  complete process while Ring 0 faults enter a non-returning SMP kernel panic
+  (white diagnostics on a red framebuffer plus emergency serial output)
 - ✅ **SMP**: MADT parse, INIT-SIPI-SIPI, per-CPU GDT/TSS/IDT/CpuLocal
   (GS_BASE), per-CPU scheduler with idle task, shared LAPIC timer
   calibration, LAPIC EOI on vector 0x20, online-CPU load balancing, IPI
@@ -138,7 +141,9 @@ See [docs/USERSPACE.md](docs/USERSPACE.md) — the short version: depend on
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for detailed design
 (including SMP, HBI, HHDM base-rev-3 mapping rules, and allocators). The
 security contract for every pointer-bearing syscall is documented separately
-in [docs/USER_MEMORY.md](docs/USER_MEMORY.md).
+in [docs/USER_MEMORY.md](docs/USER_MEMORY.md). Exception containment and the
+non-rebooting red panic screen are specified in
+[docs/FAULTS_AND_PANIC.md](docs/FAULTS_AND_PANIC.md).
 
 ## Building
 

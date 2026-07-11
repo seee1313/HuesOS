@@ -124,8 +124,5 @@ fn log_line(msg: &str) {
 #[cfg(not(test))]
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
-    use core::fmt::Write;
-    let mut writer = huesos_arch::serial::SerialWriter;
-    let _ = write!(&mut writer, "[KERNEL PANIC] {}\n", info);
-    loop { huesos_arch::hlt(); }
+    huesos_kernel::panic::from_rust(info)
 }

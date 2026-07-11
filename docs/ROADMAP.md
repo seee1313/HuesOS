@@ -7,6 +7,16 @@ priority order.
 
 ## Done (recent)
 
+### Ring-3 fault isolation + SMP kernel panic
+- CPL-aware dispatch for #PF, #GP, #UD, #DE, and #AC; #DF is always fatal
+- Unhandled userspace exceptions terminate the complete process with stable
+  `ProcessWait` codes while unrelated services continue
+- Cross-CPU process termination, reschedule IPI, and CR3-safe deferred teardown
+- Single-owner kernel panic, panic-stop IPI, lock-free emergency serial path
+- Allocation-free white-on-red framebuffer diagnostics; no automatic reboot
+- Embedded faulting child plus debug/SMP QEMU containment smoke test
+- Trusted `panic_test=1` HBI hook and screenshot-based panic renderer test
+
 ### Syscall user-memory boundary
 - Central validated user-copy layer; syscall handlers no longer directly
   dereference caller pointers
@@ -48,12 +58,12 @@ priority order.
 
 ## Immediate
 
-### 1. User-fault isolation and recoverable copies
-- **Current**: syscall copies reject invalid ranges before access; mappings
-  cannot yet be removed concurrently because no unmap/protect syscall exists.
-- **Needed**: classify CPL3 page faults and terminate only the offending
-  process; add exception-table/fixup recovery (or address-space locking) before
-  exposing VMAR unmap/protect; add SMEP/SMAP after the copy path is prepared.
+### 1. Recoverable copies, VMAR unmap/protect, and SMEP/SMAP
+- **Current**: syscall copies prevalidate mappings, and Ring-3 faults are
+  process-contained. No userspace unmap/protect operation can race a copy yet.
+- **Needed**: exception-table/fixup recovery or address-space locking before
+  exposing VMAR unmap/protect, followed by SMEP/SMAP once explicit copy access
+  windows are ready.
 
 ### 2. IOAPIC interrupt routing
 - **Current**: LAPIC timer on all CPUs; keyboard still via legacy PIC path.

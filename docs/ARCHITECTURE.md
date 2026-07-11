@@ -172,6 +172,16 @@ checklist, and the required upgrade before VMAR unmap/protect is introduced.
 `Canvas` and presents via bounds-checked `FramebufferBlit`. No raw video
 mapping is given to userspace.
 
+## Fault Containment
+
+The saved CS privilege level determines exception policy. Page faults, GPF,
+invalid opcodes, divide errors, and alignment checks from Ring 3 terminate the
+entire owning process and report a stable negative status through
+`ProcessWait`. Ring 0 exceptions and double faults enter the SMP panic path:
+one CPU emits emergency serial diagnostics and a white-on-red framebuffer
+report, other CPUs receive a panic-stop IPI, and no CPU reboots. See
+[FAULTS_AND_PANIC.md](FAULTS_AND_PANIC.md).
+
 ## Security Model
 
 - No global namespaces — capabilities via handles.

@@ -21,6 +21,15 @@ pub fn read_byte() -> u8 {
     SERIAL.lock().receive()
 }
 
+/// Write without taking the normal serial lock. Intended only for fatal panic
+/// paths where the interrupted CPU might already own that lock.
+pub fn emergency_write(s: &str) {
+    let mut port = unsafe { SerialPort::new(0x3F8) };
+    for byte in s.bytes() {
+        port.send(byte);
+    }
+}
+
 /// Writer for `core::fmt::Write`.
 pub struct SerialWriter;
 

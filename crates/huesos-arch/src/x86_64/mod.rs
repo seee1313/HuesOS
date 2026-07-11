@@ -5,6 +5,7 @@ pub mod ap_boot;
 pub mod context_switch;
 pub mod cpu;
 pub mod cpu_local;
+pub mod fault;
 pub mod gdt;
 pub mod idt;
 pub mod interrupts;
