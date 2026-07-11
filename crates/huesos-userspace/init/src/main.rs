@@ -23,6 +23,7 @@ macro_rules! init_logln {
 
 static DRIVER_MANAGER_ELF: &[u8] = include_bytes!(env!("HUESOS_DRIVER_MANAGER_PATH"));
 static TERMINAL_ELF: &[u8] = include_bytes!(env!("HUESOS_TERMINAL_PATH"));
+static FAULT_PROBE_ELF: &[u8] = include_bytes!(env!("HUESOS_FAULT_PROBE_PATH"));
 static BOOTFS_IMAGE: &[u8] = include_bytes!(env!("HUESOS_BOOTFS_PATH"));
 
 #[unsafe(no_mangle)]
@@ -38,6 +39,7 @@ pub extern "C" fn _start() -> ! {
 
     run_vmo_check(&mut logger);
     run_channel_check(&mut logger);
+    run_fault_isolation_check(&mut logger);
 
     let driver_manager = launch_service(&mut logger, "driver-manager", DRIVER_MANAGER_ELF);
 
@@ -176,6 +178,57 @@ fn read_ready_message(logger: &mut InitLogger, name: &str, channel: &Channel) {
         }
     }
     init_logln!(logger, "[init] {} did not send ready message yet", name);
+}
+
+fn run_fault_isolation_check(logger: &mut InitLogger) {
+    let cases: [(&[u8], i64); 4] = [
+        (b"page", libcanvas::fault_exit::PAGE_FAULT),
+        (b"opcode", libcanvas::fault_exit::INVALID_OPCODE),
+        (b"gpf", libcanvas::fault_exit::GENERAL_PROTECTION),
+        (b"divide", libcanvas::fault_exit::DIVIDE_ERROR),
+    ];
+
+    for (command, expected) in cases {
+        let Ok((process, bootstrap)) =
+            libcanvas::process::spawn_elf("fault-probe", FAULT_PROBE_ELF)
+        else {
+            init_logln!(logger, "[init] user fault isolation FAILED (launch)");
+            return;
+        };
+        if let Err(error) = bootstrap.write(command) {
+            init_logln!(
+                logger,
+                "[init] user fault isolation FAILED (command: {})",
+                error.as_str()
+            );
+            return;
+        }
+        drop(bootstrap);
+        match process.wait_exit() {
+            Ok(code) if code == expected => {}
+            Ok(code) => {
+                init_logln!(
+                    logger,
+                    "[init] user fault isolation FAILED (exit code {}, expected {})",
+                    code,
+                    expected
+                );
+                return;
+            }
+            Err(error) => {
+                init_logln!(
+                    logger,
+                    "[init] user fault isolation FAILED ({})",
+                    error.as_str()
+                );
+                return;
+            }
+        }
+    }
+    init_logln!(
+        logger,
+        "[init] user fault isolation OK (#PF/#UD/#GP/#DE contained)"
+    );
 }
 
 fn run_vmo_check(logger: &mut InitLogger) {

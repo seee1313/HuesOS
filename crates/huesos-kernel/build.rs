@@ -41,6 +41,13 @@ fn main() {
         profile,
         &[],
     );
+    let fault_probe = build_userspace_program(
+        &userspace_root,
+        "fault-probe",
+        "huesos-fault-probe",
+        profile,
+        &[],
+    );
     let bootfs = build_bootfs_image(&manifest_dir, &input_driver_host, &terminal);
     let init = build_userspace_program(
         &userspace_root,
@@ -50,6 +57,7 @@ fn main() {
         &[
             ("HUESOS_DRIVER_MANAGER_PATH", driver_manager.as_os_str()),
             ("HUESOS_TERMINAL_PATH", terminal.as_os_str()),
+            ("HUESOS_FAULT_PROBE_PATH", fault_probe.as_os_str()),
             ("HUESOS_BOOTFS_PATH", bootfs.as_os_str()),
         ],
     );
@@ -58,7 +66,13 @@ fn main() {
 }
 
 fn track_userspace_inputs(userspace_root: &Path) {
-    for program in ["init", "driver-manager", "driver-host-input", "terminal"] {
+    for program in [
+        "init",
+        "driver-manager",
+        "driver-host-input",
+        "terminal",
+        "fault-probe",
+    ] {
         println!(
             "cargo:rerun-if-changed={}",
             userspace_root.join(program).join("src").display()

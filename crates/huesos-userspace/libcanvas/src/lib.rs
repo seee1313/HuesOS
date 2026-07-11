@@ -81,8 +81,8 @@ pub use vmo::Vmo;
 /// Re-exported so application code can match on specific failure reasons
 /// (`use libcanvas::ErrorCode;`) without depending on `huesos-abi` directly.
 pub use huesos_abi::{
-    vmar_flags, ErrorCode, PortPacket, BOOTSTRAP_HANDLE, PORT_PACKET_INTERRUPT, USER_STACK_SIZE,
-    USER_STACK_TOP,
+    fault_exit, vmar_flags, ErrorCode, PortPacket, BOOTSTRAP_HANDLE, PORT_PACKET_INTERRUPT,
+    USER_STACK_SIZE, USER_STACK_TOP,
 };
 
 /// Result type used throughout `libcanvas`: every fallible syscall wrapper
