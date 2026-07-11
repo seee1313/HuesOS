@@ -15,9 +15,14 @@ This runs, e.g.:
 - `huesos-elf`: malformed input, alignment helpers, optional real init ELF.
 - `huesos-object`: VMO R/W, OOM without panic, handle tables, channel peer
   delivery regression.
-- `huesos-fat` / `huesos-alloc`: exercised via the Makefile host-test path
-  (workspace `build-std` is temporarily bypassed — see `Makefile` `test`
-  target).
+- `huesos-fat` / `huesos-alloc`: exercised in the same pinned-toolchain host
+  command. The custom kernel target is overridden explicitly and workspace
+  `build-std` is disabled for that invocation; the repository Cargo config is
+  never renamed or mutated.
+- `huesos-syscalls::user_memory`: address-boundary arithmetic tests cover the
+  null guard, kernel half, overflow, upper-bound crossing, and a legal range
+  crossing a 4 KiB boundary. Page-table permission tests require QEMU because
+  they inspect the active CR3.
 
 Crates tied to real hardware (`huesos-arch`, SMP, full process/scheduler)
 are validated by QEMU boots rather than host mocks.
@@ -45,6 +50,7 @@ HBI v2.1 parsed. Entries: 0x4
 HuesOS v0.1.0 on CPU 0
 PMM: ... frames (... MiB)
 [init] hello from ring3 userspace, via libcanvas
+[init] user pointer guard smoke OK
 [init] VMO read/write round-trip OK
 [init] channel IPC round-trip OK
 [init] launched driver-manager
@@ -67,6 +73,32 @@ same userspace pipeline.
 | `INVALID OPCODE` in userspace under `-smp 2` | syscall MSRs not programmed on AP |
 | Triple fault after AP start | IDTR zero, stack=0 in trampoline, missing NXE |
 | VMO/channel FAILED | object/syscall regression |
+| Bad user pointer causes kernel `PAGE FAULT` | syscall bypassed `user_memory` validation/copy layer |
+
+### Adversarial user-pointer matrix
+
+The feature-gated `libcanvas::diagnostics` probe runs automatically in init and
+currently verifies three hardware-backed cases on every QEMU boot: a kernel-
+half input, an unmapped low-userspace output, and a mapped read-only text page
+used as an output. Success is reported as `user pointer guard smoke OK`; because
+execution continues, the probe also proves these cases return `InvalidArgs`
+rather than raising a fatal kernel page fault.
+
+The complete regression matrix to retain and expand is:
+
+- address zero and the low 64 KiB guard;
+- the last valid byte and a range crossing `USER_ASPACE_END`;
+- arithmetic overflow in `address + length`;
+- an unmapped userspace page;
+- a supervisor-only/kernel higher-half page;
+- a readable but non-writable page used as an output;
+- a valid range crossing two pages with different permissions;
+- a valid unaligned ABI structure;
+- a zero-length optional buffer;
+- transfer lengths immediately below, at, and above each documented limit.
+
+All invalid cases must return `InvalidArgs` without a kernel exception or
+consuming a queued message/event. See [USER_MEMORY.md](USER_MEMORY.md).
 
 ## Real Hardware Smoke Tests
 

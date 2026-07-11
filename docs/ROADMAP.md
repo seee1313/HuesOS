@@ -7,6 +7,17 @@ priority order.
 
 ## Done (recent)
 
+### Syscall user-memory boundary
+- Central validated user-copy layer; syscall handlers no longer directly
+  dereference caller pointers
+- Full ABI-bound and active page-table walk (`PRESENT`, `USER_ACCESSIBLE`,
+  `WRITABLE` for outputs), including multi-page ranges and huge-page leaves
+- Single-fetch ABI records and output preflight before blocking/side effects
+- Bounded VMO/Channel/debug/framebuffer temporary transfers with fallible
+  allocation
+- Handle duplication restricted to equal or reduced rights
+- Detailed contract and review checklist in `docs/USER_MEMORY.md`
+
 ### SMP / LAPIC (core path) — verified in QEMU
 - MADT parse, INIT-SIPI-SIPI trampoline (stack + far jmp into long mode,
   `EFER.NXE`)
@@ -27,35 +38,46 @@ priority order.
 - Wait queues + `park`/`wake` hooks from the scheduler
 - Blocking `ChannelRead` / `PortRead` (flag arg) and blocking `ProcessWait`
 - Handle transfer-on-write already landed earlier; documented
-- `Vmo` Drop frees physical frames; exit path frees kernel stacks via reaper
+- `Vmo` Drop returns physical frames when the object is explicitly released;
+  exit path frees kernel stacks via reaper
 - `AddressSpace::destroy` frees owned user frames + private page tables
 - Process teardown clears handle table; driver-host input uses blocking Port
-- Global handle-count GC: last close unregisters object (Vmo Drop, etc.)
+- Handle counts track table and in-flight ownership, but the registry
+  intentionally does not yet auto-unregister on the ordinary last close
 - Timed waits: `ChannelRead`/`PortRead` mode `>=2` = timeout in ticks + `TimedOut`
 
 ## Immediate
 
-### 1. IOAPIC interrupt routing
+### 1. User-fault isolation and recoverable copies
+- **Current**: syscall copies reject invalid ranges before access; mappings
+  cannot yet be removed concurrently because no unmap/protect syscall exists.
+- **Needed**: classify CPL3 page faults and terminate only the offending
+  process; add exception-table/fixup recovery (or address-space locking) before
+  exposing VMAR unmap/protect; add SMEP/SMAP after the copy path is prepared.
+
+### 2. IOAPIC interrupt routing
 - **Current**: LAPIC timer on all CPUs; keyboard still via legacy PIC path.
 - **Needed**: full IOAPIC programming, IRQ remapping for multi-core IRQs,
   drop reliance on 8259 for anything that can go through IOAPIC.
 
-### 2. Process/task teardown (mostly done)
-- **Current**: stacks reaped; VMO frames on Drop; AS destroy; handle clear;
-  last-handle unregisters from global registry. Residual: objects held only
-  by kernel internals without a handle path.
-- **Needed**: a "zombie" list + reaper task (or reference-counted teardown
-  triggered once nothing can reference the task anymore) that frees the
-  process's `AddressSpace` (walking all 4 page table levels and returning
-  frames to `huesos-pmm`) and the task's kernel stack.
+### 3. Process/task and object teardown (mostly done)
+- **Current**: exited-process stacks, private page tables, and address-space-
+  owned frames are reaped; process teardown clears its handle table. The
+  global object registry still holds strong `Arc`s and does not automatically
+  unregister an object on ordinary last-handle close.
+- **Needed**: formalize handle, mapping, in-flight Channel, scheduler, and
+  kernel-internal ownership; use weak registry entries or equivalent lifecycle
+  accounting so VMOs and their physical frames are reclaimed without freeing
+  an object that is still mapped or in flight. Finished task metadata also
+  needs bounded zombie reclamation.
 
-### 3. Blocking syscalls / wait primitives (mostly done)
+### 4. Blocking syscalls / wait primitives (mostly done)
 - **Current**: Channel/Port block + tick timeouts (`TimedOut`); ProcessWait.
 - **Needed**: multiplexed multi-object wait / cancel.
 
 ## Short Term
 
-### 4. Multiple/dynamic userspace processes
+### 5. Multiple/dynamic userspace processes
 - **Current**: MVP split launch exists (`ProcessCreate`, `VmarMap`,
   `ThreadCreate`, `ThreadStart`) and init can launch embedded child ELF
   images through `libcanvas::process::spawn_elf`.
@@ -64,27 +86,29 @@ priority order.
   semantics, and eventually loading ELF images from a VFS instead of
   build-time `include_bytes!`.
 
-### 5. Handle transfer semantics
-- **Current**: `ChannelWrite` copies `Handle` values into the message but
-  doesn't remove them from the sender's handle table (so a "transferred"
-  handle remains usable by both processes — a capability leak).
-- **Needed**: proper move semantics matching the `TRANSFER` right.
+### 6. Handle transfer semantics
+- **Current**: `ChannelWrite` validates all handles, requires `TRANSFER`, then
+  removes them from the sender before enqueueing; in-flight messages retain
+  handle-count ownership until receipt or drop.
+- **Needed**: transactional rollback when peer closure/send failure becomes
+  observable, richer typed handle dispositions, and stress tests for concurrent
+  close/transfer.
 
-### 6. Real VFS + drivers in userspace
+### 7. Real VFS + drivers in userspace
 - BOOTFS is live as a RAM archive; `huesos-fat` exists as a library.
 - **Needed**: virtio-block (or similar) + FAT/other backends behind
   FileSystemService; load DriverHosts from FS instead of build embeds.
 
 ## Medium Term
 
-### 7. Capabilities & resource quotas
+### 8. Capabilities & resource quotas
 - Job-based CPU time / memory / handle-count quotas (the `Job` object
   exists as a container concept but enforces nothing yet).
 
-### 8. Networking
+### 9. Networking
 - virtio-net driver + a userspace TCP/IP stack.
 
-### 9. Scheduler polish
+### 10. Scheduler polish
 - Work-stealing, better AP timer calibration without PIT races, fair
   migration, and serial-log interleaving cleanup under SMP.
 
