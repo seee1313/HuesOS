@@ -46,7 +46,7 @@ pub extern "C" fn _start() -> ! {
         open_service(&registry, b"open:filesystem", b"service:filesystem:channel").ok();
 
     println!("[terminal] keyboard service online, starting shell");
-    let mut shell = Shell::new(keyboard, filesystem);
+    let mut shell = Shell::new(keyboard, filesystem, bootstrap);
     shell.run();
 }
 

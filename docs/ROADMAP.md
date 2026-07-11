@@ -7,6 +7,16 @@ priority order.
 
 ## Done (recent)
 
+### Monotonic clock, full-screen Snake, and orderly shutdown
+- Hardware-timer monotonic syscall unaffected by yields or online CPU count
+- Snake pacing moved entirely off RDTSC to 100 Hz monotonic deadlines
+- Resolution-adaptive full-screen board, refreshed HUD/grid/object visuals
+- Terminal `shutdown` request routed through init supervisor IPC
+- Init-KOID authorization for `SystemShutdown`; unprivileged callers denied
+- Non-ACPI halt: PS/2 interfaces quiesced, LAPIC timer stopped, peer CPUs
+  stopped by IPI, final safe-to-power-off screen retained
+- QEMU keyboard-injection and framebuffer screenshot tests
+
 ### Ring-3 fault isolation + SMP kernel panic
 - CPL-aware dispatch for #PF, #GP, #UD, #DE, and #AC; #DF is always fatal
 - Unhandled userspace exceptions terminate the complete process with stable

@@ -1,5 +1,9 @@
 # HuesOS hardware compatibility notes
 
+> `shutdown` is intentionally a software halt, not physical power removal.
+> HuesOS disables PS/2 interfaces and halts all CPUs without ACPI; the operator
+> must switch off power after the final screen appears. See [SHUTDOWN.md](SHUTDOWN.md).
+
 This document records real-machine smoke tests reported by developers/users.
 It is not a certification matrix yet; it is a lightweight compatibility log so
 we can track which firmware/GPU/CPU combinations have booted beyond QEMU.

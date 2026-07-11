@@ -159,6 +159,11 @@ once, and blocking/dequeueing calls preflight outputs before side effects.
 See [USER_MEMORY.md](USER_MEMORY.md) for the complete contract, limits, review
 checklist, and the required upgrade before VMAR unmap/protect is introduced.
 
+`ClockGetMonotonic` exposes a hardware-tick clock independent of yields and SMP
+CPU count. `SystemShutdown` is restricted to the init KOID; terminal requests
+it through init-owned IPC rather than receiving global power authority. See
+[SHUTDOWN.md](SHUTDOWN.md).
+
 ## Scheduler
 
 - **Fair**: CFS-like virtual runtime in a rank-balanced WAVL tree
@@ -171,6 +176,22 @@ checklist, and the required upgrade before VMAR unmap/protect is introduced.
 `huesos-fb` owns Limine's framebuffer. Userspace draws into a VMO-backed
 `Canvas` and presents via bounds-checked `FramebufferBlit`. No raw video
 mapping is given to userspace.
+
+## Monotonic Time
+
+Each per-CPU scheduler still tracks local scheduling ticks, but public
+monotonic time is a separate atomic counter advanced only by CPU 0's calibrated
+LAPIC interrupt. Cooperative scheduling operations never update it. This keeps
+time stable under different workloads and prevents an SMP system from running
+clocks N times faster with N CPUs.
+
+## Orderly Shutdown
+
+Shutdown is a root-supervisor operation. Terminal sends an IPC request to init;
+the kernel verifies init's recorded KOID, renders the final screen, disables
+both PS/2 interfaces with 8042 commands, broadcasts vector `0xF2`, and halts
+all CPUs permanently. It intentionally performs neither ACPI poweroff nor
+8042 reset. Physical power remains on.
 
 ## Fault Containment
 

@@ -69,6 +69,7 @@ pub mod interrupt;
 pub mod port;
 pub mod process;
 mod raw;
+pub mod system;
 pub mod vmo;
 
 pub use handle::Handle;

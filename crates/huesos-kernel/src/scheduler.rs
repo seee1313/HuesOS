@@ -34,6 +34,10 @@ pub const MAX_CPUS: usize = 64;
 /// Bitmask of CPUs that have finished scheduler init and may receive tasks.
 /// Bit N set => CPU with LAPIC-id N is online for load-balancing.
 static ONLINE_CPUS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// Hardware-timer-driven monotonic clock. Only CPU 0 advances it, so SMP does
+/// not make time run faster. Cooperative yields never affect this clock.
+static MONOTONIC_TICKS: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
 
 /// Mark the current CPU as online for task placement.
 pub fn mark_cpu_online() {
@@ -257,13 +261,15 @@ pub fn init() {
     huesos_arch::timer_callback::set_timer_callback(&|| {
         huesos_arch::interrupts::disable();
         let cpu = cpu_id();
+        if cpu == 0 {
+            MONOTONIC_TICKS.fetch_add(1, Ordering::SeqCst);
+        }
         let mut guard = PER_CPU_SCHEDULERS[cpu].lock();
         let switch_context = guard.tick();
-        let ticks_now = guard.ticks;
         drop(guard); // Release the lock before performing context switch!
 
-        // Wake any waiters whose timeout expired.
-        huesos_object::wait::notify_tick(ticks_now);
+        // Wake any waiters whose timeout expired against hardware time.
+        huesos_object::wait::notify_tick(MONOTONIC_TICKS.load(Ordering::SeqCst));
 
         if let Some((old_ptr, new_ptr)) = switch_context {
             // Safety: interrupts are disabled; pointers point to active Vec
@@ -377,8 +383,7 @@ pub fn current_task_id() -> Option<u64> {
 /// Monotonic BSP-ish tick counter for wait timeouts (sum of local ticks is
 /// fine; we use the current CPU's scheduler ticks).
 pub fn global_ticks() -> u64 {
-    let guard = PER_CPU_SCHEDULERS[cpu_id()].lock();
-    guard.ticks
+    MONOTONIC_TICKS.load(Ordering::SeqCst)
 }
 
 /// Find the best CPU to spawn a task on (online CPU with fewest tasks).

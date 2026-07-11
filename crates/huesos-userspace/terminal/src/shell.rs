@@ -14,6 +14,7 @@ pub struct Shell {
     input_len: usize,
     keyboard: Channel,
     filesystem: Option<Channel>,
+    supervisor: Channel,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -41,7 +42,7 @@ fn decode_keyboard_event(msg: &[u8]) -> Option<Key> {
 
 impl Shell {
     /// Create shell screen using an already-open keyboard service channel.
-    pub fn new(keyboard: Channel, filesystem: Option<Channel>) -> Self {
+    pub fn new(keyboard: Channel, filesystem: Option<Channel>, supervisor: Channel) -> Self {
         let mut screen = Screen::new();
         screen.clear();
         screen.write_line("HuesOS Terminal");
@@ -55,6 +56,7 @@ impl Shell {
             input_len: 0,
             keyboard,
             filesystem,
+            supervisor,
         };
         shell.prompt();
         shell.screen.render();
@@ -114,6 +116,8 @@ impl Shell {
                     let hard = trimmed.ends_with("hard");
                     snake::run(&self.keyboard, hard);
                     self.redraw_after_game(hard);
+                } else if trimmed == "shutdown" {
+                    self.request_shutdown();
                 } else {
                     execute_line(line, &mut self.screen, self.filesystem.as_ref());
                     self.prompt();
@@ -122,6 +126,19 @@ impl Shell {
             }
         }
         self.screen.render();
+    }
+
+    fn request_shutdown(&mut self) {
+        self.screen.clear();
+        self.screen.write_line("HuesOS orderly shutdown requested");
+        self.screen
+            .write_line("Waiting for init to quiesce devices and halt all CPUs...");
+        self.screen.render();
+        if let Err(error) = self.supervisor.write(b"system:shutdown") {
+            self.screen.write_str("shutdown request failed: ");
+            self.screen.write_line(error.as_str());
+            self.prompt();
+        }
     }
 
     fn redraw_after_game(&mut self, hard: bool) {

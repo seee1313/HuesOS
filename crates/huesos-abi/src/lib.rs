@@ -90,13 +90,18 @@ pub enum Syscall {
     InterruptBindPort = 22,
     /// Read channel bytes and receive transferred handles.
     ChannelReadEtc = 23,
+    /// Read the monotonic scheduler clock in 100 Hz ticks.
+    ClockGetMonotonic = 24,
+    /// Request an orderly system shutdown. Kernel policy restricts this to
+    /// the root userspace supervisor.
+    SystemShutdown = 25,
 }
 
 impl Syscall {
     /// Total number of defined syscalls (i.e. one past the highest
     /// currently-assigned number). The dispatcher uses this to reject
     /// obviously-out-of-range numbers before a `match`.
-    pub const COUNT: u64 = 24;
+    pub const COUNT: u64 = 26;
 
     /// Convert a raw syscall number back into a [`Syscall`], if valid.
     pub const fn from_raw(n: u64) -> Option<Self> {
@@ -125,6 +130,8 @@ impl Syscall {
             21 => Self::InterruptCreate,
             22 => Self::InterruptBindPort,
             23 => Self::ChannelReadEtc,
+            24 => Self::ClockGetMonotonic,
+            25 => Self::SystemShutdown,
             _ => return None,
         })
     }
