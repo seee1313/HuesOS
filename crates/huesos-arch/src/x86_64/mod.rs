@@ -24,6 +24,7 @@ pub mod timer_callback;
 /// Must be called exactly once per CPU before entering Rust code.
 pub unsafe fn init_early() {
     serial::init();
+    cpu::enable_sse();
     // Enable the No-Execute bit in EFER: without this, PageTableFlags::NO_EXECUTE
     // is treated as a reserved bit and using it on any page table entry
     // causes an immediate #GP/#PF instead of the intended W^X protection.
