@@ -60,6 +60,10 @@ see [Known Limitations](#known-limitations) and
 - ✅ PS/2 keyboard IRQ bridge to userspace via Interrupt objects + Ports
 - ✅ Real framebuffer driver (`huesos-fb`) + `libcanvas` (safe syscall lib;
   userspace never maps raw video memory)
+- ✅ Privileged non-ACPI `shutdown`: terminal → init IPC, PS/2 quiesce,
+  shutdown-stop IPI, permanent CPU halt, and a final safe-to-power-off screen
+- ✅ Full-screen Snake paced by the kernel monotonic clock (no RDTSC/device-
+  frequency dependency), with resolution-adaptive layout and refreshed visuals
 
 All of the above is exercised live by `huesos-init` on every boot — built
 against `libcanvas` — which creates a VMO, does a channel round-trip,
@@ -143,7 +147,9 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for detailed design
 security contract for every pointer-bearing syscall is documented separately
 in [docs/USER_MEMORY.md](docs/USER_MEMORY.md). Exception containment and the
 non-rebooting red panic screen are specified in
-[docs/FAULTS_AND_PANIC.md](docs/FAULTS_AND_PANIC.md).
+[docs/FAULTS_AND_PANIC.md](docs/FAULTS_AND_PANIC.md). See
+[docs/SHUTDOWN.md](docs/SHUTDOWN.md) for the non-ACPI halt protocol and
+[docs/SNAKE.md](docs/SNAKE.md) for deterministic game timing/fullscreen layout.
 
 ## Building
 

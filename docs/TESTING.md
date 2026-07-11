@@ -106,6 +106,26 @@ The complete regression matrix to retain and expand is:
 All invalid cases must return `InvalidArgs` without a kernel exception or
 consuming a queued message/event. See [USER_MEMORY.md](USER_MEMORY.md).
 
+## Monotonic Clock, Snake, and Shutdown Tests
+
+Init verifies that a 10-tick blocking wait measures 9–12 hardware monotonic
+ticks. This catches time accidentally advancing on `yield` or once per CPU.
+Expected output:
+
+```text
+[init] monotonic clock OK (10-tick wait measured 10 ticks)
+```
+
+The Snake visual test injects `snake` through QEMU's PS/2 keyboard and captures
+two PPM frames 500 ms apart. It checks a fullscreen board, cyan border, visible
+head, movement between frames, and substantial framebuffer change.
+
+Init first verifies that an unprivileged child receives `AccessDenied`. The
+shutdown test then injects `shutdown` and Enter. It checks terminal → init IPC,
+privileged syscall authorization, PS/2 quiescing, SMP halt messages, absence of
+Kernel Panic, and the final dark/cyan/white framebuffer. See
+[SHUTDOWN.md](SHUTDOWN.md) and [SNAKE.md](SNAKE.md).
+
 ## Kernel Panic Screen Test
 
 Normal images never panic intentionally. To exercise the fatal path, build an
