@@ -215,6 +215,21 @@ pub fn map_new_page(page: Page<Size4KiB>, flags: PageTableFlags) -> PhysFrame<Si
     frame
 }
 
+/// Failure while mutating a userspace page table.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum UserPageError {
+    /// The PMM could not allocate an intermediate page-table frame.
+    OutOfMemory,
+    /// The virtual page already has a mapping.
+    AlreadyMapped,
+    /// A huge parent entry prevents a 4 KiB mapping/unmapping operation.
+    ParentHugePage,
+    /// The requested page was not mapped during rollback.
+    NotMapped,
+    /// A page-table entry contained an invalid physical frame address.
+    InvalidFrameAddress,
+}
+
 /// A process's private top-level page table (PML4), sharing the kernel's
 /// higher-half mappings but with an independent lower half for userspace.
 pub struct AddressSpace {
@@ -252,30 +267,66 @@ impl AddressSpace {
         }
     }
 
-    /// Map a page into this address space (user-accessible).
+    /// Fallibly map a non-owned frame into this inactive address space.
+    pub fn try_map_user_page(
+        &mut self,
+        page: Page<Size4KiB>,
+        frame: PhysFrame<Size4KiB>,
+        flags: PageTableFlags,
+    ) -> Result<(), UserPageError> {
+        use x86_64::structures::paging::mapper::MapToError;
+
+        let virt = phys_to_virt(self.pml4_frame.start_address().as_u64());
+        // SAFETY: pml4_frame is owned by this AddressSpace and HHDM maps every
+        // page-table frame for its full lifetime.
+        let table: &mut PageTable = unsafe { &mut *virt.as_mut_ptr() };
+        let phys_offset = VirtAddr::new(*HHDM_OFFSET.lock());
+        // SAFETY: table is the unique mutable PML4 owned behind &mut self.
+        let mut mapper = unsafe { OffsetPageTable::new(table, phys_offset) };
+        let flush = unsafe { mapper.map_to(page, frame, flags, &mut PmmFrameAllocator) }.map_err(
+            |error| match error {
+                MapToError::FrameAllocationFailed => UserPageError::OutOfMemory,
+                MapToError::PageAlreadyMapped(_) => UserPageError::AlreadyMapped,
+                MapToError::ParentEntryHugePage => UserPageError::ParentHugePage,
+            },
+        )?;
+        // The child CR3 is inactive, so it cannot contain a stale TLB entry.
+        flush.ignore();
+        Ok(())
+    }
+
+    /// Remove one 4 KiB mapping from this inactive address space.
     ///
-    /// Does **not** take ownership of `frame` (VMO-backed mappings).
-    pub fn map_user_page(
+    /// Data-frame ownership is unchanged; rollback callers only remove VMO
+    /// mappings. Empty intermediate page tables remain allocated until normal
+    /// address-space destruction.
+    pub fn unmap_user_page(&mut self, page: Page<Size4KiB>) -> Result<(), UserPageError> {
+        use x86_64::structures::paging::mapper::UnmapError;
+
+        let virt = phys_to_virt(self.pml4_frame.start_address().as_u64());
+        // SAFETY: identical unique-PML4 invariant to try_map_user_page.
+        let table: &mut PageTable = unsafe { &mut *virt.as_mut_ptr() };
+        let phys_offset = VirtAddr::new(*HHDM_OFFSET.lock());
+        // SAFETY: table and physical offset describe this owned address space.
+        let mut mapper = unsafe { OffsetPageTable::new(table, phys_offset) };
+        let (_, flush) = mapper.unmap(page).map_err(|error| match error {
+            UnmapError::PageNotMapped => UserPageError::NotMapped,
+            UnmapError::ParentEntryHugePage => UserPageError::ParentHugePage,
+            UnmapError::InvalidFrameAddress(_) => UserPageError::InvalidFrameAddress,
+        })?;
+        flush.ignore();
+        Ok(())
+    }
+
+    /// Map a page during trusted bootstrap paths that cannot recover.
+    fn map_user_page(
         &mut self,
         page: Page<Size4KiB>,
         frame: PhysFrame<Size4KiB>,
         flags: PageTableFlags,
     ) {
-        let virt = phys_to_virt(self.pml4_frame.start_address().as_u64());
-        let table: &mut PageTable = unsafe { &mut *virt.as_mut_ptr() };
-        let phys_offset = VirtAddr::new(*HHDM_OFFSET.lock());
-        let mut mapper = unsafe { OffsetPageTable::new(table, phys_offset) };
-        unsafe {
-            // AddressSpace mappings are constructed for a non-active child
-            // CR3. Flushing the caller's current TLB for every child page is
-            // both unnecessary and catastrophically slow for large static
-            // programs such as Doom. The first CR3 load establishes a clean
-            // TLB context for these entries.
-            mapper
-                .map_to(page, frame, flags, &mut PmmFrameAllocator)
-                .expect("user map_to failed")
-                .ignore();
-        }
+        self.try_map_user_page(page, frame, flags)
+            .expect("trusted userspace image mapping failed");
     }
 
     /// Allocate a fresh frame and map it into this address space.

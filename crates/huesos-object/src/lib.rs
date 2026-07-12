@@ -176,6 +176,10 @@ mod tests {
             flags: 0,
         };
         assert!(vmar.record_mapping(outside).is_err());
+
+        assert!(vmar.remove_mapping(first));
+        assert!(!vmar.overlaps_existing(first.base, first.size));
+        assert!(!vmar.remove_mapping(first));
     }
 
     #[test]
