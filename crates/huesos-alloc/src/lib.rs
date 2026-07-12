@@ -12,6 +12,9 @@ use core::result::Result;
 pub enum AllocError {
     OutOfMemory,
     InvalidSize,
+    InvalidPointer,
+    DoubleFree,
+    CorruptedFreeList,
 }
 
 pub struct BuddyAllocator<const ORDER: usize> {
@@ -59,7 +62,9 @@ impl<const ORDER: usize> BuddyAllocator<ORDER> {
                 0,
                 "block not aligned to its order"
             );
-            allocator.push_free_block(order, block_ptr);
+            allocator
+                .push_free_block_checked(order, block_ptr)
+                .expect("constructor generated an invalid buddy block");
 
             current_offset += 1 << order;
             remaining_pages -= 1 << order;
@@ -73,41 +78,17 @@ impl<const ORDER: usize> BuddyAllocator<ORDER> {
         (1usize << order) * self.page_size
     }
 
-    fn push_free_block(&mut self, order: usize, ptr: *mut FreeBlock) {
-        let end = self.base_addr + self.total_pages * self.page_size;
-        debug_assert!((ptr as usize) >= self.base_addr, "ptr below base");
-        debug_assert!((ptr as usize) < end, "ptr above end");
-        debug_assert_eq!((ptr as usize) % self.page_size, 0, "ptr not page-aligned");
-        debug_assert_eq!(
-            (ptr as usize) % (1 << order),
-            0,
-            "ptr not aligned to order {}",
-            order
-        );
-        unsafe {
-            (*ptr).next = self.free_lists[order];
-            self.free_lists[order] = ptr;
+    fn pop_free_block(&mut self, order: usize) -> Result<Option<*mut FreeBlock>, AllocError> {
+        let pointer = self.free_lists[order];
+        if pointer.is_null() {
+            return Ok(None);
         }
-    }
-
-    fn pop_free_block(&mut self, order: usize) -> Option<*mut FreeBlock> {
-        let ptr = self.free_lists[order];
-        if ptr.is_null() {
-            return None;
+        if !self.valid_free_node(order, pointer) {
+            return Err(AllocError::CorruptedFreeList);
         }
-        let end = self.base_addr + self.total_pages * self.page_size;
-        debug_assert!((ptr as usize) >= self.base_addr, "popped ptr below base");
-        debug_assert!((ptr as usize) < end, "popped ptr above end");
-        debug_assert_eq!(
-            (ptr as usize) % (1 << order),
-            0,
-            "popped ptr not aligned to order {}",
-            order
-        );
-        unsafe {
-            self.free_lists[order] = (*ptr).next;
-        }
-        Some(ptr)
+        // SAFETY: pointer is a validated free-list node.
+        self.free_lists[order] = unsafe { (*pointer).next };
+        Ok(Some(pointer))
     }
 
     pub fn allocate(&mut self, pages: usize) -> Result<usize, AllocError> {
@@ -120,7 +101,7 @@ impl<const ORDER: usize> BuddyAllocator<ORDER> {
         }
 
         for i in order..ORDER {
-            if let Some(block) = self.pop_free_block(i) {
+            if let Some(block) = self.pop_free_block(i)? {
                 // Standard buddy split: push LOWER buddy, continue with UPPER buddy.
                 let mut current = block;
                 for j in (order..i).rev() {
@@ -144,7 +125,7 @@ impl<const ORDER: usize> BuddyAllocator<ORDER> {
                         j
                     );
                     // Push LOWER buddy (current) onto free list
-                    self.push_free_block(j, current);
+                    self.push_free_block_checked(j, current)?;
                     // Continue splitting the UPPER buddy
                     current = upper;
                 }
@@ -163,54 +144,48 @@ impl<const ORDER: usize> BuddyAllocator<ORDER> {
     /// Return a block previously produced by [`Self::allocate`].
     ///
     /// # Safety
-    /// `ptr` must be live, uniquely allocated by this instance, and `pages`
-    /// must match the original request. Double-free or mismatched size corrupts
-    /// the embedded free list.
-    pub unsafe fn deallocate(&mut self, ptr: usize, pages: usize) {
+    /// `ptr` must be a live allocation from this instance and `pages` must
+    /// match the original request. Unlike the old implementation, malformed
+    /// input is rejected in release builds before any free-list write.
+    pub unsafe fn deallocate(&mut self, ptr: usize, pages: usize) -> Result<(), AllocError> {
+        if pages == 0 {
+            return Err(AllocError::InvalidSize);
+        }
         let order = pages.next_power_of_two().trailing_zeros() as usize;
         if order >= ORDER {
-            return;
+            return Err(AllocError::InvalidSize);
         }
-
-        debug_assert!(ptr >= self.base_addr, "dealloc ptr below base");
-        debug_assert!(
-            ptr < self.base_addr + self.total_pages * self.page_size,
-            "dealloc ptr above end"
-        );
-        debug_assert_eq!(
-            ptr % (1 << order),
-            0,
-            "dealloc ptr not aligned to order {}",
-            order
-        );
+        let heap_end = self
+            .base_addr
+            .checked_add(
+                self.total_pages
+                    .checked_mul(self.page_size)
+                    .ok_or(AllocError::InvalidSize)?,
+            )
+            .ok_or(AllocError::InvalidSize)?;
+        let block_bytes = self.order_bytes(order);
+        let allocation_end = ptr
+            .checked_add(block_bytes)
+            .ok_or(AllocError::InvalidPointer)?;
+        if ptr < self.base_addr
+            || allocation_end > heap_end
+            || !(ptr - self.base_addr).is_multiple_of(block_bytes)
+        {
+            return Err(AllocError::InvalidPointer);
+        }
+        if self.range_is_free(ptr, block_bytes)? {
+            return Err(AllocError::DoubleFree);
+        }
 
         let mut current_ptr = ptr as *mut FreeBlock;
         let mut current_order = order;
-
         while current_order < ORDER - 1 {
             let block_size = self.order_bytes(current_order);
             let buddy_offset = (current_ptr as usize - self.base_addr) ^ block_size;
             let buddy_ptr = (self.base_addr + buddy_offset) as *mut FreeBlock;
-
-            debug_assert!(
-                (buddy_ptr as usize) >= self.base_addr,
-                "dealloc buddy below base at order {}",
-                current_order
-            );
-            debug_assert!(
-                (buddy_ptr as usize) < self.base_addr + self.total_pages * self.page_size,
-                "dealloc buddy above end at order {}",
-                current_order
-            );
-            debug_assert_eq!(
-                (buddy_ptr as usize) % (1 << current_order),
-                0,
-                "dealloc buddy not aligned"
-            );
-
-            if self.is_block_free(current_order, buddy_ptr) {
-                self.remove_free_block(current_order, buddy_ptr);
-                current_ptr = if (current_ptr as usize) < (buddy_ptr as usize) {
+            if self.is_block_free(current_order, buddy_ptr)? {
+                self.remove_free_block(current_order, buddy_ptr)?;
+                current_ptr = if (current_ptr as usize) < buddy_ptr as usize {
                     current_ptr
                 } else {
                     buddy_ptr
@@ -220,41 +195,99 @@ impl<const ORDER: usize> BuddyAllocator<ORDER> {
                 break;
             }
         }
-        self.push_free_block(current_order, current_ptr);
+        self.push_free_block_checked(current_order, current_ptr)?;
+        Ok(())
     }
 
-    fn is_block_free(&self, order: usize, ptr: *mut FreeBlock) -> bool {
-        let mut curr = self.free_lists[order];
-        while !curr.is_null() {
-            if curr == ptr {
-                return true;
-            }
-            unsafe {
-                curr = (*curr).next;
-            }
+    fn valid_free_node(&self, order: usize, pointer: *mut FreeBlock) -> bool {
+        if pointer.is_null() || order >= ORDER {
+            return false;
         }
-        false
+        let address = pointer as usize;
+        let Some(heap_bytes) = self.total_pages.checked_mul(self.page_size) else {
+            return false;
+        };
+        let Some(heap_end) = self.base_addr.checked_add(heap_bytes) else {
+            return false;
+        };
+        address >= self.base_addr
+            && address < heap_end
+            && (address - self.base_addr).is_multiple_of(self.order_bytes(order))
+            && address.is_multiple_of(core::mem::align_of::<FreeBlock>())
     }
 
-    fn remove_free_block(&mut self, order: usize, ptr: *mut FreeBlock) {
-        let mut curr = &mut self.free_lists[order] as *mut *mut FreeBlock;
-        while unsafe { !(*curr).is_null() } {
-            let node = unsafe { *curr };
-            if node == ptr {
-                unsafe {
-                    *curr = (*node).next;
+    fn range_is_free(&self, ptr: usize, bytes: usize) -> Result<bool, AllocError> {
+        let end = ptr.checked_add(bytes).ok_or(AllocError::InvalidPointer)?;
+        for order in 0..ORDER {
+            let mut current = self.free_lists[order];
+            while !current.is_null() {
+                if !self.valid_free_node(order, current) {
+                    return Err(AllocError::CorruptedFreeList);
                 }
-                return;
-            }
-            unsafe {
-                curr = &mut (*node).next as *mut *mut FreeBlock;
+                let block_start = current as usize;
+                let block_end = block_start + self.order_bytes(order);
+                if ptr >= block_start && end <= block_end {
+                    return Ok(true);
+                }
+                // SAFETY: node range/alignment was validated above and free
+                // memory stores a FreeBlock header by allocator invariant.
+                current = unsafe { (*current).next };
             }
         }
-        debug_assert!(
-            false,
-            "remove_free_block: buddy not found in free list at order {}",
-            order
-        );
+        Ok(false)
+    }
+
+    fn is_block_free(&self, order: usize, ptr: *mut FreeBlock) -> Result<bool, AllocError> {
+        let mut current = self.free_lists[order];
+        while !current.is_null() {
+            if !self.valid_free_node(order, current) {
+                return Err(AllocError::CorruptedFreeList);
+            }
+            if current == ptr {
+                return Ok(true);
+            }
+            // SAFETY: validated free-list node.
+            current = unsafe { (*current).next };
+        }
+        Ok(false)
+    }
+
+    fn remove_free_block(&mut self, order: usize, ptr: *mut FreeBlock) -> Result<(), AllocError> {
+        let mut link = &mut self.free_lists[order] as *mut *mut FreeBlock;
+        loop {
+            // SAFETY: link starts in the free-list head array and advances only
+            // through validated node `next` fields.
+            let node = unsafe { *link };
+            if node.is_null() {
+                return Err(AllocError::CorruptedFreeList);
+            }
+            if !self.valid_free_node(order, node) {
+                return Err(AllocError::CorruptedFreeList);
+            }
+            if node == ptr {
+                // SAFETY: node was validated and link is its owning list link.
+                unsafe { *link = (*node).next };
+                return Ok(());
+            }
+            // SAFETY: validated node contains a writable next field.
+            link = unsafe { &mut (*node).next };
+        }
+    }
+
+    fn push_free_block_checked(
+        &mut self,
+        order: usize,
+        pointer: *mut FreeBlock,
+    ) -> Result<(), AllocError> {
+        if !self.valid_free_node(order, pointer) {
+            return Err(AllocError::InvalidPointer);
+        }
+        // SAFETY: pointer is a validated block head in exclusively free memory.
+        unsafe {
+            (*pointer).next = self.free_lists[order];
+            self.free_lists[order] = pointer;
+        }
+        Ok(())
     }
 }
 
@@ -276,8 +309,8 @@ impl Slab {
     /// Build a slab over freshly allocated pages.
     ///
     /// # Safety
-    /// The page range must be writable, exclusively owned, suitably aligned,
-    /// and large enough for every generated slot pointer.
+    /// The page range must be writable, exclusively owned, page-aligned, and
+    /// remain valid until the slab is returned to its buddy provider.
     pub unsafe fn new(page_start: usize, slot_size: usize, total_pages: usize) -> Self {
         let total_slots = (total_pages * 4096) / slot_size;
         let mut slab = Self {
@@ -287,41 +320,91 @@ impl Slab {
             used_slots: 0,
             total_slots,
         };
-        for i in 0..total_slots {
-            let p = (page_start + i * slot_size) as *mut SlabSlot;
-            unsafe { slab.push_slot(p) };
+        for index in 0..total_slots {
+            let pointer = (page_start + index * slot_size) as *mut SlabSlot;
+            // SAFETY: constructor generates each in-range slot exactly once.
+            unsafe { slab.push_slot(pointer) };
         }
         slab
     }
-    /// Link a valid free slot into this slab.
+
+    fn end(&self) -> Option<usize> {
+        self.page_start
+            .checked_add(self.total_slots.checked_mul(self.slot_size)?)
+    }
+
+    fn valid_slot(&self, pointer: usize) -> bool {
+        let Some(end) = self.end() else { return false };
+        pointer >= self.page_start
+            && pointer < end
+            && (pointer - self.page_start).is_multiple_of(self.slot_size)
+            && pointer.is_multiple_of(core::mem::align_of::<SlabSlot>())
+    }
+
+    fn free_list_contains(&self, pointer: usize) -> Result<bool, AllocError> {
+        let mut current = self.free_list;
+        while let Some(node) = current {
+            if !self.valid_slot(node as usize) {
+                return Err(AllocError::CorruptedFreeList);
+            }
+            if node as usize == pointer {
+                return Ok(true);
+            }
+            // SAFETY: node was validated as an aligned in-slab slot.
+            current = unsafe { (*node).next };
+        }
+        Ok(false)
+    }
+
+    /// Link one validated free slot.
     ///
     /// # Safety
-    /// `slot` must be aligned, writable, inside this slab, and not currently
+    /// `slot` must be a unique, writable slot in this slab and not already
     /// present in the free list.
     unsafe fn push_slot(&mut self, slot: *mut SlabSlot) {
+        // SAFETY: delegated to the caller contract.
         unsafe {
             (*slot).next = self.free_list;
             self.free_list = Some(slot);
         }
     }
-    pub fn pop_slot(&mut self) -> Option<usize> {
-        let slot = self.free_list?;
-        unsafe {
-            self.free_list = (*slot).next;
+
+    pub fn pop_slot(&mut self) -> Result<Option<usize>, AllocError> {
+        let Some(slot) = self.free_list else {
+            return Ok(None);
+        };
+        if !self.valid_slot(slot as usize) {
+            return Err(AllocError::CorruptedFreeList);
         }
-        self.used_slots += 1;
-        Some(slot as usize)
+        // SAFETY: slot is an aligned in-slab free-list node.
+        self.free_list = unsafe { (*slot).next };
+        self.used_slots = self
+            .used_slots
+            .checked_add(1)
+            .ok_or(AllocError::CorruptedFreeList)?;
+        Ok(Some(slot as usize))
     }
+
     /// Return one live slot to this slab.
     ///
     /// # Safety
-    /// `ptr` must identify a currently allocated slot in this slab and must
-    /// not have been freed already.
-    pub unsafe fn free_slot(&mut self, ptr: usize) {
-        let p = ptr as *mut SlabSlot;
-        unsafe { self.push_slot(p) };
+    /// The caller must own `ptr` as an allocated slot from this slab.
+    pub unsafe fn free_slot(&mut self, ptr: usize) -> Result<(), AllocError> {
+        if !self.valid_slot(ptr) {
+            return Err(AllocError::InvalidPointer);
+        }
+        if self.free_list_contains(ptr)? {
+            return Err(AllocError::DoubleFree);
+        }
+        if self.used_slots == 0 {
+            return Err(AllocError::DoubleFree);
+        }
+        // SAFETY: validation above proves a unique in-range allocated slot.
+        unsafe { self.push_slot(ptr as *mut SlabSlot) };
         self.used_slots -= 1;
+        Ok(())
     }
+
     pub fn is_full(&self) -> bool {
         self.used_slots == self.total_slots
     }
@@ -339,44 +422,59 @@ impl SlabCache {
             slabs: [const { None }; 16],
         }
     }
+
     pub fn allocate<B: BuddyProvider>(&mut self, buddy: &mut B) -> Result<usize, AllocError> {
         for slab in self.slabs.iter_mut().flatten() {
             if !slab.is_full() {
-                if let Some(pointer) = slab.pop_slot() {
+                if let Some(pointer) = slab.pop_slot()? {
                     return Ok(pointer);
                 }
             }
         }
+        let index = self
+            .slabs
+            .iter()
+            .position(Option::is_none)
+            .ok_or(AllocError::OutOfMemory)?;
         let page = buddy.allocate_page()?;
-        unsafe {
-            let mut ns = Slab::new(page, self.slot_size, 1);
-            if let Some(p) = ns.pop_slot() {
-                if let Some(idx) = self.slabs.iter().position(|x| x.is_none()) {
-                    self.slabs[idx] = Some(ns);
-                    return Ok(p);
-                }
-            }
-        }
-        Err(AllocError::OutOfMemory)
+        // SAFETY: BuddyProvider returned one exclusive writable page.
+        let mut slab = unsafe { Slab::new(page, self.slot_size, 1) };
+        let pointer = slab.pop_slot()?.ok_or(AllocError::CorruptedFreeList)?;
+        self.slabs[index] = Some(slab);
+        Ok(pointer)
     }
-    /// Return a slot to the slab that owns its address.
+
+    /// Return a slot and give a completely empty slab page back to buddy.
     ///
     /// # Safety
-    /// `ptr` must be a live slot allocated by this cache. The caller must
-    /// prevent double-free and size-class mismatch.
-    pub unsafe fn deallocate(&mut self, ptr: usize) {
-        for slab in self.slabs.iter_mut().flatten() {
-            let end = slab.page_start + slab.total_slots * slab.slot_size;
-            if ptr >= slab.page_start && ptr < end {
-                unsafe { slab.free_slot(ptr) };
-                return;
-            }
+    /// `ptr` must be a live slot allocated by this cache.
+    pub unsafe fn deallocate<B: BuddyProvider>(
+        &mut self,
+        ptr: usize,
+        buddy: &mut B,
+    ) -> Result<(), AllocError> {
+        let index = self
+            .slabs
+            .iter()
+            .position(|entry| entry.as_ref().is_some_and(|slab| slab.valid_slot(ptr)))
+            .ok_or(AllocError::InvalidPointer)?;
+        let slab = self.slabs[index]
+            .as_mut()
+            .ok_or(AllocError::InvalidPointer)?;
+        // SAFETY: cache ownership lookup above found the unique slab.
+        unsafe { slab.free_slot(ptr) }?;
+        if slab.used_slots == 0 {
+            let page = slab.page_start;
+            self.slabs[index] = None;
+            buddy.deallocate_page(page)?;
         }
+        Ok(())
     }
 }
 
 pub trait BuddyProvider {
     fn allocate_page(&mut self) -> Result<usize, AllocError>;
+    fn deallocate_page(&mut self, page: usize) -> Result<(), AllocError>;
 }
 
 pub struct SlabAllocator {
@@ -414,10 +512,16 @@ impl SlabAllocator {
     /// # Safety
     /// `ptr` must be live and `size` must select the same cache used during
     /// allocation. The pointer must not be freed more than once.
-    pub unsafe fn deallocate(&mut self, ptr: usize, size: usize) {
-        if let Some(idx) = Self::get_cache_idx(size) {
-            unsafe { self.caches[idx].deallocate(ptr) };
-        }
+    pub unsafe fn deallocate<B: BuddyProvider>(
+        &mut self,
+        ptr: usize,
+        size: usize,
+        buddy: &mut B,
+    ) -> Result<(), AllocError> {
+        let index = Self::get_cache_idx(size).ok_or(AllocError::InvalidSize)?;
+        // SAFETY: caller contract guarantees this allocation belongs to the
+        // selected size class; the cache performs range/double-free checks.
+        unsafe { self.caches[index].deallocate(ptr, buddy) }
     }
 }
 
@@ -434,6 +538,20 @@ unsafe impl Sync for SlabAllocator {}
 mod tests {
     use super::*;
 
+    struct TestBuddy<'a> {
+        allocator: &'a mut BuddyAllocator<4>,
+    }
+
+    impl BuddyProvider for TestBuddy<'_> {
+        fn allocate_page(&mut self) -> Result<usize, AllocError> {
+            self.allocator.allocate(1)
+        }
+
+        fn deallocate_page(&mut self, page: usize) -> Result<(), AllocError> {
+            unsafe { self.allocator.deallocate(page, 1) }
+        }
+    }
+
     #[test]
     fn test_buddy_allocate_deallocate() {
         // Vec only guarantees byte alignment. The production heap is page
@@ -448,12 +566,49 @@ mod tests {
         assert!(b != 0);
         assert!(c != 0);
         unsafe {
-            allocator.deallocate(a, 1);
-            allocator.deallocate(b, 2);
-            allocator.deallocate(c, 4);
+            allocator.deallocate(a, 1).unwrap();
+            allocator.deallocate(b, 2).unwrap();
+            allocator.deallocate(c, 4).unwrap();
         }
         let d = allocator.allocate(8).unwrap();
         assert_eq!(d, base);
+    }
+
+    #[test]
+    fn buddy_rejects_double_free_and_invalid_pointer() {
+        let mut memory = alloc::vec![0u8; 9 * 4096];
+        let base = (memory.as_mut_ptr() as usize + 4095) & !4095;
+        let mut allocator = unsafe { BuddyAllocator::<4>::new(base, 8, 4096) };
+        let allocation = allocator.allocate(1).unwrap();
+        unsafe { allocator.deallocate(allocation, 1).unwrap() };
+        assert_eq!(
+            unsafe { allocator.deallocate(allocation, 1) },
+            Err(AllocError::DoubleFree)
+        );
+        assert_eq!(
+            unsafe { allocator.deallocate(base - 4096, 1) },
+            Err(AllocError::InvalidPointer)
+        );
+    }
+
+    #[test]
+    fn slab_rejects_double_free_and_returns_empty_page() {
+        let mut memory = alloc::vec![0u8; 3 * 4096];
+        let base = (memory.as_mut_ptr() as usize + 4095) & !4095;
+        let mut buddy_allocator = unsafe { BuddyAllocator::<4>::new(base, 2, 4096) };
+        let mut provider = TestBuddy {
+            allocator: &mut buddy_allocator,
+        };
+        let mut slabs = SlabAllocator::new();
+        let pointer = slabs.allocate(32, &mut provider).unwrap();
+        unsafe { slabs.deallocate(pointer, 32, &mut provider).unwrap() };
+        assert_eq!(
+            unsafe { slabs.deallocate(pointer, 32, &mut provider) },
+            Err(AllocError::InvalidPointer)
+        );
+        // The empty slab page was returned, so both pages can coalesce and be
+        // allocated as one order-1 block.
+        assert!(provider.allocator.allocate(2).is_ok());
     }
 
     #[test]

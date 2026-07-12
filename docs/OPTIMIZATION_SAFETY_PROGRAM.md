@@ -141,6 +141,12 @@ table operations, and roll back pages/metadata/VMO references on failure.
 Finished tasks release kernel stacks and process Arcs through stable `Reaped`
 tombstones. See [VMAR_TRANSACTIONS.md](VMAR_TRANSACTIONS.md).
 
+## Allocator-hardening checkpoint
+
+Buddy/slab deallocation now performs release-build range, alignment, overflow,
+free-list integrity, and double-free checks. Empty slabs return their pages to
+the buddy provider. See [ALLOCATOR_HARDENING.md](ALLOCATOR_HARDENING.md).
+
 ## Work packages
 
 ### P0 — correctness and resource lifecycle
