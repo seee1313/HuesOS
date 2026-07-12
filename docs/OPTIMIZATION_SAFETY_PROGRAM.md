@@ -134,6 +134,13 @@ final-handle collection, explicit VMAR-to-VMO kernel references, process-exit
 collection, and drop-outside-lock reentrancy safety. Host tests verify exact PMM
 frame restoration and mapped-VMO retention. See [OBJECT_LIFECYCLE.md](OBJECT_LIFECYCLE.md).
 
+## VMAR/reaper checkpoint
+
+Dynamic VMO mappings now reserve metadata atomically, use typed fallible page-
+table operations, and roll back pages/metadata/VMO references on failure.
+Finished tasks release kernel stacks and process Arcs through stable `Reaped`
+tombstones. See [VMAR_TRANSACTIONS.md](VMAR_TRANSACTIONS.md).
+
 ## Work packages
 
 ### P0 — correctness and resource lifecycle
