@@ -33,9 +33,10 @@ pub use port::{Port, PortPacket};
 pub use process::Process;
 pub(crate) use registry::phys_to_virt;
 pub use registry::{
-    current_process, lookup_interrupts_by_irq, lookup_object, lookup_process, note_handle_close,
-    note_handle_open, register_interrupt, register_object, register_process, root_job,
-    set_cpu_id_callback, set_current_process, set_phys_to_virt, unregister_object,
+    collect_exited_process, current_process, lookup_interrupts_by_irq, lookup_object,
+    lookup_process, note_handle_close, note_handle_open, note_kernel_ref_close,
+    note_kernel_ref_open, object_ref_counts, register_interrupt, register_object, register_process,
+    root_job, set_cpu_id_callback, set_current_process, set_phys_to_virt, unregister_object,
 };
 pub use thread::Thread;
 pub use vmar::{Vmar, VmarChild, VmarError, VmarMapping};
@@ -224,9 +225,49 @@ mod tests {
     }
 
     #[test]
+    fn final_handle_close_collects_vmo_and_returns_frames() {
+        with_fresh_env(huesos_pmm::FRAME_SIZE * 16, || {
+            let free_before = huesos_pmm::free_frames();
+            let vmo = Vmo::new(4096).expect("one-page VMO");
+            let koid = vmo.koid();
+            register_object(vmo);
+            let table = HandleTable::new();
+            let value = table.add(Handle::new(koid, Rights::DEFAULT_VMO));
+            assert_eq!(huesos_pmm::free_frames(), free_before - 1);
+            assert!(lookup_object(koid).is_some());
+
+            table.remove(value).expect("live handle");
+            assert!(lookup_object(koid).is_none());
+            assert_eq!(huesos_pmm::free_frames(), free_before);
+        });
+    }
+
+    #[test]
+    fn kernel_mapping_reference_keeps_vmo_alive_after_handle_close() {
+        with_fresh_env(huesos_pmm::FRAME_SIZE * 16, || {
+            let free_before = huesos_pmm::free_frames();
+            let vmo = Vmo::new(4096).expect("one-page VMO");
+            let koid = vmo.koid();
+            register_object(vmo);
+            let table = HandleTable::new();
+            let value = table.add(Handle::new(koid, Rights::DEFAULT_VMO));
+            note_kernel_ref_open(koid);
+
+            table.remove(value).expect("live handle");
+            assert!(lookup_object(koid).is_some());
+            assert_eq!(huesos_pmm::free_frames(), free_before - 1);
+
+            note_kernel_ref_close(koid);
+            assert_eq!(object_ref_counts(koid), (0, 0));
+            assert!(lookup_object(koid).is_none());
+            assert_eq!(huesos_pmm::free_frames(), free_before);
+        });
+    }
+
+    #[test]
     fn handle_table_can_insert_at_fixed_slot() {
         let table = HandleTable::new();
-        let h = Handle::new(Koid(7), Rights::DEFAULT);
+        let h = Handle::new(alloc_koid(), Rights::DEFAULT);
         assert!(table.insert_at(3, h).is_ok());
         assert_eq!(table.get(3), Some(h));
         assert!(table.insert_at(3, h).is_err());
@@ -236,7 +277,7 @@ mod tests {
     #[test]
     fn handle_table_reserves_slot_zero_as_invalid() {
         let table = HandleTable::new();
-        let h = Handle::new(Koid(42), Rights::DEFAULT);
+        let h = Handle::new(alloc_koid(), Rights::DEFAULT);
         let hv = table.add(h);
         assert_ne!(
             hv, INVALID_HANDLE,
@@ -249,10 +290,10 @@ mod tests {
     #[test]
     fn handle_table_reuses_freed_slots() {
         let table = HandleTable::new();
-        let h1 = table.add(Handle::new(Koid(1), Rights::DEFAULT));
-        let _h2 = table.add(Handle::new(Koid(2), Rights::DEFAULT));
+        let h1 = table.add(Handle::new(alloc_koid(), Rights::DEFAULT));
+        let _h2 = table.add(Handle::new(alloc_koid(), Rights::DEFAULT));
         table.remove(h1);
-        let h3 = table.add(Handle::new(Koid(3), Rights::DEFAULT));
+        let h3 = table.add(Handle::new(alloc_koid(), Rights::DEFAULT));
         assert_eq!(h3, h1, "freed handle slots should be reused, not leaked");
     }
 

@@ -509,6 +509,7 @@ pub fn exit_current_task(code: i64) -> ! {
     }
     if let Some(proc) = process_to_signal {
         proc.set_exit_code(code);
+        huesos_object::collect_exited_process(proc.koid());
         PROCESS_TEARDOWN.lock().push(proc);
     }
     if let Some(id) = reap_id {
@@ -550,6 +551,7 @@ pub fn terminate_current_process(code: i64) -> ! {
     };
     process.set_exit_code(code);
     let process_koid = process.koid();
+    huesos_object::collect_exited_process(process_koid);
 
     for scheduler in &PER_CPU_SCHEDULERS {
         let mut guard = scheduler.lock();

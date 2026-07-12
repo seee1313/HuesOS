@@ -157,6 +157,15 @@ impl HandleTable {
     }
 }
 
+impl Drop for HandleTable {
+    fn drop(&mut self) {
+        // Clear is idempotent and ensures process/object teardown cannot leak
+        // global handle references when a table is dropped outside the normal
+        // explicit ProcessExit path (including construction failures/tests).
+        self.clear();
+    }
+}
+
 impl Default for HandleTable {
     fn default() -> Self {
         Self::new()
