@@ -23,6 +23,9 @@ pub enum TaskKind {
         /// Owning process (address space + handle table).
         process: Arc<Process>,
     },
+    /// Finished task after stack and process ownership have been reclaimed.
+    /// The scheduler keeps the slot so task IDs/indexes never change.
+    Reaped,
 }
 
 /// A schedulable task — execution context with its own stack.

@@ -542,7 +542,7 @@ pub fn terminate_current_process(code: i64) -> ! {
         let guard = PER_CPU_SCHEDULERS[current_cpu].lock();
         guard.current_task().and_then(|task| match &task.kind {
             TaskKind::User { process } => Some(Arc::clone(process)),
-            TaskKind::Kernel => None,
+            TaskKind::Kernel | TaskKind::Reaped => None,
         })
     };
 
@@ -558,7 +558,7 @@ pub fn terminate_current_process(code: i64) -> ! {
         for idx in 0..guard.tasks.len() {
             let matched = match &guard.tasks[idx].kind {
                 TaskKind::User { process } => process.koid() == process_koid,
-                TaskKind::Kernel => false,
+                TaskKind::Kernel | TaskKind::Reaped => false,
             };
             if !matched {
                 continue;
@@ -635,9 +635,12 @@ pub fn reap_finished_tasks() {
             continue;
         }
         if let Some(task) = guard.tasks.get_mut(idx) {
-            if task.finished.load(Ordering::Relaxed) && !task.kernel_stack.is_empty() {
-                // Free the kernel stack Vec's heap allocation.
+            if task.finished.load(Ordering::Acquire) {
+                // A finished slot is never scheduled again. Release both its
+                // stack allocation and any Process Arc while preserving the
+                // vector index encoded in historical task IDs.
                 task.kernel_stack = alloc::vec::Vec::new();
+                task.kind = TaskKind::Reaped;
             }
         }
     }
@@ -653,7 +656,7 @@ pub fn reap_finished_tasks() {
             let guard = PER_CPU_SCHEDULERS[cpu].lock();
             guard.current_task().is_some_and(|task| match &task.kind {
                 TaskKind::User { process } => process.koid() == koid,
-                TaskKind::Kernel => false,
+                TaskKind::Kernel | TaskKind::Reaped => false,
             })
         });
         if still_current {
