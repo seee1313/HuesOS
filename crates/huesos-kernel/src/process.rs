@@ -147,37 +147,66 @@ pub fn map_vmo_into_vmar(
     let first_vmo_page = (args.vmo_offset / PAGE_SIZE) as usize;
     let page_count = (args.len / PAGE_SIZE) as usize;
 
-    // Validate all backing frames before mutating page tables, so ordinary
-    // userspace argument errors do not leave partial mappings behind.
-    for i in 0..page_count {
-        if vmo.frame_at(first_vmo_page + i).is_none() {
+    // Validate every backing frame before reserving metadata or touching page
+    // tables. Ordinary argument errors therefore have no rollback work.
+    for index in 0..page_count {
+        if vmo.frame_at(first_vmo_page + index).is_none() {
             return Err(ErrorCode::InvalidArgs);
         }
     }
 
-    for i in 0..page_count {
-        let frame_phys = vmo
-            .frame_at(first_vmo_page + i)
-            .ok_or(ErrorCode::InvalidArgs)?;
-        let page: Page<Size4KiB> =
-            Page::containing_address(VirtAddr::new(args.addr + i as u64 * PAGE_SIZE));
-        let frame: PhysFrame<Size4KiB> = PhysFrame::containing_address(PhysAddr::new(frame_phys));
-        runtime.address_space.map_user_page(page, frame, page_flags);
-    }
-
-    vmar.record_mapping(VmarMapping {
+    let mapping = VmarMapping {
         base: args.addr,
         size: args.len,
         vmo: vmo.koid(),
         flags: args.flags,
-    })
-    .map_err(|error| match error {
+    };
+    vmar.record_mapping(mapping).map_err(|error| match error {
         VmarError::InvalidRange => ErrorCode::InvalidArgs,
         VmarError::Overlap => ErrorCode::Busy,
     })?;
-    // The mapping, not the caller's handle, owns the backing frames until the
-    // VMAR is destroyed during process teardown.
     huesos_object::note_kernel_ref_open(vmo.koid());
+
+    let mut mapped_pages = 0usize;
+    let map_result = (|| -> Result<(), ErrorCode> {
+        for index in 0..page_count {
+            let frame_phys = vmo
+                .frame_at(first_vmo_page + index)
+                .ok_or(ErrorCode::InvalidArgs)?;
+            let page = Page::<Size4KiB>::containing_address(VirtAddr::new(
+                args.addr + index as u64 * PAGE_SIZE,
+            ));
+            let frame = PhysFrame::<Size4KiB>::containing_address(PhysAddr::new(frame_phys));
+            runtime
+                .address_space
+                .try_map_user_page(page, frame, page_flags)
+                .map_err(|error| match error {
+                    huesos_arch::paging::UserPageError::OutOfMemory => ErrorCode::NoMemory,
+                    huesos_arch::paging::UserPageError::AlreadyMapped => ErrorCode::Busy,
+                    huesos_arch::paging::UserPageError::ParentHugePage
+                    | huesos_arch::paging::UserPageError::NotMapped
+                    | huesos_arch::paging::UserPageError::InvalidFrameAddress => {
+                        ErrorCode::InvalidArgs
+                    }
+                })?;
+            mapped_pages += 1;
+        }
+        Ok(())
+    })();
+
+    if let Err(error) = map_result {
+        // Roll back only pages installed by this transaction, in reverse order.
+        for index in (0..mapped_pages).rev() {
+            let page = Page::<Size4KiB>::containing_address(VirtAddr::new(
+                args.addr + index as u64 * PAGE_SIZE,
+            ));
+            let _ = runtime.address_space.unmap_user_page(page);
+        }
+        let removed = vmar.remove_mapping(mapping);
+        debug_assert!(removed, "VMAR rollback lost its reservation");
+        huesos_object::note_kernel_ref_close(vmo.koid());
+        return Err(error);
+    }
 
     Ok(args.addr)
 }

@@ -126,11 +126,31 @@ impl Vmar {
         if !self.contains_range(mapping.base, mapping.size) {
             return Err(VmarError::InvalidRange);
         }
-        if self.overlaps_existing(mapping.base, mapping.size) {
+        // Hold the mapping lock across check+insert so two threads cannot both
+        // validate the same range and then race page-table mutation.
+        let mut mappings = self.mappings.lock();
+        if mappings.iter().any(|existing| {
+            ranges_overlap(mapping.base, mapping.size, existing.base, existing.size)
+        }) || self
+            .children
+            .lock()
+            .iter()
+            .any(|child| ranges_overlap(mapping.base, mapping.size, child.base, child.size))
+        {
             return Err(VmarError::Overlap);
         }
-        self.mappings.lock().push(mapping);
+        mappings.push(mapping);
         Ok(())
+    }
+
+    /// Remove one exact mapping reservation during transaction rollback.
+    pub fn remove_mapping(&self, mapping: VmarMapping) -> bool {
+        let mut mappings = self.mappings.lock();
+        let Some(index) = mappings.iter().position(|existing| *existing == mapping) else {
+            return false;
+        };
+        mappings.swap_remove(index);
+        true
     }
 
     /// Return a snapshot of known mappings.
