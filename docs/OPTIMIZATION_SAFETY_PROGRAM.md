@@ -127,6 +127,13 @@ The sole remaining `static mut` is the foreign DoomGeneric
   bounded cooperative process polling so a failed diagnostic cannot prevent
   Terminal startup.
 
+## Object-lifecycle checkpoint
+
+The P0 registry leak is addressed by a unified atomic registry state, automatic
+final-handle collection, explicit VMAR-to-VMO kernel references, process-exit
+collection, and drop-outside-lock reentrancy safety. Host tests verify exact PMM
+frame restoration and mapped-VMO retention. See [OBJECT_LIFECYCLE.md](OBJECT_LIFECYCLE.md).
+
 ## Work packages
 
 ### P0 — correctness and resource lifecycle

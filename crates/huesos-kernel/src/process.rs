@@ -175,6 +175,9 @@ pub fn map_vmo_into_vmar(
         VmarError::InvalidRange => ErrorCode::InvalidArgs,
         VmarError::Overlap => ErrorCode::Busy,
     })?;
+    // The mapping, not the caller's handle, owns the backing frames until the
+    // VMAR is destroyed during process teardown.
+    huesos_object::note_kernel_ref_open(vmo.koid());
 
     Ok(args.addr)
 }

@@ -1,4 +1,17 @@
-//! Global object registries and process-local current context.
+//! Global object ownership, typed registries, and process-local context.
+//!
+//! ## Ownership model
+//!
+//! One mutex protects object entries, userspace-handle counts, kernel mapping
+//! references, and typed indexes. Keeping the state together makes final-close
+//! collection atomic and establishes one lock order. The registry owns one
+//! strong `Arc` while an object is discoverable. Handles are lightweight
+//! `(koid, rights)` values counted here; in-flight Channel handles keep the same
+//! count. VMAR mappings hold explicit kernel references.
+//!
+//! Collection removes the registry Arc only when both counts reach zero. The
+//! removed Arc is dropped after releasing the mutex because dropping a Channel
+//! may drop queued transferred handles and recursively update this registry.
 
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
@@ -7,108 +20,201 @@ use spin::Mutex;
 
 use crate::{Interrupt, Job, KernelObject, Koid, Process};
 
-/// Global object registry (koid -> Arc<dyn KernelObject>).
-static OBJECT_REGISTRY: Mutex<BTreeMap<Koid, Arc<dyn KernelObject>>> = Mutex::new(BTreeMap::new());
-/// Number of live process handles referring to each koid. When this hits
-/// zero, the registry Arc is dropped so object Drop (e.g. Vmo frames) runs.
-static HANDLE_COUNTS: Mutex<BTreeMap<Koid, u32>> = Mutex::new(BTreeMap::new());
-/// Typed process registry for kernel subsystems that must hold an owning
-/// `Arc<Process>` rather than a type-erased object reference.
-static PROCESS_REGISTRY: Mutex<BTreeMap<Koid, Arc<Process>>> = Mutex::new(BTreeMap::new());
-/// Typed interrupt registry indexed by IRQ number for fast IRQ bridge lookup.
-/// Multiple userspace interrupt objects may observe the same IRQ during the
-/// migration window (e.g. DriverManager diagnostics plus a temporary terminal
-/// keyboard consumer), so each IRQ maps to a fanout list.
-static INTERRUPT_REGISTRY: Mutex<BTreeMap<u8, Vec<Arc<Interrupt>>>> = Mutex::new(BTreeMap::new());
-
-/// Register a kernel object globally. Handle count starts at 0; the first
-/// [`note_handle_open`] (from `HandleTable::add`) makes it reachable.
-pub fn register_object(obj: Arc<dyn KernelObject>) {
-    let koid = obj.koid();
-    OBJECT_REGISTRY.lock().insert(koid, obj);
-    HANDLE_COUNTS.lock().entry(koid).or_insert(0);
+struct RegistryState {
+    objects: BTreeMap<Koid, Arc<dyn KernelObject>>,
+    handle_counts: BTreeMap<Koid, u32>,
+    kernel_refs: BTreeMap<Koid, u32>,
+    processes: BTreeMap<Koid, Arc<Process>>,
+    interrupts: BTreeMap<u8, Vec<Arc<Interrupt>>>,
 }
 
-/// A process handle table now references `koid`.
+impl RegistryState {
+    const fn new() -> Self {
+        Self {
+            objects: BTreeMap::new(),
+            handle_counts: BTreeMap::new(),
+            kernel_refs: BTreeMap::new(),
+            processes: BTreeMap::new(),
+            interrupts: BTreeMap::new(),
+        }
+    }
+
+    fn unused(&self, koid: Koid) -> bool {
+        self.handle_counts.get(&koid).copied().unwrap_or(0) == 0
+            && self.kernel_refs.get(&koid).copied().unwrap_or(0) == 0
+    }
+
+    fn collect_object(&mut self, koid: Koid) -> Option<Arc<dyn KernelObject>> {
+        if !self.unused(koid) {
+            return None;
+        }
+        self.handle_counts.remove(&koid);
+        self.kernel_refs.remove(&koid);
+        let object = self.objects.remove(&koid)?;
+
+        // Interrupt registry ownership exists only to deliver events to live
+        // userspace handles; remove it with the final handle.
+        for list in self.interrupts.values_mut() {
+            list.retain(|interrupt| interrupt.koid() != koid);
+        }
+        self.interrupts.retain(|_, list| !list.is_empty());
+
+        // A running process remains typed-owned by the scheduler/process
+        // registry even if userspace closes its last handle. Once exited, no
+        // handle and no kernel reference means it can leave the typed index.
+        if let Some(process) = self.processes.get(&koid) {
+            if process.exit_code().is_some() {
+                self.processes.remove(&koid);
+            }
+        }
+        Some(object)
+    }
+}
+
+static REGISTRY: Mutex<RegistryState> = Mutex::new(RegistryState::new());
+
+/// Register a new object before publishing its first handle.
+pub fn register_object(object: Arc<dyn KernelObject>) {
+    let koid = object.koid();
+    let mut state = REGISTRY.lock();
+    state.handle_counts.entry(koid).or_insert(0);
+    state.kernel_refs.entry(koid).or_insert(0);
+    state.objects.insert(koid, object);
+}
+
+/// Record one new userspace handle reference.
 pub fn note_handle_open(koid: Koid) {
     if !koid.is_valid() {
         return;
     }
-    let mut counts = HANDLE_COUNTS.lock();
-    *counts.entry(koid).or_insert(0) += 1;
+    let mut state = REGISTRY.lock();
+    let count = state.handle_counts.entry(koid).or_insert(0);
+    *count = count.saturating_add(1);
 }
 
-/// A process handle table no longer references `koid`.
-///
-/// Counts are tracked for diagnostics and future GC, but we intentionally
-/// **do not** auto-unregister at zero: channel transfers, in-flight messages,
-/// and kernel-held Arcs (scheduler tasks, process registry) make "zero table
-/// handles" an unreliable signal. Explicit teardown paths call
-/// [`unregister_object`] when it is actually safe.
+/// Release one userspace/in-flight handle reference and collect if unused.
 pub fn note_handle_close(koid: Koid) {
     if !koid.is_valid() {
         return;
     }
-    let mut counts = HANDLE_COUNTS.lock();
-    let entry = counts.entry(koid).or_insert(0);
-    if *entry > 0 {
-        *entry -= 1;
-    }
-    if *entry == 0 {
-        counts.remove(&koid);
-    }
+    let removed = {
+        let mut state = REGISTRY.lock();
+        if let Some(count) = state.handle_counts.get_mut(&koid) {
+            *count = count.saturating_sub(1);
+        }
+        state.collect_object(koid)
+    };
+    drop(removed);
 }
 
-/// Register a process in both the type-erased object registry and the typed
-/// process registry.
+/// Hold an object independently of userspace handles (for example a VMAR
+/// mapping that must keep VMO frames alive after the mapping handle closes).
+pub fn note_kernel_ref_open(koid: Koid) {
+    if !koid.is_valid() {
+        return;
+    }
+    let mut state = REGISTRY.lock();
+    let count = state.kernel_refs.entry(koid).or_insert(0);
+    *count = count.saturating_add(1);
+}
+
+/// Release one kernel-owned reference and collect if no handles remain.
+pub fn note_kernel_ref_close(koid: Koid) {
+    if !koid.is_valid() {
+        return;
+    }
+    let removed = {
+        let mut state = REGISTRY.lock();
+        if let Some(count) = state.kernel_refs.get_mut(&koid) {
+            *count = count.saturating_sub(1);
+        }
+        state.collect_object(koid)
+    };
+    drop(removed);
+}
+
+/// Register a process in object and typed indexes.
 pub fn register_process(process: Arc<Process>) {
-    PROCESS_REGISTRY
-        .lock()
-        .insert(process.koid(), process.clone());
+    let koid = process.koid();
+    {
+        let mut state = REGISTRY.lock();
+        state.processes.insert(koid, Arc::clone(&process));
+    }
     register_object(process);
 }
 
-/// Lookup a kernel object by koid.
+/// Re-run process collection after setting its exit status.
+pub fn collect_exited_process(koid: Koid) {
+    let removed = {
+        let mut state = REGISTRY.lock();
+        let exited = state
+            .processes
+            .get(&koid)
+            .is_some_and(|process| process.exit_code().is_some());
+        if exited && state.unused(koid) {
+            state.processes.remove(&koid);
+        }
+        state.collect_object(koid)
+    };
+    drop(removed);
+}
+
+/// Return `(handle_refs, kernel_refs)` for diagnostics and leak tests.
+pub fn object_ref_counts(koid: Koid) -> (u32, u32) {
+    let state = REGISTRY.lock();
+    (
+        state.handle_counts.get(&koid).copied().unwrap_or(0),
+        state.kernel_refs.get(&koid).copied().unwrap_or(0),
+    )
+}
+
+/// Lookup an object by koid, returning an owning temporary reference.
 pub fn lookup_object(koid: Koid) -> Option<Arc<dyn KernelObject>> {
-    OBJECT_REGISTRY.lock().get(&koid).cloned()
+    REGISTRY.lock().objects.get(&koid).cloned()
 }
 
-/// Lookup a process by koid, returning a typed owning reference.
+/// Lookup a process by koid.
 pub fn lookup_process(koid: Koid) -> Option<Arc<Process>> {
-    PROCESS_REGISTRY.lock().get(&koid).cloned()
+    REGISTRY.lock().processes.get(&koid).cloned()
 }
 
-/// Register an interrupt in both the type-erased object registry and the
-/// typed IRQ registry.
+/// Register an interrupt for both object lookup and IRQ fanout.
 pub fn register_interrupt(interrupt: Arc<Interrupt>) {
-    INTERRUPT_REGISTRY
-        .lock()
-        .entry(interrupt.irq())
-        .or_default()
-        .push(interrupt.clone());
+    {
+        let mut state = REGISTRY.lock();
+        state
+            .interrupts
+            .entry(interrupt.irq())
+            .or_default()
+            .push(Arc::clone(&interrupt));
+    }
     register_object(interrupt);
 }
 
-/// Lookup all interrupt objects registered for an IRQ number.
+/// Snapshot interrupt listeners for an IRQ.
 pub fn lookup_interrupts_by_irq(irq: u8) -> Vec<Arc<Interrupt>> {
-    INTERRUPT_REGISTRY
+    REGISTRY
         .lock()
+        .interrupts
         .get(&irq)
         .cloned()
-        .unwrap_or_else(Vec::new)
+        .unwrap_or_default()
 }
 
-/// Remove an object from the global registry (called on final handle close
-/// in a full refcounted implementation; for the MVP this is invoked
-/// explicitly by `ProcessExit`/object-specific teardown).
+/// Explicitly remove an object and all typed indexes.
 pub fn unregister_object(koid: Koid) {
-    OBJECT_REGISTRY.lock().remove(&koid);
-    PROCESS_REGISTRY.lock().remove(&koid);
-    let mut interrupts = INTERRUPT_REGISTRY.lock();
-    for list in interrupts.values_mut() {
-        list.retain(|interrupt| interrupt.koid() != koid);
-    }
-    interrupts.retain(|_, list| !list.is_empty());
+    let removed = {
+        let mut state = REGISTRY.lock();
+        state.handle_counts.remove(&koid);
+        state.kernel_refs.remove(&koid);
+        state.processes.remove(&koid);
+        for list in state.interrupts.values_mut() {
+            list.retain(|interrupt| interrupt.koid() != koid);
+        }
+        state.interrupts.retain(|_, list| !list.is_empty());
+        state.objects.remove(&koid)
+    };
+    drop(removed);
 }
 
 /// Current process per CPU core (set by the scheduler on every context switch).

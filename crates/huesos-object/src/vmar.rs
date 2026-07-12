@@ -139,6 +139,18 @@ impl Vmar {
     }
 }
 
+impl Drop for Vmar {
+    fn drop(&mut self) {
+        // Every recorded mapping owns one kernel reference to its backing VMO.
+        // Release after taking the vector so no VMAR lock is held while object
+        // collection may drop a VMO and return physical frames to the PMM.
+        let mappings = core::mem::take(&mut *self.mappings.lock());
+        for mapping in mappings {
+            crate::note_kernel_ref_close(mapping.vmo);
+        }
+    }
+}
+
 impl KernelObject for Vmar {
     fn object_type(&self) -> ObjectType {
         ObjectType::Vmar
