@@ -45,15 +45,18 @@ impl KernelAllocator {
     /// # Safety
     /// `ptr` must be live, allocated by this instance, and paired with the
     /// original allocation size. It must not be freed twice.
-    pub unsafe fn kfree(&mut self, ptr: usize, size: usize) {
+    pub unsafe fn kfree(&mut self, ptr: usize, size: usize) -> Result<(), AllocError> {
         if size == 0 {
-            return;
+            return Err(AllocError::InvalidSize);
         }
         if size <= 2048 {
-            unsafe { self.slab.deallocate(ptr, size) };
+            let mut provider = BuddyWrapper {
+                buddy: &mut self.buddy,
+            };
+            unsafe { self.slab.deallocate(ptr, size, &mut provider) }
         } else {
             let pages = size.div_ceil(4096);
-            unsafe { self.buddy.deallocate(ptr, pages) };
+            unsafe { self.buddy.deallocate(ptr, pages) }
         }
     }
 }
@@ -62,15 +65,26 @@ struct BuddyWrapper<'a> {
     buddy: &'a mut BuddyAllocator<BUDDY_ORDER>,
 }
 
-impl<'a> BuddyProvider for BuddyWrapper<'a> {
+impl BuddyProvider for BuddyWrapper<'_> {
     fn allocate_page(&mut self) -> Result<usize, AllocError> {
         self.buddy.allocate(1)
+    }
+
+    fn deallocate_page(&mut self, page: usize) -> Result<(), AllocError> {
+        // SAFETY: SlabCache returns only complete pages previously supplied by
+        // this exact buddy allocator.
+        unsafe { self.buddy.deallocate(page, 1) }
     }
 }
 
 impl BuddyProvider for KernelAllocator {
     fn allocate_page(&mut self) -> Result<usize, AllocError> {
         self.buddy.allocate(1)
+    }
+
+    fn deallocate_page(&mut self, page: usize) -> Result<(), AllocError> {
+        // SAFETY: BuddyProvider contract pairs this with allocate_page.
+        unsafe { self.buddy.deallocate(page, 1) }
     }
 }
 
@@ -90,7 +104,7 @@ pub fn kmalloc(size: usize) -> usize {
 pub unsafe fn kfree(ptr: usize, size: usize) {
     let mut lock = GLOBAL_ALLOCATOR.lock();
     if let Some(allocator) = lock.as_mut() {
-        unsafe { allocator.kfree(ptr, size) };
+        let _ = unsafe { allocator.kfree(ptr, size) };
     }
 }
 
