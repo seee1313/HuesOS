@@ -24,7 +24,19 @@ pub use huesos_pmm::MemoryRegion;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-pub static INIT_BINARY: &[u8] = include_bytes!(env!("HUESOS_INIT_PATH"));
+#[repr(align(16))]
+struct AlignedBytes<const N: usize>([u8; N]);
+
+const INIT_BINARY_LEN: usize = include_bytes!(env!("HUESOS_INIT_PATH")).len();
+static INIT_BINARY_STORAGE: AlignedBytes<INIT_BINARY_LEN> =
+    AlignedBytes(*include_bytes!(env!("HUESOS_INIT_PATH")));
+
+/// Statically embedded, explicitly aligned init ELF image.
+///
+/// `xmas-elf` reads typed ELF records and requires natural alignment. Relying
+/// on incidental linker placement of `include_bytes!` caused boot panics when
+/// unrelated code-size changes shifted this array.
+pub static INIT_BINARY: &[u8] = &INIT_BINARY_STORAGE.0;
 static INIT_PROCESS_KOID: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 pub(crate) fn init_process_koid() -> u64 {
