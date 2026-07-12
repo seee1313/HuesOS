@@ -159,8 +159,9 @@ non-rebooting red panic screen are specified in
 hardening effort is tracked in
 [docs/OPTIMIZATION_SAFETY_PROGRAM.md](docs/OPTIMIZATION_SAFETY_PROGRAM.md),
 [docs/UNSAFE_AUDIT.md](docs/UNSAFE_AUDIT.md),
-[docs/OBJECT_LIFECYCLE.md](docs/OBJECT_LIFECYCLE.md), and
-[docs/VMAR_TRANSACTIONS.md](docs/VMAR_TRANSACTIONS.md).
+[docs/OBJECT_LIFECYCLE.md](docs/OBJECT_LIFECYCLE.md),
+[docs/VMAR_TRANSACTIONS.md](docs/VMAR_TRANSACTIONS.md), and
+[docs/ALLOCATOR_HARDENING.md](docs/ALLOCATOR_HARDENING.md).
 
 ## Building
 
