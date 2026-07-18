@@ -259,8 +259,6 @@ pub mod rights {
     pub const SAME_RIGHTS: u32 = 1 << 31;
 }
 
-
-
 /// Lowest userspace virtual address accepted by the root VMAR. The first
 /// 64 KiB stay unmapped as a low/null-pointer guard.
 pub const USER_ASPACE_BASE: u64 = 0x0000_0000_0001_0000;
@@ -269,7 +267,6 @@ pub const USER_ASPACE_BASE: u64 = 0x0000_0000_0001_0000;
 pub const USER_ASPACE_END: u64 = 0x0000_8000_0000_0000;
 /// Size of the root userspace VMAR.
 pub const USER_ASPACE_SIZE: u64 = USER_ASPACE_END - USER_ASPACE_BASE;
-
 
 /// Top of the initial stack used by the userspace process launcher.
 pub const USER_STACK_TOP: u64 = 0x0000_7fff_ff00_0000;
@@ -329,9 +326,9 @@ pub struct FramebufferInfo {
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct FramebufferBlitArgs {
-    /// Handle to a VMO containing the source pixel data, tightly packed
-    /// (no per-row padding) in the same pixel format `FramebufferInfo`
-    /// describes.
+    /// Handle to a VMO containing source pixels in the same pixel format
+    /// described by [`FramebufferInfo`]. Row spacing is given by
+    /// [`FramebufferBlitArgs::src_stride`].
     pub vmo: HandleValue,
     /// Byte offset into the VMO where pixel data starts.
     pub vmo_offset: u64,
@@ -339,13 +336,14 @@ pub struct FramebufferBlitArgs {
     pub src_width: u32,
     /// Height, in pixels, of the source rectangle within the VMO.
     pub src_height: u32,
+    /// Bytes between the starts of adjacent source rows. This may exceed the
+    /// rectangle's row size when presenting a dirty region of a larger VMO.
+    pub src_stride: u32,
     /// Destination X coordinate on the real framebuffer.
     pub dst_x: u32,
     /// Destination Y coordinate on the real framebuffer.
     pub dst_y: u32,
 }
-
-
 
 /// Arguments for [`Syscall::ChannelReadEtc`], passed by pointer because the
 /// syscall needs byte and handle buffers plus actual-count outputs.

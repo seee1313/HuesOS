@@ -101,6 +101,38 @@ impl Canvas {
         Ok(())
     }
 
+    /// Fill a clipped rectangle in a packed shadow buffer without syscalls.
+    pub fn fill_rect_to_shadow(
+        &self,
+        shadow: &mut [u8],
+        x: u32,
+        y: u32,
+        w: u32,
+        h: u32,
+        r: u8,
+        g: u8,
+        b: u8,
+    ) -> crate::Result<()> {
+        let len = self.byte_len();
+        if !self.supports_buffered_raster() || shadow.len() < len {
+            return Err(crate::ErrorCode::InvalidArgs);
+        }
+        let x_end = x.saturating_add(w).min(self.info.width);
+        let y_end = y.saturating_add(h).min(self.info.height);
+        if x >= x_end || y >= y_end {
+            return Ok(());
+        }
+        let pixel = self.pack_color(r, g, b).to_le_bytes();
+        for output_y in y..y_end {
+            let row = output_y as usize * self.info.pitch as usize;
+            for output_x in x..x_end {
+                let offset = row + output_x as usize * 4;
+                shadow[offset..offset + 4].copy_from_slice(&pixel);
+            }
+        }
+        Ok(())
+    }
+
     /// Rasterize text directly into a packed shadow buffer without issuing
     /// per-pixel VMO writes.
     pub fn draw_text_to_shadow(
@@ -144,6 +176,40 @@ impl Canvas {
                 }
             }
             cursor_x = cursor_x.saturating_add(8);
+        }
+        Ok(())
+    }
+
+    /// Upload a dirty shadow-buffer rectangle into the matching VMO region.
+    /// Rows are transferred independently because the source shadow and VMO
+    /// retain the full-canvas stride outside the rectangle.
+    pub fn upload_shadow_region(
+        &self,
+        shadow: &[u8],
+        x: u32,
+        y: u32,
+        width: u32,
+        height: u32,
+    ) -> crate::Result<()> {
+        let len = self.byte_len();
+        let x_end = x.checked_add(width).ok_or(crate::ErrorCode::InvalidArgs)?;
+        let y_end = y.checked_add(height).ok_or(crate::ErrorCode::InvalidArgs)?;
+        if !self.supports_buffered_raster()
+            || shadow.len() < len
+            || width == 0
+            || height == 0
+            || x_end > self.info.width
+            || y_end > self.info.height
+        {
+            return Err(crate::ErrorCode::InvalidArgs);
+        }
+        let row_bytes = width as usize * 4;
+        for output_y in y..y_end {
+            let offset = output_y as usize * self.info.pitch as usize + x as usize * 4;
+            let end = offset + row_bytes;
+            if self.vmo.write(offset as u64, &shadow[offset..end])? != row_bytes {
+                return Err(crate::ErrorCode::InvalidArgs);
+            }
         }
         Ok(())
     }
@@ -310,11 +376,40 @@ impl Canvas {
 
     /// Blit this entire canvas onto the real framebuffer at `(dst_x, dst_y)`.
     pub fn present_at(&self, dst_x: u32, dst_y: u32) -> crate::Result<()> {
+        self.present_region_at(0, 0, self.info.width, self.info.height, dst_x, dst_y)
+    }
+
+    /// Present a source rectangle at the same framebuffer coordinates.
+    pub fn present_region(&self, x: u32, y: u32, width: u32, height: u32) -> crate::Result<()> {
+        self.present_region_at(x, y, width, height, x, y)
+    }
+
+    /// Present a source rectangle at an explicit framebuffer destination.
+    pub fn present_region_at(
+        &self,
+        src_x: u32,
+        src_y: u32,
+        width: u32,
+        height: u32,
+        dst_x: u32,
+        dst_y: u32,
+    ) -> crate::Result<()> {
+        let src_x_end = src_x
+            .checked_add(width)
+            .ok_or(crate::ErrorCode::InvalidArgs)?;
+        let src_y_end = src_y
+            .checked_add(height)
+            .ok_or(crate::ErrorCode::InvalidArgs)?;
+        if width == 0 || height == 0 || src_x_end > self.info.width || src_y_end > self.info.height
+        {
+            return Err(crate::ErrorCode::InvalidArgs);
+        }
         let args = FramebufferBlitArgs {
             vmo: self.vmo.handle().raw(),
-            vmo_offset: 0,
-            src_width: self.info.width,
-            src_height: self.info.height,
+            vmo_offset: self.offset(src_x, src_y),
+            src_width: width,
+            src_height: height,
+            src_stride: self.info.pitch,
             dst_x,
             dst_y,
         };

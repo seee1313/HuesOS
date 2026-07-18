@@ -21,6 +21,11 @@ const MAX_BLIT_BYTES: u64 = 64 * 1024 * 1024;
 const BLIT_CHUNK_BYTES: usize = 64 * 1024;
 const MAX_ROW_BYTES: usize = 1024 * 1024;
 
+fn strided_source_span(row_bytes: u64, stride: u64, height: u32) -> Option<u64> {
+    let preceding_rows = u64::from(height.checked_sub(1)?);
+    preceding_rows.checked_mul(stride)?.checked_add(row_bytes)
+}
+
 pub(crate) fn sys_framebuffer_blit(args_ptr: *const FramebufferBlitArgs) -> SyscallResult {
     let args = user_memory::read_value(args_ptr)?;
     let fb_info = huesos_fb::info().ok_or(ErrorCode::NoFramebuffer)?;
@@ -28,13 +33,16 @@ pub(crate) fn sys_framebuffer_blit(args_ptr: *const FramebufferBlitArgs) -> Sysc
     let row_bytes_u64 = (args.src_width as u64)
         .checked_mul(bytes_per_pixel)
         .ok_or(ErrorCode::InvalidArgs)?;
-    let byte_len = row_bytes_u64
+    let stride = args.src_stride as u64;
+    let packed_byte_len = row_bytes_u64
         .checked_mul(args.src_height as u64)
         .ok_or(ErrorCode::InvalidArgs)?;
-    if byte_len == 0
-        || byte_len > MAX_BLIT_BYTES
+    if packed_byte_len == 0
+        || packed_byte_len > MAX_BLIT_BYTES
         || row_bytes_u64 > MAX_ROW_BYTES as u64
-        || byte_len > usize::MAX as u64
+        || stride < row_bytes_u64
+        || stride > MAX_BLIT_BYTES
+        || packed_byte_len > usize::MAX as u64
     {
         return Err(ErrorCode::InvalidArgs);
     }
@@ -51,11 +59,13 @@ pub(crate) fn sys_framebuffer_blit(args_ptr: *const FramebufferBlitArgs) -> Sysc
 
     // Validate the whole source before the first visible write, preventing a
     // malformed short VMO from producing a partially updated framebuffer.
+    let source_span = strided_source_span(row_bytes_u64, stride, args.src_height)
+        .ok_or(ErrorCode::InvalidArgs)?;
     let source_end = args
         .vmo_offset
-        .checked_add(byte_len)
+        .checked_add(source_span)
         .ok_or(ErrorCode::InvalidArgs)?;
-    if source_end > vmo.size() as u64 || args.vmo_offset > usize::MAX as u64 {
+    if source_end > vmo.size() as u64 || source_end > usize::MAX as u64 {
         return Err(ErrorCode::InvalidArgs);
     }
 
@@ -71,12 +81,28 @@ pub(crate) fn sys_framebuffer_blit(args_ptr: *const FramebufferBlitArgs) -> Sysc
     while first_row < height {
         let rows = rows_per_chunk.min(height - first_row);
         let chunk_len = rows * row_bytes;
-        let source_offset = (args.vmo_offset as usize)
-            .checked_add(first_row * row_bytes)
-            .ok_or(ErrorCode::InvalidArgs)?;
-        let copied = vmo.read(source_offset, &mut buffer[..chunk_len]);
-        if copied != chunk_len {
-            return Err(ErrorCode::InvalidArgs);
+        if stride == row_bytes_u64 {
+            let source_offset = (args.vmo_offset as usize)
+                .checked_add(first_row * row_bytes)
+                .ok_or(ErrorCode::InvalidArgs)?;
+            if vmo.read(source_offset, &mut buffer[..chunk_len]) != chunk_len {
+                return Err(ErrorCode::InvalidArgs);
+            }
+        } else {
+            for row in 0..rows {
+                let source_offset = args
+                    .vmo_offset
+                    .checked_add(
+                        (first_row + row)
+                            .checked_mul(stride as usize)
+                            .ok_or(ErrorCode::InvalidArgs)? as u64,
+                    )
+                    .ok_or(ErrorCode::InvalidArgs)? as usize;
+                let output = &mut buffer[row * row_bytes..(row + 1) * row_bytes];
+                if vmo.read(source_offset, output) != row_bytes {
+                    return Err(ErrorCode::InvalidArgs);
+                }
+            }
         }
         huesos_fb::blit(
             args.dst_x,
@@ -90,4 +116,21 @@ pub(crate) fn sys_framebuffer_blit(args_ptr: *const FramebufferBlitArgs) -> Sysc
     }
 
     Ok(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::strided_source_span;
+
+    #[test]
+    fn strided_span_includes_only_bytes_through_last_row() {
+        assert_eq!(strided_source_span(16, 64, 1), Some(16));
+        assert_eq!(strided_source_span(16, 64, 3), Some(144));
+    }
+
+    #[test]
+    fn strided_span_rejects_zero_height_and_overflow() {
+        assert_eq!(strided_source_span(16, 64, 0), None);
+        assert_eq!(strided_source_span(16, u64::MAX, 3), None);
+    }
 }
