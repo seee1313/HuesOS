@@ -15,6 +15,9 @@
 #![no_std]
 #![warn(missing_docs)]
 
+/// Ring-3 ACPI manager broker and immutable table-archive protocol.
+pub mod acpi_broker;
+
 /// Syscall number enumeration. The numeric value (not the variant name) is
 /// what actually crosses the ABI boundary in `rax`, so **never remove or
 /// reorder a variant** — only ever append new ones. Removing a syscall
@@ -230,6 +233,8 @@ pub const INVALID_HANDLE: HandleValue = 0;
 pub const BOOTSTRAP_HANDLE: HandleValue = 1;
 /// Read-only HBI BOOTFS VMO installed by the kernel in the initial process.
 pub const INIT_BOOTFS_HANDLE: HandleValue = 2;
+/// Immutable validated ACPI table archive installed in the initial process.
+pub const INIT_ACPI_TABLES_HANDLE: HandleValue = 3;
 
 /// Stable process exit codes used when the kernel terminates a process after
 /// an unhandled ring-3 CPU exception.
