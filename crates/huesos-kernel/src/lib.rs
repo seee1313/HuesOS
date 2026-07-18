@@ -116,13 +116,14 @@ pub unsafe fn kmain(boot_info: BootInfo) -> ! {
         dbg("[ACPI] firmware table mapping failed; continuing uniprocessor\n");
     }
 
-    if let Some(hbi_data) = boot_info.hbi_image {
-        if let Ok(hbi) = boot::hbi::HbiImage::parse(hbi_data) {
-            dbg("HBI v2.1 parsed. Entries: ");
-            dbg_num(hbi.get_num_entries() as u64);
-            dbg("\n");
-        }
-    }
+    let bootfs_image = boot_info.hbi_image.and_then(|hbi_data| {
+        let hbi = boot::hbi::HbiImage::parse(hbi_data).ok()?;
+        let bootfs = hbi.get_module(boot::hbi::ModuleType::Bootfs).ok()?;
+        dbg("HBI v2.1 parsed. Entries: ");
+        dbg_num(hbi.get_num_entries() as u64);
+        dbg("\n");
+        Some(bootfs)
+    });
 
     init::framebuffer_init(boot_info.framebuffer);
     huesos_arch::fault::set_kernel_fault_handler(crate::panic::from_cpu_fault);
@@ -141,7 +142,7 @@ pub unsafe fn kmain(boot_info: BootInfo) -> ! {
     }
 
     log_boot_banner(&boot_info);
-    spawn_init_process();
+    spawn_init_process(bootfs_image);
 
     // BSP idle: timer IRQ drives the scheduler; opportunistically reap.
     loop {
@@ -171,8 +172,8 @@ fn log_boot_banner(boot_info: &BootInfo) {
     }
 }
 
-fn spawn_init_process() {
-    use huesos_object::KernelObject;
+fn spawn_init_process(bootfs_image: Option<&[u8]>) {
+    use huesos_object::{Handle, KernelObject, Rights};
 
     let spawned = match process::spawn_from_elf("init", INIT_BINARY) {
         Ok(spawned) => spawned,
@@ -190,6 +191,30 @@ fn spawn_init_process() {
         spawned.process.koid().0,
         core::sync::atomic::Ordering::Release,
     );
+
+    if let Some(bytes) = bootfs_image {
+        match huesos_object::Vmo::new(bytes.len()) {
+            Ok(vmo) if vmo.write(0, bytes) == bytes.len() => {
+                let koid = vmo.koid();
+                huesos_object::register_object(vmo);
+                let rights = Rights::READ | Rights::DUPLICATE | Rights::TRANSFER;
+                if spawned
+                    .process
+                    .handles
+                    .insert_at(huesos_abi::INIT_BOOTFS_HANDLE, Handle::new(koid, rights))
+                    .is_err()
+                {
+                    huesos_object::unregister_object(koid);
+                    dbg("[init] failed to install BOOTFS handle\n");
+                }
+            }
+            Ok(_) => dbg("[init] short BOOTFS VMO initialization\n"),
+            Err(_) => dbg("[init] BOOTFS VMO allocation failed\n"),
+        }
+    } else {
+        dbg("[init] HBI BOOTFS module unavailable\n");
+    }
+
     let name = *b"init\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0";
     let _ = scheduler::spawn_user_thread(
         &name,

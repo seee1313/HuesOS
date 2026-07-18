@@ -6,9 +6,7 @@
 use core::cell::UnsafeCell;
 use core::panic::PanicInfo;
 use libcanvas::framebuffer::Canvas;
-use libcanvas::{Channel, ErrorCode};
-
-static FREEDOOM_WAD: &[u8] = include_bytes!("../../../../third_party/freedoom/freedoom1.wad");
+use libcanvas::{Channel, ErrorCode, Vmo};
 
 const DOOM_WIDTH: usize = 640;
 const DOOM_HEIGHT: usize = 400;
@@ -17,8 +15,13 @@ const SCALE_CHUNK_SIZE: usize = 1024 * 1024;
 struct DoomState {
     canvas: Option<Canvas>,
     keyboard: Option<Channel>,
+    wad: Option<Vmo>,
+    wad_offset: u64,
+    wad_len: u64,
     output_width: u32,
     output_height: u32,
+    output_x: u32,
+    output_y: u32,
     output_bpp: u32,
     scale_chunk: [u8; SCALE_CHUNK_SIZE],
 }
@@ -28,8 +31,13 @@ impl DoomState {
         Self {
             canvas: None,
             keyboard: None,
+            wad: None,
+            wad_offset: 0,
+            wad_len: 0,
             output_width: 640,
             output_height: 400,
+            output_x: 0,
+            output_y: 0,
             output_bpp: 4,
             scale_chunk: [0; SCALE_CHUNK_SIZE],
         }
@@ -88,35 +96,100 @@ pub extern "C" fn _start() -> ! {
 #[unsafe(no_mangle)]
 pub extern "C" fn DG_Init() {
     if let Ok(info) = libcanvas::framebuffer::info() {
+        let output_bpp = (info.bpp as u32).div_ceil(8);
+        let (width, height) = adaptive_output_size(info.width, info.height);
+        if output_bpp == 4 {
+            // Clear pixels outside the bounded game viewport once. Subsequent
+            // frames present only the smaller Doom canvas.
+            if let Ok(background) = Canvas::new_fullscreen() {
+                let _ = background.fill_rect(0, 0, info.width, info.height, 3, 6, 12);
+                let _ = background.present();
+            }
+        }
+        libcanvas::println!(
+            "[doom] adaptive viewport {}x{} at {},{} on {}x{}",
+            width,
+            height,
+            info.width.saturating_sub(width) / 2,
+            info.height.saturating_sub(height) / 2,
+            info.width,
+            info.height
+        );
         STATE.with(|state| {
-            state.output_width = info.width;
-            state.output_height = info.height;
-            state.output_bpp = (info.bpp as u32).div_ceil(8);
-            state.canvas = if state.output_bpp == 4 {
-                Canvas::new_fullscreen().ok()
+            state.output_width = width;
+            state.output_height = height;
+            state.output_x = info.width.saturating_sub(width) / 2;
+            state.output_y = info.height.saturating_sub(height) / 2;
+            state.output_bpp = output_bpp;
+            state.canvas = if output_bpp == 4 {
+                Canvas::new(width, height).ok()
             } else {
-                state.output_width = 640;
-                state.output_height = 400;
+                state.output_width = DOOM_WIDTH as u32;
+                state.output_height = DOOM_HEIGHT as u32;
+                state.output_x = 0;
+                state.output_y = 0;
                 state.output_bpp = 4;
-                Canvas::new(640, 400).ok()
+                Canvas::new(DOOM_WIDTH as u32, DOOM_HEIGHT as u32).ok()
             };
         });
     }
+
     let bootstrap = libcanvas::channel::bootstrap();
     let mut message = [0u8; 32];
     loop {
-        match bootstrap.read_channel_handle(&mut message) {
-            Ok((n, channel)) if &message[..n] == b"keyboard" => {
-                STATE.with(|state| state.keyboard = Some(channel));
-                break;
+        match bootstrap.read_optional_handle(&mut message) {
+            Ok((n, Some(handle))) if &message[..n] == b"keyboard" => {
+                STATE.with(|state| state.keyboard = Some(Channel::from_handle(handle)));
+            }
+            Ok((20, Some(handle))) if &message[..4] == b"wad\0" => {
+                let offset = read_u64(&message[4..12]);
+                let len = read_u64(&message[12..20]);
+                STATE.with(|state| {
+                    state.wad = Some(Vmo::from_handle(handle));
+                    state.wad_offset = offset;
+                    state.wad_len = len;
+                });
             }
             Ok(_) | Err(ErrorCode::ShouldWait | ErrorCode::TimedOut | ErrorCode::InvalidArgs) => {
                 libcanvas::process::yield_now();
             }
             Err(_) => break,
         }
+        let ready = STATE.with(|state| state.keyboard.is_some() && state.wad.is_some());
+        if ready {
+            break;
+        }
     }
     core::mem::forget(bootstrap);
+}
+
+fn adaptive_output_size(framebuffer_width: u32, framebuffer_height: u32) -> (u32, u32) {
+    // 960x600 keeps the 16:10 engine aspect ratio while bounding physical
+    // pixels to at most 1-2 display pixels on common 1280p/1080p/1440p modes.
+    const COMFORT_WIDTH: u32 = 960;
+    const COMFORT_HEIGHT: u32 = 600;
+    if framebuffer_width >= COMFORT_WIDTH && framebuffer_height >= COMFORT_HEIGHT {
+        return (COMFORT_WIDTH, COMFORT_HEIGHT);
+    }
+
+    let width_scale = framebuffer_width as u64 * DOOM_HEIGHT as u64;
+    let height_scale = framebuffer_height as u64 * DOOM_WIDTH as u64;
+    if width_scale <= height_scale {
+        let width = framebuffer_width.clamp(1, COMFORT_WIDTH);
+        (
+            width,
+            (width * DOOM_HEIGHT as u32 / DOOM_WIDTH as u32).max(1),
+        )
+    } else {
+        let height = framebuffer_height.clamp(1, COMFORT_HEIGHT);
+        (height * DOOM_WIDTH as u32 / DOOM_HEIGHT as u32, height)
+    }
+}
+
+fn read_u64(bytes: &[u8]) -> u64 {
+    u64::from_le_bytes([
+        bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+    ])
 }
 
 #[unsafe(no_mangle)]
@@ -161,7 +234,7 @@ pub extern "C" fn DG_DrawFrame() {
             let _ = canvas.write_bytes((first_y * row_bytes) as u64, output);
             first_y += rows;
         }
-        let _ = canvas.present();
+        let _ = canvas.present_at(state.output_x, state.output_y);
     });
 }
 
@@ -246,22 +319,36 @@ pub extern "C" fn DG_SetWindowTitle(_title: *const u8) {}
 
 #[unsafe(no_mangle)]
 pub extern "C" fn hues_wad_len() -> usize {
-    FREEDOOM_WAD.len()
+    STATE.with(|state| state.wad_len.min(usize::MAX as u64) as usize)
 }
 
-/// Copy bytes from the embedded IWAD into a C caller buffer.
+/// Read bytes from the read-only BOOTFS IWAD capability into a C buffer.
 ///
 /// # Safety
-/// `output` must be writable for `length` bytes or null. The function bounds
-/// the actual copy to the embedded WAD length.
+/// `output` must be writable for `length` bytes or null. Reads are bounded by
+/// the validated BOOTFS entry supplied by init.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn hues_wad_read(offset: usize, output: *mut u8, length: usize) -> usize {
-    if output.is_null() || offset >= FREEDOOM_WAD.len() {
+    if output.is_null() || length == 0 {
         return 0;
     }
-    let count = length.min(FREEDOOM_WAD.len() - offset);
-    unsafe { core::ptr::copy_nonoverlapping(FREEDOOM_WAD.as_ptr().add(offset), output, count) };
-    count
+    STATE.with(|state| {
+        let Some(wad) = state.wad.as_ref() else {
+            return 0;
+        };
+        let offset = offset as u64;
+        if offset >= state.wad_len {
+            return 0;
+        }
+        let count = length.min((state.wad_len - offset).min(usize::MAX as u64) as usize);
+        // SAFETY: caller guarantees the output range; count is no larger than
+        // that range and the VMO wrapper writes only into this temporary slice.
+        let destination = unsafe { core::slice::from_raw_parts_mut(output, count) };
+        let Some(vmo_offset) = state.wad_offset.checked_add(offset) else {
+            return 0;
+        };
+        wad.read(vmo_offset, destination).unwrap_or_default()
+    })
 }
 
 /// Forward a C debug byte range to the HuesOS debug channel.
