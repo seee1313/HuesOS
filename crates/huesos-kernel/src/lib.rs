@@ -96,14 +96,24 @@ pub unsafe fn kmain(boot_info: BootInfo) -> ! {
 
     // Limine base revision 3 leaves ACPI/reserved regions out of the HHDM.
     // Map them now so RSDP / XSDT / MADT walks don't #PF.
-    init::map_firmware_tables(boot_info.memory_regions, boot_info.rsdp_addr);
+    let firmware_tables_mapped =
+        init::map_firmware_tables(boot_info.memory_regions, boot_info.rsdp_addr).is_ok();
 
-    init::heap_init();
+    if let Err(error) = init::heap_init() {
+        use core::fmt::Write;
+        let mut writer = huesos_arch::serial::SerialWriter;
+        let _ = writeln!(writer, "[boot] kernel heap mapping failed: {error:?}");
+        loop {
+            huesos_arch::hlt();
+        }
+    }
     let panic_test_requested = boot_info.hbi_image.is_some_and(cmdline_requests_panic_test);
     init::object_init();
 
-    if let Some(rsdp) = boot_info.rsdp_addr {
+    if let Some(rsdp) = boot_info.rsdp_addr.filter(|_| firmware_tables_mapped) {
         smp::bringup_aps(rsdp, boot_info.hhdm_offset);
+    } else if boot_info.rsdp_addr.is_some() {
+        dbg("[ACPI] firmware table mapping failed; continuing uniprocessor\n");
     }
 
     if let Some(hbi_data) = boot_info.hbi_image {
@@ -164,7 +174,18 @@ fn log_boot_banner(boot_info: &BootInfo) {
 fn spawn_init_process() {
     use huesos_object::KernelObject;
 
-    let spawned = process::spawn_from_elf("init", INIT_BINARY);
+    let spawned = match process::spawn_from_elf("init", INIT_BINARY) {
+        Ok(spawned) => spawned,
+        Err(error) => {
+            use core::fmt::Write;
+            let mut writer = huesos_arch::serial::SerialWriter;
+            let _ = writeln!(
+                writer,
+                "[init] launch failed: {error:?}; entering kernel idle"
+            );
+            return;
+        }
+    };
     INIT_PROCESS_KOID.store(
         spawned.process.koid().0,
         core::sync::atomic::Ordering::Release,

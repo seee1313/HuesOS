@@ -6,7 +6,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use huesos_abi::{vmar_flags, ErrorCode, VmarMapArgs};
 use huesos_arch::gdt;
-use huesos_arch::paging::{flags, AddressSpace};
+use huesos_arch::paging::{flags, AddressSpace, UserPageError};
 use huesos_elf::{Loader, SegmentFlags};
 use huesos_object::{KernelObject, KernelObjectExt};
 use huesos_object::{Process, Vmar, VmarError, VmarMapping};
@@ -33,18 +33,18 @@ pub struct ProcessRuntime {
 
 impl ProcessRuntime {
     /// Create an empty runtime and register its root VMAR object.
-    pub fn new(process_koid: huesos_object::Koid) -> Self {
-        let address_space = AddressSpace::new();
+    pub fn new(process_koid: huesos_object::Koid) -> Result<Self, UserPageError> {
+        let address_space = AddressSpace::new()?;
         let root_vmar = Vmar::new_root(
             process_koid,
             huesos_abi::USER_ASPACE_BASE,
             huesos_abi::USER_ASPACE_SIZE,
         );
         huesos_object::register_object(root_vmar.clone());
-        Self {
+        Ok(Self {
             address_space,
             root_vmar,
-        }
+        })
     }
 
     /// CR3 value for scheduling this process.
@@ -60,7 +60,13 @@ struct KernelLoader<'a> {
 }
 
 impl<'a> Loader for KernelLoader<'a> {
-    fn map_zeroed_page(&mut self, vaddr: u64, flags_req: SegmentFlags) -> *mut u8 {
+    type Error = UserPageError;
+
+    fn map_zeroed_page(
+        &mut self,
+        vaddr: u64,
+        flags_req: SegmentFlags,
+    ) -> Result<*mut u8, Self::Error> {
         let page: Page<Size4KiB> = Page::containing_address(VirtAddr::new(vaddr));
         let mut pt_flags = PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE;
         if flags_req.write {
@@ -69,8 +75,23 @@ impl<'a> Loader for KernelLoader<'a> {
         if !flags_req.execute {
             pt_flags |= PageTableFlags::NO_EXECUTE;
         }
-        let frame = self.aspace.map_new_user_page(page, pt_flags);
-        huesos_arch::paging::phys_to_virt(frame.start_address().as_u64()).as_mut_ptr()
+        let frame = self.aspace.map_new_user_page(page, pt_flags)?;
+        Ok(huesos_arch::paging::phys_to_virt(frame.start_address().as_u64()).as_mut_ptr())
+    }
+}
+
+/// Failure while constructing a process from an ELF image.
+#[derive(Debug)]
+pub enum SpawnError {
+    /// The process address space or stack could not be allocated/mapped.
+    Paging(UserPageError),
+    /// ELF validation or segment mapping failed.
+    Elf(huesos_elf::ElfLoadError<UserPageError>),
+}
+
+impl From<UserPageError> for SpawnError {
+    fn from(error: UserPageError) -> Self {
+        Self::Paging(error)
     }
 }
 
@@ -98,7 +119,7 @@ pub fn create_suspended_process(
     let process = Process::new(if name.is_empty() { "process" } else { name });
     huesos_object::register_process(process.clone());
 
-    let runtime = ProcessRuntime::new(process.koid());
+    let runtime = ProcessRuntime::new(process.koid()).map_err(|_| ErrorCode::NoMemory)?;
     let root_vmar = Arc::clone(&runtime.root_vmar);
     *process.address_space.lock() =
         Some(Box::new(runtime) as Box<dyn core::any::Any + Send + Sync>);
@@ -182,6 +203,7 @@ pub fn map_vmo_into_vmar(
                 .try_map_user_page(page, frame, page_flags)
                 .map_err(|error| match error {
                     huesos_arch::paging::UserPageError::OutOfMemory => ErrorCode::NoMemory,
+                    huesos_arch::paging::UserPageError::NotInitialized => ErrorCode::Internal,
                     huesos_arch::paging::UserPageError::AlreadyMapped => ErrorCode::Busy,
                     huesos_arch::paging::UserPageError::ParentHugePage
                     | huesos_arch::paging::UserPageError::NotMapped
@@ -309,16 +331,29 @@ pub fn start_thread(
 
 /// Load `elf_bytes` into a brand new address space and prepare a process
 /// object ready to hand to the scheduler.
-pub fn spawn_from_elf(name: &str, elf_bytes: &[u8]) -> SpawnedProcess {
+pub fn spawn_from_elf(name: &str, elf_bytes: &[u8]) -> Result<SpawnedProcess, SpawnError> {
     let process = Process::new(name);
     huesos_object::register_process(process.clone());
-    let mut runtime = ProcessRuntime::new(process.koid());
+    let mut runtime = match ProcessRuntime::new(process.koid()) {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            huesos_object::unregister_object(process.koid());
+            return Err(SpawnError::Paging(error));
+        }
+    };
 
     let loaded = {
         let mut loader = KernelLoader {
             aspace: &mut runtime.address_space,
         };
-        huesos_elf::load(elf_bytes, &mut loader).expect("failed to load userspace ELF")
+        match huesos_elf::load(elf_bytes, &mut loader) {
+            Ok(loaded) => loaded,
+            Err(error) => {
+                runtime.destroy();
+                huesos_object::unregister_object(process.koid());
+                return Err(SpawnError::Elf(error));
+            }
+        }
     };
 
     // Map the initial user stack (grows down from USER_STACK_TOP).
@@ -326,9 +361,14 @@ pub fn spawn_from_elf(name: &str, elf_bytes: &[u8]) -> SpawnedProcess {
     let mut addr = stack_bottom;
     while addr < USER_STACK_TOP {
         let page: Page<Size4KiB> = Page::containing_address(VirtAddr::new(addr));
-        runtime
+        if let Err(error) = runtime
             .address_space
-            .map_new_user_page(page, flags::USER_RW | PageTableFlags::NO_EXECUTE);
+            .map_new_user_page(page, flags::USER_RW | PageTableFlags::NO_EXECUTE)
+        {
+            runtime.destroy();
+            huesos_object::unregister_object(process.koid());
+            return Err(SpawnError::Paging(error));
+        }
         addr += 4096;
     }
 
@@ -336,14 +376,14 @@ pub fn spawn_from_elf(name: &str, elf_bytes: &[u8]) -> SpawnedProcess {
     *process.address_space.lock() =
         Some(Box::new(runtime) as Box<dyn core::any::Any + Send + Sync>);
 
-    SpawnedProcess {
+    Ok(SpawnedProcess {
         process,
         entry_point: loaded.entry_point,
         // SysV x86_64 function entry expects RSP % 16 == 8 (as if a call
         // pushed a return address). iretq does not push one into user memory.
         user_rsp: USER_STACK_TOP - 40,
         cr3,
-    }
+    })
 }
 
 /// Entry trampoline installed as a task's initial resume address (via
@@ -383,12 +423,23 @@ fn take_user_entry(task_id: u64) -> Option<(u64, u64)> {
     Some((pending.entry, pending.rsp))
 }
 
+/// Remove a startup record for a task killed before its first schedule.
+/// The generation-bearing ID ensures this cannot remove a replacement task's
+/// record after slot reuse.
+pub(crate) fn cancel_user_entry(task_id: u64) {
+    PENDING_USER_ENTRIES
+        .lock()
+        .retain(|pending| pending.task_id != task_id);
+}
+
 /// Trampoline used as the initial RIP for user tasks.
 pub extern "C" fn user_entry_trampoline() -> ! {
-    let task_id = crate::scheduler::current_task_id()
-        .expect("user_entry_trampoline invoked without a current task id");
-    let (entry, rsp) =
-        take_user_entry(task_id).expect("user_entry_trampoline invoked without a pending entry");
+    let Some(task_id) = crate::scheduler::current_task_id() else {
+        crate::scheduler::terminate_current_process(huesos_abi::fault_exit::STARTUP_FAILED);
+    };
+    let Some((entry, rsp)) = take_user_entry(task_id) else {
+        crate::scheduler::terminate_current_process(huesos_abi::fault_exit::STARTUP_FAILED);
+    };
 
     let sel = gdt::selectors();
     let user_cs = (sel.user_code.0 as u64) | 3; // RPL=3

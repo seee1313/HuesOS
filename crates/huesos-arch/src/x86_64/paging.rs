@@ -59,16 +59,39 @@ pub fn phys_to_virt(phys: u64) -> VirtAddr {
     VirtAddr::new(*HHDM_OFFSET.lock() + phys)
 }
 
+/// Failure while mutating the shared kernel page table.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum KernelPageError {
+    /// Paging initialization has not installed the kernel mapper.
+    NotInitialized,
+    /// The PMM could not allocate a data or intermediate table frame.
+    OutOfMemory,
+    /// The virtual page already has a mapping.
+    AlreadyMapped,
+    /// A huge parent mapping prevents insertion of a 4 KiB page.
+    ParentHugePage,
+}
+
 /// Map `page` to `frame` with `flags` in the *kernel* address space.
-pub fn map_page(page: Page<Size4KiB>, frame: PhysFrame<Size4KiB>, flags: PageTableFlags) {
+pub fn map_page(
+    page: Page<Size4KiB>,
+    frame: PhysFrame<Size4KiB>,
+    flags: PageTableFlags,
+) -> Result<(), KernelPageError> {
+    use x86_64::structures::paging::mapper::MapToError;
+
     let mut guard = KERNEL_PAGE_TABLE.lock();
-    let mapper = guard.as_mut().expect("page table not initialized");
-    unsafe {
-        mapper
-            .map_to(page, frame, flags, &mut PmmFrameAllocator)
-            .expect("kernel map_to failed")
-            .flush();
-    }
+    let mapper = guard.as_mut().ok_or(KernelPageError::NotInitialized)?;
+    let flush =
+        unsafe { mapper.map_to(page, frame, flags, &mut PmmFrameAllocator) }.map_err(|error| {
+            match error {
+                MapToError::FrameAllocationFailed => KernelPageError::OutOfMemory,
+                MapToError::PageAlreadyMapped(_) => KernelPageError::AlreadyMapped,
+                MapToError::ParentEntryHugePage => KernelPageError::ParentHugePage,
+            }
+        })?;
+    flush.flush();
+    Ok(())
 }
 
 /// Ensure that `[phys_base, phys_base + length)` is reachable via the HHDM.
@@ -84,17 +107,21 @@ pub fn map_page(page: Page<Size4KiB>, frame: PhysFrame<Size4KiB>, flags: PageTab
 /// - [`init`] must have been called (kernel mapper live).
 /// - The PMM must be initialized so intermediate page-table frames can be
 ///   allocated if a new PT/PD is needed.
-pub fn map_hhdm_range(phys_base: u64, length: u64) {
+pub fn map_hhdm_range(phys_base: u64, length: u64) -> Result<(), KernelPageError> {
     map_hhdm_range_flags(
         phys_base,
         length,
         PageTableFlags::PRESENT | PageTableFlags::WRITABLE,
-    );
+    )
 }
 
 /// Like [`map_hhdm_range`], but with explicit page flags (e.g. `NO_CACHE` for MMIO).
-pub fn map_hhdm_range_flags(phys_base: u64, length: u64, flags: PageTableFlags) {
-    map_phys_range(phys_base, length, flags, phys_to_virt);
+pub fn map_hhdm_range_flags(
+    phys_base: u64,
+    length: u64,
+    flags: PageTableFlags,
+) -> Result<(), KernelPageError> {
+    map_phys_range(phys_base, length, flags, phys_to_virt)
 }
 
 /// Identity-map `[phys_base, phys_base + length)` so `virt == phys`.
@@ -103,13 +130,13 @@ pub fn map_hhdm_range_flags(phys_base: u64, length: u64, flags: PageTableFlags) 
 /// CR3 it still loads RSP/entry from absolute addresses `0x7008` / `0x7010`.
 /// Base revision 3 dropped the unconditional low 4 GiB identity map, so we
 /// must reinstall the few pages the trampoline needs.
-pub fn map_identity_range(phys_base: u64, length: u64) {
+pub fn map_identity_range(phys_base: u64, length: u64) -> Result<(), KernelPageError> {
     map_phys_range(
         phys_base,
         length,
         PageTableFlags::PRESENT | PageTableFlags::WRITABLE,
         VirtAddr::new,
-    );
+    )
 }
 
 fn map_phys_range(
@@ -117,15 +144,15 @@ fn map_phys_range(
     length: u64,
     flags: PageTableFlags,
     virt_of: impl Fn(u64) -> VirtAddr,
-) {
+) -> Result<(), KernelPageError> {
     if length == 0 {
-        return;
+        return Ok(());
     }
     let start = phys_base & !0xfff;
     let end = phys_base.saturating_add(length).saturating_add(0xfff) & !0xfff;
 
     let mut guard = KERNEL_PAGE_TABLE.lock();
-    let mapper = guard.as_mut().expect("page table not initialized");
+    let mapper = guard.as_mut().ok_or(KernelPageError::NotInitialized)?;
 
     let mut phys = start;
     while phys < end {
@@ -150,6 +177,7 @@ fn map_phys_range(
             break;
         }
     }
+    Ok(())
 }
 
 /// Check whether a 4 KiB page in the currently active address space is
@@ -207,19 +235,28 @@ pub fn active_user_page_accessible(addr: VirtAddr, write: bool) -> bool {
 
 /// Allocate a fresh physical frame and map it at `page` in the kernel
 /// address space. Returns the physical frame allocated.
-pub fn map_new_page(page: Page<Size4KiB>, flags: PageTableFlags) -> PhysFrame<Size4KiB> {
+pub fn map_new_page(
+    page: Page<Size4KiB>,
+    flags: PageTableFlags,
+) -> Result<PhysFrame<Size4KiB>, KernelPageError> {
     let frame = PmmFrameAllocator
         .allocate_frame()
-        .expect("out of physical memory");
-    map_page(page, frame, flags);
-    frame
+        .ok_or(KernelPageError::OutOfMemory)?;
+    if let Err(error) = map_page(page, frame, flags) {
+        // SAFETY: map_page failed, so the fresh frame has no published owner.
+        unsafe { PmmFrameAllocator.deallocate_frame(frame) };
+        return Err(error);
+    }
+    Ok(frame)
 }
 
 /// Failure while mutating a userspace page table.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum UserPageError {
-    /// The PMM could not allocate an intermediate page-table frame.
+    /// The PMM could not allocate a data or intermediate page-table frame.
     OutOfMemory,
+    /// Paging initialization has not installed the required mapper.
+    NotInitialized,
     /// The virtual page already has a mapping.
     AlreadyMapped,
     /// A huge parent entry prevents a 4 KiB mapping/unmapping operation.
@@ -244,10 +281,10 @@ impl AddressSpace {
     /// Create a new address space that inherits kernel mappings (so that
     /// syscalls/interrupts keep working after a `CR3` switch) but starts
     /// with an empty user half.
-    pub fn new() -> Self {
+    pub fn new() -> Result<Self, UserPageError> {
         let pml4_frame = PmmFrameAllocator
             .allocate_frame()
-            .expect("out of memory allocating PML4");
+            .ok_or(UserPageError::OutOfMemory)?;
         let virt = phys_to_virt(pml4_frame.start_address().as_u64());
         let new_table: &mut PageTable = unsafe { &mut *virt.as_mut_ptr() };
         new_table.zero();
@@ -261,10 +298,10 @@ impl AddressSpace {
             new_table[i] = current_table[i].clone();
         }
 
-        Self {
+        Ok(Self {
             pml4_frame,
             owned_frames: alloc::vec::Vec::new(),
-        }
+        })
     }
 
     /// Fallibly map a non-owned frame into this inactive address space.
@@ -318,28 +355,26 @@ impl AddressSpace {
         Ok(())
     }
 
-    /// Map a page during trusted bootstrap paths that cannot recover.
-    fn map_user_page(
-        &mut self,
-        page: Page<Size4KiB>,
-        frame: PhysFrame<Size4KiB>,
-        flags: PageTableFlags,
-    ) {
-        self.try_map_user_page(page, frame, flags)
-            .expect("trusted userspace image mapping failed");
-    }
-
     /// Allocate a fresh frame and map it into this address space.
     /// The frame is owned by this address space and freed in [`Self::destroy`].
+    /// If page-table insertion fails, the newly allocated frame is returned
+    /// immediately and is never published in `owned_frames`.
     pub fn map_new_user_page(
         &mut self,
         page: Page<Size4KiB>,
         flags: PageTableFlags,
-    ) -> PhysFrame<Size4KiB> {
-        let frame = PmmFrameAllocator.allocate_frame().expect("out of memory");
+    ) -> Result<PhysFrame<Size4KiB>, UserPageError> {
+        let frame = PmmFrameAllocator
+            .allocate_frame()
+            .ok_or(UserPageError::OutOfMemory)?;
+        if let Err(error) = self.try_map_user_page(page, frame, flags) {
+            // SAFETY: this frame was allocated immediately above and no
+            // mapping or owner retained it after try_map_user_page failed.
+            unsafe { PmmFrameAllocator.deallocate_frame(frame) };
+            return Err(error);
+        }
         self.owned_frames.push(frame.start_address().as_u64());
-        self.map_user_page(page, frame, flags);
-        frame
+        Ok(frame)
     }
 
     /// Physical address of this address space's PML4, suitable for CR3.
@@ -427,12 +462,6 @@ unsafe fn free_page_table_recursive(table_phys: u64, level: u8, owned: &mut allo
         table[i].set_unused();
     }
     huesos_pmm::free_frame(table_phys);
-}
-
-impl Default for AddressSpace {
-    fn default() -> Self {
-        Self::new()
-    }
 }
 
 /// Common page flag combinations.
