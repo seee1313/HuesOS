@@ -70,16 +70,19 @@ pub fn init() {
 }
 
 extern "x86-interrupt" fn divide_error_handler(frame: InterruptStackFrame) {
+    super::cpu::clear_user_access();
     dispatch(fault_info(FaultKind::DivideError, &frame, 0, 0));
 }
 
 extern "x86-interrupt" fn breakpoint_handler(_frame: InterruptStackFrame) {
+    super::cpu::clear_user_access();
     // INT3 is deliberately non-fatal for now. A debugger hook can replace
     // this behavior later; returning resumes immediately after the trap.
     crate::serial::emergency_write("[idt] BREAKPOINT\n");
 }
 
 extern "x86-interrupt" fn invalid_opcode_handler(frame: InterruptStackFrame) {
+    super::cpu::clear_user_access();
     dispatch(fault_info(FaultKind::InvalidOpcode, &frame, 0, 0));
 }
 
@@ -87,6 +90,7 @@ extern "x86-interrupt" fn general_protection_fault_handler(
     frame: InterruptStackFrame,
     error_code: u64,
 ) {
+    super::cpu::clear_user_access();
     dispatch(fault_info(
         FaultKind::GeneralProtection,
         &frame,
@@ -99,6 +103,7 @@ extern "x86-interrupt" fn page_fault_handler(
     frame: InterruptStackFrame,
     error_code: PageFaultErrorCode,
 ) {
+    super::cpu::clear_user_access();
     let address = Cr2::read().map(|a| a.as_u64()).unwrap_or(0);
     dispatch(fault_info(
         FaultKind::PageFault,
@@ -109,14 +114,17 @@ extern "x86-interrupt" fn page_fault_handler(
 }
 
 extern "x86-interrupt" fn alignment_check_handler(frame: InterruptStackFrame, error_code: u64) {
+    super::cpu::clear_user_access();
     dispatch(fault_info(FaultKind::AlignmentCheck, &frame, error_code, 0));
 }
 
 extern "x86-interrupt" fn double_fault_handler(frame: InterruptStackFrame, error_code: u64) -> ! {
+    super::cpu::clear_user_access();
     super::fault::kernel_fault(fault_info(FaultKind::DoubleFault, &frame, error_code, 0));
 }
 
 extern "x86-interrupt" fn panic_stop_handler(_frame: InterruptStackFrame) {
+    super::cpu::clear_user_access();
     super::interrupts::disable();
     PANIC_STOPPED_CPUS.fetch_add(1, Ordering::Release);
     super::lapic::eoi();
@@ -126,6 +134,7 @@ extern "x86-interrupt" fn panic_stop_handler(_frame: InterruptStackFrame) {
 }
 
 extern "x86-interrupt" fn shutdown_stop_handler(_frame: InterruptStackFrame) {
+    super::cpu::clear_user_access();
     super::interrupts::disable();
     super::lapic::timer_stop();
     super::lapic::eoi();
@@ -135,6 +144,7 @@ extern "x86-interrupt" fn shutdown_stop_handler(_frame: InterruptStackFrame) {
 }
 
 extern "x86-interrupt" fn timer_handler(_stack_frame: InterruptStackFrame) {
+    super::cpu::clear_user_access();
     super::lapic::eoi();
     unsafe {
         super::interrupts::PICS.lock().notify_end_of_interrupt(32);
@@ -143,6 +153,7 @@ extern "x86-interrupt" fn timer_handler(_stack_frame: InterruptStackFrame) {
 }
 
 extern "x86-interrupt" fn keyboard_handler(_stack_frame: InterruptStackFrame) {
+    super::cpu::clear_user_access();
     use x86_64::instructions::port::Port;
     let mut port: Port<u8> = Port::new(0x60);
     let scancode: u8 = unsafe { port.read() };
