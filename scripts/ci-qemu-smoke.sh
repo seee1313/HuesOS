@@ -37,6 +37,7 @@ if grep -q 'KERNEL PANIC' "$log"; then
     exit 1
 fi
 for marker in \
+    '[uACPI] validated ACPI table graph and MADT' \
     '[init] user fault isolation OK' \
     '[init] terminal says terminal:ready' \
     '[terminal] keyboard service online'; do
