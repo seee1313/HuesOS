@@ -23,8 +23,8 @@ jobs:
           rustup toolchain install nightly-2026-03-01 --profile minimal \
             --component rust-src,rustfmt,clippy,llvm-tools-preview
           rustup default nightly-2026-03-01
-      - name: Enforce safety regression budget
-        run: python3 tools/check-safety-budget.py
+      - name: Enforce safety and privileged lock policies
+        run: make audit-check
       - name: Clippy
         env:
           CARGO_BUILD_JOBS: "1"

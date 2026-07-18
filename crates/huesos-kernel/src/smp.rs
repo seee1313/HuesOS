@@ -19,12 +19,11 @@ static AP_STACKS: spin::Once<Vec<Vec<u8>>> = spin::Once::new();
 /// How long the BSP waits for each AP to report ready (rough microseconds).
 const AP_READY_TIMEOUT_US: u32 = 200_000;
 
-/// Parse ACPI MADT, discover CPUs, and bring up all APs.
-/// Called once on the BSP after paging and heap are ready.
-pub fn bringup_aps(rsdp_addr: u64, hhdm_offset: u64) {
-    let madt = unsafe { huesos_arch::acpi::parse_madt(rsdp_addr, |p| p + hhdm_offset) };
-
-    let Some(madt) = madt else {
+/// Parse a uACPI-referenced MADT, discover CPUs, and bring up all APs.
+/// Called once on the BSP after paging and heap are ready. The table reference
+/// remains owned by uACPI for the complete call.
+pub fn bringup_aps(madt_bytes: &[u8], hhdm_offset: u64) {
+    let Some(madt) = huesos_arch::acpi::parse_madt_bytes(madt_bytes) else {
         unsafe {
             huesos_arch::lapic::set_base(0xfee0_0000, hhdm_offset);
             huesos_arch::lapic::init();

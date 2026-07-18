@@ -5,8 +5,8 @@
 //! into a ring buffer that userspace/kernel consumers can drain via
 //! [`read_char`].
 
+use crate::{LockRank, RankedIrqSafeTicketLock};
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use spin::Mutex;
 
 const BUFFER_SIZE: usize = 256;
 
@@ -43,7 +43,8 @@ impl RingBuffer {
     }
 }
 
-static BUFFER: Mutex<RingBuffer> = Mutex::new(RingBuffer::new());
+static BUFFER: RankedIrqSafeTicketLock<RingBuffer> =
+    RankedIrqSafeTicketLock::new(RingBuffer::new(), LockRank::ARCHITECTURE);
 static SHIFT_HELD: AtomicBool = AtomicBool::new(false);
 static BYTES_RECEIVED: AtomicUsize = AtomicUsize::new(0);
 

@@ -142,12 +142,21 @@ global_asm!(
 );
 
 unsafe extern "C" {
-    /// Switch CPU context from `old` to `new`.
-    ///
-    /// # Safety
-    /// Must be called with interrupts disabled. Both pointers must be valid
-    /// for the lifetime of the call.
-    pub unsafe fn context_switch(old: *mut Context, new: *const Context);
+    #[link_name = "context_switch"]
+    fn context_switch_asm(old: *mut Context, new: *const Context);
+}
+
+/// Switch CPU context from `old` to `new` after enforcing that no ranked lock
+/// guard can leak across the switch.
+///
+/// # Safety
+/// Must be called with interrupts disabled. Both pointers must be valid for
+/// the lifetime of the call and refer to distinct, live task contexts.
+pub unsafe fn context_switch(old: *mut Context, new: *const Context) {
+    crate::assert_no_ranked_locks_held();
+    // SAFETY: the caller provides the context pointer and interrupt contracts;
+    // the wrapper has additionally verified the lock-rank invariant.
+    unsafe { context_switch_asm(old, new) };
 }
 
 global_asm!(
@@ -178,17 +187,31 @@ global_asm!(
 );
 
 unsafe extern "C" {
-    /// Perform the initial ring0 -> ring3 transition via `iretq`.
-    ///
-    /// # Safety
-    /// `user_rip`/`user_rsp` must point into valid, mapped user memory in
-    /// the currently active address space, and `user_cs`/`user_ss` must be
-    /// valid ring3 selectors (RPL=3).
-    pub unsafe fn enter_userspace(
+    #[link_name = "enter_userspace"]
+    fn enter_userspace_asm(
         user_rip: u64,
         user_rsp: u64,
         user_cs: u64,
         user_ss: u64,
         user_rflags: u64,
     ) -> !;
+}
+
+/// Perform the initial ring0 → ring3 transition via `iretq` after verifying
+/// that the kernel retains no ranked lock guard.
+///
+/// # Safety
+/// `user_rip`/`user_rsp` must point into valid, mapped user memory in the
+/// current address space, and `user_cs`/`user_ss` must be ring3 selectors.
+pub unsafe fn enter_userspace(
+    user_rip: u64,
+    user_rsp: u64,
+    user_cs: u64,
+    user_ss: u64,
+    user_rflags: u64,
+) -> ! {
+    crate::assert_no_ranked_locks_held();
+    // SAFETY: caller owns the architectural transition contract; this wrapper
+    // checks the additional synchronization invariant before entering ring3.
+    unsafe { enter_userspace_asm(user_rip, user_rsp, user_cs, user_ss, user_rflags) }
 }

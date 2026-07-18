@@ -14,7 +14,7 @@ The upstream license, README, headers, sources, and exact revision are stored un
 
 ## Current stage: validated table subsystem
 
-The first stage compiles uACPI in `UACPI_BAREBONES_MODE`. uACPI now owns RSDP/XSDT/RSDT traversal, SDT mapping, checksum validation, table lifetime, and MADT discovery. HuesOS keeps its existing typed MADT consumer temporarily, but SMP bring-up is gated on successful uACPI table initialization and an accessible validated `APIC` table.
+The first stage compiles uACPI in `UACPI_BAREBONES_MODE`. uACPI owns RSDP/XSDT/RSDT traversal, SDT mapping, checksum validation, table lifetime, and MADT discovery. SMP bring-up consumes the referenced `APIC` table as a bounded byte slice while the uACPI reference remains alive; the former handwritten physical-pointer RSDP/XSDT/MADT walker has been removed.
 
 This staged integration is intentional. Enabling AML before the kernel provides correct mutex, event, work-queue, interrupt, PCI, and SystemIO contracts would replace a small parser with a larger unsound boundary.
 
@@ -42,7 +42,7 @@ The early descriptor scratch buffer is static, 16-byte aligned, and protected by
 
 uACPI failure is not a kernel panic. If table initialization, checksum validation, or MADT lookup fails, HuesOS emits a serial diagnostic and continues in uniprocessor mode. It never passes an unvalidated ACPI pointer to SMP bring-up.
 
-HHDM unmap is deliberately a no-op during this stage. Firmware mappings are shared boot mappings, may be referenced by the existing MADT consumer, and are retained for the kernel lifetime. Dynamic map accounting will be introduced before AML runtime mappings are enabled.
+HHDM unmap is deliberately a no-op during this stage. Firmware mappings are shared boot mappings retained for the kernel lifetime. The MADT consumer itself performs no raw pointer access; dynamic map accounting will be introduced before AML runtime mappings are enabled.
 
 ## Lock ordering
 

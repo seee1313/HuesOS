@@ -44,9 +44,13 @@ Timer IRQ may:
 
 Timer IRQ must not tear down processes, drop object graphs, parse firmware, or allocate framebuffer-sized buffers. Device IRQ paths may enqueue bounded Port packets and wake a task but may not wait on process-runtime or filesystem locks.
 
-## Runtime enforcement plan
+## Runtime enforcement status
 
-All-build lock-rank enforcement requires migration from direct `spin::Mutex` use to a ranked wrapper with per-CPU held-rank stacks. The wrapper must also work before GS/per-CPU initialization and restore state across IRQ nesting. Until each lock is migrated, CI static checks and this table are authoritative; partial runtime checking would create false confidence. Migration will proceed subsystem-by-subsystem, with release assertions retained as requested.
+`RankedIrqSafeTicketLock` enforces non-decreasing rank order in **all builds**. Each CPU owns a fixed-capacity rank stack selected through GS-based `CpuLocal` state; acquiring a ranked lock disables local interrupts before touching that stack. The implementation rejects rank inversions, recursive acquisition, excessive nesting, and non-LIFO guard release. Contract violations use lock-independent emergency serial output and fail-stop rather than entering the ordinary panic path while synchronization state may be corrupt.
+
+The context-switch and ring0→ring3 assembly boundaries call `assert_no_ranked_locks_held`, so a ranked guard cannot silently survive a task switch or userspace entry. The allocator, paging state, architecture IRQ state, uACPI initialization, process startup records, per-CPU scheduler, task reaper, and process-teardown queues have been migrated. CI rejects any new `spin::Mutex` in the kernel, architecture, or in-kernel uACPI crates. Legacy `spin::Mutex` instances remain in the platform-neutral object and syscall crates; those locks are still governed by this table but do not yet provide runtime evidence. They must move to a host-testable shared ranked-lock core before runtime enforcement is considered complete.
+
+Rank tracking starts after `init_gs_base`. HuesOS deliberately keeps pre-GS serial/GDT bootstrap locks unranked; AP and BSP initialization install their unique tracker index before allocator, scheduler, object, or firmware runtime work begins.
 
 ## Review checklist
 
