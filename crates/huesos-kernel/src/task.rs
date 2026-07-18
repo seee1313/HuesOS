@@ -24,7 +24,8 @@ pub enum TaskKind {
         process: Arc<Process>,
     },
     /// Finished task after stack and process ownership have been reclaimed.
-    /// The scheduler keeps the slot so task IDs/indexes never change.
+    /// The scheduler may reuse this slot, but only after incrementing the
+    /// generation encoded in the replacement task's opaque ID.
     Reaped,
 }
 

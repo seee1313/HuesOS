@@ -24,12 +24,49 @@ use crate::task::{Task, TaskKind};
 use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::ops::{Deref, DerefMut};
 use core::sync::atomic::Ordering;
 use huesos_object::{KernelObject, Process};
 use x86_64::VirtAddr;
 
 /// Maximum number of CPUs supported.
 pub const MAX_CPUS: usize = 64;
+
+// Task IDs are opaque capabilities, not bare vector indexes. The high byte
+// identifies a CPU, the next 24 bits identify a slot generation, and the low
+// 32 bits identify the slot. A delayed wake carrying an older generation can
+// therefore never wake an unrelated task after slot reuse.
+const TASK_CPU_SHIFT: u32 = 56;
+const TASK_GENERATION_SHIFT: u32 = 32;
+const TASK_GENERATION_MASK: u32 = 0x00ff_ffff;
+const TASK_INDEX_MASK: u64 = 0xffff_ffff;
+
+const fn encode_task_id(cpu: usize, generation: u32, index: usize) -> u64 {
+    ((cpu as u64) << TASK_CPU_SHIFT)
+        | (((generation & TASK_GENERATION_MASK) as u64) << TASK_GENERATION_SHIFT)
+        | (index as u64 & TASK_INDEX_MASK)
+}
+
+const fn task_cpu(id: u64) -> usize {
+    (id >> TASK_CPU_SHIFT) as usize
+}
+
+const fn task_generation(id: u64) -> u32 {
+    ((id >> TASK_GENERATION_SHIFT) as u32) & TASK_GENERATION_MASK
+}
+
+const fn task_index(id: u64) -> usize {
+    (id & TASK_INDEX_MASK) as usize
+}
+
+const fn next_task_generation(previous: u32) -> u32 {
+    let next = previous.wrapping_add(1) & TASK_GENERATION_MASK;
+    if next == 0 {
+        1
+    } else {
+        next
+    }
+}
 
 /// Bitmask of CPUs that have finished scheduler init and may receive tasks.
 /// Bit N set => CPU with LAPIC-id N is online for load-balancing.
@@ -83,11 +120,29 @@ pub enum SchedPolicy {
 static PER_CPU_SCHEDULERS: [spin::Mutex<Scheduler>; MAX_CPUS] =
     [const { spin::Mutex::new(Scheduler::new()) }; MAX_CPUS];
 
+struct TaskSlot {
+    generation: u32,
+    // The allocation keeps Context addresses stable while the slot vector
+    // grows. Reuse replaces the value only after the old task was reaped.
+    task: Box<Task>,
+}
+
+impl Deref for TaskSlot {
+    type Target = Task;
+
+    fn deref(&self) -> &Self::Target {
+        &self.task
+    }
+}
+
+impl DerefMut for TaskSlot {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.task
+    }
+}
+
 struct Scheduler {
-    // Box keeps Context addresses stable while other tasks are appended and
-    // the Vec reallocates during a suspended context switch.
-    #[allow(clippy::vec_box)]
-    tasks: Vec<Box<Task>>,
+    tasks: Vec<TaskSlot>,
     current: usize,
     fair_queue: wavl::WavlTree,
     ticks: u64,
@@ -103,17 +158,57 @@ impl Scheduler {
         }
     }
 
-    fn add_task(&mut self, task: Task) -> u64 {
-        let id = task.id;
-        let idx = self.tasks.len();
+    fn add_task(&mut self, cpu: usize, create: impl FnOnce(u64) -> Task) -> u64 {
+        let reusable = self
+            .tasks
+            .iter()
+            .enumerate()
+            .skip(1)
+            .find(|(_, slot)| matches!(&slot.kind, TaskKind::Reaped))
+            .map(|(index, _)| index);
+
+        let (index, generation) = if let Some(index) = reusable {
+            let previous = self.tasks[index].generation;
+            // Generation zero is reserved for never-reused slots. Skipping it
+            // makes wraparound retain stale-ID protection for another full
+            // 24-bit cycle.
+            (index, next_task_generation(previous))
+        } else {
+            (self.tasks.len(), 0)
+        };
+
+        let id = encode_task_id(cpu, generation, index);
+        let task = create(id);
         let policy = task.sched_policy;
-        self.tasks.push(Box::new(task));
-        if idx > 0 {
+        if index == self.tasks.len() {
+            self.tasks.push(TaskSlot {
+                generation,
+                task: Box::new(task),
+            });
+        } else {
+            let slot = &mut self.tasks[index];
+            slot.generation = generation;
+            *slot.task = task;
+        }
+        if index > 0 {
             if let SchedPolicy::Fair { vruntime, .. } = policy {
                 self.fair_queue.insert(vruntime, id);
             }
         }
         id
+    }
+
+    fn task_matches(&self, id: u64) -> bool {
+        self.tasks
+            .get(task_index(id))
+            .is_some_and(|slot| slot.generation == task_generation(id) && slot.id == id)
+    }
+
+    fn live_task_count(&self) -> usize {
+        self.tasks
+            .iter()
+            .filter(|slot| !matches!(&slot.kind, TaskKind::Reaped))
+            .count()
     }
 
     fn apply_task_environment(&self, idx: usize) {
@@ -200,8 +295,9 @@ impl Scheduler {
         // Skip tasks that finished or are blocked (parked on a wait queue).
         if next_idx == 0 {
             while let Some(task_id) = self.fair_queue.pop_min() {
-                let idx = (task_id & 0xFFFFFFFF) as usize;
-                if let Some(task) = self.tasks.get(idx) {
+                let idx = task_index(task_id);
+                if self.task_matches(task_id) {
+                    let task = &self.tasks[idx];
                     if task.finished.load(Ordering::Relaxed) || task.blocked.load(Ordering::Relaxed)
                     {
                         continue;
@@ -228,7 +324,7 @@ impl Scheduler {
     }
 
     fn current_task(&self) -> Option<&Task> {
-        self.tasks.get(self.current).map(|t| &**t)
+        self.tasks.get(self.current).map(|slot| &**slot)
     }
 }
 
@@ -252,10 +348,12 @@ pub fn init() {
     let cpu = cpu_id();
     let mut guard = PER_CPU_SCHEDULERS[cpu].lock();
     unsafe { register_scheduler_ptr(&mut *guard) };
-    guard.add_task(Task::new_idle(
-        0,
-        *b"idle\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0",
-    ));
+    guard.add_task(cpu, |id| {
+        Task::new_idle(
+            id,
+            *b"idle\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0",
+        )
+    });
     drop(guard);
 
     huesos_arch::timer_callback::set_timer_callback(&|| {
@@ -344,15 +442,16 @@ pub fn park_current() {
 /// before `park_current` set `blocked=true` (swap would early-return and the
 /// subsequent park would sleep forever).
 pub fn wake_task(task_id: u64) {
-    let cpu = (task_id >> 32) as usize;
+    let cpu = task_cpu(task_id);
     if cpu >= MAX_CPUS {
         return;
     }
-    let idx = (task_id & 0xFFFF_FFFF) as usize;
+    let idx = task_index(task_id);
     let mut guard = PER_CPU_SCHEDULERS[cpu].lock();
-    let Some(task) = guard.tasks.get_mut(idx) else {
+    if !guard.task_matches(task_id) {
         return;
-    };
+    }
+    let task = &mut guard.tasks[idx];
     if task.finished.load(Ordering::Relaxed) {
         task.blocked.store(false, Ordering::SeqCst);
         return;
@@ -394,7 +493,7 @@ fn find_best_cpu() -> usize {
             continue;
         }
         let guard = scheduler.lock();
-        let count = guard.tasks.len();
+        let count = guard.live_task_count();
         // Prefer the least-loaded online CPU that already has at least an idle task.
         if count >= 1 && count < min_tasks {
             min_tasks = count;
@@ -407,15 +506,17 @@ fn find_best_cpu() -> usize {
 /// Set the scheduling policy for a task by its ID.
 pub fn set_sched_policy(task_id: u64, policy: SchedPolicy) {
     huesos_arch::interrupts::disable();
-    let cpu = (task_id >> 32) as usize;
-    let idx = (task_id & 0xFFFFFFFF) as usize;
+    let cpu = task_cpu(task_id);
+    let idx = task_index(task_id);
     if cpu < MAX_CPUS {
         let mut guard = PER_CPU_SCHEDULERS[cpu].lock();
 
-        let mut old_policy = None;
-        if let Some(task) = guard.tasks.get(idx) {
-            old_policy = Some(task.sched_policy);
+        if !guard.task_matches(task_id) {
+            drop(guard);
+            huesos_arch::interrupts::enable();
+            return;
         }
+        let old_policy = Some(guard.tasks[idx].sched_policy);
 
         if let Some(SchedPolicy::Fair { vruntime, .. }) = old_policy {
             guard.fair_queue.remove(vruntime, task_id);
@@ -437,9 +538,7 @@ pub fn spawn_kernel_thread(name: &[u8; 32], entry: extern "C" fn() -> !) -> u64 
     huesos_arch::interrupts::disable();
     let cpu = find_best_cpu();
     let mut guard = PER_CPU_SCHEDULERS[cpu].lock();
-    let id = ((cpu as u64) << 32) | (guard.tasks.len() as u64);
-    let task = Task::new_kernel(id, *name, entry);
-    guard.add_task(task);
+    let id = guard.add_task(cpu, |id| Task::new_kernel(id, *name, entry));
     drop(guard);
     huesos_arch::interrupts::enable();
 
@@ -465,16 +564,16 @@ pub fn spawn_user_thread(
     // use find_best_cpu for load balance.
     let cpu = cpu_id();
     let mut guard = PER_CPU_SCHEDULERS[cpu].lock();
-    let id = ((cpu as u64) << 32) | (guard.tasks.len() as u64);
-    crate::process::queue_user_entry(id, entry_point, user_rsp);
-    let task = Task::new_user(
-        id,
-        *name,
-        process,
-        crate::process::user_entry_trampoline,
-        cr3,
-    );
-    guard.add_task(task);
+    let id = guard.add_task(cpu, |id| {
+        crate::process::queue_user_entry(id, entry_point, user_rsp);
+        Task::new_user(
+            id,
+            *name,
+            process,
+            crate::process::user_entry_trampoline,
+            cr3,
+        )
+    });
     drop(guard);
     huesos_arch::interrupts::enable();
 
@@ -623,25 +722,28 @@ pub fn reap_finished_tasks() {
         core::mem::take(&mut *q)
     };
     for task_id in batch {
-        let cpu = (task_id >> 32) as usize;
-        let idx = (task_id & 0xFFFF_FFFF) as usize;
+        let cpu = task_cpu(task_id);
+        let idx = task_index(task_id);
         if cpu >= MAX_CPUS {
             continue;
         }
         let mut guard = PER_CPU_SCHEDULERS[cpu].lock();
-        // Never reap the currently running task (shouldn't be queued).
+        // Drop duplicate/stale queue entries before comparing indexes: a new
+        // generation may legitimately be running in the same slot.
+        if !guard.task_matches(task_id) {
+            continue;
+        }
+        // Never reap the currently running generation (shouldn't be queued).
         if guard.current == idx {
             REAP_QUEUE.lock().push(task_id);
             continue;
         }
-        if let Some(task) = guard.tasks.get_mut(idx) {
-            if task.finished.load(Ordering::Acquire) {
-                // A finished slot is never scheduled again. Release both its
-                // stack allocation and any Process Arc while preserving the
-                // vector index encoded in historical task IDs.
-                task.kernel_stack = alloc::vec::Vec::new();
-                task.kind = TaskKind::Reaped;
-            }
+        let task = &mut guard.tasks[idx];
+        if task.finished.load(Ordering::Acquire) {
+            // Releasing the stack and Process Arc turns this allocation into
+            // a reusable tombstone. The next occupant gets a new generation.
+            task.kernel_stack = alloc::vec::Vec::new();
+            task.kind = TaskKind::Reaped;
         }
     }
 
@@ -666,5 +768,30 @@ pub fn reap_finished_tasks() {
         } else {
             crate::process::teardown_process(&proc);
         }
+    }
+}
+
+#[cfg(test)]
+mod task_id_tests {
+    use super::*;
+
+    #[test]
+    fn task_id_fields_round_trip_without_aliasing() {
+        let id = encode_task_id(63, 0x00ab_cdef, 0xfedc_ba98);
+        assert_eq!(task_cpu(id), 63);
+        assert_eq!(task_generation(id), 0x00ab_cdef);
+        assert_eq!(task_index(id), 0xfedc_ba98);
+
+        let next_cpu = encode_task_id(62, 0x00ab_cdef, 0xfedc_ba98);
+        let next_generation = encode_task_id(63, 0x00ab_cdf0, 0xfedc_ba98);
+        assert_ne!(id, next_cpu);
+        assert_ne!(id, next_generation);
+    }
+
+    #[test]
+    fn reused_generations_never_publish_zero() {
+        assert_eq!(next_task_generation(0), 1);
+        assert_eq!(next_task_generation(41), 42);
+        assert_eq!(next_task_generation(TASK_GENERATION_MASK), 1);
     }
 }
