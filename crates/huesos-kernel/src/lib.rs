@@ -129,11 +129,22 @@ pub unsafe fn kmain(boot_info: BootInfo) -> ! {
     let panic_test_requested = boot_info.hbi_image.is_some_and(cmdline_requests_panic_test);
     init::object_init();
 
-    if let Some(rsdp) = boot_info
-        .rsdp_addr
-        .filter(|_| firmware_tables_mapped && uacpi_tables_ready)
-    {
-        smp::bringup_aps(rsdp, boot_info.hhdm_offset);
+    if firmware_tables_mapped && uacpi_tables_ready {
+        match huesos_uacpi::Table::find(b"APIC").and_then(|table| {
+            let bytes = table.bytes()?;
+            smp::bringup_aps(bytes, boot_info.hhdm_offset);
+            Ok(())
+        }) {
+            Ok(()) => {}
+            Err(error) => {
+                use core::fmt::Write;
+                let mut writer = huesos_arch::serial::SerialWriter;
+                let _ = writeln!(
+                    writer,
+                    "[uACPI] MADT consumer failed: {error:?}; continuing uniprocessor"
+                );
+            }
+        }
     } else if boot_info.rsdp_addr.is_some() {
         dbg("[ACPI] validated table access unavailable; continuing uniprocessor\n");
     }
