@@ -1,7 +1,7 @@
 #![allow(dead_code)]
 
 use core::alloc::{GlobalAlloc, Layout};
-use huesos_arch::IrqSafeTicketLock;
+use huesos_arch::{LockRank, RankedIrqSafeTicketLock};
 
 use huesos_alloc::{AllocError, BuddyAllocator, BuddyProvider, SlabAllocator};
 
@@ -108,8 +108,8 @@ pub unsafe fn kfree(ptr: usize, size: usize) {
     }
 }
 
-pub static GLOBAL_ALLOCATOR: IrqSafeTicketLock<Option<KernelAllocator>> =
-    IrqSafeTicketLock::new(None);
+pub static GLOBAL_ALLOCATOR: RankedIrqSafeTicketLock<Option<KernelAllocator>> =
+    RankedIrqSafeTicketLock::new(None, LockRank::ALLOCATOR);
 
 pub struct KernelGlobalAlloc;
 

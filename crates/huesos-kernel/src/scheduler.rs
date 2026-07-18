@@ -26,6 +26,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::ops::{Deref, DerefMut};
 use core::sync::atomic::Ordering;
+use huesos_arch::{LockRank, RankedIrqSafeTicketLock};
 use huesos_object::{KernelObject, Process};
 use x86_64::VirtAddr;
 
@@ -116,8 +117,8 @@ pub enum SchedPolicy {
     },
 }
 
-static PER_CPU_SCHEDULERS: [spin::Mutex<Scheduler>; MAX_CPUS] =
-    [const { spin::Mutex::new(Scheduler::new()) }; MAX_CPUS];
+static PER_CPU_SCHEDULERS: [RankedIrqSafeTicketLock<Scheduler>; MAX_CPUS] =
+    [const { RankedIrqSafeTicketLock::new(Scheduler::new(), LockRank::SCHEDULER) }; MAX_CPUS];
 
 struct TaskSlot {
     generation: u32,
@@ -722,11 +723,13 @@ fn switch_away_from_finished(cpu: usize) -> ! {
 static REAP_PENDING: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 /// Task ids waiting for kernel-stack reclamation.
-static REAP_QUEUE: spin::Mutex<alloc::vec::Vec<u64>> = spin::Mutex::new(alloc::vec::Vec::new());
+static REAP_QUEUE: RankedIrqSafeTicketLock<alloc::vec::Vec<u64>> =
+    RankedIrqSafeTicketLock::new(alloc::vec::Vec::new(), LockRank::REAPER);
 
 /// Processes waiting for address-space / handle-table teardown.
-static PROCESS_TEARDOWN: spin::Mutex<alloc::vec::Vec<alloc::sync::Arc<huesos_object::Process>>> =
-    spin::Mutex::new(alloc::vec::Vec::new());
+static PROCESS_TEARDOWN: RankedIrqSafeTicketLock<
+    alloc::vec::Vec<alloc::sync::Arc<huesos_object::Process>>,
+> = RankedIrqSafeTicketLock::new(alloc::vec::Vec::new(), LockRank::REAPER);
 
 /// Service deferred teardown after an ordinary syscall has released all
 /// subsystem locks. The atomic fast path avoids touching queue mutexes on

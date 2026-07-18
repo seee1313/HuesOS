@@ -10,7 +10,10 @@
 extern crate alloc;
 
 mod sync;
-pub use sync::{IrqSafeTicketLock, IrqSafeRawSpinlock, RawSpinlock, TicketLock};
+pub use sync::{
+    IrqSafeRawSpinlock, IrqSafeTicketLock, LockRank, LockRankError, RankedIrqSafeTicketLock,
+    RawSpinlock, TicketLock, assert_no_ranked_locks_held,
+};
 
 mod x86_64;
 pub use x86_64::*;

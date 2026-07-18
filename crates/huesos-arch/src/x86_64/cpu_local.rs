@@ -40,6 +40,8 @@ pub struct CpuLocal {
     pub user_rsp: u64,
     /// Kernel RSP for syscall handling (offset 48).
     pub kernel_rsp: u64,
+    /// Index of this CPU's runtime lock-rank tracker (offset 56).
+    pub rank_tracker_index: usize,
 }
 
 impl CpuLocal {
@@ -54,13 +56,15 @@ impl CpuLocal {
             gdt: core::ptr::null_mut(),
             user_rsp: 0,
             kernel_rsp: 0,
+            rank_tracker_index: 0,
         }
     }
 }
 
 static_assertions::const_assert_eq!(core::mem::offset_of!(CpuLocal, user_rsp), 40);
 static_assertions::const_assert_eq!(core::mem::offset_of!(CpuLocal, kernel_rsp), 48);
-static_assertions::const_assert_eq!(core::mem::size_of::<CpuLocal>(), 56);
+static_assertions::const_assert_eq!(core::mem::offset_of!(CpuLocal, rank_tracker_index), 56);
+static_assertions::const_assert_eq!(core::mem::size_of::<CpuLocal>(), 64);
 
 struct CpuLocalStorage(UnsafeCell<[CpuLocal; MAX_CPUS]>);
 
@@ -89,6 +93,7 @@ pub unsafe fn alloc_cpu_local(lapic_id: u32) -> &'static mut CpuLocal {
     unsafe {
         (*pointer).self_ptr = pointer;
         (*pointer).lapic_id = lapic_id;
+        (*pointer).rank_tracker_index = index;
         &mut *pointer
     }
 }
@@ -142,4 +147,21 @@ pub unsafe fn current_lapic_id() -> u32 {
         );
     }
     id
+}
+
+/// Return the current CPU's unique lock-rank tracker index.
+///
+/// # Safety
+/// `init_gs_base` must have been called on this CPU.
+pub unsafe fn current_rank_tracker_index() -> usize {
+    let index: usize;
+    unsafe {
+        asm!(
+            "mov {out}, gs:[{offset}]",
+            out = out(reg) index,
+            offset = const core::mem::offset_of!(CpuLocal, rank_tracker_index),
+            options(nomem, nostack, preserves_flags),
+        );
+    }
+    index
 }
