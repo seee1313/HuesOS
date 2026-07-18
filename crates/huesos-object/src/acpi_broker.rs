@@ -49,12 +49,23 @@ pub struct AcpiBroker {
 impl AcpiBroker {
     /// Construct a broker with no privileged grants.
     pub fn deny_all() -> Arc<Self> {
+        Self::with_policy(Vec::new(), Vec::new(), false, false)
+    }
+
+    /// Construct an immutable broker policy from firmware-derived grants.
+    /// Callers must pass only resources parsed from validated uACPI tables.
+    pub fn with_policy(
+        system_io: Vec<SystemIoGrant>,
+        pci: Vec<PciFunctionGrant>,
+        allow_reset: bool,
+        allow_power_off: bool,
+    ) -> Arc<Self> {
         Arc::new(Self {
             koid: alloc_koid(),
-            system_io: Vec::new(),
-            pci: Vec::new(),
-            allow_reset: false,
-            allow_power_off: false,
+            system_io,
+            pci,
+            allow_reset,
+            allow_power_off,
         })
     }
 
@@ -145,5 +156,38 @@ mod tests {
         };
         let validated = request.validate();
         assert!(validated.as_ref().is_ok_and(|request| !AcpiBroker::deny_all().authorizes(request)));
+    }
+
+    #[test]
+    fn system_io_grant_is_exact_and_directional() {
+        let broker = AcpiBroker::with_policy(
+            alloc::vec![SystemIoGrant {
+                base: 0x400,
+                length: 4,
+                read: true,
+                write: false,
+            }],
+            Vec::new(),
+            false,
+            false,
+        );
+        let read = Request {
+            version: VERSION,
+            opcode: Opcode::SystemIoRead as u16,
+            width: 2,
+            address: 0x402,
+            ..Request::default()
+        }
+        .validate();
+        let write = Request {
+            version: VERSION,
+            opcode: Opcode::SystemIoWrite as u16,
+            width: 2,
+            address: 0x402,
+            ..Request::default()
+        }
+        .validate();
+        assert!(read.as_ref().is_ok_and(|request| broker.authorizes(request)));
+        assert!(write.as_ref().is_ok_and(|request| !broker.authorizes(request)));
     }
 }
