@@ -8,7 +8,7 @@ CARGO_BUILD := cargo build -p huesos-boot $(CARGO_FLAGS)
 
 ISO := build/huesos.iso
 
-.PHONY: all build build-release run run-release iso iso-release clean fmt test audit clippy
+.PHONY: all build build-release run run-release iso iso-release clean fmt test audit audit-check clippy
 
 all: build
 
@@ -37,6 +37,9 @@ test:
 
 audit:
 	python3 tools/audit-safety.py
+
+audit-check:
+	python3 tools/check-safety-budget.py
 
 clippy:
 	bash scripts/clippy.sh
