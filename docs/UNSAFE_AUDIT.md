@@ -118,6 +118,14 @@ initial broker has an empty allowlist and its Ring-3 startup self-test proves a
 valid port request returns `AccessDenied` without executing I/O. One additional
 unsafe block wraps init's fixed broker handle in RAII before one-way transfer.
 
+## uACPI table-metadata boundary
+
+One additional unsafe FFI call reads `uacpi_table_info` by validated index. The
+wrapper checks returned index, bounded length, signature, physical/virtual
+origin and checksum status. Archive construction cross-checks metadata against
+the independently referenced table bytes before exposing any firmware address
+to Ring 3.
+
 ## Remaining high-priority boundaries
 
 ### Allocator internals

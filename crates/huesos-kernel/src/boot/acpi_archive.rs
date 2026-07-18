@@ -25,6 +25,7 @@ struct Entry {
     index: usize,
     signature: [u8; 4],
     revision: u8,
+    physical_address: u64,
     offset: u64,
     length: u32,
     instance: u32,
@@ -55,6 +56,11 @@ pub fn build() -> Result<Vec<u8>, ArchiveBuildError> {
         .map_err(|_| ArchiveBuildError::OutOfMemory)?;
 
     for index in 0..count {
+        let metadata =
+            huesos_uacpi::table_metadata(index).map_err(|_| ArchiveBuildError::InvalidTable)?;
+        if metadata.checksum_bad {
+            return Err(ArchiveBuildError::InvalidTable);
+        }
         let table = huesos_uacpi::Table::get(index).map_err(|_| ArchiveBuildError::InvalidTable)?;
         let bytes = table.bytes().map_err(|_| ArchiveBuildError::InvalidTable)?;
         let length = u32::try_from(bytes.len()).map_err(|_| ArchiveBuildError::TooLarge)?;
@@ -67,11 +73,15 @@ pub fn build() -> Result<Vec<u8>, ArchiveBuildError> {
         let revision = table
             .revision()
             .map_err(|_| ArchiveBuildError::InvalidTable)?;
+        if metadata.length != bytes.len() || metadata.signature != signature {
+            return Err(ArchiveBuildError::InvalidTable);
+        }
         let instance = instances.entry(signature).or_insert(0);
         entries.push(Entry {
             index,
             signature,
             revision,
+            physical_address: metadata.physical_address.unwrap_or(0),
             offset: next_offset,
             length,
             instance: *instance,
@@ -124,7 +134,8 @@ fn encode_entry(output: &mut [u8], position: usize, entry: &Entry) {
     let encoded = &mut output[start..start + TABLE_ARCHIVE_ENTRY_BYTES];
     encoded[..4].copy_from_slice(&entry.signature);
     encoded[4] = entry.revision;
-    encoded[8..16].copy_from_slice(&entry.offset.to_le_bytes());
-    encoded[16..20].copy_from_slice(&entry.length.to_le_bytes());
-    encoded[20..24].copy_from_slice(&entry.instance.to_le_bytes());
+    encoded[8..16].copy_from_slice(&entry.physical_address.to_le_bytes());
+    encoded[16..24].copy_from_slice(&entry.offset.to_le_bytes());
+    encoded[24..28].copy_from_slice(&entry.length.to_le_bytes());
+    encoded[28..32].copy_from_slice(&entry.instance.to_le_bytes());
 }

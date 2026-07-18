@@ -17,7 +17,7 @@ pub const MAX_ARCHIVE_BYTES: u64 = 64 * 1024 * 1024;
 /// Encoded archive-header size, including alignment padding before `total_size`.
 pub const TABLE_ARCHIVE_HEADER_BYTES: u16 = 24;
 /// Encoded table-entry size.
-pub const TABLE_ARCHIVE_ENTRY_BYTES: usize = 24;
+pub const TABLE_ARCHIVE_ENTRY_BYTES: usize = 32;
 
 /// Privileged operation requested by the ACPI manager.
 #[repr(u16)]
@@ -227,6 +227,8 @@ pub struct TableArchiveEntry {
     pub revision: u8,
     /// Reserved and required to be zero.
     pub reserved: [u8; 3],
+    /// Original firmware physical address, or zero for virtual tables.
+    pub physical_address: u64,
     /// Byte offset from the start of the archive.
     pub offset: u64,
     /// Table length in bytes.
@@ -284,6 +286,14 @@ pub fn validate_archive_layout(
             return Err(ArchiveError::Reserved);
         }
         if !(36..=MAX_TABLE_BYTES).contains(&entry.length) || entry.offset < metadata_end {
+            return Err(ArchiveError::Range);
+        }
+        if entry.physical_address != 0
+            && entry
+                .physical_address
+                .checked_add(entry.length as u64)
+                .is_none()
+        {
             return Err(ArchiveError::Range);
         }
         if entry.offset < previous_end {
