@@ -92,6 +92,15 @@ length and arithmetic checks without dereferencing raw firmware pointers. This
 removed nineteen unsafe blocks and four unsafe functions from the audited
 baseline.
 
+## CR0.WP, SMEP, and SMAP boundary
+
+Four new unsafe blocks are confined to privileged control-register updates and
+`STAC`/`CLAC`. CPUID gates optional CR4 features, existing register bits are
+preserved, and scoped user-copy guards prevent AC state from crossing IRQ or
+syscall boundaries. No raw user-pointer site was added; all existing copies now
+run inside the audited guard. This is an intentional security-boundary budget
+increase.
+
 ## Remaining high-priority boundaries
 
 ### Allocator internals
