@@ -49,8 +49,8 @@ fn map_ap_low_pages() {
     // Both HHDM (BSP access) and identity (post-paging trampoline).
     const LOW: u64 = 0x0000;
     const LEN: u64 = 0x1_0000; // 64 KiB
-    crate::x86_64::paging::map_hhdm_range(LOW, LEN);
-    crate::x86_64::paging::map_identity_range(LOW, LEN);
+    let _ = crate::x86_64::paging::map_hhdm_range(LOW, LEN);
+    let _ = crate::x86_64::paging::map_identity_range(LOW, LEN);
 }
 
 /// Copy the AP trampoline from the kernel image to low memory.
@@ -85,7 +85,10 @@ pub unsafe fn boot_ap(apic_id: u8, stack_top: u64, entry_point: u64) {
     // Write ApBootInfo through the HHDM — physical 0x7000 is not identity-mapped
     // for ordinary kernel code under base revision 3.
     let info = crate::x86_64::paging::phys_to_virt(AP_BOOT_INFO_PHYS).as_mut_ptr::<ApBootInfo>();
-    (*info).cr3 = x86_64::registers::control::Cr3::read().0.start_address().as_u64();
+    (*info).cr3 = x86_64::registers::control::Cr3::read()
+        .0
+        .start_address()
+        .as_u64();
     (*info).stack_top = stack_top;
     (*info).entry_point = entry_point;
     (*info).status = 0;

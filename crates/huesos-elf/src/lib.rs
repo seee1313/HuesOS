@@ -29,15 +29,18 @@ pub struct SegmentFlags {
 /// Abstraction over "an address space that can have pages mapped into it",
 /// implemented by the kernel using its real page-table machinery.
 pub trait Loader {
+    /// Target-specific mapping failure.
+    type Error;
+
     /// Map a fresh, zeroed page at `vaddr` with the given permissions and
     /// return a kernel-accessible pointer to that page's contents (e.g. via
     /// the HHDM) so the loader can copy segment data into it.
-    fn map_zeroed_page(&mut self, vaddr: u64, flags: SegmentFlags) -> *mut u8;
+    fn map_zeroed_page(&mut self, vaddr: u64, flags: SegmentFlags) -> Result<*mut u8, Self::Error>;
 }
 
 /// Errors that can occur while loading an ELF binary.
 #[derive(Debug)]
-pub enum ElfLoadError {
+pub enum ElfLoadError<E = ()> {
     /// The file could not be parsed as an ELF64 image.
     ParseError(&'static str),
     /// The ELF is not a supported class/type (must be 64-bit executable).
@@ -50,6 +53,8 @@ pub enum ElfLoadError {
     /// load error rather than an out-of-bounds slice panic that would take
     /// down the whole kernel just for trying to load a bad binary.
     SegmentOutOfBounds,
+    /// The target address space could not map a segment page.
+    Mapping(E),
 }
 
 /// Result of successfully loading an ELF binary.
@@ -63,13 +68,17 @@ pub struct LoadedElf {
 
 /// Load `data` (the raw ELF file bytes) into the address space represented
 /// by `loader`, mapping each `PT_LOAD` segment.
-pub fn load<L: Loader>(data: &[u8], loader: &mut L) -> Result<LoadedElf, ElfLoadError> {
+pub fn load<L: Loader>(data: &[u8], loader: &mut L) -> Result<LoadedElf, ElfLoadError<L::Error>> {
     let elf = ElfFile::new(data).map_err(ElfLoadError::ParseError)?;
 
     use xmas_elf::header::Type as HeaderType;
     match elf.header.pt2.type_().as_type() {
         HeaderType::Executable => {}
-        _ => return Err(ElfLoadError::Unsupported("only ET_EXEC binaries are supported")),
+        _ => {
+            return Err(ElfLoadError::Unsupported(
+                "only ET_EXEC binaries are supported",
+            ))
+        }
     }
 
     let mut highest_addr = 0u64;
@@ -96,7 +105,7 @@ fn load_segment<L: Loader>(
     ph: &ProgramHeader,
     file_data: &[u8],
     loader: &mut L,
-) -> Result<(), ElfLoadError> {
+) -> Result<(), ElfLoadError<L::Error>> {
     let flags = SegmentFlags {
         read: ph.flags().is_read(),
         write: ph.flags().is_write(),
@@ -136,7 +145,9 @@ fn load_segment<L: Loader>(
 
     let mut page = page_start;
     while page < page_end {
-        let dst = loader.map_zeroed_page(page, flags);
+        let dst = loader
+            .map_zeroed_page(page, flags)
+            .map_err(ElfLoadError::Mapping)?;
 
         // Compute overlap between [page, page+PAGE_SIZE) and the segment's
         // file-backed range [vaddr_start, vaddr_start+file_size).
@@ -195,13 +206,19 @@ mod tests {
     }
 
     impl Loader for FakeLoader {
-        fn map_zeroed_page(&mut self, vaddr: u64, _flags: SegmentFlags) -> *mut u8 {
+        type Error = ();
+
+        fn map_zeroed_page(
+            &mut self,
+            vaddr: u64,
+            _flags: SegmentFlags,
+        ) -> Result<*mut u8, Self::Error> {
             let page = align_down(vaddr, PAGE_SIZE);
             let buf = self
                 .pages
                 .entry(page)
                 .or_insert_with(|| std::vec![0u8; PAGE_SIZE as usize]);
-            buf.as_mut_ptr()
+            Ok(buf.as_mut_ptr())
         }
     }
 
@@ -226,7 +243,12 @@ mod tests {
     /// `ph_offset`/`ph_filesz` are deliberately parameterized so tests can
     /// pass in "lies" that a corrupted or hand-rolled linker script could
     /// plausibly produce.
-    fn build_minimal_elf(ph_offset: u32, ph_filesz: u32, ph_memsz: u32, total_len: usize) -> alloc::vec::Vec<u8> {
+    fn build_minimal_elf(
+        ph_offset: u32,
+        ph_filesz: u32,
+        ph_memsz: u32,
+        total_len: usize,
+    ) -> alloc::vec::Vec<u8> {
         let mut buf = alloc::vec![0u8; total_len.max(64 + 56)];
 
         // e_ident
@@ -269,10 +291,38 @@ mod tests {
         // Sanity check for the hand-built ELF helper itself: a segment
         // whose claimed file range genuinely fits within the file must
         // still load successfully.
-        let elf = build_minimal_elf(/* ph_offset */ 128, /* filesz */ 16, /* memsz */ 16, 256);
+        let elf = build_minimal_elf(
+            /* ph_offset */ 128, /* filesz */ 16, /* memsz */ 16, 256,
+        );
         let mut loader = FakeLoader::new();
         let loaded = load(&elf, &mut loader).expect("well-formed minimal ELF should load");
         assert_eq!(loaded.entry_point, 0x400050);
+    }
+
+    #[test]
+    fn preserves_target_mapping_failure() {
+        #[derive(Debug, Eq, PartialEq)]
+        struct InjectedFailure;
+
+        struct FailingLoader;
+        impl Loader for FailingLoader {
+            type Error = InjectedFailure;
+
+            fn map_zeroed_page(
+                &mut self,
+                _vaddr: u64,
+                _flags: SegmentFlags,
+            ) -> Result<*mut u8, Self::Error> {
+                Err(InjectedFailure)
+            }
+        }
+
+        let elf = build_minimal_elf(128, 16, 16, 256);
+        let result = load(&elf, &mut FailingLoader);
+        assert!(matches!(
+            result,
+            Err(ElfLoadError::Mapping(InjectedFailure))
+        ));
     }
 
     #[test]
@@ -280,7 +330,9 @@ mod tests {
         // p_offset + p_filesz reaches past the actual file length: this
         // used to panic with an out-of-bounds slice index instead of
         // returning a clean error.
-        let elf = build_minimal_elf(/* ph_offset */ 128, /* filesz */ 1000, /* memsz */ 1000, 256);
+        let elf = build_minimal_elf(
+            /* ph_offset */ 128, /* filesz */ 1000, /* memsz */ 1000, 256,
+        );
         let mut loader = FakeLoader::new();
         let result = load(&elf, &mut loader);
         assert!(
@@ -294,7 +346,9 @@ mod tests {
     fn rejects_filesz_greater_than_memsz() {
         // A segment claiming more file-backed bytes than its total memory
         // size is never valid (file_size must be <= mem_size).
-        let elf = build_minimal_elf(/* ph_offset */ 128, /* filesz */ 64, /* memsz */ 32, 256);
+        let elf = build_minimal_elf(
+            /* ph_offset */ 128, /* filesz */ 64, /* memsz */ 32, 256,
+        );
         let mut loader = FakeLoader::new();
         let result = load(&elf, &mut loader);
         assert!(matches!(result, Err(ElfLoadError::SegmentOutOfBounds)));

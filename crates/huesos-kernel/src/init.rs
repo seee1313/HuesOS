@@ -31,7 +31,10 @@ pub unsafe fn pmm_init(regions: &[MemoryRegion], hhdm_offset: u64) {
 ///
 /// Also maps a small window around the RSDP address itself, in case the
 /// firmware put it in a region whose type we don't classify above.
-pub fn map_firmware_tables(regions: &[MemoryRegion], rsdp_addr: Option<u64>) {
+pub fn map_firmware_tables(
+    regions: &[MemoryRegion],
+    rsdp_addr: Option<u64>,
+) -> Result<(), huesos_arch::paging::KernelPageError> {
     for r in regions {
         // Do NOT map general RESERVED: that includes MMIO (LAPIC/IOAPIC/PCI)
         // and a WB map of the LAPIC page would make later NO_CACHE remap a
@@ -43,7 +46,7 @@ pub fn map_firmware_tables(regions: &[MemoryRegion], rsdp_addr: Option<u64>) {
         if needs_map && r.length > 0 {
             // ACPI tables are tiny; cap so a mis-typed region cannot explode.
             let len = core::cmp::min(r.length, 4 * 1024 * 1024);
-            huesos_arch::paging::map_hhdm_range(r.base, len);
+            huesos_arch::paging::map_hhdm_range(r.base, len)?;
         }
     }
 
@@ -51,11 +54,12 @@ pub fn map_firmware_tables(regions: &[MemoryRegion], rsdp_addr: Option<u64>) {
         // Always cover the RSDP page (and a couple of neighbours) even if
         // its memmap type was unexpected.
         let page = rsdp & !0xfff;
-        huesos_arch::paging::map_hhdm_range(page.saturating_sub(0x1000), 0x3000);
+        huesos_arch::paging::map_hhdm_range(page.saturating_sub(0x1000), 0x3000)?;
     }
+    Ok(())
 }
 
-pub fn heap_init() {
+pub fn heap_init() -> Result<(), huesos_arch::paging::KernelPageError> {
     use huesos_arch::paging::{flags, map_new_page};
     use x86_64::structures::paging::{Page, Size4KiB};
     use x86_64::VirtAddr;
@@ -65,13 +69,14 @@ pub fn heap_init() {
     for i in 0..page_count {
         let v = HEAP_VIRT_START + (i as u64) * 4096;
         let p = Page::<Size4KiB>::containing_address(VirtAddr::new(v));
-        map_new_page(p, flags::KERNEL_RW);
+        map_new_page(p, flags::KERNEL_RW)?;
     }
 
     unsafe {
         let a = crate::mem::alloc::KernelAllocator::new(HEAP_VIRT_START as usize, page_count);
         *crate::mem::alloc::GLOBAL_ALLOCATOR.lock() = Some(a);
     }
+    Ok(())
 }
 
 pub fn object_init() {
@@ -131,6 +136,9 @@ fn handle_irq(irq: u8, d: u64) {
 
 extern "C" fn handle_syscall(f: &mut huesos_arch::syscall::SyscallFrame) {
     let r = huesos_syscalls::dispatch(f.num, f.arg1, f.arg2, f.arg3, f.arg4, f.arg5);
+    // Dispatch has returned with syscall/object locks released. Deferred
+    // address-space and object destruction is safe here in process context.
+    crate::scheduler::reap_if_pending();
     f.num = match r {
         Ok(v) => v as u64,
         Err(e) => e as i32 as i64 as u64,

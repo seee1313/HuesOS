@@ -27,7 +27,7 @@ pub unsafe fn set_base(phys: u32, hhdm_offset: u64) {
     // LAPIC is MMIO: must be uncacheable. WB mapping can hang IPI delivery
     // status polls forever (writes never reach the device).
     use x86_64::structures::paging::PageTableFlags;
-    crate::x86_64::paging::map_hhdm_range_flags(
+    let _ = crate::x86_64::paging::map_hhdm_range_flags(
         phys as u64,
         0x1000,
         PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::NO_CACHE,

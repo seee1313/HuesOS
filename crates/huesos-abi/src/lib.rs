@@ -173,6 +173,9 @@ pub enum ErrorCode {
     NoFramebuffer = -18,
     /// This syscall number is not recognized by this kernel build.
     NotSupported = -19,
+    /// A required kernel subsystem was unavailable or violated its state
+    /// contract; callers must not retry without an external state change.
+    Internal = -21,
 }
 
 impl ErrorCode {
@@ -192,6 +195,7 @@ impl ErrorCode {
             -17 => Self::NotFound,
             -18 => Self::NoFramebuffer,
             -19 => Self::NotSupported,
+            -21 => Self::Internal,
             _ => return None,
         })
     }
@@ -211,6 +215,7 @@ impl ErrorCode {
             Self::NotFound => "not found",
             Self::NoFramebuffer => "no framebuffer available",
             Self::NotSupported => "syscall not supported",
+            Self::Internal => "internal kernel state error",
         }
     }
 }
@@ -237,6 +242,8 @@ pub mod fault_exit {
     pub const DIVIDE_ERROR: i64 = -0x1004;
     /// User alignment check (#AC).
     pub const ALIGNMENT_CHECK: i64 = -0x1005;
+    /// Kernel could not recover the task's validated startup record.
+    pub const STARTUP_FAILED: i64 = -0x10ff;
 }
 
 /// Rights bitmask, mirrored from `huesos-object::Rights` numerically (kept
