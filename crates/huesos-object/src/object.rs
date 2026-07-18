@@ -49,6 +49,8 @@ pub enum ObjectType {
     Interrupt = 7,
     /// Virtual memory address region.
     Vmar = 8,
+    /// Restricted privileged-operation broker for Ring-3 ACPI.
+    AcpiBroker = 9,
     /// Generic / unknown.
     Unknown = 0xFF,
 }

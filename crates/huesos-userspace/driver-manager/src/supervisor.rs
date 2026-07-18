@@ -4,7 +4,7 @@ use crate::fs_service::FileSystemService;
 use crate::manifest::INPUT_HOST;
 use crate::protocol;
 use crate::registry::{ServiceRegistry, ServiceState};
-use libcanvas::{println, Channel, ErrorCode, Process, Vmo};
+use libcanvas::{println, Channel, ErrorCode, Handle, Process, Vmo};
 
 /// Fallback embedded DriverHost image (same binary packaged into BOOTFS).
 /// Prefer this over spawn_elf_from_vmo until VMO-backed launch is fully solid.
@@ -14,9 +14,13 @@ static INPUT_HOST_ELF: &[u8] = include_bytes!(env!("HUESOS_INPUT_DRIVER_HOST_PAT
 pub struct DriverManager {
     registry: ServiceRegistry,
     input_host: Option<ManagedHost>,
+    acpi_manager: Option<ManagedHost>,
+    acpi_tables: Option<Vmo>,
+    acpi_broker: Option<Handle>,
     registry_channel: Option<Channel>,
     fs: FileSystemService,
     heartbeat_count: u64,
+    acpi_heartbeat_count: u64,
     bootfs_loaded: bool,
 }
 
@@ -33,9 +37,13 @@ impl DriverManager {
         Self {
             registry,
             input_host: None,
+            acpi_manager: None,
+            acpi_tables: None,
+            acpi_broker: None,
             registry_channel: None,
             fs: FileSystemService::new(),
             heartbeat_count: 0,
+            acpi_heartbeat_count: 0,
             bootfs_loaded: false,
         }
     }
@@ -143,6 +151,7 @@ impl DriverManager {
             self.poll_registry_requests();
             self.fs.poll();
             self.poll_input_host();
+            self.poll_acpi_manager();
             // Multi-channel poll: cannot block on one fd without starving others.
             // Yield cooperatively; hot IRQ path is already blocking in the host.
             libcanvas::process::yield_now();
@@ -152,6 +161,61 @@ impl DriverManager {
     /// Return whether the keyboard service is online.
     pub fn keyboard_ready(&self) -> bool {
         self.registry.state("keyboard") == Some(ServiceState::Online)
+    }
+
+    fn try_start_acpi_manager(&mut self) {
+        if self.acpi_manager.is_some()
+            || !self.bootfs_loaded
+            || self.acpi_tables.is_none()
+            || self.acpi_broker.is_none()
+        {
+            return;
+        }
+        let Some(bootfs) = self.fs.bootfs() else {
+            return;
+        };
+        let Ok(Some(entry)) = bootfs.get_entry("/services/acpi-manager.elf") else {
+            println!("[driver-manager] ACPI manager ELF missing from BOOTFS");
+            return;
+        };
+        let Some(bootfs_vmo) = self.fs.vmo() else {
+            return;
+        };
+        let launched = libcanvas::process::spawn_elf_from_vmo(
+            "acpi-manager",
+            bootfs_vmo,
+            entry.offset,
+            entry.len,
+        );
+        let Ok((process, bootstrap)) = launched else {
+            println!("[driver-manager] failed to launch isolated ACPI manager");
+            return;
+        };
+        let Some(archive) = self.acpi_tables.take() else {
+            return;
+        };
+        if bootstrap
+            .write_handle(
+                protocol::ACPI_MANAGER_TABLES.as_bytes(),
+                archive.into_handle(),
+            )
+            .is_err()
+        {
+            println!("[driver-manager] failed to transfer ACPI table archive");
+            return;
+        }
+        let Some(broker) = self.acpi_broker.take() else {
+            return;
+        };
+        if bootstrap
+            .write_handle(protocol::ACPI_MANAGER_BROKER.as_bytes(), broker)
+            .is_err()
+        {
+            println!("[driver-manager] failed to transfer ACPI broker capability");
+            return;
+        }
+        println!("[driver-manager] launched isolated Ring-3 ACPI manager");
+        self.acpi_manager = Some(ManagedHost { process, bootstrap });
     }
 
     fn describe_manifest(&self) {
@@ -205,6 +269,17 @@ impl DriverManager {
                     self.fs.install_bootfs(Vmo::from_handle(handle));
                     self.bootfs_loaded = true;
                     self.start_driver_hosts();
+                    self.try_start_acpi_manager();
+                }
+                Ok((n, handle)) if &buf[..n] == protocol::ACPI_TABLES_VMO.as_bytes() => {
+                    println!("[driver-manager] received immutable ACPI table archive");
+                    self.acpi_tables = Some(Vmo::from_handle(handle));
+                    self.try_start_acpi_manager();
+                }
+                Ok((n, handle)) if &buf[..n] == protocol::ACPI_BROKER.as_bytes() => {
+                    println!("[driver-manager] received unique ACPI broker capability");
+                    self.acpi_broker = Some(handle);
+                    self.try_start_acpi_manager();
                 }
                 Ok((_n, _handle)) => println!("[driver-manager] unknown bootstrap handle message"),
                 Err(ErrorCode::ShouldWait) => return,
@@ -305,6 +380,33 @@ impl DriverManager {
                     println!(
                         "[driver-manager] input host channel read failed: {}",
                         e.as_str()
+                    );
+                    return;
+                }
+            }
+        }
+    }
+
+    fn poll_acpi_manager(&mut self) {
+        let mut buffer = [0u8; 64];
+        loop {
+            let Some(host) = self.acpi_manager.as_ref() else {
+                return;
+            };
+            let _keep_process_alive = &host.process;
+            match host.bootstrap.read_into(&mut buffer) {
+                Ok(length) if &buffer[..length] == protocol::ACPI_MANAGER_READY.as_bytes() => {
+                    println!("[driver-manager] ACPI manager archive validation ready");
+                }
+                Ok(length) if &buffer[..length] == protocol::ACPI_HEARTBEAT.as_bytes() => {
+                    self.acpi_heartbeat_count = self.acpi_heartbeat_count.wrapping_add(1);
+                }
+                Ok(_) => {}
+                Err(ErrorCode::ShouldWait) => return,
+                Err(error) => {
+                    println!(
+                        "[driver-manager] ACPI manager channel failed: {}",
+                        error.as_str()
                     );
                     return;
                 }

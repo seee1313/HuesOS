@@ -12,6 +12,7 @@
 
 extern crate alloc;
 
+mod acpi_broker;
 mod callbacks;
 mod channel;
 mod debug;
@@ -111,5 +112,10 @@ pub fn dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> Syscal
         S::ProcessGetExitCode => {
             process::sys_process_get_exit_code(a1 as HandleValue, a2 as *mut i64)
         }
+        S::AcpiBrokerCall => acpi_broker::sys_acpi_broker_call(
+            a1 as HandleValue,
+            a2 as *const huesos_abi::acpi_broker::Request,
+            a3 as *mut huesos_abi::acpi_broker::Response,
+        ),
     }
 }

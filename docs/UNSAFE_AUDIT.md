@@ -101,6 +101,23 @@ syscall boundaries. No raw user-pointer site was added; all existing copies now
 run inside the audited guard. This is an intentional security-boundary budget
 increase.
 
+## uACPI archive enumeration boundary
+
+Two additional unsafe calls reference installed uACPI tables by index and read
+the serialized table count. The wrappers return RAII `Table` references, reuse
+the existing bounded SDT-length validation, and copy bytes into an immutable
+archive during single-threaded early boot. No foreign pointer escapes into
+Ring 3; userspace receives only a read-only VMO snapshot.
+
+## ACPI broker port-I/O boundary
+
+Six exact-width port-I/O unsafe blocks are centralized in the ACPI broker
+syscall. They execute only after structural request validation, handle-rights
+checks, object downcast, and immutable per-object allowlist authorization. The
+initial broker has an empty allowlist and its Ring-3 startup self-test proves a
+valid port request returns `AccessDenied` without executing I/O. One additional
+unsafe block wraps init's fixed broker handle in RAII before one-way transfer.
+
 ## Remaining high-priority boundaries
 
 ### Allocator internals

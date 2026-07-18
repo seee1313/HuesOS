@@ -24,6 +24,18 @@ pub const ATTACH_KEYBOARD_CLIENT: &str = "keyboard-client";
 
 /// Init passes the BOOTFS image as a VMO handle with this message.
 pub const BOOTFS_VMO: &str = "bootfs-vmo";
+/// Init passes the immutable ACPI table archive with this message.
+pub const ACPI_TABLES_VMO: &str = "acpi-tables-vmo";
+/// Init passes the unique deny-by-default ACPI broker capability.
+pub const ACPI_BROKER: &str = "acpi-broker";
+/// DriverManager passes the archive to the isolated ACPI manager.
+pub const ACPI_MANAGER_TABLES: &str = "acpi-tables-vmo";
+/// DriverManager passes the unique broker capability to the ACPI manager.
+pub const ACPI_MANAGER_BROKER: &str = "acpi-broker";
+/// ACPI manager completed archive validation.
+pub const ACPI_MANAGER_READY: &str = "acpi-manager:ready";
+/// ACPI manager heartbeat.
+pub const ACPI_HEARTBEAT: &str = "heartbeat:acpi";
 /// Client asks DriverManager to open FileSystemService.
 pub const OPEN_FILESYSTEM: &str = "open:filesystem";
 /// DriverManager responds with a FileSystemService channel.

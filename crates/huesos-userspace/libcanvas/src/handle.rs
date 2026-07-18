@@ -32,6 +32,14 @@ impl Handle {
         self.0
     }
 
+    /// Take ownership of the fixed ACPI broker capability installed only in
+    /// the initial process by the kernel.
+    pub fn take_init_acpi_broker() -> Self {
+        // SAFETY: the kernel reserves this slot for exactly one init-owned
+        // broker handle; init calls this once before transferring ownership.
+        unsafe { Self::from_raw(huesos_abi::INIT_ACPI_BROKER_HANDLE) }
+    }
+
     /// Consume this `Handle` without closing the underlying kernel handle,
     /// returning the raw value. Use this when transferring ownership
     /// elsewhere (e.g. sending it over a channel) instead of letting this

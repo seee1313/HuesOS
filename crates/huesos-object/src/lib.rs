@@ -9,6 +9,7 @@
 
 extern crate alloc;
 
+mod acpi_broker;
 mod channel;
 mod handle;
 mod interrupt;
@@ -23,6 +24,7 @@ mod vmar;
 mod vmo;
 pub mod wait;
 
+pub use acpi_broker::{AcpiBroker, PciFunctionGrant, SystemIoGrant};
 pub use channel::{Channel, ChannelMessage, ChannelRecvError};
 pub use handle::{Handle, HandleTable, HandleValue, Rights, INVALID_HANDLE};
 pub use interrupt::{Interrupt, InterruptBinding};

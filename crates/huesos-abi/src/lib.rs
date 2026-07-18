@@ -15,6 +15,9 @@
 #![no_std]
 #![warn(missing_docs)]
 
+/// Ring-3 ACPI manager broker and immutable table-archive protocol.
+pub mod acpi_broker;
+
 /// Syscall number enumeration. The numeric value (not the variant name) is
 /// what actually crosses the ABI boundary in `rax`, so **never remove or
 /// reorder a variant** — only ever append new ones. Removing a syscall
@@ -98,13 +101,16 @@ pub enum Syscall {
     /// Query a process exit code without blocking. Returns `ShouldWait` while
     /// the process is still running.
     ProcessGetExitCode = 26,
+    /// Submit one structurally validated request through an ACPI broker
+    /// capability and write an [`acpi_broker::Response`].
+    AcpiBrokerCall = 27,
 }
 
 impl Syscall {
     /// Total number of defined syscalls (i.e. one past the highest
     /// currently-assigned number). The dispatcher uses this to reject
     /// obviously-out-of-range numbers before a `match`.
-    pub const COUNT: u64 = 27;
+    pub const COUNT: u64 = 28;
 
     /// Convert a raw syscall number back into a [`Syscall`], if valid.
     pub const fn from_raw(n: u64) -> Option<Self> {
@@ -136,6 +142,7 @@ impl Syscall {
             24 => Self::ClockGetMonotonic,
             25 => Self::SystemShutdown,
             26 => Self::ProcessGetExitCode,
+            27 => Self::AcpiBrokerCall,
             _ => return None,
         })
     }
@@ -230,6 +237,10 @@ pub const INVALID_HANDLE: HandleValue = 0;
 pub const BOOTSTRAP_HANDLE: HandleValue = 1;
 /// Read-only HBI BOOTFS VMO installed by the kernel in the initial process.
 pub const INIT_BOOTFS_HANDLE: HandleValue = 2;
+/// Immutable validated ACPI table archive installed in the initial process.
+pub const INIT_ACPI_TABLES_HANDLE: HandleValue = 3;
+/// Deny-by-default privileged ACPI broker capability for the initial process.
+pub const INIT_ACPI_BROKER_HANDLE: HandleValue = 4;
 
 /// Stable process exit codes used when the kernel terminates a process after
 /// an unhandled ring-3 CPU exception.
