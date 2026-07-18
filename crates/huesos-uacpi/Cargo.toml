@@ -8,7 +8,6 @@ build = "build.rs"
 
 [dependencies]
 huesos-arch = { path = "../huesos-arch" }
-spin = { workspace = true }
 
 [build-dependencies]
 cc = "1.2"

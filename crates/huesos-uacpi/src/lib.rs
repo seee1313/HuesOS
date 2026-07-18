@@ -17,7 +17,8 @@ const MAX_LOG_BYTES: usize = 4096;
 const MAX_TABLE_BYTES: usize = 16 * 1024 * 1024;
 
 static RSDP_PHYSICAL: AtomicU64 = AtomicU64::new(0);
-static INITIALIZE_LOCK: spin::Mutex<()> = spin::Mutex::new(());
+static INITIALIZE_LOCK: huesos_arch::RankedIrqSafeTicketLock<()> =
+    huesos_arch::RankedIrqSafeTicketLock::new((), huesos_arch::LockRank::ARCHITECTURE);
 
 #[repr(align(16))]
 struct Scratch(UnsafeCell<[u8; 8192]>);

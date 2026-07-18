@@ -1,11 +1,12 @@
 //! Generic IRQ event callback used by kernel-side IRQ bridge objects.
 
-use spin::Mutex;
+use crate::{LockRank, RankedIrqSafeTicketLock};
 
 /// IRQ callback signature: `(legacy_pic_irq, event_data)`.
 pub type IrqCallback = fn(u8, u64);
 
-static IRQ_CALLBACK: Mutex<Option<IrqCallback>> = Mutex::new(None);
+static IRQ_CALLBACK: RankedIrqSafeTicketLock<Option<IrqCallback>> =
+    RankedIrqSafeTicketLock::new(None, LockRank::ARCHITECTURE);
 
 /// Set the IRQ callback. Called by the kernel once during init.
 pub fn set_irq_callback(callback: IrqCallback) {

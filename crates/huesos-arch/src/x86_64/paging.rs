@@ -4,7 +4,7 @@
 //! physical memory manager fed from the Limine memory map), not a hardcoded
 //! bump range.
 
-use spin::Mutex;
+use crate::{LockRank, RankedIrqSafeTicketLock};
 use x86_64::registers::control::{Cr3, Cr3Flags};
 use x86_64::structures::paging::{
     FrameAllocator, FrameDeallocator, Mapper, OffsetPageTable, Page, PageTable, PageTableFlags,
@@ -13,10 +13,12 @@ use x86_64::structures::paging::{
 use x86_64::{PhysAddr, VirtAddr};
 
 /// Higher-half direct map offset, fixed once at boot.
-static HHDM_OFFSET: Mutex<u64> = Mutex::new(0);
+static HHDM_OFFSET: RankedIrqSafeTicketLock<u64> =
+    RankedIrqSafeTicketLock::new(0, LockRank::ARCHITECTURE);
 
 /// Kernel's own mapper over the bootloader-provided top-level table.
-static KERNEL_PAGE_TABLE: Mutex<Option<OffsetPageTable<'static>>> = Mutex::new(None);
+static KERNEL_PAGE_TABLE: RankedIrqSafeTicketLock<Option<OffsetPageTable<'static>>> =
+    RankedIrqSafeTicketLock::new(None, LockRank::ARCHITECTURE);
 
 /// Frame allocator adapter over `huesos-pmm`.
 pub struct PmmFrameAllocator;

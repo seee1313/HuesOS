@@ -1,7 +1,7 @@
 //! Interrupt controller setup (8259 PIC).
 
+use crate::{LockRank, RankedIrqSafeTicketLock};
 use pic8259::ChainedPics;
-use spin::Mutex;
 
 /// PIC 1 offset (master).
 pub const PIC_1_OFFSET: u8 = 32;
@@ -9,8 +9,10 @@ pub const PIC_1_OFFSET: u8 = 32;
 pub const PIC_2_OFFSET: u8 = 40;
 
 /// Global chained PICs.
-pub static PICS: Mutex<ChainedPics> =
-    Mutex::new(unsafe { ChainedPics::new(PIC_1_OFFSET, PIC_2_OFFSET) });
+pub static PICS: RankedIrqSafeTicketLock<ChainedPics> = RankedIrqSafeTicketLock::new(
+    unsafe { ChainedPics::new(PIC_1_OFFSET, PIC_2_OFFSET) },
+    LockRank::ARCHITECTURE,
+);
 
 /// Initialize the PIC and enable interrupts.
 pub fn init() {
