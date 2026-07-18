@@ -1,0 +1,14 @@
+[package]
+name = "huesos-uacpi"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+build = "build.rs"
+
+[dependencies]
+huesos-arch = { path = "../huesos-arch" }
+spin = { workspace = true }
+
+[build-dependencies]
+cc = "1.2"

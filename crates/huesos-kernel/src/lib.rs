@@ -107,13 +107,35 @@ pub unsafe fn kmain(boot_info: BootInfo) -> ! {
             huesos_arch::hlt();
         }
     }
+    let uacpi_tables_ready = boot_info.rsdp_addr.is_some_and(|rsdp| {
+        if let Err(error) = huesos_uacpi::initialize_tables(rsdp) {
+            use core::fmt::Write;
+            let mut writer = huesos_arch::serial::SerialWriter;
+            let _ = writeln!(writer, "[uACPI] table initialization failed: {error:?}");
+            return false;
+        }
+        match huesos_uacpi::Table::find(b"APIC") {
+            Ok(table) if table.bytes().is_ok() => {
+                dbg("[uACPI] validated ACPI table graph and MADT\n");
+                true
+            }
+            _ => {
+                dbg("[uACPI] MADT unavailable after table initialization\n");
+                false
+            }
+        }
+    });
+
     let panic_test_requested = boot_info.hbi_image.is_some_and(cmdline_requests_panic_test);
     init::object_init();
 
-    if let Some(rsdp) = boot_info.rsdp_addr.filter(|_| firmware_tables_mapped) {
+    if let Some(rsdp) = boot_info
+        .rsdp_addr
+        .filter(|_| firmware_tables_mapped && uacpi_tables_ready)
+    {
         smp::bringup_aps(rsdp, boot_info.hhdm_offset);
     } else if boot_info.rsdp_addr.is_some() {
-        dbg("[ACPI] firmware table mapping failed; continuing uniprocessor\n");
+        dbg("[ACPI] validated table access unavailable; continuing uniprocessor\n");
     }
 
     let bootfs_image = boot_info.hbi_image.and_then(|hbi_data| {

@@ -13,6 +13,7 @@ members = [
     "crates/huesos-alloc",
     "crates/huesos-user-alloc",
     "crates/huesos-fat",
+    "crates/huesos-uacpi",
 ]
 resolver = "2"
 exclude = ["tools"]
