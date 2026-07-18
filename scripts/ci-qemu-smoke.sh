@@ -39,6 +39,7 @@ fi
 for marker in \
     '[uACPI] validated ACPI table graph and MADT' \
     '[uACPI] built immutable Ring-3 table archive' \
+    '[uACPI] derived bounded FADT SystemIO policy' \
     '[acpi-manager] broker deny-by-default self-test OK' \
     '[driver-manager] ACPI manager archive validation ready' \
     '[init] user fault isolation OK' \

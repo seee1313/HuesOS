@@ -41,6 +41,8 @@ Structural validation includes:
 
 Authorization is independent of structural validity. The broker checks every request against capabilities derived from validated firmware resources and platform policy. It never accepts a caller-provided raw kernel pointer, MMIO virtual address or unrestricted PCI segment.
 
+The first non-empty policy is derived only from fixed legacy FADT SystemIO descriptors: SMI command, PM1 event/control, PM2 control, PM timer and GPE blocks. Zero-length blocks, arithmetic overflow and addresses outside the 16-bit port space are discarded. PM timer is read-only; reset, power-off, Generic Address Structures, MMIO, PCI and interrupts remain denied until dedicated validators exist.
+
 ## Concurrency and lifecycle
 
 Requests carry a 64-bit correlation ID. One broker worker serializes firmware control operations; read-only requests may later be parallelized only after uACPI locking and device semantics are proven. Deferred GPE work is queued to CPU 0 as required by common firmware assumptions.

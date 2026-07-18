@@ -142,6 +142,26 @@ pub unsafe fn kmain(boot_info: BootInfo) -> ! {
         None
     };
 
+    let acpi_system_io = if uacpi_tables_ready {
+        match boot::acpi_policy::fadt_system_io_grants() {
+            Ok(grants) => {
+                dbg("[uACPI] derived bounded FADT SystemIO policy\n");
+                grants
+            }
+            Err(error) => {
+                use core::fmt::Write;
+                let mut writer = huesos_arch::serial::SerialWriter;
+                let _ = writeln!(
+                    writer,
+                    "[uACPI] FADT SystemIO policy unavailable: {error:?}; broker denies all"
+                );
+                alloc::vec::Vec::new()
+            }
+        }
+    } else {
+        alloc::vec::Vec::new()
+    };
+
     let panic_test_requested = boot_info.hbi_image.is_some_and(cmdline_requests_panic_test);
     init::object_init();
 
@@ -191,7 +211,7 @@ pub unsafe fn kmain(boot_info: BootInfo) -> ! {
     }
 
     log_boot_banner(&boot_info);
-    spawn_init_process(bootfs_image, acpi_archive.as_deref());
+    spawn_init_process(bootfs_image, acpi_archive.as_deref(), acpi_system_io);
 
     // BSP idle: timer IRQ drives the scheduler; opportunistically reap.
     loop {
@@ -221,7 +241,11 @@ fn log_boot_banner(boot_info: &BootInfo) {
     }
 }
 
-fn spawn_init_process(bootfs_image: Option<&[u8]>, acpi_archive: Option<&[u8]>) {
+fn spawn_init_process(
+    bootfs_image: Option<&[u8]>,
+    acpi_archive: Option<&[u8]>,
+    acpi_system_io: alloc::vec::Vec<huesos_object::SystemIoGrant>,
+) {
     use huesos_object::KernelObject;
 
     let spawned = match process::spawn_from_elf("init", INIT_BINARY) {
@@ -259,7 +283,7 @@ fn spawn_init_process(bootfs_image: Option<&[u8]>, acpi_archive: Option<&[u8]>) 
             bytes,
         ) {
             dbg("[init] installed immutable ACPI table archive VMO\n");
-            if install_acpi_broker(&spawned.process) {
+            if install_acpi_broker(&spawned.process, acpi_system_io) {
                 dbg("[init] installed deny-by-default ACPI broker capability\n");
             } else {
                 dbg("[init] failed to install ACPI broker capability\n");
@@ -306,10 +330,18 @@ fn install_readonly_vmo(
     true
 }
 
-fn install_acpi_broker(process: &huesos_object::Process) -> bool {
+fn install_acpi_broker(
+    process: &huesos_object::Process,
+    system_io: alloc::vec::Vec<huesos_object::SystemIoGrant>,
+) -> bool {
     use huesos_object::{Handle, KernelObject, Rights};
 
-    let broker = huesos_object::AcpiBroker::deny_all();
+    let broker = huesos_object::AcpiBroker::with_policy(
+        system_io,
+        alloc::vec::Vec::new(),
+        false,
+        false,
+    );
     let koid = broker.koid();
     huesos_object::register_object(broker);
     let rights = Rights::READ | Rights::WRITE | Rights::TRANSFER;
