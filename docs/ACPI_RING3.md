@@ -23,7 +23,7 @@ The kernel exports validated ACPI tables in a read-only VMO. The VMO begins with
 - duplicate signatures use monotonically increasing instance numbers;
 - consumers receive only `READ | DUPLICATE | TRANSFER`, never write rights.
 
-The archive removes arbitrary physical mapping from the AML process. uACPI's userspace map callback resolves firmware physical addresses only through a broker-created immutable address map associated with this VMO.
+Each table entry records both its immutable VMO offset and original firmware physical address. uACPI metadata length, signature and checksum status are cross-checked against the referenced bytes before publication. The archive therefore removes arbitrary physical mapping from the AML process: a future userspace map callback may resolve only ranges present in this immutable physical-address index. RSDP publication remains a separate prerequisite before namespace startup.
 
 ## Broker channel
 

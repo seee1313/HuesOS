@@ -28,8 +28,11 @@ pub extern "C" fn _start() -> ! {
         libcanvas::process::exit(-1);
     };
     match validate_archive(&archive) {
-        Ok(table_count) => {
-            println!("[acpi-manager] validated {} ACPI tables", table_count);
+        Ok((table_count, physical_count)) => {
+            println!(
+                "[acpi-manager] validated {} ACPI tables, {} physical mappings",
+                table_count, physical_count
+            );
         }
         Err(error) => {
             println!("[acpi-manager] invalid table archive: {}", error.as_str());
@@ -127,7 +130,7 @@ impl ArchiveError {
     }
 }
 
-fn validate_archive(vmo: &Vmo) -> Result<u32, ArchiveError> {
+fn validate_archive(vmo: &Vmo) -> Result<(u32, u32), ArchiveError> {
     let mut header = [0u8; TABLE_ARCHIVE_HEADER_BYTES as usize];
     read_exact(vmo, 0, &mut header)?;
     if header[..8] != TABLE_ARCHIVE_MAGIC
@@ -153,6 +156,7 @@ fn validate_archive(vmo: &Vmo) -> Result<u32, ArchiveError> {
     }
 
     let mut previous_end = metadata_end;
+    let mut physical_count = 0u32;
     let mut raw = [0u8; TABLE_ARCHIVE_ENTRY_BYTES];
     for index in 0..count {
         let offset = u64::from(TABLE_ARCHIVE_HEADER_BYTES)
@@ -161,10 +165,22 @@ fn validate_archive(vmo: &Vmo) -> Result<u32, ArchiveError> {
         if raw[5..8] != [0; 3] {
             return Err(ArchiveError::Header);
         }
-        let table_offset = u64_at(&raw, 8)?;
-        let table_length = u32_at(&raw, 16)?;
+        let physical_address = u64_at(&raw, 8)?;
+        let table_offset = u64_at(&raw, 16)?;
+        let table_length = u32_at(&raw, 24)?;
         if !(36..=MAX_TABLE_BYTES).contains(&table_length) || table_offset < previous_end {
             return Err(ArchiveError::Range);
+        }
+        if physical_address != 0 {
+            if physical_address
+                .checked_add(u64::from(table_length))
+                .is_none()
+            {
+                return Err(ArchiveError::Range);
+            }
+            physical_count = physical_count
+                .checked_add(1)
+                .ok_or(ArchiveError::Count)?;
         }
         let end = table_offset
             .checked_add(u64::from(table_length))
@@ -178,7 +194,7 @@ fn validate_archive(vmo: &Vmo) -> Result<u32, ArchiveError> {
         let mut probe = [0u8; 1];
         read_exact(vmo, total_size - 1, &mut probe)?;
     }
-    Ok(count)
+    Ok((count, physical_count))
 }
 
 fn read_exact(vmo: &Vmo, offset: u64, output: &mut [u8]) -> Result<(), ArchiveError> {

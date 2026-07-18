@@ -40,6 +40,8 @@ pub enum Error {
     NotFound,
     /// A mapped SDT reported an invalid length.
     InvalidTableLength,
+    /// uACPI returned inconsistent table metadata.
+    InvalidTableMetadata,
 }
 
 #[repr(C)]
@@ -48,12 +50,24 @@ struct UacpiTable {
     index: usize,
 }
 
+#[repr(C)]
+struct UacpiTableInfo {
+    index: usize,
+    size: usize,
+    address: u64,
+    signature: [c_char; 4],
+    origin: u8,
+    flags: u8,
+    reference_count: u16,
+}
+
 unsafe extern "C" {
     fn uacpi_setup_early_table_access(buffer: *mut c_void, size: usize) -> i32;
     fn uacpi_table_subsystem_available() -> u8;
     fn uacpi_table_find_by_signature(signature: *const c_char, table: *mut UacpiTable) -> i32;
     fn uacpi_table_count() -> usize;
     fn uacpi_table_get_by_index(index: usize, table: *mut UacpiTable) -> i32;
+    fn uacpi_table_info_get_by_index(index: usize, info: *mut UacpiTableInfo) -> i32;
     fn uacpi_table_unref(table: *mut UacpiTable);
 }
 
@@ -87,6 +101,55 @@ pub fn table_count() -> usize {
     // SAFETY: callers reach this after initialize_tables; the function only
     // reads uACPI's serialized table-array length.
     unsafe { uacpi_table_count() }
+}
+
+/// Validated metadata for one installed uACPI table.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TableMetadata {
+    /// Stable table-array index.
+    pub index: usize,
+    /// Table length reported by uACPI.
+    pub length: usize,
+    /// Original physical address for firmware/host physical tables.
+    pub physical_address: Option<u64>,
+    /// Four-byte SDT signature.
+    pub signature: [u8; 4],
+    /// Whether uACPI detected a bad checksum.
+    pub checksum_bad: bool,
+}
+
+/// Read bounded metadata for an installed table without mapping it.
+pub fn table_metadata(index: usize) -> Result<TableMetadata, Error> {
+    let mut info = UacpiTableInfo {
+        index: 0,
+        size: 0,
+        address: 0,
+        signature: [0; 4],
+        origin: 0,
+        flags: 0,
+        reference_count: 0,
+    };
+    // SAFETY: info is writable for the complete C structure and uACPI checks
+    // the supplied index before initializing it.
+    let status = unsafe { uacpi_table_info_get_by_index(index, &mut info) };
+    if status != STATUS_OK
+        || info.index != index
+        || !(36..=MAX_TABLE_BYTES).contains(&info.size)
+    {
+        return Err(Error::InvalidTableMetadata);
+    }
+    let mut signature = [0u8; 4];
+    for (output, input) in signature.iter_mut().zip(info.signature) {
+        *output = input as u8;
+    }
+    let physical = info.origin & ((1 << 0) | (1 << 2)) != 0;
+    Ok(TableMetadata {
+        index,
+        length: info.size,
+        physical_address: physical.then_some(info.address),
+        signature,
+        checksum_bad: info.flags & (1 << 2) != 0,
+    })
 }
 
 /// A referenced, mapped ACPI system-description table.
