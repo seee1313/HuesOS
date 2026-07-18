@@ -8,7 +8,7 @@
 //!
 //! Controls: WASD/HJKL, Enter restart, Esc quit to shell.
 
-use libcanvas::framebuffer::Canvas;
+use libcanvas::framebuffer::{Canvas, TextFont};
 use libcanvas::{Channel, ErrorCode};
 
 const GRID_W: usize = 32;
@@ -207,6 +207,7 @@ pub fn run(keyboard: &Channel, hard: bool) {
     };
 
     let layout = Layout::fullscreen(&canvas);
+    let mut renderer = Renderer::new();
 
     let mut body = [Point { x: 0, y: 0 }; MAX_LEN];
     let mut len = 0usize;
@@ -257,9 +258,21 @@ pub fn run(keyboard: &Channel, hard: bool) {
         &mut banner_ttl,
         &mut pending_event,
     );
-    draw(
-        &canvas, &layout, hard, &body, len, food, gold_food, phase, score, &bombs, &bullets,
-        &rocket, banner,
+    draw_frame(
+        &mut renderer,
+        &canvas,
+        &layout,
+        hard,
+        &body,
+        len,
+        food,
+        gold_food,
+        phase,
+        score,
+        &bombs,
+        &bullets,
+        &rocket,
+        banner,
     );
 
     loop {
@@ -291,9 +304,21 @@ pub fn run(keyboard: &Channel, hard: bool) {
                             &mut banner_ttl,
                             &mut pending_event,
                         );
-                        draw(
-                            &canvas, &layout, hard, &body, len, food, gold_food, phase, score,
-                            &bombs, &bullets, &rocket, banner,
+                        draw_frame(
+                            &mut renderer,
+                            &canvas,
+                            &layout,
+                            hard,
+                            &body,
+                            len,
+                            food,
+                            gold_food,
+                            phase,
+                            score,
+                            &bombs,
+                            &bullets,
+                            &rocket,
+                            banner,
                         );
                         continue;
                     }
@@ -367,9 +392,21 @@ pub fn run(keyboard: &Channel, hard: bool) {
             }
         }
 
-        draw(
-            &canvas, &layout, hard, &body, len, food, gold_food, phase, score, &bombs, &bullets,
-            &rocket, banner,
+        draw_frame(
+            &mut renderer,
+            &canvas,
+            &layout,
+            hard,
+            &body,
+            len,
+            food,
+            gold_food,
+            phase,
+            score,
+            &bombs,
+            &bullets,
+            &rocket,
+            banner,
         );
     }
 }
@@ -971,11 +1008,130 @@ fn decode(msg: &[u8]) -> Option<Action> {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct CellVisual {
+    background: u8,
+    foreground: u8,
+}
+
+const EMPTY_CELL: CellVisual = CellVisual {
+    background: 0,
+    foreground: 0,
+};
+
+struct Renderer {
+    previous: [CellVisual; MAX_LEN],
+    initialized: bool,
+    previous_phase: Phase,
+    frames: u64,
+    dirty_cells: u64,
+    presents: u64,
+}
+
+impl Renderer {
+    const fn new() -> Self {
+        Self {
+            previous: [EMPTY_CELL; MAX_LEN],
+            initialized: false,
+            previous_phase: Phase::Playing,
+            frames: 0,
+            dirty_cells: 0,
+            presents: 0,
+        }
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "fixed-capacity no_std game state is passed without allocation"
+    )]
+    fn draw(
+        &mut self,
+        canvas: &Canvas,
+        layout: &Layout,
+        hard: bool,
+        body: &[Point; MAX_LEN],
+        len: usize,
+        food: Point,
+        gold_food: Option<GoldFood>,
+        phase: Phase,
+        score: u32,
+        bombs: &[Bomb; MAX_BOMBS],
+        bullets: &[Bullet; MAX_BULLETS],
+        rocket: &Rocket,
+        banner: EventBanner,
+    ) {
+        let current = build_visual_board(body, len, food, gold_food, bombs, bullets, rocket);
+        crate::screen::with_render_shadow(|shadow| {
+            if !self.initialized || phase != self.previous_phase {
+                render_full(
+                    canvas, shadow, layout, hard, &current, gold_food, phase, score, banner,
+                );
+                if canvas.upload_shadow(shadow).is_ok() && canvas.present().is_ok() {
+                    self.presents = self.presents.saturating_add(1);
+                }
+                self.previous = current;
+                self.initialized = true;
+                self.previous_phase = phase;
+                self.frames = self.frames.saturating_add(1);
+                return;
+            }
+
+            render_hud(canvas, shadow, layout, hard, gold_food, score, banner);
+            if canvas
+                .upload_shadow_region(shadow, 0, 0, canvas.width(), HUD_HEIGHT)
+                .is_ok()
+                && canvas
+                    .present_region(0, 0, canvas.width(), HUD_HEIGHT)
+                    .is_ok()
+            {
+                self.presents = self.presents.saturating_add(1);
+            }
+
+            // Coalesce only adjacent dirty cells. Head and tail can be far
+            // apart, so one bounding rectangle would regress to a near-full
+            // board copy as the snake grows.
+            for y in 0..GRID_H {
+                let mut x = 0;
+                while x < GRID_W {
+                    let index = y * GRID_W + x;
+                    if current[index] == self.previous[index] {
+                        x += 1;
+                        continue;
+                    }
+                    let start = x;
+                    while x < GRID_W {
+                        let run_index = y * GRID_W + x;
+                        if current[run_index] == self.previous[run_index] {
+                            break;
+                        }
+                        render_cell(canvas, shadow, layout, x, y, current[run_index]);
+                        self.previous[run_index] = current[run_index];
+                        self.dirty_cells = self.dirty_cells.saturating_add(1);
+                        x += 1;
+                    }
+                    let px = layout.board_x + start as u32 * layout.cell;
+                    let py = layout.board_y + y as u32 * layout.cell;
+                    let width = (x - start) as u32 * layout.cell;
+                    if canvas
+                        .upload_shadow_region(shadow, px, py, width, layout.cell)
+                        .is_ok()
+                        && canvas.present_region(px, py, width, layout.cell).is_ok()
+                    {
+                        self.presents = self.presents.saturating_add(1);
+                    }
+                }
+            }
+            self.frames = self.frames.saturating_add(1);
+        });
+    }
+}
+
 #[expect(
     clippy::too_many_arguments,
-    reason = "no_std game state uses explicit fixed-capacity buffers; aggregation is tracked separately"
+    reason = "renderer boundary mirrors fixed-capacity game state"
 )]
-fn draw(
+fn draw_frame(
+    renderer: &mut Renderer,
     canvas: &Canvas,
     layout: &Layout,
     hard: bool,
@@ -990,235 +1146,344 @@ fn draw(
     rocket: &Rocket,
     banner: EventBanner,
 ) {
-    // Layered full-screen background and HUD panel.
-    let _ = canvas.fill_rect(0, 0, canvas.width(), canvas.height(), 4, 8, 16);
-    let _ = canvas.fill_rect(0, 0, canvas.width(), HUD_HEIGHT, 10, 24, 40);
-    let _ = canvas.fill_rect(0, HUD_HEIGHT - 2, canvas.width(), 2, 40, 150, 180);
+    renderer.draw(
+        canvas, layout, hard, body, len, food, gold_food, phase, score, bombs, bullets, rocket,
+        banner,
+    );
+}
 
-    let title = if hard {
-        "HuesOS Snake  [HARD]"
-    } else {
-        "HuesOS Snake"
-    };
-    let _ = canvas.draw_text(layout.board_x, 12, title, 200, 230, 255);
-    let mut score_buf = [0u8; 24];
-    let score_txt = format_labeled_u32(&mut score_buf, "Score: ", score);
-    let _ = canvas.draw_text(layout.board_x + 220, 12, score_txt, 180, 220, 160);
+fn build_visual_board(
+    body: &[Point; MAX_LEN],
+    len: usize,
+    food: Point,
+    gold_food: Option<GoldFood>,
+    bombs: &[Bomb; MAX_BOMBS],
+    bullets: &[Bullet; MAX_BULLETS],
+    rocket: &Rocket,
+) -> [CellVisual; MAX_LEN] {
+    let mut cells = [EMPTY_CELL; MAX_LEN];
 
-    let help = if hard {
-        "WASD move | Esc quit | every 2 apples: random hazard"
-    } else {
-        "WASD/HJKL move | Esc quit | try: snake hard"
-    };
-    let _ = canvas.draw_text(layout.board_x, 28, help, 140, 160, 180);
-
-    // Event banner
-    let banner_txt = match banner {
-        EventBanner::None => "",
-        EventBanner::Bombs => "!! BOMBS INCOMING !!",
-        EventBanner::Ak => "!! AK BURST !!",
-        EventBanner::Rocket => "!! HOMING ROCKET !!",
-    };
-    if !banner_txt.is_empty() {
-        let _ = canvas.draw_text(layout.board_x + 320, 12, banner_txt, 255, 180, 80);
+    for bomb in bombs.iter().filter(|bomb| bomb.alive && bomb.fuse <= 4) {
+        let radius = match bomb.kind {
+            BombKind::Small => BOMB_R_SMALL,
+            BombKind::Large => BOMB_R_LARGE,
+        };
+        for dx in -radius..=radius {
+            for dy in -radius..=radius {
+                let x = bomb.pos.x as i16 + dx;
+                let y = bomb.pos.y as i16 + dy;
+                if x >= 0 && x < GRID_W as i16 && y >= 0 && y < GRID_H as i16 {
+                    cells[y as usize * GRID_W + x as usize].background = 1;
+                }
+            }
+        }
     }
 
-    // Golden apple active text
-    if let Some(gf) = gold_food {
-        let mut gold_buf = [0u8; 24];
-        let gold_txt = format_labeled_u32(&mut gold_buf, "Gold Apple: ", gf.ttl);
-        let _ = canvas.draw_text(layout.board_x + 340, 28, gold_txt, 255, 215, 0);
+    cells[cell_index(food)].foreground = 1;
+    if let Some(gold) = gold_food {
+        cells[cell_index(gold.pos)].foreground = if gold.ttl <= 10 && gold.ttl % 2 == 0 {
+            3
+        } else {
+            2
+        };
     }
+    for bomb in bombs.iter().filter(|bomb| bomb.alive) {
+        cells[cell_index(bomb.pos)].foreground = match (bomb.kind, bomb.fuse <= 3) {
+            (BombKind::Small, false) => 4,
+            (BombKind::Small, true) => 5,
+            (BombKind::Large, false) => 6,
+            (BombKind::Large, true) => 7,
+        };
+    }
+    for bullet in bullets.iter().filter(|bullet| bullet.alive) {
+        cells[cell_index(bullet.pos)].foreground = 8;
+    }
+    if rocket.alive {
+        cells[cell_index(rocket.pos)].foreground = 9;
+    }
+    for segment in body.iter().take(len).skip(1) {
+        cells[cell_index(*segment)].foreground = 10;
+    }
+    if len > 0 {
+        cells[cell_index(body[0])].foreground = 11;
+    }
+    cells
+}
 
-    let board_w = layout.board_w;
-    let board_h = layout.board_h;
-    let _ = canvas.fill_rect(
+fn cell_index(point: Point) -> usize {
+    point.y as usize * GRID_W + point.x as usize
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "full redraw is reserved for initialization and phase transitions"
+)]
+fn render_full(
+    canvas: &Canvas,
+    shadow: &mut [u8],
+    layout: &Layout,
+    hard: bool,
+    cells: &[CellVisual; MAX_LEN],
+    gold_food: Option<GoldFood>,
+    phase: Phase,
+    score: u32,
+    banner: EventBanner,
+) {
+    let _ = canvas.clear_shadow(shadow, 4, 8, 16);
+    render_hud(canvas, shadow, layout, hard, gold_food, score, banner);
+    shadow_rect(
+        canvas,
+        shadow,
         layout.board_x.saturating_sub(4),
         layout.board_y.saturating_sub(4),
-        board_w + 8,
-        board_h + 8,
-        55,
-        190,
-        205,
+        layout.board_w + 8,
+        layout.board_h + 8,
+        (55, 190, 205),
     );
-    let _ = canvas.fill_rect(
+    shadow_rect(
+        canvas,
+        shadow,
         layout.board_x.saturating_sub(2),
         layout.board_y.saturating_sub(2),
-        board_w + 4,
-        board_h + 4,
-        8,
-        20,
-        32,
+        layout.board_w + 4,
+        layout.board_h + 4,
+        (8, 20, 32),
     );
-    let _ = canvas.fill_rect(layout.board_x, layout.board_y, board_w, board_h, 7, 14, 24);
-
-    // Sparse grid guides retain a clean look while making the enlarged board
-    // readable on high-resolution displays.
-    for x in (4..GRID_W).step_by(4) {
-        let _ = canvas.fill_rect(
-            layout.board_x + x as u32 * layout.cell,
-            layout.board_y,
-            1,
-            board_h,
-            12,
-            27,
-            39,
-        );
-    }
-    for y in (3..GRID_H).step_by(3) {
-        let _ = canvas.fill_rect(
-            layout.board_x,
-            layout.board_y + y as u32 * layout.cell,
-            board_w,
-            1,
-            12,
-            27,
-            39,
-        );
-    }
-
-    // Faint red highlight for bomb blast radius when fuse is low
-    for b in bombs.iter() {
-        if !b.alive {
-            continue;
-        }
-        if b.fuse <= 4 {
-            let r = match b.kind {
-                BombKind::Small => BOMB_R_SMALL,
-                BombKind::Large => BOMB_R_LARGE,
-            };
-            for dx in -r..=r {
-                for dy in -r..=r {
-                    let rx = b.pos.x as i16 + dx;
-                    let ry = b.pos.y as i16 + dy;
-                    if rx >= 0
-                        && rx < GRID_W as i16
-                        && ry >= 0
-                        && ry < GRID_H as i16
-                        && (rx as u8 != b.pos.x || ry as u8 != b.pos.y)
-                    {
-                        let inset = (layout.cell / 4).max(1);
-                        let px = layout.board_x + rx as u32 * layout.cell + inset;
-                        let py = layout.board_y + ry as u32 * layout.cell + inset;
-                        let size = layout.cell.saturating_sub(inset * 2).max(1);
-                        let _ = canvas.fill_rect(px, py, size, size, 120, 30, 30);
-                    }
-                }
-            }
-        }
-    }
-
-    // Normal Food
-    fill_cell(canvas, layout, food.x, food.y, 220, 80, 80);
-
-    // Gold Food
-    if let Some(gf) = gold_food {
-        let flash = gf.ttl <= 10 && (gf.ttl % 2 == 0);
-        if flash {
-            fill_cell(canvas, layout, gf.pos.x, gf.pos.y, 100, 80, 0);
-        } else {
-            fill_cell(canvas, layout, gf.pos.x, gf.pos.y, 255, 215, 0);
-        }
-    }
-
-    // Bombs (dark with fuse flash)
-    for b in bombs.iter() {
-        if !b.alive {
-            continue;
-        }
-        let flash = b.fuse <= 3;
-        match b.kind {
-            BombKind::Small => {
-                if flash {
-                    fill_cell(canvas, layout, b.pos.x, b.pos.y, 255, 200, 40);
-                } else {
-                    fill_cell(canvas, layout, b.pos.x, b.pos.y, 60, 60, 70);
-                }
-            }
-            BombKind::Large => {
-                if flash {
-                    fill_cell(canvas, layout, b.pos.x, b.pos.y, 255, 80, 40);
-                } else {
-                    fill_cell(canvas, layout, b.pos.x, b.pos.y, 40, 40, 50);
-                }
-            }
-        }
-    }
-
-    // Bullets (bright yellow/orange streaks)
-    for b in bullets.iter() {
-        if b.alive {
-            fill_cell(canvas, layout, b.pos.x, b.pos.y, 255, 220, 60);
-        }
-    }
-
-    // Rocket (magenta diamond-ish block)
-    if rocket.alive {
-        fill_cell(canvas, layout, rocket.pos.x, rocket.pos.y, 220, 60, 220);
-    }
-
-    // Snake with an elegant gradient from bright mint green to deep forest blue-green
-    for (index, segment) in body.iter().take(len).enumerate() {
-        if index == 0 {
-            fill_cell(canvas, layout, segment.x, segment.y, 50, 240, 140);
-        } else {
-            let r = 50 - (30 * index / len) as u8;
-            let g = 200 - (100 * index / len) as u8;
-            let b = 150 - (90 * index / len) as u8;
-            fill_cell(canvas, layout, segment.x, segment.y, r, g, b);
+    for y in 0..GRID_H {
+        for x in 0..GRID_W {
+            render_cell(canvas, shadow, layout, x, y, cells[y * GRID_W + x]);
         }
     }
 
     if phase == Phase::GameOver {
-        let overlay_y = layout.board_y + board_h.saturating_sub(72) / 2;
-        let _ = canvas.fill_rect(layout.board_x, overlay_y, board_w, 72, 18, 4, 10);
+        let overlay_y = layout.board_y + layout.board_h.saturating_sub(72) / 2;
+        shadow_rect(
+            canvas,
+            shadow,
+            layout.board_x,
+            overlay_y,
+            layout.board_w,
+            72,
+            (18, 4, 10),
+        );
         let lose = if hard {
             "You lost at snake! (HARD)"
         } else {
             "You lost at snake!"
         };
-        let _ = canvas.draw_text(
+        shadow_text(
+            canvas,
+            shadow,
             layout.board_x + 24,
-            layout.board_y + board_h / 2 - 20,
+            layout.board_y + layout.board_h / 2 - 20,
             lose,
-            255,
-            120,
-            120,
+            (255, 120, 120),
         );
-        let _ = canvas.draw_text(
+        shadow_text(
+            canvas,
+            shadow,
             layout.board_x + 24,
-            layout.board_y + board_h / 2,
+            layout.board_y + layout.board_h / 2,
             "Enter = play again    Esc = shell",
-            220,
-            220,
-            200,
+            (220, 220, 200),
         );
     }
-
-    let _ = canvas.present();
 }
 
-fn fill_cell(canvas: &Canvas, layout: &Layout, x: u8, y: u8, r: u8, g: u8, b: u8) {
+fn render_hud(
+    canvas: &Canvas,
+    shadow: &mut [u8],
+    layout: &Layout,
+    hard: bool,
+    gold_food: Option<GoldFood>,
+    score: u32,
+    banner: EventBanner,
+) {
+    shadow_rect(
+        canvas,
+        shadow,
+        0,
+        0,
+        canvas.width(),
+        HUD_HEIGHT,
+        (10, 24, 40),
+    );
+    shadow_rect(
+        canvas,
+        shadow,
+        0,
+        HUD_HEIGHT - 2,
+        canvas.width(),
+        2,
+        (40, 150, 180),
+    );
+    let title = if hard {
+        "HuesOS Snake  [HARD]"
+    } else {
+        "HuesOS Snake"
+    };
+    shadow_text(canvas, shadow, layout.board_x, 12, title, (200, 230, 255));
+    let mut score_buf = [0u8; 24];
+    let score_text = format_labeled_u32(&mut score_buf, "Score: ", score);
+    shadow_text(
+        canvas,
+        shadow,
+        layout.board_x + 220,
+        12,
+        score_text,
+        (180, 220, 160),
+    );
+    let help = if hard {
+        "WASD move | Esc quit | every 2 apples: random hazard"
+    } else {
+        "WASD/HJKL move | Esc quit | try: snake hard"
+    };
+    shadow_text(canvas, shadow, layout.board_x, 28, help, (140, 160, 180));
+    let banner_text = match banner {
+        EventBanner::None => "",
+        EventBanner::Bombs => "!! BOMBS INCOMING !!",
+        EventBanner::Ak => "!! AK BURST !!",
+        EventBanner::Rocket => "!! HOMING ROCKET !!",
+    };
+    shadow_text(
+        canvas,
+        shadow,
+        layout.board_x + 320,
+        12,
+        banner_text,
+        (255, 180, 80),
+    );
+    if let Some(gold) = gold_food {
+        let mut gold_buf = [0u8; 24];
+        let gold_text = format_labeled_u32(&mut gold_buf, "Gold Apple: ", gold.ttl);
+        shadow_text(
+            canvas,
+            shadow,
+            layout.board_x + 340,
+            28,
+            gold_text,
+            (255, 215, 0),
+        );
+    }
+}
+
+fn render_cell(
+    canvas: &Canvas,
+    shadow: &mut [u8],
+    layout: &Layout,
+    x: usize,
+    y: usize,
+    visual: CellVisual,
+) {
+    let px = layout.board_x + x as u32 * layout.cell;
+    let py = layout.board_y + y as u32 * layout.cell;
+    shadow_rect(
+        canvas,
+        shadow,
+        px,
+        py,
+        layout.cell,
+        layout.cell,
+        (7, 14, 24),
+    );
+    if x > 0 && x.is_multiple_of(4) {
+        shadow_rect(canvas, shadow, px, py, 1, layout.cell, (12, 27, 39));
+    }
+    if y > 0 && y.is_multiple_of(3) {
+        shadow_rect(canvas, shadow, px, py, layout.cell, 1, (12, 27, 39));
+    }
+    if visual.background == 1 {
+        let inset = (layout.cell / 4).max(1);
+        shadow_rect(
+            canvas,
+            shadow,
+            px + inset,
+            py + inset,
+            layout.cell.saturating_sub(inset * 2).max(1),
+            layout.cell.saturating_sub(inset * 2).max(1),
+            (120, 30, 30),
+        );
+    }
+    let color = match visual.foreground {
+        1 => Some((220, 80, 80)),
+        2 => Some((255, 215, 0)),
+        3 => Some((100, 80, 0)),
+        4 => Some((60, 60, 70)),
+        5 => Some((255, 200, 40)),
+        6 => Some((40, 40, 50)),
+        7 => Some((255, 80, 40)),
+        8 => Some((255, 220, 60)),
+        9 => Some((220, 60, 220)),
+        10 => Some((30, 155, 105)),
+        11 => Some((50, 240, 140)),
+        _ => None,
+    };
+    if let Some(color) = color {
+        fill_cell_shadow(canvas, shadow, layout, x as u8, y as u8, color);
+    }
+}
+
+fn fill_cell_shadow(
+    canvas: &Canvas,
+    shadow: &mut [u8],
+    layout: &Layout,
+    x: u8,
+    y: u8,
+    color: (u8, u8, u8),
+) {
     let inset = (layout.cell / 10).max(1);
     let px = layout.board_x + x as u32 * layout.cell + inset;
     let py = layout.board_y + y as u32 * layout.cell + inset;
     let size = layout.cell.saturating_sub(inset * 2).max(1);
-    let _ = canvas.fill_rect(px, py, size, size, r, g, b);
-
-    // Small highlight gives food, hazards and body segments depth at any
-    // resolution without changing collision geometry.
+    shadow_rect(canvas, shadow, px, py, size, size, color);
     if size >= 8 {
         let highlight = (size / 5).max(2);
-        let _ = canvas.fill_rect(
+        shadow_rect(
+            canvas,
+            shadow,
             px + inset,
             py + inset,
             highlight,
             highlight,
-            r.saturating_add(28),
-            g.saturating_add(28),
-            b.saturating_add(28),
+            (
+                color.0.saturating_add(28),
+                color.1.saturating_add(28),
+                color.2.saturating_add(28),
+            ),
         );
     }
+}
+
+fn shadow_rect(
+    canvas: &Canvas,
+    shadow: &mut [u8],
+    x: u32,
+    y: u32,
+    width: u32,
+    height: u32,
+    color: (u8, u8, u8),
+) {
+    let _ = canvas.fill_rect_to_shadow(shadow, x, y, width, height, color.0, color.1, color.2);
+}
+
+fn shadow_text(
+    canvas: &Canvas,
+    shadow: &mut [u8],
+    x: u32,
+    y: u32,
+    text: &str,
+    color: (u8, u8, u8),
+) {
+    let _ = canvas.draw_text_to_shadow(
+        shadow,
+        x,
+        y,
+        text,
+        color.0,
+        color.1,
+        color.2,
+        TextFont::Tty8x16,
+    );
 }
 
 /// Write `"<label><value>"` into `buf` and return the UTF-8 slice.

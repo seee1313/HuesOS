@@ -30,6 +30,12 @@ impl TerminalShadow {
 
 static TERMINAL_SHADOW: TerminalShadow = TerminalShadow::new();
 
+/// Borrow the process-wide software framebuffer. Terminal rendering and Snake
+/// execute sequentially on the same thread, so their borrows never overlap.
+pub(crate) fn with_render_shadow<R>(operation: impl FnOnce(&mut [u8; SHADOW_CAPACITY]) -> R) -> R {
+    TERMINAL_SHADOW.with(operation)
+}
+
 /// Simple fixed-size text screen backed by a `Canvas`.
 pub struct Screen {
     canvas: Option<Canvas>,
@@ -150,7 +156,7 @@ impl Screen {
         };
 
         if canvas.supports_buffered_raster() && canvas.byte_len() <= SHADOW_CAPACITY {
-            let rendered = TERMINAL_SHADOW.with(|shadow| {
+            let rendered = with_render_shadow(|shadow| {
                 if canvas.clear_shadow(shadow, 5, 8, 16).is_err() {
                     return false;
                 }
