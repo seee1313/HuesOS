@@ -153,8 +153,9 @@ pub unsafe extern "C" fn ap_entry() -> ! {
         huesos_arch::cpu_local::init_gs_base(cpu_local);
     }
 
-    // SIMD enable bits are per logical CPU, just like syscall MSRs.
+    // SIMD and supervisor-memory protection bits are per logical CPU.
     huesos_arch::cpu::enable_sse();
+    huesos_arch::cpu::enable_memory_protection();
 
     // Per-CPU GDT/TSS.
     let gdt = huesos_arch::gdt::PerCpuGdt::new();

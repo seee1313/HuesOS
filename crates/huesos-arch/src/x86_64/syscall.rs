@@ -84,7 +84,14 @@ pub fn init(
     ));
 
     // Mask interrupts (IF) during syscall entry until we've swapped stacks.
-    SFMask::write(RFlags::INTERRUPT_FLAG | RFlags::DIRECTION_FLAG | RFlags::TRAP_FLAG);
+    // Clear AC as well as IF/DF/TF on every userspace syscall entry. A user
+    // process must never carry an SMAP-bypass access window into ring0.
+    SFMask::write(
+        RFlags::INTERRUPT_FLAG
+            | RFlags::DIRECTION_FLAG
+            | RFlags::TRAP_FLAG
+            | RFlags::ALIGNMENT_CHECK,
+    );
 
     unsafe {
         Efer::update(|flags| *flags |= EferFlags::SYSTEM_CALL_EXTENSIONS);

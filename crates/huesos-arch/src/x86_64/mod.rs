@@ -38,6 +38,7 @@ pub unsafe fn init_early() {
     // Set up per-CPU locals for the BSP (LAPIC ID = 0 until LAPIC is initialized).
     let cpu_local = unsafe { cpu_local::alloc_cpu_local(0) };
     unsafe { cpu_local::init_gs_base(cpu_local) };
+    cpu::enable_memory_protection();
 }
 
 /// Second-stage architecture init: paging must have the PMM ready.
