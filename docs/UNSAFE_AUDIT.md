@@ -83,6 +83,15 @@ inversion, recursive acquisition, and non-LIFO release. The corresponding
 safety-budget increase is intentional; no `unwrap`, `expect`, `panic!`, or
 `static mut` count increased.
 
+## uACPI-owned MADT lifetime
+
+The handwritten physical-pointer `RSDP → RSDT/XSDT → MADT` walker was removed.
+uACPI now owns discovery, mapping, checksum validation, and reference lifetime;
+the SMP consumer receives an ordinary bounded byte slice and repeats all entry
+length and arithmetic checks without dereferencing raw firmware pointers. This
+removed nineteen unsafe blocks and four unsafe functions from the audited
+baseline.
+
 ## Remaining high-priority boundaries
 
 ### Allocator internals
