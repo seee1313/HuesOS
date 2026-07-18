@@ -38,6 +38,8 @@ if grep -q 'KERNEL PANIC' "$log"; then
 fi
 for marker in \
     '[uACPI] validated ACPI table graph and MADT' \
+    '[uACPI] built immutable Ring-3 table archive' \
+    '[driver-manager] ACPI manager archive validation ready' \
     '[init] user fault isolation OK' \
     '[init] terminal says terminal:ready' \
     '[terminal] keyboard service online'; do

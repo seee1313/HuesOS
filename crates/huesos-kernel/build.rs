@@ -37,6 +37,13 @@ fn main() {
             input_driver_host.as_os_str(),
         )],
     );
+    let acpi_manager = build_userspace_program(
+        &userspace_root,
+        "acpi-manager",
+        "huesos-acpi-manager",
+        profile,
+        &[],
+    );
     let doom = build_userspace_program(&userspace_root, "doom", "huesos-doom", profile, &[]);
     let terminal =
         build_userspace_program(&userspace_root, "terminal", "huesos-terminal", profile, &[]);
@@ -47,7 +54,13 @@ fn main() {
         profile,
         &[],
     );
-    let _bootfs = build_bootfs_image(&manifest_dir, &input_driver_host, &terminal, &doom);
+    let _bootfs = build_bootfs_image(
+        &manifest_dir,
+        &input_driver_host,
+        &acpi_manager,
+        &terminal,
+        &doom,
+    );
     let init = build_userspace_program(
         &userspace_root,
         "init",
@@ -68,6 +81,7 @@ fn track_userspace_inputs(userspace_root: &Path) {
         "init",
         "driver-manager",
         "driver-host-input",
+        "acpi-manager",
         "terminal",
         "doom",
         "fault-probe",
@@ -139,6 +153,7 @@ struct BootFsFile {
 fn build_bootfs_image(
     manifest_dir: &Path,
     input_driver_host: &Path,
+    acpi_manager: &Path,
     terminal: &Path,
     doom: &Path,
 ) -> PathBuf {
@@ -156,6 +171,10 @@ fn build_bootfs_image(
         BootFsFile {
             path: "/drivers/input-host.elf",
             data: fs::read(input_driver_host).expect("failed to read input DriverHost ELF"),
+        },
+        BootFsFile {
+            path: "/services/acpi-manager.elf",
+            data: read_build_input(acpi_manager, "ACPI manager ELF"),
         },
         BootFsFile {
             path: "/bin/terminal.elf",

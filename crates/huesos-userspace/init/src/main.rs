@@ -40,6 +40,7 @@ struct BootfsEntry {
 pub extern "C" fn _start() -> ! {
     let mut logger = InitLogger::new();
     let bootfs = Vmo::take_init_bootfs();
+    let acpi_tables = Vmo::take_init_acpi_tables();
     init_logln!(logger, "[init] hello from ring3 userspace, via libcanvas");
 
     if libcanvas::diagnostics::user_pointer_guard_smoke_test() {
@@ -59,6 +60,7 @@ pub extern "C" fn _start() -> ! {
     if let Some((_, channel)) = &driver_manager {
         read_ready_message(&mut logger, "driver-manager", channel);
         send_bootfs_vmo(&mut logger, channel, &bootfs);
+        send_acpi_tables_vmo(&mut logger, channel, &acpi_tables);
     }
 
     let registry_pair = create_driver_manager_registry_channel(&mut logger, &driver_manager);
@@ -176,6 +178,24 @@ fn send_bootfs_vmo(logger: &mut InitLogger, dm_bootstrap: &Channel, bootfs: &Vmo
     match dm_bootstrap.write_handle(b"bootfs-vmo", vmo.into_handle()) {
         Ok(()) => init_logln!(logger, "[init] passed HBI BOOTFS VMO to DriverManager"),
         Err(e) => init_logln!(logger, "[init] failed to pass BOOTFS VMO: {}", e.as_str()),
+    }
+}
+
+fn send_acpi_tables_vmo(logger: &mut InitLogger, dm_bootstrap: &Channel, tables: &Vmo) {
+    let duplicate = tables.duplicate(
+        libcanvas::rights::READ | libcanvas::rights::DUPLICATE | libcanvas::rights::TRANSFER,
+    );
+    let Ok(vmo) = duplicate else {
+        init_logln!(logger, "[init] ACPI table archive unavailable");
+        return;
+    };
+    match dm_bootstrap.write_handle(b"acpi-tables-vmo", vmo.into_handle()) {
+        Ok(()) => init_logln!(logger, "[init] passed ACPI table archive to DriverManager"),
+        Err(e) => init_logln!(
+            logger,
+            "[init] failed to pass ACPI archive: {}",
+            e.as_str()
+        ),
     }
 }
 

@@ -26,6 +26,12 @@ impl Vmo {
         Self::from_abi_owned(huesos_abi::INIT_BOOTFS_HANDLE)
     }
 
+    /// Take ownership of the immutable validated ACPI table archive installed
+    /// only in the initial process by the kernel.
+    pub fn take_init_acpi_tables() -> Self {
+        Self::from_abi_owned(huesos_abi::INIT_ACPI_TABLES_HANDLE)
+    }
+
     fn from_abi_owned(raw: HandleValue) -> Self {
         Self(unsafe { Handle::from_raw(raw) })
     }

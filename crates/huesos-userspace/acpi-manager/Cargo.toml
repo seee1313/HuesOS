@@ -1,0 +1,23 @@
+[package]
+name = "huesos-acpi-manager"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[[bin]]
+name = "huesos-acpi-manager"
+path = "src/main.rs"
+
+[dependencies]
+libcanvas = { path = "../libcanvas" }
+huesos-abi = { path = "../../huesos-abi" }
+
+[profile.release]
+opt-level = 2
+panic = "abort"
+lto = false
+
+[profile.dev]
+panic = "abort"
+
+[workspace]
