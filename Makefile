@@ -40,6 +40,7 @@ audit:
 
 audit-check:
 	python3 tools/check-safety-budget.py
+	python3 tools/check-lock-policy.py
 
 clippy:
 	bash scripts/clippy.sh
