@@ -574,7 +574,6 @@ pub fn spawn_user_thread(
     let cpu = cpu_id();
     let mut guard = PER_CPU_SCHEDULERS[cpu].lock();
     let id = guard.add_task(cpu, |id| {
-        crate::process::queue_user_entry(id, entry_point, user_rsp);
         Task::new_user(
             id,
             *name,
@@ -584,6 +583,10 @@ pub fn spawn_user_thread(
         )
     });
     drop(guard);
+    // Publish startup metadata only after releasing the rank-60 scheduler.
+    // Interrupts remain disabled, so this CPU cannot run the new local task
+    // before its rank-40 process record is visible.
+    crate::process::queue_user_entry(id, entry_point, user_rsp);
     huesos_arch::interrupts::enable();
 
     if cpu != cpu_id() {

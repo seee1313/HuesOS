@@ -4,9 +4,10 @@
 use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use huesos_abi::{vmar_flags, ErrorCode, VmarMapArgs};
+use huesos_abi::{ErrorCode, VmarMapArgs, vmar_flags};
 use huesos_arch::gdt;
-use huesos_arch::paging::{flags, AddressSpace, UserPageError};
+use huesos_arch::paging::{AddressSpace, UserPageError, flags};
+use huesos_arch::{LockRank, RankedIrqSafeTicketLock};
 use huesos_elf::{Loader, SegmentFlags};
 use huesos_object::{KernelObject, KernelObjectExt};
 use huesos_object::{Process, Vmar, VmarError, VmarMapping};
@@ -403,7 +404,8 @@ struct PendingUserEntry {
     rsp: u64,
 }
 
-static PENDING_USER_ENTRIES: spin::Mutex<Vec<PendingUserEntry>> = spin::Mutex::new(Vec::new());
+static PENDING_USER_ENTRIES: RankedIrqSafeTicketLock<Vec<PendingUserEntry>> =
+    RankedIrqSafeTicketLock::new(Vec::new(), LockRank::PROCESS);
 
 /// Queue the first userspace RIP/RSP pair for a just-created scheduler task.
 pub fn queue_user_entry(task_id: u64, entry: u64, rsp: u64) {
