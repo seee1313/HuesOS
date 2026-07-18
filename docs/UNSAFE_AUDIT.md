@@ -64,6 +64,25 @@ The global mutable handler integer became `AtomicUsize`. Initialization uses a
 release store before APs are released. Assembly reads the aligned, immutable-
 after-init value. This removes a mutable-static data race.
 
+## Runtime lock-rank boundary review
+
+The all-build lock-rank implementation adds seven localized unsafe blocks, one
+unsafe function, and three unsafe `Send`/`Sync` implementations. These sites
+cover only invariants that safe Rust cannot encode:
+
+- each GS-installed `CpuLocal` owns one permanently assigned rank tracker;
+- local interrupts remain disabled while its `UnsafeCell` is accessed;
+- ticket-lock acquire/release provides exclusive access to protected `T`;
+- context-switch and ring3-entry wrappers validate that no ranked guard is held
+  before calling their assembly symbols.
+
+The rank state has fixed capacity and never allocates. Violations use raw
+emergency serial output followed by fail-stop, avoiding recursive acquisition
+of the ordinary serial or panic-path locks. Host tests cover valid nesting,
+inversion, recursive acquisition, and non-LIFO release. The corresponding
+safety-budget increase is intentional; no `unwrap`, `expect`, `panic!`, or
+`static mut` count increased.
+
 ## Remaining high-priority boundaries
 
 ### Allocator internals
