@@ -5,7 +5,7 @@
 
 use crate::handle::Handle;
 use crate::raw;
-use huesos_abi::{HandleValue, Syscall, INVALID_HANDLE};
+use huesos_abi::{HandleValue, INVALID_HANDLE, Syscall};
 
 /// An owned Virtual Memory Object.
 #[derive(Debug)]
@@ -17,6 +17,16 @@ impl Vmo {
     /// # Safety
     /// `raw` must be an owned VMO handle in this process.
     pub unsafe fn from_raw(raw: HandleValue) -> Self {
+        Self::from_abi_owned(raw)
+    }
+
+    /// Take ownership of the fixed read-only BOOTFS capability installed only
+    /// in the initial process by the kernel.
+    pub fn take_init_bootfs() -> Self {
+        Self::from_abi_owned(huesos_abi::INIT_BOOTFS_HANDLE)
+    }
+
+    fn from_abi_owned(raw: HandleValue) -> Self {
         Self(unsafe { Handle::from_raw(raw) })
     }
 
@@ -73,6 +83,11 @@ impl Vmo {
             buf.len() as u64,
         );
         raw::decode(ret).map(|n| n as usize)
+    }
+
+    /// Duplicate this VMO handle with an explicit rights mask.
+    pub fn duplicate(&self, rights: u32) -> crate::Result<Self> {
+        self.0.duplicate(rights).map(Self)
     }
 
     /// Borrow the underlying handle (e.g. to pass to

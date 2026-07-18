@@ -3,7 +3,7 @@
 use crate::channel::Channel;
 use crate::vmo::Vmo;
 
-use super::elf::{self, ProgramHeader, PAGE_SIZE, PF_R, PF_W, PF_X, PT_LOAD};
+use super::elf::{self, PAGE_SIZE, PF_R, PF_W, PF_X, PT_LOAD, ProgramHeader};
 use super::{Process, Thread, Vmar};
 
 /// Load a static ELF image into a new process and start its initial thread.
@@ -48,11 +48,22 @@ pub fn spawn_elf(name: &str, elf: &[u8]) -> crate::Result<(Process, Channel)> {
 }
 
 /// Load an ELF image from a VMO into a new process and start its initial thread.
-pub fn spawn_elf_from_vmo(name: &str, vmo: &Vmo, offset: u64, _len: u64) -> crate::Result<(Process, Channel)> {
-    // Read the header and program header table into a temporary buffer.
-    // 4KB is usually enough for most ELF headers.
+pub fn spawn_elf_from_vmo(
+    name: &str,
+    vmo: &Vmo,
+    offset: u64,
+    len: u64,
+) -> crate::Result<(Process, Channel)> {
+    if len == 0 || offset.checked_add(len).is_none() {
+        return Err(crate::ErrorCode::InvalidArgs);
+    }
+    // Read the header and program header table into a bounded temporary buffer.
     let mut header_buf = [0u8; 4096];
-    let read = vmo.read(offset, &mut header_buf)?;
+    let header_len = (len as usize).min(header_buf.len());
+    let read = vmo.read(offset, &mut header_buf[..header_len])?;
+    if read != header_len {
+        return Err(crate::ErrorCode::InvalidArgs);
+    }
     let header_slice = &header_buf[..read];
 
     let image = elf::parse_elf(header_slice).ok_or(crate::ErrorCode::InvalidArgs)?;
@@ -60,9 +71,10 @@ pub fn spawn_elf_from_vmo(name: &str, vmo: &Vmo, offset: u64, _len: u64) -> crat
 
     let mut i = 0;
     while i < image.phnum {
-        let ph = elf::read_program_header(header_slice, image, i).ok_or(crate::ErrorCode::InvalidArgs)?;
+        let ph = elf::read_program_header(header_slice, image, i)
+            .ok_or(crate::ErrorCode::InvalidArgs)?;
         if ph.ty == PT_LOAD {
-            map_load_segment_from_vmo(&root_vmar, vmo, offset, ph)?;
+            map_load_segment_from_vmo(&root_vmar, vmo, offset, len, ph)?;
         }
         i += 1;
     }
@@ -124,8 +136,19 @@ fn map_load_segment(root_vmar: &Vmar, elf: &[u8], ph: ProgramHeader) -> crate::R
     Ok(())
 }
 
-fn map_load_segment_from_vmo(root_vmar: &Vmar, vmo: &Vmo, elf_offset: u64, ph: ProgramHeader) -> crate::Result<()> {
-    if ph.filesz > ph.memsz {
+fn map_load_segment_from_vmo(
+    root_vmar: &Vmar,
+    vmo: &Vmo,
+    elf_offset: u64,
+    elf_len: u64,
+    ph: ProgramHeader,
+) -> crate::Result<()> {
+    if ph.filesz > ph.memsz
+        || ph
+            .offset
+            .checked_add(ph.filesz)
+            .is_none_or(|end| end > elf_len)
+    {
         return Err(crate::ErrorCode::InvalidArgs);
     }
 
@@ -149,8 +172,16 @@ fn map_load_segment_from_vmo(root_vmar: &Vmar, vmo: &Vmo, elf_offset: u64, ph: P
 
         while read_total < ph.filesz {
             let to_read = (ph.filesz - read_total).min(buf.len() as u64);
-            vmo.read(elf_offset + ph.offset + read_total, &mut buf[..to_read as usize])?;
-            seg_vmo.write(vmo_file_offset + read_total, &buf[..to_read as usize])?;
+            let source_offset = elf_offset
+                .checked_add(ph.offset)
+                .and_then(|base| base.checked_add(read_total))
+                .ok_or(crate::ErrorCode::InvalidArgs)?;
+            let count = to_read as usize;
+            if vmo.read(source_offset, &mut buf[..count])? != count
+                || seg_vmo.write(vmo_file_offset + read_total, &buf[..count])? != count
+            {
+                return Err(crate::ErrorCode::InvalidArgs);
+            }
             read_total += to_read;
         }
     }

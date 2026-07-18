@@ -23,13 +23,23 @@ macro_rules! init_logln {
 
 static DRIVER_MANAGER_ELF: &[u8] = include_bytes!(env!("HUESOS_DRIVER_MANAGER_PATH"));
 static TERMINAL_ELF: &[u8] = include_bytes!(env!("HUESOS_TERMINAL_PATH"));
-static DOOM_ELF: &[u8] = include_bytes!(env!("HUESOS_DOOM_PATH"));
 static FAULT_PROBE_ELF: &[u8] = include_bytes!(env!("HUESOS_FAULT_PROBE_PATH"));
-static BOOTFS_IMAGE: &[u8] = include_bytes!(env!("HUESOS_BOOTFS_PATH"));
+
+const BOOTFS_HEADER_SIZE: u64 = 16;
+const BOOTFS_ENTRY_SIZE: u64 = 216;
+const BOOTFS_PATH_SIZE: usize = 192;
+const BOOTFS_MAGIC: &[u8; 8] = b"HBOOTFS1";
+
+#[derive(Clone, Copy)]
+struct BootfsEntry {
+    offset: u64,
+    len: u64,
+}
 
 #[unsafe(no_mangle)]
 pub extern "C" fn _start() -> ! {
     let mut logger = InitLogger::new();
+    let bootfs = Vmo::take_init_bootfs();
     init_logln!(logger, "[init] hello from ring3 userspace, via libcanvas");
 
     if libcanvas::diagnostics::user_pointer_guard_smoke_test() {
@@ -48,7 +58,7 @@ pub extern "C" fn _start() -> ! {
 
     if let Some((_, channel)) = &driver_manager {
         read_ready_message(&mut logger, "driver-manager", channel);
-        send_bootfs_vmo(&mut logger, channel);
+        send_bootfs_vmo(&mut logger, channel, &bootfs);
     }
 
     let registry_pair = create_driver_manager_registry_channel(&mut logger, &driver_manager);
@@ -87,8 +97,12 @@ pub extern "C" fn _start() -> ! {
                 }
                 Ok((n, Some(handle))) if &supervisor_message[..n] == b"system:launch-doom" => {
                     if doom_process.is_none() {
-                        doom_process =
-                            launch_doom(&mut logger, channel, Channel::from_handle(handle));
+                        doom_process = launch_doom(
+                            &mut logger,
+                            channel,
+                            Channel::from_handle(handle),
+                            &bootfs,
+                        );
                     } else {
                         init_logln!(logger, "[init] Doom is already running");
                         let _ = channel.write(b"doom:error:busy");
@@ -115,13 +129,29 @@ pub extern "C" fn _start() -> ! {
     }
 }
 
-fn launch_doom(logger: &mut InitLogger, terminal: &Channel, keyboard: Channel) -> Option<Process> {
-    init_logln!(logger, "[init] launching DoomGeneric/Freedoom");
+fn launch_doom(
+    logger: &mut InitLogger,
+    terminal: &Channel,
+    keyboard: Channel,
+    bootfs: &Vmo,
+) -> Option<Process> {
+    init_logln!(logger, "[init] launching DoomGeneric/Freedoom from BOOTFS");
     let result = (|| -> libcanvas::Result<Process> {
-        let (process, bootstrap) = libcanvas::process::spawn_elf("doom", DOOM_ELF)?;
-        init_logln!(logger, "[init] Doom process created; passing keyboard");
+        let doom = find_bootfs_entry(bootfs, b"/bin/doom.elf")?;
+        let wad = find_bootfs_entry(bootfs, b"/data/freedoom1.wad")?;
+        let (process, bootstrap) =
+            libcanvas::process::spawn_elf_from_vmo("doom", bootfs, doom.offset, doom.len)?;
+        init_logln!(logger, "[init] Doom process created; passing capabilities");
         bootstrap.write_handle(b"keyboard", keyboard.into_handle())?;
-        init_logln!(logger, "[init] Doom keyboard passed; process running");
+
+        let wad_vmo = bootfs.duplicate(libcanvas::rights::READ | libcanvas::rights::TRANSFER)?;
+        let mut metadata = [0u8; 20];
+        metadata[..4].copy_from_slice(b"wad\0");
+        metadata[4..12].copy_from_slice(&wad.offset.to_le_bytes());
+        metadata[12..20].copy_from_slice(&wad.len.to_le_bytes());
+        bootstrap.write_handle(&metadata, wad_vmo.into_handle())?;
+
+        init_logln!(logger, "[init] Doom keyboard and read-only WAD VMO passed");
         terminal.write(b"doom:started")?;
         Ok(process)
     })();
@@ -135,26 +165,65 @@ fn launch_doom(logger: &mut InitLogger, terminal: &Channel, keyboard: Channel) -
     }
 }
 
-fn send_bootfs_vmo(logger: &mut InitLogger, dm_bootstrap: &Channel) {
-    let Ok(vmo) = Vmo::create(BOOTFS_IMAGE.len() as u64) else {
-        init_logln!(logger, "[init] failed to create BOOTFS VMO");
+fn send_bootfs_vmo(logger: &mut InitLogger, dm_bootstrap: &Channel, bootfs: &Vmo) {
+    let duplicate = bootfs.duplicate(
+        libcanvas::rights::READ | libcanvas::rights::DUPLICATE | libcanvas::rights::TRANSFER,
+    );
+    let Ok(vmo) = duplicate else {
+        init_logln!(logger, "[init] failed to duplicate HBI BOOTFS VMO");
         return;
     };
-    match vmo.write(0, BOOTFS_IMAGE) {
-        Ok(written) if written == BOOTFS_IMAGE.len() => {}
-        Ok(written) => {
-            init_logln!(logger, "[init] short BOOTFS VMO write: {} bytes", written);
-            return;
-        }
-        Err(e) => {
-            init_logln!(logger, "[init] failed to write BOOTFS VMO: {}", e.as_str());
-            return;
-        }
-    }
     match dm_bootstrap.write_handle(b"bootfs-vmo", vmo.into_handle()) {
-        Ok(()) => init_logln!(logger, "[init] passed BOOTFS VMO to DriverManager"),
+        Ok(()) => init_logln!(logger, "[init] passed HBI BOOTFS VMO to DriverManager"),
         Err(e) => init_logln!(logger, "[init] failed to pass BOOTFS VMO: {}", e.as_str()),
     }
+}
+
+fn find_bootfs_entry(vmo: &Vmo, wanted: &[u8]) -> libcanvas::Result<BootfsEntry> {
+    let mut header = [0u8; BOOTFS_HEADER_SIZE as usize];
+    if vmo.read(0, &mut header)? != header.len() || &header[..8] != BOOTFS_MAGIC {
+        return Err(ErrorCode::InvalidArgs);
+    }
+    let count = u32::from_le_bytes([header[8], header[9], header[10], header[11]]);
+    if count > 4096 {
+        return Err(ErrorCode::InvalidArgs);
+    }
+    let data_start = BOOTFS_HEADER_SIZE
+        .checked_add(u64::from(count) * BOOTFS_ENTRY_SIZE)
+        .ok_or(ErrorCode::InvalidArgs)?;
+    let mut raw = [0u8; BOOTFS_ENTRY_SIZE as usize];
+    for index in 0..count {
+        let offset = BOOTFS_HEADER_SIZE + u64::from(index) * BOOTFS_ENTRY_SIZE;
+        if vmo.read(offset, &mut raw)? != raw.len() {
+            return Err(ErrorCode::InvalidArgs);
+        }
+        let path_len = match raw[..BOOTFS_PATH_SIZE].iter().position(|byte| *byte == 0) {
+            Some(len) => len,
+            None => BOOTFS_PATH_SIZE,
+        };
+        if &raw[..path_len] != wanted {
+            continue;
+        }
+        let meta = &raw[BOOTFS_PATH_SIZE..];
+        let file_offset =
+            u64::from_le_bytes(meta[..8].try_into().map_err(|_| ErrorCode::InvalidArgs)?);
+        let len = u64::from_le_bytes(meta[8..16].try_into().map_err(|_| ErrorCode::InvalidArgs)?);
+        let end = file_offset
+            .checked_add(len)
+            .filter(|end| file_offset >= data_start && *end > file_offset)
+            .ok_or(ErrorCode::InvalidArgs)?;
+        // BOOTFS has no size syscall dependency: probing the final byte proves
+        // the complete checked range is backed by this VMO.
+        let mut probe = [0u8; 1];
+        if vmo.read(end - 1, &mut probe)? != 1 {
+            return Err(ErrorCode::InvalidArgs);
+        }
+        return Ok(BootfsEntry {
+            offset: file_offset,
+            len,
+        });
+    }
+    Err(ErrorCode::NotFound)
 }
 
 fn create_driver_manager_registry_channel(

@@ -3,15 +3,15 @@
 //! the kernel/init build.
 //!
 //! `huesos-init` remains the only binary embedded directly in the kernel.
-//! The next-stage userspace services are embedded into `init` so init can
-//! create processes, map VMARs, create threads, and start them itself via
-//! the new Zircon-like launch ABI.
+//! Core early services remain embedded in init for deterministic bootstrap;
+//! large optional applications and assets (Doom/Freedoom) live only in the
+//! HBI BOOTFS and are launched through its read-only VMO capability.
 
 use std::env;
 use std::ffi::OsStr;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::fs;
 
 fn main() {
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
@@ -32,22 +32,14 @@ fn main() {
         "driver-manager",
         "huesos-driver-manager",
         profile,
-        &[("HUESOS_INPUT_DRIVER_HOST_PATH", input_driver_host.as_os_str())],
+        &[(
+            "HUESOS_INPUT_DRIVER_HOST_PATH",
+            input_driver_host.as_os_str(),
+        )],
     );
-    let doom = build_userspace_program(
-        &userspace_root,
-        "doom",
-        "huesos-doom",
-        profile,
-        &[],
-    );
-    let terminal = build_userspace_program(
-        &userspace_root,
-        "terminal",
-        "huesos-terminal",
-        profile,
-        &[],
-    );
+    let doom = build_userspace_program(&userspace_root, "doom", "huesos-doom", profile, &[]);
+    let terminal =
+        build_userspace_program(&userspace_root, "terminal", "huesos-terminal", profile, &[]);
     let fault_probe = build_userspace_program(
         &userspace_root,
         "fault-probe",
@@ -55,7 +47,7 @@ fn main() {
         profile,
         &[],
     );
-    let bootfs = build_bootfs_image(&manifest_dir, &input_driver_host, &terminal);
+    let _bootfs = build_bootfs_image(&manifest_dir, &input_driver_host, &terminal, &doom);
     let init = build_userspace_program(
         &userspace_root,
         "init",
@@ -64,9 +56,7 @@ fn main() {
         &[
             ("HUESOS_DRIVER_MANAGER_PATH", driver_manager.as_os_str()),
             ("HUESOS_TERMINAL_PATH", terminal.as_os_str()),
-            ("HUESOS_DOOM_PATH", doom.as_os_str()),
             ("HUESOS_FAULT_PROBE_PATH", fault_probe.as_os_str()),
-            ("HUESOS_BOOTFS_PATH", bootfs.as_os_str()),
         ],
     );
 
@@ -99,6 +89,7 @@ fn track_userspace_inputs(userspace_root: &Path) {
         "cargo:rerun-if-changed={}",
         userspace_root.join("user_linker.ld").display()
     );
+    println!("cargo:rerun-if-changed=../../third_party/freedoom/freedoom1.wad");
 }
 
 fn build_userspace_program(
@@ -140,13 +131,17 @@ fn build_userspace_program(
     bin_path
 }
 
-
 struct BootFsFile {
     path: &'static str,
     data: Vec<u8>,
 }
 
-fn build_bootfs_image(manifest_dir: &Path, input_driver_host: &Path, terminal: &Path) -> PathBuf {
+fn build_bootfs_image(
+    manifest_dir: &Path,
+    input_driver_host: &Path,
+    terminal: &Path,
+    doom: &Path,
+) -> PathBuf {
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
     let bootfs_path = out_dir.join("huesos.bootfs");
     let files = vec![
@@ -166,10 +161,34 @@ fn build_bootfs_image(manifest_dir: &Path, input_driver_host: &Path, terminal: &
             path: "/bin/terminal.elf",
             data: fs::read(terminal).expect("failed to read terminal ELF"),
         },
+        BootFsFile {
+            path: "/bin/doom.elf",
+            data: read_build_input(doom, "Doom ELF"),
+        },
+        BootFsFile {
+            path: "/data/freedoom1.wad",
+            data: read_build_input(
+                &manifest_dir.join("../../third_party/freedoom/freedoom1.wad"),
+                "Freedoom WAD",
+            ),
+        },
     ];
     write_bootfs(&bootfs_path, &files);
-    println!("cargo:rerun-if-changed={}", manifest_dir.join("build.rs").display());
+    println!(
+        "cargo:rerun-if-changed={}",
+        manifest_dir.join("build.rs").display()
+    );
     bootfs_path
+}
+
+fn read_build_input(path: &Path, label: &str) -> Vec<u8> {
+    match fs::read(path) {
+        Ok(data) => data,
+        Err(error) => {
+            eprintln!("failed to read {label} at {}: {error}", path.display());
+            std::process::exit(1);
+        }
+    }
 }
 
 fn write_bootfs(path: &Path, files: &[BootFsFile]) {
@@ -189,8 +208,16 @@ fn write_bootfs(path: &Path, files: &[BootFsFile]) {
 
     let mut cursor = data_offset as u64;
     for (idx, file) in files.iter().enumerate() {
-        assert!(file.path.starts_with('/'), "BOOTFS path must be absolute: {}", file.path);
-        assert!(file.path.len() < PATH_SIZE, "BOOTFS path too long: {}", file.path);
+        assert!(
+            file.path.starts_with('/'),
+            "BOOTFS path must be absolute: {}",
+            file.path
+        );
+        assert!(
+            file.path.len() < PATH_SIZE,
+            "BOOTFS path too long: {}",
+            file.path
+        );
         let entry = entries_offset + idx * ENTRY_SIZE;
         image[entry..entry + file.path.len()].copy_from_slice(file.path.as_bytes());
         image[entry + PATH_SIZE..entry + PATH_SIZE + 8].copy_from_slice(&cursor.to_le_bytes());

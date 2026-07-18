@@ -228,6 +228,8 @@ pub const INVALID_HANDLE: HandleValue = 0;
 /// Initial bootstrap channel handle number installed in a newly-started
 /// child process by `Syscall::ThreadStart`.
 pub const BOOTSTRAP_HANDLE: HandleValue = 1;
+/// Read-only HBI BOOTFS VMO installed by the kernel in the initial process.
+pub const INIT_BOOTFS_HANDLE: HandleValue = 2;
 
 /// Stable process exit codes used when the kernel terminates a process after
 /// an unhandled ring-3 CPU exception.
