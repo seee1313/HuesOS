@@ -21,9 +21,7 @@ done
     cd crates/huesos-userspace/init
     HUESOS_DRIVER_MANAGER_PATH="$TMP/driver-manager" \
     HUESOS_TERMINAL_PATH="$TMP/terminal" \
-    HUESOS_DOOM_PATH="$TMP/doom" \
     HUESOS_FAULT_PROBE_PATH="$TMP/fault-probe" \
-    HUESOS_BOOTFS_PATH="$TMP/bootfs" \
         cargo clippy --release -- -D warnings
 )
 

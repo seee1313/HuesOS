@@ -32,7 +32,7 @@ run-release: iso-release
 
 test:
 	cargo test -p huesos-elf -p huesos-pmm -p huesos-object -p huesos-fb \
-		-p huesos-syscalls -p huesos-fat -p huesos-alloc -p huesos-kernel \
+		-p huesos-syscalls -p huesos-fat -p huesos-alloc -p huesos-uacpi -p huesos-kernel \
 		--target x86_64-unknown-linux-gnu -Z build-std=
 
 audit:
