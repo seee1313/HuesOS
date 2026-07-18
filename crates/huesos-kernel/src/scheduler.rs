@@ -59,12 +59,11 @@ const fn task_index(id: u64) -> usize {
     (id & TASK_INDEX_MASK) as usize
 }
 
-const fn next_task_generation(previous: u32) -> u32 {
-    let next = previous.wrapping_add(1) & TASK_GENERATION_MASK;
-    if next == 0 {
-        1
+const fn next_task_generation(previous: u32) -> Option<u32> {
+    if previous >= TASK_GENERATION_MASK {
+        None
     } else {
-        next
+        Some(previous + 1)
     }
 }
 
@@ -122,6 +121,8 @@ static PER_CPU_SCHEDULERS: [spin::Mutex<Scheduler>; MAX_CPUS] =
 
 struct TaskSlot {
     generation: u32,
+    /// Permanently set before a generation could wrap and recreate an old ID.
+    retired: bool,
     // The allocation keeps Context addresses stable while the slot vector
     // grows. Reuse replaces the value only after the old task was reaped.
     task: Box<Task>,
@@ -143,6 +144,8 @@ impl DerefMut for TaskSlot {
 
 struct Scheduler {
     tasks: Vec<TaskSlot>,
+    /// Reaped reusable indexes. Each index appears at most once.
+    free_slots: Vec<usize>,
     current: usize,
     fair_queue: wavl::WavlTree,
     ticks: u64,
@@ -152,6 +155,7 @@ impl Scheduler {
     const fn new() -> Self {
         Self {
             tasks: Vec::new(),
+            free_slots: Vec::new(),
             current: 0,
             fair_queue: wavl::WavlTree::new(),
             ticks: 0,
@@ -159,23 +163,25 @@ impl Scheduler {
     }
 
     fn add_task(&mut self, cpu: usize, create: impl FnOnce(u64) -> Task) -> u64 {
-        let reusable = self
-            .tasks
-            .iter()
-            .enumerate()
-            .skip(1)
-            .find(|(_, slot)| matches!(&slot.kind, TaskKind::Reaped))
-            .map(|(index, _)| index);
-
-        let (index, generation) = if let Some(index) = reusable {
-            let previous = self.tasks[index].generation;
-            // Generation zero is reserved for never-reused slots. Skipping it
-            // makes wraparound retain stale-ID protection for another full
-            // 24-bit cycle.
-            (index, next_task_generation(previous))
-        } else {
-            (self.tasks.len(), 0)
+        let reusable = loop {
+            let Some(index) = self.free_slots.pop() else {
+                break None;
+            };
+            let Some(slot) = self.tasks.get_mut(index) else {
+                continue;
+            };
+            if slot.retired || !matches!(&slot.kind, TaskKind::Reaped) {
+                continue;
+            }
+            if let Some(generation) = next_task_generation(slot.generation) {
+                break Some((index, generation));
+            }
+            // Defensive retirement if a corrupted/stale free-list entry ever
+            // names an exhausted slot. The task constructor is not consumed.
+            slot.retired = true;
         };
+
+        let (index, generation) = reusable.unwrap_or((self.tasks.len(), 0));
 
         let id = encode_task_id(cpu, generation, index);
         let task = create(id);
@@ -183,11 +189,13 @@ impl Scheduler {
         if index == self.tasks.len() {
             self.tasks.push(TaskSlot {
                 generation,
+                retired: false,
                 task: Box::new(task),
             });
         } else {
             let slot = &mut self.tasks[index];
             slot.generation = generation;
+            slot.retired = false;
             *slot.task = task;
         }
         if index > 0 {
@@ -610,9 +618,11 @@ pub fn exit_current_task(code: i64) -> ! {
         proc.set_exit_code(code);
         huesos_object::collect_exited_process(proc.koid());
         PROCESS_TEARDOWN.lock().push(proc);
+        REAP_PENDING.store(true, Ordering::Release);
     }
     if let Some(id) = reap_id {
         REAP_QUEUE.lock().push(id);
+        REAP_PENDING.store(true, Ordering::Release);
     }
     loop {
         let mut guard = PER_CPU_SCHEDULERS[cpu].lock();
@@ -676,10 +686,12 @@ pub fn terminate_current_process(code: i64) -> ! {
                 guard.fair_queue.remove(vruntime, id);
             }
             REAP_QUEUE.lock().push(id);
+            REAP_PENDING.store(true, Ordering::Release);
         }
     }
 
     PROCESS_TEARDOWN.lock().push(Arc::clone(&process));
+    REAP_PENDING.store(true, Ordering::Release);
     for cpu in 0..MAX_CPUS {
         if cpu != current_cpu && is_cpu_online(cpu) {
             huesos_arch::lapic::ipi_reschedule(cpu as u8);
@@ -706,12 +718,24 @@ fn switch_away_from_finished(cpu: usize) -> ! {
     }
 }
 
+/// True while deferred task/process teardown needs process-context service.
+static REAP_PENDING: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
 /// Task ids waiting for kernel-stack reclamation.
 static REAP_QUEUE: spin::Mutex<alloc::vec::Vec<u64>> = spin::Mutex::new(alloc::vec::Vec::new());
 
 /// Processes waiting for address-space / handle-table teardown.
 static PROCESS_TEARDOWN: spin::Mutex<alloc::vec::Vec<alloc::sync::Arc<huesos_object::Process>>> =
     spin::Mutex::new(alloc::vec::Vec::new());
+
+/// Service deferred teardown after an ordinary syscall has released all
+/// subsystem locks. The atomic fast path avoids touching queue mutexes on
+/// syscalls that have no lifecycle work.
+pub fn reap_if_pending() {
+    if REAP_PENDING.swap(false, Ordering::AcqRel) {
+        reap_finished_tasks();
+    }
+}
 
 /// Drain finished tasks' kernel stacks (frames stay until process Arc drops).
 /// Safe to call from a low-priority path; currently invoked from the BSP
@@ -722,6 +746,9 @@ pub fn reap_finished_tasks() {
         core::mem::take(&mut *q)
     };
     for task_id in batch {
+        // This lock is acquired before any scheduler lock, preventing a
+        // scheduler -> pending-entry inversion during task-slot reclamation.
+        crate::process::cancel_user_entry(task_id);
         let cpu = task_cpu(task_id);
         let idx = task_index(task_id);
         if cpu >= MAX_CPUS {
@@ -736,14 +763,28 @@ pub fn reap_finished_tasks() {
         // Never reap the currently running generation (shouldn't be queued).
         if guard.current == idx {
             REAP_QUEUE.lock().push(task_id);
+            REAP_PENDING.store(true, Ordering::Release);
             continue;
         }
-        let task = &mut guard.tasks[idx];
-        if task.finished.load(Ordering::Acquire) {
-            // Releasing the stack and Process Arc turns this allocation into
-            // a reusable tombstone. The next occupant gets a new generation.
-            task.kernel_stack = alloc::vec::Vec::new();
-            task.kind = TaskKind::Reaped;
+        let reusable = {
+            let slot = &mut guard.tasks[idx];
+            if !slot.finished.load(Ordering::Acquire) || matches!(&slot.kind, TaskKind::Reaped) {
+                false
+            } else {
+                // Release the stack and Process Arc before publishing the slot.
+                slot.kernel_stack = alloc::vec::Vec::new();
+                slot.kind = TaskKind::Reaped;
+                if slot.generation >= TASK_GENERATION_MASK {
+                    // Never permit generation wrap to recreate a historical ID.
+                    slot.retired = true;
+                    false
+                } else {
+                    true
+                }
+            }
+        };
+        if reusable {
+            guard.free_slots.push(idx);
         }
     }
 
@@ -765,6 +806,7 @@ pub fn reap_finished_tasks() {
             // A remote CPU has not yet taken its reschedule IPI. Never destroy
             // page tables while that CPU can still have the process CR3 live.
             PROCESS_TEARDOWN.lock().push(proc);
+            REAP_PENDING.store(true, Ordering::Release);
         } else {
             crate::process::teardown_process(&proc);
         }
@@ -789,9 +831,9 @@ mod task_id_tests {
     }
 
     #[test]
-    fn reused_generations_never_publish_zero() {
-        assert_eq!(next_task_generation(0), 1);
-        assert_eq!(next_task_generation(41), 42);
-        assert_eq!(next_task_generation(TASK_GENERATION_MASK), 1);
+    fn generation_exhaustion_retires_instead_of_wrapping() {
+        assert_eq!(next_task_generation(0), Some(1));
+        assert_eq!(next_task_generation(41), Some(42));
+        assert_eq!(next_task_generation(TASK_GENERATION_MASK), None);
     }
 }
