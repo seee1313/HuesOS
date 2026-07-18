@@ -52,6 +52,8 @@ unsafe extern "C" {
     fn uacpi_setup_early_table_access(buffer: *mut c_void, size: usize) -> i32;
     fn uacpi_table_subsystem_available() -> u8;
     fn uacpi_table_find_by_signature(signature: *const c_char, table: *mut UacpiTable) -> i32;
+    fn uacpi_table_count() -> usize;
+    fn uacpi_table_get_by_index(index: usize, table: *mut UacpiTable) -> i32;
     fn uacpi_table_unref(table: *mut UacpiTable);
 }
 
@@ -80,12 +82,34 @@ pub fn initialize_tables(rsdp_physical: u64) -> Result<(), Error> {
     Ok(())
 }
 
+/// Number of tables installed by uACPI after successful initialization.
+pub fn table_count() -> usize {
+    // SAFETY: callers reach this after initialize_tables; the function only
+    // reads uACPI's serialized table-array length.
+    unsafe { uacpi_table_count() }
+}
+
 /// A referenced, mapped ACPI system-description table.
 pub struct Table {
     inner: UacpiTable,
 }
 
 impl Table {
+    /// Reference an installed table by its stable uACPI index.
+    pub fn get(index: usize) -> Result<Self, Error> {
+        let mut inner = UacpiTable {
+            ptr: core::ptr::null_mut(),
+            index: 0,
+        };
+        // SAFETY: inner is writable and receives exactly one referenced table
+        // descriptor on success. uACPI validates index against its table array.
+        let status = unsafe { uacpi_table_get_by_index(index, &mut inner) };
+        if status != STATUS_OK || inner.ptr.is_null() {
+            return Err(Error::NotFound);
+        }
+        Ok(Self { inner })
+    }
+
     /// Find a table by its four-byte ACPI signature.
     pub fn find(signature: &[u8; 4]) -> Result<Self, Error> {
         let mut inner = UacpiTable {
@@ -100,6 +124,19 @@ impl Table {
             return Err(Error::NotFound);
         }
         Ok(Self { inner })
+    }
+
+    /// Return the table's four-byte ACPI signature.
+    pub fn signature(&self) -> Result<[u8; 4], Error> {
+        let bytes = self.bytes()?;
+        let mut signature = [0; 4];
+        signature.copy_from_slice(&bytes[..4]);
+        Ok(signature)
+    }
+
+    /// Return the revision byte from the standard SDT header.
+    pub fn revision(&self) -> Result<u8, Error> {
+        Ok(self.bytes()?[8])
     }
 
     /// Borrow the complete mapped SDT after validating its standard length
