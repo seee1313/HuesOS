@@ -1,12 +1,12 @@
 {
-  "rust_files": 111,
-  "rust_lines": 19562,
+  "rust_files": 114,
+  "rust_lines": 20469,
   "totals": {
     "expect_calls": 21,
     "panic_macros": 5,
     "static_mut": 1,
     "todo_markers": 1,
-    "unsafe_blocks": 200,
+    "unsafe_blocks": 202,
     "unsafe_functions": 43,
     "unsafe_impls": 28,
     "unwrap_calls": 24
@@ -45,7 +45,7 @@
     "crates/huesos-object/src/vmo.rs": 4,
     "crates/huesos-pmm/src/lib.rs": 5,
     "crates/huesos-syscalls/src/user_memory.rs": 6,
-    "crates/huesos-uacpi/src/lib.rs": 9,
+    "crates/huesos-uacpi/src/lib.rs": 11,
     "crates/huesos-user-alloc/src/lib.rs": 1,
     "crates/huesos-userspace/doom/src/main.rs": 9,
     "crates/huesos-userspace/fault-probe/src/main.rs": 4,

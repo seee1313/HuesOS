@@ -101,6 +101,14 @@ syscall boundaries. No raw user-pointer site was added; all existing copies now
 run inside the audited guard. This is an intentional security-boundary budget
 increase.
 
+## uACPI archive enumeration boundary
+
+Two additional unsafe calls reference installed uACPI tables by index and read
+the serialized table count. The wrappers return RAII `Table` references, reuse
+the existing bounded SDT-length validation, and copy bytes into an immutable
+archive during single-threaded early boot. No foreign pointer escapes into
+Ring 3; userspace receives only a read-only VMO snapshot.
+
 ## Remaining high-priority boundaries
 
 ### Allocator internals
