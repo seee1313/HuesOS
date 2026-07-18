@@ -259,6 +259,11 @@ fn spawn_init_process(bootfs_image: Option<&[u8]>, acpi_archive: Option<&[u8]>) 
             bytes,
         ) {
             dbg("[init] installed immutable ACPI table archive VMO\n");
+            if install_acpi_broker(&spawned.process) {
+                dbg("[init] installed deny-by-default ACPI broker capability\n");
+            } else {
+                dbg("[init] failed to install ACPI broker capability\n");
+            }
         } else {
             dbg("[init] failed to install ACPI table archive VMO\n");
         }
@@ -293,6 +298,27 @@ fn install_readonly_vmo(
     if process
         .handles
         .insert_at(slot, Handle::new(koid, rights))
+        .is_err()
+    {
+        huesos_object::unregister_object(koid);
+        return false;
+    }
+    true
+}
+
+fn install_acpi_broker(process: &huesos_object::Process) -> bool {
+    use huesos_object::{Handle, KernelObject, Rights};
+
+    let broker = huesos_object::AcpiBroker::deny_all();
+    let koid = broker.koid();
+    huesos_object::register_object(broker);
+    let rights = Rights::READ | Rights::WRITE | Rights::TRANSFER;
+    if process
+        .handles
+        .insert_at(
+            huesos_abi::INIT_ACPI_BROKER_HANDLE,
+            Handle::new(koid, rights),
+        )
         .is_err()
     {
         huesos_object::unregister_object(koid);

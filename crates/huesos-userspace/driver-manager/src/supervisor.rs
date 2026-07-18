@@ -4,7 +4,7 @@ use crate::fs_service::FileSystemService;
 use crate::manifest::INPUT_HOST;
 use crate::protocol;
 use crate::registry::{ServiceRegistry, ServiceState};
-use libcanvas::{println, Channel, ErrorCode, Process, Vmo};
+use libcanvas::{println, Channel, ErrorCode, Handle, Process, Vmo};
 
 /// Fallback embedded DriverHost image (same binary packaged into BOOTFS).
 /// Prefer this over spawn_elf_from_vmo until VMO-backed launch is fully solid.
@@ -16,6 +16,7 @@ pub struct DriverManager {
     input_host: Option<ManagedHost>,
     acpi_manager: Option<ManagedHost>,
     acpi_tables: Option<Vmo>,
+    acpi_broker: Option<Handle>,
     registry_channel: Option<Channel>,
     fs: FileSystemService,
     heartbeat_count: u64,
@@ -38,6 +39,7 @@ impl DriverManager {
             input_host: None,
             acpi_manager: None,
             acpi_tables: None,
+            acpi_broker: None,
             registry_channel: None,
             fs: FileSystemService::new(),
             heartbeat_count: 0,
@@ -162,7 +164,11 @@ impl DriverManager {
     }
 
     fn try_start_acpi_manager(&mut self) {
-        if self.acpi_manager.is_some() || !self.bootfs_loaded || self.acpi_tables.is_none() {
+        if self.acpi_manager.is_some()
+            || !self.bootfs_loaded
+            || self.acpi_tables.is_none()
+            || self.acpi_broker.is_none()
+        {
             return;
         }
         let Some(bootfs) = self.fs.bootfs() else {
@@ -196,6 +202,16 @@ impl DriverManager {
             .is_err()
         {
             println!("[driver-manager] failed to transfer ACPI table archive");
+            return;
+        }
+        let Some(broker) = self.acpi_broker.take() else {
+            return;
+        };
+        if bootstrap
+            .write_handle(protocol::ACPI_MANAGER_BROKER.as_bytes(), broker)
+            .is_err()
+        {
+            println!("[driver-manager] failed to transfer ACPI broker capability");
             return;
         }
         println!("[driver-manager] launched isolated Ring-3 ACPI manager");
@@ -258,6 +274,11 @@ impl DriverManager {
                 Ok((n, handle)) if &buf[..n] == protocol::ACPI_TABLES_VMO.as_bytes() => {
                     println!("[driver-manager] received immutable ACPI table archive");
                     self.acpi_tables = Some(Vmo::from_handle(handle));
+                    self.try_start_acpi_manager();
+                }
+                Ok((n, handle)) if &buf[..n] == protocol::ACPI_BROKER.as_bytes() => {
+                    println!("[driver-manager] received unique ACPI broker capability");
+                    self.acpi_broker = Some(handle);
                     self.try_start_acpi_manager();
                 }
                 Ok((_n, _handle)) => println!("[driver-manager] unknown bootstrap handle message"),

@@ -13,3 +13,4 @@ huesos-fb = { path = "../huesos-fb" }
 bitflags = { workspace = true }
 spin = { workspace = true }
 log = { workspace = true }
+x86_64 = { workspace = true }

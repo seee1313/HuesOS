@@ -10,3 +10,4 @@ spin = { workspace = true }
 bitflags = { workspace = true }
 log = { workspace = true }
 huesos-pmm = { path = "../huesos-pmm" }
+huesos-abi = { path = "../huesos-abi" }

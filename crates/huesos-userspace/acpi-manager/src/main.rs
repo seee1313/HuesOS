@@ -15,6 +15,7 @@ use huesos_abi::acpi_broker::{
 use libcanvas::{Channel, ErrorCode, Vmo, println};
 
 const ARCHIVE_MESSAGE: &[u8] = b"acpi-tables-vmo";
+const BROKER_MESSAGE: &[u8] = b"acpi-broker";
 
 #[unsafe(no_mangle)]
 pub extern "C" fn _start() -> ! {
@@ -29,7 +30,6 @@ pub extern "C" fn _start() -> ! {
     match validate_archive(&archive) {
         Ok(table_count) => {
             println!("[acpi-manager] validated {} ACPI tables", table_count);
-            let _ = bootstrap.write(b"acpi-manager:ready");
         }
         Err(error) => {
             println!("[acpi-manager] invalid table archive: {}", error.as_str());
@@ -37,6 +37,17 @@ pub extern "C" fn _start() -> ! {
             libcanvas::process::exit(-2);
         }
     }
+    let Some(broker) = receive_broker(&bootstrap) else {
+        let _ = bootstrap.write(b"acpi-manager:broker-failed");
+        libcanvas::process::exit(-3);
+    };
+    if !verify_deny_by_default(&broker) {
+        println!("[acpi-manager] broker deny-by-default self-test failed");
+        let _ = bootstrap.write(b"acpi-manager:broker-failed");
+        libcanvas::process::exit(-4);
+    }
+    println!("[acpi-manager] broker deny-by-default self-test OK");
+    let _ = bootstrap.write(b"acpi-manager:ready");
 
     let mut yields = 0u32;
     loop {
@@ -63,6 +74,38 @@ fn receive_archive(bootstrap: &Channel) -> Option<Vmo> {
         }
     }
     None
+}
+
+fn receive_broker(bootstrap: &Channel) -> Option<libcanvas::acpi_broker::AcpiBroker> {
+    let mut message = [0u8; 32];
+    for _ in 0..100_000 {
+        match bootstrap.read_handle(&mut message) {
+            Ok((length, handle)) if &message[..length] == BROKER_MESSAGE => {
+                return Some(libcanvas::acpi_broker::AcpiBroker::from_handle(handle));
+            }
+            Ok((_length, _handle)) => {}
+            Err(ErrorCode::ShouldWait) | Err(ErrorCode::TimedOut) => {
+                libcanvas::process::yield_now();
+            }
+            Err(_) => return None,
+        }
+    }
+    None
+}
+
+fn verify_deny_by_default(broker: &libcanvas::acpi_broker::AcpiBroker) -> bool {
+    let request = huesos_abi::acpi_broker::Request {
+        version: VERSION,
+        opcode: huesos_abi::acpi_broker::Opcode::SystemIoRead as u16,
+        width: 1,
+        request_id: 1,
+        address: 0x80,
+        ..huesos_abi::acpi_broker::Request::default()
+    };
+    broker.call(&request).is_ok_and(|response| {
+        response.status == huesos_abi::acpi_broker::Status::AccessDenied as i32
+            && response.request_id == request.request_id
+    })
 }
 
 #[derive(Clone, Copy)]

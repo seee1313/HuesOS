@@ -58,6 +58,7 @@
 #![no_std]
 #![warn(missing_docs)]
 
+pub mod acpi_broker;
 pub mod channel;
 pub mod debug;
 #[cfg(feature = "kernel-smoke-tests")]
