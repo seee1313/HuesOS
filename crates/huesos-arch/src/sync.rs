@@ -15,97 +15,16 @@ use core::ops::{Deref, DerefMut};
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use x86_64::instructions::interrupts;
 
-/// Maximum number of locks that one CPU may nest.
-const MAX_HELD_LOCKS: usize = 16;
+// The platform-neutral rank state machine lives in `huesos-sync` so it can be
+// unit-tested on the host without `cli`/`sti`. The architecture layer keeps
+// the per-CPU tracker storage, the interrupt-masking lock wrappers, and the
+// fail-stop violation handler; it delegates the pure rank bookkeeping to
+// `huesos-sync`.
+pub use huesos_sync::{LockRank, LockRankError};
+use huesos_sync::RankTracker;
+
 /// Number of hardware-thread rank trackers. This matches `cpu_local::MAX_CPUS`.
 const MAX_RANK_TRACKERS: usize = 64;
-
-/// Runtime lock-order rank. Locks must be acquired in non-decreasing rank
-/// order. Equal-rank nesting is allowed for objects in the same domain, but
-/// recursively acquiring the same lock is rejected.
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-#[repr(transparent)]
-pub struct LockRank(u8);
-
-impl LockRank {
-    /// Immutable boot and architecture state.
-    pub const ARCHITECTURE: Self = Self(10);
-    /// Global object registries and indexes.
-    pub const REGISTRY: Self = Self(20);
-    /// State local to one kernel object.
-    pub const OBJECT: Self = Self(30);
-    /// Process address-space and runtime state.
-    pub const PROCESS: Self = Self(40);
-    /// Wait queues and timeout metadata.
-    pub const WAIT: Self = Self(50);
-    /// Per-CPU scheduler state.
-    pub const SCHEDULER: Self = Self(60);
-    /// Deferred object and process teardown.
-    pub const REAPER: Self = Self(70);
-    /// Kernel allocator metadata.
-    pub const ALLOCATOR: Self = Self(80);
-
-    /// Numeric rank used in diagnostics and lock inventories.
-    pub const fn value(self) -> u8 {
-        self.0
-    }
-}
-
-#[derive(Clone, Copy)]
-struct HeldLock {
-    rank: LockRank,
-    identity: usize,
-}
-
-const EMPTY_HELD_LOCK: HeldLock = HeldLock {
-    rank: LockRank(0),
-    identity: 0,
-};
-
-struct RankTracker {
-    depth: usize,
-    held: [HeldLock; MAX_HELD_LOCKS],
-}
-
-impl RankTracker {
-    const fn new() -> Self {
-        Self {
-            depth: 0,
-            held: [EMPTY_HELD_LOCK; MAX_HELD_LOCKS],
-        }
-    }
-
-    fn enter(&mut self, rank: LockRank, identity: usize) -> Result<(), LockRankError> {
-        if self.depth == MAX_HELD_LOCKS {
-            return Err(LockRankError::NestingLimit);
-        }
-        if self.held[..self.depth]
-            .iter()
-            .any(|held| held.identity == identity)
-        {
-            return Err(LockRankError::RecursiveAcquire);
-        }
-        if self.depth != 0 && rank < self.held[self.depth - 1].rank {
-            return Err(LockRankError::Inversion);
-        }
-        self.held[self.depth] = HeldLock { rank, identity };
-        self.depth += 1;
-        Ok(())
-    }
-
-    fn leave(&mut self, rank: LockRank, identity: usize) -> Result<(), LockRankError> {
-        let Some(index) = self.depth.checked_sub(1) else {
-            return Err(LockRankError::UnbalancedRelease);
-        };
-        let held = self.held[index];
-        if held.rank != rank || held.identity != identity {
-            return Err(LockRankError::UnbalancedRelease);
-        }
-        self.depth = index;
-        self.held[index] = EMPTY_HELD_LOCK;
-        Ok(())
-    }
-}
 
 struct RankTrackerSlot(UnsafeCell<RankTracker>);
 
@@ -122,21 +41,6 @@ unsafe impl Sync for RankTrackerSlot {}
 
 static RANK_TRACKERS: [RankTrackerSlot; MAX_RANK_TRACKERS] =
     [const { RankTrackerSlot::new() }; MAX_RANK_TRACKERS];
-
-/// A runtime lock-order contract violation. Checks are enabled in every build.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum LockRankError {
-    /// A lower-ranked lock was requested while a higher rank was held.
-    Inversion,
-    /// The CPU attempted to recursively acquire the same non-recursive lock.
-    RecursiveAcquire,
-    /// More than [`MAX_HELD_LOCKS`] locks were nested on one CPU.
-    NestingLimit,
-    /// Guards were released out of LIFO order or on a different CPU.
-    UnbalancedRelease,
-    /// More hardware threads attempted to use ranked locks than supported.
-    CpuCapacity,
-}
 
 fn with_rank_tracker<R>(operation: impl FnOnce(&mut RankTracker) -> R) -> Result<R, LockRankError> {
     // SAFETY: every path that uses ranked locks runs after per-CPU GS setup;
@@ -163,7 +67,7 @@ fn rank_violation(_error: LockRankError) -> ! {
 pub fn assert_no_ranked_locks_held() {
     let was_enabled = interrupts::are_enabled();
     interrupts::disable();
-    let depth = match with_rank_tracker(|tracker| tracker.depth) {
+    let depth = match with_rank_tracker(|tracker| tracker.depth()) {
         Ok(depth) => depth,
         Err(error) => rank_violation(error),
     };
@@ -561,44 +465,5 @@ impl<'a, T> Deref for IrqSafeTicketLockGuard<'a, T> {
 impl<'a, T> DerefMut for IrqSafeTicketLockGuard<'a, T> {
     fn deref_mut(&mut self) -> &mut T {
         unsafe { &mut *self.data.data.get() }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{LockRank, LockRankError, RankTracker};
-
-    #[test]
-    fn rank_tracker_accepts_nested_non_decreasing_ranks() {
-        let mut tracker = RankTracker::new();
-        assert_eq!(tracker.enter(LockRank::REGISTRY, 1), Ok(()));
-        assert_eq!(tracker.enter(LockRank::OBJECT, 2), Ok(()));
-        assert_eq!(tracker.leave(LockRank::OBJECT, 2), Ok(()));
-        assert_eq!(tracker.leave(LockRank::REGISTRY, 1), Ok(()));
-    }
-
-    #[test]
-    fn rank_tracker_rejects_inversion_and_recursion() {
-        let mut tracker = RankTracker::new();
-        assert_eq!(tracker.enter(LockRank::WAIT, 1), Ok(()));
-        assert_eq!(
-            tracker.enter(LockRank::OBJECT, 2),
-            Err(LockRankError::Inversion)
-        );
-        assert_eq!(
-            tracker.enter(LockRank::WAIT, 1),
-            Err(LockRankError::RecursiveAcquire)
-        );
-    }
-
-    #[test]
-    fn rank_tracker_requires_lifo_release() {
-        let mut tracker = RankTracker::new();
-        assert_eq!(tracker.enter(LockRank::OBJECT, 1), Ok(()));
-        assert_eq!(tracker.enter(LockRank::OBJECT, 2), Ok(()));
-        assert_eq!(
-            tracker.leave(LockRank::OBJECT, 1),
-            Err(LockRankError::UnbalancedRelease)
-        );
     }
 }
