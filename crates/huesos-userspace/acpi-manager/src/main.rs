@@ -8,9 +8,10 @@
 #![no_main]
 
 use core::panic::PanicInfo;
+use huesos_abi::acpi_archive::PhysicalIndex;
 use huesos_abi::acpi_broker::{
-    MAX_ARCHIVE_BYTES, MAX_TABLE_BYTES, MAX_TABLES, TABLE_ARCHIVE_ENTRY_BYTES,
-    TABLE_ARCHIVE_HEADER_BYTES, TABLE_ARCHIVE_MAGIC, VERSION,
+    MAX_ARCHIVE_BYTES, MAX_TABLE_BYTES, MAX_TABLES, TableArchiveEntry,
+    TABLE_ARCHIVE_ENTRY_BYTES, TABLE_ARCHIVE_HEADER_BYTES, TABLE_ARCHIVE_MAGIC, VERSION,
 };
 use libcanvas::{Channel, ErrorCode, Vmo, println};
 
@@ -28,10 +29,10 @@ pub extern "C" fn _start() -> ! {
         libcanvas::process::exit(-1);
     };
     match validate_archive(&archive) {
-        Ok((table_count, physical_count)) => {
+        Ok((table_count, index)) => {
             println!(
-                "[acpi-manager] validated {} ACPI tables, {} physical mappings",
-                table_count, physical_count
+                "[acpi-manager] validated {} ACPI tables, {} physical ranges indexed",
+                table_count, index.len()
             );
         }
         Err(error) => {
@@ -130,7 +131,7 @@ impl ArchiveError {
     }
 }
 
-fn validate_archive(vmo: &Vmo) -> Result<(u32, u32), ArchiveError> {
+fn validate_archive(vmo: &Vmo) -> Result<(u32, PhysicalIndex), ArchiveError> {
     let mut header = [0u8; TABLE_ARCHIVE_HEADER_BYTES as usize];
     read_exact(vmo, 0, &mut header)?;
     if header[..8] != TABLE_ARCHIVE_MAGIC
@@ -156,37 +157,44 @@ fn validate_archive(vmo: &Vmo) -> Result<(u32, u32), ArchiveError> {
     }
 
     let mut previous_end = metadata_end;
-    let mut physical_count = 0u32;
+    let mut index = PhysicalIndex::empty();
     let mut raw = [0u8; TABLE_ARCHIVE_ENTRY_BYTES];
-    for index in 0..count {
+    for index_in_archive in 0..count {
         let offset = u64::from(TABLE_ARCHIVE_HEADER_BYTES)
-            + u64::from(index) * TABLE_ARCHIVE_ENTRY_BYTES as u64;
+            + u64::from(index_in_archive) * TABLE_ARCHIVE_ENTRY_BYTES as u64;
         read_exact(vmo, offset, &mut raw)?;
-        if raw[5..8] != [0; 3] {
+        // SAFETY: raw is a 32-byte buffer matching TableArchiveEntry's repr(C)
+        // layout; read_unaligned tolerates the unaligned slice base.
+        let entry: TableArchiveEntry =
+            unsafe { core::ptr::read_unaligned(raw.as_ptr().cast::<TableArchiveEntry>()) };
+        if entry.reserved != [0; 3] {
             return Err(ArchiveError::Header);
         }
-        let physical_address = u64_at(&raw, 8)?;
-        let table_offset = u64_at(&raw, 16)?;
-        let table_length = u32_at(&raw, 24)?;
-        if !(36..=MAX_TABLE_BYTES).contains(&table_length) || table_offset < previous_end {
+        if !(36..=MAX_TABLE_BYTES).contains(&entry.length) || entry.offset < metadata_end {
             return Err(ArchiveError::Range);
         }
-        if physical_address != 0 {
-            if physical_address
-                .checked_add(u64::from(table_length))
+        if entry.physical_address != 0
+            && entry
+                .physical_address
+                .checked_add(u64::from(entry.length))
                 .is_none()
-            {
-                return Err(ArchiveError::Range);
-            }
-            physical_count = physical_count
-                .checked_add(1)
-                .ok_or(ArchiveError::Count)?;
+        {
+            return Err(ArchiveError::Range);
         }
-        let end = table_offset
-            .checked_add(u64::from(table_length))
+        if entry.offset < previous_end {
+            return Err(ArchiveError::Range);
+        }
+        let end = entry
+            .offset
+            .checked_add(u64::from(entry.length))
             .ok_or(ArchiveError::Range)?;
         if end > total_size {
             return Err(ArchiveError::Range);
+        }
+        // Only firmware physical ranges back the deny-by-default map index
+        // that the future Ring-3 uACPI map callback must consult.
+        if entry.physical_address != 0 {
+            let _ = index.insert(entry.physical_address, u64::from(entry.length));
         }
         previous_end = end;
     }
@@ -194,7 +202,7 @@ fn validate_archive(vmo: &Vmo) -> Result<(u32, u32), ArchiveError> {
         let mut probe = [0u8; 1];
         read_exact(vmo, total_size - 1, &mut probe)?;
     }
-    Ok((count, physical_count))
+    Ok((count, index))
 }
 
 fn read_exact(vmo: &Vmo, offset: u64, output: &mut [u8]) -> Result<(), ArchiveError> {

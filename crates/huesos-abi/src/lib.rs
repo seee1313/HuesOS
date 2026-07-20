@@ -18,6 +18,13 @@
 /// Ring-3 ACPI manager broker and immutable table-archive protocol.
 pub mod acpi_broker;
 
+/// Immutable ACPI table-archive decoding and physical-address index.
+///
+/// Used by both the kernel archive builder and the Ring-3 `acpi-manager` to
+/// agree on one decoded view and to consult the deny-by-default physical
+/// range index before any userspace mapping.
+pub mod acpi_archive;
+
 /// Syscall number enumeration. The numeric value (not the variant name) is
 /// what actually crosses the ABI boundary in `rax`, so **never remove or
 /// reorder a variant** — only ever append new ones. Removing a syscall
