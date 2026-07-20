@@ -35,6 +35,7 @@ test:
 		-p huesos-syscalls -p huesos-fat -p huesos-alloc -p huesos-uacpi -p huesos-kernel \
 		-p huesos-lifecycle \
 		-p huesos-ioapic \
+		-p huesos-extable \
 		--target x86_64-unknown-linux-gnu -Z build-std=
 
 audit:
