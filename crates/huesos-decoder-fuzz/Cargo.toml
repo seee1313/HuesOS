@@ -1,0 +1,9 @@
+[package]
+name = "huesos-decoder-fuzz"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+huesos-abi = { path = "../huesos-abi" }

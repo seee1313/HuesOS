@@ -1,0 +1,40 @@
+name: HuesOS sanitizers
+
+# Extended CI (Task #11) + fuzzing/sanitizer coverage (Task #12): run the
+# host-testable crate suite under AddressSanitizer so memory-safety bugs in
+# the decoders, the Ring-3 ACPI broker, and the object model are caught
+# automatically. The huesos-decoder-fuzz crate (randomized decoder harness)
+# is exercised here as well, complementing the unit tests.
+
+on:
+  push:
+    branches: [main, "huesos-dev/**", "huesos-dev-**"]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sanitizers-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  address-sanitizer:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install nightly-2026-03-01 --profile minimal \
+            --component rust-src,llvm-tools-preview
+          rustup default nightly-2026-03-01
+      - name: AddressSanitizer host tests
+        env:
+          CARGO_BUILD_JOBS: "1"
+          RUSTFLAGS: "-Zsanitizer=address"
+        run: |
+          cargo test -p huesos-abi -p huesos-arch -p huesos-elf -p huesos-pmm \
+            -p huesos-object -p huesos-fb -p huesos-syscalls -p huesos-fat \
+            -p huesos-alloc -p huesos-uacpi -p huesos-kernel -p huesos-decoder-fuzz \
+            --target x86_64-unknown-linux-gnu -Z build-std=
