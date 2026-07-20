@@ -18,6 +18,7 @@ mod koid;
 mod object;
 mod port;
 mod process;
+mod supervision;
 mod registry;
 mod thread;
 mod vmar;
@@ -33,6 +34,7 @@ pub use koid::{alloc_koid, Koid};
 pub use object::{KernelObject, KernelObjectExt, ObjectType};
 pub use port::{Port, PortPacket};
 pub use process::Process;
+pub use supervision::{CrashThrottle, SupervisionAction, SupervisionDecision};
 pub(crate) use registry::phys_to_virt;
 pub use registry::{
     collect_exited_process, current_process, lookup_interrupts_by_irq, lookup_object,
