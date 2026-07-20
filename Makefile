@@ -31,7 +31,7 @@ run-release: iso-release
 	bash scripts/run.sh release
 
 test:
-	cargo test -p huesos-arch -p huesos-elf -p huesos-pmm -p huesos-object -p huesos-fb \
+	cargo test -p huesos-abi -p huesos-arch -p huesos-elf -p huesos-pmm -p huesos-object -p huesos-fb \
 		-p huesos-syscalls -p huesos-fat -p huesos-alloc -p huesos-uacpi -p huesos-kernel \
 		--target x86_64-unknown-linux-gnu -Z build-std=
 
