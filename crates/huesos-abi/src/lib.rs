@@ -25,6 +25,11 @@ pub mod acpi_broker;
 /// range index before any userspace mapping.
 pub mod acpi_archive;
 
+/// Deny-by-default policy primitives for the Ring-3 ACPI broker: an
+/// append-only audit ring and a fixed-window rate limiter. Pure, `no_std`,
+/// and exercised directly by host tests.
+pub mod broker_policy;
+
 /// Syscall number enumeration. The numeric value (not the variant name) is
 /// what actually crosses the ABI boundary in `rax`, so **never remove or
 /// reorder a variant** — only ever append new ones. Removing a syscall
