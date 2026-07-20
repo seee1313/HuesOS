@@ -339,6 +339,7 @@ fn install_acpi_broker(
     let broker = huesos_object::AcpiBroker::with_policy(
         system_io,
         alloc::vec::Vec::new(),
+        alloc::vec::Vec::new(),
         false,
         false,
     );

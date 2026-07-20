@@ -37,11 +37,25 @@ pub struct PciFunctionGrant {
     pub write: bool,
 }
 
+/// One firmware MMIO range granted to the ACPI manager.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MmioGrant {
+    /// First byte of the granted MMIO range (firmware physical address).
+    pub base: u64,
+    /// Length of the granted range in bytes.
+    pub length: u64,
+    /// Reads are permitted.
+    pub read: bool,
+    /// Writes are permitted.
+    pub write: bool,
+}
+
 /// Immutable authority consulted before privileged ACPI broker operations.
 pub struct AcpiBroker {
     koid: Koid,
     system_io: Vec<SystemIoGrant>,
     pci: Vec<PciFunctionGrant>,
+    mmio: Vec<MmioGrant>,
     allow_reset: bool,
     allow_power_off: bool,
 }
@@ -49,7 +63,7 @@ pub struct AcpiBroker {
 impl AcpiBroker {
     /// Construct a broker with no privileged grants.
     pub fn deny_all() -> Arc<Self> {
-        Self::with_policy(Vec::new(), Vec::new(), false, false)
+        Self::with_policy(Vec::new(), Vec::new(), Vec::new(), false, false)
     }
 
     /// Construct an immutable broker policy from firmware-derived grants.
@@ -57,6 +71,7 @@ impl AcpiBroker {
     pub fn with_policy(
         system_io: Vec<SystemIoGrant>,
         pci: Vec<PciFunctionGrant>,
+        mmio: Vec<MmioGrant>,
         allow_reset: bool,
         allow_power_off: bool,
     ) -> Arc<Self> {
@@ -64,6 +79,7 @@ impl AcpiBroker {
             koid: alloc_koid(),
             system_io,
             pci,
+            mmio,
             allow_reset,
             allow_power_off,
         })
@@ -74,6 +90,7 @@ impl AcpiBroker {
         match request.opcode {
             Opcode::SystemIoRead | Opcode::SystemIoWrite => self.authorizes_system_io(request),
             Opcode::PciRead | Opcode::PciWrite => self.authorizes_pci(request),
+            Opcode::MmioRead | Opcode::MmioWrite => self.authorizes_mmio(request),
             Opcode::Reset => self.allow_reset,
             Opcode::PowerOff => self.allow_power_off,
             Opcode::InstallInterrupt | Opcode::RemoveInterrupt => false,
@@ -97,6 +114,24 @@ impl AcpiBroker {
                 _ => false,
             };
             operation_allowed && port >= grant.base && end <= grant_end
+        })
+    }
+
+    fn authorizes_mmio(&self, request: &ValidRequest) -> bool {
+        let start = request.address;
+        let Some(end) = start.checked_add(request.width as u64) else {
+            return false;
+        };
+        self.mmio.iter().any(|grant| {
+            let Some(grant_end) = grant.base.checked_add(grant.length) else {
+                return false;
+            };
+            let operation_allowed = match request.opcode {
+                Opcode::MmioRead => grant.read,
+                Opcode::MmioWrite => grant.write,
+                _ => false,
+            };
+            operation_allowed && start >= grant.base && end <= grant_end
         })
     }
 
@@ -168,6 +203,7 @@ mod tests {
                 write: false,
             }],
             Vec::new(),
+            Vec::new(),
             false,
             false,
         );
@@ -189,5 +225,49 @@ mod tests {
         .validate();
         assert!(read.as_ref().is_ok_and(|request| broker.authorizes(request)));
         assert!(write.as_ref().is_ok_and(|request| !broker.authorizes(request)));
+    }
+
+    #[test]
+    fn mmio_grant_is_exact_and_directional() {
+        let broker = AcpiBroker::with_policy(
+            Vec::new(),
+            Vec::new(),
+            alloc::vec![MmioGrant {
+                base: 0xFEC0_0000,
+                length: 0x1000,
+                read: true,
+                write: false,
+            }],
+            false,
+            false,
+        );
+        let read = Request {
+            version: VERSION,
+            opcode: Opcode::MmioRead as u16,
+            width: 4,
+            address: 0xFEC0_0004,
+            ..Request::default()
+        }
+        .validate();
+        let write = Request {
+            version: VERSION,
+            opcode: Opcode::MmioWrite as u16,
+            width: 4,
+            address: 0xFEC0_0004,
+            ..Request::default()
+        }
+        .validate();
+        assert!(read.as_ref().is_ok_and(|request| broker.authorizes(request)));
+        assert!(write.as_ref().is_ok_and(|request| !broker.authorizes(request)));
+        // A read starting outside the granted range is denied.
+        let outside = Request {
+            version: VERSION,
+            opcode: Opcode::MmioRead as u16,
+            width: 4,
+            address: 0xFEC1_0000,
+            ..Request::default()
+        }
+        .validate();
+        assert!(outside.as_ref().is_ok_and(|request| !broker.authorizes(request)));
     }
 }
