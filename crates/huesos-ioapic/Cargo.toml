@@ -1,0 +1,12 @@
+[package]
+name = "huesos-ioapic"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# Host-testable, dependency-free policy and data-plane primitives for I/O APIC
+# interrupt routing (ROADMAP Immediate #2): redirection-entry codec, MADT
+# Interrupt Source Override parsing/resolution, device-vector allocation, and
+# GSI -> I/O APIC selection. Pure `no_std` + `core` only; the privileged MMIO
+# register access stays in huesos-arch and is verified on-target.
+[dependencies]
