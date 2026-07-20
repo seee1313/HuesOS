@@ -15,6 +15,7 @@ members = [
     "crates/huesos-fat",
     "crates/huesos-uacpi",
     "crates/huesos-decoder-fuzz",
+    "crates/huesos-lifecycle",
 ]
 resolver = "2"
 exclude = ["tools"]
