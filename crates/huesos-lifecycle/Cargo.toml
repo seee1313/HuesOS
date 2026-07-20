@@ -1,0 +1,11 @@
+[package]
+name = "huesos-lifecycle"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# Host-testable, dependency-free policy primitives for kernel object / task
+# lifecycle accounting (bounded reclamation of finished-task metadata and
+# strong/weak collection decisions). Pure `no_std` + `core` only, so it builds
+# for the kernel target and runs host tests without hardware or an allocator.
+[dependencies]
