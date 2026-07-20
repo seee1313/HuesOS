@@ -208,6 +208,13 @@ HuesOS/
 └── Makefile
 ```
 
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the contribution rules. They are
+strict: the safety budget (`make audit-check`) must not regress, privileged
+crates use ranked locks only, host-testable logic must be host-tested, and no
+change may claim verification it did not perform.
+
 ## License
 
 HuesOS kernel and native Rust crates are MIT. The separately built DoomGeneric
