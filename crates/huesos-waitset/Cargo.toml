@@ -1,0 +1,12 @@
+[package]
+name = "huesos-waitset"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# Host-testable, dependency-free policy for multiplexed multi-object waits
+# (ROADMAP Immediate #4): signal sets, a bounded wait set, Any/All dispatch,
+# cancellation, and tick deadlines. Pure `no_std` + `core` only. The privileged
+# blocking syscalls / scheduler park-wake wiring stays in the kernel and is
+# verified on-target.
+[dependencies]
