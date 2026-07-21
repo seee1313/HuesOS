@@ -1,0 +1,12 @@
+[package]
+name = "huesos-extable"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# Host-testable, dependency-free exception/fixup table for recoverable kernel
+# user-copies (ROADMAP Immediate #1). Pure `no_std` + `core` only: the table is
+# a sorted, non-overlapping set of [start_rip, end_rip) -> fixup_rip ranges with
+# binary-search lookup. The privileged page-fault handler in huesos-arch
+# consults it on a kernel-mode fault; that integration is verified on-target.
+[dependencies]
