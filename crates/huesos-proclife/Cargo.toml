@@ -1,0 +1,13 @@
+[package]
+name = "huesos-proclife"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# Host-testable, dependency-free process lifecycle state machine (ROADMAP
+# Short-Term #5: multiple/dynamic userspace processes). Models per-process
+# state transitions, exit-status capture, waiter coordination for blocking
+# exit waits / port signals, and reap eligibility. Pure `no_std` + `core` only.
+# The privileged wiring into the scheduler/process subsystem is verified
+# on-target.
+[dependencies]
