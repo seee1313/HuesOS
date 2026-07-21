@@ -383,6 +383,57 @@ pub fn yield_now() -> impl Future<Output = ()> {
     Yield { yielded: false }
 }
 
+// --- block_on: drive a single future to completion ---
+
+static FLAG_VTABLE: RawWakerVTable =
+    RawWakerVTable::new(flag_clone, flag_wake, flag_wake_by_ref, flag_drop);
+
+unsafe fn flag_clone(data: *const ()) -> RawWaker {
+    RawWaker::new(data, &FLAG_VTABLE)
+}
+unsafe fn flag_wake(data: *const ()) {
+    // SAFETY: `data` points at the `Cell<bool>` living on `block_on`'s stack for
+    // the duration of the drive; single-threaded, so the set is race-free.
+    (*(data.cast::<core::cell::Cell<bool>>())).set(true);
+}
+unsafe fn flag_wake_by_ref(data: *const ()) {
+    flag_wake(data);
+}
+unsafe fn flag_drop(_data: *const ()) {}
+
+/// Drive a single future to completion.
+///
+/// Polls `fut` until it is ready. When the future is pending and has not woken
+/// itself, `park` is called (the driver uses this to process device completions
+/// or wait for an interrupt) before re-polling. The future may borrow its
+/// environment (it need not be `'static`), since it is polled in place and never
+/// moved.
+pub fn block_on<O>(fut: impl Future<Output = O>, mut park: impl FnMut()) -> O {
+    use core::cell::Cell;
+    let woken = Cell::new(true);
+    // SAFETY: the waker only touches `woken`, which outlives every poll below.
+    let waker = unsafe {
+        Waker::from_raw(RawWaker::new(
+            &woken as *const Cell<bool> as *const (),
+            &FLAG_VTABLE,
+        ))
+    };
+    let mut cx = Context::from_waker(&waker);
+    let mut future = fut;
+    // SAFETY: `future` is pinned on the stack for the whole drive; never moved.
+    let mut pinned = unsafe { Pin::new_unchecked(&mut future) };
+    loop {
+        woken.set(false);
+        if let Poll::Ready(out) = pinned.as_mut().poll(&mut cx) {
+            return out;
+        }
+        if !woken.get() {
+            park();
+            woken.set(true);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     //! Host tests for the executor. No `unwrap`/`expect`/`panic!` (results are
@@ -615,5 +666,30 @@ mod tests {
             // ex drops here with one live (parked) future holding `guard`.
         }
         assert_eq!(DROPPED.load(Ordering::SeqCst), 1);
+    }
+
+    // --- block_on ---
+
+    #[test]
+    fn block_on_drives_a_yielding_future() {
+        static POLLS: AtomicU32 = AtomicU32::new(0);
+        POLLS.store(0, Ordering::SeqCst);
+        let parks = AtomicU32::new(0);
+        // A future that yields once (wakes itself) then completes; block_on
+        // re-polls it via the waker without ever needing to park.
+        let out = block_on(
+            async {
+                POLLS.fetch_add(1, Ordering::SeqCst);
+                yield_now().await;
+                POLLS.fetch_add(1, Ordering::SeqCst);
+                42
+            },
+            || {
+                parks.fetch_add(1, Ordering::SeqCst);
+            },
+        );
+        assert_eq!(out, 42);
+        assert_eq!(POLLS.load(Ordering::SeqCst), 2);
+        assert_eq!(parks.load(Ordering::SeqCst), 0);
     }
 }
