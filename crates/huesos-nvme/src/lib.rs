@@ -17,8 +17,14 @@
 #![cfg_attr(not(test), no_std)]
 #![warn(missing_docs)]
 
+extern crate alloc;
+
 pub mod cmd;
+pub mod controller;
 pub mod prp;
 pub mod regs;
+pub mod transport;
 
 pub use cmd::{Cqe, Sqe};
+pub use controller::{Controller, NvmeError};
+pub use transport::{MockNvme, NvmeTransport};
