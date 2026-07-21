@@ -36,6 +36,7 @@ test:
 		-p huesos-lifecycle \
 		-p huesos-ioapic \
 		-p huesos-extable \
+		-p huesos-waitset \
 		--target x86_64-unknown-linux-gnu -Z build-std=
 
 audit:
