@@ -20,6 +20,7 @@ members = [
     "crates/huesos-extable",
     "crates/huesos-waitset",
     "crates/huesos-proclife",
+    "crates/huesos-handlemove",
 ]
 resolver = "2"
 exclude = ["tools"]
