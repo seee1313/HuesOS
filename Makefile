@@ -40,6 +40,7 @@ test:
 		-p huesos-proclife \
 		-p huesos-handlemove \
 		-p hues-async \
+		-p huesos-nvme \
 		--target x86_64-unknown-linux-gnu -Z build-std=
 
 audit:

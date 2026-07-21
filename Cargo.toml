@@ -22,6 +22,7 @@ members = [
     "crates/huesos-proclife",
     "crates/huesos-handlemove",
     "crates/hues-async",
+    "crates/huesos-nvme",
 ]
 resolver = "2"
 exclude = ["tools"]
