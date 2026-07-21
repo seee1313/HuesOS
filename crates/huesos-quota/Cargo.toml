@@ -1,0 +1,11 @@
+[package]
+name = "huesos-quota"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# Host-testable resource-quota model for capability/resource limits (ROADMAP
+# Medium-Term #8). Per-object limits (memory, handles, CPU) plus hierarchical
+# Job-tree enforcement (a node's acquisition is checked against its own limit
+# and every ancestor's subtree usage). Pure no_std + core; budget-neutral.
+[dependencies]
