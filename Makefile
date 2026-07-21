@@ -38,6 +38,7 @@ test:
 		-p huesos-extable \
 		-p huesos-waitset \
 		-p huesos-proclife \
+		-p huesos-handlemove \
 		--target x86_64-unknown-linux-gnu -Z build-std=
 
 audit:

@@ -1,0 +1,12 @@
+[package]
+name = "huesos-handlemove"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# Host-testable, dependency-free model of handle-transfer semantics (ROADMAP
+# Short-Term #6): capability rights that can only be preserved or reduced,
+# typed dispositions (Move/Duplicate), and an all-or-nothing (transactional)
+# transfer with rollback on validation failure. Pure `no_std` + `core` only.
+# The privileged wiring into the channel send path is verified on-target.
+[dependencies]
