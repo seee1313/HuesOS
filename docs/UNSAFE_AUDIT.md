@@ -265,3 +265,55 @@ policy crates; the other regression-key totals are unchanged. The Ring-0
 invariants above are intentionally retained; reducing them further (e.g. typed
 errors in paging/PMM) is on-target-affecting work tracked under the remaining
 boundaries.
+
+## hues-async executor boundary (dedicated safety-budget review)
+
+`hues-async` is a minimal, allocation-free, futures-based executor for ring-3
+drivers (ROADMAP Short-Term #7). Storing heterogeneous `Future`s in a fixed-
+capacity table without a heap requires type erasure, and a no-alloc `Waker`
+requires raw pointers; this is the irreducible `unsafe` for the design (the
+same technique used by established no-alloc executors). The surface is small
+and every site carries a `SAFETY:` comment.
+
+Budget delta (this review): `unsafe_blocks` 213 -> 218 (+5), `unsafe_functions`
+43 -> 51 (+6 functions, counted as +8 textually because the two `PollFn`/
+`DropFn` type aliases also spell `unsafe fn`), `unsafe_impls` unchanged, no new
+`unwrap`/`expect`/`panic!` (the only `assert!` is a compile-time capacity
+guard).
+
+### Type-erased inline futures
+
+- `poll_impl::<Fut>` / `drop_impl::<Fut>` (`unsafe fn`): cast the type-erased
+  storage pointer back to the concrete `Fut`. `poll_impl` polls it through
+  `Pin::new_unchecked`; `drop_impl` runs `ptr::drop_in_place` exactly once.
+  - **Invariant:** the future is *pinned* in its slot — placed inline by
+    `spawn` and never moved while alive, dropped in place. The slot is stable
+    (fixed array in the executor; the executor is contracted to not move after
+    the first spawn).
+- `spawn` placement block: writes the future into the inline `Storage` after
+  checking `size_of::<Fut>() <= F` and `align_of::<Fut>() <= 16`; `Storage` is
+  `#[repr(C, align(16))]`, so the write is valid and aligned.
+- `poll` blocks: build the `Waker` via `Waker::from_raw` from a pointer to the
+  slot's stable `WakeState`, and invoke the stored type-erased poll/drop
+  pointer. Slot occupancy (`poll_fn` is `Some`) is checked before use, and a
+  completed task's slot is freed and its generation bumped (invalidating any
+  outstanding wakers/ids).
+- `Drop for Executor` block: drops any still-live futures during teardown so
+  they are not leaked; `&mut self` guarantees exclusive access.
+
+### No-alloc waker
+
+- `waker_clone` / `waker_wake` / `waker_wake_by_ref` / `waker_drop` are
+  `unsafe fn` (the signatures `RawWakerVTable` requires). `waker_wake_by_ref`
+  dereferences the per-slot `WakeState` pointer (valid for the executor's
+  lifetime) and sets the task's ready bit in the `u64` mask.
+  - **Invariant:** the executor is single-threaded, so the read-modify-write of
+    the ready mask is race-free. A spurious set of a freed slot's bit is
+    harmless (the run loop checks occupancy before polling).
+
+### Why this cannot be reached by malformed input
+
+The executor only ever runs the driver's own `Future`s in its own ring-3
+process; no userspace or firmware data is interpreted by these `unsafe` sites.
+The size/alignment checks and the generation/occupancy guards are defensive
+against driver programming errors, not against an attacker.
