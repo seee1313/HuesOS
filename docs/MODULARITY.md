@@ -81,3 +81,25 @@ The DriverManager also owns the first filesystem service modules:
 `crates/huesos-userspace/driver-host-input/` is the first DriverHost process.
 It hosts the DriverManager-managed MVP keyboard service, binds IRQ1 to a Port, and reports
 readiness/heartbeats to DriverManager.
+
+## Host-testable policy crates
+
+A recurring modularization pattern is extracting the *decision/encoding* logic
+out of privileged paths into standalone `no_std`, dependency-free, host-tested
+crates. This keeps the kernel's `unsafe`/MMIO surface narrow and makes the logic
+unit-testable without QEMU:
+
+- `huesos-lifecycle` — object/task lifecycle: bounded zombie reclamation and the
+  two-counter (handle/kernel refs) collection model.
+- `huesos-ioapic` — I/O APIC routing: redirection-entry codec, MADT Interrupt
+  Source Override parsing, device-vector allocation, GSI→I/O APIC routing.
+- `huesos-extable` — exception/fixup table for recoverable user-copies.
+- `huesos-waitset` — multi-object wait dispatch (Any/All, cancel, timeout).
+- `huesos-proclife` — per-process lifecycle state machine (exit/wait/reap).
+- `huesos-handlemove` — handle-transfer semantics (rights monotonicity,
+  all-or-nothing transactional transfer).
+- `huesos-decoder-fuzz` — a randomized harness for the ACPI decoders.
+
+Each policy crate documents its intended privileged integration (and what still
+needs on-target verification) in its own `docs/` page; the privileged
+integrations themselves are tracked in [ROADMAP.md](ROADMAP.md).

@@ -40,7 +40,16 @@ crates/
 ├── huesos-fb          # Framebuffer driver (bounds-checked blit)
 ├── huesos-syscalls    # Syscall dispatch
 ├── huesos-elf         # ELF64 loader
+├── huesos-uacpi       # uACPI integration: table archive, Ring-3 broker boundary
 ├── huesos-kernel      # Scheduler (Fair/Deadline), SMP, process/thread, HBI parse
+├── huesos-user-alloc  # Userspace allocator
+├── huesos-lifecycle   # Policy: object/task lifecycle, bounded zombie reclamation
+├── huesos-ioapic      # Policy: I/O APIC routing (redirection codec, ISO, vectors)
+├── huesos-extable     # Policy: exception/fixup table for recoverable copies
+├── huesos-waitset     # Policy: multi-object wait (Any/All, cancel, timeout)
+├── huesos-proclife    # Policy: process lifecycle state machine (exit/wait/reap)
+├── huesos-handlemove  # Policy: handle-transfer semantics (rights, atomic move)
+├── huesos-decoder-fuzz # Host fuzz harness for ACPI decoders
 └── huesos-userspace/
     ├── libcanvas      # Safe userspace syscall library
     ├── init           # ring3 init
@@ -49,6 +58,12 @@ crates/
 ```
 
 Tools (outside the no_std workspace): `tools/hbi-gen` builds HBI v2.1 images.
+
+The `Policy:` crates are host-testable decision/encoding models extracted from
+the privileged paths (see the [README](../README.md) and
+[ROADMAP.md](ROADMAP.md)). They are `no_std`, dependency-free, and unit-tested
+on the host, but are not yet wired into the running kernel; each one's `docs/`
+page describes the intended privileged integration.
 
 ## Boot Flow
 

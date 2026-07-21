@@ -116,6 +116,15 @@ Default `scripts/run.sh` uses `-smp 2`.
   lifetime/resource quota enforcement is not yet complete
 - Framebuffer text is ASCII-only (no Unicode shaping, by design)
 
+> Note: several of the items above (I/O APIC routing, object/task teardown,
+> multi-object waits, process lifecycle, handle-transfer semantics) now have
+> host-testable **policy cores** in dedicated crates (`huesos-ioapic`,
+> `huesos-lifecycle`, `huesos-waitset`, `huesos-proclife`,
+> `huesos-handlemove`, `huesos-extable`). These model the decisions/encodings
+> but do not yet change the running kernel; the limitations above describe the
+> kernel's current on-target behavior, which is unchanged until those cores are
+> integrated and verified.
+
 ## Hardware Compatibility
 
 See [docs/HARDWARE.md](docs/HARDWARE.md) for real-machine smoke-test notes.
@@ -161,7 +170,14 @@ hardening effort is tracked in
 [docs/UNSAFE_AUDIT.md](docs/UNSAFE_AUDIT.md),
 [docs/OBJECT_LIFECYCLE.md](docs/OBJECT_LIFECYCLE.md),
 [docs/VMAR_TRANSACTIONS.md](docs/VMAR_TRANSACTIONS.md), and
-[docs/ALLOCATOR_HARDENING.md](docs/ALLOCATOR_HARDENING.md).
+[docs/ALLOCATOR_HARDENING.md](docs/ALLOCATOR_HARDENING.md). The host-testable
+policy crates are each documented in
+[docs/OBJECT_LIFECYCLE_POLICY.md](docs/OBJECT_LIFECYCLE_POLICY.md),
+[docs/IOAPIC_ROUTING.md](docs/IOAPIC_ROUTING.md),
+[docs/RECOVERABLE_COPIES.md](docs/RECOVERABLE_COPIES.md),
+[docs/MULTI_OBJECT_WAIT.md](docs/MULTI_OBJECT_WAIT.md),
+[docs/DYNAMIC_PROCESSES.md](docs/DYNAMIC_PROCESSES.md), and
+[docs/HANDLE_TRANSFER.md](docs/HANDLE_TRANSFER.md).
 
 ## Building
 
@@ -192,7 +208,16 @@ HuesOS/
 │   ├── huesos-fb          # Framebuffer driver: pixel/rect/text/blit primitives
 │   ├── huesos-syscalls    # Syscall dispatch table
 │   ├── huesos-elf         # ELF64 loader
+│   ├── huesos-uacpi       # uACPI integration: table archive, Ring-3 broker boundary
 │   ├── huesos-kernel      # Scheduler (Fair/Deadline), SMP, process/thread, HBI parse
+│   ├── huesos-user-alloc  # Userspace allocator
+│   ├── huesos-lifecycle   # Policy: object/task lifecycle, bounded zombie reclamation
+│   ├── huesos-ioapic      # Policy: I/O APIC routing (redirection codec, ISO, vectors)
+│   ├── huesos-extable     # Policy: exception/fixup table for recoverable copies
+│   ├── huesos-waitset     # Policy: multi-object wait (Any/All, cancel, timeout)
+│   ├── huesos-proclife    # Policy: process lifecycle state machine (exit/wait/reap)
+│   ├── huesos-handlemove  # Policy: handle-transfer semantics (rights, atomic move)
+│   ├── huesos-decoder-fuzz # Host fuzz harness for ACPI decoders
 │   └── huesos-userspace/
 │       ├── libcanvas      # Safe userspace syscall library (the only sanctioned way in)
 │       ├── init           # Real ring3 userspace init
@@ -207,6 +232,13 @@ HuesOS/
 ├── x86_64-huesos.json     # Kernel target spec (ELF, higher-half)
 └── Makefile
 ```
+
+The `Policy:` crates are host-testable decision/encoding models extracted from
+the privileged kernel paths as part of the ongoing hardening effort (see
+[docs/ROADMAP.md](docs/ROADMAP.md)). They are `no_std`, dependency-free, and
+unit-tested on the host, but are **not yet wired into the running kernel** —
+each one's `docs/` page describes its intended privileged integration and what
+still requires on-target (QEMU/bare-metal) verification.
 
 ## Contributing
 

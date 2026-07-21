@@ -23,6 +23,14 @@ This runs, e.g.:
   null guard, kernel half, overflow, upper-bound crossing, and a legal range
   crossing a 4 KiB boundary. Page-table permission tests require QEMU because
   they inspect the active CR3.
+- The host-testable **policy crates** (`huesos-lifecycle`, `huesos-ioapic`,
+  `huesos-extable`, `huesos-waitset`, `huesos-proclife`, `huesos-handlemove`)
+  are pure decision/encoding models with focused host suites: lifecycle
+  reaping + collection accounting, redirection-entry round-trip + MADT source
+  override parsing + vector allocation + GSI routing, fixup-table lookup,
+  multi-object wait dispatch (Any/All/cancel/timeout), the process lifecycle
+  state machine, and all-or-nothing transactional handle transfer.
+  `huesos-decoder-fuzz` is a randomized ACPI-decoder harness.
 
 Crates tied to real hardware (`huesos-arch`, SMP, full process/scheduler)
 are validated by QEMU boots rather than host mocks.
