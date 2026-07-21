@@ -39,6 +39,7 @@ test:
 		-p huesos-waitset \
 		-p huesos-proclife \
 		-p huesos-handlemove \
+		-p hues-async \
 		--target x86_64-unknown-linux-gnu -Z build-std=
 
 audit:

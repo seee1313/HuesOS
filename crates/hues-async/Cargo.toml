@@ -1,0 +1,12 @@
+[package]
+name = "hues-async"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# Minimal, allocation-free, futures-based async executor for fast ring-3
+# drivers (ROADMAP Short-Term #7). Run-to-completion, single-threaded, fixed
+# capacity: a static task table with inline (type-erased) futures, a u64 ready
+# bitmask, and a no-alloc waker. Designed for the lowest practical overhead so
+# device drivers (e.g. NVMe) can drive I/O without a heavyweight runtime.
+[dependencies]
