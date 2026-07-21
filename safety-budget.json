@@ -1,6 +1,6 @@
 {
-  "rust_files": 119,
-  "rust_lines": 21547,
+  "rust_files": 128,
+  "rust_lines": 25876,
   "totals": {
     "expect_calls": 22,
     "panic_macros": 5,
@@ -9,7 +9,7 @@
     "unsafe_blocks": 213,
     "unsafe_functions": 43,
     "unsafe_impls": 28,
-    "unwrap_calls": 26
+    "unwrap_calls": 25
   },
   "unsafe_by_file": {
     "crates/huesos-abi/src/acpi_archive.rs": 2,
