@@ -1,0 +1,13 @@
+[package]
+name = "huesos-nvme"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# NVMe protocol + driver for a ring-3 DriverHost (ROADMAP Short-Term #7).
+# This first slice is the host-testable protocol foundation: controller
+# register map, submission/completion queue entry structures + opcodes/status,
+# queue index/phase management, and PRP layout. Pure `no_std` + `core`.
+# The async controller, block service, and kernel MMIO/DMA plumbing build on
+# top (documented in docs/NVME.md).
+[dependencies]
