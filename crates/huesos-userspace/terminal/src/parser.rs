@@ -56,7 +56,9 @@ impl<'src> Parser<'src> {
                     break;
                 }
                 Some(Ok(Token::Word(_))) | Some(Ok(Token::Quoted(_))) => {
-                    let token = self.tokens.next().unwrap();
+                    let Some(token) = self.tokens.next() else {
+                        return Err(ParseError::InvalidToken);
+                    };
                     let arg = match token {
                         Ok(Token::Word(word)) | Ok(Token::Quoted(word)) => normalize_atom(word),
                         _ => return Err(ParseError::InvalidToken),

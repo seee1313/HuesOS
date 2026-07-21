@@ -176,3 +176,92 @@ comment:
 
 Unsafe added only to silence the compiler or wrap a safe syscall helper is not
 accepted.
+
+## Panicking-surface audit (`unwrap` / `expect` / `panic!`)
+
+Companion to the unsafe audit above, this section categorizes the *panicking*
+surface tracked by the safety budget (`tools/audit-safety.py`). After the
+Ring-3 fix below the total is **52**: 25 `unwrap` calls, 22 `expect` calls, and
+5 `panic!` macros. There are no `todo!()`, `unimplemented!()`, or
+`unreachable!()` calls, and no real `TODO/FIXME/HACK` markers (the single grep
+hit is the word "TODO" inside a prose comment in `libcanvas`).
+
+### Build scripts (host, compile-time) -- legitimate
+
+`huesos-kernel/build.rs` and `huesos-userspace/doom/build.rs` use
+`unwrap`/`expect`/`panic!` for environment variables (`CARGO_MANIFEST_DIR`,
+`OUT_DIR`), `fs::read`/`fs::write`, and invoking the userspace `cargo` builds.
+Build scripts run on the host at build time. A build failure SHOULD abort the
+build, so panicking here is correct; none of this is runtime kernel or
+userspace code. (4 `unwrap`, 3 `expect`, 2 `panic!`.)
+
+### Test code -- budgeted, acceptable
+
+The host-test modules in `huesos-abi`, `huesos-alloc`, `huesos-elf`,
+`huesos-fat`, `huesos-fb`, `huesos-object`, `huesos-pmm`, and
+`huesos-kernel::boot::hbi` use `unwrap`/`expect`/`panic!` to assert test
+preconditions. Per `CONTRIBUTING.md`, NEW code must be panic-free in tests
+(using `assert!`/`match`), but these existing budgeted tests are grandfathered
+and are low-value to churn. (21 `unwrap`, 14 `expect`, 1 `panic!`.)
+
+### Ring-0 runtime invariants -- assessed legitimate
+
+Each Ring-0 panicking site is either a fatal-by-design boot/init invariant or an
+explicit contract guard; none is reachable from well-formed userspace input (the
+validated user-copy layer rejects bad pointers before any of these paths):
+
+- `huesos-alloc` (buddy constructor): `.expect("constructor generated an invalid
+  buddy block")`. The constructor's own alignment logic (checked by a
+  `debug_assert`) guarantees valid blocks; failure is a fatal kernel bug.
+- `huesos-arch::x86_64::syscall`: `.expect("invalid STAR segment layout")`. The
+  GDT is constructed specifically to satisfy the STAR selector layout; failure
+  means a GDT bug and is fatal.
+- `huesos-boot`: `.expect("Limine did not provide a memory map")`. Early boot
+  cannot proceed without a memory map; fatal by design. (The adjacent
+  `hhdm_offset` uses `unwrap_or(0)` + `assert!`; both are fatal. Minor style
+  inconsistency, not a defect.)
+- `huesos-object::port`: `.expect("infinite wait")`. `read_blocking` wraps
+  `read_blocking_timeout(0)`, an infinite loop that returns only when a packet
+  arrives; the infinite path never yields `None`, so the expect is an invariant.
+- `huesos-object::registry`: `.expect("phys_to_virt not registered")`.
+  `phys_to_virt` is called only after `set_phys_to_virt` during init; failure is
+  an init-ordering bug and is fatal.
+- `huesos-kernel::scheduler`: `panic!("terminate_current_process called without
+  a userspace process")`. Contract guard: the function must only be invoked for
+  the current userspace process; a violation is a kernel logic bug and takes the
+  SMP panic path.
+- `huesos-kernel`: `panic!("intentional panic requested by HBI cmdline
+  panic_test=1")`. Intentional test hook for the panic screen (a feature).
+
+(5 `expect`, 2 `panic!` in Ring-0 runtime.)
+
+### Ring-3 runtime -- FIXED
+
+`huesos-userspace/terminal/src/parser.rs` called `self.tokens.next().unwrap()`
+immediately after a successful `peek()` of a `Word`/`Quoted` token. The `None`
+arm is formally unreachable given `peek`/`next` consistency, but a panic here
+would kill the terminal userspace process. It is replaced with a defensive
+`let-else` returning `ParseError::InvalidToken` -- the same `let-else` pattern
+already used at the top of the same `parse` function. The change is
+behavior-preserving and removes the only Ring-3 runtime `unwrap`. The terminal
+crate now has no runtime `unwrap`/`expect`/`panic!`.
+
+### Bug-hunt notes (Ring 3 + Ring 0)
+
+- Terminal lexer/AST/parser reviewed: argument-count bounds are enforced
+  (`TooManyArgs`), `normalize_atom`'s quote-stripping slice bounds are valid for
+  ASCII quotes, and no out-of-bounds or panic path remains.
+- No Ring-0 logic bug was identified in this pass. Deeper Ring-0 verification
+  (concurrency, paging/PMM error paths) requires on-target testing (QEMU /
+  bare-metal), which was not available where this audit was authored; the
+  "Remaining high-priority boundaries" section above already tracks the known
+  hardening work (e.g. replacing panic-on-map-failure with typed errors).
+
+### Budget change
+
+`unwrap_calls` 26 -> 25 (terminal parser fix). `safety-budget.json` was
+regenerated, which also updates `rust_files`/`rust_lines` to reflect the merged
+policy crates; the other regression-key totals are unchanged. The Ring-0
+invariants above are intentionally retained; reducing them further (e.g. typed
+errors in paging/PMM) is on-target-affecting work tracked under the remaining
+boundaries.
