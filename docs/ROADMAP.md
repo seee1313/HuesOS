@@ -7,6 +7,31 @@ priority order.
 
 ## Done (recent)
 
+### Host-testable policy cores + contribution rules + safety audit
+- Six `no_std`, dependency-free, host-unit-tested **policy crates** extracted
+  from the privileged paths, each with a `docs/` design page describing its
+  intended kernel integration and what still needs on-target verification:
+  - `huesos-lifecycle` — bounded zombie reclamation + two-counter collection
+    model (Immediate #3).
+  - `huesos-ioapic` — I/O APIC redirection-entry codec, MADT Interrupt Source
+    Override parsing, device-vector allocation, GSI→I/O APIC routing (#2).
+  - `huesos-extable` — exception/fixup table for recoverable user-copies (#1).
+  - `huesos-waitset` — multi-object wait/cancel/timeout dispatch (#4).
+  - `huesos-proclife` — per-process lifecycle state machine and exit/wait/reap
+    coordination (Short-Term #5).
+  - `huesos-handlemove` — rights monotonicity + all-or-nothing transactional
+    handle transfer (Short-Term #6).
+- These model decisions/encodings only; the privileged integrations (I/O APIC
+  MMIO writes, fault-handler fixup, multi-wait syscall, channel send path)
+  remain and need on-target verification.
+- `CONTRIBUTING.md` with strict rules (safety budget, ranked-lock policy,
+  Conventional Commits, host-test requirement, Definition of Done).
+- Panicking-surface audit (`docs/UNSAFE_AUDIT.md`): every `unwrap`/`expect`/
+  `panic!` site categorized (build scripts, budgeted tests, Ring-0 invariants);
+  the one Ring-3 runtime unwrap (terminal parser) replaced with a defensive
+  `let-else`; safety budget tightened (`unwrap_calls` 26 → 25) and the baseline
+  regenerated.
+
 ### Buffered terminal renderer / post-game stall fix
 - Root cause isolated to per-pixel/per-scanline VMO syscalls during Terminal repaint
 - Static 16 MiB userspace shadow framebuffer; no per-frame heap allocation
@@ -88,29 +113,41 @@ priority order.
 ### 1. Recoverable copies, VMAR unmap/protect, and SMEP/SMAP
 - **Current**: syscall copies prevalidate mappings, and Ring-3 faults are
   process-contained. No userspace unmap/protect operation can race a copy yet.
-- **Needed**: exception-table/fixup recovery or address-space locking before
-  exposing VMAR unmap/protect, followed by SMEP/SMAP once explicit copy access
-  windows are ready.
+- **Policy core landed**: `huesos-extable` — host-tested fixup-table data
+  structure and lookup (see [RECOVERABLE_COPIES.md](RECOVERABLE_COPIES.md)).
+- **Needed (on-target)**: install the fault handler that consults the table,
+  add exception-table/fixup recovery or address-space locking before exposing
+  VMAR unmap/protect, then SMEP/SMAP once explicit copy access windows are ready.
 
 ### 2. IOAPIC interrupt routing
 - **Current**: LAPIC timer on all CPUs; keyboard still via legacy PIC path.
-- **Needed**: full IOAPIC programming, IRQ remapping for multi-core IRQs,
-  drop reliance on 8259 for anything that can go through IOAPIC.
+- **Policy core landed**: `huesos-ioapic` — host-tested redirection-entry codec,
+  MADT Interrupt Source Override parsing, vector allocation, and GSI→I/O APIC
+  routing (see [IOAPIC_ROUTING.md](IOAPIC_ROUTING.md)).
+- **Needed (on-target)**: map and program the I/O APIC MMIO using the policy
+  crate, IRQ remapping for multi-core IRQs, and drop reliance on 8259 for
+  anything that can go through the I/O APIC.
 
 ### 3. Process/task and object teardown (mostly done)
 - **Current**: exited-process stacks, private page tables, and address-space-
   owned frames are reaped; process teardown clears its handle table. The
   global object registry still holds strong `Arc`s and does not automatically
   unregister an object on ordinary last-handle close.
-- **Needed**: formalize handle, mapping, in-flight Channel, scheduler, and
-  kernel-internal ownership; use weak registry entries or equivalent lifecycle
-  accounting so VMOs and their physical frames are reclaimed without freeing
-  an object that is still mapped or in flight. Finished task metadata also
-  needs bounded zombie reclamation.
+- **Policy core landed**: `huesos-lifecycle` — host-tested bounded zombie
+  reclamation and the two-counter (handle/kernel refs) collection model (see
+  [OBJECT_LIFECYCLE_POLICY.md](OBJECT_LIFECYCLE_POLICY.md)).
+- **Needed (on-target)**: wire the policy into the registry — weak registry
+  entries / lifecycle accounting so VMOs and their physical frames are reclaimed
+  without freeing an object still mapped or in flight, and feed finished-task
+  records into the bounded graveyard.
 
 ### 4. Blocking syscalls / wait primitives (mostly done)
 - **Current**: Channel/Port block + tick timeouts (`TimedOut`); ProcessWait.
-- **Needed**: multiplexed multi-object wait / cancel.
+- **Policy core landed**: `huesos-waitset` — host-tested multi-object wait
+  dispatch (Any/All, cancel, deadline) (see
+  [MULTI_OBJECT_WAIT.md](MULTI_OBJECT_WAIT.md)).
+- **Needed (on-target)**: a multiplexed multi-object wait / cancel syscall wired
+  to the scheduler park/wake hooks using the policy crate.
 
 ## Short Term
 
@@ -118,17 +155,25 @@ priority order.
 - **Current**: MVP split launch exists (`ProcessCreate`, `VmarMap`,
   `ThreadCreate`, `ThreadStart`) and init can launch embedded child ELF
   images through `libcanvas::process::spawn_elf`.
-- **Needed**: finish the process lifecycle around this path: blocking waits
-  or port signals for exit, teardown/reaping, richer handle-transfer
-  semantics, and eventually loading ELF images from a VFS instead of
-  build-time `include_bytes!`.
+- **Policy core landed**: `huesos-proclife` — host-tested per-process lifecycle
+  state machine (Created→Running→Exited→Reaped) with exit/wait/reap
+  coordination and an exit-info payload for port signals (see
+  [DYNAMIC_PROCESSES.md](DYNAMIC_PROCESSES.md)).
+- **Needed (on-target)**: drive the state machine from the scheduler/process
+  subsystem (blocking waits / port signals for exit, teardown/reaping), richer
+  handle-transfer semantics, and eventually loading ELF images from a VFS
+  instead of build-time `include_bytes!`.
 
 ### 6. Handle transfer semantics
 - **Current**: `ChannelWrite` validates all handles, requires `TRANSFER`, then
   removes them from the sender before enqueueing; in-flight messages retain
   handle-count ownership until receipt or drop.
-- **Needed**: transactional rollback when peer closure/send failure becomes
-  observable, richer typed handle dispositions, and stress tests for concurrent
+- **Policy core landed**: `huesos-handlemove` — host-tested rights monotonicity
+  (transfer can preserve/reduce, never add rights), typed Move/Duplicate
+  dispositions, and all-or-nothing transactional transfer (see
+  [HANDLE_TRANSFER.md](HANDLE_TRANSFER.md)).
+- **Needed (on-target)**: wire the transactional transfer into the channel send
+  path (rollback on peer closure/send failure), and stress tests for concurrent
   close/transfer.
 
 ### 7. Real VFS + drivers in userspace
