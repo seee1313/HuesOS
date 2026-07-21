@@ -11,3 +11,4 @@ license.workspace = true
 # The async controller, block service, and kernel MMIO/DMA plumbing build on
 # top (documented in docs/NVME.md).
 [dependencies]
+hues-async = { path = "../hues-async" }

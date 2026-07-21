@@ -1,0 +1,12 @@
+[package]
+name = "huesos-pci"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# PCI configuration-space parsing and device discovery for ring-3 DriverHosts
+# (foundation for the NVMe on-target plumbing, ROADMAP Short-Term #7). Host-
+# testable: config-space accessors, BAR decoding/sizing, class-code matching,
+# and a mock PCI bus. The actual config-space access mechanism (ECAM MMIO or
+# port 0xCF8/0xCFC) is on-target.
+[dependencies]

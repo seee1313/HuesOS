@@ -41,6 +41,7 @@ test:
 		-p huesos-handlemove \
 		-p hues-async \
 		-p huesos-nvme \
+		-p huesos-pci \
 		--target x86_64-unknown-linux-gnu -Z build-std=
 
 audit:

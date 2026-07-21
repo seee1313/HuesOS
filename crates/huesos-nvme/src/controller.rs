@@ -276,25 +276,18 @@ impl<T: NvmeTransport> Controller<T> {
         }
     }
 
-    /// Read `nlb` logical blocks starting at `lba` into `buf`.
+    /// Read `nlb` logical blocks starting at `lba` into `buf` (synchronous).
     pub fn read(&mut self, lba: u64, nlb: u16, buf: &mut [u8]) -> Result<(), NvmeError> {
-        let nbytes = (nlb as u64) * (self.lba_size as u64);
-        let dma = self.dma_alloc(nbytes, self.page_size as u64)?;
-        let (prp1, prp2) = self.setup_prp(dma, nbytes)?;
-        let cid = self.submit_io(build::read(self.nsid, lba, nlb, prp1, prp2));
+        let (cid, dma, nbytes) = self.prepare_read(lba, nlb)?;
         let cqe = self.poll_io(cid, 1_000_000)?;
         Self::check(&cqe)?;
-        self.t.dma_read(dma, &mut buf[..nbytes as usize]);
+        self.finish_read(dma, nbytes, buf);
         Ok(())
     }
 
-    /// Write `nlb` logical blocks starting at `lba` from `buf`.
+    /// Write `nlb` logical blocks starting at `lba` from `buf` (synchronous).
     pub fn write(&mut self, lba: u64, nlb: u16, buf: &[u8]) -> Result<(), NvmeError> {
-        let nbytes = (nlb as u64) * (self.lba_size as u64);
-        let dma = self.dma_alloc(nbytes, self.page_size as u64)?;
-        self.t.dma_write(dma, &buf[..nbytes as usize]);
-        let (prp1, prp2) = self.setup_prp(dma, nbytes)?;
-        let cid = self.submit_io(build::write(self.nsid, lba, nlb, prp1, prp2));
+        let (cid, _, _) = self.prepare_write(lba, nlb, buf)?;
         let cqe = self.poll_io(cid, 1_000_000)?;
         Self::check(&cqe)
     }
@@ -304,6 +297,60 @@ impl<T: NvmeTransport> Controller<T> {
         let cid = self.submit_io(build::flush(self.nsid));
         let cqe = self.poll_io(cid, 1_000_000)?;
         Self::check(&cqe)
+    }
+
+    // --- split submit/complete primitives (shared with the async wrapper) ---
+
+    /// Allocate the data buffer + PRP and submit a Read; returns
+    /// `(cid, dma_addr, nbytes)`. The completion is awaited separately.
+    pub(crate) fn prepare_read(&mut self, lba: u64, nlb: u16) -> Result<(u16, u64, u64), NvmeError> {
+        let nbytes = (nlb as u64) * (self.lba_size as u64);
+        let dma = self.dma_alloc(nbytes, self.page_size as u64)?;
+        let (prp1, prp2) = self.setup_prp(dma, nbytes)?;
+        let cid = self.submit_io(build::read(self.nsid, lba, nlb, prp1, prp2));
+        Ok((cid, dma, nbytes))
+    }
+
+    /// Write `buf` into a fresh DMA buffer, set up PRP, and submit a Write;
+    /// returns `(cid, dma_addr, nbytes)`.
+    pub(crate) fn prepare_write(
+        &mut self,
+        lba: u64,
+        nlb: u16,
+        buf: &[u8],
+    ) -> Result<(u16, u64, u64), NvmeError> {
+        let nbytes = (nlb as u64) * (self.lba_size as u64);
+        let dma = self.dma_alloc(nbytes, self.page_size as u64)?;
+        self.t.dma_write(dma, &buf[..nbytes as usize]);
+        let (prp1, prp2) = self.setup_prp(dma, nbytes)?;
+        let cid = self.submit_io(build::write(self.nsid, lba, nlb, prp1, prp2));
+        Ok((cid, dma, nbytes))
+    }
+
+    /// Copy a completed read's data out of the DMA buffer into `buf`.
+    pub(crate) fn finish_read(&mut self, dma: u64, nbytes: u64, buf: &mut [u8]) {
+        self.t.dma_read(dma, &mut buf[..nbytes as usize]);
+    }
+
+    /// Non-blocking completion check: if the next CQE is present (phase match),
+    /// consume it and return it when its CID matches `want_cid`.
+    pub(crate) fn try_poll_io(&mut self, want_cid: u16) -> Option<Cqe> {
+        let base = self.io_cq + (self.io_cq_head as u64) * 16;
+        let mut b = [0u8; 16];
+        self.t.dma_read(base, &mut b);
+        let cqe = cqe_from_bytes(&b);
+        if cqe.phase() == self.io_cq_phase {
+            self.io_cq_head = (self.io_cq_head + 1) % self.io_size.max(1);
+            if self.io_cq_head == 0 {
+                self.io_cq_phase = !self.io_cq_phase;
+            }
+            let db = off::DOORBELL_BASE + 3 * self.doorbell_stride;
+            self.t.write32(db, self.io_cq_head as u32);
+            if cqe.cid() == want_cid {
+                return Some(cqe);
+            }
+        }
+        None
     }
 }
 
