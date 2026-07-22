@@ -43,6 +43,7 @@
 
 /// One exception-table entry: faults taken at any instruction pointer in the
 /// half-open range `[start_rip, end_rip)` recover at `fixup_rip`.
+#[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FixupRange {
     /// First covered instruction pointer (inclusive).
