@@ -63,12 +63,9 @@ impl FaultInfo {
 pub type UserFaultHandler = fn(FaultInfo) -> !;
 /// Kernel callback used for fatal ring-0 diagnostics.
 pub type KernelFaultHandler = fn(FaultInfo) -> !;
-/// Lookup callback for recoverable kernel user-copy faults.
-pub type KernelFaultRecovery = fn(u64) -> Option<u64>;
 
 static USER_HANDLER: AtomicUsize = AtomicUsize::new(0);
 static KERNEL_HANDLER: AtomicUsize = AtomicUsize::new(0);
-static RECOVERY_HANDLER: AtomicUsize = AtomicUsize::new(0);
 
 /// Register the ring-3 fault policy callback.
 pub fn set_user_fault_handler(handler: UserFaultHandler) {
@@ -78,23 +75,6 @@ pub fn set_user_fault_handler(handler: UserFaultHandler) {
 /// Register the fatal ring-0 fault callback.
 pub fn set_kernel_fault_handler(handler: KernelFaultHandler) {
     KERNEL_HANDLER.store(handler as usize, Ordering::Release);
-}
-
-/// Register the exception-table lookup used by recoverable user copies.
-pub fn set_kernel_fault_recovery(handler: KernelFaultRecovery) {
-    RECOVERY_HANDLER.store(handler as usize, Ordering::Release);
-}
-
-/// Return a fixup instruction pointer for a recoverable kernel fault, if any.
-pub fn recover_kernel_fault(rip: u64) -> Option<u64> {
-    let handler = RECOVERY_HANDLER.load(Ordering::Acquire);
-    if handler == 0 {
-        return None;
-    }
-    // SAFETY: only `set_kernel_fault_recovery` publishes this exact function
-    // pointer type, before interrupts are enabled.
-    let handler: KernelFaultRecovery = unsafe { core::mem::transmute(handler) };
-    handler(rip)
 }
 
 /// Hand a ring-3 exception to the kernel process manager.
