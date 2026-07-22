@@ -3,7 +3,7 @@
 use huesos_abi::{ErrorCode, HandleValue, INVALID_HANDLE};
 use huesos_object::{Handle, Rights};
 
-use crate::{user_memory, util::current_proc, SyscallResult};
+use crate::{user_memory, util::{current_proc, map_handle_install_error}, SyscallResult};
 
 pub(crate) fn sys_handle_close(handle: HandleValue) -> SyscallResult {
     if handle == INVALID_HANDLE {
@@ -39,7 +39,10 @@ pub(crate) fn sys_handle_duplicate(
         }
         requested
     };
-    let new_hv = proc.handles.add(Handle::new(h.koid, new_rights));
+    let new_hv = proc
+        .handles
+        .try_add(Handle::new(h.koid, new_rights))
+        .map_err(map_handle_install_error)?;
     if let Err(error) = user_memory::write_value(out, &new_hv) {
         let _ = proc.handles.remove(new_hv);
         return Err(error);

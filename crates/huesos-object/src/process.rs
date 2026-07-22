@@ -46,7 +46,7 @@ impl Process {
         Arc::new(Self {
             koid,
             name: Mutex::new(String::from(name)),
-            handles: HandleTable::new(),
+            handles: HandleTable::new_in_job(Arc::clone(&job)),
             job,
             lifecycle: Mutex::new(ProcessLifecycle::new(koid.0, koid.0)),
             exit_waiters: WaitQueue::new(),

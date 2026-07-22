@@ -4,7 +4,7 @@ use alloc::vec::Vec;
 use huesos_abi::{ChannelReadEtcArgs, ErrorCode, HandleValue};
 use huesos_object::{ChannelRecvError, Handle, KernelObject, KernelObjectExt, Rights};
 
-use crate::{user_memory, util::current_proc, SyscallResult};
+use crate::{user_memory, util::{current_proc, map_handle_install_error}, SyscallResult};
 
 fn map_recv_error(error: ChannelRecvError) -> huesos_abi::ErrorCode {
     match error {
@@ -28,8 +28,23 @@ pub(crate) fn sys_channel_create(out0: *mut HandleValue, out1: *mut HandleValue)
     huesos_object::register_object(ch0);
     huesos_object::register_object(ch1);
     let proc = current_proc()?;
-    let hv0 = proc.handles.add(Handle::new(koid0, Rights::DEFAULT));
-    let hv1 = proc.handles.add(Handle::new(koid1, Rights::DEFAULT));
+    let hv0 = match proc.handles.try_add(Handle::new(koid0, Rights::DEFAULT)) {
+        Ok(handle) => handle,
+        Err(error) => {
+            huesos_object::unregister_object(koid0);
+            huesos_object::unregister_object(koid1);
+            return Err(map_handle_install_error(error));
+        }
+    };
+    let hv1 = match proc.handles.try_add(Handle::new(koid1, Rights::DEFAULT)) {
+        Ok(handle) => handle,
+        Err(error) => {
+            let _ = proc.handles.remove(hv0);
+            huesos_object::unregister_object(koid0);
+            huesos_object::unregister_object(koid1);
+            return Err(map_handle_install_error(error));
+        }
+    };
     if let Err(error) = user_memory::write_value(out0, &hv0) {
         let _ = proc.handles.remove(hv0);
         let _ = proc.handles.remove(hv1);
@@ -93,6 +108,7 @@ pub(crate) fn sys_channel_write(
     let message = huesos_object::ChannelMessage {
         data,
         handles: transferred,
+        handle_owner: proc.handles.job(),
     };
     match ch.send(message) {
         Ok(()) => Ok(0),
@@ -100,6 +116,10 @@ pub(crate) fn sys_channel_write(
             // Queue admission is quota-governed. Restore every moved handle
             // when admission fails so the operation remains all-or-nothing.
             let (mut message, reason) = error.into_parts();
+            // The handles are restored to the sender's table, so the sender
+            // keeps their quota charge. Do not let ChannelMessage::Drop
+            // release it while the rollback is in progress.
+            let _ = message.handle_owner.take();
             for (hv, inner_h) in raw_handles.iter().copied().zip(message.handles.drain(..)) {
                 match proc.handles.restore_existing_at(hv, inner_h) {
                     Ok(()) => {}
@@ -209,6 +229,19 @@ pub(crate) fn sys_channel_read_etc(
     user_memory::copy_to_user(args.bytes, &msg.data)?;
     user_memory::write_value(args.out_bytes, &(msg.data.len() as u32))?;
 
+    let transferred_count = msg.handles.len() as u64;
+    if transferred_count != 0 {
+        let destination_job = proc.job();
+        if !destination_job.charge(huesos_quota::Resource::Handles, transferred_count) {
+            match ch.requeue_front(msg) {
+                Ok(()) => return Err(ErrorCode::NoMemory),
+                Err(_) => return Err(ErrorCode::NoMemory),
+            }
+        }
+        if let Some(owner) = msg.handle_owner.take() {
+            let _ = owner.release(huesos_quota::Resource::Handles, transferred_count);
+        }
+    }
     let transferred = core::mem::take(&mut msg.handles);
     for handle in transferred {
         received_values.push(proc.handles.add_existing(handle));

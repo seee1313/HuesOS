@@ -9,7 +9,7 @@ use crate::{
         VMAR_UNMAP_FN, YIELD_FN,
     },
     user_memory,
-    util::current_proc,
+    util::{current_proc, map_handle_install_error},
     SyscallResult,
 };
 
@@ -50,11 +50,18 @@ pub(crate) fn sys_process_create(
     let caller = current_proc()?;
     let process_handle = caller
         .handles
-        .add(Handle::new(process.koid(), Rights::DEFAULT));
-    let root_vmar_handle = caller.handles.add(Handle::new(
+        .try_add(Handle::new(process.koid(), Rights::DEFAULT))
+        .map_err(map_handle_install_error)?;
+    let root_vmar_handle = match caller.handles.try_add(Handle::new(
         root_vmar.koid(),
         Rights::DEFAULT | Rights::SET_PROPERTY,
-    ));
+    )) {
+        Ok(handle) => handle,
+        Err(error) => {
+            let _ = caller.handles.remove(process_handle);
+            return Err(map_handle_install_error(error));
+        }
+    };
 
     user_memory::write_value(out_process, &process_handle)?;
     user_memory::write_value(out_root_vmar, &root_vmar_handle)?;
@@ -99,7 +106,8 @@ pub(crate) fn sys_thread_create(
     huesos_object::register_object(thread);
     let thread_handle = caller
         .handles
-        .add(Handle::new(thread_koid, Rights::DEFAULT));
+        .try_add(Handle::new(thread_koid, Rights::DEFAULT))
+        .map_err(map_handle_install_error)?;
 
     user_memory::write_value(out_thread, &thread_handle)?;
     Ok(0)
@@ -147,15 +155,16 @@ pub(crate) fn sys_thread_start(
 
     child_process
         .handles
-        .insert_at(BOOTSTRAP_HANDLE, Handle::new(child_koid, Rights::DEFAULT))
-        .map_err(|_| ErrorCode::Busy)?;
+        .try_insert_at(BOOTSTRAP_HANDLE, Handle::new(child_koid, Rights::DEFAULT))
+        .map_err(map_handle_install_error)?;
 
     let start = (*THREAD_START_FN.lock()).ok_or(ErrorCode::NotSupported)?;
     let task_id = start(thread, entry, stack)?;
 
     let parent_handle = caller
         .handles
-        .add(Handle::new(parent_koid, Rights::DEFAULT));
+        .try_add(Handle::new(parent_koid, Rights::DEFAULT))
+        .map_err(map_handle_install_error)?;
     user_memory::write_value(out_parent_bootstrap, &parent_handle)?;
     Ok(task_id as i64)
 }

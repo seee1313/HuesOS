@@ -3,7 +3,7 @@
 use huesos_abi::{ErrorCode, HandleValue};
 use huesos_object::{Handle, KernelObject, KernelObjectExt, Rights};
 
-use crate::{user_memory, util::current_proc, SyscallResult};
+use crate::{user_memory, util::{current_proc, map_handle_install_error}, SyscallResult};
 
 /// Upper bound on a single VMO's size (4 GiB). This is not yet a per-job
 /// memory quota; it rejects pathological requests before allocator metadata
@@ -53,7 +53,13 @@ fn sys_vmo_create_with_rights(
     if executable {
         rights |= Rights::EXECUTE;
     }
-    let hv = proc.handles.add(Handle::new(koid, rights));
+    let hv = match proc.handles.try_add(Handle::new(koid, rights)) {
+        Ok(handle) => handle,
+        Err(error) => {
+            huesos_object::unregister_object(koid);
+            return Err(map_handle_install_error(error));
+        }
+    };
     if let Err(error) = user_memory::write_value(out_handle, &hv) {
         let _ = proc.handles.remove(hv);
         return Err(error);

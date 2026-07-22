@@ -43,18 +43,23 @@ CPU tick accounting is now charged from the scheduler to the owning Job. The
 current MVP records budget exhaustion but does not yet throttle or terminate a
 process because the supervisor policy is not finalized.
 
-Handle-count and page-table accounting are still outstanding. Until those
-charges are integrated, queue, VMO, and CPU accounting are active but the
-complete system-wide resource budget is not yet enforced.
+Handle-count accounting is now charged to the Process Job for locally installed
+handles. A transferred capability keeps its sender Job charge while in flight
+and moves the charge to the receiving Job on successful receipt; failed queue
+admission and failed destination admission preserve the original ownership.
+Page-table accounting and user-visible Job creation/limits remain outstanding.
+Until those charges are integrated, queue, VMO, CPU, and handle accounting are
+active but the complete system-wide resource budget is not yet enforced.
 
 ## Required privileged integration
 
 Before exposing user-configurable quotas, the kernel must:
 
-- attach every Process to a Job node;
-- charge VMO physical frames and address-space mappings;
-- charge process and in-flight handle references;
-- charge CPU time from scheduler accounting;
+- attach every Process to a Job node; (implemented with unlimited root default)
+- charge VMO physical frames; (implemented)
+- charge address-space mappings;
+- charge process and in-flight handle references; (handle path implemented)
+- charge CPU time from scheduler accounting; (accounting implemented)
 - release charges only after the corresponding object/task lifecycle reaches a
   terminal state;
 - make charge/release operations atomic with object registry and reaper state;

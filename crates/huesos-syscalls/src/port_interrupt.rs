@@ -3,7 +3,7 @@
 use huesos_abi::{ErrorCode, HandleValue, PortPacket};
 use huesos_object::{Handle, KernelObject, KernelObjectExt, Rights};
 
-use crate::{user_memory, util::current_proc, SyscallResult};
+use crate::{user_memory, util::{current_proc, map_handle_install_error}, SyscallResult};
 
 pub(crate) fn sys_port_create(out: *mut HandleValue) -> SyscallResult {
     user_memory::validate_write(out)?;
@@ -11,7 +11,13 @@ pub(crate) fn sys_port_create(out: *mut HandleValue) -> SyscallResult {
     let koid = port.koid();
     huesos_object::register_object(port);
     let proc = current_proc()?;
-    let handle = proc.handles.add(Handle::new(koid, Rights::DEFAULT));
+    let handle = match proc.handles.try_add(Handle::new(koid, Rights::DEFAULT)) {
+        Ok(handle) => handle,
+        Err(error) => {
+            huesos_object::unregister_object(koid);
+            return Err(map_handle_install_error(error));
+        }
+    };
     user_memory::write_value(out, &handle)?;
     Ok(0)
 }
@@ -62,7 +68,13 @@ pub(crate) fn sys_interrupt_create(irq: u32, out: *mut HandleValue) -> SyscallRe
     huesos_object::register_interrupt(interrupt);
 
     let proc = current_proc()?;
-    let handle = proc.handles.add(Handle::new(koid, Rights::DEFAULT));
+    let handle = match proc.handles.try_add(Handle::new(koid, Rights::DEFAULT)) {
+        Ok(handle) => handle,
+        Err(error) => {
+            huesos_object::unregister_object(koid);
+            return Err(map_handle_install_error(error));
+        }
+    };
     user_memory::write_value(out, &handle)?;
     Ok(0)
 }

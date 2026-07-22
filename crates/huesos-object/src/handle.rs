@@ -1,10 +1,12 @@
 //! Capability handles and per-process handle tables.
 
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use bitflags::bitflags;
 use spin::Mutex;
 
-use crate::{note_handle_close, note_handle_open, Koid};
+use crate::{note_handle_close, note_handle_open, Job, Koid};
+use huesos_quota::Resource;
 
 bitflags! {
     /// Capability rights on a Handle.
@@ -73,11 +75,14 @@ pub enum HandleTableError {
     OutOfMemory,
     /// The same slot was requested more than once.
     Duplicate,
+    /// The owning Job has no handle quota left.
+    QuotaExceeded,
 }
 
 /// Per-process handle table.
 pub struct HandleTable {
     table: Mutex<Vec<Option<Handle>>>,
+    job: Option<Arc<Job>>,
 }
 
 impl HandleTable {
@@ -85,13 +90,39 @@ impl HandleTable {
     pub fn new() -> Self {
         Self {
             table: Mutex::new(Vec::new()),
+            job: None,
         }
     }
+
+    /// Create a handle table charged to `job`.
+    pub fn new_in_job(job: Arc<Job>) -> Self {
+        Self {
+            table: Mutex::new(Vec::new()),
+            job: Some(job),
+        }
+    }
+
+    /// Owning Job, if this table participates in handle accounting.
+    pub fn job(&self) -> Option<Arc<Job>> {
+        self.job.clone()
+    }
+
     /// Add a handle, return its value. Value 0 is reserved as
     /// [`INVALID_HANDLE`], so real handles start at 1.
     pub fn add(&self, handle: Handle) -> HandleValue {
         note_handle_open(handle.koid);
         self.add_existing(handle)
+    }
+
+    /// Add a handle while charging the owning Job's handle budget.
+    pub fn try_add(&self, handle: Handle) -> Result<HandleValue, HandleTableError> {
+        if let Some(job) = &self.job {
+            if !job.charge(Resource::Handles, 1) {
+                return Err(HandleTableError::QuotaExceeded);
+            }
+        }
+        note_handle_open(handle.koid);
+        Ok(self.add_existing(handle))
     }
 
     /// Insert a handle that is already accounted for in the global handle
@@ -130,6 +161,31 @@ impl HandleTable {
         Ok(())
     }
 
+    /// Insert a handle at an exact slot while charging the owning Job.
+    pub fn try_insert_at(
+        &self,
+        value: HandleValue,
+        handle: Handle,
+    ) -> Result<(), HandleTableError> {
+        if value == INVALID_HANDLE {
+            return Err(HandleTableError::Missing);
+        }
+        if let Some(job) = &self.job {
+            if !job.charge(Resource::Handles, 1) {
+                return Err(HandleTableError::QuotaExceeded);
+            }
+        }
+        match self.insert_at(value, handle) {
+            Ok(()) => Ok(()),
+            Err(handle) => {
+                if let Some(job) = &self.job {
+                    let _ = job.release(Resource::Handles, 1);
+                }
+                Err(HandleTableError::Missing)
+            }
+        }
+    }
+
     /// Get handle by value.
     pub fn get(&self, value: HandleValue) -> Option<Handle> {
         if value == INVALID_HANDLE {
@@ -141,6 +197,9 @@ impl HandleTable {
     pub fn remove(&self, value: HandleValue) -> Option<Handle> {
         let h = self.remove_keep_alive(value)?;
         note_handle_close(h.koid);
+        if let Some(job) = &self.job {
+            let _ = job.release(Resource::Handles, 1);
+        }
         Some(h)
     }
 
@@ -215,6 +274,9 @@ impl HandleTable {
         for slot in t.iter_mut() {
             if let Some(h) = slot.take() {
                 note_handle_close(h.koid);
+                if let Some(job) = &self.job {
+                    let _ = job.release(Resource::Handles, 1);
+                }
             }
         }
     }

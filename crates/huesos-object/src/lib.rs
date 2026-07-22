@@ -323,6 +323,7 @@ mod tests {
         let _ = a.send(ChannelMessage {
             data: alloc::vec![1, 2, 3],
             handles: Vec::new(),
+            handle_owner: None,
         });
         // The regression this guards against: sys_channel_create used to
         // create two disconnected Channel::new() objects instead of a real
@@ -347,6 +348,7 @@ mod tests {
         let failed = a.send(ChannelMessage {
             data: Vec::new(),
             handles: Vec::new(),
+            handle_owner: None,
         });
         assert!(failed.is_err());
         if let Err(error) = failed {
@@ -399,6 +401,7 @@ mod tests {
         let send = b.send(ChannelMessage {
             data: Vec::new(),
             handles: Vec::new(),
+            handle_owner: None,
         });
         assert!(send.is_err());
         if let Err(error) = send {
@@ -443,6 +446,26 @@ mod tests {
             assert_eq!(job.usage().map(|usage| usage.memory), Ok(0));
             assert!(Vmo::new_in_job(8192, Some(job)).is_err());
         });
+    }
+
+    #[test]
+    fn process_handle_table_charges_and_releases_job_quota() {
+        let job = Job::root_with_limits(huesos_quota::Limits {
+            max_memory: huesos_quota::UNLIMITED,
+            max_handles: 1,
+            max_cpu_ticks: huesos_quota::UNLIMITED,
+        });
+        let process = Process::new_in_job("handle-quota", job.clone());
+        let first = match process.handles.try_add(Handle::new(alloc_koid(), Rights::DEFAULT)) {
+            Ok(handle) => handle,
+            Err(_) => return,
+        };
+        assert!(matches!(
+            process.handles.try_add(Handle::new(alloc_koid(), Rights::DEFAULT)),
+            Err(HandleTableError::QuotaExceeded)
+        ));
+        assert!(process.handles.remove(first).is_some());
+        assert!(process.handles.try_add(Handle::new(alloc_koid(), Rights::DEFAULT)).is_ok());
     }
 
 }
