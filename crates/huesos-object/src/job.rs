@@ -141,6 +141,18 @@ mod tests {
     }
 
     #[test]
+    fn cpu_tick_budget_is_accounted() {
+        let root = Job::root_with_limits(Limits {
+            max_memory: huesos_quota::UNLIMITED,
+            max_handles: huesos_quota::UNLIMITED,
+            max_cpu_ticks: 1,
+        });
+        assert!(root.charge(Resource::CpuTicks, 1));
+        assert!(!root.charge(Resource::CpuTicks, 1));
+        assert_eq!(root.usage().map(|usage| usage.cpu_ticks), Ok(1));
+    }
+
+    #[test]
     fn release_returns_capacity_to_parent() {
         let root = Job::root_with_limits(memory_limits(100));
         let child = match Job::child(&root, "child", Limits::unlimited()) {
