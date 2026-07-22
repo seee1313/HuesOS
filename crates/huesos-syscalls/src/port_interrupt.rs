@@ -7,7 +7,7 @@ use crate::{user_memory, util::current_proc, SyscallResult};
 
 pub(crate) fn sys_port_create(out: *mut HandleValue) -> SyscallResult {
     user_memory::validate_write(out)?;
-    let port = huesos_object::Port::new();
+    let port = huesos_object::Port::new().map_err(|_| ErrorCode::NoMemory)?;
     let koid = port.koid();
     huesos_object::register_object(port);
     let proc = current_proc()?;

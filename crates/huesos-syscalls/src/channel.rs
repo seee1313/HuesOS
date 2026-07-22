@@ -13,7 +13,7 @@ pub(crate) fn sys_channel_create(out0: *mut HandleValue, out1: *mut HandleValue)
     user_memory::validate_write(out0)?;
     user_memory::validate_write(out1)?;
 
-    let (ch0, ch1) = huesos_object::Channel::pair();
+    let (ch0, ch1) = huesos_object::Channel::pair().map_err(|_| ErrorCode::NoMemory)?;
     let koid0 = ch0.koid();
     let koid1 = ch1.koid();
     huesos_object::register_object(ch0);
@@ -21,8 +21,16 @@ pub(crate) fn sys_channel_create(out0: *mut HandleValue, out1: *mut HandleValue)
     let proc = current_proc()?;
     let hv0 = proc.handles.add(Handle::new(koid0, Rights::DEFAULT));
     let hv1 = proc.handles.add(Handle::new(koid1, Rights::DEFAULT));
-    user_memory::write_value(out0, &hv0)?;
-    user_memory::write_value(out1, &hv1)?;
+    if let Err(error) = user_memory::write_value(out0, &hv0) {
+        let _ = proc.handles.remove(hv0);
+        let _ = proc.handles.remove(hv1);
+        return Err(error);
+    }
+    if let Err(error) = user_memory::write_value(out1, &hv1) {
+        let _ = proc.handles.remove(hv0);
+        let _ = proc.handles.remove(hv1);
+        return Err(error);
+    }
     Ok(0)
 }
 
@@ -56,10 +64,6 @@ pub(crate) fn sys_channel_write(
         .downcast_ref::<huesos_object::Channel>()
         .ok_or(ErrorCode::WrongType)?;
 
-    let mut transferred = Vec::new();
-    transferred
-        .try_reserve_exact(handle_count)
-        .map_err(|_| ErrorCode::NoMemory)?;
     for (i, &hv) in raw_handles.iter().enumerate() {
         if raw_handles[..i].contains(&hv) {
             return Err(ErrorCode::InvalidArgs);
@@ -68,17 +72,34 @@ pub(crate) fn sys_channel_write(
         if !inner_h.has_rights(Rights::TRANSFER) {
             return Err(ErrorCode::AccessDenied);
         }
-        transferred.push(inner_h);
     }
-    for hv in raw_handles {
-        // Keep the global handle count alive while the capability is in flight.
-        let _ = proc.handles.remove_keep_alive(hv);
-    }
-    ch.send(huesos_object::ChannelMessage {
+    let transferred = proc
+        .handles
+        .remove_many_keep_alive(&raw_handles)
+        .map_err(|error| match error {
+            huesos_object::HandleTableError::Missing => ErrorCode::BadHandle,
+            huesos_object::HandleTableError::Duplicate => ErrorCode::InvalidArgs,
+            huesos_object::HandleTableError::OutOfMemory => ErrorCode::NoMemory,
+        })?;
+    let message = huesos_object::ChannelMessage {
         data,
         handles: transferred,
-    });
-    Ok(0)
+    };
+    match ch.send(message) {
+        Ok(()) => Ok(0),
+        Err(error) => {
+            // Queue admission is quota-governed. Restore every moved handle
+            // when admission fails so the operation remains all-or-nothing.
+            let (mut message, _reason) = error.into_parts();
+            for (hv, inner_h) in raw_handles.iter().copied().zip(message.handles.drain(..)) {
+                match proc.handles.restore_existing_at(hv, inner_h) {
+                    Ok(()) => {}
+                    Err(lost) => huesos_object::note_handle_close(lost.koid),
+                }
+            }
+            Err(ErrorCode::NoMemory)
+        }
+    }
 }
 
 pub(crate) fn sys_channel_read(
@@ -145,6 +166,13 @@ pub(crate) fn sys_channel_read_etc(
     let ch = obj
         .downcast_ref::<huesos_object::Channel>()
         .ok_or(ErrorCode::WrongType)?;
+    // Reserve the bounded destination handle staging area before dequeueing.
+    // An OOM result must not consume a message or its in-flight capabilities.
+    let mut received_values = Vec::new();
+    received_values
+        .try_reserve_exact(handle_capacity)
+        .map_err(|_| ErrorCode::NoMemory)?;
+
     let mut msg = if wait_mode == 0 {
         match ch.recv_if_fits(byte_capacity, handle_capacity) {
             Ok(Some(msg)) => msg,
@@ -166,10 +194,6 @@ pub(crate) fn sys_channel_read_etc(
     user_memory::write_value(args.out_bytes, &(msg.data.len() as u32))?;
 
     let transferred = core::mem::take(&mut msg.handles);
-    let mut received_values = Vec::new();
-    received_values
-        .try_reserve_exact(transferred.len())
-        .map_err(|_| ErrorCode::NoMemory)?;
     for handle in transferred {
         received_values.push(proc.handles.add_existing(handle));
     }
