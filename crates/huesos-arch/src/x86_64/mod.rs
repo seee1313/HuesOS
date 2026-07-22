@@ -1,9 +1,5 @@
 //! x86_64-specific implementation.
 
-use core::arch::global_asm;
-
-global_asm!(include_str!("uaccess.S"));
-
 pub mod acpi;
 pub mod ap_boot;
 pub mod context_switch;
@@ -22,7 +18,6 @@ pub mod pit;
 pub mod serial;
 pub mod syscall;
 pub mod timer_callback;
-pub mod uaccess;
 
 /// Early architecture initialization (before paging/heap are set up).
 ///

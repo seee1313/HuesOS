@@ -1,8 +1,7 @@
 # Recoverable Copies: Exception / Fixup Table (`huesos-extable`)
 
-Status: **policy + privileged copy/fault integration landed; QEMU matrix and
-host tests pass. Adversarial fault-injection, wider fault classes, and full
-SMEP/SMAP validation remain.**
+Status: **policy + host tests landed; privileged fault-handler integration and
+on-target behavior not yet implemented or verified.**
 
 This document describes the host-testable crate `huesos-extable` and how it is
 intended to plug into the kernel. It supports
@@ -65,30 +64,37 @@ repair overlaps or duplicates; `new_sorted` still rejects them.
 The decision the privileged handler makes: `Recover { fixup_rip }` when the
 faulting RIP is covered, else `Fatal` (the kernel panic path).
 
-## Current privileged integration
+## Intended kernel integration (NOT yet implemented here)
 
-The kernel now emits four `(fault range, fixup)` entries from the assembly
-user-copy primitives into a linker `.ex_table` section. The kernel validates
-that section through `huesos-extable` at fault-recovery time, and the page-fault
-handler redirects a kernel-mode RIP to the fixup when it falls inside one of
-the copy ranges. The fixup returns `-1`, which the validated user-copy layer
-maps to `InvalidArgs`.
+This crate changes no privileged behavior. The planned integration in
+`huesos-arch`:
 
-Process user-memory locking and VMAR mutation locking prevent the normal
-validation/copy race; the cross-CPU TLB shootdown handles stale translations.
-The copy primitives remain bounded and execute only while `UserAccessGuard` has
-opened the SMAP window.
+1. The linker emits a sorted `.extable`-style section of `(fault_rip, fixup_rip)`
+   entries around each recoverable copy site; each copy site's faulting
+   instruction(s) map to a fixup that returns an error code.
+2. Wrap that section in an `Extable` (validated once at boot).
+3. In the kernel-mode `#PF`/`#GP` handler, when a fault occurs in the copy
+   window, call `resolve_kernel_fault(fault_rip, &EXTABLE)`; on `Recover`, set
+   the saved `RIP` to `fixup_rip` and return from the exception (the copy
+   returns an error); on `Fatal`, take the existing SMP kernel panic path.
+4. Add the address-space locking / copy-window guard that prevents a VMAR
+   `unmap`/`protect` from racing an in-flight copy, *before* exposing those
+   operations; then enable SMEP/SMAP with explicit copy access windows.
 
 ## What still requires on-target verification
 
-The remaining on-target work is:
+The following are **not** verified by this change and must be confirmed in QEMU
+(`-smp 1`/`-smp 2`) and on hardware before the integration is done:
 
-- deliberate fault injection during each load/store fixup range;
-- validation that a recoverable kernel copy does not kill unrelated services;
-- coverage for recoverable faults from additional copy helpers;
-- full SMEP/SMAP and STAC/CLAC stress under IRQ and SMP pressure;
-- eventual removal of the address-space lock once all required copies are
-  proven fault-recoverable.
+- The linker-section emission and the fault handler reading this table.
+- An actual recoverable copy: a fault during a user-copy is redirected to the
+  fixup and returns an error without panicking (and without killing unrelated
+  services).
+- The copy-window / address-space locking that makes VMAR `unmap`/`protect`
+  race-free, and SMEP/SMAP enablement.
+
+These need the full toolchain (pinned nightly + `build-std`, QEMU/OVMF) and were
+not runnable where this crate was authored.
 
 ## Tests (host)
 

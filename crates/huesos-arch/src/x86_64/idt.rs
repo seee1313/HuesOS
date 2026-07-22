@@ -104,25 +104,10 @@ extern "x86-interrupt" fn general_protection_fault_handler(
 }
 
 extern "x86-interrupt" fn page_fault_handler(
-    mut frame: InterruptStackFrame,
+    frame: InterruptStackFrame,
     error_code: PageFaultErrorCode,
 ) {
     super::cpu::clear_user_access();
-    if frame.code_segment.0 & 3 == 0 {
-        if let Some(fixup) = super::fault::recover_kernel_fault(
-            frame.instruction_pointer.as_u64(),
-        ) {
-            // SAFETY: the exception frame is the CPU-owned return frame for
-            // this handler; the fixup is emitted by the validated extable and
-            // points at the same copy function's recovery return.
-            unsafe {
-                frame
-                    .as_mut()
-                    .update(|value| value.instruction_pointer = x86_64::VirtAddr::new(fixup));
-            }
-            return;
-        }
-    }
     let address = Cr2::read().map(|a| a.as_u64()).unwrap_or(0);
     dispatch(fault_info(
         FaultKind::PageFault,

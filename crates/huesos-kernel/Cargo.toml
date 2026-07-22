@@ -13,7 +13,6 @@ huesos-object = { path = "../huesos-object" }
 huesos-syscalls = { path = "../huesos-syscalls" }
 huesos-pmm = { path = "../huesos-pmm" }
 huesos-elf = { path = "../huesos-elf" }
-huesos-extable = { path = "../huesos-extable" }
 huesos-lifecycle = { path = "../huesos-lifecycle" }
 huesos-fb = { path = "../huesos-fb" }
 huesos-abi = { path = "../huesos-abi" }

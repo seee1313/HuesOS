@@ -66,29 +66,6 @@ pub struct BootInfo<'a> {
     pub rsdp_addr: Option<u64>,
 }
 
-unsafe extern "C" {
-    static __huesos_ex_table_start: u8;
-    static __huesos_ex_table_end: u8;
-}
-
-fn recover_kernel_fault(rip: u64) -> Option<u64> {
-    let start = unsafe { core::ptr::addr_of!(__huesos_ex_table_start) as usize };
-    let end = unsafe { core::ptr::addr_of!(__huesos_ex_table_end) as usize };
-    let entry_size = core::mem::size_of::<huesos_extable::FixupRange>();
-    if end <= start || (end - start) % entry_size != 0 {
-        return None;
-    }
-    let count = (end - start) / entry_size;
-    let entries = unsafe {
-        core::slice::from_raw_parts(
-            start as *const huesos_extable::FixupRange,
-            count,
-        )
-    };
-    let table = huesos_extable::Extable::new_sorted(entries)?;
-    table.find(rip)
-}
-
 /// Enter the kernel core from the boot protocol adapter.
 ///
 /// # Safety
@@ -219,7 +196,6 @@ pub unsafe fn kmain(boot_info: BootInfo) -> ! {
 
     init::framebuffer_init(boot_info.framebuffer);
     huesos_arch::fault::set_kernel_fault_handler(crate::panic::from_cpu_fault);
-    huesos_arch::fault::set_kernel_fault_recovery(recover_kernel_fault);
     huesos_arch::fault::set_user_fault_handler(handle_user_fault);
     huesos_hal::init();
     init::syscall_init();
