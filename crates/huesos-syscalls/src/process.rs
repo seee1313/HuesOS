@@ -224,7 +224,7 @@ fn sys_vmar_op(
         return Err(ErrorCode::AccessDenied);
     }
     let callback = (*callback.lock()).ok_or(ErrorCode::NotSupported)?;
-    callback(vmar, args)
+    callback(vmar, args).map(|value| value as i64)
 }
 
 pub(crate) fn sys_process_exit(code: i64) -> SyscallResult {
