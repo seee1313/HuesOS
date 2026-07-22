@@ -112,7 +112,12 @@ extern "x86-interrupt" fn page_fault_handler(
         if let Some(fixup) = super::fault::recover_kernel_fault(
             frame.instruction_pointer.as_u64(),
         ) {
-            frame.instruction_pointer = x86_64::VirtAddr::new(fixup);
+            // SAFETY: the exception frame is the CPU-owned return frame for
+            // this handler; the fixup is emitted by the validated extable and
+            // points at the same copy function's recovery return.
+            unsafe {
+                frame.as_mut().instruction_pointer = x86_64::VirtAddr::new(fixup);
+            }
             return;
         }
     }
