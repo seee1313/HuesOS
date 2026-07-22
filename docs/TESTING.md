@@ -174,6 +174,20 @@ after two seconds, and requires its small text palette with no panic. Buffered
 render validation measured 6–8 ticks under QEMU TCG. See
 [TERMINAL_RENDERING.md](TERMINAL_RENDERING.md).
 
+## Recoverable-copy smoke test
+
+To exercise the actual linker exception table and ring-0 page-fault fixup,
+build an HBI command-line module containing `extable_test=1`. The kernel then
+calls its bounded assembly copy primitive against an intentionally unmapped
+user address. It must return through the fixup path and print:
+
+```text
+[extable] recoverable copy smoke OK
+```
+
+A missing or malformed extable must not be treated as a successful test; the
+kernel stops in the test image before launching userspace.
+
 ## Kernel Panic Screen Test
 
 Normal images never panic intentionally. To exercise the fatal path, build an

@@ -186,6 +186,7 @@ pub unsafe fn kmain(boot_info: BootInfo) -> ! {
     };
 
     let panic_test_requested = boot_info.hbi_image.is_some_and(cmdline_requests_panic_test);
+    let extable_test_requested = boot_info.hbi_image.is_some_and(cmdline_requests_extable_test);
     init::object_init();
 
     if firmware_tables_mapped && uacpi_tables_ready {
@@ -221,6 +222,17 @@ pub unsafe fn kmain(boot_info: BootInfo) -> ! {
     huesos_arch::fault::set_kernel_fault_handler(crate::panic::from_cpu_fault);
     huesos_arch::fault::set_kernel_fault_recovery(recover_kernel_fault);
     huesos_arch::fault::set_user_fault_handler(handle_user_fault);
+    if extable_test_requested {
+        let ok = run_extable_smoke();
+        if ok {
+            dbg("[extable] recoverable copy smoke OK\n");
+        } else {
+            dbg("[extable] recoverable copy smoke FAILED\n");
+            loop {
+                huesos_arch::hlt();
+            }
+        }
+    }
     huesos_hal::init();
     init::syscall_init();
     scheduler::init();
@@ -381,6 +393,33 @@ fn install_acpi_broker(
         return false;
     }
     true
+}
+
+fn run_extable_smoke() -> bool {
+    let mut output = [0u8; 1];
+    let _access = huesos_arch::cpu::UserAccessGuard::new();
+    let result = unsafe {
+        huesos_arch::uaccess::copy_from_user(
+            output.as_mut_ptr(),
+            huesos_abi::USER_ASPACE_BASE as *const u8,
+            output.len(),
+        )
+    };
+    result < 0
+}
+
+fn cmdline_requests_extable_test(hbi_data: &[u8]) -> bool {
+    use crate::boot::hbi::{HbiImage, ModuleType};
+
+    let Ok(image) = HbiImage::parse(hbi_data) else {
+        return false;
+    };
+    let Ok(cmdline) = image.get_module(ModuleType::Cmdline) else {
+        return false;
+    };
+    cmdline
+        .split(|byte| byte.is_ascii_whitespace())
+        .any(|argument| argument == b"extable_test=1")
 }
 
 fn cmdline_requests_panic_test(hbi_data: &[u8]) -> bool {

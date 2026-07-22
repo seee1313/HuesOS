@@ -1,12 +1,12 @@
 {
   "rust_files": 142,
-  "rust_lines": 31626,
+  "rust_lines": 31665,
   "totals": {
     "expect_calls": 22,
     "panic_macros": 5,
     "static_mut": 1,
     "todo_markers": 1,
-    "unsafe_blocks": 230,
+    "unsafe_blocks": 231,
     "unsafe_functions": 57,
     "unsafe_impls": 28,
     "unwrap_calls": 25
@@ -39,7 +39,7 @@
     "crates/huesos-fb/src/lib.rs": 7,
     "crates/huesos-kernel/src/boot/hbi.rs": 3,
     "crates/huesos-kernel/src/init.rs": 4,
-    "crates/huesos-kernel/src/lib.rs": 2,
+    "crates/huesos-kernel/src/lib.rs": 3,
     "crates/huesos-kernel/src/mem/alloc.rs": 12,
     "crates/huesos-kernel/src/process.rs": 2,
     "crates/huesos-kernel/src/scheduler.rs": 9,
