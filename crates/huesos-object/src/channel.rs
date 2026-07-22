@@ -8,7 +8,7 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use spin::Mutex;
 
 use crate::wait::{self, WaitQueue};
-use crate::{alloc_koid, Handle, KernelObject, Koid, ObjectType};
+use crate::{alloc_koid, Handle, Job, KernelObject, Koid, ObjectType};
 use huesos_quota::{Limits, Quota, Resource, UNLIMITED};
 
 /// Maximum number of messages retained in one channel inbox.
@@ -62,6 +62,18 @@ impl MessageQueue {
     }
 
     fn enqueue(&mut self, msg: ChannelMessage) -> Result<(), ChannelSendError> {
+        self.enqueue_impl(msg, false)
+    }
+
+    fn enqueue_front(&mut self, msg: ChannelMessage) -> Result<(), ChannelSendError> {
+        self.enqueue_impl(msg, true)
+    }
+
+    fn enqueue_impl(
+        &mut self,
+        msg: ChannelMessage,
+        front: bool,
+    ) -> Result<(), ChannelSendError> {
         let bytes = msg.data.len() as u64;
         let handles = msg.handles.len() as u64;
         if self.messages.len() >= MAX_CHANNEL_QUEUE_MESSAGES
@@ -70,16 +82,16 @@ impl MessageQueue {
         {
             return Err(ChannelSendError::new(msg, ChannelSendFailure::QuotaExceeded));
         }
-
-        // Queue storage is preallocated during channel creation. Never grow
-        // it from a send path; a capacity mismatch is a normal admission
-        // failure rather than a reason to allocate or panic.
         if self.messages.capacity() <= self.messages.len() {
             return Err(ChannelSendError::new(msg, ChannelSendFailure::OutOfMemory));
         }
         let _ = self.quota.try_acquire(Resource::Memory, bytes);
         let _ = self.quota.try_acquire(Resource::Handles, handles);
-        self.messages.push_back(msg);
+        if front {
+            self.messages.push_front(msg);
+        } else {
+            self.messages.push_back(msg);
+        }
         Ok(())
     }
 
@@ -129,14 +141,20 @@ pub struct ChannelMessage {
     pub data: Vec<u8>,
     /// Handles transferred with the message.
     pub handles: Vec<Handle>,
+    /// Job that currently owns the in-flight handle quota charge.
+    pub handle_owner: Option<Arc<Job>>,
 }
 
 impl Drop for ChannelMessage {
     fn drop(&mut self) {
         // If the message is discarded (peer closed, buffer dropped), release
         // the handle-count holds that kept objects alive in flight.
+        let handle_count = self.handles.len() as u64;
         for h in self.handles.drain(..) {
             crate::note_handle_close(h.koid);
+        }
+        if let Some(owner) = self.handle_owner.take() {
+            let _ = owner.release(huesos_quota::Resource::Handles, handle_count);
         }
     }
 }
@@ -230,6 +248,12 @@ impl Channel {
     /// Whether the peer endpoint has been closed.
     pub fn peer_closed(&self) -> bool {
         !self.peer_alive.load(Ordering::Acquire)
+    }
+
+    /// Requeue a dequeued message at the front, preserving its in-flight
+    /// capability ownership when destination admission fails.
+    pub fn requeue_front(&self, msg: ChannelMessage) -> Result<(), ChannelSendError> {
+        self.inbox.lock().enqueue_front(msg)
     }
 
     /// Receive a message, distinguishing an empty live queue from a closed

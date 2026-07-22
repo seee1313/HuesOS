@@ -321,7 +321,7 @@ fn install_readonly_vmo(
     let rights = Rights::READ | Rights::DUPLICATE | Rights::TRANSFER;
     if process
         .handles
-        .insert_at(slot, Handle::new(koid, rights))
+        .try_insert_at(slot, Handle::new(koid, rights))
         .is_err()
     {
         huesos_object::unregister_object(koid);
