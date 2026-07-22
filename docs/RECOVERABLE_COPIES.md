@@ -68,12 +68,16 @@ faulting RIP is covered, else `Fatal` (the kernel panic path).
 ## Current privileged integration
 
 The kernel now emits four `(fault range, fixup)` entries from the assembly
-user-copy primitives into a linker `.ex_table` section. An opt-in HBI test
-image installs the `huesos-extable` lookup callback; the page-fault handler then
-redirects a kernel-mode RIP to the fixup when it falls inside one of the copy
-ranges. The fixup returns `-1`, which the validated user-copy layer maps to
-`InvalidArgs`. Normal images keep the established fatal kernel-fault policy
-until release-mode linker-table validation is promoted.
+copy primitives into a linker `.ex_table` section. An opt-in HBI test image
+installs the `huesos-extable` lookup callback and calls the assembly primitive
+against an unmapped user address; the page-fault handler then redirects a
+kernel-mode RIP to the fixup, which returns `-1`.
+
+Normal validated user-copy helpers continue using the Process copy lock and
+ordinary bounded pointer copies until the release-mode assembly smoke is
+validated and the copy primitive is promoted into the general syscall path.
+This preserves the already-verified normal boot behavior while keeping the
+exception-table integration opt-in and testable.
 
 Process user-memory locking and VMAR mutation locking prevent the normal
 validation/copy race; the cross-CPU TLB shootdown handles stale translations.

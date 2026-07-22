@@ -124,14 +124,9 @@ pub(crate) fn copy_from_user(src: *const u8, len: usize) -> Result<Vec<u8>, Erro
         if len != 0 {
             let _access = huesos_arch::cpu::UserAccessGuard::new();
             // SAFETY: the complete user range was validated, the Process
-            // copy lock is held, and the SMAP window is active. The assembly
-            // primitive has exception-table fixups for both dereferences.
-            let copied = unsafe {
-                huesos_arch::uaccess::copy_from_user(bytes.as_mut_ptr(), src, len)
-            };
-            if copied < 0 {
-                return Err(ErrorCode::InvalidArgs);
-            }
+            // copy lock is held, and the SMAP window is active. VMAR mutation
+            // cannot race this bounded copy while the lock is held.
+            unsafe { ptr::copy_nonoverlapping(src, bytes.as_mut_ptr(), len) };
         }
         Ok(bytes)
     })
@@ -157,14 +152,9 @@ pub(crate) fn copy_to_user(dst: *mut u8, bytes: &[u8]) -> Result<(), ErrorCode> 
             let _access = huesos_arch::cpu::UserAccessGuard::new();
             // SAFETY: the complete destination range is writable and cannot
             // overlap the kernel-owned source slice because kernel addresses
-            // are excluded by validate_range. The assembly primitive has
-            // exception-table fixups for both dereferences.
-            let copied = unsafe {
-                huesos_arch::uaccess::copy_to_user(dst, bytes.as_ptr(), bytes.len())
-            };
-            if copied < 0 {
-                return Err(ErrorCode::InvalidArgs);
-            }
+            // are excluded by validate_range. VMAR mutation cannot race this
+            // bounded copy while the lock is held.
+            unsafe { ptr::copy_nonoverlapping(bytes.as_ptr(), dst, bytes.len()) };
         }
         Ok(())
     })
