@@ -60,6 +60,7 @@ unit of surface, (b) documents it in `docs/UNSAFE_AUDIT.md`, and (c) updates
 ```bash
 python3 tools/audit-safety.py          # report current surface
 python3 tools/check-safety-budget.py   # hard gate (CI runs this)
+python3 tools/check-policy-crates.py   # policy crate/documentation gate
 ```
 
 ---
@@ -209,7 +210,7 @@ with a short rationale, and keep "Needed" honest about what remains.
 ## 10. Definition of Done (checklist)
 
 - [ ] Compiles warning-free on the pinned toolchain (`scripts/clippy.sh`).
-- [ ] `make audit-check` passes (safety budget + lock policy).
+- [ ] `make audit-check` passes (safety budget + lock policy + policy-crate check).
 - [ ] Host tests added/updated and wired into `make test`; all pass.
 - [ ] On-target behavior verified in QEMU (or explicitly marked unverified).
 - [ ] Relevant `docs/` updated; `ROADMAP.md` current.

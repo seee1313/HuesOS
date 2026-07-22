@@ -380,7 +380,7 @@ impl SourceOverrideTable {
     /// else the identity mapping (`legacy_irq` as the GSI).
     pub fn resolve_gsi(&self, legacy_irq: u8) -> u32 {
         for override_entry in self.iter() {
-            if override_entry.source == legacy_irq {
+            if override_entry.bus == 0 && override_entry.source == legacy_irq {
                 return override_entry.gsi;
             }
         }
@@ -390,7 +390,7 @@ impl SourceOverrideTable {
     /// Look up the override for a legacy IRQ, if any.
     pub fn find(&self, legacy_irq: u8) -> Option<SourceOverride> {
         for override_entry in self.iter() {
-            if override_entry.source == legacy_irq {
+            if override_entry.bus == 0 && override_entry.source == legacy_irq {
                 return Some(*override_entry);
             }
         }
@@ -1070,4 +1070,16 @@ mod tests {
         let second = entry_for_legacy_irq(2, &overrides, &mut vectors, 0x00);
         assert_eq!(second, None);
     }
+    #[test]
+    fn non_isa_source_override_does_not_remap_legacy_irq() {
+        let table = table_with(&[SourceOverride {
+            bus: 1,
+            source: 1,
+            gsi: 99,
+            flags: 0,
+        }]);
+        assert_eq!(table.resolve_gsi(1), 1);
+        assert_eq!(table.find(1), None);
+    }
+
 }

@@ -176,8 +176,12 @@ impl ProcessLifecycle {
     }
 
     /// Register an exit waiter (a blocked `ProcessWait` / port subscription).
-    pub fn add_waiter(&mut self) {
+    pub fn add_waiter(&mut self) -> bool {
+        if self.state != ProcState::Created && self.state != ProcState::Running {
+            return false;
+        }
         self.waiters = self.waiters.saturating_add(1);
+        true
     }
 
     /// Release an exit waiter; saturates at zero.
@@ -377,4 +381,14 @@ mod tests {
         assert!(p.start());
         assert_eq!(p.exit_info(), None);
     }
+    #[test]
+    fn exited_process_does_not_accept_new_waiters() {
+        let mut p = ProcessLifecycle::new(3, 1);
+        assert!(p.start());
+        assert!(p.exit(0));
+        assert!(!p.add_waiter());
+        assert_eq!(p.waiter_count(), 0);
+        assert!(p.can_reap());
+    }
+
 }

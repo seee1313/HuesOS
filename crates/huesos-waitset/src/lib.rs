@@ -198,7 +198,7 @@ impl<const N: usize> WaitSet<N> {
     /// Add an item awaiting `awaited` signals under `key`. Returns false if the
     /// set is full or `key` is already present.
     pub fn add(&mut self, key: u64, awaited: Signals) -> bool {
-        if self.len == N {
+        if self.canceled || self.len == N {
             return false;
         }
         if self.occupied().any(|item| item.key == key) {
@@ -551,4 +551,13 @@ mod tests {
         assert!(ws.signal(1, Signals::CANCELED));
         assert_eq!(ws.poll(WaitMode::Any), WaitOutcome::Signaled);
     }
+    #[test]
+    fn canceled_wait_set_rejects_new_items() {
+        let mut ws: WaitSet<2> = WaitSet::new();
+        ws.cancel();
+        assert!(!ws.add(1, Signals::READABLE));
+        assert_eq!(ws.len(), 0);
+        assert_eq!(ws.poll(WaitMode::Any), WaitOutcome::Canceled);
+    }
+
 }

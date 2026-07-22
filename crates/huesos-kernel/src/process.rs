@@ -183,11 +183,18 @@ pub fn map_vmo_into_vmar(
         vmo: vmo.koid(),
         flags: args.flags,
     };
-    vmar.record_mapping(mapping).map_err(|error| match error {
-        VmarError::InvalidRange => ErrorCode::InvalidArgs,
-        VmarError::Overlap => ErrorCode::Busy,
-    })?;
-    huesos_object::note_kernel_ref_open(vmo.koid());
+    // Acquire the VMAR-owned lifetime reference atomically with registry
+    // lookup. A concurrent last-handle close must not collect the VMO between
+    // metadata reservation and reference accounting.
+    let _vmo_kernel_ref =
+        huesos_object::acquire_kernel_ref(vmo.koid()).ok_or(ErrorCode::BadHandle)?;
+    if let Err(error) = vmar.record_mapping(mapping) {
+        huesos_object::note_kernel_ref_close(vmo.koid());
+        return Err(match error {
+            VmarError::InvalidRange => ErrorCode::InvalidArgs,
+            VmarError::Overlap => ErrorCode::Busy,
+        });
+    }
 
     let mut mapped_pages = 0usize;
     let map_result = (|| -> Result<(), ErrorCode> {

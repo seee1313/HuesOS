@@ -2,6 +2,14 @@
 
 ## Unit Tests (Host)
 
+The policy-crate gate is independent of Cargo and checks that every policy
+crate is a workspace member, forbids unsafe Rust, has host tests, and has a
+current design document:
+
+```bash
+make policy-check
+```
+
 Crates with hardware-independent logic have host unit tests:
 
 ```bash
@@ -23,6 +31,9 @@ This runs, e.g.:
   null guard, kernel half, overflow, upper-bound crossing, and a legal range
   crossing a 4 KiB boundary. Page-table permission tests require QEMU because
   they inspect the active CR3.
+- `huesos-object`: bounded Channel/Port queue admission, batch handle-move
+  validation, and quota exhaustion are host-tested; the kernel scheduler also
+  carries a pending-wake handshake for SMP enqueue-to-park races.
 - The host-testable **policy crates** (`huesos-lifecycle`, `huesos-ioapic`,
   `huesos-extable`, `huesos-waitset`, `huesos-proclife`, `huesos-handlemove`)
   are pure decision/encoding models with focused host suites: lifecycle
