@@ -108,6 +108,14 @@ extern "x86-interrupt" fn page_fault_handler(
     error_code: PageFaultErrorCode,
 ) {
     super::cpu::clear_user_access();
+    if frame.code_segment.0 & 3 == 0 {
+        if let Some(fixup) = super::fault::recover_kernel_fault(
+            frame.instruction_pointer.as_u64(),
+        ) {
+            frame.instruction_pointer = x86_64::VirtAddr::new(fixup);
+            return;
+        }
+    }
     let address = Cr2::read().map(|a| a.as_u64()).unwrap_or(0);
     dispatch(fault_info(
         FaultKind::PageFault,

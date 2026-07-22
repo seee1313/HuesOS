@@ -37,6 +37,13 @@ SECTIONS
         *(.note.gnu.build-id)
     } :rodata
 
+    . = ALIGN(8);
+    __huesos_ex_table_start = .;
+    .ex_table : ALIGN(8) {
+        KEEP(*(.ex_table))
+    } :rodata
+    __huesos_ex_table_end = .;
+
     . = ALIGN(CONSTANT(MAXPAGESIZE));
 
     .data : {
