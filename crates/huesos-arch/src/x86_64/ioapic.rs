@@ -73,7 +73,6 @@ pub fn init_keyboard(madt_bytes: &[u8]) -> Result<(), IoApicError> {
         return Err(IoApicError::NoController);
     }
 
-    let overrides = overrides;
     let mut vectors = VectorAllocator::new(KEYBOARD_VECTOR, KEYBOARD_VECTOR);
     let (gsi, entry) = entry_for_legacy_irq(
         1,
