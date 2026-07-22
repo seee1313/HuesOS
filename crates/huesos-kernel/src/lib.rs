@@ -72,8 +72,8 @@ unsafe extern "C" {
 }
 
 fn recover_kernel_fault(rip: u64) -> Option<u64> {
-    let start = unsafe { core::ptr::addr_of!(__huesos_ex_table_start) as usize };
-    let end = unsafe { core::ptr::addr_of!(__huesos_ex_table_end) as usize };
+    let start = core::ptr::addr_of!(__huesos_ex_table_start) as usize;
+    let end = core::ptr::addr_of!(__huesos_ex_table_end) as usize;
     let entry_size = core::mem::size_of::<huesos_extable::FixupRange>();
     if end <= start || (end - start) % entry_size != 0 {
         return None;
