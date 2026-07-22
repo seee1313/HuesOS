@@ -83,6 +83,7 @@ version = "0.1.0"
 dependencies = [
  "bit_field",
  "bitflags 2.13.0",
+ "huesos-ioapic",
  "huesos-pmm",
  "log",
  "pic8259",

@@ -1,7 +1,8 @@
 # I/O APIC Routing Policy (`huesos-ioapic`)
 
-Status: **policy + host tests landed; privileged MMIO driver and on-target
-behavior not yet implemented or verified.**
+Status: **policy + host tests landed; IRQ1 now has an integrated masked-first
+MMIO route with PIC fallback. QEMU matrix verification is complete; broader
+IRQ routing and bare-metal coverage remain.**
 
 This document describes the host-testable crate `huesos-ioapic` and how it is
 intended to plug into the kernel's interrupt handling. It supports
@@ -10,13 +11,12 @@ reliance on the legacy 8259 PIC).
 
 ## Current state (why this matters)
 
-Today the kernel routes the LAPIC timer through the local APIC and still
-delivers the PS/2 keyboard via the **legacy 8259 PIC** path. The MADT parser
-(`crates/huesos-arch/src/x86_64/acpi.rs`, `parse_madt_bytes`) extracts Local
-APICs (entry type 0) and I/O APIC descriptors (entry type 1) but does **not**
-consume **Interrupt Source Overrides** (entry type 2). Source overrides are
-common on real firmware (e.g. ISA IRQ0 remapped to GSI2) and are required for
-correct I/O APIC routing.
+The kernel routes the LAPIC timer through the local APIC and attempts to route
+PS/2 keyboard IRQ1 through the I/O APIC before interrupts are enabled. If MADT,
+MMIO mapping, vector allocation, or GSI selection fails, the 8259 keyboard path
+remains enabled as a deliberate fallback. The MADT parser extracts Local APICs
+(entry type 0) and I/O APIC descriptors (entry type 1); the policy consumer now
+also parses Interrupt Source Overrides (entry type 2).
 
 ## Why a separate crate
 
@@ -94,36 +94,32 @@ overrides (ISA defaults otherwise), allocates a vector, and builds a masked,
 fixed-delivery entry targeting a given APIC ID. The caller unmasks it only
 after installing it.
 
-## Intended kernel integration (NOT yet implemented here)
+## Current privileged integration
 
-This crate changes no privileged behavior. The planned integration in
-`huesos-arch`:
+`huesos-arch::ioapic::init_keyboard` now performs the first integrated route:
 
-1. Consume `parse_source_overrides` alongside `parse_madt_bytes` (or fold
-   source-override collection into `MadtInfo`).
-2. Map the I/O APIC MMIO base (uncached) from the existing `IoApicInfo.address`.
-3. For each routable IRQ, use `route_gsi` + `entry_for_legacy_irq` to build a
-   `RedirectionEntry`, then write its `low()`/`high()` halves to the I/O APIC
-   redirection registers (index register `0x10`, data register `0x11`; entry
-   `n` at index `0x10 + 2*n`), masked first, then unmasked.
-4. Re-point the keyboard (IRQ1) from the 8259 to the I/O APIC and retire the
-   PIC path where every consumer can go through the I/O APIC.
-5. EOI via the LAPIC (already done for the timer); level-triggered lines need
-   EOI after the device is serviced.
+1. parse MADT and source overrides;
+2. map each I/O APIC MMIO window uncached;
+3. read the pin count from the version register;
+4. use `route_gsi` and `entry_for_legacy_irq` for ISA IRQ1;
+5. program the high and low redirection halves masked-first;
+6. unmask the entry only after both writes;
+7. install the dedicated vector `0x31` and send LAPIC EOI in the handler.
 
+`interrupts::init` masks the 8259 keyboard path only after this route succeeds.
+If any step fails, the existing PIC handler remains active.
 ## What still requires on-target verification
 
-The following are **not** verified by this change and must be confirmed in QEMU
-(`-smp 1`/`-smp 2`) and on real hardware before the integration is done:
+The QEMU debug/release × SMP1/SMP2 serial smoke matrix verifies that the
+integrated boot path remains healthy. The following still require additional
+coverage before claiming a complete interrupt subsystem:
 
-- Actual I/O APIC MMIO programming and the index/data register-pair writes.
-- Keyboard IRQ delivery via the I/O APIC instead of the 8259 (and full removal
-  of the PIC path).
-- Correct handling of real source overrides (e.g. IRQ0→GSI2) from firmware.
-- SMP IRQ affinity / destination selection and level-triggered EOI semantics.
-
-These need the full toolchain (pinned nightly + `build-std`, QEMU/OVMF) and were
-not runnable where this crate was authored.
+- deliberate keyboard injection assertions that the `0x31` vector, rather than
+  the PIC vector, delivered the event;
+- multiple routable IRQs and real source overrides such as IRQ0→GSI2;
+- SMP affinity/destination selection beyond the BSP-targeted keyboard route;
+- level-triggered device EOI semantics;
+- bare-metal firmware variation.
 
 ## Tests (host)
 

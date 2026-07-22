@@ -9,6 +9,7 @@ pub mod fault;
 pub mod gdt;
 pub mod idt;
 pub mod interrupts;
+pub mod ioapic;
 pub mod irq_callback;
 pub mod keyboard;
 pub mod lapic;

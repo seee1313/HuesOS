@@ -133,13 +133,14 @@ priority order.
   hardening and support mapping splits/child VMARs.
 
 ### 2. IOAPIC interrupt routing
-- **Current**: LAPIC timer on all CPUs; keyboard still via legacy PIC path.
+- **Current**: LAPIC timer on all CPUs; keyboard IRQ1 is routed through an
+  integrated masked-first I/O APIC path with PIC fallback.
 - **Policy core landed**: `huesos-ioapic` — host-tested redirection-entry codec,
   MADT Interrupt Source Override parsing, vector allocation, and GSI→I/O APIC
   routing (see [IOAPIC_ROUTING.md](IOAPIC_ROUTING.md)).
-- **Needed (on-target)**: map and program the I/O APIC MMIO using the policy
-  crate, IRQ remapping for multi-core IRQs, and drop reliance on 8259 for
-  anything that can go through the I/O APIC.
+- **Needed (on-target)**: deliberate vector/IRQ assertions, x2APIC and real
+  source-override coverage, broader device routing, level-triggered EOI tests,
+  and removal of PIC fallback where safe.
 
 ### 3. Process/task and object teardown (mostly done)
 - **Current**: exited-process stacks, private page tables, and address-space-
@@ -222,7 +223,7 @@ priority order.
 These were deliberately excluded to keep the first MVP's surface area
 achievable — several are now partially landed (SMP, BOOTFS, FAT lib):
 
-- ~~SMP~~ → core path done; IOAPIC still open
+- ~~SMP~~ → core path done; IOAPIC keyboard path done, general routing still open
 - Any filesystem on real block devices
 - Networking
 - Full process teardown / wait

@@ -44,6 +44,20 @@ pub fn bringup_aps(madt_bytes: &[u8], hhdm_offset: u64) {
         huesos_arch::lapic::init();
     }
 
+    match huesos_arch::ioapic::init_keyboard(madt_bytes) {
+        Ok(()) => log_line("[IOAPIC] routed keyboard IRQ1\n"),
+        Err(error) => {
+            log_line("[IOAPIC] keyboard route unavailable; retaining PIC: ");
+            log_line(match error {
+                huesos_arch::ioapic::IoApicError::NoController => "no controller",
+                huesos_arch::ioapic::IoApicError::InvalidMadt => "invalid MADT",
+                huesos_arch::ioapic::IoApicError::Mapping => "MMIO mapping failed",
+                huesos_arch::ioapic::IoApicError::NoRoute => "no route",
+            });
+            log_line("\n");
+        }
+    }
+
     // Calibrate once on the BSP *before* APs start. APs reuse this count.
     let count = huesos_arch::lapic::calibrate_timer();
     huesos_arch::lapic::set_timer_initial_count(count);

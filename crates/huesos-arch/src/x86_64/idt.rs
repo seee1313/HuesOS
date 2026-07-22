@@ -61,6 +61,7 @@ static IDT: Lazy<InterruptDescriptorTable> = Lazy::new(|| {
     }
     idt[32].set_handler_fn(timer_handler);
     idt[33].set_handler_fn(keyboard_handler);
+    idt[super::ioapic::KEYBOARD_VECTOR].set_handler_fn(ioapic_keyboard_handler);
     idt[PANIC_STOP_VECTOR].set_handler_fn(panic_stop_handler);
     idt[SHUTDOWN_STOP_VECTOR].set_handler_fn(shutdown_stop_handler);
     idt[TLB_SHOOTDOWN_VECTOR].set_handler_fn(tlb_shootdown_handler);
@@ -162,13 +163,25 @@ extern "x86-interrupt" fn timer_handler(_stack_frame: InterruptStackFrame) {
 }
 
 extern "x86-interrupt" fn keyboard_handler(_stack_frame: InterruptStackFrame) {
+    keyboard_irq_ack(true);
+}
+
+extern "x86-interrupt" fn ioapic_keyboard_handler(_stack_frame: InterruptStackFrame) {
+    keyboard_irq_ack(false);
+}
+
+fn keyboard_irq_ack(pic: bool) {
     super::cpu::clear_user_access();
     use x86_64::instructions::port::Port;
     let mut port: Port<u8> = Port::new(0x60);
     let scancode: u8 = unsafe { port.read() };
     crate::x86_64::keyboard::on_scancode(scancode);
-    unsafe {
-        super::interrupts::PICS.lock().notify_end_of_interrupt(33);
+    if pic {
+        unsafe {
+            super::interrupts::PICS.lock().notify_end_of_interrupt(33);
+        }
+    } else {
+        super::lapic::eoi();
     }
     crate::x86_64::irq_callback::emit(1, scancode as u64);
 }
