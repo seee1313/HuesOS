@@ -55,6 +55,10 @@ impl<T: NvmeTransport> AsyncController<T> {
         buf: &mut [u8],
         park: impl FnMut(),
     ) -> Result<(), NvmeError> {
+        let nbytes = self.ctrl.checked_io_bytes(lba, nlb)?;
+        if buf.len() < nbytes as usize {
+            return Err(NvmeError::BufferTooSmall);
+        }
         let (cid, dma, nbytes) = self.ctrl.prepare_read(lba, nlb)?;
         let fut = IoFuture {
             ctrl: &mut self.ctrl,

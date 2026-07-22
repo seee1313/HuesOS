@@ -26,6 +26,12 @@ pub enum NvmeError {
     },
     /// No completion appeared within the poll budget.
     Timeout,
+    /// An I/O request was malformed or the controller is not initialized.
+    InvalidArgs,
+    /// The request lies outside the identified namespace.
+    OutOfRange,
+    /// The caller buffer is smaller than the requested transfer.
+    BufferTooSmall,
 }
 
 /// A polling NVMe controller over a transport `T`.
@@ -35,6 +41,7 @@ pub struct Controller<T: NvmeTransport> {
     doorbell_stride: u32,
     dma_next: u64,
     dma_end: u64,
+    dma_valid: bool,
     // Admin queue.
     admin_sq: u64,
     admin_cq: u64,
@@ -61,12 +68,17 @@ impl<T: NvmeTransport> Controller<T> {
     /// Wrap a transport. `dma_base`/`dma_size` describe the DMA address window
     /// the controller may allocate queues and buffers from.
     pub fn new(t: T, dma_base: u64, dma_size: u64) -> Self {
+        let (dma_end, dma_valid) = match dma_base.checked_add(dma_size) {
+            Some(end) => (end, true),
+            None => (0, false),
+        };
         Self {
             t,
             page_size: 4096,
             doorbell_stride: 4,
             dma_next: dma_base,
-            dma_end: dma_base + dma_size,
+            dma_end,
+            dma_valid,
             admin_sq: 0,
             admin_cq: 0,
             admin_sq_tail: 0,
@@ -101,13 +113,38 @@ impl<T: NvmeTransport> Controller<T> {
     }
 
     fn dma_alloc(&mut self, bytes: u64, align: u64) -> Result<u64, NvmeError> {
-        let aligned = (self.dma_next + align - 1) & !(align - 1);
-        let end = aligned + bytes;
+        if !self.dma_valid || align == 0 || !align.is_power_of_two() {
+            return Err(NvmeError::InvalidArgs);
+        }
+        let aligned = self
+            .dma_next
+            .checked_add(align - 1)
+            .ok_or(NvmeError::OutOfDma)?
+            & !(align - 1);
+        let end = aligned.checked_add(bytes).ok_or(NvmeError::OutOfDma)?;
         if end > self.dma_end {
             return Err(NvmeError::OutOfDma);
         }
         self.dma_next = end;
         Ok(aligned)
+    }
+
+    pub(crate) fn checked_io_bytes(&self, lba: u64, nlb: u16) -> Result<u64, NvmeError> {
+        if self.lba_size == 0 || self.nsze == 0 {
+            return Err(NvmeError::NotReady);
+        }
+        if nlb == 0 {
+            return Err(NvmeError::InvalidArgs);
+        }
+        let end = lba
+            .checked_add(nlb as u64)
+            .ok_or(NvmeError::OutOfRange)?;
+        if end > self.nsze {
+            return Err(NvmeError::OutOfRange);
+        }
+        (nlb as u64)
+            .checked_mul(self.lba_size as u64)
+            .ok_or(NvmeError::InvalidArgs)
     }
 
     fn next_cid(&mut self) -> u16 {
@@ -278,6 +315,10 @@ impl<T: NvmeTransport> Controller<T> {
 
     /// Read `nlb` logical blocks starting at `lba` into `buf` (synchronous).
     pub fn read(&mut self, lba: u64, nlb: u16, buf: &mut [u8]) -> Result<(), NvmeError> {
+        let nbytes = self.checked_io_bytes(lba, nlb)?;
+        if buf.len() < nbytes as usize {
+            return Err(NvmeError::BufferTooSmall);
+        }
         let (cid, dma, nbytes) = self.prepare_read(lba, nlb)?;
         let cqe = self.poll_io(cid, 1_000_000)?;
         Self::check(&cqe)?;
@@ -287,6 +328,10 @@ impl<T: NvmeTransport> Controller<T> {
 
     /// Write `nlb` logical blocks starting at `lba` from `buf` (synchronous).
     pub fn write(&mut self, lba: u64, nlb: u16, buf: &[u8]) -> Result<(), NvmeError> {
+        let nbytes = self.checked_io_bytes(lba, nlb)?;
+        if buf.len() < nbytes as usize {
+            return Err(NvmeError::BufferTooSmall);
+        }
         let (cid, _, _) = self.prepare_write(lba, nlb, buf)?;
         let cqe = self.poll_io(cid, 1_000_000)?;
         Self::check(&cqe)
@@ -294,6 +339,9 @@ impl<T: NvmeTransport> Controller<T> {
 
     /// Flush volatile write cache to non-volatile media.
     pub fn flush(&mut self) -> Result<(), NvmeError> {
+        if self.io_size == 0 {
+            return Err(NvmeError::NotReady);
+        }
         let cid = self.submit_io(build::flush(self.nsid));
         let cqe = self.poll_io(cid, 1_000_000)?;
         Self::check(&cqe)
@@ -304,7 +352,7 @@ impl<T: NvmeTransport> Controller<T> {
     /// Allocate the data buffer + PRP and submit a Read; returns
     /// `(cid, dma_addr, nbytes)`. The completion is awaited separately.
     pub(crate) fn prepare_read(&mut self, lba: u64, nlb: u16) -> Result<(u16, u64, u64), NvmeError> {
-        let nbytes = (nlb as u64) * (self.lba_size as u64);
+        let nbytes = self.checked_io_bytes(lba, nlb)?;
         let dma = self.dma_alloc(nbytes, self.page_size as u64)?;
         let (prp1, prp2) = self.setup_prp(dma, nbytes)?;
         let cid = self.submit_io(build::read(self.nsid, lba, nlb, prp1, prp2));
@@ -319,7 +367,10 @@ impl<T: NvmeTransport> Controller<T> {
         nlb: u16,
         buf: &[u8],
     ) -> Result<(u16, u64, u64), NvmeError> {
-        let nbytes = (nlb as u64) * (self.lba_size as u64);
+        let nbytes = self.checked_io_bytes(lba, nlb)?;
+        if buf.len() < nbytes as usize {
+            return Err(NvmeError::BufferTooSmall);
+        }
         let dma = self.dma_alloc(nbytes, self.page_size as u64)?;
         self.t.dma_write(dma, &buf[..nbytes as usize]);
         let (prp1, prp2) = self.setup_prp(dma, nbytes)?;
@@ -451,4 +502,19 @@ mod tests {
         assert!(c.init().is_ok());
         assert!(c.flush().is_ok());
     }
+    #[test]
+    fn rejects_short_buffers_and_out_of_range_requests() {
+        let mut c = init_for_invalid_tests();
+        assert_eq!(c.write(0, 2, &[0u8; 512]), Err(NvmeError::BufferTooSmall));
+        assert_eq!(c.read(2048, 1, &mut [0u8; 512]), Err(NvmeError::OutOfRange));
+        assert_eq!(c.read(0, 0, &mut []), Err(NvmeError::InvalidArgs));
+    }
+
+    fn init_for_invalid_tests() -> Controller<MockNvme> {
+        let mock = MockNvme::new(1 << 20, 2048, 9);
+        let mut c = Controller::new(mock, 0, 1 << 20);
+        assert!(c.init().is_ok());
+        c
+    }
+
 }

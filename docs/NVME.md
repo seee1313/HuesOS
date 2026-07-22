@@ -1,7 +1,8 @@
 # NVMe Driver (ring-3 DriverHost)
 
-Status: **protocol foundation landed and host-tested.** The async controller,
-block service, and kernel MMIO/DMA plumbing are the next slices (tracked below).
+Status: **protocol foundation, async controller, block wire validation, and
+host tests landed.** Request bounds and DMA arithmetic are checked; real
+DriverHost MMIO/DMA plumbing remains the next on-target slice.
 This is ROADMAP Short-Term #7 (real VFS + drivers in userspace), first device.
 
 ## Goal
@@ -47,7 +48,9 @@ Pure `no_std` + `core`, host-unit-tested (29 tests):
 - `prp`: PRP1 (offset-carrying first address), page-count, PRP-list detection,
   and per-page rest-entry computation for Read/Write.
 
-No `unsafe`, no `unwrap`/`expect`/`panic!` (budget-neutral).
+No `unsafe`, no `unwrap`/`expect`/`panic!` (budget-neutral). The controller
+rejects zero-block, namespace-out-of-range, short-buffer, DMA-window overflow,
+and malformed block-wire requests before touching queues or device memory.
 
 ## Async Controller (next slice)
 
