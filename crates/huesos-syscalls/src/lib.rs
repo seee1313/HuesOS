@@ -27,12 +27,13 @@ mod vmo;
 
 use huesos_abi::{
     ChannelReadEtcArgs, ErrorCode, FramebufferBlitArgs, FramebufferInfo, HandleValue, PortPacket,
-    VmarMapArgs,
+    VmarMapArgs, VmarOpArgs,
 };
 
 pub use callbacks::{
     set_clock_fn, set_debug_write_fn, set_exit_fn, set_process_create_fn, set_shutdown_fn,
-    set_thread_start_fn, set_vmar_map_fn, set_yield_fn, ProcessCreateFn, ThreadStartFn, VmarMapFn,
+    set_thread_start_fn, set_vmar_map_fn, set_vmar_protect_fn, set_vmar_unmap_fn, set_yield_fn,
+    ProcessCreateFn, ThreadStartFn, VmarMapFn, VmarOpFn,
 };
 
 /// Result type for syscalls: `Ok(value)` or a negative error code.
@@ -120,5 +121,7 @@ pub fn dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> Syscal
         S::VmoCreateEx => {
             vmo::sys_vmo_create_ex(a1 as usize, a2 as u32, a3 as *mut HandleValue)
         }
+        S::VmarUnmap => process::sys_vmar_unmap(a1 as *const VmarOpArgs),
+        S::VmarProtect => process::sys_vmar_protect(a1 as *const VmarOpArgs),
     }
 }

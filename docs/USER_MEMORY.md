@@ -99,21 +99,20 @@ This preserves the practical rule that an invalid output pointer does not
 consume an event or create a partially reported resource. Revalidation still
 occurs at the final copy.
 
-## Current concurrency assumption
+## Current concurrency model
 
-The implementation validates the active page tables and then performs the
-copy. This is sound for the current VMAR API because HuesOS does not expose
-`VmarUnmap` or permission mutation: another userspace thread cannot remove the
-mapping between validation and access.
+Validated copy helpers now hold the owning Process `user_memory_lock` across
+page-table validation and the bounded raw copy. `VmarUnmap` and `VmarProtect`
+use the same lock, so kernel copies and VMAR permission mutation cannot overlap
+within a process. A global VMAR mutation lock serializes page-table changes
+while the architecture layer performs a cross-CPU TLB shootdown before the
+syscall returns to userspace.
 
-Before adding unmap/protect operations, the kernel must implement one of:
-
-- address-space locking across validation and copy; or
-- fault-recoverable user copies with an exception/fixup table.
-
-The second design is preferable long term because it also handles races and
-future pageable memory without turning a recoverable bad address into a kernel
-fatal fault.
+This locking does not make arbitrary kernel pointer dereferences safe: all
+caller pointers must still use `user_memory`, and future pageable/faulting
+copies still require the `huesos-extable` recovery path. The exception-table
+policy remains the long-term defense for faults that occur despite validation
+or for future operations that cannot hold an address-space lock.
 
 ## Review checklist for a new syscall
 

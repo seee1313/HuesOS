@@ -162,9 +162,9 @@ referenced by **handles** with **rights**.
 ## Syscalls
 
 Invoked via real `syscall` (not a software interrupt). Canonical numbers
-live in `huesos-abi::Syscall`. Current surface includes VMO/Channel/handle
-ops, process/thread/VMAR launch, Port/Interrupt, framebuffer info/blit,
-yield/exit/debug write.
+live in `huesos-abi::Syscall`. Current surface includes VMO/Channel/handle ops, process/thread/VMAR launch,
+exact VMAR map/unmap/protect operations, Port/Interrupt, framebuffer
+info/blit, yield/exit/debug write.
 
 Raw caller pointers are never dereferenced by individual syscall handlers.
 `huesos-syscalls::user_memory` validates ABI bounds plus every active

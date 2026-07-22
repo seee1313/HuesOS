@@ -1,7 +1,7 @@
 //! Scheduler/kernel callbacks registered by `huesos-kernel`.
 
 use alloc::sync::Arc;
-use huesos_abi::{ErrorCode, VmarMapArgs};
+use huesos_abi::{ErrorCode, VmarMapArgs, VmarOpArgs};
 use spin::Mutex;
 
 /// Global yield callback (set by kernel scheduler to avoid circular deps).
@@ -26,6 +26,8 @@ pub type ProcessCreateFn =
 /// Kernel callback type used by the syscall layer to map a VMO into a VMAR.
 pub type VmarMapFn =
     fn(&huesos_object::Vmar, &huesos_object::Vmo, VmarMapArgs) -> Result<u64, ErrorCode>;
+/// Kernel callback type used by VMAR unmap/protect operations.
+pub type VmarOpFn = fn(&huesos_object::Vmar, VmarOpArgs) -> Result<u64, ErrorCode>;
 /// Kernel callback type used by the syscall layer to start a suspended thread.
 pub type ThreadStartFn = fn(&huesos_object::Thread, u64, u64) -> Result<u64, ErrorCode>;
 
@@ -33,6 +35,10 @@ pub type ThreadStartFn = fn(&huesos_object::Thread, u64, u64) -> Result<u64, Err
 pub(crate) static PROCESS_CREATE_FN: Mutex<Option<ProcessCreateFn>> = Mutex::new(None);
 /// Global VMAR-map callback (set by the kernel process layer).
 pub(crate) static VMAR_MAP_FN: Mutex<Option<VmarMapFn>> = Mutex::new(None);
+/// Global VMAR-unmap callback.
+pub(crate) static VMAR_UNMAP_FN: Mutex<Option<VmarOpFn>> = Mutex::new(None);
+/// Global VMAR-protect callback.
+pub(crate) static VMAR_PROTECT_FN: Mutex<Option<VmarOpFn>> = Mutex::new(None);
 /// Global thread-start callback (set by the kernel scheduler/process layer).
 pub(crate) static THREAD_START_FN: Mutex<Option<ThreadStartFn>> = Mutex::new(None);
 
@@ -69,6 +75,16 @@ pub fn set_process_create_fn(f: ProcessCreateFn) {
 /// Set the VMAR-map function. Called once by kernel init.
 pub fn set_vmar_map_fn(f: VmarMapFn) {
     *VMAR_MAP_FN.lock() = Some(f);
+}
+
+/// Set the VMAR-unmap function. Called once by kernel init.
+pub fn set_vmar_unmap_fn(f: VmarOpFn) {
+    *VMAR_UNMAP_FN.lock() = Some(f);
+}
+
+/// Set the VMAR-protect function. Called once by kernel init.
+pub fn set_vmar_protect_fn(f: VmarOpFn) {
+    *VMAR_PROTECT_FN.lock() = Some(f);
 }
 
 /// Set the thread-start function. Called once by kernel init.

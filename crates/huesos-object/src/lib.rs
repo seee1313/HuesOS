@@ -164,6 +164,7 @@ mod tests {
             base: 0x12000,
             size: 0x2000,
             vmo: Koid(2),
+            vmo_offset: 0,
             flags: 0,
         };
         assert!(vmar.record_mapping(first).is_ok());
@@ -172,6 +173,7 @@ mod tests {
             base: 0x13000,
             size: 0x1000,
             vmo: Koid(3),
+            vmo_offset: 0,
             flags: 0,
         };
         assert!(vmar.record_mapping(overlap).is_err());
@@ -180,6 +182,7 @@ mod tests {
             base: 0x1f000,
             size: 0x2000,
             vmo: Koid(4),
+            vmo_offset: 0,
             flags: 0,
         };
         assert!(vmar.record_mapping(outside).is_err());

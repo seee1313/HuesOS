@@ -5,12 +5,69 @@
 //! bump range.
 
 use crate::{LockRank, RankedIrqSafeTicketLock};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use x86_64::registers::control::{Cr3, Cr3Flags};
 use x86_64::structures::paging::{
     FrameAllocator, FrameDeallocator, Mapper, OffsetPageTable, Page, PageTable, PageTableFlags,
     PhysFrame, Size4KiB,
 };
 use x86_64::{PhysAddr, VirtAddr};
+
+
+const TLB_SHOOTDOWN_VECTOR: u8 = 0xF3;
+static TLB_ACTIVE: AtomicBool = AtomicBool::new(false);
+static TLB_START: AtomicU64 = AtomicU64::new(0);
+static TLB_END: AtomicU64 = AtomicU64::new(0);
+static TLB_ACKS: AtomicUsize = AtomicUsize::new(0);
+
+/// Invalidate the requested range on the local CPU as part of an active
+/// cross-CPU TLB shootdown request.
+pub fn handle_tlb_shootdown() {
+    if !TLB_ACTIVE.load(Ordering::Acquire) {
+        return;
+    }
+    let mut page = TLB_START.load(Ordering::Acquire);
+    let end = TLB_END.load(Ordering::Acquire);
+    while page < end {
+        crate::x86_64::cpu::invlpg(page);
+        page = page.saturating_add(4096);
+    }
+    TLB_ACKS.fetch_add(1, Ordering::Release);
+}
+
+/// Invalidate a virtual-address range on every online CPU.
+///
+/// The caller supplies the number of remote online CPUs expected to acknowledge
+/// the IPI. The request is serialized by the kernel VMAR mutation lock; this
+/// architecture primitive only owns the fixed atomic mailbox and IPI handshake.
+pub fn shootdown_range(start: u64, end: u64, expected_remote: usize) {
+    let start = start & !0xfff;
+    let end = end.saturating_add(0xfff) & !0xfff;
+    if start >= end {
+        return;
+    }
+
+    let interrupts_were_enabled = x86_64::instructions::interrupts::are_enabled();
+    x86_64::instructions::interrupts::disable();
+    TLB_START.store(start, Ordering::Relaxed);
+    TLB_END.store(end, Ordering::Relaxed);
+    TLB_ACKS.store(0, Ordering::Relaxed);
+    TLB_ACTIVE.store(true, Ordering::Release);
+
+    crate::x86_64::lapic::broadcast_excluding_self(TLB_SHOOTDOWN_VECTOR);
+    let mut page = start;
+    while page < end {
+        crate::x86_64::cpu::invlpg(page);
+        page = page.saturating_add(4096);
+    }
+    while TLB_ACKS.load(Ordering::Acquire) < expected_remote {
+        core::hint::spin_loop();
+    }
+    TLB_ACTIVE.store(false, Ordering::Release);
+    if interrupts_were_enabled {
+        x86_64::instructions::interrupts::enable();
+    }
+}
 
 /// Higher-half direct map offset, fixed once at boot.
 static HHDM_OFFSET: RankedIrqSafeTicketLock<u64> =
@@ -353,6 +410,27 @@ impl AddressSpace {
             UnmapError::ParentEntryHugePage => UserPageError::ParentHugePage,
             UnmapError::InvalidFrameAddress(_) => UserPageError::InvalidFrameAddress,
         })?;
+        flush.ignore();
+        Ok(())
+    }
+
+    /// Update permissions on one mapped 4 KiB user page in this address space.
+    pub fn protect_user_page(
+        &mut self,
+        page: Page<Size4KiB>,
+        flags: PageTableFlags,
+    ) -> Result<(), UserPageError> {
+        let virt = phys_to_virt(self.pml4_frame.start_address().as_u64());
+        // SAFETY: pml4_frame is owned by this AddressSpace and HHDM maps every
+        // page-table frame for its full lifetime.
+        let table: &mut PageTable = unsafe { &mut *virt.as_mut_ptr() };
+        let phys_offset = VirtAddr::new(*HHDM_OFFSET.lock());
+        // SAFETY: table is the unique mutable PML4 owned behind &mut self.
+        let mut mapper = unsafe { OffsetPageTable::new(table, phys_offset) };
+        let flush = mapper
+            .update_flags(page, flags)
+            .map_err(|_| UserPageError::NotMapped)?;
+        // The caller performs one range TLB shootdown after the transaction.
         flush.ignore();
         Ok(())
     }

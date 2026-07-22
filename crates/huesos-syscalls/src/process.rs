@@ -1,10 +1,13 @@
 //! Process/thread/VMAR launch syscalls plus yield/exit.
 
-use huesos_abi::{ErrorCode, HandleValue, VmarMapArgs, BOOTSTRAP_HANDLE};
+use huesos_abi::{ErrorCode, HandleValue, VmarMapArgs, VmarOpArgs, BOOTSTRAP_HANDLE};
 use huesos_object::{Handle, KernelObject, KernelObjectExt, Rights};
 
 use crate::{
-    callbacks::{EXIT_FN, PROCESS_CREATE_FN, THREAD_START_FN, VMAR_MAP_FN, YIELD_FN},
+    callbacks::{
+        EXIT_FN, PROCESS_CREATE_FN, THREAD_START_FN, VMAR_MAP_FN, VMAR_PROTECT_FN,
+        VMAR_UNMAP_FN, YIELD_FN,
+    },
     user_memory,
     util::current_proc,
     SyscallResult,
@@ -48,9 +51,10 @@ pub(crate) fn sys_process_create(
     let process_handle = caller
         .handles
         .add(Handle::new(process.koid(), Rights::DEFAULT));
-    let root_vmar_handle = caller
-        .handles
-        .add(Handle::new(root_vmar.koid(), Rights::DEFAULT));
+    let root_vmar_handle = caller.handles.add(Handle::new(
+        root_vmar.koid(),
+        Rights::DEFAULT | Rights::SET_PROPERTY,
+    ));
 
     user_memory::write_value(out_process, &process_handle)?;
     user_memory::write_value(out_root_vmar, &root_vmar_handle)?;
@@ -185,6 +189,42 @@ pub(crate) fn sys_vmar_map(args_ptr: *const VmarMapArgs) -> SyscallResult {
     let map = (*VMAR_MAP_FN.lock()).ok_or(ErrorCode::NotSupported)?;
     let mapped = map(vmar, vmo, args)?;
     Ok(mapped as i64)
+}
+
+
+pub(crate) fn sys_vmar_unmap(args_ptr: *const VmarOpArgs) -> SyscallResult {
+    sys_vmar_op(args_ptr, false, &VMAR_UNMAP_FN)
+}
+
+pub(crate) fn sys_vmar_protect(args_ptr: *const VmarOpArgs) -> SyscallResult {
+    sys_vmar_op(args_ptr, true, &VMAR_PROTECT_FN)
+}
+
+fn sys_vmar_op(
+    args_ptr: *const VmarOpArgs,
+    protect: bool,
+    callback: &spin::Mutex<Option<crate::callbacks::VmarOpFn>>,
+) -> SyscallResult {
+    let args = user_memory::read_value(args_ptr)?;
+    let proc = current_proc()?;
+    let vmar_handle = proc.handles.get(args.vmar).ok_or(ErrorCode::BadHandle)?;
+    let required = if protect {
+        Rights::SET_PROPERTY
+    } else {
+        Rights::WRITE
+    };
+    if !vmar_handle.has_rights(required) {
+        return Err(ErrorCode::AccessDenied);
+    }
+    let object = huesos_object::lookup_object(vmar_handle.koid).ok_or(ErrorCode::BadHandle)?;
+    let vmar = object
+        .downcast_ref::<huesos_object::Vmar>()
+        .ok_or(ErrorCode::WrongType)?;
+    if vmar.process() != proc.koid() {
+        return Err(ErrorCode::AccessDenied);
+    }
+    let callback = (*callback.lock()).ok_or(ErrorCode::NotSupported)?;
+    callback(vmar, args)
 }
 
 pub(crate) fn sys_process_exit(code: i64) -> SyscallResult {

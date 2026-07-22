@@ -91,6 +91,14 @@ pub fn is_cpu_online(cpu: usize) -> bool {
     (ONLINE_CPUS.load(Ordering::SeqCst) & (1u64 << cpu)) != 0
 }
 
+/// Number of online CPUs other than the caller, used by global TLB shootdowns.
+pub fn online_remote_cpu_count() -> usize {
+    ONLINE_CPUS
+        .load(Ordering::SeqCst)
+        .count_ones()
+        .saturating_sub(1) as usize
+}
+
 /// Saved CPU context for a task.
 pub type SchedContext = huesos_arch::context_switch::Context;
 

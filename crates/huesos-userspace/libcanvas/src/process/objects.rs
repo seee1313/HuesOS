@@ -4,7 +4,7 @@ use crate::channel::Channel;
 use crate::handle::Handle;
 use crate::raw;
 use crate::vmo::Vmo;
-use huesos_abi::{HandleValue, Syscall, VmarMapArgs, BOOTSTRAP_HANDLE, INVALID_HANDLE};
+use huesos_abi::{HandleValue, Syscall, VmarMapArgs, VmarOpArgs, BOOTSTRAP_HANDLE, INVALID_HANDLE};
 
 /// Initial bootstrap channel handle number installed in a newly-started
 /// child process by `Thread::start`.
@@ -149,6 +149,30 @@ impl Vmar {
             flags,
         };
         let ret = raw::syscall1(Syscall::VmarMap, &args as *const _ as u64);
+        raw::decode(ret).map(|mapped| mapped as u64)
+    }
+
+    /// Remove one exact page-aligned mapping from this VMAR.
+    pub fn unmap(&self, addr: u64, len: u64) -> crate::Result<u64> {
+        let args = VmarOpArgs {
+            vmar: self.0.raw(),
+            addr,
+            len,
+            flags: 0,
+        };
+        let ret = raw::syscall1(Syscall::VmarUnmap, &args as *const _ as u64);
+        raw::decode(ret).map(|mapped| mapped as u64)
+    }
+
+    /// Change permissions on one exact page-aligned mapping.
+    pub fn protect(&self, addr: u64, len: u64, flags: u32) -> crate::Result<u64> {
+        let args = VmarOpArgs {
+            vmar: self.0.raw(),
+            addr,
+            len,
+            flags,
+        };
+        let ret = raw::syscall1(Syscall::VmarProtect, &args as *const _ as u64);
         raw::decode(ret).map(|mapped| mapped as u64)
     }
 

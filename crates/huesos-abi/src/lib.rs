@@ -121,13 +121,18 @@ pub enum Syscall {
     /// the capability-safe successor to [`Syscall::VmoCreate`] for executable
     /// ELF segments.
     VmoCreateEx = 28,
+    /// Remove one exact mapping from a VMAR. `a1` points to [`VmarOpArgs`].
+    VmarUnmap = 29,
+    /// Change permissions on one exact VMAR mapping. `a1` points to
+    /// [`VmarOpArgs`].
+    VmarProtect = 30,
 }
 
 impl Syscall {
     /// Total number of defined syscalls (i.e. one past the highest
     /// currently-assigned number). The dispatcher uses this to reject
     /// obviously-out-of-range numbers before a `match`.
-    pub const COUNT: u64 = 29;
+    pub const COUNT: u64 = 31;
 
     /// Convert a raw syscall number back into a [`Syscall`], if valid.
     pub const fn from_raw(n: u64) -> Option<Self> {
@@ -161,6 +166,8 @@ impl Syscall {
             26 => Self::ProcessGetExitCode,
             27 => Self::AcpiBrokerCall,
             28 => Self::VmoCreateEx,
+            29 => Self::VmarUnmap,
+            30 => Self::VmarProtect,
             _ => return None,
         })
     }
@@ -474,6 +481,23 @@ pub struct VmarMapArgs {
 }
 
 
+/// Arguments for [`Syscall::VmarUnmap`] and [`Syscall::VmarProtect`].
+///
+/// The MVP requires an exact page-aligned mapping range. `flags` is zero for
+/// unmap and contains [`vmar_flags`] permissions for protect.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct VmarOpArgs {
+    /// Handle to the target VMAR.
+    pub vmar: HandleValue,
+    /// Exact mapping base address.
+    pub addr: u64,
+    /// Exact mapping length.
+    pub len: u64,
+    /// New permissions for protect; zero for unmap.
+    pub flags: u32,
+}
+
 #[cfg(test)]
 mod tests {
     use super::{rights, vmar_flags, ErrorCode, Syscall};
@@ -501,9 +525,12 @@ mod tests {
     #[test]
     fn syscall_numbers_remain_append_only() {
         assert_eq!(Syscall::VmoCreateEx as u64, 28);
-        assert_eq!(Syscall::COUNT, 29);
+        assert_eq!(Syscall::VmarUnmap as u64, 29);
+        assert_eq!(Syscall::VmarProtect as u64, 30);
+        assert_eq!(Syscall::COUNT, 31);
         assert_eq!(Syscall::from_raw(28), Some(Syscall::VmoCreateEx));
-        assert_eq!(Syscall::from_raw(29), None);
+        assert_eq!(Syscall::from_raw(30), Some(Syscall::VmarProtect));
+        assert_eq!(Syscall::from_raw(31), None);
     }
 
     #[test]

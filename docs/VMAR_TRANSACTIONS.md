@@ -29,17 +29,27 @@ order, the exact metadata reservation is removed, and the VMO kernel reference
 is released. The caller receives `NoMemory`, `Busy`, or `InvalidArgs`; ordinary
 resource pressure no longer reaches `expect` in this syscall path.
 
-## Inactive address-space API
+## Address-space mutation and TLB shootdown
 
 `AddressSpace::try_map_user_page` maps a non-owned VMO frame and returns typed
 errors for intermediate-frame OOM, existing mappings, and huge parents.
 `unmap_user_page` supports rollback and reports not-mapped, huge-parent, and
-invalid-frame cases. Both ignore TLB flush tokens because the child CR3 is
-inactive; the first CR3 activation starts without stale translations.
+invalid-frame cases. `protect_user_page` updates effective PTE permissions
+without freeing the VMO frame.
+
+VMAR mutation is serialized by the Process `user_memory_lock` plus a global
+VMAR mutation lock. After a committed unmap/protect transaction, the
+architecture layer sends an IPI to every online remote CPU, invalidates the
+range locally, waits for acknowledgements, and only then returns to ring 3.
+This avoids stale translations when multiple threads of one process run on
+SMP. Per-page flush tokens are ignored because one range shootdown is performed
+at the transaction boundary.
 
 Empty intermediate tables created by a failed transaction remain owned by the
 address space and are reclaimed by its normal recursive destruction. Data
-frames remain VMO-owned throughout rollback.
+frames remain VMO-owned throughout rollback. The MVP mutation API requires an
+exact existing mapping range; splitting mappings and child VMAR trees remain
+future work.
 
 ## Finished task ownership
 
