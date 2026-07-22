@@ -385,4 +385,27 @@ mod tests {
         assert!(table.get(first).is_some());
     }
 
+    #[test]
+    fn channel_peer_close_is_observable_and_rejects_send() {
+        let (a, b) = match Channel::pair() {
+            Ok(pair) => pair,
+            Err(_) => return,
+        };
+        drop(a);
+        assert!(b.peer_closed());
+        let send = b.send(ChannelMessage {
+            data: Vec::new(),
+            handles: Vec::new(),
+        });
+        assert!(send.is_err());
+        if let Err(error) = send {
+            let (_message, reason) = error.into_parts();
+            assert_eq!(reason, ChannelSendFailure::PeerClosed);
+        }
+        assert_eq!(
+            b.recv_if_fits(0, 0),
+            Err(ChannelRecvError::PeerClosed)
+        );
+    }
+
 }

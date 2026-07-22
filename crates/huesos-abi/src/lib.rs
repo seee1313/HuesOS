@@ -221,6 +221,7 @@ impl ErrorCode {
             -18 => Self::NoFramebuffer,
             -19 => Self::NotSupported,
             -21 => Self::Internal,
+            -22 => Self::PeerClosed,
             _ => return None,
         })
     }
@@ -241,6 +242,7 @@ impl ErrorCode {
             Self::NoFramebuffer => "no framebuffer available",
             Self::NotSupported => "syscall not supported",
             Self::Internal => "internal kernel state error",
+            Self::PeerClosed => "channel peer closed",
         }
     }
 }
@@ -472,7 +474,7 @@ pub struct VmarMapArgs {
 
 #[cfg(test)]
 mod tests {
-    use super::{rights, vmar_flags, Syscall};
+    use super::{rights, vmar_flags, ErrorCode, Syscall};
 
     #[test]
     fn mapping_rights_include_each_requested_permission() {
@@ -500,5 +502,11 @@ mod tests {
         assert_eq!(Syscall::COUNT, 29);
         assert_eq!(Syscall::from_raw(28), Some(Syscall::VmoCreateEx));
         assert_eq!(Syscall::from_raw(29), None);
+    }
+
+    #[test]
+    fn peer_closed_error_round_trips() {
+        assert_eq!(ErrorCode::from_raw(-22), Some(ErrorCode::PeerClosed));
+        assert_eq!(ErrorCode::PeerClosed.as_str(), "channel peer closed");
     }
 }

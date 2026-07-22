@@ -4,6 +4,7 @@ use alloc::collections::VecDeque;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::any::Any;
+use core::sync::atomic::{AtomicBool, Ordering};
 use spin::Mutex;
 
 use crate::wait::{self, WaitQueue};
@@ -33,6 +34,10 @@ pub struct Channel {
     readers: Arc<WaitQueue>,
     /// Peer's reader wait queue.
     peer_readers: Arc<WaitQueue>,
+    /// Liveness of this endpoint.
+    local_alive: Arc<AtomicBool>,
+    /// Liveness of the peer endpoint.
+    peer_alive: Arc<AtomicBool>,
 }
 
 struct MessageQueue {
@@ -96,6 +101,8 @@ pub enum ChannelSendFailure {
     QuotaExceeded,
     /// The queue could not reserve its bounded slot.
     OutOfMemory,
+    /// The peer endpoint was closed before the send linearized.
+    PeerClosed,
 }
 
 /// A failed send together with the untouched message, allowing the syscall
@@ -141,6 +148,8 @@ pub enum ChannelRecvError {
     BytesTooSmall,
     /// Handle buffer is too small for the next queued message.
     HandlesTooSmall,
+    /// The peer endpoint is closed and the queue is empty.
+    PeerClosed,
 }
 
 /// Failure while allocating the bounded channel queues.
@@ -158,6 +167,8 @@ impl Channel {
         let q2 = Arc::new(Mutex::new(MessageQueue::new()?));
         let readers_a = Arc::new(WaitQueue::new());
         let readers_b = Arc::new(WaitQueue::new());
+        let alive_a = Arc::new(AtomicBool::new(true));
+        let alive_b = Arc::new(AtomicBool::new(true));
 
         let a = Arc::new(Self {
             koid: alloc_koid(),
@@ -165,6 +176,8 @@ impl Channel {
             outbox: Arc::clone(&q2),
             readers: Arc::clone(&readers_a),
             peer_readers: Arc::clone(&readers_b),
+            local_alive: Arc::clone(&alive_a),
+            peer_alive: Arc::clone(&alive_b),
         });
         let b = Arc::new(Self {
             koid: alloc_koid(),
@@ -172,13 +185,15 @@ impl Channel {
             outbox: q1,
             readers: readers_b,
             peer_readers: readers_a,
+            local_alive: alive_b,
+            peer_alive: alive_a,
         });
         Ok((a, b))
     }
 
-    /// Create a standalone channel endpoint with no peer (writes are
-    /// retained in its bounded outbox; real producers should use
-    /// [`Channel::pair`]). Mainly useful for tests.
+    /// Create a standalone channel endpoint with no peer. Sends fail with
+    /// [`ChannelSendFailure::PeerClosed`]; real producers should use
+    /// [`Channel::pair`]. Mainly useful for tests.
     pub fn new() -> Result<Arc<Self>, ChannelCreateError> {
         let readers = Arc::new(WaitQueue::new());
         Ok(Arc::new(Self {
@@ -187,12 +202,20 @@ impl Channel {
             outbox: Arc::new(Mutex::new(MessageQueue::new()?)),
             readers: Arc::clone(&readers),
             peer_readers: readers,
+            local_alive: Arc::new(AtomicBool::new(true)),
+            peer_alive: Arc::new(AtomicBool::new(false)),
         }))
     }
 
     /// Send a message to the peer endpoint (enqueued FIFO) and wake one reader.
     /// The message is returned unchanged on failure.
     pub fn send(&self, msg: ChannelMessage) -> Result<(), ChannelSendError> {
+        // The atomic check is the send/close linearization point. A close that
+        // happens after this check is ordered after the send and may discard
+        // the unread message, which is the normal endpoint-close semantics.
+        if !self.peer_alive.load(Ordering::Acquire) {
+            return Err(ChannelSendError::new(msg, ChannelSendFailure::PeerClosed));
+        }
         let mut outbox = self.outbox.lock();
         match outbox.enqueue(msg) {
             Ok(()) => {
@@ -204,39 +227,74 @@ impl Channel {
         }
     }
 
-    /// Receive a message sent by the peer endpoint (non-blocking, FIFO).
-    pub fn recv(&self) -> Option<ChannelMessage> {
-        self.inbox.lock().dequeue()
+    /// Whether the peer endpoint has been closed.
+    pub fn peer_closed(&self) -> bool {
+        !self.peer_alive.load(Ordering::Acquire)
     }
 
-    /// Blocking receive: park until a message is available.
-    pub fn recv_blocking(&self) -> ChannelMessage {
+    /// Receive a message, distinguishing an empty live queue from a closed
+    /// peer.
+    pub fn recv_status(&self) -> Result<Option<ChannelMessage>, ChannelRecvError> {
+        if let Some(msg) = self.inbox.lock().dequeue() {
+            return Ok(Some(msg));
+        }
+        if self.peer_closed() {
+            Err(ChannelRecvError::PeerClosed)
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Receive a message sent by the peer endpoint (non-blocking, FIFO).
+    /// This compatibility helper hides peer closure; syscall paths use
+    /// [`Self::recv_status`] so closure is observable at the ABI.
+    pub fn recv(&self) -> Option<ChannelMessage> {
+        self.recv_status().ok().flatten()
+    }
+
+    /// Blocking receive with peer-close reporting.
+    pub fn recv_blocking_status(&self) -> Result<ChannelMessage, ChannelRecvError> {
         loop {
-            if let Some(msg) = self.recv() {
-                return msg;
+            match self.recv_status()? {
+                Some(msg) => return Ok(msg),
+                None => wait::park_on(self.readers.as_ref()),
             }
-            wait::park_on(self.readers.as_ref());
+        }
+    }
+
+    /// Blocking receive: park until a message is available or the peer closes.
+    pub fn recv_blocking(&self) -> Result<ChannelMessage, ChannelRecvError> {
+        self.recv_blocking_status()
+    }
+
+    /// Blocking receive with timeout and peer-close reporting.
+    pub fn recv_blocking_timeout_status(
+        &self,
+        timeout_ticks: u64,
+    ) -> Result<Option<ChannelMessage>, ChannelRecvError> {
+        use wait::ParkResult;
+        if timeout_ticks == 0 {
+            return self.recv_blocking_status().map(Some);
+        }
+        loop {
+            match self.recv_status()? {
+                Some(msg) => return Ok(Some(msg)),
+                None => {}
+            }
+            match wait::park_on_timeout(self.readers.as_ref(), timeout_ticks) {
+                ParkResult::Woken => continue,
+                ParkResult::TimedOut => return self.recv_status(),
+            }
         }
     }
 
     /// Blocking receive with timeout in scheduler ticks (`0` = forever).
-    /// Returns `None` if the timeout expires with no message.
-    pub fn recv_blocking_timeout(&self, timeout_ticks: u64) -> Option<ChannelMessage> {
-        use wait::ParkResult;
-        if timeout_ticks == 0 {
-            return Some(self.recv_blocking());
-        }
-        loop {
-            if let Some(msg) = self.recv() {
-                return Some(msg);
-            }
-            match wait::park_on_timeout(self.readers.as_ref(), timeout_ticks) {
-                ParkResult::Woken => continue,
-                ParkResult::TimedOut => {
-                    return self.recv();
-                }
-            }
-        }
+    /// Returns `None` if the timeout expires, and reports peer closure.
+    pub fn recv_blocking_timeout(
+        &self,
+        timeout_ticks: u64,
+    ) -> Result<Option<ChannelMessage>, ChannelRecvError> {
+        self.recv_blocking_timeout_status(timeout_ticks)
     }
 
     /// Receive only if the caller-provided byte/handle capacities can hold
@@ -248,7 +306,11 @@ impl Channel {
     ) -> Result<Option<ChannelMessage>, ChannelRecvError> {
         let mut q = self.inbox.lock();
         let Some(msg) = q.messages.front() else {
-            return Ok(None);
+            return if self.peer_closed() {
+                Err(ChannelRecvError::PeerClosed)
+            } else {
+                Ok(None)
+            };
         };
         if msg.data.len() > byte_capacity {
             return Err(ChannelRecvError::BytesTooSmall);
@@ -272,6 +334,15 @@ impl Channel {
                 Err(e) => return Err(e),
             }
         }
+    }
+}
+
+impl Drop for Channel {
+    fn drop(&mut self) {
+        self.local_alive.store(false, Ordering::Release);
+        // Wake readers so a blocking syscall can observe PeerClosed instead of
+        // sleeping forever after the last endpoint disappears.
+        self.peer_readers.wake_all();
     }
 }
 

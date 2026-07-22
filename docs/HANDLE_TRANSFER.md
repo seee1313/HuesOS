@@ -91,9 +91,8 @@ be wired without duplicating rollback semantics.
   right and per-permission VMO mappings.
 - Transactional rollback under concurrent handle-table allocation and queue
   rejection races.
-- Peer-close semantics once channels gain explicit closed-state signaling.
 - QEMU/SMP stress testing of concurrent close, transfer, receive, and object
-  collection.
+  collection; the peer-close state and `PeerClosed` ABI status are now wired.
 
 ## Tests (host)
 
