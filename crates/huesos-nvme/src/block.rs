@@ -87,6 +87,8 @@ impl<T: NvmeTransport> BlockDevice for Controller<T> {
 
 /// Header size of an encoded request (op + lba + count).
 pub const REQUEST_HEADER: usize = 1 + 8 + 2;
+/// Maximum write payload carried by one block-service message.
+pub const MAX_REQUEST_DATA: usize = 64 * 1024;
 
 /// Encode a block request. `data` is the write payload (empty for Read/Flush/Info).
 pub fn encode_request(op: BlockOp, lba: u64, count: u16, data: &[u8]) -> Vec<u8> {
@@ -120,6 +122,15 @@ pub fn decode_request(msg: &[u8]) -> Option<DecodedRequest<'_>> {
     let lba = u64::from_le_bytes([msg[1], msg[2], msg[3], msg[4], msg[5], msg[6], msg[7], msg[8]]);
     let count = u16::from_le_bytes([msg[9], msg[10]]);
     let data = &msg[REQUEST_HEADER..];
+    if data.len() > MAX_REQUEST_DATA {
+        return None;
+    }
+    match op {
+        BlockOp::Read | BlockOp::Write if count == 0 => return None,
+        BlockOp::Read | BlockOp::Flush | BlockOp::Info if !data.is_empty() => return None,
+        BlockOp::Flush | BlockOp::Info if count != 0 => return None,
+        BlockOp::Read | BlockOp::Write | BlockOp::Flush | BlockOp::Info => {}
+    }
     Some(DecodedRequest { op, lba, count, data })
 }
 
@@ -232,4 +243,14 @@ mod tests {
         assert_eq!(decode_status(&resp), Some(0));
         assert_eq!(decode_info(&resp[4..]), Some(info));
     }
+    #[test]
+    fn decode_rejects_invalid_operation_payload_shape() {
+        let read_with_data = encode_request(BlockOp::Read, 1, 1, &[1]);
+        assert!(decode_request(&read_with_data).is_none());
+        let flush_with_count = encode_request(BlockOp::Flush, 0, 1, &[]);
+        assert!(decode_request(&flush_with_count).is_none());
+        let zero_count = encode_request(BlockOp::Write, 0, 0, &[]);
+        assert!(decode_request(&zero_count).is_none());
+    }
+
 }
