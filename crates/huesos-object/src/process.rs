@@ -22,6 +22,8 @@ pub struct Process {
     pub lifecycle: Mutex<ProcessLifecycle>,
     /// Waiters blocked in `ProcessWait` until this process exits.
     pub exit_waiters: WaitQueue,
+    /// Serializes validated kernel copies with VMAR mutation operations.
+    pub user_memory_lock: Mutex<()>,
     /// Opaque pointer to the arch-specific address space (owned elsewhere;
     /// stored here so syscalls/scheduler can find it without a separate
     /// process table). Boxed `dyn Any` to avoid a dependency on huesos-arch.
@@ -48,6 +50,7 @@ impl Process {
             job,
             lifecycle: Mutex::new(ProcessLifecycle::new(koid.0, koid.0)),
             exit_waiters: WaitQueue::new(),
+            user_memory_lock: Mutex::new(()),
             address_space: Mutex::new(None),
         })
     }

@@ -102,7 +102,7 @@ Default `scripts/run.sh` uses `-smp 2`.
 
 ## Known Limitations
 
-- No IOAPIC routing yet (LAPIC timer + legacy PIC keyboard path only)
+- IOAPIC routing currently covers only the PS/2 keyboard IRQ1, with legacy PIC fallback; general device IRQ routing is not complete
 - No filesystem on real block devices yet (BOOTFS is RAM; FAT crate is
   library-ready, not wired as the production VFS backend)
 - Exited-process address spaces and kernel stacks are reaped, but finished task

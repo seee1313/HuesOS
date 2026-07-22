@@ -26,6 +26,8 @@ pub struct VmarMapping {
     pub size: u64,
     /// Backing VMO koid.
     pub vmo: Koid,
+    /// Byte offset within the backing VMO.
+    pub vmo_offset: u64,
     /// ABI mapping flags used when the mapping was created.
     pub flags: u32,
 }
@@ -141,6 +143,25 @@ impl Vmar {
         }
         mappings.push(mapping);
         Ok(())
+    }
+
+    /// Find one exact mapping reservation.
+    pub fn mapping(&self, base: u64, size: u64) -> Option<VmarMapping> {
+        self.mappings
+            .lock()
+            .iter()
+            .find(|mapping| mapping.base == base && mapping.size == size)
+            .copied()
+    }
+
+    /// Update permissions on one exact mapping reservation.
+    pub fn update_mapping_flags(&self, mapping: VmarMapping, flags: u32) -> bool {
+        let mut mappings = self.mappings.lock();
+        let Some(existing) = mappings.iter_mut().find(|existing| **existing == mapping) else {
+            return false;
+        };
+        existing.flags = flags;
+        true
     }
 
     /// Remove one exact mapping reservation during transaction rollback.

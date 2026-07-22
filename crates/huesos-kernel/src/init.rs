@@ -117,6 +117,8 @@ pub fn syscall_init() {
     huesos_syscalls::set_shutdown_fn(crate::shutdown::request);
     huesos_syscalls::set_process_create_fn(crate::process::create_suspended_process);
     huesos_syscalls::set_vmar_map_fn(crate::process::map_vmo_into_vmar);
+    huesos_syscalls::set_vmar_unmap_fn(crate::process::unmap_vmar_mapping);
+    huesos_syscalls::set_vmar_protect_fn(crate::process::protect_vmar_mapping);
     huesos_syscalls::set_thread_start_fn(crate::process::start_thread);
     huesos_arch::irq_callback::set_irq_callback(handle_irq);
 

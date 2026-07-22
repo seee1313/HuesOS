@@ -4,7 +4,7 @@
 use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use huesos_abi::{ErrorCode, VmarMapArgs, vmar_flags};
+use huesos_abi::{ErrorCode, VmarMapArgs, VmarOpArgs, vmar_flags};
 use huesos_arch::gdt;
 use huesos_arch::paging::{AddressSpace, UserPageError, flags};
 use huesos_arch::{LockRank, RankedIrqSafeTicketLock};
@@ -181,6 +181,7 @@ pub fn map_vmo_into_vmar(
         base: args.addr,
         size: args.len,
         vmo: vmo.koid(),
+        vmo_offset: args.vmo_offset,
         flags: args.flags,
     };
     // Acquire the VMAR-owned lifetime reference atomically with registry
@@ -298,6 +299,166 @@ fn page_flags_from_vmar_flags(flags: u32) -> Result<PageTableFlags, ErrorCode> {
     Ok(pt_flags)
 }
 
+fn process_runtime_for_vmar(
+    vmar: &Vmar,
+) -> Result<Arc<Process>, ErrorCode> {
+    let object = huesos_object::lookup_object(vmar.process()).ok_or(ErrorCode::BadHandle)?;
+    let process = object
+        .downcast_ref::<Process>()
+        .ok_or(ErrorCode::WrongType)?;
+    huesos_object::lookup_process(process.koid()).ok_or(ErrorCode::BadHandle)
+}
+
+fn validate_vmar_op_args(
+    vmar: &Vmar,
+    args: VmarOpArgs,
+    protect: bool,
+) -> Result<VmarMapping, ErrorCode> {
+    if args.len == 0
+        || !args.addr.is_multiple_of(PAGE_SIZE)
+        || !args.len.is_multiple_of(PAGE_SIZE)
+    {
+        return Err(ErrorCode::InvalidArgs);
+    }
+    if protect {
+        if args.flags & !ALL_VMAR_FLAGS != 0
+            || args.flags & vmar_flags::USER == 0
+            || args.flags & vmar_flags::SPECIFIC == 0
+            || args.flags & (vmar_flags::READ | vmar_flags::WRITE | vmar_flags::EXECUTE) == 0
+            || args.flags & (vmar_flags::WRITE | vmar_flags::EXECUTE)
+                == (vmar_flags::WRITE | vmar_flags::EXECUTE)
+        {
+            return Err(ErrorCode::InvalidArgs);
+        }
+    } else if args.flags != 0 {
+        return Err(ErrorCode::InvalidArgs);
+    }
+    if !vmar.contains_range(args.addr, args.len) {
+        return Err(ErrorCode::InvalidArgs);
+    }
+    vmar.mapping(args.addr, args.len).ok_or(ErrorCode::NotFound)
+}
+
+fn remap_mapping_pages(
+    runtime: &mut ProcessRuntime,
+    vmo: &huesos_object::Vmo,
+    mapping: VmarMapping,
+    count: usize,
+) -> bool {
+    let Ok(flags) = page_flags_from_vmar_flags(mapping.flags) else {
+        return false;
+    };
+    for index in 0..count {
+        let first_page = (mapping.vmo_offset / PAGE_SIZE) as usize;
+        let Some(frame_phys) = vmo.frame_at(first_page + index) else {
+            return false;
+        };
+        let page = Page::<Size4KiB>::containing_address(VirtAddr::new(
+            mapping.base + index as u64 * PAGE_SIZE,
+        ));
+        let frame = PhysFrame::<Size4KiB>::containing_address(PhysAddr::new(frame_phys));
+        if runtime
+            .address_space
+            .try_map_user_page(page, frame, flags)
+            .is_err()
+        {
+            return false;
+        }
+    }
+    true
+}
+
+/// Remove one exact VMAR mapping under the address-space/copy lock and perform
+/// a cross-CPU TLB shootdown before returning to userspace.
+pub fn unmap_vmar_mapping(vmar: &Vmar, args: VmarOpArgs) -> Result<u64, ErrorCode> {
+    let process = process_runtime_for_vmar(vmar)?;
+    let _memory_guard = process.user_memory_lock.lock();
+    let _mutation_guard = VMAR_MUTATION_LOCK.lock();
+    let mapping = validate_vmar_op_args(vmar, args, false)?;
+    let object = huesos_object::lookup_object(mapping.vmo).ok_or(ErrorCode::BadHandle)?;
+    let vmo = object
+        .downcast_ref::<huesos_object::Vmo>()
+        .ok_or(ErrorCode::WrongType)?;
+    let runtime_any = process.address_space.lock();
+    let mut runtime = runtime_any;
+    let runtime = runtime
+        .as_mut()
+        .and_then(|value| value.downcast_mut::<ProcessRuntime>())
+        .ok_or(ErrorCode::BadHandle)?;
+    let page_count = (mapping.size / PAGE_SIZE) as usize;
+    let mut unmapped = 0usize;
+    for index in 0..page_count {
+        let page = Page::<Size4KiB>::containing_address(VirtAddr::new(
+            mapping.base + index as u64 * PAGE_SIZE,
+        ));
+        if runtime.address_space.unmap_user_page(page).is_err() {
+            let _ = remap_mapping_pages(runtime, vmo, mapping, unmapped);
+            return Err(ErrorCode::Internal);
+        }
+        unmapped += 1;
+    }
+    if !vmar.remove_mapping(mapping) {
+        let _ = remap_mapping_pages(runtime, vmo, mapping, unmapped);
+        return Err(ErrorCode::Internal);
+    }
+    huesos_object::note_kernel_ref_close(mapping.vmo);
+    huesos_arch::paging::shootdown_range(
+        mapping.base,
+        mapping.base + mapping.size,
+        crate::scheduler::online_remote_cpu_count(),
+    );
+    Ok(mapping.base)
+}
+
+/// Change permissions on one exact VMAR mapping under the address-space/copy
+/// lock and perform a cross-CPU TLB shootdown.
+pub fn protect_vmar_mapping(vmar: &Vmar, args: VmarOpArgs) -> Result<u64, ErrorCode> {
+    let process = process_runtime_for_vmar(vmar)?;
+    let _memory_guard = process.user_memory_lock.lock();
+    let _mutation_guard = VMAR_MUTATION_LOCK.lock();
+    let mapping = validate_vmar_op_args(vmar, args, true)?;
+    let old_flags = page_flags_from_vmar_flags(mapping.flags)?;
+    let new_flags = page_flags_from_vmar_flags(args.flags)?;
+    let runtime_any = process.address_space.lock();
+    let mut runtime = runtime_any;
+    let runtime = runtime
+        .as_mut()
+        .and_then(|value| value.downcast_mut::<ProcessRuntime>())
+        .ok_or(ErrorCode::BadHandle)?;
+    let page_count = (mapping.size / PAGE_SIZE) as usize;
+    let mut changed = 0usize;
+    for index in 0..page_count {
+        let page = Page::<Size4KiB>::containing_address(VirtAddr::new(
+            mapping.base + index as u64 * PAGE_SIZE,
+        ));
+        if runtime.address_space.protect_user_page(page, new_flags).is_err() {
+            for rollback in 0..changed {
+                let rollback_page = Page::<Size4KiB>::containing_address(VirtAddr::new(
+                    mapping.base + rollback as u64 * PAGE_SIZE,
+                ));
+                let _ = runtime.address_space.protect_user_page(rollback_page, old_flags);
+            }
+            return Err(ErrorCode::Internal);
+        }
+        changed += 1;
+    }
+    if !vmar.update_mapping_flags(mapping, args.flags) {
+        for rollback in 0..changed {
+            let rollback_page = Page::<Size4KiB>::containing_address(VirtAddr::new(
+                mapping.base + rollback as u64 * PAGE_SIZE,
+            ));
+            let _ = runtime.address_space.protect_user_page(rollback_page, old_flags);
+        }
+        return Err(ErrorCode::Internal);
+    }
+    huesos_arch::paging::shootdown_range(
+        mapping.base,
+        mapping.base + mapping.size,
+        crate::scheduler::online_remote_cpu_count(),
+    );
+    Ok(mapping.base)
+}
+
 /// Start a suspended userspace thread.
 ///
 /// The syscall layer owns bootstrap-channel creation and installs the child
@@ -413,6 +574,9 @@ struct PendingUserEntry {
 
 static PENDING_USER_ENTRIES: RankedIrqSafeTicketLock<Vec<PendingUserEntry>> =
     RankedIrqSafeTicketLock::new(Vec::new(), LockRank::PROCESS);
+
+static VMAR_MUTATION_LOCK: RankedIrqSafeTicketLock<()> =
+    RankedIrqSafeTicketLock::new((), LockRank::PROCESS);
 
 /// Queue the first userspace RIP/RSP pair for a just-created scheduler task.
 pub fn queue_user_entry(task_id: u64, entry: u64, rsp: u64) {

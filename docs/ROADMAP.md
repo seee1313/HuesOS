@@ -121,22 +121,26 @@ priority order.
 ## Immediate
 
 ### 1. Recoverable copies, VMAR unmap/protect, and SMEP/SMAP
-- **Current**: syscall copies prevalidate mappings, and Ring-3 faults are
-  process-contained. No userspace unmap/protect operation can race a copy yet.
+- **Current**: `VmarUnmap` and `VmarProtect` operate on exact mappings under
+  Process user-copy locking and a global mutation lock; cross-CPU TLB shootdown
+  is required before returning to ring 3. `huesos-extable` remains the
+  host-tested long-term recovery policy for faults that occur despite
+  validation or future pageable copies.
 - **Policy core landed**: `huesos-extable` — host-tested fixup-table data
   structure and lookup (see [RECOVERABLE_COPIES.md](RECOVERABLE_COPIES.md)).
-- **Needed (on-target)**: install the fault handler that consults the table,
-  add exception-table/fixup recovery or address-space locking before exposing
-  VMAR unmap/protect, then SMEP/SMAP once explicit copy access windows are ready.
+- **Needed (on-target)**: install the actual fault-handler fixup path, add
+  adversarial unmap/protect race tests, then complete SMEP/SMAP copy-window
+  hardening and support mapping splits/child VMARs.
 
 ### 2. IOAPIC interrupt routing
-- **Current**: LAPIC timer on all CPUs; keyboard still via legacy PIC path.
+- **Current**: LAPIC timer on all CPUs; keyboard IRQ1 is routed through an
+  integrated masked-first I/O APIC path with PIC fallback.
 - **Policy core landed**: `huesos-ioapic` — host-tested redirection-entry codec,
   MADT Interrupt Source Override parsing, vector allocation, and GSI→I/O APIC
   routing (see [IOAPIC_ROUTING.md](IOAPIC_ROUTING.md)).
-- **Needed (on-target)**: map and program the I/O APIC MMIO using the policy
-  crate, IRQ remapping for multi-core IRQs, and drop reliance on 8259 for
-  anything that can go through the I/O APIC.
+- **Needed (on-target)**: deliberate vector/IRQ assertions, x2APIC and real
+  source-override coverage, broader device routing, level-triggered EOI tests,
+  and removal of PIC fallback where safe.
 
 ### 3. Process/task and object teardown (mostly done)
 - **Current**: exited-process stacks, private page tables, and address-space-
@@ -219,7 +223,7 @@ priority order.
 These were deliberately excluded to keep the first MVP's surface area
 achievable — several are now partially landed (SMP, BOOTFS, FAT lib):
 
-- ~~SMP~~ → core path done; IOAPIC still open
+- ~~SMP~~ → core path done; IOAPIC keyboard path done, general routing still open
 - Any filesystem on real block devices
 - Networking
 - Full process teardown / wait

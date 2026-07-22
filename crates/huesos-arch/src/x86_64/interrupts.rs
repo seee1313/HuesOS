@@ -24,7 +24,12 @@ pub fn init() {
         // the *previous* mask, which on some UEFI firmware/QEMU
         // combinations leaves the timer masked since firmware doesn't need
         // it once it hands off to the OS.
-        pics.write_masks(0b1111_1100, 0b1111_1111);
+        if super::ioapic::keyboard_routed() {
+            // LAPIC timer and I/O APIC keyboard are independent of the 8259.
+            pics.write_masks(0b1111_1111, 0b1111_1111);
+        } else {
+            pics.write_masks(0b1111_1100, 0b1111_1111);
+        }
     }
     enable();
 }

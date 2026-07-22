@@ -11,6 +11,8 @@ use super::fault::{FaultInfo, FaultKind};
 pub const PANIC_STOP_VECTOR: u8 = 0xF1;
 /// IPI vector used for an orderly system-wide software halt.
 pub const SHUTDOWN_STOP_VECTOR: u8 = 0xF2;
+/// IPI vector used for cross-CPU TLB invalidation.
+pub const TLB_SHOOTDOWN_VECTOR: u8 = 0xF3;
 static PANIC_STOPPED_CPUS: AtomicUsize = AtomicUsize::new(0);
 
 /// Number of peer CPUs that acknowledged the panic-stop IPI.
@@ -59,8 +61,10 @@ static IDT: Lazy<InterruptDescriptorTable> = Lazy::new(|| {
     }
     idt[32].set_handler_fn(timer_handler);
     idt[33].set_handler_fn(keyboard_handler);
+    idt[super::ioapic::KEYBOARD_VECTOR].set_handler_fn(ioapic_keyboard_handler);
     idt[PANIC_STOP_VECTOR].set_handler_fn(panic_stop_handler);
     idt[SHUTDOWN_STOP_VECTOR].set_handler_fn(shutdown_stop_handler);
+    idt[TLB_SHOOTDOWN_VECTOR].set_handler_fn(tlb_shootdown_handler);
     idt
 });
 
@@ -143,6 +147,12 @@ extern "x86-interrupt" fn shutdown_stop_handler(_frame: InterruptStackFrame) {
     }
 }
 
+extern "x86-interrupt" fn tlb_shootdown_handler(_frame: InterruptStackFrame) {
+    super::cpu::clear_user_access();
+    super::paging::handle_tlb_shootdown();
+    super::lapic::eoi();
+}
+
 extern "x86-interrupt" fn timer_handler(_stack_frame: InterruptStackFrame) {
     super::cpu::clear_user_access();
     super::lapic::eoi();
@@ -153,13 +163,25 @@ extern "x86-interrupt" fn timer_handler(_stack_frame: InterruptStackFrame) {
 }
 
 extern "x86-interrupt" fn keyboard_handler(_stack_frame: InterruptStackFrame) {
+    keyboard_irq_ack(true);
+}
+
+extern "x86-interrupt" fn ioapic_keyboard_handler(_stack_frame: InterruptStackFrame) {
+    keyboard_irq_ack(false);
+}
+
+fn keyboard_irq_ack(pic: bool) {
     super::cpu::clear_user_access();
     use x86_64::instructions::port::Port;
     let mut port: Port<u8> = Port::new(0x60);
     let scancode: u8 = unsafe { port.read() };
     crate::x86_64::keyboard::on_scancode(scancode);
-    unsafe {
-        super::interrupts::PICS.lock().notify_end_of_interrupt(33);
+    if pic {
+        unsafe {
+            super::interrupts::PICS.lock().notify_end_of_interrupt(33);
+        }
+    } else {
+        super::lapic::eoi();
     }
     crate::x86_64::irq_callback::emit(1, scancode as u64);
 }
