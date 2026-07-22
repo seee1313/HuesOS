@@ -104,7 +104,7 @@ extern "x86-interrupt" fn general_protection_fault_handler(
 }
 
 extern "x86-interrupt" fn page_fault_handler(
-    frame: InterruptStackFrame,
+    mut frame: InterruptStackFrame,
     error_code: PageFaultErrorCode,
 ) {
     super::cpu::clear_user_access();
