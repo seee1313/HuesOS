@@ -109,7 +109,12 @@ fn map_load_segment(root_vmar: &Vmar, elf: &[u8], ph: ProgramHeader) -> crate::R
     }
 
     let map_len = page_end - page_start;
-    let vmo = Vmo::create(map_len)?;
+    let vmo_flags = if ph.flags & PF_X != 0 {
+        huesos_abi::vmo_create_flags::EXECUTABLE
+    } else {
+        0
+    };
+    let vmo = Vmo::create_with_flags(map_len, vmo_flags)?;
 
     if ph.filesz > 0 {
         let file_start = ph.offset as usize;
@@ -163,7 +168,12 @@ fn map_load_segment_from_vmo(
     }
 
     let map_len = page_end - page_start;
-    let seg_vmo = Vmo::create(map_len)?;
+    let vmo_flags = if ph.flags & PF_X != 0 {
+        huesos_abi::vmo_create_flags::EXECUTABLE
+    } else {
+        0
+    };
+    let seg_vmo = Vmo::create_with_flags(map_len, vmo_flags)?;
 
     if ph.filesz > 0 {
         let mut buf = [0u8; 4096];

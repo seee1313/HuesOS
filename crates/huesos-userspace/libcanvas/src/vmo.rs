@@ -58,6 +58,19 @@ impl Vmo {
         Ok(Self(unsafe { Handle::from_raw(out) }))
     }
 
+    /// Create a VMO with explicit creation flags from [`huesos_abi::vmo_create_flags`].
+    pub fn create_with_flags(size: u64, flags: u32) -> crate::Result<Self> {
+        let mut out: HandleValue = INVALID_HANDLE;
+        let ret = raw::syscall3(
+            Syscall::VmoCreateEx,
+            size,
+            flags as u64,
+            &mut out as *mut HandleValue as u64,
+        );
+        raw::decode(ret)?;
+        Ok(Self::from_abi_owned(out))
+    }
+
     /// Write `data` into this VMO starting at `offset`. Returns the number
     /// of bytes actually written (may be less than `data.len()` if the
     /// write would run past the VMO's current size).
