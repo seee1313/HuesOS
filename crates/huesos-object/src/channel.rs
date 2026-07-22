@@ -277,9 +277,8 @@ impl Channel {
             return self.recv_blocking_status().map(Some);
         }
         loop {
-            match self.recv_status()? {
-                Some(msg) => return Ok(Some(msg)),
-                None => {}
+            if let Some(msg) = self.recv_status()? {
+                return Ok(Some(msg));
             }
             match wait::park_on_timeout(self.readers.as_ref(), timeout_ticks) {
                 ParkResult::Woken => continue,

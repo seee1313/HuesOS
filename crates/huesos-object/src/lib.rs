@@ -408,4 +408,19 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn process_object_drives_lifecycle_policy_and_reap_waiters() {
+        let process = Process::new("lifecycle");
+        assert!(process.start());
+        assert!(!process.start());
+        assert!(process.add_exit_waiter());
+        assert!(process.set_exit_code(17));
+        assert_eq!(process.exit_code(), Some(17));
+        assert!(!process.can_reap());
+        assert!(process.exit_info().is_some());
+        process.remove_exit_waiter();
+        assert!(process.can_reap());
+        assert!(!process.set_exit_code(18));
+    }
+
 }

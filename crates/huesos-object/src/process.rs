@@ -7,6 +7,7 @@ use core::any::Any;
 use spin::Mutex;
 
 use crate::wait::WaitQueue;
+use huesos_proclife::{ExitInfo, ProcessLifecycle, ProcState};
 use crate::{alloc_koid, HandleTable, KernelObject, Koid, ObjectType};
 
 /// Process — address space + handle table + exit state.
@@ -15,8 +16,8 @@ pub struct Process {
     name: Mutex<String>,
     /// Handle table for this process.
     pub handles: HandleTable,
-    /// Exit code, set by `ProcessExit`. `None` while still running.
-    pub exit_code: Mutex<Option<i64>>,
+    /// Lifecycle state machine shared with the host-tested policy core.
+    pub lifecycle: Mutex<ProcessLifecycle>,
     /// Waiters blocked in `ProcessWait` until this process exits.
     pub exit_waiters: WaitQueue,
     /// Opaque pointer to the arch-specific address space (owned elsewhere;
@@ -28,11 +29,12 @@ pub struct Process {
 impl Process {
     /// Create a process.
     pub fn new(name: &str) -> Arc<Self> {
+        let koid = alloc_koid();
         Arc::new(Self {
-            koid: alloc_koid(),
+            koid,
             name: Mutex::new(String::from(name)),
             handles: HandleTable::new(),
-            exit_code: Mutex::new(None),
+            lifecycle: Mutex::new(ProcessLifecycle::new(koid.0, koid.0)),
             exit_waiters: WaitQueue::new(),
             address_space: Mutex::new(None),
         })
@@ -53,20 +55,52 @@ impl Process {
         count
     }
 
+    /// Mark the process as running. The policy accepts this only once, when
+    /// the first thread is started.
+    pub fn start(&self) -> bool {
+        self.lifecycle.lock().start()
+    }
+
     /// Record the exit code and wake anyone blocked in ProcessWait.
     /// Idempotent: the first exit code wins.
-    pub fn set_exit_code(&self, code: i64) {
-        let mut slot = self.exit_code.lock();
-        if slot.is_none() {
-            *slot = Some(code);
+    pub fn set_exit_code(&self, code: i64) -> bool {
+        let exited = self.lifecycle.lock().exit(code);
+        if exited {
+            self.exit_waiters.wake_all();
         }
-        drop(slot);
-        self.exit_waiters.wake_all();
+        exited
     }
 
     /// Snapshot exit code if the process has already exited.
     pub fn exit_code(&self) -> Option<i64> {
-        *self.exit_code.lock()
+        self.lifecycle.lock().exit_code()
+    }
+
+    /// Current policy state.
+    pub fn lifecycle_state(&self) -> ProcState {
+        self.lifecycle.lock().state()
+    }
+
+    /// Register one blocking exit waiter. Returns false if the process has
+    /// already exited and the caller should observe the stored status without
+    /// parking.
+    pub fn add_exit_waiter(&self) -> bool {
+        self.lifecycle.lock().add_waiter()
+    }
+
+    /// Release one blocking exit waiter.
+    pub fn remove_exit_waiter(&self) {
+        self.lifecycle.lock().remove_waiter();
+    }
+
+    /// Whether lifecycle policy permits final metadata reaping.
+    pub fn can_reap(&self) -> bool {
+        self.lifecycle.lock().can_reap()
+    }
+
+    /// Snapshot the generation-bearing exit payload.
+    pub fn exit_info(&self) -> Option<ExitInfo> {
+        self.lifecycle.lock().exit_info()
     }
 }
 

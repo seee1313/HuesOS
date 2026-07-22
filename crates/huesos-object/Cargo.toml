@@ -12,3 +12,4 @@ log = { workspace = true }
 huesos-pmm = { path = "../huesos-pmm" }
 huesos-abi = { path = "../huesos-abi" }
 huesos-quota = { path = "../huesos-quota" }
+huesos-proclife = { path = "../huesos-proclife" }

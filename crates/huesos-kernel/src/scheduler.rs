@@ -598,6 +598,8 @@ pub fn spawn_user_thread(
     // under QEMU TCG (missing ready handshake). Kernel threads may still
     // use find_best_cpu for load balance.
     let cpu = cpu_id();
+    // Drive the policy transition before publishing the first runnable task.
+    let _ = process.start();
     let mut guard = PER_CPU_SCHEDULERS[cpu].lock();
     let id = guard.add_task(cpu, |id| {
         Task::new_user(

@@ -1,7 +1,8 @@
 # Dynamic Processes: Process Lifecycle Policy (`huesos-proclife`)
 
-Status: **policy + host tests landed; privileged scheduler/process integration
-and on-target behavior not yet implemented or verified.**
+Status: **policy + host tests landed; the kernel Process object now owns the
+policy state machine and `ProcessWait` accounts waiters. Full graveyard/reap
+integration and on-target lifecycle stress remain.**
 
 This document describes the host-testable crate `huesos-proclife` and how it is
 intended to plug into the kernel. It supports
@@ -60,20 +61,22 @@ A stateful per-process record:
 - `reap()`: `Exited -> Reaped` only when `can_reap()`.
 - `exit_info()`: the `ExitInfo`, available once exited (and still after reap).
 
-## Intended kernel integration (NOT yet implemented here)
+## Current kernel integration boundary
 
-This crate changes no privileged behavior. The planned integration:
+The kernel `Process` object now owns a `Mutex<ProcessLifecycle>` rather than a
+second independent exit-code state. The first userspace task publication drives
+`Created -> Running`; process exit drives the policy's `exit(code)` transition
+and wakes the existing wait queue. `ProcessWait` calls `add_waiter()` before
+parking and releases the waiter when the exit status is observed, so waits
+arriving after exit do not park unnecessarily.
 
-1. `ThreadStart` drives `start()`; process exit (last thread exit / kill) drives
-   `exit(code)`.
-2. On `exit`, wake blocked `ProcessWait` callers and emit a port packet built
-   from `exit_info()` to subscribed supervisors.
-3. `ProcessWait` registers via `add_waiter()` and releases via `remove_waiter()`
-   on satisfaction/cancel; reaping (`reap()`) is gated on `can_reap()` so an
-   observed exit is not lost.
-4. On `Reaped`, hand a `FinishedTask` record to the `huesos-lifecycle` graveyard
-   and release address-space/kernel-stack resources (already reaped today) plus
-   bounded finished-task metadata.
+The remaining integration work is:
+
+1. emit a generation-bearing exit packet to subscribed Port supervisors;
+2. drive `Exited -> Reaped` from the object/reaper lifecycle;
+3. hand `FinishedTask` records to the bounded `huesos-lifecycle` graveyard;
+4. release address-space, kernel-stack, handle, and quota resources only after
+   the policy transition permits it.
 
 ## What still requires on-target verification
 
