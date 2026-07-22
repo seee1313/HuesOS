@@ -28,6 +28,7 @@ use core::ops::{Deref, DerefMut};
 use core::sync::atomic::Ordering;
 use huesos_arch::{LockRank, RankedIrqSafeTicketLock};
 use huesos_object::{KernelObject, Process};
+use huesos_lifecycle::TaskGraveyard;
 use x86_64::VirtAddr;
 
 /// Maximum number of CPUs supported.
@@ -655,7 +656,9 @@ pub fn exit_current_task(code: i64) -> ! {
         }
     }
     if let Some(proc) = process_to_signal {
-        proc.set_exit_code(code);
+        if proc.set_exit_code(code) {
+            record_process_exit(&proc, code);
+        }
         huesos_object::collect_exited_process(proc.koid());
         PROCESS_TEARDOWN.lock().push(proc);
         REAP_PENDING.store(true, Ordering::Release);
@@ -698,7 +701,9 @@ pub fn terminate_current_process(code: i64) -> ! {
     let Some(process) = process else {
         panic!("terminate_current_process called without a userspace process");
     };
-    process.set_exit_code(code);
+    if process.set_exit_code(code) {
+        record_process_exit(&process, code);
+    }
     let process_koid = process.koid();
     huesos_object::collect_exited_process(process_koid);
 
@@ -756,6 +761,36 @@ fn switch_away_from_finished(cpu: usize) -> ! {
         huesos_arch::hlt();
         huesos_arch::interrupts::disable();
     }
+}
+
+static TASK_GRAVEYARD: RankedIrqSafeTicketLock<Option<TaskGraveyard<256>>> =
+    RankedIrqSafeTicketLock::new(None, LockRank::REAPER);
+
+fn record_process_exit(process: &Process, code: i64) {
+    let Some(info) = process.exit_info() else {
+        return;
+    };
+    let mut yard = TASK_GRAVEYARD.lock();
+    let graveyard = yard.get_or_insert_with(TaskGraveyard::new);
+    let _ = graveyard.record_exit(info.koid, code, global_ticks());
+}
+
+fn reap_observed_process_exits() {
+    let mut yard = TASK_GRAVEYARD.lock();
+    let Some(graveyard) = yard.as_mut() else {
+        return;
+    };
+    let _ = graveyard.reap_waited(|koid, generation| {
+        match huesos_object::lookup_process(huesos_object::Koid(koid)) {
+            Some(process) => {
+                process.lifecycle_state().is_terminal()
+                    && process
+                        .exit_info()
+                        .is_some_and(|info| info.generation == generation)
+            }
+            None => true,
+        }
+    });
 }
 
 /// True while deferred task/process teardown needs process-context service.
@@ -853,6 +888,7 @@ pub fn reap_finished_tasks() {
             crate::process::teardown_process(&proc);
         }
     }
+    reap_observed_process_exits();
 }
 
 #[cfg(test)]
