@@ -402,10 +402,10 @@ mod tests {
             let (_message, reason) = error.into_parts();
             assert_eq!(reason, ChannelSendFailure::PeerClosed);
         }
-        assert_eq!(
+        assert!(matches!(
             b.recv_if_fits(0, 0),
             Err(ChannelRecvError::PeerClosed)
-        );
+        ));
     }
 
 }
