@@ -538,4 +538,10 @@ mod tests {
         assert_eq!(ErrorCode::from_raw(-22), Some(ErrorCode::PeerClosed));
         assert_eq!(ErrorCode::PeerClosed.as_str(), "channel peer closed");
     }
+
+    #[test]
+    fn peer_closed_error_round_trips() {
+        assert_eq!(ErrorCode::from_raw(-22), Some(ErrorCode::PeerClosed));
+        assert_eq!(ErrorCode::PeerClosed.as_str(), "channel peer closed");
+    }
 }
