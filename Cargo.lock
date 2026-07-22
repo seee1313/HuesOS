@@ -162,6 +162,7 @@ dependencies = [
  "bitflags 2.13.0",
  "huesos-abi",
  "huesos-pmm",
+ "huesos-proclife",
  "huesos-quota",
  "log",
  "spin",

@@ -202,8 +202,12 @@ pub(crate) fn sys_process_wait(handle: HandleValue, out_code: *mut i64) -> Sysca
     // fault only after the target has exited.
     user_memory::validate_write(out_code)?;
     let target = process_for_wait(handle)?;
+    let registered = target.add_exit_waiter();
     loop {
         if let Some(code) = target.exit_code() {
+            if registered {
+                target.remove_exit_waiter();
+            }
             user_memory::write_value(out_code, &code)?;
             return Ok(0);
         }
