@@ -116,7 +116,9 @@ extern "x86-interrupt" fn page_fault_handler(
             // this handler; the fixup is emitted by the validated extable and
             // points at the same copy function's recovery return.
             unsafe {
-                frame.as_mut().instruction_pointer = x86_64::VirtAddr::new(fixup);
+                frame
+                    .as_mut()
+                    .update(|value| value.instruction_pointer = x86_64::VirtAddr::new(fixup));
             }
             return;
         }
