@@ -1,8 +1,8 @@
 # Recoverable Copies: Exception / Fixup Table (`huesos-extable`)
 
-Status: **policy + privileged copy/fault integration landed; QEMU matrix and
-host tests pass. Adversarial fault-injection, wider fault classes, and full
-SMEP/SMAP validation remain.**
+Status: **policy + privileged copy/fault integration landed as an opt-in
+extable test path; normal boot remains on the existing fatal fault policy until
+the release linker-table smoke is promoted.**
 
 This document describes the host-testable crate `huesos-extable` and how it is
 intended to plug into the kernel. It supports
@@ -68,11 +68,12 @@ faulting RIP is covered, else `Fatal` (the kernel panic path).
 ## Current privileged integration
 
 The kernel now emits four `(fault range, fixup)` entries from the assembly
-user-copy primitives into a linker `.ex_table` section. The kernel validates
-that section through `huesos-extable` at fault-recovery time, and the page-fault
-handler redirects a kernel-mode RIP to the fixup when it falls inside one of
-the copy ranges. The fixup returns `-1`, which the validated user-copy layer
-maps to `InvalidArgs`.
+user-copy primitives into a linker `.ex_table` section. An opt-in HBI test
+image installs the `huesos-extable` lookup callback; the page-fault handler then
+redirects a kernel-mode RIP to the fixup when it falls inside one of the copy
+ranges. The fixup returns `-1`, which the validated user-copy layer maps to
+`InvalidArgs`. Normal images keep the established fatal kernel-fault policy
+until release-mode linker-table validation is promoted.
 
 Process user-memory locking and VMAR mutation locking prevent the normal
 validation/copy race; the cross-CPU TLB shootdown handles stale translations.

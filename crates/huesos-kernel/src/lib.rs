@@ -220,9 +220,11 @@ pub unsafe fn kmain(boot_info: BootInfo) -> ! {
 
     init::framebuffer_init(boot_info.framebuffer);
     huesos_arch::fault::set_kernel_fault_handler(crate::panic::from_cpu_fault);
-    huesos_arch::fault::set_kernel_fault_recovery(recover_kernel_fault);
     huesos_arch::fault::set_user_fault_handler(handle_user_fault);
     if extable_test_requested {
+        // Keep the recovery hook opt-in until the dedicated extable image has
+        // validated the linker table and both fixup ranges in release mode.
+        huesos_arch::fault::set_kernel_fault_recovery(recover_kernel_fault);
         let ok = run_extable_smoke();
         if ok {
             dbg("[extable] recoverable copy smoke OK\n");
