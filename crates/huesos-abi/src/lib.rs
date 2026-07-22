@@ -201,6 +201,8 @@ pub enum ErrorCode {
     /// A required kernel subsystem was unavailable or violated its state
     /// contract; callers must not retry without an external state change.
     Internal = -21,
+    /// The peer endpoint is closed and no queued message remains.
+    PeerClosed = -22,
 }
 
 impl ErrorCode {
