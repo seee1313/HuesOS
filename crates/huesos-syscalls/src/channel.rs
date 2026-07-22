@@ -6,6 +6,15 @@ use huesos_object::{ChannelRecvError, Handle, KernelObject, KernelObjectExt, Rig
 
 use crate::{user_memory, util::current_proc, SyscallResult};
 
+fn map_recv_error(error: ChannelRecvError) -> huesos_abi::ErrorCode {
+    match error {
+        ChannelRecvError::BytesTooSmall | ChannelRecvError::HandlesTooSmall => {
+            ErrorCode::InvalidArgs
+        }
+        ChannelRecvError::PeerClosed => ErrorCode::PeerClosed,
+    }
+}
+
 pub(crate) fn sys_channel_create(out0: *mut HandleValue, out1: *mut HandleValue) -> SyscallResult {
     if out0 == out1 {
         return Err(ErrorCode::InvalidArgs);
@@ -90,14 +99,19 @@ pub(crate) fn sys_channel_write(
         Err(error) => {
             // Queue admission is quota-governed. Restore every moved handle
             // when admission fails so the operation remains all-or-nothing.
-            let (mut message, _reason) = error.into_parts();
+            let (mut message, reason) = error.into_parts();
             for (hv, inner_h) in raw_handles.iter().copied().zip(message.handles.drain(..)) {
                 match proc.handles.restore_existing_at(hv, inner_h) {
                     Ok(()) => {}
                     Err(lost) => huesos_object::note_handle_close(lost.koid),
                 }
             }
-            Err(ErrorCode::NoMemory)
+            let status = match reason {
+                huesos_object::ChannelSendFailure::PeerClosed => ErrorCode::PeerClosed,
+                huesos_object::ChannelSendFailure::QuotaExceeded
+                | huesos_object::ChannelSendFailure::OutOfMemory => ErrorCode::NoMemory,
+            };
+            Err(status)
         }
     }
 }
@@ -128,9 +142,15 @@ pub(crate) fn sys_channel_read(
         .downcast_ref::<huesos_object::Channel>()
         .ok_or(ErrorCode::WrongType)?;
     let msg = match wait_mode {
-        0 => ch.recv().ok_or(ErrorCode::ShouldWait)?,
-        1 => ch.recv_blocking(),
-        ticks => ch.recv_blocking_timeout(ticks).ok_or(ErrorCode::TimedOut)?,
+        0 => ch
+            .recv_status()
+            .map_err(map_recv_error)?
+            .ok_or(ErrorCode::ShouldWait)?,
+        1 => ch.recv_blocking().map_err(map_recv_error)?,
+        ticks => ch
+            .recv_blocking_timeout(ticks)
+            .map_err(map_recv_error)?
+            .ok_or(ErrorCode::TimedOut)?,
     };
     let to_copy = msg.data.len().min(capacity);
     user_memory::copy_to_user(buf, &msg.data[..to_copy])?;
@@ -177,16 +197,12 @@ pub(crate) fn sys_channel_read_etc(
         match ch.recv_if_fits(byte_capacity, handle_capacity) {
             Ok(Some(msg)) => msg,
             Ok(None) => return Err(ErrorCode::ShouldWait),
-            Err(ChannelRecvError::BytesTooSmall | ChannelRecvError::HandlesTooSmall) => {
-                return Err(ErrorCode::InvalidArgs)
-            }
+            Err(error) => return Err(map_recv_error(error)),
         }
     } else {
         match ch.recv_if_fits_blocking(byte_capacity, handle_capacity) {
             Ok(msg) => msg,
-            Err(ChannelRecvError::BytesTooSmall | ChannelRecvError::HandlesTooSmall) => {
-                return Err(ErrorCode::InvalidArgs)
-            }
+            Err(error) => return Err(map_recv_error(error)),
         }
     };
 
