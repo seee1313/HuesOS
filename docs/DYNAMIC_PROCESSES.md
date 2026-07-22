@@ -73,10 +73,9 @@ arriving after exit do not park unnecessarily.
 The remaining integration work is:
 
 1. emit a generation-bearing exit packet to subscribed Port supervisors;
-2. drive `Exited -> Reaped` from the object/reaper lifecycle;
-3. hand `FinishedTask` records to the bounded `huesos-lifecycle` graveyard;
-4. release address-space, kernel-stack, handle, and quota resources only after
-   the policy transition permits it.
+2. connect more object-specific cleanup decisions to the `Reaped` transition;
+3. charge/release handle, page-table, and CPU quota resources only after the
+   policy transition permits it.
 
 ## What still requires on-target verification
 

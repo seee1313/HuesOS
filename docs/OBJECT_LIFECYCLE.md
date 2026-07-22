@@ -63,9 +63,13 @@ re-enter registry collection. Dropping while holding the mutex would deadlock.
 
 A running process can outlive all userspace process handles because scheduler
 tasks own `Arc<Process>`. Its object-discovery entry may disappear, while the
-typed process index remains until the process exits. Setting the exit status
-re-runs collection; if no wait handle remains, the typed index is removed.
-Scheduler/task Arcs then determine the final Rust lifetime.
+typed process index remains until the process exits. `Process` now owns the
+`huesos-proclife` state machine: the first task starts it, exit records the
+status, waiters are accounted, and `Reaped` is reached only after the last
+waiter is released. The scheduler records a generation-bearing
+`FinishedTask` in the bounded `huesos-lifecycle` graveyard and removes observed
+terminal records during deferred reaping. Scheduler/task Arcs still determine
+the final Rust lifetime.
 
 Interrupt fanout exists only to deliver events to live userspace capabilities.
 Final handle collection removes the corresponding typed IRQ entries.

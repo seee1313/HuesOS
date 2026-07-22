@@ -84,7 +84,14 @@ impl Process {
     /// Record the exit code and wake anyone blocked in ProcessWait.
     /// Idempotent: the first exit code wins.
     pub fn set_exit_code(&self, code: i64) -> bool {
-        let exited = self.lifecycle.lock().exit(code);
+        let exited = {
+            let mut lifecycle = self.lifecycle.lock();
+            let exited = lifecycle.exit(code);
+            if exited && lifecycle.can_reap() {
+                let _ = lifecycle.reap();
+            }
+            exited
+        };
         if exited {
             self.exit_waiters.wake_all();
         }
@@ -110,7 +117,11 @@ impl Process {
 
     /// Release one blocking exit waiter.
     pub fn remove_exit_waiter(&self) {
-        self.lifecycle.lock().remove_waiter();
+        let mut lifecycle = self.lifecycle.lock();
+        lifecycle.remove_waiter();
+        if lifecycle.can_reap() {
+            let _ = lifecycle.reap();
+        }
     }
 
     /// Whether lifecycle policy permits final metadata reaping.
