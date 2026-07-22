@@ -425,11 +425,13 @@ impl AddressSpace {
         // page-table frame for its full lifetime.
         let table: &mut PageTable = unsafe { &mut *virt.as_mut_ptr() };
         let phys_offset = VirtAddr::new(*HHDM_OFFSET.lock());
-        // SAFETY: table is the unique mutable PML4 owned behind &mut self.
-        let mut mapper = unsafe { OffsetPageTable::new(table, phys_offset) };
-        let flush = mapper
-            .update_flags(page, flags)
-            .map_err(|_| UserPageError::NotMapped)?;
+        // SAFETY: table is the unique mutable PML4 owned behind &mut self;
+        // update_flags changes only the validated page in that table.
+        let flush = unsafe {
+            let mut mapper = OffsetPageTable::new(table, phys_offset);
+            mapper.update_flags(page, flags)
+        }
+        .map_err(|_| UserPageError::NotMapped)?;
         // The caller performs one range TLB shootdown after the transaction.
         flush.ignore();
         Ok(())
