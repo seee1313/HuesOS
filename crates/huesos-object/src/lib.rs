@@ -422,7 +422,7 @@ mod tests {
         assert!(!process.can_reap());
         assert!(process.exit_info().is_some());
         process.remove_exit_waiter();
-        assert!(process.can_reap());
+        assert_eq!(process.lifecycle_state(), huesos_proclife::ProcState::Reaped);
         assert!(!process.set_exit_code(18));
     }
 
