@@ -1,5 +1,3 @@
-.intel_syntax noprefix
-
 .section .text
 
 .global huesos_copy_from_user
@@ -56,5 +54,3 @@ huesos_copy_to_user:
 .quad .Lcfu_write, .Lcfu_write_end, .Lcfu_fixup
 .quad .Lctu_read, .Lctu_read_end, .Lctu_fixup
 .quad .Lctu_write, .Lctu_write_end, .Lctu_fixup
-
-.att_syntax prefix
