@@ -177,7 +177,7 @@ impl HandleTable {
         }
         match self.insert_at(value, handle) {
             Ok(()) => Ok(()),
-            Err(handle) => {
+            Err(_handle) => {
                 if let Some(job) = &self.job {
                     let _ = job.release(Resource::Handles, 1);
                 }

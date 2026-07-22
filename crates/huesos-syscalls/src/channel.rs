@@ -103,7 +103,8 @@ pub(crate) fn sys_channel_write(
         .map_err(|error| match error {
             huesos_object::HandleTableError::Missing => ErrorCode::BadHandle,
             huesos_object::HandleTableError::Duplicate => ErrorCode::InvalidArgs,
-            huesos_object::HandleTableError::OutOfMemory => ErrorCode::NoMemory,
+            huesos_object::HandleTableError::OutOfMemory
+            | huesos_object::HandleTableError::QuotaExceeded => ErrorCode::NoMemory,
         })?;
     let message = huesos_object::ChannelMessage {
         data,
