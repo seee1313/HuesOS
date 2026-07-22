@@ -157,7 +157,7 @@ impl Vmar {
     /// Update permissions on one exact mapping reservation.
     pub fn update_mapping_flags(&self, mapping: VmarMapping, flags: u32) -> bool {
         let mut mappings = self.mappings.lock();
-        let Some(existing) = mappings.iter_mut().find(|existing| *existing == mapping) else {
+        let Some(existing) = mappings.iter_mut().find(|existing| **existing == mapping) else {
             return false;
         };
         existing.flags = flags;
