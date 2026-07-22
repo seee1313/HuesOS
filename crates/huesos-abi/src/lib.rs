@@ -116,13 +116,18 @@ pub enum Syscall {
     /// Submit one structurally validated request through an ACPI broker
     /// capability and write an [`acpi_broker::Response`].
     AcpiBrokerCall = 27,
+    /// Create a VMO with explicit mapping rights. `a1` is the size, `a2` is
+    /// [`vmo_create_flags`], and `a3` is the output handle pointer. This is
+    /// the capability-safe successor to [`Syscall::VmoCreate`] for executable
+    /// ELF segments.
+    VmoCreateEx = 28,
 }
 
 impl Syscall {
     /// Total number of defined syscalls (i.e. one past the highest
     /// currently-assigned number). The dispatcher uses this to reject
     /// obviously-out-of-range numbers before a `match`.
-    pub const COUNT: u64 = 28;
+    pub const COUNT: u64 = 29;
 
     /// Convert a raw syscall number back into a [`Syscall`], if valid.
     pub const fn from_raw(n: u64) -> Option<Self> {
@@ -155,6 +160,7 @@ impl Syscall {
             25 => Self::SystemShutdown,
             26 => Self::ProcessGetExitCode,
             27 => Self::AcpiBrokerCall,
+            28 => Self::VmoCreateEx,
             _ => return None,
         })
     }
@@ -289,6 +295,32 @@ pub mod rights {
     pub const MAP: u32 = 1 << 5;
     /// Duplicate with the exact same rights as the source handle.
     pub const SAME_RIGHTS: u32 = 1 << 31;
+
+    /// Return the rights required to perform a VMAR mapping with `flags`.
+    ///
+    /// `MAP` is always required. Read/write/execute permissions are separate
+    /// capabilities so reducing a VMO handle's rights cannot be bypassed by
+    /// requesting a stronger page-table mapping.
+    pub const fn mapping_required(flags: u32) -> u32 {
+        let mut required = MAP;
+        if flags & super::vmar_flags::READ != 0 {
+            required |= READ;
+        }
+        if flags & super::vmar_flags::WRITE != 0 {
+            required |= WRITE;
+        }
+        if flags & super::vmar_flags::EXECUTE != 0 {
+            required |= EXECUTE;
+        }
+        required
+    }
+}
+
+/// Flags accepted by [`Syscall::VmoCreateEx`].
+pub mod vmo_create_flags {
+    /// Grant the returned VMO capability the right to create executable
+    /// mappings. The page mapping still remains subject to W^X.
+    pub const EXECUTABLE: u32 = 1 << 0;
 }
 
 /// Lowest userspace virtual address accepted by the root VMAR. The first
@@ -435,4 +467,38 @@ pub struct VmarMapArgs {
     pub len: u64,
     /// Mapping options/permissions from [`vmar_flags`].
     pub flags: u32,
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::{rights, vmar_flags, Syscall};
+
+    #[test]
+    fn mapping_rights_include_each_requested_permission() {
+        let flags = vmar_flags::USER
+            | vmar_flags::SPECIFIC
+            | vmar_flags::READ
+            | vmar_flags::WRITE
+            | vmar_flags::EXECUTE;
+        let required = rights::mapping_required(flags);
+        assert_eq!(
+            required,
+            rights::MAP | rights::READ | rights::WRITE | rights::EXECUTE
+        );
+    }
+
+    #[test]
+    fn mapping_rights_always_include_map_but_not_unrequested_permissions() {
+        let required = rights::mapping_required(vmar_flags::USER | vmar_flags::SPECIFIC);
+        assert_eq!(required, rights::MAP);
+    }
+
+    #[test]
+    fn syscall_numbers_remain_append_only() {
+        assert_eq!(Syscall::VmoCreateEx as u64, 28);
+        assert_eq!(Syscall::COUNT, 29);
+        assert_eq!(Syscall::from_raw(28), Some(Syscall::VmoCreateEx));
+        assert_eq!(Syscall::from_raw(29), None);
+    }
 }

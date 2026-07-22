@@ -26,6 +26,9 @@ pub(crate) fn sys_handle_duplicate(
 
     let proc = current_proc()?;
     let h = proc.handles.get(handle).ok_or(ErrorCode::BadHandle)?;
+    if !h.has_rights(Rights::DUPLICATE) {
+        return Err(ErrorCode::AccessDenied);
+    }
     let new_rights = if rights == huesos_abi::rights::SAME_RIGHTS {
         h.rights
     } else {
@@ -37,6 +40,9 @@ pub(crate) fn sys_handle_duplicate(
         requested
     };
     let new_hv = proc.handles.add(Handle::new(h.koid, new_rights));
-    user_memory::write_value(out, &new_hv)?;
+    if let Err(error) = user_memory::write_value(out, &new_hv) {
+        let _ = proc.handles.remove(new_hv);
+        return Err(error);
+    }
     Ok(0)
 }

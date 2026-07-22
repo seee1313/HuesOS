@@ -1,5 +1,6 @@
 //! Channel IPC objects.
 
+use alloc::collections::VecDeque;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::any::Any;
@@ -7,25 +8,112 @@ use spin::Mutex;
 
 use crate::wait::{self, WaitQueue};
 use crate::{alloc_koid, Handle, KernelObject, Koid, ObjectType};
+use huesos_quota::{Limits, Quota, Resource, UNLIMITED};
 
-/// Channel — one endpoint of a bidirectional IPC pipe.
-///
+/// Maximum number of messages retained in one channel inbox.
+pub const MAX_CHANNEL_QUEUE_MESSAGES: usize = 256;
+/// Maximum aggregate byte payload retained in one channel inbox.
+pub const MAX_CHANNEL_QUEUE_BYTES: u64 = 1024 * 1024;
+/// Maximum aggregate transferred handles retained in one channel inbox.
+pub const MAX_CHANNEL_QUEUE_HANDLES: u64 = 256;
+
 /// A channel pair (created together via [`Channel::pair`]) shares two
-/// message queues: writes on endpoint A enqueue onto the queue that
-/// endpoint B reads from, and vice versa. Each endpoint keeps an `Arc` to
-/// its peer's inbox so the pair keeps working even after one side's
-/// `Channel` object handle is dropped independently.
+/// bounded message queues: writes on endpoint A enqueue onto the queue that
+/// endpoint B reads from, and vice versa. Each endpoint keeps an `Arc` to its
+/// peer's inbox so the pair keeps working even after one side's `Channel`
+/// object handle is dropped independently.
 pub struct Channel {
     koid: Koid,
     /// Queue this endpoint *reads from* (the peer writes into it).
-    inbox: Arc<Mutex<Vec<ChannelMessage>>>,
+    inbox: Arc<Mutex<MessageQueue>>,
     /// Queue this endpoint *writes to* (the peer reads from it).
-    outbox: Arc<Mutex<Vec<ChannelMessage>>>,
+    outbox: Arc<Mutex<MessageQueue>>,
     /// Waiters blocked in a read on this endpoint (shared with peer's
     /// `peer_readers` so `send` can wake them).
     readers: Arc<WaitQueue>,
     /// Peer's reader wait queue.
     peer_readers: Arc<WaitQueue>,
+}
+
+struct MessageQueue {
+    messages: VecDeque<ChannelMessage>,
+    quota: Quota,
+}
+
+impl MessageQueue {
+    fn new() -> Result<Self, ChannelCreateError> {
+        let mut messages = VecDeque::new();
+        messages
+            .try_reserve_exact(MAX_CHANNEL_QUEUE_MESSAGES)
+            .map_err(|_| ChannelCreateError::OutOfMemory)?;
+        Ok(Self {
+            messages,
+            quota: Quota::new(Limits {
+                max_memory: MAX_CHANNEL_QUEUE_BYTES,
+                max_handles: MAX_CHANNEL_QUEUE_HANDLES,
+                max_cpu_ticks: UNLIMITED,
+            }),
+        })
+    }
+
+    fn enqueue(&mut self, msg: ChannelMessage) -> Result<(), ChannelSendError> {
+        let bytes = msg.data.len() as u64;
+        let handles = msg.handles.len() as u64;
+        if self.messages.len() >= MAX_CHANNEL_QUEUE_MESSAGES
+            || !self.quota.fits(Resource::Memory, bytes)
+            || !self.quota.fits(Resource::Handles, handles)
+        {
+            return Err(ChannelSendError::new(msg, ChannelSendFailure::QuotaExceeded));
+        }
+
+        // Queue storage is preallocated during channel creation. Never grow
+        // it from a send path; a capacity mismatch is a normal admission
+        // failure rather than a reason to allocate or panic.
+        if self.messages.capacity() <= self.messages.len() {
+            return Err(ChannelSendError::new(msg, ChannelSendFailure::OutOfMemory));
+        }
+        let _ = self.quota.try_acquire(Resource::Memory, bytes);
+        let _ = self.quota.try_acquire(Resource::Handles, handles);
+        self.messages.push_back(msg);
+        Ok(())
+    }
+
+    fn dequeue(&mut self) -> Option<ChannelMessage> {
+        let msg = self.messages.pop_front()?;
+        self.quota
+            .release(Resource::Memory, msg.data.len() as u64);
+        self.quota
+            .release(Resource::Handles, msg.handles.len() as u64);
+        Some(msg)
+    }
+}
+
+/// Failure returned when a channel message cannot be admitted to its bounded
+/// peer queue.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ChannelSendFailure {
+    /// The queue's message, byte, or transferred-handle quota is exhausted.
+    QuotaExceeded,
+    /// The queue could not reserve its bounded slot.
+    OutOfMemory,
+}
+
+/// A failed send together with the untouched message, allowing the syscall
+/// layer to restore moved handles transactionally.
+pub struct ChannelSendError {
+    message: ChannelMessage,
+    reason: ChannelSendFailure,
+}
+
+impl ChannelSendError {
+    fn new(message: ChannelMessage, reason: ChannelSendFailure) -> Self {
+        Self { message, reason }
+    }
+
+    /// Split the failure into its reason and original message.
+    pub fn into_parts(self) -> (ChannelMessage, ChannelSendFailure) {
+        (self.message, self.reason)
+    }
 }
 
 /// A message sent over a channel.
@@ -55,12 +143,19 @@ pub enum ChannelRecvError {
     HandlesTooSmall,
 }
 
+/// Failure while allocating the bounded channel queues.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ChannelCreateError {
+    /// The fixed queue storage could not be allocated.
+    OutOfMemory,
+}
+
 impl Channel {
     /// Create a connected pair of channel endpoints. Writing to one and
     /// reading from the other (or vice versa) delivers messages correctly.
-    pub fn pair() -> (Arc<Self>, Arc<Self>) {
-        let q1 = Arc::new(Mutex::new(Vec::new()));
-        let q2 = Arc::new(Mutex::new(Vec::new()));
+    pub fn pair() -> Result<(Arc<Self>, Arc<Self>), ChannelCreateError> {
+        let q1 = Arc::new(Mutex::new(MessageQueue::new()?));
+        let q2 = Arc::new(Mutex::new(MessageQueue::new()?));
         let readers_a = Arc::new(WaitQueue::new());
         let readers_b = Arc::new(WaitQueue::new());
 
@@ -78,37 +173,40 @@ impl Channel {
             readers: readers_b,
             peer_readers: readers_a,
         });
-        (a, b)
+        Ok((a, b))
     }
 
     /// Create a standalone channel endpoint with no peer (writes are
-    /// dropped, reads always empty). Mainly useful for tests; real
-    /// producers should use [`Channel::pair`].
-    pub fn new() -> Arc<Self> {
+    /// retained in its bounded outbox; real producers should use
+    /// [`Channel::pair`]). Mainly useful for tests.
+    pub fn new() -> Result<Arc<Self>, ChannelCreateError> {
         let readers = Arc::new(WaitQueue::new());
-        Arc::new(Self {
+        Ok(Arc::new(Self {
             koid: alloc_koid(),
-            inbox: Arc::new(Mutex::new(Vec::new())),
-            outbox: Arc::new(Mutex::new(Vec::new())),
+            inbox: Arc::new(Mutex::new(MessageQueue::new()?)),
+            outbox: Arc::new(Mutex::new(MessageQueue::new()?)),
             readers: Arc::clone(&readers),
             peer_readers: readers,
-        })
+        }))
     }
 
     /// Send a message to the peer endpoint (enqueued FIFO) and wake one reader.
-    pub fn send(&self, msg: ChannelMessage) {
-        self.outbox.lock().push(msg);
-        self.peer_readers.wake_one();
+    /// The message is returned unchanged on failure.
+    pub fn send(&self, msg: ChannelMessage) -> Result<(), ChannelSendError> {
+        let mut outbox = self.outbox.lock();
+        match outbox.enqueue(msg) {
+            Ok(()) => {
+                drop(outbox);
+                self.peer_readers.wake_one();
+                Ok(())
+            }
+            Err(error) => Err(error),
+        }
     }
 
     /// Receive a message sent by the peer endpoint (non-blocking, FIFO).
     pub fn recv(&self) -> Option<ChannelMessage> {
-        let mut q = self.inbox.lock();
-        if q.is_empty() {
-            None
-        } else {
-            Some(q.remove(0))
-        }
+        self.inbox.lock().dequeue()
     }
 
     /// Blocking receive: park until a message is available.
@@ -149,7 +247,7 @@ impl Channel {
         handle_capacity: usize,
     ) -> Result<Option<ChannelMessage>, ChannelRecvError> {
         let mut q = self.inbox.lock();
-        let Some(msg) = q.first() else {
+        let Some(msg) = q.messages.front() else {
             return Ok(None);
         };
         if msg.data.len() > byte_capacity {
@@ -158,7 +256,7 @@ impl Channel {
         if msg.handles.len() > handle_capacity {
             return Err(ChannelRecvError::HandlesTooSmall);
         }
-        Ok(Some(q.remove(0)))
+        Ok(q.dequeue())
     }
 
     /// Blocking variant of [`Self::recv_if_fits`].

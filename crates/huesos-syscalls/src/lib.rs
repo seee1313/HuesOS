@@ -117,5 +117,8 @@ pub fn dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> Syscal
             a2 as *const huesos_abi::acpi_broker::Request,
             a3 as *mut huesos_abi::acpi_broker::Response,
         ),
+        S::VmoCreateEx => {
+            vmo::sys_vmo_create_ex(a1 as usize, a2 as u32, a3 as *mut HandleValue)
+        }
     }
 }

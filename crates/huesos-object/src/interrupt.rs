@@ -59,7 +59,7 @@ impl Interrupt {
         let Some(port) = port_obj.downcast_ref::<Port>() else {
             return;
         };
-        port.queue(PortPacket {
+        let _ = port.queue(PortPacket {
             key: binding.key,
             packet_type,
             status: 0,

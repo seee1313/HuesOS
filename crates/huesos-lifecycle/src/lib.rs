@@ -450,8 +450,12 @@ impl RefAccount {
     }
 
     /// Open `n` handle references (installing handles / enqueueing a transfer).
-    pub fn open_handles(&mut self, n: u64) {
+    pub fn open_handles(&mut self, n: u64) -> bool {
+        if self.collected {
+            return false;
+        }
         self.handle_refs = self.handle_refs.saturating_add(n);
+        true
     }
 
     /// Close `n` handle references, saturating at zero (never underflows).
@@ -460,8 +464,12 @@ impl RefAccount {
     }
 
     /// Open `n` kernel references (e.g. a VMAR mapping).
-    pub fn open_kernel_refs(&mut self, n: u64) {
+    pub fn open_kernel_refs(&mut self, n: u64) -> bool {
+        if self.collected {
+            return false;
+        }
         self.kernel_refs = self.kernel_refs.saturating_add(n);
+        true
     }
 
     /// Close `n` kernel references, saturating at zero.
@@ -797,4 +805,15 @@ mod tests {
         assert!(!account.may_collect());
         assert!(!account.try_collect());
     }
+    #[test]
+    fn collected_account_cannot_be_resurrected() {
+        let mut account = RefAccount::registered();
+        assert!(account.try_collect());
+        assert!(!account.open_handles(1));
+        assert!(!account.open_kernel_refs(1));
+        assert_eq!(account.handle_refs(), 0);
+        assert_eq!(account.kernel_refs(), 0);
+        assert!(!account.try_collect());
+    }
+
 }

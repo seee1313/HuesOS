@@ -415,25 +415,43 @@ pub fn park_current() {
     {
         let mut guard = PER_CPU_SCHEDULERS[cpu].lock();
         let idx = guard.current;
-        if let Some(task) = guard.tasks.get_mut(idx) {
+        let mut should_park = true;
+        let fair_key = if let Some(task) = guard.tasks.get_mut(idx) {
+            // The scheduler lock makes the blocked flag and the pending wake
+            // handshake atomic with respect to remote wake_task calls.
             task.blocked.store(true, Ordering::SeqCst);
-            if let SchedPolicy::Fair { vruntime, .. } = task.sched_policy {
-                let id = task.id;
-                guard.fair_queue.remove(vruntime, id);
+            let fair_key = match task.sched_policy {
+                SchedPolicy::Fair { vruntime, .. } => Some((vruntime, task.id)),
+                SchedPolicy::Deadline { .. } => None,
+            };
+            let pending = task.wake_pending.swap(false, Ordering::SeqCst);
+            if pending || !task.blocked.load(Ordering::SeqCst) {
+                task.blocked.store(false, Ordering::SeqCst);
+                should_park = false;
             }
+            fair_key
+        } else {
+            None
+        };
+        if let Some((vruntime, task_id)) = fair_key {
+            guard.fair_queue.remove(vruntime, task_id);
         }
         // Prefer tick(); if it declines to switch (edge case), force idle.
-        let switch_context = guard.tick().or_else(|| {
-            if guard.current == 0 || guard.tasks.len() <= 1 {
-                return None;
-            }
-            let old = guard.current;
-            guard.current = 0;
-            guard.apply_task_environment(0);
-            let old_ptr = &raw mut guard.tasks[old].context;
-            let new_ptr = &raw const guard.tasks[0].context;
-            Some((old_ptr, new_ptr))
-        });
+        let switch_context = if should_park {
+            guard.tick().or_else(|| {
+                if guard.current == 0 || guard.tasks.len() <= 1 {
+                    return None;
+                }
+                let old = guard.current;
+                guard.current = 0;
+                guard.apply_task_environment(0);
+                let old_ptr = &raw mut guard.tasks[old].context;
+                let new_ptr = &raw const guard.tasks[0].context;
+                Some((old_ptr, new_ptr))
+            })
+        } else {
+            None
+        };
         drop(guard);
         if let Some((old_ptr, new_ptr)) = switch_context {
             unsafe {
@@ -463,9 +481,17 @@ pub fn wake_task(task_id: u64) {
     let task = &mut guard.tasks[idx];
     if task.finished.load(Ordering::Relaxed) {
         task.blocked.store(false, Ordering::SeqCst);
+        task.wake_pending.store(false, Ordering::SeqCst);
         return;
     }
-    task.blocked.store(false, Ordering::SeqCst);
+    let was_blocked = task.blocked.swap(false, Ordering::SeqCst);
+    if !was_blocked {
+        // The waiter has not completed its enqueue-to-park handshake yet.
+        // Remember the wake so park_current will not put it to sleep.
+        task.wake_pending.store(true, Ordering::SeqCst);
+        return;
+    }
+    task.wake_pending.store(false, Ordering::SeqCst);
     if let SchedPolicy::Fair { vruntime, .. } = task.sched_policy {
         // insert is idempotent enough if we remove first (wavl may allow dup — remove first)
         let id = task.id;

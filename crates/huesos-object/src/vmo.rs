@@ -43,7 +43,10 @@ impl Vmo {
     pub fn new(size: usize) -> Result<Arc<Self>, VmoError> {
         let koid = alloc_koid();
         let page_count = size.div_ceil(PAGE_SIZE).max(1);
-        let mut frames = Vec::with_capacity(page_count);
+        let mut frames = Vec::new();
+        frames
+            .try_reserve_exact(page_count)
+            .map_err(|_| VmoError::OutOfMemory)?;
         for _ in 0..page_count {
             let frame = match huesos_pmm::alloc_frame() {
                 Ok(f) => f,

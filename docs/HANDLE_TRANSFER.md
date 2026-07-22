@@ -1,7 +1,9 @@
 # Handle-Transfer Semantics (`huesos-handlemove`)
 
-Status: **policy + host tests landed; privileged channel-send integration and
-on-target behavior not yet implemented or verified.**
+Status: **policy + host tests landed; bounded queue admission and rollback on
+queue rejection are now integrated, but the policy crate is not yet the single
+implementation used by the privileged channel path and concurrent close/send
+behavior still requires on-target verification.**
 
 This document describes the host-testable crate `huesos-handlemove` and how it
 is intended to plug into the kernel. It supports
@@ -70,30 +72,28 @@ destination handle.
 `TransferError` ∈ {`NoSuchHandle`, `MissingRight`, `AlreadyStaged`,
 `DestinationFull`}.
 
-## Intended kernel integration (NOT yet implemented here)
+## Current privileged integration boundary
 
-This crate changes no privileged behavior. The planned integration:
+The syscall channel path now validates the complete handle list before removal,
+removes it as one handle-table batch, and restores the original handle slots if
+bounded queue admission fails. In-flight messages still hold the global handle
+count until receipt or drop. Queue admission is quota-bound and therefore
+returns a normal resource error instead of growing without limit.
 
-1. The channel send path builds `Disposition`s from the caller's handle list
-   (validated through the user-memory copy layer), each with its requested
-   rights and Move/Duplicate operation.
-2. `transfer` runs against the sender's handle table and a staging area for the
-   message; on `Err`, the send fails cleanly with no partial drain (the
-   transactional rollback the roadmap calls for).
-3. In-flight messages hold the transferred handle counts until receipt or drop
-   (already the case via `remove_keep_alive`), consistent with the registry
-   collection model in `huesos-lifecycle`.
+The pure `transfer` function remains the normative policy model, but the kernel
+has not yet replaced its object-specific handle representation with the policy
+crate's `Disposition` table. That is an intentional next step so the model can
+be wired without duplicating rollback semantics.
 
 ## What still requires on-target verification
 
-- Wiring `transfer` into the actual channel send/receive path.
-- Transactional rollback under concurrent close/transfer races and peer
-  closure mid-send.
-- Rights enforcement end-to-end across processes, and stress testing
-  concurrent close/transfer.
-
-These need the full toolchain (pinned nightly + `build-std`, QEMU/OVMF) and were
-not runnable where this crate was authored.
+- Rights enforcement end-to-end across processes, including the `DUPLICATE`
+  right and per-permission VMO mappings.
+- Transactional rollback under concurrent handle-table allocation and queue
+  rejection races.
+- Peer-close semantics once channels gain explicit closed-state signaling.
+- QEMU/SMP stress testing of concurrent close, transfer, receive, and object
+  collection.
 
 ## Tests (host)
 

@@ -107,6 +107,24 @@ pub fn note_handle_close(koid: Koid) {
     drop(removed);
 }
 
+/// Acquire an object reference and one kernel-owned lifetime reference in a
+/// single registry critical section.
+///
+/// This is the only safe entry point for a new VMAR mapping: a concurrent last
+/// handle close cannot collect the object between lookup and kernel-reference
+/// accounting. The returned `Arc` keeps the object alive while the caller
+/// installs its metadata/page-table transaction.
+pub fn acquire_kernel_ref(koid: Koid) -> Option<Arc<dyn KernelObject>> {
+    if !koid.is_valid() {
+        return None;
+    }
+    let mut state = REGISTRY.lock();
+    let object = state.objects.get(&koid).cloned()?;
+    let count = state.kernel_refs.entry(koid).or_insert(0);
+    *count = count.saturating_add(1);
+    Some(object)
+}
+
 /// Hold an object independently of userspace handles (for example a VMAR
 /// mapping that must keep VMO frames alive after the mapping handle closes).
 pub fn note_kernel_ref_open(koid: Koid) {

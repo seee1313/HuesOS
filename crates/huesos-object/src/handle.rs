@@ -64,6 +64,17 @@ pub type HandleValue = u32;
 /// Invalid handle value.
 pub const INVALID_HANDLE: HandleValue = 0;
 
+/// Failure while preparing a transactional batch handle move.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HandleTableError {
+    /// One of the requested slots is no longer occupied.
+    Missing,
+    /// Kernel memory could not hold the bounded batch.
+    OutOfMemory,
+    /// The same slot was requested more than once.
+    Duplicate,
+}
+
 /// Per-process handle table.
 pub struct HandleTable {
     table: Mutex<Vec<Option<Handle>>>,
@@ -144,6 +155,58 @@ impl HandleTable {
             .lock()
             .get_mut(value as usize)
             .and_then(|h| h.take())
+    }
+
+    /// Remove a distinct batch of handles while preserving their in-flight
+    /// handle-count ownership. Validation and allocation happen before the
+    /// first slot is changed, so a missing slot cannot produce a partial move.
+    pub fn remove_many_keep_alive(
+        &self,
+        values: &[HandleValue],
+    ) -> Result<Vec<Handle>, HandleTableError> {
+        let mut t = self.table.lock();
+        for (index, &value) in values.iter().enumerate() {
+            if values[..index].contains(&value) {
+                return Err(HandleTableError::Duplicate);
+            }
+            if value == INVALID_HANDLE
+                || t.get(value as usize).and_then(|slot| slot.as_ref()).is_none()
+            {
+                return Err(HandleTableError::Missing);
+            }
+        }
+        let mut removed = Vec::new();
+        removed
+            .try_reserve_exact(values.len())
+            .map_err(|_| HandleTableError::OutOfMemory)?;
+        for &value in values {
+            let handle = t[value as usize].take();
+            match handle {
+                Some(handle) => removed.push(handle),
+                None => return Err(HandleTableError::Missing),
+            }
+        }
+        Ok(removed)
+    }
+
+    /// Restore a handle to an exact slot after a failed transactional move.
+    ///
+    /// The handle-count ownership is intentionally preserved: callers use this
+    /// only for a handle that was removed with [`Self::remove_keep_alive`].
+    pub fn restore_existing_at(&self, value: HandleValue, handle: Handle) -> Result<(), Handle> {
+        if value == INVALID_HANDLE {
+            return Err(handle);
+        }
+        let mut t = self.table.lock();
+        while t.len() <= value as usize {
+            t.push(None);
+        }
+        let slot = &mut t[value as usize];
+        if slot.is_some() {
+            return Err(handle);
+        }
+        *slot = Some(handle);
+        Ok(())
     }
 
     /// Drop every handle slot (process teardown).

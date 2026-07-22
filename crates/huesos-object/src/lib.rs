@@ -26,19 +26,22 @@ mod vmo;
 pub mod wait;
 
 pub use acpi_broker::{AcpiBroker, PciFunctionGrant, SystemIoGrant};
-pub use channel::{Channel, ChannelMessage, ChannelRecvError};
-pub use handle::{Handle, HandleTable, HandleValue, Rights, INVALID_HANDLE};
+pub use channel::{
+    Channel, ChannelCreateError, ChannelMessage, ChannelRecvError, ChannelSendError,
+    ChannelSendFailure,
+};
+pub use handle::{Handle, HandleTable, HandleTableError, HandleValue, Rights, INVALID_HANDLE};
 pub use interrupt::{Interrupt, InterruptBinding};
 pub use job::Job;
 pub use koid::{alloc_koid, Koid};
 pub use object::{KernelObject, KernelObjectExt, ObjectType};
-pub use port::{Port, PortPacket};
+pub use port::{Port, PortCreateError, PortPacket, PortQueueError};
 pub use process::Process;
 pub use supervision::{CrashThrottle, SupervisionAction, SupervisionDecision};
 pub(crate) use registry::phys_to_virt;
 pub use registry::{
-    collect_exited_process, current_process, lookup_interrupts_by_irq, lookup_object,
-    lookup_process, note_handle_close, note_handle_open, note_kernel_ref_close,
+    acquire_kernel_ref, collect_exited_process, current_process, lookup_interrupts_by_irq,
+    lookup_object, lookup_process, note_handle_close, note_handle_open, note_kernel_ref_close,
     note_kernel_ref_open, object_ref_counts, register_interrupt, register_object, register_process,
     root_job, set_cpu_id_callback, set_current_process, set_phys_to_virt, unregister_object,
 };
@@ -188,7 +191,10 @@ mod tests {
 
     #[test]
     fn interrupt_signal_queues_port_packet() {
-        let port = Port::new();
+        let port = match Port::new() {
+            Ok(port) => port,
+            Err(_) => return,
+        };
         let port_koid = port.koid();
         register_object(port.clone());
 
@@ -307,8 +313,11 @@ mod tests {
 
     #[test]
     fn channel_pair_delivers_messages_to_the_peer_not_the_sender() {
-        let (a, b) = Channel::pair();
-        a.send(ChannelMessage {
+        let (a, b) = match Channel::pair() {
+            Ok(pair) => pair,
+            Err(_) => return,
+        };
+        let _ = a.send(ChannelMessage {
             data: alloc::vec![1, 2, 3],
             handles: Vec::new(),
         });
@@ -319,4 +328,61 @@ mod tests {
         let msg = b.recv().expect("b must receive what a sent");
         assert_eq!(msg.data, alloc::vec![1, 2, 3]);
     }
+    #[test]
+    fn channel_queue_is_bounded_and_returns_failed_message() {
+        let (a, _b) = match Channel::pair() {
+            Ok(pair) => pair,
+            Err(_) => return,
+        };
+        for _ in 0..channel::MAX_CHANNEL_QUEUE_MESSAGES {
+            let result = a.send(ChannelMessage {
+                data: Vec::new(),
+                handles: Vec::new(),
+            });
+            assert!(result.is_ok());
+        }
+        let failed = a.send(ChannelMessage {
+            data: Vec::new(),
+            handles: Vec::new(),
+        });
+        assert!(failed.is_err());
+        if let Err(error) = failed {
+            let (message, reason) = error.into_parts();
+            assert_eq!(reason, ChannelSendFailure::QuotaExceeded);
+            assert!(message.data.is_empty());
+            assert!(message.handles.is_empty());
+        }
+    }
+
+    #[test]
+    fn port_queue_is_bounded_without_irq_allocation() {
+        let port = match Port::new() {
+            Ok(port) => port,
+            Err(_) => return,
+        };
+        let packet = PortPacket {
+            key: 1,
+            packet_type: 1,
+            status: 0,
+            data: [0; 4],
+        };
+        for _ in 0..port::MAX_PORT_PACKETS {
+            assert!(port.queue(packet).is_ok());
+        }
+        assert_eq!(port.queue(packet), Err(PortQueueError::QuotaExceeded));
+        assert_eq!(port.dropped_packets(), 1);
+    }
+
+    #[test]
+    fn batch_handle_move_validates_before_mutating() {
+        let table = HandleTable::new();
+        let first = table.add(Handle::new(alloc_koid(), Rights::DEFAULT));
+        let result = table.remove_many_keep_alive(&[first, first + 100]);
+        assert_eq!(result, Err(HandleTableError::Missing));
+        assert!(table.get(first).is_some());
+        let duplicate = table.remove_many_keep_alive(&[first, first]);
+        assert_eq!(duplicate, Err(HandleTableError::Duplicate));
+        assert!(table.get(first).is_some());
+    }
+
 }

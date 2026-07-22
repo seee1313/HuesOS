@@ -134,7 +134,8 @@ pub(crate) fn sys_thread_start(
     let child_process =
         huesos_object::lookup_process(thread.process()).ok_or(ErrorCode::BadHandle)?;
 
-    let (parent_bootstrap, child_bootstrap) = huesos_object::Channel::pair();
+    let (parent_bootstrap, child_bootstrap) =
+        huesos_object::Channel::pair().map_err(|_| ErrorCode::NoMemory)?;
     let parent_koid = parent_bootstrap.koid();
     let child_koid = child_bootstrap.koid();
     huesos_object::register_object(parent_bootstrap);
@@ -164,7 +165,10 @@ pub(crate) fn sys_vmar_map(args_ptr: *const VmarMapArgs) -> SyscallResult {
         return Err(ErrorCode::AccessDenied);
     }
     let vmo_handle = proc.handles.get(args.vmo).ok_or(ErrorCode::BadHandle)?;
-    if !vmo_handle.has_rights(Rights::MAP) {
+    let required_vmo_rights = huesos_object::Rights::from_bits_retain(
+        huesos_abi::rights::mapping_required(args.flags),
+    );
+    if !vmo_handle.has_rights(required_vmo_rights) {
         return Err(ErrorCode::AccessDenied);
     }
 

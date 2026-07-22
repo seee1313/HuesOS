@@ -40,13 +40,17 @@ count cannot free an in-flight capability.
 
 ## VMO mapping ownership
 
-After a VMO mapping is successfully recorded, the VMAR opens one kernel
-reference to the VMO. Closing every VMO handle does not free its frames while
-the mapping exists. `Vmar::drop` takes its mapping vector, releases every
-reference without holding the VMAR lock, and permits final VMO collection.
+Before a new VMAR mapping is recorded, the registry atomically verifies that
+the VMO is still discoverable and opens one kernel reference. This closes the
+SMP race where a concurrent last-handle close could remove the registry Arc
+between lookup and reference accounting. Closing every VMO handle therefore
+does not free its frames while the mapping exists. `Vmar::drop` takes its
+mapping vector, releases every reference without holding the VMAR lock, and
+permits final VMO collection.
 
-The reference is opened only after page-table mapping and metadata recording
-succeed, so rejected mapping requests do not leak counts.
+If metadata reservation or page-table installation fails, the mapping
+transaction releases the acquired reference and removes its reservation, so
+rejected mapping requests do not leak counts.
 
 ## Drop outside the registry lock
 

@@ -8,7 +8,7 @@ priority order.
 ## Done (recent)
 
 ### Host-testable policy cores + contribution rules + safety audit
-- Six `no_std`, dependency-free, host-unit-tested **policy crates** extracted
+- Seven `no_std`, dependency-free, host-unit-tested **policy crates** extracted
   from the privileged paths, each with a `docs/` design page describing its
   intended kernel integration and what still needs on-target verification:
   - `huesos-lifecycle` — bounded zombie reclamation + two-counter collection
@@ -21,9 +21,13 @@ priority order.
     coordination (Short-Term #5).
   - `huesos-handlemove` — rights monotonicity + all-or-nothing transactional
     handle transfer (Short-Term #6).
-- These model decisions/encodings only; the privileged integrations (I/O APIC
-  MMIO writes, fault-handler fixup, multi-wait syscall, channel send path)
-  remain and need on-target verification.
+  - `huesos-quota` — flat and hierarchical resource admission for memory,
+    handles, and CPU ticks (Medium-Term #8).
+- These model decisions/encodings remain host-testable; bounded Channel/Port
+  queue admission now uses the quota core, while the I/O APIC MMIO writes,
+  fault-handler fixup, multi-wait syscall, full Job accounting, and complete
+  policy-crate replacement of object-specific paths still need on-target
+  verification.
 - `CONTRIBUTING.md` with strict rules (safety budget, ranked-lock policy,
   Conventional Commits, host-test requirement, Definition of Done).
 - Panicking-surface audit (`docs/UNSAFE_AUDIT.md`): every `unwrap`/`expect`/
@@ -99,14 +103,20 @@ priority order.
 ### Blocking waits + reaper (feature/wait-reaper-stability)
 - Wait queues + `park`/`wake` hooks from the scheduler
 - Blocking `ChannelRead` / `PortRead` (flag arg) and blocking `ProcessWait`
-- Handle transfer-on-write already landed earlier; documented
+- Handle transfer-on-write validates batches before removal and restores moved
+  handles when bounded queue admission fails; the normative policy crate is
+  not yet the direct implementation of the privileged table operations
 - `Vmo` Drop returns physical frames when the object is explicitly released;
   exit path frees kernel stacks via reaper
 - `AddressSpace::destroy` frees owned user frames + private page tables
 - Process teardown clears handle table; driver-host input uses blocking Port
-- Handle counts track table and in-flight ownership, but the registry
-  intentionally does not yet auto-unregister on the ordinary last close
+- Registry VMAR mapping acquires the VMO kernel lifetime reference atomically
+  with object lookup
+- Channel and Port queues use bounded per-object quota admission; overflow is
+  observable as a normal error/drop counter rather than an unbounded allocation
 - Timed waits: `ChannelRead`/`PortRead` mode `>=2` = timeout in ticks + `TimedOut`
+- The scheduler uses a pending-wake handshake to close the enqueue-to-park SMP
+  lost-wakeup window
 
 ## Immediate
 
@@ -165,16 +175,17 @@ priority order.
   instead of build-time `include_bytes!`.
 
 ### 6. Handle transfer semantics
-- **Current**: `ChannelWrite` validates all handles, requires `TRANSFER`, then
-  removes them from the sender before enqueueing; in-flight messages retain
-  handle-count ownership until receipt or drop.
+- **Current**: `ChannelWrite` validates distinct handles and `TRANSFER`, removes
+  them as one handle-table batch, and restores the original slots when bounded
+  queue admission fails; in-flight messages retain handle-count ownership until
+  receipt or drop.
 - **Policy core landed**: `huesos-handlemove` — host-tested rights monotonicity
   (transfer can preserve/reduce, never add rights), typed Move/Duplicate
   dispositions, and all-or-nothing transactional transfer (see
   [HANDLE_TRANSFER.md](HANDLE_TRANSFER.md)).
-- **Needed (on-target)**: wire the transactional transfer into the channel send
-  path (rollback on peer closure/send failure), and stress tests for concurrent
-  close/transfer.
+- **Needed (on-target)**: replace the object-specific batch path with the policy
+  crate's dispositions and stress concurrent handle allocation, close, transfer,
+  and queue rejection.
 
 ### 7. Real VFS + drivers in userspace
 - BOOTFS is live as a RAM archive; `huesos-fat` exists as a library.
@@ -184,8 +195,12 @@ priority order.
 ## Medium Term
 
 ### 8. Capabilities & resource quotas
-- Job-based CPU time / memory / handle-count quotas (the `Job` object
-  exists as a container concept but enforces nothing yet).
+- **Policy core landed**: `huesos-quota` models flat and hierarchical memory,
+  handle, and CPU-tick budgets; bounded Channel/Port queues use local quota
+  admission (see [QUOTAS.md](QUOTAS.md)).
+- **Needed**: attach quota nodes to `Job`, charge VMO frames/mappings,
+  process handles and scheduler CPU time, and verify release during SMP
+  teardown.
 
 ### 9. Networking
 - virtio-net driver + a userspace TCP/IP stack.

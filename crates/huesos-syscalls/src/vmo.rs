@@ -11,6 +11,29 @@ use crate::{user_memory, util::current_proc, SyscallResult};
 const MAX_VMO_SIZE: usize = 4 * 1024 * 1024 * 1024;
 
 pub(crate) fn sys_vmo_create(size: usize, out_handle: *mut HandleValue) -> SyscallResult {
+    sys_vmo_create_with_rights(size, false, out_handle)
+}
+
+pub(crate) fn sys_vmo_create_ex(
+    size: usize,
+    flags: u32,
+    out_handle: *mut HandleValue,
+) -> SyscallResult {
+    if flags & !huesos_abi::vmo_create_flags::EXECUTABLE != 0 {
+        return Err(ErrorCode::InvalidArgs);
+    }
+    sys_vmo_create_with_rights(
+        size,
+        flags & huesos_abi::vmo_create_flags::EXECUTABLE != 0,
+        out_handle,
+    )
+}
+
+fn sys_vmo_create_with_rights(
+    size: usize,
+    executable: bool,
+    out_handle: *mut HandleValue,
+) -> SyscallResult {
     if size == 0 {
         return Err(ErrorCode::InvalidArgs);
     }
@@ -25,8 +48,15 @@ pub(crate) fn sys_vmo_create(size: usize, out_handle: *mut HandleValue) -> Sysca
     let koid = vmo.koid();
     huesos_object::register_object(vmo);
     let proc = current_proc()?;
-    let hv = proc.handles.add(Handle::new(koid, Rights::DEFAULT_VMO));
-    user_memory::write_value(out_handle, &hv)?;
+    let mut rights = Rights::DEFAULT_VMO;
+    if executable {
+        rights |= Rights::EXECUTE;
+    }
+    let hv = proc.handles.add(Handle::new(koid, rights));
+    if let Err(error) = user_memory::write_value(out_handle, &hv) {
+        let _ = proc.handles.remove(hv);
+        return Err(error);
+    }
     Ok(0)
 }
 
