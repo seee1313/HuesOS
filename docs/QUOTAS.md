@@ -33,10 +33,15 @@ The bounded Channel and Port queues use `huesos-quota::Quota` for their local
 byte/packet admission budgets. This prevents unbounded IPC retention and avoids
 allocating from the keyboard IRQ path after a Port is created.
 
-The full `Job` integration is deliberately still separate: `huesos-object::Job`
-does not yet own a `QuotaTree`, and process memory/handle/CPU usage is not yet
-charged to a hierarchical Job. Until that integration lands, queue limits are
-per-object bounded quotas, not system-wide parent Job quotas.
+`huesos-object::Job` now owns a shared hierarchical `QuotaTree`, and every
+Process is attached to a Job. VMO physical-frame allocation is charged to the
+owning Job before frames are allocated and released from the same Job on VMO
+Drop. The root Job remains unlimited by default, preserving the existing MVP
+behavior.
+
+Handle-count, CPU-time, and page-table accounting are still outstanding. Until
+those charges are integrated, queue and VMO limits are active but the complete
+system-wide resource budget is not yet enforced.
 
 ## Required privileged integration
 

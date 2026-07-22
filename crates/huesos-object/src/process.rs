@@ -8,7 +8,7 @@ use spin::Mutex;
 
 use crate::wait::WaitQueue;
 use huesos_proclife::{ExitInfo, ProcessLifecycle, ProcState};
-use crate::{alloc_koid, HandleTable, KernelObject, Koid, ObjectType};
+use crate::{alloc_koid, root_job, HandleTable, Job, KernelObject, Koid, ObjectType};
 
 /// Process — address space + handle table + exit state.
 pub struct Process {
@@ -16,6 +16,8 @@ pub struct Process {
     name: Mutex<String>,
     /// Handle table for this process.
     pub handles: HandleTable,
+    /// Job that owns this process's resource charges.
+    pub job: Arc<Job>,
     /// Lifecycle state machine shared with the host-tested policy core.
     pub lifecycle: Mutex<ProcessLifecycle>,
     /// Waiters blocked in `ProcessWait` until this process exits.
@@ -29,11 +31,21 @@ pub struct Process {
 impl Process {
     /// Create a process.
     pub fn new(name: &str) -> Arc<Self> {
+        let job = match root_job() {
+            Some(job) => job,
+            None => Job::root(),
+        };
+        Self::new_in_job(name, job)
+    }
+
+    /// Create a process attached to an explicit Job.
+    pub fn new_in_job(name: &str, job: Arc<Job>) -> Arc<Self> {
         let koid = alloc_koid();
         Arc::new(Self {
             koid,
             name: Mutex::new(String::from(name)),
             handles: HandleTable::new(),
+            job,
             lifecycle: Mutex::new(ProcessLifecycle::new(koid.0, koid.0)),
             exit_waiters: WaitQueue::new(),
             address_space: Mutex::new(None),
@@ -53,6 +65,11 @@ impl Process {
         let count = name.len().min(output.len());
         output[..count].copy_from_slice(&name.as_bytes()[..count]);
         count
+    }
+
+    /// Return the Job owning this process's resource charges.
+    pub fn job(&self) -> Arc<Job> {
+        Arc::clone(&self.job)
     }
 
     /// Mark the process as running. The policy accepts this only once, when

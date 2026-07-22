@@ -310,7 +310,7 @@ fn install_readonly_vmo(
 ) -> bool {
     use huesos_object::{Handle, KernelObject, Rights};
 
-    let Ok(vmo) = huesos_object::Vmo::new(bytes.len()) else {
+    let Ok(vmo) = huesos_object::Vmo::new_in_job(bytes.len(), Some(process.job())) else {
         return false;
     };
     if vmo.write(0, bytes) != bytes.len() {

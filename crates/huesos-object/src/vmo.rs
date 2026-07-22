@@ -6,7 +6,7 @@ use alloc::vec::Vec;
 use core::any::Any;
 use spin::Mutex;
 
-use crate::{alloc_koid, phys_to_virt, KernelObject, Koid, ObjectType};
+use crate::{alloc_koid, phys_to_virt, Job, KernelObject, Koid, ObjectType};
 
 /// Virtual Memory Object — a resizable collection of physical page frames.
 ///
@@ -18,6 +18,8 @@ pub struct Vmo {
     size: Mutex<usize>,
     /// Physical frame addresses, one per 4 KiB page.
     frames: Mutex<Vec<u64>>,
+    /// Job charged for the physical frames, if this VMO belongs to a process.
+    job: Option<Arc<Job>>,
 }
 
 const PAGE_SIZE: usize = 4096;
@@ -41,18 +43,35 @@ impl Vmo {
     /// frames already allocated before the failure are freed back to the
     /// PMM before returning, so a failed allocation never leaks memory.
     pub fn new(size: usize) -> Result<Arc<Self>, VmoError> {
+        Self::new_in_job(size, None)
+    }
+
+    /// Create a VMO and charge its physical-page budget to `job`.
+    pub fn new_in_job(size: usize, job: Option<Arc<Job>>) -> Result<Arc<Self>, VmoError> {
         let koid = alloc_koid();
         let page_count = size.div_ceil(PAGE_SIZE).max(1);
+        let charged_bytes = (page_count as u64).saturating_mul(PAGE_SIZE as u64);
+        if let Some(owner) = &job {
+            if !owner.charge(huesos_quota::Resource::Memory, charged_bytes) {
+                return Err(VmoError::OutOfMemory);
+            }
+        }
         let mut frames = Vec::new();
-        frames
-            .try_reserve_exact(page_count)
-            .map_err(|_| VmoError::OutOfMemory)?;
+        if frames.try_reserve_exact(page_count).is_err() {
+            if let Some(owner) = &job {
+                let _ = owner.release(huesos_quota::Resource::Memory, charged_bytes);
+            }
+            return Err(VmoError::OutOfMemory);
+        }
         for _ in 0..page_count {
             let frame = match huesos_pmm::alloc_frame() {
                 Ok(f) => f,
                 Err(_) => {
                     for f in frames {
                         huesos_pmm::free_frame(f);
+                    }
+                    if let Some(owner) = &job {
+                        let _ = owner.release(huesos_quota::Resource::Memory, charged_bytes);
                     }
                     return Err(VmoError::OutOfMemory);
                 }
@@ -66,6 +85,7 @@ impl Vmo {
             name: Mutex::new(String::new()),
             size: Mutex::new(size),
             frames: Mutex::new(frames),
+            job,
         }))
     }
 
@@ -151,10 +171,25 @@ impl Vmo {
         }
         let mut frames = self.frames.lock();
         let needed_pages = new_size.div_ceil(PAGE_SIZE);
+        let additional_pages = needed_pages.saturating_sub(frames.len());
+        let additional_bytes = (additional_pages as u64).saturating_mul(PAGE_SIZE as u64);
+        if let Some(owner) = &self.job {
+            if !owner.charge(huesos_quota::Resource::Memory, additional_bytes) {
+                return Err(VmoError::OutOfMemory);
+            }
+        }
         while frames.len() < needed_pages {
             let frame = match huesos_pmm::alloc_frame() {
                 Ok(f) => f,
                 Err(_) => {
+                    let allocated = frames.len().saturating_sub(needed_pages.saturating_sub(additional_pages));
+                    let unallocated = additional_pages.saturating_sub(allocated);
+                    if let Some(owner) = &self.job {
+                        let _ = owner.release(
+                            huesos_quota::Resource::Memory,
+                            (unallocated as u64).saturating_mul(PAGE_SIZE as u64),
+                        );
+                    }
                     *size = frames.len() * PAGE_SIZE;
                     return Err(VmoError::OutOfMemory);
                 }
@@ -187,8 +222,15 @@ impl Drop for Vmo {
         // owns a live Arc (mappings hold koids, not Arcs — frames stay
         // valid until VMO is fully unreferenced).
         let frames = core::mem::take(&mut *self.frames.lock());
+        let frame_count = frames.len();
         for f in frames {
             huesos_pmm::free_frame(f);
+        }
+        if let Some(owner) = self.job.take() {
+            let _ = owner.release(
+                huesos_quota::Resource::Memory,
+                (frame_count as u64).saturating_mul(PAGE_SIZE as u64),
+            );
         }
     }
 }
