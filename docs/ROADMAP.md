@@ -202,9 +202,11 @@ priority order.
 - **Current**: `Job` owns a shared hierarchical quota tree, Processes attach to
   Jobs, VMO physical-frame allocation is charged/released, and bounded
   Channel/Port queues use local quota admission (see [QUOTAS.md](QUOTAS.md)).
-- **Needed**: charge handle references, page-table mappings, and scheduler CPU
-  time; expose controlled child-Job creation; and verify release during SMP
-  teardown.
+- **Current**: scheduler CPU ticks are charged to the owning Job; exhaustion is
+  recorded but not yet converted into throttling or termination.
+- **Needed**: charge handle references and page-table mappings, expose
+  controlled child-Job creation, define exhaustion supervision, and verify
+  release during SMP teardown.
 
 ### 9. Networking
 - virtio-net driver + a userspace TCP/IP stack.

@@ -266,6 +266,9 @@ impl Scheduler {
 
         // 2. Update stats for currently running task
         if self.current > 0 {
+            if let TaskKind::User { process } = &self.tasks[self.current].kind {
+                let _ = process.charge_cpu_tick();
+            }
             let task_id = self.tasks[self.current].id;
             let finished = self.tasks[self.current].finished.load(Ordering::Relaxed);
             let blocked = self.tasks[self.current].blocked.load(Ordering::Relaxed);

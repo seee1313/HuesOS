@@ -39,9 +39,13 @@ owning Job before frames are allocated and released from the same Job on VMO
 Drop. The root Job remains unlimited by default, preserving the existing MVP
 behavior.
 
-Handle-count, CPU-time, and page-table accounting are still outstanding. Until
-those charges are integrated, queue and VMO limits are active but the complete
-system-wide resource budget is not yet enforced.
+CPU tick accounting is now charged from the scheduler to the owning Job. The
+current MVP records budget exhaustion but does not yet throttle or terminate a
+process because the supervisor policy is not finalized.
+
+Handle-count and page-table accounting are still outstanding. Until those
+charges are integrated, queue, VMO, and CPU accounting are active but the
+complete system-wide resource budget is not yet enforced.
 
 ## Required privileged integration
 

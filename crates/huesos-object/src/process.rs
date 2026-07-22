@@ -75,6 +75,14 @@ impl Process {
         Arc::clone(&self.job)
     }
 
+    /// Account one scheduler tick to the owning Job. Returns false when the
+    /// Job CPU budget is exhausted; the scheduler currently records the
+    /// exhaustion for supervision but does not kill the process.
+    pub fn charge_cpu_tick(&self) -> bool {
+        self.job
+            .charge(huesos_quota::Resource::CpuTicks, 1)
+    }
+
     /// Mark the process as running. The policy accepts this only once, when
     /// the first thread is started.
     pub fn start(&self) -> bool {
