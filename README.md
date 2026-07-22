@@ -112,8 +112,9 @@ Default `scripts/run.sh` uses `-smp 2`.
 - Dynamic process launch and blocking `ProcessWait` work, but supervision,
   cancellation, and multi-object waits remain MVP-level
 - No dynamic loading / relocations (static ELF only)
-- Capability rights are enforced on current handle syscalls, but object
-  lifetime/resource quota enforcement is not yet complete
+- Capability rights are enforced on current handle syscalls; VMO memory and
+  bounded IPC queue quotas are active, but handle/CPU/page-table accounting
+  and user-visible Job quota controls are not yet complete
 - Framebuffer text is ASCII-only (no Unicode shaping, by design)
 
 > Note: several of the items above (I/O APIC routing, object/task teardown,

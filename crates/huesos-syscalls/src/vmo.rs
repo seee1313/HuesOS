@@ -44,10 +44,11 @@ fn sys_vmo_create_with_rights(
     // output pointer must leave no externally visible side effect.
     user_memory::validate_write(out_handle)?;
 
-    let vmo = huesos_object::Vmo::new(size).map_err(|_| ErrorCode::NoMemory)?;
+    let proc = current_proc()?;
+    let vmo = huesos_object::Vmo::new_in_job(size, Some(proc.job()))
+        .map_err(|_| ErrorCode::NoMemory)?;
     let koid = vmo.koid();
     huesos_object::register_object(vmo);
-    let proc = current_proc()?;
     let mut rights = Rights::DEFAULT_VMO;
     if executable {
         rights |= Rights::EXECUTE;

@@ -423,4 +423,23 @@ mod tests {
         assert!(!process.set_exit_code(18));
     }
 
+    #[test]
+    fn vmo_memory_charge_is_released_on_drop() {
+        with_fresh_env(huesos_pmm::FRAME_SIZE * 16, || {
+            let job = Job::root_with_limits(huesos_quota::Limits {
+                max_memory: huesos_pmm::FRAME_SIZE,
+                max_handles: huesos_quota::UNLIMITED,
+                max_cpu_ticks: huesos_quota::UNLIMITED,
+            });
+            let vmo = match Vmo::new_in_job(4096, Some(job.clone())) {
+                Ok(vmo) => vmo,
+                Err(_) => return,
+            };
+            assert_eq!(job.usage().map(|usage| usage.memory), Ok(4096));
+            drop(vmo);
+            assert_eq!(job.usage().map(|usage| usage.memory), Ok(0));
+            assert!(Vmo::new_in_job(8192, Some(job)).is_err());
+        });
+    }
+
 }

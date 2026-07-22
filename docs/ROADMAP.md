@@ -195,11 +195,11 @@ priority order.
 ## Medium Term
 
 ### 8. Capabilities & resource quotas
-- **Policy core landed**: `huesos-quota` models flat and hierarchical memory,
-  handle, and CPU-tick budgets; bounded Channel/Port queues use local quota
-  admission (see [QUOTAS.md](QUOTAS.md)).
-- **Needed**: attach quota nodes to `Job`, charge VMO frames/mappings,
-  process handles and scheduler CPU time, and verify release during SMP
+- **Current**: `Job` owns a shared hierarchical quota tree, Processes attach to
+  Jobs, VMO physical-frame allocation is charged/released, and bounded
+  Channel/Port queues use local quota admission (see [QUOTAS.md](QUOTAS.md)).
+- **Needed**: charge handle references, page-table mappings, and scheduler CPU
+  time; expose controlled child-Job creation; and verify release during SMP
   teardown.
 
 ### 9. Networking
