@@ -306,7 +306,7 @@ fn process_runtime_for_vmar(
     let process = object
         .downcast_ref::<Process>()
         .ok_or(ErrorCode::WrongType)?;
-    Ok(huesos_object::lookup_process(process.koid()).ok_or(ErrorCode::BadHandle)?)
+    huesos_object::lookup_process(process.koid()).ok_or(ErrorCode::BadHandle)
 }
 
 fn validate_vmar_op_args(
