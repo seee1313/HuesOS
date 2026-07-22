@@ -441,7 +441,7 @@ mod tests {
         assert!(t.try_acquire(child, Resource::Memory, 50));
         // Child's own 50 limit denies this, even though the parent has room.
         assert!(!t.try_acquire(child, Resource::Memory, 1));
-        assert_eq!(t.used(child).map(|usage| usage.memory), Some(50));
+        assert_eq!(t.used(child).map(|usage| usage.memory), Ok(50));
     }
 
     #[test]
@@ -476,7 +476,7 @@ mod tests {
         assert!(t.try_acquire(root, Resource::Memory, 80));
         t.set_limits(root, mem_limits(50)); // tighten below current usage
         assert!(!t.try_acquire(root, Resource::Memory, 1));
-        assert_eq!(t.limits(root).map(|limits| limits.max_memory), Some(50));
+        assert_eq!(t.limits(root).map(|limits| limits.max_memory), Ok(50));
     }
     #[test]
     fn cross_tree_and_invalid_nodes_are_rejected_without_panicking() {
