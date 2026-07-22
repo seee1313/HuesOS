@@ -342,6 +342,7 @@ mod tests {
             let result = a.send(ChannelMessage {
                 data: Vec::new(),
                 handles: Vec::new(),
+                handle_owner: None,
             });
             assert!(result.is_ok());
         }
