@@ -416,19 +416,25 @@ pub fn park_current() {
         let mut guard = PER_CPU_SCHEDULERS[cpu].lock();
         let idx = guard.current;
         let mut should_park = true;
-        if let Some(task) = guard.tasks.get_mut(idx) {
+        let fair_key = if let Some(task) = guard.tasks.get_mut(idx) {
             // The scheduler lock makes the blocked flag and the pending wake
             // handshake atomic with respect to remote wake_task calls.
             task.blocked.store(true, Ordering::SeqCst);
-            if let SchedPolicy::Fair { vruntime, .. } = task.sched_policy {
-                let id = task.id;
-                guard.fair_queue.remove(vruntime, id);
-            }
+            let fair_key = match task.sched_policy {
+                SchedPolicy::Fair { vruntime, .. } => Some((vruntime, task.id)),
+                SchedPolicy::Deadline { .. } => None,
+            };
             let pending = task.wake_pending.swap(false, Ordering::SeqCst);
             if pending || !task.blocked.load(Ordering::SeqCst) {
                 task.blocked.store(false, Ordering::SeqCst);
                 should_park = false;
             }
+            fair_key
+        } else {
+            None
+        };
+        if let Some((vruntime, task_id)) = fair_key {
+            guard.fair_queue.remove(vruntime, task_id);
         }
         // Prefer tick(); if it declines to switch (edge case), force idle.
         let switch_context = if should_park {
