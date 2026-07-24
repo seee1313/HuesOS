@@ -125,6 +125,23 @@ The complete regression matrix to retain and expand is:
 All invalid cases must return `InvalidArgs` without a kernel exception or
 consuming a queued message/event. See [USER_MEMORY.md](USER_MEMORY.md).
 
+## ProcessWait lifecycle regression
+
+Before the fault-isolation probes, init launches `fault-probe` with the `wait`
+command and calls the blocking `ProcessWait` wrapper. The child yields 32 times
+before exiting with code zero, giving init an opportunity to park. A successful
+boot must contain:
+
+```text
+[init] ProcessWait lifecycle OK (blocked wake)
+```
+
+This covers the scheduler-visible lifecycle path: waiter registration, park,
+exit publication, wake, and exit-code delivery. `scripts/ci-qemu-smoke.sh`
+requires this marker for debug/release and SMP 1/2 matrix boots. It does not
+prove an arbitrary-duration SMP soak; that remains a separate lifecycle stress
+requirement.
+
 ## Monotonic Clock, Snake, and Shutdown Tests
 
 Init verifies that a 10-tick blocking wait measures 9–12 hardware monotonic

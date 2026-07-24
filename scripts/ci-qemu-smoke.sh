@@ -44,6 +44,7 @@ for marker in \
     '[acpi-manager] broker deny-by-default self-test OK' \
     '[driver-manager] ACPI manager archive validation ready' \
     '[init] user fault isolation OK' \
+    '[init] ProcessWait lifecycle OK (blocked wake)' \
     '[init] terminal says terminal:ready' \
     '[terminal] keyboard service online'; do
     if ! grep -Fq "$marker" "$log"; then
