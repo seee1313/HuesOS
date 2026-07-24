@@ -26,8 +26,8 @@ mod util;
 mod vmo;
 
 use huesos_abi::{
-    ChannelReadEtcArgs, ErrorCode, FramebufferBlitArgs, FramebufferInfo, HandleValue, PortPacket,
-    VmarMapArgs, VmarOpArgs,
+    ChannelConsumeArgs, ChannelPeekArgs, ChannelReadEtcArgs, ErrorCode, FramebufferBlitArgs,
+    FramebufferInfo, HandleValue, PortPacket, VmarMapArgs, VmarOpArgs,
 };
 
 pub use callbacks::{
@@ -123,5 +123,7 @@ pub fn dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> Syscal
         }
         S::VmarUnmap => process::sys_vmar_unmap(a1 as *const VmarOpArgs),
         S::VmarProtect => process::sys_vmar_protect(a1 as *const VmarOpArgs),
+        S::ChannelPeek => channel::sys_channel_peek(a1 as *const ChannelPeekArgs),
+        S::ChannelConsume => channel::sys_channel_consume(a1 as *const ChannelConsumeArgs),
     }
 }
