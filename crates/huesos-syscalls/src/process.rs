@@ -9,7 +9,7 @@ use crate::{
         VMAR_UNMAP_FN, YIELD_FN,
     },
     user_memory,
-    util::current_proc,
+    util::{current_proc, DeferGuard},
     SyscallResult,
 };
 
@@ -46,18 +46,31 @@ pub(crate) fn sys_process_create(
 
     let create = (*PROCESS_CREATE_FN.lock()).ok_or(ErrorCode::NotSupported)?;
     let (process, root_vmar) = create(name)?;
+    let process_koid = process.koid();
+    let root_vmar_koid = root_vmar.koid();
 
     let caller = current_proc()?;
     let process_handle = caller
         .handles
-        .add(Handle::new(process.koid(), Rights::DEFAULT));
+        .add(Handle::new(process_koid, Rights::DEFAULT));
     let root_vmar_handle = caller.handles.add(Handle::new(
-        root_vmar.koid(),
+        root_vmar_koid,
         Rights::DEFAULT | Rights::SET_PROPERTY,
     ));
 
+    // Rollback: if either write_value fails after the objects are registered
+    // and handles inserted, undo everything to maintain the all-or-nothing
+    // syscall contract.
+    let rollback = DeferGuard::new(|| {
+        let _ = caller.handles.remove(process_handle);
+        let _ = caller.handles.remove(root_vmar_handle);
+        huesos_object::unregister_object(process_koid);
+        huesos_object::unregister_object(root_vmar_koid);
+    });
+
     user_memory::write_value(out_process, &process_handle)?;
     user_memory::write_value(out_root_vmar, &root_vmar_handle)?;
+    rollback.commit();
     Ok(0)
 }
 
@@ -101,7 +114,15 @@ pub(crate) fn sys_thread_create(
         .handles
         .add(Handle::new(thread_koid, Rights::DEFAULT));
 
+    // Rollback: if write_value fails after the thread is registered and the
+    // handle inserted, undo both to prevent an orphaned thread object.
+    let rollback = DeferGuard::new(|| {
+        let _ = caller.handles.remove(thread_handle);
+        huesos_object::unregister_object(thread_koid);
+    });
+
     user_memory::write_value(out_thread, &thread_handle)?;
+    rollback.commit();
     Ok(0)
 }
 
@@ -148,15 +169,40 @@ pub(crate) fn sys_thread_start(
     child_process
         .handles
         .insert_at(BOOTSTRAP_HANDLE, Handle::new(child_koid, Rights::DEFAULT))
-        .map_err(|_| ErrorCode::Busy)?;
+        .map_err(|_| {
+            // Rollback channel registration before returning.
+            huesos_object::unregister_object(parent_koid);
+            huesos_object::unregister_object(child_koid);
+            ErrorCode::Busy
+        })?;
 
     let start = (*THREAD_START_FN.lock()).ok_or(ErrorCode::NotSupported)?;
-    let task_id = start(thread, entry, stack)?;
 
     let parent_handle = caller
         .handles
         .add(Handle::new(parent_koid, Rights::DEFAULT));
+
+    // From this point, the rollback must handle the case where `start()`
+    // fails (thread not yet running) or `write_value` fails (thread is
+    // running but parent handle delivery failed).
+    let rollback = DeferGuard::new(|| {
+        // Remove the child bootstrap handle from the child process. If the
+        // thread was started, this is a best-effort cleanup — the running
+        // child may have already observed the handle.
+        let _ = child_process.handles.remove(BOOTSTRAP_HANDLE);
+        let _ = caller.handles.remove(parent_handle);
+        huesos_object::unregister_object(parent_koid);
+        huesos_object::unregister_object(child_koid);
+    });
+
+    let task_id = start(thread, entry, stack)?;
+    // Thread is now running. If write_value fails below, we still run the
+    // rollback which unregisters the parent bootstrap channel and removes
+    // the parent handle. The child bootstrap is also cleaned up, but the
+    // running thread may have already captured its copy. The channel pair
+    // stays alive through the remaining Arc references (if any).
     user_memory::write_value(out_parent_bootstrap, &parent_handle)?;
+    rollback.commit();
     Ok(task_id as i64)
 }
 

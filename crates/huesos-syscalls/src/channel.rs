@@ -4,7 +4,7 @@ use alloc::vec::Vec;
 use huesos_abi::{ChannelReadEtcArgs, ErrorCode, HandleValue};
 use huesos_object::{ChannelRecvError, Handle, KernelObject, KernelObjectExt, Rights};
 
-use crate::{user_memory, util::current_proc, SyscallResult};
+use crate::{user_memory, util::{current_proc, DeferGuard}, SyscallResult};
 
 fn map_recv_error(error: ChannelRecvError) -> huesos_abi::ErrorCode {
     match error {
@@ -30,16 +30,19 @@ pub(crate) fn sys_channel_create(out0: *mut HandleValue, out1: *mut HandleValue)
     let proc = current_proc()?;
     let hv0 = proc.handles.add(Handle::new(koid0, Rights::DEFAULT));
     let hv1 = proc.handles.add(Handle::new(koid1, Rights::DEFAULT));
-    if let Err(error) = user_memory::write_value(out0, &hv0) {
+
+    // Rollback: if either write fails, remove both handles and unregister
+    // both channel objects so the pair is fully cleaned up.
+    let rollback = DeferGuard::new(|| {
         let _ = proc.handles.remove(hv0);
         let _ = proc.handles.remove(hv1);
-        return Err(error);
-    }
-    if let Err(error) = user_memory::write_value(out1, &hv1) {
-        let _ = proc.handles.remove(hv0);
-        let _ = proc.handles.remove(hv1);
-        return Err(error);
-    }
+        huesos_object::unregister_object(koid0);
+        huesos_object::unregister_object(koid1);
+    });
+
+    user_memory::write_value(out0, &hv0)?;
+    user_memory::write_value(out1, &hv1)?;
+    rollback.commit();
     Ok(0)
 }
 
@@ -152,6 +155,11 @@ pub(crate) fn sys_channel_read(
             .map_err(map_recv_error)?
             .ok_or(ErrorCode::TimedOut)?,
     };
+
+    // The message is dequeued; if copy_to_user or write_value fail, the
+    // message data is lost but ChannelMessage::Drop releases any in-flight
+    // handles via note_handle_close. No handle leak, but data loss is
+    // unavoidable without a peek/consume split (future hardening).
     let to_copy = msg.data.len().min(capacity);
     user_memory::copy_to_user(buf, &msg.data[..to_copy])?;
     user_memory::write_value(out_actual, &(to_copy as u32))?;
@@ -213,7 +221,18 @@ pub(crate) fn sys_channel_read_etc(
     for handle in transferred {
         received_values.push(proc.handles.add_existing(handle));
     }
+
+    // Rollback: if the handle-array or count write fails after handles have
+    // been inserted into the caller's table, remove them. The transferred
+    // Handle objects are dropped (note_handle_close fires for each).
+    let rollback = DeferGuard::new(|| {
+        for &hv in &received_values {
+            let _ = proc.handles.remove(hv);
+        }
+    });
+
     user_memory::write_array(args.handles, &received_values)?;
     user_memory::write_value(args.out_handles, &(received_values.len() as u32))?;
+    rollback.commit();
     Ok(0)
 }
