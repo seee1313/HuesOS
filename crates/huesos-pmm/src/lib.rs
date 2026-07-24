@@ -121,9 +121,13 @@ impl BitmapAllocator {
 /// and while the HHDM mapping supplied by the bootloader is still active.
 pub unsafe fn init(regions: &[MemoryRegion], hhdm_offset: u64) {
     // 1. Determine how many frames we need to track.
+    // checked_add + saturate: a memory map whose region end overflows u64 is
+    // fundamentally broken; saturating to u64::MAX produces a bitmap
+    // allocation that fails the assert below, giving a clear boot-time
+    // diagnostic rather than a silent wraparound.
     let highest = regions
         .iter()
-        .map(|r| r.base + r.length)
+        .map(|r| r.base.saturating_add(r.length))
         .max()
         .unwrap_or(0);
     let frame_count = (highest.div_ceil(FRAME_SIZE)) as usize;
@@ -160,7 +164,7 @@ pub unsafe fn init(regions: &[MemoryRegion], hhdm_offset: u64) {
             continue;
         }
         let start_frame = r.base / FRAME_SIZE;
-        let end_frame = (r.base + r.length) / FRAME_SIZE;
+        let end_frame = r.base.saturating_add(r.length) / FRAME_SIZE;
         for f in start_frame..end_frame {
             alloc.set_free(f as usize);
             free_count += 1;

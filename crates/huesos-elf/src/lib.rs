@@ -139,9 +139,16 @@ fn load_segment<L: Loader>(
     }
 
     let page_start = align_down(vaddr_start, PAGE_SIZE);
-    let page_end = align_up(vaddr_start + mem_size, PAGE_SIZE);
+    let mem_end = vaddr_start
+        .checked_add(mem_size)
+        .ok_or(ElfLoadError::SegmentOutOfBounds)?;
+    let page_end = align_up(mem_end, PAGE_SIZE);
 
     let segment_bytes = &file_data[file_off..file_end];
+
+    let seg_file_end = vaddr_start
+        .checked_add(file_size as u64)
+        .ok_or(ElfLoadError::SegmentOutOfBounds)?;
 
     let mut page = page_start;
     while page < page_end {
@@ -150,9 +157,8 @@ fn load_segment<L: Loader>(
             .map_err(ElfLoadError::Mapping)?;
 
         // Compute overlap between [page, page+PAGE_SIZE) and the segment's
-        // file-backed range [vaddr_start, vaddr_start+file_size).
+        // file-backed range [vaddr_start, seg_file_end).
         let seg_file_start = vaddr_start;
-        let seg_file_end = vaddr_start + file_size as u64;
         let copy_start = core::cmp::max(page, seg_file_start);
         let copy_end = core::cmp::min(page + PAGE_SIZE, seg_file_end);
 
