@@ -53,6 +53,7 @@ pub extern "C" fn _start() -> ! {
     run_vmo_check(&mut logger);
     run_channel_check(&mut logger);
     run_monotonic_clock_check(&mut logger);
+    run_process_wait_check(&mut logger);
     run_fault_isolation_check(&mut logger);
     run_shutdown_authorization_check(&mut logger);
 
@@ -402,6 +403,34 @@ fn wait_process_exit(process: &Process) -> libcanvas::Result<i64> {
         libcanvas::process::yield_now();
     }
     Err(ErrorCode::TimedOut)
+}
+
+fn run_process_wait_check(logger: &mut InitLogger) {
+    let Ok((process, bootstrap)) = libcanvas::process::spawn_elf("wait-probe", FAULT_PROBE_ELF)
+    else {
+        init_logln!(logger, "[init] ProcessWait lifecycle FAILED (launch)");
+        return;
+    };
+    if bootstrap.write(b"wait").is_err() {
+        init_logln!(logger, "[init] ProcessWait lifecycle FAILED (command)");
+        return;
+    }
+    drop(bootstrap);
+
+    // Unlike the early-boot polling helper, this deliberately parks in the
+    // blocking syscall. The child yields before exit, so QEMU must exercise
+    // registration, park, wake, and lifecycle exit publication.
+    match process.wait_exit() {
+        Ok(0) => init_logln!(logger, "[init] ProcessWait lifecycle OK (blocked wake)"),
+        Ok(code) => init_logln!(
+            logger,
+            "[init] ProcessWait lifecycle FAILED (exit code {})",
+            code
+        ),
+        Err(error) => init_logln!(
+            logger,
+            "[init] ProcessWait lifecycle FAILED ({})", error.as_str()),
+    }
 }
 
 fn run_shutdown_authorization_check(logger: &mut InitLogger) {
