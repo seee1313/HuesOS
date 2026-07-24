@@ -4,15 +4,17 @@ set -euo pipefail
 
 profile="${1:-release}"
 cpus="${2:-2}"
-timeout_seconds="${3:-120}"
+timeout_seconds="${3:-180}"
+stress="${4:-32}"
+case "$stress" in 32|256) ;; *) echo "unsupported lifecycle stress: $stress" >&2; exit 2 ;; esac
 artifact_dir="${ARTIFACT_DIR:-ci-artifacts}"
 mkdir -p "$artifact_dir"
 log="$artifact_dir/qemu-${profile}-smp${cpus}.log"
 rm -f "$log"
 
 case "$profile" in
-    debug) CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-1}" make iso PROFILE=debug ;;
-    release) CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-1}" make iso-release ;;
+    debug) HUESOS_LIFECYCLE_WAIT_STRESS="$stress" CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-1}" make iso PROFILE=debug ;;
+    release) HUESOS_LIFECYCLE_WAIT_STRESS="$stress" CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-1}" make iso-release ;;
     *) echo "unsupported profile: $profile" >&2; exit 2 ;;
 esac
 
@@ -44,7 +46,7 @@ for marker in \
     '[acpi-manager] broker deny-by-default self-test OK' \
     '[driver-manager] ACPI manager archive validation ready' \
     '[init] user fault isolation OK' \
-    '[init] ProcessWait lifecycle OK (blocked wake)' \
+    "[init] ProcessWait lifecycle $( [[ "$stress" == 256 ]] && echo soak || echo smoke ) OK ($stress blocked wakes)" \
     '[init] terminal says terminal:ready' \
     '[terminal] keyboard service online'; do
     if ! grep -Fq "$marker" "$log"; then
@@ -54,4 +56,4 @@ for marker in \
     fi
 done
 
-echo "QEMU smoke passed: profile=$profile smp=$cpus"
+echo "QEMU smoke passed: profile=$profile smp=$cpus stress=$stress"

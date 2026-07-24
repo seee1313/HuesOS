@@ -58,11 +58,37 @@ jobs:
         env:
           CARGO_BUILD_JOBS: "1"
           ARTIFACT_DIR: ci-artifacts
-        run: bash scripts/ci-qemu-smoke.sh ${{ matrix.profile }} ${{ matrix.cpus }} 120
+        run: bash scripts/ci-qemu-smoke.sh ${{ matrix.profile }} ${{ matrix.cpus }} 180
       - name: Upload serial log
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: qemu-${{ matrix.profile }}-smp${{ matrix.cpus }}
+          path: ci-artifacts/
+          if-no-files-found: warn
+
+  qemu-lifecycle-soak:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        cpus: [1, 2]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo DEBIAN_FRONTEND=noninteractive apt-get install -y gcc xorriso qemu-system-x86
+      - name: Install Rust toolchain
+        run: rustup toolchain install nightly-2026-03-01 --profile minimal --component rust-src,llvm-tools-preview
+      - name: Run 256-exit lifecycle soak
+        env:
+          CARGO_BUILD_JOBS: "1"
+          ARTIFACT_DIR: ci-artifacts
+        run: bash scripts/ci-qemu-smoke.sh debug ${{ matrix.cpus }} 1500 256
+      - name: Upload serial log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: qemu-lifecycle-soak-smp${{ matrix.cpus }}
           path: ci-artifacts/
           if-no-files-found: warn

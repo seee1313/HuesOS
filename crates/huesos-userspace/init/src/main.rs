@@ -53,7 +53,7 @@ pub extern "C" fn _start() -> ! {
     run_vmo_check(&mut logger);
     run_channel_check(&mut logger);
     run_monotonic_clock_check(&mut logger);
-    run_process_wait_check(&mut logger);
+    run_process_wait_stress(&mut logger);
     run_fault_isolation_check(&mut logger);
     run_shutdown_authorization_check(&mut logger);
 
@@ -405,32 +405,46 @@ fn wait_process_exit(process: &Process) -> libcanvas::Result<i64> {
     Err(ErrorCode::TimedOut)
 }
 
-fn run_process_wait_check(logger: &mut InitLogger) {
-    let Ok((process, bootstrap)) = libcanvas::process::spawn_elf("wait-probe", FAULT_PROBE_ELF)
-    else {
-        init_logln!(logger, "[init] ProcessWait lifecycle FAILED (launch)");
-        return;
-    };
-    if bootstrap.write(b"wait").is_err() {
-        init_logln!(logger, "[init] ProcessWait lifecycle FAILED (command)");
-        return;
+fn lifecycle_wait_iterations() -> usize {
+    match option_env!("HUESOS_LIFECYCLE_WAIT_STRESS") {
+        Some("256") => 256,
+        _ => 32,
     }
-    drop(bootstrap);
+}
 
-    // Unlike the early-boot polling helper, this deliberately parks in the
-    // blocking syscall. The child yields before exit, so QEMU must exercise
-    // registration, park, wake, and lifecycle exit publication.
-    match process.wait_exit() {
-        Ok(0) => init_logln!(logger, "[init] ProcessWait lifecycle OK (blocked wake)"),
-        Ok(code) => init_logln!(
-            logger,
-            "[init] ProcessWait lifecycle FAILED (exit code {})",
-            code
-        ),
-        Err(error) => init_logln!(
-            logger,
-            "[init] ProcessWait lifecycle FAILED ({})", error.as_str()),
+fn run_process_wait_stress(logger: &mut InitLogger) {
+    let iterations = lifecycle_wait_iterations();
+    for index in 0..iterations {
+        let Ok((process, bootstrap)) = libcanvas::process::spawn_elf("wait-probe", FAULT_PROBE_ELF)
+        else {
+            init_logln!(logger, "[init] ProcessWait lifecycle FAILED (launch at {})", index);
+            return;
+        };
+        if bootstrap.write(b"wait").is_err() {
+            init_logln!(logger, "[init] ProcessWait lifecycle FAILED (command at {})", index);
+            return;
+        }
+        drop(bootstrap);
+        // The child yields before exit, so this must exercise wait registration,
+        // scheduler park/wake, lifecycle publication, and exit-code delivery.
+        match process.wait_exit() {
+            Ok(0) => {
+                if (index + 1) % 32 == 0 && index + 1 != iterations {
+                    init_logln!(logger, "[init] ProcessWait lifecycle progress {}/{}", index + 1, iterations);
+                }
+            }
+            Ok(code) => {
+                init_logln!(logger, "[init] ProcessWait lifecycle FAILED (exit {} at {})", code, index);
+                return;
+            }
+            Err(error) => {
+                init_logln!(logger, "[init] ProcessWait lifecycle FAILED ({} at {})", error.as_str(), index);
+                return;
+            }
+        }
     }
+    let mode = if iterations == 256 { "soak" } else { "smoke" };
+    init_logln!(logger, "[init] ProcessWait lifecycle {} OK ({} blocked wakes)", mode, iterations);
 }
 
 fn run_shutdown_authorization_check(logger: &mut InitLogger) {

@@ -21,12 +21,10 @@ pub extern "C" fn _start() -> ! {
         b"gpf" => trigger_general_protection(),
         b"divide" => trigger_divide_error(),
         b"wait" => {
-            // Give init a chance to park in ProcessWait. This is deliberately
-            // cooperative: the probe exercises the wake path without relying
-            // on wall-clock timing or a busy loop.
-            for _ in 0..32 {
-                libcanvas::process::yield_now();
-            }
+            // Yield once so init can register and park in ProcessWait. A
+            // single scheduler handoff is enough for the wake-path regression
+            // while keeping the 256-exit soak bounded under QEMU TCG.
+            libcanvas::process::yield_now();
             libcanvas::process::exit(0)
         }
         b"shutdown" => match libcanvas::system::shutdown() {

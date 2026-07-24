@@ -127,20 +127,31 @@ consuming a queued message/event. See [USER_MEMORY.md](USER_MEMORY.md).
 
 ## ProcessWait lifecycle regression
 
-Before the fault-isolation probes, init launches `fault-probe` with the `wait`
-command and calls the blocking `ProcessWait` wrapper. The child yields 32 times
-before exiting with code zero, giving init an opportunity to park. A successful
-boot must contain:
+Init runs a bounded blocking `ProcessWait` stress probe before fault isolation.
+Each `fault-probe` child receives `wait`, yields once, then exits with code
+zero. The parent must register a waiter, park, wake, and receive that code.
 
-```text
-[init] ProcessWait lifecycle OK (blocked wake)
-```
+The kernel build passes only the whitelisted build setting
+`HUESOS_LIFECYCLE_WAIT_STRESS=32|256` to init; any missing or invalid value
+falls back to 32. This is a test-build input, not a userspace-visible kernel
+cmdline or a new syscall ABI.
 
-This covers the scheduler-visible lifecycle path: waiter registration, park,
-exit publication, wake, and exit-code delivery. `scripts/ci-qemu-smoke.sh`
-requires this marker for debug/release and SMP 1/2 matrix boots. It does not
-prove an arbitrary-duration SMP soak; that remains a separate lifecycle stress
-requirement.
+- The normal `qemu-boot` matrix runs 32 exits and requires:
+
+  ```text
+  [init] ProcessWait lifecycle smoke OK (32 blocked wakes)
+  ```
+
+- The `qemu-lifecycle-soak` matrix runs 256 exits on SMP 1 and SMP 2 and
+  requires:
+
+  ```text
+  [init] ProcessWait lifecycle soak OK (256 blocked wakes)
+  ```
+
+The latter emits progress every 32 exits and exercises a full
+`TaskGraveyard<256>`-sized sequence of lifecycle records. It remains a bounded regression/soak test rather than a proof of an
+unbounded-duration SMP run.
 
 ## Monotonic Clock, Snake, and Shutdown Tests
 

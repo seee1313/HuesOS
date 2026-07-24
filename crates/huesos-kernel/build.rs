@@ -19,6 +19,11 @@ fn main() {
     let profile = "release";
 
     track_userspace_inputs(&userspace_root);
+    println!("cargo:rerun-if-env-changed=HUESOS_LIFECYCLE_WAIT_STRESS");
+    let lifecycle_wait_stress = env::var("HUESOS_LIFECYCLE_WAIT_STRESS")
+        .ok()
+        .filter(|value| matches!(value.as_str(), "32" | "256"))
+        .unwrap_or_else(|| "32".into());
 
     let input_driver_host = build_userspace_program(
         &userspace_root,
@@ -70,6 +75,7 @@ fn main() {
             ("HUESOS_DRIVER_MANAGER_PATH", driver_manager.as_os_str()),
             ("HUESOS_TERMINAL_PATH", terminal.as_os_str()),
             ("HUESOS_FAULT_PROBE_PATH", fault_probe.as_os_str()),
+            ("HUESOS_LIFECYCLE_WAIT_STRESS", OsStr::new(&lifecycle_wait_stress)),
         ],
     );
 
