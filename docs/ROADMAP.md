@@ -99,6 +99,11 @@ priority order.
 
 ### HBI / FAT / alloc hardening
 - HBI v2.1 gen/parser `EntryHeader` stride alignment (24 bytes)
+- HBI parser validates image_size vs buffer length, caps num_entries at 256,
+  checks per-directory-entry offset/length bounds, and cross-checks
+  DirectoryEntry ↔ EntryHeader type_id consistency
+- ELF loader and PMM use checked/saturating arithmetic for segment-end and
+  region-end computations; paging map_phys_range rejects overflow ranges
 - FAT BPB field widths + FAT16 EOC thresholds
 - Buddy allocator stores and uses `page_size`
 

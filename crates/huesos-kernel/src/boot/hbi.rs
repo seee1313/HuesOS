@@ -99,14 +99,31 @@ pub enum HbiError {
     InvalidOffset,
     /// Generic parse error (e.g. arithmetic overflow).
     ParseError,
+    /// The declared image_size does not match the actual buffer length.
+    ImageSizeMismatch,
+    /// The number of directory entries exceeds the sanity bound.
+    TooManyEntries,
+    /// A directory entry's type_id/length is inconsistent with its per-module
+    /// EntryHeader.
+    EntryMismatch,
 }
 
 impl<'a> HbiImage<'a> {
     /// Parse an HBI image from a byte slice.
     ///
-    /// This function is safe and performs all necessary size checks.
+    /// This function is safe and performs all necessary size checks:
+    /// - Magic and version validation.
+    /// - `image_size` consistency with the actual buffer length.
+    /// - `num_entries` sanity bound (max 256 directory entries).
+    /// - Checked arithmetic for all offset/length computations.
+    /// - Directory entry offset/length bounds against the buffer.
+    /// - Directory entry ↔ EntryHeader type_id consistency.
     pub fn parse(data: &'a [u8]) -> Result<Self, HbiError> {
         const HEADER_SIZE: usize = core::mem::size_of::<GlobalHeader>();
+        /// Sanity upper bound on directory entries. The boot image generator
+        /// produces a handful of entries (kernel, bootfs, cmdline, platform);
+        /// anything above this is either corrupted or a malicious image.
+        const MAX_ENTRIES: usize = 256;
 
         if data.len() < HEADER_SIZE {
             return Err(HbiError::BufferTooSmall);
@@ -123,7 +140,17 @@ impl<'a> HbiImage<'a> {
             return Err(HbiError::UnsupportedVersion);
         }
 
+        // Validate image_size: if non-zero, it must match the actual buffer.
+        // A zero image_size is tolerated for forward-compatibility with
+        // pre-release tooling that did not populate the field.
+        if header.image_size != 0 && header.image_size as usize != data.len() {
+            return Err(HbiError::ImageSizeMismatch);
+        }
+
         let num_entries = header.num_entries as usize;
+        if num_entries > MAX_ENTRIES {
+            return Err(HbiError::TooManyEntries);
+        }
 
         let header_size = header.header_size as usize;
         if header_size < HEADER_SIZE || data.len() < header_size {
@@ -135,7 +162,9 @@ impl<'a> HbiImage<'a> {
             .ok_or(HbiError::ParseError)?;
 
         let entries_start = HEADER_SIZE;
-        let entries_end = entries_start + entries_byte_len;
+        let entries_end = entries_start
+            .checked_add(entries_byte_len)
+            .ok_or(HbiError::ParseError)?;
 
         if entries_end > data.len() {
             return Err(HbiError::BufferTooSmall);
@@ -145,10 +174,43 @@ impl<'a> HbiImage<'a> {
         let mut entries = alloc::vec::Vec::with_capacity(num_entries);
         let entry_size = core::mem::size_of::<DirectoryEntry>();
         for i in 0..num_entries {
-            let off = entries_start + i * entry_size;
+            let off = entries_start
+                .checked_add(i.checked_mul(entry_size).ok_or(HbiError::ParseError)?)
+                .ok_or(HbiError::ParseError)?;
             let entry = unsafe {
                 core::ptr::read_unaligned(data.as_ptr().add(off) as *const DirectoryEntry)
             };
+
+            // Validate each entry's offset/length bounds before accepting it.
+            let payload_start = (entry.offset as usize)
+                .checked_add(core::mem::size_of::<EntryHeader>())
+                .ok_or(HbiError::InvalidOffset)?;
+            let payload_end = payload_start
+                .checked_add(entry.length as usize)
+                .ok_or(HbiError::InvalidOffset)?;
+            if payload_end > data.len() {
+                return Err(HbiError::InvalidOffset);
+            }
+
+            // Validate type_id consistency: the per-module EntryHeader at
+            // `entry.offset` must carry the same type_id as the directory.
+            // Read the type_id field (first 4 bytes, little-endian) without
+            // unsafe by copying the bytes directly.
+            let eh_offset = entry.offset as usize;
+            let eh_type_id = if eh_offset.saturating_add(4) <= data.len() {
+                u32::from_le_bytes([
+                    data[eh_offset],
+                    data[eh_offset + 1],
+                    data[eh_offset + 2],
+                    data[eh_offset + 3],
+                ])
+            } else {
+                return Err(HbiError::InvalidOffset);
+            };
+            if eh_type_id != entry.type_id {
+                return Err(HbiError::EntryMismatch);
+            }
+
             entries.push(entry);
         }
 
@@ -160,6 +222,10 @@ impl<'a> HbiImage<'a> {
     }
 
     /// Get the raw payload of a module by type.
+    ///
+    /// The directory entry bounds were already validated during [`parse`];
+    /// this re-validates for defense-in-depth in case entries are ever
+    /// constructed by another path.
     pub fn get_module(&self, module_type: ModuleType) -> Result<&'a [u8], HbiError> {
         let type_id = module_type as u32;
 
@@ -226,7 +292,7 @@ mod tests {
             flags: 0,
             num_entries: 0,
             header_size: core::mem::size_of::<GlobalHeader>() as u32,
-            image_size: core::mem::size_of::<GlobalHeader>() as u64,
+            image_size: 128,
             arch_id: 0,
             reserved: [0; 36],
         };
@@ -243,5 +309,34 @@ mod tests {
         assert!(result.is_ok());
         let hbi = result.unwrap();
         assert_eq!(hbi.get_num_entries(), 0);
+    }
+
+    /// Build the first 32 bytes of an HBI global header directly (no unsafe
+    /// transmute), filling the rest of `data` with zeroes.
+    fn write_minimal_header(data: &mut [u8], num_entries: u32, image_size: u64) {
+        data[..8].copy_from_slice(b"HUESOS_H");
+        data[8..12].copy_from_slice(&0x0002_0001u32.to_le_bytes()); // version
+        data[12..16].copy_from_slice(&0u32.to_le_bytes()); // flags
+        data[16..20].copy_from_slice(&num_entries.to_le_bytes());
+        data[20..24].copy_from_slice(
+            &(core::mem::size_of::<GlobalHeader>() as u32).to_le_bytes(),
+        ); // header_size
+        data[24..32].copy_from_slice(&image_size.to_le_bytes());
+    }
+
+    #[test]
+    fn test_hbi_parse_image_size_mismatch() {
+        let mut data = vec![0u8; 128];
+        write_minimal_header(&mut data, 0, 999); // wrong image_size
+        let result = HbiImage::parse(&data);
+        assert!(matches!(result, Err(HbiError::ImageSizeMismatch)));
+    }
+
+    #[test]
+    fn test_hbi_parse_too_many_entries() {
+        let mut data = vec![0u8; 128];
+        write_minimal_header(&mut data, 257, 0); // above MAX_ENTRIES
+        let result = HbiImage::parse(&data);
+        assert!(matches!(result, Err(HbiError::TooManyEntries)));
     }
 }

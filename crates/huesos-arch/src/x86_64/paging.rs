@@ -129,6 +129,8 @@ pub enum KernelPageError {
     AlreadyMapped,
     /// A huge parent mapping prevents insertion of a 4 KiB page.
     ParentHugePage,
+    /// The requested physical range overflows the address space.
+    Overflow,
 }
 
 /// Map `page` to `frame` with `flags` in the *kernel* address space.
@@ -208,7 +210,13 @@ fn map_phys_range(
         return Ok(());
     }
     let start = phys_base & !0xfff;
-    let end = phys_base.saturating_add(length).saturating_add(0xfff) & !0xfff;
+    let raw_end = phys_base
+        .checked_add(length)
+        .ok_or(KernelPageError::Overflow)?;
+    let end = raw_end
+        .checked_add(0xfff)
+        .ok_or(KernelPageError::Overflow)?
+        & !0xfff;
 
     let mut guard = KERNEL_PAGE_TABLE.lock();
     let mapper = guard.as_mut().ok_or(KernelPageError::NotInitialized)?;
