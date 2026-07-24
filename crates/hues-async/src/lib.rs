@@ -53,6 +53,8 @@
 #![cfg_attr(not(test), no_std)]
 #![warn(missing_docs)]
 
+pub mod backend;
+
 use core::cell::{Cell, UnsafeCell};
 use core::future::Future;
 use core::mem::{self, MaybeUninit};
