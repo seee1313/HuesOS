@@ -53,6 +53,15 @@ fn now_ticks() -> u64 {
     (*TICKS_FN.lock()).map(|f| f()).unwrap_or(0)
 }
 
+/// Yield to the scheduler without parking on a wait queue.
+///
+/// Used by blocking helpers when [`WaitQueue::prepare`] returns `None`
+/// (scheduler not yet initialized during early boot). The task stays
+/// runnable and simply re-checks on the next poll.
+pub fn yield_to_scheduler() {
+    park_current();
+}
+
 /// FIFO wait queue of blocked tasks.
 pub struct WaitQueue {
     waiters: Mutex<Vec<TaskId>>,
@@ -104,6 +113,77 @@ impl WaitQueue {
             wake_task(id);
         }
     }
+
+    /// Enqueue the current task in this wait queue **without** parking.
+    ///
+    /// Returns a [`PreparedWait`] token that the caller must consume by
+    /// either [`PreparedWait::park`] (condition still unmet — safe to sleep)
+    /// or [`PreparedWait::cancel`] (condition already met — leave the queue).
+    ///
+    /// # Why this exists
+    ///
+    /// The classic lost-wakeup race: a caller checks the condition (finds it
+    /// unmet), is preempted, a waker fires on an *empty* wait queue and
+    /// delivers no wake, then the caller enqueues and parks forever. By
+    /// enqueueing **before** re-checking the condition, the waiter is
+    /// guaranteed visible to wakers before it decides to sleep.
+    ///
+    /// Returns `None` if called before the scheduler is ready (early boot).
+    pub fn prepare(&self) -> Option<PreparedWait<'_>> {
+        let task = current_task_id()?;
+        self.enqueue(task);
+        Some(PreparedWait { task, queue: self })
+    }
+}
+
+/// A prepared wait: the current task has been enqueued in a [`WaitQueue`] and
+/// must be consumed by [`cancel`](Self::cancel) or [`park`](Self::park).
+///
+/// The lifetime `'a` ties this token to the wait queue; the queue cannot be
+/// dropped while a prepared wait is outstanding.
+pub struct PreparedWait<'a> {
+    task: TaskId,
+    queue: &'a WaitQueue,
+}
+
+impl<'a> PreparedWait<'a> {
+    /// Cancel the wait: remove ourselves from the queue without sleeping.
+    ///
+    /// Use this when the re-check after [`WaitQueue::prepare`] found the
+    /// condition already satisfied.
+    pub fn cancel(self) {
+        self.queue.remove(self.task);
+    }
+
+    /// Park the current task until woken. Returns when the scheduler delivers
+    /// a wake (or spuriously). Caller **must** re-check the condition
+    /// afterwards.
+    ///
+    /// The scheduler's `wake_pending` protocol ensures that a wake arriving
+    /// between [`WaitQueue::prepare`] and this call is not lost.
+    pub fn park(self) {
+        park_current();
+        self.queue.remove(self.task);
+    }
+
+    /// Park the current task until woken or until `timeout_ticks` scheduler
+    /// ticks elapse. `timeout_ticks == 0` waits forever (same as [`park`]).
+    pub fn park_timeout(self, timeout_ticks: u64) -> ParkResult {
+        if timeout_ticks == 0 {
+            self.park();
+            return ParkResult::Woken;
+        }
+        let deadline = now_ticks().saturating_add(timeout_ticks);
+        arm_timeout(self.task, deadline);
+        park_current();
+        cancel_timeout(self.task);
+        self.queue.remove(self.task);
+        if now_ticks() >= deadline {
+            ParkResult::TimedOut
+        } else {
+            ParkResult::Woken
+        }
+    }
 }
 
 impl Default for WaitQueue {
@@ -116,6 +196,15 @@ impl Default for WaitQueue {
 ///
 /// Callers must re-check the wait condition after this returns (standard
 /// lost-wakeup pattern: enqueue → recheck → park).
+///
+/// # Deprecation note
+///
+/// This helper has a lost-wakeup gap between the caller's condition check
+/// and the internal enqueue. New code should use [`WaitQueue::prepare`]
+/// followed by [`PreparedWait::park`] (or [`PreparedWait::cancel`]) so the
+/// task is visible to wakers *before* it re-checks the condition. This
+/// function is retained for callers that cannot use the prepare pattern.
+#[doc(hidden)]
 pub fn park_on(queue: &WaitQueue) {
     let Some(task) = current_task_id() else {
         for _ in 0..1000 {
@@ -141,27 +230,11 @@ pub enum ParkResult {
 ///
 /// `timeout_ticks == 0` means wait forever (same as [`park_on`]).
 ///
-/// Implementation: enqueue, then park. The scheduler tick path does not
-/// auto-wake waiters; we rely on a short cooperative pattern where the
-/// waker or a subsequent timed re-entry checks the deadline. For true
-/// timeouts we park once and, after returning, compare ticks — but a pure
-/// park never returns without wake. So we use a hybrid: register the
-/// waiter and spin-park in slices of 1 tick by yielding via park only when
-/// a global timer wake is available.
+/// # Deprecation note
 ///
-/// Practical approach used here: park, and require the kernel's
-/// `wake_task` for event delivery. For timeout, the BSP idle/timer path
-/// will call [`poll_timeouts`] if registered — for MVP we do a bounded
-/// number of park attempts is wrong.
-///
-/// Instead: store deadline in a side table and have `wake` from timer
-/// scan it. Simpler MVP: **busy-yield with tick check** without full park
-/// when timeout is set (still blocks the task via park_current each
-/// slice... we need timer to wake us).
-///
-/// Simplest correct MVP with existing hooks: on timeout wait, enqueue and
-/// call `park_current` only after arming a one-shot by storing
-/// (task, deadline) in TIMEOUTS; `notify_tick(now)` wakes expired tasks.
+/// Same lost-wakeup concern as [`park_on`]. New code should use
+/// [`WaitQueue::prepare`] followed by [`PreparedWait::park_timeout`].
+#[doc(hidden)]
 pub fn park_on_timeout(queue: &WaitQueue, timeout_ticks: u64) -> ParkResult {
     if timeout_ticks == 0 {
         park_on(queue);
