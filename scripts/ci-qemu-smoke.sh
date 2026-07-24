@@ -6,6 +6,7 @@ profile="${1:-release}"
 cpus="${2:-2}"
 timeout_seconds="${3:-360}"
 stress="${4:-32}"
+diagnostics="${LIFECYCLE_REAPER_DIAGNOSTICS:-1}"
 case "$stress" in 32|256) ;; *) echo "unsupported lifecycle stress: $stress" >&2; exit 2 ;; esac
 artifact_dir="${ARTIFACT_DIR:-ci-artifacts}"
 mkdir -p "$artifact_dir"
@@ -13,8 +14,8 @@ log="$artifact_dir/qemu-${profile}-smp${cpus}.log"
 rm -f "$log"
 
 case "$profile" in
-    debug) HUESOS_LIFECYCLE_WAIT_STRESS="$stress" CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-1}" make iso PROFILE=debug ;;
-    release) HUESOS_LIFECYCLE_WAIT_STRESS="$stress" CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-1}" make iso-release ;;
+    debug) HUESOS_LIFECYCLE_WAIT_STRESS="$stress" HUESOS_LIFECYCLE_REAPER_DIAGNOSTICS="$diagnostics" CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-1}" make iso PROFILE=debug ;;
+    release) HUESOS_LIFECYCLE_WAIT_STRESS="$stress" HUESOS_LIFECYCLE_REAPER_DIAGNOSTICS="$diagnostics" CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-1}" make iso-release ;;
     *) echo "unsupported profile: $profile" >&2; exit 2 ;;
 esac
 

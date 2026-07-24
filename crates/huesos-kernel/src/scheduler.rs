@@ -43,6 +43,16 @@ const TASK_GENERATION_SHIFT: u32 = 32;
 const TASK_GENERATION_MASK: u32 = 0x00ff_ffff;
 const TASK_INDEX_MASK: u64 = 0xffff_ffff;
 
+macro_rules! lifecycle_diag {
+    ($($arg:tt)*) => {{
+        if option_env!("HUESOS_LIFECYCLE_REAPER_DIAGNOSTICS") == Some("1") {
+            use core::fmt::Write;
+            let mut writer = huesos_arch::serial::SerialWriter;
+            let _ = writeln!(writer, "[lifecycle] {}", format_args!($($arg)*));
+        }
+    }};
+}
+
 const fn encode_task_id(cpu: usize, generation: u32, index: usize) -> u64 {
     ((cpu as u64) << TASK_CPU_SHIFT)
         | (((generation & TASK_GENERATION_MASK) as u64) << TASK_GENERATION_SHIFT)
@@ -659,6 +669,7 @@ pub fn exit_current_task(code: i64) -> ! {
         }
     }
     if let Some(proc) = process_to_signal {
+        lifecycle_diag!("exit task={} process={} code={}", reap_id.unwrap_or(0), proc.koid().0, code);
         if proc.set_exit_code(code) {
             record_process_exit(&proc, code);
         }
@@ -832,6 +843,7 @@ pub fn reap_finished_tasks() {
         let mut q = REAP_QUEUE.lock();
         core::mem::take(&mut *q)
     };
+    lifecycle_diag!("reap batch tasks={}", batch.len());
     for task_id in batch {
         // This lock is acquired before any scheduler lock, preventing a
         // scheduler -> pending-entry inversion during task-slot reclamation.
@@ -845,12 +857,14 @@ pub fn reap_finished_tasks() {
         // Drop duplicate/stale queue entries before comparing indexes: a new
         // generation may legitimately be running in the same slot.
         if !guard.task_matches(task_id) {
+            lifecycle_diag!("reap stale task={}", task_id);
             continue;
         }
         // Never reap the currently running generation (shouldn't be queued).
         if guard.current == idx {
             REAP_QUEUE.lock().push(task_id);
             REAP_PENDING.store(true, Ordering::Release);
+            lifecycle_diag!("reap current task={} cpu={} slot={}", task_id, cpu, idx);
             continue;
         }
         let reusable = {
@@ -872,6 +886,9 @@ pub fn reap_finished_tasks() {
         };
         if reusable {
             guard.free_slots.push(idx);
+            lifecycle_diag!("reap reusable task={} cpu={} slot={}", task_id, cpu, idx);
+        } else {
+            lifecycle_diag!("reap retained task={} cpu={} slot={}", task_id, cpu, idx);
         }
     }
 
@@ -880,6 +897,7 @@ pub fn reap_finished_tasks() {
         let mut q = PROCESS_TEARDOWN.lock();
         core::mem::take(&mut *q)
     };
+    lifecycle_diag!("reap batch processes={}", procs.len());
     for proc in procs {
         let koid = proc.koid();
         let still_current = (0..MAX_CPUS).any(|cpu| {
@@ -894,7 +912,9 @@ pub fn reap_finished_tasks() {
             // page tables while that CPU can still have the process CR3 live.
             PROCESS_TEARDOWN.lock().push(proc);
             REAP_PENDING.store(true, Ordering::Release);
+            lifecycle_diag!("teardown deferred process={}", koid.0);
         } else {
+            lifecycle_diag!("teardown process={}", koid.0);
             crate::process::teardown_process(&proc);
         }
     }
