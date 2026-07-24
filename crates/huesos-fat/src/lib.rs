@@ -156,7 +156,10 @@ impl<'a, D: BlockDevice> FatFileSystem<'a, D> {
             0
         };
 
-        let components = path.split('/').filter(|c| !c.is_empty());
+        let components: alloc::vec::Vec<&str> = path.split('/').filter(|c| !c.is_empty()).collect();
+        let Some(&last_component) = components.last() else {
+            return Err(DriverError::InvalidPath);
+        };
 
         // For FAT16 we start from fixed root
         let mut is_root_special = !self.is_fat32;
@@ -176,15 +179,22 @@ impl<'a, D: BlockDevice> FatFileSystem<'a, D> {
                 current_cluster = entry.first_cluster();
                 is_root_special = false;
             } else {
-                // last component must be file
-                return Ok(entry);
+                // A file entry is only valid as the last component of the
+                // path. If more components follow, the caller tried to
+                // traverse through a file as if it were a directory.
+                return if component == last_component {
+                    Ok(entry)
+                } else {
+                    Err(DriverError::NotADirectory)
+                };
             }
         }
 
-        // If we finished loop on a directory, return last dir entry
-        // (for now we return the last traversed entry)
-        // Better to have open_dir, but for read_file compatibility:
-        Err(DriverError::FileNotFound) // caller should have used full path to file
+        // If we finished the loop on a directory, the caller asked for a
+        // directory path rather than a file. read_file needs a full path
+        // to a regular file.
+        let _ = last_component;
+        Err(DriverError::FileNotFound)
     }
 
     fn root_dir_offset(&self) -> u32 {
