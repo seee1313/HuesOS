@@ -669,7 +669,6 @@ pub fn exit_current_task(code: i64) -> ! {
         }
     }
     if let Some(proc) = process_to_signal {
-        lifecycle_diag!("exit task={} process={} code={}", reap_id.unwrap_or(0), proc.koid().0, code);
         if proc.set_exit_code(code) {
             record_process_exit(&proc, code);
         }
@@ -843,7 +842,6 @@ pub fn reap_finished_tasks() {
         let mut q = REAP_QUEUE.lock();
         core::mem::take(&mut *q)
     };
-    lifecycle_diag!("reap batch tasks={}", batch.len());
     for task_id in batch {
         // This lock is acquired before any scheduler lock, preventing a
         // scheduler -> pending-entry inversion during task-slot reclamation.
@@ -886,9 +884,6 @@ pub fn reap_finished_tasks() {
         };
         if reusable {
             guard.free_slots.push(idx);
-            lifecycle_diag!("reap reusable task={} cpu={} slot={}", task_id, cpu, idx);
-        } else {
-            lifecycle_diag!("reap retained task={} cpu={} slot={}", task_id, cpu, idx);
         }
     }
 
@@ -897,7 +892,6 @@ pub fn reap_finished_tasks() {
         let mut q = PROCESS_TEARDOWN.lock();
         core::mem::take(&mut *q)
     };
-    lifecycle_diag!("reap batch processes={}", procs.len());
     for proc in procs {
         let koid = proc.koid();
         let still_current = (0..MAX_CPUS).any(|cpu| {
@@ -914,7 +908,6 @@ pub fn reap_finished_tasks() {
             REAP_PENDING.store(true, Ordering::Release);
             lifecycle_diag!("teardown deferred process={}", koid.0);
         } else {
-            lifecycle_diag!("teardown process={}", koid.0);
             crate::process::teardown_process(&proc);
         }
     }

@@ -6,7 +6,7 @@ profile="${1:-release}"
 cpus="${2:-2}"
 timeout_seconds="${3:-360}"
 stress="${4:-32}"
-diagnostics="${LIFECYCLE_REAPER_DIAGNOSTICS:-1}"
+diagnostics="${LIFECYCLE_REAPER_DIAGNOSTICS:-0}"
 case "$stress" in 32|256) ;; *) echo "unsupported lifecycle stress: $stress" >&2; exit 2 ;; esac
 artifact_dir="${ARTIFACT_DIR:-ci-artifacts}"
 mkdir -p "$artifact_dir"
