@@ -78,7 +78,9 @@ priority order.
   dereference caller pointers
 - Full ABI-bound and active page-table walk (`PRESENT`, `USER_ACCESSIBLE`,
   `WRITABLE` for outputs), including multi-page ranges and huge-page leaves
-- Single-fetch ABI records and output preflight before blocking/side effects
+- Single-fetch ABI records and output preflight before blocking/side effects;
+  RAII `DeferGuard` rollback undoes handle-table insertions and object
+  registrations when user-memory delivery fails after side effects
 - Bounded VMO/Channel/debug/framebuffer temporary transfers with fallible
   allocation
 - Handle duplication restricted to equal or reduced rights
