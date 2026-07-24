@@ -1,9 +1,9 @@
-//! # hues-async — a minimal, allocation-free futures executor for fast drivers
+//! # hues-async — a minimal, allocation-free futures executor for ring 0 and ring 3
 //!
-//! `hues-async` is a tiny run-to-completion executor for `no_std` ring-3 driver
-//! processes. It is built for the lowest practical overhead so device drivers
-//! (the first being NVMe, ROADMAP Short-Term #7) can drive queue-based I/O
-//! without a heavyweight runtime.
+//! `hues-async` is a tiny run-to-completion executor for `no_std` environments.
+//! It works identically in ring-0 kernel drivers and ring-3 userspace driver
+//! processes, with **zero allocation** at every level: futures are stored
+//! inline, wakers are pointer-based, and the ready set is a single `u64`.
 //!
 //! ## Design
 //!
@@ -20,45 +20,61 @@
 //!   (e.g. an NVMe completion-queue entry observed by the driver's event loop)
 //!   the driver calls [`Executor::wake`] with the [`TaskId`] returned by
 //!   [`Executor::spawn`] — this path is generation-guarded against stale ids.
-//! - **Hybrid completion.** The executor only polls ready tasks. The *driver*
-//!   implements the hybrid wait (a short completion-queue poll window after a
-//!   submit, then falling back to an interrupt wait) in its event loop; this
-//!   crate stays mechanism-only.
+//! - **Backend-agnostic.** The executor is generic over a [`Backend`] trait.
+//!   [`backend::KernelBackend`] (ring 0) and [`backend::UserBackend`] (ring 3)
+//!   plug in the platform-specific park/wake/tick primitives. A
+//!   [`NullBackend`] is provided for tests.
 //!
 //! ## Contracts (read before use)
 //!
-//! - **Single-threaded.** One executor runs on one core. The waker and the
-//!   run loop are not internally synchronized; the driver process is expected
-//!   to drive everything from one thread (the completion handler wakes tasks
-//!   from that same thread).
+//! - **Single-threaded per executor.** One executor runs on one core (ring 0)
+//!   or one thread (ring 3). The waker and the run loop are not internally
+//!   synchronized.
 //! - **Stable address.** The executor must not be moved after the first
 //!   [`spawn`](Executor::spawn) (wakers hold interior pointers). Create it in
-//!   its final location (e.g. the driver's state) before spawning.
+//!   its final location before spawning.
 //! - **Futures must make progress.** The run loop drains ready tasks until
 //!   quiescent; a task that unconditionally re-wakes itself without progressing
 //!   will spin.
-//! - **Futures are `'static`.** A spawned future must own its data (or borrow
-//!   only `'static` state). The executor owns and drops its futures (it drops
-//!   any still-live futures when the executor itself is dropped).
+//! - **Spawned futures are `'static`.** Use [`scope_on`] for borrowing futures.
 //!
 //! ## Safety
 //!
 //! This crate contains a small, deliberate amount of `unsafe` — the minimum
 //! needed to store heterogeneous futures inline and to implement a no-alloc
-//! [`Waker`]. Every site carries a `SAFETY:` comment, and the surface is
-//! documented in `docs/UNSAFE_AUDIT.md` and bounded by `safety-budget.json`.
+//! [`Waker`]. Every site carries a `SAFETY:` comment.
 //! The crate uses no `unwrap`/`expect`/`panic!` outside the compile-time
 //! capacity assertion.
 
 #![cfg_attr(not(test), no_std)]
 #![warn(missing_docs)]
 
+pub mod backend;
+
 use core::cell::{Cell, UnsafeCell};
 use core::future::Future;
+use core::marker::PhantomData;
 use core::mem::{self, MaybeUninit};
 use core::pin::Pin;
 use core::ptr;
 use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+
+use backend::Backend;
+
+/// A backend that does nothing. Used as the default type parameter so that
+/// tests and benchmarks can construct `Executor<N, F>` without specifying a
+/// backend. **Not suitable for production use** (park spins, wake is a no-op).
+pub struct NullBackend;
+
+impl Backend for NullBackend {
+    fn park(&self) {
+        core::hint::spin_loop();
+    }
+    fn wake(&self, _slot: u32) {}
+    fn now_ticks(&self) -> u64 {
+        0
+    }
+}
 
 /// Errors returned by [`Executor::spawn`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -122,17 +138,37 @@ struct Slot<const F: usize> {
 
 /// A fixed-capacity, allocation-free, single-threaded futures executor.
 ///
-/// `TASKS` is the number of concurrent task slots (at most 64); `F` is the
-/// maximum size in bytes of any spawned future.
-pub struct Executor<const TASKS: usize, const F: usize> {
+/// Generic over:
+/// - `TASKS`: number of concurrent task slots (at most 64)
+/// - `F`: maximum size in bytes of any spawned future
+/// - `B`: the [`Backend`] providing platform-specific park/wake/tick
+///
+/// The default backend is [`NullBackend`] (tests only). Production code
+/// should use [`backend::KernelBackend`] (ring 0) or
+/// [`backend::UserBackend`] (ring 3).
+pub struct Executor<const TASKS: usize, const F: usize, B: Backend = NullBackend> {
     ready: Cell<u64>,
     count: Cell<usize>,
     slots: [Slot<F>; TASKS],
+    backend: B,
+    _marker: PhantomData<B>,
 }
 
-impl<const TASKS: usize, const F: usize> Executor<TASKS, F> {
-    /// Create an empty executor. Compile-time asserts `TASKS <= 64`.
+impl<const TASKS: usize, const F: usize> Executor<TASKS, F, NullBackend> {
+    /// Create an empty executor with the [`NullBackend`] (tests only).
+    ///
+    /// For production use, use [`new_with`](Self::new_with) with a
+    /// [`backend::KernelBackend`] or [`backend::UserBackend`].
     pub fn new() -> Self {
+        Self::new_with(NullBackend)
+    }
+}
+
+impl<const TASKS: usize, const F: usize, B: Backend> Executor<TASKS, F, B> {
+    /// Create an empty executor with the given backend.
+    ///
+    /// Compile-time asserts `TASKS <= 64`.
+    pub fn new_with(backend: B) -> Self {
         const { assert!(TASKS <= 64, "hues-async: TASKS must be <= 64 (u64 ready mask)") };
         Self {
             ready: Cell::new(0),
@@ -149,7 +185,14 @@ impl<const TASKS: usize, const F: usize> Executor<TASKS, F> {
                     index: i as u32,
                 }),
             }),
+            backend,
+            _marker: PhantomData,
         }
+    }
+
+    /// Reference to the backend.
+    pub fn backend(&self) -> &B {
+        &self.backend
     }
 
     /// Number of currently live tasks.
@@ -280,10 +323,28 @@ impl<const TASKS: usize, const F: usize> Executor<TASKS, F> {
         polled
     }
 
-    /// Run until there are no live tasks, calling `park` whenever the ready set
-    /// is empty (the driver uses `park` to poll its device completion queue
-    /// and/or wait for an interrupt). Returns the total number of polls.
-    pub fn run(&self, mut park: impl FnMut()) -> usize {
+    /// Run until there are no live tasks. When the ready set is empty and
+    /// tasks remain, calls the backend's [`Backend::park`] to sleep until
+    /// an external event (IRQ, completion, timer) wakes a slot.
+    ///
+    /// Returns the total number of polls performed.
+    pub fn run(&self) -> usize {
+        let mut total = 0usize;
+        loop {
+            total += self.poll();
+            if self.is_empty() {
+                break;
+            }
+            self.backend.park();
+        }
+        total
+    }
+
+    /// Run until there are no live tasks, calling a custom `park` closure
+    /// instead of the backend. This preserves backward compatibility with
+    /// code that passes a driver-specific park function (e.g. one that
+    /// also polls a device completion queue).
+    pub fn run_with(&self, mut park: impl FnMut()) -> usize {
         let mut total = 0usize;
         loop {
             total += self.poll();
@@ -294,21 +355,29 @@ impl<const TASKS: usize, const F: usize> Executor<TASKS, F> {
         }
         total
     }
-}
 
-impl<const TASKS: usize, const F: usize> Default for Executor<TASKS, F> {
-    fn default() -> Self {
-        Self::new()
+    /// Current monotonic tick from the backend.
+    pub fn now_ticks(&self) -> u64 {
+        self.backend.now_ticks()
     }
 }
 
-impl<const TASKS: usize, const F: usize> Drop for Executor<TASKS, F> {
+impl<const TASKS: usize, const F: usize, B: Backend> Default for Executor<TASKS, F, B>
+where
+    B: Default,
+{
+    fn default() -> Self {
+        Self::new_with(B::default())
+    }
+}
+
+impl<const TASKS: usize, const F: usize, B: Backend> Drop for Executor<TASKS, F, B> {
     fn drop(&mut self) {
         // Drop any still-live futures so they are not leaked.
         for slot in self.slots.iter_mut() {
             if let Some(drop) = slot.drop_fn.get() {
                 let ptr = slot.storage.get() as *mut ();
-                // SAFETY: the slot holds a live future; drop it in place during
+                // SAFETY: `ptr` points at a live future; drop it in place during
                 // teardown. `&mut self` guarantees exclusive access.
                 unsafe { drop(ptr) };
                 slot.poll_fn.set(None);
@@ -401,14 +470,10 @@ unsafe fn flag_wake_by_ref(data: *const ()) {
 }
 unsafe fn flag_drop(_data: *const ()) {}
 
-/// Drive a single future to completion.
-///
-/// Polls `fut` until it is ready. When the future is pending and has not woken
-/// itself, `park` is called (the driver uses this to process device completions
-/// or wait for an interrupt) before re-polling. The future may borrow its
-/// environment (it need not be `'static`), since it is polled in place and never
-/// moved.
-pub fn block_on<O>(fut: impl Future<Output = O>, mut park: impl FnMut()) -> O {
+/// Internal: drive a future to completion with a generic park function.
+/// Both [`block_on`] and [`scope_on`] delegate here to avoid duplicating
+/// the unsafe waker/pin setup.
+fn drive<O>(fut: impl Future<Output = O>, mut park: impl FnMut()) -> O {
     use core::cell::Cell;
     let woken = Cell::new(true);
     // SAFETY: the waker only touches `woken`, which outlives every poll below.
@@ -434,6 +499,29 @@ pub fn block_on<O>(fut: impl Future<Output = O>, mut park: impl FnMut()) -> O {
     }
 }
 
+/// Drive a single future to completion.
+///
+/// Polls `fut` until it is ready. When the future is pending and has not woken
+/// itself, `park` is called before re-polling. The future may borrow its
+/// environment (it need not be `'static`), since it is polled in place and never
+/// moved.
+pub fn block_on<O>(fut: impl Future<Output = O>, park: impl FnMut()) -> O {
+    drive(fut, park)
+}
+
+/// Drive a single future to completion using a [`Backend`] for parking.
+///
+/// This is the backend-aware counterpart to [`block_on`]. The future may
+/// borrow its environment (it need not be `'static`). When the future is
+/// pending and has not woken itself, `backend.park()` is called.
+///
+/// This function is the foundation for async code in both ring 0 and ring 3:
+/// the same `scope_on(&backend, async { ... })` works identically in
+/// a kernel IRQ handler and a userspace driver process.
+pub fn scope_on<O, B: Backend>(fut: impl Future<Output = O>, backend: &B) -> O {
+    drive(fut, || backend.park())
+}
+
 #[cfg(test)]
 mod tests {
     //! Host tests for the executor. No `unwrap`/`expect`/`panic!` (results are
@@ -443,8 +531,8 @@ mod tests {
     use super::*;
     use core::sync::atomic::{AtomicU32, Ordering};
 
-    fn spawn_ok<const T: usize, const F: usize, Fut: Future<Output = ()> + 'static>(
-        ex: &Executor<T, F>,
+    fn spawn_ok<const T: usize, const F: usize, B: Backend, Fut: Future<Output = ()> + 'static>(
+        ex: &Executor<T, F, B>,
         fut: Fut,
     ) -> TaskId {
         let r = ex.spawn(fut);
@@ -482,8 +570,6 @@ mod tests {
             yield_now().await;
             YIELD_POLLS.store(1, Ordering::SeqCst);
         });
-        // The outer async block polls yield_now (Pending + self-wake) and is
-        // re-polled within the same run-to-completion pass.
         ex.poll();
         assert_eq!(YIELD_POLLS.load(Ordering::SeqCst), 1);
         assert!(ex.is_empty());
@@ -532,12 +618,10 @@ mod tests {
         EXT_POLLS.store(0, Ordering::SeqCst);
         let ex: Executor<4, 64> = Executor::new();
         let id = spawn_ok(&ex, ParkOnce(false));
-        // First poll: runs once, parks (Pending) without self-waking.
         ex.poll();
         assert_eq!(EXT_POLLS.load(Ordering::SeqCst), 1);
         assert_eq!(ex.count(), 1);
         assert!(!ex.has_ready());
-        // External completion (e.g. an NVMe CQ entry observed by the driver).
         ex.wake(id);
         assert!(ex.has_ready());
         ex.poll();
@@ -560,14 +644,11 @@ mod tests {
 
     #[test]
     fn spawn_too_large_returns_error() {
-        // Capacity F = 8 bytes. The array is used after the await, so it is
-        // live across the suspension point and stored in the future's state,
-        // making the future larger than 8 bytes.
         let ex: Executor<2, 8> = Executor::new();
         let big = async {
             let blob = [0u8; 64];
             core::future::pending::<()>().await;
-            let _ = blob[0]; // keep `blob` live across the await
+            let _ = blob[0];
         };
         let r = ex.spawn(big);
         assert_eq!(r.err(), Some(SpawnError::TooLarge));
@@ -581,24 +662,20 @@ mod tests {
     fn stale_task_id_wake_is_ignored() {
         GEN.store(0, Ordering::SeqCst);
         let ex: Executor<1, 64> = Executor::new();
-        // Task 1 completes immediately, freeing the only slot.
         let id1 = spawn_ok(&ex, async {
             GEN.fetch_add(1, Ordering::SeqCst);
         });
         ex.poll();
         assert!(ex.is_empty());
-        // Task 2 reuses the slot and parks (Pending, no self-wake).
         let _id2 = spawn_ok(&ex, ParkOnce2(false));
-        ex.poll(); // run task 2 to its parked state
+        ex.poll();
         assert_eq!(ex.count(), 1);
         assert!(!ex.has_ready());
-        // Waking with the stale id1 must NOT ready the reused slot.
         ex.wake(id1);
         assert!(!ex.has_ready());
         assert_eq!(ex.count(), 1);
     }
 
-    /// Parks once without self-waking (for the stale-id test).
     struct ParkOnce2(bool);
     impl Future for ParkOnce2 {
         type Output = ();
@@ -612,12 +689,12 @@ mod tests {
         }
     }
 
-    // --- run() with a park hook ---
+    // --- run_with() with a custom park hook ---
 
     static RUN_COUNTER: AtomicU32 = AtomicU32::new(0);
 
     #[test]
-    fn run_drives_to_completion_with_park() {
+    fn run_with_drives_to_completion_with_park() {
         RUN_COUNTER.store(0, Ordering::SeqCst);
         let ex: Executor<4, 64> = Executor::new();
         let _ = spawn_ok(&ex, async {
@@ -628,12 +705,11 @@ mod tests {
             RUN_COUNTER.fetch_add(1, Ordering::SeqCst);
         });
         let parks = AtomicU32::new(0);
-        ex.run(|| {
+        ex.run_with(|| {
             parks.fetch_add(1, Ordering::SeqCst);
         });
         assert_eq!(RUN_COUNTER.load(Ordering::SeqCst), 2);
         assert!(ex.is_empty());
-        // Both tasks completed without ever needing to park.
         assert_eq!(parks.load(Ordering::SeqCst), 0);
     }
 
@@ -656,14 +732,11 @@ mod tests {
             let _ = spawn_ok(&ex, async {
                 let guard = DropGuard;
                 core::future::pending::<()>().await;
-                drop(guard); // keep `guard` live across the await
+                drop(guard);
             });
             assert_eq!(DROPPED.load(Ordering::SeqCst), 0);
-            // Poll once: the future runs to the suspension point with `guard`
-            // alive in its state, then parks.
             ex.poll();
             assert_eq!(DROPPED.load(Ordering::SeqCst), 0);
-            // ex drops here with one live (parked) future holding `guard`.
         }
         assert_eq!(DROPPED.load(Ordering::SeqCst), 1);
     }
@@ -675,8 +748,6 @@ mod tests {
         static POLLS: AtomicU32 = AtomicU32::new(0);
         POLLS.store(0, Ordering::SeqCst);
         let parks = AtomicU32::new(0);
-        // A future that yields once (wakes itself) then completes; block_on
-        // re-polls it via the waker without ever needing to park.
         let out = block_on(
             async {
                 POLLS.fetch_add(1, Ordering::SeqCst);
@@ -691,5 +762,92 @@ mod tests {
         assert_eq!(out, 42);
         assert_eq!(POLLS.load(Ordering::SeqCst), 2);
         assert_eq!(parks.load(Ordering::SeqCst), 0);
+    }
+
+    // --- scope_on with a backend ---
+
+    #[test]
+    fn scope_on_drives_a_future_with_backend() {
+        use backend::{Backend, KernelBackend, UserBackend};
+
+        static SCOPE_POLLS: AtomicU32 = AtomicU32::new(0);
+        SCOPE_POLLS.store(0, Ordering::SeqCst);
+
+        fn noop_park() {}
+        fn noop_wake(_slot: u32) {}
+        fn noop_ticks() -> u64 { 0 }
+
+        // Works with both KernelBackend and UserBackend.
+        let kb = KernelBackend::new(noop_park, noop_wake, noop_ticks);
+        let out_k = scope_on(
+            async {
+                SCOPE_POLLS.fetch_add(1, Ordering::SeqCst);
+                yield_now().await;
+                SCOPE_POLLS.fetch_add(1, Ordering::SeqCst);
+                99
+            },
+            &kb,
+        );
+        assert_eq!(out_k, 99);
+        assert_eq!(SCOPE_POLLS.load(Ordering::SeqCst), 2);
+
+        SCOPE_POLLS.store(0, Ordering::SeqCst);
+        let ub = UserBackend::new(noop_park, noop_wake, noop_ticks);
+        let out_u = scope_on(
+            async {
+                SCOPE_POLLS.fetch_add(1, Ordering::SeqCst);
+                77
+            },
+            &ub,
+        );
+        assert_eq!(out_u, 77);
+        assert_eq!(SCOPE_POLLS.load(Ordering::SeqCst), 1);
+    }
+
+    // --- scope_on with borrowing future (non-'static) ---
+
+    #[test]
+    fn scope_on_allows_borrowing_futures() {
+        use backend::KernelBackend;
+
+        fn noop_park() {}
+        fn noop_wake(_slot: u32) {}
+        fn noop_ticks() -> u64 { 0 }
+
+        let backend = KernelBackend::new(noop_park, noop_wake, noop_ticks);
+        let local_data = 42u32;
+        // This future borrows `local_data` — it is NOT 'static.
+        // block_on would reject this; scope_on accepts it.
+        let result = scope_on(
+            async {
+                let reference = &local_data;
+                *reference + 1
+            },
+            &backend,
+        );
+        assert_eq!(result, 43);
+    }
+
+    // --- executor with a real backend ---
+
+    #[test]
+    fn executor_with_backend_polls_tasks() {
+        use backend::KernelBackend;
+
+        static BE_POLLS: AtomicU32 = AtomicU32::new(0);
+        BE_POLLS.store(0, Ordering::SeqCst);
+
+        fn noop_park() {}
+        fn noop_wake(_slot: u32) {}
+        fn noop_ticks() -> u64 { 0 }
+
+        let backend = KernelBackend::new(noop_park, noop_wake, noop_ticks);
+        let ex = Executor::<4, 64, _>::new_with(backend);
+        let _ = spawn_ok(&ex, async {
+            BE_POLLS.fetch_add(1, Ordering::SeqCst);
+        });
+        ex.poll();
+        assert_eq!(BE_POLLS.load(Ordering::SeqCst), 1);
+        assert!(ex.is_empty());
     }
 }
