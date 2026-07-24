@@ -1,6 +1,6 @@
 //! Channels: connected pairs of IPC endpoints for message passing.
 
-use crate::handle::Handle;
+use crate::handle::{close_raw, Handle};
 use crate::raw;
 use huesos_abi::{ChannelReadEtcArgs, HandleValue, Syscall, INVALID_HANDLE};
 
@@ -84,8 +84,11 @@ impl Channel {
         Ok(())
     }
 
-    /// Send a message with one transferred handle. On success, `handle` is
-    /// consumed and removed from this process by the kernel.
+    /// Send a message with one transferred handle.
+    ///
+    /// On success, `handle` is consumed and removed from this process by the
+    /// kernel. On failure, this wrapper closes the consumed handle so callers
+    /// that use `?` do not leak the still-open handle-table entry.
     pub fn write_handle(&self, data: &[u8], handle: Handle) -> crate::Result<()> {
         let raw_handle = handle.into_raw();
         let handles = [raw_handle];
@@ -97,8 +100,13 @@ impl Channel {
             handles.as_ptr() as u64,
             handles.len() as u64,
         );
-        raw::decode(ret)?;
-        Ok(())
+        match raw::decode(ret) {
+            Ok(_) => Ok(()),
+            Err(error) => {
+                close_raw(raw_handle);
+                Err(error)
+            }
+        }
     }
 
     /// Read a message into a caller-provided buffer. Returns the number of
