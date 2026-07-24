@@ -119,8 +119,12 @@ priority order.
   observable as a normal error/drop counter rather than an unbounded allocation
 - Timed waits: `ChannelRead`/`PortRead` mode `>=2` = timeout in ticks + `TimedOut`
 - The scheduler uses a pending-wake handshake to close the enqueue-to-park SMP
-  lost-wakeup window; QEMU init now also exercises a blocking `ProcessWait`
-  wake after a yielding child exit in the debug/release, SMP 1/2 smoke matrix
+  lost-wakeup window; `WaitQueue::prepare` / `PreparedWait::park` / `cancel`
+  closes the remaining check-to-enqueue gap in every blocking path (Channel
+  recv, Port read, ProcessWait). `hues-async` is integrated as a ring-0
+  allocation-free primitive for the early-boot ProcessWait path; QEMU init now
+  also exercises a blocking `ProcessWait` wake after a yielding child exit in
+  the debug/release, SMP 1/2 smoke matrix
 
 ## Immediate
 

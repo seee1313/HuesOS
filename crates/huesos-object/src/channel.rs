@@ -255,9 +255,19 @@ impl Channel {
     /// Blocking receive with peer-close reporting.
     pub fn recv_blocking_status(&self) -> Result<ChannelMessage, ChannelRecvError> {
         loop {
+            // Enqueue BEFORE checking the condition so we are visible to
+            // wakers; re-check while in the queue to close the lost-wakeup
+            // race between check and park.
+            let prepared = self
+                .readers
+                .prepare()
+                .ok_or(ChannelRecvError::PeerClosed)?;
             match self.recv_status()? {
-                Some(msg) => return Ok(msg),
-                None => wait::park_on(self.readers.as_ref()),
+                Some(msg) => {
+                    prepared.cancel();
+                    return Ok(msg);
+                }
+                None => prepared.park(),
             }
         }
     }
@@ -277,10 +287,16 @@ impl Channel {
             return self.recv_blocking_status().map(Some);
         }
         loop {
+            // Prepare first so we are visible to wakers before re-checking.
+            let prepared = self
+                .readers
+                .prepare()
+                .ok_or(ChannelRecvError::PeerClosed)?;
             if let Some(msg) = self.recv_status()? {
+                prepared.cancel();
                 return Ok(Some(msg));
             }
-            match wait::park_on_timeout(self.readers.as_ref(), timeout_ticks) {
+            match prepared.park_timeout(timeout_ticks) {
                 ParkResult::Woken => continue,
                 ParkResult::TimedOut => return self.recv_status(),
             }
@@ -327,10 +343,21 @@ impl Channel {
         handle_capacity: usize,
     ) -> Result<ChannelMessage, ChannelRecvError> {
         loop {
+            // Enqueue BEFORE checking so we are visible to wakers.
+            let prepared = self
+                .readers
+                .prepare()
+                .ok_or(ChannelRecvError::PeerClosed)?;
             match self.recv_if_fits(byte_capacity, handle_capacity) {
-                Ok(Some(msg)) => return Ok(msg),
-                Ok(None) => wait::park_on(self.readers.as_ref()),
-                Err(e) => return Err(e),
+                Ok(Some(msg)) => {
+                    prepared.cancel();
+                    return Ok(msg);
+                }
+                Ok(None) => prepared.park(),
+                Err(e) => {
+                    prepared.cancel();
+                    return Err(e);
+                }
             }
         }
     }

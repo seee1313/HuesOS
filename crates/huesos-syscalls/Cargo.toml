@@ -10,6 +10,7 @@ huesos-object = { path = "../huesos-object" }
 huesos-arch = { path = "../huesos-arch" }
 huesos-abi = { path = "../huesos-abi" }
 huesos-fb = { path = "../huesos-fb" }
+hues-async = { path = "../hues-async" }
 bitflags = { workspace = true }
 spin = { workspace = true }
 log = { workspace = true }

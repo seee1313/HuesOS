@@ -123,17 +123,29 @@ impl Port {
         use wait::ParkResult;
         if timeout_ticks == 0 {
             loop {
+                // Enqueue BEFORE checking so we are visible to wakers.
+                let Some(prepared) = self.waiters.prepare() else {
+                    // Early boot (scheduler not ready): spin-yield.
+                    crate::wait::yield_to_scheduler();
+                    continue;
+                };
                 if let Some(p) = self.read() {
+                    prepared.cancel();
                     return Some(p);
                 }
-                wait::park_on(&self.waiters);
+                prepared.park();
             }
         }
         loop {
+            let Some(prepared) = self.waiters.prepare() else {
+                crate::wait::yield_to_scheduler();
+                continue;
+            };
             if let Some(p) = self.read() {
+                prepared.cancel();
                 return Some(p);
             }
-            match wait::park_on_timeout(&self.waiters, timeout_ticks) {
+            match prepared.park_timeout(timeout_ticks) {
                 ParkResult::Woken => continue,
                 ParkResult::TimedOut => return self.read(),
             }

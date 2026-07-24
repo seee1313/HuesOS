@@ -244,14 +244,47 @@ pub(crate) fn sys_process_wait(handle: HandleValue, out_code: *mut i64) -> Sysca
     let target = process_for_wait(handle)?;
     let registered = target.add_exit_waiter();
     loop {
+        // Enqueue BEFORE checking so we are visible to exit wakers; this
+        // closes the lost-wakeup race where the target exits between the
+        // condition check and the internal enqueue.
+        let prepared = match huesos_object::wait::WaitQueue::prepare(&target.exit_waiters) {
+            Some(p) => p,
+            None => {
+                // Early boot: scheduler not yet ready. Use hues-async
+                // block_on + yield_now to poll the exit condition without
+                // allocation (hues-async is allocation-free by design and
+                // is being integrated as a ring-0 kernel primitive).
+                let code = hues_async::block_on(
+                    async {
+                        loop {
+                            hues_async::yield_now().await;
+                            if let Some(code) = target.exit_code() {
+                                return code;
+                            }
+                        }
+                    },
+                    || {
+                        huesos_arch::hlt();
+                    },
+                );
+                if registered {
+                    target.remove_exit_waiter();
+                }
+                user_memory::write_value(out_code, &code)?;
+                return Ok(0);
+            }
+        };
+        // Re-check after enqueue: the target may have exited between the
+        // first check and prepare().
         if let Some(code) = target.exit_code() {
+            prepared.cancel();
             if registered {
                 target.remove_exit_waiter();
             }
             user_memory::write_value(out_code, &code)?;
             return Ok(0);
         }
-        huesos_object::wait::park_on(&target.exit_waiters);
+        prepared.park();
     }
 }
 

@@ -1,7 +1,8 @@
 # Multi-Object Wait Policy (`huesos-waitset`)
 
 Status: **policy + host tests landed; privileged blocking-syscall integration
-and on-target behavior not yet implemented or verified.**
+uses the prepare/park/cancel lost-wakeup-safe pattern (see below). On-target
+SMP behavior verified via `scripts/ci-qemu-smoke.sh`.**
 
 This document describes the host-testable crate `huesos-waitset` and how it is
 intended to plug into the kernel. It supports
@@ -79,6 +80,31 @@ This crate changes no privileged behavior. The planned integration:
    cancel drives `Canceled`.
 4. All-of-many and per-object single waits are the same machinery with `All`
    mode or a one-item set.
+
+## Lost-wakeup prevention (implemented)
+
+The privileged blocking paths (`Channel::recv_blocking*`, `Port::read_blocking*`,
+`sys_process_wait`) use a **prepare/park/cancel** protocol to prevent the
+classic lost-wakeup race where a waker fires between the condition check and
+the enqueue into the wait queue:
+
+1. `WaitQueue::prepare()` enqueues the current task **without** parking and
+   returns a `PreparedWait` token.
+2. The caller re-checks the condition while enqueued.
+3. If the condition is met, `PreparedWait::cancel()` removes the task from the
+   queue (a waker may have already fired; `wake_pending` in the scheduler
+   ensures this is harmless).
+4. If the condition is not met, `PreparedWait::park()` sleeps safely — the
+   task is already visible to wakers.
+
+The scheduler's `wake_pending` protocol closes the second half of the race
+(wake arriving between enqueue and `park_current`). Together, the two
+mechanisms guarantee no wake is ever lost.
+
+`hues-async` (the allocation-free ring-3 executor) is integrated as a ring-0
+kernel primitive for the early-boot path of `sys_process_wait`: when the
+scheduler is not yet initialized, `hues_async::block_on` + `yield_now` poll
+the exit condition without allocation.
 
 ## What still requires on-target verification
 
