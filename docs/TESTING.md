@@ -150,8 +150,11 @@ cmdline or a new syscall ABI.
   ```
 
 The latter emits progress every 32 exits and exercises a full
-`TaskGraveyard<256>`-sized sequence of lifecycle records. It remains a bounded regression/soak test rather than a proof of an
-unbounded-duration SMP run.
+`TaskGraveyard<256>`-sized sequence of lifecycle records. The normal matrix
+uses a 360-second QEMU budget because repeated process launch/exit is slow
+under TCG; the 256-exit soak has a separate 1500-second budget. This remains a
+bounded regression/soak test rather than a proof of an unbounded-duration SMP
+run.
 
 ## Monotonic Clock, Snake, and Shutdown Tests
 

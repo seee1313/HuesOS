@@ -4,7 +4,7 @@ set -euo pipefail
 
 profile="${1:-release}"
 cpus="${2:-2}"
-timeout_seconds="${3:-180}"
+timeout_seconds="${3:-360}"
 stress="${4:-32}"
 case "$stress" in 32|256) ;; *) echo "unsupported lifecycle stress: $stress" >&2; exit 2 ;; esac
 artifact_dir="${ARTIFACT_DIR:-ci-artifacts}"
