@@ -301,6 +301,24 @@ impl<const N: usize> TaskGraveyard<N> {
         exit_tick: u64,
     ) -> (FinishedTask, InsertOutcome<FinishedTask>) {
         let generation = self.store.alloc_generation();
+        self.record_exit_with_generation(koid, generation, exit_code, exit_tick)
+    }
+
+    /// Record an exit using the generation allocated by the owning lifecycle.
+    ///
+    /// A process lifecycle is the authority for the generation in its exit
+    /// payload. Kernel integration must use this method so a graveyard record
+    /// and a waiter observing that payload identify the same exit, even when a
+    /// `Koid` is reused. This method deliberately does not advance the store's
+    /// standalone generation allocator; [`Self::record_exit`] remains for
+    /// callers that do not already own a lifecycle generation.
+    pub fn record_exit_with_generation(
+        &mut self,
+        koid: u64,
+        generation: u64,
+        exit_code: i64,
+        exit_tick: u64,
+    ) -> (FinishedTask, InsertOutcome<FinishedTask>) {
         let record = FinishedTask {
             koid,
             generation,
@@ -663,6 +681,18 @@ mod tests {
         assert_eq!(ob, InsertOutcome::Retained);
         assert!(b.generation > a.generation);
         assert_eq!(yard.len(), 2);
+    }
+
+    #[test]
+    fn externally_owned_generation_is_retained_verbatim() {
+        let mut yard: TaskGraveyard<8> = TaskGraveyard::new();
+        let (record, outcome) = yard.record_exit_with_generation(7, 99, 3, 500);
+        assert_eq!(outcome, InsertOutcome::Retained);
+        assert_eq!(record.generation, 99);
+        assert_eq!(yard.find(7, 99), Some(record));
+        // A lifecycle-provided generation does not consume the standalone
+        // allocator used by policy-only callers.
+        assert_eq!(yard.store().next_generation(), 1);
     }
 
     #[test]

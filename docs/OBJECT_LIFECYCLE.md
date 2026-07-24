@@ -59,6 +59,15 @@ before the removed Arc is dropped. This is mandatory for Channels: dropping a
 Channel may drop queued messages, which release transferred handle counts and
 re-enter registry collection. Dropping while holding the mutex would deadlock.
 
+## Exit identity and bounded graveyard
+
+`ProcessLifecycle` owns the generation in its `ExitInfo`; that lifecycle
+payload is the authority for identifying an exit. When the scheduler records a
+finished process in `TaskGraveyard`, it stores this exact `(koid, generation)`
+pair rather than allocating a second graveyard-local generation. Deferred
+reaping therefore compares like identities and does not confuse a lifecycle
+exit with an unrelated graveyard sequence number.
+
 ## Processes and typed registries
 
 A running process can outlive all userspace process handles because scheduler
