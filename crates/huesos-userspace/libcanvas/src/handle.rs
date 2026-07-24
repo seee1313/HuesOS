@@ -66,10 +66,19 @@ impl Handle {
     }
 }
 
+/// Close a raw handle value without first wrapping it in an owning [`Handle`].
+///
+/// This is used by transfer helpers after they intentionally call
+/// [`Handle::into_raw`]: if the kernel rejects the transfer, the consumed Rust
+/// wrapper must not leak the still-open handle-table entry.
+pub(crate) fn close_raw(raw_handle: HandleValue) {
+    if raw_handle != INVALID_HANDLE {
+        let _ = raw::syscall1(Syscall::HandleClose, raw_handle as u64);
+    }
+}
+
 impl Drop for Handle {
     fn drop(&mut self) {
-        if self.0 != INVALID_HANDLE {
-            let _ = raw::syscall1(Syscall::HandleClose, self.0 as u64);
-        }
+        close_raw(self.0);
     }
 }

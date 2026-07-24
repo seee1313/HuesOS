@@ -80,6 +80,13 @@ bounded queue admission fails. In-flight messages still hold the global handle
 count until receipt or drop. Queue admission is quota-bound and therefore
 returns a normal resource error instead of growing without limit.
 
+The userspace `libcanvas::Channel::write_handle` wrapper consumes an owned
+`Handle` before issuing `ChannelWrite`. If the syscall fails, the kernel's
+all-or-nothing contract leaves the raw handle value in the sender's table (or a
+close on that value is harmless if a future kernel path consumed it despite
+returning an error). The wrapper therefore closes the raw value on failure so
+ordinary `?` error paths do not leak a capability.
+
 The pure `transfer` function remains the normative policy model, but the kernel
 has not yet replaced its object-specific handle representation with the policy
 crate's `Disposition` table. That is an intentional next step so the model can
