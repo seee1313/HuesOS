@@ -126,13 +126,23 @@ pub enum Syscall {
     /// Change permissions on one exact VMAR mapping. `a1` points to
     /// [`VmarOpArgs`].
     VmarProtect = 30,
+    /// Peek at the next channel message without dequeueing it. `a1` points
+    /// to [`ChannelPeekArgs`]. Returns the message's byte size, handle
+    /// count, and an opaque cookie that [`Syscall::ChannelConsume`] uses to
+    /// dequeue the exact same message.
+    ChannelPeek = 31,
+    /// Dequeue and copy out the message identified by a cookie from
+    /// [`Syscall::ChannelPeek`]. `a1` points to [`ChannelConsumeArgs`].
+    /// This is the second half of the peek/consume split that replaces the
+    /// legacy truncating [`Syscall::ChannelRead`].
+    ChannelConsume = 32,
 }
 
 impl Syscall {
     /// Total number of defined syscalls (i.e. one past the highest
     /// currently-assigned number). The dispatcher uses this to reject
     /// obviously-out-of-range numbers before a `match`.
-    pub const COUNT: u64 = 31;
+    pub const COUNT: u64 = 33;
 
     /// Convert a raw syscall number back into a [`Syscall`], if valid.
     pub const fn from_raw(n: u64) -> Option<Self> {
@@ -168,6 +178,8 @@ impl Syscall {
             28 => Self::VmoCreateEx,
             29 => Self::VmarUnmap,
             30 => Self::VmarProtect,
+            31 => Self::ChannelPeek,
+            32 => Self::ChannelConsume,
             _ => return None,
         })
     }
@@ -441,6 +453,47 @@ pub struct ChannelReadEtcArgs {
     pub out_handles: *mut u32,
 }
 
+/// Arguments for [`Syscall::ChannelPeek`]: inspect the next queued message
+/// without dequeueing it. The returned cookie identifies the message for a
+/// subsequent [`Syscall::ChannelConsume`] call.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct ChannelPeekArgs {
+    /// Channel handle to peek into.
+    pub channel: HandleValue,
+    /// Output: byte size of the next message.
+    pub out_byte_size: *mut u32,
+    /// Output: number of transferred handles in the next message.
+    pub out_handle_count: *mut u32,
+    /// Output: opaque cookie for [`Syscall::ChannelConsume`].
+    pub out_cookie: *mut u64,
+    /// Wait mode: 0 = non-blocking, 1 = blocking, >= 2 = timeout in ticks.
+    pub wait_mode: u64,
+}
+
+/// Arguments for [`Syscall::ChannelConsume`]: dequeue and copy out the
+/// message identified by a cookie from [`Syscall::ChannelPeek`].
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct ChannelConsumeArgs {
+    /// Channel handle to consume from.
+    pub channel: HandleValue,
+    /// Opaque cookie from [`Syscall::ChannelPeek`].
+    pub cookie: u64,
+    /// Destination byte buffer.
+    pub bytes: *mut u8,
+    /// Capacity of `bytes`.
+    pub bytes_capacity: u32,
+    /// Destination handle buffer.
+    pub handles: *mut HandleValue,
+    /// Capacity of `handles`.
+    pub handles_capacity: u32,
+    /// Output: actual bytes copied.
+    pub out_bytes: *mut u32,
+    /// Output: actual handles transferred.
+    pub out_handles: *mut u32,
+}
+
 /// Port packet type for interrupt notifications.
 pub const PORT_PACKET_INTERRUPT: u32 = 1;
 
@@ -527,10 +580,14 @@ mod tests {
         assert_eq!(Syscall::VmoCreateEx as u64, 28);
         assert_eq!(Syscall::VmarUnmap as u64, 29);
         assert_eq!(Syscall::VmarProtect as u64, 30);
-        assert_eq!(Syscall::COUNT, 31);
+        assert_eq!(Syscall::ChannelPeek as u64, 31);
+        assert_eq!(Syscall::ChannelConsume as u64, 32);
+        assert_eq!(Syscall::COUNT, 33);
         assert_eq!(Syscall::from_raw(28), Some(Syscall::VmoCreateEx));
         assert_eq!(Syscall::from_raw(30), Some(Syscall::VmarProtect));
-        assert_eq!(Syscall::from_raw(31), None);
+        assert_eq!(Syscall::from_raw(31), Some(Syscall::ChannelPeek));
+        assert_eq!(Syscall::from_raw(32), Some(Syscall::ChannelConsume));
+        assert_eq!(Syscall::from_raw(33), None);
     }
 
     #[test]
