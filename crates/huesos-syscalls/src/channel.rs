@@ -1,7 +1,7 @@
 //! Channel IPC syscalls.
 
 use alloc::vec::Vec;
-use huesos_abi::{ChannelReadEtcArgs, ErrorCode, HandleValue};
+use huesos_abi::{ChannelConsumeArgs, ChannelPeekArgs, ChannelReadEtcArgs, ErrorCode, HandleValue};
 use huesos_object::{ChannelRecvError, Handle, KernelObject, KernelObjectExt, Rights};
 
 use crate::{user_memory, util::{current_proc, DeferGuard}, SyscallResult};
@@ -93,7 +93,7 @@ pub(crate) fn sys_channel_write(
             huesos_object::HandleTableError::Duplicate => ErrorCode::InvalidArgs,
             huesos_object::HandleTableError::OutOfMemory => ErrorCode::NoMemory,
         })?;
-    let message = huesos_object::ChannelMessage {
+    let message = huesos_object::ChannelMessage { seq: 0,
         data,
         handles: transferred,
     };
@@ -234,5 +234,137 @@ pub(crate) fn sys_channel_read_etc(
     user_memory::write_array(args.handles, &received_values)?;
     user_memory::write_value(args.out_handles, &(received_values.len() as u32))?;
     rollback.commit();
+    Ok(0)
+}
+
+/// Peek at the next channel message without dequeueing it. Returns the
+/// message's byte size, handle count, and an opaque cookie for a
+/// subsequent [`sys_channel_consume`] call. Supports blocking and timeout
+/// wait modes via the existing channel wait-queue infrastructure.
+pub(crate) fn sys_channel_peek(args_ptr: *const ChannelPeekArgs) -> SyscallResult {
+    let args = user_memory::read_value(args_ptr)?;
+    user_memory::validate_write(args.out_byte_size)?;
+    user_memory::validate_write(args.out_handle_count)?;
+    user_memory::validate_write(args.out_cookie)?;
+
+    let proc = current_proc()?;
+    let h = proc.handles.get(args.channel).ok_or(ErrorCode::BadHandle)?;
+    if !h.has_rights(Rights::READ) {
+        return Err(ErrorCode::AccessDenied);
+    }
+    let obj = huesos_object::lookup_object(h.koid).ok_or(ErrorCode::BadHandle)?;
+    let ch = obj
+        .downcast_ref::<huesos_object::Channel>()
+        .ok_or(ErrorCode::WrongType)?;
+
+    // Blocking/timeout: use the same prepare/park pattern as recv_blocking.
+    if args.wait_mode != 0 {
+        loop {
+            match ch.peek().map_err(map_recv_error)? {
+                Some(_) => break,
+                None => {
+                    if args.wait_mode == 1 {
+                        let prepared = ch
+                            .reader_queue()
+                            .prepare()
+                            .ok_or(ErrorCode::PeerClosed)?;
+                        if ch.peek().map_err(map_recv_error)?.is_some() {
+                            prepared.cancel();
+                            break;
+                        }
+                        prepared.park();
+                    } else {
+                        let prepared = ch
+                            .reader_queue()
+                            .prepare()
+                            .ok_or(ErrorCode::PeerClosed)?;
+                        if ch.peek().map_err(map_recv_error)?.is_some() {
+                            prepared.cancel();
+                            break;
+                        }
+                        match prepared.park_timeout(args.wait_mode) {
+                            huesos_object::wait::ParkResult::Woken => continue,
+                            huesos_object::wait::ParkResult::TimedOut => {
+                                return Err(ErrorCode::TimedOut);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let (byte_size, handle_count, cookie) = ch.peek().map_err(map_recv_error)?.ok_or(ErrorCode::ShouldWait)?;
+    user_memory::write_value(args.out_byte_size, &(byte_size as u32))?;
+    user_memory::write_value(args.out_handle_count, &(handle_count as u32))?;
+    user_memory::write_value(args.out_cookie, &cookie)?;
+    Ok(0)
+}
+
+/// Dequeue and copy out the message identified by a cookie from a prior
+/// [`sys_channel_peek`]. If the cookie is stale (the queue moved on),
+/// returns [`ErrorCode::InvalidArgs`].
+pub(crate) fn sys_channel_consume(args_ptr: *const ChannelConsumeArgs) -> SyscallResult {
+    let args = user_memory::read_value(args_ptr)?;
+    let byte_capacity = args.bytes_capacity as usize;
+    let handle_capacity = args.handles_capacity as usize;
+    if byte_capacity > user_memory::MAX_CHANNEL_BYTES
+        || handle_capacity > user_memory::MAX_CHANNEL_HANDLES
+    {
+        return Err(ErrorCode::InvalidArgs);
+    }
+    user_memory::validate_range(args.bytes as u64, byte_capacity, true)?;
+    user_memory::validate_write_array(args.handles, handle_capacity)?;
+    user_memory::validate_write(args.out_bytes)?;
+    user_memory::validate_write(args.out_handles)?;
+
+    let proc = current_proc()?;
+    let h = proc.handles.get(args.channel).ok_or(ErrorCode::BadHandle)?;
+    if !h.has_rights(Rights::READ) {
+        return Err(ErrorCode::AccessDenied);
+    }
+    let obj = huesos_object::lookup_object(h.koid).ok_or(ErrorCode::BadHandle)?;
+    let ch = obj
+        .downcast_ref::<huesos_object::Channel>()
+        .ok_or(ErrorCode::WrongType)?;
+
+    let mut msg = ch.consume(args.cookie).ok_or(ErrorCode::InvalidArgs)?;
+
+    // Message dequeued; copy out data + handles.
+    if msg.data.len() > byte_capacity {
+        // Caller peeked a larger message but provided a smaller buffer.
+        // Drop the message (handles released via ChannelMessage::Drop).
+        return Err(ErrorCode::InvalidArgs);
+    }
+    user_memory::copy_to_user(args.bytes, &msg.data)?;
+    user_memory::write_value(args.out_bytes, &(msg.data.len() as u32))?;
+
+    let transferred = core::mem::take(&mut msg.handles);
+    if transferred.len() > handle_capacity {
+        // Should not happen (peek reported handle_count), but guard anyway.
+        for handle in transferred {
+            huesos_object::note_handle_close(handle.koid);
+        }
+        return Err(ErrorCode::InvalidArgs);
+    }
+
+    let mut received_values = alloc::vec::Vec::new();
+    received_values
+        .try_reserve_exact(transferred.len())
+        .map_err(|_| ErrorCode::NoMemory)?;
+
+    for handle in transferred {
+        received_values.push(proc.handles.add_existing(handle));
+    }
+
+    // If write_array fails, roll back the handle-table insertions manually
+    // (no DeferGuard — avoids a borrow conflict with the Vec).
+    if let Err(e) = user_memory::write_array(args.handles, &received_values) {
+        for &hv in &received_values {
+            let _ = proc.handles.remove(hv);
+        }
+        return Err(e);
+    }
+    user_memory::write_value(args.out_handles, &(received_values.len() as u32))?;
     Ok(0)
 }

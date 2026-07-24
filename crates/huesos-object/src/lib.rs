@@ -320,7 +320,7 @@ mod tests {
             Ok(pair) => pair,
             Err(_) => return,
         };
-        let _ = a.send(ChannelMessage {
+        let _ = a.send(ChannelMessage { seq: 0,
             data: alloc::vec![1, 2, 3],
             handles: Vec::new(),
         });
@@ -338,13 +338,13 @@ mod tests {
             Err(_) => return,
         };
         for _ in 0..channel::MAX_CHANNEL_QUEUE_MESSAGES {
-            let result = a.send(ChannelMessage {
+            let result = a.send(ChannelMessage { seq: 0,
                 data: Vec::new(),
                 handles: Vec::new(),
             });
             assert!(result.is_ok());
         }
-        let failed = a.send(ChannelMessage {
+        let failed = a.send(ChannelMessage { seq: 0,
             data: Vec::new(),
             handles: Vec::new(),
         });
@@ -396,7 +396,7 @@ mod tests {
         };
         drop(a);
         assert!(b.peer_closed());
-        let send = b.send(ChannelMessage {
+        let send = b.send(ChannelMessage { seq: 0,
             data: Vec::new(),
             handles: Vec::new(),
         });

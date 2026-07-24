@@ -43,6 +43,10 @@ pub struct Channel {
 struct MessageQueue {
     messages: VecDeque<ChannelMessage>,
     quota: Quota,
+    /// Monotonic sequence counter; each enqueued message receives a unique
+    /// cookie (its sequence number) that [`Self::consume`] uses to dequeue
+    /// the exact message a prior peek identified.
+    next_seq: u64,
 }
 
 impl MessageQueue {
@@ -58,6 +62,7 @@ impl MessageQueue {
                 max_handles: MAX_CHANNEL_QUEUE_HANDLES,
                 max_cpu_ticks: UNLIMITED,
             }),
+            next_seq: 0,
         })
     }
 
@@ -79,6 +84,10 @@ impl MessageQueue {
         }
         let _ = self.quota.try_acquire(Resource::Memory, bytes);
         let _ = self.quota.try_acquire(Resource::Handles, handles);
+        let seq = self.next_seq;
+        self.next_seq = self.next_seq.wrapping_add(1);
+        let mut msg = msg;
+        msg.seq = seq;
         self.messages.push_back(msg);
         Ok(())
     }
@@ -90,6 +99,24 @@ impl MessageQueue {
         self.quota
             .release(Resource::Handles, msg.handles.len() as u64);
         Some(msg)
+    }
+
+    /// Inspect the front message without dequeueing. Returns
+    /// `(byte_size, handle_count, cookie)`.
+    fn peek_front(&self) -> Option<(usize, usize, u64)> {
+        let msg = self.messages.front()?;
+        Some((msg.data.len(), msg.handles.len(), msg.seq))
+    }
+
+    /// Dequeue the front message only if its cookie matches. Returns the
+    /// message on match; returns `None` if the queue is empty or the
+    /// cookie does not match the front (a stale cookie from a prior peek).
+    fn consume(&mut self, cookie: u64) -> Option<ChannelMessage> {
+        let front = self.messages.front()?;
+        if front.seq != cookie {
+            return None;
+        }
+        self.dequeue()
     }
 }
 
@@ -125,6 +152,9 @@ impl ChannelSendError {
 
 /// A message sent over a channel.
 pub struct ChannelMessage {
+    /// Opaque sequence cookie assigned at enqueue time. Used by the
+    /// peek/consume protocol to identify a specific queued message.
+    pub seq: u64,
     /// Raw bytes.
     pub data: Vec<u8>,
     /// Handles transferred with the message.
@@ -360,6 +390,31 @@ impl Channel {
                 }
             }
         }
+    }
+
+    /// Peek at the front message without dequeueing it.
+    /// Returns `(byte_size, handle_count, cookie)`.
+    pub fn peek(&self) -> Result<Option<(usize, usize, u64)>, ChannelRecvError> {
+        let q = self.inbox.lock();
+        if let Some(info) = q.peek_front() {
+            return Ok(Some(info));
+        }
+        if !self.peer_alive.load(Ordering::Acquire) {
+            return Err(ChannelRecvError::PeerClosed);
+        }
+        Ok(None)
+    }
+
+    /// Consume the message identified by `cookie` (from a prior [`peek`]).
+    /// Returns `None` if the cookie is stale (the front message has changed
+    /// since the peek) or the queue is empty.
+    pub fn consume(&self, cookie: u64) -> Option<ChannelMessage> {
+        self.inbox.lock().consume(cookie)
+    }
+
+    /// Reference to the reader wait queue, for syscall-level blocking peek.
+    pub fn reader_queue(&self) -> &WaitQueue {
+        self.readers.as_ref()
     }
 }
 
