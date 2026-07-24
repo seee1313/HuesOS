@@ -112,6 +112,9 @@ priority order.
 - Process teardown clears handle table; driver-host input uses blocking Port
 - Registry VMAR mapping acquires the VMO kernel lifetime reference atomically
   with object lookup
+- Process lifecycle owns exit generation; the scheduler records that exact
+  `(koid, generation)` identity in its bounded task graveyard, avoiding a
+  second, mismatched ABA identifier during deferred reaping
 - Channel and Port queues use bounded per-object quota admission; overflow is
   observable as a normal error/drop counter rather than an unbounded allocation
 - Timed waits: `ChannelRead`/`PortRead` mode `>=2` = timeout in ticks + `TimedOut`

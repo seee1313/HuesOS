@@ -1,7 +1,8 @@
 # Object / Task Lifecycle Policy (`huesos-lifecycle`)
 
-Status: **policy + host tests landed; kernel integration not yet landed and not
-yet verified on-target.**
+Status: **registry accounting and bounded task-graveyard integration landed; host
+policy tests cover the decision model. SMP on-target lifecycle stress remains
+required before this is considered fully verified.**
 
 This document describes the host-testable policy crate `huesos-lifecycle` and
 how it is intended to plug into the kernel. It supports the remaining work in
@@ -43,9 +44,12 @@ accounting. Backed by an inline `[Option<M>; N]` (no allocator, no `unsafe`).
 
 ### `TaskGraveyard<N>`
 
-Concrete wrapper for [`FinishedTask`] records: assigns a generation on
-`record_exit`, supports `find(koid, generation)`, `find_latest(koid)`, and
-waiter-driven `reap_waited(predicate)`.
+Concrete wrapper for [`FinishedTask`] records. `record_exit` assigns a local
+generation for standalone policy callers. Kernel process-exit integration uses
+`record_exit_with_generation`: the `ProcessLifecycle`-owned generation in
+`ExitInfo` is recorded verbatim, so a graveyard record and a waiter identify
+the same `(koid, generation)` exit. The store supports `find(koid,
+generation)`, `find_latest(koid)`, and waiter-driven `reap_waited(predicate)`.
 
 ### `RefAccount`
 
@@ -60,23 +64,22 @@ described in [OBJECT_LIFECYCLE.md](OBJECT_LIFECYCLE.md):
   capability is queued (`remove_keep_alive` semantics);
 - counters saturate and never underflow.
 
-## Intended kernel integration (NOT yet implemented here)
+## Current kernel integration
 
-This crate changes no privileged behavior yet. The planned integration:
+The kernel uses the policy in the following bounded, reviewable ways:
 
-1. In the scheduler/task layer, replace unbounded retention of finished-task
-   metadata with a `TaskGraveyard<N>` (capacity chosen to bound memory while
-   covering the realistic number of concurrently-waited exits; suggested start
-   `N = 64`).
-2. On task exit, `record_exit(koid, exit_code, exit_tick)` stores the record;
-   the returned generation is what `ProcessWait` reports so a waiter can pin a
-   specific exit.
-3. When a `ProcessWait` is satisfied (or a wait handle is closed), call
-   `reap_waited` so observed records are reclaimed promptly; the FIFO bound is
-   the safety net for unobserved ones.
-4. `RefAccount` is a reference model for the registry's existing collection
-   path; it is intended to be used in host tests that mirror the kernel's
-   open/close call sequence, not called from the hot path.
+1. The scheduler owns a `TaskGraveyard<256>` under its reaper-ranked lock.
+2. On process exit, it snapshots lifecycle-owned `ExitInfo` and records the
+   same `koid`, `generation`, exit code, and tick through
+   `record_exit_with_generation`. The graveyard never invents a second
+   identity for a lifecycle-managed exit.
+3. Deferred reaping compares the process lifecycle payload with the stored
+   `(koid, generation)` pair and reaps records that have been observed or whose
+   typed process record is gone. The FIFO bound remains the safety net for
+   unobserved exits.
+4. `RefAccount` remains a reference model for the registry's collection path;
+   it documents and host-tests the accounting invariants rather than running in
+   the hot path.
 
 ## What still requires on-target verification
 
@@ -89,6 +92,8 @@ is considered done:
   [OBJECT_LIFECYCLE.md](OBJECT_LIFECYCLE.md) integration matrix).
 - The graveyard bound holds under many rapid exits with no waiters, and evicted
   records do not strand kernel references.
+- A process exit observed through `ProcessWait` has the same generation as its
+  graveyard record under concurrent teardown.
 - No regression in `ProcessWait`/blocking behavior under SMP.
 
 These need the full toolchain (pinned nightly + `build-std`, QEMU/OVMF) and were
@@ -96,8 +101,9 @@ not runnable in the environment where this crate was authored.
 
 ## Tests (host)
 
-`make test` now includes `-p huesos-lifecycle`. The suite (23 tests) covers
+`make test` now includes `-p huesos-lifecycle`. The suite (25 tests) covers
 FIFO eviction and wraparound, `retain` compaction across a wrapped layout, the
 accounting invariant, the `N == 0` degenerate case, generation monotonicity and
-saturation, koid-reuse disambiguation, waiter-driven reaping, and every
-`RefAccount` collection invariant above.
+saturation, koid-reuse disambiguation, waiter-driven reaping, externally
+lifecycle-owned generation preservation, and every `RefAccount` collection
+invariant above.

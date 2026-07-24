@@ -70,6 +70,10 @@ and wakes the existing wait queue. `ProcessWait` calls `add_waiter()` before
 parking and releases the waiter when the exit status is observed, so waits
 arriving after exit do not park unnecessarily.
 
+The scheduler copies this lifecycle-owned generation unchanged into its bounded
+finished-task graveyard, so deferred reaping and any later supervisor packet
+refer to the same `(koid, generation)` exit identity.
+
 The remaining integration work is:
 
 1. emit a generation-bearing exit packet to subscribed Port supervisors;

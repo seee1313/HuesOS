@@ -775,7 +775,14 @@ fn record_process_exit(process: &Process, code: i64) {
     };
     let mut yard = TASK_GRAVEYARD.lock();
     let graveyard = yard.get_or_insert_with(TaskGraveyard::new);
-    let _ = graveyard.record_exit(info.koid, code, global_ticks());
+    // ProcessLifecycle owns the generation in ExitInfo. Reusing it here keeps
+    // the graveyard record and ProcessWait/reaper observations ABA-safe.
+    let _ = graveyard.record_exit_with_generation(
+        info.koid,
+        info.generation,
+        code,
+        global_ticks(),
+    );
 }
 
 fn reap_observed_process_exits() {
