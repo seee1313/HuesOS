@@ -20,10 +20,11 @@ const MEMMAP_ACPI_TABLES_OR_MAPPED_RESERVED: u64 = 8;
 /// # Safety
 /// `regions` must remain readable for the call and every usable physical range
 /// must be accessible through the supplied HHDM offset.
-pub unsafe fn pmm_init(regions: &[MemoryRegion], hhdm_offset: u64) {
-    unsafe {
-        huesos_pmm::init(regions, hhdm_offset);
-    }
+pub unsafe fn pmm_init(
+    regions: &[MemoryRegion],
+    hhdm_offset: u64,
+) -> Result<(), huesos_pmm::PmmInitError> {
+    unsafe { huesos_pmm::init(regions, hhdm_offset) }
 }
 
 /// Map firmware / ACPI physical ranges into the HHDM so early ACPI walks

@@ -39,16 +39,24 @@ pub fn enable_sse() {
 
 /// Enable architectural supervisor-memory protections supported by this CPU.
 ///
-/// CR0.WP is unconditional. SMEP and SMAP are enabled only when advertised by
-/// CPUID. Once SMAP is active, supervisor access to user pages is possible only
-/// while a [`UserAccessGuard`] exists.
+/// CR0.WP and EFER.NXE are unconditional. SMEP and SMAP are enabled only when
+/// advertised by CPUID. Enabling EFER.NXE here (rather than only once on the
+/// BSP) covers APs uniformly — they call this from `smp::ap_entry` — so every
+/// logical CPU treats the `NO_EXECUTE` page-table bit as valid before the
+/// kernel installs any W^X mapping. Once SMAP is active, supervisor access to
+/// user pages is possible only while a [`UserAccessGuard`] exists.
 pub fn enable_memory_protection() {
     let features = core::arch::x86_64::__cpuid_count(7, 0).ebx;
     let smep = features & (1 << 7) != 0;
     let smap = features & (1 << 20) != 0;
-    // SAFETY: this runs in ring0 once per CPU. Only CR0.WP and CPUID-supported
-    // CR4 features are added; existing control-register bits are preserved.
+    // SAFETY: this runs in ring0 once per CPU. EFER.NXE is OR-ed in via the
+    // typed x86_64 crate, which preserves SCE/LMA/LME. CR0.WP and CPUID-
+    // supported CR4 features are OR-ed via inline asm; existing control-
+    // register bits are preserved.
     unsafe {
+        use x86_64::registers::control::{Efer, EferFlags};
+        Efer::update(|flags| *flags |= EferFlags::NO_EXECUTE_ENABLE);
+
         core::arch::asm!(
             "mov rax, cr0",
             "or rax, 0x10000",

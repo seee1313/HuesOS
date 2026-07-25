@@ -2,7 +2,9 @@
 
 ## Enabled controls
 
-HuesOS enables the following independently on every logical CPU:
+HuesOS enables the following independently on every logical CPU inside a single
+`cpu::enable_memory_protection` call, which the BSP invokes from
+`arch::init_early` and every AP invokes from `smp::ap_entry`:
 
 - `EFER.NXE` for non-executable mappings;
 - `CR0.WP` so ring0 cannot write read-only pages;
@@ -10,6 +12,29 @@ HuesOS enables the following independently on every logical CPU:
 - `CR4.SMAP` when CPUID advertises it, preventing accidental ring0 data access to user pages.
 
 Unsupported SMEP/SMAP features remain disabled; boot does not assume a particular CPU generation.
+
+## W^X for kernel data mappings
+
+`huesos_arch::paging::flags::KERNEL_RW` includes `NO_EXECUTE`, so every kernel
+data mapping installed through this module — heap pages via
+`init::heap_init`, ACPI/RSDP windows via `map_hhdm_range`, and any future
+kernel-owned buffer that reuses these helpers — cannot be reached as a
+code-execution gadget.
+
+Two exceptions are deliberate and documented in the source:
+
+- `map_identity_range` (used only by the AP trampoline, physical page
+  `0x8000`) is *not* NX, because the trampoline itself executes from that
+  identity mapping before hopping into the higher-half kernel. Setting NX
+  there would #GP the AP on its first instruction.
+- The kernel `.text` and `.rodata` sections are mapped by Limine with its
+  own flags and are not routed through `KERNEL_RW`.
+
+EFER.NXE must be set on every CPU that will ever load a page table with the
+`NO_EXECUTE` bit; otherwise the bit is reserved and every access to such a
+page raises `#GP`. Enabling it in `enable_memory_protection` (rather than
+only once on the BSP, as an earlier revision did) is what makes this
+uniform.
 
 ## User-copy contract
 

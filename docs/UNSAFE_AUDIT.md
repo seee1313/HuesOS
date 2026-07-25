@@ -283,9 +283,12 @@ The Ring-0 invariants above are intentionally retained; reducing them further
 (e.g. typed errors in paging/PMM) is on-target-affecting work tracked under the
 remaining boundaries.
 
-The `unwrap_calls` counter has since moved to **30** as part of the NVMe
-`PciMmioTransport` introduction; see the "NVMe PciMmioTransport MMIO/DMA
-boundary" section for the dedicated-review record.
+The `unwrap_calls` counter moved to **30** with the NVMe `PciMmioTransport`
+introduction (see the "NVMe PciMmioTransport MMIO/DMA boundary" section for
+the retroactive dedicated-review record), and was **tightened back to 25**
+in a follow-up PR that rewrote the five NVMe `buffer_pool` host tests
+around a `match`-based `expect_some!` helper. CONTRIBUTING §1 is again
+satisfied 100%.
 
 ## VMAR mutation and TLB-shootdown boundary
 
@@ -395,11 +398,12 @@ buffers must be raw-pointer-addressable so the device sees the exact byte
 sequence the driver writes. Each site carries a `SAFETY:` comment describing
 the alignment, ordering, and lifetime invariant it relies on.
 
-The `unwrap_calls` increase in tests **does not** satisfy CONTRIBUTING §1
-("zero .unwrap()/.expect()/panic!(...) -- including in tests") and is
-recorded here explicitly as technical debt. Follow-up work: rewrite the five
-NVMe test unwraps using `assert!`/`match`/`Result` propagation and lower
-`unwrap_calls` back to 25.
+The `unwrap_calls` increase in tests did not satisfy CONTRIBUTING §1
+("zero unwrap / expect / panic macros — including in tests") and was
+recorded here as technical debt. That debt has since been paid off: the
+five NVMe `buffer_pool` host tests were rewritten around a `match`-based
+`expect_some!` helper and `safety-budget.json` was tightened back to
+`unwrap_calls: 25` in the same commit.
 
 This section is a **retroactive dedicated-review record**: CONTRIBUTING §1
 requires the review to ship in the same commit that raises the budget; the

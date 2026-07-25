@@ -1,6 +1,6 @@
 {
   "rust_files": 147,
-  "rust_lines": 34611,
+  "rust_lines": 34543,
   "totals": {
     "expect_calls": 22,
     "panic_macros": 5,
@@ -9,7 +9,7 @@
     "unsafe_blocks": 234,
     "unsafe_functions": 56,
     "unsafe_impls": 28,
-    "unwrap_calls": 30
+    "unwrap_calls": 25
   },
   "unsafe_by_file": {
     "crates/hues-async/src/lib.rs": 19,
