@@ -51,6 +51,8 @@ pub enum ObjectType {
     Vmar = 8,
     /// Restricted privileged-operation broker for Ring-3 ACPI.
     AcpiBroker = 9,
+    /// MMIO capability for ring-3 driver processes.
+    MmioCapability = 10,
     /// Generic / unknown.
     Unknown = 0xFF,
 }

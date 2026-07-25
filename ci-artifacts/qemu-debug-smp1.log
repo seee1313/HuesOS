@@ -1,0 +1,108 @@
+[2J[01;01H[=3h[2J[01;01H[2J[01;01H[=3h[2J[01;01H[2J[01;01H[=3h[2J[01;01HBdsDxe: loading Boot0001 "UEFI QEMU DVD-ROM QM00005 " from PciRoot(0x0)/Pci(0x1F,0x2)/Sata(0x2,0xFFFF,0x0)
+BdsDxe: starting Boot0001 "UEFI QEMU DVD-ROM QM00005 " from PciRoot(0x0)/Pci(0x1F,0x2)/Sata(0x2,0xFFFF,0x0)
+[2J[01;01H[01;01H[2J[01;01H[01;01H[HuesOS] Bootloader handed over control
+[PMM] Reserved HBI image: phys_addr=0x1669d000, length=46167968
+[uACPI] starting uACPI, version 6.0.0
+[uACPI] RSDP 0x000000001F77E014 00000024 v02 (BOCHS )
+[uACPI] XSDT 0x000000001F77D0E8 00000054 v01 (BOCHS  BXPC    )
+[uACPI] DSDT 0x000000001F77A000 000020F8 v01 (BOCHS  BXPC    )
+[uACPI] FACP 0x000000001F779000 000000F4 v03 (BOCHS  BXPC    )
+[uACPI] APIC 0x000000001F778000 00000078 v03 (BOCHS  BXPC    )
+[uACPI] HPET 0x000000001F777000 00000038 v01 (BOCHS  BXPC    )
+[uACPI] MCFG 0x000000001F776000 0000003C v01 (BOCHS  BXPC    )
+[uACPI] WAET 0x000000001F775000 00000028 v01 (BOCHS  BXPC    )
+[uACPI] BGRT 0x000000001F774000 00000038 v01 (INTEL  EDK2    )
+[uACPI] validated ACPI table graph and MADT
+[uACPI] built immutable Ring-3 table archive
+[uACPI] derived bounded FADT SystemIO policy
+[SMP] MADT parsed 1 CPUs found
+[IOAPIC] routed keyboard IRQ1
+[SMP] LAPIC timer count=624071
+HBI v2.1 parsed. Entries: 0x4
+[SMP] APs released to run
+HuesOS v0.1.0 on CPU 0
+PMM: 79317/268435456 frames (309 MiB)
+FB: 1280x800@32
+[init] installed immutable ACPI table archive VMO
+[init] installed deny-by-default ACPI broker capability
+[kernel] entering userspace: rip=0x400bb0 rsp=0x7ffffeffffd8 cs=0x23 ss=0x1b
+[init] hello from ring3 userspace, via libcanvas
+[init] user pointer guard smoke OK
+[init] VMO read/write round-trip OK
+[init] channel IPC round-trip OK
+[init] monotonic clock OK (10-tick wait measured 11 ticks)
+[kernel] entering userspace: rip=0x400030 rsp=0x7ffffeffffd8 cs=0x23 ss=0x1b
+[fault-probe] triggering wait
+[init] ProcessWait lifecycle OK (blocked wake)
+[kernel] entering userspace: rip=0x400030 rsp=0x7ffffeffffd8 cs=0x23 ss=0x1b
+[fault-probe] triggering page
+[user-fault] process=fault-probe koid=21 task=4294967298 cpu=0 reason=PAGE FAULT rip=0x400001 address=0x10000 error=0x4 action=terminate-process code=-4097
+[kernel] entering userspace: rip=0x400030 rsp=0x7ffffeffffd8 cs=0x23 ss=0x1b
+[fault-probe] triggering opcode
+[user-fault] process=fault-probe koid=29 task=8589934594 cpu=0 reason=INVALID OPCODE rip=0x400167 address=0x0 error=0x0 action=terminate-process code=-4099
+[kernel] entering userspace: rip=0x400030 rsp=0x7ffffeffffd8 cs=0x23 ss=0x1b
+[fault-probe] triggering gpf
+[user-fault] process=fault-probe koid=37 task=12884901890 cpu=0 reason=GENERAL PROTECTION FAULT rip=0x400117 address=0x0 error=0x0 action=terminate-process code=-4098
+[kernel] entering userspace: rip=0x400030 rsp=0x7ffffeffffd8 cs=0x23 ss=0x1b
+[fault-probe] triggering divide
+[user-fault] process=fault-probe koid=45 task=17179869186 cpu=0 reason=DIVIDE ERROR rip=0x4002cd address=0x0 error=0x0 action=terminate-process code=-4100
+[init] user fault isolation OK (#PF/#UD/#GP/#DE contained)
+[kernel] entering userspace: rip=0x400030 rsp=0x7ffffeffffd8 cs=0x23 ss=0x1b
+[fault-probe] triggering shutdown
+[init] shutdown authorization OK (unprivileged caller denied)
+[init] launched driver-manager
+[kernel] entering userspace: rip=0x402430 rsp=0x7ffffeffffd8 cs=0x23 ss=0x1b
+[driver-manager] started in userspace
+[init] driver-manager says driver-manager:degraded
+[init] passed HBI BOOTFS VMO to DriverManager
+[driver-manager] received BOOTFS VMO from init
+[driver-manager] BOOTFS mounted
+[driver-manager] manifest: host=input-host services=1 irqs=1 io_ports=2
+[driver-manager] capability: service=keyboard required=1
+[driver-manager] capability: irq=1
+[driver-manager] capability: io=0x60+1
+[driver-manager] capability: io=0x64+1
+[driver-manager] manifest loaded: host=input-host elf=/drivers/input-host.elf
+[driver-manager] launched DriverHost input-host
+[kernel] entering userspace: rip=0x400490 rsp=0x7ffffeffffd8 cs=0x23 ss=0x1b
+[driver-host:input] started
+[driver-host:input] keyboard IRQ bound to Port
+[driver-manager] input DriverHost starting
+[driver-manager] registered service keyboard from input-host
+[driver-manager] input DriverHost ready
+[init] passed ACPI table archive to DriverManager
+[driver-manager] received immutable ACPI table archive
+[init] transferred ACPI broker capability
+[driver-manager] received unique ACPI broker capability
+[driver-manager] launched isolated Ring-3 ACPI manager
+[kernel] entering userspace: rip=0x400140 rsp=0x7ffffeffffd8 cs=0x23 ss=0x1b
+[acpi-manager] isolated Ring-3 service started
+[acpi-manager] validated 7 ACPI tables, 7 physical ranges indexed
+[acpi-manager] broker deny-by-default self-test OK
+[driver-manager] ACPI manager archive validation ready
+[init] passed registry channel to DriverManager[driver-manager] received service registry channel from init
+
+[init] framebuffer log handoff: starting terminal service
+[init] launched terminal
+[kernel] entering userspace: rip=0x408e30 rsp=0x7ffffeffffd8 cs=0x23 ss=0x1b
+[terminal] started in userspace
+[init] terminal says terminal:ready
+[init] passed DriverManager registry to terminal
+[init] service launch complete; parking as init supervisor
+[driver-manager] opened keyboard service channel for client
+[driver-host:input] attached keyboard client
+[driver-manager] opened filesystem service channel for client
+[terminal] keyboard service online, starting shell
+[driver-manager] input heartbeat #1
+[driver-manager] input heartbeat #2
+[driver-manager] input heartbeat #3
+[driver-manager] input heartbeat #64
+[driver-manager] input heartbeat #128
+[driver-manager] input heartbeat #192
+[driver-manager] input heartbeat #256
+[driver-manager] input heartbeat #320
+[driver-manager] input heartbeat #384
+[driver-manager] input heartbeat #448
+[driver-manager] input heartbeat #512
+[driver-manager] input heartbeat #576
+[driver-manager] input heartbeat #640
