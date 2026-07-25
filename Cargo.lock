@@ -141,6 +141,7 @@ dependencies = [
  "huesos-alloc",
  "huesos-arch",
  "huesos-elf",
+ "huesos-extable",
  "huesos-fb",
  "huesos-hal",
  "huesos-lifecycle",

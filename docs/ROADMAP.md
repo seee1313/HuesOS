@@ -176,14 +176,22 @@ priority order.
 ### 1. Recoverable copies, VMAR unmap/protect, and SMEP/SMAP
 - **Current**: `VmarUnmap` and `VmarProtect` operate on exact mappings under
   Process user-copy locking and a global mutation lock; cross-CPU TLB shootdown
-  is required before returning to ring 3. `huesos-extable` remains the
-  host-tested long-term recovery policy for faults that occur despite
-  validation or future pageable copies.
+  is required before returning to ring 3.
 - **Policy core landed**: `huesos-extable` — host-tested fixup-table data
   structure and lookup (see [RECOVERABLE_COPIES.md](RECOVERABLE_COPIES.md)).
-- **Needed (on-target)**: install the actual fault-handler fixup path, add
-  adversarial unmap/protect race tests, then complete SMEP/SMAP copy-window
-  hardening and support mapping splits/child VMARs.
+- **Plumbing landed (H1)**: kernel-side `crate::extable` module + arch-side
+  `set_kernel_recover_hook` + IDT `#PF` re-entry that redirects RIP to a
+  `fixup_rip` when the extable covers the fault. `EXTABLE_ENTRIES` is
+  intentionally empty in this landing so the fault path stays byte-for-byte
+  identical to the pre-hook kernel — see `docs/UNSAFE_AUDIT.md § "Kernel
+  recoverable-copy hook"` for the safety-budget review.
+- **Needed (on-target)**: (a) a `user_access_ok!` macro emitting
+  `.ex_table` entries around each `huesos-syscalls::user_memory` copy
+  block; (b) linker-collected sorted `.ex_table` visible to
+  `EXTABLE_ENTRIES`; (c) adversarial unmap/protect race smoke test that
+  provokes the fault and expects `EFAULT` rather than a panic; (d)
+  complete SMEP/SMAP copy-window hardening and support mapping splits /
+  child VMARs.
 
 ### 2. IOAPIC interrupt routing
 - **Current**: LAPIC timer on all CPUs; keyboard IRQ1 is routed through an

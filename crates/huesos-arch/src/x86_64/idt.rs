@@ -104,17 +104,40 @@ extern "x86-interrupt" fn general_protection_fault_handler(
 }
 
 extern "x86-interrupt" fn page_fault_handler(
-    frame: InterruptStackFrame,
+    mut frame: InterruptStackFrame,
     error_code: PageFaultErrorCode,
 ) {
     super::cpu::clear_user_access();
     let address = Cr2::read().map(|a| a.as_u64()).unwrap_or(0);
-    dispatch(fault_info(
-        FaultKind::PageFault,
-        &frame,
-        error_code.bits(),
-        address,
-    ));
+    let info = fault_info(FaultKind::PageFault, &frame, error_code.bits(), address);
+
+    // Kernel-mode #PF only: consult the recoverable-copy extable *before*
+    // committing to the fatal path. This turns validated user-copy sites
+    // (e.g. concurrent VMAR unmap racing an in-flight kernel copy) into
+    // an ordinary `Err(EFAULT)` return instead of a kernel panic.
+    //
+    // For user-mode #PF the historical `dispatch` path stands unchanged:
+    // ring-3 exceptions always route through the process-termination
+    // policy, never through the extable.
+    if !info.from_userspace() {
+        if let Some(fixup_rip) = super::fault::try_kernel_recover(info) {
+            // Redirect resumption to the fixup landing pad. On iretq the
+            // CPU will pick up the new RIP and the copy helper returns
+            // its `Err` immediately, with no further copy attempted.
+            // SAFETY: we only rewrite the saved RIP; every other frame
+            // field is preserved, and the fixup address itself came
+            // from a static, table-owned kernel symbol registered via
+            // set_kernel_recover_hook (never from user-controlled data).
+            unsafe {
+                frame.as_mut().update(|f| {
+                    f.instruction_pointer = x86_64::VirtAddr::new(fixup_rip);
+                });
+            }
+            return;
+        }
+    }
+
+    dispatch(info);
 }
 
 extern "x86-interrupt" fn alignment_check_handler(frame: InterruptStackFrame, error_code: u64) {

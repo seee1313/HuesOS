@@ -14,6 +14,7 @@ huesos-syscalls = { path = "../huesos-syscalls" }
 huesos-pmm = { path = "../huesos-pmm" }
 huesos-elf = { path = "../huesos-elf" }
 huesos-lifecycle = { path = "../huesos-lifecycle" }
+huesos-extable = { path = "../huesos-extable" }
 huesos-fb = { path = "../huesos-fb" }
 huesos-abi = { path = "../huesos-abi" }
 huesos-alloc = { path = "../huesos-alloc" }

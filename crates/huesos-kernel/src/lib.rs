@@ -11,6 +11,7 @@
 extern crate alloc;
 
 pub mod boot;
+pub mod extable;
 pub mod init;
 pub mod mem;
 pub mod panic;
@@ -210,6 +211,9 @@ pub unsafe fn kmain(boot_info: BootInfo) -> ! {
     init::framebuffer_init(boot_info.framebuffer);
     huesos_arch::fault::set_kernel_fault_handler(crate::panic::from_cpu_fault);
     huesos_arch::fault::set_user_fault_handler(handle_user_fault);
+    // Install the ring-0 recoverable-copy hook (empty extable in this PR;
+    // see crate::extable module docs for why populating is a follow-up).
+    crate::extable::install();
     huesos_hal::init();
     init::syscall_init();
     scheduler::init();

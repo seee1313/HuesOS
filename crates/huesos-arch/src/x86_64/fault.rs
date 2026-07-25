@@ -63,9 +63,20 @@ impl FaultInfo {
 pub type UserFaultHandler = fn(FaultInfo) -> !;
 /// Kernel callback used for fatal ring-0 diagnostics.
 pub type KernelFaultHandler = fn(FaultInfo) -> !;
+/// Kernel callback consulted before a fatal ring-0 fault, to decide whether
+/// the fault is one of a bounded set of validated user-copy sites that can
+/// be recovered by resuming at `fixup_rip` (an `Err(EFAULT)` return path)
+/// instead of panicking the kernel.
+///
+/// The hook must be effectively pure with respect to the fault: it may only
+/// consult the extable it owns. It must not allocate, take a blocking lock,
+/// or perform I/O. Returning `None` preserves the historical fatal-panic
+/// behavior — deleting the hook is therefore always a safe rollback.
+pub type KernelFaultRecoverHook = fn(FaultInfo) -> Option<u64>;
 
 static USER_HANDLER: AtomicUsize = AtomicUsize::new(0);
 static KERNEL_HANDLER: AtomicUsize = AtomicUsize::new(0);
+static KERNEL_RECOVER_HOOK: AtomicUsize = AtomicUsize::new(0);
 
 /// Register the ring-3 fault policy callback.
 pub fn set_user_fault_handler(handler: UserFaultHandler) {
@@ -75,6 +86,33 @@ pub fn set_user_fault_handler(handler: UserFaultHandler) {
 /// Register the fatal ring-0 fault callback.
 pub fn set_kernel_fault_handler(handler: KernelFaultHandler) {
     KERNEL_HANDLER.store(handler as usize, Ordering::Release);
+}
+
+/// Register the recoverable-copy fixup hook. The hook is consulted **only**
+/// for ring-0 faults, **only** by [`try_kernel_recover`], and is otherwise
+/// invisible. Leaving it unset preserves pre-hook behavior exactly.
+pub fn set_kernel_recover_hook(hook: KernelFaultRecoverHook) {
+    KERNEL_RECOVER_HOOK.store(hook as usize, Ordering::Release);
+}
+
+/// Consult the registered recoverable-copy hook, if any. Returns
+/// `Some(fixup_rip)` when a covering extable entry exists and the CPU
+/// should resume at that address instead of taking the fatal path.
+///
+/// The IDT layer calls this only for **CPL0** faults and only before
+/// [`kernel_fault`]. `info.instruction_pointer` is the faulting RIP.
+pub fn try_kernel_recover(info: FaultInfo) -> Option<u64> {
+    if info.from_userspace() {
+        return None;
+    }
+    let hook = KERNEL_RECOVER_HOOK.load(Ordering::Acquire);
+    if hook == 0 {
+        return None;
+    }
+    // SAFETY: only `set_kernel_recover_hook` writes this value, from a
+    // function pointer with exactly this signature.
+    let hook: KernelFaultRecoverHook = unsafe { core::mem::transmute(hook) };
+    hook(info)
 }
 
 /// Hand a ring-3 exception to the kernel process manager.

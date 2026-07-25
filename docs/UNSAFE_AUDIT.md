@@ -457,3 +457,49 @@ require making the crate not host-testable (or gating the whole allocator
 under `#[cfg(target_arch = "x86_64")]`), which is a much larger design
 change than the deadlock this PR closes. It remains a follow-up option if
 future work makes per-CPU GS available under host tests.
+
+## Kernel recoverable-copy hook (dedicated safety-budget review)
+
+This lands the *plumbing* only — an empty extable plus the arch-side hook
+and IDT #PF re-entry point — for the recoverable-copy path (Immediate #1,
+Recoverable copies). Populating the table with actual user-copy sites is a
+follow-up PR: doing both in one change was previously reverted
+(`f7b74b2..651cc1c`), and this PR intentionally splits that into two steps
+so the fault-path change can bake on its own first.
+
+`safety-budget.json` moves in this PR:
+
+- `unsafe_blocks`: 234 → 235 (net +1). Composed of:
+  - `crates/huesos-arch/src/x86_64/idt.rs`: 4 → 5 (+1) — one new
+    `unsafe { frame.as_mut().update(...) }` in `page_fault_handler` that
+    rewrites the saved RIP when the recover hook returns `Some(fixup_rip)`.
+    **SAFETY invariant:** only the saved RIP is written; every other frame
+    field is preserved; the fixup address itself came from the static
+    table registered via `set_kernel_recover_hook`, never from user data.
+  - `crates/huesos-arch/src/x86_64/fault.rs`: 2 → 3 (+1) — one new
+    `unsafe { core::mem::transmute::<usize, KernelFaultRecoverHook>(hook) }`
+    in `try_kernel_recover`. **SAFETY invariant:** identical to the two
+    existing hook slots in the same file (`USER_HANDLER`, `KERNEL_HANDLER`);
+    only `set_kernel_recover_hook` writes the atomic, and it does so with
+    a function pointer whose signature is `fn(FaultInfo) -> Option<u64>`.
+  - `crates/huesos-arch/src/x86_64/mod.rs`: 7 → 6 (−1) — the duplicate
+    EFER.NXE write removed in PR #101 (kernel-heap-nx). The old baseline
+    was never regenerated at that PR; the net −1 balances out today's +2.
+- No other counter changes.
+
+The rollback story is unusually clean: leaving `EXTABLE_ENTRIES` empty
+(the state this PR ships) means `try_recover` always returns `None`,
+`try_kernel_recover` always returns `None`, and the IDT `#PF` handler
+takes the historical fatal-panic path unchanged. Deleting the `install()`
+call, or the `if let Some(fixup_rip) = ... { … return; }` block in
+`page_fault_handler`, is a safe revert with no state to unwind.
+
+Follow-up (not in this PR):
+
+1. `user_access_ok!` macro that wraps each `unsafe { copy_nonoverlapping(...) }`
+   in `huesos-syscalls::user_memory` with an `asm!(".pushsection .ex_table")`
+   entry naming start/end/fixup RIPs.
+2. Linker script hook in `scripts/linker.ld` to collect `.ex_table`
+   contributions into a single sorted array visible to `EXTABLE_ENTRIES`.
+3. Smoke test: a userspace `unmap-during-copy` probe that provokes the race
+   and expects `EFAULT`, not a kernel panic.
