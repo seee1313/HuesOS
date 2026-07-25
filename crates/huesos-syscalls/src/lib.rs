@@ -24,10 +24,12 @@ mod system;
 mod user_memory;
 mod util;
 mod vmo;
+mod waitset;
 
 use huesos_abi::{
     ChannelConsumeArgs, ChannelPeekArgs, ChannelReadEtcArgs, ErrorCode, FramebufferBlitArgs,
     FramebufferInfo, HandleValue, PortPacket, VmarMapArgs, VmarOpArgs,
+    WaitSetWaitArgs,
 };
 
 pub use callbacks::{
@@ -125,5 +127,6 @@ pub fn dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> Syscal
         S::VmarProtect => process::sys_vmar_protect(a1 as *const VmarOpArgs),
         S::ChannelPeek => channel::sys_channel_peek(a1 as *const ChannelPeekArgs),
         S::ChannelConsume => channel::sys_channel_consume(a1 as *const ChannelConsumeArgs),
+        S::WaitSetWait => waitset::sys_waitset_wait(a1 as *const WaitSetWaitArgs),
     }
 }

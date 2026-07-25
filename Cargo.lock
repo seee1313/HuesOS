@@ -208,6 +208,7 @@ dependencies = [
  "huesos-arch",
  "huesos-fb",
  "huesos-object",
+ "huesos-waitset",
  "log",
  "spin",
  "x86_64",
