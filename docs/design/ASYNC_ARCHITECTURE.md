@@ -127,13 +127,53 @@ admission paths. These errors are architectural, not exceptional.
 | 1 | Backend trait + KernelBackend + UserBackend | ✅ Merged (PR #85) |
 | 2 | Executor generic over Backend + scope_on | ✅ Merged (PR #85) |
 | 3 | Per-CPU async runtime module (async_rt) | ✅ This compare |
-| 4 | WaitQueue ↔ Waker bridge | 📋 Future |
-| 5 | Async Recv future (channel) | 📋 Future |
-| 6 | Async Sleep future (timer) | 📋 Future |
-| 7 | sys_waitset_wait (multiplex) | 📋 Future |
-| 8 | IRQ → reactor wake (keyboard/NVMe) | 📋 Future |
-| 9 | Async ProcessWait future | 📋 Future |
-| 10 | Init system on async | 📋 Future |
+| 4 | WaitQueue ↔ Waker bridge | ✅ This compare |
+| 5 | Async Recv + Sleep futures | ✅ This compare |
+| 6 | sys_waitset_wait (multiplex) | ✅ This compare |
+| 7 | IRQ → reactor wake (keyboard) | ✅ This compare |
+| 8 | Async ProcessWait future | ✅ This compare |
+| 9 | Init system on async | 📋 Documented; code migration future |
+| 10 | Async optimizations | 📋 Future |
+
+## Init System Integration
+
+The init process is the natural consumer of async primitives. The
+recommended migration path:
+
+```rust
+// Current init loop (sync):
+loop {
+    if let Some((n, handle)) = channel.read_optional_handle(buf)? {
+        handle_message(n, handle);
+    }
+}
+
+// Future init loop (async):
+use hues_async::scope_on;
+use huesos_object::channel::ChannelAsyncExt;
+use huesos_object::process::ProcessAsyncExt;
+
+scope_on(async {
+    loop {
+        // Async channel recv (peek & claim + waker bridge)
+        let msg = channel.recv_async().await?;
+        handle_message(msg);
+    }
+}, &backend);
+```
+
+The init process can also await child processes:
+
+```rust
+let exit_code = child_process.wait_async().await;
+if exit_code != 0 {
+    respawn(child_process).await;
+}
+```
+
+**Migration status**: planned for a future compare. The async primitives
+(Recv, Sleep, ProcessWait, WaitForKey) and the reactor model are
+production-ready; the init integration is the final code migration step.
 
 ## References
 
