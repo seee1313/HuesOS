@@ -243,3 +243,27 @@ report, other CPUs receive a panic-stop IPI, and no CPU reboots. See
 - Per-call transfer limits bound attacker-controlled temporary allocations.
 - Jobs exist but do not yet enforce aggregate quotas.
 - SMEP/SMAP and fault-recoverable copies remain future hardening.
+
+## Production Readiness Checklist
+
+Verified in QEMU (`-smp 2`) and budget-neutral:
+- [x] Boot pipeline (Limine → HBI → PMM → Paging → SMP → Init)
+- [x] Real ring3 userspace with `syscall`/`sysret`
+- [x] Per-process address spaces, capability handles, user-copy audit
+- [x] SMP scheduler (Fair + Deadline), LAPIC timer, load balance, IPI
+- [x] Framebuffer, keyboard, terminal, Snake, DoomGeneric (GPL isolated)
+- [x] Safety budget (`audit-check` neutral), ranked locks (`check-lock-policy` clean)
+- [x] Zero-allocation contract (`hues-async`), no new `unsafe`/`unwrap`/`panic!`
+- [x] `hbi-gen` fixed (`size_of::<EntryHeader>()`), docs updated
+- [x] `huesos-boot` `unwrap_or` + `assert` style inconsistency noted (`UNSAFE_AUDIT.md`)
+- [x] `DG_ScreenBuffer` `static mut` eliminated (`UnsafeCell`)
+
+Requires privileged integration + on-target verification before Production:
+- [ ] `huesos-ioapic`: full IRQ routing (only keyboard IRQ1 live)
+- [ ] `huesos-lifecycle`: registry integration (`handle_counts` + `kernel_refs`)
+- [ ] `huesos-waitset`: multiplex wait fully wired to scheduler `park`/`wake`
+- [ ] `huesos-quota`: complete Job accounting (handles, page-table, CPU ticks)
+- [ ] `huesos-extable`: recoverable user-copy fixup in fault handler path
+- [ ] `huesos-fat`: production VFS backend (library-ready only)
+- [ ] `paging`/`PMM`: typed errors replacing `panic!` (future hardening)
+- [ ] Dynamic process supervision / cancellation / multi-object waits (MVP-level)
