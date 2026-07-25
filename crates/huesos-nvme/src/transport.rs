@@ -192,6 +192,9 @@ impl MockNvme {
                 // need a non-zero, plausible structure.
                 data[0] = 0x86;
                 data[1] = 0x80; // VID
+                                // MDTS at offset 77: max transfer = 2^MDTS * page_size.
+                                // Set MDTS=5 for 32 * 4096 = 128KB max transfer.
+                data[77] = 5;
             }
             identify::NAMESPACE => {
                 // NSZE (bytes 7:0), NCAP (15:8), LBAF0 LBADS at byte 26.

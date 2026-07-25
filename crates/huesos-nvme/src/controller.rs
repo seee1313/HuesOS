@@ -62,6 +62,9 @@ pub struct Controller<T: NvmeTransport> {
     nsze: u64,
     lba_size: u32,
     identify_buf: u64,
+    // Capabilities (validated during init).
+    mdts: u32,
+    max_queue_size: u16,
 }
 
 impl<T: NvmeTransport> Controller<T> {
@@ -96,6 +99,8 @@ impl<T: NvmeTransport> Controller<T> {
             nsze: 0,
             lba_size: 0,
             identify_buf: 0,
+            mdts: 0,
+            max_queue_size: 0,
         }
     }
 
@@ -107,6 +112,17 @@ impl<T: NvmeTransport> Controller<T> {
     pub fn lba_size(&self) -> u32 {
         self.lba_size
     }
+
+    /// Maximum data transfer size in bytes (MDTS).
+    pub fn mdts(&self) -> u32 {
+        self.mdts
+    }
+
+    /// Maximum queue size (entries) supported by the controller.
+    pub fn max_queue_size(&self) -> u16 {
+        self.max_queue_size
+    }
+
     /// Borrow the underlying transport.
     pub fn transport_mut(&mut self) -> &mut T {
         &mut self.t
@@ -140,9 +156,20 @@ impl<T: NvmeTransport> Controller<T> {
         if end > self.nsze {
             return Err(NvmeError::OutOfRange);
         }
-        (nlb as u64)
+        let bytes = (nlb as u64)
             .checked_mul(self.lba_size as u64)
-            .ok_or(NvmeError::InvalidArgs)
+            .ok_or(NvmeError::InvalidArgs)?;
+        // MDTS validation: transfer size must not exceed controller capability.
+        if bytes > self.mdts as u64 {
+            return Err(NvmeError::InvalidArgs);
+        }
+        // Alignment validation: buffer must be aligned to LBA size.
+        // (Caller is responsible for providing aligned buffers; we validate the
+        // transfer size is a multiple of LBA size.)
+        if bytes % (self.lba_size as u64) != 0 {
+            return Err(NvmeError::InvalidArgs);
+        }
+        Ok(bytes)
     }
 
     fn next_cid(&mut self) -> u16 {
@@ -204,6 +231,7 @@ impl<T: NvmeTransport> Controller<T> {
         self.page_size = cap::min_page_size(capv) as u32;
         self.doorbell_stride = cap::doorbell_stride_bytes(capv);
         let mqes = cap::mqes(capv);
+        self.max_queue_size = mqes;
         self.admin_size = 16.min(mqes);
         self.io_size = 16.min(mqes);
 
@@ -238,6 +266,20 @@ impl<T: NvmeTransport> Controller<T> {
             0,
             self.identify_buf,
         ))?;
+
+        // Read MDTS (Maximum Data Transfer Size) from Identify Controller.
+        // MDTS is at offset 77 in the Identify Controller data structure.
+        // MDTS is in units of the minimum memory page size (CAP.MPSMIN).
+        let mut ctrl_id = [0u8; 4096];
+        self.t.dma_read(self.identify_buf, &mut ctrl_id);
+        let mdts_raw = ctrl_id[77];
+        // MDTS = 0 means no limit. Otherwise, max transfer = 2^MDTS * page_size.
+        self.mdts = if mdts_raw == 0 {
+            u32::MAX
+        } else {
+            (1u32 << mdts_raw).saturating_mul(self.page_size)
+        };
+
         self.admin_command(build::identify(
             identify::NAMESPACE,
             0,
