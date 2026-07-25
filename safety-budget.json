@@ -6,7 +6,7 @@
     "panic_macros": 5,
     "static_mut": 1,
     "todo_markers": 1,
-    "unsafe_blocks": 232,
+    "unsafe_blocks": 234,
     "unsafe_functions": 56,
     "unsafe_impls": 28,
     "unwrap_calls": 25
@@ -47,7 +47,7 @@
     "crates/huesos-nvme/src/pci_transport.rs": 8,
     "crates/huesos-object/src/lib.rs": 1,
     "crates/huesos-object/src/vmo.rs": 4,
-    "crates/huesos-pmm/src/lib.rs": 5,
+    "crates/huesos-pmm/src/lib.rs": 7,
     "crates/huesos-syscalls/src/acpi_broker.rs": 6,
     "crates/huesos-syscalls/src/user_memory.rs": 6,
     "crates/huesos-uacpi/src/lib.rs": 12,
