@@ -517,17 +517,30 @@ impl<T> IrqSafeTicketLock<T> {
         }
     }
 
-    /// Try to acquire without spinning.
+    /// Try to acquire the lock once, without spinning.
+    ///
+    /// Returns `None` under contention and restores the caller's interrupt
+    /// state. The previous implementation delegated to a full blocking
+    /// [`TicketLock::lock`], which turned a `try_lock`-shaped API into a
+    /// silent deadlock hazard for any caller that relied on it being
+    /// non-blocking (for example, diagnostics or IRQ-context probes).
     pub fn try_lock(&self) -> Option<IrqSafeTicketLockGuard<'_, T>> {
         let was_enabled = interrupts::are_enabled();
         interrupts::disable();
-        // For ticket lock, try_lock is not trivial; simplified to full lock
-        self.lock.lock();
-        Some(IrqSafeTicketLockGuard {
-            lock: &self.lock,
-            was_enabled,
-            data: self,
-        })
+        if self.lock.try_lock() {
+            Some(IrqSafeTicketLockGuard {
+                lock: &self.lock,
+                was_enabled,
+                data: self,
+            })
+        } else {
+            // Restore interrupt state on failure so the caller observes no
+            // externally visible side effect from a failed try_lock.
+            if was_enabled {
+                interrupts::enable();
+            }
+            None
+        }
     }
 }
 
@@ -568,7 +581,7 @@ impl<'a, T> DerefMut for IrqSafeTicketLockGuard<'a, T> {
 
 #[cfg(test)]
 mod tests {
-    use super::{LockRank, LockRankError, RankTracker};
+    use super::{LockRank, LockRankError, RankTracker, TicketLock};
 
     #[test]
     fn rank_tracker_accepts_nested_non_decreasing_ranks() {
@@ -591,6 +604,47 @@ mod tests {
             tracker.enter(LockRank::WAIT, 1),
             Err(LockRankError::RecursiveAcquire)
         );
+    }
+
+    #[test]
+    fn ticket_lock_try_lock_is_non_blocking_under_contention() {
+        // Regression: IrqSafeTicketLock::try_lock previously delegated to a
+        // full blocking TicketLock::lock, which turned a try_lock-shaped API
+        // into a silent deadlock hazard. The wrapper now defers to
+        // TicketLock::try_lock, so a contended try_lock must return false
+        // instead of blocking.
+        let lock = TicketLock::new();
+        // First acquisition succeeds; the second one must observe contention
+        // and fail without ever taking a ticket.
+        assert!(lock.try_lock(), "first try_lock must succeed");
+        assert!(
+            !lock.try_lock(),
+            "contended try_lock must return false, not block"
+        );
+        // Serving the held ticket lets a subsequent try_lock succeed again.
+        lock.unlock();
+        assert!(
+            lock.try_lock(),
+            "try_lock must succeed once the lock is released"
+        );
+        lock.unlock();
+    }
+
+    #[test]
+    fn ticket_lock_try_lock_does_not_leak_tickets() {
+        // Confirms the CAS-based try_lock does not abandon a ticket that
+        // would permanently stall the queue. After N failed try_locks against
+        // a held ticket, releasing must let exactly one blocking lock proceed.
+        let lock = TicketLock::new();
+        assert!(lock.try_lock());
+        for _ in 0..8 {
+            assert!(!lock.try_lock());
+        }
+        lock.unlock();
+        // A blocking lock must now proceed immediately because no phantom
+        // tickets were consumed by the failed try_locks.
+        lock.lock();
+        lock.unlock();
     }
 
     #[test]
