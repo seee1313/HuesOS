@@ -23,6 +23,7 @@ macro_rules! init_logln {
 
 static DRIVER_MANAGER_ELF: &[u8] = include_bytes!(env!("HUESOS_DRIVER_MANAGER_PATH"));
 static TERMINAL_ELF: &[u8] = include_bytes!(env!("HUESOS_TERMINAL_PATH"));
+static ACPI_MANAGER_ELF: &[u8] = include_bytes!(env!("HUESOS_ACPI_MANAGER_PATH"));
 static FAULT_PROBE_ELF: &[u8] = include_bytes!(env!("HUESOS_FAULT_PROBE_PATH"));
 
 const BOOTFS_HEADER_SIZE: u64 = 16;
@@ -64,6 +65,12 @@ pub extern "C" fn _start() -> ! {
         send_bootfs_vmo(&mut logger, channel, &bootfs);
         send_acpi_tables_vmo(&mut logger, channel, &acpi_tables);
         send_acpi_broker(&mut logger, channel, acpi_broker);
+    }
+
+    // Launch ACPI manager service for table validation and broker policy enforcement.
+    let acpi_manager = launch_service(&mut logger, "acpi-manager", ACPI_MANAGER_ELF);
+    if let Some((_, channel)) = &acpi_manager {
+        read_ready_message(&mut logger, "acpi-manager", channel);
     }
 
     let registry_pair = create_driver_manager_registry_channel(&mut logger, &driver_manager);

@@ -70,6 +70,7 @@ fn main() {
             ("HUESOS_DRIVER_MANAGER_PATH", driver_manager.as_os_str()),
             ("HUESOS_TERMINAL_PATH", terminal.as_os_str()),
             ("HUESOS_FAULT_PROBE_PATH", fault_probe.as_os_str()),
+            ("HUESOS_ACPI_MANAGER_PATH", acpi_manager.as_os_str()),
         ],
     );
 
