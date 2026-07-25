@@ -18,6 +18,7 @@ huesos-fb = { path = "../huesos-fb" }
 huesos-abi = { path = "../huesos-abi" }
 huesos-alloc = { path = "../huesos-alloc" }
 huesos-uacpi = { path = "../huesos-uacpi" }
+hues-async = { path = "../hues-async" }
 spin = { workspace = true }
 log = { workspace = true }
 linked_list_allocator = { workspace = true }
