@@ -47,29 +47,6 @@ name = "hues-async"
 version = "0.1.0"
 
 [[package]]
-name = "huesos-decoder-fuzz"
-version = "0.1.0"
-dependencies = [
- "huesos-abi",
-]
-
-[[package]]
-name = "huesos-extable"
-version = "0.1.0"
-
-[[package]]
-name = "huesos-handlemove"
-version = "0.1.0"
-
-[[package]]
-name = "huesos-ioapic"
-version = "0.1.0"
-
-[[package]]
-name = "huesos-lifecycle"
-version = "0.1.0"
-
-[[package]]
 name = "huesos-abi"
 version = "0.1.0"
 
@@ -105,12 +82,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "huesos-decoder-fuzz"
+version = "0.1.0"
+dependencies = [
+ "huesos-abi",
+]
+
+[[package]]
 name = "huesos-elf"
 version = "0.1.0"
 dependencies = [
  "log",
  "xmas-elf",
 ]
+
+[[package]]
+name = "huesos-extable"
+version = "0.1.0"
 
 [[package]]
 name = "huesos-fat"
@@ -137,16 +125,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "huesos-handlemove"
+version = "0.1.0"
+
+[[package]]
+name = "huesos-ioapic"
+version = "0.1.0"
+
+[[package]]
 name = "huesos-kernel"
 version = "0.1.0"
 dependencies = [
+ "hues-async",
  "huesos-abi",
  "huesos-alloc",
  "huesos-arch",
  "huesos-elf",
- "huesos-lifecycle",
  "huesos-fb",
  "huesos-hal",
+ "huesos-lifecycle",
  "huesos-object",
  "huesos-pmm",
  "huesos-syscalls",
@@ -155,6 +152,17 @@ dependencies = [
  "log",
  "spin",
  "x86_64",
+]
+
+[[package]]
+name = "huesos-lifecycle"
+version = "0.1.0"
+
+[[package]]
+name = "huesos-nvme"
+version = "0.1.0"
+dependencies = [
+ "hues-async",
 ]
 
 [[package]]
@@ -171,18 +179,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "huesos-nvme"
-version = "0.1.0"
-dependencies = [
- "hues-async",
-]
-
-[[package]]
 name = "huesos-pci"
-version = "0.1.0"
-
-[[package]]
-name = "huesos-proclife"
 version = "0.1.0"
 
 [[package]]
@@ -194,25 +191,27 @@ dependencies = [
 ]
 
 [[package]]
-name = "huesos-syscalls"
+name = "huesos-proclife"
 version = "0.1.0"
-dependencies = [
- "bitflags 2.13.0",
- "huesos-abi",
- "huesos-arch",
- "huesos-fb",
- "huesos-object",
- "log",
- "spin",
-]
 
 [[package]]
 name = "huesos-quota"
 version = "0.1.0"
 
 [[package]]
-name = "huesos-waitset"
+name = "huesos-syscalls"
 version = "0.1.0"
+dependencies = [
+ "bitflags 2.13.0",
+ "hues-async",
+ "huesos-abi",
+ "huesos-arch",
+ "huesos-fb",
+ "huesos-object",
+ "log",
+ "spin",
+ "x86_64",
+]
 
 [[package]]
 name = "huesos-uacpi"
@@ -224,6 +223,10 @@ dependencies = [
 
 [[package]]
 name = "huesos-user-alloc"
+version = "0.1.0"
+
+[[package]]
+name = "huesos-waitset"
 version = "0.1.0"
 
 [[package]]
