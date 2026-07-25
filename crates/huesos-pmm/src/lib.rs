@@ -13,6 +13,86 @@
 use core::sync::atomic::{AtomicUsize, Ordering};
 use spin::Mutex;
 
+// -----------------------------------------------------------------------------
+// IRQ-safe access to the global PMM state.
+//
+// The PMM is called from ordinary kernel code *and* from paths that can run
+// with interrupts already disabled (e.g. the page-fault handler asks the
+// x86_64 mapper for a fresh page-table frame). A plain spin::Mutex around the
+// allocator can deadlock the local CPU if an IRQ tries to grab it while the
+// same CPU already holds it. This crate is not on the privileged-crate list
+// enforced by tools/check-lock-policy.py because host tests cannot execute
+// the per-CPU GS-BASE machinery that RankedIrqSafeTicketLock requires; we
+// therefore wrap spin::Mutex with a minimal IRQ-mask helper that is a no-op
+// on non-x86_64 host builds and inline cli/sti on the real kernel target.
+//
+// This closes the "PMM lock held across IRQ that re-enters PMM" hazard
+// without pulling huesos-arch's ranked-lock machinery into a crate that
+// runs under `cargo test` on the host.
+// -----------------------------------------------------------------------------
+
+/// Saved interrupt state to restore on drop.
+struct IrqGuard {
+    #[cfg(target_arch = "x86_64")]
+    were_enabled: bool,
+}
+
+impl IrqGuard {
+    #[inline]
+    fn acquire() -> Self {
+        #[cfg(target_arch = "x86_64")]
+        {
+            let flags: u64;
+            // SAFETY: pushfq / cli are always safe on x86_64. They only
+            // read RFLAGS and mask interrupts on the local CPU; no memory
+            // is accessed and no software-visible register other than a
+            // scratch is used (constrained by the asm! output).
+            unsafe {
+                core::arch::asm!(
+                    "pushfq",
+                    "pop {flags}",
+                    "cli",
+                    flags = out(reg) flags,
+                    options(nomem, preserves_flags),
+                );
+            }
+            IrqGuard {
+                were_enabled: (flags & (1 << 9)) != 0,
+            }
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            IrqGuard {}
+        }
+    }
+}
+
+impl Drop for IrqGuard {
+    #[inline]
+    fn drop(&mut self) {
+        #[cfg(target_arch = "x86_64")]
+        if self.were_enabled {
+            // SAFETY: sti is always safe on x86_64; it only unmasks
+            // interrupts on the local CPU.
+            unsafe {
+                core::arch::asm!("sti", options(nomem, preserves_flags));
+            }
+        }
+    }
+}
+
+/// Take the PMM lock with local interrupts disabled, returning a guard that
+/// re-enables interrupts when dropped (only if they were enabled on entry).
+///
+/// This exists so the page-fault handler and other IRQ-context paths that
+/// call `alloc_frame` cannot deadlock the local CPU by re-entering the
+/// PMM while it already holds the underlying spinlock.
+fn lock_allocator() -> (IrqGuard, spin::MutexGuard<'static, Option<BitmapAllocator>>) {
+    let irq = IrqGuard::acquire();
+    let guard = ALLOCATOR.lock();
+    (irq, guard)
+}
+
 /// Frame size (4 KiB pages only, for MVP simplicity).
 pub const FRAME_SIZE: u64 = 4096;
 
@@ -204,7 +284,10 @@ pub unsafe fn init(regions: &[MemoryRegion], hhdm_offset: u64) {
 
     TOTAL_FRAMES.store(frame_count, Ordering::Relaxed);
     FREE_FRAMES.store(free_count, Ordering::Relaxed);
-    *ALLOCATOR.lock() = Some(alloc);
+    {
+        let (_irq, mut guard) = lock_allocator();
+        *guard = Some(alloc);
+    }
 
     log::info!(
         "PMM initialized: {} total frames, {} free ({} MiB)",
@@ -222,7 +305,7 @@ pub unsafe fn init(regions: &[MemoryRegion], hhdm_offset: u64) {
 /// `base + length` uses saturating arithmetic so a boot module whose end
 /// wraps `u64::MAX` cannot overflow into an unrelated frame index.
 pub fn reserve_range(base: u64, length: u64) {
-    let mut guard = ALLOCATOR.lock();
+    let (_irq, mut guard) = lock_allocator();
     if let Some(alloc) = guard.as_mut() {
         let start_frame = base / FRAME_SIZE;
         let end_phys = base.saturating_add(length);
@@ -239,15 +322,22 @@ pub fn reserve_range(base: u64, length: u64) {
 }
 
 /// Allocate a single 4 KiB physical frame. Returns the physical address.
+///
+/// Safe to call from IRQ-context code paths (e.g. the page-fault handler
+/// asking the mapper for a fresh page-table frame): the underlying lock is
+/// taken with local interrupts masked, so a re-entrant IRQ on the same CPU
+/// cannot deadlock against the caller.
 pub fn alloc_frame() -> Result<u64, PmmError> {
-    let mut guard = ALLOCATOR.lock();
+    let (_irq, mut guard) = lock_allocator();
     let alloc = guard.as_mut().ok_or(PmmError::NotInitialized)?;
     alloc.allocate().ok_or(PmmError::OutOfMemory)
 }
 
 /// Free a previously allocated frame.
+///
+/// Same IRQ-safety contract as [`alloc_frame`].
 pub fn free_frame(phys_addr: u64) {
-    let mut guard = ALLOCATOR.lock();
+    let (_irq, mut guard) = lock_allocator();
     if let Some(alloc) = guard.as_mut() {
         alloc.deallocate(phys_addr);
     }

@@ -1,12 +1,12 @@
 {
-  "rust_files": 141,
-  "rust_lines": 31537,
+  "rust_files": 147,
+  "rust_lines": 34611,
   "totals": {
     "expect_calls": 22,
     "panic_macros": 5,
     "static_mut": 1,
     "todo_markers": 1,
-    "unsafe_blocks": 232,
+    "unsafe_blocks": 234,
     "unsafe_functions": 56,
     "unsafe_impls": 28,
     "unwrap_calls": 30
@@ -44,9 +44,10 @@
     "crates/huesos-kernel/src/scheduler.rs": 9,
     "crates/huesos-kernel/src/smp.rs": 9,
     "crates/huesos-kernel/src/task.rs": 7,
+    "crates/huesos-nvme/src/pci_transport.rs": 8,
     "crates/huesos-object/src/lib.rs": 1,
     "crates/huesos-object/src/vmo.rs": 4,
-    "crates/huesos-pmm/src/lib.rs": 5,
+    "crates/huesos-pmm/src/lib.rs": 7,
     "crates/huesos-syscalls/src/acpi_broker.rs": 6,
     "crates/huesos-syscalls/src/user_memory.rs": 6,
     "crates/huesos-uacpi/src/lib.rs": 12,
@@ -61,7 +62,6 @@
     "crates/huesos-userspace/libcanvas/src/process/objects.rs": 4,
     "crates/huesos-userspace/libcanvas/src/raw.rs": 1,
     "crates/huesos-userspace/libcanvas/src/vmo.rs": 3,
-    "crates/huesos-userspace/terminal/src/screen.rs": 2,
-    "crates/huesos-nvme/src/pci_transport.rs": 8
+    "crates/huesos-userspace/terminal/src/screen.rs": 2
   }
 }
