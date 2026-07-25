@@ -474,6 +474,34 @@ pub fn park_current() {
     huesos_arch::interrupts::enable();
 }
 
+/// Rebase a Deadline task's `(deadline, remaining_budget)` on unblock,
+/// matching a standard Constant Bandwidth Server (CBS) replenishment.
+///
+/// Contract:
+/// - `deadline` becomes `now + period` (saturating; a `period` of `u64::MAX`
+///   just pins the deadline at `u64::MAX`, which prevents overflow rather
+///   than wrapping to zero and creating a spurious "immediately due" task).
+/// - `remaining_budget` is refilled to full `capacity`. A task that spent
+///   any CPU time in the previous period is entitled to a fresh capacity
+///   when its period is reset; leaving a partially consumed budget would
+///   silently starve the task on wake.
+///
+/// Without this rebase, a task blocked for longer than one period wakes
+/// with a stale deadline in the past, which makes EDF give it infinite
+/// priority and starves every other Deadline task. Extracted into a
+/// pure `pub(crate)` function so the property is exercised by host tests
+/// without dragging in the per-CPU scheduler.
+pub(crate) fn replenish_deadline_on_unblock(
+    now: u64,
+    capacity: u64,
+    period: u64,
+    remaining_budget: &mut u64,
+    deadline: &mut u64,
+) {
+    *deadline = now.saturating_add(period);
+    *remaining_budget = capacity;
+}
+
 /// Wake a previously parked task. Safe to call from IRQ context (port queue).
 ///
 /// Always clears `blocked` and ensures the task is on the fair runqueue.
@@ -490,6 +518,10 @@ pub fn wake_task(task_id: u64) {
     if !guard.task_matches(task_id) {
         return;
     }
+    // Read scheduler-local tick count here so the Deadline replenishment
+    // path below (which mutably borrows a task from `guard.tasks`) does
+    // not need to alias-borrow `guard.ticks` at the same time.
+    let now = guard.ticks;
     let task = &mut guard.tasks[idx];
     if task.finished.load(Ordering::Relaxed) {
         task.blocked.store(false, Ordering::SeqCst);
@@ -504,10 +536,26 @@ pub fn wake_task(task_id: u64) {
         return;
     }
     task.wake_pending.store(false, Ordering::SeqCst);
-    if let SchedPolicy::Fair { vruntime, .. } = task.sched_policy {
-        // insert is idempotent enough if we remove first (wavl may allow dup — remove first)
-        let id = task.id;
-        let vr = vruntime;
+    // Fold both policy paths under one mutable-task borrow so the borrow
+    // checker sees a single scope. The Fair path collects (vruntime, id)
+    // into `fair_reinsert` and applies the fair_queue mutation *after*
+    // the task borrow ends; the Deadline path rebases deadline + refills
+    // budget in place under the same borrow via the pure helper.
+    let fair_reinsert = match &mut task.sched_policy {
+        SchedPolicy::Fair { vruntime, .. } => Some((*vruntime, task.id)),
+        SchedPolicy::Deadline {
+            capacity,
+            period,
+            remaining_budget,
+            deadline,
+        } => {
+            replenish_deadline_on_unblock(now, *capacity, *period, remaining_budget, deadline);
+            None
+        }
+    };
+    if let Some((vr, id)) = fair_reinsert {
+        // insert is idempotent enough if we remove first (wavl may allow
+        // dup — remove first).
         guard.fair_queue.remove(vr, id);
         guard.fair_queue.insert(vr, id);
     }
@@ -918,5 +966,55 @@ mod task_id_tests {
         assert_eq!(next_task_generation(0), Some(1));
         assert_eq!(next_task_generation(41), Some(42));
         assert_eq!(next_task_generation(TASK_GENERATION_MASK), None);
+    }
+
+    // --- EDF replenishment on unblock ---
+    //
+    // Regression for the bug where a Deadline task blocked for longer than
+    // one period woke with a stale (past) deadline and gained infinite
+    // priority under EDF, starving every other Deadline task.
+
+    #[test]
+    fn replenish_rebases_deadline_from_now_and_refills_budget() {
+        let capacity = 40;
+        let period = 100;
+        let mut remaining_budget = 5; // partially consumed in previous period
+        let mut deadline = 30; // stale — well before "now"
+        replenish_deadline_on_unblock(500, capacity, period, &mut remaining_budget, &mut deadline);
+        assert_eq!(deadline, 600, "new deadline must be now + period");
+        assert_eq!(remaining_budget, capacity, "budget must be fully refilled");
+    }
+
+    #[test]
+    fn replenish_never_makes_deadline_stale_relative_to_now() {
+        // Sweep a range of (now, period) pairs. Post-replenish deadline
+        // must always be >= now — EDF fairness relies on this.
+        for now in [0u64, 1, 100, u64::MAX / 2, u64::MAX - 10] {
+            for period in [1u64, 10, 1000, u64::MAX] {
+                let mut remaining_budget = 0;
+                let mut deadline = 0;
+                replenish_deadline_on_unblock(
+                    now,
+                    10,
+                    period,
+                    &mut remaining_budget,
+                    &mut deadline,
+                );
+                assert!(
+                    deadline >= now,
+                    "post-replenish deadline={deadline} must be >= now={now} (period={period})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn replenish_saturates_deadline_on_overflow() {
+        // A pathological period must not wrap deadline to zero (which would
+        // make EDF think the task is immediately due).
+        let mut remaining_budget = 0;
+        let mut deadline = 100;
+        replenish_deadline_on_unblock(u64::MAX, 10, 5, &mut remaining_budget, &mut deadline);
+        assert_eq!(deadline, u64::MAX, "must saturate, not wrap");
     }
 }
