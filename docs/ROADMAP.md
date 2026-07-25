@@ -7,6 +7,16 @@ priority order.
 
 ## Done (recent)
 
+### `hues-async` alloc-free rule enforced in CI
+- New gate `tools/check-hues-async-noalloc.py` rejects any use of the
+  `alloc` crate or any heap-backed collection / smart-pointer under
+  `crates/hues-async/**` (production and tests). Wired into
+  `make audit-check` and therefore into the `static-safety` CI job.
+- Rationale and full list of banned identifiers documented in
+  [ASYNC_RUNTIME.md](ASYNC_RUNTIME.md#project-rule-no-allocations-ever) and
+  cross-linked from `CONTRIBUTING.md § 1a`.
+- Current `crates/hues-async/` code passes the gate with zero changes.
+
 ### Host-testable policy cores + contribution rules + safety audit
 - Seven `no_std`, dependency-free, host-unit-tested **policy crates** extracted
   from the privileged paths, each with a `docs/` design page describing its
@@ -154,16 +164,6 @@ priority order.
 - Full design doc: `docs/design/ASYNC_ARCHITECTURE.md`
 
 ## Immediate
-
-### 0. Enforce `hues-async` alloc-free rule in CI
-- **Current**: the executor is written without `alloc`, but nothing in CI
-  refuses a `Box`/`Vec`/`String`/`Arc`/`alloc::` import that a future
-  contributor might land in `crates/hues-async/**`.
-- **Needed**: a new `tools/check-hues-async-noalloc.py` gate wired into
-  `make audit-check`, plus a matching sentence in `CONTRIBUTING.md` and in
-  `docs/ASYNC_RUNTIME.md`. The gate is a project rule (see the "Rules" the
-  HuesOS Dev effort adopted); it must reject the whole file if any of the
-  forbidden identifiers appear outside a `#[cfg(test)]` block.
 
 ### 0b. Retire the five NVMe test unwraps
 - **Current**: `safety-budget.json` sits at `unwrap_calls = 30`; the five

@@ -254,8 +254,10 @@ PCI/PCIe enumerator, `huesos-nvme` is a controller crate with an on-target
 `PciMmioTransport`, and `hues-async` is a **strictly allocation-free** `no_std`
 futures executor for ring-3 driver hosts (see
 [docs/ASYNC_RUNTIME.md](docs/ASYNC_RUNTIME.md)). The alloc-free constraint on
-`crates/hues-async` is a project rule; a dedicated CI gate enforcing it is
-tracked as follow-up work in [docs/ROADMAP.md](docs/ROADMAP.md).
+`crates/hues-async` is enforced by `tools/check-hues-async-noalloc.py`, wired
+into `make audit-check` and the `static-safety` CI job — no `Box`, `Vec`,
+`String`, `Arc`, `alloc::` or heap-backed collection may appear in that crate,
+in production or in tests.
 
 ## Contributing
 
