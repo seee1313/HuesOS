@@ -227,8 +227,14 @@ priority order.
 - **Policy core landed**: `huesos-waitset` — host-tested multi-object wait
   dispatch (Any/All, cancel, deadline) (see
   [MULTI_OBJECT_WAIT.md](MULTI_OBJECT_WAIT.md)).
-- **Needed (on-target)**: a multiplexed multi-object wait / cancel syscall wired
-  to the scheduler park/wake hooks using the policy crate.
+- **Landed**: `Syscall::WaitSetWait` (#33) in `huesos-syscalls::waitset`
+  plus the `libcanvas::wait_any` / `wait_all` typed wrappers in userspace.
+  ABI signal constants (`huesos_abi::signals::{READABLE, WRITABLE,
+  CANCELED, PEER_CLOSED, SIGNALED}`) live in `huesos-abi` with a host test
+  that pins their numeric layout to `huesos_waitset::Signals`.
+- **Needed (on-target)**: cancellation smoke tests (a canceled handle
+  wakes a pending waiter); explicit level-triggered signal-object type
+  (currently only Channel/Port/Process report signals via `update_waitset_signals`).
 
 ## Short Term
 

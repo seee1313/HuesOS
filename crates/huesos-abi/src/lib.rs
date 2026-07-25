@@ -499,6 +499,35 @@ pub struct ChannelConsumeArgs {
     pub out_handles: *mut u32,
 }
 
+/// Signal bits used by [`Syscall::WaitSetWait`]. Kept in the ABI crate as
+/// plain `u32` constants (rather than pulled from `huesos-waitset`) so
+/// userspace does not need to depend on the kernel-side policy crate.
+/// The numeric values must match `huesos_waitset::Signals::*` bit for bit;
+/// a host test in this crate locks that contract in.
+pub mod signals {
+    /// No signals set.
+    pub const NONE: u32 = 0;
+    /// Object is readable (e.g. a channel has queued messages).
+    pub const READABLE: u32 = 1 << 0;
+    /// Object is writable (e.g. a channel has buffer space).
+    pub const WRITABLE: u32 = 1 << 1;
+    /// Object was canceled (e.g. its handle was closed).
+    pub const CANCELED: u32 = 1 << 2;
+    /// The peer end was closed.
+    pub const PEER_CLOSED: u32 = 1 << 3;
+    /// Generic user signal (events, process exit, ...).
+    pub const SIGNALED: u32 = 1 << 4;
+}
+
+/// Wait-completion mode passed to [`Syscall::WaitSetWait`] via
+/// [`WaitSetWaitArgs::mode`]. Must match `huesos_waitset::WaitMode`.
+pub mod wait_mode {
+    /// Return when any item's awaited signals become active.
+    pub const ANY: u32 = 0;
+    /// Return only when every item's awaited signals become active.
+    pub const ALL: u32 = 1;
+}
+
 /// One item in a [`Syscall::WaitSetWait`] request: a handle and the
 /// signals the caller is waiting for, tagged with a user key.
 #[repr(C)]
@@ -644,5 +673,23 @@ mod tests {
     fn peer_closed_error_round_trips() {
         assert_eq!(ErrorCode::from_raw(-22), Some(ErrorCode::PeerClosed));
         assert_eq!(ErrorCode::PeerClosed.as_str(), "channel peer closed");
+    }
+
+    #[test]
+    fn waitset_signal_bits_are_stable_abi() {
+        // These numeric values are the ABI contract with userspace. Every
+        // libcanvas caller passes them through as u32 into WaitSetWaitArgs,
+        // and the kernel parses them via `huesos_waitset::Signals::from_bits`.
+        // The kernel-side Signals bit layout must not diverge from these
+        // constants; if it does, this host test fails before the divergence
+        // can reach users.
+        assert_eq!(super::signals::NONE, 0);
+        assert_eq!(super::signals::READABLE, 1 << 0);
+        assert_eq!(super::signals::WRITABLE, 1 << 1);
+        assert_eq!(super::signals::CANCELED, 1 << 2);
+        assert_eq!(super::signals::PEER_CLOSED, 1 << 3);
+        assert_eq!(super::signals::SIGNALED, 1 << 4);
+        assert_eq!(super::wait_mode::ANY, 0);
+        assert_eq!(super::wait_mode::ALL, 1);
     }
 }
