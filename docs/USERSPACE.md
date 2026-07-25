@@ -83,11 +83,45 @@ Two non-negotiable requirements for any HuesOS program:
 |---|---|
 | `libcanvas::vmo::Vmo` | Anonymous memory blocks: `create`, `read`, `write`. |
 | `libcanvas::channel::Channel` | IPC: `pair()`, `write`, `read`/`read_into`. |
+| `libcanvas::port::Port` | Queue for interrupt / user packets. |
 | `libcanvas::handle::Handle` | The RAII base every handle-owning type builds on. Closes itself on `Drop`. |
 | `libcanvas::framebuffer::Canvas` | Off-screen drawing surface + `present()` to blit to the real screen. |
+| `libcanvas::waitset::{wait_any, wait_all}` | Multiplex a single block across several handles (Channel/Port/Process) with an optional tick timeout — use this instead of busy-polling. |
 | `libcanvas::debug` / `println!`/`print!` | Write to the kernel's serial debug console (the only "stdout" today). |
 | `libcanvas::process` | `exit(code)`, `yield_now()`. |
 | `libcanvas::ErrorCode` | The error type every fallible call returns. |
+
+### Multiplexed waits — the driver event loop
+
+A driver that listens on both a control Channel and a device Port used to
+`sys_yield` in a loop, burning CPU while both endpoints were quiet. The
+`wait_any` / `wait_all` wrappers block once until any (or all) of the given
+handles have their awaited signals active, with an optional
+scheduler-tick timeout. Every handle must carry `rights::READ`; up to
+`libcanvas::waitset::MAX_ITEMS` (16) handles per call.
+
+```ignore
+use libcanvas::{wait_any, Signals, WaitItem};
+
+const CTRL_KEY: u64 = 0;
+const PORT_KEY: u64 = 1;
+
+let items = [
+    WaitItem::new(ctrl.handle_value(), Signals::READABLE | Signals::PEER_CLOSED, CTRL_KEY),
+    WaitItem::new(port.handle_value(), Signals::READABLE,                       PORT_KEY),
+];
+
+loop {
+    let outcome = wait_any(&items, /* timeout_ticks */ 0)?;
+    for result in outcome.satisfied() {
+        match result.key {
+            CTRL_KEY => { /* drain ctrl */ }
+            PORT_KEY => { /* drain port */ }
+            _ => {}
+        }
+    }
+}
+```
 
 Every fallible function returns `libcanvas::Result<T>` (`Result<T,
 ErrorCode>`) — handle it with `?`, `match`, or at minimum acknowledge it

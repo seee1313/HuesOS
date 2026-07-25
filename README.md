@@ -109,8 +109,9 @@ Default `scripts/run.sh` uses `-smp 2`.
   metadata is retained and the global object registry still needs a complete
   strong/weak-reference lifecycle (ordinary last-handle close does not yet
   unregister every object)
-- Dynamic process launch and blocking `ProcessWait` work, but supervision,
-  cancellation, and multi-object waits remain MVP-level
+- Dynamic process launch and blocking `ProcessWait` work; multi-object wait
+  (`WaitSetWait` syscall + `libcanvas::wait_any` / `wait_all`) is landed,
+  but supervision and cancellation remain MVP-level
 - No dynamic loading / relocations (static ELF only)
 - Capability rights are enforced on current handle syscalls; VMO memory and
   bounded IPC queue quotas are active, but handle/CPU/page-table accounting
