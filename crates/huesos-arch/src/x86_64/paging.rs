@@ -168,10 +168,16 @@ pub fn map_page(
 /// - The PMM must be initialized so intermediate page-table frames can be
 ///   allocated if a new PT/PD is needed.
 pub fn map_hhdm_range(phys_base: u64, length: u64) -> Result<(), KernelPageError> {
+    // W^X for HHDM data windows: ACPI/RSDP/MMIO ranges never need to be
+    // executed from, and marking them NX blocks a write-what-where in the
+    // higher half from being reused as a code-execution gadget. Callers
+    // that genuinely need executable HHDM pages must use
+    // `map_hhdm_range_flags` with an explicit flag set (there are none in
+    // the current kernel).
     map_hhdm_range_flags(
         phys_base,
         length,
-        PageTableFlags::PRESENT | PageTableFlags::WRITABLE,
+        PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::NO_EXECUTE,
     )
 }
 
@@ -190,6 +196,12 @@ pub fn map_hhdm_range_flags(
 /// CR3 it still loads RSP/entry from absolute addresses `0x7008` / `0x7010`.
 /// Base revision 3 dropped the unconditional low 4 GiB identity map, so we
 /// must reinstall the few pages the trampoline needs.
+///
+/// Deliberately **not** `NO_EXECUTE`: the trampoline itself executes from
+/// this range (it jumps to `AP_TRAMPOLINE_PHYS` in long mode before hopping
+/// into the higher-half kernel), so setting NX here would #GP the AP on
+/// its first instruction. Callers that only need a data identity mapping
+/// should compose `map_phys_range` with their own flag set.
 pub fn map_identity_range(phys_base: u64, length: u64) -> Result<(), KernelPageError> {
     map_phys_range(
         phys_base,
@@ -554,11 +566,22 @@ unsafe fn free_page_table_recursive(table_phys: u64, level: u8, owned: &mut allo
 }
 
 /// Common page flag combinations.
+///
+/// Kernel-side data mappings default to W^X: every `KERNEL_RW`-flagged page
+/// is `NO_EXECUTE`. The kernel's own `.text` is mapped by Limine with its
+/// own flags and is unaffected. New kernel data mappings created through
+/// this module (heap pages via `init::heap_init`, ACPI/RSDP windows via
+/// `map_hhdm_range`, and future kernel stacks) therefore cannot be reached
+/// as a code-execution gadget even if a write-what-where primitive lands in
+/// heap memory. EFER.NXE is enabled by `cpu::enable_memory_protection` on
+/// every CPU before any of these mappings are installed.
 pub mod flags {
     use x86_64::structures::paging::PageTableFlags as F;
 
-    /// Kernel read/write, not user accessible.
-    pub const KERNEL_RW: F = F::from_bits_truncate(F::PRESENT.bits() | F::WRITABLE.bits());
+    /// Kernel read/write, not user accessible, not executable (W^X).
+    pub const KERNEL_RW: F = F::from_bits_truncate(
+        F::PRESENT.bits() | F::WRITABLE.bits() | F::NO_EXECUTE.bits(),
+    );
     /// User read/write.
     pub const USER_RW: F =
         F::from_bits_truncate(F::PRESENT.bits() | F::WRITABLE.bits() | F::USER_ACCESSIBLE.bits());
