@@ -52,6 +52,8 @@ The context-switch and ring0→ring3 assembly boundaries call `assert_no_ranked_
 
 Rank tracking starts after `init_gs_base`. HuesOS deliberately keeps pre-GS serial/GDT bootstrap locks unranked; AP and BSP initialization install their unique tracker index before allocator, scheduler, object, or firmware runtime work begins.
 
+`huesos-pmm` is an intentional exception to the ranked-lock migration. It runs before `init_gs_base` on the BSP (the PMM must exist before any per-CPU state can be allocated) and is exercised by host tests that cannot execute per-CPU GS machinery. Instead of `RankedIrqSafeTicketLock`, the PMM uses `spin::Mutex` wrapped in a crate-local `IrqGuard` that masks local interrupts around every `lock()` call. This closes the concrete deadlock "IRQ-context path re-enters `alloc_frame` while the same CPU already holds the PMM lock" without dragging the ranked-lock machinery into a host-testable crate. See `docs/UNSAFE_AUDIT.md § "PMM IRQ-guard boundary"` for the safety-budget review of the two new `asm!` sites.
+
 ## Review checklist
 
 For every new lock or acquisition:

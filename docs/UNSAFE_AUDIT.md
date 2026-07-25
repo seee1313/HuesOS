@@ -405,3 +405,51 @@ This section is a **retroactive dedicated-review record**: CONTRIBUTING §1
 requires the review to ship in the same commit that raises the budget; the
 NVMe commit did not include it. The `HuesOS Dev` production-hardening effort
 is filing this record now so the audit trail is not silently missing.
+
+## PMM IRQ-guard boundary (dedicated safety-budget review)
+
+`huesos-pmm` runs behind a single `spin::Mutex<Option<BitmapAllocator>>`.
+Ordinary kernel code and `alloc_frame` / `free_frame` calls from IRQ-context
+paths (notably the page-fault handler asking the mapper for a fresh
+page-table frame) share the same lock. A plain `Mutex::lock()` can therefore
+deadlock the local CPU when a re-entrant IRQ tries to acquire a lock the
+same CPU already holds.
+
+`huesos-pmm` is intentionally *not* on the privileged-crate list enforced by
+`tools/check-lock-policy.py`, because host tests (`cargo test -p huesos-pmm`)
+cannot execute the per-CPU GS-BASE machinery that
+`huesos_arch::RankedIrqSafeTicketLock` depends on. Adding an `huesos-arch`
+dependency would break the tests without adding value on the host.
+
+This PR introduces a minimal IRQ-guard local to `huesos-pmm` — no crate
+dependency — that masks local interrupts around every `ALLOCATOR.lock()`
+call and restores the previous flag on drop. The wrapper is a no-op on
+non-x86_64 host builds and two `asm!` sites on the real kernel target:
+
+- `IrqGuard::acquire`: one `unsafe { asm!("pushfq; pop {}; cli", ...) }`
+  reads RFLAGS and masks interrupts. **SAFETY invariant:** `pushfq` / `cli`
+  are always safe on x86_64; the block accesses no memory (`options(nomem)`),
+  writes only a scratch register constrained by `out(reg)`, and does not
+  perturb anything the compiler could reason about besides IF.
+- `IrqGuard::drop`: one `unsafe { asm!("sti", ...) }` only when the caller
+  observed IF=1 on entry. **SAFETY invariant:** `sti` is always safe on
+  x86_64; it only unmasks interrupts on the local CPU and has no memory
+  effect (`options(nomem)`).
+
+`safety-budget.json` moves in this PR:
+
+- `unsafe_blocks`: 232 -> 234 (+2): the two `asm!` sites above.
+- `crates/huesos-pmm/src/lib.rs`: unsafe surface 5 -> 7.
+- No other counter changes.
+
+Both increases are irreducible for the design: any lock wrapper that
+disables interrupts on x86 must execute the two instructions, and merging
+the two sites into a single `asm!` block would collapse two distinct
+SAFETY contracts (RMW-of-RFLAGS+mask vs. unmask) into one, which is worse
+for review clarity than the +2 counter delta.
+
+The alternative — moving `huesos-pmm` to `RankedIrqSafeTicketLock` — would
+require making the crate not host-testable (or gating the whole allocator
+under `#[cfg(target_arch = "x86_64")]`), which is a much larger design
+change than the deadlock this PR closes. It remains a follow-up option if
+future work makes per-CPU GS available under host tests.
