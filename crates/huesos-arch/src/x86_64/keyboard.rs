@@ -1,138 +1,18 @@
-//! Minimal PS/2 keyboard driver (US QWERTY scancode set 1).
+//! PS/2 controller helpers that must remain kernel-side.
 //!
-//! This is a small, real driver (not a stub): it decodes scancode set 1
-//! into ASCII where possible, tracks shift state, and pushes decoded bytes
-//! into a ring buffer that userspace/kernel consumers can drain via
-//! [`read_char`].
-
-use crate::{LockRank, RankedIrqSafeTicketLock};
-use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-
-const BUFFER_SIZE: usize = 256;
-
-struct RingBuffer {
-    data: [u8; BUFFER_SIZE],
-    head: usize,
-    tail: usize,
-}
-
-impl RingBuffer {
-    const fn new() -> Self {
-        Self {
-            data: [0; BUFFER_SIZE],
-            head: 0,
-            tail: 0,
-        }
-    }
-
-    fn push(&mut self, byte: u8) {
-        let next = (self.head + 1) % BUFFER_SIZE;
-        if next != self.tail {
-            self.data[self.head] = byte;
-            self.head = next;
-        }
-    }
-
-    fn pop(&mut self) -> Option<u8> {
-        if self.head == self.tail {
-            return None;
-        }
-        let byte = self.data[self.tail];
-        self.tail = (self.tail + 1) % BUFFER_SIZE;
-        Some(byte)
-    }
-}
-
-static BUFFER: RankedIrqSafeTicketLock<RingBuffer> =
-    RankedIrqSafeTicketLock::new(RingBuffer::new(), LockRank::ARCHITECTURE);
-static SHIFT_HELD: AtomicBool = AtomicBool::new(false);
-static BYTES_RECEIVED: AtomicUsize = AtomicUsize::new(0);
-
-// Scancode set 1, unshifted, index = scancode.
-const SET1_LOWER: [u8; 58] = [
-    0, 27, b'1', b'2', b'3', b'4', b'5', b'6', b'7', b'8', b'9', b'0', b'-', b'=', 8, b'\t', b'q',
-    b'w', b'e', b'r', b't', b'y', b'u', b'i', b'o', b'p', b'[', b']', b'\n', 0, b'a', b's', b'd',
-    b'f', b'g', b'h', b'j', b'k', b'l', b';', b'\'', b'`', 0, b'\\', b'z', b'x', b'c', b'v', b'b',
-    b'n', b'm', b',', b'.', b'/', 0, b'*', 0, b' ',
-];
-
-const SET1_UPPER: [u8; 58] = [
-    0, 27, b'!', b'@', b'#', b'$', b'%', b'^', b'&', b'*', b'(', b')', b'_', b'+', 8, b'\t', b'Q',
-    b'W', b'E', b'R', b'T', b'Y', b'U', b'I', b'O', b'P', b'{', b'}', b'\n', 0, b'A', b'S', b'D',
-    b'F', b'G', b'H', b'J', b'K', b'L', b':', b'"', b'~', 0, b'|', b'Z', b'X', b'C', b'V', b'B',
-    b'N', b'M', b'<', b'>', b'?', 0, b'*', 0, b' ',
-];
-
-const LSHIFT_DOWN: u8 = 0x2A;
-const LSHIFT_UP: u8 = 0xAA;
-const RSHIFT_DOWN: u8 = 0x36;
-const RSHIFT_UP: u8 = 0xB6;
-
-/// Wait-queue callback: invoked by the keyboard IRQ handler when a
-/// character is pushed to the ring buffer. The kernel registers a
-/// callback that wakes async futures (and blocking readers) via the
-/// WaitQueue Waker bridge.
-///
-/// This indirection keeps huesos-arch free of huesos-object
-/// dependencies.
-type KeyWakeFn = fn();
-static KEY_WAKE_FN: crate::sync::RankedIrqSafeTicketLock<Option<KeyWakeFn>> =
-    crate::sync::RankedIrqSafeTicketLock::new(None, crate::sync::LockRank::ARCHITECTURE);
-
-/// Register the kernel's wake callback. Called once from kernel init
-/// after the keyboard WaitQueue is set up.
-pub fn set_key_wake_fn(f: KeyWakeFn) {
-    *KEY_WAKE_FN.lock() = Some(f);
-}
-
-/// Called from the IDT keyboard interrupt handler with the raw scancode.
-pub fn on_scancode(scancode: u8) {
-    match scancode {
-        LSHIFT_DOWN | RSHIFT_DOWN => {
-            SHIFT_HELD.store(true, Ordering::Relaxed);
-            return;
-        }
-        LSHIFT_UP | RSHIFT_UP => {
-            SHIFT_HELD.store(false, Ordering::Relaxed);
-            return;
-        }
-        _ => {}
-    }
-
-    // Ignore key-release events (top bit set) for printable keys.
-    if scancode & 0x80 != 0 {
-        return;
-    }
-
-    let idx = scancode as usize;
-    let table = if SHIFT_HELD.load(Ordering::Relaxed) {
-        &SET1_UPPER
-    } else {
-        &SET1_LOWER
-    };
-
-    if idx < table.len() {
-        let ch = table[idx];
-        if ch != 0 {
-            BUFFER.lock().push(ch);
-            BYTES_RECEIVED.fetch_add(1, Ordering::Relaxed);
-            // IRQ -> reactor bridge: invoke the kernel's wake callback.
-            if let Some(f) = *KEY_WAKE_FN.lock() {
-                f();
-            }
-        }
-    }
-}
-
-/// Non-blocking read of a single decoded character, if available.
-pub fn read_char() -> Option<u8> {
-    BUFFER.lock().pop()
-}
-
-/// Total bytes decoded since boot (diagnostic counter).
-pub fn bytes_received() -> usize {
-    BYTES_RECEIVED.load(Ordering::Relaxed)
-}
+//! The PS/2 keyboard **driver itself** (scancode decoding, ring buffer,
+//! wait-queue plumbing) lives in userspace as `driver-host:input`. The
+//! kernel intentionally has no knowledge of scancode set 1, shift state,
+//! ASCII mappings, or wait-queue wakers.
+//!
+//! What remains here are the last unavoidable kernel-side PS/2 touches:
+//!
+//! * [`prepare_shutdown`] disables both 8042 ports on the orderly-halt
+//!   path. The controller is a platform device the kernel must quiesce
+//!   before an unrecoverable `hlt` so no more IRQs are generated while
+//!   the shutdown screen stays on. A follow-up change will move even
+//!   this step behind a userspace shutdown broker via an `IoPort`
+//!   capability, at which point this module can be deleted entirely.
 
 /// Quiesce both PS/2 interfaces before the kernel halts the machine.
 ///
@@ -155,36 +35,6 @@ pub fn prepare_shutdown() {
                 break;
             }
             core::hint::spin_loop();
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Async WaitForKey future (IRQ -> reactor bridge)
-// ---------------------------------------------------------------------------
-
-use core::future::Future;
-use core::pin::Pin;
-use core::task::{Context, Poll};
-
-/// A zero-alloc future that awaits the next keyboard character.
-///
-/// The keyboard IRQ handler invokes the registered wake callback
-/// (via set_key_wake_fn) when a character is pushed. This future
-/// polls read_char() and returns Ready when a character is available.
-pub struct WaitForKey;
-
-impl Future for WaitForKey {
-    type Output = u8;
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        if let Some(ch) = read_char() {
-            Poll::Ready(ch)
-        } else {
-            // No character. Wake ourselves to re-check. The kernel's
-            // wake callback provides actual notification.
-            cx.waker().wake_by_ref();
-            Poll::Pending
         }
     }
 }

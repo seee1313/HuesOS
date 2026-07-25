@@ -194,11 +194,15 @@ extern "x86-interrupt" fn ioapic_keyboard_handler(_stack_frame: InterruptStackFr
 }
 
 fn keyboard_irq_ack(pic: bool) {
+    // The kernel is a thin IRQ shim on IRQ1: read the scancode from the
+    // PS/2 data port, EOI the controller that fired, then hand the raw
+    // byte to userspace via the IRQ callback bridge. Scancode decoding,
+    // shift/lock state, and ring-buffering live in the userspace
+    // `driver-host:input` process.
     super::cpu::clear_user_access();
     use x86_64::instructions::port::Port;
     let mut port: Port<u8> = Port::new(0x60);
     let scancode: u8 = unsafe { port.read() };
-    crate::x86_64::keyboard::on_scancode(scancode);
     if pic {
         unsafe {
             super::interrupts::PICS.lock().notify_end_of_interrupt(33);

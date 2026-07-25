@@ -696,3 +696,41 @@ surfaces here even if the debug boot smoke is green). The job:
    absence of the explicit failure marker `[extable-test] FAILED`.
 5. Uploads the serial log as an artifact even on failure so a
    regression can be triaged from the CI UI.
+
+## Kernel PS/2 driver removed from `huesos-arch`
+
+`crates/huesos-arch/src/x86_64/keyboard.rs` previously bundled a full PS/2
+keyboard driver into the kernel image: scancode-set-1 tables (`SET1_LOWER`,
+`SET1_UPPER`), a 256-byte ranked ring buffer, shift-state tracking, an
+IRQ→reactor wake callback (`KEY_WAKE_FN` + `set_key_wake_fn`), and the
+`WaitForKey` future. The consumers of that API (`read_char`, `bytes_received`,
+`WaitForKey`, `set_key_wake_fn`) had zero call sites — the wake callback was
+never installed and the buffer was never drained. The IDT handler
+(`keyboard_irq_ack`) was calling `on_scancode` purely to feed a dead consumer;
+the live scancode path is `crate::x86_64::irq_callback::emit(1, byte)`, which
+delivers to the userspace `driver-host:input` process that owns its own
+decoder.
+
+This change deletes the driver body, leaves only `prepare_shutdown` behind
+(the last unavoidable kernel-side PS/2 touch, scheduled for removal once the
+userspace `IoPort` capability + `shutdown-broker` land), and simplifies
+`keyboard_irq_ack` to `read port 0x60 → EOI → forward via irq_callback`.
+
+`safety-budget.json` moves in this PR:
+
+- `unsafe_blocks`: 244 → 244 (unchanged; both remaining blocks are the
+  `status.read()` and `command.write()` calls inside `prepare_shutdown`,
+  which are not touched).
+- `unsafe_functions`: 59 → 59 (unchanged).
+- `unsafe_impls`: 28 → 28 (unchanged).
+- `rust_lines`: net −~150 lines (the deleted driver body).
+
+No new unsafe is introduced. `per-file` counts:
+- `crates/huesos-arch/src/x86_64/keyboard.rs` remains at 2 unsafe blocks.
+- `crates/huesos-arch/src/x86_64/idt.rs` remains at its current count
+  (the removed line was safe Rust — a function call).
+
+The IDT change is behaviour-preserving for the live path: `irq_callback::emit`
+is invoked with the same `(1, scancode)` arguments in the same order relative
+to EOI. The only observable difference is that the kernel no longer performs
+scancode decoding into a buffer nobody reads.
