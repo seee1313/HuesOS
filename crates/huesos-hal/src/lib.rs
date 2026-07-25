@@ -24,5 +24,7 @@ pub fn early_panic(msg: &str) -> ! {
     for b in msg.bytes() {
         serial::write_byte(b);
     }
-    loop { huesos_arch::hlt(); }
+    loop {
+        huesos_arch::hlt();
+    }
 }

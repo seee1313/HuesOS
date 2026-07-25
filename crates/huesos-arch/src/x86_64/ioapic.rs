@@ -6,8 +6,8 @@
 
 use core::sync::atomic::{AtomicBool, Ordering};
 use huesos_ioapic::{
-    entry_for_legacy_irq, parse_source_overrides, route_gsi, IoApicDescriptor,
-    RedirectionEntry, VectorAllocator,
+    entry_for_legacy_irq, parse_source_overrides, route_gsi, IoApicDescriptor, RedirectionEntry,
+    VectorAllocator,
 };
 use x86_64::structures::paging::PageTableFlags;
 
@@ -74,13 +74,8 @@ pub fn init_keyboard(madt_bytes: &[u8]) -> Result<(), IoApicError> {
     }
 
     let mut vectors = VectorAllocator::new(KEYBOARD_VECTOR, KEYBOARD_VECTOR);
-    let (gsi, entry) = entry_for_legacy_irq(
-        1,
-        &overrides,
-        &mut vectors,
-        super::lapic::id() as u8,
-    )
-    .ok_or(IoApicError::NoRoute)?;
+    let (gsi, entry) = entry_for_legacy_irq(1, &overrides, &mut vectors, super::lapic::id() as u8)
+        .ok_or(IoApicError::NoRoute)?;
     let (ioapic_id, pin) = route_gsi(&descriptors[..count], gsi).ok_or(IoApicError::NoRoute)?;
     let index = descriptors[..count]
         .iter()
@@ -136,4 +131,3 @@ fn write_data(base: u64, value: u32) {
     // SAFETY: init mapped the I/O APIC's IOWIN register as uncached MMIO.
     unsafe { core::ptr::write_volatile(pointer, value) };
 }
-

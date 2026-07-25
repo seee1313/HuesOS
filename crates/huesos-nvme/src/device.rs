@@ -78,7 +78,13 @@ mod tests {
 
     #[test]
     fn bar_contains_and_phys() {
-        let bar = BarRegion { index: 0, base: 0xFE00_0000, size: 0x4000, is_memory: true, prefetchable: false };
+        let bar = BarRegion {
+            index: 0,
+            base: 0xFE00_0000,
+            size: 0x4000,
+            is_memory: true,
+            prefetchable: false,
+        };
         assert!(bar.contains(0));
         assert!(bar.contains(0x3FFF));
         assert!(!bar.contains(0x4000));
@@ -87,7 +93,11 @@ mod tests {
 
     #[test]
     fn dma_fits_and_translate() {
-        let dma = DmaRegion { phys: 0x100_0000, virt: 0x7000_0000_0000, size: 0x10_0000 };
+        let dma = DmaRegion {
+            phys: 0x100_0000,
+            virt: 0x7000_0000_0000,
+            size: 0x10_0000,
+        };
         assert!(dma.fits(0, 0x10_0000));
         assert!(!dma.fits(1, 0x10_0000)); // would exceed
         assert!(!dma.fits(u64::MAX, 1)); // overflow-safe
@@ -98,8 +108,18 @@ mod tests {
     #[test]
     fn device_resources_compose() {
         let res = DeviceResources {
-            reg_bar: BarRegion { index: 0, base: 0xFE00_0000, size: 0x4000, is_memory: true, prefetchable: false },
-            dma: DmaRegion { phys: 0x100_0000, virt: 0x7000_0000_0000, size: 0x10_0000 },
+            reg_bar: BarRegion {
+                index: 0,
+                base: 0xFE00_0000,
+                size: 0x4000,
+                is_memory: true,
+                prefetchable: false,
+            },
+            dma: DmaRegion {
+                phys: 0x100_0000,
+                virt: 0x7000_0000_0000,
+                size: 0x10_0000,
+            },
         };
         // The driver maps register offset 0x14 (CC) to BAR phys, and DMA offset
         // 0 to the DMA window phys/virt.

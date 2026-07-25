@@ -76,9 +76,8 @@ const RSHIFT_UP: u8 = 0xB6;
 /// This indirection keeps huesos-arch free of huesos-object
 /// dependencies.
 type KeyWakeFn = fn();
-static KEY_WAKE_FN: crate::sync::RankedIrqSafeTicketLock<
-    Option<KeyWakeFn>,
-> = crate::sync::RankedIrqSafeTicketLock::new(None, crate::sync::LockRank::ARCHITECTURE);
+static KEY_WAKE_FN: crate::sync::RankedIrqSafeTicketLock<Option<KeyWakeFn>> =
+    crate::sync::RankedIrqSafeTicketLock::new(None, crate::sync::LockRank::ARCHITECTURE);
 
 /// Register the kernel's wake callback. Called once from kernel init
 /// after the keyboard WaitQueue is set up.

@@ -43,8 +43,20 @@ fn parse_fadt_system_io(bytes: &[u8]) -> Result<Vec<SystemIoGrant>, PolicyError>
     add_grant(&mut grants, read_u32(bytes, 60)?, pm1_event_len, true, true);
 
     let pm1_control_len = bytes[89];
-    add_grant(&mut grants, read_u32(bytes, 64)?, pm1_control_len, true, true);
-    add_grant(&mut grants, read_u32(bytes, 68)?, pm1_control_len, true, true);
+    add_grant(
+        &mut grants,
+        read_u32(bytes, 64)?,
+        pm1_control_len,
+        true,
+        true,
+    );
+    add_grant(
+        &mut grants,
+        read_u32(bytes, 68)?,
+        pm1_control_len,
+        true,
+        true,
+    );
 
     add_grant(&mut grants, read_u32(bytes, 72)?, bytes[90], true, true);
     add_grant(&mut grants, read_u32(bytes, 76)?, bytes[91], true, false);
@@ -60,20 +72,17 @@ fn read_u32(bytes: &[u8], offset: usize) -> Result<u32, PolicyError> {
     Ok(u32::from_le_bytes([field[0], field[1], field[2], field[3]]))
 }
 
-fn add_grant(
-    grants: &mut Vec<SystemIoGrant>,
-    base: u32,
-    length: u8,
-    read: bool,
-    write: bool,
-) {
+fn add_grant(grants: &mut Vec<SystemIoGrant>, base: u32, length: u8, read: bool, write: bool) {
     if base == 0 || length == 0 || grants.len() == MAX_FADT_GRANTS {
         return;
     }
     let Ok(base) = u16::try_from(base) else {
         return;
     };
-    if (base as u32).checked_add(length as u32).is_none_or(|end| end > 0x1_0000) {
+    if (base as u32)
+        .checked_add(length as u32)
+        .is_none_or(|end| end > 0x1_0000)
+    {
         return;
     }
     grants.push(SystemIoGrant {
@@ -104,11 +113,13 @@ mod tests {
         let grants = parse_fadt_system_io(&fadt);
         assert_eq!(grants.as_ref().map(|ranges| ranges.len()), Ok(4));
         assert!(grants.as_ref().is_ok_and(|ranges| {
-            ranges.iter().any(|range| range.base == 0x408 && range.read && !range.write)
+            ranges
+                .iter()
+                .any(|range| range.base == 0x408 && range.read && !range.write)
         }));
-        assert!(grants.as_ref().is_ok_and(|ranges| {
-            ranges.iter().all(|range| range.base != 0xffff)
-        }));
+        assert!(grants
+            .as_ref()
+            .is_ok_and(|ranges| { ranges.iter().all(|range| range.base != 0xffff) }));
     }
 
     #[test]

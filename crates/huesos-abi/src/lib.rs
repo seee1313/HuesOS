@@ -499,7 +499,6 @@ pub struct ChannelConsumeArgs {
     pub out_handles: *mut u32,
 }
 
-
 /// One item in a [`Syscall::WaitSetWait`] request: a handle and the
 /// signals the caller is waiting for, tagged with a user key.
 #[repr(C)]
@@ -582,7 +581,6 @@ pub struct VmarMapArgs {
     /// Mapping options/permissions from [`vmar_flags`].
     pub flags: u32,
 }
-
 
 /// Arguments for [`Syscall::VmarUnmap`] and [`Syscall::VmarProtect`].
 ///

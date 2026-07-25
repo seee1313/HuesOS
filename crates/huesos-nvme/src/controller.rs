@@ -136,9 +136,7 @@ impl<T: NvmeTransport> Controller<T> {
         if nlb == 0 {
             return Err(NvmeError::InvalidArgs);
         }
-        let end = lba
-            .checked_add(nlb as u64)
-            .ok_or(NvmeError::OutOfRange)?;
+        let end = lba.checked_add(nlb as u64).ok_or(NvmeError::OutOfRange)?;
         if end > self.nsze {
             return Err(NvmeError::OutOfRange);
         }
@@ -213,7 +211,10 @@ impl<T: NvmeTransport> Controller<T> {
         self.admin_sq = self.dma_alloc(self.admin_size as u64 * 64, ps)?;
         self.admin_cq = self.dma_alloc(self.admin_size as u64 * 16, ps)?;
 
-        self.t.write32(off::AQA, aqa::build(self.admin_size as u32, self.admin_size as u32));
+        self.t.write32(
+            off::AQA,
+            aqa::build(self.admin_size as u32, self.admin_size as u32),
+        );
         self.t.write64(off::ASQ, self.admin_sq);
         self.t.write64(off::ACQ, self.admin_cq);
 
@@ -231,14 +232,28 @@ impl<T: NvmeTransport> Controller<T> {
         }
 
         self.identify_buf = self.dma_alloc(4096, ps)?;
-        self.admin_command(build::identify(identify::CONTROLLER, 0, 0, self.identify_buf))?;
-        self.admin_command(build::identify(identify::NAMESPACE, 0, 1, self.identify_buf))?;
+        self.admin_command(build::identify(
+            identify::CONTROLLER,
+            0,
+            0,
+            self.identify_buf,
+        ))?;
+        self.admin_command(build::identify(
+            identify::NAMESPACE,
+            0,
+            1,
+            self.identify_buf,
+        ))?;
 
         let mut id = [0u8; 4096];
         self.t.dma_read(self.identify_buf, &mut id);
         self.nsze = u64::from_le_bytes([id[0], id[1], id[2], id[3], id[4], id[5], id[6], id[7]]);
         let lbads = id[128 + 2];
-        self.lba_size = if (9..=16).contains(&lbads) { 1u32 << lbads } else { 512 };
+        self.lba_size = if (9..=16).contains(&lbads) {
+            1u32 << lbads
+        } else {
+            512
+        };
 
         self.admin_command(build::set_number_of_queues(1, 1))?;
 
@@ -309,7 +324,10 @@ impl<T: NvmeTransport> Controller<T> {
         if cqe.is_success() {
             Ok(())
         } else {
-            Err(NvmeError::CommandFailed { sct: cqe.sct(), sc: cqe.sc() })
+            Err(NvmeError::CommandFailed {
+                sct: cqe.sct(),
+                sc: cqe.sc(),
+            })
         }
     }
 
@@ -351,7 +369,11 @@ impl<T: NvmeTransport> Controller<T> {
 
     /// Allocate the data buffer + PRP and submit a Read; returns
     /// `(cid, dma_addr, nbytes)`. The completion is awaited separately.
-    pub(crate) fn prepare_read(&mut self, lba: u64, nlb: u16) -> Result<(u16, u64, u64), NvmeError> {
+    pub(crate) fn prepare_read(
+        &mut self,
+        lba: u64,
+        nlb: u16,
+    ) -> Result<(u16, u64, u64), NvmeError> {
         let nbytes = self.checked_io_bytes(lba, nlb)?;
         let dma = self.dma_alloc(nbytes, self.page_size as u64)?;
         let (prp1, prp2) = self.setup_prp(dma, nbytes)?;
@@ -516,5 +538,4 @@ mod tests {
         assert!(c.init().is_ok());
         c
     }
-
 }

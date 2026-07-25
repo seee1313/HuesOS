@@ -282,7 +282,11 @@ mod tests {
         assert_eq!(p.exit_code(), Some(7));
         assert_eq!(
             p.exit_info(),
-            Some(ExitInfo { koid: 1, generation: 1, exit_code: 7 })
+            Some(ExitInfo {
+                koid: 1,
+                generation: 1,
+                exit_code: 7
+            })
         );
     }
 
@@ -370,7 +374,11 @@ mod tests {
         // Exit info remains observable after reap.
         assert_eq!(
             p.exit_info(),
-            Some(ExitInfo { koid: 1, generation: 1, exit_code: 5 })
+            Some(ExitInfo {
+                koid: 1,
+                generation: 1,
+                exit_code: 5
+            })
         );
     }
 
@@ -390,5 +398,4 @@ mod tests {
         assert_eq!(p.waiter_count(), 0);
         assert!(p.can_reap());
     }
-
 }

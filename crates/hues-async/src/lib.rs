@@ -169,7 +169,12 @@ impl<const TASKS: usize, const F: usize, B: Backend> Executor<TASKS, F, B> {
     ///
     /// Compile-time asserts `TASKS <= 64`.
     pub fn new_with(backend: B) -> Self {
-        const { assert!(TASKS <= 64, "hues-async: TASKS must be <= 64 (u64 ready mask)") };
+        const {
+            assert!(
+                TASKS <= 64,
+                "hues-async: TASKS must be <= 64 (u64 ready mask)"
+            )
+        };
         Self {
             ready: Cell::new(0),
             count: Cell::new(0),
@@ -775,7 +780,9 @@ mod tests {
 
         fn noop_park() {}
         fn noop_wake(_slot: u32) {}
-        fn noop_ticks() -> u64 { 0 }
+        fn noop_ticks() -> u64 {
+            0
+        }
 
         // Works with both KernelBackend and UserBackend.
         let kb = KernelBackend::new(noop_park, noop_wake, noop_ticks);
@@ -812,7 +819,9 @@ mod tests {
 
         fn noop_park() {}
         fn noop_wake(_slot: u32) {}
-        fn noop_ticks() -> u64 { 0 }
+        fn noop_ticks() -> u64 {
+            0
+        }
 
         let backend = KernelBackend::new(noop_park, noop_wake, noop_ticks);
         let local_data = 42u32;
@@ -839,7 +848,9 @@ mod tests {
 
         fn noop_park() {}
         fn noop_wake(_slot: u32) {}
-        fn noop_ticks() -> u64 { 0 }
+        fn noop_ticks() -> u64 {
+            0
+        }
 
         let backend = KernelBackend::new(noop_park, noop_wake, noop_ticks);
         let ex = Executor::<4, 64, _>::new_with(backend);

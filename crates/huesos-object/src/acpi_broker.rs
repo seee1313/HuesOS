@@ -5,7 +5,7 @@ use alloc::vec::Vec;
 use core::any::Any;
 use huesos_abi::acpi_broker::{Opcode, ValidRequest};
 
-use crate::{KernelObject, Koid, ObjectType, alloc_koid};
+use crate::{alloc_koid, KernelObject, Koid, ObjectType};
 
 /// Exact SystemIO range granted to one ACPI manager instance.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -107,7 +107,9 @@ impl AcpiBroker {
         let function = ((request.address >> 16) & 0x07) as u8;
         let offset = (request.address & 0x0fff) as u16;
         if request.address & 0xffff_0000_0000_f000 != 0
-            || offset.checked_add(request.width as u16).is_none_or(|end| end > 4096)
+            || offset
+                .checked_add(request.width as u16)
+                .is_none_or(|end| end > 4096)
         {
             return false;
         }
@@ -155,7 +157,9 @@ mod tests {
             ..Request::default()
         };
         let validated = request.validate();
-        assert!(validated.as_ref().is_ok_and(|request| !AcpiBroker::deny_all().authorizes(request)));
+        assert!(validated
+            .as_ref()
+            .is_ok_and(|request| !AcpiBroker::deny_all().authorizes(request)));
     }
 
     #[test]
@@ -187,7 +191,11 @@ mod tests {
             ..Request::default()
         }
         .validate();
-        assert!(read.as_ref().is_ok_and(|request| broker.authorizes(request)));
-        assert!(write.as_ref().is_ok_and(|request| !broker.authorizes(request)));
+        assert!(read
+            .as_ref()
+            .is_ok_and(|request| broker.authorizes(request)));
+        assert!(write
+            .as_ref()
+            .is_ok_and(|request| !broker.authorizes(request)));
     }
 }

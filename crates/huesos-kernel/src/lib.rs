@@ -269,22 +269,14 @@ fn spawn_init_process(
     );
 
     if let Some(bytes) = bootfs_image {
-        if !install_readonly_vmo(
-            &spawned.process,
-            huesos_abi::INIT_BOOTFS_HANDLE,
-            bytes,
-        ) {
+        if !install_readonly_vmo(&spawned.process, huesos_abi::INIT_BOOTFS_HANDLE, bytes) {
             dbg("[init] failed to install BOOTFS VMO\n");
         }
     } else {
         dbg("[init] HBI BOOTFS module unavailable\n");
     }
     if let Some(bytes) = acpi_archive {
-        if install_readonly_vmo(
-            &spawned.process,
-            huesos_abi::INIT_ACPI_TABLES_HANDLE,
-            bytes,
-        ) {
+        if install_readonly_vmo(&spawned.process, huesos_abi::INIT_ACPI_TABLES_HANDLE, bytes) {
             dbg("[init] installed immutable ACPI table archive VMO\n");
             if install_acpi_broker(&spawned.process, acpi_system_io) {
                 dbg("[init] installed deny-by-default ACPI broker capability\n");
@@ -339,12 +331,8 @@ fn install_acpi_broker(
 ) -> bool {
     use huesos_object::{Handle, KernelObject, Rights};
 
-    let broker = huesos_object::AcpiBroker::with_policy(
-        system_io,
-        alloc::vec::Vec::new(),
-        false,
-        false,
-    );
+    let broker =
+        huesos_object::AcpiBroker::with_policy(system_io, alloc::vec::Vec::new(), false, false);
     let koid = broker.koid();
     huesos_object::register_object(broker);
     let rights = Rights::READ | Rights::WRITE | Rights::TRANSFER;

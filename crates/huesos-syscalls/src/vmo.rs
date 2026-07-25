@@ -45,8 +45,8 @@ fn sys_vmo_create_with_rights(
     user_memory::validate_write(out_handle)?;
 
     let proc = current_proc()?;
-    let vmo = huesos_object::Vmo::new_in_job(size, Some(proc.job()))
-        .map_err(|_| ErrorCode::NoMemory)?;
+    let vmo =
+        huesos_object::Vmo::new_in_job(size, Some(proc.job())).map_err(|_| ErrorCode::NoMemory)?;
     let koid = vmo.koid();
     huesos_object::register_object(vmo);
     let mut rights = Rights::DEFAULT_VMO;

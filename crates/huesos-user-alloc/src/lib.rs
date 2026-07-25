@@ -24,9 +24,7 @@ pub enum PageProtection {
 }
 
 /// Size classes for segregated fits.
-const SIZE_CLASSES: &[usize] = &[
-    16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384,
-];
+const SIZE_CLASSES: &[usize] = &[16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384];
 
 pub struct ScudoAllocator<P: PageProvider> {
     page_provider: P,
@@ -76,11 +74,12 @@ impl<P: PageProvider> ScudoAllocator<P> {
         // simplified: allocate enough pages for the size class plus one guard page.
         let pages_needed = class_size.div_ceil(4096);
         let ptr = self.page_provider.allocate_pages(pages_needed + 1)?;
-        
+
         // Protect the second page as Guard Page
         unsafe {
             let guard_ptr = NonNull::new_unchecked(ptr.as_ptr().add(4096));
-            self.page_provider.protect_page(guard_ptr, PageProtection::NoAccess);
+            self.page_provider
+                .protect_page(guard_ptr, PageProtection::NoAccess);
         }
 
         Some(ptr)

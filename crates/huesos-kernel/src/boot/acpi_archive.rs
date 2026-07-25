@@ -3,7 +3,7 @@
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 use huesos_abi::acpi_broker::{
-    MAX_ARCHIVE_BYTES, MAX_TABLE_BYTES, MAX_TABLES, TABLE_ARCHIVE_ENTRY_BYTES,
+    MAX_ARCHIVE_BYTES, MAX_TABLES, MAX_TABLE_BYTES, TABLE_ARCHIVE_ENTRY_BYTES,
     TABLE_ARCHIVE_HEADER_BYTES, TABLE_ARCHIVE_MAGIC, VERSION,
 };
 
@@ -106,8 +106,8 @@ pub fn build() -> Result<Vec<u8>, ArchiveBuildError> {
     encode_header(&mut archive, count as u32, next_offset);
     for (position, entry) in entries.iter().enumerate() {
         encode_entry(&mut archive, position, entry);
-        let table = huesos_uacpi::Table::get(entry.index)
-            .map_err(|_| ArchiveBuildError::InvalidTable)?;
+        let table =
+            huesos_uacpi::Table::get(entry.index).map_err(|_| ArchiveBuildError::InvalidTable)?;
         let bytes = table.bytes().map_err(|_| ArchiveBuildError::InvalidTable)?;
         if bytes.len() != entry.length as usize {
             return Err(ArchiveBuildError::InvalidTable);

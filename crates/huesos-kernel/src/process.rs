@@ -4,9 +4,9 @@
 use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use huesos_abi::{ErrorCode, VmarMapArgs, VmarOpArgs, vmar_flags};
+use huesos_abi::{vmar_flags, ErrorCode, VmarMapArgs, VmarOpArgs};
 use huesos_arch::gdt;
-use huesos_arch::paging::{AddressSpace, UserPageError, flags};
+use huesos_arch::paging::{flags, AddressSpace, UserPageError};
 use huesos_arch::{LockRank, RankedIrqSafeTicketLock};
 use huesos_elf::{Loader, SegmentFlags};
 use huesos_object::{KernelObject, KernelObjectExt};
@@ -299,9 +299,7 @@ fn page_flags_from_vmar_flags(flags: u32) -> Result<PageTableFlags, ErrorCode> {
     Ok(pt_flags)
 }
 
-fn process_runtime_for_vmar(
-    vmar: &Vmar,
-) -> Result<Arc<Process>, ErrorCode> {
+fn process_runtime_for_vmar(vmar: &Vmar) -> Result<Arc<Process>, ErrorCode> {
     let object = huesos_object::lookup_object(vmar.process()).ok_or(ErrorCode::BadHandle)?;
     let process = object
         .downcast_ref::<Process>()
@@ -314,9 +312,7 @@ fn validate_vmar_op_args(
     args: VmarOpArgs,
     protect: bool,
 ) -> Result<VmarMapping, ErrorCode> {
-    if args.len == 0
-        || !args.addr.is_multiple_of(PAGE_SIZE)
-        || !args.len.is_multiple_of(PAGE_SIZE)
+    if args.len == 0 || !args.addr.is_multiple_of(PAGE_SIZE) || !args.len.is_multiple_of(PAGE_SIZE)
     {
         return Err(ErrorCode::InvalidArgs);
     }
@@ -431,12 +427,18 @@ pub fn protect_vmar_mapping(vmar: &Vmar, args: VmarOpArgs) -> Result<u64, ErrorC
         let page = Page::<Size4KiB>::containing_address(VirtAddr::new(
             mapping.base + index as u64 * PAGE_SIZE,
         ));
-        if runtime.address_space.protect_user_page(page, new_flags).is_err() {
+        if runtime
+            .address_space
+            .protect_user_page(page, new_flags)
+            .is_err()
+        {
             for rollback in 0..changed {
                 let rollback_page = Page::<Size4KiB>::containing_address(VirtAddr::new(
                     mapping.base + rollback as u64 * PAGE_SIZE,
                 ));
-                let _ = runtime.address_space.protect_user_page(rollback_page, old_flags);
+                let _ = runtime
+                    .address_space
+                    .protect_user_page(rollback_page, old_flags);
             }
             return Err(ErrorCode::Internal);
         }
@@ -447,7 +449,9 @@ pub fn protect_vmar_mapping(vmar: &Vmar, args: VmarOpArgs) -> Result<u64, ErrorC
             let rollback_page = Page::<Size4KiB>::containing_address(VirtAddr::new(
                 mapping.base + rollback as u64 * PAGE_SIZE,
             ));
-            let _ = runtime.address_space.protect_user_page(rollback_page, old_flags);
+            let _ = runtime
+                .address_space
+                .protect_user_page(rollback_page, old_flags);
         }
         return Err(ErrorCode::Internal);
     }

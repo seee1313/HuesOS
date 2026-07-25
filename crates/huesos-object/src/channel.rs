@@ -73,7 +73,10 @@ impl MessageQueue {
             || !self.quota.fits(Resource::Memory, bytes)
             || !self.quota.fits(Resource::Handles, handles)
         {
-            return Err(ChannelSendError::new(msg, ChannelSendFailure::QuotaExceeded));
+            return Err(ChannelSendError::new(
+                msg,
+                ChannelSendFailure::QuotaExceeded,
+            ));
         }
 
         // Queue storage is preallocated during channel creation. Never grow
@@ -94,8 +97,7 @@ impl MessageQueue {
 
     fn dequeue(&mut self) -> Option<ChannelMessage> {
         let msg = self.messages.pop_front()?;
-        self.quota
-            .release(Resource::Memory, msg.data.len() as u64);
+        self.quota.release(Resource::Memory, msg.data.len() as u64);
         self.quota
             .release(Resource::Handles, msg.handles.len() as u64);
         Some(msg)
@@ -288,10 +290,7 @@ impl Channel {
             // Enqueue BEFORE checking the condition so we are visible to
             // wakers; re-check while in the queue to close the lost-wakeup
             // race between check and park.
-            let prepared = self
-                .readers
-                .prepare()
-                .ok_or(ChannelRecvError::PeerClosed)?;
+            let prepared = self.readers.prepare().ok_or(ChannelRecvError::PeerClosed)?;
             match self.recv_status()? {
                 Some(msg) => {
                     prepared.cancel();
@@ -318,10 +317,7 @@ impl Channel {
         }
         loop {
             // Prepare first so we are visible to wakers before re-checking.
-            let prepared = self
-                .readers
-                .prepare()
-                .ok_or(ChannelRecvError::PeerClosed)?;
+            let prepared = self.readers.prepare().ok_or(ChannelRecvError::PeerClosed)?;
             if let Some(msg) = self.recv_status()? {
                 prepared.cancel();
                 return Ok(Some(msg));
@@ -374,10 +370,7 @@ impl Channel {
     ) -> Result<ChannelMessage, ChannelRecvError> {
         loop {
             // Enqueue BEFORE checking so we are visible to wakers.
-            let prepared = self
-                .readers
-                .prepare()
-                .ok_or(ChannelRecvError::PeerClosed)?;
+            let prepared = self.readers.prepare().ok_or(ChannelRecvError::PeerClosed)?;
             match self.recv_if_fits(byte_capacity, handle_capacity) {
                 Ok(Some(msg)) => {
                     prepared.cancel();

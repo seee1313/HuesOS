@@ -373,7 +373,9 @@ impl SourceOverrideTable {
 
     /// Iterate the valid overrides.
     pub fn iter(&self) -> impl Iterator<Item = &SourceOverride> {
-        self.entries[..self.count].iter().filter_map(|slot| slot.as_ref())
+        self.entries[..self.count]
+            .iter()
+            .filter_map(|slot| slot.as_ref())
     }
 
     /// Resolve a legacy bus IRQ to a GSI: the override whose `source` matches,
@@ -517,7 +519,8 @@ impl VectorAllocator {
         }
         let cap = self.capacity();
         for offset in 0..cap {
-            let idx = ((self.next as usize - self.start as usize + offset) % cap) + self.start as usize;
+            let idx =
+                ((self.next as usize - self.start as usize + offset) % cap) + self.start as usize;
             if !self.used[idx] {
                 self.used[idx] = true;
                 self.count += 1;
@@ -673,7 +676,10 @@ mod tests {
         assert_eq!(entry.pin_polarity, PinPolarity::ActiveHigh);
         assert_eq!(entry.trigger_mode, TriggerMode::Edge);
         // Mask bit must be set in the encoded value.
-        assert_eq!(entry.to_bits() & RedirectionEntry::MASK_BIT, RedirectionEntry::MASK_BIT);
+        assert_eq!(
+            entry.to_bits() & RedirectionEntry::MASK_BIT,
+            RedirectionEntry::MASK_BIT
+        );
     }
 
     #[test]
@@ -760,23 +766,53 @@ mod tests {
 
     #[test]
     fn override_flag_polarity() {
-        let active_low = SourceOverride { bus: 0, source: 9, gsi: 9, flags: 0b11 };
+        let active_low = SourceOverride {
+            bus: 0,
+            source: 9,
+            gsi: 9,
+            flags: 0b11,
+        };
         assert_eq!(active_low.polarity(), PinPolarity::ActiveLow);
-        let active_high = SourceOverride { bus: 0, source: 1, gsi: 1, flags: 0b01 };
+        let active_high = SourceOverride {
+            bus: 0,
+            source: 1,
+            gsi: 1,
+            flags: 0b01,
+        };
         assert_eq!(active_high.polarity(), PinPolarity::ActiveHigh);
         // Conforming (0b00) maps to the ISA default (active high).
-        let conforming = SourceOverride { bus: 0, source: 0, gsi: 2, flags: 0b00 };
+        let conforming = SourceOverride {
+            bus: 0,
+            source: 0,
+            gsi: 2,
+            flags: 0b00,
+        };
         assert_eq!(conforming.polarity(), PinPolarity::ActiveHigh);
     }
 
     #[test]
     fn override_flag_trigger() {
-        let level = SourceOverride { bus: 0, source: 9, gsi: 9, flags: 0b1100 };
+        let level = SourceOverride {
+            bus: 0,
+            source: 9,
+            gsi: 9,
+            flags: 0b1100,
+        };
         assert_eq!(level.trigger(), TriggerMode::Level);
-        let edge = SourceOverride { bus: 0, source: 1, gsi: 1, flags: 0b0100 };
+        let edge = SourceOverride {
+            bus: 0,
+            source: 1,
+            gsi: 1,
+            flags: 0b0100,
+        };
         assert_eq!(edge.trigger(), TriggerMode::Edge);
         // Conforming (0b00) maps to the ISA default (edge).
-        let conforming = SourceOverride { bus: 0, source: 0, gsi: 2, flags: 0b0000 };
+        let conforming = SourceOverride {
+            bus: 0,
+            source: 0,
+            gsi: 2,
+            flags: 0b0000,
+        };
         assert_eq!(conforming.trigger(), TriggerMode::Edge);
     }
 
@@ -804,7 +840,12 @@ mod tests {
     #[test]
     fn resolve_gsi_applies_override() {
         // The classic ISA IRQ0 -> GSI2 source override.
-        let table = table_with(&[SourceOverride { bus: 0, source: 0, gsi: 2, flags: 0 }]);
+        let table = table_with(&[SourceOverride {
+            bus: 0,
+            source: 0,
+            gsi: 2,
+            flags: 0,
+        }]);
         assert_eq!(table.resolve_gsi(0), 2);
         // Unrelated IRQs are unaffected.
         assert_eq!(table.resolve_gsi(1), 1);
@@ -813,8 +854,18 @@ mod tests {
     #[test]
     fn find_returns_matching_override() {
         let table = table_with(&[
-            SourceOverride { bus: 0, source: 0, gsi: 2, flags: 0 },
-            SourceOverride { bus: 0, source: 9, gsi: 9, flags: 0b1111 },
+            SourceOverride {
+                bus: 0,
+                source: 0,
+                gsi: 2,
+                flags: 0,
+            },
+            SourceOverride {
+                bus: 0,
+                source: 9,
+                gsi: 9,
+                flags: 0b1111,
+            },
         ]);
         assert_eq!(table.len(), 2);
         let found = table.find(9);
@@ -991,8 +1042,16 @@ mod tests {
     #[test]
     fn route_gsi_by_explicit_range() {
         let apics = [
-            IoApicDescriptor { id: 0, gsi_base: 0, pin_count: 24 },
-            IoApicDescriptor { id: 1, gsi_base: 24, pin_count: 24 },
+            IoApicDescriptor {
+                id: 0,
+                gsi_base: 0,
+                pin_count: 24,
+            },
+            IoApicDescriptor {
+                id: 1,
+                gsi_base: 24,
+                pin_count: 24,
+            },
         ];
         assert_eq!(route_gsi(&apics, 0), Some((0, 0)));
         assert_eq!(route_gsi(&apics, 23), Some((0, 23)));
@@ -1006,8 +1065,16 @@ mod tests {
     fn route_gsi_fallback_by_base() {
         // Unknown pin counts (0): fall back to largest gsi_base <= gsi.
         let apics = [
-            IoApicDescriptor { id: 2, gsi_base: 0, pin_count: 0 },
-            IoApicDescriptor { id: 3, gsi_base: 16, pin_count: 0 },
+            IoApicDescriptor {
+                id: 2,
+                gsi_base: 0,
+                pin_count: 0,
+            },
+            IoApicDescriptor {
+                id: 3,
+                gsi_base: 16,
+                pin_count: 0,
+            },
         ];
         assert_eq!(route_gsi(&apics, 5), Some((2, 5)));
         assert_eq!(route_gsi(&apics, 16), Some((3, 0)));
@@ -1016,7 +1083,11 @@ mod tests {
 
     #[test]
     fn route_gsi_no_owner() {
-        let apics = [IoApicDescriptor { id: 0, gsi_base: 10, pin_count: 24 }];
+        let apics = [IoApicDescriptor {
+            id: 0,
+            gsi_base: 10,
+            pin_count: 24,
+        }];
         // GSI below the lowest base has no owner.
         assert_eq!(route_gsi(&apics, 5), None);
         assert!(route_gsi(&[], 0).is_none());
@@ -1081,5 +1152,4 @@ mod tests {
         assert_eq!(table.resolve_gsi(1), 1);
         assert_eq!(table.find(1), None);
     }
-
 }

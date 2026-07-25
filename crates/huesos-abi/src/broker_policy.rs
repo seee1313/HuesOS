@@ -106,10 +106,7 @@ impl<const N: usize> AuditLog<N> {
 
     /// Iterate the retained entries in chronological (insertion) order.
     pub fn iter(&self) -> AuditIter<'_, N> {
-        AuditIter {
-            log: self,
-            pos: 0,
-        }
+        AuditIter { log: self, pos: 0 }
     }
 }
 

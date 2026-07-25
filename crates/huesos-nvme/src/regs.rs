@@ -224,7 +224,7 @@ mod tests {
     #[test]
     fn doorbell_offsets_follow_stride() {
         let stride = 4; // DSTRD = 0
-        // SQ0 tail at base, CQ0 head at base+4, SQ1 tail at base+8.
+                        // SQ0 tail at base, CQ0 head at base+4, SQ1 tail at base+8.
         assert_eq!(doorbell_offset(0, false, stride), 0x1000);
         assert_eq!(doorbell_offset(0, true, stride), 0x1004);
         assert_eq!(doorbell_offset(1, false, stride), 0x1008);

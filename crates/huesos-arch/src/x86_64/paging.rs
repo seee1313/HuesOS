@@ -13,7 +13,6 @@ use x86_64::structures::paging::{
 };
 use x86_64::{PhysAddr, VirtAddr};
 
-
 const TLB_SHOOTDOWN_VECTOR: u8 = 0xF3;
 static TLB_ACTIVE: AtomicBool = AtomicBool::new(false);
 static TLB_START: AtomicU64 = AtomicU64::new(0);

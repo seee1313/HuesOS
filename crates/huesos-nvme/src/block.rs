@@ -7,9 +7,9 @@
 //! FileSystemService / VFS mount consumes that service (the broader #7 goal).
 //! The protocol encoding is host-tested; the Channel transport is on-target.
 
-use alloc::vec::Vec;
 use crate::controller::{Controller, NvmeError};
 use crate::transport::NvmeTransport;
+use alloc::vec::Vec;
 
 /// Static information about a block device.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -119,7 +119,9 @@ pub fn decode_request(msg: &[u8]) -> Option<DecodedRequest<'_>> {
         return None;
     }
     let op = BlockOp::from_byte(msg[0])?;
-    let lba = u64::from_le_bytes([msg[1], msg[2], msg[3], msg[4], msg[5], msg[6], msg[7], msg[8]]);
+    let lba = u64::from_le_bytes([
+        msg[1], msg[2], msg[3], msg[4], msg[5], msg[6], msg[7], msg[8],
+    ]);
     let count = u16::from_le_bytes([msg[9], msg[10]]);
     let data = &msg[REQUEST_HEADER..];
     if data.len() > MAX_REQUEST_DATA {
@@ -131,7 +133,12 @@ pub fn decode_request(msg: &[u8]) -> Option<DecodedRequest<'_>> {
         BlockOp::Flush | BlockOp::Info if count != 0 => return None,
         BlockOp::Read | BlockOp::Write | BlockOp::Flush | BlockOp::Info => {}
     }
-    Some(DecodedRequest { op, lba, count, data })
+    Some(DecodedRequest {
+        op,
+        lba,
+        count,
+        data,
+    })
 }
 
 /// Encode a block response. `payload` is the read data or the Info body.
@@ -156,9 +163,20 @@ pub fn decode_info(payload: &[u8]) -> Option<BlockInfo> {
         return None;
     }
     let block_size = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
-    let block_count =
-        u64::from_le_bytes([payload[4], payload[5], payload[6], payload[7], payload[8], payload[9], payload[10], payload[11]]);
-    Some(BlockInfo { block_size, block_count })
+    let block_count = u64::from_le_bytes([
+        payload[4],
+        payload[5],
+        payload[6],
+        payload[7],
+        payload[8],
+        payload[9],
+        payload[10],
+        payload[11],
+    ]);
+    Some(BlockInfo {
+        block_size,
+        block_count,
+    })
 }
 
 /// Decode a response status word.
@@ -237,7 +255,10 @@ mod tests {
 
     #[test]
     fn info_response_round_trips() {
-        let info = BlockInfo { block_size: 512, block_count: 1_000_000 };
+        let info = BlockInfo {
+            block_size: 512,
+            block_count: 1_000_000,
+        };
         let payload = encode_info(&info);
         let resp = encode_response(0, &payload);
         assert_eq!(decode_status(&resp), Some(0));
@@ -252,5 +273,4 @@ mod tests {
         let zero_count = encode_request(BlockOp::Write, 0, 0, &[]);
         assert!(decode_request(&zero_count).is_none());
     }
-
 }

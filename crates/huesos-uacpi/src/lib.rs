@@ -132,10 +132,7 @@ pub fn table_metadata(index: usize) -> Result<TableMetadata, Error> {
     // SAFETY: info is writable for the complete C structure and uACPI checks
     // the supplied index before initializing it.
     let status = unsafe { uacpi_table_info_get_by_index(index, &mut info) };
-    if status != STATUS_OK
-        || info.index != index
-        || !(36..=MAX_TABLE_BYTES).contains(&info.size)
-    {
+    if status != STATUS_OK || info.index != index || !(36..=MAX_TABLE_BYTES).contains(&info.size) {
         return Err(Error::InvalidTableMetadata);
     }
     let mut signature = [0u8; 4];

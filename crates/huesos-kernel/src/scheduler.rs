@@ -27,8 +27,8 @@ use alloc::vec::Vec;
 use core::ops::{Deref, DerefMut};
 use core::sync::atomic::Ordering;
 use huesos_arch::{LockRank, RankedIrqSafeTicketLock};
-use huesos_object::{KernelObject, Process};
 use huesos_lifecycle::TaskGraveyard;
+use huesos_object::{KernelObject, Process};
 use x86_64::VirtAddr;
 
 /// Maximum number of CPUs supported.
@@ -777,12 +777,7 @@ fn record_process_exit(process: &Process, code: i64) {
     let graveyard = yard.get_or_insert_with(TaskGraveyard::new);
     // ProcessLifecycle owns the generation in ExitInfo. Reusing it here keeps
     // the graveyard record and ProcessWait/reaper observations ABA-safe.
-    let _ = graveyard.record_exit_with_generation(
-        info.koid,
-        info.generation,
-        code,
-        global_ticks(),
-    );
+    let _ = graveyard.record_exit_with_generation(info.koid, info.generation, code, global_ticks());
 }
 
 fn reap_observed_process_exits() {

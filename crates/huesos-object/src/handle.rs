@@ -170,7 +170,9 @@ impl HandleTable {
                 return Err(HandleTableError::Duplicate);
             }
             if value == INVALID_HANDLE
-                || t.get(value as usize).and_then(|slot| slot.as_ref()).is_none()
+                || t.get(value as usize)
+                    .and_then(|slot| slot.as_ref())
+                    .is_none()
             {
                 return Err(HandleTableError::Missing);
             }
