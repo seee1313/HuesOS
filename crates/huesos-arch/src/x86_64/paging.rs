@@ -579,9 +579,8 @@ pub mod flags {
     use x86_64::structures::paging::PageTableFlags as F;
 
     /// Kernel read/write, not user accessible, not executable (W^X).
-    pub const KERNEL_RW: F = F::from_bits_truncate(
-        F::PRESENT.bits() | F::WRITABLE.bits() | F::NO_EXECUTE.bits(),
-    );
+    pub const KERNEL_RW: F =
+        F::from_bits_truncate(F::PRESENT.bits() | F::WRITABLE.bits() | F::NO_EXECUTE.bits());
     /// User read/write.
     pub const USER_RW: F =
         F::from_bits_truncate(F::PRESENT.bits() | F::WRITABLE.bits() | F::USER_ACCESSIBLE.bits());

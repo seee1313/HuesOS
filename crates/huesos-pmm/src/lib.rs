@@ -216,10 +216,7 @@ impl BitmapAllocator {
 /// # Safety
 /// Must be called exactly once, early in boot, before any other PMM function
 /// and while the HHDM mapping supplied by the bootloader is still active.
-pub unsafe fn init(
-    regions: &[MemoryRegion],
-    hhdm_offset: u64,
-) -> Result<(), PmmInitError> {
+pub unsafe fn init(regions: &[MemoryRegion], hhdm_offset: u64) -> Result<(), PmmInitError> {
     // 1. Determine how many frames we need to track.
     // checked_add + saturate: a memory map whose region end overflows u64 is
     // fundamentally broken; saturating to u64::MAX produces a bitmap
@@ -271,8 +268,7 @@ pub unsafe fn init(
         // must not index past the bitmap. Floor division preserves the
         // original semantics: only whole 4 KiB frames that fit inside the
         // usable range are handed out.
-        let end_frame = (r.base.saturating_add(r.length) / FRAME_SIZE)
-            .min(frame_count as u64);
+        let end_frame = (r.base.saturating_add(r.length) / FRAME_SIZE).min(frame_count as u64);
         for f in start_frame..end_frame {
             let idx = f as usize;
             if idx >= frame_count {
@@ -509,7 +505,8 @@ mod tests {
             reserve_range(base, FRAME_SIZE * 10);
             let freed_now = free_frames();
             assert!(
-                freed_now == free_before - 2 || freed_now == free_before - 1
+                freed_now == free_before - 2
+                    || freed_now == free_before - 1
                     || freed_now == free_before,
                 "clamp must never reserve more frames than the tail contains \
                  (before={free_before}, after={freed_now})"

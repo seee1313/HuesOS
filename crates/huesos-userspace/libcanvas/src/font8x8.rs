@@ -7,6 +7,12 @@
 // Auto-generated 8x8 bitmap font, ASCII 0x20..0x7E, rendered from
 // DejaVu Sans Mono Bold at 8px and thresholded to 1bpp.
 // Each row is a const [u8; 8]; bit 0 (LSB) = leftmost pixel.
+//
+// #[rustfmt::skip]: this table is human-readable *only* while every glyph
+// row fits on one line — one line == one 8x8 glyph, with the trailing
+// comment naming the codepoint. Letting rustfmt fold each row into eight
+// separate lines destroys the visual grid and blows the file up ~4x.
+#[rustfmt::skip]
 pub const FONT_8X8: [[u8; 8]; 95] = [
     [0b00000000, 0b00000000, 0b00000000, 0b00000000, 0b00000000, 0b00000000, 0b00000000, 0b00000000], // 0x20 ' '
     [0b00000000, 0b00000100, 0b00000100, 0b00000100, 0b00000100, 0b00000000, 0b00000100, 0b00000000], // 0x21 '!'

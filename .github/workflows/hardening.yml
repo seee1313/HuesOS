@@ -23,7 +23,7 @@ jobs:
           rustup toolchain install nightly-2026-03-01 --profile minimal \
             --component rust-src,rustfmt,clippy,llvm-tools-preview
           rustup default nightly-2026-03-01
-      - name: Enforce safety and privileged lock policies
+      - name: Enforce safety, lock, alloc-free and formatting policies
         run: make audit-check
       - name: Clippy
         env:

@@ -34,7 +34,11 @@ fn decode_keyboard_event(msg: &[u8]) -> Option<Key> {
         // Releases are intentionally ignored by the line editor.
         [b'k', 0, _] => None,
         // Compatibility with an older input host during rolling updates.
-        [b'c', byte] => Some(if *byte == 27 { Key::Esc } else { Key::Char(*byte) }),
+        [b'c', byte] => Some(if *byte == 27 {
+            Key::Esc
+        } else {
+            Key::Char(*byte)
+        }),
         b"enter" => Some(Key::Enter),
         b"backspace" => Some(Key::Backspace),
         _ => None,
@@ -133,8 +137,10 @@ impl Shell {
 
     fn run_doom(&mut self) {
         self.screen.clear();
-        self.screen.write_line("Launching DOOM (Freedoom Phase 1)...");
-        self.screen.write_line("Controls: WASD move, F fire, E use, Esc menu, Q quit");
+        self.screen
+            .write_line("Launching DOOM (Freedoom Phase 1)...");
+        self.screen
+            .write_line("Controls: WASD move, F fire, E use, Esc menu, Q quit");
         self.screen.render();
 
         let result = (|| -> libcanvas::Result<()> {
@@ -166,7 +172,8 @@ impl Shell {
                 self.screen.write_line(error.as_str());
             }
         }
-        self.screen.write_line("Type 'help' to list available commands.");
+        self.screen
+            .write_line("Type 'help' to list available commands.");
         self.screen.write_line("");
         self.prompt();
     }
@@ -192,7 +199,8 @@ impl Shell {
         } else {
             self.screen.write_line("Returned from Snake.");
         }
-        self.screen.write_line("Type 'help' to list available commands.");
+        self.screen
+            .write_line("Type 'help' to list available commands.");
         self.screen.write_line("");
         self.prompt();
     }

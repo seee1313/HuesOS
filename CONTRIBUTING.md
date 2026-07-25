@@ -62,6 +62,8 @@ python3 tools/audit-safety.py             # report current surface
 python3 tools/check-safety-budget.py      # hard gate (CI runs this)
 python3 tools/check-policy-crates.py      # policy crate/documentation gate
 python3 tools/check-hues-async-noalloc.py # hues-async alloc-free gate (CI runs this)
+python3 tools/fmt-all.py                  # format kernel workspace + standalone userspace
+python3 tools/fmt-all.py --check          # rustfmt gate (CI runs this via make fmt-check)
 ```
 
 ---
@@ -88,6 +90,28 @@ or move the test to a downstream crate that is allowed to allocate. See
 [docs/ASYNC_RUNTIME.md](docs/ASYNC_RUNTIME.md#project-rule-no-allocations-ever).
 
 ---
+
+## 1b. Formatting is enforced across kernel and userspace (hard gate)
+
+`cargo fmt --all` on the root workspace formats the 25 kernel/library crates
+listed in the root `Cargo.toml`. It does **not** touch the 8 standalone
+userspace crates under `crates/huesos-userspace/` — they are intentionally
+excluded from the workspace (they target ring-3 with their own linker
+script and are built by `huesos-kernel/build.rs`).
+
+Do not run bare `cargo fmt --all`. Always go through the wrapper:
+
+- `python3 tools/fmt-all.py` (or `make fmt`) — format everything.
+- `python3 tools/fmt-all.py --check` (or `make fmt-check`) — CI gate; exits
+  non-zero if any crate would reformat.
+
+`make audit-check` invokes the `--check` mode, so any PR that leaves an
+unformatted file anywhere in the tree fails static-safety in CI.
+
+If a table of tabular data (bitmap font, generated file list, opcode
+lookup) must remain visually aligned, mark the item with `#[rustfmt::skip]`
+and add a one-line comment explaining why. Two current uses:
+`libcanvas::font8x8::FONT_8X8` and `doom/build.rs::sources`.
 
 ## 2. Lock policy (hard gate for privileged crates)
 

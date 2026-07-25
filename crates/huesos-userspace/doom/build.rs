@@ -3,6 +3,10 @@ use std::path::PathBuf;
 fn main() {
     let root = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
     let doom = root.join("../../../third_party/doomgeneric");
+    // #[rustfmt::skip]: tabular list of upstream DoomGeneric C sources; five
+    // files per line preserves at-a-glance readability. Letting rustfmt fold
+    // each entry to its own line turns this into ~85 lines for no gain.
+    #[rustfmt::skip]
     let sources = [
         "dummy.c", "am_map.c", "doomdef.c", "doomstat.c", "dstrings.c",
         "d_event.c", "d_items.c", "d_iwad.c", "d_loop.c", "d_main.c",

@@ -3,7 +3,7 @@
 use crate::channel::Channel;
 use crate::vmo::Vmo;
 
-use super::elf::{self, PAGE_SIZE, PF_R, PF_W, PF_X, PT_LOAD, ProgramHeader};
+use super::elf::{self, ProgramHeader, PAGE_SIZE, PF_R, PF_W, PF_X, PT_LOAD};
 use super::{Process, Thread, Vmar};
 
 /// Load a static ELF image into a new process and start its initial thread.

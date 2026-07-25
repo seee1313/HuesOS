@@ -63,8 +63,8 @@ pub mod channel;
 pub mod debug;
 #[cfg(feature = "kernel-smoke-tests")]
 pub mod diagnostics;
-pub mod framebuffer;
 mod font8x8;
+pub mod framebuffer;
 pub mod handle;
 pub mod interrupt;
 pub mod port;
@@ -73,8 +73,8 @@ mod raw;
 pub mod system;
 pub mod vmo;
 
-pub use handle::Handle;
 pub use channel::Channel;
+pub use handle::Handle;
 pub use interrupt::Interrupt;
 pub use port::Port;
 pub use process::{Process, Thread, Vmar};
@@ -83,8 +83,8 @@ pub use vmo::Vmo;
 /// Re-exported so application code can match on specific failure reasons
 /// (`use libcanvas::ErrorCode;`) without depending on `huesos-abi` directly.
 pub use huesos_abi::{
-    fault_exit, rights, vmar_flags, ErrorCode, PortPacket, BOOTSTRAP_HANDLE,
-    INIT_BOOTFS_HANDLE, PORT_PACKET_INTERRUPT, USER_STACK_SIZE, USER_STACK_TOP,
+    fault_exit, rights, vmar_flags, ErrorCode, PortPacket, BOOTSTRAP_HANDLE, INIT_BOOTFS_HANDLE,
+    PORT_PACKET_INTERRUPT, USER_STACK_SIZE, USER_STACK_TOP,
 };
 
 /// Result type used throughout `libcanvas`: every fallible syscall wrapper

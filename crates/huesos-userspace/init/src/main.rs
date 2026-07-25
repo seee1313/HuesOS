@@ -201,19 +201,11 @@ fn send_acpi_tables_vmo(logger: &mut InitLogger, dm_bootstrap: &Channel, tables:
     };
     match dm_bootstrap.write_handle(b"acpi-tables-vmo", vmo.into_handle()) {
         Ok(()) => init_logln!(logger, "[init] passed ACPI table archive to DriverManager"),
-        Err(e) => init_logln!(
-            logger,
-            "[init] failed to pass ACPI archive: {}",
-            e.as_str()
-        ),
+        Err(e) => init_logln!(logger, "[init] failed to pass ACPI archive: {}", e.as_str()),
     }
 }
 
-fn send_acpi_broker(
-    logger: &mut InitLogger,
-    dm_bootstrap: &Channel,
-    broker: libcanvas::Handle,
-) {
+fn send_acpi_broker(logger: &mut InitLogger, dm_bootstrap: &Channel, broker: libcanvas::Handle) {
     match dm_bootstrap.write_handle(b"acpi-broker", broker) {
         Ok(()) => init_logln!(logger, "[init] transferred ACPI broker capability"),
         Err(error) => init_logln!(
@@ -436,7 +428,9 @@ fn run_process_wait_check(logger: &mut InitLogger) {
         ),
         Err(error) => init_logln!(
             logger,
-            "[init] ProcessWait lifecycle FAILED ({})", error.as_str()),
+            "[init] ProcessWait lifecycle FAILED ({})",
+            error.as_str()
+        ),
     }
 }
 

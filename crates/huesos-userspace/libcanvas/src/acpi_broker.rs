@@ -1,8 +1,8 @@
 //! Safe userspace wrapper for the restricted ACPI broker capability.
 
-use crate::{Handle, Result, raw};
-use huesos_abi::Syscall;
+use crate::{raw, Handle, Result};
 use huesos_abi::acpi_broker::{Request, Response};
+use huesos_abi::Syscall;
 
 /// Unique capability for privileged operations authorized to an ACPI manager.
 pub struct AcpiBroker(Handle);

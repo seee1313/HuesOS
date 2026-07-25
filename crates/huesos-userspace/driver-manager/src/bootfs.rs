@@ -113,7 +113,8 @@ fn path_matches_prefix(path: &[u8], prefix: &[u8]) -> bool {
     if prefix == b"/" || prefix.is_empty() {
         return true;
     }
-    path == prefix || (path.len() > prefix.len() && path.starts_with(prefix) && path[prefix.len()] == b'/')
+    path == prefix
+        || (path.len() > prefix.len() && path.starts_with(prefix) && path[prefix.len()] == b'/')
 }
 
 fn read_u32(bytes: &[u8]) -> u32 {

@@ -41,14 +41,23 @@ impl FileSystemService {
     pub fn open_for_registry(&mut self, registry: &Channel) {
         match Channel::pair() {
             Ok((client_end, server_end)) => {
-                if let Err(e) = registry.write_handle(protocol::FILESYSTEM_CHANNEL.as_bytes(), client_end.into_handle()) {
-                    println!("[driver-manager] failed to return filesystem channel: {}", e.as_str());
+                if let Err(e) = registry.write_handle(
+                    protocol::FILESYSTEM_CHANNEL.as_bytes(),
+                    client_end.into_handle(),
+                ) {
+                    println!(
+                        "[driver-manager] failed to return filesystem channel: {}",
+                        e.as_str()
+                    );
                     return;
                 }
                 self.client = Some(server_end);
                 println!("[driver-manager] opened filesystem service channel for client");
             }
-            Err(e) => println!("[driver-manager] failed to create filesystem channel: {}", e.as_str()),
+            Err(e) => println!(
+                "[driver-manager] failed to create filesystem channel: {}",
+                e.as_str()
+            ),
         }
     }
 
@@ -62,7 +71,10 @@ impl FileSystemService {
                 Ok(n) => self.handle_request(&request[..n]),
                 Err(ErrorCode::ShouldWait) => return,
                 Err(e) => {
-                    println!("[driver-manager] filesystem request read failed: {}", e.as_str());
+                    println!(
+                        "[driver-manager] filesystem request read failed: {}",
+                        e.as_str()
+                    );
                     return;
                 }
             }
