@@ -23,9 +23,11 @@ mod registry;
 mod thread;
 mod vmar;
 mod vmo;
+mod mmio_capability;
 pub mod wait;
 
 pub use acpi_broker::{AcpiBroker, PciFunctionGrant, SystemIoGrant};
+pub use mmio_capability::{MmioCapability, MmioGrant};
 pub use channel::{
     Channel, ChannelCreateError, ChannelMessage, ChannelRecvError, ChannelSendError,
     ChannelSendFailure,

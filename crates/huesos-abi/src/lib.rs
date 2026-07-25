@@ -210,6 +210,8 @@ pub enum ErrorCode {
     Internal = -21,
     /// The peer endpoint is closed and no queued message remains.
     PeerClosed = -22,
+    /// The caller-provided buffer is too small for the operation.
+    BufferTooSmall = -23,
 }
 
 impl ErrorCode {
@@ -231,6 +233,7 @@ impl ErrorCode {
             -19 => Self::NotSupported,
             -21 => Self::Internal,
             -22 => Self::PeerClosed,
+            -23 => Self::BufferTooSmall,
             _ => return None,
         })
     }
@@ -252,6 +255,7 @@ impl ErrorCode {
             Self::NotSupported => "syscall not supported",
             Self::Internal => "internal kernel state error",
             Self::PeerClosed => "channel peer closed",
+            Self::BufferTooSmall => "buffer too small for message",
         }
     }
 }
