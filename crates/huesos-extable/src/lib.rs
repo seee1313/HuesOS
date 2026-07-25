@@ -126,7 +126,10 @@ impl<'a> Extable<'a> {
     /// confirm `fault_rip < end_rip`. Correct because the table is sorted and
     /// non-overlapping.
     pub fn find(&self, fault_rip: u64) -> Option<u64> {
-        let idx = match self.entries.binary_search_by_key(&fault_rip, |e| e.start_rip) {
+        let idx = match self
+            .entries
+            .binary_search_by_key(&fault_rip, |e| e.start_rip)
+        {
             Ok(i) => i,
             Err(0) => return None,
             Err(i) => i - 1,
@@ -335,7 +338,11 @@ mod tests {
 
     #[test]
     fn sort_then_build_table() {
-        let mut entries = [range(300, 320, 3), range(100, 110, 1), FixupRange::point(200, 2)];
+        let mut entries = [
+            range(300, 320, 3),
+            range(100, 110, 1),
+            FixupRange::point(200, 2),
+        ];
         sort_ranges(&mut entries);
         assert_eq!(entries[0].start_rip, 100);
         assert_eq!(entries[1].start_rip, 200);

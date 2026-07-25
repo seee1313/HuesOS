@@ -134,9 +134,8 @@ pub fn decode(bytes: &[u8]) -> Result<DecodedArchive, ArchiveError> {
     // SAFETY: the archive header is exactly TABLE_ARCHIVE_HEADER_BYTES and the
     // struct is repr(C) POD matching the on-wire layout. read_unaligned is used
     // because the VMO slice need not be 8-byte aligned.
-    let header: TableArchiveHeader = unsafe {
-        core::ptr::read_unaligned(bytes.as_ptr().cast::<TableArchiveHeader>())
-    };
+    let header: TableArchiveHeader =
+        unsafe { core::ptr::read_unaligned(bytes.as_ptr().cast::<TableArchiveHeader>()) };
     if header.magic != TABLE_ARCHIVE_MAGIC || header.version != VERSION {
         return Err(ArchiveError::Format);
     }
@@ -308,8 +307,7 @@ mod tests {
     fn rejects_oversized_table() {
         // A table longer than MAX_TABLE_BYTES is rejected before any body read,
         // so the archive need only carry the header and one entry.
-        let metadata_end =
-            TABLE_ARCHIVE_HEADER_BYTES as usize + TABLE_ARCHIVE_ENTRY_BYTES;
+        let metadata_end = TABLE_ARCHIVE_HEADER_BYTES as usize + TABLE_ARCHIVE_ENTRY_BYTES;
         let mut bytes = [0u8; 64];
         bytes[..8].copy_from_slice(&TABLE_ARCHIVE_MAGIC);
         bytes[8..10].copy_from_slice(&VERSION.to_le_bytes());
@@ -328,8 +326,7 @@ mod tests {
         // Two entries; move the second entry's VMO offset inside the first
         // entry's body so the per-entry ranges overlap.
         let mut bytes = encode_archive(&[(Some(0x1000u64), 128), (Some(0x2000u64), 64)]);
-        let metadata_end =
-            TABLE_ARCHIVE_HEADER_BYTES as usize + 2 * TABLE_ARCHIVE_ENTRY_BYTES;
+        let metadata_end = TABLE_ARCHIVE_HEADER_BYTES as usize + 2 * TABLE_ARCHIVE_ENTRY_BYTES;
         let second = TABLE_ARCHIVE_HEADER_BYTES as usize + TABLE_ARCHIVE_ENTRY_BYTES;
         // metadata_end (88) .. first entry end (216): an in-body offset.
         let overlap_offset = (metadata_end + 32) as u64;

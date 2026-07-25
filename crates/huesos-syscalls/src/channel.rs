@@ -4,7 +4,11 @@ use alloc::vec::Vec;
 use huesos_abi::{ChannelConsumeArgs, ChannelPeekArgs, ChannelReadEtcArgs, ErrorCode, HandleValue};
 use huesos_object::{ChannelRecvError, Handle, KernelObject, KernelObjectExt, Rights};
 
-use crate::{user_memory, util::{current_proc, DeferGuard}, SyscallResult};
+use crate::{
+    user_memory,
+    util::{current_proc, DeferGuard},
+    SyscallResult,
+};
 
 fn map_recv_error(error: ChannelRecvError) -> huesos_abi::ErrorCode {
     match error {
@@ -85,15 +89,16 @@ pub(crate) fn sys_channel_write(
             return Err(ErrorCode::AccessDenied);
         }
     }
-    let transferred = proc
-        .handles
-        .remove_many_keep_alive(&raw_handles)
-        .map_err(|error| match error {
-            huesos_object::HandleTableError::Missing => ErrorCode::BadHandle,
-            huesos_object::HandleTableError::Duplicate => ErrorCode::InvalidArgs,
-            huesos_object::HandleTableError::OutOfMemory => ErrorCode::NoMemory,
-        })?;
-    let message = huesos_object::ChannelMessage { seq: 0,
+    let transferred =
+        proc.handles
+            .remove_many_keep_alive(&raw_handles)
+            .map_err(|error| match error {
+                huesos_object::HandleTableError::Missing => ErrorCode::BadHandle,
+                huesos_object::HandleTableError::Duplicate => ErrorCode::InvalidArgs,
+                huesos_object::HandleTableError::OutOfMemory => ErrorCode::NoMemory,
+            })?;
+    let message = huesos_object::ChannelMessage {
+        seq: 0,
         data,
         handles: transferred,
     };
@@ -264,20 +269,14 @@ pub(crate) fn sys_channel_peek(args_ptr: *const ChannelPeekArgs) -> SyscallResul
                 Some(_) => break,
                 None => {
                     if args.wait_mode == 1 {
-                        let prepared = ch
-                            .reader_queue()
-                            .prepare()
-                            .ok_or(ErrorCode::PeerClosed)?;
+                        let prepared = ch.reader_queue().prepare().ok_or(ErrorCode::PeerClosed)?;
                         if ch.peek().map_err(map_recv_error)?.is_some() {
                             prepared.cancel();
                             break;
                         }
                         prepared.park();
                     } else {
-                        let prepared = ch
-                            .reader_queue()
-                            .prepare()
-                            .ok_or(ErrorCode::PeerClosed)?;
+                        let prepared = ch.reader_queue().prepare().ok_or(ErrorCode::PeerClosed)?;
                         if ch.peek().map_err(map_recv_error)?.is_some() {
                             prepared.cancel();
                             break;
@@ -294,7 +293,10 @@ pub(crate) fn sys_channel_peek(args_ptr: *const ChannelPeekArgs) -> SyscallResul
         }
     }
 
-    let (byte_size, handle_count, cookie) = ch.peek().map_err(map_recv_error)?.ok_or(ErrorCode::ShouldWait)?;
+    let (byte_size, handle_count, cookie) = ch
+        .peek()
+        .map_err(map_recv_error)?
+        .ok_or(ErrorCode::ShouldWait)?;
     user_memory::write_value(args.out_byte_size, &(byte_size as u32))?;
     user_memory::write_value(args.out_handle_count, &(handle_count as u32))?;
     user_memory::write_value(args.out_cookie, &cookie)?;

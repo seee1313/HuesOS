@@ -86,11 +86,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut current_offset = align_up(header_size as u64, 8);
     let mut directory = Vec::new();
 
-    for (type_id, data, flags, extra) in &payloads {
+    for (type_id, data, flags, _extra) in &payloads {
         let length = data.len() as u32;
-        let mut hasher = Hasher::new();
-        hasher.update(data);
-        let crc = hasher.finalize();
 
         directory.push(DirectoryEntry {
             type_id: *type_id,

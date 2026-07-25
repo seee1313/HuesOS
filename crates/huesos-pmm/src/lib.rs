@@ -299,7 +299,10 @@ mod tests {
                     Err(_) => break,
                 }
             }
-            assert!(reused, "freed frame {f1:#x} was never handed back out by the allocator");
+            assert!(
+                reused,
+                "freed frame {f1:#x} was never handed back out by the allocator"
+            );
             let _ = f2;
         });
     }

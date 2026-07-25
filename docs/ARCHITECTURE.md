@@ -80,7 +80,7 @@ page describes the intended privileged integration.
    window around the RSDP) into the HHDM — base rev 3 does *not* map these
    by default. General RESERVED is intentionally **not** bulk-mapped (would
    WB-map LAPIC/MMIO).
-7. Heap init (128 MiB buddy+slab at `0xffff_ff00_0000_0000`).
+7. Heap init (64 MiB buddy+slab at `0xffff_ff00_0000_0000`).
 8. Object subsystem init; phys-to-virt + CPU-id callbacks.
 9. **SMP bring-up** (if RSDP/MADT present):
    - Program LAPIC base (HHDM + **NO_CACHE**); calibrate timer once on BSP.

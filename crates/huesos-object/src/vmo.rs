@@ -182,7 +182,9 @@ impl Vmo {
             let frame = match huesos_pmm::alloc_frame() {
                 Ok(f) => f,
                 Err(_) => {
-                    let allocated = frames.len().saturating_sub(needed_pages.saturating_sub(additional_pages));
+                    let allocated = frames
+                        .len()
+                        .saturating_sub(needed_pages.saturating_sub(additional_pages));
                     let unallocated = additional_pages.saturating_sub(allocated);
                     if let Some(owner) = &self.job {
                         let _ = owner.release(

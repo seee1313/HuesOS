@@ -7,10 +7,10 @@
 //! controller entirely in memory so the full submit -> CQE -> wake path can be
 //! exercised without hardware.
 
-use alloc::vec;
-use alloc::vec::Vec;
 use crate::cmd::{admin, feature, identify, io, status, Cqe, Sqe};
 use crate::regs::{aqa, cap, cc, csts, off};
+use alloc::vec;
+use alloc::vec::Vec;
 
 /// Abstraction over the controller's registers (BAR0) and DMA memory.
 pub trait NvmeTransport {
@@ -33,7 +33,7 @@ pub trait NvmeTransport {
 struct IoQueue {
     sq_base: u64,
     cq_base: u64,
-    size: u16,    // entry count
+    size: u16, // entry count
     cq_head: u16,
     sq_head: u16,
     cq_phase: bool,
@@ -221,7 +221,9 @@ impl MockNvme {
     fn process_io(&mut self, qid: u16, sq_tail: u16) {
         let (sq_base, cq_base, size, mut cq_head, mut sq_head, mut cq_phase) =
             match self.io[qid as usize] {
-                Some(q) => (q.sq_base, q.cq_base, q.size, q.cq_head, q.sq_head, q.cq_phase),
+                Some(q) => (
+                    q.sq_base, q.cq_base, q.size, q.cq_head, q.sq_head, q.cq_phase,
+                ),
                 None => return,
             };
         while sq_head != sq_tail {

@@ -55,8 +55,8 @@ impl<'a> PlatformData<'a> {
 
         let mut offset = 0;
         while offset + 8 <= self.data.len() {
-            let id = u32::from_le_bytes(self.data[offset..offset+4].try_into().ok()?);
-            let len = u32::from_le_bytes(self.data[offset+4..offset+8].try_into().ok()?);
+            let id = u32::from_le_bytes(self.data[offset..offset + 4].try_into().ok()?);
+            let len = u32::from_le_bytes(self.data[offset + 4..offset + 8].try_into().ok()?);
 
             if id == prop_id {
                 let start = offset + 8;

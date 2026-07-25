@@ -147,8 +147,7 @@ impl Request {
             } else {
                 (1u64 << (self.width as u32 * 8)) - 1
             };
-            if matches!(opcode, Opcode::SystemIoWrite | Opcode::PciWrite)
-                && self.value > max_value
+            if matches!(opcode, Opcode::SystemIoWrite | Opcode::PciWrite) && self.value > max_value
             {
                 return Err(ValidationError::Value);
             }
@@ -328,8 +327,12 @@ mod tests {
 
     #[test]
     fn accepts_exact_width_aligned_io() {
-        assert!(request(Opcode::SystemIoRead, 2, 0x404, 0).validate().is_ok());
-        assert!(request(Opcode::PciWrite, 4, 0x10, 0xffff_ffff).validate().is_ok());
+        assert!(request(Opcode::SystemIoRead, 2, 0x404, 0)
+            .validate()
+            .is_ok());
+        assert!(request(Opcode::PciWrite, 4, 0x10, 0xffff_ffff)
+            .validate()
+            .is_ok());
     }
 
     #[test]

@@ -18,8 +18,8 @@ mod koid;
 mod object;
 mod port;
 mod process;
-mod supervision;
 mod registry;
+mod supervision;
 mod thread;
 mod vmar;
 mod vmo;
@@ -37,7 +37,6 @@ pub use koid::{alloc_koid, Koid};
 pub use object::{KernelObject, KernelObjectExt, ObjectType};
 pub use port::{Port, PortCreateError, PortPacket, PortQueueError};
 pub use process::Process;
-pub use supervision::{CrashThrottle, SupervisionAction, SupervisionDecision};
 pub(crate) use registry::phys_to_virt;
 pub use registry::{
     acquire_kernel_ref, collect_exited_process, current_process, lookup_interrupts_by_irq,
@@ -45,6 +44,7 @@ pub use registry::{
     note_kernel_ref_open, object_ref_counts, register_interrupt, register_object, register_process,
     root_job, set_cpu_id_callback, set_current_process, set_phys_to_virt, unregister_object,
 };
+pub use supervision::{CrashThrottle, SupervisionAction, SupervisionDecision};
 pub use thread::Thread;
 pub use vmar::{Vmar, VmarChild, VmarError, VmarMapping};
 pub use vmo::{Vmo, VmoError};
@@ -320,7 +320,8 @@ mod tests {
             Ok(pair) => pair,
             Err(_) => return,
         };
-        let _ = a.send(ChannelMessage { seq: 0,
+        let _ = a.send(ChannelMessage {
+            seq: 0,
             data: alloc::vec![1, 2, 3],
             handles: Vec::new(),
         });
@@ -338,13 +339,15 @@ mod tests {
             Err(_) => return,
         };
         for _ in 0..channel::MAX_CHANNEL_QUEUE_MESSAGES {
-            let result = a.send(ChannelMessage { seq: 0,
+            let result = a.send(ChannelMessage {
+                seq: 0,
                 data: Vec::new(),
                 handles: Vec::new(),
             });
             assert!(result.is_ok());
         }
-        let failed = a.send(ChannelMessage { seq: 0,
+        let failed = a.send(ChannelMessage {
+            seq: 0,
             data: Vec::new(),
             handles: Vec::new(),
         });
@@ -396,7 +399,8 @@ mod tests {
         };
         drop(a);
         assert!(b.peer_closed());
-        let send = b.send(ChannelMessage { seq: 0,
+        let send = b.send(ChannelMessage {
+            seq: 0,
             data: Vec::new(),
             handles: Vec::new(),
         });
@@ -422,7 +426,10 @@ mod tests {
         assert!(!process.can_reap());
         assert!(process.exit_info().is_some());
         process.remove_exit_waiter();
-        assert_eq!(process.lifecycle_state(), huesos_proclife::ProcState::Reaped);
+        assert_eq!(
+            process.lifecycle_state(),
+            huesos_proclife::ProcState::Reaped
+        );
         assert!(!process.set_exit_code(18));
     }
 
@@ -444,5 +451,4 @@ mod tests {
             assert!(Vmo::new_in_job(8192, Some(job)).is_err());
         });
     }
-
 }

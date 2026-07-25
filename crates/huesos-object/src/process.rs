@@ -7,8 +7,8 @@ use core::any::Any;
 use spin::Mutex;
 
 use crate::wait::WaitQueue;
-use huesos_proclife::{ExitInfo, ProcessLifecycle, ProcState};
 use crate::{alloc_koid, root_job, HandleTable, Job, KernelObject, Koid, ObjectType};
+use huesos_proclife::{ExitInfo, ProcState, ProcessLifecycle};
 
 /// Process — address space + handle table + exit state.
 pub struct Process {
@@ -79,8 +79,7 @@ impl Process {
     /// Job CPU budget is exhausted; the scheduler currently records the
     /// exhaustion for supervision but does not kill the process.
     pub fn charge_cpu_tick(&self) -> bool {
-        self.job
-            .charge(huesos_quota::Resource::CpuTicks, 1)
+        self.job.charge(huesos_quota::Resource::CpuTicks, 1)
     }
 
     /// Mark the process as running. The policy accepts this only once, when

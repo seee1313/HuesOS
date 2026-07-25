@@ -564,7 +564,10 @@ mod tests {
         }
         // Only the last 4 survive, oldest to newest.
         assert_eq!(store.len(), 4);
-        assert_eq!(store.iter().copied().collect::<Vec<u32>>(), vec![46, 47, 48, 49]);
+        assert_eq!(
+            store.iter().copied().collect::<Vec<u32>>(),
+            vec![46, 47, 48, 49]
+        );
         assert_eq!(store.total_inserted(), 50);
         assert_eq!(store.total_evicted(), 46);
         assert_eq!(store.total_reaped(), 0);
@@ -603,7 +606,10 @@ mod tests {
         for value in 0..6u32 {
             let _ = store.insert(value); // ends holding [2,3,4,5], head advanced
         }
-        assert_eq!(store.iter().copied().collect::<Vec<u32>>(), vec![2, 3, 4, 5]);
+        assert_eq!(
+            store.iter().copied().collect::<Vec<u32>>(),
+            vec![2, 3, 4, 5]
+        );
         // Keep values >= 4, exercising compaction over a wrapped layout.
         let removed = store.retain(|v| *v >= 4);
         assert_eq!(removed, 2);
@@ -806,8 +812,8 @@ mod tests {
         // object is collectable while a capability is in flight.
         let mut account = RefAccount::registered();
         account.open_handles(1); // installed in the sender's table
-        // Transfer: close the table handle and open the in-flight handle
-        // atomically; the count stays at 1 throughout.
+                                 // Transfer: close the table handle and open the in-flight handle
+                                 // atomically; the count stays at 1 throughout.
         account.close_handles(1);
         account.open_handles(1);
         assert_eq!(account.handle_refs(), 1);
@@ -845,5 +851,4 @@ mod tests {
         assert_eq!(account.kernel_refs(), 0);
         assert!(!account.try_collect());
     }
-
 }

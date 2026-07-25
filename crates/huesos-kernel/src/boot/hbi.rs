@@ -318,9 +318,7 @@ mod tests {
         data[8..12].copy_from_slice(&0x0002_0001u32.to_le_bytes()); // version
         data[12..16].copy_from_slice(&0u32.to_le_bytes()); // flags
         data[16..20].copy_from_slice(&num_entries.to_le_bytes());
-        data[20..24].copy_from_slice(
-            &(core::mem::size_of::<GlobalHeader>() as u32).to_le_bytes(),
-        ); // header_size
+        data[20..24].copy_from_slice(&(core::mem::size_of::<GlobalHeader>() as u32).to_le_bytes()); // header_size
         data[24..32].copy_from_slice(&image_size.to_le_bytes());
     }
 

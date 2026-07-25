@@ -44,7 +44,11 @@ pub struct Limits {
 impl Limits {
     /// No limits on anything.
     pub const fn unlimited() -> Self {
-        Limits { max_memory: UNLIMITED, max_handles: UNLIMITED, max_cpu_ticks: UNLIMITED }
+        Limits {
+            max_memory: UNLIMITED,
+            max_handles: UNLIMITED,
+            max_cpu_ticks: UNLIMITED,
+        }
     }
     /// The limit for a given resource.
     pub fn for_resource(&self, res: Resource) -> u64 {
@@ -111,7 +115,10 @@ pub struct Quota {
 impl Quota {
     /// A quota with the given limits and zero usage.
     pub fn new(limits: Limits) -> Self {
-        Quota { limits, used: Usage::default() }
+        Quota {
+            limits,
+            used: Usage::default(),
+        }
     }
     /// Current limits.
     pub fn limits(&self) -> Limits {
@@ -230,7 +237,12 @@ impl QuotaTree {
     /// Add a root node (no parent).
     pub fn add_root(&mut self, limits: Limits) -> NodeId {
         let id = self.nodes.len();
-        self.nodes.push(Node { parent: None, children: Vec::new(), limits, used: Usage::default() });
+        self.nodes.push(Node {
+            parent: None,
+            children: Vec::new(),
+            limits,
+            used: Usage::default(),
+        });
         NodeId {
             index: id,
             tree_id: self.tree_id,
@@ -249,7 +261,12 @@ impl QuotaTree {
     pub fn add_child(&mut self, parent: NodeId, limits: Limits) -> Result<NodeId, QuotaTreeError> {
         let parent_index = self.index_of(parent)?;
         let id = self.nodes.len();
-        self.nodes.push(Node { parent: Some(parent_index), children: Vec::new(), limits, used: Usage::default() });
+        self.nodes.push(Node {
+            parent: Some(parent_index),
+            children: Vec::new(),
+            limits,
+            used: Usage::default(),
+        });
         self.nodes[parent_index].children.push(id);
         Ok(NodeId {
             index: id,
@@ -326,7 +343,11 @@ mod tests {
     use super::*;
 
     fn mem_limits(max: u64) -> Limits {
-        Limits { max_memory: max, max_handles: UNLIMITED, max_cpu_ticks: UNLIMITED }
+        Limits {
+            max_memory: max,
+            max_handles: UNLIMITED,
+            max_cpu_ticks: UNLIMITED,
+        }
     }
 
     fn child(t: &mut QuotaTree, parent: NodeId, limits: Limits) -> NodeId {
@@ -387,7 +408,11 @@ mod tests {
 
     #[test]
     fn quota_tracks_each_resource_independently() {
-        let mut q = Quota::new(Limits { max_memory: 100, max_handles: 2, max_cpu_ticks: UNLIMITED });
+        let mut q = Quota::new(Limits {
+            max_memory: 100,
+            max_handles: 2,
+            max_cpu_ticks: UNLIMITED,
+        });
         assert!(q.try_acquire(Resource::Handles, 2));
         assert!(!q.try_acquire(Resource::Handles, 1)); // handles exhausted
         assert!(q.try_acquire(Resource::Memory, 100)); // memory independent
@@ -410,7 +435,7 @@ mod tests {
         let mut t = QuotaTree::new();
         let root = t.add_root(mem_limits(100)); // parent caps total at 100
         let child = child(&mut t, root, mem_limits(UNLIMITED)); // child itself unbounded
-        // Child can use up to the parent's 100.
+                                                                // Child can use up to the parent's 100.
         assert!(t.try_acquire(child, Resource::Memory, 60));
         assert!(t.try_acquire(child, Resource::Memory, 40));
         // Now the parent's subtree is at 100; further acquisition is denied by
@@ -483,7 +508,10 @@ mod tests {
         let mut first = QuotaTree::new();
         let root = first.add_root(mem_limits(10));
         let mut second = QuotaTree::new();
-        assert_eq!(second.add_child(root, mem_limits(10)), Err(QuotaTreeError::InvalidNode));
+        assert_eq!(
+            second.add_child(root, mem_limits(10)),
+            Err(QuotaTreeError::InvalidNode)
+        );
         assert_eq!(second.subtree_usage(root), Err(QuotaTreeError::InvalidNode));
         assert!(!second.try_acquire(root, Resource::Memory, 1));
         assert!(!second.release(root, Resource::Memory, 1));
@@ -492,5 +520,4 @@ mod tests {
         assert!(!second.set_limits(root, mem_limits(1)));
         assert!(!second.try_acquire(NodeId::INVALID, Resource::Memory, 1));
     }
-
 }

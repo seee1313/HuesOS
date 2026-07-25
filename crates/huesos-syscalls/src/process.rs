@@ -5,8 +5,8 @@ use huesos_object::{Handle, KernelObject, KernelObjectExt, Rights};
 
 use crate::{
     callbacks::{
-        EXIT_FN, PROCESS_CREATE_FN, THREAD_START_FN, VMAR_MAP_FN, VMAR_PROTECT_FN,
-        VMAR_UNMAP_FN, YIELD_FN,
+        EXIT_FN, PROCESS_CREATE_FN, THREAD_START_FN, VMAR_MAP_FN, VMAR_PROTECT_FN, VMAR_UNMAP_FN,
+        YIELD_FN,
     },
     user_memory,
     util::{current_proc, DeferGuard},
@@ -215,9 +215,8 @@ pub(crate) fn sys_vmar_map(args_ptr: *const VmarMapArgs) -> SyscallResult {
         return Err(ErrorCode::AccessDenied);
     }
     let vmo_handle = proc.handles.get(args.vmo).ok_or(ErrorCode::BadHandle)?;
-    let required_vmo_rights = huesos_object::Rights::from_bits_retain(
-        huesos_abi::rights::mapping_required(args.flags),
-    );
+    let required_vmo_rights =
+        huesos_object::Rights::from_bits_retain(huesos_abi::rights::mapping_required(args.flags));
     if !vmo_handle.has_rights(required_vmo_rights) {
         return Err(ErrorCode::AccessDenied);
     }
@@ -236,7 +235,6 @@ pub(crate) fn sys_vmar_map(args_ptr: *const VmarMapArgs) -> SyscallResult {
     let mapped = map(vmar, vmo, args)?;
     Ok(mapped as i64)
 }
-
 
 pub(crate) fn sys_vmar_unmap(args_ptr: *const VmarOpArgs) -> SyscallResult {
     sys_vmar_op(args_ptr, false, &VMAR_UNMAP_FN)

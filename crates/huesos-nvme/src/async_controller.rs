@@ -9,11 +9,11 @@
 //! is exercised end-to-end on the host. A real DriverHost passes a `park` that
 //! processes completions and/or awaits the MSI-X interrupt via a HuesOS Port.
 
+use crate::controller::{Controller, NvmeError};
+use crate::transport::NvmeTransport;
 use core::future::Future;
 use core::pin::Pin;
 use core::task::{Context, Poll};
-use crate::controller::{Controller, NvmeError};
-use crate::transport::NvmeTransport;
 
 /// An async NVMe controller over a transport `T`.
 pub struct AsyncController<T: NvmeTransport> {

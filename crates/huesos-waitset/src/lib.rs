@@ -517,8 +517,14 @@ mod tests {
         // Before the deadline: still pending.
         assert_eq!(ws.poll_at(WaitMode::Any, 5, Some(10)), WaitOutcome::Pending);
         // At and after the deadline: timed out.
-        assert_eq!(ws.poll_at(WaitMode::Any, 10, Some(10)), WaitOutcome::TimedOut);
-        assert_eq!(ws.poll_at(WaitMode::Any, 11, Some(10)), WaitOutcome::TimedOut);
+        assert_eq!(
+            ws.poll_at(WaitMode::Any, 10, Some(10)),
+            WaitOutcome::TimedOut
+        );
+        assert_eq!(
+            ws.poll_at(WaitMode::Any, 11, Some(10)),
+            WaitOutcome::TimedOut
+        );
         // No deadline means never times out.
         assert_eq!(ws.poll_at(WaitMode::Any, 1000, None), WaitOutcome::Pending);
     }
@@ -529,7 +535,10 @@ mod tests {
         assert!(ws.add(1, Signals::READABLE));
         assert!(ws.signal(1, Signals::READABLE));
         // Satisfied, even though the deadline has long passed.
-        assert_eq!(ws.poll_at(WaitMode::Any, 999, Some(10)), WaitOutcome::Signaled);
+        assert_eq!(
+            ws.poll_at(WaitMode::Any, 999, Some(10)),
+            WaitOutcome::Signaled
+        );
     }
 
     #[test]
@@ -537,7 +546,10 @@ mod tests {
         let mut ws: WaitSet<4> = WaitSet::new();
         assert!(ws.add(1, Signals::READABLE));
         ws.cancel();
-        assert_eq!(ws.poll_at(WaitMode::Any, 999, Some(10)), WaitOutcome::Canceled);
+        assert_eq!(
+            ws.poll_at(WaitMode::Any, 999, Some(10)),
+            WaitOutcome::Canceled
+        );
     }
 
     // --- CANCELED as a signal ---
@@ -559,5 +571,4 @@ mod tests {
         assert_eq!(ws.len(), 0);
         assert_eq!(ws.poll(WaitMode::Any), WaitOutcome::Canceled);
     }
-
 }

@@ -52,7 +52,12 @@ impl ConfigSpace {
         u16::from_le_bytes([self.0[off], self.0[off + 1]])
     }
     fn read_u32(&self, off: usize) -> u32 {
-        u32::from_le_bytes([self.0[off], self.0[off + 1], self.0[off + 2], self.0[off + 3]])
+        u32::from_le_bytes([
+            self.0[off],
+            self.0[off + 1],
+            self.0[off + 2],
+            self.0[off + 3],
+        ])
     }
     fn write_u16(&mut self, off: usize, v: u16) {
         let b = v.to_le_bytes();
@@ -101,7 +106,11 @@ impl ConfigSpace {
     }
     /// The class code triple.
     pub fn class_code(&self) -> ClassCode {
-        ClassCode { class: self.class(), subclass: self.subclass(), prog_if: self.prog_if() }
+        ClassCode {
+            class: self.class(),
+            subclass: self.subclass(),
+            prog_if: self.prog_if(),
+        }
     }
     /// Raw BAR register `n` (0..6).
     pub fn bar_raw(&self, n: usize) -> u32 {
@@ -148,11 +157,17 @@ pub struct ClassCode {
 impl ClassCode {
     /// NVM Express controller: Mass Storage (0x01) / NVM Controller (0x08) /
     /// NVM Express (0x02).
-    pub const NVME: ClassCode = ClassCode { class: 0x01, subclass: 0x08, prog_if: 0x02 };
+    pub const NVME: ClassCode = ClassCode {
+        class: 0x01,
+        subclass: 0x08,
+        prog_if: 0x02,
+    };
 
     /// True when this class code matches `other` exactly.
     pub fn matches(&self, other: ClassCode) -> bool {
-        self.class == other.class && self.subclass == other.subclass && self.prog_if == other.prog_if
+        self.class == other.class
+            && self.subclass == other.subclass
+            && self.prog_if == other.prog_if
     }
 }
 
@@ -197,13 +212,25 @@ pub fn decode_memory_bar(lo: u32, hi: u32, size: u64) -> Bar {
     let is_64 = ((lo >> 1) & 0x3) == 0b10;
     let prefetchable = (lo >> 3) & 1 == 1;
     let base32 = (lo & 0xFFFF_FFF0) as u64;
-    let base = if is_64 { ((hi as u64) << 32) | base32 } else { base32 };
-    Bar::Memory { base, size, prefetchable, is_64 }
+    let base = if is_64 {
+        ((hi as u64) << 32) | base32
+    } else {
+        base32
+    };
+    Bar::Memory {
+        base,
+        size,
+        prefetchable,
+        is_64,
+    }
 }
 
 /// Decode an I/O BAR from its raw register value and decoded size.
 pub fn decode_io_bar(lo: u32, size: u32) -> Bar {
-    Bar::Io { base: lo & 0xFFFF_FFFC, size }
+    Bar::Io {
+        base: lo & 0xFFFF_FFFC,
+        size,
+    }
 }
 
 /// A mock PCI device for host tests: a config space plus BAR size masks.
@@ -232,7 +259,11 @@ impl MockPciDevice {
                 return Bar::Unused;
             }
             let is_64 = ((lo >> 1) & 0x3) == 0b10;
-            let hi = if is_64 && n + 1 < 6 { self.config.bar_raw(n + 1) } else { 0 };
+            let hi = if is_64 && n + 1 < 6 {
+                self.config.bar_raw(n + 1)
+            } else {
+                0
+            };
             decode_memory_bar(lo, hi, size)
         } else {
             let size = io_bar_size(mask);
@@ -254,7 +285,9 @@ pub struct MockPciBus {
 impl MockPciBus {
     /// An empty bus.
     pub fn new() -> Self {
-        Self { devices: Vec::new() }
+        Self {
+            devices: Vec::new(),
+        }
     }
     /// Add a device to the bus.
     pub fn add(&mut self, dev: MockPciDevice) {
@@ -277,13 +310,19 @@ mod tests {
         let mut config = ConfigSpace::zeroed();
         config.set_ids(0x8086, 0x0A54); // Intel QEMU NVMe-ish
         config.set_class(0x01, 0x08, 0x02); // Mass Storage / NVM / NVM Express
-        // BAR0: 64-bit memory, base 0xFE00_0000.
+                                            // BAR0: 64-bit memory, base 0xFE00_0000.
         config.set_bar_raw(0, 0xFE00_0000 | 0b0100); // memory, 64-bit (type 0b10 << 1)
         config.set_bar_raw(1, 0x0000_0000); // upper 32 bits
         let mut bar_sizes = [0u32; 6];
         // BAR0 size mask for a 16 KiB region: 0xFFFF_C000.
         bar_sizes[0] = 0xFFFF_C000;
-        MockPciDevice { bus: 0, dev: 4, func: 0, config, bar_sizes }
+        MockPciDevice {
+            bus: 0,
+            dev: 4,
+            func: 0,
+            config,
+            bar_sizes,
+        }
     }
 
     #[test]
@@ -326,7 +365,15 @@ mod tests {
         // 32-bit memory BAR at 0xF000_0000, 64 KiB.
         let lo = 0xF000_0000u32; // memory, 32-bit (type bits 0)
         let bar = decode_memory_bar(lo, 0, 0x1_0000);
-        assert_eq!(bar, Bar::Memory { base: 0xF000_0000, size: 0x1_0000, prefetchable: false, is_64: false });
+        assert_eq!(
+            bar,
+            Bar::Memory {
+                base: 0xF000_0000,
+                size: 0x1_0000,
+                prefetchable: false,
+                is_64: false
+            }
+        );
     }
 
     #[test]
@@ -335,14 +382,28 @@ mod tests {
         let lo = 0b0100u32 | 0b1000;
         let hi = 0x0000_0002u32; // base high = 0x2_0000_0000
         let bar = decode_memory_bar(lo, hi, 0x1000);
-        assert_eq!(bar, Bar::Memory { base: 0x2_0000_0000, size: 0x1000, prefetchable: true, is_64: true });
+        assert_eq!(
+            bar,
+            Bar::Memory {
+                base: 0x2_0000_0000,
+                size: 0x1000,
+                prefetchable: true,
+                is_64: true
+            }
+        );
     }
 
     #[test]
     fn decodes_an_io_bar() {
         let lo = 0x0000_C001u32; // I/O (bit 0 set), base 0xC000
         let bar = decode_io_bar(lo, 0x10);
-        assert_eq!(bar, Bar::Io { base: 0xC000, size: 0x10 });
+        assert_eq!(
+            bar,
+            Bar::Io {
+                base: 0xC000,
+                size: 0x10
+            }
+        );
     }
 
     #[test]
@@ -350,7 +411,10 @@ mod tests {
         let dev = nvme_device();
         let bar = dev.decode_bar(0);
         assert!(matches!(bar, Bar::Memory { .. }));
-        if let Bar::Memory { base, size, is_64, .. } = bar {
+        if let Bar::Memory {
+            base, size, is_64, ..
+        } = bar
+        {
             assert_eq!(base, 0xFE00_0000);
             assert_eq!(size, 0x4000); // 16 KiB from mask 0xFFFF_C000
             assert!(is_64);
@@ -364,7 +428,9 @@ mod tests {
         let mut bus = MockPciBus::new();
         // A non-NVMe device (e.g. a VGA controller).
         let mut vga = MockPciDevice {
-            bus: 0, dev: 2, func: 0,
+            bus: 0,
+            dev: 2,
+            func: 0,
             config: ConfigSpace::zeroed(),
             bar_sizes: [0; 6],
         };
@@ -373,7 +439,13 @@ mod tests {
         bus.add(vga);
         bus.add(nvme_device());
         // An absent slot should not match.
-        let mut absent = MockPciDevice { bus: 0, dev: 9, func: 0, config: ConfigSpace::zeroed(), bar_sizes: [0; 6] };
+        let mut absent = MockPciDevice {
+            bus: 0,
+            dev: 9,
+            func: 0,
+            config: ConfigSpace::zeroed(),
+            bar_sizes: [0; 6],
+        };
         absent.config.set_ids(0xFFFF, 0xFFFF);
         absent.config.set_class(0x01, 0x08, 0x02);
         bus.add(absent);
@@ -387,8 +459,20 @@ mod tests {
     #[test]
     fn class_code_matching_is_exact() {
         let nvme = ClassCode::NVME;
-        assert!(nvme.matches(ClassCode { class: 0x01, subclass: 0x08, prog_if: 0x02 }));
-        assert!(!nvme.matches(ClassCode { class: 0x01, subclass: 0x08, prog_if: 0x01 }));
-        assert!(!nvme.matches(ClassCode { class: 0x01, subclass: 0x06, prog_if: 0x02 }));
+        assert!(nvme.matches(ClassCode {
+            class: 0x01,
+            subclass: 0x08,
+            prog_if: 0x02
+        }));
+        assert!(!nvme.matches(ClassCode {
+            class: 0x01,
+            subclass: 0x08,
+            prog_if: 0x01
+        }));
+        assert!(!nvme.matches(ClassCode {
+            class: 0x01,
+            subclass: 0x06,
+            prog_if: 0x02
+        }));
     }
 }

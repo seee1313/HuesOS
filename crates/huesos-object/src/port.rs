@@ -79,9 +79,7 @@ impl Port {
         let packet_bytes = core::mem::size_of::<PortPacket>() as u64;
         let mut packets = self.packets.lock();
         let mut quota = self.quota.lock();
-        if packets.len() >= MAX_PORT_PACKETS
-            || !quota.fits(Resource::Memory, packet_bytes)
-        {
+        if packets.len() >= MAX_PORT_PACKETS || !quota.fits(Resource::Memory, packet_bytes) {
             self.dropped_packets.fetch_add(1, Ordering::Relaxed);
             return Err(PortQueueError::QuotaExceeded);
         }
@@ -107,9 +105,7 @@ impl Port {
     pub fn read(&self) -> Option<PortPacket> {
         let packet = self.packets.lock().pop_front()?;
         let packet_bytes = core::mem::size_of::<PortPacket>() as u64;
-        self.quota
-            .lock()
-            .release(Resource::Memory, packet_bytes);
+        self.quota.lock().release(Resource::Memory, packet_bytes);
         Some(packet)
     }
 
