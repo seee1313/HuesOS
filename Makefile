@@ -55,6 +55,7 @@ audit-check:
 	python3 tools/check-safety-budget.py
 	python3 tools/check-lock-policy.py
 	python3 tools/check-policy-crates.py
+	python3 tools/check-hues-async-noalloc.py
 
 clippy:
 	bash scripts/clippy.sh

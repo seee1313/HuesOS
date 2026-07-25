@@ -58,10 +58,34 @@ unit of surface, (b) documents it in `docs/UNSAFE_AUDIT.md`, and (c) updates
 `safety-budget.json` in the same commit. Do **not** silently raise the budget.
 
 ```bash
-python3 tools/audit-safety.py          # report current surface
-python3 tools/check-safety-budget.py   # hard gate (CI runs this)
-python3 tools/check-policy-crates.py   # policy crate/documentation gate
+python3 tools/audit-safety.py             # report current surface
+python3 tools/check-safety-budget.py      # hard gate (CI runs this)
+python3 tools/check-policy-crates.py      # policy crate/documentation gate
+python3 tools/check-hues-async-noalloc.py # hues-async alloc-free gate (CI runs this)
 ```
+
+---
+
+## 1a. hues-async is strictly allocation-free (hard gate)
+
+`crates/hues-async/**` must not use the `alloc` crate or any heap-backed
+collection / smart-pointer, in production **or** in tests. The executor
+stores futures inline in a fixed-capacity table and tracks readiness in a
+single `u64`; anything on the heap defeats the design.
+
+`tools/check-hues-async-noalloc.py` (invoked by `make audit-check` and by
+the CI `static-safety` job) rejects any of the following identifiers
+inside `crates/hues-async/**/*.rs`:
+
+- `use alloc`, `extern crate alloc`, `alloc::`
+- `Box<`, `Vec<`, `Vec::`, `String`
+- `Arc<`, `Rc<`, `Weak<`
+- `BTreeMap`, `BTreeSet`, `HashMap`, `HashSet`
+- `VecDeque`, `LinkedList`, `BinaryHeap`
+
+If you need a collection inside a hues-async test, use a fixed-size array,
+or move the test to a downstream crate that is allowed to allocate. See
+[docs/ASYNC_RUNTIME.md](docs/ASYNC_RUNTIME.md#project-rule-no-allocations-ever).
 
 ---
 

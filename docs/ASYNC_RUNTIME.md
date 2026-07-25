@@ -41,6 +41,40 @@ arrives, the driver maps it to a `TaskId` (e.g. the NVMe command id) and calls
 `Executor::wake`. This keeps `hues-async` mechanism-only and the policy in the
 driver.
 
+## Project rule: no allocations, ever
+
+`crates/hues-async/**` is **strictly allocation-free**. This is not a
+performance suggestion; it is a hard project rule enforced by CI:
+
+- The crate is `#![cfg_attr(not(test), no_std)]` and must not import the
+  `alloc` crate anywhere (production **or** tests).
+- The following identifiers are forbidden anywhere in a `.rs` file under
+  `crates/hues-async/`: `use alloc`, `extern crate alloc`, `alloc::`,
+  `Box<`, `Vec<`, `Vec::`, `String`, `Arc<`, `Rc<`, `Weak<`, `BTreeMap`,
+  `BTreeSet`, `HashMap`, `HashSet`, `VecDeque`, `LinkedList`, `BinaryHeap`.
+- Tests that need collections must use fixed-size arrays, or live in a
+  downstream crate that consumes `hues-async` and is allowed to allocate.
+
+Enforcement: `tools/check-hues-async-noalloc.py`, wired into
+`make audit-check` and the `static-safety` CI job. Run it locally at any
+time:
+
+```bash
+python3 tools/check-hues-async-noalloc.py
+```
+
+The gate reports every offending line and exits non-zero on any hit. It is
+intentionally a raw-text scan (no AST parsing) so it runs on a fresh
+checkout with only Python 3 available, matches the style of the three
+existing safety gates, and cannot be bypassed with clever type aliases: the
+banned identifiers cover the imports that would introduce them.
+
+Rationale: the executor stores futures inline in a fixed-capacity table and
+tracks readiness in a single `u64`. Any heap-backed container defeats that
+design and re-introduces the runtime overhead the crate exists to avoid.
+Growth beyond the fixed capacity should surface as `SpawnError::TooLarge`
+at compile-time-visible sites, not as a silent `Vec::push`.
+
 ## Contracts
 
 - **Single-threaded.** One executor per driver core; waking and polling happen on
