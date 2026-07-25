@@ -1,13 +1,13 @@
 {
-  "rust_files": 149,
-  "rust_lines": 35583,
+  "rust_files": 150,
+  "rust_lines": 36154,
   "totals": {
     "expect_calls": 22,
     "panic_macros": 5,
     "static_mut": 1,
     "todo_markers": 1,
-    "unsafe_blocks": 236,
-    "unsafe_functions": 56,
+    "unsafe_blocks": 242,
+    "unsafe_functions": 58,
     "unsafe_impls": 28,
     "unwrap_calls": 25
   },
@@ -37,6 +37,7 @@
     "crates/huesos-fat/src/lib.rs": 5,
     "crates/huesos-fb/src/lib.rs": 7,
     "crates/huesos-kernel/src/boot/hbi.rs": 3,
+    "crates/huesos-kernel/src/extable.rs": 4,
     "crates/huesos-kernel/src/init.rs": 4,
     "crates/huesos-kernel/src/lib.rs": 1,
     "crates/huesos-kernel/src/mem/alloc.rs": 12,
@@ -49,6 +50,7 @@
     "crates/huesos-object/src/vmo.rs": 4,
     "crates/huesos-pmm/src/lib.rs": 7,
     "crates/huesos-syscalls/src/acpi_broker.rs": 6,
+    "crates/huesos-syscalls/src/user_access.rs": 4,
     "crates/huesos-syscalls/src/user_memory.rs": 6,
     "crates/huesos-uacpi/src/lib.rs": 12,
     "crates/huesos-user-alloc/src/lib.rs": 1,

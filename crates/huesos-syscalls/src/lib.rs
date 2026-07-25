@@ -21,6 +21,7 @@ mod handle;
 mod port_interrupt;
 mod process;
 mod system;
+mod user_access;
 mod user_memory;
 mod util;
 mod vmo;

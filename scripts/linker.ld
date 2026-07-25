@@ -50,6 +50,22 @@ SECTIONS
         *(.note.gnu.build-id)
     } :rodata
 
+    /* Kernel-user copy exception table. Each 24-byte entry is
+     * (start_rip, end_rip, fixup_rip), emitted by the user_access_ok!
+     * macro's asm! .pushsection block. `KEEP` prevents LTO / GC from
+     * dropping the entries when the wrapping function is inlined.
+     * 8-byte aligned so u64 reads never cross a cache-line for no
+     * reason. Placed in :rodata so it inherits the read-only,
+     * NO_EXECUTE flags stamped by apply_kernel_wx.
+     */
+    . = ALIGN(8);
+    __huesos_ex_table_start = .;
+    .ex_table : ALIGN(8) {
+        KEEP(*(.ex_table))
+        KEEP(*(.ex_table.*))
+    } :rodata
+    __huesos_ex_table_end = .;
+
     . = ALIGN(CONSTANT(MAXPAGESIZE));
     __huesos_rodata_end = .;
 

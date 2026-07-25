@@ -233,9 +233,22 @@ pub unsafe fn kmain(boot_info: BootInfo) -> ! {
     init::framebuffer_init(boot_info.framebuffer);
     huesos_arch::fault::set_kernel_fault_handler(crate::panic::from_cpu_fault);
     huesos_arch::fault::set_user_fault_handler(handle_user_fault);
-    // Install the ring-0 recoverable-copy hook (empty extable in this PR;
-    // see crate::extable module docs for why populating is a follow-up).
-    crate::extable::install();
+    // Read + sort + publish the linker-emitted .ex_table entries and
+    // wire the ring-0 recoverable-copy hook. This is the fault path
+    // that turns a race between a validated syscall copy and a
+    // concurrent VmarUnmap on another CPU into an ordinary
+    // Err(EFAULT) instead of a kernel panic. See crate::extable
+    // module docs for the boot ordering rationale and the rollback
+    // story.
+    let extable_entries = crate::extable::install();
+    {
+        use core::fmt::Write;
+        let mut writer = huesos_arch::serial::SerialWriter;
+        let _ = writeln!(
+            writer,
+            "[extable] installed {extable_entries} recoverable-copy entries"
+        );
+    }
     huesos_hal::init();
     init::syscall_init();
     scheduler::init();

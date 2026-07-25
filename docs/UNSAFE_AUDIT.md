@@ -543,3 +543,56 @@ working" to "not working", so we prefer the graceful degradation.
 Rollback story: deleting the `apply_kernel_wx()` call from `kmain` is
 byte-for-byte compatible with the pre-PR kernel. The linker-exported
 `__huesos_*` symbols are inert if nothing reads them.
+
+## Extable macro infrastructure (dedicated safety-budget review, part 1 of 3)
+
+Follow-up to PR #109 (`feat(extable): install ring-0 recoverable-copy
+fault hook`). This PR lands the *macro infrastructure* — an `asm!`-based
+`recoverable_copy_from_user` / `recoverable_copy_to_user` primitive that
+emits its own `.ex_table` entries into the linker section, plus the
+kernel-side reader that turns those raw entries into a sorted, validated
+`Extable` view. Populating the table with the actual user_memory copy
+sites is PR-2; a userspace `unmap-during-copy` smoke probe is PR-3.
+
+`safety-budget.json` moves in this PR:
+
+- `unsafe_blocks`: 236 → 242 (net +6).
+- `unsafe_functions`: 56 → 58 (net +2).
+
+Per-file breakdown:
+
+- **`crates/huesos-syscalls/src/user_access.rs`** (+2 fn, +2 blocks):
+  * `unsafe fn recoverable_copy_from_user` / `recoverable_copy_to_user`.
+    **Contract:** caller has passed `validate_range` and holds the
+    process `user_memory_lock`. The `unsafe fn` marker is what forces
+    every call site to spell out that it has done so.
+  * `unsafe { asm!(...) }` block inside each function. **SAFETY:** the
+    `asm!` block is opaque to LLVM (no inlining, no reordering, no
+    elision), the src/dst/len operands go in through explicit register
+    constraints, `options(nostack, preserves_flags)` matches the syscall
+    handler calling contract, and a fault inside the protected byte
+    range redirects RIP to the fixup label via the extable — no ambient
+    Rust reference to the raw pointers exists after the fault.
+- **`crates/huesos-kernel/src/extable.rs`** (+4 blocks):
+  * `unsafe { core::ptr::read_unaligned(addr as *const RawEntry) }` in
+    `install`. **SAFETY:** `[__huesos_ex_table_start,
+    __huesos_ex_table_end)` is a linker-defined range of `RawEntry`
+    records; the linker script's `.balign 8` guarantees alignment but
+    `read_unaligned` costs the same on x86 and survives a future
+    linker-script edit.
+  * `unsafe { Arc::from_raw(previous as *const SortedTable) }` in
+    `publish`. **SAFETY:** the previous pointer was published by an
+    earlier `Arc::into_raw` on the same type and was atomically removed
+    from `SORTED_PTR` before we reconstruct + drop.
+  * `unsafe { &*ptr }` (×2) in `try_recover` and `entry_count`.
+    **SAFETY:** `ptr` was published by `install` via `Arc::into_raw`;
+    the `Arc` is intentionally leaked so the pointee lives for the
+    kernel lifetime, so dereferencing is sound from any CPU at any time.
+
+None of the eight new sites can be reached by malformed userspace input:
+the extable itself is emitted at compile time by kernel code only.
+
+Rollback story is unusually clean: the `.ex_table` section is inert
+read-only rodata; if `install()` never runs (delete the call from
+`kmain`), `try_recover` returns `None` for every fault and the fault
+path is byte-for-byte identical to pre-PR behavior.

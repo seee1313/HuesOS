@@ -181,15 +181,24 @@ priority order.
   structure and lookup (see [RECOVERABLE_COPIES.md](RECOVERABLE_COPIES.md)).
 - **Plumbing landed (H1)**: kernel-side `crate::extable` module + arch-side
   `set_kernel_recover_hook` + IDT `#PF` re-entry that redirects RIP to a
-  `fixup_rip` when the extable covers the fault. `EXTABLE_ENTRIES` is
-  intentionally empty in this landing so the fault path stays byte-for-byte
-  identical to the pre-hook kernel — see `docs/UNSAFE_AUDIT.md § "Kernel
-  recoverable-copy hook"` for the safety-budget review.
-- **Needed (on-target)**: (a) a `user_access_ok!` macro emitting
-  `.ex_table` entries around each `huesos-syscalls::user_memory` copy
-  block; (b) linker-collected sorted `.ex_table` visible to
-  `EXTABLE_ENTRIES`; (c) adversarial unmap/protect race smoke test that
-  provokes the fault and expects `EFAULT` rather than a panic; (d)
+  `fixup_rip` when the extable covers the fault.
+- **Macro infrastructure landed (H2 follow-up, part 1 of 3)**:
+  `huesos-syscalls::user_access::recoverable_copy_{from,to}_user` are
+  `asm!`-based user-copy primitives that emit their own `.ex_table`
+  entries via `.pushsection`. `crate::extable::install` now reads the
+  linker-emitted `[__huesos_ex_table_start, __huesos_ex_table_end)`
+  range, sorts it, validates the non-overlap invariant via
+  `Extable::new_sorted`, and publishes the sorted snapshot behind a
+  lock-free `AtomicPtr`. Kernel boots log
+  `[extable] installed N recoverable-copy entries`. See
+  `docs/UNSAFE_AUDIT.md § "Extable macro infrastructure"` for the
+  safety-budget review.
+- **Needed (on-target)**: (a) **part 2** — wire the new user_access
+  primitives into `huesos-syscalls::user_memory::copy_{from,to}_user`
+  and `read_array` / `write_array` so the extable actually covers real
+  syscall paths; (b) **part 3** — a `huesos-userspace/extable-probe`
+  crate that provokes the unmap-during-copy race and expects `EFAULT`,
+  wired into `scripts/ci-qemu-smoke.sh` as a serial-log grep; (c)
   complete SMEP/SMAP copy-window hardening and support mapping splits /
   child VMARs.
 
