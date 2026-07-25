@@ -33,8 +33,11 @@ priority order.
 - Panicking-surface audit (`docs/UNSAFE_AUDIT.md`): every `unwrap`/`expect`/
   `panic!` site categorized (build scripts, budgeted tests, Ring-0 invariants);
   the one Ring-3 runtime unwrap (terminal parser) replaced with a defensive
-  `let-else`; safety budget tightened (`unwrap_calls` 26 → 25) and the baseline
-  regenerated.
+  `let-else`. `unwrap_calls` was tightened `26 → 25` at that point, then later
+  raised to **30** (+5) by the NVMe `PciMmioTransport` host tests; see
+  `docs/UNSAFE_AUDIT.md § "NVMe PciMmioTransport MMIO/DMA boundary"` for the
+  retroactive dedicated-review record. Retiring those five NVMe test unwraps
+  and returning to `unwrap_calls = 25` is tracked as follow-up cleanup.
 
 ### Buffered terminal renderer / post-game stall fix
 - Root cause isolated to per-pixel/per-scanline VMO syscalls during Terminal repaint
@@ -151,6 +154,24 @@ priority order.
 - Full design doc: `docs/design/ASYNC_ARCHITECTURE.md`
 
 ## Immediate
+
+### 0. Enforce `hues-async` alloc-free rule in CI
+- **Current**: the executor is written without `alloc`, but nothing in CI
+  refuses a `Box`/`Vec`/`String`/`Arc`/`alloc::` import that a future
+  contributor might land in `crates/hues-async/**`.
+- **Needed**: a new `tools/check-hues-async-noalloc.py` gate wired into
+  `make audit-check`, plus a matching sentence in `CONTRIBUTING.md` and in
+  `docs/ASYNC_RUNTIME.md`. The gate is a project rule (see the "Rules" the
+  HuesOS Dev effort adopted); it must reject the whole file if any of the
+  forbidden identifiers appear outside a `#[cfg(test)]` block.
+
+### 0b. Retire the five NVMe test unwraps
+- **Current**: `safety-budget.json` sits at `unwrap_calls = 30`; the five
+  extras were introduced by NVMe `buffer_pool`/`queue` host tests
+  (`5f68d39`). CONTRIBUTING §1 forbids new `.unwrap()` in tests.
+- **Needed**: rewrite the tests using `assert!`/`match`/`Result`
+  propagation; drop `unwrap_calls` back to 25; regenerate the baseline in
+  the same commit.
 
 ### 1. Recoverable copies, VMAR unmap/protect, and SMEP/SMAP
 - **Current**: `VmarUnmap` and `VmarProtect` operate on exact mappings under
