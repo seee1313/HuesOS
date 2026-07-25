@@ -77,7 +77,17 @@ pub struct BootInfo<'a> {
 /// active HHDM, firmware tables, framebuffer, modules, and memory map.
 pub unsafe fn kmain(boot_info: BootInfo) -> ! {
     huesos_arch::init_early();
-    init::pmm_init(boot_info.memory_regions, boot_info.hhdm_offset);
+    if let Err(error) = init::pmm_init(boot_info.memory_regions, boot_info.hhdm_offset) {
+        // PMM init runs before heap, panic handler, and framebuffer are
+        // ready, so surface the diagnostic on early serial and halt the
+        // BSP. Matches the pattern used by init::heap_init below.
+        use core::fmt::Write;
+        let mut writer = huesos_arch::serial::SerialWriter;
+        let _ = writeln!(writer, "[boot] PMM init failed: {error:?}");
+        loop {
+            huesos_arch::hlt();
+        }
+    }
 
     // Protect the HBI image from being overwritten by the PMM!
     if let Some(hbi_data) = boot_info.hbi_image {

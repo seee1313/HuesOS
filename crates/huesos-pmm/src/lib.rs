@@ -40,6 +40,17 @@ pub enum PmmError {
     NotInitialized,
 }
 
+/// Errors returned by [`init`]. Unlike [`PmmError`], these are boot-time
+/// conditions that must reach the boot adapter as diagnostics rather than as
+/// a `panic!` before the panic handler is registered.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PmmInitError {
+    /// No usable memory region was large enough to hold the frame bitmap.
+    /// Reported instead of the previous `assert!` so the caller can emit an
+    /// early-serial diagnostic and halt the CPU gracefully.
+    NoUsableRegion,
+}
+
 struct BitmapAllocator {
     /// Higher-half direct map offset, used to turn physical bitmap addresses
     /// into addresses the CPU can actually dereference.
@@ -116,10 +127,19 @@ impl BitmapAllocator {
 /// cover all usable RAM (true for Limine's default HHDM before we build our
 /// own page tables).
 ///
+/// Returns [`PmmInitError::NoUsableRegion`] if no usable memory-map entry is
+/// large enough to hold the frame bitmap. Callers must surface this as a
+/// diagnostic and halt gracefully; the PMM is one of the earliest subsystems
+/// to run and a bare `panic!` here fires before the panic handler / red
+/// framebuffer are wired up, leaving no diagnostic on real hardware.
+///
 /// # Safety
 /// Must be called exactly once, early in boot, before any other PMM function
 /// and while the HHDM mapping supplied by the bootloader is still active.
-pub unsafe fn init(regions: &[MemoryRegion], hhdm_offset: u64) {
+pub unsafe fn init(
+    regions: &[MemoryRegion],
+    hhdm_offset: u64,
+) -> Result<(), PmmInitError> {
     // 1. Determine how many frames we need to track.
     // checked_add + saturate: a memory map whose region end overflows u64 is
     // fundamentally broken; saturating to u64::MAX produces a bitmap
@@ -144,7 +164,9 @@ pub unsafe fn init(regions: &[MemoryRegion], hhdm_offset: u64) {
             break;
         }
     }
-    assert!(found, "PMM: no usable region large enough for bitmap");
+    if !found {
+        return Err(PmmInitError::NoUsableRegion);
+    }
 
     // 3. Zero the bitmap via the HHDM, then mark it fully "used"; we'll clear
     //    bits for usable regions next.
@@ -212,6 +234,8 @@ pub unsafe fn init(regions: &[MemoryRegion], hhdm_offset: u64) {
         free_count,
         (free_count as u64 * FRAME_SIZE) / (1024 * 1024)
     );
+
+    Ok(())
 }
 
 /// Reserve (mark used) an arbitrary physical range without allocating it
@@ -286,9 +310,9 @@ mod tests {
             usable: true,
             kind: 0,
         }];
-        unsafe {
-            init(&regions, hhdm_offset);
-        }
+        // SAFETY: the enclosing TEST_LOCK serializes concurrent host tests.
+        let result = unsafe { init(&regions, hhdm_offset) };
+        assert!(result.is_ok(), "test PMM init failed: {result:?}");
         f()
     }
 
