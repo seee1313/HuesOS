@@ -411,7 +411,7 @@ mod tests {
         let d = RamDisk::new();
 
         // Build a minimal FAT16 image: 2 sectors per cluster.
-        let mut bpb = FatBpb {
+        let bpb = FatBpb {
             jump: [0xEB, 0x3C, 0x90],
             oem_name: *b"MSDOS5.0",
             bytes_per_sector: 512,
