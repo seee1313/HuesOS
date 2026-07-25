@@ -22,6 +22,11 @@ pub enum DriverError {
     InvalidFat,
     PathTooLong,
     InvalidPath,
+    /// The caller-supplied buffer is smaller than the file. The read is
+    /// abandoned without copying any bytes so the caller can retry with a
+    /// larger buffer instead of receiving a silently truncated file that
+    /// looks indistinguishable from a legitimately smaller one.
+    BufferTooSmall,
 }
 
 /// BIOS Parameter Block layout matching the on-disk FAT12/16/32 boot sector.
@@ -278,6 +283,28 @@ impl<'a, D: BlockDevice> FatFileSystem<'a, D> {
 
     // ==================== FILE READING ====================
 
+    /// Return the on-disk size of the file at `path` without reading any
+    /// data. Useful to size a buffer before [`Self::read_file`], which
+    /// refuses to truncate.
+    pub fn file_size(&self, path: &str) -> Result<u64, DriverError> {
+        let entry = self.find_entry(path)?;
+        if entry.is_directory() {
+            return Err(DriverError::NotADirectory);
+        }
+        Ok(entry.file_size as u64)
+    }
+
+    /// Read the entire file at `path` into `buf`.
+    ///
+    /// Contract: on success, exactly `entry.file_size` bytes are written to
+    /// `buf[..entry.file_size]` and that value is returned. If `buf` is
+    /// smaller than the file, this returns [`DriverError::BufferTooSmall`]
+    /// **without** copying any bytes; the caller is expected to consult
+    /// [`Self::file_size`] first (or grow the buffer and retry). The
+    /// previous behavior silently truncated the read at `buf.len()`, which
+    /// is indistinguishable from a legitimately smaller file and led to
+    /// data-loss bugs in higher-level callers (e.g. an ELF loader that
+    /// received a truncated program header table).
     pub fn read_file(&self, path: &str, buf: &mut [u8]) -> Result<usize, DriverError> {
         let entry = self.find_entry(path)?;
 
@@ -285,9 +312,14 @@ impl<'a, D: BlockDevice> FatFileSystem<'a, D> {
             return Err(DriverError::NotADirectory);
         }
 
+        let file_size = entry.file_size as usize;
+        if file_size > buf.len() {
+            return Err(DriverError::BufferTooSmall);
+        }
+
         let mut bytes_read = 0usize;
         let mut cluster = entry.first_cluster();
-        let mut remaining = entry.file_size as usize;
+        let mut remaining = file_size;
 
         while remaining > 0 && !self.is_end_of_chain(cluster) {
             let sector = self.cluster_to_sector(cluster);
@@ -301,10 +333,11 @@ impl<'a, D: BlockDevice> FatFileSystem<'a, D> {
                 self.device.read_sector(sector + s, &mut sector_buf)?;
 
                 let copy_len = core::cmp::min(remaining, 512);
-                if bytes_read + copy_len > buf.len() {
-                    remaining = 0;
-                    break;
-                }
+                // The pre-flight check above guarantees `bytes_read +
+                // copy_len <= buf.len()`; a defensive assertion here would
+                // catch a future regression that broke the pre-flight
+                // invariant but has no effect on today's control flow.
+                debug_assert!(bytes_read + copy_len <= buf.len());
                 buf[bytes_read..bytes_read + copy_len].copy_from_slice(&sector_buf[..copy_len]);
                 bytes_read += copy_len;
                 remaining -= copy_len;
@@ -481,5 +514,105 @@ mod tests {
         let n = fs.read_file("TEST.TXT", &mut buf).unwrap();
         assert_eq!(n, 600);
         assert!(buf[..600].iter().all(|&b| b == 0xAB));
+    }
+
+    /// Test-only fixture builder that lays down a minimal FAT16 image
+    /// (BPB in sector 0, single-FAT table in sector 1, one directory
+    /// entry for TEST.TXT in sector 2, one cluster of 0xAB payload in
+    /// sectors 3-4). Uses byte-by-byte writes rather than a
+    /// reinterpret-cast on the packed record types so the fixture is
+    /// entirely `unsafe`-free and keeps the crate's unsafe budget stable.
+    ///
+    /// Field layout of BPB/DirEntry is fixed by the on-disk FAT spec;
+    /// see `FatBpb` / `DirectoryEntry` in the parent module.
+    fn build_test_image(d: &RamDisk, file_size: u32) {
+        // ----- Sector 0: BPB (only the fields our mount() reads). -----
+        let mut bpb = [0u8; 512];
+        bpb[0..3].copy_from_slice(&[0xEB, 0x3C, 0x90]);
+        bpb[3..11].copy_from_slice(b"MSDOS5.0");
+        bpb[11..13].copy_from_slice(&512u16.to_le_bytes()); // bytes_per_sector
+        bpb[13] = 2; // sectors_per_cluster
+        bpb[14..16].copy_from_slice(&1u16.to_le_bytes()); // reserved_sectors
+        bpb[16] = 1; // num_fats
+        bpb[17..19].copy_from_slice(&16u16.to_le_bytes()); // root_ent_count
+        bpb[19..21].copy_from_slice(&20u16.to_le_bytes()); // total_sectors_16
+        bpb[21] = 0xF0; // media_type
+        bpb[22..24].copy_from_slice(&1u16.to_le_bytes()); // fat_size_16 (nonzero => FAT16)
+                                                          // The remaining BPB fields are zero, matching the historical
+                                                          // fixture.
+        d.write_sector(0, &bpb);
+
+        // ----- Sector 1: FAT table. Entry 0 = media descriptor, entry 1
+        //       = EOC, entry 2 (our file's start cluster) = EOC. -----
+        let mut fat = [0u8; 512];
+        fat[0..2].copy_from_slice(&0xFFF0u16.to_le_bytes());
+        fat[2..4].copy_from_slice(&0xFFF8u16.to_le_bytes());
+        d.write_sector(1, &fat);
+
+        // ----- Sector 2: root dir, first 32-byte slot is TEST.TXT. -----
+        let mut root = [0u8; 512];
+        root[0..8].copy_from_slice(b"TEST    ");
+        root[8..11].copy_from_slice(b"TXT");
+        root[11] = 0x00; // attr (regular file)
+                         // reserved..last_access_date all zero.
+        root[20..22].copy_from_slice(&0u16.to_le_bytes()); // first_cluster_hi
+        root[26..28].copy_from_slice(&2u16.to_le_bytes()); // first_cluster_lo
+        root[28..32].copy_from_slice(&file_size.to_le_bytes());
+        d.write_sector(2, &root);
+
+        // ----- Sectors 3+: payload. `sectors_per_cluster == 2` and the
+        //       chain terminates after cluster 2, so we need at most
+        //       cluster 2's two sectors (3 and 4). -----
+        let payload = [0xABu8; 512];
+        d.write_sector(3, &payload);
+        d.write_sector(4, &payload);
+    }
+
+    #[test]
+    fn read_file_refuses_to_truncate_when_buffer_too_small() {
+        // Regression: read_file used to silently truncate at buf.len(),
+        // returning a byte count smaller than the file with no diagnostic.
+        // Higher-level callers (e.g. an ELF loader that received a
+        // truncated program header table) had no way to distinguish this
+        // from a legitimately shorter file. Contract now: too-small
+        // buffer -> BufferTooSmall, no partial write.
+        let d = RamDisk::new();
+        build_test_image(&d, 512);
+        let Ok(fs) = FatFileSystem::mount(&d) else {
+            assert!(false, "mount must succeed on well-formed image");
+            return;
+        };
+        let mut buf = [0u8; 100];
+        let sentinel = buf;
+        let result = fs.read_file("TEST.TXT", &mut buf);
+        assert_eq!(result, Err(DriverError::BufferTooSmall));
+        assert_eq!(buf, sentinel, "no bytes must be copied on BufferTooSmall");
+    }
+
+    #[test]
+    fn file_size_reports_on_disk_size_without_reading_data() {
+        let d = RamDisk::new();
+        build_test_image(&d, 512);
+        let Ok(fs) = FatFileSystem::mount(&d) else {
+            assert!(false, "mount must succeed");
+            return;
+        };
+        assert_eq!(fs.file_size("TEST.TXT"), Ok(512));
+        assert_eq!(fs.file_size("NOSUCH.TXT"), Err(DriverError::FileNotFound));
+    }
+
+    #[test]
+    fn read_file_succeeds_when_buffer_is_exactly_file_size() {
+        // The boundary case that BufferTooSmall must NOT trigger for.
+        let d = RamDisk::new();
+        build_test_image(&d, 512);
+        let Ok(fs) = FatFileSystem::mount(&d) else {
+            assert!(false, "mount must succeed");
+            return;
+        };
+        let mut buf = [0u8; 512];
+        let result = fs.read_file("TEST.TXT", &mut buf);
+        assert_eq!(result, Ok(512));
+        assert!(buf.iter().all(|&b| b == 0xAB));
     }
 }
