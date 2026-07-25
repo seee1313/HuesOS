@@ -2,28 +2,36 @@
 //!
 //! ## Ownership model
 //!
-//! One mutex protects object entries, userspace-handle counts, kernel mapping
-//! references, and typed indexes. Keeping the state together makes final-close
-//! collection atomic and establishes one lock order. The registry owns one
-//! strong `Arc` while an object is discoverable. Handles are lightweight
-//! `(koid, rights)` values counted here; in-flight Channel handles keep the same
-//! count. VMAR mappings hold explicit kernel references.
+//! One mutex protects object entries, per-object reference accounts (via the
+//! host-tested [`huesos_lifecycle::RefAccount`] policy model), and typed
+//! indexes. Keeping the state together makes final-close collection atomic
+//! and establishes one lock order. The registry owns one strong `Arc` while
+//! an object is discoverable. Handles are lightweight `(koid, rights)`
+//! values counted here; in-flight Channel handles keep the same count. VMAR
+//! mappings hold explicit kernel references.
 //!
-//! Collection removes the registry Arc only when both counts reach zero. The
-//! removed Arc is dropped after releasing the mutex because dropping a Channel
-//! may drop queued transferred handles and recursively update this registry.
+//! Collection removes the registry `Arc` only when [`RefAccount::may_collect`]
+//! returns true (i.e. both counts are zero and the object is still
+//! registered). The removed `Arc` is dropped after releasing the mutex
+//! because dropping a Channel may drop queued transferred handles and
+//! recursively update this registry.
 
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use huesos_lifecycle::RefAccount;
 use spin::Mutex;
 
 use crate::{Interrupt, Job, KernelObject, Koid, Process};
 
 struct RegistryState {
     objects: BTreeMap<Koid, Arc<dyn KernelObject>>,
-    handle_counts: BTreeMap<Koid, u32>,
-    kernel_refs: BTreeMap<Koid, u32>,
+    /// Two-counter reference account per registered object, sourced from the
+    /// host-tested `huesos_lifecycle::RefAccount` specification model. One
+    /// entry replaces the previous split `handle_counts` + `kernel_refs`
+    /// maps, and every `open_*` / `close_*` / `try_collect` call goes
+    /// through the same well-tested API.
+    accounts: BTreeMap<Koid, RefAccount>,
     processes: BTreeMap<Koid, Arc<Process>>,
     interrupts: BTreeMap<u8, Vec<Arc<Interrupt>>>,
 }
@@ -32,24 +40,30 @@ impl RegistryState {
     const fn new() -> Self {
         Self {
             objects: BTreeMap::new(),
-            handle_counts: BTreeMap::new(),
-            kernel_refs: BTreeMap::new(),
+            accounts: BTreeMap::new(),
             processes: BTreeMap::new(),
             interrupts: BTreeMap::new(),
         }
     }
 
-    fn unused(&self, koid: Koid) -> bool {
-        self.handle_counts.get(&koid).copied().unwrap_or(0) == 0
-            && self.kernel_refs.get(&koid).copied().unwrap_or(0) == 0
+    /// Handle and kernel reference counts as `(handles, kernel_refs)`.
+    fn ref_counts(&self, koid: Koid) -> (u32, u32) {
+        match self.accounts.get(&koid) {
+            Some(account) => (account.handle_refs() as u32, account.kernel_refs() as u32),
+            None => (0, 0),
+        }
     }
 
     fn collect_object(&mut self, koid: Koid) -> Option<Arc<dyn KernelObject>> {
-        if !self.unused(koid) {
+        // try_collect() only succeeds when both counts are zero AND the
+        // account is registered AND not already collected. This is the
+        // single point in the file that removes the registry Arc; earlier
+        // hand-rolled checks were spread across three call sites.
+        let account = self.accounts.get_mut(&koid)?;
+        if !account.try_collect() {
             return None;
         }
-        self.handle_counts.remove(&koid);
-        self.kernel_refs.remove(&koid);
+        self.accounts.remove(&koid);
         let object = self.objects.remove(&koid)?;
 
         // Interrupt registry ownership exists only to deliver events to live
@@ -73,12 +87,13 @@ impl RegistryState {
 
 static REGISTRY: Mutex<RegistryState> = Mutex::new(RegistryState::new());
 
-/// Register a new object before publishing its first handle.
+/// Register a new object before publishing its first handle. Idempotent
+/// re-registration is not supported; the caller must not register the same
+/// koid twice.
 pub fn register_object(object: Arc<dyn KernelObject>) {
     let koid = object.koid();
     let mut state = REGISTRY.lock();
-    state.handle_counts.entry(koid).or_insert(0);
-    state.kernel_refs.entry(koid).or_insert(0);
+    state.accounts.insert(koid, RefAccount::registered());
     state.objects.insert(koid, object);
 }
 
@@ -88,8 +103,12 @@ pub fn note_handle_open(koid: Koid) {
         return;
     }
     let mut state = REGISTRY.lock();
-    let count = state.handle_counts.entry(koid).or_insert(0);
-    *count = count.saturating_add(1);
+    if let Some(account) = state.accounts.get_mut(&koid) {
+        // open_handles returns false if the account has already been
+        // collected; ignoring is correct because a stale reference to a
+        // collected koid cannot resurrect the object.
+        let _ = account.open_handles(1);
+    }
 }
 
 /// Release one userspace/in-flight handle reference and collect if unused.
@@ -99,8 +118,8 @@ pub fn note_handle_close(koid: Koid) {
     }
     let removed = {
         let mut state = REGISTRY.lock();
-        if let Some(count) = state.handle_counts.get_mut(&koid) {
-            *count = count.saturating_sub(1);
+        if let Some(account) = state.accounts.get_mut(&koid) {
+            account.close_handles(1);
         }
         state.collect_object(koid)
     };
@@ -120,8 +139,10 @@ pub fn acquire_kernel_ref(koid: Koid) -> Option<Arc<dyn KernelObject>> {
     }
     let mut state = REGISTRY.lock();
     let object = state.objects.get(&koid).cloned()?;
-    let count = state.kernel_refs.entry(koid).or_insert(0);
-    *count = count.saturating_add(1);
+    let account = state.accounts.get_mut(&koid)?;
+    // open_kernel_refs returns false only if collected — impossible here
+    // because we just cloned the object Arc under the same mutex.
+    let _ = account.open_kernel_refs(1);
     Some(object)
 }
 
@@ -132,8 +153,9 @@ pub fn note_kernel_ref_open(koid: Koid) {
         return;
     }
     let mut state = REGISTRY.lock();
-    let count = state.kernel_refs.entry(koid).or_insert(0);
-    *count = count.saturating_add(1);
+    if let Some(account) = state.accounts.get_mut(&koid) {
+        let _ = account.open_kernel_refs(1);
+    }
 }
 
 /// Release one kernel-owned reference and collect if no handles remain.
@@ -143,8 +165,8 @@ pub fn note_kernel_ref_close(koid: Koid) {
     }
     let removed = {
         let mut state = REGISTRY.lock();
-        if let Some(count) = state.kernel_refs.get_mut(&koid) {
-            *count = count.saturating_sub(1);
+        if let Some(account) = state.accounts.get_mut(&koid) {
+            account.close_kernel_refs(1);
         }
         state.collect_object(koid)
     };
@@ -169,7 +191,8 @@ pub fn collect_exited_process(koid: Koid) {
             .processes
             .get(&koid)
             .is_some_and(|process| process.exit_code().is_some());
-        if exited && state.unused(koid) {
+        let (handles, kernel) = state.ref_counts(koid);
+        if exited && handles == 0 && kernel == 0 {
             state.processes.remove(&koid);
         }
         state.collect_object(koid)
@@ -179,11 +202,7 @@ pub fn collect_exited_process(koid: Koid) {
 
 /// Return `(handle_refs, kernel_refs)` for diagnostics and leak tests.
 pub fn object_ref_counts(koid: Koid) -> (u32, u32) {
-    let state = REGISTRY.lock();
-    (
-        state.handle_counts.get(&koid).copied().unwrap_or(0),
-        state.kernel_refs.get(&koid).copied().unwrap_or(0),
-    )
+    REGISTRY.lock().ref_counts(koid)
 }
 
 /// Lookup an object by koid, returning an owning temporary reference.
@@ -219,12 +238,14 @@ pub fn lookup_interrupts_by_irq(irq: u8) -> Vec<Arc<Interrupt>> {
         .unwrap_or_default()
 }
 
-/// Explicitly remove an object and all typed indexes.
+/// Explicitly remove an object and all typed indexes. Unlike the
+/// count-driven `note_*_close` paths, this ignores the reference account
+/// and always removes the object; existing kernel call sites use it for
+/// hard cleanup after a spawn failure or an explicit teardown.
 pub fn unregister_object(koid: Koid) {
     let removed = {
         let mut state = REGISTRY.lock();
-        state.handle_counts.remove(&koid);
-        state.kernel_refs.remove(&koid);
+        state.accounts.remove(&koid);
         state.processes.remove(&koid);
         for list in state.interrupts.values_mut() {
             list.retain(|interrupt| interrupt.koid() != koid);

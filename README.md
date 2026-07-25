@@ -105,10 +105,11 @@ Default `scripts/run.sh` uses `-smp 2`.
 - IOAPIC routing currently covers only the PS/2 keyboard IRQ1, with legacy PIC fallback; general device IRQ routing is not complete
 - No filesystem on real block devices yet (BOOTFS is RAM; FAT crate is
   library-ready, not wired as the production VFS backend)
-- Exited-process address spaces and kernel stacks are reaped, but finished task
-  metadata is retained and the global object registry still needs a complete
-  strong/weak-reference lifecycle (ordinary last-handle close does not yet
-  unregister every object)
+- Exited-process address spaces and kernel stacks are reaped; last-handle
+  close of an ordinary object now drops its registry `Arc` and reclaims
+  frames (via `huesos_lifecycle::RefAccount`). Finished task metadata is
+  still retained in the bounded task graveyard for `TaskWait`-style
+  observers.
 - Dynamic process launch and blocking `ProcessWait` work, but supervision,
   cancellation, and multi-object waits remain MVP-level
 - No dynamic loading / relocations (static ELF only)
