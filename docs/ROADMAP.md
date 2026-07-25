@@ -133,6 +133,20 @@ priority order.
   also exercises a blocking `ProcessWait` wake after a yielding child exit in
   the debug/release, SMP 1/2 smoke matrix
 
+### Async architecture (ring 0 + ring 3 universal async)
+- `hues-async` Executor generic over `Backend` trait: `KernelBackend`
+  (ring 0, SMP-ready) and `UserBackend` (ring 3, single-threaded)
+- `scope_on(fut, &backend)` drives non-'static futures; `spawn` requires
+  `'static` futures in executor slots. Clear separation.
+- Reactor = scheduler: timer callback drains events and wakes tasks.
+  No separate reactor thread. `async_rt::run_sync(fut)` is the kernel
+  async entry point.
+- Completion model: inline metadata (PortPacket), shared ring/CQ
+  (NVMe I/O), peek & claim (Channel IPC with cookie-gated consume)
+- Lock rules: never hold a ranked lock across `.await`. Capacity
+  errors are policy, not bugs.
+- Full design doc: `docs/design/ASYNC_ARCHITECTURE.md`
+
 ## Immediate
 
 ### 1. Recoverable copies, VMAR unmap/protect, and SMEP/SMAP

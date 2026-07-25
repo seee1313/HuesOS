@@ -38,6 +38,8 @@ impl LockRank {
     pub const PROCESS: Self = Self(40);
     /// Wait queues and timeout metadata.
     pub const WAIT: Self = Self(50);
+    /// Ring-0 async runtime (executor + reactor).
+    pub const ASYNC_RT: Self = Self(55);
     /// Per-CPU scheduler state.
     pub const SCHEDULER: Self = Self(60);
     /// Deferred object and process teardown.

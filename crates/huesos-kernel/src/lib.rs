@@ -20,6 +20,9 @@ pub mod shutdown;
 pub mod smp;
 pub mod task;
 
+/// Ring-0 async runtime: per-CPU executor with reactor model.
+pub mod async_rt;
+
 pub use huesos_pmm::MemoryRegion;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
