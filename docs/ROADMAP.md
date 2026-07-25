@@ -287,6 +287,13 @@ priority order.
 ### 10. Scheduler polish
 - Work-stealing, better AP timer calibration without PIT races, fair
   migration, and serial-log interleaving cleanup under SMP.
+- **Landed**: EDF replenish-on-unblock. A Deadline task blocked for
+  longer than one period would previously wake with a stale (past)
+  deadline and be given infinite priority by EDF, starving every other
+  Deadline task. `wake_task` now rebases `deadline = now + period` and
+  refills `remaining_budget` — matching a standard Constant Bandwidth
+  Server. Pure helper `replenish_deadline_on_unblock` covered by three
+  host tests including overflow saturation.
 
 ## Long Term
 
