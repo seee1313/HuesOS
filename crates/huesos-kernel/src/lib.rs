@@ -199,6 +199,9 @@ pub unsafe fn kmain(boot_info: BootInfo) -> ! {
     };
 
     let panic_test_requested = boot_info.hbi_image.is_some_and(cmdline_requests_panic_test);
+    let extable_test_requested = boot_info
+        .hbi_image
+        .is_some_and(cmdline_requests_extable_test);
     init::object_init();
 
     if firmware_tables_mapped && uacpi_tables_ready {
@@ -248,6 +251,9 @@ pub unsafe fn kmain(boot_info: BootInfo) -> ! {
             writer,
             "[extable] installed {extable_entries} recoverable-copy entries"
         );
+    }
+    if extable_test_requested {
+        run_extable_synthetic_probe();
     }
     huesos_hal::init();
     init::syscall_init();
@@ -400,6 +406,14 @@ fn install_acpi_broker(
 }
 
 fn cmdline_requests_panic_test(hbi_data: &[u8]) -> bool {
+    cmdline_flag_present(hbi_data, b"panic_test=1")
+}
+
+fn cmdline_requests_extable_test(hbi_data: &[u8]) -> bool {
+    cmdline_flag_present(hbi_data, b"extable_test=1")
+}
+
+fn cmdline_flag_present(hbi_data: &[u8], needle: &[u8]) -> bool {
     use crate::boot::hbi::{HbiImage, ModuleType};
 
     let Ok(image) = HbiImage::parse(hbi_data) else {
@@ -410,7 +424,42 @@ fn cmdline_requests_panic_test(hbi_data: &[u8]) -> bool {
     };
     cmdline
         .split(|byte| byte.is_ascii_whitespace())
-        .any(|argument| argument == b"panic_test=1")
+        .any(|argument| argument == needle)
+}
+
+/// Trigger the synthetic recoverable-copy probe from
+/// [`huesos_syscalls::user_access`] and log the outcome on early serial.
+/// Only invoked when the HBI command-line requests `extable_test=1`.
+///
+/// The probe intentionally accesses an unmapped userspace address; the
+/// kernel's IDT `#PF` handler is expected to consult the extable and
+/// redirect execution to the fixup landing pad, so the caller observes
+/// an ordinary `Err(ErrorCode::InvalidArgs)` and the kernel keeps
+/// running. If the probe returns any other outcome the fault path is
+/// broken and the CI QEMU smoke gate will fail on the missing / wrong
+/// marker.
+fn run_extable_synthetic_probe() {
+    use core::fmt::Write;
+    let mut writer = huesos_arch::serial::SerialWriter;
+    // SAFETY: this is the only call site of the trusted probe. It runs
+    // once during kmain, on the BSP, before any userspace process is
+    // spawned. No user-controlled data reaches the fault path — the
+    // faulting address is a compile-time constant deep inside the
+    // canonical lower half of the address space.
+    match unsafe { huesos_syscalls::user_access::synthetic_recoverable_copy_probe() } {
+        Ok(()) => {
+            let _ = writeln!(
+                writer,
+                "[extable-test] recovered synthetic user-copy fault OK"
+            );
+        }
+        Err(error) => {
+            let _ = writeln!(
+                writer,
+                "[extable-test] FAILED: probe returned {error:?} instead of recovered fault"
+            );
+        }
+    }
 }
 
 fn handle_user_fault(info: huesos_arch::fault::FaultInfo) -> ! {

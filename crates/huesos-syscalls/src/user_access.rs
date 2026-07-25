@@ -172,3 +172,58 @@ pub(crate) unsafe fn recoverable_copy_to_user(
         Err(huesos_abi::ErrorCode::InvalidArgs)
     }
 }
+
+/// Synthetic recoverable-copy probe used by the QEMU smoke gate.
+///
+/// Deliberately calls [`recoverable_copy_from_user`] with a userspace
+/// address that is **guaranteed unmapped** (a canonical bottom-half
+/// address well below the initial user stack region). The copy is
+/// expected to take a ring-0 `#PF` on the very first byte, land at the
+/// extable fixup, and return `Err(ErrorCode::InvalidArgs)` — without
+/// panicking the kernel.
+///
+/// This is *not* a race probe: userspace does not race
+/// `validate_range` against a concurrent `VmarUnmap`, because that
+/// would need cross-CPU threading infrastructure the current userspace
+/// runtime does not yet expose. Instead, this probe verifies the fault
+/// **recovery** half of the mechanism directly: if the kernel's IDT
+/// `#PF` handler consults the extable and jumps to the fixup landing
+/// pad, the whole `recoverable_copy` primitive is by construction
+/// covered — the race path only differs in *why* the page went away.
+///
+/// Returns `Ok(())` if recovery worked (i.e. the caller observed
+/// `Err(InvalidArgs)` from the underlying copy, which is the recovery
+/// path's return value) or `Err(ErrorCode::Internal)` if the copy
+/// unexpectedly succeeded (which means the extable didn't fire and
+/// something is very wrong).
+///
+/// The probe is only invoked from `kmain` when the HBI command-line
+/// requests it (`extable_test=1`). Ring-3 processes cannot reach this
+/// function even though it is `pub`: the `huesos-syscalls` crate is
+/// linked only into the kernel.
+///
+/// # Safety
+/// The caller must be a trusted kernel path that intentionally wants to
+/// take a ring-0 `#PF` on a validated fault-recovery site. `dst` is a
+/// small kernel-owned scratch buffer.
+pub unsafe fn synthetic_recoverable_copy_probe() -> Result<(), huesos_abi::ErrorCode> {
+    // Guaranteed-unmapped ring-3 address: well inside the canonical
+    // lower half, below the initial user stack (USER_STACK_TOP is
+    // ~0x0000_7fff_ff00_0000; we pick 0x0000_1000_0000_0000, which
+    // sits above USER_ASPACE_BASE but below any real allocation the
+    // kernel ever installs in the ring-0 debug/tests probe path).
+    const UNMAPPED_USER_ADDR: *const u8 = 0x0000_1000_0000_0000 as *const u8;
+    let mut scratch = [0u8; 8];
+    // SAFETY: dst is a live kernel-owned stack array; src is an
+    // intentionally-unmapped userspace address whose access will fault
+    // and be recovered by the extable. len is small so the probe is
+    // over quickly.
+    let outcome = unsafe {
+        recoverable_copy_from_user(scratch.as_mut_ptr(), UNMAPPED_USER_ADDR, scratch.len())
+    };
+    match outcome {
+        Err(huesos_abi::ErrorCode::InvalidArgs) => Ok(()),
+        Ok(()) => Err(huesos_abi::ErrorCode::Internal),
+        Err(other) => Err(other),
+    }
+}

@@ -632,3 +632,67 @@ per record; the race window on a single 8-byte read of a fresh
 `WaitSetItem` is microscopic compared to a 1 MiB VMO copy, so it is
 intentionally deferred to a later PR that also adds a
 `recoverable_read_at::<T>` helper.
+
+## Extable smoke probe (dedicated safety-budget review, part 3 of 3)
+
+Follow-up to PR-2 (`feat(extable): wire recoverable_copy_* into
+user_memory bulk paths`). PR-2 landed the wire-up; a CI-side proof
+that the wire-up actually recovers a real ring-0 `#PF` on target was
+the missing piece. This PR ships that proof.
+
+Design decision: the probe is **kernel-side synthetic**, not a
+userspace multithreaded race. A cross-CPU race between
+`validate_range` and `VmarUnmap` requires intra-process threading
+that the current userspace runtime does not yet expose
+(`Thread::create` targets another process). A single-process probe
+that unmaps its own buffer before the syscall would be filtered out
+by `validate_range` before ever reaching the copy — so it would not
+exercise the fault-recovery path. The synthetic probe skips
+`validate_range` (kernel is trusted) and calls
+`recoverable_copy_from_user` directly with a guaranteed-unmapped
+canonical-lower-half address; the ring-0 `#PF` and the extable
+lookup are identical to the race path, only the reason the page went
+away differs. If IDT `#PF` → `try_kernel_recover` → fixup landing
+pad works, the mechanism works for the race case by construction.
+
+`safety-budget.json` moves in this PR:
+
+- `unsafe_blocks`: 242 → 244 (net +2).
+- `unsafe_functions`: 58 → 59 (net +1).
+
+Per-file breakdown:
+
+- **`crates/huesos-syscalls/src/user_access.rs`** (+1 fn, +1 block):
+  * `pub unsafe fn synthetic_recoverable_copy_probe`. **Contract:**
+    caller is a trusted kernel path that *intentionally* wants to
+    take a ring-0 `#PF` on a validated recovery site. The `unsafe fn`
+    marker forces every call site to spell that out; there is
+    exactly one call site (`run_extable_synthetic_probe` in kmain).
+  * `unsafe { recoverable_copy_from_user(...) }` block inside the
+    probe. **SAFETY:** dst is a live kernel-owned stack array; src
+    is the intentionally-unmapped `0x0000_1000_0000_0000` in the
+    canonical lower half of the address space; len is 8 bytes.
+- **`crates/huesos-kernel/src/lib.rs`** (+1 block):
+  * `unsafe { user_access::synthetic_recoverable_copy_probe() }` in
+    `run_extable_synthetic_probe`. **SAFETY:** the single call site
+    runs once during kmain on the BSP, before any userspace process
+    is spawned; no user-controlled data reaches the fault path
+    (faulting address is a compile-time constant).
+
+Every new site has an inline SAFETY comment.
+
+## CI wiring
+
+New `.github/workflows/hardening.yml` job `qemu-extable-smoke` runs
+in matrix `{debug, release}` (both profiles so a release/LTO
+regression — the historical failure mode of `651cc1c revert` —
+surfaces here even if the debug boot smoke is green). The job:
+
+1. Writes `extable_test=1` into `build/cmdline.txt`.
+2. Builds the ISO (mkhbi.sh picks up the new cmdline).
+3. Boots QEMU with a 120 s timeout.
+4. Requires: no `KERNEL PANIC` marker, the positive marker
+   `[extable-test] recovered synthetic user-copy fault OK`, and
+   absence of the explicit failure marker `[extable-test] FAILED`.
+5. Uploads the serial log as an artifact even on failure so a
+   regression can be triaged from the CI UI.

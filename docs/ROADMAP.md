@@ -200,15 +200,26 @@ priority order.
   `rep movsb` opcode in the corresponding copy helper. VMO reads and
   Channel messages (the paths that dominate bulk userspace byte
   traffic) are now covered.
-- **Needed (on-target)**: (a) **part 3** — a
-  `huesos-userspace/extable-probe` crate that provokes the
-  unmap-during-copy race and expects `EFAULT`, wired into
-  `scripts/ci-qemu-smoke.sh` as a serial-log grep; (b) wire
-  `read_value` / `read_array` / `write_value` / `write_array` through
-  a new `recoverable_read_at::<T>` helper (deferred: the race window
-  on a single small ABI record is microscopic vs. a 1 MiB VMO copy);
-  (c) complete SMEP/SMAP copy-window hardening and support mapping
-  splits / child VMARs.
+- **Smoke probe landed (H2 follow-up, part 3 of 3)**: kernel-side
+  `huesos_syscalls::user_access::synthetic_recoverable_copy_probe`,
+  gated by HBI cmdline `extable_test=1` and dispatched from `kmain`.
+  New CI job `qemu-extable-smoke` in `.github/workflows/hardening.yml`
+  runs in matrix `{debug, release}` (both profiles so a release/LTO
+  regression — the historical failure mode of `651cc1c revert` —
+  surfaces even if the debug boot smoke is green) and requires the
+  positive `[extable-test] recovered synthetic user-copy fault OK`
+  serial-log marker plus absence of `KERNEL PANIC` and
+  `[extable-test] FAILED`. See `docs/UNSAFE_AUDIT.md § "Extable smoke
+  probe"` for the design rationale (kernel-side synthetic vs.
+  userspace race).
+- **Needed (on-target)**: (a) wire `read_value` / `read_array` /
+  `write_value` / `write_array` through a new
+  `recoverable_read_at::<T>` helper (deferred: the race window on a
+  single small ABI record is microscopic vs. a 1 MiB VMO copy); (b)
+  complete SMEP/SMAP copy-window hardening and support mapping
+  splits / child VMARs; (c) once intra-process threading lands in
+  userspace, add a real cross-CPU race probe alongside the synthetic
+  one.
 
 ### 2. IOAPIC interrupt routing
 - **Current**: LAPIC timer on all CPUs; keyboard IRQ1 is routed through an

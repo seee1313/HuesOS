@@ -21,7 +21,14 @@ mod handle;
 mod port_interrupt;
 mod process;
 mod system;
-mod user_access;
+/// Recoverable user-memory access primitives with `.ex_table` fault
+/// recovery. `pub` because the kernel's `extable_test=1` synthetic
+/// probe calls [`user_access::synthetic_recoverable_copy_probe`]
+/// directly. Ordinary syscall handlers still route through
+/// [`user_memory::copy_from_user`] / [`copy_to_user`][`user_memory::copy_to_user`],
+/// which enforce validate_range + user_memory_lock before calling
+/// into user_access.
+pub mod user_access;
 mod user_memory;
 mod util;
 mod vmo;
