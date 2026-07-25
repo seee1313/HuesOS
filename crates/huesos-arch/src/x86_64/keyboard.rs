@@ -68,6 +68,24 @@ const LSHIFT_UP: u8 = 0xAA;
 const RSHIFT_DOWN: u8 = 0x36;
 const RSHIFT_UP: u8 = 0xB6;
 
+/// Wait-queue callback: invoked by the keyboard IRQ handler when a
+/// character is pushed to the ring buffer. The kernel registers a
+/// callback that wakes async futures (and blocking readers) via the
+/// WaitQueue Waker bridge.
+///
+/// This indirection keeps huesos-arch free of huesos-object
+/// dependencies.
+type KeyWakeFn = fn();
+static KEY_WAKE_FN: crate::sync::RankedIrqSafeTicketLock<
+    Option<KeyWakeFn>,
+> = crate::sync::RankedIrqSafeTicketLock::new(None, crate::sync::LockRank::ARCHITECTURE);
+
+/// Register the kernel's wake callback. Called once from kernel init
+/// after the keyboard WaitQueue is set up.
+pub fn set_key_wake_fn(f: KeyWakeFn) {
+    *KEY_WAKE_FN.lock() = Some(f);
+}
+
 /// Called from the IDT keyboard interrupt handler with the raw scancode.
 pub fn on_scancode(scancode: u8) {
     match scancode {
@@ -99,6 +117,10 @@ pub fn on_scancode(scancode: u8) {
         if ch != 0 {
             BUFFER.lock().push(ch);
             BYTES_RECEIVED.fetch_add(1, Ordering::Relaxed);
+            // IRQ -> reactor bridge: invoke the kernel's wake callback.
+            if let Some(f) = *KEY_WAKE_FN.lock() {
+                f();
+            }
         }
     }
 }
@@ -134,6 +156,36 @@ pub fn prepare_shutdown() {
                 break;
             }
             core::hint::spin_loop();
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Async WaitForKey future (IRQ -> reactor bridge)
+// ---------------------------------------------------------------------------
+
+use core::future::Future;
+use core::pin::Pin;
+use core::task::{Context, Poll};
+
+/// A zero-alloc future that awaits the next keyboard character.
+///
+/// The keyboard IRQ handler invokes the registered wake callback
+/// (via set_key_wake_fn) when a character is pushed. This future
+/// polls read_char() and returns Ready when a character is available.
+pub struct WaitForKey;
+
+impl Future for WaitForKey {
+    type Output = u8;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        if let Some(ch) = read_char() {
+            Poll::Ready(ch)
+        } else {
+            // No character. Wake ourselves to re-check. The kernel's
+            // wake callback provides actual notification.
+            cx.waker().wake_by_ref();
+            Poll::Pending
         }
     }
 }
