@@ -1,4 +1,15 @@
-/* HuesOS kernel linker script - Limine higher-half ELF kernel. */
+/* HuesOS kernel linker script - Limine higher-half ELF kernel.
+ *
+ * The kernel exports page-aligned start / end symbols for every
+ * non-`.text` load segment. `huesos_arch::paging::apply_kernel_wx()`
+ * walks those ranges after paging init and sets `NO_EXECUTE` on
+ * every 4 KiB page they cover, so a write-what-where in kernel
+ * data cannot be re-purposed as a code-execution gadget through
+ * one of the higher-half data windows.
+ *
+ * `.text` deliberately has no such symbols: it is the *only*
+ * higher-half range that must remain executable.
+ */
 OUTPUT_FORMAT(elf64-x86-64)
 ENTRY(kmain_entry)
 
@@ -15,13 +26,14 @@ SECTIONS
     /* Limine loads kernels within the topmost 2GiB of the address space. */
     . = 0xffffffff80000000;
 
+    __huesos_limine_requests_start = .;
     .limine_requests : {
         KEEP(*(.requests_start_marker))
         KEEP(*(.requests))
         KEEP(*(.requests_end_marker))
     } :limine_requests
-
     . = ALIGN(CONSTANT(MAXPAGESIZE));
+    __huesos_limine_requests_end = .;
 
     .text : {
         *(.text .text.*)
@@ -29,6 +41,7 @@ SECTIONS
 
     . = ALIGN(CONSTANT(MAXPAGESIZE));
 
+    __huesos_rodata_start = .;
     .rodata : {
         *(.rodata .rodata.*)
     } :rodata
@@ -38,7 +51,9 @@ SECTIONS
     } :rodata
 
     . = ALIGN(CONSTANT(MAXPAGESIZE));
+    __huesos_rodata_end = .;
 
+    __huesos_data_start = .;
     .data : {
         *(.data .data.*)
     } :data
@@ -47,6 +62,8 @@ SECTIONS
         *(.bss .bss.*)
         *(COMMON)
     } :data
+    . = ALIGN(CONSTANT(MAXPAGESIZE));
+    __huesos_data_end = .;
 
     /DISCARD/ : {
         *(.eh_frame*)

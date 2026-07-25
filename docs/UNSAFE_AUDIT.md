@@ -503,3 +503,43 @@ Follow-up (not in this PR):
    contributions into a single sorted array visible to `EXTABLE_ENTRIES`.
 3. Smoke test: a userspace `unmap-during-copy` probe that provokes the race
    and expects `EFAULT`, not a kernel panic.
+
+## Kernel W^X sweep (dedicated safety-budget review)
+
+`huesos-arch::paging::apply_kernel_wx` is a post-init hardening sweep
+that stamps `NO_EXECUTE` on every kernel `.rodata` / `.data` / `.bss` /
+`.limine_requests` page. It complements the `flags::KERNEL_RW` default
+(landed in PR #101, kernel-heap-nx) by also covering pages that
+**Limine** installed at kernel load time before the kernel owned the
+mapper. `.text` is the only higher-half range that must remain
+executable and is intentionally not touched.
+
+Without this sweep, a write-what-where in kernel data (a bug we do
+not have today, but future NVMe/PCI DMA plumbing is exactly the kind
+of code where one can appear) could stage a code-execution gadget in
+`.data` or `.bss`. With it, the same primitive becomes a `#PF`
+NX-violation and is caught by the ring-0 panic path.
+
+`safety-budget.json` moves in this PR:
+
+- `unsafe_blocks`: 235 → 236 (net +1). One new `unsafe` block in
+  `crates/huesos-arch/src/x86_64/paging.rs`: `unsafe {
+  mapper.update_flags(page, target) }` inside `stamp_nx_range`.
+  **SAFETY:** mapper is the kernel PML4; `translate` proved the page
+  is currently mapped; we only OR `NO_EXECUTE` in on top of the
+  existing flags and preserve every other bit.
+- Reading the linker-provided `__huesos_*_start / _end` symbols uses
+  `core::ptr::addr_of!` on an `extern static` and does **not**
+  require an `unsafe` block in this edition — the address computation
+  itself is safe, only a dereference would be unsafe.
+- `unsafe_functions` / `unsafe_impls` / `unwrap_calls` / `expect_calls`
+  / `panic_macros` / `static_mut` unchanged.
+
+The sweep is opportunistic: `apply_kernel_wx` returns `Result` but a
+failure is logged on early serial and the kernel continues. A halt on
+the hardening path would be an unforced downgrade from "hardened +
+working" to "not working", so we prefer the graceful degradation.
+
+Rollback story: deleting the `apply_kernel_wx()` call from `kmain` is
+byte-for-byte compatible with the pre-PR kernel. The linker-exported
+`__huesos_*` symbols are inert if nothing reads them.

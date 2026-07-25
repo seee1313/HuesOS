@@ -211,6 +211,119 @@ pub fn map_identity_range(phys_base: u64, length: u64) -> Result<(), KernelPageE
     )
 }
 
+/// Stamp `NO_EXECUTE` on every 4 KiB page in the higher-half virtual
+/// range `[start, end)`. Pages that are unmapped or already NX are
+/// silently skipped; huge-page parent entries are skipped as well
+/// because HuesOS's linker script page-aligns each load segment, so
+/// no huge page ever covers one of the ranges we stamp here.
+///
+/// This is intended for kernel-image data ranges (`.rodata`, `.data`,
+/// `.bss`, `.limine_requests`) — never for `.text`, which must remain
+/// executable. See [`apply_kernel_wx`].
+///
+/// # Errors
+/// Returns [`KernelPageError::NotInitialized`] if paging has not been
+/// initialized yet. Individual per-page failures do not surface as
+/// errors: this hardening pass is opportunistic and never worth
+/// halting the boot for.
+///
+/// # Safety
+/// Must run after [`init`] and after EFER.NXE is set on the current
+/// CPU (established by [`crate::cpu::enable_memory_protection`]).
+pub fn stamp_nx_range(start: u64, end: u64) -> Result<(), KernelPageError> {
+    use x86_64::structures::paging::mapper::{FlagUpdateError, Translate, TranslateResult};
+
+    if start >= end {
+        return Ok(());
+    }
+    let mut guard = KERNEL_PAGE_TABLE.lock();
+    let mapper = guard.as_mut().ok_or(KernelPageError::NotInitialized)?;
+
+    let mut virt = start & !0xfff;
+    let last = (end - 1) & !0xfff;
+    loop {
+        let page = Page::<Size4KiB>::containing_address(VirtAddr::new(virt));
+        // Peek the current flags so we can OR in NO_EXECUTE without
+        // clobbering PRESENT / WRITABLE / other bits Limine set at load
+        // time. TranslateResult::Mapped exposes the leaf-entry flags.
+        if let TranslateResult::Mapped { flags: current, .. } =
+            mapper.translate(page.start_address())
+        {
+            let target = current | PageTableFlags::NO_EXECUTE;
+            if target != current {
+                // SAFETY: mapper is the kernel PML4; the page is
+                // mapped (per the Translate check above); we only OR
+                // NX in and preserve every other bit. `update_flags`
+                // still enforces its own preconditions internally and
+                // returns Err for a huge-page parent entry, which we
+                // treat as a benign skip rather than an error.
+                match unsafe { mapper.update_flags(page, target) } {
+                    Ok(flush) => flush.flush(),
+                    Err(FlagUpdateError::PageNotMapped)
+                    | Err(FlagUpdateError::ParentEntryHugePage) => {}
+                }
+            }
+        }
+        if virt == last {
+            break;
+        }
+        // Saturating on overflow guards against a caller passing
+        // `end == u64::MAX`; higher-half kernel ranges never
+        // approach that value.
+        let next = virt.saturating_add(4096);
+        if next <= virt {
+            break;
+        }
+        virt = next;
+    }
+    Ok(())
+}
+
+/// Post-init W^X sweep for the kernel image.
+///
+/// Walks the non-`.text` load segments (`.limine_requests`, `.rodata`,
+/// `.data`, `.bss`) exported by `scripts/linker.ld` and stamps
+/// `NO_EXECUTE` on every 4 KiB page they cover. `.text` is the only
+/// higher-half range that must remain executable and is intentionally
+/// not touched.
+///
+/// This turns a hypothetical write-what-where in kernel data into a
+/// `#PF` NX-violation instead of a code-execution primitive. It is a
+/// hardening layer on top of [`flags::KERNEL_RW`] (which already sets
+/// `NO_EXECUTE` on every mapping installed *by us* through
+/// [`init::heap_init`] etc.); this sweep additionally covers the
+/// pages *Limine* installed at load time before we owned the mapper.
+///
+/// The kernel boots successfully whether or not this succeeds; a
+/// failure only removes the extra hardening layer.
+///
+/// # Safety
+/// Same contract as [`stamp_nx_range`].
+pub fn apply_kernel_wx() -> Result<(), KernelPageError> {
+    extern "C" {
+        static __huesos_limine_requests_start: u8;
+        static __huesos_limine_requests_end: u8;
+        static __huesos_rodata_start: u8;
+        static __huesos_rodata_end: u8;
+        static __huesos_data_start: u8;
+        static __huesos_data_end: u8;
+    }
+    // Taking the address of an extern static via `addr_of!` is safe
+    // (no dereference); we cast to u64 for the byte-range API.
+    let (rq_start, rq_end, ro_start, ro_end, da_start, da_end) = (
+        core::ptr::addr_of!(__huesos_limine_requests_start) as u64,
+        core::ptr::addr_of!(__huesos_limine_requests_end) as u64,
+        core::ptr::addr_of!(__huesos_rodata_start) as u64,
+        core::ptr::addr_of!(__huesos_rodata_end) as u64,
+        core::ptr::addr_of!(__huesos_data_start) as u64,
+        core::ptr::addr_of!(__huesos_data_end) as u64,
+    );
+    stamp_nx_range(rq_start, rq_end)?;
+    stamp_nx_range(ro_start, ro_end)?;
+    stamp_nx_range(da_start, da_end)?;
+    Ok(())
+}
+
 fn map_phys_range(
     phys_base: u64,
     length: u64,

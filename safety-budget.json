@@ -1,12 +1,12 @@
 {
-  "rust_files": 148,
-  "rust_lines": 34986,
+  "rust_files": 149,
+  "rust_lines": 35583,
   "totals": {
     "expect_calls": 22,
     "panic_macros": 5,
     "static_mut": 1,
     "todo_markers": 1,
-    "unsafe_blocks": 235,
+    "unsafe_blocks": 236,
     "unsafe_functions": 56,
     "unsafe_impls": 28,
     "unwrap_calls": 25
@@ -29,7 +29,7 @@
     "crates/huesos-arch/src/x86_64/keyboard.rs": 2,
     "crates/huesos-arch/src/x86_64/lapic.rs": 12,
     "crates/huesos-arch/src/x86_64/mod.rs": 6,
-    "crates/huesos-arch/src/x86_64/paging.rs": 28,
+    "crates/huesos-arch/src/x86_64/paging.rs": 29,
     "crates/huesos-arch/src/x86_64/pit.rs": 1,
     "crates/huesos-arch/src/x86_64/serial.rs": 2,
     "crates/huesos-arch/src/x86_64/syscall.rs": 2,
