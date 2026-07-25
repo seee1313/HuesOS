@@ -154,3 +154,28 @@ impl KernelObject for Process {
         self
     }
 }
+
+/// RAII guard for process exit waiter registration. Automatically
+/// removes the waiter when dropped, preventing waiter count mismatch
+/// on error paths.
+pub struct ExitWaiterGuard<'a> {
+    process: &'a Process,
+}
+
+impl<'a> ExitWaiterGuard<'a> {
+    /// Register an exit waiter and return a guard. The guard will
+    /// automatically call remove_exit_waiter() when dropped.
+    pub fn new(process: &'a Process) -> Option<Self> {
+        if process.add_exit_waiter() {
+            Some(Self { process })
+        } else {
+            None
+        }
+    }
+}
+
+impl Drop for ExitWaiterGuard<'_> {
+    fn drop(&mut self) {
+        self.process.remove_exit_waiter();
+    }
+}

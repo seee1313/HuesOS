@@ -160,9 +160,11 @@ pub(crate) fn sys_channel_read(
     // message data is lost but ChannelMessage::Drop releases any in-flight
     // handles via note_handle_close. No handle leak, but data loss is
     // unavoidable without a peek/consume split (future hardening).
-    let to_copy = msg.data.len().min(capacity);
-    user_memory::copy_to_user(buf, &msg.data[..to_copy])?;
-    user_memory::write_value(out_actual, &(to_copy as u32))?;
+    if msg.data.len() > capacity {
+        return Err(ErrorCode::BufferTooSmall);
+    }
+    user_memory::copy_to_user(buf, &msg.data)?;
+    user_memory::write_value(out_actual, &(msg.data.len() as u32))?;
     Ok(0)
 }
 
