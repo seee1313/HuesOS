@@ -72,8 +72,14 @@ static STATE: SingleThreadState = SingleThreadState::new();
 unsafe extern "C" {
     fn doomgeneric_Create(argc: i32, argv: *mut *mut u8);
     fn doomgeneric_Tick();
-    static mut DG_ScreenBuffer: *mut u32;
 }
+
+/// Replaces the previous `static mut DG_ScreenBuffer`. The C engine writes
+/// through the same memory address (`#[no_mangle]` keeps the symbol visible),
+/// but Rust reads it safely via `UnsafeCell` under the single-thread/non-
+/// reentrant contract documented in `SAFETY:` comments.
+#[no_mangle]
+pub static DG_ScreenBuffer: UnsafeCell<*mut u32> = UnsafeCell::new(core::ptr::null_mut());
 
 #[unsafe(no_mangle)]
 pub extern "C" fn _start() -> ! {
@@ -195,8 +201,10 @@ fn read_u64(bytes: &[u8]) -> u64 {
 #[unsafe(no_mangle)]
 pub extern "C" fn DG_DrawFrame() {
     // SAFETY: DoomGeneric owns a valid 640x400 screen buffer after Create and
-    // calls DrawFrame synchronously while it remains allocated.
-    let source_ptr = unsafe { DG_ScreenBuffer };
+    // calls DrawFrame synchronously while it remains allocated. The single-
+    // thread/non-reentrant contract guarantees no concurrent mutation of the
+    // UnsafeCell backing `DG_ScreenBuffer`.
+    let source_ptr = unsafe { *DG_ScreenBuffer.get() };
     if source_ptr.is_null() {
         return;
     }
