@@ -45,7 +45,7 @@ see [Known Limitations](#known-limitations) and
   reschedule on remote spawn
 - ✅ Scheduler: Fair (CFS-like WAVL-tree) + Deadline (EDF) policies, not
   just plain round-robin
-- ✅ Buddy + slab kernel heap (`huesos-alloc`, 128 MiB heap, `page_size`-aware)
+- ✅ Buddy + slab kernel heap (`huesos-alloc`, 64 MiB heap, `page_size`-aware)
 - ✅ FAT16/32 driver crate (`huesos-fat`) with correct on-disk BPB layout
   and FAT16-aware end-of-chain
 - ✅ ELF64 loader (`huesos-elf`) that maps `PT_LOAD` segments into a fresh
