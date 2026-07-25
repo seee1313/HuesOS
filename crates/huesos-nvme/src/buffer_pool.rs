@@ -134,11 +134,30 @@ impl DmaBufferPool {
 mod tests {
     use super::*;
 
+    // Helper: unpack an Option in a test without calling unwrap. CONTRIBUTING
+    // rule 1 forbids the unwrap / expect / panic macros including in tests;
+    // an assert!(false, ...) is the budget-allowed diagnostic, and `return`
+    // after it keeps the types sound for the remainder of the test body.
+    macro_rules! expect_some {
+        ($opt:expr, $msg:literal) => {
+            match $opt {
+                Some(value) => value,
+                None => {
+                    assert!(false, concat!("expected Some: ", $msg));
+                    return;
+                }
+            }
+        };
+    }
+
     #[test]
     fn buffer_pool_acquire_release() {
-        let mut pool = DmaBufferPool::new(0x1000_0000, 0x10_0000, 4096, 4).unwrap();
+        let mut pool = expect_some!(
+            DmaBufferPool::new(0x1000_0000, 0x10_0000, 4096, 4),
+            "constructor with valid parameters"
+        );
         assert_eq!(pool.available(), 4);
-        let (addr0, idx0) = pool.acquire().unwrap();
+        let (addr0, idx0) = expect_some!(pool.acquire(), "first acquire on fresh pool");
         assert_eq!(addr0, 0x1000_0000);
         assert_eq!(idx0, 0);
         assert_eq!(pool.available(), 3);
@@ -148,9 +167,12 @@ mod tests {
 
     #[test]
     fn buffer_pool_exhaustion() {
-        let mut pool = DmaBufferPool::new(0x1000_0000, 0x10_0000, 4096, 2).unwrap();
-        let (_, idx0) = pool.acquire().unwrap();
-        let (_, _idx1) = pool.acquire().unwrap();
+        let mut pool = expect_some!(
+            DmaBufferPool::new(0x1000_0000, 0x10_0000, 4096, 2),
+            "constructor with valid parameters"
+        );
+        let (_, idx0) = expect_some!(pool.acquire(), "first acquire");
+        let (_, _idx1) = expect_some!(pool.acquire(), "second acquire");
         assert!(pool.acquire().is_none()); // exhausted
         pool.release(idx0);
         assert!(pool.acquire().is_some()); // can acquire again
