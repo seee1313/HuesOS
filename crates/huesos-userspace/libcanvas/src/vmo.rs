@@ -5,7 +5,7 @@
 
 use crate::handle::Handle;
 use crate::raw;
-use huesos_abi::{HandleValue, INVALID_HANDLE, Syscall};
+use huesos_abi::{HandleValue, Syscall, INVALID_HANDLE};
 
 /// An owned Virtual Memory Object.
 #[derive(Debug)]

@@ -52,9 +52,36 @@ fn execute_command(command: CommandAst, screen: &mut Screen, filesystem: Option<
             screen.write_line("Keyboard: IRQ1 -> Interrupt -> Port -> userspace scancodes");
             screen.write_line("Framebuffer: terminal still uses Canvas/FramebufferBlit bridge");
         }
-        "ls" => fs_request(filesystem, "LIST", if command.argc == 0 { "/" } else { command.args[0] }, screen),
-        "cat" => fs_request(filesystem, "CAT", if command.argc == 0 { "" } else { command.args[0] }, screen),
-        "stat" => fs_request(filesystem, "STAT", if command.argc == 0 { "" } else { command.args[0] }, screen),
+        "ls" => fs_request(
+            filesystem,
+            "LIST",
+            if command.argc == 0 {
+                "/"
+            } else {
+                command.args[0]
+            },
+            screen,
+        ),
+        "cat" => fs_request(
+            filesystem,
+            "CAT",
+            if command.argc == 0 {
+                ""
+            } else {
+                command.args[0]
+            },
+            screen,
+        ),
+        "stat" => fs_request(
+            filesystem,
+            "STAT",
+            if command.argc == 0 {
+                ""
+            } else {
+                command.args[0]
+            },
+            screen,
+        ),
         "pwd" => screen.write_line("/"),
         "whoami" => screen.write_line("huesos"),
         "ast" => print_ast(command, screen),
@@ -63,7 +90,9 @@ fn execute_command(command: CommandAst, screen: &mut Screen, filesystem: Option<
             // Handled in Shell::handle_key (`snake` / `snake hard`).
             screen.write_line("snake: use 'snake' or 'snake hard' from the prompt");
         }
-        "shutdown" => screen.write_line("shutdown: request is handled by the shell supervisor path"),
+        "shutdown" => {
+            screen.write_line("shutdown: request is handled by the shell supervisor path")
+        }
         "font" => {
             if command.argc == 0 {
                 let name = screen.font_name();

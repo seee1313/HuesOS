@@ -709,7 +709,8 @@ mod tests {
             let top = 0x0000_7fff_ff00_0000u64 + offset;
             let rsp = initial_user_rsp(top);
             assert_eq!(
-                rsp % 16, 8,
+                rsp % 16,
+                8,
                 "RSP={rsp:#x} for top={top:#x} violates SysV entry alignment"
             );
             // The returned RSP must stay inside the caller-supplied region.

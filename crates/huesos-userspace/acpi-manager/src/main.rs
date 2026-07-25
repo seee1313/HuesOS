@@ -10,10 +10,10 @@
 use core::panic::PanicInfo;
 use huesos_abi::acpi_archive::PhysicalIndex;
 use huesos_abi::acpi_broker::{
-    MAX_ARCHIVE_BYTES, MAX_TABLE_BYTES, MAX_TABLES, TableArchiveEntry,
-    TABLE_ARCHIVE_ENTRY_BYTES, TABLE_ARCHIVE_HEADER_BYTES, TABLE_ARCHIVE_MAGIC, VERSION,
+    TableArchiveEntry, MAX_ARCHIVE_BYTES, MAX_TABLES, MAX_TABLE_BYTES, TABLE_ARCHIVE_ENTRY_BYTES,
+    TABLE_ARCHIVE_HEADER_BYTES, TABLE_ARCHIVE_MAGIC, VERSION,
 };
-use libcanvas::{Channel, ErrorCode, Vmo, println};
+use libcanvas::{println, Channel, ErrorCode, Vmo};
 
 const ARCHIVE_MESSAGE: &[u8] = b"acpi-tables-vmo";
 const BROKER_MESSAGE: &[u8] = b"acpi-broker";
@@ -32,7 +32,8 @@ pub extern "C" fn _start() -> ! {
         Ok((table_count, index)) => {
             println!(
                 "[acpi-manager] validated {} ACPI tables, {} physical ranges indexed",
-                table_count, index.len()
+                table_count,
+                index.len()
             );
         }
         Err(error) => {
