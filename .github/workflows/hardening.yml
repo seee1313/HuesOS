@@ -66,3 +66,47 @@ jobs:
           name: qemu-${{ matrix.profile }}-smp${{ matrix.cpus }}
           path: ci-artifacts/
           if-no-files-found: warn
+
+  qemu-extable-smoke:
+    # Boot QEMU with an HBI cmdline that asks the kernel to fire the
+    # synthetic recoverable-copy probe, then verify the serial log
+    # contains the "recovered" marker. This is the CI proof that the
+    # extable populate + wire-up actually redirects a ring-0 #PF to
+    # the fixup landing pad — the exact class of failure the earlier
+    # extable attempt (651cc1c revert) shipped without a target-side
+    # test and had to roll back.
+    #
+    # Matrix intentionally covers both profiles so a release/LTO
+    # regression (the historical failure mode) surfaces here even if
+    # the debug boot smoke is green. smp=2 exercises the same CPL0
+    # #PF handler on both cores.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        profile: [debug, release]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            gcc xorriso qemu-system-x86
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install nightly-2026-03-01 --profile minimal \
+            --component rust-src,llvm-tools-preview
+          rustup default nightly-2026-03-01
+      - name: Extable smoke (synthetic recoverable-copy probe)
+        env:
+          CARGO_BUILD_JOBS: "1"
+          ARTIFACT_DIR: ci-artifacts
+        run: bash scripts/ci-qemu-extable-smoke.sh ${{ matrix.profile }} 2 120
+      - name: Upload serial log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: qemu-extable-${{ matrix.profile }}-smp2
+          path: ci-artifacts/
+          if-no-files-found: warn
