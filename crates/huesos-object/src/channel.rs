@@ -438,3 +438,72 @@ impl KernelObject for Channel {
         self
     }
 }
+
+// ---------------------------------------------------------------------------
+// Async Recv future (peek & claim protocol)
+// ---------------------------------------------------------------------------
+
+use core::future::Future;
+use core::pin::Pin;
+use core::task::{Context, Poll};
+
+/// A zero-alloc, stack-pinned future that awaits a message on a [`Channel`].
+///
+/// Uses the **peek & claim** protocol: [`Channel::peek`] inspects the front
+/// message (size, handle count, cookie) without dequeueing; [`Channel::consume`]
+/// dequeues only the identified message by cookie. This avoids reading into
+/// an arbitrary user buffer as the async essence.
+///
+/// On each Pending return, the future registers its waker via the
+/// [`WaitQueue::register_waker`] bridge. When a sender enqueues a message,
+/// `wake_one` fires the waker, the executor re-polls, and the future
+/// finds the message.
+pub struct Recv<'a> {
+    channel: &'a Channel,
+}
+
+impl<'a> Recv<'a> {
+    /// Create a new Recv future for the given channel.
+    pub fn new(channel: &'a Channel) -> Self {
+        Self { channel }
+    }
+}
+
+impl<'a> Future for Recv<'a> {
+    type Output = Result<ChannelMessage, ChannelRecvError>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        match self.channel.peek() {
+            Ok(Some((_size, _handles, cookie))) => {
+                // Peek found a message. Consume by cookie (peek & claim).
+                match self.channel.consume(cookie) {
+                    Some(msg) => Poll::Ready(Ok(msg)),
+                    // Cookie stale (queue moved between peek and consume).
+                    // Re-poll immediately.
+                    None => {
+                        cx.waker().wake_by_ref();
+                        Poll::Pending
+                    }
+                }
+            }
+            Ok(None) => {
+                // No message yet. Register waker for the next arrival.
+                self.channel.reader_queue().register_waker(cx.waker());
+                Poll::Pending
+            }
+            Err(e) => Poll::Ready(Err(e)),
+        }
+    }
+}
+
+/// Extension trait: async methods on [`Channel`].
+pub trait ChannelAsyncExt {
+    /// Await a message on this channel.
+    fn recv_async(&self) -> Recv<'_>;
+}
+
+impl ChannelAsyncExt for Channel {
+    fn recv_async(&self) -> Recv<'_> {
+        Recv::new(self)
+    }
+}

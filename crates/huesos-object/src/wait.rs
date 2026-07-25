@@ -331,3 +331,50 @@ pub fn notify_tick(now: u64) {
         wake_task(task);
     }
 }
+
+// ---------------------------------------------------------------------------
+// Async Sleep future (tick-based deadline)
+// ---------------------------------------------------------------------------
+
+use core::future::Future;
+use core::pin::Pin;
+use core::task::{Context, Poll};
+
+/// A zero-alloc, stack-pinned future that sleeps until a scheduler tick
+/// deadline. The deadline is absolute (compared against monotonic ticks).
+///
+/// The future relies on the scheduler's timer callback calling
+/// [`notify_tick`] which wakes timed-out tasks. On each poll, if the
+/// deadline hasn't passed, it wakes itself to ensure re-poll on the
+/// next tick.
+pub struct Sleep {
+    deadline: u64,
+}
+
+impl Sleep {
+    /// Create a Sleep future with an absolute tick deadline.
+    pub fn until(deadline: u64) -> Self {
+        Self { deadline }
+    }
+
+    /// Create a Sleep future for `ticks` from now.
+    pub fn for_ticks(ticks: u64) -> Self {
+        Self {
+            deadline: now_ticks().saturating_add(ticks),
+        }
+    }
+}
+
+impl Future for Sleep {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        if now_ticks() >= self.deadline {
+            Poll::Ready(())
+        } else {
+            // Re-poll on next tick. Spurious wakeups are harmless.
+            cx.waker().wake_by_ref();
+            Poll::Pending
+        }
+    }
+}
