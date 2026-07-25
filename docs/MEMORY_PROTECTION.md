@@ -28,13 +28,38 @@ Two exceptions are deliberate and documented in the source:
   identity mapping before hopping into the higher-half kernel. Setting NX
   there would #GP the AP on its first instruction.
 - The kernel `.text` and `.rodata` sections are mapped by Limine with its
-  own flags and are not routed through `KERNEL_RW`.
+  own flags. `.text` legitimately needs to remain executable. `.rodata`
+  and every other non-`.text` load segment (`.data`, `.bss`,
+  `.limine_requests`) are additionally hardened by a post-init W^X
+  sweep — see below.
 
 EFER.NXE must be set on every CPU that will ever load a page table with the
 `NO_EXECUTE` bit; otherwise the bit is reserved and every access to such a
 page raises `#GP`. Enabling it in `enable_memory_protection` (rather than
 only once on the BSP, as an earlier revision did) is what makes this
 uniform.
+
+## Kernel W^X sweep
+
+`huesos-arch::paging::apply_kernel_wx` walks the page-aligned start / end
+symbols exported by `scripts/linker.ld` for `.limine_requests`,
+`.rodata`, and `.data`/`.bss`, and OR-s `NO_EXECUTE` into every 4 KiB
+page-table entry it finds mapped in that range. This complements
+`flags::KERNEL_RW`: `KERNEL_RW` handles mappings HuesOS installs itself
+after paging init, the sweep handles pages Limine installed at load time
+before we owned the mapper.
+
+The sweep is called from `kmain` between `init_paging` and
+`init::heap_init`. Failure is logged on early serial and boot
+continues — a halt would trade a working hardened kernel for a broken
+kernel with the same coverage, which is the wrong tradeoff. Every
+existing per-page mapping keeps its PRESENT/WRITABLE/etc. bits; only
+`NO_EXECUTE` is added on top.
+
+The linker script deliberately does **not** export `__huesos_text_*`
+symbols. `.text` is the only higher-half range that must remain
+executable, and having no symbols makes it structurally impossible to
+accidentally stamp NX on it from `apply_kernel_wx`.
 
 ## User-copy contract
 

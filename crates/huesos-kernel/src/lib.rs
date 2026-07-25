@@ -108,6 +108,28 @@ pub unsafe fn kmain(boot_info: BootInfo) -> ! {
     let phys_offset = huesos_arch::VirtAddr::new(boot_info.hhdm_offset);
     huesos_arch::init_paging(phys_offset);
 
+    // W^X hardening sweep for the kernel image: stamp NO_EXECUTE on
+    // every kernel .rodata / .data / .bss / .limine_requests page so
+    // a write-what-where in kernel data cannot stage a
+    // code-execution gadget in the higher half. `.text` is the only
+    // range left executable.
+    //
+    // EFER.NXE was already set by enable_memory_protection() during
+    // init_early on the BSP, so NO_EXECUTE bits are respected by the
+    // CPU here; APs pick up the same bits when they load CR3 because
+    // NXE is a per-CPU MSR that ap_entry sets before enabling
+    // interrupts (see arch::mod::init_early + smp::ap_entry).
+    //
+    // Failure here does *not* halt the boot: the kernel still runs,
+    // it just loses the extra hardening layer. A halt would be an
+    // unforced downgrade from "hardened + working" to "not working"
+    // and would defeat the purpose of an opportunistic sweep.
+    if let Err(error) = huesos_arch::paging::apply_kernel_wx() {
+        use core::fmt::Write;
+        let mut writer = huesos_arch::serial::SerialWriter;
+        let _ = writeln!(writer, "[boot] kernel W^X stamp skipped: {error:?}");
+    }
+
     // Limine base revision 3 leaves ACPI/reserved regions out of the HHDM.
     // Map them now so RSDP / XSDT / MADT walks don't #PF.
     let firmware_tables_mapped =
