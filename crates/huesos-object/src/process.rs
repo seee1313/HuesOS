@@ -154,3 +154,60 @@ impl KernelObject for Process {
         self
     }
 }
+
+// ---------------------------------------------------------------------------
+// Async ProcessWait future
+// ---------------------------------------------------------------------------
+
+use core::future::Future;
+use core::pin::Pin;
+use core::task::{Context, Poll};
+
+/// A zero-alloc future that awaits process exit.
+///
+/// Registers its waker in the process's exit_waiters WaitQueue.
+/// When the process exits, set_exit_code() calls wake_all() which
+/// fires the waker, the future re-polls, and returns the exit code.
+///
+/// Uses double-check pattern: re-checks exit_code() after waker
+/// registration to close the lost-wakeup gap.
+pub struct ProcessWait<'a> {
+    process: &'a Process,
+}
+
+impl<'a> ProcessWait<'a> {
+    /// Create a new ProcessWait future for the given process.
+    pub fn new(process: &'a Process) -> Self {
+        Self { process }
+    }
+}
+
+impl<'a> Future for ProcessWait<'a> {
+    type Output = i64;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        if let Some(code) = self.process.exit_code() {
+            Poll::Ready(code)
+        } else {
+            self.process.exit_waiters.register_waker(cx.waker());
+            // Double-check: exit may have happened between check and register.
+            if let Some(code) = self.process.exit_code() {
+                Poll::Ready(code)
+            } else {
+                Poll::Pending
+            }
+        }
+    }
+}
+
+/// Extension trait: async methods on [`Process`].
+pub trait ProcessAsyncExt {
+    /// Await process exit, returning the exit code.
+    fn wait_async(&self) -> ProcessWait<'_>;
+}
+
+impl ProcessAsyncExt for Process {
+    fn wait_async(&self) -> ProcessWait<'_> {
+        ProcessWait::new(self)
+    }
+}
