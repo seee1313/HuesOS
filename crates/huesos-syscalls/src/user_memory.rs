@@ -11,6 +11,8 @@ use core::{mem, ptr};
 use huesos_abi::{ErrorCode, USER_ASPACE_BASE, USER_ASPACE_END};
 use huesos_arch::VirtAddr;
 
+use crate::user_access;
+
 const PAGE_SIZE: u64 = 4096;
 
 /// Maximum byte count copied by one VMO read/write syscall.
@@ -117,15 +119,29 @@ pub(crate) fn zeroed_buffer(len: usize) -> Result<Vec<u8>, ErrorCode> {
 }
 
 /// Copy bytes from userspace into a kernel-owned vector.
+///
+/// This is the main bulk-copy path for VMO reads and Channel messages
+/// (up to 1 MiB and 64 KiB respectively). It goes through the
+/// recoverable [`user_access::recoverable_copy_from_user`] primitive
+/// so a race between `validate_range` above and a concurrent VmarUnmap
+/// on another CPU returns `Err(ErrorCode::InvalidArgs)` instead of
+/// panicking the kernel.
 pub(crate) fn copy_from_user(src: *const u8, len: usize) -> Result<Vec<u8>, ErrorCode> {
     with_user_memory_lock(|| {
         validate_range(src as u64, len, false)?;
         let mut bytes = zeroed_buffer(len)?;
         if len != 0 {
             let _access = huesos_arch::cpu::UserAccessGuard::new();
-            // SAFETY: the full source range is readable, and `bytes` owns a
-            // distinct initialized destination of exactly `len` bytes.
-            unsafe { ptr::copy_nonoverlapping(src, bytes.as_mut_ptr(), len) };
+            // SAFETY: caller-side contract for user_access is (a) src's
+            // full range was verified readable by validate_range above,
+            // (b) bytes owns a distinct initialized destination of
+            // exactly len bytes, (c) we hold the process
+            // user_memory_lock via with_user_memory_lock. The
+            // recoverable copy adds fault recovery on top of the same
+            // rep movsb the previous ptr::copy_nonoverlapping compiled
+            // to; the wire format and byte order are identical, only
+            // the failure mode changes from panic to Err.
+            unsafe { user_access::recoverable_copy_from_user(bytes.as_mut_ptr(), src, len)? };
         }
         Ok(bytes)
     })
@@ -144,15 +160,22 @@ pub(crate) fn write_value<T: Copy>(dst: *mut T, value: &T) -> Result<(), ErrorCo
 }
 
 /// Copy a kernel byte slice to userspace.
+///
+/// Mirror of [`copy_from_user`] for outbound bulk transfers. Goes
+/// through [`user_access::recoverable_copy_to_user`] so a concurrent
+/// unmap of the destination returns `Err(ErrorCode::InvalidArgs)`
+/// instead of panicking.
 pub(crate) fn copy_to_user(dst: *mut u8, bytes: &[u8]) -> Result<(), ErrorCode> {
     with_user_memory_lock(|| {
         validate_range(dst as u64, bytes.len(), true)?;
         if !bytes.is_empty() {
             let _access = huesos_arch::cpu::UserAccessGuard::new();
-            // SAFETY: the complete destination range is writable and cannot
-            // overlap the kernel-owned source slice because kernel addresses are
-            // excluded by validate_range.
-            unsafe { ptr::copy_nonoverlapping(bytes.as_ptr(), dst, bytes.len()) };
+            // SAFETY: caller-side contract for user_access is (a) dst's
+            // full range was verified writable by validate_range above,
+            // (b) bytes is a distinct live kernel-owned slice (kernel
+            // addresses are excluded by validate_range so src/dst
+            // cannot alias), (c) we hold the process user_memory_lock.
+            unsafe { user_access::recoverable_copy_to_user(dst, bytes.as_ptr(), bytes.len())? };
         }
         Ok(())
     })

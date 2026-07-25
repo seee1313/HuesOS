@@ -193,14 +193,22 @@ priority order.
   `[extable] installed N recoverable-copy entries`. See
   `docs/UNSAFE_AUDIT.md § "Extable macro infrastructure"` for the
   safety-budget review.
-- **Needed (on-target)**: (a) **part 2** — wire the new user_access
-  primitives into `huesos-syscalls::user_memory::copy_{from,to}_user`
-  and `read_array` / `write_array` so the extable actually covers real
-  syscall paths; (b) **part 3** — a `huesos-userspace/extable-probe`
-  crate that provokes the unmap-during-copy race and expects `EFAULT`,
-  wired into `scripts/ci-qemu-smoke.sh` as a serial-log grep; (c)
-  complete SMEP/SMAP copy-window hardening and support mapping splits /
-  child VMARs.
+- **Wire-up landed (H2 follow-up, part 2 of 3)**: `copy_from_user` /
+  `copy_to_user` in `huesos-syscalls::user_memory` now go through
+  `user_access::recoverable_copy_{from,to}_user`. `readelf .ex_table`
+  reports 2 entries × 24 bytes, each pointing at the exact 2-byte
+  `rep movsb` opcode in the corresponding copy helper. VMO reads and
+  Channel messages (the paths that dominate bulk userspace byte
+  traffic) are now covered.
+- **Needed (on-target)**: (a) **part 3** — a
+  `huesos-userspace/extable-probe` crate that provokes the
+  unmap-during-copy race and expects `EFAULT`, wired into
+  `scripts/ci-qemu-smoke.sh` as a serial-log grep; (b) wire
+  `read_value` / `read_array` / `write_value` / `write_array` through
+  a new `recoverable_read_at::<T>` helper (deferred: the race window
+  on a single small ABI record is microscopic vs. a 1 MiB VMO copy);
+  (c) complete SMEP/SMAP copy-window hardening and support mapping
+  splits / child VMARs.
 
 ### 2. IOAPIC interrupt routing
 - **Current**: LAPIC timer on all CPUs; keyboard IRQ1 is routed through an
