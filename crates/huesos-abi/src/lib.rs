@@ -136,13 +136,17 @@ pub enum Syscall {
     /// This is the second half of the peek/consume split that replaces the
     /// legacy truncating [`Syscall::ChannelRead`].
     ChannelConsume = 32,
+    /// Multiplexed wait on multiple objects. `a1` points to
+    /// [`WaitSetWaitArgs`]. Returns when any (or all, per `mode`)
+    /// of the specified objects have the awaited signals active.
+    WaitSetWait = 33,
 }
 
 impl Syscall {
     /// Total number of defined syscalls (i.e. one past the highest
     /// currently-assigned number). The dispatcher uses this to reject
     /// obviously-out-of-range numbers before a `match`.
-    pub const COUNT: u64 = 33;
+    pub const COUNT: u64 = 34;
 
     /// Convert a raw syscall number back into a [`Syscall`], if valid.
     pub const fn from_raw(n: u64) -> Option<Self> {
@@ -180,6 +184,7 @@ impl Syscall {
             30 => Self::VmarProtect,
             31 => Self::ChannelPeek,
             32 => Self::ChannelConsume,
+            33 => Self::WaitSetWait,
             _ => return None,
         })
     }
@@ -494,6 +499,51 @@ pub struct ChannelConsumeArgs {
     pub out_handles: *mut u32,
 }
 
+
+/// One item in a [`Syscall::WaitSetWait`] request: a handle and the
+/// signals the caller is waiting for, tagged with a user key.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct WaitSetItem {
+    /// Handle to the object to wait on (channel, port, process).
+    pub handle: HandleValue,
+    /// Signal bits awaited (e.g. READABLE, SIGNALED, PEER_CLOSED).
+    pub awaited_signals: u32,
+    /// User-defined key returned in the result to identify this item.
+    pub key: u64,
+}
+
+/// One result entry from [`Syscall::WaitSetWait`]: which items are
+/// satisfied and with which signals.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct WaitSetResult {
+    /// User key from the matching [`WaitSetItem`].
+    pub key: u64,
+    /// Active signals that satisfy the awaited mask.
+    pub active_signals: u32,
+}
+
+/// Arguments for [`Syscall::WaitSetWait`]: multiplexed wait on multiple
+/// objects with Any/All semantics.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct WaitSetWaitArgs {
+    /// Pointer to array of [`WaitSetItem`] (caller-controlled memory).
+    pub items: *const WaitSetItem,
+    /// Number of items in the array (max 16).
+    pub item_count: u32,
+    /// Wait mode: 0 = Any (return when any item satisfied),
+    /// 1 = All (return when all items satisfied).
+    pub mode: u32,
+    /// Timeout in scheduler ticks. 0 = wait forever.
+    pub timeout_ticks: u64,
+    /// Output: array of [`WaitSetResult`] (capacity >= item_count).
+    pub out_results: *mut WaitSetResult,
+    /// Output: number of results written.
+    pub out_count: *mut u32,
+}
+
 /// Port packet type for interrupt notifications.
 pub const PORT_PACKET_INTERRUPT: u32 = 1;
 
@@ -582,12 +632,14 @@ mod tests {
         assert_eq!(Syscall::VmarProtect as u64, 30);
         assert_eq!(Syscall::ChannelPeek as u64, 31);
         assert_eq!(Syscall::ChannelConsume as u64, 32);
-        assert_eq!(Syscall::COUNT, 33);
+        assert_eq!(Syscall::WaitSetWait as u64, 33);
+        assert_eq!(Syscall::COUNT, 34);
         assert_eq!(Syscall::from_raw(28), Some(Syscall::VmoCreateEx));
         assert_eq!(Syscall::from_raw(30), Some(Syscall::VmarProtect));
         assert_eq!(Syscall::from_raw(31), Some(Syscall::ChannelPeek));
         assert_eq!(Syscall::from_raw(32), Some(Syscall::ChannelConsume));
-        assert_eq!(Syscall::from_raw(33), None);
+        assert_eq!(Syscall::from_raw(33), Some(Syscall::WaitSetWait));
+        assert_eq!(Syscall::from_raw(34), None);
     }
 
     #[test]

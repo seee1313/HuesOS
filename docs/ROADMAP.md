@@ -129,7 +129,10 @@ priority order.
   lost-wakeup window; `WaitQueue::prepare` / `PreparedWait::park` / `cancel`
   closes the remaining check-to-enqueue gap in every blocking path (Channel
   recv, Port read, ProcessWait). `hues-async` is integrated as a ring-0
-  allocation-free primitive for the early-boot ProcessWait path; QEMU init now
+  allocation-free primitive for the early-boot ProcessWait path; async primitives
+  (Recv, Sleep, ProcessWait) use the WaitQueue ↔ Waker bridge; sys_waitset_wait
+  multiplexes across objects; keyboard IRQ → reactor wake bridge;
+  QEMU init now
   also exercises a blocking `ProcessWait` wake after a yielding child exit in
   the debug/release, SMP 1/2 smoke matrix
 

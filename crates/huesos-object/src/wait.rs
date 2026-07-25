@@ -5,6 +5,7 @@
 //! dependency on `huesos-kernel` / `huesos-arch`.
 
 use alloc::vec::Vec;
+use core::task::Waker;
 use spin::Mutex;
 
 /// Scheduler task identifier (matches `Task::id`).
@@ -63,8 +64,13 @@ pub fn yield_to_scheduler() {
 }
 
 /// FIFO wait queue of blocked tasks.
+///
+/// Supports two waiter types: scheduler tasks (blocking syscalls)
+/// and async wakers (futures). When wake_one/wake_all fires,
+/// both types are notified.
 pub struct WaitQueue {
     waiters: Mutex<Vec<TaskId>>,
+    async_wakers: Mutex<Vec<Waker>>,
 }
 
 impl WaitQueue {
@@ -72,7 +78,25 @@ impl WaitQueue {
     pub const fn new() -> Self {
         Self {
             waiters: Mutex::new(Vec::new()),
+            async_wakers: Mutex::new(Vec::new()),
         }
+    }
+
+    /// Register an async waker. When wake_one/wake_all fires,
+    /// the waker is invoked so the future re-polls.
+    pub fn register_waker(&self, waker: &Waker) {
+        let mut wakers = self.async_wakers.lock();
+        for existing in wakers.iter_mut() {
+            if existing.will_wake(waker) {
+                return;
+            }
+        }
+        wakers.push(waker.clone());
+    }
+
+    /// Remove all registered async wakers.
+    pub fn clear_wakers(&self) {
+        self.async_wakers.lock().clear();
     }
 
     /// Enqueue `task` if not already waiting.
@@ -88,7 +112,8 @@ impl WaitQueue {
         self.waiters.lock().retain(|&t| t != task);
     }
 
-    /// Wake the oldest waiter, if any.
+    /// Wake the oldest waiter, if any. Also wakes all registered
+    /// async wakers so futures re-poll.
     pub fn wake_one(&self) {
         let id = {
             let mut w = self.waiters.lock();
@@ -101,9 +126,16 @@ impl WaitQueue {
         if let Some(id) = id {
             wake_task(id);
         }
+        let wakers: Vec<Waker> = {
+            let mut w = self.async_wakers.lock();
+            core::mem::take(&mut *w)
+        };
+        for waker in wakers {
+            waker.wake();
+        }
     }
 
-    /// Wake every waiter.
+    /// Wake every waiter. Also wakes all registered async wakers.
     pub fn wake_all(&self) {
         let waiters = {
             let mut w = self.waiters.lock();
@@ -111,6 +143,13 @@ impl WaitQueue {
         };
         for id in waiters {
             wake_task(id);
+        }
+        let wakers: Vec<Waker> = {
+            let mut w = self.async_wakers.lock();
+            core::mem::take(&mut *w)
+        };
+        for waker in wakers {
+            waker.wake();
         }
     }
 
@@ -290,5 +329,52 @@ pub fn notify_tick(now: u64) {
     };
     for task in expired {
         wake_task(task);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Async Sleep future (tick-based deadline)
+// ---------------------------------------------------------------------------
+
+use core::future::Future;
+use core::pin::Pin;
+use core::task::{Context, Poll};
+
+/// A zero-alloc, stack-pinned future that sleeps until a scheduler tick
+/// deadline. The deadline is absolute (compared against monotonic ticks).
+///
+/// The future relies on the scheduler's timer callback calling
+/// [`notify_tick`] which wakes timed-out tasks. On each poll, if the
+/// deadline hasn't passed, it wakes itself to ensure re-poll on the
+/// next tick.
+pub struct Sleep {
+    deadline: u64,
+}
+
+impl Sleep {
+    /// Create a Sleep future with an absolute tick deadline.
+    pub fn until(deadline: u64) -> Self {
+        Self { deadline }
+    }
+
+    /// Create a Sleep future for `ticks` from now.
+    pub fn for_ticks(ticks: u64) -> Self {
+        Self {
+            deadline: now_ticks().saturating_add(ticks),
+        }
+    }
+}
+
+impl Future for Sleep {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        if now_ticks() >= self.deadline {
+            Poll::Ready(())
+        } else {
+            // Re-poll on next tick. Spurious wakeups are harmless.
+            cx.waker().wake_by_ref();
+            Poll::Pending
+        }
     }
 }
