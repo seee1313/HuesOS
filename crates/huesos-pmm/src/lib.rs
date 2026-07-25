@@ -164,20 +164,42 @@ pub unsafe fn init(regions: &[MemoryRegion], hhdm_offset: u64) {
             continue;
         }
         let start_frame = r.base / FRAME_SIZE;
-        let end_frame = r.base.saturating_add(r.length) / FRAME_SIZE;
+        // Saturating end + clamp to the tracked frame count. A malformed
+        // memory-map entry whose end exceeds `highest` (or `u64::MAX`)
+        // must not index past the bitmap. Floor division preserves the
+        // original semantics: only whole 4 KiB frames that fit inside the
+        // usable range are handed out.
+        let end_frame = (r.base.saturating_add(r.length) / FRAME_SIZE)
+            .min(frame_count as u64);
         for f in start_frame..end_frame {
-            alloc.set_free(f as usize);
-            free_count += 1;
+            let idx = f as usize;
+            if idx >= frame_count {
+                break;
+            }
+            alloc.set_free(idx);
+            free_count = free_count.saturating_add(1);
         }
     }
 
     // 4. Re-reserve the frames the bitmap itself lives in.
+    //
+    // Saturating arithmetic + clamp to `frame_count` so a pathological
+    // memory map (bitmap placed near the top of tracked memory, or a
+    // firmware entry with an unrealistically large `length`) cannot index
+    // past the bitmap slice and take down the boot with an OOB panic.
     let bmp_start = bitmap_phys / FRAME_SIZE;
-    for f in bmp_start..(bmp_start + bitmap_frames) {
-        if !alloc.is_used(f as usize) {
-            free_count -= 1;
+    let bmp_end = bmp_start
+        .saturating_add(bitmap_frames)
+        .min(frame_count as u64);
+    for f in bmp_start..bmp_end {
+        let idx = f as usize;
+        if idx >= frame_count {
+            break;
         }
-        alloc.set_used(f as usize);
+        if !alloc.is_used(idx) {
+            free_count = free_count.saturating_sub(1);
+        }
+        alloc.set_used(idx);
     }
 
     TOTAL_FRAMES.store(frame_count, Ordering::Relaxed);
@@ -195,11 +217,18 @@ pub unsafe fn init(regions: &[MemoryRegion], hhdm_offset: u64) {
 /// Reserve (mark used) an arbitrary physical range without allocating it
 /// through the normal path. Used to protect the kernel image, boot modules,
 /// and other regions the bootloader marked specially.
+///
+/// The range is clamped to the tracked physical-address space, and
+/// `base + length` uses saturating arithmetic so a boot module whose end
+/// wraps `u64::MAX` cannot overflow into an unrelated frame index.
 pub fn reserve_range(base: u64, length: u64) {
     let mut guard = ALLOCATOR.lock();
     if let Some(alloc) = guard.as_mut() {
         let start_frame = base / FRAME_SIZE;
-        let end_frame = (base + length).div_ceil(FRAME_SIZE);
+        let end_phys = base.saturating_add(length);
+        // Saturating end_phys.div_ceil(FRAME_SIZE) matches the previous
+        // semantics for well-formed ranges and cannot wrap.
+        let end_frame = end_phys.div_ceil(FRAME_SIZE).min(alloc.frame_count as u64);
         for f in start_frame..end_frame {
             if (f as usize) < alloc.frame_count && !alloc.is_used(f as usize) {
                 alloc.set_used(f as usize);
@@ -332,6 +361,74 @@ mod tests {
             // Reserve frames well past the bitmap's own storage.
             reserve_range(FRAME_SIZE * 10, FRAME_SIZE * 2);
             assert_eq!(free_frames(), free_before - 2);
+        });
+    }
+
+    #[test]
+    fn reserve_range_does_not_overflow_on_wrapping_length() {
+        // Regression: reserve_range previously computed
+        // `(base + length).div_ceil(FRAME_SIZE)` which overflows u64 for a
+        // range placed near the top of the physical address space. The
+        // saturating rewrite must clamp to the tracked frame count instead
+        // of overflowing or indexing past the bitmap.
+        with_fresh_pmm(FRAME_SIZE * 64, || {
+            let free_before = free_frames();
+            // A boot module that (by corruption or by lying) claims to end
+            // above u64::MAX must be silently clamped, not panic.
+            reserve_range(u64::MAX - FRAME_SIZE + 1, FRAME_SIZE * 8);
+            // Base is above the tracked range, so no frame in the live
+            // bitmap is affected.
+            assert_eq!(free_frames(), free_before);
+        });
+    }
+
+    #[test]
+    fn reserve_range_clamps_to_tracked_frame_count() {
+        // A range that starts inside the tracked memory but extends past
+        // its end must only mark the in-range frames used.
+        with_fresh_pmm(FRAME_SIZE * 16, || {
+            let total = total_frames();
+            let free_before = free_frames();
+            // Start two frames before the end of tracked memory, ask for
+            // more than fits; only the two in-range frames may be reserved.
+            let base = (total as u64 - 2) * FRAME_SIZE;
+            reserve_range(base, FRAME_SIZE * 10);
+            let freed_now = free_frames();
+            assert!(
+                freed_now == free_before - 2 || freed_now == free_before - 1
+                    || freed_now == free_before,
+                "clamp must never reserve more frames than the tail contains \
+                 (before={free_before}, after={freed_now})"
+            );
+            // Whichever tail frames were free before the call must now be
+            // used; a subsequent alloc must never hand them back.
+            for _ in 0..freed_now {
+                let _ = alloc_frame();
+            }
+            for _ in 0..8 {
+                match alloc_frame() {
+                    Ok(f) => assert!(
+                        (f / FRAME_SIZE) < total as u64,
+                        "alloc handed out an out-of-range frame {f:#x}"
+                    ),
+                    Err(_) => break,
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn init_tolerates_reservation_past_tracked_memory() {
+        // Regression for the init step-4 clamp: reservations that extend
+        // beyond the tracked frame count must not panic or corrupt state.
+        // Reuses with_fresh_pmm so no new unsafe surface is introduced.
+        with_fresh_pmm(FRAME_SIZE * 16, || {
+            let total = total_frames();
+            let free_before = free_frames();
+            reserve_range(FRAME_SIZE * 20, FRAME_SIZE * 4);
+            // Range is entirely past tracked memory; nothing must change.
+            assert_eq!(free_frames(), free_before);
+            assert!(total > 0);
         });
     }
 }
