@@ -26,19 +26,15 @@ pub mod timer_callback;
 pub unsafe fn init_early() {
     serial::init();
     cpu::enable_sse();
-    // Enable the No-Execute bit in EFER: without this, PageTableFlags::NO_EXECUTE
-    // is treated as a reserved bit and using it on any page table entry
-    // causes an immediate #GP/#PF instead of the intended W^X protection.
-    unsafe {
-        use x86_64::registers::control::{Efer, EferFlags};
-        Efer::update(|flags| *flags |= EferFlags::NO_EXECUTE_ENABLE);
-    }
     gdt::init();
     idt::init();
 
     // Set up per-CPU locals for the BSP (LAPIC ID = 0 until LAPIC is initialized).
     let cpu_local = unsafe { cpu_local::alloc_cpu_local(0) };
     unsafe { cpu_local::init_gs_base(cpu_local) };
+    // enable_memory_protection now also sets EFER.NXE, so every CPU that
+    // reaches this point picks up W^X support uniformly — the AP entry path
+    // already calls the same function.
     cpu::enable_memory_protection();
 }
 
