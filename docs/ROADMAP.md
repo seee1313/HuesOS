@@ -7,6 +7,14 @@ priority order.
 
 ## Done (recent)
 
+### NVMe host-test unwraps retired; `unwrap_calls` back to 25
+- The five `.unwrap()` calls introduced by NVMe `buffer_pool` host tests
+  (previously tracked as Immediate #0b) have been rewritten around an
+  `expect_some!` `match`-based helper. CONTRIBUTING §1 is again satisfied
+  100%: no `.unwrap()` / `.expect()` / `panic!()` outside the historical
+  Ring-0 invariants explicitly documented in `docs/UNSAFE_AUDIT.md`.
+- `safety-budget.json` tightened `unwrap_calls: 30 → 25` in the same commit.
+
 ### `hues-async` alloc-free rule enforced in CI
 - New gate `tools/check-hues-async-noalloc.py` rejects any use of the
   `alloc` crate or any heap-backed collection / smart-pointer under
@@ -164,14 +172,6 @@ priority order.
 - Full design doc: `docs/design/ASYNC_ARCHITECTURE.md`
 
 ## Immediate
-
-### 0b. Retire the five NVMe test unwraps
-- **Current**: `safety-budget.json` sits at `unwrap_calls = 30`; the five
-  extras were introduced by NVMe `buffer_pool`/`queue` host tests
-  (`5f68d39`). CONTRIBUTING §1 forbids new `.unwrap()` in tests.
-- **Needed**: rewrite the tests using `assert!`/`match`/`Result`
-  propagation; drop `unwrap_calls` back to 25; regenerate the baseline in
-  the same commit.
 
 ### 1. Recoverable copies, VMAR unmap/protect, and SMEP/SMAP
 - **Current**: `VmarUnmap` and `VmarProtect` operate on exact mappings under
