@@ -45,6 +45,16 @@
 //! [`Waker`]. Every site carries a `SAFETY:` comment.
 //! The crate uses no `unwrap`/`expect`/`panic!` outside the compile-time
 //! capacity assertion.
+//!
+//! ## ALLOCATOR PROHIBITION (PRODUCTION CONTRACT)
+//!
+//! `hues-async` is **allocation-free by design and by enforcement**. No
+//! allocator crate (`alloc`, `GlobalAlloc`, `Box`, `Vec`, `String`, etc.)
+//! is used, imported, or referenced in any production path of this crate.
+//! Futures are stored inline (`Storage<F>`), the ready set is a single `u64`,
+//! and wakers own nothing allocable. Any change that introduces heap
+//! allocation violates the architectural contract and must be rejected.
+//! See `CONTRIBUTING.md` §1 (safety budget) and `docs/UNSAFE_AUDIT.md`.
 
 #![cfg_attr(not(test), no_std)]
 #![warn(missing_docs)]

@@ -65,6 +65,10 @@ the privileged paths (see the [README](../README.md) and
 on the host, but are not yet wired into the running kernel; each one's `docs/`
 page describes the intended privileged integration.
 
+`hues-async` (used for ring-0 and ring-3 async drivers) is explicitly
+**allocation-free** by design (`Storage<F>` inline, `u64` ready mask,
+no `alloc`/`Vec`/`Box`). See its crate docs for the zero-allocation contract.
+
 ## Boot Flow
 
 1. **Limine** maps `huesos-boot` into the higher half (`0xffffffff80000000`+),
@@ -139,8 +143,10 @@ On-disk layout (generator: `tools/hbi-gen`, parser:
 - Directory entries (`type_id`, `offset`, `length`, `flags`)
 - Per-module `EntryHeader` (**24 bytes** = 6×`u32`) + payload + 8-byte pad
 
-`hbi-gen` must advance the payload cursor by `size_of::<EntryHeader>()`, not
-a hardcoded 16 — otherwise every module after the first is mis-sliced.
+`hbi-gen` advances the payload cursor using `core::mem::size_of::<EntryHeader>()`
+(24 bytes = 6×`u32`), not a hardcoded 16 — the previous mis-slice bug
+was fixed in `hbi-gen` (see `tools/hbi-gen/src/main.rs`). Every module after
+the first is correctly aligned.
 
 ## Object System
 
