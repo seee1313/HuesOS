@@ -296,6 +296,13 @@ priority order.
 - BOOTFS is live as a RAM archive; `huesos-fat` exists as a library.
 - **Needed**: virtio-block (or similar) + FAT/other backends behind
   FileSystemService; load DriverHosts from FS instead of build embeds.
+- **PS/2 driver ownership**: the scancode decoder, shift-state machine, and
+  key-event dispatch now live only in the userspace `driver-host:input`
+  process. The kernel keeps a two-instruction IRQ1 shim that reads port
+  0x60 and forwards the raw byte via `irq_callback::emit(1, byte)`;
+  `huesos-arch::keyboard::prepare_shutdown` is the last kernel-side PS/2
+  touch and is scheduled for removal once the userspace shutdown broker
+  lands (see the `IoPort` capability + `shutdown-broker` work items).
 
 ## Medium Term
 
