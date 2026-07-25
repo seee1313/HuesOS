@@ -54,14 +54,6 @@
 //! [rev]: https://github.com/seee1313/HuesOS/commit/651cc1c
 //! [`user_memory`]: crate::user_memory
 
-// This module is the *infrastructure* half of the recoverable-copy
-// landing. Follow-up PR-2 wires these primitives into
-// `crate::user_memory::copy_{from,to}_user` and reads / writes; until
-// then the two exported functions are dead-code from the compiler's
-// perspective. The allow is scoped narrowly to this module so a real
-// dead-code regression elsewhere in `huesos-syscalls` still shows up.
-#![allow(dead_code)]
-
 /// Copy `len` bytes from `src` to `dst`. On success returns `Ok(())`. On
 /// a ring-0 `#PF` inside the copy — for example because another CPU
 /// concurrently unmapped `src` — returns `Err(ErrorCode::InvalidArgs)`

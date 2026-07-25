@@ -596,3 +596,39 @@ Rollback story is unusually clean: the `.ex_table` section is inert
 read-only rodata; if `install()` never runs (delete the call from
 `kmain`), `try_recover` returns `None` for every fault and the fault
 path is byte-for-byte identical to pre-PR behavior.
+
+## Extable wire-up (part 2 of 3, budget-neutral)
+
+Follow-up to the extable macro infrastructure landed in the previous PR.
+This PR routes the two bulk-copy paths in `huesos-syscalls::user_memory`
+— `copy_from_user` and `copy_to_user` — through the recoverable
+`user_access` primitives, so the `.ex_table` section is no longer empty
+and the kernel actually gains fault recovery for the paths that dominate
+VMO and Channel byte traffic.
+
+Effect on `readelf .ex_table` after this PR:
+
+- 2 entries × 24 bytes = 48 bytes total.
+- Each `(start, end, fixup)` triple points at exactly the 2-byte
+  `rep movsb` opcode in the corresponding `unsafe fn`, with the fixup
+  landing pad four bytes further on (`mov edx, 1`). Verified with
+  `objdump --start-address=... --stop-address=...`.
+
+`safety-budget.json` moves in this PR:
+
+- `unsafe_blocks`: unchanged. Two `unsafe { ptr::copy_nonoverlapping }`
+  sites in `user_memory.rs` are replaced by two
+  `unsafe { user_access::recoverable_copy_*(...)? }` sites — same
+  count, same shape, same SAFETY invariants, but the failure mode
+  changes from kernel panic to `Err(ErrorCode::InvalidArgs)`.
+- All other counters unchanged.
+
+The remaining `read_value` / `read_array` / `write_value` /
+`write_array` helpers still use `ptr::read_unaligned` /
+`ptr::write_unaligned` for individual `T: Copy` records. Wiring those
+through the byte-oriented recoverable primitive would require a
+`MaybeUninit` shuffle and an additional `unsafe { assume_init_read }`
+per record; the race window on a single 8-byte read of a fresh
+`WaitSetItem` is microscopic compared to a 1 MiB VMO copy, so it is
+intentionally deferred to a later PR that also adds a
+`recoverable_read_at::<T>` helper.
