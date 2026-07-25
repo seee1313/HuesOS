@@ -21,16 +21,22 @@ extern crate alloc;
 
 pub mod async_controller;
 pub mod block;
+pub mod buffer_pool;
 pub mod cmd;
 pub mod controller;
 pub mod device;
+pub mod pci_transport;
 pub mod prp;
+pub mod queues;
 pub mod regs;
 pub mod transport;
 
-pub use async_controller::AsyncController;
+pub use async_controller::{AsyncController, InterruptController, PollingInterrupts};
 pub use block::{BlockDevice, BlockInfo, BlockOp};
+pub use buffer_pool::DmaBufferPool;
 pub use cmd::{Cqe, Sqe};
 pub use controller::{Controller, NvmeError};
 pub use device::{BarRegion, DeviceResources, DmaRegion};
+pub use pci_transport::PciMmioTransport;
+pub use queues::{QueueManager, QueueSelector};
 pub use transport::{MockNvme, NvmeTransport};

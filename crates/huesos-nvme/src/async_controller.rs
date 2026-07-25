@@ -8,6 +8,14 @@
 //! completion is immediate, so the submit -> park/wake -> CQE -> complete path
 //! is exercised end-to-end on the host. A real DriverHost passes a `park` that
 //! processes completions and/or awaits the MSI-X interrupt via a HuesOS Port.
+//!
+//! ## Event-driven completions (MSI-X)
+//!
+//! For real hardware, the completion loop can be driven by MSI-X interrupts
+//! instead of polling. The [`InterruptController`] trait abstracts interrupt
+//! delivery: when an interrupt arrives, the corresponding task is woken via
+//! the hues-async waker mechanism. The hybrid model (poll briefly, then wait
+//! for interrupt) balances latency and efficiency.
 
 use crate::controller::{Controller, NvmeError};
 use crate::transport::NvmeTransport;
@@ -15,20 +23,74 @@ use core::future::Future;
 use core::pin::Pin;
 use core::task::{Context, Poll};
 
-/// An async NVMe controller over a transport `T`.
-pub struct AsyncController<T: NvmeTransport> {
-    ctrl: Controller<T>,
+/// Abstraction over interrupt delivery for event-driven completions.
+///
+/// Implementations register a waker for a command ID (CID) and invoke it
+/// when the corresponding completion arrives (via MSI-X interrupt or Port
+/// notification). The default [`PollingInterrupts`] implementation wakes
+/// immediately, preserving the polling behavior.
+pub trait InterruptController {
+    /// Register a waker for the given CID. When the completion arrives,
+    /// the waker will be invoked to re-poll the I/O future.
+    fn register_waker(&mut self, cid: u16, waker: &core::task::Waker);
+    /// Notify that a completion has arrived for the given CID. This invokes
+    /// the registered waker (if any) to re-poll the I/O future.
+    fn notify_completion(&mut self, cid: u16);
+    /// Clear the waker registration for the given CID (after completion).
+    fn clear_waker(&mut self, cid: u16);
 }
 
-impl<T: NvmeTransport> AsyncController<T> {
-    /// Wrap a (not-yet-initialized) controller.
+/// Polling-based interrupt controller: wakes immediately on notification.
+/// This preserves the existing polling behavior for host tests and mock
+/// transports. Real drivers will use an MSI-X-backed implementation.
+pub struct PollingInterrupts;
+
+impl InterruptController for PollingInterrupts {
+    fn register_waker(&mut self, _cid: u16, waker: &core::task::Waker) {
+        // Polling model: wake immediately to re-poll.
+        waker.wake_by_ref();
+    }
+    fn notify_completion(&mut self, _cid: u16) {
+        // No-op: polling model doesn't track completions.
+    }
+    fn clear_waker(&mut self, _cid: u16) {
+        // No-op: polling model doesn't track wakers.
+    }
+}
+
+/// An async NVMe controller over a transport `T` with interrupt controller `I`.
+///
+/// The interrupt controller `I` abstracts completion delivery: polling-based
+/// ([`PollingInterrupts`]) for host tests, or MSI-X-backed for real hardware.
+pub struct AsyncController<T: NvmeTransport, I: InterruptController = PollingInterrupts> {
+    ctrl: Controller<T>,
+    interrupts: I,
+}
+
+impl<T: NvmeTransport> AsyncController<T, PollingInterrupts> {
+    /// Wrap a (not-yet-initialized) controller with polling interrupts.
     pub fn new(ctrl: Controller<T>) -> Self {
-        Self { ctrl }
+        Self {
+            ctrl,
+            interrupts: PollingInterrupts,
+        }
+    }
+}
+
+impl<T: NvmeTransport, I: InterruptController> AsyncController<T, I> {
+    /// Wrap a controller with a custom interrupt controller.
+    pub fn with_interrupts(ctrl: Controller<T>, interrupts: I) -> Self {
+        Self { ctrl, interrupts }
     }
 
     /// Borrow the inner controller (for geometry, etc.).
     pub fn controller(&self) -> &Controller<T> {
         &self.ctrl
+    }
+
+    /// Borrow the interrupt controller (for MSI-X registration, etc.).
+    pub fn interrupts(&mut self) -> &mut I {
+        &mut self.interrupts
     }
 
     /// Initialize the controller (delegates to the sync controller).
@@ -62,6 +124,7 @@ impl<T: NvmeTransport> AsyncController<T> {
         let (cid, dma, nbytes) = self.ctrl.prepare_read(lba, nlb)?;
         let fut = IoFuture {
             ctrl: &mut self.ctrl,
+            interrupts: &mut self.interrupts,
             cid,
             dma,
             nbytes,
@@ -82,6 +145,7 @@ impl<T: NvmeTransport> AsyncController<T> {
         let (cid, _, _) = self.ctrl.prepare_write(lba, nlb, buf)?;
         let fut = IoFuture {
             ctrl: &mut self.ctrl,
+            interrupts: &mut self.interrupts,
             cid,
             dma: 0,
             nbytes: 0,
@@ -93,9 +157,11 @@ impl<T: NvmeTransport> AsyncController<T> {
 }
 
 /// The I/O completion future: yields once (exercising the waker), then polls
-/// the completion queue until the command's CQE appears.
-struct IoFuture<'a, T: NvmeTransport> {
+/// the completion queue until the command's CQE appears. Uses the interrupt
+/// controller to register wakers for event-driven completions.
+struct IoFuture<'a, T: NvmeTransport, I: InterruptController> {
     ctrl: &'a mut Controller<T>,
+    interrupts: &'a mut I,
     cid: u16,
     dma: u64,
     nbytes: u64,
@@ -103,17 +169,20 @@ struct IoFuture<'a, T: NvmeTransport> {
     phase: u8,
 }
 
-impl<T: NvmeTransport> Future for IoFuture<'_, T> {
+impl<T: NvmeTransport, I: InterruptController> Future for IoFuture<'_, T, I> {
     type Output = Result<(), NvmeError>;
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
         if this.phase == 0 {
             this.phase = 1;
-            cx.waker().wake_by_ref();
+            // Register waker for event-driven completion (MSI-X).
+            this.interrupts.register_waker(this.cid, cx.waker());
             return Poll::Pending;
         }
         match this.ctrl.try_poll_io(this.cid) {
             Some(cqe) => {
+                // Completion arrived. Clear waker registration.
+                this.interrupts.clear_waker(this.cid);
                 if !cqe.is_success() {
                     return Poll::Ready(Err(NvmeError::CommandFailed {
                         sct: cqe.sct(),
@@ -126,7 +195,8 @@ impl<T: NvmeTransport> Future for IoFuture<'_, T> {
                 Poll::Ready(Ok(()))
             }
             None => {
-                cx.waker().wake_by_ref();
+                // No completion yet. Re-register waker and park.
+                this.interrupts.register_waker(this.cid, cx.waker());
                 Poll::Pending
             }
         }
