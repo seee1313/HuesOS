@@ -142,10 +142,12 @@ extern "C" fn handle_syscall(f: &mut huesos_arch::syscall::SyscallFrame) {
     // Dispatch has returned with syscall/object locks released. Deferred
     // address-space and object destruction is safe here in process context.
     crate::scheduler::reap_if_pending();
-    f.num = match r {
-        Ok(v) => v as u64,
-        Err(e) => e as i32 as i64 as u64,
-    };
+    // The bit-pattern translation from `Result<i64, ErrorCode>` to the
+    // raw `u64` delivered on `sysret` is the ABI contract with userspace;
+    // going through the shared encoder means every syscall handler uses
+    // the same audited translation and any drift is caught by
+    // `huesos_abi::tests::encode_syscall_result_*`.
+    f.num = huesos_abi::encode_syscall_result(r);
 }
 
 fn debug_write(b: &[u8]) {

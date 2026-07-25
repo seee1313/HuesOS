@@ -273,6 +273,42 @@ impl ErrorCode {
     }
 }
 
+/// Encode a `Result<i64, ErrorCode>` into the raw `u64` value the kernel
+/// writes back to `SyscallFrame::num` for `sysret` to deliver to the
+/// caller. This is the **single point** in the codebase that decides the
+/// syscall wire format:
+///
+/// - `Ok(v)` is delivered as the raw bit pattern of `v` treated as `u64`.
+///   The caller (see `libcanvas::raw::decode`) re-reads it as `i64` and
+///   observes a non-negative value.
+/// - `Err(e)` is delivered as the raw bit pattern of `e as i32`
+///   sign-extended to `i64` and reinterpreted as `u64`. The caller reads
+///   `i64`, sees a negative value, and passes it to
+///   [`ErrorCode::from_raw`] to recover the original error.
+///
+/// The `as i32 as i64 as u64` chain looks noisy but is intentional and
+/// correct exactly for these three casts:
+///
+/// - `e as i32` reads the discriminant of a `#[repr(i32)]` enum.
+/// - `as i64` sign-extends (Rust guarantees this for signed-integer casts).
+/// - `as u64` is a bitwise reinterpretation with no numeric change.
+///
+/// Extracting the encoder here means every syscall handler goes through
+/// the same audited translation and a host test locks the exact bit
+/// pattern for each variant. If `#[repr(i32)]` were ever removed from
+/// [`ErrorCode`] (e.g. a well-meaning refactor to `#[repr(u32)]`), the
+/// numeric value of `e as i32` would still be the negative discriminant
+/// but the reinterpretation cost would be zero and the sign-extension
+/// would silently propagate a wrong upper half. The unit test in this
+/// module catches that class of regression.
+#[inline]
+pub const fn encode_syscall_result(result: Result<i64, ErrorCode>) -> u64 {
+    match result {
+        Ok(v) => v as u64,
+        Err(e) => (e as i32) as i64 as u64,
+    }
+}
+
 /// Userspace handle value (an opaque index into the calling process's
 /// handle table — meaningless outside that process).
 pub type HandleValue = u32;
@@ -673,6 +709,84 @@ mod tests {
     fn peer_closed_error_round_trips() {
         assert_eq!(ErrorCode::from_raw(-22), Some(ErrorCode::PeerClosed));
         assert_eq!(ErrorCode::PeerClosed.as_str(), "channel peer closed");
+    }
+
+    #[test]
+    fn encode_syscall_result_ok_preserves_bit_pattern() {
+        // Any non-negative i64 must round-trip through the ABI encoder
+        // and be re-read by the caller as the same value.
+        for v in [0i64, 1, 42, 4096, i64::MAX] {
+            let raw = super::encode_syscall_result(Ok(v));
+            assert_eq!(raw, v as u64);
+            // Round-trip through the caller-side decode: raw as i64, sign
+            // check, then value.
+            let signed = raw as i64;
+            assert!(
+                signed >= 0,
+                "Ok({v}) must decode as non-negative i64, got {signed}"
+            );
+            assert_eq!(signed, v);
+        }
+    }
+
+    #[test]
+    fn encode_syscall_result_err_sign_extends_correctly() {
+        // Every ErrorCode discriminant must encode to a negative i64 that
+        // ErrorCode::from_raw recovers back to the original variant. This
+        // is the exact contract libcanvas::raw::decode depends on.
+        for variant in [
+            ErrorCode::InvalidArgs,
+            ErrorCode::BadHandle,
+            ErrorCode::WrongType,
+            ErrorCode::AccessDenied,
+            ErrorCode::NoMemory,
+            ErrorCode::Busy,
+            ErrorCode::ShouldWait,
+            ErrorCode::TimedOut,
+            ErrorCode::NotFound,
+            ErrorCode::NoFramebuffer,
+            ErrorCode::NotSupported,
+            ErrorCode::Internal,
+            ErrorCode::PeerClosed,
+        ] {
+            let raw = super::encode_syscall_result(Err(variant));
+            let signed = raw as i64;
+            assert!(
+                signed < 0,
+                "{variant:?} must encode as a negative i64, got {signed}"
+            );
+            assert_eq!(
+                ErrorCode::from_raw(signed),
+                Some(variant),
+                "{variant:?} must round-trip through from_raw"
+            );
+        }
+    }
+
+    #[test]
+    fn encode_syscall_result_specific_wire_values_are_locked() {
+        // Lock the exact bit pattern for two representative variants so
+        // a stealth ABI change (e.g. someone renumbering the enum, or
+        // dropping #[repr(i32)]) fails a host test before it can reach
+        // users. -10 is the smallest-magnitude InvalidArgs; -22 is the
+        // largest-magnitude PeerClosed.
+        assert_eq!(
+            super::encode_syscall_result(Err(ErrorCode::InvalidArgs)),
+            (-10i64) as u64,
+        );
+        assert_eq!(
+            super::encode_syscall_result(Err(ErrorCode::PeerClosed)),
+            (-22i64) as u64,
+        );
+        // Ensure sign-extension actually happened: the top 32 bits must be
+        // all-ones for a negative encoded value. If the ABI shifted to a
+        // zero-extension path (which would happen if ErrorCode became
+        // #[repr(u32)]), the top half would be zero and this test would
+        // fail with 0x00000000_fffffff6 instead of 0xffffffff_fffffff6.
+        assert_eq!(
+            super::encode_syscall_result(Err(ErrorCode::InvalidArgs)),
+            0xffff_ffff_ffff_fff6,
+        );
     }
 
     #[test]
