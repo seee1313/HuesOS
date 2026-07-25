@@ -218,7 +218,11 @@ HuesOS/
 │   ├── huesos-waitset     # Policy: multi-object wait (Any/All, cancel, timeout)
 │   ├── huesos-proclife    # Policy: process lifecycle state machine (exit/wait/reap)
 │   ├── huesos-handlemove  # Policy: handle-transfer semantics (rights, atomic move)
+│   ├── huesos-quota       # Policy: flat + hierarchical resource quotas (mem/handles/CPU ticks)
 │   ├── huesos-decoder-fuzz # Host fuzz harness for ACPI decoders
+│   ├── huesos-pci         # PCI/PCIe enumeration and BAR decode (host-tested)
+│   ├── huesos-nvme        # NVMe controller crate + PciMmioTransport (ring-3 driver)
+│   ├── hues-async         # Alloc-free `no_std` futures executor for ring-3 drivers
 │   └── huesos-userspace/
 │       ├── libcanvas      # Safe userspace syscall library (the only sanctioned way in)
 │       ├── init           # Real ring3 userspace init
@@ -237,9 +241,21 @@ HuesOS/
 The `Policy:` crates are host-testable decision/encoding models extracted from
 the privileged kernel paths as part of the ongoing hardening effort (see
 [docs/ROADMAP.md](docs/ROADMAP.md)). They are `no_std`, dependency-free, and
-unit-tested on the host, but are **not yet wired into the running kernel** —
-each one's `docs/` page describes its intended privileged integration and what
+unit-tested on the host. Integration status differs per crate: `huesos-quota`'s
+bounded Channel/Port queue admission and VMO memory accounting are already
+active in the kernel (see [docs/QUOTAS.md](docs/QUOTAS.md)), while the other
+Policy crates remain host-only decision models pending on-target wiring. Each
+one's `docs/` page describes its intended privileged integration and what
 still requires on-target (QEMU/bare-metal) verification.
+
+The `huesos-pci`, `huesos-nvme`, and `hues-async` crates are new hardware and
+runtime infrastructure (not policy models): `huesos-pci` is a host-tested
+PCI/PCIe enumerator, `huesos-nvme` is a controller crate with an on-target
+`PciMmioTransport`, and `hues-async` is a **strictly allocation-free** `no_std`
+futures executor for ring-3 driver hosts (see
+[docs/ASYNC_RUNTIME.md](docs/ASYNC_RUNTIME.md)). The alloc-free constraint on
+`crates/hues-async` is a project rule; a dedicated CI gate enforcing it is
+tracked as follow-up work in [docs/ROADMAP.md](docs/ROADMAP.md).
 
 ## Contributing
 
