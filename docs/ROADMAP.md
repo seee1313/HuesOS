@@ -206,15 +206,21 @@ priority order.
 ### 3. Process/task and object teardown (mostly done)
 - **Current**: exited-process stacks, private page tables, and address-space-
   owned frames are reaped; process teardown clears its handle table. The
-  global object registry still holds strong `Arc`s and does not automatically
-  unregister an object on ordinary last-handle close.
+  global object registry now backs each object with a
+  `huesos_lifecycle::RefAccount` (host-tested two-counter model), and
+  `note_handle_close` / `note_kernel_ref_close` invoke `try_collect` — the
+  registry `Arc` is dropped on last-handle close for ordinary objects.
 - **Policy core landed**: `huesos-lifecycle` — host-tested bounded zombie
   reclamation and the two-counter (handle/kernel refs) collection model (see
   [OBJECT_LIFECYCLE_POLICY.md](OBJECT_LIFECYCLE_POLICY.md)).
-- **Needed (on-target)**: wire the policy into the registry — weak registry
-  entries / lifecycle accounting so VMOs and their physical frames are reclaimed
-  without freeing an object still mapped or in flight, and feed finished-task
-  records into the bounded graveyard.
+- **Landed**: registry migration from split `handle_counts` + `kernel_refs`
+  maps to one `BTreeMap<Koid, RefAccount>`; ABA-style stale-koid resurrection
+  is impossible because `open_*` on a collected account is a no-op. New
+  regression test `once_collected_object_stays_gone_and_ignores_stale_notes`.
+- **Needed (on-target)**: (a) feed finished-task metadata into the
+  `TaskGraveyard` (already used by scheduler for `TaskWait`, needs uniform
+  policy call); (b) use `huesos-proclife` for the process lifecycle state
+  machine instead of ad-hoc bool flags.
 
 ### 4. Blocking syscalls / wait primitives (mostly done)
 - **Current**: Channel/Port block + tick timeouts (`TimedOut`); ProcessWait.

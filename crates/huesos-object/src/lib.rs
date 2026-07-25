@@ -290,6 +290,42 @@ mod tests {
     }
 
     #[test]
+    fn once_collected_object_stays_gone_and_ignores_stale_notes() {
+        // Regression for the RefAccount migration: once try_collect succeeds
+        // in the registry, further note_handle_open / note_kernel_ref_open
+        // calls for the same koid must not resurrect the account. This is
+        // what protects against ABA-style stale-koid bugs after slot reuse.
+        //
+        // Written without unwrap / expect per CONTRIBUTING rule 1; asserts
+        // are the budget-allowed diagnostic and `return` after them keeps
+        // the type flow sound for the remainder of the closure.
+        with_fresh_env(huesos_pmm::FRAME_SIZE * 16, || {
+            let free_before = huesos_pmm::free_frames();
+            let Ok(vmo) = Vmo::new(4096) else {
+                assert!(false, "one-page VMO must allocate in test fixture");
+                return;
+            };
+            let koid = vmo.koid();
+            register_object(vmo);
+            let table = HandleTable::new();
+            let value = table.add(Handle::new(koid, Rights::DEFAULT_VMO));
+
+            assert!(table.remove(value).is_some(), "live handle must remove");
+            assert!(lookup_object(koid).is_none());
+            assert_eq!(object_ref_counts(koid), (0, 0));
+            assert_eq!(huesos_pmm::free_frames(), free_before);
+
+            // A stale note_handle_open must be a no-op: the account is
+            // gone, the object is gone, and lookup must stay None.
+            note_handle_open(koid);
+            note_kernel_ref_open(koid);
+            assert_eq!(object_ref_counts(koid), (0, 0));
+            assert!(lookup_object(koid).is_none());
+            assert_eq!(huesos_pmm::free_frames(), free_before);
+        });
+    }
+
+    #[test]
     fn handle_table_can_insert_at_fixed_slot() {
         let table = HandleTable::new();
         let h = Handle::new(alloc_koid(), Rights::DEFAULT);
