@@ -552,11 +552,31 @@ pub fn spawn_from_elf(name: &str, elf_bytes: &[u8]) -> Result<SpawnedProcess, Sp
     Ok(SpawnedProcess {
         process,
         entry_point: loaded.entry_point,
-        // SysV x86_64 function entry expects RSP % 16 == 8 (as if a call
-        // pushed a return address). iretq does not push one into user memory.
-        user_rsp: USER_STACK_TOP - 40,
+        // SysV x86_64 function entry expects `(RSP + 8) % 16 == 0`, i.e.
+        // `RSP % 16 == 8`, as if a `call` had just pushed a return address.
+        // `iretq` does not push one into user memory, so we synthesize the
+        // same shape by pointing the initial RSP one qword below a
+        // 16-byte-aligned top. Compute this explicitly instead of the
+        // previous magic `USER_STACK_TOP - 40`, which happened to satisfy
+        // the ABI only because `USER_STACK_TOP` was itself 16-byte aligned;
+        // any future ASLR / randomized-top work would have silently broken
+        // SSE/AVX in user code.
+        user_rsp: initial_user_rsp(USER_STACK_TOP),
         cr3,
     })
+}
+
+/// Return an initial user RSP that satisfies the SysV x86_64 ABI on first
+/// entry: `(RSP + 8) % 16 == 0`. The chosen value is one qword below the
+/// 16-byte-aligned top of the caller-supplied stack region, so a userspace
+/// prologue can `sub rsp, N` (for any 16-byte-aligned N) and remain aligned
+/// through every subsequent `call`.
+///
+/// Extracted as a `const fn` so the property can be exercised by host tests
+/// without pulling in the entire process-launch machinery.
+pub const fn initial_user_rsp(stack_top: u64) -> u64 {
+    let aligned_top = stack_top & !0xf;
+    aligned_top - 8
 }
 
 /// Entry trampoline installed as a task's initial resume address (via
@@ -662,4 +682,38 @@ pub fn teardown_process(process: &Process) {
         }
     }
     process.handles.clear();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::initial_user_rsp;
+
+    // SysV x86_64: (RSP + 8) % 16 == 0 on function entry, equivalently
+    // RSP % 16 == 8. If this ever regresses, userspace SSE/AVX prologues
+    // will fault at runtime for reasons that look completely unrelated
+    // (misaligned MOVAPS / VMOVAPS).
+    #[test]
+    fn initial_user_rsp_matches_sysv_call_frame() {
+        // Aligned top: canonical case that mirrors USER_STACK_TOP today.
+        let aligned = 0x0000_7fff_ff00_0000u64;
+        let rsp = initial_user_rsp(aligned);
+        assert_eq!(rsp % 16, 8, "RSP={rsp:#x} violates SysV entry alignment");
+        assert!(rsp < aligned);
+        assert!(aligned - rsp <= 16, "wasted more than one qword of stack");
+    }
+
+    #[test]
+    fn initial_user_rsp_absorbs_unaligned_top() {
+        // Any future ASLR / randomized top must still satisfy the ABI.
+        for offset in 0u64..64 {
+            let top = 0x0000_7fff_ff00_0000u64 + offset;
+            let rsp = initial_user_rsp(top);
+            assert_eq!(
+                rsp % 16, 8,
+                "RSP={rsp:#x} for top={top:#x} violates SysV entry alignment"
+            );
+            // The returned RSP must stay inside the caller-supplied region.
+            assert!(rsp < top, "RSP={rsp:#x} escapes top={top:#x}");
+        }
+    }
 }
