@@ -85,8 +85,16 @@ mod tests {
             usable: true,
             kind: 0,
         }];
-        unsafe {
-            huesos_pmm::init(&regions, hhdm_offset);
+        // SAFETY: single-threaded test-only bring-up of the PMM; the test
+        // lock upstream serializes concurrent runs.
+        match unsafe { huesos_pmm::init(&regions, hhdm_offset) } {
+            Ok(()) => {}
+            Err(error) => {
+                // In tests we treat this as a fixture failure; assert! is
+                // budget-allowed while unwrap/expect are not.
+                assert!(false, "test PMM init unexpectedly failed: {error:?}");
+                return f();
+            }
         }
         // `set_phys_to_virt` only accepts a plain `fn` (no captures), so we
         // route the per-test hhdm_offset through a static instead of a
