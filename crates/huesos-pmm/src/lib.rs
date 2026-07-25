@@ -33,14 +33,14 @@ use spin::Mutex;
 
 /// Saved interrupt state to restore on drop.
 struct IrqGuard {
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(all(target_arch = "x86_64", target_os = "none"))]
     were_enabled: bool,
 }
 
 impl IrqGuard {
     #[inline]
     fn acquire() -> Self {
-        #[cfg(target_arch = "x86_64")]
+        #[cfg(all(target_arch = "x86_64", target_os = "none"))]
         {
             let flags: u64;
             // SAFETY: pushfq / cli are always safe on x86_64. They only
@@ -60,7 +60,7 @@ impl IrqGuard {
                 were_enabled: (flags & (1 << 9)) != 0,
             }
         }
-        #[cfg(not(target_arch = "x86_64"))]
+        #[cfg(not(all(target_arch = "x86_64", target_os = "none")))]
         {
             IrqGuard {}
         }
@@ -70,7 +70,7 @@ impl IrqGuard {
 impl Drop for IrqGuard {
     #[inline]
     fn drop(&mut self) {
-        #[cfg(target_arch = "x86_64")]
+        #[cfg(all(target_arch = "x86_64", target_os = "none"))]
         if self.were_enabled {
             // SAFETY: sti is always safe on x86_64; it only unmasks
             // interrupts on the local CPU.
