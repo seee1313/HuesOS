@@ -1,12 +1,12 @@
 {
-  "rust_files": 151,
-  "rust_lines": 36556,
+  "rust_files": 154,
+  "rust_lines": 37405,
   "totals": {
     "expect_calls": 22,
     "panic_macros": 5,
     "static_mut": 1,
     "todo_markers": 1,
-    "unsafe_blocks": 244,
+    "unsafe_blocks": 245,
     "unsafe_functions": 59,
     "unsafe_impls": 28,
     "unwrap_calls": 25
@@ -63,6 +63,7 @@
     "crates/huesos-userspace/libcanvas/src/port.rs": 1,
     "crates/huesos-userspace/libcanvas/src/process/objects.rs": 4,
     "crates/huesos-userspace/libcanvas/src/raw.rs": 1,
+    "crates/huesos-userspace/libcanvas/src/resource.rs": 1,
     "crates/huesos-userspace/libcanvas/src/vmo.rs": 3,
     "crates/huesos-userspace/terminal/src/screen.rs": 2
   }

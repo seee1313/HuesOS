@@ -65,6 +65,12 @@ pub extern "C" fn _start() -> ! {
         send_bootfs_vmo(&mut logger, channel, &bootfs);
         send_acpi_tables_vmo(&mut logger, channel, &acpi_tables);
         send_acpi_broker(&mut logger, channel, acpi_broker);
+        send_manifest_grants(
+            &mut logger,
+            channel,
+            &bootfs,
+            b"/manifests/input-host.hdriver",
+        );
     }
 
     // Launch ACPI manager service for table validation and broker policy enforcement.
@@ -213,6 +219,231 @@ fn send_acpi_broker(logger: &mut InitLogger, dm_bootstrap: &Channel, broker: lib
             "[init] failed to transfer ACPI broker: {}",
             error.as_str()
         ),
+    }
+}
+
+/// Read a driver manifest from BOOTFS, mint the kernel-side `Resource`
+/// capabilities it declares, and transfer each handle to driver-manager
+/// via its bootstrap channel. The wire label carries the metadata
+/// driver-manager needs to know what to do with each handle: it uses
+/// the format `resource:<driver_name>:<kind>:<base_hex>:<len_hex>:<mode>`
+/// (e.g. `resource:input-host:ioport:0x60:0x1:excl`).
+///
+/// See `docs/ARCHITECTURE_ROADMAP.md` §4: init is the root userspace
+/// supervisor for this MVP and thus the only process the kernel will
+/// accept `Syscall::ResourceCreate` from.
+fn send_manifest_grants(
+    logger: &mut InitLogger,
+    dm_bootstrap: &Channel,
+    bootfs: &Vmo,
+    manifest_path: &[u8],
+) {
+    use libcanvas::manifest::{parse_for_grants, MAX_RESOURCE_GRANTS};
+    use libcanvas::resource::Resource;
+
+    // 1. Locate + read the manifest file.
+    let entry = match find_bootfs_entry(bootfs, manifest_path) {
+        Ok(entry) => entry,
+        Err(e) => {
+            init_logln!(
+                logger,
+                "[init] manifest grants: BOOTFS entry not found for {}: {}",
+                core::str::from_utf8(manifest_path).unwrap_or("?"),
+                e.as_str()
+            );
+            return;
+        }
+    };
+    // Bounded static buffer: manifests are small (well under 1 KiB in MVP).
+    let mut buf = [0u8; 1024];
+    let take = (entry.len as usize).min(buf.len());
+    let read = match bootfs.read(entry.offset, &mut buf[..take]) {
+        Ok(n) => n,
+        Err(e) => {
+            init_logln!(
+                logger,
+                "[init] manifest grants: read failed: {}",
+                e.as_str()
+            );
+            return;
+        }
+    };
+    let manifest = parse_for_grants(&buf[..read]);
+    let driver_name = manifest.name();
+    let grants = manifest.grants();
+    if grants.is_empty() {
+        init_logln!(
+            logger,
+            "[init] manifest {} declares no resource grants; nothing to mint",
+            driver_name
+        );
+        return;
+    }
+    init_logln!(
+        logger,
+        "[init] manifest {}: minting {} resource grant(s)",
+        driver_name,
+        grants.len()
+    );
+
+    // 2. For each grant: mint + transfer. Bounded-loop iteration keeps
+    // us allocation-free even though the manifest is dynamically sized.
+    let mut sent = 0usize;
+    let mut i = 0usize;
+    while i < grants.len() && i < MAX_RESOURCE_GRANTS {
+        let grant = grants[i];
+        let resource = match Resource::create(grant.kind, grant.base, grant.len, grant.exclusive) {
+            Ok(r) => r,
+            Err(e) => {
+                init_logln!(
+                    logger,
+                    "[init] manifest {}: Resource::create({:?}, base={:#x}, len={:#x}) failed: {}",
+                    driver_name,
+                    grant.kind,
+                    grant.base,
+                    grant.len,
+                    e.as_str()
+                );
+                i += 1;
+                continue;
+            }
+        };
+        // Build the wire label into a bounded stack buffer.
+        let mut label = [0u8; 96];
+        let label_len = format_grant_label(&mut label, driver_name, &grant);
+        // SAFETY: label_len is set by format_grant_label to a value
+        // <= label.len(), so slicing is in-bounds. Guard against a
+        // future formatter bug by clamping.
+        let label_slice = &label[..label_len.min(label.len())];
+        // Consume the Resource into an owned Handle and hand it to
+        // the transfer syscall. The Channel wrapper closes the handle
+        // for us on any failure path, so there is no leak on error.
+        match dm_bootstrap.write_handle(label_slice, resource.into_handle()) {
+            Ok(()) => sent += 1,
+            Err(e) => init_logln!(
+                logger,
+                "[init] manifest {}: write_handle failed for {}: {}",
+                driver_name,
+                core::str::from_utf8(label_slice).unwrap_or("?"),
+                e.as_str()
+            ),
+        }
+        i += 1;
+    }
+    init_logln!(
+        logger,
+        "[init] manifest {}: transferred {}/{} resource handle(s) to DriverManager",
+        driver_name,
+        sent,
+        grants.len()
+    );
+
+    // 3. Critical flag: mark the eventual driver-host process critical
+    // after driver-manager launches it. Currently we cannot mark it
+    // from here because we don't own the driver-host process handle;
+    // driver-manager does the mark_critical syscall when it spawns
+    // the host. Signal our intent via a control message so driver-
+    // manager knows to make the call.
+    if manifest.critical {
+        let mut label = [0u8; 64];
+        let len = format_critical_label(&mut label, driver_name);
+        let payload = &label[..len.min(label.len())];
+        match dm_bootstrap.write(payload) {
+            Ok(()) => init_logln!(
+                logger,
+                "[init] manifest {}: signalled critical=true to DriverManager",
+                driver_name
+            ),
+            Err(e) => init_logln!(
+                logger,
+                "[init] manifest {}: failed to signal critical: {}",
+                driver_name,
+                e.as_str()
+            ),
+        }
+    }
+}
+
+/// Write `resource:<driver>:<kind>:0x<base>:0x<len>:<mode>` into `out`;
+/// return the number of bytes written.
+fn format_grant_label(
+    out: &mut [u8],
+    driver: &str,
+    grant: &libcanvas::manifest::ResourceGrant,
+) -> usize {
+    use libcanvas::resource::ResourceKind;
+    let kind = match grant.kind {
+        ResourceKind::IoPort => "ioport",
+        ResourceKind::Mmio => "mmio",
+        ResourceKind::Irq => "irq",
+    };
+    let mode = if grant.exclusive { "excl" } else { "shared" };
+    let mut w = FixedWriter::new(out);
+    let _ = w.write_bytes(b"resource:");
+    let _ = w.write_bytes(driver.as_bytes());
+    let _ = w.write_bytes(b":");
+    let _ = w.write_bytes(kind.as_bytes());
+    let _ = w.write_bytes(b":0x");
+    let _ = w.write_hex_u64(grant.base);
+    let _ = w.write_bytes(b":0x");
+    let _ = w.write_hex_u64(grant.len);
+    let _ = w.write_bytes(b":");
+    let _ = w.write_bytes(mode.as_bytes());
+    w.len()
+}
+
+fn format_critical_label(out: &mut [u8], driver: &str) -> usize {
+    let mut w = FixedWriter::new(out);
+    let _ = w.write_bytes(b"resource:mark-critical:");
+    let _ = w.write_bytes(driver.as_bytes());
+    w.len()
+}
+
+/// Bounded no-alloc byte writer used to synthesise the wire labels
+/// above. Silently truncates once the target slice is full so a
+/// pathologically long driver name cannot cause a panic.
+struct FixedWriter<'a> {
+    buf: &'a mut [u8],
+    len: usize,
+}
+
+impl<'a> FixedWriter<'a> {
+    fn new(buf: &'a mut [u8]) -> Self {
+        Self { buf, len: 0 }
+    }
+
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    fn write_bytes(&mut self, bytes: &[u8]) -> Result<(), ()> {
+        for &b in bytes {
+            if self.len >= self.buf.len() {
+                return Err(());
+            }
+            self.buf[self.len] = b;
+            self.len += 1;
+        }
+        Ok(())
+    }
+
+    fn write_hex_u64(&mut self, mut value: u64) -> Result<(), ()> {
+        if value == 0 {
+            return self.write_bytes(b"0");
+        }
+        let mut tmp = [0u8; 16];
+        let mut idx = tmp.len();
+        while value != 0 {
+            idx -= 1;
+            let nibble = (value & 0xf) as u8;
+            tmp[idx] = if nibble < 10 {
+                b'0' + nibble
+            } else {
+                b'a' + (nibble - 10)
+            };
+            value >>= 4;
+        }
+        self.write_bytes(&tmp[idx..])
     }
 }
 

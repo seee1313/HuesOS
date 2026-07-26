@@ -776,3 +776,81 @@ cases: `zero_length_range_rejected`, `wrap_past_u64_max_rejected`,
 `intersects_matches_half_open_range_semantics`,
 `resource_koid_lookup_returns_registered_object`. QEMU smoke matrix is
 unaffected because no runtime call site is added yet.
+
+## Manifest-driven `Resource` grants (dedicated safety-budget review, +1 block)
+
+Introduces the syscall path that turns declarative driver manifests
+into kernel-minted `Resource` capabilities: `Syscall::ResourceCreate`
+and `Syscall::ProcessMarkCritical`, both gated on the root userspace
+supervisor (init KOID) via
+`huesos_syscalls::resource::set_root_supervisor_predicate`. Kernel
+`Process` gains an immutable-after-set `critical: AtomicBool` (Fuchsia
+"critical to root job" analogue). Userspace: `libcanvas::resource`
+(safe wrapper), `libcanvas::manifest` (proto-`.hml`/`.cm` parser), and
+init-side `send_manifest_grants` reading `/manifests/input-host.hdriver`
+from BOOTFS, minting the declared resources, and transferring them to
+DriverManager as named handles over its bootstrap channel.
+
+`safety-budget.json` moves in this PR:
+
+- `unsafe_blocks`: 244 → 245 (net +1).
+- `unsafe_functions`: 59 → 59 (unchanged).
+- `unsafe_impls`: 28 → 28 (unchanged).
+- `rust_files`: 151 → 154 (+3: libcanvas resource + libcanvas manifest
+  + huesos-syscalls resource module).
+- `rust_lines`: 36556 → 37405 (+849).
+
+Per-file breakdown of the new unsafe:
+
+- **`crates/huesos-userspace/libcanvas/src/resource.rs`** (+1 block):
+  * Inside `Resource::create`:
+    `Ok(Self(unsafe { Handle::from_raw(out) }))`.
+    **SAFETY:** the kernel wrote a fresh handle owned by this
+    process into `out` immediately before ResourceCreate returned
+    success; the raw value has no other `Handle` wrapper.
+    `libcanvas::handle::Handle::from_raw` is `unsafe fn` by
+    definition (transferring ownership over the FFI-ish boundary);
+    the wrapper cannot be made safe. The rest of the userspace
+    call sites use the safe `Resource::into_handle()` path added
+    in the same PR to keep every downstream caller alloc-free and
+    unsafe-free.
+
+Every other new function is safe Rust. The kernel-side handlers in
+`crates/huesos-syscalls/src/resource.rs` operate through existing safe
+APIs (`Process::mark_critical`, `HandleTable::add`,
+`Resource::try_create_*`); no new unsafe there.
+
+## Root-supervisor gate
+
+Both new syscalls check the caller's KOID against a
+kernel-configurable predicate installed once at boot:
+
+```rust
+huesos_syscalls::resource::set_root_supervisor_predicate(|koid| {
+    koid == crate::init_process_koid()
+});
+```
+
+Every other caller receives `AccessDenied`. The predicate is stored
+behind a `spin::Mutex<Option<fn(u64) -> bool>>` mirroring the existing
+callback registration pattern already used for the yield / exit /
+process-create / shutdown hooks — no new locking machinery.
+
+The `Process::critical` flag is monotonic: `mark_critical()` uses a
+`Release` store into an `AtomicBool` and there is no clearing path,
+matching Fuchsia's contract and eliminating a would-be shantage
+vector where a process could toggle its own criticality to force a
+reboot on demand.
+
+## CI wiring
+
+No new CI job in this PR. Existing host tests cover:
+
+- `huesos-abi::tests::resource_kind_abi_round_trip` and the extended
+  `syscall_numbers_remain_append_only` regression asserting the new
+  slots 34 (`ResourceCreate`) and 35 (`ProcessMarkCritical`) at the
+  correct wire positions.
+
+Runtime QEMU exercise of the wire path arrives in the following
+PRs (shutdown-broker + `sys_hard_halt` + `arch-drop-ps2-module`),
+which are the first consumers of the handles this PR mints.
