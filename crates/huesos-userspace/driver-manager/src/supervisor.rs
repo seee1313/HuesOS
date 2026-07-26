@@ -534,49 +534,69 @@ impl DriverManager {
         child_bootstrap: &Channel,
         child_process: &Process,
     ) {
-        let Some(mut bucket) = self.take_pending_bucket(driver.as_bytes()) else {
+        // Optionally consume the pending bucket first so we can still
+        // send the transfer-complete sentinel even when the driver
+        // declared zero grants — child's `consume_manifest_resources`
+        // needs the sentinel to exit its blocking drain either way.
+        let bucket = self.take_pending_bucket(driver.as_bytes());
+        let mut sent = 0usize;
+        let mut total = 0usize;
+        if let Some(mut bucket) = bucket {
+            total = bucket.count;
+            for entry_idx in 0..total {
+                // `handle.take()` on the &mut we already own moves the
+                // Handle out without triggering its Drop; write_handle
+                // then becomes the sole owner. This is the safe form of
+                // the more general "move-out-of-array" pattern.
+                let Some(handle) = bucket.entries[entry_idx].handle.take() else {
+                    continue;
+                };
+                let entry = &bucket.entries[entry_idx];
+                let label = &entry.label[..entry.label_len];
+                match child_bootstrap.write_handle(label, handle) {
+                    Ok(()) => sent += 1,
+                    Err(e) => println!(
+                        "[driver-manager] forward to {} failed for {}: {}",
+                        driver,
+                        core::str::from_utf8(label).unwrap_or("?"),
+                        e.as_str()
+                    ),
+                }
+            }
+            println!(
+                "[driver-manager] forwarded {}/{} resource handle(s) to {}",
+                sent, total, driver
+            );
+            if bucket.critical_requested {
+                match libcanvas::resource::mark_process_critical(child_process.handle().raw()) {
+                    Ok(()) => println!("[driver-manager] marked {} critical", driver),
+                    Err(e) => println!(
+                        "[driver-manager] mark_critical({}) failed: {}",
+                        driver,
+                        e.as_str()
+                    ),
+                }
+            }
+        } else {
             println!(
                 "[driver-manager] no pending resources for {} (manifest declared none, or already forwarded)",
                 driver
             );
-            return;
-        };
-        let total = bucket.count;
-        let mut sent = 0usize;
-        for entry_idx in 0..total {
-            // `handle.take()` on the &mut we already own moves the
-            // Handle out without triggering its Drop; write_handle
-            // then becomes the sole owner. This is the safe form of
-            // the more general "move-out-of-array" pattern.
-            let Some(handle) = bucket.entries[entry_idx].handle.take() else {
-                continue;
-            };
-            let entry = &bucket.entries[entry_idx];
-            let label = &entry.label[..entry.label_len];
-            match child_bootstrap.write_handle(label, handle) {
-                Ok(()) => sent += 1,
-                Err(e) => println!(
-                    "[driver-manager] forward to {} failed for {}: {}",
-                    driver,
-                    core::str::from_utf8(label).unwrap_or("?"),
-                    e.as_str()
-                ),
-            }
         }
-        println!(
-            "[driver-manager] forwarded {}/{} resource handle(s) to {}",
-            sent, total, driver
-        );
-        if bucket.critical_requested {
-            match libcanvas::resource::mark_process_critical(child_process.handle().raw()) {
-                Ok(()) => println!("[driver-manager] marked {} critical", driver),
-                Err(e) => println!(
-                    "[driver-manager] mark_critical({}) failed: {}",
-                    driver,
-                    e.as_str()
-                ),
-            }
+
+        // Sentinel: tell the child that manifest resource delivery
+        // is done so it can exit its blocking drain loop. Sent even
+        // on the zero-grant path so the child never has to know
+        // whether its manifest happened to declare any grants —
+        // one deterministic exit condition either way.
+        if let Err(e) = child_bootstrap.write(protocol::RESOURCE_TRANSFER_COMPLETE.as_bytes()) {
+            println!(
+                "[driver-manager] resource:transfer-complete send to {} failed: {}",
+                driver,
+                e.as_str()
+            );
         }
+        let _ = (sent, total); // keep local totals visible above the sentinel emit.
     }
 
     fn poll_init_bootstrap(&mut self, init_bootstrap: &Channel) {

@@ -33,6 +33,15 @@ pub const BOOTFS_VMO: &str = "bootfs-vmo";
 /// arrived and then had no handles to forward to it because init
 /// was still busy minting them.
 pub const MANIFEST_GRANTS_COMPLETE_PREFIX: &str = "manifest:grants-complete:";
+
+/// DriverManager writes this on a DriverHost's bootstrap channel
+/// immediately after the last resource handle it forwards, so the
+/// child's `consume_manifest_resources` drain loop has a
+/// deterministic exit condition instead of relying on the kernel's
+/// `WaitSetWait` timeout (which is not honoured today). Sent even
+/// when the manifest declared no grants so the child does not need
+/// to know that up front.
+pub const RESOURCE_TRANSFER_COMPLETE: &str = "resource:transfer-complete";
 /// Init passes the immutable ACPI table archive with this message.
 pub const ACPI_TABLES_VMO: &str = "acpi-tables-vmo";
 /// Init passes the unique deny-by-default ACPI broker capability.

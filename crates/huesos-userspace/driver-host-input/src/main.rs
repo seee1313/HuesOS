@@ -21,12 +21,6 @@ const HEARTBEAT_EVERY_SCANCODES: u64 = 256;
 const WAIT_KEY_BOOTSTRAP: u64 = 0;
 const WAIT_KEY_PORT: u64 = 1;
 
-// Poll timeout for bootstrap-side drain during startup. Small enough
-// that startup never hangs longer than a fraction of a second if
-// DriverManager sends nothing; large enough that all the buffered
-// resource transfers arrive in one wake-up round.
-const BOOTSTRAP_DRAIN_TIMEOUT_TICKS: u64 = 8;
-
 #[unsafe(no_mangle)]
 pub extern "C" fn _start() -> ! {
     println!("[driver-host:input] started");
@@ -59,12 +53,20 @@ pub extern "C" fn _start() -> ! {
 }
 
 const RESOURCE_LABEL_PREFIX: &[u8] = b"resource:";
+/// End-of-transfer sentinel that DriverManager writes on the
+/// bootstrap channel immediately after the last per-driver resource
+/// handle. Its arrival is the deterministic signal that
+/// `consume_manifest_resources` uses to stop draining. Kept in sync
+/// with `driver-manager::supervisor::forward_pending_resources`.
+const RESOURCE_TRANSFER_COMPLETE: &[u8] = b"resource:transfer-complete";
 
-/// Drain any `resource:*` handle-transfer messages waiting on the
-/// bootstrap channel, log each one, and hold on to the handles so
-/// they stay valid for the driver's lifetime. Event-driven: parks
-/// on the bootstrap channel with a short timeout so no CPU is
-/// burned on busy-yield during bring-up.
+/// Drain every `resource:*` handle-transfer message DriverManager
+/// forwards on the bootstrap channel, log each one, and hold on to
+/// the handles so they stay valid for the driver's lifetime. Exits
+/// on the `resource:transfer-complete` sentinel, on `PEER_CLOSED`, or
+/// on any read error. Blocking wait — zero busy-yield, and no
+/// dependence on `WaitSetWait`'s timeout parameter (which the kernel
+/// currently ignores; that is fixed independently in a follow-up).
 fn consume_manifest_resources(bootstrap: &libcanvas::Channel) {
     // Bounded static storage for received handles. `Handle` holds a
     // raw HandleValue; keeping the Handles in an array without an
@@ -72,19 +74,18 @@ fn consume_manifest_resources(bootstrap: &libcanvas::Channel) {
     // libcanvas's zero-alloc style.
     let mut received: [Option<libcanvas::Handle>; 8] = [const { None }; 8];
     let mut received_count = 0usize;
-    let mut label = [0u8; 96];
+    let mut buf = [0u8; 96];
     let items = [WaitItem::new(
         bootstrap.handle().raw(),
         Signals::READABLE | Signals::PEER_CLOSED,
         WAIT_KEY_BOOTSTRAP,
     )];
-    loop {
-        // Park on the bootstrap channel with a short timeout; the
-        // wake either delivers a queued message or expires when
-        // DriverManager is done sending. Zero busy-yield.
-        match wait_any(&items, BOOTSTRAP_DRAIN_TIMEOUT_TICKS) {
+    'outer: loop {
+        // Park until the bootstrap channel becomes readable (or
+        // peer-closed). Wait forever — the sentinel below is the
+        // real exit condition.
+        match wait_any(&items, 0) {
             Ok(_) => {}
-            Err(ErrorCode::TimedOut) => break,
             Err(e) => {
                 println!(
                     "[driver-host:input] resource-drain wait failed: {}",
@@ -94,13 +95,17 @@ fn consume_manifest_resources(bootstrap: &libcanvas::Channel) {
             }
         }
         // Drain everything currently readable in one burst before we
-        // park again. Anything still pending after ShouldWait means
-        // the channel is quiet — go back to sleep.
+        // park again. `read_optional_handle` is the right primitive
+        // here because the stream interleaves handle-transfer
+        // messages (resource grants) with plain byte messages (the
+        // transfer-complete sentinel). Using `read_handle` would
+        // silently drop the sentinel — see the docs on
+        // `Channel::read_handle` for the exact failure mode.
         loop {
-            match bootstrap.read_handle(&mut label) {
-                Ok((n, handle)) if label[..n].starts_with(RESOURCE_LABEL_PREFIX) => {
+            match bootstrap.read_optional_handle(&mut buf) {
+                Ok((n, Some(handle))) if buf[..n].starts_with(RESOURCE_LABEL_PREFIX) => {
                     if received_count < received.len() {
-                        let text = core::str::from_utf8(&label[..n]).unwrap_or("?");
+                        let text = core::str::from_utf8(&buf[..n]).unwrap_or("?");
                         println!(
                             "[driver-host:input] received manifest resource #{}: {}",
                             received_count + 1,
@@ -113,22 +118,35 @@ fn consume_manifest_resources(bootstrap: &libcanvas::Channel) {
                         drop(handle);
                     }
                 }
-                Ok((n, handle)) => {
-                    let text = core::str::from_utf8(&label[..n]).unwrap_or("?");
+                Ok((n, Some(handle))) => {
+                    let text = core::str::from_utf8(&buf[..n]).unwrap_or("?");
                     println!(
                         "[driver-host:input] non-resource handle transfer ignored: {}",
                         text
                     );
                     drop(handle);
                 }
-                Err(ErrorCode::ShouldWait) | Err(ErrorCode::InvalidArgs) => break,
+                Ok((n, None)) if &buf[..n] == RESOURCE_TRANSFER_COMPLETE => {
+                    // DriverManager is done. Every resource this
+                    // driver was granted is either in `received`
+                    // above or was explicitly logged as dropped.
+                    break 'outer;
+                }
+                Ok((n, None)) => {
+                    let text = core::str::from_utf8(&buf[..n]).unwrap_or("?");
+                    println!(
+                        "[driver-host:input] unexpected plain bootstrap message: {}",
+                        text
+                    );
+                }
+                Err(ErrorCode::ShouldWait) => break, // drained; park again
                 Err(e) => {
                     println!(
                         "[driver-host:input] resource-drain read failed: {}",
                         e.as_str()
                     );
                     // Fall through to retain what we already have.
-                    break;
+                    break 'outer;
                 }
             }
         }

@@ -58,8 +58,8 @@ for marker in \
     '[init] monotonic clock OK' \
     '[driver-manager] launched DriverHost input-host' \
     '[driver-host:input] started' \
-    'service:keyboard:ready' \
     '[driver-host:input] retained' \
+    '[driver-host:input] keyboard IRQ bound to Port' \
     '[shutdown-broker] ready' \
     '[acpi-manager] broker deny-by-default self-test OK' \
     '[init] launched terminal' \
