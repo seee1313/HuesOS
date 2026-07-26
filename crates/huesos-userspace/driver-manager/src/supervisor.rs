@@ -3,6 +3,7 @@
 use crate::fs_service::FileSystemService;
 use crate::manifest::INPUT_HOST;
 use crate::protocol;
+use crate::protocol::MANIFEST_GRANTS_COMPLETE_PREFIX;
 use crate::registry::{ServiceRegistry, ServiceState};
 use libcanvas::{println, Channel, ErrorCode, Handle, Process, Vmo};
 
@@ -123,7 +124,20 @@ pub struct DriverManager {
     /// hash-map is warranted.
     pending_resources: [PendingResources; 4],
     pending_resource_count: usize,
+    /// Driver names for which init has signalled that every
+    /// declared resource grant has been transferred. Populated by
+    /// `manifest:grants-complete:<driver>` control messages from
+    /// init; consulted by [`try_start_pending_hosts`] before it
+    /// spawns any host. A driver never spawns until its name
+    /// appears here (or the driver declares zero grants in its
+    /// manifest, in which case init still sends the signal so the
+    /// two paths converge).
+    grants_ready: [[u8; 32]; MAX_TRACKED_HOSTS],
+    grants_ready_len: [usize; MAX_TRACKED_HOSTS],
+    grants_ready_count: usize,
 }
+
+const MAX_TRACKED_HOSTS: usize = 4;
 
 struct ManagedHost {
     process: Process,
@@ -153,7 +167,57 @@ impl DriverManager {
                 PendingResources::empty(),
             ],
             pending_resource_count: 0,
+            grants_ready: [[0; 32]; MAX_TRACKED_HOSTS],
+            grants_ready_len: [0; MAX_TRACKED_HOSTS],
+            grants_ready_count: 0,
         }
+    }
+
+    fn mark_driver_grants_ready(&mut self, driver: &[u8]) {
+        if self.grants_ready_count >= self.grants_ready.len() {
+            println!("[driver-manager] grants-ready table full, ignoring");
+            return;
+        }
+        // De-dup: init may retransmit if a message races. Silently
+        // ignore duplicates rather than blowing the small table.
+        for i in 0..self.grants_ready_count {
+            if &self.grants_ready[i][..self.grants_ready_len[i]] == driver {
+                return;
+            }
+        }
+        let idx = self.grants_ready_count;
+        let take = driver.len().min(self.grants_ready[idx].len());
+        self.grants_ready[idx][..take].copy_from_slice(&driver[..take]);
+        self.grants_ready_len[idx] = take;
+        self.grants_ready_count += 1;
+        println!(
+            "[driver-manager] grants-complete for {}",
+            core::str::from_utf8(driver).unwrap_or("?")
+        );
+    }
+
+    fn driver_grants_ready(&self, driver: &[u8]) -> bool {
+        for i in 0..self.grants_ready_count {
+            if &self.grants_ready[i][..self.grants_ready_len[i]] == driver {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Called every time either the BOOTFS VMO or a
+    /// `manifest:grants-complete` message lands. Attempts to spawn
+    /// each declared host whose prerequisites have all arrived;
+    /// hosts whose grants are still in flight are silently skipped
+    /// and will be picked up on the next tick.
+    fn try_start_pending_hosts(&mut self) {
+        if !self.bootfs_loaded || self.input_host.is_some() {
+            return;
+        }
+        if !self.driver_grants_ready(b"input-host") {
+            return;
+        }
+        self.start_driver_hosts();
     }
 
     fn record_resource_handle(&mut self, label: &[u8], handle: Handle) {
@@ -470,108 +534,136 @@ impl DriverManager {
         child_bootstrap: &Channel,
         child_process: &Process,
     ) {
-        let Some(mut bucket) = self.take_pending_bucket(driver.as_bytes()) else {
+        // Optionally consume the pending bucket first so we can still
+        // send the transfer-complete sentinel even when the driver
+        // declared zero grants — child's `consume_manifest_resources`
+        // needs the sentinel to exit its blocking drain either way.
+        let bucket = self.take_pending_bucket(driver.as_bytes());
+        let mut sent = 0usize;
+        let mut total = 0usize;
+        if let Some(mut bucket) = bucket {
+            total = bucket.count;
+            for entry_idx in 0..total {
+                // `handle.take()` on the &mut we already own moves the
+                // Handle out without triggering its Drop; write_handle
+                // then becomes the sole owner. This is the safe form of
+                // the more general "move-out-of-array" pattern.
+                let Some(handle) = bucket.entries[entry_idx].handle.take() else {
+                    continue;
+                };
+                let entry = &bucket.entries[entry_idx];
+                let label = &entry.label[..entry.label_len];
+                match child_bootstrap.write_handle(label, handle) {
+                    Ok(()) => sent += 1,
+                    Err(e) => println!(
+                        "[driver-manager] forward to {} failed for {}: {}",
+                        driver,
+                        core::str::from_utf8(label).unwrap_or("?"),
+                        e.as_str()
+                    ),
+                }
+            }
+            println!(
+                "[driver-manager] forwarded {}/{} resource handle(s) to {}",
+                sent, total, driver
+            );
+            if bucket.critical_requested {
+                match libcanvas::resource::mark_process_critical(child_process.handle().raw()) {
+                    Ok(()) => println!("[driver-manager] marked {} critical", driver),
+                    Err(e) => println!(
+                        "[driver-manager] mark_critical({}) failed: {}",
+                        driver,
+                        e.as_str()
+                    ),
+                }
+            }
+        } else {
             println!(
                 "[driver-manager] no pending resources for {} (manifest declared none, or already forwarded)",
                 driver
             );
-            return;
-        };
-        let total = bucket.count;
-        let mut sent = 0usize;
-        for entry_idx in 0..total {
-            // `handle.take()` on the &mut we already own moves the
-            // Handle out without triggering its Drop; write_handle
-            // then becomes the sole owner. This is the safe form of
-            // the more general "move-out-of-array" pattern.
-            let Some(handle) = bucket.entries[entry_idx].handle.take() else {
-                continue;
-            };
-            let entry = &bucket.entries[entry_idx];
-            let label = &entry.label[..entry.label_len];
-            match child_bootstrap.write_handle(label, handle) {
-                Ok(()) => sent += 1,
-                Err(e) => println!(
-                    "[driver-manager] forward to {} failed for {}: {}",
-                    driver,
-                    core::str::from_utf8(label).unwrap_or("?"),
-                    e.as_str()
-                ),
-            }
         }
-        println!(
-            "[driver-manager] forwarded {}/{} resource handle(s) to {}",
-            sent, total, driver
-        );
-        if bucket.critical_requested {
-            match libcanvas::resource::mark_process_critical(child_process.handle().raw()) {
-                Ok(()) => println!("[driver-manager] marked {} critical", driver),
-                Err(e) => println!(
-                    "[driver-manager] mark_critical({}) failed: {}",
-                    driver,
-                    e.as_str()
-                ),
-            }
+
+        // Sentinel: tell the child that manifest resource delivery
+        // is done so it can exit its blocking drain loop. Sent even
+        // on the zero-grant path so the child never has to know
+        // whether its manifest happened to declare any grants —
+        // one deterministic exit condition either way.
+        if let Err(e) = child_bootstrap.write(protocol::RESOURCE_TRANSFER_COMPLETE.as_bytes()) {
+            println!(
+                "[driver-manager] resource:transfer-complete send to {} failed: {}",
+                driver,
+                e.as_str()
+            );
         }
+        let _ = (sent, total); // keep local totals visible above the sentinel emit.
     }
 
     fn poll_init_bootstrap(&mut self, init_bootstrap: &Channel) {
-        let mut buf = [0u8; 64];
+        let mut buf = [0u8; 96];
         loop {
-            match init_bootstrap.read_handle(&mut buf) {
-                Ok((n, handle)) if &buf[..n] == protocol::REGISTRY_CHANNEL.as_bytes() => {
+            // Use `read_optional_handle` so we consume every message
+            // exactly once regardless of whether it carries a
+            // transferred handle. The old `read_handle` path would
+            // silently drop plain (no-handle) control messages —
+            // `read_optional_handle` returns `Ok(bytes, None)` for
+            // them so we can dispatch on the payload string. This is
+            // what the `manifest:grants-complete:<driver>` barrier
+            // depends on: it flows through init's bootstrap channel
+            // interleaved with handle transfers and must not be lost
+            // just because it happens to have no handle attached.
+            match init_bootstrap.read_optional_handle(&mut buf) {
+                Ok((n, Some(handle))) if &buf[..n] == protocol::REGISTRY_CHANNEL.as_bytes() => {
                     println!("[driver-manager] received service registry channel from init");
                     self.registry_channel = Some(Channel::from_handle(handle));
                 }
-                Ok((n, handle)) if &buf[..n] == protocol::BOOTFS_VMO.as_bytes() => {
+                Ok((n, Some(handle))) if &buf[..n] == protocol::BOOTFS_VMO.as_bytes() => {
                     println!("[driver-manager] received BOOTFS VMO from init");
                     self.fs.install_bootfs(Vmo::from_handle(handle));
                     self.bootfs_loaded = true;
-                    self.start_driver_hosts();
+                    // NOTE: spawn is deferred to the explicit
+                    // `manifest:grants-complete:<driver>` control
+                    // message so init has time to mint and
+                    // transfer the Resource handles this driver
+                    // needs before we hand it off. See
+                    // `docs/ARCHITECTURE_ROADMAP.md` §4.
+                    self.try_start_pending_hosts();
                     self.try_start_acpi_manager();
                 }
-                Ok((n, handle)) if &buf[..n] == protocol::ACPI_TABLES_VMO.as_bytes() => {
+                Ok((n, Some(handle))) if &buf[..n] == protocol::ACPI_TABLES_VMO.as_bytes() => {
                     println!("[driver-manager] received immutable ACPI table archive");
                     self.acpi_tables = Some(Vmo::from_handle(handle));
                     self.try_start_acpi_manager();
                 }
-                Ok((n, handle)) if &buf[..n] == protocol::ACPI_BROKER.as_bytes() => {
+                Ok((n, Some(handle))) if &buf[..n] == protocol::ACPI_BROKER.as_bytes() => {
                     println!("[driver-manager] received unique ACPI broker capability");
                     self.acpi_broker = Some(handle);
                     self.try_start_acpi_manager();
                 }
-                Ok((n, handle)) if buf[..n].starts_with(RESOURCE_LABEL_PREFIX) => {
+                Ok((n, Some(handle))) if buf[..n].starts_with(RESOURCE_LABEL_PREFIX) => {
                     // Manifest-driven resource grant from init
                     // (PR-C/PR-D). Buffer here; forward at spawn.
                     self.record_resource_handle(&buf[..n], handle);
                 }
-                Ok((_n, _handle)) => println!("[driver-manager] unknown bootstrap handle message"),
-                Err(ErrorCode::ShouldWait) => return,
-                Err(ErrorCode::InvalidArgs) => {
-                    // Plain (no-handle) control message. Try reading
-                    // it as bytes; recognise the mark-critical
-                    // sidecar init sends alongside handles for
-                    // critical-flag drivers.
-                    let mut plain = [0u8; 96];
-                    match init_bootstrap.read_into(&mut plain) {
-                        Ok(m) if plain[..m].starts_with(CRITICAL_INTENT_LABEL_PREFIX) => {
-                            let driver = &plain[CRITICAL_INTENT_LABEL_PREFIX.len()..m];
-                            self.record_critical_intent(driver);
-                        }
-                        Ok(m) => println!(
-                            "[driver-manager] unrecognised init control message ({} B)",
-                            m
-                        ),
-                        Err(ErrorCode::ShouldWait) => return,
-                        Err(e2) => {
-                            println!(
-                                "[driver-manager] bootstrap plain-read failed: {}",
-                                e2.as_str()
-                            );
-                            return;
-                        }
-                    }
+                Ok((_n, Some(_handle))) => {
+                    println!("[driver-manager] unknown bootstrap handle message")
                 }
+                Ok((n, None)) if buf[..n].starts_with(CRITICAL_INTENT_LABEL_PREFIX) => {
+                    let driver = &buf[CRITICAL_INTENT_LABEL_PREFIX.len()..n];
+                    self.record_critical_intent(driver);
+                }
+                Ok((n, None))
+                    if buf[..n].starts_with(MANIFEST_GRANTS_COMPLETE_PREFIX.as_bytes()) =>
+                {
+                    let driver = &buf[MANIFEST_GRANTS_COMPLETE_PREFIX.len()..n];
+                    self.mark_driver_grants_ready(driver);
+                    self.try_start_pending_hosts();
+                }
+                Ok((n, None)) => println!(
+                    "[driver-manager] unrecognised init control message ({} B)",
+                    n
+                ),
+                Err(ErrorCode::ShouldWait) => return,
                 Err(e) => {
                     println!("[driver-manager] bootstrap read failed: {}", e.as_str());
                     return;

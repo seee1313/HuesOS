@@ -288,24 +288,20 @@ pub const KEYBOARD_SERVICE: ServiceManifest = ServiceManifest {
 };
 
 /// Input DriverHost manifest.
+///
+/// 8042 port ownership split (kept in sync with the BOOTFS-embedded
+/// `.hdriver` in `huesos-kernel/build.rs`): 0x60 (data) belongs to
+/// this driver, 0x64 (status/command) belongs to `shutdown-broker`.
+/// Granting 0x64 to both hosts would fail as `Resource::Conflict`.
 pub const INPUT_HOST: DriverHostManifest = DriverHostManifest {
     name: "input-host",
     services: &[KEYBOARD_SERVICE],
     irqs: &[1],
-    io_ports: &[
-        IoPortRange { base: 0x60, len: 1 },
-        IoPortRange { base: 0x64, len: 1 },
-    ],
+    io_ports: &[IoPortRange { base: 0x60, len: 1 }],
     resources: &[
         ResourceGrantManifest {
             kind: ResourceGrantKind::IoPort,
             base: 0x60,
-            len: 1,
-            exclusive: true,
-        },
-        ResourceGrantManifest {
-            kind: ResourceGrantKind::IoPort,
-            base: 0x64,
             len: 1,
             exclusive: true,
         },

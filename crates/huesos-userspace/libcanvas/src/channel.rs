@@ -197,6 +197,16 @@ impl Channel {
     }
 
     /// Read a message that is expected to contain one transferred generic handle.
+    ///
+    /// **Warning:** if the next queued message has zero handles this
+    /// call still dequeues it (and its payload bytes) and then
+    /// discards both, returning `Err(InvalidArgs)`. Do not use
+    /// `read_handle` on a channel that interleaves handle-transfer
+    /// messages with plain control messages — use
+    /// [`Self::read_optional_handle`] there and dispatch on the
+    /// returned `Option<Handle>` yourself so you never lose a plain
+    /// message. See `driver-manager::supervisor::poll_init_bootstrap`
+    /// for the canonical pattern.
     pub fn read_handle(&self, buf: &mut [u8]) -> crate::Result<(usize, Handle)> {
         let (bytes, handle) = self.read_optional_handle(buf)?;
         handle
