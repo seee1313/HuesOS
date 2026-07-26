@@ -1,4 +1,19 @@
 //! Driver manifest definitions and parser.
+//!
+//! Manifests are the driver-manager's (proto-`component_manager`'s)
+//! declarative description of what a driver process needs from the
+//! kernel: which IRQs, which I/O port ranges, which MMIO regions,
+//! and whether the driver is critical to system liveness.
+//! See `docs/ARCHITECTURE_ROADMAP.md` §1 and §4.
+
+// `resources` and `critical` on DriverHostManifest and
+// DynamicDriverHostManifest are consumed by init (through the shared
+// `libcanvas::manifest` parser); the compile-time static path retained
+// here is a duplicate view kept so the existing manifest-describe /
+// registry logic in driver-manager keeps building. Dead-code lint would
+// otherwise fire because driver-manager does not itself act on these
+// fields yet — the manifest-driven grants wiring runs in init.
+#![allow(dead_code)]
 
 /// DriverHost trust/isolation grouping.
 #[derive(Clone, Copy)]
@@ -11,6 +26,15 @@ pub struct DriverHostManifest {
     pub irqs: &'static [u32],
     /// I/O port capabilities requested by the host.
     pub io_ports: &'static [IoPortRange],
+    /// Fine-grained `Resource` grants requested by the host, used by
+    /// the manifest-driven grants path. When present, the kernel mints
+    /// one `Resource` per entry and installs its handle in the driver
+    /// process's handle table at spawn time.
+    pub resources: &'static [ResourceGrantManifest],
+    /// If `true`, the driver process is marked critical: its abnormal
+    /// exit will trigger a kernel-driven hard halt of the whole system.
+    /// See `docs/ARCHITECTURE_ROADMAP.md` §3.
+    pub critical: bool,
 }
 
 /// One service provided by a DriverHost.
@@ -31,6 +55,39 @@ pub struct IoPortRange {
     pub len: u16,
 }
 
+/// Kind of a fine-grained `Resource` grant. Wire-compatible with
+/// `huesos_abi::ResourceKindAbi` and duplicated here so the manifest
+/// parser can stay usable in the driver-manager crate without pulling
+/// the full ABI enum into every consumer.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum ResourceGrantKind {
+    /// x86 port I/O space.
+    IoPort = 1,
+    /// Physical memory-mapped I/O region.
+    Mmio = 2,
+    /// Physical interrupt vector / IRQ line.
+    Irq = 3,
+}
+
+// Note: numeric conversion to `huesos_abi::ResourceKindAbi` is intentionally
+// **not** exposed from this crate. `driver-manager` does not link
+// `huesos-abi` directly; all cross-boundary manifest work is done via the
+// shared parser in `libcanvas::manifest`, which owns the ABI mapping.
+
+/// One resource grant requested by a driver in its manifest.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ResourceGrantManifest {
+    /// Kind of resource.
+    pub kind: ResourceGrantKind,
+    /// Inclusive lower bound of the range.
+    pub base: u64,
+    /// Length of the range in `kind`-native units.
+    pub len: u64,
+    /// `true` for exclusive-allocation grants; `false` for shared.
+    pub exclusive: bool,
+}
+
 /// Dynamic DriverHost manifest parsed from a file.
 #[derive(Clone, Copy)]
 pub struct DynamicDriverHostManifest {
@@ -44,6 +101,9 @@ pub struct DynamicDriverHostManifest {
     pub io_port_count: usize,
     pub services: [ServiceManifestDynamic; 8],
     pub service_count: usize,
+    pub resources: [ResourceGrantManifest; 8],
+    pub resource_count: usize,
+    pub critical: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -70,6 +130,14 @@ impl DynamicDriverHostManifest {
                 required: false,
             }; 8],
             service_count: 0,
+            resources: [ResourceGrantManifest {
+                kind: ResourceGrantKind::IoPort,
+                base: 0,
+                len: 0,
+                exclusive: false,
+            }; 8],
+            resource_count: 0,
+            critical: false,
         }
     }
 
@@ -136,6 +204,21 @@ pub fn parse_hdriver(data: &[u8]) -> Option<DynamicDriverHostManifest> {
                 manifest.services[manifest.service_count].name_len = len;
                 manifest.services[manifest.service_count].required = true;
                 manifest.service_count += 1;
+            } else if key == b"critical" {
+                // Accept a small allow-list of truthy tokens; anything
+                // else leaves the default `false` in place. Keeps the
+                // parser strict without pulling in a full bool parser.
+                manifest.critical = matches!(val, b"true" | b"1" | b"yes" | b"on");
+            } else if key == b"resource" && manifest.resource_count < 8 {
+                // Format: <kind>:<base>:<len>:<mode>
+                //   kind := "ioport" | "mmio" | "irq"
+                //   base := decimal or 0x-prefixed hex
+                //   len  := decimal
+                //   mode := "excl" | "shared"
+                if let Some(grant) = parse_resource_grant(val) {
+                    manifest.resources[manifest.resource_count] = grant;
+                    manifest.resource_count += 1;
+                }
             }
         }
 
@@ -143,6 +226,55 @@ pub fn parse_hdriver(data: &[u8]) -> Option<DynamicDriverHostManifest> {
     }
 
     Some(manifest)
+}
+
+fn parse_resource_grant(val: &[u8]) -> Option<ResourceGrantManifest> {
+    let mut parts = val.split(|&b| b == b':');
+    let kind_bytes = parts.next()?;
+    let base_bytes = parts.next()?;
+    let len_bytes = parts.next()?;
+    let mode_bytes = parts.next()?;
+    if parts.next().is_some() {
+        return None;
+    }
+
+    let kind = match kind_bytes {
+        b"ioport" => ResourceGrantKind::IoPort,
+        b"mmio" => ResourceGrantKind::Mmio,
+        b"irq" => ResourceGrantKind::Irq,
+        _ => return None,
+    };
+
+    let base = parse_u64_lit(base_bytes)?;
+    let len = parse_u64_lit(len_bytes)?;
+
+    // For IoPort the ABI address space is 16-bit; reject early rather
+    // than silently truncating in the kernel.
+    if matches!(kind, ResourceGrantKind::IoPort) && (base > 0xffff || len > 0xffff) {
+        return None;
+    }
+
+    let exclusive = match mode_bytes {
+        b"excl" | b"exclusive" => true,
+        b"shared" => false,
+        _ => return None,
+    };
+
+    Some(ResourceGrantManifest {
+        kind,
+        base,
+        len,
+        exclusive,
+    })
+}
+
+fn parse_u64_lit(bytes: &[u8]) -> Option<u64> {
+    let s = core::str::from_utf8(bytes).ok()?;
+    if let Some(hex) = s.strip_prefix("0x") {
+        u64::from_str_radix(hex, 16).ok()
+    } else {
+        s.parse::<u64>().ok()
+    }
 }
 
 /// Keyboard service manifest.
@@ -160,6 +292,27 @@ pub const INPUT_HOST: DriverHostManifest = DriverHostManifest {
         IoPortRange { base: 0x60, len: 1 },
         IoPortRange { base: 0x64, len: 1 },
     ],
+    resources: &[
+        ResourceGrantManifest {
+            kind: ResourceGrantKind::IoPort,
+            base: 0x60,
+            len: 1,
+            exclusive: true,
+        },
+        ResourceGrantManifest {
+            kind: ResourceGrantKind::IoPort,
+            base: 0x64,
+            len: 1,
+            exclusive: true,
+        },
+        ResourceGrantManifest {
+            kind: ResourceGrantKind::Irq,
+            base: 1,
+            len: 1,
+            exclusive: true,
+        },
+    ],
+    critical: false,
 };
 
 /// Static DriverHost manifest table.

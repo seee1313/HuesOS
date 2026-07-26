@@ -167,7 +167,12 @@ fn build_bootfs_image(
         },
         BootFsFile {
             path: "/manifests/input-host.hdriver",
-            data: b"name=input-host\nkind=driver-host\nprovides=keyboard\nirq=1\nioport=0x60:1\nioport=0x64:1\nelf=/drivers/input-host.elf\nheartbeat=true\n".to_vec(),
+            // Legacy `irq=`/`ioport=` fields are retained for parser
+            // back-compat during the manifest-driven-grants rollout;
+            // the new `resource=` lines are the source of truth for
+            // the kernel-minted Resource handles. `critical=false` is
+            // the default; explicit here for review clarity.
+            data: b"name=input-host\nkind=driver-host\nprovides=keyboard\nirq=1\nioport=0x60:1\nioport=0x64:1\nresource=ioport:0x60:1:excl\nresource=ioport:0x64:1:excl\nresource=irq:1:1:excl\ncritical=false\nelf=/drivers/input-host.elf\nheartbeat=true\n".to_vec(),
         },
         BootFsFile {
             path: "/drivers/input-host.elf",

@@ -4,6 +4,7 @@ use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::sync::Arc;
 use core::any::Any;
+use core::sync::atomic::{AtomicBool, Ordering};
 use spin::Mutex;
 
 use crate::wait::WaitQueue;
@@ -28,6 +29,13 @@ pub struct Process {
     /// stored here so syscalls/scheduler can find it without a separate
     /// process table). Boxed `dyn Any` to avoid a dependency on huesos-arch.
     pub address_space: Mutex<Option<Box<dyn Any + Send + Sync>>>,
+    /// Criticality flag: if `true`, an abnormal exit of this process
+    /// triggers a kernel-driven hard halt of the whole system. Set once
+    /// via [`Self::mark_critical`]; never cleared. Inspired by
+    /// Fuchsia's "critical to root job" mechanism
+    /// (`src/power/shutdown-shim/main.cc`), captured in
+    /// `docs/ARCHITECTURE_ROADMAP.md` §3.
+    critical: AtomicBool,
 }
 
 impl Process {
@@ -52,7 +60,21 @@ impl Process {
             exit_waiters: WaitQueue::new(),
             user_memory_lock: Mutex::new(()),
             address_space: Mutex::new(None),
+            critical: AtomicBool::new(false),
         })
+    }
+
+    /// Mark this process as critical (see the `critical` field docs).
+    /// Idempotent: repeated calls are silent no-ops. There is no way
+    /// to un-mark; this matches the Fuchsia contract and avoids a
+    /// shantage-by-toggling attack surface.
+    pub fn mark_critical(&self) {
+        self.critical.store(true, Ordering::Release);
+    }
+
+    /// Whether this process has been marked critical.
+    pub fn is_critical(&self) -> bool {
+        self.critical.load(Ordering::Acquire)
     }
 
     /// Human-readable process name as an owned string.

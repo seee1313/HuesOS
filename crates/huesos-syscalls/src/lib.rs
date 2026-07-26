@@ -20,6 +20,10 @@ mod framebuffer;
 mod handle;
 mod port_interrupt;
 mod process;
+/// Resource capability primitive syscalls
+/// (`ResourceCreate`, `ProcessMarkCritical`). Gated on the root
+/// supervisor KOID via [`resource::set_root_supervisor_predicate`].
+pub mod resource;
 mod system;
 /// Recoverable user-memory access primitives with `.ex_table` fault
 /// recovery. `pub` because the kernel's `extable_test=1` synthetic
@@ -133,5 +137,9 @@ pub fn dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> Syscal
         S::ChannelPeek => channel::sys_channel_peek(a1 as *const ChannelPeekArgs),
         S::ChannelConsume => channel::sys_channel_consume(a1 as *const ChannelConsumeArgs),
         S::WaitSetWait => waitset::sys_waitset_wait(a1 as *const WaitSetWaitArgs),
+        S::ResourceCreate => {
+            resource::sys_resource_create(a1 as u32, a2, a3, a4 as u32, a5 as *mut HandleValue)
+        }
+        S::ProcessMarkCritical => resource::sys_process_mark_critical(a1 as HandleValue),
     }
 }

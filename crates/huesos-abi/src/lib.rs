@@ -140,13 +140,26 @@ pub enum Syscall {
     /// [`WaitSetWaitArgs`]. Returns when any (or all, per `mode`)
     /// of the specified objects have the awaited signals active.
     WaitSetWait = 33,
+    /// Mint an immutable [`Resource`](../../huesos_object/struct.Resource.html)
+    /// capability object and install its handle in the caller's handle
+    /// table. `a1` is the [`ResourceKindAbi`] tag, `a2` is `base`, `a3`
+    /// is `len`, `a4 != 0` means exclusive, `a5` is a
+    /// `*mut HandleValue` output pointer. Kernel policy currently
+    /// restricts this call to the root userspace supervisor (init
+    /// KOID); see `docs/ARCHITECTURE_ROADMAP.md` §4.
+    ResourceCreate = 34,
+    /// Mark the target process as critical: its abnormal exit will
+    /// trigger a kernel-driven hard halt. Immutable after the first
+    /// successful call; caller must be the root userspace supervisor.
+    /// `a1` is a process handle owned by the caller.
+    ProcessMarkCritical = 35,
 }
 
 impl Syscall {
     /// Total number of defined syscalls (i.e. one past the highest
     /// currently-assigned number). The dispatcher uses this to reject
     /// obviously-out-of-range numbers before a `match`.
-    pub const COUNT: u64 = 34;
+    pub const COUNT: u64 = 36;
 
     /// Convert a raw syscall number back into a [`Syscall`], if valid.
     pub const fn from_raw(n: u64) -> Option<Self> {
@@ -185,6 +198,35 @@ impl Syscall {
             31 => Self::ChannelPeek,
             32 => Self::ChannelConsume,
             33 => Self::WaitSetWait,
+            34 => Self::ResourceCreate,
+            35 => Self::ProcessMarkCritical,
+            _ => return None,
+        })
+    }
+}
+
+/// Wire-format resource kind for [`Syscall::ResourceCreate`].
+///
+/// Values match `huesos_object::ResourceKind` numerically so the
+/// syscall handler can round-trip the tag without a lookup table.
+#[repr(u32)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ResourceKindAbi {
+    /// x86 port I/O space.
+    IoPort = 1,
+    /// Physical memory-mapped I/O region.
+    Mmio = 2,
+    /// Physical interrupt vector / IRQ line.
+    Irq = 3,
+}
+
+impl ResourceKindAbi {
+    /// Decode a wire value without constructing an invalid Rust enum.
+    pub const fn from_raw(raw: u32) -> Option<Self> {
+        Some(match raw {
+            1 => Self::IoPort,
+            2 => Self::Mmio,
+            3 => Self::Irq,
             _ => return None,
         })
     }
@@ -666,7 +708,7 @@ pub struct VmarOpArgs {
 
 #[cfg(test)]
 mod tests {
-    use super::{rights, vmar_flags, ErrorCode, Syscall};
+    use super::{rights, vmar_flags, ErrorCode, ResourceKindAbi, Syscall};
 
     #[test]
     fn mapping_rights_include_each_requested_permission() {
@@ -696,13 +738,32 @@ mod tests {
         assert_eq!(Syscall::ChannelPeek as u64, 31);
         assert_eq!(Syscall::ChannelConsume as u64, 32);
         assert_eq!(Syscall::WaitSetWait as u64, 33);
-        assert_eq!(Syscall::COUNT, 34);
+        assert_eq!(Syscall::ResourceCreate as u64, 34);
+        assert_eq!(Syscall::ProcessMarkCritical as u64, 35);
+        assert_eq!(Syscall::COUNT, 36);
         assert_eq!(Syscall::from_raw(28), Some(Syscall::VmoCreateEx));
         assert_eq!(Syscall::from_raw(30), Some(Syscall::VmarProtect));
         assert_eq!(Syscall::from_raw(31), Some(Syscall::ChannelPeek));
         assert_eq!(Syscall::from_raw(32), Some(Syscall::ChannelConsume));
         assert_eq!(Syscall::from_raw(33), Some(Syscall::WaitSetWait));
-        assert_eq!(Syscall::from_raw(34), None);
+        assert_eq!(Syscall::from_raw(34), Some(Syscall::ResourceCreate));
+        assert_eq!(Syscall::from_raw(35), Some(Syscall::ProcessMarkCritical));
+        assert_eq!(Syscall::from_raw(36), None);
+    }
+
+    #[test]
+    fn resource_kind_abi_round_trip() {
+        for &kind in &[
+            ResourceKindAbi::IoPort,
+            ResourceKindAbi::Mmio,
+            ResourceKindAbi::Irq,
+        ] {
+            let raw = kind as u32;
+            assert_eq!(ResourceKindAbi::from_raw(raw), Some(kind));
+        }
+        assert_eq!(ResourceKindAbi::from_raw(0), None);
+        assert_eq!(ResourceKindAbi::from_raw(4), None);
+        assert_eq!(ResourceKindAbi::from_raw(u32::MAX), None);
     }
 
     #[test]

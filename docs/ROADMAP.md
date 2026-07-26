@@ -303,6 +303,14 @@ priority order.
   `huesos-arch::keyboard::prepare_shutdown` is the last kernel-side PS/2
   touch and is scheduled for removal once the userspace shutdown broker
   lands (see the `IoPort` capability + `shutdown-broker` work items).
+- **Manifest-driven resource grants (landed as PR-C)**: `Resource`
+  capability objects (`ObjectType::Resource`, kinds
+  `IoPort`/`Mmio`/`Irq`, shared/exclusive semantics) are minted
+  kernel-side by the root supervisor via `Syscall::ResourceCreate`;
+  driver manifests declare fine-grained `resource=<kind>:<base>:<len>:<mode>`
+  and `critical=true` lines that init reads out of BOOTFS and turns
+  into per-driver handle grants transferred through DriverManager. See
+  `docs/ARCHITECTURE_ROADMAP.md` §2/§4.
 
 ## Medium Term
 
