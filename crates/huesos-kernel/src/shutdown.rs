@@ -5,10 +5,19 @@ use huesos_abi::ErrorCode;
 use huesos_object::KernelObject;
 
 /// Validate the root supervisor and halt every CPU (legacy KOID-gated
-/// path used by [`huesos_abi::Syscall::SystemShutdown`]). Retained for
-/// back-compat while the userspace `shutdown-broker` bring-up
-/// stabilises; new callers should route through the capability-gated
-/// [`hard_halt`] path via `Syscall::HardHalt`.
+/// path used by [`huesos_abi::Syscall::SystemShutdown`]). Retained as
+/// a fallback for `init` when the userspace `shutdown-broker` failed
+/// to come up; the happy path is capability-gated
+/// [`hard_halt`] via `Syscall::HardHalt` (see
+/// `docs/ARCHITECTURE_ROADMAP.md` §3).
+///
+/// Since PR-E the kernel no longer performs 8042 quiesce on this
+/// path — the 8042 driver has moved to userspace along with every
+/// other PS/2 concern (see PR #119 / PR #123 for the two migration
+/// steps). `interrupts::disable()` already masks all IRQ delivery
+/// before the LAPIC halt sequence, so the machine cannot observe a
+/// spurious PS/2 IRQ after we return from this function's `hlt`
+/// loop even without the historical `out 0x64, 0xAD/0xA7`.
 pub fn request() -> Result<(), ErrorCode> {
     let caller = huesos_object::current_process().ok_or(ErrorCode::AccessDenied)?;
     if caller.koid().0 != crate::init_process_koid() {
@@ -23,11 +32,6 @@ pub fn request() -> Result<(), ErrorCode> {
 
     huesos_fb::shutdown_render();
     huesos_arch::interrupts::disable();
-
-    // The 8042 has no power-off command. Disable both PS/2 interfaces so no
-    // further device traffic is generated while the software-halted machine
-    // waits for physical power removal.
-    huesos_arch::keyboard::prepare_shutdown();
     huesos_arch::lapic::timer_stop();
     huesos_arch::lapic::broadcast_excluding_self(huesos_arch::idt::SHUTDOWN_STOP_VECTOR);
 

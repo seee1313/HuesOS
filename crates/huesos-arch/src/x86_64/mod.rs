@@ -11,7 +11,6 @@ pub mod idt;
 pub mod interrupts;
 pub mod ioapic;
 pub mod irq_callback;
-pub mod keyboard;
 pub mod lapic;
 pub mod paging;
 pub mod pit;

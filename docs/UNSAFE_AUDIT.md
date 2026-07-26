@@ -957,3 +957,61 @@ now routes through the broker on the happy path. A dedicated
 qemu-shutdown-broker smoke job is scheduled for a follow-up so the
 critical-exit-fallback path is asserted too (that requires a way to
 kill the broker mid-run, which today's smoke image does not have).
+
+## `huesos-arch::x86_64::keyboard` module removed (safety-budget shrink, −2 blocks)
+
+Deletes the last kernel-side PS/2 code, completing the migration
+started in PR #119 (kernel PS/2 driver body removal) and PR #123
+(userspace shutdown-broker with capability-gated 8042 quiesce). The
+module file `crates/huesos-arch/src/x86_64/keyboard.rs` is deleted
+outright and the `pub mod keyboard;` declaration is removed from
+`crates/huesos-arch/src/x86_64/mod.rs`.
+
+The two `unsafe { ... }` blocks that had been retained by PR #119
+(the `status.read()` and `command.write()` calls inside
+`prepare_shutdown`) go away with the module. The last remaining
+caller — `huesos_kernel::shutdown::request` on the legacy
+`SystemShutdown` fallback path — no longer performs 8042 quiesce.
+That is safe because `huesos_arch::interrupts::disable()` already
+runs earlier in the same function, masking IRQ delivery before the
+LAPIC halt sequence begins, so no PS/2 event can reach a
+soon-to-be-halted CPU regardless of what the 8042 controller thinks
+its state is.
+
+`safety-budget.json` moves in this PR:
+
+* `unsafe_blocks`: 247 → 245 (net −2).
+* `unsafe_functions`: 59 → 59 (unchanged).
+* `unsafe_impls`: 28 → 28 (unchanged).
+* `rust_files`: 155 → 154 (−1: the deleted `keyboard.rs`).
+* `rust_lines`: 38496 → 38459 (−37).
+* Per-file `unsafe_by_file` entry for
+  `crates/huesos-arch/src/x86_64/keyboard.rs` (was 2) is removed.
+
+No new `unsafe` introduced. This PR is pure deletion + a two-line
+edit to `shutdown::request()` removing one call site and updating
+the doc comment to reflect the completed migration.
+
+The happy-path shutdown flow at the end of PR-E is:
+
+    terminal `system:shutdown`
+      → init forwards `shutdown` to shutdown-broker
+      → broker performs 8042 quiesce via its IoPort(0x64) resource
+      → broker invokes sys_hard_halt via its PowerControl resource
+      → kernel executes shutdown::hard_halt (interrupts::disable →
+        fb::shutdown_render → LAPIC timer stop → IPI stop → hlt loop)
+
+The kernel is fully unaware of PS/2 on the happy path. The legacy
+`SystemShutdown` fallback path (still reachable if init cannot
+launch the broker at all) uses the same LAPIC halt sequence but
+without any device-specific quiesce.
+
+## CI wiring
+
+No new CI job. The existing `qemu-smoke` matrix continues to
+exercise both boot and the terminal shutdown command; behaviour on
+the happy path is unchanged from PR #123. The legacy fallback path
+is not currently smoke-exercised because there is no way in the
+smoke image to make init fail to launch the broker; a
+qemu-shutdown-fallback smoke covering the "broker missing" scenario
+is a future follow-up.
