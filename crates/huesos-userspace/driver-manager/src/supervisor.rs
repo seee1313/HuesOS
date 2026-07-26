@@ -580,14 +580,24 @@ impl DriverManager {
     }
 
     fn poll_init_bootstrap(&mut self, init_bootstrap: &Channel) {
-        let mut buf = [0u8; 64];
+        let mut buf = [0u8; 96];
         loop {
-            match init_bootstrap.read_handle(&mut buf) {
-                Ok((n, handle)) if &buf[..n] == protocol::REGISTRY_CHANNEL.as_bytes() => {
+            // Use `read_optional_handle` so we consume every message
+            // exactly once regardless of whether it carries a
+            // transferred handle. The old `read_handle` path would
+            // silently drop plain (no-handle) control messages —
+            // `read_optional_handle` returns `Ok(bytes, None)` for
+            // them so we can dispatch on the payload string. This is
+            // what the `manifest:grants-complete:<driver>` barrier
+            // depends on: it flows through init's bootstrap channel
+            // interleaved with handle transfers and must not be lost
+            // just because it happens to have no handle attached.
+            match init_bootstrap.read_optional_handle(&mut buf) {
+                Ok((n, Some(handle))) if &buf[..n] == protocol::REGISTRY_CHANNEL.as_bytes() => {
                     println!("[driver-manager] received service registry channel from init");
                     self.registry_channel = Some(Channel::from_handle(handle));
                 }
-                Ok((n, handle)) if &buf[..n] == protocol::BOOTFS_VMO.as_bytes() => {
+                Ok((n, Some(handle))) if &buf[..n] == protocol::BOOTFS_VMO.as_bytes() => {
                     println!("[driver-manager] received BOOTFS VMO from init");
                     self.fs.install_bootfs(Vmo::from_handle(handle));
                     self.bootfs_loaded = true;
@@ -600,56 +610,40 @@ impl DriverManager {
                     self.try_start_pending_hosts();
                     self.try_start_acpi_manager();
                 }
-                Ok((n, handle)) if &buf[..n] == protocol::ACPI_TABLES_VMO.as_bytes() => {
+                Ok((n, Some(handle))) if &buf[..n] == protocol::ACPI_TABLES_VMO.as_bytes() => {
                     println!("[driver-manager] received immutable ACPI table archive");
                     self.acpi_tables = Some(Vmo::from_handle(handle));
                     self.try_start_acpi_manager();
                 }
-                Ok((n, handle)) if &buf[..n] == protocol::ACPI_BROKER.as_bytes() => {
+                Ok((n, Some(handle))) if &buf[..n] == protocol::ACPI_BROKER.as_bytes() => {
                     println!("[driver-manager] received unique ACPI broker capability");
                     self.acpi_broker = Some(handle);
                     self.try_start_acpi_manager();
                 }
-                Ok((n, handle)) if buf[..n].starts_with(RESOURCE_LABEL_PREFIX) => {
+                Ok((n, Some(handle))) if buf[..n].starts_with(RESOURCE_LABEL_PREFIX) => {
                     // Manifest-driven resource grant from init
                     // (PR-C/PR-D). Buffer here; forward at spawn.
                     self.record_resource_handle(&buf[..n], handle);
                 }
-                Ok((_n, _handle)) => println!("[driver-manager] unknown bootstrap handle message"),
-                Err(ErrorCode::ShouldWait) => return,
-                Err(ErrorCode::InvalidArgs) => {
-                    // Plain (no-handle) control message. Try reading
-                    // it as bytes; recognise the mark-critical
-                    // sidecar init sends alongside handles for
-                    // critical-flag drivers.
-                    let mut plain = [0u8; 96];
-                    match init_bootstrap.read_into(&mut plain) {
-                        Ok(m) if plain[..m].starts_with(CRITICAL_INTENT_LABEL_PREFIX) => {
-                            let driver = &plain[CRITICAL_INTENT_LABEL_PREFIX.len()..m];
-                            self.record_critical_intent(driver);
-                        }
-                        Ok(m)
-                            if plain[..m]
-                                .starts_with(MANIFEST_GRANTS_COMPLETE_PREFIX.as_bytes()) =>
-                        {
-                            let driver = &plain[MANIFEST_GRANTS_COMPLETE_PREFIX.len()..m];
-                            self.mark_driver_grants_ready(driver);
-                            self.try_start_pending_hosts();
-                        }
-                        Ok(m) => println!(
-                            "[driver-manager] unrecognised init control message ({} B)",
-                            m
-                        ),
-                        Err(ErrorCode::ShouldWait) => return,
-                        Err(e2) => {
-                            println!(
-                                "[driver-manager] bootstrap plain-read failed: {}",
-                                e2.as_str()
-                            );
-                            return;
-                        }
-                    }
+                Ok((_n, Some(_handle))) => {
+                    println!("[driver-manager] unknown bootstrap handle message")
                 }
+                Ok((n, None)) if buf[..n].starts_with(CRITICAL_INTENT_LABEL_PREFIX) => {
+                    let driver = &buf[CRITICAL_INTENT_LABEL_PREFIX.len()..n];
+                    self.record_critical_intent(driver);
+                }
+                Ok((n, None))
+                    if buf[..n].starts_with(MANIFEST_GRANTS_COMPLETE_PREFIX.as_bytes()) =>
+                {
+                    let driver = &buf[MANIFEST_GRANTS_COMPLETE_PREFIX.len()..n];
+                    self.mark_driver_grants_ready(driver);
+                    self.try_start_pending_hosts();
+                }
+                Ok((n, None)) => println!(
+                    "[driver-manager] unrecognised init control message ({} B)",
+                    n
+                ),
+                Err(ErrorCode::ShouldWait) => return,
                 Err(e) => {
                     println!("[driver-manager] bootstrap read failed: {}", e.as_str());
                     return;
