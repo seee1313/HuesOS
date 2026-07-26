@@ -14,6 +14,7 @@
 #![no_std]
 #![warn(missing_docs)]
 
+mod font6x13;
 mod font8x8;
 
 use huesos_abi::FramebufferInfo as AbiFramebufferInfo;

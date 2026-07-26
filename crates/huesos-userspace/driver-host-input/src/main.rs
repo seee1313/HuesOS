@@ -9,11 +9,23 @@
 #![no_main]
 
 use core::panic::PanicInfo;
-use libcanvas::{println, ErrorCode, Interrupt, Port, PORT_PACKET_INTERRUPT};
+use libcanvas::{
+    println, wait_any, ErrorCode, Interrupt, Port, Signals, WaitItem, PORT_PACKET_INTERRUPT,
+};
 
 const KEY_KEYBOARD: u64 = 1;
 const ATTACH_KEYBOARD_CLIENT: &[u8] = b"keyboard-client";
-const HEARTBEAT_EVERY_SCANCODES: u64 = 32;
+const HEARTBEAT_EVERY_SCANCODES: u64 = 256;
+
+// wait_any keys used by the event loop.
+const WAIT_KEY_BOOTSTRAP: u64 = 0;
+const WAIT_KEY_PORT: u64 = 1;
+
+// Poll timeout for bootstrap-side drain during startup. Small enough
+// that startup never hangs longer than a fraction of a second if
+// DriverManager sends nothing; large enough that all the buffered
+// resource transfers arrive in one wake-up round.
+const BOOTSTRAP_DRAIN_TIMEOUT_TICKS: u64 = 8;
 
 #[unsafe(no_mangle)]
 pub extern "C" fn _start() -> ! {
@@ -50,8 +62,9 @@ const RESOURCE_LABEL_PREFIX: &[u8] = b"resource:";
 
 /// Drain any `resource:*` handle-transfer messages waiting on the
 /// bootstrap channel, log each one, and hold on to the handles so
-/// they stay valid for the driver's lifetime. Bounded-poll so a
-/// misconfigured DriverManager cannot hang bring-up.
+/// they stay valid for the driver's lifetime. Event-driven: parks
+/// on the bootstrap channel with a short timeout so no CPU is
+/// burned on busy-yield during bring-up.
 fn consume_manifest_resources(bootstrap: &libcanvas::Channel) {
     // Bounded static storage for received handles. `Handle` holds a
     // raw HandleValue; keeping the Handles in an array without an
@@ -60,50 +73,63 @@ fn consume_manifest_resources(bootstrap: &libcanvas::Channel) {
     let mut received: [Option<libcanvas::Handle>; 8] = [const { None }; 8];
     let mut received_count = 0usize;
     let mut label = [0u8; 96];
-    let mut idle = 0u32;
+    let items = [WaitItem::new(
+        bootstrap.handle().raw(),
+        Signals::READABLE | Signals::PEER_CLOSED,
+        WAIT_KEY_BOOTSTRAP,
+    )];
     loop {
-        match bootstrap.read_handle(&mut label) {
-            Ok((n, handle)) if label[..n].starts_with(RESOURCE_LABEL_PREFIX) => {
-                if received_count < received.len() {
-                    let text = core::str::from_utf8(&label[..n]).unwrap_or("?");
-                    println!(
-                        "[driver-host:input] received manifest resource #{}: {}",
-                        received_count + 1,
-                        text
-                    );
-                    received[received_count] = Some(handle);
-                    received_count += 1;
-                } else {
-                    println!("[driver-host:input] resource buffer full, dropping label");
-                    drop(handle);
-                }
-                idle = 0;
-            }
-            Ok((n, handle)) => {
-                let text = core::str::from_utf8(&label[..n]).unwrap_or("?");
-                println!(
-                    "[driver-host:input] non-resource handle transfer ignored: {}",
-                    text
-                );
-                drop(handle);
-            }
-            Err(ErrorCode::ShouldWait) | Err(ErrorCode::TimedOut) => {
-                idle = idle.wrapping_add(1);
-                // Empirically DriverManager delivers all buffered
-                // handles within a handful of yields once we start
-                // reading; a couple hundred idle rounds is plenty of
-                // headroom on smp=1 debug boots.
-                if idle >= 256 {
-                    break;
-                }
-                libcanvas::process::yield_now();
-            }
+        // Park on the bootstrap channel with a short timeout; the
+        // wake either delivers a queued message or expires when
+        // DriverManager is done sending. Zero busy-yield.
+        match wait_any(&items, BOOTSTRAP_DRAIN_TIMEOUT_TICKS) {
+            Ok(_) => {}
+            Err(ErrorCode::TimedOut) => break,
             Err(e) => {
                 println!(
-                    "[driver-host:input] resource-drain read failed: {}",
+                    "[driver-host:input] resource-drain wait failed: {}",
                     e.as_str()
                 );
                 break;
+            }
+        }
+        // Drain everything currently readable in one burst before we
+        // park again. Anything still pending after ShouldWait means
+        // the channel is quiet — go back to sleep.
+        loop {
+            match bootstrap.read_handle(&mut label) {
+                Ok((n, handle)) if label[..n].starts_with(RESOURCE_LABEL_PREFIX) => {
+                    if received_count < received.len() {
+                        let text = core::str::from_utf8(&label[..n]).unwrap_or("?");
+                        println!(
+                            "[driver-host:input] received manifest resource #{}: {}",
+                            received_count + 1,
+                            text
+                        );
+                        received[received_count] = Some(handle);
+                        received_count += 1;
+                    } else {
+                        println!("[driver-host:input] resource buffer full, dropping label");
+                        drop(handle);
+                    }
+                }
+                Ok((n, handle)) => {
+                    let text = core::str::from_utf8(&label[..n]).unwrap_or("?");
+                    println!(
+                        "[driver-host:input] non-resource handle transfer ignored: {}",
+                        text
+                    );
+                    drop(handle);
+                }
+                Err(ErrorCode::ShouldWait) | Err(ErrorCode::InvalidArgs) => break,
+                Err(e) => {
+                    println!(
+                        "[driver-host:input] resource-drain read failed: {}",
+                        e.as_str()
+                    );
+                    // Fall through to retain what we already have.
+                    break;
+                }
             }
         }
     }
@@ -135,51 +161,107 @@ fn setup_keyboard_irq_bridge() -> libcanvas::Result<Port> {
 fn run_driver_loop(port: Port, bootstrap: libcanvas::Channel) -> ! {
     let mut keyboard_client: Option<libcanvas::Channel> = None;
     let mut decoder = KeyboardDecoder::new();
-    let mut idle = 0u32;
-    loop {
-        // Always service bootstrap first so attach/ready paths stay live.
-        poll_bootstrap(&bootstrap, &mut keyboard_client);
+    let mut scancode_count: u64 = 0;
 
-        // Non-blocking port read. Full park/block is still too sharp under
-        // SMP+TCG for the only IRQ consumer during bring-up.
+    // Event-driven: park on either the IRQ Port or the bootstrap
+    // Channel. Zero CPU is spent when the keyboard is idle. When a
+    // key press wakes us, we drain every readable packet in one
+    // burst before parking again, so we never leave events sitting
+    // in the queue when they could be delivered right now.
+    //
+    // The `WaitItem` order matches the sat-set walk order the kernel
+    // uses when both are ready simultaneously; putting the Port
+    // first means keypresses (the latency-critical path) are
+    // dispatched before bootstrap control messages when both fire
+    // in the same wake.
+    let items = [
+        WaitItem::new(port.handle().raw(), Signals::READABLE, WAIT_KEY_PORT),
+        WaitItem::new(
+            bootstrap.handle().raw(),
+            Signals::READABLE | Signals::PEER_CLOSED,
+            WAIT_KEY_BOOTSTRAP,
+        ),
+    ];
+
+    loop {
+        // Timeout = 0 means block indefinitely: we wake only on real
+        // I/O, never on a tick. This is the "no dumb yields" path
+        // the driver has been missing.
+        let outcome = match wait_any(&items, 0) {
+            Ok(outcome) => outcome,
+            Err(e) => {
+                println!("[driver-host:input] wait_any failed: {}", e.as_str());
+                let _ = bootstrap.write(b"driver-host:input:error");
+                libcanvas::process::yield_now();
+                continue;
+            }
+        };
+
+        // The order we drain matters only when both fire in the same
+        // wake: doing the Port first keeps key-to-terminal latency
+        // minimal.
+        let mut port_ready = false;
+        let mut bootstrap_ready = false;
+        for result in outcome.satisfied() {
+            match result.key {
+                WAIT_KEY_PORT => port_ready = true,
+                WAIT_KEY_BOOTSTRAP => bootstrap_ready = true,
+                _ => {}
+            }
+        }
+
+        if port_ready {
+            drain_keyboard_port(
+                &port,
+                &keyboard_client,
+                &mut decoder,
+                &bootstrap,
+                &mut scancode_count,
+            );
+        }
+        if bootstrap_ready {
+            poll_bootstrap(&bootstrap, &mut keyboard_client);
+        }
+    }
+}
+
+/// Drain every currently-queued IRQ packet from the port and dispatch
+/// its scancode. Called once per wake; loops internally until
+/// `ShouldWait` so a keystroke burst never leaves events pending.
+fn drain_keyboard_port(
+    port: &Port,
+    keyboard_client: &Option<libcanvas::Channel>,
+    decoder: &mut KeyboardDecoder,
+    bootstrap: &libcanvas::Channel,
+    scancode_count: &mut u64,
+) {
+    loop {
         match port.read() {
             Ok(packet)
                 if packet.packet_type == PORT_PACKET_INTERRUPT && packet.key == KEY_KEYBOARD =>
             {
-                idle = 0;
-                let irq = packet.data[0];
                 let scancode = packet.data[1] as u8;
-                let count = packet.data[2];
-                // Serial output is orders of magnitude slower than IRQ event
-                // delivery, especially on real UART hardware. Log the first
-                // few events and exponentially sparse milestones instead of
-                // issuing a DebugWrite syscall for every make/break byte.
-                if count <= 3 || count.is_power_of_two() {
-                    println!(
-                        "[driver-host:input] irq={} scancode={:#x} count={}",
-                        irq, scancode, count
-                    );
-                }
+                *scancode_count = scancode_count.wrapping_add(1);
                 if let Some(event) = decoder.feed(scancode) {
-                    send_keyboard_event(&keyboard_client, event);
+                    send_keyboard_event(keyboard_client, event);
                 }
-                if count % HEARTBEAT_EVERY_SCANCODES == 0 {
+                // Heartbeat only every N scancodes so we never burn a
+                // DebugWrite syscall per key press. First-few-events
+                // spam log removed for the same reason.
+                if (*scancode_count).is_multiple_of(HEARTBEAT_EVERY_SCANCODES) {
                     let _ = bootstrap.write(b"heartbeat:input");
                 }
             }
-            Ok(_) => {}
-            Err(ErrorCode::ShouldWait) | Err(ErrorCode::TimedOut) => {
-                idle = idle.wrapping_add(1);
-                if idle >= 1024 {
-                    idle = 0;
-                    let _ = bootstrap.write(b"heartbeat:input");
-                }
-                libcanvas::process::yield_now();
+            Ok(_) => {
+                // A non-interrupt packet slipped through (should not
+                // happen with the current IRQ bridge); skip and keep
+                // draining.
             }
+            Err(ErrorCode::ShouldWait) | Err(ErrorCode::TimedOut) => return,
             Err(e) => {
                 println!("[driver-host:input] port read failed: {}", e.as_str());
                 let _ = bootstrap.write(b"driver-host:input:error");
-                libcanvas::process::yield_now();
+                return;
             }
         }
     }

@@ -334,6 +334,17 @@ priority order.
   and `mod.rs` no longer declares it. Legacy `SystemShutdown`
   continues to work as a broker-unavailable fallback but skips the
   historical `out 0x64, 0xAD/0xA7` sequence entirely.
+- **Input UX quality: Cozette 6x13 font + event-driven PS/2 driver
+  (landed as PR-F)**: replaces the 8x8-upscaled-to-8x16 pixelated
+  terminal text with the Cozette bitmap font (6×13, MIT), doubling
+  usable terminal cells from 44×96 to 54×168. The input-host
+  driver loop is rewritten around `wait_any([bootstrap, port])` so
+  it spends zero CPU when the keyboard is idle and dispatches
+  key events at IPI-plus-context-switch latency instead of at
+  scheduler-yield granularity. `tools/fontgen/bdf2rs.py` is the
+  new regenerator for the font tables from an upstream `.bdf`
+  release; both `libcanvas::font6x13` and `huesos_fb::font6x13`
+  ship the same glyph data.
 
 ## Medium Term
 

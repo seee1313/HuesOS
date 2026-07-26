@@ -43,6 +43,13 @@ impl Channel {
         self.0
     }
 
+    /// Borrow the underlying handle. Handy for passing this channel
+    /// to a multiplexed wait via [`wait_any`](crate::wait_any) or
+    /// [`wait_all`](crate::wait_all) without giving up ownership.
+    pub fn handle(&self) -> &Handle {
+        &self.0
+    }
+
     /// Duplicate this endpoint with the same rights. Both wrappers refer to
     /// the same channel inbox; use this to lend a service channel to a child
     /// while retaining ownership in the parent.
