@@ -296,13 +296,17 @@ priority order.
 - BOOTFS is live as a RAM archive; `huesos-fat` exists as a library.
 - **Needed**: virtio-block (or similar) + FAT/other backends behind
   FileSystemService; load DriverHosts from FS instead of build embeds.
-- **PS/2 driver ownership**: the scancode decoder, shift-state machine, and
-  key-event dispatch now live only in the userspace `driver-host:input`
-  process. The kernel keeps a two-instruction IRQ1 shim that reads port
-  0x60 and forwards the raw byte via `irq_callback::emit(1, byte)`;
-  `huesos-arch::keyboard::prepare_shutdown` is the last kernel-side PS/2
-  touch and is scheduled for removal once the userspace shutdown broker
-  lands (see the `IoPort` capability + `shutdown-broker` work items).
+- **PS/2 driver ownership (fully migrated as of PR-E)**: the scancode
+  decoder, shift-state machine, and key-event dispatch live only in the
+  userspace `driver-host:input` process. The kernel keeps a
+  two-instruction IRQ1 shim in the IDT that reads port 0x60 and
+  forwards the raw byte via `irq_callback::emit(1, byte)`. **The
+  `huesos-arch::x86_64::keyboard` module has been deleted**; the 8042
+  quiesce sequence executed on the shutdown path is now driven by the
+  userspace `shutdown-broker` component through its IoPort resource.
+  The legacy `SystemShutdown` kernel path no longer touches PS/2 at
+  all — `interrupts::disable()` already masks IRQ delivery before the
+  LAPIC halt sequence, so no spurious event can reach a dead handler.
 - **Manifest-driven resource grants (landed as PR-C)**: `Resource`
   capability objects (`ObjectType::Resource`, kinds
   `IoPort`/`Mmio`/`Irq`, shared/exclusive semantics) are minted
@@ -323,9 +327,13 @@ priority order.
   analogue). DriverManager forward layer + input-host verification
   close the PR-C limitation end-to-end: manifest-minted resource
   handles now reach the driver process they were declared for.
-  `keyboard::prepare_shutdown` remains only as a fallback of the
-  legacy `SystemShutdown` syscall path and is scheduled for removal
-  in PR-E.
+  `keyboard::prepare_shutdown` is deleted in PR-E; see the item
+  above.
+- **`huesos-arch::x86_64::keyboard` module deletion (landed as PR-E)**:
+  the last kernel-side PS/2 code is gone. The module file is removed
+  and `mod.rs` no longer declares it. Legacy `SystemShutdown`
+  continues to work as a broker-unavailable fallback but skips the
+  historical `out 0x64, 0xAD/0xA7` sequence entirely.
 
 ## Medium Term
 
