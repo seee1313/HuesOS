@@ -387,6 +387,38 @@ fn send_manifest_grants(
             ),
         }
     }
+
+    // 4. Grants-complete barrier: tell DriverManager it is now safe
+    // to spawn this DriverHost. Every `resource:*` transfer and any
+    // `resource:mark-critical:*` control message queued before this
+    // one is guaranteed by channel FIFO order to be observable by
+    // DM before it processes the barrier — so `forward_pending_resources`
+    // sees the full grant set. Without this signal DM used to spawn
+    // the host as soon as the BOOTFS VMO arrived, racing init's
+    // still-in-flight `Resource::create` calls.
+    let mut label = [0u8; 96];
+    let len = format_grants_complete_label(&mut label, driver_name);
+    let payload = &label[..len.min(label.len())];
+    match dm_bootstrap.write(payload) {
+        Ok(()) => init_logln!(
+            logger,
+            "[init] manifest {}: signalled grants-complete to DriverManager",
+            driver_name
+        ),
+        Err(e) => init_logln!(
+            logger,
+            "[init] manifest {}: failed to signal grants-complete: {}",
+            driver_name,
+            e.as_str()
+        ),
+    }
+}
+
+fn format_grants_complete_label(out: &mut [u8], driver: &str) -> usize {
+    let mut w = FixedWriter::new(out);
+    let _ = w.write_bytes(b"manifest:grants-complete:");
+    let _ = w.write_bytes(driver.as_bytes());
+    w.len()
 }
 
 /// Write `resource:<driver>:<kind>:0x<base>:0x<len>:<mode>` into `out`;

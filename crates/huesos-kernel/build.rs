@@ -183,7 +183,18 @@ fn build_bootfs_image(
             // the new `resource=` lines are the source of truth for
             // the kernel-minted Resource handles. `critical=false` is
             // the default; explicit here for review clarity.
-            data: b"name=input-host\nkind=driver-host\nprovides=keyboard\nirq=1\nioport=0x60:1\nioport=0x64:1\nresource=ioport:0x60:1:excl\nresource=ioport:0x64:1:excl\nresource=irq:1:1:excl\ncritical=false\nelf=/drivers/input-host.elf\nheartbeat=true\n".to_vec(),
+            //
+            // 8042 port map (see IBM PS/2 spec):
+            //   0x60 — data port (scancodes + keyboard replies)
+            //   0x64 — status + command port
+            // The input driver reads scancodes off 0x60 and only
+            // *observes* 0x64's status bits to know when a byte is
+            // ready; it never issues an 8042 command itself. That's
+            // why we grant IoPort 0x60 exclusive (data belongs to
+            // the driver) but leave 0x64 to shutdown-broker (which
+            // is the sole issuer of 8042 commands). Granting 0x64
+            // to both hosts would collide as `Resource::Conflict`.
+            data: b"name=input-host\nkind=driver-host\nprovides=keyboard\nirq=1\nioport=0x60:1\nresource=ioport:0x60:1:excl\nresource=irq:1:1:excl\ncritical=false\nelf=/drivers/input-host.elf\nheartbeat=true\n".to_vec(),
         },
         BootFsFile {
             path: "/manifests/shutdown-broker.hdriver",

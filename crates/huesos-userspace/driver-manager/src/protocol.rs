@@ -24,6 +24,15 @@ pub const ATTACH_KEYBOARD_CLIENT: &str = "keyboard-client";
 
 /// Init passes the BOOTFS image as a VMO handle with this message.
 pub const BOOTFS_VMO: &str = "bootfs-vmo";
+/// Init tells DriverManager that every `resource:*` grant for a
+/// specific driver has been transferred and DriverManager is now
+/// free to spawn that DriverHost. Full label:
+/// `manifest:grants-complete:<driver-name>` (e.g.
+/// `manifest:grants-complete:input-host`). This closes the race
+/// where DM used to start a host as soon as the BOOTFS VMO
+/// arrived and then had no handles to forward to it because init
+/// was still busy minting them.
+pub const MANIFEST_GRANTS_COMPLETE_PREFIX: &str = "manifest:grants-complete:";
 /// Init passes the immutable ACPI table archive with this message.
 pub const ACPI_TABLES_VMO: &str = "acpi-tables-vmo";
 /// Init passes the unique deny-by-default ACPI broker capability.

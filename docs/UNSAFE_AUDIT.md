@@ -1077,3 +1077,63 @@ exercises the keyboard IRQ path implicitly (any smoke that presses
 a key runs through the new driver loop). Font rendering is
 observable in the boot screenshot / serial log the smoke image
 already captures.
+
+## Init service integration ordering fix + CI happy-path markers (safety-budget-neutral)
+
+Three related fixes for the "keyboard didn't work after boot" bug the
+human tester reported:
+
+**Bug 1 (race):** DriverManager was spawning `input-host` as soon as
+the BOOTFS VMO arrived from init, then discovering there were no
+`resource:*` handles to forward to it because init was still
+mid-`Resource::create` for that same driver. The fix introduces an
+explicit `manifest:grants-complete:<driver>` control message on the
+init → DM bootstrap channel. Init emits it once every declared grant
+has been transferred (or once the mint failed and we gave up).
+DriverManager defers the spawn until it sees this message; it also
+re-checks on BOOTFS_VMO arrival in case the barrier landed first.
+Channel FIFO ordering guarantees every earlier `write_handle` is
+already visible when the barrier is processed, so
+`forward_pending_resources` sees the complete grant set.
+
+**Bug 2 (double-mint):** init was minting `IoPort 0x64 exclusive`
+twice — once for `input-host` and once for `shutdown-broker`. The
+second `Resource::try_create_exclusive` correctly returned
+`Conflict`, which left `shutdown-broker` unable to spawn. Fixed by
+tightening the 8042 ownership split: `input-host` now owns only
+0x60 (the data port it actually reads scancodes from);
+`shutdown-broker` owns 0x64 (the command port it writes 0xAD/0xA7
+to). This is the real ownership boundary the two subsystems have —
+the previous manifest was over-granting.
+
+**Bug 3 (CI blind spot):** `scripts/ci-qemu-smoke.sh` was only
+checking early-boot markers (uACPI + first few init self-tests), so
+a boot that stranded the terminal on `open:keyboard` still passed
+CI green. This PR extends the marker set to cover the full happy-path
+boot chain — input-host `service:keyboard:ready`, shutdown-broker
+`ready`, acpi-manager self-test OK, terminal `keyboard service
+online, starting shell` — and adds an anti-marker set that fails
+CI if any known "silent stall" line (`did not become ready in
+time`, `resource busy`, `failed to open keyboard service`, etc.)
+appears in the serial log. Without this the fix could not be
+verified end-to-end from a sandbox that has no QEMU.
+
+`safety-budget.json` moves in this PR:
+
+* `unsafe_blocks`: 245 → 245 (unchanged).
+* `unsafe_functions`: 59 → 59 (unchanged).
+* `unsafe_impls`: 28 → 28 (unchanged).
+* `rust_files`: 156 → 156 (unchanged).
+* `rust_lines`: 38967 → 39093 (+126).
+
+No new `unsafe`. All three fixes are pure safe-Rust changes plus a
+bash script edit for the CI harness.
+
+## CI wiring
+
+`scripts/ci-qemu-smoke.sh` now enforces both positive markers
+(everything the healthy boot must print) and negative markers
+(anything a broken boot silently prints instead of panicking). The
+existing `qemu-boot` matrix job invokes this script unchanged, so
+the new checks land automatically across `{debug,release} × {smp=1,
+smp=2}`.

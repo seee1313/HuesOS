@@ -345,6 +345,22 @@ priority order.
   new regenerator for the font tables from an upstream `.bdf`
   release; both `libcanvas::font6x13` and `huesos_fb::font6x13`
   ship the same glyph data.
+- **Init service integration ordering + CI happy-path markers
+  (landed as PR-G)**: explicit
+  `manifest:grants-complete:<driver>` barrier on the init → DM
+  bootstrap channel so DriverManager cannot spawn an input host
+  before init has finished minting its Resource grants; tightened
+  8042 port ownership so `input-host` owns only 0x60 and
+  `shutdown-broker` owns only 0x64, removing the exclusive-mint
+  collision that used to leave the broker unspawned; and a
+  significantly expanded `scripts/ci-qemu-smoke.sh` marker set
+  covering every step of the healthy boot chain up to
+  `[terminal] keyboard service online, starting shell` plus an
+  anti-marker set that fails CI on any known "silent stall"
+  line. Closes the class of bug where a userspace regression
+  leaves the terminal wedged waiting for a service that never
+  came up while CI stays green because early-boot self-tests
+  still print.
 
 ## Medium Term
 

@@ -3,6 +3,7 @@
 use crate::fs_service::FileSystemService;
 use crate::manifest::INPUT_HOST;
 use crate::protocol;
+use crate::protocol::MANIFEST_GRANTS_COMPLETE_PREFIX;
 use crate::registry::{ServiceRegistry, ServiceState};
 use libcanvas::{println, Channel, ErrorCode, Handle, Process, Vmo};
 
@@ -123,7 +124,20 @@ pub struct DriverManager {
     /// hash-map is warranted.
     pending_resources: [PendingResources; 4],
     pending_resource_count: usize,
+    /// Driver names for which init has signalled that every
+    /// declared resource grant has been transferred. Populated by
+    /// `manifest:grants-complete:<driver>` control messages from
+    /// init; consulted by [`try_start_pending_hosts`] before it
+    /// spawns any host. A driver never spawns until its name
+    /// appears here (or the driver declares zero grants in its
+    /// manifest, in which case init still sends the signal so the
+    /// two paths converge).
+    grants_ready: [[u8; 32]; MAX_TRACKED_HOSTS],
+    grants_ready_len: [usize; MAX_TRACKED_HOSTS],
+    grants_ready_count: usize,
 }
+
+const MAX_TRACKED_HOSTS: usize = 4;
 
 struct ManagedHost {
     process: Process,
@@ -153,7 +167,57 @@ impl DriverManager {
                 PendingResources::empty(),
             ],
             pending_resource_count: 0,
+            grants_ready: [[0; 32]; MAX_TRACKED_HOSTS],
+            grants_ready_len: [0; MAX_TRACKED_HOSTS],
+            grants_ready_count: 0,
         }
+    }
+
+    fn mark_driver_grants_ready(&mut self, driver: &[u8]) {
+        if self.grants_ready_count >= self.grants_ready.len() {
+            println!("[driver-manager] grants-ready table full, ignoring");
+            return;
+        }
+        // De-dup: init may retransmit if a message races. Silently
+        // ignore duplicates rather than blowing the small table.
+        for i in 0..self.grants_ready_count {
+            if &self.grants_ready[i][..self.grants_ready_len[i]] == driver {
+                return;
+            }
+        }
+        let idx = self.grants_ready_count;
+        let take = driver.len().min(self.grants_ready[idx].len());
+        self.grants_ready[idx][..take].copy_from_slice(&driver[..take]);
+        self.grants_ready_len[idx] = take;
+        self.grants_ready_count += 1;
+        println!(
+            "[driver-manager] grants-complete for {}",
+            core::str::from_utf8(driver).unwrap_or("?")
+        );
+    }
+
+    fn driver_grants_ready(&self, driver: &[u8]) -> bool {
+        for i in 0..self.grants_ready_count {
+            if &self.grants_ready[i][..self.grants_ready_len[i]] == driver {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Called every time either the BOOTFS VMO or a
+    /// `manifest:grants-complete` message lands. Attempts to spawn
+    /// each declared host whose prerequisites have all arrived;
+    /// hosts whose grants are still in flight are silently skipped
+    /// and will be picked up on the next tick.
+    fn try_start_pending_hosts(&mut self) {
+        if !self.bootfs_loaded || self.input_host.is_some() {
+            return;
+        }
+        if !self.driver_grants_ready(b"input-host") {
+            return;
+        }
+        self.start_driver_hosts();
     }
 
     fn record_resource_handle(&mut self, label: &[u8], handle: Handle) {
@@ -527,7 +591,13 @@ impl DriverManager {
                     println!("[driver-manager] received BOOTFS VMO from init");
                     self.fs.install_bootfs(Vmo::from_handle(handle));
                     self.bootfs_loaded = true;
-                    self.start_driver_hosts();
+                    // NOTE: spawn is deferred to the explicit
+                    // `manifest:grants-complete:<driver>` control
+                    // message so init has time to mint and
+                    // transfer the Resource handles this driver
+                    // needs before we hand it off. See
+                    // `docs/ARCHITECTURE_ROADMAP.md` §4.
+                    self.try_start_pending_hosts();
                     self.try_start_acpi_manager();
                 }
                 Ok((n, handle)) if &buf[..n] == protocol::ACPI_TABLES_VMO.as_bytes() => {
@@ -557,6 +627,14 @@ impl DriverManager {
                         Ok(m) if plain[..m].starts_with(CRITICAL_INTENT_LABEL_PREFIX) => {
                             let driver = &plain[CRITICAL_INTENT_LABEL_PREFIX.len()..m];
                             self.record_critical_intent(driver);
+                        }
+                        Ok(m)
+                            if plain[..m]
+                                .starts_with(MANIFEST_GRANTS_COMPLETE_PREFIX.as_bytes()) =>
+                        {
+                            let driver = &plain[MANIFEST_GRANTS_COMPLETE_PREFIX.len()..m];
+                            self.mark_driver_grants_ready(driver);
+                            self.try_start_pending_hosts();
                         }
                         Ok(m) => println!(
                             "[driver-manager] unrecognised init control message ({} B)",

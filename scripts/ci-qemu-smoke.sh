@@ -40,6 +40,14 @@ fi
 # These cover the critical boot path: bootloader → kernel → userspace init.
 # Additional service markers (acpi-manager, driver-manager, terminal) are
 # commented out pending service launch integration — see docs/ROADMAP.md.
+#
+# Boot markers that must appear in the QEMU log for the test to pass.
+# These now cover the full happy-path boot chain, kernel → init →
+# DriverManager → DriverHosts → shutdown-broker → terminal shell
+# ready, so a regression that leaves any of them stranded (e.g. the
+# manifest-grants-race-with-BOOTFS-VMO delivery bug that shipped in
+# PR-D and was fixed in this PR) turns CI red instead of merging
+# green under a broken user experience.
 for marker in \
     '[uACPI] validated ACPI table graph and MADT' \
     '[uACPI] built immutable Ring-3 table archive' \
@@ -47,9 +55,34 @@ for marker in \
     '[init] hello from ring3 userspace, via libcanvas' \
     '[init] VMO read/write round-trip OK' \
     '[init] channel IPC round-trip OK' \
-    '[init] monotonic clock OK'; do
+    '[init] monotonic clock OK' \
+    '[driver-manager] launched DriverHost input-host' \
+    '[driver-host:input] started' \
+    'service:keyboard:ready' \
+    '[driver-host:input] retained' \
+    '[shutdown-broker] ready' \
+    '[acpi-manager] broker deny-by-default self-test OK' \
+    '[init] launched terminal' \
+    '[terminal] keyboard service online, starting shell'; do
     if ! grep -Fq "$marker" "$log"; then
         echo "missing boot marker: $marker" >&2
+        tail -200 "$log" >&2
+        exit 1
+    fi
+done
+
+# Regressions that must NOT appear on the happy path. These messages
+# indicate a subsystem the user-visible flow depends on failed silently
+# — the historical bug shape where CI stayed green because we only
+# checked positive early-boot markers.
+for regression in \
+    '[driver-manager] input DriverHost did not become ready in time' \
+    '[driver-manager] keyboard service requested before ready' \
+    '[init] shutdown-broker: IoPort resource mint failed' \
+    '[init] shutdown-broker: PowerControl mint failed' \
+    '[terminal] failed to open keyboard service'; do
+    if grep -Fq "$regression" "$log"; then
+        echo "regression marker present: $regression" >&2
         tail -200 "$log" >&2
         exit 1
     fi
