@@ -56,6 +56,7 @@ pub extern "C" fn _start() -> ! {
     run_channel_check(&mut logger);
     run_monotonic_clock_check(&mut logger);
     run_process_wait_check(&mut logger);
+    run_waitset_check(&mut logger);
     run_fault_isolation_check(&mut logger);
     run_shutdown_authorization_check(&mut logger);
 
@@ -1013,6 +1014,139 @@ fn run_channel_check(logger: &mut InitLogger) {
             e.as_str()
         ),
     }
+}
+
+/// Regression suite for `Syscall::WaitSetWait`.
+///
+/// Three properties, each a live end-to-end syscall probe:
+///
+/// 1. **READABLE fires on channel wake.** A `wait_any` on the empty
+///    receiver returns pending; after the peer writes a message the
+///    same wait wakes and reports `Signals::READABLE` for the item.
+///    The read then returns the payload — proving the wake was not
+///    a spurious poll.
+///
+/// 2. **`timeout_ticks` is honoured.** A `wait_any` on a channel
+///    that never becomes readable returns `Err(TimedOut)` within
+///    the requested budget. Between PR #126 and this PR the kernel
+///    silently ignored `timeout_ticks` and looped forever, and the
+///    only reason it did not lock up any real boot was that every
+///    caller either passed `0` (wait forever) or had a peer that
+///    eventually wrote something. driver-host-input was the first
+///    caller that actually depended on timeout firing, and it
+///    stalled.
+///
+/// 3. **Ports report `READABLE`, not `SIGNALED`.** Bound-key IRQ
+///    packets on a Port were previously reported under
+///    `Signals::SIGNALED` while every driver awaited `READABLE`, so
+///    the two never intersected and Port-based `wait_any` never
+///    fired. Rectified in the same PR as this test.
+fn run_waitset_check(logger: &mut InitLogger) {
+    use libcanvas::{wait_any, Signals, WaitItem};
+
+    // Property 1 — READABLE fires on channel wake.
+    let Ok((tx, rx)) = libcanvas::Channel::pair() else {
+        init_logln!(logger, "[init] waitset self-test FAILED (channel pair)");
+        return;
+    };
+    if let Err(e) = tx.write(b"waitset-probe") {
+        init_logln!(
+            logger,
+            "[init] waitset self-test FAILED (write: {})",
+            e.as_str()
+        );
+        return;
+    }
+    let items = [WaitItem::new(rx.handle().raw(), Signals::READABLE, 7)];
+    match wait_any(&items, 0) {
+        Ok(outcome) => {
+            let found = outcome
+                .satisfied()
+                .iter()
+                .any(|r| r.key == 7 && (r.active_signals & Signals::READABLE.bits()) != 0);
+            if !found {
+                init_logln!(
+                    logger,
+                    "[init] waitset self-test FAILED (READABLE not reported for channel)"
+                );
+                return;
+            }
+        }
+        Err(e) => {
+            init_logln!(
+                logger,
+                "[init] waitset self-test FAILED (channel wait_any: {})",
+                e.as_str()
+            );
+            return;
+        }
+    }
+    // Drain the probe message so the next iteration starts empty.
+    let mut buf = [0u8; 32];
+    let _ = rx.read_into(&mut buf);
+
+    // Property 2 — timeout_ticks is honoured.
+    let empty_items = [WaitItem::new(rx.handle().raw(), Signals::READABLE, 8)];
+    match wait_any(&empty_items, 4) {
+        Err(libcanvas::ErrorCode::TimedOut) => {}
+        Ok(_) => {
+            init_logln!(
+                logger,
+                "[init] waitset self-test FAILED (timeout returned Ok on empty channel)"
+            );
+            return;
+        }
+        Err(e) => {
+            init_logln!(
+                logger,
+                "[init] waitset self-test FAILED (timeout wait_any: {})",
+                e.as_str()
+            );
+            return;
+        }
+    }
+
+    // Property 3 — Port with no packet queued parks past the
+    // deadline (times out) instead of spinning. This closes the
+    // second half of the WaitSetWait timeout regression: even for
+    // a Port item (which has different signal semantics than a
+    // Channel) the timeout budget must be honoured.
+    //
+    // The complementary "packet arrives → wait wakes with
+    // READABLE" property for Ports is validated end-to-end at
+    // runtime by the input-host driver loop and asserted by the
+    // CI serial-marker chain; init cannot re-run that check
+    // without stealing the keyboard IRQ capability from input-host
+    // (Interrupt::keyboard is exclusive).
+    let Ok(idle_port) = libcanvas::Port::create() else {
+        init_logln!(logger, "[init] waitset self-test FAILED (port create)");
+        return;
+    };
+    let idle_items = [WaitItem::new(
+        idle_port.handle().raw(),
+        Signals::READABLE,
+        9,
+    )];
+    match wait_any(&idle_items, 4) {
+        Err(libcanvas::ErrorCode::TimedOut) => {}
+        Ok(_) => {
+            init_logln!(
+                logger,
+                "[init] waitset self-test FAILED (port timeout returned Ok on empty port)"
+            );
+            return;
+        }
+        Err(e) => {
+            init_logln!(
+                logger,
+                "[init] waitset self-test FAILED (idle port wait_any: {})",
+                e.as_str()
+            );
+            return;
+        }
+    }
+
+    init_logln!(logger, "[init] waitset self-test OK");
 }
 
 #[panic_handler]

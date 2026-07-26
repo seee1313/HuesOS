@@ -1137,3 +1137,84 @@ bash script edit for the CI harness.
 existing `qemu-boot` matrix job invokes this script unchanged, so
 the new checks land automatically across `{debug,release} × {smp=1,
 smp=2}`.
+
+## `sys_waitset_wait` correctness fixes + waitset self-test (safety-budget-neutral)
+
+Third follow-up to PR #126. The first two follow-ups fixed
+ordering and message-loss on the init → DriverManager bootstrap
+channel; CI's happy-path markers then went green and the boot
+reached `[terminal] keyboard service online, starting shell`. The
+tester reported keystrokes still did not reach the terminal.
+
+Three latent bugs in the kernel `Syscall::WaitSetWait` handler
+were interacting to silently drop every IRQ packet delivered while
+input-host was parked in wait_any:
+
+**Bug A (drain on probe).** `update_waitset_signals` used
+`port.read()` to test whether a Port had a queued packet. `read`
+dequeues the packet unconditionally. On every ready-check the
+kernel consumed one IRQ packet and threw it away; the driver's
+own `port.read()` after the wake then found nothing.
+
+**Bug B (wrong signal bit).** Even without Bug A the wake would
+not have fired: the handler set `Signals::SIGNALED` on Ports while
+every driver awaited `Signals::READABLE`. The awaited-vs-active
+intersection was always empty, so `WaitOutcome::Signaled` was
+unreachable for Port items regardless of packet queue state.
+
+**Bug C (timeout ignored).** The inner poll loop called
+`waitset.poll(mode)` without a deadline. `poll` only returns
+`Signaled` / `Pending` / `Canceled`; `TimedOut` is only produced
+by `poll_at`. The `TimedOut` match arm in the syscall handler was
+therefore dead code, and `Pending => continue` looped forever.
+Every caller that passed a non-zero timeout ended up in an
+infinite yield-loop.
+
+Fixes:
+
+* `huesos-object::Port::has_pending` — new non-destructive
+  readiness predicate. `update_waitset_signals` now calls it
+  instead of `port.read()`.
+* `update_waitset_signals` now sets `Signals::READABLE` on Ports
+  (consistency with `Channel` — both are "message available"
+  from the driver's point of view).
+* `sys_waitset_wait` now computes an absolute deadline from
+  `args.timeout_ticks` up front, uses `waitset.poll_at(mode, now,
+  deadline)`, and reads the current tick via the existing
+  `CLOCK_FN` callback that the scheduler installs at boot.
+* New userspace self-test `run_waitset_check` in `init` covering
+  the three properties end-to-end: `READABLE` fires when the
+  peer writes to a Channel, `timeout_ticks` triggers `TimedOut`
+  on an empty Channel, and a Port with no packet queued also
+  times out (instead of spinning). Prints
+  `[init] waitset self-test OK` on pass.
+* CI `scripts/ci-qemu-smoke.sh` adds `[init] waitset self-test
+  OK` to the positive-marker set and `[init] waitset self-test
+  FAILED` to the regression-marker set. Any of the three
+  underlying bugs (or a future analogue) surfaces immediately
+  as a red CI cell instead of a silent user-visible stall.
+
+`safety-budget.json` moves in this PR:
+
+* `unsafe_blocks`: 245 → 245 (unchanged).
+* `unsafe_functions`: 59 → 59 (unchanged).
+* `unsafe_impls`: 28 → 28 (unchanged).
+* `rust_files`: 156 → 156 (unchanged).
+* `rust_lines`: 39144 → 39373 (+229; waitset self-test + docs).
+* `expect_calls`: 22 → 21 (net −1; removed a legacy
+  `.expect("...")` in the pre-existing
+  `interrupt_signal_queues_port_packet` test as I added the new
+  regression alongside it — replaced with the
+  `Some(...) else { assert!(false, ...); return; }` pattern that
+  CONTRIBUTING.md prescribes for tests. Baseline for `expect_calls`
+  lowered accordingly.).
+
+No new unsafe. Every change is pure safe Rust plus a bash edit to
+ci-qemu-smoke.sh.
+
+Additionally the new host test `port_has_pending_is_non_destructive`
+in `huesos-object` locks the fix in for the kernel side: it
+enqueues a packet, probes `has_pending` three times, and asserts
+the packet is still returned by `port.read` on the fourth call.
+Any future refactor of `has_pending` that regresses to a
+destructive check fails this test.

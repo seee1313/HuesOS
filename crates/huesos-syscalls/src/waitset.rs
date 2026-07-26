@@ -46,14 +46,22 @@ pub(crate) fn sys_waitset_wait(args_ptr: *const WaitSetWaitArgs) -> SyscallResul
         }
     }
 
+    // Compute an absolute deadline once, up front, in scheduler-tick
+    // units. `timeout_ticks == 0` means "wait forever" (deadline =
+    // None), matching every other blocking wait primitive.
+    let deadline: Option<u64> = if args.timeout_ticks == 0 {
+        None
+    } else {
+        let now = current_tick();
+        Some(now.saturating_add(args.timeout_ticks))
+    };
+
     update_waitset_signals(&mut waitset, &items, &proc)?;
 
-    let outcome = waitset.poll(mode);
-    match outcome {
+    match waitset.poll_at(mode, current_tick(), deadline) {
         WaitOutcome::Signaled | WaitOutcome::Canceled => {
             return write_results(&waitset, &items, &args);
         }
-        WaitOutcome::TimedOut if args.timeout_ticks == 0 => {}
         WaitOutcome::TimedOut => {
             user_memory::write_value(args.out_count, &0u32)?;
             return Err(ErrorCode::TimedOut);
@@ -69,8 +77,7 @@ pub(crate) fn sys_waitset_wait(args_ptr: *const WaitSetWaitArgs) -> SyscallResul
 
         update_waitset_signals(&mut waitset, &items, &proc)?;
 
-        let outcome = waitset.poll(mode);
-        match outcome {
+        match waitset.poll_at(mode, current_tick(), deadline) {
             WaitOutcome::Signaled | WaitOutcome::Canceled => {
                 return write_results(&waitset, &items, &args);
             }
@@ -80,6 +87,19 @@ pub(crate) fn sys_waitset_wait(args_ptr: *const WaitSetWaitArgs) -> SyscallResul
             }
             WaitOutcome::Pending => continue,
         }
+    }
+}
+
+/// Snapshot the scheduler's monotonic tick counter for deadline
+/// arithmetic. Falls back to `0` before the kernel has installed a
+/// clock callback (very early boot); in that window `timeout_ticks`
+/// is effectively meaningless because no time has elapsed either
+/// way. Every real syscall path runs after
+/// `huesos_syscalls::set_clock_fn`.
+fn current_tick() -> u64 {
+    match *crate::callbacks::CLOCK_FN.lock() {
+        Some(f) => f(),
+        None => 0,
     }
 }
 
@@ -103,8 +123,21 @@ fn update_waitset_signals(
         }
 
         if let Some(port) = obj.downcast_ref::<huesos_object::Port>() {
-            if port.read().is_some() {
-                active = active.union(Signals::SIGNALED);
+            // Non-destructive readiness check. The historical
+            // `port.read().is_some()` idiom silently dequeued the
+            // packet during the ready probe — every IRQ delivered
+            // while a driver was parked in wait_any was consumed
+            // by the kernel and never surfaced to the driver, which
+            // is why keystrokes were vanishing after PR #126.
+            //
+            // Report the readiness under `READABLE` so callers can
+            // await on the same signal name they use for Channels;
+            // the previous `SIGNALED` bit never intersected with
+            // driver `awaited = READABLE` masks and so `wait_any`
+            // never fired for ports at all — a second, latent bug
+            // that the drain-on-probe bug happened to mask.
+            if port.has_pending() {
+                active = active.union(Signals::READABLE);
             }
         }
 

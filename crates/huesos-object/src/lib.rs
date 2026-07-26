@@ -215,7 +215,11 @@ mod tests {
         interrupt.bind_port(port_koid, 0xabc);
         interrupt.signal(1, 0x1e);
 
-        let packet = port.read().expect("interrupt should queue one packet");
+        let Some(packet) = port.read() else {
+            assert!(false, "interrupt should queue one packet");
+            unregister_object(port_koid);
+            return;
+        };
         assert_eq!(packet.key, 0xabc);
         assert_eq!(packet.packet_type, 1);
         assert_eq!(packet.data[0], 1);
@@ -423,6 +427,48 @@ mod tests {
         }
         assert_eq!(port.queue(packet), Err(PortQueueError::QuotaExceeded));
         assert_eq!(port.dropped_packets(), 1);
+    }
+
+    #[test]
+    fn port_has_pending_is_non_destructive() {
+        // Regression: the WaitSetWait signal probe in
+        // huesos-syscalls used to call port.read() during ready
+        // checks, which dequeued the packet and threw it away.
+        // The result was that every IRQ delivered while a driver
+        // was parked in wait_any got consumed by the kernel and
+        // never surfaced to the driver — keystrokes vanished
+        // between the input host and its consumers. `has_pending`
+        // is the non-destructive replacement used by the fix.
+        let port = match Port::new() {
+            Ok(port) => port,
+            Err(_) => return,
+        };
+        assert!(!port.has_pending(), "fresh port has no packets");
+
+        let packet = PortPacket {
+            key: 0xdead,
+            packet_type: 1,
+            status: 0,
+            data: [0xaa, 0xbb, 0xcc, 0xdd],
+        };
+        assert!(port.queue(packet).is_ok());
+
+        // Probing readiness must NEVER consume the packet, no matter
+        // how many times it's called (the syscall handler polls in
+        // a loop while waiting).
+        assert!(port.has_pending());
+        assert!(port.has_pending());
+        assert!(port.has_pending());
+
+        // After all those probes the actual read still returns the
+        // original packet — proof no probe silently drained it.
+        let Some(read_back) = port.read() else {
+            assert!(false, "read must still see the packet");
+            return;
+        };
+        assert_eq!(read_back.key, 0xdead);
+        assert_eq!(read_back.data[0], 0xaa);
+        assert!(!port.has_pending(), "after real read, port is empty");
     }
 
     #[test]
