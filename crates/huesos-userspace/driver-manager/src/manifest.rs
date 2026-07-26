@@ -68,6 +68,9 @@ pub enum ResourceGrantKind {
     Mmio = 2,
     /// Physical interrupt vector / IRQ line.
     Irq = 3,
+    /// Atomic-halt / power-off capability. See
+    /// `docs/ARCHITECTURE_ROADMAP.md` §3.
+    PowerControl = 4,
 }
 
 // Note: numeric conversion to `huesos_abi::ResourceKindAbi` is intentionally
@@ -242,6 +245,7 @@ fn parse_resource_grant(val: &[u8]) -> Option<ResourceGrantManifest> {
         b"ioport" => ResourceGrantKind::IoPort,
         b"mmio" => ResourceGrantKind::Mmio,
         b"irq" => ResourceGrantKind::Irq,
+        b"pwr" | b"powercontrol" => ResourceGrantKind::PowerControl,
         _ => return None,
     };
 

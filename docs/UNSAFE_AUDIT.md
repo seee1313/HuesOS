@@ -854,3 +854,106 @@ No new CI job in this PR. Existing host tests cover:
 Runtime QEMU exercise of the wire path arrives in the following
 PRs (shutdown-broker + `sys_hard_halt` + `arch-drop-ps2-module`),
 which are the first consumers of the handles this PR mints.
+
+## Userspace shutdown-broker + `sys_hard_halt` + IoPort ops (dedicated safety-budget review, +2 blocks)
+
+Introduces the Fuchsia-inspired inversion-of-control shutdown path
+described in `docs/ARCHITECTURE_ROADMAP.md` §3 and closes the PR-C
+manifest-driven-grants limitation by adding the DriverManager forward
+layer + input-host verification path (§4).
+
+**Kernel surface (huesos-abi + huesos-syscalls + huesos-object):**
+
+* `Syscall::HardHalt = 36` — atomic capability-gated halt; caller
+  must present a live `PowerControl` `Resource` handle. Diverges.
+* `Syscall::IoPortWrite8 = 37`, `Syscall::IoPortRead8 = 38` — port
+  I/O gated on an `IoPort` resource whose granted range contains the
+  requested port.
+* `ResourceKind::PowerControl` (`ResourceKindAbi::PowerControl = 4`)
+  — new binary capability; `base`/`len` fixed to `0/1` at mint.
+* `huesos_kernel::shutdown::hard_halt()`: same stop-CPUs-and-hlt
+  sequence as the legacy `request()` path but **without**
+  `huesos_arch::keyboard::prepare_shutdown()` (device quiesce is
+  now the capability holder's responsibility, done userspace-side).
+* `huesos_kernel::shutdown::note_critical_exit(name, code)`: called
+  from the scheduler exit hook when a `Process::is_critical()`
+  process exits (any code), diverges into `hard_halt`.
+* `Process::critical` gains observable-in-scheduler semantics via
+  `record_process_exit` calling `note_critical_exit`.
+
+**Userspace surface:**
+
+* New crate `crates/huesos-userspace/shutdown-broker` (~230 LoC).
+  Receives its `IoPort(0x64)` and `PowerControl` resource handles
+  through labelled bootstrap-channel transfers, waits for init's
+  `shutdown-broker:go` barrier, then on `shutdown` command performs
+  8042 quiesce (`out 0x64, 0xAD; out 0x64, 0xA7`) via the IoPort
+  resource and invokes `sys_hard_halt`. Marked `critical=true` in its
+  manifest so the kernel critical-exit fallback fires if it dies
+  before delivering the halt.
+* `libcanvas::resource::IoPort` — safe wrapper over the new
+  IoPortRead8/Write8 syscalls.
+* `libcanvas::resource::hard_halt(&Handle)` — safe wrapper over
+  HardHalt.
+* Init: `launch_shutdown_broker` mints the two Resources, transfers
+  them, marks the broker critical, releases the go barrier, waits
+  for `shutdown-broker:ready`. The terminal `system:shutdown` path
+  now forwards `shutdown` to the broker instead of invoking the
+  legacy `SystemShutdown` syscall (which remains as a fallback for
+  the case where the broker failed to start).
+* DriverManager forward layer: manifest-driven resource handles from
+  init are buffered per-driver, forwarded through the target
+  driver's bootstrap at spawn time with the original wire labels;
+  `mark_critical` sidecar is honoured. This closes the PR-C
+  limitation where handles were minted but never delivered to the
+  driver process.
+* Input-host: drains `resource:*` handle transfers on startup, logs
+  the count, holds the handles alive via `core::mem::forget` so
+  future PRs can migrate to consuming them without re-plumbing the
+  transfer path.
+
+`safety-budget.json` moves in this PR:
+
+* `unsafe_blocks`: 245 → 247 (net +2).
+* `unsafe_functions`: 59 → 59 (unchanged).
+* `unsafe_impls`: 28 → 28 (unchanged).
+* `rust_files`: 154 → 155 (+1: `shutdown-broker/src/main.rs`).
+* `rust_lines`: 37405 → 38496 (+1091).
+
+Per-file breakdown of the new unsafe:
+
+* **`crates/huesos-syscalls/src/resource.rs`** (+2 blocks):
+  * `unsafe { Port::<u8>::new(port_u16).write(byte) }` inside
+    `sys_ioport_write8`.
+    **SAFETY:** the caller presented a live `IoPort` resource
+    handle whose `[base, base+len)` range was checked to contain
+    `port_u16` under the current handle-table lock; this is the
+    identical capability contract Zircon's `zx_ioports_request`
+    enforces. `Port::write` performs a single `out` instruction.
+  * `unsafe { Port::<u8>::new(port_u16).read() }` inside
+    `sys_ioport_read8`. **SAFETY:** same contract as write.
+
+Every other new function is safe Rust: the shutdown-broker binary
+uses `libcanvas::resource::IoPort::{read_u8, write_u8}` (which route
+through the syscalls above); init's `launch_shutdown_broker` uses
+the existing safe `libcanvas::resource::{Resource::create,
+mark_process_critical}` and `Channel::write_handle` APIs;
+DriverManager's forward layer is pure safe Rust with no `unsafe`
+block anywhere in `supervisor.rs`.
+
+## CI wiring
+
+Existing host tests cover the ABI-level changes:
+
+* Extended `syscall_numbers_remain_append_only` regression asserts
+  slots 36 (`HardHalt`), 37 (`IoPortWrite8`), and 38 (`IoPortRead8`)
+  at the correct wire positions.
+* Extended `resource_kind_abi_round_trip` includes
+  `ResourceKindAbi::PowerControl`.
+
+Runtime QEMU exercise of the shutdown path is naturally covered by
+the existing `qemu-smoke` matrix: the terminal `shutdown` command
+now routes through the broker on the happy path. A dedicated
+qemu-shutdown-broker smoke job is scheduled for a follow-up so the
+critical-exit-fallback path is asserted too (that requires a way to
+kill the broker mid-run, which today's smoke image does not have).

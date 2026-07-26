@@ -45,6 +45,11 @@ pub enum ResourceKind {
     Mmio = 2,
     /// Physical interrupt vector / IRQ line.
     Irq = 3,
+    /// Authority to invoke the atomic-halt / reboot / (future)
+    /// mexec/suspend syscalls. A `PowerControl` resource has no
+    /// meaningful base/len (both should be zero at mint time); the
+    /// capability is binary. See `docs/ARCHITECTURE_ROADMAP.md` §3.
+    PowerControl = 4,
 }
 
 /// Reason a `Resource::try_create*` call was rejected.

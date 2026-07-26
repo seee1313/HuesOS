@@ -76,4 +76,68 @@ pub mod kind {
     pub const MMIO: ResourceKindAbi = ResourceKindAbi::Mmio;
     /// Physical interrupt vector / IRQ line.
     pub const IRQ: ResourceKindAbi = ResourceKindAbi::Irq;
+    /// Atomic-halt / reboot / power-off capability.
+    pub const POWER_CONTROL: ResourceKindAbi = ResourceKindAbi::PowerControl;
+}
+
+/// Safe wrapper over an `IoPort` [`Resource`] handle. Provides typed
+/// `read_u8`/`write_u8` methods that go through the kernel's
+/// capability-checked `IoPortRead8`/`IoPortWrite8` syscalls.
+pub struct IoPort {
+    handle: Handle,
+}
+
+impl IoPort {
+    /// Adopt an already-owned handle (e.g. one just received over a
+    /// bootstrap channel) as an `IoPort` capability. The caller is
+    /// responsible for having verified the handle really names an
+    /// IoPort resource (the kernel will reject reads/writes with the
+    /// wrong kind, so this is a safety-net, not a security check).
+    pub fn from_handle(handle: Handle) -> Self {
+        Self { handle }
+    }
+
+    /// The underlying raw handle, for passing to a syscall that needs
+    /// it without transferring ownership.
+    pub fn raw(&self) -> HandleValue {
+        self.handle.raw()
+    }
+
+    /// Write one byte to `port`. Fails with `AccessDenied` if the port
+    /// lies outside the resource's granted `[base, base+len)` range,
+    /// or with `WrongType` if the handle does not name an IoPort
+    /// resource.
+    pub fn write_u8(&self, port: u16, value: u8) -> Result<()> {
+        let ret = raw::syscall3(
+            Syscall::IoPortWrite8,
+            self.handle.raw() as u64,
+            port as u64,
+            value as u64,
+        );
+        raw::decode(ret)?;
+        Ok(())
+    }
+
+    /// Read one byte from `port`. Same capability contract as
+    /// [`Self::write_u8`].
+    pub fn read_u8(&self, port: u16) -> Result<u8> {
+        let ret = raw::syscall2(Syscall::IoPortRead8, self.handle.raw() as u64, port as u64);
+        let value = raw::decode(ret)?;
+        Ok(value as u8)
+    }
+}
+
+/// Invoke the kernel's capability-gated atomic halt. Never returns on
+/// success; on failure the kernel returns an `ErrorCode` and the
+/// caller decides what to do. `power_control` must be a live handle
+/// naming a [`ResourceKind::PowerControl`] resource; every other
+/// process gets `AccessDenied`.
+pub fn hard_halt(power_control: &Handle) -> ! {
+    let ret = raw::syscall1(Syscall::HardHalt, power_control.raw() as u64);
+    // If the kernel returned, halting failed. Fall through to an
+    // exit-1 loop so the surrounding driver-manager's critical-exit
+    // fallback still fires. This should never happen if the caller
+    // holds a live PowerControl handle.
+    let _ = raw::decode(ret);
+    crate::process::exit(-1);
 }

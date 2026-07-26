@@ -141,5 +141,8 @@ pub fn dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> Syscal
             resource::sys_resource_create(a1 as u32, a2, a3, a4 as u32, a5 as *mut HandleValue)
         }
         S::ProcessMarkCritical => resource::sys_process_mark_critical(a1 as HandleValue),
+        S::HardHalt => resource::sys_hard_halt(a1 as HandleValue),
+        S::IoPortWrite8 => resource::sys_ioport_write8(a1 as HandleValue, a2 as u32, a3 as u32),
+        S::IoPortRead8 => resource::sys_ioport_read8(a1 as HandleValue, a2 as u32),
     }
 }

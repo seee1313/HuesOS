@@ -1,16 +1,14 @@
-//! Syscall handlers for the immutable `Resource` capability primitive.
+//! Syscall handlers for the immutable `Resource` capability primitive
+//! and its capability-gated system-control operations.
 //!
-//! Currently exposes two operations, both restricted to the root
-//! userspace supervisor (init KOID) so a compromised driver-manager or
-//! driver process cannot forge capabilities. See
-//! `docs/ARCHITECTURE_ROADMAP.md` §2 and §3 for the model.
-//!
-//! * `sys_resource_create` mints a `Resource` and installs its handle in
-//!   the caller's handle table with `READ | WRITE | TRANSFER` rights.
-//!   The caller (init or driver-manager on its behalf) later transfers
-//!   the handle to the target driver via a channel.
-//! * `sys_process_mark_critical` marks a target process as critical
-//!   (see `Process::critical` docs).
+//! `sys_resource_create` and `sys_process_mark_critical` are gated on the
+//! root userspace supervisor (init KOID) so a compromised driver process
+//! cannot forge capabilities. `sys_hard_halt` and the `sys_ioport_*`
+//! operations gate on **capability possession** instead: the caller must
+//! present a live `Resource` handle whose kind (and, for I/O ports,
+//! whose range) authorises the requested operation. This matches the
+//! Zircon model where a resource handle *is* the capability. See
+//! `docs/ARCHITECTURE_ROADMAP.md` §2 and §3 for the design.
 
 use huesos_abi::{ErrorCode, HandleValue, ResourceKindAbi};
 use huesos_object::{
@@ -20,6 +18,18 @@ use huesos_object::{
 
 use crate::user_memory;
 use crate::SyscallResult;
+
+/// Kernel-installed atomic halt. Diverges: the syscall never returns
+/// to the caller. Registered once at boot from
+/// `huesos_kernel::init::syscall_init`.
+pub type HardHaltFn = fn() -> !;
+static HARD_HALT_FN: spin::Mutex<Option<HardHaltFn>> = spin::Mutex::new(None);
+
+/// Install the kernel-side atomic halt implementation. Called once
+/// from `huesos_kernel::init::syscall_init`.
+pub fn set_hard_halt_fn(f: HardHaltFn) {
+    *HARD_HALT_FN.lock() = Some(f);
+}
 
 /// Kernel-configurable predicate: is `caller_koid` the root userspace
 /// supervisor? Set once by the kernel during init via
@@ -57,12 +67,23 @@ pub(crate) fn sys_resource_create(
         ResourceKindAbi::IoPort => ResourceKind::IoPort,
         ResourceKindAbi::Mmio => ResourceKind::Mmio,
         ResourceKindAbi::Irq => ResourceKind::Irq,
+        ResourceKindAbi::PowerControl => ResourceKind::PowerControl,
+    };
+
+    // `PowerControl` is a binary capability with no meaningful range;
+    // force base/len to zero at mint time so overlap-checked collisions
+    // deterministically fire only on genuine double-mint attempts.
+    // Every other kind keeps the caller-supplied range.
+    let (mint_base, mint_len) = if matches!(kernel_kind, ResourceKind::PowerControl) {
+        (0, 1)
+    } else {
+        (base, len)
     };
 
     let resource = if exclusive != 0 {
-        Resource::try_create_exclusive(kernel_kind, base, len)
+        Resource::try_create_exclusive(kernel_kind, mint_base, mint_len)
     } else {
-        Resource::try_create_shared(kernel_kind, base, len)
+        Resource::try_create_shared(kernel_kind, mint_base, mint_len)
     }
     .map_err(|e| match e {
         ResourceError::InvalidRange => ErrorCode::InvalidArgs,
@@ -105,4 +126,76 @@ pub(crate) fn sys_process_mark_critical(process_handle: HandleValue) -> SyscallR
         .ok_or(ErrorCode::WrongType)?;
     process.mark_critical();
     Ok(0)
+}
+
+/// Look up a caller-owned handle and confirm it names a live
+/// [`Resource`] of the requested kind. Returns the owning `Arc<dyn
+/// KernelObject>` so the caller can downcast to `Resource` at the
+/// point of use (the borrow-checker keeps the resource alive for
+/// exactly the duration of the caller's use).
+fn require_resource_of_kind(
+    handle: HandleValue,
+    kind: ResourceKind,
+) -> Result<alloc::sync::Arc<dyn KernelObject>, ErrorCode> {
+    let caller = current_process().ok_or(ErrorCode::AccessDenied)?;
+    let entry = caller.handles.get(handle).ok_or(ErrorCode::BadHandle)?;
+    let object = huesos_object::lookup_object(entry.koid).ok_or(ErrorCode::BadHandle)?;
+    let resource = object
+        .downcast_ref::<Resource>()
+        .ok_or(ErrorCode::WrongType)?;
+    if resource.kind() != kind {
+        return Err(ErrorCode::WrongType);
+    }
+    Ok(object)
+}
+
+pub(crate) fn sys_hard_halt(resource_handle: HandleValue) -> SyscallResult {
+    // Capability check: caller must present a live PowerControl resource
+    // handle. Fuchsia-inspired inversion of control: the kernel does
+    // not decide *when* to halt, only that halting is safe *now*.
+    let guard = require_resource_of_kind(resource_handle, ResourceKind::PowerControl)?;
+    let halt = (*HARD_HALT_FN.lock()).ok_or(ErrorCode::NotSupported)?;
+    // Drop the Arc explicitly before the diverging call so the object
+    // account is released even though the halt is followed by an hlt
+    // loop that would otherwise reap the whole registry.
+    drop(guard);
+    halt();
+}
+
+pub(crate) fn sys_ioport_write8(
+    resource_handle: HandleValue,
+    port: u32,
+    value: u32,
+) -> SyscallResult {
+    let guard = require_resource_of_kind(resource_handle, ResourceKind::IoPort)?;
+    let resource = guard
+        .downcast_ref::<Resource>()
+        .ok_or(ErrorCode::WrongType)?;
+    // Port must fit in u16 (x86 architectural limit) and lie entirely
+    // inside the resource's granted range.
+    let port_u16 = u16::try_from(port).map_err(|_| ErrorCode::InvalidArgs)?;
+    if !resource.contains(ResourceKind::IoPort, u64::from(port_u16), 1) {
+        return Err(ErrorCode::AccessDenied);
+    }
+    let byte = (value & 0xff) as u8;
+    // SAFETY: the port is inside a range the caller was granted; the
+    // ranged capability check above has been performed under the
+    // current handle-table lock. `Port::write` performs a single `out`
+    // instruction to a validated port.
+    unsafe { x86_64::instructions::port::Port::<u8>::new(port_u16).write(byte) };
+    Ok(0)
+}
+
+pub(crate) fn sys_ioport_read8(resource_handle: HandleValue, port: u32) -> SyscallResult {
+    let guard = require_resource_of_kind(resource_handle, ResourceKind::IoPort)?;
+    let resource = guard
+        .downcast_ref::<Resource>()
+        .ok_or(ErrorCode::WrongType)?;
+    let port_u16 = u16::try_from(port).map_err(|_| ErrorCode::InvalidArgs)?;
+    if !resource.contains(ResourceKind::IoPort, u64::from(port_u16), 1) {
+        return Err(ErrorCode::AccessDenied);
+    }
+    // SAFETY: same capability contract as sys_ioport_write8 above.
+    let byte: u8 = unsafe { x86_64::instructions::port::Port::<u8>::new(port_u16).read() };
+    Ok(i64::from(byte))
 }

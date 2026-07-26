@@ -144,6 +144,7 @@ fn parse_resource_grant(val: &[u8]) -> Option<ResourceGrant> {
         b"ioport" => ResourceKindAbi::IoPort,
         b"mmio" => ResourceKindAbi::Mmio,
         b"irq" => ResourceKindAbi::Irq,
+        b"pwr" | b"powercontrol" => ResourceKindAbi::PowerControl,
         _ => return None,
     };
     let base = parse_u64_lit(base)?;
