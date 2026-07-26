@@ -1218,3 +1218,81 @@ enqueues a packet, probes `has_pending` three times, and asserts
 the packet is still returned by `port.read` on the fourth call.
 Any future refactor of `has_pending` that regresses to a
 destructive check fails this test.
+
+## `shutdown-broker` bootstrap race — blocking wait_any replaces bounded yield-loop (safety-budget-neutral)
+
+Follow-up on the same PR-H branch. After the three `sys_waitset_wait`
+correctness fixes above landed on this branch, a subsequent CI run
+still failed with
+
+```
+[shutdown-broker] missing required capability handles; exiting
+[init] shutdown-broker: IoPort transfer failed: channel peer closed
+missing boot marker: [shutdown-broker] ready
+```
+
+which was a fourth, independent latent bug — surfaced now precisely
+*because* the waitset self-test above added a live syscall probe
+between `spawn_elf("shutdown-broker")` and the first `write_handle`,
+lengthening the window init spends between the two operations by a
+handful of scheduler ticks.
+
+The pre-existing `shutdown-broker::receive_capabilities` used a
+bounded 100 000-iteration `read_handle + yield_now` loop to fetch the
+two capability handles init transfers on the bootstrap channel. On
+SMP that loop could burn all 100 000 non-blocking reads on the
+broker's CPU before init's CPU had a chance to enqueue the first
+handle. The broker then exited voluntarily under "missing caps";
+subsequent init `write_handle` calls saw `PeerClosed`. Identical
+race in `wait_for_go`.
+
+### Fix
+
+`receive_capabilities` and `wait_for_go` now use the same
+blocking-wait discipline the input DriverHost adopted in `fce52e6`:
+
+```
+loop {
+    wait_any(&[bootstrap: READABLE | PEER_CLOSED], /*timeout=*/ 0)?; // wait forever
+    // drain every currently-readable message
+    // return when both caps received / PEER_CLOSED observed
+}
+```
+
+This is only safe now that the `sys_waitset_wait` timeout / Port
+regressions above are fixed on the same branch: previously, a wait
+with `timeout_ticks == 0` could not observe `PEER_CLOSED` on a
+channel via a Port at all. Reordering was considered (broker fix in
+a separate PR merged first) but the two changes are semantically
+coupled: correct broker synchronization depends on correct waitset
+semantics, and the waitset fix without the broker fix leaves this
+race live even though `[terminal] keyboard service online` prints.
+Adding both under `PR-H` keeps the guarantee "no red CI marker at
+merge time" the single reviewable unit.
+
+### Test coverage extension
+
+New Property 4 in `init::run_waitset_check`: create a channel pair,
+drop the tx endpoint, and assert that a `wait_any(rx, READABLE |
+PEER_CLOSED)` returns with `PEER_CLOSED` in `active_signals`. This
+is exactly the invariant the broker's blocking bootstrap loop
+depends on for its peer-died fast-fail path: without it, closing
+one end of a channel with no queued messages leaves the other end
+permanently parked. Any regression of the kernel-side
+`Signals::PEER_CLOSED` wakeup for channels now turns CI red at the
+`[init] waitset self-test FAILED` line instead of silently at the
+broker three services downstream.
+
+### `safety-budget.json` delta
+
+* `unsafe_blocks`: 245 → 245 (unchanged).
+* `unsafe_functions`: 59 → 59 (unchanged).
+* `unsafe_impls`: 28 → 28 (unchanged).
+* `rust_files`: 156 → 156 (unchanged).
+* `rust_lines`: 39373 → 39478 (+105; broker rewrite + Property 4 + docs).
+* `expect_calls`: 21 → 21 (unchanged).
+
+No new `unsafe`. Both `receive_capabilities` and `wait_for_go`
+remain zero-alloc, no-panic, and now scale correctly to arbitrary
+init scheduling delay because the wait is bounded by the peer's
+actual behavior instead of a fixed 100 000-yield fuel budget.

@@ -1146,6 +1146,50 @@ fn run_waitset_check(logger: &mut InitLogger) {
         }
     }
 
+    // Property 4 — PEER_CLOSED wakes wait_any. This is the invariant
+    // the shutdown-broker bootstrap loop depends on for its "peer
+    // died before completing the handshake" fast-fail path: without
+    // it, closing one end of a channel with no queued messages would
+    // leave the other end permanently parked in wait_any(READABLE |
+    // PEER_CLOSED). Regression coverage for the broker rewrite from
+    // bounded-yield-loop to blocking wait_any in PR-H.
+    let Ok((peer_tx, peer_rx)) = libcanvas::Channel::pair() else {
+        init_logln!(
+            logger,
+            "[init] waitset self-test FAILED (peer channel pair)"
+        );
+        return;
+    };
+    drop(peer_tx);
+    let peer_items = [WaitItem::new(
+        peer_rx.handle().raw(),
+        Signals::READABLE | Signals::PEER_CLOSED,
+        10,
+    )];
+    match wait_any(&peer_items, 0) {
+        Ok(outcome) => {
+            let found = outcome
+                .satisfied()
+                .iter()
+                .any(|r| r.key == 10 && (r.active_signals & Signals::PEER_CLOSED.bits()) != 0);
+            if !found {
+                init_logln!(
+                    logger,
+                    "[init] waitset self-test FAILED (PEER_CLOSED not reported on dropped tx)"
+                );
+                return;
+            }
+        }
+        Err(e) => {
+            init_logln!(
+                logger,
+                "[init] waitset self-test FAILED (peer wait_any: {})",
+                e.as_str()
+            );
+            return;
+        }
+    }
+
     init_logln!(logger, "[init] waitset self-test OK");
 }
 
