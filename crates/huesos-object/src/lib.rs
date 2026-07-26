@@ -19,6 +19,7 @@ mod object;
 mod port;
 mod process;
 mod registry;
+mod resource;
 mod supervision;
 mod thread;
 mod vmar;
@@ -44,6 +45,7 @@ pub use registry::{
     note_kernel_ref_open, object_ref_counts, register_interrupt, register_object, register_process,
     root_job, set_cpu_id_callback, set_current_process, set_phys_to_virt, unregister_object,
 };
+pub use resource::{Resource, ResourceError, ResourceKind};
 pub use supervision::{CrashThrottle, SupervisionAction, SupervisionDecision};
 pub use thread::Thread;
 pub use vmar::{Vmar, VmarChild, VmarError, VmarMapping};
