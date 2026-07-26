@@ -153,13 +153,28 @@ pub enum Syscall {
     /// successful call; caller must be the root userspace supervisor.
     /// `a1` is a process handle owned by the caller.
     ProcessMarkCritical = 35,
+    /// Atomic system halt. Never returns. Caller must hold a
+    /// `PowerControl` [`Resource`] handle passed in `a1`. Inspired by
+    /// Fuchsia's inversion-of-control shutdown model
+    /// (`src/power/shutdown-shim/main.cc`); see
+    /// `docs/ARCHITECTURE_ROADMAP.md` §3.
+    HardHalt = 36,
+    /// Write one byte to an x86 I/O port. `a1` is an `IoPort`
+    /// [`Resource`] handle owned by the caller, `a2` is the port
+    /// number (must fall inside the resource's `[base, base+len)`
+    /// range), `a3` is the byte value.
+    IoPortWrite8 = 37,
+    /// Read one byte from an x86 I/O port. Same handle/port contract
+    /// as [`Self::IoPortWrite8`]; the read byte is returned in the
+    /// low 8 bits of the syscall's `Ok(i64)` value.
+    IoPortRead8 = 38,
 }
 
 impl Syscall {
     /// Total number of defined syscalls (i.e. one past the highest
     /// currently-assigned number). The dispatcher uses this to reject
     /// obviously-out-of-range numbers before a `match`.
-    pub const COUNT: u64 = 36;
+    pub const COUNT: u64 = 39;
 
     /// Convert a raw syscall number back into a [`Syscall`], if valid.
     pub const fn from_raw(n: u64) -> Option<Self> {
@@ -200,6 +215,9 @@ impl Syscall {
             33 => Self::WaitSetWait,
             34 => Self::ResourceCreate,
             35 => Self::ProcessMarkCritical,
+            36 => Self::HardHalt,
+            37 => Self::IoPortWrite8,
+            38 => Self::IoPortRead8,
             _ => return None,
         })
     }
@@ -218,6 +236,13 @@ pub enum ResourceKindAbi {
     Mmio = 2,
     /// Physical interrupt vector / IRQ line.
     Irq = 3,
+    /// Authority to invoke the atomic-halt / reboot / (future)
+    /// mexec/suspend syscalls. Holding this handle is the
+    /// capability check for [`Syscall::HardHalt`]; a `PowerControl`
+    /// resource has no meaningful `base`/`len`, so both are fixed to
+    /// zero at mint time. See
+    /// `docs/ARCHITECTURE_ROADMAP.md` §3.
+    PowerControl = 4,
 }
 
 impl ResourceKindAbi {
@@ -227,6 +252,7 @@ impl ResourceKindAbi {
             1 => Self::IoPort,
             2 => Self::Mmio,
             3 => Self::Irq,
+            4 => Self::PowerControl,
             _ => return None,
         })
     }
@@ -740,7 +766,10 @@ mod tests {
         assert_eq!(Syscall::WaitSetWait as u64, 33);
         assert_eq!(Syscall::ResourceCreate as u64, 34);
         assert_eq!(Syscall::ProcessMarkCritical as u64, 35);
-        assert_eq!(Syscall::COUNT, 36);
+        assert_eq!(Syscall::HardHalt as u64, 36);
+        assert_eq!(Syscall::IoPortWrite8 as u64, 37);
+        assert_eq!(Syscall::IoPortRead8 as u64, 38);
+        assert_eq!(Syscall::COUNT, 39);
         assert_eq!(Syscall::from_raw(28), Some(Syscall::VmoCreateEx));
         assert_eq!(Syscall::from_raw(30), Some(Syscall::VmarProtect));
         assert_eq!(Syscall::from_raw(31), Some(Syscall::ChannelPeek));
@@ -748,7 +777,10 @@ mod tests {
         assert_eq!(Syscall::from_raw(33), Some(Syscall::WaitSetWait));
         assert_eq!(Syscall::from_raw(34), Some(Syscall::ResourceCreate));
         assert_eq!(Syscall::from_raw(35), Some(Syscall::ProcessMarkCritical));
-        assert_eq!(Syscall::from_raw(36), None);
+        assert_eq!(Syscall::from_raw(36), Some(Syscall::HardHalt));
+        assert_eq!(Syscall::from_raw(37), Some(Syscall::IoPortWrite8));
+        assert_eq!(Syscall::from_raw(38), Some(Syscall::IoPortRead8));
+        assert_eq!(Syscall::from_raw(39), None);
     }
 
     #[test]
@@ -757,12 +789,13 @@ mod tests {
             ResourceKindAbi::IoPort,
             ResourceKindAbi::Mmio,
             ResourceKindAbi::Irq,
+            ResourceKindAbi::PowerControl,
         ] {
             let raw = kind as u32;
             assert_eq!(ResourceKindAbi::from_raw(raw), Some(kind));
         }
         assert_eq!(ResourceKindAbi::from_raw(0), None);
-        assert_eq!(ResourceKindAbi::from_raw(4), None);
+        assert_eq!(ResourceKindAbi::from_raw(5), None);
         assert_eq!(ResourceKindAbi::from_raw(u32::MAX), None);
     }
 

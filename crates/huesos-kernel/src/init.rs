@@ -123,6 +123,11 @@ pub fn syscall_init() {
     huesos_syscalls::resource::set_root_supervisor_predicate(|koid| {
         koid == crate::init_process_koid()
     });
+    // Kernel-side halt implementation for the capability-gated
+    // `Syscall::HardHalt`. Fuchsia-style inversion of control: the
+    // syscall only checks the caller's PowerControl capability; the
+    // actual arch-specific stop-CPUs-and-hlt sequence lives here.
+    huesos_syscalls::resource::set_hard_halt_fn(crate::shutdown::hard_halt);
     huesos_syscalls::set_vmar_map_fn(crate::process::map_vmo_into_vmar);
     huesos_syscalls::set_vmar_unmap_fn(crate::process::unmap_vmar_mapping);
     huesos_syscalls::set_vmar_protect_fn(crate::process::protect_vmar_mapping);

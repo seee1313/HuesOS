@@ -22,6 +22,16 @@ pub extern "C" fn _start() -> ! {
     let bootstrap = libcanvas::channel::bootstrap();
     let _ = bootstrap.write(b"driver-host:input:starting");
 
+    // PR-D verification (fixes PR-C limitation): consume every
+    // manifest-driven Resource handle DriverManager forwards through
+    // our bootstrap channel and log what we received. We do not yet
+    // *use* these handles (the legacy Interrupt::keyboard() path
+    // below remains the live source of scancodes for this MVP), but
+    // holding them alive proves the end-to-end
+    // manifest → init(mint) → driver-manager(forward) → driver(hold)
+    // capability path works. See docs/ARCHITECTURE_ROADMAP.md §4.
+    consume_manifest_resources(&bootstrap);
+
     match setup_keyboard_irq_bridge() {
         Ok(port) => {
             let _ = bootstrap.write(b"service:keyboard:ready");
@@ -33,6 +43,81 @@ pub extern "C" fn _start() -> ! {
             let _ = bootstrap.write(b"service:keyboard:failed");
             libcanvas::process::exit(-1);
         }
+    }
+}
+
+const RESOURCE_LABEL_PREFIX: &[u8] = b"resource:";
+
+/// Drain any `resource:*` handle-transfer messages waiting on the
+/// bootstrap channel, log each one, and hold on to the handles so
+/// they stay valid for the driver's lifetime. Bounded-poll so a
+/// misconfigured DriverManager cannot hang bring-up.
+fn consume_manifest_resources(bootstrap: &libcanvas::Channel) {
+    // Bounded static storage for received handles. `Handle` holds a
+    // raw HandleValue; keeping the Handles in an array without an
+    // allocator satisfies the CONTRIBUTING no-panic rule and matches
+    // libcanvas's zero-alloc style.
+    let mut received: [Option<libcanvas::Handle>; 8] = [const { None }; 8];
+    let mut received_count = 0usize;
+    let mut label = [0u8; 96];
+    let mut idle = 0u32;
+    loop {
+        match bootstrap.read_handle(&mut label) {
+            Ok((n, handle)) if label[..n].starts_with(RESOURCE_LABEL_PREFIX) => {
+                if received_count < received.len() {
+                    let text = core::str::from_utf8(&label[..n]).unwrap_or("?");
+                    println!(
+                        "[driver-host:input] received manifest resource #{}: {}",
+                        received_count + 1,
+                        text
+                    );
+                    received[received_count] = Some(handle);
+                    received_count += 1;
+                } else {
+                    println!("[driver-host:input] resource buffer full, dropping label");
+                    drop(handle);
+                }
+                idle = 0;
+            }
+            Ok((n, handle)) => {
+                let text = core::str::from_utf8(&label[..n]).unwrap_or("?");
+                println!(
+                    "[driver-host:input] non-resource handle transfer ignored: {}",
+                    text
+                );
+                drop(handle);
+            }
+            Err(ErrorCode::ShouldWait) | Err(ErrorCode::TimedOut) => {
+                idle = idle.wrapping_add(1);
+                // Empirically DriverManager delivers all buffered
+                // handles within a handful of yields once we start
+                // reading; a couple hundred idle rounds is plenty of
+                // headroom on smp=1 debug boots.
+                if idle >= 256 {
+                    break;
+                }
+                libcanvas::process::yield_now();
+            }
+            Err(e) => {
+                println!(
+                    "[driver-host:input] resource-drain read failed: {}",
+                    e.as_str()
+                );
+                break;
+            }
+        }
+    }
+    println!(
+        "[driver-host:input] retained {} manifest resource handle(s)",
+        received_count
+    );
+    // Keep every received handle alive for the driver-host lifetime.
+    // Future PRs will migrate the input driver off the legacy
+    // Interrupt::keyboard() and Port::create() paths onto these
+    // manifest-granted Resources; forget() prevents close-on-drop
+    // in the meantime.
+    for slot in received.into_iter().flatten() {
+        core::mem::forget(slot);
     }
 }
 

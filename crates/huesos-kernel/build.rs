@@ -44,6 +44,13 @@ fn main() {
         profile,
         &[],
     );
+    let shutdown_broker = build_userspace_program(
+        &userspace_root,
+        "shutdown-broker",
+        "huesos-shutdown-broker",
+        profile,
+        &[],
+    );
     let doom = build_userspace_program(&userspace_root, "doom", "huesos-doom", profile, &[]);
     let terminal =
         build_userspace_program(&userspace_root, "terminal", "huesos-terminal", profile, &[]);
@@ -58,6 +65,7 @@ fn main() {
         &manifest_dir,
         &input_driver_host,
         &acpi_manager,
+        &shutdown_broker,
         &terminal,
         &doom,
     );
@@ -71,6 +79,7 @@ fn main() {
             ("HUESOS_TERMINAL_PATH", terminal.as_os_str()),
             ("HUESOS_FAULT_PROBE_PATH", fault_probe.as_os_str()),
             ("HUESOS_ACPI_MANAGER_PATH", acpi_manager.as_os_str()),
+            ("HUESOS_SHUTDOWN_BROKER_PATH", shutdown_broker.as_os_str()),
         ],
     );
 
@@ -83,6 +92,7 @@ fn track_userspace_inputs(userspace_root: &Path) {
         "driver-manager",
         "driver-host-input",
         "acpi-manager",
+        "shutdown-broker",
         "terminal",
         "doom",
         "fault-probe",
@@ -155,6 +165,7 @@ fn build_bootfs_image(
     manifest_dir: &Path,
     input_driver_host: &Path,
     acpi_manager: &Path,
+    shutdown_broker: &Path,
     terminal: &Path,
     doom: &Path,
 ) -> PathBuf {
@@ -175,12 +186,26 @@ fn build_bootfs_image(
             data: b"name=input-host\nkind=driver-host\nprovides=keyboard\nirq=1\nioport=0x60:1\nioport=0x64:1\nresource=ioport:0x60:1:excl\nresource=ioport:0x64:1:excl\nresource=irq:1:1:excl\ncritical=false\nelf=/drivers/input-host.elf\nheartbeat=true\n".to_vec(),
         },
         BootFsFile {
+            path: "/manifests/shutdown-broker.hdriver",
+            // shutdown-broker owns the 8042 command port (0x64) and a
+            // PowerControl resource. `critical=true` so a broker crash
+            // before it delivers the atomic halt triggers the kernel's
+            // critical-exit fallback (docs/ARCHITECTURE_ROADMAP.md §3).
+            // IoPort 0x60 is intentionally not granted: only the
+            // command port is needed for quiesce.
+            data: b"name=shutdown-broker\nkind=service\nresource=ioport:0x64:1:excl\nresource=pwr:0x0:0x0:excl\ncritical=true\nelf=/services/shutdown-broker.elf\n".to_vec(),
+        },
+        BootFsFile {
             path: "/drivers/input-host.elf",
             data: fs::read(input_driver_host).expect("failed to read input DriverHost ELF"),
         },
         BootFsFile {
             path: "/services/acpi-manager.elf",
             data: read_build_input(acpi_manager, "ACPI manager ELF"),
+        },
+        BootFsFile {
+            path: "/services/shutdown-broker.elf",
+            data: read_build_input(shutdown_broker, "shutdown-broker ELF"),
         },
         BootFsFile {
             path: "/bin/terminal.elf",

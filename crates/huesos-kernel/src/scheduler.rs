@@ -821,11 +821,27 @@ fn record_process_exit(process: &Process, code: i64) {
     let Some(info) = process.exit_info() else {
         return;
     };
-    let mut yard = TASK_GRAVEYARD.lock();
-    let graveyard = yard.get_or_insert_with(TaskGraveyard::new);
-    // ProcessLifecycle owns the generation in ExitInfo. Reusing it here keeps
-    // the graveyard record and ProcessWait/reaper observations ABA-safe.
-    let _ = graveyard.record_exit_with_generation(info.koid, info.generation, code, global_ticks());
+    {
+        let mut yard = TASK_GRAVEYARD.lock();
+        let graveyard = yard.get_or_insert_with(TaskGraveyard::new);
+        // ProcessLifecycle owns the generation in ExitInfo. Reusing it here keeps
+        // the graveyard record and ProcessWait/reaper observations ABA-safe.
+        let _ =
+            graveyard.record_exit_with_generation(info.koid, info.generation, code, global_ticks());
+    }
+    // Critical-process fallback (Fuchsia-inspired "critical to root
+    // job"). A process marked critical is one whose continued liveness
+    // the system depends on; if it exits — for any reason — the kernel
+    // atomically halts before the surrounding services can observe an
+    // inconsistent partial-shutdown state. Runs *after* graveyard
+    // record so a ProcessWait on the doomed process still sees the
+    // real exit code before the machine stops. See
+    // `docs/ARCHITECTURE_ROADMAP.md` §3.
+    if process.is_critical() {
+        // Snapshot the name so the halt banner can name the offender.
+        let name = process.name();
+        crate::shutdown::note_critical_exit(&name, code);
+    }
 }
 
 fn reap_observed_process_exits() {

@@ -25,6 +25,7 @@ static DRIVER_MANAGER_ELF: &[u8] = include_bytes!(env!("HUESOS_DRIVER_MANAGER_PA
 static TERMINAL_ELF: &[u8] = include_bytes!(env!("HUESOS_TERMINAL_PATH"));
 static ACPI_MANAGER_ELF: &[u8] = include_bytes!(env!("HUESOS_ACPI_MANAGER_PATH"));
 static FAULT_PROBE_ELF: &[u8] = include_bytes!(env!("HUESOS_FAULT_PROBE_PATH"));
+static SHUTDOWN_BROKER_ELF: &[u8] = include_bytes!(env!("HUESOS_SHUTDOWN_BROKER_PATH"));
 
 const BOOTFS_HEADER_SIZE: u64 = 16;
 const BOOTFS_ENTRY_SIZE: u64 = 216;
@@ -79,6 +80,14 @@ pub extern "C" fn _start() -> ! {
         read_ready_message(&mut logger, "acpi-manager", channel);
     }
 
+    // Launch shutdown-broker: the userspace capability owner for
+    // atomic halt (Fuchsia-style inversion of control, see
+    // docs/ARCHITECTURE_ROADMAP.md §3). Init mints two Resources
+    // (IoPort 0x64 + PowerControl), transfers them to the broker, and
+    // marks the broker critical so a broker crash before it delivers
+    // the halt triggers the kernel-side critical-exit fallback.
+    let shutdown_broker = launch_shutdown_broker(&mut logger);
+
     let registry_pair = create_driver_manager_registry_channel(&mut logger, &driver_manager);
 
     init_logln!(
@@ -105,12 +114,28 @@ pub extern "C" fn _start() -> ! {
             match channel.read_optional_handle(&mut supervisor_message) {
                 Ok((n, None)) if &supervisor_message[..n] == b"system:shutdown" => {
                     init_logln!(logger, "[init] terminal requested orderly shutdown");
-                    if let Err(error) = libcanvas::system::shutdown() {
+                    if let Some((_, broker_channel)) = &shutdown_broker {
+                        // Preferred path: forward to shutdown-broker.
+                        // The broker performs 8042 quiesce over its
+                        // IoPort resource and then invokes sys_hard_halt
+                        // via its PowerControl resource. It never
+                        // returns, so we do not read for an ack —
+                        // this write is the last thing init does on
+                        // this path.
+                        if let Err(error) = broker_channel.write(b"shutdown") {
+                            init_logln!(
+                                logger,
+                                "[init] shutdown-broker forward failed: {}; falling back",
+                                error.as_str()
+                            );
+                            fallback_legacy_shutdown(&mut logger);
+                        }
+                    } else {
                         init_logln!(
                             logger,
-                            "[init] shutdown request rejected: {}",
-                            error.as_str()
+                            "[init] shutdown-broker unavailable; using legacy SystemShutdown"
                         );
+                        fallback_legacy_shutdown(&mut logger);
                     }
                 }
                 Ok((n, Some(handle))) if &supervisor_message[..n] == b"system:launch-doom" => {
@@ -372,10 +397,13 @@ fn format_grant_label(
     grant: &libcanvas::manifest::ResourceGrant,
 ) -> usize {
     use libcanvas::resource::ResourceKind;
+    // "pwr" is used as the short wire label for PowerControl to keep
+    // shutdown-broker's manifest / label matcher compact.
     let kind = match grant.kind {
         ResourceKind::IoPort => "ioport",
         ResourceKind::Mmio => "mmio",
         ResourceKind::Irq => "irq",
+        ResourceKind::PowerControl => "pwr",
     };
     let mode = if grant.exclusive { "excl" } else { "shared" };
     let mut w = FixedWriter::new(out);
@@ -561,6 +589,169 @@ fn launch_service(logger: &mut InitLogger, name: &str, elf: &[u8]) -> Option<(Pr
             init_logln!(logger, "[init] failed to launch {}: {}", name, e.as_str());
             None
         }
+    }
+}
+
+/// Launch the userspace shutdown-broker, transfer it the two Resource
+/// handles it needs (IoPort 0x64 + PowerControl), mark it critical, and
+/// wait for its ready message. On any failure returns `None`; the main
+/// supervisor loop then falls back to the legacy `SystemShutdown`
+/// syscall path.
+fn launch_shutdown_broker(logger: &mut InitLogger) -> Option<(Process, Channel)> {
+    use libcanvas::manifest::ResourceGrant;
+    use libcanvas::resource::{kind, Resource};
+
+    // 1. Mint the two capabilities before spawn so any Resource-create
+    // failure is diagnosed before we commit the child process.
+    let ioport_grant = ResourceGrant {
+        kind: kind::IO_PORT,
+        base: 0x64,
+        len: 1,
+        exclusive: true,
+    };
+    let power_grant = ResourceGrant {
+        kind: kind::POWER_CONTROL,
+        base: 0,
+        len: 0,
+        exclusive: true,
+    };
+    let ioport = match Resource::create(
+        ioport_grant.kind,
+        ioport_grant.base,
+        ioport_grant.len,
+        ioport_grant.exclusive,
+    ) {
+        Ok(r) => r,
+        Err(e) => {
+            init_logln!(
+                logger,
+                "[init] shutdown-broker: IoPort resource mint failed: {}",
+                e.as_str()
+            );
+            return None;
+        }
+    };
+    let power = match Resource::create(
+        power_grant.kind,
+        power_grant.base,
+        power_grant.len,
+        power_grant.exclusive,
+    ) {
+        Ok(r) => r,
+        Err(e) => {
+            init_logln!(
+                logger,
+                "[init] shutdown-broker: PowerControl mint failed: {}",
+                e.as_str()
+            );
+            drop(ioport);
+            return None;
+        }
+    };
+
+    // 2. Spawn the broker.
+    let (process, bootstrap) =
+        match libcanvas::process::spawn_elf("shutdown-broker", SHUTDOWN_BROKER_ELF) {
+            Ok(pair) => pair,
+            Err(e) => {
+                init_logln!(
+                    logger,
+                    "[init] shutdown-broker: spawn failed: {}",
+                    e.as_str()
+                );
+                drop(ioport);
+                drop(power);
+                return None;
+            }
+        };
+    init_logln!(logger, "[init] shutdown-broker: spawned");
+
+    // 3. Transfer capabilities via labelled bootstrap messages. Labels
+    // are the same format PR-C uses for other manifest grants so the
+    // broker can reuse a single parser.
+    let mut label = [0u8; 96];
+    let ioport_label_len = format_grant_label(&mut label, "shutdown-broker", &ioport_grant);
+    let ioport_label = &label[..ioport_label_len.min(label.len())];
+    if let Err(e) = bootstrap.write_handle(ioport_label, ioport.into_handle()) {
+        init_logln!(
+            logger,
+            "[init] shutdown-broker: IoPort transfer failed: {}",
+            e.as_str()
+        );
+        drop(power);
+        return None;
+    }
+    let mut label2 = [0u8; 96];
+    let power_label_len = format_grant_label(&mut label2, "shutdown-broker", &power_grant);
+    let power_label = &label2[..power_label_len.min(label2.len())];
+    if let Err(e) = bootstrap.write_handle(power_label, power.into_handle()) {
+        init_logln!(
+            logger,
+            "[init] shutdown-broker: PowerControl transfer failed: {}",
+            e.as_str()
+        );
+        return None;
+    }
+
+    // 4. Mark critical *before* the go barrier, so a broker crash
+    // between now and the shutdown command trips the kernel's
+    // critical-exit halt fallback.
+    if let Err(e) = libcanvas::resource::mark_process_critical(process.handle().raw()) {
+        init_logln!(
+            logger,
+            "[init] shutdown-broker: mark_critical failed: {}",
+            e.as_str()
+        );
+        return None;
+    }
+    init_logln!(logger, "[init] shutdown-broker: marked critical");
+
+    // 5. Release the broker into its main loop.
+    if let Err(e) = bootstrap.write(b"shutdown-broker:go") {
+        init_logln!(
+            logger,
+            "[init] shutdown-broker: go message failed: {}",
+            e.as_str()
+        );
+        return None;
+    }
+
+    // 6. Wait for the ready ack.
+    let mut buf = [0u8; 64];
+    let mut attempts = 0u32;
+    loop {
+        match bootstrap.read_into(&mut buf) {
+            Ok(n) if &buf[..n] == b"shutdown-broker:ready" => {
+                init_logln!(logger, "[init] shutdown-broker: ready");
+                return Some((process, bootstrap));
+            }
+            Ok(_) => {}
+            Err(ErrorCode::ShouldWait) | Err(ErrorCode::TimedOut) => {}
+            Err(e) => {
+                init_logln!(
+                    logger,
+                    "[init] shutdown-broker: ready-wait failed: {}",
+                    e.as_str()
+                );
+                return None;
+            }
+        }
+        attempts = attempts.saturating_add(1);
+        if attempts >= 200_000 {
+            init_logln!(logger, "[init] shutdown-broker: ready timeout");
+            return None;
+        }
+        libcanvas::process::yield_now();
+    }
+}
+
+fn fallback_legacy_shutdown(logger: &mut InitLogger) {
+    if let Err(error) = libcanvas::system::shutdown() {
+        init_logln!(
+            logger,
+            "[init] shutdown request rejected: {}",
+            error.as_str()
+        );
     }
 }
 

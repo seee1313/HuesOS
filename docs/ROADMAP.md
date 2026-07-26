@@ -311,6 +311,21 @@ priority order.
   and `critical=true` lines that init reads out of BOOTFS and turns
   into per-driver handle grants transferred through DriverManager. See
   `docs/ARCHITECTURE_ROADMAP.md` §2/§4.
+- **Userspace shutdown-broker + `sys_hard_halt` + critical-process
+  fallback (landed as PR-D)**: capability-gated atomic halt via a new
+  `PowerControl` resource kind, `Syscall::HardHalt = 36`, and safe
+  8042 quiesce through `Syscall::IoPortWrite8`/`IoPortRead8`. The
+  userspace `shutdown-broker` component holds an IoPort(0x64) grant
+  and a PowerControl grant; init marks it critical, and the terminal
+  `system:shutdown` command now routes through it. If the broker
+  crashes before delivering the halt, the kernel's critical-exit
+  hook forces `hard_halt` itself (Fuchsia's "critical to root job"
+  analogue). DriverManager forward layer + input-host verification
+  close the PR-C limitation end-to-end: manifest-minted resource
+  handles now reach the driver process they were declared for.
+  `keyboard::prepare_shutdown` remains only as a fallback of the
+  legacy `SystemShutdown` syscall path and is scheduled for removal
+  in PR-E.
 
 ## Medium Term
 
