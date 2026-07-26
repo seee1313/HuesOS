@@ -734,3 +734,45 @@ The IDT change is behaviour-preserving for the live path: `irq_callback::emit`
 is invoked with the same `(1, scancode)` arguments in the same order relative
 to EOI. The only observable difference is that the kernel no longer performs
 scancode decoding into a buffer nobody reads.
+
+## `Resource` capability primitive (safety-budget-neutral)
+
+`crates/huesos-object/src/resource.rs` introduces `KernelObject::Resource`,
+an immutable capability grant for `[base, base+len)` over a physical-
+address-space kind (IoPort, Mmio, Irq). Design inspired by Zircon
+`zx_resource_t` (`zircon/kernel/object/resource_dispatcher.cc`),
+detailed in `docs/ARCHITECTURE_ROADMAP.md` §2.
+
+**No unsafe is added.** `Resource` is pure safe Rust: immutable fields,
+arithmetic on `u64` with `checked_add`, and pointer-free downcasting via
+the existing `KernelObject`/`Any` machinery. The overlap-and-register
+critical section in `registry::try_register_resource_locked` uses the
+already-existing `REGISTRY` `Mutex` — no new locking primitive, no new
+`unsafe` block.
+
+`safety-budget.json` moves in this PR:
+
+- `unsafe_blocks`: 244 → 244 (unchanged).
+- `unsafe_functions`: 59 → 59 (unchanged).
+- `unsafe_impls`: 28 → 28 (unchanged).
+- `rust_files`: 150 → 151 (+1, `resource.rs`).
+- `rust_lines`: 36134 → 36543 (+409, resource module + tests).
+
+The PR intentionally does not introduce a userspace syscall for creating
+resources: minting is kernel-side only until the manifest-driven grants
+PR (follow-up on the same PR chain). This means a compromised userspace
+component cannot forge a capability, and the atomic overlap-check-then-
+register path in `registry::try_register_resource_locked` is only
+reachable from trusted kernel code.
+
+## CI wiring
+
+No new CI job. Existing host-test matrix runs the 8 new `resource::tests::*`
+cases: `zero_length_range_rejected`, `wrap_past_u64_max_rejected`,
+`contains_is_kind_sensitive_and_bounds_checked`,
+`exclusive_and_exclusive_of_same_kind_conflict_when_overlapping`,
+`shared_and_shared_of_same_kind_may_overlap`,
+`shared_rejected_when_overlapping_existing_exclusive`,
+`intersects_matches_half_open_range_semantics`,
+`resource_koid_lookup_returns_registered_object`. QEMU smoke matrix is
+unaffected because no runtime call site is added yet.

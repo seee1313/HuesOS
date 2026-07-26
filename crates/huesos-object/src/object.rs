@@ -51,6 +51,10 @@ pub enum ObjectType {
     Vmar = 8,
     /// Restricted privileged-operation broker for Ring-3 ACPI.
     AcpiBroker = 9,
+    /// Immutable capability grant over a `[base, base+len)` range of a
+    /// physical-address-space kind (I/O port, MMIO, IRQ). See the
+    /// `Resource` docs and `docs/ARCHITECTURE_ROADMAP.md` §2.
+    Resource = 10,
     /// Generic / unknown.
     Unknown = 0xFF,
 }

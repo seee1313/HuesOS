@@ -22,7 +22,9 @@ use alloc::vec::Vec;
 use huesos_lifecycle::RefAccount;
 use spin::Mutex;
 
-use crate::{Interrupt, Job, KernelObject, Koid, Process};
+use crate::{
+    Interrupt, Job, KernelObject, KernelObjectExt, Koid, Process, Resource, ResourceError,
+};
 
 struct RegistryState {
     objects: BTreeMap<Koid, Arc<dyn KernelObject>>,
@@ -213,6 +215,53 @@ pub fn lookup_object(koid: Koid) -> Option<Arc<dyn KernelObject>> {
 /// Lookup a process by koid.
 pub fn lookup_process(koid: Koid) -> Option<Arc<Process>> {
     REGISTRY.lock().processes.get(&koid).cloned()
+}
+
+/// Atomically overlap-check a candidate `Resource` against existing
+/// resources of the same kind, and register it on success.
+///
+/// The walk and the insert both happen under a single lock acquisition
+/// so no other thread can insert a conflicting resource between the
+/// check and the commit (a two-step public API would open a
+/// time-of-check-to-time-of-use window).
+///
+/// # Overlap rules
+///
+/// * Exclusive candidate: any range-intersection with any existing
+///   resource of the same kind (exclusive or shared) is a `Conflict`.
+/// * Shared candidate: only range-intersection with an existing
+///   `exclusive` resource of the same kind is a `Conflict`.
+///
+/// See `docs/ARCHITECTURE_ROADMAP.md` §2 and the Zircon reference in
+/// `resource.rs`.
+pub(crate) fn try_register_resource_locked(candidate: Arc<Resource>) -> Result<(), ResourceError> {
+    let koid = candidate.koid();
+    let mut state = REGISTRY.lock();
+    for existing in state.objects.values() {
+        if existing.object_type() != crate::ObjectType::Resource {
+            continue;
+        }
+        let Some(other) = existing.downcast_ref::<Resource>() else {
+            continue;
+        };
+        if other.kind() != candidate.kind() {
+            continue;
+        }
+        if !other.intersects(candidate.base(), candidate.len()) {
+            continue;
+        }
+        // Both exclusive vs. one exclusive → conflict.
+        // Shared vs. shared is permitted; only reject shared when the
+        // other side is exclusive.
+        if candidate.is_exclusive() || other.is_exclusive() {
+            return Err(ResourceError::Conflict);
+        }
+    }
+    state.accounts.insert(koid, RefAccount::registered());
+    state
+        .objects
+        .insert(koid, candidate as Arc<dyn KernelObject>);
+    Ok(())
 }
 
 /// Register an interrupt for both object lookup and IRQ fanout.
