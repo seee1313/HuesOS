@@ -63,6 +63,7 @@ pub mod channel;
 pub mod debug;
 #[cfg(feature = "kernel-smoke-tests")]
 pub mod diagnostics;
+mod font6x13;
 mod font8x8;
 pub mod framebuffer;
 pub mod handle;

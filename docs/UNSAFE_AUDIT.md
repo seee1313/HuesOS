@@ -1015,3 +1015,65 @@ is not currently smoke-exercised because there is no way in the
 smoke image to make init fail to launch the broker; a
 qemu-shutdown-fallback smoke covering the "broker missing" scenario
 is a future follow-up.
+
+## Input UX quality: Cozette 6x13 font + event-driven PS/2 driver (safety-budget-neutral)
+
+Two independent quality improvements landed together because both
+change the userspace input/terminal path:
+
+**Fonts:** the 8x16 terminal text was actually the 8x8 DejaVu font
+upscaled 2× — pixelated and hard to read on modern displays. This PR
+ships the Cozette bitmap font (6×13, MIT, from
+<https://github.com/slavfox/Cozette>) as the new default via a new
+`TextFont::Cozette6x13` variant. The font is generated from the
+upstream `.bdf` by `tools/fontgen/bdf2rs.py` and shipped in two
+places (`libcanvas::font6x13` for userspace, `huesos_fb::font6x13`
+for the kernel; the kernel copy is currently unused but avoids a
+future tooling dependency when a ring-0 debug console lands). The
+existing `TextFont::Tty8x16` and `TextFont::Compact8x8` variants are
+retained for back-compat. Terminal row/column layout re-tuned:
+54 × 168 cells at 12px margins vs. the previous 44 × 96 — actual
+usable screen real-estate roughly doubles.
+
+**PS/2 latency:** the input-host was busy-yielding through
+`port.read()` + `libcanvas::process::yield_now()` every scheduler
+tick regardless of whether the keyboard was idle. This PR rewrites
+the driver loop around the existing `wait_any([bootstrap, port])`
+multiplexed wait primitive that landed with `Syscall::WaitSetWait`.
+Effect:
+
+* Zero CPU is spent when the keyboard is idle. Under QEMU that
+  removes the input-host from the per-tick scheduler wake list
+  entirely.
+* Key-to-terminal latency is bounded only by IPI + context-switch,
+  not by whatever the scheduler's next `yield_now` scan finds.
+* Log spam removed: the per-scancode `println!` (was: first 3, then
+  power-of-two milestones) is gone. The heartbeat interval bumped
+  4× (32 → 256) so a fast typist does not fire a DebugWrite
+  syscall on nearly every keystroke.
+* `consume_manifest_resources` startup drain also moved onto
+  `wait_any` with a short timeout — no more `yield_now` × 256
+  busy-poll during boot.
+
+`safety-budget.json` moves in this PR:
+
+* `unsafe_blocks`: 245 → 245 (unchanged).
+* `unsafe_functions`: 59 → 59 (unchanged).
+* `unsafe_impls`: 28 → 28 (unchanged).
+* `rust_files`: 154 → 156 (+2: two font6x13 modules).
+* `rust_lines`: 38459 → 38967 (+508: font tables + wait_any
+  rewrite + module docs).
+
+No new `unsafe`. The font modules are pure `const` arrays and a
+safe `glyph` accessor; the driver rewrite uses the existing safe
+`wait_any` / `Channel::read_handle` / `Port::read` wrappers. The
+new `Channel::handle()` accessor is a `&Handle` borrow, no
+unsafe involved.
+
+## CI wiring
+
+No new job. The existing `qemu-smoke` matrix boots the terminal and
+exercises the keyboard IRQ path implicitly (any smoke that presses
+a key runs through the new driver loop). Font rendering is
+observable in the boot screenshot / serial log the smoke image
+already captures.

@@ -26,11 +26,38 @@ pub fn info() -> crate::Result<FramebufferInfo> {
 /// Built-in text font selection.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TextFont {
-    /// TTY-style 8x16 font (default). Each source bitmap row is expanded to
-    /// two scanlines, giving classic VGA console proportions.
+    /// Cozette 6x13 (default). Real hand-drawn bitmap font from
+    /// <https://github.com/slavfox/Cozette> (MIT), with proper
+    /// baseline metrics, descenders for `g`/`p`/`y`/etc., and a
+    /// compact 6-pixel advance width. Regenerate via
+    /// `tools/fontgen/bdf2rs.py`.
+    Cozette6x13,
+    /// TTY-style 8x16 font. Each source 8x8 bitmap row is expanded
+    /// to two scanlines. Retained as a fallback so terminal layouts
+    /// that hard-code an 8-pixel advance keep working during the
+    /// migration.
     Tty8x16,
     /// Original compact 8x8 HuesOS font.
     Compact8x8,
+}
+
+impl TextFont {
+    /// Advance width in pixels per glyph.
+    pub const fn cell_w(self) -> u32 {
+        match self {
+            Self::Cozette6x13 => crate::font6x13::CELL_W as u32,
+            Self::Tty8x16 | Self::Compact8x8 => 8,
+        }
+    }
+
+    /// Cell height in pixels per line.
+    pub const fn cell_h(self) -> u32 {
+        match self {
+            Self::Cozette6x13 => crate::font6x13::CELL_H as u32,
+            Self::Tty8x16 => 16,
+            Self::Compact8x8 => 8,
+        }
+    }
 }
 
 /// An off-screen drawing surface, backed by a VMO, matching the real
@@ -134,7 +161,8 @@ impl Canvas {
     }
 
     /// Rasterize text directly into a packed shadow buffer without issuing
-    /// per-pixel VMO writes.
+    /// per-pixel VMO writes. Dispatches on `font` to either the native
+    /// Cozette 6x13 rasteriser or the legacy scaled-8x8 rasteriser.
     pub fn draw_text_to_shadow(
         &self,
         shadow: &mut [u8],
@@ -151,6 +179,59 @@ impl Canvas {
             return Err(crate::ErrorCode::InvalidArgs);
         }
         let pixel = self.pack_color(r, g, b).to_le_bytes();
+        match font {
+            TextFont::Cozette6x13 => self.draw_text_to_shadow_6x13(shadow, x, y, text, &pixel),
+            TextFont::Tty8x16 | TextFont::Compact8x8 => {
+                self.draw_text_to_shadow_8x8(shadow, x, y, text, &pixel, font)
+            }
+        }
+    }
+
+    fn draw_text_to_shadow_6x13(
+        &self,
+        shadow: &mut [u8],
+        x: u32,
+        y: u32,
+        text: &str,
+        pixel: &[u8; 4],
+    ) -> crate::Result<()> {
+        let fallback: [u8; crate::font6x13::CELL_H] = [0b0011_1111; crate::font6x13::CELL_H];
+        let cell_w = crate::font6x13::CELL_W as u32;
+        let mut cursor_x = x;
+        for ch in text.chars() {
+            let glyph = crate::font6x13::glyph(ch).unwrap_or(&fallback);
+            for (source_y, bits) in glyph.iter().enumerate() {
+                let output_y = y + source_y as u32;
+                if output_y >= self.info.height {
+                    continue;
+                }
+                for column in 0..cell_w {
+                    if bits & (1 << column) == 0 {
+                        continue;
+                    }
+                    let output_x = cursor_x + column;
+                    if output_x >= self.info.width {
+                        continue;
+                    }
+                    let offset =
+                        output_y as usize * self.info.pitch as usize + output_x as usize * 4;
+                    shadow[offset..offset + 4].copy_from_slice(pixel);
+                }
+            }
+            cursor_x = cursor_x.saturating_add(cell_w);
+        }
+        Ok(())
+    }
+
+    fn draw_text_to_shadow_8x8(
+        &self,
+        shadow: &mut [u8],
+        x: u32,
+        y: u32,
+        text: &str,
+        pixel: &[u8; 4],
+        font: TextFont,
+    ) -> crate::Result<()> {
         let scale = if font == TextFont::Tty8x16 { 2 } else { 1 };
         let mut cursor_x = x;
         for ch in text.chars() {
@@ -171,7 +252,7 @@ impl Canvas {
                         }
                         let offset =
                             output_y as usize * self.info.pitch as usize + output_x as usize * 4;
-                        shadow[offset..offset + 4].copy_from_slice(&pixel);
+                        shadow[offset..offset + 4].copy_from_slice(pixel);
                     }
                 }
             }
@@ -303,11 +384,12 @@ impl Canvas {
     /// entirely within the VMO the caller already owns (no new syscall
     /// needed) — see `crate::font8x8`.
     pub fn draw_text(&self, x: u32, y: u32, text: &str, r: u8, g: u8, b: u8) -> crate::Result<()> {
-        self.draw_text_with_font(x, y, text, r, g, b, TextFont::Tty8x16)
+        self.draw_text_with_font(x, y, text, r, g, b, TextFont::Cozette6x13)
     }
 
-    /// Draw text with an explicit built-in font. The original HuesOS font is
-    /// retained as [`TextFont::Compact8x8`].
+    /// Draw text with an explicit built-in font. Cell width comes
+    /// from [`TextFont::cell_w`], so callers do not hard-code
+    /// per-font advance widths.
     pub fn draw_text_with_font(
         &self,
         x: u32,
@@ -318,13 +400,14 @@ impl Canvas {
         b: u8,
         font: TextFont,
     ) -> crate::Result<()> {
+        let cell_w = font.cell_w();
         let mut cx = x;
         for ch in text.chars() {
             if ch == '\n' {
                 continue;
             }
             self.draw_glyph(cx, y, ch, r, g, b, font)?;
-            cx += 8;
+            cx += cell_w;
         }
         Ok(())
     }
@@ -339,10 +422,51 @@ impl Canvas {
         b: u8,
         font: TextFont,
     ) -> crate::Result<()> {
+        match font {
+            TextFont::Cozette6x13 => self.draw_glyph_6x13(x, y, ch, r, g, b),
+            TextFont::Tty8x16 | TextFont::Compact8x8 => {
+                self.draw_glyph_8x8_scaled(x, y, ch, r, g, b, font)
+            }
+        }
+    }
+
+    fn draw_glyph_6x13(&self, x: u32, y: u32, ch: char, r: u8, g: u8, b: u8) -> crate::Result<()> {
+        // Missing glyphs: draw a filled block as a visible placeholder,
+        // matching the 8x8 fallback behaviour.
+        let fallback: [u8; crate::font6x13::CELL_H] = [0b0011_1111; crate::font6x13::CELL_H];
+        let bitmap = crate::font6x13::glyph(ch).unwrap_or(&fallback);
+        for (row, bits) in bitmap.iter().enumerate() {
+            let py = y + row as u32;
+            if py >= self.info.height {
+                break;
+            }
+            for col in 0..crate::font6x13::CELL_W as u32 {
+                if bits & (1 << col) != 0 {
+                    let px = x + col;
+                    if px < self.info.width {
+                        self.set_pixel(px, py, r, g, b)?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn draw_glyph_8x8_scaled(
+        &self,
+        x: u32,
+        y: u32,
+        ch: char,
+        r: u8,
+        g: u8,
+        b: u8,
+        font: TextFont,
+    ) -> crate::Result<()> {
         let bitmap = crate::font8x8::glyph(ch).unwrap_or(&[0xFF; 8]);
         let vertical_scale = match font {
             TextFont::Tty8x16 => 2,
             TextFont::Compact8x8 => 1,
+            TextFont::Cozette6x13 => 1,
         };
         for (row, bits) in bitmap.iter().enumerate() {
             for scaled_row in 0..vertical_scale {

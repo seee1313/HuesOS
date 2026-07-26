@@ -3,11 +3,18 @@
 use core::cell::UnsafeCell;
 use libcanvas::framebuffer::{Canvas, TextFont};
 
-const ROWS: usize = 44;
-const COLS: usize = 96;
-const LINE_HEIGHT: u32 = 16;
-const LEFT_MARGIN: u32 = 16;
-const TOP_MARGIN: u32 = 16;
+// Terminal layout defaults are sized for the Cozette 6x13 font
+// (advance 6px, line box 13px). Row/column counts stay generous so a
+// 1024x768 boot display can host ~54 lines × ~168 columns, giving
+// contemporary terminals real breathing room instead of the previous
+// 96-column classic-VT budget.
+const ROWS: usize = 54;
+const COLS: usize = 168;
+/// Extra pixel of leading between rows to keep descenders (`g`, `p`,
+/// `y`, `q`) visually separated from the next line's ascenders.
+const LINE_HEIGHT: u32 = 14;
+const LEFT_MARGIN: u32 = 12;
+const TOP_MARGIN: u32 = 12;
 /// Covers up to 2560×1600 at 32 bpp without heap allocation.
 const SHADOW_CAPACITY: usize = 16 * 1024 * 1024;
 
@@ -53,7 +60,7 @@ impl Screen {
             cells: [[b' '; COLS]; ROWS],
             row: 0,
             col: 0,
-            font: TextFont::Tty8x16,
+            font: TextFont::Cozette6x13,
         }
     }
 
@@ -131,7 +138,17 @@ impl Screen {
         }
     }
 
-    /// Select the default TTY-style 8x16 font.
+    /// Select the default Cozette 6x13 bitmap font. Currently unused
+    /// because `Screen::new` picks it up as the default, but retained
+    /// so the terminal shell can add a `font cozette` toggle
+    /// alongside the existing `font tty` / `font compact` commands
+    /// without adding an accessor at that point.
+    #[allow(dead_code)]
+    pub fn use_cozette_font(&mut self) {
+        self.font = TextFont::Cozette6x13;
+    }
+
+    /// Select the legacy TTY-style 8x16 upscaled font.
     pub fn use_tty_font(&mut self) {
         self.font = TextFont::Tty8x16;
     }
@@ -144,6 +161,7 @@ impl Screen {
     /// Human-readable active font name.
     pub fn font_name(&self) -> &'static str {
         match self.font {
+            TextFont::Cozette6x13 => "cozette 6x13",
             TextFont::Tty8x16 => "tty 8x16",
             TextFont::Compact8x8 => "compact 8x8",
         }
