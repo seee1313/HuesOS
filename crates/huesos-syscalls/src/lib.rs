@@ -44,9 +44,10 @@ use huesos_abi::{
 };
 
 pub use callbacks::{
-    set_clock_fn, set_debug_write_fn, set_exit_fn, set_process_create_fn, set_shutdown_fn,
-    set_thread_start_fn, set_vmar_map_fn, set_vmar_protect_fn, set_vmar_unmap_fn, set_yield_fn,
-    ProcessCreateFn, ThreadStartFn, VmarMapFn, VmarOpFn,
+    set_clock_fn, set_cpu_mask_fn, set_current_cpu_fn, set_debug_write_fn, set_exit_fn,
+    set_process_create_fn, set_shutdown_fn, set_thread_start_fn, set_vmar_map_fn,
+    set_vmar_protect_fn, set_vmar_unmap_fn, set_yield_fn, ProcessCreateFn, ThreadStartFn,
+    VmarMapFn, VmarOpFn,
 };
 
 /// Result type for syscalls: `Ok(value)` or a negative error code.
@@ -144,5 +145,14 @@ pub fn dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> Syscal
         S::HardHalt => resource::sys_hard_halt(a1 as HandleValue),
         S::IoPortWrite8 => resource::sys_ioport_write8(a1 as HandleValue, a2 as u32, a3 as u32),
         S::IoPortRead8 => resource::sys_ioport_read8(a1 as HandleValue, a2 as u32),
+        S::ProcessSetAffinity => process::sys_process_set_affinity(a1 as HandleValue, a2 as usize),
+        S::SystemCpuCount => system::sys_system_cpu_count(),
+        S::SystemCurrentCpu => system::sys_system_current_cpu(),
+        S::ProcessSetAffinityMask => {
+            process::sys_process_set_affinity_mask(a1 as HandleValue, a2, a3 as usize)
+        }
+        S::ProcessGetAffinity => {
+            process::sys_process_get_affinity(a1 as HandleValue, a2 as *mut u64, a3 as *mut u64)
+        }
     }
 }

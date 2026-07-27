@@ -8,7 +8,7 @@ use core::any::Any;
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use crate::wait::{self, WaitQueue};
-use crate::{alloc_koid, Handle, KernelObject, Koid, ObjectType};
+use crate::{alloc_koid, Handle, KernelObject, Koid, ObjectType, Rights};
 use huesos_quota::{Limits, Quota, Resource, UNLIMITED};
 
 /// Maximum number of messages retained in one channel inbox.
@@ -66,9 +66,13 @@ impl MessageQueue {
         })
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "failed sends must return the owned message without allocating on the error path"
+    )]
     fn enqueue(&mut self, msg: ChannelMessage) -> Result<(), ChannelSendError> {
-        let bytes = msg.data.len() as u64;
-        let handles = msg.handles.len() as u64;
+        let bytes = msg.data_len() as u64;
+        let handles = msg.handle_count() as u64;
         if self.messages.len() >= MAX_CHANNEL_QUEUE_MESSAGES
             || !self.quota.fits(Resource::Memory, bytes)
             || !self.quota.fits(Resource::Handles, handles)
@@ -97,9 +101,9 @@ impl MessageQueue {
 
     fn dequeue(&mut self) -> Option<ChannelMessage> {
         let msg = self.messages.pop_front()?;
-        self.quota.release(Resource::Memory, msg.data.len() as u64);
+        self.quota.release(Resource::Memory, msg.data_len() as u64);
         self.quota
-            .release(Resource::Handles, msg.handles.len() as u64);
+            .release(Resource::Handles, msg.handle_count() as u64);
         Some(msg)
     }
 
@@ -107,7 +111,7 @@ impl MessageQueue {
     /// `(byte_size, handle_count, cookie)`.
     fn peek_front(&self) -> Option<(usize, usize, u64)> {
         let msg = self.messages.front()?;
-        Some((msg.data.len(), msg.handles.len(), msg.seq))
+        Some((msg.data_len(), msg.handle_count(), msg.seq))
     }
 
     /// Dequeue the front message only if its cookie matches. Returns the
@@ -119,6 +123,30 @@ impl MessageQueue {
             return None;
         }
         self.dequeue()
+    }
+
+    /// Dequeue the front message only if its cookie matches and the caller's
+    /// buffers can hold both byte payload and transferred handles. Size failures
+    /// leave the message queued so the caller can retry with larger buffers.
+    fn consume_if_fits(
+        &mut self,
+        cookie: u64,
+        byte_capacity: usize,
+        handle_capacity: usize,
+    ) -> Result<Option<ChannelMessage>, ChannelRecvError> {
+        let Some(front) = self.messages.front() else {
+            return Ok(None);
+        };
+        if front.seq != cookie {
+            return Ok(None);
+        }
+        if front.data_len() > byte_capacity {
+            return Err(ChannelRecvError::BytesTooSmall);
+        }
+        if front.handle_count() > handle_capacity {
+            return Err(ChannelRecvError::HandlesTooSmall);
+        }
+        Ok(self.dequeue())
     }
 }
 
@@ -152,24 +180,228 @@ impl ChannelSendError {
     }
 }
 
+/// Maximum payload bytes stored inline in a queued channel message.
+pub const CHANNEL_INLINE_BYTES: usize = 64;
+/// Maximum transferred handles stored inline in a queued channel message.
+pub const CHANNEL_INLINE_HANDLES: usize = 2;
+
+const EMPTY_HANDLE: Handle = Handle::new(Koid::INVALID, Rights::DEFAULT);
+
+/// Byte payload storage for a channel message.
+pub enum ChannelMessageData {
+    /// Inline storage for small control messages.
+    Inline {
+        /// Number of live bytes in `bytes`.
+        len: usize,
+        /// Inline bytes.
+        bytes: [u8; CHANNEL_INLINE_BYTES],
+    },
+    /// Heap storage for larger messages.
+    Heap(Vec<u8>),
+}
+
+impl ChannelMessageData {
+    /// Build payload storage from an owned vector, inlining when possible.
+    pub fn from_vec(data: Vec<u8>) -> Self {
+        if data.len() <= CHANNEL_INLINE_BYTES {
+            let mut bytes = [0u8; CHANNEL_INLINE_BYTES];
+            bytes[..data.len()].copy_from_slice(&data);
+            Self::Inline {
+                len: data.len(),
+                bytes,
+            }
+        } else {
+            Self::Heap(data)
+        }
+    }
+
+    /// Build inline payload storage from a slice.
+    pub fn inline(data: &[u8]) -> Option<Self> {
+        if data.len() > CHANNEL_INLINE_BYTES {
+            return None;
+        }
+        let mut bytes = [0u8; CHANNEL_INLINE_BYTES];
+        bytes[..data.len()].copy_from_slice(data);
+        Some(Self::Inline {
+            len: data.len(),
+            bytes,
+        })
+    }
+
+    /// Payload length.
+    pub fn len(&self) -> usize {
+        match self {
+            Self::Inline { len, .. } => *len,
+            Self::Heap(data) => data.len(),
+        }
+    }
+
+    /// Whether the payload is empty.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Payload as a byte slice.
+    pub fn as_slice(&self) -> &[u8] {
+        match self {
+            Self::Inline { len, bytes } => &bytes[..*len],
+            Self::Heap(data) => data.as_slice(),
+        }
+    }
+}
+
+/// Transferred-handle storage for a channel message.
+pub enum ChannelMessageHandles {
+    /// Inline storage for the common zero/one-handle bootstrap messages.
+    Inline {
+        /// Number of live handles in `handles`.
+        len: usize,
+        /// Inline handles.
+        handles: [Handle; CHANNEL_INLINE_HANDLES],
+    },
+    /// Heap storage for larger handle batches.
+    Heap(Vec<Handle>),
+}
+
+impl ChannelMessageHandles {
+    /// Build handle storage from an owned vector, inlining when possible.
+    pub fn from_vec(handles: Vec<Handle>) -> Self {
+        if handles.len() <= CHANNEL_INLINE_HANDLES {
+            let mut inline = [EMPTY_HANDLE; CHANNEL_INLINE_HANDLES];
+            for (slot, handle) in inline.iter_mut().zip(handles.iter().copied()) {
+                *slot = handle;
+            }
+            Self::Inline {
+                len: handles.len(),
+                handles: inline,
+            }
+        } else {
+            Self::Heap(handles)
+        }
+    }
+
+    /// Build inline handle storage from a slice.
+    pub fn inline(handles: &[Handle]) -> Option<Self> {
+        if handles.len() > CHANNEL_INLINE_HANDLES {
+            return None;
+        }
+        let mut inline = [EMPTY_HANDLE; CHANNEL_INLINE_HANDLES];
+        for (slot, handle) in inline.iter_mut().zip(handles.iter().copied()) {
+            *slot = handle;
+        }
+        Some(Self::Inline {
+            len: handles.len(),
+            handles: inline,
+        })
+    }
+
+    /// Number of transferred handles.
+    pub fn len(&self) -> usize {
+        match self {
+            Self::Inline { len, .. } => *len,
+            Self::Heap(handles) => handles.len(),
+        }
+    }
+
+    /// Whether no handles are carried.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Move handles out into `out`, clear this message's handle list, and
+    /// return the number moved. `out` must be large enough for `self.len()`.
+    pub fn take_into(&mut self, out: &mut [Handle]) -> usize {
+        match self {
+            Self::Inline { len, handles } => {
+                let count = *len;
+                out[..count].copy_from_slice(&handles[..count]);
+                for handle in handles.iter_mut().take(count) {
+                    *handle = EMPTY_HANDLE;
+                }
+                *len = 0;
+                count
+            }
+            Self::Heap(handles) => {
+                let count = handles.len();
+                out[..count].copy_from_slice(handles.as_slice());
+                handles.clear();
+                count
+            }
+        }
+    }
+
+    fn close_all(&mut self) {
+        match self {
+            Self::Inline { len, handles } => {
+                for handle in handles.iter().take(*len) {
+                    crate::note_handle_close(handle.koid);
+                }
+                *len = 0;
+            }
+            Self::Heap(handles) => {
+                for h in handles.drain(..) {
+                    crate::note_handle_close(h.koid);
+                }
+            }
+        }
+    }
+}
+
 /// A message sent over a channel.
 pub struct ChannelMessage {
     /// Opaque sequence cookie assigned at enqueue time. Used by the
     /// peek/consume protocol to identify a specific queued message.
     pub seq: u64,
-    /// Raw bytes.
-    pub data: Vec<u8>,
-    /// Handles transferred with the message.
-    pub handles: Vec<Handle>,
+    data: ChannelMessageData,
+    handles: ChannelMessageHandles,
+}
+
+impl ChannelMessage {
+    /// Build a message from owned buffers, inlining the common small case.
+    pub fn new(data: Vec<u8>, handles: Vec<Handle>) -> Self {
+        Self {
+            seq: 0,
+            data: ChannelMessageData::from_vec(data),
+            handles: ChannelMessageHandles::from_vec(handles),
+        }
+    }
+
+    /// Build a fully-inline message. Returns `None` if either slice exceeds
+    /// the inline capacity.
+    pub fn inline(data: &[u8], handles: &[Handle]) -> Option<Self> {
+        Some(Self {
+            seq: 0,
+            data: ChannelMessageData::inline(data)?,
+            handles: ChannelMessageHandles::inline(handles)?,
+        })
+    }
+
+    /// Payload length.
+    pub fn data_len(&self) -> usize {
+        self.data.len()
+    }
+
+    /// Transferred-handle count.
+    pub fn handle_count(&self) -> usize {
+        self.handles.len()
+    }
+
+    /// Payload bytes.
+    pub fn data(&self) -> &[u8] {
+        self.data.as_slice()
+    }
+
+    /// Move transferred handles into caller storage and clear the message list.
+    pub fn take_handles_into(&mut self, out: &mut [Handle]) -> usize {
+        self.handles.take_into(out)
+    }
 }
 
 impl Drop for ChannelMessage {
     fn drop(&mut self) {
         // If the message is discarded (peer closed, buffer dropped), release
         // the handle-count holds that kept objects alive in flight.
-        for h in self.handles.drain(..) {
-            crate::note_handle_close(h.koid);
-        }
+        self.handles.close_all();
     }
 }
 
@@ -241,6 +473,10 @@ impl Channel {
 
     /// Send a message to the peer endpoint (enqueued FIFO) and wake one reader.
     /// The message is returned unchanged on failure.
+    #[expect(
+        clippy::result_large_err,
+        reason = "failed sends must return the owned message without allocating on the error path"
+    )]
     pub fn send(&self, msg: ChannelMessage) -> Result<(), ChannelSendError> {
         // The atomic check is the send/close linearization point. A close that
         // happens after this check is ordered after the send and may discard
@@ -353,10 +589,10 @@ impl Channel {
                 Ok(None)
             };
         };
-        if msg.data.len() > byte_capacity {
+        if msg.data_len() > byte_capacity {
             return Err(ChannelRecvError::BytesTooSmall);
         }
-        if msg.handles.len() > handle_capacity {
+        if msg.handle_count() > handle_capacity {
             return Err(ChannelRecvError::HandlesTooSmall);
         }
         Ok(q.dequeue())
@@ -403,6 +639,19 @@ impl Channel {
     /// since the peek) or the queue is empty.
     pub fn consume(&self, cookie: u64) -> Option<ChannelMessage> {
         self.inbox.lock().consume(cookie)
+    }
+
+    /// Consume the identified message only if caller buffers can hold it.
+    /// Size errors leave the message queued.
+    pub fn consume_if_fits(
+        &self,
+        cookie: u64,
+        byte_capacity: usize,
+        handle_capacity: usize,
+    ) -> Result<Option<ChannelMessage>, ChannelRecvError> {
+        self.inbox
+            .lock()
+            .consume_if_fits(cookie, byte_capacity, handle_capacity)
     }
 
     /// Reference to the reader wait queue, for syscall-level blocking peek.

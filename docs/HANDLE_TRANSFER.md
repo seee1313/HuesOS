@@ -1,9 +1,13 @@
 # Handle-Transfer Semantics (`huesos-handlemove`)
 
 Status: **policy + host tests landed; bounded queue admission and rollback on
-queue rejection are now integrated, but the policy crate is not yet the single
-implementation used by the privileged channel path and concurrent close/send
-behavior still requires on-target verification.**
+queue rejection are integrated. Userspace `Channel::write_handle` now returns
+the still-owned handle on send failure, preserving the kernel's all-or-nothing
+rollback contract instead of closing a restored capability. Receive-side handle
+publication is serialized with copy-out to prevent sibling threads from seeing
+handles from a syscall that ultimately fails. The policy crate is still not the
+single implementation used by the privileged channel path and concurrent
+close/send behavior still requires on-target verification.**
 
 This document describes the host-testable crate `huesos-handlemove` and how it
 is intended to plug into the kernel. It supports
@@ -82,10 +86,11 @@ returns a normal resource error instead of growing without limit.
 
 The userspace `libcanvas::Channel::write_handle` wrapper consumes an owned
 `Handle` before issuing `ChannelWrite`. If the syscall fails, the kernel's
-all-or-nothing contract leaves the raw handle value in the sender's table (or a
-close on that value is harmless if a future kernel path consumed it despite
-returning an error). The wrapper therefore closes the raw value on failure so
-ordinary `?` error paths do not leak a capability.
+all-or-nothing contract leaves the raw handle value in the sender's table. The
+wrapper now returns `Err((ErrorCode, Handle))`, handing that still-owned
+capability back to the caller instead of closing it. Callers that intentionally
+want to drop the capability can ignore the returned handle; callers that want to
+retry or route it elsewhere can keep it.
 
 The pure `transfer` function remains the normative policy model, but the kernel
 has not yet replaced its object-specific handle representation with the policy

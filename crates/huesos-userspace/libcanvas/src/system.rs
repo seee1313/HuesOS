@@ -9,6 +9,18 @@ pub fn monotonic_ticks() -> crate::Result<u64> {
     raw::decode(value).map(|ticks| ticks as u64)
 }
 
+/// Number of online CPUs using HuesOS dense CPU indexes.
+pub fn cpu_count() -> crate::Result<usize> {
+    let value = raw::syscall0(Syscall::SystemCpuCount);
+    raw::decode(value).map(|count| count as usize)
+}
+
+/// Dense CPU index of the caller.
+pub fn current_cpu() -> crate::Result<usize> {
+    let value = raw::syscall0(Syscall::SystemCurrentCpu);
+    raw::decode(value).map(|cpu| cpu as usize)
+}
+
 /// Request an orderly non-ACPI software shutdown.
 ///
 /// Kernel policy accepts this only from the root init supervisor. On success

@@ -773,7 +773,7 @@ mod tests {
 
     #[test]
     fn scope_on_drives_a_future_with_backend() {
-        use backend::{Backend, KernelBackend, UserBackend};
+        use backend::{KernelBackend, UserBackend};
 
         static SCOPE_POLLS: AtomicU32 = AtomicU32::new(0);
         SCOPE_POLLS.store(0, Ordering::SeqCst);

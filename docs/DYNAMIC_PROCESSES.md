@@ -70,6 +70,21 @@ and wakes the existing wait queue. `ProcessWait` calls `add_waiter()` before
 parking and releases the waiter when the exit status is observed, so waits
 arriving after exit do not park unnecessarily.
 
+Thread startup is also reserved transactionally: a `ThreadStart` syscall first
+reserves both the target `Thread` and the process's single initial-thread slot,
+then creates bootstrap channels, publishes the parent endpoint to the caller,
+and only after successful copy-out publishes the scheduler task. Any failure
+before publication rolls both reservations and both channel endpoints back, so a
+failed `ThreadStart` cannot leave a hidden bootstrap handle or a half-started
+child. Additional threads in an already-running process are rejected until the
+multi-thread bootstrap protocol grows per-thread startup handles.
+
+Processes also carry a default dense-CPU affinity. `ProcessSetAffinity` may
+change that home CPU only while the process is still `Created` and no
+initial-thread start is reserved. `ThreadStart` pins the initial task to that
+home CPU; the scheduler no longer consults a global load average or performs
+automatic balancing.
+
 The scheduler copies this lifecycle-owned generation unchanged into its bounded
 finished-task graveyard, so deferred reaping and any later supervisor packet
 refer to the same `(koid, generation)` exit identity.

@@ -110,7 +110,12 @@ impl<'a, D: BlockDevice> FatFileSystem<'a, D> {
         device.read_sector(0, &mut boot)?;
 
         let bpb = unsafe { core::ptr::read_unaligned(boot.as_ptr() as *const FatBpb) };
-        if bpb.bytes_per_sector != 512 {
+        if bpb.bytes_per_sector != 512
+            || bpb.sectors_per_cluster == 0
+            || bpb.num_fats == 0
+            || (bpb.fat_size_16 == 0 && bpb.fat_size_32 == 0)
+            || (bpb.total_sectors_16 == 0 && bpb.total_sectors_32 == 0)
+        {
             return Err(DriverError::InvalidFat);
         }
 
@@ -131,6 +136,19 @@ impl<'a, D: BlockDevice> FatFileSystem<'a, D> {
         } else {
             self.bpb.fat_size_16 as u32
         }
+    }
+
+    fn total_sectors(&self) -> u32 {
+        if self.bpb.total_sectors_16 != 0 {
+            self.bpb.total_sectors_16 as u32
+        } else {
+            self.bpb.total_sectors_32
+        }
+    }
+
+    fn max_data_clusters(&self) -> u32 {
+        let sectors = self.total_sectors().saturating_sub(self.data_offset());
+        sectors / self.bpb.sectors_per_cluster as u32 + 2
     }
 
     fn data_offset(&self) -> u32 {
@@ -181,6 +199,9 @@ impl<'a, D: BlockDevice> FatFileSystem<'a, D> {
             };
 
             if entry.is_directory() {
+                if component == last_component {
+                    return Err(DriverError::NotADirectory);
+                }
                 current_cluster = entry.first_cluster();
                 is_root_special = false;
             } else {
@@ -233,8 +254,14 @@ impl<'a, D: BlockDevice> FatFileSystem<'a, D> {
         name: &str,
     ) -> Result<DirectoryEntry, DriverError> {
         let mut cluster = dir_cluster;
+        let mut visited = 0u32;
+        let max_clusters = self.max_data_clusters();
 
         while !self.is_end_of_chain(cluster) {
+            if visited >= max_clusters {
+                return Err(DriverError::InvalidFat);
+            }
+            visited += 1;
             let sector = self.cluster_to_sector(cluster);
             let sectors_per_cluster = self.bpb.sectors_per_cluster as u32;
 
@@ -267,18 +294,35 @@ impl<'a, D: BlockDevice> FatFileSystem<'a, D> {
         entry_name[8..].copy_from_slice(&entry.ext);
 
         let mut search = [b' '; 11];
-        let mut i = 0;
+        let mut name_len = 0usize;
+        let mut ext_len = 0usize;
+        let mut in_ext = false;
         for &b in name.as_bytes() {
             if b == b'.' {
-                i = 8;
+                if in_ext || name_len == 0 {
+                    return false;
+                }
+                in_ext = true;
                 continue;
             }
-            if i < 11 {
-                search[i] = b.to_ascii_uppercase();
-                i += 1;
+            if b == b' ' || b == b'/' || b == b'\\' {
+                return false;
+            }
+            if in_ext {
+                if ext_len >= 3 {
+                    return false;
+                }
+                search[8 + ext_len] = b.to_ascii_uppercase();
+                ext_len += 1;
+            } else {
+                if name_len >= 8 {
+                    return false;
+                }
+                search[name_len] = b.to_ascii_uppercase();
+                name_len += 1;
             }
         }
-        entry_name == search
+        name_len != 0 && entry_name == search
     }
 
     // ==================== FILE READING ====================
@@ -320,8 +364,14 @@ impl<'a, D: BlockDevice> FatFileSystem<'a, D> {
         let mut bytes_read = 0usize;
         let mut cluster = entry.first_cluster();
         let mut remaining = file_size;
+        let mut visited = 0u32;
+        let max_clusters = self.max_data_clusters();
 
         while remaining > 0 && !self.is_end_of_chain(cluster) {
+            if visited >= max_clusters {
+                return Err(DriverError::InvalidFat);
+            }
+            visited += 1;
             let sector = self.cluster_to_sector(cluster);
             let sectors_per_cluster = self.bpb.sectors_per_cluster as u32;
 
@@ -346,7 +396,11 @@ impl<'a, D: BlockDevice> FatFileSystem<'a, D> {
             cluster = self.get_next_cluster(cluster)?;
         }
 
-        Ok(bytes_read)
+        if remaining == 0 {
+            Ok(bytes_read)
+        } else {
+            Err(DriverError::InvalidFat)
+        }
     }
 
     // ==================== FAT CHAIN HELPERS ====================

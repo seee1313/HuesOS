@@ -76,11 +76,13 @@ The first port maps:
 | Q | Immediate safe return to terminal |
 
 The keyboard service now publishes unified three-byte events containing the
-logical key plus an explicit pressed/released flag. Doom forwards those real
-make/break transitions to `DG_GetKey`, so held movement and simultaneous game
-tics no longer depend on guessed release delays. Terminal and Snake ignore
-release events while retaining backward compatibility with the old text event
-format.
+logical key plus an explicit pressed/released flag. It handles Shift,
+CapsLock, and the common Set-1 extended arrow scancodes, encoding arrows as
+non-printable logical key bytes so the terminal line editor ignores them while
+games can opt in. Doom forwards those real make/break transitions to
+`DG_GetKey`, so held movement and simultaneous game tics no longer depend on
+guessed release delays. Terminal and Snake ignore release events while retaining
+backward compatibility with the old text event format.
 
 ## SIMD and stack ABI
 

@@ -13,11 +13,27 @@ use super::{Process, Thread, Vmar};
 /// map an initial stack, create a suspended main thread, and start it with
 /// a bootstrap channel installed as handle 1 in the child.
 pub fn spawn_elf(name: &str, elf: &[u8]) -> crate::Result<(Process, Channel)> {
+    spawn_elf_with_affinity(name, elf, None)
+}
+
+/// Load a static ELF image into a new process with an explicit home CPU.
+pub fn spawn_elf_on_cpu(name: &str, elf: &[u8], cpu: usize) -> crate::Result<(Process, Channel)> {
+    spawn_elf_with_affinity(name, elf, Some(cpu))
+}
+
+fn spawn_elf_with_affinity(
+    name: &str,
+    elf: &[u8],
+    home_cpu: Option<usize>,
+) -> crate::Result<(Process, Channel)> {
     let image = elf::parse_elf(elf).ok_or(crate::ErrorCode::InvalidArgs)?;
     if name == "doom" {
         crate::println!("[doom-launch] ELF parsed, creating process");
     }
     let (process, root_vmar) = Process::create(name)?;
+    if let Some(cpu) = home_cpu {
+        process.set_affinity(cpu)?;
+    }
 
     let mut i = 0;
     while i < image.phnum {
@@ -40,7 +56,7 @@ pub fn spawn_elf(name: &str, elf: &[u8]) -> crate::Result<(Process, Channel)> {
     map_initial_stack(&root_vmar)?;
     let thread = Thread::create(&process, "main")?;
     // iretq enters directly, so synthesize SysV's post-call alignment.
-    let bootstrap = thread.start(image.entry, huesos_abi::USER_STACK_TOP - 40)?;
+    let bootstrap = thread.start(image.entry, initial_user_rsp(huesos_abi::USER_STACK_TOP))?;
     if name == "doom" {
         crate::println!("[doom-launch] thread started");
     }
@@ -57,16 +73,31 @@ pub fn spawn_elf_from_vmo(
     if len == 0 || offset.checked_add(len).is_none() {
         return Err(crate::ErrorCode::InvalidArgs);
     }
-    // Read the header and program header table into a bounded temporary buffer.
-    let mut header_buf = [0u8; 4096];
-    let header_len = (len as usize).min(header_buf.len());
-    let read = vmo.read(offset, &mut header_buf[..header_len])?;
-    if read != header_len {
+    // Read the ELF header and program-header table into a bounded temporary
+    // buffer. Program headers are not required to live in the first page.
+    const HEADER_MAX: usize = 16 * 1024;
+    let mut header_buf = [0u8; HEADER_MAX];
+    let first_read_len = (len as usize).min(4096).min(header_buf.len());
+    let first_read = vmo.read(offset, &mut header_buf[..first_read_len])?;
+    if first_read != first_read_len {
         return Err(crate::ErrorCode::InvalidArgs);
     }
-    let header_slice = &header_buf[..read];
-
-    let image = elf::parse_elf(header_slice).ok_or(crate::ErrorCode::InvalidArgs)?;
+    let image = elf::parse_elf(&header_buf[..first_read]).ok_or(crate::ErrorCode::InvalidArgs)?;
+    let phdr_end = image
+        .phoff
+        .checked_add((image.phnum as u64).saturating_mul(image.phentsize as u64))
+        .ok_or(crate::ErrorCode::InvalidArgs)?;
+    if phdr_end > len || phdr_end as usize > HEADER_MAX {
+        return Err(crate::ErrorCode::InvalidArgs);
+    }
+    let header_len = (phdr_end as usize).max(first_read);
+    if header_len > first_read {
+        let read = vmo.read(offset, &mut header_buf[..header_len])?;
+        if read != header_len {
+            return Err(crate::ErrorCode::InvalidArgs);
+        }
+    }
+    let header_slice = &header_buf[..header_len];
     let (process, root_vmar) = Process::create(name)?;
 
     let mut i = 0;
@@ -81,8 +112,12 @@ pub fn spawn_elf_from_vmo(
 
     map_initial_stack(&root_vmar)?;
     let thread = Thread::create(&process, "main")?;
-    let bootstrap = thread.start(image.entry, huesos_abi::USER_STACK_TOP - 40)?;
+    let bootstrap = thread.start(image.entry, initial_user_rsp(huesos_abi::USER_STACK_TOP))?;
     Ok((process, bootstrap))
+}
+
+fn initial_user_rsp(stack_top: u64) -> u64 {
+    (stack_top & !0xf) - 8
 }
 
 fn map_load_segment(root_vmar: &Vmar, elf: &[u8], ph: ProgramHeader) -> crate::Result<()> {

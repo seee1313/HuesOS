@@ -16,6 +16,10 @@ use libcanvas::{
 const KEY_KEYBOARD: u64 = 1;
 const ATTACH_KEYBOARD_CLIENT: &[u8] = b"keyboard-client";
 const HEARTBEAT_EVERY_SCANCODES: u64 = 256;
+const KEY_ARROW_UP: u8 = 0x80;
+const KEY_ARROW_DOWN: u8 = 0x81;
+const KEY_ARROW_LEFT: u8 = 0x82;
+const KEY_ARROW_RIGHT: u8 = 0x83;
 
 // wait_any keys used by the event loop.
 const WAIT_KEY_BOOTSTRAP: u64 = 0;
@@ -65,8 +69,9 @@ const RESOURCE_TRANSFER_COMPLETE: &[u8] = b"resource:transfer-complete";
 /// the handles so they stay valid for the driver's lifetime. Exits
 /// on the `resource:transfer-complete` sentinel, on `PEER_CLOSED`, or
 /// on any read error. Blocking wait — zero busy-yield, and no
-/// dependence on `WaitSetWait`'s timeout parameter (which the kernel
-/// currently ignores; that is fixed independently in a follow-up).
+/// dependence on `WaitSetWait`'s timeout parameter. The kernel now parks the
+/// task on the watched object queues and uses the shared timeout table rather
+/// than busy-yielding between polls.
 fn consume_manifest_resources(bootstrap: &libcanvas::Channel) {
     // Bounded static storage for received handles. `Handle` holds a
     // raw HandleValue; keeping the Handles in an array without an
@@ -325,14 +330,28 @@ struct KeyEvent {
 
 struct KeyboardDecoder {
     shift: bool,
+    caps_lock: bool,
+    extended: bool,
 }
 
 impl KeyboardDecoder {
     const fn new() -> Self {
-        Self { shift: false }
+        Self {
+            shift: false,
+            caps_lock: false,
+            extended: false,
+        }
     }
 
     fn feed(&mut self, scancode: u8) -> Option<KeyEvent> {
+        if scancode == 0xe0 {
+            self.extended = true;
+            return None;
+        }
+        if self.extended {
+            self.extended = false;
+            return self.feed_extended(scancode);
+        }
         match scancode {
             0x2a | 0x36 => {
                 self.shift = true;
@@ -342,17 +361,37 @@ impl KeyboardDecoder {
                 self.shift = false;
                 return None;
             }
+            0x3a => {
+                self.caps_lock = !self.caps_lock;
+                return None;
+            }
+            0xba => return None,
             _ => {}
         }
         let pressed = scancode & 0x80 == 0;
         let index = (scancode & 0x7f) as usize;
         let table = if self.shift { &SET1_UPPER } else { &SET1_LOWER };
-        let byte = table.get(index).copied().unwrap_or(0);
+        let mut byte = table.get(index).copied().unwrap_or(0);
+        if self.caps_lock && byte.is_ascii_alphabetic() {
+            byte ^= 0x20;
+        }
         if byte == 0 {
             None
         } else {
             Some(KeyEvent { key: byte, pressed })
         }
+    }
+
+    fn feed_extended(&self, scancode: u8) -> Option<KeyEvent> {
+        let pressed = scancode & 0x80 == 0;
+        let key = match scancode & 0x7f {
+            0x48 => KEY_ARROW_UP,
+            0x50 => KEY_ARROW_DOWN,
+            0x4b => KEY_ARROW_LEFT,
+            0x4d => KEY_ARROW_RIGHT,
+            _ => return None,
+        };
+        Some(KeyEvent { key, pressed })
     }
 }
 

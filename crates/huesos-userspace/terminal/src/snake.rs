@@ -60,6 +60,10 @@ const BOMB_FUSE_LARGE: u32 = 16;
 const BOMB_R_SMALL: i16 = 1;
 const BOMB_R_LARGE: i16 = 2;
 const AK_BURST: usize = 5;
+const KEY_ARROW_UP: u8 = 0x80;
+const KEY_ARROW_DOWN: u8 = 0x81;
+const KEY_ARROW_LEFT: u8 = 0x82;
+const KEY_ARROW_RIGHT: u8 = 0x83;
 
 fn step_delay_ticks(score: u32) -> u64 {
     // Mild speed-up: every 5 food, -1 tick/10 ms, never below MIN_STEP_TICKS.
@@ -993,10 +997,10 @@ enum Action {
 fn decode(msg: &[u8]) -> Option<Action> {
     match msg {
         [b'k', 1, b] | [b'c', b] => match *b {
-            b'w' | b'W' | b'k' | b'K' => Some(Action::Dir(Dir::Up)),
-            b's' | b'S' | b'j' | b'J' => Some(Action::Dir(Dir::Down)),
-            b'a' | b'A' | b'h' | b'H' => Some(Action::Dir(Dir::Left)),
-            b'd' | b'D' | b'l' | b'L' => Some(Action::Dir(Dir::Right)),
+            b'w' | b'W' | b'k' | b'K' | KEY_ARROW_UP => Some(Action::Dir(Dir::Up)),
+            b's' | b'S' | b'j' | b'J' | KEY_ARROW_DOWN => Some(Action::Dir(Dir::Down)),
+            b'a' | b'A' | b'h' | b'H' | KEY_ARROW_LEFT => Some(Action::Dir(Dir::Left)),
+            b'd' | b'D' | b'l' | b'L' | KEY_ARROW_RIGHT => Some(Action::Dir(Dir::Right)),
             27 => Some(Action::Esc),
             b'\n' => Some(Action::Enter),
             _ => None,

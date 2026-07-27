@@ -5,18 +5,19 @@ use crate::protocol;
 use libcanvas::{println, Channel, ErrorCode, Vmo};
 
 const RESPONSE_MAX: usize = 1024;
+const MAX_FS_CLIENTS: usize = 4;
 
 /// DriverManager-owned filesystem service.
 pub struct FileSystemService {
     bootfs: Option<BootFs>,
-    client: Option<Channel>,
+    clients: [Option<Channel>; MAX_FS_CLIENTS],
 }
 
 impl FileSystemService {
     pub const fn new() -> Self {
         Self {
             bootfs: None,
-            client: None,
+            clients: [const { None }; MAX_FS_CLIENTS],
         }
     }
 
@@ -39,9 +40,14 @@ impl FileSystemService {
     }
 
     pub fn open_for_registry(&mut self, registry: &Channel) {
+        let Some(slot) = self.clients.iter().position(Option::is_none) else {
+            let _ = registry.write(b"err:filesystem-busy\n");
+            println!("[driver-manager] filesystem client table full");
+            return;
+        };
         match Channel::pair() {
             Ok((client_end, server_end)) => {
-                if let Err(e) = registry.write_handle(
+                if let Err((e, _handle)) = registry.write_handle(
                     protocol::FILESYSTEM_CHANNEL.as_bytes(),
                     client_end.into_handle(),
                 ) {
@@ -51,7 +57,7 @@ impl FileSystemService {
                     );
                     return;
                 }
-                self.client = Some(server_end);
+                self.clients[slot] = Some(server_end);
                 println!("[driver-manager] opened filesystem service channel for client");
             }
             Err(e) => println!(
@@ -63,25 +69,29 @@ impl FileSystemService {
 
     pub fn poll(&mut self) {
         let mut request = [0u8; 128];
-        loop {
-            let Some(client) = self.client.as_ref() else {
-                return;
-            };
-            match client.read_into(&mut request) {
-                Ok(n) => self.handle_request(&request[..n]),
-                Err(ErrorCode::ShouldWait) => return,
-                Err(e) => {
-                    println!(
-                        "[driver-manager] filesystem request read failed: {}",
-                        e.as_str()
-                    );
-                    return;
+        for index in 0..self.clients.len() {
+            while let Some(client) = self.clients[index].as_ref() {
+                let read_result = client.read_into(&mut request);
+                match read_result {
+                    Ok(n) => self.handle_request_for(index, &request[..n]),
+                    Err(ErrorCode::ShouldWait) => break,
+                    Err(ErrorCode::PeerClosed) => {
+                        self.clients[index] = None;
+                        break;
+                    }
+                    Err(e) => {
+                        println!(
+                            "[driver-manager] filesystem request read failed: {}",
+                            e.as_str()
+                        );
+                        break;
+                    }
                 }
             }
         }
     }
 
-    fn handle_request(&mut self, request: &[u8]) {
+    fn handle_request_for(&mut self, client_index: usize, request: &[u8]) {
         let mut response = [0u8; RESPONSE_MAX];
         let len = match self.dispatch(request, &mut response) {
             Ok(n) => n,
@@ -89,7 +99,7 @@ impl FileSystemService {
             Err(ErrorCode::InvalidArgs) => write_bytes(&mut response, b"err:invalid-args\n"),
             Err(_) => write_bytes(&mut response, b"err:fs\n"),
         };
-        if let Some(client) = self.client.as_ref() {
+        if let Some(client) = self.clients[client_index].as_ref() {
             let _ = client.write(&response[..len]);
         }
     }

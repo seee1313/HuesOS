@@ -50,7 +50,11 @@ Pure `no_std` + `core`, host-unit-tested (29 tests):
 
 No `unsafe`, no `unwrap`/`expect`/`panic!` (budget-neutral). The controller
 rejects zero-block, namespace-out-of-range, short-buffer, DMA-window overflow,
-and malformed block-wire requests before touching queues or device memory.
+invalid MDTS values, and malformed block-wire requests before touching queues or
+device memory. The first controller slice uses one reusable bounded DMA data
+buffer plus one PRP-list page for I/O, so repeated reads/writes no longer consume
+the DMA window monotonically; transfers that would require chained PRP-list pages
+are rejected until chaining is implemented.
 
 ## Async Controller (next slice)
 
@@ -108,4 +112,7 @@ LBA size come from Identify Namespace (NSZE/LBAF).
   CQ/SQ (MSI-X vector per queue).
 - Read/Write a namespace via PRP; data integrity round-trip.
 - MSI-X completion delivery through the HuesOS Port; hybrid poll/IRQ behavior.
-- Multiple I/O queues across CPUs; multiple namespaces.
+- Multiple I/O queues across CPUs; multiple namespaces. The host-side
+  `QueueManager` now tracks exact active queue IDs and rejects deletion of a
+  non-existent queue; the remaining on-target work is submitting the matching
+  Create/Delete I/O CQ/SQ admin commands and wiring MSI-X vectors.

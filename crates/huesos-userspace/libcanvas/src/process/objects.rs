@@ -75,6 +75,40 @@ impl Process {
         }
     }
 
+    /// Set the process's single-CPU affinity before its initial thread starts.
+    pub fn set_affinity(&self, cpu: usize) -> crate::Result<()> {
+        let ret = raw::syscall2(Syscall::ProcessSetAffinity, self.0.raw() as u64, cpu as u64);
+        raw::decode(ret)?;
+        Ok(())
+    }
+
+    /// Set the process's CPU affinity mask and home CPU before its initial
+    /// thread starts.
+    pub fn set_affinity_mask(&self, mask: u64, home_cpu: usize) -> crate::Result<()> {
+        let ret = raw::syscall3(
+            Syscall::ProcessSetAffinityMask,
+            self.0.raw() as u64,
+            mask,
+            home_cpu as u64,
+        );
+        raw::decode(ret)?;
+        Ok(())
+    }
+
+    /// Query the process's affinity mask and home CPU.
+    pub fn affinity(&self) -> crate::Result<(u64, usize)> {
+        let mut mask = 0u64;
+        let mut home = 0u64;
+        let ret = raw::syscall3(
+            Syscall::ProcessGetAffinity,
+            self.0.raw() as u64,
+            &mut mask as *mut u64 as u64,
+            &mut home as *mut u64 as u64,
+        );
+        raw::decode(ret)?;
+        Ok((mask, home as usize))
+    }
+
     /// Borrow the underlying process handle.
     pub fn handle(&self) -> &Handle {
         &self.0

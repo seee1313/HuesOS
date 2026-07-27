@@ -94,6 +94,106 @@ impl HandleTable {
         self.add_existing(handle)
     }
 
+    /// Add a handle, run `commit` while the handle-table slot is still locked,
+    /// and roll the insertion back if `commit` fails.
+    ///
+    /// Syscall copy-out paths use this to prevent another thread in the same
+    /// process from observing a freshly-created handle before the creator has
+    /// successfully received its handle value.
+    pub fn add_with_commit<R, E>(
+        &self,
+        handle: Handle,
+        commit: impl FnOnce(HandleValue) -> Result<R, E>,
+    ) -> Result<(HandleValue, R), E> {
+        let koid = handle.koid;
+        note_handle_open(koid);
+        let mut t = self.table.lock();
+        if t.is_empty() {
+            t.push(None); // reserve slot 0
+        }
+        let value = match t
+            .iter()
+            .enumerate()
+            .skip(1)
+            .position(|(_, slot)| slot.is_none())
+        {
+            Some(relative) => (relative + 1) as u32,
+            None => {
+                let index = t.len() as u32;
+                t.push(None);
+                index
+            }
+        };
+        t[value as usize] = Some(handle);
+        match commit(value) {
+            Ok(result) => Ok((value, result)),
+            Err(error) => {
+                t[value as usize] = None;
+                drop(t);
+                note_handle_close(koid);
+                Err(error)
+            }
+        }
+    }
+
+    /// Add two handles and commit their userspace publication atomically with
+    /// respect to this handle table. Both insertions are rolled back if `commit`
+    /// fails.
+    pub fn add_pair_with_commit<R, E>(
+        &self,
+        first: Handle,
+        second: Handle,
+        commit: impl FnOnce(HandleValue, HandleValue) -> Result<R, E>,
+    ) -> Result<((HandleValue, HandleValue), R), E> {
+        let first_koid = first.koid;
+        let second_koid = second.koid;
+        note_handle_open(first_koid);
+        note_handle_open(second_koid);
+        let mut t = self.table.lock();
+        if t.is_empty() {
+            t.push(None);
+        }
+        let first_value = match t
+            .iter()
+            .enumerate()
+            .skip(1)
+            .position(|(_, slot)| slot.is_none())
+        {
+            Some(relative) => (relative + 1) as u32,
+            None => {
+                let index = t.len() as u32;
+                t.push(None);
+                index
+            }
+        };
+        t[first_value as usize] = Some(first);
+        let second_value = match t
+            .iter()
+            .enumerate()
+            .skip(1)
+            .position(|(_, slot)| slot.is_none())
+        {
+            Some(relative) => (relative + 1) as u32,
+            None => {
+                let index = t.len() as u32;
+                t.push(None);
+                index
+            }
+        };
+        t[second_value as usize] = Some(second);
+        match commit(first_value, second_value) {
+            Ok(result) => Ok(((first_value, second_value), result)),
+            Err(error) => {
+                t[first_value as usize] = None;
+                t[second_value as usize] = None;
+                drop(t);
+                note_handle_close(first_koid);
+                note_handle_close(second_koid);
+                Err(error)
+            }
+        }
+    }
+
     /// Insert a handle that is already accounted for in the global handle
     /// count (e.g. received via channel transfer).
     pub fn add_existing(&self, handle: Handle) -> HandleValue {
@@ -140,6 +240,7 @@ impl HandleTable {
     /// Remove handle and drop the handle-table reference (may free object).
     pub fn remove(&self, value: HandleValue) -> Option<Handle> {
         let h = self.remove_keep_alive(value)?;
+        crate::registry::wake_object_waiters(h.koid);
         note_handle_close(h.koid);
         Some(h)
     }
@@ -184,11 +285,105 @@ impl HandleTable {
         for &value in values {
             let handle = t[value as usize].take();
             match handle {
-                Some(handle) => removed.push(handle),
+                Some(handle) => {
+                    crate::registry::wake_object_waiters(handle.koid);
+                    removed.push(handle);
+                }
                 None => return Err(HandleTableError::Missing),
             }
         }
         Ok(removed)
+    }
+
+    /// Insert multiple already-accounted handles, publish their handle values
+    /// via `commit` while the table is locked, and close them on commit failure.
+    ///
+    /// This is used by channel receive paths: once a message is dequeued, a
+    /// failed userspace copy-out must not leave newly-received handles visible
+    /// to sibling threads.
+    pub fn add_existing_many_with_commit<R, E>(
+        &self,
+        handles: &[Handle],
+        out_values: &mut [HandleValue],
+        commit: impl FnOnce(&[HandleValue]) -> Result<R, E>,
+    ) -> Result<R, E> {
+        let count = handles.len();
+        let mut t = self.table.lock();
+        if t.is_empty() {
+            t.push(None);
+        }
+        for (inserted, &handle) in handles.iter().enumerate() {
+            let value = match t
+                .iter()
+                .enumerate()
+                .skip(1)
+                .position(|(_, slot)| slot.is_none())
+            {
+                Some(relative) => (relative + 1) as u32,
+                None => {
+                    let index = t.len() as u32;
+                    t.push(None);
+                    index
+                }
+            };
+            t[value as usize] = Some(handle);
+            out_values[inserted] = value;
+        }
+        let values = &out_values[..count];
+        match commit(values) {
+            Ok(result) => Ok(result),
+            Err(error) => {
+                let mut koids = [Koid::INVALID; 64];
+                let mut koid_count = 0usize;
+                for &value in values {
+                    if let Some(handle) = t[value as usize].take() {
+                        if koid_count < koids.len() {
+                            koids[koid_count] = handle.koid;
+                            koid_count += 1;
+                        }
+                    }
+                }
+                drop(t);
+                for koid in koids.iter().copied().take(koid_count) {
+                    note_handle_close(koid);
+                }
+                Err(error)
+            }
+        }
+    }
+
+    /// Remove a distinct batch of handles into caller-provided storage while
+    /// preserving in-flight handle-count ownership. Validation is complete
+    /// before any slot is changed.
+    pub fn remove_many_keep_alive_into(
+        &self,
+        values: &[HandleValue],
+        out: &mut [Handle],
+    ) -> Result<usize, HandleTableError> {
+        if values.len() > out.len() {
+            return Err(HandleTableError::OutOfMemory);
+        }
+        let mut t = self.table.lock();
+        for (index, &value) in values.iter().enumerate() {
+            if values[..index].contains(&value) {
+                return Err(HandleTableError::Duplicate);
+            }
+            if value == INVALID_HANDLE
+                || t.get(value as usize)
+                    .and_then(|slot| slot.as_ref())
+                    .is_none()
+            {
+                return Err(HandleTableError::Missing);
+            }
+        }
+        for (index, &value) in values.iter().enumerate() {
+            let Some(handle) = t[value as usize].take() else {
+                return Err(HandleTableError::Missing);
+            };
+            crate::registry::wake_object_waiters(handle.koid);
+            out[index] = handle;
+        }
+        Ok(values.len())
     }
 
     /// Restore a handle to an exact slot after a failed transactional move.
@@ -216,6 +411,7 @@ impl HandleTable {
         let mut t = self.table.lock();
         for slot in t.iter_mut() {
             if let Some(h) = slot.take() {
+                crate::registry::wake_object_waiters(h.koid);
                 note_handle_close(h.koid);
             }
         }

@@ -20,6 +20,10 @@ pub extern "C" fn _start() -> ! {
         b"opcode" => trigger_invalid_opcode(),
         b"gpf" => trigger_general_protection(),
         b"divide" => trigger_divide_error(),
+        b"cpu" => match libcanvas::system::current_cpu() {
+            Ok(cpu) => libcanvas::process::exit(cpu as i64),
+            Err(_) => libcanvas::process::exit(94),
+        },
         b"wait" => {
             // Give init a chance to park in ProcessWait. This is deliberately
             // cooperative: the probe exercises the wake path without relying

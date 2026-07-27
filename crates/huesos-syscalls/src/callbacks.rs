@@ -17,6 +17,10 @@ pub type ShutdownFn = fn() -> Result<(), ErrorCode>;
 pub(crate) static DEBUG_WRITE_FN: Mutex<Option<DebugWriteFn>> = Mutex::new(None);
 /// Global monotonic-clock callback.
 pub(crate) static CLOCK_FN: Mutex<Option<fn() -> u64>> = Mutex::new(None);
+/// Global online-CPU mask callback.
+pub(crate) static CPU_MASK_FN: Mutex<Option<fn() -> u64>> = Mutex::new(None);
+/// Global current-CPU callback.
+pub(crate) static CURRENT_CPU_FN: Mutex<Option<fn() -> usize>> = Mutex::new(None);
 /// Global privileged shutdown callback.
 pub(crate) static SHUTDOWN_FN: Mutex<Option<ShutdownFn>> = Mutex::new(None);
 
@@ -60,6 +64,16 @@ pub fn set_debug_write_fn(f: DebugWriteFn) {
 /// Set the monotonic clock source. Called once by kernel init.
 pub fn set_clock_fn(f: fn() -> u64) {
     *CLOCK_FN.lock() = Some(f);
+}
+
+/// Set the online CPU mask callback. Called once by kernel init.
+pub fn set_cpu_mask_fn(f: fn() -> u64) {
+    *CPU_MASK_FN.lock() = Some(f);
+}
+
+/// Set the current dense CPU index callback. Called once by kernel init.
+pub fn set_current_cpu_fn(f: fn() -> usize) {
+    *CURRENT_CPU_FN.lock() = Some(f);
 }
 
 /// Set the privileged orderly-shutdown callback. Called once by kernel init.

@@ -83,9 +83,7 @@ pub fn heap_init() -> Result<(), huesos_arch::paging::KernelPageError> {
 pub fn object_init() {
     huesos_object::init();
     huesos_object::set_phys_to_virt(|p| huesos_arch::paging::phys_to_virt(p).as_u64());
-    huesos_object::set_cpu_id_callback(|| {
-        (unsafe { huesos_arch::cpu_local::current_lapic_id() } as usize)
-    });
+    huesos_object::set_cpu_id_callback(|| unsafe { huesos_arch::cpu_local::current_cpu_index() });
 }
 
 pub fn framebuffer_init(fb: Option<crate::FramebufferInfo>) {
@@ -115,6 +113,8 @@ pub fn syscall_init() {
     huesos_syscalls::set_exit_fn(crate::scheduler::exit_current_task);
     huesos_syscalls::set_debug_write_fn(debug_write);
     huesos_syscalls::set_clock_fn(crate::scheduler::global_ticks);
+    huesos_syscalls::set_cpu_mask_fn(crate::scheduler::online_cpu_mask);
+    huesos_syscalls::set_current_cpu_fn(crate::scheduler::current_cpu_index);
     huesos_syscalls::set_shutdown_fn(crate::shutdown::request);
     huesos_syscalls::set_process_create_fn(crate::process::create_suspended_process);
     // Gate the Resource / ProcessMarkCritical syscalls on the root

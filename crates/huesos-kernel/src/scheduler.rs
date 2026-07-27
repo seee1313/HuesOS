@@ -25,7 +25,7 @@ use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::ops::{Deref, DerefMut};
-use core::sync::atomic::Ordering;
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use huesos_arch::{LockRank, RankedIrqSafeTicketLock};
 use huesos_lifecycle::TaskGraveyard;
 use huesos_object::{KernelObject, Process};
@@ -69,9 +69,139 @@ const fn next_task_generation(previous: u32) -> Option<u32> {
     }
 }
 
-/// Bitmask of CPUs that have finished scheduler init and may receive tasks.
-/// Bit N set => CPU with LAPIC-id N is online for load-balancing.
+/// Bit N set => dense CPU index N is online for load-balancing/IPI routing.
+/// Firmware LAPIC IDs are intentionally not used as bit positions because they
+/// can be sparse or greater than `MAX_CPUS`; `lapic_id_for_cpu_index` resolves
+/// the APIC ID at the final IPI boundary.
 static ONLINE_CPUS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+const RUNQUEUE_TOKEN_FREE: usize = usize::MAX;
+const TOKEN_MAILBOX_EMPTY: usize = 0;
+const TOKEN_MAILBOX_FILLING: usize = 1;
+const TOKEN_MAILBOX_PENDING: usize = 2;
+const TOKEN_MAILBOX_GRANTED: usize = 3;
+const TOKEN_WAIT_ITERS: usize = 100_000;
+
+static RUNQUEUE_TOKENS: [AtomicUsize; MAX_CPUS] =
+    [const { AtomicUsize::new(RUNQUEUE_TOKEN_FREE) }; MAX_CPUS];
+static TOKEN_MAILBOX_STATE: [AtomicUsize; MAX_CPUS] =
+    [const { AtomicUsize::new(TOKEN_MAILBOX_EMPTY) }; MAX_CPUS];
+static TOKEN_MAILBOX_REQUESTER: [AtomicUsize; MAX_CPUS] = [const { AtomicUsize::new(0) }; MAX_CPUS];
+static TOKEN_MAILBOX_REQUEST_ID: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
+static NEXT_TOKEN_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
+
+struct RunqueueTokenGuard {
+    cpu: usize,
+    remote: bool,
+    request_id: u64,
+}
+
+impl Drop for RunqueueTokenGuard {
+    fn drop(&mut self) {
+        if self.remote {
+            RUNQUEUE_TOKENS[self.cpu].store(RUNQUEUE_TOKEN_FREE, Ordering::Release);
+            if TOKEN_MAILBOX_REQUEST_ID[self.cpu].load(Ordering::Acquire) == self.request_id {
+                TOKEN_MAILBOX_STATE[self.cpu].store(TOKEN_MAILBOX_EMPTY, Ordering::Release);
+            }
+        }
+    }
+}
+
+fn process_runqueue_token_mailbox(cpu: usize) {
+    if cpu >= MAX_CPUS || TOKEN_MAILBOX_STATE[cpu].load(Ordering::Acquire) != TOKEN_MAILBOX_PENDING
+    {
+        return;
+    }
+    let requester = TOKEN_MAILBOX_REQUESTER[cpu].load(Ordering::Acquire);
+    if requester >= MAX_CPUS {
+        TOKEN_MAILBOX_STATE[cpu].store(TOKEN_MAILBOX_EMPTY, Ordering::Release);
+        return;
+    }
+    if RUNQUEUE_TOKENS[cpu]
+        .compare_exchange(
+            RUNQUEUE_TOKEN_FREE,
+            requester,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        )
+        .is_ok()
+    {
+        TOKEN_MAILBOX_STATE[cpu].store(TOKEN_MAILBOX_GRANTED, Ordering::Release);
+    }
+}
+
+fn acquire_runqueue_token(cpu: usize) -> Option<RunqueueTokenGuard> {
+    let current = cpu_id();
+    if cpu >= MAX_CPUS {
+        return None;
+    }
+    if cpu == current {
+        return Some(RunqueueTokenGuard {
+            cpu,
+            remote: false,
+            request_id: 0,
+        });
+    }
+    if !is_cpu_online(cpu) {
+        return None;
+    }
+    let request_id = NEXT_TOKEN_REQUEST_ID.fetch_add(1, Ordering::Relaxed).max(1);
+    for _ in 0..TOKEN_WAIT_ITERS {
+        if TOKEN_MAILBOX_STATE[cpu]
+            .compare_exchange(
+                TOKEN_MAILBOX_EMPTY,
+                TOKEN_MAILBOX_FILLING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+        {
+            TOKEN_MAILBOX_REQUESTER[cpu].store(current, Ordering::Release);
+            TOKEN_MAILBOX_REQUEST_ID[cpu].store(request_id, Ordering::Release);
+            TOKEN_MAILBOX_STATE[cpu].store(TOKEN_MAILBOX_PENDING, Ordering::Release);
+            if let Some(apic_id) = lapic_id_for_cpu_index(cpu) {
+                huesos_arch::lapic::ipi_reschedule(apic_id);
+            }
+            break;
+        }
+        core::hint::spin_loop();
+    }
+    for _ in 0..TOKEN_WAIT_ITERS {
+        if TOKEN_MAILBOX_REQUEST_ID[cpu].load(Ordering::Acquire) == request_id
+            && TOKEN_MAILBOX_STATE[cpu].load(Ordering::Acquire) == TOKEN_MAILBOX_GRANTED
+        {
+            return Some(RunqueueTokenGuard {
+                cpu,
+                remote: true,
+                request_id,
+            });
+        }
+        core::hint::spin_loop();
+    }
+    if TOKEN_MAILBOX_REQUEST_ID[cpu].load(Ordering::Acquire) == request_id
+        && TOKEN_MAILBOX_STATE[cpu]
+            .compare_exchange(
+                TOKEN_MAILBOX_PENDING,
+                TOKEN_MAILBOX_EMPTY,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    {
+        return None;
+    }
+    if TOKEN_MAILBOX_REQUEST_ID[cpu].load(Ordering::Acquire) == request_id
+        && TOKEN_MAILBOX_STATE[cpu].load(Ordering::Acquire) == TOKEN_MAILBOX_GRANTED
+    {
+        return Some(RunqueueTokenGuard {
+            cpu,
+            remote: true,
+            request_id,
+        });
+    }
+    None
+}
+
 /// Hardware-timer-driven monotonic clock. Only CPU 0 advances it, so SMP does
 /// not make time run faster. Cooperative yields never affect this clock.
 static MONOTONIC_TICKS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
@@ -89,7 +219,22 @@ pub fn is_cpu_online(cpu: usize) -> bool {
     if cpu >= 64 {
         return false;
     }
-    (ONLINE_CPUS.load(Ordering::SeqCst) & (1u64 << cpu)) != 0
+    (online_cpu_mask() & (1u64 << cpu)) != 0
+}
+
+/// Dense CPU mask for online scheduler instances.
+pub fn online_cpu_mask() -> u64 {
+    ONLINE_CPUS.load(Ordering::SeqCst)
+}
+
+/// Number of online CPUs.
+pub fn online_cpu_count() -> usize {
+    online_cpu_mask().count_ones() as usize
+}
+
+/// Dense CPU index of the caller.
+pub fn current_cpu_index() -> usize {
+    cpu_id()
 }
 
 /// Number of online CPUs other than the caller, used by global TLB shootdowns.
@@ -222,13 +367,6 @@ impl Scheduler {
             .is_some_and(|slot| slot.generation == task_generation(id) && slot.id == id)
     }
 
-    fn live_task_count(&self) -> usize {
-        self.tasks
-            .iter()
-            .filter(|slot| !matches!(&slot.kind, TaskKind::Reaped))
-            .count()
-    }
-
     fn apply_task_environment(&self, idx: usize) {
         let task = &self.tasks[idx];
         let stack_top = task.kernel_stack_top();
@@ -349,9 +487,17 @@ impl Scheduler {
     }
 }
 
-/// Return the LAPIC ID of the current CPU via GS_BASE, clamped to MAX_CPUS.
+/// Return the dense CPU index of the current CPU via GS_BASE.
+///
+/// LAPIC IDs are firmware-assigned and may be sparse or greater than 63 on real
+/// machines. Scheduler arrays, task IDs, and current-process state use this
+/// dense index instead; LAPIC IDs are consulted only at the IPI boundary.
 fn cpu_id() -> usize {
-    (unsafe { huesos_arch::cpu_local::current_lapic_id() } as usize).min(MAX_CPUS - 1)
+    (unsafe { huesos_arch::cpu_local::current_cpu_index() }).min(MAX_CPUS - 1)
+}
+
+fn lapic_id_for_cpu_index(cpu: usize) -> Option<u8> {
+    huesos_arch::cpu_local::lapic_id_for_index(cpu).and_then(|id| u8::try_from(id).ok())
 }
 
 /// Register the current CPU's scheduler pointer in its `CpuLocal`.
@@ -380,6 +526,7 @@ pub fn init() {
     huesos_arch::timer_callback::set_timer_callback(&|| {
         huesos_arch::interrupts::disable();
         let cpu = cpu_id();
+        process_runqueue_token_mailbox(cpu);
         if cpu == 0 {
             MONOTONIC_TICKS.fetch_add(1, Ordering::SeqCst);
         }
@@ -406,6 +553,7 @@ pub fn init() {
 pub fn yield_now() {
     huesos_arch::interrupts::disable();
     let cpu = cpu_id();
+    process_runqueue_token_mailbox(cpu);
     let mut guard = PER_CPU_SCHEDULERS[cpu].lock();
     let switch_context = guard.tick();
     drop(guard); // Release the lock before performing context switch!
@@ -424,6 +572,7 @@ pub fn yield_now() {
 pub fn park_current() {
     huesos_arch::interrupts::disable();
     let cpu = cpu_id();
+    process_runqueue_token_mailbox(cpu);
     {
         let mut guard = PER_CPU_SCHEDULERS[cpu].lock();
         let idx = guard.current;
@@ -514,6 +663,9 @@ pub fn wake_task(task_id: u64) {
         return;
     }
     let idx = task_index(task_id);
+    let Some(_token) = acquire_runqueue_token(cpu) else {
+        return;
+    };
     let mut guard = PER_CPU_SCHEDULERS[cpu].lock();
     if !guard.task_matches(task_id) {
         return;
@@ -561,7 +713,9 @@ pub fn wake_task(task_id: u64) {
     }
     drop(guard);
     if cpu != cpu_id() {
-        huesos_arch::lapic::ipi_reschedule(cpu as u8);
+        if let Some(apic_id) = lapic_id_for_cpu_index(cpu) {
+            huesos_arch::lapic::ipi_reschedule(apic_id);
+        }
     }
 }
 
@@ -577,33 +731,16 @@ pub fn global_ticks() -> u64 {
     MONOTONIC_TICKS.load(Ordering::SeqCst)
 }
 
-/// Find the best CPU to spawn a task on (online CPU with fewest tasks).
-fn find_best_cpu() -> usize {
-    let mut best_cpu = cpu_id();
-    let mut min_tasks = usize::MAX;
-    let mask = ONLINE_CPUS.load(Ordering::SeqCst);
-
-    for (i, scheduler) in PER_CPU_SCHEDULERS.iter().enumerate() {
-        if (mask & (1u64 << i)) == 0 {
-            continue;
-        }
-        let guard = scheduler.lock();
-        let count = guard.live_task_count();
-        // Prefer the least-loaded online CPU that already has at least an idle task.
-        if count >= 1 && count < min_tasks {
-            min_tasks = count;
-            best_cpu = i;
-        }
-    }
-    best_cpu
-}
-
 /// Set the scheduling policy for a task by its ID.
 pub fn set_sched_policy(task_id: u64, policy: SchedPolicy) {
     huesos_arch::interrupts::disable();
     let cpu = task_cpu(task_id);
     let idx = task_index(task_id);
     if cpu < MAX_CPUS {
+        let Some(_token) = acquire_runqueue_token(cpu) else {
+            huesos_arch::interrupts::enable();
+            return;
+        };
         let mut guard = PER_CPU_SCHEDULERS[cpu].lock();
 
         if !guard.task_matches(task_id) {
@@ -631,15 +768,11 @@ pub fn set_sched_policy(task_id: u64, policy: SchedPolicy) {
 /// Spawn a new kernel thread.
 pub fn spawn_kernel_thread(name: &[u8; 32], entry: extern "C" fn() -> !) -> u64 {
     huesos_arch::interrupts::disable();
-    let cpu = find_best_cpu();
+    let cpu = cpu_id();
     let mut guard = PER_CPU_SCHEDULERS[cpu].lock();
     let id = guard.add_task(cpu, |id| Task::new_kernel(id, *name, entry));
     drop(guard);
     huesos_arch::interrupts::enable();
-
-    if cpu != cpu_id() {
-        huesos_arch::lapic::ipi_reschedule(cpu as u8);
-    }
     id
 }
 
@@ -652,12 +785,29 @@ pub fn spawn_user_thread(
     user_rsp: u64,
     cr3: u64,
 ) -> u64 {
+    spawn_user_thread_on_cpu(name, process, entry_point, user_rsp, cr3, cpu_id())
+        .unwrap_or(u64::MAX)
+}
+
+/// Spawn a userspace task on an explicit dense CPU index. This is the only
+/// cross-CPU task-placement path: no global load average or implicit balancing
+/// is consulted. Remote runqueue mutation is guarded by the runqueue token.
+pub fn spawn_user_thread_on_cpu(
+    name: &[u8; 32],
+    process: Arc<Process>,
+    entry_point: u64,
+    user_rsp: u64,
+    cr3: u64,
+    cpu: usize,
+) -> Option<u64> {
+    if cpu >= MAX_CPUS || !is_cpu_online(cpu) {
+        return None;
+    }
     huesos_arch::interrupts::disable();
-    // Prefer the caller's CPU for userspace launches. Early boot services
-    // spawned by init must not be stranded on an AP that is still settling
-    // under QEMU TCG (missing ready handshake). Kernel threads may still
-    // use find_best_cpu for load balance.
-    let cpu = cpu_id();
+    let Some(_token) = acquire_runqueue_token(cpu) else {
+        huesos_arch::interrupts::enable();
+        return None;
+    };
     // Drive the policy transition before publishing the first runnable task.
     let _ = process.start();
     let mut guard = PER_CPU_SCHEDULERS[cpu].lock();
@@ -672,15 +822,17 @@ pub fn spawn_user_thread(
     });
     drop(guard);
     // Publish startup metadata only after releasing the rank-60 scheduler.
-    // Interrupts remain disabled, so this CPU cannot run the new local task
-    // before its rank-40 process record is visible.
+    // Interrupts remain disabled, so this CPU cannot run the new task before
+    // its rank-40 process record is visible.
     crate::process::queue_user_entry(id, entry_point, user_rsp);
     huesos_arch::interrupts::enable();
 
     if cpu != cpu_id() {
-        huesos_arch::lapic::ipi_reschedule(cpu as u8);
+        if let Some(apic_id) = lapic_id_for_cpu_index(cpu) {
+            huesos_arch::lapic::ipi_reschedule(apic_id);
+        }
     }
-    id
+    Some(id)
 }
 
 /// Mark the currently running task as finished (won't be scheduled again)
@@ -790,7 +942,9 @@ pub fn terminate_current_process(code: i64) -> ! {
     REAP_PENDING.store(true, Ordering::Release);
     for cpu in 0..MAX_CPUS {
         if cpu != current_cpu && is_cpu_online(cpu) {
-            huesos_arch::lapic::ipi_reschedule(cpu as u8);
+            if let Some(apic_id) = lapic_id_for_cpu_index(cpu) {
+                huesos_arch::lapic::ipi_reschedule(apic_id);
+            }
         }
     }
 

@@ -2,7 +2,7 @@
 //!
 //! NVMe supports multiple I/O queue pairs for parallel I/O across CPUs.
 //! This module provides [`QueueSelector`] for round-robin queue selection
-//! and [`QueueManager`] for queue lifecycle (create, delete, resize).
+//! and [`QueueManager`] for queue lifecycle tracking.
 //!
 //! ## Queue architecture
 //!
@@ -17,24 +17,29 @@
 //!   └── I/O commands: Read, Write, Flush for namespace 1
 //!
 //! ...
-//!
-//! I/O Queue N (queue N) ─── MSI-X vector N
-//!   └── I/O commands: Read, Write, Flush for namespace 1
 //! ```
 //!
 //! ## Queue selection
 //!
-//! [`QueueSelector`] distributes I/O across queues using round-robin. For
-//! SMP systems, each CPU can have its own queue to avoid lock contention.
+//! [`QueueSelector`] distributes I/O across explicitly-created queues using
+//! round-robin. It does not create queues itself.
 //!
 //! ## Future work
 //!
-//! - Per-CPU queue assignment (CPU affinity)
-//! - Queue resizing based on workload
-//! - Priority queues for latency-sensitive I/O
-//! - Multi-namespace queue mapping
+//! - Submit actual Create/Delete I/O CQ/SQ admin commands.
+//! - Per-CPU queue assignment (CPU affinity).
+//! - Queue resizing based on workload.
+//! - Priority queues for latency-sensitive I/O.
+//! - Multi-namespace queue mapping.
 
 use core::sync::atomic::{AtomicU16, Ordering};
+
+/// Maximum queue IDs the host-testable lifecycle tracker stores.
+///
+/// NVMe controllers may advertise more queues; the current driver slice uses a
+/// small fixed bound because it has no allocator in this policy object and the
+/// integrated controller currently creates queue 1 only.
+pub const MAX_TRACKED_IO_QUEUES: usize = 64;
 
 /// Round-robin queue selector for distributing I/O across queues.
 ///
@@ -66,15 +71,18 @@ impl QueueSelector {
     }
 }
 
-/// Queue lifecycle management: create, delete, resize.
+/// Queue lifecycle management state.
 ///
-/// This is a placeholder for future implementation. The actual queue
-/// management requires admin command submission (Create I/O CQ/SQ) and
-/// MSI-X vector assignment, which is controller-specific.
+/// This host-testable object tracks which queue IDs are active and prevents the
+/// earlier bug where `delete_queue(id)` ignored `id` and simply decremented the
+/// active count. The privileged controller still owns the actual admin command
+/// submission; this type models the bookkeeping that code will use.
 pub struct QueueManager {
+    active: [bool; MAX_TRACKED_IO_QUEUES + 1],
     /// Number of currently active I/O queues.
     active_queues: u16,
-    /// Maximum queues supported by the controller (CAP.MQES).
+    /// Maximum queue ID this manager may allocate, capped to
+    /// [`MAX_TRACKED_IO_QUEUES`].
     max_queues: u16,
 }
 
@@ -82,8 +90,9 @@ impl QueueManager {
     /// Create a queue manager with the given maximum queue count.
     pub fn new(max_queues: u16) -> Self {
         Self {
+            active: [false; MAX_TRACKED_IO_QUEUES + 1],
             active_queues: 0,
-            max_queues,
+            max_queues: max_queues.min(MAX_TRACKED_IO_QUEUES as u16),
         }
     }
 
@@ -92,37 +101,43 @@ impl QueueManager {
         self.active_queues
     }
 
-    /// Maximum queues supported by the controller.
+    /// Maximum queues tracked by this manager.
     pub fn max_queues(&self) -> u16 {
         self.max_queues
     }
 
-    /// Create a new I/O queue pair. Returns queue ID (1-indexed) or None if
-    /// at capacity.
-    ///
-    /// # Future work
-    ///
-    /// This should submit Create I/O CQ/SQ admin commands and assign MSI-X
-    /// vectors. Currently a stub that tracks queue count.
+    /// True if `queue_id` is currently active.
+    pub fn is_active(&self, queue_id: u16) -> bool {
+        let index = queue_id as usize;
+        index < self.active.len() && self.active[index]
+    }
+
+    /// Create a new I/O queue pair. Returns the allocated queue ID (1-indexed)
+    /// or `None` if at capacity.
     pub fn create_queue(&mut self) -> Option<u16> {
         if self.active_queues >= self.max_queues {
             return None;
         }
-        self.active_queues += 1;
-        Some(self.active_queues)
+        let mut queue_id = 1u16;
+        while queue_id <= self.max_queues {
+            if !self.active[queue_id as usize] {
+                self.active[queue_id as usize] = true;
+                self.active_queues += 1;
+                return Some(queue_id);
+            }
+            queue_id += 1;
+        }
+        None
     }
 
-    /// Delete an I/O queue pair. Returns true if the queue was deleted.
-    ///
-    /// # Future work
-    ///
-    /// This should submit Delete I/O CQ/SQ admin commands and release MSI-X
-    /// vectors. Currently a stub that tracks queue count.
-    pub fn delete_queue(&mut self, _queue_id: u16) -> bool {
-        if self.active_queues == 0 {
+    /// Delete an I/O queue pair. Returns true only if that exact queue existed.
+    pub fn delete_queue(&mut self, queue_id: u16) -> bool {
+        let index = queue_id as usize;
+        if queue_id == 0 || index >= self.active.len() || !self.active[index] {
             return false;
         }
-        self.active_queues -= 1;
+        self.active[index] = false;
+        self.active_queues = self.active_queues.saturating_sub(1);
         true
     }
 }
@@ -147,8 +162,12 @@ mod tests {
         assert_eq!(manager.active_queues(), 0);
         assert_eq!(manager.create_queue(), Some(1));
         assert_eq!(manager.create_queue(), Some(2));
+        assert!(manager.is_active(1));
+        assert!(manager.is_active(2));
         assert_eq!(manager.active_queues(), 2);
         assert!(manager.delete_queue(1));
+        assert!(!manager.is_active(1));
+        assert!(manager.is_active(2));
         assert_eq!(manager.active_queues(), 1);
     }
 
@@ -158,5 +177,25 @@ mod tests {
         assert_eq!(manager.create_queue(), Some(1));
         assert_eq!(manager.create_queue(), Some(2));
         assert_eq!(manager.create_queue(), None); // at capacity
+    }
+
+    #[test]
+    fn delete_queue_requires_exact_active_id() {
+        let mut manager = QueueManager::new(4);
+        assert_eq!(manager.create_queue(), Some(1));
+        assert_eq!(manager.create_queue(), Some(2));
+        assert!(!manager.delete_queue(4));
+        assert!(!manager.delete_queue(0));
+        assert_eq!(manager.active_queues(), 2);
+        assert!(manager.delete_queue(2));
+        assert_eq!(manager.active_queues(), 1);
+        assert!(!manager.delete_queue(2));
+        assert_eq!(manager.create_queue(), Some(2));
+    }
+
+    #[test]
+    fn max_queue_count_is_capped_to_static_storage() {
+        let manager = QueueManager::new(u16::MAX);
+        assert_eq!(manager.max_queues(), MAX_TRACKED_IO_QUEUES as u16);
     }
 }

@@ -30,7 +30,7 @@ pub mod wait;
 pub use acpi_broker::{AcpiBroker, PciFunctionGrant, SystemIoGrant};
 pub use channel::{
     Channel, ChannelCreateError, ChannelMessage, ChannelRecvError, ChannelSendError,
-    ChannelSendFailure,
+    ChannelSendFailure, CHANNEL_INLINE_BYTES, CHANNEL_INLINE_HANDLES,
 };
 pub use handle::{Handle, HandleTable, HandleTableError, HandleValue, Rights, INVALID_HANDLE};
 pub use interrupt::{Interrupt, InterruptBinding};
@@ -371,17 +371,13 @@ mod tests {
             Ok(pair) => pair,
             Err(_) => return,
         };
-        let _ = a.send(ChannelMessage {
-            seq: 0,
-            data: alloc::vec![1, 2, 3],
-            handles: Vec::new(),
-        });
+        let _ = a.send(ChannelMessage::new(alloc::vec![1, 2, 3], Vec::new()));
         // The regression this guards against: sys_channel_create used to
         // create two disconnected Channel::new() objects instead of a real
         // pair, so a message sent on `a` was never visible on `b`.
         assert!(a.recv().is_none(), "a must not receive its own message");
         let msg = b.recv().expect("b must receive what a sent");
-        assert_eq!(msg.data, alloc::vec![1, 2, 3]);
+        assert_eq!(msg.data(), &[1, 2, 3]);
     }
     #[test]
     fn channel_queue_is_bounded_and_returns_failed_message() {
@@ -390,24 +386,16 @@ mod tests {
             Err(_) => return,
         };
         for _ in 0..channel::MAX_CHANNEL_QUEUE_MESSAGES {
-            let result = a.send(ChannelMessage {
-                seq: 0,
-                data: Vec::new(),
-                handles: Vec::new(),
-            });
+            let result = a.send(ChannelMessage::new(Vec::new(), Vec::new()));
             assert!(result.is_ok());
         }
-        let failed = a.send(ChannelMessage {
-            seq: 0,
-            data: Vec::new(),
-            handles: Vec::new(),
-        });
+        let failed = a.send(ChannelMessage::new(Vec::new(), Vec::new()));
         assert!(failed.is_err());
         if let Err(error) = failed {
             let (message, reason) = error.into_parts();
             assert_eq!(reason, ChannelSendFailure::QuotaExceeded);
-            assert!(message.data.is_empty());
-            assert!(message.handles.is_empty());
+            assert_eq!(message.data_len(), 0);
+            assert_eq!(message.handle_count(), 0);
         }
     }
 
@@ -492,11 +480,7 @@ mod tests {
         };
         drop(a);
         assert!(b.peer_closed());
-        let send = b.send(ChannelMessage {
-            seq: 0,
-            data: Vec::new(),
-            handles: Vec::new(),
-        });
+        let send = b.send(ChannelMessage::new(Vec::new(), Vec::new()));
         assert!(send.is_err());
         if let Err(error) = send {
             let (_message, reason) = error.into_parts();

@@ -118,6 +118,18 @@ pub(crate) fn zeroed_buffer(len: usize) -> Result<Vec<u8>, ErrorCode> {
     Ok(bytes)
 }
 
+/// Copy bytes from userspace into a caller-provided kernel buffer.
+pub(crate) fn copy_from_user_into(src: *const u8, out: &mut [u8]) -> Result<(), ErrorCode> {
+    with_user_memory_lock(|| {
+        validate_range(src as u64, out.len(), false)?;
+        if !out.is_empty() {
+            let _access = huesos_arch::cpu::UserAccessGuard::new();
+            unsafe { user_access::recoverable_copy_from_user(out.as_mut_ptr(), src, out.len())? };
+        }
+        Ok(())
+    })
+}
+
 /// Copy bytes from userspace into a kernel-owned vector.
 ///
 /// This is the main bulk-copy path for VMO reads and Channel messages

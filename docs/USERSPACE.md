@@ -193,6 +193,11 @@ current task until a message arrives, or `read_into_timeout` for a scheduler-
 tick deadline. Ports likewise provide `read`, `read_blocking`, and
 `read_timeout`; blocking waits do not require a userspace yield-spin loop.
 
+The kernel stores small channel messages inline: payloads up to 64 bytes and up
+to two transferred handles avoid per-message heap allocation in the queued
+`ChannelMessage`. Larger messages keep the existing bounded heap-backed path and
+the same ABI limits.
+
 ### Graphics (the framebuffer)
 
 You never get direct access to video memory. Instead:

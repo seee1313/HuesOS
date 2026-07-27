@@ -460,24 +460,28 @@ impl DriverManager {
         let Some(archive) = self.acpi_tables.take() else {
             return;
         };
-        if bootstrap
-            .write_handle(
-                protocol::ACPI_MANAGER_TABLES.as_bytes(),
-                archive.into_handle(),
-            )
-            .is_err()
-        {
-            println!("[driver-manager] failed to transfer ACPI table archive");
+        if let Err((error, handle)) = bootstrap.write_handle(
+            protocol::ACPI_MANAGER_TABLES.as_bytes(),
+            archive.into_handle(),
+        ) {
+            println!(
+                "[driver-manager] failed to transfer ACPI table archive: {}",
+                error.as_str()
+            );
+            self.acpi_tables = Some(Vmo::from_handle(handle));
             return;
         }
         let Some(broker) = self.acpi_broker.take() else {
             return;
         };
-        if bootstrap
-            .write_handle(protocol::ACPI_MANAGER_BROKER.as_bytes(), broker)
-            .is_err()
+        if let Err((error, broker)) =
+            bootstrap.write_handle(protocol::ACPI_MANAGER_BROKER.as_bytes(), broker)
         {
-            println!("[driver-manager] failed to transfer ACPI broker capability");
+            println!(
+                "[driver-manager] failed to transfer ACPI broker capability: {}",
+                error.as_str()
+            );
+            self.acpi_broker = Some(broker);
             return;
         }
         println!("[driver-manager] launched isolated Ring-3 ACPI manager");
@@ -555,7 +559,7 @@ impl DriverManager {
                 let label = &entry.label[..entry.label_len];
                 match child_bootstrap.write_handle(label, handle) {
                     Ok(()) => sent += 1,
-                    Err(e) => println!(
+                    Err((e, _handle)) => println!(
                         "[driver-manager] forward to {} failed for {}: {}",
                         driver,
                         core::str::from_utf8(label).unwrap_or("?"),
@@ -715,7 +719,7 @@ impl DriverManager {
         };
         match Channel::pair() {
             Ok((client_end, driver_end)) => {
-                if let Err(e) = input_host.bootstrap.write_handle(
+                if let Err((e, _handle)) = input_host.bootstrap.write_handle(
                     protocol::ATTACH_KEYBOARD_CLIENT.as_bytes(),
                     driver_end.into_handle(),
                 ) {
@@ -725,7 +729,7 @@ impl DriverManager {
                     );
                     return;
                 }
-                if let Err(e) = registry.write_handle(
+                if let Err((e, _handle)) = registry.write_handle(
                     protocol::KEYBOARD_CHANNEL.as_bytes(),
                     client_end.into_handle(),
                 ) {

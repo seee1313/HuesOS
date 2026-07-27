@@ -2,7 +2,7 @@
 
 use huesos_abi::ErrorCode;
 
-use crate::callbacks::{CLOCK_FN, SHUTDOWN_FN};
+use crate::callbacks::{CLOCK_FN, CPU_MASK_FN, CURRENT_CPU_FN, SHUTDOWN_FN};
 use crate::SyscallResult;
 
 pub(crate) fn sys_clock_get_monotonic() -> SyscallResult {
@@ -12,6 +12,16 @@ pub(crate) fn sys_clock_get_monotonic() -> SyscallResult {
         return Err(ErrorCode::Busy);
     }
     Ok(ticks as i64)
+}
+
+pub(crate) fn sys_system_cpu_count() -> SyscallResult {
+    let mask_fn = (*CPU_MASK_FN.lock()).ok_or(ErrorCode::NotSupported)?;
+    Ok(mask_fn().count_ones() as i64)
+}
+
+pub(crate) fn sys_system_current_cpu() -> SyscallResult {
+    let current = (*CURRENT_CPU_FN.lock()).ok_or(ErrorCode::NotSupported)?;
+    Ok(current() as i64)
 }
 
 pub(crate) fn sys_system_shutdown() -> SyscallResult {
