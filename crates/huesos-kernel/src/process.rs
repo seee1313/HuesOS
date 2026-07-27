@@ -26,8 +26,9 @@ const USER_STACK_SIZE: u64 = huesos_abi::USER_STACK_SIZE;
 /// still keep the real x86_64 page-table owner alive for as long as the
 /// process object lives.
 pub struct ProcessRuntime {
-    /// Real process address space.
-    pub address_space: AddressSpace,
+    /// Real process address space. Wrapped in `Option` so `destroy` and `Drop`
+    /// can move it out exactly once and return all page-table / owned frames.
+    pub address_space: Option<AddressSpace>,
     /// Root VMAR object for this address space.
     pub root_vmar: Arc<Vmar>,
 }
@@ -43,14 +44,33 @@ impl ProcessRuntime {
         );
         huesos_object::register_object(root_vmar.clone());
         Ok(Self {
-            address_space,
+            address_space: Some(address_space),
             root_vmar,
         })
     }
 
     /// CR3 value for scheduling this process.
     pub fn cr3(&self) -> u64 {
-        self.address_space.phys_addr().as_u64()
+        self.address_space
+            .as_ref()
+            .map(|address_space| address_space.phys_addr().as_u64())
+            .unwrap_or(0)
+    }
+
+    fn address_space_mut(&mut self) -> Option<&mut AddressSpace> {
+        self.address_space.as_mut()
+    }
+}
+
+impl Drop for ProcessRuntime {
+    fn drop(&mut self) {
+        if let Some(address_space) = self.address_space.take() {
+            // SAFETY: dropping ProcessRuntime is only permitted after the
+            // owning process has left every scheduler current slot, or during
+            // construction/launch rollback before the CR3 was ever published.
+            unsafe { address_space.destroy() };
+        }
+        huesos_object::unregister_object(self.root_vmar.koid());
     }
 }
 
@@ -197,6 +217,7 @@ pub fn map_vmo_into_vmar(
         });
     }
 
+    let address_space = runtime.address_space_mut().ok_or(ErrorCode::BadHandle)?;
     let mut mapped_pages = 0usize;
     let map_result = (|| -> Result<(), ErrorCode> {
         for index in 0..page_count {
@@ -207,8 +228,7 @@ pub fn map_vmo_into_vmar(
                 args.addr + index as u64 * PAGE_SIZE,
             ));
             let frame = PhysFrame::<Size4KiB>::containing_address(PhysAddr::new(frame_phys));
-            runtime
-                .address_space
+            address_space
                 .try_map_user_page(page, frame, page_flags)
                 .map_err(|error| match error {
                     huesos_arch::paging::UserPageError::OutOfMemory => ErrorCode::NoMemory,
@@ -231,7 +251,7 @@ pub fn map_vmo_into_vmar(
             let page = Page::<Size4KiB>::containing_address(VirtAddr::new(
                 args.addr + index as u64 * PAGE_SIZE,
             ));
-            let _ = runtime.address_space.unmap_user_page(page);
+            let _ = address_space.unmap_user_page(page);
         }
         let removed = vmar.remove_mapping(mapping);
         debug_assert!(removed, "VMAR rollback lost its reservation");
@@ -344,6 +364,9 @@ fn remap_mapping_pages(
     let Ok(flags) = page_flags_from_vmar_flags(mapping.flags) else {
         return false;
     };
+    let Some(address_space) = runtime.address_space_mut() else {
+        return false;
+    };
     for index in 0..count {
         let first_page = (mapping.vmo_offset / PAGE_SIZE) as usize;
         let Some(frame_phys) = vmo.frame_at(first_page + index) else {
@@ -353,11 +376,7 @@ fn remap_mapping_pages(
             mapping.base + index as u64 * PAGE_SIZE,
         ));
         let frame = PhysFrame::<Size4KiB>::containing_address(PhysAddr::new(frame_phys));
-        if runtime
-            .address_space
-            .try_map_user_page(page, frame, flags)
-            .is_err()
-        {
+        if address_space.try_map_user_page(page, frame, flags).is_err() {
             return false;
         }
     }
@@ -387,7 +406,11 @@ pub fn unmap_vmar_mapping(vmar: &Vmar, args: VmarOpArgs) -> Result<u64, ErrorCod
         let page = Page::<Size4KiB>::containing_address(VirtAddr::new(
             mapping.base + index as u64 * PAGE_SIZE,
         ));
-        if runtime.address_space.unmap_user_page(page).is_err() {
+        let unmap_result = runtime
+            .address_space_mut()
+            .ok_or(ErrorCode::BadHandle)?
+            .unmap_user_page(page);
+        if unmap_result.is_err() {
             let _ = remap_mapping_pages(runtime, vmo, mapping, unmapped);
             return Err(ErrorCode::Internal);
         }
@@ -427,18 +450,18 @@ pub fn protect_vmar_mapping(vmar: &Vmar, args: VmarOpArgs) -> Result<u64, ErrorC
         let page = Page::<Size4KiB>::containing_address(VirtAddr::new(
             mapping.base + index as u64 * PAGE_SIZE,
         ));
-        if runtime
-            .address_space
-            .protect_user_page(page, new_flags)
-            .is_err()
-        {
+        let protect_result = runtime
+            .address_space_mut()
+            .ok_or(ErrorCode::BadHandle)?
+            .protect_user_page(page, new_flags);
+        if protect_result.is_err() {
             for rollback in 0..changed {
                 let rollback_page = Page::<Size4KiB>::containing_address(VirtAddr::new(
                     mapping.base + rollback as u64 * PAGE_SIZE,
                 ));
-                let _ = runtime
-                    .address_space
-                    .protect_user_page(rollback_page, old_flags);
+                if let Some(address_space) = runtime.address_space_mut() {
+                    let _ = address_space.protect_user_page(rollback_page, old_flags);
+                }
             }
             return Err(ErrorCode::Internal);
         }
@@ -449,9 +472,9 @@ pub fn protect_vmar_mapping(vmar: &Vmar, args: VmarOpArgs) -> Result<u64, ErrorC
             let rollback_page = Page::<Size4KiB>::containing_address(VirtAddr::new(
                 mapping.base + rollback as u64 * PAGE_SIZE,
             ));
-            let _ = runtime
-                .address_space
-                .protect_user_page(rollback_page, old_flags);
+            if let Some(address_space) = runtime.address_space_mut() {
+                let _ = address_space.protect_user_page(rollback_page, old_flags);
+            }
         }
         return Err(ErrorCode::Internal);
     }
@@ -479,27 +502,31 @@ pub fn start_thread(
         return Err(ErrorCode::InvalidArgs);
     }
 
-    if thread.task_id.lock().is_some() {
+    let process = huesos_object::lookup_process(thread.process()).ok_or(ErrorCode::BadHandle)?;
+    if process.exit_code().is_some() {
         return Err(ErrorCode::Busy);
     }
-
-    let process = huesos_object::lookup_process(thread.process()).ok_or(ErrorCode::BadHandle)?;
     let cr3 = {
         let mut runtime_guard = process.address_space.lock();
         let runtime = runtime_guard
             .as_mut()
             .and_then(|runtime| runtime.downcast_mut::<ProcessRuntime>())
             .ok_or(ErrorCode::BadHandle)?;
-        runtime.cr3()
+        runtime
+            .address_space
+            .as_ref()
+            .ok_or(ErrorCode::BadHandle)?
+            .phys_addr()
+            .as_u64()
     };
 
     let mut task_name = [0u8; 32];
     let label = b"user-thread";
     task_name[..label.len()].copy_from_slice(label);
 
-    let task_id = crate::scheduler::spawn_user_thread(&task_name, process, entry, stack, cr3);
-    *thread.task_id.lock() = Some(task_id);
-    Ok(task_id)
+    let target_cpu = process.home_cpu();
+    crate::scheduler::spawn_user_thread_on_cpu(&task_name, process, entry, stack, cr3, target_cpu)
+        .ok_or(ErrorCode::Busy)
 }
 
 /// Load `elf_bytes` into a brand new address space and prepare a process
@@ -516,8 +543,13 @@ pub fn spawn_from_elf(name: &str, elf_bytes: &[u8]) -> Result<SpawnedProcess, Sp
     };
 
     let loaded = {
+        let Some(address_space) = runtime.address_space_mut() else {
+            runtime.destroy();
+            huesos_object::unregister_object(process.koid());
+            return Err(SpawnError::Paging(UserPageError::NotInitialized));
+        };
         let mut loader = KernelLoader {
-            aspace: &mut runtime.address_space,
+            aspace: address_space,
         };
         match huesos_elf::load(elf_bytes, &mut loader) {
             Ok(loaded) => loaded,
@@ -534,10 +566,13 @@ pub fn spawn_from_elf(name: &str, elf_bytes: &[u8]) -> Result<SpawnedProcess, Sp
     let mut addr = stack_bottom;
     while addr < USER_STACK_TOP {
         let page: Page<Size4KiB> = Page::containing_address(VirtAddr::new(addr));
-        if let Err(error) = runtime
-            .address_space
-            .map_new_user_page(page, flags::USER_RW | PageTableFlags::NO_EXECUTE)
-        {
+        let map_result = runtime
+            .address_space_mut()
+            .ok_or(UserPageError::NotInitialized)
+            .and_then(|address_space| {
+                address_space.map_new_user_page(page, flags::USER_RW | PageTableFlags::NO_EXECUTE)
+            });
+        if let Err(error) = map_result {
             runtime.destroy();
             huesos_object::unregister_object(process.koid());
             return Err(SpawnError::Paging(error));
@@ -659,13 +694,12 @@ pub extern "C" fn user_entry_trampoline() -> ! {
 
 impl ProcessRuntime {
     /// Destroy the address space and drop the root VMAR registration.
-    pub fn destroy(self) {
-        let root_koid = self.root_vmar.koid();
-        // Safety: caller must ensure no CPU still has this CR3 loaded.
-        unsafe {
-            self.address_space.destroy();
+    pub fn destroy(mut self) {
+        if let Some(address_space) = self.address_space.take() {
+            // SAFETY: caller must ensure no CPU still has this CR3 loaded.
+            unsafe { address_space.destroy() };
         }
-        huesos_object::unregister_object(root_koid);
+        // Drop runs next and unregisters the root VMAR exactly once.
     }
 }
 
@@ -678,7 +712,7 @@ impl ProcessRuntime {
 pub fn teardown_process(process: &Process) {
     if let Some(any) = process.address_space.lock().take() {
         if let Ok(runtime) = any.downcast::<ProcessRuntime>() {
-            runtime.destroy();
+            drop(runtime);
         }
     }
     process.handles.clear();

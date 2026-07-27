@@ -5,7 +5,7 @@ use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::sync::Arc;
 use core::any::Any;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use crate::wait::WaitQueue;
 use crate::{alloc_koid, root_job, HandleTable, Job, KernelObject, Koid, ObjectType};
@@ -29,6 +29,11 @@ pub struct Process {
     /// stored here so syscalls/scheduler can find it without a separate
     /// process table). Boxed `dyn Any` to avoid a dependency on huesos-arch.
     pub address_space: IrqSafeMutex<Option<Box<dyn Any + Send + Sync>>>,
+    /// Dense CPU index new threads are pinned to by default.
+    home_cpu: AtomicUsize,
+    /// Initial-thread start reservation. Prevents two different Thread objects
+    /// from racing to become the first runnable thread of the same process.
+    start_reserved: AtomicBool,
     /// Criticality flag: if `true`, an abnormal exit of this process
     /// triggers a kernel-driven hard halt of the whole system. Set once
     /// via [`Self::mark_critical`]; never cleared. Inspired by
@@ -60,6 +65,8 @@ impl Process {
             exit_waiters: WaitQueue::new(),
             user_memory_lock: IrqSafeMutex::new(()),
             address_space: IrqSafeMutex::new(None),
+            home_cpu: AtomicUsize::new(crate::registry::current_cpu()),
+            start_reserved: AtomicBool::new(false),
             critical: AtomicBool::new(false),
         })
     }
@@ -97,11 +104,60 @@ impl Process {
         Arc::clone(&self.job)
     }
 
+    /// Dense CPU index this process's initial thread is pinned to by default.
+    pub fn home_cpu(&self) -> usize {
+        self.home_cpu.load(Ordering::Acquire)
+    }
+
+    /// Set the default CPU affinity for this process before its first thread
+    /// starts. Returns false once a thread is running/reserved.
+    pub fn set_home_cpu(&self, cpu: usize) -> bool {
+        let lifecycle = self.lifecycle.lock();
+        if lifecycle.state() != ProcState::Created || self.start_reserved.load(Ordering::Acquire) {
+            return false;
+        }
+        drop(lifecycle);
+        self.home_cpu.store(cpu, Ordering::Release);
+        true
+    }
+
     /// Account one scheduler tick to the owning Job. Returns false when the
     /// Job CPU budget is exhausted; the scheduler currently records the
     /// exhaustion for supervision but does not kill the process.
     pub fn charge_cpu_tick(&self) -> bool {
         self.job.charge(huesos_quota::Resource::CpuTicks, 1)
+    }
+
+    /// Whether the process can accept its initial thread start.
+    ///
+    /// The current launch model supports one initial thread per process. Extra
+    /// thread starts would expose bootstrap handle races with already-running
+    /// sibling threads, so they are rejected until the multi-thread bootstrap
+    /// protocol grows per-thread startup handles.
+    pub fn can_start_initial_thread(&self) -> bool {
+        self.lifecycle.lock().state() == ProcState::Created
+            && !self.start_reserved.load(Ordering::Acquire)
+    }
+
+    /// Reserve the initial-thread start slot. Returns false if the process is
+    /// no longer Created or another thread-start syscall already reserved it.
+    pub fn reserve_initial_thread_start(&self) -> bool {
+        if self.lifecycle.lock().state() != ProcState::Created {
+            return false;
+        }
+        self.start_reserved
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
+    /// Cancel a previous initial-thread start reservation after a failed start.
+    pub fn cancel_initial_thread_start(&self) {
+        self.start_reserved.store(false, Ordering::Release);
+    }
+
+    /// Clear the start reservation after the scheduler task was published.
+    pub fn finish_initial_thread_start(&self) {
+        self.start_reserved.store(false, Ordering::Release);
     }
 
     /// Mark the process as running. The policy accepts this only once, when

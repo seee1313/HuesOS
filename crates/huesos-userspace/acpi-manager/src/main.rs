@@ -13,7 +13,7 @@ use huesos_abi::acpi_broker::{
     TableArchiveEntry, MAX_ARCHIVE_BYTES, MAX_TABLES, MAX_TABLE_BYTES, TABLE_ARCHIVE_ENTRY_BYTES,
     TABLE_ARCHIVE_HEADER_BYTES, TABLE_ARCHIVE_MAGIC, VERSION,
 };
-use libcanvas::{println, Channel, ErrorCode, Vmo};
+use libcanvas::{println, wait_any, Channel, ErrorCode, Signals, Vmo, WaitItem};
 
 const ARCHIVE_MESSAGE: &[u8] = b"acpi-tables-vmo";
 const BROKER_MESSAGE: &[u8] = b"acpi-broker";
@@ -66,36 +66,48 @@ pub extern "C" fn _start() -> ! {
 
 fn receive_archive(bootstrap: &Channel) -> Option<Vmo> {
     let mut message = [0u8; 32];
-    for _ in 0..100_000 {
-        match bootstrap.read_handle(&mut message) {
-            Ok((length, handle)) if &message[..length] == ARCHIVE_MESSAGE => {
-                return Some(Vmo::from_handle(handle));
+    let items = [WaitItem::new(
+        bootstrap.handle().raw(),
+        Signals::READABLE | Signals::PEER_CLOSED,
+        0,
+    )];
+    loop {
+        wait_any(&items, 0).ok()?;
+        loop {
+            match bootstrap.read_optional_handle(&mut message) {
+                Ok((length, Some(handle))) if &message[..length] == ARCHIVE_MESSAGE => {
+                    return Some(Vmo::from_handle(handle));
+                }
+                Ok((_length, Some(handle))) => drop(handle),
+                Ok((_length, None)) => {}
+                Err(ErrorCode::ShouldWait) | Err(ErrorCode::TimedOut) => break,
+                Err(_) => return None,
             }
-            Ok((_length, _handle)) => {}
-            Err(ErrorCode::ShouldWait) | Err(ErrorCode::TimedOut) => {
-                libcanvas::process::yield_now();
-            }
-            Err(_) => return None,
         }
     }
-    None
 }
 
 fn receive_broker(bootstrap: &Channel) -> Option<libcanvas::acpi_broker::AcpiBroker> {
     let mut message = [0u8; 32];
-    for _ in 0..100_000 {
-        match bootstrap.read_handle(&mut message) {
-            Ok((length, handle)) if &message[..length] == BROKER_MESSAGE => {
-                return Some(libcanvas::acpi_broker::AcpiBroker::from_handle(handle));
+    let items = [WaitItem::new(
+        bootstrap.handle().raw(),
+        Signals::READABLE | Signals::PEER_CLOSED,
+        0,
+    )];
+    loop {
+        wait_any(&items, 0).ok()?;
+        loop {
+            match bootstrap.read_optional_handle(&mut message) {
+                Ok((length, Some(handle))) if &message[..length] == BROKER_MESSAGE => {
+                    return Some(libcanvas::acpi_broker::AcpiBroker::from_handle(handle));
+                }
+                Ok((_length, Some(handle))) => drop(handle),
+                Ok((_length, None)) => {}
+                Err(ErrorCode::ShouldWait) | Err(ErrorCode::TimedOut) => break,
+                Err(_) => return None,
             }
-            Ok((_length, _handle)) => {}
-            Err(ErrorCode::ShouldWait) | Err(ErrorCode::TimedOut) => {
-                libcanvas::process::yield_now();
-            }
-            Err(_) => return None,
         }
     }
-    None
 }
 
 fn verify_deny_by_default(broker: &libcanvas::acpi_broker::AcpiBroker) -> bool {

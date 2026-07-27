@@ -354,12 +354,23 @@ fn map_phys_range(
                 Ok(flush) => flush.flush(),
                 Err(x86_64::structures::paging::mapper::MapToError::PageAlreadyMapped(_)) => {
                     // Page present (e.g. Limine left it WB). Force the flags
-                    // we want — critical for LAPIC NO_CACHE.
-                    let _ = mapper.update_flags(page, flags).map(|f| f.flush());
+                    // we want — critical for LAPIC/IOAPIC NO_CACHE + NX.
+                    mapper.update_flags(page, flags).map(|f| f.flush()).map_err(|error| {
+                        match error {
+                            x86_64::structures::paging::mapper::FlagUpdateError::PageNotMapped => {
+                                KernelPageError::AlreadyMapped
+                            }
+                            x86_64::structures::paging::mapper::FlagUpdateError::ParentEntryHugePage => {
+                                KernelPageError::ParentHugePage
+                            }
+                        }
+                    })?;
                 }
-                Err(x86_64::structures::paging::mapper::MapToError::ParentEntryHugePage) => {}
-                Err(_) => {
-                    // Best-effort: leave unmapped; caller will observe the #PF.
+                Err(x86_64::structures::paging::mapper::MapToError::ParentEntryHugePage) => {
+                    return Err(KernelPageError::ParentHugePage);
+                }
+                Err(x86_64::structures::paging::mapper::MapToError::FrameAllocationFailed) => {
+                    return Err(KernelPageError::OutOfMemory);
                 }
             }
         }

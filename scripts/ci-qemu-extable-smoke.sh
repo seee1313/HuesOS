@@ -30,6 +30,7 @@ rm -f "$log"
 # not interfere with the regular boot smoke's HBI.
 mkdir -p build
 echo "extable_test=1" > build/cmdline.txt
+trap 'echo "init_args=foo" > build/cmdline.txt' EXIT
 
 # Force a fresh HBI build (the ISO recipe rebuilds if inputs change,
 # but the cmdline.txt input was just rewritten — mkiso.sh will
@@ -48,10 +49,6 @@ timeout "${timeout_seconds}s" qemu-system-x86_64 \
     -no-reboot -no-shutdown
 status=$?
 set -e
-
-# Restore the placeholder so a follow-up regular boot smoke does not
-# get contaminated with our extable_test=1 flag.
-echo "init_args=foo" > build/cmdline.txt
 
 if [[ "$status" != 0 && "$status" != 124 ]]; then
     echo "QEMU exited unexpectedly with status $status" >&2

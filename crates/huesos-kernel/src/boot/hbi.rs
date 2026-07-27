@@ -106,6 +106,8 @@ pub enum HbiError {
     /// A directory entry's type_id/length is inconsistent with its per-module
     /// EntryHeader.
     EntryMismatch,
+    /// A module payload failed its recorded CRC32 check.
+    ChecksumMismatch,
 }
 
 impl<'a> HbiImage<'a> {
@@ -166,12 +168,13 @@ impl<'a> HbiImage<'a> {
             .checked_add(entries_byte_len)
             .ok_or(HbiError::ParseError)?;
 
-        if entries_end > data.len() {
+        if entries_end > data.len() || entries_end > header_size {
             return Err(HbiError::BufferTooSmall);
         }
 
         // Read each directory entry with an unaligned read.
-        let mut entries = alloc::vec::Vec::with_capacity(num_entries);
+        let mut entries: alloc::vec::Vec<DirectoryEntry> =
+            alloc::vec::Vec::with_capacity(num_entries);
         let entry_size = core::mem::size_of::<DirectoryEntry>();
         for i in 0..num_entries {
             let off = entries_start
@@ -182,9 +185,17 @@ impl<'a> HbiImage<'a> {
             };
 
             // Validate each entry's offset/length bounds before accepting it.
-            let payload_start = (entry.offset as usize)
+            let eh_offset = entry.offset as usize;
+            if eh_offset < header_size {
+                return Err(HbiError::InvalidOffset);
+            }
+            let entry_header_end = eh_offset
                 .checked_add(core::mem::size_of::<EntryHeader>())
                 .ok_or(HbiError::InvalidOffset)?;
+            if entry_header_end > data.len() {
+                return Err(HbiError::InvalidOffset);
+            }
+            let payload_start = entry_header_end;
             let payload_end = payload_start
                 .checked_add(entry.length as usize)
                 .ok_or(HbiError::InvalidOffset)?;
@@ -192,23 +203,32 @@ impl<'a> HbiImage<'a> {
                 return Err(HbiError::InvalidOffset);
             }
 
-            // Validate type_id consistency: the per-module EntryHeader at
-            // `entry.offset` must carry the same type_id as the directory.
-            // Read the type_id field (first 4 bytes, little-endian) without
-            // unsafe by copying the bytes directly.
-            let eh_offset = entry.offset as usize;
-            let eh_type_id = if eh_offset.saturating_add(4) <= data.len() {
-                u32::from_le_bytes([
-                    data[eh_offset],
-                    data[eh_offset + 1],
-                    data[eh_offset + 2],
-                    data[eh_offset + 3],
-                ])
-            } else {
-                return Err(HbiError::InvalidOffset);
+            let header = unsafe {
+                core::ptr::read_unaligned(data.as_ptr().add(eh_offset) as *const EntryHeader)
             };
-            if eh_type_id != entry.type_id {
+            if header.type_id != entry.type_id || header.length != entry.length {
                 return Err(HbiError::EntryMismatch);
+            }
+            if crc32(&data[payload_start..payload_end]) != header.crc32 {
+                return Err(HbiError::ChecksumMismatch);
+            }
+
+            for existing in &entries {
+                let existing_start = existing.offset as usize;
+                let existing_payload_start = existing_start
+                    .checked_add(core::mem::size_of::<EntryHeader>())
+                    .ok_or(HbiError::InvalidOffset)?;
+                let existing_payload_end = existing_payload_start
+                    .checked_add(existing.length as usize)
+                    .ok_or(HbiError::InvalidOffset)?;
+                if ranges_overlap(
+                    eh_offset,
+                    payload_end.saturating_sub(eh_offset),
+                    existing_start,
+                    existing_payload_end.saturating_sub(existing_start),
+                ) {
+                    return Err(HbiError::InvalidOffset);
+                }
             }
 
             entries.push(entry);
@@ -262,6 +282,30 @@ impl<'a> HbiImage<'a> {
     pub fn header(&self) -> &GlobalHeader {
         &self.header
     }
+}
+
+fn ranges_overlap(a_base: usize, a_size: usize, b_base: usize, b_size: usize) -> bool {
+    let Some(a_end) = a_base.checked_add(a_size) else {
+        return true;
+    };
+    let Some(b_end) = b_base.checked_add(b_size) else {
+        return true;
+    };
+    a_size == 0 || b_size == 0 || (a_base < b_end && b_base < a_end)
+}
+
+fn crc32(bytes: &[u8]) -> u32 {
+    let mut crc = 0xffff_ffffu32;
+    for &byte in bytes {
+        crc ^= byte as u32;
+        let mut bit = 0;
+        while bit < 8 {
+            let mask = (crc & 1).wrapping_neg();
+            crc = (crc >> 1) ^ (0xedb8_8320 & mask);
+            bit += 1;
+        }
+    }
+    !crc
 }
 
 #[cfg(test)]

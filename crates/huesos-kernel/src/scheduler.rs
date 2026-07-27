@@ -25,7 +25,7 @@ use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::ops::{Deref, DerefMut};
-use core::sync::atomic::Ordering;
+use core::sync::atomic::{AtomicUsize, Ordering};
 use huesos_arch::{LockRank, RankedIrqSafeTicketLock};
 use huesos_lifecycle::TaskGraveyard;
 use huesos_object::{KernelObject, Process};
@@ -69,9 +69,57 @@ const fn next_task_generation(previous: u32) -> Option<u32> {
     }
 }
 
-/// Bitmask of CPUs that have finished scheduler init and may receive tasks.
-/// Bit N set => CPU with LAPIC-id N is online for load-balancing.
+/// Bit N set => dense CPU index N is online for load-balancing/IPI routing.
+/// Firmware LAPIC IDs are intentionally not used as bit positions because they
+/// can be sparse or greater than `MAX_CPUS`; `lapic_id_for_cpu_index` resolves
+/// the APIC ID at the final IPI boundary.
 static ONLINE_CPUS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+const RUNQUEUE_TOKEN_FREE: usize = usize::MAX;
+static RUNQUEUE_TOKENS: [AtomicUsize; MAX_CPUS] =
+    [const { AtomicUsize::new(RUNQUEUE_TOKEN_FREE) }; MAX_CPUS];
+
+struct RunqueueTokenGuard {
+    cpu: usize,
+    remote: bool,
+}
+
+impl Drop for RunqueueTokenGuard {
+    fn drop(&mut self) {
+        if self.remote {
+            RUNQUEUE_TOKENS[self.cpu].store(RUNQUEUE_TOKEN_FREE, Ordering::Release);
+        }
+    }
+}
+
+fn acquire_runqueue_token(cpu: usize) -> Option<RunqueueTokenGuard> {
+    let current = cpu_id();
+    if cpu >= MAX_CPUS {
+        return None;
+    }
+    if cpu == current {
+        return Some(RunqueueTokenGuard { cpu, remote: false });
+    }
+    for _ in 0..100_000 {
+        if RUNQUEUE_TOKENS[cpu]
+            .compare_exchange(
+                RUNQUEUE_TOKEN_FREE,
+                current,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+        {
+            if let Some(apic_id) = lapic_id_for_cpu_index(cpu) {
+                huesos_arch::lapic::ipi_reschedule(apic_id);
+            }
+            return Some(RunqueueTokenGuard { cpu, remote: true });
+        }
+        core::hint::spin_loop();
+    }
+    None
+}
+
 /// Hardware-timer-driven monotonic clock. Only CPU 0 advances it, so SMP does
 /// not make time run faster. Cooperative yields never affect this clock.
 static MONOTONIC_TICKS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
@@ -222,13 +270,6 @@ impl Scheduler {
             .is_some_and(|slot| slot.generation == task_generation(id) && slot.id == id)
     }
 
-    fn live_task_count(&self) -> usize {
-        self.tasks
-            .iter()
-            .filter(|slot| !matches!(&slot.kind, TaskKind::Reaped))
-            .count()
-    }
-
     fn apply_task_environment(&self, idx: usize) {
         let task = &self.tasks[idx];
         let stack_top = task.kernel_stack_top();
@@ -349,9 +390,17 @@ impl Scheduler {
     }
 }
 
-/// Return the LAPIC ID of the current CPU via GS_BASE, clamped to MAX_CPUS.
+/// Return the dense CPU index of the current CPU via GS_BASE.
+///
+/// LAPIC IDs are firmware-assigned and may be sparse or greater than 63 on real
+/// machines. Scheduler arrays, task IDs, and current-process state use this
+/// dense index instead; LAPIC IDs are consulted only at the IPI boundary.
 fn cpu_id() -> usize {
-    (unsafe { huesos_arch::cpu_local::current_lapic_id() } as usize).min(MAX_CPUS - 1)
+    (unsafe { huesos_arch::cpu_local::current_cpu_index() }).min(MAX_CPUS - 1)
+}
+
+fn lapic_id_for_cpu_index(cpu: usize) -> Option<u8> {
+    huesos_arch::cpu_local::lapic_id_for_index(cpu).and_then(|id| u8::try_from(id).ok())
 }
 
 /// Register the current CPU's scheduler pointer in its `CpuLocal`.
@@ -514,6 +563,9 @@ pub fn wake_task(task_id: u64) {
         return;
     }
     let idx = task_index(task_id);
+    let Some(_token) = acquire_runqueue_token(cpu) else {
+        return;
+    };
     let mut guard = PER_CPU_SCHEDULERS[cpu].lock();
     if !guard.task_matches(task_id) {
         return;
@@ -561,7 +613,9 @@ pub fn wake_task(task_id: u64) {
     }
     drop(guard);
     if cpu != cpu_id() {
-        huesos_arch::lapic::ipi_reschedule(cpu as u8);
+        if let Some(apic_id) = lapic_id_for_cpu_index(cpu) {
+            huesos_arch::lapic::ipi_reschedule(apic_id);
+        }
     }
 }
 
@@ -577,33 +631,16 @@ pub fn global_ticks() -> u64 {
     MONOTONIC_TICKS.load(Ordering::SeqCst)
 }
 
-/// Find the best CPU to spawn a task on (online CPU with fewest tasks).
-fn find_best_cpu() -> usize {
-    let mut best_cpu = cpu_id();
-    let mut min_tasks = usize::MAX;
-    let mask = ONLINE_CPUS.load(Ordering::SeqCst);
-
-    for (i, scheduler) in PER_CPU_SCHEDULERS.iter().enumerate() {
-        if (mask & (1u64 << i)) == 0 {
-            continue;
-        }
-        let guard = scheduler.lock();
-        let count = guard.live_task_count();
-        // Prefer the least-loaded online CPU that already has at least an idle task.
-        if count >= 1 && count < min_tasks {
-            min_tasks = count;
-            best_cpu = i;
-        }
-    }
-    best_cpu
-}
-
 /// Set the scheduling policy for a task by its ID.
 pub fn set_sched_policy(task_id: u64, policy: SchedPolicy) {
     huesos_arch::interrupts::disable();
     let cpu = task_cpu(task_id);
     let idx = task_index(task_id);
     if cpu < MAX_CPUS {
+        let Some(_token) = acquire_runqueue_token(cpu) else {
+            huesos_arch::interrupts::enable();
+            return;
+        };
         let mut guard = PER_CPU_SCHEDULERS[cpu].lock();
 
         if !guard.task_matches(task_id) {
@@ -631,15 +668,11 @@ pub fn set_sched_policy(task_id: u64, policy: SchedPolicy) {
 /// Spawn a new kernel thread.
 pub fn spawn_kernel_thread(name: &[u8; 32], entry: extern "C" fn() -> !) -> u64 {
     huesos_arch::interrupts::disable();
-    let cpu = find_best_cpu();
+    let cpu = cpu_id();
     let mut guard = PER_CPU_SCHEDULERS[cpu].lock();
     let id = guard.add_task(cpu, |id| Task::new_kernel(id, *name, entry));
     drop(guard);
     huesos_arch::interrupts::enable();
-
-    if cpu != cpu_id() {
-        huesos_arch::lapic::ipi_reschedule(cpu as u8);
-    }
     id
 }
 
@@ -652,12 +685,29 @@ pub fn spawn_user_thread(
     user_rsp: u64,
     cr3: u64,
 ) -> u64 {
+    spawn_user_thread_on_cpu(name, process, entry_point, user_rsp, cr3, cpu_id())
+        .unwrap_or(u64::MAX)
+}
+
+/// Spawn a userspace task on an explicit dense CPU index. This is the only
+/// cross-CPU task-placement path: no global load average or implicit balancing
+/// is consulted. Remote runqueue mutation is guarded by the runqueue token.
+pub fn spawn_user_thread_on_cpu(
+    name: &[u8; 32],
+    process: Arc<Process>,
+    entry_point: u64,
+    user_rsp: u64,
+    cr3: u64,
+    cpu: usize,
+) -> Option<u64> {
+    if cpu >= MAX_CPUS || !is_cpu_online(cpu) {
+        return None;
+    }
     huesos_arch::interrupts::disable();
-    // Prefer the caller's CPU for userspace launches. Early boot services
-    // spawned by init must not be stranded on an AP that is still settling
-    // under QEMU TCG (missing ready handshake). Kernel threads may still
-    // use find_best_cpu for load balance.
-    let cpu = cpu_id();
+    let Some(_token) = acquire_runqueue_token(cpu) else {
+        huesos_arch::interrupts::enable();
+        return None;
+    };
     // Drive the policy transition before publishing the first runnable task.
     let _ = process.start();
     let mut guard = PER_CPU_SCHEDULERS[cpu].lock();
@@ -672,15 +722,17 @@ pub fn spawn_user_thread(
     });
     drop(guard);
     // Publish startup metadata only after releasing the rank-60 scheduler.
-    // Interrupts remain disabled, so this CPU cannot run the new local task
-    // before its rank-40 process record is visible.
+    // Interrupts remain disabled, so this CPU cannot run the new task before
+    // its rank-40 process record is visible.
     crate::process::queue_user_entry(id, entry_point, user_rsp);
     huesos_arch::interrupts::enable();
 
     if cpu != cpu_id() {
-        huesos_arch::lapic::ipi_reschedule(cpu as u8);
+        if let Some(apic_id) = lapic_id_for_cpu_index(cpu) {
+            huesos_arch::lapic::ipi_reschedule(apic_id);
+        }
     }
-    id
+    Some(id)
 }
 
 /// Mark the currently running task as finished (won't be scheduled again)
@@ -790,7 +842,9 @@ pub fn terminate_current_process(code: i64) -> ! {
     REAP_PENDING.store(true, Ordering::Release);
     for cpu in 0..MAX_CPUS {
         if cpu != current_cpu && is_cpu_online(cpu) {
-            huesos_arch::lapic::ipi_reschedule(cpu as u8);
+            if let Some(apic_id) = lapic_id_for_cpu_index(cpu) {
+                huesos_arch::lapic::ipi_reschedule(apic_id);
+            }
         }
     }
 

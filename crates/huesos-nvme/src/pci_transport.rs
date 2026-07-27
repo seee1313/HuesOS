@@ -105,8 +105,15 @@ impl PciMmioTransport {
 
 impl NvmeTransport for PciMmioTransport {
     fn read64(&mut self, off: u32) -> u64 {
-        debug_assert!(self.validate_reg_offset(off));
-        let addr = self.bar_virt + off as u64;
+        let Some(last) = off.checked_add(7) else {
+            return 0;
+        };
+        if !self.validate_reg_offset(off) || !self.validate_reg_offset(last) {
+            return 0;
+        }
+        let Some(addr) = self.bar_virt.checked_add(off as u64) else {
+            return 0;
+        };
         // Safety: addr is a valid MMIO address within BAR0, mapped uncacheable.
         // Volatile read ensures the access is not optimized away and observes
         // device-visible ordering.
@@ -114,8 +121,15 @@ impl NvmeTransport for PciMmioTransport {
     }
 
     fn write64(&mut self, off: u32, val: u64) {
-        debug_assert!(self.validate_reg_offset(off));
-        let addr = self.bar_virt + off as u64;
+        let Some(last) = off.checked_add(7) else {
+            return;
+        };
+        if !self.validate_reg_offset(off) || !self.validate_reg_offset(last) {
+            return;
+        }
+        let Some(addr) = self.bar_virt.checked_add(off as u64) else {
+            return;
+        };
         // Safety: addr is a valid MMIO address within BAR0, mapped uncacheable.
         // Volatile write ensures the access is not optimized away and is visible
         // to the device before subsequent operations.
@@ -123,34 +137,63 @@ impl NvmeTransport for PciMmioTransport {
     }
 
     fn read32(&mut self, off: u32) -> u32 {
-        debug_assert!(self.validate_reg_offset(off));
-        let addr = self.bar_virt + off as u64;
+        let Some(last) = off.checked_add(3) else {
+            return 0;
+        };
+        if !self.validate_reg_offset(off) || !self.validate_reg_offset(last) {
+            return 0;
+        }
+        let Some(addr) = self.bar_virt.checked_add(off as u64) else {
+            return 0;
+        };
         unsafe { core::ptr::read_volatile(addr as *const u32) }
     }
 
     fn write32(&mut self, off: u32, val: u32) {
-        debug_assert!(self.validate_reg_offset(off));
-        let addr = self.bar_virt + off as u64;
+        let Some(last) = off.checked_add(3) else {
+            return;
+        };
+        if !self.validate_reg_offset(off) || !self.validate_reg_offset(last) {
+            return;
+        }
+        let Some(addr) = self.bar_virt.checked_add(off as u64) else {
+            return;
+        };
         unsafe { core::ptr::write_volatile(addr as *mut u32, val) }
     }
 
     fn dma_read(&mut self, addr: u64, buf: &mut [u8]) {
-        // addr is a DMA-window offset, not an absolute physical address.
-        let off = addr - self.dma_phys;
-        debug_assert!(self.validate_dma_range(off, buf.len() as u64));
-        let virt = self.dma_virt + off;
+        // addr is a device-visible physical address inside the DMA window.
+        let Some(off) = addr.checked_sub(self.dma_phys) else {
+            buf.fill(0);
+            return;
+        };
+        if !self.validate_dma_range(off, buf.len() as u64) {
+            buf.fill(0);
+            return;
+        }
+        let Some(virt) = self.dma_virt.checked_add(off) else {
+            buf.fill(0);
+            return;
+        };
         // Safety: virt is a valid DMA address within the DMA window, mapped
         // by the kernel. The kernel ensures cache coherency (invalidate before
-        // device read, flush after device write).
+        // reading device-produced data as needed).
         unsafe {
             core::ptr::copy_nonoverlapping(virt as *const u8, buf.as_mut_ptr(), buf.len());
         }
     }
 
     fn dma_write(&mut self, addr: u64, buf: &[u8]) {
-        let off = addr - self.dma_phys;
-        debug_assert!(self.validate_dma_range(off, buf.len() as u64));
-        let virt = self.dma_virt + off;
+        let Some(off) = addr.checked_sub(self.dma_phys) else {
+            return;
+        };
+        if !self.validate_dma_range(off, buf.len() as u64) {
+            return;
+        }
+        let Some(virt) = self.dma_virt.checked_add(off) else {
+            return;
+        };
         unsafe {
             core::ptr::copy_nonoverlapping(buf.as_ptr(), virt as *mut u8, buf.len());
         }

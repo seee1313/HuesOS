@@ -168,13 +168,16 @@ pub enum Syscall {
     /// as [`Self::IoPortWrite8`]; the read byte is returned in the
     /// low 8 bits of the syscall's `Ok(i64)` value.
     IoPortRead8 = 38,
+    /// Set a process's default CPU affinity (dense CPU index) before its
+    /// initial thread starts. `a1` is a process handle, `a2` is the CPU index.
+    ProcessSetAffinity = 39,
 }
 
 impl Syscall {
     /// Total number of defined syscalls (i.e. one past the highest
     /// currently-assigned number). The dispatcher uses this to reject
     /// obviously-out-of-range numbers before a `match`.
-    pub const COUNT: u64 = 39;
+    pub const COUNT: u64 = 40;
 
     /// Convert a raw syscall number back into a [`Syscall`], if valid.
     pub const fn from_raw(n: u64) -> Option<Self> {
@@ -218,6 +221,7 @@ impl Syscall {
             36 => Self::HardHalt,
             37 => Self::IoPortWrite8,
             38 => Self::IoPortRead8,
+            39 => Self::ProcessSetAffinity,
             _ => return None,
         })
     }
@@ -769,7 +773,8 @@ mod tests {
         assert_eq!(Syscall::HardHalt as u64, 36);
         assert_eq!(Syscall::IoPortWrite8 as u64, 37);
         assert_eq!(Syscall::IoPortRead8 as u64, 38);
-        assert_eq!(Syscall::COUNT, 39);
+        assert_eq!(Syscall::ProcessSetAffinity as u64, 39);
+        assert_eq!(Syscall::COUNT, 40);
         assert_eq!(Syscall::from_raw(28), Some(Syscall::VmoCreateEx));
         assert_eq!(Syscall::from_raw(30), Some(Syscall::VmarProtect));
         assert_eq!(Syscall::from_raw(31), Some(Syscall::ChannelPeek));
@@ -780,7 +785,8 @@ mod tests {
         assert_eq!(Syscall::from_raw(36), Some(Syscall::HardHalt));
         assert_eq!(Syscall::from_raw(37), Some(Syscall::IoPortWrite8));
         assert_eq!(Syscall::from_raw(38), Some(Syscall::IoPortRead8));
-        assert_eq!(Syscall::from_raw(39), None);
+        assert_eq!(Syscall::from_raw(39), Some(Syscall::ProcessSetAffinity));
+        assert_eq!(Syscall::from_raw(40), None);
     }
 
     #[test]

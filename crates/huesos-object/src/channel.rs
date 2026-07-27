@@ -120,6 +120,30 @@ impl MessageQueue {
         }
         self.dequeue()
     }
+
+    /// Dequeue the front message only if its cookie matches and the caller's
+    /// buffers can hold both byte payload and transferred handles. Size failures
+    /// leave the message queued so the caller can retry with larger buffers.
+    fn consume_if_fits(
+        &mut self,
+        cookie: u64,
+        byte_capacity: usize,
+        handle_capacity: usize,
+    ) -> Result<Option<ChannelMessage>, ChannelRecvError> {
+        let Some(front) = self.messages.front() else {
+            return Ok(None);
+        };
+        if front.seq != cookie {
+            return Ok(None);
+        }
+        if front.data.len() > byte_capacity {
+            return Err(ChannelRecvError::BytesTooSmall);
+        }
+        if front.handles.len() > handle_capacity {
+            return Err(ChannelRecvError::HandlesTooSmall);
+        }
+        Ok(self.dequeue())
+    }
 }
 
 /// Failure returned when a channel message cannot be admitted to its bounded
@@ -403,6 +427,19 @@ impl Channel {
     /// since the peek) or the queue is empty.
     pub fn consume(&self, cookie: u64) -> Option<ChannelMessage> {
         self.inbox.lock().consume(cookie)
+    }
+
+    /// Consume the identified message only if caller buffers can hold it.
+    /// Size errors leave the message queued.
+    pub fn consume_if_fits(
+        &self,
+        cookie: u64,
+        byte_capacity: usize,
+        handle_capacity: usize,
+    ) -> Result<Option<ChannelMessage>, ChannelRecvError> {
+        self.inbox
+            .lock()
+            .consume_if_fits(cookie, byte_capacity, handle_capacity)
     }
 
     /// Reference to the reader wait queue, for syscall-level blocking peek.

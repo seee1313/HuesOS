@@ -75,6 +75,13 @@ impl Process {
         }
     }
 
+    /// Set the process's default CPU affinity before its initial thread starts.
+    pub fn set_affinity(&self, cpu: usize) -> crate::Result<()> {
+        let ret = raw::syscall2(Syscall::ProcessSetAffinity, self.0.raw() as u64, cpu as u64);
+        raw::decode(ret)?;
+        Ok(())
+    }
+
     /// Borrow the underlying process handle.
     pub fn handle(&self) -> &Handle {
         &self.0

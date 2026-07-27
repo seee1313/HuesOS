@@ -65,8 +65,9 @@ const RESOURCE_TRANSFER_COMPLETE: &[u8] = b"resource:transfer-complete";
 /// the handles so they stay valid for the driver's lifetime. Exits
 /// on the `resource:transfer-complete` sentinel, on `PEER_CLOSED`, or
 /// on any read error. Blocking wait — zero busy-yield, and no
-/// dependence on `WaitSetWait`'s timeout parameter (which the kernel
-/// currently ignores; that is fixed independently in a follow-up).
+/// dependence on `WaitSetWait`'s timeout parameter. The kernel now parks the
+/// task on the watched object queues and uses the shared timeout table rather
+/// than busy-yielding between polls.
 fn consume_manifest_resources(bootstrap: &libcanvas::Channel) {
     // Bounded static storage for received handles. `Handle` holds a
     // raw HandleValue; keeping the Handles in an array without an

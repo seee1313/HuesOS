@@ -23,7 +23,6 @@ macro_rules! init_logln {
 
 static DRIVER_MANAGER_ELF: &[u8] = include_bytes!(env!("HUESOS_DRIVER_MANAGER_PATH"));
 static TERMINAL_ELF: &[u8] = include_bytes!(env!("HUESOS_TERMINAL_PATH"));
-static ACPI_MANAGER_ELF: &[u8] = include_bytes!(env!("HUESOS_ACPI_MANAGER_PATH"));
 static FAULT_PROBE_ELF: &[u8] = include_bytes!(env!("HUESOS_FAULT_PROBE_PATH"));
 static SHUTDOWN_BROKER_ELF: &[u8] = include_bytes!(env!("HUESOS_SHUTDOWN_BROKER_PATH"));
 
@@ -75,11 +74,10 @@ pub extern "C" fn _start() -> ! {
         );
     }
 
-    // Launch ACPI manager service for table validation and broker policy enforcement.
-    let acpi_manager = launch_service(&mut logger, "acpi-manager", ACPI_MANAGER_ELF);
-    if let Some((_, channel)) = &acpi_manager {
-        read_ready_message(&mut logger, "acpi-manager", channel);
-    }
+    // DriverManager owns the isolated ACPI manager launch because it receives
+    // both the immutable table archive and the unique broker capability over
+    // its bootstrap channel. Launching a second ACPI manager directly from init
+    // would strand that process without its required handles.
 
     // Launch shutdown-broker: the userspace capability owner for
     // atomic halt (Fuchsia-style inversion of control, see
@@ -186,14 +184,18 @@ fn launch_doom(
         let (process, bootstrap) =
             libcanvas::process::spawn_elf_from_vmo("doom", bootfs, doom.offset, doom.len)?;
         init_logln!(logger, "[init] Doom process created; passing capabilities");
-        bootstrap.write_handle(b"keyboard", keyboard.into_handle())?;
+        bootstrap
+            .write_handle(b"keyboard", keyboard.into_handle())
+            .map_err(|(error, _handle)| error)?;
 
         let wad_vmo = bootfs.duplicate(libcanvas::rights::READ | libcanvas::rights::TRANSFER)?;
         let mut metadata = [0u8; 20];
         metadata[..4].copy_from_slice(b"wad\0");
         metadata[4..12].copy_from_slice(&wad.offset.to_le_bytes());
         metadata[12..20].copy_from_slice(&wad.len.to_le_bytes());
-        bootstrap.write_handle(&metadata, wad_vmo.into_handle())?;
+        bootstrap
+            .write_handle(&metadata, wad_vmo.into_handle())
+            .map_err(|(error, _handle)| error)?;
 
         init_logln!(logger, "[init] Doom keyboard and read-only WAD VMO passed");
         terminal.write(b"doom:started")?;
@@ -219,7 +221,9 @@ fn send_bootfs_vmo(logger: &mut InitLogger, dm_bootstrap: &Channel, bootfs: &Vmo
     };
     match dm_bootstrap.write_handle(b"bootfs-vmo", vmo.into_handle()) {
         Ok(()) => init_logln!(logger, "[init] passed HBI BOOTFS VMO to DriverManager"),
-        Err(e) => init_logln!(logger, "[init] failed to pass BOOTFS VMO: {}", e.as_str()),
+        Err((e, _handle)) => {
+            init_logln!(logger, "[init] failed to pass BOOTFS VMO: {}", e.as_str())
+        }
     }
 }
 
@@ -233,14 +237,16 @@ fn send_acpi_tables_vmo(logger: &mut InitLogger, dm_bootstrap: &Channel, tables:
     };
     match dm_bootstrap.write_handle(b"acpi-tables-vmo", vmo.into_handle()) {
         Ok(()) => init_logln!(logger, "[init] passed ACPI table archive to DriverManager"),
-        Err(e) => init_logln!(logger, "[init] failed to pass ACPI archive: {}", e.as_str()),
+        Err((e, _handle)) => {
+            init_logln!(logger, "[init] failed to pass ACPI archive: {}", e.as_str())
+        }
     }
 }
 
 fn send_acpi_broker(logger: &mut InitLogger, dm_bootstrap: &Channel, broker: libcanvas::Handle) {
     match dm_bootstrap.write_handle(b"acpi-broker", broker) {
         Ok(()) => init_logln!(logger, "[init] transferred ACPI broker capability"),
-        Err(error) => init_logln!(
+        Err((error, _handle)) => init_logln!(
             logger,
             "[init] failed to transfer ACPI broker: {}",
             error.as_str()
@@ -282,7 +288,14 @@ fn send_manifest_grants(
     };
     // Bounded static buffer: manifests are small (well under 1 KiB in MVP).
     let mut buf = [0u8; 1024];
-    let take = (entry.len as usize).min(buf.len());
+    if entry.len as usize > buf.len() {
+        init_logln!(
+            logger,
+            "[init] manifest grants: manifest too large for bounded parser"
+        );
+        return;
+    }
+    let take = entry.len as usize;
     let read = match bootfs.read(entry.offset, &mut buf[..take]) {
         Ok(n) => n,
         Err(e) => {
@@ -300,17 +313,17 @@ fn send_manifest_grants(
     if grants.is_empty() {
         init_logln!(
             logger,
-            "[init] manifest {} declares no resource grants; nothing to mint",
+            "[init] manifest {} declares no resource grants; sending barrier",
             driver_name
         );
-        return;
+    } else {
+        init_logln!(
+            logger,
+            "[init] manifest {}: minting {} resource grant(s)",
+            driver_name,
+            grants.len()
+        );
     }
-    init_logln!(
-        logger,
-        "[init] manifest {}: minting {} resource grant(s)",
-        driver_name,
-        grants.len()
-    );
 
     // 2. For each grant: mint + transfer. Bounded-loop iteration keeps
     // us allocation-free even though the manifest is dynamically sized.
@@ -342,11 +355,11 @@ fn send_manifest_grants(
         // future formatter bug by clamping.
         let label_slice = &label[..label_len.min(label.len())];
         // Consume the Resource into an owned Handle and hand it to
-        // the transfer syscall. The Channel wrapper closes the handle
-        // for us on any failure path, so there is no leak on error.
+        // the transfer syscall. On failure, write_handle returns the still-owned
+        // handle; this call drops it after logging, so no reservation leaks.
         match dm_bootstrap.write_handle(label_slice, resource.into_handle()) {
             Ok(()) => sent += 1,
-            Err(e) => init_logln!(
+            Err((e, _handle)) => init_logln!(
                 logger,
                 "[init] manifest {}: write_handle failed for {}: {}",
                 driver_name,
@@ -569,7 +582,7 @@ fn create_driver_manager_registry_channel(
                     init_logln!(logger, "[init] passed registry channel to DriverManager");
                     Some(terminal_end)
                 }
-                Err(e) => {
+                Err((e, _handle)) => {
                     init_logln!(
                         logger,
                         "[init] failed to pass registry channel: {}",
@@ -604,7 +617,7 @@ fn send_terminal_registry_channel(
     };
     match terminal_bootstrap.write_handle(b"driver-manager-registry", registry.into_handle()) {
         Ok(()) => init_logln!(logger, "[init] passed DriverManager registry to terminal"),
-        Err(e) => init_logln!(
+        Err((e, _handle)) => init_logln!(
             logger,
             "[init] failed to pass registry to terminal: {}",
             e.as_str()
@@ -705,7 +718,7 @@ fn launch_shutdown_broker(logger: &mut InitLogger) -> Option<(Process, Channel)>
     let mut label = [0u8; 96];
     let ioport_label_len = format_grant_label(&mut label, "shutdown-broker", &ioport_grant);
     let ioport_label = &label[..ioport_label_len.min(label.len())];
-    if let Err(e) = bootstrap.write_handle(ioport_label, ioport.into_handle()) {
+    if let Err((e, _handle)) = bootstrap.write_handle(ioport_label, ioport.into_handle()) {
         init_logln!(
             logger,
             "[init] shutdown-broker: IoPort transfer failed: {}",
@@ -717,7 +730,7 @@ fn launch_shutdown_broker(logger: &mut InitLogger) -> Option<(Process, Channel)>
     let mut label2 = [0u8; 96];
     let power_label_len = format_grant_label(&mut label2, "shutdown-broker", &power_grant);
     let power_label = &label2[..power_label_len.min(label2.len())];
-    if let Err(e) = bootstrap.write_handle(power_label, power.into_handle()) {
+    if let Err((e, _handle)) = bootstrap.write_handle(power_label, power.into_handle()) {
         init_logln!(
             logger,
             "[init] shutdown-broker: PowerControl transfer failed: {}",

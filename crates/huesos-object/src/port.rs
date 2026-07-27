@@ -123,6 +123,12 @@ impl Port {
         !self.packets.lock().is_empty()
     }
 
+    /// Wait queue used by multiplexed waits to park until the port becomes
+    /// readable. The queue is also woken from IRQ context by [`Self::queue`].
+    pub fn wait_queue(&self) -> &WaitQueue {
+        &self.waiters
+    }
+
     /// Read a packet (non-blocking, FIFO order).
     pub fn read(&self) -> Option<PortPacket> {
         let packet = self.packets.lock().pop_front()?;

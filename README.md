@@ -185,6 +185,15 @@ policy crates are each documented in
 
 See [docs/BUILD.md](docs/BUILD.md) for prerequisites and build instructions.
 
+## Licensing note
+
+First-party HuesOS Rust code is MIT-licensed (see `LICENSE`). The repository
+also vendors third-party components under their own licenses: DoomGeneric is
+GPL-2.0-only, Freedoom assets are BSD-style, Limine is BSD-2-Clause, OVMF/edk2
+is BSD-2-Clause-Patent and related notices, and uACPI carries its upstream
+license. See the corresponding `third_party/*/LICENSE` files before
+redistributing combined binaries or ISOs.
+
 ## Testing
 
 See [docs/TESTING.md](docs/TESTING.md) for unit tests, multi-core QEMU

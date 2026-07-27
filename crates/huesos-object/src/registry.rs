@@ -31,7 +31,8 @@ use huesos_lifecycle::RefAccount;
 
 use crate::irq_guard::IrqSafeMutex;
 use crate::{
-    Interrupt, Job, KernelObject, KernelObjectExt, Koid, Process, Resource, ResourceError,
+    Channel, Interrupt, Job, KernelObject, KernelObjectExt, Koid, Port, Process, Resource,
+    ResourceError,
 };
 
 struct RegistryState {
@@ -295,6 +296,26 @@ pub fn lookup_interrupts_by_irq(irq: u8) -> Vec<Arc<Interrupt>> {
         .unwrap_or_default()
 }
 
+/// Wake waiters observing an object whose handle state changed.
+///
+/// Multi-object waits enqueue on the underlying object's ordinary wait queue;
+/// when a process closes a waited handle, the object may stay alive because the
+/// wait syscall holds a temporary Arc. Waking here lets that waiter re-check its
+/// handle table and report `Signals::CANCELED` instead of sleeping forever.
+pub(crate) fn wake_object_waiters(koid: Koid) {
+    let object = REGISTRY.lock().objects.get(&koid).cloned();
+    let Some(object) = object else {
+        return;
+    };
+    if let Some(channel) = object.downcast_ref::<Channel>() {
+        channel.reader_queue().wake_all();
+    } else if let Some(port) = object.downcast_ref::<Port>() {
+        port.wait_queue().wake_all();
+    } else if let Some(process) = object.downcast_ref::<Process>() {
+        process.exit_waiters.wake_all();
+    }
+}
+
 /// Explicitly remove an object and all typed indexes. Unlike the
 /// count-driven `note_*_close` paths, this ignores the reference account
 /// and always removes the object; existing kernel call sites use it for
@@ -324,7 +345,7 @@ pub fn set_cpu_id_callback(f: fn() -> usize) {
     *CPU_ID_CALLBACK.lock() = Some(f);
 }
 
-fn current_cpu() -> usize {
+pub(crate) fn current_cpu() -> usize {
     // Drop the lock before calling the callback (see
     // `huesos_object::wait::park_current` for why holding a callback
     // mutex guard across the call is unsafe in general, even though this

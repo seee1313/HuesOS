@@ -62,6 +62,9 @@ pub struct Controller<T: NvmeTransport> {
     nsze: u64,
     lba_size: u32,
     identify_buf: u64,
+    io_data_buf: u64,
+    io_data_buf_size: u64,
+    io_prp_list: u64,
     // Capabilities (validated during init).
     mdts: u32,
     max_queue_size: u16,
@@ -99,6 +102,9 @@ impl<T: NvmeTransport> Controller<T> {
             nsze: 0,
             lba_size: 0,
             identify_buf: 0,
+            io_data_buf: 0,
+            io_data_buf_size: 0,
+            io_prp_list: 0,
             mdts: 0,
             max_queue_size: 0,
         }
@@ -235,6 +241,20 @@ impl<T: NvmeTransport> Controller<T> {
         self.admin_size = 16.min(mqes);
         self.io_size = 16.min(mqes);
 
+        // Spec-compliant initialization starts from a disabled controller. A
+        // firmware-warmed or previously-initialized device may already have
+        // CC.EN/RDY set; clear EN and wait for RDY=0 before programming admin
+        // queue registers.
+        self.t.write32(off::CC, 0);
+        for _ in 0..100_000 {
+            if self.t.read32(off::CSTS) & csts::RDY == 0 {
+                break;
+            }
+        }
+        if self.t.read32(off::CSTS) & csts::RDY != 0 {
+            return Err(NvmeError::NotReady);
+        }
+
         let ps = self.page_size as u64;
         self.admin_sq = self.dma_alloc(self.admin_size as u64 * 64, ps)?;
         self.admin_cq = self.dma_alloc(self.admin_size as u64 * 16, ps)?;
@@ -275,10 +295,18 @@ impl<T: NvmeTransport> Controller<T> {
         let mdts_raw = ctrl_id[77];
         // MDTS = 0 means no limit. Otherwise, max transfer = 2^MDTS * page_size.
         self.mdts = if mdts_raw == 0 {
-            u32::MAX
-        } else {
+            // No device-advertised limit. Keep the driver bounded by one
+            // reusable DMA transfer buffer rather than treating u32::MAX as an
+            // allocation request.
+            128 * 1024
+        } else if mdts_raw < 31 {
             (1u32 << mdts_raw).saturating_mul(self.page_size)
+        } else {
+            return Err(NvmeError::InvalidArgs);
         };
+        self.io_data_buf_size = self.mdts as u64;
+        self.io_data_buf = self.dma_alloc(self.io_data_buf_size, ps)?;
+        self.io_prp_list = self.dma_alloc(ps, ps)?;
 
         self.admin_command(build::identify(
             identify::NAMESPACE,
@@ -319,7 +347,13 @@ impl<T: NvmeTransport> Controller<T> {
             return Ok((buf, buf + ps));
         }
         let entries = pages - 1;
-        let list = self.dma_alloc((entries as u64) * 8, ps)?;
+        if entries as u64 * 8 > ps || self.io_prp_list == 0 {
+            // PRP-list chaining is not implemented yet; reject transfers that
+            // would need more than one list page instead of programming an
+            // invalid contiguous list.
+            return Err(NvmeError::InvalidArgs);
+        }
+        let list = self.io_prp_list;
         let mut i = 0;
         while i < entries {
             let e = buf + ((i + 1) as u64) * ps;
@@ -417,7 +451,10 @@ impl<T: NvmeTransport> Controller<T> {
         nlb: u16,
     ) -> Result<(u16, u64, u64), NvmeError> {
         let nbytes = self.checked_io_bytes(lba, nlb)?;
-        let dma = self.dma_alloc(nbytes, self.page_size as u64)?;
+        if self.io_data_buf == 0 || nbytes > self.io_data_buf_size {
+            return Err(NvmeError::OutOfDma);
+        }
+        let dma = self.io_data_buf;
         let (prp1, prp2) = self.setup_prp(dma, nbytes)?;
         let cid = self.submit_io(build::read(self.nsid, lba, nlb, prp1, prp2));
         Ok((cid, dma, nbytes))
@@ -435,7 +472,10 @@ impl<T: NvmeTransport> Controller<T> {
         if buf.len() < nbytes as usize {
             return Err(NvmeError::BufferTooSmall);
         }
-        let dma = self.dma_alloc(nbytes, self.page_size as u64)?;
+        if self.io_data_buf == 0 || nbytes > self.io_data_buf_size {
+            return Err(NvmeError::OutOfDma);
+        }
+        let dma = self.io_data_buf;
         self.t.dma_write(dma, &buf[..nbytes as usize]);
         let (prp1, prp2) = self.setup_prp(dma, nbytes)?;
         let cid = self.submit_io(build::write(self.nsid, lba, nlb, prp1, prp2));
