@@ -56,6 +56,7 @@ for marker in \
     '[init] VMO read/write round-trip OK' \
     '[init] channel IPC round-trip OK' \
     '[init] monotonic clock OK' \
+    '[init] waitset self-test OK' \
     '[driver-manager] launched DriverHost input-host' \
     '[driver-host:input] started' \
     '[driver-host:input] retained' \
@@ -80,7 +81,8 @@ for regression in \
     '[driver-manager] keyboard service requested before ready' \
     '[init] shutdown-broker: IoPort resource mint failed' \
     '[init] shutdown-broker: PowerControl mint failed' \
-    '[terminal] failed to open keyboard service'; do
+    '[terminal] failed to open keyboard service' \
+    '[init] waitset self-test FAILED'; do
     if grep -Fq "$regression" "$log"; then
         echo "regression marker present: $regression" >&2
         tail -200 "$log" >&2

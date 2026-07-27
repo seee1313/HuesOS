@@ -9,7 +9,11 @@ pub(crate) fn sys_debug_write(buf: *const u8, len: usize) -> SyscallResult {
         return Err(ErrorCode::InvalidArgs);
     }
     let bytes = user_memory::copy_from_user(buf, len)?;
-    if let Some(f) = *DEBUG_WRITE_FN.lock() {
+    // Drop the lock before calling the callback (see
+    // `huesos_object::wait::park_current` for why holding a callback
+    // mutex guard across the call is unsafe in general).
+    let debug_write_fn = *DEBUG_WRITE_FN.lock();
+    if let Some(f) = debug_write_fn {
         f(&bytes);
     }
     Ok(len as i64)

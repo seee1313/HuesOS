@@ -30,7 +30,7 @@
 
 use core::panic::PanicInfo;
 use libcanvas::resource::IoPort;
-use libcanvas::{println, Channel, ErrorCode, Handle};
+use libcanvas::{println, wait_any, Channel, ErrorCode, Handle, Signals, WaitItem};
 
 const READY_MESSAGE: &[u8] = b"shutdown-broker:ready";
 const GO_MESSAGE: &[u8] = b"shutdown-broker:go";
@@ -109,76 +109,137 @@ pub extern "C" fn _start() -> ! {
     }
 }
 
+/// Receive the two capability handles init transfers on the bootstrap
+/// channel. Blocks on `wait_any(READABLE | PEER_CLOSED, forever)` and
+/// drains everything currently queued between wakes, so we never
+/// spin-poll and can never exit early because init got scheduled
+/// slower than a fixed yield budget.
+///
+/// The historical bounded 100_000-iteration `read_handle + yield_now`
+/// polling loop was a race with init: on SMP, the broker's CPU could
+/// burn all 100_000 non-blocking reads before init's CPU had a chance
+/// to `write_handle`, causing the broker to exit with
+/// `missing required capability handles` and init to fail its
+/// subsequent `write_handle` with `PeerClosed`. See PR-H commit
+/// message for the full trace. Blocking on the wait primitive
+/// converts the race into deterministic synchronization: kernel wakes
+/// us the tick after init's send commits.
 fn receive_capabilities(
     bootstrap: &Channel,
     ioport: &mut Option<IoPort>,
     power: &mut Option<Handle>,
 ) {
     let mut label = [0u8; 96];
-    // Bounded poll: init transfers the two handles very early, so we
-    // should see both within a few thousand yields. If not, exit path
-    // above prints the diagnostic.
-    for _ in 0..100_000 {
+    let items = [WaitItem::new(
+        bootstrap.handle().raw(),
+        Signals::READABLE | Signals::PEER_CLOSED,
+        0,
+    )];
+    'outer: loop {
         if ioport.is_some() && power.is_some() {
             return;
         }
-        match bootstrap.read_handle(&mut label) {
-            Ok((n, handle)) => {
-                let msg = &label[..n];
-                if !msg.starts_with(RESOURCE_LABEL_PREFIX) {
-                    // Unrelated transfer; drop the handle (closes on
-                    // scope exit) to avoid accumulating.
-                    println!("[shutdown-broker] unexpected handle-transfer label");
-                    drop(handle);
-                    continue;
-                }
-                let tail = &msg[RESOURCE_LABEL_PREFIX.len()..];
-                if tail.starts_with(b"ioport:") {
-                    if ioport.is_some() {
-                        println!("[shutdown-broker] duplicate ioport handle");
+        // Wait forever until either a message arrives or the peer
+        // (init) closes its end. `timeout_ticks == 0` == wait forever
+        // now that `sys_waitset_wait` honours the deadline correctly
+        // (see PR-H Bug C fix).
+        if let Err(e) = wait_any(&items, 0) {
+            println!("[shutdown-broker] bootstrap wait failed: {}", e.as_str());
+            return;
+        }
+        // Drain everything queued in one burst. Because the stream
+        // interleaves handle-transfer messages with (potentially) plain
+        // control messages, use `read_optional_handle` so a plain
+        // message doesn't consume a handle-carrying message's slot.
+        loop {
+            match bootstrap.read_optional_handle(&mut label) {
+                Ok((n, Some(handle))) => {
+                    let msg = &label[..n];
+                    if !msg.starts_with(RESOURCE_LABEL_PREFIX) {
+                        println!("[shutdown-broker] unexpected handle-transfer label");
                         drop(handle);
                         continue;
                     }
-                    *ioport = Some(IoPort::from_handle(handle));
-                } else if tail.starts_with(b"pwr:") {
-                    if power.is_some() {
-                        println!("[shutdown-broker] duplicate power handle");
+                    let tail = &msg[RESOURCE_LABEL_PREFIX.len()..];
+                    if tail.starts_with(b"ioport:") {
+                        if ioport.is_some() {
+                            println!("[shutdown-broker] duplicate ioport handle");
+                            drop(handle);
+                            continue;
+                        }
+                        *ioport = Some(IoPort::from_handle(handle));
+                    } else if tail.starts_with(b"pwr:") {
+                        if power.is_some() {
+                            println!("[shutdown-broker] duplicate power handle");
+                            drop(handle);
+                            continue;
+                        }
+                        *power = Some(handle);
+                    } else {
+                        println!("[shutdown-broker] unknown resource kind in label");
                         drop(handle);
-                        continue;
                     }
-                    *power = Some(handle);
-                } else {
-                    println!("[shutdown-broker] unknown resource kind in label");
-                    drop(handle);
+                    if ioport.is_some() && power.is_some() {
+                        return;
+                    }
                 }
-            }
-            Err(ErrorCode::ShouldWait) | Err(ErrorCode::TimedOut) => {
-                libcanvas::process::yield_now();
-            }
-            Err(e) => {
-                println!("[shutdown-broker] handle read failed: {}", e.as_str());
-                return;
+                Ok((_, None)) => {
+                    // Plain control message intermixed with the
+                    // handle stream; ignore quietly and keep draining.
+                }
+                Err(ErrorCode::ShouldWait) | Err(ErrorCode::TimedOut) => {
+                    // Fully drained; go back to sleep on the waitset.
+                    continue 'outer;
+                }
+                Err(ErrorCode::PeerClosed) => {
+                    println!("[shutdown-broker] bootstrap peer closed during handle transfer");
+                    return;
+                }
+                Err(e) => {
+                    println!("[shutdown-broker] handle read failed: {}", e.as_str());
+                    return;
+                }
             }
         }
     }
 }
 
+/// Wait for init's explicit `shutdown-broker:go` barrier. Same
+/// blocking-wait discipline as [`receive_capabilities`]; the historical
+/// bounded yield-loop had exactly the same race window.
 fn wait_for_go(bootstrap: &Channel) -> bool {
     let mut buf = [0u8; 32];
-    for _ in 0..100_000 {
-        match bootstrap.read_into(&mut buf) {
-            Ok(n) if &buf[..n] == GO_MESSAGE => return true,
-            Ok(_) => {}
-            Err(ErrorCode::ShouldWait) | Err(ErrorCode::TimedOut) => {
-                libcanvas::process::yield_now();
-            }
-            Err(e) => {
-                println!("[shutdown-broker] go read failed: {}", e.as_str());
-                return false;
+    let items = [WaitItem::new(
+        bootstrap.handle().raw(),
+        Signals::READABLE | Signals::PEER_CLOSED,
+        0,
+    )];
+    'outer: loop {
+        if let Err(e) = wait_any(&items, 0) {
+            println!("[shutdown-broker] go wait failed: {}", e.as_str());
+            return false;
+        }
+        loop {
+            match bootstrap.read_into(&mut buf) {
+                Ok(n) if &buf[..n] == GO_MESSAGE => return true,
+                Ok(_) => {
+                    // Non-matching plain message; keep draining before
+                    // parking again.
+                }
+                Err(ErrorCode::ShouldWait) | Err(ErrorCode::TimedOut) => {
+                    continue 'outer;
+                }
+                Err(ErrorCode::PeerClosed) => {
+                    println!("[shutdown-broker] bootstrap peer closed before go barrier");
+                    return false;
+                }
+                Err(e) => {
+                    println!("[shutdown-broker] go read failed: {}", e.as_str());
+                    return false;
+                }
             }
         }
     }
-    false
 }
 
 /// Disable both PS/2 interfaces (commands 0xAD, 0xA7) over the granted

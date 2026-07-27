@@ -101,6 +101,22 @@ impl Port {
         self.dropped_packets.load(Ordering::Relaxed)
     }
 
+    /// Non-destructive readiness check for signal probes (e.g. the
+    /// [`Syscall::WaitSetWait`] handler). Returns `true` while at
+    /// least one packet is queued *without dequeueing anything*, so
+    /// the caller is safe to poll this on every wake without
+    /// accidentally draining IRQ packets that no one will ever see
+    /// again.
+    ///
+    /// The historical `port.read().is_some()` idiom used by
+    /// `huesos-syscalls::waitset::update_waitset_signals` looked
+    /// equivalent but silently consumed a packet — the reason IRQ1
+    /// keystrokes were vanishing between the driver-host and its
+    /// consumers even though every ready check "found" the packet.
+    pub fn has_pending(&self) -> bool {
+        !self.packets.lock().is_empty()
+    }
+
     /// Read a packet (non-blocking, FIFO order).
     pub fn read(&self) -> Option<PortPacket> {
         let packet = self.packets.lock().pop_front()?;
