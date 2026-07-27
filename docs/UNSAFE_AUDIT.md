@@ -1590,3 +1590,136 @@ that disables interrupts on x86 must execute `cli`/`sti`, and merging the
 two sites into one `asm!` block would collapse two distinct SAFETY
 contracts (mask-and-read-RFLAGS vs. conditional-unmask) into one, which is
 worse for review clarity than the +2 counter delta.
+
+## `huesos-object` migration to type-enforced `IrqSafeMutex` (supersedes the ad-hoc `IrqGuard` fix above)
+
+### Why the previous fix was incomplete
+
+The "huesos-object IRQ-guard boundary" fix above wrapped every `spin::Mutex`
+call site *known at the time* with a manually-inserted `let _irq =
+IrqGuard::acquire();` immediately before `.lock()`. Field verification (a
+real QEMU boot with continuous typing) showed the system still froze,
+just less often — the ad-hoc approach missed a lock, proving exactly the
+risk that kind of fix carries: nothing stops a call site from being missed,
+today or in a future change, because there is no compiler-enforced
+relationship between "this data is IRQ-reachable" and "this lock disables
+interrupts".
+
+The missed lock: `huesos_object::wait::PARK_FN` / `WAKE_FN` /
+`CURRENT_TASK_FN` / `TICKS_FN`. These are tiny function-pointer statics that
+do not *look* like part of the same IRQ-reachable graph as `waiters`/
+`async_wakers` (which the first pass did cover), but `wake_task` — which
+locks `WAKE_FN` — is called from `WaitQueue::wake_one`/`wake_all`, which is
+reachable from the keyboard IRQ1 bridge (`Interrupt::signal` ->
+`Port::queue` -> `wake_one`) on the same CPU as ordinary syscall-context
+callers of `wake_one`/`wake_all` (`Channel::send`, `Process::set_exit_code`,
+`Port::queue` itself from non-IRQ syscalls). The exact same self-deadlock
+hazard applied to `WAKE_FN`, just with a narrower window than the
+`REGISTRY`/`Port::packets` case the first pass fixed, hence "freezes less
+often" rather than "no longer freezes".
+
+### Fix: replace convention with a type
+
+Per architectural direction (Zircon `Guard<SpinLock, IrqSave/NoIrqSave>`
+style, chosen over a full seL4-style "IRQ handler never touches the object
+graph" rewrite because it fits the existing Zircon-inspired object model
+without an architecture change): a new type,
+`crate::irq_guard::IrqSafeMutex<T>`, wraps `spin::Mutex<T>` and makes it
+**impossible** to `.lock()` without disabling local interrupts for the
+critical section. `IrqGuard` (the old free-standing RAII disable/restore
+type) is now a private implementation detail of `IrqSafeMutex`, not a
+type callers can forget to use.
+
+Every shared-state field/static in `huesos-object` now uses `IrqSafeMutex`,
+not just the ones a prior audit judged IRQ-reachable:
+`registry::REGISTRY`/`PER_CPU_PROCESSES`/`CPU_ID_CALLBACK`/`ROOT_JOB`/
+`PHYS_TO_VIRT`, `port::Port::{packets, quota}`, `interrupt::Interrupt::
+binding`, `wait::{CURRENT_TASK_FN, PARK_FN, WAKE_FN, TICKS_FN}`,
+`wait::WaitQueue::{waiters, async_wakers}`, `wait::TIMEOUTS`,
+`channel::Channel::{inbox, outbox}`, `handle::HandleTable::table`,
+`job::Job::{name, quota_tree}`, `process::Process::{name, lifecycle,
+user_memory_lock, address_space}`, `thread::Thread::{name, task_id}`,
+`vmar::Vmar::{name, mappings, children}`, `vmo::Vmo::{name, size, frames}`.
+This is deliberately blanket rather than lock-by-lock: the entire point is
+that no one has to correctly reason about which locks are IRQ-reachable
+ever again, including for locks that become IRQ-reachable later as this
+crate evolves.
+
+New CI gate `tools/check-huesos-object-lock-policy.py` (wired into `make
+audit-check`) rejects any `spin::Mutex` type/constructor/import in
+`crates/huesos-object/src/` outside `irq_guard.rs` itself and `#[cfg(test)]`
+blocks. This is the enforcement mechanism that makes the type-level fix
+durable: a future PR that adds a new `spin::Mutex` field to this crate
+fails CI immediately, rather than silently reintroducing the same hazard a
+third time.
+
+### `seL4`-inspired secondary hardening: shrink the IRQ critical section
+
+Independently of the lock-type change, `Interrupt::signal` (the actual IRQ
+handler body) no longer calls `lookup_object` against the global registry
+at all. `InterruptBinding` now stores an owning `Arc<Port>` (captured once,
+at `bind_port` time, in ordinary syscall context) instead of a bare
+`Koid` that `signal` had to re-resolve through `REGISTRY` on every
+interrupt. This follows seL4's design principle of keeping the actual
+hardware-interrupt-context code path as small and side-effect-free as
+possible — the registry lookup, which used to run inside the timing-critical
+IRQ path, now runs once per bind instead of once per keystroke, and the IRQ
+handler's only registry-shaped operation is a cheap `Arc` clone under an
+already-necessary `IrqSafeMutex`.
+
+This required adding `KernelObjectExt::downcast_arc<T>`, a safe (zero
+`unsafe`) owned downcast from `Arc<dyn KernelObject>` to `Arc<T>`,
+implemented via a blanket `AsAnyArc` trait that erases any `KernelObject`
+to `Arc<dyn Any + Send + Sync>` so `alloc`'s own safe `Arc::downcast` can be
+used — `alloc::sync::Arc` in `no_std` does not otherwise expose `Any`
+downcasting the way `std::sync::Arc` does. `sys_interrupt_bind_port`
+(`huesos-syscalls::port_interrupt`) now resolves the `Port` `Arc` once at
+bind time and passes it to `Interrupt::bind_port` instead of passing a
+`Koid` for `Interrupt::signal` to re-resolve later.
+
+### Verification
+
+- `cargo test -p huesos-object --target x86_64-unknown-linux-gnu
+  -Z build-std=`: all 39 tests pass unchanged, including
+  `interrupt_signal_queues_port_packet` (updated to call the new
+  `bind_port(Arc<Port>, key)` signature) and
+  `port_has_pending_is_non_destructive`.
+- `python3 tools/check-huesos-object-lock-policy.py`: new gate passes
+  (zero bare `spin::Mutex` outside `irq_guard.rs`).
+- `make audit-check`: all 6 gates green (the new gate is now wired in).
+- `cargo build -p huesos-boot --release` (`CARGO_BUILD_JOBS=1`): builds
+  clean, including every embedded userspace ELF (init, driver-manager,
+  driver-host-input, terminal, doom+Freedoom WAD, fault-probe,
+  acpi-manager, shutdown-broker).
+- `cargo clippy --workspace --lib --bins -- -D warnings` /
+  `bash scripts/clippy.sh`: clean.
+- `python3 tools/fmt-all.py --check`: clean.
+- `make test`: full host suite green, 0 failures.
+
+### Not verified in this sandbox (no QEMU)
+
+The end-to-end "type continuously for tens of seconds without a freeze"
+path, which is what actually exercises the timing this bug depends on.
+The previous ad-hoc fix's field report ("freezes less often, not never")
+is the direct evidence this second pass responds to; a fresh QEMU
+soak-with-typing test is the authoritative signal for whether the
+type-enforced fix (plus the newly-covered `PARK_FN`/`WAKE_FN` locks) closes
+the hazard completely. Root cause and fix are argued from the complete
+lock graph this time (every `spin::Mutex` in the crate, not a manually
+curated subset), which is the property the ad-hoc fix lacked.
+
+### Safety-budget delta (measured)
+
+```
+unsafe_blocks:    247 -> 247 (unchanged — same two asm! sites, now inside
+  IrqSafeMutex instead of the free-standing IrqGuard; no new unsafe).
+unsafe_functions:  59 ->  59 (unchanged).
+unsafe_impls:      28 ->  28 (unchanged).
+static_mut:         1 ->   1 (unchanged).
+unwrap_calls:      25 ->  25 (unchanged).
+expect_calls:      21 ->  21 (unchanged).
+panic_macros:       5 ->   5 (unchanged).
+```
+
+No new `unsafe` surface: this is a mechanical lock-type migration plus one
+new safe (`downcast_arc`) trait method, not new privileged code.

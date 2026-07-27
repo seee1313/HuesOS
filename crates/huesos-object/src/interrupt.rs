@@ -3,27 +3,30 @@
 use alloc::sync::Arc;
 use core::any::Any;
 use core::sync::atomic::{AtomicU64, Ordering};
-use spin::Mutex;
 
-use crate::irq_guard::IrqGuard;
-use crate::{
-    alloc_koid, lookup_object, KernelObject, KernelObjectExt, Koid, ObjectType, Port, PortPacket,
-};
+use crate::irq_guard::IrqSafeMutex;
+use crate::{alloc_koid, KernelObject, Koid, ObjectType, Port, PortPacket};
 
 /// Binding from an interrupt object to a port.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+///
+/// Holds an owning `Arc<Port>` (not just its `Koid`) so the IRQ handler's
+/// `signal()` never needs to consult the global object registry. This is
+/// the seL4-style minimization of the IRQ critical section: the registry
+/// lookup is only ever needed once, at `bind_port` time (ordinary syscall
+/// context), not on every interrupt.
+#[derive(Clone)]
 pub struct InterruptBinding {
-    /// Destination port koid.
-    pub port: Koid,
+    /// The bound port, held alive independently of userspace handles.
+    port: Arc<Port>,
     /// User-supplied key copied into queued packets.
-    pub key: u64,
+    key: u64,
 }
 
 /// Interrupt — userspace-visible IRQ bridge object.
 pub struct Interrupt {
     koid: Koid,
     irq: u8,
-    binding: Mutex<Option<InterruptBinding>>,
+    binding: IrqSafeMutex<Option<InterruptBinding>>,
     count: AtomicU64,
 }
 
@@ -33,7 +36,7 @@ impl Interrupt {
         Arc::new(Self {
             koid: alloc_koid(),
             irq,
-            binding: Mutex::new(None),
+            binding: IrqSafeMutex::new(None),
             count: AtomicU64::new(0),
         })
     }
@@ -45,38 +48,27 @@ impl Interrupt {
 
     /// Bind this interrupt to `port` with a user-supplied `key`.
     ///
-    /// Called from ordinary syscall context (`Syscall::InterruptBindPort`)
-    /// with interrupts enabled, on the same `binding` lock `signal` takes
-    /// from the IRQ handler on this CPU. Guarded so IRQ1 firing mid-bind
-    /// cannot self-deadlock the CPU (see `crate::irq_guard`).
-    pub fn bind_port(&self, port: Koid, key: u64) {
-        let _irq = IrqGuard::acquire();
+    /// Called from ordinary syscall context (`Syscall::InterruptBindPort`).
+    /// This is the only place that needs the target `Port`'s `Arc`; `signal`
+    /// below never looks it up again, so the IRQ handler's critical section
+    /// never touches the object registry.
+    pub fn bind_port(&self, port: Arc<Port>, key: u64) {
         *self.binding.lock() = Some(InterruptBinding { port, key });
     }
 
     /// Signal this interrupt and queue a packet to the bound port, if any.
     ///
-    /// Called from the IRQ handler. Interrupts are already masked by the
-    /// hardware on entry to an interrupt-gate ISR, but the guard is taken
-    /// symmetrically with `bind_port` regardless — it is a correctness
-    /// invariant of `binding`'s lock, not an artifact of which context
-    /// happens to call in from, and it costs nothing when interrupts are
-    /// already off.
+    /// Called from the IRQ handler. `binding` is an `IrqSafeMutex`, so this
+    /// cannot self-deadlock a CPU whose syscall context (`bind_port`)
+    /// already holds it when an interrupt lands (see `crate::irq_guard`).
+    /// The clone below is a cheap `Arc` refcount bump, not a registry
+    /// lookup — the port itself is looked up once, at bind time.
     pub fn signal(&self, packet_type: u32, data0: u64) {
         let count = self.count.fetch_add(1, Ordering::Relaxed) + 1;
-        let Some(binding) = ({
-            let _irq = IrqGuard::acquire();
-            *self.binding.lock()
-        }) else {
+        let Some(binding) = self.binding.lock().clone() else {
             return;
         };
-        let Some(port_obj) = lookup_object(binding.port) else {
-            return;
-        };
-        let Some(port) = port_obj.downcast_ref::<Port>() else {
-            return;
-        };
-        let _ = port.queue(PortPacket {
+        let _ = binding.port.queue(PortPacket {
             key: binding.key,
             packet_type,
             status: 0,

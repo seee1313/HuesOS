@@ -1,8 +1,8 @@
 //! Capability handles and per-process handle tables.
 
+use crate::irq_guard::IrqSafeMutex;
 use alloc::vec::Vec;
 use bitflags::bitflags;
-use spin::Mutex;
 
 use crate::{note_handle_close, note_handle_open, Koid};
 
@@ -77,14 +77,14 @@ pub enum HandleTableError {
 
 /// Per-process handle table.
 pub struct HandleTable {
-    table: Mutex<Vec<Option<Handle>>>,
+    table: IrqSafeMutex<Vec<Option<Handle>>>,
 }
 
 impl HandleTable {
     /// Create empty handle table.
     pub fn new() -> Self {
         Self {
-            table: Mutex::new(Vec::new()),
+            table: IrqSafeMutex::new(Vec::new()),
         }
     }
     /// Add a handle, return its value. Value 0 is reserved as

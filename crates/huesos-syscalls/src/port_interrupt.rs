@@ -93,9 +93,9 @@ pub(crate) fn sys_interrupt_bind_port(
 
     let port_obj = huesos_object::lookup_object(port_h.koid).ok_or(ErrorCode::BadHandle)?;
     let port = port_obj
-        .downcast_ref::<huesos_object::Port>()
-        .ok_or(ErrorCode::WrongType)?;
+        .downcast_arc::<huesos_object::Port>()
+        .map_err(|_| ErrorCode::WrongType)?;
 
-    interrupt.bind_port(port.koid(), key);
+    interrupt.bind_port(port, key);
     Ok(0)
 }

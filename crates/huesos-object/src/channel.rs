@@ -1,11 +1,11 @@
 //! Channel IPC objects.
 
+use crate::irq_guard::IrqSafeMutex;
 use alloc::collections::VecDeque;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::any::Any;
 use core::sync::atomic::{AtomicBool, Ordering};
-use spin::Mutex;
 
 use crate::wait::{self, WaitQueue};
 use crate::{alloc_koid, Handle, KernelObject, Koid, ObjectType};
@@ -26,9 +26,9 @@ pub const MAX_CHANNEL_QUEUE_HANDLES: u64 = 256;
 pub struct Channel {
     koid: Koid,
     /// Queue this endpoint *reads from* (the peer writes into it).
-    inbox: Arc<Mutex<MessageQueue>>,
+    inbox: Arc<IrqSafeMutex<MessageQueue>>,
     /// Queue this endpoint *writes to* (the peer reads from it).
-    outbox: Arc<Mutex<MessageQueue>>,
+    outbox: Arc<IrqSafeMutex<MessageQueue>>,
     /// Waiters blocked in a read on this endpoint (shared with peer's
     /// `peer_readers` so `send` can wake them).
     readers: Arc<WaitQueue>,
@@ -195,8 +195,8 @@ impl Channel {
     /// Create a connected pair of channel endpoints. Writing to one and
     /// reading from the other (or vice versa) delivers messages correctly.
     pub fn pair() -> Result<(Arc<Self>, Arc<Self>), ChannelCreateError> {
-        let q1 = Arc::new(Mutex::new(MessageQueue::new()?));
-        let q2 = Arc::new(Mutex::new(MessageQueue::new()?));
+        let q1 = Arc::new(IrqSafeMutex::new(MessageQueue::new()?));
+        let q2 = Arc::new(IrqSafeMutex::new(MessageQueue::new()?));
         let readers_a = Arc::new(WaitQueue::new());
         let readers_b = Arc::new(WaitQueue::new());
         let alive_a = Arc::new(AtomicBool::new(true));
@@ -230,8 +230,8 @@ impl Channel {
         let readers = Arc::new(WaitQueue::new());
         Ok(Arc::new(Self {
             koid: alloc_koid(),
-            inbox: Arc::new(Mutex::new(MessageQueue::new()?)),
-            outbox: Arc::new(Mutex::new(MessageQueue::new()?)),
+            inbox: Arc::new(IrqSafeMutex::new(MessageQueue::new()?)),
+            outbox: Arc::new(IrqSafeMutex::new(MessageQueue::new()?)),
             readers: Arc::clone(&readers),
             peer_readers: readers,
             local_alive: Arc::new(AtomicBool::new(true)),

@@ -5,10 +5,28 @@ use core::any::Any;
 
 use crate::Koid;
 
+/// Blanket-implemented helper that lets any concrete kernel object type be
+/// converted from an owned `Arc<Self>` into `Arc<dyn Any + Send + Sync>`,
+/// which `alloc::sync::Arc` can safely `downcast::<T>()` back from (this is
+/// exactly `std`/`alloc`'s own `Arc<dyn Any>::downcast`, just reached
+/// through our custom `KernelObject` trait object instead of a bare `dyn
+/// Any`). No per-type boilerplate is required: the blanket impl covers
+/// every `KernelObject` automatically.
+pub trait AsAnyArc {
+    /// Erase to `Arc<dyn Any + Send + Sync>` for a safe owned downcast.
+    fn as_any_arc(self: Arc<Self>) -> Arc<dyn Any + Send + Sync>;
+}
+
+impl<T: Any + Send + Sync> AsAnyArc for T {
+    fn as_any_arc(self: Arc<Self>) -> Arc<dyn Any + Send + Sync> {
+        self
+    }
+}
+
 /// Trait for all kernel objects. `Any` enables safe downcasting from the
 /// type-erased registry back to the concrete object type (e.g. `Vmo`,
 /// `Channel`) that syscalls need.
-pub trait KernelObject: Send + Sync + Any {
+pub trait KernelObject: Send + Sync + Any + AsAnyArc {
     /// Return the object type.
     fn object_type(&self) -> ObjectType;
     /// Return the kernel object id.
@@ -21,11 +39,25 @@ pub trait KernelObject: Send + Sync + Any {
 pub trait KernelObjectExt {
     /// Attempt to downcast to a concrete kernel object type `T`.
     fn downcast_ref<T: KernelObject + 'static>(&self) -> Option<&T>;
+    /// Attempt to downcast an owned `Arc<dyn KernelObject>` to `Arc<T>`,
+    /// returning the original `Arc` unchanged on mismatch. Implemented with
+    /// zero `unsafe`: clones the `Arc`, erases the clone to `Arc<dyn Any +
+    /// Send + Sync>` via [`AsAnyArc`], and uses `alloc`'s own safe
+    /// `Arc::downcast`.
+    fn downcast_arc<T: KernelObject + 'static>(self) -> Result<Arc<T>, Arc<dyn KernelObject>>;
 }
 
 impl KernelObjectExt for Arc<dyn KernelObject> {
     fn downcast_ref<T: KernelObject + 'static>(&self) -> Option<&T> {
         self.as_any().downcast_ref::<T>()
+    }
+
+    fn downcast_arc<T: KernelObject + 'static>(self) -> Result<Arc<T>, Arc<dyn KernelObject>> {
+        let any_arc: Arc<dyn Any + Send + Sync> = Arc::clone(&self).as_any_arc();
+        match any_arc.downcast::<T>() {
+            Ok(t) => Ok(t),
+            Err(_) => Err(self),
+        }
     }
 }
 
