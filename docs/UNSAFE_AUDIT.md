@@ -1296,3 +1296,152 @@ No new `unsafe`. Both `receive_capabilities` and `wait_for_go`
 remain zero-alloc, no-panic, and now scale correctly to arbitrary
 init scheduling delay because the wait is bounded by the peer's
 actual behavior instead of a fixed 100 000-yield fuel budget.
+
+## `qemu-boot (release, 1)` flaky hang: callback-mutex-guard-held-across-park root cause (PR #127 follow-up)
+
+### Symptom
+
+`qemu-boot (release, 1)` intermittently timed out in CI with no
+"kernel panic" marker and no further serial output after the last
+`[kernel] entering userspace: rip=0x400030 ...` line — i.e. the
+system stopped making *any* progress, including timer ticks, rather
+than crashing or livelocking a single task. The hang was not
+reliably reproducible on every run (it depended on host CPU
+scheduling pressure), which is why it surfaced as CI flakiness on
+`release,1` rather than a deterministic failure on every profile.
+
+### Root cause
+
+`huesos-object::wait` (and three other call sites) used the pattern
+
+```rust
+fn park_current() {
+    if let Some(f) = *PARK_FN.lock() {
+        f();
+    }
+}
+```
+
+`if let PAT = EXPR { BODY }` (and the equivalent `match EXPR { ... }`,
+`.and_then(...)`, `.map(...)` chains applied directly to a `.lock()`
+temporary) extends the temporary's lifetime — including the
+`MutexGuard` returned by `.lock()` — across the *entire* `if let`/
+`match` expression, not just the condition. That means the guard is
+still held while `BODY` runs.
+
+For `current_task_id`, `wake_task`, `now_ticks`, `current_cpu`, and
+`sys_debug_write` this was harmless because the callback returns
+quickly. For `park_current` it was not: `PARK_FN` resolves to
+`huesos_kernel::scheduler::park_current`, which performs a real
+context switch and only returns once a later `wake_task` call makes
+this task runnable again — an arbitrarily long time later, possibly
+never if no one else can make progress.
+
+Holding the `PARK_FN` `Mutex` guard for that entire window means: any
+other task or CPU that calls `huesos_object::wait::park_current` or
+`wake_task` before the first task is woken spins forever on the
+`spin::Mutex` (`PARK_FN`/`WAKE_FN` are separate statics but the same
+class of bug applies to both, and `wake_task` is called from the
+timer interrupt path). Because `park_current`/`wake_task` in
+`huesos-kernel::scheduler` run with interrupts disabled around the
+scheduler lock, a task permanently spinning on `PARK_FN` inside a
+syscall (interrupts masked by `SFMask` on `syscall` entry until the
+handler re-enables them) prevents the LAPIC/PIT timer tick from ever
+being serviced again — a full, silent, unrecoverable system hang
+with no panic message. This matches the observed symptom exactly:
+diagnostic tick counters added while root-causing this confirmed the
+monotonic tick counter stops advancing at the moment of the hang.
+
+The race window: `init` spawns a child (`wait-probe` in
+`run_process_wait_check`, or later `wait-any` calls against
+`shutdown-broker`/`terminal`) and itself parks (directly, or via
+`ProcessWait`/`WaitSetWait`, which bottom out in the same
+`park_current`). On a single CPU, if the freshly spawned child's
+first `park_current`/`wake_task` call lands before the parking task's
+own call has returned (specifically: before its context switch has
+completed and the lock has been dropped), the two calls interleave on
+`PARK_FN`/`WAKE_FN` and deadlock. This is timing-dependent —
+`release` LTO and host scheduling pressure changed the odds enough to
+make it common in CI but rare in an idle local sandbox, which is
+consistent with the flaky, profile/CPU-count-dependent failure
+pattern observed across `qemu-boot` matrix runs.
+
+### Why this was missed for so long
+
+The exact same class of bug had already been identified and fixed
+once, for a different callback: `huesos_syscalls::process::sys_yield`
+uses the correct pattern —
+
+```rust
+// Never hold a callback mutex across a context switch.
+let yield_fn = *YIELD_FN.lock();
+if let Some(f) = yield_fn {
+    f();
+}
+```
+
+— with an explicit comment calling out the hazard. `park_current`,
+`wake_task`, `current_task_id`, `now_ticks` in
+`huesos-object::wait`, `current_cpu` in `huesos-object::registry`,
+`current_tick` in `huesos-syscalls::waitset`, and `sys_debug_write`
+in `huesos-syscalls::debug` were not updated to match when that
+pattern was established, because none of these call sites *looked*
+like a context switch at the point they were written — `PARK_FN` is
+just `Option<fn()>` stored behind a generic wait-queue abstraction
+that does not, in its own module, reveal that the function pointer
+it stores can block indefinitely.
+
+### Fix
+
+Every `MUTEX.lock()` whose stored callback can be called while the
+guard is still notionally live now has the guard bound to a local,
+dropped, and only *then* invoked — matching the existing `sys_yield`
+pattern exactly:
+
+```rust
+let park_fn = *PARK_FN.lock();
+if let Some(f) = park_fn {
+    f();
+}
+```
+
+Fixed in:
+
+* `huesos-object::wait::park_current` (the actual hang cause).
+* `huesos-object::wait::wake_task`, `current_task_id`, `now_ticks`
+  (same anti-pattern, lower risk today, fixed for consistency and to
+  close off the same class of regression before it becomes load-bearing).
+* `huesos-object::registry::current_cpu`.
+* `huesos-syscalls::waitset::current_tick`.
+* `huesos-syscalls::debug::sys_debug_write`.
+
+`huesos-syscalls::system::sys_monotonic_ticks`'s existing
+`(*CLOCK_FN.lock()).ok_or(...)? ` was checked and is *not* an
+instance of this bug: `ok_or` immediately unwraps to an owned `fn`
+value bound to a `let`, and the guard temporary is dropped at the end
+of that `let` statement, before the following statement calls `clock()`.
+
+### Verification
+
+* `python3 tools/audit-safety.py` / `check-safety-budget.py`: no
+  change to any counted category (pure safe-Rust lock-scope fix, zero
+  new `unsafe`).
+* `make audit-check`: all 5 gates green.
+* `cargo clippy --workspace --lib --bins -- -D warnings` /
+  `bash scripts/clippy.sh`: clean.
+* `make test`: full host suite green, 0 failures.
+* `bash scripts/ci-qemu-smoke.sh release 1 120` run 5/5 times green
+  (previously reproduced the hang locally by running the same script
+  under artificial host CPU load, matching the CI failure signature
+  byte-for-byte, including the exact last serial line before the
+  hang).
+* `bash scripts/ci-qemu-smoke.sh` also re-run once each for
+  `debug 1`, `debug 2`, `release 2`, and
+  `scripts/ci-qemu-extable-smoke.sh` for `debug`/`release`: all green.
+
+### `safety-budget.json` delta
+
+No change: `unsafe_blocks`, `unsafe_functions`, `unsafe_impls`,
+`static_mut`, `unwrap_calls`, `expect_calls`, `panic_macros` all
+unchanged. `rust_lines` increases only by the added explanatory
+comments.

@@ -316,7 +316,12 @@ pub fn set_cpu_id_callback(f: fn() -> usize) {
 }
 
 fn current_cpu() -> usize {
-    if let Some(f) = *CPU_ID_CALLBACK.lock() {
+    // Drop the lock before calling the callback (see
+    // `huesos_object::wait::park_current` for why holding a callback
+    // mutex guard across the call is unsafe in general, even though this
+    // particular callback is short and non-blocking).
+    let cpu_id_fn = *CPU_ID_CALLBACK.lock();
+    if let Some(f) = cpu_id_fn {
         f()
     } else {
         0

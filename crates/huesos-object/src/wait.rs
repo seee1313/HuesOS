@@ -35,23 +35,58 @@ pub fn set_ticks_fn(ticks: fn() -> u64) {
 }
 
 fn current_task_id() -> Option<TaskId> {
-    (*CURRENT_TASK_FN.lock()).and_then(|f| f())
+    // Copy the `Option<fn>` out and drop the guard *before* calling it.
+    // `if let Some(f) = *MUTEX.lock() { f() }` (and the equivalent
+    // `.and_then`/`.map` chains on a `.lock()` temporary) extend the
+    // guard's lifetime across the whole arm/closure body, because the
+    // temporary in a `match`/`if let` scrutinee lives until the end of
+    // the enclosing expression. That is harmless for a short call, but
+    // `park_current` below calls into the scheduler's blocking park,
+    // which performs a real context switch and may not return for an
+    // arbitrary amount of time — see the `park_current` doc comment.
+    let current_task_fn = *CURRENT_TASK_FN.lock();
+    current_task_fn.and_then(|f| f())
 }
 
+/// Park the current task via the scheduler-installed hook.
+///
+/// # Why the guard must be dropped before calling `f()`
+///
+/// This resolves to `huesos_kernel::scheduler::park_current`, which
+/// performs a real context switch and only returns once a matching
+/// `wake_task` call has made this task runnable again — that can be an
+/// arbitrarily long time later. Calling `f()` while still holding the
+/// `PARK_FN` mutex guard (as `if let Some(f) = *PARK_FN.lock() { f() }`
+/// does, due to temporary lifetime extension in `if let` scrutinees)
+/// means the lock stays held for the entire time this task is parked.
+/// Any other CPU/task that calls `park_current` or `wake_task` before
+/// this task is woken then spins forever on `PARK_FN`/`WAKE_FN` with
+/// interrupts disabled, which stops the timer tick from ever firing
+/// again — a full, unrecoverable system hang. This was the root cause
+/// of the flaky `qemu-boot (release, 1)` CI hang: `init` parking (e.g.
+/// via `ProcessWait`/`WaitSetWait`) raced a freshly spawned task's own
+/// park/wake path on the single CPU.
+///
+/// The fix is the same pattern already used by
+/// `huesos_syscalls::process::sys_yield`: copy the `Option<fn>` out of
+/// the mutex into a local, let the guard drop, and only then invoke it.
 fn park_current() {
-    if let Some(f) = *PARK_FN.lock() {
+    let park_fn = *PARK_FN.lock();
+    if let Some(f) = park_fn {
         f();
     }
 }
 
 fn wake_task(id: TaskId) {
-    if let Some(f) = *WAKE_FN.lock() {
+    let wake_fn = *WAKE_FN.lock();
+    if let Some(f) = wake_fn {
         f(id);
     }
 }
 
 fn now_ticks() -> u64 {
-    (*TICKS_FN.lock()).map(|f| f()).unwrap_or(0)
+    let ticks_fn = *TICKS_FN.lock();
+    ticks_fn.map(|f| f()).unwrap_or(0)
 }
 
 /// Yield to the scheduler without parking on a wait queue.

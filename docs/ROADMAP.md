@@ -7,6 +7,32 @@ priority order.
 
 ## Done (recent)
 
+### Fixed flaky `qemu-boot (release, 1)` CI hang: callback-mutex guard held across `park_current`
+- Root cause: `huesos_object::wait::park_current` (and five other, lower-risk
+  call sites) called `f()` while still holding the `MutexGuard` from
+  `*PARK_FN.lock()`, because `if let Some(f) = *MUTEX.lock() { f() }` extends
+  the lock's temporary lifetime across the whole body. `park_current` performs
+  a real context switch and may not return for an arbitrary time, so any
+  other task/CPU calling `park_current`/`wake_task` before the first one was
+  woken spun forever on the mutex with interrupts disabled — stopping the
+  timer tick permanently and hanging the system with no panic message. This
+  is the actual cause of the `qemu-boot (release, 1)` CI flakiness (not a bug
+  in the `sys_waitset_wait`/shutdown-broker fixes from PR #127, which remain
+  correct and necessary on their own).
+- Fixed by copying the `Option<fn>` out of the lock into a local before
+  calling it, matching the pattern already used (and commented) in
+  `huesos_syscalls::process::sys_yield`. Applied to
+  `huesos_object::wait::{park_current, wake_task, current_task_id,
+  now_ticks}`, `huesos_object::registry::current_cpu`,
+  `huesos_syscalls::waitset::current_tick`, and
+  `huesos_syscalls::debug::sys_debug_write`.
+- Zero safety-budget impact (pure safe-Rust lock-scope fix, no new
+  `unsafe`). Full writeup in `docs/UNSAFE_AUDIT.md`.
+- Verified: `bash scripts/ci-qemu-smoke.sh release 1 120` green 5/5 under
+  artificial host CPU load that previously reproduced the hang; `debug 1`,
+  `debug 2`, `release 2`, and both `ci-qemu-extable-smoke.sh` profiles also
+  re-verified green.
+
 ### NVMe host-test unwraps retired; `unwrap_calls` back to 25
 - The five `.unwrap()` calls introduced by NVMe `buffer_pool` host tests
   (previously tracked as Immediate #0b) have been rewritten around an

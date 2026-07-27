@@ -97,7 +97,12 @@ pub(crate) fn sys_waitset_wait(args_ptr: *const WaitSetWaitArgs) -> SyscallResul
 /// way. Every real syscall path runs after
 /// `huesos_syscalls::set_clock_fn`.
 fn current_tick() -> u64 {
-    match *crate::callbacks::CLOCK_FN.lock() {
+    // Drop the lock before calling the callback (see
+    // `huesos_object::wait::park_current` for why holding a callback
+    // mutex guard across the call is unsafe in general, even though this
+    // particular callback is short and non-blocking).
+    let clock_fn = *crate::callbacks::CLOCK_FN.lock();
+    match clock_fn {
         Some(f) => f(),
         None => 0,
     }
