@@ -22,6 +22,7 @@ use alloc::vec::Vec;
 use huesos_lifecycle::RefAccount;
 use spin::Mutex;
 
+use crate::irq_guard::IrqGuard;
 use crate::{
     Interrupt, Job, KernelObject, KernelObjectExt, Koid, Process, Resource, ResourceError,
 };
@@ -89,12 +90,27 @@ impl RegistryState {
 
 static REGISTRY: Mutex<RegistryState> = Mutex::new(RegistryState::new());
 
+/// Take the registry lock with local interrupts disabled.
+///
+/// `lookup_object` and `lookup_interrupts_by_irq` are called from the
+/// keyboard IRQ1 bridge (`Interrupt::signal`) on the same CPU that runs
+/// ordinary syscall-context code locking `REGISTRY`. Every call site in this
+/// module goes through this helper so a keystroke can never land while the
+/// same CPU already holds `REGISTRY`, which would otherwise self-deadlock
+/// the CPU (and, because `REGISTRY` is global, eventually the whole
+/// system). See `crate::irq_guard` for the full hazard writeup.
+fn lock_registry() -> (IrqGuard, spin::MutexGuard<'static, RegistryState>) {
+    let irq = IrqGuard::acquire();
+    let guard = REGISTRY.lock();
+    (irq, guard)
+}
+
 /// Register a new object before publishing its first handle. Idempotent
 /// re-registration is not supported; the caller must not register the same
 /// koid twice.
 pub fn register_object(object: Arc<dyn KernelObject>) {
     let koid = object.koid();
-    let mut state = REGISTRY.lock();
+    let (_irq, mut state) = lock_registry();
     state.accounts.insert(koid, RefAccount::registered());
     state.objects.insert(koid, object);
 }
@@ -104,7 +120,7 @@ pub fn note_handle_open(koid: Koid) {
     if !koid.is_valid() {
         return;
     }
-    let mut state = REGISTRY.lock();
+    let (_irq, mut state) = lock_registry();
     if let Some(account) = state.accounts.get_mut(&koid) {
         // open_handles returns false if the account has already been
         // collected; ignoring is correct because a stale reference to a
@@ -119,7 +135,7 @@ pub fn note_handle_close(koid: Koid) {
         return;
     }
     let removed = {
-        let mut state = REGISTRY.lock();
+        let (_irq, mut state) = lock_registry();
         if let Some(account) = state.accounts.get_mut(&koid) {
             account.close_handles(1);
         }
@@ -139,7 +155,7 @@ pub fn acquire_kernel_ref(koid: Koid) -> Option<Arc<dyn KernelObject>> {
     if !koid.is_valid() {
         return None;
     }
-    let mut state = REGISTRY.lock();
+    let (_irq, mut state) = lock_registry();
     let object = state.objects.get(&koid).cloned()?;
     let account = state.accounts.get_mut(&koid)?;
     // open_kernel_refs returns false only if collected — impossible here
@@ -154,7 +170,7 @@ pub fn note_kernel_ref_open(koid: Koid) {
     if !koid.is_valid() {
         return;
     }
-    let mut state = REGISTRY.lock();
+    let (_irq, mut state) = lock_registry();
     if let Some(account) = state.accounts.get_mut(&koid) {
         let _ = account.open_kernel_refs(1);
     }
@@ -166,7 +182,7 @@ pub fn note_kernel_ref_close(koid: Koid) {
         return;
     }
     let removed = {
-        let mut state = REGISTRY.lock();
+        let (_irq, mut state) = lock_registry();
         if let Some(account) = state.accounts.get_mut(&koid) {
             account.close_kernel_refs(1);
         }
@@ -179,7 +195,7 @@ pub fn note_kernel_ref_close(koid: Koid) {
 pub fn register_process(process: Arc<Process>) {
     let koid = process.koid();
     {
-        let mut state = REGISTRY.lock();
+        let (_irq, mut state) = lock_registry();
         state.processes.insert(koid, Arc::clone(&process));
     }
     register_object(process);
@@ -188,7 +204,7 @@ pub fn register_process(process: Arc<Process>) {
 /// Re-run process collection after setting its exit status.
 pub fn collect_exited_process(koid: Koid) {
     let removed = {
-        let mut state = REGISTRY.lock();
+        let (_irq, mut state) = lock_registry();
         let exited = state
             .processes
             .get(&koid)
@@ -204,17 +220,20 @@ pub fn collect_exited_process(koid: Koid) {
 
 /// Return `(handle_refs, kernel_refs)` for diagnostics and leak tests.
 pub fn object_ref_counts(koid: Koid) -> (u32, u32) {
-    REGISTRY.lock().ref_counts(koid)
+    let (_irq, state) = lock_registry();
+    state.ref_counts(koid)
 }
 
 /// Lookup an object by koid, returning an owning temporary reference.
 pub fn lookup_object(koid: Koid) -> Option<Arc<dyn KernelObject>> {
-    REGISTRY.lock().objects.get(&koid).cloned()
+    let (_irq, state) = lock_registry();
+    state.objects.get(&koid).cloned()
 }
 
 /// Lookup a process by koid.
 pub fn lookup_process(koid: Koid) -> Option<Arc<Process>> {
-    REGISTRY.lock().processes.get(&koid).cloned()
+    let (_irq, state) = lock_registry();
+    state.processes.get(&koid).cloned()
 }
 
 /// Atomically overlap-check a candidate `Resource` against existing
@@ -236,7 +255,7 @@ pub fn lookup_process(koid: Koid) -> Option<Arc<Process>> {
 /// `resource.rs`.
 pub(crate) fn try_register_resource_locked(candidate: Arc<Resource>) -> Result<(), ResourceError> {
     let koid = candidate.koid();
-    let mut state = REGISTRY.lock();
+    let (_irq, mut state) = lock_registry();
     for existing in state.objects.values() {
         if existing.object_type() != crate::ObjectType::Resource {
             continue;
@@ -267,7 +286,7 @@ pub(crate) fn try_register_resource_locked(candidate: Arc<Resource>) -> Result<(
 /// Register an interrupt for both object lookup and IRQ fanout.
 pub fn register_interrupt(interrupt: Arc<Interrupt>) {
     {
-        let mut state = REGISTRY.lock();
+        let (_irq, mut state) = lock_registry();
         state
             .interrupts
             .entry(interrupt.irq())
@@ -279,12 +298,8 @@ pub fn register_interrupt(interrupt: Arc<Interrupt>) {
 
 /// Snapshot interrupt listeners for an IRQ.
 pub fn lookup_interrupts_by_irq(irq: u8) -> Vec<Arc<Interrupt>> {
-    REGISTRY
-        .lock()
-        .interrupts
-        .get(&irq)
-        .cloned()
-        .unwrap_or_default()
+    let (_irq, state) = lock_registry();
+    state.interrupts.get(&irq).cloned().unwrap_or_default()
 }
 
 /// Explicitly remove an object and all typed indexes. Unlike the
@@ -293,7 +308,7 @@ pub fn lookup_interrupts_by_irq(irq: u8) -> Vec<Arc<Interrupt>> {
 /// hard cleanup after a spawn failure or an explicit teardown.
 pub fn unregister_object(koid: Koid) {
     let removed = {
-        let mut state = REGISTRY.lock();
+        let (_irq, mut state) = lock_registry();
         state.accounts.remove(&koid);
         state.processes.remove(&koid);
         for list in state.interrupts.values_mut() {
@@ -329,14 +344,21 @@ fn current_cpu() -> usize {
 }
 
 /// Set the current process.
+///
+/// Reachable from the scheduler's context-switch path, which can run with
+/// interrupts disabled already or run right before an IRQ that itself reads
+/// `PER_CPU_PROCESSES` (indirectly, via `current_process`) — guard for the
+/// same reason as `REGISTRY` above.
 pub fn set_current_process(p: Arc<Process>) {
     let cpu = current_cpu().min(63);
+    let _irq = IrqGuard::acquire();
     PER_CPU_PROCESSES.lock()[cpu] = Some(p);
 }
 
 /// Get the current process.
 pub fn current_process() -> Option<Arc<Process>> {
     let cpu = current_cpu().min(63);
+    let _irq = IrqGuard::acquire();
     PER_CPU_PROCESSES.lock()[cpu].clone()
 }
 

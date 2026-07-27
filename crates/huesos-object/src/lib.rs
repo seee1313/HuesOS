@@ -13,6 +13,7 @@ mod acpi_broker;
 mod channel;
 mod handle;
 mod interrupt;
+mod irq_guard;
 mod job;
 mod koid;
 mod object;

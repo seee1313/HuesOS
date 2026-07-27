@@ -8,6 +8,8 @@ use alloc::vec::Vec;
 use core::task::Waker;
 use spin::Mutex;
 
+use crate::irq_guard::IrqGuard;
+
 /// Scheduler task identifier (matches `Task::id`).
 pub type TaskId = u64;
 
@@ -103,6 +105,14 @@ pub fn yield_to_scheduler() {
 /// Supports two waiter types: scheduler tasks (blocking syscalls)
 /// and async wakers (futures). When wake_one/wake_all fires,
 /// both types are notified.
+///
+/// `wake_one`/`wake_all` are reachable from the keyboard IRQ1 bridge
+/// (`Interrupt::signal` -> `Port::queue` -> `WaitQueue::wake_one`) on the
+/// same CPU that runs ordinary syscall-context code locking `waiters`/
+/// `async_wakers` (`enqueue`, `remove`, `prepare`). Every method below
+/// disables local interrupts for its critical section so a keystroke can
+/// never land while the same CPU already holds either lock — see
+/// `crate::irq_guard` for the full hazard writeup.
 pub struct WaitQueue {
     waiters: Mutex<Vec<TaskId>>,
     async_wakers: Mutex<Vec<Waker>>,
@@ -120,6 +130,7 @@ impl WaitQueue {
     /// Register an async waker. When wake_one/wake_all fires,
     /// the waker is invoked so the future re-polls.
     pub fn register_waker(&self, waker: &Waker) {
+        let _irq = IrqGuard::acquire();
         let mut wakers = self.async_wakers.lock();
         for existing in wakers.iter_mut() {
             if existing.will_wake(waker) {
@@ -131,11 +142,13 @@ impl WaitQueue {
 
     /// Remove all registered async wakers.
     pub fn clear_wakers(&self) {
+        let _irq = IrqGuard::acquire();
         self.async_wakers.lock().clear();
     }
 
     /// Enqueue `task` if not already waiting.
     pub fn enqueue(&self, task: TaskId) {
+        let _irq = IrqGuard::acquire();
         let mut w = self.waiters.lock();
         if !w.contains(&task) {
             w.push(task);
@@ -144,6 +157,7 @@ impl WaitQueue {
 
     /// Remove a specific waiter (e.g. after wake or cancel).
     pub fn remove(&self, task: TaskId) {
+        let _irq = IrqGuard::acquire();
         self.waiters.lock().retain(|&t| t != task);
     }
 
@@ -151,6 +165,7 @@ impl WaitQueue {
     /// async wakers so futures re-poll.
     pub fn wake_one(&self) {
         let id = {
+            let _irq = IrqGuard::acquire();
             let mut w = self.waiters.lock();
             if w.is_empty() {
                 None
@@ -162,6 +177,7 @@ impl WaitQueue {
             wake_task(id);
         }
         let wakers: Vec<Waker> = {
+            let _irq = IrqGuard::acquire();
             let mut w = self.async_wakers.lock();
             core::mem::take(&mut *w)
         };
@@ -173,6 +189,7 @@ impl WaitQueue {
     /// Wake every waiter. Also wakes all registered async wakers.
     pub fn wake_all(&self) {
         let waiters = {
+            let _irq = IrqGuard::acquire();
             let mut w = self.waiters.lock();
             core::mem::take(&mut *w)
         };
@@ -180,6 +197,7 @@ impl WaitQueue {
             wake_task(id);
         }
         let wakers: Vec<Waker> = {
+            let _irq = IrqGuard::acquire();
             let mut w = self.async_wakers.lock();
             core::mem::take(&mut *w)
         };
@@ -337,19 +355,26 @@ struct TimeoutEntry {
 
 static TIMEOUTS: Mutex<Vec<TimeoutEntry>> = Mutex::new(Vec::new());
 
+/// `arm_timeout`/`cancel_timeout` run from syscall context (interrupts
+/// enabled) via `PreparedWait::park_timeout`; `notify_tick` runs from the
+/// timer IRQ handler on the same CPU. Same self-deadlock hazard as
+/// `REGISTRY`/`Port`/`WaitQueue` above — see `crate::irq_guard`.
 fn arm_timeout(task: TaskId, deadline: u64) {
+    let _irq = IrqGuard::acquire();
     let mut t = TIMEOUTS.lock();
     t.retain(|e| e.task != task);
     t.push(TimeoutEntry { task, deadline });
 }
 
 fn cancel_timeout(task: TaskId) {
+    let _irq = IrqGuard::acquire();
     TIMEOUTS.lock().retain(|e| e.task != task);
 }
 
 /// Called from the scheduler timer path each tick to wake timed-out waiters.
 pub fn notify_tick(now: u64) {
     let expired: Vec<TaskId> = {
+        let _irq = IrqGuard::acquire();
         let mut t = TIMEOUTS.lock();
         let mut out = Vec::new();
         t.retain(|e| {

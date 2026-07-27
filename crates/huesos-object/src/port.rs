@@ -6,6 +6,7 @@ use core::any::Any;
 use core::sync::atomic::{AtomicU64, Ordering};
 use spin::Mutex;
 
+use crate::irq_guard::IrqGuard;
 use crate::wait::{self, WaitQueue};
 use crate::{alloc_koid, KernelObject, Koid, ObjectType};
 use huesos_quota::{Limits, Quota, Resource, UNLIMITED};
@@ -75,8 +76,15 @@ impl Port {
     /// Queue a packet and wake one blocked reader. This path is bounded and
     /// does not allocate after Port creation, making it suitable for IRQ
     /// producers.
+    ///
+    /// Runs from the keyboard IRQ1 bridge (`Interrupt::signal`) as well as
+    /// from ordinary syscall/kernel code, so `packets`/`quota` are taken
+    /// with local interrupts disabled: a keystroke landing on this CPU
+    /// while it already holds either lock would otherwise self-deadlock
+    /// the CPU (see `crate::irq_guard`).
     pub fn queue(&self, packet: PortPacket) -> Result<(), PortQueueError> {
         let packet_bytes = core::mem::size_of::<PortPacket>() as u64;
+        let _irq = IrqGuard::acquire();
         let mut packets = self.packets.lock();
         let mut quota = self.quota.lock();
         if packets.len() >= MAX_PORT_PACKETS || !quota.fits(Resource::Memory, packet_bytes) {
@@ -113,12 +121,22 @@ impl Port {
     /// equivalent but silently consumed a packet — the reason IRQ1
     /// keystrokes were vanishing between the driver-host and its
     /// consumers even though every ready check "found" the packet.
+    ///
+    /// Guarded the same way as [`Self::queue`]: this is called from
+    /// `sys_waitset_wait`'s poll loop with interrupts enabled, on the
+    /// same lock the keyboard IRQ1 bridge uses.
     pub fn has_pending(&self) -> bool {
+        let _irq = IrqGuard::acquire();
         !self.packets.lock().is_empty()
     }
 
     /// Read a packet (non-blocking, FIFO order).
+    ///
+    /// Guarded the same way as [`Self::queue`]: called from ordinary
+    /// syscall context (`Syscall::PortRead`) with interrupts enabled, on
+    /// the same locks the keyboard IRQ1 bridge uses from IRQ context.
     pub fn read(&self) -> Option<PortPacket> {
+        let _irq = IrqGuard::acquire();
         let packet = self.packets.lock().pop_front()?;
         let packet_bytes = core::mem::size_of::<PortPacket>() as u64;
         self.quota.lock().release(Resource::Memory, packet_bytes);
