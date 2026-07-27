@@ -48,9 +48,14 @@ impl Vmo {
 
     /// Create a VMO and charge its physical-page budget to `job`.
     pub fn new_in_job(size: usize, job: Option<Arc<Job>>) -> Result<Arc<Self>, VmoError> {
+        if size == 0 || size > 4 * 1024 * 1024 * 1024 {
+            return Err(VmoError::OutOfMemory);
+        }
         let koid = alloc_koid();
         let page_count = size.div_ceil(PAGE_SIZE).max(1);
-        let charged_bytes = (page_count as u64).saturating_mul(PAGE_SIZE as u64);
+        let charged_bytes = (page_count as u64)
+            .checked_mul(PAGE_SIZE as u64)
+            .ok_or(VmoError::OutOfMemory)?;
         if let Some(owner) = &job {
             if !owner.charge(huesos_quota::Resource::Memory, charged_bytes) {
                 return Err(VmoError::OutOfMemory);
@@ -169,10 +174,15 @@ impl Vmo {
         if new_size <= *size {
             return Ok(());
         }
+        if new_size > 4 * 1024 * 1024 * 1024 {
+            return Err(VmoError::OutOfMemory);
+        }
         let mut frames = self.frames.lock();
         let needed_pages = new_size.div_ceil(PAGE_SIZE);
         let additional_pages = needed_pages.saturating_sub(frames.len());
-        let additional_bytes = (additional_pages as u64).saturating_mul(PAGE_SIZE as u64);
+        let additional_bytes = (additional_pages as u64)
+            .checked_mul(PAGE_SIZE as u64)
+            .ok_or(VmoError::OutOfMemory)?;
         if let Some(owner) = &self.job {
             if !owner.charge(huesos_quota::Resource::Memory, additional_bytes) {
                 return Err(VmoError::OutOfMemory);
