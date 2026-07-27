@@ -1445,3 +1445,148 @@ No change: `unsafe_blocks`, `unsafe_functions`, `unsafe_impls`,
 `static_mut`, `unwrap_calls`, `expect_calls`, `panic_macros` all
 unchanged. `rust_lines` increases only by the added explanatory
 comments.
+
+## `huesos-object` IRQ-guard boundary (dedicated safety-budget review)
+
+### The bug this closes
+
+`huesos-object`'s global object registry (`REGISTRY`), `Port::packets`/
+`Port::quota`, `Interrupt::binding`, and `WaitQueue::waiters`/
+`async_wakers`/`TIMEOUTS` are all plain `spin::Mutex`. Every one of them is
+reachable from *two* contexts on the same CPU:
+
+- ordinary syscall-context code, which runs with interrupts enabled
+  (`Syscall::PortRead`, `Syscall::InterruptBindPort`,
+  `Syscall::WaitSetWait`'s poll loop, `ProcessWait`'s blocking park/timeout
+  path, ...);
+- the keyboard IRQ1 hardware interrupt handler
+  (`huesos_arch::x86_64::idt::keyboard_irq_ack` ->
+  `huesos_arch::x86_64::irq_callback::emit` ->
+  `huesos_kernel::init::handle_irq` -> `Interrupt::signal` ->
+  `Port::queue` -> `WaitQueue::wake_one`), and the timer IRQ handler
+  (`huesos_object::wait::notify_tick`).
+
+A plain `spin::Mutex` has no notion of interrupt context. If syscall-path
+code takes one of these locks and a keystroke (or timer tick) fires on the
+*same* CPU before the guard is dropped, the IRQ handler tries to take the
+same lock and spins forever: the owning context can never resume (it is
+preempted inside the IRQ handler) to release the lock the IRQ handler is
+waiting for. This is a single-CPU self-deadlock — it does not require SMP
+or a second CPU to reproduce, and it stops the local CPU's timer tick along
+with everything else, with no panic message.
+
+Concretely, the field-reported symptom ("clean boot, keyboard input works
+for a moment, then either the terminal or the entire system freezes") is
+`sys_waitset_wait`'s poll loop (`huesos-syscalls::waitset`) calling
+`yield_now()` — which re-enables interrupts before returning — immediately
+followed by `update_waitset_signals`, which locks `REGISTRY` and a `Port`'s
+`packets` queue with interrupts back on. A keystroke landing in that window
+on the CPU running `driver-host:input`'s (or `terminal`'s) wait loop
+deadlocks that CPU solid. The bug is latent at boot (the window is a few
+instructions wide) and becomes reliable within seconds of real typing,
+because every additional keystroke and every additional
+`WaitSetWait`/`ChannelRead`/`PortRead` poll iteration is another roll of the
+dice against the same narrow window.
+
+### Why this was missed
+
+The equivalent hazard for `huesos-pmm`'s allocator lock (a `spin::Mutex`
+reachable from both ordinary calls and the page-fault handler's re-entrant
+`alloc_frame`) was already found and fixed with a crate-local IRQ-mask
+guard — see "PMM IRQ-guard boundary" above. `huesos-object`'s registry/
+Port/Interrupt/WaitQueue locks are the *same* class of hazard, already
+called out as a known gap in `docs/LOCK_ORDER.md`'s "Runtime enforcement
+status" section ("Legacy `spin::Mutex` instances remain in the
+platform-neutral object and syscall crates... They must move to a
+host-testable shared ranked-lock core before runtime enforcement is
+considered complete"), but had not yet been closed.
+
+### Fix
+
+New `crates/huesos-object/src/irq_guard.rs`: a verbatim reuse of
+`huesos-pmm`'s `IrqGuard` pattern (RAII `cli` on construction, conditional
+`sti` on drop, no-op under `cfg(not(target_os = "none"))` so host tests are
+unaffected). `huesos-object` cannot depend on `huesos-arch`'s
+`RankedIrqSafeTicketLock` for the same reason `huesos-pmm` cannot: it must
+stay host-testable (`cargo test -p huesos-object` runs on the host with no
+per-CPU GS-BASE machinery), and pulling in the ranked-lock machinery would
+either break that or require gating the whole crate behind
+`target_arch = "x86_64"`.
+
+Every lock identified above now takes `IrqGuard::acquire()` immediately
+before locking, for the duration of the critical section:
+
+- `huesos_object::registry`: `lock_registry()` helper wraps every
+  `REGISTRY.lock()` call site (`register_object`, `note_handle_open`,
+  `note_handle_close`, `acquire_kernel_ref`, `note_kernel_ref_open`,
+  `note_kernel_ref_close`, `register_process`, `collect_exited_process`,
+  `object_ref_counts`, `lookup_object`, `lookup_process`,
+  `try_register_resource_locked`, `register_interrupt`,
+  `lookup_interrupts_by_irq`, `unregister_object`); `set_current_process`/
+  `current_process` similarly guard `PER_CPU_PROCESSES`.
+- `huesos_object::port::Port`: `queue`, `has_pending`, and `read` all guard
+  `packets`/`quota`.
+- `huesos_object::interrupt::Interrupt`: `bind_port` and `signal` both guard
+  `binding` (bind_port runs from ordinary syscall context with interrupts
+  enabled; signal runs from the IRQ handler, where interrupts are already
+  masked by hardware on interrupt-gate entry — the guard there is a
+  correctness invariant of the lock, not conditional on which context
+  happens to call in, and costs nothing when interrupts are already off).
+- `huesos_object::wait::WaitQueue`: `register_waker`, `clear_wakers`,
+  `enqueue`, `remove`, `wake_one`, `wake_all` all guard `waiters`/
+  `async_wakers`.
+- `huesos_object::wait`: `arm_timeout`, `cancel_timeout`, `notify_tick` all
+  guard `TIMEOUTS` (the timer-IRQ counterpart of the same hazard: armed by
+  `PreparedWait::park_timeout` from syscall context, drained by the timer
+  IRQ handler on the same CPU).
+
+`CPU_ID_CALLBACK` was checked and left unguarded: it is read-mostly
+(`set_cpu_id_callback` runs once at boot, before interrupts are enabled)
+and is not itself reachable from an IRQ handler.
+
+### Verification
+
+- `python3 tools/audit-safety.py` / `check-safety-budget.py`: `unsafe_blocks`
+  245 -> 247 (+2, both accounted for below); every other counter unchanged.
+- `make audit-check`: all 5 gates green (lock-policy, policy-crates,
+  hues-async noalloc, and fmt are untouched by this change; `huesos-object`
+  correctly remains off the `RankedIrqSafeTicketLock`-enforced crate list
+  checked by `tools/check-lock-policy.py`, since it is still not
+  IRQ-context-verified by that tool — it now uses the PMM-style local guard
+  instead, exactly like `huesos-pmm` already does).
+- `cargo test -p huesos-object --target x86_64-unknown-linux-gnu
+  -Z build-std=`: all 39 tests pass unchanged, including
+  `interrupt_signal_queues_port_packet` and
+  `port_has_pending_is_non_destructive` — confirming `IrqGuard` is a true
+  no-op on the host target and does not change any observable behavior
+  there.
+- `cargo build -p huesos-boot --release` (kernel target,
+  `CARGO_BUILD_JOBS=1`): builds clean.
+- `cargo clippy --workspace --lib --bins -- -D warnings` /
+  `bash scripts/clippy.sh`: clean across every standalone crate.
+- `python3 tools/fmt-all.py --check`: clean.
+- `make test`: full host suite green, 0 failures.
+
+### Safety-budget delta (measured)
+
+```
+unsafe_blocks:    245 -> 247 (+2).
+  crates/huesos-object/src/irq_guard.rs: 0 -> 2 (+2) — the same two `asm!`
+    sites as huesos-pmm's IrqGuard (`cli` on acquire, conditional `sti` on
+    drop), gated to `target_arch = "x86_64", target_os = "none"` only.
+unsafe_functions:  59 -> 59 (unchanged).
+unsafe_impls:      28 -> 28 (unchanged).
+static_mut:         1 ->  1 (unchanged).
+unwrap_calls:      25 -> 25 (unchanged).
+expect_calls:      21 -> 21 (unchanged).
+panic_macros:       5 ->  5 (unchanged).
+rust_files:       156 -> 157 (+1; new irq_guard.rs).
+rust_lines:     39478 -> 39715 (+237; new module + guard call sites + docs).
+```
+
+Both new `unsafe` blocks are irreducible for the design, for the same
+reason documented under "PMM IRQ-guard boundary" above: any lock wrapper
+that disables interrupts on x86 must execute `cli`/`sti`, and merging the
+two sites into one `asm!` block would collapse two distinct SAFETY
+contracts (mask-and-read-RFLAGS vs. conditional-unmask) into one, which is
+worse for review clarity than the +2 counter delta.

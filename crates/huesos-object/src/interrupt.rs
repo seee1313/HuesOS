@@ -5,6 +5,7 @@ use core::any::Any;
 use core::sync::atomic::{AtomicU64, Ordering};
 use spin::Mutex;
 
+use crate::irq_guard::IrqGuard;
 use crate::{
     alloc_koid, lookup_object, KernelObject, KernelObjectExt, Koid, ObjectType, Port, PortPacket,
 };
@@ -43,14 +44,30 @@ impl Interrupt {
     }
 
     /// Bind this interrupt to `port` with a user-supplied `key`.
+    ///
+    /// Called from ordinary syscall context (`Syscall::InterruptBindPort`)
+    /// with interrupts enabled, on the same `binding` lock `signal` takes
+    /// from the IRQ handler on this CPU. Guarded so IRQ1 firing mid-bind
+    /// cannot self-deadlock the CPU (see `crate::irq_guard`).
     pub fn bind_port(&self, port: Koid, key: u64) {
+        let _irq = IrqGuard::acquire();
         *self.binding.lock() = Some(InterruptBinding { port, key });
     }
 
     /// Signal this interrupt and queue a packet to the bound port, if any.
+    ///
+    /// Called from the IRQ handler. Interrupts are already masked by the
+    /// hardware on entry to an interrupt-gate ISR, but the guard is taken
+    /// symmetrically with `bind_port` regardless — it is a correctness
+    /// invariant of `binding`'s lock, not an artifact of which context
+    /// happens to call in from, and it costs nothing when interrupts are
+    /// already off.
     pub fn signal(&self, packet_type: u32, data0: u64) {
         let count = self.count.fetch_add(1, Ordering::Relaxed) + 1;
-        let Some(binding) = *self.binding.lock() else {
+        let Some(binding) = ({
+            let _irq = IrqGuard::acquire();
+            *self.binding.lock()
+        }) else {
             return;
         };
         let Some(port_obj) = lookup_object(binding.port) else {

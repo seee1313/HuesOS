@@ -7,6 +7,41 @@ priority order.
 
 ## Done (recent)
 
+### Fixed keyboard self-deadlock: IRQ-safe guards for `huesos-object` registry/Port/Interrupt/WaitQueue locks
+- Root cause: the keyboard IRQ1 bridge (`Interrupt::signal` -> `Port::queue`
+  -> `WaitQueue::wake_one`) and the timer IRQ (`wait::notify_tick`) share
+  several plain `spin::Mutex` locks (`REGISTRY`, `Port::packets`/`quota`,
+  `Interrupt::binding`, `WaitQueue::waiters`/`async_wakers`, the wait-timeout
+  table) with ordinary syscall-context code that runs with interrupts
+  enabled (`PortRead`, `InterruptBindPort`, `WaitSetWait`'s poll loop,
+  `ProcessWait`'s timeout path). A keystroke or timer tick landing on the
+  same CPU while syscall-context code already holds one of these locks
+  self-deadlocks that CPU: the IRQ handler cannot get the lock, and the
+  lock holder cannot resume because it is preempted inside the IRQ handler
+  that is spinning on it. This reproduced as "keyboard input works for a
+  few seconds, then the terminal or the entire system freezes solid", with
+  the local CPU's timer tick stopping and no panic message — a single-CPU
+  hazard, not an SMP race, so it did not require `-smp 2` to trigger.
+- Fixed with a new crate-local `huesos_object::irq_guard::IrqGuard`, a
+  verbatim reuse of `huesos-pmm`'s existing IRQ-mask-around-`lock()` pattern
+  (see `docs/UNSAFE_AUDIT.md` "PMM IRQ-guard boundary"), applied to every
+  affected lock. `huesos-object` still cannot depend on
+  `huesos-arch::RankedIrqSafeTicketLock` without losing host-testability, so
+  this closes the gap `docs/LOCK_ORDER.md` had flagged as outstanding
+  ("Legacy `spin::Mutex` instances remain in the platform-neutral object
+  and syscall crates... must move to a host-testable shared ranked-lock
+  core") without requiring that larger migration.
+- Safety-budget delta: `unsafe_blocks` 245 -> 247 (+2; the same two `cli`/
+  `sti` `asm!` sites as the PMM guard, gated to real kernel builds and a
+  no-op under host tests). Full writeup and verification log in
+  `docs/UNSAFE_AUDIT.md` § "huesos-object IRQ-guard boundary".
+- Verified: `cargo test -p huesos-object` (all 39 tests, unchanged
+  behavior on host target), `cargo build -p huesos-boot --release`,
+  `cargo clippy -D warnings` / `scripts/clippy.sh`, `make test` (full host
+  suite), `make audit-check` (5/5 gates) all green locally. QEMU boot/
+  keyboard-under-load verification is via CI's `qemu-boot` matrix per
+  `docs/TESTING.md`.
+
 ### Fixed flaky `qemu-boot (release, 1)` CI hang: callback-mutex guard held across `park_current`
 - Root cause: `huesos_object::wait::park_current` (and five other, lower-risk
   call sites) called `f()` while still holding the `MutexGuard` from
