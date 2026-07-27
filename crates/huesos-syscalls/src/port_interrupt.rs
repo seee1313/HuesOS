@@ -11,9 +11,11 @@ pub(crate) fn sys_port_create(out: *mut HandleValue) -> SyscallResult {
     let koid = port.koid();
     huesos_object::register_object(port);
     let proc = current_proc()?;
-    let handle = proc.handles.add(Handle::new(koid, Rights::DEFAULT));
-    user_memory::write_value(out, &handle)?;
-    Ok(0)
+    proc.handles
+        .add_with_commit(Handle::new(koid, Rights::DEFAULT), |handle| {
+            user_memory::write_value(out, &handle)
+        })
+        .map(|_| 0)
 }
 
 pub(crate) fn sys_port_read(
@@ -62,9 +64,11 @@ pub(crate) fn sys_interrupt_create(irq: u32, out: *mut HandleValue) -> SyscallRe
     huesos_object::register_interrupt(interrupt);
 
     let proc = current_proc()?;
-    let handle = proc.handles.add(Handle::new(koid, Rights::DEFAULT));
-    user_memory::write_value(out, &handle)?;
-    Ok(0)
+    proc.handles
+        .add_with_commit(Handle::new(koid, Rights::DEFAULT), |handle| {
+            user_memory::write_value(out, &handle)
+        })
+        .map(|_| 0)
 }
 
 pub(crate) fn sys_interrupt_bind_port(

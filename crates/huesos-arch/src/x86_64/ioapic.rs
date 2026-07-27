@@ -93,7 +93,10 @@ fn map_mmio(base: u64) -> Result<(), IoApicError> {
     super::paging::map_hhdm_range_flags(
         base,
         0x20,
-        PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::NO_CACHE,
+        PageTableFlags::PRESENT
+            | PageTableFlags::WRITABLE
+            | PageTableFlags::NO_CACHE
+            | PageTableFlags::NO_EXECUTE,
     )
     .map_err(|_| IoApicError::Mapping)
 }

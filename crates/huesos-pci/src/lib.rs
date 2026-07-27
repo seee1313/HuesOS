@@ -113,8 +113,11 @@ impl ConfigSpace {
         }
     }
     /// Raw BAR register `n` (0..6).
-    pub fn bar_raw(&self, n: usize) -> u32 {
-        self.read_u32(off::BAR0 + n * 4)
+    pub fn bar_raw(&self, n: usize) -> Option<u32> {
+        if n >= 6 {
+            return None;
+        }
+        Some(self.read_u32(off::BAR0 + n * 4))
     }
     /// True if a device is present (vendor ID is not all-ones).
     pub fn is_present(&self) -> bool {
@@ -133,9 +136,12 @@ impl ConfigSpace {
         self.0[off::SUBCLASS] = subclass;
         self.0[off::PROG_IF] = prog_if;
     }
-    /// Set a BAR register (raw value).
+    /// Set a BAR register (raw value). Out-of-range indexes are ignored so
+    /// malformed mock setup cannot panic.
     pub fn set_bar_raw(&mut self, n: usize, v: u32) {
-        self.write_u32(off::BAR0 + n * 4, v);
+        if n < 6 {
+            self.write_u32(off::BAR0 + n * 4, v);
+        }
     }
     /// Set command-register bits.
     pub fn set_command(&mut self, bits: u16) {
@@ -251,8 +257,12 @@ pub struct MockPciDevice {
 impl MockPciDevice {
     /// Decode BAR `n` from its raw register and the stored size mask.
     pub fn decode_bar(&self, n: usize) -> Bar {
-        let lo = self.config.bar_raw(n);
-        let mask = self.bar_sizes[n];
+        let Some(lo) = self.config.bar_raw(n) else {
+            return Bar::Unused;
+        };
+        let Some(&mask) = self.bar_sizes.get(n) else {
+            return Bar::Unused;
+        };
         if lo & 1 == 0 {
             let size = memory_bar_size(mask);
             if size == 0 {
@@ -260,7 +270,7 @@ impl MockPciDevice {
             }
             let is_64 = ((lo >> 1) & 0x3) == 0b10;
             let hi = if is_64 && n + 1 < 6 {
-                self.config.bar_raw(n + 1)
+                self.config.bar_raw(n + 1).unwrap_or_default()
             } else {
                 0
             };

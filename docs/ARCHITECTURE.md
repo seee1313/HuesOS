@@ -101,8 +101,8 @@ page describes the intended privileged integration.
 |-------|------------------|
 | CpuLocal | `huesos-arch::cpu_local`, GS_BASE |
 | Per-CPU GDT/TSS | `PerCpuGdt` (APs); BSP uses static GDT early |
-| Per-CPU scheduler | `PER_CPU_SCHEDULERS[lapic_id]`, spinlock |
-| Online mask | `ONLINE_CPUS` — spawn only onto online CPUs |
+| Per-CPU scheduler | `PER_CPU_SCHEDULERS[dense_cpu_index]`, spinlock |
+| Online mask | `ONLINE_CPUS` — dense CPU-index bits; LAPIC IDs are resolved only when sending IPIs |
 | Timer | LAPIC periodic vector `0x20`; EOI LAPIC (+ PIC for legacy) |
 | IPI | `ipi_reschedule` wakes remote idle CPUs on spawn |
 | Syscall | STAR/LSTAR/SFMASK **per CPU** |
@@ -115,8 +115,8 @@ reserved/ACPI/MMIO — and there is **no** unconditional low 4 GiB identity
 map. The kernel therefore:
 
 - Maps ACPI-related ranges + RSDP window via `map_hhdm_range`
-- Maps LAPIC MMIO with `PRESENT|WRITABLE|NO_CACHE` (and `update_flags` if a
-  page was already present)
+- Maps LAPIC/IOAPIC MMIO with `PRESENT|WRITABLE|NO_CACHE|NO_EXECUTE` and
+  propagates mapping/update failures instead of treating them as best-effort
 - Identity-maps the first 64 KiB for the AP trampoline / `ApBootInfo`
 
 ## Memory Model

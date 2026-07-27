@@ -1,14 +1,9 @@
 //! Channel IPC syscalls.
 
-use alloc::vec::Vec;
 use huesos_abi::{ChannelConsumeArgs, ChannelPeekArgs, ChannelReadEtcArgs, ErrorCode, HandleValue};
 use huesos_object::{ChannelRecvError, Handle, KernelObject, KernelObjectExt, Rights};
 
-use crate::{
-    user_memory,
-    util::{current_proc, DeferGuard},
-    SyscallResult,
-};
+use crate::{user_memory, util::current_proc, SyscallResult};
 
 fn map_recv_error(error: ChannelRecvError) -> huesos_abi::ErrorCode {
     match error {
@@ -32,22 +27,16 @@ pub(crate) fn sys_channel_create(out0: *mut HandleValue, out1: *mut HandleValue)
     huesos_object::register_object(ch0);
     huesos_object::register_object(ch1);
     let proc = current_proc()?;
-    let hv0 = proc.handles.add(Handle::new(koid0, Rights::DEFAULT));
-    let hv1 = proc.handles.add(Handle::new(koid1, Rights::DEFAULT));
-
-    // Rollback: if either write fails, remove both handles and unregister
-    // both channel objects so the pair is fully cleaned up.
-    let rollback = DeferGuard::new(|| {
-        let _ = proc.handles.remove(hv0);
-        let _ = proc.handles.remove(hv1);
-        huesos_object::unregister_object(koid0);
-        huesos_object::unregister_object(koid1);
-    });
-
-    user_memory::write_value(out0, &hv0)?;
-    user_memory::write_value(out1, &hv1)?;
-    rollback.commit();
-    Ok(0)
+    proc.handles
+        .add_pair_with_commit(
+            Handle::new(koid0, Rights::DEFAULT),
+            Handle::new(koid1, Rights::DEFAULT),
+            |hv0, hv1| {
+                user_memory::write_value(out0, &hv0)?;
+                user_memory::write_value(out1, &hv1)
+            },
+        )
+        .map(|_| 0)
 }
 
 pub(crate) fn sys_channel_write(
@@ -150,24 +139,43 @@ pub(crate) fn sys_channel_read(
         .downcast_ref::<huesos_object::Channel>()
         .ok_or(ErrorCode::WrongType)?;
     let msg = match wait_mode {
-        0 => ch
-            .recv_status()
-            .map_err(map_recv_error)?
-            .ok_or(ErrorCode::ShouldWait)?,
-        1 => ch.recv_blocking().map_err(map_recv_error)?,
-        ticks => ch
-            .recv_blocking_timeout(ticks)
-            .map_err(map_recv_error)?
-            .ok_or(ErrorCode::TimedOut)?,
+        0 => match ch.recv_if_fits(capacity, 0) {
+            Ok(Some(msg)) => msg,
+            Ok(None) => return Err(ErrorCode::ShouldWait),
+            Err(error) => return Err(map_recv_error(error)),
+        },
+        1 => ch
+            .recv_if_fits_blocking(capacity, 0)
+            .map_err(map_recv_error)?,
+        ticks => loop {
+            match ch.recv_if_fits(capacity, 0) {
+                Ok(Some(msg)) => break msg,
+                Ok(None) => {
+                    let prepared = ch.reader_queue().prepare().ok_or(ErrorCode::PeerClosed)?;
+                    match ch.recv_if_fits(capacity, 0) {
+                        Ok(Some(msg)) => {
+                            prepared.cancel();
+                            break msg;
+                        }
+                        Ok(None) => match prepared.park_timeout(ticks) {
+                            huesos_object::wait::ParkResult::Woken => continue,
+                            huesos_object::wait::ParkResult::TimedOut => {
+                                return Err(ErrorCode::TimedOut);
+                            }
+                        },
+                        Err(error) => {
+                            prepared.cancel();
+                            return Err(map_recv_error(error));
+                        }
+                    }
+                }
+                Err(error) => return Err(map_recv_error(error)),
+            }
+        },
     };
 
-    // The message is dequeued; if copy_to_user or write_value fail, the
-    // message data is lost but ChannelMessage::Drop releases any in-flight
-    // handles via note_handle_close. No handle leak, but data loss is
-    // unavoidable without a peek/consume split (future hardening).
-    let to_copy = msg.data.len().min(capacity);
-    user_memory::copy_to_user(buf, &msg.data[..to_copy])?;
-    user_memory::write_value(out_actual, &(to_copy as u32))?;
+    user_memory::copy_to_user(buf, &msg.data)?;
+    user_memory::write_value(out_actual, &(msg.data.len() as u32))?;
     Ok(0)
 }
 
@@ -199,13 +207,6 @@ pub(crate) fn sys_channel_read_etc(
     let ch = obj
         .downcast_ref::<huesos_object::Channel>()
         .ok_or(ErrorCode::WrongType)?;
-    // Reserve the bounded destination handle staging area before dequeueing.
-    // An OOM result must not consume a message or its in-flight capabilities.
-    let mut received_values = Vec::new();
-    received_values
-        .try_reserve_exact(handle_capacity)
-        .map_err(|_| ErrorCode::NoMemory)?;
-
     let mut msg = if wait_mode == 0 {
         match ch.recv_if_fits(byte_capacity, handle_capacity) {
             Ok(Some(msg)) => msg,
@@ -223,22 +224,16 @@ pub(crate) fn sys_channel_read_etc(
     user_memory::write_value(args.out_bytes, &(msg.data.len() as u32))?;
 
     let transferred = core::mem::take(&mut msg.handles);
-    for handle in transferred {
-        received_values.push(proc.handles.add_existing(handle));
-    }
-
-    // Rollback: if the handle-array or count write fails after handles have
-    // been inserted into the caller's table, remove them. The transferred
-    // Handle objects are dropped (note_handle_close fires for each).
-    let rollback = DeferGuard::new(|| {
-        for &hv in &received_values {
-            let _ = proc.handles.remove(hv);
-        }
-    });
-
-    user_memory::write_array(args.handles, &received_values)?;
-    user_memory::write_value(args.out_handles, &(received_values.len() as u32))?;
-    rollback.commit();
+    let transferred_count = transferred.len();
+    let mut received_values = [0 as HandleValue; user_memory::MAX_CHANNEL_HANDLES];
+    proc.handles.add_existing_many_with_commit(
+        transferred,
+        &mut received_values[..transferred_count],
+        |values| {
+            user_memory::write_array(args.handles, values)?;
+            user_memory::write_value(args.out_handles, &(values.len() as u32))
+        },
+    )?;
     Ok(0)
 }
 
@@ -330,43 +325,24 @@ pub(crate) fn sys_channel_consume(args_ptr: *const ChannelConsumeArgs) -> Syscal
         .downcast_ref::<huesos_object::Channel>()
         .ok_or(ErrorCode::WrongType)?;
 
-    let mut msg = ch.consume(args.cookie).ok_or(ErrorCode::InvalidArgs)?;
+    let mut msg = ch
+        .consume_if_fits(args.cookie, byte_capacity, handle_capacity)
+        .map_err(map_recv_error)?
+        .ok_or(ErrorCode::InvalidArgs)?;
 
-    // Message dequeued; copy out data + handles.
-    if msg.data.len() > byte_capacity {
-        // Caller peeked a larger message but provided a smaller buffer.
-        // Drop the message (handles released via ChannelMessage::Drop).
-        return Err(ErrorCode::InvalidArgs);
-    }
     user_memory::copy_to_user(args.bytes, &msg.data)?;
     user_memory::write_value(args.out_bytes, &(msg.data.len() as u32))?;
 
     let transferred = core::mem::take(&mut msg.handles);
-    if transferred.len() > handle_capacity {
-        // Should not happen (peek reported handle_count), but guard anyway.
-        for handle in transferred {
-            huesos_object::note_handle_close(handle.koid);
-        }
-        return Err(ErrorCode::InvalidArgs);
-    }
-
-    let mut received_values = alloc::vec::Vec::new();
-    received_values
-        .try_reserve_exact(transferred.len())
-        .map_err(|_| ErrorCode::NoMemory)?;
-
-    for handle in transferred {
-        received_values.push(proc.handles.add_existing(handle));
-    }
-
-    // If write_array fails, roll back the handle-table insertions manually
-    // (no DeferGuard — avoids a borrow conflict with the Vec).
-    if let Err(e) = user_memory::write_array(args.handles, &received_values) {
-        for &hv in &received_values {
-            let _ = proc.handles.remove(hv);
-        }
-        return Err(e);
-    }
-    user_memory::write_value(args.out_handles, &(received_values.len() as u32))?;
+    let transferred_count = transferred.len();
+    let mut received_values = [0 as HandleValue; user_memory::MAX_CHANNEL_HANDLES];
+    proc.handles.add_existing_many_with_commit(
+        transferred,
+        &mut received_values[..transferred_count],
+        |values| {
+            user_memory::write_array(args.handles, values)?;
+            user_memory::write_value(args.out_handles, &(values.len() as u32))
+        },
+    )?;
     Ok(0)
 }

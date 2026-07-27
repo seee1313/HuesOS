@@ -3,6 +3,7 @@
 //! Uses the host-tested [`huesos_waitset`] policy crate for signal-set
 //! algebra, Any/All completion, and cancellation precedence.
 
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use huesos_abi::{ErrorCode, WaitSetWaitArgs};
 use huesos_object::{KernelObjectExt, Rights};
@@ -34,16 +35,22 @@ pub(crate) fn sys_waitset_wait(args_ptr: *const WaitSetWaitArgs) -> SyscallResul
 
     let proc = current_proc()?;
     let mut waitset: WaitSet<MAX_WAIT_ITEMS> = WaitSet::new();
+    let mut watched: Vec<Arc<dyn huesos_object::KernelObject>> = Vec::new();
+    watched
+        .try_reserve_exact(item_count)
+        .map_err(|_| ErrorCode::NoMemory)?;
 
     for item in &items {
         let h = proc.handles.get(item.handle).ok_or(ErrorCode::BadHandle)?;
         if !h.has_rights(Rights::READ) {
             return Err(ErrorCode::AccessDenied);
         }
+        let object = huesos_object::lookup_object(h.koid).ok_or(ErrorCode::BadHandle)?;
         let awaited = Signals::from_bits(item.awaited_signals);
         if !waitset.add(item.key, awaited) {
             return Err(ErrorCode::InvalidArgs);
         }
+        watched.push(object);
     }
 
     // Compute an absolute deadline once, up front, in scheduler-tick
@@ -56,26 +63,8 @@ pub(crate) fn sys_waitset_wait(args_ptr: *const WaitSetWaitArgs) -> SyscallResul
         Some(now.saturating_add(args.timeout_ticks))
     };
 
-    update_waitset_signals(&mut waitset, &items, &proc)?;
-
-    match waitset.poll_at(mode, current_tick(), deadline) {
-        WaitOutcome::Signaled | WaitOutcome::Canceled => {
-            return write_results(&waitset, &items, &args);
-        }
-        WaitOutcome::TimedOut => {
-            user_memory::write_value(args.out_count, &0u32)?;
-            return Err(ErrorCode::TimedOut);
-        }
-        WaitOutcome::Pending => {}
-    }
-
     loop {
-        let yield_fn = *crate::callbacks::YIELD_FN.lock();
-        if let Some(y) = yield_fn {
-            y();
-        }
-
-        update_waitset_signals(&mut waitset, &items, &proc)?;
+        update_waitset_signals(&mut waitset, &items, &watched, &proc)?;
 
         match waitset.poll_at(mode, current_tick(), deadline) {
             WaitOutcome::Signaled | WaitOutcome::Canceled => {
@@ -85,7 +74,31 @@ pub(crate) fn sys_waitset_wait(args_ptr: *const WaitSetWaitArgs) -> SyscallResul
                 user_memory::write_value(args.out_count, &0u32)?;
                 return Err(ErrorCode::TimedOut);
             }
-            WaitOutcome::Pending => continue,
+            WaitOutcome::Pending => {}
+        }
+
+        let Some(task) = huesos_object::wait::current_task() else {
+            return Err(ErrorCode::Internal);
+        };
+        enqueue_waiters(&watched, task);
+        update_waitset_signals(&mut waitset, &items, &watched, &proc)?;
+        match waitset.poll_at(mode, current_tick(), deadline) {
+            WaitOutcome::Signaled | WaitOutcome::Canceled => {
+                remove_waiters(&watched, task);
+                return write_results(&waitset, &items, &args);
+            }
+            WaitOutcome::TimedOut => {
+                remove_waiters(&watched, task);
+                user_memory::write_value(args.out_count, &0u32)?;
+                return Err(ErrorCode::TimedOut);
+            }
+            WaitOutcome::Pending => {}
+        }
+        let result = huesos_object::wait::park_current_until(deadline);
+        remove_waiters(&watched, task);
+        if matches!(result, huesos_object::wait::ParkResult::TimedOut) {
+            user_memory::write_value(args.out_count, &0u32)?;
+            return Err(ErrorCode::TimedOut);
         }
     }
 }
@@ -111,12 +124,14 @@ fn current_tick() -> u64 {
 fn update_waitset_signals(
     waitset: &mut WaitSet<MAX_WAIT_ITEMS>,
     items: &[huesos_abi::WaitSetItem],
+    watched: &[Arc<dyn huesos_object::KernelObject>],
     proc: &huesos_object::Process,
 ) -> SyscallResult {
-    for item in items {
-        let h = proc.handles.get(item.handle).ok_or(ErrorCode::BadHandle)?;
-        let obj = huesos_object::lookup_object(h.koid).ok_or(ErrorCode::BadHandle)?;
+    for (item, obj) in items.iter().zip(watched.iter()) {
         let mut active = Signals::from_bits(0);
+        if proc.handles.get(item.handle).is_none() {
+            active = active.union(Signals::CANCELED);
+        }
 
         if let Some(ch) = obj.downcast_ref::<huesos_object::Channel>() {
             if ch.peek().is_ok_and(|opt| opt.is_some()) {
@@ -155,6 +170,30 @@ fn update_waitset_signals(
         waitset.set_active(item.key, active);
     }
     Ok(0)
+}
+
+fn enqueue_waiters(objects: &[Arc<dyn huesos_object::KernelObject>], task: huesos_object::TaskId) {
+    for obj in objects {
+        if let Some(ch) = obj.downcast_ref::<huesos_object::Channel>() {
+            ch.reader_queue().enqueue(task);
+        } else if let Some(port) = obj.downcast_ref::<huesos_object::Port>() {
+            port.wait_queue().enqueue(task);
+        } else if let Some(process) = obj.downcast_ref::<huesos_object::Process>() {
+            process.exit_waiters.enqueue(task);
+        }
+    }
+}
+
+fn remove_waiters(objects: &[Arc<dyn huesos_object::KernelObject>], task: huesos_object::TaskId) {
+    for obj in objects {
+        if let Some(ch) = obj.downcast_ref::<huesos_object::Channel>() {
+            ch.reader_queue().remove(task);
+        } else if let Some(port) = obj.downcast_ref::<huesos_object::Port>() {
+            port.wait_queue().remove(task);
+        } else if let Some(process) = obj.downcast_ref::<huesos_object::Process>() {
+            process.exit_waiters.remove(task);
+        }
+    }
 }
 
 fn write_results(

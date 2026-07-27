@@ -63,6 +63,14 @@ fn current_task_id() -> Option<TaskId> {
     current_task_fn.and_then(|f| f())
 }
 
+/// Current scheduler task id, if scheduler hooks are installed.
+///
+/// Exposed for multi-object waits that must enqueue the same task on several
+/// object wait queues before performing one scheduler park.
+pub fn current_task() -> Option<TaskId> {
+    current_task_id()
+}
+
 /// Park the current task via the scheduler-installed hook.
 ///
 /// # Why the guard must be dropped before calling `f()`
@@ -337,6 +345,38 @@ pub fn park_on_timeout(queue: &WaitQueue, timeout_ticks: u64) -> ParkResult {
         ParkResult::TimedOut
     } else {
         ParkResult::Woken
+    }
+}
+
+/// Park the current task once, with an optional absolute tick deadline, without
+/// owning a specific [`WaitQueue`] token.
+///
+/// Multi-object waits enqueue the same task on several object queues, re-check
+/// every condition, and then need exactly one scheduler park. This helper arms
+/// the same timeout table used by [`PreparedWait::park_timeout`] while leaving
+/// queue cleanup to the caller.
+pub fn park_current_until(deadline: Option<u64>) -> ParkResult {
+    match deadline {
+        None => {
+            park_current();
+            ParkResult::Woken
+        }
+        Some(deadline) => {
+            if now_ticks() >= deadline {
+                return ParkResult::TimedOut;
+            }
+            let Some(task) = current_task_id() else {
+                return ParkResult::TimedOut;
+            };
+            arm_timeout(task, deadline);
+            park_current();
+            cancel_timeout(task);
+            if now_ticks() >= deadline {
+                ParkResult::TimedOut
+            } else {
+                ParkResult::Woken
+            }
+        }
     }
 }
 

@@ -12,8 +12,8 @@
 
 use huesos_abi::{ErrorCode, HandleValue, ResourceKindAbi};
 use huesos_object::{
-    current_process, register_object, unregister_object, Handle, KernelObject, KernelObjectExt,
-    Process, Resource, ResourceError, ResourceKind, Rights,
+    current_process, unregister_object, Handle, KernelObject, KernelObjectExt, Process, Resource,
+    ResourceError, ResourceKind, Rights,
 };
 
 use crate::user_memory;
@@ -99,18 +99,17 @@ pub(crate) fn sys_resource_create(
     // rights juggling later.
     let caller = current_process().ok_or(ErrorCode::AccessDenied)?;
     let rights = Rights::READ | Rights::WRITE | Rights::TRANSFER;
-    let handle_value = caller.handles.add(Handle::new(koid, rights));
-
-    if user_memory::write_value(out_handle, &handle_value).is_err() {
-        // Rollback: caller could not receive the handle, so return the
-        // registry to its previous state instead of leaking a Resource
-        // range reservation the caller cannot address.
-        let _ = caller.handles.remove(handle_value);
-        unregister_object(koid);
-        return Err(ErrorCode::InvalidArgs);
+    match caller
+        .handles
+        .add_with_commit(Handle::new(koid, rights), |handle_value| {
+            user_memory::write_value(out_handle, &handle_value)
+        }) {
+        Ok(_) => Ok(0),
+        Err(error) => {
+            unregister_object(koid);
+            Err(error)
+        }
     }
-    let _ = register_object; // Silence unused warning in this module; the symbol is imported for future rollback paths.
-    Ok(0)
 }
 
 pub(crate) fn sys_process_mark_critical(process_handle: HandleValue) -> SyscallResult {

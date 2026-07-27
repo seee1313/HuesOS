@@ -28,8 +28,11 @@ pub unsafe fn init_early() {
     gdt::init();
     idt::init();
 
-    // Set up per-CPU locals for the BSP (LAPIC ID = 0 until LAPIC is initialized).
-    let cpu_local = unsafe { cpu_local::alloc_cpu_local(0) };
+    // Set up per-CPU locals for the BSP. Use CPUID's initial APIC ID as the
+    // early value; SMP bring-up overwrites it with the LAPIC MMIO ID once the
+    // controller is mapped. The dense slot index, not this firmware APIC ID, is
+    // used for per-CPU arrays.
+    let cpu_local = unsafe { cpu_local::alloc_cpu_local(cpu::apic_id()) };
     unsafe { cpu_local::init_gs_base(cpu_local) };
     // enable_memory_protection now also sets EFER.NXE, so every CPU that
     // reaches this point picks up W^X support uniformly — the AP entry path

@@ -149,11 +149,16 @@ pub unsafe fn current_lapic_id() -> u32 {
     id
 }
 
-/// Return the current CPU's unique lock-rank tracker index.
+/// Return the current CPU's dense scheduler/index value.
+///
+/// Unlike LAPIC IDs, this is allocated densely in `0..MAX_CPUS` and is
+/// therefore safe to use for per-CPU arrays, scheduler slots, task IDs, and
+/// object current-process state. Sparse or high APIC IDs are deliberately not
+/// used as array indexes.
 ///
 /// # Safety
 /// `init_gs_base` must have been called on this CPU.
-pub unsafe fn current_rank_tracker_index() -> usize {
+pub unsafe fn current_cpu_index() -> usize {
     let index: usize;
     unsafe {
         asm!(
@@ -164,4 +169,29 @@ pub unsafe fn current_rank_tracker_index() -> usize {
         );
     }
     index
+}
+
+/// Return the current CPU's unique lock-rank tracker index.
+///
+/// # Safety
+/// `init_gs_base` must have been called on this CPU.
+pub unsafe fn current_rank_tracker_index() -> usize {
+    unsafe { current_cpu_index() }
+}
+
+/// Translate a dense CPU index back to the LAPIC ID used for IPIs.
+///
+/// Returns `None` for an index that has not been allocated yet. The BSP/AP
+/// bring-up path initializes `lapic_id` before a CPU is marked online, so
+/// scheduler users that consult this after `is_cpu_online(index)` see a stable
+/// value.
+pub fn lapic_id_for_index(index: usize) -> Option<u32> {
+    if index >= CPU_LOCAL_NEXT.load(core::sync::atomic::Ordering::SeqCst) || index >= MAX_CPUS {
+        return None;
+    }
+    // SAFETY: indices below CPU_LOCAL_NEXT have been uniquely assigned and the
+    // slot storage is static. Reading the immutable-after-init LAPIC ID is safe
+    // for IPI routing.
+    let locals = unsafe { &*CPU_LOCALS.0.get() };
+    Some(locals[index].lapic_id)
 }

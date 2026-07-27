@@ -28,9 +28,11 @@ if [ -f ".cargo/config.toml.bak" ]; then
     mv .cargo/config.toml.bak .cargo/config.toml
 fi
 
-# 2. Locate generated bootfs
+# 2. Locate generated bootfs. Prefer the newest file so debug/release or stale
+# target trees cannot accidentally package an old BOOTFS image with the current
+# kernel profile.
 echo "[HBI] Locating bootfs..."
-BOOTFS_PATH=$(find target -name "huesos.bootfs" | head -n 1)
+BOOTFS_PATH=$(find target -name "huesos.bootfs" -type f -printf '%T@ %p\n' | sort -nr | head -n 1 | cut -d' ' -f2-)
 
 if [ -z "${BOOTFS_PATH}" ] || [ ! -f "${BOOTFS_PATH}" ]; then
     echo "error: bootfs not found. Run 'make build' first." >&2

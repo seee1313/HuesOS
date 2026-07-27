@@ -69,8 +69,10 @@ const fn next_task_generation(previous: u32) -> Option<u32> {
     }
 }
 
-/// Bitmask of CPUs that have finished scheduler init and may receive tasks.
-/// Bit N set => CPU with LAPIC-id N is online for load-balancing.
+/// Bit N set => dense CPU index N is online for load-balancing/IPI routing.
+/// Firmware LAPIC IDs are intentionally not used as bit positions because they
+/// can be sparse or greater than `MAX_CPUS`; `lapic_id_for_cpu_index` resolves
+/// the APIC ID at the final IPI boundary.
 static ONLINE_CPUS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 /// Hardware-timer-driven monotonic clock. Only CPU 0 advances it, so SMP does
 /// not make time run faster. Cooperative yields never affect this clock.
@@ -349,9 +351,17 @@ impl Scheduler {
     }
 }
 
-/// Return the LAPIC ID of the current CPU via GS_BASE, clamped to MAX_CPUS.
+/// Return the dense CPU index of the current CPU via GS_BASE.
+///
+/// LAPIC IDs are firmware-assigned and may be sparse or greater than 63 on real
+/// machines. Scheduler arrays, task IDs, and current-process state use this
+/// dense index instead; LAPIC IDs are consulted only at the IPI boundary.
 fn cpu_id() -> usize {
-    (unsafe { huesos_arch::cpu_local::current_lapic_id() } as usize).min(MAX_CPUS - 1)
+    (unsafe { huesos_arch::cpu_local::current_cpu_index() }).min(MAX_CPUS - 1)
+}
+
+fn lapic_id_for_cpu_index(cpu: usize) -> Option<u8> {
+    huesos_arch::cpu_local::lapic_id_for_index(cpu).and_then(|id| u8::try_from(id).ok())
 }
 
 /// Register the current CPU's scheduler pointer in its `CpuLocal`.
@@ -561,7 +571,9 @@ pub fn wake_task(task_id: u64) {
     }
     drop(guard);
     if cpu != cpu_id() {
-        huesos_arch::lapic::ipi_reschedule(cpu as u8);
+        if let Some(apic_id) = lapic_id_for_cpu_index(cpu) {
+            huesos_arch::lapic::ipi_reschedule(apic_id);
+        }
     }
 }
 
@@ -638,7 +650,9 @@ pub fn spawn_kernel_thread(name: &[u8; 32], entry: extern "C" fn() -> !) -> u64 
     huesos_arch::interrupts::enable();
 
     if cpu != cpu_id() {
-        huesos_arch::lapic::ipi_reschedule(cpu as u8);
+        if let Some(apic_id) = lapic_id_for_cpu_index(cpu) {
+            huesos_arch::lapic::ipi_reschedule(apic_id);
+        }
     }
     id
 }
@@ -678,7 +692,9 @@ pub fn spawn_user_thread(
     huesos_arch::interrupts::enable();
 
     if cpu != cpu_id() {
-        huesos_arch::lapic::ipi_reschedule(cpu as u8);
+        if let Some(apic_id) = lapic_id_for_cpu_index(cpu) {
+            huesos_arch::lapic::ipi_reschedule(apic_id);
+        }
     }
     id
 }
@@ -790,7 +806,9 @@ pub fn terminate_current_process(code: i64) -> ! {
     REAP_PENDING.store(true, Ordering::Release);
     for cpu in 0..MAX_CPUS {
         if cpu != current_cpu && is_cpu_online(cpu) {
-            huesos_arch::lapic::ipi_reschedule(cpu as u8);
+            if let Some(apic_id) = lapic_id_for_cpu_index(cpu) {
+                huesos_arch::lapic::ipi_reschedule(apic_id);
+            }
         }
     }
 

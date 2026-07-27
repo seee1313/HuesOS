@@ -53,12 +53,11 @@ fn sys_vmo_create_with_rights(
     if executable {
         rights |= Rights::EXECUTE;
     }
-    let hv = proc.handles.add(Handle::new(koid, rights));
-    if let Err(error) = user_memory::write_value(out_handle, &hv) {
-        let _ = proc.handles.remove(hv);
-        return Err(error);
-    }
-    Ok(0)
+    proc.handles
+        .add_with_commit(Handle::new(koid, rights), |hv| {
+            user_memory::write_value(out_handle, &hv)
+        })
+        .map(|_| 0)
 }
 
 pub(crate) fn sys_vmo_read(

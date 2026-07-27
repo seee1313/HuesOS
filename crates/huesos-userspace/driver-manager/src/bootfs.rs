@@ -36,8 +36,10 @@ impl BootFs {
         let Some(entry) = self.get_entry(path)? else {
             return Err(libcanvas::ErrorCode::NotFound);
         };
-        let to_read = (entry.len as usize).min(out.len());
-        self.vmo.read(entry.offset, &mut out[..to_read])
+        if entry.len as usize > out.len() {
+            return Err(libcanvas::ErrorCode::InvalidArgs);
+        }
+        self.vmo.read(entry.offset, &mut out[..entry.len as usize])
     }
 
     /// Write a text stat response for `path` into `out`.

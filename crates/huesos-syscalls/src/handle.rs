@@ -39,10 +39,9 @@ pub(crate) fn sys_handle_duplicate(
         }
         requested
     };
-    let new_hv = proc.handles.add(Handle::new(h.koid, new_rights));
-    if let Err(error) = user_memory::write_value(out, &new_hv) {
-        let _ = proc.handles.remove(new_hv);
-        return Err(error);
-    }
-    Ok(0)
+    proc.handles
+        .add_with_commit(Handle::new(h.koid, new_rights), |new_hv| {
+            user_memory::write_value(out, &new_hv)
+        })
+        .map(|_| 0)
 }

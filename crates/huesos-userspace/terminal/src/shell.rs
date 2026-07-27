@@ -146,7 +146,8 @@ impl Shell {
         let result = (|| -> libcanvas::Result<()> {
             let keyboard = self.keyboard.duplicate()?;
             self.supervisor
-                .write_handle(b"system:launch-doom", keyboard.into_handle())?;
+                .write_handle(b"system:launch-doom", keyboard.into_handle())
+                .map_err(|(error, _handle)| error)?;
             let mut response = [0u8; 64];
             let n = self.supervisor.read_into_blocking(&mut response)?;
             if !response[..n].starts_with(b"doom:started") {

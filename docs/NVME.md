@@ -50,7 +50,11 @@ Pure `no_std` + `core`, host-unit-tested (29 tests):
 
 No `unsafe`, no `unwrap`/`expect`/`panic!` (budget-neutral). The controller
 rejects zero-block, namespace-out-of-range, short-buffer, DMA-window overflow,
-and malformed block-wire requests before touching queues or device memory.
+invalid MDTS values, and malformed block-wire requests before touching queues or
+device memory. The first controller slice uses one reusable bounded DMA data
+buffer plus one PRP-list page for I/O, so repeated reads/writes no longer consume
+the DMA window monotonically; transfers that would require chained PRP-list pages
+are rejected until chaining is implemented.
 
 ## Async Controller (next slice)
 

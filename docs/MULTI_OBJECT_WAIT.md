@@ -66,20 +66,29 @@ set by key; `cancel` marks the whole wait canceled. Queries: `any_satisfied`,
   `now >= deadline`, returns `TimedOut`; a `None` deadline never times out.
   `Signaled`/`Canceled` are returned regardless of the deadline.
 
-## Intended kernel integration (NOT yet implemented here)
+## Privileged kernel integration
 
-This crate changes no privileged behavior. The planned integration:
+The `WaitSetWait` syscall now uses the policy crate for the dispatch decision
+and the existing object `WaitQueue`s for real blocking:
 
-1. A multi-wait syscall builds a `WaitSet` from the caller's (handle, awaited,
-   key) array, validated through the user-memory copy layer.
-2. The syscall parks the thread on the existing `WaitQueue`/scheduler hooks and
-   re-evaluates `poll(WaitMode::Any)` (the Zircon-style multi-wait semantic) on
-   each signal, cancel, and tick, returning the satisfied items' keys and active
-   signals.
-3. `poll_at` provides the deadline (`TimedOut`), and handle closure / explicit
-   cancel drives `Canceled`.
-4. All-of-many and per-object single waits are the same machinery with `All`
-   mode or a one-item set.
+1. The syscall snapshots the caller's handles into temporary object `Arc`s after
+   validating rights and copying the user `(handle, awaited, key)` array.
+2. It computes active signals non-destructively (`Channel::peek`,
+   `Port::has_pending`, process exit state, peer-closed state) and polls the
+   `WaitSet` once before sleeping.
+3. If still pending, it enqueues the current scheduler task on every watched
+   object's wait queue, re-checks to close the lost-wakeup window, then parks
+   exactly once via `wait::park_current_until(deadline)`.
+4. Channel sends, peer-close drops, port IRQ enqueue, process exit, timeout
+   ticks, and handle close all wake the parked task; the syscall removes the
+   task from every queue before returning or re-looping.
+5. Handle closure by another thread in the same process wakes the object's wait
+   queue and the next signal snapshot reports `Signals::CANCELED` for waiters
+   that requested it.
+
+This replaces the earlier yield-and-repoll integration and means an idle driver
+waiting on a control Channel and an IRQ Port consumes no CPU until a real wake or
+deadline occurs.
 
 ## Lost-wakeup prevention (implemented)
 
@@ -108,17 +117,16 @@ the exit condition without allocation.
 
 ## What still requires on-target verification
 
-The following are **not** verified by this change and must be confirmed in QEMU
-(`-smp 1`/`-smp 2`) before the integration is done:
+The syscall is wired to scheduler park/wake hooks, but the following remain
+important QEMU/bare-metal regression targets:
 
-- The actual blocking syscall wired to the scheduler park/wake hooks.
-- Wake-on-signal across cores, cancel propagation, and deadline (`TimedOut`)
-  behavior under the monotonic tick.
+- Wake-on-signal across cores for every supported object kind.
+- Handle-close cancellation racing with wake and timeout.
+- Deadline (`TimedOut`) behavior under `-smp 1` and `-smp 2`.
 - Correct return of satisfied keys/active signals to userspace via the
   user-memory copy layer.
 
-These need the full toolchain (pinned nightly + `build-std`, QEMU/OVMF) and were
-not runnable where this crate was authored.
+These need the full toolchain (pinned nightly + `build-std`, QEMU/OVMF).
 
 ## Tests (host)
 

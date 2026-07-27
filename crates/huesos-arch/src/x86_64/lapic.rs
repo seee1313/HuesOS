@@ -30,7 +30,10 @@ pub unsafe fn set_base(phys: u32, hhdm_offset: u64) {
     let _ = crate::x86_64::paging::map_hhdm_range_flags(
         phys as u64,
         0x1000,
-        PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::NO_CACHE,
+        PageTableFlags::PRESENT
+            | PageTableFlags::WRITABLE
+            | PageTableFlags::NO_CACHE
+            | PageTableFlags::NO_EXECUTE,
     );
     LAPIC_BASE.store(hhdm_offset + phys as u64, Ordering::Relaxed);
 }

@@ -81,14 +81,19 @@ impl Canvas {
     pub fn new(width: u32, height: u32) -> crate::Result<Self> {
         let info = info()?;
         let bytes_per_pixel = (info.bpp as u32).div_ceil(8);
-        let size = width as u64 * height as u64 * bytes_per_pixel as u64;
+        let pitch = width
+            .checked_mul(bytes_per_pixel)
+            .ok_or(crate::ErrorCode::InvalidArgs)?;
+        let size = (pitch as u64)
+            .checked_mul(height as u64)
+            .ok_or(crate::ErrorCode::InvalidArgs)?;
         let vmo = Vmo::create(size)?;
         Ok(Self {
             vmo,
             info: FramebufferInfo {
                 width,
                 height,
-                pitch: width * bytes_per_pixel, // tightly packed, no padding
+                pitch, // tightly packed, no padding
                 ..info
             },
             bytes_per_pixel,
@@ -363,7 +368,13 @@ impl Canvas {
         // Build one row's worth of pixel bytes, then write it repeatedly —
         // far fewer syscalls than one VmoWrite per pixel.
         let row_pixels = (x_end - x) as usize;
-        let mut row = alloc_row(row_pixels * bpp);
+        let row_bytes = row_pixels
+            .checked_mul(bpp)
+            .ok_or(crate::ErrorCode::InvalidArgs)?;
+        if row_bytes > RowBuf::CAP {
+            return Err(crate::ErrorCode::InvalidArgs);
+        }
+        let mut row = alloc_row(row_bytes);
         for px in 0..row_pixels {
             row[px * bpp..px * bpp + bpp].copy_from_slice(&bytes[..bpp]);
         }
