@@ -1,9 +1,9 @@
 //! Job container objects and hierarchical resource accounting.
 
+use crate::irq_guard::IrqSafeMutex;
 use alloc::string::String;
 use alloc::sync::Arc;
 use core::any::Any;
-use spin::Mutex;
 
 use crate::{alloc_koid, KernelObject, Koid, ObjectType};
 use huesos_quota::{Limits, QuotaTree, QuotaTreeError, Resource, Usage};
@@ -18,9 +18,9 @@ pub enum JobError {
 /// Job — container of processes and a node in the resource-quota hierarchy.
 pub struct Job {
     koid: Koid,
-    name: Mutex<String>,
+    name: IrqSafeMutex<String>,
     parent: Option<Arc<Job>>,
-    quota_tree: Arc<Mutex<QuotaTree>>,
+    quota_tree: Arc<IrqSafeMutex<QuotaTree>>,
     quota_node: huesos_quota::NodeId,
 }
 
@@ -36,9 +36,9 @@ impl Job {
         let node = tree.add_root(limits);
         Arc::new(Self {
             koid: alloc_koid(),
-            name: Mutex::new(String::from("root")),
+            name: IrqSafeMutex::new(String::from("root")),
             parent: None,
-            quota_tree: Arc::new(Mutex::new(tree)),
+            quota_tree: Arc::new(IrqSafeMutex::new(tree)),
             quota_node: node,
         })
     }
@@ -52,7 +52,7 @@ impl Job {
             .map_err(|_| JobError::InvalidParent)?;
         Ok(Arc::new(Self {
             koid: alloc_koid(),
-            name: Mutex::new(String::from(name)),
+            name: IrqSafeMutex::new(String::from(name)),
             parent: Some(Arc::clone(parent)),
             quota_tree: Arc::clone(&parent.quota_tree),
             quota_node: node,

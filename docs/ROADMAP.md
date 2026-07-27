@@ -7,6 +7,36 @@ priority order.
 
 ## Done (recent)
 
+### Type-enforced `IrqSafeMutex` for all of `huesos-object`, replacing the ad-hoc `IrqGuard` fix
+- Field verification of the previous "IRQ-safe guards" fix (see below) found
+  the keyboard self-deadlock still occurred, just less often — the manually
+  curated set of guarded locks missed `wait::PARK_FN`/`WAKE_FN` (called from
+  `WaitQueue::wake_one`, which the keyboard IRQ1 bridge reaches through
+  `Interrupt::signal` -> `Port::queue`), proving the fix approach itself
+  (convention over enforcement) was the real gap.
+- Replaced every `spin::Mutex` in `huesos-object` with a new
+  `crate::irq_guard::IrqSafeMutex<T>` (Zircon `Guard<SpinLock, IrqSave>`
+  style): the type makes it impossible to `.lock()` without disabling local
+  interrupts, so a future call site cannot reintroduce this bug by omission.
+  New CI gate `tools/check-huesos-object-lock-policy.py` (in `make
+  audit-check`) rejects any bare `spin::Mutex` in the crate going forward.
+- Also applied a seL4-inspired secondary hardening: `Interrupt::signal` (the
+  actual IRQ handler body) no longer looks anything up in the global object
+  registry — `InterruptBinding` now caches the bound `Port`'s `Arc` at
+  `bind_port` time instead of re-resolving a `Koid` on every interrupt.
+  Needed a new safe `KernelObjectExt::downcast_arc` (zero `unsafe`, via a
+  blanket `AsAnyArc` trait and `alloc`'s own `Arc::downcast`).
+- Zero new safety-budget surface: mechanical lock-type migration, no new
+  `unsafe`. Full writeup in `docs/UNSAFE_AUDIT.md` § "huesos-object
+  migration to type-enforced `IrqSafeMutex`".
+- Verified: `cargo test -p huesos-object` (39/39, including updated
+  `interrupt_signal_queues_port_packet`), `cargo build -p huesos-boot
+  --release` (full kernel + every embedded userspace ELF), `make
+  audit-check` (6/6 gates), `clippy -D warnings`, `make test` (full host
+  suite) all green locally. A fresh QEMU soak-with-continuous-typing test
+  is still the authoritative signal that this closes the hazard completely
+  (see docs/TESTING.md); not run in this sandbox.
+
 ### Fixed keyboard self-deadlock: IRQ-safe guards for `huesos-object` registry/Port/Interrupt/WaitQueue locks
 - Root cause: the keyboard IRQ1 bridge (`Interrupt::signal` -> `Port::queue`
   -> `WaitQueue::wake_one`) and the timer IRQ (`wait::notify_tick`) share

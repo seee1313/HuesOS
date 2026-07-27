@@ -1,11 +1,11 @@
 //! Process objects.
 
+use crate::irq_guard::IrqSafeMutex;
 use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::sync::Arc;
 use core::any::Any;
 use core::sync::atomic::{AtomicBool, Ordering};
-use spin::Mutex;
 
 use crate::wait::WaitQueue;
 use crate::{alloc_koid, root_job, HandleTable, Job, KernelObject, Koid, ObjectType};
@@ -14,21 +14,21 @@ use huesos_proclife::{ExitInfo, ProcState, ProcessLifecycle};
 /// Process — address space + handle table + exit state.
 pub struct Process {
     koid: Koid,
-    name: Mutex<String>,
+    name: IrqSafeMutex<String>,
     /// Handle table for this process.
     pub handles: HandleTable,
     /// Job that owns this process's resource charges.
     pub job: Arc<Job>,
     /// Lifecycle state machine shared with the host-tested policy core.
-    pub lifecycle: Mutex<ProcessLifecycle>,
+    pub lifecycle: IrqSafeMutex<ProcessLifecycle>,
     /// Waiters blocked in `ProcessWait` until this process exits.
     pub exit_waiters: WaitQueue,
     /// Serializes validated kernel copies with VMAR mutation operations.
-    pub user_memory_lock: Mutex<()>,
+    pub user_memory_lock: IrqSafeMutex<()>,
     /// Opaque pointer to the arch-specific address space (owned elsewhere;
     /// stored here so syscalls/scheduler can find it without a separate
     /// process table). Boxed `dyn Any` to avoid a dependency on huesos-arch.
-    pub address_space: Mutex<Option<Box<dyn Any + Send + Sync>>>,
+    pub address_space: IrqSafeMutex<Option<Box<dyn Any + Send + Sync>>>,
     /// Criticality flag: if `true`, an abnormal exit of this process
     /// triggers a kernel-driven hard halt of the whole system. Set once
     /// via [`Self::mark_critical`]; never cleared. Inspired by
@@ -53,13 +53,13 @@ impl Process {
         let koid = alloc_koid();
         Arc::new(Self {
             koid,
-            name: Mutex::new(String::from(name)),
+            name: IrqSafeMutex::new(String::from(name)),
             handles: HandleTable::new(),
             job,
-            lifecycle: Mutex::new(ProcessLifecycle::new(koid.0, koid.0)),
+            lifecycle: IrqSafeMutex::new(ProcessLifecycle::new(koid.0, koid.0)),
             exit_waiters: WaitQueue::new(),
-            user_memory_lock: Mutex::new(()),
-            address_space: Mutex::new(None),
+            user_memory_lock: IrqSafeMutex::new(()),
+            address_space: IrqSafeMutex::new(None),
             critical: AtomicBool::new(false),
         })
     }

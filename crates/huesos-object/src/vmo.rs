@@ -1,10 +1,10 @@
 //! Virtual Memory Object implementation.
 
+use crate::irq_guard::IrqSafeMutex;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::any::Any;
-use spin::Mutex;
 
 use crate::{alloc_koid, phys_to_virt, Job, KernelObject, Koid, ObjectType};
 
@@ -14,10 +14,10 @@ use crate::{alloc_koid, phys_to_virt, Job, KernelObject, Koid, ObjectType};
 /// it can actually be mapped into a process's page tables.
 pub struct Vmo {
     koid: Koid,
-    name: Mutex<String>,
-    size: Mutex<usize>,
+    name: IrqSafeMutex<String>,
+    size: IrqSafeMutex<usize>,
     /// Physical frame addresses, one per 4 KiB page.
-    frames: Mutex<Vec<u64>>,
+    frames: IrqSafeMutex<Vec<u64>>,
     /// Job charged for the physical frames, if this VMO belongs to a process.
     job: Option<Arc<Job>>,
 }
@@ -82,9 +82,9 @@ impl Vmo {
         }
         Ok(Arc::new(Self {
             koid,
-            name: Mutex::new(String::new()),
-            size: Mutex::new(size),
-            frames: Mutex::new(frames),
+            name: IrqSafeMutex::new(String::new()),
+            size: IrqSafeMutex::new(size),
+            frames: IrqSafeMutex::new(frames),
             job,
         }))
     }

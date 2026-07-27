@@ -3,12 +3,25 @@
 //! Waiters are identified by scheduler task ids (`u64`). The kernel injects
 //! `park` / `wake` / `current_task` callbacks so this crate stays free of a
 //! dependency on `huesos-kernel` / `huesos-arch`.
+//!
+//! All shared state here is behind [`crate::irq_guard::IrqSafeMutex`], not a
+//! plain `spin::Mutex`: `wake_one`/`wake_all`/`notify_tick` are reachable
+//! from the keyboard IRQ1 bridge (`Interrupt::signal` -> `Port::queue` ->
+//! `WaitQueue::wake_one` -> `wake_task`) and the timer IRQ, on the same CPU
+//! that runs ordinary syscall-context code (`Channel::send`,
+//! `Process::set_exit_code`, `PreparedWait::park_timeout`, ...) that also
+//! locks this state. `IrqSafeMutex` makes it impossible to reintroduce the
+//! self-deadlock that mismatch caused by locking without disabling
+//! interrupts — see `crate::irq_guard` for the full writeup, including the
+//! two real incidents (the `PARK_FN`/`WAKE_FN` function-pointer statics
+//! below were the second one, missed in the first pass at fixing this
+//! because they only look like "a few bytes of function pointer", not
+//! obviously part of the same IRQ-reachable lock graph as `waiters`).
 
 use alloc::vec::Vec;
 use core::task::Waker;
-use spin::Mutex;
 
-use crate::irq_guard::IrqGuard;
+use crate::irq_guard::IrqSafeMutex;
 
 /// Scheduler task identifier (matches `Task::id`).
 pub type TaskId = u64;
@@ -17,11 +30,11 @@ type CurrentTaskFn = fn() -> Option<TaskId>;
 type ParkFn = fn();
 type WakeFn = fn(TaskId);
 
-static CURRENT_TASK_FN: Mutex<Option<CurrentTaskFn>> = Mutex::new(None);
-static PARK_FN: Mutex<Option<ParkFn>> = Mutex::new(None);
-static WAKE_FN: Mutex<Option<WakeFn>> = Mutex::new(None);
+static CURRENT_TASK_FN: IrqSafeMutex<Option<CurrentTaskFn>> = IrqSafeMutex::new(None);
+static PARK_FN: IrqSafeMutex<Option<ParkFn>> = IrqSafeMutex::new(None);
+static WAKE_FN: IrqSafeMutex<Option<WakeFn>> = IrqSafeMutex::new(None);
 /// Monotonic tick counter (scheduler ticks), for wait timeouts.
-static TICKS_FN: Mutex<Option<fn() -> u64>> = Mutex::new(None);
+static TICKS_FN: IrqSafeMutex<Option<fn() -> u64>> = IrqSafeMutex::new(None);
 
 /// Register scheduler hooks. Called once from kernel init after the
 /// scheduler exists.
@@ -58,20 +71,15 @@ fn current_task_id() -> Option<TaskId> {
 /// performs a real context switch and only returns once a matching
 /// `wake_task` call has made this task runnable again — that can be an
 /// arbitrarily long time later. Calling `f()` while still holding the
-/// `PARK_FN` mutex guard (as `if let Some(f) = *PARK_FN.lock() { f() }`
+/// `PARK_FN` lock guard (as `if let Some(f) = *PARK_FN.lock() { f() }`
 /// does, due to temporary lifetime extension in `if let` scrutinees)
-/// means the lock stays held for the entire time this task is parked.
-/// Any other CPU/task that calls `park_current` or `wake_task` before
-/// this task is woken then spins forever on `PARK_FN`/`WAKE_FN` with
-/// interrupts disabled, which stops the timer tick from ever firing
-/// again — a full, unrecoverable system hang. This was the root cause
-/// of the flaky `qemu-boot (release, 1)` CI hang: `init` parking (e.g.
-/// via `ProcessWait`/`WaitSetWait`) raced a freshly spawned task's own
-/// park/wake path on the single CPU.
-///
-/// The fix is the same pattern already used by
-/// `huesos_syscalls::process::sys_yield`: copy the `Option<fn>` out of
-/// the mutex into a local, let the guard drop, and only then invoke it.
+/// would mean interrupts stay disabled (an `IrqSafeMutex` guard, unlike a
+/// plain `spin::Mutex` guard, also holds interrupts off until dropped) for
+/// the entire time this task is parked — freezing the CPU's timer tick for
+/// as long as the park lasts, which can be forever. Copying the `Option<fn>`
+/// out and dropping the guard first, as below, restores interrupts before
+/// the context switch and matches the pattern already used by
+/// `huesos_syscalls::process::sys_yield`.
 fn park_current() {
     let park_fn = *PARK_FN.lock();
     if let Some(f) = park_fn {
@@ -105,32 +113,23 @@ pub fn yield_to_scheduler() {
 /// Supports two waiter types: scheduler tasks (blocking syscalls)
 /// and async wakers (futures). When wake_one/wake_all fires,
 /// both types are notified.
-///
-/// `wake_one`/`wake_all` are reachable from the keyboard IRQ1 bridge
-/// (`Interrupt::signal` -> `Port::queue` -> `WaitQueue::wake_one`) on the
-/// same CPU that runs ordinary syscall-context code locking `waiters`/
-/// `async_wakers` (`enqueue`, `remove`, `prepare`). Every method below
-/// disables local interrupts for its critical section so a keystroke can
-/// never land while the same CPU already holds either lock — see
-/// `crate::irq_guard` for the full hazard writeup.
 pub struct WaitQueue {
-    waiters: Mutex<Vec<TaskId>>,
-    async_wakers: Mutex<Vec<Waker>>,
+    waiters: IrqSafeMutex<Vec<TaskId>>,
+    async_wakers: IrqSafeMutex<Vec<Waker>>,
 }
 
 impl WaitQueue {
     /// Create an empty wait queue.
     pub const fn new() -> Self {
         Self {
-            waiters: Mutex::new(Vec::new()),
-            async_wakers: Mutex::new(Vec::new()),
+            waiters: IrqSafeMutex::new(Vec::new()),
+            async_wakers: IrqSafeMutex::new(Vec::new()),
         }
     }
 
     /// Register an async waker. When wake_one/wake_all fires,
     /// the waker is invoked so the future re-polls.
     pub fn register_waker(&self, waker: &Waker) {
-        let _irq = IrqGuard::acquire();
         let mut wakers = self.async_wakers.lock();
         for existing in wakers.iter_mut() {
             if existing.will_wake(waker) {
@@ -142,13 +141,11 @@ impl WaitQueue {
 
     /// Remove all registered async wakers.
     pub fn clear_wakers(&self) {
-        let _irq = IrqGuard::acquire();
         self.async_wakers.lock().clear();
     }
 
     /// Enqueue `task` if not already waiting.
     pub fn enqueue(&self, task: TaskId) {
-        let _irq = IrqGuard::acquire();
         let mut w = self.waiters.lock();
         if !w.contains(&task) {
             w.push(task);
@@ -157,7 +154,6 @@ impl WaitQueue {
 
     /// Remove a specific waiter (e.g. after wake or cancel).
     pub fn remove(&self, task: TaskId) {
-        let _irq = IrqGuard::acquire();
         self.waiters.lock().retain(|&t| t != task);
     }
 
@@ -165,7 +161,6 @@ impl WaitQueue {
     /// async wakers so futures re-poll.
     pub fn wake_one(&self) {
         let id = {
-            let _irq = IrqGuard::acquire();
             let mut w = self.waiters.lock();
             if w.is_empty() {
                 None
@@ -177,7 +172,6 @@ impl WaitQueue {
             wake_task(id);
         }
         let wakers: Vec<Waker> = {
-            let _irq = IrqGuard::acquire();
             let mut w = self.async_wakers.lock();
             core::mem::take(&mut *w)
         };
@@ -189,7 +183,6 @@ impl WaitQueue {
     /// Wake every waiter. Also wakes all registered async wakers.
     pub fn wake_all(&self) {
         let waiters = {
-            let _irq = IrqGuard::acquire();
             let mut w = self.waiters.lock();
             core::mem::take(&mut *w)
         };
@@ -197,7 +190,6 @@ impl WaitQueue {
             wake_task(id);
         }
         let wakers: Vec<Waker> = {
-            let _irq = IrqGuard::acquire();
             let mut w = self.async_wakers.lock();
             core::mem::take(&mut *w)
         };
@@ -353,28 +345,21 @@ struct TimeoutEntry {
     deadline: u64,
 }
 
-static TIMEOUTS: Mutex<Vec<TimeoutEntry>> = Mutex::new(Vec::new());
+static TIMEOUTS: IrqSafeMutex<Vec<TimeoutEntry>> = IrqSafeMutex::new(Vec::new());
 
-/// `arm_timeout`/`cancel_timeout` run from syscall context (interrupts
-/// enabled) via `PreparedWait::park_timeout`; `notify_tick` runs from the
-/// timer IRQ handler on the same CPU. Same self-deadlock hazard as
-/// `REGISTRY`/`Port`/`WaitQueue` above — see `crate::irq_guard`.
 fn arm_timeout(task: TaskId, deadline: u64) {
-    let _irq = IrqGuard::acquire();
     let mut t = TIMEOUTS.lock();
     t.retain(|e| e.task != task);
     t.push(TimeoutEntry { task, deadline });
 }
 
 fn cancel_timeout(task: TaskId) {
-    let _irq = IrqGuard::acquire();
     TIMEOUTS.lock().retain(|e| e.task != task);
 }
 
 /// Called from the scheduler timer path each tick to wake timed-out waiters.
 pub fn notify_tick(now: u64) {
     let expired: Vec<TaskId> = {
-        let _irq = IrqGuard::acquire();
         let mut t = TIMEOUTS.lock();
         let mut out = Vec::new();
         t.retain(|e| {

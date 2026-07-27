@@ -213,7 +213,7 @@ mod tests {
         register_object(port.clone());
 
         let interrupt = Interrupt::new(1);
-        interrupt.bind_port(port_koid, 0xabc);
+        interrupt.bind_port(port.clone(), 0xabc);
         interrupt.signal(1, 0x1e);
 
         let Some(packet) = port.read() else {

@@ -1,10 +1,10 @@
 //! Virtual memory address region bookkeeping.
 
+use crate::irq_guard::IrqSafeMutex;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::any::Any;
-use spin::Mutex;
 
 use crate::{alloc_koid, KernelObject, Koid, ObjectType};
 
@@ -51,12 +51,12 @@ pub struct VmarChild {
 /// shape.
 pub struct Vmar {
     koid: Koid,
-    name: Mutex<String>,
+    name: IrqSafeMutex<String>,
     process: Koid,
     base: u64,
     size: u64,
-    mappings: Mutex<Vec<VmarMapping>>,
-    children: Mutex<Vec<VmarChild>>,
+    mappings: IrqSafeMutex<Vec<VmarMapping>>,
+    children: IrqSafeMutex<Vec<VmarChild>>,
 }
 
 impl Vmar {
@@ -64,12 +64,12 @@ impl Vmar {
     pub fn new_root(process: Koid, base: u64, size: u64) -> Arc<Self> {
         Arc::new(Self {
             koid: alloc_koid(),
-            name: Mutex::new(String::from("root")),
+            name: IrqSafeMutex::new(String::from("root")),
             process,
             base,
             size,
-            mappings: Mutex::new(Vec::new()),
-            children: Mutex::new(Vec::new()),
+            mappings: IrqSafeMutex::new(Vec::new()),
+            children: IrqSafeMutex::new(Vec::new()),
         })
     }
 

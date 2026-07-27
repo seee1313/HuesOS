@@ -1,9 +1,9 @@
 //! Thread objects.
 
+use crate::irq_guard::IrqSafeMutex;
 use alloc::string::String;
 use alloc::sync::Arc;
 use core::any::Any;
-use spin::Mutex;
 
 use crate::{alloc_koid, KernelObject, Koid, ObjectType};
 
@@ -11,10 +11,10 @@ use crate::{alloc_koid, KernelObject, Koid, ObjectType};
 /// scheduler task).
 pub struct Thread {
     koid: Koid,
-    name: Mutex<String>,
+    name: IrqSafeMutex<String>,
     process: Koid,
     /// Scheduler task id this Thread object corresponds to.
-    pub task_id: Mutex<Option<u64>>,
+    pub task_id: IrqSafeMutex<Option<u64>>,
 }
 
 impl Thread {
@@ -27,9 +27,9 @@ impl Thread {
     pub fn new_for_process(name: &str, process: Koid) -> Arc<Self> {
         Arc::new(Self {
             koid: alloc_koid(),
-            name: Mutex::new(String::from(name)),
+            name: IrqSafeMutex::new(String::from(name)),
             process,
-            task_id: Mutex::new(None),
+            task_id: IrqSafeMutex::new(None),
         })
     }
 
