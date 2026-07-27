@@ -1,4 +1,4 @@
-# HuesOS
+# Хуесос
 
 **HuesOS** is an x86_64 microkernel operating system written in Rust,
 inspired by Google Zircon (Fuchsia). It boots exclusively via UEFI (via
