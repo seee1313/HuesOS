@@ -52,7 +52,9 @@ pub fn bringup_aps(madt_bytes: &[u8], hhdm_offset: u64) {
                 huesos_arch::ioapic::IoApicError::NoController => "no controller",
                 huesos_arch::ioapic::IoApicError::InvalidMadt => "invalid MADT",
                 huesos_arch::ioapic::IoApicError::Mapping => "MMIO mapping failed",
+                huesos_arch::ioapic::IoApicError::InvalidVector => "invalid vector",
                 huesos_arch::ioapic::IoApicError::NoRoute => "no route",
+                huesos_arch::ioapic::IoApicError::Verification => "readback mismatch",
             });
             log_line("\n");
         }

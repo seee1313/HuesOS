@@ -6,8 +6,8 @@
 
 use core::sync::atomic::{AtomicBool, Ordering};
 use huesos_ioapic::{
-    entry_for_legacy_irq, parse_source_overrides, route_gsi, IoApicDescriptor, RedirectionEntry,
-    VectorAllocator,
+    entry_for_legacy_irq, is_device_vector, parse_source_overrides, route_gsi, IoApicDescriptor,
+    RedirectionEntry, VectorAllocator,
 };
 use x86_64::structures::paging::PageTableFlags;
 
@@ -25,8 +25,12 @@ pub enum IoApicError {
     InvalidMadt,
     /// The I/O APIC MMIO range could not be mapped.
     Mapping,
+    /// The configured vector is not in the external-device range.
+    InvalidVector,
     /// No vector or GSI route was available.
     NoRoute,
+    /// MMIO readback did not match the programmed redirection entry.
+    Verification,
 }
 
 /// Whether IRQ1 was successfully routed through an I/O APIC.
@@ -40,6 +44,9 @@ pub fn keyboard_routed() -> bool {
 /// 32-bit halves have been written. The function runs once on the BSP before
 /// `STI`; all later keyboard events use the existing userspace IRQ bridge.
 pub fn init_keyboard(madt_bytes: &[u8]) -> Result<(), IoApicError> {
+    if !is_device_vector(KEYBOARD_VECTOR) {
+        return Err(IoApicError::InvalidVector);
+    }
     let madt = super::acpi::parse_madt_bytes(madt_bytes).ok_or(IoApicError::InvalidMadt)?;
     let overrides = parse_source_overrides(madt_bytes).ok_or(IoApicError::InvalidMadt)?;
 
@@ -83,8 +90,14 @@ pub fn init_keyboard(madt_bytes: &[u8]) -> Result<(), IoApicError> {
         .ok_or(IoApicError::NoRoute)?;
 
     let masked = entry;
+    let unmasked = masked.unmasked();
     write_redirection(bases[index], pin, masked);
-    write_redirection(bases[index], pin, masked.unmasked());
+    write_redirection(bases[index], pin, unmasked);
+    let observed = read_redirection(bases[index], pin);
+    if !unmasked.writable_fields_match(&observed) {
+        write_redirection(bases[index], pin, masked);
+        return Err(IoApicError::Verification);
+    }
     KEYBOARD_ROUTED.store(true, Ordering::Release);
     Ok(())
 }
@@ -104,6 +117,13 @@ fn map_mmio(base: u64) -> Result<(), IoApicError> {
 fn read_register(base: u64, register: u32) -> u32 {
     write_index(base, register);
     read_data(base)
+}
+
+fn read_redirection(base: u64, pin: u32) -> RedirectionEntry {
+    let register = 0x10 + pin.saturating_mul(2);
+    let low = read_register(base, register) as u64;
+    let high = read_register(base, register + 1) as u64;
+    RedirectionEntry::from_bits(low | (high << 32))
 }
 
 fn write_redirection(base: u64, pin: u32, entry: RedirectionEntry) {

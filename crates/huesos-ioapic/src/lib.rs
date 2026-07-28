@@ -268,6 +268,29 @@ impl RedirectionEntry {
         (self.to_bits() >> 32) as u32
     }
 
+    /// Whether every writable field matches `observed`.
+    ///
+    /// I/O APIC readback may report the read-only delivery-status and remote-IRR
+    /// bits changing underneath us, so privileged verification compares only
+    /// the fields software actually programs.
+    pub fn writable_fields_match(&self, observed: &Self) -> bool {
+        self.vector == observed.vector
+            && self.delivery_mode == observed.delivery_mode
+            && self.destination_mode == observed.destination_mode
+            && self.pin_polarity == observed.pin_polarity
+            && self.trigger_mode == observed.trigger_mode
+            && self.masked == observed.masked
+            && self.destination == observed.destination
+    }
+
+    /// Whether a level-triggered fixed-delivery entry needs a LAPIC EOI to let
+    /// the I/O APIC clear remote-IRR and reassert future interrupts.
+    pub fn level_requires_lapic_eoi(&self) -> bool {
+        !self.masked
+            && self.delivery_mode == DeliveryMode::Fixed
+            && self.trigger_mode == TriggerMode::Level
+    }
+
     /// Builder: set the vector.
     pub fn with_vector(mut self, vector: u8) -> Self {
         self.vector = vector;
@@ -463,6 +486,11 @@ pub const DEVICE_VECTOR_START: u8 = 0x30;
 /// shutdown-stop (0xF2) IPIs and the spurious vector (0xFF).
 pub const DEVICE_VECTOR_END: u8 = 0xEF;
 
+/// Whether `vector` is in the HuesOS external-device IRQ vector range.
+pub fn is_device_vector(vector: u8) -> bool {
+    (DEVICE_VECTOR_START..=DEVICE_VECTOR_END).contains(&vector)
+}
+
 /// Allocates distinct interrupt vectors from a configured inclusive range.
 ///
 /// Backed by a 256-bit occupancy map (no allocator). Allocation is a circular
@@ -622,6 +650,18 @@ pub fn route_gsi(io_apics: &[IoApicDescriptor], gsi: u32) -> Option<(u8, u32)> {
 // Integration helper
 // ---------------------------------------------------------------------------
 
+fn allocate_device_vector(vectors: &mut VectorAllocator) -> Option<u8> {
+    let capacity = vectors.capacity();
+    for _ in 0..capacity {
+        let vector = vectors.allocate()?;
+        if is_device_vector(vector) {
+            return Some(vector);
+        }
+        let _ = vectors.free(vector);
+    }
+    None
+}
+
 /// Build a redirection entry for a legacy ISA IRQ.
 ///
 /// Applies source overrides for the GSI and polarity/trigger, allocates a
@@ -641,7 +681,7 @@ pub fn entry_for_legacy_irq(
         Some(override_entry) => (override_entry.polarity(), override_entry.trigger()),
         None => (PinPolarity::ActiveHigh, TriggerMode::Edge),
     };
-    let vector = vectors.allocate()?;
+    let vector = allocate_device_vector(vectors)?;
     let entry = RedirectionEntry::masked()
         .with_vector(vector)
         .with_destination(destination_apic_id)
@@ -760,6 +800,41 @@ mod tests {
         assert_eq!(entry.pin_polarity, PinPolarity::ActiveLow);
         assert_eq!(entry.trigger_mode, TriggerMode::Level);
         assert!(!entry.masked);
+    }
+
+    #[test]
+    fn writable_field_match_ignores_read_only_status_bits() {
+        let expected = RedirectionEntry::masked()
+            .with_vector(0x50)
+            .with_destination(0x03)
+            .with_trigger(TriggerMode::Level)
+            .unmasked();
+        let mut observed = expected;
+        observed.delivery_status = true;
+        observed.remote_irr = true;
+        assert!(expected.writable_fields_match(&observed));
+        observed.vector = 0x51;
+        assert!(!expected.writable_fields_match(&observed));
+    }
+
+    #[test]
+    fn level_fixed_entries_require_lapic_eoi() {
+        let level = RedirectionEntry::masked()
+            .with_vector(0x50)
+            .with_trigger(TriggerMode::Level)
+            .unmasked();
+        assert!(level.level_requires_lapic_eoi());
+        let edge = RedirectionEntry::masked()
+            .with_vector(0x51)
+            .with_trigger(TriggerMode::Edge)
+            .unmasked();
+        assert!(!edge.level_requires_lapic_eoi());
+        let masked = level;
+        assert!(!RedirectionEntry {
+            masked: true,
+            ..masked
+        }
+        .level_requires_lapic_eoi());
     }
 
     // --- SourceOverride flag decoding ---
@@ -959,6 +1034,10 @@ mod tests {
         let alloc = VectorAllocator::device_default();
         assert_eq!(alloc.capacity(), (0xEF - 0x30 + 1) as usize);
         assert_eq!(alloc.used_count(), 0);
+        assert!(!is_device_vector(0x20));
+        assert!(is_device_vector(DEVICE_VECTOR_START));
+        assert!(is_device_vector(DEVICE_VECTOR_END));
+        assert!(!is_device_vector(0xF0));
     }
 
     #[test]
@@ -1141,6 +1220,53 @@ mod tests {
         let second = entry_for_legacy_irq(2, &overrides, &mut vectors, 0x00);
         assert_eq!(second, None);
     }
+
+    #[test]
+    fn legacy_irq_rejects_non_device_vector() {
+        let overrides = SourceOverrideTable::empty();
+        let mut vectors = VectorAllocator::new(0x20, 0x20);
+        assert_eq!(
+            entry_for_legacy_irq(1, &overrides, &mut vectors, 0x00),
+            None
+        );
+        assert_eq!(vectors.used_count(), 0);
+    }
+
+    #[test]
+    fn legacy_irq_skips_reserved_vector_before_device_range() {
+        let overrides = SourceOverrideTable::empty();
+        let mut vectors = VectorAllocator::new(0x20, DEVICE_VECTOR_START);
+        let built = entry_for_legacy_irq(1, &overrides, &mut vectors, 0x00);
+        assert!(
+            built.is_some(),
+            "expected device vector after reserved range"
+        );
+        if let Some((_gsi, entry)) = built {
+            assert_eq!(entry.vector, DEVICE_VECTOR_START);
+        }
+        assert_eq!(vectors.used_count(), 1);
+    }
+
+    #[test]
+    fn keyboard_override_can_route_to_non_identity_gsi() {
+        let overrides = table_with(&[SourceOverride {
+            bus: 0,
+            source: 1,
+            gsi: 17,
+            flags: 0b1111,
+        }]);
+        let mut vectors = VectorAllocator::new(0x31, 0x31);
+        let built = entry_for_legacy_irq(1, &overrides, &mut vectors, 0x02);
+        assert!(built.is_some(), "expected keyboard route");
+        if let Some((gsi, entry)) = built {
+            assert_eq!(gsi, 17);
+            assert_eq!(entry.vector, 0x31);
+            assert_eq!(entry.pin_polarity, PinPolarity::ActiveLow);
+            assert_eq!(entry.trigger_mode, TriggerMode::Level);
+            assert_eq!(entry.destination, 0x02);
+        }
+    }
+
     #[test]
     fn non_isa_source_override_does_not_remap_legacy_irq() {
         let table = table_with(&[SourceOverride {

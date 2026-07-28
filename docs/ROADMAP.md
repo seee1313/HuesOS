@@ -320,9 +320,15 @@ priority order.
 - **Policy core landed**: `huesos-ioapic` — host-tested redirection-entry codec,
   MADT Interrupt Source Override parsing, vector allocation, and GSI→I/O APIC
   routing (see [IOAPIC_ROUTING.md](IOAPIC_ROUTING.md)).
-- **Needed (on-target)**: deliberate vector/IRQ assertions, x2APIC and real
-  source-override coverage, broader device routing, level-triggered EOI tests,
-  and removal of PIC fallback where safe.
+- **Route verification landed**: the policy helper refuses non-device vectors
+  and skips reserved vectors in misconfigured ranges; host tests cover
+  non-identity IRQ1 source overrides and level-triggered LAPIC
+  EOI requirements, and the privileged keyboard route now reads back the I/O
+  APIC redirection entry after unmasking. A mismatch masks the entry again and
+  leaves the PIC fallback active.
+- **Needed (on-target)**: x2APIC destination mode, broader multi-device routing,
+  real hardware source-override coverage beyond QEMU, and removal of PIC
+  fallback where safe.
 
 ### 3. Process/task and object teardown (mostly done)
 - **Current**: exited-process stacks, private page tables, and address-space-

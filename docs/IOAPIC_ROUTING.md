@@ -1,8 +1,8 @@
 # I/O APIC Routing Policy (`huesos-ioapic`)
 
 Status: **policy + host tests landed; IRQ1 now has an integrated masked-first
-MMIO route with PIC fallback. QEMU matrix verification is complete; broader
-IRQ routing and bare-metal coverage remain.**
+MMIO route with readback verification and PIC fallback. QEMU matrix verification
+is complete; broader IRQ routing, x2APIC, and bare-metal coverage remain.**
 
 This document describes the host-testable crate `huesos-ioapic` and how it is
 intended to plug into the kernel's interrupt handling. It supports
@@ -55,6 +55,9 @@ A faithful codec for the 64-bit I/O APIC redirection table entry
 into the two 32-bit halves the driver writes (low half first). Reserved
 delivery-mode encodings decode to `Fixed`. `RedirectionEntry::masked()` starts
 masked so a partially programmed entry never fires; `unmasked()` enables it.
+`writable_fields_match()` lets the privileged driver verify MMIO readback while
+ignoring read-only delivery-status / remote-IRR bits, and
+`level_requires_lapic_eoi()` documents the level-triggered remote-IRR EOI rule.
 
 ### `SourceOverride` and `parse_source_overrides`
 
@@ -75,9 +78,12 @@ dereferenced. `SourceOverrideTable::resolve_gsi`/`find` apply the overrides
 Hands out distinct device-IRQ vectors from an inclusive range (default
 `0x30..=0xEF`), deliberately avoiding the CPU exceptions (`0x00-0x1F`), the
 LAPIC timer vector (`0x20`), the panic-stop (`0xF1`) and shutdown-stop (`0xF2`)
-IPIs, and the spurious vector (`0xFF`). Backed by a 256-entry occupancy map
-(no allocator); allocation is a circular scan, with `reserve`/`free` for
-explicit management.
+IPIs, and the spurious vector (`0xFF`). `is_device_vector()` and
+`entry_for_legacy_irq` refuse vectors outside this external-device range even if
+a caller accidentally configures a bad allocator range; reserved vectors are
+freed and skipped until a valid device vector appears or the range is exhausted.
+Backed by a 256-entry occupancy map (no allocator); allocation is a circular
+scan, with `reserve`/`free` for explicit management.
 
 ### `IoApicDescriptor` and `route_gsi`
 
@@ -104,29 +110,36 @@ after installing it.
 4. use `route_gsi` and `entry_for_legacy_irq` for ISA IRQ1;
 5. program the high and low redirection halves masked-first;
 6. unmask the entry only after both writes;
-7. install the dedicated vector `0x31` and send LAPIC EOI in the handler.
+7. read the redirection entry back and compare every writable field;
+8. install the dedicated vector `0x31` and send LAPIC EOI in the handler.
 
 `interrupts::init` masks the 8259 keyboard path only after this route succeeds.
-If any step fails, the existing PIC handler remains active.
+If any step fails, including readback mismatch, the driver masks the candidate
+I/O APIC entry again and the existing PIC handler remains active.
 ## What still requires on-target verification
 
 The QEMU debug/release × SMP1/SMP2 serial smoke matrix verifies that the
 integrated boot path remains healthy. The following still require additional
 coverage before claiming a complete interrupt subsystem:
 
-- deliberate keyboard injection assertions that the `0x31` vector, rather than
+- keyboard-injection CI assertions that prove the `0x31` vector, rather than
   the PIC vector, delivered the event;
-- multiple routable IRQs and real source overrides such as IRQ0→GSI2;
-- SMP affinity/destination selection beyond the BSP-targeted keyboard route;
-- level-triggered device EOI semantics;
-- bare-metal firmware variation.
+- multiple routable IRQs and real source overrides such as IRQ0→GSI2 on
+  hardware, not only synthetic host tables;
+- x2APIC / logical destination support and SMP affinity selection beyond the
+  BSP-targeted keyboard route;
+- bare-metal firmware variation;
+- eventual PIC fallback removal once the I/O APIC path is proven on enough
+  machines.
 
 ## Tests (host)
 
-`make test` includes `-p huesos-ioapic`. The suite (31 tests) covers
-redirection-entry round-trip and bit placement, reserved-delivery-mode fallback,
-override flag decoding, GSI resolution (identity and override), defensive MADT
-source-override parsing (valid, empty, bad signature, truncated, oversized
-declared length, zero-length entry), vector allocation/exhaustion/free/reserve
-and the empty-range and underflow edge cases, GSI→I/O-APIC selection (explicit
-range, fallback, no owner), and the `entry_for_legacy_irq` integration helper.
+`make test` includes `-p huesos-ioapic`. The suite covers redirection-entry
+round-trip and bit placement, readback comparison of writable fields,
+level-triggered LAPIC EOI policy, reserved-delivery-mode fallback, override flag
+decoding, GSI resolution (identity and override), defensive MADT source-override
+parsing (valid, empty, bad signature, truncated, oversized declared length,
+zero-length entry), device-vector range assertions, vector
+allocation/exhaustion/free/reserve and the empty-range and underflow edge cases,
+GSI→I/O-APIC selection (explicit range, fallback, no owner), non-identity IRQ1
+source overrides, and the `entry_for_legacy_irq` integration helper.
