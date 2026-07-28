@@ -1,7 +1,8 @@
 //! Process/thread/VMAR launch syscalls plus yield/exit.
 
 use huesos_abi::{
-    ErrorCode, HandleValue, VmarCreateChildArgs, VmarMapArgs, VmarOpArgs, BOOTSTRAP_HANDLE,
+    ErrorCode, HandleValue, ProcessBindExitPortArgs, VmarCreateChildArgs, VmarMapArgs, VmarOpArgs,
+    BOOTSTRAP_HANDLE,
 };
 use huesos_object::{Handle, KernelObject, KernelObjectExt, Rights};
 
@@ -273,6 +274,41 @@ pub(crate) fn sys_thread_start(
 }
 
 const VMAR_PAGE_SIZE: u64 = 4096;
+
+pub(crate) fn sys_process_bind_exit_port(
+    args_ptr: *const ProcessBindExitPortArgs,
+) -> SyscallResult {
+    let args = user_memory::read_value(args_ptr)?;
+    if args.flags != 0 {
+        return Err(ErrorCode::InvalidArgs);
+    }
+    let proc = current_proc()?;
+    let process_handle = proc.handles.get(args.process).ok_or(ErrorCode::BadHandle)?;
+    if !process_handle.has_rights(Rights::READ) {
+        return Err(ErrorCode::AccessDenied);
+    }
+    let port_handle = proc.handles.get(args.port).ok_or(ErrorCode::BadHandle)?;
+    if !port_handle.has_rights(Rights::WRITE) {
+        return Err(ErrorCode::AccessDenied);
+    }
+
+    let process_obj =
+        huesos_object::lookup_object(process_handle.koid).ok_or(ErrorCode::BadHandle)?;
+    let process = process_obj
+        .downcast_ref::<huesos_object::Process>()
+        .ok_or(ErrorCode::WrongType)?;
+    let port_obj = huesos_object::lookup_object(port_handle.koid).ok_or(ErrorCode::BadHandle)?;
+    let port = port_obj
+        .downcast_arc::<huesos_object::Port>()
+        .map_err(|_| ErrorCode::WrongType)?;
+    process
+        .bind_exit_port(port, args.key)
+        .map_err(|error| match error {
+            huesos_object::ProcessExitPortError::Full => ErrorCode::Busy,
+            huesos_object::ProcessExitPortError::OutOfMemory => ErrorCode::NoMemory,
+        })?;
+    Ok(0)
+}
 
 pub(crate) fn sys_vmar_create_child(args_ptr: *const VmarCreateChildArgs) -> SyscallResult {
     let args = user_memory::read_value(args_ptr)?;

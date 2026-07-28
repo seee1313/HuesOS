@@ -91,7 +91,8 @@ pub use waitset::{wait_all, wait_any, Signals, WaitItem, WaitOutcome};
 /// (`use libcanvas::ErrorCode;`) without depending on `huesos-abi` directly.
 pub use huesos_abi::{
     fault_exit, rights, signals, vmar_flags, wait_mode, ErrorCode, PortPacket, BOOTSTRAP_HANDLE,
-    INIT_BOOTFS_HANDLE, PORT_PACKET_INTERRUPT, USER_STACK_SIZE, USER_STACK_TOP,
+    INIT_BOOTFS_HANDLE, PORT_PACKET_INTERRUPT, PORT_PACKET_PROCESS_EXIT, USER_STACK_SIZE,
+    USER_STACK_TOP,
 };
 
 /// Result type used throughout `libcanvas`: every fallible syscall wrapper

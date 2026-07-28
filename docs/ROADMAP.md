@@ -395,18 +395,21 @@ next-stage expansion items; they are not blockers for the Immediate milestone.
 
 ## Short Term
 
-### 5. Multiple/dynamic userspace processes
-- **Current**: MVP split launch exists (`ProcessCreate`, `VmarMap`,
+### 5. Multiple/dynamic userspace processes — COMPLETE ✅
+- **Current**: split launch exists (`ProcessCreate`, `VmarMap`,
   `ThreadCreate`, `ThreadStart`) and init can launch embedded child ELF
   images through `libcanvas::process::spawn_elf`.
 - **Policy core landed**: `huesos-proclife` — host-tested per-process lifecycle
   state machine (Created→Running→Exited→Reaped) with exit/wait/reap
-  coordination and an exit-info payload for port signals (see
+  coordination and an exit-info payload (see
   [DYNAMIC_PROCESSES.md](DYNAMIC_PROCESSES.md)).
-- **Needed (on-target)**: drive the state machine from the scheduler/process
-  subsystem (blocking waits / port signals for exit, teardown/reaping), richer
-  handle-transfer semantics, and eventually loading ELF images from a VFS
-  instead of build-time `include_bytes!`.
+- **Exit notifications landed**: `ProcessBindExitPort` lets a supervisor bind a
+  Port to a process. On exit, the kernel queues a `PORT_PACKET_PROCESS_EXIT`
+  packet carrying `(koid, generation, exit_code)` plus the user key; late binds
+  to an already-exited process queue immediately.
+- **Short-Term #5 status**: complete for the current launch model. Loading ELF
+  images from VFS instead of build-time `include_bytes!` is tracked under
+  Short-Term #7 (real VFS + userspace drivers), not as a blocker for #5.
 
 ### 6. Handle transfer semantics
 - **Current**: `ChannelWrite` validates distinct handles and `TRANSFER`, removes

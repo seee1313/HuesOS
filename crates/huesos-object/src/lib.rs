@@ -39,7 +39,7 @@ pub use job::Job;
 pub use koid::{alloc_koid, Koid};
 pub use object::{KernelObject, KernelObjectExt, ObjectType};
 pub use port::{Port, PortCreateError, PortPacket, PortQueueError};
-pub use process::Process;
+pub use process::{Process, ProcessExitPortError};
 pub(crate) use registry::phys_to_virt;
 pub use registry::{
     acquire_kernel_ref, collect_exited_process, current_process, lookup_interrupts_by_irq,
@@ -254,6 +254,25 @@ mod tests {
         assert!(parent.mapping(0x12000, 0x1000).is_none());
         assert!(parent.mapping(0x11000, 0x1000).is_some());
         assert!(parent.remove_child(child.koid()));
+    }
+
+    #[test]
+    fn process_exit_queues_bound_port_packet() {
+        let process = Process::new("watched");
+        let port = match Port::new() {
+            Ok(port) => port,
+            Err(_) => return,
+        };
+        assert!(process.bind_exit_port(port.clone(), 0xCAFE).is_ok());
+        assert!(process.set_exit_code(42));
+        let packet = port.read();
+        assert!(packet.is_some(), "exit should queue a packet");
+        if let Some(packet) = packet {
+            assert_eq!(packet.key, 0xCAFE);
+            assert_eq!(packet.packet_type, 2);
+            assert_eq!(packet.data[0], process.koid().0);
+            assert_eq!(packet.data[2], 42);
+        }
     }
 
     #[test]

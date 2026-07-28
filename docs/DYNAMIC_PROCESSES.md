@@ -89,14 +89,20 @@ automatic balancing.
 The scheduler copies this lifecycle-owned generation unchanged into its bounded
 finished-task graveyard via `record_exit_with_generation`, accounts overflow
 `Evicted` outcomes, and reaps by asking the `Process` object whether the stored
-generation has been observed. Deferred reaping and any later supervisor packet
-therefore refer to the same `(koid, generation)` exit identity without direct
-scheduler access to `ProcState`.
+generation has been observed. Deferred reaping and supervisor packets therefore
+refer to the same `(koid, generation)` exit identity without direct scheduler
+access to `ProcState`.
+
+Supervisors can receive exit packets with `ProcessBindExitPort`: the process
+queues `PORT_PACKET_PROCESS_EXIT` to the bound Port on exit. Packet `data[0]` is
+the process koid, `data[1]` is the lifecycle generation, and `data[2]` is the
+`i64` exit code reinterpreted as `u64`; the user-supplied key is copied into the
+packet key field. Binding after a process already exited queues the same packet
+immediately.
 
 The remaining integration work is future-facing:
 
-1. emit a generation-bearing exit packet to subscribed Port supervisors;
-2. add stress/diagnostic coverage for graveyard eviction counters;
+1. add stress/diagnostic coverage for graveyard eviction counters;
 3. charge/release handle, page-table, and CPU quota resources only after the
    policy transition permits it.
 

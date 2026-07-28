@@ -193,13 +193,16 @@ pub enum Syscall {
     SignalSet = 46,
     /// Clear a signal object. `a1` is a Signal handle with WRITE rights.
     SignalClear = 47,
+    /// Bind a Port to receive one process-exit packet when the process exits.
+    /// `a1` points to [`ProcessBindExitPortArgs`].
+    ProcessBindExitPort = 48,
 }
 
 impl Syscall {
     /// Total number of defined syscalls (i.e. one past the highest
     /// currently-assigned number). The dispatcher uses this to reject
     /// obviously-out-of-range numbers before a `match`.
-    pub const COUNT: u64 = 48;
+    pub const COUNT: u64 = 49;
 
     /// Convert a raw syscall number back into a [`Syscall`], if valid.
     pub const fn from_raw(n: u64) -> Option<Self> {
@@ -252,6 +255,7 @@ impl Syscall {
             45 => Self::SignalCreate,
             46 => Self::SignalSet,
             47 => Self::SignalClear,
+            48 => Self::ProcessBindExitPort,
             _ => return None,
         })
     }
@@ -712,6 +716,8 @@ pub struct WaitSetWaitArgs {
 
 /// Port packet type for interrupt notifications.
 pub const PORT_PACKET_INTERRUPT: u32 = 1;
+/// Port packet type for process-exit notifications.
+pub const PORT_PACKET_PROCESS_EXIT: u32 = 2;
 
 /// Fixed-size event packet returned by [`Syscall::PortRead`].
 #[repr(C)]
@@ -726,6 +732,20 @@ pub struct PortPacket {
     pub status: i32,
     /// Source-specific payload words.
     pub data: [u64; 4],
+}
+
+/// Arguments for [`Syscall::ProcessBindExitPort`].
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ProcessBindExitPortArgs {
+    /// Process handle to observe.
+    pub process: HandleValue,
+    /// Port handle receiving the exit packet.
+    pub port: HandleValue,
+    /// User key copied into the queued packet.
+    pub key: u64,
+    /// Reserved for future one-shot/repeating policy flags. Must be zero.
+    pub flags: u32,
 }
 
 /// Arguments for [`Syscall::VmarCreateChild`].
@@ -830,7 +850,8 @@ mod tests {
         assert_eq!(Syscall::SignalCreate as u64, 45);
         assert_eq!(Syscall::SignalSet as u64, 46);
         assert_eq!(Syscall::SignalClear as u64, 47);
-        assert_eq!(Syscall::COUNT, 48);
+        assert_eq!(Syscall::ProcessBindExitPort as u64, 48);
+        assert_eq!(Syscall::COUNT, 49);
         assert_eq!(Syscall::from_raw(28), Some(Syscall::VmoCreateEx));
         assert_eq!(Syscall::from_raw(30), Some(Syscall::VmarProtect));
         assert_eq!(Syscall::from_raw(31), Some(Syscall::ChannelPeek));
@@ -850,7 +871,8 @@ mod tests {
         assert_eq!(Syscall::from_raw(45), Some(Syscall::SignalCreate));
         assert_eq!(Syscall::from_raw(46), Some(Syscall::SignalSet));
         assert_eq!(Syscall::from_raw(47), Some(Syscall::SignalClear));
-        assert_eq!(Syscall::from_raw(48), None);
+        assert_eq!(Syscall::from_raw(48), Some(Syscall::ProcessBindExitPort));
+        assert_eq!(Syscall::from_raw(49), None);
     }
 
     #[test]

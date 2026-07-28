@@ -41,8 +41,8 @@ mod waitset;
 
 use huesos_abi::{
     ChannelConsumeArgs, ChannelPeekArgs, ChannelReadEtcArgs, ErrorCode, FramebufferBlitArgs,
-    FramebufferInfo, HandleValue, PortPacket, VmarCreateChildArgs, VmarMapArgs, VmarOpArgs,
-    WaitSetWaitArgs,
+    FramebufferInfo, HandleValue, PortPacket, ProcessBindExitPortArgs, VmarCreateChildArgs,
+    VmarMapArgs, VmarOpArgs, WaitSetWaitArgs,
 };
 
 pub use callbacks::{
@@ -160,5 +160,8 @@ pub fn dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> Syscal
         S::SignalCreate => signal::sys_signal_create(a1 as *mut HandleValue),
         S::SignalSet => signal::sys_signal_set(a1 as HandleValue),
         S::SignalClear => signal::sys_signal_clear(a1 as HandleValue),
+        S::ProcessBindExitPort => {
+            process::sys_process_bind_exit_port(a1 as *const ProcessBindExitPortArgs)
+        }
     }
 }

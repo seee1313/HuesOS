@@ -2,11 +2,12 @@
 
 use crate::channel::Channel;
 use crate::handle::Handle;
+use crate::port::Port;
 use crate::raw;
 use crate::vmo::Vmo;
 use huesos_abi::{
-    HandleValue, Syscall, VmarCreateChildArgs, VmarMapArgs, VmarOpArgs, BOOTSTRAP_HANDLE,
-    INVALID_HANDLE,
+    HandleValue, ProcessBindExitPortArgs, Syscall, VmarCreateChildArgs, VmarMapArgs, VmarOpArgs,
+    BOOTSTRAP_HANDLE, INVALID_HANDLE,
 };
 
 /// Initial bootstrap channel handle number installed in a newly-started
@@ -61,6 +62,19 @@ impl Process {
         );
         raw::decode(ret)?;
         Ok(code)
+    }
+
+    /// Queue a process-exit packet to `port` when this process exits.
+    pub fn bind_exit_port(&self, port: &Port, key: u64) -> crate::Result<()> {
+        let args = ProcessBindExitPortArgs {
+            process: self.0.raw(),
+            port: port.handle().raw(),
+            key,
+            flags: 0,
+        };
+        let ret = raw::syscall1(Syscall::ProcessBindExitPort, &args as *const _ as u64);
+        raw::decode(ret)?;
+        Ok(())
     }
 
     /// Query process completion without blocking.

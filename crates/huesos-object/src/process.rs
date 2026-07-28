@@ -4,12 +4,32 @@ use crate::irq_guard::IrqSafeMutex;
 use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 use core::any::Any;
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use crate::wait::WaitQueue;
-use crate::{alloc_koid, root_job, HandleTable, Job, KernelObject, Koid, ObjectType};
+use crate::{
+    alloc_koid, root_job, HandleTable, Job, KernelObject, Koid, ObjectType, Port, PortPacket,
+};
 use huesos_proclife::{ExitInfo, ProcState, ProcessLifecycle};
+
+const PORT_PACKET_PROCESS_EXIT: u32 = 2;
+const MAX_EXIT_PORTS: usize = 8;
+
+/// Failure when binding a process-exit port.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProcessExitPortError {
+    /// Too many exit ports are already bound.
+    Full,
+    /// Could not reserve storage for the subscription.
+    OutOfMemory,
+}
+
+struct ExitPortBinding {
+    port: Arc<Port>,
+    key: u64,
+}
 
 /// Process — address space + handle table + exit state.
 pub struct Process {
@@ -23,6 +43,8 @@ pub struct Process {
     lifecycle: IrqSafeMutex<ProcessLifecycle>,
     /// Waiters blocked in `ProcessWait` until this process exits.
     pub exit_waiters: WaitQueue,
+    /// Ports that receive one packet when this process exits.
+    exit_ports: IrqSafeMutex<Vec<ExitPortBinding>>,
     /// Serializes validated kernel copies with VMAR mutation operations.
     pub user_memory_lock: IrqSafeMutex<()>,
     /// Opaque pointer to the arch-specific address space (owned elsewhere;
@@ -66,6 +88,7 @@ impl Process {
             job,
             lifecycle: IrqSafeMutex::new(ProcessLifecycle::new(koid.0, koid.0)),
             exit_waiters: WaitQueue::new(),
+            exit_ports: IrqSafeMutex::new(Vec::new()),
             user_memory_lock: IrqSafeMutex::new(()),
             address_space: IrqSafeMutex::new(None),
             home_cpu: AtomicUsize::new(crate::registry::current_cpu()),
@@ -200,9 +223,49 @@ impl Process {
             exited
         };
         if exited {
+            if let Some(info) = self.exit_info() {
+                self.queue_exit_packets(info);
+            }
             self.exit_waiters.wake_all();
         }
         exited
+    }
+
+    fn queue_exit_packets(&self, info: ExitInfo) {
+        let bindings = self.exit_ports.lock();
+        for binding in bindings.iter() {
+            let _ = binding.port.queue(PortPacket {
+                key: binding.key,
+                packet_type: PORT_PACKET_PROCESS_EXIT,
+                status: 0,
+                data: [info.koid, info.generation, info.exit_code as u64, 0],
+            });
+        }
+    }
+
+    /// Bind a Port to receive a packet when this process exits. Late binding to
+    /// an already-exited process queues the packet immediately.
+    pub fn bind_exit_port(&self, port: Arc<Port>, key: u64) -> Result<(), ProcessExitPortError> {
+        let immediate = self.exit_info();
+        if let Some(info) = immediate {
+            let _ = port.queue(PortPacket {
+                key,
+                packet_type: PORT_PACKET_PROCESS_EXIT,
+                status: 0,
+                data: [info.koid, info.generation, info.exit_code as u64, 0],
+            });
+            return Ok(());
+        }
+
+        let mut bindings = self.exit_ports.lock();
+        if bindings.len() >= MAX_EXIT_PORTS {
+            return Err(ProcessExitPortError::Full);
+        }
+        bindings
+            .try_reserve_exact(1)
+            .map_err(|_| ProcessExitPortError::OutOfMemory)?;
+        bindings.push(ExitPortBinding { port, key });
+        Ok(())
     }
 
     /// Snapshot exit code if the process has already exited.
