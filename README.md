@@ -64,8 +64,8 @@ see [Known Limitations](#known-limitations) and
   shutdown-stop IPI, permanent CPU halt, and a final safe-to-power-off screen
 - ✅ Full-screen Snake paced by the kernel monotonic clock (no RDTSC/device-
   frequency dependency), with resolution-adaptive layout and refreshed visuals
-- ✅ TTY-style 8×16 default terminal font with the original 8×8 font retained
-  as `font compact`
+- ✅ Cozette 6×13 default terminal font, with TTY-style 8×16 and original
+  8×8 modes retained as `font tty` / `font compact`
 - ✅ DoomGeneric userspace port with Freedoom Phase 1, custom non-POSIX libc,
   Canvas video, Channel keyboard input, and monotonic timing (silent first cut)
 

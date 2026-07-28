@@ -10,6 +10,7 @@ use libcanvas::framebuffer::{Canvas, TextFont};
 // 96-column classic-VT budget.
 const ROWS: usize = 54;
 const COLS: usize = 168;
+const ALL_ROWS_DIRTY: u64 = (1u64 << ROWS) - 1;
 /// Extra pixel of leading between rows to keep descenders (`g`, `p`,
 /// `y`, `q`) visually separated from the next line's ascenders.
 const LINE_HEIGHT: u32 = 14;
@@ -50,6 +51,8 @@ pub struct Screen {
     row: usize,
     col: usize,
     font: TextFont,
+    dirty_rows: u64,
+    force_full_render: bool,
 }
 
 impl Screen {
@@ -61,6 +64,8 @@ impl Screen {
             row: 0,
             col: 0,
             font: TextFont::Cozette6x13,
+            dirty_rows: ALL_ROWS_DIRTY,
+            force_full_render: true,
         }
     }
 
@@ -69,6 +74,7 @@ impl Screen {
         self.cells = [[b' '; COLS]; ROWS];
         self.row = 0;
         self.col = 0;
+        self.mark_all_dirty();
     }
 
     /// Write a string then a newline.
@@ -99,6 +105,7 @@ impl Screen {
             b'?'
         };
         self.col += 1;
+        self.mark_row_dirty(self.row);
     }
 
     /// Delete one character on the current line.
@@ -106,16 +113,22 @@ impl Screen {
         if self.col > 0 {
             self.col -= 1;
             self.cells[self.row][self.col] = b' ';
+            self.mark_row_dirty(self.row);
         }
     }
 
     /// Advance to a new line, scrolling if needed.
     pub fn newline(&mut self) {
+        let old_row = self.row;
         self.col = 0;
         if self.row + 1 >= ROWS {
             self.scroll();
         } else {
             self.row += 1;
+            // The active input row is highlighted, so both the old and
+            // new row must be repainted when the cursor moves vertically.
+            self.mark_row_dirty(old_row);
+            self.mark_row_dirty(self.row);
         }
     }
 
@@ -138,24 +151,22 @@ impl Screen {
         }
     }
 
-    /// Select the default Cozette 6x13 bitmap font. Currently unused
-    /// because `Screen::new` picks it up as the default, but retained
-    /// so the terminal shell can add a `font cozette` toggle
-    /// alongside the existing `font tty` / `font compact` commands
-    /// without adding an accessor at that point.
-    #[allow(dead_code)]
+    /// Select the default Cozette 6x13 bitmap font.
     pub fn use_cozette_font(&mut self) {
         self.font = TextFont::Cozette6x13;
+        self.mark_all_dirty();
     }
 
     /// Select the legacy TTY-style 8x16 upscaled font.
     pub fn use_tty_font(&mut self) {
         self.font = TextFont::Tty8x16;
+        self.mark_all_dirty();
     }
 
     /// Select the original compact HuesOS 8x8 font.
     pub fn use_compact_font(&mut self) {
         self.font = TextFont::Compact8x8;
+        self.mark_all_dirty();
     }
 
     /// Human-readable active font name.
@@ -167,72 +178,35 @@ impl Screen {
         }
     }
 
-    /// Present the current text buffer to the framebuffer.
-    pub fn render(&self) {
-        let Some(canvas) = &self.canvas else {
+    /// Present dirty text rows to the framebuffer.
+    pub fn render(&mut self) {
+        if self.dirty_rows == 0 && !self.force_full_render {
             return;
+        }
+
+        let rendered = if let Some(canvas) = self.canvas.as_ref() {
+            if canvas.supports_buffered_raster() && canvas.byte_len() <= SHADOW_CAPACITY {
+                let dirty_rows = self.dirty_rows;
+                let force_full = self.force_full_render;
+                with_render_shadow(|shadow| {
+                    if force_full || dirty_rows == ALL_ROWS_DIRTY {
+                        self.render_full_buffered(canvas, shadow)
+                    } else {
+                        self.render_dirty_buffered(canvas, shadow, dirty_rows)
+                    }
+                })
+            } else {
+                // Conservative fallback for unusual non-32-bpp framebuffers.
+                self.render_full_fallback(canvas)
+            }
+        } else {
+            true
         };
 
-        if canvas.supports_buffered_raster() && canvas.byte_len() <= SHADOW_CAPACITY {
-            let rendered = with_render_shadow(|shadow| {
-                if canvas.clear_shadow(shadow, 5, 8, 16).is_err() {
-                    return false;
-                }
-                let mut row = 0;
-                while row < ROWS {
-                    let len = line_len(&self.cells[row]);
-                    if let Ok(text) = core::str::from_utf8(&self.cells[row][..len]) {
-                        let color = if row == self.row {
-                            (180, 240, 180)
-                        } else {
-                            (180, 220, 255)
-                        };
-                        let _ = canvas.draw_text_to_shadow(
-                            shadow,
-                            LEFT_MARGIN,
-                            TOP_MARGIN + row as u32 * LINE_HEIGHT,
-                            text,
-                            color.0,
-                            color.1,
-                            color.2,
-                            self.font,
-                        );
-                    }
-                    row += 1;
-                }
-                canvas.upload_shadow(shadow).is_ok() && canvas.present().is_ok()
-            });
-            if rendered {
-                return;
-            }
+        if rendered {
+            self.dirty_rows = 0;
+            self.force_full_render = false;
         }
-
-        // Conservative fallback for unusual non-32-bpp framebuffers.
-        let _ = canvas.fill_rect(0, 0, canvas.width(), canvas.height(), 5, 8, 16);
-        let mut row = 0;
-        while row < ROWS {
-            let len = line_len(&self.cells[row]);
-            if len > 0 {
-                if let Ok(text) = core::str::from_utf8(&self.cells[row][..len]) {
-                    let color = if row == self.row {
-                        (180, 240, 180)
-                    } else {
-                        (180, 220, 255)
-                    };
-                    let _ = canvas.draw_text_with_font(
-                        LEFT_MARGIN,
-                        TOP_MARGIN + row as u32 * LINE_HEIGHT,
-                        text,
-                        color.0,
-                        color.1,
-                        color.2,
-                        self.font,
-                    );
-                }
-            }
-            row += 1;
-        }
-        let _ = canvas.present();
     }
 
     fn scroll(&mut self) {
@@ -243,7 +217,186 @@ impl Screen {
         }
         self.cells[ROWS - 1] = [b' '; COLS];
         self.row = ROWS - 1;
+        self.mark_all_dirty();
     }
+
+    fn mark_row_dirty(&mut self, row: usize) {
+        if row < ROWS {
+            self.dirty_rows |= 1u64 << row;
+        }
+    }
+
+    fn mark_all_dirty(&mut self) {
+        self.dirty_rows = ALL_ROWS_DIRTY;
+        self.force_full_render = true;
+    }
+
+    fn render_full_buffered(&self, canvas: &Canvas, shadow: &mut [u8; SHADOW_CAPACITY]) -> bool {
+        if canvas.clear_shadow(shadow, 5, 8, 16).is_err() {
+            return false;
+        }
+        let mut row = 0;
+        while row < ROWS {
+            if !self.draw_row_text_to_shadow(canvas, shadow, row) {
+                return false;
+            }
+            row += 1;
+        }
+        canvas.upload_shadow(shadow).is_ok() && canvas.present().is_ok()
+    }
+
+    fn render_dirty_buffered(
+        &self,
+        canvas: &Canvas,
+        shadow: &mut [u8; SHADOW_CAPACITY],
+        dirty_rows: u64,
+    ) -> bool {
+        let mut row = 0;
+        let mut range_start: Option<usize> = None;
+        let mut range_end = 0usize;
+
+        while row < ROWS {
+            if dirty_rows & (1u64 << row) != 0 {
+                if !self.render_row_to_shadow(canvas, shadow, row) {
+                    return false;
+                }
+                match range_start {
+                    Some(_) if row == range_end => {
+                        range_end += 1;
+                    }
+                    Some(start) => {
+                        if !flush_shadow_rows(canvas, shadow, start, range_end) {
+                            return false;
+                        }
+                        range_start = Some(row);
+                        range_end = row + 1;
+                    }
+                    None => {
+                        range_start = Some(row);
+                        range_end = row + 1;
+                    }
+                }
+            }
+            row += 1;
+        }
+
+        if let Some(start) = range_start {
+            flush_shadow_rows(canvas, shadow, start, range_end)
+        } else {
+            true
+        }
+    }
+
+    fn render_row_to_shadow(
+        &self,
+        canvas: &Canvas,
+        shadow: &mut [u8; SHADOW_CAPACITY],
+        row: usize,
+    ) -> bool {
+        let y = row_y(row);
+        if canvas
+            .fill_rect_to_shadow(shadow, 0, y, canvas.width(), LINE_HEIGHT, 5, 8, 16)
+            .is_err()
+        {
+            return false;
+        }
+        self.draw_row_text_to_shadow(canvas, shadow, row)
+    }
+
+    fn draw_row_text_to_shadow(
+        &self,
+        canvas: &Canvas,
+        shadow: &mut [u8; SHADOW_CAPACITY],
+        row: usize,
+    ) -> bool {
+        let len = line_len(&self.cells[row]);
+        if len == 0 {
+            return true;
+        }
+        let Ok(text) = core::str::from_utf8(&self.cells[row][..len]) else {
+            return true;
+        };
+        let color = if row == self.row {
+            (180, 240, 180)
+        } else {
+            (180, 220, 255)
+        };
+        canvas
+            .draw_text_to_shadow(
+                shadow,
+                LEFT_MARGIN,
+                row_y(row),
+                text,
+                color.0,
+                color.1,
+                color.2,
+                self.font,
+            )
+            .is_ok()
+    }
+
+    fn render_full_fallback(&self, canvas: &Canvas) -> bool {
+        if canvas
+            .fill_rect(0, 0, canvas.width(), canvas.height(), 5, 8, 16)
+            .is_err()
+        {
+            return false;
+        }
+        let mut row = 0;
+        while row < ROWS {
+            let len = line_len(&self.cells[row]);
+            if len > 0 {
+                if let Ok(text) = core::str::from_utf8(&self.cells[row][..len]) {
+                    let color = if row == self.row {
+                        (180, 240, 180)
+                    } else {
+                        (180, 220, 255)
+                    };
+                    if canvas
+                        .draw_text_with_font(
+                            LEFT_MARGIN,
+                            row_y(row),
+                            text,
+                            color.0,
+                            color.1,
+                            color.2,
+                            self.font,
+                        )
+                        .is_err()
+                    {
+                        return false;
+                    }
+                }
+            }
+            row += 1;
+        }
+        canvas.present().is_ok()
+    }
+}
+
+fn flush_shadow_rows(
+    canvas: &Canvas,
+    shadow: &[u8; SHADOW_CAPACITY],
+    start_row: usize,
+    end_row: usize,
+) -> bool {
+    let y = row_y(start_row);
+    if y >= canvas.height() {
+        return true;
+    }
+    let y_end = row_y(end_row).min(canvas.height());
+    if y >= y_end {
+        return true;
+    }
+    let height = y_end - y;
+    canvas
+        .upload_shadow_region(shadow, 0, y, canvas.width(), height)
+        .is_ok()
+        && canvas.present_region(0, y, canvas.width(), height).is_ok()
+}
+
+fn row_y(row: usize) -> u32 {
+    TOP_MARGIN + row as u32 * LINE_HEIGHT
 }
 
 fn line_len(line: &[u8; COLS]) -> usize {

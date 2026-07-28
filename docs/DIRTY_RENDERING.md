@@ -25,7 +25,8 @@ Packed sources retain the bounded bulk-copy fast path. Strided sources are gathe
 `Canvas` adds:
 
 - `fill_rect_to_shadow`: clipped, syscall-free 32-bpp rasterization;
-- `upload_shadow_region`: row-wise VMO upload for one rectangle;
+- `upload_shadow_region`: contiguous bounded-chunk upload for full-width
+  stripes, row-wise VMO upload for narrower rectangles;
 - `present_region`: same-coordinate dirty present;
 - `present_region_at`: dirty present with an explicit destination.
 

@@ -148,10 +148,11 @@ unmapped pointer or executing an invalid opcode) terminates the complete
 process, not the kernel. A supervisor receives a stable negative status from
 `Process::wait_exit`; see [FAULTS_AND_PANIC.md](FAULTS_AND_PANIC.md).
 
-Canvas text defaults to `TextFont::Tty8x16`; callers that require the original
-compact glyphs can use `draw_text_with_font(..., TextFont::Compact8x8)`.
-Software renderers can upload packed frames with `Canvas::write_bytes` before a
-single `present_at`.
+Canvas text defaults to `TextFont::Cozette6x13`; callers that require the
+legacy TTY-style or original compact glyphs can use
+`draw_text_with_font(..., TextFont::Tty8x16)` or
+`draw_text_with_font(..., TextFont::Compact8x8)`. Software renderers can upload
+packed frames with `Canvas::write_bytes` before a single `present_at`.
 
 `libcanvas::system::monotonic_ticks()` returns the kernel's 100 Hz monotonic
 clock. It is suitable for deadlines and animation pacing; do not calibrate
@@ -207,7 +208,9 @@ You never get direct access to video memory. Instead:
 2. Draw into it with `set_pixel`/`fill_rect`/`draw_text` (all pure
    userspace-side operations against your own VMO — no syscall per pixel).
 3. Call `canvas.present()` to ask the kernel to blit your VMO's contents
-   onto the real screen in one syscall.
+   onto the real screen in one syscall. Dirty renderers can instead use
+   `upload_shadow_region` plus `present_region` to update only changed
+   rectangles; full-width stripes upload through contiguous bounded VMO chunks.
 
 ```rust
 use libcanvas::framebuffer::Canvas;

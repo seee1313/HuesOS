@@ -34,7 +34,8 @@ fn execute_command(command: CommandAst, screen: &mut Screen, filesystem: Option<
             screen.write_line("  cat <path>  print BOOTFS file");
             screen.write_line("  stat <path> show BOOTFS file metadata");
             screen.write_line("  shutdown    safely halt HuesOS (no ACPI)");
-            screen.write_line("  font tty    use default TTY-style 8x16 font");
+            screen.write_line("  font cozette use default Cozette 6x13 font");
+            screen.write_line("  font tty     use TTY-style 8x16 font");
             screen.write_line("  font compact use original HuesOS 8x8 font");
         }
         "clear" | "cls" => screen.clear(),
@@ -100,6 +101,10 @@ fn execute_command(command: CommandAst, screen: &mut Screen, filesystem: Option<
                 screen.write_line(name);
             } else {
                 match command.args[0] {
+                    "cozette" => {
+                        screen.use_cozette_font();
+                        screen.write_line("font: Cozette 6x13");
+                    }
                     "tty" => {
                         screen.use_tty_font();
                         screen.write_line("font: TTY-style 8x16");
@@ -108,7 +113,7 @@ fn execute_command(command: CommandAst, screen: &mut Screen, filesystem: Option<
                         screen.use_compact_font();
                         screen.write_line("font: original HuesOS 8x8");
                     }
-                    _ => screen.write_line("usage: font tty|compact"),
+                    _ => screen.write_line("usage: font cozette|tty|compact"),
                 }
             }
         }

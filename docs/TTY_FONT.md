@@ -1,19 +1,20 @@
 # Terminal Fonts
 
-HuesOS Terminal starts with a custom TTY-style 8×16 bitmap font. It derives
-from the project's existing permitted glyph data by expanding each 8-pixel row
-to two scanlines, giving classic VGA/Linux-console proportions without copying
-the GPL font tables from the Linux kernel.
+HuesOS Terminal starts with the Cozette 6×13 bitmap font (MIT), giving a
+1024×768 boot display roughly 54 rows × 168 columns without using Linux kernel
+font tables.
 
-The original HuesOS 8×8 font remains available:
+The legacy HuesOS fonts remain available at runtime:
 
 ```text
-font tty       # default 8×16
-font compact   # original 8×8
+font cozette   # default Cozette 6×13
+font tty       # TTY-style 8×16, derived from permitted project glyph data
+font compact   # original HuesOS 8×8
 font           # show active mode
 ```
 
-The terminal uses a 16-pixel line pitch in both modes, so changing fonts does
-not invalidate scrollback/cursor geometry. Other Canvas users receive the TTY
-font from `draw_text` by default and may explicitly request
-`TextFont::Compact8x8` through `draw_text_with_font`.
+The terminal grid is sized for Cozette with a 14-pixel line pitch. Font changes
+mark the full terminal dirty and repaint through the same buffered renderer;
+ordinary typing after that goes back to dirty-row uploads. Other Canvas users
+receive Cozette from `draw_text` by default and may explicitly request
+`TextFont::Tty8x16` or `TextFont::Compact8x8` through `draw_text_with_font`.

@@ -170,11 +170,11 @@ the buddy provider. See [ALLOCATOR_HARDENING.md](ALLOCATOR_HARDENING.md).
 
 ### P1 — graphics and terminal
 
-- Keep the buffered Terminal renderer and add dirty-row upload.
+- Buffered Terminal renderer now uses dirty-row upload for line editing.
 - Remove full-frame temporary allocation from kernel framebuffer blit.
 - Copy VMO-to-framebuffer in bounded chunks or directly by physical page.
 - Add frame/upload/present counters and Full HD/1440p tests.
-- Apply incremental/dirty-cell rendering to Snake in its own focused change.
+- Snake uses incremental dirty-cell rendering; keep expanding coverage.
 
 ### P1 — scheduler and SMP
 

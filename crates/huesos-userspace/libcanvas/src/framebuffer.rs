@@ -267,8 +267,9 @@ impl Canvas {
     }
 
     /// Upload a dirty shadow-buffer rectangle into the matching VMO region.
-    /// Rows are transferred independently because the source shadow and VMO
-    /// retain the full-canvas stride outside the rectangle.
+    /// Full-width stripes are transferred in one contiguous VMO write; narrower
+    /// rectangles still copy row-by-row because the source shadow and VMO retain
+    /// the full-canvas stride outside the rectangle.
     pub fn upload_shadow_region(
         &self,
         shadow: &[u8],
@@ -289,9 +290,25 @@ impl Canvas {
         {
             return Err(crate::ErrorCode::InvalidArgs);
         }
+        let pitch = self.info.pitch as usize;
         let row_bytes = width as usize * 4;
+        if x == 0 && width == self.info.width {
+            const CHUNK: usize = 1024 * 1024;
+            let start = y as usize * pitch;
+            let end = start + height as usize * pitch;
+            let mut offset = start;
+            while offset < end {
+                let chunk_end = (offset + CHUNK).min(end);
+                if self.vmo.write(offset as u64, &shadow[offset..chunk_end])? != chunk_end - offset
+                {
+                    return Err(crate::ErrorCode::InvalidArgs);
+                }
+                offset = chunk_end;
+            }
+            return Ok(());
+        }
         for output_y in y..y_end {
-            let offset = output_y as usize * self.info.pitch as usize + x as usize * 4;
+            let offset = output_y as usize * pitch + x as usize * 4;
             let end = offset + row_bytes;
             if self.vmo.write(offset as u64, &shadow[offset..end])? != row_bytes {
                 return Err(crate::ErrorCode::InvalidArgs);

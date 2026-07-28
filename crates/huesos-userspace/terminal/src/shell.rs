@@ -52,7 +52,7 @@ impl Shell {
         screen.clear();
         screen.write_line("HuesOS Terminal");
         screen.write_line("Type 'help' to list available commands.");
-        screen.write_line("TTY 8x16 font active; use 'font compact' for the original font.");
+        screen.write_line("Cozette 6x13 font active; use 'font tty' or 'font compact'.");
         screen.write_line("");
 
         let mut shell = Self {
@@ -72,23 +72,27 @@ impl Shell {
     pub fn run(&mut self) -> ! {
         let mut buf = [0u8; 16];
         loop {
-            match self.keyboard.read_into(&mut buf) {
-                Ok(n) => {
-                    if let Some(key) = decode_keyboard_event(&buf[..n]) {
-                        self.handle_key(key);
-                    }
-                }
+            match self.keyboard.read_into_blocking(&mut buf) {
+                Ok(n) => self.handle_keyboard_message(&buf[..n]),
                 Err(ErrorCode::ShouldWait) | Err(ErrorCode::TimedOut) => {
                     libcanvas::process::yield_now();
                 }
-                Err(e) => {
-                    self.screen.write_str("terminal: keyboard service error: ");
-                    self.screen.write_line(e.as_str());
-                    self.screen.render();
-                    libcanvas::process::yield_now();
-                }
+                Err(e) => self.report_keyboard_error(e),
             }
         }
+    }
+
+    fn handle_keyboard_message(&mut self, msg: &[u8]) {
+        if let Some(key) = decode_keyboard_event(msg) {
+            self.handle_key(key);
+        }
+    }
+
+    fn report_keyboard_error(&mut self, error: ErrorCode) {
+        self.screen.write_str("terminal: keyboard service error: ");
+        self.screen.write_line(error.as_str());
+        self.screen.render();
+        libcanvas::process::yield_now();
     }
 
     fn handle_key(&mut self, key: Key) {
