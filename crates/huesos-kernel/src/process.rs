@@ -179,10 +179,8 @@ pub fn map_vmo_into_vmar(
         .and_then(|runtime| runtime.downcast_mut::<ProcessRuntime>())
         .ok_or(ErrorCode::BadHandle)?;
 
-    // Root-VMAR-only MVP: child VMAR allocation exists in the object shape,
-    // but the syscall API to create child VMARs is intentionally deferred.
-    if runtime.root_vmar.koid() != vmar.koid() {
-        return Err(ErrorCode::NotSupported);
+    if runtime.root_vmar.process() != vmar.process() {
+        return Err(ErrorCode::AccessDenied);
     }
 
     let page_flags = page_flags_from_vmar_flags(args.flags)?;
@@ -352,7 +350,111 @@ fn validate_vmar_op_args(
     if !vmar.contains_range(args.addr, args.len) {
         return Err(ErrorCode::InvalidArgs);
     }
-    vmar.mapping(args.addr, args.len).ok_or(ErrorCode::NotFound)
+    vmar.mapping_covering(args.addr, args.len)
+        .ok_or(ErrorCode::NotFound)
+}
+
+fn split_mapping_for_unmap(mapping: VmarMapping, addr: u64, len: u64) -> [Option<VmarMapping>; 2] {
+    let unmap_end = addr + len;
+    let mapping_end = mapping.base + mapping.size;
+    let mut out = [None, None];
+    if addr > mapping.base {
+        out[0] = Some(VmarMapping {
+            base: mapping.base,
+            size: addr - mapping.base,
+            vmo: mapping.vmo,
+            vmo_offset: mapping.vmo_offset,
+            flags: mapping.flags,
+        });
+    }
+    if unmap_end < mapping_end {
+        out[1] = Some(VmarMapping {
+            base: unmap_end,
+            size: mapping_end - unmap_end,
+            vmo: mapping.vmo,
+            vmo_offset: mapping.vmo_offset + (unmap_end - mapping.base),
+            flags: mapping.flags,
+        });
+    }
+    out
+}
+
+fn split_mapping_for_protect(
+    mapping: VmarMapping,
+    addr: u64,
+    len: u64,
+    flags: u32,
+) -> [Option<VmarMapping>; 3] {
+    let protect_end = addr + len;
+    let mapping_end = mapping.base + mapping.size;
+    let mut out = [None, None, None];
+    if addr > mapping.base {
+        out[0] = Some(VmarMapping {
+            base: mapping.base,
+            size: addr - mapping.base,
+            vmo: mapping.vmo,
+            vmo_offset: mapping.vmo_offset,
+            flags: mapping.flags,
+        });
+    }
+    out[1] = Some(VmarMapping {
+        base: addr,
+        size: len,
+        vmo: mapping.vmo,
+        vmo_offset: mapping.vmo_offset + (addr - mapping.base),
+        flags,
+    });
+    if protect_end < mapping_end {
+        out[2] = Some(VmarMapping {
+            base: protect_end,
+            size: mapping_end - protect_end,
+            vmo: mapping.vmo,
+            vmo_offset: mapping.vmo_offset + (protect_end - mapping.base),
+            flags: mapping.flags,
+        });
+    }
+    out
+}
+
+fn compact_replacements<const N: usize>(
+    items: [Option<VmarMapping>; N],
+) -> ([VmarMapping; 3], usize) {
+    let empty = VmarMapping {
+        base: 0,
+        size: 0,
+        vmo: huesos_object::Koid::INVALID,
+        vmo_offset: 0,
+        flags: 0,
+    };
+    let mut out = [empty; 3];
+    let mut count = 0usize;
+    for item in items.into_iter().flatten() {
+        out[count] = item;
+        count += 1;
+    }
+    (out, count)
+}
+
+fn adjust_mapping_refcount(
+    vmo: huesos_object::Koid,
+    replacement_count: usize,
+) -> Result<usize, ErrorCode> {
+    let extra = replacement_count.saturating_sub(1);
+    for acquired in 0..extra {
+        if huesos_object::acquire_kernel_ref(vmo).is_none() {
+            for _ in 0..acquired {
+                huesos_object::note_kernel_ref_close(vmo);
+            }
+            return Err(ErrorCode::BadHandle);
+        }
+    }
+    Ok(extra)
+}
+
+fn release_extra_mapping_refs(vmo: huesos_object::Koid, extra: usize) {
+    for _ in 0..extra {
+        huesos_object::note_kernel_ref_close(vmo);
+    }
 }
 
 fn remap_mapping_pages(
@@ -400,33 +502,51 @@ pub fn unmap_vmar_mapping(vmar: &Vmar, args: VmarOpArgs) -> Result<u64, ErrorCod
         .as_mut()
         .and_then(|value| value.downcast_mut::<ProcessRuntime>())
         .ok_or(ErrorCode::BadHandle)?;
-    let page_count = (mapping.size / PAGE_SIZE) as usize;
+    let page_count = (args.len / PAGE_SIZE) as usize;
+    let sub_mapping = VmarMapping {
+        base: args.addr,
+        size: args.len,
+        vmo: mapping.vmo,
+        vmo_offset: mapping.vmo_offset + (args.addr - mapping.base),
+        flags: mapping.flags,
+    };
+    let replacements_raw = split_mapping_for_unmap(mapping, args.addr, args.len);
+    let (replacements, replacement_count) = compact_replacements(replacements_raw);
+    let extra_refs = adjust_mapping_refcount(mapping.vmo, replacement_count)?;
+
     let mut unmapped = 0usize;
     for index in 0..page_count {
         let page = Page::<Size4KiB>::containing_address(VirtAddr::new(
-            mapping.base + index as u64 * PAGE_SIZE,
+            args.addr + index as u64 * PAGE_SIZE,
         ));
         let unmap_result = runtime
             .address_space_mut()
             .ok_or(ErrorCode::BadHandle)?
             .unmap_user_page(page);
         if unmap_result.is_err() {
-            let _ = remap_mapping_pages(runtime, vmo, mapping, unmapped);
+            let _ = remap_mapping_pages(runtime, vmo, sub_mapping, unmapped);
+            release_extra_mapping_refs(mapping.vmo, extra_refs);
             return Err(ErrorCode::Internal);
         }
         unmapped += 1;
     }
-    if !vmar.remove_mapping(mapping) {
-        let _ = remap_mapping_pages(runtime, vmo, mapping, unmapped);
+    if vmar
+        .replace_mapping(mapping, &replacements[..replacement_count])
+        .is_err()
+    {
+        let _ = remap_mapping_pages(runtime, vmo, sub_mapping, unmapped);
+        release_extra_mapping_refs(mapping.vmo, extra_refs);
         return Err(ErrorCode::Internal);
     }
-    huesos_object::note_kernel_ref_close(mapping.vmo);
+    if replacement_count == 0 {
+        huesos_object::note_kernel_ref_close(mapping.vmo);
+    }
     huesos_arch::paging::shootdown_range(
-        mapping.base,
-        mapping.base + mapping.size,
+        args.addr,
+        args.addr + args.len,
         crate::scheduler::online_remote_cpu_count(),
     );
-    Ok(mapping.base)
+    Ok(args.addr)
 }
 
 /// Change permissions on one exact VMAR mapping under the address-space/copy
@@ -444,11 +564,15 @@ pub fn protect_vmar_mapping(vmar: &Vmar, args: VmarOpArgs) -> Result<u64, ErrorC
         .as_mut()
         .and_then(|value| value.downcast_mut::<ProcessRuntime>())
         .ok_or(ErrorCode::BadHandle)?;
-    let page_count = (mapping.size / PAGE_SIZE) as usize;
+    let page_count = (args.len / PAGE_SIZE) as usize;
+    let replacements_raw = split_mapping_for_protect(mapping, args.addr, args.len, args.flags);
+    let (replacements, replacement_count) = compact_replacements(replacements_raw);
+    let extra_refs = adjust_mapping_refcount(mapping.vmo, replacement_count)?;
+
     let mut changed = 0usize;
     for index in 0..page_count {
         let page = Page::<Size4KiB>::containing_address(VirtAddr::new(
-            mapping.base + index as u64 * PAGE_SIZE,
+            args.addr + index as u64 * PAGE_SIZE,
         ));
         let protect_result = runtime
             .address_space_mut()
@@ -457,33 +581,38 @@ pub fn protect_vmar_mapping(vmar: &Vmar, args: VmarOpArgs) -> Result<u64, ErrorC
         if protect_result.is_err() {
             for rollback in 0..changed {
                 let rollback_page = Page::<Size4KiB>::containing_address(VirtAddr::new(
-                    mapping.base + rollback as u64 * PAGE_SIZE,
+                    args.addr + rollback as u64 * PAGE_SIZE,
                 ));
                 if let Some(address_space) = runtime.address_space_mut() {
                     let _ = address_space.protect_user_page(rollback_page, old_flags);
                 }
             }
+            release_extra_mapping_refs(mapping.vmo, extra_refs);
             return Err(ErrorCode::Internal);
         }
         changed += 1;
     }
-    if !vmar.update_mapping_flags(mapping, args.flags) {
+    if vmar
+        .replace_mapping(mapping, &replacements[..replacement_count])
+        .is_err()
+    {
         for rollback in 0..changed {
             let rollback_page = Page::<Size4KiB>::containing_address(VirtAddr::new(
-                mapping.base + rollback as u64 * PAGE_SIZE,
+                args.addr + rollback as u64 * PAGE_SIZE,
             ));
             if let Some(address_space) = runtime.address_space_mut() {
                 let _ = address_space.protect_user_page(rollback_page, old_flags);
             }
         }
+        release_extra_mapping_refs(mapping.vmo, extra_refs);
         return Err(ErrorCode::Internal);
     }
     huesos_arch::paging::shootdown_range(
-        mapping.base,
-        mapping.base + mapping.size,
+        args.addr,
+        args.addr + args.len,
         crate::scheduler::online_remote_cpu_count(),
     );
-    Ok(mapping.base)
+    Ok(args.addr)
 }
 
 /// Start a suspended userspace thread.

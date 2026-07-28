@@ -1,6 +1,8 @@
 //! Process/thread/VMAR launch syscalls plus yield/exit.
 
-use huesos_abi::{ErrorCode, HandleValue, VmarMapArgs, VmarOpArgs, BOOTSTRAP_HANDLE};
+use huesos_abi::{
+    ErrorCode, HandleValue, VmarCreateChildArgs, VmarMapArgs, VmarOpArgs, BOOTSTRAP_HANDLE,
+};
 use huesos_object::{Handle, KernelObject, KernelObjectExt, Rights};
 
 use crate::{
@@ -268,6 +270,63 @@ pub(crate) fn sys_thread_start(
     process_start_guard.commit();
     start_guard.commit();
     Ok(task_id as i64)
+}
+
+const VMAR_PAGE_SIZE: u64 = 4096;
+
+pub(crate) fn sys_vmar_create_child(args_ptr: *const VmarCreateChildArgs) -> SyscallResult {
+    let args = user_memory::read_value(args_ptr)?;
+    if args.flags != 0
+        || args.len == 0
+        || !args.addr.is_multiple_of(VMAR_PAGE_SIZE)
+        || !args.len.is_multiple_of(VMAR_PAGE_SIZE)
+    {
+        return Err(ErrorCode::InvalidArgs);
+    }
+    user_memory::validate_write(args.out_child)?;
+
+    let proc = current_proc()?;
+    let parent_handle = proc.handles.get(args.parent).ok_or(ErrorCode::BadHandle)?;
+    if !parent_handle.has_rights(Rights::WRITE) {
+        return Err(ErrorCode::AccessDenied);
+    }
+    let parent_obj =
+        huesos_object::lookup_object(parent_handle.koid).ok_or(ErrorCode::BadHandle)?;
+    let parent = parent_obj
+        .downcast_ref::<huesos_object::Vmar>()
+        .ok_or(ErrorCode::WrongType)?;
+    if parent.process() != proc.koid() {
+        return Err(ErrorCode::AccessDenied);
+    }
+
+    let _parent_ref =
+        huesos_object::acquire_kernel_ref(parent.koid()).ok_or(ErrorCode::BadHandle)?;
+    let child = huesos_object::Vmar::new_child(parent, args.addr, args.len);
+    let child_record = huesos_object::VmarChild {
+        koid: child.koid(),
+        base: args.addr,
+        size: args.len,
+    };
+    parent
+        .record_child(child_record)
+        .map_err(|error| match error {
+            huesos_object::VmarError::InvalidRange => ErrorCode::InvalidArgs,
+            huesos_object::VmarError::Overlap => ErrorCode::Busy,
+        })?;
+
+    let child_koid = child.koid();
+    huesos_object::register_object(child);
+    match proc
+        .handles
+        .add_with_commit(Handle::new(child_koid, parent_handle.rights), |handle| {
+            user_memory::write_value(args.out_child, &handle)
+        }) {
+        Ok((handle, _)) => Ok(handle as i64),
+        Err(error) => {
+            huesos_object::unregister_object(child_koid);
+            Err(error)
+        }
+    }
 }
 
 pub(crate) fn sys_vmar_map(args_ptr: *const VmarMapArgs) -> SyscallResult {

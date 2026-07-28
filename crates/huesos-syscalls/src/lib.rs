@@ -40,7 +40,8 @@ mod waitset;
 
 use huesos_abi::{
     ChannelConsumeArgs, ChannelPeekArgs, ChannelReadEtcArgs, ErrorCode, FramebufferBlitArgs,
-    FramebufferInfo, HandleValue, PortPacket, VmarMapArgs, VmarOpArgs, WaitSetWaitArgs,
+    FramebufferInfo, HandleValue, PortPacket, VmarCreateChildArgs, VmarMapArgs, VmarOpArgs,
+    WaitSetWaitArgs,
 };
 
 pub use callbacks::{
@@ -154,5 +155,6 @@ pub fn dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> Syscal
         S::ProcessGetAffinity => {
             process::sys_process_get_affinity(a1 as HandleValue, a2 as *mut u64, a3 as *mut u64)
         }
+        S::VmarCreateChild => process::sys_vmar_create_child(a1 as *const VmarCreateChildArgs),
     }
 }

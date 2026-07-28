@@ -177,6 +177,13 @@ that maps a VMO directly into your address space (that's on the kernel's
 roadmap). You interact with a VMO's contents by reading/writing byte
 ranges through syscalls, the same way you'd `pread`/`pwrite` a file.
 
+Process launch code receives a root VMAR from `Process::create`. `Vmar::map`
+installs fixed page-aligned VMO mappings inside that VMAR, and
+`Vmar::create_child` can reserve nested VMAR ranges for loaders that want
+separate address-space regions. `Vmar::unmap` / `Vmar::protect` accept covered
+subranges and split mapping metadata transactionally; old exact-range callers
+remain valid.
+
 ### IPC (Channels)
 
 ```rust

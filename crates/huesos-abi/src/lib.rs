@@ -121,9 +121,12 @@ pub enum Syscall {
     /// the capability-safe successor to [`Syscall::VmoCreate`] for executable
     /// ELF segments.
     VmoCreateEx = 28,
-    /// Remove one exact mapping from a VMAR. `a1` points to [`VmarOpArgs`].
+    /// Remove a page-aligned mapping range from a VMAR. Subranges split the
+    /// original mapping metadata transactionally. `a1` points to
+    /// [`VmarOpArgs`].
     VmarUnmap = 29,
-    /// Change permissions on one exact VMAR mapping. `a1` points to
+    /// Change permissions on a page-aligned VMAR mapping range. Subranges split
+    /// the original mapping metadata transactionally. `a1` points to
     /// [`VmarOpArgs`].
     VmarProtect = 30,
     /// Peek at the next channel message without dequeueing it. `a1` points
@@ -181,13 +184,16 @@ pub enum Syscall {
     /// Query process affinity. `a1` process handle, `a2=*mut u64 mask`,
     /// `a3=*mut u64 home_cpu`.
     ProcessGetAffinity = 43,
+    /// Reserve a child VMAR inside an existing VMAR. `a1` points to
+    /// [`VmarCreateChildArgs`].
+    VmarCreateChild = 44,
 }
 
 impl Syscall {
     /// Total number of defined syscalls (i.e. one past the highest
     /// currently-assigned number). The dispatcher uses this to reject
     /// obviously-out-of-range numbers before a `match`.
-    pub const COUNT: u64 = 44;
+    pub const COUNT: u64 = 45;
 
     /// Convert a raw syscall number back into a [`Syscall`], if valid.
     pub const fn from_raw(n: u64) -> Option<Self> {
@@ -236,6 +242,7 @@ impl Syscall {
             41 => Self::SystemCurrentCpu,
             42 => Self::ProcessSetAffinityMask,
             43 => Self::ProcessGetAffinity,
+            44 => Self::VmarCreateChild,
             _ => return None,
         })
     }
@@ -712,6 +719,22 @@ pub struct PortPacket {
     pub data: [u64; 4],
 }
 
+/// Arguments for [`Syscall::VmarCreateChild`].
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct VmarCreateChildArgs {
+    /// Parent VMAR handle.
+    pub parent: HandleValue,
+    /// Child VMAR base address. Must be page-aligned and inside `parent`.
+    pub addr: u64,
+    /// Child VMAR size in bytes. Must be non-zero and page-aligned.
+    pub len: u64,
+    /// Reserved for future placement/policy flags. Must be zero.
+    pub flags: u32,
+    /// Output handle for the new child VMAR.
+    pub out_child: *mut HandleValue,
+}
+
 /// Arguments for [`Syscall::VmarMap`], passed by pointer because mapping a
 /// VMO needs more than the syscall ABI's five register-sized arguments.
 #[repr(C)]
@@ -735,8 +758,10 @@ pub struct VmarMapArgs {
 
 /// Arguments for [`Syscall::VmarUnmap`] and [`Syscall::VmarProtect`].
 ///
-/// The MVP requires an exact page-aligned mapping range. `flags` is zero for
-/// unmap and contains [`vmar_flags`] permissions for protect.
+/// The range must be page-aligned and covered by one mapping in the target
+/// VMAR. Subranges split the mapping into the remaining left/right pieces
+/// (and a protected middle piece for `VmarProtect`). `flags` is zero for unmap
+/// and contains [`vmar_flags`] permissions for protect.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct VmarOpArgs {
@@ -792,7 +817,8 @@ mod tests {
         assert_eq!(Syscall::SystemCurrentCpu as u64, 41);
         assert_eq!(Syscall::ProcessSetAffinityMask as u64, 42);
         assert_eq!(Syscall::ProcessGetAffinity as u64, 43);
-        assert_eq!(Syscall::COUNT, 44);
+        assert_eq!(Syscall::VmarCreateChild as u64, 44);
+        assert_eq!(Syscall::COUNT, 45);
         assert_eq!(Syscall::from_raw(28), Some(Syscall::VmoCreateEx));
         assert_eq!(Syscall::from_raw(30), Some(Syscall::VmarProtect));
         assert_eq!(Syscall::from_raw(31), Some(Syscall::ChannelPeek));
@@ -808,7 +834,8 @@ mod tests {
         assert_eq!(Syscall::from_raw(41), Some(Syscall::SystemCurrentCpu));
         assert_eq!(Syscall::from_raw(42), Some(Syscall::ProcessSetAffinityMask));
         assert_eq!(Syscall::from_raw(43), Some(Syscall::ProcessGetAffinity));
-        assert_eq!(Syscall::from_raw(44), None);
+        assert_eq!(Syscall::from_raw(44), Some(Syscall::VmarCreateChild));
+        assert_eq!(Syscall::from_raw(45), None);
     }
 
     #[test]

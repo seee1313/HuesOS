@@ -204,6 +204,57 @@ mod tests {
     }
 
     #[test]
+    fn vmar_children_reserve_parent_ranges_and_mappings_can_split() {
+        let parent = Vmar::new_root(Koid(1), 0x10000, 0x10000);
+        let child = Vmar::new_child(&parent, 0x14000, 0x2000);
+        let reservation = VmarChild {
+            koid: child.koid(),
+            base: child.base(),
+            size: child.size(),
+        };
+        assert!(parent.record_child(reservation).is_ok());
+        assert!(parent
+            .record_mapping(VmarMapping {
+                base: 0x14000,
+                size: 0x1000,
+                vmo: Koid(2),
+                vmo_offset: 0,
+                flags: 0,
+            })
+            .is_err());
+
+        let mapping = VmarMapping {
+            base: 0x11000,
+            size: 0x3000,
+            vmo: Koid(3),
+            vmo_offset: 0,
+            flags: 1,
+        };
+        assert!(parent.record_mapping(mapping).is_ok());
+        assert_eq!(parent.mapping_covering(0x12000, 0x1000), Some(mapping));
+        let replacements = [
+            VmarMapping {
+                base: 0x11000,
+                size: 0x1000,
+                vmo: Koid(3),
+                vmo_offset: 0,
+                flags: 1,
+            },
+            VmarMapping {
+                base: 0x13000,
+                size: 0x1000,
+                vmo: Koid(3),
+                vmo_offset: 0x2000,
+                flags: 1,
+            },
+        ];
+        assert!(parent.replace_mapping(mapping, &replacements).is_ok());
+        assert!(parent.mapping(0x12000, 0x1000).is_none());
+        assert!(parent.mapping(0x11000, 0x1000).is_some());
+        assert!(parent.remove_child(child.koid()));
+    }
+
+    #[test]
     fn interrupt_signal_queues_port_packet() {
         let port = match Port::new() {
             Ok(port) => port,

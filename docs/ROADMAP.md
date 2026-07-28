@@ -309,10 +309,15 @@ priority order.
   `rep movsb` user-access primitive. Small syscall records and
   handle/wait result arrays now share the same post-validation fault
   recovery as bulk VMO/Channel byte copies.
-- **Needed (on-target)**: (a) complete SMEP/SMAP copy-window hardening
-  and support mapping splits / child VMARs; (b) once intra-process
-  threading lands in userspace, add a real cross-CPU race probe
-  alongside the synthetic one.
+- **Child VMAR hierarchy + split ops landed**: `VmarCreateChild` reserves
+  nested VMAR ranges append-only in the ABI; mappings may be installed into
+  child VMARs; partial `VmarUnmap` / `VmarProtect` split mapping metadata
+  transactionally while preserving VMO lifetime refs. Existing exact-range
+  callers keep working unchanged.
+- **Immediate status**: complete for the current userspace threading model.
+  A real cross-CPU unmap-vs-copy race probe remains gated on future
+  intra-process threading; the current CI probe is the kernel-side synthetic
+  extable fault-recovery proof.
 
 ### 2. IOAPIC interrupt routing
 - **Current**: LAPIC timer on all CPUs; keyboard IRQ1 is routed through an

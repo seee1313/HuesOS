@@ -4,7 +4,10 @@ use crate::channel::Channel;
 use crate::handle::Handle;
 use crate::raw;
 use crate::vmo::Vmo;
-use huesos_abi::{HandleValue, Syscall, VmarMapArgs, VmarOpArgs, BOOTSTRAP_HANDLE, INVALID_HANDLE};
+use huesos_abi::{
+    HandleValue, Syscall, VmarCreateChildArgs, VmarMapArgs, VmarOpArgs, BOOTSTRAP_HANDLE,
+    INVALID_HANDLE,
+};
 
 /// Initial bootstrap channel handle number installed in a newly-started
 /// child process by `Thread::start`.
@@ -163,6 +166,21 @@ impl Thread {
 }
 
 impl Vmar {
+    /// Reserve a child VMAR range inside this VMAR.
+    pub fn create_child(&self, addr: u64, len: u64) -> crate::Result<Vmar> {
+        let mut child: HandleValue = INVALID_HANDLE;
+        let args = VmarCreateChildArgs {
+            parent: self.0.raw(),
+            addr,
+            len,
+            flags: 0,
+            out_child: &mut child as *mut HandleValue,
+        };
+        let ret = raw::syscall1(Syscall::VmarCreateChild, &args as *const _ as u64);
+        raw::decode(ret)?;
+        Ok(Vmar(unsafe { Handle::from_raw(child) }))
+    }
+
     /// Map `vmo` into this VMAR.
     ///
     /// `flags` is a bitmask from [`huesos_abi::vmar_flags`].
@@ -186,7 +204,8 @@ impl Vmar {
         raw::decode(ret).map(|mapped| mapped as u64)
     }
 
-    /// Remove one exact page-aligned mapping from this VMAR.
+    /// Remove a page-aligned mapping range from this VMAR. Subranges split the
+    /// original mapping metadata.
     pub fn unmap(&self, addr: u64, len: u64) -> crate::Result<u64> {
         let args = VmarOpArgs {
             vmar: self.0.raw(),
@@ -198,7 +217,8 @@ impl Vmar {
         raw::decode(ret).map(|mapped| mapped as u64)
     }
 
-    /// Change permissions on one exact page-aligned mapping.
+    /// Change permissions on a page-aligned mapping range. Subranges split the
+    /// original mapping metadata.
     pub fn protect(&self, addr: u64, len: u64, flags: u32) -> crate::Result<u64> {
         let args = VmarOpArgs {
             vmar: self.0.raw(),
