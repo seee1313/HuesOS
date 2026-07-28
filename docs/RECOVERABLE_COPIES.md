@@ -1,7 +1,10 @@
 # Recoverable Copies: Exception / Fixup Table (`huesos-extable`)
 
-Status: **policy + host tests landed; privileged fault-handler integration and
-on-target behavior not yet implemented or verified.**
+Status: **policy core, privileged fault-handler hook, recoverable user-copy
+primitives, bulk/typed `user_memory` wire-up, and synthetic QEMU smoke coverage
+landed.** Remaining work is SMEP/SMAP copy-window hardening, mapping
+splits/child VMAR support, and a real cross-CPU race probe once intra-process
+threading exists.
 
 This document describes the host-testable crate `huesos-extable` and how it is
 intended to plug into the kernel. It supports
@@ -64,37 +67,35 @@ repair overlaps or duplicates; `new_sorted` still rejects them.
 The decision the privileged handler makes: `Recover { fixup_rip }` when the
 faulting RIP is covered, else `Fatal` (the kernel panic path).
 
-## Intended kernel integration (NOT yet implemented here)
+## Kernel integration status
 
-This crate changes no privileged behavior. The planned integration in
-`huesos-arch`:
+The kernel integration is now live for validated user-copy sites:
 
-1. The linker emits a sorted `.extable`-style section of `(fault_rip, fixup_rip)`
-   entries around each recoverable copy site; each copy site's faulting
-   instruction(s) map to a fixup that returns an error code.
-2. Wrap that section in an `Extable` (validated once at boot).
-3. In the kernel-mode `#PF`/`#GP` handler, when a fault occurs in the copy
-   window, call `resolve_kernel_fault(fault_rip, &EXTABLE)`; on `Recover`, set
-   the saved `RIP` to `fixup_rip` and return from the exception (the copy
-   returns an error); on `Fatal`, take the existing SMP kernel panic path.
-4. Add the address-space locking / copy-window guard that prevents a VMAR
-   `unmap`/`protect` from racing an in-flight copy, *before* exposing those
-   operations; then enable SMEP/SMAP with explicit copy access windows.
+1. Recoverable copy helpers emit `.ex_table` entries around the exact
+   `rep movsb` instruction that may fault.
+2. Boot-time extable installation reads the linker-emitted section, validates
+   and sorts it, and publishes a kernel-lifetime snapshot.
+3. The ring-0 `#PF` path consults the extable and redirects recoverable faults
+   to the emitted fixup address; non-covered faults still take the fatal panic
+   path.
+4. `huesos-syscalls::user_memory::{copy_from_user, copy_to_user,
+   read_value, read_array, write_value, write_array}` route through those
+   recoverable primitives after bounds and page-table validation.
+
+Still pending: complete the SMEP/SMAP copy-window hardening and mapping
+split/child-VMAR support before exposing broader concurrent mapping mutation.
 
 ## What still requires on-target verification
 
-The following are **not** verified by this change and must be confirmed in QEMU
-(`-smp 1`/`-smp 2`) and on hardware before the integration is done:
+The following still require QEMU (`-smp 1`/`-smp 2`) and hardware coverage:
 
-- The linker-section emission and the fault handler reading this table.
-- An actual recoverable copy: a fault during a user-copy is redirected to the
-  fixup and returns an error without panicking (and without killing unrelated
-  services).
-- The copy-window / address-space locking that makes VMAR `unmap`/`protect`
-  race-free, and SMEP/SMAP enablement.
-
-These need the full toolchain (pinned nightly + `build-std`, QEMU/OVMF) and were
-not runnable where this crate was authored.
+- A real userspace race between validated copy and concurrent mapping mutation;
+  the current CI probe is synthetic because userspace does not yet expose
+  intra-process threading.
+- The copy-window / address-space locking that makes broader VMAR
+  `unmap`/`protect` race-free, including mapping splits and child VMARs.
+- Hardware SMEP/SMAP coverage across CPUs and supported/unsupported feature
+  combinations.
 
 ## Tests (host)
 

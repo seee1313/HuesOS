@@ -7,7 +7,10 @@
 //! that turns a userspace address into a Rust pointer.
 
 use alloc::vec::Vec;
-use core::{mem, ptr};
+use core::{
+    mem::{self, MaybeUninit},
+    slice,
+};
 use huesos_abi::{ErrorCode, USER_ASPACE_BASE, USER_ASPACE_END};
 use huesos_arch::VirtAddr;
 
@@ -65,10 +68,73 @@ pub(crate) fn validate_write<T>(out: *mut T) -> Result<(), ErrorCode> {
 
 /// Validate an output array before a syscall consumes a queued object.
 pub(crate) fn validate_write_array<T>(out: *mut T, count: usize) -> Result<(), ErrorCode> {
-    let len = mem::size_of::<T>()
-        .checked_mul(count)
-        .ok_or(ErrorCode::InvalidArgs)?;
+    let len = checked_array_byte_len::<T>(count)?;
     validate_range(out as u64, len, true)
+}
+
+fn checked_value_byte_len<T>() -> Result<usize, ErrorCode> {
+    let len = mem::size_of::<T>();
+    if len == 0 {
+        return Err(ErrorCode::InvalidArgs);
+    }
+    Ok(len)
+}
+
+fn checked_array_byte_len<T>(count: usize) -> Result<usize, ErrorCode> {
+    let elem = mem::size_of::<T>();
+    if count != 0 && elem == 0 {
+        return Err(ErrorCode::InvalidArgs);
+    }
+    elem.checked_mul(count).ok_or(ErrorCode::InvalidArgs)
+}
+
+fn recoverable_read_at<T: Copy>(src: *const T) -> Result<T, ErrorCode> {
+    let byte_len = checked_value_byte_len::<T>()?;
+    validate_range(src as u64, byte_len, false)?;
+    let mut value = MaybeUninit::<T>::uninit();
+    let _access = huesos_arch::cpu::UserAccessGuard::new();
+    // SAFETY: byte_len bytes at src were verified readable in the active
+    // user page tables. value owns an uninitialized kernel destination of the
+    // same size, and the process user_memory_lock is held by the caller. The
+    // recoverable copy converts a post-validation unmap/protect race into
+    // InvalidArgs instead of a ring-0 panic. assume_init is sound after a
+    // successful full-byte copy; T is restricted by this module's ABI contract
+    // to Copy records with all bit patterns valid.
+    unsafe {
+        user_access::recoverable_copy_from_user(
+            value.as_mut_ptr().cast::<u8>(),
+            src.cast::<u8>(),
+            byte_len,
+        )?;
+        Ok(value.assume_init())
+    }
+}
+
+fn recoverable_read_array_at<T: Copy>(src: *const T, count: usize) -> Result<Vec<T>, ErrorCode> {
+    let byte_len = checked_array_byte_len::<T>(count)?;
+    validate_range(src as u64, byte_len, false)?;
+    let mut values = Vec::new();
+    values
+        .try_reserve_exact(count)
+        .map_err(|_| ErrorCode::NoMemory)?;
+    if count == 0 {
+        return Ok(values);
+    }
+    let _access = huesos_arch::cpu::UserAccessGuard::new();
+    // SAFETY: the complete userspace source range was validated above.
+    // values has enough spare capacity for count initialized T records, and
+    // that spare memory is a live kernel destination. set_len is performed
+    // only after the recoverable copy reports success, so no uninitialized
+    // values become observable on fault.
+    unsafe {
+        user_access::recoverable_copy_from_user(
+            values.spare_capacity_mut().as_mut_ptr().cast::<u8>(),
+            src.cast::<u8>(),
+            byte_len,
+        )?;
+        values.set_len(count);
+    }
+    Ok(values)
 }
 
 /// Copy one plain ABI value from userspace.
@@ -76,35 +142,12 @@ pub(crate) fn validate_write_array<T>(out: *mut T, count: usize) -> Result<(), E
 /// Callers use this only with `#[repr(C)]`, `Copy` ABI records whose bit
 /// patterns are valid for every field (integers and raw pointers).
 pub(crate) fn read_value<T: Copy>(src: *const T) -> Result<T, ErrorCode> {
-    with_user_memory_lock(|| {
-        validate_range(src as u64, mem::size_of::<T>(), false)?;
-        let _access = huesos_arch::cpu::UserAccessGuard::new();
-        // SAFETY: every byte of T was verified readable in the active user page
-        // tables. The guard opens a non-preemptible SMAP window. Unaligned access
-        // is intentional because the ABI does not require aligned records.
-        Ok(unsafe { ptr::read_unaligned(src) })
-    })
+    with_user_memory_lock(|| recoverable_read_at(src))
 }
 
 /// Copy an array of plain values from userspace into kernel-owned memory.
 pub(crate) fn read_array<T: Copy>(src: *const T, count: usize) -> Result<Vec<T>, ErrorCode> {
-    with_user_memory_lock(|| {
-        let byte_len = mem::size_of::<T>()
-            .checked_mul(count)
-            .ok_or(ErrorCode::InvalidArgs)?;
-        validate_range(src as u64, byte_len, false)?;
-        let mut values = Vec::new();
-        values
-            .try_reserve_exact(count)
-            .map_err(|_| ErrorCode::NoMemory)?;
-        let _access = huesos_arch::cpu::UserAccessGuard::new();
-        for i in 0..count {
-            // SAFETY: the complete array range was validated above. read_unaligned
-            // avoids imposing an alignment requirement on the syscall ABI.
-            values.push(unsafe { ptr::read_unaligned(src.add(i)) });
-        }
-        Ok(values)
-    })
+    with_user_memory_lock(|| recoverable_read_array_at(src, count))
 }
 
 /// Allocate an initialized kernel byte buffer without invoking the infallible
@@ -159,16 +202,27 @@ pub(crate) fn copy_from_user(src: *const u8, len: usize) -> Result<Vec<u8>, Erro
     })
 }
 
+fn recoverable_write_at<T: Copy>(dst: *mut T, value: &T) -> Result<(), ErrorCode> {
+    let byte_len = checked_value_byte_len::<T>()?;
+    validate_range(dst as u64, byte_len, true)?;
+    let _access = huesos_arch::cpu::UserAccessGuard::new();
+    // SAFETY: dst's complete byte range was validated writable, value is a
+    // live kernel-owned ABI record of the same size, and the caller holds the
+    // process user_memory_lock. The recoverable copy preserves the previous
+    // unaligned ABI byte layout while turning a concurrent destination unmap
+    // into InvalidArgs.
+    unsafe {
+        user_access::recoverable_copy_to_user(
+            dst.cast::<u8>(),
+            (value as *const T).cast::<u8>(),
+            byte_len,
+        )
+    }
+}
+
 /// Copy one plain ABI value to userspace.
 pub(crate) fn write_value<T: Copy>(dst: *mut T, value: &T) -> Result<(), ErrorCode> {
-    with_user_memory_lock(|| {
-        validate_write(dst)?;
-        let _access = huesos_arch::cpu::UserAccessGuard::new();
-        // SAFETY: the complete destination is user-accessible and writable.
-        // write_unaligned keeps the raw syscall ABI independent of Rust alignment.
-        unsafe { ptr::write_unaligned(dst, *value) };
-        Ok(())
-    })
+    with_user_memory_lock(|| recoverable_write_at(dst, value))
 }
 
 /// Copy a kernel byte slice to userspace.
@@ -193,17 +247,26 @@ pub(crate) fn copy_to_user(dst: *mut u8, bytes: &[u8]) -> Result<(), ErrorCode> 
     })
 }
 
+fn recoverable_write_array_at<T: Copy>(dst: *mut T, values: &[T]) -> Result<(), ErrorCode> {
+    let byte_len = checked_array_byte_len::<T>(values.len())?;
+    validate_range(dst as u64, byte_len, true)?;
+    if values.is_empty() {
+        return Ok(());
+    }
+    let _access = huesos_arch::cpu::UserAccessGuard::new();
+    // SAFETY: dst's complete byte range was validated writable. values is a
+    // live kernel-owned contiguous slice of Copy ABI records; viewing it as
+    // bytes preserves the existing unaligned syscall ABI, and the recoverable
+    // copy handles post-validation destination faults.
+    unsafe {
+        let bytes = slice::from_raw_parts(values.as_ptr().cast::<u8>(), byte_len);
+        user_access::recoverable_copy_to_user(dst.cast::<u8>(), bytes.as_ptr(), bytes.len())
+    }
+}
+
 /// Copy an array of plain values to userspace.
 pub(crate) fn write_array<T: Copy>(dst: *mut T, values: &[T]) -> Result<(), ErrorCode> {
-    with_user_memory_lock(|| {
-        validate_write_array(dst, values.len())?;
-        let _access = huesos_arch::cpu::UserAccessGuard::new();
-        for (i, value) in values.iter().enumerate() {
-            // SAFETY: the complete destination array was validated above.
-            unsafe { ptr::write_unaligned(dst.add(i), *value) };
-        }
-        Ok(())
-    })
+    with_user_memory_lock(|| recoverable_write_array_at(dst, values))
 }
 
 #[cfg(test)]
@@ -237,5 +300,26 @@ mod tests {
     #[test]
     fn accepts_page_crossing_range_inside_userspace() {
         assert!(bounds_only(USER_ASPACE_BASE + PAGE_SIZE - 2, 4));
+    }
+
+    #[test]
+    fn typed_copy_sizes_reject_zero_sized_records() {
+        assert!(matches!(
+            checked_value_byte_len::<()>(),
+            Err(ErrorCode::InvalidArgs)
+        ));
+        assert!(matches!(checked_array_byte_len::<()>(0), Ok(0)));
+        assert!(matches!(
+            checked_array_byte_len::<()>(1),
+            Err(ErrorCode::InvalidArgs)
+        ));
+    }
+
+    #[test]
+    fn typed_copy_sizes_reject_overflow() {
+        assert!(matches!(
+            checked_array_byte_len::<u64>(usize::MAX),
+            Err(ErrorCode::InvalidArgs)
+        ));
     }
 }
