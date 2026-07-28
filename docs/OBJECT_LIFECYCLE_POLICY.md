@@ -72,11 +72,11 @@ The kernel uses the policy in the following bounded, reviewable ways:
 2. On process exit, it snapshots lifecycle-owned `ExitInfo` and records the
    same `koid`, `generation`, exit code, and tick through
    `record_exit_with_generation`. The graveyard never invents a second
-   identity for a lifecycle-managed exit.
-3. Deferred reaping compares the process lifecycle payload with the stored
-   `(koid, generation)` pair and reaps records that have been observed or whose
-   typed process record is gone. The FIFO bound remains the safety net for
-   unobserved exits.
+   identity for a lifecycle-managed exit, and the kernel accounts the policy's
+   `Evicted` outcome when the bounded FIFO overwrites an old record.
+3. Deferred reaping asks the typed `Process` object whether the stored
+   generation has been observed and reaps records whose process object is gone.
+   The FIFO bound remains the safety net for unobserved exits.
 4. `RefAccount` remains a reference model for the registry's collection path;
    it documents and host-tests the accounting invariants rather than running in
    the hot path.

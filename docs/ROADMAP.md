@@ -358,10 +358,14 @@ priority order.
   maps to one `BTreeMap<Koid, RefAccount>`; ABA-style stale-koid resurrection
   is impossible because `open_*` on a collected account is a no-op. New
   regression test `once_collected_object_stays_gone_and_ignores_stale_notes`.
-- **Needed (on-target)**: (a) feed finished-task metadata into the
-  `TaskGraveyard` (already used by scheduler for `TaskWait`, needs uniform
-  policy call); (b) use `huesos-proclife` for the process lifecycle state
-  machine instead of ad-hoc bool flags.
+- **Process lifecycle replacement landed**: `Process.lifecycle` is now a
+  private `huesos-proclife::ProcessLifecycle` policy object reached only
+  through typed methods; scheduler/reaper code no longer inspects process
+  `ProcState` directly. Finished-task metadata is recorded through
+  `TaskGraveyard::record_exit_with_generation`, and overflow eviction outcome
+  is accounted explicitly.
+- **Immediate status**: complete. Remaining lifecycle work is future-facing
+  observability/stress coverage, not a missing Immediate architecture piece.
 
 ### 4. Blocking syscalls / wait primitives (mostly done)
 - **Current**: Channel/Port block + tick timeouts (`TimedOut`); ProcessWait.

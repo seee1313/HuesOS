@@ -63,8 +63,9 @@ A stateful per-process record:
 
 ## Current kernel integration boundary
 
-The kernel `Process` object now owns a `Mutex<ProcessLifecycle>` rather than a
-second independent exit-code state. The first userspace task publication drives
+The kernel `Process` object now owns a private `Mutex<ProcessLifecycle>` rather
+than a second independent exit-code state; callers can only drive or observe it
+through typed `Process` methods. The first userspace task publication drives
 `Created -> Running`; process exit drives the policy's `exit(code)` transition
 and wakes the existing wait queue. `ProcessWait` calls `add_waiter()` before
 parking and releases the waiter when the exit status is observed, so waits
@@ -86,13 +87,16 @@ home CPU; the scheduler no longer consults a global load average or performs
 automatic balancing.
 
 The scheduler copies this lifecycle-owned generation unchanged into its bounded
-finished-task graveyard, so deferred reaping and any later supervisor packet
-refer to the same `(koid, generation)` exit identity.
+finished-task graveyard via `record_exit_with_generation`, accounts overflow
+`Evicted` outcomes, and reaps by asking the `Process` object whether the stored
+generation has been observed. Deferred reaping and any later supervisor packet
+therefore refer to the same `(koid, generation)` exit identity without direct
+scheduler access to `ProcState`.
 
-The remaining integration work is:
+The remaining integration work is future-facing:
 
 1. emit a generation-bearing exit packet to subscribed Port supervisors;
-2. connect more object-specific cleanup decisions to the `Reaped` transition;
+2. add stress/diagnostic coverage for graveyard eviction counters;
 3. charge/release handle, page-table, and CPU quota resources only after the
    policy transition permits it.
 

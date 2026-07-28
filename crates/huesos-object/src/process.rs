@@ -20,7 +20,7 @@ pub struct Process {
     /// Job that owns this process's resource charges.
     pub job: Arc<Job>,
     /// Lifecycle state machine shared with the host-tested policy core.
-    pub lifecycle: IrqSafeMutex<ProcessLifecycle>,
+    lifecycle: IrqSafeMutex<ProcessLifecycle>,
     /// Waiters blocked in `ProcessWait` until this process exits.
     pub exit_waiters: WaitQueue,
     /// Serializes validated kernel copies with VMAR mutation operations.
@@ -239,6 +239,13 @@ impl Process {
     /// Snapshot the generation-bearing exit payload.
     pub fn exit_info(&self) -> Option<ExitInfo> {
         self.lifecycle.lock().exit_info()
+    }
+
+    /// Whether this process has exposed the exit generation recorded by a
+    /// graveyard waiter.
+    pub fn observed_exit_generation(&self, generation: u64) -> bool {
+        self.exit_info()
+            .is_some_and(|info| info.generation == generation)
     }
 }
 

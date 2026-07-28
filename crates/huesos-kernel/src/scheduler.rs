@@ -27,7 +27,7 @@ use alloc::vec::Vec;
 use core::ops::{Deref, DerefMut};
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use huesos_arch::{LockRank, RankedIrqSafeTicketLock};
-use huesos_lifecycle::TaskGraveyard;
+use huesos_lifecycle::{InsertOutcome, TaskGraveyard};
 use huesos_object::{KernelObject, Process};
 use x86_64::VirtAddr;
 
@@ -970,6 +970,7 @@ fn switch_away_from_finished(cpu: usize) -> ! {
 
 static TASK_GRAVEYARD: RankedIrqSafeTicketLock<Option<TaskGraveyard<256>>> =
     RankedIrqSafeTicketLock::new(None, LockRank::REAPER);
+static TASK_GRAVEYARD_EVICTIONS: AtomicU64 = AtomicU64::new(0);
 
 fn record_process_exit(process: &Process, code: i64) {
     let Some(info) = process.exit_info() else {
@@ -980,8 +981,11 @@ fn record_process_exit(process: &Process, code: i64) {
         let graveyard = yard.get_or_insert_with(TaskGraveyard::new);
         // ProcessLifecycle owns the generation in ExitInfo. Reusing it here keeps
         // the graveyard record and ProcessWait/reaper observations ABA-safe.
-        let _ =
+        let (_, outcome) =
             graveyard.record_exit_with_generation(info.koid, info.generation, code, global_ticks());
+        if matches!(outcome, InsertOutcome::Evicted(_)) {
+            TASK_GRAVEYARD_EVICTIONS.fetch_add(1, Ordering::Relaxed);
+        }
     }
     // Critical-process fallback (Fuchsia-inspired "critical to root
     // job"). A process marked critical is one whose continued liveness
@@ -1005,12 +1009,7 @@ fn reap_observed_process_exits() {
     };
     let _ = graveyard.reap_waited(|koid, generation| {
         match huesos_object::lookup_process(huesos_object::Koid(koid)) {
-            Some(process) => {
-                process.lifecycle_state().is_terminal()
-                    && process
-                        .exit_info()
-                        .is_some_and(|info| info.generation == generation)
-            }
+            Some(process) => process.observed_exit_generation(generation),
             None => true,
         }
     });

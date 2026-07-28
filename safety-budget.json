@@ -1,6 +1,6 @@
 {
   "rust_files": 157,
-  "rust_lines": 42186,
+  "rust_lines": 42192,
   "totals": {
     "expect_calls": 21,
     "panic_macros": 5,
