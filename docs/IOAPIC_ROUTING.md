@@ -1,8 +1,9 @@
 # I/O APIC Routing Policy (`huesos-ioapic`)
 
 Status: **policy + host tests landed; IRQ1 now has an integrated masked-first
-MMIO route with readback verification and PIC fallback. QEMU matrix verification
-is complete; broader IRQ routing, x2APIC, and bare-metal coverage remain.**
+MMIO route with readback verification and PIC fallback. The route core is
+x2APIC-aware (no APIC-ID truncation) and generic over legacy IRQ/vector, but only
+IRQ1 is enabled until matching handlers/drivers exist.**
 
 This document describes the host-testable crate `huesos-ioapic` and how it is
 intended to plug into the kernel's interrupt handling. It supports
@@ -100,22 +101,31 @@ overrides (ISA defaults otherwise), allocates a vector, and builds a masked,
 fixed-delivery entry targeting a given APIC ID. The caller unmasks it only
 after installing it.
 
+The helper is x2APIC-aware in the production-safe sense: without interrupt
+remapping, the I/O APIC redirection entry exposes only an 8-bit physical
+destination field. `ioapic_physical_destination` therefore rejects APIC IDs above
+255 instead of silently truncating them and routing interrupts to the wrong CPU.
+
 ## Current privileged integration
 
-`huesos-arch::ioapic::init_keyboard` now performs the first integrated route:
+`huesos-arch::ioapic::init_keyboard` now performs the first integrated route
+through a generic internal `init_legacy_irq(madt, irq, vector)` helper:
 
 1. parse MADT and source overrides;
 2. map each I/O APIC MMIO window uncached;
 3. read the pin count from the version register;
-4. use `route_gsi` and `entry_for_legacy_irq` for ISA IRQ1;
-5. program the high and low redirection halves masked-first;
-6. unmask the entry only after both writes;
-7. read the redirection entry back and compare every writable field;
-8. install the dedicated vector `0x31` and send LAPIC EOI in the handler.
+4. use `route_gsi` and `entry_for_legacy_irq` for the requested ISA IRQ;
+5. reject unrepresentable x2APIC destinations instead of truncating;
+6. program the high and low redirection halves masked-first;
+7. unmask the entry only after both writes;
+8. read the redirection entry back and compare every writable field;
+9. mark the legacy IRQ as routed in a bitmap.
 
-`interrupts::init` masks the 8259 keyboard path only after this route succeeds.
-If any step fails, including readback mismatch, the driver masks the candidate
-I/O APIC entry again and the existing PIC handler remains active.
+The keyboard handler is the only current external-IRQ IDT consumer, so only IRQ1
+is enabled today. `interrupts::init` masks the 8259 keyboard path only after this
+route succeeds. If any step fails, including readback mismatch or unsupported
+APIC destination, the driver masks the candidate I/O APIC entry again and the
+existing PIC handler remains active.
 ## What still requires on-target verification
 
 The QEMU debug/release × SMP1/SMP2 serial smoke matrix verifies that the
@@ -124,10 +134,12 @@ coverage before claiming a complete interrupt subsystem:
 
 - keyboard-injection CI assertions that prove the `0x31` vector, rather than
   the PIC vector, delivered the event;
-- multiple routable IRQs and real source overrides such as IRQ0→GSI2 on
-  hardware, not only synthetic host tables;
-- x2APIC / logical destination support and SMP affinity selection beyond the
-  BSP-targeted keyboard route;
+- enabling additional routed IRQs only alongside their IDT handlers and userspace
+  drivers;
+- interrupt-remapping or logical-destination support for machines whose x2APIC
+  IDs exceed the classic I/O APIC's 8-bit physical destination field;
+- real source overrides such as IRQ0→GSI2 on hardware, not only synthetic host
+  tables;
 - bare-metal firmware variation;
 - eventual PIC fallback removal once the I/O APIC path is proven on enough
   machines.
@@ -142,4 +154,5 @@ parsing (valid, empty, bad signature, truncated, oversized declared length,
 zero-length entry), device-vector range assertions, vector
 allocation/exhaustion/free/reserve and the empty-range and underflow edge cases,
 GSI→I/O-APIC selection (explicit range, fallback, no owner), non-identity IRQ1
-source overrides, and the `entry_for_legacy_irq` integration helper.
+source overrides, x2APIC APIC-ID rejection, and the `entry_for_legacy_irq`
+integration helper.

@@ -662,6 +662,21 @@ fn allocate_device_vector(vectors: &mut VectorAllocator) -> Option<u8> {
     None
 }
 
+/// Convert a LAPIC/x2APIC physical ID into the 8-bit I/O APIC redirection
+/// destination field.
+///
+/// Without interrupt remapping, the classic I/O APIC redirection entry can only
+/// name an 8-bit physical APIC destination. Returning `None` for larger x2APIC
+/// IDs is deliberate production-safe behavior: do not silently truncate and
+/// route an interrupt to the wrong CPU.
+pub fn ioapic_physical_destination(apic_id: u32) -> Option<u8> {
+    if apic_id <= u8::MAX as u32 {
+        Some(apic_id as u8)
+    } else {
+        None
+    }
+}
+
 /// Build a redirection entry for a legacy ISA IRQ.
 ///
 /// Applies source overrides for the GSI and polarity/trigger, allocates a
@@ -669,13 +684,15 @@ fn allocate_device_vector(vectors: &mut VectorAllocator) -> Option<u8> {
 /// returned entry is left **masked**; the caller unmasks it (via
 /// [`RedirectionEntry::unmasked`]) only after it has been installed.
 ///
-/// Returns `(gsi, entry)`, or `None` if no vector is available.
+/// Returns `(gsi, entry)`, or `None` if no vector or 8-bit physical destination
+/// is available.
 pub fn entry_for_legacy_irq(
     legacy_irq: u8,
     overrides: &SourceOverrideTable,
     vectors: &mut VectorAllocator,
-    destination_apic_id: u8,
+    destination_apic_id: u32,
 ) -> Option<(u32, RedirectionEntry)> {
+    let destination = ioapic_physical_destination(destination_apic_id)?;
     let gsi = overrides.resolve_gsi(legacy_irq);
     let (polarity, trigger) = match overrides.find(legacy_irq) {
         Some(override_entry) => (override_entry.polarity(), override_entry.trigger()),
@@ -684,7 +701,7 @@ pub fn entry_for_legacy_irq(
     let vector = allocate_device_vector(vectors)?;
     let entry = RedirectionEntry::masked()
         .with_vector(vector)
-        .with_destination(destination_apic_id)
+        .with_destination(destination)
         .with_polarity(polarity)
         .with_trigger(trigger);
     Some((gsi, entry))
@@ -1173,6 +1190,22 @@ mod tests {
     }
 
     // --- entry_for_legacy_irq ---
+
+    #[test]
+    fn physical_destination_rejects_unrepresentable_x2apic_ids() {
+        assert_eq!(ioapic_physical_destination(0), Some(0));
+        assert_eq!(ioapic_physical_destination(255), Some(255));
+        assert_eq!(ioapic_physical_destination(256), None);
+        assert_eq!(ioapic_physical_destination(u32::MAX), None);
+    }
+
+    #[test]
+    fn legacy_irq_rejects_unrepresentable_x2apic_destination() {
+        let overrides = SourceOverrideTable::empty();
+        let mut vectors = VectorAllocator::new(0x30, 0x30);
+        assert_eq!(entry_for_legacy_irq(1, &overrides, &mut vectors, 256), None);
+        assert_eq!(vectors.used_count(), 0);
+    }
 
     #[test]
     fn legacy_irq_without_override_uses_isa_defaults() {

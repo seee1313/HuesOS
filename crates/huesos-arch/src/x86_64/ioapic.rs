@@ -4,7 +4,7 @@
 //! the privileged MMIO mapping and register-pair writes. The first integrated
 //! device is ISA IRQ1, routed to a fixed vector before interrupts are enabled.
 
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicU32, Ordering};
 use huesos_ioapic::{
     entry_for_legacy_irq, is_device_vector, parse_source_overrides, route_gsi, IoApicDescriptor,
     RedirectionEntry, VectorAllocator,
@@ -14,7 +14,7 @@ use x86_64::structures::paging::PageTableFlags;
 /// Vector used for the I/O APIC keyboard route.
 pub const KEYBOARD_VECTOR: u8 = 0x31;
 
-static KEYBOARD_ROUTED: AtomicBool = AtomicBool::new(false);
+static ROUTED_LEGACY_IRQS: AtomicU32 = AtomicU32::new(0);
 
 /// Failure while configuring the integrated I/O APIC keyboard route.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -29,13 +29,23 @@ pub enum IoApicError {
     InvalidVector,
     /// No vector or GSI route was available.
     NoRoute,
+    /// The current LAPIC/x2APIC destination cannot be encoded safely.
+    UnsupportedDestination,
     /// MMIO readback did not match the programmed redirection entry.
     Verification,
 }
 
+/// Whether a legacy ISA IRQ was successfully routed through an I/O APIC.
+pub fn legacy_irq_routed(irq: u8) -> bool {
+    if irq >= 32 {
+        return false;
+    }
+    ROUTED_LEGACY_IRQS.load(Ordering::Acquire) & (1u32 << irq) != 0
+}
+
 /// Whether IRQ1 was successfully routed through an I/O APIC.
 pub fn keyboard_routed() -> bool {
-    KEYBOARD_ROUTED.load(Ordering::Acquire)
+    legacy_irq_routed(1)
 }
 
 /// Configure the I/O APIC redirection entry for ISA IRQ1.
@@ -44,7 +54,14 @@ pub fn keyboard_routed() -> bool {
 /// 32-bit halves have been written. The function runs once on the BSP before
 /// `STI`; all later keyboard events use the existing userspace IRQ bridge.
 pub fn init_keyboard(madt_bytes: &[u8]) -> Result<(), IoApicError> {
-    if !is_device_vector(KEYBOARD_VECTOR) {
+    init_legacy_irq(madt_bytes, 1, KEYBOARD_VECTOR)
+}
+
+fn init_legacy_irq(madt_bytes: &[u8], legacy_irq: u8, vector: u8) -> Result<(), IoApicError> {
+    if legacy_irq >= 32 {
+        return Err(IoApicError::NoRoute);
+    }
+    if !is_device_vector(vector) {
         return Err(IoApicError::InvalidVector);
     }
     let madt = super::acpi::parse_madt_bytes(madt_bytes).ok_or(IoApicError::InvalidMadt)?;
@@ -80,9 +97,15 @@ pub fn init_keyboard(madt_bytes: &[u8]) -> Result<(), IoApicError> {
         return Err(IoApicError::NoController);
     }
 
-    let mut vectors = VectorAllocator::new(KEYBOARD_VECTOR, KEYBOARD_VECTOR);
-    let (gsi, entry) = entry_for_legacy_irq(1, &overrides, &mut vectors, super::lapic::id() as u8)
-        .ok_or(IoApicError::NoRoute)?;
+    let destination = super::lapic::id();
+    let mut vectors = VectorAllocator::new(vector, vector);
+    let destination_error = if destination > u8::MAX as u32 {
+        IoApicError::UnsupportedDestination
+    } else {
+        IoApicError::NoRoute
+    };
+    let (gsi, entry) = entry_for_legacy_irq(legacy_irq, &overrides, &mut vectors, destination)
+        .ok_or(destination_error)?;
     let (ioapic_id, pin) = route_gsi(&descriptors[..count], gsi).ok_or(IoApicError::NoRoute)?;
     let index = descriptors[..count]
         .iter()
@@ -98,7 +121,7 @@ pub fn init_keyboard(madt_bytes: &[u8]) -> Result<(), IoApicError> {
         write_redirection(bases[index], pin, masked);
         return Err(IoApicError::Verification);
     }
-    KEYBOARD_ROUTED.store(true, Ordering::Release);
+    ROUTED_LEGACY_IRQS.fetch_or(1u32 << legacy_irq, Ordering::AcqRel);
     Ok(())
 }
 

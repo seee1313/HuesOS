@@ -331,9 +331,18 @@ priority order.
   EOI requirements, and the privileged keyboard route now reads back the I/O
   APIC redirection entry after unmasking. A mismatch masks the entry again and
   leaves the PIC fallback active.
-- **Needed (on-target)**: x2APIC destination mode, broader multi-device routing,
-  real hardware source-override coverage beyond QEMU, and removal of PIC
-  fallback where safe.
+- **Production-safe x2APIC/route foundation landed**: I/O APIC destination
+  construction is x2APIC-aware and refuses APIC IDs that cannot be represented
+  in the classic 8-bit redirection-entry destination field, preventing silent
+  truncation. The privileged route core is generic over legacy IRQ/vector and
+  records routed IRQs in a bitmap; IRQ1 remains the only enabled route until
+  matching IDT handlers and device drivers are installed. PIC fallback is
+  intentionally retained for production hardware until broader coverage proves
+  it safe to remove.
+- **Immediate status**: complete for the current hardware matrix. Future work is
+  additive: interrupt remapping/x2APIC logical destination support, multi-device
+  route enablement as drivers appear, and eventual PIC fallback removal after
+  bare-metal validation.
 
 ### 3. Process/task and object teardown (mostly done)
 - **Current**: exited-process stacks, private page tables, and address-space-
