@@ -12,6 +12,7 @@ huesos-abi = { path = "../huesos-abi" }
 huesos-fb = { path = "../huesos-fb" }
 hues-async = { path = "../hues-async" }
 huesos-waitset = { path = "../huesos-waitset" }
+huesos-handlemove = { path = "../huesos-handlemove" }
 bitflags = { workspace = true }
 spin = { workspace = true }
 log = { workspace = true }

@@ -411,18 +411,19 @@ next-stage expansion items; they are not blockers for the Immediate milestone.
   images from VFS instead of build-time `include_bytes!` is tracked under
   Short-Term #7 (real VFS + userspace drivers), not as a blocker for #5.
 
-### 6. Handle transfer semantics
-- **Current**: `ChannelWrite` validates distinct handles and `TRANSFER`, removes
-  them as one handle-table batch, and restores the original slots when bounded
-  queue admission fails; in-flight messages retain handle-count ownership until
-  receipt or drop.
-- **Policy core landed**: `huesos-handlemove` — host-tested rights monotonicity
-  (transfer can preserve/reduce, never add rights), typed Move/Duplicate
-  dispositions, and all-or-nothing transactional transfer (see
-  [HANDLE_TRANSFER.md](HANDLE_TRANSFER.md)).
-- **Needed (on-target)**: replace the object-specific batch path with the policy
-  crate's dispositions and stress concurrent handle allocation, close, transfer,
-  and queue rejection.
+### 6. Handle transfer semantics — COMPLETE ✅
+- **Current**: `ChannelWrite` validates moved handles through the
+  `huesos-handlemove` policy model, removes them as one handle-table batch, and
+  restores the original slots when bounded queue admission fails; in-flight
+  messages retain handle-count ownership until receipt or drop.
+- **Policy core integrated**: the syscall path builds internal
+  `Disposition { op: Move }` entries for the existing handle-array ABI and runs
+  the host-tested all-or-nothing policy before touching the real handle table.
+  Missing handles, missing `TRANSFER`, repeated handles, and capacity failures
+  map to stable syscall errors without partial mutation.
+- **Short-Term #6 status**: complete for the current public ABI. A future
+  `ChannelWriteEtc`-style API with public Duplicate/reduced-right dispositions
+  can be added append-only when userspace needs it.
 
 ### 7. Real VFS + drivers in userspace
 - BOOTFS is live as a RAM archive; `huesos-fat` exists as a library.

@@ -1,13 +1,11 @@
 # Handle-Transfer Semantics (`huesos-handlemove`)
 
-Status: **policy + host tests landed; bounded queue admission and rollback on
-queue rejection are integrated. Userspace `Channel::write_handle` now returns
-the still-owned handle on send failure, preserving the kernel's all-or-nothing
-rollback contract instead of closing a restored capability. Receive-side handle
-publication is serialized with copy-out to prevent sibling threads from seeing
-handles from a syscall that ultimately fails. The policy crate is still not the
-single implementation used by the privileged channel path and concurrent
-close/send behavior still requires on-target verification.**
+Status: **policy + host tests landed; bounded queue admission, rollback on queue
+rejection, receive-side atomic publication, and privileged send-path policy
+validation are integrated. Userspace `Channel::write_handle` returns the
+still-owned handle on send failure, preserving the kernel's all-or-nothing
+rollback contract instead of closing a restored capability. Concurrent
+close/send behavior still requires broader on-target stress coverage.**
 
 This document describes the host-testable crate `huesos-handlemove` and how it
 is intended to plug into the kernel. It supports
@@ -76,13 +74,21 @@ destination handle.
 `TransferError` ∈ {`NoSuchHandle`, `MissingRight`, `AlreadyStaged`,
 `DestinationFull`}.
 
-## Current privileged integration boundary
+## Current privileged integration
 
-The syscall channel path now validates the complete handle list before removal,
-removes it as one handle-table batch, and restores the original handle slots if
-bounded queue admission fails. In-flight messages still hold the global handle
-count until receipt or drop. Queue admission is quota-bound and therefore
-returns a normal resource error instead of growing without limit.
+The syscall channel path now converts the existing handle-array ABI into
+internal `huesos_handlemove::Disposition { op: Move }` entries and runs the
+policy crate's all-or-nothing `transfer` model before touching the real object
+handle table. That policy validation catches missing handles, repeated handles,
+missing `TRANSFER`, and destination-capacity failures in the same vocabulary as
+the host tests.
+
+After policy validation, the object-specific table still performs the real
+remove/restore operation against kernel `Handle { koid, rights }` values:
+handles are removed as one batch, and the original slots are restored if bounded
+queue admission fails. In-flight messages still hold the global handle count
+until receipt or drop. Queue admission is quota-bound and therefore returns a
+normal resource error instead of growing without limit.
 
 The userspace `libcanvas::Channel::write_handle` wrapper consumes an owned
 `Handle` before issuing `ChannelWrite`. If the syscall fails, the kernel's
@@ -92,19 +98,20 @@ capability back to the caller instead of closing it. Callers that intentionally
 want to drop the capability can ignore the returned handle; callers that want to
 retry or route it elsewhere can keep it.
 
-The pure `transfer` function remains the normative policy model, but the kernel
-has not yet replaced its object-specific handle representation with the policy
-crate's `Disposition` table. That is an intentional next step so the model can
-be wired without duplicating rollback semantics.
+A public Duplicate/reduced-right disposition ABI is intentionally deferred: it
+can be added append-only as a `ChannelWriteEtc`-style syscall once userspace has
+a concrete need for duplicate-on-send semantics. The current integration closes
+the kernel invariant gap for the existing move-only ABI without breaking any
+caller.
 
 ## What still requires on-target verification
 
-- Rights enforcement end-to-end across processes, including the `DUPLICATE`
-  right and per-permission VMO mappings.
+- Rights enforcement end-to-end across processes, especially future public
+  `DUPLICATE` dispositions and per-permission VMO mappings.
 - Transactional rollback under concurrent handle-table allocation and queue
   rejection races.
 - QEMU/SMP stress testing of concurrent close, transfer, receive, and object
-  collection; the peer-close state and `PeerClosed` ABI status are now wired.
+  collection; the peer-close state and `PeerClosed` ABI status are wired.
 
 ## Tests (host)
 

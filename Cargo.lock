@@ -209,6 +209,7 @@ dependencies = [
  "huesos-abi",
  "huesos-arch",
  "huesos-fb",
+ "huesos-handlemove",
  "huesos-object",
  "huesos-waitset",
  "log",

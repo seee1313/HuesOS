@@ -1,6 +1,7 @@
 //! Channel IPC syscalls.
 
 use huesos_abi::{ChannelConsumeArgs, ChannelPeekArgs, ChannelReadEtcArgs, ErrorCode, HandleValue};
+use huesos_handlemove as handlemove;
 use huesos_object::{ChannelRecvError, Handle, KernelObject, KernelObjectExt, Rights};
 
 use crate::{user_memory, util::current_proc, SyscallResult};
@@ -12,6 +13,76 @@ fn map_recv_error(error: ChannelRecvError) -> huesos_abi::ErrorCode {
         }
         ChannelRecvError::PeerClosed => ErrorCode::PeerClosed,
     }
+}
+
+fn policy_rights(rights: Rights) -> handlemove::Rights {
+    let mut out = handlemove::Rights::NONE;
+    if rights.contains(Rights::DUPLICATE) {
+        out = out.union(handlemove::Rights::DUPLICATE);
+    }
+    if rights.contains(Rights::TRANSFER) {
+        out = out.union(handlemove::Rights::TRANSFER);
+    }
+    if rights.contains(Rights::READ) {
+        out = out.union(handlemove::Rights::READ);
+    }
+    if rights.contains(Rights::WRITE) {
+        out = out.union(handlemove::Rights::WRITE);
+    }
+    out
+}
+
+fn validate_move_dispositions(
+    proc: &huesos_object::Process,
+    raw_handles: &[HandleValue],
+) -> Result<(), ErrorCode> {
+    let mut src = handlemove::HandleTable::<{ user_memory::MAX_CHANNEL_HANDLES }>::new();
+    let mut dst = handlemove::HandleTable::<{ user_memory::MAX_CHANNEL_HANDLES }>::new();
+    let mut unique_raw = [0 as HandleValue; user_memory::MAX_CHANNEL_HANDLES];
+    let mut unique_policy = [0u64; user_memory::MAX_CHANNEL_HANDLES];
+    let mut unique_count = 0usize;
+    let mut disps = [handlemove::Disposition {
+        handle: 0,
+        op: handlemove::DispOp::Move,
+        rights: handlemove::Rights::NONE,
+    }; user_memory::MAX_CHANNEL_HANDLES];
+
+    for (index, &hv) in raw_handles.iter().enumerate() {
+        let handle = proc.handles.get(hv).ok_or(ErrorCode::BadHandle)?;
+        let rights = policy_rights(handle.rights);
+        let mut policy_handle = None;
+        for existing in 0..unique_count {
+            if unique_raw[existing] == hv {
+                policy_handle = Some(unique_policy[existing]);
+                break;
+            }
+        }
+        let policy_handle = match policy_handle {
+            Some(value) => value,
+            None => {
+                let inserted = src.insert(rights).ok_or(ErrorCode::Internal)?;
+                unique_raw[unique_count] = hv;
+                unique_policy[unique_count] = inserted;
+                unique_count += 1;
+                inserted
+            }
+        };
+        disps[index] = handlemove::Disposition {
+            handle: policy_handle,
+            op: handlemove::DispOp::Move,
+            rights,
+        };
+    }
+
+    handlemove::transfer(&mut src, &mut dst, &disps[..raw_handles.len()]).map_err(|error| {
+        match error {
+            handlemove::TransferError::NoSuchHandle => ErrorCode::BadHandle,
+            handlemove::TransferError::MissingRight => ErrorCode::AccessDenied,
+            handlemove::TransferError::AlreadyStaged => ErrorCode::InvalidArgs,
+            handlemove::TransferError::DestinationFull => ErrorCode::NoMemory,
+        }
+    })?;
+    Ok(())
 }
 
 pub(crate) fn sys_channel_create(out0: *mut HandleValue, out1: *mut HandleValue) -> SyscallResult {
@@ -73,15 +144,7 @@ pub(crate) fn sys_channel_write(
         for (index, slot) in raw_handles[..handle_count].iter_mut().enumerate() {
             *slot = user_memory::read_value(handles.wrapping_add(index))?;
         }
-        for (i, &hv) in raw_handles[..handle_count].iter().enumerate() {
-            if raw_handles[..i].contains(&hv) {
-                return Err(ErrorCode::InvalidArgs);
-            }
-            let inner_h = proc.handles.get(hv).ok_or(ErrorCode::BadHandle)?;
-            if !inner_h.has_rights(Rights::TRANSFER) {
-                return Err(ErrorCode::AccessDenied);
-            }
-        }
+        validate_move_dispositions(&proc, &raw_handles[..handle_count])?;
         let mut transferred =
             [huesos_object::Handle::new(huesos_object::Koid::INVALID, Rights::DEFAULT);
                 huesos_object::CHANNEL_INLINE_HANDLES];
@@ -103,15 +166,7 @@ pub(crate) fn sys_channel_write(
     // Slow path: snapshot larger caller-controlled memory into bounded Vecs.
     let data = user_memory::copy_from_user(bytes, byte_count)?;
     let raw_handles = user_memory::read_array(handles, handle_count)?;
-    for (i, &hv) in raw_handles.iter().enumerate() {
-        if raw_handles[..i].contains(&hv) {
-            return Err(ErrorCode::InvalidArgs);
-        }
-        let inner_h = proc.handles.get(hv).ok_or(ErrorCode::BadHandle)?;
-        if !inner_h.has_rights(Rights::TRANSFER) {
-            return Err(ErrorCode::AccessDenied);
-        }
-    }
+    validate_move_dispositions(&proc, &raw_handles)?;
     let transferred =
         proc.handles
             .remove_many_keep_alive(&raw_handles)
