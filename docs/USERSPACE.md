@@ -206,6 +206,22 @@ to two transferred handles avoid per-message heap allocation in the queued
 `ChannelMessage`. Larger messages keep the existing bounded heap-backed path and
 the same ABI limits.
 
+### Signals
+
+`libcanvas::Signal` is a level-triggered waitable object. `set()` makes
+`Signals::SIGNALED` active until `clear()`; `wait_any` / `wait_all` can wait on
+its handle alongside Channels, Ports, and Processes.
+
+```rust
+use libcanvas::{Signal, Signals, WaitItem, wait_any};
+
+let signal = Signal::create()?;
+signal.set()?;
+let items = [WaitItem::new(signal.handle().raw(), Signals::SIGNALED, 1)];
+let ready = wait_any(&items, 0)?;
+assert_eq!(ready.satisfied()[0].key, 1);
+```
+
 ### Graphics (the framebuffer)
 
 You never get direct access to video memory. Instead:

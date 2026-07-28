@@ -377,9 +377,13 @@ priority order.
   ABI signal constants (`huesos_abi::signals::{READABLE, WRITABLE,
   CANCELED, PEER_CLOSED, SIGNALED}`) live in `huesos-abi` with a host test
   that pins their numeric layout to `huesos_waitset::Signals`.
-- **Needed (on-target)**: cancellation smoke tests (a canceled handle
-  wakes a pending waiter); explicit level-triggered signal-object type
-  (currently only Channel/Port/Process report signals via `update_waitset_signals`).
+- **Signal object landed**: append-only public ABI `SignalCreate` /
+  `SignalSet` / `SignalClear`, `ObjectType::Signal`, `libcanvas::Signal`, and
+  `WaitSetWait` `SIGNALED` support. Signal state is level-triggered: `set`
+  stays active until `clear`, and handle close wakes pending waiters so they can
+  report `CANCELED`.
+- **Immediate status**: complete. Future work is richer wait diagnostics and
+  higher-level userspace event abstractions built on `Signal`.
 
 ## Short Term
 

@@ -87,6 +87,8 @@ pub enum ObjectType {
     /// physical-address-space kind (I/O port, MMIO, IRQ). See the
     /// `Resource` docs and `docs/ARCHITECTURE_ROADMAP.md` §2.
     Resource = 10,
+    /// Level-triggered waitable signal object.
+    Signal = 11,
     /// Generic / unknown.
     Unknown = 0xFF,
 }

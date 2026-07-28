@@ -24,6 +24,7 @@ mod process;
 /// (`ResourceCreate`, `ProcessMarkCritical`). Gated on the root
 /// supervisor KOID via [`resource::set_root_supervisor_predicate`].
 pub mod resource;
+mod signal;
 mod system;
 /// Recoverable user-memory access primitives with `.ex_table` fault
 /// recovery. `pub` because the kernel's `extable_test=1` synthetic
@@ -156,5 +157,8 @@ pub fn dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> Syscal
             process::sys_process_get_affinity(a1 as HandleValue, a2 as *mut u64, a3 as *mut u64)
         }
         S::VmarCreateChild => process::sys_vmar_create_child(a1 as *const VmarCreateChildArgs),
+        S::SignalCreate => signal::sys_signal_create(a1 as *mut HandleValue),
+        S::SignalSet => signal::sys_signal_set(a1 as HandleValue),
+        S::SignalClear => signal::sys_signal_clear(a1 as HandleValue),
     }
 }

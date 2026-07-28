@@ -73,6 +73,7 @@ pub mod port;
 pub mod process;
 mod raw;
 pub mod resource;
+pub mod signal;
 pub mod system;
 pub mod vmo;
 pub mod waitset;
@@ -82,6 +83,7 @@ pub use handle::Handle;
 pub use interrupt::Interrupt;
 pub use port::Port;
 pub use process::{Process, Thread, Vmar};
+pub use signal::Signal;
 pub use vmo::Vmo;
 pub use waitset::{wait_all, wait_any, Signals, WaitItem, WaitOutcome};
 

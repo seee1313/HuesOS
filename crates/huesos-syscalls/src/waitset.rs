@@ -167,6 +167,12 @@ fn update_waitset_signals(
             }
         }
 
+        if let Some(signal) = obj.downcast_ref::<huesos_object::Signal>() {
+            if signal.is_signaled() {
+                active = active.union(Signals::SIGNALED);
+            }
+        }
+
         waitset.set_active(item.key, active);
     }
     Ok(0)
@@ -180,6 +186,8 @@ fn enqueue_waiters(objects: &[Arc<dyn huesos_object::KernelObject>], task: hueso
             port.wait_queue().enqueue(task);
         } else if let Some(process) = obj.downcast_ref::<huesos_object::Process>() {
             process.exit_waiters.enqueue(task);
+        } else if let Some(signal) = obj.downcast_ref::<huesos_object::Signal>() {
+            signal.wait_queue().enqueue(task);
         }
     }
 }
@@ -192,6 +200,8 @@ fn remove_waiters(objects: &[Arc<dyn huesos_object::KernelObject>], task: huesos
             port.wait_queue().remove(task);
         } else if let Some(process) = obj.downcast_ref::<huesos_object::Process>() {
             process.exit_waiters.remove(task);
+        } else if let Some(signal) = obj.downcast_ref::<huesos_object::Signal>() {
+            signal.wait_queue().remove(task);
         }
     }
 }

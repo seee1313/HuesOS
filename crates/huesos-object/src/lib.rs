@@ -21,6 +21,7 @@ mod port;
 mod process;
 mod registry;
 mod resource;
+mod signal;
 mod supervision;
 mod thread;
 mod vmar;
@@ -47,6 +48,7 @@ pub use registry::{
     root_job, set_cpu_id_callback, set_current_process, set_phys_to_virt, unregister_object,
 };
 pub use resource::{Resource, ResourceError, ResourceKind};
+pub use signal::Signal;
 pub use supervision::{CrashThrottle, SupervisionAction, SupervisionDecision};
 pub use thread::Thread;
 pub use vmar::{Vmar, VmarChild, VmarError, VmarMapping};
@@ -252,6 +254,19 @@ mod tests {
         assert!(parent.mapping(0x12000, 0x1000).is_none());
         assert!(parent.mapping(0x11000, 0x1000).is_some());
         assert!(parent.remove_child(child.koid()));
+    }
+
+    #[test]
+    fn signal_is_level_triggered() {
+        let signal = Signal::new();
+        assert_eq!(signal.object_type(), ObjectType::Signal);
+        assert!(!signal.is_signaled());
+        signal.set();
+        assert!(signal.is_signaled());
+        signal.set();
+        assert!(signal.is_signaled());
+        signal.clear();
+        assert!(!signal.is_signaled());
     }
 
     #[test]

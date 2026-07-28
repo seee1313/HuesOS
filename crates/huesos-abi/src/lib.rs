@@ -187,13 +187,19 @@ pub enum Syscall {
     /// Reserve a child VMAR inside an existing VMAR. `a1` points to
     /// [`VmarCreateChildArgs`].
     VmarCreateChild = 44,
+    /// Create a level-triggered signal object. `a1` is `*mut HandleValue`.
+    SignalCreate = 45,
+    /// Set a signal object. `a1` is a Signal handle with WRITE rights.
+    SignalSet = 46,
+    /// Clear a signal object. `a1` is a Signal handle with WRITE rights.
+    SignalClear = 47,
 }
 
 impl Syscall {
     /// Total number of defined syscalls (i.e. one past the highest
     /// currently-assigned number). The dispatcher uses this to reject
     /// obviously-out-of-range numbers before a `match`.
-    pub const COUNT: u64 = 45;
+    pub const COUNT: u64 = 48;
 
     /// Convert a raw syscall number back into a [`Syscall`], if valid.
     pub const fn from_raw(n: u64) -> Option<Self> {
@@ -243,6 +249,9 @@ impl Syscall {
             42 => Self::ProcessSetAffinityMask,
             43 => Self::ProcessGetAffinity,
             44 => Self::VmarCreateChild,
+            45 => Self::SignalCreate,
+            46 => Self::SignalSet,
+            47 => Self::SignalClear,
             _ => return None,
         })
     }
@@ -818,7 +827,10 @@ mod tests {
         assert_eq!(Syscall::ProcessSetAffinityMask as u64, 42);
         assert_eq!(Syscall::ProcessGetAffinity as u64, 43);
         assert_eq!(Syscall::VmarCreateChild as u64, 44);
-        assert_eq!(Syscall::COUNT, 45);
+        assert_eq!(Syscall::SignalCreate as u64, 45);
+        assert_eq!(Syscall::SignalSet as u64, 46);
+        assert_eq!(Syscall::SignalClear as u64, 47);
+        assert_eq!(Syscall::COUNT, 48);
         assert_eq!(Syscall::from_raw(28), Some(Syscall::VmoCreateEx));
         assert_eq!(Syscall::from_raw(30), Some(Syscall::VmarProtect));
         assert_eq!(Syscall::from_raw(31), Some(Syscall::ChannelPeek));
@@ -835,7 +847,10 @@ mod tests {
         assert_eq!(Syscall::from_raw(42), Some(Syscall::ProcessSetAffinityMask));
         assert_eq!(Syscall::from_raw(43), Some(Syscall::ProcessGetAffinity));
         assert_eq!(Syscall::from_raw(44), Some(Syscall::VmarCreateChild));
-        assert_eq!(Syscall::from_raw(45), None);
+        assert_eq!(Syscall::from_raw(45), Some(Syscall::SignalCreate));
+        assert_eq!(Syscall::from_raw(46), Some(Syscall::SignalSet));
+        assert_eq!(Syscall::from_raw(47), Some(Syscall::SignalClear));
+        assert_eq!(Syscall::from_raw(48), None);
     }
 
     #[test]

@@ -32,7 +32,7 @@ use huesos_lifecycle::RefAccount;
 use crate::irq_guard::IrqSafeMutex;
 use crate::{
     Channel, Interrupt, Job, KernelObject, KernelObjectExt, Koid, Port, Process, Resource,
-    ResourceError,
+    ResourceError, Signal,
 };
 
 struct RegistryState {
@@ -313,6 +313,8 @@ pub(crate) fn wake_object_waiters(koid: Koid) {
         port.wait_queue().wake_all();
     } else if let Some(process) = object.downcast_ref::<Process>() {
         process.exit_waiters.wake_all();
+    } else if let Some(signal) = object.downcast_ref::<Signal>() {
+        signal.wait_queue().wake_all();
     }
 }
 

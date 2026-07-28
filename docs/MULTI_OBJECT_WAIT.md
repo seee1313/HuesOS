@@ -74,14 +74,14 @@ and the existing object `WaitQueue`s for real blocking:
 1. The syscall snapshots the caller's handles into temporary object `Arc`s after
    validating rights and copying the user `(handle, awaited, key)` array.
 2. It computes active signals non-destructively (`Channel::peek`,
-   `Port::has_pending`, process exit state, peer-closed state) and polls the
-   `WaitSet` once before sleeping.
+   `Port::has_pending`, process exit state, level-triggered `Signal` state,
+   peer-closed state) and polls the `WaitSet` once before sleeping.
 3. If still pending, it enqueues the current scheduler task on every watched
    object's wait queue, re-checks to close the lost-wakeup window, then parks
    exactly once via `wait::park_current_until(deadline)`.
-4. Channel sends, peer-close drops, port IRQ enqueue, process exit, timeout
-   ticks, and handle close all wake the parked task; the syscall removes the
-   task from every queue before returning or re-looping.
+4. Channel sends, peer-close drops, port IRQ enqueue, process exit, `SignalSet`,
+   timeout ticks, and handle close all wake the parked task; the syscall removes
+   the task from every queue before returning or re-looping.
 5. Handle closure by another thread in the same process wakes the object's wait
    queue and the next signal snapshot reports `Signals::CANCELED` for waiters
    that requested it.
