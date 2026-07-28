@@ -262,7 +262,15 @@ priority order.
   errors are policy, not bugs.
 - Full design doc: `docs/design/ASYNC_ARCHITECTURE.md`
 
-## Immediate
+## Immediate — COMPLETE ✅
+
+**Status:** CLOSED. All four Immediate tracks are implemented in `main`:
+recoverable user copies + child/splitting VMARs, production-safe IOAPIC routing,
+`huesos-proclife`-backed process lifecycle/reaper integration, and public
+level-triggered Signal objects integrated with `WaitSetWait`.
+
+Notes remaining under this section are explicitly future-facing validation or
+next-stage expansion items; they are not blockers for the Immediate milestone.
 
 ### 1. Recoverable copies, VMAR unmap/protect, and SMEP/SMAP
 - **Current**: `VmarUnmap` and `VmarProtect` operate on exact mappings under
