@@ -47,9 +47,12 @@ raise limits.
 
 Userspace quota control is append-only in the ABI:
 
-- `JobDefault` returns a handle to the caller's current Job;
-- `JobCreate` creates a bounded child Job;
-- `JobSetLimits` replaces a Job's limits;
+- `JobDefault` returns a non-mutating discovery handle to the caller's current
+  Job (`READ`/`GET_PROPERTY`, duplicate/transfer allowed, no `WRITE` or
+  `SET_PROPERTY`);
+- `JobCreate` creates a bounded child Job only from an explicitly delegated
+  mutable parent-Job handle;
+- `JobSetLimits` replaces a Job's limits only with `SET_PROPERTY`;
 - `JobBindQuotaPort` subscribes a Port to exhaustion notifications;
 - `ProcessCreateInJob` creates a suspended process owned by an explicit Job.
 

@@ -24,7 +24,10 @@ pub(crate) fn sys_job_default(out: *mut HandleValue) -> SyscallResult {
     let job = proc.job();
     proc.handles
         .add_with_commit(
-            Handle::new(job.koid(), Rights::DEFAULT | Rights::SET_PROPERTY),
+            Handle::new(
+                job.koid(),
+                Rights::READ | Rights::GET_PROPERTY | Rights::DUPLICATE | Rights::TRANSFER,
+            ),
             |handle| user_memory::write_value(out, &handle),
         )
         .map(|_| 0)
