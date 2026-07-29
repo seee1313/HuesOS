@@ -43,15 +43,15 @@ mod waitset;
 use huesos_abi::{
     ChannelConsumeArgs, ChannelPeekArgs, ChannelReadEtcArgs, ErrorCode, FramebufferBlitArgs,
     FramebufferInfo, HandleValue, JobBindQuotaPortArgs, JobCreateArgs, JobSetLimitsArgs,
-    JobSetNameArgs, PortPacket, ProcessBindExitPortArgs, ProcessCreateInJobArgs,
+    JobSetNameArgs, PortPacket, ProcessBindExitPortArgs, ProcessCreateInJobArgs, ResourceMapArgs,
     VmarCreateChildArgs, VmarMapArgs, VmarOpArgs, WaitSetWaitArgs,
 };
 
 pub use callbacks::{
     set_clock_fn, set_cpu_mask_fn, set_current_cpu_fn, set_debug_write_fn, set_exit_fn,
-    set_process_create_fn, set_process_create_in_job_fn, set_shutdown_fn, set_thread_start_fn,
-    set_vmar_map_fn, set_vmar_protect_fn, set_vmar_unmap_fn, set_yield_fn, ProcessCreateFn,
-    ProcessCreateInJobFn, ThreadStartFn, VmarMapFn, VmarOpFn,
+    set_process_create_fn, set_process_create_in_job_fn, set_resource_map_fn, set_shutdown_fn,
+    set_thread_start_fn, set_vmar_map_fn, set_vmar_protect_fn, set_vmar_unmap_fn, set_yield_fn,
+    ProcessCreateFn, ProcessCreateInJobFn, ResourceMapFn, ThreadStartFn, VmarMapFn, VmarOpFn,
 };
 
 /// Result type for syscalls: `Ok(value)` or a negative error code.
@@ -145,6 +145,7 @@ pub fn dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> Syscal
         S::ResourceCreate => {
             resource::sys_resource_create(a1 as u32, a2, a3, a4 as u32, a5 as *mut HandleValue)
         }
+        S::ResourceMap => resource::sys_resource_map(a1 as *const ResourceMapArgs),
         S::ProcessMarkCritical => resource::sys_process_mark_critical(a1 as HandleValue),
         S::HardHalt => resource::sys_hard_halt(a1 as HandleValue),
         S::IoPortWrite8 => resource::sys_ioport_write8(a1 as HandleValue, a2 as u32, a3 as u32),

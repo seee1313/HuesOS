@@ -7,7 +7,7 @@
 //! future component_manager. See `docs/ARCHITECTURE_ROADMAP.md` §4.
 
 use crate::{raw, Handle, Result};
-use huesos_abi::{HandleValue, Syscall, INVALID_HANDLE};
+use huesos_abi::{HandleValue, ResourceMapArgs, Syscall, INVALID_HANDLE};
 
 pub use huesos_abi::ResourceKindAbi as ResourceKind;
 
@@ -35,9 +35,21 @@ impl Resource {
         Ok(Self(unsafe { Handle::from_raw(out) }))
     }
 
+    /// Adopt an already-owned handle as a generic Resource capability.
+    pub fn from_handle(handle: Handle) -> Self {
+        Self(handle)
+    }
+
     /// Access the underlying handle for transfer through a channel.
     pub fn handle(&self) -> &Handle {
         &self.0
+    }
+
+    /// Map a page-aligned subrange of this Resource into the current process's
+    /// root VMAR at a fixed address. Only `Mmio` and `DmaPool` resources are
+    /// accepted by the kernel; flags are from [`huesos_abi::vmar_flags`].
+    pub fn map_self(&self, resource_offset: u64, addr: u64, len: u64, flags: u32) -> Result<u64> {
+        map_self(self.handle(), resource_offset, addr, len, flags)
     }
 
     /// Consume `self` and yield the raw handle for transfer semantics
@@ -54,6 +66,28 @@ impl Resource {
     pub fn into_handle(self) -> Handle {
         self.0
     }
+}
+
+/// Map a page-aligned Resource subrange into this process at a fixed virtual
+/// address. Prefer [`Resource::map_self`] when the caller owns a typed wrapper;
+/// this free function is convenient for DriverHosts that keep bootstrap
+/// resources as generic [`Handle`] values.
+pub fn map_self(
+    resource: &Handle,
+    resource_offset: u64,
+    addr: u64,
+    len: u64,
+    flags: u32,
+) -> Result<u64> {
+    let args = ResourceMapArgs {
+        resource: resource.raw(),
+        resource_offset,
+        addr,
+        len,
+        flags,
+    };
+    let ret = raw::syscall1(Syscall::ResourceMap, &args as *const _ as u64);
+    raw::decode(ret).map(|mapped| mapped as u64)
 }
 
 /// Mark the target process as critical (see the kernel

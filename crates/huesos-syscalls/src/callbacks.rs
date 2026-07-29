@@ -1,7 +1,7 @@
 //! Scheduler/kernel callbacks registered by `huesos-kernel`.
 
 use alloc::sync::Arc;
-use huesos_abi::{ErrorCode, VmarMapArgs, VmarOpArgs};
+use huesos_abi::{ErrorCode, ResourceMapArgs, VmarMapArgs, VmarOpArgs};
 use spin::Mutex;
 
 /// Global yield callback (set by kernel scheduler to avoid circular deps).
@@ -38,6 +38,9 @@ pub type VmarMapFn =
     fn(&huesos_object::Vmar, &huesos_object::Vmo, VmarMapArgs) -> Result<u64, ErrorCode>;
 /// Kernel callback type used by VMAR unmap/protect operations.
 pub type VmarOpFn = fn(&huesos_object::Vmar, VmarOpArgs) -> Result<u64, ErrorCode>;
+/// Kernel callback type used to map an `Mmio`/`DmaPool` Resource into the
+/// caller's root VMAR.
+pub type ResourceMapFn = fn(&huesos_object::Resource, ResourceMapArgs) -> Result<u64, ErrorCode>;
 /// Kernel callback type used by the syscall layer to start a suspended thread.
 pub type ThreadStartFn = fn(&huesos_object::Thread, u64, u64) -> Result<u64, ErrorCode>;
 
@@ -51,6 +54,8 @@ pub(crate) static VMAR_MAP_FN: Mutex<Option<VmarMapFn>> = Mutex::new(None);
 pub(crate) static VMAR_UNMAP_FN: Mutex<Option<VmarOpFn>> = Mutex::new(None);
 /// Global VMAR-protect callback.
 pub(crate) static VMAR_PROTECT_FN: Mutex<Option<VmarOpFn>> = Mutex::new(None);
+/// Global Resource-map callback.
+pub(crate) static RESOURCE_MAP_FN: Mutex<Option<ResourceMapFn>> = Mutex::new(None);
 /// Global thread-start callback (set by the kernel scheduler/process layer).
 pub(crate) static THREAD_START_FN: Mutex<Option<ThreadStartFn>> = Mutex::new(None);
 
@@ -112,6 +117,11 @@ pub fn set_vmar_unmap_fn(f: VmarOpFn) {
 /// Set the VMAR-protect function. Called once by kernel init.
 pub fn set_vmar_protect_fn(f: VmarOpFn) {
     *VMAR_PROTECT_FN.lock() = Some(f);
+}
+
+/// Set the Resource-map function. Called once by kernel init.
+pub fn set_resource_map_fn(f: ResourceMapFn) {
+    *RESOURCE_MAP_FN.lock() = Some(f);
 }
 
 /// Set the thread-start function. Called once by kernel init.

@@ -270,13 +270,16 @@ pub enum Syscall {
     ProcessCreateInJob = 54,
     /// Set a Job diagnostic name. `a1` points to [`JobSetNameArgs`].
     JobSetName = 55,
+    /// Map an `Mmio` or `DmaPool` Resource into the caller's root VMAR at a
+    /// fixed userspace address. `a1` points to [`ResourceMapArgs`].
+    ResourceMap = 56,
 }
 
 impl Syscall {
     /// Total number of defined syscalls (i.e. one past the highest
     /// currently-assigned number). The dispatcher uses this to reject
     /// obviously-out-of-range numbers before a `match`.
-    pub const COUNT: u64 = 56;
+    pub const COUNT: u64 = 57;
 
     /// Convert a raw syscall number back into a [`Syscall`], if valid.
     pub const fn from_raw(n: u64) -> Option<Self> {
@@ -337,6 +340,7 @@ impl Syscall {
             53 => Self::JobBindQuotaPort,
             54 => Self::ProcessCreateInJob,
             55 => Self::JobSetName,
+            56 => Self::ResourceMap,
             _ => return None,
         })
     }
@@ -979,9 +983,33 @@ pub struct VmarOpArgs {
     pub flags: u32,
 }
 
+/// Arguments for [`Syscall::ResourceMap`].
+///
+/// The kernel maps a page-aligned subrange of an `Mmio` or `DmaPool` Resource
+/// into the caller's root VMAR. The mapping is fixed-address only and must use
+/// ordinary [`vmar_flags`] permissions (`USER | SPECIFIC | READ/WRITE`, never
+/// executable). The Resource handle remains the authority for the physical
+/// range; no general physical-memory mapping is exposed.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ResourceMapArgs {
+    /// Resource handle owned by the caller.
+    pub resource: HandleValue,
+    /// Offset from the Resource base. Must be page-aligned.
+    pub resource_offset: u64,
+    /// Requested destination virtual address. Must be page-aligned.
+    pub addr: u64,
+    /// Mapping length in bytes. Must be non-zero and page-aligned.
+    pub len: u64,
+    /// Mapping options/permissions from [`vmar_flags`].
+    pub flags: u32,
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{hbi_boot, rights, vmar_flags, ErrorCode, ResourceKindAbi, Syscall};
+    use super::{
+        hbi_boot, rights, vmar_flags, ErrorCode, ResourceKindAbi, ResourceMapArgs, Syscall,
+    };
 
     #[test]
     fn boot_driver_manifest_header_validates() {
@@ -1058,7 +1086,8 @@ mod tests {
         assert_eq!(Syscall::JobBindQuotaPort as u64, 53);
         assert_eq!(Syscall::ProcessCreateInJob as u64, 54);
         assert_eq!(Syscall::JobSetName as u64, 55);
-        assert_eq!(Syscall::COUNT, 56);
+        assert_eq!(Syscall::ResourceMap as u64, 56);
+        assert_eq!(Syscall::COUNT, 57);
         assert_eq!(Syscall::from_raw(28), Some(Syscall::VmoCreateEx));
         assert_eq!(Syscall::from_raw(30), Some(Syscall::VmarProtect));
         assert_eq!(Syscall::from_raw(31), Some(Syscall::ChannelPeek));
@@ -1089,7 +1118,21 @@ mod tests {
         assert_eq!(Syscall::from_raw(53), Some(Syscall::JobBindQuotaPort));
         assert_eq!(Syscall::from_raw(54), Some(Syscall::ProcessCreateInJob));
         assert_eq!(Syscall::from_raw(55), Some(Syscall::JobSetName));
-        assert_eq!(Syscall::from_raw(56), None);
+        assert_eq!(Syscall::from_raw(56), Some(Syscall::ResourceMap));
+        assert_eq!(Syscall::from_raw(57), None);
+    }
+
+    #[test]
+    fn resource_map_args_layout_smoke() {
+        let args = ResourceMapArgs {
+            resource: 7,
+            resource_offset: 0x1000,
+            addr: 0x7000_0000_0000,
+            len: 0x2000,
+            flags: vmar_flags::USER | vmar_flags::SPECIFIC | vmar_flags::READ,
+        };
+        assert_eq!(args.resource, 7);
+        assert_eq!(args.len, 0x2000);
     }
 
     #[test]

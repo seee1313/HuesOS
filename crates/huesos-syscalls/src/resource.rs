@@ -10,12 +10,13 @@
 //! Zircon model where a resource handle *is* the capability. See
 //! `docs/ARCHITECTURE_ROADMAP.md` §2 and §3 for the design.
 
-use huesos_abi::{ErrorCode, HandleValue, ResourceKindAbi};
+use huesos_abi::{vmar_flags, ErrorCode, HandleValue, ResourceKindAbi, ResourceMapArgs};
 use huesos_object::{
     current_process, unregister_object, Handle, KernelObject, KernelObjectExt, Process, Resource,
     ResourceError, ResourceKind, Rights,
 };
 
+use crate::callbacks::RESOURCE_MAP_FN;
 use crate::user_memory;
 use crate::SyscallResult;
 
@@ -111,6 +112,29 @@ pub(crate) fn sys_resource_create(
             Err(error)
         }
     }
+}
+
+pub(crate) fn sys_resource_map(args_ptr: *const ResourceMapArgs) -> SyscallResult {
+    let args = user_memory::read_value(args_ptr)?;
+    let caller = current_process().ok_or(ErrorCode::AccessDenied)?;
+    let handle = caller
+        .handles
+        .get(args.resource)
+        .ok_or(ErrorCode::BadHandle)?;
+    let required = if args.flags & vmar_flags::WRITE != 0 {
+        Rights::READ | Rights::WRITE
+    } else {
+        Rights::READ
+    };
+    if !handle.has_rights(required) {
+        return Err(ErrorCode::AccessDenied);
+    }
+    let object = huesos_object::lookup_object(handle.koid).ok_or(ErrorCode::BadHandle)?;
+    let resource = object
+        .downcast_ref::<Resource>()
+        .ok_or(ErrorCode::WrongType)?;
+    let map = (*RESOURCE_MAP_FN.lock()).ok_or(ErrorCode::NotSupported)?;
+    map(resource, args).map(|addr| addr as i64)
 }
 
 pub(crate) fn sys_process_mark_critical(process_handle: HandleValue) -> SyscallResult {

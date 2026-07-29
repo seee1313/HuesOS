@@ -4,13 +4,13 @@
 use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use huesos_abi::{vmar_flags, ErrorCode, VmarMapArgs, VmarOpArgs};
+use huesos_abi::{vmar_flags, ErrorCode, ResourceMapArgs, VmarMapArgs, VmarOpArgs};
 use huesos_arch::gdt;
 use huesos_arch::paging::{flags, AddressSpace, UserPageError};
 use huesos_arch::{LockRank, RankedIrqSafeTicketLock};
 use huesos_elf::{Loader, SegmentFlags};
 use huesos_object::{KernelObject, KernelObjectExt};
-use huesos_object::{Process, Vmar, VmarError, VmarMapping};
+use huesos_object::{Process, Resource, ResourceKind, Vmar, VmarError, VmarMapping};
 use x86_64::structures::paging::{Page, PageTableFlags, PhysFrame, Size4KiB};
 use x86_64::{PhysAddr, VirtAddr};
 
@@ -273,6 +273,140 @@ pub fn map_vmo_into_vmar(
     }
 
     Ok(args.addr)
+}
+
+/// Map a page-aligned `Mmio` or `DmaPool` Resource into the caller's root VMAR.
+///
+/// This is the hardware-driver escape hatch for Stage B: authority comes from a
+/// Resource handle, the mapping is fixed-address and user-accessible, and only
+/// the resource's own half-open physical range may be exposed. No arbitrary
+/// physical memory mapping is available.
+pub fn map_resource_into_current(
+    resource: &Resource,
+    args: ResourceMapArgs,
+) -> Result<u64, ErrorCode> {
+    validate_resource_map_args(resource, args)?;
+    let process = huesos_object::current_process().ok_or(ErrorCode::AccessDenied)?;
+    let _memory_guard = process.user_memory_lock.lock();
+    let _mutation_guard = VMAR_MUTATION_LOCK.lock();
+
+    let mut runtime_guard = process.address_space.lock();
+    let runtime = runtime_guard
+        .as_mut()
+        .and_then(|runtime| runtime.downcast_mut::<ProcessRuntime>())
+        .ok_or(ErrorCode::BadHandle)?;
+    let root_vmar = Arc::clone(&runtime.root_vmar);
+    if root_vmar.process() != process.koid() {
+        return Err(ErrorCode::AccessDenied);
+    }
+    if root_vmar.overlaps_existing(args.addr, args.len) {
+        return Err(ErrorCode::Busy);
+    }
+
+    let phys_base = resource
+        .base()
+        .checked_add(args.resource_offset)
+        .ok_or(ErrorCode::InvalidArgs)?;
+    let page_flags = resource_page_flags(resource.kind(), args.flags)?;
+    let mapping = VmarMapping {
+        base: args.addr,
+        size: args.len,
+        vmo: resource.koid(),
+        vmo_offset: args.resource_offset,
+        flags: args.flags,
+    };
+    let _resource_ref =
+        huesos_object::acquire_kernel_ref(resource.koid()).ok_or(ErrorCode::BadHandle)?;
+    if let Err(error) = root_vmar.record_mapping(mapping) {
+        huesos_object::note_kernel_ref_close(resource.koid());
+        return Err(match error {
+            VmarError::InvalidRange => ErrorCode::InvalidArgs,
+            VmarError::Overlap => ErrorCode::Busy,
+        });
+    }
+
+    let address_space = runtime.address_space_mut().ok_or(ErrorCode::BadHandle)?;
+    let page_count = (args.len / PAGE_SIZE) as usize;
+    let mut mapped_pages = 0usize;
+    let map_result = (|| -> Result<(), ErrorCode> {
+        for index in 0..page_count {
+            let virt = args.addr + index as u64 * PAGE_SIZE;
+            let phys = phys_base + index as u64 * PAGE_SIZE;
+            let page = Page::<Size4KiB>::containing_address(VirtAddr::new(virt));
+            let frame = PhysFrame::<Size4KiB>::containing_address(PhysAddr::new(phys));
+            address_space
+                .try_map_user_page(page, frame, page_flags)
+                .map_err(|error| match error {
+                    huesos_arch::paging::UserPageError::OutOfMemory => ErrorCode::NoMemory,
+                    huesos_arch::paging::UserPageError::NotInitialized => ErrorCode::Internal,
+                    huesos_arch::paging::UserPageError::AlreadyMapped => ErrorCode::Busy,
+                    huesos_arch::paging::UserPageError::ParentHugePage
+                    | huesos_arch::paging::UserPageError::NotMapped
+                    | huesos_arch::paging::UserPageError::InvalidFrameAddress => {
+                        ErrorCode::InvalidArgs
+                    }
+                })?;
+            mapped_pages += 1;
+        }
+        Ok(())
+    })();
+
+    if let Err(error) = map_result {
+        for index in (0..mapped_pages).rev() {
+            let page = Page::<Size4KiB>::containing_address(VirtAddr::new(
+                args.addr + index as u64 * PAGE_SIZE,
+            ));
+            let _ = address_space.unmap_user_page(page);
+        }
+        let removed = root_vmar.remove_mapping(mapping);
+        debug_assert!(removed, "resource VMAR rollback lost its reservation");
+        huesos_object::note_kernel_ref_close(resource.koid());
+        return Err(error);
+    }
+
+    huesos_arch::paging::shootdown_range(
+        args.addr,
+        args.addr + args.len,
+        crate::scheduler::online_remote_cpu_count(),
+    );
+    Ok(args.addr)
+}
+
+fn validate_resource_map_args(resource: &Resource, args: ResourceMapArgs) -> Result<(), ErrorCode> {
+    if args.len == 0
+        || !args.addr.is_multiple_of(PAGE_SIZE)
+        || !args.len.is_multiple_of(PAGE_SIZE)
+        || !args.resource_offset.is_multiple_of(PAGE_SIZE)
+    {
+        return Err(ErrorCode::InvalidArgs);
+    }
+    if args.flags & !ALL_VMAR_FLAGS != 0
+        || args.flags & vmar_flags::USER == 0
+        || args.flags & vmar_flags::SPECIFIC == 0
+        || args.flags & (vmar_flags::READ | vmar_flags::WRITE) == 0
+        || args.flags & vmar_flags::EXECUTE != 0
+    {
+        return Err(ErrorCode::InvalidArgs);
+    }
+    if !matches!(resource.kind(), ResourceKind::Mmio | ResourceKind::DmaPool) {
+        return Err(ErrorCode::WrongType);
+    }
+    let phys = resource
+        .base()
+        .checked_add(args.resource_offset)
+        .ok_or(ErrorCode::InvalidArgs)?;
+    if !resource.contains(resource.kind(), phys, args.len) {
+        return Err(ErrorCode::AccessDenied);
+    }
+    Ok(())
+}
+
+fn resource_page_flags(kind: ResourceKind, flags: u32) -> Result<PageTableFlags, ErrorCode> {
+    let mut pt_flags = page_flags_from_vmar_flags(flags)?;
+    if matches!(kind, ResourceKind::Mmio) {
+        pt_flags |= PageTableFlags::NO_CACHE;
+    }
+    Ok(pt_flags)
 }
 
 fn validate_vmar_map_args(
