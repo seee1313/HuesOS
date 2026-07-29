@@ -461,13 +461,16 @@ next-stage expansion items; they are not blockers for the Immediate milestone.
   encryption/integrity rules, Hxblob relationship, and read-only prototype
   scope. `crates/huesos-hxfs` implements the read-only parser over a `BlockReader`
   trait, validates metadata CRC32C, parses superblock/checkpoint/volume/object
-  tables, resolves paths, and reads regular files by extents in host tests.
-- **Needed**: on-target NVMe/SSD data-path soak, Hxfs BlockDevice adapter/service
-  integration, then Stage H write/COW work. A future performance slice can
-  replace the current synchronous service execution with deeper async queue-slot
-  tracking, but Stage C's public Channel+Port service contract, Stage D's Volume
-  handles, Stage E's BlobFS read path, Stage F's DevFS handle namespace, and
-  Stage G's Hxfs read-only parser are now present.
+  tables, resolves paths, and reads regular files by extents in host tests. A
+  separate `hxfs-service` userspace process now mounts the VolumeManager
+  filesystem-candidate BlockDevice and exposes directory/file handles over
+  async channels.
+- **Needed**: on-target NVMe/SSD data-path soak and then Stage H write/COW work.
+  A future performance slice can replace the current synchronous service
+  execution with deeper async queue-slot tracking, but Stage C's public
+  Channel+Port service contract, Stage D's Volume handles, Stage E's BlobFS read
+  path, Stage F's DevFS handle namespace, and Stage G's Hxfs read-only service
+  path are now present.
 - **PS/2 driver ownership (fully migrated as of PR-E)**: the scancode
   decoder, shift-state machine, and key-event dispatch live only in the
   userspace `driver-host:input` process. The kernel keeps a

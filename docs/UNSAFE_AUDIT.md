@@ -13,8 +13,8 @@ are intentionally not treated as the versioned project baseline unless they are
 copied into `docs/` in a dedicated review. The versioned baseline remains this
 file plus `safety-budget.json`.
 
-At the current baseline (`safety-budget.json`) the repository contains 183
-first-party Rust files and 51,510 Rust lines. The measured surface is **265**
+At the current baseline (`safety-budget.json`) the repository contains 185
+first-party Rust files and 52,511 Rust lines. The measured surface is **265**
 unsafe blocks, **63** unsafe functions, **29** unsafe impls, one `static mut`,
 **25** unwrap calls, **21** expect calls, and **5** panic macros. Prior baseline
 values are retained in the changelog sections below so that any deviation
@@ -2312,6 +2312,31 @@ identify the policy and then rejected because key handling is outside Stage G.
 No unsafe Rust is introduced. The crate is `no_std`, uses caller-provided output
 buffers for reads, and uses a byte-slice `BlockReader` only as a host-test
 adapter.
+
+### Safety-budget delta (measured)
+
+```
+unsafe_blocks:    265 -> 265 (unchanged).
+unsafe_functions:  63 ->  63 (unchanged).
+unsafe_impls:      29 ->  29 (unchanged).
+static_mut:         1 ->   1 (unchanged).
+unwrap_calls:      25 ->  25 (unchanged).
+expect_calls:      21 ->  21 (unchanged).
+panic_macros:       5 ->   5 (unchanged).
+```
+
+## Hxfs userspace read-only service integration (safety-budget-neutral)
+
+The Hxfs Stage-G parser is now wired into a separate `hxfs-service` userspace
+process. DriverManager launches it from BOOTFS, passes the VolumeManager
+filesystem-candidate BlockDevice channel, and proxies `open:hxfs` clients to the
+service after it reports `service:hxfs:ready`. The service exposes directory and
+file handles as channels and supports root/open/list/read operations for the
+read-only prototype.
+
+No new unsafe Rust is introduced. This is handle routing, fixed-capacity client
+and endpoint tables, and the existing safe Hxfs `BlockReader` abstraction backed
+by `libcanvas::block::BlockDevice`.
 
 ### Safety-budget delta (measured)
 
