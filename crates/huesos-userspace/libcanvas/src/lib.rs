@@ -68,6 +68,7 @@ mod font8x8;
 pub mod framebuffer;
 pub mod handle;
 pub mod interrupt;
+pub mod job;
 pub mod manifest;
 pub mod port;
 pub mod process;
@@ -81,6 +82,7 @@ pub mod waitset;
 pub use channel::Channel;
 pub use handle::Handle;
 pub use interrupt::Interrupt;
+pub use job::{Job, JobLimits};
 pub use port::Port;
 pub use process::{Process, Thread, Vmar};
 pub use signal::Signal;
@@ -92,7 +94,7 @@ pub use waitset::{wait_all, wait_any, Signals, WaitItem, WaitOutcome};
 pub use huesos_abi::{
     fault_exit, rights, scheduler_flags, signals, vmar_flags, wait_mode, ErrorCode, PortPacket,
     BOOTSTRAP_HANDLE, INIT_BOOTFS_HANDLE, PORT_PACKET_INTERRUPT, PORT_PACKET_PROCESS_EXIT,
-    USER_STACK_SIZE, USER_STACK_TOP,
+    PORT_PACKET_QUOTA_EXHAUSTED, USER_STACK_SIZE, USER_STACK_TOP,
 };
 
 /// Result type used throughout `libcanvas`: every fallible syscall wrapper

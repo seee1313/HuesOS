@@ -39,27 +39,28 @@ owning Job before frames are allocated and released from the same Job on VMO
 Drop. The root Job remains unlimited by default, preserving the existing MVP
 behavior.
 
-CPU tick accounting is now charged from the scheduler to the owning Job. The
-current MVP records budget exhaustion but does not yet throttle or terminate a
-process because the supervisor policy is not finalized.
+CPU tick accounting is charged from the scheduler to the owning Job. When a
+Job charge fails, the kernel does not kill the process automatically; it queues a
+`PORT_PACKET_QUOTA_EXHAUSTED` packet to every Port bound with
+`JobBindQuotaPort`. Supervisors can decide whether to throttle, terminate, or
+raise limits.
 
-Handle-count and page-table accounting are still outstanding. Until those
-charges are integrated, queue, VMO, and CPU accounting are active but the
-complete system-wide resource budget is not yet enforced.
+Userspace quota control is append-only in the ABI:
+
+- `JobDefault` returns a handle to the caller's current Job;
+- `JobCreate` creates a bounded child Job;
+- `JobSetLimits` replaces a Job's limits;
+- `JobBindQuotaPort` subscribes a Port to exhaustion notifications;
+- `ProcessCreateInJob` creates a suspended process owned by an explicit Job.
+
+The active enforcement points are VMO frame allocation, scheduler CPU ticks, and
+bounded Channel/Port queues. Finer-grained classes such as page-table metadata
+and per-process handle-table hard caps can be added as separate counters without
+changing the Job hierarchy API.
 
 ## Required privileged integration
 
-Before exposing user-configurable quotas, the kernel must:
-
-- attach every Process to a Job node;
-- charge VMO physical frames and address-space mappings;
-- charge process and in-flight handle references;
-- charge CPU time from scheduler accounting;
-- release charges only after the corresponding object/task lifecycle reaches a
-  terminal state;
-- make charge/release operations atomic with object registry and reaper state;
-- add QEMU SMP tests for concurrent charge, release, and process exit.
-
 The policy crate's host tests cover flat quotas, parent/child budgets, sibling
-sharing, release, saturation, and invalid/cross-tree node rejection. They do
-not prove the privileged integration.
+sharing, release, saturation, and invalid/cross-tree node rejection. Privileged
+integration must continue to be validated by QEMU/SMP stress tests for
+concurrent charge, release, process exit, and quota-port delivery.

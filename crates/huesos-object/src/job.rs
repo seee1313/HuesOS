@@ -5,8 +5,16 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use core::any::Any;
 
-use crate::{alloc_koid, KernelObject, Koid, ObjectType};
+use crate::{alloc_koid, KernelObject, Koid, ObjectType, Port, PortPacket};
 use huesos_quota::{Limits, QuotaTree, QuotaTreeError, Resource, Usage};
+
+const PORT_PACKET_QUOTA_EXHAUSTED: u32 = 3;
+const MAX_QUOTA_PORTS: usize = 8;
+
+struct QuotaPortBinding {
+    port: Arc<Port>,
+    key: u64,
+}
 
 /// Failure while creating a child Job.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -22,6 +30,7 @@ pub struct Job {
     parent: Option<Arc<Job>>,
     quota_tree: Arc<IrqSafeMutex<QuotaTree>>,
     quota_node: huesos_quota::NodeId,
+    quota_ports: IrqSafeMutex<alloc::vec::Vec<QuotaPortBinding>>,
 }
 
 impl Job {
@@ -40,6 +49,7 @@ impl Job {
             parent: None,
             quota_tree: Arc::new(IrqSafeMutex::new(tree)),
             quota_node: node,
+            quota_ports: IrqSafeMutex::new(alloc::vec::Vec::new()),
         })
     }
 
@@ -56,6 +66,7 @@ impl Job {
             parent: Some(Arc::clone(parent)),
             quota_tree: Arc::clone(&parent.quota_tree),
             quota_node: node,
+            quota_ports: IrqSafeMutex::new(alloc::vec::Vec::new()),
         }))
     }
 
@@ -76,9 +87,14 @@ impl Job {
 
     /// Try to charge a resource to this Job and all ancestor limits.
     pub fn charge(&self, resource: Resource, amount: u64) -> bool {
-        self.quota_tree
+        let charged = self
+            .quota_tree
             .lock()
-            .try_acquire(self.quota_node, resource, amount)
+            .try_acquire(self.quota_node, resource, amount);
+        if !charged {
+            self.notify_quota_exhausted(resource, amount);
+        }
+        charged
     }
 
     /// Release a previously charged resource.
@@ -86,6 +102,44 @@ impl Job {
         self.quota_tree
             .lock()
             .release(self.quota_node, resource, amount)
+    }
+
+    /// Current limits for this Job node.
+    pub fn limits(&self) -> Result<Limits, QuotaTreeError> {
+        self.quota_tree.lock().limits(self.quota_node)
+    }
+
+    /// Replace limits for this Job node.
+    pub fn set_limits(&self, limits: Limits) -> bool {
+        self.quota_tree.lock().set_limits(self.quota_node, limits)
+    }
+
+    /// Bind a Port to receive quota-exhaustion packets for this Job.
+    pub fn bind_quota_port(&self, port: Arc<Port>, key: u64) -> bool {
+        let mut ports = self.quota_ports.lock();
+        if ports.len() >= MAX_QUOTA_PORTS || ports.try_reserve_exact(1).is_err() {
+            return false;
+        }
+        ports.push(QuotaPortBinding { port, key });
+        true
+    }
+
+    /// Notify observers that a charge failed.
+    pub fn notify_quota_exhausted(&self, resource: Resource, amount: u64) {
+        let resource_id = match resource {
+            Resource::Memory => 0,
+            Resource::Handles => 1,
+            Resource::CpuTicks => 2,
+        };
+        let ports = self.quota_ports.lock();
+        for binding in ports.iter() {
+            let _ = binding.port.queue(PortPacket {
+                key: binding.key,
+                packet_type: PORT_PACKET_QUOTA_EXHAUSTED,
+                status: 0,
+                data: [self.koid.0, resource_id, amount, 0],
+            });
+        }
     }
 
     /// Usage charged directly to this Job node.
@@ -150,6 +204,31 @@ mod tests {
         assert!(root.charge(Resource::CpuTicks, 1));
         assert!(!root.charge(Resource::CpuTicks, 1));
         assert_eq!(root.usage().map(|usage| usage.cpu_ticks), Ok(1));
+    }
+
+    #[test]
+    fn quota_exhaustion_queues_bound_port_packet() {
+        let job = Job::root_with_limits(Limits {
+            max_memory: 1,
+            max_handles: huesos_quota::UNLIMITED,
+            max_cpu_ticks: huesos_quota::UNLIMITED,
+        });
+        let port = match Port::new() {
+            Ok(port) => port,
+            Err(_) => return,
+        };
+        assert!(job.bind_quota_port(port.clone(), 7));
+        assert!(job.charge(Resource::Memory, 1));
+        assert!(!job.charge(Resource::Memory, 1));
+        let packet = port.read();
+        assert!(packet.is_some(), "exhaustion should queue a packet");
+        if let Some(packet) = packet {
+            assert_eq!(packet.key, 7);
+            assert_eq!(packet.packet_type, PORT_PACKET_QUOTA_EXHAUSTED);
+            assert_eq!(packet.data[0], job.koid().0);
+            assert_eq!(packet.data[1], 0);
+            assert_eq!(packet.data[2], 1);
+        }
     }
 
     #[test]

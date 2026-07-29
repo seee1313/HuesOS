@@ -199,13 +199,25 @@ pub enum Syscall {
     /// Set scheduler flags on a process before its initial thread starts.
     /// `a1` is a process handle, `a2` is a [`scheduler_flags`] mask.
     ProcessSetSchedulerFlags = 49,
+    /// Return a handle to the caller's current Job. `a1=*mut HandleValue`.
+    JobDefault = 50,
+    /// Create a child Job. `a1` points to [`JobCreateArgs`].
+    JobCreate = 51,
+    /// Replace a Job's limits. `a1` points to [`JobSetLimitsArgs`].
+    JobSetLimits = 52,
+    /// Bind a Port for quota-exhaustion packets. `a1` points to
+    /// [`JobBindQuotaPortArgs`].
+    JobBindQuotaPort = 53,
+    /// Create a process inside an explicit Job. `a1` points to
+    /// [`ProcessCreateInJobArgs`].
+    ProcessCreateInJob = 54,
 }
 
 impl Syscall {
     /// Total number of defined syscalls (i.e. one past the highest
     /// currently-assigned number). The dispatcher uses this to reject
     /// obviously-out-of-range numbers before a `match`.
-    pub const COUNT: u64 = 50;
+    pub const COUNT: u64 = 55;
 
     /// Convert a raw syscall number back into a [`Syscall`], if valid.
     pub const fn from_raw(n: u64) -> Option<Self> {
@@ -260,6 +272,11 @@ impl Syscall {
             47 => Self::SignalClear,
             48 => Self::ProcessBindExitPort,
             49 => Self::ProcessSetSchedulerFlags,
+            50 => Self::JobDefault,
+            51 => Self::JobCreate,
+            52 => Self::JobSetLimits,
+            53 => Self::JobBindQuotaPort,
+            54 => Self::ProcessCreateInJob,
             _ => return None,
         })
     }
@@ -729,6 +746,8 @@ pub struct WaitSetWaitArgs {
 pub const PORT_PACKET_INTERRUPT: u32 = 1;
 /// Port packet type for process-exit notifications.
 pub const PORT_PACKET_PROCESS_EXIT: u32 = 2;
+/// Port packet type for quota-exhaustion notifications.
+pub const PORT_PACKET_QUOTA_EXHAUSTED: u32 = 3;
 
 /// Fixed-size event packet returned by [`Syscall::PortRead`].
 #[repr(C)]
@@ -743,6 +762,70 @@ pub struct PortPacket {
     pub status: i32,
     /// Source-specific payload words.
     pub data: [u64; 4],
+}
+
+/// Job quota limits for public Job syscalls. `u64::MAX` means unlimited.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct JobLimitsAbi {
+    /// Maximum charged memory bytes.
+    pub max_memory: u64,
+    /// Maximum live handles.
+    pub max_handles: u64,
+    /// Maximum charged CPU ticks.
+    pub max_cpu_ticks: u64,
+}
+
+/// Arguments for [`Syscall::JobCreate`].
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct JobCreateArgs {
+    /// Parent Job handle.
+    pub parent: HandleValue,
+    /// Limits for the child Job.
+    pub limits: JobLimitsAbi,
+    /// Output child Job handle.
+    pub out_job: *mut HandleValue,
+}
+
+/// Arguments for [`Syscall::JobSetLimits`].
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct JobSetLimitsArgs {
+    /// Job handle.
+    pub job: HandleValue,
+    /// Replacement limits.
+    pub limits: JobLimitsAbi,
+}
+
+/// Arguments for [`Syscall::JobBindQuotaPort`].
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct JobBindQuotaPortArgs {
+    /// Job handle to observe.
+    pub job: HandleValue,
+    /// Port handle receiving quota packets.
+    pub port: HandleValue,
+    /// User key copied into queued packets.
+    pub key: u64,
+    /// Reserved for future flags. Must be zero.
+    pub flags: u32,
+}
+
+/// Arguments for [`Syscall::ProcessCreateInJob`].
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ProcessCreateInJobArgs {
+    /// Job handle that will own the process.
+    pub job: HandleValue,
+    /// Pointer to process name bytes.
+    pub name: *const u8,
+    /// Name length.
+    pub name_len: u64,
+    /// Output process handle.
+    pub out_process: *mut HandleValue,
+    /// Output root VMAR handle.
+    pub out_root_vmar: *mut HandleValue,
 }
 
 /// Arguments for [`Syscall::ProcessBindExitPort`].
@@ -863,7 +946,12 @@ mod tests {
         assert_eq!(Syscall::SignalClear as u64, 47);
         assert_eq!(Syscall::ProcessBindExitPort as u64, 48);
         assert_eq!(Syscall::ProcessSetSchedulerFlags as u64, 49);
-        assert_eq!(Syscall::COUNT, 50);
+        assert_eq!(Syscall::JobDefault as u64, 50);
+        assert_eq!(Syscall::JobCreate as u64, 51);
+        assert_eq!(Syscall::JobSetLimits as u64, 52);
+        assert_eq!(Syscall::JobBindQuotaPort as u64, 53);
+        assert_eq!(Syscall::ProcessCreateInJob as u64, 54);
+        assert_eq!(Syscall::COUNT, 55);
         assert_eq!(Syscall::from_raw(28), Some(Syscall::VmoCreateEx));
         assert_eq!(Syscall::from_raw(30), Some(Syscall::VmarProtect));
         assert_eq!(Syscall::from_raw(31), Some(Syscall::ChannelPeek));
@@ -888,7 +976,12 @@ mod tests {
             Syscall::from_raw(49),
             Some(Syscall::ProcessSetSchedulerFlags)
         );
-        assert_eq!(Syscall::from_raw(50), None);
+        assert_eq!(Syscall::from_raw(50), Some(Syscall::JobDefault));
+        assert_eq!(Syscall::from_raw(51), Some(Syscall::JobCreate));
+        assert_eq!(Syscall::from_raw(52), Some(Syscall::JobSetLimits));
+        assert_eq!(Syscall::from_raw(53), Some(Syscall::JobBindQuotaPort));
+        assert_eq!(Syscall::from_raw(54), Some(Syscall::ProcessCreateInJob));
+        assert_eq!(Syscall::from_raw(55), None);
     }
 
     #[test]

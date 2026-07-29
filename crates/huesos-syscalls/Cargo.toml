@@ -13,6 +13,7 @@ huesos-fb = { path = "../huesos-fb" }
 hues-async = { path = "../hues-async" }
 huesos-waitset = { path = "../huesos-waitset" }
 huesos-handlemove = { path = "../huesos-handlemove" }
+huesos-quota = { path = "../huesos-quota" }
 bitflags = { workspace = true }
 spin = { workspace = true }
 log = { workspace = true }

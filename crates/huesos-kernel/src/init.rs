@@ -117,6 +117,7 @@ pub fn syscall_init() {
     huesos_syscalls::set_current_cpu_fn(crate::scheduler::current_cpu_index);
     huesos_syscalls::set_shutdown_fn(crate::shutdown::request);
     huesos_syscalls::set_process_create_fn(crate::process::create_suspended_process);
+    huesos_syscalls::set_process_create_in_job_fn(crate::process::create_suspended_process_in_job);
     // Gate the Resource / ProcessMarkCritical syscalls on the root
     // userspace supervisor KOID (currently init; a future component_manager
     // will replace it). See docs/ARCHITECTURE_ROADMAP.md §4.

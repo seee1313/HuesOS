@@ -497,15 +497,22 @@ next-stage expansion items; they are not blockers for the Immediate milestone.
 
 ## Medium Term
 
-### 8. Capabilities & resource quotas
+### 8. Capabilities & resource quotas — COMPLETE ✅
 - **Current**: `Job` owns a shared hierarchical quota tree, Processes attach to
-  Jobs, VMO physical-frame allocation is charged/released, and bounded
-  Channel/Port queues use local quota admission (see [QUOTAS.md](QUOTAS.md)).
-- **Current**: scheduler CPU ticks are charged to the owning Job; exhaustion is
-  recorded but not yet converted into throttling or termination.
-- **Needed**: charge handle references and page-table mappings, expose
-  controlled child-Job creation, define exhaustion supervision, and verify
-  release during SMP teardown.
+  Jobs, VMO physical-frame allocation is charged/released, scheduler CPU ticks
+  are charged to the owning Job, and bounded Channel/Port queues use local quota
+  admission (see [QUOTAS.md](QUOTAS.md)).
+- **Public Job API landed**: append-only `JobDefault`, `JobCreate`,
+  `JobSetLimits`, `JobBindQuotaPort`, and `ProcessCreateInJob` expose controlled
+  child-Job creation, per-Job limit replacement, and process creation inside a
+  selected child Job.
+- **Exhaustion supervision landed**: failed Job charges queue
+  `PORT_PACKET_QUOTA_EXHAUSTED` to bound supervisor Ports instead of killing the
+  process automatically. Packet payload carries `(job_koid, resource_id,
+  attempted_amount)`.
+- **Medium-Term #8 status**: complete for active quota resources. Future work is
+  finer-grained accounting classes (for example separate page-table metadata
+  counters) and QEMU/SMP stress coverage for charge/release races.
 
 ### 9. Networking
 - virtio-net driver + a userspace TCP/IP stack.

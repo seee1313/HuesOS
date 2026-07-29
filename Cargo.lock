@@ -211,6 +211,7 @@ dependencies = [
  "huesos-fb",
  "huesos-handlemove",
  "huesos-object",
+ "huesos-quota",
  "huesos-waitset",
  "log",
  "spin",

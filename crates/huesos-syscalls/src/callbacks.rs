@@ -27,6 +27,12 @@ pub(crate) static SHUTDOWN_FN: Mutex<Option<ShutdownFn>> = Mutex::new(None);
 /// Kernel callback type used by the syscall layer to create a suspended process.
 pub type ProcessCreateFn =
     fn(&str) -> Result<(Arc<huesos_object::Process>, Arc<huesos_object::Vmar>), ErrorCode>;
+/// Kernel callback type used to create a suspended process in an explicit Job.
+pub type ProcessCreateInJobFn =
+    fn(
+        &str,
+        Arc<huesos_object::Job>,
+    ) -> Result<(Arc<huesos_object::Process>, Arc<huesos_object::Vmar>), ErrorCode>;
 /// Kernel callback type used by the syscall layer to map a VMO into a VMAR.
 pub type VmarMapFn =
     fn(&huesos_object::Vmar, &huesos_object::Vmo, VmarMapArgs) -> Result<u64, ErrorCode>;
@@ -37,6 +43,8 @@ pub type ThreadStartFn = fn(&huesos_object::Thread, u64, u64) -> Result<u64, Err
 
 /// Global process-create callback (set by the kernel process layer).
 pub(crate) static PROCESS_CREATE_FN: Mutex<Option<ProcessCreateFn>> = Mutex::new(None);
+/// Global explicit-job process-create callback.
+pub(crate) static PROCESS_CREATE_IN_JOB_FN: Mutex<Option<ProcessCreateInJobFn>> = Mutex::new(None);
 /// Global VMAR-map callback (set by the kernel process layer).
 pub(crate) static VMAR_MAP_FN: Mutex<Option<VmarMapFn>> = Mutex::new(None);
 /// Global VMAR-unmap callback.
@@ -84,6 +92,11 @@ pub fn set_shutdown_fn(f: ShutdownFn) {
 /// Set the process-create function. Called once by kernel init.
 pub fn set_process_create_fn(f: ProcessCreateFn) {
     *PROCESS_CREATE_FN.lock() = Some(f);
+}
+
+/// Set the explicit-job process-create function. Called once by kernel init.
+pub fn set_process_create_in_job_fn(f: ProcessCreateInJobFn) {
+    *PROCESS_CREATE_IN_JOB_FN.lock() = Some(f);
 }
 
 /// Set the VMAR-map function. Called once by kernel init.

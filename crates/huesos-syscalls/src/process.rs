@@ -1,15 +1,15 @@
 //! Process/thread/VMAR launch syscalls plus yield/exit.
 
 use huesos_abi::{
-    ErrorCode, HandleValue, ProcessBindExitPortArgs, VmarCreateChildArgs, VmarMapArgs, VmarOpArgs,
-    BOOTSTRAP_HANDLE,
+    ErrorCode, HandleValue, ProcessBindExitPortArgs, ProcessCreateInJobArgs, VmarCreateChildArgs,
+    VmarMapArgs, VmarOpArgs, BOOTSTRAP_HANDLE,
 };
 use huesos_object::{Handle, KernelObject, KernelObjectExt, Rights};
 
 use crate::{
     callbacks::{
-        EXIT_FN, PROCESS_CREATE_FN, THREAD_START_FN, VMAR_MAP_FN, VMAR_PROTECT_FN, VMAR_UNMAP_FN,
-        YIELD_FN,
+        EXIT_FN, PROCESS_CREATE_FN, PROCESS_CREATE_IN_JOB_FN, THREAD_START_FN, VMAR_MAP_FN,
+        VMAR_PROTECT_FN, VMAR_UNMAP_FN, YIELD_FN,
     },
     user_memory,
     util::{current_proc, DeferGuard},
@@ -95,6 +95,52 @@ fn validate_affinity(mask: u64, home_cpu: usize) -> Result<(), ErrorCode> {
         return Err(ErrorCode::InvalidArgs);
     }
     Ok(())
+}
+
+pub(crate) fn sys_process_create_in_job(args_ptr: *const ProcessCreateInJobArgs) -> SyscallResult {
+    let args = user_memory::read_value(args_ptr)?;
+    if args.name_len as usize > MAX_PROCESS_NAME_LEN || args.out_process == args.out_root_vmar {
+        return Err(ErrorCode::InvalidArgs);
+    }
+    user_memory::validate_write(args.out_process)?;
+    user_memory::validate_write(args.out_root_vmar)?;
+    let proc = current_proc()?;
+    let job_handle = proc.handles.get(args.job).ok_or(ErrorCode::BadHandle)?;
+    if !job_handle.has_rights(Rights::WRITE) {
+        return Err(ErrorCode::AccessDenied);
+    }
+    let job_obj = huesos_object::lookup_object(job_handle.koid).ok_or(ErrorCode::BadHandle)?;
+    let job = job_obj
+        .downcast_arc::<huesos_object::Job>()
+        .map_err(|_| ErrorCode::WrongType)?;
+
+    let name_storage;
+    let name = if args.name_len == 0 {
+        "process"
+    } else {
+        name_storage = user_memory::copy_from_user(args.name, args.name_len as usize)?;
+        core::str::from_utf8(&name_storage).map_err(|_| ErrorCode::InvalidArgs)?
+    };
+    let create = (*PROCESS_CREATE_IN_JOB_FN.lock()).ok_or(ErrorCode::NotSupported)?;
+    let (process, root_vmar) = create(name, job)?;
+    let process_koid = process.koid();
+    let root_vmar_koid = root_vmar.koid();
+
+    match proc.handles.add_pair_with_commit(
+        Handle::new(process_koid, Rights::DEFAULT),
+        Handle::new(root_vmar_koid, Rights::DEFAULT | Rights::SET_PROPERTY),
+        |process_handle, root_vmar_handle| {
+            user_memory::write_value(args.out_process, &process_handle)?;
+            user_memory::write_value(args.out_root_vmar, &root_vmar_handle)
+        },
+    ) {
+        Ok(_) => Ok(0),
+        Err(error) => {
+            huesos_object::unregister_object(process_koid);
+            huesos_object::unregister_object(root_vmar_koid);
+            Err(error)
+        }
+    }
 }
 
 pub(crate) fn sys_process_set_affinity(process_handle: HandleValue, cpu: usize) -> SyscallResult {

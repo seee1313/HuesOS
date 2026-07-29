@@ -138,6 +138,21 @@ pub fn create_suspended_process(
     name: &str,
 ) -> Result<(Arc<Process>, Arc<Vmar>), huesos_abi::ErrorCode> {
     let process = Process::new(if name.is_empty() { "process" } else { name });
+    finish_process_creation(process)
+}
+
+/// Create a suspended process in an explicit Job.
+pub fn create_suspended_process_in_job(
+    name: &str,
+    job: Arc<huesos_object::Job>,
+) -> Result<(Arc<Process>, Arc<Vmar>), huesos_abi::ErrorCode> {
+    let process = Process::new_in_job(if name.is_empty() { "process" } else { name }, job);
+    finish_process_creation(process)
+}
+
+fn finish_process_creation(
+    process: Arc<Process>,
+) -> Result<(Arc<Process>, Arc<Vmar>), huesos_abi::ErrorCode> {
     huesos_object::register_process(process.clone());
 
     let runtime = ProcessRuntime::new(process.koid()).map_err(|_| ErrorCode::NoMemory)?;

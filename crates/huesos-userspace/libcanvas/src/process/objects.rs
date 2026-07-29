@@ -27,6 +27,11 @@ pub struct Thread(Handle);
 pub struct Vmar(Handle);
 
 impl Process {
+    /// Wrap a raw process handle returned by the kernel.
+    pub(crate) unsafe fn from_raw(raw: HandleValue) -> Self {
+        Self(unsafe { Handle::from_raw(raw) })
+    }
+
     /// Create a suspended process and its root VMAR.
     ///
     /// This is an ABI skeleton: current kernels will return
@@ -191,6 +196,11 @@ impl Thread {
 }
 
 impl Vmar {
+    /// Wrap a raw VMAR handle returned by the kernel.
+    pub(crate) unsafe fn from_raw(raw: HandleValue) -> Self {
+        Self(unsafe { Handle::from_raw(raw) })
+    }
+
     /// Reserve a child VMAR range inside this VMAR.
     pub fn create_child(&self, addr: u64, len: u64) -> crate::Result<Vmar> {
         let mut child: HandleValue = INVALID_HANDLE;

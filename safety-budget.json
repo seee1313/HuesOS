@@ -1,13 +1,13 @@
 {
-  "rust_files": 160,
-  "rust_lines": 42932,
+  "rust_files": 162,
+  "rust_lines": 43403,
   "totals": {
     "expect_calls": 21,
     "panic_macros": 5,
     "static_mut": 1,
     "todo_markers": 1,
-    "unsafe_blocks": 255,
-    "unsafe_functions": 60,
+    "unsafe_blocks": 261,
+    "unsafe_functions": 62,
     "unsafe_impls": 28,
     "unwrap_calls": 25
   },
@@ -61,8 +61,9 @@
     "crates/huesos-userspace/libcanvas/src/channel.rs": 7,
     "crates/huesos-userspace/libcanvas/src/handle.rs": 3,
     "crates/huesos-userspace/libcanvas/src/interrupt.rs": 1,
+    "crates/huesos-userspace/libcanvas/src/job.rs": 4,
     "crates/huesos-userspace/libcanvas/src/port.rs": 1,
-    "crates/huesos-userspace/libcanvas/src/process/objects.rs": 5,
+    "crates/huesos-userspace/libcanvas/src/process/objects.rs": 9,
     "crates/huesos-userspace/libcanvas/src/raw.rs": 1,
     "crates/huesos-userspace/libcanvas/src/resource.rs": 1,
     "crates/huesos-userspace/libcanvas/src/signal.rs": 1,
