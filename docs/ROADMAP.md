@@ -538,6 +538,35 @@ next-stage expansion items; they are not blockers for the Immediate milestone.
   Future polish is diagnostic/telemetry work rather than a missing scheduler
   architecture item.
 
+## Regression / Stabilization after Medium Term #8/#10 — CLOSED ✅
+
+A post-landing audit of Medium Term #8/#10 found 16 stabilization items around
+scheduler stealing, Job/quota capabilities, deferred notifications, VMAR rollback
+accounting, and diagnostics. The fixes are intentionally tracked as a separate
+regression section instead of downgrading the Medium Term milestones: #8 and #10
+remain feature-complete for their approved architecture, while this section
+records the hardening pass that made the landing production-safe.
+
+Closed items:
+
+- token stealing no longer runs from the hard LAPIC timer path;
+- reschedule IPIs use a dedicated non-timer vector;
+- late runqueue token grants are canceled/released safely;
+- quota exhaustion packets are deferred out of charge/scheduler critical paths;
+- default Job handles are non-mutating; mutable Job control requires explicit
+  delegated capability rights;
+- unpublished child Job quota nodes roll back;
+- failed child-VMAR reservations have refcount regression coverage;
+- bound Port references are accounted with registry kernel refs;
+- exit packets are queued outside binding-list locks;
+- waitset boot self-test has per-step markers;
+- Job limit tightening below current usage is rejected;
+- Job diagnostic naming is append-only via `JobSetName`;
+- token stealing is gated on an opt-in process count;
+- lock-policy CI guards the scheduler stealer against lower-rank process calls;
+- external incident audit files are documented as non-versioned unless copied
+  into `docs/` intentionally.
+
 ## Long Term
 
 - KASLR, SMAP/SMEP, other hardening.
