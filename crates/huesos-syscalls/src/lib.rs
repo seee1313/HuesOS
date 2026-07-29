@@ -122,6 +122,11 @@ pub fn dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> Syscal
         S::InterruptCreate => {
             port_interrupt::sys_interrupt_create(a1 as u32, a2 as *mut HandleValue)
         }
+        S::InterruptCreateForResource => port_interrupt::sys_interrupt_create_for_resource(
+            a1 as HandleValue,
+            a2 as u32,
+            a3 as *mut HandleValue,
+        ),
         S::InterruptBindPort => {
             port_interrupt::sys_interrupt_bind_port(a1 as HandleValue, a2 as HandleValue, a3)
         }

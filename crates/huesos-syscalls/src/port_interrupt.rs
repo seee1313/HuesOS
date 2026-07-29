@@ -1,7 +1,7 @@
 //! Port and interrupt bridge syscalls.
 
 use huesos_abi::{ErrorCode, HandleValue, PortPacket};
-use huesos_object::{Handle, KernelObject, KernelObjectExt, Rights};
+use huesos_object::{Handle, KernelObject, KernelObjectExt, Resource, ResourceKind, Rights};
 
 use crate::{user_memory, util::current_proc, SyscallResult};
 
@@ -58,8 +58,37 @@ pub(crate) fn sys_interrupt_create(irq: u32, out: *mut HandleValue) -> SyscallRe
     if irq != KEYBOARD_IRQ {
         return Err(ErrorCode::NotSupported);
     }
+    install_interrupt_handle(irq, out)
+}
 
-    let interrupt = huesos_object::Interrupt::new(irq as u8);
+pub(crate) fn sys_interrupt_create_for_resource(
+    resource_handle: HandleValue,
+    irq: u32,
+    out: *mut HandleValue,
+) -> SyscallResult {
+    user_memory::validate_write(out)?;
+    let irq_u8 = u8::try_from(irq).map_err(|_| ErrorCode::InvalidArgs)?;
+    let proc = current_proc()?;
+    let handle = proc
+        .handles
+        .get(resource_handle)
+        .ok_or(ErrorCode::BadHandle)?;
+    if !handle.has_rights(Rights::READ) {
+        return Err(ErrorCode::AccessDenied);
+    }
+    let object = huesos_object::lookup_object(handle.koid).ok_or(ErrorCode::BadHandle)?;
+    let resource = object
+        .downcast_ref::<Resource>()
+        .ok_or(ErrorCode::WrongType)?;
+    if !resource.contains(ResourceKind::Irq, u64::from(irq_u8), 1) {
+        return Err(ErrorCode::AccessDenied);
+    }
+    install_interrupt_handle(irq, out)
+}
+
+fn install_interrupt_handle(irq: u32, out: *mut HandleValue) -> SyscallResult {
+    let irq = u8::try_from(irq).map_err(|_| ErrorCode::InvalidArgs)?;
+    let interrupt = huesos_object::Interrupt::new(irq);
     let koid = interrupt.koid();
     huesos_object::register_interrupt(interrupt);
 

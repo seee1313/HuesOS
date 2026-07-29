@@ -27,6 +27,19 @@ impl Interrupt {
         Ok(Self(unsafe { Handle::from_raw(out) }))
     }
 
+    /// Create an Interrupt object for `irq` using an IRQ Resource capability.
+    pub fn create_from_resource(resource: &Handle, irq: u32) -> crate::Result<Self> {
+        let mut out: HandleValue = INVALID_HANDLE;
+        let ret = raw::syscall3(
+            Syscall::InterruptCreateForResource,
+            resource.raw() as u64,
+            irq as u64,
+            &mut out as *mut HandleValue as u64,
+        );
+        raw::decode(ret)?;
+        Ok(Self(unsafe { Handle::from_raw(out) }))
+    }
+
     /// Create an Interrupt object for the keyboard IRQ.
     pub fn keyboard() -> crate::Result<Self> {
         Self::create(KEYBOARD_IRQ)

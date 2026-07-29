@@ -273,13 +273,16 @@ pub enum Syscall {
     /// Map an `Mmio` or `DmaPool` Resource into the caller's root VMAR at a
     /// fixed userspace address. `a1` points to [`ResourceMapArgs`].
     ResourceMap = 56,
+    /// Create an Interrupt object authorized by an `Irq` Resource. `a1` is the
+    /// Resource handle, `a2` is the IRQ/vector, `a3=*mut HandleValue`.
+    InterruptCreateForResource = 57,
 }
 
 impl Syscall {
     /// Total number of defined syscalls (i.e. one past the highest
     /// currently-assigned number). The dispatcher uses this to reject
     /// obviously-out-of-range numbers before a `match`.
-    pub const COUNT: u64 = 57;
+    pub const COUNT: u64 = 58;
 
     /// Convert a raw syscall number back into a [`Syscall`], if valid.
     pub const fn from_raw(n: u64) -> Option<Self> {
@@ -341,6 +344,7 @@ impl Syscall {
             54 => Self::ProcessCreateInJob,
             55 => Self::JobSetName,
             56 => Self::ResourceMap,
+            57 => Self::InterruptCreateForResource,
             _ => return None,
         })
     }
@@ -1087,7 +1091,8 @@ mod tests {
         assert_eq!(Syscall::ProcessCreateInJob as u64, 54);
         assert_eq!(Syscall::JobSetName as u64, 55);
         assert_eq!(Syscall::ResourceMap as u64, 56);
-        assert_eq!(Syscall::COUNT, 57);
+        assert_eq!(Syscall::InterruptCreateForResource as u64, 57);
+        assert_eq!(Syscall::COUNT, 58);
         assert_eq!(Syscall::from_raw(28), Some(Syscall::VmoCreateEx));
         assert_eq!(Syscall::from_raw(30), Some(Syscall::VmarProtect));
         assert_eq!(Syscall::from_raw(31), Some(Syscall::ChannelPeek));
@@ -1119,7 +1124,11 @@ mod tests {
         assert_eq!(Syscall::from_raw(54), Some(Syscall::ProcessCreateInJob));
         assert_eq!(Syscall::from_raw(55), Some(Syscall::JobSetName));
         assert_eq!(Syscall::from_raw(56), Some(Syscall::ResourceMap));
-        assert_eq!(Syscall::from_raw(57), None);
+        assert_eq!(
+            Syscall::from_raw(57),
+            Some(Syscall::InterruptCreateForResource)
+        );
+        assert_eq!(Syscall::from_raw(58), None);
     }
 
     #[test]
