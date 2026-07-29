@@ -119,6 +119,7 @@ pub fn dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> Syscal
         S::VmarMap => process::sys_vmar_map(a1 as *const VmarMapArgs),
         S::PortCreate => port_interrupt::sys_port_create(a1 as *mut HandleValue),
         S::PortRead => port_interrupt::sys_port_read(a1 as HandleValue, a2 as *mut PortPacket, a3),
+        S::PortQueue => port_interrupt::sys_port_queue(a1 as HandleValue, a2 as *const PortPacket),
         S::InterruptCreate => {
             port_interrupt::sys_interrupt_create(a1 as u32, a2 as *mut HandleValue)
         }

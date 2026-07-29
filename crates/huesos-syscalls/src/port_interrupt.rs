@@ -51,6 +51,27 @@ pub(crate) fn sys_port_read(
     Ok(0)
 }
 
+pub(crate) fn sys_port_queue(port_handle: HandleValue, packet: *const PortPacket) -> SyscallResult {
+    let packet = user_memory::read_value(packet)?;
+    let proc = current_proc()?;
+    let h = proc.handles.get(port_handle).ok_or(ErrorCode::BadHandle)?;
+    if !h.has_rights(Rights::WRITE) {
+        return Err(ErrorCode::AccessDenied);
+    }
+    let obj = huesos_object::lookup_object(h.koid).ok_or(ErrorCode::BadHandle)?;
+    let port = obj
+        .downcast_ref::<huesos_object::Port>()
+        .ok_or(ErrorCode::WrongType)?;
+    port.queue(huesos_object::PortPacket {
+        key: packet.key,
+        packet_type: packet.packet_type,
+        status: packet.status,
+        data: packet.data,
+    })
+    .map_err(|_| ErrorCode::NoMemory)?;
+    Ok(0)
+}
+
 const KEYBOARD_IRQ: u32 = 1;
 
 pub(crate) fn sys_interrupt_create(irq: u32, out: *mut HandleValue) -> SyscallResult {

@@ -18,6 +18,9 @@
 /// Ring-3 ACPI manager broker and immutable table-archive protocol.
 pub mod acpi_broker;
 
+/// Async BlockDevice wire protocol.
+pub mod block;
+
 /// Immutable ACPI table-archive decoding and physical-address index.
 ///
 /// Used by both the kernel archive builder and the Ring-3 `acpi-manager` to
@@ -276,13 +279,16 @@ pub enum Syscall {
     /// Create an Interrupt object authorized by an `Irq` Resource. `a1` is the
     /// Resource handle, `a2` is the IRQ/vector, `a3=*mut HandleValue`.
     InterruptCreateForResource = 57,
+    /// Queue one packet to a Port. `a1` is a Port handle with WRITE rights,
+    /// `a2=*const PortPacket`.
+    PortQueue = 58,
 }
 
 impl Syscall {
     /// Total number of defined syscalls (i.e. one past the highest
     /// currently-assigned number). The dispatcher uses this to reject
     /// obviously-out-of-range numbers before a `match`.
-    pub const COUNT: u64 = 58;
+    pub const COUNT: u64 = 59;
 
     /// Convert a raw syscall number back into a [`Syscall`], if valid.
     pub const fn from_raw(n: u64) -> Option<Self> {
@@ -345,6 +351,7 @@ impl Syscall {
             55 => Self::JobSetName,
             56 => Self::ResourceMap,
             57 => Self::InterruptCreateForResource,
+            58 => Self::PortQueue,
             _ => return None,
         })
     }
@@ -825,6 +832,8 @@ pub const PORT_PACKET_INTERRUPT: u32 = 1;
 pub const PORT_PACKET_PROCESS_EXIT: u32 = 2;
 /// Port packet type for quota-exhaustion notifications.
 pub const PORT_PACKET_QUOTA_EXHAUSTED: u32 = 3;
+/// Port packet type for async BlockDevice completions.
+pub const PORT_PACKET_BLOCK_COMPLETION: u32 = 4;
 
 /// Fixed-size event packet returned by [`Syscall::PortRead`].
 #[repr(C)]
@@ -1092,7 +1101,8 @@ mod tests {
         assert_eq!(Syscall::JobSetName as u64, 55);
         assert_eq!(Syscall::ResourceMap as u64, 56);
         assert_eq!(Syscall::InterruptCreateForResource as u64, 57);
-        assert_eq!(Syscall::COUNT, 58);
+        assert_eq!(Syscall::PortQueue as u64, 58);
+        assert_eq!(Syscall::COUNT, 59);
         assert_eq!(Syscall::from_raw(28), Some(Syscall::VmoCreateEx));
         assert_eq!(Syscall::from_raw(30), Some(Syscall::VmarProtect));
         assert_eq!(Syscall::from_raw(31), Some(Syscall::ChannelPeek));
@@ -1128,7 +1138,8 @@ mod tests {
             Syscall::from_raw(57),
             Some(Syscall::InterruptCreateForResource)
         );
-        assert_eq!(Syscall::from_raw(58), None);
+        assert_eq!(Syscall::from_raw(58), Some(Syscall::PortQueue));
+        assert_eq!(Syscall::from_raw(59), None);
     }
 
     #[test]

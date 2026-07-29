@@ -9,6 +9,16 @@ use huesos_abi::{HandleValue, PortPacket, Syscall, INVALID_HANDLE};
 pub struct Port(Handle);
 
 impl Port {
+    /// Build a Port wrapper from an owned generic handle.
+    pub fn from_handle(handle: Handle) -> Self {
+        Self(handle)
+    }
+
+    /// Consume this Port and return the underlying generic handle.
+    pub fn into_handle(self) -> Handle {
+        self.0
+    }
+
     /// Create a new Port event queue.
     pub fn create() -> crate::Result<Self> {
         let mut out: HandleValue = INVALID_HANDLE;
@@ -48,6 +58,17 @@ impl Port {
         );
         raw::decode(ret)?;
         Ok(packet)
+    }
+
+    /// Queue one packet to this Port. Requires WRITE rights on the Port handle.
+    pub fn queue(&self, packet: &PortPacket) -> crate::Result<()> {
+        let ret = raw::syscall2(
+            Syscall::PortQueue,
+            self.0.raw() as u64,
+            packet as *const PortPacket as u64,
+        );
+        raw::decode(ret)?;
+        Ok(())
     }
 
     /// Borrow the underlying handle.

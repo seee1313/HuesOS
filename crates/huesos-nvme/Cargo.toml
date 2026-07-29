@@ -12,3 +12,4 @@ license.workspace = true
 # top (documented in docs/NVME.md).
 [dependencies]
 hues-async = { path = "../hues-async" }
+huesos-abi = { path = "../huesos-abi" }

@@ -165,6 +165,7 @@ name = "huesos-nvme"
 version = "0.1.0"
 dependencies = [
  "hues-async",
+ "huesos-abi",
 ]
 
 [[package]]
