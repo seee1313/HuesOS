@@ -58,8 +58,22 @@ pub const ACPI_MANAGER_READY: &str = "acpi-manager:ready";
 pub const ACPI_HEARTBEAT: &str = "heartbeat:acpi";
 /// Client asks DriverManager to open FileSystemService.
 pub const OPEN_FILESYSTEM: &str = "open:filesystem";
+/// Client asks DriverManager to open DevFS.
+pub const OPEN_DEVFS: &str = "open:devfs";
+/// Client asks DriverManager to open BlobFS.
+pub const OPEN_BLOBFS: &str = "open:blobfs";
 /// DriverManager responds with a FileSystemService channel.
 pub const FILESYSTEM_CHANNEL: &str = "service:filesystem:channel";
+/// DriverManager responds with a DevFS channel.
+pub const DEVFS_CHANNEL: &str = "service:devfs:channel";
+/// DevFS is not currently available.
+pub const DEVFS_UNAVAILABLE: &str = "err:devfs-unavailable";
+/// DriverManager responds with a BlobFS channel.
+pub const BLOBFS_CHANNEL: &str = "service:blobfs:channel";
+/// BlobFS is not currently mounted/available.
+pub const BLOBFS_UNAVAILABLE: &str = "err:blobfs-unavailable";
+/// BlobFS returns an opened blob as a VMO handle.
+pub const BLOBFS_BLOB_VMO: &str = "service:blobfs:blob-vmo";
 /// Client asks DriverManager to open the NVMe-backed async BlockDevice service.
 pub const OPEN_BLOCK_NVME: &str = "open:block:nvme";
 /// Client asks DriverManager to open the system volume.

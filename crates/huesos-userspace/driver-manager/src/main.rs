@@ -9,7 +9,9 @@
 #![no_std]
 #![no_main]
 
+mod blobfs_service;
 mod bootfs;
+mod devfs_service;
 mod fs_service;
 mod manifest;
 mod protocol;

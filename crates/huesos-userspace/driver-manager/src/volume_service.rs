@@ -111,6 +111,51 @@ impl VolumeManagerService {
         }
     }
 
+    /// Open the filesystem-candidate block range for DevFS.
+    pub fn open_fs_candidate_for_devfs(
+        &mut self,
+        target: &Channel,
+        nvme_bootstrap: Option<&Channel>,
+        nvme_online: bool,
+    ) {
+        let Some(nvme_bootstrap) = nvme_bootstrap else {
+            let _ = target.write(b"err:volume");
+            return;
+        };
+        match self.open_fs_candidate_channel(nvme_bootstrap, nvme_online) {
+            Ok(channel) => {
+                if let Err((error, _handle)) = target.write_handle(
+                    protocol::VOLUME_FS_CANDIDATE_CHANNEL.as_bytes(),
+                    channel.into_handle(),
+                ) {
+                    println!(
+                        "[driver-manager] failed to return DevFS fs-candidate: {}",
+                        error.as_str()
+                    );
+                }
+            }
+            Err(_) => {
+                let _ = target.write(b"err:volume");
+            }
+        }
+    }
+
+    /// Open the filesystem-candidate block range for an internal service.
+    pub fn open_fs_candidate_channel(
+        &mut self,
+        nvme_bootstrap: &Channel,
+        nvme_online: bool,
+    ) -> Result<Channel, ErrorCode> {
+        if !nvme_online {
+            return Err(ErrorCode::ShouldWait);
+        }
+        self.ensure_system_volume(nvme_bootstrap)?;
+        let Some(info) = self.system else {
+            return Err(ErrorCode::InvalidArgs);
+        };
+        self.create_range_channel(nvme_bootstrap, 0, info.block_count, true)
+    }
+
     /// Poll volume clients and block-range proxies.
     pub fn poll(&mut self, nvme_bootstrap: Option<&Channel>, nvme_online: bool) {
         let mut index = 0usize;
@@ -277,54 +322,61 @@ impl VolumeManagerService {
             self.write_volume_error(index);
             return;
         };
-        let Some(proxy_index) = self.proxies.iter().position(Option::is_none) else {
+        let label = if fs_candidate {
+            protocol::VOLUME_FS_CANDIDATE_CHANNEL.as_bytes()
+        } else {
+            protocol::VOLUME_BLOCK_RANGE_CHANNEL.as_bytes()
+        };
+        let range =
+            self.create_range_channel(nvme_bootstrap, start_block, block_count, fs_candidate);
+        let Ok(client_end) = range else {
             self.write_volume_error(index);
-            println!("[driver-manager] volume block-range proxy table full");
             return;
         };
-        let backend = match attach_backend(nvme_bootstrap) {
-            Ok(backend) => backend,
-            Err(_) => {
-                self.write_volume_error(index);
-                return;
-            }
+        let Some(client) = self.clients[index].as_ref() else {
+            return;
         };
-        match Channel::pair() {
-            Ok((client_end, proxy_client)) => {
-                let Some(client) = self.clients[index].as_ref() else {
-                    return;
-                };
-                let label = if fs_candidate {
-                    protocol::VOLUME_FS_CANDIDATE_CHANNEL.as_bytes()
-                } else {
-                    protocol::VOLUME_BLOCK_RANGE_CHANNEL.as_bytes()
-                };
-                if let Err((error, _handle)) =
-                    client.channel.write_handle(label, client_end.into_handle())
-                {
-                    println!(
-                        "[driver-manager] failed to return volume block range: {}",
-                        error.as_str()
-                    );
-                    return;
-                }
-                self.proxies[proxy_index] = Some(BlockRangeProxy {
-                    client: proxy_client,
-                    backend: backend.channel,
-                    backend_completion: backend.completion,
-                    client_completion: None,
-                    start_block,
-                    block_count,
-                    block_size: info.block_size,
-                    max_request_bytes: info.max_request_bytes,
-                });
-                println!(
-                    "[driver-manager] opened volume block range start={} count={} fs_candidate={}",
-                    start_block, block_count, fs_candidate as u8
-                );
-            }
-            Err(_) => self.write_volume_error(index),
+        if let Err((error, _handle)) = client.channel.write_handle(label, client_end.into_handle())
+        {
+            println!(
+                "[driver-manager] failed to return volume block range: {}",
+                error.as_str()
+            );
+            self.write_volume_error(index);
         }
+    }
+
+    fn create_range_channel(
+        &mut self,
+        nvme_bootstrap: &Channel,
+        start_block: u64,
+        block_count: u64,
+        fs_candidate: bool,
+    ) -> Result<Channel, ErrorCode> {
+        let Some(info) = self.system else {
+            return Err(ErrorCode::InvalidArgs);
+        };
+        let Some(proxy_index) = self.proxies.iter().position(Option::is_none) else {
+            println!("[driver-manager] volume block-range proxy table full");
+            return Err(ErrorCode::NoMemory);
+        };
+        let backend = attach_backend(nvme_bootstrap)?;
+        let (client_end, proxy_client) = Channel::pair()?;
+        self.proxies[proxy_index] = Some(BlockRangeProxy {
+            client: proxy_client,
+            backend: backend.channel,
+            backend_completion: backend.completion,
+            client_completion: None,
+            start_block,
+            block_count,
+            block_size: info.block_size,
+            max_request_bytes: info.max_request_bytes,
+        });
+        println!(
+            "[driver-manager] opened volume block range start={} count={} fs_candidate={}",
+            start_block, block_count, fs_candidate as u8
+        );
+        Ok(client_end)
     }
 
     fn write_volume_error(&self, index: usize) {

@@ -59,9 +59,11 @@
 #![warn(missing_docs)]
 
 pub mod acpi_broker;
+pub mod blobfs;
 pub mod block;
 pub mod channel;
 pub mod debug;
+pub mod devfs;
 #[cfg(feature = "kernel-smoke-tests")]
 pub mod diagnostics;
 mod font6x13;
@@ -81,6 +83,7 @@ pub mod vmo;
 pub mod volume;
 pub mod waitset;
 
+pub use blobfs::BlobFs;
 pub use channel::Channel;
 pub use handle::Handle;
 pub use interrupt::Interrupt;

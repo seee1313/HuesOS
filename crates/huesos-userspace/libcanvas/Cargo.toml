@@ -10,5 +10,6 @@ kernel-smoke-tests = []
 
 [dependencies]
 huesos-abi = { path = "../../huesos-abi" }
+huesos-blobfs = { path = "../../huesos-blobfs" }
 
 [workspace]

@@ -7,6 +7,10 @@ name = "huesos-abi"
 version = "0.1.0"
 
 [[package]]
+name = "huesos-blobfs"
+version = "0.1.0"
+
+[[package]]
 name = "huesos-driver-host-input"
 version = "0.1.0"
 dependencies = [
@@ -18,4 +22,5 @@ name = "libcanvas"
 version = "0.1.0"
 dependencies = [
  "huesos-abi",
+ "huesos-blobfs",
 ]

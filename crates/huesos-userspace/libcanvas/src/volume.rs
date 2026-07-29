@@ -12,6 +12,14 @@ pub struct Volume {
 }
 
 impl Volume {
+    /// Adopt an already-open Volume service channel.
+    pub fn from_channel(channel: Channel) -> Self {
+        Self {
+            channel,
+            next_request_id: 1,
+        }
+    }
+
     /// Open the system volume through a DriverManager registry channel.
     pub fn open_system(registry: &Channel) -> Result<Self> {
         let mut buf = [0u8; 64];

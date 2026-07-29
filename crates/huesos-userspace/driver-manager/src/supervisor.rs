@@ -1,5 +1,7 @@
 //! DriverHost launch/supervision loop.
 
+use crate::blobfs_service::BlobFsService;
+use crate::devfs_service::DevFsService;
 use crate::fs_service::FileSystemService;
 use crate::manifest::INPUT_HOST;
 use crate::protocol;
@@ -146,6 +148,8 @@ pub struct DriverManager {
     registry_channel: Option<Channel>,
     fs: FileSystemService,
     volume: VolumeManagerService,
+    devfs: DevFsService,
+    blobfs: BlobFsService,
     heartbeat_count: u64,
     acpi_heartbeat_count: u64,
     nvme_heartbeat_count: u64,
@@ -257,6 +261,8 @@ impl DriverManager {
             registry_channel: None,
             fs: FileSystemService::new(),
             volume: VolumeManagerService::new(),
+            devfs: DevFsService::new(),
+            blobfs: BlobFsService::new(),
             heartbeat_count: 0,
             acpi_heartbeat_count: 0,
             nvme_heartbeat_count: 0,
@@ -661,10 +667,12 @@ impl DriverManager {
             self.poll_registry_requests();
             self.fs.poll();
             let nvme_online = self.registry.state("block:nvme") == Some(ServiceState::Online);
-            self.volume.poll(
-                self.nvme_host.as_ref().map(|host| &host.bootstrap),
-                nvme_online,
-            );
+            let nvme_bootstrap = self.nvme_host.as_ref().map(|host| &host.bootstrap);
+            self.volume.poll(nvme_bootstrap, nvme_online);
+            self.blobfs
+                .poll(&mut self.volume, nvme_bootstrap, nvme_online);
+            self.devfs
+                .poll(&mut self.volume, nvme_bootstrap, nvme_online);
             self.poll_input_host();
             self.poll_nvme_host();
             self.poll_acpi_manager();
@@ -955,6 +963,10 @@ impl DriverManager {
                 Ok(n) if &buf[..n] == protocol::OPEN_FILESYSTEM.as_bytes() => {
                     self.open_filesystem_service()
                 }
+                Ok(n) if &buf[..n] == protocol::OPEN_DEVFS.as_bytes() => self.open_devfs_service(),
+                Ok(n) if &buf[..n] == protocol::OPEN_BLOBFS.as_bytes() => {
+                    self.open_blobfs_service()
+                }
                 Ok(n) if &buf[..n] == protocol::OPEN_BLOCK_NVME.as_bytes() => {
                     self.open_nvme_block_service()
                 }
@@ -976,6 +988,23 @@ impl DriverManager {
             return;
         };
         self.fs.open_for_registry(registry);
+    }
+
+    fn open_devfs_service(&mut self) {
+        let Some(registry) = self.registry_channel.as_ref() else {
+            return;
+        };
+        self.devfs.open_for_registry(registry);
+    }
+
+    fn open_blobfs_service(&mut self) {
+        let Some(registry) = self.registry_channel.as_ref() else {
+            return;
+        };
+        let nvme_online = self.registry.state("block:nvme") == Some(ServiceState::Online);
+        let nvme_bootstrap = self.nvme_host.as_ref().map(|host| &host.bootstrap);
+        self.blobfs
+            .open_for_registry(registry, &mut self.volume, nvme_bootstrap, nvme_online);
     }
 
     fn open_nvme_block_service(&mut self) {
