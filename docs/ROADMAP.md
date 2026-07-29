@@ -440,13 +440,16 @@ next-stage expansion items; they are not blockers for the Immediate milestone.
   `DmaPool`, Resource-authorized Interrupt creation, BAR/DMA mapping in the
   DriverHost, controller reset/enable, admin-queue setup, Identify
   Controller/Namespace on target, 1 MiB max request clamp, PRP-list support
-  within one list page, and per-CPU queue creation planning/commands.
+  within one list page, per-CPU queue creation planning/commands, real
+  DriverManager `service:block:nvme:channel` handoff, VMO buffer registration,
+  Port-based completions, and `libcanvas::block::BlockDevice` helpers.
 - **Agreed production targets**: HBI `.img` driver loading, 64 MiB preallocated
   DMA pool, no heap after driver init, MSI-X→MSI→polling fallback, per-CPU
   queues depth 256, and 1 MiB max request size.
-- **Needed**: wire the bound MSI-X/MSI Port into the async completion loop, real
-  BlockDevice service registration, BlobFS read-only mount, and later Hxfs/DevFS
-  layers.
+- **Needed**: on-target NVMe data-path soak, BlobFS read-only mount, and later
+  Hxfs/DevFS layers. A future performance slice can replace the current
+  synchronous service execution with deeper async queue-slot tracking, but Stage
+  C's public Channel+Port service contract is now present.
 - **PS/2 driver ownership (fully migrated as of PR-E)**: the scancode
   decoder, shift-state machine, and key-event dispatch live only in the
   userspace `driver-host:input` process. The kernel keeps a

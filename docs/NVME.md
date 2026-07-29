@@ -7,10 +7,9 @@ kernel-programmed MSI-X with MSI fallback, DriverManager launch of
 `driver-host-nvme` from BOOTFS, real BAR/DMA mapping in the DriverHost,
 controller disable/enable + admin queue setup from the 64 MiB DMA pool, Identify
 Controller/Namespace integration, per-CPU queue creation planning, PRP handling
-up to the 1 MiB request cap, MSI/MSI-X vectors bound to a userspace Port, and
-the async BlockDevice Channel+Port wire protocol. The public BlockDevice service
-channel remains the next slice. This is ROADMAP Short-Term #7 (real VFS +
-drivers in userspace), first device.
+up to the 1 MiB request cap, MSI/MSI-X vectors bound to a userspace Port, and a
+real async BlockDevice service channel exposed through DriverManager. This is
+ROADMAP Short-Term #7 (real VFS + drivers in userspace), first device.
 
 ## Goal
 
@@ -134,16 +133,16 @@ with the success response:
 service:block:nvme:channel
 ```
 
-Stage B can launch the real NVMe DriverHost, map its resources, and Identify the
-first namespace, but there is still no async BlockDevice server channel.
-DriverManager therefore continues to return `err:block:nvme-unavailable` for
-`open:block:nvme` until Stage C wires a real service channel. This keeps clients
-and future BlobFS/Hxfs code on a stable discovery contract without pretending
-that storage I/O is already online.
+Stage C exposes the identified NVMe namespace through DriverManager. Clients send
+`open:block:nvme` to the registry and receive `service:block:nvme:channel`. The
+client then transfers a completion Port and VMO-backed buffer handles to the
+DriverHost; fixed `AsyncBlockRequest` records submit Info/Read/Write/Flush and
+completion packets are queued to the supplied Port. DriverManager still returns
+`err:block:nvme-unavailable` until the DriverHost has identified the namespace.
 
 ## On-target verification checklist
 
-Stage A/B + MSI-X/MSI completed in code:
+Stage A/B/C + MSI-X/MSI completed in code:
 
 - Boot reserves/logs the 64 MiB DMA pool.
 - Kernel storage boot-info logs discovered NVMe PCI function(s), BAR0, IRQ/vector
@@ -159,11 +158,15 @@ Stage A/B + MSI-X/MSI completed in code:
 - The controller path disables/enables CC.EN with CAP.TO-derived bounded waits,
   programs AQA/ASQ/ACQ, submits Identify Controller/Namespace, Set Features
   Number of Queues, and Create I/O CQ/SQ commands.
+- DriverManager attaches NVMe block clients and returns a real service channel.
+- `driver-host-nvme` accepts completion Ports and VMO buffer handles, executes
+  Info/Read/Write/Flush, and queues async completion packets to client Ports.
+- `libcanvas::block::BlockDevice` provides synchronous convenience helpers over
+  the Channel+Port async protocol.
 
-Remaining Stage C / later hardware work:
+Remaining later work:
 
-- Real async BlockDevice service channel and request server.
-- Use the bound MSI-X/MSI Port in the async completion loop instead of only
-  having it ready for Stage C.
-- Data-path on-target read/write soak through the future BlockDevice server.
+- Replace the current synchronous per-request server execution with fully async
+  queue-slot tracking driven directly by the bound MSI-X/MSI Port.
+- Data-path on-target read/write soak under QEMU `-device nvme` and hardware.
 - Multiple namespaces beyond the current system namespace-first policy.

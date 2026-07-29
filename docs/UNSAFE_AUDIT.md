@@ -13,8 +13,8 @@ are intentionally not treated as the versioned project baseline unless they are
 copied into `docs/` in a dedicated review. The versioned baseline remains this
 file plus `safety-budget.json`.
 
-At the current baseline (`safety-budget.json`) the repository contains 169
-first-party Rust files and 47,521 Rust lines. The measured surface is **265**
+At the current baseline (`safety-budget.json`) the repository contains 171
+first-party Rust files and 48,212 Rust lines. The measured surface is **265**
 unsafe blocks, **63** unsafe functions, **29** unsafe impls, one `static mut`,
 **25** unwrap calls, **21** expect calls, and **5** panic macros. Prior baseline
 values are retained in the changelog sections below so that any deviation
@@ -2211,6 +2211,34 @@ unsafe blocks; it validates that the requested vector is covered by the caller's
 
 ```
 unsafe_blocks:    263 -> 265 (+2).
+unsafe_functions:  63 ->  63 (unchanged).
+unsafe_impls:      29 ->  29 (unchanged).
+static_mut:         1 ->   1 (unchanged).
+unwrap_calls:      25 ->  25 (unchanged).
+expect_calls:      21 ->  21 (unchanged).
+panic_macros:       5 ->   5 (unchanged).
+```
+
+## NVMe Stage-C BlockDevice service integration (safety-budget-neutral)
+
+Stage C wires the public async BlockDevice service without adding unsafe Rust.
+DriverManager now returns `service:block:nvme:channel` for `open:block:nvme` once
+`driver-host-nvme` has identified the namespace, and transfers the server end to
+the DriverHost. The DriverHost accepts a client completion Port and VMO-backed
+buffer registrations, executes fixed `AsyncBlockRequest` Info/Read/Write/Flush
+records, and queues completion packets through the new `PortQueue` syscall.
+`libcanvas::block::BlockDevice` provides synchronous convenience wrappers over
+that Channel+Port protocol for early tools.
+
+The canonical block wire structures moved to `huesos_abi::block`; the old
+`huesos_nvme::block_async` path re-exports them so existing NVMe code does not
+fork the ABI. `PortQueue` validates WRITE rights on the target Port and reuses
+the existing bounded `Port::queue` admission path.
+
+### Safety-budget delta (measured)
+
+```
+unsafe_blocks:    265 -> 265 (unchanged).
 unsafe_functions:  63 ->  63 (unchanged).
 unsafe_impls:      29 ->  29 (unchanged).
 static_mut:         1 ->   1 (unchanged).
