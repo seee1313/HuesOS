@@ -448,11 +448,18 @@ next-stage expansion items; they are not blockers for the Immediate milestone.
 - **Agreed production targets**: HBI `.img` driver loading, 64 MiB preallocated
   DMA pool, no heap after driver init, MSI-X→MSI→polling fallback, per-CPU
   queues depth 256, and 1 MiB max request size.
-- **Needed**: on-target NVMe/SSD data-path soak, BlobFS read-only mount, and
-  later Hxfs/DevFS layers. A future performance slice can replace the current
-  synchronous service execution with deeper async queue-slot tracking, but Stage
-  C's public Channel+Port service contract and Stage D's Volume handles are now
-  present.
+- **BlobFS/DevFS Stage E/F landed**: `huesos-blobfs` defines read-only BlobFS v1
+  (superblock, blob table, SHA-256 hashes, overlap/hash validation) optimized for
+  immutable NVMe/SSD random access. DriverManager can mount BlobFS over the
+  system Volume fs-candidate, list hashes, and return verified blob VMOs by hash.
+  DevFS exposes a runtime handle namespace (`open:devfs`) with `/dev/block/system`
+  returning a Volume handle and `/dev/nvme0/ns1` returning a range-relative
+  BlockDevice handle. DevFS remains a handle resolver, not a disk filesystem.
+- **Needed**: on-target NVMe/SSD data-path soak, then Hxfs read-only design/code.
+  A future performance slice can replace the current synchronous service
+  execution with deeper async queue-slot tracking, but Stage C's public
+  Channel+Port service contract, Stage D's Volume handles, Stage E's BlobFS read
+  path, and Stage F's DevFS handle namespace are now present.
 - **PS/2 driver ownership (fully migrated as of PR-E)**: the scancode
   decoder, shift-state machine, and key-event dispatch live only in the
   userspace `driver-host:input` process. The kernel keeps a

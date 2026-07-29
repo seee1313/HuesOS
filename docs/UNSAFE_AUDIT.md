@@ -13,8 +13,8 @@ are intentionally not treated as the versioned project baseline unless they are
 copied into `docs/` in a dedicated review. The versioned baseline remains this
 file plus `safety-budget.json`.
 
-At the current baseline (`safety-budget.json`) the repository contains 174
-first-party Rust files and 49,125 Rust lines. The measured surface is **265**
+At the current baseline (`safety-budget.json`) the repository contains 179
+first-party Rust files and 50,526 Rust lines. The measured surface is **265**
 unsafe blocks, **63** unsafe functions, **29** unsafe impls, one `static mut`,
 **25** unwrap calls, **21** expect calls, and **5** panic macros. Prior baseline
 values are retained in the changelog sections below so that any deviation
@@ -2260,6 +2260,33 @@ enforce block bounds before forwarding requests to the NVMe service.
 No new unsafe surface is introduced. The implementation is userspace protocol
 routing, bounded fixed tables for clients/proxies, VMO handle forwarding, and
 Port completion forwarding through the existing safe wrappers.
+
+### Safety-budget delta (measured)
+
+```
+unsafe_blocks:    265 -> 265 (unchanged).
+unsafe_functions:  63 ->  63 (unchanged).
+unsafe_impls:      29 ->  29 (unchanged).
+static_mut:         1 ->   1 (unchanged).
+unwrap_calls:      25 ->  25 (unchanged).
+expect_calls:      21 ->  21 (unchanged).
+panic_macros:       5 ->   5 (unchanged).
+```
+
+## BlobFS read-only and DevFS handle namespace (safety-budget-neutral)
+
+Stage E/F adds `huesos-blobfs`, BlobFS service mounting in DriverManager, and a
+DevFS runtime namespace. BlobFS v1 is immutable and content-addressed: the parser
+validates magic/version/layout, rejects overlapping payloads and non-zero
+reserved fields, and verifies SHA-256 payload hashes before returning read-only
+blob VMOs. DevFS is a resolver over live handles, not a disk filesystem;
+`/dev/block/system` returns the system Volume handle and `/dev/nvme0/ns1` returns
+a range-relative BlockDevice handle.
+
+The implementation is pure safe Rust: fixed wire records, bounded userspace
+service tables, safe VMO read/write wrappers, and a pure no-unsafe SHA-256
+implementation for BlobFS verification. It intentionally remains NVMe/SSD
+focused and introduces no rotational-media or generic-storage tuning paths.
 
 ### Safety-budget delta (measured)
 

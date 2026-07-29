@@ -174,11 +174,18 @@ Stage A/B/C + MSI-X/MSI completed in code:
   the Channel+Port async protocol.
 - DriverManager's VolumeManager exposes `service:volume:system:channel`, raw
   NVMe namespace volume info, range-relative BlockDevice proxy handles, and a
-  filesystem-candidate handle for the next FS layer.
+  filesystem-candidate handle for the FS layer.
+- BlobFS read-only service mounts from the system Volume fs-candidate, validates
+  the v1 superblock/table, verifies SHA-256 on blob open, and returns read-only
+  blob VMOs by hash.
+- DevFS exposes a runtime handle namespace: `/dev/block/system` opens a Volume
+  handle and `/dev/nvme0/ns1` opens a BlockDevice handle.
 
 Remaining later work:
 
 - Replace the current synchronous per-request server execution with fully async
   queue-slot tracking driven directly by the bound MSI-X/MSI Port.
-- Data-path on-target read/write soak under QEMU `-device nvme` and hardware.
+- Data-path on-target read/write/blob-open soak under QEMU `-device nvme` and
+  hardware.
 - Multiple namespaces beyond the current system namespace-first policy.
+- Hxfs read-only prototype.
