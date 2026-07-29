@@ -25,6 +25,10 @@ pub mod acpi_broker;
 /// range index before any userspace mapping.
 pub mod acpi_archive;
 
+/// Boot-time storage hardware metadata shared from the kernel to init and
+/// DriverManager.
+pub mod storage_boot;
+
 /// HBI boot-driver manifest ABI.
 pub mod hbi_boot {
     /// Magic for `/storage/boot-drivers.manifest`.
@@ -513,6 +517,8 @@ pub const INIT_BOOTFS_HANDLE: HandleValue = 2;
 pub const INIT_ACPI_TABLES_HANDLE: HandleValue = 3;
 /// Deny-by-default privileged ACPI broker capability for the initial process.
 pub const INIT_ACPI_BROKER_HANDLE: HandleValue = 4;
+/// Kernel-produced storage boot-info VMO installed in the initial process.
+pub const INIT_STORAGE_BOOT_INFO_HANDLE: HandleValue = 5;
 
 /// Stable process exit codes used when the kernel terminates a process after
 /// an unhandled ring-3 CPU exception.

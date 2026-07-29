@@ -32,6 +32,14 @@ impl Vmo {
         Self::from_abi_owned(huesos_abi::INIT_ACPI_TABLES_HANDLE)
     }
 
+    /// Take ownership of the storage boot-info VMO installed only in the
+    /// initial process by the kernel. If the kernel did not install it on this
+    /// boot, ordinary VMO syscalls on the returned wrapper fail with
+    /// `BadHandle`; callers should treat that as "no storage metadata".
+    pub fn take_init_storage_boot_info() -> Self {
+        Self::from_abi_owned(huesos_abi::INIT_STORAGE_BOOT_INFO_HANDLE)
+    }
+
     fn from_abi_owned(raw: HandleValue) -> Self {
         Self(unsafe { Handle::from_raw(raw) })
     }

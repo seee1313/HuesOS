@@ -118,6 +118,8 @@ pub enum PmmError {
     OutOfMemory,
     /// PMM has not been initialized yet.
     NotInitialized,
+    /// The requested allocation shape is invalid.
+    InvalidArgs,
 }
 
 /// Errors returned by [`init`]. Unlike [`PmmError`], these are boot-time
@@ -187,6 +189,48 @@ impl BitmapAllocator {
                 FREE_FRAMES.fetch_sub(1, Ordering::Relaxed);
                 return Some(idx as u64 * FRAME_SIZE);
             }
+        }
+        None
+    }
+
+    fn allocate_contiguous(
+        &mut self,
+        frame_count: usize,
+        alignment_frames: usize,
+        max_exclusive: u64,
+    ) -> Option<u64> {
+        if frame_count == 0 {
+            return None;
+        }
+        let alignment = alignment_frames.max(1);
+        let max_frame = max_exclusive
+            .div_ceil(FRAME_SIZE)
+            .min(self.frame_count as u64) as usize;
+        if frame_count > max_frame {
+            return None;
+        }
+
+        let mut idx = 0usize;
+        while idx <= max_frame - frame_count {
+            let misalignment = idx % alignment;
+            if misalignment != 0 {
+                idx = idx.saturating_add(alignment - misalignment);
+                continue;
+            }
+
+            let mut run = 0usize;
+            while run < frame_count && !self.is_used(idx + run) {
+                run += 1;
+            }
+            if run == frame_count {
+                for frame in idx..idx + frame_count {
+                    self.set_used(frame);
+                }
+                self.cursor = (idx + frame_count) % self.frame_count;
+                FREE_FRAMES.fetch_sub(frame_count, Ordering::Relaxed);
+                return Some(idx as u64 * FRAME_SIZE);
+            }
+            idx = idx.saturating_add(run.max(1));
         }
         None
     }
@@ -353,6 +397,40 @@ pub fn alloc_frame() -> Result<u64, PmmError> {
     alloc.allocate().ok_or(PmmError::OutOfMemory)
 }
 
+/// Allocate a physically contiguous, aligned run of 4 KiB frames.
+///
+/// The returned range is marked used in the PMM and will never be handed to
+/// normal frame allocations until each frame is explicitly freed. This is used
+/// for boot-critical DMA pools before an IOMMU/IOVA allocator exists.
+/// `alignment` is in bytes and must be a non-zero multiple of 4 KiB.
+/// `max_exclusive == 0` means no upper physical-address cap.
+pub fn alloc_contiguous_aligned(
+    length: u64,
+    alignment: u64,
+    max_exclusive: u64,
+) -> Result<u64, PmmError> {
+    if length == 0
+        || alignment == 0
+        || !length.is_multiple_of(FRAME_SIZE)
+        || !alignment.is_multiple_of(FRAME_SIZE)
+    {
+        return Err(PmmError::InvalidArgs);
+    }
+    let frame_count = usize::try_from(length / FRAME_SIZE).map_err(|_| PmmError::InvalidArgs)?;
+    let alignment_frames =
+        usize::try_from(alignment / FRAME_SIZE).map_err(|_| PmmError::InvalidArgs)?;
+    let max = if max_exclusive == 0 {
+        u64::MAX
+    } else {
+        max_exclusive
+    };
+    let (_irq, mut guard) = lock_allocator();
+    let alloc = guard.as_mut().ok_or(PmmError::NotInitialized)?;
+    alloc
+        .allocate_contiguous(frame_count, alignment_frames, max)
+        .ok_or(PmmError::OutOfMemory)
+}
+
 /// Free a previously allocated frame.
 ///
 /// Same IRQ-safety contract as [`alloc_frame`].
@@ -471,6 +549,45 @@ mod tests {
             // Reserve frames well past the bitmap's own storage.
             reserve_range(FRAME_SIZE * 10, FRAME_SIZE * 2);
             assert_eq!(free_frames(), free_before - 2);
+        });
+    }
+
+    #[test]
+    fn alloc_contiguous_respects_alignment_and_max_address() {
+        with_fresh_pmm(FRAME_SIZE * 128, || {
+            let free_before = free_frames();
+            let Ok(base) =
+                alloc_contiguous_aligned(FRAME_SIZE * 4, FRAME_SIZE * 8, FRAME_SIZE * 96)
+            else {
+                assert!(false, "contiguous run should fit");
+                return;
+            };
+            assert_eq!(base % (FRAME_SIZE * 8), 0);
+            assert!(base + FRAME_SIZE * 4 <= FRAME_SIZE * 96);
+            assert_eq!(free_frames(), free_before - 4);
+
+            // Reserve the same run through normal allocation exhaustion checks:
+            // no subsequent single-frame allocation may return a frame inside it.
+            for _ in 0..free_frames() {
+                match alloc_frame() {
+                    Ok(frame) => assert!(frame < base || frame >= base + FRAME_SIZE * 4),
+                    Err(_) => break,
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn alloc_contiguous_rejects_bad_shape() {
+        with_fresh_pmm(FRAME_SIZE * 16, || {
+            assert_eq!(
+                alloc_contiguous_aligned(0, FRAME_SIZE, 0),
+                Err(PmmError::InvalidArgs)
+            );
+            assert_eq!(
+                alloc_contiguous_aligned(FRAME_SIZE, 1, 0),
+                Err(PmmError::InvalidArgs)
+            );
         });
     }
 
