@@ -17,7 +17,7 @@ use core::ptr::null_mut;
 use huesos_nvme::controller::{Controller, ControllerConfig, NvmeError};
 use huesos_nvme::device::{BarRegion, DeviceResources, DmaRegion};
 use huesos_nvme::pci_transport::PciMmioTransport;
-use libcanvas::{println, Channel, ErrorCode, Handle};
+use libcanvas::{println, Channel, ErrorCode, Handle, Interrupt, Port};
 
 const REQUIRED_RESOURCES: usize = 3;
 const RESOURCE_LABEL_PREFIX: &[u8] = b"resource:";
@@ -25,6 +25,8 @@ const RESOURCE_TRANSFER_COMPLETE: &[u8] = b"resource:transfer-complete";
 const LABEL_CAP: usize = 96;
 const MMIO_MAP_ADDR: u64 = 0x0000_7000_0000_0000;
 const DMA_MAP_ADDR: u64 = 0x0000_7100_0000_0000;
+const MSI_VECTOR_BASE: u64 = 0xD0;
+const MAX_BOUND_INTERRUPTS: usize = 16;
 
 struct NoHeapAllocator;
 
@@ -42,6 +44,34 @@ unsafe impl GlobalAlloc for NoHeapAllocator {
 
 #[global_allocator]
 static ALLOCATOR: NoHeapAllocator = NoHeapAllocator;
+
+struct InterruptSlot {
+    handle: Option<Interrupt>,
+}
+
+impl InterruptSlot {
+    const fn empty() -> Self {
+        Self { handle: None }
+    }
+}
+
+struct InterruptState {
+    port: Port,
+    slots: [InterruptSlot; MAX_BOUND_INTERRUPTS],
+    count: usize,
+}
+
+impl InterruptState {
+    fn keepalive_marker(&self) -> usize {
+        let mut live = usize::from(self.port.handle().raw() != 0);
+        for slot in &self.slots {
+            if slot.handle.is_some() {
+                live += 1;
+            }
+        }
+        live
+    }
+}
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum ResourceSlotKind {
@@ -238,11 +268,13 @@ pub extern "C" fn _start() -> ! {
     drain_bootstrap_resources(&bootstrap, &mut state);
     state.log_summary();
 
+    let mut interrupt_state: Option<InterruptState> = None;
     if state.ready() {
         println!("[driver-host:nvme] resources: mmio OK, irq OK, dma OK");
         let _ = bootstrap.write(b"driver-host:nvme:resources-ready");
         match bring_up_controller(&state) {
-            Ok(()) => {
+            Ok(irq_state) => {
+                interrupt_state = Some(irq_state);
                 let _ = bootstrap.write(b"service:block:nvme:identified");
                 let _ = bootstrap.write(b"driver-host:nvme:ready");
             }
@@ -256,11 +288,14 @@ pub extern "C" fn _start() -> ! {
     }
 
     loop {
+        if let Some(irq_state) = interrupt_state.as_ref() {
+            let _keep_irq_handles_alive = irq_state.keepalive_marker();
+        }
         libcanvas::process::yield_now();
     }
 }
 
-fn bring_up_controller(state: &NvmeBootstrap) -> Result<(), &'static str> {
+fn bring_up_controller(state: &NvmeBootstrap) -> Result<InterruptState, &'static str> {
     let mmio = state.slot(ResourceSlotKind::Mmio).ok_or("mmio-slot")?;
     let irq = state.slot(ResourceSlotKind::Irq).ok_or("irq-slot")?;
     let dma = state.slot(ResourceSlotKind::DmaPool).ok_or("dma-slot")?;
@@ -294,6 +329,8 @@ fn bring_up_controller(state: &NvmeBootstrap) -> Result<(), &'static str> {
             size: dma.len,
         },
     };
+    let interrupt_state = bind_interrupts(irq)?;
+    let interrupt_first = interrupt_state.count != 0;
     let transport = PciMmioTransport::new(resources);
     let mut controller = Controller::new(transport, dma.base, dma.len);
     let cpu_count = match libcanvas::system::cpu_count() {
@@ -302,26 +339,61 @@ fn bring_up_controller(state: &NvmeBootstrap) -> Result<(), &'static str> {
     };
     let config = ControllerConfig {
         cpu_count,
-        // Stage B brings the controller up with a polling completion path until
-        // MSI-X/MSI programming grows a PCI config-space Resource/API. The queue
-        // planner still records the fallback policy and creates per-CPU queues.
-        msix_available: false,
-        msi_available: false,
+        msix_available: interrupt_first && irq.len > 1,
+        msi_available: interrupt_first && irq.len == 1,
     };
     let info = controller
         .init_with_config(config)
         .map_err(nvme_error_label)?;
     println!(
-        "[driver-host:nvme] identified nsid={} block_size={} block_count={} max_request={} queues={} irq={:#x}+{:#x}",
+        "[driver-host:nvme] identified nsid={} block_size={} block_count={} max_request={} queues={} irq={:#x}+{:#x} bound_irqs={}",
         info.namespace.nsid,
         info.namespace.block_size,
         info.namespace.block_count,
         info.controller.max_request_bytes,
         info.io_queue_count,
         irq.base,
-        irq.len
+        irq.len,
+        interrupt_state.count
     );
-    Ok(())
+    Ok(interrupt_state)
+}
+
+fn bind_interrupts(irq: &ResourceSlot) -> Result<InterruptState, &'static str> {
+    let Some(irq_handle) = irq.handle() else {
+        return Err("irq-handle");
+    };
+    let port = Port::create().map_err(|_| "irq-port")?;
+    let mut state = InterruptState {
+        port,
+        slots: [const { InterruptSlot::empty() }; MAX_BOUND_INTERRUPTS],
+        count: 0,
+    };
+    if irq.base < MSI_VECTOR_BASE {
+        println!(
+            "[driver-host:nvme] no MSI/MSI-X vectors programmed; polling fallback irq={:#x}+{:#x}",
+            irq.base, irq.len
+        );
+        return Ok(state);
+    }
+    let bind_count = (irq.len as usize).min(MAX_BOUND_INTERRUPTS);
+    let mut idx = 0usize;
+    while idx < bind_count {
+        let vector = irq.base + idx as u64;
+        let interrupt =
+            Interrupt::create_from_resource(irq_handle, vector as u32).map_err(|_| "irq-create")?;
+        interrupt
+            .bind_port(&state.port, vector)
+            .map_err(|_| "irq-bind")?;
+        state.slots[idx].handle = Some(interrupt);
+        state.count += 1;
+        idx += 1;
+    }
+    println!(
+        "[driver-host:nvme] bound {} MSI/MSI-X vector(s) at {:#x}",
+        state.count, irq.base
+    );
+    Ok(state)
 }
 
 fn nvme_error_label(error: NvmeError) -> &'static str {
