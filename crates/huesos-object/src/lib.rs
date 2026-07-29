@@ -39,7 +39,7 @@ pub use job::{flush_pending_quota_notifications, Job};
 pub use koid::{alloc_koid, Koid};
 pub use object::{KernelObject, KernelObjectExt, ObjectType};
 pub use port::{Port, PortCreateError, PortPacket, PortQueueError};
-pub use process::{Process, ProcessExitPortError};
+pub use process::{steal_opt_in_process_count, Process, ProcessExitPortError};
 pub(crate) use registry::phys_to_virt;
 pub use registry::{
     acquire_kernel_ref, collect_exited_process, current_process, lookup_interrupts_by_irq,

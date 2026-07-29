@@ -16,6 +16,7 @@ use huesos_proclife::{ExitInfo, ProcState, ProcessLifecycle};
 
 const PORT_PACKET_PROCESS_EXIT: u32 = 2;
 const MAX_EXIT_PORTS: usize = 8;
+static STEAL_OPT_IN_PROCESS_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 /// Failure when binding a process-exit port.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -75,6 +76,11 @@ pub struct Process {
     /// (`src/power/shutdown-shim/main.cc`), captured in
     /// `docs/ARCHITECTURE_ROADMAP.md` §3.
     critical: AtomicBool,
+}
+
+/// Number of processes that enabled opt-in scheduler stealing.
+pub fn steal_opt_in_process_count() -> usize {
+    STEAL_OPT_IN_PROCESS_COUNT.load(Ordering::Acquire)
 }
 
 impl Process {
@@ -186,7 +192,19 @@ impl Process {
             return false;
         }
         drop(lifecycle);
-        self.scheduler_flags.store(flags, Ordering::Release);
+        let old = self.scheduler_flags.swap(flags, Ordering::AcqRel);
+        let steal_flag = huesos_abi::scheduler_flags::STEAL_OPT_IN;
+        let old_steal = old & steal_flag != 0;
+        let new_steal = flags & steal_flag != 0;
+        match (old_steal, new_steal) {
+            (false, true) => {
+                STEAL_OPT_IN_PROCESS_COUNT.fetch_add(1, Ordering::AcqRel);
+            }
+            (true, false) => {
+                STEAL_OPT_IN_PROCESS_COUNT.fetch_sub(1, Ordering::AcqRel);
+            }
+            _ => {}
+        }
         true
     }
 
@@ -361,6 +379,16 @@ impl Process {
     pub fn observed_exit_generation(&self, generation: u64) -> bool {
         self.exit_info()
             .is_some_and(|info| info.generation == generation)
+    }
+}
+
+impl Drop for Process {
+    fn drop(&mut self) {
+        if self.scheduler_flags.load(Ordering::Acquire) & huesos_abi::scheduler_flags::STEAL_OPT_IN
+            != 0
+        {
+            STEAL_OPT_IN_PROCESS_COUNT.fetch_sub(1, Ordering::AcqRel);
+        }
     }
 }
 

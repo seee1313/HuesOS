@@ -677,7 +677,10 @@ unsafe fn register_scheduler_ptr(sched: *mut Scheduler) {
     reason = "future idle-task/deferred scheduler hook; never called from hard timer IRQ"
 )]
 fn try_token_steal_for_idle_cpu(target_cpu: usize) {
-    if target_cpu >= MAX_CPUS || !is_cpu_online(target_cpu) {
+    if target_cpu >= MAX_CPUS
+        || !is_cpu_online(target_cpu)
+        || huesos_object::steal_opt_in_process_count() == 0
+    {
         return;
     }
     {
