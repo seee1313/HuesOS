@@ -397,6 +397,9 @@ pub(crate) fn sys_vmar_create_child(args_ptr: *const VmarCreateChildArgs) -> Sys
         return Err(ErrorCode::AccessDenied);
     }
 
+    // `Vmar::new_child` takes ownership of this explicit parent kernel-ref:
+    // if reservation/publication fails before registration, dropping the child
+    // VMAR closes it; after registration, unregistering the child closes it.
     let _parent_ref =
         huesos_object::acquire_kernel_ref(parent.koid()).ok_or(ErrorCode::BadHandle)?;
     let child = huesos_object::Vmar::new_child(parent, args.addr, args.len);

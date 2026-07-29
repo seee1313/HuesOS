@@ -288,6 +288,37 @@ mod tests {
     }
 
     #[test]
+    fn failed_child_vmar_reservation_releases_parent_kernel_ref() {
+        let parent = Vmar::new_root(Koid(100), 0x1000, 0x4000);
+        let parent_koid = parent.koid();
+        register_object(parent.clone());
+        assert!(parent
+            .record_child(VmarChild {
+                koid: Koid(200),
+                base: 0x1000,
+                size: 0x1000,
+            })
+            .is_ok());
+
+        let Some(_parent_ref) = acquire_kernel_ref(parent_koid) else {
+            assert!(false, "registered VMAR must acquire a kernel ref");
+            return;
+        };
+        assert_eq!(object_ref_counts(parent_koid), (0, 1));
+        let child = Vmar::new_child(&parent, 0x1000, 0x1000);
+        assert!(parent
+            .record_child(VmarChild {
+                koid: child.koid(),
+                base: child.base(),
+                size: child.size(),
+            })
+            .is_err());
+        drop(child);
+        assert_eq!(object_ref_counts(parent_koid), (0, 0));
+        unregister_object(parent_koid);
+    }
+
+    #[test]
     fn signal_is_level_triggered() {
         let signal = Signal::new();
         assert_eq!(signal.object_type(), ObjectType::Signal);
