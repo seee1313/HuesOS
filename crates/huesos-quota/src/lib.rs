@@ -195,6 +195,7 @@ struct Node {
     children: Vec<usize>,
     limits: Limits,
     used: Usage,
+    active: bool,
 }
 
 /// A hierarchical resource-quota tree (the Job-tree model).
@@ -242,6 +243,7 @@ impl QuotaTree {
             children: Vec::new(),
             limits,
             used: Usage::default(),
+            active: true,
         });
         NodeId {
             index: id,
@@ -251,10 +253,12 @@ impl QuotaTree {
 
     fn index_of(&self, node: NodeId) -> Result<usize, QuotaTreeError> {
         if node.tree_id != self.tree_id || node.index >= self.nodes.len() {
-            Err(QuotaTreeError::InvalidNode)
-        } else {
-            Ok(node.index)
+            return Err(QuotaTreeError::InvalidNode);
         }
+        if !self.nodes[node.index].active {
+            return Err(QuotaTreeError::InvalidNode);
+        }
+        Ok(node.index)
     }
 
     /// Add a child node under `parent`.
@@ -266,12 +270,37 @@ impl QuotaTree {
             children: Vec::new(),
             limits,
             used: Usage::default(),
+            active: true,
         });
         self.nodes[parent_index].children.push(id);
         Ok(NodeId {
             index: id,
             tree_id: self.tree_id,
         })
+    }
+
+    /// Remove an unpublished leaf node.
+    ///
+    /// This is intended for transactional rollback after a privileged caller
+    /// created a child Job node but failed to publish the corresponding handle.
+    /// Only active, childless, zero-usage non-root nodes can be removed. The
+    /// backing slot becomes an inactive tombstone so existing [`NodeId`] indices
+    /// for other nodes remain stable.
+    pub fn remove_leaf(&mut self, node: NodeId) -> Result<(), QuotaTreeError> {
+        let index = self.index_of(node)?;
+        if self.nodes[index].parent.is_none()
+            || !self.nodes[index].children.is_empty()
+            || self.nodes[index].used != Usage::default()
+        {
+            return Err(QuotaTreeError::InvalidNode);
+        }
+        if let Some(parent) = self.nodes[index].parent {
+            self.nodes[parent].children.retain(|&child| child != index);
+        }
+        self.nodes[index].active = false;
+        self.nodes[index].parent = None;
+        self.nodes[index].limits = Limits::unlimited();
+        Ok(())
     }
 
     fn subtree_usage_index(&self, index: usize) -> Usage {
@@ -492,6 +521,28 @@ mod tests {
         assert!(!t.try_acquire(leaf, Resource::Memory, 1)); // mid's 120 caps it
         assert_eq!(subtree_memory(&t, root), 120);
         assert_eq!(subtree_memory(&t, mid), 120);
+    }
+
+    #[test]
+    fn remove_leaf_rolls_back_unpublished_child() {
+        let mut t = QuotaTree::new();
+        let root = t.add_root(mem_limits(100));
+        let child = child(&mut t, root, mem_limits(10));
+        assert_eq!(t.len(), 2);
+        assert_eq!(t.remove_leaf(child), Ok(()));
+        assert_eq!(t.limits(child), Err(QuotaTreeError::InvalidNode));
+        assert_eq!(t.subtree_usage(root).map(|usage| usage.memory), Ok(0));
+    }
+
+    #[test]
+    fn remove_leaf_rejects_used_or_parent_nodes() {
+        let mut t = QuotaTree::new();
+        let root = t.add_root(mem_limits(100));
+        let child_node = child(&mut t, root, mem_limits(10));
+        let grandchild = child(&mut t, child_node, mem_limits(5));
+        assert_eq!(t.remove_leaf(child_node), Err(QuotaTreeError::InvalidNode));
+        assert!(t.try_acquire(grandchild, Resource::Memory, 1));
+        assert_eq!(t.remove_leaf(grandchild), Err(QuotaTreeError::InvalidNode));
     }
 
     #[test]

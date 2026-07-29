@@ -142,6 +142,11 @@ impl Job {
         self.parent.clone()
     }
 
+    /// Roll back this Job's quota-tree node before the Job is published.
+    pub fn rollback_unpublished_quota_node(&self) -> bool {
+        self.quota_tree.lock().remove_leaf(self.quota_node).is_ok()
+    }
+
     /// Try to charge a resource to this Job and all ancestor limits.
     pub fn charge(&self, resource: Resource, amount: u64) -> bool {
         let charged = self

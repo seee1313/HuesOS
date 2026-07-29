@@ -57,6 +57,11 @@ pub(crate) fn sys_job_create(args_ptr: *const JobCreateArgs) -> SyscallResult {
     ) {
         Ok((handle, _)) => Ok(handle as i64),
         Err(error) => {
+            if let Some(object) = huesos_object::lookup_object(koid) {
+                if let Some(job) = object.downcast_ref::<huesos_object::Job>() {
+                    let _ = job.rollback_unpublished_quota_node();
+                }
+            }
             huesos_object::unregister_object(koid);
             Err(error)
         }
