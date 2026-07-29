@@ -21,6 +21,7 @@ extern crate alloc;
 
 pub mod async_controller;
 pub mod block;
+pub mod block_async;
 pub mod buffer_pool;
 pub mod cmd;
 pub mod controller;
@@ -35,6 +36,9 @@ pub mod transport;
 
 pub use async_controller::{AsyncController, InterruptController, PollingInterrupts};
 pub use block::{BlockDevice, BlockInfo, BlockOp};
+pub use block_async::{
+    completion_data, decode_completion_data, AsyncBlockOp, AsyncBlockRequest, AsyncBlockStatus,
+};
 pub use buffer_pool::DmaBufferPool;
 pub use cmd::{Cqe, Sqe};
 pub use controller::{Controller, NvmeError};
