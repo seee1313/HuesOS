@@ -27,6 +27,13 @@ fn main() {
         profile,
         &[],
     );
+    let nvme_driver_host = build_userspace_program(
+        &userspace_root,
+        "driver-host-nvme",
+        "huesos-driver-host-nvme",
+        profile,
+        &[],
+    );
     let driver_manager = build_userspace_program(
         &userspace_root,
         "driver-manager",
@@ -64,6 +71,7 @@ fn main() {
     let _bootfs = build_bootfs_image(
         &manifest_dir,
         &input_driver_host,
+        &nvme_driver_host,
         &acpi_manager,
         &shutdown_broker,
         &terminal,
@@ -91,6 +99,7 @@ fn track_userspace_inputs(userspace_root: &Path) {
         "init",
         "driver-manager",
         "driver-host-input",
+        "driver-host-nvme",
         "acpi-manager",
         "shutdown-broker",
         "terminal",
@@ -164,6 +173,7 @@ struct BootFsFile {
 fn build_bootfs_image(
     manifest_dir: &Path,
     input_driver_host: &Path,
+    nvme_driver_host: &Path,
     acpi_manager: &Path,
     shutdown_broker: &Path,
     terminal: &Path,
@@ -207,8 +217,23 @@ fn build_bootfs_image(
             data: b"name=shutdown-broker\nkind=service\nresource=ioport:0x64:1:excl\nresource=pwr:0x0:0x0:excl\ncritical=true\nelf=/services/shutdown-broker.elf\n".to_vec(),
         },
         BootFsFile {
+            path: "/manifests/nvme.hdriver",
+            // Stage-A NVMe resources are dynamic (PCI BAR, IRQ metadata, and
+            // reserved DMA pool) so init mints them from the kernel-produced
+            // storage boot-info VMO rather than static resource= lines.
+            data: b"name=driver-host-nvme\nkind=driver-host\nprovides=block:nvme\ncritical=false\nelf=/drivers/driver-host-nvme.elf\nheartbeat=false\n".to_vec(),
+        },
+        BootFsFile {
+            path: "/storage/boot-drivers.manifest",
+            data: build_boot_driver_manifest(),
+        },
+        BootFsFile {
             path: "/drivers/input-host.elf",
             data: fs::read(input_driver_host).expect("failed to read input DriverHost ELF"),
+        },
+        BootFsFile {
+            path: "/drivers/driver-host-nvme.elf",
+            data: read_build_input(nvme_driver_host, "NVMe DriverHost ELF"),
         },
         BootFsFile {
             path: "/services/acpi-manager.elf",
@@ -240,6 +265,32 @@ fn build_bootfs_image(
         manifest_dir.join("build.rs").display()
     );
     bootfs_path
+}
+
+fn build_boot_driver_manifest() -> Vec<u8> {
+    const MAGIC: u32 = 0x4844_5242;
+    const VERSION: u16 = 1;
+    const PATH_BYTES: usize = 64;
+    const ENTRY_BYTES: usize = PATH_BYTES * 2 + 4;
+
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&MAGIC.to_le_bytes());
+    bytes.extend_from_slice(&VERSION.to_le_bytes());
+    bytes.extend_from_slice(&1u16.to_le_bytes());
+    let mut entry = [0u8; ENTRY_BYTES];
+    write_padded_path(&mut entry[..PATH_BYTES], b"/drivers/driver-host-nvme.elf");
+    write_padded_path(
+        &mut entry[PATH_BYTES..PATH_BYTES * 2],
+        b"/manifests/nvme.hdriver",
+    );
+    entry[PATH_BYTES * 2..PATH_BYTES * 2 + 4].copy_from_slice(&0u32.to_le_bytes());
+    bytes.extend_from_slice(&entry);
+    bytes
+}
+
+fn write_padded_path(dst: &mut [u8], path: &[u8]) {
+    let len = path.len().min(dst.len().saturating_sub(1));
+    dst[..len].copy_from_slice(&path[..len]);
 }
 
 fn read_build_input(path: &Path, label: &str) -> Vec<u8> {

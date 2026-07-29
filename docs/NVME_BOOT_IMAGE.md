@@ -1,6 +1,6 @@
 # NVMe DriverHost HBI `.img` Bootstrap Contract
 
-Status: **contract landed; kernel/DriverManager wiring remains next**.
+Status: **Stage A wiring landed; controller I/O remains next**.
 
 HuesOS keeps storage-critical userspace drivers out of the disk they are needed
 to read. The bootloader provides an HBI image containing a small immutable
@@ -9,7 +9,9 @@ bootstrap set:
 - `init` and DriverManager;
 - `driver-host-nvme` ELF;
 - the NVMe driver manifest;
-- resource metadata for BAR/MMIO, IRQ/MSI/MSI-X policy, and a 64 MiB `DmaPool`;
+- `/storage/boot-drivers.manifest` naming storage-critical DriverHosts;
+- kernel-produced storage boot-info metadata for BAR/MMIO, IRQ/MSI/MSI-X policy,
+  and the 64 MiB `DmaPool`;
 - optional recovery/diagnostic tools.
 
 ## Why this exists
@@ -23,29 +25,59 @@ all drivers required to reach persistent storage are already in the boot image.
 The HBI BOOTFS namespace reserves:
 
 ```text
-/bin/driver-host-nvme.elf
+/drivers/driver-host-nvme.elf
 /manifests/nvme.hdriver
 /storage/boot-drivers.manifest
 ```
 
 `/storage/boot-drivers.manifest` is a small fixed-record table described by
-`huesos_abi::hbi_boot`. It names each storage-critical DriverHost and its
-manifest path. The manifest then declares fine-grained Resource grants, including
-`resource=dma:<phys-base>:0x4000000:excl` for the preallocated 64 MiB DMA pool.
+`huesos_abi::hbi_boot`. It names each storage-critical DriverHost ELF and its
+manifest path. Stage A currently emits one entry:
+
+```text
+elf      = /drivers/driver-host-nvme.elf
+manifest = /manifests/nvme.hdriver
+```
+
+The `.hdriver` does **not** hard-code BAR/IRQ/DMA resources, because those are
+discovered dynamically. Instead, the kernel installs a read-only storage
+boot-info VMO (`huesos_abi::storage_boot`) into init. Init reads that metadata,
+mints the root-only Resource handles, and forwards them to DriverManager before
+signalling `manifest:grants-complete:driver-host-nvme`.
 
 ## Resource labels
 
 When init/DriverManager transfers resources to `driver-host-nvme`, labels use
-the existing `resource:<driver>:<kind>:0x<base>:0x<len>:<mode>` format. `kind`
-for the DMA pool is `dma`.
+the existing format:
 
-## Non-goals in this slice
+```text
+resource:<driver>:<kind>:0x<base>:0x<len>:<mode>
+```
 
-This contract does not yet:
+Stage A sends, when hardware is present:
 
-- allocate/map the actual DMA pool;
-- discover the NVMe PCI BAR;
-- configure MSI-X/MSI;
-- launch `driver-host-nvme` during boot.
+```text
+resource:driver-host-nvme:mmio:0x<bar0_phys>:0x<bar0_len>:excl
+resource:driver-host-nvme:irq:0x<irq_or_metadata>:0x1:excl
+resource:driver-host-nvme:dma:0x<dma_pool_phys>:0x4000000:excl
+```
 
-Those are the next on-target slices.
+`driver-host-nvme` validates labels strictly and logs either:
+
+```text
+[driver-host:nvme] resources: mmio OK, irq OK, dma OK
+```
+
+or the exact missing kind.
+
+## Still not part of Stage A
+
+Stage A intentionally does not yet:
+
+- map BAR0 into the DriverHost VMAR;
+- map the DMA pool into the DriverHost VMAR;
+- program MSI-X/MSI or bind completions to Ports;
+- initialize NVMe admin queues;
+- register a real async BlockDevice channel.
+
+Those are Stage B/C tasks.
