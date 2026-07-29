@@ -1,11 +1,14 @@
 # NVMe Driver (ring-3 DriverHost)
 
-Status: **production architecture foundation landed.** The repository now has:
+Status: **Stage A hardware plumbing landed.** The repository now has:
 `DmaPool` resource capability, a userspace `driver-host-nvme` skeleton, Identify
-Controller/Namespace parsers, per-CPU queue/DMA planning, and an async
-BlockDevice Channel+Port wire protocol. Real BAR mapping, interrupt routing,
-controller bring-up from HBI `.img`, and on-target I/O remain the next slices.
-This is ROADMAP Short-Term #7 (real VFS + drivers in userspace), first device.
+Controller/Namespace parsers, per-CPU queue/DMA planning, an async BlockDevice
+Channel+Port wire protocol, a 64 MiB boot DMA pool reservation, kernel PCI NVMe
+BAR/IRQ metadata discovery, HBI boot-driver packaging, and DriverManager launch
+of `driver-host-nvme` from BOOTFS when NVMe hardware is discovered. Real BAR
+userspace mapping, MSI-X/MSI programming, controller admin-queue bring-up, and
+on-target I/O remain the next slices. This is ROADMAP Short-Term #7 (real VFS +
+drivers in userspace), first device.
 
 ## Goal
 
@@ -88,22 +91,24 @@ The driver accesses the device through two abstractions:
 
 On-target, these are backed by kernel-provided capabilities:
 
-- **BAR mapping**: the kernel maps the NVMe controller's BAR0 (MMIO,
-  uncacheable) into the DriverHost's address space. This extends the existing
-  deny-by-default MMIO capability (used by the ACPI broker) into a general
-  device-MMIO grant authorized by the device manager.
-- **Coherent DMA buffers**: boot reserves a preallocated `DmaPool` resource
-  for the DriverHost. The first production target is a 64 MiB pool, physically
-  pinned and device-visible. The driver carves admin queues, per-CPU I/O queues,
-  PRP-list pages, request descriptors, and bounce buffers from that pool and
-  performs no heap allocation after initialization. With no IOMMU, DMA pool
-  pages must be physically contiguous (or represented by an IOMMU mapping that
-  is contiguous from the device's point of view).
+- **BAR metadata Resource**: Stage A discovers NVMe PCI functions using legacy
+  config-space access, validates BAR0 as a memory BAR, sizes it, and forwards an
+  exclusive `Mmio` Resource label to `driver-host-nvme`. The actual userspace
+  MMIO mapping syscall/VMAR path is deliberately left for Stage B before any
+  register access from ring 3.
+- **Interrupt metadata Resource**: Stage A records INTx line/pin and MSI/MSI-X
+  capability metadata, then forwards an `Irq` Resource label. MSI-X → MSI →
+  polling programming and Port delivery remain the next hardware slice.
+- **Coherent DMA buffers**: boot reserves a preallocated `DmaPool` resource for
+  the DriverHost. The first production target is a 64 MiB pool, physically
+  contiguous, pinned, below 4 GiB when available, and device-visible. The driver
+  can identify `base/len` and later carve admin queues, per-CPU I/O queues,
+  PRP-list pages, request descriptors, and bounce buffers from that pool without
+  heap allocation after initialization.
 
-This plumbing requires QEMU (`-device nvme`) / bare-metal verification and is a
-separate slice. The ABI side now has a `ResourceKindAbi::DmaPool` / object
-`ResourceKind::DmaPool` capability so DriverManager can transfer the reserved
-boot pool to `nvme-driverhost` without treating it as ordinary MMIO.
+The ABI side has a `ResourceKindAbi::DmaPool` / object `ResourceKind::DmaPool`
+capability and a storage boot-info VMO (`huesos_abi::storage_boot`) so init can
+mint dynamic resources while DriverManager remains the launch/registry owner.
 
 ## Block protocol / DriverManager registry
 
@@ -121,11 +126,28 @@ with the success response:
 service:block:nvme:channel
 ```
 
-Until the real NVMe DriverHost is launched and registered, DriverManager returns
-`err:block:nvme-unavailable` rather than treating the request as unknown. This
-keeps clients and future BlobFS/Hxfs code on a stable discovery contract.
+Stage A can launch the real NVMe DriverHost and mark the hardware resources as
+present, but there is still no async BlockDevice server channel. DriverManager
+therefore continues to return `err:block:nvme-unavailable` for `open:block:nvme`
+until Stage C wires a real service channel. This keeps clients and future
+BlobFS/Hxfs code on a stable discovery contract without pretending that storage
+I/O is already online.
 
 ## On-target verification checklist
+
+Stage A completed in code:
+
+- Boot reserves/logs the 64 MiB DMA pool.
+- Kernel storage boot-info logs discovered NVMe PCI function(s), BAR0, IRQ line,
+  and MSI/MSI-X metadata.
+- Init forwards `Mmio`, `Irq`, and `DmaPool` Resource handles with deterministic
+  labels to DriverManager.
+- DriverManager enumerates `/storage/boot-drivers.manifest` and launches
+  `/drivers/driver-host-nvme.elf` from HBI BOOTFS when hardware is present.
+- `driver-host-nvme` logs `resources: mmio OK, irq OK, dma OK` or the exact
+  missing resource kind.
+
+Remaining Stage B/C work:
 
 - Controller enable: CC.EN -> wait CSTS.RDY within CAP.TO; AQA/ASQ/ACQ set up.
 - Identify Controller + Namespace; Set Features (Number of Queues); Create I/O
