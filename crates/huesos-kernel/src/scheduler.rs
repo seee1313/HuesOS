@@ -135,8 +135,51 @@ fn process_runqueue_token_mailbox(cpu: usize) {
             Ordering::Acquire,
         )
         .is_ok()
+        && TOKEN_MAILBOX_STATE[cpu]
+            .compare_exchange(
+                TOKEN_MAILBOX_PENDING,
+                TOKEN_MAILBOX_GRANTED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
     {
-        TOKEN_MAILBOX_STATE[cpu].store(TOKEN_MAILBOX_GRANTED, Ordering::Release);
+        // Requester canceled after we acquired the token but before the
+        // grant was published. Do not leave a token nobody will release.
+        RUNQUEUE_TOKENS[cpu].store(RUNQUEUE_TOKEN_FREE, Ordering::Release);
+    }
+}
+
+fn cancel_runqueue_token_request(cpu: usize, requester: usize, request_id: u64) {
+    if TOKEN_MAILBOX_REQUEST_ID[cpu].load(Ordering::Acquire) != request_id {
+        return;
+    }
+    if TOKEN_MAILBOX_STATE[cpu]
+        .compare_exchange(
+            TOKEN_MAILBOX_PENDING,
+            TOKEN_MAILBOX_EMPTY,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        )
+        .is_ok()
+    {
+        return;
+    }
+    if TOKEN_MAILBOX_REQUEST_ID[cpu].load(Ordering::Acquire) == request_id
+        && TOKEN_MAILBOX_STATE[cpu].load(Ordering::Acquire) == TOKEN_MAILBOX_GRANTED
+    {
+        let _ = RUNQUEUE_TOKENS[cpu].compare_exchange(
+            requester,
+            RUNQUEUE_TOKEN_FREE,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+        let _ = TOKEN_MAILBOX_STATE[cpu].compare_exchange(
+            TOKEN_MAILBOX_GRANTED,
+            TOKEN_MAILBOX_EMPTY,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
     }
 }
 
@@ -188,27 +231,7 @@ fn acquire_runqueue_token(cpu: usize) -> Option<RunqueueTokenGuard> {
         }
         core::hint::spin_loop();
     }
-    if TOKEN_MAILBOX_REQUEST_ID[cpu].load(Ordering::Acquire) == request_id
-        && TOKEN_MAILBOX_STATE[cpu]
-            .compare_exchange(
-                TOKEN_MAILBOX_PENDING,
-                TOKEN_MAILBOX_EMPTY,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            )
-            .is_ok()
-    {
-        return None;
-    }
-    if TOKEN_MAILBOX_REQUEST_ID[cpu].load(Ordering::Acquire) == request_id
-        && TOKEN_MAILBOX_STATE[cpu].load(Ordering::Acquire) == TOKEN_MAILBOX_GRANTED
-    {
-        return Some(RunqueueTokenGuard {
-            cpu,
-            remote: true,
-            request_id,
-        });
-    }
+    cancel_runqueue_token_request(cpu, current, request_id);
     None
 }
 
