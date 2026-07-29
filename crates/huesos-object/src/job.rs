@@ -179,8 +179,22 @@ impl Job {
     }
 
     /// Replace limits for this Job node.
+    ///
+    /// Refuses to tighten below current subtree usage; callers must first
+    /// release resources or choose a limit that can actually contain the Job.
     pub fn set_limits(&self, limits: Limits) -> bool {
-        self.quota_tree.lock().set_limits(self.quota_node, limits)
+        let mut tree = self.quota_tree.lock();
+        let Ok(usage) = tree.subtree_usage(self.quota_node) else {
+            return false;
+        };
+        if (limits.max_memory != huesos_quota::UNLIMITED && usage.memory > limits.max_memory)
+            || (limits.max_handles != huesos_quota::UNLIMITED && usage.handles > limits.max_handles)
+            || (limits.max_cpu_ticks != huesos_quota::UNLIMITED
+                && usage.cpu_ticks > limits.max_cpu_ticks)
+        {
+            return false;
+        }
+        tree.set_limits(self.quota_node, limits)
     }
 
     /// Bind a Port to receive quota-exhaustion packets for this Job.
@@ -353,6 +367,15 @@ mod tests {
         drop(job);
         assert_eq!(crate::object_ref_counts(port_koid), (0, 0));
         crate::unregister_object(port_koid);
+    }
+
+    #[test]
+    fn job_set_limits_rejects_tightening_below_usage() {
+        let job = Job::root_with_limits(memory_limits(100));
+        assert!(job.charge(Resource::Memory, 60));
+        assert!(!job.set_limits(memory_limits(50)));
+        assert!(job.set_limits(memory_limits(60)));
+        assert!(!job.charge(Resource::Memory, 1));
     }
 
     #[test]
