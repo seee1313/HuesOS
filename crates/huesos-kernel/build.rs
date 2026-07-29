@@ -34,6 +34,13 @@ fn main() {
         profile,
         &[],
     );
+    let hxfs_service = build_userspace_program(
+        &userspace_root,
+        "hxfs-service",
+        "huesos-hxfs-service",
+        profile,
+        &[],
+    );
     let driver_manager = build_userspace_program(
         &userspace_root,
         "driver-manager",
@@ -70,12 +77,15 @@ fn main() {
     );
     let _bootfs = build_bootfs_image(
         &manifest_dir,
-        &input_driver_host,
-        &nvme_driver_host,
-        &acpi_manager,
-        &shutdown_broker,
-        &terminal,
-        &doom,
+        BootfsInputs {
+            input_driver_host: &input_driver_host,
+            nvme_driver_host: &nvme_driver_host,
+            hxfs_service: &hxfs_service,
+            acpi_manager: &acpi_manager,
+            shutdown_broker: &shutdown_broker,
+            terminal: &terminal,
+            doom: &doom,
+        },
     );
     let init = build_userspace_program(
         &userspace_root,
@@ -100,6 +110,7 @@ fn track_userspace_inputs(userspace_root: &Path) {
         "driver-manager",
         "driver-host-input",
         "driver-host-nvme",
+        "hxfs-service",
         "acpi-manager",
         "shutdown-broker",
         "terminal",
@@ -170,15 +181,17 @@ struct BootFsFile {
     data: Vec<u8>,
 }
 
-fn build_bootfs_image(
-    manifest_dir: &Path,
-    input_driver_host: &Path,
-    nvme_driver_host: &Path,
-    acpi_manager: &Path,
-    shutdown_broker: &Path,
-    terminal: &Path,
-    doom: &Path,
-) -> PathBuf {
+struct BootfsInputs<'a> {
+    input_driver_host: &'a Path,
+    nvme_driver_host: &'a Path,
+    hxfs_service: &'a Path,
+    acpi_manager: &'a Path,
+    shutdown_broker: &'a Path,
+    terminal: &'a Path,
+    doom: &'a Path,
+}
+
+fn build_bootfs_image(manifest_dir: &Path, inputs: BootfsInputs<'_>) -> PathBuf {
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
     let bootfs_path = out_dir.join("huesos.bootfs");
     let files = vec![
@@ -229,27 +242,31 @@ fn build_bootfs_image(
         },
         BootFsFile {
             path: "/drivers/input-host.elf",
-            data: fs::read(input_driver_host).expect("failed to read input DriverHost ELF"),
+            data: fs::read(inputs.input_driver_host).expect("failed to read input DriverHost ELF"),
         },
         BootFsFile {
             path: "/drivers/driver-host-nvme.elf",
-            data: read_build_input(nvme_driver_host, "NVMe DriverHost ELF"),
+            data: read_build_input(inputs.nvme_driver_host, "NVMe DriverHost ELF"),
+        },
+        BootFsFile {
+            path: "/services/hxfs.elf",
+            data: read_build_input(inputs.hxfs_service, "Hxfs service ELF"),
         },
         BootFsFile {
             path: "/services/acpi-manager.elf",
-            data: read_build_input(acpi_manager, "ACPI manager ELF"),
+            data: read_build_input(inputs.acpi_manager, "ACPI manager ELF"),
         },
         BootFsFile {
             path: "/services/shutdown-broker.elf",
-            data: read_build_input(shutdown_broker, "shutdown-broker ELF"),
+            data: read_build_input(inputs.shutdown_broker, "shutdown-broker ELF"),
         },
         BootFsFile {
             path: "/bin/terminal.elf",
-            data: fs::read(terminal).expect("failed to read terminal ELF"),
+            data: fs::read(inputs.terminal).expect("failed to read terminal ELF"),
         },
         BootFsFile {
             path: "/bin/doom.elf",
-            data: read_build_input(doom, "Doom ELF"),
+            data: read_build_input(inputs.doom, "Doom ELF"),
         },
         BootFsFile {
             path: "/data/freedoom1.wad",

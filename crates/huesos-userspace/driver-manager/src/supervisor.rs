@@ -142,6 +142,9 @@ pub struct DriverManager {
     registry: ServiceRegistry,
     input_host: Option<ManagedHost>,
     nvme_host: Option<ManagedHost>,
+    hxfs_service: Option<ManagedHost>,
+    hxfs_failed: bool,
+    hxfs_ready: bool,
     acpi_manager: Option<ManagedHost>,
     acpi_tables: Option<Vmo>,
     acpi_broker: Option<Handle>,
@@ -255,6 +258,9 @@ impl DriverManager {
             registry,
             input_host: None,
             nvme_host: None,
+            hxfs_service: None,
+            hxfs_failed: false,
+            hxfs_ready: false,
             acpi_manager: None,
             acpi_tables: None,
             acpi_broker: None,
@@ -667,14 +673,24 @@ impl DriverManager {
             self.poll_registry_requests();
             self.fs.poll();
             let nvme_online = self.registry.state("block:nvme") == Some(ServiceState::Online);
-            let nvme_bootstrap = self.nvme_host.as_ref().map(|host| &host.bootstrap);
-            self.volume.poll(nvme_bootstrap, nvme_online);
-            self.blobfs
-                .poll(&mut self.volume, nvme_bootstrap, nvme_online);
-            self.devfs
-                .poll(&mut self.volume, nvme_bootstrap, nvme_online);
+            self.volume.poll(
+                self.nvme_host.as_ref().map(|host| &host.bootstrap),
+                nvme_online,
+            );
+            self.try_start_hxfs_service(nvme_online);
+            self.blobfs.poll(
+                &mut self.volume,
+                self.nvme_host.as_ref().map(|host| &host.bootstrap),
+                nvme_online,
+            );
+            self.devfs.poll(
+                &mut self.volume,
+                self.nvme_host.as_ref().map(|host| &host.bootstrap),
+                nvme_online,
+            );
             self.poll_input_host();
             self.poll_nvme_host();
+            self.poll_hxfs_service();
             self.poll_acpi_manager();
             // Multi-channel poll: cannot block on one fd without starving others.
             // Yield cooperatively; hot IRQ path is already blocking in the host.
@@ -685,6 +701,57 @@ impl DriverManager {
     /// Return whether the keyboard service is online.
     pub fn keyboard_ready(&self) -> bool {
         self.registry.state("keyboard") == Some(ServiceState::Online)
+    }
+
+    fn try_start_hxfs_service(&mut self, nvme_online: bool) {
+        if self.hxfs_service.is_some() || self.hxfs_failed || !nvme_online || !self.bootfs_loaded {
+            return;
+        }
+        let block_channel = match (&self.nvme_host, &mut self.volume) {
+            (Some(nvme_host), volume) => {
+                volume.open_fs_candidate_channel(&nvme_host.bootstrap, nvme_online)
+            }
+            (None, _) => return,
+        };
+        let block_channel = match block_channel {
+            Ok(channel) => channel,
+            Err(_) => return,
+        };
+        let Some(bootfs) = self.fs.bootfs() else {
+            return;
+        };
+        let Ok(Some(entry)) = bootfs.get_entry("/services/hxfs.elf") else {
+            println!("[driver-manager] Hxfs service ELF missing from BOOTFS");
+            self.hxfs_failed = true;
+            return;
+        };
+        let Some(bootfs_vmo) = self.fs.vmo() else {
+            return;
+        };
+        let launched = libcanvas::process::spawn_elf_from_vmo(
+            "hxfs-service",
+            bootfs_vmo,
+            entry.offset,
+            entry.len,
+        );
+        let Ok((process, bootstrap)) = launched else {
+            println!("[driver-manager] failed to launch Hxfs service");
+            self.hxfs_failed = true;
+            return;
+        };
+        if let Err((error, _handle)) = bootstrap.write_handle(
+            protocol::HXFS_BLOCK_DEVICE.as_bytes(),
+            block_channel.into_handle(),
+        ) {
+            println!(
+                "[driver-manager] failed to transfer Hxfs block device: {}",
+                error.as_str()
+            );
+            self.hxfs_failed = true;
+            return;
+        }
+        println!("[driver-manager] launched read-only Hxfs service");
+        self.hxfs_service = Some(ManagedHost { process, bootstrap });
     }
 
     fn try_start_acpi_manager(&mut self) {
@@ -967,6 +1034,7 @@ impl DriverManager {
                 Ok(n) if &buf[..n] == protocol::OPEN_BLOBFS.as_bytes() => {
                     self.open_blobfs_service()
                 }
+                Ok(n) if &buf[..n] == protocol::OPEN_HXFS.as_bytes() => self.open_hxfs_service(),
                 Ok(n) if &buf[..n] == protocol::OPEN_BLOCK_NVME.as_bytes() => {
                     self.open_nvme_block_service()
                 }
@@ -1005,6 +1073,46 @@ impl DriverManager {
         let nvme_bootstrap = self.nvme_host.as_ref().map(|host| &host.bootstrap);
         self.blobfs
             .open_for_registry(registry, &mut self.volume, nvme_bootstrap, nvme_online);
+    }
+
+    fn open_hxfs_service(&mut self) {
+        let Some(registry) = self.registry_channel.as_ref() else {
+            return;
+        };
+        if !self.hxfs_ready {
+            let _ = registry.write(protocol::HXFS_UNAVAILABLE.as_bytes());
+            return;
+        }
+        let Some(hxfs) = self.hxfs_service.as_ref() else {
+            let _ = registry.write(protocol::HXFS_UNAVAILABLE.as_bytes());
+            return;
+        };
+        match Channel::pair() {
+            Ok((client_end, server_end)) => {
+                if let Err((error, _handle)) = hxfs.bootstrap.write_handle(
+                    protocol::ATTACH_HXFS_CLIENT.as_bytes(),
+                    server_end.into_handle(),
+                ) {
+                    println!(
+                        "[driver-manager] failed to attach Hxfs client: {}",
+                        error.as_str()
+                    );
+                    let _ = registry.write(protocol::HXFS_UNAVAILABLE.as_bytes());
+                    return;
+                }
+                if let Err((error, _handle)) = registry
+                    .write_handle(protocol::HXFS_CHANNEL.as_bytes(), client_end.into_handle())
+                {
+                    println!(
+                        "[driver-manager] failed to return Hxfs channel: {}",
+                        error.as_str()
+                    );
+                }
+            }
+            Err(_) => {
+                let _ = registry.write(protocol::HXFS_UNAVAILABLE.as_bytes());
+            }
+        }
     }
 
     fn open_nvme_block_service(&mut self) {
@@ -1144,6 +1252,38 @@ impl DriverManager {
                         error.as_str()
                     );
                     self.registry.mark_failed("block:nvme");
+                    return;
+                }
+            }
+        }
+    }
+
+    fn poll_hxfs_service(&mut self) {
+        let mut buf = [0u8; 64];
+        loop {
+            let Some(host) = self.hxfs_service.as_ref() else {
+                return;
+            };
+            let _keep_process_alive = &host.process;
+            match host.bootstrap.read_into(&mut buf) {
+                Ok(n) if &buf[..n] == protocol::HXFS_READY.as_bytes() => {
+                    self.hxfs_ready = true;
+                    println!("[driver-manager] Hxfs service ready");
+                }
+                Ok(n) if &buf[..n] == protocol::HXFS_SERVICE_UNAVAILABLE.as_bytes() => {
+                    self.hxfs_failed = true;
+                    self.hxfs_ready = false;
+                    println!("[driver-manager] Hxfs service unavailable");
+                }
+                Ok(_) => {}
+                Err(ErrorCode::ShouldWait) => return,
+                Err(error) => {
+                    println!(
+                        "[driver-manager] Hxfs service channel failed: {}",
+                        error.as_str()
+                    );
+                    self.hxfs_failed = true;
+                    self.hxfs_ready = false;
                     return;
                 }
             }

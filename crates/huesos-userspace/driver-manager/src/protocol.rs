@@ -74,6 +74,20 @@ pub const BLOBFS_CHANNEL: &str = "service:blobfs:channel";
 pub const BLOBFS_UNAVAILABLE: &str = "err:blobfs-unavailable";
 /// BlobFS returns an opened blob as a VMO handle.
 pub const BLOBFS_BLOB_VMO: &str = "service:blobfs:blob-vmo";
+/// Client asks DriverManager to open Hxfs.
+pub const OPEN_HXFS: &str = "open:hxfs";
+/// DriverManager responds with an Hxfs service channel.
+pub const HXFS_CHANNEL: &str = "service:hxfs:channel";
+/// Hxfs is not mounted/available.
+pub const HXFS_UNAVAILABLE: &str = "err:hxfs-unavailable";
+/// DriverManager passes a filesystem-candidate BlockDevice to Hxfs service.
+pub const HXFS_BLOCK_DEVICE: &str = "hxfs:block-device";
+/// DriverManager attaches an Hxfs client channel to Hxfs service.
+pub const ATTACH_HXFS_CLIENT: &str = "hxfs-client";
+/// Hxfs service mounted successfully.
+pub const HXFS_READY: &str = "service:hxfs:ready";
+/// Hxfs service failed to mount.
+pub const HXFS_SERVICE_UNAVAILABLE: &str = "service:hxfs:unavailable";
 /// Client asks DriverManager to open the NVMe-backed async BlockDevice service.
 pub const OPEN_BLOCK_NVME: &str = "open:block:nvme";
 /// Client asks DriverManager to open the system volume.
