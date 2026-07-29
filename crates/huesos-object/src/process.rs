@@ -266,10 +266,20 @@ impl Process {
     }
 
     fn queue_exit_packets(&self, info: ExitInfo) {
-        let bindings = self.exit_ports.lock();
-        for binding in bindings.iter() {
-            let _ = binding.port.queue(PortPacket {
-                key: binding.key,
+        let mut snapshot: [Option<(Arc<Port>, u64)>; MAX_EXIT_PORTS] =
+            core::array::from_fn(|_| None);
+        let count = {
+            let bindings = self.exit_ports.lock();
+            let mut count = 0usize;
+            for binding in bindings.iter().take(MAX_EXIT_PORTS) {
+                snapshot[count] = Some((Arc::clone(&binding.port), binding.key));
+                count += 1;
+            }
+            count
+        };
+        for (port, key) in snapshot.into_iter().take(count).flatten() {
+            let _ = port.queue(PortPacket {
+                key,
                 packet_type: PORT_PACKET_PROCESS_EXIT,
                 status: 0,
                 data: [info.koid, info.generation, info.exit_code as u64, 0],
