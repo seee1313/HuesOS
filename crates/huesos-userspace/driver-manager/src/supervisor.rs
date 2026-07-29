@@ -5,7 +5,7 @@ use crate::manifest::INPUT_HOST;
 use crate::protocol;
 use crate::protocol::MANIFEST_GRANTS_COMPLETE_PREFIX;
 use crate::registry::{ServiceRegistry, ServiceState};
-use libcanvas::{println, Channel, ErrorCode, Handle, Process, Vmo};
+use libcanvas::{hbi_boot, println, storage_boot, Channel, ErrorCode, Handle, Process, Vmo};
 
 /// Fallback embedded DriverHost image (same binary packaged into BOOTFS).
 /// Prefer this over spawn_elf_from_vmo until VMO-backed launch is fully solid.
@@ -16,6 +16,34 @@ static INPUT_HOST_ELF: &[u8] = include_bytes!(env!("HUESOS_INPUT_DRIVER_HOST_PAT
 /// `docs/ARCHITECTURE_ROADMAP.md` §4.
 const RESOURCE_LABEL_PREFIX: &[u8] = b"resource:";
 const CRITICAL_INTENT_LABEL_PREFIX: &[u8] = b"resource:mark-critical:";
+const NVME_DRIVER_NAME: &[u8] = b"driver-host-nvme";
+
+#[derive(Clone, Copy)]
+struct BootDriverSpec {
+    elf_path: [u8; hbi_boot::PATH_BYTES],
+    elf_path_len: usize,
+    manifest_path: [u8; hbi_boot::PATH_BYTES],
+    manifest_path_len: usize,
+}
+
+impl BootDriverSpec {
+    const fn empty() -> Self {
+        Self {
+            elf_path: [0; hbi_boot::PATH_BYTES],
+            elf_path_len: 0,
+            manifest_path: [0; hbi_boot::PATH_BYTES],
+            manifest_path_len: 0,
+        }
+    }
+
+    fn elf_path(&self) -> &str {
+        core::str::from_utf8(&self.elf_path[..self.elf_path_len]).unwrap_or("")
+    }
+
+    fn manifest_path(&self) -> &str {
+        core::str::from_utf8(&self.manifest_path[..self.manifest_path_len]).unwrap_or("")
+    }
+}
 
 /// Maximum resource handles a single DriverHost manifest may request.
 /// Mirrors the manifest parser's `MAX_RESOURCE_GRANTS` bound; kept as
@@ -110,6 +138,7 @@ impl PendingResources {
 pub struct DriverManager {
     registry: ServiceRegistry,
     input_host: Option<ManagedHost>,
+    nvme_host: Option<ManagedHost>,
     acpi_manager: Option<ManagedHost>,
     acpi_tables: Option<Vmo>,
     acpi_broker: Option<Handle>,
@@ -117,12 +146,15 @@ pub struct DriverManager {
     fs: FileSystemService,
     heartbeat_count: u64,
     acpi_heartbeat_count: u64,
+    nvme_heartbeat_count: u64,
     bootfs_loaded: bool,
+    storage_boot: Option<storage_boot::StorageBootInfo>,
+    nvme_boot_driver: Option<BootDriverSpec>,
     /// Resource handles received from init but not yet forwarded to
     /// their target drivers. Indexed implicitly by driver name via a
     /// linear scan; the number of drivers is small in the MVP so no
     /// hash-map is warranted.
-    pending_resources: [PendingResources; 4],
+    pending_resources: [PendingResources; 8],
     pending_resource_count: usize,
     /// Driver names for which init has signalled that every
     /// declared resource grant has been transferred. Populated by
@@ -137,11 +169,75 @@ pub struct DriverManager {
     grants_ready_count: usize,
 }
 
-const MAX_TRACKED_HOSTS: usize = 4;
+const MAX_TRACKED_HOSTS: usize = 8;
 
 struct ManagedHost {
     process: Process,
     bootstrap: Channel,
+}
+
+fn parse_nvme_boot_driver_spec(bytes: &[u8]) -> Option<BootDriverSpec> {
+    let header_len = 8usize;
+    let entry_len = hbi_boot::PATH_BYTES * 2 + 4;
+    if bytes.len() < header_len {
+        return None;
+    }
+    let header = hbi_boot::BootDriverManifestHeader {
+        magic: read_u32(bytes, 0)?,
+        version: read_u16(bytes, 4)?,
+        entry_count: read_u16(bytes, 6)?,
+    };
+    if !hbi_boot::validate_header(header) {
+        return None;
+    }
+    let count = header.entry_count as usize;
+    let total = header_len.checked_add(count.checked_mul(entry_len)?)?;
+    if bytes.len() < total {
+        return None;
+    }
+    let mut idx = 0usize;
+    while idx < count {
+        let base = header_len + idx * entry_len;
+        let flags = read_u32(bytes, base + hbi_boot::PATH_BYTES * 2)?;
+        if flags == 0 {
+            let mut spec = BootDriverSpec::empty();
+            let elf = bytes.get(base..base + hbi_boot::PATH_BYTES)?;
+            let manifest =
+                bytes.get(base + hbi_boot::PATH_BYTES..base + hbi_boot::PATH_BYTES * 2)?;
+            spec.elf_path_len = copy_nul_terminated(elf, &mut spec.elf_path);
+            spec.manifest_path_len = copy_nul_terminated(manifest, &mut spec.manifest_path);
+            if spec.manifest_path() == "/manifests/nvme.hdriver" {
+                return Some(spec);
+            }
+        }
+        idx += 1;
+    }
+    None
+}
+
+fn copy_nul_terminated(src: &[u8], dst: &mut [u8]) -> usize {
+    let mut len = 0usize;
+    while len < src.len() && len < dst.len() && src[len] != 0 {
+        dst[len] = src[len];
+        len += 1;
+    }
+    len
+}
+
+fn read_u16(bytes: &[u8], offset: usize) -> Option<u16> {
+    Some(u16::from_le_bytes([
+        *bytes.get(offset)?,
+        *bytes.get(offset + 1)?,
+    ]))
+}
+
+fn read_u32(bytes: &[u8], offset: usize) -> Option<u32> {
+    Some(u32::from_le_bytes([
+        *bytes.get(offset)?,
+        *bytes.get(offset + 1)?,
+        *bytes.get(offset + 2)?,
+        *bytes.get(offset + 3)?,
+    ]))
 }
 
 impl DriverManager {
@@ -152,6 +248,7 @@ impl DriverManager {
         Self {
             registry,
             input_host: None,
+            nvme_host: None,
             acpi_manager: None,
             acpi_tables: None,
             acpi_broker: None,
@@ -159,8 +256,15 @@ impl DriverManager {
             fs: FileSystemService::new(),
             heartbeat_count: 0,
             acpi_heartbeat_count: 0,
+            nvme_heartbeat_count: 0,
             bootfs_loaded: false,
+            storage_boot: None,
+            nvme_boot_driver: None,
             pending_resources: [
+                PendingResources::empty(),
+                PendingResources::empty(),
+                PendingResources::empty(),
+                PendingResources::empty(),
                 PendingResources::empty(),
                 PendingResources::empty(),
                 PendingResources::empty(),
@@ -211,13 +315,20 @@ impl DriverManager {
     /// hosts whose grants are still in flight are silently skipped
     /// and will be picked up on the next tick.
     fn try_start_pending_hosts(&mut self) {
-        if !self.bootfs_loaded || self.input_host.is_some() {
-            return;
+        if self.bootfs_loaded
+            && self.input_host.is_none()
+            && self.driver_grants_ready(b"input-host")
+        {
+            self.start_input_host();
         }
-        if !self.driver_grants_ready(b"input-host") {
-            return;
+        if self.bootfs_loaded
+            && self.nvme_host.is_none()
+            && self.driver_grants_ready(NVME_DRIVER_NAME)
+            && self.nvme_boot_driver.is_some()
+            && self.storage_boot_has_nvme()
+        {
+            self.start_nvme_host();
         }
-        self.start_driver_hosts();
     }
 
     fn record_resource_handle(&mut self, label: &[u8], handle: Handle) {
@@ -309,8 +420,8 @@ impl DriverManager {
         None
     }
 
-    /// Launch all MVP DriverHosts and wait until mandatory services are ready.
-    pub fn start_driver_hosts(&mut self) {
+    /// Launch the input DriverHost and wait until mandatory services are ready.
+    pub fn start_input_host(&mut self) {
         self.describe_manifest();
         let bootfs = match self.fs.bootfs() {
             Some(b) => b,
@@ -410,6 +521,136 @@ impl DriverManager {
         }
     }
 
+    fn install_storage_boot_info(&mut self, vmo: Vmo) {
+        let mut bytes = [0u8; storage_boot::MAX_ENCODED_BYTES];
+        let read = match vmo.read(0, &mut bytes) {
+            Ok(n) => n,
+            Err(error) => {
+                println!(
+                    "[driver-manager] storage boot-info read failed: {}",
+                    error.as_str()
+                );
+                return;
+            }
+        };
+        let Some(info) = storage_boot::decode(&bytes[..read]) else {
+            println!("[driver-manager] storage boot-info parse failed");
+            return;
+        };
+        println!(
+            "[driver-manager] storage boot-info: dma={:#x}+{:#x} nvme_count={}",
+            info.dma_pool.base, info.dma_pool.len, info.nvme_count
+        );
+        if info.nvme_count > 0 {
+            let nvme = info.nvme[0];
+            println!(
+                "[driver-manager] NVMe PCI function: {:02x}:{:02x}.{} bar0={:#x}+{:#x} irq={} flags={:#x}",
+                nvme.bus,
+                nvme.device,
+                nvme.function,
+                nvme.bar0_base,
+                nvme.bar0_len,
+                nvme.irq_line,
+                nvme.flags
+            );
+        }
+        self.storage_boot = Some(info);
+        self.try_start_pending_hosts();
+    }
+
+    fn storage_boot_has_nvme(&self) -> bool {
+        self.storage_boot
+            .as_ref()
+            .is_some_and(|info| info.nvme_count > 0)
+    }
+
+    fn load_boot_driver_manifest(&mut self) {
+        if self.nvme_boot_driver.is_some() {
+            return;
+        }
+        let Some(bootfs) = self.fs.bootfs() else {
+            return;
+        };
+        let mut bytes = [0u8; 1024];
+        let Ok(n) = bootfs.read_file("/storage/boot-drivers.manifest", &mut bytes) else {
+            println!("[driver-manager] no storage boot-driver manifest in BOOTFS");
+            return;
+        };
+        let Some(spec) = parse_nvme_boot_driver_spec(&bytes[..n]) else {
+            println!("[driver-manager] storage boot-driver manifest has no NVMe entry");
+            return;
+        };
+        println!(
+            "[driver-manager] boot driver manifest: nvme elf={} manifest={}",
+            spec.elf_path(),
+            spec.manifest_path()
+        );
+        self.nvme_boot_driver = Some(spec);
+        self.try_start_pending_hosts();
+    }
+
+    fn start_nvme_host(&mut self) {
+        let Some(spec) = self.nvme_boot_driver else {
+            return;
+        };
+        let Some(bootfs) = self.fs.bootfs() else {
+            return;
+        };
+        let Some(vmo) = self.fs.vmo() else {
+            return;
+        };
+        let mut manifest_buf = [0u8; 1024];
+        let manifest_path = spec.manifest_path();
+        let n = match bootfs.read_file(manifest_path, &mut manifest_buf) {
+            Ok(n) => n,
+            Err(error) => {
+                println!(
+                    "[driver-manager] failed to read NVMe manifest {}: {}",
+                    manifest_path,
+                    error.as_str()
+                );
+                return;
+            }
+        };
+        let Some(manifest) = crate::manifest::parse_hdriver(&manifest_buf[..n]) else {
+            println!("[driver-manager] failed to parse NVMe manifest");
+            return;
+        };
+        if manifest.name_as_str().as_bytes() != NVME_DRIVER_NAME {
+            println!("[driver-manager] NVMe manifest name mismatch");
+            return;
+        }
+        let elf_path = spec.elf_path();
+        let entry = match bootfs.get_entry(elf_path) {
+            Ok(Some(entry)) => entry,
+            _ => {
+                println!("[driver-manager] NVMe DriverHost ELF missing: {}", elf_path);
+                return;
+            }
+        };
+        let launched = libcanvas::process::spawn_elf_from_vmo(
+            manifest.name_as_str(),
+            vmo,
+            entry.offset,
+            entry.len,
+        );
+        match launched {
+            Ok((process, bootstrap)) => {
+                println!("[driver-manager] launched NVMe DriverHost from HBI BOOTFS");
+                self.forward_pending_resources(manifest.name_as_str(), &bootstrap, &process);
+                self.nvme_host = Some(ManagedHost { process, bootstrap });
+                self.wait_for_nvme_host_ready();
+            }
+            Err(error) => {
+                println!(
+                    "[driver-manager] failed to launch NVMe DriverHost: {}",
+                    error.as_str()
+                );
+                self.registry.mark_failed("block:nvme");
+            }
+        }
+    }
+
     /// Main supervision loop.
     pub fn run(&mut self, init_bootstrap: Channel) -> ! {
         loop {
@@ -417,6 +658,7 @@ impl DriverManager {
             self.poll_registry_requests();
             self.fs.poll();
             self.poll_input_host();
+            self.poll_nvme_host();
             self.poll_acpi_manager();
             // Multi-channel poll: cannot block on one fd without starving others.
             // Yield cooperatively; hot IRQ path is already blocking in the host.
@@ -526,6 +768,17 @@ impl DriverManager {
         println!("[driver-manager] input DriverHost did not become ready in time");
     }
 
+    fn wait_for_nvme_host_ready(&mut self) {
+        for _ in 0..20_000 {
+            self.poll_nvme_host();
+            if self.registry.state("block:nvme") == Some(ServiceState::Online) {
+                return;
+            }
+            libcanvas::process::yield_now();
+        }
+        println!("[driver-manager] NVMe DriverHost did not report resources in time");
+    }
+
     /// Forward every manifest-driven Resource handle init has buffered
     /// for `driver` to that driver's bootstrap channel, using the
     /// original wire label. If init also requested criticality, invoke
@@ -625,6 +878,7 @@ impl DriverManager {
                     println!("[driver-manager] received BOOTFS VMO from init");
                     self.fs.install_bootfs(Vmo::from_handle(handle));
                     self.bootfs_loaded = true;
+                    self.load_boot_driver_manifest();
                     // NOTE: spawn is deferred to the explicit
                     // `manifest:grants-complete:<driver>` control
                     // message so init has time to mint and
@@ -638,6 +892,10 @@ impl DriverManager {
                     println!("[driver-manager] received immutable ACPI table archive");
                     self.acpi_tables = Some(Vmo::from_handle(handle));
                     self.try_start_acpi_manager();
+                }
+                Ok((n, Some(handle))) if &buf[..n] == protocol::STORAGE_BOOT_VMO.as_bytes() => {
+                    println!("[driver-manager] received storage boot-info VMO");
+                    self.install_storage_boot_info(Vmo::from_handle(handle));
                 }
                 Ok((n, Some(handle))) if &buf[..n] == protocol::ACPI_BROKER.as_bytes() => {
                     println!("[driver-manager] received unique ACPI broker capability");
@@ -713,10 +971,16 @@ impl DriverManager {
         let Some(registry) = self.registry_channel.as_ref() else {
             return;
         };
-        // Contract landed before real NVMe DriverHost launch/wiring: clients get
-        // an explicit unavailable response instead of an unknown request.
+        // Stage A wires hardware resources and launches the DriverHost, but the
+        // async BlockDevice service channel is a later Stage-C contract. Keep a
+        // deterministic unavailable response until the driver exposes a real
+        // service channel.
         let _ = registry.write(protocol::BLOCK_NVME_UNAVAILABLE.as_bytes());
-        println!("[driver-manager] NVMe BlockDevice requested before online");
+        if self.registry.state("block:nvme") == Some(ServiceState::Online) {
+            println!("[driver-manager] NVMe BlockDevice requested before I/O server online");
+        } else {
+            println!("[driver-manager] NVMe BlockDevice requested before resources online");
+        }
     }
 
     fn open_keyboard_service(&mut self) {
@@ -782,6 +1046,28 @@ impl DriverManager {
         }
     }
 
+    fn poll_nvme_host(&mut self) {
+        let mut buf = [0u8; 64];
+        loop {
+            let Some(host) = self.nvme_host.as_ref() else {
+                return;
+            };
+            let _keep_process_alive = &host.process;
+            match host.bootstrap.read_into(&mut buf) {
+                Ok(n) => self.handle_nvme_host_message(&buf[..n]),
+                Err(ErrorCode::ShouldWait) => return,
+                Err(error) => {
+                    println!(
+                        "[driver-manager] NVMe host channel read failed: {}",
+                        error.as_str()
+                    );
+                    self.registry.mark_failed("block:nvme");
+                    return;
+                }
+            }
+        }
+    }
+
     fn poll_acpi_manager(&mut self) {
         let mut buffer = [0u8; 64];
         loop {
@@ -806,6 +1092,30 @@ impl DriverManager {
                     return;
                 }
             }
+        }
+    }
+
+    fn handle_nvme_host_message(&mut self, msg: &[u8]) {
+        if msg == protocol::NVME_HOST_STARTING.as_bytes() {
+            println!("[driver-manager] NVMe DriverHost starting");
+        } else if msg == protocol::NVME_HOST_RESOURCES_READY.as_bytes()
+            || msg == protocol::NVME_BLOCK_READY.as_bytes()
+        {
+            let owner = self.registry.owner("block:nvme").unwrap_or("unknown-host");
+            println!(
+                "[driver-manager] registered Stage-A block:nvme resources from {}",
+                owner
+            );
+            self.registry.mark_online("block:nvme");
+        } else if msg == protocol::NVME_HOST_READY.as_bytes() {
+            println!("[driver-manager] NVMe DriverHost ready (resource-only Stage A)");
+        } else if msg == protocol::NVME_HOST_MISSING_RESOURCES.as_bytes() {
+            println!("[driver-manager] NVMe DriverHost missing required resources");
+            self.registry.mark_failed("block:nvme");
+        } else if msg == b"heartbeat:nvme" {
+            self.nvme_heartbeat_count = self.nvme_heartbeat_count.wrapping_add(1);
+        } else {
+            println!("[driver-manager] unknown NVMe-host message");
         }
     }
 

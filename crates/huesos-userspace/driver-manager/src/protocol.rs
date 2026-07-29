@@ -24,6 +24,8 @@ pub const ATTACH_KEYBOARD_CLIENT: &str = "keyboard-client";
 
 /// Init passes the BOOTFS image as a VMO handle with this message.
 pub const BOOTFS_VMO: &str = "bootfs-vmo";
+/// Init passes the kernel-produced storage boot-info VMO with this message.
+pub const STORAGE_BOOT_VMO: &str = "storage-boot-vmo";
 /// Init tells DriverManager that every `resource:*` grant for a
 /// specific driver has been transferred and DriverManager is now
 /// free to spawn that DriverHost. Full label:
@@ -68,3 +70,14 @@ pub const OPEN_BLOCK_NVME: &str = "open:block:nvme";
 pub const BLOCK_NVME_CHANNEL: &str = "service:block:nvme:channel";
 /// NVMe block service is not currently online.
 pub const BLOCK_NVME_UNAVAILABLE: &str = "err:block:nvme-unavailable";
+/// NVMe DriverHost reported it is starting.
+pub const NVME_HOST_STARTING: &str = "driver-host:nvme:starting";
+/// NVMe DriverHost has received the Stage-A hardware resources.
+pub const NVME_HOST_RESOURCES_READY: &str = "driver-host:nvme:resources-ready";
+/// NVMe DriverHost reported its resource set is missing/incomplete.
+pub const NVME_HOST_MISSING_RESOURCES: &str = "service:block:nvme:missing-resources";
+/// NVMe DriverHost reported ready. In Stage A this means resources are present,
+/// not that a real BlockDevice channel is available.
+pub const NVME_HOST_READY: &str = "driver-host:nvme:ready";
+/// NVMe skeleton compatibility message for resource-only readiness.
+pub const NVME_BLOCK_READY: &str = "service:block:nvme:ready";

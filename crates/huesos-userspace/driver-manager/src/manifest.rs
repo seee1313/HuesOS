@@ -290,6 +290,12 @@ pub const KEYBOARD_SERVICE: ServiceManifest = ServiceManifest {
     required: true,
 };
 
+/// NVMe block service manifest.
+pub const BLOCK_NVME_SERVICE: ServiceManifest = ServiceManifest {
+    name: "block:nvme",
+    required: true,
+};
+
 /// Input DriverHost manifest.
 ///
 /// 8042 port ownership split (kept in sync with the BOOTFS-embedded
@@ -318,5 +324,17 @@ pub const INPUT_HOST: DriverHostManifest = DriverHostManifest {
     critical: false,
 };
 
+/// NVMe DriverHost manifest shell. The actual `.hdriver` is enumerated from
+/// `/storage/boot-drivers.manifest`; this static entry reserves the service
+/// registry name before on-target PCI discovery is wired through.
+pub const NVME_HOST: DriverHostManifest = DriverHostManifest {
+    name: "driver-host-nvme",
+    services: &[BLOCK_NVME_SERVICE],
+    irqs: &[],
+    io_ports: &[],
+    resources: &[],
+    critical: false,
+};
+
 /// Static DriverHost manifest table.
-pub const DRIVER_HOSTS: &[DriverHostManifest] = &[INPUT_HOST];
+pub const DRIVER_HOSTS: &[DriverHostManifest] = &[INPUT_HOST, NVME_HOST];
