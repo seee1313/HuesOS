@@ -689,6 +689,9 @@ impl DriverManager {
                 Ok(n) if &buf[..n] == protocol::OPEN_FILESYSTEM.as_bytes() => {
                     self.open_filesystem_service()
                 }
+                Ok(n) if &buf[..n] == protocol::OPEN_BLOCK_NVME.as_bytes() => {
+                    self.open_nvme_block_service()
+                }
                 Ok(_) => println!("[driver-manager] unknown registry request"),
                 Err(ErrorCode::ShouldWait) => return,
                 Err(e) => {
@@ -704,6 +707,16 @@ impl DriverManager {
             return;
         };
         self.fs.open_for_registry(registry);
+    }
+
+    fn open_nvme_block_service(&mut self) {
+        let Some(registry) = self.registry_channel.as_ref() else {
+            return;
+        };
+        // Contract landed before real NVMe DriverHost launch/wiring: clients get
+        // an explicit unavailable response instead of an unknown request.
+        let _ = registry.write(protocol::BLOCK_NVME_UNAVAILABLE.as_bytes());
+        println!("[driver-manager] NVMe BlockDevice requested before online");
     }
 
     fn open_keyboard_service(&mut self) {

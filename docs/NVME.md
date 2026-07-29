@@ -105,12 +105,25 @@ separate slice. The ABI side now has a `ResourceKindAbi::DmaPool` / object
 `ResourceKind::DmaPool` capability so DriverManager can transfer the reserved
 boot pool to `nvme-driverhost` without treating it as ordinary MMIO.
 
-## Block protocol (later slice)
+## Block protocol / DriverManager registry
 
-The DriverHost exposes `read_blocks(lba, count) -> data` and
-`write_blocks(lba, data)` over a Channel (a small block protocol), consumed by a
-future FileSystemService / VFS mount (the broader #7 goal). Namespace size and
-LBA size come from Identify Namespace (NSZE/LBAF).
+The async BlockDevice control protocol is a fixed request record over a Channel
+and Port completions keyed by `request_id`. DriverManager reserves the registry
+request:
+
+```text
+open:block:nvme
+```
+
+with the success response:
+
+```text
+service:block:nvme:channel
+```
+
+Until the real NVMe DriverHost is launched and registered, DriverManager returns
+`err:block:nvme-unavailable` rather than treating the request as unknown. This
+keeps clients and future BlobFS/Hxfs code on a stable discovery contract.
 
 ## On-target verification checklist
 

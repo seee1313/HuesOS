@@ -58,3 +58,13 @@ pub const ACPI_HEARTBEAT: &str = "heartbeat:acpi";
 pub const OPEN_FILESYSTEM: &str = "open:filesystem";
 /// DriverManager responds with a FileSystemService channel.
 pub const FILESYSTEM_CHANNEL: &str = "service:filesystem:channel";
+/// Client asks DriverManager to open the NVMe-backed async BlockDevice service.
+pub const OPEN_BLOCK_NVME: &str = "open:block:nvme";
+/// DriverManager responds with an NVMe BlockDevice service channel.
+#[allow(
+    dead_code,
+    reason = "success label reserved before real NVMe service wiring"
+)]
+pub const BLOCK_NVME_CHANNEL: &str = "service:block:nvme:channel";
+/// NVMe block service is not currently online.
+pub const BLOCK_NVME_UNAVAILABLE: &str = "err:block:nvme-unavailable";
