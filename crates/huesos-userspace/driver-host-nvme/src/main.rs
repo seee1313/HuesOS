@@ -70,7 +70,10 @@ impl NvmeBootstrap {
     }
 
     fn record(&mut self, label: &[u8], handle: Handle) {
-        let kind = classify_resource(label);
+        let Some(kind) = classify_resource(label) else {
+            drop(handle);
+            return;
+        };
         let mut fallback = Some(handle);
         for slot in &mut self.slots {
             if slot.kind == kind && !slot.is_present() {
@@ -80,7 +83,7 @@ impl NvmeBootstrap {
                 break;
             }
         }
-        // Unknown/duplicate resources are dropped by Handle's RAII wrapper.
+        // Duplicate resources are dropped by Handle's RAII wrapper.
     }
 
     fn ready(&self) -> bool {
@@ -88,28 +91,21 @@ impl NvmeBootstrap {
     }
 }
 
-fn classify_resource(label: &[u8]) -> ResourceSlotKind {
-    if contains(label, b"dma") {
-        ResourceSlotKind::DmaPool
-    } else if contains(label, b"irq") {
-        ResourceSlotKind::Irq
-    } else {
-        ResourceSlotKind::Mmio
+fn classify_resource(label: &[u8]) -> Option<ResourceSlotKind> {
+    // Expected label format from init:
+    // resource:<driver>:<kind>:0x<base>:0x<len>:<mode>
+    let mut parts = label.split(|&byte| byte == b':');
+    if parts.next()? != b"resource" {
+        return None;
     }
-}
-
-fn contains(haystack: &[u8], needle: &[u8]) -> bool {
-    if needle.is_empty() || needle.len() > haystack.len() {
-        return false;
+    let _driver = parts.next()?;
+    let kind = parts.next()?;
+    match kind {
+        b"mmio" => Some(ResourceSlotKind::Mmio),
+        b"irq" => Some(ResourceSlotKind::Irq),
+        b"dma" => Some(ResourceSlotKind::DmaPool),
+        _ => None,
     }
-    let mut index = 0usize;
-    while index + needle.len() <= haystack.len() {
-        if &haystack[index..index + needle.len()] == needle {
-            return true;
-        }
-        index += 1;
-    }
-    false
 }
 
 #[unsafe(no_mangle)]
