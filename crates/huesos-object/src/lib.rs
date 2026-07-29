@@ -257,6 +257,18 @@ mod tests {
     }
 
     #[test]
+    fn process_scheduler_flags_are_created_state_only() {
+        let process = Process::new("sched-flags");
+        assert_eq!(process.scheduler_flags(), 0);
+        assert!(process.set_scheduler_flags(1, 1));
+        assert_eq!(process.scheduler_flags(), 1);
+        assert!(!process.set_scheduler_flags(2, 1));
+        assert!(process.start());
+        assert!(!process.set_scheduler_flags(0, 1));
+        assert_eq!(process.scheduler_flags(), 1);
+    }
+
+    #[test]
     fn process_exit_queues_bound_port_packet() {
         let process = Process::new("watched");
         let port = match Port::new() {

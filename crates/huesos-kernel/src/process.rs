@@ -793,6 +793,14 @@ pub(crate) fn cancel_user_entry(task_id: u64) {
         .retain(|pending| pending.task_id != task_id);
 }
 
+/// Whether a just-spawned user task has not consumed its entry/RSP record yet.
+pub(crate) fn has_pending_user_entry(task_id: u64) -> bool {
+    PENDING_USER_ENTRIES
+        .lock()
+        .iter()
+        .any(|pending| pending.task_id == task_id)
+}
+
 /// Trampoline used as the initial RIP for user tasks.
 pub extern "C" fn user_entry_trampoline() -> ! {
     let Some(task_id) = crate::scheduler::current_task_id() else {

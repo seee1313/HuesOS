@@ -119,6 +119,22 @@ pub(crate) fn sys_process_set_affinity_mask(
     }
 }
 
+pub(crate) fn sys_process_set_scheduler_flags(
+    process_handle: HandleValue,
+    flags: u32,
+) -> SyscallResult {
+    const ALLOWED: u32 = huesos_abi::scheduler_flags::STEAL_OPT_IN;
+    let process_obj = process_from_handle(process_handle, Rights::WRITE)?;
+    let process = process_obj
+        .downcast_ref::<huesos_object::Process>()
+        .ok_or(ErrorCode::WrongType)?;
+    if process.set_scheduler_flags(flags, ALLOWED) {
+        Ok(0)
+    } else {
+        Err(ErrorCode::InvalidArgs)
+    }
+}
+
 pub(crate) fn sys_process_get_affinity(
     process_handle: HandleValue,
     out_mask: *mut u64,

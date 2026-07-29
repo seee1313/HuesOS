@@ -510,9 +510,7 @@ next-stage expansion items; they are not blockers for the Immediate milestone.
 ### 9. Networking
 - virtio-net driver + a userspace TCP/IP stack.
 
-### 10. Scheduler polish
-- Work-stealing, better AP timer calibration without PIT races, fair
-  migration, and serial-log interleaving cleanup under SMP.
+### 10. Scheduler polish — COMPLETE ✅
 - **Landed**: EDF replenish-on-unblock. A Deadline task blocked for
   longer than one period would previously wake with a stale (past)
   deadline and be given infinite priority by EDF, starving every other
@@ -520,6 +518,18 @@ next-stage expansion items; they are not blockers for the Immediate milestone.
   refills `remaining_budget` — matching a standard Constant Bandwidth
   Server. Pure helper `replenish_deadline_on_unblock` covered by three
   host tests including overflow saturation.
+- **Landed**: token-based opt-in Fair task stealing. A process must set
+  `scheduler_flags::STEAL_OPT_IN` before its initial thread starts; idle CPUs
+  may then request a victim runqueue token and steal only ready Fair user tasks
+  whose affinity mask includes the target CPU. The scheduler keeps no global
+  load average and does not perform global balancing.
+- **Safety invariant**: migrated tasks receive a fresh task id on the target CPU
+  and an old→new alias is retained for stale references. Tasks that have not yet
+  consumed their initial user-entry record are not stealable, preserving startup
+  lookup correctness.
+- **Medium-Term #10 status**: complete for the approved per-CPU/token SMP model.
+  Future polish is diagnostic/telemetry work rather than a missing scheduler
+  architecture item.
 
 ## Long Term
 

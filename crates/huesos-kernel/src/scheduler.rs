@@ -90,6 +90,16 @@ static TOKEN_MAILBOX_REQUESTER: [AtomicUsize; MAX_CPUS] = [const { AtomicUsize::
 static TOKEN_MAILBOX_REQUEST_ID: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
 static NEXT_TOKEN_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 
+const STEAL_OPT_IN_FLAG: u32 = huesos_abi::scheduler_flags::STEAL_OPT_IN;
+const TASK_ID_ALIAS_SLOTS: usize = 128;
+static TASK_ID_ALIAS_OLD: [AtomicU64; TASK_ID_ALIAS_SLOTS] =
+    [const { AtomicU64::new(0) }; TASK_ID_ALIAS_SLOTS];
+static TASK_ID_ALIAS_NEW: [AtomicU64; TASK_ID_ALIAS_SLOTS] =
+    [const { AtomicU64::new(0) }; TASK_ID_ALIAS_SLOTS];
+static TASK_STEAL_ATTEMPTS: AtomicU64 = AtomicU64::new(0);
+static TASK_STEAL_SUCCESSES: AtomicU64 = AtomicU64::new(0);
+static NEXT_STEAL_ALIAS_SLOT: AtomicUsize = AtomicUsize::new(0);
+
 struct RunqueueTokenGuard {
     cpu: usize,
     remote: bool,
@@ -200,6 +210,35 @@ fn acquire_runqueue_token(cpu: usize) -> Option<RunqueueTokenGuard> {
         });
     }
     None
+}
+
+fn record_task_id_alias(old: u64, new: u64) {
+    if old == 0 || new == 0 || old == new {
+        return;
+    }
+    let slot = NEXT_STEAL_ALIAS_SLOT.fetch_add(1, Ordering::Relaxed) % TASK_ID_ALIAS_SLOTS;
+    TASK_ID_ALIAS_NEW[slot].store(new, Ordering::Release);
+    TASK_ID_ALIAS_OLD[slot].store(old, Ordering::Release);
+}
+
+fn resolve_task_id_alias(mut id: u64) -> u64 {
+    for _ in 0..4 {
+        let mut next = id;
+        for index in 0..TASK_ID_ALIAS_SLOTS {
+            if TASK_ID_ALIAS_OLD[index].load(Ordering::Acquire) == id {
+                let candidate = TASK_ID_ALIAS_NEW[index].load(Ordering::Acquire);
+                if candidate != 0 {
+                    next = candidate;
+                }
+                break;
+            }
+        }
+        if next == id {
+            break;
+        }
+        id = next;
+    }
+    id
 }
 
 /// Hardware-timer-driven monotonic clock. Only CPU 0 advances it, so SMP does
@@ -482,6 +521,107 @@ impl Scheduler {
         Some((old_ptr, new_ptr))
     }
 
+    fn add_existing_task(&mut self, cpu: usize, mut task: Box<Task>) -> u64 {
+        let reusable = loop {
+            let Some(index) = self.free_slots.pop() else {
+                break None;
+            };
+            let Some(slot) = self.tasks.get_mut(index) else {
+                continue;
+            };
+            if slot.retired || !matches!(&slot.kind, TaskKind::Reaped) {
+                continue;
+            }
+            if let Some(generation) = next_task_generation(slot.generation) {
+                break Some((index, generation));
+            }
+            slot.retired = true;
+        };
+        let (index, generation) = reusable.unwrap_or((self.tasks.len(), 0));
+        let id = encode_task_id(cpu, generation, index);
+        task.id = id;
+        let policy = task.sched_policy;
+        if index == self.tasks.len() {
+            self.tasks.push(TaskSlot {
+                generation,
+                retired: false,
+                task,
+            });
+        } else {
+            let slot = &mut self.tasks[index];
+            slot.generation = generation;
+            slot.retired = false;
+            slot.task = task;
+        }
+        if let SchedPolicy::Fair { vruntime, .. } = policy {
+            self.fair_queue.insert(vruntime, id);
+        }
+        id
+    }
+
+    fn has_ready_non_idle(&self) -> bool {
+        if !self.fair_queue.is_empty() {
+            return true;
+        }
+        for task in self.tasks.iter().skip(1) {
+            if task.finished.load(Ordering::Relaxed) || task.blocked.load(Ordering::Relaxed) {
+                continue;
+            }
+            if matches!(task.sched_policy, SchedPolicy::Deadline { remaining_budget, .. } if remaining_budget > 0)
+            {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn take_stealable_task(&mut self, victim_cpu: usize, target_cpu: usize) -> Option<Box<Task>> {
+        let mut skipped = Vec::new();
+        while let Some((vruntime, task_id)) = self.fair_queue.pop_min_key() {
+            if !self.task_matches(task_id) {
+                continue;
+            }
+            let idx = task_index(task_id);
+            if idx == 0 || idx == self.current {
+                skipped.push((vruntime, task_id));
+                continue;
+            }
+            let task = &self.tasks[idx];
+            if task.finished.load(Ordering::Relaxed) || task.blocked.load(Ordering::Relaxed) {
+                continue;
+            }
+            if crate::process::has_pending_user_entry(task.id) {
+                skipped.push((vruntime, task_id));
+                continue;
+            }
+            let stealable = match &task.kind {
+                TaskKind::User { process } => {
+                    process.steal_opt_in(STEAL_OPT_IN_FLAG)
+                        && process.affinity_mask() & (1u64 << target_cpu) != 0
+                }
+                TaskKind::Kernel | TaskKind::Reaped => false,
+            };
+            if !stealable {
+                skipped.push((vruntime, task_id));
+                continue;
+            }
+            for (vr, id) in skipped {
+                self.fair_queue.insert(vr, id);
+            }
+            let replacement = Box::new(Task::new_reaped(task_id));
+            let moved = core::mem::replace(&mut self.tasks[idx].task, replacement);
+            self.tasks[idx].kind = TaskKind::Reaped;
+            self.tasks[idx].finished.store(true, Ordering::Release);
+            self.free_slots.push(idx);
+            let _ = victim_cpu;
+            return Some(moved);
+        }
+        for (vr, id) in skipped {
+            self.fair_queue.insert(vr, id);
+        }
+        None
+    }
+
     fn current_task(&self) -> Option<&Task> {
         self.tasks.get(self.current).map(|slot| &**slot)
     }
@@ -509,6 +649,45 @@ unsafe fn register_scheduler_ptr(sched: *mut Scheduler) {
     unsafe { (*ptr).scheduler = sched as *mut () };
 }
 
+fn try_token_steal_for_idle_cpu(target_cpu: usize) {
+    if target_cpu >= MAX_CPUS || !is_cpu_online(target_cpu) {
+        return;
+    }
+    {
+        let guard = PER_CPU_SCHEDULERS[target_cpu].lock();
+        if guard.current != 0 || guard.has_ready_non_idle() {
+            return;
+        }
+    }
+
+    let mask = online_cpu_mask();
+    for offset in 1..MAX_CPUS {
+        let victim_cpu = (target_cpu + offset) % MAX_CPUS;
+        if victim_cpu == target_cpu || mask & (1u64 << victim_cpu) == 0 {
+            continue;
+        }
+        TASK_STEAL_ATTEMPTS.fetch_add(1, Ordering::Relaxed);
+        let Some(_token) = acquire_runqueue_token(victim_cpu) else {
+            continue;
+        };
+        let moved = {
+            let mut victim = PER_CPU_SCHEDULERS[victim_cpu].lock();
+            victim.take_stealable_task(victim_cpu, target_cpu)
+        };
+        let Some(task) = moved else {
+            continue;
+        };
+        let old_id = task.id;
+        let new_id = {
+            let mut target = PER_CPU_SCHEDULERS[target_cpu].lock();
+            target.add_existing_task(target_cpu, task)
+        };
+        record_task_id_alias(old_id, new_id);
+        TASK_STEAL_SUCCESSES.fetch_add(1, Ordering::Relaxed);
+        return;
+    }
+}
+
 /// Initialize the scheduler for the current CPU and register the timer callback.
 /// Called once per CPU.
 pub fn init() {
@@ -530,6 +709,7 @@ pub fn init() {
         if cpu == 0 {
             MONOTONIC_TICKS.fetch_add(1, Ordering::SeqCst);
         }
+        try_token_steal_for_idle_cpu(cpu);
         let mut guard = PER_CPU_SCHEDULERS[cpu].lock();
         let switch_context = guard.tick();
         drop(guard); // Release the lock before performing context switch!
@@ -658,6 +838,7 @@ pub(crate) fn replenish_deadline_on_unblock(
 /// before `park_current` set `blocked=true` (swap would early-return and the
 /// subsequent park would sleep forever).
 pub fn wake_task(task_id: u64) {
+    let task_id = resolve_task_id_alias(task_id);
     let cpu = task_cpu(task_id);
     if cpu >= MAX_CPUS {
         return;
@@ -734,6 +915,7 @@ pub fn global_ticks() -> u64 {
 /// Set the scheduling policy for a task by its ID.
 pub fn set_sched_policy(task_id: u64, policy: SchedPolicy) {
     huesos_arch::interrupts::disable();
+    let task_id = resolve_task_id_alias(task_id);
     let cpu = task_cpu(task_id);
     let idx = task_index(task_id);
     if cpu < MAX_CPUS {

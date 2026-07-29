@@ -112,6 +112,17 @@ impl Process {
         Ok(())
     }
 
+    /// Set scheduler flags before the initial thread starts.
+    pub fn set_scheduler_flags(&self, flags: u32) -> crate::Result<()> {
+        let ret = raw::syscall2(
+            Syscall::ProcessSetSchedulerFlags,
+            self.0.raw() as u64,
+            flags as u64,
+        );
+        raw::decode(ret)?;
+        Ok(())
+    }
+
     /// Query the process's affinity mask and home CPU.
     pub fn affinity(&self) -> crate::Result<(u64, usize)> {
         let mut mask = 0u64;

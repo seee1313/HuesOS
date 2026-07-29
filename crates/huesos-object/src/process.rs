@@ -56,6 +56,8 @@ pub struct Process {
     /// CPU affinity mask. New threads must start on `home_cpu`, and future
     /// explicit migration requests must stay within this mask.
     affinity_mask: AtomicU64,
+    /// Scheduler feature flags (see `huesos_abi::scheduler_flags`).
+    scheduler_flags: core::sync::atomic::AtomicU32,
     /// Initial-thread start reservation. Prevents two different Thread objects
     /// from racing to become the first runnable thread of the same process.
     start_reserved: AtomicBool,
@@ -93,6 +95,7 @@ impl Process {
             address_space: IrqSafeMutex::new(None),
             home_cpu: AtomicUsize::new(crate::registry::current_cpu()),
             affinity_mask: AtomicU64::new(1u64 << crate::registry::current_cpu()),
+            scheduler_flags: core::sync::atomic::AtomicU32::new(0),
             start_reserved: AtomicBool::new(false),
             critical: AtomicBool::new(false),
         })
@@ -164,6 +167,30 @@ impl Process {
             return false;
         }
         self.set_affinity_mask(1u64 << cpu, cpu)
+    }
+
+    /// Set scheduler flags before the initial thread starts.
+    pub fn set_scheduler_flags(&self, flags: u32, allowed_mask: u32) -> bool {
+        if flags & !allowed_mask != 0 {
+            return false;
+        }
+        let lifecycle = self.lifecycle.lock();
+        if lifecycle.state() != ProcState::Created || self.start_reserved.load(Ordering::Acquire) {
+            return false;
+        }
+        drop(lifecycle);
+        self.scheduler_flags.store(flags, Ordering::Release);
+        true
+    }
+
+    /// Snapshot scheduler flags.
+    pub fn scheduler_flags(&self) -> u32 {
+        self.scheduler_flags.load(Ordering::Acquire)
+    }
+
+    /// Whether this process opted in to token-based scheduler stealing.
+    pub fn steal_opt_in(&self, flag: u32) -> bool {
+        self.scheduler_flags() & flag != 0
     }
 
     /// Account one scheduler tick to the owning Job. Returns false when the

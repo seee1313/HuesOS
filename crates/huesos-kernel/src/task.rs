@@ -81,6 +81,24 @@ impl Task {
         }
     }
 
+    /// Create an inert reaped placeholder for an emptied scheduler slot.
+    pub fn new_reaped(id: u64) -> Self {
+        Self {
+            id,
+            name: *b"reaped\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0",
+            context: Context::zero_with_cr3(current_cr3()),
+            kernel_stack: Vec::new(),
+            kind: TaskKind::Reaped,
+            finished: core::sync::atomic::AtomicBool::new(true),
+            blocked: core::sync::atomic::AtomicBool::new(false),
+            wake_pending: core::sync::atomic::AtomicBool::new(false),
+            sched_policy: crate::scheduler::SchedPolicy::Fair {
+                weight: 1024,
+                vruntime: 0,
+            },
+        }
+    }
+
     /// Create a kernel task that starts executing `entry`.
     pub fn new_kernel(id: u64, name: [u8; 32], entry: extern "C" fn() -> !) -> Self {
         let mut stack = alloc::vec![0u8; KERNEL_STACK_SIZE];

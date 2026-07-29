@@ -196,13 +196,16 @@ pub enum Syscall {
     /// Bind a Port to receive one process-exit packet when the process exits.
     /// `a1` points to [`ProcessBindExitPortArgs`].
     ProcessBindExitPort = 48,
+    /// Set scheduler flags on a process before its initial thread starts.
+    /// `a1` is a process handle, `a2` is a [`scheduler_flags`] mask.
+    ProcessSetSchedulerFlags = 49,
 }
 
 impl Syscall {
     /// Total number of defined syscalls (i.e. one past the highest
     /// currently-assigned number). The dispatcher uses this to reject
     /// obviously-out-of-range numbers before a `match`.
-    pub const COUNT: u64 = 49;
+    pub const COUNT: u64 = 50;
 
     /// Convert a raw syscall number back into a [`Syscall`], if valid.
     pub const fn from_raw(n: u64) -> Option<Self> {
@@ -256,6 +259,7 @@ impl Syscall {
             46 => Self::SignalSet,
             47 => Self::SignalClear,
             48 => Self::ProcessBindExitPort,
+            49 => Self::ProcessSetSchedulerFlags,
             _ => return None,
         })
     }
@@ -506,6 +510,13 @@ pub const USER_ASPACE_SIZE: u64 = USER_ASPACE_END - USER_ASPACE_BASE;
 pub const USER_STACK_TOP: u64 = 0x0000_7fff_ff00_0000;
 /// Size of the initial userspace stack mapped by the userspace process launcher.
 pub const USER_STACK_SIZE: u64 = 4096 * 16;
+
+/// Scheduler flags for [`Syscall::ProcessSetSchedulerFlags`].
+pub mod scheduler_flags {
+    /// User tasks in this process may be moved by token-based idle stealing,
+    /// within the process affinity mask. Disabled by default.
+    pub const STEAL_OPT_IN: u32 = 1 << 0;
+}
 
 /// VMAR mapping flags for [`Syscall::VmarMap`].
 pub mod vmar_flags {
@@ -851,7 +862,8 @@ mod tests {
         assert_eq!(Syscall::SignalSet as u64, 46);
         assert_eq!(Syscall::SignalClear as u64, 47);
         assert_eq!(Syscall::ProcessBindExitPort as u64, 48);
-        assert_eq!(Syscall::COUNT, 49);
+        assert_eq!(Syscall::ProcessSetSchedulerFlags as u64, 49);
+        assert_eq!(Syscall::COUNT, 50);
         assert_eq!(Syscall::from_raw(28), Some(Syscall::VmoCreateEx));
         assert_eq!(Syscall::from_raw(30), Some(Syscall::VmarProtect));
         assert_eq!(Syscall::from_raw(31), Some(Syscall::ChannelPeek));
@@ -872,7 +884,11 @@ mod tests {
         assert_eq!(Syscall::from_raw(46), Some(Syscall::SignalSet));
         assert_eq!(Syscall::from_raw(47), Some(Syscall::SignalClear));
         assert_eq!(Syscall::from_raw(48), Some(Syscall::ProcessBindExitPort));
-        assert_eq!(Syscall::from_raw(49), None);
+        assert_eq!(
+            Syscall::from_raw(49),
+            Some(Syscall::ProcessSetSchedulerFlags)
+        );
+        assert_eq!(Syscall::from_raw(50), None);
     }
 
     #[test]

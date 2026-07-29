@@ -39,7 +39,17 @@ impl WavlTree {
 
     /// Remove and return the task id with the smallest fair-scheduling key.
     pub fn pop_min(&mut self) -> Option<u64> {
-        self.entries.pop_first().map(|(_, task_id)| task_id)
+        self.pop_min_key().map(|(_, task_id)| task_id)
+    }
+
+    /// Remove and return the full smallest fair-scheduling key.
+    pub fn pop_min_key(&mut self) -> Option<(u64, u64)> {
+        self.entries.pop_first()
+    }
+
+    /// Whether the queue is empty.
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
     }
 
     /// Remove an exact task key. Missing keys are a harmless no-op.
