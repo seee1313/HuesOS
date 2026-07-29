@@ -442,14 +442,17 @@ next-stage expansion items; they are not blockers for the Immediate milestone.
   Controller/Namespace on target, 1 MiB max request clamp, PRP-list support
   within one list page, per-CPU queue creation planning/commands, real
   DriverManager `service:block:nvme:channel` handoff, VMO buffer registration,
-  Port-based completions, and `libcanvas::block::BlockDevice` helpers.
+  Port-based completions, `libcanvas::block::BlockDevice` helpers, and Stage-D
+  VolumeManager system volume handles optimized strictly for NVMe/SSD raw
+  namespaces.
 - **Agreed production targets**: HBI `.img` driver loading, 64 MiB preallocated
   DMA pool, no heap after driver init, MSI-X→MSI→polling fallback, per-CPU
   queues depth 256, and 1 MiB max request size.
-- **Needed**: on-target NVMe data-path soak, BlobFS read-only mount, and later
-  Hxfs/DevFS layers. A future performance slice can replace the current
+- **Needed**: on-target NVMe/SSD data-path soak, BlobFS read-only mount, and
+  later Hxfs/DevFS layers. A future performance slice can replace the current
   synchronous service execution with deeper async queue-slot tracking, but Stage
-  C's public Channel+Port service contract is now present.
+  C's public Channel+Port service contract and Stage D's Volume handles are now
+  present.
 - **PS/2 driver ownership (fully migrated as of PR-E)**: the scancode
   decoder, shift-state machine, and key-event dispatch live only in the
   userspace `driver-host:input` process. The kernel keeps a

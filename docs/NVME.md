@@ -8,8 +8,9 @@ kernel-programmed MSI-X with MSI fallback, DriverManager launch of
 controller disable/enable + admin queue setup from the 64 MiB DMA pool, Identify
 Controller/Namespace integration, per-CPU queue creation planning, PRP handling
 up to the 1 MiB request cap, MSI/MSI-X vectors bound to a userspace Port, and a
-real async BlockDevice service channel exposed through DriverManager. This is
-ROADMAP Short-Term #7 (real VFS + drivers in userspace), first device.
+real async BlockDevice service channel exposed through DriverManager, and a
+VolumeManager system volume optimized specifically for NVMe/SSD raw namespaces.
+This is ROADMAP Short-Term #7 (real VFS + userspace drivers), first device.
 
 ## Goal
 
@@ -140,6 +141,14 @@ DriverHost; fixed `AsyncBlockRequest` records submit Info/Read/Write/Flush and
 completion packets are queued to the supplied Port. DriverManager still returns
 `err:block:nvme-unavailable` until the DriverHost has identified the namespace.
 
+Stage D adds `open:volume:system`: a handle-first VolumeManager service that
+produces one raw whole-namespace system volume. This is intentionally optimized
+for NVMe/SSD systems only, not generic rotational storage. `Volume.GetInfo`
+returns the raw NVMe namespace geometry, `Volume.OpenBlockRange` returns a
+range-relative BlockDevice handle with bounds enforcement, and
+`Volume.OpenFsCandidate` returns the first block range future BlobFS/Hxfs code
+should probe.
+
 ## On-target verification checklist
 
 Stage A/B/C + MSI-X/MSI completed in code:
@@ -163,6 +172,9 @@ Stage A/B/C + MSI-X/MSI completed in code:
   Info/Read/Write/Flush, and queues async completion packets to client Ports.
 - `libcanvas::block::BlockDevice` provides synchronous convenience helpers over
   the Channel+Port async protocol.
+- DriverManager's VolumeManager exposes `service:volume:system:channel`, raw
+  NVMe namespace volume info, range-relative BlockDevice proxy handles, and a
+  filesystem-candidate handle for the next FS layer.
 
 Remaining later work:
 
