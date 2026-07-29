@@ -971,15 +971,47 @@ impl DriverManager {
         let Some(registry) = self.registry_channel.as_ref() else {
             return;
         };
-        // Stage A wires hardware resources and launches the DriverHost, but the
-        // async BlockDevice service channel is a later Stage-C contract. Keep a
-        // deterministic unavailable response until the driver exposes a real
-        // service channel.
-        let _ = registry.write(protocol::BLOCK_NVME_UNAVAILABLE.as_bytes());
-        if self.registry.state("block:nvme") == Some(ServiceState::Online) {
-            println!("[driver-manager] NVMe BlockDevice requested before I/O server online");
-        } else {
-            println!("[driver-manager] NVMe BlockDevice requested before resources online");
+        if self.registry.state("block:nvme") != Some(ServiceState::Online) {
+            let _ = registry.write(protocol::BLOCK_NVME_UNAVAILABLE.as_bytes());
+            println!("[driver-manager] NVMe BlockDevice requested before online");
+            return;
+        }
+        let Some(nvme_host) = self.nvme_host.as_ref() else {
+            let _ = registry.write(protocol::BLOCK_NVME_UNAVAILABLE.as_bytes());
+            return;
+        };
+        match Channel::pair() {
+            Ok((client_end, driver_end)) => {
+                if let Err((error, _handle)) = nvme_host.bootstrap.write_handle(
+                    protocol::ATTACH_BLOCK_NVME_CLIENT.as_bytes(),
+                    driver_end.into_handle(),
+                ) {
+                    println!(
+                        "[driver-manager] failed to attach NVMe block client: {}",
+                        error.as_str()
+                    );
+                    let _ = registry.write(protocol::BLOCK_NVME_UNAVAILABLE.as_bytes());
+                    return;
+                }
+                if let Err((error, _handle)) = registry.write_handle(
+                    protocol::BLOCK_NVME_CHANNEL.as_bytes(),
+                    client_end.into_handle(),
+                ) {
+                    println!(
+                        "[driver-manager] failed to return NVMe block channel: {}",
+                        error.as_str()
+                    );
+                    return;
+                }
+                println!("[driver-manager] opened NVMe BlockDevice service channel");
+            }
+            Err(error) => {
+                println!(
+                    "[driver-manager] failed to create NVMe block channel: {}",
+                    error.as_str()
+                );
+                let _ = registry.write(protocol::BLOCK_NVME_UNAVAILABLE.as_bytes());
+            }
         }
     }
 

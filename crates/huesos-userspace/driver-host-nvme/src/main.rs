@@ -14,10 +14,13 @@
 use core::alloc::{GlobalAlloc, Layout};
 use core::panic::PanicInfo;
 use core::ptr::null_mut;
+use huesos_abi::block::{
+    completion_data, AsyncBlockInfo, AsyncBlockOp, AsyncBlockRequest, AsyncBlockStatus,
+};
 use huesos_nvme::controller::{Controller, ControllerConfig, NvmeError};
 use huesos_nvme::device::{BarRegion, DeviceResources, DmaRegion};
 use huesos_nvme::pci_transport::PciMmioTransport;
-use libcanvas::{println, Channel, ErrorCode, Handle, Interrupt, Port};
+use libcanvas::{println, Channel, ErrorCode, Handle, Interrupt, Port, Vmo};
 
 const REQUIRED_RESOURCES: usize = 3;
 const RESOURCE_LABEL_PREFIX: &[u8] = b"resource:";
@@ -27,6 +30,9 @@ const MMIO_MAP_ADDR: u64 = 0x0000_7000_0000_0000;
 const DMA_MAP_ADDR: u64 = 0x0000_7100_0000_0000;
 const MSI_VECTOR_BASE: u64 = 0xD0;
 const MAX_BOUND_INTERRUPTS: usize = 16;
+const MAX_BLOCK_CLIENTS: usize = 4;
+const MAX_CLIENT_BUFFERS: usize = 8;
+const TRANSFER_CHUNK_BYTES: usize = 4096;
 
 struct NoHeapAllocator;
 
@@ -71,6 +77,55 @@ impl InterruptState {
         }
         live
     }
+}
+
+struct ClientBuffer {
+    id: u32,
+    vmo: Vmo,
+}
+
+struct BlockClient {
+    channel: Channel,
+    completion_port: Option<Port>,
+    buffers: [Option<ClientBuffer>; MAX_CLIENT_BUFFERS],
+}
+
+impl BlockClient {
+    fn new(channel: Channel) -> Self {
+        Self {
+            channel,
+            completion_port: None,
+            buffers: [const { None }; MAX_CLIENT_BUFFERS],
+        }
+    }
+
+    fn upsert_buffer(&mut self, id: u32, vmo: Vmo) -> Result<(), ()> {
+        for slot in &mut self.buffers {
+            if slot.as_ref().is_some_and(|buffer| buffer.id == id) {
+                *slot = Some(ClientBuffer { id, vmo });
+                return Ok(());
+            }
+        }
+        let Some(slot) = self.buffers.iter_mut().find(|slot| slot.is_none()) else {
+            return Err(());
+        };
+        *slot = Some(ClientBuffer { id, vmo });
+        Ok(())
+    }
+
+    fn buffer(&self, id: u32) -> Option<&Vmo> {
+        self.buffers
+            .iter()
+            .flatten()
+            .find(|buffer| buffer.id == id)
+            .map(|buffer| &buffer.vmo)
+    }
+}
+
+struct DriverRuntime {
+    controller: Controller<PciMmioTransport>,
+    interrupt_state: InterruptState,
+    clients: [Option<BlockClient>; MAX_BLOCK_CLIENTS],
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -268,13 +323,13 @@ pub extern "C" fn _start() -> ! {
     drain_bootstrap_resources(&bootstrap, &mut state);
     state.log_summary();
 
-    let mut interrupt_state: Option<InterruptState> = None;
+    let mut runtime: Option<DriverRuntime> = None;
     if state.ready() {
         println!("[driver-host:nvme] resources: mmio OK, irq OK, dma OK");
         let _ = bootstrap.write(b"driver-host:nvme:resources-ready");
         match bring_up_controller(&state) {
-            Ok(irq_state) => {
-                interrupt_state = Some(irq_state);
+            Ok(driver_runtime) => {
+                runtime = Some(driver_runtime);
                 let _ = bootstrap.write(b"service:block:nvme:identified");
                 let _ = bootstrap.write(b"driver-host:nvme:ready");
             }
@@ -288,14 +343,14 @@ pub extern "C" fn _start() -> ! {
     }
 
     loop {
-        if let Some(irq_state) = interrupt_state.as_ref() {
-            let _keep_irq_handles_alive = irq_state.keepalive_marker();
+        if let Some(runtime) = runtime.as_mut() {
+            runtime.poll(&bootstrap);
         }
         libcanvas::process::yield_now();
     }
 }
 
-fn bring_up_controller(state: &NvmeBootstrap) -> Result<InterruptState, &'static str> {
+fn bring_up_controller(state: &NvmeBootstrap) -> Result<DriverRuntime, &'static str> {
     let mmio = state.slot(ResourceSlotKind::Mmio).ok_or("mmio-slot")?;
     let irq = state.slot(ResourceSlotKind::Irq).ok_or("irq-slot")?;
     let dma = state.slot(ResourceSlotKind::DmaPool).ok_or("dma-slot")?;
@@ -356,7 +411,11 @@ fn bring_up_controller(state: &NvmeBootstrap) -> Result<InterruptState, &'static
         irq.len,
         interrupt_state.count
     );
-    Ok(interrupt_state)
+    Ok(DriverRuntime {
+        controller,
+        interrupt_state,
+        clients: [const { None }; MAX_BLOCK_CLIENTS],
+    })
 }
 
 fn bind_interrupts(irq: &ResourceSlot) -> Result<InterruptState, &'static str> {
@@ -394,6 +453,290 @@ fn bind_interrupts(irq: &ResourceSlot) -> Result<InterruptState, &'static str> {
         state.count, irq.base
     );
     Ok(state)
+}
+
+impl DriverRuntime {
+    fn poll(&mut self, bootstrap: &Channel) {
+        let _keep_irq_handles_alive = self.interrupt_state.keepalive_marker();
+        self.poll_bootstrap(bootstrap);
+        self.drain_interrupt_port();
+        let mut index = 0usize;
+        while index < self.clients.len() {
+            self.poll_client(index);
+            index += 1;
+        }
+    }
+
+    fn poll_bootstrap(&mut self, bootstrap: &Channel) {
+        let mut buf = [0u8; 64];
+        loop {
+            match bootstrap.read_optional_handle(&mut buf) {
+                Ok((n, Some(handle))) if &buf[..n] == b"block:nvme-client" => {
+                    self.attach_client(Channel::from_handle(handle));
+                }
+                Ok((_n, Some(handle))) => drop(handle),
+                Ok((_n, None)) => {}
+                Err(ErrorCode::ShouldWait) | Err(ErrorCode::TimedOut) => return,
+                Err(_) => return,
+            }
+        }
+    }
+
+    fn attach_client(&mut self, channel: Channel) {
+        let Some(slot) = self.clients.iter_mut().find(|slot| slot.is_none()) else {
+            println!("[driver-host:nvme] block client table full");
+            drop(channel);
+            return;
+        };
+        *slot = Some(BlockClient::new(channel));
+        println!("[driver-host:nvme] attached block client");
+    }
+
+    fn drain_interrupt_port(&self) {
+        loop {
+            match self.interrupt_state.port.read() {
+                Ok(_packet) => {}
+                Err(ErrorCode::ShouldWait) => return,
+                Err(_) => return,
+            }
+        }
+    }
+
+    fn poll_client(&mut self, index: usize) {
+        let mut buf = [0u8; 96];
+        loop {
+            let Some(client) = self.clients[index].as_mut() else {
+                return;
+            };
+            match client.channel.read_optional_handle(&mut buf) {
+                Ok((n, Some(handle))) if &buf[..n] == b"block:completion-port" => {
+                    client.completion_port = Some(Port::from_handle(handle));
+                }
+                Ok((n, Some(handle))) if buf[..n].starts_with(b"block:buffer:0x") => {
+                    let id = parse_hex_u32(&buf[b"block:buffer:0x".len()..n]);
+                    if let Some(id) = id {
+                        if client.upsert_buffer(id, Vmo::from_handle(handle)).is_err() {
+                            println!("[driver-host:nvme] client buffer table full");
+                        }
+                    } else {
+                        drop(handle);
+                    }
+                }
+                Ok((_n, Some(handle))) => drop(handle),
+                Ok((n, None)) => self.handle_block_request(index, &buf[..n]),
+                Err(ErrorCode::ShouldWait) | Err(ErrorCode::TimedOut) => return,
+                Err(ErrorCode::PeerClosed) => {
+                    self.clients[index] = None;
+                    return;
+                }
+                Err(error) => {
+                    println!(
+                        "[driver-host:nvme] block client read failed: {}",
+                        error.as_str()
+                    );
+                    return;
+                }
+            }
+        }
+    }
+
+    fn handle_block_request(&mut self, index: usize, bytes: &[u8]) {
+        let Some(request) = AsyncBlockRequest::decode(bytes) else {
+            return;
+        };
+        let status = self.execute_block_request(index, request);
+        let bytes = transferred_bytes(&self.controller, status, request);
+        self.complete(index, request.request_id, status, bytes, 0);
+    }
+
+    fn execute_block_request(
+        &mut self,
+        index: usize,
+        request: AsyncBlockRequest,
+    ) -> AsyncBlockStatus {
+        if request.namespace_id != 1 {
+            return AsyncBlockStatus::InvalidArgs;
+        }
+        match request.op {
+            AsyncBlockOp::Info => self.send_info(index),
+            AsyncBlockOp::Flush => match self.controller.flush() {
+                Ok(()) => AsyncBlockStatus::Ok,
+                Err(_) => AsyncBlockStatus::IoError,
+            },
+            AsyncBlockOp::Read => self.read_request(index, request),
+            AsyncBlockOp::Write => self.write_request(index, request),
+        }
+    }
+
+    fn send_info(&mut self, index: usize) -> AsyncBlockStatus {
+        let info = AsyncBlockInfo {
+            namespace_id: 1,
+            block_size: self.controller.lba_size(),
+            block_count: self.controller.namespace_size(),
+            max_request_bytes: self.controller.mdts(),
+        };
+        let Some(client) = self.clients[index].as_ref() else {
+            return AsyncBlockStatus::NoResources;
+        };
+        if client.channel.write(&info.encode()).is_err() {
+            return AsyncBlockStatus::IoError;
+        }
+        AsyncBlockStatus::Ok
+    }
+
+    fn read_request(&mut self, index: usize, request: AsyncBlockRequest) -> AsyncBlockStatus {
+        let Some(block_size) = block_size_usize(&self.controller) else {
+            return AsyncBlockStatus::InvalidArgs;
+        };
+        let total_bytes = request.block_count as usize * block_size;
+        if total_bytes as u64 > self.controller.mdts() as u64 {
+            return AsyncBlockStatus::InvalidArgs;
+        }
+        let mut scratch = [0u8; TRANSFER_CHUNK_BYTES];
+        let mut done_blocks = 0u32;
+        while done_blocks < request.block_count {
+            let chunk_blocks = ((TRANSFER_CHUNK_BYTES / block_size) as u32)
+                .max(1)
+                .min(request.block_count - done_blocks);
+            let chunk_bytes = chunk_blocks as usize * block_size;
+            if self
+                .controller
+                .read(
+                    request.lba + u64::from(done_blocks),
+                    chunk_blocks as u16,
+                    &mut scratch[..chunk_bytes],
+                )
+                .is_err()
+            {
+                return AsyncBlockStatus::IoError;
+            }
+            let Some(client) = self.clients[index].as_ref() else {
+                return AsyncBlockStatus::NoResources;
+            };
+            let Some(vmo) = client.buffer(request.buffer_id) else {
+                return AsyncBlockStatus::InvalidArgs;
+            };
+            let offset = u64::from(done_blocks) * block_size as u64;
+            match vmo.write(offset, &scratch[..chunk_bytes]) {
+                Ok(written) if written == chunk_bytes => {}
+                _ => return AsyncBlockStatus::IoError,
+            }
+            done_blocks += chunk_blocks;
+        }
+        AsyncBlockStatus::Ok
+    }
+
+    fn write_request(&mut self, index: usize, request: AsyncBlockRequest) -> AsyncBlockStatus {
+        let Some(block_size) = block_size_usize(&self.controller) else {
+            return AsyncBlockStatus::InvalidArgs;
+        };
+        let total_bytes = request.block_count as usize * block_size;
+        if total_bytes as u64 > self.controller.mdts() as u64 {
+            return AsyncBlockStatus::InvalidArgs;
+        }
+        let mut scratch = [0u8; TRANSFER_CHUNK_BYTES];
+        let mut done_blocks = 0u32;
+        while done_blocks < request.block_count {
+            let chunk_blocks = ((TRANSFER_CHUNK_BYTES / block_size) as u32)
+                .max(1)
+                .min(request.block_count - done_blocks);
+            let chunk_bytes = chunk_blocks as usize * block_size;
+            let Some(client) = self.clients[index].as_ref() else {
+                return AsyncBlockStatus::NoResources;
+            };
+            let Some(vmo) = client.buffer(request.buffer_id) else {
+                return AsyncBlockStatus::InvalidArgs;
+            };
+            let offset = u64::from(done_blocks) * block_size as u64;
+            match vmo.read(offset, &mut scratch[..chunk_bytes]) {
+                Ok(read) if read == chunk_bytes => {}
+                _ => return AsyncBlockStatus::IoError,
+            }
+            if self
+                .controller
+                .write(
+                    request.lba + u64::from(done_blocks),
+                    chunk_blocks as u16,
+                    &scratch[..chunk_bytes],
+                )
+                .is_err()
+            {
+                return AsyncBlockStatus::IoError;
+            }
+            done_blocks += chunk_blocks;
+        }
+        AsyncBlockStatus::Ok
+    }
+
+    fn complete(
+        &self,
+        index: usize,
+        request_id: u64,
+        status: AsyncBlockStatus,
+        bytes: u64,
+        nvme_status: u16,
+    ) {
+        let Some(client) = self.clients[index].as_ref() else {
+            return;
+        };
+        let Some(port) = client.completion_port.as_ref() else {
+            return;
+        };
+        let packet = libcanvas::PortPacket {
+            key: request_id,
+            packet_type: libcanvas::PORT_PACKET_BLOCK_COMPLETION,
+            status: 0,
+            data: completion_data(request_id, status, bytes, nvme_status),
+        };
+        let _ = port.queue(&packet);
+    }
+}
+
+fn block_size_usize(controller: &Controller<PciMmioTransport>) -> Option<usize> {
+    let block_size = controller.lba_size() as usize;
+    if block_size == 0 || block_size > TRANSFER_CHUNK_BYTES {
+        None
+    } else {
+        Some(block_size)
+    }
+}
+
+fn transferred_bytes(
+    controller: &Controller<PciMmioTransport>,
+    status: AsyncBlockStatus,
+    request: AsyncBlockRequest,
+) -> u64 {
+    if status != AsyncBlockStatus::Ok {
+        return 0;
+    }
+    match request.op {
+        AsyncBlockOp::Read | AsyncBlockOp::Write => {
+            u64::from(request.block_count).saturating_mul(u64::from(controller.lba_size()))
+        }
+        AsyncBlockOp::Flush => 0,
+        AsyncBlockOp::Info => huesos_abi::block::ASYNC_INFO_RESPONSE_BYTES as u64,
+    }
+}
+
+fn parse_hex_u32(bytes: &[u8]) -> Option<u32> {
+    u32::try_from(parse_hex_u64_raw(bytes)?).ok()
+}
+
+fn parse_hex_u64_raw(bytes: &[u8]) -> Option<u64> {
+    if bytes.is_empty() {
+        return None;
+    }
+    let mut value = 0u64;
+    for &digit in bytes {
+        let nibble = match digit {
+            b'0'..=b'9' => digit - b'0',
+            b'a'..=b'f' => digit - b'a' + 10,
+            b'A'..=b'F' => digit - b'A' + 10,
+            _ => return None,
+        };
+        value = value.checked_mul(16)?.checked_add(u64::from(nibble))?;
+    }
+    Some(value)
 }
 
 fn nvme_error_label(error: NvmeError) -> &'static str {

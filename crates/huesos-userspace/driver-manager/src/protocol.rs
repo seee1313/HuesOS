@@ -63,11 +63,9 @@ pub const FILESYSTEM_CHANNEL: &str = "service:filesystem:channel";
 /// Client asks DriverManager to open the NVMe-backed async BlockDevice service.
 pub const OPEN_BLOCK_NVME: &str = "open:block:nvme";
 /// DriverManager responds with an NVMe BlockDevice service channel.
-#[allow(
-    dead_code,
-    reason = "success label reserved before real NVMe service wiring"
-)]
 pub const BLOCK_NVME_CHANNEL: &str = "service:block:nvme:channel";
+/// DriverManager tells NVMe DriverHost about a new block client channel.
+pub const ATTACH_BLOCK_NVME_CLIENT: &str = "block:nvme-client";
 /// NVMe block service is not currently online.
 pub const BLOCK_NVME_UNAVAILABLE: &str = "err:block:nvme-unavailable";
 /// NVMe DriverHost reported it is starting.
