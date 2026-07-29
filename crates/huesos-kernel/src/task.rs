@@ -49,6 +49,10 @@ pub struct Task {
     /// Wake arriving before the task completes the enqueue-to-park handshake.
     /// This closes the SMP lost-wakeup window without a lock across park.
     pub wake_pending: core::sync::atomic::AtomicBool,
+    /// True until the first userspace-entry trampoline consumes this task's
+    /// pending RIP/RSP record. Token stealing must not migrate such a task,
+    /// because the startup record is keyed by the original task id.
+    pub startup_pending: core::sync::atomic::AtomicBool,
     /// Scheduling policy.
     pub sched_policy: crate::scheduler::SchedPolicy,
 }
@@ -74,6 +78,7 @@ impl Task {
             finished: core::sync::atomic::AtomicBool::new(false),
             blocked: core::sync::atomic::AtomicBool::new(false),
             wake_pending: core::sync::atomic::AtomicBool::new(false),
+            startup_pending: core::sync::atomic::AtomicBool::new(false),
             sched_policy: crate::scheduler::SchedPolicy::Fair {
                 weight: 1024,
                 vruntime: 0,
@@ -92,6 +97,7 @@ impl Task {
             finished: core::sync::atomic::AtomicBool::new(true),
             blocked: core::sync::atomic::AtomicBool::new(false),
             wake_pending: core::sync::atomic::AtomicBool::new(false),
+            startup_pending: core::sync::atomic::AtomicBool::new(false),
             sched_policy: crate::scheduler::SchedPolicy::Fair {
                 weight: 1024,
                 vruntime: 0,
@@ -123,6 +129,7 @@ impl Task {
             finished: core::sync::atomic::AtomicBool::new(false),
             blocked: core::sync::atomic::AtomicBool::new(false),
             wake_pending: core::sync::atomic::AtomicBool::new(false),
+            startup_pending: core::sync::atomic::AtomicBool::new(false),
             sched_policy: crate::scheduler::SchedPolicy::Fair {
                 weight: 1024,
                 vruntime: 0,
@@ -161,6 +168,7 @@ impl Task {
             finished: core::sync::atomic::AtomicBool::new(false),
             blocked: core::sync::atomic::AtomicBool::new(false),
             wake_pending: core::sync::atomic::AtomicBool::new(false),
+            startup_pending: core::sync::atomic::AtomicBool::new(true),
             sched_policy: crate::scheduler::SchedPolicy::Fair {
                 weight: 1024,
                 vruntime: 0,

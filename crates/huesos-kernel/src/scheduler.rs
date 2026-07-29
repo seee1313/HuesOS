@@ -590,7 +590,7 @@ impl Scheduler {
             if task.finished.load(Ordering::Relaxed) || task.blocked.load(Ordering::Relaxed) {
                 continue;
             }
-            if crate::process::has_pending_user_entry(task.id) {
+            if task.startup_pending.load(Ordering::Acquire) {
                 skipped.push((vruntime, task_id));
                 continue;
             }
@@ -904,6 +904,24 @@ pub fn wake_task(task_id: u64) {
 pub fn current_task_id() -> Option<u64> {
     let guard = PER_CPU_SCHEDULERS[cpu_id()].lock();
     guard.current_task().map(|t| t.id)
+}
+
+/// Mark a user task's first-entry metadata as consumed. After this point the
+/// task may be migrated by opt-in token stealing because no rank-40 pending
+/// startup record is keyed by its task id anymore.
+pub(crate) fn mark_user_entry_consumed(task_id: u64) {
+    let task_id = resolve_task_id_alias(task_id);
+    let cpu = task_cpu(task_id);
+    if cpu >= MAX_CPUS {
+        return;
+    }
+    let guard = PER_CPU_SCHEDULERS[cpu].lock();
+    let idx = task_index(task_id);
+    if guard.task_matches(task_id) {
+        guard.tasks[idx]
+            .startup_pending
+            .store(false, Ordering::Release);
+    }
 }
 
 /// Monotonic BSP-ish tick counter for wait timeouts (sum of local ticks is
