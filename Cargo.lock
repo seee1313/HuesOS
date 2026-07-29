@@ -146,6 +146,7 @@ dependencies = [
  "huesos-hal",
  "huesos-lifecycle",
  "huesos-object",
+ "huesos-pci",
  "huesos-pmm",
  "huesos-syscalls",
  "huesos-uacpi",

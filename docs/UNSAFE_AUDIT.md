@@ -13,8 +13,8 @@ are intentionally not treated as the versioned project baseline unless they are
 copied into `docs/` in a dedicated review. The versioned baseline remains this
 file plus `safety-budget.json`.
 
-At the current baseline (`safety-budget.json`) the repository contains 167
-first-party Rust files and 44,987 Rust lines. The measured surface is **261**
+At the current baseline (`safety-budget.json`) the repository contains 169
+first-party Rust files and 46,627 Rust lines. The measured surface is **264**
 unsafe blocks, **62** unsafe functions, **28** unsafe impls, one `static mut`,
 **25** unwrap calls, **21** expect calls, and **5** panic macros. Prior baseline
 values are retained in the changelog sections below so that any deviation
@@ -2088,6 +2088,44 @@ code is introduced.
 
 ```
 unsafe_blocks:    261 -> 261 (unchanged).
+unsafe_functions:  62 ->  62 (unchanged).
+unsafe_impls:      28 ->  28 (unchanged).
+static_mut:         1 ->   1 (unchanged).
+unwrap_calls:      25 ->  25 (unchanged).
+expect_calls:      21 ->  21 (unchanged).
+panic_macros:       5 ->   5 (unchanged).
+```
+
+## NVMe Stage-A boot hardware plumbing (dedicated safety-budget review)
+
+Stage A introduces the first on-target storage hardware shim while preserving
+HuesOS's userspace-driver architecture. The kernel now reserves a 64 MiB
+physically contiguous boot DMA pool before heap setup, performs bounded legacy
+PCI config-space discovery for NVMe class-code functions, sizes BAR0, records
+legacy/MSI/MSI-X metadata, and passes a read-only storage boot-info VMO to init.
+Init remains the root Resource minter and forwards `Mmio`, `Irq`, and `DmaPool`
+capabilities to DriverManager/`driver-host-nvme`; the NVMe DriverHost still runs
+in ring 3 and no filesystem logic enters the kernel.
+
+New unsafe blocks are narrow hardware/physical-memory boundaries:
+
+1. `crates/huesos-kernel/src/init.rs::reserve_boot_dma_pool` zeroes the freshly
+   reserved DMA pool through the HHDM with `ptr::write_bytes`. The PMM has
+   already marked the run used, paging has published `phys_to_virt`, and the
+   range is ordinary usable RAM, not MMIO.
+2. `crates/huesos-kernel/src/boot/storage.rs::read_config_u32` performs one
+   architected x86 PCI Configuration Mechanism #1 CF8/CFC DWORD read.
+3. `crates/huesos-kernel/src/boot/storage.rs::write_config_u32` performs the
+   matching CF8/CFC DWORD write. BAR sizing restores BAR0/BAR1 and COMMAND after
+   the all-ones probe.
+
+No unsafe is added to userspace DriverManager or `driver-host-nvme`; they parse
+bounded metadata/labels and move ordinary handles.
+
+### Safety-budget delta (measured)
+
+```
+unsafe_blocks:    261 -> 264 (+3).
 unsafe_functions:  62 ->  62 (unchanged).
 unsafe_impls:      28 ->  28 (unchanged).
 static_mut:         1 ->   1 (unchanged).

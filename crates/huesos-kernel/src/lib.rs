@@ -108,6 +108,8 @@ pub unsafe fn kmain(boot_info: BootInfo) -> ! {
     let phys_offset = huesos_arch::VirtAddr::new(boot_info.hhdm_offset);
     huesos_arch::init_paging(phys_offset);
 
+    let boot_dma_pool = init::reserve_boot_dma_pool();
+
     // W^X hardening sweep for the kernel image: stamp NO_EXECUTE on
     // every kernel .rodata / .data / .bss / .limine_requests page so
     // a write-what-where in kernel data cannot stage a
@@ -232,6 +234,7 @@ pub unsafe fn kmain(boot_info: BootInfo) -> ! {
         dbg("\n");
         Some(bootfs)
     });
+    let storage_boot_info = boot::storage::build_storage_boot_info(boot_dma_pool);
 
     init::framebuffer_init(boot_info.framebuffer);
     huesos_arch::fault::set_kernel_fault_handler(crate::panic::from_cpu_fault);
@@ -269,7 +272,12 @@ pub unsafe fn kmain(boot_info: BootInfo) -> ! {
     }
 
     log_boot_banner(&boot_info);
-    spawn_init_process(bootfs_image, acpi_archive.as_deref(), acpi_system_io);
+    spawn_init_process(
+        bootfs_image,
+        acpi_archive.as_deref(),
+        acpi_system_io,
+        storage_boot_info.as_slice(),
+    );
 
     // BSP idle: timer IRQ drives the scheduler; opportunistically reap.
     loop {
@@ -303,6 +311,7 @@ fn spawn_init_process(
     bootfs_image: Option<&[u8]>,
     acpi_archive: Option<&[u8]>,
     acpi_system_io: alloc::vec::Vec<huesos_object::SystemIoGrant>,
+    storage_boot_info: &[u8],
 ) {
     use huesos_object::KernelObject;
 
@@ -341,6 +350,17 @@ fn spawn_init_process(
         } else {
             dbg("[init] failed to install ACPI table archive VMO\n");
         }
+    }
+    if storage_boot_info.is_empty() {
+        dbg("[init] storage boot-info unavailable\n");
+    } else if install_readonly_vmo(
+        &spawned.process,
+        huesos_abi::INIT_STORAGE_BOOT_INFO_HANDLE,
+        storage_boot_info,
+    ) {
+        dbg("[init] installed storage boot-info VMO\n");
+    } else {
+        dbg("[init] failed to install storage boot-info VMO\n");
     }
 
     let name = *b"init\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0";

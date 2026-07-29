@@ -1,12 +1,12 @@
 {
-  "rust_files": 167,
-  "rust_lines": 44987,
+  "rust_files": 169,
+  "rust_lines": 46627,
   "totals": {
     "expect_calls": 21,
     "panic_macros": 5,
     "static_mut": 1,
     "todo_markers": 1,
-    "unsafe_blocks": 261,
+    "unsafe_blocks": 264,
     "unsafe_functions": 62,
     "unsafe_impls": 28,
     "unwrap_calls": 25
@@ -37,7 +37,7 @@
     "crates/huesos-fb/src/lib.rs": 7,
     "crates/huesos-kernel/src/boot/hbi.rs": 4,
     "crates/huesos-kernel/src/extable.rs": 4,
-    "crates/huesos-kernel/src/init.rs": 4,
+    "crates/huesos-kernel/src/init.rs": 5,
     "crates/huesos-kernel/src/lib.rs": 2,
     "crates/huesos-kernel/src/mem/alloc.rs": 12,
     "crates/huesos-kernel/src/process.rs": 3,
@@ -68,6 +68,7 @@
     "crates/huesos-userspace/libcanvas/src/resource.rs": 1,
     "crates/huesos-userspace/libcanvas/src/signal.rs": 1,
     "crates/huesos-userspace/libcanvas/src/vmo.rs": 3,
-    "crates/huesos-userspace/terminal/src/screen.rs": 2
+    "crates/huesos-userspace/terminal/src/screen.rs": 2,
+    "crates/huesos-kernel/src/boot/storage.rs": 2
   }
 }

@@ -14,6 +14,23 @@ const MEMMAP_ACPI_RECLAIMABLE: u64 = 2;
 const MEMMAP_ACPI_NVS: u64 = 3;
 /// Some Limine builds also expose this as type 8 (ACPI tables / mapped reserved).
 const MEMMAP_ACPI_TABLES_OR_MAPPED_RESERVED: u64 = 8;
+/// Stage-A storage target: a single 64 MiB physically contiguous DMA pool.
+const BOOT_DMA_POOL_LEN: u64 = 64 * 1024 * 1024;
+/// Prefer a 2 MiB-aligned base so later huge-page/IOMMU mappings can reuse the
+/// same aperture without moving the pool.
+const BOOT_DMA_POOL_ALIGN: u64 = 2 * 1024 * 1024;
+/// Until an IOMMU/IOVA allocator lands, keep the boot pool below 4 GiB so it
+/// is usable even for controllers/firmware paths with conservative DMA masks.
+const BOOT_DMA_POOL_MAX_PHYS: u64 = 0x1_0000_0000;
+
+/// Reserved boot DMA pool descriptor.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BootDmaPool {
+    /// Device-visible physical base.
+    pub base: u64,
+    /// Length in bytes.
+    pub len: u64,
+}
 
 /// Initialize the physical frame allocator from the boot memory map.
 ///
@@ -25,6 +42,47 @@ pub unsafe fn pmm_init(
     hhdm_offset: u64,
 ) -> Result<(), huesos_pmm::PmmInitError> {
     unsafe { huesos_pmm::init(regions, hhdm_offset) }
+}
+
+/// Reserve and zero the Stage-A boot DMA pool before the kernel heap consumes
+/// normal PMM frames.
+pub fn reserve_boot_dma_pool() -> Option<BootDmaPool> {
+    let base = match huesos_pmm::alloc_contiguous_aligned(
+        BOOT_DMA_POOL_LEN,
+        BOOT_DMA_POOL_ALIGN,
+        BOOT_DMA_POOL_MAX_PHYS,
+    ) {
+        Ok(base) => base,
+        Err(error) => {
+            use core::fmt::Write;
+            let mut writer = huesos_arch::serial::SerialWriter;
+            let _ = writeln!(
+                writer,
+                "[storage] 64 MiB boot DMA pool unavailable: {error:?}"
+            );
+            return None;
+        }
+    };
+
+    let virt = huesos_arch::paging::phys_to_virt(base).as_mut_ptr::<u8>();
+    // SAFETY: `alloc_contiguous_aligned` returned a run of ordinary physical
+    // RAM that is now exclusively reserved in the PMM. Limine's HHDM covers
+    // usable RAM on this boot path, and paging initialization has already
+    // published `phys_to_virt`, so zeroing the newly reserved pool through the
+    // HHDM cannot alias a live allocation.
+    unsafe { core::ptr::write_bytes(virt, 0, BOOT_DMA_POOL_LEN as usize) };
+
+    use core::fmt::Write;
+    let mut writer = huesos_arch::serial::SerialWriter;
+    let _ = writeln!(
+        writer,
+        "[storage] reserved boot DMA pool: phys={:#x}, len={:#x}",
+        base, BOOT_DMA_POOL_LEN
+    );
+    Some(BootDmaPool {
+        base,
+        len: BOOT_DMA_POOL_LEN,
+    })
 }
 
 /// Map firmware / ACPI physical ranges into the HHDM so early ACPI walks

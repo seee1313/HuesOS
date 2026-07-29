@@ -19,6 +19,7 @@ huesos-fb = { path = "../huesos-fb" }
 huesos-abi = { path = "../huesos-abi" }
 huesos-alloc = { path = "../huesos-alloc" }
 huesos-uacpi = { path = "../huesos-uacpi" }
+huesos-pci = { path = "../huesos-pci" }
 hues-async = { path = "../hues-async" }
 spin = { workspace = true }
 log = { workspace = true }

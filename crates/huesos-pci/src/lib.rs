@@ -28,6 +28,9 @@ pub mod off {
     pub const CLASS: usize = 0x0B;
     pub const HEADER_TYPE: usize = 0x0E;
     pub const BAR0: usize = 0x10;
+    pub const CAPABILITY_POINTER: usize = 0x34;
+    pub const INTERRUPT_LINE: usize = 0x3C;
+    pub const INTERRUPT_PIN: usize = 0x3D;
 }
 
 /// Command register bits.
@@ -36,6 +39,19 @@ pub mod command {
     pub const IO_SPACE: u16 = 1 << 0;
     pub const MEMORY_SPACE: u16 = 1 << 1;
     pub const BUS_MASTER: u16 = 1 << 2;
+}
+
+/// Status register bits.
+#[allow(missing_docs)]
+pub mod status {
+    pub const CAPABILITIES_LIST: u16 = 1 << 4;
+}
+
+/// PCI capability IDs used by Stage-A storage discovery.
+#[allow(missing_docs)]
+pub mod capability_id {
+    pub const MSI: u8 = 0x05;
+    pub const MSIX: u8 = 0x11;
 }
 
 /// A 256-byte conventional PCI configuration space.
@@ -84,6 +100,10 @@ impl ConfigSpace {
     pub fn command(&self) -> u16 {
         self.read_u16(off::COMMAND)
     }
+    /// Status register.
+    pub fn status(&self) -> u16 {
+        self.read_u16(off::STATUS)
+    }
     /// Revision ID.
     pub fn revision(&self) -> u8 {
         self.0[off::REVISION]
@@ -103,6 +123,31 @@ impl ConfigSpace {
     /// Header type (0x00 = standard device).
     pub fn header_type(&self) -> u8 {
         self.0[off::HEADER_TYPE] & 0x7F
+    }
+    /// True when function 0 advertises additional functions.
+    pub fn is_multifunction(&self) -> bool {
+        self.0[off::HEADER_TYPE] & 0x80 != 0
+    }
+    /// Capability-list pointer, if advertised and in the conventional config
+    /// header range.
+    pub fn capability_pointer(&self) -> Option<u8> {
+        if self.status() & status::CAPABILITIES_LIST == 0 {
+            return None;
+        }
+        let ptr = self.0[off::CAPABILITY_POINTER] & 0xFC;
+        if (0x40..=0xFC).contains(&ptr) {
+            Some(ptr)
+        } else {
+            None
+        }
+    }
+    /// Interrupt line byte (`0xff` means unknown/not routed by firmware).
+    pub fn interrupt_line(&self) -> u8 {
+        self.0[off::INTERRUPT_LINE]
+    }
+    /// Interrupt pin byte (1=A, 2=B, ...; zero means no pin).
+    pub fn interrupt_pin(&self) -> u8 {
+        self.0[off::INTERRUPT_PIN]
     }
     /// The class code triple.
     pub fn class_code(&self) -> ClassCode {
@@ -200,6 +245,90 @@ pub enum Bar {
     },
     /// BAR not implemented (size 0 / unused).
     Unused,
+}
+
+/// Parsed MSI-X capability metadata.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MsixCapability {
+    /// Capability offset in conventional config space.
+    pub offset: u8,
+    /// Number of MSI-X table entries.
+    pub table_size: u16,
+    /// Table BAR indicator register.
+    pub table_bir: u8,
+    /// Table offset within the BAR.
+    pub table_offset: u32,
+}
+
+/// Parsed MSI capability metadata.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MsiCapability {
+    /// Capability offset in conventional config space.
+    pub offset: u8,
+    /// Maximum vector count encoded by the capability.
+    pub vector_count: u16,
+}
+
+/// Interrupt capability summary relevant to NVMe Stage A.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct InterruptCapabilities {
+    /// Legacy INTx line, if firmware routed one.
+    pub intx_line: Option<u8>,
+    /// Interrupt pin (1=A, 2=B, ...), if present.
+    pub intx_pin: Option<u8>,
+    /// MSI metadata, if present.
+    pub msi: Option<MsiCapability>,
+    /// MSI-X metadata, if present.
+    pub msix: Option<MsixCapability>,
+}
+
+/// Parse legacy/MSI/MSI-X interrupt metadata from a conventional PCI config
+/// space. Capability-list traversal is bounded and rejects malformed cycles by
+/// capping the walk to the 48 possible DWORD-aligned capability slots.
+pub fn parse_interrupt_capabilities(config: &ConfigSpace) -> InterruptCapabilities {
+    let mut out = InterruptCapabilities {
+        intx_line: (config.interrupt_line() != 0xff).then_some(config.interrupt_line()),
+        intx_pin: (config.interrupt_pin() != 0).then_some(config.interrupt_pin()),
+        msi: None,
+        msix: None,
+    };
+
+    let Some(mut ptr) = config.capability_pointer() else {
+        return out;
+    };
+    let mut steps = 0usize;
+    while steps < 48 && (0x40..=0xFC).contains(&ptr) {
+        let off = ptr as usize;
+        let cap_id = config.0[off];
+        let next = config.0[off + 1] & 0xFC;
+        match cap_id {
+            capability_id::MSI if off + 4 <= config.0.len() => {
+                let control = config.read_u16(off + 2);
+                let mmc = (control >> 1) & 0x7;
+                out.msi = Some(MsiCapability {
+                    offset: ptr,
+                    vector_count: 1u16 << mmc,
+                });
+            }
+            capability_id::MSIX if off + 12 <= config.0.len() => {
+                let control = config.read_u16(off + 2);
+                let table = config.read_u32(off + 4);
+                out.msix = Some(MsixCapability {
+                    offset: ptr,
+                    table_size: (control & 0x07ff).saturating_add(1),
+                    table_bir: (table & 0x7) as u8,
+                    table_offset: table & !0x7,
+                });
+            }
+            _ => {}
+        }
+        if next == 0 || next == ptr {
+            break;
+        }
+        ptr = next;
+        steps += 1;
+    }
+    out
 }
 
 /// Compute a memory BAR's size from its size mask (the value read back after
@@ -431,6 +560,48 @@ mod tests {
         }
         // Unset BAR -> Unused.
         assert_eq!(dev.decode_bar(2), Bar::Unused);
+    }
+
+    #[test]
+    fn parses_interrupt_capabilities() {
+        let mut config = ConfigSpace::zeroed();
+        config.set_ids(0x8086, 0x5845);
+        config.set_class(0x01, 0x08, 0x02);
+        config.write_u16(off::STATUS, status::CAPABILITIES_LIST);
+        config.0[off::CAPABILITY_POINTER] = 0x40;
+        config.0[off::INTERRUPT_LINE] = 11;
+        config.0[off::INTERRUPT_PIN] = 1;
+        config.0[0x40] = capability_id::MSI;
+        config.0[0x41] = 0x50;
+        // Multiple-message capable = 2^2 vectors.
+        config.write_u16(0x42, 0b0100);
+        config.0[0x50] = capability_id::MSIX;
+        config.0[0x51] = 0;
+        // Table size encoded as N-1, so 3 means 4 entries.
+        config.write_u16(0x52, 3);
+        config.write_u32(0x54, 0x2000 | 2);
+
+        let caps = parse_interrupt_capabilities(&config);
+        assert_eq!(caps.intx_line, Some(11));
+        assert_eq!(caps.intx_pin, Some(1));
+        assert_eq!(caps.msi.map(|m| m.vector_count), Some(4));
+        assert_eq!(
+            caps.msix
+                .map(|m| (m.table_size, m.table_bir, m.table_offset)),
+            Some((4, 2, 0x2000))
+        );
+    }
+
+    #[test]
+    fn capability_walk_is_bounded_on_self_cycle() {
+        let mut config = ConfigSpace::zeroed();
+        config.set_ids(0x8086, 0x5845);
+        config.write_u16(off::STATUS, status::CAPABILITIES_LIST);
+        config.0[off::CAPABILITY_POINTER] = 0x40;
+        config.0[0x40] = capability_id::MSI;
+        config.0[0x41] = 0x40;
+        let caps = parse_interrupt_capabilities(&config);
+        assert_eq!(caps.msi.map(|m| m.offset), Some(0x40));
     }
 
     #[test]
