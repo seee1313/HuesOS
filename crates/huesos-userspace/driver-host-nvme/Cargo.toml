@@ -10,6 +10,7 @@ path = "src/main.rs"
 [dependencies]
 libcanvas = { path = "../libcanvas" }
 huesos-abi = { path = "../../huesos-abi" }
+huesos-nvme = { path = "../../huesos-nvme" }
 
 [profile.release]
 opt-level = 2

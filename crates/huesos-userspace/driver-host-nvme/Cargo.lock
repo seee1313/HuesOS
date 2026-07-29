@@ -3,6 +3,10 @@
 version = 4
 
 [[package]]
+name = "hues-async"
+version = "0.1.0"
+
+[[package]]
 name = "huesos-abi"
 version = "0.1.0"
 
@@ -11,7 +15,15 @@ name = "huesos-driver-host-nvme"
 version = "0.1.0"
 dependencies = [
  "huesos-abi",
+ "huesos-nvme",
  "libcanvas",
+]
+
+[[package]]
+name = "huesos-nvme"
+version = "0.1.0"
+dependencies = [
+ "hues-async",
 ]
 
 [[package]]

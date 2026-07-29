@@ -1106,7 +1106,16 @@ impl DriverManager {
                 "[driver-manager] registered Stage-A block:nvme resources from {}",
                 owner
             );
+        } else if msg == protocol::NVME_BLOCK_IDENTIFIED.as_bytes() {
+            let owner = self.registry.owner("block:nvme").unwrap_or("unknown-host");
+            println!(
+                "[driver-manager] registered identified block:nvme namespace from {}",
+                owner
+            );
             self.registry.mark_online("block:nvme");
+        } else if msg == protocol::NVME_BLOCK_BRINGUP_FAILED.as_bytes() {
+            println!("[driver-manager] NVMe controller bring-up failed");
+            self.registry.mark_failed("block:nvme");
         } else if msg == protocol::NVME_HOST_READY.as_bytes() {
             println!("[driver-manager] NVMe DriverHost ready (resource-only Stage A)");
         } else if msg == protocol::NVME_HOST_MISSING_RESOURCES.as_bytes() {

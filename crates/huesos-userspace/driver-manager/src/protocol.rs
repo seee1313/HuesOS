@@ -79,5 +79,9 @@ pub const NVME_HOST_MISSING_RESOURCES: &str = "service:block:nvme:missing-resour
 /// NVMe DriverHost reported ready. In Stage A this means resources are present,
 /// not that a real BlockDevice channel is available.
 pub const NVME_HOST_READY: &str = "driver-host:nvme:ready";
+/// NVMe DriverHost completed Identify Controller/Namespace on target.
+pub const NVME_BLOCK_IDENTIFIED: &str = "service:block:nvme:identified";
+/// NVMe DriverHost failed controller bring-up after resources mapped.
+pub const NVME_BLOCK_BRINGUP_FAILED: &str = "service:block:nvme:bringup-failed";
 /// NVMe skeleton compatibility message for resource-only readiness.
 pub const NVME_BLOCK_READY: &str = "service:block:nvme:ready";
