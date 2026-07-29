@@ -7,6 +7,9 @@ use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame, Pag
 
 use super::fault::{FaultInfo, FaultKind};
 
+/// IPI vector used for a scheduler reschedule request. Kept separate from the
+/// LAPIC timer vector so remote wake/token paths do not advance time.
+pub const RESCHEDULE_VECTOR: u8 = 0xF0;
 /// IPI vector used to freeze non-owner CPUs during a kernel panic.
 pub const PANIC_STOP_VECTOR: u8 = 0xF1;
 /// IPI vector used for an orderly system-wide software halt.
@@ -62,6 +65,7 @@ static IDT: Lazy<InterruptDescriptorTable> = Lazy::new(|| {
     idt[32].set_handler_fn(timer_handler);
     idt[33].set_handler_fn(keyboard_handler);
     idt[super::ioapic::KEYBOARD_VECTOR].set_handler_fn(ioapic_keyboard_handler);
+    idt[RESCHEDULE_VECTOR].set_handler_fn(reschedule_handler);
     idt[PANIC_STOP_VECTOR].set_handler_fn(panic_stop_handler);
     idt[SHUTDOWN_STOP_VECTOR].set_handler_fn(shutdown_stop_handler);
     idt[TLB_SHOOTDOWN_VECTOR].set_handler_fn(tlb_shootdown_handler);
@@ -174,6 +178,12 @@ extern "x86-interrupt" fn tlb_shootdown_handler(_frame: InterruptStackFrame) {
     super::cpu::clear_user_access();
     super::paging::handle_tlb_shootdown();
     super::lapic::eoi();
+}
+
+extern "x86-interrupt" fn reschedule_handler(_frame: InterruptStackFrame) {
+    super::cpu::clear_user_access();
+    super::lapic::eoi();
+    crate::x86_64::timer_callback::reschedule();
 }
 
 extern "x86-interrupt" fn timer_handler(_stack_frame: InterruptStackFrame) {

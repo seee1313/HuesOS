@@ -273,9 +273,16 @@ pub fn broadcast_excluding_self(vector: u8) {
 }
 
 /// Send a reschedule IPI to `dest_apic_id`.
-/// Uses the timer vector (0x20) to trigger a scheduler tick on the target CPU.
+///
+/// Uses a dedicated vector instead of the LAPIC timer vector, so remote wake and
+/// token-mailbox traffic cannot advance monotonic time or execute timer-only
+/// policy on the target CPU.
 pub fn ipi_reschedule(dest_apic_id: u8) {
     unsafe {
-        send_ipi(dest_apic_id, 0x20, IpiDelivery::Fixed);
+        send_ipi(
+            dest_apic_id,
+            super::idt::RESCHEDULE_VECTOR,
+            IpiDelivery::Fixed,
+        );
     }
 }

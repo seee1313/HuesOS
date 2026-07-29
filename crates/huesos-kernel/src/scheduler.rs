@@ -649,6 +649,10 @@ unsafe fn register_scheduler_ptr(sched: *mut Scheduler) {
     unsafe { (*ptr).scheduler = sched as *mut () };
 }
 
+#[allow(
+    dead_code,
+    reason = "future idle-task/deferred scheduler hook; never called from hard timer IRQ"
+)]
 fn try_token_steal_for_idle_cpu(target_cpu: usize) {
     if target_cpu >= MAX_CPUS || !is_cpu_online(target_cpu) {
         return;
@@ -688,6 +692,31 @@ fn try_token_steal_for_idle_cpu(target_cpu: usize) {
     }
 }
 
+fn run_current_cpu_scheduler_interrupt(hardware_tick: bool) {
+    huesos_arch::interrupts::disable();
+    let cpu = cpu_id();
+    process_runqueue_token_mailbox(cpu);
+    if hardware_tick && cpu == 0 {
+        MONOTONIC_TICKS.fetch_add(1, Ordering::SeqCst);
+    }
+    let mut guard = PER_CPU_SCHEDULERS[cpu].lock();
+    let switch_context = guard.tick();
+    drop(guard); // Release the lock before performing context switch!
+
+    if hardware_tick {
+        // Wake any waiters whose timeout expired against hardware time.
+        huesos_object::wait::notify_tick(MONOTONIC_TICKS.load(Ordering::SeqCst));
+    }
+
+    if let Some((old_ptr, new_ptr)) = switch_context {
+        // Safety: interrupts are disabled; pointers point to active Vec
+        unsafe {
+            huesos_arch::context_switch::context_switch(old_ptr, new_ptr);
+        }
+    }
+    huesos_arch::interrupts::enable();
+}
+
 /// Initialize the scheduler for the current CPU and register the timer callback.
 /// Called once per CPU.
 pub fn init() {
@@ -703,27 +732,10 @@ pub fn init() {
     drop(guard);
 
     huesos_arch::timer_callback::set_timer_callback(&|| {
-        huesos_arch::interrupts::disable();
-        let cpu = cpu_id();
-        process_runqueue_token_mailbox(cpu);
-        if cpu == 0 {
-            MONOTONIC_TICKS.fetch_add(1, Ordering::SeqCst);
-        }
-        try_token_steal_for_idle_cpu(cpu);
-        let mut guard = PER_CPU_SCHEDULERS[cpu].lock();
-        let switch_context = guard.tick();
-        drop(guard); // Release the lock before performing context switch!
-
-        // Wake any waiters whose timeout expired against hardware time.
-        huesos_object::wait::notify_tick(MONOTONIC_TICKS.load(Ordering::SeqCst));
-
-        if let Some((old_ptr, new_ptr)) = switch_context {
-            // Safety: interrupts are disabled; pointers point to active Vec
-            unsafe {
-                huesos_arch::context_switch::context_switch(old_ptr, new_ptr);
-            }
-        }
-        huesos_arch::interrupts::enable();
+        run_current_cpu_scheduler_interrupt(true);
+    });
+    huesos_arch::timer_callback::set_reschedule_callback(&|| {
+        run_current_cpu_scheduler_interrupt(false);
     });
 
     mark_cpu_online();
