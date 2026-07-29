@@ -97,6 +97,85 @@ impl<R: BlockReader> Hxfs<R> {
         }
     }
 
+    /// Open an absolute directory path inside the system volume.
+    pub fn open_directory_path(&mut self, path: &str) -> Result<DirectoryHandle, HxfsError> {
+        if path == "/" {
+            return Ok(self.root_directory());
+        }
+        let mut current = self.system_volume.root_object_id;
+        let mut rest = if let Some(stripped) = path.as_bytes().strip_prefix(b"/") {
+            stripped
+        } else {
+            return Err(HxfsError::BadName);
+        };
+        loop {
+            let slash = rest.iter().position(|&byte| byte == b'/');
+            let (component, tail) = match slash {
+                Some(pos) => (&rest[..pos], &rest[pos + 1..]),
+                None => (rest, &[][..]),
+            };
+            if component.is_empty() || component.len() > MAX_NAME_BYTES {
+                return Err(HxfsError::BadName);
+            }
+            let dir = self.find_object(current)?;
+            if dir.object_type != OBJECT_TYPE_DIRECTORY {
+                return Err(HxfsError::WrongType);
+            }
+            let next = self.lookup_in_directory(dir, component)?;
+            let object = self.find_object(next)?;
+            if object.object_type != OBJECT_TYPE_DIRECTORY {
+                return Err(HxfsError::WrongType);
+            }
+            if tail.is_empty() {
+                return Ok(DirectoryHandle { object_id: next });
+            }
+            current = next;
+            rest = tail;
+        }
+    }
+
+    /// List a directory into `out` as newline-separated UTF-8 names. Returns
+    /// bytes written and truncates at `out.len()` without splitting safety
+    /// invariants: the result is only a diagnostic/listing convenience for the
+    /// Stage-G service.
+    pub fn list_directory(
+        &mut self,
+        directory: DirectoryHandle,
+        out: &mut [u8],
+    ) -> Result<usize, HxfsError> {
+        let dir = self.find_object(directory.object_id)?;
+        if dir.object_type != OBJECT_TYPE_DIRECTORY {
+            return Err(HxfsError::WrongType);
+        }
+        let mut writer = ListWriter::new(out);
+        self.for_each_directory_entry(dir, |entry| {
+            writer.write(entry.name.as_bytes());
+            writer.write_byte(b'\n');
+        })?;
+        Ok(writer.len())
+    }
+
+    /// Open one child file by name from a directory handle.
+    pub fn open_child_file(
+        &mut self,
+        directory: DirectoryHandle,
+        name: &str,
+    ) -> Result<FileHandle, HxfsError> {
+        let dir = self.find_object(directory.object_id)?;
+        if dir.object_type != OBJECT_TYPE_DIRECTORY {
+            return Err(HxfsError::WrongType);
+        }
+        let object_id = self.lookup_in_directory(dir, name.as_bytes())?;
+        let object = self.find_object(object_id)?;
+        if object.object_type != OBJECT_TYPE_FILE {
+            return Err(HxfsError::WrongType);
+        }
+        Ok(FileHandle {
+            object_id: object.object_id,
+            size: object.size,
+        })
+    }
+
     /// Open an absolute path inside the system volume.
     pub fn open_path(&mut self, path: &str) -> Result<FileHandle, HxfsError> {
         if path.is_empty() || !path.as_bytes().starts_with(b"/") {
@@ -215,6 +294,41 @@ impl<R: BlockReader> Hxfs<R> {
             index += 1;
         }
         Err(HxfsError::NotFound)
+    }
+
+    fn for_each_directory_entry(
+        &mut self,
+        dir: ObjectDescriptor,
+        mut visit: impl FnMut(DirectoryEntry<'_>),
+    ) -> Result<(), HxfsError> {
+        let mut block = [0u8; BLOCK_SIZE];
+        self.read_metadata_block(
+            dir.tree_lba,
+            BLOCK_TYPE_DIRECTORY,
+            dir.object_id,
+            &mut block,
+        )?;
+        let header = parse_header(&block)?;
+        let owner = read_u64(&block, header.header_bytes as usize)?;
+        let count = read_u32(&block, header.header_bytes as usize + 8)?;
+        if owner != dir.object_id || count != dir.record_count {
+            return Err(HxfsError::BadTree);
+        }
+        let mut previous: Option<&str> = None;
+        let mut index = 0u32;
+        while index < count {
+            let offset = header.header_bytes as usize + 16 + index as usize * DIR_RECORD_BYTES;
+            let entry = parse_dir_record(&block, offset)?;
+            if let Some(prev) = previous {
+                if prev.as_bytes() >= entry.name.as_bytes() {
+                    return Err(HxfsError::BadTree);
+                }
+            }
+            visit(entry);
+            previous = Some(entry.name);
+            index += 1;
+        }
+        Ok(())
     }
 
     fn copy_extents(&mut self, object: ObjectDescriptor, out: &mut [u8]) -> Result<(), HxfsError> {
@@ -532,6 +646,34 @@ fn read_i64(bytes: &[u8], offset: usize) -> Result<i64, HxfsError> {
     ))
 }
 
+struct ListWriter<'a> {
+    out: &'a mut [u8],
+    len: usize,
+}
+
+impl<'a> ListWriter<'a> {
+    fn new(out: &'a mut [u8]) -> Self {
+        Self { out, len: 0 }
+    }
+
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    fn write_byte(&mut self, byte: u8) {
+        if self.len < self.out.len() {
+            self.out[self.len] = byte;
+            self.len += 1;
+        }
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        for &byte in bytes {
+            self.write_byte(byte);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -664,6 +806,22 @@ mod tests {
         let read = fs.read_file(file, &mut buf);
         assert_eq!(read, Ok(11));
         assert_eq!(&buf[..11], b"hello hxfs\n");
+    }
+
+    #[test]
+    fn directory_listing_and_child_open_work() {
+        let image = build_image(false);
+        let reader = SliceBlockReader::new(&image);
+        let Ok(mut fs) = Hxfs::mount(reader) else {
+            assert!(false, "test image should mount");
+            return;
+        };
+        let root = fs.root_directory();
+        let mut list = [0u8; 32];
+        assert_eq!(fs.list_directory(root, &mut list), Ok(10));
+        assert_eq!(&list[..10], b"hello.txt\n");
+        let file = fs.open_child_file(root, "hello.txt");
+        assert!(file.is_ok());
     }
 
     #[test]
