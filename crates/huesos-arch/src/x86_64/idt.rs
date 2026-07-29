@@ -16,6 +16,10 @@ pub const PANIC_STOP_VECTOR: u8 = 0xF1;
 pub const SHUTDOWN_STOP_VECTOR: u8 = 0xF2;
 /// IPI vector used for cross-CPU TLB invalidation.
 pub const TLB_SHOOTDOWN_VECTOR: u8 = 0xF3;
+/// First vector reserved for NVMe MSI-X/MSI delivery.
+pub const NVME_MSI_VECTOR_BASE: u8 = 0xD0;
+/// Number of contiguous NVMe MSI vectors installed in the IDT.
+pub const NVME_MSI_VECTOR_COUNT: u8 = 16;
 static PANIC_STOPPED_CPUS: AtomicUsize = AtomicUsize::new(0);
 
 /// Number of peer CPUs that acknowledged the panic-stop IPI.
@@ -69,6 +73,22 @@ static IDT: Lazy<InterruptDescriptorTable> = Lazy::new(|| {
     idt[PANIC_STOP_VECTOR].set_handler_fn(panic_stop_handler);
     idt[SHUTDOWN_STOP_VECTOR].set_handler_fn(shutdown_stop_handler);
     idt[TLB_SHOOTDOWN_VECTOR].set_handler_fn(tlb_shootdown_handler);
+    idt[NVME_MSI_VECTOR_BASE].set_handler_fn(nvme_msi_handler_0);
+    idt[NVME_MSI_VECTOR_BASE + 1].set_handler_fn(nvme_msi_handler_1);
+    idt[NVME_MSI_VECTOR_BASE + 2].set_handler_fn(nvme_msi_handler_2);
+    idt[NVME_MSI_VECTOR_BASE + 3].set_handler_fn(nvme_msi_handler_3);
+    idt[NVME_MSI_VECTOR_BASE + 4].set_handler_fn(nvme_msi_handler_4);
+    idt[NVME_MSI_VECTOR_BASE + 5].set_handler_fn(nvme_msi_handler_5);
+    idt[NVME_MSI_VECTOR_BASE + 6].set_handler_fn(nvme_msi_handler_6);
+    idt[NVME_MSI_VECTOR_BASE + 7].set_handler_fn(nvme_msi_handler_7);
+    idt[NVME_MSI_VECTOR_BASE + 8].set_handler_fn(nvme_msi_handler_8);
+    idt[NVME_MSI_VECTOR_BASE + 9].set_handler_fn(nvme_msi_handler_9);
+    idt[NVME_MSI_VECTOR_BASE + 10].set_handler_fn(nvme_msi_handler_10);
+    idt[NVME_MSI_VECTOR_BASE + 11].set_handler_fn(nvme_msi_handler_11);
+    idt[NVME_MSI_VECTOR_BASE + 12].set_handler_fn(nvme_msi_handler_12);
+    idt[NVME_MSI_VECTOR_BASE + 13].set_handler_fn(nvme_msi_handler_13);
+    idt[NVME_MSI_VECTOR_BASE + 14].set_handler_fn(nvme_msi_handler_14);
+    idt[NVME_MSI_VECTOR_BASE + 15].set_handler_fn(nvme_msi_handler_15);
     idt
 });
 
@@ -195,6 +215,37 @@ extern "x86-interrupt" fn timer_handler(_stack_frame: InterruptStackFrame) {
     crate::x86_64::timer_callback::tick();
 }
 
+macro_rules! nvme_msi_handler {
+    ($name:ident, $offset:expr) => {
+        extern "x86-interrupt" fn $name(_stack_frame: InterruptStackFrame) {
+            pci_msi_ack(NVME_MSI_VECTOR_BASE + $offset);
+        }
+    };
+}
+
+nvme_msi_handler!(nvme_msi_handler_0, 0);
+nvme_msi_handler!(nvme_msi_handler_1, 1);
+nvme_msi_handler!(nvme_msi_handler_2, 2);
+nvme_msi_handler!(nvme_msi_handler_3, 3);
+nvme_msi_handler!(nvme_msi_handler_4, 4);
+nvme_msi_handler!(nvme_msi_handler_5, 5);
+nvme_msi_handler!(nvme_msi_handler_6, 6);
+nvme_msi_handler!(nvme_msi_handler_7, 7);
+nvme_msi_handler!(nvme_msi_handler_8, 8);
+nvme_msi_handler!(nvme_msi_handler_9, 9);
+nvme_msi_handler!(nvme_msi_handler_10, 10);
+nvme_msi_handler!(nvme_msi_handler_11, 11);
+nvme_msi_handler!(nvme_msi_handler_12, 12);
+nvme_msi_handler!(nvme_msi_handler_13, 13);
+nvme_msi_handler!(nvme_msi_handler_14, 14);
+nvme_msi_handler!(nvme_msi_handler_15, 15);
+
+fn pci_msi_ack(vector: u8) {
+    super::cpu::clear_user_access();
+    super::lapic::eoi();
+    crate::x86_64::irq_callback::emit(vector, 0);
+}
+
 extern "x86-interrupt" fn keyboard_handler(_stack_frame: InterruptStackFrame) {
     keyboard_irq_ack(true);
 }
@@ -225,7 +276,10 @@ fn keyboard_irq_ack(pic: bool) {
 
 #[cfg(test)]
 mod tests {
-    use super::{PANIC_STOP_VECTOR, RESCHEDULE_VECTOR, SHUTDOWN_STOP_VECTOR, TLB_SHOOTDOWN_VECTOR};
+    use super::{
+        NVME_MSI_VECTOR_BASE, NVME_MSI_VECTOR_COUNT, PANIC_STOP_VECTOR, RESCHEDULE_VECTOR,
+        SHUTDOWN_STOP_VECTOR, TLB_SHOOTDOWN_VECTOR,
+    };
 
     #[test]
     fn reschedule_ipi_has_dedicated_non_timer_vector() {
@@ -234,5 +288,12 @@ mod tests {
         assert_ne!(RESCHEDULE_VECTOR, SHUTDOWN_STOP_VECTOR);
         assert_ne!(RESCHEDULE_VECTOR, TLB_SHOOTDOWN_VECTOR);
         assert_eq!(RESCHEDULE_VECTOR, 0xF0);
+    }
+
+    #[test]
+    fn nvme_msi_vectors_do_not_overlap_ipis() {
+        let end = NVME_MSI_VECTOR_BASE + NVME_MSI_VECTOR_COUNT - 1;
+        assert!(end < RESCHEDULE_VECTOR);
+        assert!(NVME_MSI_VECTOR_BASE >= 0xD0);
     }
 }
