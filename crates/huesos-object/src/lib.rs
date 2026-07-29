@@ -275,6 +275,8 @@ mod tests {
             Ok(port) => port,
             Err(_) => return,
         };
+        let port_koid = port.koid();
+        register_object(port.clone());
         assert!(process.bind_exit_port(port.clone(), 0xCAFE).is_ok());
         assert!(process.set_exit_code(42));
         let packet = port.read();
@@ -285,6 +287,9 @@ mod tests {
             assert_eq!(packet.data[0], process.koid().0);
             assert_eq!(packet.data[2], 42);
         }
+        drop(process);
+        assert_eq!(object_ref_counts(port_koid), (0, 0));
+        unregister_object(port_koid);
     }
 
     #[test]

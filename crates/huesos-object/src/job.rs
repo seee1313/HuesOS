@@ -70,7 +70,14 @@ static PENDING_QUOTA_EVENTS: IrqSafeMutex<PendingQuotaEvents> =
 
 struct QuotaPortBinding {
     port: Arc<Port>,
+    port_koid: Koid,
     key: u64,
+}
+
+impl Drop for QuotaPortBinding {
+    fn drop(&mut self) {
+        crate::note_kernel_ref_close(self.port_koid);
+    }
 }
 
 /// Failure while creating a child Job.
@@ -182,7 +189,15 @@ impl Job {
         if ports.len() >= MAX_QUOTA_PORTS || ports.try_reserve_exact(1).is_err() {
             return false;
         }
-        ports.push(QuotaPortBinding { port, key });
+        let port_koid = port.koid();
+        if crate::acquire_kernel_ref(port_koid).is_none() {
+            return false;
+        }
+        ports.push(QuotaPortBinding {
+            port,
+            port_koid,
+            key,
+        });
         true
     }
 
@@ -309,14 +324,17 @@ mod tests {
             max_handles: huesos_quota::UNLIMITED,
             max_cpu_ticks: huesos_quota::UNLIMITED,
         });
+        let job_koid = job.koid();
         crate::register_object(job.clone());
         let port = match Port::new() {
             Ok(port) => port,
             Err(_) => {
-                crate::unregister_object(job.koid());
+                crate::unregister_object(job_koid);
                 return;
             }
         };
+        let port_koid = port.koid();
+        crate::register_object(port.clone());
         assert!(job.bind_quota_port(port.clone(), 7));
         assert!(job.charge(Resource::Memory, 1));
         assert!(!job.charge(Resource::Memory, 1));
@@ -331,7 +349,10 @@ mod tests {
             assert_eq!(packet.data[1], 0);
             assert_eq!(packet.data[2], 1);
         }
-        crate::unregister_object(job.koid());
+        crate::unregister_object(job_koid);
+        drop(job);
+        assert_eq!(crate::object_ref_counts(port_koid), (0, 0));
+        crate::unregister_object(port_koid);
     }
 
     #[test]

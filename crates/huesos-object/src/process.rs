@@ -28,7 +28,14 @@ pub enum ProcessExitPortError {
 
 struct ExitPortBinding {
     port: Arc<Port>,
+    port_koid: Koid,
     key: u64,
+}
+
+impl Drop for ExitPortBinding {
+    fn drop(&mut self) {
+        crate::note_kernel_ref_close(self.port_koid);
+    }
 }
 
 /// Process — address space + handle table + exit state.
@@ -291,7 +298,15 @@ impl Process {
         bindings
             .try_reserve_exact(1)
             .map_err(|_| ProcessExitPortError::OutOfMemory)?;
-        bindings.push(ExitPortBinding { port, key });
+        let port_koid = port.koid();
+        if crate::acquire_kernel_ref(port_koid).is_none() {
+            return Err(ProcessExitPortError::OutOfMemory);
+        }
+        bindings.push(ExitPortBinding {
+            port,
+            port_koid,
+            key,
+        });
         Ok(())
     }
 
