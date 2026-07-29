@@ -43,8 +43,8 @@ mod waitset;
 use huesos_abi::{
     ChannelConsumeArgs, ChannelPeekArgs, ChannelReadEtcArgs, ErrorCode, FramebufferBlitArgs,
     FramebufferInfo, HandleValue, JobBindQuotaPortArgs, JobCreateArgs, JobSetLimitsArgs,
-    PortPacket, ProcessBindExitPortArgs, ProcessCreateInJobArgs, VmarCreateChildArgs, VmarMapArgs,
-    VmarOpArgs, WaitSetWaitArgs,
+    JobSetNameArgs, PortPacket, ProcessBindExitPortArgs, ProcessCreateInJobArgs,
+    VmarCreateChildArgs, VmarMapArgs, VmarOpArgs, WaitSetWaitArgs,
 };
 
 pub use callbacks::{
@@ -175,5 +175,6 @@ pub fn dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> Syscal
         S::ProcessCreateInJob => {
             process::sys_process_create_in_job(a1 as *const ProcessCreateInJobArgs)
         }
+        S::JobSetName => job::sys_job_set_name(a1 as *const JobSetNameArgs),
     }
 }

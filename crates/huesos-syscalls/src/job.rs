@@ -3,11 +3,14 @@
 use alloc::sync::Arc;
 use huesos_abi::{
     ErrorCode, HandleValue, JobBindQuotaPortArgs, JobCreateArgs, JobLimitsAbi, JobSetLimitsArgs,
+    JobSetNameArgs,
 };
 use huesos_object::{Handle, KernelObjectExt, Rights};
 use huesos_quota::Limits;
 
 use crate::{user_memory, util::current_proc, SyscallResult};
+
+const MAX_JOB_NAME_LEN: usize = 64;
 
 fn limits_from_abi(limits: JobLimitsAbi) -> Limits {
     Limits {
@@ -85,6 +88,27 @@ pub(crate) fn sys_job_set_limits(args_ptr: *const JobSetLimitsArgs) -> SyscallRe
     } else {
         Err(ErrorCode::InvalidArgs)
     }
+}
+
+/// Set a Job diagnostic name.
+pub(crate) fn sys_job_set_name(args_ptr: *const JobSetNameArgs) -> SyscallResult {
+    let args = user_memory::read_value(args_ptr)?;
+    if args.name_len as usize > MAX_JOB_NAME_LEN {
+        return Err(ErrorCode::InvalidArgs);
+    }
+    let name_bytes = user_memory::copy_from_user(args.name, args.name_len as usize)?;
+    let name = core::str::from_utf8(&name_bytes).map_err(|_| ErrorCode::InvalidArgs)?;
+    let proc = current_proc()?;
+    let job_handle = proc.handles.get(args.job).ok_or(ErrorCode::BadHandle)?;
+    if !job_handle.has_rights(Rights::SET_PROPERTY) {
+        return Err(ErrorCode::AccessDenied);
+    }
+    let job_obj = huesos_object::lookup_object(job_handle.koid).ok_or(ErrorCode::BadHandle)?;
+    let job = job_obj
+        .downcast_ref::<huesos_object::Job>()
+        .ok_or(ErrorCode::WrongType)?;
+    job.set_name(name);
+    Ok(0)
 }
 
 /// Bind a Port for quota-exhaustion packets.

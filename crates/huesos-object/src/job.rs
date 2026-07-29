@@ -144,6 +144,11 @@ impl Job {
         self.name.lock().clone()
     }
 
+    /// Replace this Job's diagnostic name.
+    pub fn set_name(&self, name: &str) {
+        *self.name.lock() = String::from(name);
+    }
+
     /// Parent Job, if this is not the root.
     pub fn parent(&self) -> Option<Arc<Job>> {
         self.parent.clone()
@@ -367,6 +372,14 @@ mod tests {
         drop(job);
         assert_eq!(crate::object_ref_counts(port_koid), (0, 0));
         crate::unregister_object(port_koid);
+    }
+
+    #[test]
+    fn job_name_can_be_replaced() {
+        let job = Job::root();
+        assert_eq!(job.name(), "root");
+        job.set_name("supervisor");
+        assert_eq!(job.name(), "supervisor");
     }
 
     #[test]

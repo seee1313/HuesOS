@@ -211,13 +211,15 @@ pub enum Syscall {
     /// Create a process inside an explicit Job. `a1` points to
     /// [`ProcessCreateInJobArgs`].
     ProcessCreateInJob = 54,
+    /// Set a Job diagnostic name. `a1` points to [`JobSetNameArgs`].
+    JobSetName = 55,
 }
 
 impl Syscall {
     /// Total number of defined syscalls (i.e. one past the highest
     /// currently-assigned number). The dispatcher uses this to reject
     /// obviously-out-of-range numbers before a `match`.
-    pub const COUNT: u64 = 55;
+    pub const COUNT: u64 = 56;
 
     /// Convert a raw syscall number back into a [`Syscall`], if valid.
     pub const fn from_raw(n: u64) -> Option<Self> {
@@ -277,6 +279,7 @@ impl Syscall {
             52 => Self::JobSetLimits,
             53 => Self::JobBindQuotaPort,
             54 => Self::ProcessCreateInJob,
+            55 => Self::JobSetName,
             _ => return None,
         })
     }
@@ -798,6 +801,18 @@ pub struct JobSetLimitsArgs {
     pub limits: JobLimitsAbi,
 }
 
+/// Arguments for [`Syscall::JobSetName`].
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct JobSetNameArgs {
+    /// Job handle.
+    pub job: HandleValue,
+    /// Pointer to UTF-8 name bytes.
+    pub name: *const u8,
+    /// Name length in bytes.
+    pub name_len: u64,
+}
+
 /// Arguments for [`Syscall::JobBindQuotaPort`].
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -951,7 +966,8 @@ mod tests {
         assert_eq!(Syscall::JobSetLimits as u64, 52);
         assert_eq!(Syscall::JobBindQuotaPort as u64, 53);
         assert_eq!(Syscall::ProcessCreateInJob as u64, 54);
-        assert_eq!(Syscall::COUNT, 55);
+        assert_eq!(Syscall::JobSetName as u64, 55);
+        assert_eq!(Syscall::COUNT, 56);
         assert_eq!(Syscall::from_raw(28), Some(Syscall::VmoCreateEx));
         assert_eq!(Syscall::from_raw(30), Some(Syscall::VmarProtect));
         assert_eq!(Syscall::from_raw(31), Some(Syscall::ChannelPeek));
@@ -981,7 +997,8 @@ mod tests {
         assert_eq!(Syscall::from_raw(52), Some(Syscall::JobSetLimits));
         assert_eq!(Syscall::from_raw(53), Some(Syscall::JobBindQuotaPort));
         assert_eq!(Syscall::from_raw(54), Some(Syscall::ProcessCreateInJob));
-        assert_eq!(Syscall::from_raw(55), None);
+        assert_eq!(Syscall::from_raw(55), Some(Syscall::JobSetName));
+        assert_eq!(Syscall::from_raw(56), None);
     }
 
     #[test]

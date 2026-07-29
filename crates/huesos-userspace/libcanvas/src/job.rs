@@ -5,7 +5,7 @@ use crate::port::Port;
 use crate::raw;
 use huesos_abi::{
     HandleValue, JobBindQuotaPortArgs, JobCreateArgs, JobLimitsAbi, JobSetLimitsArgs,
-    ProcessCreateInJobArgs, Syscall, INVALID_HANDLE,
+    JobSetNameArgs, ProcessCreateInJobArgs, Syscall, INVALID_HANDLE,
 };
 
 use crate::process::{Process, Vmar};
@@ -46,6 +46,18 @@ impl Job {
             limits,
         };
         let ret = raw::syscall1(Syscall::JobSetLimits, &args as *const _ as u64);
+        raw::decode(ret)?;
+        Ok(())
+    }
+
+    /// Replace this Job's diagnostic name.
+    pub fn set_name(&self, name: &str) -> crate::Result<()> {
+        let args = JobSetNameArgs {
+            job: self.0.raw(),
+            name: name.as_ptr(),
+            name_len: name.len() as u64,
+        };
+        let ret = raw::syscall1(Syscall::JobSetName, &args as *const _ as u64);
         raw::decode(ret)?;
         Ok(())
     }
