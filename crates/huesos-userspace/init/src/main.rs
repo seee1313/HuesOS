@@ -496,7 +496,7 @@ fn send_nvme_boot_grants(logger: &mut InitLogger, dm_bootstrap: &Channel, storag
         ResourceGrant {
             kind: kind::IRQ,
             base: nvme.irq_line as u64,
-            len: 1,
+            len: u64::from(nvme.irq_vector_count.max(1)),
             exclusive: true,
         },
         ResourceGrant {
@@ -509,13 +509,15 @@ fn send_nvme_boot_grants(logger: &mut InitLogger, dm_bootstrap: &Channel, storag
 
     init_logln!(
         logger,
-        "[init] NVMe boot grants: pci={:02x}:{:02x}.{} bar0={:#x}+{:#x} irq={} dma={:#x}+{:#x}",
+        "[init] NVMe boot grants: pci={:02x}:{:02x}.{} bar0={:#x}+{:#x} irq={} count={} flags={:#x} dma={:#x}+{:#x}",
         nvme.bus,
         nvme.device,
         nvme.function,
         nvme.bar0_base,
         nvme.bar0_len,
         nvme.irq_line,
+        nvme.irq_vector_count,
+        nvme.flags,
         info.dma_pool.base,
         info.dma_pool.len
     );

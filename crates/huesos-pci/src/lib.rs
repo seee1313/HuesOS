@@ -39,6 +39,7 @@ pub mod command {
     pub const IO_SPACE: u16 = 1 << 0;
     pub const MEMORY_SPACE: u16 = 1 << 1;
     pub const BUS_MASTER: u16 = 1 << 2;
+    pub const INTX_DISABLE: u16 = 1 << 10;
 }
 
 /// Status register bits.

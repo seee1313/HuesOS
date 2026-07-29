@@ -28,6 +28,10 @@ pub const NVME_FLAG_INTX_PRESENT: u32 = 1 << 0;
 pub const NVME_FLAG_MSI_PRESENT: u32 = 1 << 1;
 /// NVMe entry flag: MSI-X capability was present in PCI config space.
 pub const NVME_FLAG_MSIX_PRESENT: u32 = 1 << 2;
+/// NVMe entry flag: kernel programmed MSI-X for this function.
+pub const NVME_FLAG_MSIX_ENABLED: u32 = 1 << 3;
+/// NVMe entry flag: kernel programmed MSI for this function.
+pub const NVME_FLAG_MSI_ENABLED: u32 = 1 << 4;
 
 /// Preallocated boot DMA pool descriptor.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -77,6 +81,8 @@ pub struct NvmeBootFunction {
     pub msix_table_bir: u8,
     /// Reserved for alignment / future flags. Must be zero in v1.
     pub reserved0: u8,
+    /// Number of interrupt vectors programmed and covered by the IRQ Resource.
+    pub irq_vector_count: u16,
     /// MSI-X table offset within `msix_table_bir`, if present.
     pub msix_table_offset: u32,
 }
@@ -116,6 +122,7 @@ impl StorageBootInfo {
                 msix_table_size: 0,
                 msix_table_bir: 0,
                 reserved0: 0,
+                irq_vector_count: 0,
                 msix_table_offset: 0,
             }; MAX_NVME_FUNCTIONS],
         }
@@ -210,6 +217,7 @@ fn encode_nvme(entry: &NvmeBootFunction, out: &mut [u8], base: usize) -> Option<
     write_u16(out, base + 34, entry.msix_table_size)?;
     *out.get_mut(base + 36)? = entry.msix_table_bir;
     *out.get_mut(base + 37)? = entry.reserved0;
+    write_u16(out, base + 38, entry.irq_vector_count)?;
     write_u32(out, base + 40, entry.msix_table_offset)?;
     Some(())
 }
@@ -230,6 +238,7 @@ fn decode_nvme(bytes: &[u8], base: usize) -> Option<NvmeBootFunction> {
         msix_table_size: read_u16(bytes, base + 34)?,
         msix_table_bir: *bytes.get(base + 36)?,
         reserved0: *bytes.get(base + 37)?,
+        irq_vector_count: read_u16(bytes, base + 38)?,
         msix_table_offset: read_u32(bytes, base + 40)?,
     })
 }
@@ -307,6 +316,7 @@ mod tests {
             msix_table_size: 3,
             msix_table_bir: 0,
             reserved0: 0,
+            irq_vector_count: 0,
             msix_table_offset: 0x2000,
         }));
         info

@@ -10,7 +10,8 @@ use core::fmt::Write;
 
 use huesos_abi::storage_boot::{
     self, DmaPoolInfo, NvmeBootFunction, StorageBootInfo, FLAG_DMA_POOL_PRESENT,
-    NVME_FLAG_INTX_PRESENT, NVME_FLAG_MSIX_PRESENT, NVME_FLAG_MSI_PRESENT,
+    NVME_FLAG_INTX_PRESENT, NVME_FLAG_MSIX_ENABLED, NVME_FLAG_MSIX_PRESENT, NVME_FLAG_MSI_ENABLED,
+    NVME_FLAG_MSI_PRESENT,
 };
 use huesos_pci::{command, parse_interrupt_capabilities, Bar, ClassCode, ConfigSpace};
 
@@ -22,6 +23,16 @@ const MAX_BUSES: u16 = 256;
 const MAX_DEVICES: u8 = 32;
 const MAX_FUNCTIONS: u8 = 8;
 const MIN_NVME_BAR0_LEN: u64 = 0x1000;
+const MAX_NVME_MSIX_VECTORS: u16 = huesos_arch::idt::NVME_MSI_VECTOR_COUNT as u16;
+const NVME_MSI_VECTOR_BASE: u8 = huesos_arch::idt::NVME_MSI_VECTOR_BASE;
+const MSI_MESSAGE_ADDRESS_BASE: u32 = 0xFEE0_0000;
+const MSIX_ENTRY_BYTES: u64 = 16;
+const MSIX_VECTOR_CONTROL_MASKED: u32 = 1;
+const MSIX_CONTROL_FUNCTION_MASK: u16 = 1 << 14;
+const MSIX_CONTROL_ENABLE: u16 = 1 << 15;
+const MSI_CONTROL_ENABLE: u16 = 1;
+const MSI_CONTROL_MME_MASK: u16 = 0x7 << 4;
+const MSI_CONTROL_64BIT: u16 = 1 << 7;
 
 #[derive(Clone, Copy)]
 struct PciLocation {
@@ -34,6 +45,13 @@ struct PciLocation {
 struct Bar0Info {
     base: u64,
     len: u64,
+}
+
+#[derive(Clone, Copy)]
+struct InterruptRoute {
+    flags: u32,
+    irq_base: u32,
+    irq_count: u16,
 }
 
 /// Build an encoded storage boot-info blob for init.
@@ -109,6 +127,7 @@ fn inspect_function(location: PciLocation) -> Option<NvmeBootFunction> {
     }
     let msi_vector_count = interrupts.msi.map(|m| m.vector_count).unwrap_or(0);
     let msix = interrupts.msix.unwrap_or_default();
+    let route = configure_interrupts(location, &bar0, &interrupts, flags);
 
     Some(NvmeBootFunction {
         bus: location.bus,
@@ -119,14 +138,151 @@ fn inspect_function(location: PciLocation) -> Option<NvmeBootFunction> {
         device_id: config.device_id(),
         bar0_base: bar0.base,
         bar0_len: bar0.len,
-        irq_line: u32::from(interrupts.intx_line.unwrap_or(0xff)),
-        flags,
+        irq_line: route.irq_base,
+        flags: route.flags,
         msi_vector_count,
         msix_table_size: msix.table_size,
         msix_table_bir: msix.table_bir,
         reserved0: 0,
+        irq_vector_count: route.irq_count,
         msix_table_offset: msix.table_offset,
     })
+}
+
+fn configure_interrupts(
+    location: PciLocation,
+    bar0: &Bar0Info,
+    interrupts: &huesos_pci::InterruptCapabilities,
+    base_flags: u32,
+) -> InterruptRoute {
+    if let Some(msix) = interrupts.msix {
+        if let Some(route) = try_configure_msix(location, bar0, msix, base_flags) {
+            return route;
+        }
+    }
+    if let Some(msi) = interrupts.msi {
+        if let Some(route) = try_configure_msi(location, msi, base_flags) {
+            return route;
+        }
+    }
+    InterruptRoute {
+        flags: base_flags,
+        irq_base: u32::from(interrupts.intx_line.unwrap_or(0xff)),
+        irq_count: interrupts.intx_line.map(|_| 1).unwrap_or(0),
+    }
+}
+
+fn try_configure_msix(
+    location: PciLocation,
+    bar0: &Bar0Info,
+    msix: huesos_pci::MsixCapability,
+    base_flags: u32,
+) -> Option<InterruptRoute> {
+    if msix.table_bir != 0 || msix.table_size == 0 {
+        return None;
+    }
+    let count = msix.table_size.min(MAX_NVME_MSIX_VECTORS);
+    let table_bytes = u64::from(count).checked_mul(MSIX_ENTRY_BYTES)?;
+    let table_end = u64::from(msix.table_offset).checked_add(table_bytes)?;
+    if table_end > bar0.len {
+        return None;
+    }
+    let table_phys = bar0.base.checked_add(u64::from(msix.table_offset))?;
+    map_mmio_window(table_phys, table_bytes).ok()?;
+
+    let control = read_config_u16(location, msix.offset as usize + 2);
+    write_config_u16(
+        location,
+        msix.offset as usize + 2,
+        control | MSIX_CONTROL_FUNCTION_MASK,
+    );
+    let mut idx = 0u16;
+    while idx < count {
+        let vector = NVME_MSI_VECTOR_BASE.wrapping_add(idx as u8);
+        program_msix_entry(table_phys, idx, vector);
+        idx += 1;
+    }
+    write_config_u16(
+        location,
+        msix.offset as usize + 2,
+        (control | MSIX_CONTROL_ENABLE) & !MSIX_CONTROL_FUNCTION_MASK,
+    );
+    enable_device_bus_master(location);
+    Some(InterruptRoute {
+        flags: base_flags | NVME_FLAG_MSIX_ENABLED,
+        irq_base: u32::from(NVME_MSI_VECTOR_BASE),
+        irq_count: count,
+    })
+}
+
+fn try_configure_msi(
+    location: PciLocation,
+    msi: huesos_pci::MsiCapability,
+    base_flags: u32,
+) -> Option<InterruptRoute> {
+    let vector = NVME_MSI_VECTOR_BASE;
+    let control = read_config_u16(location, msi.offset as usize + 2);
+    let message_address = msi_message_address();
+    write_config_u32(location, msi.offset as usize + 4, message_address);
+    let data_offset = if control & MSI_CONTROL_64BIT != 0 {
+        write_config_u32(location, msi.offset as usize + 8, 0);
+        msi.offset as usize + 12
+    } else {
+        msi.offset as usize + 8
+    };
+    write_config_u16(location, data_offset, u16::from(vector));
+    write_config_u16(
+        location,
+        msi.offset as usize + 2,
+        (control & !MSI_CONTROL_MME_MASK) | MSI_CONTROL_ENABLE,
+    );
+    enable_device_bus_master(location);
+    Some(InterruptRoute {
+        flags: base_flags | NVME_FLAG_MSI_ENABLED,
+        irq_base: u32::from(vector),
+        irq_count: 1,
+    })
+}
+
+fn map_mmio_window(phys: u64, len: u64) -> Result<(), huesos_arch::paging::KernelPageError> {
+    use x86_64::structures::paging::PageTableFlags;
+    huesos_arch::paging::map_hhdm_range_flags(
+        phys,
+        len,
+        PageTableFlags::PRESENT
+            | PageTableFlags::WRITABLE
+            | PageTableFlags::NO_CACHE
+            | PageTableFlags::NO_EXECUTE,
+    )
+}
+
+fn program_msix_entry(table_phys: u64, index: u16, vector: u8) {
+    let entry_phys = table_phys + u64::from(index) * MSIX_ENTRY_BYTES;
+    let entry = huesos_arch::paging::phys_to_virt(entry_phys).as_u64();
+    let message_address = msi_message_address();
+    // SAFETY: `try_configure_msix` bounds-checks the table against BAR0, maps
+    // the MMIO page(s) uncached, and calls this with `index < programmed_count`.
+    // MSI-X table writes are volatile MMIO writes to architected entry fields.
+    unsafe {
+        core::ptr::write_volatile((entry + 12) as *mut u32, MSIX_VECTOR_CONTROL_MASKED);
+        core::ptr::write_volatile(entry as *mut u32, message_address);
+        core::ptr::write_volatile((entry + 4) as *mut u32, 0);
+        core::ptr::write_volatile((entry + 8) as *mut u32, u32::from(vector));
+        core::ptr::write_volatile((entry + 12) as *mut u32, 0);
+    }
+}
+
+fn msi_message_address() -> u32 {
+    MSI_MESSAGE_ADDRESS_BASE | ((huesos_arch::lapic::id() & 0xff) << 12)
+}
+
+fn enable_device_bus_master(location: PciLocation) {
+    let command = read_config_u16(location, huesos_pci::off::COMMAND);
+    write_config_u16(
+        location,
+        huesos_pci::off::COMMAND,
+        command | command::MEMORY_SPACE | command::BUS_MASTER | command::INTX_DISABLE,
+    );
 }
 
 fn read_config_space(location: PciLocation) -> ConfigSpace {
@@ -255,7 +411,7 @@ fn log_storage_info(info: &StorageBootInfo) {
         let entry = info.nvme[idx];
         let _ = writeln!(
             writer,
-            "[storage] nvme{} pci={:02x}:{:02x}.{} vendor={:#x} device={:#x} bar0={:#x}+{:#x} irq={} flags={:#x}",
+            "[storage] nvme{} pci={:02x}:{:02x}.{} vendor={:#x} device={:#x} bar0={:#x}+{:#x} irq={} count={} flags={:#x}",
             idx,
             entry.bus,
             entry.device,
@@ -265,6 +421,7 @@ fn log_storage_info(info: &StorageBootInfo) {
             entry.bar0_base,
             entry.bar0_len,
             entry.irq_line,
+            entry.irq_vector_count,
             entry.flags
         );
         idx += 1;
