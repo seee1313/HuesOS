@@ -455,11 +455,16 @@ next-stage expansion items; they are not blockers for the Immediate milestone.
   DevFS exposes a runtime handle namespace (`open:devfs`) with `/dev/block/system`
   returning a Volume handle and `/dev/nvme0/ns1` returning a range-relative
   BlockDevice handle. DevFS remains a handle resolver, not a disk filesystem.
-- **Needed**: on-target NVMe/SSD data-path soak, then Hxfs read-only design/code.
-  A future performance slice can replace the current synchronous service
-  execution with deeper async queue-slot tracking, but Stage C's public
-  Channel+Port service contract, Stage D's Volume handles, Stage E's BlobFS read
-  path, and Stage F's DevFS handle namespace are now present.
+- **Hxfs Stage-G design baseline added**: `docs/HXFS_DESIGN.md` defines the
+  object/volume-store model, NVMe/SSD-only media assumptions, COW + sequential
+  checkpoint/journal architecture, virtual-volume policy, encryption/integrity
+  rules, Hxblob relationship, and read-only prototype scope.
+- **Needed**: on-target NVMe/SSD data-path soak, then Hxfs read-only prototype
+  code after the design is reviewed. A future performance slice can replace the
+  current synchronous service execution with deeper async queue-slot tracking,
+  but Stage C's public Channel+Port service contract, Stage D's Volume handles,
+  Stage E's BlobFS read path, and Stage F's DevFS handle namespace are now
+  present.
 - **PS/2 driver ownership (fully migrated as of PR-E)**: the scancode
   decoder, shift-state machine, and key-event dispatch live only in the
   userspace `driver-host:input` process. The kernel keeps a
