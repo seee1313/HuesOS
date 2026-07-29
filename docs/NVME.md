@@ -1,14 +1,15 @@
 # NVMe Driver (ring-3 DriverHost)
 
-Status: **Stage B controller bring-up landed.** The repository now has:
+Status: **Stage B + real MSI-X/MSI wiring landed.** The repository now has:
 `DmaPool` resource capability, HBI boot-driver packaging, kernel PCI NVMe
-BAR/IRQ metadata discovery, a Resource-backed userspace MMIO/DMA mapping ABI,
-DriverManager launch of `driver-host-nvme` from BOOTFS, real BAR/DMA mapping in
-the DriverHost, controller disable/enable + admin queue setup from the 64 MiB DMA
-pool, Identify Controller/Namespace integration, per-CPU queue creation planning,
-PRP handling up to the 1 MiB request cap, and the async BlockDevice Channel+Port
-wire protocol. Real MSI-X/MSI programming and the public BlockDevice service
-channel remain the next slices. This is ROADMAP Short-Term #7 (real VFS +
+BAR/IRQ metadata discovery, Resource-backed userspace MMIO/DMA mapping,
+kernel-programmed MSI-X with MSI fallback, DriverManager launch of
+`driver-host-nvme` from BOOTFS, real BAR/DMA mapping in the DriverHost,
+controller disable/enable + admin queue setup from the 64 MiB DMA pool, Identify
+Controller/Namespace integration, per-CPU queue creation planning, PRP handling
+up to the 1 MiB request cap, MSI/MSI-X vectors bound to a userspace Port, and
+the async BlockDevice Channel+Port wire protocol. The public BlockDevice service
+channel remains the next slice. This is ROADMAP Short-Term #7 (real VFS +
 drivers in userspace), first device.
 
 ## Goal
@@ -99,11 +100,14 @@ On-target, these are backed by kernel-provided capabilities:
   `DmaPool` Resource handle to map only that Resource's page-aligned range into
   its own root VMAR. MMIO mappings are installed user-accessible, writable, NX,
   and `NO_CACHE`.
-- **Interrupt metadata Resource**: Stage A records INTx line/pin and MSI/MSI-X
-  capability metadata, then forwards an `Irq` Resource label. Stage B uses the
-  polling fallback path while creating queues; MSI-X/MSI programming and Port
-  delivery remain separate because HuesOS still needs a PCI config-space/vector
-  programming API for userspace DriverHosts.
+- **MSI-X/MSI interrupts**: Stage A records INTx line/pin and MSI/MSI-X
+  capability metadata. The follow-up interrupt slice programs MSI-X table entries
+  in BAR0 when available, falls back to MSI if MSI-X is unavailable/unsupported,
+  disables INTx when message-signalled interrupts are enabled, reserves an `Irq`
+  Resource over the programmed vector range, and lets `driver-host-nvme` create
+  Interrupt objects from that Resource and bind them to a userspace Port. If
+  neither MSI-X nor MSI can be programmed, the driver stays on the polling
+  fallback path.
 - **Coherent DMA buffers**: boot reserves a preallocated `DmaPool` resource for
   the DriverHost. The first production target is a 64 MiB pool, physically
   contiguous, pinned, below 4 GiB when available, and device-visible. Stage B maps
@@ -139,17 +143,19 @@ that storage I/O is already online.
 
 ## On-target verification checklist
 
-Stage A/B completed in code:
+Stage A/B + MSI-X/MSI completed in code:
 
 - Boot reserves/logs the 64 MiB DMA pool.
-- Kernel storage boot-info logs discovered NVMe PCI function(s), BAR0, IRQ line,
-  and MSI/MSI-X metadata.
+- Kernel storage boot-info logs discovered NVMe PCI function(s), BAR0, IRQ/vector
+  range, and MSI/MSI-X metadata/programming status.
 - Init forwards `Mmio`, `Irq`, and `DmaPool` Resource handles with deterministic
   labels to DriverManager.
 - DriverManager enumerates `/storage/boot-drivers.manifest` and launches
   `/drivers/driver-host-nvme.elf` from HBI BOOTFS when hardware is present.
-- `driver-host-nvme` maps BAR0/DMA with `ResourceMap`, initializes the controller,
-  and logs namespace id, block size, block count, max request, and queue count.
+- `driver-host-nvme` maps BAR0/DMA with `ResourceMap`, binds MSI-X/MSI vectors to
+  a Port when vector resources are present, initializes the controller, and logs
+  namespace id, block size, block count, max request, queue count, and bound IRQ
+  count.
 - The controller path disables/enables CC.EN with CAP.TO-derived bounded waits,
   programs AQA/ASQ/ACQ, submits Identify Controller/Namespace, Set Features
   Number of Queues, and Create I/O CQ/SQ commands.
@@ -157,7 +163,7 @@ Stage A/B completed in code:
 Remaining Stage C / later hardware work:
 
 - Real async BlockDevice service channel and request server.
-- MSI-X/MSI programming through a PCI config/vector API and Port delivery;
-  polling fallback is the active Stage-B path.
+- Use the bound MSI-X/MSI Port in the async completion loop instead of only
+  having it ready for Stage C.
 - Data-path on-target read/write soak through the future BlockDevice server.
 - Multiple namespaces beyond the current system namespace-first policy.

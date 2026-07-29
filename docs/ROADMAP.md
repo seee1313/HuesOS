@@ -427,24 +427,26 @@ next-stage expansion items; they are not blockers for the Immediate milestone.
 
 ### 7. Real VFS + drivers in userspace
 - BOOTFS is live as a RAM archive; `huesos-fat` exists as a library.
-- **NVMe Stage A/B landed**: DmaPool resource capability, manifest parsing for
-  `resource=dma:...`, HBI `.img` boot-driver contract, userspace
+- **NVMe Stage A/B + MSI-X/MSI landed**: DmaPool resource capability, manifest
+  parsing for `resource=dma:...`, HBI `.img` boot-driver contract, userspace
   `driver-host-nvme`, strict NVMe resource-label parsing, Identify
   Controller/Namespace parsers, per-CPU queue/DMA planning, async BlockDevice
   Channel+Port protocol, client completion tracker, DriverManager registry
   reservation for `open:block:nvme`, 64 MiB boot DMA pool reservation,
-  kernel PCI NVMe BAR0/IRQ/MSI/MSI-X metadata discovery, storage boot-info VMO,
+  kernel PCI NVMe BAR0/IRQ/MSI/MSI-X metadata discovery, kernel MSI-X table
+  programming with MSI fallback, storage boot-info VMO carrying vector ranges,
   dynamic init-minted `Mmio`/`Irq`/`DmaPool` grants, DriverManager launch of
   `driver-host-nvme` from HBI BOOTFS, `ResourceMap` self-mapping for `Mmio` and
-  `DmaPool`, BAR/DMA mapping in the DriverHost, controller reset/enable,
-  admin-queue setup, Identify Controller/Namespace on target, 1 MiB max request
-  clamp, PRP-list support within one list page, and per-CPU queue creation
-  planning/commands.
+  `DmaPool`, Resource-authorized Interrupt creation, BAR/DMA mapping in the
+  DriverHost, controller reset/enable, admin-queue setup, Identify
+  Controller/Namespace on target, 1 MiB max request clamp, PRP-list support
+  within one list page, and per-CPU queue creation planning/commands.
 - **Agreed production targets**: HBI `.img` driver loading, 64 MiB preallocated
   DMA pool, no heap after driver init, MSI-X→MSI→polling fallback, per-CPU
   queues depth 256, and 1 MiB max request size.
-- **Needed**: real MSI-X/MSI programming and Port delivery, real BlockDevice
-  service registration, BlobFS read-only mount, and later Hxfs/DevFS layers.
+- **Needed**: wire the bound MSI-X/MSI Port into the async completion loop, real
+  BlockDevice service registration, BlobFS read-only mount, and later Hxfs/DevFS
+  layers.
 - **PS/2 driver ownership (fully migrated as of PR-E)**: the scancode
   decoder, shift-state machine, and key-event dispatch live only in the
   userspace `driver-host:input` process. The kernel keeps a

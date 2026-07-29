@@ -14,7 +14,7 @@ copied into `docs/` in a dedicated review. The versioned baseline remains this
 file plus `safety-budget.json`.
 
 At the current baseline (`safety-budget.json`) the repository contains 169
-first-party Rust files and 47,162 Rust lines. The measured surface is **263**
+first-party Rust files and 47,521 Rust lines. The measured surface is **265**
 unsafe blocks, **63** unsafe functions, **29** unsafe impls, one `static mut`,
 **25** unwrap calls, **21** expect calls, and **5** panic macros. Prior baseline
 values are retained in the changelog sections below so that any deviation
@@ -2172,6 +2172,47 @@ Safety-surface notes:
 unsafe_blocks:    264 -> 263 (net -1).
 unsafe_functions:  62 ->  63 (+1).
 unsafe_impls:      28 ->  29 (+1).
+static_mut:         1 ->   1 (unchanged).
+unwrap_calls:      25 ->  25 (unchanged).
+expect_calls:      21 ->  21 (unchanged).
+panic_macros:       5 ->   5 (unchanged).
+```
+
+## NVMe MSI-X/MSI programming boundary (dedicated safety-budget review)
+
+The NVMe interrupt slice programs real message-signalled interrupts while keeping
+NVMe itself in userspace. During boot hardware discovery, the kernel prefers
+MSI-X, falls back to MSI, and leaves polling as the final fallback. For MSI-X the
+kernel validates the table BIR/offset/size against BAR0, maps only the table
+window as uncached MMIO, masks the function, writes each MSI-X table entry with
+an LAPIC message address and vector in the reserved `0xD0..0xDF` range, unmasks
+the entries, enables MSI-X, and disables INTx. For MSI the kernel writes the
+standard message address/data fields and enables one vector. The programmed
+vector range is exposed as an `Irq` Resource; `driver-host-nvme` creates
+Interrupt objects from that Resource and binds them to a Port.
+
+New safety surface:
+
+1. `crates/huesos-kernel/src/boot/storage.rs::program_msix_entry` performs
+   volatile writes to MSI-X table MMIO entries after the table window has been
+   bounds-checked and mapped uncached. The writes are the architected MSI-X
+   message address/data/vector-control fields.
+2. `crates/huesos-userspace/libcanvas/src/interrupt.rs::create_from_resource`
+   wraps the fresh raw Interrupt handle returned by the kernel in the existing
+   RAII `Handle` type, mirroring the older keyboard-only `Interrupt::create`
+   wrapper.
+
+The IDT handler additions for `0xD0..0xDF` use safe Rust handler functions and
+add no unsafe blocks. The Resource-authorized interrupt-create syscall adds no
+unsafe blocks; it validates that the requested vector is covered by the caller's
+`Irq` Resource before registering the Interrupt object.
+
+### Safety-budget delta (measured)
+
+```
+unsafe_blocks:    263 -> 265 (+2).
+unsafe_functions:  63 ->  63 (unchanged).
+unsafe_impls:      29 ->  29 (unchanged).
 static_mut:         1 ->   1 (unchanged).
 unwrap_calls:      25 ->  25 (unchanged).
 expect_calls:      21 ->  21 (unchanged).
