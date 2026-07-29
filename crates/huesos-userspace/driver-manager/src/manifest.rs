@@ -71,6 +71,8 @@ pub enum ResourceGrantKind {
     /// Atomic-halt / power-off capability. See
     /// `docs/ARCHITECTURE_ROADMAP.md` §3.
     PowerControl = 4,
+    /// Preallocated DMA pool for userspace DriverHosts.
+    DmaPool = 5,
 }
 
 // Note: numeric conversion to `huesos_abi::ResourceKindAbi` is intentionally
@@ -246,6 +248,7 @@ fn parse_resource_grant(val: &[u8]) -> Option<ResourceGrantManifest> {
         b"mmio" => ResourceGrantKind::Mmio,
         b"irq" => ResourceGrantKind::Irq,
         b"pwr" | b"powercontrol" => ResourceGrantKind::PowerControl,
+        b"dma" | b"dmapool" => ResourceGrantKind::DmaPool,
         _ => return None,
     };
 
