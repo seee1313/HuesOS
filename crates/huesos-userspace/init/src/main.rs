@@ -42,6 +42,7 @@ pub extern "C" fn _start() -> ! {
     let mut logger = InitLogger::new();
     let bootfs = Vmo::take_init_bootfs();
     let acpi_tables = Vmo::take_init_acpi_tables();
+    let storage_boot_info = Vmo::take_init_storage_boot_info();
     let acpi_broker = libcanvas::Handle::take_init_acpi_broker();
     init_logln!(logger, "[init] hello from ring3 userspace, via libcanvas");
 
@@ -67,12 +68,14 @@ pub extern "C" fn _start() -> ! {
         send_bootfs_vmo(&mut logger, channel, &bootfs);
         send_acpi_tables_vmo(&mut logger, channel, &acpi_tables);
         send_acpi_broker(&mut logger, channel, acpi_broker);
+        send_storage_boot_info_vmo(&mut logger, channel, &storage_boot_info);
         send_manifest_grants(
             &mut logger,
             channel,
             &bootfs,
             b"/manifests/input-host.hdriver",
         );
+        send_nvme_boot_grants(&mut logger, channel, &storage_boot_info);
     }
 
     // DriverManager owns the isolated ACPI manager launch because it receives
@@ -255,6 +258,27 @@ fn send_acpi_broker(logger: &mut InitLogger, dm_bootstrap: &Channel, broker: lib
     }
 }
 
+fn send_storage_boot_info_vmo(logger: &mut InitLogger, dm_bootstrap: &Channel, storage: &Vmo) {
+    let duplicate = storage.duplicate(
+        libcanvas::rights::READ | libcanvas::rights::DUPLICATE | libcanvas::rights::TRANSFER,
+    );
+    let Ok(vmo) = duplicate else {
+        init_logln!(logger, "[init] storage boot-info VMO unavailable");
+        return;
+    };
+    match dm_bootstrap.write_handle(b"storage-boot-vmo", vmo.into_handle()) {
+        Ok(()) => init_logln!(
+            logger,
+            "[init] passed storage boot-info VMO to DriverManager"
+        ),
+        Err((error, _handle)) => init_logln!(
+            logger,
+            "[init] failed to pass storage boot-info VMO: {}",
+            error.as_str()
+        ),
+    }
+}
+
 /// Read a driver manifest from BOOTFS, mint the kernel-side `Resource`
 /// capabilities it declares, and transfer each handle to driver-manager
 /// via its bootstrap channel. The wire label carries the metadata
@@ -425,6 +449,126 @@ fn send_manifest_grants(
             "[init] manifest {}: failed to signal grants-complete: {}",
             driver_name,
             e.as_str()
+        ),
+    }
+}
+
+fn send_nvme_boot_grants(logger: &mut InitLogger, dm_bootstrap: &Channel, storage: &Vmo) {
+    use libcanvas::manifest::ResourceGrant;
+    use libcanvas::resource::{kind, Resource};
+    use libcanvas::storage_boot;
+
+    let mut bytes = [0u8; storage_boot::MAX_ENCODED_BYTES];
+    let read = match storage.read(0, &mut bytes) {
+        Ok(n) => n,
+        Err(error) => {
+            init_logln!(
+                logger,
+                "[init] NVMe boot grants skipped: storage boot-info read failed: {}",
+                error.as_str()
+            );
+            return;
+        }
+    };
+    let Some(info) = storage_boot::decode(&bytes[..read]) else {
+        init_logln!(
+            logger,
+            "[init] NVMe boot grants skipped: bad storage boot-info"
+        );
+        return;
+    };
+    if info.nvme_count == 0 {
+        init_logln!(
+            logger,
+            "[init] NVMe boot grants skipped: no NVMe PCI function"
+        );
+        return;
+    }
+
+    let nvme = info.nvme[0];
+    let grants = [
+        ResourceGrant {
+            kind: kind::MMIO,
+            base: nvme.bar0_base,
+            len: nvme.bar0_len,
+            exclusive: true,
+        },
+        ResourceGrant {
+            kind: kind::IRQ,
+            base: nvme.irq_line as u64,
+            len: 1,
+            exclusive: true,
+        },
+        ResourceGrant {
+            kind: kind::DMA_POOL,
+            base: info.dma_pool.base,
+            len: info.dma_pool.len,
+            exclusive: true,
+        },
+    ];
+
+    init_logln!(
+        logger,
+        "[init] NVMe boot grants: pci={:02x}:{:02x}.{} bar0={:#x}+{:#x} irq={} dma={:#x}+{:#x}",
+        nvme.bus,
+        nvme.device,
+        nvme.function,
+        nvme.bar0_base,
+        nvme.bar0_len,
+        nvme.irq_line,
+        info.dma_pool.base,
+        info.dma_pool.len
+    );
+
+    let mut sent = 0usize;
+    let mut idx = 0usize;
+    while idx < grants.len() {
+        let grant = grants[idx];
+        let resource = match Resource::create(grant.kind, grant.base, grant.len, grant.exclusive) {
+            Ok(resource) => resource,
+            Err(error) => {
+                init_logln!(
+                    logger,
+                    "[init] NVMe boot grant {:?} base={:#x} len={:#x} failed: {}",
+                    grant.kind,
+                    grant.base,
+                    grant.len,
+                    error.as_str()
+                );
+                idx += 1;
+                continue;
+            }
+        };
+        let mut label = [0u8; 96];
+        let label_len = format_grant_label(&mut label, "driver-host-nvme", &grant);
+        let payload = &label[..label_len.min(label.len())];
+        match dm_bootstrap.write_handle(payload, resource.into_handle()) {
+            Ok(()) => sent += 1,
+            Err((error, _handle)) => init_logln!(
+                logger,
+                "[init] NVMe boot grant transfer failed for {}: {}",
+                core::str::from_utf8(payload).unwrap_or("?"),
+                error.as_str()
+            ),
+        }
+        idx += 1;
+    }
+    init_logln!(
+        logger,
+        "[init] NVMe boot grants: transferred {}/{} resource handle(s)",
+        sent,
+        grants.len()
+    );
+
+    let mut label = [0u8; 96];
+    let len = format_grants_complete_label(&mut label, "driver-host-nvme");
+    let payload = &label[..len.min(label.len())];
+    match dm_bootstrap.write(payload) {
+        Ok(()) => init_logln!(logger, "[init] NVMe boot grants-complete signalled"),
+        Err(error) => init_logln!(
+            logger,
+            "[init] NVMe boot grants-complete failed: {}",
+            error.as_str()
         ),
     }
 }
