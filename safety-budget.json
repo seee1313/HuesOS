@@ -1,14 +1,14 @@
 {
   "rust_files": 169,
-  "rust_lines": 46627,
+  "rust_lines": 47162,
   "totals": {
     "expect_calls": 21,
     "panic_macros": 5,
     "static_mut": 1,
     "todo_markers": 1,
-    "unsafe_blocks": 264,
-    "unsafe_functions": 62,
-    "unsafe_impls": 28,
+    "unsafe_blocks": 263,
+    "unsafe_functions": 63,
+    "unsafe_impls": 29,
     "unwrap_calls": 25
   },
   "unsafe_by_file": {
@@ -44,7 +44,7 @@
     "crates/huesos-kernel/src/scheduler.rs": 9,
     "crates/huesos-kernel/src/smp.rs": 9,
     "crates/huesos-kernel/src/task.rs": 7,
-    "crates/huesos-nvme/src/pci_transport.rs": 8,
+    "crates/huesos-nvme/src/pci_transport.rs": 6,
     "crates/huesos-object/src/irq_guard.rs": 2,
     "crates/huesos-object/src/lib.rs": 1,
     "crates/huesos-object/src/vmo.rs": 4,
@@ -69,6 +69,7 @@
     "crates/huesos-userspace/libcanvas/src/signal.rs": 1,
     "crates/huesos-userspace/libcanvas/src/vmo.rs": 3,
     "crates/huesos-userspace/terminal/src/screen.rs": 2,
-    "crates/huesos-kernel/src/boot/storage.rs": 2
+    "crates/huesos-kernel/src/boot/storage.rs": 2,
+    "crates/huesos-userspace/driver-host-nvme/src/main.rs": 3
   }
 }

@@ -14,8 +14,8 @@ copied into `docs/` in a dedicated review. The versioned baseline remains this
 file plus `safety-budget.json`.
 
 At the current baseline (`safety-budget.json`) the repository contains 169
-first-party Rust files and 46,627 Rust lines. The measured surface is **264**
-unsafe blocks, **62** unsafe functions, **28** unsafe impls, one `static mut`,
+first-party Rust files and 47,162 Rust lines. The measured surface is **263**
+unsafe blocks, **63** unsafe functions, **29** unsafe impls, one `static mut`,
 **25** unwrap calls, **21** expect calls, and **5** panic macros. Prior baseline
 values are retained in the changelog sections below so that any deviation
 between historical narrative and the current file is auditable.
@@ -2128,6 +2128,50 @@ bounded metadata/labels and move ordinary handles.
 unsafe_blocks:    261 -> 264 (+3).
 unsafe_functions:  62 ->  62 (unchanged).
 unsafe_impls:      28 ->  28 (unchanged).
+static_mut:         1 ->   1 (unchanged).
+unwrap_calls:      25 ->  25 (unchanged).
+expect_calls:      21 ->  21 (unchanged).
+panic_macros:       5 ->   5 (unchanged).
+```
+
+## NVMe Stage-B ResourceMap and no-heap DriverHost boundary (dedicated safety-budget review)
+
+Stage B adds the minimal mapping ABI needed for a userspace storage DriverHost to
+bring up real hardware without moving the NVMe driver into the kernel.
+`Syscall::ResourceMap` maps only a caller-owned `Mmio` or `DmaPool` Resource
+subrange into the caller's root VMAR at a fixed user address. The syscall
+validates page alignment, Resource containment, VMAR permissions, overlap, and
+handle rights before the kernel installs PTEs. MMIO mappings add `NO_CACHE` and
+all mappings are NX. The Resource object receives a VMAR-owned kernel reference
+so the physical authority outlives the mapping record.
+
+The NVMe DriverHost now links `huesos-nvme` and therefore the Rust `alloc` crate
+is present in that binary. To keep the agreed "no heap after init" policy hard,
+`driver-host-nvme` installs `NoHeapAllocator`: every allocation request returns
+null and `dealloc` is a no-op because the allocator never hands memory out. Any
+accidental heap use therefore fails immediately instead of silently introducing a
+runtime allocation path. The controller path itself carves queues, Identify
+buffers, a reusable data buffer, and PRP list memory from the mapped 64 MiB DMA
+pool.
+
+Safety-surface notes:
+
+- `crates/huesos-userspace/driver-host-nvme/src/main.rs` adds one unsafe impl
+  (`GlobalAlloc`) and two unsafe trait methods required by Rust's allocator
+  interface.
+- `PciMmioTransport::new` is now safe; the ResourceMap syscall is the mapping
+  safety boundary, while individual MMIO/DMA operations still perform their
+  existing bounds checks before volatile/raw pointer operations. That removes one
+  unsafe function and one test-only unsafe block from `huesos-nvme`.
+- Kernel `ResourceMap` itself adds no unsafe blocks; it reuses the existing
+  page-table mapping primitive and VMAR rollback path.
+
+### Safety-budget delta (measured)
+
+```
+unsafe_blocks:    264 -> 263 (net -1).
+unsafe_functions:  62 ->  63 (+1).
+unsafe_impls:      28 ->  29 (+1).
 static_mut:         1 ->   1 (unchanged).
 unwrap_calls:      25 ->  25 (unchanged).
 expect_calls:      21 ->  21 (unchanged).

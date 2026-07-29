@@ -1,13 +1,14 @@
 # NVMe Driver (ring-3 DriverHost)
 
-Status: **Stage A hardware plumbing landed.** The repository now has:
-`DmaPool` resource capability, a userspace `driver-host-nvme` skeleton, Identify
-Controller/Namespace parsers, per-CPU queue/DMA planning, an async BlockDevice
-Channel+Port wire protocol, a 64 MiB boot DMA pool reservation, kernel PCI NVMe
-BAR/IRQ metadata discovery, HBI boot-driver packaging, and DriverManager launch
-of `driver-host-nvme` from BOOTFS when NVMe hardware is discovered. Real BAR
-userspace mapping, MSI-X/MSI programming, controller admin-queue bring-up, and
-on-target I/O remain the next slices. This is ROADMAP Short-Term #7 (real VFS +
+Status: **Stage B controller bring-up landed.** The repository now has:
+`DmaPool` resource capability, HBI boot-driver packaging, kernel PCI NVMe
+BAR/IRQ metadata discovery, a Resource-backed userspace MMIO/DMA mapping ABI,
+DriverManager launch of `driver-host-nvme` from BOOTFS, real BAR/DMA mapping in
+the DriverHost, controller disable/enable + admin queue setup from the 64 MiB DMA
+pool, Identify Controller/Namespace integration, per-CPU queue creation planning,
+PRP handling up to the 1 MiB request cap, and the async BlockDevice Channel+Port
+wire protocol. Real MSI-X/MSI programming and the public BlockDevice service
+channel remain the next slices. This is ROADMAP Short-Term #7 (real VFS +
 drivers in userspace), first device.
 
 ## Goal
@@ -91,24 +92,27 @@ The driver accesses the device through two abstractions:
 
 On-target, these are backed by kernel-provided capabilities:
 
-- **BAR metadata Resource**: Stage A discovers NVMe PCI functions using legacy
-  config-space access, validates BAR0 as a memory BAR, sizes it, and forwards an
-  exclusive `Mmio` Resource label to `driver-host-nvme`. The actual userspace
-  MMIO mapping syscall/VMAR path is deliberately left for Stage B before any
-  register access from ring 3.
+- **Resource-backed BAR mapping**: Stage A discovers NVMe PCI functions using
+  legacy config-space access, validates BAR0 as a memory BAR, sizes it, and
+  forwards an exclusive `Mmio` Resource label to `driver-host-nvme`. Stage B adds
+  `Syscall::ResourceMap`, allowing a process that already holds an `Mmio` or
+  `DmaPool` Resource handle to map only that Resource's page-aligned range into
+  its own root VMAR. MMIO mappings are installed user-accessible, writable, NX,
+  and `NO_CACHE`.
 - **Interrupt metadata Resource**: Stage A records INTx line/pin and MSI/MSI-X
-  capability metadata, then forwards an `Irq` Resource label. MSI-X → MSI →
-  polling programming and Port delivery remain the next hardware slice.
+  capability metadata, then forwards an `Irq` Resource label. Stage B uses the
+  polling fallback path while creating queues; MSI-X/MSI programming and Port
+  delivery remain separate because HuesOS still needs a PCI config-space/vector
+  programming API for userspace DriverHosts.
 - **Coherent DMA buffers**: boot reserves a preallocated `DmaPool` resource for
   the DriverHost. The first production target is a 64 MiB pool, physically
-  contiguous, pinned, below 4 GiB when available, and device-visible. The driver
-  can identify `base/len` and later carve admin queues, per-CPU I/O queues,
-  PRP-list pages, request descriptors, and bounce buffers from that pool without
-  heap allocation after initialization.
+  contiguous, pinned, below 4 GiB when available, and device-visible. Stage B maps
+  this pool into the DriverHost and carves admin queues, I/O queues, Identify
+  buffers, the reusable data buffer, and PRP-list page from it without a heap.
 
 The ABI side has a `ResourceKindAbi::DmaPool` / object `ResourceKind::DmaPool`
-capability and a storage boot-info VMO (`huesos_abi::storage_boot`) so init can
-mint dynamic resources while DriverManager remains the launch/registry owner.
+capability, a storage boot-info VMO (`huesos_abi::storage_boot`), and
+`ResourceMapArgs` for fixed-address self-mapping.
 
 ## Block protocol / DriverManager registry
 
@@ -126,16 +130,16 @@ with the success response:
 service:block:nvme:channel
 ```
 
-Stage A can launch the real NVMe DriverHost and mark the hardware resources as
-present, but there is still no async BlockDevice server channel. DriverManager
-therefore continues to return `err:block:nvme-unavailable` for `open:block:nvme`
-until Stage C wires a real service channel. This keeps clients and future
-BlobFS/Hxfs code on a stable discovery contract without pretending that storage
-I/O is already online.
+Stage B can launch the real NVMe DriverHost, map its resources, and Identify the
+first namespace, but there is still no async BlockDevice server channel.
+DriverManager therefore continues to return `err:block:nvme-unavailable` for
+`open:block:nvme` until Stage C wires a real service channel. This keeps clients
+and future BlobFS/Hxfs code on a stable discovery contract without pretending
+that storage I/O is already online.
 
 ## On-target verification checklist
 
-Stage A completed in code:
+Stage A/B completed in code:
 
 - Boot reserves/logs the 64 MiB DMA pool.
 - Kernel storage boot-info logs discovered NVMe PCI function(s), BAR0, IRQ line,
@@ -144,17 +148,16 @@ Stage A completed in code:
   labels to DriverManager.
 - DriverManager enumerates `/storage/boot-drivers.manifest` and launches
   `/drivers/driver-host-nvme.elf` from HBI BOOTFS when hardware is present.
-- `driver-host-nvme` logs `resources: mmio OK, irq OK, dma OK` or the exact
-  missing resource kind.
+- `driver-host-nvme` maps BAR0/DMA with `ResourceMap`, initializes the controller,
+  and logs namespace id, block size, block count, max request, and queue count.
+- The controller path disables/enables CC.EN with CAP.TO-derived bounded waits,
+  programs AQA/ASQ/ACQ, submits Identify Controller/Namespace, Set Features
+  Number of Queues, and Create I/O CQ/SQ commands.
 
-Remaining Stage B/C work:
+Remaining Stage C / later hardware work:
 
-- Controller enable: CC.EN -> wait CSTS.RDY within CAP.TO; AQA/ASQ/ACQ set up.
-- Identify Controller + Namespace; Set Features (Number of Queues); Create I/O
-  CQ/SQ (MSI-X vector per queue).
-- Read/Write a namespace via PRP; data integrity round-trip.
-- MSI-X completion delivery through the HuesOS Port; hybrid poll/IRQ behavior.
-- Multiple I/O queues across CPUs; multiple namespaces. The host-side
-  `QueueManager` now tracks exact active queue IDs and rejects deletion of a
-  non-existent queue; the remaining on-target work is submitting the matching
-  Create/Delete I/O CQ/SQ admin commands and wiring MSI-X vectors.
+- Real async BlockDevice service channel and request server.
+- MSI-X/MSI programming through a PCI config/vector API and Port delivery;
+  polling fallback is the active Stage-B path.
+- Data-path on-target read/write soak through the future BlockDevice server.
+- Multiple namespaces beyond the current system namespace-first policy.
