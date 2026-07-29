@@ -62,12 +62,22 @@ pub const OPEN_FILESYSTEM: &str = "open:filesystem";
 pub const FILESYSTEM_CHANNEL: &str = "service:filesystem:channel";
 /// Client asks DriverManager to open the NVMe-backed async BlockDevice service.
 pub const OPEN_BLOCK_NVME: &str = "open:block:nvme";
+/// Client asks DriverManager to open the system volume.
+pub const OPEN_VOLUME_SYSTEM: &str = "open:volume:system";
 /// DriverManager responds with an NVMe BlockDevice service channel.
 pub const BLOCK_NVME_CHANNEL: &str = "service:block:nvme:channel";
 /// DriverManager tells NVMe DriverHost about a new block client channel.
 pub const ATTACH_BLOCK_NVME_CLIENT: &str = "block:nvme-client";
 /// NVMe block service is not currently online.
 pub const BLOCK_NVME_UNAVAILABLE: &str = "err:block:nvme-unavailable";
+/// DriverManager responds with a system Volume channel.
+pub const VOLUME_SYSTEM_CHANNEL: &str = "service:volume:system:channel";
+/// System volume is not currently available.
+pub const VOLUME_SYSTEM_UNAVAILABLE: &str = "err:volume:system-unavailable";
+/// VolumeManager responds with a range-relative BlockDevice channel.
+pub const VOLUME_BLOCK_RANGE_CHANNEL: &str = "service:volume:block-range:channel";
+/// VolumeManager responds with the first filesystem-candidate BlockDevice channel.
+pub const VOLUME_FS_CANDIDATE_CHANNEL: &str = "service:volume:fs-candidate:channel";
 /// NVMe DriverHost reported it is starting.
 pub const NVME_HOST_STARTING: &str = "driver-host:nvme:starting";
 /// NVMe DriverHost has received the Stage-A hardware resources.

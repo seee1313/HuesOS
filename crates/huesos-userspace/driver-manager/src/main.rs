@@ -15,6 +15,7 @@ mod manifest;
 mod protocol;
 mod registry;
 mod supervisor;
+mod volume_service;
 
 use core::panic::PanicInfo;
 use libcanvas::println;

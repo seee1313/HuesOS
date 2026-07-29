@@ -10,6 +10,7 @@ version = "0.1.0"
 name = "huesos-driver-manager"
 version = "0.1.0"
 dependencies = [
+ "huesos-abi",
  "libcanvas",
 ]
 

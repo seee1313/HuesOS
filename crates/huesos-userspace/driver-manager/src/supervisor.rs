@@ -5,6 +5,7 @@ use crate::manifest::INPUT_HOST;
 use crate::protocol;
 use crate::protocol::MANIFEST_GRANTS_COMPLETE_PREFIX;
 use crate::registry::{ServiceRegistry, ServiceState};
+use crate::volume_service::VolumeManagerService;
 use libcanvas::{hbi_boot, println, storage_boot, Channel, ErrorCode, Handle, Process, Vmo};
 
 /// Fallback embedded DriverHost image (same binary packaged into BOOTFS).
@@ -144,6 +145,7 @@ pub struct DriverManager {
     acpi_broker: Option<Handle>,
     registry_channel: Option<Channel>,
     fs: FileSystemService,
+    volume: VolumeManagerService,
     heartbeat_count: u64,
     acpi_heartbeat_count: u64,
     nvme_heartbeat_count: u64,
@@ -254,6 +256,7 @@ impl DriverManager {
             acpi_broker: None,
             registry_channel: None,
             fs: FileSystemService::new(),
+            volume: VolumeManagerService::new(),
             heartbeat_count: 0,
             acpi_heartbeat_count: 0,
             nvme_heartbeat_count: 0,
@@ -657,6 +660,11 @@ impl DriverManager {
             self.poll_init_bootstrap(&init_bootstrap);
             self.poll_registry_requests();
             self.fs.poll();
+            let nvme_online = self.registry.state("block:nvme") == Some(ServiceState::Online);
+            self.volume.poll(
+                self.nvme_host.as_ref().map(|host| &host.bootstrap),
+                nvme_online,
+            );
             self.poll_input_host();
             self.poll_nvme_host();
             self.poll_acpi_manager();
@@ -950,6 +958,9 @@ impl DriverManager {
                 Ok(n) if &buf[..n] == protocol::OPEN_BLOCK_NVME.as_bytes() => {
                     self.open_nvme_block_service()
                 }
+                Ok(n) if &buf[..n] == protocol::OPEN_VOLUME_SYSTEM.as_bytes() => {
+                    self.open_system_volume()
+                }
                 Ok(_) => println!("[driver-manager] unknown registry request"),
                 Err(ErrorCode::ShouldWait) => return,
                 Err(e) => {
@@ -1013,6 +1024,16 @@ impl DriverManager {
                 let _ = registry.write(protocol::BLOCK_NVME_UNAVAILABLE.as_bytes());
             }
         }
+    }
+
+    fn open_system_volume(&mut self) {
+        let Some(registry) = self.registry_channel.as_ref() else {
+            return;
+        };
+        let nvme_online = self.registry.state("block:nvme") == Some(ServiceState::Online);
+        let nvme_bootstrap = self.nvme_host.as_ref().map(|host| &host.bootstrap);
+        self.volume
+            .open_system_volume(registry, nvme_bootstrap, nvme_online);
     }
 
     fn open_keyboard_service(&mut self) {
