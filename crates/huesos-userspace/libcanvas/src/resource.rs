@@ -78,6 +78,8 @@ pub mod kind {
     pub const IRQ: ResourceKindAbi = ResourceKindAbi::Irq;
     /// Atomic-halt / reboot / power-off capability.
     pub const POWER_CONTROL: ResourceKindAbi = ResourceKindAbi::PowerControl;
+    /// Preallocated DMA pool capability for userspace DriverHosts.
+    pub const DMA_POOL: ResourceKindAbi = ResourceKindAbi::DmaPool;
 }
 
 /// Safe wrapper over an `IoPort` [`Resource`] handle. Provides typed

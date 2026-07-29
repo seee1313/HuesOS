@@ -88,15 +88,18 @@ On-target, these are backed by kernel-provided capabilities:
   uncacheable) into the DriverHost's address space. This extends the existing
   deny-by-default MMIO capability (used by the ACPI broker) into a general
   device-MMIO grant authorized by the device manager.
-- **Coherent DMA buffers**: the kernel provides physically-contiguous (or
-  IOMMU-mapped) pages to the DriverHost as VMOs for the queues and data buffers,
-  and the driver programs their physical addresses into ASQ/ACQ/PRP entries.
-  With no IOMMU, buffers must be physically contiguous; the identity between the
-  DriverHost's virtual mapping and the device-visible physical address is
-  established by the kernel.
+- **Coherent DMA buffers**: boot reserves a preallocated `DmaPool` resource
+  for the DriverHost. The first production target is a 64 MiB pool, physically
+  pinned and device-visible. The driver carves admin queues, per-CPU I/O queues,
+  PRP-list pages, request descriptors, and bounce buffers from that pool and
+  performs no heap allocation after initialization. With no IOMMU, DMA pool
+  pages must be physically contiguous (or represented by an IOMMU mapping that
+  is contiguous from the device's point of view).
 
 This plumbing requires QEMU (`-device nvme`) / bare-metal verification and is a
-separate slice.
+separate slice. The ABI side now has a `ResourceKindAbi::DmaPool` / object
+`ResourceKind::DmaPool` capability so DriverManager can transfer the reserved
+boot pool to `nvme-driverhost` without treating it as ordinary MMIO.
 
 ## Block protocol (later slice)
 

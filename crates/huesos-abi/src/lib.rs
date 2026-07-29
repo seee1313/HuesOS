@@ -305,6 +305,12 @@ pub enum ResourceKindAbi {
     /// zero at mint time. See
     /// `docs/ARCHITECTURE_ROADMAP.md` §3.
     PowerControl = 4,
+    /// Preallocated physically pinned DMA pool for userspace DriverHosts.
+    ///
+    /// The `base`/`len` range names the device-visible physical DMA window.
+    /// The kernel is responsible for reserving and mapping the backing pages;
+    /// the handle is the authority to use the range, not the mapping itself.
+    DmaPool = 5,
 }
 
 impl ResourceKindAbi {
@@ -315,6 +321,7 @@ impl ResourceKindAbi {
             2 => Self::Mmio,
             3 => Self::Irq,
             4 => Self::PowerControl,
+            5 => Self::DmaPool,
             _ => return None,
         })
     }
@@ -1008,12 +1015,14 @@ mod tests {
             ResourceKindAbi::Mmio,
             ResourceKindAbi::Irq,
             ResourceKindAbi::PowerControl,
+            ResourceKindAbi::DmaPool,
         ] {
             let raw = kind as u32;
             assert_eq!(ResourceKindAbi::from_raw(raw), Some(kind));
         }
         assert_eq!(ResourceKindAbi::from_raw(0), None);
-        assert_eq!(ResourceKindAbi::from_raw(5), None);
+        assert_eq!(ResourceKindAbi::from_raw(5), Some(ResourceKindAbi::DmaPool));
+        assert_eq!(ResourceKindAbi::from_raw(6), None);
         assert_eq!(ResourceKindAbi::from_raw(u32::MAX), None);
     }
 

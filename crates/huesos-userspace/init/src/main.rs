@@ -451,6 +451,7 @@ fn format_grant_label(
         ResourceKind::Mmio => "mmio",
         ResourceKind::Irq => "irq",
         ResourceKind::PowerControl => "pwr",
+        ResourceKind::DmaPool => "dma",
     };
     let mode = if grant.exclusive { "excl" } else { "shared" };
     let mut w = FixedWriter::new(out);

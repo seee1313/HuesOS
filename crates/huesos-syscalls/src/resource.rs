@@ -68,6 +68,7 @@ pub(crate) fn sys_resource_create(
         ResourceKindAbi::Mmio => ResourceKind::Mmio,
         ResourceKindAbi::Irq => ResourceKind::Irq,
         ResourceKindAbi::PowerControl => ResourceKind::PowerControl,
+        ResourceKindAbi::DmaPool => ResourceKind::DmaPool,
     };
 
     // `PowerControl` is a binary capability with no meaningful range;

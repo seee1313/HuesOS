@@ -50,6 +50,9 @@ pub enum ResourceKind {
     /// meaningful base/len (both should be zero at mint time); the
     /// capability is binary. See `docs/ARCHITECTURE_ROADMAP.md` §3.
     PowerControl = 4,
+    /// Preallocated DMA pool for userspace DriverHosts. The range is a
+    /// device-visible physical window reserved and mapped by the kernel.
+    DmaPool = 5,
 }
 
 /// Reason a `Resource::try_create*` call was rejected.
@@ -282,6 +285,22 @@ mod tests {
         unregister_object(a.koid());
         unregister_object(b.koid());
         unregister_object(c.koid());
+    }
+
+    #[test]
+    fn dma_pool_ranges_conflict_like_mmio() {
+        let Ok(pool) = Resource::try_create_exclusive(ResourceKind::DmaPool, 0x1000_0000, 0x4000)
+        else {
+            assert!(false, "first DMA pool should mint");
+            return;
+        };
+        assert!(pool.contains(ResourceKind::DmaPool, 0x1000_1000, 0x1000));
+        assert!(!pool.contains(ResourceKind::Mmio, 0x1000_1000, 0x1000));
+        assert_eq!(
+            Resource::try_create_exclusive(ResourceKind::DmaPool, 0x1000_2000, 0x1000).map(|_| ()),
+            Err(ResourceError::Conflict)
+        );
+        unregister_object(pool.koid());
     }
 
     #[test]
