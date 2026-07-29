@@ -222,3 +222,17 @@ fn keyboard_irq_ack(pic: bool) {
     }
     crate::x86_64::irq_callback::emit(1, scancode as u64);
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{PANIC_STOP_VECTOR, RESCHEDULE_VECTOR, SHUTDOWN_STOP_VECTOR, TLB_SHOOTDOWN_VECTOR};
+
+    #[test]
+    fn reschedule_ipi_has_dedicated_non_timer_vector() {
+        assert_ne!(RESCHEDULE_VECTOR, 0x20);
+        assert_ne!(RESCHEDULE_VECTOR, PANIC_STOP_VECTOR);
+        assert_ne!(RESCHEDULE_VECTOR, SHUTDOWN_STOP_VECTOR);
+        assert_ne!(RESCHEDULE_VECTOR, TLB_SHOOTDOWN_VECTOR);
+        assert_eq!(RESCHEDULE_VECTOR, 0xF0);
+    }
+}
