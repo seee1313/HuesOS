@@ -41,6 +41,12 @@ impl BlockDevice {
                 Err(error) => return Err(error),
             }
         };
+        Self::from_channel(channel)
+    }
+
+    /// Adopt an already-open BlockDevice service channel and install a
+    /// completion Port.
+    pub fn from_channel(channel: Channel) -> Result<Self> {
         let completion = Port::create()?;
         channel
             .write_handle(

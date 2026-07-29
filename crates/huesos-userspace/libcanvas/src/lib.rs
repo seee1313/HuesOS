@@ -78,6 +78,7 @@ pub mod resource;
 pub mod signal;
 pub mod system;
 pub mod vmo;
+pub mod volume;
 pub mod waitset;
 
 pub use channel::Channel;
@@ -88,6 +89,7 @@ pub use port::Port;
 pub use process::{Process, Thread, Vmar};
 pub use signal::Signal;
 pub use vmo::Vmo;
+pub use volume::Volume;
 pub use waitset::{wait_all, wait_any, Signals, WaitItem, WaitOutcome};
 
 /// Re-exported so application code can match on specific failure reasons
