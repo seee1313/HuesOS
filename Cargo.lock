@@ -133,6 +133,10 @@ name = "huesos-handlemove"
 version = "0.1.0"
 
 [[package]]
+name = "huesos-hxfs"
+version = "0.1.0"
+
+[[package]]
 name = "huesos-ioapic"
 version = "0.1.0"
 

@@ -41,6 +41,7 @@ test:
 		-p huesos-handlemove \
 		-p hues-async \
 		-p huesos-nvme \
+		-p huesos-hxfs \
 		-p huesos-pci \
 		-p huesos-quota \
 		--target x86_64-unknown-linux-gnu -Z build-std=

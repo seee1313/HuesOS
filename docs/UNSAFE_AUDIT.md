@@ -13,8 +13,8 @@ are intentionally not treated as the versioned project baseline unless they are
 copied into `docs/` in a dedicated review. The versioned baseline remains this
 file plus `safety-budget.json`.
 
-At the current baseline (`safety-budget.json`) the repository contains 179
-first-party Rust files and 50,526 Rust lines. The measured surface is **265**
+At the current baseline (`safety-budget.json`) the repository contains 183
+first-party Rust files and 51,510 Rust lines. The measured surface is **265**
 unsafe blocks, **63** unsafe functions, **29** unsafe impls, one `static mut`,
 **25** unwrap calls, **21** expect calls, and **5** panic macros. Prior baseline
 values are retained in the changelog sections below so that any deviation
@@ -2287,6 +2287,31 @@ The implementation is pure safe Rust: fixed wire records, bounded userspace
 service tables, safe VMO read/write wrappers, and a pure no-unsafe SHA-256
 implementation for BlobFS verification. It intentionally remains NVMe/SSD
 focused and introduces no rotational-media or generic-storage tuning paths.
+
+### Safety-budget delta (measured)
+
+```
+unsafe_blocks:    265 -> 265 (unchanged).
+unsafe_functions:  63 ->  63 (unchanged).
+unsafe_impls:      29 ->  29 (unchanged).
+static_mut:         1 ->   1 (unchanged).
+unwrap_calls:      25 ->  25 (unchanged).
+expect_calls:      21 ->  21 (unchanged).
+panic_macros:       5 ->   5 (unchanged).
+```
+
+## Hxfs Stage-G read-only prototype (safety-budget-neutral)
+
+The Stage-G implementation adds `crates/huesos-hxfs`, a read-only parser and
+reader for the accepted Hxfs design. It defines stable v1 on-disk records,
+validates metadata block CRC32C, parses superblock/checkpoint/volume/object
+metadata, resolves paths through directory records, and reads regular files by
+extent over a `BlockReader` trait. Encrypted volumes are parsed far enough to
+identify the policy and then rejected because key handling is outside Stage G.
+
+No unsafe Rust is introduced. The crate is `no_std`, uses caller-provided output
+buffers for reads, and uses a byte-slice `BlockReader` only as a host-test
+adapter.
 
 ### Safety-budget delta (measured)
 
