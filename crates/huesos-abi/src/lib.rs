@@ -25,6 +25,59 @@ pub mod acpi_broker;
 /// range index before any userspace mapping.
 pub mod acpi_archive;
 
+/// HBI boot-driver manifest ABI.
+pub mod hbi_boot {
+    /// Magic for `/storage/boot-drivers.manifest`.
+    pub const MAGIC: u32 = 0x4844_5242;
+    /// Current manifest version.
+    pub const VERSION: u16 = 1;
+    /// Maximum number of boot-critical drivers described by one manifest.
+    pub const MAX_BOOT_DRIVERS: usize = 8;
+    /// Fixed path storage per manifest entry.
+    pub const PATH_BYTES: usize = 64;
+
+    /// Header for the boot-driver manifest.
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+    pub struct BootDriverManifestHeader {
+        /// [`MAGIC`].
+        pub magic: u32,
+        /// [`VERSION`].
+        pub version: u16,
+        /// Number of following [`BootDriverManifestEntry`] records.
+        pub entry_count: u16,
+    }
+
+    /// One storage-critical DriverHost entry.
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub struct BootDriverManifestEntry {
+        /// NUL-padded DriverHost ELF path inside HBI BOOTFS.
+        pub elf_path: [u8; PATH_BYTES],
+        /// NUL-padded `.hdriver` manifest path inside HBI BOOTFS.
+        pub manifest_path: [u8; PATH_BYTES],
+        /// Reserved for future boot policy flags. Must be zero for v1.
+        pub flags: u32,
+    }
+
+    impl Default for BootDriverManifestEntry {
+        fn default() -> Self {
+            Self {
+                elf_path: [0; PATH_BYTES],
+                manifest_path: [0; PATH_BYTES],
+                flags: 0,
+            }
+        }
+    }
+
+    /// Validate a manifest header without dereferencing entry paths.
+    pub const fn validate_header(header: BootDriverManifestHeader) -> bool {
+        header.magic == MAGIC
+            && header.version == VERSION
+            && (header.entry_count as usize) <= MAX_BOOT_DRIVERS
+    }
+}
+
 /// Deny-by-default policy primitives for the Ring-3 ACPI broker: an
 /// append-only audit ring and a fixed-window rate limiter. Pure, `no_std`,
 /// and exercised directly by host tests.
@@ -922,7 +975,32 @@ pub struct VmarOpArgs {
 
 #[cfg(test)]
 mod tests {
-    use super::{rights, vmar_flags, ErrorCode, ResourceKindAbi, Syscall};
+    use super::{hbi_boot, rights, vmar_flags, ErrorCode, ResourceKindAbi, Syscall};
+
+    #[test]
+    fn boot_driver_manifest_header_validates() {
+        assert!(hbi_boot::validate_header(
+            hbi_boot::BootDriverManifestHeader {
+                magic: hbi_boot::MAGIC,
+                version: hbi_boot::VERSION,
+                entry_count: 1,
+            }
+        ));
+        assert!(!hbi_boot::validate_header(
+            hbi_boot::BootDriverManifestHeader {
+                magic: 0,
+                version: hbi_boot::VERSION,
+                entry_count: 1,
+            }
+        ));
+        assert!(!hbi_boot::validate_header(
+            hbi_boot::BootDriverManifestHeader {
+                magic: hbi_boot::MAGIC,
+                version: hbi_boot::VERSION,
+                entry_count: (hbi_boot::MAX_BOOT_DRIVERS + 1) as u16,
+            }
+        ));
+    }
 
     #[test]
     fn mapping_rights_include_each_requested_permission() {
