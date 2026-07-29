@@ -209,6 +209,15 @@ mod tests {
     }
 
     #[test]
+    fn rejects_unknown_completion_status_or_wide_nvme_status() {
+        assert_eq!(decode_completion_data([1, 99, 0, 0]), None);
+        assert_eq!(
+            decode_completion_data([1, 0, 0, u64::from(u16::MAX) + 1]),
+            None
+        );
+    }
+
+    #[test]
     fn completion_payload_round_trips() {
         let data = completion_data(55, AsyncBlockStatus::IoError, 4096, 0x1234);
         assert_eq!(

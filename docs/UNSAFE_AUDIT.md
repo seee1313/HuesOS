@@ -13,8 +13,8 @@ are intentionally not treated as the versioned project baseline unless they are
 copied into `docs/` in a dedicated review. The versioned baseline remains this
 file plus `safety-budget.json`.
 
-At the current baseline (`safety-budget.json`) the repository contains 162
-first-party Rust files and 43,884 Rust lines. The measured surface is **261**
+At the current baseline (`safety-budget.json`) the repository contains 166
+first-party Rust files and 44,699 Rust lines. The measured surface is **261**
 unsafe blocks, **62** unsafe functions, **28** unsafe impls, one `static mut`,
 **25** unwrap calls, **21** expect calls, and **5** panic macros. Prior baseline
 values are retained in the changelog sections below so that any deviation

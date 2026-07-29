@@ -173,6 +173,20 @@ mod tests {
     }
 
     #[test]
+    fn handles_minimal_queue_capacity() {
+        assert_eq!(
+            plan_queues(QueuePlanInput {
+                cpu_count: 1,
+                cap_mqes: 0,
+                msix_available: true,
+                msi_available: true,
+            })
+            .map(|plan| plan.admin_depth),
+            Some(2)
+        );
+    }
+
+    #[test]
     fn fits_inside_sixty_four_mib_pool_for_64_cpus() {
         let Some(plan) = plan_queues(QueuePlanInput {
             cpu_count: 64,

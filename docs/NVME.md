@@ -1,16 +1,20 @@
 # NVMe Driver (ring-3 DriverHost)
 
-Status: **protocol foundation, async controller, block wire validation, and
-host tests landed.** Request bounds and DMA arithmetic are checked; real
-DriverHost MMIO/DMA plumbing remains the next on-target slice.
+Status: **production architecture foundation landed.** The repository now has:
+`DmaPool` resource capability, a userspace `driver-host-nvme` skeleton, Identify
+Controller/Namespace parsers, per-CPU queue/DMA planning, and an async
+BlockDevice Channel+Port wire protocol. Real BAR mapping, interrupt routing,
+controller bring-up from HBI `.img`, and on-target I/O remain the next slices.
 This is ROADMAP Short-Term #7 (real VFS + drivers in userspace), first device.
 
 ## Goal
 
 A userspace NVMe driver running as a ring-3 DriverHost process, built on
-`hues-async`. Scope (agreed): full-featured — multiple I/O queues, MSI-X per
-queue, multiple namespaces, full Identify/Set Features — exposing a simple
-block protocol (read/write by LBA) over a Channel, with VFS mounting later.
+`hues-async`. Scope (agreed): userspace DriverHost loaded from HBI `.img`, preallocated
+64 MiB DMA pool, no heap allocation after initialization, interrupt-first I/O
+(MSI-X → MSI → polling fallback), per-CPU I/O queues with depth 256, 1 MiB max
+request size, and async BlockDevice protocol over Channel submissions plus Port
+completions. BlobFS/Hxfs/VFS mounting comes later.
 
 ## Layering
 

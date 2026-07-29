@@ -141,6 +141,14 @@ mod tests {
     }
 
     #[test]
+    fn controller_mdts_below_one_mib_is_respected() {
+        let mut data = [0u8; IDENTIFY_BYTES];
+        data[77] = 4; // 4096 * 2^4 = 64 KiB
+        let info = parse_controller(&data, 4096);
+        assert_eq!(info.map(|info| info.max_request_bytes), Ok(64 * 1024));
+    }
+
+    #[test]
     fn controller_rejects_oversized_shift() {
         let mut data = [0u8; IDENTIFY_BYTES];
         data[77] = 31;

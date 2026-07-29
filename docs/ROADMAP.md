@@ -427,8 +427,15 @@ next-stage expansion items; they are not blockers for the Immediate milestone.
 
 ### 7. Real VFS + drivers in userspace
 - BOOTFS is live as a RAM archive; `huesos-fat` exists as a library.
-- **Needed**: virtio-block (or similar) + FAT/other backends behind
-  FileSystemService; load DriverHosts from FS instead of build embeds.
+- **NVMe foundation landed**: DmaPool resource capability, userspace
+  `driver-host-nvme` skeleton, Identify Controller/Namespace parsers, per-CPU
+  queue/DMA planning, and async BlockDevice Channel+Port protocol. Agreed
+  production targets are HBI `.img` driver loading, 64 MiB preallocated DMA
+  pool, no heap after driver init, MSI-X→MSI→polling fallback, per-CPU queues
+  depth 256, and 1 MiB max request size.
+- **Needed**: wire HBI `.img` DriverHost launch/resources, real BAR/DMA mapping,
+  NVMe interrupts, BlockDevice service registration, BlobFS read-only mount, and
+  later Hxfs/DevFS layers.
 - **PS/2 driver ownership (fully migrated as of PR-E)**: the scancode
   decoder, shift-state machine, and key-event dispatch live only in the
   userspace `driver-host:input` process. The kernel keeps a
