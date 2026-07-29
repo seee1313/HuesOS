@@ -65,6 +65,7 @@ pub struct MockNvme {
     lba_shift: u32,
     num_io_queues: u16,
     admin_sq_tail: u16,
+    mdts_raw: u8,
 }
 
 impl MockNvme {
@@ -94,6 +95,7 @@ impl MockNvme {
             lba_shift,
             num_io_queues: 0,
             admin_sq_tail: 0,
+            mdts_raw: 5,
         }
     }
 
@@ -108,6 +110,10 @@ impl MockNvme {
     /// LBA size in bytes.
     pub fn lba_size(&self) -> u32 {
         1 << self.lba_shift
+    }
+    /// Set the Identify Controller MDTS byte returned by the mock.
+    pub fn set_mdts_raw(&mut self, mdts_raw: u8) {
+        self.mdts_raw = mdts_raw;
     }
 
     // --- command processing ---
@@ -193,15 +199,14 @@ impl MockNvme {
                 data[0] = 0x86;
                 data[1] = 0x80; // VID
                                 // MDTS at offset 77: max transfer = 2^MDTS * page_size.
-                                // Set MDTS=5 for 32 * 4096 = 128KB max transfer.
-                data[77] = 5;
+                data[77] = self.mdts_raw;
             }
             identify::NAMESPACE => {
                 // NSZE (bytes 7:0), NCAP (15:8), LBAF0 LBADS at byte 26.
                 data[0..8].copy_from_slice(&self.nsze.to_le_bytes());
                 data[8..16].copy_from_slice(&self.nsze.to_le_bytes());
-                // LBAF0: LBADS at byte 26 (offset within the LBAF array at 128).
-                data[128 + 2] = self.lba_shift as u8;
+                // LBAF0: LBADS is byte 3 within the LBAF entry at offset 128.
+                data[128 + 3] = self.lba_shift as u8;
             }
             _ => {}
         }

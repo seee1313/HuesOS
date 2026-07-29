@@ -58,17 +58,15 @@ pub struct PciMmioTransport {
 impl PciMmioTransport {
     /// Create a PCI MMIO transport from kernel-provided device resources.
     ///
-    /// # Safety
-    ///
-    /// The caller must ensure that:
-    /// - `resources.reg_bar` is a valid NVMe controller BAR0 mapped uncacheable.
-    /// - `resources.dma` is a valid DMA-coherent memory region.
-    /// - The kernel has established the identity between virtual and physical
-    ///   addresses for the DMA region.
-    pub unsafe fn new(resources: DeviceResources) -> Self {
+    /// The resource-map syscall is the safety boundary: it only returns fixed
+    /// user virtual addresses for live `Mmio`/`DmaPool` Resource handles. This
+    /// constructor records those already-validated descriptors; individual
+    /// MMIO/DMA accesses below remain bounds-checked before using volatile/raw
+    /// pointer operations.
+    pub fn new(resources: DeviceResources) -> Self {
         Self {
-            bar_virt: resources.reg_bar.base,
-            bar_phys: resources.reg_bar.base,
+            bar_virt: resources.reg_bar.virt,
+            bar_phys: resources.reg_bar.phys,
             bar_size: resources.reg_bar.size,
             dma_virt: resources.dma.virt,
             dma_phys: resources.dma.phys,
@@ -212,7 +210,8 @@ mod tests {
         let resources = DeviceResources {
             reg_bar: BarRegion {
                 index: 0,
-                base: 0xFE00_0000,
+                phys: 0xFE00_0000,
+                virt: 0x7000_0000_0000,
                 size: 0x4000,
                 is_memory: true,
                 prefetchable: false,
@@ -223,7 +222,7 @@ mod tests {
                 size: 0x10_0000,
             },
         };
-        let transport = unsafe { PciMmioTransport::new(resources) };
+        let transport = PciMmioTransport::new(resources);
         assert!(transport.validate_reg_offset(0));
         assert!(transport.validate_reg_offset(0x3FFF));
         assert!(!transport.validate_reg_offset(0x4000));

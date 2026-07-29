@@ -45,7 +45,7 @@ pub use block_client::{
 };
 pub use buffer_pool::DmaBufferPool;
 pub use cmd::{Cqe, Sqe};
-pub use controller::{Controller, NvmeError};
+pub use controller::{Controller, ControllerConfig, ControllerInitInfo, NvmeError};
 pub use device::{BarRegion, DeviceResources, DmaRegion};
 pub use identify::{parse_controller, parse_namespace, ControllerInfo, NamespaceInfo};
 pub use pci_transport::PciMmioTransport;

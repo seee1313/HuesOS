@@ -7,6 +7,10 @@
 //! its completion; the queue/command machinery here is shared.
 
 use crate::cmd::{build, identify, Cqe, Sqe};
+use crate::identify::{
+    parse_controller, parse_namespace, ControllerInfo, NamespaceInfo, IDENTIFY_BYTES,
+};
+use crate::queue_plan::{plan_queues, InterruptMode, QueuePlan, QueuePlanInput};
 use crate::regs::{aqa, cap, cc, csts, off};
 use crate::transport::NvmeTransport;
 
@@ -34,6 +38,41 @@ pub enum NvmeError {
     BufferTooSmall,
 }
 
+/// Production initialization policy for a controller.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ControllerConfig {
+    /// Online CPU count used for per-CPU I/O queue planning.
+    pub cpu_count: usize,
+    /// Whether MSI-X metadata/resources are available.
+    pub msix_available: bool,
+    /// Whether MSI metadata/resources are available.
+    pub msi_available: bool,
+}
+
+impl ControllerConfig {
+    /// Conservative single-queue polling configuration used by legacy tests.
+    pub const fn single_queue_polling() -> Self {
+        Self {
+            cpu_count: 1,
+            msix_available: false,
+            msi_available: false,
+        }
+    }
+}
+
+/// Result of controller initialization.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ControllerInitInfo {
+    /// Parsed controller Identify data.
+    pub controller: ControllerInfo,
+    /// Parsed namespace Identify data.
+    pub namespace: NamespaceInfo,
+    /// Queue/DMA plan used for admin and I/O queue creation.
+    pub queue_plan: QueuePlan,
+    /// I/O queues successfully created.
+    pub io_queue_count: usize,
+}
+
 /// A polling NVMe controller over a transport `T`.
 pub struct Controller<T: NvmeTransport> {
     t: T,
@@ -56,6 +95,7 @@ pub struct Controller<T: NvmeTransport> {
     io_cq_head: u16,
     io_cq_phase: bool,
     io_size: u16,
+    io_queue_count: usize,
     cid: u16,
     // Namespace.
     nsid: u32,
@@ -97,6 +137,7 @@ impl<T: NvmeTransport> Controller<T> {
             io_cq_head: 0,
             io_cq_phase: true,
             io_size: 0,
+            io_queue_count: 0,
             cid: 0,
             nsid: 1,
             nsze: 0,
@@ -129,6 +170,11 @@ impl<T: NvmeTransport> Controller<T> {
         self.max_queue_size
     }
 
+    /// Number of I/O queue pairs created during initialization.
+    pub fn io_queue_count(&self) -> usize {
+        self.io_queue_count
+    }
+
     /// Borrow the underlying transport.
     pub fn transport_mut(&mut self) -> &mut T {
         &mut self.t
@@ -149,6 +195,22 @@ impl<T: NvmeTransport> Controller<T> {
         }
         self.dma_next = end;
         Ok(aligned)
+    }
+
+    fn dma_alloc_zeroed(&mut self, bytes: u64, align: u64) -> Result<u64, NvmeError> {
+        let addr = self.dma_alloc(bytes, align)?;
+        self.dma_zero(addr, bytes);
+        Ok(addr)
+    }
+
+    fn dma_zero(&mut self, addr: u64, bytes: u64) {
+        let zero = [0u8; 64];
+        let mut done = 0u64;
+        while done < bytes {
+            let chunk = (bytes - done).min(zero.len() as u64) as usize;
+            self.t.dma_write(addr + done, &zero[..chunk]);
+            done += chunk as u64;
+        }
     }
 
     pub(crate) fn checked_io_bytes(&self, lba: u64, nlb: u16) -> Result<u64, NvmeError> {
@@ -218,7 +280,7 @@ impl<T: NvmeTransport> Controller<T> {
 
     fn admin_command(&mut self, sqe: Sqe) -> Result<Cqe, NvmeError> {
         self.submit_admin(sqe);
-        let cqe = self.poll_admin(1024)?;
+        let cqe = self.poll_admin(1_000_000)?;
         if cqe.is_success() {
             Ok(cqe)
         } else {
@@ -229,35 +291,39 @@ impl<T: NvmeTransport> Controller<T> {
         }
     }
 
-    /// Initialize the controller: enable, Identify, Set Features, Create I/O
-    /// queue 1. After this, `namespace_size`/`lba_size` are valid and I/O can
-    /// be issued.
+    /// Initialize the controller with a conservative single-queue polling plan.
     pub fn init(&mut self) -> Result<(), NvmeError> {
+        self.init_with_config(ControllerConfig::single_queue_polling())
+            .map(|_| ())
+    }
+
+    /// Initialize the controller: disable/reset, bring up the admin queue from
+    /// the preallocated DMA pool, Identify controller/namespace, and create
+    /// per-CPU I/O queues according to `config`.
+    pub fn init_with_config(
+        &mut self,
+        config: ControllerConfig,
+    ) -> Result<ControllerInitInfo, NvmeError> {
         let capv = self.t.read64(off::CAP);
         self.page_size = cap::min_page_size(capv) as u32;
         self.doorbell_stride = cap::doorbell_stride_bytes(capv);
-        let mqes = cap::mqes(capv);
-        self.max_queue_size = mqes;
-        self.admin_size = 16.min(mqes);
-        self.io_size = 16.min(mqes);
+        let mqes_entries = cap::mqes(capv).max(2);
+        self.max_queue_size = mqes_entries;
+        let plan = plan_queues(QueuePlanInput {
+            cpu_count: config.cpu_count.max(1),
+            cap_mqes: mqes_entries.saturating_sub(1),
+            msix_available: config.msix_available,
+            msi_available: config.msi_available,
+        })
+        .ok_or(NvmeError::InvalidArgs)?;
+        self.admin_size = plan.admin_depth.min(mqes_entries).max(2);
+        self.io_size = plan.io_depth.min(mqes_entries).max(2);
 
-        // Spec-compliant initialization starts from a disabled controller. A
-        // firmware-warmed or previously-initialized device may already have
-        // CC.EN/RDY set; clear EN and wait for RDY=0 before programming admin
-        // queue registers.
-        self.t.write32(off::CC, 0);
-        for _ in 0..100_000 {
-            if self.t.read32(off::CSTS) & csts::RDY == 0 {
-                break;
-            }
-        }
-        if self.t.read32(off::CSTS) & csts::RDY != 0 {
-            return Err(NvmeError::NotReady);
-        }
+        self.disable_controller(capv)?;
 
         let ps = self.page_size as u64;
-        self.admin_sq = self.dma_alloc(self.admin_size as u64 * 64, ps)?;
-        self.admin_cq = self.dma_alloc(self.admin_size as u64 * 16, ps)?;
+        self.admin_sq = self.dma_alloc_zeroed(self.admin_size as u64 * 64, ps)?;
+        self.admin_cq = self.dma_alloc_zeroed(self.admin_size as u64 * 16, ps)?;
 
         self.t.write32(
             off::AQA,
@@ -267,19 +333,9 @@ impl<T: NvmeTransport> Controller<T> {
         self.t.write64(off::ACQ, self.admin_cq);
 
         self.t.write32(off::CC, cc::enable(0, 6, 4, cc::CSS_NVM));
+        self.wait_ready(capv, true)?;
 
-        let mut ready = false;
-        for _ in 0..100_000 {
-            if self.t.read32(off::CSTS) & csts::RDY != 0 {
-                ready = true;
-                break;
-            }
-        }
-        if !ready {
-            return Err(NvmeError::NotReady);
-        }
-
-        self.identify_buf = self.dma_alloc(4096, ps)?;
+        self.identify_buf = self.dma_alloc_zeroed(IDENTIFY_BYTES as u64, ps)?;
         self.admin_command(build::identify(
             identify::CONTROLLER,
             0,
@@ -287,51 +343,94 @@ impl<T: NvmeTransport> Controller<T> {
             self.identify_buf,
         ))?;
 
-        // Read MDTS (Maximum Data Transfer Size) from Identify Controller.
-        // MDTS is at offset 77 in the Identify Controller data structure.
-        // MDTS is in units of the minimum memory page size (CAP.MPSMIN).
-        let mut ctrl_id = [0u8; 4096];
+        let mut ctrl_id = [0u8; IDENTIFY_BYTES];
         self.t.dma_read(self.identify_buf, &mut ctrl_id);
-        let mdts_raw = ctrl_id[77];
-        // MDTS = 0 means no limit. Otherwise, max transfer = 2^MDTS * page_size.
-        self.mdts = if mdts_raw == 0 {
-            // No device-advertised limit. Keep the driver bounded by one
-            // reusable DMA transfer buffer rather than treating u32::MAX as an
-            // allocation request.
-            128 * 1024
-        } else if mdts_raw < 31 {
-            (1u32 << mdts_raw).saturating_mul(self.page_size)
-        } else {
-            return Err(NvmeError::InvalidArgs);
-        };
+        let controller_info =
+            parse_controller(&ctrl_id, self.page_size).map_err(|_| NvmeError::InvalidArgs)?;
+        self.mdts = controller_info.max_request_bytes;
         self.io_data_buf_size = self.mdts as u64;
-        self.io_data_buf = self.dma_alloc(self.io_data_buf_size, ps)?;
-        self.io_prp_list = self.dma_alloc(ps, ps)?;
+        self.io_data_buf = self.dma_alloc_zeroed(self.io_data_buf_size, ps)?;
+        self.io_prp_list = self.dma_alloc_zeroed(ps, ps)?;
 
         self.admin_command(build::identify(
             identify::NAMESPACE,
             0,
-            1,
+            self.nsid,
             self.identify_buf,
         ))?;
 
-        let mut id = [0u8; 4096];
-        self.t.dma_read(self.identify_buf, &mut id);
-        self.nsze = u64::from_le_bytes([id[0], id[1], id[2], id[3], id[4], id[5], id[6], id[7]]);
-        let lbads = id[128 + 2];
-        self.lba_size = if (9..=16).contains(&lbads) {
-            1u32 << lbads
-        } else {
-            512
-        };
+        let mut ns_id = [0u8; IDENTIFY_BYTES];
+        self.t.dma_read(self.identify_buf, &mut ns_id);
+        let namespace_info =
+            parse_namespace(self.nsid, &ns_id).map_err(|_| NvmeError::InvalidArgs)?;
+        self.nsze = namespace_info.block_count;
+        self.lba_size = namespace_info.block_size;
 
-        self.admin_command(build::set_number_of_queues(1, 1))?;
+        let requested = plan.io_queue_count.clamp(1, u16::MAX as usize) as u16;
+        let set_queues = self.admin_command(build::set_number_of_queues(requested, requested))?;
+        let granted_sq = ((set_queues.result() & 0xffff) as u16)
+            .saturating_add(1)
+            .min(requested);
+        let granted_cq = ((set_queues.result() >> 16) as u16)
+            .saturating_add(1)
+            .min(requested);
+        let create_count = granted_sq.min(granted_cq).max(1) as usize;
+        self.create_io_queues(create_count, plan.interrupt_mode)?;
 
-        self.io_cq = self.dma_alloc(self.io_size as u64 * 16, ps)?;
-        self.io_sq = self.dma_alloc(self.io_size as u64 * 64, ps)?;
-        self.admin_command(build::create_io_cq(1, self.io_size, self.io_cq, 0, true))?;
-        self.admin_command(build::create_io_sq(1, self.io_size, self.io_sq, 1))?;
+        Ok(ControllerInitInfo {
+            controller: controller_info,
+            namespace: namespace_info,
+            queue_plan: plan,
+            io_queue_count: self.io_queue_count,
+        })
+    }
 
+    fn disable_controller(&mut self, capv: u64) -> Result<(), NvmeError> {
+        self.t.write32(off::CC, 0);
+        self.wait_ready(capv, false)
+    }
+
+    fn wait_ready(&mut self, capv: u64, ready: bool) -> Result<(), NvmeError> {
+        let budget = ready_poll_budget(capv);
+        let target = if ready { csts::RDY } else { 0 };
+        for _ in 0..budget {
+            if self.t.read32(off::CSTS) & csts::RDY == target {
+                return Ok(());
+            }
+        }
+        Err(NvmeError::NotReady)
+    }
+
+    fn create_io_queues(
+        &mut self,
+        count: usize,
+        interrupt_mode: InterruptMode,
+    ) -> Result<(), NvmeError> {
+        let ps = self.page_size as u64;
+        self.io_queue_count = 0;
+        for index in 0..count {
+            let qid = (index + 1) as u16;
+            let cq = self.dma_alloc_zeroed(self.io_size as u64 * 16, ps)?;
+            let sq = self.dma_alloc_zeroed(self.io_size as u64 * 64, ps)?;
+            let vector = index.min(u16::MAX as usize) as u16;
+            let interrupt_enabled = !matches!(interrupt_mode, InterruptMode::Polling);
+            self.admin_command(build::create_io_cq(
+                qid,
+                self.io_size,
+                cq,
+                vector,
+                interrupt_enabled,
+            ))?;
+            self.admin_command(build::create_io_sq(qid, self.io_size, sq, qid))?;
+            if qid == 1 {
+                self.io_cq = cq;
+                self.io_sq = sq;
+                self.io_sq_tail = 0;
+                self.io_cq_head = 0;
+                self.io_cq_phase = true;
+            }
+            self.io_queue_count += 1;
+        }
         Ok(())
     }
 
@@ -509,6 +608,11 @@ impl<T: NvmeTransport> Controller<T> {
     }
 }
 
+fn ready_poll_budget(capv: u64) -> u32 {
+    let timeout_ms = cap::timeout_ms(capv).max(500);
+    timeout_ms.saturating_mul(200).min(u32::MAX as u64) as u32
+}
+
 fn sqe_to_bytes(sqe: &Sqe) -> [u8; 64] {
     let mut b = [0u8; 64];
     let mut i = 0;
@@ -597,6 +701,48 @@ mod tests {
         let mut read = vec![0u8; nbytes];
         assert!(c.read(100, n, &mut read).is_ok());
         assert_eq!(read, data);
+    }
+
+    #[test]
+    fn one_mib_transfer_limit_works_and_oversize_is_rejected() {
+        let mut mock = MockNvme::new(8 << 20, 1024, 12);
+        mock.set_mdts_raw(8); // 4096 * 2^8 = 1 MiB
+        let mut c = Controller::new(mock, 0, 8 << 20);
+        assert!(c.init().is_ok());
+        let n = 256u16; // 256 * 4096 = 1 MiB
+        let nbytes = (n as usize) * 4096;
+        let mut data = vec![0u8; nbytes];
+        for (i, byte) in data.iter_mut().enumerate() {
+            *byte = ((i * 13) & 0xff) as u8;
+        }
+        assert!(c.write(0, n, &data).is_ok());
+        let mut read = vec![0u8; nbytes];
+        assert!(c.read(0, n, &mut read).is_ok());
+        assert_eq!(read, data);
+        let mut oversized = vec![0u8; nbytes + 4096];
+        assert_eq!(
+            c.read(0, n + 1, &mut oversized),
+            Err(NvmeError::InvalidArgs)
+        );
+    }
+
+    #[test]
+    fn init_with_config_creates_per_cpu_queues_and_identifies() {
+        let mock = MockNvme::new(1 << 22, 4096, 12);
+        let mut c = Controller::new(mock, 0, 1 << 22);
+        let info = c.init_with_config(ControllerConfig {
+            cpu_count: 4,
+            msix_available: true,
+            msi_available: true,
+        });
+        assert!(info.is_ok());
+        let Ok(info) = info else {
+            return;
+        };
+        assert_eq!(info.namespace.block_size, 4096);
+        assert_eq!(info.io_queue_count, 4);
+        assert_eq!(c.io_queue_count(), 4);
+        assert_eq!(info.queue_plan.interrupt_mode, InterruptMode::Msix);
     }
 
     #[test]

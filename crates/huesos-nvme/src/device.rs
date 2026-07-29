@@ -17,7 +17,9 @@ pub struct BarRegion {
     /// BAR index (0-5).
     pub index: u8,
     /// Physical base address.
-    pub base: u64,
+    pub phys: u64,
+    /// Mapped virtual base address in the DriverHost.
+    pub virt: u64,
     /// Size in bytes.
     pub size: u64,
     /// Memory (true) vs I/O-port (false) BAR.
@@ -33,7 +35,11 @@ impl BarRegion {
     }
     /// The physical address of a register at `off` within this BAR.
     pub fn phys_of(&self, off: u64) -> u64 {
-        self.base + off
+        self.phys + off
+    }
+    /// The mapped virtual address of a register at `off` within this BAR.
+    pub fn virt_of(&self, off: u64) -> u64 {
+        self.virt + off
     }
 }
 
@@ -80,7 +86,8 @@ mod tests {
     fn bar_contains_and_phys() {
         let bar = BarRegion {
             index: 0,
-            base: 0xFE00_0000,
+            phys: 0xFE00_0000,
+            virt: 0x7000_0000_0000,
             size: 0x4000,
             is_memory: true,
             prefetchable: false,
@@ -110,7 +117,8 @@ mod tests {
         let res = DeviceResources {
             reg_bar: BarRegion {
                 index: 0,
-                base: 0xFE00_0000,
+                phys: 0xFE00_0000,
+                virt: 0x7000_0000_0000,
                 size: 0x4000,
                 is_memory: true,
                 prefetchable: false,
