@@ -3,13 +3,70 @@
 use crate::irq_guard::IrqSafeMutex;
 use alloc::string::String;
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 use core::any::Any;
 
-use crate::{alloc_koid, KernelObject, Koid, ObjectType, Port, PortPacket};
+use crate::{alloc_koid, KernelObject, KernelObjectExt, Koid, ObjectType, Port, PortPacket};
 use huesos_quota::{Limits, QuotaTree, QuotaTreeError, Resource, Usage};
 
 const PORT_PACKET_QUOTA_EXHAUSTED: u32 = 3;
 const MAX_QUOTA_PORTS: usize = 8;
+const MAX_PENDING_QUOTA_EVENTS: usize = 256;
+const EMPTY_QUOTA_EVENT: QuotaEvent = QuotaEvent {
+    job: Koid::INVALID,
+    resource_id: 0,
+    amount: 0,
+};
+
+#[derive(Clone, Copy)]
+struct QuotaEvent {
+    job: Koid,
+    resource_id: u64,
+    amount: u64,
+}
+
+struct PendingQuotaEvents {
+    events: [QuotaEvent; MAX_PENDING_QUOTA_EVENTS],
+    head: usize,
+    len: usize,
+    dropped: u64,
+}
+
+impl PendingQuotaEvents {
+    const fn new() -> Self {
+        Self {
+            events: [EMPTY_QUOTA_EVENT; MAX_PENDING_QUOTA_EVENTS],
+            head: 0,
+            len: 0,
+            dropped: 0,
+        }
+    }
+
+    fn push(&mut self, event: QuotaEvent) {
+        if self.len == MAX_PENDING_QUOTA_EVENTS {
+            self.dropped = self.dropped.saturating_add(1);
+            self.events[self.head] = event;
+            self.head = (self.head + 1) % MAX_PENDING_QUOTA_EVENTS;
+            return;
+        }
+        let slot = (self.head + self.len) % MAX_PENDING_QUOTA_EVENTS;
+        self.events[slot] = event;
+        self.len += 1;
+    }
+
+    fn drain_into(&mut self, out: &mut [QuotaEvent; MAX_PENDING_QUOTA_EVENTS]) -> usize {
+        let count = self.len;
+        for (index, slot) in out.iter_mut().enumerate().take(count) {
+            *slot = self.events[(self.head + index) % MAX_PENDING_QUOTA_EVENTS];
+        }
+        self.head = 0;
+        self.len = 0;
+        count
+    }
+}
+
+static PENDING_QUOTA_EVENTS: IrqSafeMutex<PendingQuotaEvents> =
+    IrqSafeMutex::new(PendingQuotaEvents::new());
 
 struct QuotaPortBinding {
     port: Arc<Port>,
@@ -30,7 +87,7 @@ pub struct Job {
     parent: Option<Arc<Job>>,
     quota_tree: Arc<IrqSafeMutex<QuotaTree>>,
     quota_node: huesos_quota::NodeId,
-    quota_ports: IrqSafeMutex<alloc::vec::Vec<QuotaPortBinding>>,
+    quota_ports: IrqSafeMutex<Vec<QuotaPortBinding>>,
 }
 
 impl Job {
@@ -92,7 +149,7 @@ impl Job {
             .lock()
             .try_acquire(self.quota_node, resource, amount);
         if !charged {
-            self.notify_quota_exhausted(resource, amount);
+            enqueue_quota_exhaustion(self.koid, resource, amount);
         }
         charged
     }
@@ -124,21 +181,10 @@ impl Job {
         true
     }
 
-    /// Notify observers that a charge failed.
-    pub fn notify_quota_exhausted(&self, resource: Resource, amount: u64) {
-        let resource_id = match resource {
-            Resource::Memory => 0,
-            Resource::Handles => 1,
-            Resource::CpuTicks => 2,
-        };
+    fn quota_port_snapshot(&self, out: &mut Vec<(Arc<Port>, u64)>) {
         let ports = self.quota_ports.lock();
         for binding in ports.iter() {
-            let _ = binding.port.queue(PortPacket {
-                key: binding.key,
-                packet_type: PORT_PACKET_QUOTA_EXHAUSTED,
-                status: 0,
-                data: [self.koid.0, resource_id, amount, 0],
-            });
+            out.push((Arc::clone(&binding.port), binding.key));
         }
     }
 
@@ -150,6 +196,51 @@ impl Job {
     /// Aggregate usage of this Job and all descendants.
     pub fn subtree_usage(&self) -> Result<Usage, QuotaTreeError> {
         self.quota_tree.lock().subtree_usage(self.quota_node)
+    }
+}
+
+fn resource_id(resource: Resource) -> u64 {
+    match resource {
+        Resource::Memory => 0,
+        Resource::Handles => 1,
+        Resource::CpuTicks => 2,
+    }
+}
+
+fn enqueue_quota_exhaustion(job: Koid, resource: Resource, amount: u64) {
+    PENDING_QUOTA_EVENTS.lock().push(QuotaEvent {
+        job,
+        resource_id: resource_id(resource),
+        amount,
+    });
+}
+
+/// Deliver pending quota-exhaustion packets outside the charge path.
+///
+/// This must be called from ordinary process/deferred context, not while a
+/// scheduler or object critical section is held. `Job::charge` may run from the
+/// scheduler tick path, so it only records a bounded event and never queues a
+/// Port packet directly.
+pub fn flush_pending_quota_notifications() {
+    let mut drained = [EMPTY_QUOTA_EVENT; MAX_PENDING_QUOTA_EVENTS];
+    let count = PENDING_QUOTA_EVENTS.lock().drain_into(&mut drained);
+    for event in drained.iter().copied().take(count) {
+        let Some(object) = crate::lookup_object(event.job) else {
+            continue;
+        };
+        let Some(job) = object.downcast_ref::<Job>() else {
+            continue;
+        };
+        let mut ports: Vec<(Arc<Port>, u64)> = Vec::new();
+        job.quota_port_snapshot(&mut ports);
+        for (port, key) in ports {
+            let _ = port.queue(PortPacket {
+                key,
+                packet_type: PORT_PACKET_QUOTA_EXHAUSTED,
+                status: 0,
+                data: [event.job.0, event.resource_id, event.amount, 0],
+            });
+        }
     }
 }
 
@@ -213,13 +304,19 @@ mod tests {
             max_handles: huesos_quota::UNLIMITED,
             max_cpu_ticks: huesos_quota::UNLIMITED,
         });
+        crate::register_object(job.clone());
         let port = match Port::new() {
             Ok(port) => port,
-            Err(_) => return,
+            Err(_) => {
+                crate::unregister_object(job.koid());
+                return;
+            }
         };
         assert!(job.bind_quota_port(port.clone(), 7));
         assert!(job.charge(Resource::Memory, 1));
         assert!(!job.charge(Resource::Memory, 1));
+        assert_eq!(port.read(), None);
+        flush_pending_quota_notifications();
         let packet = port.read();
         assert!(packet.is_some(), "exhaustion should queue a packet");
         if let Some(packet) = packet {
@@ -229,6 +326,7 @@ mod tests {
             assert_eq!(packet.data[1], 0);
             assert_eq!(packet.data[2], 1);
         }
+        crate::unregister_object(job.koid());
     }
 
     #[test]

@@ -1269,6 +1269,7 @@ pub fn reap_if_pending() {
     if REAP_PENDING.swap(false, Ordering::AcqRel) {
         reap_finished_tasks();
     }
+    huesos_object::flush_pending_quota_notifications();
 }
 
 /// Drain finished tasks' kernel stacks (frames stay until process Arc drops).

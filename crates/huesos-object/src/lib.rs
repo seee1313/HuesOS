@@ -35,7 +35,7 @@ pub use channel::{
 };
 pub use handle::{Handle, HandleTable, HandleTableError, HandleValue, Rights, INVALID_HANDLE};
 pub use interrupt::{Interrupt, InterruptBinding};
-pub use job::Job;
+pub use job::{flush_pending_quota_notifications, Job};
 pub use koid::{alloc_koid, Koid};
 pub use object::{KernelObject, KernelObjectExt, ObjectType};
 pub use port::{Port, PortCreateError, PortPacket, PortQueueError};
