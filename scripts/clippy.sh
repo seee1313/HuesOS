@@ -13,7 +13,7 @@ cargo clippy --workspace --lib --bins -- -D warnings
 # dependency ELFs merely to lint source.
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
-for name in driver-manager terminal doom fault-probe bootfs input-host acpi-manager shutdown-broker; do
+for name in driver-manager terminal doom fault-probe bootfs input-host nvme-host acpi-manager shutdown-broker; do
     : > "$TMP/$name"
 done
 
@@ -33,7 +33,7 @@ done
         cargo clippy --release -- -D warnings
 )
 
-for program in driver-host-input terminal doom fault-probe acpi-manager shutdown-broker; do
+for program in driver-host-input driver-host-nvme terminal doom fault-probe acpi-manager shutdown-broker; do
     (
         cd "crates/huesos-userspace/$program"
         cargo clippy --release -- -D warnings

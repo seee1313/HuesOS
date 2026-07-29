@@ -1,0 +1,22 @@
+[package]
+name = "huesos-driver-host-nvme"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "huesos-driver-host-nvme"
+path = "src/main.rs"
+
+[dependencies]
+libcanvas = { path = "../libcanvas" }
+huesos-abi = { path = "../../huesos-abi" }
+
+[profile.release]
+opt-level = 2
+panic = "abort"
+lto = false
+
+[profile.dev]
+panic = "abort"
+
+[workspace]
