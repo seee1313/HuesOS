@@ -1103,6 +1103,8 @@ fn run_channel_check(logger: &mut InitLogger) {
 fn run_waitset_check(logger: &mut InitLogger) {
     use libcanvas::{wait_any, Signals, WaitItem};
 
+    init_logln!(logger, "[init] waitset self-test starting");
+
     // Property 1 — READABLE fires on channel wake.
     let Ok((tx, rx)) = libcanvas::Channel::pair() else {
         init_logln!(logger, "[init] waitset self-test FAILED (channel pair)");
@@ -1140,6 +1142,7 @@ fn run_waitset_check(logger: &mut InitLogger) {
             return;
         }
     }
+    init_logln!(logger, "[init] waitset self-test channel-readable OK");
     // Drain the probe message so the next iteration starts empty.
     let mut buf = [0u8; 32];
     let _ = rx.read_into(&mut buf);
@@ -1164,6 +1167,7 @@ fn run_waitset_check(logger: &mut InitLogger) {
             return;
         }
     }
+    init_logln!(logger, "[init] waitset self-test channel-timeout OK");
 
     // Property 3 — Port with no packet queued parks past the
     // deadline (times out) instead of spinning. This closes the
@@ -1204,6 +1208,7 @@ fn run_waitset_check(logger: &mut InitLogger) {
             return;
         }
     }
+    init_logln!(logger, "[init] waitset self-test port-timeout OK");
 
     // Property 4 — PEER_CLOSED wakes wait_any. This is the invariant
     // the shutdown-broker bootstrap loop depends on for its "peer
@@ -1248,6 +1253,7 @@ fn run_waitset_check(logger: &mut InitLogger) {
             return;
         }
     }
+    init_logln!(logger, "[init] waitset self-test peer-closed OK");
 
     init_logln!(logger, "[init] waitset self-test OK");
 }
