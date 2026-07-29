@@ -13,8 +13,8 @@ are intentionally not treated as the versioned project baseline unless they are
 copied into `docs/` in a dedicated review. The versioned baseline remains this
 file plus `safety-budget.json`.
 
-At the current baseline (`safety-budget.json`) the repository contains 166
-first-party Rust files and 44,699 Rust lines. The measured surface is **261**
+At the current baseline (`safety-budget.json`) the repository contains 167
+first-party Rust files and 44,987 Rust lines. The measured surface is **261**
 unsafe blocks, **62** unsafe functions, **28** unsafe impls, one `static mut`,
 **25** unwrap calls, **21** expect calls, and **5** panic macros. Prior baseline
 values are retained in the changelog sections below so that any deviation
@@ -2069,3 +2069,29 @@ All new unsafe surface is in `libcanvas` RAII handle wrapping:
 by the kernel into owned wrappers, and `Process::from_raw` / `Vmar::from_raw`
 are crate-private helpers used by `Job::create_process` to avoid exposing tuple
 fields. Kernel/object quota implementation adds no unsafe blocks.
+
+## NVMe userspace DriverHost foundation (safety-budget-neutral)
+
+The first NVMe storage foundation landed without adding unsafe Rust. The series
+adds the `DmaPool` resource kind, HBI boot-driver manifest ABI, a no-heap
+userspace `driver-host-nvme` skeleton, strict resource-label parsing, Identify
+Controller/Namespace parsers, per-CPU queue/DMA planning, async BlockDevice
+wire protocol, client completion tracking, and a DriverManager registry
+reservation for `open:block:nvme`.
+
+All new code is host-testable or userspace-safe scaffolding. Real BAR mapping,
+DMA mapping, MSI-X/MSI interrupt wiring, and controller on-target bring-up remain
+future slices and will need their own safety review when hardware-facing unsafe
+code is introduced.
+
+### Safety-budget delta (measured)
+
+```
+unsafe_blocks:    261 -> 261 (unchanged).
+unsafe_functions:  62 ->  62 (unchanged).
+unsafe_impls:      28 ->  28 (unchanged).
+static_mut:         1 ->   1 (unchanged).
+unwrap_calls:      25 ->  25 (unchanged).
+expect_calls:      21 ->  21 (unchanged).
+panic_macros:       5 ->   5 (unchanged).
+```
