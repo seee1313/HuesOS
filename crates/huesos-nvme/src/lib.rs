@@ -22,6 +22,7 @@ extern crate alloc;
 pub mod async_controller;
 pub mod block;
 pub mod block_async;
+pub mod block_client;
 pub mod buffer_pool;
 pub mod cmd;
 pub mod controller;
@@ -38,6 +39,9 @@ pub use async_controller::{AsyncController, InterruptController, PollingInterrup
 pub use block::{BlockDevice, BlockInfo, BlockOp};
 pub use block_async::{
     completion_data, decode_completion_data, AsyncBlockOp, AsyncBlockRequest, AsyncBlockStatus,
+};
+pub use block_client::{
+    ClientRequest, ClientRequestTracker, ClientTrackerError, MatchedCompletion,
 };
 pub use buffer_pool::DmaBufferPool;
 pub use cmd::{Cqe, Sqe};
