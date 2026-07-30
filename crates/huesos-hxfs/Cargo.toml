@@ -9,3 +9,5 @@ default = []
 writer = []
 
 [dependencies]
+aes = { version = "0.8", default-features = false }
+cipher = { version = "0.4", default-features = false }
