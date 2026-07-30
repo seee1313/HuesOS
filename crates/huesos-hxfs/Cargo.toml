@@ -7,7 +7,9 @@ license.workspace = true
 [features]
 default = []
 writer = []
+compression-engines = ["dep:lz4_flex"]
 
 [dependencies]
 aes = { version = "0.8", default-features = false }
 cipher = { version = "0.4", default-features = false }
+lz4_flex = { version = "0.11", default-features = false, optional = true }
