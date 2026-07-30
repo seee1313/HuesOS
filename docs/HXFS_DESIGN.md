@@ -980,3 +980,55 @@ The Stage K foundation does not yet enable arbitrary on-target write requests in
 or an approved userspace allocator integration. What is now fixed is the storage
 contract: mutable Hxfs state is published through v2 journaled checkpoints over a
 BlockStore, and ordinary mount refuses Recovering state until replay succeeds.
+
+---
+
+## 34. Stage K fixed-capacity service write dispatcher
+
+The selected production direction for `hxfs-service` is **no heap in the service
+state**. The service therefore does not link the alloc-backed host writer into
+the target process. Instead it uses a fixed-capacity writer:
+
+```text
+huesos_hxfs::fixed_writer::FixedHxfsWriter<S, MAX_OBJECTS, MAX_DIR_ENTRIES, MAX_EXTENTS>
+```
+
+Properties:
+
+- owns the BlockStore-backed mutable state;
+- mirrors mounted metadata in fixed arrays;
+- uses no `alloc` in the production module;
+- serves the canonical `huesos_abi::hxfs` native request/response protocol;
+- supports explicit checkpoint/fsync publication through the v2 journal;
+- keeps the legacy read-only string commands for compatibility while native
+  clients move to the ABI path.
+
+Initial fixed-capacity `hxfs-service` limits:
+
+```text
+SERVICE_MAX_OBJECTS     = 32
+SERVICE_MAX_DIR_ENTRIES = 64
+SERVICE_MAX_EXTENTS     = 64
+inline write payload    = 4096 bytes
+```
+
+Initial mutation coverage:
+
+```text
+root/directory open
+mkdir
+create empty file
+write-at offset 0 whole-file replacement
+block-aligned append
+truncate/sparse extend
+rename
+unlink empty directories/files
+fsync/checkpoint
+read-at/list-directory through native ABI
+```
+
+Known intentional limitation:
+
+General overlapping unaligned extent surgery is rejected for now. Supporting it
+without heap is possible, but it belongs with the persistent allocator/refcount
+stages so extent splitting, reclaim, and crash recovery are designed together.

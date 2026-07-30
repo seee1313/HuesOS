@@ -56,13 +56,12 @@ After the original Stage I roadmap update, the first production-mutable slice wa
 ```text
 Stage J — canonical Hxfs service ABI in huesos-abi             DONE
 Stage L — Hxfs v2 root-store feature flags + journal replay    DONE FOUNDATION
-Stage K — BlockStore-backed journaled mutable writer foundation DONE FOUNDATION
+Stage K — no-heap fixed-capacity write dispatcher              DONE FOUNDATION
 ```
 
-Important limitation: arbitrary on-target write requests are still not enabled in
-`hxfs-service`; the service now replays v2 journals before mount, while the
-write-capable service request dispatcher still needs an approved no-heap or
-userspace-allocator state model.
+Important limitation: the on-target write dispatcher is now enabled through a
+fixed-capacity no-heap state model, but general unaligned overlapping extent
+surgery/reclaim is still deferred to allocator/refcount stages.
 
 ---
 
@@ -555,7 +554,7 @@ J4 test(hxfs): add format/ABI compatibility tests
 
 ---
 
-## Stage K — Persistent mutable `hxfs-service` over BlockDevice — FOUNDATION DONE
+## Stage K — Persistent mutable `hxfs-service` over BlockDevice — NO-HEAP FOUNDATION DONE
 
 Goal:
 
