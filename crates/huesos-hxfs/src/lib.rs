@@ -20,6 +20,7 @@ pub mod crc32c;
 pub mod crypto;
 pub mod fixed_writer;
 pub mod format;
+pub mod gpt;
 pub mod hxblob;
 pub mod hxblob_tree;
 pub mod io_policy;
@@ -29,6 +30,7 @@ pub mod reader;
 pub mod recovery;
 pub mod ref_tree;
 pub mod scrub;
+pub mod volume_topology;
 #[cfg(any(test, feature = "writer"))]
 pub mod writer;
 
@@ -512,6 +514,9 @@ pub(crate) fn read_checkpoint<R: BlockReader>(
     let compression_policy_tree_lba = read_u64(&block, base + 80)?;
     let hxblob_index_tree_lba = read_u64(&block, base + 88)?;
     let hxblob_merkle_tree_lba = read_u64(&block, base + 96)?;
+    let virtual_volume_tree_lba = read_u64(&block, base + 104)?;
+    let gpt_summary_lba = read_u64(&block, base + 112)?;
+    let install_manifest_lba = read_u64(&block, base + 120)?;
     Ok(Checkpoint {
         sequence_number: checkpoint_sequence,
         volume_table_lba,
@@ -525,6 +530,9 @@ pub(crate) fn read_checkpoint<R: BlockReader>(
         compression_policy_tree_lba,
         hxblob_index_tree_lba,
         hxblob_merkle_tree_lba,
+        virtual_volume_tree_lba,
+        gpt_summary_lba,
+        install_manifest_lba,
     })
 }
 
@@ -801,7 +809,7 @@ mod tests {
         let superblock = make_block(BLOCK_TYPE_SUPERBLOCK, 0, 0, &super_payload);
         image[0..BLOCK_SIZE].copy_from_slice(&superblock);
 
-        let mut checkpoint_payload = [0u8; 104];
+        let mut checkpoint_payload = [0u8; 128];
         checkpoint_payload[0..8].copy_from_slice(&1u64.to_le_bytes());
         checkpoint_payload[8..16].copy_from_slice(&2u64.to_le_bytes());
         checkpoint_payload[16..20].copy_from_slice(&1u32.to_le_bytes());

@@ -1,4 +1,4 @@
-//! Hxfs v4 on-disk constants and stable decoded records.
+//! Hxfs v5 on-disk constants and stable decoded records.
 
 /// Hxfs format GUID. Not an ASCII magic string; this is the stable format type
 /// identity used by mount validation.
@@ -6,14 +6,14 @@ pub const FORMAT_GUID: [u8; 16] = [
     0x48, 0x78, 0x66, 0x73, 0x2d, 0x48, 0x75, 0x65, 0x73, 0x4f, 0x53, 0x2d, 0x76, 0x31, 0x00, 0x01,
 ];
 
-/// Hxfs v4 linear format version. v4 adds encryption policy, compression
-/// policy, and Hxblob roots to the checkpoint.
-pub const FORMAT_VERSION: u32 = 4;
-/// Hxfs v4 metadata type-system version.
-pub const TYPE_SYSTEM_VERSION: u32 = 4;
-/// Hxfs v4 block size.
+/// Hxfs v5 linear format version. v5 adds GPT cooperation and virtual-volume
+/// topology roots to the checkpoint.
+pub const FORMAT_VERSION: u32 = 5;
+/// Hxfs v5 metadata type-system version.
+pub const TYPE_SYSTEM_VERSION: u32 = 5;
+/// Hxfs v5 block size.
 pub const BLOCK_SIZE: usize = 4096;
-/// Hxfs v4 block size as u64.
+/// Hxfs v5 block size as u64.
 pub const BLOCK_SIZE_U64: u64 = BLOCK_SIZE as u64;
 /// Maximum UTF-8 directory entry name length.
 pub const MAX_NAME_BYTES: usize = 255;
@@ -50,6 +50,12 @@ pub const BLOCK_TYPE_COMPRESSION_POLICY_TREE: u32 = 13;
 pub const BLOCK_TYPE_HXBLOB_INDEX_TREE: u32 = 14;
 /// Metadata block type: persistent Hxblob Merkle tree metadata root.
 pub const BLOCK_TYPE_HXBLOB_MERKLE_TREE: u32 = 15;
+/// Metadata block type: persistent virtual-volume topology root.
+pub const BLOCK_TYPE_VIRTUAL_VOLUME_TREE: u32 = 16;
+/// Metadata block type: GPT cooperation summary root.
+pub const BLOCK_TYPE_GPT_SUMMARY: u32 = 17;
+/// Metadata block type: installed layout manifest root.
+pub const BLOCK_TYPE_INSTALL_MANIFEST: u32 = 18;
 
 /// Incompatible feature: v2 root-store state and feature flags are present.
 pub const FEATURE_INCOMPAT_V2_ROOT_STORE: u64 = 1 << 0;
@@ -215,6 +221,12 @@ pub struct Checkpoint {
     pub hxblob_index_tree_lba: u64,
     /// Hxblob Merkle metadata tree root LBA, or zero if absent.
     pub hxblob_merkle_tree_lba: u64,
+    /// Virtual-volume topology tree root LBA, or zero if absent.
+    pub virtual_volume_tree_lba: u64,
+    /// GPT cooperation summary root LBA, or zero if absent.
+    pub gpt_summary_lba: u64,
+    /// Installed layout manifest root LBA, or zero if absent.
+    pub install_manifest_lba: u64,
 }
 
 /// Decoded volume descriptor.
