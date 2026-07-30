@@ -33,6 +33,7 @@ pub mod prp;
 pub mod queue_plan;
 pub mod queues;
 pub mod regs;
+pub mod reliability;
 pub mod transport;
 
 pub use async_controller::{AsyncController, InterruptController, PollingInterrupts};
@@ -51,4 +52,8 @@ pub use identify::{parse_controller, parse_namespace, ControllerInfo, NamespaceI
 pub use pci_transport::PciMmioTransport;
 pub use queue_plan::{plan_queues, InterruptMode, QueuePlan, QueuePlanInput};
 pub use queues::{QueueManager, QueueSelector};
+pub use reliability::{
+    validate_maintenance, MaintenanceOp, NvmeTelemetry, QueueSlot, QueueSlotTracker,
+    ReliabilityError, ResetController, ResetState,
+};
 pub use transport::{MockNvme, NvmeTransport};
