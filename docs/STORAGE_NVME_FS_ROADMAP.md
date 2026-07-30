@@ -83,6 +83,23 @@ work.
 
 ---
 
+
+### 0.3 Follow-up implementation status — P/Q/R
+
+The crypto/compression/Hxblob root slice is now implemented as a v4 foundation:
+
+```text
+Stage P — AES-256-XTS software backend via RustCrypto AES       DONE FOUNDATION
+Stage Q — LZ4/Zstd policy + compressed extent pipeline          DONE FOUNDATION
+Stage R — no-heap persistent Hxblob index/Merkle trees          DONE FOUNDATION
+```
+
+Important limitation: TPM unseal/key lifetime integration, no-heap Zstd engine
+audit, BlobView service operations, and DriverManager package resolving from
+Hxblob remain future production work.
+
+---
+
 ## 1. Целевая философия
 
 Главный принцип HuesOS storage:
@@ -823,7 +840,7 @@ O4 test(hxfs): add quota persistence and rollback tests
 
 ---
 
-## Stage P — Production encryption path
+## Stage P — Production encryption path — FOUNDATION DONE
 
 Goal:
 
@@ -887,7 +904,7 @@ P7 docs(audit): record encryption safety boundary
 
 ---
 
-## Stage Q — Production compression path
+## Stage Q — Production compression path — FOUNDATION DONE
 
 Goal:
 
@@ -926,7 +943,7 @@ Q4 test(hxfs): add compressed sparse/overwrite/remount tests
 
 ---
 
-## Stage R — Production Hxblob package/blob subsystem
+## Stage R — Production Hxblob package/blob subsystem — FOUNDATION DONE
 
 Goal:
 

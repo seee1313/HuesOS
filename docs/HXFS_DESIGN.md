@@ -1100,3 +1100,73 @@ Still intentionally deferred:
 - snapshot deletion reclaim using persistent refcounts;
 - full scrub/fsck traversal of these trees;
 - cross-volume quota management ABI.
+
+---
+
+## 36. Stage P/Q/R crypto, compression, and Hxblob roots
+
+Stage P/Q/R advances Hxfs format to v4 and adds checkpoint roots for policy and
+package/blob metadata:
+
+```text
+encryption_policy_tree_lba
+compression_policy_tree_lba
+hxblob_index_tree_lba
+hxblob_merkle_tree_lba
+```
+
+Format v4 feature bits:
+
+```text
+FEATURE_INCOMPAT_V4_POLICY_AND_BLOB_TREES
+FEATURE_INCOMPAT_HXBLOB_INDEX
+```
+
+Stage P selected audited RustCrypto AES as the software fallback primitive:
+
+```text
+aes crate + cipher traits
+AES-256-XTS over exact 4 KiB Hxfs data units
+hardware inline crypto remains preferred when available
+software fallback remains mandatory when keys exist
+```
+
+The implementation provides an in-place 4 KiB AES-XTS backend and keeps live
+volume keys as RAM-only values. It does not add a TPM unseal implementation yet;
+that remains the platform KeyProvider integration layer.
+
+Stage Q selected LZ4 and Zstd as the persistent policy algorithms:
+
+```text
+COMPRESSION_LZ4
+COMPRESSION_ZSTD
+compressed extent descriptors
+threshold-based compression planning
+payload CRC validation fields
+```
+
+The default no-heap build keeps stable descriptors and validation. The LZ4
+engine adapter is feature-gated through the selected audited `lz4_flex` crate.
+The selected Zstd policy id is persistent, but a no-heap Zstd encoder backend is
+not linked into `hxfs-service` yet because the common audited `zstd` crate path
+pulls a C/std backend; enabling it for the filesystem service requires a separate
+no-heap compatibility audit.
+
+Stage R adds fixed-capacity persistent Hxblob trees:
+
+```text
+hxblob_tree::HxblobIndexTree
+hxblob_tree::HxblobMerkleTree
+```
+
+These provide write-once `hash(content) -> ObjectId` records, Merkle metadata
+descriptors, sorted validation, duplicate hash rejection, and idempotent dedup
+for identical entries.
+
+Still deferred:
+
+- TPM/bootloader KeyProvider unseal path;
+- key zeroization policy and memory lifetime audit;
+- no-heap Zstd encoder/decoder backend selection;
+- `hxfs-service` BlobView native operations;
+- DriverManager/package resolver integration with Hxblob.
