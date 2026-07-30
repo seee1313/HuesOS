@@ -1242,3 +1242,54 @@ tools/hxfs-scrub.py
 
 Repair remains deliberately out of scope for this slice. Automatic repair is a
 destructive operation and must be reviewed separately.
+
+---
+
+## 38. Stage X/Y/Z security, observability, and release gate
+
+Stage X adds the no-heap security policy core:
+
+```text
+security_policy::required_rights
+security_policy::validate_request_rights
+security_policy::validate_path
+security_policy::validate_symlink_depth
+security_policy::admit_request
+```
+
+It enforces operation-specific rights, handle-kind compatibility, path/name
+shape, symlink depth, and per-client outstanding request quota in a host-testable
+module before runtime service wiring.
+
+Stage Y adds observability, fault-injection, and benchmark foundations:
+
+```text
+observability::HxfsCounters
+observability::FaultInjector
+observability::LatencyHistogram
+tools/storage-bench.py
+scripts/ci-qemu-nvme-soak.sh
+```
+
+The benchmark suite is a regression harness, not a hardware truth source. The
+NVMe soak script is the production-gate runtime harness when QEMU is available.
+
+Stage Z adds a production gate without freezing the format as production-ready:
+
+```text
+docs/STORAGE_PRODUCTION_GATE.md
+tools/check-storage-production-gate.py
+make storage-gate
+```
+
+Current status remains:
+
+```text
+Hxfs v5 foundation schema: documented
+Hxfs v5 production freeze: not approved
+storage production-ready: false
+```
+
+This is intentional. Claiming production readiness now would be a bad decision
+because QEMU NVMe soak, runtime cache integration, reclaim, BlobView service,
+TPM key provider, and repair policy are still open.

@@ -119,6 +119,24 @@ work.
 
 ---
 
+
+### 0.5 Follow-up implementation status — X/Y/Z
+
+The security/observability/release-gate foundation slice is now implemented:
+
+```text
+Stage X — no-heap Hxfs security/capability policy core         DONE FOUNDATION
+Stage Y — counters/fault-injection/bench/soak harnesses         DONE FOUNDATION
+Stage Z — production gate metadata, no production freeze claim   DONE FOUNDATION
+```
+
+Important limitation: the gate explicitly says storage is not production-ready
+and Hxfs v5 is not production-frozen yet. Runtime service enforcement wiring,
+full QEMU NVMe soak, repair policy, and remaining production features are still
+required before a real release freeze.
+
+---
+
 ## 1. Целевая философия
 
 Главный принцип HuesOS storage:
@@ -1263,7 +1281,7 @@ W5 docs(hxfs): define repair policy before implementation
 
 ---
 
-## Stage X — Security hardening and capability policy
+## Stage X — Security hardening and capability policy — FOUNDATION DONE
 
 Goal:
 
@@ -1307,7 +1325,7 @@ X5 docs(audit): record Hxfs service security boundary
 
 ---
 
-## Stage Y — Observability, benchmarks, and fault injection
+## Stage Y — Observability, benchmarks, and fault injection — FOUNDATION DONE
 
 Goal:
 
@@ -1363,7 +1381,7 @@ Y5 scripts: add long-running QEMU NVMe soak
 
 ---
 
-## Stage Z — Production release gate and on-disk format v1 freeze
+## Stage Z — Production release gate and on-disk format v1 freeze — FOUNDATION DONE
 
 Goal:
 
