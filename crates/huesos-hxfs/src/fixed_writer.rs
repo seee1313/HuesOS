@@ -636,6 +636,10 @@ impl<
             refcount_tree_lba,
             backref_tree_lba,
             quota_tree_lba,
+            0,
+            0,
+            0,
+            0,
             checkpoint_lba,
         );
         self.write_journaled_target(
@@ -1649,9 +1653,13 @@ fn build_checkpoint_block(
     refcount_tree_lba: u64,
     backref_tree_lba: u64,
     quota_tree_lba: u64,
+    encryption_policy_tree_lba: u64,
+    compression_policy_tree_lba: u64,
+    hxblob_index_tree_lba: u64,
+    hxblob_merkle_tree_lba: u64,
     lba: u64,
 ) -> [u8; BLOCK_SIZE] {
-    let mut payload = [0u8; 72];
+    let mut payload = [0u8; 104];
     payload[0..8].copy_from_slice(&sequence.to_le_bytes());
     payload[8..16].copy_from_slice(&volume_table_lba.to_le_bytes());
     payload[16..20].copy_from_slice(&1u32.to_le_bytes());
@@ -1660,6 +1668,10 @@ fn build_checkpoint_block(
     payload[48..56].copy_from_slice(&refcount_tree_lba.to_le_bytes());
     payload[56..64].copy_from_slice(&backref_tree_lba.to_le_bytes());
     payload[64..72].copy_from_slice(&quota_tree_lba.to_le_bytes());
+    payload[72..80].copy_from_slice(&encryption_policy_tree_lba.to_le_bytes());
+    payload[80..88].copy_from_slice(&compression_policy_tree_lba.to_le_bytes());
+    payload[88..96].copy_from_slice(&hxblob_index_tree_lba.to_le_bytes());
+    payload[96..104].copy_from_slice(&hxblob_merkle_tree_lba.to_le_bytes());
     make_metadata_block(BLOCK_TYPE_CHECKPOINT, 0, lba, &payload)
 }
 

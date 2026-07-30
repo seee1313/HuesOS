@@ -1033,7 +1033,7 @@ fn build_checkpoint_block(
     volume_uuid: Uuid,
     lba: u64,
 ) -> Result<[u8; BLOCK_SIZE], HxfsWriteError> {
-    let mut payload = [0u8; 72];
+    let mut payload = [0u8; 104];
     payload[0..8].copy_from_slice(&sequence.to_le_bytes());
     payload[8..16].copy_from_slice(&volume_table_lba.to_le_bytes());
     payload[16..20].copy_from_slice(&1u32.to_le_bytes());

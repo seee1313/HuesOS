@@ -1,4 +1,4 @@
-//! Hxfs v3 on-disk constants and stable decoded records.
+//! Hxfs v4 on-disk constants and stable decoded records.
 
 /// Hxfs format GUID. Not an ASCII magic string; this is the stable format type
 /// identity used by mount validation.
@@ -6,14 +6,14 @@ pub const FORMAT_GUID: [u8; 16] = [
     0x48, 0x78, 0x66, 0x73, 0x2d, 0x48, 0x75, 0x65, 0x73, 0x4f, 0x53, 0x2d, 0x76, 0x31, 0x00, 0x01,
 ];
 
-/// Hxfs v3 linear format version. v3 adds persistent allocation, refcount,
-/// backref, and quota tree roots to the checkpoint.
-pub const FORMAT_VERSION: u32 = 3;
-/// Hxfs v3 metadata type-system version.
-pub const TYPE_SYSTEM_VERSION: u32 = 3;
-/// Hxfs v3 block size.
+/// Hxfs v4 linear format version. v4 adds encryption policy, compression
+/// policy, and Hxblob roots to the checkpoint.
+pub const FORMAT_VERSION: u32 = 4;
+/// Hxfs v4 metadata type-system version.
+pub const TYPE_SYSTEM_VERSION: u32 = 4;
+/// Hxfs v4 block size.
 pub const BLOCK_SIZE: usize = 4096;
-/// Hxfs v3 block size as u64.
+/// Hxfs v4 block size as u64.
 pub const BLOCK_SIZE_U64: u64 = BLOCK_SIZE as u64;
 /// Maximum UTF-8 directory entry name length.
 pub const MAX_NAME_BYTES: usize = 255;
@@ -42,6 +42,14 @@ pub const BLOCK_TYPE_REFCOUNT_TREE: u32 = 9;
 pub const BLOCK_TYPE_BACKREF_TREE: u32 = 10;
 /// Metadata block type: persistent quota tree root.
 pub const BLOCK_TYPE_QUOTA_TREE: u32 = 11;
+/// Metadata block type: persistent encryption policy tree root.
+pub const BLOCK_TYPE_ENCRYPTION_POLICY_TREE: u32 = 12;
+/// Metadata block type: persistent compression policy tree root.
+pub const BLOCK_TYPE_COMPRESSION_POLICY_TREE: u32 = 13;
+/// Metadata block type: persistent Hxblob index tree root.
+pub const BLOCK_TYPE_HXBLOB_INDEX_TREE: u32 = 14;
+/// Metadata block type: persistent Hxblob Merkle tree metadata root.
+pub const BLOCK_TYPE_HXBLOB_MERKLE_TREE: u32 = 15;
 
 /// Incompatible feature: v2 root-store state and feature flags are present.
 pub const FEATURE_INCOMPAT_V2_ROOT_STORE: u64 = 1 << 0;
@@ -51,13 +59,18 @@ pub const FEATURE_INCOMPAT_MUTABLE_JOURNAL: u64 = 1 << 1;
 pub const FEATURE_INCOMPAT_V3_STORAGE_TREES: u64 = 1 << 2;
 /// Incompatible feature: allocator charges enforce persistent quota records.
 pub const FEATURE_INCOMPAT_QUOTA_ENFORCEMENT: u64 = 1 << 3;
-/// Incompatible features required for a normal v3 mutable Hxfs image.
+/// Incompatible feature: v4 encryption/compression/Hxblob roots are present.
+pub const FEATURE_INCOMPAT_V4_POLICY_AND_BLOB_TREES: u64 = 1 << 4;
+/// Incompatible feature: Hxblob write-once index records may be present.
+pub const FEATURE_INCOMPAT_HXBLOB_INDEX: u64 = 1 << 5;
+/// Incompatible features required for a normal v4 mutable Hxfs image.
 pub const BASE_INCOMPAT_FEATURES: u64 = FEATURE_INCOMPAT_V2_ROOT_STORE
     | FEATURE_INCOMPAT_MUTABLE_JOURNAL
-    | FEATURE_INCOMPAT_V3_STORAGE_TREES;
+    | FEATURE_INCOMPAT_V3_STORAGE_TREES
+    | FEATURE_INCOMPAT_V4_POLICY_AND_BLOB_TREES;
 /// Incompatible features supported by this implementation.
 pub const SUPPORTED_INCOMPAT_FEATURES: u64 =
-    BASE_INCOMPAT_FEATURES | FEATURE_INCOMPAT_QUOTA_ENFORCEMENT;
+    BASE_INCOMPAT_FEATURES | FEATURE_INCOMPAT_QUOTA_ENFORCEMENT | FEATURE_INCOMPAT_HXBLOB_INDEX;
 /// Compatible features supported by this implementation.
 pub const SUPPORTED_COMPAT_FEATURES: u64 = 0;
 /// Read-only-compatible features supported by this implementation.
@@ -194,6 +207,14 @@ pub struct Checkpoint {
     pub backref_tree_lba: u64,
     /// Quota tree root LBA, or zero if absent.
     pub quota_tree_lba: u64,
+    /// Encryption policy tree root LBA, or zero if absent.
+    pub encryption_policy_tree_lba: u64,
+    /// Compression policy tree root LBA, or zero if absent.
+    pub compression_policy_tree_lba: u64,
+    /// Hxblob index tree root LBA, or zero if absent.
+    pub hxblob_index_tree_lba: u64,
+    /// Hxblob Merkle metadata tree root LBA, or zero if absent.
+    pub hxblob_merkle_tree_lba: u64,
 }
 
 /// Decoded volume descriptor.
