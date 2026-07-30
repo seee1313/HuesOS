@@ -69,11 +69,14 @@ pub const FEATURE_INCOMPAT_QUOTA_ENFORCEMENT: u64 = 1 << 3;
 pub const FEATURE_INCOMPAT_V4_POLICY_AND_BLOB_TREES: u64 = 1 << 4;
 /// Incompatible feature: Hxblob write-once index records may be present.
 pub const FEATURE_INCOMPAT_HXBLOB_INDEX: u64 = 1 << 5;
-/// Incompatible features required for a normal v4 mutable Hxfs image.
+/// Incompatible feature: v5 virtual-volume/GPT topology roots are present.
+pub const FEATURE_INCOMPAT_V5_VOLUME_TOPOLOGY: u64 = 1 << 6;
+/// Incompatible features required for a normal v5 mutable Hxfs image.
 pub const BASE_INCOMPAT_FEATURES: u64 = FEATURE_INCOMPAT_V2_ROOT_STORE
     | FEATURE_INCOMPAT_MUTABLE_JOURNAL
     | FEATURE_INCOMPAT_V3_STORAGE_TREES
-    | FEATURE_INCOMPAT_V4_POLICY_AND_BLOB_TREES;
+    | FEATURE_INCOMPAT_V4_POLICY_AND_BLOB_TREES
+    | FEATURE_INCOMPAT_V5_VOLUME_TOPOLOGY;
 /// Incompatible features supported by this implementation.
 pub const SUPPORTED_INCOMPAT_FEATURES: u64 =
     BASE_INCOMPAT_FEATURES | FEATURE_INCOMPAT_QUOTA_ENFORCEMENT | FEATURE_INCOMPAT_HXBLOB_INDEX;
