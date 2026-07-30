@@ -1032,3 +1032,71 @@ Known intentional limitation:
 General overlapping unaligned extent surgery is rejected for now. Supporting it
 without heap is possible, but it belongs with the persistent allocator/refcount
 stages so extent splitting, reclaim, and crash recovery are designed together.
+
+---
+
+## 35. Stage M/N/O storage policy trees
+
+Stage M/N/O advances Hxfs format to v3 and adds persistent storage policy tree
+roots to each checkpoint:
+
+```text
+allocation_tree_lba
+refcount_tree_lba
+backref_tree_lba
+quota_tree_lba
+```
+
+Format v3 feature bits:
+
+```text
+FEATURE_INCOMPAT_V3_STORAGE_TREES
+FEATURE_INCOMPAT_QUOTA_ENFORCEMENT
+```
+
+The initial no-heap implementation uses fixed-capacity sorted root-leaf B-tree
+cores:
+
+```text
+alloc_tree::AllocationBtree
+ref_tree::RefcountBtree
+ref_tree::BackrefBtree
+quota_tree::QuotaBtree
+```
+
+These are not heap-backed vectors and are safe to use from `hxfs-service` fixed
+state. They persist enough metadata for allocator accounting, refcount/backref
+scrub foundations, and quota enforcement in the current write path.
+
+Current Stage M coverage:
+
+- format v3 checkpoint storage-tree roots;
+- persistent allocation tree metadata block;
+- sorted allocation records by physical block;
+- first-fit allocation/free/TRIM policy core;
+- fixed writer publishes allocation tree root on checkpoint.
+
+Current Stage N coverage:
+
+- persistent refcount tree metadata block;
+- persistent backref tree metadata block;
+- refcount increment/decrement/reclaim policy core;
+- backref owner records for data extents;
+- fixed writer publishes refcount/backref roots on checkpoint.
+
+Current Stage O coverage:
+
+- persistent quota tree metadata block;
+- per-volume physical-byte and object-count quota records;
+- quota checks before object creation, data-block allocation, and checkpoint
+  metadata publication;
+- fixed writer publishes quota root on checkpoint and marks the final clean
+  superblock with quota enforcement support.
+
+Still intentionally deferred:
+
+- multi-level node splitting/rebalancing beyond the fixed root-leaf stage;
+- full free-space reuse inside `hxfs-service` allocator path;
+- snapshot deletion reclaim using persistent refcounts;
+- full scrub/fsck traversal of these trees;
+- cross-volume quota management ABI.

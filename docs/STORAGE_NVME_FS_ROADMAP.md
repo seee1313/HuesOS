@@ -65,6 +65,24 @@ surgery/reclaim is still deferred to allocator/refcount stages.
 
 ---
 
+
+### 0.2 Follow-up implementation status — M/N/O
+
+The storage-policy tree slice is now implemented as a no-heap foundation:
+
+```text
+Stage M — v3 allocation tree root + allocation B-tree core       DONE FOUNDATION
+Stage N — refcount/backref tree roots + B-tree cores             DONE FOUNDATION
+Stage O — persistent quota tree + allocator-path enforcement     DONE FOUNDATION
+```
+
+Important limitation: the current trees are fixed-capacity root-leaf B-tree
+cores suitable for `hxfs-service` no-heap state. Multi-level split/rebalance,
+full free-space reuse, and snapshot deletion reclaim remain future production
+work.
+
+---
+
 ## 1. Целевая философия
 
 Главный принцип HuesOS storage:
@@ -662,7 +680,7 @@ L5 docs(hxfs): document recovery semantics and failure classes
 
 ---
 
-## Stage M — Production allocator, free-space persistence, and TRIM
+## Stage M — Production allocator, free-space persistence, and TRIM — FOUNDATION DONE
 
 Goal:
 
@@ -710,7 +728,7 @@ M5 test(hxfs): add allocator persistence and ENOSPC tests
 
 ---
 
-## Stage N — Refcount/backref, snapshot reclaim, and future reflinks
+## Stage N — Refcount/backref, snapshot reclaim, and future reflinks — FOUNDATION DONE
 
 Goal:
 
@@ -758,7 +776,7 @@ N5 test(hxfs): add snapshot reclaim and crash tests
 
 ---
 
-## Stage O — Persistent quotas and enforcement
+## Stage O — Persistent quotas and enforcement — FOUNDATION DONE
 
 Goal:
 
