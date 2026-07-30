@@ -45,6 +45,12 @@ pub struct RefcountBtree<const N: usize> {
     records: [Option<RefcountRecord>; N],
 }
 
+impl<const N: usize> Default for RefcountBtree<N> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl<const N: usize> RefcountBtree<N> {
     /// Create an empty refcount tree.
     pub const fn new() -> Self {
@@ -222,6 +228,12 @@ impl BackrefRecord {
 /// Fixed-capacity backref B-tree root/leaf.
 pub struct BackrefBtree<const N: usize> {
     records: [Option<BackrefRecord>; N],
+}
+
+impl<const N: usize> Default for BackrefBtree<N> {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl<const N: usize> BackrefBtree<N> {

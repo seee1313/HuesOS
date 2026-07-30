@@ -1640,6 +1640,7 @@ fn write_object_record(out: &mut [u8], offset: usize, object: ObjectDescriptor) 
     out[offset + 52..offset + 56].copy_from_slice(&object.flags.to_le_bytes());
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_checkpoint_block(
     sequence: u64,
     volume_table_lba: u64,

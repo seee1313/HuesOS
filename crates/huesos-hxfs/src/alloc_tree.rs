@@ -68,6 +68,12 @@ pub struct AllocationBtree<const N: usize> {
     records: [Option<AllocationRecord>; N],
 }
 
+impl<const N: usize> Default for AllocationBtree<N> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl<const N: usize> AllocationBtree<N> {
     /// Create an empty allocation tree.
     pub const fn new() -> Self {

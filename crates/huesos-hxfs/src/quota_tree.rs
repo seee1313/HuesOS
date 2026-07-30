@@ -56,6 +56,12 @@ pub struct QuotaBtree<const N: usize> {
     records: [Option<QuotaRecord>; N],
 }
 
+impl<const N: usize> Default for QuotaBtree<N> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl<const N: usize> QuotaBtree<N> {
     /// Create an empty quota tree.
     pub const fn new() -> Self {
