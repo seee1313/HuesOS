@@ -25,6 +25,7 @@ pub mod gpt;
 pub mod hxblob;
 pub mod hxblob_tree;
 pub mod io_policy;
+pub mod observability;
 pub mod quota;
 pub mod quota_tree;
 pub mod reader;
