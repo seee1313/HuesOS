@@ -288,7 +288,11 @@ pub fn map_resource_into_current(
     validate_resource_map_args(resource, args)?;
     let process = huesos_object::current_process().ok_or(ErrorCode::AccessDenied)?;
     let _memory_guard = process.user_memory_lock.lock();
-    let _mutation_guard = VMAR_MUTATION_LOCK.lock();
+    // Do not take VMAR_MUTATION_LOCK here: resource mapping mutates an inactive
+    // userspace page table and `try_map_user_page` reads architecture state at
+    // LockRank::ARCHITECTURE. Holding the PROCESS-ranked VMAR mutation lock
+    // across that path trips the runtime rank checker. The per-process
+    // address-space lock plus the VMAR mapping lock serialize this operation.
 
     let mut runtime_guard = process.address_space.lock();
     let runtime = runtime_guard
