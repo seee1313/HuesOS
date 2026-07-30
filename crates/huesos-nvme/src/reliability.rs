@@ -123,9 +123,15 @@ pub enum ResetState {
     /// Controller accepts normal I/O.
     Online,
     /// A command timeout was observed; new I/O should be blocked.
-    TimedOut { request_id: u64 },
+    TimedOut {
+        /// Request id that timed out.
+        request_id: u64,
+    },
     /// Reset command sequence is in progress.
-    Resetting { started_tick: u64 },
+    Resetting {
+        /// Tick at which reset started.
+        started_tick: u64,
+    },
     /// Identify/queue setup must be rerun after reset.
     Reidentify,
     /// Controller failed permanently until service restart/operator action.
@@ -176,7 +182,7 @@ impl ResetController {
     /// Poll reset completion/timeout.
     pub fn poll_reset(&mut self, now_tick: u64, hardware_ready: bool) -> ResetState {
         match self.state {
-            ResetState::Resetting { started_tick } if hardware_ready => {
+            ResetState::Resetting { started_tick: _ } if hardware_ready => {
                 self.state = ResetState::Reidentify;
             }
             ResetState::Resetting { started_tick }
@@ -203,9 +209,19 @@ pub enum MaintenanceOp {
     /// NVMe Flush command.
     Flush,
     /// NVMe Dataset Management deallocate/TRIM hint.
-    Discard { lba: u64, blocks: u32 },
+    Discard {
+        /// Starting LBA.
+        lba: u64,
+        /// Number of logical blocks.
+        blocks: u32,
+    },
     /// NVMe Write Zeroes command.
-    WriteZeroes { lba: u64, blocks: u32 },
+    WriteZeroes {
+        /// Starting LBA.
+        lba: u64,
+        /// Number of logical blocks.
+        blocks: u32,
+    },
 }
 
 /// Validate a maintenance operation against namespace support.
@@ -216,12 +232,10 @@ pub fn validate_maintenance(
 ) -> Result<(), ReliabilityError> {
     match op {
         MaintenanceOp::Flush => Ok(()),
-        MaintenanceOp::Discard { blocks, .. } if blocks == 0 => Err(ReliabilityError::Unsupported),
+        MaintenanceOp::Discard { blocks: 0, .. } => Err(ReliabilityError::Unsupported),
         MaintenanceOp::Discard { .. } if discard_supported => Ok(()),
         MaintenanceOp::Discard { .. } => Err(ReliabilityError::Unsupported),
-        MaintenanceOp::WriteZeroes { blocks, .. } if blocks == 0 => {
-            Err(ReliabilityError::Unsupported)
-        }
+        MaintenanceOp::WriteZeroes { blocks: 0, .. } => Err(ReliabilityError::Unsupported),
         MaintenanceOp::WriteZeroes { .. } if write_zeroes_supported => Ok(()),
         MaintenanceOp::WriteZeroes { .. } => Err(ReliabilityError::Unsupported),
     }
