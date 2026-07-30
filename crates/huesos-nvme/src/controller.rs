@@ -32,6 +32,14 @@ pub enum NvmeError {
     Timeout,
     /// An I/O request was malformed or the controller is not initialized.
     InvalidArgs,
+    /// Queue planning failed for the discovered CAP/CPU/interrupt inputs.
+    InvalidQueuePlan,
+    /// Identify Controller returned data that failed parser validation.
+    InvalidIdentifyController,
+    /// Identify Namespace returned data that failed parser validation.
+    InvalidIdentifyNamespace,
+    /// PRP layout for a transfer is not supported by the current bounded pool.
+    InvalidPrp,
     /// The request lies outside the identified namespace.
     OutOfRange,
     /// The caller buffer is smaller than the requested transfer.
@@ -226,7 +234,7 @@ impl<T: NvmeTransport> Controller<T> {
         }
         let bytes = (nlb as u64)
             .checked_mul(self.lba_size as u64)
-            .ok_or(NvmeError::InvalidArgs)?;
+            .ok_or(NvmeError::InvalidQueuePlan)?;
         // MDTS validation: transfer size must not exceed controller capability.
         if bytes > self.mdts as u64 {
             return Err(NvmeError::InvalidArgs);
@@ -345,8 +353,8 @@ impl<T: NvmeTransport> Controller<T> {
 
         let mut ctrl_id = [0u8; IDENTIFY_BYTES];
         self.t.dma_read(self.identify_buf, &mut ctrl_id);
-        let controller_info =
-            parse_controller(&ctrl_id, self.page_size).map_err(|_| NvmeError::InvalidArgs)?;
+        let controller_info = parse_controller(&ctrl_id, self.page_size)
+            .map_err(|_| NvmeError::InvalidIdentifyController)?;
         self.mdts = controller_info.max_request_bytes;
         self.io_data_buf_size = self.mdts as u64;
         self.io_data_buf = self.dma_alloc_zeroed(self.io_data_buf_size, ps)?;
@@ -362,7 +370,7 @@ impl<T: NvmeTransport> Controller<T> {
         let mut ns_id = [0u8; IDENTIFY_BYTES];
         self.t.dma_read(self.identify_buf, &mut ns_id);
         let namespace_info =
-            parse_namespace(self.nsid, &ns_id).map_err(|_| NvmeError::InvalidArgs)?;
+            parse_namespace(self.nsid, &ns_id).map_err(|_| NvmeError::InvalidIdentifyNamespace)?;
         self.nsze = namespace_info.block_count;
         self.lba_size = namespace_info.block_size;
 
@@ -450,7 +458,7 @@ impl<T: NvmeTransport> Controller<T> {
             // PRP-list chaining is not implemented yet; reject transfers that
             // would need more than one list page instead of programming an
             // invalid contiguous list.
-            return Err(NvmeError::InvalidArgs);
+            return Err(NvmeError::InvalidPrp);
         }
         let list = self.io_prp_list;
         let mut i = 0;

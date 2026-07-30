@@ -7,11 +7,12 @@ log="${3:-build/qemu-nvme-soak.log}"
 nvme_img="${NVME_IMG:-build/nvme-soak.img}"
 nvme_size="${NVME_IMG_SIZE:-4G}"
 ovmf="${OVMF_PATH:-third_party/ovmf/OVMF.fd}"
+nvme_layout="${QEMU_NVME_LAYOUT:-split}"
 
 mkdir -p build "$(dirname "$log")" "$(dirname "$nvme_img")"
 rm -f "$log"
 
-echo "[soak] profile=${profile} seconds=${seconds} log=${log} nvme_img=${nvme_img}"
+echo "[soak] profile=${profile} seconds=${seconds} log=${log} nvme_img=${nvme_img} layout=${nvme_layout}"
 echo "[soak] building ISO before NVMe soak"
 case "$profile" in
     release) CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-1}" make iso-release >/tmp/huesos-nvme-soak-build.log ;;
@@ -42,20 +43,39 @@ if [[ ! -f "$nvme_img" ]]; then
     fi
 fi
 
-set +e
-timeout "${seconds}s" qemu-system-x86_64 \
-    -machine q35 \
-    -cpu qemu64 \
-    -smp 2 \
-    -m 512M \
-    -bios "$ovmf" \
-    -cdrom build/huesos.iso \
-    -drive id=nvme0,if=none,format=raw,file="$nvme_img" \
-    -device nvme,serial=huesosnvme,drive=nvme0 \
-    -net none \
-    -display none \
-    -serial "file:$log" \
+qemu_common=(
+    -machine q35
+    -cpu qemu64
+    -smp 2
+    -m 512M
+    -bios "$ovmf"
+    -cdrom build/huesos.iso
+    -drive id=nvme0,if=none,format=raw,file="$nvme_img"
+    -net none
+    -display none
+    -serial "file:$log"
     -no-reboot -no-shutdown
+)
+
+qemu_nvme=()
+case "$nvme_layout" in
+    split)
+        # Modern QEMU model: create controller and namespace explicitly. This
+        # avoids booting a controller with no active namespace on hosts where
+        # the legacy `drive=` shortcut is not accepted as a namespace.
+        qemu_nvme=(-device nvme,serial=huesosnvme,id=nvme-ctrl -device nvme-ns,drive=nvme0,bus=nvme-ctrl,nsid=1)
+        ;;
+    legacy)
+        qemu_nvme=(-device nvme,serial=huesosnvme,drive=nvme0)
+        ;;
+    *)
+        echo "[soak] unsupported QEMU_NVME_LAYOUT=$nvme_layout (use split or legacy)" >&2
+        exit 2
+        ;;
+esac
+
+set +e
+timeout "${seconds}s" qemu-system-x86_64 "${qemu_common[@]}" "${qemu_nvme[@]}"
 status=$?
 set -e
 

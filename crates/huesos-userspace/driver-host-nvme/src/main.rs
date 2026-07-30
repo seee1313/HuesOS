@@ -746,6 +746,10 @@ fn nvme_error_label(error: NvmeError) -> &'static str {
         NvmeError::CommandFailed { .. } => "command-failed",
         NvmeError::Timeout => "timeout",
         NvmeError::InvalidArgs => "invalid-args",
+        NvmeError::InvalidQueuePlan => "invalid-queue-plan",
+        NvmeError::InvalidIdentifyController => "invalid-identify-controller",
+        NvmeError::InvalidIdentifyNamespace => "invalid-identify-namespace",
+        NvmeError::InvalidPrp => "invalid-prp",
         NvmeError::OutOfRange => "out-of-range",
         NvmeError::BufferTooSmall => "buffer-too-small",
     }
