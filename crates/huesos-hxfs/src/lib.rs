@@ -16,6 +16,7 @@ pub mod allocator;
 pub mod compression;
 pub mod crc32c;
 pub mod crypto;
+pub mod fixed_writer;
 pub mod format;
 pub mod hxblob;
 pub mod io_policy;
@@ -59,6 +60,14 @@ pub enum HxfsError {
     NeedsRecovery,
     /// Journal descriptor range or replay record is malformed.
     BadJournal,
+    /// Mutation requested an object that already exists.
+    AlreadyExists,
+    /// Mutation would exceed a fixed-capacity or media-space limit.
+    NoSpace,
+    /// Mutation requested removing a non-empty directory.
+    DirectoryNotEmpty,
+    /// Operation is not supported by the current fixed-capacity stage.
+    Unsupported,
 }
 
 /// Mounted read-only Hxfs instance.
@@ -401,11 +410,11 @@ impl<R: BlockReader> Hxfs<R> {
     }
 }
 
-const HEADER_BYTES: usize = 40;
-const VOLUME_RECORD_BYTES: usize = 96;
-const OBJECT_RECORD_BYTES: usize = 64;
-const DIR_RECORD_BYTES: usize = 272;
-const EXTENT_RECORD_BYTES: usize = 32;
+pub(crate) const HEADER_BYTES: usize = 40;
+pub(crate) const VOLUME_RECORD_BYTES: usize = 96;
+pub(crate) const OBJECT_RECORD_BYTES: usize = 64;
+pub(crate) const DIR_RECORD_BYTES: usize = 272;
+pub(crate) const EXTENT_RECORD_BYTES: usize = 32;
 
 pub(crate) fn read_superblock<R: BlockReader>(
     reader: &mut R,
@@ -473,7 +482,7 @@ pub(crate) fn read_superblock<R: BlockReader>(
     })
 }
 
-fn read_checkpoint<R: BlockReader>(
+pub(crate) fn read_checkpoint<R: BlockReader>(
     reader: &mut R,
     lba: u64,
     sequence_number: u64,
@@ -498,7 +507,7 @@ fn read_checkpoint<R: BlockReader>(
     })
 }
 
-fn read_system_volume<R: BlockReader>(
+pub(crate) fn read_system_volume<R: BlockReader>(
     reader: &mut R,
     checkpoint: Checkpoint,
 ) -> Result<VolumeDescriptor, HxfsError> {
@@ -548,7 +557,7 @@ pub(crate) fn validate_metadata_block(
     Ok(header)
 }
 
-fn parse_header(block: &[u8]) -> Result<BlockHeader, HxfsError> {
+pub(crate) fn parse_header(block: &[u8]) -> Result<BlockHeader, HxfsError> {
     Ok(BlockHeader {
         block_type: read_u32(block, 0)?,
         type_version: read_u16(block, 4)?,
@@ -577,7 +586,10 @@ fn parse_volume_record(block: &[u8], offset: usize) -> Result<VolumeDescriptor, 
     })
 }
 
-fn parse_object_record(block: &[u8], offset: usize) -> Result<ObjectDescriptor, HxfsError> {
+pub(crate) fn parse_object_record(
+    block: &[u8],
+    offset: usize,
+) -> Result<ObjectDescriptor, HxfsError> {
     Ok(ObjectDescriptor {
         object_id: read_u64(block, offset)?,
         object_type: read_u32(block, offset + 8)?,
@@ -592,7 +604,10 @@ fn parse_object_record(block: &[u8], offset: usize) -> Result<ObjectDescriptor, 
     })
 }
 
-fn parse_dir_record(block: &[u8], offset: usize) -> Result<DirectoryEntry<'_>, HxfsError> {
+pub(crate) fn parse_dir_record(
+    block: &[u8],
+    offset: usize,
+) -> Result<DirectoryEntry<'_>, HxfsError> {
     let object_id = read_u64(block, offset)?;
     let name_len = read_u16(block, offset + 8)? as usize;
     if name_len == 0 || name_len > MAX_NAME_BYTES {
@@ -605,7 +620,7 @@ fn parse_dir_record(block: &[u8], offset: usize) -> Result<DirectoryEntry<'_>, H
     Ok(DirectoryEntry { object_id, name })
 }
 
-fn parse_extent_record(block: &[u8], offset: usize) -> Result<ExtentRecord, HxfsError> {
+pub(crate) fn parse_extent_record(block: &[u8], offset: usize) -> Result<ExtentRecord, HxfsError> {
     let record = ExtentRecord {
         logical_block: read_u64(block, offset)?,
         physical_block: read_u64(block, offset + 8)?,
