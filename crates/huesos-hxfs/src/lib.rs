@@ -20,6 +20,7 @@ pub mod crc32c;
 pub mod crypto;
 pub mod fixed_writer;
 pub mod format;
+pub mod fsck;
 pub mod gpt;
 pub mod hxblob;
 pub mod hxblob_tree;
