@@ -31,6 +31,7 @@ pub mod reader;
 pub mod recovery;
 pub mod ref_tree;
 pub mod scrub;
+pub mod security_policy;
 pub mod volume_topology;
 #[cfg(any(test, feature = "writer"))]
 pub mod writer;
