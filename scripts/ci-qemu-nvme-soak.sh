@@ -4,16 +4,20 @@ set -euo pipefail
 profile="${1:-release}"
 seconds="${2:-300}"
 log="${3:-build/qemu-nvme-soak.log}"
+nvme_img="${NVME_IMG:-build/nvme-soak.img}"
+nvme_size="${NVME_IMG_SIZE:-4G}"
+ovmf="${OVMF_PATH:-third_party/ovmf/OVMF.fd}"
 
-mkdir -p build
+mkdir -p build "$(dirname "$log")" "$(dirname "$nvme_img")"
+rm -f "$log"
 
-echo "[soak] profile=${profile} seconds=${seconds} log=${log}"
+echo "[soak] profile=${profile} seconds=${seconds} log=${log} nvme_img=${nvme_img}"
 echo "[soak] building ISO before NVMe soak"
-if [[ "$profile" == "release" ]]; then
-    make iso-release >/tmp/huesos-nvme-soak-build.log
-else
-    make iso >/tmp/huesos-nvme-soak-build.log
-fi
+case "$profile" in
+    release) CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-1}" make iso-release >/tmp/huesos-nvme-soak-build.log ;;
+    debug) CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-1}" make iso PROFILE=debug >/tmp/huesos-nvme-soak-build.log ;;
+    *) echo "[soak] unsupported profile: $profile" >&2; exit 2 ;;
+esac
 
 # This script is a production-gate harness. It is intentionally conservative:
 # it records the command shape and validates storage markers when QEMU is
@@ -23,16 +27,50 @@ if ! command -v qemu-system-x86_64 >/dev/null 2>&1; then
     exit 0
 fi
 
-timeout "${seconds}" qemu-system-x86_64 \
-    -M q35 \
-    -m 512M \
+if [[ ! -f "$ovmf" ]]; then
+    echo "[soak] OVMF firmware missing at $ovmf" >&2
+    echo "[soak] set OVMF_PATH=/path/to/OVMF.fd if your distro uses another path" >&2
+    exit 1
+fi
+
+if [[ ! -f "$nvme_img" ]]; then
+    echo "[soak] creating NVMe raw image: $nvme_img ($nvme_size)"
+    if command -v qemu-img >/dev/null 2>&1; then
+        qemu-img create -f raw "$nvme_img" "$nvme_size" >/dev/null
+    else
+        truncate -s "$nvme_size" "$nvme_img"
+    fi
+fi
+
+set +e
+timeout "${seconds}s" qemu-system-x86_64 \
+    -machine q35 \
+    -cpu qemu64 \
     -smp 2 \
+    -m 512M \
+    -bios "$ovmf" \
     -cdrom build/huesos.iso \
+    -drive id=nvme0,if=none,format=raw,file="$nvme_img" \
     -device nvme,serial=huesosnvme,drive=nvme0 \
-    -drive id=nvme0,if=none,format=raw,file=build/nvme-soak.img \
-    -serial stdio \
+    -net none \
     -display none \
-    >"$log" 2>&1 || true
+    -serial "file:$log" \
+    -no-reboot -no-shutdown
+status=$?
+set -e
+
+# A healthy OS intentionally keeps running, so timeout(1)'s 124 is expected.
+if [[ "$status" != 0 && "$status" != 124 ]]; then
+    echo "[soak] QEMU exited unexpectedly with status $status" >&2
+    tail -200 "$log" >&2 || true
+    exit 1
+fi
+
+if grep -Fq 'KERNEL PANIC' "$log" || grep -Fq '[hxfs] PANIC' "$log"; then
+    echo "[soak] panic marker detected" >&2
+    tail -200 "$log" >&2 || true
+    exit 1
+fi
 
 required=(
     "[driver-host:nvme]"
@@ -42,6 +80,8 @@ required=(
 for marker in "${required[@]}"; do
     if ! grep -Fq "$marker" "$log"; then
         echo "[soak] missing marker: $marker" >&2
+        echo "[soak] last 200 serial lines:" >&2
+        tail -200 "$log" >&2 || true
         exit 1
     fi
 done
