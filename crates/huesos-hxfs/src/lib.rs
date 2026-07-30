@@ -1,10 +1,10 @@
-//! Hxfs read-only prototype.
+//! Hxfs parser, recovery, and host-testable mutable foundations.
 //!
-//! Stage G implements a read-only parser/reader for the design in
-//! `docs/HXFS_DESIGN.md`. It validates metadata CRC32C, parses a checkpoint,
-//! volume table, object table, directory entries, and extent tables, then reads
-//! ordinary files by ObjectId or path. It does not implement writes, COW publish,
-//! snapshots, encryption, mmap, or Hxblob.
+//! The read path validates metadata CRC32C, parses a checkpoint, volume table,
+//! object table, directory entries, and extent tables, then reads ordinary files
+//! by ObjectId or path. Format v2 adds explicit feature flags and journal replay
+//! state so a mutable userspace service can refuse unsafe mounts until recovery
+//! is performed.
 
 #![cfg_attr(not(test), no_std)]
 #![warn(missing_docs)]
@@ -21,6 +21,7 @@ pub mod hxblob;
 pub mod io_policy;
 pub mod quota;
 pub mod reader;
+pub mod recovery;
 pub mod scrub;
 #[cfg(any(test, feature = "writer"))]
 pub mod writer;
@@ -54,6 +55,10 @@ pub enum HxfsError {
     WrongType,
     /// Path bytes are not valid UTF-8.
     BadName,
+    /// Root store is in Recovering state and needs journal replay before mount.
+    NeedsRecovery,
+    /// Journal descriptor range or replay record is malformed.
+    BadJournal,
 }
 
 /// Mounted read-only Hxfs instance.
@@ -68,6 +73,12 @@ impl<R: BlockReader> Hxfs<R> {
     /// Mount a read-only Hxfs instance.
     pub fn mount(mut reader: R) -> Result<Self, HxfsError> {
         let superblock = read_superblock(&mut reader, 0)?;
+        if superblock.root_state != ROOT_STATE_CLEAN
+            || superblock.journal_start_lba != 0
+            || superblock.journal_end_lba != 0
+        {
+            return Err(HxfsError::NeedsRecovery);
+        }
         let checkpoint = read_checkpoint(
             &mut reader,
             superblock.checkpoint_lba,
@@ -396,7 +407,10 @@ const OBJECT_RECORD_BYTES: usize = 64;
 const DIR_RECORD_BYTES: usize = 272;
 const EXTENT_RECORD_BYTES: usize = 32;
 
-fn read_superblock<R: BlockReader>(reader: &mut R, lba: u64) -> Result<Superblock, HxfsError> {
+pub(crate) fn read_superblock<R: BlockReader>(
+    reader: &mut R,
+    lba: u64,
+) -> Result<Superblock, HxfsError> {
     let mut block = [0u8; BLOCK_SIZE];
     reader.read_blocks(lba, 1, &mut block)?;
     let header = validate_metadata_block(&block, lba, BLOCK_TYPE_SUPERBLOCK, 0)?;
@@ -416,11 +430,29 @@ fn read_superblock<R: BlockReader>(reader: &mut R, lba: u64) -> Result<Superbloc
     let backup_checkpoint_lba = read_u64(&block, base + 64)?;
     let journal_start_lba = read_u64(&block, base + 72)?;
     let journal_end_lba = read_u64(&block, base + 80)?;
+    let compatible_features = read_u64(&block, base + 88)?;
+    let ro_compatible_features = read_u64(&block, base + 96)?;
+    let incompatible_features = read_u64(&block, base + 104)?;
+    let root_state = read_u32(&block, base + 112)?;
+    let root_flags = read_u32(&block, base + 116)?;
     if format_version != FORMAT_VERSION
         || type_system_version != TYPE_SYSTEM_VERSION
         || block_size as usize != BLOCK_SIZE
     {
         return Err(HxfsError::UnsupportedFormat);
+    }
+    if compatible_features & !SUPPORTED_COMPAT_FEATURES != 0
+        || ro_compatible_features & !SUPPORTED_RO_COMPAT_FEATURES != 0
+        || incompatible_features & !SUPPORTED_INCOMPAT_FEATURES != 0
+        || incompatible_features & FEATURE_INCOMPAT_V2_ROOT_STORE == 0
+    {
+        return Err(HxfsError::UnsupportedFormat);
+    }
+    if !matches!(root_state, ROOT_STATE_CLEAN | ROOT_STATE_RECOVERING) || root_flags != 0 {
+        return Err(HxfsError::BadBlock);
+    }
+    if (journal_start_lba == 0) != (journal_end_lba == 0) || journal_start_lba > journal_end_lba {
+        return Err(HxfsError::BadJournal);
     }
     Ok(Superblock {
         format_guid,
@@ -433,6 +465,11 @@ fn read_superblock<R: BlockReader>(reader: &mut R, lba: u64) -> Result<Superbloc
         backup_checkpoint_lba,
         journal_start_lba,
         journal_end_lba,
+        compatible_features,
+        ro_compatible_features,
+        incompatible_features,
+        root_state,
+        root_flags,
     })
 }
 
@@ -715,7 +752,7 @@ mod tests {
 
     fn build_image(encrypted: bool) -> Vec<u8> {
         let mut image = vec![0u8; BLOCK_SIZE * 8];
-        let mut super_payload = [0u8; 96];
+        let mut super_payload = [0u8; 120];
         super_payload[0..16].copy_from_slice(&FORMAT_GUID);
         super_payload[16..20].copy_from_slice(&FORMAT_VERSION.to_le_bytes());
         super_payload[20..24].copy_from_slice(&TYPE_SYSTEM_VERSION.to_le_bytes());
@@ -723,7 +760,11 @@ mod tests {
         super_payload[40..48].copy_from_slice(&1u64.to_le_bytes());
         super_payload[48..52].copy_from_slice(&(BLOCK_SIZE as u32).to_le_bytes());
         super_payload[56..64].copy_from_slice(&1u64.to_le_bytes());
-        let superblock = make_block(BLOCK_TYPE_SUPERBLOCK, 0, 0, &super_payload[..88]);
+        super_payload[104..112].copy_from_slice(
+            &(FEATURE_INCOMPAT_V2_ROOT_STORE | FEATURE_INCOMPAT_MUTABLE_JOURNAL).to_le_bytes(),
+        );
+        super_payload[112..116].copy_from_slice(&ROOT_STATE_CLEAN.to_le_bytes());
+        let superblock = make_block(BLOCK_TYPE_SUPERBLOCK, 0, 0, &super_payload);
         image[0..BLOCK_SIZE].copy_from_slice(&superblock);
 
         let mut checkpoint_payload = [0u8; 40];

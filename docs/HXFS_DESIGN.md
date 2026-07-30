@@ -882,3 +882,68 @@ DUPLICATE
 This deliberately avoids POSIX flags and file descriptors. A future POSIX layer
 must translate into this native ABI instead of expanding Hxfs itself into a
 POSIX filesystem.
+
+---
+
+## 32. Stage L v2 root-store and journal replay contract
+
+Format v2 is the first mutable-service Hxfs format. v1 images are not accepted
+by the mutable path; unknown future incompatible features still reject mount.
+
+Root-store v2 adds:
+
+```text
+compatible_features
+ro_compatible_features
+incompatible_features
+root_state
+root_flags
+journal_start_lba
+journal_end_lba
+```
+
+Supported initial incompatible features:
+
+```text
+FEATURE_INCOMPAT_V2_ROOT_STORE
+FEATURE_INCOMPAT_MUTABLE_JOURNAL
+```
+
+Root states:
+
+```text
+Clean:
+  checkpoint_lba points at the published checkpoint
+  journal_start_lba = 0
+  journal_end_lba = 0
+
+Recovering:
+  checkpoint_lba remains the last known safe checkpoint
+  journal_start_lba..journal_end_lba points at a contiguous replay range
+  ordinary mount must return NeedsRecovery until replay succeeds
+```
+
+Journal record model:
+
+```text
+journal metadata block -> full 4 KiB data-copy block -> next record
+```
+
+Each record stores:
+
+```text
+sequence_number
+record_index
+record_count
+target_lba
+data_lba
+data_crc32c
+flags
+final_checkpoint_lba
+```
+
+Replay order is idempotent. All normal records rewrite their target LBAs first.
+The final record must have `JOURNAL_RECORD_FLAG_FINAL_SUPERBLOCK`, must target
+LBA 0, and publishes the final clean superblock last. If replay crashes before
+that final write, the filesystem remains in Recovering state and replay can run
+again.

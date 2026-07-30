@@ -703,7 +703,7 @@ fn build_checkpoint_block(
 }
 
 fn write_superblock(block: &mut [u8], instance_uuid: Uuid, sequence: u64, checkpoint_lba: u64) {
-    let mut payload = [0u8; 88];
+    let mut payload = [0u8; 120];
     payload[0..16].copy_from_slice(&FORMAT_GUID);
     payload[16..20].copy_from_slice(&FORMAT_VERSION.to_le_bytes());
     payload[20..24].copy_from_slice(&TYPE_SYSTEM_VERSION.to_le_bytes());
@@ -711,6 +711,10 @@ fn write_superblock(block: &mut [u8], instance_uuid: Uuid, sequence: u64, checkp
     payload[40..48].copy_from_slice(&sequence.to_le_bytes());
     payload[48..52].copy_from_slice(&(BLOCK_SIZE as u32).to_le_bytes());
     payload[56..64].copy_from_slice(&checkpoint_lba.to_le_bytes());
+    payload[104..112].copy_from_slice(
+        &(FEATURE_INCOMPAT_V2_ROOT_STORE | FEATURE_INCOMPAT_MUTABLE_JOURNAL).to_le_bytes(),
+    );
+    payload[112..116].copy_from_slice(&ROOT_STATE_CLEAN.to_le_bytes());
     let new_block = make_metadata_block(BLOCK_TYPE_SUPERBLOCK, 0, 0, &payload);
     block.copy_from_slice(&new_block);
 }

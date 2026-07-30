@@ -1,4 +1,4 @@
-//! Hxfs v1 on-disk constants and stable decoded records.
+//! Hxfs v2 on-disk constants and stable decoded records.
 
 /// Hxfs format GUID. Not an ASCII magic string; this is the stable format type
 /// identity used by mount validation.
@@ -6,13 +6,14 @@ pub const FORMAT_GUID: [u8; 16] = [
     0x48, 0x78, 0x66, 0x73, 0x2d, 0x48, 0x75, 0x65, 0x73, 0x4f, 0x53, 0x2d, 0x76, 0x31, 0x00, 0x01,
 ];
 
-/// Hxfs v1 linear format version.
-pub const FORMAT_VERSION: u32 = 1;
-/// Hxfs v1 metadata type-system version.
-pub const TYPE_SYSTEM_VERSION: u32 = 1;
-/// Hxfs v1 block size.
+/// Hxfs v2 linear format version. v2 is the first mutable-service format with
+/// explicit feature flags and journal replay semantics.
+pub const FORMAT_VERSION: u32 = 2;
+/// Hxfs v2 metadata type-system version.
+pub const TYPE_SYSTEM_VERSION: u32 = 2;
+/// Hxfs v2 block size.
 pub const BLOCK_SIZE: usize = 4096;
-/// Hxfs v1 block size as u64.
+/// Hxfs v2 block size as u64.
 pub const BLOCK_SIZE_U64: u64 = BLOCK_SIZE as u64;
 /// Maximum UTF-8 directory entry name length.
 pub const MAX_NAME_BYTES: usize = 255;
@@ -31,6 +32,29 @@ pub const BLOCK_TYPE_OBJECT_TABLE: u32 = 4;
 pub const BLOCK_TYPE_DIRECTORY: u32 = 5;
 /// Metadata block type: file extent table.
 pub const BLOCK_TYPE_EXTENT_TABLE: u32 = 6;
+/// Metadata block type: journal replay record.
+pub const BLOCK_TYPE_JOURNAL_RECORD: u32 = 7;
+
+/// Incompatible feature: v2 root-store state and feature flags are present.
+pub const FEATURE_INCOMPAT_V2_ROOT_STORE: u64 = 1 << 0;
+/// Incompatible feature: journal replay records may be required before mount.
+pub const FEATURE_INCOMPAT_MUTABLE_JOURNAL: u64 = 1 << 1;
+/// Incompatible features supported by this implementation.
+pub const SUPPORTED_INCOMPAT_FEATURES: u64 =
+    FEATURE_INCOMPAT_V2_ROOT_STORE | FEATURE_INCOMPAT_MUTABLE_JOURNAL;
+/// Compatible features supported by this implementation.
+pub const SUPPORTED_COMPAT_FEATURES: u64 = 0;
+/// Read-only-compatible features supported by this implementation.
+pub const SUPPORTED_RO_COMPAT_FEATURES: u64 = 0;
+
+/// Root-store state: clean checkpoint, no journal replay required.
+pub const ROOT_STATE_CLEAN: u32 = 1;
+/// Root-store state: valid checkpoint plus journal range that must be replayed.
+pub const ROOT_STATE_RECOVERING: u32 = 2;
+
+/// Journal record flag: replay this record last to publish the final clean
+/// superblock/root-store block.
+pub const JOURNAL_RECORD_FLAG_FINAL_SUPERBLOCK: u32 = 1 << 0;
 
 /// Object type: regular file.
 pub const OBJECT_TYPE_FILE: u32 = 1;
@@ -100,8 +124,39 @@ pub struct Superblock {
     pub backup_checkpoint_lba: u64,
     /// Journal start LBA (`0` means clean/no replay needed for Stage G).
     pub journal_start_lba: u64,
-    /// Journal end LBA.
+    /// Journal end LBA, exclusive.
     pub journal_end_lba: u64,
+    /// Compatible feature bits.
+    pub compatible_features: u64,
+    /// Read-only-compatible feature bits.
+    pub ro_compatible_features: u64,
+    /// Incompatible feature bits.
+    pub incompatible_features: u64,
+    /// Root-store state, one of [`ROOT_STATE_CLEAN`] or [`ROOT_STATE_RECOVERING`].
+    pub root_state: u32,
+    /// Reserved root-store flags. Must be zero until defined.
+    pub root_flags: u32,
+}
+
+/// Decoded journal replay record.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct JournalRecord {
+    /// Transaction sequence number.
+    pub sequence_number: u64,
+    /// Zero-based record index.
+    pub record_index: u32,
+    /// Total records in this journal range.
+    pub record_count: u32,
+    /// LBA to rewrite during replay.
+    pub target_lba: u64,
+    /// LBA of the full 4 KiB data-copy block.
+    pub data_lba: u64,
+    /// CRC32C over the full 4 KiB data-copy block.
+    pub data_crc32c: u32,
+    /// Journal record flags.
+    pub flags: u32,
+    /// Checkpoint LBA that will be published by the final clean superblock.
+    pub final_checkpoint_lba: u64,
 }
 
 /// Decoded checkpoint record.
