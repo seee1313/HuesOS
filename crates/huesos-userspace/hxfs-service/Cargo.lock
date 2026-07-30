@@ -13,6 +13,9 @@ version = "0.1.0"
 [[package]]
 name = "huesos-hxfs"
 version = "0.1.0"
+dependencies = [
+ "huesos-abi",
+]
 
 [[package]]
 name = "huesos-hxfs-service"
