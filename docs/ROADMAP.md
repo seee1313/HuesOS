@@ -5,6 +5,11 @@ scheduler → ring3 → syscalls → VMO/Channel IPC) is working and verified in
 QEMU (`-smp 1` and `-smp 2`). This roadmap covers what's next, roughly in
 priority order.
 
+Storage/NVMe/Hxfs production planning is tracked in the dedicated
+[Storage / NVMe / FS Roadmap](STORAGE_NVME_FS_ROADMAP.md). The current storage
+state is a strong foundation through Hxfs Stage I, not yet full production
+mutable Hxfs.
+
 ## Done (recent)
 
 ### Type-enforced `IrqSafeMutex` for all of `huesos-object`, replacing the ad-hoc `IrqGuard` fix
