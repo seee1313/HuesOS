@@ -808,3 +808,77 @@ Recommended commits:
 
 No write path, snapshots, encryption execution, Hxblob implementation, or mmap
 coherency should be added in Stage G code without another design review.
+
+---
+
+## 31. Stage J production write-service contract
+
+Stage J freezes the native Hxfs service contract before `hxfs-service` is
+allowed to mutate persistent media.
+
+Canonical ABI location:
+
+```text
+crates/huesos-abi/src/hxfs.rs
+```
+
+Rules:
+
+- the ABI is handle-first;
+- paths are resolver payloads only;
+- requests use fixed little-endian headers plus optional inline payload bytes;
+- Hxfs handle ids are service-local runtime capabilities, never persisted;
+- all public ABI extensions must be versioned or append-only;
+- write durability is explicit: buffered mutations become durable only after
+  `Fsync` / `Checkpoint` according to the handle and volume operation used;
+- `hxfs-service` must reject mutation if the mounted volume needs journal replay
+  or fsck.
+
+The initial operation set is:
+
+```text
+GetInfo
+OpenRoot
+OpenPath
+CreateFile
+Mkdir
+Symlink
+Rename
+Unlink
+Truncate
+WriteAt
+Fsync
+Checkpoint
+CreateSnapshot
+DeleteSnapshot
+ReadAt
+ListDirectory
+```
+
+The initial handle kinds are:
+
+```text
+None
+Volume
+Directory
+File
+Snapshot
+BlobView
+```
+
+The initial rights are:
+
+```text
+READ
+WRITE
+CREATE
+MODIFY_DIRECTORY
+SYNC
+SNAPSHOT
+TRANSFER
+DUPLICATE
+```
+
+This deliberately avoids POSIX flags and file descriptors. A future POSIX layer
+must translate into this native ABI instead of expanding Hxfs itself into a
+POSIX filesystem.

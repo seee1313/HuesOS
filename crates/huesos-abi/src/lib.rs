@@ -24,6 +24,9 @@ pub mod block;
 /// VolumeManager wire protocol.
 pub mod volume;
 
+/// Native Hxfs handle-first service wire protocol.
+pub mod hxfs;
+
 /// Immutable ACPI table-archive decoding and physical-address index.
 ///
 /// Used by both the kernel archive builder and the Ring-3 `acpi-manager` to
