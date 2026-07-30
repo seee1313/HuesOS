@@ -14,6 +14,7 @@ extern crate alloc;
 
 pub mod alloc_tree;
 pub mod allocator;
+pub mod cache_policy;
 pub mod compression;
 pub mod crc32c;
 pub mod crypto;
