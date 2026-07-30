@@ -49,6 +49,23 @@ target QEMU/NVMe and bare-metal validation
 
 ---
 
+### 0.1 Follow-up implementation status — J/K/L
+
+After the original Stage I roadmap update, the first production-mutable slice was implemented:
+
+```text
+Stage J — canonical Hxfs service ABI in huesos-abi             DONE
+Stage L — Hxfs v2 root-store feature flags + journal replay    DONE FOUNDATION
+Stage K — BlockStore-backed journaled mutable writer foundation DONE FOUNDATION
+```
+
+Important limitation: arbitrary on-target write requests are still not enabled in
+`hxfs-service`; the service now replays v2 journals before mount, while the
+write-capable service request dispatcher still needs an approved no-heap or
+userspace-allocator state model.
+
+---
+
 ## 1. Целевая философия
 
 Главный принцип HuesOS storage:
@@ -477,7 +494,7 @@ The stages below are the remaining roadmap to final production storage/FS. They 
 
 ---
 
-## Stage J — Production contract freeze before real disk mutation
+## Stage J — Production contract freeze before real disk mutation — DONE
 
 Goal:
 
@@ -538,7 +555,7 @@ J4 test(hxfs): add format/ABI compatibility tests
 
 ---
 
-## Stage K — Persistent mutable `hxfs-service` over BlockDevice
+## Stage K — Persistent mutable `hxfs-service` over BlockDevice — FOUNDATION DONE
 
 Goal:
 
@@ -592,7 +609,7 @@ K7 docs(hxfs): record mutable service safety boundary
 
 ---
 
-## Stage L — Journal replay, recovery, and root-store validation
+## Stage L — Journal replay, recovery, and root-store validation — FOUNDATION DONE
 
 Goal:
 
