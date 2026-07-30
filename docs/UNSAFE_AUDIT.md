@@ -13,8 +13,8 @@ are intentionally not treated as the versioned project baseline unless they are
 copied into `docs/` in a dedicated review. The versioned baseline remains this
 file plus `safety-budget.json`.
 
-At the current baseline (`safety-budget.json`) the repository contains 186
-first-party Rust files and 53,339 Rust lines. The measured surface is **265**
+At the current baseline (`safety-budget.json`) the repository contains 193
+first-party Rust files and 54,388 Rust lines. The measured surface is **265**
 unsafe blocks, **63** unsafe functions, **29** unsafe impls, one `static mut`,
 **25** unwrap calls, **21** expect calls, and **5** panic macros. Prior baseline
 values are retained in the changelog sections below so that any deviation
@@ -2364,6 +2364,32 @@ Stage H until the AES-XTS key/policy layer is implemented.
 No unsafe Rust is introduced. The writer uses safe `alloc` containers and the
 existing read-only parser to verify committed images and snapshot views in host
 tests.
+
+### Safety-budget delta (measured)
+
+```
+unsafe_blocks:    265 -> 265 (unchanged).
+unsafe_functions:  63 ->  63 (unchanged).
+unsafe_impls:      29 ->  29 (unchanged).
+static_mut:         1 ->   1 (unchanged).
+unwrap_calls:      25 ->  25 (unchanged).
+expect_calls:      21 ->  21 (unchanged).
+panic_macros:       5 ->   5 (unchanged).
+```
+
+## Hxfs Stage-I advanced policy modules (safety-budget-neutral)
+
+Stage I adds host-testable advanced Hxfs policy modules: per-zone hybrid
+allocation with pending TRIM tracking, per-volume quota accounting, AES-XTS
+crypto/key wrapping descriptors and hardware/software backend selection,
+compression policy descriptors, Hxblob hash-to-object indexing and Merkle
+planning, NVMe/SSD read-ahead/direct-I/O/write-hint planning, and scrub report
+helpers. These modules are policy/metadata models only; production crypto,
+compression engines, persistent free-space trees, and repair tools remain
+separate implementation layers.
+
+No unsafe Rust is introduced. All code is safe `no_std` policy logic with host
+unit tests and no filesystem-specific kernel changes.
 
 ### Safety-budget delta (measured)
 

@@ -12,9 +12,16 @@
 #[cfg(any(test, feature = "writer"))]
 extern crate alloc;
 
+pub mod allocator;
+pub mod compression;
 pub mod crc32c;
+pub mod crypto;
 pub mod format;
+pub mod hxblob;
+pub mod io_policy;
+pub mod quota;
 pub mod reader;
+pub mod scrub;
 #[cfg(any(test, feature = "writer"))]
 pub mod writer;
 
@@ -482,7 +489,7 @@ fn read_system_volume<R: BlockReader>(
     Err(HxfsError::NotFound)
 }
 
-fn validate_metadata_block(
+pub(crate) fn validate_metadata_block(
     block: &[u8; BLOCK_SIZE],
     expected_lba: u64,
     expected_type: u32,

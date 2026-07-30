@@ -469,13 +469,21 @@ next-stage expansion items; they are not blockers for the Immediate milestone.
   implements append-only COW mutation over Hxfs images with mkdir, create,
   path-level symlink, overwrite, truncate/sparse extension, rename, unlink,
   checkpoint commit, and read-only snapshot create/delete/open in host tests.
-  Encrypted volumes are still rejected until the AES-XTS policy/key layer lands.
-- **Needed**: on-target NVMe/SSD data-path soak and then Hxfs write service
-  persistence over BlockDevice. A future performance slice can replace the
-  current synchronous service execution with deeper async queue-slot tracking,
-  but Stage C's public Channel+Port service contract, Stage D's Volume handles,
-  Stage E's BlobFS read path, Stage F's DevFS handle namespace, Stage G's Hxfs
-  read-only service path, and Stage H's host-tested COW writer are now present.
+- **Hxfs Stage-I advanced policy modules landed**: `allocator`, `quota`,
+  `crypto`, `compression`, `hxblob`, `io_policy`, and `scrub` cover the advanced
+  features discussed: 16 GiB NVMe/SSD allocation zones, pending TRIM, physical
+  byte/object quotas, AES-XTS key wrapping descriptors and hardware/software
+  backend selection, compression policy validation, Hxblob hash→ObjectId indexing
+  and Merkle planning, async parallel read-ahead/direct-I/O/write hints, and
+  online scrub reporting. Encrypted volumes are still rejected by runtime mount
+  paths until the actual AES-XTS key/crypto engines land.
+- **Needed**: on-target NVMe/SSD data-path soak, then persistent Hxfs write
+  service over BlockDevice plus production crypto/compression engines. A future
+  performance slice can replace the current synchronous service execution with
+  deeper async queue-slot tracking, but Stage C's public Channel+Port service
+  contract, Stage D's Volume handles, Stage E's BlobFS read path, Stage F's DevFS
+  handle namespace, Stage G's Hxfs read-only service path, Stage H's host-tested
+  COW writer, and Stage I's advanced policy models are now present.
 - **PS/2 driver ownership (fully migrated as of PR-E)**: the scancode
   decoder, shift-state machine, and key-event dispatch live only in the
   userspace `driver-host:input` process. The kernel keeps a
