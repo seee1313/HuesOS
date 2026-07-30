@@ -24,6 +24,7 @@ pub mod io_policy;
 pub mod quota;
 pub mod reader;
 pub mod recovery;
+pub mod ref_tree;
 pub mod scrub;
 #[cfg(any(test, feature = "writer"))]
 pub mod writer;
