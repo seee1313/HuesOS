@@ -1033,7 +1033,7 @@ fn build_checkpoint_block(
     volume_uuid: Uuid,
     lba: u64,
 ) -> Result<[u8; BLOCK_SIZE], HxfsWriteError> {
-    let mut payload = [0u8; 40];
+    let mut payload = [0u8; 72];
     payload[0..8].copy_from_slice(&sequence.to_le_bytes());
     payload[8..16].copy_from_slice(&volume_table_lba.to_le_bytes());
     payload[16..20].copy_from_slice(&1u32.to_le_bytes());
@@ -1110,9 +1110,7 @@ fn write_superblock_state(
     payload[56..64].copy_from_slice(&checkpoint_lba.to_le_bytes());
     payload[72..80].copy_from_slice(&journal_start_lba.to_le_bytes());
     payload[80..88].copy_from_slice(&journal_end_lba.to_le_bytes());
-    payload[104..112].copy_from_slice(
-        &(FEATURE_INCOMPAT_V2_ROOT_STORE | FEATURE_INCOMPAT_MUTABLE_JOURNAL).to_le_bytes(),
-    );
+    payload[104..112].copy_from_slice(&BASE_INCOMPAT_FEATURES.to_le_bytes());
     payload[112..116].copy_from_slice(&root_state.to_le_bytes());
     let new_block = make_metadata_block(BLOCK_TYPE_SUPERBLOCK, 0, 0, &payload);
     block.copy_from_slice(&new_block);

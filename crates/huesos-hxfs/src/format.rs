@@ -1,4 +1,4 @@
-//! Hxfs v2 on-disk constants and stable decoded records.
+//! Hxfs v3 on-disk constants and stable decoded records.
 
 /// Hxfs format GUID. Not an ASCII magic string; this is the stable format type
 /// identity used by mount validation.
@@ -6,14 +6,14 @@ pub const FORMAT_GUID: [u8; 16] = [
     0x48, 0x78, 0x66, 0x73, 0x2d, 0x48, 0x75, 0x65, 0x73, 0x4f, 0x53, 0x2d, 0x76, 0x31, 0x00, 0x01,
 ];
 
-/// Hxfs v2 linear format version. v2 is the first mutable-service format with
-/// explicit feature flags and journal replay semantics.
-pub const FORMAT_VERSION: u32 = 2;
-/// Hxfs v2 metadata type-system version.
-pub const TYPE_SYSTEM_VERSION: u32 = 2;
-/// Hxfs v2 block size.
+/// Hxfs v3 linear format version. v3 adds persistent allocation, refcount,
+/// backref, and quota tree roots to the checkpoint.
+pub const FORMAT_VERSION: u32 = 3;
+/// Hxfs v3 metadata type-system version.
+pub const TYPE_SYSTEM_VERSION: u32 = 3;
+/// Hxfs v3 block size.
 pub const BLOCK_SIZE: usize = 4096;
-/// Hxfs v2 block size as u64.
+/// Hxfs v3 block size as u64.
 pub const BLOCK_SIZE_U64: u64 = BLOCK_SIZE as u64;
 /// Maximum UTF-8 directory entry name length.
 pub const MAX_NAME_BYTES: usize = 255;
@@ -34,14 +34,30 @@ pub const BLOCK_TYPE_DIRECTORY: u32 = 5;
 pub const BLOCK_TYPE_EXTENT_TABLE: u32 = 6;
 /// Metadata block type: journal replay record.
 pub const BLOCK_TYPE_JOURNAL_RECORD: u32 = 7;
+/// Metadata block type: persistent allocation tree root.
+pub const BLOCK_TYPE_ALLOCATION_TREE: u32 = 8;
+/// Metadata block type: persistent refcount tree root.
+pub const BLOCK_TYPE_REFCOUNT_TREE: u32 = 9;
+/// Metadata block type: persistent backref tree root.
+pub const BLOCK_TYPE_BACKREF_TREE: u32 = 10;
+/// Metadata block type: persistent quota tree root.
+pub const BLOCK_TYPE_QUOTA_TREE: u32 = 11;
 
 /// Incompatible feature: v2 root-store state and feature flags are present.
 pub const FEATURE_INCOMPAT_V2_ROOT_STORE: u64 = 1 << 0;
 /// Incompatible feature: journal replay records may be required before mount.
 pub const FEATURE_INCOMPAT_MUTABLE_JOURNAL: u64 = 1 << 1;
+/// Incompatible feature: v3 persistent storage policy tree roots are present.
+pub const FEATURE_INCOMPAT_V3_STORAGE_TREES: u64 = 1 << 2;
+/// Incompatible feature: allocator charges enforce persistent quota records.
+pub const FEATURE_INCOMPAT_QUOTA_ENFORCEMENT: u64 = 1 << 3;
+/// Incompatible features required for a normal v3 mutable Hxfs image.
+pub const BASE_INCOMPAT_FEATURES: u64 = FEATURE_INCOMPAT_V2_ROOT_STORE
+    | FEATURE_INCOMPAT_MUTABLE_JOURNAL
+    | FEATURE_INCOMPAT_V3_STORAGE_TREES;
 /// Incompatible features supported by this implementation.
 pub const SUPPORTED_INCOMPAT_FEATURES: u64 =
-    FEATURE_INCOMPAT_V2_ROOT_STORE | FEATURE_INCOMPAT_MUTABLE_JOURNAL;
+    BASE_INCOMPAT_FEATURES | FEATURE_INCOMPAT_QUOTA_ENFORCEMENT;
 /// Compatible features supported by this implementation.
 pub const SUPPORTED_COMPAT_FEATURES: u64 = 0;
 /// Read-only-compatible features supported by this implementation.
@@ -170,6 +186,14 @@ pub struct Checkpoint {
     pub volume_count: u32,
     /// Boot/system volume UUID found by boot metadata.
     pub system_volume_uuid: Uuid,
+    /// Allocation tree root LBA, or zero if absent.
+    pub allocation_tree_lba: u64,
+    /// Refcount tree root LBA, or zero if absent.
+    pub refcount_tree_lba: u64,
+    /// Backref tree root LBA, or zero if absent.
+    pub backref_tree_lba: u64,
+    /// Quota tree root LBA, or zero if absent.
+    pub quota_tree_lba: u64,
 }
 
 /// Decoded volume descriptor.

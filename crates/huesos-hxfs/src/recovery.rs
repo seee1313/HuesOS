@@ -230,9 +230,7 @@ mod tests {
         payload[56..64].copy_from_slice(&checkpoint_lba.to_le_bytes());
         payload[72..80].copy_from_slice(&journal_start.to_le_bytes());
         payload[80..88].copy_from_slice(&journal_end.to_le_bytes());
-        payload[104..112].copy_from_slice(
-            &(FEATURE_INCOMPAT_V2_ROOT_STORE | FEATURE_INCOMPAT_MUTABLE_JOURNAL).to_le_bytes(),
-        );
+        payload[104..112].copy_from_slice(&BASE_INCOMPAT_FEATURES.to_le_bytes());
         payload[112..116].copy_from_slice(&state.to_le_bytes());
         make_block(BLOCK_TYPE_SUPERBLOCK, 0, &payload)
     }

@@ -12,6 +12,7 @@
 #[cfg(any(test, feature = "writer"))]
 extern crate alloc;
 
+pub mod alloc_tree;
 pub mod allocator;
 pub mod compression;
 pub mod crc32c;
@@ -453,7 +454,7 @@ pub(crate) fn read_superblock<R: BlockReader>(
     if compatible_features & !SUPPORTED_COMPAT_FEATURES != 0
         || ro_compatible_features & !SUPPORTED_RO_COMPAT_FEATURES != 0
         || incompatible_features & !SUPPORTED_INCOMPAT_FEATURES != 0
-        || incompatible_features & FEATURE_INCOMPAT_V2_ROOT_STORE == 0
+        || incompatible_features & BASE_INCOMPAT_FEATURES != BASE_INCOMPAT_FEATURES
     {
         return Err(HxfsError::UnsupportedFormat);
     }
@@ -499,11 +500,19 @@ pub(crate) fn read_checkpoint<R: BlockReader>(
     let volume_count = read_u32(&block, base + 16)?;
     let mut system_volume_uuid = [0u8; 16];
     system_volume_uuid.copy_from_slice(block.get(base + 24..base + 40).ok_or(HxfsError::BadBlock)?);
+    let allocation_tree_lba = read_u64(&block, base + 40)?;
+    let refcount_tree_lba = read_u64(&block, base + 48)?;
+    let backref_tree_lba = read_u64(&block, base + 56)?;
+    let quota_tree_lba = read_u64(&block, base + 64)?;
     Ok(Checkpoint {
         sequence_number: checkpoint_sequence,
         volume_table_lba,
         volume_count,
         system_volume_uuid,
+        allocation_tree_lba,
+        refcount_tree_lba,
+        backref_tree_lba,
+        quota_tree_lba,
     })
 }
 
@@ -775,14 +784,12 @@ mod tests {
         super_payload[40..48].copy_from_slice(&1u64.to_le_bytes());
         super_payload[48..52].copy_from_slice(&(BLOCK_SIZE as u32).to_le_bytes());
         super_payload[56..64].copy_from_slice(&1u64.to_le_bytes());
-        super_payload[104..112].copy_from_slice(
-            &(FEATURE_INCOMPAT_V2_ROOT_STORE | FEATURE_INCOMPAT_MUTABLE_JOURNAL).to_le_bytes(),
-        );
+        super_payload[104..112].copy_from_slice(&BASE_INCOMPAT_FEATURES.to_le_bytes());
         super_payload[112..116].copy_from_slice(&ROOT_STATE_CLEAN.to_le_bytes());
         let superblock = make_block(BLOCK_TYPE_SUPERBLOCK, 0, 0, &super_payload);
         image[0..BLOCK_SIZE].copy_from_slice(&superblock);
 
-        let mut checkpoint_payload = [0u8; 40];
+        let mut checkpoint_payload = [0u8; 72];
         checkpoint_payload[0..8].copy_from_slice(&1u64.to_le_bytes());
         checkpoint_payload[8..16].copy_from_slice(&2u64.to_le_bytes());
         checkpoint_payload[16..20].copy_from_slice(&1u32.to_le_bytes());

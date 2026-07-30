@@ -5,6 +5,7 @@
 //! handle-first mutations without allocation, and publishes changes through the
 //! v2 journal/root-store protocol.
 
+use crate::alloc_tree::{AllocationBtree, AllocationRecord, AllocationState};
 use crate::crc32c::{crc32c, metadata_crc32c};
 use crate::format::*;
 use crate::recovery::BlockStore;
@@ -484,7 +485,7 @@ impl<
         let old_checkpoint_lba = self.superblock.checkpoint_lba;
         let sequence = self.superblock.sequence_number.saturating_add(1).max(1);
         let live_objects = self.live_object_count();
-        let target_count = live_objects.checked_add(3).ok_or(HxfsError::NoSpace)?;
+        let target_count = live_objects.checked_add(4).ok_or(HxfsError::NoSpace)?;
         if target_count == 0 {
             return Err(HxfsError::NoSpace);
         }
@@ -492,7 +493,11 @@ impl<
         let target_start_lba = self.next_lba;
         let object_table_lba = target_start_lba + live_objects as u64;
         let volume_table_lba = object_table_lba + 1;
-        let checkpoint_lba = volume_table_lba + 1;
+        let allocation_tree_lba = volume_table_lba + 1;
+        let refcount_tree_lba = 0;
+        let backref_tree_lba = 0;
+        let quota_tree_lba = 0;
+        let checkpoint_lba = allocation_tree_lba + 1;
         let journal_start_lba = checkpoint_lba + 1;
         let journal_end_lba = journal_start_lba + u64::from(record_count) * 2;
         let mut plans = [const { None }; MAX_OBJECTS];
@@ -550,10 +555,27 @@ impl<
         )?;
         record_index += 1;
 
+        let allocation_block = self.build_allocation_tree_block(allocation_tree_lba)?;
+        self.write_journaled_target(
+            allocation_tree_lba,
+            &allocation_block,
+            sequence,
+            record_index,
+            record_count,
+            journal_start_lba,
+            checkpoint_lba,
+            0,
+        )?;
+        record_index += 1;
+
         let checkpoint_block = build_checkpoint_block(
             sequence,
             volume_table_lba,
             self.system_volume.uuid,
+            allocation_tree_lba,
+            refcount_tree_lba,
+            backref_tree_lba,
+            quota_tree_lba,
             checkpoint_lba,
         );
         self.write_journaled_target(
@@ -1194,6 +1216,53 @@ impl<
         ))
     }
 
+    fn build_allocation_tree_block(&self, lba: u64) -> FixedResult<[u8; BLOCK_SIZE]> {
+        let mut tree = AllocationBtree::<MAX_EXTENTS>::new();
+        let mut index = 0usize;
+        while index < self.extents.len() {
+            if let Some(extent) = self.extents[index] {
+                if extent.extent.flags & EXTENT_FLAG_HOLE == 0 {
+                    tree.insert(AllocationRecord {
+                        start_block: extent.extent.physical_block,
+                        block_count: u64::from(extent.extent.block_count),
+                        state: AllocationState::Allocated,
+                        owner_object_id: extent.object_id,
+                    })
+                    .map_err(|_| HxfsError::BadTree)?;
+                }
+            }
+            index += 1;
+        }
+        tree.validate().map_err(|_| HxfsError::BadTree)?;
+        let mut payload = [0u8; BLOCK_SIZE - HEADER_BYTES];
+        let count = tree.record_count();
+        payload[0..4].copy_from_slice(&(count as u32).to_le_bytes());
+        let mut written = 0usize;
+        index = 0;
+        while index < tree.records().len() {
+            if let Some(record) = tree.records()[index] {
+                let offset = 16 + written * 32;
+                if offset + 32 > payload.len() {
+                    return Err(HxfsError::NoSpace);
+                }
+                payload[offset..offset + 8].copy_from_slice(&record.start_block.to_le_bytes());
+                payload[offset + 8..offset + 16].copy_from_slice(&record.block_count.to_le_bytes());
+                payload[offset + 16..offset + 20]
+                    .copy_from_slice(&(record.state as u32).to_le_bytes());
+                payload[offset + 24..offset + 32]
+                    .copy_from_slice(&record.owner_object_id.to_le_bytes());
+                written += 1;
+            }
+            index += 1;
+        }
+        Ok(make_metadata_block(
+            BLOCK_TYPE_ALLOCATION_TREE,
+            self.system_volume.root_object_id,
+            lba,
+            &payload[..16 + written * 32],
+        ))
+    }
+
     fn build_volume_table_block(
         &self,
         object_table_lba: u64,
@@ -1336,13 +1405,21 @@ fn build_checkpoint_block(
     sequence: u64,
     volume_table_lba: u64,
     volume_uuid: Uuid,
+    allocation_tree_lba: u64,
+    refcount_tree_lba: u64,
+    backref_tree_lba: u64,
+    quota_tree_lba: u64,
     lba: u64,
 ) -> [u8; BLOCK_SIZE] {
-    let mut payload = [0u8; 40];
+    let mut payload = [0u8; 72];
     payload[0..8].copy_from_slice(&sequence.to_le_bytes());
     payload[8..16].copy_from_slice(&volume_table_lba.to_le_bytes());
     payload[16..20].copy_from_slice(&1u32.to_le_bytes());
     payload[24..40].copy_from_slice(&volume_uuid);
+    payload[40..48].copy_from_slice(&allocation_tree_lba.to_le_bytes());
+    payload[48..56].copy_from_slice(&refcount_tree_lba.to_le_bytes());
+    payload[56..64].copy_from_slice(&backref_tree_lba.to_le_bytes());
+    payload[64..72].copy_from_slice(&quota_tree_lba.to_le_bytes());
     make_metadata_block(BLOCK_TYPE_CHECKPOINT, 0, lba, &payload)
 }
 
@@ -1388,9 +1465,7 @@ fn make_superblock_block(
     payload[56..64].copy_from_slice(&checkpoint_lba.to_le_bytes());
     payload[72..80].copy_from_slice(&journal_start_lba.to_le_bytes());
     payload[80..88].copy_from_slice(&journal_end_lba.to_le_bytes());
-    payload[104..112].copy_from_slice(
-        &(FEATURE_INCOMPAT_V2_ROOT_STORE | FEATURE_INCOMPAT_MUTABLE_JOURNAL).to_le_bytes(),
-    );
+    payload[104..112].copy_from_slice(&BASE_INCOMPAT_FEATURES.to_le_bytes());
     payload[112..116].copy_from_slice(&root_state.to_le_bytes());
     make_metadata_block(BLOCK_TYPE_SUPERBLOCK, 0, 0, &payload)
 }
