@@ -89,8 +89,10 @@ pub fn parse_namespace(nsid: u32, data: &[u8]) -> Result<NamespaceInfo, Identify
         return Err(IdentifyError::InvalidLbaFormat);
     }
     let lbaf_offset = 128 + lbaf_index * 4;
+    // NVMe LBAF entry layout: MS[0..2], LBADS[2], RP[3].
+    // Reading byte 3 here accidentally reads relative performance.
     let lbads = *data
-        .get(lbaf_offset + 3)
+        .get(lbaf_offset + 2)
         .ok_or(IdentifyError::BufferTooSmall)?;
     if !(9..=16).contains(&lbads) {
         return Err(IdentifyError::UnsupportedLbaSize);
@@ -163,7 +165,7 @@ mod tests {
         let mut data = [0u8; IDENTIFY_BYTES];
         data[0..8].copy_from_slice(&4096u64.to_le_bytes());
         data[26] = 1;
-        data[128 + 4 + 3] = 12; // LBAF1: 4096-byte blocks
+        data[128 + 4 + 2] = 12; // LBAF1.LBADS: 4096-byte blocks
         assert_eq!(
             parse_namespace(7, &data),
             Ok(NamespaceInfo {
@@ -182,7 +184,7 @@ mod tests {
             Err(IdentifyError::EmptyNamespace)
         );
         data[0..8].copy_from_slice(&1u64.to_le_bytes());
-        data[128 + 3] = 8;
+        data[128 + 2] = 8;
         assert_eq!(
             parse_namespace(1, &data),
             Err(IdentifyError::UnsupportedLbaSize)

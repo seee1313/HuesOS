@@ -202,11 +202,11 @@ impl MockNvme {
                 data[77] = self.mdts_raw;
             }
             identify::NAMESPACE => {
-                // NSZE (bytes 7:0), NCAP (15:8), LBAF0 LBADS at byte 26.
+                // NSZE (bytes 7:0), NCAP (15:8), LBAF0 descriptor at 128.
                 data[0..8].copy_from_slice(&self.nsze.to_le_bytes());
                 data[8..16].copy_from_slice(&self.nsze.to_le_bytes());
-                // LBAF0: LBADS is byte 3 within the LBAF entry at offset 128.
-                data[128 + 3] = self.lba_shift as u8;
+                // NVMe LBAF entry layout: MS[0..2], LBADS[2], RP[3].
+                data[128 + 2] = self.lba_shift as u8;
             }
             _ => {}
         }
