@@ -22,6 +22,7 @@ pub mod format;
 pub mod hxblob;
 pub mod io_policy;
 pub mod quota;
+pub mod quota_tree;
 pub mod reader;
 pub mod recovery;
 pub mod ref_tree;

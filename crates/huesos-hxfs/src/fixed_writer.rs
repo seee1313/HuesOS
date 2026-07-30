@@ -8,6 +8,7 @@
 use crate::alloc_tree::{AllocationBtree, AllocationRecord, AllocationState};
 use crate::crc32c::{crc32c, metadata_crc32c};
 use crate::format::*;
+use crate::quota_tree::{QuotaBtree, QuotaRecord};
 use crate::recovery::BlockStore;
 use crate::ref_tree::{BackrefBtree, BackrefKind, BackrefRecord, RefcountBtree, RefcountRecord};
 use crate::{
@@ -143,6 +144,22 @@ impl<
     /// Whether dirty mutable state is waiting for an explicit checkpoint.
     pub const fn is_dirty(&self) -> bool {
         self.dirty
+    }
+
+    /// Current append-only media bytes charged by the fixed writer.
+    pub fn charged_physical_bytes(&self) -> FixedResult<u64> {
+        self.next_lba
+            .checked_mul(BLOCK_SIZE_U64)
+            .ok_or(HxfsError::OutOfRange)
+    }
+
+    /// Set per-volume quota limits for future allocator/object charges.
+    pub fn set_quota_limits(&mut self, physical_bytes: u64, objects: u64) -> FixedResult<()> {
+        self.system_volume.quota_physical_bytes = physical_bytes;
+        self.system_volume.quota_objects = objects;
+        self.quota_admits(0, 0)?;
+        self.dirty = true;
+        Ok(())
     }
 
     /// Root directory handle.
@@ -292,6 +309,7 @@ impl<
         name: &str,
     ) -> FixedResult<DirectoryHandle> {
         self.ensure_directory(parent.object_id)?;
+        self.quota_admits(0, 1)?;
         if self.lookup_child(parent.object_id, name.as_bytes()).is_ok() {
             return Err(HxfsError::AlreadyExists);
         }
@@ -327,6 +345,7 @@ impl<
         name: &str,
     ) -> FixedResult<FileHandle> {
         self.ensure_directory(parent.object_id)?;
+        self.quota_admits(0, 1)?;
         if self.lookup_child(parent.object_id, name.as_bytes()).is_ok() {
             return Err(HxfsError::AlreadyExists);
         }
@@ -486,7 +505,7 @@ impl<
         let old_checkpoint_lba = self.superblock.checkpoint_lba;
         let sequence = self.superblock.sequence_number.saturating_add(1).max(1);
         let live_objects = self.live_object_count();
-        let target_count = live_objects.checked_add(6).ok_or(HxfsError::NoSpace)?;
+        let target_count = live_objects.checked_add(7).ok_or(HxfsError::NoSpace)?;
         if target_count == 0 {
             return Err(HxfsError::NoSpace);
         }
@@ -497,10 +516,11 @@ impl<
         let allocation_tree_lba = volume_table_lba + 1;
         let refcount_tree_lba = allocation_tree_lba + 1;
         let backref_tree_lba = refcount_tree_lba + 1;
-        let quota_tree_lba = 0;
-        let checkpoint_lba = backref_tree_lba + 1;
+        let quota_tree_lba = backref_tree_lba + 1;
+        let checkpoint_lba = quota_tree_lba + 1;
         let journal_start_lba = checkpoint_lba + 1;
         let journal_end_lba = journal_start_lba + u64::from(record_count) * 2;
+        self.quota_allows_media_blocks(journal_end_lba)?;
         let mut plans = [const { None }; MAX_OBJECTS];
 
         let mut record_index = 0u32;
@@ -586,6 +606,19 @@ impl<
         self.write_journaled_target(
             backref_tree_lba,
             &backref_block,
+            sequence,
+            record_index,
+            record_count,
+            journal_start_lba,
+            checkpoint_lba,
+            0,
+        )?;
+        record_index += 1;
+
+        let quota_block = self.build_quota_tree_block(quota_tree_lba, journal_end_lba)?;
+        self.write_journaled_target(
+            quota_tree_lba,
+            &quota_block,
             sequence,
             record_index,
             record_count,
@@ -1072,8 +1105,45 @@ impl<
         Ok(max_lba.saturating_add(1).max(1))
     }
 
+    fn quota_admits(&self, additional_bytes: u64, additional_objects: u64) -> FixedResult<()> {
+        let next_objects = (self.live_object_count() as u64)
+            .checked_add(additional_objects)
+            .ok_or(HxfsError::NoSpace)?;
+        if self.system_volume.quota_objects != 0 && next_objects > self.system_volume.quota_objects
+        {
+            return Err(HxfsError::NoSpace);
+        }
+        let current_bytes = self
+            .next_lba
+            .checked_mul(BLOCK_SIZE_U64)
+            .ok_or(HxfsError::OutOfRange)?;
+        let next_bytes = current_bytes
+            .checked_add(additional_bytes)
+            .ok_or(HxfsError::OutOfRange)?;
+        if self.system_volume.quota_physical_bytes != 0
+            && next_bytes > self.system_volume.quota_physical_bytes
+        {
+            return Err(HxfsError::NoSpace);
+        }
+        Ok(())
+    }
+
+    fn quota_allows_media_blocks(&self, future_next_lba: u64) -> FixedResult<()> {
+        if self.system_volume.quota_physical_bytes == 0 {
+            return Ok(());
+        }
+        let bytes = future_next_lba
+            .checked_mul(BLOCK_SIZE_U64)
+            .ok_or(HxfsError::OutOfRange)?;
+        if bytes > self.system_volume.quota_physical_bytes {
+            return Err(HxfsError::NoSpace);
+        }
+        Ok(())
+    }
+
     fn write_data_blocks(&mut self, data: &[u8]) -> FixedResult<u64> {
         let start = self.next_lba;
+        self.quota_admits(BLOCK_SIZE_U64, 0)?;
         let mut block = [0u8; BLOCK_SIZE];
         block[..data.len()].copy_from_slice(data);
         self.store.write_blocks(start, 1, &block)?;
@@ -1382,6 +1452,56 @@ impl<
         ))
     }
 
+    fn build_quota_tree_block(
+        &self,
+        lba: u64,
+        future_next_lba: u64,
+    ) -> FixedResult<[u8; BLOCK_SIZE]> {
+        let physical_used_bytes = future_next_lba
+            .checked_mul(BLOCK_SIZE_U64)
+            .ok_or(HxfsError::OutOfRange)?;
+        let mut tree = QuotaBtree::<1>::new();
+        tree.upsert(QuotaRecord {
+            volume_uuid: self.system_volume.uuid,
+            physical_limit_bytes: self.system_volume.quota_physical_bytes,
+            physical_used_bytes,
+            object_limit: self.system_volume.quota_objects,
+            object_count: self.live_object_count() as u64,
+        })
+        .map_err(|_| HxfsError::NoSpace)?;
+        tree.validate().map_err(|_| HxfsError::BadTree)?;
+        let mut payload = [0u8; BLOCK_SIZE - HEADER_BYTES];
+        let count = tree.record_count();
+        payload[0..4].copy_from_slice(&(count as u32).to_le_bytes());
+        let mut written = 0usize;
+        let mut index = 0usize;
+        while index < tree.records().len() {
+            if let Some(record) = tree.records()[index] {
+                let offset = 16 + written * 56;
+                if offset + 56 > payload.len() {
+                    return Err(HxfsError::NoSpace);
+                }
+                payload[offset..offset + 16].copy_from_slice(&record.volume_uuid);
+                payload[offset + 16..offset + 24]
+                    .copy_from_slice(&record.physical_limit_bytes.to_le_bytes());
+                payload[offset + 24..offset + 32]
+                    .copy_from_slice(&record.physical_used_bytes.to_le_bytes());
+                payload[offset + 32..offset + 40]
+                    .copy_from_slice(&record.object_limit.to_le_bytes());
+                payload[offset + 40..offset + 48]
+                    .copy_from_slice(&record.object_count.to_le_bytes());
+                written += 1;
+            }
+            index += 1;
+        }
+        Ok(make_metadata_block(
+            BLOCK_TYPE_QUOTA_TREE,
+            self.system_volume.root_object_id,
+            lba,
+            &payload[..16 + written * 56],
+        ))
+    }
+
     fn build_volume_table_block(
         &self,
         object_table_lba: u64,
@@ -1584,7 +1704,9 @@ fn make_superblock_block(
     payload[56..64].copy_from_slice(&checkpoint_lba.to_le_bytes());
     payload[72..80].copy_from_slice(&journal_start_lba.to_le_bytes());
     payload[80..88].copy_from_slice(&journal_end_lba.to_le_bytes());
-    payload[104..112].copy_from_slice(&BASE_INCOMPAT_FEATURES.to_le_bytes());
+    payload[104..112].copy_from_slice(
+        &(BASE_INCOMPAT_FEATURES | FEATURE_INCOMPAT_QUOTA_ENFORCEMENT).to_le_bytes(),
+    );
     payload[112..116].copy_from_slice(&root_state.to_le_bytes());
     make_metadata_block(BLOCK_TYPE_SUPERBLOCK, 0, 0, &payload)
 }
@@ -1707,6 +1829,7 @@ mod tests {
         assert_ne!(mounted.checkpoint().allocation_tree_lba, 0);
         assert_ne!(mounted.checkpoint().refcount_tree_lba, 0);
         assert_ne!(mounted.checkpoint().backref_tree_lba, 0);
+        assert_ne!(mounted.checkpoint().quota_tree_lba, 0);
         let store = mounted.into_store();
 
         let image: Vec<u8> = store.as_slice().to_vec();
@@ -1720,6 +1843,42 @@ mod tests {
         let mut out = [0u8; 16];
         assert_eq!(fs.read_file(file, &mut out), Ok(5));
         assert_eq!(&out[..5], b"fixed");
+    }
+
+    #[test]
+    fn fixed_writer_enforces_object_and_physical_quota() {
+        let Ok(seed) = HxfsWriter::new(INSTANCE, VOLUME) else {
+            assert!(false, "seed writer should initialize");
+            return;
+        };
+        let store = MemStore::from_image(seed.image());
+        let Ok(mut mounted) = FixedHxfsWriter::<MemStore, 16, 32, 32>::mount(store) else {
+            assert!(false, "fixed writer should mount");
+            return;
+        };
+        assert!(mounted.set_quota_limits(0, 1).is_ok());
+        assert_eq!(mounted.create_file_path("/denied"), Err(HxfsError::NoSpace));
+
+        let Ok(seed) = HxfsWriter::new(INSTANCE, VOLUME) else {
+            assert!(false, "seed writer should initialize");
+            return;
+        };
+        let store = MemStore::from_image(seed.image());
+        let Ok(mut mounted) = FixedHxfsWriter::<MemStore, 16, 32, 32>::mount(store) else {
+            assert!(false, "fixed writer should mount");
+            return;
+        };
+        let limit = mounted.charged_physical_bytes();
+        assert!(limit.is_ok());
+        let Ok(limit) = limit else { return };
+        assert!(mounted.set_quota_limits(limit, 0).is_ok());
+        let file = mounted.create_file_path("/file");
+        assert!(file.is_ok());
+        let Ok(file) = file else { return };
+        assert_eq!(
+            mounted.write_file_at(file, 0, b"x"),
+            Err(HxfsError::NoSpace)
+        );
     }
 
     #[test]
