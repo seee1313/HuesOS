@@ -6,6 +6,7 @@
 use core::panic::PanicInfo;
 use huesos_hxfs::format::{DirectoryHandle, FileHandle};
 use huesos_hxfs::reader::BlockReader;
+use huesos_hxfs::recovery::{replay_journal, BlockStore, ReplayOutcome};
 use huesos_hxfs::{Hxfs, HxfsError};
 use libcanvas::{println, Channel, ErrorCode, Vmo};
 
@@ -23,6 +24,18 @@ impl BlockReader for BlockDeviceReader {
         self.device
             .read_blocks(lba, blocks, out)
             .map_err(|_| HxfsError::Io)
+    }
+}
+
+impl BlockStore for BlockDeviceReader {
+    fn write_blocks(&mut self, lba: u64, blocks: u32, input: &[u8]) -> Result<(), HxfsError> {
+        self.device
+            .write_blocks(lba, blocks, input)
+            .map_err(|_| HxfsError::Io)
+    }
+
+    fn flush(&mut self) -> Result<(), HxfsError> {
+        self.device.flush().map_err(|_| HxfsError::Io)
     }
 }
 
@@ -398,7 +411,24 @@ fn mount_from_bootstrap(bootstrap: &Channel) -> Option<MountedHxfs> {
                 let Ok(device) = libcanvas::block::BlockDevice::from_channel(channel) else {
                     return None;
                 };
-                let reader = BlockDeviceReader { device };
+                let mut reader = BlockDeviceReader { device };
+                match replay_journal(&mut reader) {
+                    Ok(ReplayOutcome::Clean) => {}
+                    Ok(ReplayOutcome::Replayed {
+                        sequence_number,
+                        records,
+                        final_checkpoint_lba,
+                    }) => {
+                        println!(
+                            "[hxfs] replayed journal seq={} records={} checkpoint_lba={}",
+                            sequence_number, records, final_checkpoint_lba
+                        );
+                    }
+                    Err(error) => {
+                        println!("[hxfs] journal replay failed: {:?}", error);
+                        return None;
+                    }
+                }
                 match Hxfs::mount(reader) {
                     Ok(fs) => return Some(fs),
                     Err(error) => {

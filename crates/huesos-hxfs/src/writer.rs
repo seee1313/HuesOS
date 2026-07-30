@@ -11,9 +11,10 @@ use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
 
-use crate::crc32c::metadata_crc32c;
+use crate::crc32c::{crc32c, metadata_crc32c};
 use crate::format::*;
-use crate::reader::SliceBlockReader;
+use crate::reader::{BlockReader, SliceBlockReader};
+use crate::recovery::BlockStore;
 use crate::{Hxfs, HxfsError};
 
 /// Mutation failure for the Stage-H writer.
@@ -35,6 +36,8 @@ pub enum HxfsWriteError {
     OutOfSpace,
     /// Snapshot was not found.
     SnapshotNotFound,
+    /// Underlying persistent block store rejected I/O.
+    Io,
 }
 
 /// Snapshot descriptor retained by the writer.
@@ -48,6 +51,38 @@ pub struct SnapshotInfo {
     pub sequence_number: u64,
     /// Snapshot name.
     pub name: String,
+}
+
+/// Crash point used by journaled commit tests and fault injection.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum JournalCrashPoint {
+    /// Recovering root-store and journal are durable, but target blocks are not.
+    RecoveringBeforeTargets,
+    /// First target block is durable, then the system crashes before clean publish.
+    AfterFirstTarget,
+    /// Full journaled transaction completed and final clean superblock is published.
+    Clean,
+}
+
+/// Images produced by one journaled commit.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct JournaledImages {
+    /// Image in Recovering state before any target blocks were written.
+    pub recovering_before_targets: Vec<u8>,
+    /// Image in Recovering state after the first target block was written.
+    pub after_first_target: Vec<u8>,
+    /// Final clean image with stale journal blocks left allocated after publish.
+    pub clean: Vec<u8>,
+    /// Published checkpoint LBA.
+    pub checkpoint_lba: u64,
+    /// Transaction sequence number.
+    pub sequence_number: u64,
+    /// Journal start LBA.
+    pub journal_start_lba: u64,
+    /// Journal end LBA, exclusive.
+    pub journal_end_lba: u64,
+    /// Journal record count.
+    pub record_count: u32,
 }
 
 #[derive(Clone)]
@@ -387,6 +422,132 @@ impl HxfsWriter {
         Ok(checkpoint_lba)
     }
 
+    /// Publish a new checkpoint through the v2 journal protocol.
+    ///
+    /// The writer first builds the same COW target blocks as [`Self::commit`],
+    /// then appends journal metadata/data-copy records, and finally leaves the
+    /// in-memory image in the clean post-commit state. The stale journal range is
+    /// intentionally retained in the image so future allocations do not reuse the
+    /// blocks until a real allocator/reclaim stage owns that policy.
+    pub fn commit_journaled(&mut self) -> Result<u64, HxfsWriteError> {
+        let images = self.commit_journaled_images()?;
+        self.image = images.clean;
+        Ok(images.checkpoint_lba)
+    }
+
+    /// Build crash-point images for one full journaled commit.
+    pub fn commit_journaled_images(&mut self) -> Result<JournaledImages, HxfsWriteError> {
+        self.reject_encrypted()?;
+        let old_image = self.image.clone();
+        let old_blocks = old_image.len() / BLOCK_SIZE;
+        let old_checkpoint_lba = self.checkpoint_lba;
+        let checkpoint_lba = self.commit()?;
+        let sequence_number = self.sequence_number;
+        let final_without_journal = self.image.clone();
+        let final_blocks = final_without_journal.len() / BLOCK_SIZE;
+        if final_blocks < old_blocks {
+            return Err(HxfsWriteError::OutOfSpace);
+        }
+        let target_count = final_blocks - old_blocks;
+        let record_count =
+            u32::try_from(target_count + 1).map_err(|_| HxfsWriteError::OutOfSpace)?;
+        let journal_start_lba = final_blocks as u64;
+        let journal_end_lba = journal_start_lba + u64::from(record_count) * 2;
+
+        let final_superblock = block_from_slice(&final_without_journal[0..BLOCK_SIZE])?;
+        let mut journal_blocks = Vec::new();
+        let mut record_index = 0u32;
+        let mut target_lba = old_blocks as u64;
+        while target_lba < final_blocks as u64 {
+            let start = target_lba as usize * BLOCK_SIZE;
+            let data = block_from_slice(&final_without_journal[start..start + BLOCK_SIZE])?;
+            let metadata_lba = journal_start_lba + u64::from(record_index) * 2;
+            journal_blocks.push(build_journal_record_block(
+                sequence_number,
+                record_index,
+                record_count,
+                target_lba,
+                metadata_lba + 1,
+                crc32c(&data),
+                0,
+                checkpoint_lba,
+                metadata_lba,
+            ));
+            journal_blocks.push(data);
+            record_index += 1;
+            target_lba += 1;
+        }
+        let metadata_lba = journal_start_lba + u64::from(record_index) * 2;
+        journal_blocks.push(build_journal_record_block(
+            sequence_number,
+            record_index,
+            record_count,
+            0,
+            metadata_lba + 1,
+            crc32c(&final_superblock),
+            JOURNAL_RECORD_FLAG_FINAL_SUPERBLOCK,
+            checkpoint_lba,
+            metadata_lba,
+        ));
+        journal_blocks.push(final_superblock);
+
+        let mut recovering_before_targets = old_image;
+        recovering_before_targets.resize(final_without_journal.len(), 0);
+        append_blocks(&mut recovering_before_targets, &journal_blocks);
+        write_superblock_state(
+            &mut recovering_before_targets[0..BLOCK_SIZE],
+            self.instance_uuid,
+            sequence_number,
+            old_checkpoint_lba,
+            journal_start_lba,
+            journal_end_lba,
+            ROOT_STATE_RECOVERING,
+        );
+
+        let mut after_first_target = recovering_before_targets.clone();
+        if target_count != 0 {
+            let first_target_start = old_blocks * BLOCK_SIZE;
+            after_first_target[first_target_start..first_target_start + BLOCK_SIZE]
+                .copy_from_slice(
+                    &final_without_journal[first_target_start..first_target_start + BLOCK_SIZE],
+                );
+        }
+
+        let mut clean = final_without_journal;
+        append_blocks(&mut clean, &journal_blocks);
+        write_superblock(
+            &mut clean[0..BLOCK_SIZE],
+            self.instance_uuid,
+            sequence_number,
+            checkpoint_lba,
+        );
+        self.image = clean.clone();
+
+        Ok(JournaledImages {
+            recovering_before_targets,
+            after_first_target,
+            clean,
+            checkpoint_lba,
+            sequence_number,
+            journal_start_lba,
+            journal_end_lba,
+            record_count,
+        })
+    }
+
+    /// Return the image corresponding to one selected journal crash point.
+    pub fn commit_journaled_crash_image(
+        &mut self,
+        point: JournalCrashPoint,
+    ) -> Result<Vec<u8>, HxfsWriteError> {
+        let images = self.commit_journaled_images()?;
+        Ok(match point {
+            JournalCrashPoint::RecoveringBeforeTargets => images.recovering_before_targets,
+            JournalCrashPoint::AfterFirstTarget => images.after_first_target,
+            JournalCrashPoint::Clean => images.clean,
+        })
+    }
+
     /// Mount current image through the read-only parser.
     pub fn mount_current(&self) -> Result<Hxfs<SliceBlockReader<'_>>, HxfsError> {
         Hxfs::mount(SliceBlockReader::new(&self.image))
@@ -554,6 +715,184 @@ impl HxfsWriter {
     }
 }
 
+/// Host-test block store backed by a growable byte vector.
+pub struct VecBlockStore {
+    image: Vec<u8>,
+    flushes: u64,
+}
+
+impl VecBlockStore {
+    /// Create a zero-filled store with `blocks` 4 KiB blocks.
+    pub fn with_blocks(blocks: usize) -> Self {
+        Self {
+            image: vec![0u8; blocks.saturating_mul(BLOCK_SIZE)],
+            flushes: 0,
+        }
+    }
+
+    /// Current store image bytes.
+    pub fn image(&self) -> &[u8] {
+        &self.image
+    }
+
+    /// Number of flush calls observed by this store.
+    pub const fn flushes(&self) -> u64 {
+        self.flushes
+    }
+}
+
+impl BlockReader for VecBlockStore {
+    fn read_blocks(&mut self, lba: u64, blocks: u32, out: &mut [u8]) -> Result<(), HxfsError> {
+        let start = usize::try_from(lba)
+            .ok()
+            .and_then(|lba| lba.checked_mul(BLOCK_SIZE))
+            .ok_or(HxfsError::OutOfRange)?;
+        let len = usize::try_from(blocks)
+            .ok()
+            .and_then(|blocks| blocks.checked_mul(BLOCK_SIZE))
+            .ok_or(HxfsError::OutOfRange)?;
+        out.get_mut(..len)
+            .ok_or(HxfsError::BufferTooSmall)?
+            .copy_from_slice(self.image.get(start..start + len).ok_or(HxfsError::Io)?);
+        Ok(())
+    }
+}
+
+impl BlockStore for VecBlockStore {
+    fn write_blocks(&mut self, lba: u64, blocks: u32, input: &[u8]) -> Result<(), HxfsError> {
+        let start = usize::try_from(lba)
+            .ok()
+            .and_then(|lba| lba.checked_mul(BLOCK_SIZE))
+            .ok_or(HxfsError::OutOfRange)?;
+        let len = usize::try_from(blocks)
+            .ok()
+            .and_then(|blocks| blocks.checked_mul(BLOCK_SIZE))
+            .ok_or(HxfsError::OutOfRange)?;
+        let end = start.checked_add(len).ok_or(HxfsError::OutOfRange)?;
+        if self.image.len() < end {
+            self.image.resize(end, 0);
+        }
+        self.image[start..end].copy_from_slice(input.get(..len).ok_or(HxfsError::BufferTooSmall)?);
+        Ok(())
+    }
+
+    fn flush(&mut self) -> Result<(), HxfsError> {
+        self.flushes = self.flushes.saturating_add(1);
+        Ok(())
+    }
+}
+
+/// BlockStore-backed mutable Hxfs writer foundation.
+pub struct PersistentHxfsWriter<S: BlockStore> {
+    store: S,
+    writer: HxfsWriter,
+    dirty: bool,
+}
+
+impl<S: BlockStore> PersistentHxfsWriter<S> {
+    /// Create a new empty Hxfs volume and persist its initial clean checkpoint.
+    pub fn new_empty(
+        mut store: S,
+        instance_uuid: Uuid,
+        volume_uuid: Uuid,
+    ) -> Result<Self, HxfsWriteError> {
+        let writer = HxfsWriter::new(instance_uuid, volume_uuid)?;
+        write_image_to_store(&mut store, writer.image()).map_err(|_| HxfsWriteError::Io)?;
+        store.flush().map_err(|_| HxfsWriteError::Io)?;
+        Ok(Self {
+            store,
+            writer,
+            dirty: false,
+        })
+    }
+
+    /// Immutable view of the underlying writer state.
+    pub const fn writer(&self) -> &HxfsWriter {
+        &self.writer
+    }
+
+    /// Immutable view of the underlying store.
+    pub const fn store(&self) -> &S {
+        &self.store
+    }
+
+    /// Consume the wrapper and return the store.
+    pub fn into_store(self) -> S {
+        self.store
+    }
+
+    /// Create a directory and mark the transaction dirty.
+    pub fn mkdir(&mut self, path: &str) -> Result<u64, HxfsWriteError> {
+        let id = self.writer.mkdir(path)?;
+        self.dirty = true;
+        Ok(id)
+    }
+
+    /// Create a file and mark the transaction dirty.
+    pub fn create_file(&mut self, path: &str, data: &[u8]) -> Result<u64, HxfsWriteError> {
+        let id = self.writer.create_file(path, data)?;
+        self.dirty = true;
+        Ok(id)
+    }
+
+    /// Overwrite a file and mark the transaction dirty.
+    pub fn overwrite_file(&mut self, path: &str, data: &[u8]) -> Result<(), HxfsWriteError> {
+        self.writer.overwrite_file(path, data)?;
+        self.dirty = true;
+        Ok(())
+    }
+
+    /// Truncate/extend a file and mark the transaction dirty.
+    pub fn truncate_file(&mut self, path: &str, new_size: u64) -> Result<(), HxfsWriteError> {
+        self.writer.truncate_file(path, new_size)?;
+        self.dirty = true;
+        Ok(())
+    }
+
+    /// Rename an object and mark the transaction dirty.
+    pub fn rename(&mut self, from: &str, to: &str) -> Result<(), HxfsWriteError> {
+        self.writer.rename(from, to)?;
+        self.dirty = true;
+        Ok(())
+    }
+
+    /// Unlink an object and mark the transaction dirty.
+    pub fn unlink(&mut self, path: &str) -> Result<(), HxfsWriteError> {
+        self.writer.unlink(path)?;
+        self.dirty = true;
+        Ok(())
+    }
+
+    /// Publish dirty state through a journaled checkpoint and flush the store.
+    pub fn fsync_checkpoint(&mut self) -> Result<u64, HxfsWriteError> {
+        if self.dirty {
+            let checkpoint = self.writer.commit_journaled()?;
+            write_image_to_store(&mut self.store, self.writer.image())
+                .map_err(|_| HxfsWriteError::Io)?;
+            self.store.flush().map_err(|_| HxfsWriteError::Io)?;
+            self.dirty = false;
+            Ok(checkpoint)
+        } else {
+            self.store.flush().map_err(|_| HxfsWriteError::Io)?;
+            Ok(self.writer.checkpoint_lba)
+        }
+    }
+}
+
+fn write_image_to_store<S: BlockStore>(store: &mut S, image: &[u8]) -> Result<(), HxfsError> {
+    if !image.len().is_multiple_of(BLOCK_SIZE) {
+        return Err(HxfsError::OutOfRange);
+    }
+    let mut lba = 0u64;
+    let mut offset = 0usize;
+    while offset < image.len() {
+        store.write_blocks(lba, 1, &image[offset..offset + BLOCK_SIZE])?;
+        offset += BLOCK_SIZE;
+        lba += 1;
+    }
+    Ok(())
+}
+
 struct NodePlan {
     object_id: u64,
     tree_lba: u64,
@@ -702,7 +1041,65 @@ fn build_checkpoint_block(
     Ok(make_metadata_block(BLOCK_TYPE_CHECKPOINT, 0, lba, &payload))
 }
 
+fn append_blocks(image: &mut Vec<u8>, blocks: &[[u8; BLOCK_SIZE]]) {
+    for block in blocks {
+        image.extend_from_slice(block);
+    }
+}
+
+fn block_from_slice(slice: &[u8]) -> Result<[u8; BLOCK_SIZE], HxfsWriteError> {
+    if slice.len() != BLOCK_SIZE {
+        return Err(HxfsWriteError::OutOfSpace);
+    }
+    let mut block = [0u8; BLOCK_SIZE];
+    block.copy_from_slice(slice);
+    Ok(block)
+}
+
+fn build_journal_record_block(
+    sequence: u64,
+    record_index: u32,
+    record_count: u32,
+    target_lba: u64,
+    data_lba: u64,
+    data_crc32c: u32,
+    flags: u32,
+    final_checkpoint_lba: u64,
+    metadata_lba: u64,
+) -> [u8; BLOCK_SIZE] {
+    let mut payload = [0u8; 48];
+    payload[0..8].copy_from_slice(&sequence.to_le_bytes());
+    payload[8..12].copy_from_slice(&record_index.to_le_bytes());
+    payload[12..16].copy_from_slice(&record_count.to_le_bytes());
+    payload[16..24].copy_from_slice(&target_lba.to_le_bytes());
+    payload[24..32].copy_from_slice(&data_lba.to_le_bytes());
+    payload[32..36].copy_from_slice(&data_crc32c.to_le_bytes());
+    payload[36..40].copy_from_slice(&flags.to_le_bytes());
+    payload[40..48].copy_from_slice(&final_checkpoint_lba.to_le_bytes());
+    make_metadata_block(BLOCK_TYPE_JOURNAL_RECORD, 0, metadata_lba, &payload)
+}
+
 fn write_superblock(block: &mut [u8], instance_uuid: Uuid, sequence: u64, checkpoint_lba: u64) {
+    write_superblock_state(
+        block,
+        instance_uuid,
+        sequence,
+        checkpoint_lba,
+        0,
+        0,
+        ROOT_STATE_CLEAN,
+    );
+}
+
+fn write_superblock_state(
+    block: &mut [u8],
+    instance_uuid: Uuid,
+    sequence: u64,
+    checkpoint_lba: u64,
+    journal_start_lba: u64,
+    journal_end_lba: u64,
+    root_state: u32,
+) {
     let mut payload = [0u8; 120];
     payload[0..16].copy_from_slice(&FORMAT_GUID);
     payload[16..20].copy_from_slice(&FORMAT_VERSION.to_le_bytes());
@@ -711,10 +1108,12 @@ fn write_superblock(block: &mut [u8], instance_uuid: Uuid, sequence: u64, checkp
     payload[40..48].copy_from_slice(&sequence.to_le_bytes());
     payload[48..52].copy_from_slice(&(BLOCK_SIZE as u32).to_le_bytes());
     payload[56..64].copy_from_slice(&checkpoint_lba.to_le_bytes());
+    payload[72..80].copy_from_slice(&journal_start_lba.to_le_bytes());
+    payload[80..88].copy_from_slice(&journal_end_lba.to_le_bytes());
     payload[104..112].copy_from_slice(
         &(FEATURE_INCOMPAT_V2_ROOT_STORE | FEATURE_INCOMPAT_MUTABLE_JOURNAL).to_le_bytes(),
     );
-    payload[112..116].copy_from_slice(&ROOT_STATE_CLEAN.to_le_bytes());
+    payload[112..116].copy_from_slice(&root_state.to_le_bytes());
     let new_block = make_metadata_block(BLOCK_TYPE_SUPERBLOCK, 0, 0, &payload);
     block.copy_from_slice(&new_block);
 }
@@ -737,6 +1136,7 @@ fn make_metadata_block(block_type: u32, owner: u64, lba: u64, payload: &[u8]) ->
 #[cfg(test)]
 mod write_tests {
     use super::*;
+    use crate::recovery::{replay_journal, ReplayOutcome};
 
     const INSTANCE: Uuid = [0x33; 16];
     const VOLUME: Uuid = [0x44; 16];
@@ -813,6 +1213,71 @@ mod write_tests {
             writer.snapshot_image(snapshot),
             Err(HxfsWriteError::SnapshotNotFound)
         );
+    }
+
+    #[test]
+    fn journaled_commit_recovers_before_target_blocks() {
+        let Ok(mut writer) = HxfsWriter::new(INSTANCE, VOLUME) else {
+            assert!(false, "writer should initialize");
+            return;
+        };
+        assert!(writer.mkdir("/home").is_ok());
+        assert!(writer.create_file("/home/data.txt", b"journaled").is_ok());
+        let images = writer.commit_journaled_images();
+        assert!(images.is_ok());
+        let Ok(images) = images else { return };
+        assert!(matches!(
+            Hxfs::mount(SliceBlockReader::new(&images.recovering_before_targets)),
+            Err(HxfsError::NeedsRecovery)
+        ));
+
+        let mut store = VecBlockStore {
+            image: images.recovering_before_targets,
+            flushes: 0,
+        };
+        let replay = replay_journal(&mut store);
+        assert_eq!(
+            replay,
+            Ok(ReplayOutcome::Replayed {
+                sequence_number: images.sequence_number,
+                records: images.record_count,
+                final_checkpoint_lba: images.checkpoint_lba,
+            })
+        );
+        let mut mounted = Hxfs::mount(SliceBlockReader::new(store.image()));
+        assert!(mounted.is_ok());
+        let Ok(ref mut mounted) = mounted else { return };
+        let file = mounted.open_path("/home/data.txt");
+        assert!(file.is_ok());
+        let Ok(file) = file else { return };
+        let mut out = [0u8; 16];
+        assert_eq!(mounted.read_file(file, &mut out), Ok(9));
+        assert_eq!(&out[..9], b"journaled");
+    }
+
+    #[test]
+    fn persistent_writer_flushes_checkpoint_to_block_store() {
+        let store = VecBlockStore::with_blocks(1);
+        let persistent = PersistentHxfsWriter::new_empty(store, INSTANCE, VOLUME);
+        assert!(persistent.is_ok());
+        let Ok(mut persistent) = persistent else {
+            return;
+        };
+        assert!(persistent.mkdir("/home").is_ok());
+        assert!(persistent.create_file("/home/persist.txt", b"ok").is_ok());
+        assert!(persistent.fsync_checkpoint().is_ok());
+        let store = persistent.into_store();
+        assert!(store.flushes() >= 2);
+
+        let mounted = Hxfs::mount(SliceBlockReader::new(store.image()));
+        assert!(mounted.is_ok());
+        let Ok(mut mounted) = mounted else { return };
+        let file = mounted.open_path("/home/persist.txt");
+        assert!(file.is_ok());
+        let Ok(file) = file else { return };
+        let mut out = [0u8; 4];
+        assert_eq!(mounted.read_file(file, &mut out), Ok(2));
+        assert_eq!(&out[..2], b"ok");
     }
 
     #[test]

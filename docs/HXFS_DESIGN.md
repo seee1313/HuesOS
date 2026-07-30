@@ -947,3 +947,36 @@ The final record must have `JOURNAL_RECORD_FLAG_FINAL_SUPERBLOCK`, must target
 LBA 0, and publishes the final clean superblock last. If replay crashes before
 that final write, the filesystem remains in Recovering state and replay can run
 again.
+
+---
+
+## 33. Stage K mutable-service foundation
+
+Stage K starts the production mutable path without moving filesystem logic into
+the kernel or the NVMe driver.
+
+The first implementation boundary is split intentionally:
+
+```text
+huesos-hxfs::writer::HxfsWriter
+  host-testable COW object/metadata mutation model
+
+huesos-hxfs::writer::PersistentHxfsWriter<S: BlockStore>
+  BlockStore-backed explicit fsync/checkpoint foundation
+
+hxfs-service
+  replays v2 journals on BlockDevice before ordinary mount
+```
+
+Durability remains explicit:
+
+```text
+mutation -> dirty in service/writer memory
+fsync/checkpoint -> journaled checkpoint publish -> BlockStore flush
+```
+
+The Stage K foundation does not yet enable arbitrary on-target write requests in
+`hxfs-service`; that still requires a no-heap/fixed-capacity service state model
+or an approved userspace allocator integration. What is now fixed is the storage
+contract: mutable Hxfs state is published through v2 journaled checkpoints over a
+BlockStore, and ordinary mount refuses Recovering state until replay succeeds.
