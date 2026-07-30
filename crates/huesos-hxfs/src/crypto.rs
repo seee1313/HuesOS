@@ -6,8 +6,11 @@
 //! primitive is provided by RustCrypto's `aes` crate; this module implements the
 //! Hxfs block-level XTS glue for full 4 KiB units.
 
+#[cfg(feature = "crypto-aes")]
 use aes::Aes256;
+#[cfg(feature = "crypto-aes")]
 use cipher::generic_array::GenericArray;
+#[cfg(feature = "crypto-aes")]
 use cipher::{BlockDecrypt, BlockEncrypt, KeyInit};
 
 use crate::format::BLOCK_SIZE;
@@ -121,6 +124,8 @@ pub enum CryptoError {
     BadKey,
     /// Data unit is not exactly one 4 KiB Hxfs block.
     BadDataUnit,
+    /// Software AES-XTS engine is not linked in this build.
+    EngineUnavailable,
 }
 
 /// Validate a policy against available key providers.
@@ -161,7 +166,17 @@ pub fn encrypt_block_in_place(
     data_unit: u128,
     block: &mut [u8; BLOCK_SIZE],
 ) -> Result<(), CryptoError> {
-    crypt_block_in_place(key, data_unit, block, true)
+    #[cfg(feature = "crypto-aes")]
+    {
+        return crypt_block_in_place(key, data_unit, block, true);
+    }
+    #[cfg(not(feature = "crypto-aes"))]
+    {
+        let _ = key;
+        let _ = data_unit;
+        let _ = block;
+        Err(CryptoError::EngineUnavailable)
+    }
 }
 
 /// Decrypt one 4 KiB Hxfs block in place using AES-256-XTS.
@@ -170,9 +185,20 @@ pub fn decrypt_block_in_place(
     data_unit: u128,
     block: &mut [u8; BLOCK_SIZE],
 ) -> Result<(), CryptoError> {
-    crypt_block_in_place(key, data_unit, block, false)
+    #[cfg(feature = "crypto-aes")]
+    {
+        return crypt_block_in_place(key, data_unit, block, false);
+    }
+    #[cfg(not(feature = "crypto-aes"))]
+    {
+        let _ = key;
+        let _ = data_unit;
+        let _ = block;
+        Err(CryptoError::EngineUnavailable)
+    }
 }
 
+#[cfg(feature = "crypto-aes")]
 fn crypt_block_in_place(
     key: Aes256XtsKey,
     data_unit: u128,
@@ -206,6 +232,7 @@ fn crypt_block_in_place(
     Ok(())
 }
 
+#[cfg(feature = "crypto-aes")]
 fn xor_block(block: &mut [u8; AES_BLOCK_BYTES], tweak: &[u8; AES_BLOCK_BYTES]) {
     let mut index = 0usize;
     while index < AES_BLOCK_BYTES {
@@ -214,6 +241,7 @@ fn xor_block(block: &mut [u8; AES_BLOCK_BYTES], tweak: &[u8; AES_BLOCK_BYTES]) {
     }
 }
 
+#[cfg(feature = "crypto-aes")]
 fn multiply_tweak_alpha(tweak: &mut [u8; AES_BLOCK_BYTES]) {
     let mut carry = 0u8;
     let mut index = 0usize;
@@ -241,6 +269,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "crypto-aes")]
     fn key() -> Aes256XtsKey {
         let mut raw = [0u8; AES_256_XTS_KEY_BYTES];
         let mut index = 0usize;
@@ -280,6 +309,7 @@ mod tests {
         assert!(WrappedVolumeKey::new(1, 1, &[0u8; WRAPPED_KEY_BYTES + 1]).is_none());
     }
 
+    #[cfg(feature = "crypto-aes")]
     #[test]
     fn aes_xts_round_trips_one_block() {
         let key = key();
@@ -300,6 +330,7 @@ mod tests {
         assert_eq!(block, original);
     }
 
+    #[cfg(feature = "crypto-aes")]
     #[test]
     fn xts_tweak_depends_on_data_unit() {
         let key = key();
