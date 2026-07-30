@@ -18,6 +18,7 @@ version = "0.1.0"
 name = "huesos-hxfs-service"
 version = "0.1.0"
 dependencies = [
+ "huesos-abi",
  "huesos-hxfs",
  "libcanvas",
 ]

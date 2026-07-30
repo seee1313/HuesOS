@@ -1,19 +1,28 @@
-//! Read-only Hxfs userspace service.
+//! Fixed-capacity Hxfs userspace service.
 
 #![no_std]
 #![no_main]
 
 use core::panic::PanicInfo;
+use huesos_abi::hxfs::{
+    response_flags, rights as hxfs_rights, HxfsHandleKind, HxfsOp, HxfsRequest, HxfsResponse,
+    HxfsStatus, HXFS_MAX_INLINE_WRITE_BYTES, HXFS_REQUEST_BYTES, HXFS_RESPONSE_BYTES,
+};
+use huesos_hxfs::fixed_writer::FixedHxfsWriter;
 use huesos_hxfs::format::{DirectoryHandle, FileHandle};
 use huesos_hxfs::reader::BlockReader;
 use huesos_hxfs::recovery::{replay_journal, BlockStore, ReplayOutcome};
-use huesos_hxfs::{Hxfs, HxfsError};
+use huesos_hxfs::HxfsError;
 use libcanvas::{println, Channel, ErrorCode, Vmo};
 
 const MAX_CLIENTS: usize = 4;
 const MAX_FILE_HANDLES: usize = 8;
 const MAX_DIR_HANDLES: usize = 8;
 const MAX_READ_BYTES: usize = 4096;
+const MAX_NATIVE_REQUEST_BYTES: usize = HXFS_REQUEST_BYTES + HXFS_MAX_INLINE_WRITE_BYTES;
+const SERVICE_MAX_OBJECTS: usize = 32;
+const SERVICE_MAX_DIR_ENTRIES: usize = 64;
+const SERVICE_MAX_EXTENTS: usize = 64;
 
 struct BlockDeviceReader {
     device: libcanvas::block::BlockDevice,
@@ -39,7 +48,23 @@ impl BlockStore for BlockDeviceReader {
     }
 }
 
-type MountedHxfs = Hxfs<BlockDeviceReader>;
+type MountedHxfs = FixedHxfsWriter<
+    BlockDeviceReader,
+    SERVICE_MAX_OBJECTS,
+    SERVICE_MAX_DIR_ENTRIES,
+    SERVICE_MAX_EXTENTS,
+>;
+
+#[derive(Clone, Copy)]
+struct ResponseMeta {
+    status: HxfsStatus,
+    handle_kind: HxfsHandleKind,
+    handle_id: u64,
+    rights: u64,
+    object_id: u64,
+    value: u64,
+    flags: u32,
+}
 
 struct FileEndpoint {
     channel: Channel,
@@ -112,7 +137,7 @@ impl HxfsRuntime {
     }
 
     fn poll_client(&mut self, index: usize) {
-        let mut buf = [0u8; 320];
+        let mut buf = [0u8; MAX_NATIVE_REQUEST_BYTES];
         loop {
             let Some(client) = self.clients[index].as_ref() else {
                 return;
@@ -130,6 +155,10 @@ impl HxfsRuntime {
     }
 
     fn handle_client_request(&mut self, index: usize, request: &[u8]) {
+        if let Some((native, payload)) = decode_native_message(request) {
+            self.handle_client_native(index, native, payload);
+            return;
+        }
         if request == b"ROOT" || request == b"OPEN_DIR /" {
             self.return_dir(index, self.fs.root_directory());
             return;
@@ -143,6 +172,127 @@ impl HxfsRuntime {
             return;
         }
         self.write_client(index, b"err:hxfs-invalid");
+    }
+
+    fn handle_client_native(&mut self, index: usize, request: HxfsRequest, payload: &[u8]) {
+        match request.op {
+            HxfsOp::GetInfo => self.write_client_response(
+                index,
+                request,
+                HxfsStatus::Ok,
+                HxfsHandleKind::Volume,
+                0,
+                hxfs_rights::ALL,
+                self.fs.volume_info().root_object_id,
+                self.fs.superblock().sequence_number,
+            ),
+            HxfsOp::OpenRoot => {
+                self.return_dir_abi_to_client(index, request, self.fs.root_directory())
+            }
+            HxfsOp::OpenPath => self.client_open_native(index, request, payload),
+            HxfsOp::Mkdir => self.client_mkdir_native(index, request, payload),
+            HxfsOp::CreateFile => self.client_create_file_native(index, request, payload),
+            HxfsOp::Rename => self.client_rename_native(index, request, payload),
+            HxfsOp::Unlink => self.client_unlink_native(index, request, payload),
+            HxfsOp::Fsync | HxfsOp::Checkpoint => self.client_checkpoint_native(index, request),
+            _ => self.write_client_status(index, request, HxfsStatus::Unsupported),
+        }
+    }
+
+    fn client_open_native(&mut self, index: usize, request: HxfsRequest, payload: &[u8]) {
+        let Ok(path) = core::str::from_utf8(payload) else {
+            self.write_client_status(index, request, HxfsStatus::Invalid);
+            return;
+        };
+        match request.handle_kind {
+            HxfsHandleKind::File => match self.fs.open_path(path) {
+                Ok(file) => self.return_file_abi_to_client(index, request, file),
+                Err(error) => self.write_client_status(index, request, status_for_error(error)),
+            },
+            HxfsHandleKind::Directory => match self.fs.open_directory_path(path) {
+                Ok(dir) => self.return_dir_abi_to_client(index, request, dir),
+                Err(error) => self.write_client_status(index, request, status_for_error(error)),
+            },
+            _ => self.write_client_status(index, request, HxfsStatus::Invalid),
+        }
+    }
+
+    fn client_mkdir_native(&mut self, index: usize, request: HxfsRequest, payload: &[u8]) {
+        let Ok(path) = core::str::from_utf8(payload) else {
+            self.write_client_status(index, request, HxfsStatus::Invalid);
+            return;
+        };
+        match self.fs.mkdir_path(path) {
+            Ok(dir) => self.return_dir_abi_to_client(index, request, dir),
+            Err(error) => self.write_client_status(index, request, status_for_error(error)),
+        }
+    }
+
+    fn client_create_file_native(&mut self, index: usize, request: HxfsRequest, payload: &[u8]) {
+        let Ok(path) = core::str::from_utf8(payload) else {
+            self.write_client_status(index, request, HxfsStatus::Invalid);
+            return;
+        };
+        match self.fs.create_file_path(path) {
+            Ok(file) => self.return_file_abi_to_client(index, request, file),
+            Err(error) => self.write_client_status(index, request, status_for_error(error)),
+        }
+    }
+
+    fn client_rename_native(&mut self, index: usize, request: HxfsRequest, payload: &[u8]) {
+        let Some((from, to)) = split_two_strings(payload) else {
+            self.write_client_status(index, request, HxfsStatus::Invalid);
+            return;
+        };
+        match self.fs.rename_path(from, to) {
+            Ok(()) => self.write_client_response(
+                index,
+                request,
+                HxfsStatus::Ok,
+                HxfsHandleKind::None,
+                0,
+                0,
+                0,
+                0,
+            ),
+            Err(error) => self.write_client_status(index, request, status_for_error(error)),
+        }
+    }
+
+    fn client_unlink_native(&mut self, index: usize, request: HxfsRequest, payload: &[u8]) {
+        let Ok(path) = core::str::from_utf8(payload) else {
+            self.write_client_status(index, request, HxfsStatus::Invalid);
+            return;
+        };
+        match self.fs.unlink_path(path) {
+            Ok(()) => self.write_client_response(
+                index,
+                request,
+                HxfsStatus::Ok,
+                HxfsHandleKind::None,
+                0,
+                0,
+                0,
+                0,
+            ),
+            Err(error) => self.write_client_status(index, request, status_for_error(error)),
+        }
+    }
+
+    fn client_checkpoint_native(&mut self, index: usize, request: HxfsRequest) {
+        match self.fs.publish_checkpoint() {
+            Ok(sequence) => self.write_client_response(
+                index,
+                request,
+                HxfsStatus::Ok,
+                HxfsHandleKind::Volume,
+                0,
+                hxfs_rights::SYNC,
+                self.fs.volume_info().root_object_id,
+                sequence,
+            ),
+            Err(error) => self.write_client_status(index, request, status_for_error(error)),
+        }
     }
 
     fn open_file_path(&mut self, index: usize, path: &[u8]) {
@@ -221,13 +371,145 @@ impl HxfsRuntime {
         }
     }
 
+    fn write_client_status(&self, index: usize, request: HxfsRequest, status: HxfsStatus) {
+        self.write_client_response_meta(index, request, error_meta(status), &[]);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn write_client_response(
+        &self,
+        index: usize,
+        request: HxfsRequest,
+        status: HxfsStatus,
+        handle_kind: HxfsHandleKind,
+        handle_id: u64,
+        rights: u64,
+        object_id: u64,
+        value: u64,
+    ) {
+        self.write_client_response_meta(
+            index,
+            request,
+            ResponseMeta {
+                status,
+                handle_kind,
+                handle_id,
+                rights,
+                object_id,
+                value,
+                flags: 0,
+            },
+            &[],
+        );
+    }
+
+    fn write_client_response_meta(
+        &self,
+        index: usize,
+        request: HxfsRequest,
+        meta: ResponseMeta,
+        payload: &[u8],
+    ) {
+        if let Some(client) = self.clients[index].as_ref() {
+            write_response_to_channel(client, request, meta, payload);
+        }
+    }
+
+    fn return_file_abi_to_client(&mut self, index: usize, request: HxfsRequest, file: FileHandle) {
+        let Some(slot) = self.files.iter_mut().find(|slot| slot.is_none()) else {
+            self.write_client_status(index, request, HxfsStatus::NoSpace);
+            return;
+        };
+        let Ok((client_end, server_end)) = Channel::pair() else {
+            self.write_client_status(index, request, HxfsStatus::NoSpace);
+            return;
+        };
+        let Some(client) = self.clients[index].as_ref() else {
+            return;
+        };
+        let response = make_response(
+            request,
+            ResponseMeta {
+                status: HxfsStatus::Ok,
+                handle_kind: HxfsHandleKind::File,
+                handle_id: file.object_id,
+                rights: hxfs_rights::READ | hxfs_rights::WRITE | hxfs_rights::SYNC,
+                object_id: file.object_id,
+                value: file.size,
+                flags: response_flags::HANDLE_TRANSFERRED,
+            },
+            0,
+        );
+        if client
+            .write_handle(&response, client_end.into_handle())
+            .is_err()
+        {
+            return;
+        }
+        *slot = Some(FileEndpoint {
+            channel: server_end,
+            handle: file,
+        });
+    }
+
+    fn return_dir_abi_to_client(
+        &mut self,
+        index: usize,
+        request: HxfsRequest,
+        dir: DirectoryHandle,
+    ) {
+        let Some(slot) = self.dirs.iter_mut().find(|slot| slot.is_none()) else {
+            self.write_client_status(index, request, HxfsStatus::NoSpace);
+            return;
+        };
+        let Ok((client_end, server_end)) = Channel::pair() else {
+            self.write_client_status(index, request, HxfsStatus::NoSpace);
+            return;
+        };
+        let Some(client) = self.clients[index].as_ref() else {
+            return;
+        };
+        let response = make_response(
+            request,
+            ResponseMeta {
+                status: HxfsStatus::Ok,
+                handle_kind: HxfsHandleKind::Directory,
+                handle_id: dir.object_id,
+                rights: hxfs_rights::READ
+                    | hxfs_rights::CREATE
+                    | hxfs_rights::MODIFY_DIRECTORY
+                    | hxfs_rights::SYNC,
+                object_id: dir.object_id,
+                value: 0,
+                flags: response_flags::HANDLE_TRANSFERRED,
+            },
+            0,
+        );
+        if client
+            .write_handle(&response, client_end.into_handle())
+            .is_err()
+        {
+            return;
+        }
+        *slot = Some(DirEndpoint {
+            channel: server_end,
+            handle: dir,
+        });
+    }
+
     fn poll_file(&mut self, index: usize) {
-        let mut buf = [0u8; 64];
+        let mut buf = [0u8; MAX_NATIVE_REQUEST_BYTES];
         loop {
             let Some(endpoint) = self.files[index].as_ref() else {
                 return;
             };
             match endpoint.channel.read_into(&mut buf) {
+                Ok(n) if decode_native_message(&buf[..n]).is_some() => {
+                    let Some((native, payload)) = decode_native_message(&buf[..n]) else {
+                        return;
+                    };
+                    self.handle_file_native(index, native, payload);
+                }
                 Ok(n) if &buf[..n] == b"INFO" => self.file_info(index),
                 Ok(n) if &buf[..n] == b"READ" => self.file_read_inline(index),
                 Ok(n) if &buf[..n] == b"READ_VMO" => self.file_read_vmo(index),
@@ -315,6 +597,158 @@ impl HxfsRuntime {
         }
     }
 
+    fn write_file_status(&self, index: usize, request: HxfsRequest, status: HxfsStatus) {
+        if let Some(endpoint) = self.files[index].as_ref() {
+            write_response_to_channel(&endpoint.channel, request, error_meta(status), &[]);
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn write_file_response(
+        &self,
+        index: usize,
+        request: HxfsRequest,
+        status: HxfsStatus,
+        file: FileHandle,
+        value: u64,
+        flags: u32,
+        payload: &[u8],
+    ) {
+        if let Some(endpoint) = self.files[index].as_ref() {
+            write_response_to_channel(
+                &endpoint.channel,
+                request,
+                ResponseMeta {
+                    status,
+                    handle_kind: HxfsHandleKind::File,
+                    handle_id: file.object_id,
+                    rights: hxfs_rights::READ | hxfs_rights::WRITE | hxfs_rights::SYNC,
+                    object_id: file.object_id,
+                    value,
+                    flags,
+                },
+                payload,
+            );
+        }
+    }
+
+    fn handle_file_native(&mut self, index: usize, request: HxfsRequest, payload: &[u8]) {
+        match request.op {
+            HxfsOp::GetInfo => self.file_info_native(index, request),
+            HxfsOp::ReadAt => self.file_read_native(index, request),
+            HxfsOp::WriteAt => self.file_write_native(index, request, payload),
+            HxfsOp::Truncate => self.file_truncate_native(index, request),
+            HxfsOp::Fsync | HxfsOp::Checkpoint => self.file_checkpoint_native(index, request),
+            _ => self.write_file_status(index, request, HxfsStatus::Unsupported),
+        }
+    }
+
+    fn file_info_native(&self, index: usize, request: HxfsRequest) {
+        let Some(endpoint) = self.files[index].as_ref() else {
+            return;
+        };
+        self.write_file_response(
+            index,
+            request,
+            HxfsStatus::Ok,
+            endpoint.handle,
+            endpoint.handle.size,
+            0,
+            &[],
+        );
+    }
+
+    fn file_read_native(&mut self, index: usize, request: HxfsRequest) {
+        let Some(endpoint) = self.files[index].as_ref() else {
+            return;
+        };
+        let requested = if request.arg1 == 0 {
+            MAX_READ_BYTES
+        } else {
+            match usize::try_from(request.arg1) {
+                Ok(value) => value.min(MAX_READ_BYTES),
+                Err(_) => {
+                    self.write_file_status(index, request, HxfsStatus::Invalid);
+                    return;
+                }
+            }
+        };
+        let mut out = [0u8; MAX_READ_BYTES];
+        match self
+            .fs
+            .read_file_at(endpoint.handle, request.arg0, &mut out[..requested])
+        {
+            Ok(n) => self.write_file_response(
+                index,
+                request,
+                HxfsStatus::Ok,
+                endpoint.handle,
+                n as u64,
+                response_flags::INLINE_PAYLOAD,
+                &out[..n],
+            ),
+            Err(error) => self.write_file_status(index, request, status_for_error(error)),
+        }
+    }
+
+    fn file_write_native(&mut self, index: usize, request: HxfsRequest, payload: &[u8]) {
+        let Some(handle) = self.files[index].as_ref().map(|endpoint| endpoint.handle) else {
+            return;
+        };
+        match self.fs.write_file_at(handle, request.arg0, payload) {
+            Ok(new_handle) => {
+                if let Some(endpoint) = self.files[index].as_mut() {
+                    endpoint.handle = new_handle;
+                }
+                self.write_file_response(
+                    index,
+                    request,
+                    HxfsStatus::Ok,
+                    new_handle,
+                    payload.len() as u64,
+                    response_flags::DIRTY,
+                    &[],
+                );
+            }
+            Err(error) => self.write_file_status(index, request, status_for_error(error)),
+        }
+    }
+
+    fn file_truncate_native(&mut self, index: usize, request: HxfsRequest) {
+        let Some(handle) = self.files[index].as_ref().map(|endpoint| endpoint.handle) else {
+            return;
+        };
+        match self.fs.truncate_file(handle, request.arg0) {
+            Ok(new_handle) => {
+                if let Some(endpoint) = self.files[index].as_mut() {
+                    endpoint.handle = new_handle;
+                }
+                self.write_file_response(
+                    index,
+                    request,
+                    HxfsStatus::Ok,
+                    new_handle,
+                    new_handle.size,
+                    response_flags::DIRTY,
+                    &[],
+                );
+            }
+            Err(error) => self.write_file_status(index, request, status_for_error(error)),
+        }
+    }
+
+    fn file_checkpoint_native(&mut self, index: usize, request: HxfsRequest) {
+        let Some(handle) = self.files[index].as_ref().map(|endpoint| endpoint.handle) else {
+            return;
+        };
+        match self.fs.publish_checkpoint() {
+            Ok(sequence) => {
+                self.write_file_response(index, request, HxfsStatus::Ok, handle, sequence, 0, &[])
+            }
+            Err(error) => self.write_file_status(index, request, status_for_error(error)),
+        }
+    }
+
     fn write_file(&self, index: usize, bytes: &[u8]) {
         if let Some(endpoint) = self.files[index].as_ref() {
             let _ = endpoint.channel.write(bytes);
@@ -322,12 +756,18 @@ impl HxfsRuntime {
     }
 
     fn poll_dir(&mut self, index: usize) {
-        let mut buf = [0u8; 320];
+        let mut buf = [0u8; MAX_NATIVE_REQUEST_BYTES];
         loop {
             let Some(endpoint) = self.dirs[index].as_ref() else {
                 return;
             };
             match endpoint.channel.read_into(&mut buf) {
+                Ok(n) if decode_native_message(&buf[..n]).is_some() => {
+                    let Some((native, payload)) = decode_native_message(&buf[..n]) else {
+                        return;
+                    };
+                    self.handle_dir_native(index, native, payload);
+                }
                 Ok(n) if &buf[..n] == b"LIST" => self.dir_list(index),
                 Ok(n) if buf[..n].starts_with(b"OPEN_FILE ") => {
                     let name = &buf[b"OPEN_FILE ".len()..n];
@@ -395,6 +835,276 @@ impl HxfsRuntime {
         });
     }
 
+    fn write_dir_status(&self, index: usize, request: HxfsRequest, status: HxfsStatus) {
+        if let Some(endpoint) = self.dirs[index].as_ref() {
+            write_response_to_channel(&endpoint.channel, request, error_meta(status), &[]);
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn write_dir_response(
+        &self,
+        index: usize,
+        request: HxfsRequest,
+        status: HxfsStatus,
+        dir: DirectoryHandle,
+        value: u64,
+        flags: u32,
+        payload: &[u8],
+    ) {
+        if let Some(endpoint) = self.dirs[index].as_ref() {
+            write_response_to_channel(
+                &endpoint.channel,
+                request,
+                ResponseMeta {
+                    status,
+                    handle_kind: HxfsHandleKind::Directory,
+                    handle_id: dir.object_id,
+                    rights: hxfs_rights::READ
+                        | hxfs_rights::CREATE
+                        | hxfs_rights::MODIFY_DIRECTORY
+                        | hxfs_rights::SYNC,
+                    object_id: dir.object_id,
+                    value,
+                    flags,
+                },
+                payload,
+            );
+        }
+    }
+
+    fn return_file_abi_to_dir(&mut self, index: usize, request: HxfsRequest, file: FileHandle) {
+        let Some(slot) = self.files.iter_mut().find(|slot| slot.is_none()) else {
+            self.write_dir_status(index, request, HxfsStatus::NoSpace);
+            return;
+        };
+        let Ok((client_end, server_end)) = Channel::pair() else {
+            self.write_dir_status(index, request, HxfsStatus::NoSpace);
+            return;
+        };
+        let Some(endpoint) = self.dirs[index].as_ref() else {
+            return;
+        };
+        let response = make_response(
+            request,
+            ResponseMeta {
+                status: HxfsStatus::Ok,
+                handle_kind: HxfsHandleKind::File,
+                handle_id: file.object_id,
+                rights: hxfs_rights::READ | hxfs_rights::WRITE | hxfs_rights::SYNC,
+                object_id: file.object_id,
+                value: file.size,
+                flags: response_flags::HANDLE_TRANSFERRED,
+            },
+            0,
+        );
+        if endpoint
+            .channel
+            .write_handle(&response, client_end.into_handle())
+            .is_err()
+        {
+            return;
+        }
+        *slot = Some(FileEndpoint {
+            channel: server_end,
+            handle: file,
+        });
+    }
+
+    fn return_dir_abi_to_dir(&mut self, index: usize, request: HxfsRequest, dir: DirectoryHandle) {
+        let Some(slot_index) = self.dirs.iter().position(|slot| slot.is_none()) else {
+            self.write_dir_status(index, request, HxfsStatus::NoSpace);
+            return;
+        };
+        let Ok((client_end, server_end)) = Channel::pair() else {
+            self.write_dir_status(index, request, HxfsStatus::NoSpace);
+            return;
+        };
+        let Some(endpoint) = self.dirs[index].as_ref() else {
+            return;
+        };
+        let response = make_response(
+            request,
+            ResponseMeta {
+                status: HxfsStatus::Ok,
+                handle_kind: HxfsHandleKind::Directory,
+                handle_id: dir.object_id,
+                rights: hxfs_rights::READ
+                    | hxfs_rights::CREATE
+                    | hxfs_rights::MODIFY_DIRECTORY
+                    | hxfs_rights::SYNC,
+                object_id: dir.object_id,
+                value: 0,
+                flags: response_flags::HANDLE_TRANSFERRED,
+            },
+            0,
+        );
+        if endpoint
+            .channel
+            .write_handle(&response, client_end.into_handle())
+            .is_err()
+        {
+            return;
+        }
+        self.dirs[slot_index] = Some(DirEndpoint {
+            channel: server_end,
+            handle: dir,
+        });
+    }
+
+    fn handle_dir_native(&mut self, index: usize, request: HxfsRequest, payload: &[u8]) {
+        match request.op {
+            HxfsOp::GetInfo => self.dir_info_native(index, request),
+            HxfsOp::ListDirectory => self.dir_list_native(index, request),
+            HxfsOp::OpenPath => self.dir_open_native(index, request, payload),
+            HxfsOp::CreateFile => self.dir_create_file_native(index, request, payload),
+            HxfsOp::Mkdir => self.dir_mkdir_native(index, request, payload),
+            HxfsOp::Rename => self.dir_rename_native(index, request, payload),
+            HxfsOp::Unlink => self.dir_unlink_native(index, request, payload),
+            HxfsOp::Fsync | HxfsOp::Checkpoint => self.dir_checkpoint_native(index, request),
+            _ => self.write_dir_status(index, request, HxfsStatus::Unsupported),
+        }
+    }
+
+    fn dir_info_native(&self, index: usize, request: HxfsRequest) {
+        let Some(endpoint) = self.dirs[index].as_ref() else {
+            return;
+        };
+        self.write_dir_response(
+            index,
+            request,
+            HxfsStatus::Ok,
+            endpoint.handle,
+            endpoint.handle.object_id,
+            0,
+            &[],
+        );
+    }
+
+    fn dir_list_native(&mut self, index: usize, request: HxfsRequest) {
+        let Some(endpoint) = self.dirs[index].as_ref() else {
+            return;
+        };
+        let mut out = [0u8; MAX_READ_BYTES];
+        match self.fs.list_directory(endpoint.handle, &mut out) {
+            Ok(n) => self.write_dir_response(
+                index,
+                request,
+                HxfsStatus::Ok,
+                endpoint.handle,
+                n as u64,
+                response_flags::INLINE_PAYLOAD,
+                &out[..n],
+            ),
+            Err(error) => self.write_dir_status(index, request, status_for_error(error)),
+        }
+    }
+
+    fn dir_open_native(&mut self, index: usize, request: HxfsRequest, payload: &[u8]) {
+        let Some(endpoint) = self.dirs[index].as_ref() else {
+            return;
+        };
+        let Ok(name) = core::str::from_utf8(payload) else {
+            self.write_dir_status(index, request, HxfsStatus::Invalid);
+            return;
+        };
+        match request.handle_kind {
+            HxfsHandleKind::File => match self.fs.open_child_file(endpoint.handle, name) {
+                Ok(file) => self.return_file_abi_to_dir(index, request, file),
+                Err(error) => self.write_dir_status(index, request, status_for_error(error)),
+            },
+            HxfsHandleKind::Directory => match self.fs.open_child_dir(endpoint.handle, name) {
+                Ok(dir) => self.return_dir_abi_to_dir(index, request, dir),
+                Err(error) => self.write_dir_status(index, request, status_for_error(error)),
+            },
+            _ => self.write_dir_status(index, request, HxfsStatus::Invalid),
+        }
+    }
+
+    fn dir_create_file_native(&mut self, index: usize, request: HxfsRequest, payload: &[u8]) {
+        let Some(parent) = self.dirs[index].as_ref().map(|endpoint| endpoint.handle) else {
+            return;
+        };
+        let Ok(name) = core::str::from_utf8(payload) else {
+            self.write_dir_status(index, request, HxfsStatus::Invalid);
+            return;
+        };
+        match self.fs.create_file_child(parent, name) {
+            Ok(file) => self.return_file_abi_to_dir(index, request, file),
+            Err(error) => self.write_dir_status(index, request, status_for_error(error)),
+        }
+    }
+
+    fn dir_mkdir_native(&mut self, index: usize, request: HxfsRequest, payload: &[u8]) {
+        let Some(parent) = self.dirs[index].as_ref().map(|endpoint| endpoint.handle) else {
+            return;
+        };
+        let Ok(name) = core::str::from_utf8(payload) else {
+            self.write_dir_status(index, request, HxfsStatus::Invalid);
+            return;
+        };
+        match self.fs.mkdir_child(parent, name) {
+            Ok(dir) => self.return_dir_abi_to_dir(index, request, dir),
+            Err(error) => self.write_dir_status(index, request, status_for_error(error)),
+        }
+    }
+
+    fn dir_rename_native(&mut self, index: usize, request: HxfsRequest, payload: &[u8]) {
+        let Some(parent) = self.dirs[index].as_ref().map(|endpoint| endpoint.handle) else {
+            return;
+        };
+        let Some((from, to)) = split_two_strings(payload) else {
+            self.write_dir_status(index, request, HxfsStatus::Invalid);
+            return;
+        };
+        match self.fs.rename_child(parent, from, parent, to) {
+            Ok(()) => self.write_dir_response(
+                index,
+                request,
+                HxfsStatus::Ok,
+                parent,
+                0,
+                response_flags::DIRTY,
+                &[],
+            ),
+            Err(error) => self.write_dir_status(index, request, status_for_error(error)),
+        }
+    }
+
+    fn dir_unlink_native(&mut self, index: usize, request: HxfsRequest, payload: &[u8]) {
+        let Some(parent) = self.dirs[index].as_ref().map(|endpoint| endpoint.handle) else {
+            return;
+        };
+        let Ok(name) = core::str::from_utf8(payload) else {
+            self.write_dir_status(index, request, HxfsStatus::Invalid);
+            return;
+        };
+        match self.fs.unlink_child(parent, name) {
+            Ok(()) => self.write_dir_response(
+                index,
+                request,
+                HxfsStatus::Ok,
+                parent,
+                0,
+                response_flags::DIRTY,
+                &[],
+            ),
+            Err(error) => self.write_dir_status(index, request, status_for_error(error)),
+        }
+    }
+
+    fn dir_checkpoint_native(&mut self, index: usize, request: HxfsRequest) {
+        let Some(parent) = self.dirs[index].as_ref().map(|endpoint| endpoint.handle) else {
+            return;
+        };
+        match self.fs.publish_checkpoint() {
+            Ok(sequence) => {
+                self.write_dir_response(index, request, HxfsStatus::Ok, parent, sequence, 0, &[])
+            }
+            Err(error) => self.write_dir_status(index, request, status_for_error(error)),
+        }
+    }
+
     fn write_dir(&self, index: usize, bytes: &[u8]) {
         if let Some(endpoint) = self.dirs[index].as_ref() {
             let _ = endpoint.channel.write(bytes);
@@ -429,7 +1139,7 @@ fn mount_from_bootstrap(bootstrap: &Channel) -> Option<MountedHxfs> {
                         return None;
                     }
                 }
-                match Hxfs::mount(reader) {
+                match FixedHxfsWriter::mount(reader) {
                     Ok(fs) => return Some(fs),
                     Err(error) => {
                         println!("[hxfs] mount failed: {:?}", error);
@@ -453,6 +1163,96 @@ fn strip_prefix<'a>(bytes: &'a [u8], prefix: &[u8]) -> Option<&'a [u8]> {
     } else {
         None
     }
+}
+
+fn decode_native_message(bytes: &[u8]) -> Option<(HxfsRequest, &[u8])> {
+    if bytes.len() < HXFS_REQUEST_BYTES {
+        return None;
+    }
+    let request = HxfsRequest::decode(&bytes[..HXFS_REQUEST_BYTES])?;
+    let payload_len = request.payload_len as usize;
+    if bytes.len() != HXFS_REQUEST_BYTES.checked_add(payload_len)? {
+        return None;
+    }
+    Some((request, &bytes[HXFS_REQUEST_BYTES..]))
+}
+
+fn make_response(
+    request: HxfsRequest,
+    meta: ResponseMeta,
+    payload_len: u32,
+) -> [u8; HXFS_RESPONSE_BYTES] {
+    HxfsResponse {
+        version: huesos_abi::hxfs::HXFS_PROTOCOL_VERSION,
+        reserved0: 0,
+        status: meta.status,
+        flags: meta.flags,
+        request_id: request.request_id,
+        handle_id: meta.handle_id,
+        handle_kind: meta.handle_kind,
+        rights: meta.rights,
+        object_id: meta.object_id,
+        value: meta.value,
+        payload_len,
+        reserved1: 0,
+    }
+    .encode()
+}
+
+fn write_response_to_channel(
+    channel: &Channel,
+    request: HxfsRequest,
+    meta: ResponseMeta,
+    payload: &[u8],
+) {
+    let mut out = [0u8; MAX_NATIVE_REQUEST_BYTES];
+    let payload_len = payload.len().min(HXFS_MAX_INLINE_WRITE_BYTES);
+    let response = make_response(request, meta, payload_len as u32);
+    out[..HXFS_RESPONSE_BYTES].copy_from_slice(&response);
+    out[HXFS_RESPONSE_BYTES..HXFS_RESPONSE_BYTES + payload_len]
+        .copy_from_slice(&payload[..payload_len]);
+    let _ = channel.write(&out[..HXFS_RESPONSE_BYTES + payload_len]);
+}
+
+fn error_meta(status: HxfsStatus) -> ResponseMeta {
+    ResponseMeta {
+        status,
+        handle_kind: HxfsHandleKind::None,
+        handle_id: 0,
+        rights: 0,
+        object_id: 0,
+        value: 0,
+        flags: 0,
+    }
+}
+
+fn status_for_error(error: HxfsError) -> HxfsStatus {
+    match error {
+        HxfsError::NotFound => HxfsStatus::NotFound,
+        HxfsError::AlreadyExists => HxfsStatus::AlreadyExists,
+        HxfsError::WrongType | HxfsError::DirectoryNotEmpty => HxfsStatus::WrongType,
+        HxfsError::NeedsRecovery | HxfsError::BadJournal => HxfsStatus::NeedsRecovery,
+        HxfsError::Io => HxfsStatus::IoError,
+        HxfsError::NoSpace => HxfsStatus::NoSpace,
+        HxfsError::Unsupported | HxfsError::UnsupportedFormat => HxfsStatus::Unsupported,
+        HxfsError::EncryptedVolume => HxfsStatus::EncryptedUnavailable,
+        HxfsError::BufferTooSmall
+        | HxfsError::OutOfRange
+        | HxfsError::BadChecksum
+        | HxfsError::BadBlock
+        | HxfsError::BadTree
+        | HxfsError::BadName => HxfsStatus::Invalid,
+    }
+}
+
+fn split_two_strings(bytes: &[u8]) -> Option<(&str, &str)> {
+    let split = bytes.iter().position(|&byte| byte == 0)?;
+    let left = core::str::from_utf8(&bytes[..split]).ok()?;
+    let right = core::str::from_utf8(&bytes[split + 1..]).ok()?;
+    if left.is_empty() || right.is_empty() {
+        return None;
+    }
+    Some((left, right))
 }
 
 fn write_size_info(out: &mut [u8], size: u64) -> usize {
