@@ -132,7 +132,8 @@ pub const fn engine_available(algorithm: u32) -> bool {
 #[cfg(feature = "compression-engines")]
 /// Feature-gated LZ4 block compression adapter using the selected audited crate.
 pub fn compress_lz4(input: &[u8], out: &mut [u8]) -> Result<usize, CompressionError> {
-    let written = lz4_flex::block::compress_into(input, out).map_err(|_| CompressionError::BadExtent)?;
+    let written =
+        lz4_flex::block::compress_into(input, out).map_err(|_| CompressionError::BadExtent)?;
     if written >= input.len() {
         return Err(CompressionError::Incompressible);
     }
