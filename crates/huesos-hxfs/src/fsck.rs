@@ -9,9 +9,15 @@ use crate::format::*;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FsckFinding {
     /// Required v3/v4/v5 checkpoint root is missing.
-    MissingRequiredRoot { root: FsckRoot },
+    MissingRequiredRoot {
+        /// Missing checkpoint root.
+        root: FsckRoot,
+    },
     /// A root is present without the feature bit that defines it.
-    UnexpectedRoot { root: FsckRoot },
+    UnexpectedRoot {
+        /// Unexpected checkpoint root.
+        root: FsckRoot,
+    },
     /// Root-store feature combination is invalid.
     BadFeatureSet,
     /// Root-store is Recovering and needs journal replay before ordinary mount.

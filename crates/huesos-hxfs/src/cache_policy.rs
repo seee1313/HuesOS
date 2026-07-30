@@ -317,7 +317,7 @@ pub enum MmapDecision {
 
 /// Decide mmap handling for a file request.
 pub fn decide_mmap(request: MmapRequest) -> Result<MmapDecision, CachePolicyError> {
-    if request.length == 0 || request.offset % BLOCK_SIZE_U64 != 0 {
+    if request.length == 0 || !request.offset.is_multiple_of(BLOCK_SIZE_U64) {
         return Err(CachePolicyError::Invalid);
     }
     if request.encrypted || request.compressed {
