@@ -100,6 +100,25 @@ Hxblob remain future production work.
 
 ---
 
+
+### 0.4 Follow-up implementation status — S/T/U/V/W
+
+The cache/topology/NVMe/tools/fsck foundation slice is now implemented:
+
+```text
+Stage S — no-heap cache/writeback/mmap/direct-I/O policy core   DONE FOUNDATION
+Stage T — Hxfs v5 virtual-volume/GPT topology roots             DONE FOUNDATION
+Stage U — NVMe queue timeout/reset telemetry policy core         DONE FOUNDATION
+Stage V — mkhxfs/inspect/install-layout development tools        DONE FOUNDATION
+Stage W — report-only fsck/scrub foundation                      DONE FOUNDATION
+```
+
+Important limitation: runtime writable mmap, live NVMe driver-host scheduler
+changes, destructive fsck repair, and full installer integration remain future
+work.
+
+---
+
 ## 1. Целевая философия
 
 Главный принцип HuesOS storage:
@@ -1000,7 +1019,7 @@ R6 test(hxblob): add dedup/corruption/remount tests
 
 ---
 
-## Stage S — Cache, mmap, direct I/O, and read/write performance
+## Stage S — Cache, mmap, direct I/O, and read/write performance — FOUNDATION DONE
 
 Goal:
 
@@ -1055,7 +1074,7 @@ S7 bench(hxfs): add NVMe-oriented performance smoke tests
 
 ---
 
-## Stage T — VolumeManager, GPT, and virtual volume production
+## Stage T — VolumeManager, GPT, and virtual volume production — FOUNDATION DONE
 
 Goal:
 
@@ -1098,7 +1117,7 @@ T5 test(hxfs): add virtual volume policy/remount tests
 
 ---
 
-## Stage U — NVMe production performance and reliability
+## Stage U — NVMe production performance and reliability — FOUNDATION DONE
 
 Goal:
 
@@ -1154,7 +1173,7 @@ U6 docs(nvme): record production reliability contract
 
 ---
 
-## Stage V — Image builder, installer, migration, and recovery tooling
+## Stage V — Image builder, installer, migration, and recovery tooling — FOUNDATION DONE
 
 Goal:
 
@@ -1196,7 +1215,7 @@ V5 docs(storage): document install/recovery layout
 
 ---
 
-## Stage W — Scrub, fsck, and repair
+## Stage W — Scrub, fsck, and repair — FOUNDATION DONE
 
 Goal:
 

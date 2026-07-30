@@ -1170,3 +1170,75 @@ Still deferred:
 - no-heap Zstd encoder/decoder backend selection;
 - `hxfs-service` BlobView native operations;
 - DriverManager/package resolver integration with Hxblob.
+
+---
+
+## 37. Stage S/T/U/V/W cache, topology, NVMe reliability, tools, and fsck
+
+Stage S adds no-heap runtime policy cores, not runtime mmap enablement:
+
+```text
+cache_policy::FixedCache
+cache_policy::WritebackQueue
+cache_policy::decide_mmap
+cache_policy::decide_direct_io
+```
+
+Writable mmap is intentionally denied in this foundation until coherent dirty
+VMO writeback is designed. Encrypted/compressed files are also denied for direct
+mmap because they need transform layers.
+
+Stage T advances Hxfs to format v5 and adds checkpoint fields for installation
+and topology cooperation:
+
+```text
+virtual_volume_tree_lba
+gpt_summary_lba
+install_manifest_lba
+```
+
+The no-heap topology/GPT cores are:
+
+```text
+volume_topology::VirtualVolumeTree
+gpt::parse_gpt_header
+gpt::parse_partition_entry
+```
+
+These enforce the selected virtual-volume rules: no nested volumes and no moving
+objects between volumes.
+
+Stage U adds NVMe reliability policy cores before changing the live DriverHost:
+
+```text
+huesos_nvme::reliability::QueueSlotTracker
+huesos_nvme::reliability::ResetController
+huesos_nvme::reliability::NvmeTelemetry
+huesos_nvme::reliability::MaintenanceOp
+```
+
+This models queue-full handling, command timeout, reset -> reidentify, and
+flush/discard/write-zeroes support checks.
+
+Stage V adds development install/recovery tools:
+
+```text
+tools/mkhxfs.py
+tools/hxfs-inspect.py
+tools/hxfs-install-layout.py
+tools/hxfs_image.py
+```
+
+These are dependency-free Python tools for creating a minimal Hxfs v5 image,
+inspecting root/checkpoint metadata, and printing an install layout plan.
+
+Stage W adds report-only fsck/scrub foundations:
+
+```text
+fsck::scrub_checkpoint_roots
+fsck::scrub_accounting
+tools/hxfs-scrub.py
+```
+
+Repair remains deliberately out of scope for this slice. Automatic repair is a
+destructive operation and must be reviewed separately.
