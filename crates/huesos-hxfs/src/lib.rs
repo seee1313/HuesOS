@@ -9,9 +9,14 @@
 #![cfg_attr(not(test), no_std)]
 #![warn(missing_docs)]
 
+#[cfg(any(test, feature = "writer"))]
+extern crate alloc;
+
 pub mod crc32c;
 pub mod format;
 pub mod reader;
+#[cfg(any(test, feature = "writer"))]
+pub mod writer;
 
 use crate::crc32c::metadata_crc32c;
 use crate::format::*;

@@ -13,8 +13,8 @@ are intentionally not treated as the versioned project baseline unless they are
 copied into `docs/` in a dedicated review. The versioned baseline remains this
 file plus `safety-budget.json`.
 
-At the current baseline (`safety-budget.json`) the repository contains 185
-first-party Rust files and 52,511 Rust lines. The measured surface is **265**
+At the current baseline (`safety-budget.json`) the repository contains 186
+first-party Rust files and 53,339 Rust lines. The measured surface is **265**
 unsafe blocks, **63** unsafe functions, **29** unsafe impls, one `static mut`,
 **25** unwrap calls, **21** expect calls, and **5** panic macros. Prior baseline
 values are retained in the changelog sections below so that any deviation
@@ -2337,6 +2337,33 @@ read-only prototype.
 No new unsafe Rust is introduced. This is handle routing, fixed-capacity client
 and endpoint tables, and the existing safe Hxfs `BlockReader` abstraction backed
 by `libcanvas::block::BlockDevice`.
+
+### Safety-budget delta (measured)
+
+```
+unsafe_blocks:    265 -> 265 (unchanged).
+unsafe_functions:  63 ->  63 (unchanged).
+unsafe_impls:      29 ->  29 (unchanged).
+static_mut:         1 ->   1 (unchanged).
+unwrap_calls:      25 ->  25 (unchanged).
+expect_calls:      21 ->  21 (unchanged).
+panic_macros:       5 ->   5 (unchanged).
+```
+
+## Hxfs Stage-H COW writer and snapshots (safety-budget-neutral)
+
+Stage H adds the first Hxfs mutation engine in `crates/huesos-hxfs::writer`.
+It is host-testable and append-only: new file data, directory blocks, extent
+blocks, object tables, volume tables, and checkpoints are written to fresh 4 KiB
+blocks, then the superblock/root-store pointer is republished. The writer
+supports mkdir, create file, create path-level symlink, overwrite, truncate with
+sparse extension, rename, unlink of files/empty directories, checkpoint commit,
+and read-only snapshot create/delete/open. Encrypted volumes remain rejected in
+Stage H until the AES-XTS key/policy layer is implemented.
+
+No unsafe Rust is introduced. The writer uses safe `alloc` containers and the
+existing read-only parser to verify committed images and snapshot views in host
+tests.
 
 ### Safety-budget delta (measured)
 

@@ -465,12 +465,17 @@ next-stage expansion items; they are not blockers for the Immediate milestone.
   separate `hxfs-service` userspace process now mounts the VolumeManager
   filesystem-candidate BlockDevice and exposes directory/file handles over
   async channels.
-- **Needed**: on-target NVMe/SSD data-path soak and then Stage H write/COW work.
-  A future performance slice can replace the current synchronous service
-  execution with deeper async queue-slot tracking, but Stage C's public
-  Channel+Port service contract, Stage D's Volume handles, Stage E's BlobFS read
-  path, Stage F's DevFS handle namespace, and Stage G's Hxfs read-only service
-  path are now present.
+- **Hxfs Stage-H COW writer foundation landed**: `crates/huesos-hxfs::writer`
+  implements append-only COW mutation over Hxfs images with mkdir, create,
+  path-level symlink, overwrite, truncate/sparse extension, rename, unlink,
+  checkpoint commit, and read-only snapshot create/delete/open in host tests.
+  Encrypted volumes are still rejected until the AES-XTS policy/key layer lands.
+- **Needed**: on-target NVMe/SSD data-path soak and then Hxfs write service
+  persistence over BlockDevice. A future performance slice can replace the
+  current synchronous service execution with deeper async queue-slot tracking,
+  but Stage C's public Channel+Port service contract, Stage D's Volume handles,
+  Stage E's BlobFS read path, Stage F's DevFS handle namespace, Stage G's Hxfs
+  read-only service path, and Stage H's host-tested COW writer are now present.
 - **PS/2 driver ownership (fully migrated as of PR-E)**: the scancode
   decoder, shift-state machine, and key-event dispatch live only in the
   userspace `driver-host:input` process. The kernel keeps a
