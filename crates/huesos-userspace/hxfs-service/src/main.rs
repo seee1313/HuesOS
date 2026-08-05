@@ -20,9 +20,16 @@ const MAX_FILE_HANDLES: usize = 8;
 const MAX_DIR_HANDLES: usize = 8;
 const MAX_READ_BYTES: usize = 4096;
 const MAX_NATIVE_REQUEST_BYTES: usize = HXFS_REQUEST_BYTES + HXFS_MAX_INLINE_WRITE_BYTES;
-const SERVICE_MAX_OBJECTS: usize = 32;
-const SERVICE_MAX_DIR_ENTRIES: usize = 64;
-const SERVICE_MAX_EXTENTS: usize = 64;
+// Sized to fit the `mount_from_bootstrap` -> `FixedHxfsWriter::mount`
+// stack frame inside `USER_STACK_SIZE` (64 KiB). The previous
+// 32/64/64 capacities put roughly 30 KiB of fixed `[Option<T>; N]`
+// arrays on the stack in a single frame, which overflowed the
+// guard page (`user-fault rip=0x403f4d address=0x7ffffefef688` in
+// the qemu-nvme-boot smoke). The seed v5 image uses only a handful
+// of objects/entries/extents, so 16/16/16 leaves comfortable headroom.
+const SERVICE_MAX_OBJECTS: usize = 16;
+const SERVICE_MAX_DIR_ENTRIES: usize = 16;
+const SERVICE_MAX_EXTENTS: usize = 16;
 
 struct BlockDeviceReader {
     device: libcanvas::block::BlockDevice,
