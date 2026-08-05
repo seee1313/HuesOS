@@ -6,7 +6,14 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-from hxfs_image import build_empty_image
+from hxfs_image import build_empty_image, build_empty_image_stream
+
+
+# Memory-resident builder is only used for tiny development images
+# (loopback smoke, single-block unit tests). Anything bigger than this
+# is built via the streaming variant so a developer or CI runner does
+# not need to allocate the whole image in Python heap.
+IN_MEMORY_BLOCK_LIMIT = 1024
 
 
 def parse_uuid(text: str) -> bytes:
@@ -34,10 +41,17 @@ def main() -> int:
         help="System virtual volume UUID as hex",
     )
     args = parser.parse_args()
-    image = build_empty_image(args.blocks, args.instance_uuid, args.volume_uuid)
-    args.output.parent.mkdir(parents=True, exist_ok=True)
-    args.output.write_bytes(image)
-    print(f"wrote {args.output} ({len(image)} bytes)")
+    if args.blocks <= IN_MEMORY_BLOCK_LIMIT:
+        image = build_empty_image(args.blocks, args.instance_uuid, args.volume_uuid)
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        args.output.write_bytes(image)
+        print(f"wrote {args.output} ({len(image)} bytes)")
+    else:
+        build_empty_image_stream(
+            args.output, args.blocks, args.instance_uuid, args.volume_uuid
+        )
+        size_bytes = args.blocks * 4096
+        print(f"wrote {args.output} ({size_bytes} bytes, streaming)")
     return 0
 
 

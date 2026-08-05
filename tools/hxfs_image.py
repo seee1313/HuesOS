@@ -123,6 +123,98 @@ def build_empty_image(size_blocks: int, instance_uuid: bytes, volume_uuid: bytes
     return bytes(image)
 
 
+def build_empty_image_stream(
+    out_path: Path,
+    size_blocks: int,
+    instance_uuid: bytes,
+    volume_uuid: bytes,
+) -> None:
+    """Write an Hxfs v5 empty image to `out_path` without buffering the full
+    file in memory.
+
+    The original `build_empty_image` materializes the entire image as a
+    `bytearray`, which fails with `MemoryError` for any realistic NVMe
+    target (a 4 GiB QEMU image needs 4 GiB of resident Python heap, far
+    beyond the budget a developer or CI runner is willing to spend on a
+    tooling step). This streaming variant writes the metadata blocks at
+    the head of the file and then extends the file with zeroed blocks via
+    sparse allocation, so the on-disk size matches `size_blocks` while
+    peak Python memory stays at a single metadata block (~4 KiB).
+
+    The resulting image is bit-for-bit identical to the in-memory builder
+    for the metadata region; only the trailing region differs in that
+    it is implicitly zero-filled by the filesystem instead of explicitly
+    zero-filled in Python. Hxfs treats unwritten blocks as zero-filled by
+    design, so this is safe.
+    """
+    if size_blocks < 8:
+        raise ValueError("Hxfs image needs at least 8 blocks")
+    if len(instance_uuid) != 16 or len(volume_uuid) != 16:
+        raise ValueError("UUIDs must be exactly 16 bytes")
+
+    super_payload = bytearray(120)
+    super_payload[0:16] = FORMAT_GUID
+    super_payload[16:20] = le32(FORMAT_VERSION)
+    super_payload[20:24] = le32(TYPE_SYSTEM_VERSION)
+    super_payload[24:40] = instance_uuid
+    super_payload[40:48] = le64(1)
+    super_payload[48:52] = le32(BLOCK_SIZE)
+    super_payload[56:64] = le64(1)
+    super_payload[104:112] = le64(BASE_INCOMPAT_FEATURES)
+    super_payload[112:116] = le32(ROOT_STATE_CLEAN)
+    superblock = make_block(BLOCK_TYPE_SUPERBLOCK, 0, 0, bytes(super_payload))
+
+    checkpoint_payload = bytearray(128)
+    checkpoint_payload[0:8] = le64(1)
+    checkpoint_payload[8:16] = le64(2)
+    checkpoint_payload[16:20] = le32(1)
+    checkpoint_payload[24:40] = volume_uuid
+    checkpoint = make_block(BLOCK_TYPE_CHECKPOINT, 0, 1, bytes(checkpoint_payload))
+
+    volume_payload = bytearray(16 + 96)
+    volume_payload[0:4] = le32(1)
+    record = 16
+    volume_payload[record:record + 16] = volume_uuid
+    volume_payload[record + 16:record + 24] = le64(1)
+    volume_payload[record + 24:record + 32] = le64(3)
+    volume_payload[record + 32:record + 36] = le32(1)
+    volume_payload[record + 36:record + 40] = le32(VOLUME_FLAG_SYSTEM)
+    volume_table = make_block(BLOCK_TYPE_VOLUME_TABLE, 0, 2, bytes(volume_payload))
+
+    object_payload = bytearray(16 + 64)
+    object_payload[0:4] = le32(1)
+    offset = 16
+    object_payload[offset:offset + 8] = le64(1)
+    object_payload[offset + 8:offset + 12] = le32(OBJECT_TYPE_DIRECTORY)
+    object_payload[offset + 12:offset + 16] = le32(1)
+    object_payload[offset + 40:offset + 48] = le64(4)
+    object_table = make_block(BLOCK_TYPE_OBJECT_TABLE, 1, 3, bytes(object_payload))
+
+    dir_payload = bytearray(16)
+    dir_payload[0:8] = le64(1)
+    dir_payload[8:12] = le32(0)
+    directory = make_block(BLOCK_TYPE_DIRECTORY, 1, 4, bytes(dir_payload))
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    total_bytes = size_blocks * BLOCK_SIZE
+    metadata_bytes = 5 * BLOCK_SIZE
+    with open(out_path, "wb") as f:
+        f.write(superblock)
+        f.write(checkpoint)
+        f.write(volume_table)
+        f.write(object_table)
+        f.write(directory)
+        if total_bytes > metadata_bytes:
+            # Use sparse allocation: seek past the metadata region and
+            # let the kernel extend the file with implicit zero blocks.
+            # `truncate` afterwards ensures the file size matches the
+            # requested image size even on filesystems that do not
+            # honour sparse seeks (e.g. CI tmpfs with strict quota).
+            f.seek(total_bytes - 1)
+            f.write(b"\x00")
+            f.truncate(total_bytes)
+
+
 def parse_superblock(image: bytes) -> dict[str, object]:
     if len(image) < BLOCK_SIZE:
         raise ValueError("image too small")
