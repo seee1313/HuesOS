@@ -62,8 +62,15 @@ impl BlockReader for BlockDeviceReader {
 
 impl BlockStore for BlockDeviceReader {
     fn write_blocks(&mut self, lba: u64, blocks: u32, input: &[u8]) -> Result<(), HxfsError> {
+        let lbas = lba
+            .checked_mul(u64::from(HXFS_LBA_FACTOR))
+            .ok_or(HxfsError::OutOfRange)?;
+        let total = u64::from(blocks)
+            .checked_mul(u64::from(HXFS_LBA_FACTOR))
+            .ok_or(HxfsError::OutOfRange)?;
+        let total = u32::try_from(total).map_err(|_| HxfsError::OutOfRange)?;
         self.device
-            .write_blocks(lba, blocks, input)
+            .write_blocks(lbas, total, input)
             .map_err(|_| HxfsError::Io)
     }
 
