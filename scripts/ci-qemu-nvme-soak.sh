@@ -114,7 +114,7 @@ fi
 
 required=(
     "[driver-host:nvme] identified"
-    "service:block:nvme"
+    "[driver-manager] registered identified block:nvme namespace"
     "[hxfs] service started"
 )
 for marker in "${required[@]}"; do
@@ -138,7 +138,8 @@ for regression in \
     '[hxfs] journal replay failed: BadBlock' \
     '[hxfs] superblock checksum mismatch' \
     '[hxfs] service exiting: mount failed' \
-    '[driver-manager] Hxfs service channel failed'; do
+    '[driver-manager] Hxfs service channel failed' \
+    '[user-fault] process=hxfs-service'; do
     if grep -Fq "$regression" "$log"; then
         echo "[soak] regression marker present: $regression" >&2
         wc -l "$log" >&2; head -2000 "$log" >&2
