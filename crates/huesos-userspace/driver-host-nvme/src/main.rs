@@ -333,8 +333,18 @@ pub extern "C" fn _start() -> ! {
                 let _ = bootstrap.write(b"service:block:nvme:identified");
                 let _ = bootstrap.write(b"driver-host:nvme:ready");
             }
-            Err(error) => {
-                println!("[driver-host:nvme] controller bring-up failed: {}", error);
+            Err((error, detail)) => {
+                match detail {
+                    Some(reason) => {
+                        println!(
+                            "[driver-host:nvme] controller bring-up failed: {} ({})",
+                            error, reason
+                        );
+                    }
+                    None => {
+                        println!("[driver-host:nvme] controller bring-up failed: {}", error);
+                    }
+                }
                 let _ = bootstrap.write(b"service:block:nvme:bringup-failed");
             }
         }
@@ -350,24 +360,32 @@ pub extern "C" fn _start() -> ! {
     }
 }
 
-fn bring_up_controller(state: &NvmeBootstrap) -> Result<DriverRuntime, &'static str> {
-    let mmio = state.slot(ResourceSlotKind::Mmio).ok_or("mmio-slot")?;
-    let irq = state.slot(ResourceSlotKind::Irq).ok_or("irq-slot")?;
-    let dma = state.slot(ResourceSlotKind::DmaPool).ok_or("dma-slot")?;
+fn bring_up_controller(
+    state: &NvmeBootstrap,
+) -> Result<DriverRuntime, (&'static str, Option<&'static str>)> {
+    let mmio = state
+        .slot(ResourceSlotKind::Mmio)
+        .ok_or(("mmio-slot", None))?;
+    let irq = state
+        .slot(ResourceSlotKind::Irq)
+        .ok_or(("irq-slot", None))?;
+    let dma = state
+        .slot(ResourceSlotKind::DmaPool)
+        .ok_or(("dma-slot", None))?;
     let Some(mmio_handle) = mmio.handle() else {
-        return Err("mmio-handle");
+        return Err(("mmio-handle", None));
     };
     let Some(dma_handle) = dma.handle() else {
-        return Err("dma-handle");
+        return Err(("dma-handle", None));
     };
     let flags = libcanvas::vmar_flags::USER
         | libcanvas::vmar_flags::SPECIFIC
         | libcanvas::vmar_flags::READ
         | libcanvas::vmar_flags::WRITE;
     libcanvas::resource::map_self(mmio_handle, 0, MMIO_MAP_ADDR, mmio.len, flags)
-        .map_err(|_| "map-mmio")?;
+        .map_err(|_| ("map-mmio", None))?;
     libcanvas::resource::map_self(dma_handle, 0, DMA_MAP_ADDR, dma.len, flags)
-        .map_err(|_| "map-dma")?;
+        .map_err(|_| ("map-dma", None))?;
 
     let resources = DeviceResources {
         reg_bar: BarRegion {
@@ -384,7 +402,7 @@ fn bring_up_controller(state: &NvmeBootstrap) -> Result<DriverRuntime, &'static 
             size: dma.len,
         },
     };
-    let interrupt_state = bind_interrupts(irq)?;
+    let interrupt_state = bind_interrupts(irq).map_err(|label| (label, None))?;
     let interrupt_first = interrupt_state.count != 0;
     let transport = PciMmioTransport::new(resources);
     let mut controller = Controller::new(transport, dma.base, dma.len);
@@ -397,9 +415,15 @@ fn bring_up_controller(state: &NvmeBootstrap) -> Result<DriverRuntime, &'static 
         msix_available: interrupt_first && irq.len > 1,
         msi_available: interrupt_first && irq.len == 1,
     };
-    let info = controller
-        .init_with_config(config)
-        .map_err(nvme_error_label)?;
+    let info = controller.init_with_config(config).map_err(|error| {
+        let detail = match error {
+            NvmeError::InvalidIdentifyController | NvmeError::InvalidIdentifyNamespace => {
+                Some(controller.last_identify_error().unwrap_or("unknown"))
+            }
+            _ => None,
+        };
+        (nvme_error_label(error), detail)
+    })?;
     println!(
         "[driver-host:nvme] identified nsid={} block_size={} block_count={} max_request={} queues={} irq={:#x}+{:#x} bound_irqs={}",
         info.namespace.nsid,
