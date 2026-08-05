@@ -75,6 +75,13 @@ pub fn parse_controller(
 }
 
 /// Parse Identify Namespace data for `nsid`.
+///
+/// Falls back to LBAF0 when the FLBAS-selected LBAF reports an unsupported
+/// `LBADS`. This keeps the bring-up path working on QEMU / older firmware
+/// that reports a non-zero `NLBAF` but leaves the default format descriptor
+/// with `LBADS = 0` (reserved). The NVMe spec reserves `LBADS = 0`, so the
+/// fallback still rejects genuinely empty namespaces; it only rescues
+/// namespaces whose chosen LBAF slot is malformed while LBAF0 is sane.
 pub fn parse_namespace(nsid: u32, data: &[u8]) -> Result<NamespaceInfo, IdentifyError> {
     if data.len() < IDENTIFY_BYTES {
         return Err(IdentifyError::BufferTooSmall);
@@ -88,13 +95,27 @@ pub fn parse_namespace(nsid: u32, data: &[u8]) -> Result<NamespaceInfo, Identify
     if lbaf_index >= 16 {
         return Err(IdentifyError::InvalidLbaFormat);
     }
-    let lbaf_offset = 128 + lbaf_index * 4;
-    // NVMe LBAF entry layout: MS[0..2], LBADS[2], RP[3].
-    // Reading byte 3 here accidentally reads relative performance.
     let lbads = *data
-        .get(lbaf_offset + 2)
+        .get(128 + lbaf_index * 4 + 2)
         .ok_or(IdentifyError::BufferTooSmall)?;
+    // NVMe LBAF entry layout: MS[0..2], LBADS[2], RP[3].
     if !(9..=16).contains(&lbads) {
+        // LBAF0 fallback: if the FLBAS-selected format is unusable but
+        // LBAF0 has a valid LBADS, prefer LBAF0. This matches the policy
+        // already used by the BlockDevice bring-up code: the first
+        // namespace is always served as LBAF0 regardless of FLBAS.
+        if let Some(fallback) = data.get(128 + 2) {
+            if (9..=16).contains(fallback) {
+                let block_size = 1u32
+                    .checked_shl(u32::from(*fallback))
+                    .ok_or(IdentifyError::UnsupportedLbaSize)?;
+                return Ok(NamespaceInfo {
+                    nsid,
+                    block_count,
+                    block_size,
+                });
+            }
+        }
         return Err(IdentifyError::UnsupportedLbaSize);
     }
     let block_size = 1u32
@@ -185,6 +206,42 @@ mod tests {
         );
         data[0..8].copy_from_slice(&1u64.to_le_bytes());
         data[128 + 2] = 8;
+        assert_eq!(
+            parse_namespace(1, &data),
+            Err(IdentifyError::UnsupportedLbaSize)
+        );
+    }
+
+    #[test]
+    fn namespace_falls_back_to_lbaf0_when_flbas_is_unusable() {
+        // FLBAS selects LBAF1 (lbaf_index=1) but LBAF1.LBADS=0 (reserved).
+        // LBAF0.LBADS=9 is valid. The parser must fall back to LBAF0.
+        let mut data = [0u8; IDENTIFY_BYTES];
+        data[0..8].copy_from_slice(&2048u64.to_le_bytes());
+        data[26] = 1; // FLBAS -> LBAF1
+                      // LBAF0.LBADS=9 (byte 130).
+        data[128 + 2] = 9;
+        // LBAF1.LBADS=0 (byte 134) — reserved, would reject without fallback.
+        data[128 + 4 + 2] = 0;
+        assert_eq!(
+            parse_namespace(1, &data),
+            Ok(NamespaceInfo {
+                nsid: 1,
+                block_count: 2048,
+                block_size: 512,
+            })
+        );
+    }
+
+    #[test]
+    fn namespace_rejects_when_both_flbas_and_lbaf0_are_unusable() {
+        // FLBAS=LBAF0 with LBADS=0, and LBAF0 itself has LBADS=0. The
+        // fallback cannot rescue this case: the namespace has no usable
+        // format descriptor and we must still reject.
+        let mut data = [0u8; IDENTIFY_BYTES];
+        data[0..8].copy_from_slice(&1024u64.to_le_bytes());
+        data[26] = 0; // FLBAS -> LBAF0
+                      // LBAF0.LBADS stays 0 (reserved).
         assert_eq!(
             parse_namespace(1, &data),
             Err(IdentifyError::UnsupportedLbaSize)

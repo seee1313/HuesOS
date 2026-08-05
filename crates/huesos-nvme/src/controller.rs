@@ -8,7 +8,7 @@
 
 use crate::cmd::{build, identify, Cqe, Sqe};
 use crate::identify::{
-    parse_controller, parse_namespace, ControllerInfo, NamespaceInfo, IDENTIFY_BYTES,
+    parse_controller, parse_namespace, ControllerInfo, IdentifyError, NamespaceInfo, IDENTIFY_BYTES,
 };
 use crate::queue_plan::{plan_queues, InterruptMode, QueuePlan, QueuePlanInput};
 use crate::regs::{aqa, cap, cc, csts, off};
@@ -109,6 +109,11 @@ pub struct Controller<T: NvmeTransport> {
     nsid: u32,
     nsze: u64,
     lba_size: u32,
+    // Last Identify parser error (for diagnostics; `None` until a parse
+    // failure is observed). Public accessor exposes the reason so the
+    // userspace DriverHost can print a precise failure marker without
+    // changing the public error type.
+    last_identify_error: Option<&'static str>,
     identify_buf: u64,
     io_data_buf: u64,
     io_data_buf_size: u64,
@@ -150,6 +155,7 @@ impl<T: NvmeTransport> Controller<T> {
             nsid: 1,
             nsze: 0,
             lba_size: 0,
+            last_identify_error: None,
             identify_buf: 0,
             io_data_buf: 0,
             io_data_buf_size: 0,
@@ -181,6 +187,21 @@ impl<T: NvmeTransport> Controller<T> {
     /// Number of I/O queue pairs created during initialization.
     pub fn io_queue_count(&self) -> usize {
         self.io_queue_count
+    }
+
+    /// Reason of the most recent Identify parse failure, if any.
+    ///
+    /// The synchronous `NvmeError::InvalidIdentifyController` and
+    /// `NvmeError::InvalidIdentifyNamespace` variants intentionally do not
+    /// carry a sub-reason to keep the public error type stable, but on a
+    /// real bring-up failure it is essential for the DriverHost to log the
+    /// exact parser rejection (`buffer-too-small`, `empty-namespace`, etc.)
+    /// rather than a single opaque marker. The DriverHost calls this
+    /// immediately after `init_with_config` returns an
+    /// `InvalidIdentify{Controller,Namespace}` to print a precise reason.
+    /// `None` before the first failure (including the success path).
+    pub fn last_identify_error(&self) -> Option<&'static str> {
+        self.last_identify_error
     }
 
     /// Borrow the underlying transport.
@@ -353,8 +374,10 @@ impl<T: NvmeTransport> Controller<T> {
 
         let mut ctrl_id = [0u8; IDENTIFY_BYTES];
         self.t.dma_read(self.identify_buf, &mut ctrl_id);
-        let controller_info = parse_controller(&ctrl_id, self.page_size)
-            .map_err(|_| NvmeError::InvalidIdentifyController)?;
+        let controller_info = parse_controller(&ctrl_id, self.page_size).map_err(|e| {
+            self.last_identify_error = Some(identify_error_label(e));
+            NvmeError::InvalidIdentifyController
+        })?;
         self.mdts = controller_info.max_request_bytes;
         self.io_data_buf_size = self.mdts as u64;
         self.io_data_buf = self.dma_alloc_zeroed(self.io_data_buf_size, ps)?;
@@ -369,8 +392,10 @@ impl<T: NvmeTransport> Controller<T> {
 
         let mut ns_id = [0u8; IDENTIFY_BYTES];
         self.t.dma_read(self.identify_buf, &mut ns_id);
-        let namespace_info =
-            parse_namespace(self.nsid, &ns_id).map_err(|_| NvmeError::InvalidIdentifyNamespace)?;
+        let namespace_info = parse_namespace(self.nsid, &ns_id).map_err(|e| {
+            self.last_identify_error = Some(identify_error_label(e));
+            NvmeError::InvalidIdentifyNamespace
+        })?;
         self.nsze = namespace_info.block_count;
         self.lba_size = namespace_info.block_size;
 
@@ -619,6 +644,16 @@ impl<T: NvmeTransport> Controller<T> {
 fn ready_poll_budget(capv: u64) -> u32 {
     let timeout_ms = cap::timeout_ms(capv).max(500);
     timeout_ms.saturating_mul(200).min(u32::MAX as u64) as u32
+}
+
+fn identify_error_label(error: IdentifyError) -> &'static str {
+    match error {
+        IdentifyError::BufferTooSmall => "buffer-too-small",
+        IdentifyError::InvalidMdts => "invalid-mdts",
+        IdentifyError::EmptyNamespace => "empty-namespace",
+        IdentifyError::InvalidLbaFormat => "invalid-lba-format",
+        IdentifyError::UnsupportedLbaSize => "unsupported-lba-size",
+    }
 }
 
 fn sqe_to_bytes(sqe: &Sqe) -> [u8; 64] {
