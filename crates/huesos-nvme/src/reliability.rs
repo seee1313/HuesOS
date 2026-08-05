@@ -380,10 +380,7 @@ mod tests {
     #[test]
     fn queue_slot_complete_unknown_request_is_not_found() {
         let mut tracker = QueueSlotTracker::<4>::new();
-        assert_eq!(
-            tracker.complete(999),
-            Err(ReliabilityError::NotFound)
-        );
+        assert_eq!(tracker.complete(999), Err(ReliabilityError::NotFound));
     }
 
     #[test]
@@ -416,10 +413,7 @@ mod tests {
         // test pins that contract.
         let mut reset = ResetController::new(10);
         assert_eq!(reset.state(), ResetState::Online);
-        assert_eq!(
-            reset.begin_reset(100),
-            Err(ReliabilityError::ResetRequired)
-        );
+        assert_eq!(reset.begin_reset(100), Err(ReliabilityError::ResetRequired));
     }
 
     #[test]
@@ -471,19 +465,11 @@ mod tests {
         // flag, not the block count. The WriteZeroes op has
         // the same shape.
         assert_eq!(
-            validate_maintenance(
-                MaintenanceOp::Discard { lba: 0, blocks: 0 },
-                true,
-                true
-            ),
+            validate_maintenance(MaintenanceOp::Discard { lba: 0, blocks: 0 }, true, true),
             Err(ReliabilityError::Unsupported)
         );
         assert_eq!(
-            validate_maintenance(
-                MaintenanceOp::WriteZeroes { lba: 0, blocks: 0 },
-                true,
-                true
-            ),
+            validate_maintenance(MaintenanceOp::WriteZeroes { lba: 0, blocks: 0 }, true, true),
             Err(ReliabilityError::Unsupported)
         );
     }

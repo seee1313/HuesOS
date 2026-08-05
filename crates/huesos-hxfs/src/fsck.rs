@@ -392,6 +392,8 @@ mod tests {
         assert!(report
             .findings()
             .contains(&Some(FsckFinding::ReferenceMismatch)));
-        assert!(!report.findings().contains(&Some(FsckFinding::QuotaMismatch)));
+        assert!(!report
+            .findings()
+            .contains(&Some(FsckFinding::QuotaMismatch)));
     }
 }

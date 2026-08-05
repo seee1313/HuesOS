@@ -297,11 +297,7 @@ mod tests {
 
     #[test]
     fn truncate_against_a_directory_handle_is_wrong_kind() {
-        let req = request(
-            HxfsOp::Truncate,
-            HxfsHandleKind::Directory,
-            rights::WRITE,
-        );
+        let req = request(HxfsOp::Truncate, HxfsHandleKind::Directory, rights::WRITE);
         assert_eq!(validate_request_rights(req), Err(SecurityError::WrongKind));
     }
 
@@ -317,9 +313,15 @@ mod tests {
 
     #[test]
     fn path_rejects_empty_and_overlong_inputs() {
-        assert_eq!(validate_path(b"", PathMode::Absolute), Err(SecurityError::BadPath));
+        assert_eq!(
+            validate_path(b"", PathMode::Absolute),
+            Err(SecurityError::BadPath)
+        );
         let overlong = [b'a'; HXFS_MAX_PATH_BYTES + 1];
-        assert_eq!(validate_path(&overlong, PathMode::Absolute), Err(SecurityError::BadPath));
+        assert_eq!(
+            validate_path(&overlong, PathMode::Absolute),
+            Err(SecurityError::BadPath)
+        );
     }
 
     #[test]
