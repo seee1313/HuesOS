@@ -361,4 +361,130 @@ mod tests {
         assert_eq!(telemetry.flushes, 1);
         assert_eq!(telemetry.discards, 1);
     }
+
+    // Production-gate NVMe reliability coverage: each test pins
+    // one invariant from the timeout/reset contract in
+    // docs/STORAGE_NVME_FS_ROADMAP.md §M (Stage U).
+    //
+    //   U1 feat(nvme): implement multi-slot async completion tracking
+    //   U2 feat(nvme): add command timeout and reset policy
+    //   U3 feat(nvme): map flush/discard/write-zeroes operations
+    //   U4 test(nvme): add MSI-X/MSI/polling fallback tests
+    //   U5 bench(nvme): add high-queue-depth block benchmarks
+    //
+    // The queue-slot tracker and reset state machine are the
+    // only piece wired into the host-test surface today; the
+    // tests below pin their boundary contracts so the
+    // future driver-host integration cannot regress them.
+
+    #[test]
+    fn queue_slot_complete_unknown_request_is_not_found() {
+        let mut tracker = QueueSlotTracker::<4>::new();
+        assert_eq!(
+            tracker.complete(999),
+            Err(ReliabilityError::NotFound)
+        );
+    }
+
+    #[test]
+    fn queue_slot_expired_returns_first_indexed_expired() {
+        // expired_request walks slots in index order and
+        // returns the first slot whose deadline_tick has been
+        // reached. The slot-insertion order is preserved by
+        // the linear scan; the second submit (request 11)
+        // gets a smaller deadline (now=2 + 5 = 7) than the
+        // first (now=1 + 100 = 101), so at tick 10 the
+        // function returns Some(11) without ever inspecting
+        // slot 0.
+        let mut tracker = QueueSlotTracker::<4>::new();
+        assert_eq!(tracker.submit(10, 1, 100), Ok(()));
+        assert_eq!(tracker.submit(11, 2, 5), Ok(()));
+        // At tick 6, neither has expired.
+        assert_eq!(tracker.expired_request(6), None);
+        // At tick 10, slot 1 (deadline 7) is expired; the
+        // linear scan returns it even though slot 0
+        // (deadline 101) is not yet expired.
+        assert_eq!(tracker.expired_request(10), Some(11));
+    }
+
+    #[test]
+    fn reset_state_machine_rejects_begin_when_online() {
+        // A begin_reset issued while the controller is still
+        // Online (no prior timeout) must surface ResetRequired,
+        // not silently transition. The driver-host wrapper
+        // gates reset on a prior command_timed_out call; this
+        // test pins that contract.
+        let mut reset = ResetController::new(10);
+        assert_eq!(reset.state(), ResetState::Online);
+        assert_eq!(
+            reset.begin_reset(100),
+            Err(ReliabilityError::ResetRequired)
+        );
+    }
+
+    #[test]
+    fn reset_poll_timeout_does_not_reset_to_failed_when_already_reidentify() {
+        // The reset state machine must not regress Reidentify
+        // back to Failed; once re-identification is in
+        // flight, the timeout branch is irrelevant and the
+        // state stays Reidentify.
+        let mut reset = ResetController::new(10);
+        reset.command_timed_out(7);
+        assert!(reset.begin_reset(100).is_ok());
+        assert_eq!(reset.poll_reset(105, true), ResetState::Reidentify);
+        // A second tick past the timeout must NOT move to
+        // Failed; hardware_ready=true already advanced the
+        // state to Reidentify, and the timeout branch only
+        // fires from Resetting.
+        assert_eq!(reset.poll_reset(1_000, true), ResetState::Reidentify);
+    }
+
+    #[test]
+    fn reset_reidentify_complete_when_not_reidentify_is_a_no_op() {
+        // Calling reidentify_complete on a state that is not
+        // Reidentify must not move to Online. The early Online
+        // state is the most important; reidentify_complete
+        // there must leave the state as Online and not flap.
+        let mut reset = ResetController::new(10);
+        assert_eq!(reset.state(), ResetState::Online);
+        reset.reidentify_complete();
+        assert_eq!(reset.state(), ResetState::Online);
+    }
+
+    #[test]
+    fn telemetry_zero_init_counters_all_start_at_zero() {
+        let telemetry = NvmeTelemetry::default();
+        assert_eq!(telemetry.submitted, 0);
+        assert_eq!(telemetry.completed, 0);
+        assert_eq!(telemetry.timeouts, 0);
+        assert_eq!(telemetry.resets, 0);
+        assert_eq!(telemetry.queue_full, 0);
+        assert_eq!(telemetry.flushes, 0);
+        assert_eq!(telemetry.discards, 0);
+        assert_eq!(telemetry.write_zeroes, 0);
+    }
+
+    #[test]
+    fn maintenance_zero_blocks_discard_is_unsupported() {
+        // The Discard op is rejected on any namespace that has
+        // blocks=0; a non-zero blocks value gates the support
+        // flag, not the block count. The WriteZeroes op has
+        // the same shape.
+        assert_eq!(
+            validate_maintenance(
+                MaintenanceOp::Discard { lba: 0, blocks: 0 },
+                true,
+                true
+            ),
+            Err(ReliabilityError::Unsupported)
+        );
+        assert_eq!(
+            validate_maintenance(
+                MaintenanceOp::WriteZeroes { lba: 0, blocks: 0 },
+                true,
+                true
+            ),
+            Err(ReliabilityError::Unsupported)
+        );
+    }
 }

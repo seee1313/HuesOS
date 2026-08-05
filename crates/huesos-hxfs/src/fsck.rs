@@ -296,4 +296,102 @@ mod tests {
             .findings()
             .contains(&Some(FsckFinding::QuotaMismatch)));
     }
+
+    // Production-gate scrub/fsck coverage: each test pins one
+    // invariant from the report-only scrub path in
+    // docs/STORAGE_NVME_FS_ROADMAP.md §N (Stage W).
+    //
+    //   W1 feat(hxfs): add metadata tree scrub walker
+    //   W2 feat(hxfs): validate extent ownership and backrefs
+    //   W3 feat(hxblob): validate blob hashes and Merkle roots
+    //   W4 feat(tools): add read-only hxfs-scrub tool
+    //   W5 docs(hxfs): define repair policy before implementation
+    //
+    // The current host-test surface covers the clean / missing
+    // / accounting-mismatch branches. The tests below pin
+    // boundary behaviour: report capacity, recovery state,
+    // feature-flag accounting, and the post-condition that
+    // a clean report is a clean report.
+
+    #[test]
+    fn report_is_clean_only_when_no_findings_are_recorded() {
+        let report = scrub_checkpoint_roots::<8>(
+            superblock(
+                BASE_INCOMPAT_FEATURES
+                    | FEATURE_INCOMPAT_QUOTA_ENFORCEMENT
+                    | FEATURE_INCOMPAT_HXBLOB_INDEX,
+                ROOT_STATE_CLEAN,
+            ),
+            checkpoint(),
+        );
+        assert!(report.is_clean());
+        // A clean report must have zero findings.
+        let mut count = 0usize;
+        let mut index = 0;
+        while index < report.findings().len() {
+            if report.findings()[index].is_some() {
+                count += 1;
+            }
+            index += 1;
+        }
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn recovering_root_state_without_journal_replays_need_a_walk() {
+        // The scrub walker must report NeedsJournalReplay
+        // whenever the superblock root_state is Recovering,
+        // even if the checkpoint itself looks valid. The
+        // recovery is a precondition for the walk to make
+        // meaningful claims about the data layout.
+        let report = scrub_checkpoint_roots::<8>(
+            superblock(BASE_INCOMPAT_FEATURES, ROOT_STATE_RECOVERING),
+            checkpoint(),
+        );
+        assert!(report
+            .findings()
+            .contains(&Some(FsckFinding::NeedsJournalReplay)));
+    }
+
+    #[test]
+    fn missing_hxblob_index_when_feature_set_is_reported() {
+        // The Hxblob index root is required when the
+        // FEATURE_INCOMPAT_HXBLOB_INDEX incompat bit is
+        // advertised in the superblock. The scrub walker
+        // must not silently skip this requirement.
+        let mut checkpoint = checkpoint();
+        checkpoint.hxblob_index_tree_lba = 0;
+        let report = scrub_checkpoint_roots::<8>(
+            superblock(
+                BASE_INCOMPAT_FEATURES | FEATURE_INCOMPAT_HXBLOB_INDEX,
+                ROOT_STATE_CLEAN,
+            ),
+            checkpoint,
+        );
+        assert!(report
+            .findings()
+            .contains(&Some(FsckFinding::MissingRequiredRoot {
+                root: FsckRoot::HxblobIndex,
+            })));
+    }
+
+    #[test]
+    fn accounting_match_is_a_clean_report() {
+        // When recorded values match the observed values, the
+        // accounting scrub must produce no findings.
+        let report = scrub_accounting::<4>(10, 10, 10, 10, 10);
+        assert!(report.is_clean());
+    }
+
+    #[test]
+    fn accounting_object_count_mismatch_alone_is_reported() {
+        // A pure object-count mismatch (refcount = 0 but
+        // objects_in_use != 0) must surface ReferenceMismatch
+        // even when the byte counters are equal.
+        let report = scrub_accounting::<4>(0, 5, 5, 5, 5);
+        assert!(report
+            .findings()
+            .contains(&Some(FsckFinding::ReferenceMismatch)));
+        assert!(!report.findings().contains(&Some(FsckFinding::QuotaMismatch)));
+    }
 }

@@ -245,4 +245,117 @@ mod tests {
             Err(SecurityError::RequestQuota)
         );
     }
+
+    // Production-gate security hardening coverage: each test
+    // pins one invariant from the rights/path/quota contract in
+    // docs/STORAGE_NVME_FS_ROADMAP.md §O (Stage X).
+    //
+    //   X1 feat(abi): define Hxfs handle rights
+    //   X2 feat(hxfs-service): enforce rights and request quotas
+    //   X3 feat(hxfs): harden path/symlink/name validation
+    //   X4 fuzz(hxfs): add ABI/path resolver fuzz targets
+    //   X5 docs(audit): record Hxfs service security boundary
+
+    #[test]
+    fn unknown_right_bits_are_rejected() {
+        // A request that carries rights bits outside the
+        // known rights::ALL mask must surface UnknownRights,
+        // not silently accept. The validate_request_rights
+        // contract guarantees this so a future rights-bit
+        // addition cannot accidentally pass an unrelated bit.
+        let mut req = request(HxfsOp::GetInfo, HxfsHandleKind::Volume, rights::READ);
+        // A bit well above the highest known rights bit.
+        req.rights = rights::ALL | (1u64 << 60);
+        assert_eq!(
+            validate_request_rights(req),
+            Err(SecurityError::UnknownRights)
+        );
+    }
+
+    #[test]
+    fn getinfo_requires_no_specific_rights() {
+        // GetInfo is a metadata read; any non-zero rights bit
+        // set is accepted (the caller may have full rights on
+        // the volume handle), and missing rights are not a
+        // failure. The strict-required check only fires for
+        // ops that have a non-zero required mask.
+        let req = request(HxfsOp::GetInfo, HxfsHandleKind::Volume, 0);
+        assert_eq!(validate_request_rights(req), Ok(()));
+    }
+
+    #[test]
+    fn rename_against_a_file_handle_is_wrong_kind() {
+        // Rename must operate on a directory or volume; a
+        // file handle is the wrong kind.
+        let req = request(
+            HxfsOp::Rename,
+            HxfsHandleKind::File,
+            rights::MODIFY_DIRECTORY,
+        );
+        assert_eq!(validate_request_rights(req), Err(SecurityError::WrongKind));
+    }
+
+    #[test]
+    fn truncate_against_a_directory_handle_is_wrong_kind() {
+        let req = request(
+            HxfsOp::Truncate,
+            HxfsHandleKind::Directory,
+            rights::WRITE,
+        );
+        assert_eq!(validate_request_rights(req), Err(SecurityError::WrongKind));
+    }
+
+    #[test]
+    fn snapshot_op_against_file_handle_is_wrong_kind() {
+        let req = request(
+            HxfsOp::CreateSnapshot,
+            HxfsHandleKind::File,
+            rights::SNAPSHOT,
+        );
+        assert_eq!(validate_request_rights(req), Err(SecurityError::WrongKind));
+    }
+
+    #[test]
+    fn path_rejects_empty_and_overlong_inputs() {
+        assert_eq!(validate_path(b"", PathMode::Absolute), Err(SecurityError::BadPath));
+        let overlong = [b'a'; HXFS_MAX_PATH_BYTES + 1];
+        assert_eq!(validate_path(&overlong, PathMode::Absolute), Err(SecurityError::BadPath));
+    }
+
+    #[test]
+    fn single_name_path_rejects_absolute_prefix() {
+        // A SingleName is a single directory entry; it must
+        // not contain a path separator. The "/" prefix is
+        // therefore rejected.
+        assert_eq!(
+            validate_path(b"/etc", PathMode::SingleName),
+            Err(SecurityError::BadPath)
+        );
+    }
+
+    #[test]
+    fn symlink_depth_at_max_is_admitted_at_max_plus_one_is_rejected() {
+        // The exact boundary: MAX_SYMLINK_DEPTH must succeed
+        // and one more must fail. This is the policy table
+        // contract that the resolver walks; the boundary
+        // cannot be off-by-one without breaking production
+        // mounts.
+        assert_eq!(validate_symlink_depth(0), Ok(()));
+        assert_eq!(validate_symlink_depth(MAX_SYMLINK_DEPTH), Ok(()));
+        assert_eq!(
+            validate_symlink_depth(MAX_SYMLINK_DEPTH + 1),
+            Err(SecurityError::SymlinkLimit)
+        );
+    }
+
+    #[test]
+    fn request_quota_at_limit_admits_one_more_is_over() {
+        // admit_request counts outstanding requests per
+        // client; the contract admits up to
+        // MAX_OUTSTANDING_REQUESTS_PER_CLIENT outstanding,
+        // and the next one is rejected.
+        let max = MAX_OUTSTANDING_REQUESTS_PER_CLIENT;
+        assert_eq!(admit_request(max - 1), Ok(()));
+        assert_eq!(admit_request(max), Err(SecurityError::RequestQuota));
+    }
 }
