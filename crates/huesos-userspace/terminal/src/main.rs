@@ -64,14 +64,42 @@ fn wait_for_registry(bootstrap: &Channel) -> Channel {
     }
 }
 
+/// Maximum number of registry polls before \`open_service\` gives up and
+/// returns an error. The bound prevents the terminal from yield-spinning
+/// forever when the requested service is unavailable (e.g. hxfs-service
+/// exited during a failed mount) and spamming the serial log with
+/// repeated \`ignored unknown registry handle message\` markers. At 100
+/// polls with a single yield each this is well below the timeout window
+/// DriverManager itself uses for service bring-up.
+const OPEN_SERVICE_MAX_POLLS: u32 = 100;
+
 fn open_service(registry: &Channel, request: &[u8], response: &[u8]) -> libcanvas::Result<Channel> {
     let mut buf = [0u8; 64];
     registry.write(request)?;
+    let mut polls: u32 = 0;
     loop {
         match registry.read_channel_handle(&mut buf) {
             Ok((n, channel)) if &buf[..n] == response => return Ok(channel),
-            Ok((_n, _channel)) => println!("[terminal] ignored unknown registry handle message"),
+            Ok((_n, _channel)) => {
+                polls = polls.saturating_add(1);
+                if polls >= OPEN_SERVICE_MAX_POLLS {
+                    println!(
+                        "[terminal] open_service: giving up after {} polls (peer keeps sending unknown handles)",
+                        polls
+                    );
+                    return Err(ErrorCode::TimedOut);
+                }
+                libcanvas::process::yield_now();
+            }
             Err(ErrorCode::ShouldWait) | Err(ErrorCode::InvalidArgs) | Err(ErrorCode::TimedOut) => {
+                polls = polls.saturating_add(1);
+                if polls >= OPEN_SERVICE_MAX_POLLS {
+                    println!(
+                        "[terminal] open_service: giving up after {} polls (registry did not answer)",
+                        polls
+                    );
+                    return Err(ErrorCode::TimedOut);
+                }
                 libcanvas::process::yield_now();
             }
             Err(e) => return Err(e),
