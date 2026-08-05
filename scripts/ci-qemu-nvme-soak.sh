@@ -102,13 +102,13 @@ set -e
 # A healthy OS intentionally keeps running, so timeout(1)'s 124 is expected.
 if [[ "$status" != 0 && "$status" != 124 ]]; then
     echo "[soak] QEMU exited unexpectedly with status $status" >&2
-    tail -200 "$log" >&2 || true
+    wc -l "$log" >&2; head -2000 "$log" >&2 || true
     exit 1
 fi
 
 if grep -Fq 'KERNEL PANIC' "$log" || grep -Fq '[hxfs] PANIC' "$log"; then
     echo "[soak] panic marker detected" >&2
-    tail -200 "$log" >&2 || true
+    wc -l "$log" >&2; head -2000 "$log" >&2 || true
     exit 1
 fi
 
@@ -121,7 +121,7 @@ for marker in "${required[@]}"; do
     if ! grep -Fq "$marker" "$log"; then
         echo "[soak] missing marker: $marker" >&2
         echo "[soak] last 200 serial lines:" >&2
-        tail -200 "$log" >&2 || true
+        wc -l "$log" >&2; head -2000 "$log" >&2 || true
         exit 1
     fi
 done
@@ -129,13 +129,19 @@ done
 # Negative markers that must NOT appear. The mount path against an
 # Hxfs image must succeed; \`journal replay failed: BadBlock\` would
 # mean the smoke is back to using a raw namespace instead of the
-# Hxfs image, so we fail fast.
+# Hxfs image, so we fail fast. \`[hxfs] service exiting: mount
+# failed\` and \`[driver-manager] Hxfs service channel failed\`
+# would mean the on-target trace left behind by the now-fixed
+# yield-spin-on-failure regression in the hxfs service or the
+# DriverManager service-channel poll.
 for regression in \
     '[hxfs] journal replay failed: BadBlock' \
-    '[hxfs] superblock checksum mismatch'; do
+    '[hxfs] superblock checksum mismatch' \
+    '[hxfs] service exiting: mount failed' \
+    '[driver-manager] Hxfs service channel failed'; do
     if grep -Fq "$regression" "$log"; then
         echo "[soak] regression marker present: $regression" >&2
-        tail -200 "$log" >&2 || true
+        wc -l "$log" >&2; head -2000 "$log" >&2
         exit 1
     fi
 done
