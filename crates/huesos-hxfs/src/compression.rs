@@ -197,6 +197,7 @@ pub const COMPRESSED_BLOCK_LIMIT: usize = 4096;
 /// storing compressed payloads that are larger than the input
 /// would waste media and complicate the on-disk layout. A codec
 /// that cannot compress returns `Plain` instead.
+#[derive(Debug)]
 pub enum CompressOutcome<'a> {
     /// Store `input` verbatim in a normal uncompressed extent.
     Plain,
@@ -222,6 +223,16 @@ pub enum CompressOutcome<'a> {
 /// [`CompressionError::BadChecksum`] so the Hxfs service can
 /// distinguish a payload that is the wrong shape from one that is
 /// the right shape but bit-rotted.
+///
+/// The shape checks (`payload.len() == compressed_bytes`,
+/// `out.len() >= uncompressed_bytes`) and the algorithm/engine
+/// dispatch run *before* the CRC check so the caller can
+/// distinguish a payload that is the wrong shape
+/// ([`CompressionError::BadExtent`]) or points at an engine
+/// that is not linked ([`CompressionError::EngineUnavailable`])
+/// from a payload that is the right shape but bit-rotted
+/// ([`CompressionError::BadChecksum`]). The on-disk Hxfs service
+/// translates each variant into a distinct serial marker.
 pub fn decompress_block(
     extent: &CompressedExtent,
     payload: &[u8],
@@ -232,9 +243,6 @@ pub fn decompress_block(
     }
     if extent.uncompressed_bytes as usize > out.len() {
         return Err(CompressionError::BadExtent);
-    }
-    if crc32c(payload) != extent.payload_crc32c {
-        return Err(CompressionError::BadChecksum);
     }
     let written = match extent.algorithm {
         COMPRESSION_NONE => {
@@ -263,6 +271,9 @@ pub fn decompress_block(
     };
     if written != extent.uncompressed_bytes as usize {
         return Err(CompressionError::BadExtent);
+    }
+    if crc32c(payload) != extent.payload_crc32c {
+        return Err(CompressionError::BadChecksum);
     }
     Ok(())
 }
@@ -462,5 +473,306 @@ mod tests {
             }),
             Err(CompressionError::BadExtent)
         );
+    }
+
+    // --- Stage Q production-pipeline tests ---
+
+    fn lz4_policy(min_size: u32) -> CompressionPolicy {
+        CompressionPolicy {
+            policy_id: 1,
+            algorithm: COMPRESSION_LZ4,
+            min_size_bytes: min_size,
+        }
+    }
+
+    fn none_policy() -> CompressionPolicy {
+        CompressionPolicy {
+            policy_id: 0,
+            algorithm: COMPRESSION_NONE,
+            min_size_bytes: 0,
+        }
+    }
+
+    fn repeat_byte(byte: u8, len: usize, out: &mut [u8]) {
+        let mut index = 0usize;
+        while index < len && index < out.len() {
+            out[index] = byte;
+            index += 1;
+        }
+    }
+
+    #[test]
+    fn compress_block_returns_plain_for_empty_input() {
+        let policy = lz4_policy(1);
+        let input: [u8; 0] = [];
+        let mut scratch = [0u8; 64];
+        match compress_block(policy, &input, &mut scratch) {
+            Ok(CompressOutcome::Plain) => {}
+            other => assert!(
+                false,
+                "empty input must fall back to Plain, got {:?}",
+                other
+            ),
+        }
+    }
+
+    #[test]
+    fn compress_block_returns_plain_for_none_policy() {
+        let policy = none_policy();
+        let mut input = [0u8; 4096];
+        repeat_byte(0xab, input.len(), &mut input);
+        let mut scratch = [0u8; 4096];
+        match compress_block(policy, &input, &mut scratch) {
+            Ok(CompressOutcome::Plain) => {}
+            other => assert!(
+                false,
+                "COMPRESSION_NONE must fall back to Plain, got {:?}",
+                other
+            ),
+        }
+    }
+
+    #[test]
+    fn compress_block_returns_plain_for_below_threshold() {
+        // min_size_bytes above the input size: the policy says
+        // "don't bother compressing small files".
+        let policy = lz4_policy(8192);
+        let mut input = [0u8; 256];
+        repeat_byte(0xcd, input.len(), &mut input);
+        let mut scratch = [0u8; 4096];
+        match compress_block(policy, &input, &mut scratch) {
+            Ok(CompressOutcome::Plain) => {}
+            other => assert!(
+                false,
+                "below-threshold input must fall back to Plain, got {:?}",
+                other
+            ),
+        }
+    }
+
+    #[test]
+    fn compress_block_rejects_oversize_input() {
+        // Input larger than the on-disk extent limit is not a
+        // valid candidate for the pipeline.
+        let policy = lz4_policy(1);
+        let mut scratch = [0u8; 8192];
+        let input = [0u8; 8192];
+        match compress_block(policy, &input, &mut scratch) {
+            Err(CompressionError::BadExtent) => {}
+            other => {
+                assert!(
+                    false,
+                    "oversize input must surface BadExtent, got {:?}",
+                    other
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn compress_block_rejects_undersize_scratch() {
+        // Scratch buffer must be at least as large as the input
+        // so the codec can write its worst-case output.
+        let policy = lz4_policy(1);
+        let input = [0u8; 256];
+        let mut scratch = [0u8; 128];
+        match compress_block(policy, &input, &mut scratch) {
+            Err(CompressionError::BadExtent) => {}
+            other => {
+                assert!(
+                    false,
+                    "undersize scratch must surface BadExtent, got {:?}",
+                    other
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn resolve_compression_policy_finds_known_and_rejects_unknown() {
+        let table = [none_policy(), lz4_policy(4096)];
+        assert_eq!(resolve_compression_policy(0, &table), Ok(none_policy()));
+        assert_eq!(resolve_compression_policy(1, &table), Ok(lz4_policy(4096)));
+        assert_eq!(
+            resolve_compression_policy(99, &table),
+            Err(CompressionError::InvalidPolicy)
+        );
+        // An empty table must reject every id, not panic.
+        assert_eq!(
+            resolve_compression_policy(0, &[]),
+            Err(CompressionError::InvalidPolicy)
+        );
+    }
+
+    #[test]
+    fn decompress_block_rejects_payload_length_mismatch() {
+        let extent = CompressedExtent {
+            logical_block: 0,
+            physical_block: 10,
+            uncompressed_bytes: 100,
+            compressed_bytes: 50,
+            algorithm: COMPRESSION_LZ4,
+            payload_crc32c: 0xdead_beef,
+        };
+        // A payload of 49 bytes does not match compressed_bytes = 50.
+        let mut out = [0u8; 100];
+        let payload = [0u8; 49];
+        assert_eq!(
+            decompress_block(&extent, &payload, &mut out),
+            Err(CompressionError::BadExtent)
+        );
+    }
+
+    #[test]
+    fn decompress_block_rejects_undersize_output() {
+        let extent = CompressedExtent {
+            logical_block: 0,
+            physical_block: 10,
+            uncompressed_bytes: 100,
+            compressed_bytes: 50,
+            algorithm: COMPRESSION_LZ4,
+            payload_crc32c: 0,
+        };
+        let payload = [0u8; 50];
+        let mut out = [0u8; 64]; // smaller than uncompressed_bytes
+        assert_eq!(
+            decompress_block(&extent, &payload, &mut out),
+            Err(CompressionError::BadExtent)
+        );
+    }
+
+    #[test]
+    fn decompress_block_rejects_unknown_algorithm() {
+        let extent = CompressedExtent {
+            logical_block: 0,
+            physical_block: 10,
+            uncompressed_bytes: 100,
+            compressed_bytes: 50,
+            algorithm: 99,
+            payload_crc32c: 0,
+        };
+        let payload = [0u8; 50];
+        let mut out = [0u8; 100];
+        assert_eq!(
+            decompress_block(&extent, &payload, &mut out),
+            Err(CompressionError::UnknownAlgorithm)
+        );
+    }
+
+    #[test]
+    fn decompress_block_rejects_unavailable_engine() {
+        // COMPRESSION_ZSTD is not linked in this build, so the
+        // engine should be reported as unavailable regardless of
+        // the input shape.
+        let extent = CompressedExtent {
+            logical_block: 0,
+            physical_block: 10,
+            uncompressed_bytes: 100,
+            compressed_bytes: 50,
+            algorithm: COMPRESSION_ZSTD,
+            payload_crc32c: 0,
+        };
+        let payload = [0u8; 50];
+        let mut out = [0u8; 100];
+        assert_eq!(
+            decompress_block(&extent, &payload, &mut out),
+            Err(CompressionError::EngineUnavailable)
+        );
+    }
+
+    #[test]
+    fn decompress_block_rejects_bad_crc_for_plain_payload() {
+        // Even on the COMPRESSION_NONE branch the CRC must match;
+        // a corrupt plain payload must surface as BadChecksum,
+        // not as a successful decode.
+        let payload = [0u8; 32];
+        let extent = CompressedExtent {
+            logical_block: 0,
+            physical_block: 10,
+            uncompressed_bytes: 32,
+            compressed_bytes: 32,
+            algorithm: COMPRESSION_NONE,
+            payload_crc32c: 0xdead_beef, // wrong on purpose
+        };
+        let mut out = [0u8; 32];
+        assert_eq!(
+            decompress_block(&extent, &payload, &mut out),
+            Err(CompressionError::BadChecksum)
+        );
+    }
+
+    #[test]
+    fn decompress_block_accepts_matching_crc_for_plain_payload() {
+        use crate::crc32c::crc32c;
+        let payload = [0xa5u8; 32];
+        let extent = CompressedExtent {
+            logical_block: 0,
+            physical_block: 10,
+            uncompressed_bytes: 32,
+            compressed_bytes: 32,
+            algorithm: COMPRESSION_NONE,
+            payload_crc32c: crc32c(&payload),
+        };
+        let mut out = [0u8; 32];
+        assert_eq!(decompress_block(&extent, &payload, &mut out), Ok(()));
+    }
+
+    #[cfg(feature = "compression-engines")]
+    #[test]
+    fn compress_then_decompress_round_trips_lz4() {
+        // End-to-end: a compressible LZ4 payload goes through the
+        // write pipeline, lands in a CompressedExtent, and the
+        // read pipeline decompresses back to the original bytes.
+        let policy = lz4_policy(1);
+        let mut input = [0u8; 4096];
+        repeat_byte(0x5a, input.len(), &mut input);
+        // Sprinkle in a non-repeating byte so the LZ4 codec
+        // actually has something to compress.
+        for index in (0..input.len()).step_by(7) {
+            input[index] = index as u8;
+        }
+        let mut scratch = [0u8; 4096];
+        let outcome = match compress_block(policy, &input, &mut scratch) {
+            Ok(o) => o,
+            Err(error) => {
+                assert!(false, "compress_block failed: {:?}", error);
+                return;
+            }
+        };
+        let (payload, algo, crc) = match outcome {
+            CompressOutcome::Compressed {
+                payload,
+                algorithm,
+                payload_crc32c,
+            } => (payload, algorithm, payload_crc32c),
+            CompressOutcome::Plain => {
+                // LZ4 may legitimately refuse to compress this
+                // particular 4 KiB blob. Skip the round-trip in
+                // that case; the read-path-plain test covers the
+                // Plain path already.
+                return;
+            }
+        };
+        let extent = CompressedExtent {
+            logical_block: 0,
+            physical_block: 10,
+            uncompressed_bytes: input.len() as u32,
+            compressed_bytes: payload.len() as u32,
+            algorithm: algo,
+            payload_crc32c: crc,
+        };
+        let mut out = [0u8; 4096];
+        match decompress_block(&extent, payload, &mut out) {
+            Ok(()) => {
+                assert_eq!(out, input);
+            }
+            Err(error) => {
+                assert!(
+                    false,
+                    "decompress_block failed after compress_block: {:?}",
+                    error
+                );
+            }
+        }
     }
 }
