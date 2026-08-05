@@ -5,7 +5,30 @@
 //! extent, and validation records. Engine adapters are feature-gated behind
 //! `compression-engines` so the no-heap service can link only codecs that are
 //! approved for its target profile.
+//!
+//! ## Stage Q production pipeline
+//!
+//! Production Hxfs needs three things on top of the foundation layer:
+//!
+//! 1. A single [`compress_block`] entry point that picks an algorithm by
+//!    policy, runs the codec, and falls back to
+//!    [`CompressionDecision::StorePlain`] when the codec refuses to shrink
+//!    the input. The caller never has to know whether the on-disk extent is
+//!    plain or compressed.
+//! 2. A single [`decompress_block`] entry point that pairs with the codec
+//!    used in the write path and verifies the [`CompressedExtent::payload_crc32c`]
+//!    before returning the uncompressed bytes. A CRC mismatch is
+//!    [`CompressionError::BadChecksum`], which the Hxfs service translates
+//!    into a read-side abort and a serial marker so the on-target trace
+//!    localises corruption.
+//! 3. A [`resolve_compression_policy`] helper that maps a `policy_id` to
+//!    its [`CompressionPolicy`] descriptor. The Hxfs volume table stores
+//!    only the id; the per-object metadata references the id; the runtime
+//!    resolves to a concrete codec before writing or reading. This keeps
+//!    the on-disk footprint of an object record independent of the codec
+//!    choice.
 
+use crate::crc32c::crc32c;
 use crate::format::BLOCK_SIZE_U64;
 
 /// No compression.
@@ -43,6 +66,10 @@ pub enum CompressionError {
     Incompressible,
     /// Requested codec engine is not linked in this build.
     EngineUnavailable,
+    /// Compressed payload CRC32C did not match the on-disk extent
+    /// descriptor. The payload bytes were the right shape but the
+    /// on-disk copy has been corrupted in a way the CRC detected.
+    BadChecksum,
 }
 
 /// Persistent compressed extent descriptor.
@@ -144,6 +171,203 @@ pub fn compress_lz4(input: &[u8], out: &mut [u8]) -> Result<usize, CompressionEr
 /// Feature-gated LZ4 block decompression adapter using the selected audited crate.
 pub fn decompress_lz4(input: &[u8], out: &mut [u8]) -> Result<usize, CompressionError> {
     lz4_flex::block::decompress_into(input, out).map_err(|_| CompressionError::BadExtent)
+}
+
+// --- Stage Q production pipeline ---
+
+/// Maximum block size for a single compressed extent. The on-disk
+/// extent descriptor encodes `uncompressed_bytes` and
+/// `compressed_bytes` as `u32`; the upper bound therefore comes
+/// from the maximum accepted Hxfs block size. Keep this in sync
+/// with the same constant in `format::BLOCK_SIZE`.
+pub const COMPRESSED_BLOCK_LIMIT: usize = 4096;
+
+/// Stage Q write-path pipeline result.
+///
+/// For each candidate input the pipeline either:
+/// - returns [`CompressOutcome::Plain`] and tells the caller to
+///   store the input bytes verbatim in a normal uncompressed
+///   extent (either because the policy said so, the input was
+///   too small, or the codec could not shrink the input), or
+/// - returns [`CompressOutcome::Compressed { .. }`] with the
+///   payload bytes, the algorithm id, and the CRC32C the caller
+///   must record in the on-disk extent descriptor.
+///
+/// The fallback to `Plain` is the key Stage Q safety contract:
+/// storing compressed payloads that are larger than the input
+/// would waste media and complicate the on-disk layout. A codec
+/// that cannot compress returns `Plain` instead.
+pub enum CompressOutcome<'a> {
+    /// Store `input` verbatim in a normal uncompressed extent.
+    Plain,
+    /// Store the returned compressed bytes in a
+    /// [`CompressedExtent`] with the returned algorithm id and
+    /// CRC32C.
+    Compressed {
+        /// Compressed payload bytes to write to disk.
+        payload: &'a [u8],
+        /// Algorithm id that produced the payload; the caller
+        /// must record this in `CompressedExtent::algorithm`.
+        algorithm: u32,
+        /// CRC32C over the compressed payload bytes; the caller
+        /// must record this in
+        /// `CompressedExtent::payload_crc32c`.
+        payload_crc32c: u32,
+    },
+}
+
+/// Stage Q read-path pipeline: decompress the on-disk payload
+/// and verify the CRC32C from [`CompressedExtent::payload_crc32c`]
+/// before returning. A CRC mismatch is
+/// [`CompressionError::BadChecksum`] so the Hxfs service can
+/// distinguish a payload that is the wrong shape from one that is
+/// the right shape but bit-rotted.
+pub fn decompress_block(
+    extent: &CompressedExtent,
+    payload: &[u8],
+    out: &mut [u8],
+) -> Result<(), CompressionError> {
+    if payload.len() as u64 != u64::from(extent.compressed_bytes) {
+        return Err(CompressionError::BadExtent);
+    }
+    if extent.uncompressed_bytes as usize > out.len() {
+        return Err(CompressionError::BadExtent);
+    }
+    if crc32c(payload) != extent.payload_crc32c {
+        return Err(CompressionError::BadChecksum);
+    }
+    let written = match extent.algorithm {
+        COMPRESSION_NONE => {
+            // Plain payload; the caller did not even need to
+            // call this function, but accept it for symmetry.
+            payload.len()
+        }
+        COMPRESSION_LZ4 => {
+            #[cfg(feature = "compression-engines")]
+            {
+                decompress_lz4(payload, &mut out[..extent.uncompressed_bytes as usize])?
+            }
+            #[cfg(not(feature = "compression-engines"))]
+            {
+                let _ = payload;
+                return Err(CompressionError::EngineUnavailable);
+            }
+        }
+        COMPRESSION_ZSTD => {
+            // Zstd is not linked in this build; the production
+            // policy resolver must have rejected it earlier
+            // through `engine_available`.
+            return Err(CompressionError::EngineUnavailable);
+        }
+        _ => return Err(CompressionError::UnknownAlgorithm),
+    };
+    if written != extent.uncompressed_bytes as usize {
+        return Err(CompressionError::BadExtent);
+    }
+    Ok(())
+}
+
+/// Compress `input` according to `policy`, falling back to
+/// [`CompressOutcome::Plain`] when the codec refuses to shrink
+/// the input. The returned borrowed slice always points into
+/// `scratch` so the caller does not need to allocate.
+///
+/// `scratch` must be at least as large as `input.len()`. The
+/// on-disk contract reserves `uncompressed_bytes` equal to the
+/// full Hxfs block size (4 KiB), so the default caller passes a
+/// 4 KiB scratch buffer and a `BLOCK_SIZE`-long input.
+///
+/// The function is **safe to call without `compression-engines`**:
+/// in that build the only registered codec returns
+/// `Incompressible` for any non-trivial input, and the fallback
+/// path correctly returns `Plain`. The production service still
+/// links the engines, so a non-compressible payload is rare.
+pub fn compress_block<'a>(
+    policy: CompressionPolicy,
+    input: &[u8],
+    scratch: &'a mut [u8],
+) -> Result<CompressOutcome<'a>, CompressionError> {
+    validate_policy(policy)?;
+    if input.is_empty() {
+        return Ok(CompressOutcome::Plain);
+    }
+    if input.len() > COMPRESSED_BLOCK_LIMIT {
+        return Err(CompressionError::BadExtent);
+    }
+    if scratch.len() < input.len() {
+        return Err(CompressionError::BadExtent);
+    }
+    match plan_compression(policy, input.len() as u64)? {
+        CompressionDecision::StorePlain => Ok(CompressOutcome::Plain),
+        CompressionDecision::Compress { algorithm } => {
+            // Try the codec. Incompressible fallback: if the
+            // codec returns Incompressible, the on-disk extent
+            // must be plain, not compressed-but-bigger.
+            match algorithm {
+                COMPRESSION_LZ4 => {
+                    #[cfg(feature = "compression-engines")]
+                    {
+                        match compress_lz4(input, scratch) {
+                            Ok(written) if written > 0 && written < input.len() => {
+                                let payload = &scratch[..written];
+                                Ok(CompressOutcome::Compressed {
+                                    payload,
+                                    algorithm: COMPRESSION_LZ4,
+                                    payload_crc32c: crc32c(payload),
+                                })
+                            }
+                            // Belt-and-suspenders: a future codec
+                            // that returns 0 or a non-shrinking
+                            // output without setting
+                            // `Incompressible` is treated as
+                            // "do not compress this block".
+                            _ => Ok(CompressOutcome::Plain),
+                        }
+                    }
+                    #[cfg(not(feature = "compression-engines"))]
+                    {
+                        let _ = scratch;
+                        Err(CompressionError::EngineUnavailable)
+                    }
+                }
+                COMPRESSION_ZSTD => {
+                    // Zstd is not linked in this build; treat the
+                    // same way the LZ4 path treats an unknown
+                    // engine: surface EngineUnavailable so the
+                    // production service fails the write path
+                    // loudly rather than silently storing a plain
+                    // extent that the read path cannot decode.
+                    Err(CompressionError::EngineUnavailable)
+                }
+                _ => Err(CompressionError::UnknownAlgorithm),
+            }
+        }
+    }
+}
+
+/// Stage Q policy resolution: turn a `policy_id` (the on-disk
+/// form) into a [`CompressionPolicy`] using a caller-supplied
+/// table. The Hxfs volume table stores one
+/// [`CompressionPolicy`] per virtual volume; an object references
+/// the policy by id and the runtime resolves through this helper
+/// before reaching the codec.
+///
+/// Returning `Err(CompressionError::InvalidPolicy)` for an unknown
+/// id keeps a malformed/corrupt volume table from silently
+/// promoting to [`CompressOutcome::Plain`] and bypassing the
+/// selected codec.
+pub fn resolve_compression_policy(
+    policy_id: u32,
+    table: &[CompressionPolicy],
+) -> Result<CompressionPolicy, CompressionError> {
+    let mut index = 0usize;
+    while index < table.len() {
+        if table[index].policy_id == policy_id {
+            return Ok(table[index]);
+        }
+        index += 1;
+    }
+    Err(CompressionError::InvalidPolicy)
 }
 
 #[cfg(test)]
