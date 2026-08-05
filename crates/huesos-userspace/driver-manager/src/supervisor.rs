@@ -1260,31 +1260,49 @@ impl DriverManager {
 
     fn poll_hxfs_service(&mut self) {
         let mut buf = [0u8; 64];
+        // Take the host by value so we can drop it on the PeerClosed
+        // branch without fighting the borrow checker. Without the
+        // take, the next main-loop iteration would see
+        // `self.hxfs_service.is_some()` true and re-poll the closed
+        // channel forever, flooding the serial log with a
+        // Hxfs-service-channel-failed marker on every tick.
+        let Some(host) = self.hxfs_service.take() else {
+            return;
+        };
+        let _keep_process_alive = &host.process;
         loop {
-            let Some(host) = self.hxfs_service.as_ref() else {
-                return;
-            };
-            let _keep_process_alive = &host.process;
             match host.bootstrap.read_into(&mut buf) {
                 Ok(n) if &buf[..n] == protocol::HXFS_READY.as_bytes() => {
                     self.hxfs_ready = true;
                     self.hxfs_failed = false;
+                    self.hxfs_service = Some(host);
                     println!("[driver-manager] Hxfs service ready");
+                    return;
                 }
                 Ok(n) if &buf[..n] == protocol::HXFS_SERVICE_UNAVAILABLE.as_bytes() => {
                     self.hxfs_failed = true;
                     self.hxfs_ready = false;
+                    // host is dropped here; the explicit unavailable
+                    // marker is permanent for this bring-up.
                     println!("[driver-manager] Hxfs service unavailable");
+                    return;
                 }
                 Ok(_) => {}
-                Err(ErrorCode::ShouldWait) => return,
+                Err(ErrorCode::ShouldWait) => {
+                    // Restore the host on a benign no-message yield;
+                    // we still want to keep polling it next tick.
+                    self.hxfs_service = Some(host);
+                    return;
+                }
                 Err(error) => {
                     println!(
-                        "[driver-manager] Hxfs service channel failed: {} (recovery path closed)",
+                        "[driver-manager] Hxfs service channel failed: {} (host dropped, no more polls)",
                         error.as_str()
                     );
                     self.hxfs_failed = true;
                     self.hxfs_ready = false;
+                    // host is dropped here; do not put it back so the
+                    // busy-poll on the closed channel cannot resume.
                     return;
                 }
             }
