@@ -35,12 +35,32 @@ if [[ ! -f "$ovmf" ]]; then
 fi
 
 if [[ ! -f "$nvme_img" ]]; then
-    echo "[soak] creating NVMe raw image: $nvme_img ($nvme_size)"
-    if command -v qemu-img >/dev/null 2>&1; then
-        qemu-img create -f raw "$nvme_img" "$nvme_size" >/dev/null
+    echo "[soak] creating Hxfs v5 image: $nvme_img ($nvme_size)"
+    # The QEMU NVMe namespace exposes a 512-byte LBA, so the on-disk
+    # size in bytes is also the number of LBAs. Hxfs uses 4 KiB
+    # internal blocks, so the Hxfs block count is on-disk bytes
+    # divided by 4096. We use the streaming mkhxfs builder so a
+    # multi-GiB image does not need to be materialised in Python
+    # heap; the resulting file is sparse on disk and the data
+    # region is implicitly zero-filled by the filesystem, which
+    # Hxfs treats as unwritten.
+    nvme_bytes="${nvme_size%G}"
+    if [[ "$nvme_bytes" != "$nvme_size" ]]; then
+        bytes=$((nvme_bytes * 1024 * 1024 * 1024))
     else
-        truncate -s "$nvme_size" "$nvme_img"
+        nvme_bytes="${nvme_size%M}"
+        if [[ "$nvme_bytes" != "$nvme_size" ]]; then
+            bytes=$((nvme_bytes * 1024 * 1024))
+        else
+            bytes="$nvme_size"
+        fi
     fi
+    hxfs_blocks=$((bytes / 4096))
+    if (( hxfs_blocks < 8 )); then
+        echo "[soak] image too small for Hxfs (need >= 32 KiB)" >&2
+        exit 1
+    fi
+    python3 tools/mkhxfs.py --output "$nvme_img" --blocks "$hxfs_blocks" >/dev/null
 fi
 
 qemu_common=(
@@ -93,7 +113,7 @@ if grep -Fq 'KERNEL PANIC' "$log" || grep -Fq '[hxfs] PANIC' "$log"; then
 fi
 
 required=(
-    "[driver-host:nvme]"
+    "[driver-host:nvme] identified"
     "service:block:nvme"
     "[hxfs] service started"
 )
@@ -101,6 +121,20 @@ for marker in "${required[@]}"; do
     if ! grep -Fq "$marker" "$log"; then
         echo "[soak] missing marker: $marker" >&2
         echo "[soak] last 200 serial lines:" >&2
+        tail -200 "$log" >&2 || true
+        exit 1
+    fi
+done
+
+# Negative markers that must NOT appear. The mount path against an
+# Hxfs image must succeed; \`journal replay failed: BadBlock\` would
+# mean the smoke is back to using a raw namespace instead of the
+# Hxfs image, so we fail fast.
+for regression in \
+    '[hxfs] journal replay failed: BadBlock' \
+    '[hxfs] superblock checksum mismatch'; do
+    if grep -Fq "$regression" "$log"; then
+        echo "[soak] regression marker present: $regression" >&2
         tail -200 "$log" >&2 || true
         exit 1
     fi
