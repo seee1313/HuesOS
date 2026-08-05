@@ -14,7 +14,7 @@ migration so implementation work stays explicit and reviewable.
 - Child processes receive only one bootstrap capability at startup: handle 1 is the bootstrap channel endpoint.
 - Process exit observation is part of the launch ABI via `ProcessWait`/exit-code query semantics.
 - IRQ delivery will be modeled with interrupt objects plus ports.
-- The framebuffer driver will move to userspace through a mapped framebuffer capability, not through permanent kernel blit logic.
+- The framebuffer driver will move to userspace through a mapped framebuffer capability, not through permanent kernel blit logic. **(superseded — see update below.)**
 - Initial VMAR map flags are `READ`, `WRITE`, `EXECUTE`, `USER`, and `SPECIFIC`.
 - Root VMAR uses a 64 KiB low guard and spans `[0x0000_0000_0001_0000, 0x0000_8000_0000_0000)`.
 - First VMAR implementation is root-VMAR mapping only; child VMAR allocation/tree APIs come later.
@@ -37,6 +37,44 @@ migration so implementation work stays explicit and reviewable.
 - DriverManager registers the `keyboard` service from DriverHost readiness messages and reports ready to init only after the mandatory input service comes online.
 - DriverManager now mounts BOOTFS as a FileSystemService and terminal can use `ls`, `cat`, and `stat` through DriverManager's service registry.
 - Work must be split into small commits.
+
+## Update — framebuffer stays in kernel, but is capability-gated
+
+The line above ("the framebuffer driver will move to userspace through
+a mapped framebuffer capability, not through permanent kernel blit
+logic") is **superseded by the PR-G `fb-frame-draw-capability`
+decision**. The framebuffer driver (`huesos-fb`) stays in the kernel
+for three concrete reasons:
+
+1. The kernel panic screen, the boot splash, and the shutdown screen
+   all need to be renderable even after every userspace process has
+   crashed. A userspace framebuffer driver-host cannot be relied on to
+   be alive at those moments, so the kernel needs its own draw path
+   to the real framebuffer.
+2. A userspace framebuffer driver-host that maps raw video memory
+   would give every graphics client direct write access to that
+   memory, which is a strictly worse security model than the
+   capability-gated kernel blit path. The narrower syscall is the
+   safer design.
+3. Moving the driver does not buy much — `huesos-fb` is small, has
+   no per-frame timing requirements, and is only invoked from a
+   handful of places (panic, init splash, shutdown, libcanvas
+   `present`/`present_at`).
+
+What **did** change is the access control: `Syscall::FramebufferBlit`
+is now gated on a `FrameDraw` capability (`ResourceKind::FrameDraw =
+6`, install slot `INIT_FRAME_DRAW_HANDLE = 6`). Only the init
+process can mint the capability (mint is gated on the root
+supervisor KOID predicate), and init transfers the handle to
+legitimate graphics consumers (`terminal`, `doom`, `canvas-hell`)
+over channels using the same `write_handle` pattern
+`shutdown-broker` uses for `PowerControl` and `IoPort`. A
+non-graphics process that tries to blit gets `ErrorCode::AccessDenied`
+and no information about the caller's address space or the kernel's
+framebuffer geometry (the capability check runs before the
+`*const FramebufferBlitArgs` is dereferenced). See
+[`docs/FRAMEBUFFER_POLICY.md`](FRAMEBUFFER_POLICY.md) for the full
+threat model, ABI delta, and tests.
 
 ## Immediate open decisions before code changes
 

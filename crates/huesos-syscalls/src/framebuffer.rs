@@ -4,10 +4,30 @@
 //! as the complete display. It validates the full VMO range first, then copies
 //! a bounded group of scanlines at a time. Full HD/1440p presents therefore do
 //! not churn multi-megabyte kernel heap blocks every frame.
+//!
+//! ## Capability check
+//!
+//! [`sys_framebuffer_blit`] is the only framebuffer syscall that mutates
+//! real video memory, so it is the only one gated on a capability:
+//! the caller must present a live `FrameDraw` [`Resource`](huesos_object::Resource)
+//! handle in `a1`. The check runs **before** any userspace pointer is
+//! read so a forged or stale handle value cannot leak information about
+//! the caller's address space or about the kernel's framebuffer
+//! geometry. The check reuses the `require_resource_of_kind` helper
+//! that gates [`crate::resource::sys_hard_halt`] on
+//! [`ResourceKind::PowerControl`], so a missing, wrong-kind, or
+//! already-transferred handle all surface as `AccessDenied` and the
+//! behaviour is uniform across the capability-gated syscalls.
+//!
+//! `FramebufferInfo` stays public because geometry (resolution, pixel
+//! format) is not sensitive: any process that can already see a
+//! `Canvas` rendering on screen can learn resolution from the visible
+//! image, and pixel format is dictated by the hardware.
 
-use huesos_abi::{ErrorCode, FramebufferBlitArgs, FramebufferInfo};
-use huesos_object::{KernelObjectExt, Rights};
+use huesos_abi::{ErrorCode, FramebufferBlitArgs, FramebufferInfo, HandleValue};
+use huesos_object::{KernelObjectExt, ResourceKind, Rights};
 
+use crate::resource::require_resource_of_kind;
 use crate::{user_memory, util::current_proc, SyscallResult};
 
 pub(crate) fn sys_framebuffer_info(out: *mut FramebufferInfo) -> SyscallResult {
@@ -26,7 +46,17 @@ fn strided_source_span(row_bytes: u64, stride: u64, height: u32) -> Option<u64> 
     preceding_rows.checked_mul(stride)?.checked_add(row_bytes)
 }
 
-pub(crate) fn sys_framebuffer_blit(args_ptr: *const FramebufferBlitArgs) -> SyscallResult {
+pub(crate) fn sys_framebuffer_blit(
+    cap_handle: HandleValue,
+    args_ptr: *const FramebufferBlitArgs,
+) -> SyscallResult {
+    // Capability check first: the caller must present a live `FrameDraw`
+    // Resource handle. The Arc returned by `require_resource_of_kind`
+    // keeps the underlying Resource alive for the duration of this call,
+    // so even a concurrent capability revocation in another thread
+    // cannot race us into a use-after-free. The Arc is dropped at the
+    // end of the function by ordinary Rust scope rules.
+    let _cap = require_resource_of_kind(cap_handle, ResourceKind::FrameDraw)?;
     let args = user_memory::read_value(args_ptr)?;
     let fb_info = huesos_fb::info().ok_or(ErrorCode::NoFramebuffer)?;
     let bytes_per_pixel = (fb_info.bpp as u64).div_ceil(8);
@@ -132,5 +162,19 @@ mod tests {
     fn strided_span_rejects_zero_height_and_overflow() {
         assert_eq!(strided_source_span(16, 64, 0), None);
         assert_eq!(strided_source_span(16, u64::MAX, 3), None);
+    }
+
+    #[test]
+    fn framebuffer_blit_signature_takes_capability_handle() {
+        // Lock the public ABI shape of `sys_framebuffer_blit` so a
+        // refactor that reorders or removes the capability parameter
+        // fails this test before it can ship.
+        //
+        // The function must take (HandleValue, *const FramebufferBlitArgs)
+        // in that order: capability first, then the pointer to the
+        // arguments struct. The capability check runs before the
+        // pointer is read, so flipping the order would let a forged
+        // handle leak information about the caller's address space.
+        let _: fn(HandleValue, *const FramebufferBlitArgs) -> _ = sys_framebuffer_blit;
     }
 }

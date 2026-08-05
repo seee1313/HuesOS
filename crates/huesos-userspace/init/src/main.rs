@@ -591,13 +591,17 @@ fn format_grant_label(
 ) -> usize {
     use libcanvas::resource::ResourceKind;
     // "pwr" is used as the short wire label for PowerControl to keep
-    // shutdown-broker's manifest / label matcher compact.
+    // shutdown-broker's manifest / label matcher compact. "framedraw"
+    // is the short wire label for FrameDraw — init is the only process
+    // that mints a FrameDraw resource and it transfers it to legitimate
+    // graphics consumers over a channel.
     let kind = match grant.kind {
         ResourceKind::IoPort => "ioport",
         ResourceKind::Mmio => "mmio",
         ResourceKind::Irq => "irq",
         ResourceKind::PowerControl => "pwr",
         ResourceKind::DmaPool => "dma",
+        ResourceKind::FrameDraw => "framedraw",
     };
     let mode = if grant.exclusive { "excl" } else { "shared" };
     let mut w = FixedWriter::new(out);

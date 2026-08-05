@@ -138,6 +138,21 @@ pub enum Syscall {
     /// framebuffer. This is the *only* way userspace ever touches actual
     /// video memory — it never gets a mapping of the framebuffer itself,
     /// only this narrow, bounds-checked copy operation.
+    ///
+    /// Capability check: the caller must present a live `FrameDraw`
+    /// [`Resource`](../../huesos_object/struct.Resource.html) handle in
+    /// `a1`. The kernel will reject the call with `AccessDenied` if
+    /// `a1` does not name a `FrameDraw` resource owned by the caller
+    /// (or names any other object, including a VMO). `a2` points to a
+    /// [`FramebufferBlitArgs`] with the source VMO and rectangle
+    /// geometry. This is the only framebuffer syscall requiring a
+    /// capability; [`Self::FramebufferInfo`] stays public because
+    /// geometry (resolution, pixel format) is not sensitive.
+    ///
+    /// Policy: the `FrameDraw` resource is minted by the root userspace
+    /// supervisor (`init`) and transferred to the legitimate graphics
+    /// stack (`libcanvas`-using processes) over a channel. See
+    /// `docs/ARCHITECTURE_ROADMAP.md` § framebuffer.
     FramebufferBlit = 13,
     /// Create a suspended userspace process object and its root VMAR.
     ///
@@ -389,6 +404,22 @@ pub enum ResourceKindAbi {
     /// The kernel is responsible for reserving and mapping the backing pages;
     /// the handle is the authority to use the range, not the mapping itself.
     DmaPool = 5,
+    /// Authority to invoke [`Syscall::FramebufferBlit`]. Holding this
+    /// handle is the capability check that lets a userspace process
+    /// copy (blit) a rectangle from a VMO it owns onto the real
+    /// framebuffer. The handle has no meaningful `base`/`len` — both
+    /// are forced to zero at mint time, exactly like
+    /// [`Self::PowerControl`]. A `FrameDraw` resource is a single
+    /// binary authority, not a per-rectangle range, so a single
+    /// mint-then-transfer is enough to onboard a graphics process.
+    ///
+    /// Minted exclusively by the root userspace supervisor (`init`) and
+    /// transferred to legitimate graphics-stack processes (`libcanvas`
+    /// consumers such as `terminal`, `doom`, and `canvas-hell`) over a
+    /// channel. No process can mint its own `FrameDraw` capability
+    /// because `sys_resource_create` is gated on the root-supervisor
+    /// KOID predicate.
+    FrameDraw = 6,
 }
 
 impl ResourceKindAbi {
@@ -400,6 +431,7 @@ impl ResourceKindAbi {
             3 => Self::Irq,
             4 => Self::PowerControl,
             5 => Self::DmaPool,
+            6 => Self::FrameDraw,
             _ => return None,
         })
     }
@@ -540,6 +572,15 @@ pub const INIT_ACPI_TABLES_HANDLE: HandleValue = 3;
 pub const INIT_ACPI_BROKER_HANDLE: HandleValue = 4;
 /// Kernel-produced storage boot-info VMO installed in the initial process.
 pub const INIT_STORAGE_BOOT_INFO_HANDLE: HandleValue = 5;
+/// `FrameDraw` [`Resource`](../../huesos_object/struct.Resource.html)
+/// capability installed in the initial process. `init` mints this once
+/// at boot (via [`Syscall::ResourceCreate`]) and transfers it to
+/// legitimate graphics-stack processes (`libcanvas` consumers such as
+/// `terminal`, `doom`, and `canvas-hell`) over a channel. The handle
+/// is the only authority that lets a process call
+/// [`Syscall::FramebufferBlit`]; the kernel rejects any blit whose
+/// `a1` is not a live caller-owned `FrameDraw` resource.
+pub const INIT_FRAME_DRAW_HANDLE: HandleValue = 6;
 
 /// Stable process exit codes used when the kernel terminates a process after
 /// an unhandled ring-3 CPU exception.
@@ -1169,14 +1210,32 @@ mod tests {
             ResourceKindAbi::Irq,
             ResourceKindAbi::PowerControl,
             ResourceKindAbi::DmaPool,
+            ResourceKindAbi::FrameDraw,
         ] {
             let raw = kind as u32;
             assert_eq!(ResourceKindAbi::from_raw(raw), Some(kind));
         }
         assert_eq!(ResourceKindAbi::from_raw(0), None);
         assert_eq!(ResourceKindAbi::from_raw(5), Some(ResourceKindAbi::DmaPool));
-        assert_eq!(ResourceKindAbi::from_raw(6), None);
+        assert_eq!(
+            ResourceKindAbi::from_raw(6),
+            Some(ResourceKindAbi::FrameDraw)
+        );
+        assert_eq!(ResourceKindAbi::from_raw(7), None);
         assert_eq!(ResourceKindAbi::from_raw(u32::MAX), None);
+    }
+
+    #[test]
+    fn framebuffer_blit_is_capability_gated() {
+        // The numeric value of FramebufferBlit is part of the append-only
+        // syscall ABI: changing it would force every libcanvas consumer
+        // to re-vendor. Lock the existing value here so a stealth
+        // renumber fails this host test before it can reach users.
+        assert_eq!(Syscall::FramebufferBlit as u64, 13);
+        // And lock the INIT_FRAME_DRAW_HANDLE slot so the kernel-side
+        // handle table that init relies on does not silently renumber.
+        assert_eq!(super::INIT_FRAME_DRAW_HANDLE, 6);
+        assert_eq!(super::INIT_STORAGE_BOOT_INFO_HANDLE, 5);
     }
 
     #[test]

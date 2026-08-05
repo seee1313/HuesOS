@@ -363,6 +363,24 @@ fn spawn_init_process(
         dbg("[init] failed to install storage boot-info VMO\n");
     }
 
+    // FrameDraw capability: the initial process is the root userspace
+    // supervisor and the only place a `FrameDraw` [`Resource`] is
+    // minted in the MVP. Without this handle installed at slot
+    // [`huesos_abi::INIT_FRAME_DRAW_HANDLE`], every
+    // [`huesos_abi::Syscall::FramebufferBlit`] the init process
+    // issues (e.g. its own early-boot framebuffer logger) would
+    // bounce with `AccessDenied` because the kernel-side capability
+    // check has nothing to compare the supplied handle against.
+    //
+    // init mints the resource directly here and transfers it to
+    // legitimate graphics consumers (terminal, doom, canvas-hell)
+    // over channels at runtime, see `init/src/main.rs`.
+    if install_frame_draw_capability(&spawned.process) {
+        dbg("[init] installed FrameDraw capability (handle 6)\n");
+    } else {
+        dbg("[init] failed to install FrameDraw capability\n");
+    }
+
     let name = *b"init\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0";
     let _ = scheduler::spawn_user_thread(
         &name,
@@ -415,6 +433,44 @@ fn install_acpi_broker(
         .handles
         .insert_at(
             huesos_abi::INIT_ACPI_BROKER_HANDLE,
+            Handle::new(koid, rights),
+        )
+        .is_err()
+    {
+        huesos_object::unregister_object(koid);
+        return false;
+    }
+    true
+}
+
+/// Install the [`huesos_abi::INIT_FRAME_DRAW_HANDLE`] capability for
+/// the initial process. Mints a binary `FrameDraw` [`Resource`] (the
+/// kind with no meaningful `base`/`len`, exactly like `PowerControl`)
+/// and inserts the handle at the canonical slot 6. The kernel's
+/// [`huesos_syscalls`] capability check accepts this handle as
+/// authority to call [`huesos_abi::Syscall::FramebufferBlit`]; no
+/// other process can mint the same kind because
+/// [`crate::resource::sys_resource_create`] is gated on the root
+/// supervisor KOID predicate.
+///
+/// On failure the resource is unregistered and the process keeps
+/// running without a `FrameDraw` handle — its first blit will then
+/// return `AccessDenied`, exactly the same observable behaviour the
+/// system would have if the user never started the boot.
+fn install_frame_draw_capability(process: &huesos_object::Process) -> bool {
+    use huesos_object::{Handle, KernelObject, Resource, ResourceKind, Rights};
+
+    let Ok(resource) = Resource::try_create_exclusive(ResourceKind::FrameDraw, 0, 1) else {
+        return false;
+    };
+    let koid = resource.koid();
+    // `Resource::try_create_exclusive` already registered the
+    // resource in the global registry; do not register_object again.
+    let rights = Rights::READ | Rights::WRITE | Rights::TRANSFER;
+    if process
+        .handles
+        .insert_at(
+            huesos_abi::INIT_FRAME_DRAW_HANDLE,
             Handle::new(koid, rights),
         )
         .is_err()

@@ -2,7 +2,10 @@
 //!
 //! A `Resource` represents a per-kind, half-open range `[base, base+len)`
 //! that a process holds authority over. Kinds are `IoPort` (x86 port I/O
-//! space), `Mmio` (physical MMIO), and `Irq` (physical interrupt vector).
+//! space), `Mmio` (physical MMIO), `Irq` (physical interrupt vector), and
+//! the binary capabilities `PowerControl` and `FrameDraw` (which have
+//! no meaningful range; the syscall handler forces `base=0, len=1` at
+//! mint time).
 //!
 //! # Design
 //!
@@ -53,6 +56,17 @@ pub enum ResourceKind {
     /// Preallocated DMA pool for userspace DriverHosts. The range is a
     /// device-visible physical window reserved and mapped by the kernel.
     DmaPool = 5,
+    /// Authority to invoke [`crate::abi::Syscall::FramebufferBlit`].
+    /// A `FrameDraw` resource is a binary capability, exactly like
+    /// [`Self::PowerControl`]: it has no meaningful `base`/`len`, so
+    /// the syscall handler forces both to `(0, 1)` at mint time. The
+    /// handle is the only authority that lets a userspace process
+    /// copy (blit) a rectangle from a VMO it owns onto the real
+    /// framebuffer. Minted exclusively by the root userspace
+    /// supervisor (`init`) and transferred to legitimate graphics
+    /// processes over a channel. See
+    /// `docs/ARCHITECTURE_ROADMAP.md` § framebuffer.
+    FrameDraw = 6,
 }
 
 /// Reason a `Resource::try_create*` call was rejected.

@@ -100,7 +100,13 @@ pub fn dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> Syscal
         S::ProcessExit => process::sys_process_exit(a1 as i64),
         S::DebugWrite => debug::sys_debug_write(a1 as *const u8, a2 as usize),
         S::FramebufferInfo => framebuffer::sys_framebuffer_info(a1 as *mut FramebufferInfo),
-        S::FramebufferBlit => framebuffer::sys_framebuffer_blit(a1 as *const FramebufferBlitArgs),
+        S::FramebufferBlit => {
+            // FramebufferBlit is capability-gated: `a1` is a HandleValue
+            // naming a caller-owned `FrameDraw` Resource, `a2` points
+            // to the FramebufferBlitArgs. The capability check runs
+            // inside `sys_framebuffer_blit` before the pointer is read.
+            framebuffer::sys_framebuffer_blit(a1 as HandleValue, a2 as *const FramebufferBlitArgs)
+        }
         S::ProcessCreate => process::sys_process_create(
             a1 as *const u8,
             a2 as usize,
