@@ -85,8 +85,11 @@ impl WrappedVolumeKey {
     }
 }
 
-/// In-RAM AES-256-XTS volume key.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// In-RAM AES-256-XTS volume key. Carries a `Drop` impl that
+/// zeroizes the key bytes; this makes the type `!Copy` on purpose
+/// so the compiler refuses accidental `let a = b;` copies of live
+/// key material across scopes.
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Aes256XtsKey {
     /// AES data key.
     pub data_key: [u8; 32],
@@ -109,6 +112,96 @@ impl Aes256XtsKey {
             tweak_key,
         })
     }
+
+    /// Zero both key halves in place. Call this on any code path that
+    /// drops the key: failed mount, error unwrap, normal teardown.
+    /// The Hxfs service must never rely on Drop ordering alone for
+    /// secret material.
+    pub fn zeroize(&mut self) {
+        for byte in self.data_key.iter_mut() {
+            *byte = 0;
+        }
+        for byte in self.tweak_key.iter_mut() {
+            *byte = 0;
+        }
+    }
+}
+
+impl Drop for Aes256XtsKey {
+    fn drop(&mut self) {
+        // Belt-and-suspenders: the explicit `zeroize` is the
+        // recommended path, but a Drop fallback ensures that any
+        // `let key = ...; drop(key);` shape also clears RAM.
+        self.zeroize();
+    }
+}
+
+/// RAII wrapper that holds a per-volume AES-XTS key for the lifetime
+/// of one mount and zeroizes it on drop. The Hxfs service must
+/// keep exactly one of these in scope per encrypted volume; the
+/// `borrow` API hands out `Aes256XtsKey` by value so the caller
+/// cannot accidentally retain a long-lived copy.
+pub struct CryptoKeyHandle {
+    key: Aes256XtsKey,
+    policy_id: u32,
+    zeroed: bool,
+}
+
+impl CryptoKeyHandle {
+    /// Build a handle from raw 64-byte key bytes and a policy id.
+    pub fn from_raw(policy_id: u32, raw: &[u8]) -> Option<Self> {
+        Aes256XtsKey::from_bytes(raw).map(|key| Self {
+            key,
+            policy_id,
+            zeroed: false,
+        })
+    }
+
+    /// Policy id this handle is bound to.
+    pub const fn policy_id(&self) -> u32 {
+        self.policy_id
+    }
+
+    /// Take a working copy of the key. The caller is expected to
+    /// call [`Aes256XtsKey::zeroize`] on the returned value as soon
+    /// as it is no longer needed; the handle itself keeps its
+    /// internal copy until drop.
+    pub fn borrow(&self) -> Aes256XtsKey {
+        self.key.clone()
+    }
+
+    /// Explicitly zero and disarm this handle. After this call,
+    /// [`Self::borrow`] will keep returning the all-zero key until
+    /// the handle is dropped. Idempotent.
+    pub fn revoke(&mut self) {
+        if !self.zeroed {
+            self.key.zeroize();
+            self.zeroed = true;
+        }
+    }
+
+    /// Whether the handle has been revoked.
+    pub const fn is_revoked(&self) -> bool {
+        self.zeroed
+    }
+}
+
+impl Drop for CryptoKeyHandle {
+    fn drop(&mut self) {
+        self.revoke();
+    }
+}
+
+/// Mount-time gate for encrypted volumes. Rejects volumes when no
+/// key provider is available, when the policy is not AES-XTS, or
+/// when the data unit size is not 4 KiB. The unwrap path explicitly
+/// names the missing preconditions so DriverManager can surface a
+/// diagnostic instead of a generic `EncryptedVolume`.
+pub fn validate_for_mount(
+    policy: EncryptionPolicy,
+    key_provider_available: bool,
+) -> Result<(), CryptoError> {
+    validate_policy(policy, key_provider_available)
 }
 
 /// Crypto policy failure.
@@ -162,7 +255,7 @@ pub const fn xts_data_unit(block_number: u64) -> u128 {
 
 /// Encrypt one 4 KiB Hxfs block in place using AES-256-XTS.
 pub fn encrypt_block_in_place(
-    key: Aes256XtsKey,
+    key: &Aes256XtsKey,
     data_unit: u128,
     block: &mut [u8; BLOCK_SIZE],
 ) -> Result<(), CryptoError> {
@@ -181,7 +274,7 @@ pub fn encrypt_block_in_place(
 
 /// Decrypt one 4 KiB Hxfs block in place using AES-256-XTS.
 pub fn decrypt_block_in_place(
-    key: Aes256XtsKey,
+    key: &Aes256XtsKey,
     data_unit: u128,
     block: &mut [u8; BLOCK_SIZE],
 ) -> Result<(), CryptoError> {
@@ -200,7 +293,7 @@ pub fn decrypt_block_in_place(
 
 #[cfg(feature = "crypto-aes")]
 fn crypt_block_in_place(
-    key: Aes256XtsKey,
+    key: &Aes256XtsKey,
     data_unit: u128,
     block: &mut [u8; BLOCK_SIZE],
     encrypt: bool,
