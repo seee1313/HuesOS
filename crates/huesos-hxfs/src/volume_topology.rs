@@ -271,4 +271,99 @@ mod tests {
             Err(VolumeTopologyError::CrossVolumeMove)
         );
     }
+
+    // Production-gate volume-topology coverage: each test pins
+    // one invariant from the virtual-volume rules in
+    // docs/STORAGE_NVME_FS_ROADMAP.md §L (Stage T).
+    //
+    //   T1 feat(volume): add GPT-backed system volume discovery
+    //   T2 feat(hxfs): persist virtual volume table
+    //   T3 feat(hxfs): expose virtual VolumeHandle operations
+    //   T4 feat(hxfs): create system/user/hxblob volume roles
+    //   T5 test(hxfs): add virtual volume policy/remount tests
+    //
+    // The fixed-capacity virtual-volume tree has to surface
+    // Full / DuplicateUuid / DuplicateRole / BadRecord / NotFound
+    // without panicking, keep its sorted-by-uuid invariant across
+    // mixed insert/remove, and let `find_role` return the
+    // first matching record.
+
+    #[test]
+    fn duplicate_uuid_is_rejected() {
+        let mut tree = VirtualVolumeTree::<4>::new();
+        assert!(tree.insert(record(1, VirtualVolumeRole::System)).is_ok());
+        assert_eq!(
+            tree.insert(record(1, VirtualVolumeRole::UserHome)),
+            Err(VolumeTopologyError::DuplicateUuid)
+        );
+    }
+
+    #[test]
+    fn insert_overflow_surfaces_full() {
+        let mut tree = VirtualVolumeTree::<2>::new();
+        assert!(tree.insert(record(1, VirtualVolumeRole::System)).is_ok());
+        assert!(tree.insert(record(2, VirtualVolumeRole::UserHome)).is_ok());
+        assert_eq!(
+            tree.insert(record(3, VirtualVolumeRole::Hxblob)),
+            Err(VolumeTopologyError::Full)
+        );
+    }
+
+    #[test]
+    fn get_missing_uuid_returns_not_found() {
+        let tree = VirtualVolumeTree::<4>::new();
+        assert_eq!(tree.get([42; 16]), Err(VolumeTopologyError::NotFound));
+    }
+
+    #[test]
+    fn find_role_unknown_returns_not_found() {
+        let tree = VirtualVolumeTree::<4>::new();
+        assert_eq!(
+            tree.find_role(VirtualVolumeRole::Hxblob),
+            Err(VolumeTopologyError::NotFound)
+        );
+    }
+
+    #[test]
+    fn data_role_does_not_uniquely_singleton() {
+        // The Data role is intentionally not a singleton: a host
+        // can mount many data volumes. Two Data inserts must
+        // succeed and validate() must not raise DuplicateRole.
+        let mut tree = VirtualVolumeTree::<4>::new();
+        assert!(tree.insert(record(1, VirtualVolumeRole::System)).is_ok());
+        assert!(tree.insert(record(2, VirtualVolumeRole::Data)).is_ok());
+        assert!(tree.insert(record(3, VirtualVolumeRole::Data)).is_ok());
+        assert!(tree.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_empty_tree_is_ok() {
+        let tree = VirtualVolumeTree::<4>::new();
+        assert_eq!(tree.validate(), Ok(()));
+    }
+
+    #[test]
+    fn userhome_role_uniqueness_is_enforced() {
+        let mut tree = VirtualVolumeTree::<4>::new();
+        assert!(tree.insert(record(1, VirtualVolumeRole::UserHome)).is_ok());
+        assert_eq!(
+            tree.insert(record(2, VirtualVolumeRole::UserHome)),
+            Err(VolumeTopologyError::DuplicateRole)
+        );
+    }
+
+    #[test]
+    fn cross_volume_move_distinguishes_unknown_volumes() {
+        // A move from a UUID that is not in the tree and a move
+        // to a UUID that is not in the tree are both rejected
+        // with CrossVolumeMove, not NotFound. The contract is
+        // "the topology forbids cross-volume moves", not "the
+        // topology records exist", so the absence check is
+        // upstream of the topology.
+        let tree = VirtualVolumeTree::<4>::new();
+        assert_eq!(
+            tree.validate_object_move([99; 16], [100; 16]),
+            Err(VolumeTopologyError::CrossVolumeMove)
+        );
+    }
 }
