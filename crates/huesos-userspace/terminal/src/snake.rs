@@ -7,6 +7,17 @@
 //!   3) Homing rocket that chases the head for ~3s
 //!
 //! Controls: WASD/HJKL, Enter restart, Esc quit to shell.
+//!
+//! ## Rendering model
+//!
+//! Game *logic* advances in discrete grid steps (classic Snake rules:
+//! collisions, growth, hazards are all defined on the integer grid).
+//! *Rendering*, however, runs on its own, much higher-frequency clock and
+//! interpolates every moving sprite (snake segments, bullets, the homing
+//! rocket) between its previous grid cell and its current one. This is the
+//! single change that makes the game feel smooth at every speed tier instead
+//! of visibly "teleporting" once per logical step — the classic symptom of
+//! coupling simulation rate to frame rate in a step-based game.
 
 use libcanvas::framebuffer::{Canvas, TextFont};
 use libcanvas::{Channel, ErrorCode};
@@ -51,6 +62,17 @@ impl Layout {
 const BASE_STEP_TICKS: u64 = 10;
 const MIN_STEP_TICKS: u64 = 6;
 
+// The render loop is decoupled from the simulation loop and polls/redraws at
+// this cadence regardless of how fast the snake itself is currently moving.
+// One tick (~10 ms @ 100 Hz) gives up to ~10 interpolated frames per logical
+// step at the slowest speed and ~6 at the fastest — comfortably smooth on
+// any display without burning CPU on a busy-loop.
+const RENDER_FRAME_TICKS: u64 = 1;
+
+// Fixed-point interpolation scale. 256 gives cheap shifts/mul instead of
+// floating point, which we avoid entirely in this no_std context.
+const INTERP_ONE: u16 = 256;
+
 // Hard-mode event limits and lifetimes, all expressed in snake steps.
 const MAX_BOMBS: usize = 6;
 const MAX_BULLETS: usize = 16;
@@ -73,50 +95,49 @@ fn step_delay_ticks(score: u32) -> u64 {
         .max(MIN_STEP_TICKS)
 }
 
-/// Wait one snake step against the kernel monotonic clock. Keyboard events
-/// may wake the channel early, but they never advance the game clock.
-fn wait_step(
-    score: u32,
+/// Drain every buffered keyboard event without blocking. Used at the top of
+/// each render frame so input latency is never worse than one render tick,
+/// independent of how slow/fast the snake itself is currently stepping.
+fn poll_input(keyboard: &Channel, dir: Dir, pending: &mut Dir, phase: Phase) -> Option<Action> {
+    let mut buf = [0u8; 16];
+
+    loop {
+        match keyboard.read_into(&mut buf) {
+            Ok(n) if n > 0 => {
+                if let Some(action) = apply_input(&buf[..n], dir, pending, phase) {
+                    return Some(action);
+                }
+            }
+            _ => break,
+        }
+    }
+
+    None
+}
+
+/// Block for at most one render tick waiting on the keyboard channel. This
+/// is what paces the render loop: on hardware without a working monotonic
+/// clock we still make forward progress via `fallback_ticks`.
+fn wait_render_tick(
     keyboard: &Channel,
     dir: Dir,
     pending: &mut Dir,
     phase: Phase,
+    fallback_ticks: &mut u64,
 ) -> Option<Action> {
-    let step_ticks = step_delay_ticks(score);
-    let start = libcanvas::system::monotonic_ticks().unwrap_or(0);
-    let deadline = start.saturating_add(step_ticks);
-    let mut fallback_elapsed = 0u64;
     let mut buf = [0u8; 16];
 
-    loop {
-        loop {
-            match keyboard.read_into(&mut buf) {
-                Ok(n) if n > 0 => {
-                    if let Some(result) = apply_input(&buf[..n], dir, pending, phase) {
-                        return Some(result);
-                    }
-                }
-                _ => break,
-            }
-        }
+    let action = match keyboard.read_into_timeout(&mut buf, RENDER_FRAME_TICKS) {
+        Ok(n) if n > 0 => apply_input(&buf[..n], dir, pending, phase),
+        Err(ErrorCode::TimedOut) => None,
+        _ => None,
+    };
 
-        match libcanvas::system::monotonic_ticks() {
-            Ok(now) if now >= deadline => return None,
-            Ok(_) => {}
-            Err(_) if fallback_elapsed >= step_ticks => return None,
-            Err(_) => {}
-        }
-
-        match keyboard.read_into_timeout(&mut buf, 1) {
-            Ok(n) if n > 0 => {
-                if let Some(result) = apply_input(&buf[..n], dir, pending, phase) {
-                    return Some(result);
-                }
-            }
-            Err(ErrorCode::TimedOut) => fallback_elapsed = fallback_elapsed.saturating_add(1),
-            _ => {}
-        }
+    if libcanvas::system::monotonic_ticks().is_err() {
+        *fallback_ticks = fallback_ticks.saturating_add(RENDER_FRAME_TICKS);
     }
+
+    action
 }
 
 fn apply_input(msg: &[u8], dir: Dir, pending: &mut Dir, phase: Phase) -> Option<Action> {
@@ -180,6 +201,9 @@ struct Bullet {
     alive: bool,
     /// Accumulated slowdown: the bullet skips this many upcoming steps.
     /// Grows by 1 every time the bullet punches through a regular apple.
+    /// Also reused as an initial-delay counter when a burst is fired, so
+    /// muzzle rounds leave the barrel one step apart instead of stacking
+    /// on the same cell (see `fire_ak`).
     slow: u8,
 }
 
@@ -202,6 +226,45 @@ enum EventBanner {
 struct GoldFood {
     pos: Point,
     ttl: u32,
+}
+
+/// A shallow copy of every moving entity's position, taken immediately
+/// before a logical step is applied. The renderer interpolates from this
+/// snapshot to the post-step state, which is what actually produces smooth
+/// on-screen motion regardless of the current step interval.
+#[derive(Clone, Copy)]
+struct MotionSnapshot {
+    body: [Point; MAX_LEN],
+    len: usize,
+    bullets: [Bullet; MAX_BULLETS],
+    rocket: Rocket,
+}
+
+fn capture_motion(
+    body: &[Point; MAX_LEN],
+    len: usize,
+    bullets: &[Bullet; MAX_BULLETS],
+    rocket: &Rocket,
+) -> MotionSnapshot {
+    MotionSnapshot {
+        body: *body,
+        len,
+        bullets: *bullets,
+        rocket: *rocket,
+    }
+}
+
+/// Fraction of the current step interval that has elapsed, in
+/// [0, INTERP_ONE] fixed-point. Degenerates to "fully advanced" if the
+/// interval is empty or already behind us, so callers never need a
+/// separate zero-length-interval branch.
+fn interpolation_alpha(now: u64, start: u64, end: u64) -> u16 {
+    if end <= start {
+        return INTERP_ONE;
+    }
+    let span = end - start;
+    let elapsed = now.saturating_sub(start).min(span);
+    ((elapsed.saturating_mul(INTERP_ONE as u64)) / span) as u16
 }
 
 /// Run Snake. `hard` enables random hazard events every 2 apples.
@@ -262,29 +325,29 @@ pub fn run(keyboard: &Channel, hard: bool) {
         &mut banner_ttl,
         &mut pending_event,
     );
-    draw_frame(
-        &mut renderer,
-        &canvas,
-        &layout,
-        hard,
-        &body,
-        len,
-        food,
-        gold_food,
-        phase,
-        score,
-        &bombs,
-        &bullets,
-        &rocket,
-        banner,
-    );
+
+    let mut fallback_ticks = 0u64;
+    let start_tick = libcanvas::system::monotonic_ticks().unwrap_or(fallback_ticks);
+
+    // `last_step_tick` / `next_step_tick` bound the interval the renderer
+    // interpolates across. `motion` is the pre-step snapshot that interval
+    // interpolates *from*.
+    let mut last_step_tick = start_tick;
+    let mut next_step_tick = start_tick.saturating_add(step_delay_ticks(score));
+    let mut motion = capture_motion(&body, len, &bullets, &rocket);
+
+    let mut queued_action: Option<Action> = None;
+    let mut last_render_tick = u64::MAX;
 
     loop {
-        // Wait one paced step, polling keys the whole time via blocking timeouts.
-        if let Some(action) = wait_step(score, keyboard, dir, &mut pending, phase) {
+        if queued_action.is_none() {
+            queued_action = poll_input(keyboard, dir, &mut pending, phase);
+        }
+
+        if let Some(action) = queued_action.take() {
             match phase {
                 Phase::Playing => {
-                    // Only Esc is returned from wait_step in Playing.
+                    // Only Esc is returned from input handling in Playing.
                     if matches!(action, Action::Esc) {
                         return;
                     }
@@ -308,22 +371,11 @@ pub fn run(keyboard: &Channel, hard: bool) {
                             &mut banner_ttl,
                             &mut pending_event,
                         );
-                        draw_frame(
-                            &mut renderer,
-                            &canvas,
-                            &layout,
-                            hard,
-                            &body,
-                            len,
-                            food,
-                            gold_food,
-                            phase,
-                            score,
-                            &bombs,
-                            &bullets,
-                            &rocket,
-                            banner,
-                        );
+
+                        let now = libcanvas::system::monotonic_ticks().unwrap_or(fallback_ticks);
+                        last_step_tick = now;
+                        next_step_tick = now.saturating_add(step_delay_ticks(score));
+                        motion = capture_motion(&body, len, &bullets, &rocket);
                         continue;
                     }
                     Action::Esc => return,
@@ -332,86 +384,125 @@ pub fn run(keyboard: &Channel, hard: bool) {
             }
         }
 
-        if phase != Phase::Playing {
-            // Game over: keep polling via wait_step.
-            continue;
-        }
+        let now = libcanvas::system::monotonic_ticks().unwrap_or(fallback_ticks);
 
-        dir = pending;
+        if phase == Phase::Playing {
+            // A render frame may straddle zero, one, or (under load) several
+            // logical steps. We cap the catch-up run so a stalled renderer
+            // can never turn into an unbounded replay of buffered steps.
+            let mut catch_up = 0u8;
 
-        // 1) Move snake
-        if !step(
-            &mut body,
-            &mut len,
-            dir,
-            &mut food,
-            &mut gold_food,
-            &mut score,
-            &mut rng,
-            hard,
-            &mut pending_event,
-            &bombs,
-            &bullets,
-            &rocket,
-        ) {
-            phase = Phase::GameOver;
-        }
+            while now >= next_step_tick {
+                motion = capture_motion(&body, len, &bullets, &rocket);
 
-        // 2) Spawn hard-mode event after every 2 apples
-        if hard && pending_event && phase == Phase::Playing {
-            pending_event = false;
-            spawn_event(
-                &mut rng,
-                &body,
-                len,
-                &mut bombs,
-                &mut bullets,
-                &mut rocket,
-                &mut banner,
-                &mut banner_ttl,
-            );
-        }
+                dir = pending;
 
-        // 3) Tick hazards
-        if hard
-            && phase == Phase::Playing
-            && !tick_hazards(
-                &mut bombs,
-                &mut bullets,
-                &mut rocket,
-                &body,
-                len,
-                &mut rng,
-                &mut food,
-                &mut gold_food,
-            )
-        {
-            phase = Phase::GameOver;
-        }
+                if !step(
+                    &mut body,
+                    &mut len,
+                    dir,
+                    &mut food,
+                    &mut gold_food,
+                    &mut score,
+                    &mut rng,
+                    hard,
+                    &mut pending_event,
+                    &bombs,
+                    &bullets,
+                    &rocket,
+                ) {
+                    phase = Phase::GameOver;
+                    break;
+                }
 
-        if banner_ttl > 0 {
-            banner_ttl -= 1;
-            if banner_ttl == 0 {
-                banner = EventBanner::None;
+                if hard && pending_event && phase == Phase::Playing {
+                    pending_event = false;
+                    spawn_event(
+                        &mut rng,
+                        &body,
+                        len,
+                        &mut bombs,
+                        &mut bullets,
+                        &mut rocket,
+                        &mut banner,
+                        &mut banner_ttl,
+                    );
+                }
+
+                if hard
+                    && phase == Phase::Playing
+                    && !tick_hazards(
+                        &mut bombs,
+                        &mut bullets,
+                        &mut rocket,
+                        &body,
+                        len,
+                        &mut rng,
+                        &mut food,
+                        &mut gold_food,
+                    )
+                {
+                    phase = Phase::GameOver;
+                    break;
+                }
+
+                if banner_ttl > 0 {
+                    banner_ttl -= 1;
+                    if banner_ttl == 0 {
+                        banner = EventBanner::None;
+                    }
+                }
+
+                last_step_tick = next_step_tick;
+                next_step_tick = last_step_tick.saturating_add(step_delay_ticks(score));
+
+                catch_up = catch_up.saturating_add(1);
+                if catch_up >= 4 && now >= next_step_tick {
+                    // Snap instead of continuing to replay: a long stall
+                    // (e.g. paused VM) should not produce a multi-second
+                    // fast-forward animation once the renderer resumes.
+                    motion = capture_motion(&body, len, &bullets, &rocket);
+                    last_step_tick = now;
+                    next_step_tick = now.saturating_add(step_delay_ticks(score));
+                    break;
+                }
             }
         }
 
-        draw_frame(
-            &mut renderer,
-            &canvas,
-            &layout,
-            hard,
-            &body,
-            len,
-            food,
-            gold_food,
-            phase,
-            score,
-            &bombs,
-            &bullets,
-            &rocket,
-            banner,
-        );
+        let render_now = libcanvas::system::monotonic_ticks().unwrap_or(fallback_ticks);
+        let alpha = if phase == Phase::Playing {
+            interpolation_alpha(render_now, last_step_tick, next_step_tick)
+        } else {
+            INTERP_ONE
+        };
+
+        let phase_dirty = !renderer.initialized || phase != renderer.previous_phase;
+        let should_render =
+            phase_dirty || (phase == Phase::Playing && render_now != last_render_tick);
+
+        if should_render {
+            draw_frame_smooth(
+                &mut renderer,
+                &canvas,
+                &layout,
+                hard,
+                &motion,
+                &body,
+                len,
+                food,
+                gold_food,
+                phase,
+                score,
+                &bombs,
+                &bullets,
+                &rocket,
+                banner,
+                alpha,
+            );
+            last_render_tick = render_now;
+        }
+
+        queued_action = wait_render_tick(keyboard, dir, &mut pending, phase, &mut fallback_ticks);
     }
 }
 
@@ -492,11 +583,6 @@ fn step(
         x: nx as u8,
         y: ny as u8,
     };
-    for segment in body.iter().take(*len) {
-        if segment.x == next.x && segment.y == next.y {
-            return false;
-        }
-    }
 
     let eat = next.x == food.x && next.y == food.y;
 
@@ -504,6 +590,18 @@ fn step(
     if let Some(gf) = gold_food {
         if next.x == gf.pos.x && next.y == gf.pos.y {
             eat_gold = true;
+        }
+    }
+
+    // Self-collision, with one deliberate exception: when the snake is not
+    // growing this step, the tail cell it currently occupies will be
+    // vacated in the very same step, so moving into it is legal (this is
+    // standard Snake behaviour — without it, following your own tail at
+    // full speed is an illegitimate death).
+    let collision_len = if eat { *len } else { (*len).saturating_sub(1) };
+    for segment in body.iter().take(collision_len) {
+        if segment.x == next.x && segment.y == next.y {
+            return false;
         }
     }
 
@@ -748,6 +846,16 @@ fn place_bomb(
     }
 }
 
+/// Fire a short burst of `AK_BURST` rounds from a board edge toward the
+/// snake's current row/column.
+///
+/// All rounds share the same muzzle cell and travel direction; they are
+/// staggered purely via `Bullet::slow`, which we already use as a
+/// per-step "skip movement" counter for apple pierce-through cooldown.
+/// Reusing it here as an initial firing delay means round *N* simply waits
+/// *N* extra steps before its first move — a real staggered burst — without
+/// needing to compute a backward-offset spawn cell (which previously
+/// clipped at the board edge and stacked every round on one tile).
 fn fire_ak(rng: &mut u32, body: &[Point; MAX_LEN], bullets: &mut [Bullet; MAX_BULLETS]) {
     let head = body[0];
     *rng = rng.wrapping_mul(22695477).wrapping_add(1);
@@ -785,15 +893,10 @@ fn fire_ak(rng: &mut u32, body: &[Point; MAX_LEN], bullets: &mut [Bullet; MAX_BU
         if b.alive {
             continue;
         }
-        // Stagger burst along the axis behind the muzzle.
-        let mut p = start;
-        for _ in 0..placed {
-            p = step_point(p, opposite(dir)).unwrap_or(p);
-        }
-        b.pos = p;
+        b.pos = start;
         b.dir = dir;
         b.alive = true;
-        b.slow = 0;
+        b.slow = placed as u8;
         placed += 1;
     }
 }
@@ -1012,34 +1115,37 @@ fn decode(msg: &[u8]) -> Option<Action> {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-struct CellVisual {
-    background: u8,
-    foreground: u8,
-}
-
-const EMPTY_CELL: CellVisual = CellVisual {
-    background: 0,
-    foreground: 0,
-};
-
+/// Owns everything needed to decide *how much* of the frame actually needs
+/// repainting.
+///
+/// Two optimizations matter here:
+///   * `GameOver` is a static screen — once painted, we stop touching the
+///     framebuffer entirely until Enter/Esc fires, saving all render cost
+///     while the player reads the score.
+///   * While `Playing`, the HUD (score/banner/gold TTL) only changes on
+///     logical steps, not on every interpolated render frame, so it is
+///     diffed and only re-uploaded when one of its inputs actually changed.
 struct Renderer {
-    previous: [CellVisual; MAX_LEN],
     initialized: bool,
     previous_phase: Phase,
+    previous_hard: bool,
+    previous_score: u32,
+    previous_gold_ttl: u32,
+    previous_banner: EventBanner,
     frames: u64,
-    dirty_cells: u64,
     presents: u64,
 }
 
 impl Renderer {
     const fn new() -> Self {
         Self {
-            previous: [EMPTY_CELL; MAX_LEN],
             initialized: false,
             previous_phase: Phase::Playing,
+            previous_hard: false,
+            previous_score: 0,
+            previous_gold_ttl: 0,
+            previous_banner: EventBanner::None,
             frames: 0,
-            dirty_cells: 0,
             presents: 0,
         }
     }
@@ -1048,11 +1154,12 @@ impl Renderer {
         clippy::too_many_arguments,
         reason = "fixed-capacity no_std game state is passed without allocation"
     )]
-    fn draw(
+    fn draw_smooth(
         &mut self,
         canvas: &Canvas,
         layout: &Layout,
         hard: bool,
+        motion: &MotionSnapshot,
         body: &[Point; MAX_LEN],
         len: usize,
         food: Point,
@@ -1063,68 +1170,87 @@ impl Renderer {
         bullets: &[Bullet; MAX_BULLETS],
         rocket: &Rocket,
         banner: EventBanner,
+        alpha: u16,
     ) {
-        let current = build_visual_board(body, len, food, gold_food, bombs, bullets, rocket);
+        let gold_ttl = gold_food.map(|g| g.ttl).unwrap_or(0);
+
         crate::screen::with_render_shadow(|shadow| {
             if !self.initialized || phase != self.previous_phase {
-                render_full(
-                    canvas, shadow, layout, hard, &current, gold_food, phase, score, banner,
+                render_smooth_full(
+                    canvas, shadow, layout, hard, motion, body, len, food, gold_food, phase,
+                    score, bombs, bullets, rocket, banner, alpha,
                 );
+
                 if canvas.upload_shadow(shadow).is_ok() && canvas.present().is_ok() {
                     self.presents = self.presents.saturating_add(1);
                 }
-                self.previous = current;
+
                 self.initialized = true;
                 self.previous_phase = phase;
+                self.previous_hard = hard;
+                self.previous_score = score;
+                self.previous_gold_ttl = gold_ttl;
+                self.previous_banner = banner;
                 self.frames = self.frames.saturating_add(1);
                 return;
             }
 
-            render_hud(canvas, shadow, layout, hard, gold_food, score, banner);
+            // GameOver is static once painted: nothing below it can change,
+            // so skip all further framebuffer work for this phase.
+            if phase == Phase::GameOver {
+                return;
+            }
+
+            let hud_dirty = self.previous_hard != hard
+                || self.previous_score != score
+                || self.previous_gold_ttl != gold_ttl
+                || self.previous_banner != banner;
+
+            if hud_dirty {
+                render_hud(canvas, shadow, layout, hard, gold_food, score, banner);
+
+                if canvas
+                    .upload_shadow_region(shadow, 0, 0, canvas.width(), HUD_HEIGHT)
+                    .is_ok()
+                    && canvas
+                        .present_region(0, 0, canvas.width(), HUD_HEIGHT)
+                        .is_ok()
+                {
+                    self.presents = self.presents.saturating_add(1);
+                }
+
+                self.previous_hard = hard;
+                self.previous_score = score;
+                self.previous_gold_ttl = gold_ttl;
+                self.previous_banner = banner;
+            }
+
+            render_smooth_board(
+                canvas, shadow, layout, motion, body, len, food, gold_food, bombs, bullets,
+                rocket, alpha,
+            );
+
             if canvas
-                .upload_shadow_region(shadow, 0, 0, canvas.width(), HUD_HEIGHT)
+                .upload_shadow_region(
+                    shadow,
+                    layout.board_x,
+                    layout.board_y,
+                    layout.board_w,
+                    layout.board_h,
+                )
                 .is_ok()
                 && canvas
-                    .present_region(0, 0, canvas.width(), HUD_HEIGHT)
+                    .present_region(
+                        layout.board_x,
+                        layout.board_y,
+                        layout.board_w,
+                        layout.board_h,
+                    )
                     .is_ok()
             {
                 self.presents = self.presents.saturating_add(1);
             }
 
-            // Coalesce only adjacent dirty cells. Head and tail can be far
-            // apart, so one bounding rectangle would regress to a near-full
-            // board copy as the snake grows.
-            for y in 0..GRID_H {
-                let mut x = 0;
-                while x < GRID_W {
-                    let index = y * GRID_W + x;
-                    if current[index] == self.previous[index] {
-                        x += 1;
-                        continue;
-                    }
-                    let start = x;
-                    while x < GRID_W {
-                        let run_index = y * GRID_W + x;
-                        if current[run_index] == self.previous[run_index] {
-                            break;
-                        }
-                        render_cell(canvas, shadow, layout, x, y, current[run_index]);
-                        self.previous[run_index] = current[run_index];
-                        self.dirty_cells = self.dirty_cells.saturating_add(1);
-                        x += 1;
-                    }
-                    let px = layout.board_x + start as u32 * layout.cell;
-                    let py = layout.board_y + y as u32 * layout.cell;
-                    let width = (x - start) as u32 * layout.cell;
-                    if canvas
-                        .upload_shadow_region(shadow, px, py, width, layout.cell)
-                        .is_ok()
-                        && canvas.present_region(px, py, width, layout.cell).is_ok()
-                    {
-                        self.presents = self.presents.saturating_add(1);
-                    }
-                }
-            }
             self.frames = self.frames.saturating_add(1);
         });
     }
@@ -1134,11 +1260,12 @@ impl Renderer {
     clippy::too_many_arguments,
     reason = "renderer boundary mirrors fixed-capacity game state"
 )]
-fn draw_frame(
+fn draw_frame_smooth(
     renderer: &mut Renderer,
     canvas: &Canvas,
     layout: &Layout,
     hard: bool,
+    motion: &MotionSnapshot,
     body: &[Point; MAX_LEN],
     len: usize,
     food: Point,
@@ -1149,92 +1276,39 @@ fn draw_frame(
     bullets: &[Bullet; MAX_BULLETS],
     rocket: &Rocket,
     banner: EventBanner,
+    alpha: u16,
 ) {
-    renderer.draw(
-        canvas, layout, hard, body, len, food, gold_food, phase, score, bombs, bullets, rocket,
-        banner,
+    renderer.draw_smooth(
+        canvas, layout, hard, motion, body, len, food, gold_food, phase, score, bombs, bullets,
+        rocket, banner, alpha,
     );
-}
-
-fn build_visual_board(
-    body: &[Point; MAX_LEN],
-    len: usize,
-    food: Point,
-    gold_food: Option<GoldFood>,
-    bombs: &[Bomb; MAX_BOMBS],
-    bullets: &[Bullet; MAX_BULLETS],
-    rocket: &Rocket,
-) -> [CellVisual; MAX_LEN] {
-    let mut cells = [EMPTY_CELL; MAX_LEN];
-
-    for bomb in bombs.iter().filter(|bomb| bomb.alive && bomb.fuse <= 4) {
-        let radius = match bomb.kind {
-            BombKind::Small => BOMB_R_SMALL,
-            BombKind::Large => BOMB_R_LARGE,
-        };
-        for dx in -radius..=radius {
-            for dy in -radius..=radius {
-                let x = bomb.pos.x as i16 + dx;
-                let y = bomb.pos.y as i16 + dy;
-                if x >= 0 && x < GRID_W as i16 && y >= 0 && y < GRID_H as i16 {
-                    cells[y as usize * GRID_W + x as usize].background = 1;
-                }
-            }
-        }
-    }
-
-    cells[cell_index(food)].foreground = 1;
-    if let Some(gold) = gold_food {
-        cells[cell_index(gold.pos)].foreground = if gold.ttl <= 10 && gold.ttl % 2 == 0 {
-            3
-        } else {
-            2
-        };
-    }
-    for bomb in bombs.iter().filter(|bomb| bomb.alive) {
-        cells[cell_index(bomb.pos)].foreground = match (bomb.kind, bomb.fuse <= 3) {
-            (BombKind::Small, false) => 4,
-            (BombKind::Small, true) => 5,
-            (BombKind::Large, false) => 6,
-            (BombKind::Large, true) => 7,
-        };
-    }
-    for bullet in bullets.iter().filter(|bullet| bullet.alive) {
-        cells[cell_index(bullet.pos)].foreground = 8;
-    }
-    if rocket.alive {
-        cells[cell_index(rocket.pos)].foreground = 9;
-    }
-    for segment in body.iter().take(len).skip(1) {
-        cells[cell_index(*segment)].foreground = 10;
-    }
-    if len > 0 {
-        cells[cell_index(body[0])].foreground = 11;
-    }
-    cells
-}
-
-fn cell_index(point: Point) -> usize {
-    point.y as usize * GRID_W + point.x as usize
 }
 
 #[expect(
     clippy::too_many_arguments,
     reason = "full redraw is reserved for initialization and phase transitions"
 )]
-fn render_full(
+fn render_smooth_full(
     canvas: &Canvas,
     shadow: &mut [u8],
     layout: &Layout,
     hard: bool,
-    cells: &[CellVisual; MAX_LEN],
+    motion: &MotionSnapshot,
+    body: &[Point; MAX_LEN],
+    len: usize,
+    food: Point,
     gold_food: Option<GoldFood>,
     phase: Phase,
     score: u32,
+    bombs: &[Bomb; MAX_BOMBS],
+    bullets: &[Bullet; MAX_BULLETS],
+    rocket: &Rocket,
     banner: EventBanner,
+    alpha: u16,
 ) {
     let _ = canvas.clear_shadow(shadow, 4, 8, 16);
     render_hud(canvas, shadow, layout, hard, gold_food, score, banner);
+
     shadow_rect(
         canvas,
         shadow,
@@ -1253,45 +1327,344 @@ fn render_full(
         layout.board_h + 4,
         (8, 20, 32),
     );
+
+    render_smooth_board(
+        canvas, shadow, layout, motion, body, len, food, gold_food, bombs, bullets, rocket, alpha,
+    );
+
+    if phase == Phase::GameOver {
+        render_game_over_overlay(canvas, shadow, layout, hard);
+    }
+}
+
+fn render_game_over_overlay(canvas: &Canvas, shadow: &mut [u8], layout: &Layout, hard: bool) {
+    let overlay_y = layout.board_y + layout.board_h.saturating_sub(72) / 2;
+    shadow_rect(
+        canvas,
+        shadow,
+        layout.board_x,
+        overlay_y,
+        layout.board_w,
+        72,
+        (18, 4, 10),
+    );
+    let lose = if hard {
+        "You lost at snake! (HARD)"
+    } else {
+        "You lost at snake!"
+    };
+    shadow_text(
+        canvas,
+        shadow,
+        layout.board_x + 24,
+        layout.board_y + layout.board_h / 2 - 20,
+        lose,
+        (255, 120, 120),
+    );
+    shadow_text(
+        canvas,
+        shadow,
+        layout.board_x + 24,
+        layout.board_y + layout.board_h / 2,
+        "Enter = play again    Esc = shell",
+        (220, 220, 200),
+    );
+}
+
+/// Repaint the whole board region for a single frame.
+///
+/// We intentionally redraw every tile rather than diff cell-by-cell: with
+/// interpolated motion, sprites occupy sub-cell pixel positions on almost
+/// every frame, so a per-cell dirty check would degenerate into "nearly
+/// everything is dirty" anyway while adding bookkeeping overhead. A single
+/// full-board pass keeps the code simple and is cheap enough at this grid
+/// size (32x18 cells) to run every render tick.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "smooth board redraw uses fixed-capacity no_alloc state"
+)]
+fn render_smooth_board(
+    canvas: &Canvas,
+    shadow: &mut [u8],
+    layout: &Layout,
+    motion: &MotionSnapshot,
+    body: &[Point; MAX_LEN],
+    len: usize,
+    food: Point,
+    gold_food: Option<GoldFood>,
+    bombs: &[Bomb; MAX_BOMBS],
+    bullets: &[Bullet; MAX_BULLETS],
+    rocket: &Rocket,
+    alpha: u16,
+) {
     for y in 0..GRID_H {
         for x in 0..GRID_W {
-            render_cell(canvas, shadow, layout, x, y, cells[y * GRID_W + x]);
+            render_board_tile(canvas, shadow, layout, x, y);
         }
     }
 
-    if phase == Phase::GameOver {
-        let overlay_y = layout.board_y + layout.board_h.saturating_sub(72) / 2;
+    // Bomb danger-zone halo, drawn under everything else, active once the
+    // fuse is short enough to warrant a warning.
+    for bomb in bombs.iter().filter(|bomb| bomb.alive && bomb.fuse <= 4) {
+        let radius = match bomb.kind {
+            BombKind::Small => BOMB_R_SMALL,
+            BombKind::Large => BOMB_R_LARGE,
+        };
+        for dx in -radius..=radius {
+            for dy in -radius..=radius {
+                let x = bomb.pos.x as i16 + dx;
+                let y = bomb.pos.y as i16 + dy;
+                if x >= 0 && x < GRID_W as i16 && y >= 0 && y < GRID_H as i16 {
+                    let px = layout.board_x + x as u32 * layout.cell;
+                    let py = layout.board_y + y as u32 * layout.cell;
+                    let inset = (layout.cell / 4).max(1);
+                    shadow_rect(
+                        canvas,
+                        shadow,
+                        px + inset,
+                        py + inset,
+                        layout.cell.saturating_sub(inset * 2).max(1),
+                        layout.cell.saturating_sub(inset * 2).max(1),
+                        (120, 30, 30),
+                    );
+                }
+            }
+        }
+    }
+
+    // Static sprites: food, gold apple, bombs. These occupy exactly one
+    // grid cell and never move between logical steps, so no interpolation
+    // is needed for them.
+    fill_cell_shadow(canvas, shadow, layout, food.x, food.y, (220, 80, 80));
+
+    if let Some(gold) = gold_food {
+        let color = if gold.ttl <= 10 && gold.ttl % 2 == 0 {
+            (100, 80, 0)
+        } else {
+            (255, 215, 0)
+        };
+        fill_cell_shadow(canvas, shadow, layout, gold.pos.x, gold.pos.y, color);
+    }
+
+    for bomb in bombs.iter().filter(|bomb| bomb.alive) {
+        let color = match (bomb.kind, bomb.fuse <= 3) {
+            (BombKind::Small, false) => (60, 60, 70),
+            (BombKind::Small, true) => (255, 200, 40),
+            (BombKind::Large, false) => (40, 40, 50),
+            (BombKind::Large, true) => (255, 80, 40),
+        };
+        fill_cell_shadow(canvas, shadow, layout, bomb.pos.x, bomb.pos.y, color);
+    }
+
+    // Moving sprites: bullets, rocket, snake body. All interpolate from
+    // their pre-step position (`motion`) to their post-step position
+    // (current state) using this frame's `alpha`. Entities that just spawned
+    // this step have no valid "from" position, so they pop in at their
+    // final cell instead of animating in from nowhere.
+    for i in 0..MAX_BULLETS {
+        if !bullets[i].alive {
+            continue;
+        }
+        let from = if motion.bullets[i].alive {
+            motion.bullets[i].pos
+        } else {
+            bullets[i].pos
+        };
+        fill_bullet_shadow_lerp(canvas, shadow, layout, from, bullets[i].pos, alpha);
+    }
+
+    if rocket.alive {
+        let from = if motion.rocket.alive {
+            motion.rocket.pos
+        } else {
+            rocket.pos
+        };
+        fill_cell_shadow_lerp(
+            canvas,
+            shadow,
+            layout,
+            from,
+            rocket.pos,
+            alpha,
+            (220, 60, 220),
+        );
+    }
+
+    // Body first (tail to neck), head last, so the head always renders on
+    // top at the point where the snake would otherwise overlap itself.
+    for i in (1..len).rev() {
+        let from = if i < motion.len { motion.body[i] } else { body[i] };
+        fill_cell_shadow_lerp(canvas, shadow, layout, from, body[i], alpha, (30, 155, 105));
+    }
+
+    if len > 0 {
+        let from = if motion.len > 0 {
+            motion.body[0]
+        } else {
+            body[0]
+        };
+        fill_cell_shadow_lerp(canvas, shadow, layout, from, body[0], alpha, (50, 240, 140));
+    }
+}
+
+/// Linear interpolation in fixed-point pixel space, `alpha` in
+/// [0, INTERP_ONE]. Kept in i64 purely to avoid overflow bookkeeping —
+/// board pixel coordinates are always small relative to i64's range.
+fn lerp_u32(start: u32, end: u32, alpha: u16) -> u32 {
+    let start = start as i64;
+    let end = end as i64;
+    let alpha = alpha as i64;
+    (start + ((end - start) * alpha) / INTERP_ONE as i64) as u32
+}
+
+#[expect(clippy::too_many_arguments, reason = "small framebuffer sprite helper")]
+fn fill_cell_shadow_lerp(
+    canvas: &Canvas,
+    shadow: &mut [u8],
+    layout: &Layout,
+    from: Point,
+    to: Point,
+    alpha: u16,
+    color: (u8, u8, u8),
+) {
+    let inset = (layout.cell / 10).max(1);
+    let size = layout.cell.saturating_sub(inset * 2).max(1);
+
+    let sx = layout.board_x + from.x as u32 * layout.cell + inset;
+    let sy = layout.board_y + from.y as u32 * layout.cell + inset;
+    let ex = layout.board_x + to.x as u32 * layout.cell + inset;
+    let ey = layout.board_y + to.y as u32 * layout.cell + inset;
+
+    let px = lerp_u32(sx, ex, alpha);
+    let py = lerp_u32(sy, ey, alpha);
+
+    shadow_rect(canvas, shadow, px, py, size, size, color);
+
+    if size >= 8 {
+        let highlight = (size / 5).max(2);
         shadow_rect(
             canvas,
             shadow,
-            layout.board_x,
-            overlay_y,
-            layout.board_w,
-            72,
-            (18, 4, 10),
-        );
-        let lose = if hard {
-            "You lost at snake! (HARD)"
-        } else {
-            "You lost at snake!"
-        };
-        shadow_text(
-            canvas,
-            shadow,
-            layout.board_x + 24,
-            layout.board_y + layout.board_h / 2 - 20,
-            lose,
-            (255, 120, 120),
-        );
-        shadow_text(
-            canvas,
-            shadow,
-            layout.board_x + 24,
-            layout.board_y + layout.board_h / 2,
-            "Enter = play again    Esc = shell",
-            (220, 220, 200),
+            px + inset,
+            py + inset,
+            highlight,
+            highlight,
+            (
+                color.0.saturating_add(28),
+                color.1.saturating_add(28),
+                color.2.saturating_add(28),
+            ),
         );
     }
+}
+
+/// Bullets render smaller than a full cell (they're projectiles, not board
+/// occupants), so they get their own centered lerp helper instead of
+/// reusing the inset-square logic used for snake/rocket.
+fn fill_bullet_shadow_lerp(
+    canvas: &Canvas,
+    shadow: &mut [u8],
+    layout: &Layout,
+    from: Point,
+    to: Point,
+    alpha: u16,
+) {
+    let size = (layout.cell / 3).max(1);
+
+    let scx = layout.board_x + from.x as u32 * layout.cell + layout.cell / 2;
+    let scy = layout.board_y + from.y as u32 * layout.cell + layout.cell / 2;
+    let ecx = layout.board_x + to.x as u32 * layout.cell + layout.cell / 2;
+    let ecy = layout.board_y + to.y as u32 * layout.cell + layout.cell / 2;
+
+    let cx = lerp_u32(scx, ecx, alpha);
+    let cy = lerp_u32(scy, ecy, alpha);
+
+    let px = cx.saturating_sub(size / 2);
+    let py = cy.saturating_sub(size / 2);
+
+    shadow_rect(canvas, shadow, px, py, size, size, (255, 220, 60));
+}
+
+/// Base tile background plus the sparse grid lines. Drawn under every
+/// sprite on every frame; static sprites and lerped moving sprites are
+/// layered on top by the caller.
+fn render_board_tile(canvas: &Canvas, shadow: &mut [u8], layout: &Layout, x: usize, y: usize) {
+    let px = layout.board_x + x as u32 * layout.cell;
+    let py = layout.board_y + y as u32 * layout.cell;
+
+    shadow_rect(canvas, shadow, px, py, layout.cell, layout.cell, (7, 14, 24));
+
+    if x > 0 && x.is_multiple_of(4) {
+        shadow_rect(canvas, shadow, px, py, 1, layout.cell, (12, 27, 39));
+    }
+    if y > 0 && y.is_multiple_of(3) {
+        shadow_rect(canvas, shadow, px, py, layout.cell, 1, (12, 27, 39));
+    }
+}
+
+/// Draws a single non-moving sprite centered in its cell. Used for food,
+/// the gold apple and bombs — none of which need interpolation.
+fn fill_cell_shadow(
+    canvas: &Canvas,
+    shadow: &mut [u8],
+    layout: &Layout,
+    x: u8,
+    y: u8,
+    color: (u8, u8, u8),
+) {
+    let inset = (layout.cell / 10).max(1);
+    let px = layout.board_x + x as u32 * layout.cell + inset;
+    let py = layout.board_y + y as u32 * layout.cell + inset;
+    let size = layout.cell.saturating_sub(inset * 2).max(1);
+    shadow_rect(canvas, shadow, px, py, size, size, color);
+    if size >= 8 {
+        let highlight = (size / 5).max(2);
+        shadow_rect(
+            canvas,
+            shadow,
+            px + inset,
+            py + inset,
+            highlight,
+            highlight,
+            (
+                color.0.saturating_add(28),
+                color.1.saturating_add(28),
+                color.2.saturating_add(28),
+            ),
+        );
+    }
+}
+
+fn shadow_rect(
+    canvas: &Canvas,
+    shadow: &mut [u8],
+    x: u32,
+    y: u32,
+    width: u32,
+    height: u32,
+    color: (u8, u8, u8),
+) {
+    let _ = canvas.fill_rect_to_shadow(shadow, x, y, width, height, color.0, color.1, color.2);
+}
+
+fn shadow_text(
+    canvas: &Canvas,
+    shadow: &mut [u8],
+    x: u32,
+    y: u32,
+    text: &str,
+    color: (u8, u8, u8),
+) {
+    let _ = canvas.draw_text_to_shadow(
+        shadow,
+        x,
+        y,
+        text,
+        color.0,
+        color.1,
+        color.2,
+        TextFont::Tty8x16,
+    );
 }
 
 fn render_hud(
@@ -1369,125 +1742,6 @@ fn render_hud(
             (255, 215, 0),
         );
     }
-}
-
-fn render_cell(
-    canvas: &Canvas,
-    shadow: &mut [u8],
-    layout: &Layout,
-    x: usize,
-    y: usize,
-    visual: CellVisual,
-) {
-    let px = layout.board_x + x as u32 * layout.cell;
-    let py = layout.board_y + y as u32 * layout.cell;
-    shadow_rect(
-        canvas,
-        shadow,
-        px,
-        py,
-        layout.cell,
-        layout.cell,
-        (7, 14, 24),
-    );
-    if x > 0 && x.is_multiple_of(4) {
-        shadow_rect(canvas, shadow, px, py, 1, layout.cell, (12, 27, 39));
-    }
-    if y > 0 && y.is_multiple_of(3) {
-        shadow_rect(canvas, shadow, px, py, layout.cell, 1, (12, 27, 39));
-    }
-    if visual.background == 1 {
-        let inset = (layout.cell / 4).max(1);
-        shadow_rect(
-            canvas,
-            shadow,
-            px + inset,
-            py + inset,
-            layout.cell.saturating_sub(inset * 2).max(1),
-            layout.cell.saturating_sub(inset * 2).max(1),
-            (120, 30, 30),
-        );
-    }
-    let color = match visual.foreground {
-        1 => Some((220, 80, 80)),
-        2 => Some((255, 215, 0)),
-        3 => Some((100, 80, 0)),
-        4 => Some((60, 60, 70)),
-        5 => Some((255, 200, 40)),
-        6 => Some((40, 40, 50)),
-        7 => Some((255, 80, 40)),
-        8 => Some((255, 220, 60)),
-        9 => Some((220, 60, 220)),
-        10 => Some((30, 155, 105)),
-        11 => Some((50, 240, 140)),
-        _ => None,
-    };
-    if let Some(color) = color {
-        fill_cell_shadow(canvas, shadow, layout, x as u8, y as u8, color);
-    }
-}
-
-fn fill_cell_shadow(
-    canvas: &Canvas,
-    shadow: &mut [u8],
-    layout: &Layout,
-    x: u8,
-    y: u8,
-    color: (u8, u8, u8),
-) {
-    let inset = (layout.cell / 10).max(1);
-    let px = layout.board_x + x as u32 * layout.cell + inset;
-    let py = layout.board_y + y as u32 * layout.cell + inset;
-    let size = layout.cell.saturating_sub(inset * 2).max(1);
-    shadow_rect(canvas, shadow, px, py, size, size, color);
-    if size >= 8 {
-        let highlight = (size / 5).max(2);
-        shadow_rect(
-            canvas,
-            shadow,
-            px + inset,
-            py + inset,
-            highlight,
-            highlight,
-            (
-                color.0.saturating_add(28),
-                color.1.saturating_add(28),
-                color.2.saturating_add(28),
-            ),
-        );
-    }
-}
-
-fn shadow_rect(
-    canvas: &Canvas,
-    shadow: &mut [u8],
-    x: u32,
-    y: u32,
-    width: u32,
-    height: u32,
-    color: (u8, u8, u8),
-) {
-    let _ = canvas.fill_rect_to_shadow(shadow, x, y, width, height, color.0, color.1, color.2);
-}
-
-fn shadow_text(
-    canvas: &Canvas,
-    shadow: &mut [u8],
-    x: u32,
-    y: u32,
-    text: &str,
-    color: (u8, u8, u8),
-) {
-    let _ = canvas.draw_text_to_shadow(
-        shadow,
-        x,
-        y,
-        text,
-        color.0,
-        color.1,
-        color.2,
-        TextFont::Tty8x16,
-    );
 }
 
 /// Write `"<label><value>"` into `buf` and return the UTF-8 slice.
