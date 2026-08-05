@@ -67,6 +67,50 @@ jobs:
           path: ci-artifacts/
           if-no-files-found: warn
 
+  qemu-nvme-boot:
+    # End-to-end NVMe DriverHost + hxfs-service smoke. Boots QEMU with a
+    # real -device nvme,serial=huesosnvme backed by a 4 GiB Hxfs v5
+    # image produced by `tools/mkhxfs.py`. The expected happy path is
+    # `controller identify` -> `VolumeManager system volume` ->
+    # `[hxfs] service started` without `journal replay failed: BadBlock`
+    # and without `controller bring-up failed`.
+    #
+    # Matrix mirrors `qemu-boot` so a release/LTO regression in the
+    # storage path surfaces here even if the no-NVMe boot smoke is
+    # green. The default 120 s timeout is generous for the bring-up
+    # path; the soak variant uses a longer wall clock.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        profile: [debug, release]
+        cpus: [2]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            gcc xorriso qemu-system-x86
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install nightly-2026-03-01 --profile minimal \
+            --component rust-src,llvm-tools-preview
+          rustup default nightly-2026-03-01
+      - name: NVMe + Hxfs QEMU smoke
+        env:
+          CARGO_BUILD_JOBS: "1"
+          ARTIFACT_DIR: ci-artifacts
+        run: bash scripts/ci-qemu-nvme-soak.sh ${{ matrix.profile }} 120
+      - name: Upload serial log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: qemu-nvme-${{ matrix.profile }}-smp${{ matrix.cpus }}
+          path: ci-artifacts/
+          if-no-files-found: warn
+
   qemu-extable-smoke:
     # Boot QEMU with an HBI cmdline that asks the kernel to fire the
     # synthetic recoverable-copy probe, then verify the serial log
