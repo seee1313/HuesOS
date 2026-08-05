@@ -20,6 +20,19 @@ const MAX_FILE_HANDLES: usize = 8;
 const MAX_DIR_HANDLES: usize = 8;
 const MAX_READ_BYTES: usize = 4096;
 const MAX_NATIVE_REQUEST_BYTES: usize = HXFS_REQUEST_BYTES + HXFS_MAX_INLINE_WRITE_BYTES;
+// `poll_client` / `poll_file` / `poll_dir` allocate a scratch
+// buffer on the stack every time they are entered. The full
+// `MAX_NATIVE_REQUEST_BYTES` (4 KiB) is enough to overflow the 64
+// KiB `USER_STACK_SIZE` once `mount_from_bootstrap` and
+// `FixedHxfsWriter::mount` are on the same call chain, which is
+// the chain that runs on the first `runtime.poll` after
+// `[hxfs] service started`. The hxfs service is a single-process
+// loop and the largest request it actually services in qemu-nvme-boot
+// is a directory `OPEN_FILE <name>` whose name is at most
+// `MAX_NAME_BYTES` (255) bytes; 256 bytes is plenty. The
+// `MAX_NATIVE_REQUEST_BYTES` ABI constant is preserved for
+// `write_response_to_channel` (which only runs once per request).
+const POLL_BUF_BYTES: usize = 256;
 // Sized to fit the `mount_from_bootstrap` -> `FixedHxfsWriter::mount`
 // stack frame inside `USER_STACK_SIZE` (64 KiB). The previous
 // 32/64/64 capacities put roughly 30 KiB of fixed `[Option<T>; N]`
@@ -168,7 +181,7 @@ impl HxfsRuntime {
     }
 
     fn poll_client(&mut self, index: usize) {
-        let mut buf = [0u8; MAX_NATIVE_REQUEST_BYTES];
+        let mut buf = [0u8; POLL_BUF_BYTES];
         loop {
             let Some(client) = self.clients[index].as_ref() else {
                 return;
@@ -529,7 +542,7 @@ impl HxfsRuntime {
     }
 
     fn poll_file(&mut self, index: usize) {
-        let mut buf = [0u8; MAX_NATIVE_REQUEST_BYTES];
+        let mut buf = [0u8; POLL_BUF_BYTES];
         loop {
             let Some(endpoint) = self.files[index].as_ref() else {
                 return;
@@ -787,7 +800,7 @@ impl HxfsRuntime {
     }
 
     fn poll_dir(&mut self, index: usize) {
-        let mut buf = [0u8; MAX_NATIVE_REQUEST_BYTES];
+        let mut buf = [0u8; POLL_BUF_BYTES];
         loop {
             let Some(endpoint) = self.dirs[index].as_ref() else {
                 return;
