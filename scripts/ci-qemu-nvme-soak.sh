@@ -102,13 +102,13 @@ set -e
 # A healthy OS intentionally keeps running, so timeout(1)'s 124 is expected.
 if [[ "$status" != 0 && "$status" != 124 ]]; then
     echo "[soak] QEMU exited unexpectedly with status $status" >&2
-    tail -200 "$log" >&2 || true
+    wc -l "$log" >&2; head -2000 "$log" >&2
     exit 1
 fi
 
 if grep -Fq 'KERNEL PANIC' "$log" || grep -Fq '[hxfs] PANIC' "$log"; then
     echo "[soak] panic marker detected" >&2
-    tail -200 "$log" >&2 || true
+    wc -l "$log" >&2; head -2000 "$log" >&2
     exit 1
 fi
 
@@ -120,8 +120,8 @@ required=(
 for marker in "${required[@]}"; do
     if ! grep -Fq "$marker" "$log"; then
         echo "[soak] missing marker: $marker" >&2
-        echo "[soak] last 200 serial lines:" >&2
-        tail -200 "$log" >&2 || true
+        echo "[soak] full serial log (head 2000 lines):" >&2
+        wc -l "$log" >&2; head -2000 "$log" >&2
         exit 1
     fi
 done
@@ -135,7 +135,7 @@ for regression in \
     '[hxfs] superblock checksum mismatch'; do
     if grep -Fq "$regression" "$log"; then
         echo "[soak] regression marker present: $regression" >&2
-        tail -200 "$log" >&2 || true
+        wc -l "$log" >&2; head -2000 "$log" >&2
         exit 1
     fi
 done
