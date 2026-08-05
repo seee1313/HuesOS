@@ -162,12 +162,12 @@ mod tests {
     use crate::crc32c::metadata_crc32c;
 
     struct MemStore {
-        image: [u8; BLOCK_SIZE * 8],
+        image: [u8; BLOCK_SIZE * 16],
         flushes: u32,
     }
 
     impl MemStore {
-        fn new(image: [u8; BLOCK_SIZE * 8]) -> Self {
+        fn new(image: [u8; BLOCK_SIZE * 16]) -> Self {
             Self { image, flushes: 0 }
         }
     }
@@ -259,7 +259,7 @@ mod tests {
 
     #[test]
     fn clean_root_store_does_not_replay() {
-        let mut image = [0u8; BLOCK_SIZE * 8];
+        let mut image = [0u8; BLOCK_SIZE * 16];
         image[0..BLOCK_SIZE].copy_from_slice(&make_superblock(1, 1, 0, 0, ROOT_STATE_CLEAN));
         let mut store = MemStore::new(image);
         assert_eq!(replay_journal(&mut store), Ok(ReplayOutcome::Clean));
@@ -268,7 +268,7 @@ mod tests {
 
     #[test]
     fn recovering_journal_replays_records_and_final_superblock() {
-        let mut image = [0u8; BLOCK_SIZE * 8];
+        let mut image = [0u8; BLOCK_SIZE * 16];
         let recovering = make_superblock(2, 1, 2, 6, ROOT_STATE_RECOVERING);
         let final_super = make_superblock(2, 7, 0, 0, ROOT_STATE_CLEAN);
         let mut target = [0x5au8; BLOCK_SIZE];
@@ -316,7 +316,7 @@ mod tests {
 
     #[test]
     fn bad_journal_crc_is_rejected_without_publish() {
-        let mut image = [0u8; BLOCK_SIZE * 8];
+        let mut image = [0u8; BLOCK_SIZE * 16];
         let recovering = make_superblock(2, 1, 2, 4, ROOT_STATE_RECOVERING);
         let final_super = make_superblock(2, 7, 0, 0, ROOT_STATE_CLEAN);
         image[0..BLOCK_SIZE].copy_from_slice(&recovering);
@@ -334,5 +334,178 @@ mod tests {
         let mut store = MemStore::new(image);
         assert_eq!(replay_journal(&mut store), Err(HxfsError::BadChecksum));
         assert_eq!(&store.image[0..BLOCK_SIZE], &recovering);
+    }
+
+    // Production gate crash matrix: each test injects one class of
+    // journal corruption and verifies that the replay path refuses to
+    // publish a partial superblock. The superblock at LBA 0 must
+    // remain unchanged so the next mount can retry recovery.
+
+    #[test]
+    fn recovering_without_journal_range_is_rejected() {
+        // State is RECOVERING but no journal range is set. The replay
+        // path must not fall through to a clean root-store branch and
+        // must not publish anything.
+        let mut image = [0u8; BLOCK_SIZE * 16];
+        image[0..BLOCK_SIZE].copy_from_slice(&make_superblock(2, 1, 0, 0, ROOT_STATE_RECOVERING));
+        let mut store = MemStore::new(image);
+        let original_snapshot: [u8; BLOCK_SIZE] = match store.image[..BLOCK_SIZE].try_into() {
+            Ok(value) => value,
+            Err(_) => return,
+        };
+        let original_superblock = original_snapshot;
+        assert_eq!(replay_journal(&mut store), Err(HxfsError::BadJournal));
+        assert_eq!(&store.image[..BLOCK_SIZE], &original_superblock[..]);
+    }
+
+    #[test]
+    fn inverted_journal_range_is_rejected() {
+        // journal_end_lba <= journal_start_lba is not a valid range.
+        let mut image = [0u8; BLOCK_SIZE * 16];
+        image[0..BLOCK_SIZE].copy_from_slice(&make_superblock(2, 1, 5, 5, ROOT_STATE_RECOVERING));
+        let mut store = MemStore::new(image);
+        let original_snapshot: [u8; BLOCK_SIZE] = match store.image[..BLOCK_SIZE].try_into() {
+            Ok(value) => value,
+            Err(_) => return,
+        };
+        let original_superblock = original_snapshot;
+        assert_eq!(replay_journal(&mut store), Err(HxfsError::BadJournal));
+        assert_eq!(&store.image[..BLOCK_SIZE], &original_superblock[..]);
+    }
+
+    #[test]
+    fn odd_journal_span_is_rejected() {
+        // Span is not a multiple of 2 records. Records occupy a
+        // metadata block plus a data block each, so an odd span would
+        // be unparseable.
+        let mut image = [0u8; BLOCK_SIZE * 16];
+        image[0..BLOCK_SIZE].copy_from_slice(&make_superblock(2, 1, 2, 5, ROOT_STATE_RECOVERING));
+        let mut store = MemStore::new(image);
+        let original_snapshot: [u8; BLOCK_SIZE] = match store.image[..BLOCK_SIZE].try_into() {
+            Ok(value) => value,
+            Err(_) => return,
+        };
+        let original_superblock = original_snapshot;
+        assert_eq!(replay_journal(&mut store), Err(HxfsError::BadJournal));
+        assert_eq!(&store.image[..BLOCK_SIZE], &original_superblock[..]);
+    }
+
+    #[test]
+    fn mid_journal_flag_on_non_final_record_is_rejected() {
+        // FINAL_SUPERBLOCK flag is set on a non-final record; the
+        // final-superblock marker must appear on the last record only.
+        let mut image = [0u8; BLOCK_SIZE * 16];
+        let recovering = make_superblock(2, 1, 2, 10, ROOT_STATE_RECOVERING);
+        image[0..BLOCK_SIZE].copy_from_slice(&recovering);
+        // Record 0 (non-final) wrongly carries the final flag.
+        let target = [0xa5u8; BLOCK_SIZE];
+        image[BLOCK_SIZE * 2..BLOCK_SIZE * 3].copy_from_slice(&make_journal_record(
+            2,
+            0,
+            4,
+            6,
+            3,
+            crc32c(&target),
+            JOURNAL_RECORD_FLAG_FINAL_SUPERBLOCK,
+            9,
+        ));
+        image[BLOCK_SIZE * 3..BLOCK_SIZE * 4].copy_from_slice(&target);
+        let mut store = MemStore::new(image);
+        let original_snapshot: [u8; BLOCK_SIZE] = match store.image[..BLOCK_SIZE].try_into() {
+            Ok(value) => value,
+            Err(_) => return,
+        };
+        let original_superblock = original_snapshot;
+        assert_eq!(replay_journal(&mut store), Err(HxfsError::BadJournal));
+        assert_eq!(&store.image[..BLOCK_SIZE], &original_superblock[..]);
+        // Target block was not written.
+        assert_eq!(
+            &store.image[BLOCK_SIZE * 6..BLOCK_SIZE * 7],
+            &[0u8; BLOCK_SIZE][..]
+        );
+    }
+
+    #[test]
+    fn unknown_journal_flag_is_rejected() {
+        // Bits other than FINAL_SUPERBLOCK are reserved and must be
+        // rejected; otherwise a future firmware could silently set
+        // its own flags and bypass the contract.
+        let mut image = [0u8; BLOCK_SIZE * 16];
+        let recovering = make_superblock(2, 1, 2, 6, ROOT_STATE_RECOVERING);
+        image[0..BLOCK_SIZE].copy_from_slice(&recovering);
+        let target = [0x5au8; BLOCK_SIZE];
+        image[BLOCK_SIZE * 2..BLOCK_SIZE * 3].copy_from_slice(&make_journal_record(
+            2,
+            0,
+            2,
+            6,
+            3,
+            crc32c(&target),
+            0x4, // unknown flag bit
+            7,
+        ));
+        image[BLOCK_SIZE * 3..BLOCK_SIZE * 4].copy_from_slice(&target);
+        let final_super = make_superblock(2, 7, 0, 0, ROOT_STATE_CLEAN);
+        image[BLOCK_SIZE * 4..BLOCK_SIZE * 5].copy_from_slice(&make_journal_record(
+            4,
+            1,
+            2,
+            0,
+            5,
+            crc32c(&final_super),
+            JOURNAL_RECORD_FLAG_FINAL_SUPERBLOCK,
+            7,
+        ));
+        image[BLOCK_SIZE * 5..BLOCK_SIZE * 6].copy_from_slice(&final_super);
+        let mut store = MemStore::new(image);
+        let original_snapshot: [u8; BLOCK_SIZE] = match store.image[..BLOCK_SIZE].try_into() {
+            Ok(value) => value,
+            Err(_) => return,
+        };
+        let original_superblock = original_snapshot;
+        assert_eq!(replay_journal(&mut store), Err(HxfsError::BadJournal));
+        assert_eq!(&store.image[..BLOCK_SIZE], &original_superblock[..]);
+    }
+
+    #[test]
+    fn final_record_with_nonzero_target_lba_is_rejected() {
+        // The final superblock must rewrite LBA 0, not anywhere else.
+        let mut image = [0u8; BLOCK_SIZE * 16];
+        let recovering = make_superblock(2, 1, 2, 4, ROOT_STATE_RECOVERING);
+        image[0..BLOCK_SIZE].copy_from_slice(&recovering);
+        let final_super = make_superblock(2, 7, 0, 0, ROOT_STATE_CLEAN);
+        image[BLOCK_SIZE * 2..BLOCK_SIZE * 3].copy_from_slice(&make_journal_record(
+            2,
+            0,
+            1,
+            42, // wrong target for final record
+            3,
+            crc32c(&final_super),
+            JOURNAL_RECORD_FLAG_FINAL_SUPERBLOCK,
+            7,
+        ));
+        image[BLOCK_SIZE * 3..BLOCK_SIZE * 4].copy_from_slice(&final_super);
+        let mut store = MemStore::new(image);
+        let original_snapshot: [u8; BLOCK_SIZE] = match store.image[..BLOCK_SIZE].try_into() {
+            Ok(value) => value,
+            Err(_) => return,
+        };
+        let original_superblock = original_snapshot;
+        assert_eq!(replay_journal(&mut store), Err(HxfsError::BadJournal));
+        assert_eq!(&store.image[..BLOCK_SIZE], &original_superblock[..]);
+    }
+
+    #[test]
+    fn replay_is_idempotent_on_clean_state() {
+        // Replaying twice on a clean root-store must produce the same
+        // outcome and must not call the BlockStore flush hook. This
+        // covers the on-target code path that double-checks state
+        // before doing any writes.
+        let mut image = [0u8; BLOCK_SIZE * 16];
+        image[0..BLOCK_SIZE].copy_from_slice(&make_superblock(1, 1, 0, 0, ROOT_STATE_CLEAN));
+        let mut store = MemStore::new(image);
+        assert_eq!(replay_journal(&mut store), Ok(ReplayOutcome::Clean));
+        assert_eq!(replay_journal(&mut store), Ok(ReplayOutcome::Clean));
+        assert_eq!(store.flushes, 0);
     }
 }
