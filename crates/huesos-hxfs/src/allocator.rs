@@ -208,4 +208,113 @@ mod tests {
         assert_eq!(alloc.allocate(2), Ok(0));
         assert_eq!(alloc.take_pending_trim(), Some((0, 4)));
     }
+
+    // Production-gate allocator coverage: each test pins one allocator
+    // contract. The full path (allocate -> free -> re-allocate) must
+    // round-trip block addresses; the failure paths (ENOSPC, invalid
+    // args, table full) must surface the right error code without
+    // panicking; the trim queue must drain in FIFO order.
+
+    #[test]
+    fn enospc_after_zone_is_exhausted() {
+        // A 16-block zone can serve at most 16 blocks. The 17th
+        // allocation must return NoSpace, not panic and not wrap.
+        let mut alloc = HybridZoneAllocator::<1, 4>::new(16);
+        assert_eq!(alloc.allocate(16), Ok(0));
+        assert_eq!(alloc.allocate(1), Err(AllocError::NoSpace));
+    }
+
+    #[test]
+    fn enospc_does_not_panic_on_extreme_request() {
+        // A request larger than the zone must surface NoSpace, not
+        // overflow the cursor arithmetic.
+        let mut alloc = HybridZoneAllocator::<1, 4>::new(8);
+        assert_eq!(alloc.allocate(u64::MAX), Err(AllocError::NoSpace));
+    }
+
+    #[test]
+    fn zero_block_allocate_is_invalid() {
+        let mut alloc = HybridZoneAllocator::<1, 4>::new(8);
+        assert_eq!(alloc.allocate(0), Err(AllocError::Invalid));
+    }
+
+    #[test]
+    fn zero_block_free_is_invalid() {
+        let mut alloc = HybridZoneAllocator::<1, 4>::new(8);
+        assert_eq!(alloc.allocate(1), Ok(0));
+        assert_eq!(alloc.free(0, 0), Err(AllocError::Invalid));
+    }
+
+    #[test]
+    fn free_outside_any_zone_is_invalid() {
+        // Free a block at an absolute address that does not fall
+        // inside any configured zone. The allocator must reject
+        // the request rather than silently picking the wrong zone.
+        let mut alloc = HybridZoneAllocator::<1, 4>::new(8);
+        // Zone 0 covers [0, 8). 100 is outside.
+        assert_eq!(alloc.free(100, 1), Err(AllocError::Invalid));
+    }
+
+    #[test]
+    fn free_and_reallocate_round_trip() {
+        // Allocate 8 blocks, free 4, allocate 4. The second
+        // allocation must come from the freed extent (lowest
+        // address wins), not from the cursor.
+        let mut alloc = HybridZoneAllocator::<1, 4>::new(64);
+        assert_eq!(alloc.allocate(8), Ok(0));
+        assert_eq!(alloc.allocate(8), Ok(8));
+        assert_eq!(alloc.free(0, 4), Ok(()));
+        assert_eq!(alloc.allocate(4), Ok(0));
+        // The remaining cursor still advances to 16.
+        assert_eq!(alloc.allocate(4), Ok(16));
+    }
+
+    #[test]
+    fn trim_queue_drains_in_insertion_order() {
+        // Three free extents produce three pending TRIM entries.
+        // Drain must return them in insertion order, then None
+        // once exhausted.
+        let mut alloc = HybridZoneAllocator::<1, 4>::new(64);
+        assert_eq!(alloc.allocate(8), Ok(0));
+        assert_eq!(alloc.allocate(8), Ok(8));
+        assert_eq!(alloc.allocate(8), Ok(16));
+        assert_eq!(alloc.free(0, 8), Ok(()));
+        assert_eq!(alloc.free(8, 8), Ok(()));
+        assert_eq!(alloc.free(16, 8), Ok(()));
+        assert_eq!(alloc.take_pending_trim(), Some((0, 8)));
+        assert_eq!(alloc.take_pending_trim(), Some((8, 8)));
+        assert_eq!(alloc.take_pending_trim(), Some((16, 8)));
+        assert_eq!(alloc.take_pending_trim(), None);
+    }
+
+    #[test]
+    fn trim_table_overflow_surfaces_table_full() {
+        // FREE = 2 means only 2 free extents and 2 pending trim
+        // entries fit. The third free must surface TableFull.
+        let mut alloc = HybridZoneAllocator::<1, 2>::new(64);
+        assert_eq!(alloc.allocate(8), Ok(0));
+        assert_eq!(alloc.allocate(8), Ok(8));
+        assert_eq!(alloc.allocate(8), Ok(16));
+        assert_eq!(alloc.free(0, 8), Ok(()));
+        assert_eq!(alloc.free(8, 8), Ok(()));
+        assert_eq!(alloc.free(16, 8), Err(AllocError::TableFull));
+    }
+
+    #[test]
+    fn multi_zone_free_is_kept_within_its_zone() {
+        // Fill zone 0 to capacity, free an extent in zone 1, then
+        // ask for a 4-block allocation. Zone 0 is exhausted so the
+        // allocator must fall through to zone 1 and use the freed
+        // extent, not the cursor past the previous allocation.
+        let mut alloc = HybridZoneAllocator::<2, 4>::new(ZONE_BLOCKS + 32);
+        // Fill zone 0 exactly.
+        assert_eq!(alloc.allocate(ZONE_BLOCKS), Ok(0));
+        // First allocation in zone 1 lands at the cursor.
+        assert_eq!(alloc.allocate(8), Ok(ZONE_BLOCKS));
+        // Free those 8 blocks in zone 1.
+        assert_eq!(alloc.free(ZONE_BLOCKS, 8), Ok(()));
+        // Next allocation: zone 0 is full, zone 1 has a freed
+        // extent, so the freed extent wins over the cursor.
+        assert_eq!(alloc.allocate(4), Ok(ZONE_BLOCKS));
+    }
 }
