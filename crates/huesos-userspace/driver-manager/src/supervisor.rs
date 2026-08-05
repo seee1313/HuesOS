@@ -1268,6 +1268,7 @@ impl DriverManager {
             match host.bootstrap.read_into(&mut buf) {
                 Ok(n) if &buf[..n] == protocol::HXFS_READY.as_bytes() => {
                     self.hxfs_ready = true;
+                    self.hxfs_failed = false;
                     println!("[driver-manager] Hxfs service ready");
                 }
                 Ok(n) if &buf[..n] == protocol::HXFS_SERVICE_UNAVAILABLE.as_bytes() => {
@@ -1279,7 +1280,7 @@ impl DriverManager {
                 Err(ErrorCode::ShouldWait) => return,
                 Err(error) => {
                     println!(
-                        "[driver-manager] Hxfs service channel failed: {}",
+                        "[driver-manager] Hxfs service channel failed: {} (recovery path closed)",
                         error.as_str()
                     );
                     self.hxfs_failed = true;
