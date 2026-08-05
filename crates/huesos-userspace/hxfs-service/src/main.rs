@@ -1290,10 +1290,17 @@ pub extern "C" fn _start() -> ! {
     println!("[hxfs] service started");
     let bootstrap = libcanvas::channel::bootstrap();
     let Some(fs) = mount_from_bootstrap(&bootstrap) else {
+        // Send the explicit unavailable marker, then exit so
+        // DriverManager observes PeerClosed on the bootstrap
+        // channel and stops polling for a service that will
+        // never become ready. Without the exit the hxfs
+        // process would spin in a yield-only loop holding the
+        // bootstrap channel open, and any retry from a client
+        // (e.g. terminal's open_service) would also spin on the
+        // registry channel and spam the serial log.
         let _ = bootstrap.write(b"service:hxfs:unavailable");
-        loop {
-            libcanvas::process::yield_now();
-        }
+        println!("[hxfs] service exiting: mount failed");
+        libcanvas::process::exit(-1);
     };
     let _ = bootstrap.write(b"service:hxfs:ready");
     let mut runtime = HxfsRuntime::new(fs);
