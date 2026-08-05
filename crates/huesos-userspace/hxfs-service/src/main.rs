@@ -30,6 +30,16 @@ const MAX_NATIVE_REQUEST_BYTES: usize = HXFS_REQUEST_BYTES + HXFS_MAX_INLINE_WRI
 const SERVICE_MAX_OBJECTS: usize = 16;
 const SERVICE_MAX_DIR_ENTRIES: usize = 16;
 const SERVICE_MAX_EXTENTS: usize = 16;
+// The qemu-nvme-boot namespace is exposed with a 512-byte LBA while
+// Hxfs internally works in 4 KiB blocks. The
+// `libcanvas::block::BlockDevice` wire protocol speaks 512-byte LBAs,
+// so a single hxfs 4 KiB block transfer is 8 LBAs. Translate the
+// hxfs-side (lba, blocks) into NVMe-side (lba * 8, blocks * 8)
+// before forwarding; otherwise the first 512 bytes of each hxfs
+// read are valid and the remaining 3584 are uninitialised VMO
+// memory, which fails the superblock/object-table CRC check with
+// `BadBlock` immediately after `[hxfs] service started`.
+const HXFS_LBA_FACTOR: u32 = 8;
 
 struct BlockDeviceReader {
     device: libcanvas::block::BlockDevice,
@@ -37,8 +47,15 @@ struct BlockDeviceReader {
 
 impl BlockReader for BlockDeviceReader {
     fn read_blocks(&mut self, lba: u64, blocks: u32, out: &mut [u8]) -> Result<(), HxfsError> {
+        let lbas = lba
+            .checked_mul(u64::from(HXFS_LBA_FACTOR))
+            .ok_or(HxfsError::OutOfRange)?;
+        let total = u64::from(blocks)
+            .checked_mul(u64::from(HXFS_LBA_FACTOR))
+            .ok_or(HxfsError::OutOfRange)?;
+        let total = u32::try_from(total).map_err(|_| HxfsError::OutOfRange)?;
         self.device
-            .read_blocks(lba, blocks, out)
+            .read_blocks(lbas, total, out)
             .map_err(|_| HxfsError::Io)
     }
 }
