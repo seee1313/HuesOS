@@ -57,6 +57,12 @@ pub struct FixedHxfsWriter<
     superblock: Superblock,
     checkpoint: Checkpoint,
     system_volume: VolumeDescriptor,
+    /// Resolved encryption policy for this volume, or `None` for
+    /// plain volumes. Mirrors [`Hxfs::encryption`]: the policy is
+    /// resolved at mount time from the caller-supplied
+    /// `encryption_policies` table and held in the writer for
+    /// later use by the on-target encryption path.
+    encryption: Option<crate::crypto::EncryptionPolicy>,
     objects: [Option<FixedObject>; MAX_OBJECTS],
     dir_entries: [Option<FixedDirEntry>; MAX_DIR_ENTRIES],
     extents: [Option<FixedExtent>; MAX_EXTENTS],
@@ -72,8 +78,24 @@ impl<
         const MAX_EXTENTS: usize,
     > FixedHxfsWriter<S, MAX_OBJECTS, MAX_DIR_ENTRIES, MAX_EXTENTS>
 {
-    /// Mount a clean v2 Hxfs volume into fixed-capacity mutable state.
-    pub fn mount(mut store: S) -> FixedResult<Self> {
+    /// Mount a clean v2 Hxfs volume into fixed-capacity mutable
+    /// state, treating the volume as unencrypted. Convenience
+    /// wrapper around [`Self::mount_with_keys`].
+    pub fn mount(store: S) -> FixedResult<Self> {
+        Self::mount_with_keys(store, &[])
+    }
+
+    /// Mount a clean v2 Hxfs volume into fixed-capacity mutable
+    /// state, resolving the system volume's encryption policy from
+    /// `encryption_policies`. See [`Hxfs::mount_with_keys`] for the
+    /// semantics of the table and the variants returned for an
+    /// encrypted-but-unresolvable volume; the writer mirrors the
+    /// reader's contract so a plain mount in either code path is
+    /// interchangeable.
+    pub fn mount_with_keys(
+        mut store: S,
+        encryption_policies: &[crate::crypto::EncryptionPolicy],
+    ) -> FixedResult<Self> {
         let superblock = read_superblock(&mut store, 0)?;
         if superblock.root_state != ROOT_STATE_CLEAN
             || superblock.journal_start_lba != 0
@@ -87,17 +109,14 @@ impl<
             superblock.sequence_number,
         )?;
         let system_volume = read_system_volume(&mut store, checkpoint)?;
-        if system_volume.flags & VOLUME_FLAG_ENCRYPTED != 0
-            || system_volume.encryption_policy_id != 0
-        {
-            return Err(HxfsError::EncryptedVolume);
-        }
+        let encryption = crate::resolve_mount_encryption(&system_volume, encryption_policies)?;
 
         let mut mounted = Self {
             store,
             superblock,
             checkpoint,
             system_volume,
+            encryption,
             objects: [const { None }; MAX_OBJECTS],
             dir_entries: [const { None }; MAX_DIR_ENTRIES],
             extents: [const { None }; MAX_EXTENTS],
@@ -109,6 +128,12 @@ impl<
         mounted.next_object_id = mounted.compute_next_object_id();
         mounted.next_lba = mounted.compute_next_lba()?;
         Ok(mounted)
+    }
+
+    /// Resolved encryption policy for this volume, or `None` for
+    /// plain volumes. Mirrors [`Hxfs::encryption`].
+    pub const fn encryption(&self) -> Option<&crate::crypto::EncryptionPolicy> {
+        self.encryption.as_ref()
     }
 
     /// Consume the writer and return the underlying block store.

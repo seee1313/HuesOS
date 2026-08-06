@@ -56,8 +56,26 @@ pub enum HxfsError {
     BadBlock,
     /// Format GUID/version/block size is unsupported.
     UnsupportedFormat,
-    /// Encryption policy was present; Stage G only parses and rejects it.
-    EncryptedVolume,
+    /// Volume is encrypted (system volume has [`VOLUME_FLAG_ENCRYPTED`]
+    /// set or a non-zero `encryption_policy_id`) but the mount-time
+    /// gate has no key context. The caller must supply an
+    /// `encryption_policies` table (or a [`crypto::CryptoKeyHandle`]
+    /// in future revisions) that contains a descriptor for the
+    /// volume's `encryption_policy_id`, and the key provider must
+    /// be available. See [`Hxfs::mount_with_keys`].
+    EncryptedVolumeKeyUnavailable,
+    /// The volume's on-disk `encryption_policy_id` does not match
+    /// any record in the caller-supplied `encryption_policies`
+    /// table. The table must be built from the same root store /
+    /// checkpoint the volume is mounted from; a mismatch usually
+    /// means the caller is looking at a stale checkpoint copy.
+    EncryptedPolicyUnknown,
+    /// The encryption policy descriptor resolved from the
+    /// volume's `encryption_policy_id` failed
+    /// [`crypto::validate_for_mount`] (unsupported algorithm, wrong
+    /// data-unit size, or the key provider is offline). The mount
+    /// cannot proceed.
+    EncryptedPolicyInvalid,
     /// Metadata tree/table is malformed.
     BadTree,
     /// Path or object was not found.
@@ -86,11 +104,47 @@ pub struct Hxfs<R: BlockReader> {
     superblock: Superblock,
     checkpoint: Checkpoint,
     system_volume: VolumeDescriptor,
+    /// Resolved encryption policy for this volume, or `None` for
+    /// plain (unencrypted) volumes. Resolved at mount time from
+    /// the caller-supplied encryption policy table; an encrypted
+    /// volume that fails to resolve is rejected at mount with
+    /// one of the [`HxfsError::Encrypted*`] variants.
+    encryption: Option<crypto::EncryptionPolicy>,
 }
 
 impl<R: BlockReader> Hxfs<R> {
-    /// Mount a read-only Hxfs instance.
-    pub fn mount(mut reader: R) -> Result<Self, HxfsError> {
+    /// Mount a read-only Hxfs instance, treating the volume as
+    /// unencrypted. Convenience wrapper around
+    /// [`Hxfs::mount_with_keys`] for callers that know the
+    /// volume is plain.
+    pub fn mount(reader: R) -> Result<Self, HxfsError> {
+        Self::mount_with_keys(reader, &[])
+    }
+
+    /// Mount a read-only Hxfs instance, resolving the system
+    /// volume's encryption policy from `encryption_policies`.
+    ///
+    /// An empty `encryption_policies` table is valid only for
+    /// volumes that are not encrypted: a plain volume mounts
+    /// successfully and [`Hxfs::encryption`] returns `None`. A
+    /// volume that has the [`VOLUME_FLAG_ENCRYPTED`] flag set or
+    /// a non-zero `encryption_policy_id` is rejected with one of:
+    ///
+    /// - [`HxfsError::EncryptedPolicyUnknown`] if the policy id
+    ///   does not appear in the table (and is not the canonical
+    ///   plain id 0);
+    /// - [`HxfsError::EncryptedPolicyInvalid`] if the resolved
+    ///   policy fails [`crypto::validate_for_mount`] (unsupported
+    ///   algorithm, wrong data-unit size, or no key provider).
+    ///
+    /// The `key_provider_available` flag is `true` for the MVP
+    /// because the software AES-XTS engine linked into this
+    /// crate is the key provider; a future revision with a
+    /// real TPM will thread the predicate through here.
+    pub fn mount_with_keys(
+        mut reader: R,
+        encryption_policies: &[crypto::EncryptionPolicy],
+    ) -> Result<Self, HxfsError> {
         let superblock = read_superblock(&mut reader, 0)?;
         if superblock.root_state != ROOT_STATE_CLEAN
             || superblock.journal_start_lba != 0
@@ -104,17 +158,22 @@ impl<R: BlockReader> Hxfs<R> {
             superblock.sequence_number,
         )?;
         let system_volume = read_system_volume(&mut reader, checkpoint)?;
-        if system_volume.flags & VOLUME_FLAG_ENCRYPTED != 0
-            || system_volume.encryption_policy_id != 0
-        {
-            return Err(HxfsError::EncryptedVolume);
-        }
+        let encryption = resolve_mount_encryption(&system_volume, encryption_policies)?;
         Ok(Self {
             reader,
             superblock,
             checkpoint,
             system_volume,
+            encryption,
         })
+    }
+
+    /// Resolved encryption policy for this volume, or `None` for
+    /// plain volumes. The policy is the same descriptor that
+    /// would be used by the on-target encryption path; readers
+    /// can inspect it for diagnostics without holding a key.
+    pub const fn encryption(&self) -> Option<&crypto::EncryptionPolicy> {
+        self.encryption.as_ref()
     }
 
     /// Superblock chosen at mount.
@@ -131,7 +190,40 @@ impl<R: BlockReader> Hxfs<R> {
     pub const fn volume_info(&self) -> VolumeDescriptor {
         self.system_volume
     }
+}
 
+/// Resolve a system volume's encryption policy for mount.
+///
+/// Returns `Ok(None)` for a plain volume (flag clear, policy id 0).
+/// Returns `Ok(Some(policy))` once the policy has been resolved and
+/// validated. Returns one of the [`HxfsError::Encrypted*`] variants
+/// when the volume is encrypted but the caller-supplied table is
+/// missing the descriptor, the descriptor fails validation, or the
+/// key provider is offline.
+fn resolve_mount_encryption(
+    system_volume: &VolumeDescriptor,
+    encryption_policies: &[crypto::EncryptionPolicy],
+) -> Result<Option<crypto::EncryptionPolicy>, HxfsError> {
+    let encrypted = system_volume.flags & VOLUME_FLAG_ENCRYPTED != 0;
+    let policy_id = system_volume.encryption_policy_id;
+    if !encrypted && policy_id == 0 {
+        return Ok(None);
+    }
+    let resolved =
+        crypto::resolve_encryption_policy(policy_id, encryption_policies).map_err(|error| {
+            match error {
+                crypto::CryptoError::UnknownPolicy => HxfsError::EncryptedPolicyUnknown,
+                other => {
+                    let _ = other;
+                    HxfsError::EncryptedPolicyUnknown
+                }
+            }
+        })?;
+    crypto::validate_for_mount(resolved, true).map_err(|_| HxfsError::EncryptedPolicyInvalid)?;
+    Ok(Some(resolved))
+}
+
+impl<R: BlockReader> Hxfs<R> {
     /// Root directory handle for the system volume.
     pub const fn root_directory(&self) -> DirectoryHandle {
         DirectoryHandle {
@@ -926,7 +1018,10 @@ mod tests {
     fn rejects_encrypted_volume_in_stage_g() {
         let image = build_image(true);
         let reader = SliceBlockReader::new(&image);
-        assert_eq!(Hxfs::mount(reader).err(), Some(HxfsError::EncryptedVolume));
+        assert_eq!(
+            Hxfs::mount_with_keys(reader, &[]).err(),
+            Some(HxfsError::EncryptedPolicyUnknown)
+        );
     }
 
     #[test]

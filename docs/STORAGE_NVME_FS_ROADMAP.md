@@ -930,14 +930,26 @@ YES — security boundary and key hierarchy require owner confirmation.
 Recommended commit split:
 
 ```text
-P1 docs(hxfs): freeze encryption data path and key lifecycle
-P2 feat(hxfs): add KeyProvider and wrapped-key loading path
-P3 feat(hxfs): add AES-XTS block crypto backend
-P4 feat(hxfs): integrate crypto with metadata/data block I/O
-P5 feat(hxfs): encrypt directory names for encrypted volumes
-P6 test(hxfs): add encrypted mount/write/remount/reject tests
-P7 docs(audit): record encryption safety boundary
+P1 docs(hxfs): freeze encryption data path and key lifecycle   DONE
+P2 feat(hxfs): add KeyProvider and wrapped-key loading path   DONE
+P3 feat(hxfs): add AES-XTS block crypto backend                DONE
+P4 feat(hxfs): integrate crypto with mount-time gate           DONE (this PR)
+   - Hxfs::mount_with_keys / FixedHxfsWriter::mount_with_keys
+   - resolve_encryption_policy(policy_id, table) -> Result
+   - plain_policy() canonical zero sentinel
+   - HxfsError::{EncryptedPolicyUnknown, EncryptedPolicyInvalid}
+   - Hxfs::encryption() accessor for downstream readers
+P5 feat(hxfs): integrate crypto with metadata/data block I/O   pending
+P6 feat(hxfs): encrypt directory names for encrypted volumes    pending
+P7 test(hxfs): add encrypted mount/write/remount/reject tests  pending
+P8 docs(audit): record encryption safety boundary               pending
 ```
+
+P3 lands the mount-time gate: an encrypted volume is now
+rejected with one of three precise error variants (no policy
+table entry, invalid policy descriptor, no key provider)
+instead of the legacy generic `EncryptedVolume`. P5/P6/P7/P8
+remain on the roadmap.
 
 ---
 

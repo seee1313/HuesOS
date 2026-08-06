@@ -1279,7 +1279,9 @@ fn status_for_error(error: HxfsError) -> HxfsStatus {
         HxfsError::Io => HxfsStatus::IoError,
         HxfsError::NoSpace => HxfsStatus::NoSpace,
         HxfsError::Unsupported | HxfsError::UnsupportedFormat => HxfsStatus::Unsupported,
-        HxfsError::EncryptedVolume => HxfsStatus::EncryptedUnavailable,
+        HxfsError::EncryptedVolumeKeyUnavailable
+        | HxfsError::EncryptedPolicyUnknown
+        | HxfsError::EncryptedPolicyInvalid => HxfsStatus::EncryptedUnavailable,
         HxfsError::BufferTooSmall
         | HxfsError::OutOfRange
         | HxfsError::BadChecksum
