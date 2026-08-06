@@ -218,6 +218,12 @@ pub struct Screen {
     observed_shadow_generation: usize,
 }
 
+// `Screen` is the public rendering API of the terminal; some of its
+// methods (framebuffer introspection, cursor position query, manual
+// invalidation) are part of the contract for future drivers and tests
+// even when no current in-tree caller exercises them. The `dead_code`
+// lint is therefore disabled at the impl block.
+#[allow(dead_code)]
 impl Screen {
     /// Create a terminal screen. Serial-only boots remain operational when a
     /// framebuffer canvas is unavailable.

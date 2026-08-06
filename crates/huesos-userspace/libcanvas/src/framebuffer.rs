@@ -189,6 +189,7 @@ impl Canvas {
     }
 
     /// Fill a clipped rectangle in a packed shadow buffer without syscalls.
+    #[allow(clippy::too_many_arguments)]
     pub fn fill_rect_to_shadow(
         &self,
         shadow: &mut [u8],
@@ -223,6 +224,7 @@ impl Canvas {
     /// Rasterize text directly into a packed shadow buffer without issuing
     /// per-pixel VMO writes. Dispatches on `font` to either the native
     /// Cozette 6x13 rasteriser or the legacy scaled-8x8 rasteriser.
+    #[allow(clippy::too_many_arguments)]
     pub fn draw_text_to_shadow(
         &self,
         shadow: &mut [u8],
@@ -419,6 +421,7 @@ impl Canvas {
 
     /// Fill an axis-aligned rectangle with a solid color. Clips to the
     /// canvas bounds.
+    #[allow(clippy::too_many_arguments)]
     pub fn fill_rect(
         &self,
         x: u32,
@@ -473,6 +476,7 @@ impl Canvas {
     /// Draw text with an explicit built-in font. Cell width comes
     /// from [`TextFont::cell_w`], so callers do not hard-code
     /// per-font advance widths.
+    #[allow(clippy::too_many_arguments)]
     pub fn draw_text_with_font(
         &self,
         x: u32,
@@ -495,6 +499,7 @@ impl Canvas {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn draw_glyph(
         &self,
         x: u32,
@@ -535,6 +540,7 @@ impl Canvas {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn draw_glyph_8x8_scaled(
         &self,
         x: u32,

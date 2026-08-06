@@ -116,6 +116,10 @@ pub fn parse_for_grants(data: &[u8]) -> ManifestForGrants {
                     manifest.critical = matches!(val, b"true" | b"1" | b"yes" | b"on");
                 }
                 b"resource" => {
+                    // Two-level guard: bounded array + parse success. The
+                    // structure is intentional (skip-on-full vs skip-on-bad)
+                    // so the nested `if let` stays explicit.
+                    #[allow(clippy::collapsible_match)]
                     if manifest.resource_count < MAX_RESOURCE_GRANTS {
                         if let Some(grant) = parse_resource_grant(val) {
                             manifest.resources[manifest.resource_count] = grant;

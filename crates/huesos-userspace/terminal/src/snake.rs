@@ -901,6 +901,7 @@ fn fire_ak(rng: &mut u32, body: &[Point; MAX_LEN], bullets: &mut [Bullet; MAX_BU
     }
 }
 
+#[allow(dead_code, reason = "kept for future direction-introspection helpers")]
 fn opposite(d: Dir) -> Dir {
     match d {
         Dir::Up => Dir::Down,
@@ -1469,6 +1470,10 @@ fn render_smooth_board(
     // (current state) using this frame's `alpha`. Entities that just spawned
     // this step have no valid "from" position, so they pop in at their
     // final cell instead of animating in from nowhere.
+    #[allow(
+        clippy::needless_range_loop,
+        reason = "fixed-capacity array indexed by `i` for cross-array motion lookup"
+    )]
     for i in 0..MAX_BULLETS {
         if !bullets[i].alive {
             continue;
@@ -1529,7 +1534,10 @@ fn lerp_u32(start: u32, end: u32, alpha: u16) -> u32 {
     (start + ((end - start) * alpha) / INTERP_ONE as i64) as u32
 }
 
-#[expect(clippy::too_many_arguments, reason = "small framebuffer sprite helper")]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "small framebuffer sprite helper, may grow with future alpha/effect args"
+)]
 fn fill_cell_shadow_lerp(
     canvas: &Canvas,
     shadow: &mut [u8],
