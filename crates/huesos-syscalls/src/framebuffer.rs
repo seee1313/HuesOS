@@ -150,7 +150,8 @@ pub(crate) fn sys_framebuffer_blit(
 
 #[cfg(test)]
 mod tests {
-    use super::strided_source_span;
+    use super::{strided_source_span, sys_framebuffer_blit};
+    use huesos_abi::{FramebufferBlitArgs, HandleValue};
 
     #[test]
     fn strided_span_includes_only_bytes_through_last_row() {
