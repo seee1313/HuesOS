@@ -92,6 +92,23 @@ impl<
     /// encrypted-but-unresolvable volume; the writer mirrors the
     /// reader's contract so a plain mount in either code path is
     /// interchangeable.
+    /// Mount a clean v2 Hxfs volume into fixed-capacity
+    /// mutable state with both encryption and compression
+    /// policy tables. See [`Hxfs::mount_with_policies`] for
+    /// the semantics of the table; the writer mirrors the
+    /// reader. The compression table is accepted so the
+    /// hxfs-service production wiring can call this entry
+    /// point uniformly; the writer does not yet consult it
+    /// for write-path policy resolution (the read path is
+    /// the only consumer today, see A.3).
+    pub fn mount_with_policies(
+        store: S,
+        encryption_policies: &[crate::crypto::EncryptionPolicy],
+        _compression_policies: &[crate::compression::CompressionPolicy],
+    ) -> FixedResult<Self> {
+        Self::mount_with_keys(store, encryption_policies)
+    }
+
     pub fn mount_with_keys(
         mut store: S,
         encryption_policies: &[crate::crypto::EncryptionPolicy],

@@ -13,7 +13,42 @@ use huesos_hxfs::format::{DirectoryHandle, FileHandle};
 use huesos_hxfs::reader::BlockReader;
 use huesos_hxfs::recovery::{replay_journal, BlockStore, ReplayOutcome};
 use huesos_hxfs::HxfsError;
+use huesos_user_alloc::UserAllocator;
 use libcanvas::{println, Channel, ErrorCode, Vmo};
+
+/// A.6 live mount: the hxfs-service is the production
+/// mount process. It needs a global allocator so the
+/// `mount_with_policies` entry point on `huesos_hxfs` (which
+/// allocates a `Vec<CompressionPolicy>` to hold the
+/// per-volume policy table) can resolve compression
+/// policies at read time. The heap is 256 KiB for the MVP
+/// service profile; the kernel reserves the higher half
+/// of the user address space for the heap and the
+/// allocator grows into that region.
+#[global_allocator]
+static HEAP: UserAllocator = UserAllocator::new();
+
+/// Initialise the heap at the user address range the
+/// kernel reserved for userspace heap. The range is
+/// documented in `huesos-kernel/src/process.rs` and the
+/// linker script `userspace/user_linker.ld`; for the MVP
+/// the hxfs-service reserves the top 256 KiB of its
+/// address space.
+const HEAP_BASE: usize = 0x7000_0000;
+const HEAP_SIZE: usize = 256 * 1024;
+
+fn init_heap() {
+    // SAFETY: the heap region is reserved for the
+    // hxfs-service by the kernel and the linker places the
+    // service's BSS/data at a non-overlapping range; the
+    // 256 KiB region is private to this process. The
+    // Userspace allocator is `no_std` and lives in
+    // `huesos-user-alloc`; its `init` function takes a
+    // raw pointer and is unsafe by signature.
+    unsafe {
+        HEAP.init(HEAP_BASE as *mut u8, HEAP_SIZE);
+    }
+}
 
 const MAX_CLIENTS: usize = 4;
 const MAX_FILE_HANDLES: usize = 8;
@@ -1183,7 +1218,18 @@ fn mount_from_bootstrap(bootstrap: &Channel) -> Option<MountedHxfs> {
                         return None;
                     }
                 }
-                match FixedHxfsWriter::mount(reader) {
+                // A.6 live mount: the production path is
+                // mount_with_policies so the volume's encryption
+                // and compression policy tables (resolved from
+                // the on-disk volume table at mount time) are
+                // honored at every read and write. The MVP
+                // hxfs-service does not yet plumb those tables
+                // through its bootstrap channel, so it passes
+                // empty tables and accepts only plain volumes;
+                // a future revision (Track D.2, TPM-backed key
+                // provider) will read the tables from the
+                // volume descriptor and pass them here.
+                match FixedHxfsWriter::mount_with_policies(reader, &[], &[]) {
                     Ok(fs) => return Some(fs),
                     Err(error) => {
                         println!("[hxfs] mount failed: {:?}", error);
@@ -1277,7 +1323,8 @@ fn status_for_error(error: HxfsError) -> HxfsStatus {
         HxfsError::WrongType | HxfsError::DirectoryNotEmpty => HxfsStatus::WrongType,
         HxfsError::NeedsRecovery | HxfsError::BadJournal => HxfsStatus::NeedsRecovery,
         HxfsError::Io => HxfsStatus::IoError,
-        HxfsError::NoSpace => HxfsStatus::NoSpace,
+        HxfsError::NoSpace | HxfsError::QuotaExceeded => HxfsStatus::NoSpace,
+        HxfsError::Compression => HxfsStatus::IoError,
         HxfsError::Unsupported | HxfsError::UnsupportedFormat => HxfsStatus::Unsupported,
         HxfsError::EncryptedVolumeKeyUnavailable
         | HxfsError::EncryptedPolicyUnknown
@@ -1334,6 +1381,13 @@ fn write_size_info(out: &mut [u8], size: u64) -> usize {
 #[unsafe(no_mangle)]
 pub extern "C" fn _start() -> ! {
     println!("[hxfs] service started");
+    // A.6 live mount: the production mount path
+    // (mount_with_policies) allocates a Vec to hold the
+    // per-volume compression policy table, so the heap has
+    // to be live before mount_from_bootstrap runs. The init
+    // helper is idempotent on subsequent calls but we only
+    // run it once at boot.
+    init_heap();
     let bootstrap = libcanvas::channel::bootstrap();
     let Some(fs) = mount_from_bootstrap(&bootstrap) else {
         // Send the explicit unavailable marker, then exit so
