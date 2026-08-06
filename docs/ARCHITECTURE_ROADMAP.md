@@ -9,6 +9,15 @@ toward the endpoint described here.
 Status: **planning document, not implemented**. Individual sections cross-link
 to concrete work items in `ROADMAP.md` §7 and the Immediate list.
 
+The **production-readiness push** that is currently in flight is tracked in
+[`PRODUCTION_ROADMAP.md`](PRODUCTION_ROADMAP.md), which organises the
+remaining work into Stages A through F (mount path wired, I/O pipeline
+complete, reliability surface, security gate, operations, service
+foundation). That document is the live to-do; this one is the long-term
+direction. The two coexist because they answer different questions:
+*this* document says **what the system is**; *that* document says
+**what still has to ship to make the system deployable**.
+
 ---
 
 ## 1. The endpoint (target architecture)
