@@ -288,9 +288,7 @@ fn hash_key(volume_id: u64, extent_physical_block: u64, page_index: u32) -> u64 
 /// currently always `0` from the single-volume read path.
 /// `extent_physical_block` is the LBA of the extent on disk.
 /// `page_index` is the page offset within the extent (0..=
-/// block_count-1). The cache is bypassed entirely when the
-/// feature gate is off.
-#[cfg(feature = "page-cache")]
+/// block_count-1).
 pub fn read_page_cached<R, F>(
     cache: &mut PageCache,
     volume_id: u64,

@@ -411,6 +411,18 @@ impl<
         if object.object_type != OBJECT_TYPE_FILE {
             return Err(HxfsError::WrongType);
         }
+        // A.5 wire: per-Job quota enforcement on the write path.
+        // The volume-level quota is the system volume descriptor
+        // (VolumeDescriptor.quota_physical_bytes /
+        // quota_objects) and the current usage is the volume's
+        // computed usage; the delta is the bytes + one object
+        // this write will commit. A breach returns
+        // HxfsError::QuotaExceeded, which the kernel
+        // translates to the user-facing NoSpace error at the
+        // mount boundary.
+        let delta_bytes = u64::try_from(data.len()).map_err(|_| HxfsError::OutOfRange)?;
+        self.check_volume_quota(delta_bytes, 0)?;
+
         if offset == 0 {
             self.clear_extents(file.object_id);
         } else if offset != object.size || !offset.is_multiple_of(BLOCK_SIZE_U64) {
@@ -442,6 +454,61 @@ impl<
         self.update_file_record_count(file.object_id)?;
         self.dirty = true;
         self.file_handle(file.object_id)
+    }
+
+    /// A.5 wire: per-Job volume-quota check on the write
+    /// path. The check is volume-level (the system volume
+    /// descriptor's `quota_physical_bytes` and `quota_objects`
+    /// are the cap; the current usage is the volume's
+    /// existing extent table). A breach returns
+    /// [`HxfsError::QuotaExceeded`], which the kernel
+    /// translates to the user-facing NoSpace error.
+    ///
+    /// `delta_bytes` is the number of physical bytes this
+    /// write will commit; `delta_objects` is the number of
+    /// new objects (the fixed-capacity MVP admits one object
+    /// at a time, so the call sites pass 1 for new-file
+    /// creation and 0 for overwrite).
+    fn check_volume_quota(&self, delta_bytes: u64, delta_objects: u64) -> FixedResult<()> {
+        use crate::quota::{check_quota, VolumeQuota, VolumeUsage};
+        let quota = VolumeQuota {
+            max_physical_bytes: self.system_volume.quota_physical_bytes,
+            max_objects: self.system_volume.quota_objects,
+        };
+        let usage = VolumeUsage {
+            physical_bytes: self.committed_physical_bytes(),
+            objects: u64::from(self.object_count()),
+        };
+        check_quota(
+            quota,
+            usage,
+            VolumeUsage {
+                physical_bytes: delta_bytes,
+                objects: delta_objects,
+            },
+        )
+        .map_err(|_| HxfsError::QuotaExceeded)?;
+        Ok(())
+    }
+
+    /// A.5 helper: return the number of live objects in the
+    /// writer. Used by the per-Job quota check on the write
+    /// path; the count is the persisted
+    /// `system_volume.object_count` (i.e. the count of
+    /// committed objects, not the in-flight new-object
+    /// candidate).
+    pub fn object_count(&self) -> u32 {
+        self.system_volume.object_count
+    }
+
+    /// A.5 helper: return the number of physical bytes
+    /// already committed to data blocks on the volume.
+    /// Computed from the next-LBA pointer because the
+    /// fixed-capacity MVP reserves contiguous LBAs for
+    /// the volume table; the boundary is `next_lba - 1`
+    /// (the last committed data LBA).
+    pub fn committed_physical_bytes(&self) -> u64 {
+        self.next_lba.saturating_sub(1) * BLOCK_SIZE_U64
     }
 
     /// Truncate or sparsely extend a file.

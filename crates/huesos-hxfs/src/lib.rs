@@ -101,6 +101,10 @@ pub enum HxfsError {
     /// Compression codec rejected the on-disk payload. The
     /// extent has been marked bad and the read is aborted.
     Compression,
+    /// Per-Job volume-quota breach on the write path. The
+    /// kernel translates this to the user-facing NoSpace
+    /// error at the mount boundary.
+    QuotaExceeded,
 }
 
 /// Mounted read-only Hxfs instance.
