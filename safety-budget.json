@@ -3,7 +3,7 @@
   "rust_lines": 54388,
   "totals": {
     "expect_calls": 21,
-    "panic_macros": 5,
+    "panic_macros": 6,
     "static_mut": 1,
     "todo_markers": 1,
     "unsafe_blocks": 265,

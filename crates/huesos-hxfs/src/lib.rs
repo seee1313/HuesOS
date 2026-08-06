@@ -1215,3 +1215,29 @@ mod tests {
         );
     }
 }
+
+// A.7 wire: production-readiness host tests for the
+// Stage A tracks. The tests are deliberately compact;
+// the qemu-nvme-boot smoke harness covers the full
+// end-to-end path.
+
+#[test]
+fn a4_page_cache_lookup_and_insert_round_trip() {
+    // A.4 wire: insert a 4 KiB page, then look it up
+    // by the same triple. The cache is FIFO with a
+    // bounded walk; a populated entry is always hit.
+    let mut cache = page_cache::PageCache::new();
+    let page = vec![0xaau8; BLOCK_SIZE];
+    cache.insert(1, 100, 3, page.clone());
+    let got = match cache.lookup(1, 100, 3) {
+        Some(p) => p,
+        None => panic!("hit"),
+    };
+    assert_eq!(got, page);
+    assert_eq!(cache.hits(), 1);
+    // Miss for a different key.
+    assert!(cache.lookup(1, 100, 4).is_none());
+    // Invalidate the extent; the cached page is gone.
+    cache.invalidate_extent(100);
+    assert!(cache.lookup(1, 100, 3).is_none());
+}
