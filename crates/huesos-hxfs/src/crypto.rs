@@ -219,6 +219,11 @@ pub enum CryptoError {
     BadDataUnit,
     /// Software AES-XTS engine is not linked in this build.
     EngineUnavailable,
+    /// Encryption policy id is not 0 (no encryption) and no matching
+    /// record exists in the volume policy table. Surfaced by
+    /// [`resolve_encryption_policy`] when the on-disk `policy_id`
+    /// cannot be resolved to a known descriptor.
+    UnknownPolicy,
 }
 
 /// Validate a policy against available key providers.
@@ -236,6 +241,50 @@ pub fn validate_policy(
         return Err(CryptoError::MissingKeyProvider);
     }
     Ok(())
+}
+
+/// Resolve a per-volume encryption policy id to its descriptor from the
+/// volume's policy table.
+///
+/// Mirrors the `resolve_compression_policy` API in the compression
+/// module: a `policy_id == 0` is the canonical "no encryption" sentinel
+/// and returns a built-in zero-cost plain policy; any other id must
+/// match a record in `table`, otherwise [`CryptoError::UnknownPolicy`]
+/// is returned. Returning the error for an unknown id (rather than
+/// silently promoting to a plain policy) keeps a malformed or
+/// corrupt volume table from bypassing the on-disk encryption flag
+/// set on the volume descriptor.
+pub fn resolve_encryption_policy(
+    policy_id: u32,
+    table: &[EncryptionPolicy],
+) -> Result<EncryptionPolicy, CryptoError> {
+    if policy_id == 0 {
+        return Ok(plain_policy());
+    }
+    let mut index = 0usize;
+    while index < table.len() {
+        if table[index].policy_id == policy_id {
+            return Ok(table[index]);
+        }
+        index += 1;
+    }
+    Err(CryptoError::UnknownPolicy)
+}
+
+/// Build the built-in plain (no-encryption) policy descriptor.
+///
+/// `policy_id` is 0, the canonical "no encryption" sentinel that
+/// `resolve_encryption_policy` short-circuits to. The other fields
+/// match the AES-XTS record shape so a plain descriptor and an
+/// encrypted descriptor are interchangeable through the same code
+/// paths; encryption is the *optional* axis, not a separate type.
+pub const fn plain_policy() -> EncryptionPolicy {
+    EncryptionPolicy {
+        policy_id: 0,
+        algorithm: 0,
+        data_unit_bytes: DATA_UNIT_BYTES_4K,
+        provider: KeyProvider::TpmOrBootloader,
+    }
 }
 
 /// Select a crypto backend. Hardware is preferred but software AES-XTS fallback
@@ -570,6 +619,39 @@ mod tests {
             Err(CryptoError::MissingKeyProvider)
         );
         assert_eq!(validate_for_mount(policy(), true), Ok(()));
+    }
+
+    #[test]
+    fn plain_policy_is_canonical_zero_sentinel() {
+        // The plain descriptor is what `resolve_encryption_policy`
+        // returns for `policy_id == 0`. Lock the id so a future
+        // refactor of the sentinel can't silently promote a
+        // non-encrypted volume through the encryption pipeline.
+        let p = plain_policy();
+        assert_eq!(p.policy_id, 0);
+    }
+
+    #[test]
+    fn resolve_encryption_policy_zero_returns_plain() {
+        // `policy_id == 0` short-circuits to the built-in plain
+        // descriptor without consulting the table, so a caller
+        // can pass `&[]` and still mount a non-encrypted volume.
+        assert_eq!(resolve_encryption_policy(0, &[]), Ok(plain_policy()));
+    }
+
+    #[test]
+    fn resolve_encryption_policy_finds_known_and_rejects_unknown() {
+        let mut p1 = policy();
+        p1.policy_id = 1;
+        let mut p2 = policy();
+        p2.policy_id = 2;
+        let table = [p1, p2];
+        assert_eq!(resolve_encryption_policy(1, &table), Ok(p1));
+        assert_eq!(resolve_encryption_policy(2, &table), Ok(p2));
+        assert_eq!(
+            resolve_encryption_policy(99, &table),
+            Err(CryptoError::UnknownPolicy)
+        );
     }
 
     #[cfg(feature = "crypto-aes")]
