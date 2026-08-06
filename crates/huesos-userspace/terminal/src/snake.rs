@@ -901,6 +901,7 @@ fn fire_ak(rng: &mut u32, body: &[Point; MAX_LEN], bullets: &mut [Bullet; MAX_BU
     }
 }
 
+#[allow(dead_code, reason = "kept for future direction-introspection helpers")]
 fn opposite(d: Dir) -> Dir {
     match d {
         Dir::Up => Dir::Down,
@@ -1174,11 +1175,17 @@ impl Renderer {
     ) {
         let gold_ttl = gold_food.map(|g| g.ttl).unwrap_or(0);
 
-        crate::screen::with_render_shadow(|shadow| {
+        // Recursive or concurrent borrow of the render shadow is a
+        // programming bug at the call site (the render closure must not
+        // call back into the shadow). The shadow guard surfaces it as a
+        // Result instead of a panic so the rest of the renderer can keep
+        // going; we just skip this frame and let the recursive borrower
+        // release the guard on return.
+        let Ok(()) = crate::screen::with_render_shadow(|shadow| {
             if !self.initialized || phase != self.previous_phase {
                 render_smooth_full(
-                    canvas, shadow, layout, hard, motion, body, len, food, gold_food, phase,
-                    score, bombs, bullets, rocket, banner, alpha,
+                    canvas, shadow, layout, hard, motion, body, len, food, gold_food, phase, score,
+                    bombs, bullets, rocket, banner, alpha,
                 );
 
                 if canvas.upload_shadow(shadow).is_ok() && canvas.present().is_ok() {
@@ -1226,8 +1233,8 @@ impl Renderer {
             }
 
             render_smooth_board(
-                canvas, shadow, layout, motion, body, len, food, gold_food, bombs, bullets,
-                rocket, alpha,
+                canvas, shadow, layout, motion, body, len, food, gold_food, bombs, bullets, rocket,
+                alpha,
             );
 
             if canvas
@@ -1252,7 +1259,9 @@ impl Renderer {
             }
 
             self.frames = self.frames.saturating_add(1);
-        });
+        }) else {
+            return;
+        };
     }
 }
 
@@ -1461,6 +1470,10 @@ fn render_smooth_board(
     // (current state) using this frame's `alpha`. Entities that just spawned
     // this step have no valid "from" position, so they pop in at their
     // final cell instead of animating in from nowhere.
+    #[allow(
+        clippy::needless_range_loop,
+        reason = "fixed-capacity array indexed by `i` for cross-array motion lookup"
+    )]
     for i in 0..MAX_BULLETS {
         if !bullets[i].alive {
             continue;
@@ -1493,7 +1506,11 @@ fn render_smooth_board(
     // Body first (tail to neck), head last, so the head always renders on
     // top at the point where the snake would otherwise overlap itself.
     for i in (1..len).rev() {
-        let from = if i < motion.len { motion.body[i] } else { body[i] };
+        let from = if i < motion.len {
+            motion.body[i]
+        } else {
+            body[i]
+        };
         fill_cell_shadow_lerp(canvas, shadow, layout, from, body[i], alpha, (30, 155, 105));
     }
 
@@ -1517,7 +1534,10 @@ fn lerp_u32(start: u32, end: u32, alpha: u16) -> u32 {
     (start + ((end - start) * alpha) / INTERP_ONE as i64) as u32
 }
 
-#[expect(clippy::too_many_arguments, reason = "small framebuffer sprite helper")]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "small framebuffer sprite helper, may grow with future alpha/effect args"
+)]
 fn fill_cell_shadow_lerp(
     canvas: &Canvas,
     shadow: &mut [u8],
@@ -1592,7 +1612,15 @@ fn render_board_tile(canvas: &Canvas, shadow: &mut [u8], layout: &Layout, x: usi
     let px = layout.board_x + x as u32 * layout.cell;
     let py = layout.board_y + y as u32 * layout.cell;
 
-    shadow_rect(canvas, shadow, px, py, layout.cell, layout.cell, (7, 14, 24));
+    shadow_rect(
+        canvas,
+        shadow,
+        px,
+        py,
+        layout.cell,
+        layout.cell,
+        (7, 14, 24),
+    );
 
     if x > 0 && x.is_multiple_of(4) {
         shadow_rect(canvas, shadow, px, py, 1, layout.cell, (12, 27, 39));

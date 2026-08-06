@@ -70,13 +70,18 @@ pub(crate) fn sys_resource_create(
         ResourceKindAbi::Irq => ResourceKind::Irq,
         ResourceKindAbi::PowerControl => ResourceKind::PowerControl,
         ResourceKindAbi::DmaPool => ResourceKind::DmaPool,
+        ResourceKindAbi::FrameDraw => ResourceKind::FrameDraw,
     };
 
-    // `PowerControl` is a binary capability with no meaningful range;
-    // force base/len to zero at mint time so overlap-checked collisions
-    // deterministically fire only on genuine double-mint attempts.
-    // Every other kind keeps the caller-supplied range.
-    let (mint_base, mint_len) = if matches!(kernel_kind, ResourceKind::PowerControl) {
+    // `PowerControl` and `FrameDraw` are binary capabilities with no
+    // meaningful range; force base/len to (0, 1) at mint time so
+    // overlap-checked collisions deterministically fire only on
+    // genuine double-mint attempts. Every other kind keeps the
+    // caller-supplied range.
+    let (mint_base, mint_len) = if matches!(
+        kernel_kind,
+        ResourceKind::PowerControl | ResourceKind::FrameDraw
+    ) {
         (0, 1)
     } else {
         (base, len)
@@ -157,7 +162,7 @@ pub(crate) fn sys_process_mark_critical(process_handle: HandleValue) -> SyscallR
 /// KernelObject>` so the caller can downcast to `Resource` at the
 /// point of use (the borrow-checker keeps the resource alive for
 /// exactly the duration of the caller's use).
-fn require_resource_of_kind(
+pub(crate) fn require_resource_of_kind(
     handle: HandleValue,
     kind: ResourceKind,
 ) -> Result<alloc::sync::Arc<dyn KernelObject>, ErrorCode> {

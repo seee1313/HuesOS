@@ -8,10 +8,28 @@
 //! before touching video memory, so a buggy or malicious blit call can,
 //! at worst, draw garbage within its own declared rectangle — it cannot
 //! read or corrupt memory outside the VMO it already owns.
+//!
+//! ## FrameDraw capability
+//!
+//! Every blit is capability-gated: the kernel's [`Syscall::FramebufferBlit`]
+//! handler requires a live `FrameDraw` [`Resource`](huesos_object::Resource)
+//! handle owned by the caller. A `Canvas` therefore carries the
+//! capability handle it will use for every blit, set at construction
+//! time. The handle is set to the canonical initial-process slot
+//! [`huesos_abi::INIT_FRAME_DRAW_HANDLE`] by default because the init
+//! process is the only place a `FrameDraw` resource exists in the
+//! MVP boot path; legitimate graphics processes that receive the
+//! handle over a channel from `init` should pass that handle value
+//! to [`Canvas::new_with_cap`] (or [`Canvas::new_fullscreen_with_cap`]).
+//! Processes that never received a `FrameDraw` capability get
+//! `AccessDenied` from the kernel on every blit; the error is
+//! surfaced through the usual `Result` return.
 
 use crate::raw;
 use crate::vmo::Vmo;
-use huesos_abi::{FramebufferBlitArgs, FramebufferInfo, Syscall};
+use huesos_abi::{
+    FramebufferBlitArgs, FramebufferInfo, HandleValue, Syscall, INIT_FRAME_DRAW_HANDLE,
+};
 
 /// Query the real framebuffer's geometry and pixel format. Returns
 /// `Err(ErrorCode::NoFramebuffer)` if the system has none (e.g. serial-only
@@ -67,19 +85,55 @@ pub struct Canvas {
     vmo: Vmo,
     info: FramebufferInfo,
     bytes_per_pixel: u32,
+    /// `FrameDraw` capability handle used by every blit. Set at
+    /// construction; the kernel rejects any blit whose handle does
+    /// not name a live caller-owned `FrameDraw` resource.
+    cap: HandleValue,
 }
 
 impl Canvas {
-    /// Create a canvas the same size as the real framebuffer.
+    /// Create a canvas the same size as the real framebuffer, using
+    /// the default `FrameDraw` capability slot installed in the init
+    /// process ([`INIT_FRAME_DRAW_HANDLE`]). Suitable for code that
+    /// runs inside the init process itself; graphics processes that
+    /// received a transferred capability handle from init should use
+    /// [`Canvas::new_fullscreen_with_cap`].
     pub fn new_fullscreen() -> crate::Result<Self> {
+        Self::new_fullscreen_with_cap(INIT_FRAME_DRAW_HANDLE)
+    }
+
+    /// Like [`Canvas::new_fullscreen`] but lets the caller specify
+    /// which `FrameDraw` capability handle to use. The handle must
+    /// name a live caller-owned `FrameDraw` resource; otherwise every
+    /// blit will return `AccessDenied`.
+    pub fn new_fullscreen_with_cap(cap: HandleValue) -> crate::Result<Self> {
         let info = info()?;
-        Self::new(info.width, info.height)
+        Self::new_with_cap(info.width, info.height, cap)
     }
 
     /// Create a canvas of an arbitrary size (e.g. smaller than the full
-    /// screen, to later blit at some offset via [`Canvas::present_at`]).
+    /// screen, to later blit at some offset via [`Canvas::present_at`]),
+    /// using the default `FrameDraw` capability slot.
     pub fn new(width: u32, height: u32) -> crate::Result<Self> {
+        Self::new_with_cap(width, height, INIT_FRAME_DRAW_HANDLE)
+    }
+
+    /// Create a canvas of an arbitrary size, using an explicit
+    /// `FrameDraw` capability handle.
+    pub fn new_with_cap(width: u32, height: u32, cap: HandleValue) -> crate::Result<Self> {
         let info = info()?;
+        Self::from_info_with_cap(info, width, height, cap)
+    }
+
+    /// Internal shared constructor: callers (graphics tests, the
+    /// `info`-shaped public constructors) reuse the same VMO sizing
+    /// logic but pass an explicit capability handle.
+    fn from_info_with_cap(
+        info: FramebufferInfo,
+        width: u32,
+        height: u32,
+        cap: HandleValue,
+    ) -> crate::Result<Self> {
         let bytes_per_pixel = (info.bpp as u32).div_ceil(8);
         let pitch = width
             .checked_mul(bytes_per_pixel)
@@ -97,6 +151,7 @@ impl Canvas {
                 ..info
             },
             bytes_per_pixel,
+            cap,
         })
     }
 
@@ -134,6 +189,7 @@ impl Canvas {
     }
 
     /// Fill a clipped rectangle in a packed shadow buffer without syscalls.
+    #[allow(clippy::too_many_arguments)]
     pub fn fill_rect_to_shadow(
         &self,
         shadow: &mut [u8],
@@ -168,6 +224,7 @@ impl Canvas {
     /// Rasterize text directly into a packed shadow buffer without issuing
     /// per-pixel VMO writes. Dispatches on `font` to either the native
     /// Cozette 6x13 rasteriser or the legacy scaled-8x8 rasteriser.
+    #[allow(clippy::too_many_arguments)]
     pub fn draw_text_to_shadow(
         &self,
         shadow: &mut [u8],
@@ -364,6 +421,7 @@ impl Canvas {
 
     /// Fill an axis-aligned rectangle with a solid color. Clips to the
     /// canvas bounds.
+    #[allow(clippy::too_many_arguments)]
     pub fn fill_rect(
         &self,
         x: u32,
@@ -418,6 +476,7 @@ impl Canvas {
     /// Draw text with an explicit built-in font. Cell width comes
     /// from [`TextFont::cell_w`], so callers do not hard-code
     /// per-font advance widths.
+    #[allow(clippy::too_many_arguments)]
     pub fn draw_text_with_font(
         &self,
         x: u32,
@@ -440,6 +499,7 @@ impl Canvas {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn draw_glyph(
         &self,
         x: u32,
@@ -480,6 +540,7 @@ impl Canvas {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn draw_glyph_8x8_scaled(
         &self,
         x: u32,
@@ -565,7 +626,16 @@ impl Canvas {
             dst_x,
             dst_y,
         };
-        let ret = raw::syscall1(Syscall::FramebufferBlit, &args as *const _ as u64);
+        // Capability-gated blit: `a1` is the `FrameDraw` handle stored
+        // on this Canvas, `a2` points to the args. The kernel's
+        // capability check runs before it dereferences `a2`, so a
+        // stale or forged handle cannot leak information about the
+        // caller's address space.
+        let ret = raw::syscall2(
+            Syscall::FramebufferBlit,
+            self.cap as u64,
+            &args as *const _ as u64,
+        );
         raw::decode(ret)?;
         Ok(())
     }

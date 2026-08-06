@@ -259,6 +259,26 @@ entirely; no one references it after PR-D. Micropatch.
 `AcpiBroker` becomes a thin authorization wrapper over the primitive
 Resource layer. Does not block H3.
 
+**PR-G** — `fb-frame-draw-capability` — **landed**. Gate the
+`Syscall::FramebufferBlit` syscall on a new `FrameDraw` capability
+(`ResourceKind::FrameDraw = 6`, install at `INIT_FRAME_DRAW_HANDLE = 6`
+in the initial process). Kernel-side `require_resource_of_kind` runs
+the capability check **before** the caller's `*const FramebufferBlitArgs`
+is dereferenced, so a forged or stale handle cannot leak address-space
+or framebuffer-geometry information. Mint is gated on the root
+supervisor KOID predicate (the same predicate that gates
+`sys_resource_create`), so only init can produce a `FrameDraw`
+resource. Transfer path uses the existing `write_handle` channel
+mechanism with `Rights::TRANSFER` on the source handle; the kernel
+rejects any blit from a process that does not own a live
+`FrameDraw` resource with `ErrorCode::AccessDenied`. `FramebufferInfo`
+(geometry query) stays public because resolution is observable from
+the visible image and pixel format is hardware-fixed. See
+[`docs/FRAMEBUFFER_POLICY.md`](FRAMEBUFFER_POLICY.md) for the threat
+model, ABI delta, and the rationale for keeping the framebuffer
+driver inside the kernel (panic screen, shutdown screen, boot
+splash) instead of moving it to a userspace driver-host.
+
 ---
 
 ## 7. Long-term cascade (post immediate, months of work)

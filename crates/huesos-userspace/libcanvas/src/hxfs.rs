@@ -481,16 +481,14 @@ fn read_native_handle(channel: &Channel, expected_kind: abi::HxfsHandleKind) -> 
 
 fn read_native_status(channel: &Channel) -> Result<abi::HxfsResponse> {
     let mut buf = [0u8; abi::HXFS_RESPONSE_BYTES];
-    loop {
-        let n = channel.read_into_blocking(&mut buf)?;
-        let Some(response) = decode_response(&buf[..n]) else {
-            return Err(ErrorCode::InvalidArgs);
-        };
-        if response.status == abi::HxfsStatus::Ok {
-            return Ok(response);
-        }
-        return Err(status_to_error(response.status));
+    let n = channel.read_into_blocking(&mut buf)?;
+    let Some(response) = decode_response(&buf[..n]) else {
+        return Err(ErrorCode::InvalidArgs);
+    };
+    if response.status == abi::HxfsStatus::Ok {
+        return Ok(response);
     }
+    Err(status_to_error(response.status))
 }
 
 fn read_native_payload(channel: &Channel, out: &mut [u8]) -> Result<usize> {
