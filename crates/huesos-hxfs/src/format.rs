@@ -77,9 +77,20 @@ pub const BASE_INCOMPAT_FEATURES: u64 = FEATURE_INCOMPAT_V2_ROOT_STORE
     | FEATURE_INCOMPAT_V3_STORAGE_TREES
     | FEATURE_INCOMPAT_V4_POLICY_AND_BLOB_TREES
     | FEATURE_INCOMPAT_V5_VOLUME_TOPOLOGY;
+/// Incompatible feature: v6 encrypted metadata blocks are present.
+/// A v5 reader that does not know this feature must reject the
+/// volume with [`HxfsError::UnsupportedFormat`] rather than try
+/// to mount it, because a v6 block is structurally different
+/// (encrypted payload) and a v5 reader would either panic on a
+/// `BadChecksum` or silently return garbage. Set by the
+/// Stage B.1 fixed writer when the volume's
+/// `encryption_policy_id != 0`.
+pub const FEATURE_INCOMPAT_V6_ENCRYPTED_METADATA: u64 = 1 << 7;
 /// Incompatible features supported by this implementation.
-pub const SUPPORTED_INCOMPAT_FEATURES: u64 =
-    BASE_INCOMPAT_FEATURES | FEATURE_INCOMPAT_QUOTA_ENFORCEMENT | FEATURE_INCOMPAT_HXBLOB_INDEX;
+pub const SUPPORTED_INCOMPAT_FEATURES: u64 = BASE_INCOMPAT_FEATURES
+    | FEATURE_INCOMPAT_QUOTA_ENFORCEMENT
+    | FEATURE_INCOMPAT_HXBLOB_INDEX
+    | FEATURE_INCOMPAT_V6_ENCRYPTED_METADATA;
 /// Compatible features supported by this implementation.
 pub const SUPPORTED_COMPAT_FEATURES: u64 = 0;
 /// Read-only-compatible features supported by this implementation.

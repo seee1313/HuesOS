@@ -19,10 +19,14 @@ pub mod cache_policy;
 pub mod compression;
 pub mod crc32c;
 pub mod crypto;
+#[cfg(feature = "crypto-aes-gcm")]
+pub mod crypto_aes_gcm;
 pub mod fixed_writer;
 pub mod format;
 pub mod fsck;
 pub mod gpt;
+#[cfg(feature = "crypto-aes-gcm")]
+pub mod hkdf;
 pub mod hxblob;
 pub mod hxblob_tree;
 pub mod io_policy;
@@ -308,6 +312,20 @@ fn resolve_compression_for_object(
         return None;
     }
     Some(resolved)
+}
+
+/// Check whether a metadata block header carries the v6
+/// "encrypted metadata" discriminator. Stage B.1 puts
+/// `type_version = 6` in the block header when the payload is
+/// encrypted under the per-volume metadata subkey; a v5 reader
+/// sees `type_version = 1` (the existing `validate_metadata_block`
+/// rejects any other value, so a v5 reader cannot accidentally
+/// read a v6 block as v5).
+///
+/// The function is `const` so callers can branch on it inside
+/// hot loops without paying a function-call cost.
+pub const fn is_v6_encrypted_metadata(header: &BlockHeader) -> bool {
+    header.type_version == 6
 }
 
 /// Report whether a superblock indicates the volume needs
