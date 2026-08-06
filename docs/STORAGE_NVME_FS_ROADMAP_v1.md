@@ -1,4 +1,16 @@
-# HuesOS Storage / NVMe / FS Roadmap
+# HuesOS Storage / NVMe / FS Roadmap (archived v1)
+
+> **This roadmap is archived as of the production-readiness push.**
+> It described the **versioned** P/Q/R/S/T... feature families and
+> was the source of truth for the Stage P (encryption) and Stage Q
+> (compression) foundations that landed in PRs #153 and #154. The
+> new push toward a deployable system is described in
+> [`PRODUCTION_ROADMAP.md`](PRODUCTION_ROADMAP.md), which organises
+> the remaining work around **production stages A through F** instead
+> of around feature families. The Stage P/Q entries in this file are
+> the historical record of how those features got built; the Stages
+> A.1, A.3, D.2, etc. entries in `PRODUCTION_ROADMAP.md` are the live
+> to-do.
 
 Дата обновления: **2026-07-30**
 Текущая база HuesOS: `main` / `fix/critical-medium-audit` = `259c3ba2ae8b9ef6d780081b20f319bee48248cf`
