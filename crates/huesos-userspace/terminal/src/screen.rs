@@ -38,6 +38,20 @@ const COLOR_CURSOR: Color = (100, 255, 170);
 /// since then.
 static SHADOW_GENERATION: AtomicUsize = AtomicUsize::new(0);
 
+/// Failure modes for the [`TerminalShadow::with`] exclusive borrow.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ShadowError {
+    /// A previous closure passed to [`with_render_shadow`] /
+    /// [`with_render_shadow_tracked`] is still running. The render
+    /// pipeline must never recurse into the shadow from inside its
+    /// own callback, so this error indicates a programming bug at
+    /// the call site rather than a runtime condition the caller
+    /// can recover from. Callers should log it and skip the frame
+    /// rather than retry; the recursive borrower will release the
+    /// guard on return and subsequent frames will succeed.
+    AlreadyBorrowed,
+}
+
 struct TerminalShadow {
     pixels: UnsafeCell<[u8; SHADOW_CAPACITY]>,
     borrowed: AtomicBool,
@@ -59,13 +73,13 @@ impl TerminalShadow {
     fn with<R>(
         &self,
         operation: impl FnOnce(&mut [u8; SHADOW_CAPACITY]) -> R,
-    ) -> (R, usize) {
+    ) -> Result<(R, usize), ShadowError> {
         if self
             .borrowed
             .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
             .is_err()
         {
-            panic!("render shadow was borrowed recursively or concurrently");
+            return Err(ShadowError::AlreadyBorrowed);
         }
 
         let _guard = ShadowBorrowGuard {
@@ -82,7 +96,7 @@ impl TerminalShadow {
         // complete lifetime of the closure.
         let result = unsafe { operation(&mut *self.pixels.get()) };
 
-        (result, generation)
+        Ok((result, generation))
     }
 }
 
@@ -103,15 +117,20 @@ static TERMINAL_SHADOW: TerminalShadow = TerminalShadow::new();
 /// Full-screen applications should use this function when possible. Doing so
 /// allows the terminal to detect that its previous framebuffer contents were
 /// replaced and restore the complete terminal on the next `Screen::render`.
+///
+/// Returns [`ShadowError::AlreadyBorrowed`] if a previous closure is still
+/// running. Callers should treat this as a skip-this-frame signal: the
+/// recursive borrower will release the guard on return and the next call
+/// will succeed.
 pub(crate) fn with_render_shadow<R>(
     operation: impl FnOnce(&mut [u8; SHADOW_CAPACITY]) -> R,
-) -> R {
-    TERMINAL_SHADOW.with(operation).0
+) -> Result<R, ShadowError> {
+    TERMINAL_SHADOW.with(operation).map(|(r, _)| r)
 }
 
 fn with_render_shadow_tracked<R>(
     operation: impl FnOnce(&mut [u8; SHADOW_CAPACITY]) -> R,
-) -> (R, usize) {
+) -> Result<(R, usize), ShadowError> {
     TERMINAL_SHADOW.with(operation)
 }
 
@@ -301,11 +320,7 @@ impl Screen {
 
         // The erased cell and both cursor positions are covered by the same
         // compact range.
-        self.mark_dirty_span(
-            self.row,
-            self.col,
-            old_col.saturating_add(1).min(COLS),
-        );
+        self.mark_dirty_span(self.row, self.col, old_col.saturating_add(1).min(COLS));
     }
 
     /// Move the cursor to the beginning of the current line.
@@ -318,11 +333,7 @@ impl Screen {
         self.col = 0;
 
         if self.cursor_visible {
-            self.mark_dirty_span(
-                self.row,
-                0,
-                old_col.saturating_add(1).min(COLS),
-            );
+            self.mark_dirty_span(self.row, 0, old_col.saturating_add(1).min(COLS));
         }
     }
 
@@ -449,32 +460,31 @@ impl Screen {
         let mut committed_generation = None;
 
         let rendered = if let Some(canvas) = self.canvas.as_ref() {
-            if canvas.supports_buffered_raster()
-                && canvas.byte_len() <= SHADOW_CAPACITY
-            {
+            if canvas.supports_buffered_raster() && canvas.byte_len() <= SHADOW_CAPACITY {
                 let dirty_rows = self.dirty_rows;
                 let force_full = self.force_full_render;
 
-                let (result, generation) =
-                    with_render_shadow_tracked(|shadow| {
-                        if force_full || dirty_rows == ALL_ROWS_DIRTY {
-                            self.render_full_buffered(
-                                canvas,
-                                shadow,
-                                view_top,
-                            )
-                        } else {
-                            self.render_dirty_buffered(
-                                canvas,
-                                shadow,
-                                dirty_rows,
-                                view_top,
-                            )
-                        }
-                    });
-
-                committed_generation = Some(generation);
-                result
+                // The shadow is borrowed exclusively for the duration of
+                // the render closure. A recursive borrow would indicate a
+                // programming bug at the call site; the kernel-side
+                // surface turns it into a Result instead of a panic so the
+                // terminal can keep running. We treat the error as
+                // "frame skipped": dirty tracking is left intact so the
+                // next call will retry once the recursive borrower has
+                // released the guard.
+                match with_render_shadow_tracked(|shadow| {
+                    if force_full || dirty_rows == ALL_ROWS_DIRTY {
+                        self.render_full_buffered(canvas, shadow, view_top)
+                    } else {
+                        self.render_dirty_buffered(canvas, shadow, dirty_rows, view_top)
+                    }
+                }) {
+                    Ok((result, generation)) => {
+                        committed_generation = Some(generation);
+                        result
+                    }
+                    Err(_shadow_error) => false,
+                }
             } else {
                 // Unusual pixel formats fall back to direct canvas drawing.
                 // Partial updates are intentionally disabled here because the
@@ -490,8 +500,8 @@ impl Screen {
             self.force_full_render = false;
             self.rendered_view_top = view_top;
 
-            self.observed_shadow_generation = committed_generation
-                .unwrap_or_else(render_shadow_generation);
+            self.observed_shadow_generation =
+                committed_generation.unwrap_or_else(render_shadow_generation);
         }
     }
 
@@ -570,18 +580,14 @@ impl Screen {
         let metrics = font_metrics(self.font);
         let available = canvas.width().saturating_sub(LEFT_MARGIN);
 
-        (available / metrics.advance)
-            .max(1)
-            .min(COLS as u32) as usize
+        (available / metrics.advance).max(1).min(COLS as u32) as usize
     }
 
     fn visible_rows_for(&self, canvas: &Canvas) -> usize {
         let metrics = font_metrics(self.font);
         let available = canvas.height().saturating_sub(TOP_MARGIN);
 
-        (available / metrics.line_height)
-            .max(1)
-            .min(ROWS as u32) as usize
+        (available / metrics.line_height).max(1).min(ROWS as u32) as usize
     }
 
     fn viewport_top(&self) -> usize {
@@ -594,12 +600,7 @@ impl Screen {
         }
     }
 
-    fn mark_dirty_span(
-        &mut self,
-        row: usize,
-        start_column: usize,
-        end_column: usize,
-    ) {
+    fn mark_dirty_span(&mut self, row: usize, start_column: usize, end_column: usize) {
         if row >= ROWS {
             return;
         }
@@ -613,10 +614,8 @@ impl Screen {
 
         self.dirty_rows |= 1u64 << row;
 
-        self.dirty_from[row] =
-            self.dirty_from[row].min(start as u16);
-        self.dirty_to[row] =
-            self.dirty_to[row].max(end as u16);
+        self.dirty_from[row] = self.dirty_from[row].min(start as u16);
+        self.dirty_to[row] = self.dirty_to[row].max(end as u16);
     }
 
     fn mark_all_dirty(&mut self) {
@@ -651,29 +650,21 @@ impl Screen {
         }
 
         let visible_rows = self.visible_rows_for(canvas);
-        let view_end = view_top
-            .saturating_add(visible_rows)
-            .min(ROWS);
+        let view_end = view_top.saturating_add(visible_rows).min(ROWS);
 
         let mut model_row = view_top;
 
         while model_row < view_end {
             let display_row = model_row - view_top;
 
-            if !self.draw_complete_row_to_shadow(
-                canvas,
-                shadow,
-                model_row,
-                display_row,
-            ) {
+            if !self.draw_complete_row_to_shadow(canvas, shadow, model_row, display_row) {
                 return false;
             }
 
             model_row += 1;
         }
 
-        canvas.upload_shadow(shadow).is_ok()
-            && canvas.present().is_ok()
+        canvas.upload_shadow(shadow).is_ok() && canvas.present().is_ok()
     }
 
     fn render_dirty_buffered(
@@ -684,9 +675,7 @@ impl Screen {
         view_top: usize,
     ) -> bool {
         let visible_rows = self.visible_rows_for(canvas);
-        let view_end = view_top
-            .saturating_add(visible_rows)
-            .min(ROWS);
+        let view_end = view_top.saturating_add(visible_rows).min(ROWS);
 
         let mut pending_rect: Option<PixelRect> = None;
         let mut model_row = view_top;
@@ -707,18 +696,11 @@ impl Screen {
 
                 if let Some(rect) = rect {
                     match pending_rect {
-                        Some(pending)
-                            if pending.is_vertically_adjacent_to(rect) =>
-                        {
-                            pending_rect =
-                                Some(pending.merge_vertical(rect));
+                        Some(pending) if pending.is_vertically_adjacent_to(rect) => {
+                            pending_rect = Some(pending.merge_vertical(rect));
                         }
                         Some(pending) => {
-                            if !flush_shadow_rect(
-                                canvas,
-                                shadow,
-                                pending,
-                            ) {
+                            if !flush_shadow_rect(canvas, shadow, pending) {
                                 return false;
                             }
 
@@ -747,13 +729,10 @@ impl Screen {
         display_row: usize,
     ) -> bool {
         let visible_columns = self.visible_columns_for(canvas);
-        let len = line_len(&self.cells[model_row])
-            .min(visible_columns);
+        let len = line_len(&self.cells[model_row]).min(visible_columns);
 
         if len > 0 {
-            let Ok(text) =
-                core::str::from_utf8(&self.cells[model_row][..len])
-            else {
+            let Ok(text) = core::str::from_utf8(&self.cells[model_row][..len]) else {
                 return false;
             };
 
@@ -776,13 +755,7 @@ impl Screen {
             }
         }
 
-        self.draw_cursor_to_shadow(
-            canvas,
-            shadow,
-            model_row,
-            display_row,
-            visible_columns,
-        )
+        self.draw_cursor_to_shadow(canvas, shadow, model_row, display_row, visible_columns)
     }
 
     fn render_row_region_to_shadow(
@@ -795,32 +768,24 @@ impl Screen {
         let metrics = font_metrics(self.font);
         let visible_columns = self.visible_columns_for(canvas);
 
-        let start_column =
-            (self.dirty_from[model_row] as usize).min(visible_columns);
-        let end_column =
-            (self.dirty_to[model_row] as usize).min(visible_columns);
+        let start_column = (self.dirty_from[model_row] as usize).min(visible_columns);
+        let end_column = (self.dirty_to[model_row] as usize).min(visible_columns);
 
         if start_column >= end_column {
             return Ok(None);
         }
 
-        let x = LEFT_MARGIN.saturating_add(
-            start_column as u32 * metrics.advance,
-        );
+        let x = LEFT_MARGIN.saturating_add(start_column as u32 * metrics.advance);
         let y = self.display_row_y(display_row);
 
         if x >= canvas.width() || y >= canvas.height() {
             return Ok(None);
         }
 
-        let requested_width =
-            (end_column - start_column) as u32 * metrics.advance;
+        let requested_width = (end_column - start_column) as u32 * metrics.advance;
 
-        let width = requested_width
-            .min(canvas.width().saturating_sub(x));
-        let height = metrics
-            .line_height
-            .min(canvas.height().saturating_sub(y));
+        let width = requested_width.min(canvas.width().saturating_sub(x));
+        let height = metrics.line_height.min(canvas.height().saturating_sub(y));
 
         if width == 0 || height == 0 {
             return Ok(None);
@@ -839,29 +804,18 @@ impl Screen {
             )
             .map_err(|_| ())?;
 
-        let text_end = line_len(&self.cells[model_row])
-            .min(end_column);
+        let text_end = line_len(&self.cells[model_row]).min(end_column);
 
         if text_end > start_column {
-            let Ok(text) = core::str::from_utf8(
-                &self.cells[model_row][start_column..text_end],
-            ) else {
+            let Ok(text) = core::str::from_utf8(&self.cells[model_row][start_column..text_end])
+            else {
                 return Err(());
             };
 
             let color = self.row_color(model_row);
 
             canvas
-                .draw_text_to_shadow(
-                    shadow,
-                    x,
-                    y,
-                    text,
-                    color.0,
-                    color.1,
-                    color.2,
-                    self.font,
-                )
+                .draw_text_to_shadow(shadow, x, y, text, color.0, color.1, color.2, self.font)
                 .map_err(|_| ())?;
         }
 
@@ -871,14 +825,9 @@ impl Screen {
             && self.col < end_column
             && self.col < visible_columns
         {
-            self.draw_cursor_at_to_shadow(
-                canvas,
-                shadow,
-                display_row,
-                self.col,
-            )
-            .then_some(())
-            .ok_or(())?;
+            self.draw_cursor_at_to_shadow(canvas, shadow, display_row, self.col)
+                .then_some(())
+                .ok_or(())?;
         }
 
         Ok(Some(PixelRect {
@@ -897,19 +846,11 @@ impl Screen {
         display_row: usize,
         visible_columns: usize,
     ) -> bool {
-        if !self.cursor_visible
-            || model_row != self.row
-            || self.col >= visible_columns
-        {
+        if !self.cursor_visible || model_row != self.row || self.col >= visible_columns {
             return true;
         }
 
-        self.draw_cursor_at_to_shadow(
-            canvas,
-            shadow,
-            display_row,
-            self.col,
-        )
+        self.draw_cursor_at_to_shadow(canvas, shadow, display_row, self.col)
     }
 
     fn draw_cursor_at_to_shadow(
@@ -919,9 +860,7 @@ impl Screen {
         display_row: usize,
         column: usize,
     ) -> bool {
-        let Some(rect) =
-            self.cursor_rect(canvas, display_row, column)
-        else {
+        let Some(rect) = self.cursor_rect(canvas, display_row, column) else {
             return true;
         };
 
@@ -939,11 +878,7 @@ impl Screen {
             .is_ok()
     }
 
-    fn render_full_fallback(
-        &self,
-        canvas: &Canvas,
-        view_top: usize,
-    ) -> bool {
+    fn render_full_fallback(&self, canvas: &Canvas, view_top: usize) -> bool {
         if canvas
             .fill_rect(
                 0,
@@ -961,21 +896,16 @@ impl Screen {
 
         let visible_rows = self.visible_rows_for(canvas);
         let visible_columns = self.visible_columns_for(canvas);
-        let view_end = view_top
-            .saturating_add(visible_rows)
-            .min(ROWS);
+        let view_end = view_top.saturating_add(visible_rows).min(ROWS);
 
         let mut model_row = view_top;
 
         while model_row < view_end {
             let display_row = model_row - view_top;
-            let len = line_len(&self.cells[model_row])
-                .min(visible_columns);
+            let len = line_len(&self.cells[model_row]).min(visible_columns);
 
             if len > 0 {
-                let Ok(text) = core::str::from_utf8(
-                    &self.cells[model_row][..len],
-                ) else {
+                let Ok(text) = core::str::from_utf8(&self.cells[model_row][..len]) else {
                     return false;
                 };
 
@@ -997,13 +927,8 @@ impl Screen {
                 }
             }
 
-            if self.cursor_visible
-                && model_row == self.row
-                && self.col < visible_columns
-            {
-                if let Some(rect) =
-                    self.cursor_rect(canvas, display_row, self.col)
-                {
+            if self.cursor_visible && model_row == self.row && self.col < visible_columns {
+                if let Some(rect) = self.cursor_rect(canvas, display_row, self.col) {
                     if canvas
                         .fill_rect(
                             rect.x,
@@ -1038,35 +963,20 @@ impl Screen {
     fn display_row_y(&self, display_row: usize) -> u32 {
         let metrics = font_metrics(self.font);
 
-        TOP_MARGIN.saturating_add(
-            display_row as u32 * metrics.line_height,
-        )
+        TOP_MARGIN.saturating_add(display_row as u32 * metrics.line_height)
     }
 
-    fn cursor_rect(
-        &self,
-        canvas: &Canvas,
-        display_row: usize,
-        column: usize,
-    ) -> Option<PixelRect> {
+    fn cursor_rect(&self, canvas: &Canvas, display_row: usize, column: usize) -> Option<PixelRect> {
         let metrics = font_metrics(self.font);
 
-        let x = LEFT_MARGIN.saturating_add(
-            column as u32 * metrics.advance,
-        );
+        let x = LEFT_MARGIN.saturating_add(column as u32 * metrics.advance);
         let row_y = self.display_row_y(display_row);
 
-        let cursor_height = if metrics.line_height >= 4 {
-            2
-        } else {
-            1
-        };
+        let cursor_height = if metrics.line_height >= 4 { 2 } else { 1 };
 
-        let maximum_offset =
-            metrics.line_height.saturating_sub(cursor_height);
+        let maximum_offset = metrics.line_height.saturating_sub(cursor_height);
 
-        let cursor_offset =
-            metrics.glyph_height.min(maximum_offset);
+        let cursor_offset = metrics.glyph_height.min(maximum_offset);
 
         let y = row_y.saturating_add(cursor_offset);
 
@@ -1080,8 +990,7 @@ impl Screen {
             .max(1)
             .min(canvas.width().saturating_sub(x));
 
-        let height = cursor_height
-            .min(canvas.height().saturating_sub(y));
+        let height = cursor_height.min(canvas.height().saturating_sub(y));
 
         if width == 0 || height == 0 {
             return None;
@@ -1102,11 +1011,7 @@ impl Default for Screen {
     }
 }
 
-fn flush_shadow_rect(
-    canvas: &Canvas,
-    shadow: &[u8; SHADOW_CAPACITY],
-    rect: PixelRect,
-) -> bool {
+fn flush_shadow_rect(canvas: &Canvas, shadow: &[u8; SHADOW_CAPACITY], rect: PixelRect) -> bool {
     if rect.width == 0 || rect.height == 0 {
         return true;
     }
@@ -1115,35 +1020,18 @@ fn flush_shadow_rect(
         return true;
     }
 
-    let width = rect
-        .width
-        .min(canvas.width().saturating_sub(rect.x));
+    let width = rect.width.min(canvas.width().saturating_sub(rect.x));
 
-    let height = rect
-        .height
-        .min(canvas.height().saturating_sub(rect.y));
+    let height = rect.height.min(canvas.height().saturating_sub(rect.y));
 
     if width == 0 || height == 0 {
         return true;
     }
 
     canvas
-        .upload_shadow_region(
-            shadow,
-            rect.x,
-            rect.y,
-            width,
-            height,
-        )
+        .upload_shadow_region(shadow, rect.x, rect.y, width, height)
         .is_ok()
-        && canvas
-            .present_region(
-                rect.x,
-                rect.y,
-                width,
-                height,
-            )
-            .is_ok()
+        && canvas.present_region(rect.x, rect.y, width, height).is_ok()
 }
 
 fn line_len(line: &[u8; COLS]) -> usize {
