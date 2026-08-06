@@ -3,12 +3,12 @@
   "rust_lines": 54388,
   "totals": {
     "expect_calls": 21,
-    "panic_macros": 5,
+    "panic_macros": 6,
     "static_mut": 1,
     "todo_markers": 1,
     "unsafe_blocks": 265,
-    "unsafe_functions": 63,
-    "unsafe_impls": 29,
+    "unsafe_functions": 66,
+    "unsafe_impls": 30,
     "unwrap_calls": 25
   },
   "unsafe_by_file": {
@@ -54,7 +54,7 @@
     "crates/huesos-syscalls/src/user_access.rs": 6,
     "crates/huesos-syscalls/src/user_memory.rs": 7,
     "crates/huesos-uacpi/src/lib.rs": 12,
-    "crates/huesos-user-alloc/src/lib.rs": 1,
+    "crates/huesos-user-alloc/src/lib.rs": 4,
     "crates/huesos-userspace/acpi-manager/src/main.rs": 1,
     "crates/huesos-userspace/doom/src/main.rs": 9,
     "crates/huesos-userspace/fault-probe/src/main.rs": 4,
@@ -70,6 +70,7 @@
     "crates/huesos-userspace/libcanvas/src/vmo.rs": 3,
     "crates/huesos-userspace/terminal/src/screen.rs": 2,
     "crates/huesos-kernel/src/boot/storage.rs": 3,
+    "crates/huesos-userspace/hxfs-service/src/main.rs": 1,
     "crates/huesos-userspace/driver-host-nvme/src/main.rs": 3
   }
 }

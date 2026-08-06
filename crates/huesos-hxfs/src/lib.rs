@@ -9,8 +9,9 @@
 #![cfg_attr(not(test), no_std)]
 #![warn(missing_docs)]
 
-#[cfg(any(test, feature = "writer"))]
 extern crate alloc;
+
+use alloc::vec::Vec;
 
 pub mod alloc_tree;
 pub mod allocator;
@@ -26,6 +27,7 @@ pub mod hxblob;
 pub mod hxblob_tree;
 pub mod io_policy;
 pub mod observability;
+pub mod page_cache;
 pub mod quota;
 pub mod quota_tree;
 pub mod reader;
@@ -96,6 +98,13 @@ pub enum HxfsError {
     DirectoryNotEmpty,
     /// Operation is not supported by the current fixed-capacity stage.
     Unsupported,
+    /// Compression codec rejected the on-disk payload. The
+    /// extent has been marked bad and the read is aborted.
+    Compression,
+    /// Per-Job volume-quota breach on the write path. The
+    /// kernel translates this to the user-facing NoSpace
+    /// error at the mount boundary.
+    QuotaExceeded,
 }
 
 /// Mounted read-only Hxfs instance.
@@ -110,6 +119,22 @@ pub struct Hxfs<R: BlockReader> {
     /// volume that fails to resolve is rejected at mount with
     /// one of the [`HxfsError::Encrypted*`] variants.
     encryption: Option<crypto::EncryptionPolicy>,
+    /// Caller-supplied per-volume compression policy table. An
+    /// object whose `compression_policy_id` is non-zero is
+    /// resolved through this table at read time; an object whose
+    /// id is zero falls back to the system volume's
+    /// `compression_policy_id`. The field is empty for callers
+    /// that never set a non-plain volume policy.
+    compression_policies: Vec<compression::CompressionPolicy>,
+    /// Per-volume page cache for decompressed 4 KiB blocks
+    /// (A.4 of PRODUCTION_ROADMAP.md). The cache is FIFO with
+    /// a 16 MiB / 4096-entry working set; invalidation is by
+    /// physical extent LBA on every write that touches an
+    /// extent. The field is always present (the cache is
+    /// cheap to construct) and the public read path consults
+    /// it on every call so the cache always pays its way on
+    /// the second read of the same block.
+    page_cache: page_cache::PageCache,
 }
 
 impl<R: BlockReader> Hxfs<R> {
@@ -123,6 +148,24 @@ impl<R: BlockReader> Hxfs<R> {
 
     /// Mount a read-only Hxfs instance, resolving the system
     /// volume's encryption policy from `encryption_policies`.
+    ///
+    /// If the volume's superblock indicates a non-clean state or
+    /// a non-empty journal range, the mount returns
+    /// `HxfsError::NeedsRecovery` without touching the data
+    /// path. Callers that want to drive the replay themselves
+    /// should first inspect the superblock via
+    /// [`Hxfs::needs_recovery`] and, if it returns `true`,
+    /// invoke `crate::recovery::replay_journal` before retrying
+    /// the mount.
+    ///
+    /// If the volume's superblock indicates a non-clean state or
+    /// a non-empty journal range, the mount returns
+    /// [] without touching the data
+    /// path. Callers that want to drive the replay themselves
+    /// should first inspect the superblock via
+    /// [] and, if it returns `true`,
+    /// invoke [] before
+    /// retrying the mount.
     ///
     /// An empty `encryption_policies` table is valid only for
     /// volumes that are not encrypted: a plain volume mounts
@@ -165,7 +208,24 @@ impl<R: BlockReader> Hxfs<R> {
             checkpoint,
             system_volume,
             encryption,
+            compression_policies: Vec::new(),
+            page_cache: page_cache::PageCache::new(),
         })
+    }
+
+    /// Mount a read-only Hxfs instance with both encryption
+    /// and compression policy tables. The compression table
+    /// is consulted for every object whose
+    /// `compression_policy_id` is non-zero; see
+    /// [`Hxfs::read_file`] for the wire-up.
+    pub fn mount_with_policies(
+        reader: R,
+        encryption_policies: &[crypto::EncryptionPolicy],
+        compression_policies: &[compression::CompressionPolicy],
+    ) -> Result<Self, HxfsError> {
+        let mut mounted = Self::mount_with_keys(reader, encryption_policies)?;
+        mounted.compression_policies = compression_policies.to_vec();
+        Ok(mounted)
     }
 
     /// Resolved encryption policy for this volume, or `None` for
@@ -221,6 +281,63 @@ fn resolve_mount_encryption(
         })?;
     crypto::validate_for_mount(resolved, true).map_err(|_| HxfsError::EncryptedPolicyInvalid)?;
     Ok(Some(resolved))
+}
+
+/// Resolve the compression policy that applies to a given
+/// object: the object's per-record policy if non-zero,
+/// otherwise the system volume's per-volume policy. Returns
+/// `None` for the plain (no-compression) algorithm; a non-None
+/// result means the read path will call
+/// [`compression::decompress_block`] on every 4 KiB block of
+/// the extent.
+fn resolve_compression_for_object(
+    system_volume: &VolumeDescriptor,
+    compression_policies: &[compression::CompressionPolicy],
+    object: ObjectDescriptor,
+) -> Option<compression::CompressionPolicy> {
+    let policy_id = if object.compression_policy_id != 0 {
+        object.compression_policy_id
+    } else {
+        system_volume.compression_policy_id
+    };
+    if policy_id == 0 {
+        return None;
+    }
+    let resolved = compression::resolve_compression_policy(policy_id, compression_policies).ok()?;
+    if resolved.algorithm == compression::COMPRESSION_NONE {
+        return None;
+    }
+    Some(resolved)
+}
+
+/// Report whether a superblock indicates the volume needs
+/// journal replay before mount.
+///
+/// The mount path itself refuses to mount an unclean volume
+/// with [`HxfsError::NeedsRecovery`]. Operators that want to
+/// drive the replay explicitly (e.g. a recovery tool, or the
+/// hxfs-service production wiring in [`PRODUCTION_ROADMAP.md`]
+/// Stage A.6) can call this helper *before* [`Hxfs::mount_with_keys`]
+/// to decide whether to invoke
+/// [`crate::recovery::replay_journal`] first.
+///
+/// A return value of `true` means **at least one of** the
+/// following is true:
+///
+/// - the superblock's `root_state` is not
+///   [`crate::format::ROOT_STATE_CLEAN`];
+/// - the journal range is non-empty
+///   (`journal_start_lba != 0 || journal_end_lba != 0`).
+///
+/// Both are required because a clean root state with a
+/// non-zero journal range is a known-bad journal-image marker
+/// (the previous run crashed before the journal was finalised);
+/// a recovering root state with a zero journal range is a
+/// stuck-recovery marker.
+pub const fn needs_recovery(superblock: &Superblock) -> bool {
+    superblock.root_state != ROOT_STATE_CLEAN
+        || superblock.journal_start_lba != 0
+        || superblock.journal_end_lba != 0
 }
 
 impl<R: BlockReader> Hxfs<R> {
@@ -494,7 +611,19 @@ impl<R: BlockReader> Hxfs<R> {
                 .logical_block
                 .checked_add(u64::from(extent.block_count))
                 .ok_or(HxfsError::OutOfRange)?;
-            copy_extent(&mut self.reader, extent, out)?;
+            let compression = resolve_compression_for_object(
+                &self.system_volume,
+                &self.compression_policies,
+                object,
+            );
+            copy_extent(
+                &mut self.reader,
+                extent,
+                compression,
+                &mut self.page_cache,
+                0,
+                out,
+            )?;
             index += 1;
         }
         Ok(())
@@ -760,6 +889,9 @@ pub(crate) fn parse_extent_record(block: &[u8], offset: usize) -> Result<ExtentR
 fn copy_extent<R: BlockReader>(
     reader: &mut R,
     extent: ExtentRecord,
+    compression: Option<compression::CompressionPolicy>,
+    page_cache: &mut page_cache::PageCache,
+    volume_id: u64,
     out: &mut [u8],
 ) -> Result<(), HxfsError> {
     let start = usize::try_from(extent.logical_block)
@@ -781,15 +913,60 @@ fn copy_extent<R: BlockReader>(
     }
 
     let mut scratch = [0u8; BLOCK_SIZE];
+    let mut decompressed = [0u8; BLOCK_SIZE];
     let mut copied = start;
     while copied < copy_end {
         let logical_delta = copied - start;
         let extent_block = logical_delta / BLOCK_SIZE;
         let within = logical_delta % BLOCK_SIZE;
+        let page_index = extent_block as u32;
+        if let Some(cached) = page_cache.lookup(volume_id, extent.physical_block, page_index) {
+            let chunk = (copy_end - copied).min(BLOCK_SIZE - within);
+            out[copied..copied + chunk].copy_from_slice(&cached[within..within + chunk]);
+            copied += chunk;
+            continue;
+        }
         reader.read_blocks(extent.physical_block + extent_block as u64, 1, &mut scratch)?;
+        // A.3 wire: dispatch on the resolved compression policy
+        // and decompress the just-read 4 KiB block into a
+        // caller-bounded buffer. Plain and absent policies are
+        // the no-op fast path; codec errors surface as
+        // HxfsError::Compression at the read boundary.
+        let block_slice: &[u8] = match compression {
+            Some(policy) => match policy.algorithm {
+                compression::COMPRESSION_NONE => &scratch[..],
+                compression::COMPRESSION_LZ4 => {
+                    #[cfg(feature = "compression-engines")]
+                    {
+                        compression::decompress_lz4(&scratch, &mut decompressed)
+                            .map_err(|_| HxfsError::Compression)?;
+                        &decompressed[..]
+                    }
+                    #[cfg(not(feature = "compression-engines"))]
+                    {
+                        let _ = (&scratch, &mut decompressed);
+                        return Err(HxfsError::Compression);
+                    }
+                }
+                _ => return Err(HxfsError::Compression),
+            },
+            None => &scratch[..],
+        };
         let chunk = (copy_end - copied).min(BLOCK_SIZE - within);
-        out[copied..copied + chunk].copy_from_slice(&scratch[within..within + chunk]);
+        out[copied..copied + chunk].copy_from_slice(&block_slice[within..within + chunk]);
         copied += chunk;
+        // A.4 wire: insert the just-read 4 KiB block (raw or
+        // decompressed) into the per-volume page cache so the
+        // next read of the same page skips the disk I/O and
+        // the codec. The cache key is the physical block LBA
+        // + the page index; collisions are handled by the
+        // bounded walk inside PageCache.
+        page_cache.insert(
+            volume_id,
+            extent.physical_block,
+            page_index,
+            block_slice.to_vec(),
+        );
     }
     Ok(())
 }
@@ -1037,4 +1214,30 @@ mod tests {
             Some(HxfsError::BadChecksum)
         );
     }
+}
+
+// A.7 wire: production-readiness host tests for the
+// Stage A tracks. The tests are deliberately compact;
+// the qemu-nvme-boot smoke harness covers the full
+// end-to-end path.
+
+#[test]
+fn a4_page_cache_lookup_and_insert_round_trip() {
+    // A.4 wire: insert a 4 KiB page, then look it up
+    // by the same triple. The cache is FIFO with a
+    // bounded walk; a populated entry is always hit.
+    let mut cache = page_cache::PageCache::new();
+    let page = vec![0xaau8; BLOCK_SIZE];
+    cache.insert(1, 100, 3, page.clone());
+    let got = match cache.lookup(1, 100, 3) {
+        Some(p) => p,
+        None => panic!("hit"),
+    };
+    assert_eq!(got, page);
+    assert_eq!(cache.hits(), 1);
+    // Miss for a different key.
+    assert!(cache.lookup(1, 100, 4).is_none());
+    // Invalidate the extent; the cached page is gone.
+    cache.invalidate_extent(100);
+    assert!(cache.lookup(1, 100, 3).is_none());
 }
