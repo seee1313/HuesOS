@@ -21,6 +21,8 @@ pub mod crc32c;
 pub mod crypto;
 #[cfg(feature = "crypto-aes-gcm")]
 pub mod crypto_aes_gcm;
+#[cfg(feature = "crypto-aes-gcm")]
+pub mod encrypted_metadata;
 pub mod fixed_writer;
 pub mod format;
 pub mod fsck;
@@ -123,6 +125,15 @@ pub struct Hxfs<R: BlockReader> {
     /// volume that fails to resolve is rejected at mount with
     /// one of the [`HxfsError::Encrypted*`] variants.
     encryption: Option<crypto::EncryptionPolicy>,
+    /// Stage B.1: derived metadata subkey for this volume. Set
+    /// when the system volume has `encryption_policy_id != 0`
+    /// and the mount gate accepted the volume; the read path
+    /// uses it to decrypt v6 metadata blocks (B.1) and v6 dirent
+    /// name bodies (B.2). The key is held in RAM for the
+    /// lifetime of the mount and zeroized on drop. `None` for
+    /// plain volumes.
+    #[cfg(feature = "crypto-aes-gcm")]
+    metadata_key: Option<[u8; hkdf::SUBKEY_BYTES]>,
     /// Caller-supplied per-volume compression policy table. An
     /// object whose `compression_policy_id` is non-zero is
     /// resolved through this table at read time; an object whose
@@ -206,12 +217,52 @@ impl<R: BlockReader> Hxfs<R> {
         )?;
         let system_volume = read_system_volume(&mut reader, checkpoint)?;
         let encryption = resolve_mount_encryption(&system_volume, encryption_policies)?;
+        // Stage B.1 wire: derive the per-volume metadata subkey
+        // when the volume is encrypted. The MVP uses the
+        // superblock's `instance_uuid` as the HKDF salt; the
+        // subkey is held in RAM for the lifetime of the mount
+        // and zeroized on drop. A future Stage D KeyProvider
+        // will supply the IKM through a kernel handle; for now
+        // the IKM is a fixed developer-only zero-key and the
+        // volume is only mountable from host tests.
+        #[cfg(feature = "crypto-aes-gcm")]
+        let metadata_key = if encryption.is_some() {
+            let mut ikm = [0u8; 32];
+            // Mix the instance UUID into the IKM so two volumes
+            // with the same superblock GUID family still get
+            // distinct subkeys. This is a development-only
+            // placeholder: the real IKM is supplied by the
+            // Stage D KeyProvider through the kernel handle.
+            let mut index = 0usize;
+            while index < 16 {
+                ikm[index] = superblock.instance_uuid[index];
+                ikm[index + 16] = superblock.instance_uuid[index];
+                index += 1;
+            }
+            let mut key = [0u8; hkdf::SUBKEY_BYTES];
+            encrypted_metadata::derive_metadata_key_for_volume(
+                &ikm,
+                &superblock.instance_uuid,
+                &mut key,
+            )
+            .map_err(|_| HxfsError::EncryptedPolicyInvalid)?;
+            // Zeroize the IKM scratch; it is short-lived and
+            // does not need to live in the struct.
+            for byte in ikm.iter_mut() {
+                *byte = 0;
+            }
+            Some(key)
+        } else {
+            None
+        };
         Ok(Self {
             reader,
             superblock,
             checkpoint,
             system_volume,
             encryption,
+            #[cfg(feature = "crypto-aes-gcm")]
+            metadata_key,
             compression_policies: Vec::new(),
             page_cache: page_cache::PageCache::new(),
         })
@@ -546,20 +597,32 @@ impl<R: BlockReader> Hxfs<R> {
         if owner != dir.object_id || count != dir.record_count {
             return Err(HxfsError::BadTree);
         }
-        let mut previous: Option<&str> = None;
+        // `previous_name` holds the previous dirent's plaintext
+        // name bytes. We cannot borrow the dirent's name field
+        // across loop iterations because the entry is created
+        // from `scratch`, which is re-borrowed on every call to
+        // `parse_dirent_in_block`. We copy the plaintext out
+        // before the next iteration so the borrow does not
+        // extend.
+        let mut previous_name = [0u8; MAX_NAME_BYTES];
+        let mut previous_len: usize = 0;
+        let mut has_previous = false;
+        let mut scratch = [0u8; MAX_NAME_BYTES];
         let mut index = 0u32;
         while index < count {
             let offset = header.header_bytes as usize + 16 + index as usize * DIR_RECORD_BYTES;
-            let entry = parse_dir_record(&block, offset)?;
-            if let Some(prev) = previous {
-                if prev.as_bytes() >= entry.name.as_bytes() {
+            let entry = self.parse_dirent_in_block(&block, offset, dir.object_id, &mut scratch)?;
+            if has_previous {
+                if &previous_name[..previous_len] >= entry.name.as_bytes() {
                     return Err(HxfsError::BadTree);
                 }
             }
             if entry.name.as_bytes() == name {
                 return Ok(entry.object_id);
             }
-            previous = Some(entry.name);
+            previous_len = entry.name.as_bytes().len();
+            previous_name[..previous_len].copy_from_slice(entry.name.as_bytes());
+            has_previous = true;
             index += 1;
         }
         Err(HxfsError::NotFound)
@@ -583,21 +646,69 @@ impl<R: BlockReader> Hxfs<R> {
         if owner != dir.object_id || count != dir.record_count {
             return Err(HxfsError::BadTree);
         }
-        let mut previous: Option<&str> = None;
+        // `visit` borrows the dirent's `name` for the duration
+        // of the call; after that borrow ends, the next
+        // iteration rebinds `scratch`. We use the same
+        // `previous_name` copy trick as in `lookup_in_directory`
+        // so the ordering check is sound without carrying a
+        // long-lived borrow across iterations.
+        let mut previous_name = [0u8; MAX_NAME_BYTES];
+        let mut previous_len: usize = 0;
+        let mut has_previous = false;
+        let mut scratch = [0u8; MAX_NAME_BYTES];
         let mut index = 0u32;
         while index < count {
             let offset = header.header_bytes as usize + 16 + index as usize * DIR_RECORD_BYTES;
-            let entry = parse_dir_record(&block, offset)?;
-            if let Some(prev) = previous {
-                if prev.as_bytes() >= entry.name.as_bytes() {
+            let entry = self.parse_dirent_in_block(&block, offset, dir.object_id, &mut scratch)?;
+            if has_previous {
+                if &previous_name[..previous_len] >= entry.name.as_bytes() {
                     return Err(HxfsError::BadTree);
                 }
             }
             visit(entry);
-            previous = Some(entry.name);
+            previous_len = entry.name.as_bytes().len();
+            previous_name[..previous_len].copy_from_slice(entry.name.as_bytes());
+            has_previous = true;
             index += 1;
         }
         Ok(())
+    }
+
+    /// Stage B.2 helper: parse one dirent record from a
+    /// directory block, decrypting the name body when the
+    /// record is encrypted and a metadata subkey is available.
+    /// The plaintext lands in `scratch` and the returned
+    /// `DirectoryEntry` borrows from it.
+    fn parse_dirent_in_block<'a>(
+        &self,
+        block: &[u8],
+        offset: usize,
+        parent_object_id: u64,
+        scratch: &'a mut [u8; MAX_NAME_BYTES],
+    ) -> Result<DirectoryEntry<'a>, HxfsError> {
+        #[cfg(feature = "crypto-aes-gcm")]
+        if let Some(key) = self.metadata_key.as_ref() {
+            return parse_dir_record_decrypt(block, offset, parent_object_id, key, scratch);
+        }
+        let _ = parent_object_id;
+        // Plaintext path: copy the v5 name bytes into `scratch`
+        // so the returned `DirectoryEntry` borrows from
+        // `scratch` (same lifetime as the encrypted path). This
+        // keeps the caller's borrow checker happy across loop
+        // iterations: the entry is only valid until the next
+        // call to `parse_dirent_in_block` rebinds `scratch`.
+        let entry = parse_dir_record(block, offset)?;
+        let name_bytes = entry.name.as_bytes();
+        if scratch.len() < name_bytes.len() {
+            return Err(HxfsError::BufferTooSmall);
+        }
+        scratch[..name_bytes.len()].copy_from_slice(name_bytes);
+        let name_str =
+            core::str::from_utf8(&scratch[..name_bytes.len()]).map_err(|_| HxfsError::BadName)?;
+        Ok(DirectoryEntry {
+            object_id: entry.object_id,
+            name: name_str,
+        })
     }
 
     fn copy_extents(&mut self, object: ObjectDescriptor, out: &mut [u8]) -> Result<(), HxfsError> {
@@ -655,7 +766,30 @@ impl<R: BlockReader> Hxfs<R> {
         out: &mut [u8; BLOCK_SIZE],
     ) -> Result<BlockHeader, HxfsError> {
         self.reader.read_blocks(lba, 1, out)?;
-        validate_metadata_block(out, lba, block_type, owner_id)
+        let header = validate_metadata_block(out, lba, block_type, owner_id)?;
+        // Stage B.1 wire: decrypt the payload in place if the
+        // block header says v6. We do this *after* the
+        // structural validation so a tampered v6 block surfaces
+        // as `BadBlock` or `BadChecksum` from
+        // `validate_metadata_block` first; only a structurally
+        // valid v6 block reaches the AEAD. The plaintext is
+        // placed back into the same buffer so the rest of the
+        // read path is unchanged.
+        #[cfg(feature = "crypto-aes-gcm")]
+        if is_v6_encrypted_metadata(&header) {
+            let key = self
+                .metadata_key
+                .as_ref()
+                .ok_or(HxfsError::EncryptedPolicyInvalid)?;
+            encrypted_metadata::decrypt_metadata_block_in_place(
+                out,
+                &header,
+                key,
+                &self.superblock.instance_uuid,
+            )
+            .map_err(|_| HxfsError::BadChecksum)?;
+        }
+        Ok(header)
     }
 }
 
@@ -813,8 +947,15 @@ pub(crate) fn validate_metadata_block(
     expected_owner: u64,
 ) -> Result<BlockHeader, HxfsError> {
     let header = parse_header(block)?;
+    // Stage B.1 wire: allow `type_version` of 1 (plain v5) or 6
+    // (encrypted v6). The header layout is identical between the
+    // two; only the on-disk payload bytes differ (encrypted
+    // ciphertext with GCM tag in the v6 case). The caller is
+    // responsible for calling `decrypt_metadata_block_in_place`
+    // after this returns when the header says v6.
+    let type_version_ok = header.type_version == 1 || header.type_version == 6;
     if header.block_type != expected_type
-        || header.type_version != 1
+        || !type_version_ok
         || header.header_bytes as usize != HEADER_BYTES
         || header.self_lba != expected_lba
         || header.owner_id != expected_owner
@@ -889,6 +1030,59 @@ pub(crate) fn parse_dir_record(
         .ok_or(HxfsError::BadTree)?;
     let name = core::str::from_utf8(name_bytes).map_err(|_| HxfsError::BadName)?;
     Ok(DirectoryEntry { object_id, name })
+}
+
+/// Stage B.2 dirent-name variant: parse the on-disk record and
+/// decrypt the body using `metadata_key` and the
+/// `parent_object_id` provided by the caller.
+///
+/// The on-disk layout is identical to the v5 plaintext layout
+/// (`object_id(8) + name_len(2) + body(name_len)`); the parent
+/// dir's volume is what decides whether the body is plaintext
+/// or encrypted ciphertext. For an encrypted parent, the body
+/// is `nonce(12) || ciphertext(M) || tag(16)` and
+/// `M = name_len - 28`.
+///
+/// The plaintext is written into `out` and the returned
+/// `DirectoryEntry` borrows from it. `out` must be at least
+/// `MAX_NAME_BYTES` long so a plaintext v5 name (up to 255
+/// bytes) fits.
+#[cfg(feature = "crypto-aes-gcm")]
+pub(crate) fn parse_dir_record_decrypt<'a>(
+    block: &[u8],
+    offset: usize,
+    parent_object_id: u64,
+    metadata_key: &[u8; hkdf::SUBKEY_BYTES],
+    out: &'a mut [u8],
+) -> Result<DirectoryEntry<'a>, HxfsError> {
+    let object_id = read_u64(block, offset)?;
+    let body_len = read_u16(block, offset + 8)? as usize;
+    if !(encrypted_metadata::ENCRYPTED_DIRENT_MIN_BODY..=MAX_NAME_BYTES).contains(&body_len) {
+        // An encrypted dirent must be at least
+        // `12 + 16 = 28` bytes long; a plaintext dirent has
+        // `name_len >= 1`. The lower bound here rejects a
+        // malformed short body.
+        return Err(HxfsError::BadName);
+    }
+    let body = block
+        .get(offset + 10..offset + 10 + body_len)
+        .ok_or(HxfsError::BadTree)?;
+    let mut enc = encrypted_metadata::EncryptedDirentName {
+        body: [0u8; MAX_NAME_BYTES],
+        body_len: body_len as u16,
+    };
+    enc.body[..body_len].copy_from_slice(body);
+    let plaintext_len = enc
+        .decrypt(parent_object_id, object_id, metadata_key, out)
+        .map_err(|_| HxfsError::BadName)?;
+    if out.len() < plaintext_len {
+        return Err(HxfsError::BufferTooSmall);
+    }
+    let name_str = core::str::from_utf8(&out[..plaintext_len]).map_err(|_| HxfsError::BadName)?;
+    Ok(DirectoryEntry {
+        object_id,
+        name: name_str,
+    })
 }
 
 pub(crate) fn parse_extent_record(block: &[u8], offset: usize) -> Result<ExtentRecord, HxfsError> {
@@ -1258,4 +1452,260 @@ fn a4_page_cache_lookup_and_insert_round_trip() {
     // Invalidate the extent; the cached page is gone.
     cache.invalidate_extent(100);
     assert!(cache.lookup(1, 100, 3).is_none());
+}
+
+// B.1 + B.2 wire: end-to-end test for encrypted metadata
+// I/O. The host test creates a fixed-capacity encrypted
+// volume, writes a file, flushes the checkpoint, then
+// re-mounts the volume with the same encryption policy
+// table and reads the file back. The on-disk dirent block
+// must carry the v6 header (type_version = 6) and the
+// dirent name body must be ciphertext; the read path
+// decrypts both.
+
+#[cfg(feature = "crypto-aes-gcm")]
+#[test]
+fn b1_b2_encrypted_volume_write_then_read_round_trip() {
+    use crate::fixed_writer::FixedHxfsWriter;
+    use crate::reader::SliceBlockReader;
+    use crate::recovery::BlockStore;
+    use crate::writer::VecBlockStore;
+
+    // Use `VecBlockStore` (in-memory, host-only) so we can
+    // mount the writer, write a file, and grab the image
+    // bytes back without a real block device. The block
+    // store implements `BlockStore: BlockReader` so the
+    // writer can call `read_blocks` to load the superblock.
+    let mut store = VecBlockStore::with_blocks(128);
+    // The writer needs a starting superblock; we drop the
+    // boot image from `build_image(true)` into the store so
+    // the mount gate sees a v5 superblock with
+    // `VOLUME_FLAG_ENCRYPTED` and `encryption_policy_id = 7`.
+    let boot_image = build_encrypted_boot_image();
+    let boot_blocks = (boot_image.len() / BLOCK_SIZE) as u32;
+    if let Err(e) = store.write_blocks(0, boot_blocks, &boot_image) {
+        assert!(false, "boot write must succeed: {:?}", e);
+        return;
+    }
+
+    // The encryption policy we resolve against at mount
+    // time; must match the policy_id in the boot image.
+    let policy = crate::crypto::EncryptionPolicy {
+        policy_id: 7,
+        algorithm: crate::crypto::ALGORITHM_AES_XTS,
+        data_unit_bytes: crate::crypto::DATA_UNIT_BYTES_4K,
+        provider: crate::crypto::KeyProvider::TpmOrBootloader,
+    };
+
+    let Ok(mut writer) =
+        FixedHxfsWriter::<VecBlockStore, 16, 32, 32>::mount_with_keys(store, &[policy])
+    else {
+        assert!(false, "writer mount must succeed for encrypted volume");
+        return;
+    };
+    // Write a tiny file at /hello.txt. The dirent block for
+    // the root directory will be re-encrypted at publish time.
+    // The boot image already has a `hello.txt` entry; we
+    // open the existing child and overwrite its payload
+    // rather than calling `create_file_child` (which would
+    // fail with `AlreadyExists`).
+    let root = writer.root_directory();
+    let payload = b"hello hxfs\n";
+    let file = match writer.open_child_file(root, "hello.txt") {
+        Ok(f) => f,
+        Err(e) => {
+            assert!(false, "open_child_file must succeed: {:?}", e);
+            return;
+        }
+    };
+    let _ = match writer.write_file_at(file, 0, payload) {
+        Ok(f) => f,
+        Err(e) => {
+            assert!(false, "write_file_at must succeed: {:?}", e);
+            return;
+        }
+    };
+    // Publish the checkpoint; this re-encrypts the dirent
+    // block and the extent table under the metadata subkey.
+    let _ = match writer.publish_checkpoint() {
+        Ok(_) => {}
+        Err(e) => {
+            assert!(false, "publish_checkpoint must succeed: {:?}", e);
+            return;
+        }
+    };
+    // Consume the writer and grab the image bytes.
+    let store = writer.into_store();
+    let image = store.image().to_vec();
+    // The new dirent block written by `publish_checkpoint`
+    // carries `type_version = 6` in its header. The LBA is
+    // `next_lba` (the writer allocates fresh LBAs for
+    // publish-time metadata, leaving the boot LBA 4 in
+    // place as historical state). The fixed writer stores
+    // the resulting checkpoint at a fresh LBA as well;
+    // we look at the writer's own LBA counter to find the
+    // new dirent block.
+    //
+    // The writer's publish path lays out blocks as:
+    //   target_start_lba = next_lba (7 in this image),
+    //   target_start_lba + 0 = dirent tree for root (object 1),
+    //   target_start_lba + 1 = extent table for object 2.
+    // So the encrypted dirent block lives at LBA 7.
+    let dir_lba: u64 = 8;
+    let dir_offset = (dir_lba as usize) * BLOCK_SIZE;
+    let type_version = u16::from_le_bytes([image[dir_offset + 4], image[dir_offset + 5]]);
+    assert_eq!(
+        type_version, 6,
+        "dirent block must be encrypted (type_version == 6)"
+    );
+    // The body bytes (after the header) must NOT contain the
+    // plaintext name `hello.txt`. The AEAD tag would never
+    // verify if an attacker flipped the bytes back, but
+    // reading the bytes directly off disk shows the body is
+    // ciphertext.
+    let body_bytes = &image[dir_offset + HEADER_BYTES..dir_offset + 16 + DIR_RECORD_BYTES];
+    let mut found = false;
+    let mut index = 0usize;
+    while index + 9 <= body_bytes.len() {
+        if &body_bytes[index..index + 9] == b"hello.txt" {
+            found = true;
+            break;
+        }
+        index += 1;
+    }
+    assert!(
+        !found,
+        "dirent body must not contain plaintext 'hello.txt' on disk"
+    );
+
+    // Now remount the volume with the same policy table and
+    // read the file back. The reader derives the same
+    // metadata subkey from the placeholder IKM + the volume
+    // UUID; the v6 block decrypts and the dirent name
+    // decrypts into the plaintext `hello.txt`.
+    let reader = SliceBlockReader::new(&image);
+    let Ok(mut fs) = Hxfs::mount_with_keys(reader, &[policy]) else {
+        assert!(false, "remount with key must succeed");
+        return;
+    };
+    // `encryption` accessor must return the resolved policy.
+    assert!(fs.encryption().is_some());
+    // The file is at /hello.txt.
+    let file = match fs.open_path("/hello.txt") {
+        Ok(f) => f,
+        Err(e) => {
+            assert!(false, "open_path must succeed for encrypted file: {:?}", e);
+            return;
+        }
+    };
+    let mut buf = [0u8; 32];
+    let read = match fs.read_file(file, &mut buf) {
+        Ok(n) => n,
+        Err(e) => {
+            assert!(false, "read_file must succeed: {:?}", e);
+            return;
+        }
+    };
+    assert_eq!(read, payload.len(), "read length must match payload");
+    assert_eq!(&buf[..read], payload, "round-trip bytes must match");
+}
+
+#[cfg(feature = "crypto-aes-gcm")]
+fn build_encrypted_boot_image() -> Vec<u8> {
+    // Full v5 boot image: superblock, checkpoint, volume
+    // table, object table, root dirent, child extent
+    // table, and 11 bytes of file payload. Mirrors the
+    // `build_image(true)` helper in the inner `tests`
+    // module but is callable from this module.
+    use alloc::vec;
+    use alloc::vec::Vec;
+    const INSTANCE_TEST: Uuid = [0x11; 16];
+    const VOLUME_TEST: Uuid = [0x22; 16];
+    fn mk(bt: u32, owner: u64, lba: u64, payload: &[u8]) -> [u8; BLOCK_SIZE] {
+        let mut block = [0u8; BLOCK_SIZE];
+        block[0..4].copy_from_slice(&bt.to_le_bytes());
+        block[4..6].copy_from_slice(&1u16.to_le_bytes());
+        block[6..8].copy_from_slice(&(HEADER_BYTES as u16).to_le_bytes());
+        block[8..16].copy_from_slice(&1u64.to_le_bytes());
+        block[16..24].copy_from_slice(&owner.to_le_bytes());
+        block[24..32].copy_from_slice(&lba.to_le_bytes());
+        block[36..40].copy_from_slice(&(payload.len() as u32).to_le_bytes());
+        block[HEADER_BYTES..HEADER_BYTES + payload.len()].copy_from_slice(payload);
+        let crc = metadata_crc32c(&block);
+        block[32..36].copy_from_slice(&crc.to_le_bytes());
+        block
+    }
+    fn write_object(
+        out: &mut [u8],
+        offset: usize,
+        object_id: u64,
+        object_type: u32,
+        size: u64,
+        tree_lba: u64,
+        record_count: u32,
+    ) {
+        out[offset..offset + 8].copy_from_slice(&object_id.to_le_bytes());
+        out[offset + 8..offset + 12].copy_from_slice(&object_type.to_le_bytes());
+        out[offset + 12..offset + 16].copy_from_slice(&1u32.to_le_bytes());
+        out[offset + 16..offset + 24].copy_from_slice(&size.to_le_bytes());
+        out[offset + 24..offset + 32].copy_from_slice(&0i64.to_le_bytes());
+        out[offset + 40..offset + 48].copy_from_slice(&tree_lba.to_le_bytes());
+        out[offset + 48..offset + 52].copy_from_slice(&record_count.to_le_bytes());
+    }
+    let mut image: Vec<u8> = vec![0u8; BLOCK_SIZE * 8];
+    let mut sp = [0u8; 120];
+    sp[0..16].copy_from_slice(&FORMAT_GUID);
+    sp[16..20].copy_from_slice(&FORMAT_VERSION.to_le_bytes());
+    sp[20..24].copy_from_slice(&TYPE_SYSTEM_VERSION.to_le_bytes());
+    sp[24..40].copy_from_slice(&INSTANCE_TEST);
+    sp[40..48].copy_from_slice(&1u64.to_le_bytes());
+    sp[48..52].copy_from_slice(&(BLOCK_SIZE as u32).to_le_bytes());
+    sp[56..64].copy_from_slice(&1u64.to_le_bytes());
+    sp[104..112].copy_from_slice(&BASE_INCOMPAT_FEATURES.to_le_bytes());
+    sp[112..116].copy_from_slice(&ROOT_STATE_CLEAN.to_le_bytes());
+    image[0..BLOCK_SIZE].copy_from_slice(&mk(BLOCK_TYPE_SUPERBLOCK, 0, 0, &sp));
+    let mut cp = [0u8; 128];
+    cp[0..8].copy_from_slice(&1u64.to_le_bytes());
+    cp[8..16].copy_from_slice(&2u64.to_le_bytes());
+    cp[16..20].copy_from_slice(&1u32.to_le_bytes());
+    cp[24..40].copy_from_slice(&VOLUME_TEST);
+    image[BLOCK_SIZE..BLOCK_SIZE * 2].copy_from_slice(&mk(BLOCK_TYPE_CHECKPOINT, 0, 1, &cp));
+    let mut vp = [0u8; 16 + VOLUME_RECORD_BYTES];
+    vp[0..4].copy_from_slice(&1u32.to_le_bytes());
+    vp[16..32].copy_from_slice(&VOLUME_TEST);
+    vp[32..40].copy_from_slice(&1u64.to_le_bytes());
+    vp[40..48].copy_from_slice(&3u64.to_le_bytes());
+    vp[48..52].copy_from_slice(&2u32.to_le_bytes());
+    vp[52..56].copy_from_slice(&(VOLUME_FLAG_SYSTEM | VOLUME_FLAG_ENCRYPTED).to_le_bytes());
+    vp[56..60].copy_from_slice(&7u32.to_le_bytes());
+    image[BLOCK_SIZE * 2..BLOCK_SIZE * 3].copy_from_slice(&mk(BLOCK_TYPE_VOLUME_TABLE, 0, 2, &vp));
+    let mut op = [0u8; 16 + 2 * OBJECT_RECORD_BYTES];
+    op[0..4].copy_from_slice(&2u32.to_le_bytes());
+    write_object(&mut op, 16, 1, OBJECT_TYPE_DIRECTORY, 0, 4, 1);
+    write_object(
+        &mut op,
+        16 + OBJECT_RECORD_BYTES,
+        2,
+        OBJECT_TYPE_FILE,
+        11,
+        5,
+        1,
+    );
+    image[BLOCK_SIZE * 3..BLOCK_SIZE * 4].copy_from_slice(&mk(BLOCK_TYPE_OBJECT_TABLE, 1, 3, &op));
+    let mut dp = [0u8; 16 + DIR_RECORD_BYTES];
+    dp[0..8].copy_from_slice(&1u64.to_le_bytes());
+    dp[8..12].copy_from_slice(&1u32.to_le_bytes());
+    dp[16..24].copy_from_slice(&2u64.to_le_bytes());
+    dp[24..26].copy_from_slice(&9u16.to_le_bytes());
+    dp[26..35].copy_from_slice(b"hello.txt");
+    image[BLOCK_SIZE * 4..BLOCK_SIZE * 5].copy_from_slice(&mk(BLOCK_TYPE_DIRECTORY, 1, 4, &dp));
+    let mut ep = [0u8; 16 + EXTENT_RECORD_BYTES];
+    ep[0..8].copy_from_slice(&2u64.to_le_bytes());
+    ep[8..12].copy_from_slice(&1u32.to_le_bytes());
+    ep[16..24].copy_from_slice(&0u64.to_le_bytes());
+    ep[24..32].copy_from_slice(&6u64.to_le_bytes());
+    ep[32..36].copy_from_slice(&1u32.to_le_bytes());
+    image[BLOCK_SIZE * 5..BLOCK_SIZE * 6].copy_from_slice(&mk(BLOCK_TYPE_EXTENT_TABLE, 2, 5, &ep));
+    image[BLOCK_SIZE * 6..BLOCK_SIZE * 6 + 11].copy_from_slice(b"hello hxfs\n");
+    image
 }

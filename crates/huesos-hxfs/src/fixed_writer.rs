@@ -63,6 +63,21 @@ pub struct FixedHxfsWriter<
     /// `encryption_policies` table and held in the writer for
     /// later use by the on-target encryption path.
     encryption: Option<crate::crypto::EncryptionPolicy>,
+    /// Stage B.1: per-volume metadata subkey used to encrypt v6
+    /// metadata blocks and v6 dirent name bodies on the write
+    /// path. `None` for plain volumes. Held in RAM for the
+    /// lifetime of the mount; zeroized on drop. The same MVP
+    /// placeholder key-derivation rules as the reader apply:
+    /// a real Stage D KeyProvider will replace this.
+    #[cfg(feature = "crypto-aes-gcm")]
+    metadata_key: Option<[u8; crate::hkdf::SUBKEY_BYTES]>,
+    /// Volume UUID used as the HKDF salt. Cached at mount time
+    /// so the write path can re-derive the AEAD nonce and AAD
+    /// without re-reading the superblock. The 16-byte UUID is
+    /// mixed into the nonce and AAD so a ciphertext cannot be
+    /// transplanted across volumes.
+    #[cfg(feature = "crypto-aes-gcm")]
+    volume_uuid: crate::format::Uuid,
     objects: [Option<FixedObject>; MAX_OBJECTS],
     dir_entries: [Option<FixedDirEntry>; MAX_DIR_ENTRIES],
     extents: [Option<FixedExtent>; MAX_EXTENTS],
@@ -127,13 +142,43 @@ impl<
         )?;
         let system_volume = read_system_volume(&mut store, checkpoint)?;
         let encryption = crate::resolve_mount_encryption(&system_volume, encryption_policies)?;
-
+        // Stage B.1 wire: derive the per-volume metadata subkey
+        // when the volume is encrypted. The placeholder IKM is
+        // the same hash-of-instance-uuid pattern the reader
+        // uses; a real Stage D KeyProvider will replace it.
+        #[cfg(feature = "crypto-aes-gcm")]
+        let metadata_key = if encryption.is_some() {
+            let mut ikm = [0u8; 32];
+            let mut index = 0usize;
+            while index < 16 {
+                ikm[index] = superblock.instance_uuid[index];
+                ikm[index + 16] = superblock.instance_uuid[index];
+                index += 1;
+            }
+            let mut key = [0u8; crate::hkdf::SUBKEY_BYTES];
+            crate::encrypted_metadata::derive_metadata_key_for_volume(
+                &ikm,
+                &superblock.instance_uuid,
+                &mut key,
+            )
+            .map_err(|_| HxfsError::EncryptedPolicyInvalid)?;
+            for byte in ikm.iter_mut() {
+                *byte = 0;
+            }
+            Some(key)
+        } else {
+            None
+        };
         let mut mounted = Self {
             store,
             superblock,
             checkpoint,
             system_volume,
             encryption,
+            #[cfg(feature = "crypto-aes-gcm")]
+            metadata_key,
+            #[cfg(feature = "crypto-aes-gcm")]
+            volume_uuid: superblock.instance_uuid,
             objects: [const { None }; MAX_OBJECTS],
             dir_entries: [const { None }; MAX_DIR_ENTRIES],
             extents: [const { None }; MAX_EXTENTS],
@@ -1332,6 +1377,16 @@ impl<
         let count = self.directory_entry_count(object_id);
         payload[0..8].copy_from_slice(&object_id.to_le_bytes());
         payload[8..12].copy_from_slice(&count.to_le_bytes());
+        // Stage B.2 wire: when the parent directory is on an
+        // encrypted volume we encrypt every dirent name body
+        // before writing the block. The encrypted body is
+        // `nonce(12) || ciphertext(M) || tag(16)`, written into
+        // the same `name[N]` region the v5 plaintext layout
+        // uses. The reader decides plaintext vs encrypted by
+        // the volume's `encryption_policy_id` (resolved at
+        // mount time), not by a per-record flag, so the on-disk
+        // plaintext v5 layout is byte-for-byte unchanged.
+        let parent_is_encrypted = self.is_volume_encrypted();
         let mut written = 0usize;
         let mut index = 0usize;
         while index < self.dir_entries.len() {
@@ -1342,21 +1397,107 @@ impl<
                         return Err(HxfsError::NoSpace);
                     }
                     payload[offset..offset + 8].copy_from_slice(&entry.object_id.to_le_bytes());
-                    payload[offset + 8..offset + 10].copy_from_slice(&entry.name_len.to_le_bytes());
-                    let name = entry.name_bytes();
-                    payload[offset + 10..offset + 10 + name.len()].copy_from_slice(name);
+                    if parent_is_encrypted {
+                        #[cfg(feature = "crypto-aes-gcm")]
+                        {
+                            let key = self
+                                .metadata_key
+                                .as_ref()
+                                .ok_or(HxfsError::EncryptedPolicyInvalid)?;
+                            let name_str = core::str::from_utf8(entry.name_bytes())
+                                .map_err(|_| HxfsError::BadName)?;
+                            let enc = crate::encrypted_metadata::EncryptedDirentName::encrypt(
+                                name_str,
+                                object_id,
+                                entry.object_id,
+                                key,
+                            )
+                            .map_err(|_| HxfsError::NoSpace)?;
+                            let body_len = enc.body_len as usize;
+                            payload[offset + 8..offset + 10]
+                                .copy_from_slice(&enc.body_len.to_le_bytes());
+                            payload[offset + 10..offset + 10 + body_len]
+                                .copy_from_slice(&enc.body[..body_len]);
+                        }
+                        #[cfg(not(feature = "crypto-aes-gcm"))]
+                        {
+                            return Err(HxfsError::EncryptedPolicyInvalid);
+                        }
+                    } else {
+                        // Plain v5 layout. `name_len` is the
+                        // UTF-8 byte length and the body is the
+                        // raw name. Byte-for-byte compatible
+                        // with the pre-B.2 writer.
+                        let name = entry.name_bytes();
+                        payload[offset + 8..offset + 10]
+                            .copy_from_slice(&entry.name_len.to_le_bytes());
+                        payload[offset + 10..offset + 10 + name.len()].copy_from_slice(name);
+                    }
                     written += 1;
                 }
             }
             index += 1;
         }
-        Ok(make_metadata_block(
+        let args = self.encryption_args();
+        Ok(make_metadata_block_for_volume(
             BLOCK_TYPE_DIRECTORY,
             object_id,
             lba,
             &payload[..16 + written * DIR_RECORD_BYTES],
-        ))
+            args.0,
+            args.1,
+            args.2,
+        )?)
     }
+
+    /// Convenience: pack the (volume_encrypted, metadata_key,
+    /// volume_uuid) triple into a tuple for the
+    /// `make_metadata_block_for_volume` call. On a build without
+    /// the feature the encryption half is `None` and the UUID
+    /// is a default; the wrapper falls through to the plain
+    /// builder. Defined as a tuple expression so the cfg
+    /// attributes can sit on the field values, not on the
+    /// expression itself.
+    #[cfg(feature = "crypto-aes-gcm")]
+    fn encryption_args(
+        &self,
+    ) -> (
+        bool,
+        Option<&[u8; crate::hkdf::SUBKEY_BYTES]>,
+        &crate::format::Uuid,
+    ) {
+        (
+            self.metadata_key.is_some(),
+            self.metadata_key.as_ref(),
+            &self.volume_uuid,
+        )
+    }
+
+    #[cfg(not(feature = "crypto-aes-gcm"))]
+    fn encryption_args(&self) -> (bool, Option<&'static [u8; 32]>, &'static [u8; 16]) {
+        (false, None, &[0u8; 16])
+    }
+
+    /// Stage B.2 helper: `true` when the volume has a non-zero
+    /// `encryption_policy_id` and we therefore have a metadata
+    /// subkey in RAM. Used by `build_directory_block` to decide
+    /// whether to encrypt each dirent name body.
+    fn is_volume_encrypted(&self) -> bool {
+        #[cfg(feature = "crypto-aes-gcm")]
+        {
+            self.metadata_key.is_some()
+        }
+        #[cfg(not(feature = "crypto-aes-gcm"))]
+        {
+            false
+        }
+    }
+
+    /// Return the metadata subkey and volume UUID for the
+    /// `make_metadata_block_for_volume` wrapper. On a build
+    /// without the `crypto-aes-gcm` feature both halves are
+    /// `None`/default; the wrapper falls through to the plain
+    /// v5 builder.
 
     fn build_extent_block(&self, object_id: u64, lba: u64) -> FixedResult<[u8; BLOCK_SIZE]> {
         let mut payload = [0u8; BLOCK_SIZE - HEADER_BYTES];
@@ -1385,12 +1526,16 @@ impl<
             }
             index += 1;
         }
-        Ok(make_metadata_block(
+        let args = self.encryption_args();
+        Ok(make_metadata_block_for_volume(
             BLOCK_TYPE_EXTENT_TABLE,
             object_id,
             lba,
             &payload[..16 + written * EXTENT_RECORD_BYTES],
-        ))
+            args.0,
+            args.1,
+            args.2,
+        )?)
     }
 
     fn build_object_table_block(
@@ -1468,12 +1613,16 @@ impl<
             }
             index += 1;
         }
-        Ok(make_metadata_block(
+        let args = self.encryption_args();
+        Ok(make_metadata_block_for_volume(
             BLOCK_TYPE_ALLOCATION_TREE,
             self.system_volume.root_object_id,
             lba,
             &payload[..16 + written * 32],
-        ))
+            args.0,
+            args.1,
+            args.2,
+        )?)
     }
 
     fn build_refcount_tree_block(&self, lba: u64) -> FixedResult<[u8; BLOCK_SIZE]> {
@@ -1511,12 +1660,16 @@ impl<
             }
             index += 1;
         }
-        Ok(make_metadata_block(
+        let args = self.encryption_args();
+        Ok(make_metadata_block_for_volume(
             BLOCK_TYPE_REFCOUNT_TREE,
             self.system_volume.root_object_id,
             lba,
             &payload[..16 + written * 24],
-        ))
+            args.0,
+            args.1,
+            args.2,
+        )?)
     }
 
     fn build_backref_tree_block(&self, lba: u64, generation: u64) -> FixedResult<[u8; BLOCK_SIZE]> {
@@ -1560,12 +1713,16 @@ impl<
             }
             index += 1;
         }
-        Ok(make_metadata_block(
+        let args = self.encryption_args();
+        Ok(make_metadata_block_for_volume(
             BLOCK_TYPE_BACKREF_TREE,
             self.system_volume.root_object_id,
             lba,
             &payload[..16 + written * 40],
-        ))
+            args.0,
+            args.1,
+            args.2,
+        )?)
     }
 
     fn build_quota_tree_block(
@@ -1610,12 +1767,16 @@ impl<
             }
             index += 1;
         }
-        Ok(make_metadata_block(
+        let args = self.encryption_args();
+        Ok(make_metadata_block_for_volume(
             BLOCK_TYPE_QUOTA_TREE,
             self.system_volume.root_object_id,
             lba,
             &payload[..16 + written * 56],
-        ))
+            args.0,
+            args.1,
+            args.2,
+        )?)
     }
 
     fn build_volume_table_block(
@@ -1855,6 +2016,73 @@ fn make_metadata_block(block_type: u32, owner: u64, lba: u64, payload: &[u8]) ->
     let crc = metadata_crc32c(&block);
     block[32..36].copy_from_slice(&crc.to_le_bytes());
     block
+}
+
+/// Stage B.1 wrapper: build a metadata block, encrypting the
+/// payload when the block type belongs to the encrypted-on-disk
+/// set and the volume is encrypted. Superblock, checkpoint,
+/// volume table, and object table are *not* encrypted even on
+/// an encrypted volume because they carry global state needed
+/// to find the encryption key (per `docs/STAGE_B_PLAN.md` B.1).
+#[cfg(feature = "crypto-aes-gcm")]
+fn make_metadata_block_for_volume(
+    block_type: u32,
+    owner: u64,
+    lba: u64,
+    payload: &[u8],
+    volume_encrypted: bool,
+    metadata_key: Option<&[u8; crate::hkdf::SUBKEY_BYTES]>,
+    volume_uuid: &crate::format::Uuid,
+) -> FixedResult<[u8; BLOCK_SIZE]> {
+    if volume_encrypted && is_encrypted_block_type(block_type) {
+        let key = metadata_key.ok_or(HxfsError::EncryptedPolicyInvalid)?;
+        return crate::encrypted_metadata::make_encrypted_metadata_block(
+            block_type,
+            owner,
+            lba,
+            payload,
+            key,
+            volume_uuid,
+        )
+        .map_err(|_| HxfsError::BadBlock);
+    }
+    Ok(make_metadata_block(block_type, owner, lba, payload))
+}
+
+/// Stage B.1 wrapper for builds without `crypto-aes-gcm`:
+/// always falls through to the plain v5 builder. A mount of an
+/// encrypted volume on a build without the feature is rejected
+/// at the mount gate with `EncryptedPolicyInvalid`; the
+/// `volume_encrypted` flag therefore never reaches `true` on
+/// such a build and the encryption path is unreachable.
+#[cfg(not(feature = "crypto-aes-gcm"))]
+fn make_metadata_block_for_volume(
+    block_type: u32,
+    owner: u64,
+    lba: u64,
+    payload: &[u8],
+    _volume_encrypted: bool,
+    _metadata_key: Option<&[u8; 32]>,
+    _volume_uuid: &crate::format::Uuid,
+) -> FixedResult<[u8; BLOCK_SIZE]> {
+    Ok(make_metadata_block(block_type, owner, lba, payload))
+}
+
+/// Stage B.1: which metadata block types carry the encrypted
+/// payload on an encrypted volume. The superblock, checkpoint,
+/// volume table, and object table stay plaintext because they
+/// are needed to bootstrap the encryption key (see
+/// `docs/STAGE_B_PLAN.md` B.1).
+fn is_encrypted_block_type(block_type: u32) -> bool {
+    matches!(
+        block_type,
+        BLOCK_TYPE_DIRECTORY
+            | BLOCK_TYPE_EXTENT_TABLE
+            | BLOCK_TYPE_ALLOCATION_TREE
+            | BLOCK_TYPE_REFCOUNT_TREE
+            | BLOCK_TYPE_BACKREF_TREE
+            | BLOCK_TYPE_QUOTA_TREE
+    )
 }
 
 fn read_u32(bytes: &[u8], offset: usize) -> FixedResult<u32> {

@@ -296,7 +296,12 @@ pub struct ObjectDescriptor {
 pub struct DirectoryEntry<'a> {
     /// Target object id.
     pub object_id: u64,
-    /// UTF-8 name bytes.
+    /// UTF-8 name bytes. For a v5 plaintext dirent this is the
+    /// name straight off disk; for a v6 encrypted dirent the
+    /// caller has decrypted the body into a stack buffer and
+    /// the borrow here points at that buffer. The lifetime is
+    /// tied to the caller's scratch buffer, not to the disk
+    /// block.
     pub name: &'a str,
 }
 
