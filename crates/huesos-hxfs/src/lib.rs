@@ -27,6 +27,7 @@ pub mod hxblob;
 pub mod hxblob_tree;
 pub mod io_policy;
 pub mod observability;
+pub mod page_cache;
 pub mod quota;
 pub mod quota_tree;
 pub mod reader;
@@ -121,6 +122,15 @@ pub struct Hxfs<R: BlockReader> {
     /// `compression_policy_id`. The field is empty for callers
     /// that never set a non-plain volume policy.
     compression_policies: Vec<compression::CompressionPolicy>,
+    /// Per-volume page cache for decompressed 4 KiB blocks
+    /// (A.4 of PRODUCTION_ROADMAP.md). The cache is FIFO with
+    /// a 16 MiB / 4096-entry working set; invalidation is by
+    /// physical extent LBA on every write that touches an
+    /// extent. The field is always present (the cache is
+    /// cheap to construct) and the public read path consults
+    /// it on every call so the cache always pays its way on
+    /// the second read of the same block.
+    page_cache: page_cache::PageCache,
 }
 
 impl<R: BlockReader> Hxfs<R> {
@@ -195,6 +205,7 @@ impl<R: BlockReader> Hxfs<R> {
             system_volume,
             encryption,
             compression_policies: Vec::new(),
+            page_cache: page_cache::PageCache::new(),
         })
     }
 
@@ -288,8 +299,7 @@ fn resolve_compression_for_object(
     if policy_id == 0 {
         return None;
     }
-    let resolved = compression::resolve_compression_policy(policy_id, compression_policies)
-        .ok()?;
+    let resolved = compression::resolve_compression_policy(policy_id, compression_policies).ok()?;
     if resolved.algorithm == compression::COMPRESSION_NONE {
         return None;
     }
@@ -597,8 +607,19 @@ impl<R: BlockReader> Hxfs<R> {
                 .logical_block
                 .checked_add(u64::from(extent.block_count))
                 .ok_or(HxfsError::OutOfRange)?;
-            let compression = resolve_compression_for_object(&self.system_volume, &self.compression_policies, object);
-            copy_extent(&mut self.reader, extent, compression, out)?;
+            let compression = resolve_compression_for_object(
+                &self.system_volume,
+                &self.compression_policies,
+                object,
+            );
+            copy_extent(
+                &mut self.reader,
+                extent,
+                compression,
+                &mut self.page_cache,
+                0,
+                out,
+            )?;
             index += 1;
         }
         Ok(())
@@ -865,6 +886,8 @@ fn copy_extent<R: BlockReader>(
     reader: &mut R,
     extent: ExtentRecord,
     compression: Option<compression::CompressionPolicy>,
+    page_cache: &mut page_cache::PageCache,
+    volume_id: u64,
     out: &mut [u8],
 ) -> Result<(), HxfsError> {
     let start = usize::try_from(extent.logical_block)
@@ -892,6 +915,13 @@ fn copy_extent<R: BlockReader>(
         let logical_delta = copied - start;
         let extent_block = logical_delta / BLOCK_SIZE;
         let within = logical_delta % BLOCK_SIZE;
+        let page_index = extent_block as u32;
+        if let Some(cached) = page_cache.lookup(volume_id, extent.physical_block, page_index) {
+            let chunk = (copy_end - copied).min(BLOCK_SIZE - within);
+            out[copied..copied + chunk].copy_from_slice(&cached[within..within + chunk]);
+            copied += chunk;
+            continue;
+        }
         reader.read_blocks(extent.physical_block + extent_block as u64, 1, &mut scratch)?;
         // A.3 wire: dispatch on the resolved compression policy
         // and decompress the just-read 4 KiB block into a
@@ -921,6 +951,18 @@ fn copy_extent<R: BlockReader>(
         let chunk = (copy_end - copied).min(BLOCK_SIZE - within);
         out[copied..copied + chunk].copy_from_slice(&block_slice[within..within + chunk]);
         copied += chunk;
+        // A.4 wire: insert the just-read 4 KiB block (raw or
+        // decompressed) into the per-volume page cache so the
+        // next read of the same page skips the disk I/O and
+        // the codec. The cache key is the physical block LBA
+        // + the page index; collisions are handled by the
+        // bounded walk inside PageCache.
+        page_cache.insert(
+            volume_id,
+            extent.physical_block,
+            page_index,
+            block_slice.to_vec(),
+        );
     }
     Ok(())
 }
