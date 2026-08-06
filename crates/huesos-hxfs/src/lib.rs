@@ -23,6 +23,8 @@ pub mod crypto;
 pub mod crypto_aes_gcm;
 #[cfg(feature = "crypto-aes-gcm")]
 pub mod encrypted_metadata;
+#[cfg(feature = "crypto-aes-gcm")]
+pub mod extent_crypto;
 pub mod fixed_writer;
 pub mod format;
 pub mod fsck;
@@ -133,7 +135,15 @@ pub struct Hxfs<R: BlockReader> {
     /// lifetime of the mount and zeroized on drop. `None` for
     /// plain volumes.
     #[cfg(feature = "crypto-aes-gcm")]
-    metadata_key: Option<[u8; hkdf::SUBKEY_BYTES]>,
+    metadata_key: Option<[u8; 32]>,
+    /// Stage B.3: derived extent subkey for this volume. Used
+    /// to wrap the *compressed* payload of every data extent
+    /// on the read path. Independent from `metadata_key`
+    /// (different HKDF info string) so a metadata-key leak
+    /// does not also leak data extents. `None` for plain
+    /// volumes.
+    #[cfg(feature = "crypto-aes-gcm")]
+    extent_key: Option<[u8; 32]>,
     /// Caller-supplied per-volume compression policy table. An
     /// object whose `compression_policy_id` is non-zero is
     /// resolved through this table at read time; an object whose
@@ -239,7 +249,7 @@ impl<R: BlockReader> Hxfs<R> {
                 ikm[index + 16] = superblock.instance_uuid[index];
                 index += 1;
             }
-            let mut key = [0u8; hkdf::SUBKEY_BYTES];
+            let mut key = [0u8; 32];
             encrypted_metadata::derive_metadata_key_for_volume(
                 &ikm,
                 &superblock.instance_uuid,
@@ -255,6 +265,30 @@ impl<R: BlockReader> Hxfs<R> {
         } else {
             None
         };
+        // Stage B.3 wire: derive the per-volume extent subkey
+        // from the same placeholder IKM. The extent subkey is
+        // independent of the metadata subkey (different HKDF
+        // info string) so a metadata-key leak does not also
+        // leak data extents.
+        #[cfg(feature = "crypto-aes-gcm")]
+        let extent_key = if encryption.is_some() {
+            let mut ikm = [0u8; 32];
+            let mut index = 0usize;
+            while index < 16 {
+                ikm[index] = superblock.instance_uuid[index];
+                ikm[index + 16] = superblock.instance_uuid[index];
+                index += 1;
+            }
+            let mut key = [0u8; 32];
+            extent_crypto::derive_extent_key_for_volume(&ikm, &superblock.instance_uuid, &mut key)
+                .map_err(|_| HxfsError::EncryptedPolicyInvalid)?;
+            for byte in ikm.iter_mut() {
+                *byte = 0;
+            }
+            Some(key)
+        } else {
+            None
+        };
         Ok(Self {
             reader,
             superblock,
@@ -263,6 +297,8 @@ impl<R: BlockReader> Hxfs<R> {
             encryption,
             #[cfg(feature = "crypto-aes-gcm")]
             metadata_key,
+            #[cfg(feature = "crypto-aes-gcm")]
+            extent_key,
             compression_policies: Vec::new(),
             page_cache: page_cache::PageCache::new(),
         })
@@ -745,12 +781,29 @@ impl<R: BlockReader> Hxfs<R> {
                 &self.compression_policies,
                 object,
             );
-            copy_extent(
+            // Stage B.3 wire: decide whether the extent is
+            // encrypted (per-object policy with per-volume
+            // fallback) and pass the matching subkey + volume
+            // UUID to the read path.
+            #[cfg(feature = "crypto-aes-gcm")]
+            let extent_is_encrypted =
+                extent_crypto::resolve_extent_encryption_for_object(&self.system_volume, &object);
+            #[cfg(feature = "crypto-aes-gcm")]
+            let extent_key: Option<&[u8; 32]> = if extent_is_encrypted {
+                self.extent_key.as_ref()
+            } else {
+                None
+            };
+            #[cfg(not(feature = "crypto-aes-gcm"))]
+            let extent_key: Option<&[u8; 32]> = None;
+            copy_extent_with_keys(
                 &mut self.reader,
                 extent,
                 compression,
                 &mut self.page_cache,
                 0,
+                extent_key,
+                &self.superblock.instance_uuid,
                 out,
             )?;
             index += 1;
@@ -1052,7 +1105,7 @@ pub(crate) fn parse_dir_record_decrypt<'a>(
     block: &[u8],
     offset: usize,
     parent_object_id: u64,
-    metadata_key: &[u8; hkdf::SUBKEY_BYTES],
+    metadata_key: &[u8; 32],
     out: &'a mut [u8],
 ) -> Result<DirectoryEntry<'a>, HxfsError> {
     let object_id = read_u64(block, offset)?;
@@ -1106,6 +1159,62 @@ fn copy_extent<R: BlockReader>(
     volume_id: u64,
     out: &mut [u8],
 ) -> Result<(), HxfsError> {
+    // Stage B.3 wire: keep the original `copy_extent` signature
+    // available for callers that do not need to thread an
+    // extent subkey through (host tests, the no-encryption
+    // build). The implementation is the same as
+    // `copy_extent_with_keys` with no key and an empty
+    // volume UUID; the `crypto-aes-gcm` match arm inside
+    // `copy_extent_with_keys` skips the decrypt step when
+    // `extent_key` is `None`.
+    copy_extent_with_keys(
+        reader,
+        extent,
+        compression,
+        page_cache,
+        volume_id,
+        None,
+        &[],
+        out,
+    )
+}
+
+/// Stage B.3 wire: same as `copy_extent` but with an
+/// optional per-volume extent subkey and a volume UUID for
+/// the AEAD nonce / AAD. When `extent_key` is `Some`, each
+/// on-disk 4 KiB block is decrypted with AES-256-GCM
+/// **before** decompression; the page cache still holds the
+/// *plaintext* (decompressed) so subsequent reads skip both
+/// the AEAD work and the codec. A bad GCM tag surfaces as
+/// `HxfsError::Compression` at the read boundary (matching
+/// the existing compression-error reporting so the higher
+/// layer can mark the extent bad).
+///
+/// `volume_uuid` must be exactly 16 bytes; the function
+/// assumes `crypto-aes-gcm` decrypt can fail with `BadTag`
+/// when the on-disk block was tampered with or the wrong key
+/// was used.
+#[allow(clippy::too_many_arguments)]
+fn copy_extent_with_keys<R: BlockReader>(
+    reader: &mut R,
+    extent: ExtentRecord,
+    compression: Option<compression::CompressionPolicy>,
+    page_cache: &mut page_cache::PageCache,
+    volume_id: u64,
+    extent_key: Option<&[u8; 32]>,
+    volume_uuid: &[u8],
+    out: &mut [u8],
+) -> Result<(), HxfsError> {
+    // Reinterpret the 16-byte volume UUID slice as a
+    // `Uuid` for the AEAD nonce/AAD builder. The caller
+    // passes the volume's `instance_uuid` bytes.
+    #[cfg(feature = "crypto-aes-gcm")]
+    let volume_uuid: [u8; 16] = {
+        let mut id = [0u8; 16];
+        let len = volume_uuid.len().min(16);
+        id[..len].copy_from_slice(&volume_uuid[..len]);
+        id
+    };
     let start = usize::try_from(extent.logical_block)
         .ok()
         .and_then(|block| block.checked_mul(BLOCK_SIZE))
@@ -1125,7 +1234,13 @@ fn copy_extent<R: BlockReader>(
     }
 
     let mut scratch = [0u8; BLOCK_SIZE];
+    // The intermediate buffer for decrypted-but-still-
+    // compressed bytes. Only used when both encryption and
+    // compression are present; for either single layer
+    // (or none) we read straight into `scratch` and let the
+    // existing compression path handle the data.
     let mut decompressed = [0u8; BLOCK_SIZE];
+    let mut compressed_after_decrypt = [0u8; BLOCK_SIZE];
     let mut copied = start;
     while copied < copy_end {
         let logical_delta = copied - start;
@@ -1139,29 +1254,54 @@ fn copy_extent<R: BlockReader>(
             continue;
         }
         reader.read_blocks(extent.physical_block + extent_block as u64, 1, &mut scratch)?;
-        // A.3 wire: dispatch on the resolved compression policy
-        // and decompress the just-read 4 KiB block into a
-        // caller-bounded buffer. Plain and absent policies are
-        // the no-op fast path; codec errors surface as
-        // HxfsError::Compression at the read boundary.
+        // A.3 + B.3 wire: the on-disk block is
+        // `compressed-then-encrypted` (or just compressed, or
+        // just encrypted, or plain). The plaintext is the
+        // result of `decrypt(decompress(scratch))` when both
+        // layers are present, `decompress(scratch)` for
+        // compression-only, `decrypt(scratch)` for
+        // encryption-only, or `scratch` itself for plain.
+        //
+        // We always end up with `block_slice: &[u8]` of
+        // length `BLOCK_SIZE` (the decompressor pads short
+        // compressed payloads to a fixed-size 4 KiB output).
+        #[cfg(feature = "crypto-aes-gcm")]
+        let block_slice: &[u8] = match (extent_key, compression) {
+            (Some(key), Some(policy)) => {
+                // Encrypted + compressed.
+                let physical_block = extent.physical_block + extent_block as u64;
+                extent_crypto::decrypt_extent_block(
+                    key,
+                    physical_block,
+                    &volume_uuid,
+                    &scratch,
+                    &mut compressed_after_decrypt,
+                )
+                .map_err(|_| HxfsError::Compression)?;
+                decompress_into(&policy, &compressed_after_decrypt, &mut decompressed)?
+            }
+            (Some(key), None) => {
+                // Encrypted, not compressed.
+                let physical_block = extent.physical_block + extent_block as u64;
+                extent_crypto::decrypt_extent_block(
+                    key,
+                    physical_block,
+                    &volume_uuid,
+                    &scratch,
+                    &mut decompressed,
+                )
+                .map_err(|_| HxfsError::Compression)?;
+                &decompressed[..]
+            }
+            (None, Some(policy)) => {
+                // Compressed, not encrypted (existing A.3 path).
+                decompress_into(&policy, &scratch, &mut decompressed)?
+            }
+            (None, None) => &scratch[..],
+        };
+        #[cfg(not(feature = "crypto-aes-gcm"))]
         let block_slice: &[u8] = match compression {
-            Some(policy) => match policy.algorithm {
-                compression::COMPRESSION_NONE => &scratch[..],
-                compression::COMPRESSION_LZ4 => {
-                    #[cfg(feature = "compression-engines")]
-                    {
-                        compression::decompress_lz4(&scratch, &mut decompressed)
-                            .map_err(|_| HxfsError::Compression)?;
-                        &decompressed[..]
-                    }
-                    #[cfg(not(feature = "compression-engines"))]
-                    {
-                        let _ = (&scratch, &mut decompressed);
-                        return Err(HxfsError::Compression);
-                    }
-                }
-                _ => return Err(HxfsError::Compression),
-            },
+            Some(policy) => decompress_into(&policy, &scratch, &mut decompressed)?,
             None => &scratch[..],
         };
         let chunk = (copy_end - copied).min(BLOCK_SIZE - within);
@@ -1181,6 +1321,41 @@ fn copy_extent<R: BlockReader>(
         );
     }
     Ok(())
+}
+
+/// Helper for `copy_extent_with_keys` / `copy_extent`: run
+/// the resolved compression codec on `input` and write the
+/// result into `output`. Returns a `&[u8]` of length
+/// `BLOCK_SIZE` (the caller-supplied output buffer). Codec
+/// errors surface as `HxfsError::Compression`.
+fn decompress_into<'a>(
+    policy: &compression::CompressionPolicy,
+    input: &[u8],
+    output: &'a mut [u8; BLOCK_SIZE],
+) -> Result<&'a [u8], HxfsError> {
+    match policy.algorithm {
+        compression::COMPRESSION_NONE => {
+            // Treat the input bytes as the plaintext
+            // directly. The caller only ever feeds us a 4 KiB
+            // scratch buffer here, so the output is also 4
+            // KiB.
+            output.copy_from_slice(input);
+            Ok(&output[..])
+        }
+        compression::COMPRESSION_LZ4 => {
+            #[cfg(feature = "compression-engines")]
+            {
+                compression::decompress_lz4(input, output).map_err(|_| HxfsError::Compression)?;
+                Ok(&output[..])
+            }
+            #[cfg(not(feature = "compression-engines"))]
+            {
+                let _ = (input, output);
+                Err(HxfsError::Compression)
+            }
+        }
+        _ => Err(HxfsError::Compression),
+    }
 }
 
 fn read_u16(bytes: &[u8], offset: usize) -> Result<u16, HxfsError> {

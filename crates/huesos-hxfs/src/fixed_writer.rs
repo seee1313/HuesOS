@@ -70,7 +70,13 @@ pub struct FixedHxfsWriter<
     /// placeholder key-derivation rules as the reader apply:
     /// a real Stage D KeyProvider will replace this.
     #[cfg(feature = "crypto-aes-gcm")]
-    metadata_key: Option<[u8; crate::hkdf::SUBKEY_BYTES]>,
+    metadata_key: Option<[u8; 32]>,
+    /// Stage B.3: per-volume extent subkey used to wrap the
+    /// *compressed* payload of every data extent on the
+    /// write path. Independent of `metadata_key` (different
+    /// HKDF info string). `None` for plain volumes.
+    #[cfg(feature = "crypto-aes-gcm")]
+    extent_key: Option<[u8; 32]>,
     /// Volume UUID used as the HKDF salt. Cached at mount time
     /// so the write path can re-derive the AEAD nonce and AAD
     /// without re-reading the superblock. The 16-byte UUID is
@@ -155,8 +161,34 @@ impl<
                 ikm[index + 16] = superblock.instance_uuid[index];
                 index += 1;
             }
-            let mut key = [0u8; crate::hkdf::SUBKEY_BYTES];
+            let mut key = [0u8; 32];
             crate::encrypted_metadata::derive_metadata_key_for_volume(
+                &ikm,
+                &superblock.instance_uuid,
+                &mut key,
+            )
+            .map_err(|_| HxfsError::EncryptedPolicyInvalid)?;
+            for byte in ikm.iter_mut() {
+                *byte = 0;
+            }
+            Some(key)
+        } else {
+            None
+        };
+        // Stage B.3 wire: derive the per-volume extent subkey
+        // from the same placeholder IKM. Independent info
+        // string from the metadata subkey.
+        #[cfg(feature = "crypto-aes-gcm")]
+        let extent_key = if encryption.is_some() {
+            let mut ikm = [0u8; 32];
+            let mut index = 0usize;
+            while index < 16 {
+                ikm[index] = superblock.instance_uuid[index];
+                ikm[index + 16] = superblock.instance_uuid[index];
+                index += 1;
+            }
+            let mut key = [0u8; 32];
+            crate::extent_crypto::derive_extent_key_for_volume(
                 &ikm,
                 &superblock.instance_uuid,
                 &mut key,
@@ -177,6 +209,8 @@ impl<
             encryption,
             #[cfg(feature = "crypto-aes-gcm")]
             metadata_key,
+            #[cfg(feature = "crypto-aes-gcm")]
+            extent_key,
             #[cfg(feature = "crypto-aes-gcm")]
             volume_uuid: superblock.instance_uuid,
             objects: [const { None }; MAX_OBJECTS],
@@ -1305,8 +1339,45 @@ impl<
     fn write_data_blocks(&mut self, data: &[u8]) -> FixedResult<u64> {
         let start = self.next_lba;
         self.quota_admits(BLOCK_SIZE_U64, 0)?;
-        let mut block = [0u8; BLOCK_SIZE];
-        block[..data.len()].copy_from_slice(data);
+        // Stage B.3 wire: when the volume is encrypted,
+        // the on-disk extent block is the AES-256-GCM
+        // envelope around the plaintext. We build the
+        // envelope with the per-volume extent subkey
+        // (derived once at mount time) so the read path's
+        // decrypt step lands on a block with the matching
+        // key. Plain volumes write the plaintext directly,
+        // byte-for-byte compatible with the pre-B.3 layout.
+        #[cfg(feature = "crypto-aes-gcm")]
+        let block = if let Some(key) = self.extent_key.as_ref() {
+            let mut ciphertext = [0u8; crate::extent_crypto::EXTENT_ENCRYPTED_BYTES];
+            crate::extent_crypto::encrypt_extent_block(
+                key,
+                start,
+                &self.volume_uuid,
+                data,
+                &mut ciphertext,
+            )
+            .map_err(|_| HxfsError::BadBlock)?;
+            // Pad the ciphertext to a full 4 KiB block so
+            // the on-disk extent block keeps the same
+            // shape it had before B.3 (a single 4 KiB
+            // read). The high bytes after the GCM envelope
+            // are zeros; they are not authenticated but
+            // the read path ignores them.
+            let mut block = [0u8; BLOCK_SIZE];
+            block[..ciphertext.len()].copy_from_slice(&ciphertext);
+            block
+        } else {
+            let mut block = [0u8; BLOCK_SIZE];
+            block[..data.len()].copy_from_slice(data);
+            block
+        };
+        #[cfg(not(feature = "crypto-aes-gcm"))]
+        let block = {
+            let mut block = [0u8; BLOCK_SIZE];
+            block[..data.len()].copy_from_slice(data);
+            block
+        };
         self.store.write_blocks(start, 1, &block)?;
         self.next_lba = self.next_lba.checked_add(1).ok_or(HxfsError::NoSpace)?;
         Ok(start)
