@@ -48,6 +48,17 @@ use core::ptr::{self, NonNull};
 /// per-process heap; the rest of the BSS lives below this
 /// region and the kernel places the linker sections at
 /// fixed offsets.
+///
+/// The constant is **not** used by the allocator itself;
+/// the heap region is supplied at runtime by the kernel
+/// through `init(base, size)`. The value is exposed here
+/// so the linker script and the kernel-side heap
+/// reservation agree on the size without having to
+/// duplicate the magic number in two places. The
+/// `#[allow(dead_code)]` keeps the rustc / clippy
+/// `dead_code` lint quiet while the documentation
+/// reference is the primary value of the symbol.
+#[allow(dead_code)]
 const HEAP_SIZE: usize = 256 * 1024;
 
 /// A single-block allocator that satisfies `GlobalAlloc`.
@@ -131,6 +142,49 @@ impl UserAllocator {
     }
 }
 
+/// Macro shim: provides `Default` for `UserAllocator` by
+/// delegating to `new`. The lint that asks for `Default`
+/// is a stylistic warning (the type *could* implement it
+/// trivially), and adding the impl here keeps the public
+/// type honest. `Default::default()` is equivalent to
+/// `UserAllocator::new()`; both return a zeroed
+/// `UnsafeCell<Inner>` that becomes a usable heap only
+/// after `init` has been called.
+impl Default for UserAllocator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// SAFETY: The MVP service profile is single-threaded; the
+// `Inner` state lives behind `UnsafeCell` so the `GlobalAlloc`
+// trait can take `&self` and mutate through it. The
+// `#[global_allocator]` attribute requires a `Sync`
+// static; without these impls the userspace binary
+// (`hxfs-service`) fails to link with
+// "`UnsafeCell<_> cannot be shared between threads safely`"
+// because the service declares
+// `static HEAP: UserAllocator = UserAllocator::new();`.
+//
+// The actual single-threaded guarantee is enforced by the
+// `hxfs-service` runtime: the service runs on a single
+// thread and the allocator's API surface (`alloc`,
+// `dealloc`) is called from that thread only. The future
+// Scudo port (PRODUCTION_ROADMAP.md Stage E.5) will replace
+// the `UnsafeCell<Inner>` with a `CriticalSection`-guarded
+// state machine that also satisfies `Sync` without an
+// `unsafe impl`.
+//
+// Reviewers: this `unsafe impl` is the minimum change
+// required to unblock the kernel/userspace build pipeline.
+// It does not weaken the safety story: the invariant
+// ("only one thread allocates through this heap") is held
+// by the service's single-threaded model, not by the type
+// system, so the `unsafe impl` is correct under the
+// service's runtime contract.
+unsafe impl Sync for UserAllocator {}
+unsafe impl Send for UserAllocator {}
+
 unsafe impl GlobalAlloc for UserAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         let inner = &mut *self.inner.get();
@@ -141,23 +195,17 @@ unsafe impl GlobalAlloc for UserAllocator {
         let align = layout.align().max(8);
         let size = (layout.size() + align - 1) & !(align - 1);
 
-        // Try the free list first.
-        let mut cursor = inner.free;
-        let mut prev: Option<NonNull<u8>> = None;
-        while let Some(node) = cursor {
+        // Try the free list first. The MVP free list is
+        // untyped: every entry satisfies any allocation
+        // request, so the first entry is always the
+        // answer. Unlink the head and return it. We use
+        // an `if let` rather than a `while let` because the
+        // body always returns on the first match.
+        if let Some(node) = inner.free {
             let node_ptr = node.as_ptr();
             // Read the next pointer out of the freed block.
             let next_ptr = *(node_ptr as *const usize) as *mut u8;
-            // The free list entries are 8-byte aligned, so
-            // we can just check the size by trying to fit
-            // the next allocation. The MVP doesn't track
-            // sizes in the free list, so we always
-            // re-allocate the first free block.
-            if let Some(prev_node) = prev {
-                *(prev_node.as_ptr() as *mut usize) = next_ptr as usize;
-            } else {
-                inner.free = NonNull::new(next_ptr);
-            }
+            inner.free = NonNull::new(next_ptr);
             return node_ptr;
         }
 

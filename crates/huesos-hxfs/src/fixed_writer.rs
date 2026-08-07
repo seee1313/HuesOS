@@ -130,6 +130,18 @@ impl<
         Self::mount_with_keys(store, encryption_policies)
     }
 
+    /// Mount a clean v5 Hxfs volume into fixed-capacity
+    /// mutable state, resolving the system volume's
+    /// encryption policy from `encryption_policies`. See
+    /// [`Hxfs::mount_with_keys`] for the semantics of the
+    /// table and the variants returned for an
+    /// encrypted-but-unresolvable volume; the writer
+    /// mirrors the reader's contract so a plain mount in
+    /// either code path is interchangeable. The fixed
+    /// capacity templates (`MAX_OBJECTS`, `MAX_DIR_ENTRIES`,
+    /// `MAX_EXTENTS`) bound the on-memory metadata
+    /// footprint and are tuned for the hxfs-service
+    /// production mount path.
     pub fn mount_with_keys(
         mut store: S,
         encryption_policies: &[crate::crypto::EncryptionPolicy],
@@ -1510,7 +1522,7 @@ impl<
             index += 1;
         }
         let args = self.encryption_args();
-        Ok(make_metadata_block_for_volume(
+        make_metadata_block_for_volume(
             BLOCK_TYPE_DIRECTORY,
             object_id,
             lba,
@@ -1518,7 +1530,7 @@ impl<
             args.0,
             args.1,
             args.2,
-        )?)
+        )
     }
 
     /// Convenience: pack the (volume_encrypted, metadata_key,
@@ -1569,7 +1581,6 @@ impl<
     /// without the `crypto-aes-gcm` feature both halves are
     /// `None`/default; the wrapper falls through to the plain
     /// v5 builder.
-
     fn build_extent_block(&self, object_id: u64, lba: u64) -> FixedResult<[u8; BLOCK_SIZE]> {
         let mut payload = [0u8; BLOCK_SIZE - HEADER_BYTES];
         let count = self.extent_count(object_id);
@@ -1598,7 +1609,7 @@ impl<
             index += 1;
         }
         let args = self.encryption_args();
-        Ok(make_metadata_block_for_volume(
+        make_metadata_block_for_volume(
             BLOCK_TYPE_EXTENT_TABLE,
             object_id,
             lba,
@@ -1606,7 +1617,7 @@ impl<
             args.0,
             args.1,
             args.2,
-        )?)
+        )
     }
 
     fn build_object_table_block(
@@ -1685,7 +1696,7 @@ impl<
             index += 1;
         }
         let args = self.encryption_args();
-        Ok(make_metadata_block_for_volume(
+        make_metadata_block_for_volume(
             BLOCK_TYPE_ALLOCATION_TREE,
             self.system_volume.root_object_id,
             lba,
@@ -1693,7 +1704,7 @@ impl<
             args.0,
             args.1,
             args.2,
-        )?)
+        )
     }
 
     fn build_refcount_tree_block(&self, lba: u64) -> FixedResult<[u8; BLOCK_SIZE]> {
@@ -1732,7 +1743,7 @@ impl<
             index += 1;
         }
         let args = self.encryption_args();
-        Ok(make_metadata_block_for_volume(
+        make_metadata_block_for_volume(
             BLOCK_TYPE_REFCOUNT_TREE,
             self.system_volume.root_object_id,
             lba,
@@ -1740,7 +1751,7 @@ impl<
             args.0,
             args.1,
             args.2,
-        )?)
+        )
     }
 
     fn build_backref_tree_block(&self, lba: u64, generation: u64) -> FixedResult<[u8; BLOCK_SIZE]> {
@@ -1785,7 +1796,7 @@ impl<
             index += 1;
         }
         let args = self.encryption_args();
-        Ok(make_metadata_block_for_volume(
+        make_metadata_block_for_volume(
             BLOCK_TYPE_BACKREF_TREE,
             self.system_volume.root_object_id,
             lba,
@@ -1793,7 +1804,7 @@ impl<
             args.0,
             args.1,
             args.2,
-        )?)
+        )
     }
 
     fn build_quota_tree_block(
@@ -1839,7 +1850,7 @@ impl<
             index += 1;
         }
         let args = self.encryption_args();
-        Ok(make_metadata_block_for_volume(
+        make_metadata_block_for_volume(
             BLOCK_TYPE_QUOTA_TREE,
             self.system_volume.root_object_id,
             lba,
@@ -1847,7 +1858,7 @@ impl<
             args.0,
             args.1,
             args.2,
-        )?)
+        )
     }
 
     fn build_volume_table_block(
@@ -2102,7 +2113,7 @@ fn make_metadata_block_for_volume(
     lba: u64,
     payload: &[u8],
     volume_encrypted: bool,
-    metadata_key: Option<&[u8; crate::hkdf::SUBKEY_BYTES]>,
+    metadata_key: Option<&[u8; 32]>,
     volume_uuid: &crate::format::Uuid,
 ) -> FixedResult<[u8; BLOCK_SIZE]> {
     if volume_encrypted && is_encrypted_block_type(block_type) {
@@ -2144,6 +2155,7 @@ fn make_metadata_block_for_volume(
 /// volume table, and object table stay plaintext because they
 /// are needed to bootstrap the encryption key (see
 /// `docs/STAGE_B_PLAN.md` B.1).
+#[cfg(feature = "crypto-aes-gcm")]
 fn is_encrypted_block_type(block_type: u32) -> bool {
     matches!(
         block_type,

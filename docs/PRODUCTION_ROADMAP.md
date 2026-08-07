@@ -200,7 +200,7 @@ contain a recognisable filename.
 encryption survives a remount; a single-byte corruption in the
 on-disk extent is rejected with the precise error.
 
-### Track B.4 — Direct I/O bypass semantics
+### Track B.4 — Direct I/O bypass semantics  (landed as PR `hxfs-stage-b4-odirect-deny`)
 
 - A `O_DIRECT` open flag on a userspace VMO bypasses the page
   cache; the kernel returns a buffer that is read/written
@@ -211,6 +211,23 @@ on-disk extent is rejected with the precise error.
 **Exit criterion.** `O_DIRECT` returns `Unsupported`; the
 non-direct path works; the documentation explains when
 `O_DIRECT` will be supported.
+
+**Implementation (commit 4).** The `huesos_abi::hxfs` request
+flag set gains a `request_flags::O_DIRECT = 0x4000` constant
+matching the Linux `O_DIRECT` bit value, so an unmodified
+Linux client can pass the flag through without a translation
+layer. The `huesos-hxfs-service` open / create paths check
+`request.flags & request_flags::O_DIRECT` and reply with
+`HxfsStatus::Unsupported` when the bit is set. The text
+protocol used by the `qemu-nvme-soak` debug harness gets an
+equivalent deny at `OPEN_FILE O_DIRECT ...` that returns
+`err:hxfs-unsupported`. The bit-detection helper lives in
+`huesos_hxfs::o_direct::has_o_direct` so the policy is
+testable from the host-test suite without booting the
+service; three host tests pin the bit value, the set-bit
+detection, and the unset-bit rejection. The kernel-side VFS
+is unchanged: `O_DIRECT` is denied in userspace before it
+ever reaches the kernel.
 
 ---
 

@@ -5,8 +5,8 @@
 
 use core::panic::PanicInfo;
 use huesos_abi::hxfs::{
-    response_flags, rights as hxfs_rights, HxfsHandleKind, HxfsOp, HxfsRequest, HxfsResponse,
-    HxfsStatus, HXFS_MAX_INLINE_WRITE_BYTES, HXFS_REQUEST_BYTES, HXFS_RESPONSE_BYTES,
+    request_flags, response_flags, rights as hxfs_rights, HxfsHandleKind, HxfsOp, HxfsRequest,
+    HxfsResponse, HxfsStatus, HXFS_MAX_INLINE_WRITE_BYTES, HXFS_REQUEST_BYTES, HXFS_RESPONSE_BYTES,
 };
 use huesos_hxfs::fixed_writer::FixedHxfsWriter;
 use huesos_hxfs::format::{DirectoryHandle, FileHandle};
@@ -242,6 +242,17 @@ impl HxfsRuntime {
             self.return_dir(index, self.fs.root_directory());
             return;
         }
+        if strip_prefix(request, b"OPEN_FILE O_DIRECT ").is_some() {
+            // Stage B.4: text-protocol equivalent of the
+            // native `request_flags::O_DIRECT` deny. The
+            // text protocol is a debug-only path used by the
+            // qemu-nvme-soak harness; an O_DIRECT request
+            // here gets the same `err:hxfs-unsupported`
+            // reply as the native path so the harness can
+            // assert on the deny end-to-end.
+            self.write_client(index, b"err:hxfs-unsupported");
+            return;
+        }
         if let Some(path) = strip_prefix(request, b"OPEN_FILE ") {
             self.open_file_path(index, path);
             return;
@@ -279,6 +290,18 @@ impl HxfsRuntime {
     }
 
     fn client_open_native(&mut self, index: usize, request: HxfsRequest, payload: &[u8]) {
+        // Stage B.4: deny O_DIRECT. The page cache is not
+        // yet production-grade, the kernel-side direct-IO
+        // alignment path is not in place, and the ROADMAP
+        // exit criterion is "O_DIRECT returns Unsupported".
+        // We reject the request up-front rather than
+        // silently falling back to a cached read/write so
+        // a Linux client that expects the flag to be
+        // honoured gets an honest error.
+        if request.flags & request_flags::O_DIRECT != 0 {
+            self.write_client_status(index, request, HxfsStatus::Unsupported);
+            return;
+        }
         let Ok(path) = core::str::from_utf8(payload) else {
             self.write_client_status(index, request, HxfsStatus::Invalid);
             return;
@@ -308,6 +331,15 @@ impl HxfsRuntime {
     }
 
     fn client_create_file_native(&mut self, index: usize, request: HxfsRequest, payload: &[u8]) {
+        // Stage B.4: deny O_DIRECT on create as well. The
+        // page cache is the only path for reading the new
+        // file's data, so an O_DIRECT create would hand the
+        // caller back a handle that the kernel cannot
+        // service.
+        if request.flags & request_flags::O_DIRECT != 0 {
+            self.write_client_status(index, request, HxfsStatus::Unsupported);
+            return;
+        }
         let Ok(path) = core::str::from_utf8(payload) else {
             self.write_client_status(index, request, HxfsStatus::Invalid);
             return;

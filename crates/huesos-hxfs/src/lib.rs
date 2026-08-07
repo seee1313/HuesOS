@@ -34,6 +34,7 @@ pub mod hkdf;
 pub mod hxblob;
 pub mod hxblob_tree;
 pub mod io_policy;
+pub mod o_direct;
 pub mod observability;
 pub mod page_cache;
 pub mod quota;
@@ -648,15 +649,13 @@ impl<R: BlockReader> Hxfs<R> {
         while index < count {
             let offset = header.header_bytes as usize + 16 + index as usize * DIR_RECORD_BYTES;
             let entry = self.parse_dirent_in_block(&block, offset, dir.object_id, &mut scratch)?;
-            if has_previous {
-                if &previous_name[..previous_len] >= entry.name.as_bytes() {
-                    return Err(HxfsError::BadTree);
-                }
+            if has_previous && &previous_name[..previous_len] >= entry.name.as_bytes() {
+                return Err(HxfsError::BadTree);
             }
             if entry.name.as_bytes() == name {
                 return Ok(entry.object_id);
             }
-            previous_len = entry.name.as_bytes().len();
+            previous_len = entry.name.len();
             previous_name[..previous_len].copy_from_slice(entry.name.as_bytes());
             has_previous = true;
             index += 1;
@@ -696,13 +695,11 @@ impl<R: BlockReader> Hxfs<R> {
         while index < count {
             let offset = header.header_bytes as usize + 16 + index as usize * DIR_RECORD_BYTES;
             let entry = self.parse_dirent_in_block(&block, offset, dir.object_id, &mut scratch)?;
-            if has_previous {
-                if &previous_name[..previous_len] >= entry.name.as_bytes() {
-                    return Err(HxfsError::BadTree);
-                }
+            if has_previous && &previous_name[..previous_len] >= entry.name.as_bytes() {
+                return Err(HxfsError::BadTree);
             }
             visit(entry);
-            previous_len = entry.name.as_bytes().len();
+            previous_len = entry.name.len();
             previous_name[..previous_len].copy_from_slice(entry.name.as_bytes());
             has_previous = true;
             index += 1;
@@ -794,15 +791,21 @@ impl<R: BlockReader> Hxfs<R> {
             } else {
                 None
             };
-            #[cfg(not(feature = "crypto-aes-gcm"))]
-            let extent_key: Option<&[u8; 32]> = None;
+            // On a build without the `crypto-aes-gcm`
+            // feature, the call to `copy_extent_with_keys`
+            // takes 6 arguments (no subkey, no volume UUID);
+            // the plain v5 read path is taken and the
+            // cfg-conditional arguments are simply absent
+            // from the call site.
             copy_extent_with_keys(
                 &mut self.reader,
                 extent,
                 compression,
                 &mut self.page_cache,
                 0,
+                #[cfg(feature = "crypto-aes-gcm")]
                 extent_key,
+                #[cfg(feature = "crypto-aes-gcm")]
                 &self.superblock.instance_uuid,
                 out,
             )?;
@@ -1151,49 +1154,24 @@ pub(crate) fn parse_extent_record(block: &[u8], offset: usize) -> Result<ExtentR
     Ok(record)
 }
 
-fn copy_extent<R: BlockReader>(
-    reader: &mut R,
-    extent: ExtentRecord,
-    compression: Option<compression::CompressionPolicy>,
-    page_cache: &mut page_cache::PageCache,
-    volume_id: u64,
-    out: &mut [u8],
-) -> Result<(), HxfsError> {
-    // Stage B.3 wire: keep the original `copy_extent` signature
-    // available for callers that do not need to thread an
-    // extent subkey through (host tests, the no-encryption
-    // build). The implementation is the same as
-    // `copy_extent_with_keys` with no key and an empty
-    // volume UUID; the `crypto-aes-gcm` match arm inside
-    // `copy_extent_with_keys` skips the decrypt step when
-    // `extent_key` is `None`.
-    copy_extent_with_keys(
-        reader,
-        extent,
-        compression,
-        page_cache,
-        volume_id,
-        None,
-        &[],
-        out,
-    )
-}
-
-/// Stage B.3 wire: same as `copy_extent` but with an
-/// optional per-volume extent subkey and a volume UUID for
-/// the AEAD nonce / AAD. When `extent_key` is `Some`, each
-/// on-disk 4 KiB block is decrypted with AES-256-GCM
-/// **before** decompression; the page cache still holds the
+/// Stage B.3 wire: read a 4 KiB data extent into `out`.
+/// The function takes an optional per-volume extent subkey
+/// and the volume's `instance_uuid` for the AEAD nonce /
+/// AAD. When `extent_key` is `Some`, each on-disk 4 KiB
+/// block is decrypted with AES-256-GCM **before**
+/// decompression; the page cache still holds the
 /// *plaintext* (decompressed) so subsequent reads skip both
 /// the AEAD work and the codec. A bad GCM tag surfaces as
 /// `HxfsError::Compression` at the read boundary (matching
 /// the existing compression-error reporting so the higher
 /// layer can mark the extent bad).
 ///
-/// `volume_uuid` must be exactly 16 bytes; the function
-/// assumes `crypto-aes-gcm` decrypt can fail with `BadTag`
-/// when the on-disk block was tampered with or the wrong key
-/// was used.
+/// `volume_uuid` is consumed as a `&[u8]` so callers can
+/// pass `&self.superblock.instance_uuid` without first
+/// copying into a `[u8; 16]`; the function truncates to
+/// the first 16 bytes (the AEAD only mixes the first 8
+/// bytes into the nonce and the full 16 into the AAD, so
+/// anything past byte 15 is ignored).
 #[allow(clippy::too_many_arguments)]
 fn copy_extent_with_keys<R: BlockReader>(
     reader: &mut R,
@@ -1201,8 +1179,8 @@ fn copy_extent_with_keys<R: BlockReader>(
     compression: Option<compression::CompressionPolicy>,
     page_cache: &mut page_cache::PageCache,
     volume_id: u64,
-    extent_key: Option<&[u8; 32]>,
-    volume_uuid: &[u8],
+    #[cfg(feature = "crypto-aes-gcm")] extent_key: Option<&[u8; 32]>,
+    #[cfg(feature = "crypto-aes-gcm")] volume_uuid: &[u8],
     out: &mut [u8],
 ) -> Result<(), HxfsError> {
     // Reinterpret the 16-byte volume UUID slice as a
@@ -1238,9 +1216,13 @@ fn copy_extent_with_keys<R: BlockReader>(
     // compressed bytes. Only used when both encryption and
     // compression are present; for either single layer
     // (or none) we read straight into `scratch` and let the
-    // existing compression path handle the data.
-    let mut decompressed = [0u8; BLOCK_SIZE];
+    // existing compression path handle the data. The
+    // buffer is `let mut` because the AEAD decrypt API
+    // takes `&mut [u8]` for the output and we re-bind the
+    // binding on each call.
+    #[cfg(feature = "crypto-aes-gcm")]
     let mut compressed_after_decrypt = [0u8; BLOCK_SIZE];
+    let mut decompressed = [0u8; BLOCK_SIZE];
     let mut copied = start;
     while copied < copy_end {
         let logical_delta = copied - start;
