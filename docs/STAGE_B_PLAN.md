@@ -89,12 +89,16 @@ Four tracks, five commits, one PR.
   Different info string from metadata key to maintain cryptographic
   separation.
 
-### B.4 — O_DIRECT deny
-- **Where**: userspace syscall handler that opens Hxfs files (likely
-  in the userspace syscall dispatcher). Returns `Unsupported` /
-  equivalent when the O_DIRECT bit is set.
+### B.4 — O_DIRECT deny  (landed as PR `hxfs-stage-b4-odirect-deny`)
+- **Where**: userspace syscall handler that opens Hxfs files
+  (the `huesos-hxfs-service` `client_open_native` and
+  `client_create_file_native` paths). Returns
+  `HxfsStatus::Unsupported` when the O_DIRECT bit is set
+  on `request.flags`.
 - **No kernel changes**. Document the deny in
   `docs/PRODUCTION_ROADMAP.md` and in the syscall handler.
+  The kernel-side VFS is unchanged: the deny happens in
+  userspace before the request ever reaches the kernel.
 
 ## Commit breakdown
 

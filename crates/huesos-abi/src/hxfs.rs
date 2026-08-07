@@ -196,6 +196,20 @@ pub mod request_flags {
     pub const INLINE_PAYLOAD: u32 = 1 << 2;
     /// Do not follow the final path component if it is a symlink.
     pub const NOFOLLOW_FINAL_SYMLINK: u32 = 1 << 3;
+    /// Stage B.4: caller requests the O_DIRECT bypass of the
+    /// page cache. The MVP denies the flag: the page cache
+    /// is not yet production-grade and the kernel-side
+    /// direct-IO alignment path is not in place, so the
+    /// request is rejected with [`HxfsStatus::Unsupported`]
+    /// rather than silently falling back to a cached
+    /// read/write. The bit value matches the Linux
+    /// `O_DIRECT` bit (0x4000) so an unmodified Linux
+    /// client can pass the flag through without a
+    /// translation layer.
+    ///
+    /// See `docs/PRODUCTION_ROADMAP.md` Stage B.4 for the
+    /// exit criterion.
+    pub const O_DIRECT: u32 = 0x4000;
 }
 
 /// Response flags.

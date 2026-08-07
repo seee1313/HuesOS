@@ -34,6 +34,7 @@ pub mod hkdf;
 pub mod hxblob;
 pub mod hxblob_tree;
 pub mod io_policy;
+pub mod o_direct;
 pub mod observability;
 pub mod page_cache;
 pub mod quota;
