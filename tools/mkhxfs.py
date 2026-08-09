@@ -66,6 +66,8 @@ def run_seed_tool(args: argparse.Namespace) -> int:
     ]
     if args.inject_bad_gcm_tag:
         command.append("--inject-bad-gcm-tag")
+    if args.inject_bad_crc:
+        command.append("--inject-bad-crc")
     env = dict(os.environ)
     env.setdefault("PATH", os.defpath)
     result = subprocess.run(command, cwd=root, env=env, check=False)
@@ -104,6 +106,11 @@ def main() -> int:
         "--inject-bad-gcm-tag",
         action="store_true",
         help="Seed mode: flip one bit in the seed file's first encrypted extent",
+    )
+    parser.add_argument(
+        "--inject-bad-crc",
+        action="store_true",
+        help="Seed mode (plain volume): flip one byte of the seed file's first compressed payload",
     )
     args = parser.parse_args()
     if args.seed_file is not None:
