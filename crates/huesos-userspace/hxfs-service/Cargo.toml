@@ -13,6 +13,18 @@ huesos-abi = { path = "../../huesos-abi" }
 huesos-hxfs = { path = "../../huesos-hxfs" }
 huesos-user-alloc = { path = "../../huesos-user-alloc" }
 
+[features]
+# Stage B.5 test wiring (never enabled in a production build):
+# mounts encrypted+compressed volumes with the synthetic key
+# context and runs the boot self-check that the qemu-nvme soak
+# asserts on. The Stage D TPM-backed KeyProvider replaces this
+# whole path. Enabled by the soak harness via
+# HUESOS_HXFS_SERVICE_FEATURES (see huesos-kernel/build.rs).
+synthetic-key = [
+    "huesos-hxfs/crypto-aes-gcm",
+    "huesos-hxfs/compression-engines",
+]
+
 [profile.release]
 opt-level = 2
 panic = "abort"

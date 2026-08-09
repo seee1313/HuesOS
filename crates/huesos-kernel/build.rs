@@ -20,11 +20,42 @@ fn main() {
 
     track_userspace_inputs(&userspace_root);
 
+    // Stage B.5: the soak harness builds the ISO with
+    // HUESOS_HXFS_SERVICE_FEATURES=synthetic-key so the embedded
+    // hxfs-service can mount the encrypted+compressed soak volume
+    // and run its boot self-check. Production builds leave the
+    // variable unset and the test wiring stays out of the binary.
+    //
+    // The synthetic-key build pulls the RustCrypto AES-GCM stack
+    // into the no-SIMD userspace target. The `aes` and `polyval`
+    // crates compile their x86 fast paths (AES-NI / CLMUL) for any
+    // x86_64 target regardless of the target's SIMD features, and
+    // the userspace target deliberately disables SSE2 (kernel
+    // context switch does not save XMM state), so the fast paths
+    // crash LLVM codegen. Both crates ship the official soft
+    // escape hatch (`aes_force_soft` / `polyval_force_soft`); the
+    // flags are injected only for this build invocation and only
+    // when test features are requested.
+    let hxfs_service_features = env::var("HUESOS_HXFS_SERVICE_FEATURES").unwrap_or_default();
+    println!("cargo:rerun-if-env-changed=HUESOS_HXFS_SERVICE_FEATURES");
+    let mut hxfs_args: Vec<String> = Vec::new();
+    let mut hxfs_env: Vec<(&str, &OsStr)> = Vec::new();
+    if !hxfs_service_features.is_empty() {
+        hxfs_args.push("--features".to_string());
+        hxfs_args.push(hxfs_service_features);
+        hxfs_env.push((
+            "RUSTFLAGS",
+            OsStr::new("--cfg aes_force_soft --cfg polyval_force_soft"),
+        ));
+    }
+    let hxfs_args_refs: Vec<&str> = hxfs_args.iter().map(String::as_str).collect();
+
     let input_driver_host = build_userspace_program(
         &userspace_root,
         "driver-host-input",
         "huesos-driver-host-input",
         profile,
+        &[],
         &[],
     );
     let nvme_driver_host = build_userspace_program(
@@ -33,13 +64,15 @@ fn main() {
         "huesos-driver-host-nvme",
         profile,
         &[],
+        &[],
     );
     let hxfs_service = build_userspace_program(
         &userspace_root,
         "hxfs-service",
         "huesos-hxfs-service",
         profile,
-        &[],
+        &hxfs_env,
+        &hxfs_args_refs,
     );
     let driver_manager = build_userspace_program(
         &userspace_root,
@@ -50,12 +83,14 @@ fn main() {
             "HUESOS_INPUT_DRIVER_HOST_PATH",
             input_driver_host.as_os_str(),
         )],
+        &[],
     );
     let acpi_manager = build_userspace_program(
         &userspace_root,
         "acpi-manager",
         "huesos-acpi-manager",
         profile,
+        &[],
         &[],
     );
     let shutdown_broker = build_userspace_program(
@@ -64,15 +99,23 @@ fn main() {
         "huesos-shutdown-broker",
         profile,
         &[],
+        &[],
     );
-    let doom = build_userspace_program(&userspace_root, "doom", "huesos-doom", profile, &[]);
-    let terminal =
-        build_userspace_program(&userspace_root, "terminal", "huesos-terminal", profile, &[]);
+    let doom = build_userspace_program(&userspace_root, "doom", "huesos-doom", profile, &[], &[]);
+    let terminal = build_userspace_program(
+        &userspace_root,
+        "terminal",
+        "huesos-terminal",
+        profile,
+        &[],
+        &[],
+    );
     let fault_probe = build_userspace_program(
         &userspace_root,
         "fault-probe",
         "huesos-fault-probe",
         profile,
+        &[],
         &[],
     );
     let _bootfs = build_bootfs_image(
@@ -99,6 +142,7 @@ fn main() {
             ("HUESOS_ACPI_MANAGER_PATH", acpi_manager.as_os_str()),
             ("HUESOS_SHUTDOWN_BROKER_PATH", shutdown_broker.as_os_str()),
         ],
+        &[],
     );
 
     println!("cargo:rustc-env=HUESOS_INIT_PATH={}", init.display());
@@ -143,6 +187,7 @@ fn build_userspace_program(
     bin_name: &str,
     profile: &str,
     extra_env: &[(&str, &OsStr)],
+    extra_args: &[&str],
 ) -> PathBuf {
     let program_dir = userspace_root.join(dir_name);
     let mut command = Command::new(env::var("CARGO").unwrap_or_else(|_| "cargo".into()));
@@ -151,6 +196,7 @@ fn build_userspace_program(
         .env_remove("RUSTFLAGS")
         .env_remove("CARGO_ENCODED_RUSTFLAGS")
         .args(["build", "--release"]);
+    command.args(extra_args);
     for &(key, value) in extra_env {
         command.env(key, value);
     }

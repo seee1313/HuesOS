@@ -242,7 +242,7 @@ impl HxfsRuntime {
             self.return_dir(index, self.fs.root_directory());
             return;
         }
-        if strip_prefix(request, b"OPEN_FILE O_DIRECT ").is_some() {
+        if is_odirect_deny(request) {
             // Stage B.4: text-protocol equivalent of the
             // native `request_flags::O_DIRECT` deny. The
             // text protocol is a debug-only path used by the
@@ -1260,8 +1260,23 @@ fn mount_from_bootstrap(bootstrap: &Channel) -> Option<MountedHxfs> {
                 // empty tables and accepts only plain volumes;
                 // a future revision (Track D.2, TPM-backed key
                 // provider) will read the tables from the
-                // volume descriptor and pass them here.
-                match FixedHxfsWriter::mount_with_policies(reader, &[], &[]) {
+                // volume descriptor and pass them here. The
+                // synthetic-key (Stage B.5) build passes the
+                // matching test-only policy tables so the soak
+                // image mounts and the self-check can read it.
+                let mounted = {
+                    #[cfg(feature = "synthetic-key")]
+                    {
+                        let enc = [huesos_hxfs::synthetic_key::encryption_policy()];
+                        let comp = [huesos_hxfs::synthetic_key::compression_policy()];
+                        FixedHxfsWriter::mount_with_policies(reader, &enc, &comp)
+                    }
+                    #[cfg(not(feature = "synthetic-key"))]
+                    {
+                        FixedHxfsWriter::mount_with_policies(reader, &[], &[])
+                    }
+                };
+                match mounted {
                     Ok(fs) => return Some(fs),
                     Err(error) => {
                         println!("[hxfs] mount failed: {:?}", error);
@@ -1285,6 +1300,15 @@ fn strip_prefix<'a>(bytes: &'a [u8], prefix: &[u8]) -> Option<&'a [u8]> {
     } else {
         None
     }
+}
+
+/// Stage B.4 + B.5: text-protocol O_DIRECT deny predicate.
+///
+/// `handle_client_request` replies `err:hxfs-unsupported` when it
+/// matches; the boot self-check drives the same predicate so the
+/// soak can assert the deny on target without a client channel.
+fn is_odirect_deny(request: &[u8]) -> bool {
+    strip_prefix(request, b"OPEN_FILE O_DIRECT ").is_some()
 }
 
 fn decode_native_message(bytes: &[u8]) -> Option<(HxfsRequest, &[u8])> {
@@ -1434,11 +1458,61 @@ pub extern "C" fn _start() -> ! {
         println!("[hxfs] service exiting: mount failed");
         libcanvas::process::exit(-1);
     };
+    // Stage B.5: boot self-check (synthetic-key build only). It
+    // drives the O_DIRECT deny probe and reads the seeded file;
+    // a corrupted encrypted extent is detected and reported as
+    // `bad-gcm-tag-marked` while the service keeps serving.
+    #[cfg(feature = "synthetic-key")]
+    let mut fs = fs;
+    #[cfg(feature = "synthetic-key")]
+    run_boot_self_check(&mut fs);
     let _ = bootstrap.write(b"service:hxfs:ready");
     let mut runtime = HxfsRuntime::new(fs);
     loop {
         runtime.poll(&bootstrap);
         libcanvas::process::yield_now();
+    }
+}
+
+/// Stage B.5 boot self-check (synthetic-key test wiring only).
+///
+/// 1. O_DIRECT text-protocol deny predicate:
+///    prints `[hxfs] odirect-deny-ok`.
+/// 2. A read of the seeded file through the normal mount API: a
+///    clean volume prints `[hxfs] self-check ok (N bytes)`; a
+///    volume whose encrypted extent was corrupted
+///    (`--inject-bad-gcm-tag`) prints
+///    `[hxfs] bad-gcm-tag-marked` and the service continues
+///    serving.
+///
+/// The AEAD IKM is the documented developer placeholder derived
+/// from the volume's instance UUID (see `Hxfs::mount_with_keys`);
+/// the Stage D TPM-backed KeyProvider replaces this entire path.
+/// The seeded file is 3584 bytes (one extent), within the
+/// service's fixed-capacity read API.
+#[cfg(feature = "synthetic-key")]
+fn run_boot_self_check(fs: &mut MountedHxfs) {
+    if is_odirect_deny(b"OPEN_FILE O_DIRECT seed.bin") {
+        println!("[hxfs] odirect-deny-ok");
+    }
+    let root = fs.root_directory();
+    match fs.open_child_file(root, huesos_hxfs::synthetic_key::SEED_FILE_NAME) {
+        Ok(file) => {
+            let mut buf = [0u8; 4096];
+            match fs.read_file(file, &mut buf) {
+                Ok(n) => println!("[hxfs] self-check ok ({} bytes)", n),
+                Err(HxfsError::Compression) => {
+                    // The seeded extent's GCM tag (or descriptor
+                    // CRC) did not verify: the corruption was
+                    // detected and the service keeps serving.
+                    // The soak asserts this marker with
+                    // --inject-bad-gcm-tag.
+                    println!("[hxfs] bad-gcm-tag-marked");
+                }
+                Err(error) => println!("[hxfs] self-check failed: {:?}", error),
+            }
+        }
+        Err(error) => println!("[hxfs] self-check: seed file absent ({:?})", error),
     }
 }
 
