@@ -18,6 +18,12 @@ use x86_64::{PhysAddr, VirtAddr};
 const USER_STACK_TOP: u64 = huesos_abi::USER_STACK_TOP;
 /// Size of the initial user stack.
 const USER_STACK_SIZE: u64 = huesos_abi::USER_STACK_SIZE;
+/// Base of the userspace heap region (Stage A.6: the kernel
+/// reserves the region so a process with a global allocator can
+/// allocate from boot; the hxfs-service heap lives here).
+const USER_HEAP_BASE: u64 = huesos_abi::USER_HEAP_BASE;
+/// Size of the userspace heap region.
+const USER_HEAP_SIZE: u64 = huesos_abi::USER_HEAP_SIZE;
 
 /// Kernel-owned runtime state for a process.
 ///
@@ -155,7 +161,39 @@ fn finish_process_creation(
 ) -> Result<(Arc<Process>, Arc<Vmar>), huesos_abi::ErrorCode> {
     huesos_object::register_process(process.clone());
 
-    let runtime = ProcessRuntime::new(process.koid()).map_err(|_| ErrorCode::NoMemory)?;
+    let mut runtime = ProcessRuntime::new(process.koid()).map_err(|_| ErrorCode::NoMemory)?;
+    // Map the userspace heap region (fixed RW, non-executable) for
+    // every process at creation. Stage A.6 wired the hxfs-service's
+    // global allocator against `huesos_abi::USER_HEAP_BASE` but the
+    // mapping itself was never delivered: the service's first heap
+    // allocation faulted at USER_HEAP_BASE (page fault, error=0x6)
+    // as soon as a code path actually allocated (Stage B.5's
+    // compression policy table). The region is inert for processes
+    // that never touch it. Note: launcher-created processes map
+    // their ELF segments and stacks through the root VMAR; the heap
+    // stays outside the VMAR bookkeeping, mirroring the legacy
+    // `spawn_from_elf` stack mapping.
+    {
+        let Some(address_space) = runtime.address_space_mut() else {
+            runtime.destroy();
+            huesos_object::unregister_object(process.koid());
+            return Err(ErrorCode::NoMemory);
+        };
+        let heap_end = USER_HEAP_BASE + USER_HEAP_SIZE;
+        let mut addr = USER_HEAP_BASE;
+        while addr < heap_end {
+            let page: Page<Size4KiB> = Page::containing_address(VirtAddr::new(addr));
+            if address_space
+                .map_new_user_page(page, flags::USER_RW | PageTableFlags::NO_EXECUTE)
+                .is_err()
+            {
+                runtime.destroy();
+                huesos_object::unregister_object(process.koid());
+                return Err(ErrorCode::NoMemory);
+            }
+            addr += 4096;
+        }
+    }
     let root_vmar = Arc::clone(&runtime.root_vmar);
     *process.address_space.lock() =
         Some(Box::new(runtime) as Box<dyn core::any::Any + Send + Sync>);

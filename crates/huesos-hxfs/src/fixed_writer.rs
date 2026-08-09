@@ -982,11 +982,69 @@ impl<
         let mut index = 0u32;
         while index < count {
             let offset = header.header_bytes as usize + 16 + index as usize * DIR_RECORD_BYTES;
-            let entry = parse_dir_record(&block, offset)?;
+            let mut scratch = [0u8; MAX_NAME_BYTES];
+            let entry =
+                self.parse_mounted_dirent(&block, offset, object.object_id, &mut scratch)?;
             self.insert_dir_entry(object.object_id, entry.object_id, entry.name.as_bytes())?;
             index += 1;
         }
         Ok(())
+    }
+
+    /// Parse one dirent record at mount time, decrypting the name
+    /// body when the volume is encrypted (Stage B.2 completion:
+    /// the writer's mount path must mirror the reader, otherwise
+    /// mounting an encrypted volume whose dirent names were
+    /// encrypted at publish fails with `BadName`). The plaintext
+    /// name lands in `scratch` and the returned entry borrows it.
+    fn parse_mounted_dirent<'a>(
+        &self,
+        block: &[u8],
+        offset: usize,
+        parent_object_id: u64,
+        scratch: &'a mut [u8; MAX_NAME_BYTES],
+    ) -> FixedResult<crate::DirectoryEntry<'a>> {
+        // The writer mounts volumes it is about to publish, whose
+        // dirent names may still be plaintext (the boot image
+        // produced by `synthetic_image` / `hxfs-seed`); after
+        // publish every name on an encrypted volume is encrypted.
+        // Encrypted bodies are always at least
+        // `ENCRYPTED_DIRENT_MIN_BODY` (28) bytes long (nonce +
+        // tag overhead), so the body length discriminates the two
+        // states; a plaintext name at or above the threshold is
+        // not representable on an encrypted volume (B.2 format
+        // invariant).
+        #[cfg(feature = "crypto-aes-gcm")]
+        if let Some(key) = self.metadata_key.as_ref() {
+            let body_len = u16::from_le_bytes(
+                block
+                    .get(offset + 8..offset + 10)
+                    .ok_or(HxfsError::BadTree)?
+                    .try_into()
+                    .map_err(|_| HxfsError::BadTree)?,
+            ) as usize;
+            if body_len >= crate::encrypted_metadata::ENCRYPTED_DIRENT_MIN_BODY {
+                return crate::parse_dir_record_decrypt(
+                    block,
+                    offset,
+                    parent_object_id,
+                    key,
+                    scratch,
+                );
+            }
+        }
+        let entry = parse_dir_record(block, offset)?;
+        let name_bytes = entry.name.as_bytes();
+        if scratch.len() < name_bytes.len() {
+            return Err(HxfsError::BufferTooSmall);
+        }
+        scratch[..name_bytes.len()].copy_from_slice(name_bytes);
+        let name_str =
+            core::str::from_utf8(&scratch[..name_bytes.len()]).map_err(|_| HxfsError::BadName)?;
+        Ok(crate::DirectoryEntry {
+            object_id: entry.object_id,
+            name: name_str,
+        })
     }
 
     fn load_extents(&mut self, object: ObjectDescriptor) -> FixedResult<()> {

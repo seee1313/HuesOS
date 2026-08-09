@@ -42,6 +42,23 @@ User-approved decisions for PR `huesos-dev/hxfs-stage-b-io-pipeline`.
 - **`read_superblock` feature-bit risk**: resolved — the V6 bit is
   in `SUPPORTED_INCOMPAT_FEATURES` and unknown bits are rejected
   with `UnsupportedFormat` (`lib.rs` `read_superblock`).
+- **A.6 heap mapping delivered (found by the QEMU soak)**: Stage A
+  wired the hxfs-service's global allocator against
+  `USER_HEAP_BASE` and documented that the kernel reserves the
+  region, but the mapping was never implemented — the service's
+  first real allocation (the Stage B.5 policy table) page-faulted
+  at `0x70000000` on target. The process launcher now maps the
+  fixed 256 KiB RW heap region for every process at creation
+  (`finish_process_creation`), and the service's `HEAP_BASE` /
+  `HEAP_SIZE` come from `huesos_abi`. Also fixed while debugging
+  the soak: the writer's mount path decrypts v6 metadata *and*
+  encrypted dirent names (the latter with the
+  `ENCRYPTED_DIRENT_MIN_BODY` length discriminator, since the
+  writer mounts pre-publish images whose names are still
+  plaintext), and the kernel build script now tracks the
+  `huesos-hxfs` / `huesos-abi` / `huesos-user-alloc` sources so a
+  change there re-embeds the userspace binaries instead of
+  silently shipping a stale service ELF in the ISO.
 
 ## Scope
 Four tracks, five commits, one PR.

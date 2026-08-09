@@ -659,6 +659,18 @@ pub const USER_STACK_TOP: u64 = 0x0000_7fff_ff00_0000;
 /// Size of the initial userspace stack mapped by the userspace process launcher.
 pub const USER_STACK_SIZE: u64 = 4096 * 16;
 
+/// Base of the userspace heap region mapped by the process launcher.
+///
+/// Every user process gets this fixed RW, non-executable region so
+/// a process that installs a `#[global_allocator]` (the hxfs-service
+/// does) can allocate from boot without a mapping syscall. The
+/// region is raw-mapped alongside the stack and the ELF segments,
+/// outside the VMAR bookkeeping, and is inert for processes that
+/// never touch it.
+pub const USER_HEAP_BASE: u64 = 0x0000_7000_0000;
+/// Size of the userspace heap region mapped by the process launcher.
+pub const USER_HEAP_SIZE: u64 = 256 * 1024;
+
 /// Scheduler flags for [`Syscall::ProcessSetSchedulerFlags`].
 pub mod scheduler_flags {
     /// User tasks in this process may be moved by token-based idle stealing,

@@ -170,6 +170,20 @@ fn track_userspace_inputs(userspace_root: &Path) {
             userspace_root.join(program).join("Cargo.toml").display()
         );
     }
+    // The userspace binaries embed workspace crates (huesos-hxfs,
+    // huesos-abi, huesos-user-alloc); a change there must re-run
+    // this build script so the recompiled binaries are re-embedded.
+    // Without this, cargo considers the build script fresh (its
+    // side-effect outputs are invisible to fingerprints) and the
+    // ISO silently ships a stale service binary.
+    for crate_dir in [
+        "crates/huesos-hxfs",
+        "crates/huesos-abi",
+        "crates/huesos-user-alloc",
+    ] {
+        println!("cargo:rerun-if-changed={}", crate_dir);
+        println!("cargo:rerun-if-changed={}", format!("{crate_dir}/src"));
+    }
     println!(
         "cargo:rerun-if-changed={}",
         userspace_root.join("libcanvas").join("src").display()

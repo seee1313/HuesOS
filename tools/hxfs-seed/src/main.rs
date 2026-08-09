@@ -172,21 +172,34 @@ struct FileStore {
 }
 
 impl FileStore {
-    fn create(path: &std::path::Path, blocks: u64) -> Result<Self, String> {
+    fn open_with(
+        path: &std::path::Path,
+        blocks: u64,
+        truncate: bool,
+    ) -> Result<Self, String> {
         use std::fs::OpenOptions;
         // read+write: the writer both writes the boot image and
         // reads blocks back at mount; File::create alone is
         // write-only and read_at would fail with EBADF.
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(true)
+        let mut options = OpenOptions::new();
+        options.read(true).write(true).create(true);
+        if truncate {
+            options.truncate(true);
+        }
+        let file = options
             .open(path)
-            .map_err(|e| format!("create {}: {e}", path.display()))?;
+            .map_err(|e| format!("open {}: {e}", path.display()))?;
         file.set_len(blocks * 4096)
             .map_err(|e| format!("set_len: {e}"))?;
         Ok(Self { file })
+    }
+
+    fn create(path: &std::path::Path, blocks: u64) -> Result<Self, String> {
+        Self::open_with(path, blocks, true)
+    }
+
+    fn open(path: &std::path::Path, blocks: u64) -> Result<Self, String> {
+        Self::open_with(path, blocks, false)
     }
 }
 
@@ -350,9 +363,11 @@ mod tests {
     #[test]
     fn seeded_image_mounts_and_seed_file_round_trips() {
         let image = build_test_image(false);
-        let reader = SliceBlockReader::new(&image);
         let policies = [synthetic_key::encryption_policy()];
         let comps = [synthetic_key::compression_policy()];
+
+        // Read-side remount (the host-test path).
+        let reader = SliceBlockReader::new(&image);
         let mut fs = Hxfs::mount_with_policies(reader, &policies, &comps).expect("mount");
         let file = fs.open_path("/seed.bin").expect("open seed.bin");
         let mut buf = [0u8; 4096];
@@ -361,6 +376,41 @@ mod tests {
         let mut expected = [0u8; 4096];
         fill_compressible_chunk(&mut expected, 0);
         assert_eq!(&buf[..3584], &expected[..3584], "seed bytes must round-trip");
+
+        // Writer-side remount of the PUBLISHED image: this is
+        // exactly the path the hxfs-service takes at boot (mount
+        // the encrypted+compressed volume, open the seed file, read
+        // it back). It exercises the writer's v6 metadata
+        // decryption and encrypted-dirent-name decryption at mount
+        // time, which no other host test covers.
+        let remount_path =
+            std::env::temp_dir().join(format!("huesos-seed-remount-{}.img", std::process::id()));
+        let store = FileStore::create(&remount_path, 1024).expect("create remount store");
+        let mut store = RecordingStore {
+            inner: store,
+            recording: false,
+            ranges: Vec::new(),
+        };
+        let blocks = (image.len() / 4096) as u32;
+        store
+            .write_blocks(0, blocks, &image)
+            .expect("copy published image into remount store");
+        let mut writer = FixedHxfsWriter::<RecordingStore, 16, 32, 128>::mount_with_policies(
+            store, &policies, &comps,
+        )
+        .expect("writer remount of published image");
+        let root = writer.root_directory();
+        let file = writer
+            .open_child_file(root, synthetic_key::SEED_FILE_NAME)
+            .expect("writer open seed.bin");
+        let mut buf = [0u8; 4096];
+        let n = writer.read_file(file, &mut buf).expect("writer read seed.bin");
+        assert_eq!(n, 3584, "writer seed file length must match");
+        assert_eq!(
+            &buf[..3584],
+            &expected[..3584],
+            "writer seed bytes must round-trip"
+        );
     }
 
     #[test]

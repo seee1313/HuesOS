@@ -30,21 +30,23 @@ static HEAP: UserAllocator = UserAllocator::new();
 
 /// Initialise the heap at the user address range the
 /// kernel reserved for userspace heap. The range is
-/// documented in `huesos-kernel/src/process.rs` and the
-/// linker script `userspace/user_linker.ld`; for the MVP
-/// the hxfs-service reserves the top 256 KiB of its
-/// address space.
-const HEAP_BASE: usize = 0x7000_0000;
-const HEAP_SIZE: usize = 256 * 1024;
+/// `huesos_abi::USER_HEAP_BASE` and is mapped by the
+/// process launcher (`huesos-kernel/src/process.rs`) for
+/// every user process; for the MVP the hxfs-service heap
+/// is the full 256 KiB region.
+const HEAP_BASE: usize = huesos_abi::USER_HEAP_BASE as usize;
+const HEAP_SIZE: usize = huesos_abi::USER_HEAP_SIZE as usize;
 
 fn init_heap() {
-    // SAFETY: the heap region is reserved for the
-    // hxfs-service by the kernel and the linker places the
-    // service's BSS/data at a non-overlapping range; the
-    // 256 KiB region is private to this process. The
-    // Userspace allocator is `no_std` and lives in
-    // `huesos-user-alloc`; its `init` function takes a
-    // raw pointer and is unsafe by signature.
+    // SAFETY: the heap region is reserved AND MAPPED for the
+    // hxfs-service by the kernel process launcher (Stage A.6
+    // intent; the mapping was missing until Stage B.5 and the
+    // service's first allocation faulted at USER_HEAP_BASE);
+    // the linker places the service's BSS/data at a
+    // non-overlapping range; the 256 KiB region is private to
+    // this process. The Userspace allocator is `no_std` and
+    // lives in `huesos-user-alloc`; its `init` function takes
+    // a raw pointer and is unsafe by signature.
     unsafe {
         HEAP.init(HEAP_BASE as *mut u8, HEAP_SIZE);
     }
