@@ -105,7 +105,26 @@ impl BlockDevice {
     }
 
     /// Write blocks from `input`.
+    ///
+    /// Stage C.1: a transport error is retried once before the
+    /// error is surfaced. QEMU NVMe (8.x) intermittently rejects a
+    /// write/flush command under load even though the request was
+    /// valid; the roadmap's media-error policy ("every block write
+    /// that returns a transport error is retried once") exists
+    /// exactly for this class of transient transport failure. The
+    /// retry re-issues the same request; if the second attempt
+    /// fails too the error is surfaced to the caller (the journal
+    /// layer decides rollback).
     pub fn write_blocks(&mut self, lba: u64, block_count: u32, input: &[u8]) -> Result<()> {
+        match self.write_blocks_once(lba, block_count, input) {
+            Ok(()) => Ok(()),
+            Err(error) => self
+                .write_blocks_once(lba, block_count, input)
+                .map_err(|_| error),
+        }
+    }
+
+    fn write_blocks_once(&mut self, lba: u64, block_count: u32, input: &[u8]) -> Result<()> {
         let request_id = self.alloc_request_id();
         let vmo = Vmo::create(input.len() as u64)?;
         if vmo.write(0, input)? != input.len() {
@@ -125,7 +144,17 @@ impl BlockDevice {
     }
 
     /// Flush volatile write cache.
+    ///
+    /// Stage C.1: like writes, a flush transport error is retried
+    /// once. Flush is idempotent, so a retry is safe.
     pub fn flush(&mut self) -> Result<()> {
+        match self.flush_once() {
+            Ok(()) => Ok(()),
+            Err(error) => self.flush_once().map_err(|_| error),
+        }
+    }
+
+    fn flush_once(&mut self) -> Result<()> {
         let request_id = self.alloc_request_id();
         let request = AsyncBlockRequest {
             op: AsyncBlockOp::Flush,
