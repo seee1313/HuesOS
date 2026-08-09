@@ -316,9 +316,10 @@ panic or, worse, a silent corruption.
   fast without touching the disk, and unrelated files keep
   working. The on-target trace prints
   `[hxfs] extent-bad-marked (N)` after the seed read fails.
-- **Transport-error retry / journal rollback (open).** A write
-  transport error retry and journal-layer rollback are not yet
-  wired; the journal replay already exists (Stage A).
+- **Write transport-error retry (landed).** `BlockDevice::write_blocks`
+  and `flush` retry once before surfacing a transport error (C.1
+  media-error policy); the journal-layer rollback decision stays
+  with the hxfs-service. Journal replay already exists (Stage A).
 - **Userspace LBA injection (landed).** `tools/hxfs-seed`
   supports `--inject-bad-gcm-tag` (encrypted volume, GCM
   ciphertext bit -> `bad-gcm-tag-marked`) and `--inject-bad-crc`
