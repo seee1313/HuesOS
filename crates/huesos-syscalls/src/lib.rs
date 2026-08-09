@@ -19,6 +19,7 @@ mod debug;
 mod framebuffer;
 mod handle;
 mod job;
+mod key;
 mod port_interrupt;
 mod process;
 /// Resource capability primitive syscalls
@@ -126,6 +127,7 @@ pub fn dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> Syscal
         S::PortCreate => port_interrupt::sys_port_create(a1 as *mut HandleValue),
         S::PortRead => port_interrupt::sys_port_read(a1 as HandleValue, a2 as *mut PortPacket, a3),
         S::PortQueue => port_interrupt::sys_port_queue(a1 as HandleValue, a2 as *const PortPacket),
+        S::VolumeKeyGet => key::sys_volume_key_get(a1 as *mut [u8; 32]),
         S::InterruptCreate => {
             port_interrupt::sys_interrupt_create(a1 as u32, a2 as *mut HandleValue)
         }

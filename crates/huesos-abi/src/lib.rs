@@ -303,13 +303,18 @@ pub enum Syscall {
     /// Queue one packet to a Port. `a1` is a Port handle with WRITE rights,
     /// `a2=*const PortPacket`.
     PortQueue = 58,
+    /// Copy the bootloader/kernel volume key blob into `a1`
+    /// (`*mut [u8; 32]`). Returns `NotFound` when no key blob was
+    /// baked into this kernel build (plain-volume deployments).
+    /// Stage D bootloader KeyProvider handoff.
+    VolumeKeyGet = 59,
 }
 
 impl Syscall {
     /// Total number of defined syscalls (i.e. one past the highest
     /// currently-assigned number). The dispatcher uses this to reject
     /// obviously-out-of-range numbers before a `match`.
-    pub const COUNT: u64 = 59;
+    pub const COUNT: u64 = 60;
 
     /// Convert a raw syscall number back into a [`Syscall`], if valid.
     pub const fn from_raw(n: u64) -> Option<Self> {
@@ -373,6 +378,7 @@ impl Syscall {
             56 => Self::ResourceMap,
             57 => Self::InterruptCreateForResource,
             58 => Self::PortQueue,
+            59 => Self::VolumeKeyGet,
             _ => return None,
         })
     }
@@ -1170,7 +1176,8 @@ mod tests {
         assert_eq!(Syscall::ResourceMap as u64, 56);
         assert_eq!(Syscall::InterruptCreateForResource as u64, 57);
         assert_eq!(Syscall::PortQueue as u64, 58);
-        assert_eq!(Syscall::COUNT, 59);
+        assert_eq!(Syscall::VolumeKeyGet as u64, 59);
+        assert_eq!(Syscall::COUNT, 60);
         assert_eq!(Syscall::from_raw(28), Some(Syscall::VmoCreateEx));
         assert_eq!(Syscall::from_raw(30), Some(Syscall::VmarProtect));
         assert_eq!(Syscall::from_raw(31), Some(Syscall::ChannelPeek));
@@ -1207,7 +1214,8 @@ mod tests {
             Some(Syscall::InterruptCreateForResource)
         );
         assert_eq!(Syscall::from_raw(58), Some(Syscall::PortQueue));
-        assert_eq!(Syscall::from_raw(59), None);
+        assert_eq!(Syscall::from_raw(59), Some(Syscall::VolumeKeyGet));
+        assert_eq!(Syscall::from_raw(60), None);
     }
 
     #[test]

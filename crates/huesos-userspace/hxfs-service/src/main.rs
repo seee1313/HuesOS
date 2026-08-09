@@ -1272,13 +1272,21 @@ fn mount_from_bootstrap(bootstrap: &Channel) -> Option<MountedHxfs> {
                 let mounted = {
                     #[cfg(feature = "synthetic-key")]
                     {
+                        // Stage D key handoff: the volume key comes
+                        // from the kernel's bootloader blob
+                        // (VolumeKeyGet), not from baked-in
+                        // userspace material. When the kernel has no
+                        // key, an encrypted volume is rejected with
+                        // EncryptedVolumeKeyUnavailable — the
+                        // security gate working as intended.
+                        let key = libcanvas::system::get_volume_key().ok().flatten();
                         let enc = [huesos_hxfs::synthetic_key::encryption_policy()];
                         let comp = [huesos_hxfs::synthetic_key::compression_policy()];
-                        FixedHxfsWriter::mount_with_policies(reader, &enc, &comp)
+                        FixedHxfsWriter::mount_with_policies(reader, &enc, &comp, key.as_ref())
                     }
                     #[cfg(not(feature = "synthetic-key"))]
                     {
-                        FixedHxfsWriter::mount_with_policies(reader, &[], &[])
+                        FixedHxfsWriter::mount_with_policies(reader, &[], &[], None)
                     }
                 };
                 match mounted {

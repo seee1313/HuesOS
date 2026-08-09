@@ -22,6 +22,12 @@ echo "[soak] building ISO before NVMe soak"
 # unset and the test wiring stays out of the binary.
 if [[ "$inject" == "1" ]]; then
     export HUESOS_HXFS_SERVICE_FEATURES=synthetic-key
+    # Stage D: the synthetic volume key is baked into the KERNEL as
+    # the bootloader key blob (single source of truth: the seed
+    # tool's --print-volume-key-hex). The service receives it via
+    # the VolumeKeyGet syscall; without it an encrypted volume
+    # cannot mount, which is the security gate.
+    export HUESOS_VOLUME_KEY_HEX="$(bash tools/hxfs-seed.sh --print-volume-key-hex)"
 fi
 case "$profile" in
     release) CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-1}" make iso-release >/tmp/huesos-nvme-soak-build.log ;;

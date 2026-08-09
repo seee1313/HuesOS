@@ -141,7 +141,7 @@ impl<
     /// state, treating the volume as unencrypted. Convenience
     /// wrapper around [`Self::mount_with_keys`].
     pub fn mount(store: S) -> FixedResult<Self> {
-        Self::mount_with_keys(store, &[])
+        Self::mount_with_keys(store, &[], None)
     }
 
     /// Mount a clean v2 Hxfs volume into fixed-capacity mutable
@@ -163,8 +163,9 @@ impl<
         store: S,
         encryption_policies: &[crate::crypto::EncryptionPolicy],
         compression_policies: &[crate::compression::CompressionPolicy],
+        volume_key: Option<&[u8; 32]>,
     ) -> FixedResult<Self> {
-        let mut mounted = Self::mount_with_keys(store, encryption_policies)?;
+        let mut mounted = Self::mount_with_keys(store, encryption_policies, volume_key)?;
         mounted.compression_policies = compression_policies.to_vec();
         Ok(mounted)
     }
@@ -181,10 +182,17 @@ impl<
     /// `MAX_EXTENTS`) bound the on-memory metadata
     /// footprint and are tuned for the hxfs-service
     /// production mount path.
+    ///
+    /// `volume_key` (Stage D): see [`Hxfs::mount_with_keys`].
+    /// An encrypted volume without a key context is rejected
+    /// with [`HxfsError::EncryptedVolumeKeyUnavailable`].
     pub fn mount_with_keys(
         mut store: S,
         encryption_policies: &[crate::crypto::EncryptionPolicy],
+        volume_key: Option<&[u8; 32]>,
     ) -> FixedResult<Self> {
+        #[cfg(not(feature = "crypto-aes-gcm"))]
+        let _ = volume_key;
         let superblock = read_superblock(&mut store, 0)?;
         if superblock.root_state != ROOT_STATE_CLEAN
             || superblock.journal_start_lba != 0
@@ -199,55 +207,38 @@ impl<
         )?;
         let system_volume = read_system_volume(&mut store, checkpoint)?;
         let encryption = crate::resolve_mount_encryption(&system_volume, encryption_policies)?;
-        // Stage B.1 wire: derive the per-volume metadata subkey
-        // when the volume is encrypted. The placeholder IKM is
-        // the same hash-of-instance-uuid pattern the reader
-        // uses; a real Stage D KeyProvider will replace it.
+        // Stage D: derive the per-volume AEAD subkeys from the
+        // caller-supplied volume key (the bootloader/kernel key
+        // path); an encrypted volume without a key context is
+        // rejected up front. The old instance-uuid placeholder IKM
+        // is gone.
         #[cfg(feature = "crypto-aes-gcm")]
         let metadata_key = if encryption.is_some() {
-            let mut ikm = [0u8; 32];
-            let mut index = 0usize;
-            while index < 16 {
-                ikm[index] = superblock.instance_uuid[index];
-                ikm[index + 16] = superblock.instance_uuid[index];
-                index += 1;
-            }
+            let ikm = volume_key.ok_or(HxfsError::EncryptedVolumeKeyUnavailable)?;
             let mut key = [0u8; 32];
             crate::encrypted_metadata::derive_metadata_key_for_volume(
-                &ikm,
+                ikm,
                 &superblock.instance_uuid,
                 &mut key,
             )
             .map_err(|_| HxfsError::EncryptedPolicyInvalid)?;
-            for byte in ikm.iter_mut() {
-                *byte = 0;
-            }
             Some(key)
         } else {
             None
         };
-        // Stage B.3 wire: derive the per-volume extent subkey
-        // from the same placeholder IKM. Independent info
-        // string from the metadata subkey.
+        // Stage B.3 wire: derive the per-volume extent subkey from
+        // the same volume key. Independent info string from the
+        // metadata subkey.
         #[cfg(feature = "crypto-aes-gcm")]
         let extent_key = if encryption.is_some() {
-            let mut ikm = [0u8; 32];
-            let mut index = 0usize;
-            while index < 16 {
-                ikm[index] = superblock.instance_uuid[index];
-                ikm[index + 16] = superblock.instance_uuid[index];
-                index += 1;
-            }
+            let ikm = volume_key.ok_or(HxfsError::EncryptedVolumeKeyUnavailable)?;
             let mut key = [0u8; 32];
             crate::extent_crypto::derive_extent_key_for_volume(
-                &ikm,
+                ikm,
                 &superblock.instance_uuid,
                 &mut key,
             )
             .map_err(|_| HxfsError::EncryptedPolicyInvalid)?;
-            for byte in ikm.iter_mut() {
-                *byte = 0;
-            }
             Some(key)
         } else {
             None

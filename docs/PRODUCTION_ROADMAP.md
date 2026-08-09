@@ -286,10 +286,14 @@ and the mount continues. **Met** by the CI injection job.
   writable on encrypted volumes; the previous loud `Unsupported`
   failure is gone. Both slot shapes are covered by host tests and
   by the on-target `multi-slot-write-ok` soak marker.
-- **Synthetic key on target**: the soak's on-target encrypted
-  mount uses the documented developer-placeholder IKM derived
-  from the volume's instance UUID, behind the `synthetic-key`
-  feature. The Stage D TPM-backed KeyProvider replaces it.
+- **Synthetic key on target (superseded by the Stage D kernel
+  key blob)**: the soak's on-target encrypted mount uses the
+  explicit `synthetic_key::VOLUME_KEY`, baked into the KERNEL as
+  the bootloader key blob (`HUESOS_VOLUME_KEY_HEX`) and served
+  via the `VolumeKeyGet` syscall; the library itself has no
+  implicit key material (an encrypted volume without a key
+  context is rejected). The `synthetic-key` feature remains
+  test-only wiring until the real TPM provider lands.
 - **Soft crypto on the no-SIMD userspace target**: the `aes` /
   `polyval` x86 fast paths cannot codegen without SSE2 (the
   kernel context switch does not save XMM state), so the
@@ -391,8 +395,20 @@ landed in Track A.1; what remains is the key-provider chain.
 be wired into `mount_with_keys` without changing the kernel
 syscall surface.
 
-### Track D.2 — TPM key provider (Stage 1)
+### Track D.2 — Key provider (bootloader key blob landed; TPM open)
 
+- **Bootloader key blob (landed, PR `hxfs-stage-d-key-provider`).**
+  The kernel bakes a 32-byte volume key into the image at build
+  time (`HUESOS_VOLUME_KEY_HEX`, emitted by `huesos-kernel/build.rs`
+  as `boot_key.rs`), installs it in `huesos_object::boot_key` at
+  init, and serves it through the new `VolumeKeyGet` syscall
+  (`NotFound` when no blob). The hxfs-service fetches it via
+  `libcanvas::system::get_volume_key` and passes it to
+  `mount_with_keys`; the mount gate now REQUIRES a key context
+  for encrypted volumes (`EncryptedVolumeKeyUnavailable` when
+  absent) — the implicit instance-uuid placeholder IKM is gone.
+  This is the kernel->service handoff shape a real TPM provider
+  will reuse (measure/seal/unseal into the same slot).
 - A `huesos-tpm-provider` userspace DriverHost holds the TPM
   Resource and serves volume-key unseal requests over a
   Channel.

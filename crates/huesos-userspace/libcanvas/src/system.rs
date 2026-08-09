@@ -21,6 +21,22 @@ pub fn current_cpu() -> crate::Result<usize> {
     raw::decode(value).map(|cpu| cpu as usize)
 }
 
+/// Copy the bootloader volume key blob (Stage D key handoff).
+///
+/// `Ok(None)` when this kernel build has no key blob (plain-volume
+/// deployments); an encrypted volume then cannot be mounted, which
+/// is the Stage D security gate. The storage service passes the
+/// key to `Hxfs::mount_with_keys`.
+pub fn get_volume_key() -> crate::Result<Option<[u8; 32]>> {
+    let mut key = [0u8; 32];
+    let ret = raw::syscall1(Syscall::VolumeKeyGet, &mut key as *mut [u8; 32] as u64);
+    match raw::decode(ret) {
+        Ok(_) => Ok(Some(key)),
+        Err(crate::ErrorCode::NotFound) => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
 /// Request an orderly non-ACPI software shutdown.
 ///
 /// Kernel policy accepts this only from the root init supervisor. On success

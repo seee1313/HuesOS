@@ -32,13 +32,15 @@ User-approved decisions for PR `huesos-dev/hxfs-stage-b-io-pipeline`.
   resolved policy selects a codec, so incompressible fallback
   records decode as plaintext. Old volumes (v1 records) read
   exactly as before.
-- **On-target synthetic key**: the soak's encrypted mount uses the
-  documented developer-placeholder IKM (derived from the volume's
-  instance UUID) behind the `synthetic-key` feature of
-  `hxfs-service`; the plan's own "Known risks" section already
-  deferred the real key provider to Stage D. The service self-check
-  and the two soak markers make the pipeline provable on target
-  today.
+- **On-target synthetic key (superseded by Stage D)**: the
+  soak's encrypted mount uses the explicit `synthetic_key::VOLUME_KEY`
+  baked into the KERNEL as the bootloader key blob
+  (`HUESOS_VOLUME_KEY_HEX` -> `VolumeKeyGet` syscall), behind the
+  `synthetic-key` feature of `hxfs-service`; the library has no
+  implicit placeholder IKM anymore (an encrypted volume without a
+  key context is rejected with `EncryptedVolumeKeyUnavailable`).
+  The Stage D TPM provider reuses the same kernel->service
+  handoff.
 - **`read_superblock` feature-bit risk**: resolved — the V6 bit is
   in `SUPPORTED_INCOMPAT_FEATURES` and unknown bits are rejected
   with `UnsupportedFormat` (`lib.rs` `read_superblock`).
