@@ -153,6 +153,21 @@ pub const EXTENT_FLAG_PREALLOCATED: u32 = 1 << 1;
 /// garbage bytes.
 pub const EXTENT_FLAG_COMPRESSED: u32 = 1 << 2;
 
+/// Extent flag: one logical block stored across two physical slots.
+///
+/// The encrypted envelope (`nonce(12) + ciphertext(4028) + tag(16)`)
+/// holds at most 4028 plaintext bytes, but an incompressible full
+/// 4 KiB block must be stored verbatim. A two-slot extent stores it
+/// as two envelopes: slot 0 at `physical_block` carries the first
+/// 4028 bytes, slot 1 at `physical_block + 1` carries the remaining
+/// 68 bytes (padded). The record's `block_count` is 2 and the
+/// compression descriptor is zero (no compression). The read path
+/// decrypts both slots and concatenates them. Only produced on
+/// encrypted volumes (a plain volume stores the block verbatim in
+/// one slot); a two-slot record on a volume without a key is
+/// rejected with `BadTree`.
+pub const EXTENT_FLAG_MULTI_SLOT: u32 = 1 << 3;
+
 /// Stable UUID/GUID bytes.
 pub type Uuid = [u8; 16];
 

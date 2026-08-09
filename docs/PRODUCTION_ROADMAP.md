@@ -276,11 +276,16 @@ and the mount continues. **Met** by the CI injection job.
   block per object. Multi-block extent trees are a Stage C+
   item. This is why the E2E file is 400 KiB, not the 4 MiB the
   original plan sketched.
-- **Incompressible full blocks on encrypted volumes**: the GCM
-  envelope holds at most 4028 plaintext bytes; a full 4 KiB block
-  that neither compresses below the limit nor fits verbatim is
-  rejected with `Unsupported` (loud, never silently truncated).
-  Incompressible round trips are covered on plain volumes.
+- **Two-slot extents for incompressible data on encrypted
+  volumes**: the GCM envelope holds at most 4028 plaintext bytes,
+  so an incompressible plaintext larger than that (a full 4 KiB
+  block, or a near-full partial block) is stored as two envelopes
+  in two consecutive physical slots (`EXTENT_FLAG_MULTI_SLOT`,
+  `block_count = 2`, ~2x physical overhead for those blocks).
+  Media files, archives and already-compressed data are therefore
+  writable on encrypted volumes; the previous loud `Unsupported`
+  failure is gone. Both slot shapes are covered by host tests and
+  by the on-target `multi-slot-write-ok` soak marker.
 - **Synthetic key on target**: the soak's on-target encrypted
   mount uses the documented developer-placeholder IKM derived
   from the volume's instance UUID, behind the `synthetic-key`

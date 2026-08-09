@@ -140,9 +140,15 @@ if [[ "$inject" == "1" ]]; then
     # Stage B.5: the boot self-check must have detected the flipped
     # GCM bit (bad-gcm-tag-marked) and exercised the O_DIRECT deny
     # probe (odirect-deny-ok) while the service kept serving.
+    # Phase-1 follow-up: the on-target write path must have
+    # round-tripped both a compressed file (write-roundtrip-ok) and
+    # an incompressible full block through the two-slot extent path
+    # (multi-slot-write-ok).
     required+=(
         "[hxfs] bad-gcm-tag-marked"
         "[hxfs] odirect-deny-ok"
+        "[hxfs] write-roundtrip-ok"
+        "[hxfs] multi-slot-write-ok"
     )
 fi
 for marker in "${required[@]}"; do

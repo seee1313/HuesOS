@@ -782,9 +782,16 @@ impl<R: BlockReader> Hxfs<R> {
             if extent.logical_block < previous_logical_end {
                 return Err(HxfsError::BadTree);
             }
+            // A two-slot extent covers ONE logical block even
+            // though its `block_count` (physical slots) is 2.
+            let logical_len = if extent.flags & EXTENT_FLAG_MULTI_SLOT != 0 {
+                1
+            } else {
+                u64::from(extent.block_count)
+            };
             previous_logical_end = extent
                 .logical_block
-                .checked_add(u64::from(extent.block_count))
+                .checked_add(logical_len)
                 .ok_or(HxfsError::OutOfRange)?;
             // v1 records: the compression decision comes from the
             // resolved policy (pre-B.3-completion behaviour). v2
@@ -1256,6 +1263,18 @@ pub(crate) fn parse_extent_record_v2(
     if compressed && flags & EXTENT_FLAG_HOLE != 0 {
         return Err(HxfsError::BadTree);
     }
+    let multi_slot = flags & EXTENT_FLAG_MULTI_SLOT != 0;
+    if multi_slot {
+        // A two-slot extent is one logical block over two physical
+        // slots, is never compressed, never a hole, and never
+        // carries descriptor bytes.
+        if flags & (EXTENT_FLAG_HOLE | EXTENT_FLAG_COMPRESSED) != 0 || block_count != 2 {
+            return Err(HxfsError::BadTree);
+        }
+        if algorithm != 0 || compressed_bytes != 0 || payload_crc32c != 0 {
+            return Err(HxfsError::BadTree);
+        }
+    }
     let meta = if compressed {
         if !matches!(
             algorithm,
@@ -1348,6 +1367,48 @@ mod extent_record_v2_tests {
         };
         assert_eq!(extent.flags, 0);
         assert!(meta.is_none());
+    }
+
+    #[test]
+    fn v2_multi_slot_record_round_trip() {
+        let mut record = make_v2_record(EXTENT_FLAG_MULTI_SLOT, 0, 0, 0);
+        record[16..20].copy_from_slice(&2u32.to_le_bytes());
+        let (extent, meta) = match parse_extent_record_v2(&record, 0) {
+            Ok(parsed) => parsed,
+            Err(e) => {
+                assert!(false, "valid multi-slot record must parse: {:?}", e);
+                return;
+            }
+        };
+        assert_eq!(extent.flags, EXTENT_FLAG_MULTI_SLOT);
+        assert_eq!(extent.block_count, 2);
+        assert!(meta.is_none());
+    }
+
+    #[test]
+    fn v2_multi_slot_record_rejects_wrong_block_count() {
+        let record = make_v2_record(EXTENT_FLAG_MULTI_SLOT, 0, 0, 0);
+        assert_eq!(
+            parse_extent_record_v2(&record, 0).err(),
+            Some(HxfsError::BadTree),
+            "multi-slot without block_count == 2 must be rejected"
+        );
+    }
+
+    #[test]
+    fn v2_multi_slot_record_rejects_compression_combination() {
+        let mut record = make_v2_record(
+            EXTENT_FLAG_MULTI_SLOT | EXTENT_FLAG_COMPRESSED,
+            compression::COMPRESSION_LZ4,
+            1024,
+            1,
+        );
+        record[16..20].copy_from_slice(&2u32.to_le_bytes());
+        assert_eq!(
+            parse_extent_record_v2(&record, 0).err(),
+            Some(HxfsError::BadTree),
+            "multi-slot must not combine with compression"
+        );
     }
 
     #[test]
@@ -1487,6 +1548,51 @@ fn copy_extent_with_keys<R: BlockReader>(
     if extent.flags & EXTENT_FLAG_HOLE != 0 {
         out[start..copy_end].fill(0);
         return Ok(());
+    }
+    // A two-slot extent: one logical block stored as two encrypted
+    // envelopes (slot 0 = first 4028 bytes, slot 1 = the rest).
+    // The generic loop below walks `block_count` logical blocks,
+    // which is wrong for a two-slot record, so handle it here.
+    #[cfg(feature = "crypto-aes-gcm")]
+    if extent.flags & EXTENT_FLAG_MULTI_SLOT != 0 {
+        let key = extent_key.ok_or(HxfsError::BadTree)?;
+        let mut slot0 = [0u8; BLOCK_SIZE];
+        let mut slot1 = [0u8; BLOCK_SIZE];
+        reader.read_blocks(extent.physical_block, 1, &mut slot0)?;
+        reader.read_blocks(extent.physical_block + 1, 1, &mut slot1)?;
+        let mut dec0 = [0u8; BLOCK_SIZE];
+        let mut dec1 = [0u8; BLOCK_SIZE];
+        extent_crypto::decrypt_extent_block(
+            key,
+            extent.physical_block,
+            &volume_uuid,
+            &slot0,
+            &mut dec0,
+        )
+        .map_err(|_| HxfsError::Compression)?;
+        extent_crypto::decrypt_extent_block(
+            key,
+            extent.physical_block + 1,
+            &volume_uuid,
+            &slot1,
+            &mut dec1,
+        )
+        .map_err(|_| HxfsError::Compression)?;
+        let mut composed = [0u8; BLOCK_SIZE];
+        composed[..extent_crypto::EXTENT_PLAINTEXT_BYTES]
+            .copy_from_slice(&dec0[..extent_crypto::EXTENT_PLAINTEXT_BYTES]);
+        let tail = BLOCK_SIZE - extent_crypto::EXTENT_PLAINTEXT_BYTES;
+        composed[extent_crypto::EXTENT_PLAINTEXT_BYTES..].copy_from_slice(&dec1[..tail]);
+        let chunk = copy_end.min(start + BLOCK_SIZE) - start;
+        out[start..start + chunk].copy_from_slice(&composed[..chunk]);
+        page_cache.insert(volume_id, extent.physical_block, 0, composed.to_vec());
+        return Ok(());
+    }
+    #[cfg(not(feature = "crypto-aes-gcm"))]
+    if extent.flags & EXTENT_FLAG_MULTI_SLOT != 0 {
+        // Two-slot extents are an encrypted-volume concept; a
+        // volume without a key cannot produce or consume them.
+        return Err(HxfsError::BadTree);
     }
 
     let mut scratch = [0u8; BLOCK_SIZE];
@@ -2653,13 +2759,138 @@ fn corrupted_compressed_plain_volume_fails_read_with_precise_error() {
     );
 }
 
-/// Stage B.5 companion: the incompressible fallback. Random data
-/// written under an LZ4 volume policy must be stored plain (v1
-/// extent records) and still round-trip byte-for-byte after a
-/// remount. This is the "random file" half of the Stage B exit
-/// signal; it lives on a plain volume because the encrypted
-/// envelope cannot hold an uncompressed full 4 KiB block (the
-/// writer rejects that case loudly with `Unsupported`).
+/// Phase-1 follow-up: an incompressible block larger than the
+/// envelope capacity (4028 bytes) on an ENCRYPTED volume must be
+/// stored as a two-slot extent (`EXTENT_FLAG_MULTI_SLOT`,
+/// `block_count == 2`) instead of failing with `Unsupported`.
+/// Media files, archives and already-compressed data are
+/// incompressible by definition, so this is the case that makes
+/// encrypted volumes usable for real workloads. The test writes a
+/// full 4 KiB random block (and a 4050-byte near-full block),
+/// asserts the two-slot on-disk shape via the recorded write
+/// ranges, and round-trips both byte-for-byte through a remount.
+#[cfg(all(test, feature = "crypto-aes-gcm", feature = "compression-engines"))]
+#[test]
+fn incompressible_full_block_on_encrypted_volume_uses_two_slot_extent() {
+    use crate::fixed_writer::FixedHxfsWriter;
+    use crate::reader::SliceBlockReader;
+    use crate::recovery::BlockStore;
+    use crate::writer::VecBlockStore;
+    use alloc::vec;
+
+    let policies = [crate::synthetic_key::encryption_policy()];
+    let comps = [crate::synthetic_key::compression_policy()];
+    let boot_image = build_seeded_boot_image(true, crate::synthetic_key::COMPRESSION_POLICY_ID);
+    let mut store = RecordingStore::new(VecBlockStore::with_blocks(512));
+    let boot_blocks = (boot_image.len() / BLOCK_SIZE) as u32;
+    if let Err(e) = store.write_blocks(0, boot_blocks, &boot_image) {
+        assert!(false, "boot write must succeed: {:?}", e);
+        return;
+    }
+    let Ok(mut writer) = FixedHxfsWriter::<RecordingStore, 16, 32, 128>::mount_with_policies(
+        store, &policies, &comps,
+    ) else {
+        assert!(false, "writer mount must succeed");
+        return;
+    };
+    let root = writer.root_directory();
+    let file = match writer.open_child_file(root, crate::synthetic_key::SEED_FILE_NAME) {
+        Ok(f) => f,
+        Err(e) => {
+            assert!(false, "open_child_file must succeed: {:?}", e);
+            return;
+        }
+    };
+    // Full 4 KiB random block: incompressible, > envelope capacity.
+    let mut full = [0u8; BLOCK_SIZE];
+    let mut state = 0x9E37_79B9_7F4A_7C15u64;
+    let mut pos = 0usize;
+    while pos < full.len() {
+        let value = next_random(&mut state).to_le_bytes();
+        let n = (full.len() - pos).min(8);
+        full[pos..pos + n].copy_from_slice(&value[..n]);
+        pos += n;
+    }
+    writer.store_mut().start_recording();
+    if let Err(e) = writer.write_file_at(file, 0, &full) {
+        assert!(
+            false,
+            "full random block must write (two-slot), got {:?}",
+            e
+        );
+        return;
+    }
+    let ranges = writer.store_mut().stop_recording();
+    assert_eq!(
+        ranges.len(),
+        2,
+        "an incompressible full block must occupy two physical slots"
+    );
+    assert_eq!(
+        ranges[1].0,
+        ranges[0].0 + 1,
+        "the two slots must be consecutive"
+    );
+    // Near-full partial block (4050 bytes): still over the
+    // envelope capacity, must also use two slots and round-trip.
+    let mut near_full = [0u8; 4050];
+    let mut pos = 0usize;
+    while pos < near_full.len() {
+        let value = next_random(&mut state).to_le_bytes();
+        let n = (near_full.len() - pos).min(8);
+        near_full[pos..pos + n].copy_from_slice(&value[..n]);
+        pos += n;
+    }
+    writer.store_mut().start_recording();
+    if let Err(e) = writer.write_file_at(file, BLOCK_SIZE as u64, &near_full) {
+        assert!(false, "near-full random block must write, got {:?}", e);
+        return;
+    }
+    let ranges2 = writer.store_mut().stop_recording();
+    assert_eq!(ranges2.len(), 2, "near-full block must use two slots");
+    if let Err(e) = writer.publish_checkpoint() {
+        assert!(false, "publish_checkpoint must succeed: {:?}", e);
+        return;
+    }
+    let store = writer.into_store();
+    let image = store.inner.image().to_vec();
+    // Reader round-trip: both writes must come back byte-for-byte.
+    let reader = SliceBlockReader::new(&image);
+    let Ok(mut fs) = Hxfs::mount_with_policies(reader, &policies, &comps) else {
+        assert!(false, "remount must succeed");
+        return;
+    };
+    let file = match fs.open_path("/seed.bin") {
+        Ok(f) => f,
+        Err(e) => {
+            assert!(false, "open_path must succeed: {:?}", e);
+            return;
+        }
+    };
+    let mut buf = vec![0u8; BLOCK_SIZE + 4050];
+    match fs.read_file(file, &mut buf) {
+        Ok(n) => assert_eq!(n, BLOCK_SIZE + 4050, "file length must match"),
+        Err(e) => {
+            assert!(false, "read_file must succeed: {:?}", e);
+            return;
+        }
+    }
+    assert_eq!(&buf[..BLOCK_SIZE], &full[..], "full block must round-trip");
+    assert_eq!(
+        &buf[BLOCK_SIZE..],
+        &near_full[..],
+        "near-full block must round-trip"
+    );
+}
+
+/// Stage B.5 companion: the incompressible fallback on a PLAIN
+/// volume. Random data written under an LZ4 volume policy must be
+/// stored plain (no descriptor, no flag) and still round-trip
+/// byte-for-byte after a remount; the read path must honour the
+/// v2 record instead of trying to LZ4-decode the raw bytes. (On an
+/// encrypted volume the same data takes the two-slot extent path,
+/// covered by
+/// `incompressible_full_block_on_encrypted_volume_uses_two_slot_extent`.)
 #[cfg(all(test, feature = "crypto-aes-gcm", feature = "compression-engines"))]
 #[test]
 fn incompressible_fallback_round_trips_on_plain_volume() {

@@ -45,6 +45,28 @@ struct FixedExtent {
     compression: Option<ExtentCompressionMeta>,
 }
 
+/// How a data block was stored on disk, decided by
+/// [`FixedHxfsWriter::write_data_blocks`] and serialized by the
+/// extent-table builder.
+///
+/// The `MultiSlot` variant is only produced by the
+/// `crypto-aes-gcm` build (the encrypted-volume two-slot path); on
+/// a build without crypto the variant is never constructed and
+/// dead-code analysis would flag it.
+#[cfg_attr(not(feature = "crypto-aes-gcm"), allow(dead_code))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ExtentWriteKind {
+    /// Plaintext stored verbatim in one slot (plain volume, or an
+    /// incompressible block small enough for the envelope).
+    Plain,
+    /// Compressed payload (optionally inside the envelope).
+    Compressed(ExtentCompressionMeta),
+    /// One logical block split across two encrypted envelopes
+    /// ([`EXTENT_FLAG_MULTI_SLOT`]): the incompressible full-block
+    /// case on an encrypted volume.
+    MultiSlot,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct ObjectPlan {
     object_id: u64,
@@ -561,19 +583,22 @@ impl<
             // object's compression policy and stores the resulting
             // descriptor (or `None` for a plain extent) with the
             // extent record; the v2 serialization at publish time
-            // carries it and sets `EXTENT_FLAG_COMPRESSED`.
-            let (physical_block, compression) = self.write_data_blocks(data, object)?;
-            let flags = if compression.is_some() {
-                EXTENT_FLAG_COMPRESSED
-            } else {
-                0
+            // carries it and sets `EXTENT_FLAG_COMPRESSED`. An
+            // incompressible full block on an encrypted volume is
+            // stored as a two-slot extent
+            // (`EXTENT_FLAG_MULTI_SLOT`, `block_count = 2`).
+            let (physical_block, kind) = self.write_data_blocks(data, object)?;
+            let (flags, block_count, compression) = match kind {
+                ExtentWriteKind::Plain => (0, 1, None),
+                ExtentWriteKind::Compressed(meta) => (EXTENT_FLAG_COMPRESSED, 1, Some(meta)),
+                ExtentWriteKind::MultiSlot => (EXTENT_FLAG_MULTI_SLOT, 2, None),
             };
             self.insert_extent(FixedExtent {
                 object_id: file.object_id,
                 extent: ExtentRecord {
                     logical_block,
                     physical_block,
-                    block_count: 1,
+                    block_count,
                     flags,
                 },
                 compression,
@@ -1517,25 +1542,35 @@ impl<
         Ok(())
     }
 
-    /// Write one data block to a fresh LBA, applying the object's
+    /// Write one data block to fresh LBA(s), applying the object's
     /// resolved compression policy first and the volume encryption
     /// envelope second.
     ///
-    /// Returns the physical LBA plus the compression descriptor
-    /// (`None` when the block is stored plain). The plaintext is
-    /// padded to a full 4 KiB block before compression so the
-    /// read path always decompresses to exactly one block; the
-    /// padding is authenticated (AEAD tag or descriptor CRC) and
-    /// is never copied to the caller. An incompressible input
-    /// falls back to a plain extent, which the read path stores
-    /// verbatim.
+    /// Returns the physical LBA of the first slot plus the
+    /// [`ExtentWriteKind`] describing how the block was stored.
+    /// The plaintext is padded to a full 4 KiB block before
+    /// compression so the read path always decompresses to exactly
+    /// one block; the padding is authenticated (AEAD tag or
+    /// descriptor CRC) and is never copied to the caller. An
+    /// incompressible input falls back to a plain extent, which
+    /// the read path stores verbatim.
+    ///
+    /// **Two-slot extents (incompressible on encrypted volumes).**
+    /// The GCM envelope holds at most 4028 plaintext bytes per
+    /// slot. An incompressible plaintext larger than that (a full
+    /// 4 KiB block, or a near-full partial block) is stored as two
+    /// envelopes in two consecutive physical slots: slot 0 carries
+    /// the first 4028 bytes, slot 1 the remainder. The record is
+    /// marked [`EXTENT_FLAG_MULTI_SLOT`] with `block_count = 2`.
+    /// This is the encrypted-volume replacement for the previous
+    /// loud `Unsupported` failure, which made media files,
+    /// archives and already-compressed data unwritable on
+    /// encrypted volumes.
     fn write_data_blocks(
         &mut self,
         data: &[u8],
         object: ObjectDescriptor,
-    ) -> FixedResult<(u64, Option<ExtentCompressionMeta>)> {
-        let start = self.next_lba;
-        self.quota_admits(BLOCK_SIZE_U64, 0)?;
+    ) -> FixedResult<(u64, ExtentWriteKind)> {
         // The LZ4 worst-case output bound is
         // `16 + 4 + input_len * 110 / 100` (lz4_flex
         // `get_maximum_output_size`); a scratch the size of the
@@ -1578,19 +1613,64 @@ impl<
                 data
             }
         };
-        // The GCM envelope holds at most `EXTENT_PLAINTEXT_BYTES`
-        // (4028) plaintext bytes per block. A full 4 KiB block
-        // that neither compresses below the envelope limit nor
-        // fits it verbatim cannot be stored on an encrypted
-        // volume; fail loudly instead of silently truncating.
-        // (On plain volumes the whole 4 KiB block is stored
-        // verbatim, so the incompressible fallback is a normal
-        // completion there.)
         #[cfg(feature = "crypto-aes-gcm")]
-        if self.extent_key.is_some()
-            && block_bytes.len() > crate::extent_crypto::EXTENT_PLAINTEXT_BYTES
-        {
-            return Err(HxfsError::Unsupported);
+        let encrypted = self.extent_key.is_some();
+        // Two-slot whenever the bytes that would go on disk exceed
+        // the envelope capacity. This includes a "successful" LZ4
+        // compression whose payload is still > 4028 bytes (e.g. a
+        // near-full block of random data with a short zero tail):
+        // such a payload would not fit the envelope either, and a
+        // multi-slot record stores the ORIGINAL plaintext (the
+        // read path concatenates, it does not decompress), so the
+        // descriptor is dropped below.
+        #[cfg(feature = "crypto-aes-gcm")]
+        let multi_slot =
+            encrypted && block_bytes.len() > crate::extent_crypto::EXTENT_PLAINTEXT_BYTES;
+        #[cfg(not(feature = "crypto-aes-gcm"))]
+        let multi_slot = false;
+        let start = self.next_lba;
+        if multi_slot {
+            self.quota_admits(2 * BLOCK_SIZE_U64, 0)?;
+        } else {
+            self.quota_admits(BLOCK_SIZE_U64, 0)?;
+        }
+        // Two-slot path: split the incompressible plaintext at the
+        // envelope capacity and encrypt each half in its own slot.
+        // (Only reachable with `crypto-aes-gcm`; `multi_slot` is
+        // false on builds without it.)
+        #[cfg(feature = "crypto-aes-gcm")]
+        if multi_slot {
+            let key = self
+                .extent_key
+                .as_ref()
+                .ok_or(HxfsError::EncryptedPolicyInvalid)?;
+            // Store the ORIGINAL plaintext, not the (useless)
+            // oversized compressed payload: the read path
+            // concatenates the two slots verbatim and never runs a
+            // codec on a multi-slot record.
+            let (head, tail) = data.split_at(crate::extent_crypto::EXTENT_PLAINTEXT_BYTES);
+            let mut slot0 = [0u8; BLOCK_SIZE];
+            crate::extent_crypto::encrypt_extent_block(
+                key,
+                start,
+                &self.volume_uuid,
+                head,
+                &mut slot0,
+            )
+            .map_err(|_| HxfsError::BadBlock)?;
+            let mut slot1 = [0u8; BLOCK_SIZE];
+            crate::extent_crypto::encrypt_extent_block(
+                key,
+                start + 1,
+                &self.volume_uuid,
+                tail,
+                &mut slot1,
+            )
+            .map_err(|_| HxfsError::BadBlock)?;
+            self.store.write_blocks(start, 1, &slot0)?;
+            self.store.write_blocks(start + 1, 1, &slot1)?;
+            self.next_lba = self.next_lba.checked_add(2).ok_or(HxfsError::NoSpace)?;
+            return Ok((start, ExtentWriteKind::MultiSlot));
         }
         // Stage B.3 wire: when the volume is encrypted,
         // the on-disk extent block is the AES-256-GCM
@@ -1633,7 +1713,11 @@ impl<
         };
         self.store.write_blocks(start, 1, &block)?;
         self.next_lba = self.next_lba.checked_add(1).ok_or(HxfsError::NoSpace)?;
-        Ok((start, compression))
+        let kind = match compression {
+            Some(meta) => ExtentWriteKind::Compressed(meta),
+            None => ExtentWriteKind::Plain,
+        };
+        Ok((start, kind))
     }
 
     fn copy_extents(&mut self, object_id: u64, out: &mut [u8]) -> FixedResult<()> {
@@ -1671,6 +1755,46 @@ impl<
         if extent.flags & EXTENT_FLAG_HOLE != 0 {
             out[start..copy_end].fill(0);
             return Ok(());
+        }
+        // Two-slot extent: one logical block across two encrypted
+        // envelopes. Decrypt both slots and concatenate; the
+        // writer-side mirror of the reader's MULTI_SLOT path.
+        #[cfg(feature = "crypto-aes-gcm")]
+        if extent.flags & EXTENT_FLAG_MULTI_SLOT != 0 {
+            if self.extent_key.is_none() {
+                // A two-slot record on a volume without a key is a
+                // corrupt volume, not raw split plaintext.
+                return Err(HxfsError::BadTree);
+            }
+            let mut slot0 = [0u8; BLOCK_SIZE];
+            let mut slot1 = [0u8; BLOCK_SIZE];
+            self.store
+                .read_blocks(extent.physical_block, 1, &mut slot0)?;
+            self.store
+                .read_blocks(extent.physical_block + 1, 1, &mut slot1)?;
+            let mut dec0 = [0u8; BLOCK_SIZE];
+            let mut dec1 = [0u8; BLOCK_SIZE];
+            let plain0 =
+                self.decrypt_extent_block_if_encrypted(extent.physical_block, &slot0, &mut dec0)?;
+            let plain1 = self.decrypt_extent_block_if_encrypted(
+                extent.physical_block + 1,
+                &slot1,
+                &mut dec1,
+            )?;
+            let mut composed = [0u8; BLOCK_SIZE];
+            composed[..crate::extent_crypto::EXTENT_PLAINTEXT_BYTES]
+                .copy_from_slice(&plain0[..crate::extent_crypto::EXTENT_PLAINTEXT_BYTES]);
+            let tail = BLOCK_SIZE - crate::extent_crypto::EXTENT_PLAINTEXT_BYTES;
+            composed[crate::extent_crypto::EXTENT_PLAINTEXT_BYTES..]
+                .copy_from_slice(&plain1[..tail]);
+            let chunk = copy_end.min(start + BLOCK_SIZE) - start;
+            out[start..start + chunk].copy_from_slice(&composed[..chunk]);
+            return Ok(());
+        }
+        #[cfg(not(feature = "crypto-aes-gcm"))]
+        if extent.flags & EXTENT_FLAG_MULTI_SLOT != 0 {
+            // Two-slot extents are an encrypted-volume concept.
+            return Err(HxfsError::BadTree);
         }
         let mut scratch = [0u8; BLOCK_SIZE];
         let mut decrypted = [0u8; BLOCK_SIZE];
