@@ -657,7 +657,16 @@ pub const USER_ASPACE_SIZE: u64 = USER_ASPACE_END - USER_ASPACE_BASE;
 /// Top of the initial stack used by the userspace process launcher.
 pub const USER_STACK_TOP: u64 = 0x0000_7fff_ff00_0000;
 /// Size of the initial userspace stack mapped by the userspace process launcher.
-pub const USER_STACK_SIZE: u64 = 4096 * 16;
+///
+/// 128 KiB: the original 64 KiB overflowed for services that do
+/// real work on the boot call chain. The hxfs-service's
+/// encrypted+compressed write/read path needs deep frames (the
+/// writer's `write_data_blocks` and `copy_extent` keep several
+/// 4 KiB crypto scratch buffers live, and the boot self-check adds
+/// probe buffers on top of the mount chain); its first on-target
+/// write round-trip faulted ~62 KiB deep. The mapping is virtual
+/// reservation, so 128 KiB is cheap for every process.
+pub const USER_STACK_SIZE: u64 = 4096 * 32;
 
 /// Base of the userspace heap region mapped by the process launcher.
 ///

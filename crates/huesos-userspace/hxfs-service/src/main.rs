@@ -59,24 +59,27 @@ const MAX_READ_BYTES: usize = 4096;
 const MAX_NATIVE_REQUEST_BYTES: usize = HXFS_REQUEST_BYTES + HXFS_MAX_INLINE_WRITE_BYTES;
 // `poll_client` / `poll_file` / `poll_dir` allocate a scratch
 // buffer on the stack every time they are entered. The full
-// `MAX_NATIVE_REQUEST_BYTES` (4 KiB) is enough to overflow the 64
-// KiB `USER_STACK_SIZE` once `mount_from_bootstrap` and
-// `FixedHxfsWriter::mount` are on the same call chain, which is
-// the chain that runs on the first `runtime.poll` after
-// `[hxfs] service started`. The hxfs service is a single-process
-// loop and the largest request it actually services in qemu-nvme-boot
-// is a directory `OPEN_FILE <name>` whose name is at most
-// `MAX_NAME_BYTES` (255) bytes; 256 bytes is plenty. The
-// `MAX_NATIVE_REQUEST_BYTES` ABI constant is preserved for
-// `write_response_to_channel` (which only runs once per request).
+// `MAX_NATIVE_REQUEST_BYTES` (4 KiB) is enough to overflow the
+// stack once `mount_from_bootstrap` and `FixedHxfsWriter::mount`
+// are on the same call chain, which is the chain that runs on the
+// first `runtime.poll` after `[hxfs] service started`. The hxfs
+// service is a single-process loop and the largest request it
+// actually services in qemu-nvme-boot is a directory
+// `OPEN_FILE <name>` whose name is at most `MAX_NAME_BYTES` (255)
+// bytes; 256 bytes is plenty. The `MAX_NATIVE_REQUEST_BYTES` ABI
+// constant is preserved for `write_response_to_channel` (which
+// only runs once per request).
 const POLL_BUF_BYTES: usize = 256;
 // Sized to fit the `mount_from_bootstrap` -> `FixedHxfsWriter::mount`
-// stack frame inside `USER_STACK_SIZE` (64 KiB). The previous
-// 32/64/64 capacities put roughly 30 KiB of fixed `[Option<T>; N]`
-// arrays on the stack in a single frame, which overflowed the
-// guard page (`user-fault rip=0x403f4d address=0x7ffffefef688` in
-// the qemu-nvme-boot smoke). The seed v5 image uses only a handful
-// of objects/entries/extents, so 16/16/16 leaves comfortable headroom.
+// stack frame inside `USER_STACK_SIZE` (128 KiB since the
+// follow-up that added the boot write self-check; 64 KiB before,
+// which the write path's crypto frames overflowed at ~62 KiB
+// depth). The previous 32/64/64 capacities put roughly 30 KiB of
+// fixed `[Option<T>; N]` arrays on the stack in a single frame,
+// which overflowed the guard page (`user-fault rip=0x403f4d
+// address=0x7ffffefef688` in the qemu-nvme-boot smoke). The seed
+// v5 image uses only a handful of objects/entries/extents, so
+// 16/16/16 leaves comfortable headroom.
 const SERVICE_MAX_OBJECTS: usize = 16;
 const SERVICE_MAX_DIR_ENTRIES: usize = 16;
 const SERVICE_MAX_EXTENTS: usize = 16;
@@ -1544,48 +1547,59 @@ fn run_boot_self_check(fs: &mut MountedHxfs) {
 /// 32 dir entries / 16 extents).
 #[cfg(feature = "synthetic-key")]
 fn write_roundtrip_check(fs: &mut MountedHxfs) {
-    // Compressible probe: 2048 bytes of a repeated line.
-    let root = fs.root_directory();
+    // Each phase runs in its own scope so the compiler can reuse
+    // the stack slots: the crypto write/read frames already keep
+    // several 4 KiB scratch buffers live on the same call chain as
+    // mount_from_bootstrap, and holding all probe buffers at once
+    // overflowed the 64 KiB stack (the stack is now 128 KiB, but
+    // keeping the probe footprint small is still the right habit).
     const LINE: &[u8] = b"HuesOS on-target write roundtrip probe 0123456789\n";
-    let mut compressible = [0u8; 2048];
-    let mut pos = 0usize;
-    while pos < compressible.len() {
-        let n = (compressible.len() - pos).min(LINE.len());
-        compressible[pos..pos + n].copy_from_slice(&LINE[..n]);
-        pos += n;
-    }
-    match fs.create_file_child(root, "probe-compress.bin") {
-        Ok(file) => {
-            if let Err(error) = fs.write_file_at(file, 0, &compressible) {
-                println!("[hxfs] write-roundtrip: write failed ({:?})", error);
-            }
+    let root = fs.root_directory();
+    // Phase A: compressible probe (512 bytes of a repeated line).
+    {
+        let mut compressible = [0u8; 512];
+        let mut pos = 0usize;
+        while pos < compressible.len() {
+            let n = (compressible.len() - pos).min(LINE.len());
+            compressible[pos..pos + n].copy_from_slice(&LINE[..n]);
+            pos += n;
         }
-        Err(error) => println!("[hxfs] write-roundtrip: create failed ({:?})", error),
-    }
-    // Incompressible probe: a full 4 KiB pseudo-random block
-    // (deterministic xorshift64; incompressibility, not
-    // randomness, is what matters).
-    let mut random = [0u8; 4096];
-    let mut state = 0x9E37_79B9_7F4A_7C15u64;
-    pos = 0;
-    while pos < random.len() {
-        let mut x = state;
-        x ^= x << 13;
-        x ^= x >> 7;
-        x ^= x << 17;
-        state = x;
-        let bytes = x.to_le_bytes();
-        let n = (random.len() - pos).min(8);
-        random[pos..pos + n].copy_from_slice(&bytes[..n]);
-        pos += n;
-    }
-    match fs.create_file_child(root, "probe-random.bin") {
-        Ok(file) => {
-            if let Err(error) = fs.write_file_at(file, 0, &random) {
-                println!("[hxfs] multi-slot-write: write failed ({:?})", error);
+        match fs.create_file_child(root, "probe-compress.bin") {
+            Ok(file) => {
+                if let Err(error) = fs.write_file_at(file, 0, &compressible) {
+                    println!("[hxfs] write-roundtrip: write failed ({:?})", error);
+                }
             }
+            Err(error) => println!("[hxfs] write-roundtrip: create failed ({:?})", error),
         }
-        Err(error) => println!("[hxfs] multi-slot-write: create failed ({:?})", error),
+    }
+    // Phase B: incompressible probe — a full 4 KiB pseudo-random
+    // block (deterministic xorshift64; incompressibility, not
+    // randomness, is what matters). It must take the two-slot
+    // extent path on the encrypted volume.
+    {
+        let mut random = [0u8; 4096];
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let mut pos = 0usize;
+        while pos < random.len() {
+            let mut x = state;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            state = x;
+            let bytes = x.to_le_bytes();
+            let n = (random.len() - pos).min(8);
+            random[pos..pos + n].copy_from_slice(&bytes[..n]);
+            pos += n;
+        }
+        match fs.create_file_child(root, "probe-random.bin") {
+            Ok(file) => {
+                if let Err(error) = fs.write_file_at(file, 0, &random) {
+                    println!("[hxfs] multi-slot-write: write failed ({:?})", error);
+                }
+            }
+            Err(error) => println!("[hxfs] multi-slot-write: create failed ({:?})", error),
+        }
     }
     // Persist both writes, then reopen with fresh handles.
     match fs.publish_checkpoint() {
@@ -1595,33 +1609,57 @@ fn write_roundtrip_check(fs: &mut MountedHxfs) {
             return;
         }
     }
-    let mut cbuf = [0u8; 2048];
-    match fs.open_child_file(root, "probe-compress.bin") {
-        Ok(file) => match fs.read_file(file, &mut cbuf) {
-            Ok(n) if n == 2048 && cbuf[..n] == compressible[..] => {
-                println!("[hxfs] write-roundtrip-ok");
+    // Phase C: read back the compressible probe.
+    {
+        let mut cbuf = [0u8; 512];
+        let expected = {
+            let mut buf = [0u8; 512];
+            let mut pos = 0usize;
+            while pos < buf.len() {
+                let n = (buf.len() - pos).min(LINE.len());
+                buf[pos..pos + n].copy_from_slice(&LINE[..n]);
+                pos += n;
             }
-            Ok(n) => println!(
-                "[hxfs] write-roundtrip: mismatch (n={n}, expected {})",
-                compressible.len()
-            ),
-            Err(error) => println!("[hxfs] write-roundtrip: read failed ({:?})", error),
-        },
-        Err(error) => println!("[hxfs] write-roundtrip: reopen failed ({:?})", error),
+            buf
+        };
+        match fs.open_child_file(root, "probe-compress.bin") {
+            Ok(file) => match fs.read_file(file, &mut cbuf) {
+                Ok(n) if n == 512 && cbuf[..n] == expected[..] => {
+                    println!("[hxfs] write-roundtrip-ok");
+                }
+                Ok(n) => println!("[hxfs] write-roundtrip: mismatch (n={n}, expected 512)"),
+                Err(error) => println!("[hxfs] write-roundtrip: read failed ({:?})", error),
+            },
+            Err(error) => println!("[hxfs] write-roundtrip: reopen failed ({:?})", error),
+        }
     }
-    let mut rbuf = [0u8; 4096];
-    match fs.open_child_file(root, "probe-random.bin") {
-        Ok(file) => match fs.read_file(file, &mut rbuf) {
-            Ok(n) if n == 4096 && rbuf[..n] == random[..] => {
-                println!("[hxfs] multi-slot-write-ok");
-            }
-            Ok(n) => println!(
-                "[hxfs] multi-slot-write: mismatch (n={n}, expected {})",
-                random.len()
-            ),
-            Err(error) => println!("[hxfs] multi-slot-write: read failed ({:?})", error),
-        },
-        Err(error) => println!("[hxfs] multi-slot-write: reopen failed ({:?})", error),
+    // Phase D: read back the incompressible probe.
+    {
+        let mut rbuf = [0u8; 4096];
+        let mut expected = [0u8; 4096];
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let mut pos = 0usize;
+        while pos < expected.len() {
+            let mut x = state;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            state = x;
+            let bytes = x.to_le_bytes();
+            let n = (expected.len() - pos).min(8);
+            expected[pos..pos + n].copy_from_slice(&bytes[..n]);
+            pos += n;
+        }
+        match fs.open_child_file(root, "probe-random.bin") {
+            Ok(file) => match fs.read_file(file, &mut rbuf) {
+                Ok(n) if n == 4096 && rbuf[..n] == expected[..] => {
+                    println!("[hxfs] multi-slot-write-ok");
+                }
+                Ok(n) => println!("[hxfs] multi-slot-write: mismatch (n={n}, expected 4096)"),
+                Err(error) => println!("[hxfs] multi-slot-write: read failed ({:?})", error),
+            },
+            Err(error) => println!("[hxfs] multi-slot-write: reopen failed ({:?})", error),
+        }
     }
 }
 

@@ -48,6 +48,12 @@ struct FixedExtent {
 /// How a data block was stored on disk, decided by
 /// [`FixedHxfsWriter::write_data_blocks`] and serialized by the
 /// extent-table builder.
+///
+/// The `MultiSlot` variant is only produced by the
+/// `crypto-aes-gcm` build (the encrypted-volume two-slot path); on
+/// a build without crypto the variant is never constructed and
+/// dead-code analysis would flag it.
+#[cfg_attr(not(feature = "crypto-aes-gcm"), allow(dead_code))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ExtentWriteKind {
     /// Plaintext stored verbatim in one slot (plain volume, or an
@@ -1609,8 +1615,6 @@ impl<
         };
         #[cfg(feature = "crypto-aes-gcm")]
         let encrypted = self.extent_key.is_some();
-        #[cfg(not(feature = "crypto-aes-gcm"))]
-        let encrypted = false;
         // Two-slot whenever the bytes that would go on disk exceed
         // the envelope capacity. This includes a "successful" LZ4
         // compression whose payload is still > 4028 bytes (e.g. a
