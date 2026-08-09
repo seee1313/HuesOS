@@ -148,57 +148,84 @@ crash, mounts, and runs the terminal.
 
 ---
 
-## Stage B — I/O pipeline complete
+## Stage B — I/O pipeline complete  (**CLOSED**)
 
 **Why this stage exists.** Stage A wires the mount; Stage B makes
 the data path match the on-disk policy. Without Stage B, the
 system mounts a volume but reads it as if it were plain,
 silently losing any encrypted or compressed bytes.
 
-### Track B.1 — Encrypted metadata I/O
+### Track B.1 — Encrypted metadata I/O  (landed as PRs `hxfs-stage-b-io-pipeline` + `hxfs-stage-b2-wiring`)
 
-- Directory entries for an encrypted volume are stored as
-  `EncryptedDirent { nonce, ciphertext, tag }`; the dirent key
-  is derived from the parent dir id and the volume key.
-- The allocator tree, extent table, and quota tree are stored
-  in encrypted form on an encrypted volume; the block pointer
-  layer stays plain (so the allocator can still find free
-  extents without a key).
-- A `dump_decrypted_metadata` debug syscall renders a decrypted
-  view of the metadata block for diagnostic purposes; the key
-  is held only in the kernel address space.
+- Metadata blocks (dirent, extent table, allocation tree,
+  refcount tree, backref tree, quota tree) on an encrypted volume
+  are stored as v6 blocks: the 40-byte `BlockHeader` stays in
+  plaintext (so the layer can route by `block_type` without a
+  key), the payload is AES-256-GCM ciphertext under the per-volume
+  metadata subkey. Block pointers stay plain so the allocator can
+  find free extents without a key.
+- `FEATURE_INCOMPAT_V6_ENCRYPTED_METADATA` (bit 7) is checked at
+  `read_superblock`, so a reader without the feature rejects the
+  volume with `UnsupportedFormat` instead of mis-parsing.
+- The fixed writer's mount paths decrypt v6 metadata, so an
+  encrypted volume can be mounted into mutable state.
 
 **Exit criterion.** A file written to an encrypted volume
 survives a remount and reads back identically; metadata
-checksums match the decrypted bytes.
+checksums match the decrypted bytes. **Met** by
+`b1_b2_encrypted_volume_write_then_read_round_trip`.
 
-### Track B.2 — Encrypted filenames
+### Track B.2 — Encrypted filenames  (landed as PR `hxfs-stage-b2-wiring`)
 
-- Filename strings are encrypted under the parent-directory
-  key; the dir hash (used for `lookup`) is computed on the
-  plaintext name.
-- A side index from `(dir_id, file_id)` to the encrypted
-  filename lets the terminal display names without holding the
-  dir key in userspace.
-- Filename length is still bounded by `MAX_NAME_BYTES`, so
-  encryption + nonce + tag does not blow the budget.
+- Dirent name bodies on an encrypted volume are encrypted under
+  the per-volume metadata subkey (`nonce(12) || ciphertext ||
+  tag(16)` inside the v5 name region); lookup uses the plaintext
+  name after decryption. On-disk dirent bytes contain no
+  recognisable filename.
+- The `(dir_id, file_id)` → encrypted-name display side index is
+  **deferred to Stage D** (the plan's explicitly deferred item);
+  userspace display of names on encrypted volumes lands with the
+  Stage D key-handle work.
 
-**Exit criterion.** `ls` on an encrypted-volume directory
-shows the plaintext names; the encrypted bytes on disk do not
-contain a recognisable filename.
+**Exit criterion.** `ls` on an encrypted-volume directory shows
+the plaintext names; the encrypted bytes on disk do not contain a
+recognisable filename. **Met** by the B.1/B.2 round-trip test.
 
-### Track B.3 — Encrypted data extents
+### Track B.3 — Encrypted data extents  (landed as PR `hxfs-stage-b3-encrypted-extents` + Stage B.3 completion in PR `hxfs-stage-b5-e2e-gcm-inject`)
 
-- A `CompressedExtent` whose `encryption_policy_id` is non-zero
-  carries a `crypto: CompressionOutcome + EncryptionKey` wire
-  format; the read path decompresses then decrypts.
+- A data extent on an encrypted volume is stored as the
+  AES-256-GCM envelope of the (compressed) payload:
+  `nonce(12) || ciphertext(4028) || tag(16) || 40-byte zero-pad`,
+  exactly filling the 4 KiB extent slot. Read order is
+  **decrypt → decompress** (the page cache sits below the
+  encryption layer and holds plaintext).
+- **Write-side compression (Stage B.3 completion).** The merged
+  B.3 wired only the read side; the writer never compressed and no
+  on-disk descriptor existed, so the Stage B exit signal was
+  unreachable. The completion commit wires the full write path:
+  `FixedHxfsWriter` resolves the object's compression policy,
+  pads the plaintext to a full block, runs `compress_block`, and
+  emits **v2 extent-table records** (`BLOCK_TYPE_EXTENT_TABLE_V2`,
+  40 bytes: v1 fields + algorithm + compressed_bytes + CRC32C;
+  `EXTENT_FLAG_COMPRESSED` marks a compressed record). A v2 block
+  is emitted whenever the object's resolved policy selects a
+  codec — including incompressible fallback records stored plain
+  with the flag clear — so the read path never mis-decodes a
+  plain block under an LZ4 policy. Old volumes (v1 blocks) read
+  exactly as before; a v1 reader rejects a v2 block with
+  `BadBlock` (same idiom as the v6 metadata gate).
 - A corruption in either step surfaces as the precise error
-  (`BadChecksum` for compression, `CryptoError::BadKey` for
-  decryption) so the higher layer can mark the extent bad.
+  (`CompressionError::BadChecksum` via the descriptor CRC for a
+  corrupted compressed payload, `CryptoError::BadKey` for a bad
+  GCM tag) at the read boundary as `HxfsError::Compression`, so
+  the higher layer can mark the extent bad.
 
 **Exit criterion.** A file written with both compression and
 encryption survives a remount; a single-byte corruption in the
-on-disk extent is rejected with the precise error.
+on-disk extent is rejected with the precise error. **Met** by
+`write_then_read_encrypted_compressed_volume` (400 KiB, the
+single-block extent-table limit) and
+`corrupted_compressed_plain_volume_fails_read_with_precise_error`.
 
 ### Track B.4 — Direct I/O bypass semantics  (landed as PR `hxfs-stage-b4-odirect-deny`)
 
@@ -210,25 +237,61 @@ on-disk extent is rejected with the precise error.
 
 **Exit criterion.** `O_DIRECT` returns `Unsupported`; the
 non-direct path works; the documentation explains when
-`O_DIRECT` will be supported.
+`O_DIRECT` will be supported. **Met** by host tests plus an
+on-target probe (see Track B.5).
 
-**Implementation (commit 4).** The `huesos_abi::hxfs` request
-flag set gains a `request_flags::O_DIRECT = 0x4000` constant
-matching the Linux `O_DIRECT` bit value, so an unmodified
-Linux client can pass the flag through without a translation
-layer. The `huesos-hxfs-service` open / create paths check
-`request.flags & request_flags::O_DIRECT` and reply with
-`HxfsStatus::Unsupported` when the bit is set. The text
-protocol used by the `qemu-nvme-soak` debug harness gets an
-equivalent deny at `OPEN_FILE O_DIRECT ...` that returns
-`err:hxfs-unsupported`. The bit-detection helper lives in
-`huesos_hxfs::o_direct::has_o_direct` so the policy is
-testable from the host-test suite without booting the
-service; three host tests pin the bit value, the set-bit
-detection, and the unset-bit rejection. The kernel-side VFS
-is unchanged: `O_DIRECT` is denied in userspace before it
-ever reaches the kernel.
+### Track B.5 — End-to-end proof and on-target fault injection  (landed as PR `hxfs-stage-b5-e2e-gcm-inject`)
 
+- `write_then_read_encrypted_compressed_volume`: a 400 KiB file
+  (100 extents — the maximum the single-block extent table
+  supports with v2 records) written through `FixedHxfsWriter`
+  with encryption + LZ4 policies survives a remount and reads
+  back byte-for-byte; the on-disk layout is asserted (v2 extent
+  table, v6 header, GCM envelope with no plaintext leak); a
+  single-byte ciphertext flip is rejected with the precise
+  error. `incompressible_fallback_round_trips_on_plain_volume`
+  covers the random-data fallback.
+- `tools/hxfs-seed` (standalone host tool, same `FixedHxfsWriter`
+  the service uses) seeds a sparse encrypted+compressed volume
+  with a `seed.bin` file; `mkhxfs.py --seed-file ...` delegates
+  to it so the format is never reimplemented in Python.
+- `hxfs-service` gains a feature-gated (`synthetic-key`) boot
+  self-check: it mounts the seeded volume, exercises the O_DIRECT
+  deny predicate (`[hxfs] odirect-deny-ok`) and reads the seed
+  file (`[hxfs] self-check ok (N bytes)`); a corrupted encrypted
+  extent is detected and reported as `[hxfs] bad-gcm-tag-marked`
+  while the service keeps serving.
+- `ci-qemu-nvme-soak.sh` gains an injection mode (4th positional
+  arg `1`): `--inject-bad-gcm-tag` flips one bit of the seed
+  file's GCM ciphertext; the harness requires the two Stage B.5
+  markers. Wired into CI as the `qemu-nvme-gcm-inject` job.
+
+**Exit criterion.** The on-target trace shows `bad-gcm-tag-marked`
+and the mount continues. **Met** by the CI injection job.
+
+### Known limitations (documented, tracked)
+
+- **Single-block extent tables**: a file is capped at 101 v2
+  records (~404 KiB) because the writer's extent table is one
+  block per object. Multi-block extent trees are a Stage C+
+  item. This is why the E2E file is 400 KiB, not the 4 MiB the
+  original plan sketched.
+- **Incompressible full blocks on encrypted volumes**: the GCM
+  envelope holds at most 4028 plaintext bytes; a full 4 KiB block
+  that neither compresses below the limit nor fits verbatim is
+  rejected with `Unsupported` (loud, never silently truncated).
+  Incompressible round trips are covered on plain volumes.
+- **Synthetic key on target**: the soak's on-target encrypted
+  mount uses the documented developer-placeholder IKM derived
+  from the volume's instance UUID, behind the `synthetic-key`
+  feature. The Stage D TPM-backed KeyProvider replaces it.
+- **Soft crypto on the no-SIMD userspace target**: the `aes` /
+  `polyval` x86 fast paths cannot codegen without SSE2 (the
+  kernel context switch does not save XMM state), so the
+  synthetic-key build compiles them with `aes_force_soft` /
+  `polyval_force_soft`. Correct, slower; revisit with Stage D.
+
+---
 ---
 
 ## Stage C — Reliability surface

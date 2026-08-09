@@ -28,8 +28,14 @@ Mandatory storage gates:
 python3 tools/check-storage-production-gate.py
 python3 tools/storage-bench.py --iterations 10
 bash scripts/ci-qemu-nvme-soak.sh release 300
+bash scripts/ci-qemu-nvme-soak.sh release 300 /tmp/qemu-nvme-gcm-inject.log 1
 python3 tools/hxfs-scrub.py <installed-hxfs-image>
 ```
+
+(The second soak invocation is the Stage B.5 fault-injection gate:
+seeded encrypted+compressed volume with a flipped GCM bit; the
+trace must show `[hxfs] bad-gcm-tag-marked` and
+`[hxfs] odirect-deny-ok` with the service still serving.)
 
 Mandatory runtime/architecture gates still open:
 

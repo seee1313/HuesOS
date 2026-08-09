@@ -57,6 +57,21 @@ pub const BLOCK_TYPE_GPT_SUMMARY: u32 = 17;
 /// Metadata block type: installed layout manifest root.
 pub const BLOCK_TYPE_INSTALL_MANIFEST: u32 = 18;
 
+/// Metadata block type: extent table with v2 records.
+///
+/// A v2 extent-table block carries 40-byte records that extend the
+/// v1 32-byte shape with an optional per-extent compression
+/// descriptor (algorithm, compressed payload length, payload
+/// CRC32C) plus an [`EXTENT_FLAG_COMPRESSED`] marker bit. The
+/// writer emits a v2 block for an object only when at least one of
+/// its extents is actually stored compressed; all-plain objects
+/// keep the v1 block type so old readers of old volumes are
+/// unaffected. A v1 reader that encounters a v2 block must reject
+/// it (`BadBlock`) rather than parse v2 records with the v1
+/// stride; this mirrors the v6-encrypted-metadata gate established
+/// in Stage B.1.
+pub const BLOCK_TYPE_EXTENT_TABLE_V2: u32 = 19;
+
 /// Incompatible feature: v2 root-store state and feature flags are present.
 pub const FEATURE_INCOMPAT_V2_ROOT_STORE: u64 = 1 << 0;
 /// Incompatible feature: journal replay records may be required before mount.
@@ -126,6 +141,17 @@ pub const VOLUME_FLAG_HXBLOB: u32 = 1 << 2;
 pub const EXTENT_FLAG_HOLE: u32 = 1 << 0;
 /// File extent flag: preallocated/reserved extent.
 pub const EXTENT_FLAG_PREALLOCATED: u32 = 1 << 1;
+
+/// Extent flag: the extent carries a compression descriptor.
+///
+/// Set on v2 extent-table records whose on-disk block is the
+/// compressed payload (optionally inside the encrypted envelope).
+/// The record's `compressed_algorithm` / `compressed_bytes` /
+/// `payload_crc32c` fields describe the payload; the read path
+/// verifies the CRC32C after decoding so bit-rot in a compressed
+/// extent surfaces as `CompressionError::BadChecksum` rather than
+/// garbage bytes.
+pub const EXTENT_FLAG_COMPRESSED: u32 = 1 << 2;
 
 /// Stable UUID/GUID bytes.
 pub type Uuid = [u8; 16];

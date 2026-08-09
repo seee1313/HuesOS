@@ -2,6 +2,64 @@
 
 User-approved decisions for PR `huesos-dev/hxfs-stage-b-io-pipeline`.
 
+## Status: **CLOSED** (all tracks landed)
+
+| Commit | Scope | PR | Status |
+|--------|-------|----|--------|
+| 1 | v6 encrypted metadata wire format (aes-gcm, HKDF, feature bit) | `hxfs-stage-b-io-pipeline` (#159) | landed |
+| 2 | B.1 metadata + B.2 dirent-name encryption on read/write paths | `hxfs-stage-b2-wiring` (#160) | landed |
+| 3 | B.3 encrypted data extents (read side) | `hxfs-stage-b3-encrypted-extents` (#161) | landed |
+| 3+ | **B.3 completion: write-side compression + v2 extent records + CRC** (was missing from the merged B.3; without it the Stage B exit signal was unreachable) | `hxfs-stage-b5-e2e-gcm-inject` (#165) | landed |
+| 4 | O_DIRECT deny | `hxfs-stage-b4-odirect-deny` | landed |
+| 5 | E2E host test + `--inject-bad-gcm-tag` soak + on-target markers | `hxfs-stage-b5-e2e-gcm-inject` (#165) | landed |
+
+**Deviations from the letter of the plan, all owner-approved:**
+
+- **E2E file size 4 MiB → 400 KiB**: the writer's extent table is a
+  single block per object; with v2 records the payload holds
+  `(4056 − 16) / 40 = 101` records, i.e. 100 extents. Multi-block
+  extent trees are tracked as a Stage C+ limitation.
+- **Soak seed file 3.5 KiB** (one extent): the service's
+  fixed-capacity read API serves files ≤ 4 KiB (single-buffer
+  `read_file`, 64 KiB user stack). The soak file only needs to
+  prove the on-target pipeline, and it does.
+- **Write-side compression was not in the merged B.3** (the writer
+  wrapped raw plaintext in the GCM envelope and never compressed;
+  the `CompressedExtent` descriptor was never serialized). The
+  completion commit (see above) wires it: v2 extent-table records
+  (`BLOCK_TYPE_EXTENT_TABLE_V2`, 40 bytes, `EXTENT_FLAG_COMPRESSED`,
+  algorithm/compressed_bytes/CRC32C), emitted whenever the object's
+  resolved policy selects a codec, so incompressible fallback
+  records decode as plaintext. Old volumes (v1 records) read
+  exactly as before.
+- **On-target synthetic key**: the soak's encrypted mount uses the
+  documented developer-placeholder IKM (derived from the volume's
+  instance UUID) behind the `synthetic-key` feature of
+  `hxfs-service`; the plan's own "Known risks" section already
+  deferred the real key provider to Stage D. The service self-check
+  and the two soak markers make the pipeline provable on target
+  today.
+- **`read_superblock` feature-bit risk**: resolved — the V6 bit is
+  in `SUPPORTED_INCOMPAT_FEATURES` and unknown bits are rejected
+  with `UnsupportedFormat` (`lib.rs` `read_superblock`).
+- **A.6 heap mapping delivered (found by the QEMU soak)**: Stage A
+  wired the hxfs-service's global allocator against
+  `USER_HEAP_BASE` and documented that the kernel reserves the
+  region, but the mapping was never implemented — the service's
+  first real allocation (the Stage B.5 policy table) page-faulted
+  at `0x70000000` on target. The process launcher now maps the
+  fixed 256 KiB RW heap region for every process at creation
+  (`finish_process_creation`), and the service's `HEAP_BASE` /
+  `HEAP_SIZE` come from `huesos_abi`. Also fixed while debugging
+  the soak: the writer's mount path decrypts v6 metadata *and*
+  encrypted dirent names (the latter with the
+  `ENCRYPTED_DIRENT_MIN_BODY` length discriminator, since the
+  writer mounts pre-publish images whose names are still
+  plaintext), and the kernel build script now tracks the
+  `huesos-hxfs` / `huesos-abi` / `huesos-user-alloc` sources so a
+  change there re-embeds the userspace binaries instead of
+  silently shipping a stale service ELF in the ISO.
+
 ## Scope
 Four tracks, five commits, one PR.
 
