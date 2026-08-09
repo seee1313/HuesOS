@@ -1033,6 +1033,10 @@ impl<
                 );
             }
         }
+        #[cfg(not(feature = "crypto-aes-gcm"))]
+        {
+            let _ = parent_object_id;
+        }
         let entry = parse_dir_record(block, offset)?;
         let name_bytes = entry.name.as_bytes();
         if scratch.len() < name_bytes.len() {
