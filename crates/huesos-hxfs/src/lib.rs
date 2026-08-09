@@ -1313,12 +1313,24 @@ mod extent_record_v2_tests {
             1024,
             0xdead_beef,
         );
-        let (extent, meta) = parse_extent_record_v2(&record, 0).expect("valid v2 record");
+        let (extent, meta) = match parse_extent_record_v2(&record, 0) {
+            Ok(parsed) => parsed,
+            Err(e) => {
+                assert!(false, "valid v2 record must parse: {:?}", e);
+                return;
+            }
+        };
         assert_eq!(extent.logical_block, 7);
         assert_eq!(extent.physical_block, 42);
         assert_eq!(extent.block_count, 1);
         assert_eq!(extent.flags, EXTENT_FLAG_COMPRESSED);
-        let meta = meta.expect("compressed record must carry a descriptor");
+        let meta = match meta {
+            Some(meta) => meta,
+            None => {
+                assert!(false, "compressed record must carry a descriptor");
+                return;
+            }
+        };
         assert_eq!(meta.algorithm, compression::COMPRESSION_LZ4);
         assert_eq!(meta.compressed_bytes, 1024);
         assert_eq!(meta.payload_crc32c, 0xdead_beef);
@@ -1327,7 +1339,13 @@ mod extent_record_v2_tests {
     #[test]
     fn v2_plain_record_round_trip_without_descriptor() {
         let record = make_v2_record(0, 0, 0, 0);
-        let (extent, meta) = parse_extent_record_v2(&record, 0).expect("valid plain v2 record");
+        let (extent, meta) = match parse_extent_record_v2(&record, 0) {
+            Ok(parsed) => parsed,
+            Err(e) => {
+                assert!(false, "valid plain v2 record must parse: {:?}", e);
+                return;
+            }
+        };
         assert_eq!(extent.flags, 0);
         assert!(meta.is_none());
     }

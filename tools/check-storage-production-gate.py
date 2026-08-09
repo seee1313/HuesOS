@@ -15,7 +15,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 REQUIRED_PATHS = [
     Path("docs/STORAGE_PRODUCTION_GATE.md"),
-    Path("docs/STORAGE_NVME_FS_ROADMAP.md"),
+    Path("docs/PRODUCTION_ROADMAP.md"),
     Path("tools/mkhxfs.py"),
     Path("tools/hxfs-inspect.py"),
     Path("tools/hxfs-scrub.py"),

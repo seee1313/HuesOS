@@ -4,6 +4,7 @@ set -euo pipefail
 profile="${1:-release}"
 seconds="${2:-300}"
 log="${3:-build/qemu-nvme-soak.log}"
+inject="${4:-0}"
 nvme_img="${NVME_IMG:-build/nvme-soak.img}"
 nvme_size="${NVME_IMG_SIZE:-4G}"
 ovmf="${OVMF_PATH:-third_party/ovmf/OVMF.fd}"
@@ -12,8 +13,16 @@ nvme_layout="${QEMU_NVME_LAYOUT:-split}"
 mkdir -p build "$(dirname "$log")" "$(dirname "$nvme_img")"
 rm -f "$log"
 
-echo "[soak] profile=${profile} seconds=${seconds} log=${log} nvme_img=${nvme_img} layout=${nvme_layout}"
+echo "[soak] profile=${profile} seconds=${seconds} log=${log} nvme_img=${nvme_img} layout=${nvme_layout} inject=${inject}"
 echo "[soak] building ISO before NVMe soak"
+# Stage B.5: the injection mode builds the ISO with the
+# synthetic-key feature so the embedded hxfs-service mounts the
+# encrypted+compressed soak volume and runs its boot self-check.
+# Production builds (and the plain soak mode) leave the variable
+# unset and the test wiring stays out of the binary.
+if [[ "$inject" == "1" ]]; then
+    export HUESOS_HXFS_SERVICE_FEATURES=synthetic-key
+fi
 case "$profile" in
     release) CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-1}" make iso-release >/tmp/huesos-nvme-soak-build.log ;;
     debug) CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-1}" make iso PROFILE=debug >/tmp/huesos-nvme-soak-build.log ;;
@@ -60,7 +69,17 @@ if [[ ! -f "$nvme_img" ]]; then
         echo "[soak] image too small for Hxfs (need >= 32 KiB)" >&2
         exit 1
     fi
-    python3 tools/mkhxfs.py --output "$nvme_img" --blocks "$hxfs_blocks" >/dev/null
+    if [[ "$inject" == "1" ]]; then
+        # Stage B.5: seeded encrypted+compressed volume with one
+        # bit of the seed file's GCM ciphertext flipped. The volume
+        # still mounts (metadata intact); the service self-check
+        # must report `bad-gcm-tag-marked` and keep serving.
+        echo "[soak] creating seeded Hxfs image with bad-GCM injection: $nvme_img"
+        python3 tools/mkhxfs.py --output "$nvme_img" --blocks "$hxfs_blocks" \
+            --seed-file seed.bin --seed-size 3584 --inject-bad-gcm-tag >/dev/null
+    else
+        python3 tools/mkhxfs.py --output "$nvme_img" --blocks "$hxfs_blocks" >/dev/null
+    fi
 fi
 
 qemu_common=(
@@ -117,6 +136,15 @@ required=(
     "[driver-manager] registered identified block:nvme namespace"
     "[hxfs] service started"
 )
+if [[ "$inject" == "1" ]]; then
+    # Stage B.5: the boot self-check must have detected the flipped
+    # GCM bit (bad-gcm-tag-marked) and exercised the O_DIRECT deny
+    # probe (odirect-deny-ok) while the service kept serving.
+    required+=(
+        "[hxfs] bad-gcm-tag-marked"
+        "[hxfs] odirect-deny-ok"
+    )
+fi
 for marker in "${required[@]}"; do
     if ! grep -Fq "$marker" "$log"; then
         echo "[soak] missing marker: $marker" >&2
