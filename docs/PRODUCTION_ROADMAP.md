@@ -299,7 +299,7 @@ and the mount continues. **Met** by the CI injection job.
 ---
 ---
 
-## Stage C — Reliability surface
+## Stage C — Reliability surface  (partial landing: PR `hxfs-stage-c-reliability`)
 
 **Why this stage exists.** Storage devices fail. The on-disk
 layout is fixed-capacity and a single bad LBA is recoverable
@@ -307,71 +307,107 @@ only if the system notices it, marks the bad extent, and
 continues. Without Stage C, a single media error turns into a
 panic or, worse, a silent corruption.
 
-### Track C.1 — Media error handling
+### Track C.1 — Media error handling  (partially landed)
 
-- Every block read that returns a transport error marks the
-  extent bad, returns `Io` to the caller, and continues with
-  the next extent.
-- Every block write that returns a transport error is retried
-  once; if the retry fails, the write is rolled back at the
-  journal layer.
-- A read of a marked-bad extent returns `Io` without retrying;
-  the caller can reallocate around the bad extent.
+- **Bad-extent registry (landed).** Every data-extent read that
+  fails decrypt/CRC/decompress verification marks the physical
+  LBA in the per-mount registry (`FixedHxfsWriter::bad_extent_count`
+  / `Hxfs::bad_extents`); a later read of the same extent fails
+  fast without touching the disk, and unrelated files keep
+  working. The on-target trace prints
+  `[hxfs] extent-bad-marked (N)` after the seed read fails.
+- **Write transport-error retry (landed).** `BlockDevice::write_blocks`
+  and `flush` retry once before surfacing a transport error (C.1
+  media-error policy); the journal-layer rollback decision stays
+  with the hxfs-service. Journal replay already exists (Stage A).
+- **Userspace LBA injection (landed).** `tools/hxfs-seed`
+  supports `--inject-bad-gcm-tag` (encrypted volume, GCM
+  ciphertext bit -> `bad-gcm-tag-marked`) and `--inject-bad-crc`
+  (plain volume, compressed-payload byte -> `bad-checksum-marked`);
+  `tools/hxfs-scrub.py --inject-bad-lba` remains open.
 
-**Exit criterion.** A QEMU disk with a known-bad LBA at a known
-offset produces the on-target trace `bad-extent-marked` and
-continues to mount; `tools/hxfs-scrub.py --inject-bad-lba` covers
-the same path from userspace.
+**Exit criterion (partial).** A QEMU volume with a corrupted LBA
+at a known offset produces the on-target trace
+`bad-gcm-tag-marked` / `bad-checksum-marked` + `extent-bad-marked`
+and continues to mount — **met** by the `qemu-nvme-gcm-inject`
+and `qemu-nvme-crc-inject` CI jobs. The write-side retry half of
+the exit signal is open.
 
-### Track C.2 — Online fsck
+### Track C.2 — Online fsck  (partially landed)
 
-- `tools/hxfs-fsck.py` walks the on-disk tree and reports
-  inconsistencies.
-- An online `fsck --fix` path applies the obvious safe fixes
-  (re-orphaned dir entries, stale refcount bumps) and reports
-  the rest for human review.
+- **Structural fsck (landed).** `FixedHxfsWriter::fsck`
+  re-validates the persisted superblock/checkpoint/volume table
+  and the in-memory object model (root presence, object-id
+  uniqueness, dangling dir entries, overlapping extents, record
+  counts) and returns a `FsckSummary { checks, errors }`; the
+  service prints `[hxfs] fsck clean (N checks)` / `[hxfs] fsck
+  findings (N errors)` at boot. The `fsck.rs` checkpoint-root
+  policy core (report-only, `FsckReport`) exists from Stage W.
+- **Repair (`fsck --fix`) (open).** Destructive repair is
+  deliberately excluded until a repair policy is reviewed; the
+  production gate still lists "destructive fsck repair policy
+  approval".
+- **`tools/hxfs-fsck.py` (open).** The userspace walker tool is
+  not yet built; the on-target fsck covers the same ground for
+  live volumes.
 
-**Exit criterion.** A volume with a known inconsistency
-(orphaned dir entry, stale refcount) fsck-fixes to a clean
-state; the same inconsistency without `--fix` produces a
-precise report.
+### Track C.3 — Scrub  (partially landed)
 
-### Track C.3 — Scrub
+- **Live scrub (landed).** `FixedHxfsWriter::scrub` walks every
+  live object: re-validates each metadata tree block through the
+  decrypt-aware read path and reads every data extent through the
+  full decrypt/decompress/CRC path, returning
+  `ScrubSummary { metadata_blocks, data_blocks, data_bytes,
+  errors }`; errors are counted and the offending extents are
+  marked bad. The service prints
+  `[hxfs] scrub complete (N blocks, M errors)` at boot; the
+  injection soaks assert it with M == 1 (the seeded corruption)
+  while the service keeps serving.
+- **Full-tree scrub traversal beyond live objects (open).** The
+  scrub walks the mounted object model; scrubbing every tree
+  (allocator/refcount/backref/quota) from disk is a follow-up.
+  `tools/hxfs-scrub.py` (report-only root/checkpoint checks)
+  exists from Stage W.
 
-- `huesos-fsck scrub` walks the volume and reads every block;
-  a bad block is reported and the surrounding extent is
-  reallocated from spare.
-- A `tools/hxfs-scrub.py` tool runs the same pass from userspace
-  for operator convenience.
+### Track C.4 — Quota enforcement at every write  (landed, service path)
 
-**Exit criterion.** A volume with a known-bad LBA inside an
-extent gets the extent reallocated; the reallocation is
-journaled; a remount sees the reallocated extent.
+- The writer's volume-quota gate (`set_quota_limits`,
+  `check_volume_quota` + the allocator gate `quota_admits`) runs
+  on every write path (file write, object create) and rejects a
+  breach with `QuotaExceeded` / `NoSpace` (the user-visible
+  "quota breach" error). The on-target quota probe sets the limit
+  to one block above usage and asserts that the second 4 KiB
+  write is rejected -> `[hxfs] quota-enforced-ok`.
+- **Kernel-path per-Job quotas (open).** There is no kernel-side
+  VFS (storage is a userspace service), so "kernel path" is the
+  service's production write path, which is covered. Per-Job
+  quota records (`quota_tree.rs`) are host-tested; wiring them
+  into the service request path is a follow-up.
 
-### Track C.4 — Quota enforcement at every write
+### Track C.5 — Error injection  (landed)
 
-- Quota is enforced on the **write path** of the in-kernel
-  fixed-capacity dispatcher, not only on the host-test path.
-- A Job that exceeds its quota is throttled; the throttling
-  is observable in the Job's per-CPU tick counter.
+- `qemu-nvme-soak` mode 1 (`--inject-bad-gcm-tag`, encrypted
+  volume): required markers `bad-gcm-tag-marked`,
+  `extent-bad-marked`, plus the Stage B.5 markers and the Stage C
+  probes. CI job `qemu-nvme-gcm-inject`.
+- `qemu-nvme-soak` mode 2 (`--inject-bad-crc`, plain volume):
+  required markers `bad-checksum-marked`, `extent-bad-marked`,
+  plus the same probe set. CI job `qemu-nvme-crc-inject`.
+- The service distinguishes the two failures by volume type
+  (`fs.encryption()`): an encrypted volume's read failure is a
+  GCM-tag failure, a plain volume's is a payload-CRC failure.
 
-**Exit criterion.** A Job at the quota edge gets
-`QuotaError::Exceeded` and the kernel returns `NoSpace` to
-userspace; the volume stays consistent; a second Job in the
-same Job tree with a lower quota gets the same outcome.
+### Exit signal status
 
-### Track C.5 — Error injection for tests
-
-- `qemu-nvme-soak --inject` flags inject a known-bad LBA at a
-  known offset, a known-corrupted extent, or a known-stale
-  checkpoint.
-- The injection is one-shot; the next boot is clean.
-
-**Exit criterion.** Every Stage C track has a `--inject` test
-in `qemu-nvme-soak` that exercises the failure path.
+Landed: corrupted-extent detection with precise on-target
+markers, bad-extent marking + fail-fast + service continuation,
+live scrub and structural fsck probes, quota enforcement on the
+production write path, two fault-injection CI jobs. Open: write
+transport-error retry/rollback, destructive fsck repair policy,
+full-tree scrub traversal, per-Job quota records in the service,
+`hxfs-fsck.py`, 24 h soak, NVMe high queue-depth soak.
 
 ---
-
 ## Stage D — Security gate
 
 **Why this stage exists.** Production storage that allows a

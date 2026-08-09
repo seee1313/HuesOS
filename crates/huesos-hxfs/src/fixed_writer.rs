@@ -17,10 +17,52 @@ use crate::{
     validate_metadata_block, ExtentCompressionMeta, HxfsError, DIR_RECORD_BYTES,
     EXTENT_RECORD_BYTES, EXTENT_RECORD_BYTES_V2, HEADER_BYTES, OBJECT_RECORD_BYTES,
 };
+use alloc::vec;
 use alloc::vec::Vec;
 
 /// Fixed writer mount/mutation result.
 pub type FixedResult<T> = Result<T, HxfsError>;
+
+/// Bounded per-mount registry of data extents whose read failed
+/// (decrypt/CRC/decompress error). Subsequent reads of a marked
+/// extent fail fast without touching the disk; other files keep
+/// working. Stage C: the extent is "bad" for the lifetime of the
+/// mount; persisting the marker on disk is a Stage C+ item.
+pub const MAX_BAD_EXTENTS: usize = 16;
+
+/// Stage C: report-only live scrub summary.
+///
+/// The scrub walks every live object: it re-validates each
+/// metadata tree block (header + CRC, through the same
+/// decrypt-aware read path as the mount) and reads every data
+/// extent through the full decrypt/decompress/CRC path into a
+/// scratch buffer. Errors are counted and the offending extents
+/// are marked bad, but scrub never repairs anything.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ScrubSummary {
+    /// Metadata tree blocks re-validated.
+    pub metadata_blocks: u64,
+    /// Data extent blocks read and verified.
+    pub data_blocks: u64,
+    /// Data bytes read and verified.
+    pub data_bytes: u64,
+    /// Failures encountered (metadata or data).
+    pub errors: u64,
+}
+
+/// Stage C: report-only structural fsck summary.
+///
+/// Re-validates the persisted superblock/checkpoint/volume table
+/// and the in-memory object model: root presence, object-id
+/// uniqueness, directory entries referencing live objects,
+/// per-object extent monotonicity, and record counts.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct FsckSummary {
+    /// Checks performed.
+    pub checks: u64,
+    /// Findings.
+    pub errors: u64,
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct FixedObject {
@@ -122,6 +164,11 @@ pub struct FixedHxfsWriter<
     /// mount (the reader does the same), and the fixed metadata
     /// arrays stay fixed-capacity.
     compression_policies: Vec<crate::compression::CompressionPolicy>,
+    /// Stage C: per-mount registry of bad data extents (physical
+    /// LBAs whose read failed). Bounded by [`MAX_BAD_EXTENTS`];
+    /// `bad_extent_count` mirrors the used slots.
+    bad_extents: [Option<u64>; MAX_BAD_EXTENTS],
+    bad_extent_count: usize,
     objects: [Option<FixedObject>; MAX_OBJECTS],
     dir_entries: [Option<FixedDirEntry>; MAX_DIR_ENTRIES],
     extents: [Option<FixedExtent>; MAX_EXTENTS],
@@ -265,6 +312,8 @@ impl<
             #[cfg(feature = "crypto-aes-gcm")]
             volume_uuid: superblock.instance_uuid,
             compression_policies: Vec::new(),
+            bad_extents: [const { None }; MAX_BAD_EXTENTS],
+            bad_extent_count: 0,
             objects: [const { None }; MAX_OBJECTS],
             dir_entries: [const { None }; MAX_DIR_ENTRIES],
             extents: [const { None }; MAX_EXTENTS],
@@ -282,6 +331,249 @@ impl<
     /// plain volumes. Mirrors [`Hxfs::encryption`].
     pub const fn encryption(&self) -> Option<&crate::crypto::EncryptionPolicy> {
         self.encryption.as_ref()
+    }
+
+    /// Number of data extents marked bad on this mount (Stage C).
+    pub const fn bad_extent_count(&self) -> usize {
+        self.bad_extent_count
+    }
+
+    /// Whether `lba` is a known-bad data extent on this mount.
+    fn is_bad_extent(&self, lba: u64) -> bool {
+        let mut index = 0usize;
+        while index < self.bad_extent_count {
+            if self.bad_extents[index] == Some(lba) {
+                return true;
+            }
+            index += 1;
+        }
+        false
+    }
+
+    /// Mark `lba` as a bad data extent (bounded, deduplicated).
+    fn mark_bad_extent(&mut self, lba: u64) {
+        if self.is_bad_extent(lba) || self.bad_extent_count >= MAX_BAD_EXTENTS {
+            return;
+        }
+        self.bad_extents[self.bad_extent_count] = Some(lba);
+        self.bad_extent_count += 1;
+    }
+
+    /// Stage C: report-only live scrub of the persisted volume.
+    ///
+    /// Walks every live object: re-validates each metadata tree
+    /// block through the decrypt-aware read path and reads every
+    /// data extent through the full decrypt/decompress/CRC path.
+    /// Failures are counted and the offending extents are marked
+    /// bad; scrub never repairs. The scrub checks the persisted
+    /// state (the store), not un-published in-memory mutations.
+    pub fn scrub(&mut self) -> FixedResult<ScrubSummary> {
+        let mut summary = ScrubSummary::default();
+        let mut index = 0usize;
+        while index < self.objects.len() {
+            if let Some(object) = self.objects[index] {
+                let descriptor = object.descriptor;
+                // Metadata tree block.
+                let mut block = [0u8; BLOCK_SIZE];
+                let metadata_ok = match descriptor.object_type {
+                    OBJECT_TYPE_DIRECTORY => self
+                        .read_mounted_metadata_block(
+                            descriptor.tree_lba,
+                            BLOCK_TYPE_DIRECTORY,
+                            descriptor.object_id,
+                            &mut block,
+                        )
+                        .is_ok(),
+                    OBJECT_TYPE_FILE | OBJECT_TYPE_SYMLINK => self
+                        .read_mounted_metadata_block_any_type(
+                            descriptor.tree_lba,
+                            BLOCK_TYPE_EXTENT_TABLE,
+                            BLOCK_TYPE_EXTENT_TABLE_V2,
+                            descriptor.object_id,
+                            &mut block,
+                        )
+                        .is_ok(),
+                    _ => true,
+                };
+                if metadata_ok {
+                    summary.metadata_blocks += 1;
+                } else {
+                    summary.errors += 1;
+                }
+                // Data extents.
+                if matches!(
+                    descriptor.object_type,
+                    OBJECT_TYPE_FILE | OBJECT_TYPE_SYMLINK
+                ) {
+                    let mut extent_index = 0usize;
+                    while extent_index < self.extents.len() {
+                        if let Some(extent) = self.extents[extent_index] {
+                            if extent.object_id != descriptor.object_id {
+                                extent_index += 1;
+                                continue;
+                            }
+                            let logical = if extent.extent.flags & EXTENT_FLAG_MULTI_SLOT != 0 {
+                                1
+                            } else {
+                                u64::from(extent.extent.block_count)
+                            };
+                            let logical = match usize::try_from(logical) {
+                                Ok(v) => v,
+                                Err(_) => {
+                                    summary.errors += 1;
+                                    extent_index += 1;
+                                    continue;
+                                }
+                            };
+                            let mut buf = vec![0u8; logical * BLOCK_SIZE];
+                            match self.copy_extent(extent.extent, extent.compression, &mut buf) {
+                                Ok(()) => {
+                                    summary.data_blocks += logical as u64;
+                                    summary.data_bytes += buf.len() as u64;
+                                }
+                                Err(HxfsError::Compression) => {
+                                    summary.errors += 1;
+                                    self.mark_bad_extent(extent.extent.physical_block);
+                                }
+                                Err(_) => {
+                                    summary.errors += 1;
+                                }
+                            }
+                        }
+                        extent_index += 1;
+                    }
+                }
+            }
+            index += 1;
+        }
+        Ok(summary)
+    }
+
+    /// Stage C: report-only structural fsck.
+    ///
+    /// Re-validates the persisted superblock/checkpoint/volume
+    /// table and the in-memory object model. Structural damage
+    /// (bad superblock, duplicate object ids, dangling directory
+    /// entries, overlapping extents, count mismatches) is counted;
+    /// fsck never repairs.
+    pub fn fsck(&mut self) -> FsckSummary {
+        let mut summary = FsckSummary::default();
+        // Persisted roots.
+        summary.checks += 1;
+        if read_superblock(&mut self.store, 0).is_err() {
+            summary.errors += 1;
+        }
+        summary.checks += 1;
+        if read_checkpoint(
+            &mut self.store,
+            self.superblock.checkpoint_lba,
+            self.superblock.sequence_number,
+        )
+        .is_err()
+        {
+            summary.errors += 1;
+        }
+        summary.checks += 1;
+        if read_system_volume(&mut self.store, self.checkpoint).is_err() {
+            summary.errors += 1;
+        }
+        // Root object present.
+        summary.checks += 1;
+        if self.object(self.system_volume.root_object_id).is_err() {
+            summary.errors += 1;
+        }
+        // Object-id uniqueness.
+        summary.checks += 1;
+        let mut index = 0usize;
+        while index < self.objects.len() {
+            if let Some(object) = self.objects[index] {
+                let mut other = index + 1;
+                while other < self.objects.len() {
+                    if let Some(peer) = self.objects[other] {
+                        if peer.descriptor.object_id == object.descriptor.object_id {
+                            summary.errors += 1;
+                        }
+                    }
+                    other += 1;
+                }
+            }
+            index += 1;
+        }
+        // Directory entries: target exists, name non-empty, no
+        // duplicate (parent, object).
+        summary.checks += 1;
+        index = 0;
+        while index < self.dir_entries.len() {
+            if let Some(entry) = self.dir_entries[index] {
+                if entry.name_len == 0 || self.object(entry.object_id).is_err() {
+                    summary.errors += 1;
+                }
+                let mut other = index + 1;
+                while other < self.dir_entries.len() {
+                    if let Some(peer) = self.dir_entries[other] {
+                        if peer.parent_object_id == entry.parent_object_id
+                            && peer.object_id == entry.object_id
+                        {
+                            summary.errors += 1;
+                        }
+                    }
+                    other += 1;
+                }
+            }
+            index += 1;
+        }
+        // Extent monotonicity per object (logical ranges must not
+        // overlap; multi-slot records cover one logical block).
+        summary.checks += 1;
+        index = 0;
+        while index < self.extents.len() {
+            if let Some(extent) = self.extents[index] {
+                let end = extent.extent.logical_block
+                    + if extent.extent.flags & EXTENT_FLAG_MULTI_SLOT != 0 {
+                        1
+                    } else {
+                        u64::from(extent.extent.block_count)
+                    };
+                let mut other = 0usize;
+                while other < self.extents.len() {
+                    if let Some(peer) = self.extents[other] {
+                        if peer.object_id == extent.object_id
+                            && peer.extent.logical_block >= extent.extent.logical_block
+                            && peer.extent.logical_block < end
+                            && !(peer.extent.physical_block == extent.extent.physical_block
+                                && peer.extent.flags == extent.extent.flags)
+                        {
+                            summary.errors += 1;
+                        }
+                    }
+                    other += 1;
+                }
+            }
+            index += 1;
+        }
+        // Record counts: live dir entries / extents per object
+        // must match the object descriptor.
+        summary.checks += 1;
+        index = 0;
+        while index < self.objects.len() {
+            if let Some(object) = self.objects[index] {
+                let expected = object.descriptor.record_count;
+                let actual = match object.descriptor.object_type {
+                    OBJECT_TYPE_DIRECTORY => {
+                        self.directory_entry_count(object.descriptor.object_id)
+                    }
+                    OBJECT_TYPE_FILE | OBJECT_TYPE_SYMLINK => {
+                        self.extent_count(object.descriptor.object_id)
+                    }
+                    _ => expected,
+                };
+                if actual != expected {
+                    summary.errors += 1;
+                }
+            }
+            index += 1;
+        }
+        summary
     }
 
     /// Consume the writer and return the underlying block store.
@@ -1756,6 +2048,11 @@ impl<
             out[start..copy_end].fill(0);
             return Ok(());
         }
+        // Stage C: a known-bad extent fails fast without touching
+        // the disk.
+        if self.is_bad_extent(extent.physical_block) {
+            return Err(HxfsError::Compression);
+        }
         // Two-slot extent: one logical block across two encrypted
         // envelopes. Decrypt both slots and concatenate; the
         // writer-side mirror of the reader's MULTI_SLOT path.
@@ -1774,13 +2071,28 @@ impl<
                 .read_blocks(extent.physical_block + 1, 1, &mut slot1)?;
             let mut dec0 = [0u8; BLOCK_SIZE];
             let mut dec1 = [0u8; BLOCK_SIZE];
-            let plain0 =
-                self.decrypt_extent_block_if_encrypted(extent.physical_block, &slot0, &mut dec0)?;
-            let plain1 = self.decrypt_extent_block_if_encrypted(
+            let plain0 = match self.decrypt_extent_block_if_encrypted(
+                extent.physical_block,
+                &slot0,
+                &mut dec0,
+            ) {
+                Ok(plain) => plain,
+                Err(error) => {
+                    self.mark_bad_extent(extent.physical_block);
+                    return Err(error);
+                }
+            };
+            let plain1 = match self.decrypt_extent_block_if_encrypted(
                 extent.physical_block + 1,
                 &slot1,
                 &mut dec1,
-            )?;
+            ) {
+                Ok(plain) => plain,
+                Err(error) => {
+                    self.mark_bad_extent(extent.physical_block + 1);
+                    return Err(error);
+                }
+            };
             let mut composed = [0u8; BLOCK_SIZE];
             composed[..crate::extent_crypto::EXTENT_PLAINTEXT_BYTES]
                 .copy_from_slice(&plain0[..crate::extent_crypto::EXTENT_PLAINTEXT_BYTES]);
@@ -1811,12 +2123,19 @@ impl<
             // payload when the record carries a compression
             // descriptor (CRC-verified). A bad AEAD tag or a
             // payload CRC mismatch surfaces as `HxfsError::Compression`
-            // so the caller can mark the extent bad and continue.
-            let plain: &[u8] = self.decrypt_extent_block_if_encrypted(
+            // and the extent is marked bad (Stage C) so a retry
+            // does not re-read the same bytes.
+            let plain: &[u8] = match self.decrypt_extent_block_if_encrypted(
                 extent.physical_block + extent_block as u64,
                 &scratch,
                 &mut decrypted,
-            )?;
+            ) {
+                Ok(plain) => plain,
+                Err(error) => {
+                    self.mark_bad_extent(extent.physical_block + extent_block as u64);
+                    return Err(error);
+                }
+            };
             let block_slice: &[u8] = if let Some(meta) = compression {
                 let payload = &plain[..meta.compressed_bytes as usize];
                 let descriptor = crate::compression::CompressedExtent {
@@ -1827,9 +2146,14 @@ impl<
                     algorithm: meta.algorithm,
                     payload_crc32c: meta.payload_crc32c,
                 };
-                crate::compression::decompress_block(&descriptor, payload, &mut decompressed)
-                    .map_err(|_| HxfsError::Compression)?;
-                &decompressed[..]
+                match crate::compression::decompress_block(&descriptor, payload, &mut decompressed)
+                {
+                    Ok(()) => &decompressed[..],
+                    Err(_) => {
+                        self.mark_bad_extent(extent.physical_block + extent_block as u64);
+                        return Err(HxfsError::Compression);
+                    }
+                }
             } else {
                 plain
             };

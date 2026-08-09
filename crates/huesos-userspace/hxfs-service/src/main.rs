@@ -1513,19 +1513,93 @@ fn run_boot_self_check(fs: &mut MountedHxfs) {
             match fs.read_file(file, &mut buf) {
                 Ok(n) => println!("[hxfs] self-check ok ({} bytes)", n),
                 Err(HxfsError::Compression) => {
-                    // The seeded extent's GCM tag (or descriptor
-                    // CRC) did not verify: the corruption was
-                    // detected and the service keeps serving.
-                    // The soak asserts this marker with
-                    // --inject-bad-gcm-tag.
-                    println!("[hxfs] bad-gcm-tag-marked");
+                    // The seeded extent's integrity check failed.
+                    // On an encrypted volume the failure is the GCM
+                    // tag (--inject-bad-gcm-tag); on a plain volume
+                    // it is the compressed-payload CRC32C
+                    // (--inject-bad-crc). The volume type
+                    // discriminates the two; the extent was marked
+                    // bad and the service keeps serving.
+                    if fs.encryption().is_some() {
+                        println!("[hxfs] bad-gcm-tag-marked");
+                    } else {
+                        println!("[hxfs] bad-checksum-marked");
+                    }
                 }
                 Err(error) => println!("[hxfs] self-check failed: {:?}", error),
             }
         }
         Err(error) => println!("[hxfs] self-check: seed file absent ({:?})", error),
     }
+    if fs.bad_extent_count() > 0 {
+        println!("[hxfs] extent-bad-marked ({})", fs.bad_extent_count());
+    }
     write_roundtrip_check(fs);
+    run_reliability_checks(fs);
+}
+
+/// Stage C: live scrub, structural fsck and quota enforcement
+/// probes, all through the production write/read paths.
+#[cfg(feature = "synthetic-key")]
+fn run_reliability_checks(fs: &mut MountedHxfs) {
+    // Live scrub: re-validates every metadata tree block and reads
+    // every data extent through the full verify path.
+    match fs.scrub() {
+        Ok(summary) => println!(
+            "[hxfs] scrub complete ({} blocks, {} errors)",
+            summary.metadata_blocks + summary.data_blocks,
+            summary.errors
+        ),
+        Err(error) => println!("[hxfs] scrub failed: {:?}", error),
+    }
+    // Structural fsck: persisted roots + object model.
+    let fsck = fs.fsck();
+    if fsck.errors == 0 {
+        println!("[hxfs] fsck clean ({} checks)", fsck.checks);
+    } else {
+        println!("[hxfs] fsck findings ({} errors)", fsck.errors);
+    }
+    // Quota enforcement on the production write path: set the
+    // volume limit to exactly one block above the current usage,
+    // then attempt two 4 KiB writes. The first must pass, the
+    // second must be rejected. Both the writer's volume check
+    // (QuotaExceeded) and the allocator gate (NoSpace, which is
+    // the user-visible "quota breach" error per the roadmap) prove
+    // enforcement, so either is accepted.
+    let base = fs.committed_physical_bytes();
+    if fs.set_quota_limits(base + 8192, 0).is_err() {
+        println!("[hxfs] quota-probe-failed (set_quota_limits)");
+        return;
+    }
+    let root = fs.root_directory();
+    match fs.create_file_child(root, "probe-quota.bin") {
+        Ok(file) => {
+            let mut chunk = [0u8; 4096];
+            let line: &[u8] = b"HuesOS quota probe 0123456789\n";
+            let mut pos = 0usize;
+            while pos < chunk.len() {
+                let n = (chunk.len() - pos).min(line.len());
+                chunk[pos..pos + n].copy_from_slice(&line[..n]);
+                pos += n;
+            }
+            let first = fs.write_file_at(file, 0, &chunk);
+            let second = fs.write_file_at(file, 4096, &chunk);
+            if first.is_ok()
+                && matches!(
+                    second,
+                    Err(HxfsError::QuotaExceeded) | Err(HxfsError::NoSpace)
+                )
+            {
+                println!("[hxfs] quota-enforced-ok");
+            } else {
+                println!(
+                    "[hxfs] quota-probe-failed (first={:?} second={:?})",
+                    first, second
+                );
+            }
+        }
+        Err(error) => println!("[hxfs] quota-probe-failed (create {:?})", error),
+    }
 }
 
 /// Phase-1 follow-up: prove the write pipeline on target.

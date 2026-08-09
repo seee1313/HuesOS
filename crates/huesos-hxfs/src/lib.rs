@@ -156,6 +156,12 @@ pub struct Hxfs<R: BlockReader> {
     /// `compression_policy_id`. The field is empty for callers
     /// that never set a non-plain volume policy.
     compression_policies: Vec<compression::CompressionPolicy>,
+    /// Stage C: per-mount registry of bad data extents (physical
+    /// LBAs whose read failed). Subsequent reads fail fast without
+    /// touching the disk; other files keep working. Mirrors the
+    /// writer's bounded registry (this one is a `Vec` because the
+    /// reader already allocates).
+    bad_extents: Vec<u64>,
     /// Per-volume page cache for decompressed 4 KiB blocks
     /// (A.4 of PRODUCTION_ROADMAP.md). The cache is FIFO with
     /// a 16 MiB / 4096-entry working set; invalidation is by
@@ -305,6 +311,7 @@ impl<R: BlockReader> Hxfs<R> {
             #[cfg(feature = "crypto-aes-gcm")]
             extent_key,
             compression_policies: Vec::new(),
+            bad_extents: Vec::new(),
             page_cache: page_cache::PageCache::new(),
         })
     }
@@ -330,6 +337,13 @@ impl<R: BlockReader> Hxfs<R> {
     /// can inspect it for diagnostics without holding a key.
     pub const fn encryption(&self) -> Option<&crypto::EncryptionPolicy> {
         self.encryption.as_ref()
+    }
+
+    /// Stage C: physical LBAs of data extents marked bad on this
+    /// mount. A read that failed decrypt/CRC/decompress verification
+    /// marks its extent here; subsequent reads fail fast.
+    pub fn bad_extents(&self) -> &[u64] {
+        &self.bad_extents
     }
 
     /// Superblock chosen at mount.
@@ -826,7 +840,12 @@ impl<R: BlockReader> Hxfs<R> {
             // the plain v5 read path is taken and the
             // cfg-conditional arguments are simply absent
             // from the call site.
-            copy_extent_with_keys(
+            // Stage C: a known-bad extent fails fast without
+            // touching the disk.
+            if self.bad_extents.contains(&extent.physical_block) {
+                return Err(HxfsError::Compression);
+            }
+            if let Err(error) = copy_extent_with_keys(
                 &mut self.reader,
                 extent,
                 compression,
@@ -838,7 +857,16 @@ impl<R: BlockReader> Hxfs<R> {
                 #[cfg(feature = "crypto-aes-gcm")]
                 &self.superblock.instance_uuid,
                 out,
-            )?;
+            ) {
+                // Stage C: mark the extent bad so a retry does not
+                // re-read the same bytes, then propagate.
+                if error == HxfsError::Compression
+                    && !self.bad_extents.contains(&extent.physical_block)
+                {
+                    self.bad_extents.push(extent.physical_block);
+                }
+                return Err(error);
+            }
             index += 1;
         }
         Ok(())
@@ -2880,6 +2908,280 @@ fn incompressible_full_block_on_encrypted_volume_uses_two_slot_extent() {
         &buf[BLOCK_SIZE..],
         &near_full[..],
         "near-full block must round-trip"
+    );
+}
+
+/// Stage C: a data extent whose read fails is marked bad on the
+/// writer's per-mount registry; a second read fails fast without
+/// re-reading the disk, and other files keep working.
+#[cfg(all(test, feature = "crypto-aes-gcm", feature = "compression-engines"))]
+#[test]
+fn stage_c_bad_extent_is_marked_and_fails_fast() {
+    use crate::fixed_writer::{FixedHxfsWriter, MAX_BAD_EXTENTS};
+    use crate::recovery::BlockStore;
+    use crate::writer::VecBlockStore;
+
+    let comps = [crate::synthetic_key::compression_policy()];
+    let boot_image = build_seeded_boot_image(false, crate::synthetic_key::COMPRESSION_POLICY_ID);
+    let mut store = RecordingStore::new(VecBlockStore::with_blocks(512));
+    let boot_blocks = (boot_image.len() / BLOCK_SIZE) as u32;
+    if let Err(e) = store.write_blocks(0, boot_blocks, &boot_image) {
+        assert!(false, "boot write must succeed: {:?}", e);
+        return;
+    }
+    let Ok(mut writer) =
+        FixedHxfsWriter::<RecordingStore, 16, 32, 64>::mount_with_policies(store, &[], &comps)
+    else {
+        assert!(false, "writer mount must succeed");
+        return;
+    };
+    let root = writer.root_directory();
+    let file = match writer.open_child_file(root, crate::synthetic_key::SEED_FILE_NAME) {
+        Ok(f) => f,
+        Err(e) => {
+            assert!(false, "open_child_file must succeed: {:?}", e);
+            return;
+        }
+    };
+    // A second file that must remain readable after the bad-extent
+    // marking.
+    let good_file = match writer.create_file_child(root, "good.bin") {
+        Ok(f) => f,
+        Err(e) => {
+            assert!(false, "create good.bin must succeed: {:?}", e);
+            return;
+        }
+    };
+    writer.store_mut().start_recording();
+    let mut index = 0usize;
+    while index < 8 {
+        let mut chunk = [0u8; BLOCK_SIZE];
+        fill_compressible_chunk(&mut chunk, index);
+        if let Err(e) = writer.write_file_at(file, (index * BLOCK_SIZE) as u64, &chunk) {
+            assert!(false, "write_file_at must succeed: {:?}", e);
+            return;
+        }
+        index += 1;
+    }
+    let mut good = [0u8; BLOCK_SIZE];
+    fill_compressible_chunk(&mut good, 99);
+    if let Err(e) = writer.write_file_at(good_file, 0, &good) {
+        assert!(false, "good write must succeed: {:?}", e);
+        return;
+    }
+    let ranges = writer.store_mut().stop_recording();
+    let corrupt_lba = ranges[0].0;
+    // Corrupt one byte of the compressed payload of the first
+    // extent (plain volume: payload starts at block offset 0).
+    let mut block = [0u8; BLOCK_SIZE];
+    if writer
+        .store_mut()
+        .read_blocks(corrupt_lba, 1, &mut block)
+        .is_err()
+    {
+        assert!(false, "read for corruption must succeed");
+        return;
+    }
+    block[10] ^= 0x40;
+    if writer
+        .store_mut()
+        .write_blocks(corrupt_lba, 1, &block)
+        .is_err()
+    {
+        assert!(false, "corruption write must succeed");
+        return;
+    }
+
+    // First read fails and marks the extent.
+    let mut buf = vec![0u8; 8 * BLOCK_SIZE];
+    assert_eq!(
+        writer.read_file(file, &mut buf).err(),
+        Some(HxfsError::Compression),
+        "corrupted payload must fail the read"
+    );
+    assert_eq!(writer.bad_extent_count(), 1, "extent must be marked bad");
+    // Second read fails fast (same error, no double-counting).
+    assert_eq!(
+        writer.read_file(file, &mut buf).err(),
+        Some(HxfsError::Compression),
+        "a marked extent must keep failing"
+    );
+    assert_eq!(writer.bad_extent_count(), 1, "marking must deduplicate");
+    // The registry is bounded.
+    assert!(MAX_BAD_EXTENTS >= 1);
+    // Other files still read fine.
+    let mut gbuf = [0u8; BLOCK_SIZE];
+    assert_eq!(
+        writer.read_file(good_file, &mut gbuf),
+        Ok(BLOCK_SIZE),
+        "unrelated file must still be readable"
+    );
+    assert_eq!(&gbuf[..], &good[..]);
+}
+
+/// Stage C: the live scrub re-validates metadata tree blocks and
+/// reads every data extent through the full verify path. A clean
+/// volume reports zero errors; a corrupted payload is counted and
+/// the extent is marked bad.
+#[cfg(all(test, feature = "crypto-aes-gcm", feature = "compression-engines"))]
+#[test]
+fn stage_c_scrub_reports_clean_and_corrupt() {
+    use crate::fixed_writer::FixedHxfsWriter;
+    use crate::recovery::BlockStore;
+    use crate::writer::VecBlockStore;
+
+    let comps = [crate::synthetic_key::compression_policy()];
+    let boot_image = build_seeded_boot_image(false, crate::synthetic_key::COMPRESSION_POLICY_ID);
+    let mut store = RecordingStore::new(VecBlockStore::with_blocks(512));
+    let boot_blocks = (boot_image.len() / BLOCK_SIZE) as u32;
+    if let Err(e) = store.write_blocks(0, boot_blocks, &boot_image) {
+        assert!(false, "boot write must succeed: {:?}", e);
+        return;
+    }
+    let Ok(mut writer) =
+        FixedHxfsWriter::<RecordingStore, 16, 32, 64>::mount_with_policies(store, &[], &comps)
+    else {
+        assert!(false, "writer mount must succeed");
+        return;
+    };
+    let root = writer.root_directory();
+    let file = match writer.open_child_file(root, crate::synthetic_key::SEED_FILE_NAME) {
+        Ok(f) => f,
+        Err(e) => {
+            assert!(false, "open_child_file must succeed: {:?}", e);
+            return;
+        }
+    };
+    writer.store_mut().start_recording();
+    let mut index = 0usize;
+    while index < 4 {
+        let mut chunk = [0u8; BLOCK_SIZE];
+        fill_compressible_chunk(&mut chunk, index);
+        if let Err(e) = writer.write_file_at(file, (index * BLOCK_SIZE) as u64, &chunk) {
+            assert!(false, "write_file_at must succeed: {:?}", e);
+            return;
+        }
+        index += 1;
+    }
+    let ranges = writer.store_mut().stop_recording();
+    if let Err(e) = writer.publish_checkpoint() {
+        assert!(false, "publish_checkpoint must succeed: {:?}", e);
+        return;
+    }
+    // Clean scrub.
+    let clean = match writer.scrub() {
+        Ok(s) => s,
+        Err(e) => {
+            assert!(false, "scrub must run: {:?}", e);
+            return;
+        }
+    };
+    assert_eq!(clean.errors, 0, "clean volume must scrub with zero errors");
+    assert!(
+        clean.metadata_blocks >= 2,
+        "at least superblock + tree blocks"
+    );
+    assert!(clean.data_blocks >= 4, "four data blocks verified");
+    assert_eq!(clean.data_bytes, 4 * BLOCK_SIZE as u64);
+    // Corrupt one payload byte and scrub again.
+    let corrupt_lba = ranges[0].0;
+    let mut block = [0u8; BLOCK_SIZE];
+    if writer
+        .store_mut()
+        .read_blocks(corrupt_lba, 1, &mut block)
+        .is_err()
+    {
+        assert!(false, "read for corruption must succeed");
+        return;
+    }
+    block[10] ^= 0x40;
+    if writer
+        .store_mut()
+        .write_blocks(corrupt_lba, 1, &block)
+        .is_err()
+    {
+        assert!(false, "corruption write must succeed");
+        return;
+    }
+    let corrupt = match writer.scrub() {
+        Ok(s) => s,
+        Err(e) => {
+            assert!(false, "scrub must run on corrupt volume: {:?}", e);
+            return;
+        }
+    };
+    assert!(
+        corrupt.errors >= 1,
+        "corrupted payload must be counted by scrub (errors={})",
+        corrupt.errors
+    );
+    assert!(
+        writer.bad_extent_count() >= 1,
+        "scrub must mark the bad extent"
+    );
+}
+
+/// Stage C: the structural fsck re-validates the persisted roots
+/// and the in-memory object model. A clean volume reports zero
+/// findings; a corrupted superblock payload is counted.
+#[cfg(all(test, feature = "crypto-aes-gcm", feature = "compression-engines"))]
+#[test]
+fn stage_c_fsck_reports_clean_and_corrupt() {
+    use crate::fixed_writer::FixedHxfsWriter;
+    use crate::recovery::BlockStore;
+    use crate::writer::VecBlockStore;
+
+    let comps = [crate::synthetic_key::compression_policy()];
+    let boot_image = build_seeded_boot_image(false, crate::synthetic_key::COMPRESSION_POLICY_ID);
+    let mut store = RecordingStore::new(VecBlockStore::with_blocks(512));
+    let boot_blocks = (boot_image.len() / BLOCK_SIZE) as u32;
+    if let Err(e) = store.write_blocks(0, boot_blocks, &boot_image) {
+        assert!(false, "boot write must succeed: {:?}", e);
+        return;
+    }
+    let Ok(mut writer) =
+        FixedHxfsWriter::<RecordingStore, 16, 32, 64>::mount_with_policies(store, &[], &comps)
+    else {
+        assert!(false, "writer mount must succeed");
+        return;
+    };
+    let root = writer.root_directory();
+    let file = match writer.open_child_file(root, crate::synthetic_key::SEED_FILE_NAME) {
+        Ok(f) => f,
+        Err(e) => {
+            assert!(false, "open_child_file must succeed: {:?}", e);
+            return;
+        }
+    };
+    let mut chunk = [0u8; BLOCK_SIZE];
+    fill_compressible_chunk(&mut chunk, 0);
+    if let Err(e) = writer.write_file_at(file, 0, &chunk) {
+        assert!(false, "write_file_at must succeed: {:?}", e);
+        return;
+    }
+    if let Err(e) = writer.publish_checkpoint() {
+        assert!(false, "publish_checkpoint must succeed: {:?}", e);
+        return;
+    }
+    let clean = writer.fsck();
+    assert_eq!(clean.errors, 0, "clean volume must fsck clean");
+    assert!(clean.checks >= 5, "fsck must run its full check set");
+    // Corrupt the persisted superblock payload.
+    let mut block = [0u8; BLOCK_SIZE];
+    if writer.store_mut().read_blocks(0, 1, &mut block).is_err() {
+        assert!(false, "read superblock must succeed");
+        return;
+    }
+    block[HEADER_BYTES + 10] ^= 0x01;
+    if writer.store_mut().write_blocks(0, 1, &block).is_err() {
+        assert!(false, "corrupt superblock write must succeed");
+        return;
+    }
+    let corrupt = writer.fsck();
+    assert!(
+        corrupt.errors >= 1,
+        "corrupted superblock must be counted by fsck (errors={})",
+        corrupt.errors
     );
 }
 
