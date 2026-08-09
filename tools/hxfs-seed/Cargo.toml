@@ -1,0 +1,18 @@
+[package]
+name = "huesos-hxfs-seed"
+version = "0.1.0"
+edition = "2021"
+description = "Host-side Hxfs volume seeder for the qemu-nvme soak (Stage B.5)"
+license = "MIT"
+
+[dependencies]
+huesos-hxfs = { path = "../../crates/huesos-hxfs", features = [
+    "crypto-aes-gcm",
+    "compression-engines",
+] }
+
+# Standalone host tool: not a member of the kernel workspace, same
+# convention as tools/hbi-gen. Run through tools/hxfs-seed.sh, which
+# pins the host target explicitly (the repo-root .cargo/config.toml
+# forces the freestanding kernel target otherwise).
+[workspace]
