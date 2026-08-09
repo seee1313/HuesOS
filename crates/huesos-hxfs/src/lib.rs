@@ -2974,15 +2974,23 @@ fn stage_c_bad_extent_is_marked_and_fails_fast() {
     // Corrupt one byte of the compressed payload of the first
     // extent (plain volume: payload starts at block offset 0).
     let mut block = [0u8; BLOCK_SIZE];
-    writer
+    if writer
         .store_mut()
         .read_blocks(corrupt_lba, 1, &mut block)
-        .expect("read for corruption");
+        .is_err()
+    {
+        assert!(false, "read for corruption must succeed");
+        return;
+    }
     block[10] ^= 0x40;
-    writer
+    if writer
         .store_mut()
         .write_blocks(corrupt_lba, 1, &block)
-        .expect("corruption write");
+        .is_err()
+    {
+        assert!(false, "corruption write must succeed");
+        return;
+    }
 
     // First read fails and marks the extent.
     let mut buf = vec![0u8; 8 * BLOCK_SIZE];
@@ -3078,15 +3086,23 @@ fn stage_c_scrub_reports_clean_and_corrupt() {
     // Corrupt one payload byte and scrub again.
     let corrupt_lba = ranges[0].0;
     let mut block = [0u8; BLOCK_SIZE];
-    writer
+    if writer
         .store_mut()
         .read_blocks(corrupt_lba, 1, &mut block)
-        .expect("read for corruption");
+        .is_err()
+    {
+        assert!(false, "read for corruption must succeed");
+        return;
+    }
     block[10] ^= 0x40;
-    writer
+    if writer
         .store_mut()
         .write_blocks(corrupt_lba, 1, &block)
-        .expect("corruption write");
+        .is_err()
+    {
+        assert!(false, "corruption write must succeed");
+        return;
+    }
     let corrupt = match writer.scrub() {
         Ok(s) => s,
         Err(e) => {
@@ -3152,15 +3168,15 @@ fn stage_c_fsck_reports_clean_and_corrupt() {
     assert!(clean.checks >= 5, "fsck must run its full check set");
     // Corrupt the persisted superblock payload.
     let mut block = [0u8; BLOCK_SIZE];
-    writer
-        .store_mut()
-        .read_blocks(0, 1, &mut block)
-        .expect("read superblock");
+    if writer.store_mut().read_blocks(0, 1, &mut block).is_err() {
+        assert!(false, "read superblock must succeed");
+        return;
+    }
     block[HEADER_BYTES + 10] ^= 0x01;
-    writer
-        .store_mut()
-        .write_blocks(0, 1, &block)
-        .expect("corrupt superblock");
+    if writer.store_mut().write_blocks(0, 1, &block).is_err() {
+        assert!(false, "corrupt superblock write must succeed");
+        return;
+    }
     let corrupt = writer.fsck();
     assert!(
         corrupt.errors >= 1,
