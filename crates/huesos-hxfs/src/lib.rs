@@ -44,6 +44,8 @@ pub mod recovery;
 pub mod ref_tree;
 pub mod scrub;
 pub mod security_policy;
+#[cfg(feature = "crypto-aes-gcm")]
+pub mod synthetic_key;
 pub mod volume_topology;
 #[cfg(any(test, feature = "writer"))]
 pub mod writer;
@@ -749,23 +751,32 @@ impl<R: BlockReader> Hxfs<R> {
             return Ok(());
         }
         let mut block = [0u8; BLOCK_SIZE];
-        self.read_metadata_block(
+        let (header, block_type) = self.read_metadata_block_any_type(
             object.tree_lba,
             BLOCK_TYPE_EXTENT_TABLE,
+            BLOCK_TYPE_EXTENT_TABLE_V2,
             object.object_id,
             &mut block,
         )?;
-        let header = parse_header(&block)?;
         let owner = read_u64(&block, header.header_bytes as usize)?;
         let count = read_u32(&block, header.header_bytes as usize + 8)?;
         if owner != object.object_id || count != object.record_count {
             return Err(HxfsError::BadTree);
         }
+        let record_bytes = if block_type == BLOCK_TYPE_EXTENT_TABLE_V2 {
+            EXTENT_RECORD_BYTES_V2
+        } else {
+            EXTENT_RECORD_BYTES
+        };
         let mut previous_logical_end = 0u64;
         let mut index = 0u32;
         while index < count {
-            let offset = header.header_bytes as usize + 16 + index as usize * EXTENT_RECORD_BYTES;
-            let extent = parse_extent_record(&block, offset)?;
+            let offset = header.header_bytes as usize + 16 + index as usize * record_bytes;
+            let (extent, meta) = if block_type == BLOCK_TYPE_EXTENT_TABLE_V2 {
+                parse_extent_record_v2(&block, offset)?
+            } else {
+                (parse_extent_record(&block, offset)?, None)
+            };
             if extent.logical_block < previous_logical_end {
                 return Err(HxfsError::BadTree);
             }
@@ -773,11 +784,20 @@ impl<R: BlockReader> Hxfs<R> {
                 .logical_block
                 .checked_add(u64::from(extent.block_count))
                 .ok_or(HxfsError::OutOfRange)?;
-            let compression = resolve_compression_for_object(
-                &self.system_volume,
-                &self.compression_policies,
-                object,
-            );
+            // v1 records: the compression decision comes from the
+            // resolved policy (pre-B.3-completion behaviour). v2
+            // records carry the per-extent descriptor instead, so
+            // the policy is not consulted and an incompressible
+            // block that was stored plain is not mis-decoded.
+            let compression = if block_type == BLOCK_TYPE_EXTENT_TABLE {
+                resolve_compression_for_object(
+                    &self.system_volume,
+                    &self.compression_policies,
+                    object,
+                )
+            } else {
+                None
+            };
             // Stage B.3 wire: decide whether the extent is
             // encrypted (per-object policy with per-volume
             // fallback) and pass the matching subkey + volume
@@ -801,6 +821,7 @@ impl<R: BlockReader> Hxfs<R> {
                 &mut self.reader,
                 extent,
                 compression,
+                meta,
                 &mut self.page_cache,
                 0,
                 #[cfg(feature = "crypto-aes-gcm")]
@@ -821,8 +842,35 @@ impl<R: BlockReader> Hxfs<R> {
         owner_id: u64,
         out: &mut [u8; BLOCK_SIZE],
     ) -> Result<BlockHeader, HxfsError> {
+        Ok(self
+            .read_metadata_block_any_type(lba, block_type, block_type, owner_id, out)?
+            .0)
+    }
+
+    /// Like [`Self::read_metadata_block`], but accepts either of
+    /// two block types and returns the type that matched.
+    ///
+    /// Stage B.3 completion: the writer emits extent tables as
+    /// [`BLOCK_TYPE_EXTENT_TABLE`] (v1 records, plain objects) or
+    /// [`BLOCK_TYPE_EXTENT_TABLE_V2`] (v2 records, objects with at
+    /// least one compressed extent); the read path validates
+    /// against the actual header type so a v1 reader of a v2
+    /// block (or vice versa) fails with a precise `BadBlock`
+    /// instead of parsing with the wrong record stride.
+    fn read_metadata_block_any_type(
+        &mut self,
+        lba: u64,
+        block_type_a: u32,
+        block_type_b: u32,
+        owner_id: u64,
+        out: &mut [u8; BLOCK_SIZE],
+    ) -> Result<(BlockHeader, u32), HxfsError> {
         self.reader.read_blocks(lba, 1, out)?;
-        let header = validate_metadata_block(out, lba, block_type, owner_id)?;
+        let header = parse_header(out)?;
+        if header.block_type != block_type_a && header.block_type != block_type_b {
+            return Err(HxfsError::BadBlock);
+        }
+        let header = validate_metadata_block(out, lba, header.block_type, owner_id)?;
         // Stage B.1 wire: decrypt the payload in place if the
         // block header says v6. We do this *after* the
         // structural validation so a tampered v6 block surfaces
@@ -845,7 +893,7 @@ impl<R: BlockReader> Hxfs<R> {
             )
             .map_err(|_| HxfsError::BadChecksum)?;
         }
-        Ok(header)
+        Ok((header, header.block_type))
     }
 }
 
@@ -1154,6 +1202,215 @@ pub(crate) fn parse_extent_record(block: &[u8], offset: usize) -> Result<ExtentR
     Ok(record)
 }
 
+/// Byte width of a v2 extent-table record
+/// ([`BLOCK_TYPE_EXTENT_TABLE_V2`]). The v1 record is 32 bytes;
+/// the v2 record adds an optional per-extent compression
+/// descriptor (algorithm, compressed payload length, payload
+/// CRC32C) in the 8 bytes that v1 leaves unused.
+pub(crate) const EXTENT_RECORD_BYTES_V2: usize = 40;
+
+/// Per-extent compression descriptor carried by a v2
+/// extent-table record. `Some` means the on-disk block is the
+/// compressed payload (optionally inside the encrypted envelope);
+/// the read path slices `compressed_bytes` out of the (decrypted)
+/// block, decompresses it, and verifies `payload_crc32c` so a
+/// corrupted compressed extent surfaces as
+/// `CompressionError::BadChecksum` instead of garbage bytes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ExtentCompressionMeta {
+    /// Codec algorithm id ([`compression::COMPRESSION_LZ4`] or
+    /// [`compression::COMPRESSION_ZSTD`]).
+    pub algorithm: u32,
+    /// Compressed payload length in bytes. The payload is the
+    /// prefix of the (decrypted) on-disk block.
+    pub compressed_bytes: u32,
+    /// CRC32C over the compressed payload bytes.
+    pub payload_crc32c: u32,
+}
+
+/// Parse one v2 extent-table record.
+///
+/// Returns the base [`ExtentRecord`] plus the compression
+/// descriptor when [`EXTENT_FLAG_COMPRESSED`] is set. A record
+/// that claims compression without a well-formed descriptor (or a
+/// descriptor without the flag) is corrupt and rejected with
+/// [`HxfsError::BadTree`]; a hole that also claims compression is
+/// rejected the same way.
+pub(crate) fn parse_extent_record_v2(
+    block: &[u8],
+    offset: usize,
+) -> Result<(ExtentRecord, Option<ExtentCompressionMeta>), HxfsError> {
+    let logical_block = read_u64(block, offset)?;
+    let physical_block = read_u64(block, offset + 8)?;
+    let block_count = read_u32(block, offset + 16)?;
+    let flags = read_u32(block, offset + 20)?;
+    let algorithm = read_u32(block, offset + 24)?;
+    let compressed_bytes = read_u32(block, offset + 28)?;
+    let payload_crc32c = read_u32(block, offset + 32)?;
+    if block_count == 0 {
+        return Err(HxfsError::BadTree);
+    }
+    let compressed = flags & EXTENT_FLAG_COMPRESSED != 0;
+    if compressed && flags & EXTENT_FLAG_HOLE != 0 {
+        return Err(HxfsError::BadTree);
+    }
+    let meta = if compressed {
+        if !matches!(
+            algorithm,
+            compression::COMPRESSION_LZ4 | compression::COMPRESSION_ZSTD
+        ) || compressed_bytes == 0
+            || compressed_bytes as usize > BLOCK_SIZE
+        {
+            return Err(HxfsError::BadTree);
+        }
+        Some(ExtentCompressionMeta {
+            algorithm,
+            compressed_bytes,
+            payload_crc32c,
+        })
+    } else {
+        // A plain v2 record must not carry descriptor bytes;
+        // they would be silently ignored otherwise.
+        if algorithm != 0 || compressed_bytes != 0 || payload_crc32c != 0 {
+            return Err(HxfsError::BadTree);
+        }
+        None
+    };
+    Ok((
+        ExtentRecord {
+            logical_block,
+            physical_block,
+            block_count,
+            flags,
+        },
+        meta,
+    ))
+}
+
+#[cfg(test)]
+mod extent_record_v2_tests {
+    use super::*;
+
+    fn make_v2_record(flags: u32, algorithm: u32, compressed_bytes: u32, crc: u32) -> [u8; 40] {
+        let mut record = [0u8; EXTENT_RECORD_BYTES_V2];
+        record[0..8].copy_from_slice(&7u64.to_le_bytes());
+        record[8..16].copy_from_slice(&42u64.to_le_bytes());
+        record[16..20].copy_from_slice(&1u32.to_le_bytes());
+        record[20..24].copy_from_slice(&flags.to_le_bytes());
+        record[24..28].copy_from_slice(&algorithm.to_le_bytes());
+        record[28..32].copy_from_slice(&compressed_bytes.to_le_bytes());
+        record[32..36].copy_from_slice(&crc.to_le_bytes());
+        record
+    }
+
+    #[test]
+    fn v2_record_round_trip_with_compression_descriptor() {
+        let record = make_v2_record(
+            EXTENT_FLAG_COMPRESSED,
+            compression::COMPRESSION_LZ4,
+            1024,
+            0xdead_beef,
+        );
+        let (extent, meta) = parse_extent_record_v2(&record, 0).expect("valid v2 record");
+        assert_eq!(extent.logical_block, 7);
+        assert_eq!(extent.physical_block, 42);
+        assert_eq!(extent.block_count, 1);
+        assert_eq!(extent.flags, EXTENT_FLAG_COMPRESSED);
+        let meta = meta.expect("compressed record must carry a descriptor");
+        assert_eq!(meta.algorithm, compression::COMPRESSION_LZ4);
+        assert_eq!(meta.compressed_bytes, 1024);
+        assert_eq!(meta.payload_crc32c, 0xdead_beef);
+    }
+
+    #[test]
+    fn v2_plain_record_round_trip_without_descriptor() {
+        let record = make_v2_record(0, 0, 0, 0);
+        let (extent, meta) = parse_extent_record_v2(&record, 0).expect("valid plain v2 record");
+        assert_eq!(extent.flags, 0);
+        assert!(meta.is_none());
+    }
+
+    #[test]
+    fn v2_record_rejects_zero_block_count() {
+        let mut record = make_v2_record(0, 0, 0, 0);
+        record[16..20].copy_from_slice(&0u32.to_le_bytes());
+        assert_eq!(
+            parse_extent_record_v2(&record, 0).err(),
+            Some(HxfsError::BadTree)
+        );
+    }
+
+    #[test]
+    fn v2_record_rejects_flag_without_descriptor() {
+        let record = make_v2_record(EXTENT_FLAG_COMPRESSED, 0, 0, 0);
+        assert_eq!(
+            parse_extent_record_v2(&record, 0).err(),
+            Some(HxfsError::BadTree)
+        );
+    }
+
+    #[test]
+    fn v2_record_rejects_descriptor_without_flag() {
+        let record = make_v2_record(0, compression::COMPRESSION_LZ4, 1024, 1);
+        assert_eq!(
+            parse_extent_record_v2(&record, 0).err(),
+            Some(HxfsError::BadTree)
+        );
+    }
+
+    #[test]
+    fn v2_record_rejects_unknown_algorithm() {
+        let record = make_v2_record(EXTENT_FLAG_COMPRESSED, 99, 1024, 1);
+        assert_eq!(
+            parse_extent_record_v2(&record, 0).err(),
+            Some(HxfsError::BadTree)
+        );
+    }
+
+    #[test]
+    fn v2_record_rejects_oversized_compressed_bytes() {
+        let record = make_v2_record(
+            EXTENT_FLAG_COMPRESSED,
+            compression::COMPRESSION_LZ4,
+            (BLOCK_SIZE + 1) as u32,
+            1,
+        );
+        assert_eq!(
+            parse_extent_record_v2(&record, 0).err(),
+            Some(HxfsError::BadTree)
+        );
+    }
+
+    #[test]
+    fn v2_record_rejects_hole_claiming_compression() {
+        let record = make_v2_record(
+            EXTENT_FLAG_HOLE | EXTENT_FLAG_COMPRESSED,
+            compression::COMPRESSION_LZ4,
+            1024,
+            1,
+        );
+        assert_eq!(
+            parse_extent_record_v2(&record, 0).err(),
+            Some(HxfsError::BadTree)
+        );
+    }
+
+    #[test]
+    fn v2_record_rejects_truncated_record() {
+        let record = make_v2_record(
+            EXTENT_FLAG_COMPRESSED,
+            compression::COMPRESSION_LZ4,
+            1024,
+            1,
+        );
+        let truncated = &record[..24];
+        assert_eq!(
+            parse_extent_record_v2(truncated, 0).err(),
+            Some(HxfsError::BadTree)
+        );
+    }
+}
+
 /// Stage B.3 wire: read a 4 KiB data extent into `out`.
 /// The function takes an optional per-volume extent subkey
 /// and the volume's `instance_uuid` for the AEAD nonce /
@@ -1177,6 +1434,7 @@ fn copy_extent_with_keys<R: BlockReader>(
     reader: &mut R,
     extent: ExtentRecord,
     compression: Option<compression::CompressionPolicy>,
+    meta: Option<ExtentCompressionMeta>,
     page_cache: &mut page_cache::PageCache,
     volume_id: u64,
     #[cfg(feature = "crypto-aes-gcm")] extent_key: Option<&[u8; 32]>,
@@ -1247,44 +1505,86 @@ fn copy_extent_with_keys<R: BlockReader>(
         // We always end up with `block_slice: &[u8]` of
         // length `BLOCK_SIZE` (the decompressor pads short
         // compressed payloads to a fixed-size 4 KiB output).
-        #[cfg(feature = "crypto-aes-gcm")]
-        let block_slice: &[u8] = match (extent_key, compression) {
-            (Some(key), Some(policy)) => {
-                // Encrypted + compressed.
-                let physical_block = extent.physical_block + extent_block as u64;
-                extent_crypto::decrypt_extent_block(
-                    key,
-                    physical_block,
-                    &volume_uuid,
-                    &scratch,
-                    &mut compressed_after_decrypt,
-                )
+        // Stage B.3 completion: a v2 extent record carries the
+        // per-extent compression descriptor, so the codec and the
+        // CRC verification come from the record itself; a v1
+        // record keeps the policy-driven path (which is what old
+        // volumes on disk contain). A compressed payload whose
+        // CRC32C does not match is a corrupted extent and is
+        // rejected with `HxfsError::Compression` at this boundary
+        // (the internal `CompressionError::BadChecksum` is
+        // observable from `decompress_block` directly).
+        let block_slice: &[u8] = if let Some(meta) = meta {
+            #[cfg(feature = "crypto-aes-gcm")]
+            let payload: &[u8] = match extent_key {
+                Some(key) => {
+                    let physical_block = extent.physical_block + extent_block as u64;
+                    extent_crypto::decrypt_extent_block(
+                        key,
+                        physical_block,
+                        &volume_uuid,
+                        &scratch,
+                        &mut compressed_after_decrypt,
+                    )
+                    .map_err(|_| HxfsError::Compression)?;
+                    &compressed_after_decrypt[..meta.compressed_bytes as usize]
+                }
+                None => &scratch[..meta.compressed_bytes as usize],
+            };
+            #[cfg(not(feature = "crypto-aes-gcm"))]
+            let payload: &[u8] = &scratch[..meta.compressed_bytes as usize];
+            let descriptor = compression::CompressedExtent {
+                logical_block: extent.logical_block,
+                physical_block: extent.physical_block,
+                uncompressed_bytes: BLOCK_SIZE as u32,
+                compressed_bytes: meta.compressed_bytes,
+                algorithm: meta.algorithm,
+                payload_crc32c: meta.payload_crc32c,
+            };
+            compression::decompress_block(&descriptor, payload, &mut decompressed)
                 .map_err(|_| HxfsError::Compression)?;
-                decompress_into(&policy, &compressed_after_decrypt, &mut decompressed)?
-            }
-            (Some(key), None) => {
-                // Encrypted, not compressed.
-                let physical_block = extent.physical_block + extent_block as u64;
-                extent_crypto::decrypt_extent_block(
-                    key,
-                    physical_block,
-                    &volume_uuid,
-                    &scratch,
-                    &mut decompressed,
-                )
-                .map_err(|_| HxfsError::Compression)?;
-                &decompressed[..]
-            }
-            (None, Some(policy)) => {
-                // Compressed, not encrypted (existing A.3 path).
-                decompress_into(&policy, &scratch, &mut decompressed)?
-            }
-            (None, None) => &scratch[..],
-        };
-        #[cfg(not(feature = "crypto-aes-gcm"))]
-        let block_slice: &[u8] = match compression {
-            Some(policy) => decompress_into(&policy, &scratch, &mut decompressed)?,
-            None => &scratch[..],
+            &decompressed[..]
+        } else {
+            #[cfg(feature = "crypto-aes-gcm")]
+            let legacy: &[u8] = match (extent_key, compression) {
+                (Some(key), Some(policy)) => {
+                    // Encrypted + compressed.
+                    let physical_block = extent.physical_block + extent_block as u64;
+                    extent_crypto::decrypt_extent_block(
+                        key,
+                        physical_block,
+                        &volume_uuid,
+                        &scratch,
+                        &mut compressed_after_decrypt,
+                    )
+                    .map_err(|_| HxfsError::Compression)?;
+                    decompress_into(&policy, &compressed_after_decrypt, &mut decompressed)?
+                }
+                (Some(key), None) => {
+                    // Encrypted, not compressed.
+                    let physical_block = extent.physical_block + extent_block as u64;
+                    extent_crypto::decrypt_extent_block(
+                        key,
+                        physical_block,
+                        &volume_uuid,
+                        &scratch,
+                        &mut decompressed,
+                    )
+                    .map_err(|_| HxfsError::Compression)?;
+                    &decompressed[..]
+                }
+                (None, Some(policy)) => {
+                    // Compressed, not encrypted (existing A.3 path).
+                    decompress_into(&policy, &scratch, &mut decompressed)?
+                }
+                (None, None) => &scratch[..],
+            };
+            #[cfg(not(feature = "crypto-aes-gcm"))]
+            let legacy: &[u8] = match compression {
+                Some(policy) => decompress_into(&policy, &scratch, &mut decompressed)?,
+                None => &scratch[..],
+            };
+            legacy
         };
         let chunk = (copy_end - copied).min(BLOCK_SIZE - within);
         out[copied..copied + chunk].copy_from_slice(&block_slice[within..within + chunk]);
@@ -1865,4 +2165,703 @@ fn build_encrypted_boot_image() -> Vec<u8> {
     image[BLOCK_SIZE * 5..BLOCK_SIZE * 6].copy_from_slice(&mk(BLOCK_TYPE_EXTENT_TABLE, 2, 5, &ep));
     image[BLOCK_SIZE * 6..BLOCK_SIZE * 6 + 11].copy_from_slice(b"hello hxfs\n");
     image
+}
+
+// ---------------------------------------------------------------------------
+// Stage B.5: end-to-end encrypted + compressed I/O pipeline test
+// (the Stage B exit criterion). The write path that Stage B.3
+// completion wires is exercised for real: a file written through
+// `FixedHxfsWriter` with encryption AND compression policies
+// survives a remount and reads back byte-for-byte; an
+// incompressible file falls back to plain extents and also round
+// trips; a single-byte corruption in the encrypted envelope is
+// rejected with the precise error; and a corrupted compressed
+// payload on a plain volume is rejected instead of silently
+// returned. The on-disk layout is asserted to reflect the policy
+// tables: the compressed file's extent table is a v2 block with
+// per-extent descriptors, the data blocks carry the GCM envelope,
+// and no plaintext leaks into the envelope region.
+// ---------------------------------------------------------------------------
+
+/// Build the boot image the Stage B.5 test mounts: an 8-block v5
+/// image with a system volume (optionally encrypted under
+/// `synthetic_key::POLICY_ID`, optionally carrying an LZ4 volume
+/// compression policy) and a pre-existing empty `seed.bin` file
+/// (object 2) that the writer overwrites, mirroring the
+/// `build_encrypted_boot_image` layout.
+#[cfg(all(test, feature = "crypto-aes-gcm"))]
+fn build_seeded_boot_image(encrypted: bool, compression_policy_id: u32) -> Vec<u8> {
+    use alloc::vec;
+    use alloc::vec::Vec;
+    const INSTANCE_TEST: Uuid = [0x11; 16];
+    const VOLUME_TEST: Uuid = [0x22; 16];
+    fn mk(bt: u32, owner: u64, lba: u64, payload: &[u8]) -> [u8; BLOCK_SIZE] {
+        let mut block = [0u8; BLOCK_SIZE];
+        block[0..4].copy_from_slice(&bt.to_le_bytes());
+        block[4..6].copy_from_slice(&1u16.to_le_bytes());
+        block[6..8].copy_from_slice(&(HEADER_BYTES as u16).to_le_bytes());
+        block[8..16].copy_from_slice(&1u64.to_le_bytes());
+        block[16..24].copy_from_slice(&owner.to_le_bytes());
+        block[24..32].copy_from_slice(&lba.to_le_bytes());
+        block[36..40].copy_from_slice(&(payload.len() as u32).to_le_bytes());
+        block[HEADER_BYTES..HEADER_BYTES + payload.len()].copy_from_slice(payload);
+        let crc = metadata_crc32c(&block);
+        block[32..36].copy_from_slice(&crc.to_le_bytes());
+        block
+    }
+    fn write_object(
+        out: &mut [u8],
+        offset: usize,
+        object_id: u64,
+        object_type: u32,
+        size: u64,
+        tree_lba: u64,
+        record_count: u32,
+    ) {
+        out[offset..offset + 8].copy_from_slice(&object_id.to_le_bytes());
+        out[offset + 8..offset + 12].copy_from_slice(&object_type.to_le_bytes());
+        out[offset + 12..offset + 16].copy_from_slice(&1u32.to_le_bytes());
+        out[offset + 16..offset + 24].copy_from_slice(&size.to_le_bytes());
+        out[offset + 24..offset + 32].copy_from_slice(&0i64.to_le_bytes());
+        out[offset + 40..offset + 48].copy_from_slice(&tree_lba.to_le_bytes());
+        out[offset + 48..offset + 52].copy_from_slice(&record_count.to_le_bytes());
+    }
+    let mut image: Vec<u8> = vec![0u8; BLOCK_SIZE * 8];
+    let mut sp = [0u8; 120];
+    sp[0..16].copy_from_slice(&FORMAT_GUID);
+    sp[16..20].copy_from_slice(&FORMAT_VERSION.to_le_bytes());
+    sp[20..24].copy_from_slice(&TYPE_SYSTEM_VERSION.to_le_bytes());
+    sp[24..40].copy_from_slice(&INSTANCE_TEST);
+    sp[40..48].copy_from_slice(&1u64.to_le_bytes());
+    sp[48..52].copy_from_slice(&(BLOCK_SIZE as u32).to_le_bytes());
+    sp[56..64].copy_from_slice(&1u64.to_le_bytes());
+    sp[104..112].copy_from_slice(&BASE_INCOMPAT_FEATURES.to_le_bytes());
+    sp[112..116].copy_from_slice(&ROOT_STATE_CLEAN.to_le_bytes());
+    image[0..BLOCK_SIZE].copy_from_slice(&mk(BLOCK_TYPE_SUPERBLOCK, 0, 0, &sp));
+    let mut cp = [0u8; 128];
+    cp[0..8].copy_from_slice(&1u64.to_le_bytes());
+    cp[8..16].copy_from_slice(&2u64.to_le_bytes());
+    cp[16..20].copy_from_slice(&1u32.to_le_bytes());
+    cp[24..40].copy_from_slice(&VOLUME_TEST);
+    image[BLOCK_SIZE..BLOCK_SIZE * 2].copy_from_slice(&mk(BLOCK_TYPE_CHECKPOINT, 0, 1, &cp));
+    let mut vp = [0u8; 16 + VOLUME_RECORD_BYTES];
+    vp[0..4].copy_from_slice(&1u32.to_le_bytes());
+    vp[16..32].copy_from_slice(&VOLUME_TEST);
+    vp[32..40].copy_from_slice(&1u64.to_le_bytes());
+    vp[40..48].copy_from_slice(&3u64.to_le_bytes());
+    vp[48..52].copy_from_slice(&2u32.to_le_bytes());
+    let flags = if encrypted {
+        VOLUME_FLAG_SYSTEM | VOLUME_FLAG_ENCRYPTED
+    } else {
+        VOLUME_FLAG_SYSTEM
+    };
+    vp[52..56].copy_from_slice(&flags.to_le_bytes());
+    vp[56..60].copy_from_slice(
+        &if encrypted {
+            crate::synthetic_key::POLICY_ID
+        } else {
+            0
+        }
+        .to_le_bytes(),
+    );
+    vp[60..64].copy_from_slice(&compression_policy_id.to_le_bytes());
+    image[BLOCK_SIZE * 2..BLOCK_SIZE * 3].copy_from_slice(&mk(BLOCK_TYPE_VOLUME_TABLE, 0, 2, &vp));
+    let mut op = [0u8; 16 + 2 * OBJECT_RECORD_BYTES];
+    op[0..4].copy_from_slice(&2u32.to_le_bytes());
+    write_object(&mut op, 16, 1, OBJECT_TYPE_DIRECTORY, 0, 4, 1);
+    write_object(
+        &mut op,
+        16 + OBJECT_RECORD_BYTES,
+        2,
+        OBJECT_TYPE_FILE,
+        0,
+        5,
+        0,
+    );
+    image[BLOCK_SIZE * 3..BLOCK_SIZE * 4].copy_from_slice(&mk(BLOCK_TYPE_OBJECT_TABLE, 1, 3, &op));
+    let mut dp = [0u8; 16 + DIR_RECORD_BYTES];
+    dp[0..8].copy_from_slice(&1u64.to_le_bytes());
+    dp[8..12].copy_from_slice(&1u32.to_le_bytes());
+    dp[16..24].copy_from_slice(&2u64.to_le_bytes());
+    dp[24..26].copy_from_slice(&8u16.to_le_bytes());
+    dp[26..34].copy_from_slice(b"seed.bin");
+    image[BLOCK_SIZE * 4..BLOCK_SIZE * 5].copy_from_slice(&mk(BLOCK_TYPE_DIRECTORY, 1, 4, &dp));
+    // Empty extent table for the empty seed.bin (record_count 0);
+    // the writer never reads it, but the block keeps the image
+    // self-consistent for inspectors.
+    let mut ep = [0u8; 16];
+    ep[0..8].copy_from_slice(&2u64.to_le_bytes());
+    ep[8..12].copy_from_slice(&0u32.to_le_bytes());
+    image[BLOCK_SIZE * 5..BLOCK_SIZE * 6].copy_from_slice(&mk(BLOCK_TYPE_EXTENT_TABLE, 2, 5, &ep));
+    image
+}
+
+/// Host-only block store wrapper that records the (lba, blocks)
+/// ranges written while `recording` is enabled. The Stage B.5
+/// test uses it to locate the file's data extents on disk for the
+/// on-disk layout and tamper assertions.
+#[cfg(all(test, feature = "crypto-aes-gcm"))]
+struct RecordingStore {
+    inner: crate::writer::VecBlockStore,
+    recording: bool,
+    ranges: Vec<(u64, u32)>,
+}
+
+#[cfg(all(test, feature = "crypto-aes-gcm"))]
+impl RecordingStore {
+    fn new(inner: crate::writer::VecBlockStore) -> Self {
+        Self {
+            inner,
+            recording: false,
+            ranges: Vec::new(),
+        }
+    }
+
+    fn start_recording(&mut self) {
+        self.recording = true;
+    }
+
+    fn stop_recording(&mut self) -> Vec<(u64, u32)> {
+        self.recording = false;
+        core::mem::take(&mut self.ranges)
+    }
+}
+
+#[cfg(all(test, feature = "crypto-aes-gcm"))]
+impl crate::reader::BlockReader for RecordingStore {
+    fn read_blocks(&mut self, lba: u64, blocks: u32, out: &mut [u8]) -> Result<(), HxfsError> {
+        self.inner.read_blocks(lba, blocks, out)
+    }
+}
+
+#[cfg(all(test, feature = "crypto-aes-gcm"))]
+impl crate::recovery::BlockStore for RecordingStore {
+    fn write_blocks(&mut self, lba: u64, blocks: u32, input: &[u8]) -> Result<(), HxfsError> {
+        if self.recording {
+            self.ranges.push((lba, blocks));
+        }
+        self.inner.write_blocks(lba, blocks, input)
+    }
+
+    fn flush(&mut self) -> Result<(), HxfsError> {
+        self.inner.flush()
+    }
+}
+
+/// Little-endian u32 read used by the on-disk assertions; returns
+/// `None` instead of panicking on a short slice.
+#[cfg(all(test, feature = "crypto-aes-gcm"))]
+fn le_u32_at(image: &[u8], offset: usize) -> Option<u32> {
+    let bytes = image.get(offset..offset + 4)?;
+    Some(u32::from_le_bytes(bytes.try_into().ok()?))
+}
+
+/// Count metadata blocks of the given `block_type` in the image.
+///
+/// Only blocks that carry a plausible metadata header (v1 or v6
+/// `type_version`, `header_bytes == HEADER_BYTES`) are counted:
+/// on encrypted volumes a data block starts with the AEAD nonce
+/// (whose first 4 bytes are the physical LBA) and would otherwise
+/// false-positive as a metadata block type.
+#[cfg(all(test, feature = "crypto-aes-gcm"))]
+fn count_metadata_blocks(image: &[u8], block_type: u32) -> usize {
+    let mut count = 0usize;
+    let mut lba = 0usize;
+    while (lba + 1) * BLOCK_SIZE <= image.len() {
+        let base = lba * BLOCK_SIZE;
+        if let Some(bt) = le_u32_at(image, base) {
+            if bt == block_type {
+                let tv =
+                    u16::from_le_bytes(image[base + 4..base + 6].try_into().ok().unwrap_or([0, 0]));
+                let hb =
+                    u16::from_le_bytes(image[base + 6..base + 8].try_into().ok().unwrap_or([0, 0]));
+                if matches!(tv, 1 | 6) && hb as usize == HEADER_BYTES {
+                    count += 1;
+                }
+            }
+        }
+        lba += 1;
+    }
+    count
+}
+
+/// Fill a 4 KiB chunk with a deterministic, highly compressible
+/// pattern; the first 8 bytes carry the block index so blocks are
+/// distinguishable in the byte-for-byte assertion.
+#[cfg(all(test, feature = "crypto-aes-gcm"))]
+fn fill_compressible_chunk(chunk: &mut [u8; BLOCK_SIZE], index: usize) {
+    const LINE: &[u8] =
+        b"HuesOS Stage B.5 encrypted+compressed I/O pipeline verification 0123456789\n";
+    let mut pos = 0usize;
+    while pos < chunk.len() {
+        let n = (chunk.len() - pos).min(LINE.len());
+        chunk[pos..pos + n].copy_from_slice(&LINE[..n]);
+        pos += n;
+    }
+    chunk[0..8].copy_from_slice(&index.to_le_bytes());
+}
+
+/// Deterministic xorshift64 PRNG for the incompressible file.
+#[cfg(all(test, feature = "crypto-aes-gcm"))]
+fn next_random(state: &mut u64) -> u64 {
+    let mut x = *state;
+    x ^= x << 13;
+    x ^= x >> 7;
+    x ^= x << 17;
+    *state = x;
+    x
+}
+
+/// Stage B.5 end-to-end test. See the module comment above for the
+/// full scope; the test is one function per the Stage B plan
+/// (`write_then_read_encrypted_compressed_volume`) with the
+/// tamper and fallback phases folded in.
+#[cfg(all(test, feature = "crypto-aes-gcm", feature = "compression-engines"))]
+#[test]
+fn write_then_read_encrypted_compressed_volume() {
+    use crate::fixed_writer::FixedHxfsWriter;
+    use crate::reader::SliceBlockReader;
+    use crate::recovery::BlockStore;
+    use crate::writer::VecBlockStore;
+    use alloc::vec;
+
+    // 100 extents x 4 KiB = 400 KiB. This is the maximum file size
+    // the single-block extent table supports with v2 records
+    // ((4056 - 16) / 40 = 101 records per block); the multi-block
+    // extent tree that lifts this limit is tracked as a Stage C+
+    // known limitation.
+    const CHUNKS: usize = 100;
+    const FILE_BYTES: usize = CHUNKS * BLOCK_SIZE;
+
+    let policies = [crate::synthetic_key::encryption_policy()];
+    let comps = [crate::synthetic_key::compression_policy()];
+
+    // ---- Phase 1: write seed.bin (compressible) + random.bin ----
+    let boot_image = build_seeded_boot_image(true, crate::synthetic_key::COMPRESSION_POLICY_ID);
+    let mut store = RecordingStore::new(VecBlockStore::with_blocks(512));
+    let boot_blocks = (boot_image.len() / BLOCK_SIZE) as u32;
+    if let Err(e) = store.write_blocks(0, boot_blocks, &boot_image) {
+        assert!(false, "boot write must succeed: {:?}", e);
+        return;
+    }
+    let Ok(mut writer) = FixedHxfsWriter::<RecordingStore, 16, 32, 256>::mount_with_policies(
+        store, &policies, &comps,
+    ) else {
+        assert!(
+            false,
+            "writer mount must succeed for encrypted+compressed volume"
+        );
+        return;
+    };
+    let root = writer.root_directory();
+    let file = match writer.open_child_file(root, crate::synthetic_key::SEED_FILE_NAME) {
+        Ok(f) => f,
+        Err(e) => {
+            assert!(false, "open_child_file must succeed: {:?}", e);
+            return;
+        }
+    };
+    let mut written = Vec::new();
+    writer.store_mut().start_recording();
+    let mut index = 0usize;
+    while index < CHUNKS {
+        let mut chunk = [0u8; BLOCK_SIZE];
+        fill_compressible_chunk(&mut chunk, index);
+        if let Err(e) = writer.write_file_at(file, (index * BLOCK_SIZE) as u64, &chunk) {
+            assert!(false, "write_file_at must succeed: {:?}", e);
+            return;
+        }
+        written.extend_from_slice(&chunk);
+        index += 1;
+    }
+    let data_ranges = writer.store_mut().stop_recording();
+    if data_ranges.is_empty() {
+        assert!(false, "no data blocks recorded");
+        return;
+    }
+    if let Err(e) = writer.publish_checkpoint() {
+        assert!(false, "publish_checkpoint must succeed: {:?}", e);
+        return;
+    }
+    let store = writer.into_store();
+    let image = store.inner.image().to_vec();
+
+    // ---- Phase 2: on-disk layout reflects the policy tables ----
+    let v2_count = count_metadata_blocks(&image, BLOCK_TYPE_EXTENT_TABLE_V2);
+    let v1_count = count_metadata_blocks(&image, BLOCK_TYPE_EXTENT_TABLE);
+    assert!(
+        v2_count >= 1,
+        "the compressed seed.bin must have at least one v2 extent table (journal + final copies)"
+    );
+    assert!(
+        v1_count >= 1,
+        "the boot image's empty v1 extent table survives in the old checkpoint"
+    );
+    // Locate the v2 block and assert its header + first record.
+    let mut v2_lba = None;
+    let mut lba = 0usize;
+    while (lba + 1) * BLOCK_SIZE <= image.len() {
+        let base = lba * BLOCK_SIZE;
+        if let Some(bt) = le_u32_at(&image, base) {
+            if bt == BLOCK_TYPE_EXTENT_TABLE_V2 {
+                let tv =
+                    u16::from_le_bytes(image[base + 4..base + 6].try_into().ok().unwrap_or([0, 0]));
+                let hb =
+                    u16::from_le_bytes(image[base + 6..base + 8].try_into().ok().unwrap_or([0, 0]));
+                if matches!(tv, 1 | 6) && hb as usize == HEADER_BYTES {
+                    v2_lba = Some(lba);
+                }
+            }
+        }
+        lba += 1;
+    }
+    let v2_lba = match v2_lba {
+        Some(v) => v,
+        None => {
+            assert!(false, "v2 extent table block not found");
+            return;
+        }
+    };
+    // The volume is encrypted, so every metadata block carries the
+    // v6 discriminator in its (plaintext) header; the record
+    // payload itself is ciphertext, so the record-level descriptor
+    // assertions live in the plain-volume test where the records
+    // are readable raw.
+    let v2_tv = u16::from_le_bytes(
+        image[v2_lba * BLOCK_SIZE + 4..v2_lba * BLOCK_SIZE + 6]
+            .try_into()
+            .ok()
+            .unwrap_or([0, 0]),
+    );
+    assert_eq!(
+        v2_tv, 6,
+        "v2 extent table must be encrypted (type_version 6)"
+    );
+    // The first recorded data block is seed.bin chunk 0; its
+    // envelope region must not contain the plaintext pattern.
+    let first_data_lba = data_ranges[0].0;
+    let envelope =
+        &image[first_data_lba as usize * BLOCK_SIZE..first_data_lba as usize * BLOCK_SIZE + 4056];
+    let mut probe = [0u8; BLOCK_SIZE];
+    fill_compressible_chunk(&mut probe, 0);
+    let needle = &probe[8..24];
+    let mut found = false;
+    let mut pos = 0usize;
+    while pos + needle.len() <= envelope.len() {
+        if &envelope[pos..pos + needle.len()] == needle {
+            found = true;
+            break;
+        }
+        pos += 1;
+    }
+    assert!(
+        !found,
+        "plaintext must not leak into the encrypted envelope"
+    );
+
+    // ---- Phase 3: remount and read back byte-for-byte ----
+    let reader = SliceBlockReader::new(&image);
+    let Ok(mut fs) = Hxfs::mount_with_policies(reader, &policies, &comps) else {
+        assert!(false, "remount with policies must succeed");
+        return;
+    };
+    assert!(fs.encryption().is_some());
+    let file = match fs.open_path("/seed.bin") {
+        Ok(f) => f,
+        Err(e) => {
+            assert!(false, "open_path must succeed: {:?}", e);
+            return;
+        }
+    };
+    let mut buf = vec![0u8; FILE_BYTES];
+    match fs.read_file(file, &mut buf) {
+        Ok(n) => assert_eq!(n, FILE_BYTES, "read length must match"),
+        Err(e) => {
+            assert!(false, "read_file must succeed: {:?}", e);
+            return;
+        }
+    }
+    assert_eq!(
+        &buf[..],
+        &written[..],
+        "compressible round trip must be byte-for-byte"
+    );
+
+    // ---- Phase 4: single-byte ciphertext corruption ----
+    let mut tampered = image.clone();
+    let flip = first_data_lba as usize * BLOCK_SIZE + 12 + 40;
+    tampered[flip] ^= 0x01;
+    let reader = SliceBlockReader::new(&tampered);
+    let Ok(mut fs) = Hxfs::mount_with_policies(reader, &policies, &comps) else {
+        assert!(false, "tampered volume must still mount (metadata intact)");
+        return;
+    };
+    let file = match fs.open_path("/seed.bin") {
+        Ok(f) => f,
+        Err(e) => {
+            assert!(false, "open_path must succeed on tampered volume: {:?}", e);
+            return;
+        }
+    };
+    let mut buf = vec![0u8; FILE_BYTES];
+    assert_eq!(
+        fs.read_file(file, &mut buf).err(),
+        Some(HxfsError::Compression),
+        "a bad GCM tag must surface as the precise error, not a panic"
+    );
+}
+
+/// Stage B.5 companion: a compressed-but-not-encrypted volume is
+/// still protected by the descriptor CRC. Corrupting one payload
+/// byte must fail the read with the precise error (the internal
+/// `CompressionError::BadChecksum` is pinned by the existing
+/// `compression` unit tests) instead of returning corrupted bytes.
+#[cfg(all(test, feature = "crypto-aes-gcm", feature = "compression-engines"))]
+#[test]
+fn corrupted_compressed_plain_volume_fails_read_with_precise_error() {
+    use crate::fixed_writer::FixedHxfsWriter;
+    use crate::reader::SliceBlockReader;
+    use crate::recovery::BlockStore;
+    use crate::writer::VecBlockStore;
+
+    let comps = [crate::synthetic_key::compression_policy()];
+    let boot_image = build_seeded_boot_image(false, crate::synthetic_key::COMPRESSION_POLICY_ID);
+    let mut store = RecordingStore::new(VecBlockStore::with_blocks(512));
+    let boot_blocks = (boot_image.len() / BLOCK_SIZE) as u32;
+    if let Err(e) = store.write_blocks(0, boot_blocks, &boot_image) {
+        assert!(false, "boot write must succeed: {:?}", e);
+        return;
+    }
+    let Ok(mut writer) =
+        FixedHxfsWriter::<RecordingStore, 16, 32, 64>::mount_with_policies(store, &[], &comps)
+    else {
+        assert!(
+            false,
+            "writer mount must succeed for plain+compressed volume"
+        );
+        return;
+    };
+    let root = writer.root_directory();
+    let file = match writer.open_child_file(root, crate::synthetic_key::SEED_FILE_NAME) {
+        Ok(f) => f,
+        Err(e) => {
+            assert!(false, "open_child_file must succeed: {:?}", e);
+            return;
+        }
+    };
+    writer.store_mut().start_recording();
+    let mut index = 0usize;
+    while index < 20 {
+        let mut chunk = [0u8; BLOCK_SIZE];
+        fill_compressible_chunk(&mut chunk, index);
+        if let Err(e) = writer.write_file_at(file, (index * BLOCK_SIZE) as u64, &chunk) {
+            assert!(false, "write_file_at must succeed: {:?}", e);
+            return;
+        }
+        index += 1;
+    }
+    let ranges = writer.store_mut().stop_recording();
+    if let Err(e) = writer.publish_checkpoint() {
+        assert!(false, "publish_checkpoint must succeed: {:?}", e);
+        return;
+    }
+    let store = writer.into_store();
+    let mut image = store.inner.image().to_vec();
+    // The v2 record must carry the compression descriptor
+    // (plain volume: the record payload is readable raw).
+    let mut descriptor_ok = false;
+    let mut lba = 0usize;
+    while (lba + 1) * BLOCK_SIZE <= image.len() {
+        let base = lba * BLOCK_SIZE;
+        if let Some(bt) = le_u32_at(&image, base) {
+            if bt == BLOCK_TYPE_EXTENT_TABLE_V2 {
+                let tv =
+                    u16::from_le_bytes(image[base + 4..base + 6].try_into().ok().unwrap_or([0, 0]));
+                let hb =
+                    u16::from_le_bytes(image[base + 6..base + 8].try_into().ok().unwrap_or([0, 0]));
+                if matches!(tv, 1 | 6) && hb as usize == HEADER_BYTES {
+                    let record = base + HEADER_BYTES + 16;
+                    let flags = le_u32_at(&image, record + 20).unwrap_or(0);
+                    let algorithm = le_u32_at(&image, record + 24).unwrap_or(0);
+                    let compressed_bytes = le_u32_at(&image, record + 28).unwrap_or(0);
+                    let crc = le_u32_at(&image, record + 32).unwrap_or(0);
+                    if flags & EXTENT_FLAG_COMPRESSED == EXTENT_FLAG_COMPRESSED
+                        && algorithm == crate::compression::COMPRESSION_LZ4
+                        && (0..BLOCK_SIZE as u32).contains(&compressed_bytes)
+                        && crc != 0
+                    {
+                        descriptor_ok = true;
+                    }
+                }
+            }
+        }
+        lba += 1;
+    }
+    assert!(
+        descriptor_ok,
+        "the v2 extent record must carry a well-formed compression descriptor"
+    );
+    let first_lba = ranges[0].0 as usize;
+    // Corrupt one byte of the compressed payload (plain volume:
+    // no envelope, payload starts at block offset 0).
+    image[first_lba * BLOCK_SIZE + 10] ^= 0x40;
+    let reader = SliceBlockReader::new(&image);
+    let Ok(mut fs) = Hxfs::mount_with_policies(reader, &[], &comps) else {
+        assert!(false, "tampered plain volume must still mount");
+        return;
+    };
+    let file = match fs.open_path("/seed.bin") {
+        Ok(f) => f,
+        Err(e) => {
+            assert!(false, "open_path must succeed: {:?}", e);
+            return;
+        }
+    };
+    let mut buf = vec![0u8; 20 * BLOCK_SIZE];
+    assert_eq!(
+        fs.read_file(file, &mut buf).err(),
+        Some(HxfsError::Compression),
+        "corrupted compressed payload must fail with the precise error, not a panic"
+    );
+}
+
+/// Stage B.5 companion: the incompressible fallback. Random data
+/// written under an LZ4 volume policy must be stored plain (v1
+/// extent records) and still round-trip byte-for-byte after a
+/// remount. This is the "random file" half of the Stage B exit
+/// signal; it lives on a plain volume because the encrypted
+/// envelope cannot hold an uncompressed full 4 KiB block (the
+/// writer rejects that case loudly with `Unsupported`).
+#[cfg(all(test, feature = "crypto-aes-gcm", feature = "compression-engines"))]
+#[test]
+fn incompressible_fallback_round_trips_on_plain_volume() {
+    use crate::fixed_writer::FixedHxfsWriter;
+    use crate::reader::SliceBlockReader;
+    use crate::recovery::BlockStore;
+    use crate::writer::VecBlockStore;
+    use alloc::vec;
+
+    const CHUNKS: usize = 20;
+    const FILE_BYTES: usize = CHUNKS * BLOCK_SIZE;
+    let comps = [crate::synthetic_key::compression_policy()];
+    let boot_image = build_seeded_boot_image(false, crate::synthetic_key::COMPRESSION_POLICY_ID);
+    let mut store = RecordingStore::new(VecBlockStore::with_blocks(512));
+    let boot_blocks = (boot_image.len() / BLOCK_SIZE) as u32;
+    if let Err(e) = store.write_blocks(0, boot_blocks, &boot_image) {
+        assert!(false, "boot write must succeed: {:?}", e);
+        return;
+    }
+    let Ok(mut writer) =
+        FixedHxfsWriter::<RecordingStore, 16, 32, 64>::mount_with_policies(store, &[], &comps)
+    else {
+        assert!(
+            false,
+            "writer mount must succeed for plain+compressed volume"
+        );
+        return;
+    };
+    let root = writer.root_directory();
+    let file = match writer.open_child_file(root, crate::synthetic_key::SEED_FILE_NAME) {
+        Ok(f) => f,
+        Err(e) => {
+            assert!(false, "open_child_file must succeed: {:?}", e);
+            return;
+        }
+    };
+    let mut rand_written = Vec::new();
+    let mut state = 0x9E37_79B9_7F4A_7C15u64;
+    let mut index = 0usize;
+    while index < CHUNKS {
+        let mut chunk = [0u8; BLOCK_SIZE];
+        let mut pos = 0usize;
+        while pos < chunk.len() {
+            let value = next_random(&mut state).to_le_bytes();
+            let n = (chunk.len() - pos).min(8);
+            chunk[pos..pos + n].copy_from_slice(&value[..n]);
+            pos += n;
+        }
+        if let Err(e) = writer.write_file_at(file, (index * BLOCK_SIZE) as u64, &chunk) {
+            assert!(false, "random write_file_at must succeed: {:?}", e);
+            return;
+        }
+        rand_written.extend_from_slice(&chunk);
+        index += 1;
+    }
+    if let Err(e) = writer.publish_checkpoint() {
+        assert!(false, "publish_checkpoint must succeed: {:?}", e);
+        return;
+    }
+    let store = writer.into_store();
+    let image = store.inner.image().to_vec();
+    // The incompressible file is stored under the LZ4 volume
+    // policy, so its extent table is a v2 block; every record must
+    // carry `EXTENT_FLAG_COMPRESSED` clear (plain fallback), and
+    // the read path must honour the descriptor instead of trying
+    // to LZ4-decode the raw bytes.
+    assert!(
+        count_metadata_blocks(&image, BLOCK_TYPE_EXTENT_TABLE_V2) >= 1,
+        "the policy-affected file must use a v2 extent table"
+    );
+    let mut compressed_records = 0usize;
+    let mut lba = 0usize;
+    while (lba + 1) * BLOCK_SIZE <= image.len() {
+        let base = lba * BLOCK_SIZE;
+        if let Some(bt) = le_u32_at(&image, base) {
+            if bt == BLOCK_TYPE_EXTENT_TABLE_V2 {
+                let tv =
+                    u16::from_le_bytes(image[base + 4..base + 6].try_into().ok().unwrap_or([0, 0]));
+                let hb =
+                    u16::from_le_bytes(image[base + 6..base + 8].try_into().ok().unwrap_or([0, 0]));
+                if matches!(tv, 1 | 6) && hb as usize == HEADER_BYTES {
+                    let count = u32::from_le_bytes(
+                        image[base + HEADER_BYTES + 8..base + HEADER_BYTES + 12]
+                            .try_into()
+                            .ok()
+                            .unwrap_or([0, 0, 0, 0]),
+                    );
+                    let mut index = 0u32;
+                    while index < count {
+                        let record =
+                            base + HEADER_BYTES + 16 + index as usize * EXTENT_RECORD_BYTES_V2;
+                        if let Some(flags) = le_u32_at(&image, record + 20) {
+                            if flags & EXTENT_FLAG_COMPRESSED != 0 {
+                                compressed_records += 1;
+                            }
+                        }
+                        index += 1;
+                    }
+                }
+            }
+        }
+        lba += 1;
+    }
+    assert_eq!(
+        compressed_records, 0,
+        "random data must be stored plain (no compressed records)"
+    );
+    let reader = SliceBlockReader::new(&image);
+    let Ok(mut fs) = Hxfs::mount_with_policies(reader, &[], &comps) else {
+        assert!(false, "remount must succeed");
+        return;
+    };
+    let file = match fs.open_path("/seed.bin") {
+        Ok(f) => f,
+        Err(e) => {
+            assert!(false, "open_path must succeed: {:?}", e);
+            return;
+        }
+    };
+    let mut buf = vec![0u8; FILE_BYTES];
+    match fs.read_file(file, &mut buf) {
+        Ok(n) => assert_eq!(n, FILE_BYTES),
+        Err(e) => {
+            assert!(false, "read_file must succeed: {:?}", e);
+            return;
+        }
+    }
+    assert_eq!(
+        &buf[..],
+        &rand_written[..],
+        "incompressible fallback round trip must be byte-for-byte"
+    );
 }

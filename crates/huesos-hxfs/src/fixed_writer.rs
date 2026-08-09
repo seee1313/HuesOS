@@ -12,10 +12,12 @@ use crate::quota_tree::{QuotaBtree, QuotaRecord};
 use crate::recovery::BlockStore;
 use crate::ref_tree::{BackrefBtree, BackrefKind, BackrefRecord, RefcountBtree, RefcountRecord};
 use crate::{
-    parse_dir_record, parse_extent_record, parse_object_record, read_checkpoint, read_superblock,
-    read_system_volume, validate_metadata_block, HxfsError, DIR_RECORD_BYTES, EXTENT_RECORD_BYTES,
-    HEADER_BYTES, OBJECT_RECORD_BYTES,
+    parse_dir_record, parse_extent_record, parse_extent_record_v2, parse_header,
+    parse_object_record, read_checkpoint, read_superblock, read_system_volume,
+    validate_metadata_block, ExtentCompressionMeta, HxfsError, DIR_RECORD_BYTES,
+    EXTENT_RECORD_BYTES, EXTENT_RECORD_BYTES_V2, HEADER_BYTES, OBJECT_RECORD_BYTES,
 };
+use alloc::vec::Vec;
 
 /// Fixed writer mount/mutation result.
 pub type FixedResult<T> = Result<T, HxfsError>;
@@ -37,6 +39,10 @@ struct FixedDirEntry {
 struct FixedExtent {
     object_id: u64,
     extent: ExtentRecord,
+    /// Stage B.3 completion: per-extent compression descriptor
+    /// carried by v2 extent-table records. `None` for plain
+    /// extents (and for every record of a v1 extent table).
+    compression: Option<ExtentCompressionMeta>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -84,6 +90,16 @@ pub struct FixedHxfsWriter<
     /// transplanted across volumes.
     #[cfg(feature = "crypto-aes-gcm")]
     volume_uuid: crate::format::Uuid,
+    /// Stage B.3 completion: per-volume compression policy table
+    /// accepted at mount time. The write path resolves the codec
+    /// for each object (per-object id with per-volume fallback)
+    /// against this table, mirroring the reader's
+    /// `resolve_compression_for_object` semantics, and stores the
+    /// policy-consistent descriptor in the extent record. The
+    /// table is mount-scoped configuration; it is copied once at
+    /// mount (the reader does the same), and the fixed metadata
+    /// arrays stay fixed-capacity.
+    compression_policies: Vec<crate::compression::CompressionPolicy>,
     objects: [Option<FixedObject>; MAX_OBJECTS],
     dir_entries: [Option<FixedDirEntry>; MAX_DIR_ENTRIES],
     extents: [Option<FixedExtent>; MAX_EXTENTS],
@@ -117,17 +133,18 @@ impl<
     /// mutable state with both encryption and compression
     /// policy tables. See [`Hxfs::mount_with_policies`] for
     /// the semantics of the table; the writer mirrors the
-    /// reader. The compression table is accepted so the
-    /// hxfs-service production wiring can call this entry
-    /// point uniformly; the writer does not yet consult it
-    /// for write-path policy resolution (the read path is
-    /// the only consumer today, see A.3).
+    /// reader. The compression table is stored and consulted
+    /// by the write path (Stage B.3 completion): the codec is
+    /// resolved per object against the table and the on-disk
+    /// extent record carries the resulting descriptor.
     pub fn mount_with_policies(
         store: S,
         encryption_policies: &[crate::crypto::EncryptionPolicy],
-        _compression_policies: &[crate::compression::CompressionPolicy],
+        compression_policies: &[crate::compression::CompressionPolicy],
     ) -> FixedResult<Self> {
-        Self::mount_with_keys(store, encryption_policies)
+        let mut mounted = Self::mount_with_keys(store, encryption_policies)?;
+        mounted.compression_policies = compression_policies.to_vec();
+        Ok(mounted)
     }
 
     /// Mount a clean v5 Hxfs volume into fixed-capacity
@@ -225,6 +242,7 @@ impl<
             extent_key,
             #[cfg(feature = "crypto-aes-gcm")]
             volume_uuid: superblock.instance_uuid,
+            compression_policies: Vec::new(),
             objects: [const { None }; MAX_OBJECTS],
             dir_entries: [const { None }; MAX_DIR_ENTRIES],
             extents: [const { None }; MAX_EXTENTS],
@@ -539,15 +557,26 @@ impl<
 
         if !data.is_empty() {
             let logical_block = offset / BLOCK_SIZE_U64;
-            let physical_block = self.write_data_blocks(data)?;
+            // Stage B.3 completion: the write path resolves the
+            // object's compression policy and stores the resulting
+            // descriptor (or `None` for a plain extent) with the
+            // extent record; the v2 serialization at publish time
+            // carries it and sets `EXTENT_FLAG_COMPRESSED`.
+            let (physical_block, compression) = self.write_data_blocks(data, object)?;
+            let flags = if compression.is_some() {
+                EXTENT_FLAG_COMPRESSED
+            } else {
+                0
+            };
             self.insert_extent(FixedExtent {
                 object_id: file.object_id,
                 extent: ExtentRecord {
                     logical_block,
                     physical_block,
                     block_count: 1,
-                    flags: 0,
+                    flags,
                 },
+                compression,
             })?;
         }
         let end = offset
@@ -911,13 +940,11 @@ impl<
 
     fn load_object_tree(&mut self) -> FixedResult<()> {
         let mut block = [0u8; BLOCK_SIZE];
-        self.store
-            .read_blocks(self.system_volume.object_table_lba, 1, &mut block)?;
-        let header = validate_metadata_block(
-            &block,
+        let header = self.read_mounted_metadata_block(
             self.system_volume.object_table_lba,
             BLOCK_TYPE_OBJECT_TABLE,
             1,
+            &mut block,
         )?;
         let count = read_u32(&block, header.header_bytes as usize)?;
         if count != self.system_volume.object_count {
@@ -941,12 +968,11 @@ impl<
 
     fn load_directory(&mut self, object: ObjectDescriptor) -> FixedResult<()> {
         let mut block = [0u8; BLOCK_SIZE];
-        self.store.read_blocks(object.tree_lba, 1, &mut block)?;
-        let header = validate_metadata_block(
-            &block,
+        let header = self.read_mounted_metadata_block(
             object.tree_lba,
             BLOCK_TYPE_DIRECTORY,
             object.object_id,
+            &mut block,
         )?;
         let owner = read_u64(&block, header.header_bytes as usize)?;
         let count = read_u32(&block, header.header_bytes as usize + 8)?;
@@ -968,29 +994,110 @@ impl<
             return Ok(());
         }
         let mut block = [0u8; BLOCK_SIZE];
-        self.store.read_blocks(object.tree_lba, 1, &mut block)?;
-        let header = validate_metadata_block(
-            &block,
+        let (header, block_type) = self.read_mounted_metadata_block_any_type(
             object.tree_lba,
             BLOCK_TYPE_EXTENT_TABLE,
+            BLOCK_TYPE_EXTENT_TABLE_V2,
             object.object_id,
+            &mut block,
         )?;
         let owner = read_u64(&block, header.header_bytes as usize)?;
         let count = read_u32(&block, header.header_bytes as usize + 8)?;
         if owner != object.object_id || count != object.record_count {
             return Err(HxfsError::BadTree);
         }
+        let record_bytes = if block_type == BLOCK_TYPE_EXTENT_TABLE_V2 {
+            EXTENT_RECORD_BYTES_V2
+        } else {
+            EXTENT_RECORD_BYTES
+        };
         let mut index = 0u32;
         while index < count {
-            let offset = header.header_bytes as usize + 16 + index as usize * EXTENT_RECORD_BYTES;
-            let extent = parse_extent_record(&block, offset)?;
+            let offset = header.header_bytes as usize + 16 + index as usize * record_bytes;
+            let (extent, compression) = if block_type == BLOCK_TYPE_EXTENT_TABLE_V2 {
+                parse_extent_record_v2(&block, offset)?
+            } else {
+                (parse_extent_record(&block, offset)?, None)
+            };
             self.insert_extent(FixedExtent {
                 object_id: object.object_id,
                 extent,
+                compression,
             })?;
             index += 1;
         }
         Ok(())
+    }
+
+    /// Read a metadata block at mount time, validating the header
+    /// and decrypting the v6 payload in place when the volume is
+    /// encrypted. Mirrors the reader's `read_metadata_block`; the
+    /// writer's own mount paths use it so an encrypted volume can
+    /// be mounted into mutable state (Stage B.1 completion).
+    fn read_mounted_metadata_block(
+        &mut self,
+        lba: u64,
+        block_type: u32,
+        owner_id: u64,
+        out: &mut [u8; BLOCK_SIZE],
+    ) -> FixedResult<BlockHeader> {
+        self.store.read_blocks(lba, 1, out)?;
+        let header = parse_header(out)?;
+        if header.block_type != block_type {
+            return Err(HxfsError::BadBlock);
+        }
+        let header = validate_metadata_block(out, lba, block_type, owner_id)?;
+        #[cfg(feature = "crypto-aes-gcm")]
+        if crate::is_v6_encrypted_metadata(&header) {
+            let key = self
+                .metadata_key
+                .as_ref()
+                .ok_or(HxfsError::EncryptedPolicyInvalid)?;
+            crate::encrypted_metadata::decrypt_metadata_block_in_place(
+                out,
+                &header,
+                key,
+                &self.superblock.instance_uuid,
+            )
+            .map_err(|_| HxfsError::BadChecksum)?;
+        }
+        Ok(header)
+    }
+
+    /// Like [`Self::read_mounted_metadata_block`], but accepts
+    /// either of two block types and returns the matching one.
+    /// Extent tables may be v1 ([`BLOCK_TYPE_EXTENT_TABLE`]) or v2
+    /// ([`BLOCK_TYPE_EXTENT_TABLE_V2`]) depending on whether the
+    /// object has compressed extents.
+    fn read_mounted_metadata_block_any_type(
+        &mut self,
+        lba: u64,
+        block_type_a: u32,
+        block_type_b: u32,
+        owner_id: u64,
+        out: &mut [u8; BLOCK_SIZE],
+    ) -> FixedResult<(BlockHeader, u32)> {
+        self.store.read_blocks(lba, 1, out)?;
+        let header = parse_header(out)?;
+        if header.block_type != block_type_a && header.block_type != block_type_b {
+            return Err(HxfsError::BadBlock);
+        }
+        let header = validate_metadata_block(out, lba, header.block_type, owner_id)?;
+        #[cfg(feature = "crypto-aes-gcm")]
+        if crate::is_v6_encrypted_metadata(&header) {
+            let key = self
+                .metadata_key
+                .as_ref()
+                .ok_or(HxfsError::EncryptedPolicyInvalid)?;
+            crate::encrypted_metadata::decrypt_metadata_block_in_place(
+                out,
+                &header,
+                key,
+                &self.superblock.instance_uuid,
+            )
+            .map_err(|_| HxfsError::BadChecksum)?;
+        }
+        Ok((header, header.block_type))
     }
 
     fn resolve_path(&self, path: &str) -> FixedResult<u64> {
@@ -1348,13 +1455,85 @@ impl<
         Ok(())
     }
 
-    fn write_data_blocks(&mut self, data: &[u8]) -> FixedResult<u64> {
+    /// Write one data block to a fresh LBA, applying the object's
+    /// resolved compression policy first and the volume encryption
+    /// envelope second.
+    ///
+    /// Returns the physical LBA plus the compression descriptor
+    /// (`None` when the block is stored plain). The plaintext is
+    /// padded to a full 4 KiB block before compression so the
+    /// read path always decompresses to exactly one block; the
+    /// padding is authenticated (AEAD tag or descriptor CRC) and
+    /// is never copied to the caller. An incompressible input
+    /// falls back to a plain extent, which the read path stores
+    /// verbatim.
+    fn write_data_blocks(
+        &mut self,
+        data: &[u8],
+        object: ObjectDescriptor,
+    ) -> FixedResult<(u64, Option<ExtentCompressionMeta>)> {
         let start = self.next_lba;
         self.quota_admits(BLOCK_SIZE_U64, 0)?;
+        // The LZ4 worst-case output bound is
+        // `16 + 4 + input_len * 110 / 100` (lz4_flex
+        // `get_maximum_output_size`); a scratch the size of the
+        // input alone makes the codec fail with `OutputTooSmall`
+        // even for highly compressible data, silently falling
+        // back to a plain extent. `+ 512` covers the 4 KiB worst
+        // case (4525 bytes) with headroom.
+        let mut compressed_scratch = [0u8; BLOCK_SIZE + 512];
+        let mut compression = None;
+        let block_bytes: &[u8] = {
+            let policy = crate::resolve_compression_for_object(
+                &self.system_volume,
+                &self.compression_policies,
+                object,
+            );
+            if let Some(policy) = policy {
+                let mut padded = [0u8; BLOCK_SIZE];
+                padded[..data.len()].copy_from_slice(data);
+                match crate::compression::compress_block(policy, &padded, &mut compressed_scratch) {
+                    Ok(crate::compression::CompressOutcome::Compressed {
+                        payload,
+                        algorithm,
+                        payload_crc32c,
+                    }) => {
+                        compression = Some(ExtentCompressionMeta {
+                            algorithm,
+                            compressed_bytes: payload.len() as u32,
+                            payload_crc32c,
+                        });
+                        payload
+                    }
+                    Ok(crate::compression::CompressOutcome::Plain) => data,
+                    // Loud failure: a volume whose policy selects a
+                    // codec that this build does not link must fail
+                    // the write rather than store a plain extent
+                    // that the read path cannot decode.
+                    Err(_) => return Err(HxfsError::Compression),
+                }
+            } else {
+                data
+            }
+        };
+        // The GCM envelope holds at most `EXTENT_PLAINTEXT_BYTES`
+        // (4028) plaintext bytes per block. A full 4 KiB block
+        // that neither compresses below the envelope limit nor
+        // fits it verbatim cannot be stored on an encrypted
+        // volume; fail loudly instead of silently truncating.
+        // (On plain volumes the whole 4 KiB block is stored
+        // verbatim, so the incompressible fallback is a normal
+        // completion there.)
+        #[cfg(feature = "crypto-aes-gcm")]
+        if self.extent_key.is_some()
+            && block_bytes.len() > crate::extent_crypto::EXTENT_PLAINTEXT_BYTES
+        {
+            return Err(HxfsError::Unsupported);
+        }
         // Stage B.3 wire: when the volume is encrypted,
         // the on-disk extent block is the AES-256-GCM
-        // envelope around the plaintext. We build the
-        // envelope with the per-volume extent subkey
+        // envelope around the (compressed) plaintext. We build
+        // the envelope with the per-volume extent subkey
         // (derived once at mount time) so the read path's
         // decrypt step lands on a block with the matching
         // key. Plain volumes write the plaintext directly,
@@ -1366,7 +1545,7 @@ impl<
                 key,
                 start,
                 &self.volume_uuid,
-                data,
+                block_bytes,
                 &mut ciphertext,
             )
             .map_err(|_| HxfsError::BadBlock)?;
@@ -1381,18 +1560,18 @@ impl<
             block
         } else {
             let mut block = [0u8; BLOCK_SIZE];
-            block[..data.len()].copy_from_slice(data);
+            block[..block_bytes.len()].copy_from_slice(block_bytes);
             block
         };
         #[cfg(not(feature = "crypto-aes-gcm"))]
         let block = {
             let mut block = [0u8; BLOCK_SIZE];
-            block[..data.len()].copy_from_slice(data);
+            block[..block_bytes.len()].copy_from_slice(block_bytes);
             block
         };
         self.store.write_blocks(start, 1, &block)?;
         self.next_lba = self.next_lba.checked_add(1).ok_or(HxfsError::NoSpace)?;
-        Ok(start)
+        Ok((start, compression))
     }
 
     fn copy_extents(&mut self, object_id: u64, out: &mut [u8]) -> FixedResult<()> {
@@ -1400,7 +1579,7 @@ impl<
         while index < self.extents.len() {
             if let Some(extent) = self.extents[index] {
                 if extent.object_id == object_id {
-                    self.copy_extent(extent.extent, out)?;
+                    self.copy_extent(extent.extent, extent.compression, out)?;
                 }
             }
             index += 1;
@@ -1408,7 +1587,12 @@ impl<
         Ok(())
     }
 
-    fn copy_extent(&mut self, extent: ExtentRecord, out: &mut [u8]) -> FixedResult<()> {
+    fn copy_extent(
+        &mut self,
+        extent: ExtentRecord,
+        compression: Option<ExtentCompressionMeta>,
+        out: &mut [u8],
+    ) -> FixedResult<()> {
         let start = usize::try_from(extent.logical_block)
             .ok()
             .and_then(|block| block.checked_mul(BLOCK_SIZE))
@@ -1427,6 +1611,8 @@ impl<
             return Ok(());
         }
         let mut scratch = [0u8; BLOCK_SIZE];
+        let mut decrypted = [0u8; BLOCK_SIZE];
+        let mut decompressed = [0u8; BLOCK_SIZE];
         let mut copied = start;
         while copied < copy_end {
             let logical_delta = copied - start;
@@ -1434,11 +1620,66 @@ impl<
             let within = logical_delta % BLOCK_SIZE;
             self.store
                 .read_blocks(extent.physical_block + extent_block as u64, 1, &mut scratch)?;
+            // Stage B.3 wire + completion: decrypt the envelope
+            // when the volume is encrypted, then decompress the
+            // payload when the record carries a compression
+            // descriptor (CRC-verified). A bad AEAD tag or a
+            // payload CRC mismatch surfaces as `HxfsError::Compression`
+            // so the caller can mark the extent bad and continue.
+            let plain: &[u8] = self.decrypt_extent_block_if_encrypted(
+                extent.physical_block + extent_block as u64,
+                &scratch,
+                &mut decrypted,
+            )?;
+            let block_slice: &[u8] = if let Some(meta) = compression {
+                let payload = &plain[..meta.compressed_bytes as usize];
+                let descriptor = crate::compression::CompressedExtent {
+                    logical_block: extent.logical_block,
+                    physical_block: extent.physical_block,
+                    uncompressed_bytes: BLOCK_SIZE as u32,
+                    compressed_bytes: meta.compressed_bytes,
+                    algorithm: meta.algorithm,
+                    payload_crc32c: meta.payload_crc32c,
+                };
+                crate::compression::decompress_block(&descriptor, payload, &mut decompressed)
+                    .map_err(|_| HxfsError::Compression)?;
+                &decompressed[..]
+            } else {
+                plain
+            };
             let chunk = (copy_end - copied).min(BLOCK_SIZE - within);
-            out[copied..copied + chunk].copy_from_slice(&scratch[within..within + chunk]);
+            out[copied..copied + chunk].copy_from_slice(&block_slice[within..within + chunk]);
             copied += chunk;
         }
         Ok(())
+    }
+
+    /// Decrypt one data block when the volume is encrypted.
+    /// Returns a slice into `scratch` (plain volume) or
+    /// `decrypted` (encrypted volume).
+    fn decrypt_extent_block_if_encrypted<'a>(
+        &self,
+        physical_block: u64,
+        scratch: &'a [u8; BLOCK_SIZE],
+        decrypted: &'a mut [u8; BLOCK_SIZE],
+    ) -> FixedResult<&'a [u8]> {
+        #[cfg(feature = "crypto-aes-gcm")]
+        if let Some(key) = self.extent_key.as_ref() {
+            crate::extent_crypto::decrypt_extent_block(
+                key,
+                physical_block,
+                &self.volume_uuid,
+                scratch,
+                decrypted,
+            )
+            .map_err(|_| HxfsError::Compression)?;
+            return Ok(&decrypted[..]);
+        }
+        #[cfg(not(feature = "crypto-aes-gcm"))]
+        {
+            let _ = (physical_block, decrypted);
+        }
+        Ok(scratch)
     }
 
     fn build_object_tree_block(
@@ -1582,6 +1823,33 @@ impl<
     /// `None`/default; the wrapper falls through to the plain
     /// v5 builder.
     fn build_extent_block(&self, object_id: u64, lba: u64) -> FixedResult<[u8; BLOCK_SIZE]> {
+        // Stage B.3 completion: emit a v2 block (40-byte records
+        // with an optional per-record compression descriptor)
+        // whenever the object's resolved compression policy selects
+        // a codec. The v2 block type is what tells the read path
+        // to use the per-record descriptors instead of the
+        // policy-driven v1 semantics — an incompressible fallback
+        // record stores plain bytes with `EXTENT_FLAG_COMPRESSED`
+        // clear, and the reader must NOT try to decode it. Objects
+        // outside any compression policy keep the v1 block type so
+        // old-style volumes read exactly as before.
+        let object = self.object(object_id)?.descriptor;
+        let v2 = crate::resolve_compression_for_object(
+            &self.system_volume,
+            &self.compression_policies,
+            object,
+        )
+        .is_some();
+        let record_bytes = if v2 {
+            EXTENT_RECORD_BYTES_V2
+        } else {
+            EXTENT_RECORD_BYTES
+        };
+        let block_type = if v2 {
+            BLOCK_TYPE_EXTENT_TABLE_V2
+        } else {
+            BLOCK_TYPE_EXTENT_TABLE
+        };
         let mut payload = [0u8; BLOCK_SIZE - HEADER_BYTES];
         let count = self.extent_count(object_id);
         payload[0..8].copy_from_slice(&object_id.to_le_bytes());
@@ -1591,8 +1859,8 @@ impl<
         while index < self.extents.len() {
             if let Some(extent) = self.extents[index] {
                 if extent.object_id == object_id {
-                    let offset = 16 + written * EXTENT_RECORD_BYTES;
-                    if offset + EXTENT_RECORD_BYTES > payload.len() {
+                    let offset = 16 + written * record_bytes;
+                    if offset + record_bytes > payload.len() {
                         return Err(HxfsError::NoSpace);
                     }
                     payload[offset..offset + 8]
@@ -1603,6 +1871,16 @@ impl<
                         .copy_from_slice(&extent.extent.block_count.to_le_bytes());
                     payload[offset + 20..offset + 24]
                         .copy_from_slice(&extent.extent.flags.to_le_bytes());
+                    if v2 {
+                        if let Some(meta) = extent.compression {
+                            payload[offset + 24..offset + 28]
+                                .copy_from_slice(&meta.algorithm.to_le_bytes());
+                            payload[offset + 28..offset + 32]
+                                .copy_from_slice(&meta.compressed_bytes.to_le_bytes());
+                            payload[offset + 32..offset + 36]
+                                .copy_from_slice(&meta.payload_crc32c.to_le_bytes());
+                        }
+                    }
                     written += 1;
                 }
             }
@@ -1610,10 +1888,10 @@ impl<
         }
         let args = self.encryption_args();
         make_metadata_block_for_volume(
-            BLOCK_TYPE_EXTENT_TABLE,
+            block_type,
             object_id,
             lba,
-            &payload[..16 + written * EXTENT_RECORD_BYTES],
+            &payload[..16 + written * record_bytes],
             args.0,
             args.1,
             args.2,
@@ -2161,6 +2439,7 @@ fn is_encrypted_block_type(block_type: u32) -> bool {
         block_type,
         BLOCK_TYPE_DIRECTORY
             | BLOCK_TYPE_EXTENT_TABLE
+            | BLOCK_TYPE_EXTENT_TABLE_V2
             | BLOCK_TYPE_ALLOCATION_TREE
             | BLOCK_TYPE_REFCOUNT_TREE
             | BLOCK_TYPE_BACKREF_TREE

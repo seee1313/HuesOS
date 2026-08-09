@@ -283,10 +283,15 @@ pub fn decompress_block(
 /// the input. The returned borrowed slice always points into
 /// `scratch` so the caller does not need to allocate.
 ///
-/// `scratch` must be at least as large as `input.len()`. The
-/// on-disk contract reserves `uncompressed_bytes` equal to the
-/// full Hxfs block size (4 KiB), so the default caller passes a
-/// 4 KiB scratch buffer and a `BLOCK_SIZE`-long input.
+/// `scratch` must be at least as large as `input.len()`, and when
+/// an engine is linked the LZ4 codec additionally needs the
+/// worst-case output headroom (`lz4_flex::block::get_maximum_output_size`
+/// = `16 + 4 + input_len * 110 / 100`); a scratch the size of the
+/// input alone makes `compress_into` fail with `OutputTooSmall`
+/// even for highly compressible data. The fixed writer passes a
+/// `BLOCK_SIZE + 512` scratch. The on-disk contract reserves
+/// `uncompressed_bytes` equal to the full Hxfs block size (4 KiB),
+/// so the default caller passes a `BLOCK_SIZE`-long input.
 ///
 /// The function is **safe to call without `compression-engines`**:
 /// in that build the only registered codec returns
