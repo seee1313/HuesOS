@@ -181,8 +181,8 @@ fn track_userspace_inputs(userspace_root: &Path) {
         "crates/huesos-abi",
         "crates/huesos-user-alloc",
     ] {
-        println!("cargo:rerun-if-changed={}", crate_dir);
-        println!("cargo:rerun-if-changed={}", format!("{crate_dir}/src"));
+        println!("cargo:rerun-if-changed={crate_dir}");
+        println!("cargo:rerun-if-changed={crate_dir}/src");
     }
     println!(
         "cargo:rerun-if-changed={}",
