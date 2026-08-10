@@ -28,16 +28,26 @@ def bench_hxfs_tools(iterations: int, blocks: int) -> dict[str, object]:
     mk = []
     inspect = []
     scrub = []
+    seed = []
     for _ in range(iterations):
         mk.append(run(["python3", "tools/mkhxfs.py", "--output", str(TMP), "--blocks", str(blocks)]))
         inspect.append(run(["python3", "tools/hxfs-inspect.py", str(TMP)]))
         scrub.append(run(["python3", "tools/hxfs-scrub.py", str(TMP)]))
+        # Stage E (Operations): the encrypted+compressed seed path
+        # (mkhxfs --seed-file delegates to the Rust hxfs-seed tool),
+        # the exact pipeline the soak volume uses.
+        seed.append(run([
+            "python3", "tools/mkhxfs.py", "--output", str(TMP),
+            "--blocks", str(max(blocks, 512)), "--seed-file", "seed.bin",
+            "--seed-size", "3584",
+        ]))
     return {
         "iterations": iterations,
         "blocks": blocks,
         "mkhxfs_avg_ms": average_ms(mk),
         "inspect_avg_ms": average_ms(inspect),
         "scrub_avg_ms": average_ms(scrub),
+        "seed_image_avg_ms": average_ms(seed),
     }
 
 

@@ -11,6 +11,8 @@ crypto-aes = ["dep:aes", "dep:cipher"]
 crypto-aes-gcm = ["dep:aes-gcm", "dep:hkdf", "dep:sha2", "aes-gcm/aes", "aes-gcm/alloc"]
 compression-engines = ["dep:lz4_flex"]
 page-cache = []
+# Stage F: Hxblob immutable object store (SHA-256 content hashes).
+hxblob = ["dep:sha2"]
 
 [dependencies]
 huesos-abi = { path = "../huesos-abi" }

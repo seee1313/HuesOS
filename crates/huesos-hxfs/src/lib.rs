@@ -3412,6 +3412,258 @@ fn stage_e_16mib_file_uses_extent_tree_and_round_trips() {
     let _ = expected;
 }
 
+/// Stage F: Hxblob immutable object store round-trip.
+///
+/// `put_blob` stores bytes as an immutable file named by its
+/// SHA-256, the index record survives a remount through the
+/// checkpoint's Hxblob index block, and `get_blob` returns the
+/// exact bytes. Duplicate content is rejected; the blob count is
+/// restored after remount.
+#[cfg(all(test, feature = "hxblob", feature = "crypto-aes-gcm"))]
+#[test]
+fn stage_f_hxblob_round_trip_survives_remount() {
+    use crate::fixed_writer::FixedHxfsWriter;
+    use crate::reader::SliceBlockReader;
+    use crate::recovery::BlockStore;
+    use crate::writer::VecBlockStore;
+
+    let policies = [crate::synthetic_key::encryption_policy()];
+    let comps = [crate::synthetic_key::compression_policy()];
+    let boot_image = build_seeded_boot_image(true, crate::synthetic_key::COMPRESSION_POLICY_ID);
+    let mut store = VecBlockStore::with_blocks(1024);
+    let boot_blocks = (boot_image.len() / BLOCK_SIZE) as u32;
+    if let Err(e) = store.write_blocks(0, boot_blocks, &boot_image) {
+        assert!(false, "boot write must succeed: {:?}", e);
+        return;
+    }
+    let Ok(mut writer) =
+        FixedHxfsWriter::<_, 16, 32, 256>::mount_with_policies(store, &policies, &comps)
+    else {
+        assert!(false, "writer mount must succeed");
+        return;
+    };
+    // Two distinct blobs (one compressible, one random-ish).
+    let payload_a = b"Hxblob immutable object payload 0123456789\n".repeat(40);
+    let mut payload_b = [0u8; 4096];
+    let mut state = 0xDEAD_BEEF_1234_5678u64;
+    let mut pos = 0usize;
+    while pos < payload_b.len() {
+        let mut x = state;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        state = x;
+        let bytes = x.to_le_bytes();
+        let n = (payload_b.len() - pos).min(8);
+        payload_b[pos..pos + n].copy_from_slice(&bytes[..n]);
+        pos += n;
+    }
+    let mut writer = writer;
+    let hash_a = match writer.put_blob(&payload_a) {
+        Ok(h) => h,
+        Err(e) => {
+            assert!(false, "put_blob A must succeed: {:?}", e);
+            return;
+        }
+    };
+    let hash_b = match writer.put_blob(&payload_b) {
+        Ok(h) => h,
+        Err(e) => {
+            assert!(false, "put_blob B must succeed: {:?}", e);
+            return;
+        }
+    };
+    assert_ne!(hash_a, hash_b, "different payloads must hash differently");
+    // Duplicate content is rejected.
+    assert_eq!(
+        writer.put_blob(&payload_a).err(),
+        Some(HxfsError::AlreadyExists)
+    );
+    assert_eq!(writer.blob_count(), 2);
+    if let Err(e) = writer.publish_checkpoint() {
+        assert!(false, "publish_checkpoint must succeed: {:?}", e);
+        return;
+    }
+    let store = writer.into_store();
+    let image = store.image().to_vec();
+    // Remount and read back both blobs byte-for-byte.
+    let mut remount_store = VecBlockStore::with_blocks(1024);
+    if let Err(e) = remount_store.write_blocks(0, (image.len() / BLOCK_SIZE) as u32, &image) {
+        assert!(false, "remount image write must succeed: {:?}", e);
+        return;
+    }
+    let Ok(mut fs) =
+        FixedHxfsWriter::<_, 16, 32, 256>::mount_with_policies(remount_store, &policies, &comps)
+    else {
+        assert!(false, "remount must succeed");
+        return;
+    };
+    let got_a = match fs.get_blob(&hash_a) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            assert!(false, "get_blob A must succeed: {:?}", e);
+            return;
+        }
+    };
+    assert_eq!(got_a, payload_a, "blob A must round-trip");
+    let got_b = match fs.get_blob(&hash_b) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            assert!(false, "get_blob B must succeed: {:?}", e);
+            return;
+        }
+    };
+    assert_eq!(got_b, &payload_b[..], "blob B must round-trip");
+    assert_eq!(fs.blob_count(), 2, "blob count must survive remount");
+}
+
+/// Stage E (Phase-2): per-Job quota enforcement round-trip.
+///
+/// A job quota is set, the active job is selected, writes are
+/// charged until the limit rejects further writes with
+/// `QuotaExceeded`, and the charged usage survives a remount
+/// through the quota tree block.
+#[cfg(all(test, feature = "crypto-aes-gcm", feature = "compression-engines"))]
+#[test]
+fn stage_e2_job_quota_round_trip() {
+    use crate::fixed_writer::FixedHxfsWriter;
+    use crate::recovery::BlockStore;
+    use crate::writer::VecBlockStore;
+
+    let comps = [crate::synthetic_key::compression_policy()];
+    let boot_image = build_seeded_boot_image(false, crate::synthetic_key::COMPRESSION_POLICY_ID);
+    let mut store = VecBlockStore::with_blocks(512);
+    let boot_blocks = (boot_image.len() / BLOCK_SIZE) as u32;
+    if let Err(e) = store.write_blocks(0, boot_blocks, &boot_image) {
+        assert!(false, "boot write must succeed: {:?}", e);
+        return;
+    }
+    let Ok(mut writer) = FixedHxfsWriter::<_, 16, 32, 64>::mount_with_policies(store, &[], &comps)
+    else {
+        assert!(false, "writer mount must succeed");
+        return;
+    };
+    if let Err(e) = writer.set_job_quota(7, 8192, 0) {
+        assert!(false, "set_job_quota must succeed: {:?}", e);
+        return;
+    }
+    writer.set_active_job(Some(7));
+    let root = writer.root_directory();
+    let file = match writer.open_child_file(root, crate::synthetic_key::SEED_FILE_NAME) {
+        Ok(f) => f,
+        Err(e) => {
+            assert!(false, "open must succeed: {:?}", e);
+            return;
+        }
+    };
+    let mut chunk = [0u8; BLOCK_SIZE];
+    fill_compressible_chunk(&mut chunk, 0);
+    // First 4 KiB write: within the 8 KiB job quota.
+    if let Err(e) = writer.write_file_at(file, 0, &chunk) {
+        assert!(false, "first write must pass: {:?}", e);
+        return;
+    }
+    // Second 4 KiB write: exactly the limit.
+    if let Err(e) = writer.write_file_at(file, BLOCK_SIZE as u64, &chunk) {
+        assert!(false, "second write must pass: {:?}", e);
+        return;
+    }
+    // Third write: over the limit -> QuotaExceeded.
+    assert_eq!(
+        writer
+            .write_file_at(file, 2 * BLOCK_SIZE as u64, &chunk)
+            .err(),
+        Some(HxfsError::QuotaExceeded)
+    );
+    assert_eq!(writer.job_quota_usage(7), (8192, 0));
+    if let Err(e) = writer.publish_checkpoint() {
+        assert!(false, "publish must succeed: {:?}", e);
+        return;
+    }
+    let store = writer.into_store();
+    let image = store.image().to_vec();
+    // Remount: the job quota usage survives.
+    let mut remount = VecBlockStore::with_blocks(512);
+    if let Err(e) = remount.write_blocks(0, (image.len() / BLOCK_SIZE) as u32, &image) {
+        assert!(false, "remount image write must succeed: {:?}", e);
+        return;
+    }
+    let Ok(mut fs) = FixedHxfsWriter::<_, 16, 32, 64>::mount_with_policies(remount, &[], &comps)
+    else {
+        assert!(false, "remount must succeed");
+        return;
+    };
+    assert_eq!(
+        fs.job_quota_usage(7),
+        (8192, 0),
+        "job quota usage must survive remount"
+    );
+}
+
+/// Stage E (Phase-2): the full tree scrub validates every
+/// checkpoint root on disk (including multi-block trees) and
+/// reports clean volumes as clean.
+#[cfg(all(test, feature = "crypto-aes-gcm", feature = "compression-engines"))]
+#[test]
+fn stage_e2_scrub_all_reports_clean() {
+    use crate::fixed_writer::FixedHxfsWriter;
+    use crate::recovery::BlockStore;
+    use crate::writer::VecBlockStore;
+
+    let comps = [crate::synthetic_key::compression_policy()];
+    let boot_image = build_seeded_boot_image(false, crate::synthetic_key::COMPRESSION_POLICY_ID);
+    let mut store = VecBlockStore::with_blocks(4096);
+    let boot_blocks = (boot_image.len() / BLOCK_SIZE) as u32;
+    if let Err(e) = store.write_blocks(0, boot_blocks, &boot_image) {
+        assert!(false, "boot write must succeed: {:?}", e);
+        return;
+    }
+    let Ok(mut writer) = FixedHxfsWriter::<_, 16, 32, 512>::mount_with_policies(store, &[], &comps)
+    else {
+        assert!(false, "writer mount must succeed");
+        return;
+    };
+    // Write enough to force a multi-block extent tree (>= 102
+    // extents).
+    let root = writer.root_directory();
+    let file = match writer.open_child_file(root, crate::synthetic_key::SEED_FILE_NAME) {
+        Ok(f) => f,
+        Err(e) => {
+            assert!(false, "open must succeed: {:?}", e);
+            return;
+        }
+    };
+    let mut index = 0usize;
+    while index < 150 {
+        let mut chunk = [0u8; BLOCK_SIZE];
+        fill_compressible_chunk(&mut chunk, index);
+        if let Err(e) = writer.write_file_at(file, (index * BLOCK_SIZE) as u64, &chunk) {
+            assert!(false, "write must succeed: {:?}", e);
+            return;
+        }
+        index += 1;
+    }
+    if let Err(e) = writer.publish_checkpoint() {
+        assert!(false, "publish must succeed: {:?}", e);
+        return;
+    }
+    let (blocks, errors) = match writer.scrub_all() {
+        Ok(result) => result,
+        Err(e) => {
+            assert!(false, "scrub_all must run: {:?}", e);
+            return;
+        }
+    };
+    assert_eq!(
+        errors, 0,
+        "clean volume must scrub_all clean (errors={errors})"
+    );
+    assert!(
+        blocks >= 5,
+        "scrub_all must validate the tree blocks (blocks={blocks})"
+    );
+}
+
 /// Stage B.5 companion: the incompressible fallback on a PLAIN
 /// volume. Random data written under an LZ4 volume policy must be
 /// stored plain (no descriptor, no flag) and still round-trip
