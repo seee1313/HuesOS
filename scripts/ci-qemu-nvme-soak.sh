@@ -164,6 +164,7 @@ if [[ "$inject" == "1" || "$inject" == "2" ]]; then
         "[hxfs] scrub complete"
         "[hxfs] fsck clean"
         "[hxfs] quota-enforced-ok"
+        "[hxfs] stage-e-1mib-ok"
     )
 fi
 for marker in "${required[@]}"; do

@@ -669,3 +669,42 @@ the build is still green).
   parser, framebuffer, ELF, PMM) or a userspace driver
   (NVMe, input). No further driver migrations are planned
   in this roadmap.
+
+## Stage E1 — Scale: multi-block trees  (landed as PR `hxfs-stage-e-scale-extents`)
+
+**Why this stage exists.** The single-block extent table capped a
+file at ~101 v2 records (~404 KiB). Real workloads (media, Doom
+WADs, package stores) need larger files.
+
+### What landed
+
+- **Multi-block extent trees.** A file object with more than 101
+  extents is stored as a two-level tree: a root block
+  (`BLOCK_TYPE_EXTENT_TREE_ROOT`, magic + version + leaf_count +
+  leaf_lbas[]) plus leaves (`BLOCK_TYPE_EXTENT_TREE_LEAF`) holding
+  up to 101 v2 extent records each. Capacity: ~10 201 extents
+  (~40 MiB per file) with one indirection level. Single-block
+  layouts remain unchanged and readable; the tree decision is
+  purely size-driven.
+- **Multi-block allocator / refcount / backref trees.** The
+  volume-level trees were also single-block and overflowed past
+  126/169/101 records; they now share the root+leaves shape
+  (block types 22-27).
+- **Chunked range read.** `FixedHxfsWriter::read_file_at` reads
+  any (offset, len) in bounded 4 KiB windows via `read_extent_block`.
+- **On-target proof.** The hxfs-service runtime moved to the heap
+  (the writer is ~32 KiB at 320-extent capacity), user stack is
+  256 KiB and user heap 1 MiB (kernel-mapped), and the soak writes
+  + reads back a 1 MiB file (256 extents -> 3 leaves) ->
+  `[hxfs] stage-e-1mib-ok` is a required marker.
+- **Host proof.** `stage_e_16mib_file_uses_extent_tree_and_round_trips`
+  writes a 16 MiB file (4096 extents -> 41 leaves) and round-trips
+  it byte-for-byte through a remount.
+
+### Known limitations (documented)
+
+- On-target file size is bounded by the stack-resident writer
+  (SERVICE_MAX_EXTENTS = 320 -> ~1.25 MiB per file). Moving the
+  writer fully off the stack lifts this; host tests cover 16 MiB.
+- Multi-block trees are linear leaf scans (no B-tree index yet);
+  acceptable at the current scale, revisit with Hxblob stores.
