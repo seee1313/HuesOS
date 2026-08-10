@@ -703,8 +703,39 @@ WADs, package stores) need larger files.
 
 ### Known limitations (documented)
 
-- On-target file size is bounded by the stack-resident writer
-  (SERVICE_MAX_EXTENTS = 320 -> ~1.25 MiB per file). Moving the
-  writer fully off the stack lifts this; host tests cover 16 MiB.
+- On-target file size is bounded by the writer created on the
+  mount call stack (SERVICE_MAX_EXTENTS = 1024 -> ~4 MiB per file);
+  the 16 MiB host test covers a deeper tree. Larger on-target files
+  need the O(n^2) per-insert extent sort replaced.
 - Multi-block trees are linear leaf scans (no B-tree index yet);
   acceptable at the current scale, revisit with Hxblob stores.
+
+## Stage E2 — Phase-2 follow-ups (landed as PR `hxfs-phase2-prod`)
+
+- **Per-Job quotas**: `FixedHxfsWriter::set_job_quota` /
+  `set_active_job` enforce a per-job physical/object limit on every
+  write; usage is persisted in the quota tree block and survives
+  remounts. The on-target service can select the caller's job.
+- **Full tree scrub**: `scrub_all()` validates every checkpoint
+  root (allocation/refcount/backref/quota) on disk, auto-detects
+  multi-block trees and checks every leaf.
+- **Observation**: the hxfs-service `STATS` text command prints a
+  mount-time health line (bad extents, scrub/fsck results).
+- **Benchmarks**: `tools/storage-bench.py` measures the
+  encrypted+compressed seed-image pipeline.
+
+## Stage F — Hxblob object store  (landed as PR `hxfs-phase2-prod`)
+
+- `FixedHxfsWriter::put_blob` stores arbitrary bytes as an
+  immutable file named by its SHA-256 content hash; duplicate
+  content is rejected (`AlreadyExists`). `get_blob` / `list_blobs`
+  read back by hash; a bounded Hxblob index tree (MAX_HXBLOBS = 32)
+  is serialized into the checkpoint at publish and reloaded at
+  mount, so blobs survive remounts. The Merkle block is present but
+  empty for the MVP (single-chunk blobs store the hash directly).
+- Host test covers two-blob round-trip through publish + remount,
+  duplicate rejection and count restoration.
+
+**Open**: on-target blob service commands (put/get over the Hxfs
+protocol), Merkle chunking for >4 KiB blobs, larger index (multi-
+block Hxblob index), Hxblob package resolution in DriverManager.
