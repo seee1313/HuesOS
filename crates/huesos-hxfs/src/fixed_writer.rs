@@ -178,9 +178,11 @@ pub struct FixedHxfsWriter<
     /// Stage F: Hxblob immutable-object index (hash -> object).
     /// Bounded by [`MAX_HXBLOBS`]; one block holds 44 records so
     /// 32 keeps the on-disk index single-block.
+    #[cfg(feature = "hxblob")]
     hxblob_index: HxblobIndexTree<MAX_HXBLOBS>,
     /// Stage F: Hxblob Merkle descriptors (empty for the MVP;
     /// single-chunk blobs store the hash directly).
+    #[cfg(feature = "hxblob")]
     hxblob_merkle: HxblobMerkleTree<MAX_HXBLOBS>,
     objects: [Option<FixedObject>; MAX_OBJECTS],
     dir_entries: [Option<FixedDirEntry>; MAX_DIR_ENTRIES],
@@ -327,7 +329,9 @@ impl<
             compression_policies: Vec::new(),
             bad_extents: [const { None }; MAX_BAD_EXTENTS],
             bad_extent_count: 0,
+            #[cfg(feature = "hxblob")]
             hxblob_index: HxblobIndexTree::new(),
+            #[cfg(feature = "hxblob")]
             hxblob_merkle: HxblobMerkleTree::new(),
             objects: [const { None }; MAX_OBJECTS],
             dir_entries: [const { None }; MAX_DIR_ENTRIES],
