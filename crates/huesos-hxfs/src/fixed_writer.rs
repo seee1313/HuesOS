@@ -8,7 +8,9 @@
 use crate::alloc_tree::{AllocationBtree, AllocationRecord, AllocationState};
 use crate::crc32c::{crc32c, metadata_crc32c};
 use crate::format::*;
+#[cfg(feature = "hxblob")]
 use crate::hxblob::BlobHash;
+#[cfg(feature = "hxblob")]
 use crate::hxblob_tree::{HxblobIndexRecord, HxblobIndexTree, HxblobMerkleTree};
 use crate::quota_tree::{QuotaBtree, QuotaRecord};
 use crate::recovery::BlockStore;
