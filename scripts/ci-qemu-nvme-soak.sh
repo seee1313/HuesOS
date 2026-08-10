@@ -36,7 +36,7 @@ elif [[ "$inject" == "3" ]]; then
     export HUESOS_TERMINAL_FEATURES=soak-shutdown
     seed_args=()
 fi
-if [[ "$inject" == "1" || "$inject" == "2" ]]; then
+if [[ "$inject" == "1" || "$inject" == "2" || "$inject" == "3" ]]; then
     # Stage D: the synthetic volume key is baked into the KERNEL as
     # the bootloader key blob (single source of truth: the seed
     # tool's --print-volume-key-hex). The service receives it via

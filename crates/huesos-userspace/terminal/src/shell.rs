@@ -1,7 +1,8 @@
 //! Terminal shell runtime and keyboard event loop.
 
-use crate::println;
 use crate::commands::execute_line;
+#[cfg(feature = "soak-shutdown")]
+use crate::println;
 use crate::screen::Screen;
 use crate::snake;
 use libcanvas::{Channel, ErrorCode};
@@ -75,7 +76,11 @@ impl Shell {
         #[cfg(feature = "soak-shutdown")]
         let mut idle_polls: u32 = 0;
         loop {
-            match self.keyboard.read_into_blocking(&mut buf) {
+            #[cfg(feature = "soak-shutdown")]
+            let read = self.keyboard.read_into_timeout(&mut buf, 100);
+            #[cfg(not(feature = "soak-shutdown"))]
+            let read = self.keyboard.read_into_blocking(&mut buf);
+            match read {
                 Ok(n) => {
                     #[cfg(feature = "soak-shutdown")]
                     {
@@ -86,16 +91,15 @@ impl Shell {
                 Err(ErrorCode::ShouldWait) | Err(ErrorCode::TimedOut) => {
                     #[cfg(feature = "soak-shutdown")]
                     {
-                        // Soak wiring: after enough idle polls (a few
-                        // seconds under QEMU TCG), trigger the orderly
-                        // userspace shutdown so the soak harness can
-                        // observe the full halt chain.
+                        // Soak wiring: after enough idle timeouts (a
+                        // few seconds under QEMU TCG at 100 ticks per
+                        // read), trigger the orderly userspace
+                        // shutdown so the harness can observe the
+                        // full halt chain.
                         idle_polls += 1;
-                        if idle_polls >= 500 {
+                        if idle_polls >= 30 {
                             println!("[terminal] soak-shutdown: auto-triggering orderly shutdown");
                             self.request_shutdown();
-                            // Never returns (init halts all CPUs); if
-                            // it somehow does, keep spinning.
                             loop {
                                 libcanvas::process::yield_now();
                             }
