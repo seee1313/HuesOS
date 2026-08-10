@@ -29,7 +29,12 @@ pub type FixedResult<T> = Result<T, HxfsError>;
 
 /// Maximum Hxblob objects per volume (Stage F). One index block
 /// holds 44 records; 32 keeps it single-block.
-pub const MAX_HXBLOBS: usize = 32;
+pub const MAX_HXBLOBS: usize = 128;
+// 128 blobs = ~13 KiB of in-memory index; the on-disk index is a
+// multi-block tree (root + leaves) with a 1936-record ceiling per
+// volume. Sized so the writer's fixed arrays stay small enough for
+// stack-resident writers in host tests (the service writer lives on
+// the heap).
 /// Maximum quota records (1 volume + per-job records).
 pub const MAX_QUOTA_RECORDS: usize = 16;
 
@@ -717,6 +722,32 @@ impl<
     /// memory until `publish_checkpoint` serializes the Hxblob
     /// index block. Returns the content hash.
     #[cfg(feature = "hxblob")]
+    /// Phase-2 packages: open (or lazily create) the `blobs/`
+    /// base directory.
+    #[cfg(feature = "hxblob")]
+    fn blobs_directory(&mut self) -> FixedResult<DirectoryHandle> {
+        const BLOBS_DIR: &str = "blobs";
+        let root = self.root_directory();
+        if let Ok(dir) = self.open_child_dir(root, BLOBS_DIR) {
+            return Ok(dir);
+        }
+        self.mkdir_child(root, BLOBS_DIR)
+    }
+
+    /// Phase-2 packages: open (or lazily create) the shard directory
+    /// `blobs/b{hash[0] % 8}` holding the payload file for `hash`.
+    #[cfg(feature = "hxblob")]
+    fn blob_shard_directory(&mut self, hash: &BlobHash) -> FixedResult<DirectoryHandle> {
+        let base = self.blobs_directory()?;
+        let shard_index = hash[0] % 8;
+        let shard_name = alloc::format!("b{}", shard_index);
+        if let Ok(dir) = self.open_child_dir(base, &shard_name) {
+            return Ok(dir);
+        }
+        self.mkdir_child(base, &shard_name)
+    }
+
+    #[cfg(feature = "hxblob")]
     pub fn put_blob(&mut self, data: &[u8]) -> FixedResult<BlobHash> {
         let hash = sha256(data);
         if self.hxblob_index.lookup(&hash).is_ok() {
@@ -726,8 +757,13 @@ impl<
             return Err(HxfsError::NoSpace);
         }
         let name = hex_encode(&hash);
-        let root = self.root_directory();
-        let file = self.create_file_child(root, &name)?;
+        // Phase-2 packages: blobs live in a sharded directory tree
+        // (blobs/b0..b7/<hash>) because directories are one block
+        // (~14 entries). Sharding keeps each directory under the
+        // limit: up to 8 shards x 14 entries = 112 blobs without a
+        // multi-block directory (a later format feature).
+        let blob_dir = self.blob_shard_directory(&hash)?;
+        let file = self.create_file_child(blob_dir, &name)?;
         let mut offset = 0usize;
         while offset < data.len() {
             let n = (data.len() - offset).min(BLOCK_SIZE);
@@ -755,9 +791,9 @@ impl<
             .lookup(hash)
             .map_err(|_| HxfsError::NotFound)?;
         let name = hex_encode(hash);
-        let root = self.root_directory();
+        let blob_dir = self.blob_shard_directory(hash)?;
         let file = self
-            .open_child_file(root, &name)
+            .open_child_file(blob_dir, &name)
             .map_err(|_| HxfsError::NotFound)?;
         let mut out = alloc::vec![0u8; record.size as usize];
         self.read_file(file, &mut out)?;
@@ -788,29 +824,42 @@ impl<
     /// + merkle_tree_lba(8) + flags(4)`); one block holds 44
     /// records (bounded by MAX_HXBLOBS = 32).
     #[cfg(feature = "hxblob")]
-    fn build_hxblob_index_block(&self, lba: u64) -> FixedResult<[u8; BLOCK_SIZE]> {
+    fn build_hxblob_index_block(
+        &self,
+        lba: u64,
+    ) -> FixedResult<([u8; BLOCK_SIZE], alloc::vec::Vec<[u8; BLOCK_SIZE]>)> {
+        // Phase-2 packages: a large Hxblob index becomes a two-level
+        // tree (root + leaves) with the same shape as the other
+        // multi-block trees; small indexes stay single-block.
+        let records: alloc::vec::Vec<HxblobIndexRecord> = self
+            .hxblob_index
+            .records()
+            .iter()
+            .filter_map(|record| *record)
+            .collect();
+        let count = records.len();
+        if count > HXBLOB_LEAF_RECORDS {
+            return self.build_hxblob_index_tree(records, lba);
+        }
         let mut payload = [0u8; BLOCK_SIZE - HEADER_BYTES];
-        let count = self.hxblob_index.record_count();
         payload[0..4].copy_from_slice(&(count as u32).to_le_bytes());
         let mut written = 0usize;
-        for record in self.hxblob_index.records() {
-            if let Some(record) = record {
-                let offset = 4 + written * 92;
-                if offset + 92 > payload.len() {
-                    return Err(HxfsError::NoSpace);
-                }
-                payload[offset..offset + 32].copy_from_slice(&record.hash);
-                payload[offset + 32..offset + 40].copy_from_slice(&record.object_id.to_le_bytes());
-                payload[offset + 40..offset + 48].copy_from_slice(&record.size.to_le_bytes());
-                payload[offset + 48..offset + 80].copy_from_slice(&record.merkle_root);
-                payload[offset + 80..offset + 88]
-                    .copy_from_slice(&record.merkle_tree_lba.to_le_bytes());
-                payload[offset + 88..offset + 92].copy_from_slice(&record.flags.to_le_bytes());
-                written += 1;
+        for record in &records {
+            let offset = 4 + written * 92;
+            if offset + 92 > payload.len() {
+                return Err(HxfsError::NoSpace);
             }
+            payload[offset..offset + 32].copy_from_slice(&record.hash);
+            payload[offset + 32..offset + 40].copy_from_slice(&record.object_id.to_le_bytes());
+            payload[offset + 40..offset + 48].copy_from_slice(&record.size.to_le_bytes());
+            payload[offset + 48..offset + 80].copy_from_slice(&record.merkle_root);
+            payload[offset + 80..offset + 88]
+                .copy_from_slice(&record.merkle_tree_lba.to_le_bytes());
+            payload[offset + 88..offset + 92].copy_from_slice(&record.flags.to_le_bytes());
+            written += 1;
         }
         let args = self.encryption_args();
-        make_metadata_block_for_volume(
+        let block = make_metadata_block_for_volume(
             BLOCK_TYPE_HXBLOB_INDEX_TREE,
             self.system_volume.root_object_id,
             lba,
@@ -818,7 +867,81 @@ impl<
             args.0,
             args.1,
             args.2,
-        )
+        )?;
+        Ok((block, alloc::vec::Vec::new()))
+    }
+
+    /// Phase-2 packages: build a two-level Hxblob index tree
+    /// (root + leaves). Leaves are returned (not written); the
+    /// publisher places them after the root.
+    #[cfg(feature = "hxblob")]
+    fn build_hxblob_index_tree(
+        &self,
+        records: alloc::vec::Vec<HxblobIndexRecord>,
+        lba: u64,
+    ) -> FixedResult<([u8; BLOCK_SIZE], alloc::vec::Vec<[u8; BLOCK_SIZE]>)> {
+        let count = records.len();
+        let leaf_count = count.div_ceil(HXBLOB_LEAF_RECORDS);
+        let mut root_payload = [0u8; BLOCK_SIZE - HEADER_BYTES];
+        root_payload[0..4].copy_from_slice(&HXBLOB_TREE_ROOT_MAGIC.to_le_bytes());
+        root_payload[4..8].copy_from_slice(&HXBLOB_TREE_ROOT_VERSION.to_le_bytes());
+        root_payload[8..12].copy_from_slice(&(leaf_count as u32).to_le_bytes());
+        let mut leaf_index = 0usize;
+        let mut leaf_lba = lba + 1;
+        while leaf_index < leaf_count {
+            root_payload[16 + leaf_index * 8..16 + leaf_index * 8 + 8]
+                .copy_from_slice(&leaf_lba.to_le_bytes());
+            leaf_lba += 1;
+            leaf_index += 1;
+        }
+        let args = self.encryption_args();
+        let root = make_metadata_block_for_volume(
+            BLOCK_TYPE_HXBLOB_INDEX_TREE_ROOT,
+            self.system_volume.root_object_id,
+            lba,
+            &root_payload[..16 + leaf_count * 8],
+            args.0,
+            args.1,
+            args.2,
+        )?;
+        let mut leaves: alloc::vec::Vec<[u8; BLOCK_SIZE]> =
+            alloc::vec::Vec::with_capacity(leaf_count);
+        let mut payload = [0u8; BLOCK_SIZE - HEADER_BYTES];
+        let mut record_index = 0usize;
+        leaf_lba = lba + 1;
+        for record in &records {
+            let within = record_index % HXBLOB_LEAF_RECORDS;
+            if within == 0 {
+                payload = [0u8; BLOCK_SIZE - HEADER_BYTES];
+                // The leaf records its own record count, like the
+                // single-block index: min(44, remaining records).
+                let this_leaf_count = (records.len() - record_index).min(HXBLOB_LEAF_RECORDS);
+                payload[0..4].copy_from_slice(&(this_leaf_count as u32).to_le_bytes());
+            }
+            let offset = 4 + within * 92;
+            payload[offset..offset + 32].copy_from_slice(&record.hash);
+            payload[offset + 32..offset + 40].copy_from_slice(&record.object_id.to_le_bytes());
+            payload[offset + 40..offset + 48].copy_from_slice(&record.size.to_le_bytes());
+            payload[offset + 48..offset + 80].copy_from_slice(&record.merkle_root);
+            payload[offset + 80..offset + 88]
+                .copy_from_slice(&record.merkle_tree_lba.to_le_bytes());
+            payload[offset + 88..offset + 92].copy_from_slice(&record.flags.to_le_bytes());
+            record_index += 1;
+            if within == HXBLOB_LEAF_RECORDS - 1 || record_index == count {
+                let leaf_count_records = record_index.min(HXBLOB_LEAF_RECORDS);
+                leaves.push(make_metadata_block_for_volume(
+                    BLOCK_TYPE_HXBLOB_INDEX_TREE_LEAF,
+                    self.system_volume.root_object_id,
+                    leaf_lba,
+                    &payload[..4 + leaf_count_records * 92],
+                    args.0,
+                    args.1,
+                    args.2,
+                )?);
+                leaf_lba += 1;
+            }
+        }
+        Ok((root, leaves))
     }
 
     /// Stage F: serialize the (empty for the MVP) Merkle block.
@@ -1490,8 +1613,27 @@ impl<
         let quota_tree_lba = backref_leaves_end;
         // Stage F: the Hxblob index + Merkle blocks live between
         // the quota tree and the checkpoint.
+        // Phase-2 packages: the Hxblob index may span multiple
+        // blocks (root + leaves); reserve space for the leaves
+        // between the index root and the Merkle block.
+        let hxblob_count = {
+            #[cfg(feature = "hxblob")]
+            {
+                self.hxblob_index.record_count()
+            }
+            #[cfg(not(feature = "hxblob"))]
+            {
+                0usize
+            }
+        };
+        let hxblob_leaf_blocks = if hxblob_count > HXBLOB_LEAF_RECORDS {
+            hxblob_count.div_ceil(HXBLOB_LEAF_RECORDS)
+        } else {
+            0
+        };
         let hxblob_index_tree_lba = quota_tree_lba + 1;
-        let hxblob_merkle_tree_lba = hxblob_index_tree_lba + 1;
+        let hxblob_leaves_end = hxblob_index_tree_lba + 1 + hxblob_leaf_blocks as u64;
+        let hxblob_merkle_tree_lba = hxblob_leaves_end;
         let checkpoint_lba = hxblob_merkle_tree_lba + 1;
         let journal_start_lba = checkpoint_lba + 1;
         let journal_end_lba = journal_start_lba + u64::from(record_count) * 2;
@@ -1628,7 +1770,8 @@ impl<
         // Stage F: write the Hxblob index + Merkle blocks (they are
         // part of the target area and covered by the journal).
         #[cfg(feature = "hxblob")]
-        let hxblob_index_block = self.build_hxblob_index_block(hxblob_index_tree_lba)?;
+        let (hxblob_index_block, hxblob_index_leaves) =
+            self.build_hxblob_index_block(hxblob_index_tree_lba)?;
         #[cfg(feature = "hxblob")]
         let hxblob_merkle_block = self.build_hxblob_merkle_block(hxblob_merkle_tree_lba)?;
         #[cfg(feature = "hxblob")]
@@ -1643,6 +1786,10 @@ impl<
                 checkpoint_lba,
                 0,
             )?;
+            // Write the index leaves plain after the root.
+            for (leaf_lba, leaf) in (hxblob_index_tree_lba + 1..).zip(hxblob_index_leaves.iter()) {
+                self.store.write_blocks(leaf_lba, 1, leaf)?;
+            }
             record_index += 1;
             self.write_journaled_target(
                 hxblob_merkle_tree_lba,
@@ -1945,49 +2092,106 @@ impl<
             return Ok(());
         }
         let mut block = [0u8; BLOCK_SIZE];
-        let header = self.read_mounted_metadata_block(
+        // Phase-2 packages: the index may be a single block
+        // (BLOCK_TYPE_HXBLOB_INDEX_TREE) or a two-level tree
+        // (BLOCK_TYPE_HXBLOB_INDEX_TREE_ROOT + leaves). Try the
+        // root first; a single-block index fails validation with
+        // BadBlock.
+        let header = match self.read_mounted_metadata_block(
             lba,
-            BLOCK_TYPE_HXBLOB_INDEX_TREE,
+            BLOCK_TYPE_HXBLOB_INDEX_TREE_ROOT,
             self.system_volume.root_object_id,
             &mut block,
-        )?;
+        ) {
+            Ok(header) => header,
+            Err(HxfsError::BadBlock) => {
+                let mut single = [0u8; BLOCK_SIZE];
+                let header = self.read_mounted_metadata_block(
+                    lba,
+                    BLOCK_TYPE_HXBLOB_INDEX_TREE,
+                    self.system_volume.root_object_id,
+                    &mut single,
+                )?;
+                let base = header.header_bytes as usize;
+                let count = read_u32(&single, base)? as usize;
+                if count > MAX_HXBLOBS {
+                    return Err(HxfsError::BadTree);
+                }
+                let mut index = 0usize;
+                while index < count {
+                    let offset = base + 4 + index * 92;
+                    self.insert_hxblob_record(&single, offset)?;
+                    index += 1;
+                }
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        };
+        // Multi-block root: collect the leaf LBAs and load each leaf.
         let base = header.header_bytes as usize;
-        let count = read_u32(&block, base)? as usize;
-        if count > MAX_HXBLOBS {
+        let leaf_count = read_u32(&block, base + 8)? as usize;
+        if leaf_count == 0 || leaf_count > MAX_HXBLOBS {
             return Err(HxfsError::BadTree);
         }
-        let mut index = 0usize;
-        while index < count {
-            let offset = base + 4 + index * 92;
-            let mut hash = [0u8; 32];
-            hash.copy_from_slice(block.get(offset..offset + 32).ok_or(HxfsError::BadTree)?);
-            let object_id = read_u64(&block, offset + 32)?;
-            let size = read_u64(&block, offset + 40)?;
-            let mut merkle_root = [0u8; 32];
-            merkle_root.copy_from_slice(
-                block
-                    .get(offset + 48..offset + 80)
-                    .ok_or(HxfsError::BadTree)?,
-            );
-            let merkle_tree_lba = read_u64(&block, offset + 80)?;
-            let flags = read_u32(&block, offset + 88)?;
-            self.hxblob_index
-                .insert(HxblobIndexRecord {
-                    hash,
-                    object_id,
-                    size,
-                    merkle_root,
-                    merkle_tree_lba,
-                    flags,
-                })
-                .map_err(|_| HxfsError::BadTree)?;
-            index += 1;
+        let mut leaf_index = 0usize;
+        let mut loaded = 0usize;
+        while leaf_index < leaf_count {
+            let leaf_lba = read_u64(&block, base + 16 + leaf_index * 8)?;
+            let mut leaf = [0u8; BLOCK_SIZE];
+            let leaf_header = self.read_mounted_metadata_block(
+                leaf_lba,
+                BLOCK_TYPE_HXBLOB_INDEX_TREE_LEAF,
+                self.system_volume.root_object_id,
+                &mut leaf,
+            )?;
+            let leaf_base = leaf_header.header_bytes as usize;
+            let count = read_u32(&leaf, leaf_base)? as usize;
+            if count > HXBLOB_LEAF_RECORDS {
+                return Err(HxfsError::BadTree);
+            }
+            let mut index = 0usize;
+            while index < count {
+                let offset = leaf_base + 4 + index * 92;
+                self.insert_hxblob_record(&leaf, offset)?;
+                loaded += 1;
+                index += 1;
+            }
+            leaf_index += 1;
+        }
+        if loaded != self.hxblob_index.record_count().min(loaded) && loaded == 0 && leaf_count > 0 {
+            return Err(HxfsError::BadTree);
         }
         Ok(())
     }
 
-    /// Stage E (Phase-2): load the quota tree (volume + per-job
-    /// records) from the checkpoint block at mount time.
+    /// Insert one Hxblob index record parsed from `block` at
+    /// `offset` (92-byte wire record).
+    #[cfg(feature = "hxblob")]
+    fn insert_hxblob_record(&mut self, block: &[u8], offset: usize) -> FixedResult<()> {
+        let mut hash = [0u8; 32];
+        hash.copy_from_slice(block.get(offset..offset + 32).ok_or(HxfsError::BadTree)?);
+        let object_id = read_u64(block, offset + 32)?;
+        let size = read_u64(block, offset + 40)?;
+        let mut merkle_root = [0u8; 32];
+        merkle_root.copy_from_slice(
+            block
+                .get(offset + 48..offset + 80)
+                .ok_or(HxfsError::BadTree)?,
+        );
+        let merkle_tree_lba = read_u64(block, offset + 80)?;
+        let flags = read_u32(block, offset + 88)?;
+        self.hxblob_index
+            .insert(HxblobIndexRecord {
+                hash,
+                object_id,
+                size,
+                merkle_root,
+                merkle_tree_lba,
+                flags,
+            })
+            .map_err(|_| HxfsError::BadTree)
+    }
+
     fn load_quota_tree(&mut self) -> FixedResult<()> {
         let lba = self.checkpoint.quota_tree_lba;
         if lba == 0 {

@@ -154,6 +154,33 @@ pub const BACKREF_TREE_ROOT_VERSION: u32 = 1;
 /// Number of backref records a leaf holds (`4056 / 40`).
 pub const BACKREF_LEAF_RECORDS: usize = 101;
 
+/// Metadata block type: Hxblob index tree ROOT (Phase-2 packages).
+///
+/// The Hxblob index (hash -> object) is a two-level tree once it
+/// grows past a single block: the root carries
+/// `magic + version + leaf_count + leaf_lbas[]` like the other
+/// multi-block trees, and each leaf holds up to
+/// [`HXBLOB_LEAF_RECORDS`] 92-byte index records. Capacity:
+/// 44 * 44 = 1936 blobs per volume.
+pub const BLOCK_TYPE_HXBLOB_INDEX_TREE_ROOT: u32 = 28;
+
+/// Metadata block type: Hxblob index tree LEAF.
+///
+/// A leaf holds `count(4)` followed by up to [`HXBLOB_LEAF_RECORDS`]
+/// 92-byte records (hash, object_id, size, merkle_root,
+/// merkle_tree_lba, flags), with the same wire layout as the
+/// single-block Hxblob index.
+pub const BLOCK_TYPE_HXBLOB_INDEX_TREE_LEAF: u32 = 29;
+
+/// Magic of the Hxblob index tree root payload.
+pub const HXBLOB_TREE_ROOT_MAGIC: u32 = 0x4842_4c42; // "HBLB"
+/// Version of the Hxblob index tree root payload.
+pub const HXBLOB_TREE_ROOT_VERSION: u32 = 1;
+/// Number of 92-byte index records a leaf holds (`(4056 - 4) / 92`).
+pub const HXBLOB_LEAF_RECORDS: usize = 44;
+/// Maximum Hxblob objects per volume (one root + leaves).
+pub const HXBLOB_TREE_MAX_RECORDS: usize = HXBLOB_LEAF_RECORDS * HXBLOB_LEAF_RECORDS;
+
 /// Incompatible feature: v2 root-store state and feature flags are present.
 pub const FEATURE_INCOMPAT_V2_ROOT_STORE: u64 = 1 << 0;
 /// Incompatible feature: journal replay records may be required before mount.

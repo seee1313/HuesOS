@@ -3436,14 +3436,12 @@ fn stage_f_hxblob_round_trip_survives_remount() {
         assert!(false, "boot write must succeed: {:?}", e);
         return;
     }
-    let Ok(mut writer) =
-        FixedHxfsWriter::<_, 16, 32, 256>::mount_with_policies(
-            store,
-            &policies,
-            &comps,
-            Some(&crate::synthetic_key::VOLUME_KEY),
-        )
-    else {
+    let Ok(mut writer) = FixedHxfsWriter::<_, 16, 32, 256>::mount_with_policies(
+        store,
+        &policies,
+        &comps,
+        Some(&crate::synthetic_key::VOLUME_KEY),
+    ) else {
         assert!(false, "writer mount must succeed");
         return;
     };
@@ -3497,14 +3495,12 @@ fn stage_f_hxblob_round_trip_survives_remount() {
         assert!(false, "remount image write must succeed: {:?}", e);
         return;
     }
-    let Ok(mut fs) =
-        FixedHxfsWriter::<_, 16, 32, 256>::mount_with_policies(
-            remount_store,
-            &policies,
-            &comps,
-            Some(&crate::synthetic_key::VOLUME_KEY),
-        )
-    else {
+    let Ok(mut fs) = FixedHxfsWriter::<_, 16, 32, 256>::mount_with_policies(
+        remount_store,
+        &policies,
+        &comps,
+        Some(&crate::synthetic_key::VOLUME_KEY),
+    ) else {
         assert!(false, "remount must succeed");
         return;
     };
@@ -3895,6 +3891,85 @@ fn rewrite_at_zero_releases_extent_slots() {
         after, 2,
         "rewrite must replace 300 blocks with 2 (data_blocks={after})"
     );
+}
+
+/// Phase-2 packages: the Hxblob index grows past one block
+/// (>44 records) into a two-level tree; all blobs must survive a
+/// publish + remount.
+#[cfg(all(test, feature = "hxblob", feature = "crypto-aes-gcm"))]
+#[test]
+fn stage_f_hxblob_multi_block_index_round_trip() {
+    use crate::fixed_writer::FixedHxfsWriter;
+    use crate::recovery::BlockStore;
+    use crate::writer::VecBlockStore;
+
+    let policies = [crate::synthetic_key::encryption_policy()];
+    let comps = [crate::synthetic_key::compression_policy()];
+    let boot_image = build_seeded_boot_image(true, crate::synthetic_key::COMPRESSION_POLICY_ID);
+    let mut store = VecBlockStore::with_blocks(8192);
+    let boot_blocks = (boot_image.len() / BLOCK_SIZE) as u32;
+    if let Err(e) = store.write_blocks(0, boot_blocks, &boot_image) {
+        assert!(false, "boot write must succeed: {:?}", e);
+        return;
+    }
+    let Ok(mut writer) = FixedHxfsWriter::<_, 128, 128, 512>::mount_with_policies(
+        store,
+        &policies,
+        &comps,
+        Some(&crate::synthetic_key::VOLUME_KEY),
+    ) else {
+        assert!(false, "writer mount must succeed");
+        return;
+    };
+    // 45 distinct blobs: forces a multi-block index (44/leaf).
+    let mut hashes = alloc::vec::Vec::new();
+    let mut index = 0usize;
+    while index < 45 {
+        let payload = alloc::format!("hxblob-package-{index:04}-payload").into_bytes();
+        match writer.put_blob(&payload) {
+            Ok(hash) => hashes.push(hash),
+            Err(e) => {
+                assert!(false, "put_blob {index} must succeed: {:?}", e);
+                return;
+            }
+        }
+        index += 1;
+    }
+    assert_eq!(writer.blob_count(), 45);
+    if let Err(e) = writer.publish_checkpoint() {
+        assert!(false, "publish_checkpoint must succeed: {:?}", e);
+        return;
+    }
+    let store = writer.into_store();
+    let image = store.image().to_vec();
+    // Remount and verify every blob.
+    let mut remount = VecBlockStore::with_blocks(8192);
+    if let Err(e) = remount.write_blocks(0, (image.len() / BLOCK_SIZE) as u32, &image) {
+        assert!(false, "remount image write must succeed: {:?}", e);
+        return;
+    }
+    let Ok(mut fs) = FixedHxfsWriter::<_, 128, 128, 512>::mount_with_policies(
+        remount,
+        &policies,
+        &comps,
+        Some(&crate::synthetic_key::VOLUME_KEY),
+    ) else {
+        assert!(false, "remount must succeed");
+        return;
+    };
+    assert_eq!(fs.blob_count(), 45, "all 45 blobs must survive remount");
+    let mut index = 0usize;
+    while index < 45 {
+        let payload = alloc::format!("hxblob-package-{index:04}-payload").into_bytes();
+        match fs.get_blob(&hashes[index]) {
+            Ok(got) => assert_eq!(got, payload, "blob {index} must round-trip"),
+            Err(e) => {
+                assert!(false, "get_blob {index} must succeed: {:?}", e);
+                return;
+            }
+        }
+        index += 1;
+    }
 }
 
 /// Stage B.5 companion: the incompressible fallback on a PLAIN
