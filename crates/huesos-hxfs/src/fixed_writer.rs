@@ -30,6 +30,8 @@ pub type FixedResult<T> = Result<T, HxfsError>;
 /// Maximum Hxblob objects per volume (Stage F). One index block
 /// holds 44 records; 32 keeps it single-block.
 pub const MAX_HXBLOBS: usize = 32;
+/// Maximum quota records (1 volume + per-job records).
+pub const MAX_QUOTA_RECORDS: usize = 16;
 
 /// Bounded per-mount registry of data extents whose read failed
 /// (decrypt/CRC/decompress error). Subsequent reads of a marked
@@ -186,6 +188,14 @@ pub struct FixedHxfsWriter<
     /// single-chunk blobs store the hash directly).
     #[cfg(feature = "hxblob")]
     hxblob_merkle: HxblobMerkleTree<MAX_HXBLOBS>,
+    /// Stage E (Phase-2): per-Job quota records (volume quota is
+    /// record for the system volume UUID). Loaded at mount from the
+    /// quota tree block; the active job's record is checked on every
+    /// write.
+    quota_tree: QuotaBtree<MAX_QUOTA_RECORDS>,
+    /// Job id whose quota is enforced on writes; `None` = no per-job
+    /// limit.
+    active_job: Option<u64>,
     objects: [Option<FixedObject>; MAX_OBJECTS],
     dir_entries: [Option<FixedDirEntry>; MAX_DIR_ENTRIES],
     extents: [Option<FixedExtent>; MAX_EXTENTS],
@@ -335,6 +345,8 @@ impl<
             hxblob_index: HxblobIndexTree::new(),
             #[cfg(feature = "hxblob")]
             hxblob_merkle: HxblobMerkleTree::new(),
+            quota_tree: QuotaBtree::new(),
+            active_job: None,
             objects: [const { None }; MAX_OBJECTS],
             dir_entries: [const { None }; MAX_DIR_ENTRIES],
             extents: [const { None }; MAX_EXTENTS],
@@ -345,6 +357,7 @@ impl<
         mounted.load_object_tree()?;
         #[cfg(feature = "hxblob")]
         mounted.load_hxblob_index()?;
+        mounted.load_quota_tree()?;
         mounted.next_object_id = mounted.compute_next_object_id();
         mounted.next_lba = mounted.compute_next_lba()?;
         Ok(mounted)
@@ -599,6 +612,111 @@ impl<
         summary
     }
 
+    /// Stage C + E (Phase-2): full tree scrub. Walks every
+    /// checkpoint root (allocation, refcount, backref, quota)
+    /// ON DISK, validating each metadata block through the
+    /// decrypt-aware read path. Multi-block trees are detected by
+    /// trying the ROOT block type first and falling back to the
+    /// single-block form; every leaf of a multi-block tree is
+    /// validated. Returns (blocks validated, errors).
+    pub fn scrub_all(&mut self) -> FixedResult<(u64, u64)> {
+        let mut blocks = 0u64;
+        let mut errors = 0u64;
+        let mut check_root_or_single =
+            |this: &mut Self, lba: u64, root_type: u32, single_type: u32| -> FixedResult<()> {
+                if lba == 0 {
+                    return Ok(());
+                }
+                let mut block = [0u8; BLOCK_SIZE];
+                let header = match this.read_mounted_metadata_block(
+                    lba,
+                    root_type,
+                    this.system_volume.root_object_id,
+                    &mut block,
+                ) {
+                    Ok(header) => header,
+                    Err(HxfsError::BadBlock) => {
+                        // Not a multi-block root; try the single form.
+                        match this.read_mounted_metadata_block(
+                            lba,
+                            single_type,
+                            this.system_volume.root_object_id,
+                            &mut block,
+                        ) {
+                            Ok(_) => blocks += 1,
+                            Err(_) => errors += 1,
+                        }
+                        return Ok(());
+                    }
+                    Err(_) => {
+                        errors += 1;
+                        return Ok(());
+                    }
+                };
+                blocks += 1;
+                // Multi-block root: validate every leaf.
+                let base = header.header_bytes as usize;
+                let count = read_u32(&block, base + 8).unwrap_or(0) as usize;
+                let leaf_type = match root_type {
+                    BLOCK_TYPE_ALLOCATION_TREE_ROOT => BLOCK_TYPE_ALLOCATION_TREE_LEAF,
+                    BLOCK_TYPE_REFCOUNT_TREE_ROOT => BLOCK_TYPE_REFCOUNT_TREE_LEAF,
+                    _ => BLOCK_TYPE_BACKREF_TREE_LEAF,
+                };
+                let mut leaf_index = 0usize;
+                while leaf_index < count {
+                    let leaf_lba = read_u64(&block, base + 16 + leaf_index * 8).unwrap_or(0);
+                    if leaf_lba == 0 {
+                        errors += 1;
+                    } else {
+                        let mut leaf = [0u8; BLOCK_SIZE];
+                        match this.read_mounted_metadata_block(
+                            leaf_lba,
+                            leaf_type,
+                            this.system_volume.root_object_id,
+                            &mut leaf,
+                        ) {
+                            Ok(_) => blocks += 1,
+                            Err(_) => errors += 1,
+                        }
+                    }
+                    leaf_index += 1;
+                }
+                Ok(())
+            };
+        check_root_or_single(
+            self,
+            self.checkpoint.allocation_tree_lba,
+            BLOCK_TYPE_ALLOCATION_TREE_ROOT,
+            BLOCK_TYPE_ALLOCATION_TREE,
+        )?;
+        check_root_or_single(
+            self,
+            self.checkpoint.refcount_tree_lba,
+            BLOCK_TYPE_REFCOUNT_TREE_ROOT,
+            BLOCK_TYPE_REFCOUNT_TREE,
+        )?;
+        check_root_or_single(
+            self,
+            self.checkpoint.backref_tree_lba,
+            BLOCK_TYPE_BACKREF_TREE_ROOT,
+            BLOCK_TYPE_BACKREF_TREE,
+        )?;
+        // Quota tree is always single-block.
+        let mut block = [0u8; BLOCK_SIZE];
+        if self.checkpoint.quota_tree_lba != 0 {
+            match self.read_mounted_metadata_block(
+                self.checkpoint.quota_tree_lba,
+                BLOCK_TYPE_QUOTA_TREE,
+                self.system_volume.root_object_id,
+                &mut block,
+            ) {
+                Ok(_) => blocks += 1,
+                Err(_) => errors += 1,
+            }
+        }
+        Ok((blocks, errors))
+    }
+
     /// Stage F: store `data` as an immutable Hxblob object.
     ///
     /// The content hash (SHA-256) is the object's identity: a
@@ -728,6 +846,73 @@ impl<
             args.1,
             args.2,
         )
+    }
+
+    /// Stage E (Phase-2): set a per-Job physical/object quota. The
+    /// job is identified by an opaque u64; the record is keyed in
+    /// the quota tree by a synthetic UUID (job id in the first 8
+    /// bytes). `0` limits mean unlimited.
+    pub fn set_job_quota(
+        &mut self,
+        job_id: u64,
+        physical_bytes: u64,
+        objects: u64,
+    ) -> FixedResult<()> {
+        let uuid = job_uuid(job_id);
+        let current = self.quota_tree.get(uuid).ok();
+        self.quota_tree
+            .upsert(QuotaRecord {
+                volume_uuid: uuid,
+                physical_limit_bytes: physical_bytes,
+                physical_used_bytes: current.map_or(0, |r| r.physical_used_bytes),
+                object_limit: objects,
+                object_count: current.map_or(0, |r| r.object_count),
+            })
+            .map_err(|_| HxfsError::NoSpace)?;
+        Ok(())
+    }
+
+    /// Stage E (Phase-2): select the job whose quota is enforced on
+    /// subsequent writes.
+    pub fn set_active_job(&mut self, job_id: Option<u64>) {
+        self.active_job = job_id;
+    }
+
+    /// Stage E (Phase-2): current usage of a job quota.
+    pub fn job_quota_usage(&self, job_id: u64) -> (u64, u64) {
+        self.quota_tree
+            .get(job_uuid(job_id))
+            .map(|r| (r.physical_used_bytes, r.object_count))
+            .unwrap_or((0, 0))
+    }
+
+    /// Stage E (Phase-2): enforce the active job's quota for a write
+    /// of `delta_bytes` / `delta_objects`.
+    fn check_job_quota(&mut self, delta_bytes: u64, delta_objects: u64) -> FixedResult<()> {
+        let Some(job_id) = self.active_job else {
+            return Ok(());
+        };
+        let uuid = job_uuid(job_id);
+        let mut record = self
+            .quota_tree
+            .get(uuid)
+            .map_err(|_| HxfsError::QuotaExceeded)?;
+        if record.physical_limit_bytes != 0
+            && record.physical_used_bytes.saturating_add(delta_bytes) > record.physical_limit_bytes
+        {
+            return Err(HxfsError::QuotaExceeded);
+        }
+        if record.object_limit != 0
+            && record.object_count.saturating_add(delta_objects) > record.object_limit
+        {
+            return Err(HxfsError::QuotaExceeded);
+        }
+        record.physical_used_bytes = record.physical_used_bytes.saturating_add(delta_bytes);
+        record.object_count = record.object_count.saturating_add(delta_objects);
+        self.quota_tree
+            .upsert(record)
+            .map_err(|_| HxfsError::NoSpace)?;
+        Ok(())
     }
 
     /// Consume the writer and return the underlying block store.
@@ -1059,6 +1244,8 @@ impl<
         // mount boundary.
         let delta_bytes = u64::try_from(data.len()).map_err(|_| HxfsError::OutOfRange)?;
         self.check_volume_quota(delta_bytes, 0)?;
+        // Stage E (Phase-2): per-Job quota enforcement.
+        self.check_job_quota(delta_bytes, 0)?;
 
         if offset == 0 {
             self.clear_extents(file.object_id);
@@ -1803,6 +1990,47 @@ impl<
                     flags,
                 })
                 .map_err(|_| HxfsError::BadTree)?;
+            index += 1;
+        }
+        Ok(())
+    }
+
+    /// Stage E (Phase-2): load the quota tree (volume + per-job
+    /// records) from the checkpoint block at mount time.
+    fn load_quota_tree(&mut self) -> FixedResult<()> {
+        let lba = self.checkpoint.quota_tree_lba;
+        if lba == 0 {
+            return Ok(());
+        }
+        let mut block = [0u8; BLOCK_SIZE];
+        let header = self.read_mounted_metadata_block(
+            lba,
+            BLOCK_TYPE_QUOTA_TREE,
+            self.system_volume.root_object_id,
+            &mut block,
+        )?;
+        let base = header.header_bytes as usize;
+        let count = read_u32(&block, base)? as usize;
+        if count > MAX_QUOTA_RECORDS {
+            return Err(HxfsError::BadTree);
+        }
+        let mut index = 0usize;
+        while index < count {
+            let offset = base + 16 + index * 56;
+            let mut uuid = [0u8; 16];
+            uuid.copy_from_slice(block.get(offset..offset + 16).ok_or(HxfsError::BadTree)?);
+            let record = QuotaRecord {
+                volume_uuid: uuid,
+                physical_limit_bytes: read_u64(&block, offset + 16)?,
+                physical_used_bytes: read_u64(&block, offset + 24)?,
+                object_limit: read_u64(&block, offset + 32)?,
+                object_count: read_u64(&block, offset + 40)?,
+            };
+            if uuid != self.system_volume.uuid {
+                self.quota_tree
+                    .upsert(record)
+                    .map_err(|_| HxfsError::BadTree)?;
+            }
             index += 1;
         }
         Ok(())
@@ -3389,7 +3617,9 @@ impl<
         let physical_used_bytes = future_next_lba
             .checked_mul(BLOCK_SIZE_U64)
             .ok_or(HxfsError::OutOfRange)?;
-        let mut tree = QuotaBtree::<1>::new();
+        // Stage E (Phase-2): the quota tree block carries the volume
+        // record PLUS every per-job record.
+        let mut tree = QuotaBtree::<MAX_QUOTA_RECORDS>::new();
         tree.upsert(QuotaRecord {
             volume_uuid: self.system_volume.uuid,
             physical_limit_bytes: self.system_volume.quota_physical_bytes,
@@ -3398,6 +3628,11 @@ impl<
             object_count: self.live_object_count() as u64,
         })
         .map_err(|_| HxfsError::NoSpace)?;
+        for record in self.quota_tree.records().iter().flatten() {
+            if record.volume_uuid != self.system_volume.uuid {
+                tree.upsert(*record).map_err(|_| HxfsError::NoSpace)?;
+            }
+        }
         tree.validate().map_err(|_| HxfsError::BadTree)?;
         let mut payload = [0u8; BLOCK_SIZE - HEADER_BYTES];
         let count = tree.record_count();
@@ -3948,4 +4183,12 @@ fn hex_encode(bytes: &[u8]) -> alloc::string::String {
         out.push(HEX[(byte & 0x0f) as usize] as char);
     }
     out
+}
+
+/// Stage E (Phase-2): synthetic UUID for a job id (job id in the
+/// first 8 bytes, rest zero).
+fn job_uuid(job_id: u64) -> crate::format::Uuid {
+    let mut uuid = [0u8; 16];
+    uuid[..8].copy_from_slice(&job_id.to_le_bytes());
+    uuid
 }
