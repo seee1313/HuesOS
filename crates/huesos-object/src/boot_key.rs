@@ -14,11 +14,11 @@
 //! unseals it into this slot at boot; the ABI of the handoff
 //! (kernel -> syscall -> service -> mount) does not change.
 
-use spin::Mutex;
+use crate::irq_guard::IrqSafeMutex;
 
 /// The kernel-owned volume key blob. `None` when this build has no
 /// key (only plain volumes can be mounted then).
-pub static BOOT_VOLUME_KEY: Mutex<Option<[u8; 32]>> = Mutex::new(None);
+pub static BOOT_VOLUME_KEY: IrqSafeMutex<Option<[u8; 32]>> = IrqSafeMutex::new(None);
 
 /// Install the build-time key blob (called once during kernel
 /// init, before any userspace process can call `VolumeKeyGet`).
