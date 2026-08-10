@@ -75,8 +75,8 @@ pub const BLOCK_TYPE_EXTENT_TABLE_V2: u32 = 19;
 /// Metadata block type: extent tree ROOT (Stage E scaling).
 ///
 /// A root block is the indirection top of a multi-block extent
-/// tree. Payload: `magic(4) + version(4) + count(4) + reserved(4)
-/// + leaf_lbas[]`, where each `leaf_lba` points at an
+/// tree. Payload: `magic(4) + version(4) + count(4) + reserved(4)`
+/// followed by `leaf_lbas[]`, where each `leaf_lba` points at an
 /// [`BLOCK_TYPE_EXTENT_TREE_LEAF`] block holding up to
 /// [`EXTENT_LEAF_RECORDS`] v2 records. The root lets a single
 /// object own up to `EXTENT_LEAF_RECORDS^2` (~10 201) extents,
