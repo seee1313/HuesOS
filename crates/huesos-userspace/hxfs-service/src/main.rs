@@ -93,7 +93,7 @@ const POLL_BUF_BYTES: usize = 256;
 // service runtime), tracked separately.
 const SERVICE_MAX_OBJECTS: usize = 32;
 const SERVICE_MAX_DIR_ENTRIES: usize = 32;
-const SERVICE_MAX_EXTENTS: usize = 1024;
+const SERVICE_MAX_EXTENTS: usize = 1100;
 // The qemu-nvme-boot namespace is exposed with a 512-byte LBA while
 // Hxfs internally works in 4 KiB blocks. The
 // `libcanvas::block::BlockDevice` wire protocol speaks 512-byte LBAs,
