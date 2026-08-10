@@ -72,6 +72,88 @@ pub const BLOCK_TYPE_INSTALL_MANIFEST: u32 = 18;
 /// in Stage B.1.
 pub const BLOCK_TYPE_EXTENT_TABLE_V2: u32 = 19;
 
+/// Metadata block type: extent tree ROOT (Stage E scaling).
+///
+/// A root block is the indirection top of a multi-block extent
+/// tree. Payload: `magic(4) + version(4) + count(4) + reserved(4)
+/// + leaf_lbas[]`, where each `leaf_lba` points at an
+/// [`BLOCK_TYPE_EXTENT_TREE_LEAF`] block holding up to
+/// [`EXTENT_LEAF_RECORDS`] v2 records. The root lets a single
+/// object own up to `EXTENT_LEAF_RECORDS^2` (~10 201) extents,
+/// i.e. ~40 MiB at one 4 KiB extent per record. An object whose
+/// `tree_lba` points here is a "tree object"; a `tree_lba` that
+/// points at an extent-table block remains the single-block
+/// layout, so old volumes keep working.
+pub const BLOCK_TYPE_EXTENT_TREE_ROOT: u32 = 20;
+
+/// Metadata block type: extent tree LEAF (Stage E scaling).
+///
+/// A leaf holds v2 extent records with the same record layout and
+/// per-record compression descriptors as a v2 extent-table block,
+/// but without the object header: the payload is just the raw
+/// records (`EXTENT_LEAF_RECORDS * 40` bytes, the rest zero).
+pub const BLOCK_TYPE_EXTENT_TREE_LEAF: u32 = 21;
+
+/// Magic of the extent tree root payload.
+pub const EXTENT_TREE_ROOT_MAGIC: u32 = 0x4558_5452; // "EXTR"
+/// Version of the extent tree root payload.
+pub const EXTENT_TREE_ROOT_VERSION: u32 = 1;
+/// Number of v2 records a leaf block holds (`4056 / 40`).
+pub const EXTENT_LEAF_RECORDS: usize = 101;
+/// Maximum extents per object (one root + leaves).
+pub const EXTENT_TREE_MAX_RECORDS: usize = EXTENT_LEAF_RECORDS * EXTENT_LEAF_RECORDS;
+
+/// Metadata block type: allocation tree ROOT (Stage E scaling).
+///
+/// The allocator tree records physical-block ownership. A root
+/// block is the indirection top of a multi-block allocation tree,
+/// with the same shape as the extent tree root:
+/// `magic + version + count + reserved + leaf_lbas[]`, each leaf
+/// pointing at an [`BLOCK_TYPE_ALLOCATION_TREE_LEAF`] block.
+pub const BLOCK_TYPE_ALLOCATION_TREE_ROOT: u32 = 22;
+
+/// Metadata block type: allocation tree LEAF (Stage E scaling).
+///
+/// A leaf holds `AllocationRecord` entries (32 bytes each, up to
+/// [`ALLOC_LEAF_RECORDS`] per block) with the same wire layout as
+/// the single-block allocation tree.
+pub const BLOCK_TYPE_ALLOCATION_TREE_LEAF: u32 = 23;
+
+/// Magic of the allocation tree root payload.
+pub const ALLOC_TREE_ROOT_MAGIC: u32 = 0x414c_4c54; // "ALLT"
+/// Version of the allocation tree root payload.
+pub const ALLOC_TREE_ROOT_VERSION: u32 = 1;
+/// Number of allocation records a leaf block holds (`4056 / 32`).
+pub const ALLOC_LEAF_RECORDS: usize = 126;
+/// Maximum allocation records on a volume (one root + leaves).
+pub const ALLOC_TREE_MAX_RECORDS: usize = ALLOC_LEAF_RECORDS * ALLOC_LEAF_RECORDS;
+
+/// Metadata block type: refcount tree ROOT (Stage E scaling).
+pub const BLOCK_TYPE_REFCOUNT_TREE_ROOT: u32 = 24;
+
+/// Metadata block type: refcount tree LEAF (Stage E scaling).
+pub const BLOCK_TYPE_REFCOUNT_TREE_LEAF: u32 = 25;
+
+/// Magic of the refcount tree root payload.
+pub const REFCOUNT_TREE_ROOT_MAGIC: u32 = 0x5245_4652; // "REFR"
+/// Version of the refcount tree root payload.
+pub const REFCOUNT_TREE_ROOT_VERSION: u32 = 1;
+/// Number of refcount records a leaf holds (`4056 / 24`).
+pub const REFCOUNT_LEAF_RECORDS: usize = 169;
+
+/// Metadata block type: backref tree ROOT (Stage E scaling).
+pub const BLOCK_TYPE_BACKREF_TREE_ROOT: u32 = 26;
+
+/// Metadata block type: backref tree LEAF (Stage E scaling).
+pub const BLOCK_TYPE_BACKREF_TREE_LEAF: u32 = 27;
+
+/// Magic of the backref tree root payload.
+pub const BACKREF_TREE_ROOT_MAGIC: u32 = 0x4241_434b; // "BACK"
+/// Version of the backref tree root payload.
+pub const BACKREF_TREE_ROOT_VERSION: u32 = 1;
+/// Number of backref records a leaf holds (`4056 / 40`).
+pub const BACKREF_LEAF_RECORDS: usize = 101;
+
 /// Incompatible feature: v2 root-store state and feature flags are present.
 pub const FEATURE_INCOMPAT_V2_ROOT_STORE: u64 = 1 << 0;
 /// Incompatible feature: journal replay records may be required before mount.

@@ -12,8 +12,8 @@ use crate::quota_tree::{QuotaBtree, QuotaRecord};
 use crate::recovery::BlockStore;
 use crate::ref_tree::{BackrefBtree, BackrefKind, BackrefRecord, RefcountBtree, RefcountRecord};
 use crate::{
-    parse_dir_record, parse_extent_record, parse_extent_record_v2, parse_header,
-    parse_object_record, read_checkpoint, read_superblock, read_system_volume,
+    parse_dir_record, parse_extent_record, parse_extent_record_v2, parse_extent_tree_root,
+    parse_header, parse_object_record, read_checkpoint, read_superblock, read_system_volume,
     validate_metadata_block, ExtentCompressionMeta, HxfsError, DIR_RECORD_BYTES,
     EXTENT_RECORD_BYTES, EXTENT_RECORD_BYTES_V2, HEADER_BYTES, OBJECT_RECORD_BYTES,
 };
@@ -751,13 +751,56 @@ impl<
         let count = out
             .len()
             .min(usize::try_from(remaining).map_err(|_| HxfsError::OutOfRange)?);
-        let mut full = [0u8; BLOCK_SIZE];
-        if object.size as usize > full.len() {
-            return Err(HxfsError::Unsupported);
+        // Stage E: range read for files of any size. Only the
+        // extents overlapping [offset, offset+count) are copied,
+        // so large files can be read in bounded chunks without
+        // materialising the whole object.
+        out[..count].fill(0);
+        let start = offset;
+        let end = offset
+            .checked_add(count as u64)
+            .ok_or(HxfsError::OutOfRange)?;
+        let mut index = 0usize;
+        while index < self.extents.len() {
+            if let Some(extent) = self.extents[index] {
+                if extent.object_id != file.object_id {
+                    index += 1;
+                    continue;
+                }
+                let logical = if extent.extent.flags & EXTENT_FLAG_MULTI_SLOT != 0 {
+                    1
+                } else {
+                    u64::from(extent.extent.block_count)
+                };
+                let extent_start = extent.extent.logical_block * BLOCK_SIZE_U64;
+                let extent_end = extent_start
+                    .checked_add(logical * BLOCK_SIZE_U64)
+                    .ok_or(HxfsError::OutOfRange)?;
+                if extent_end <= start || extent_start >= end {
+                    index += 1;
+                    continue;
+                }
+                let copy_from = start.max(extent_start);
+                let copy_to = end.min(extent_end);
+                let window = copy_to - copy_from;
+                // The range touches exactly one logical block of
+                // this single-block extent; read it with a fixed
+                // 4 KiB buffer (no object-sized allocation).
+                let block_offset = (copy_from - extent_start) / BLOCK_SIZE_U64;
+                let mut block = [0u8; BLOCK_SIZE];
+                self.read_extent_block(
+                    extent.extent,
+                    extent.compression,
+                    block_offset,
+                    &mut block,
+                )?;
+                let within = (copy_from - extent_start) as usize % BLOCK_SIZE;
+                let out_off = (copy_from - start) as usize;
+                out[out_off..out_off + window as usize]
+                    .copy_from_slice(&block[within..within + window as usize]);
+            }
+            index += 1;
         }
-        self.read_file(file, &mut full[..object.size as usize])?;
-        let start = usize::try_from(offset).map_err(|_| HxfsError::OutOfRange)?;
-        out[..count].copy_from_slice(&full[start..start + count]);
         Ok(count)
     }
 
@@ -1056,13 +1099,63 @@ impl<
             return Err(HxfsError::NoSpace);
         }
         let record_count = u32::try_from(target_count + 1).map_err(|_| HxfsError::NoSpace)?;
+        // Stage E: the target area must account for extent-tree
+        // leaves so the journal area starts after ALL target blocks.
+        let mut extra_total = 0usize;
+        let mut object_slot = 0usize;
+        while object_slot < self.objects.len() {
+            if let Some(object) = self.objects[object_slot] {
+                if matches!(
+                    object.descriptor.object_type,
+                    OBJECT_TYPE_FILE | OBJECT_TYPE_SYMLINK
+                ) {
+                    extra_total += self.extent_blocks_for_object(object.descriptor.object_id) - 1;
+                }
+            }
+            object_slot += 1;
+        }
+        // The allocation tree may also span multiple blocks; its
+        // leaf blocks are part of the target area and must not
+        // overlap the journal area.
+        let mut alloc_count = 0usize;
+        let mut alloc_slot = 0usize;
+        while alloc_slot < self.extents.len() {
+            if let Some(extent) = self.extents[alloc_slot] {
+                if extent.extent.flags & EXTENT_FLAG_HOLE == 0 {
+                    alloc_count += 1;
+                }
+            }
+            alloc_slot += 1;
+        }
+        let alloc_leaf_blocks = if alloc_count > ALLOC_LEAF_RECORDS {
+            alloc_count.div_ceil(ALLOC_LEAF_RECORDS)
+        } else {
+            0
+        };
+        let refcount_leaf_blocks = if alloc_count > REFCOUNT_LEAF_RECORDS {
+            alloc_count.div_ceil(REFCOUNT_LEAF_RECORDS)
+        } else {
+            0
+        };
+        let backref_leaf_blocks = if alloc_count > BACKREF_LEAF_RECORDS {
+            alloc_count.div_ceil(BACKREF_LEAF_RECORDS)
+        } else {
+            0
+        };
+        let extra_total =
+            (extra_total + alloc_leaf_blocks + refcount_leaf_blocks + backref_leaf_blocks) as u64;
         let target_start_lba = self.next_lba;
-        let object_table_lba = target_start_lba + live_objects as u64;
+        let object_table_lba = target_start_lba + live_objects as u64 + extra_total;
         let volume_table_lba = object_table_lba + 1;
         let allocation_tree_lba = volume_table_lba + 1;
-        let refcount_tree_lba = allocation_tree_lba + 1;
-        let backref_tree_lba = refcount_tree_lba + 1;
-        let quota_tree_lba = backref_tree_lba + 1;
+        // Each multi-block tree's leaves live immediately after its
+        // root; everything after them must be shifted.
+        let alloc_leaves_end = allocation_tree_lba + 1 + alloc_leaf_blocks as u64;
+        let refcount_tree_lba = alloc_leaves_end;
+        let refcount_leaves_end = refcount_tree_lba + 1 + refcount_leaf_blocks as u64;
+        let backref_tree_lba = refcount_leaves_end;
+        let backref_leaves_end = backref_tree_lba + 1 + backref_leaf_blocks as u64;
+        let quota_tree_lba = backref_leaves_end;
         let checkpoint_lba = quota_tree_lba + 1;
         let journal_start_lba = checkpoint_lba + 1;
         let journal_end_lba = journal_start_lba + u64::from(record_count) * 2;
@@ -1070,11 +1163,15 @@ impl<
         let mut plans = [const { None }; MAX_OBJECTS];
 
         let mut record_index = 0u32;
+        let mut block_offset = 0u64;
         let mut object_slot = 0usize;
         while object_slot < self.objects.len() {
             if let Some(object) = self.objects[object_slot] {
-                let tree_lba = target_start_lba + u64::from(record_index);
-                let block = self.build_object_tree_block(object.descriptor, tree_lba)?;
+                // `block_offset` is the per-block position of the
+                // object's root inside the target area (1 + leaves
+                // per object); `record_index` is the journal index.
+                let tree_lba = target_start_lba + block_offset;
+                let (block, leaves) = self.build_object_tree_block(object.descriptor, tree_lba)?;
                 plans[object_slot] = Some(ObjectPlan {
                     object_id: object.descriptor.object_id,
                     tree_lba,
@@ -1090,6 +1187,14 @@ impl<
                     checkpoint_lba,
                     0,
                 )?;
+                // Write the tree leaves plain after the root (they
+                // are covered by the root's journal record).
+                let mut leaf_lba = tree_lba + 1;
+                for leaf in &leaves {
+                    self.store.write_blocks(leaf_lba, 1, leaf)?;
+                    leaf_lba += 1;
+                }
+                block_offset += 1 + leaves.len() as u64;
                 record_index += 1;
             }
             object_slot += 1;
@@ -1122,7 +1227,8 @@ impl<
         )?;
         record_index += 1;
 
-        let allocation_block = self.build_allocation_tree_block(allocation_tree_lba)?;
+        let (allocation_block, allocation_leaves) =
+            self.build_allocation_tree_block(allocation_tree_lba)?;
         self.write_journaled_target(
             allocation_tree_lba,
             &allocation_block,
@@ -1133,9 +1239,15 @@ impl<
             checkpoint_lba,
             0,
         )?;
+        let mut alloc_leaf_lba = allocation_tree_lba + 1;
+        for leaf in &allocation_leaves {
+            self.store.write_blocks(alloc_leaf_lba, 1, leaf)?;
+            alloc_leaf_lba += 1;
+        }
         record_index += 1;
 
-        let refcount_block = self.build_refcount_tree_block(refcount_tree_lba)?;
+        let (refcount_block, refcount_leaves) =
+            self.build_refcount_tree_block(refcount_tree_lba)?;
         self.write_journaled_target(
             refcount_tree_lba,
             &refcount_block,
@@ -1146,9 +1258,15 @@ impl<
             checkpoint_lba,
             0,
         )?;
+        let mut refcount_leaf_lba = refcount_tree_lba + 1;
+        for leaf in &refcount_leaves {
+            self.store.write_blocks(refcount_leaf_lba, 1, leaf)?;
+            refcount_leaf_lba += 1;
+        }
         record_index += 1;
 
-        let backref_block = self.build_backref_tree_block(backref_tree_lba, sequence)?;
+        let (backref_block, backref_leaves) =
+            self.build_backref_tree_block(backref_tree_lba, sequence)?;
         self.write_journaled_target(
             backref_tree_lba,
             &backref_block,
@@ -1159,6 +1277,11 @@ impl<
             checkpoint_lba,
             0,
         )?;
+        let mut backref_leaf_lba = backref_tree_lba + 1;
+        for leaf in &backref_leaves {
+            self.store.write_blocks(backref_leaf_lba, 1, leaf)?;
+            backref_leaf_lba += 1;
+        }
         record_index += 1;
 
         let quota_block = self.build_quota_tree_block(quota_tree_lba, journal_end_lba)?;
@@ -1373,30 +1496,73 @@ impl<
             return Ok(());
         }
         let mut block = [0u8; BLOCK_SIZE];
-        let (header, block_type) = self.read_mounted_metadata_block_any_type(
+        // Stage E: try the single-block extent table first; a tree
+        // object's root fails validation with BadBlock.
+        let single = match self.read_mounted_metadata_block_any_type(
             object.tree_lba,
             BLOCK_TYPE_EXTENT_TABLE,
             BLOCK_TYPE_EXTENT_TABLE_V2,
             object.object_id,
             &mut block,
-        )?;
-        let owner = read_u64(&block, header.header_bytes as usize)?;
-        let count = read_u32(&block, header.header_bytes as usize + 8)?;
-        if owner != object.object_id || count != object.record_count {
-            return Err(HxfsError::BadTree);
-        }
-        let record_bytes = if block_type == BLOCK_TYPE_EXTENT_TABLE_V2 {
-            EXTENT_RECORD_BYTES_V2
-        } else {
-            EXTENT_RECORD_BYTES
+        ) {
+            Ok((header, block_type)) => Some((header, block_type)),
+            Err(HxfsError::BadBlock) => None,
+            Err(error) => return Err(error),
         };
+        let leaves = if let Some((header, _block_type)) = single {
+            let owner = read_u64(&block, header.header_bytes as usize)?;
+            if owner != object.object_id {
+                return Err(HxfsError::BadTree);
+            }
+            None
+        } else {
+            let header = self.read_mounted_metadata_block(
+                object.tree_lba,
+                BLOCK_TYPE_EXTENT_TREE_ROOT,
+                object.object_id,
+                &mut block,
+            )?;
+            // The root's owner is the header's owner_id (validated
+            // above); the payload starts with magic/version/count.
+            Some(parse_extent_tree_root(
+                &block[header.header_bytes as usize..],
+            )?)
+        };
+        let record_bytes = match single {
+            Some((_, BLOCK_TYPE_EXTENT_TABLE_V2)) | None => EXTENT_RECORD_BYTES_V2,
+            _ => EXTENT_RECORD_BYTES,
+        };
+        let count = object.record_count;
         let mut index = 0u32;
+        let mut leaf_buf = [0u8; BLOCK_SIZE];
         while index < count {
-            let offset = header.header_bytes as usize + 16 + index as usize * record_bytes;
-            let (extent, compression) = if block_type == BLOCK_TYPE_EXTENT_TABLE_V2 {
-                parse_extent_record_v2(&block, offset)?
+            let (block_ref, offset) = if let Some((header, _block_type)) = single {
+                (
+                    block.as_slice(),
+                    header.header_bytes as usize + 16 + index as usize * record_bytes,
+                )
             } else {
-                (parse_extent_record(&block, offset)?, None)
+                let leaf_index = (index as usize) / EXTENT_LEAF_RECORDS;
+                let within = (index as usize) % EXTENT_LEAF_RECORDS;
+                let leaves = leaves.as_ref().ok_or(HxfsError::BadTree)?;
+                if leaf_index >= leaves.len() {
+                    return Err(HxfsError::BadTree);
+                }
+                let _ = self.read_mounted_metadata_block(
+                    leaves[leaf_index],
+                    BLOCK_TYPE_EXTENT_TREE_LEAF,
+                    object.object_id,
+                    &mut leaf_buf,
+                )?;
+                (
+                    leaf_buf.as_slice(),
+                    HEADER_BYTES + within * EXTENT_RECORD_BYTES_V2,
+                )
+            };
+            let (extent, compression) = if record_bytes == EXTENT_RECORD_BYTES_V2 {
+                parse_extent_record_v2(block_ref, offset)?
+            } else {
+                (parse_extent_record(block_ref, offset)?, None)
             };
             self.insert_extent(FixedExtent {
                 object_id: object.object_id,
@@ -2164,6 +2330,47 @@ impl<
         Ok(())
     }
 
+    /// Read ONE logical block of an extent into a 4 KiB buffer,
+    /// applying decrypt/decompress. `block_offset` selects the
+    /// block within the extent (0 for single-block extents). Used
+    /// by the chunked range read so a large file can be read
+    /// without materialising the whole object.
+    fn read_extent_block(
+        &mut self,
+        extent: ExtentRecord,
+        compression: Option<ExtentCompressionMeta>,
+        block_offset: u64,
+        out: &mut [u8; BLOCK_SIZE],
+    ) -> FixedResult<()> {
+        let mut scratch = [0u8; BLOCK_SIZE];
+        let mut decrypted = [0u8; BLOCK_SIZE];
+        self.store
+            .read_blocks(extent.physical_block + block_offset, 1, &mut scratch)?;
+        let plain: &[u8] = self.decrypt_extent_block_if_encrypted(
+            extent.physical_block + block_offset,
+            &scratch,
+            &mut decrypted,
+        )?;
+        if let Some(meta) = compression {
+            let payload = &plain[..meta.compressed_bytes as usize];
+            let descriptor = crate::compression::CompressedExtent {
+                logical_block: extent.logical_block,
+                physical_block: extent.physical_block,
+                uncompressed_bytes: BLOCK_SIZE as u32,
+                compressed_bytes: meta.compressed_bytes,
+                algorithm: meta.algorithm,
+                payload_crc32c: meta.payload_crc32c,
+            };
+            let mut decompressed = [0u8; BLOCK_SIZE];
+            crate::compression::decompress_block(&descriptor, payload, &mut decompressed)
+                .map_err(|_| HxfsError::Compression)?;
+            out.copy_from_slice(&decompressed);
+        } else {
+            out.copy_from_slice(plain);
+        }
+        Ok(())
+    }
+
     /// Decrypt one data block when the volume is encrypted.
     /// Returns a slice into `scratch` (plain volume) or
     /// `decrypted` (encrypted volume).
@@ -2193,12 +2400,18 @@ impl<
     }
 
     fn build_object_tree_block(
-        &self,
+        &mut self,
         object: ObjectDescriptor,
         lba: u64,
-    ) -> FixedResult<[u8; BLOCK_SIZE]> {
+    ) -> FixedResult<([u8; BLOCK_SIZE], alloc::vec::Vec<[u8; BLOCK_SIZE]>)> {
+        // Returns (block, leaves): leaves are extent-tree leaf
+        // blocks the publisher writes plain after the root; empty
+        // for directories and single-block layouts.
         match object.object_type {
-            OBJECT_TYPE_DIRECTORY => self.build_directory_block(object.object_id, lba),
+            OBJECT_TYPE_DIRECTORY => Ok((
+                self.build_directory_block(object.object_id, lba)?,
+                alloc::vec::Vec::new(),
+            )),
             OBJECT_TYPE_FILE | OBJECT_TYPE_SYMLINK => {
                 self.build_extent_block(object.object_id, lba)
             }
@@ -2332,7 +2545,19 @@ impl<
     /// without the `crypto-aes-gcm` feature both halves are
     /// `None`/default; the wrapper falls through to the plain
     /// v5 builder.
-    fn build_extent_block(&self, object_id: u64, lba: u64) -> FixedResult<[u8; BLOCK_SIZE]> {
+    fn build_extent_block(
+        &mut self,
+        object_id: u64,
+        lba: u64,
+    ) -> FixedResult<([u8; BLOCK_SIZE], alloc::vec::Vec<[u8; BLOCK_SIZE]>)> {
+        // Stage E: objects with more extents than fit one extent
+        // table become a two-level tree (root + leaves). The
+        // leaves are returned (not written) so the publisher can
+        // place them after the root without colliding with the
+        // journal area.
+        if self.extent_count(object_id) as usize > EXTENT_LEAF_RECORDS {
+            return self.build_extent_tree(object_id, lba);
+        }
         // Stage B.3 completion: emit a v2 block (40-byte records
         // with an optional per-record compression descriptor)
         // whenever the object's resolved compression policy selects
@@ -2397,7 +2622,7 @@ impl<
             index += 1;
         }
         let args = self.encryption_args();
-        make_metadata_block_for_volume(
+        let block = make_metadata_block_for_volume(
             block_type,
             object_id,
             lba,
@@ -2405,7 +2630,120 @@ impl<
             args.0,
             args.1,
             args.2,
-        )
+        )?;
+        Ok((block, alloc::vec::Vec::new()))
+    }
+
+    /// Stage E: build a two-level extent tree (root + leaves).
+    fn build_extent_tree(
+        &self,
+        object_id: u64,
+        lba: u64,
+    ) -> FixedResult<([u8; BLOCK_SIZE], alloc::vec::Vec<[u8; BLOCK_SIZE]>)> {
+        let count = self.extent_count(object_id) as usize;
+        let leaf_count = count.div_ceil(EXTENT_LEAF_RECORDS);
+        let root_payload_len = 16 + leaf_count * 8;
+        let mut root_payload = [0u8; BLOCK_SIZE - HEADER_BYTES];
+        root_payload[0..4].copy_from_slice(&EXTENT_TREE_ROOT_MAGIC.to_le_bytes());
+        root_payload[4..8].copy_from_slice(&EXTENT_TREE_ROOT_VERSION.to_le_bytes());
+        root_payload[8..12].copy_from_slice(&(leaf_count as u32).to_le_bytes());
+        let mut leaf_index = 0usize;
+        let mut leaf_lba = lba + 1;
+        while leaf_index < leaf_count {
+            root_payload[16 + leaf_index * 8..16 + leaf_index * 8 + 8]
+                .copy_from_slice(&leaf_lba.to_le_bytes());
+            leaf_lba += 1;
+            leaf_index += 1;
+        }
+        let args = self.encryption_args();
+        let (args_enc, args_key, args_uuid) = (args.0, args.1.copied(), *args.2);
+        let root = make_metadata_block_for_volume(
+            BLOCK_TYPE_EXTENT_TREE_ROOT,
+            object_id,
+            lba,
+            &root_payload[..root_payload_len],
+            args_enc,
+            args_key.as_ref(),
+            &args_uuid,
+        )?;
+        // Collect the object's extents in logical order.
+        let mut records: alloc::vec::Vec<FixedExtent> = alloc::vec::Vec::new();
+        let mut index = 0usize;
+        while index < self.extents.len() {
+            if let Some(extent) = self.extents[index] {
+                if extent.object_id == object_id {
+                    records.push(extent);
+                }
+            }
+            index += 1;
+        }
+        records.sort_by_key(|extent| extent.extent.logical_block);
+        let mut leaves: alloc::vec::Vec<[u8; BLOCK_SIZE]> =
+            alloc::vec::Vec::with_capacity(leaf_count);
+        let mut leaf_payload = [0u8; BLOCK_SIZE - HEADER_BYTES];
+        let mut record_index = 0usize;
+        leaf_lba = lba + 1;
+        for record in &records {
+            let within = record_index % EXTENT_LEAF_RECORDS;
+            if within == 0 {
+                leaf_payload = [0u8; BLOCK_SIZE - HEADER_BYTES];
+            }
+            self.serialize_extent_record(
+                &mut leaf_payload,
+                within * EXTENT_RECORD_BYTES_V2,
+                record,
+                true,
+            );
+            record_index += 1;
+            if within == EXTENT_LEAF_RECORDS - 1 || record_index == records.len() {
+                leaves.push(make_metadata_block_for_volume(
+                    BLOCK_TYPE_EXTENT_TREE_LEAF,
+                    object_id,
+                    leaf_lba,
+                    &leaf_payload[..EXTENT_LEAF_RECORDS * EXTENT_RECORD_BYTES_V2],
+                    args_enc,
+                    args_key.as_ref(),
+                    &args_uuid,
+                )?);
+                leaf_lba += 1;
+            }
+        }
+        Ok((root, leaves))
+    }
+
+    /// Stage E: serialize one extent record into `payload`.
+    fn serialize_extent_record(
+        &self,
+        payload: &mut [u8],
+        offset: usize,
+        extent: &FixedExtent,
+        v2: bool,
+    ) {
+        payload[offset..offset + 8].copy_from_slice(&extent.extent.logical_block.to_le_bytes());
+        payload[offset + 8..offset + 16]
+            .copy_from_slice(&extent.extent.physical_block.to_le_bytes());
+        payload[offset + 16..offset + 20].copy_from_slice(&extent.extent.block_count.to_le_bytes());
+        payload[offset + 20..offset + 24].copy_from_slice(&extent.extent.flags.to_le_bytes());
+        if v2 {
+            if let Some(meta) = extent.compression {
+                payload[offset + 24..offset + 28].copy_from_slice(&meta.algorithm.to_le_bytes());
+                payload[offset + 28..offset + 32]
+                    .copy_from_slice(&meta.compressed_bytes.to_le_bytes());
+                payload[offset + 32..offset + 36]
+                    .copy_from_slice(&meta.payload_crc32c.to_le_bytes());
+            }
+        }
+    }
+
+    /// Stage E: number of blocks a file object's extent layout
+    /// consumes at publish (1, or 1 + leaf_count for a tree).
+    fn extent_blocks_for_object(&self, object_id: u64) -> usize {
+        let count = self.extent_count(object_id) as usize;
+        if count > EXTENT_LEAF_RECORDS {
+            1 + count.div_ceil(EXTENT_LEAF_RECORDS)
+        } else {
+            1
+        }
     }
 
     fn build_object_table_block(
@@ -2444,7 +2782,10 @@ impl<
         ))
     }
 
-    fn build_allocation_tree_block(&self, lba: u64) -> FixedResult<[u8; BLOCK_SIZE]> {
+    fn build_allocation_tree_block(
+        &self,
+        lba: u64,
+    ) -> FixedResult<([u8; BLOCK_SIZE], alloc::vec::Vec<[u8; BLOCK_SIZE]>)> {
         let mut tree = AllocationBtree::<MAX_EXTENTS>::new();
         let mut index = 0usize;
         while index < self.extents.len() {
@@ -2462,29 +2803,34 @@ impl<
             index += 1;
         }
         tree.validate().map_err(|_| HxfsError::BadTree)?;
+        // Stage E: a volume with more allocation records than fit
+        // one block gets a two-level allocation tree.
+        let records: alloc::vec::Vec<AllocationRecord> =
+            tree.records().iter().filter_map(|record| *record).collect();
+        let count = records.len();
+        if count > ALLOC_LEAF_RECORDS {
+            return self.build_allocation_tree_multi(records, lba);
+        }
         let mut payload = [0u8; BLOCK_SIZE - HEADER_BYTES];
-        let count = tree.record_count();
         payload[0..4].copy_from_slice(&(count as u32).to_le_bytes());
         let mut written = 0usize;
         index = 0;
-        while index < tree.records().len() {
-            if let Some(record) = tree.records()[index] {
-                let offset = 16 + written * 32;
-                if offset + 32 > payload.len() {
-                    return Err(HxfsError::NoSpace);
-                }
-                payload[offset..offset + 8].copy_from_slice(&record.start_block.to_le_bytes());
-                payload[offset + 8..offset + 16].copy_from_slice(&record.block_count.to_le_bytes());
-                payload[offset + 16..offset + 20]
-                    .copy_from_slice(&(record.state as u32).to_le_bytes());
-                payload[offset + 24..offset + 32]
-                    .copy_from_slice(&record.owner_object_id.to_le_bytes());
-                written += 1;
+        while index < records.len() {
+            let record = records[index];
+            let offset = 16 + written * 32;
+            if offset + 32 > payload.len() {
+                return Err(HxfsError::NoSpace);
             }
+            payload[offset..offset + 8].copy_from_slice(&record.start_block.to_le_bytes());
+            payload[offset + 8..offset + 16].copy_from_slice(&record.block_count.to_le_bytes());
+            payload[offset + 16..offset + 20].copy_from_slice(&(record.state as u32).to_le_bytes());
+            payload[offset + 24..offset + 32]
+                .copy_from_slice(&record.owner_object_id.to_le_bytes());
+            written += 1;
             index += 1;
         }
         let args = self.encryption_args();
-        make_metadata_block_for_volume(
+        let block = make_metadata_block_for_volume(
             BLOCK_TYPE_ALLOCATION_TREE,
             self.system_volume.root_object_id,
             lba,
@@ -2492,10 +2838,77 @@ impl<
             args.0,
             args.1,
             args.2,
-        )
+        )?;
+        Ok((block, alloc::vec::Vec::new()))
     }
 
-    fn build_refcount_tree_block(&self, lba: u64) -> FixedResult<[u8; BLOCK_SIZE]> {
+    /// Stage E: build a two-level allocation tree (root + leaves).
+    fn build_allocation_tree_multi(
+        &self,
+        records: alloc::vec::Vec<AllocationRecord>,
+        lba: u64,
+    ) -> FixedResult<([u8; BLOCK_SIZE], alloc::vec::Vec<[u8; BLOCK_SIZE]>)> {
+        let count = records.len();
+        let leaf_count = count.div_ceil(ALLOC_LEAF_RECORDS);
+        let mut root_payload = [0u8; BLOCK_SIZE - HEADER_BYTES];
+        root_payload[0..4].copy_from_slice(&ALLOC_TREE_ROOT_MAGIC.to_le_bytes());
+        root_payload[4..8].copy_from_slice(&ALLOC_TREE_ROOT_VERSION.to_le_bytes());
+        root_payload[8..12].copy_from_slice(&(leaf_count as u32).to_le_bytes());
+        let mut leaf_index = 0usize;
+        let mut leaf_lba = lba + 1;
+        while leaf_index < leaf_count {
+            root_payload[16 + leaf_index * 8..16 + leaf_index * 8 + 8]
+                .copy_from_slice(&leaf_lba.to_le_bytes());
+            leaf_lba += 1;
+            leaf_index += 1;
+        }
+        let args = self.encryption_args();
+        let root = make_metadata_block_for_volume(
+            BLOCK_TYPE_ALLOCATION_TREE_ROOT,
+            self.system_volume.root_object_id,
+            lba,
+            &root_payload[..16 + leaf_count * 8],
+            args.0,
+            args.1,
+            args.2,
+        )?;
+        let mut leaves: alloc::vec::Vec<[u8; BLOCK_SIZE]> =
+            alloc::vec::Vec::with_capacity(leaf_count);
+        let mut payload = [0u8; BLOCK_SIZE - HEADER_BYTES];
+        let mut record_index = 0usize;
+        leaf_lba = lba + 1;
+        for record in &records {
+            let within = record_index % ALLOC_LEAF_RECORDS;
+            if within == 0 {
+                payload = [0u8; BLOCK_SIZE - HEADER_BYTES];
+            }
+            let offset = within * 32;
+            payload[offset..offset + 8].copy_from_slice(&record.start_block.to_le_bytes());
+            payload[offset + 8..offset + 16].copy_from_slice(&record.block_count.to_le_bytes());
+            payload[offset + 16..offset + 20].copy_from_slice(&(record.state as u32).to_le_bytes());
+            payload[offset + 24..offset + 32]
+                .copy_from_slice(&record.owner_object_id.to_le_bytes());
+            record_index += 1;
+            if within == ALLOC_LEAF_RECORDS - 1 || record_index == count {
+                leaves.push(make_metadata_block_for_volume(
+                    BLOCK_TYPE_ALLOCATION_TREE_LEAF,
+                    self.system_volume.root_object_id,
+                    leaf_lba,
+                    &payload[..ALLOC_LEAF_RECORDS * 32],
+                    args.0,
+                    args.1,
+                    args.2,
+                )?);
+                leaf_lba += 1;
+            }
+        }
+        Ok((root, leaves))
+    }
+
+    fn build_refcount_tree_block(
+        &self,
+        lba: u64,
+    ) -> FixedResult<([u8; BLOCK_SIZE], alloc::vec::Vec<[u8; BLOCK_SIZE]>)> {
         let mut tree = RefcountBtree::<MAX_EXTENTS>::new();
         let mut index = 0usize;
         while index < self.extents.len() {
@@ -2512,26 +2925,30 @@ impl<
             index += 1;
         }
         tree.validate().map_err(|_| HxfsError::BadTree)?;
+        let records: alloc::vec::Vec<RefcountRecord> =
+            tree.records().iter().filter_map(|record| *record).collect();
+        let count = records.len();
+        if count > REFCOUNT_LEAF_RECORDS {
+            return self.build_refcount_tree_multi(records, lba);
+        }
         let mut payload = [0u8; BLOCK_SIZE - HEADER_BYTES];
-        let count = tree.record_count();
         payload[0..4].copy_from_slice(&(count as u32).to_le_bytes());
         let mut written = 0usize;
         index = 0;
-        while index < tree.records().len() {
-            if let Some(record) = tree.records()[index] {
-                let offset = 16 + written * 24;
-                if offset + 24 > payload.len() {
-                    return Err(HxfsError::NoSpace);
-                }
-                payload[offset..offset + 8].copy_from_slice(&record.start_block.to_le_bytes());
-                payload[offset + 8..offset + 16].copy_from_slice(&record.block_count.to_le_bytes());
-                payload[offset + 16..offset + 20].copy_from_slice(&record.refcount.to_le_bytes());
-                written += 1;
+        while index < records.len() {
+            let record = records[index];
+            let offset = 16 + written * 24;
+            if offset + 24 > payload.len() {
+                return Err(HxfsError::NoSpace);
             }
+            payload[offset..offset + 8].copy_from_slice(&record.start_block.to_le_bytes());
+            payload[offset + 8..offset + 16].copy_from_slice(&record.block_count.to_le_bytes());
+            payload[offset + 16..offset + 20].copy_from_slice(&record.refcount.to_le_bytes());
+            written += 1;
             index += 1;
         }
         let args = self.encryption_args();
-        make_metadata_block_for_volume(
+        let block = make_metadata_block_for_volume(
             BLOCK_TYPE_REFCOUNT_TREE,
             self.system_volume.root_object_id,
             lba,
@@ -2539,10 +2956,76 @@ impl<
             args.0,
             args.1,
             args.2,
-        )
+        )?;
+        Ok((block, alloc::vec::Vec::new()))
     }
 
-    fn build_backref_tree_block(&self, lba: u64, generation: u64) -> FixedResult<[u8; BLOCK_SIZE]> {
+    /// Stage E: build a two-level refcount tree (root + leaves).
+    fn build_refcount_tree_multi(
+        &self,
+        records: alloc::vec::Vec<RefcountRecord>,
+        lba: u64,
+    ) -> FixedResult<([u8; BLOCK_SIZE], alloc::vec::Vec<[u8; BLOCK_SIZE]>)> {
+        let count = records.len();
+        let leaf_count = count.div_ceil(REFCOUNT_LEAF_RECORDS);
+        let mut root_payload = [0u8; BLOCK_SIZE - HEADER_BYTES];
+        root_payload[0..4].copy_from_slice(&REFCOUNT_TREE_ROOT_MAGIC.to_le_bytes());
+        root_payload[4..8].copy_from_slice(&REFCOUNT_TREE_ROOT_VERSION.to_le_bytes());
+        root_payload[8..12].copy_from_slice(&(leaf_count as u32).to_le_bytes());
+        let mut leaf_index = 0usize;
+        let mut leaf_lba = lba + 1;
+        while leaf_index < leaf_count {
+            root_payload[16 + leaf_index * 8..16 + leaf_index * 8 + 8]
+                .copy_from_slice(&leaf_lba.to_le_bytes());
+            leaf_lba += 1;
+            leaf_index += 1;
+        }
+        let args = self.encryption_args();
+        let root = make_metadata_block_for_volume(
+            BLOCK_TYPE_REFCOUNT_TREE_ROOT,
+            self.system_volume.root_object_id,
+            lba,
+            &root_payload[..16 + leaf_count * 8],
+            args.0,
+            args.1,
+            args.2,
+        )?;
+        let mut leaves: alloc::vec::Vec<[u8; BLOCK_SIZE]> =
+            alloc::vec::Vec::with_capacity(leaf_count);
+        let mut payload = [0u8; BLOCK_SIZE - HEADER_BYTES];
+        let mut record_index = 0usize;
+        leaf_lba = lba + 1;
+        for record in &records {
+            let within = record_index % REFCOUNT_LEAF_RECORDS;
+            if within == 0 {
+                payload = [0u8; BLOCK_SIZE - HEADER_BYTES];
+            }
+            let offset = within * 24;
+            payload[offset..offset + 8].copy_from_slice(&record.start_block.to_le_bytes());
+            payload[offset + 8..offset + 16].copy_from_slice(&record.block_count.to_le_bytes());
+            payload[offset + 16..offset + 20].copy_from_slice(&record.refcount.to_le_bytes());
+            record_index += 1;
+            if within == REFCOUNT_LEAF_RECORDS - 1 || record_index == count {
+                leaves.push(make_metadata_block_for_volume(
+                    BLOCK_TYPE_REFCOUNT_TREE_LEAF,
+                    self.system_volume.root_object_id,
+                    leaf_lba,
+                    &payload[..REFCOUNT_LEAF_RECORDS * 24],
+                    args.0,
+                    args.1,
+                    args.2,
+                )?);
+                leaf_lba += 1;
+            }
+        }
+        Ok((root, leaves))
+    }
+
+    fn build_backref_tree_block(
+        &self,
+        lba: u64,
+        generation: u64,
+    ) -> FixedResult<([u8; BLOCK_SIZE], alloc::vec::Vec<[u8; BLOCK_SIZE]>)> {
         let mut tree = BackrefBtree::<MAX_EXTENTS>::new();
         let mut index = 0usize;
         while index < self.extents.len() {
@@ -2561,30 +3044,33 @@ impl<
             index += 1;
         }
         tree.validate().map_err(|_| HxfsError::BadTree)?;
+        let records: alloc::vec::Vec<BackrefRecord> =
+            tree.records().iter().filter_map(|record| *record).collect();
+        let count = records.len();
+        if count > BACKREF_LEAF_RECORDS {
+            return self.build_backref_tree_multi(records, lba, generation);
+        }
         let mut payload = [0u8; BLOCK_SIZE - HEADER_BYTES];
-        let count = tree.record_count();
         payload[0..4].copy_from_slice(&(count as u32).to_le_bytes());
         let mut written = 0usize;
         index = 0;
-        while index < tree.records().len() {
-            if let Some(record) = tree.records()[index] {
-                let offset = 16 + written * 40;
-                if offset + 40 > payload.len() {
-                    return Err(HxfsError::NoSpace);
-                }
-                payload[offset..offset + 8].copy_from_slice(&record.start_block.to_le_bytes());
-                payload[offset + 8..offset + 16].copy_from_slice(&record.block_count.to_le_bytes());
-                payload[offset + 16..offset + 24]
-                    .copy_from_slice(&record.owner_object_id.to_le_bytes());
-                payload[offset + 24..offset + 28]
-                    .copy_from_slice(&(record.kind as u32).to_le_bytes());
-                payload[offset + 32..offset + 40].copy_from_slice(&record.generation.to_le_bytes());
-                written += 1;
+        while index < records.len() {
+            let record = records[index];
+            let offset = 16 + written * 40;
+            if offset + 40 > payload.len() {
+                return Err(HxfsError::NoSpace);
             }
+            payload[offset..offset + 8].copy_from_slice(&record.start_block.to_le_bytes());
+            payload[offset + 8..offset + 16].copy_from_slice(&record.block_count.to_le_bytes());
+            payload[offset + 16..offset + 24]
+                .copy_from_slice(&record.owner_object_id.to_le_bytes());
+            payload[offset + 24..offset + 28].copy_from_slice(&(record.kind as u32).to_le_bytes());
+            payload[offset + 32..offset + 40].copy_from_slice(&record.generation.to_le_bytes());
+            written += 1;
             index += 1;
         }
         let args = self.encryption_args();
-        make_metadata_block_for_volume(
+        let block = make_metadata_block_for_volume(
             BLOCK_TYPE_BACKREF_TREE,
             self.system_volume.root_object_id,
             lba,
@@ -2592,7 +3078,73 @@ impl<
             args.0,
             args.1,
             args.2,
-        )
+        )?;
+        Ok((block, alloc::vec::Vec::new()))
+    }
+
+    /// Stage E: build a two-level backref tree (root + leaves).
+    fn build_backref_tree_multi(
+        &self,
+        records: alloc::vec::Vec<BackrefRecord>,
+        lba: u64,
+        _generation: u64,
+    ) -> FixedResult<([u8; BLOCK_SIZE], alloc::vec::Vec<[u8; BLOCK_SIZE]>)> {
+        let count = records.len();
+        let leaf_count = count.div_ceil(BACKREF_LEAF_RECORDS);
+        let mut root_payload = [0u8; BLOCK_SIZE - HEADER_BYTES];
+        root_payload[0..4].copy_from_slice(&BACKREF_TREE_ROOT_MAGIC.to_le_bytes());
+        root_payload[4..8].copy_from_slice(&BACKREF_TREE_ROOT_VERSION.to_le_bytes());
+        root_payload[8..12].copy_from_slice(&(leaf_count as u32).to_le_bytes());
+        let mut leaf_index = 0usize;
+        let mut leaf_lba = lba + 1;
+        while leaf_index < leaf_count {
+            root_payload[16 + leaf_index * 8..16 + leaf_index * 8 + 8]
+                .copy_from_slice(&leaf_lba.to_le_bytes());
+            leaf_lba += 1;
+            leaf_index += 1;
+        }
+        let args = self.encryption_args();
+        let root = make_metadata_block_for_volume(
+            BLOCK_TYPE_BACKREF_TREE_ROOT,
+            self.system_volume.root_object_id,
+            lba,
+            &root_payload[..16 + leaf_count * 8],
+            args.0,
+            args.1,
+            args.2,
+        )?;
+        let mut leaves: alloc::vec::Vec<[u8; BLOCK_SIZE]> =
+            alloc::vec::Vec::with_capacity(leaf_count);
+        let mut payload = [0u8; BLOCK_SIZE - HEADER_BYTES];
+        let mut record_index = 0usize;
+        leaf_lba = lba + 1;
+        for record in &records {
+            let within = record_index % BACKREF_LEAF_RECORDS;
+            if within == 0 {
+                payload = [0u8; BLOCK_SIZE - HEADER_BYTES];
+            }
+            let offset = within * 40;
+            payload[offset..offset + 8].copy_from_slice(&record.start_block.to_le_bytes());
+            payload[offset + 8..offset + 16].copy_from_slice(&record.block_count.to_le_bytes());
+            payload[offset + 16..offset + 24]
+                .copy_from_slice(&record.owner_object_id.to_le_bytes());
+            payload[offset + 24..offset + 28].copy_from_slice(&(record.kind as u32).to_le_bytes());
+            payload[offset + 32..offset + 40].copy_from_slice(&record.generation.to_le_bytes());
+            record_index += 1;
+            if within == BACKREF_LEAF_RECORDS - 1 || record_index == count {
+                leaves.push(make_metadata_block_for_volume(
+                    BLOCK_TYPE_BACKREF_TREE_LEAF,
+                    self.system_volume.root_object_id,
+                    leaf_lba,
+                    &payload[..BACKREF_LEAF_RECORDS * 40],
+                    args.0,
+                    args.1,
+                    args.2,
+                )?);
+                leaf_lba += 1;
+            }
+        }
+        Ok((root, leaves))
     }
 
     fn build_quota_tree_block(

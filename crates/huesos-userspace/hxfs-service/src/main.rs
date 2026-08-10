@@ -3,6 +3,9 @@
 #![no_std]
 #![no_main]
 
+extern crate alloc;
+
+use alloc::boxed::Box;
 use core::panic::PanicInfo;
 use huesos_abi::hxfs::{
     request_flags, response_flags, rights as hxfs_rights, HxfsHandleKind, HxfsOp, HxfsRequest,
@@ -80,9 +83,17 @@ const POLL_BUF_BYTES: usize = 256;
 // address=0x7ffffefef688` in the qemu-nvme-boot smoke). The seed
 // v5 image uses only a handful of objects/entries/extents, so
 // 16/16/16 leaves comfortable headroom.
-const SERVICE_MAX_OBJECTS: usize = 16;
-const SERVICE_MAX_DIR_ENTRIES: usize = 16;
-const SERVICE_MAX_EXTENTS: usize = 16;
+// Stage E: raised so the on-target soak can exercise multi-block
+// extent trees. The writer's fixed arrays live INSIDE the
+// MountedHxfs value, which the service keeps on the stack; 512
+// extents x ~64 B = ~32 KiB BSS is the largest that still leaves
+// the 128 KiB stack safe alongside the crypto frames. A 1 MiB
+// soak file (256 extents -> 3 leaves) exercises the tree; larger
+// files need the writer to move off the stack (a Box/heap-based
+// service runtime), tracked separately.
+const SERVICE_MAX_OBJECTS: usize = 32;
+const SERVICE_MAX_DIR_ENTRIES: usize = 32;
+const SERVICE_MAX_EXTENTS: usize = 320;
 // The qemu-nvme-boot namespace is exposed with a 512-byte LBA while
 // Hxfs internally works in 4 KiB blocks. The
 // `libcanvas::block::BlockDevice` wire protocol speaks 512-byte LBAs,
@@ -1472,7 +1483,13 @@ pub extern "C" fn _start() -> ! {
     #[cfg(feature = "synthetic-key")]
     run_boot_self_check(&mut fs);
     let _ = bootstrap.write(b"service:hxfs:ready");
-    let mut runtime = HxfsRuntime::new(fs);
+    // The runtime (and the stack-resident MountedHxfs with its
+    // fixed extent array) lives on the HEAP: at Stage E capacities
+    // the writer is ~32 KiB and the 128 KiB user stack must stay
+    // free for the crypto read/write frames (several 4 KiB scratch
+    // buffers per frame on the mount call chain). The 256 KiB
+    // userspace heap fits it comfortably.
+    let mut runtime = Box::new(HxfsRuntime::new(fs));
     loop {
         runtime.poll(&bootstrap);
         libcanvas::process::yield_now();
@@ -1733,6 +1750,76 @@ fn write_roundtrip_check(fs: &mut MountedHxfs) {
                 Err(error) => println!("[hxfs] multi-slot-write: read failed ({:?})", error),
             },
             Err(error) => println!("[hxfs] multi-slot-write: reopen failed ({:?})", error),
+        }
+    }
+    // Phase E (Stage E): a 1 MiB file with a compressible pattern,
+    // written and read back in 4 KiB chunks through the real mount
+    // API. 256 extents exercise the multi-block extent tree (3
+    // leaves) on target; the 16 MiB host test covers the full
+    // tree. The size is bounded by the service's stack-resident
+    // writer (SERVICE_MAX_EXTENTS = 256).
+    {
+        const BIG_CHUNKS: usize = 256;
+        const BIG_FILE: &str = "probe-big.bin";
+        match fs.create_file_child(root, BIG_FILE) {
+            Ok(file) => {
+                let mut chunk = [0u8; 4096];
+                let line: &[u8] = b"HuesOS 1MiB Stage E probe 0123456789\n";
+                let mut chunk_index = 0usize;
+                while chunk_index < BIG_CHUNKS {
+                    chunk[0..8].copy_from_slice(&chunk_index.to_le_bytes());
+                    let mut pos = 8usize;
+                    while pos < chunk.len() {
+                        let n = (chunk.len() - pos).min(line.len());
+                        chunk[pos..pos + n].copy_from_slice(&line[..n]);
+                        pos += n;
+                    }
+                    if let Err(error) = fs.write_file_at(file, (chunk_index * 4096) as u64, &chunk)
+                    {
+                        println!("[hxfs] stage-e-write: write failed ({:?})", error);
+                        break;
+                    }
+                    chunk_index += 1;
+                }
+                if chunk_index == BIG_CHUNKS {
+                    // Reopen with a fresh handle and read back in
+                    // chunks, verifying the first 8 bytes of each.
+                    if let Ok(file) = fs.open_child_file(root, BIG_FILE) {
+                        let mut rbuf = [0u8; 4096];
+                        let mut ok = true;
+                        let mut index = 0usize;
+                        while index < BIG_CHUNKS {
+                            match fs.read_file_at(file, (index * 4096) as u64, &mut rbuf) {
+                                Ok(_) => {
+                                    let expect = index.to_le_bytes();
+                                    if rbuf[..8] != expect[..] {
+                                        println!(
+                                            "[hxfs] stage-e-write: chunk {index} got {:?} want {:?}",
+                                            &rbuf[..8],
+                                            expect
+                                        );
+                                        ok = false;
+                                        break;
+                                    }
+                                }
+                                _ => {
+                                    ok = false;
+                                    break;
+                                }
+                            }
+                            index += 1;
+                        }
+                        if ok {
+                            println!("[hxfs] stage-e-1mib-ok");
+                        } else {
+                            println!("[hxfs] stage-e-write: verify failed at {index}");
+                        }
+                    } else {
+                        println!("[hxfs] stage-e-write: reopen failed");
+                    }
+                }
+            }
+            Err(error) => println!("[hxfs] stage-e-write: create failed ({:?})", error),
         }
     }
 }

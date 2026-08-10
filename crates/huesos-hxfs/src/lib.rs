@@ -767,31 +767,78 @@ impl<R: BlockReader> Hxfs<R> {
             return Ok(());
         }
         let mut block = [0u8; BLOCK_SIZE];
-        let (header, block_type) = self.read_metadata_block_any_type(
+        // Try the single-block extent table first; a tree object's
+        // root fails validation with BadBlock, in which case we
+        // fall through to the tree path below.
+        let single_block = match self.read_metadata_block_any_type(
             object.tree_lba,
             BLOCK_TYPE_EXTENT_TABLE,
             BLOCK_TYPE_EXTENT_TABLE_V2,
             object.object_id,
             &mut block,
-        )?;
-        let owner = read_u64(&block, header.header_bytes as usize)?;
-        let count = read_u32(&block, header.header_bytes as usize + 8)?;
-        if owner != object.object_id || count != object.record_count {
-            return Err(HxfsError::BadTree);
-        }
-        let record_bytes = if block_type == BLOCK_TYPE_EXTENT_TABLE_V2 {
-            EXTENT_RECORD_BYTES_V2
-        } else {
-            EXTENT_RECORD_BYTES
+        ) {
+            Ok((header, block_type)) => Some((header, block_type)),
+            Err(HxfsError::BadBlock) => None,
+            Err(error) => return Err(error),
         };
+        let mut leaves: alloc::vec::Vec<u64> = alloc::vec::Vec::new();
+        if single_block.is_none() {
+            // Stage E: tree object — the root was already read into
+            // `block`; validate it and collect the leaf LBAs.
+            let header = self.read_metadata_block(
+                object.tree_lba,
+                BLOCK_TYPE_EXTENT_TREE_ROOT,
+                object.object_id,
+                &mut block,
+            )?;
+            match parse_extent_tree_root(&block[header.header_bytes as usize..]) {
+                Ok(parsed) => {
+                    leaves = parsed;
+                }
+                Err(error) => {
+                    return Err(error);
+                }
+            }
+        }
+        let record_bytes = match single_block {
+            Some((_, BLOCK_TYPE_EXTENT_TABLE_V2)) | None => EXTENT_RECORD_BYTES_V2,
+            _ => EXTENT_RECORD_BYTES,
+        };
+        let count = object.record_count;
         let mut previous_logical_end = 0u64;
         let mut index = 0u32;
+        let mut leaf_buf = [0u8; BLOCK_SIZE];
         while index < count {
-            let offset = header.header_bytes as usize + 16 + index as usize * record_bytes;
-            let (extent, meta) = if block_type == BLOCK_TYPE_EXTENT_TABLE_V2 {
-                parse_extent_record_v2(&block, offset)?
+            // Resolve the block + offset of record `index`. For a
+            // tree object the leaf block is loaded per 101-record
+            // group; for a single-block object the extent-table
+            // block is already in `block`.
+            let single = single_block;
+            let block_ref: &[u8];
+            let offset: usize;
+            if let Some((header, _block_type)) = single {
+                block_ref = &block;
+                offset = header.header_bytes as usize + 16 + index as usize * record_bytes;
             } else {
-                (parse_extent_record(&block, offset)?, None)
+                let leaf_index = (index as usize) / EXTENT_LEAF_RECORDS;
+                let within = (index as usize) % EXTENT_LEAF_RECORDS;
+                if leaf_index >= leaves.len() {
+                    return Err(HxfsError::BadTree);
+                }
+                let leaf_header = self.read_metadata_block(
+                    leaves[leaf_index],
+                    BLOCK_TYPE_EXTENT_TREE_LEAF,
+                    object.object_id,
+                    &mut leaf_buf,
+                );
+                let _ = leaf_header?;
+                block_ref = &leaf_buf;
+                offset = HEADER_BYTES + within * EXTENT_RECORD_BYTES_V2;
+            }
+            let (extent, meta) = if record_bytes == EXTENT_RECORD_BYTES_V2 {
+                parse_extent_record_v2(block_ref, offset)?
+            } else {
+                (parse_extent_record(block_ref, offset)?, None)
             };
             if extent.logical_block < previous_logical_end {
                 return Err(HxfsError::BadTree);
@@ -812,7 +859,7 @@ impl<R: BlockReader> Hxfs<R> {
             // records carry the per-extent descriptor instead, so
             // the policy is not consulted and an incompressible
             // block that was stored plain is not mis-decoded.
-            let compression = if block_type == BLOCK_TYPE_EXTENT_TABLE {
+            let compression = if record_bytes == EXTENT_RECORD_BYTES {
                 resolve_compression_for_object(
                     &self.system_volume,
                     &self.compression_policies,
@@ -1334,6 +1381,38 @@ pub(crate) fn parse_extent_record_v2(
         },
         meta,
     ))
+}
+
+/// Stage E: parse the payload of an extent tree ROOT block.
+///
+/// Returns the leaf LBAs. The root payload is
+/// `magic(4) + version(4) + count(4) + reserved(4) + leaf_lbas[]`;
+/// a missing magic/version, a zero count, or a leaf count beyond
+/// the payload is `BadTree`.
+pub(crate) fn parse_extent_tree_root(block: &[u8]) -> Result<alloc::vec::Vec<u64>, HxfsError> {
+    use alloc::vec::Vec;
+    let magic = read_u32(block, 0)?;
+    let version = read_u32(block, 4)?;
+    let count = read_u32(block, 8)?;
+    if magic != EXTENT_TREE_ROOT_MAGIC || version != EXTENT_TREE_ROOT_VERSION {
+        return Err(HxfsError::BadTree);
+    }
+    let count = count as usize;
+    if count == 0 || count > EXTENT_TREE_MAX_RECORDS {
+        return Err(HxfsError::BadTree);
+    }
+    let leaf_bytes = count * 8;
+    let available = block.len().saturating_sub(16);
+    if leaf_bytes > available {
+        return Err(HxfsError::BadTree);
+    }
+    let mut leaves = Vec::with_capacity(count);
+    let mut index = 0usize;
+    while index < count {
+        leaves.push(read_u64(block, 16 + index * 8)?);
+        index += 1;
+    }
+    Ok(leaves)
 }
 
 #[cfg(test)]
@@ -3183,6 +3262,108 @@ fn stage_c_fsck_reports_clean_and_corrupt() {
         "corrupted superblock must be counted by fsck (errors={})",
         corrupt.errors
     );
+}
+
+/// Stage E: multi-block extent trees scale a single object past the
+/// 101-record single-block limit. This test writes a 16 MiB file
+/// (4096 extents -> 41 leaf blocks + root), asserts the on-disk
+/// tree shape, and round-trips it byte-for-byte through a remount
+/// on a plain volume with the LZ4 policy (compressible data).
+#[cfg(all(test, feature = "crypto-aes-gcm", feature = "compression-engines"))]
+#[test]
+fn stage_e_16mib_file_uses_extent_tree_and_round_trips() {
+    use crate::fixed_writer::FixedHxfsWriter;
+    use crate::reader::SliceBlockReader;
+    use crate::recovery::BlockStore;
+    use crate::writer::VecBlockStore;
+    use alloc::vec;
+
+    const CHUNKS: usize = 4096; // 16 MiB
+    let comps = [crate::synthetic_key::compression_policy()];
+    let boot_image = build_seeded_boot_image(false, crate::synthetic_key::COMPRESSION_POLICY_ID);
+    let mut store = RecordingStore::new(VecBlockStore::with_blocks(48 * 1024));
+    let boot_blocks = (boot_image.len() / BLOCK_SIZE) as u32;
+    if let Err(e) = store.write_blocks(0, boot_blocks, &boot_image) {
+        assert!(false, "boot write must succeed: {:?}", e);
+        return;
+    }
+    let Ok(mut writer) =
+        FixedHxfsWriter::<RecordingStore, 16, 32, 8192>::mount_with_policies(store, &[], &comps)
+    else {
+        assert!(false, "writer mount must succeed");
+        return;
+    };
+    let root = writer.root_directory();
+    let file = match writer.open_child_file(root, crate::synthetic_key::SEED_FILE_NAME) {
+        Ok(f) => f,
+        Err(e) => {
+            assert!(false, "open_child_file must succeed: {:?}", e);
+            return;
+        }
+    };
+    writer.store_mut().start_recording();
+    let mut index = 0usize;
+    while index < CHUNKS {
+        let mut chunk = [0u8; BLOCK_SIZE];
+        fill_compressible_chunk(&mut chunk, index);
+        if let Err(e) = writer.write_file_at(file, (index * BLOCK_SIZE) as u64, &chunk) {
+            assert!(false, "write_file_at {index} must succeed: {:?}", e);
+            return;
+        }
+        index += 1;
+    }
+    let _ranges = writer.store_mut().stop_recording();
+    if let Err(e) = writer.publish_checkpoint() {
+        assert!(false, "publish_checkpoint must succeed: {:?}", e);
+        return;
+    }
+    let store = writer.into_store();
+    let image = store.inner.image().to_vec();
+    // On-disk tree shape: the extent tree root block must exist.
+    let root_count = count_metadata_blocks(&image, BLOCK_TYPE_EXTENT_TREE_ROOT);
+    let leaf_count = count_metadata_blocks(&image, BLOCK_TYPE_EXTENT_TREE_LEAF);
+    assert!(root_count >= 1, "extent tree root must be present");
+    assert!(
+        leaf_count >= 41,
+        "16 MiB / 4 KiB = 4096 records must span >= 41 leaves (got {leaf_count})"
+    );
+    // Reader round-trip.
+    let reader = SliceBlockReader::new(&image);
+    let Ok(mut fs) = Hxfs::mount_with_policies(reader, &[], &comps) else {
+        assert!(false, "remount must succeed");
+        return;
+    };
+    let file = match fs.open_path("/seed.bin") {
+        Ok(f) => f,
+        Err(e) => {
+            assert!(false, "open_path must succeed: {:?}", e);
+            return;
+        }
+    };
+    let mut buf = vec![0u8; CHUNKS * BLOCK_SIZE];
+    match fs.read_file(file, &mut buf) {
+        Ok(n) => assert_eq!(n, CHUNKS * BLOCK_SIZE, "read length must match"),
+        Err(e) => {
+            assert!(false, "read_file must succeed: {:?}", e);
+            return;
+        }
+    }
+    // Verify the whole 16 MiB byte-for-byte (compressible pattern).
+    let mut expected = [0u8; BLOCK_SIZE];
+    fill_compressible_chunk(&mut expected, 0);
+    let mut pos = 0usize;
+    let mut chunk_index = 0usize;
+    while pos < buf.len() {
+        let mut want = [0u8; BLOCK_SIZE];
+        fill_compressible_chunk(&mut want, chunk_index);
+        if buf[pos..pos + BLOCK_SIZE] != want[..] {
+            assert!(false, "byte mismatch at block {chunk_index}");
+            return;
+        }
+        pos += BLOCK_SIZE;
+        chunk_index += 1;
+    }
+    let _ = expected;
 }
 
 /// Stage B.5 companion: the incompressible fallback on a PLAIN
