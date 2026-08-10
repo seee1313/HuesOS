@@ -93,7 +93,7 @@ const POLL_BUF_BYTES: usize = 256;
 // service runtime), tracked separately.
 const SERVICE_MAX_OBJECTS: usize = 32;
 const SERVICE_MAX_DIR_ENTRIES: usize = 32;
-const SERVICE_MAX_EXTENTS: usize = 1100;
+const SERVICE_MAX_EXTENTS: usize = 4096;
 // The qemu-nvme-boot namespace is exposed with a 512-byte LBA while
 // Hxfs internally works in 4 KiB blocks. The
 // `libcanvas::block::BlockDevice` wire protocol speaks 512-byte LBAs,
@@ -1786,12 +1786,12 @@ fn write_roundtrip_check(fs: &mut MountedHxfs) {
     // of fixed arrays) and then moved into the heap-backed runtime;
     // a larger on-target file needs the O(n^2) extent sort replaced.
     {
-        const BIG_CHUNKS: usize = 1024;
+        const BIG_CHUNKS: usize = 4096;
         const BIG_FILE: &str = "probe-big.bin";
         match fs.create_file_child(root, BIG_FILE) {
             Ok(file) => {
                 let mut chunk = [0u8; 4096];
-                let line: &[u8] = b"HuesOS 4MiB Stage E probe 0123456789\n";
+                let line: &[u8] = b"HuesOS 16MiB Stage E probe 0123456789\n";
                 let mut chunk_index = 0usize;
                 while chunk_index < BIG_CHUNKS {
                     chunk[0..8].copy_from_slice(&chunk_index.to_le_bytes());
@@ -1837,7 +1837,7 @@ fn write_roundtrip_check(fs: &mut MountedHxfs) {
                             index += 1;
                         }
                         if ok {
-                            println!("[hxfs] stage-e-4mib-ok");
+                            println!("[hxfs] stage-e-16mib-ok");
                         } else {
                             println!("[hxfs] stage-e-write: verify failed at {index}");
                         }
