@@ -23,6 +23,7 @@ huesos-user-alloc = { path = "../../huesos-user-alloc" }
 synthetic-key = [
     "huesos-hxfs/crypto-aes-gcm",
     "huesos-hxfs/compression-engines",
+    "huesos-hxfs/hxblob",
 ]
 
 [profile.release]

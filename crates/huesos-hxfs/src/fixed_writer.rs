@@ -3785,20 +3785,6 @@ impl<
             i += 1;
         }
     }
-
-    fn sort_extents(&mut self, object_id: u64) {
-        let mut i = 0usize;
-        while i < self.extents.len() {
-            let mut j = i + 1;
-            while j < self.extents.len() {
-                if should_swap_extent(self.extents[i], self.extents[j], object_id) {
-                    self.extents.swap(i, j);
-                }
-                j += 1;
-            }
-            i += 1;
-        }
-    }
 }
 
 impl FixedDirEntry {
@@ -3819,18 +3805,6 @@ fn should_swap_dir(a: Option<FixedDirEntry>, b: Option<FixedDirEntry>, parent: u
             left.name_bytes() > right.name_bytes()
         }
         (None, Some(right)) if right.parent_object_id == parent => true,
-        _ => false,
-    }
-}
-
-fn should_swap_extent(a: Option<FixedExtent>, b: Option<FixedExtent>, object_id: u64) -> bool {
-    match (a, b) {
-        (Some(left), Some(right))
-            if left.object_id == object_id && right.object_id == object_id =>
-        {
-            left.extent.logical_block > right.extent.logical_block
-        }
-        (None, Some(right)) if right.object_id == object_id => true,
         _ => false,
     }
 }

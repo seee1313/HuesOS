@@ -220,6 +220,7 @@ if [[ "$inject" == "1" || "$inject" == "2" ]]; then
         "[hxfs] fsck clean"
         "[hxfs] quota-enforced-ok"
         "[hxfs] stage-e-16mib-ok"
+        "[hxfs] stage-f-blob-ok"
     )
 elif [[ "$inject" == "3" ]]; then
     # Graceful-shutdown cycle: the encrypted volume must mount and
@@ -229,6 +230,7 @@ elif [[ "$inject" == "3" ]]; then
         "[hxfs] self-check ok"
         "[hxfs] write-roundtrip-ok"
         "[hxfs] stage-e-16mib-ok"
+        "[hxfs] stage-f-blob-ok"
         "[init] terminal requested orderly shutdown"
         "[shutdown-broker] 8042 quiesced; invoking hard_halt"
         "[shutdown] all CPUs halted"
