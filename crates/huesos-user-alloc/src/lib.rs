@@ -410,7 +410,7 @@ mod tests {
         // uniquely owned region for the lifetime of the test.
         unsafe {
             let allocator = UserAllocator::new();
-            let buf = Box::leak(Box::new([0u8; 8192]));
+            let mut buf = vec![0u8; 8192];
             allocator.init(buf.as_mut_ptr(), buf.len());
             let small = layout(40);
             let large = layout(4096);
@@ -445,7 +445,7 @@ mod tests {
         // uniquely owned region for the lifetime of the test.
         unsafe {
             let allocator = UserAllocator::new();
-            let buf = Box::leak(Box::new([0u8; 16384]));
+            let mut buf = vec![0u8; 16384];
             allocator.init(buf.as_mut_ptr(), buf.len());
             let s40 = layout(40);
             let s328 = layout(328);
@@ -477,7 +477,7 @@ mod tests {
         // uniquely owned region for the lifetime of the test.
         unsafe {
             let allocator = UserAllocator::new();
-            let buf = Box::leak(Box::new([0u8; 8192]));
+            let mut buf = vec![0u8; 8192];
             allocator.init(buf.as_mut_ptr(), buf.len());
             let layout64 = layout(64);
             for _cycle in 0..64 {
@@ -507,7 +507,7 @@ mod tests {
         // uniquely owned region for the lifetime of the test.
         unsafe {
             let allocator = UserAllocator::new();
-            let buf = Box::leak(Box::new([0u8; 524288]));
+            let mut buf = vec![0u8; 524288];
             allocator.init(buf.as_mut_ptr(), buf.len());
             let tiny = layout(8);
             let mid = layout(64);
@@ -543,7 +543,7 @@ mod tests {
         // uniquely owned region for the lifetime of the test.
         unsafe {
             let allocator = UserAllocator::new();
-            let buf = Box::leak(Box::new([0u8; 65536]));
+            let mut buf = vec![0u8; 65536];
             allocator.init(buf.as_mut_ptr(), buf.len());
             let s328 = layout(328);
             let s4096 = layout(4096);
