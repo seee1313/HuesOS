@@ -479,6 +479,29 @@ fn bind_interrupts(irq: &ResourceSlot) -> Result<InterruptState, &'static str> {
     Ok(state)
 }
 
+/// Run a controller operation, retrying once on
+/// [`NvmeError::Timeout`]. QEMU's NVMe emulation under TCG on a
+/// contended CI runner can occasionally take longer than the
+/// completion-poll budget to post a CQE even though the request is
+/// valid (the failure mode seen as an intermittent `Io` from the
+/// Hxfs service's checkpoint publish). The request is idempotent
+/// (same LBA, same buffer), so one re-issue absorbs the transient;
+/// a second timeout surfaces to the client as IoError and the
+/// client's own transport retry takes over.
+fn controller_op_retry<F>(op: &str, lba: u64, mut run: F) -> Result<(), NvmeError>
+where
+    F: FnMut() -> Result<(), NvmeError>,
+{
+    match run() {
+        Ok(()) => Ok(()),
+        Err(NvmeError::Timeout) => {
+            println!("[driver-host:nvme] {op} lba={lba} timed out; retrying once");
+            run()
+        }
+        Err(error) => Err(error),
+    }
+}
+
 impl DriverRuntime {
     fn poll(&mut self, bootstrap: &Channel) {
         let _keep_irq_handles_alive = self.interrupt_state.keepalive_marker();
@@ -583,10 +606,12 @@ impl DriverRuntime {
         }
         match request.op {
             AsyncBlockOp::Info => self.send_info(index),
-            AsyncBlockOp::Flush => match self.controller.flush() {
-                Ok(()) => AsyncBlockStatus::Ok,
-                Err(_) => AsyncBlockStatus::IoError,
-            },
+            AsyncBlockOp::Flush => {
+                match controller_op_retry("flush", 0, || self.controller.flush()) {
+                    Ok(()) => AsyncBlockStatus::Ok,
+                    Err(_) => AsyncBlockStatus::IoError,
+                }
+            }
             AsyncBlockOp::Read => self.read_request(index, request),
             AsyncBlockOp::Write => self.write_request(index, request),
         }
@@ -623,14 +648,14 @@ impl DriverRuntime {
                 .max(1)
                 .min(request.block_count - done_blocks);
             let chunk_bytes = chunk_blocks as usize * block_size;
-            if self
-                .controller
-                .read(
+            if controller_op_retry("read", request.lba + u64::from(done_blocks), || {
+                self.controller.read(
                     request.lba + u64::from(done_blocks),
                     chunk_blocks as u16,
                     &mut scratch[..chunk_bytes],
                 )
-                .is_err()
+            })
+            .is_err()
             {
                 return AsyncBlockStatus::IoError;
             }
@@ -676,14 +701,14 @@ impl DriverRuntime {
                 Ok(read) if read == chunk_bytes => {}
                 _ => return AsyncBlockStatus::IoError,
             }
-            if self
-                .controller
-                .write(
+            if controller_op_retry("write", request.lba + u64::from(done_blocks), || {
+                self.controller.write(
                     request.lba + u64::from(done_blocks),
                     chunk_blocks as u16,
                     &scratch[..chunk_bytes],
                 )
-                .is_err()
+            })
+            .is_err()
             {
                 return AsyncBlockStatus::IoError;
             }

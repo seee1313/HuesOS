@@ -48,6 +48,7 @@ struct Args {
     seed_size: usize,
     inject_bad_gcm_tag: bool,
     inject_bad_crc: bool,
+    seed_blob_file: Option<std::path::PathBuf>,
 }
 
 fn usage() -> ! {
@@ -82,6 +83,7 @@ fn parse_args() -> Args {
     let mut seed_size = 3584usize;
     let mut inject_bad_gcm_tag = false;
     let mut inject_bad_crc = false;
+    let mut seed_blob_file: Option<std::path::PathBuf> = None;
     let mut index = 1usize;
     let args: Vec<String> = std::env::args().collect();
     while index < args.len() {
@@ -142,6 +144,15 @@ fn parse_args() -> Args {
             }
             "--inject-bad-gcm-tag" => inject_bad_gcm_tag = true,
             "--inject-bad-crc" => inject_bad_crc = true,
+            "--seed-blob-file" => {
+                index += 1;
+                seed_blob_file = Some(std::path::PathBuf::from(
+                    args.get(index).unwrap_or_else(|| {
+                        eprintln!("--seed-blob-file requires a path");
+                        std::process::exit(2);
+                    }),
+                ));
+            }
             other => {
                 eprintln!("unknown argument: {other}");
                 usage();
@@ -172,6 +183,7 @@ fn parse_args() -> Args {
         seed_size,
         inject_bad_gcm_tag,
         inject_bad_crc,
+        seed_blob_file,
     }
 }
 
@@ -617,6 +629,34 @@ fn main() {
         println!("[hxfs-seed] injected bad CRC at LBA {first_extent_lba} (offset 8)");
     }
 
+    // Phase-2 packages: optionally store an extra file (ELF/WAD) as
+    // an Hxblob object so userspace can fetch it by content hash.
+    if let Some(blob_path) = &args.seed_blob_file {
+        let data = match std::fs::read(blob_path) {
+            Ok(data) => data,
+            Err(e) => fail(&format!("read blob file {}: {e}", blob_path.display())),
+        };
+        match writer.put_blob(&data) {
+            Ok(hash) => {
+                let blob_hash_hex = hex_encode(&hash);
+                println!(
+                    "[hxfs-seed] stored blob {} ({} bytes)",
+                    blob_hash_hex,
+                    data.len()
+                );
+                // Phase-2 packages: record the hash in a small text
+                // file on the volume so the service (or any client)
+                // can look the blob up without knowing it a priori.
+                let root = writer.root_directory();
+                if let Ok(info_file) = writer.create_file_child(root, "wad.hash") {
+                    let info = format!("{}\n", blob_hash_hex);
+                    let _ = writer.write_file_at(info_file, 0, info.as_bytes());
+                }
+            }
+            Err(e) => fail(&format!("put_blob failed: {e:?}")),
+        }
+    }
+
     if let Err(e) = writer.publish_checkpoint() {
         fail(&format!("publish_checkpoint failed: {e:?}"));
     }
@@ -642,4 +682,14 @@ fn main() {
         ranges.len(),
         mode,
     );
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
 }

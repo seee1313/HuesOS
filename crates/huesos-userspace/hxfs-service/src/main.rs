@@ -1628,6 +1628,109 @@ fn run_boot_self_check(fs: &mut MountedHxfs) {
         println!("[hxfs] extent-bad-marked ({})", fs.bad_extent_count());
     }
     write_roundtrip_check(fs);
+    // Stage F (Phase-2 A): Hxblob round-trip through the object
+    // store on target. A small payload is stored by content hash
+    // and read back byte-for-byte; this exercises put_blob /
+    // get_blob (and the SHA-256 hashing) in the production service.
+    {
+        let payload = b"Hxblob on-target object store round-trip 0123456789\n".repeat(8);
+        match fs.put_blob(&payload) {
+            Ok(hash) => match fs.get_blob(&hash) {
+                Ok(got) if got == payload => {
+                    println!("[hxfs] stage-f-blob-ok");
+                }
+                Ok(_) => println!("[hxfs] stage-f-blob: mismatch"),
+                Err(error) => println!("[hxfs] stage-f-blob: get failed ({:?})", error),
+            },
+            Err(error) => println!("[hxfs] stage-f-blob: put failed ({:?})", error),
+        }
+    }
+    // Phase-2 packages: a package-sized blob round-trips through
+    // put_blob / get_blob. A full 4096-byte single-block blob used
+    // to fault on target (the userspace allocator reused a too-small
+    // freed block for the read buffer and the chunked fill wrote
+    // past it); huesos-user-alloc now has a size-aware free list, so
+    // 4096 bytes - the full single-block size - is the probe.
+    {
+        let mut payload = alloc::vec![0u8; 4096];
+        let mut i = 0usize;
+        while i < payload.len() {
+            payload[i] = (i as u8).wrapping_mul(7).wrapping_add(3);
+            i += 1;
+        }
+        match fs.put_blob(&payload) {
+            Ok(hash) => match fs.get_blob(&hash) {
+                Ok(full) => {
+                    let mut match_ok = full.len() == payload.len();
+                    if match_ok {
+                        let mut k = 0usize;
+                        while k < full.len() {
+                            if full[k] != payload[k] {
+                                match_ok = false;
+                                break;
+                            }
+                            k += 1;
+                        }
+                    }
+                    if match_ok {
+                        println!("[hxfs] stage-f-blob-big-ok");
+                    } else {
+                        println!("[hxfs] stage-f-blob-big: mismatch");
+                    }
+                }
+                Err(error) => println!("[hxfs] stage-f-blob-big: get failed ({:?})", error),
+            },
+            Err(error) => println!("[hxfs] stage-f-blob-big: put failed ({:?})", error),
+        }
+    }
+    // Phase-2 packages (step 3): WAD content delivery from the
+    // object store. The seed stored a WAD header blob and recorded
+    // its hash in 'wad.hash'; we fetch the blob chunked and verify
+    // the IWAD magic - proving package-style content is delivered
+    // from Hxblob on target.
+    {
+        let root = fs.root_directory();
+        if let Ok(file) = fs.open_child_file(root, "wad.hash") {
+            let mut hash_text = [0u8; 128];
+            match fs.read_file(file, &mut hash_text) {
+                Ok(n) => {
+                    let text = hash_text[..n]
+                        .iter()
+                        .take_while(|&&b| b != b'\n' && b != b' ')
+                        .copied()
+                        .collect::<alloc::vec::Vec<u8>>();
+                    if let Some(hash) = hex_decode(&text) {
+                        if hash.len() == 32 {
+                            let mut hash_bytes = [0u8; 32];
+                            hash_bytes.copy_from_slice(&hash);
+                            match fs.get_blob(&hash_bytes) {
+                                Ok(wad) => {
+                                    let is_wad = wad.len() >= 4
+                                        && wad[0] == b'I'
+                                        && wad[1] == b'W'
+                                        && wad[2] == b'A'
+                                        && wad[3] == b'D';
+                                    println!(
+                                        "[hxfs] stage-f-wad: {} bytes magic={}",
+                                        wad.len(),
+                                        if is_wad { "IWAD" } else { "bad" }
+                                    );
+                                    if is_wad {
+                                        println!("[hxfs] stage-f-wad-ok");
+                                    }
+                                }
+                                Err(error) => {
+                                    println!("[hxfs] stage-f-wad: get failed ({:?})", error)
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(error) => println!("[hxfs] stage-f-wad: read hash failed ({:?})", error),
+            }
+        }
+    }
+
     run_reliability_checks(fs);
 }
 
@@ -1696,23 +1799,6 @@ fn run_reliability_checks(fs: &mut MountedHxfs) {
     // Lift the probe quota so later checks (Hxblob) are not capped
     // by the temporary 8 KiB limit.
     let _ = fs.set_quota_limits(0, 0);
-    // Stage F (Phase-2 A): Hxblob round-trip through the object
-    // store on target. A small payload is stored by content hash
-    // and read back byte-for-byte; this exercises put_blob /
-    // get_blob (and the SHA-256 hashing) in the production service.
-    {
-        let payload = b"Hxblob on-target object store round-trip 0123456789\n".repeat(8);
-        match fs.put_blob(&payload) {
-            Ok(hash) => match fs.get_blob(&hash) {
-                Ok(got) if got == payload => {
-                    println!("[hxfs] stage-f-blob-ok");
-                }
-                Ok(_) => println!("[hxfs] stage-f-blob: mismatch"),
-                Err(error) => println!("[hxfs] stage-f-blob: get failed ({:?})", error),
-            },
-            Err(error) => println!("[hxfs] stage-f-blob: put failed ({:?})", error),
-        }
-    }
 }
 
 /// Phase-1 follow-up: prove the write pipeline on target.
@@ -2088,6 +2174,58 @@ impl HxfsRuntime {
             }
             return true;
         }
+        if let Some(rest) = strip_prefix(request, b"GET_BLOB_CHUNK ") {
+            // GET_BLOB_CHUNK <hash-hex> <offset-dec>: returns a hex
+            // chunk of up to 2048 payload bytes starting at offset,
+            // or an empty reply past the end. Enables streaming
+            // large blobs (ELF/WAD) through the text protocol.
+            let mut parts = rest.splitn(2, |&b| b == b' ');
+            let Some(hash_hex) = parts.next() else {
+                self.write_client(index, b"err:bad-args");
+                return true;
+            };
+            let Some(offset_str) = parts.next() else {
+                self.write_client(index, b"err:bad-args");
+                return true;
+            };
+            let Some(hash) = hex_decode(hash_hex) else {
+                self.write_client(index, b"err:bad-hex");
+                return true;
+            };
+            if hash.len() != 32 {
+                self.write_client(index, b"err:bad-hash");
+                return true;
+            }
+            let Ok(offset_text) = core::str::from_utf8(offset_str) else {
+                self.write_client(index, b"err:bad-offset");
+                return true;
+            };
+            let Ok(offset) = offset_text.parse::<usize>() else {
+                self.write_client(index, b"err:bad-offset");
+                return true;
+            };
+            let mut hash_bytes = [0u8; 32];
+            hash_bytes.copy_from_slice(&hash);
+            match self.fs.get_blob(&hash_bytes) {
+                Ok(data) => {
+                    const CHUNK: usize = 2048;
+                    let start = offset.min(data.len());
+                    let end = (start + CHUNK).min(data.len());
+                    let reply = hex_encode(&data[start..end]);
+                    println!(
+                        "[hxfs] blob-get-chunk offset={} bytes={}",
+                        start,
+                        end - start
+                    );
+                    self.write_client(index, reply.as_bytes());
+                }
+                Err(e) => {
+                    println!("[hxfs] blob-get-chunk failed: {:?}", e);
+                    self.write_client(index, b"err:not-found");
+                }
+            }
+            return true;
+        }
         if request == b"LIST_BLOBS" {
             let mut reply = alloc::string::String::new();
             for hash in self.fs.list_blobs() {
@@ -2102,7 +2240,24 @@ impl HxfsRuntime {
 }
 
 #[panic_handler]
-fn panic(_info: &PanicInfo) -> ! {
-    libcanvas::debug::write_str("[hxfs] PANIC\n");
+fn panic(info: &PanicInfo) -> ! {
+    use core::fmt::Write;
+    // Full panic info (message + source location) to the debug
+    // console: the soak harness needs to see WHY the service died,
+    // not just that it did.
+    let _ = writeln!(libcanvas::debug::DebugWriter, "[hxfs] PANIC: {info:?}");
+    // Allocator diagnostics: if the panic is an OOM this shows how
+    // full the bump region was and whether the free list still has
+    // reusable blocks.
+    let state = HEAP.debug_state();
+    let _ = writeln!(
+        libcanvas::debug::DebugWriter,
+        "[hxfs] heap: used={} last_oom={} free_list_len={} bump8192={} freed8192={}",
+        state.bump_used_bytes,
+        state.last_oom_size,
+        state.free_list_len,
+        state.bump_8192_count,
+        state.freed_8192_count
+    );
     libcanvas::process::exit(-1);
 }

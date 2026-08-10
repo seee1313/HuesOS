@@ -3436,9 +3436,12 @@ fn stage_f_hxblob_round_trip_survives_remount() {
         assert!(false, "boot write must succeed: {:?}", e);
         return;
     }
-    let Ok(mut writer) =
-        FixedHxfsWriter::<_, 16, 32, 256>::mount_with_policies(store, &policies, &comps)
-    else {
+    let Ok(mut writer) = FixedHxfsWriter::<_, 16, 32, 256>::mount_with_policies(
+        store,
+        &policies,
+        &comps,
+        Some(&crate::synthetic_key::VOLUME_KEY),
+    ) else {
         assert!(false, "writer mount must succeed");
         return;
     };
@@ -3492,9 +3495,12 @@ fn stage_f_hxblob_round_trip_survives_remount() {
         assert!(false, "remount image write must succeed: {:?}", e);
         return;
     }
-    let Ok(mut fs) =
-        FixedHxfsWriter::<_, 16, 32, 256>::mount_with_policies(remount_store, &policies, &comps)
-    else {
+    let Ok(mut fs) = FixedHxfsWriter::<_, 16, 32, 256>::mount_with_policies(
+        remount_store,
+        &policies,
+        &comps,
+        Some(&crate::synthetic_key::VOLUME_KEY),
+    ) else {
         assert!(false, "remount must succeed");
         return;
     };
@@ -3885,6 +3891,270 @@ fn rewrite_at_zero_releases_extent_slots() {
         after, 2,
         "rewrite must replace 300 blocks with 2 (data_blocks={after})"
     );
+}
+
+/// Phase-2 packages: reproduce the on-target big-blob put on an
+/// encrypted volume (32 KiB payload) to isolate the GPF seen in
+/// the service.
+#[cfg(all(test, feature = "hxblob", feature = "crypto-aes-gcm"))]
+#[test]
+fn stage_f_hxblob_big_put_encrypted() {
+    use crate::fixed_writer::FixedHxfsWriter;
+    use crate::recovery::BlockStore;
+    use crate::writer::VecBlockStore;
+
+    let policies = [crate::synthetic_key::encryption_policy()];
+    let comps = [crate::synthetic_key::compression_policy()];
+    let boot_image = build_seeded_boot_image(true, crate::synthetic_key::COMPRESSION_POLICY_ID);
+    let mut store = VecBlockStore::with_blocks(1024);
+    let boot_blocks = (boot_image.len() / BLOCK_SIZE) as u32;
+    if let Err(e) = store.write_blocks(0, boot_blocks, &boot_image) {
+        assert!(false, "boot write must succeed: {:?}", e);
+        return;
+    }
+    let Ok(mut writer) = FixedHxfsWriter::<_, 16, 32, 64>::mount_with_policies(
+        store,
+        &policies,
+        &comps,
+        Some(&crate::synthetic_key::VOLUME_KEY),
+    ) else {
+        assert!(false, "writer mount must succeed");
+        return;
+    };
+    let mut payload = alloc::vec![0u8; 32_000];
+    let mut i = 0usize;
+    while i < payload.len() {
+        payload[i] = (i as u8).wrapping_mul(7).wrapping_add(3);
+        i += 1;
+    }
+    let hash = match writer.put_blob(&payload) {
+        Ok(h) => h,
+        Err(e) => {
+            assert!(false, "put_blob must succeed: {:?}", e);
+            return;
+        }
+    };
+    let got = match writer.get_blob(&hash) {
+        Ok(g) => g,
+        Err(e) => {
+            assert!(false, "get_blob must succeed: {:?}", e);
+            return;
+        }
+    };
+    assert_eq!(got, payload, "32 KiB blob must round-trip");
+}
+
+/// Phase-2 packages: the Hxblob index grows past one block
+/// (>44 records) into a two-level tree; all blobs must survive a
+/// publish + remount.
+#[cfg(all(test, feature = "hxblob", feature = "crypto-aes-gcm"))]
+#[test]
+fn stage_f_hxblob_multi_block_index_round_trip() {
+    use crate::fixed_writer::FixedHxfsWriter;
+    use crate::recovery::BlockStore;
+    use crate::writer::VecBlockStore;
+
+    let policies = [crate::synthetic_key::encryption_policy()];
+    let comps = [crate::synthetic_key::compression_policy()];
+    let boot_image = build_seeded_boot_image(true, crate::synthetic_key::COMPRESSION_POLICY_ID);
+    let mut store = VecBlockStore::with_blocks(8192);
+    let boot_blocks = (boot_image.len() / BLOCK_SIZE) as u32;
+    if let Err(e) = store.write_blocks(0, boot_blocks, &boot_image) {
+        assert!(false, "boot write must succeed: {:?}", e);
+        return;
+    }
+    let Ok(mut writer) = FixedHxfsWriter::<_, 128, 128, 512>::mount_with_policies(
+        store,
+        &policies,
+        &comps,
+        Some(&crate::synthetic_key::VOLUME_KEY),
+    ) else {
+        assert!(false, "writer mount must succeed");
+        return;
+    };
+    // 45 distinct blobs: forces a multi-block index (44/leaf).
+    let mut hashes = alloc::vec::Vec::new();
+    let mut index = 0usize;
+    while index < 45 {
+        let payload = alloc::format!("hxblob-package-{index:04}-payload").into_bytes();
+        match writer.put_blob(&payload) {
+            Ok(hash) => hashes.push(hash),
+            Err(e) => {
+                assert!(false, "put_blob {index} must succeed: {:?}", e);
+                return;
+            }
+        }
+        index += 1;
+    }
+    assert_eq!(writer.blob_count(), 45);
+    if let Err(e) = writer.publish_checkpoint() {
+        assert!(false, "publish_checkpoint must succeed: {:?}", e);
+        return;
+    }
+    let store = writer.into_store();
+    let image = store.image().to_vec();
+    // Remount and verify every blob.
+    let mut remount = VecBlockStore::with_blocks(8192);
+    if let Err(e) = remount.write_blocks(0, (image.len() / BLOCK_SIZE) as u32, &image) {
+        assert!(false, "remount image write must succeed: {:?}", e);
+        return;
+    }
+    let Ok(mut fs) = FixedHxfsWriter::<_, 128, 128, 512>::mount_with_policies(
+        remount,
+        &policies,
+        &comps,
+        Some(&crate::synthetic_key::VOLUME_KEY),
+    ) else {
+        assert!(false, "remount must succeed");
+        return;
+    };
+    assert_eq!(fs.blob_count(), 45, "all 45 blobs must survive remount");
+    let mut index = 0usize;
+    while index < 45 {
+        let payload = alloc::format!("hxblob-package-{index:04}-payload").into_bytes();
+        match fs.get_blob(&hashes[index]) {
+            Ok(got) => assert_eq!(got, payload, "blob {index} must round-trip"),
+            Err(e) => {
+                assert!(false, "get_blob {index} must succeed: {:?}", e);
+                return;
+            }
+        }
+        index += 1;
+    }
+}
+
+/// Phase-2 packages: the exact on-target delivery sequence. Session
+/// 1 (tools/hxfs-seed, small capacities) stores a 3072-byte "WAD
+/// header" blob and a wad.hash sidecar, then publishes and flushes.
+/// Session 2 (hxfs-service, production capacities) remounts the
+/// volume, runs its Stage F blob checks (put + get of a fresh
+/// small blob, then get of the seeded blob) and must read both
+/// back byte-for-byte. This covers the load-then-modify path of
+/// the Hxblob index (blobs present at mount time, new record
+/// inserted by the service).
+#[cfg(all(test, feature = "hxblob", feature = "crypto-aes-gcm"))]
+#[test]
+fn stage_f_hxblob_seeded_remount_put_get_round_trip() {
+    use crate::fixed_writer::FixedHxfsWriter;
+    use crate::recovery::BlockStore;
+    use crate::writer::VecBlockStore;
+
+    let policies = [crate::synthetic_key::encryption_policy()];
+    let comps = [crate::synthetic_key::compression_policy()];
+    let boot_image = build_seeded_boot_image(true, crate::synthetic_key::COMPRESSION_POLICY_ID);
+
+    // Session 1 (seed tool): encrypted+compressed volume with a
+    // WAD-header blob and its hash sidecar.
+    let mut store = VecBlockStore::with_blocks(16384);
+    let boot_blocks = (boot_image.len() / BLOCK_SIZE) as u32;
+    if let Err(e) = store.write_blocks(0, boot_blocks, &boot_image) {
+        assert!(false, "boot write must succeed: {:?}", e);
+        return;
+    }
+    let mut wad_header = alloc::vec![0u8; 3072];
+    wad_header[0..4].copy_from_slice(b"IWAD");
+    let mut i = 4usize;
+    while i < wad_header.len() {
+        wad_header[i] = (i as u8).wrapping_mul(7).wrapping_add(3);
+        i += 1;
+    }
+    let seeded = {
+        let mut writer = match FixedHxfsWriter::<VecBlockStore, 16, 32, 128>::mount_with_policies(
+            store,
+            &policies,
+            &comps,
+            Some(&crate::synthetic_key::VOLUME_KEY),
+        ) {
+            Ok(w) => w,
+            Err(e) => {
+                assert!(false, "seed mount must succeed: {:?}", e);
+                return;
+            }
+        };
+        let hash = match writer.put_blob(&wad_header) {
+            Ok(h) => h,
+            Err(e) => {
+                assert!(false, "seed put_blob must succeed: {:?}", e);
+                return;
+            }
+        };
+        let root = writer.root_directory();
+        match writer.create_file_child(root, "wad.hash") {
+            Ok(info_file) => {
+                if let Err(e) = writer.write_file_at(info_file, 0, b"deadbeef\n") {
+                    assert!(false, "write wad.hash must succeed: {:?}", e);
+                    return;
+                }
+            }
+            Err(e) => {
+                assert!(false, "create wad.hash must succeed: {:?}", e);
+                return;
+            }
+        }
+        if let Err(e) = writer.publish_checkpoint() {
+            assert!(false, "seed publish must succeed: {:?}", e);
+            return;
+        }
+        let store = writer.into_store();
+        (store.image().to_vec(), hash)
+    };
+    let (seeded_image, wad_hash) = seeded;
+
+    // Session 2 (service): remount with the service's production
+    // capacities, then the Stage F blob checks.
+    let mut remount = VecBlockStore::with_blocks(16384);
+    if let Err(e) = remount.write_blocks(0, (seeded_image.len() / BLOCK_SIZE) as u32, &seeded_image)
+    {
+        assert!(false, "remount image write must succeed: {:?}", e);
+        return;
+    }
+    let mut fs = match FixedHxfsWriter::<VecBlockStore, 32, 32, 4200>::mount_with_policies(
+        remount,
+        &policies,
+        &comps,
+        Some(&crate::synthetic_key::VOLUME_KEY),
+    ) {
+        Ok(f) => f,
+        Err(e) => {
+            assert!(false, "service mount must succeed: {:?}", e);
+            return;
+        }
+    };
+    assert_eq!(fs.blob_count(), 1, "seeded blob must be present at mount");
+    // Stage F check 1: the fresh small blob round-trips.
+    let payload = b"Hxblob on-target object store round-trip 0123456789\n".repeat(8);
+    let hash = match fs.put_blob(&payload) {
+        Ok(h) => h,
+        Err(e) => {
+            assert!(false, "service put_blob must succeed: {:?}", e);
+            return;
+        }
+    };
+    match fs.get_blob(&hash) {
+        Ok(got) => assert_eq!(
+            got, payload,
+            "fresh blob must round-trip after seeded remount"
+        ),
+        Err(e) => {
+            assert!(false, "service get_blob must succeed: {:?}", e);
+            return;
+        }
+    }
+    // Stage F check 2: the seeded WAD header reads back with the
+    // IWAD magic intact.
+    match fs.get_blob(&wad_hash) {
+        Ok(got) => {
+            assert_eq!(got, wad_header, "seeded WAD header must round-trip");
+            assert!(
+                got.len() >= 4 && &got[0..4] == b"IWAD",
+                "IWAD magic must be intact"
+            );
+        }
+        Err(e) => {
+            assert!(false, "seeded get_blob must succeed: {:?}", e);
+            return;
+        }
+    }
 }
 
 /// Stage B.5 companion: the incompressible fallback on a PLAIN

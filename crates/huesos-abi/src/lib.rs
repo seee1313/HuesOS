@@ -664,23 +664,17 @@ pub const USER_ASPACE_SIZE: u64 = USER_ASPACE_END - USER_ASPACE_BASE;
 pub const USER_STACK_TOP: u64 = 0x0000_7fff_ff00_0000;
 /// Size of the initial userspace stack mapped by the userspace process launcher.
 ///
-/// 128 KiB: the original 64 KiB overflowed for services that do
-/// real work on the boot call chain. The hxfs-service's
-/// encrypted+compressed write/read path needs deep frames (the
-/// writer's `write_data_blocks` and `copy_extent` keep several
-/// 4 KiB crypto scratch buffers live, and the boot self-check adds
-/// probe buffers on top of the mount chain); its first on-target
-/// write round-trip faulted ~62 KiB deep. The mapping is virtual
-/// reservation, so 128 KiB is cheap for every process.
-pub const USER_STACK_SIZE: u64 = 4096 * 256;
-// 1 MiB: the hxfs-service mount frame constructs the writer (4096
-// extents ~ 262 KiB) on the stack before moving it to the heap, and
-// the load/crypto frames sit on top; 512 KiB overflowed on target.
-// Virtual reservation, cheap for every process.
-// 512 KiB: the hxfs-service mount frame carries the writer's fixed
-// arrays (~80 KiB at 1024 extents) plus the crypto read/write
-// frames on the boot call chain; 256 KiB overflowed on target
-// (user-fault ~264 KiB deep). Virtual reservation, cheap.
+/// 2 MiB. The stack has been raised repeatedly as the hxfs-service
+/// boot call chain grew: 64 KiB overflowed, then 128 KiB, 512 KiB
+/// and 1 MiB (mount constructs the writer's fixed arrays - 4200
+/// extents plus per-object slots - on the stack before moving it to
+/// the heap, and the load/crypto/self-check frames sit on top).
+/// The 1 MiB ceiling was hit again on target after the Hxblob read
+/// path gained a two-slot compose step: the mount frame sits within
+/// a few KiB of the mapping and any inlining shift tips it over.
+/// The mapping is virtual reservation, so 2 MiB is cheap for every
+/// process and gives the mount chain real headroom.
+pub const USER_STACK_SIZE: u64 = 4096 * 512;
 
 /// Base of the userspace heap region mapped by the process launcher.
 ///
@@ -692,7 +686,13 @@ pub const USER_STACK_SIZE: u64 = 4096 * 256;
 /// never touch it.
 pub const USER_HEAP_BASE: u64 = 0x0000_7000_0000;
 /// Size of the userspace heap region mapped by the process launcher.
-pub const USER_HEAP_SIZE: u64 = 1024 * 1024;
+pub const USER_HEAP_SIZE: u64 = 18 * 1024 * 1024;
+// 18 MiB: the hxfs-service bump allocator holds the runtime, the
+// package-sized blob payloads, AND the live scrub's whole-object
+// buffer (the 16 MiB probe file is buffered by scrub()). A bump
+// allocator with no free() must be sized for the worst single
+// allocation chain; chunked scrub (a known follow-up) will let this
+// shrink again.
 
 /// Scheduler flags for [`Syscall::ProcessSetSchedulerFlags`].
 pub mod scheduler_flags {

@@ -49,6 +49,12 @@ if [[ "$inject" == "1" || "$inject" == "2" || "$inject" == "3" || "$inject" == "
     # the VolumeKeyGet syscall; without it an encrypted volume
     # cannot mount, which is the security gate.
     export HUESOS_VOLUME_KEY_HEX="$(bash tools/hxfs-seed.sh --print-volume-key-hex)"
+    # Phase-2 packages (step 3): every seeded mode also stores a WAD
+    # header (first 3072 bytes of freedoom1.wad) as an Hxblob object
+    # and records its hash in 'wad.hash' on the volume, so the boot
+    # self-check can verify IWAD magic delivery from the object
+    # store (marker: stage-f-wad-ok).
+    seed_args+=(--seed-blob-file build/wad-header.bin)
 fi
 case "$profile" in
     release) CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-1}" make iso-release >/tmp/huesos-nvme-soak-build.log ;;
@@ -115,6 +121,9 @@ if [[ "$need_create" == "1" ]]; then
         # seed.bin file. Modes 1/2 corrupt the seed data block;
         # mode 3 leaves it intact for the shutdown cycle.
         echo "[soak] creating seeded Hxfs image (inject=${inject}): $nvme_img"
+        # Phase-2 packages (step 3): materialise the WAD header blob
+        # source next to the image so mkhxfs.py can seed it.
+        head -c 3072 third_party/freedoom/freedoom1.wad > build/wad-header.bin
         python3 tools/mkhxfs.py --output "$nvme_img" --blocks "$hxfs_blocks" \
             --seed-file seed.bin --seed-size 3584 "${seed_args[@]}" >/dev/null
     else
@@ -227,6 +236,8 @@ if [[ "$inject" == "1" || "$inject" == "2" ]]; then
         "[hxfs] quota-enforced-ok"
         "[hxfs] stage-e-16mib-ok"
         "[hxfs] stage-f-blob-ok"
+        "[hxfs] stage-f-blob-big-ok"
+        "[hxfs] stage-f-wad-ok"
     )
 elif [[ "$inject" == "4" ]]; then
     # Stress soak: encrypted volume, self-check, write path,
@@ -237,6 +248,8 @@ elif [[ "$inject" == "4" ]]; then
         "[hxfs] multi-slot-write-ok"
         "[hxfs] stage-e-16mib-ok"
         "[hxfs] stage-f-blob-ok"
+        "[hxfs] stage-f-blob-big-ok"
+        "[hxfs] stage-f-wad-ok"
         "[hxfs] stress-ok"
         "[hxfs] scrub complete"
         "[hxfs] fsck clean"
@@ -251,6 +264,8 @@ elif [[ "$inject" == "3" ]]; then
         "[hxfs] write-roundtrip-ok"
         "[hxfs] stage-e-16mib-ok"
         "[hxfs] stage-f-blob-ok"
+        "[hxfs] stage-f-blob-big-ok"
+        "[hxfs] stage-f-wad-ok"
         "[init] terminal requested orderly shutdown"
         "[shutdown-broker] 8042 quiesced; invoking hard_halt"
         "[shutdown] all CPUs halted"

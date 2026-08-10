@@ -6,7 +6,7 @@
     "panic_macros": 6,
     "static_mut": 1,
     "todo_markers": 1,
-    "unsafe_blocks": 265,
+    "unsafe_blocks": 273,
     "unsafe_functions": 66,
     "unsafe_impls": 35,
     "unwrap_calls": 25
@@ -54,7 +54,7 @@
     "crates/huesos-syscalls/src/user_access.rs": 6,
     "crates/huesos-syscalls/src/user_memory.rs": 7,
     "crates/huesos-uacpi/src/lib.rs": 12,
-    "crates/huesos-user-alloc/src/lib.rs": 9,
+    "crates/huesos-user-alloc/src/lib.rs": 17,
     "crates/huesos-userspace/acpi-manager/src/main.rs": 1,
     "crates/huesos-userspace/doom/src/main.rs": 9,
     "crates/huesos-userspace/fault-probe/src/main.rs": 4,
