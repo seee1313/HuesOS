@@ -1189,10 +1189,8 @@ impl<
                 )?;
                 // Write the tree leaves plain after the root (they
                 // are covered by the root's journal record).
-                let mut leaf_lba = tree_lba + 1;
-                for leaf in &leaves {
+                for (leaf_lba, leaf) in (tree_lba + 1..).zip(leaves.iter()) {
                     self.store.write_blocks(leaf_lba, 1, leaf)?;
-                    leaf_lba += 1;
                 }
                 block_offset += 1 + leaves.len() as u64;
                 record_index += 1;
@@ -1239,10 +1237,8 @@ impl<
             checkpoint_lba,
             0,
         )?;
-        let mut alloc_leaf_lba = allocation_tree_lba + 1;
-        for leaf in &allocation_leaves {
+        for (alloc_leaf_lba, leaf) in (allocation_tree_lba + 1..).zip(allocation_leaves.iter()) {
             self.store.write_blocks(alloc_leaf_lba, 1, leaf)?;
-            alloc_leaf_lba += 1;
         }
         record_index += 1;
 
@@ -1258,10 +1254,8 @@ impl<
             checkpoint_lba,
             0,
         )?;
-        let mut refcount_leaf_lba = refcount_tree_lba + 1;
-        for leaf in &refcount_leaves {
+        for (refcount_leaf_lba, leaf) in (refcount_tree_lba + 1..).zip(refcount_leaves.iter()) {
             self.store.write_blocks(refcount_leaf_lba, 1, leaf)?;
-            refcount_leaf_lba += 1;
         }
         record_index += 1;
 
@@ -1277,10 +1271,8 @@ impl<
             checkpoint_lba,
             0,
         )?;
-        let mut backref_leaf_lba = backref_tree_lba + 1;
-        for leaf in &backref_leaves {
+        for (backref_leaf_lba, leaf) in (backref_tree_lba + 1..).zip(backref_leaves.iter()) {
             self.store.write_blocks(backref_leaf_lba, 1, leaf)?;
-            backref_leaf_lba += 1;
         }
         record_index += 1;
 
