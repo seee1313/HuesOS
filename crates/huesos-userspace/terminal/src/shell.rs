@@ -1,8 +1,8 @@
 //! Terminal shell runtime and keyboard event loop.
 
+use crate::commands::execute_line;
 #[cfg(feature = "soak-shutdown")]
 use crate::println;
-use crate::commands::execute_line;
 use crate::screen::Screen;
 use crate::snake;
 use libcanvas::{Channel, ErrorCode};
