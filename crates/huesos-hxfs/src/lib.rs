@@ -3667,6 +3667,226 @@ fn stage_e2_scrub_all_reports_clean() {
     );
 }
 
+/// Phase-2 (B): on-target stress shape - several small objects
+/// (all logical 0) plus a 4096-block object rewritten at offset 0.
+#[cfg(all(test, feature = "crypto-aes-gcm", feature = "compression-engines"))]
+#[test]
+fn stress_rewrite_with_sibling_objects() {
+    use crate::fixed_writer::FixedHxfsWriter;
+    use crate::recovery::BlockStore;
+    use crate::writer::VecBlockStore;
+
+    let comps = [crate::synthetic_key::compression_policy()];
+    let boot_image = build_seeded_boot_image(false, crate::synthetic_key::COMPRESSION_POLICY_ID);
+    let mut store = VecBlockStore::with_blocks(8192);
+    let boot_blocks = (boot_image.len() / BLOCK_SIZE) as u32;
+    if let Err(e) = store.write_blocks(0, boot_blocks, &boot_image) {
+        assert!(false, "boot write must succeed: {:?}", e);
+        return;
+    }
+    let Ok(mut writer) =
+        FixedHxfsWriter::<_, 16, 32, 4200>::mount_with_policies(store, &[], &comps, None)
+    else {
+        assert!(false, "writer mount must succeed");
+        return;
+    };
+    let root = writer.root_directory();
+    // Three sibling objects, each one block at logical 0.
+    let mut chunk = [0u8; BLOCK_SIZE];
+    fill_compressible_chunk(&mut chunk, 0);
+    for name in ["a.bin", "b.bin", "c.bin"] {
+        let f = match writer.create_file_child(root, name) {
+            Ok(f) => f,
+            Err(e) => {
+                assert!(false, "create {name} must succeed: {:?}", e);
+                return;
+            }
+        };
+        if let Err(e) = writer.write_file_at(f, 0, &chunk) {
+            assert!(false, "write {name} must succeed: {:?}", e);
+            return;
+        }
+    }
+    // Big object: 4096 blocks.
+    let big = match writer.create_file_child(root, "big.bin") {
+        Ok(f) => f,
+        Err(e) => {
+            assert!(false, "create big must succeed: {:?}", e);
+            return;
+        }
+    };
+    let mut index = 0usize;
+    while index < 4096 {
+        fill_compressible_chunk(&mut chunk, index);
+        if let Err(e) = writer.write_file_at(big, (index * BLOCK_SIZE) as u64, &chunk) {
+            assert!(false, "big write {index} must succeed: {:?}", e);
+            return;
+        }
+        index += 1;
+    }
+    // Rewrite big at offset 0 (clear + re-insert).
+    let mut index = 0usize;
+    while index < 4096 {
+        fill_compressible_chunk(&mut chunk, index);
+        if let Err(e) = writer.write_file_at(big, (index * BLOCK_SIZE) as u64, &chunk) {
+            assert!(false, "rewrite {index} must succeed: {:?}", e);
+            return;
+        }
+        index += 1;
+    }
+    let after = match writer.scrub() {
+        Ok(s) => s.data_blocks,
+        Err(e) => {
+            assert!(false, "scrub must run: {:?}", e);
+            return;
+        }
+    };
+    assert_eq!(after, 4099, "3 siblings + 4096 big after rewrite");
+}
+
+/// Phase-2 (B): exact reproduction of the on-target stress: a
+/// 4096-block file (MAX_EXTENTS 4200) rewritten at offset 0 three
+/// times must not exhaust the extent array.
+#[cfg(all(test, feature = "crypto-aes-gcm", feature = "compression-engines"))]
+#[test]
+fn stress_rewrite_4096_blocks_three_cycles() {
+    use crate::fixed_writer::FixedHxfsWriter;
+    use crate::recovery::BlockStore;
+    use crate::writer::VecBlockStore;
+
+    let comps = [crate::synthetic_key::compression_policy()];
+    let boot_image = build_seeded_boot_image(false, crate::synthetic_key::COMPRESSION_POLICY_ID);
+    let mut store = VecBlockStore::with_blocks(8192);
+    let boot_blocks = (boot_image.len() / BLOCK_SIZE) as u32;
+    if let Err(e) = store.write_blocks(0, boot_blocks, &boot_image) {
+        assert!(false, "boot write must succeed: {:?}", e);
+        return;
+    }
+    let Ok(mut writer) =
+        FixedHxfsWriter::<_, 16, 32, 4200>::mount_with_policies(store, &[], &comps, None)
+    else {
+        assert!(false, "writer mount must succeed");
+        return;
+    };
+    let root = writer.root_directory();
+    let file = match writer.open_child_file(root, crate::synthetic_key::SEED_FILE_NAME) {
+        Ok(f) => f,
+        Err(e) => {
+            assert!(false, "open must succeed: {:?}", e);
+            return;
+        }
+    };
+    // Cycle 0: write 4096 blocks.
+    let mut index = 0usize;
+    while index < 4096 {
+        let mut chunk = [0u8; BLOCK_SIZE];
+        fill_compressible_chunk(&mut chunk, index);
+        if let Err(e) = writer.write_file_at(file, (index * BLOCK_SIZE) as u64, &chunk) {
+            assert!(false, "cycle0 write {index} must succeed: {:?}", e);
+            return;
+        }
+        index += 1;
+    }
+    // Cycles 1..3: rewrite at offset 0 (clear + re-insert).
+    let mut cycle = 1usize;
+    while cycle <= 3 {
+        let mut index = 0usize;
+        while index < 4096 {
+            let mut chunk = [0u8; BLOCK_SIZE];
+            fill_compressible_chunk(&mut chunk, index);
+            if let Err(e) = writer.write_file_at(file, (index * BLOCK_SIZE) as u64, &chunk) {
+                assert!(false, "cycle{cycle} write {index} must succeed: {:?}", e);
+                return;
+            }
+            index += 1;
+        }
+        cycle += 1;
+    }
+    let after = match writer.scrub() {
+        Ok(s) => s.data_blocks,
+        Err(e) => {
+            assert!(false, "scrub must run: {:?}", e);
+            return;
+        }
+    };
+    assert_eq!(after, 4096, "four full writes must leave 4096 blocks");
+}
+
+/// Phase-2 (B): rewriting a file at offset 0 must release the old
+/// extent slots (clear_extents) before re-inserting, so a large
+/// file can be overwritten without exhausting the fixed array.
+#[cfg(all(test, feature = "crypto-aes-gcm", feature = "compression-engines"))]
+#[test]
+fn rewrite_at_zero_releases_extent_slots() {
+    use crate::fixed_writer::FixedHxfsWriter;
+    use crate::recovery::BlockStore;
+    use crate::writer::VecBlockStore;
+
+    let comps = [crate::synthetic_key::compression_policy()];
+    let boot_image = build_seeded_boot_image(false, crate::synthetic_key::COMPRESSION_POLICY_ID);
+    let mut store = VecBlockStore::with_blocks(2048);
+    let boot_blocks = (boot_image.len() / BLOCK_SIZE) as u32;
+    if let Err(e) = store.write_blocks(0, boot_blocks, &boot_image) {
+        assert!(false, "boot write must succeed: {:?}", e);
+        return;
+    }
+    let Ok(mut writer) =
+        FixedHxfsWriter::<_, 16, 32, 512>::mount_with_policies(store, &[], &comps, None)
+    else {
+        assert!(false, "writer mount must succeed");
+        return;
+    };
+    let root = writer.root_directory();
+    let file = match writer.open_child_file(root, crate::synthetic_key::SEED_FILE_NAME) {
+        Ok(f) => f,
+        Err(e) => {
+            assert!(false, "open must succeed: {:?}", e);
+            return;
+        }
+    };
+    // Write 300 blocks (over the 101-leaf threshold).
+    let mut index = 0usize;
+    while index < 300 {
+        let mut chunk = [0u8; BLOCK_SIZE];
+        fill_compressible_chunk(&mut chunk, index);
+        if let Err(e) = writer.write_file_at(file, (index * BLOCK_SIZE) as u64, &chunk) {
+            assert!(false, "write {index} must succeed: {:?}", e);
+            return;
+        }
+        index += 1;
+    }
+    let before = match writer.scrub() {
+        Ok(s) => s.data_blocks,
+        Err(e) => {
+            assert!(false, "scrub must run: {:?}", e);
+            return;
+        }
+    };
+    assert_eq!(before, 300, "300 data blocks after full write");
+    // Rewrite at offset 0 with fewer blocks: old slots must be freed.
+    let mut chunk = [0u8; BLOCK_SIZE];
+    fill_compressible_chunk(&mut chunk, 0);
+    if let Err(e) = writer.write_file_at(file, 0, &chunk) {
+        assert!(false, "rewrite must succeed: {:?}", e);
+        return;
+    }
+    if let Err(e) = writer.write_file_at(file, BLOCK_SIZE as u64, &chunk) {
+        assert!(false, "second rewrite must succeed: {:?}", e);
+        return;
+    }
+    let after = match writer.scrub() {
+        Ok(s) => s.data_blocks,
+        Err(e) => {
+            assert!(false, "scrub must run: {:?}", e);
+            return;
+        }
+    };
+    assert_eq!(
+        after, 2,
+        "rewrite must replace 300 blocks with 2 (data_blocks={after})"
+    );
+}
+
 /// Stage B.5 companion: the incompressible fallback on a PLAIN
 /// volume. Random data written under an LZ4 volume policy must be
 /// stored plain (no descriptor, no flag) and still round-trip

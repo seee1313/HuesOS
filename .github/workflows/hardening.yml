@@ -236,6 +236,78 @@ jobs:
           path: ci-artifacts/
           if-no-files-found: warn
 
+  qemu-nvme-stress:
+    # Stress soak: encrypted volume, 16 MiB file + repeated
+    # write/read cycles for sustained NVMe/page-cache load.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        profile: [release]
+        cpus: [2]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            gcc xorriso qemu-system-x86 socat
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install nightly-2026-03-01 --profile minimal \
+            --component rust-src,llvm-tools-preview
+          rustup default nightly-2026-03-01
+      - name: NVMe + Hxfs stress QEMU smoke
+        env:
+          CARGO_BUILD_JOBS: "1"
+          ARTIFACT_DIR: ci-artifacts
+        run: bash scripts/ci-qemu-nvme-soak.sh ${{ matrix.profile }} 200 ci-artifacts/qemu-nvme-stress.log 4
+      - name: Upload serial log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: qemu-nvme-stress-${{ matrix.profile }}-smp${{ matrix.cpus }}
+          path: ci-artifacts/
+          if-no-files-found: warn
+
+  qemu-nvme-long-soak:
+    # Bounded long soak: one pass of gcm + stress + shutdown-cycle
+    # (~2 h wall clock). GitHub's 6 h job cap prevents a literal
+    # 24 h CI job; the full 24 h run is an operator-triggered local
+    # gate (scripts/soak-long.sh), documented in the roadmap.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    strategy:
+      fail-fast: false
+      matrix:
+        profile: [release]
+        cpus: [2]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            gcc xorriso qemu-system-x86 socat
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install nightly-2026-03-01 --profile minimal \
+            --component rust-src,llvm-tools-preview
+          rustup default nightly-2026-03-01
+      - name: Long soak (one full pass)
+        env:
+          CARGO_BUILD_JOBS: "1"
+          ARTIFACT_DIR: ci-artifacts
+        run: bash scripts/soak-long.sh 1 release ci-artifacts/long-soak
+      - name: Upload serial logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: qemu-nvme-long-soak-${{ matrix.profile }}-smp${{ matrix.cpus }}
+          path: ci-artifacts/
+          if-no-files-found: warn
+
   qemu-extable-smoke:
     # Boot QEMU with an HBI cmdline that asks the kernel to fire the
     # synthetic recoverable-copy probe, then verify the serial log
