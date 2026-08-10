@@ -56,7 +56,21 @@ if [[ ! -f "$ovmf" ]]; then
     exit 1
 fi
 
+# The image is only valid for the inject mode that created it: an
+# encrypted (gcm) image must not be reused by a plain run (the
+# service would reject it with EncryptedPolicyUnknown) and vice
+# versa. A mode marker next to the image records its creator; the
+# image is (re)created when missing OR when the marker differs.
+mode_file="$nvme_img.mode"
+need_create=0
 if [[ ! -f "$nvme_img" ]]; then
+    need_create=1
+elif [[ ! -f "$mode_file" ]] || [[ "$(cat "$mode_file" 2>/dev/null)" != "$inject" ]]; then
+    echo "[soak] image mode mismatch (marker=$(cat "$mode_file" 2>/dev/null || echo none), want=$inject); recreating"
+    need_create=1
+fi
+if [[ "$need_create" == "1" ]]; then
+    rm -f "$nvme_img"
     echo "[soak] creating Hxfs v5 image: $nvme_img ($nvme_size)"
     # The QEMU NVMe namespace exposes a 512-byte LBA, so the on-disk
     # size in bytes is also the number of LBAs. Hxfs uses 4 KiB
@@ -95,6 +109,7 @@ if [[ ! -f "$nvme_img" ]]; then
     else
         python3 tools/mkhxfs.py --output "$nvme_img" --blocks "$hxfs_blocks" >/dev/null
     fi
+    echo "$inject" > "$mode_file"
 fi
 
 qemu_common=(
