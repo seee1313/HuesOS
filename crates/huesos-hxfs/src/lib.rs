@@ -3538,7 +3538,8 @@ fn stage_e2_job_quota_round_trip() {
         assert!(false, "boot write must succeed: {:?}", e);
         return;
     }
-    let Ok(mut writer) = FixedHxfsWriter::<_, 16, 32, 64>::mount_with_policies(store, &[], &comps)
+    let Ok(mut writer) =
+        FixedHxfsWriter::<_, 16, 32, 64>::mount_with_policies(store, &[], &comps, None)
     else {
         assert!(false, "writer mount must succeed");
         return;
@@ -3588,7 +3589,8 @@ fn stage_e2_job_quota_round_trip() {
         assert!(false, "remount image write must succeed: {:?}", e);
         return;
     }
-    let Ok(mut fs) = FixedHxfsWriter::<_, 16, 32, 64>::mount_with_policies(remount, &[], &comps)
+    let Ok(mut fs) =
+        FixedHxfsWriter::<_, 16, 32, 64>::mount_with_policies(remount, &[], &comps, None)
     else {
         assert!(false, "remount must succeed");
         return;
@@ -3618,7 +3620,8 @@ fn stage_e2_scrub_all_reports_clean() {
         assert!(false, "boot write must succeed: {:?}", e);
         return;
     }
-    let Ok(mut writer) = FixedHxfsWriter::<_, 16, 32, 512>::mount_with_policies(store, &[], &comps)
+    let Ok(mut writer) =
+        FixedHxfsWriter::<_, 16, 32, 512>::mount_with_policies(store, &[], &comps, None)
     else {
         assert!(false, "writer mount must succeed");
         return;

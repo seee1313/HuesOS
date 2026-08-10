@@ -2270,18 +2270,67 @@ impl<
     }
 
     fn insert_extent(&mut self, extent: FixedExtent) -> FixedResult<()> {
-        let mut slot = None;
+        // Phase-2 (B): sorted insertion instead of insert-then-bubble.
+        // The old path ran a full bubble sort on EVERY insert, making
+        // a 4096-extent file O(n^2) per write and O(n^3) overall
+        // (~68 billion compares) - the reason on-target files were
+        // capped at 4 MiB. Inserting at the sorted position is O(n)
+        // per write (shift at most one contiguous block of slots).
+        let object_id = extent.object_id;
+        let mut pos = self.extents.len();
+        let mut free = self.extents.len();
         let mut index = 0usize;
         while index < self.extents.len() {
-            if self.extents[index].is_none() && slot.is_none() {
-                slot = Some(index);
+            match self.extents[index] {
+                Some(e)
+                    if e.object_id == object_id
+                        && e.extent.logical_block > extent.extent.logical_block =>
+                {
+                    pos = index;
+                    break;
+                }
+                Some(_) => {}
+                None => {
+                    if free == self.extents.len() {
+                        free = index;
+                    }
+                }
             }
             index += 1;
         }
-        let slot = slot.ok_or(HxfsError::NoSpace)?;
-        self.extents[slot] = Some(extent);
-        self.sort_extents(extent.object_id);
-        self.update_file_record_count(extent.object_id)?;
+        // Find the last occupied slot.
+        let mut last = self.extents.len();
+        let mut i = self.extents.len();
+        while i > 0 {
+            i -= 1;
+            if self.extents[i].is_some() {
+                last = i;
+                break;
+            }
+        }
+        if last == self.extents.len() {
+            // Empty array.
+            self.extents[0] = Some(extent);
+        } else if pos == self.extents.len() {
+            // New extent is the largest for its object: place it in
+            // the first free slot (must exist).
+            if free == self.extents.len() {
+                return Err(HxfsError::NoSpace);
+            }
+            self.extents[free] = Some(extent);
+        } else {
+            // Insert before `pos`, shifting [pos..=last] right by one.
+            if last + 1 >= self.extents.len() {
+                return Err(HxfsError::NoSpace);
+            }
+            let mut j = last + 1;
+            while j > pos {
+                self.extents[j] = self.extents[j - 1];
+                j -= 1;
+            }
+            self.extents[pos] = Some(extent);
+        }
+        self.update_file_record_count(object_id)?;
         Ok(())
     }
 
@@ -3736,20 +3785,6 @@ impl<
             i += 1;
         }
     }
-
-    fn sort_extents(&mut self, object_id: u64) {
-        let mut i = 0usize;
-        while i < self.extents.len() {
-            let mut j = i + 1;
-            while j < self.extents.len() {
-                if should_swap_extent(self.extents[i], self.extents[j], object_id) {
-                    self.extents.swap(i, j);
-                }
-                j += 1;
-            }
-            i += 1;
-        }
-    }
 }
 
 impl FixedDirEntry {
@@ -3770,18 +3805,6 @@ fn should_swap_dir(a: Option<FixedDirEntry>, b: Option<FixedDirEntry>, parent: u
             left.name_bytes() > right.name_bytes()
         }
         (None, Some(right)) if right.parent_object_id == parent => true,
-        _ => false,
-    }
-}
-
-fn should_swap_extent(a: Option<FixedExtent>, b: Option<FixedExtent>, object_id: u64) -> bool {
-    match (a, b) {
-        (Some(left), Some(right))
-            if left.object_id == object_id && right.object_id == object_id =>
-        {
-            left.extent.logical_block > right.extent.logical_block
-        }
-        (None, Some(right)) if right.object_id == object_id => true,
         _ => false,
     }
 }

@@ -93,7 +93,7 @@ const POLL_BUF_BYTES: usize = 256;
 // service runtime), tracked separately.
 const SERVICE_MAX_OBJECTS: usize = 32;
 const SERVICE_MAX_DIR_ENTRIES: usize = 32;
-const SERVICE_MAX_EXTENTS: usize = 1100;
+const SERVICE_MAX_EXTENTS: usize = 4200;
 // The qemu-nvme-boot namespace is exposed with a 512-byte LBA while
 // Hxfs internally works in 4 KiB blocks. The
 // `libcanvas::block::BlockDevice` wire protocol speaks 512-byte LBAs,
@@ -172,14 +172,14 @@ struct DirEndpoint {
 }
 
 struct HxfsRuntime {
-    fs: MountedHxfs,
+    fs: Box<MountedHxfs>,
     clients: [Option<Channel>; MAX_CLIENTS],
     files: [Option<FileEndpoint>; MAX_FILE_HANDLES],
     dirs: [Option<DirEndpoint>; MAX_DIR_HANDLES],
 }
 
 impl HxfsRuntime {
-    fn new(fs: MountedHxfs) -> Self {
+    fn new(fs: Box<MountedHxfs>) -> Self {
         Self {
             fs,
             clients: [const { None }; MAX_CLIENTS],
@@ -252,6 +252,10 @@ impl HxfsRuntime {
     fn handle_client_request(&mut self, index: usize, request: &[u8]) {
         if let Some((native, payload)) = decode_native_message(request) {
             self.handle_client_native(index, native, payload);
+            return;
+        }
+        #[cfg(feature = "synthetic-key")]
+        if self.handle_blob_command(index, request) {
             return;
         }
         if request == b"ROOT" || request == b"OPEN_DIR /" {
@@ -1256,7 +1260,7 @@ impl HxfsRuntime {
     }
 }
 
-fn mount_from_bootstrap(bootstrap: &Channel) -> Option<MountedHxfs> {
+fn mount_from_bootstrap(bootstrap: &Channel) -> Option<Box<MountedHxfs>> {
     let mut buf = [0u8; 64];
     loop {
         match bootstrap.read_optional_handle(&mut buf) {
@@ -1318,7 +1322,7 @@ fn mount_from_bootstrap(bootstrap: &Channel) -> Option<MountedHxfs> {
                     }
                 };
                 match mounted {
-                    Ok(fs) => return Some(fs),
+                    Ok(fs) => return Some(Box::new(fs)),
                     Err(error) => {
                         println!("[hxfs] mount failed: {:?}", error);
                         return None;
@@ -1642,6 +1646,26 @@ fn run_reliability_checks(fs: &mut MountedHxfs) {
         }
         Err(error) => println!("[hxfs] quota-probe-failed (create {:?})", error),
     }
+    // Lift the probe quota so later checks (Hxblob) are not capped
+    // by the temporary 8 KiB limit.
+    let _ = fs.set_quota_limits(0, 0);
+    // Stage F (Phase-2 A): Hxblob round-trip through the object
+    // store on target. A small payload is stored by content hash
+    // and read back byte-for-byte; this exercises put_blob /
+    // get_blob (and the SHA-256 hashing) in the production service.
+    {
+        let payload = b"Hxblob on-target object store round-trip 0123456789\n".repeat(8);
+        match fs.put_blob(&payload) {
+            Ok(hash) => match fs.get_blob(&hash) {
+                Ok(got) if got == payload => {
+                    println!("[hxfs] stage-f-blob-ok");
+                }
+                Ok(_) => println!("[hxfs] stage-f-blob: mismatch"),
+                Err(error) => println!("[hxfs] stage-f-blob: get failed ({:?})", error),
+            },
+            Err(error) => println!("[hxfs] stage-f-blob: put failed ({:?})", error),
+        }
+    }
 }
 
 /// Phase-1 follow-up: prove the write pipeline on target.
@@ -1786,12 +1810,12 @@ fn write_roundtrip_check(fs: &mut MountedHxfs) {
     // of fixed arrays) and then moved into the heap-backed runtime;
     // a larger on-target file needs the O(n^2) extent sort replaced.
     {
-        const BIG_CHUNKS: usize = 1024;
+        const BIG_CHUNKS: usize = 4096;
         const BIG_FILE: &str = "probe-big.bin";
         match fs.create_file_child(root, BIG_FILE) {
             Ok(file) => {
                 let mut chunk = [0u8; 4096];
-                let line: &[u8] = b"HuesOS 4MiB Stage E probe 0123456789\n";
+                let line: &[u8] = b"HuesOS 16MiB Stage E probe 0123456789\n";
                 let mut chunk_index = 0usize;
                 while chunk_index < BIG_CHUNKS {
                     chunk[0..8].copy_from_slice(&chunk_index.to_le_bytes());
@@ -1837,7 +1861,7 @@ fn write_roundtrip_check(fs: &mut MountedHxfs) {
                             index += 1;
                         }
                         if ok {
-                            println!("[hxfs] stage-e-4mib-ok");
+                            println!("[hxfs] stage-e-16mib-ok");
                         } else {
                             println!("[hxfs] stage-e-write: verify failed at {index}");
                         }
@@ -1848,6 +1872,108 @@ fn write_roundtrip_check(fs: &mut MountedHxfs) {
             }
             Err(error) => println!("[hxfs] stage-e-write: create failed ({:?})", error),
         }
+    }
+}
+
+// Stage F (Phase-2 A): Hxblob object-store commands over the text
+// protocol. PUT_BLOB <hex> stores the decoded bytes and replies
+// with the hex content hash; GET_BLOB <hex-hash> replies with the
+// hex payload; LIST_BLOBS replies with the hex hashes, one per
+// line. The blob API is host-tested; these commands make it usable
+// from userspace (and from the soak harness).
+#[cfg(feature = "synthetic-key")]
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+#[cfg(feature = "synthetic-key")]
+fn hex_decode(input: &[u8]) -> Option<alloc::vec::Vec<u8>> {
+    if !input.len().is_multiple_of(2) {
+        return None;
+    }
+    let mut out = alloc::vec::Vec::with_capacity(input.len() / 2);
+    let mut index = 0usize;
+    while index < input.len() {
+        let hi = hex_value(input[index])?;
+        let lo = hex_value(input[index + 1])?;
+        out.push((hi << 4) | lo);
+        index += 2;
+    }
+    Some(out)
+}
+
+#[cfg(feature = "synthetic-key")]
+fn hex_encode(bytes: &[u8]) -> alloc::string::String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = alloc::string::String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
+}
+
+impl HxfsRuntime {
+    /// Stage F (Phase-2 A): handle one Hxblob text command.
+    #[cfg(feature = "synthetic-key")]
+    fn handle_blob_command(&mut self, index: usize, request: &[u8]) -> bool {
+        if let Some(rest) = strip_prefix(request, b"PUT_BLOB ") {
+            let Some(data) = hex_decode(rest) else {
+                self.write_client(index, b"err:bad-hex");
+                return true;
+            };
+            match self.fs.put_blob(&data) {
+                Ok(hash) => {
+                    let reply = hex_encode(&hash);
+                    println!("[hxfs] blob-put hash={}", reply);
+                    self.write_client(index, reply.as_bytes());
+                }
+                Err(e) => {
+                    println!("[hxfs] blob-put failed: {:?}", e);
+                    self.write_client(index, b"err:blob-put");
+                }
+            }
+            return true;
+        }
+        if let Some(rest) = strip_prefix(request, b"GET_BLOB ") {
+            let Some(hash) = hex_decode(rest) else {
+                self.write_client(index, b"err:bad-hex");
+                return true;
+            };
+            if hash.len() != 32 {
+                self.write_client(index, b"err:bad-hash");
+                return true;
+            }
+            let mut hash_bytes = [0u8; 32];
+            hash_bytes.copy_from_slice(&hash);
+            match self.fs.get_blob(&hash_bytes) {
+                Ok(data) => {
+                    let reply = hex_encode(&data);
+                    println!("[hxfs] blob-get bytes={}", data.len());
+                    self.write_client(index, reply.as_bytes());
+                }
+                Err(e) => {
+                    println!("[hxfs] blob-get failed: {:?}", e);
+                    self.write_client(index, b"err:not-found");
+                }
+            }
+            return true;
+        }
+        if request == b"LIST_BLOBS" {
+            let mut reply = alloc::string::String::new();
+            for hash in self.fs.list_blobs() {
+                reply.push_str(&hex_encode(&hash));
+                reply.push('\n');
+            }
+            self.write_client(index, reply.as_bytes());
+            return true;
+        }
+        false
     }
 }
 
