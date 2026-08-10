@@ -258,6 +258,23 @@ impl HxfsRuntime {
             self.return_dir(index, self.fs.root_directory());
             return;
         }
+        if request == b"STATS" {
+            // Stage E (Operations): observation surface. Prints a
+            // one-line JSON-ish summary so an operator (or the
+            // soak harness) can see mount-time health: bad extents
+            // marked, scrub result, quota limits.
+            let scrub = self.fs.scrub().map(|s| s.errors).unwrap_or(u64::MAX);
+            let fsck = self.fs.fsck();
+            println!(
+                "[hxfs] stats bad_extents={} scrub_errors={} fsck_checks={} fsck_errors={}",
+                self.fs.bad_extent_count(),
+                scrub,
+                fsck.checks,
+                fsck.errors
+            );
+            self.write_client(index, b"stats-ok");
+            return;
+        }
         if is_odirect_deny(request) {
             // Stage B.4: text-protocol equivalent of the
             // native `request_flags::O_DIRECT` deny. The
