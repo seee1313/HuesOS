@@ -1646,12 +1646,13 @@ fn run_boot_self_check(fs: &mut MountedHxfs) {
         }
     }
     // Phase-2 packages: a package-sized blob round-trips through
-    // put_blob / get_blob. Sized 3072 bytes: a full 4096-byte
-    // single-block blob currently faults on target in the read path
-    // (see known issue; multi-block files read fine, so this is not
-    // a storage blocker) - 3072 exercises the same package path.
+    // put_blob / get_blob. A full 4096-byte single-block blob used
+    // to fault on target (the userspace allocator reused a too-small
+    // freed block for the read buffer and the chunked fill wrote
+    // past it); huesos-user-alloc now has a size-aware free list, so
+    // 4096 bytes - the full single-block size - is the probe.
     {
-        let mut payload = alloc::vec![0u8; 3072];
+        let mut payload = alloc::vec![0u8; 4096];
         let mut i = 0usize;
         while i < payload.len() {
             payload[i] = (i as u8).wrapping_mul(7).wrapping_add(3);
@@ -1680,6 +1681,53 @@ fn run_boot_self_check(fs: &mut MountedHxfs) {
                 Err(error) => println!("[hxfs] stage-f-blob-big: get failed ({:?})", error),
             },
             Err(error) => println!("[hxfs] stage-f-blob-big: put failed ({:?})", error),
+        }
+    }
+    // Phase-2 packages (step 3): WAD content delivery from the
+    // object store. The seed stored a WAD header blob and recorded
+    // its hash in 'wad.hash'; we fetch the blob chunked and verify
+    // the IWAD magic - proving package-style content is delivered
+    // from Hxblob on target.
+    {
+        let root = fs.root_directory();
+        if let Ok(file) = fs.open_child_file(root, "wad.hash") {
+            let mut hash_text = [0u8; 128];
+            match fs.read_file(file, &mut hash_text) {
+                Ok(n) => {
+                    let text = hash_text[..n]
+                        .iter()
+                        .take_while(|&&b| b != b'\n' && b != b' ')
+                        .copied()
+                        .collect::<alloc::vec::Vec<u8>>();
+                    if let Some(hash) = hex_decode(&text) {
+                        if hash.len() == 32 {
+                            let mut hash_bytes = [0u8; 32];
+                            hash_bytes.copy_from_slice(&hash);
+                            match fs.get_blob(&hash_bytes) {
+                                Ok(wad) => {
+                                    let is_wad = wad.len() >= 4
+                                        && wad[0] == b'I'
+                                        && wad[1] == b'W'
+                                        && wad[2] == b'A'
+                                        && wad[3] == b'D';
+                                    println!(
+                                        "[hxfs] stage-f-wad: {} bytes magic={}",
+                                        wad.len(),
+                                        if is_wad { "IWAD" } else { "bad" }
+                                    );
+                                    if is_wad {
+                                        println!("[hxfs] stage-f-wad-ok");
+                                    }
+                                }
+                                Err(error) => {
+                                    println!("[hxfs] stage-f-wad: get failed ({:?})", error)
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(error) => println!("[hxfs] stage-f-wad: read hash failed ({:?})", error),
+            }
         }
     }
 
@@ -2192,7 +2240,24 @@ impl HxfsRuntime {
 }
 
 #[panic_handler]
-fn panic(_info: &PanicInfo) -> ! {
-    libcanvas::debug::write_str("[hxfs] PANIC\n");
+fn panic(info: &PanicInfo) -> ! {
+    use core::fmt::Write;
+    // Full panic info (message + source location) to the debug
+    // console: the soak harness needs to see WHY the service died,
+    // not just that it did.
+    let _ = writeln!(libcanvas::debug::DebugWriter, "[hxfs] PANIC: {info:?}");
+    // Allocator diagnostics: if the panic is an OOM this shows how
+    // full the bump region was and whether the free list still has
+    // reusable blocks.
+    let state = HEAP.debug_state();
+    let _ = writeln!(
+        libcanvas::debug::DebugWriter,
+        "[hxfs] heap: used={} last_oom={} free_list_len={} bump8192={} freed8192={}",
+        state.bump_used_bytes,
+        state.last_oom_size,
+        state.free_list_len,
+        state.bump_8192_count,
+        state.freed_8192_count
+    );
     libcanvas::process::exit(-1);
 }

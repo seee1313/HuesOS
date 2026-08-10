@@ -3057,6 +3057,48 @@ impl<
         block_offset: u64,
         out: &mut [u8; BLOCK_SIZE],
     ) -> FixedResult<()> {
+        // Two-slot extent: one logical block spans two encrypted
+        // envelopes (`EXTENT_FLAG_MULTI_SLOT`, `block_count = 2`).
+        // The single-slot path below would silently return only
+        // slot 0 - the tail of the logical block would read back as
+        // envelope padding instead of the second slot's plaintext.
+        // Concatenate both slots exactly like `copy_extent` does.
+        #[cfg(feature = "crypto-aes-gcm")]
+        if extent.flags & EXTENT_FLAG_MULTI_SLOT != 0 {
+            if block_offset != 0 {
+                return Err(HxfsError::OutOfRange);
+            }
+            if self.extent_key.is_none() {
+                // A two-slot record on a volume without a key is a
+                // corrupt volume, not raw split plaintext.
+                return Err(HxfsError::BadTree);
+            }
+            let mut slot0 = [0u8; BLOCK_SIZE];
+            let mut slot1 = [0u8; BLOCK_SIZE];
+            self.store
+                .read_blocks(extent.physical_block, 1, &mut slot0)?;
+            self.store
+                .read_blocks(extent.physical_block + 1, 1, &mut slot1)?;
+            let mut dec0 = [0u8; BLOCK_SIZE];
+            let mut dec1 = [0u8; BLOCK_SIZE];
+            let plain0 =
+                self.decrypt_extent_block_if_encrypted(extent.physical_block, &slot0, &mut dec0)?;
+            let plain1 = self.decrypt_extent_block_if_encrypted(
+                extent.physical_block + 1,
+                &slot1,
+                &mut dec1,
+            )?;
+            let tail = BLOCK_SIZE - crate::extent_crypto::EXTENT_PLAINTEXT_BYTES;
+            out[..crate::extent_crypto::EXTENT_PLAINTEXT_BYTES]
+                .copy_from_slice(&plain0[..crate::extent_crypto::EXTENT_PLAINTEXT_BYTES]);
+            out[crate::extent_crypto::EXTENT_PLAINTEXT_BYTES..].copy_from_slice(&plain1[..tail]);
+            return Ok(());
+        }
+        #[cfg(not(feature = "crypto-aes-gcm"))]
+        if extent.flags & EXTENT_FLAG_MULTI_SLOT != 0 {
+            // Two-slot extents are an encrypted-volume concept.
+            return Err(HxfsError::BadTree);
+        }
         let mut scratch = [0u8; BLOCK_SIZE];
         let mut decrypted = [0u8; BLOCK_SIZE];
         self.store

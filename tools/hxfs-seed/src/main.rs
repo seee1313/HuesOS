@@ -631,7 +631,6 @@ fn main() {
 
     // Phase-2 packages: optionally store an extra file (ELF/WAD) as
     // an Hxblob object so userspace can fetch it by content hash.
-    let mut blob_hash_hex = String::new();
     if let Some(blob_path) = &args.seed_blob_file {
         let data = match std::fs::read(blob_path) {
             Ok(data) => data,
@@ -639,12 +638,20 @@ fn main() {
         };
         match writer.put_blob(&data) {
             Ok(hash) => {
-                blob_hash_hex = hex_encode(&hash);
+                let blob_hash_hex = hex_encode(&hash);
                 println!(
                     "[hxfs-seed] stored blob {} ({} bytes)",
                     blob_hash_hex,
                     data.len()
                 );
+                // Phase-2 packages: record the hash in a small text
+                // file on the volume so the service (or any client)
+                // can look the blob up without knowing it a priori.
+                let root = writer.root_directory();
+                if let Ok(info_file) = writer.create_file_child(root, "wad.hash") {
+                    let info = format!("{}\n", blob_hash_hex);
+                    let _ = writer.write_file_at(info_file, 0, info.as_bytes());
+                }
             }
             Err(e) => fail(&format!("put_blob failed: {e:?}")),
         }
