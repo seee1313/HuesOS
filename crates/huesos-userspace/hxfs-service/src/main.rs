@@ -93,7 +93,7 @@ const POLL_BUF_BYTES: usize = 256;
 // service runtime), tracked separately.
 const SERVICE_MAX_OBJECTS: usize = 32;
 const SERVICE_MAX_DIR_ENTRIES: usize = 32;
-const SERVICE_MAX_EXTENTS: usize = 4096;
+const SERVICE_MAX_EXTENTS: usize = 4200;
 // The qemu-nvme-boot namespace is exposed with a 512-byte LBA while
 // Hxfs internally works in 4 KiB blocks. The
 // `libcanvas::block::BlockDevice` wire protocol speaks 512-byte LBAs,
@@ -172,14 +172,14 @@ struct DirEndpoint {
 }
 
 struct HxfsRuntime {
-    fs: MountedHxfs,
+    fs: Box<MountedHxfs>,
     clients: [Option<Channel>; MAX_CLIENTS],
     files: [Option<FileEndpoint>; MAX_FILE_HANDLES],
     dirs: [Option<DirEndpoint>; MAX_DIR_HANDLES],
 }
 
 impl HxfsRuntime {
-    fn new(fs: MountedHxfs) -> Self {
+    fn new(fs: Box<MountedHxfs>) -> Self {
         Self {
             fs,
             clients: [const { None }; MAX_CLIENTS],
@@ -1256,7 +1256,7 @@ impl HxfsRuntime {
     }
 }
 
-fn mount_from_bootstrap(bootstrap: &Channel) -> Option<MountedHxfs> {
+fn mount_from_bootstrap(bootstrap: &Channel) -> Option<Box<MountedHxfs>> {
     let mut buf = [0u8; 64];
     loop {
         match bootstrap.read_optional_handle(&mut buf) {
@@ -1318,7 +1318,7 @@ fn mount_from_bootstrap(bootstrap: &Channel) -> Option<MountedHxfs> {
                     }
                 };
                 match mounted {
-                    Ok(fs) => return Some(fs),
+                    Ok(fs) => return Some(Box::new(fs)),
                     Err(error) => {
                         println!("[hxfs] mount failed: {:?}", error);
                         return None;

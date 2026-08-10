@@ -672,7 +672,11 @@ pub const USER_STACK_TOP: u64 = 0x0000_7fff_ff00_0000;
 /// probe buffers on top of the mount chain); its first on-target
 /// write round-trip faulted ~62 KiB deep. The mapping is virtual
 /// reservation, so 128 KiB is cheap for every process.
-pub const USER_STACK_SIZE: u64 = 4096 * 128;
+pub const USER_STACK_SIZE: u64 = 4096 * 256;
+// 1 MiB: the hxfs-service mount frame constructs the writer (4096
+// extents ~ 262 KiB) on the stack before moving it to the heap, and
+// the load/crypto frames sit on top; 512 KiB overflowed on target.
+// Virtual reservation, cheap for every process.
 // 512 KiB: the hxfs-service mount frame carries the writer's fixed
 // arrays (~80 KiB at 1024 extents) plus the crypto read/write
 // frames on the boot call chain; 256 KiB overflowed on target
