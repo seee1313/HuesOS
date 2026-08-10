@@ -142,6 +142,12 @@ pub fn object_init() {
     huesos_object::init();
     huesos_object::set_phys_to_virt(|p| huesos_arch::paging::phys_to_virt(p).as_u64());
     huesos_object::set_cpu_id_callback(|| unsafe { huesos_arch::cpu_local::current_cpu_index() });
+    // Stage D bootloader key blob: install the build-time volume
+    // key (HUESOS_VOLUME_KEY_HEX) before any userspace process can
+    // call VolumeKeyGet. None on plain builds.
+    if let Some(key) = crate::boot_key::BOOT_VOLUME_KEY_BLOB {
+        huesos_object::boot_key::set_boot_volume_key(key);
+    }
 }
 
 pub fn framebuffer_init(fb: Option<crate::FramebufferInfo>) {

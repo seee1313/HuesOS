@@ -28,6 +28,14 @@ elif [[ "$inject" == "2" ]]; then
     export HUESOS_HXFS_SERVICE_FEATURES=synthetic-key
     seed_args=(--inject-bad-crc)
 fi
+if [[ "$inject" == "1" || "$inject" == "2" ]]; then
+    # Stage D: the synthetic volume key is baked into the KERNEL as
+    # the bootloader key blob (single source of truth: the seed
+    # tool's --print-volume-key-hex). The service receives it via
+    # the VolumeKeyGet syscall; without it an encrypted volume
+    # cannot mount, which is the security gate.
+    export HUESOS_VOLUME_KEY_HEX="$(bash tools/hxfs-seed.sh --print-volume-key-hex)"
+fi
 case "$profile" in
     release) CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-1}" make iso-release >/tmp/huesos-nvme-soak-build.log ;;
     debug) CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-1}" make iso PROFILE=debug >/tmp/huesos-nvme-soak-build.log ;;

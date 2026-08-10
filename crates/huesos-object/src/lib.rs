@@ -28,6 +28,8 @@ mod vmar;
 mod vmo;
 pub mod wait;
 
+pub mod boot_key;
+
 pub use acpi_broker::{AcpiBroker, PciFunctionGrant, SystemIoGrant};
 pub use channel::{
     Channel, ChannelCreateError, ChannelMessage, ChannelRecvError, ChannelSendError,

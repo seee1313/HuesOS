@@ -1,22 +1,38 @@
 //! Test-only synthetic key context shared by the image seeding
-//! tool (`tools/hxfs-seed`) and the `hxfs-service` boot self-check
-//! (Stage B.5).
+//! tool (`tools/hxfs-seed`), the kernel boot key blob and the
+//! `hxfs-service` boot self-check (Stage B.5 / Stage D).
 //!
-//! Stage B exercises the full encrypted + compressed I/O pipeline
-//! on target with a synthetic key context. The AEAD IKM is a
-//! documented developer placeholder derived from the volume's
-//! `instance_uuid` at mount time (see `Hxfs::mount_with_keys`), so
-//! the only state the mount path needs from the caller is the
-//! policy table below — there is no secret material to carry.
+//! The AEAD IKM is an explicit 32-byte volume key
+//! ([`VOLUME_KEY`]): the seed tool writes the volume with it, the
+//! soak harness exports its hex to the kernel build
+//! (`HUESOS_VOLUME_KEY_HEX`, see `huesos-kernel/build.rs`), the
+//! kernel serves it through the `VolumeKeyGet` syscall, and the
+//! service passes it to `mount_with_keys`. There is no implicit
+//! placeholder key material in the library anymore: an encrypted
+//! volume without a key context is rejected with
+//! `EncryptedVolumeKeyUnavailable`.
 //!
-//! **This module is test wiring only.** The Stage D TPM-backed
-//! KeyProvider replaces both the placeholder IKM and these
-//! descriptors in the production boot path; nothing in this
-//! module is reachable from a default (non-`crypto-aes-gcm`)
-//! build.
+//! **This module is test wiring only.** The Stage D production
+//! KeyProvider derives the real volume key from the bootloader /
+//! TPM; nothing in this module is reachable from a default
+//! (non-`crypto-aes-gcm`) build.
 
 use crate::compression::CompressionPolicy;
 use crate::crypto::EncryptionPolicy;
+
+/// The synthetic volume key (32 bytes) shared by the seed tool,
+/// the kernel boot blob and the service's test wiring.
+///
+/// Developer test material only; the production key comes from the
+/// bootloader/TPM key path (Stage D). The soak harness derives
+/// `HUESOS_VOLUME_KEY_HEX` from this constant via
+/// `hxfs-seed --print-volume-key-hex`, so the kernel blob and the
+/// volume on disk always agree.
+pub const VOLUME_KEY: [u8; 32] = [
+    0x53, 0x59, 0x4e, 0x54, 0x48, 0x45, 0x54, 0x49, // "SYNTHETI"
+    0x43, 0x5f, 0x4b, 0x45, 0x59, 0x5f, 0x33, 0x32, // "C_KEY_32"
+    0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff,
+];
 
 /// Encryption policy id used by synthetic-key volumes.
 pub const POLICY_ID: u32 = 7;

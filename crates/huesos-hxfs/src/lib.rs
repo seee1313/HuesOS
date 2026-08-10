@@ -179,7 +179,7 @@ impl<R: BlockReader> Hxfs<R> {
     /// [`Hxfs::mount_with_keys`] for callers that know the
     /// volume is plain.
     pub fn mount(reader: R) -> Result<Self, HxfsError> {
-        Self::mount_with_keys(reader, &[])
+        Self::mount_with_keys(reader, &[], None)
     }
 
     /// Mount a read-only Hxfs instance, resolving the system
@@ -220,10 +220,20 @@ impl<R: BlockReader> Hxfs<R> {
     /// because the software AES-XTS engine linked into this
     /// crate is the key provider; a future revision with a
     /// real TPM will thread the predicate through here.
+    ///
+    /// `volume_key` (Stage D): the 32-byte volume key provided by
+    /// the bootloader/kernel key path. An encrypted volume
+    /// REQUIRES a key context: `None` is rejected with
+    /// [`HxfsError::EncryptedVolumeKeyUnavailable`] — there is no
+    /// implicit placeholder key material anymore. Plain volumes
+    /// ignore the argument.
     pub fn mount_with_keys(
         mut reader: R,
         encryption_policies: &[crypto::EncryptionPolicy],
+        volume_key: Option<&[u8; 32]>,
     ) -> Result<Self, HxfsError> {
+        #[cfg(not(feature = "crypto-aes-gcm"))]
+        let _ = volume_key;
         let superblock = read_superblock(&mut reader, 0)?;
         if superblock.root_state != ROOT_STATE_CLEAN
             || superblock.journal_start_lba != 0
@@ -238,64 +248,38 @@ impl<R: BlockReader> Hxfs<R> {
         )?;
         let system_volume = read_system_volume(&mut reader, checkpoint)?;
         let encryption = resolve_mount_encryption(&system_volume, encryption_policies)?;
-        // Stage B.1 wire: derive the per-volume metadata subkey
-        // when the volume is encrypted. The MVP uses the
-        // superblock's `instance_uuid` as the HKDF salt; the
-        // subkey is held in RAM for the lifetime of the mount
-        // and zeroized on drop. A future Stage D KeyProvider
-        // will supply the IKM through a kernel handle; for now
-        // the IKM is a fixed developer-only zero-key and the
-        // volume is only mountable from host tests.
+        // Stage D: derive the per-volume AEAD subkeys from the
+        // caller-supplied volume key (the bootloader/kernel key
+        // path). An encrypted volume without a key context is
+        // rejected up front — the old implicit instance-uuid
+        // placeholder IKM is gone. The subkeys are held in RAM for
+        // the lifetime of the mount and zeroized on drop; the HKDF
+        // salt is the superblock's `instance_uuid` so two volumes
+        // with the same volume key still get distinct subkeys.
         #[cfg(feature = "crypto-aes-gcm")]
         let metadata_key = if encryption.is_some() {
-            let mut ikm = [0u8; 32];
-            // Mix the instance UUID into the IKM so two volumes
-            // with the same superblock GUID family still get
-            // distinct subkeys. This is a development-only
-            // placeholder: the real IKM is supplied by the
-            // Stage D KeyProvider through the kernel handle.
-            let mut index = 0usize;
-            while index < 16 {
-                ikm[index] = superblock.instance_uuid[index];
-                ikm[index + 16] = superblock.instance_uuid[index];
-                index += 1;
-            }
+            let ikm = volume_key.ok_or(HxfsError::EncryptedVolumeKeyUnavailable)?;
             let mut key = [0u8; 32];
             encrypted_metadata::derive_metadata_key_for_volume(
-                &ikm,
+                ikm,
                 &superblock.instance_uuid,
                 &mut key,
             )
             .map_err(|_| HxfsError::EncryptedPolicyInvalid)?;
-            // Zeroize the IKM scratch; it is short-lived and
-            // does not need to live in the struct.
-            for byte in ikm.iter_mut() {
-                *byte = 0;
-            }
             Some(key)
         } else {
             None
         };
-        // Stage B.3 wire: derive the per-volume extent subkey
-        // from the same placeholder IKM. The extent subkey is
-        // independent of the metadata subkey (different HKDF
-        // info string) so a metadata-key leak does not also
-        // leak data extents.
+        // Stage B.3 wire: derive the per-volume extent subkey from
+        // the same volume key. The extent subkey is independent of
+        // the metadata subkey (different HKDF info string) so a
+        // metadata-key leak does not also leak data extents.
         #[cfg(feature = "crypto-aes-gcm")]
         let extent_key = if encryption.is_some() {
-            let mut ikm = [0u8; 32];
-            let mut index = 0usize;
-            while index < 16 {
-                ikm[index] = superblock.instance_uuid[index];
-                ikm[index + 16] = superblock.instance_uuid[index];
-                index += 1;
-            }
+            let ikm = volume_key.ok_or(HxfsError::EncryptedVolumeKeyUnavailable)?;
             let mut key = [0u8; 32];
-            extent_crypto::derive_extent_key_for_volume(&ikm, &superblock.instance_uuid, &mut key)
+            extent_crypto::derive_extent_key_for_volume(ikm, &superblock.instance_uuid, &mut key)
                 .map_err(|_| HxfsError::EncryptedPolicyInvalid)?;
-            for byte in ikm.iter_mut() {
-                *byte = 0;
-            }
             Some(key)
         } else {
             None
@@ -325,8 +309,9 @@ impl<R: BlockReader> Hxfs<R> {
         reader: R,
         encryption_policies: &[crypto::EncryptionPolicy],
         compression_policies: &[compression::CompressionPolicy],
+        volume_key: Option<&[u8; 32]>,
     ) -> Result<Self, HxfsError> {
-        let mut mounted = Self::mount_with_keys(reader, encryption_policies)?;
+        let mut mounted = Self::mount_with_keys(reader, encryption_policies, volume_key)?;
         mounted.compression_policies = compression_policies.to_vec();
         Ok(mounted)
     }
@@ -2098,8 +2083,29 @@ mod tests {
         let image = build_image(true);
         let reader = SliceBlockReader::new(&image);
         assert_eq!(
-            Hxfs::mount_with_keys(reader, &[]).err(),
+            Hxfs::mount_with_keys(reader, &[], None).err(),
             Some(HxfsError::EncryptedPolicyUnknown)
+        );
+    }
+
+    /// Stage D: an encrypted volume with a resolvable policy but
+    /// NO key context must be rejected with
+    /// `EncryptedVolumeKeyUnavailable` — the implicit placeholder
+    /// IKM is gone.
+    #[cfg(feature = "crypto-aes-gcm")]
+    #[test]
+    fn encrypted_volume_without_key_context_is_rejected() {
+        let image = build_image(true);
+        let policy = crate::crypto::EncryptionPolicy {
+            policy_id: 7,
+            algorithm: crate::crypto::ALGORITHM_AES_XTS,
+            data_unit_bytes: crate::crypto::DATA_UNIT_BYTES_4K,
+            provider: crate::crypto::KeyProvider::TpmOrBootloader,
+        };
+        let reader = SliceBlockReader::new(&image);
+        assert_eq!(
+            Hxfs::mount_with_keys(reader, &[policy], None).err(),
+            Some(HxfsError::EncryptedVolumeKeyUnavailable)
         );
     }
 
@@ -2187,9 +2193,11 @@ fn b1_b2_encrypted_volume_write_then_read_round_trip() {
         provider: crate::crypto::KeyProvider::TpmOrBootloader,
     };
 
-    let Ok(mut writer) =
-        FixedHxfsWriter::<VecBlockStore, 16, 32, 32>::mount_with_keys(store, &[policy])
-    else {
+    let Ok(mut writer) = FixedHxfsWriter::<VecBlockStore, 16, 32, 32>::mount_with_keys(
+        store,
+        &[policy],
+        Some(&crate::synthetic_key::VOLUME_KEY),
+    ) else {
         assert!(false, "writer mount must succeed for encrypted volume");
         return;
     };
@@ -2274,7 +2282,9 @@ fn b1_b2_encrypted_volume_write_then_read_round_trip() {
     // UUID; the v6 block decrypts and the dirent name
     // decrypts into the plaintext `hello.txt`.
     let reader = SliceBlockReader::new(&image);
-    let Ok(mut fs) = Hxfs::mount_with_keys(reader, &[policy]) else {
+    let Ok(mut fs) =
+        Hxfs::mount_with_keys(reader, &[policy], Some(&crate::synthetic_key::VOLUME_KEY))
+    else {
         assert!(false, "remount with key must succeed");
         return;
     };
@@ -2586,7 +2596,10 @@ fn write_then_read_encrypted_compressed_volume() {
         return;
     }
     let Ok(mut writer) = FixedHxfsWriter::<RecordingStore, 16, 32, 256>::mount_with_policies(
-        store, &policies, &comps,
+        store,
+        &policies,
+        &comps,
+        Some(&crate::synthetic_key::VOLUME_KEY),
     ) else {
         assert!(
             false,
@@ -2702,7 +2715,12 @@ fn write_then_read_encrypted_compressed_volume() {
 
     // ---- Phase 3: remount and read back byte-for-byte ----
     let reader = SliceBlockReader::new(&image);
-    let Ok(mut fs) = Hxfs::mount_with_policies(reader, &policies, &comps) else {
+    let Ok(mut fs) = Hxfs::mount_with_policies(
+        reader,
+        &policies,
+        &comps,
+        Some(&crate::synthetic_key::VOLUME_KEY),
+    ) else {
         assert!(false, "remount with policies must succeed");
         return;
     };
@@ -2733,7 +2751,12 @@ fn write_then_read_encrypted_compressed_volume() {
     let flip = first_data_lba as usize * BLOCK_SIZE + 12 + 40;
     tampered[flip] ^= 0x01;
     let reader = SliceBlockReader::new(&tampered);
-    let Ok(mut fs) = Hxfs::mount_with_policies(reader, &policies, &comps) else {
+    let Ok(mut fs) = Hxfs::mount_with_policies(
+        reader,
+        &policies,
+        &comps,
+        Some(&crate::synthetic_key::VOLUME_KEY),
+    ) else {
         assert!(false, "tampered volume must still mount (metadata intact)");
         return;
     };
@@ -2773,9 +2796,12 @@ fn corrupted_compressed_plain_volume_fails_read_with_precise_error() {
         assert!(false, "boot write must succeed: {:?}", e);
         return;
     }
-    let Ok(mut writer) =
-        FixedHxfsWriter::<RecordingStore, 16, 32, 64>::mount_with_policies(store, &[], &comps)
-    else {
+    let Ok(mut writer) = FixedHxfsWriter::<RecordingStore, 16, 32, 64>::mount_with_policies(
+        store,
+        &[],
+        &comps,
+        None,
+    ) else {
         assert!(
             false,
             "writer mount must succeed for plain+compressed volume"
@@ -2847,7 +2873,7 @@ fn corrupted_compressed_plain_volume_fails_read_with_precise_error() {
     // no envelope, payload starts at block offset 0).
     image[first_lba * BLOCK_SIZE + 10] ^= 0x40;
     let reader = SliceBlockReader::new(&image);
-    let Ok(mut fs) = Hxfs::mount_with_policies(reader, &[], &comps) else {
+    let Ok(mut fs) = Hxfs::mount_with_policies(reader, &[], &comps, None) else {
         assert!(false, "tampered plain volume must still mount");
         return;
     };
@@ -2895,7 +2921,10 @@ fn incompressible_full_block_on_encrypted_volume_uses_two_slot_extent() {
         return;
     }
     let Ok(mut writer) = FixedHxfsWriter::<RecordingStore, 16, 32, 128>::mount_with_policies(
-        store, &policies, &comps,
+        store,
+        &policies,
+        &comps,
+        Some(&crate::synthetic_key::VOLUME_KEY),
     ) else {
         assert!(false, "writer mount must succeed");
         return;
@@ -2963,7 +2992,12 @@ fn incompressible_full_block_on_encrypted_volume_uses_two_slot_extent() {
     let image = store.inner.image().to_vec();
     // Reader round-trip: both writes must come back byte-for-byte.
     let reader = SliceBlockReader::new(&image);
-    let Ok(mut fs) = Hxfs::mount_with_policies(reader, &policies, &comps) else {
+    let Ok(mut fs) = Hxfs::mount_with_policies(
+        reader,
+        &policies,
+        &comps,
+        Some(&crate::synthetic_key::VOLUME_KEY),
+    ) else {
         assert!(false, "remount must succeed");
         return;
     };
@@ -3008,9 +3042,12 @@ fn stage_c_bad_extent_is_marked_and_fails_fast() {
         assert!(false, "boot write must succeed: {:?}", e);
         return;
     }
-    let Ok(mut writer) =
-        FixedHxfsWriter::<RecordingStore, 16, 32, 64>::mount_with_policies(store, &[], &comps)
-    else {
+    let Ok(mut writer) = FixedHxfsWriter::<RecordingStore, 16, 32, 64>::mount_with_policies(
+        store,
+        &[],
+        &comps,
+        None,
+    ) else {
         assert!(false, "writer mount must succeed");
         return;
     };
@@ -3117,9 +3154,12 @@ fn stage_c_scrub_reports_clean_and_corrupt() {
         assert!(false, "boot write must succeed: {:?}", e);
         return;
     }
-    let Ok(mut writer) =
-        FixedHxfsWriter::<RecordingStore, 16, 32, 64>::mount_with_policies(store, &[], &comps)
-    else {
+    let Ok(mut writer) = FixedHxfsWriter::<RecordingStore, 16, 32, 64>::mount_with_policies(
+        store,
+        &[],
+        &comps,
+        None,
+    ) else {
         assert!(false, "writer mount must succeed");
         return;
     };
@@ -3218,9 +3258,12 @@ fn stage_c_fsck_reports_clean_and_corrupt() {
         assert!(false, "boot write must succeed: {:?}", e);
         return;
     }
-    let Ok(mut writer) =
-        FixedHxfsWriter::<RecordingStore, 16, 32, 64>::mount_with_policies(store, &[], &comps)
-    else {
+    let Ok(mut writer) = FixedHxfsWriter::<RecordingStore, 16, 32, 64>::mount_with_policies(
+        store,
+        &[],
+        &comps,
+        None,
+    ) else {
         assert!(false, "writer mount must succeed");
         return;
     };
@@ -3287,9 +3330,12 @@ fn stage_e_16mib_file_uses_extent_tree_and_round_trips() {
         assert!(false, "boot write must succeed: {:?}", e);
         return;
     }
-    let Ok(mut writer) =
-        FixedHxfsWriter::<RecordingStore, 16, 32, 8192>::mount_with_policies(store, &[], &comps)
-    else {
+    let Ok(mut writer) = FixedHxfsWriter::<RecordingStore, 16, 32, 8192>::mount_with_policies(
+        store,
+        &[],
+        &comps,
+        None,
+    ) else {
         assert!(false, "writer mount must succeed");
         return;
     };
@@ -3329,7 +3375,7 @@ fn stage_e_16mib_file_uses_extent_tree_and_round_trips() {
     );
     // Reader round-trip.
     let reader = SliceBlockReader::new(&image);
-    let Ok(mut fs) = Hxfs::mount_with_policies(reader, &[], &comps) else {
+    let Ok(mut fs) = Hxfs::mount_with_policies(reader, &[], &comps, None) else {
         assert!(false, "remount must succeed");
         return;
     };
@@ -3393,9 +3439,12 @@ fn incompressible_fallback_round_trips_on_plain_volume() {
         assert!(false, "boot write must succeed: {:?}", e);
         return;
     }
-    let Ok(mut writer) =
-        FixedHxfsWriter::<RecordingStore, 16, 32, 64>::mount_with_policies(store, &[], &comps)
-    else {
+    let Ok(mut writer) = FixedHxfsWriter::<RecordingStore, 16, 32, 64>::mount_with_policies(
+        store,
+        &[],
+        &comps,
+        None,
+    ) else {
         assert!(
             false,
             "writer mount must succeed for plain+compressed volume"
@@ -3482,7 +3531,7 @@ fn incompressible_fallback_round_trips_on_plain_volume() {
         "random data must be stored plain (no compressed records)"
     );
     let reader = SliceBlockReader::new(&image);
-    let Ok(mut fs) = Hxfs::mount_with_policies(reader, &[], &comps) else {
+    let Ok(mut fs) = Hxfs::mount_with_policies(reader, &[], &comps, None) else {
         assert!(false, "remount must succeed");
         return;
     };

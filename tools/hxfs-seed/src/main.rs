@@ -206,10 +206,6 @@ impl FileStore {
     fn create(path: &std::path::Path, blocks: u64) -> Result<Self, String> {
         Self::open_with(path, blocks, true)
     }
-
-    fn open(path: &std::path::Path, blocks: u64) -> Result<Self, String> {
-        Self::open_with(path, blocks, false)
-    }
 }
 
 impl BlockReader for FileStore {
@@ -351,7 +347,10 @@ mod tests {
         let policies = [synthetic_key::encryption_policy()];
         let comps = [synthetic_key::compression_policy()];
         let mut writer = FixedHxfsWriter::<RecordingStore, 16, 32, 128>::mount_with_policies(
-            store, &policies, &comps,
+            store,
+            &policies,
+            &comps,
+            Some(&synthetic_key::VOLUME_KEY),
         )
         .expect("mount");
         let root = writer.root_directory();
@@ -406,7 +405,7 @@ mod tests {
 
         // Read-side remount (the host-test path).
         let reader = SliceBlockReader::new(&image);
-        let mut fs = Hxfs::mount_with_policies(reader, &policies, &comps).expect("mount");
+        let mut fs = Hxfs::mount_with_policies(reader, &policies, &comps, Some(&synthetic_key::VOLUME_KEY)).expect("mount");
         let file = fs.open_path("/seed.bin").expect("open seed.bin");
         let mut buf = [0u8; 4096];
         let n = fs.read_file(file, &mut buf).expect("read seed.bin");
@@ -434,7 +433,10 @@ mod tests {
             .write_blocks(0, blocks, &image)
             .expect("copy published image into remount store");
         let mut writer = FixedHxfsWriter::<RecordingStore, 16, 32, 128>::mount_with_policies(
-            store, &policies, &comps,
+            store,
+            &policies,
+            &comps,
+            Some(&synthetic_key::VOLUME_KEY),
         )
         .expect("writer remount of published image");
         let root = writer.root_directory();
@@ -458,7 +460,7 @@ mod tests {
         let policies = [synthetic_key::encryption_policy()];
         let comps = [synthetic_key::compression_policy()];
         // Metadata is intact: the volume must still mount.
-        let mut fs = Hxfs::mount_with_policies(reader, &policies, &comps).expect("mount");
+        let mut fs = Hxfs::mount_with_policies(reader, &policies, &comps, Some(&synthetic_key::VOLUME_KEY)).expect("mount");
         let file = fs.open_path("/seed.bin").expect("open seed.bin");
         let mut buf = [0u8; 4096];
         assert_eq!(
@@ -480,7 +482,8 @@ mod tests {
         let comps = [synthetic_key::compression_policy()];
         // Plain volume: metadata is intact, so it must still mount.
         let reader = SliceBlockReader::new(&image);
-        let mut fs = Hxfs::mount_with_policies(reader, &policies, &comps).expect("mount");
+        let mut fs =
+            Hxfs::mount_with_policies(reader, &policies, &comps, None).expect("mount");
         let file = fs.open_path("/seed.bin").expect("open seed.bin");
         let mut buf = [0u8; 4096];
         assert_eq!(
@@ -497,6 +500,18 @@ mod tests {
 }
 
 fn main() {
+    // Stage D: single source of truth for the synthetic volume key.
+    // The soak harness feeds this hex to the kernel build
+    // (HUESOS_VOLUME_KEY_HEX) so the bootloader key blob in the
+    // kernel matches the key the volume was seeded with.
+    if std::env::args().any(|arg| arg == "--print-volume-key-hex") {
+        let mut hex = String::with_capacity(64);
+        for byte in synthetic_key::VOLUME_KEY {
+            hex.push_str(&format!("{byte:02x}"));
+        }
+        println!("{hex}");
+        return;
+    }
     let args = parse_args();
     let store = match FileStore::create(&args.output, args.blocks) {
         Ok(store) => store,
@@ -533,7 +548,10 @@ fn main() {
     let policies = [synthetic_key::encryption_policy()];
     let comps = [synthetic_key::compression_policy()];
     let mut writer = match FixedHxfsWriter::<RecordingStore, 16, 32, 128>::mount_with_policies(
-        store, &policies, &comps,
+        store,
+        &policies,
+        &comps,
+        Some(&synthetic_key::VOLUME_KEY),
     ) {
         Ok(writer) => writer,
         Err(e) => fail(&format!("mount failed: {e:?}")),
