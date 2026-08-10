@@ -11,6 +11,15 @@ use crate::identify::{
     parse_controller, parse_namespace, ControllerInfo, IdentifyError, NamespaceInfo, IDENTIFY_BYTES,
 };
 use crate::queue_plan::{plan_queues, InterruptMode, QueuePlan, QueuePlanInput};
+// Synchronous completion-poll budget. Iterations are cheap (one
+// 16-byte DMA read of the CQ slot); a slow emulated controller
+// (QEMU under TCG on a contended CI runner) can take longer than
+// 1M iterations to post a completion, and an exhausted budget
+// surfaces as NvmeError::Timeout -> an Io error to the Hxfs
+// service. 50M is still a bounded wait (a few seconds worst
+// case) but absorbs realistic emulation jitter.
+const IO_POLL_BUDGET: u32 = 50_000_000;
+
 use crate::regs::{aqa, cap, cc, csts, off};
 use crate::transport::NvmeTransport;
 
@@ -309,7 +318,7 @@ impl<T: NvmeTransport> Controller<T> {
 
     fn admin_command(&mut self, sqe: Sqe) -> Result<Cqe, NvmeError> {
         self.submit_admin(sqe);
-        let cqe = self.poll_admin(1_000_000)?;
+        let cqe = self.poll_admin(IO_POLL_BUDGET)?;
         if cqe.is_success() {
             Ok(cqe)
         } else {
@@ -546,7 +555,7 @@ impl<T: NvmeTransport> Controller<T> {
             return Err(NvmeError::BufferTooSmall);
         }
         let (cid, dma, nbytes) = self.prepare_read(lba, nlb)?;
-        let cqe = self.poll_io(cid, 1_000_000)?;
+        let cqe = self.poll_io(cid, IO_POLL_BUDGET)?;
         Self::check(&cqe)?;
         self.finish_read(dma, nbytes, buf);
         Ok(())
@@ -559,7 +568,7 @@ impl<T: NvmeTransport> Controller<T> {
             return Err(NvmeError::BufferTooSmall);
         }
         let (cid, _, _) = self.prepare_write(lba, nlb, buf)?;
-        let cqe = self.poll_io(cid, 1_000_000)?;
+        let cqe = self.poll_io(cid, IO_POLL_BUDGET)?;
         Self::check(&cqe)
     }
 
@@ -569,7 +578,7 @@ impl<T: NvmeTransport> Controller<T> {
             return Err(NvmeError::NotReady);
         }
         let cid = self.submit_io(build::flush(self.nsid));
-        let cqe = self.poll_io(cid, 1_000_000)?;
+        let cqe = self.poll_io(cid, IO_POLL_BUDGET)?;
         Self::check(&cqe)
     }
 

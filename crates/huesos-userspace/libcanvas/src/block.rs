@@ -83,7 +83,21 @@ impl BlockDevice {
     }
 
     /// Read blocks into `out`.
+    ///
+    /// Stage C.1 hardening: like writes, a transport error is
+    /// retried once before being surfaced. The QEMU NVMe emulation
+    /// intermittently times out an I/O under load on slow (TCG,
+    /// shared) runners; reads are idempotent, so a retry is safe.
     pub fn read_blocks(&mut self, lba: u64, block_count: u32, out: &mut [u8]) -> Result<()> {
+        match self.read_blocks_once(lba, block_count, out) {
+            Ok(()) => Ok(()),
+            Err(error) => self
+                .read_blocks_once(lba, block_count, out)
+                .map_err(|_| error),
+        }
+    }
+
+    fn read_blocks_once(&mut self, lba: u64, block_count: u32, out: &mut [u8]) -> Result<()> {
         let request_id = self.alloc_request_id();
         let vmo = Vmo::create(out.len() as u64)?;
         self.register_buffer(BUFFER_ID, &vmo)?;
