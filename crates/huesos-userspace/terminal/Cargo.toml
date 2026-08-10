@@ -7,6 +7,12 @@ edition = "2021"
 name = "huesos-terminal"
 path = "src/main.rs"
 
+[features]
+# Soak wiring: the terminal auto-triggers an orderly userspace
+# shutdown after ~N empty keyboard polls (used by the
+# qemu-nvme-soak inject=3 shutdown-cycle gate).
+soak-shutdown = []
+
 [dependencies]
 libcanvas = { path = "../libcanvas" }
 logos = { version = "0.16.1", default-features = false, features = ["export_derive"] }

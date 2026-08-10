@@ -109,13 +109,25 @@ fn main() {
         &[],
     );
     let doom = build_userspace_program(&userspace_root, "doom", "huesos-doom", profile, &[], &[]);
+    // Soak shutdown-cycle wiring (qemu-nvme-soak inject=3): the
+    // harness exports HUESOS_TERMINAL_FEATURES=soak-shutdown so the
+    // terminal auto-triggers an orderly userspace shutdown after a
+    // few idle seconds. Production builds leave it unset.
+    let terminal_features = env::var("HUESOS_TERMINAL_FEATURES").unwrap_or_default();
+    println!("cargo:rerun-if-env-changed=HUESOS_TERMINAL_FEATURES");
+    let mut terminal_args: Vec<String> = Vec::new();
+    if !terminal_features.is_empty() {
+        terminal_args.push("--features".to_string());
+        terminal_args.push(terminal_features);
+    }
+    let terminal_args_refs: Vec<&str> = terminal_args.iter().map(String::as_str).collect();
     let terminal = build_userspace_program(
         &userspace_root,
         "terminal",
         "huesos-terminal",
         profile,
         &[],
-        &[],
+        &terminal_args_refs,
     );
     let fault_probe = build_userspace_program(
         &userspace_root,

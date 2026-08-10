@@ -1,5 +1,6 @@
 //! Terminal shell runtime and keyboard event loop.
 
+use crate::println;
 use crate::commands::execute_line;
 use crate::screen::Screen;
 use crate::snake;
@@ -71,10 +72,35 @@ impl Shell {
     /// Run the shell forever.
     pub fn run(&mut self) -> ! {
         let mut buf = [0u8; 16];
+        #[cfg(feature = "soak-shutdown")]
+        let mut idle_polls: u32 = 0;
         loop {
             match self.keyboard.read_into_blocking(&mut buf) {
-                Ok(n) => self.handle_keyboard_message(&buf[..n]),
+                Ok(n) => {
+                    #[cfg(feature = "soak-shutdown")]
+                    {
+                        idle_polls = 0;
+                    }
+                    self.handle_keyboard_message(&buf[..n]);
+                }
                 Err(ErrorCode::ShouldWait) | Err(ErrorCode::TimedOut) => {
+                    #[cfg(feature = "soak-shutdown")]
+                    {
+                        // Soak wiring: after enough idle polls (a few
+                        // seconds under QEMU TCG), trigger the orderly
+                        // userspace shutdown so the soak harness can
+                        // observe the full halt chain.
+                        idle_polls += 1;
+                        if idle_polls >= 500 {
+                            println!("[terminal] soak-shutdown: auto-triggering orderly shutdown");
+                            self.request_shutdown();
+                            // Never returns (init halts all CPUs); if
+                            // it somehow does, keep spinning.
+                            loop {
+                                libcanvas::process::yield_now();
+                            }
+                        }
+                    }
                     libcanvas::process::yield_now();
                 }
                 Err(e) => self.report_keyboard_error(e),
