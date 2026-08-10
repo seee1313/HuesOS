@@ -9,6 +9,7 @@ license = "MIT"
 huesos-hxfs = { path = "../../crates/huesos-hxfs", features = [
     "crypto-aes-gcm",
     "compression-engines",
+    "hxblob",
 ] }
 
 # Standalone host tool: not a member of the kernel workspace, same

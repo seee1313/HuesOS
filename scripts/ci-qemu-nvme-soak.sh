@@ -227,6 +227,7 @@ if [[ "$inject" == "1" || "$inject" == "2" ]]; then
         "[hxfs] quota-enforced-ok"
         "[hxfs] stage-e-16mib-ok"
         "[hxfs] stage-f-blob-ok"
+        "[hxfs] stage-f-blob-big-ok"
     )
 elif [[ "$inject" == "4" ]]; then
     # Stress soak: encrypted volume, self-check, write path,
@@ -237,6 +238,7 @@ elif [[ "$inject" == "4" ]]; then
         "[hxfs] multi-slot-write-ok"
         "[hxfs] stage-e-16mib-ok"
         "[hxfs] stage-f-blob-ok"
+        "[hxfs] stage-f-blob-big-ok"
         "[hxfs] stress-ok"
         "[hxfs] scrub complete"
         "[hxfs] fsck clean"
@@ -251,6 +253,7 @@ elif [[ "$inject" == "3" ]]; then
         "[hxfs] write-roundtrip-ok"
         "[hxfs] stage-e-16mib-ok"
         "[hxfs] stage-f-blob-ok"
+        "[hxfs] stage-f-blob-big-ok"
         "[init] terminal requested orderly shutdown"
         "[shutdown-broker] 8042 quiesced; invoking hard_halt"
         "[shutdown] all CPUs halted"

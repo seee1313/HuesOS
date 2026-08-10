@@ -3893,6 +3893,57 @@ fn rewrite_at_zero_releases_extent_slots() {
     );
 }
 
+/// Phase-2 packages: reproduce the on-target big-blob put on an
+/// encrypted volume (32 KiB payload) to isolate the GPF seen in
+/// the service.
+#[cfg(all(test, feature = "hxblob", feature = "crypto-aes-gcm"))]
+#[test]
+fn stage_f_hxblob_big_put_encrypted() {
+    use crate::fixed_writer::FixedHxfsWriter;
+    use crate::recovery::BlockStore;
+    use crate::writer::VecBlockStore;
+
+    let policies = [crate::synthetic_key::encryption_policy()];
+    let comps = [crate::synthetic_key::compression_policy()];
+    let boot_image = build_seeded_boot_image(true, crate::synthetic_key::COMPRESSION_POLICY_ID);
+    let mut store = VecBlockStore::with_blocks(1024);
+    let boot_blocks = (boot_image.len() / BLOCK_SIZE) as u32;
+    if let Err(e) = store.write_blocks(0, boot_blocks, &boot_image) {
+        assert!(false, "boot write must succeed: {:?}", e);
+        return;
+    }
+    let Ok(mut writer) = FixedHxfsWriter::<_, 16, 32, 64>::mount_with_policies(
+        store,
+        &policies,
+        &comps,
+        Some(&crate::synthetic_key::VOLUME_KEY),
+    ) else {
+        assert!(false, "writer mount must succeed");
+        return;
+    };
+    let mut payload = alloc::vec![0u8; 32_000];
+    let mut i = 0usize;
+    while i < payload.len() {
+        payload[i] = (i as u8).wrapping_mul(7).wrapping_add(3);
+        i += 1;
+    }
+    let hash = match writer.put_blob(&payload) {
+        Ok(h) => h,
+        Err(e) => {
+            assert!(false, "put_blob must succeed: {:?}", e);
+            return;
+        }
+    };
+    let got = match writer.get_blob(&hash) {
+        Ok(g) => g,
+        Err(e) => {
+            assert!(false, "get_blob must succeed: {:?}", e);
+            return;
+        }
+    };
+    assert_eq!(got, payload, "32 KiB blob must round-trip");
+}
+
 /// Phase-2 packages: the Hxblob index grows past one block
 /// (>44 records) into a two-level tree; all blobs must survive a
 /// publish + remount.

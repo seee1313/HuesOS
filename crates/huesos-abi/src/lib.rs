@@ -692,7 +692,13 @@ pub const USER_STACK_SIZE: u64 = 4096 * 256;
 /// never touch it.
 pub const USER_HEAP_BASE: u64 = 0x0000_7000_0000;
 /// Size of the userspace heap region mapped by the process launcher.
-pub const USER_HEAP_SIZE: u64 = 1024 * 1024;
+pub const USER_HEAP_SIZE: u64 = 18 * 1024 * 1024;
+// 18 MiB: the hxfs-service bump allocator holds the runtime, the
+// package-sized blob payloads, AND the live scrub's whole-object
+// buffer (the 16 MiB probe file is buffered by scrub()). A bump
+// allocator with no free() must be sized for the worst single
+// allocation chain; chunked scrub (a known follow-up) will let this
+// shrink again.
 
 /// Scheduler flags for [`Syscall::ProcessSetSchedulerFlags`].
 pub mod scheduler_flags {

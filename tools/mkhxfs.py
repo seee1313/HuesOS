@@ -68,6 +68,9 @@ def run_seed_tool(args: argparse.Namespace) -> int:
         command.append("--inject-bad-gcm-tag")
     if args.inject_bad_crc:
         command.append("--inject-bad-crc")
+    if args.seed_blob_file:
+        command.append("--seed-blob-file")
+        command.append(str(args.seed_blob_file))
     env = dict(os.environ)
     env.setdefault("PATH", os.defpath)
     result = subprocess.run(command, cwd=root, env=env, check=False)
@@ -111,6 +114,12 @@ def main() -> int:
         "--inject-bad-crc",
         action="store_true",
         help="Seed mode (plain volume): flip one byte of the seed file's first compressed payload",
+    )
+    parser.add_argument(
+        "--seed-blob-file",
+        type=Path,
+        default=None,
+        help="Seed mode: store this file (ELF/WAD) as an Hxblob object",
     )
     args = parser.parse_args()
     if args.seed_file is not None:

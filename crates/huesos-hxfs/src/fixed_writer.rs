@@ -796,7 +796,16 @@ impl<
             .open_child_file(blob_dir, &name)
             .map_err(|_| HxfsError::NotFound)?;
         let mut out = alloc::vec![0u8; record.size as usize];
-        self.read_file(file, &mut out)?;
+        // Phase-2 packages: read chunk-wise (read_file_at) so a
+        // package-sized blob does not materialise through the
+        // whole-object read path; the chunked path is the one the
+        // 16 MiB on-target probe exercises.
+        let mut offset = 0usize;
+        while offset < out.len() {
+            let n = (out.len() - offset).min(BLOCK_SIZE);
+            self.read_file_at(file, offset as u64, &mut out[offset..offset + n])?;
+            offset += n;
+        }
         Ok(out)
     }
 
