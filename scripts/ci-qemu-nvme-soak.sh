@@ -27,6 +27,14 @@ if [[ "$inject" == "1" ]]; then
 elif [[ "$inject" == "2" ]]; then
     export HUESOS_HXFS_SERVICE_FEATURES=synthetic-key
     seed_args=(--inject-bad-crc)
+elif [[ "$inject" == "3" ]]; then
+    # Mode 3: graceful-shutdown cycle. A clean encrypted volume
+    # (no corruption); the service self-check runs, then the
+    # terminal auto-triggers an orderly userspace shutdown and the
+    # harness waits for the halt marker instead of a timeout kill.
+    export HUESOS_HXFS_SERVICE_FEATURES=synthetic-key
+    export HUESOS_TERMINAL_FEATURES=soak-shutdown
+    seed_args=()
 fi
 if [[ "$inject" == "1" || "$inject" == "2" ]]; then
     # Stage D: the synthetic volume key is baked into the KERNEL as
@@ -96,13 +104,10 @@ if [[ "$need_create" == "1" ]]; then
         echo "[soak] image too small for Hxfs (need >= 32 KiB)" >&2
         exit 1
     fi
-    if [[ "$inject" == "1" || "$inject" == "2" ]]; then
-        # Injection modes: seeded volume whose seed-file data block
-        # is corrupted (mode 1: GCM ciphertext bit on an encrypted
-        # volume; mode 2: compressed-payload byte on a plain
-        # volume). Metadata stays intact, so the volume still
-        # mounts; the service self-check must report the precise
-        # marker and keep serving.
+    if [[ "$inject" == "1" || "$inject" == "2" || "$inject" == "3" ]]; then
+        # Seeded modes: an encrypted+compressed volume with a
+        # seed.bin file. Modes 1/2 corrupt the seed data block;
+        # mode 3 leaves it intact for the shutdown cycle.
         echo "[soak] creating seeded Hxfs image (inject=${inject}): $nvme_img"
         python3 tools/mkhxfs.py --output "$nvme_img" --blocks "$hxfs_blocks" \
             --seed-file seed.bin --seed-size 3584 "${seed_args[@]}" >/dev/null
@@ -125,6 +130,12 @@ qemu_common=(
     -serial "file:$log"
     -no-reboot -no-shutdown
 )
+# Mode 3 attaches a QEMU monitor over a Unix socket so the harness
+# can quit QEMU after observing the halt marker.
+qemu_monitor=()
+if [[ "$inject" == "3" ]]; then
+    qemu_monitor=(-monitor "unix:build/qemu-monitor.sock,server=on,wait=off")
+fi
 
 qemu_nvme=()
 case "$nvme_layout" in
@@ -144,8 +155,29 @@ case "$nvme_layout" in
 esac
 
 set +e
-timeout "${seconds}s" qemu-system-x86_64 "${qemu_common[@]}" "${qemu_nvme[@]}"
-status=$?
+if [[ "$inject" == "3" ]]; then
+    rm -f build/qemu-monitor.sock
+    qemu-system-x86_64 "${qemu_common[@]}" "${qemu_nvme[@]}" "${qemu_monitor[@]}" &
+    qemu_pid=$!
+    status=124
+    waited=0
+    while [[ $waited -lt "$seconds" ]]; do
+        if grep -Fq "[shutdown] all CPUs halted" "$log" 2>/dev/null; then
+            status=0
+            break
+        fi
+        sleep 2
+        waited=$((waited + 2))
+    done
+    if [[ -S build/qemu-monitor.sock ]]; then
+        printf 'quit\n' | timeout 5 socat - UNIX-CONNECT:build/qemu-monitor.sock 2>/dev/null || true
+    fi
+    kill "$qemu_pid" 2>/dev/null
+    wait "$qemu_pid" 2>/dev/null
+else
+    timeout "${seconds}s" qemu-system-x86_64 "${qemu_common[@]}" "${qemu_nvme[@]}"
+    status=$?
+fi
 set -e
 
 # A healthy OS intentionally keeps running, so timeout(1)'s 124 is expected.
@@ -188,6 +220,18 @@ if [[ "$inject" == "1" || "$inject" == "2" ]]; then
         "[hxfs] fsck clean"
         "[hxfs] quota-enforced-ok"
         "[hxfs] stage-e-4mib-ok"
+    )
+elif [[ "$inject" == "3" ]]; then
+    # Graceful-shutdown cycle: the encrypted volume must mount and
+    # self-check cleanly, then the userspace shutdown chain must
+    # reach the final atomic halt.
+    required+=(
+        "[hxfs] self-check ok"
+        "[hxfs] write-roundtrip-ok"
+        "[hxfs] stage-e-4mib-ok"
+        "[init] terminal requested orderly shutdown"
+        "[shutdown-broker] 8042 quiesced; invoking hard_halt"
+        "[shutdown] all CPUs halted"
     )
 fi
 for marker in "${required[@]}"; do
