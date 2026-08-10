@@ -176,6 +176,9 @@ struct HxfsRuntime {
     clients: [Option<Channel>; MAX_CLIENTS],
     files: [Option<FileEndpoint>; MAX_FILE_HANDLES],
     dirs: [Option<DirEndpoint>; MAX_DIR_HANDLES],
+    // Stage E (Production polish): runtime knobs (sysctl-like).
+    stats_interval_ticks: u32,
+    stats_since: u32,
 }
 
 impl HxfsRuntime {
@@ -185,6 +188,8 @@ impl HxfsRuntime {
             clients: [const { None }; MAX_CLIENTS],
             files: [const { None }; MAX_FILE_HANDLES],
             dirs: [const { None }; MAX_DIR_HANDLES],
+            stats_interval_ticks: 0,
+            stats_since: 0,
         }
     }
 
@@ -277,6 +282,37 @@ impl HxfsRuntime {
                 fsck.errors
             );
             self.write_client(index, b"stats-ok");
+            return;
+        }
+        if let Some(rest) = strip_prefix(request, b"SET_KNOB ") {
+            if let Some(eq) = rest.iter().position(|&b| b == b'=') {
+                let name = &rest[..eq];
+                let value = &rest[eq + 1..];
+                let mut applied = false;
+                if name == b"stats_interval" {
+                    if let Ok(text) = core::str::from_utf8(value) {
+                        if let Ok(ticks) = text.parse::<u32>() {
+                            self.stats_interval_ticks = ticks;
+                            self.stats_since = 0;
+                            applied = true;
+                        }
+                    }
+                }
+                if applied {
+                    self.write_client(index, b"knob-ok");
+                } else {
+                    self.write_client(index, b"err:knob");
+                }
+            } else {
+                self.write_client(index, b"err:knob");
+            }
+            return;
+        }
+        if request == b"GET_KNOBS" {
+            let mut reply = alloc::vec![0u8; 64];
+            let text = alloc::format!("stats_interval={}\n", self.stats_interval_ticks);
+            reply[..text.len()].copy_from_slice(text.as_bytes());
+            self.write_client(index, &reply[..text.len()]);
             return;
         }
         if is_odirect_deny(request) {
@@ -1521,6 +1557,17 @@ pub extern "C" fn _start() -> ! {
     let mut runtime = Box::new(HxfsRuntime::new(fs));
     loop {
         runtime.poll(&bootstrap);
+        runtime.stats_since = runtime.stats_since.wrapping_add(1);
+        if runtime.stats_interval_ticks != 0 && runtime.stats_since >= runtime.stats_interval_ticks
+        {
+            runtime.stats_since = 0;
+            let scrub = runtime.fs.scrub().map(|s| s.errors).unwrap_or(u64::MAX);
+            println!(
+                "[hxfs] periodic-stats bad_extents={} scrub_errors={}",
+                runtime.fs.bad_extent_count(),
+                scrub
+            );
+        }
         libcanvas::process::yield_now();
     }
 }
@@ -1873,8 +1920,85 @@ fn write_roundtrip_check(fs: &mut MountedHxfs) {
             Err(error) => println!("[hxfs] stage-e-write: create failed ({:?})", error),
         }
     }
+    // Stage E (Production polish, soak inject=4): stress phase.
+    // Sustained NVMe/page-cache churn without growing the extent
+    // array: each cycle reads the 16 MiB probe file end-to-end
+    // (verify pattern) and rewrites a small file. A single failure
+    // fails the phase.
+    {
+        const STRESS_CYCLES: usize = 3;
+        const STRESS_FILE: &str = "probe-big.bin";
+        const TOUCH_FILE: &str = "probe-touch.bin";
+        let mut ok = true;
+        let mut cycle = 0usize;
+        while cycle < STRESS_CYCLES {
+            // 1) Full read of the 16 MiB file (chunked).
+            match fs.open_child_file(root, STRESS_FILE) {
+                Ok(file) => {
+                    let mut rbuf = [0u8; 4096];
+                    let mut probe = 0usize;
+                    while probe < 4096 {
+                        if let Err(error) = fs.read_file_at(file, (probe * 4096) as u64, &mut rbuf)
+                        {
+                            println!("[hxfs] stress: read failed at {} ({:?})", probe, error);
+                            ok = false;
+                            break;
+                        }
+                        if rbuf[..8] != probe.to_le_bytes()[..] {
+                            println!("[hxfs] stress: verify failed at {}", probe);
+                            ok = false;
+                            break;
+                        }
+                        probe += 1;
+                    }
+                }
+                Err(error) => {
+                    println!("[hxfs] stress: open failed ({:?})", error);
+                    ok = false;
+                }
+            }
+            // 2) Rewrite a small file (1 block) to churn the write path.
+            if ok {
+                match fs.open_child_file(root, TOUCH_FILE) {
+                    Ok(file) => {
+                        let mut chunk = [0u8; 4096];
+                        chunk[0..8].copy_from_slice(&cycle.to_le_bytes());
+                        if let Err(error) = fs.write_file_at(file, 0, &chunk) {
+                            println!("[hxfs] stress: touch write failed ({:?})", error);
+                            ok = false;
+                        }
+                    }
+                    Err(_) => {
+                        // First cycle: create it.
+                        if let Ok(file) = fs.create_file_child(root, TOUCH_FILE) {
+                            let mut chunk = [0u8; 4096];
+                            chunk[0..8].copy_from_slice(&cycle.to_le_bytes());
+                            if let Err(error) = fs.write_file_at(file, 0, &chunk) {
+                                println!("[hxfs] stress: touch create write failed ({:?})", error);
+                                ok = false;
+                            }
+                        } else {
+                            println!("[hxfs] stress: touch create failed");
+                            ok = false;
+                        }
+                    }
+                }
+            }
+            if !ok {
+                break;
+            }
+            cycle += 1;
+        }
+        if ok {
+            println!(
+                "[hxfs] stress-ok ({} cycles x 16MiB read + touch)",
+                STRESS_CYCLES
+            );
+        } else {
+            println!("[hxfs] stress-failed at cycle {}", cycle);
+        }
+    }
 }
-
 // Stage F (Phase-2 A): Hxblob object-store commands over the text
 // protocol. PUT_BLOB <hex> stores the decoded bytes and replies
 // with the hex content hash; GET_BLOB <hex-hash> replies with the

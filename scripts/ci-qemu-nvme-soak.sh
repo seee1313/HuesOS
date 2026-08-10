@@ -35,8 +35,14 @@ elif [[ "$inject" == "3" ]]; then
     export HUESOS_HXFS_SERVICE_FEATURES=synthetic-key
     export HUESOS_TERMINAL_FEATURES=soak-shutdown
     seed_args=()
+elif [[ "$inject" == "4" ]]; then
+    # Mode 4: stress soak. A clean encrypted volume; the service
+    # runs its self-check plus repeated 16 MiB write/read cycles
+    # (stress-ok) for sustained NVMe/page-cache load.
+    export HUESOS_HXFS_SERVICE_FEATURES=synthetic-key
+    seed_args=()
 fi
-if [[ "$inject" == "1" || "$inject" == "2" || "$inject" == "3" ]]; then
+if [[ "$inject" == "1" || "$inject" == "2" || "$inject" == "3" || "$inject" == "4" ]]; then
     # Stage D: the synthetic volume key is baked into the KERNEL as
     # the bootloader key blob (single source of truth: the seed
     # tool's --print-volume-key-hex). The service receives it via
@@ -104,7 +110,7 @@ if [[ "$need_create" == "1" ]]; then
         echo "[soak] image too small for Hxfs (need >= 32 KiB)" >&2
         exit 1
     fi
-    if [[ "$inject" == "1" || "$inject" == "2" || "$inject" == "3" ]]; then
+    if [[ "$inject" == "1" || "$inject" == "2" || "$inject" == "3" || "$inject" == "4" ]]; then
         # Seeded modes: an encrypted+compressed volume with a
         # seed.bin file. Modes 1/2 corrupt the seed data block;
         # mode 3 leaves it intact for the shutdown cycle.
@@ -221,6 +227,20 @@ if [[ "$inject" == "1" || "$inject" == "2" ]]; then
         "[hxfs] quota-enforced-ok"
         "[hxfs] stage-e-16mib-ok"
         "[hxfs] stage-f-blob-ok"
+    )
+elif [[ "$inject" == "4" ]]; then
+    # Stress soak: encrypted volume, self-check, write path,
+    # 16 MiB file, blob round-trip and the repeated stress cycles.
+    required+=(
+        "[hxfs] self-check ok"
+        "[hxfs] write-roundtrip-ok"
+        "[hxfs] multi-slot-write-ok"
+        "[hxfs] stage-e-16mib-ok"
+        "[hxfs] stage-f-blob-ok"
+        "[hxfs] stress-ok"
+        "[hxfs] scrub complete"
+        "[hxfs] fsck clean"
+        "[hxfs] quota-enforced-ok"
     )
 elif [[ "$inject" == "3" ]]; then
     # Graceful-shutdown cycle: the encrypted volume must mount and

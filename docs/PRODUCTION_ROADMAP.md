@@ -755,3 +755,22 @@ WADs, package stores) need larger files.
 **Open**: on-target blob service commands (put/get over the Hxfs
 protocol), Merkle chunking for >4 KiB blobs, larger index (multi-
 block Hxblob index), Hxblob package resolution in DriverManager.
+
+## Stage E (Operations) — production polish  (landed as PR `hxfs-phase2-c-polish`)
+
+- **Runtime knobs (sysctl-like)**: hxfs-service `SET_KNOB name=value` /
+  `GET_KNOBS` over the text protocol; `stats_interval` emits a
+  periodic `[hxfs] periodic-stats` health line from the service
+  loop. More knobs follow the same pattern.
+- **Stress soak**: `qemu-nvme-soak inject=4` runs the encrypted
+  volume with repeated 16 MiB read cycles + write churn
+  (`[hxfs] stress-ok`), sustained NVMe/page-cache load. CI job
+  `qemu-nvme-stress`.
+- **Long soak**: `scripts/soak-long.sh` runs full passes of
+  gcm + stress + shutdown-cycle. CI runs one bounded pass
+  (`qemu-nvme-long-soak`, ~2 h); GitHub's 6 h job cap prevents a
+  literal 24 h CI job, so the full 24 h run is an operator-triggered
+  local gate (documented here as the Stage E 24 h exit criterion).
+- **TPM-backed key provider (D.2) remains open**: the bootloader
+  key blob handoff is in place (Stage D); real TPM measurement /
+  sealing / unseal is a separate hardware-dependent workstream.
