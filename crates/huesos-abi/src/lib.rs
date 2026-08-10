@@ -672,7 +672,7 @@ pub const USER_STACK_TOP: u64 = 0x0000_7fff_ff00_0000;
 /// probe buffers on top of the mount chain); its first on-target
 /// write round-trip faulted ~62 KiB deep. The mapping is virtual
 /// reservation, so 128 KiB is cheap for every process.
-pub const USER_STACK_SIZE: u64 = 4096 * 32;
+pub const USER_STACK_SIZE: u64 = 4096 * 64;
 
 /// Base of the userspace heap region mapped by the process launcher.
 ///
@@ -684,7 +684,7 @@ pub const USER_STACK_SIZE: u64 = 4096 * 32;
 /// never touch it.
 pub const USER_HEAP_BASE: u64 = 0x0000_7000_0000;
 /// Size of the userspace heap region mapped by the process launcher.
-pub const USER_HEAP_SIZE: u64 = 256 * 1024;
+pub const USER_HEAP_SIZE: u64 = 1024 * 1024;
 
 /// Scheduler flags for [`Syscall::ProcessSetSchedulerFlags`].
 pub mod scheduler_flags {

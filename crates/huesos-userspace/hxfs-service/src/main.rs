@@ -3,6 +3,9 @@
 #![no_std]
 #![no_main]
 
+extern crate alloc;
+
+use alloc::boxed::Box;
 use core::panic::PanicInfo;
 use huesos_abi::hxfs::{
     request_flags, response_flags, rights as hxfs_rights, HxfsHandleKind, HxfsOp, HxfsRequest,
@@ -80,9 +83,17 @@ const POLL_BUF_BYTES: usize = 256;
 // address=0x7ffffefef688` in the qemu-nvme-boot smoke). The seed
 // v5 image uses only a handful of objects/entries/extents, so
 // 16/16/16 leaves comfortable headroom.
-const SERVICE_MAX_OBJECTS: usize = 16;
-const SERVICE_MAX_DIR_ENTRIES: usize = 16;
-const SERVICE_MAX_EXTENTS: usize = 16;
+// Stage E: raised so the on-target soak can exercise multi-block
+// extent trees. The writer's fixed arrays live INSIDE the
+// MountedHxfs value, which the service keeps on the stack; 512
+// extents x ~64 B = ~32 KiB BSS is the largest that still leaves
+// the 128 KiB stack safe alongside the crypto frames. A 1 MiB
+// soak file (256 extents -> 3 leaves) exercises the tree; larger
+// files need the writer to move off the stack (a Box/heap-based
+// service runtime), tracked separately.
+const SERVICE_MAX_OBJECTS: usize = 32;
+const SERVICE_MAX_DIR_ENTRIES: usize = 32;
+const SERVICE_MAX_EXTENTS: usize = 320;
 // The qemu-nvme-boot namespace is exposed with a 512-byte LBA while
 // Hxfs internally works in 4 KiB blocks. The
 // `libcanvas::block::BlockDevice` wire protocol speaks 512-byte LBAs,
@@ -1480,7 +1491,13 @@ pub extern "C" fn _start() -> ! {
     #[cfg(feature = "synthetic-key")]
     run_boot_self_check(&mut fs);
     let _ = bootstrap.write(b"service:hxfs:ready");
-    let mut runtime = HxfsRuntime::new(fs);
+    // The runtime (and the stack-resident MountedHxfs with its
+    // fixed extent array) lives on the HEAP: at Stage E capacities
+    // the writer is ~32 KiB and the 128 KiB user stack must stay
+    // free for the crypto read/write frames (several 4 KiB scratch
+    // buffers per frame on the mount call chain). The 256 KiB
+    // userspace heap fits it comfortably.
+    let mut runtime = Box::new(HxfsRuntime::new(fs));
     loop {
         runtime.poll(&bootstrap);
         libcanvas::process::yield_now();
@@ -1521,19 +1538,93 @@ fn run_boot_self_check(fs: &mut MountedHxfs) {
             match fs.read_file(file, &mut buf) {
                 Ok(n) => println!("[hxfs] self-check ok ({} bytes)", n),
                 Err(HxfsError::Compression) => {
-                    // The seeded extent's GCM tag (or descriptor
-                    // CRC) did not verify: the corruption was
-                    // detected and the service keeps serving.
-                    // The soak asserts this marker with
-                    // --inject-bad-gcm-tag.
-                    println!("[hxfs] bad-gcm-tag-marked");
+                    // The seeded extent's integrity check failed.
+                    // On an encrypted volume the failure is the GCM
+                    // tag (--inject-bad-gcm-tag); on a plain volume
+                    // it is the compressed-payload CRC32C
+                    // (--inject-bad-crc). The volume type
+                    // discriminates the two; the extent was marked
+                    // bad and the service keeps serving.
+                    if fs.encryption().is_some() {
+                        println!("[hxfs] bad-gcm-tag-marked");
+                    } else {
+                        println!("[hxfs] bad-checksum-marked");
+                    }
                 }
                 Err(error) => println!("[hxfs] self-check failed: {:?}", error),
             }
         }
         Err(error) => println!("[hxfs] self-check: seed file absent ({:?})", error),
     }
+    if fs.bad_extent_count() > 0 {
+        println!("[hxfs] extent-bad-marked ({})", fs.bad_extent_count());
+    }
     write_roundtrip_check(fs);
+    run_reliability_checks(fs);
+}
+
+/// Stage C: live scrub, structural fsck and quota enforcement
+/// probes, all through the production write/read paths.
+#[cfg(feature = "synthetic-key")]
+fn run_reliability_checks(fs: &mut MountedHxfs) {
+    // Live scrub: re-validates every metadata tree block and reads
+    // every data extent through the full verify path.
+    match fs.scrub() {
+        Ok(summary) => println!(
+            "[hxfs] scrub complete ({} blocks, {} errors)",
+            summary.metadata_blocks + summary.data_blocks,
+            summary.errors
+        ),
+        Err(error) => println!("[hxfs] scrub failed: {:?}", error),
+    }
+    // Structural fsck: persisted roots + object model.
+    let fsck = fs.fsck();
+    if fsck.errors == 0 {
+        println!("[hxfs] fsck clean ({} checks)", fsck.checks);
+    } else {
+        println!("[hxfs] fsck findings ({} errors)", fsck.errors);
+    }
+    // Quota enforcement on the production write path: set the
+    // volume limit to exactly one block above the current usage,
+    // then attempt two 4 KiB writes. The first must pass, the
+    // second must be rejected. Both the writer's volume check
+    // (QuotaExceeded) and the allocator gate (NoSpace, which is
+    // the user-visible "quota breach" error per the roadmap) prove
+    // enforcement, so either is accepted.
+    let base = fs.committed_physical_bytes();
+    if fs.set_quota_limits(base + 8192, 0).is_err() {
+        println!("[hxfs] quota-probe-failed (set_quota_limits)");
+        return;
+    }
+    let root = fs.root_directory();
+    match fs.create_file_child(root, "probe-quota.bin") {
+        Ok(file) => {
+            let mut chunk = [0u8; 4096];
+            let line: &[u8] = b"HuesOS quota probe 0123456789\n";
+            let mut pos = 0usize;
+            while pos < chunk.len() {
+                let n = (chunk.len() - pos).min(line.len());
+                chunk[pos..pos + n].copy_from_slice(&line[..n]);
+                pos += n;
+            }
+            let first = fs.write_file_at(file, 0, &chunk);
+            let second = fs.write_file_at(file, 4096, &chunk);
+            if first.is_ok()
+                && matches!(
+                    second,
+                    Err(HxfsError::QuotaExceeded) | Err(HxfsError::NoSpace)
+                )
+            {
+                println!("[hxfs] quota-enforced-ok");
+            } else {
+                println!(
+                    "[hxfs] quota-probe-failed (first={:?} second={:?})",
+                    first, second
+                );
+            }
+        }
+        Err(error) => println!("[hxfs] quota-probe-failed (create {:?})", error),
+    }
 }
 
 /// Phase-1 follow-up: prove the write pipeline on target.
@@ -1667,6 +1758,76 @@ fn write_roundtrip_check(fs: &mut MountedHxfs) {
                 Err(error) => println!("[hxfs] multi-slot-write: read failed ({:?})", error),
             },
             Err(error) => println!("[hxfs] multi-slot-write: reopen failed ({:?})", error),
+        }
+    }
+    // Phase E (Stage E): a 1 MiB file with a compressible pattern,
+    // written and read back in 4 KiB chunks through the real mount
+    // API. 256 extents exercise the multi-block extent tree (3
+    // leaves) on target; the 16 MiB host test covers the full
+    // tree. The size is bounded by the service's stack-resident
+    // writer (SERVICE_MAX_EXTENTS = 256).
+    {
+        const BIG_CHUNKS: usize = 256;
+        const BIG_FILE: &str = "probe-big.bin";
+        match fs.create_file_child(root, BIG_FILE) {
+            Ok(file) => {
+                let mut chunk = [0u8; 4096];
+                let line: &[u8] = b"HuesOS 1MiB Stage E probe 0123456789\n";
+                let mut chunk_index = 0usize;
+                while chunk_index < BIG_CHUNKS {
+                    chunk[0..8].copy_from_slice(&chunk_index.to_le_bytes());
+                    let mut pos = 8usize;
+                    while pos < chunk.len() {
+                        let n = (chunk.len() - pos).min(line.len());
+                        chunk[pos..pos + n].copy_from_slice(&line[..n]);
+                        pos += n;
+                    }
+                    if let Err(error) = fs.write_file_at(file, (chunk_index * 4096) as u64, &chunk)
+                    {
+                        println!("[hxfs] stage-e-write: write failed ({:?})", error);
+                        break;
+                    }
+                    chunk_index += 1;
+                }
+                if chunk_index == BIG_CHUNKS {
+                    // Reopen with a fresh handle and read back in
+                    // chunks, verifying the first 8 bytes of each.
+                    if let Ok(file) = fs.open_child_file(root, BIG_FILE) {
+                        let mut rbuf = [0u8; 4096];
+                        let mut ok = true;
+                        let mut index = 0usize;
+                        while index < BIG_CHUNKS {
+                            match fs.read_file_at(file, (index * 4096) as u64, &mut rbuf) {
+                                Ok(_) => {
+                                    let expect = index.to_le_bytes();
+                                    if rbuf[..8] != expect[..] {
+                                        println!(
+                                            "[hxfs] stage-e-write: chunk {index} got {:?} want {:?}",
+                                            &rbuf[..8],
+                                            expect
+                                        );
+                                        ok = false;
+                                        break;
+                                    }
+                                }
+                                _ => {
+                                    ok = false;
+                                    break;
+                                }
+                            }
+                            index += 1;
+                        }
+                        if ok {
+                            println!("[hxfs] stage-e-1mib-ok");
+                        } else {
+                            println!("[hxfs] stage-e-write: verify failed at {index}");
+                        }
+                    } else {
+                        println!("[hxfs] stage-e-write: reopen failed");
+                    }
+                }
+            }
+            Err(error) => println!("[hxfs] stage-e-write: create failed ({:?})", error),
         }
     }
 }

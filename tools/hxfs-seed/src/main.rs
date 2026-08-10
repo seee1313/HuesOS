@@ -47,12 +47,14 @@ struct Args {
     seed_file: String,
     seed_size: usize,
     inject_bad_gcm_tag: bool,
+    inject_bad_crc: bool,
 }
 
 fn usage() -> ! {
     eprintln!(
         "usage: huesos-hxfs-seed --output PATH [--blocks N] [--instance-uuid HEX] \
-         [--volume-uuid HEX] [--seed-file NAME] [--seed-size BYTES] [--inject-bad-gcm-tag]"
+         [--volume-uuid HEX] [--seed-file NAME] [--seed-size BYTES] \
+         [--inject-bad-gcm-tag] [--inject-bad-crc]"
     );
     std::process::exit(2);
 }
@@ -79,6 +81,7 @@ fn parse_args() -> Args {
     let mut seed_file = String::from(synthetic_key::SEED_FILE_NAME);
     let mut seed_size = 3584usize;
     let mut inject_bad_gcm_tag = false;
+    let mut inject_bad_crc = false;
     let mut index = 1usize;
     let args: Vec<String> = std::env::args().collect();
     while index < args.len() {
@@ -138,6 +141,7 @@ fn parse_args() -> Args {
                     });
             }
             "--inject-bad-gcm-tag" => inject_bad_gcm_tag = true,
+            "--inject-bad-crc" => inject_bad_crc = true,
             other => {
                 eprintln!("unknown argument: {other}");
                 usage();
@@ -155,6 +159,10 @@ fn parse_args() -> Args {
         );
         std::process::exit(2);
     }
+    if inject_bad_gcm_tag && inject_bad_crc {
+        eprintln!("--inject-bad-gcm-tag and --inject-bad-crc are mutually exclusive");
+        std::process::exit(2);
+    }
     Args {
         output,
         blocks,
@@ -163,6 +171,7 @@ fn parse_args() -> Args {
         seed_file,
         seed_size,
         inject_bad_gcm_tag,
+        inject_bad_crc,
     }
 }
 
@@ -299,9 +308,16 @@ mod tests {
     use huesos_hxfs::reader::SliceBlockReader;
     use huesos_hxfs::Hxfs;
 
-    fn build_test_image(inject: bool) -> Vec<u8> {
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum InjectMode {
+        None,
+        Gcm,
+        Crc,
+    }
+
+    fn build_test_image(inject: InjectMode) -> Vec<u8> {
         let path = std::env::temp_dir().join(format!(
-            "huesos-seed-test-{}-{inject}.img",
+            "huesos-seed-test-{}-{inject:?}.img",
             std::process::id()
         ));
         let _ = std::fs::remove_file(&path);
@@ -311,11 +327,18 @@ mod tests {
             recording: false,
             ranges: Vec::new(),
         };
+        // CRC injection needs a plain volume (the corruption must
+        // surface as a payload CRC failure, not a GCM tag failure).
+        let encrypted = inject != InjectMode::Crc;
         let boot_image = huesos_hxfs::synthetic_image::build_boot_image(
             [0x11; 16],
             [0x22; 16],
-            true,
-            synthetic_key::POLICY_ID,
+            encrypted,
+            if encrypted {
+                synthetic_key::POLICY_ID
+            } else {
+                0
+            },
             synthetic_key::COMPRESSION_POLICY_ID,
         );
         store
@@ -341,17 +364,32 @@ mod tests {
             .write_file_at(file, 0, &chunk[..3584])
             .expect("write seed");
         let ranges = writer.store_mut().stop_recording();
-        if inject {
-            let mut block = [0u8; 4096];
-            writer
-                .store_mut()
-                .read_blocks(ranges[0].0, 1, &mut block)
-                .expect("read for injection");
-            block[12 + 40] ^= 0x01;
-            writer
-                .store_mut()
-                .write_blocks(ranges[0].0, 1, &block)
-                .expect("inject");
+        match inject {
+            InjectMode::Gcm => {
+                let mut block = [0u8; 4096];
+                writer
+                    .store_mut()
+                    .read_blocks(ranges[0].0, 1, &mut block)
+                    .expect("read for injection");
+                block[12 + 40] ^= 0x01;
+                writer
+                    .store_mut()
+                    .write_blocks(ranges[0].0, 1, &block)
+                    .expect("inject");
+            }
+            InjectMode::Crc => {
+                let mut block = [0u8; 4096];
+                writer
+                    .store_mut()
+                    .read_blocks(ranges[0].0, 1, &mut block)
+                    .expect("read for injection");
+                block[8] ^= 0x01;
+                writer
+                    .store_mut()
+                    .write_blocks(ranges[0].0, 1, &block)
+                    .expect("inject");
+            }
+            InjectMode::None => {}
         }
         writer.publish_checkpoint().expect("publish");
         let mut store = writer.into_store();
@@ -361,7 +399,7 @@ mod tests {
 
     #[test]
     fn seeded_image_mounts_and_seed_file_round_trips() {
-        let image = build_test_image(false);
+        let image = build_test_image(InjectMode::None);
         let policies = [synthetic_key::encryption_policy()];
         let comps = [synthetic_key::compression_policy()];
 
@@ -417,7 +455,7 @@ mod tests {
 
     #[test]
     fn injected_image_still_mounts_and_bad_tag_surfaces_precisely() {
-        let image = build_test_image(true);
+        let image = build_test_image(InjectMode::Gcm);
         let reader = SliceBlockReader::new(&image);
         let policies = [synthetic_key::encryption_policy()];
         let comps = [synthetic_key::compression_policy()];
@@ -429,6 +467,34 @@ mod tests {
             fs.read_file(file, &mut buf).err(),
             Some(HxfsError::Compression),
             "the injected bad GCM tag must surface as the precise error"
+        );
+        assert_eq!(
+            fs.bad_extents().len(),
+            1,
+            "the bad extent must be marked"
+        );
+    }
+
+    #[test]
+    fn injected_crc_image_still_mounts_and_checksum_fails_precisely() {
+        let image = build_test_image(InjectMode::Crc);
+        let policies: [huesos_hxfs::crypto::EncryptionPolicy; 0] = [];
+        let comps = [synthetic_key::compression_policy()];
+        // Plain volume: metadata is intact, so it must still mount.
+        let reader = SliceBlockReader::new(&image);
+        let mut fs =
+            Hxfs::mount_with_policies(reader, &policies, &comps, None).expect("mount");
+        let file = fs.open_path("/seed.bin").expect("open seed.bin");
+        let mut buf = [0u8; 4096];
+        assert_eq!(
+            fs.read_file(file, &mut buf).err(),
+            Some(HxfsError::Compression),
+            "the injected bad CRC must surface as the precise error"
+        );
+        assert_eq!(
+            fs.bad_extents().len(),
+            1,
+            "the bad extent must be marked"
         );
     }
 }
@@ -459,12 +525,20 @@ fn main() {
 
     // Boot image: encrypted volume (synthetic policy id 7) with the
     // LZ4 volume compression policy and a pre-existing empty seed
-    // file entry.
+    // file entry. Stage C: the bad-CRC mode builds a PLAIN volume
+    // (also with the LZ4 policy) so the seeded-file corruption is
+    // detected by the compressed-payload CRC32C instead of the GCM
+    // tag.
+    let encrypted = !args.inject_bad_crc;
     let boot_image = huesos_hxfs::synthetic_image::build_boot_image(
         args.instance_uuid,
         args.volume_uuid,
-        true,
-        synthetic_key::POLICY_ID,
+        encrypted,
+        if encrypted {
+            synthetic_key::POLICY_ID
+        } else {
+            0
+        },
         synthetic_key::COMPRESSION_POLICY_ID,
     );
     if let Err(e) = store.write_blocks(0, BOOT_IMAGE_BLOCKS as u32, &boot_image) {
@@ -526,6 +600,21 @@ fn main() {
             "[hxfs-seed] injected bad GCM tag at LBA {first_extent_lba} (offset {})",
             12 + 40
         );
+    } else if args.inject_bad_crc {
+        // Stage C: flip one byte of the compressed payload of the
+        // seed file's first data extent on a PLAIN volume. There is
+        // no envelope (payload starts at block offset 0), so the
+        // descriptor CRC32C fails on read and the service reports
+        // `bad-checksum-marked`.
+        let mut block = [0u8; 4096];
+        if let Err(e) = writer.store_mut().read_blocks(first_extent_lba, 1, &mut block) {
+            fail(&format!("read for injection failed: {e:?}"));
+        }
+        block[8] ^= 0x01;
+        if let Err(e) = writer.store_mut().write_blocks(first_extent_lba, 1, &block) {
+            fail(&format!("injection write failed: {e:?}"));
+        }
+        println!("[hxfs-seed] injected bad CRC at LBA {first_extent_lba} (offset 8)");
     }
 
     if let Err(e) = writer.publish_checkpoint() {
@@ -535,13 +624,22 @@ fn main() {
     if let Err(e) = store.flush() {
         fail(&format!("flush failed: {e:?}"));
     }
+    let mode = if args.inject_bad_gcm_tag {
+        " with bad-GCM injection"
+    } else if args.inject_bad_crc {
+        " with bad-CRC injection (plain volume)"
+    } else if encrypted {
+        " encrypted+compressed"
+    } else {
+        " plain"
+    };
     println!(
-        "[hxfs-seed] wrote {} ({} blocks, seed file '{}' = {} bytes across {} extent(s), encrypted+compressed{})",
+        "[hxfs-seed] wrote {} ({} blocks, seed file '{}' = {} bytes across {} extent(s){})",
         args.output.display(),
         args.blocks,
         args.seed_file,
         args.seed_size,
         ranges.len(),
-        if args.inject_bad_gcm_tag { " with bad-GCM injection" } else { "" },
+        mode,
     );
 }

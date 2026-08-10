@@ -156,6 +156,12 @@ pub struct Hxfs<R: BlockReader> {
     /// `compression_policy_id`. The field is empty for callers
     /// that never set a non-plain volume policy.
     compression_policies: Vec<compression::CompressionPolicy>,
+    /// Stage C: per-mount registry of bad data extents (physical
+    /// LBAs whose read failed). Subsequent reads fail fast without
+    /// touching the disk; other files keep working. Mirrors the
+    /// writer's bounded registry (this one is a `Vec` because the
+    /// reader already allocates).
+    bad_extents: Vec<u64>,
     /// Per-volume page cache for decompressed 4 KiB blocks
     /// (A.4 of PRODUCTION_ROADMAP.md). The cache is FIFO with
     /// a 16 MiB / 4096-entry working set; invalidation is by
@@ -289,6 +295,7 @@ impl<R: BlockReader> Hxfs<R> {
             #[cfg(feature = "crypto-aes-gcm")]
             extent_key,
             compression_policies: Vec::new(),
+            bad_extents: Vec::new(),
             page_cache: page_cache::PageCache::new(),
         })
     }
@@ -315,6 +322,13 @@ impl<R: BlockReader> Hxfs<R> {
     /// can inspect it for diagnostics without holding a key.
     pub const fn encryption(&self) -> Option<&crypto::EncryptionPolicy> {
         self.encryption.as_ref()
+    }
+
+    /// Stage C: physical LBAs of data extents marked bad on this
+    /// mount. A read that failed decrypt/CRC/decompress verification
+    /// marks its extent here; subsequent reads fail fast.
+    pub fn bad_extents(&self) -> &[u64] {
+        &self.bad_extents
     }
 
     /// Superblock chosen at mount.
@@ -738,31 +752,78 @@ impl<R: BlockReader> Hxfs<R> {
             return Ok(());
         }
         let mut block = [0u8; BLOCK_SIZE];
-        let (header, block_type) = self.read_metadata_block_any_type(
+        // Try the single-block extent table first; a tree object's
+        // root fails validation with BadBlock, in which case we
+        // fall through to the tree path below.
+        let single_block = match self.read_metadata_block_any_type(
             object.tree_lba,
             BLOCK_TYPE_EXTENT_TABLE,
             BLOCK_TYPE_EXTENT_TABLE_V2,
             object.object_id,
             &mut block,
-        )?;
-        let owner = read_u64(&block, header.header_bytes as usize)?;
-        let count = read_u32(&block, header.header_bytes as usize + 8)?;
-        if owner != object.object_id || count != object.record_count {
-            return Err(HxfsError::BadTree);
-        }
-        let record_bytes = if block_type == BLOCK_TYPE_EXTENT_TABLE_V2 {
-            EXTENT_RECORD_BYTES_V2
-        } else {
-            EXTENT_RECORD_BYTES
+        ) {
+            Ok((header, block_type)) => Some((header, block_type)),
+            Err(HxfsError::BadBlock) => None,
+            Err(error) => return Err(error),
         };
+        let mut leaves: alloc::vec::Vec<u64> = alloc::vec::Vec::new();
+        if single_block.is_none() {
+            // Stage E: tree object — the root was already read into
+            // `block`; validate it and collect the leaf LBAs.
+            let header = self.read_metadata_block(
+                object.tree_lba,
+                BLOCK_TYPE_EXTENT_TREE_ROOT,
+                object.object_id,
+                &mut block,
+            )?;
+            match parse_extent_tree_root(&block[header.header_bytes as usize..]) {
+                Ok(parsed) => {
+                    leaves = parsed;
+                }
+                Err(error) => {
+                    return Err(error);
+                }
+            }
+        }
+        let record_bytes = match single_block {
+            Some((_, BLOCK_TYPE_EXTENT_TABLE_V2)) | None => EXTENT_RECORD_BYTES_V2,
+            _ => EXTENT_RECORD_BYTES,
+        };
+        let count = object.record_count;
         let mut previous_logical_end = 0u64;
         let mut index = 0u32;
+        let mut leaf_buf = [0u8; BLOCK_SIZE];
         while index < count {
-            let offset = header.header_bytes as usize + 16 + index as usize * record_bytes;
-            let (extent, meta) = if block_type == BLOCK_TYPE_EXTENT_TABLE_V2 {
-                parse_extent_record_v2(&block, offset)?
+            // Resolve the block + offset of record `index`. For a
+            // tree object the leaf block is loaded per 101-record
+            // group; for a single-block object the extent-table
+            // block is already in `block`.
+            let single = single_block;
+            let block_ref: &[u8];
+            let offset: usize;
+            if let Some((header, _block_type)) = single {
+                block_ref = &block;
+                offset = header.header_bytes as usize + 16 + index as usize * record_bytes;
             } else {
-                (parse_extent_record(&block, offset)?, None)
+                let leaf_index = (index as usize) / EXTENT_LEAF_RECORDS;
+                let within = (index as usize) % EXTENT_LEAF_RECORDS;
+                if leaf_index >= leaves.len() {
+                    return Err(HxfsError::BadTree);
+                }
+                let leaf_header = self.read_metadata_block(
+                    leaves[leaf_index],
+                    BLOCK_TYPE_EXTENT_TREE_LEAF,
+                    object.object_id,
+                    &mut leaf_buf,
+                );
+                let _ = leaf_header?;
+                block_ref = &leaf_buf;
+                offset = HEADER_BYTES + within * EXTENT_RECORD_BYTES_V2;
+            }
+            let (extent, meta) = if record_bytes == EXTENT_RECORD_BYTES_V2 {
+                parse_extent_record_v2(block_ref, offset)?
+            } else {
+                (parse_extent_record(block_ref, offset)?, None)
             };
             if extent.logical_block < previous_logical_end {
                 return Err(HxfsError::BadTree);
@@ -783,7 +844,7 @@ impl<R: BlockReader> Hxfs<R> {
             // records carry the per-extent descriptor instead, so
             // the policy is not consulted and an incompressible
             // block that was stored plain is not mis-decoded.
-            let compression = if block_type == BLOCK_TYPE_EXTENT_TABLE {
+            let compression = if record_bytes == EXTENT_RECORD_BYTES {
                 resolve_compression_for_object(
                     &self.system_volume,
                     &self.compression_policies,
@@ -811,7 +872,12 @@ impl<R: BlockReader> Hxfs<R> {
             // the plain v5 read path is taken and the
             // cfg-conditional arguments are simply absent
             // from the call site.
-            copy_extent_with_keys(
+            // Stage C: a known-bad extent fails fast without
+            // touching the disk.
+            if self.bad_extents.contains(&extent.physical_block) {
+                return Err(HxfsError::Compression);
+            }
+            if let Err(error) = copy_extent_with_keys(
                 &mut self.reader,
                 extent,
                 compression,
@@ -823,7 +889,16 @@ impl<R: BlockReader> Hxfs<R> {
                 #[cfg(feature = "crypto-aes-gcm")]
                 &self.superblock.instance_uuid,
                 out,
-            )?;
+            ) {
+                // Stage C: mark the extent bad so a retry does not
+                // re-read the same bytes, then propagate.
+                if error == HxfsError::Compression
+                    && !self.bad_extents.contains(&extent.physical_block)
+                {
+                    self.bad_extents.push(extent.physical_block);
+                }
+                return Err(error);
+            }
             index += 1;
         }
         Ok(())
@@ -1291,6 +1366,38 @@ pub(crate) fn parse_extent_record_v2(
         },
         meta,
     ))
+}
+
+/// Stage E: parse the payload of an extent tree ROOT block.
+///
+/// Returns the leaf LBAs. The root payload is
+/// `magic(4) + version(4) + count(4) + reserved(4) + leaf_lbas[]`;
+/// a missing magic/version, a zero count, or a leaf count beyond
+/// the payload is `BadTree`.
+pub(crate) fn parse_extent_tree_root(block: &[u8]) -> Result<alloc::vec::Vec<u64>, HxfsError> {
+    use alloc::vec::Vec;
+    let magic = read_u32(block, 0)?;
+    let version = read_u32(block, 4)?;
+    let count = read_u32(block, 8)?;
+    if magic != EXTENT_TREE_ROOT_MAGIC || version != EXTENT_TREE_ROOT_VERSION {
+        return Err(HxfsError::BadTree);
+    }
+    let count = count as usize;
+    if count == 0 || count > EXTENT_TREE_MAX_RECORDS {
+        return Err(HxfsError::BadTree);
+    }
+    let leaf_bytes = count * 8;
+    let available = block.len().saturating_sub(16);
+    if leaf_bytes > available {
+        return Err(HxfsError::BadTree);
+    }
+    let mut leaves = Vec::with_capacity(count);
+    let mut index = 0usize;
+    while index < count {
+        leaves.push(read_u64(block, 16 + index * 8)?);
+        index += 1;
+    }
+    Ok(leaves)
 }
 
 #[cfg(test)]
@@ -2915,6 +3022,394 @@ fn incompressible_full_block_on_encrypted_volume_uses_two_slot_extent() {
         &near_full[..],
         "near-full block must round-trip"
     );
+}
+
+/// Stage C: a data extent whose read fails is marked bad on the
+/// writer's per-mount registry; a second read fails fast without
+/// re-reading the disk, and other files keep working.
+#[cfg(all(test, feature = "crypto-aes-gcm", feature = "compression-engines"))]
+#[test]
+fn stage_c_bad_extent_is_marked_and_fails_fast() {
+    use crate::fixed_writer::{FixedHxfsWriter, MAX_BAD_EXTENTS};
+    use crate::recovery::BlockStore;
+    use crate::writer::VecBlockStore;
+
+    let comps = [crate::synthetic_key::compression_policy()];
+    let boot_image = build_seeded_boot_image(false, crate::synthetic_key::COMPRESSION_POLICY_ID);
+    let mut store = RecordingStore::new(VecBlockStore::with_blocks(512));
+    let boot_blocks = (boot_image.len() / BLOCK_SIZE) as u32;
+    if let Err(e) = store.write_blocks(0, boot_blocks, &boot_image) {
+        assert!(false, "boot write must succeed: {:?}", e);
+        return;
+    }
+    let Ok(mut writer) = FixedHxfsWriter::<RecordingStore, 16, 32, 64>::mount_with_policies(
+        store,
+        &[],
+        &comps,
+        None,
+    ) else {
+        assert!(false, "writer mount must succeed");
+        return;
+    };
+    let root = writer.root_directory();
+    let file = match writer.open_child_file(root, crate::synthetic_key::SEED_FILE_NAME) {
+        Ok(f) => f,
+        Err(e) => {
+            assert!(false, "open_child_file must succeed: {:?}", e);
+            return;
+        }
+    };
+    // A second file that must remain readable after the bad-extent
+    // marking.
+    let good_file = match writer.create_file_child(root, "good.bin") {
+        Ok(f) => f,
+        Err(e) => {
+            assert!(false, "create good.bin must succeed: {:?}", e);
+            return;
+        }
+    };
+    writer.store_mut().start_recording();
+    let mut index = 0usize;
+    while index < 8 {
+        let mut chunk = [0u8; BLOCK_SIZE];
+        fill_compressible_chunk(&mut chunk, index);
+        if let Err(e) = writer.write_file_at(file, (index * BLOCK_SIZE) as u64, &chunk) {
+            assert!(false, "write_file_at must succeed: {:?}", e);
+            return;
+        }
+        index += 1;
+    }
+    let mut good = [0u8; BLOCK_SIZE];
+    fill_compressible_chunk(&mut good, 99);
+    if let Err(e) = writer.write_file_at(good_file, 0, &good) {
+        assert!(false, "good write must succeed: {:?}", e);
+        return;
+    }
+    let ranges = writer.store_mut().stop_recording();
+    let corrupt_lba = ranges[0].0;
+    // Corrupt one byte of the compressed payload of the first
+    // extent (plain volume: payload starts at block offset 0).
+    let mut block = [0u8; BLOCK_SIZE];
+    if writer
+        .store_mut()
+        .read_blocks(corrupt_lba, 1, &mut block)
+        .is_err()
+    {
+        assert!(false, "read for corruption must succeed");
+        return;
+    }
+    block[10] ^= 0x40;
+    if writer
+        .store_mut()
+        .write_blocks(corrupt_lba, 1, &block)
+        .is_err()
+    {
+        assert!(false, "corruption write must succeed");
+        return;
+    }
+
+    // First read fails and marks the extent.
+    let mut buf = vec![0u8; 8 * BLOCK_SIZE];
+    assert_eq!(
+        writer.read_file(file, &mut buf).err(),
+        Some(HxfsError::Compression),
+        "corrupted payload must fail the read"
+    );
+    assert_eq!(writer.bad_extent_count(), 1, "extent must be marked bad");
+    // Second read fails fast (same error, no double-counting).
+    assert_eq!(
+        writer.read_file(file, &mut buf).err(),
+        Some(HxfsError::Compression),
+        "a marked extent must keep failing"
+    );
+    assert_eq!(writer.bad_extent_count(), 1, "marking must deduplicate");
+    // The registry is bounded.
+    assert!(MAX_BAD_EXTENTS >= 1);
+    // Other files still read fine.
+    let mut gbuf = [0u8; BLOCK_SIZE];
+    assert_eq!(
+        writer.read_file(good_file, &mut gbuf),
+        Ok(BLOCK_SIZE),
+        "unrelated file must still be readable"
+    );
+    assert_eq!(&gbuf[..], &good[..]);
+}
+
+/// Stage C: the live scrub re-validates metadata tree blocks and
+/// reads every data extent through the full verify path. A clean
+/// volume reports zero errors; a corrupted payload is counted and
+/// the extent is marked bad.
+#[cfg(all(test, feature = "crypto-aes-gcm", feature = "compression-engines"))]
+#[test]
+fn stage_c_scrub_reports_clean_and_corrupt() {
+    use crate::fixed_writer::FixedHxfsWriter;
+    use crate::recovery::BlockStore;
+    use crate::writer::VecBlockStore;
+
+    let comps = [crate::synthetic_key::compression_policy()];
+    let boot_image = build_seeded_boot_image(false, crate::synthetic_key::COMPRESSION_POLICY_ID);
+    let mut store = RecordingStore::new(VecBlockStore::with_blocks(512));
+    let boot_blocks = (boot_image.len() / BLOCK_SIZE) as u32;
+    if let Err(e) = store.write_blocks(0, boot_blocks, &boot_image) {
+        assert!(false, "boot write must succeed: {:?}", e);
+        return;
+    }
+    let Ok(mut writer) = FixedHxfsWriter::<RecordingStore, 16, 32, 64>::mount_with_policies(
+        store,
+        &[],
+        &comps,
+        None,
+    ) else {
+        assert!(false, "writer mount must succeed");
+        return;
+    };
+    let root = writer.root_directory();
+    let file = match writer.open_child_file(root, crate::synthetic_key::SEED_FILE_NAME) {
+        Ok(f) => f,
+        Err(e) => {
+            assert!(false, "open_child_file must succeed: {:?}", e);
+            return;
+        }
+    };
+    writer.store_mut().start_recording();
+    let mut index = 0usize;
+    while index < 4 {
+        let mut chunk = [0u8; BLOCK_SIZE];
+        fill_compressible_chunk(&mut chunk, index);
+        if let Err(e) = writer.write_file_at(file, (index * BLOCK_SIZE) as u64, &chunk) {
+            assert!(false, "write_file_at must succeed: {:?}", e);
+            return;
+        }
+        index += 1;
+    }
+    let ranges = writer.store_mut().stop_recording();
+    if let Err(e) = writer.publish_checkpoint() {
+        assert!(false, "publish_checkpoint must succeed: {:?}", e);
+        return;
+    }
+    // Clean scrub.
+    let clean = match writer.scrub() {
+        Ok(s) => s,
+        Err(e) => {
+            assert!(false, "scrub must run: {:?}", e);
+            return;
+        }
+    };
+    assert_eq!(clean.errors, 0, "clean volume must scrub with zero errors");
+    assert!(
+        clean.metadata_blocks >= 2,
+        "at least superblock + tree blocks"
+    );
+    assert!(clean.data_blocks >= 4, "four data blocks verified");
+    assert_eq!(clean.data_bytes, 4 * BLOCK_SIZE as u64);
+    // Corrupt one payload byte and scrub again.
+    let corrupt_lba = ranges[0].0;
+    let mut block = [0u8; BLOCK_SIZE];
+    if writer
+        .store_mut()
+        .read_blocks(corrupt_lba, 1, &mut block)
+        .is_err()
+    {
+        assert!(false, "read for corruption must succeed");
+        return;
+    }
+    block[10] ^= 0x40;
+    if writer
+        .store_mut()
+        .write_blocks(corrupt_lba, 1, &block)
+        .is_err()
+    {
+        assert!(false, "corruption write must succeed");
+        return;
+    }
+    let corrupt = match writer.scrub() {
+        Ok(s) => s,
+        Err(e) => {
+            assert!(false, "scrub must run on corrupt volume: {:?}", e);
+            return;
+        }
+    };
+    assert!(
+        corrupt.errors >= 1,
+        "corrupted payload must be counted by scrub (errors={})",
+        corrupt.errors
+    );
+    assert!(
+        writer.bad_extent_count() >= 1,
+        "scrub must mark the bad extent"
+    );
+}
+
+/// Stage C: the structural fsck re-validates the persisted roots
+/// and the in-memory object model. A clean volume reports zero
+/// findings; a corrupted superblock payload is counted.
+#[cfg(all(test, feature = "crypto-aes-gcm", feature = "compression-engines"))]
+#[test]
+fn stage_c_fsck_reports_clean_and_corrupt() {
+    use crate::fixed_writer::FixedHxfsWriter;
+    use crate::recovery::BlockStore;
+    use crate::writer::VecBlockStore;
+
+    let comps = [crate::synthetic_key::compression_policy()];
+    let boot_image = build_seeded_boot_image(false, crate::synthetic_key::COMPRESSION_POLICY_ID);
+    let mut store = RecordingStore::new(VecBlockStore::with_blocks(512));
+    let boot_blocks = (boot_image.len() / BLOCK_SIZE) as u32;
+    if let Err(e) = store.write_blocks(0, boot_blocks, &boot_image) {
+        assert!(false, "boot write must succeed: {:?}", e);
+        return;
+    }
+    let Ok(mut writer) = FixedHxfsWriter::<RecordingStore, 16, 32, 64>::mount_with_policies(
+        store,
+        &[],
+        &comps,
+        None,
+    ) else {
+        assert!(false, "writer mount must succeed");
+        return;
+    };
+    let root = writer.root_directory();
+    let file = match writer.open_child_file(root, crate::synthetic_key::SEED_FILE_NAME) {
+        Ok(f) => f,
+        Err(e) => {
+            assert!(false, "open_child_file must succeed: {:?}", e);
+            return;
+        }
+    };
+    let mut chunk = [0u8; BLOCK_SIZE];
+    fill_compressible_chunk(&mut chunk, 0);
+    if let Err(e) = writer.write_file_at(file, 0, &chunk) {
+        assert!(false, "write_file_at must succeed: {:?}", e);
+        return;
+    }
+    if let Err(e) = writer.publish_checkpoint() {
+        assert!(false, "publish_checkpoint must succeed: {:?}", e);
+        return;
+    }
+    let clean = writer.fsck();
+    assert_eq!(clean.errors, 0, "clean volume must fsck clean");
+    assert!(clean.checks >= 5, "fsck must run its full check set");
+    // Corrupt the persisted superblock payload.
+    let mut block = [0u8; BLOCK_SIZE];
+    if writer.store_mut().read_blocks(0, 1, &mut block).is_err() {
+        assert!(false, "read superblock must succeed");
+        return;
+    }
+    block[HEADER_BYTES + 10] ^= 0x01;
+    if writer.store_mut().write_blocks(0, 1, &block).is_err() {
+        assert!(false, "corrupt superblock write must succeed");
+        return;
+    }
+    let corrupt = writer.fsck();
+    assert!(
+        corrupt.errors >= 1,
+        "corrupted superblock must be counted by fsck (errors={})",
+        corrupt.errors
+    );
+}
+
+/// Stage E: multi-block extent trees scale a single object past the
+/// 101-record single-block limit. This test writes a 16 MiB file
+/// (4096 extents -> 41 leaf blocks + root), asserts the on-disk
+/// tree shape, and round-trips it byte-for-byte through a remount
+/// on a plain volume with the LZ4 policy (compressible data).
+#[cfg(all(test, feature = "crypto-aes-gcm", feature = "compression-engines"))]
+#[test]
+fn stage_e_16mib_file_uses_extent_tree_and_round_trips() {
+    use crate::fixed_writer::FixedHxfsWriter;
+    use crate::reader::SliceBlockReader;
+    use crate::recovery::BlockStore;
+    use crate::writer::VecBlockStore;
+    use alloc::vec;
+
+    const CHUNKS: usize = 4096; // 16 MiB
+    let comps = [crate::synthetic_key::compression_policy()];
+    let boot_image = build_seeded_boot_image(false, crate::synthetic_key::COMPRESSION_POLICY_ID);
+    let mut store = RecordingStore::new(VecBlockStore::with_blocks(48 * 1024));
+    let boot_blocks = (boot_image.len() / BLOCK_SIZE) as u32;
+    if let Err(e) = store.write_blocks(0, boot_blocks, &boot_image) {
+        assert!(false, "boot write must succeed: {:?}", e);
+        return;
+    }
+    let Ok(mut writer) = FixedHxfsWriter::<RecordingStore, 16, 32, 8192>::mount_with_policies(
+        store,
+        &[],
+        &comps,
+        None,
+    ) else {
+        assert!(false, "writer mount must succeed");
+        return;
+    };
+    let root = writer.root_directory();
+    let file = match writer.open_child_file(root, crate::synthetic_key::SEED_FILE_NAME) {
+        Ok(f) => f,
+        Err(e) => {
+            assert!(false, "open_child_file must succeed: {:?}", e);
+            return;
+        }
+    };
+    writer.store_mut().start_recording();
+    let mut index = 0usize;
+    while index < CHUNKS {
+        let mut chunk = [0u8; BLOCK_SIZE];
+        fill_compressible_chunk(&mut chunk, index);
+        if let Err(e) = writer.write_file_at(file, (index * BLOCK_SIZE) as u64, &chunk) {
+            assert!(false, "write_file_at {index} must succeed: {:?}", e);
+            return;
+        }
+        index += 1;
+    }
+    let _ranges = writer.store_mut().stop_recording();
+    if let Err(e) = writer.publish_checkpoint() {
+        assert!(false, "publish_checkpoint must succeed: {:?}", e);
+        return;
+    }
+    let store = writer.into_store();
+    let image = store.inner.image().to_vec();
+    // On-disk tree shape: the extent tree root block must exist.
+    let root_count = count_metadata_blocks(&image, BLOCK_TYPE_EXTENT_TREE_ROOT);
+    let leaf_count = count_metadata_blocks(&image, BLOCK_TYPE_EXTENT_TREE_LEAF);
+    assert!(root_count >= 1, "extent tree root must be present");
+    assert!(
+        leaf_count >= 41,
+        "16 MiB / 4 KiB = 4096 records must span >= 41 leaves (got {leaf_count})"
+    );
+    // Reader round-trip.
+    let reader = SliceBlockReader::new(&image);
+    let Ok(mut fs) = Hxfs::mount_with_policies(reader, &[], &comps, None) else {
+        assert!(false, "remount must succeed");
+        return;
+    };
+    let file = match fs.open_path("/seed.bin") {
+        Ok(f) => f,
+        Err(e) => {
+            assert!(false, "open_path must succeed: {:?}", e);
+            return;
+        }
+    };
+    let mut buf = vec![0u8; CHUNKS * BLOCK_SIZE];
+    match fs.read_file(file, &mut buf) {
+        Ok(n) => assert_eq!(n, CHUNKS * BLOCK_SIZE, "read length must match"),
+        Err(e) => {
+            assert!(false, "read_file must succeed: {:?}", e);
+            return;
+        }
+    }
+    // Verify the whole 16 MiB byte-for-byte (compressible pattern).
+    let mut expected = [0u8; BLOCK_SIZE];
+    fill_compressible_chunk(&mut expected, 0);
+    let mut pos = 0usize;
+    let mut chunk_index = 0usize;
+    while pos < buf.len() {
+        let mut want = [0u8; BLOCK_SIZE];
+        fill_compressible_chunk(&mut want, chunk_index);
+        if buf[pos..pos + BLOCK_SIZE] != want[..] {
+            assert!(false, "byte mismatch at block {chunk_index}");
+            return;
+        }
+        pos += BLOCK_SIZE;
+        chunk_index += 1;
+    }
+    let _ = expected;
 }
 
 /// Stage B.5 companion: the incompressible fallback on a PLAIN

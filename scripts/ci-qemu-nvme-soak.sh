@@ -15,13 +15,20 @@ rm -f "$log"
 
 echo "[soak] profile=${profile} seconds=${seconds} log=${log} nvme_img=${nvme_img} layout=${nvme_layout} inject=${inject}"
 echo "[soak] building ISO before NVMe soak"
-# Stage B.5: the injection mode builds the ISO with the
-# synthetic-key feature so the embedded hxfs-service mounts the
-# encrypted+compressed soak volume and runs its boot self-check.
-# Production builds (and the plain soak mode) leave the variable
-# unset and the test wiring stays out of the binary.
+# Injection modes build the ISO with the synthetic-key feature so
+# the embedded hxfs-service mounts the seeded volume and runs its
+# boot self-check. Production builds (and the plain soak mode)
+# leave the variable unset and the test wiring stays out of the
+# binary.
+seed_args=()
 if [[ "$inject" == "1" ]]; then
     export HUESOS_HXFS_SERVICE_FEATURES=synthetic-key
+    seed_args=(--inject-bad-gcm-tag)
+elif [[ "$inject" == "2" ]]; then
+    export HUESOS_HXFS_SERVICE_FEATURES=synthetic-key
+    seed_args=(--inject-bad-crc)
+fi
+if [[ "$inject" == "1" || "$inject" == "2" ]]; then
     # Stage D: the synthetic volume key is baked into the KERNEL as
     # the bootloader key blob (single source of truth: the seed
     # tool's --print-volume-key-hex). The service receives it via
@@ -75,14 +82,16 @@ if [[ ! -f "$nvme_img" ]]; then
         echo "[soak] image too small for Hxfs (need >= 32 KiB)" >&2
         exit 1
     fi
-    if [[ "$inject" == "1" ]]; then
-        # Stage B.5: seeded encrypted+compressed volume with one
-        # bit of the seed file's GCM ciphertext flipped. The volume
-        # still mounts (metadata intact); the service self-check
-        # must report `bad-gcm-tag-marked` and keep serving.
-        echo "[soak] creating seeded Hxfs image with bad-GCM injection: $nvme_img"
+    if [[ "$inject" == "1" || "$inject" == "2" ]]; then
+        # Injection modes: seeded volume whose seed-file data block
+        # is corrupted (mode 1: GCM ciphertext bit on an encrypted
+        # volume; mode 2: compressed-payload byte on a plain
+        # volume). Metadata stays intact, so the volume still
+        # mounts; the service self-check must report the precise
+        # marker and keep serving.
+        echo "[soak] creating seeded Hxfs image (inject=${inject}): $nvme_img"
         python3 tools/mkhxfs.py --output "$nvme_img" --blocks "$hxfs_blocks" \
-            --seed-file seed.bin --seed-size 3584 --inject-bad-gcm-tag >/dev/null
+            --seed-file seed.bin --seed-size 3584 "${seed_args[@]}" >/dev/null
     else
         python3 tools/mkhxfs.py --output "$nvme_img" --blocks "$hxfs_blocks" >/dev/null
     fi
@@ -142,19 +151,28 @@ required=(
     "[driver-manager] registered identified block:nvme namespace"
     "[hxfs] service started"
 )
-if [[ "$inject" == "1" ]]; then
-    # Stage B.5: the boot self-check must have detected the flipped
-    # GCM bit (bad-gcm-tag-marked) and exercised the O_DIRECT deny
-    # probe (odirect-deny-ok) while the service kept serving.
-    # Phase-1 follow-up: the on-target write path must have
-    # round-tripped both a compressed file (write-roundtrip-ok) and
-    # an incompressible full block through the two-slot extent path
-    # (multi-slot-write-ok).
+if [[ "$inject" == "1" || "$inject" == "2" ]]; then
+    # Injection modes: the boot self-check must have detected the
+    # seeded corruption with the precise marker (mode 1: GCM tag on
+    # an encrypted volume; mode 2: payload CRC on a plain volume),
+    # marked the extent bad, exercised the O_DIRECT deny probe and
+    # the on-target write path, and run the Stage C reliability
+    # probes (live scrub, structural fsck, quota enforcement) — all
+    # while the service kept serving.
+    bad_marker="[hxfs] bad-gcm-tag-marked"
+    if [[ "$inject" == "2" ]]; then
+        bad_marker="[hxfs] bad-checksum-marked"
+    fi
     required+=(
-        "[hxfs] bad-gcm-tag-marked"
+        "$bad_marker"
+        "[hxfs] extent-bad-marked"
         "[hxfs] odirect-deny-ok"
         "[hxfs] write-roundtrip-ok"
         "[hxfs] multi-slot-write-ok"
+        "[hxfs] scrub complete"
+        "[hxfs] fsck clean"
+        "[hxfs] quota-enforced-ok"
+        "[hxfs] stage-e-1mib-ok"
     )
 fi
 for marker in "${required[@]}"; do
