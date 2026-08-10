@@ -3437,7 +3437,12 @@ fn stage_f_hxblob_round_trip_survives_remount() {
         return;
     }
     let Ok(mut writer) =
-        FixedHxfsWriter::<_, 16, 32, 256>::mount_with_policies(store, &policies, &comps)
+        FixedHxfsWriter::<_, 16, 32, 256>::mount_with_policies(
+            store,
+            &policies,
+            &comps,
+            Some(&crate::synthetic_key::VOLUME_KEY),
+        )
     else {
         assert!(false, "writer mount must succeed");
         return;
@@ -3493,7 +3498,12 @@ fn stage_f_hxblob_round_trip_survives_remount() {
         return;
     }
     let Ok(mut fs) =
-        FixedHxfsWriter::<_, 16, 32, 256>::mount_with_policies(remount_store, &policies, &comps)
+        FixedHxfsWriter::<_, 16, 32, 256>::mount_with_policies(
+            remount_store,
+            &policies,
+            &comps,
+            Some(&crate::synthetic_key::VOLUME_KEY),
+        )
     else {
         assert!(false, "remount must succeed");
         return;
