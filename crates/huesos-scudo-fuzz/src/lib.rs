@@ -130,6 +130,15 @@ mod tests {
                 // contents survived everything that happened since.
                 let index = rng.below(count);
                 let entry = live[index];
+                // Re-check alignment at free time, not just at
+                // hand-out: this is the invariant the previous
+                // allocator broke on its reuse path.
+                assert_eq!(
+                    entry.ptr as usize % entry.align,
+                    0,
+                    "a live block lost its {}-byte alignment",
+                    entry.align
+                );
                 let mut i = 0;
                 while i < entry.size {
                     // SAFETY: `entry` is a live allocation this harness
@@ -187,10 +196,21 @@ mod tests {
                         // The reported usable size must cover the request.
                         // SAFETY: `ptr` is live.
                         match unsafe { allocator.usable_size(ptr) } {
-                            Ok(usable) => assert!(
-                                usable >= size,
-                                "usable_size {usable} smaller than request {size}"
-                            ),
+                            Ok(usable) => {
+                                assert!(
+                                    usable >= size,
+                                    "usable_size {usable} smaller than request {size}"
+                                );
+                                // The whole reported extent must be
+                                // real memory, not an optimistic
+                                // number: write it and read it back.
+                                // SAFETY: the allocator states these
+                                // bytes belong to this allocation.
+                                unsafe { core::ptr::write_bytes(ptr, tag, usable) };
+                                // SAFETY: just written above.
+                                let last = unsafe { ptr.add(usable - 1).read() };
+                                assert_eq!(last, tag, "usable_size overstates the block");
+                            }
                             Err(error) => {
                                 assert!(false, "usable_size failed on a live pointer: {error:?}")
                             }

@@ -311,7 +311,16 @@ mod tests {
                     request_size: 48,
                 };
                 unsafe { write_header(header_end, &written) };
-                block.0[byte_index] ^= 0x01;
+                // Corrupt through the same pointer the header was
+                // written through. Touching `block.0` directly makes
+                // the compiler think the store is dead (it cannot see
+                // the raw-pointer read that follows) and warn.
+                // SAFETY: `byte_index` is inside the 16 header bytes,
+                // which live at the start of `block`.
+                unsafe {
+                    let byte = header_end.sub(HEADER_BYTES).add(byte_index);
+                    byte.write(byte.read() ^ 0x01);
+                }
                 let read = unsafe { read_header(header_end) };
                 assert_eq!(
                     read,

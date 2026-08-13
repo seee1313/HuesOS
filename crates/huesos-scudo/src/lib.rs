@@ -280,6 +280,30 @@ impl<B: Backend> Allocator<B> {
         Ok(unsafe { Secondary::finish_allocation(&self.backend, offset, size) })
     }
 
+    /// The size that was handed to [`Secondary::allocate`] for this
+    /// chunk.
+    ///
+    /// An over-aligned secondary allocation is padded by `align`
+    /// before it reaches the secondary, so the block it committed is
+    /// larger than the user's request. Freeing it, or measuring it,
+    /// has to use that same padded figure: re-deriving it from
+    /// `request_size` alone loses the padding, which decommits fewer
+    /// pages than were committed (a leak) and files the block in the
+    /// reuse cache under a size it does not have.
+    ///
+    /// The padding is recovered from `class`, which the allocate path
+    /// set to `log2(align)`.
+    fn secondary_block_size(header: &chunk::ChunkHeader) -> Option<usize> {
+        let request = header.request_size as usize;
+        if header.class == 0 {
+            // Not over-aligned: the request went to the secondary
+            // unpadded.
+            return Some(request);
+        }
+        let align = 1usize.checked_shl(header.class as u32)?;
+        request.checked_add(align)?.checked_add(HEADER_BYTES)
+    }
+
     /// Serve an over-aligned request.
     ///
     /// The block is over-allocated by `align` so a correctly aligned
@@ -306,7 +330,13 @@ impl<B: Backend> Allocator<B> {
                     .secondary
                     .allocate(&self.backend, padded)
                     .map_err(AllocError::Secondary)?;
-                (offset, Origin::Secondary, 0u8)
+                // Record the padding so `deallocate` and
+                // `usable_size` can reproduce `padded` exactly. The
+                // `class` field is otherwise unused for secondary
+                // chunks, and an alignment is a power of two, so its
+                // log2 fits in the byte. `0` keeps its old meaning:
+                // a secondary chunk that was never over-aligned.
+                (offset, Origin::Secondary, align.trailing_zeros() as u8)
             }
         };
 
@@ -396,12 +426,12 @@ impl<B: Backend> Allocator<B> {
                 Origin::Primary => Some(header.class),
                 Origin::Secondary => None,
             },
-            request_size: if header.origin == Origin::Secondary {
+            request_size: match header.origin {
                 // The secondary needs the padded size to compute the
                 // same page count it committed.
-                request_size + header.offset as usize
-            } else {
-                request_size
+                Origin::Secondary => Self::secondary_block_size(&header)
+                    .ok_or(AllocError::Corruption(HeaderError::Malformed))?,
+                Origin::Primary => request_size,
             },
         };
 
@@ -441,14 +471,25 @@ impl<B: Backend> Allocator<B> {
         // SAFETY: delegated to the caller's contract; the header is
         // still checksum-validated before its fields are used.
         let header = unsafe { chunk::read_header(ptr) }.map_err(AllocError::Corruption)?;
-        match header.origin {
-            Origin::Primary => size_for_class(header.class as usize)
-                .map(|size| size - header.offset as usize)
-                .ok_or(AllocError::Corruption(HeaderError::Malformed)),
-            Origin::Secondary => Ok(page_align_up(header.request_size as usize + HEADER_BYTES)
-                - HEADER_BYTES
-                - header.offset as usize),
-        }
+        let shift = header.offset as usize;
+        let usable = match header.origin {
+            // The primary hands out a whole chunk of the class; the
+            // header sits in the stride ahead of it, so the class
+            // size is body space and only the alignment shift comes
+            // off it.
+            Origin::Primary => {
+                size_for_class(header.class as usize).and_then(|size| size.checked_sub(shift))
+            }
+            // The secondary committed `page_align_up(block + header)`
+            // bytes, of which the header and the alignment shift are
+            // not the caller's.
+            Origin::Secondary => Self::secondary_block_size(&header)
+                .and_then(|block| block.checked_add(HEADER_BYTES))
+                .map(page_align_up)
+                .and_then(|committed| committed.checked_sub(HEADER_BYTES))
+                .and_then(|body| body.checked_sub(shift)),
+        };
+        usable.ok_or(AllocError::Corruption(HeaderError::Malformed))
     }
 }
 
@@ -778,5 +819,107 @@ mod tests {
             }
             assert_eq!(unsafe { allocator.deallocate(ptr) }, Ok(()));
         }
+    }
+
+    /// An over-aligned secondary allocation is padded by `align`
+    /// before it reaches the secondary, so the block committed is
+    /// bigger than the user's request. Everything downstream has to
+    /// use that padded figure.
+    ///
+    /// The bug this pins: `deallocate` and `usable_size` re-derived
+    /// the block size from `request_size` alone, losing the padding.
+    /// Freeing then decommitted fewer pages than were committed —
+    /// leaking a page per allocation and filing the block in the
+    /// reuse cache under a size it did not have — while
+    /// `usable_size` could report *less* than the caller asked for.
+    ///
+    /// `usable_size_is_at_least_the_request` missed it because it
+    /// only ever passed `align = 8`, which never reaches the
+    /// over-aligned path at all.
+    #[test]
+    fn over_aligned_secondary_reports_and_returns_its_whole_block() {
+        let mut allocator = allocator(4096);
+
+        // Sizes past MAX_PRIMARY_SIZE so these land in the secondary,
+        // with alignments above MIN_ALIGNMENT so they take the
+        // over-aligned path.
+        for size in [65_537usize, 70_000, 85_997, 100_000] {
+            for align in [32usize, 64, 4096, 8192] {
+                let committed_before = allocator.stats().live_bytes;
+
+                let ptr = match allocator.allocate(size, align) {
+                    Ok(ptr) => ptr,
+                    // OOM is legitimate for the larger combinations.
+                    Err(_) => continue,
+                };
+                assert_eq!(ptr as usize % align, 0, "alignment {align} not honoured");
+
+                let usable = match unsafe { allocator.usable_size(ptr) } {
+                    Ok(usable) => usable,
+                    Err(error) => {
+                        assert!(false, "usable_size failed: {error:?}");
+                        return;
+                    }
+                };
+                assert!(
+                    usable >= size,
+                    "size {size} align {align}: usable_size {usable} is below the request"
+                );
+
+                // Every byte usable_size claims must be real memory.
+                unsafe { core::ptr::write_bytes(ptr, 0xA5, usable) };
+                assert_eq!(unsafe { ptr.add(usable - 1).read() }, 0xA5);
+
+                assert_eq!(unsafe { allocator.deallocate(ptr) }, Ok(()));
+                assert_eq!(allocator.flush_quarantine(), Ok(()));
+
+                // The leak check: freeing must give back exactly what
+                // allocating took, so a repeated cycle cannot drift.
+                assert_eq!(
+                    allocator.stats().live_bytes,
+                    committed_before,
+                    "size {size} align {align}: accounting drifted across a free"
+                );
+            }
+        }
+    }
+
+    /// Repeat one over-aligned secondary cycle many times: a block
+    /// whose free decommits less than its allocate committed shows up
+    /// as unbounded growth here, even though a single round trip
+    /// looks fine.
+    #[test]
+    fn repeated_over_aligned_secondary_cycles_do_not_grow_committed_memory() {
+        let mut allocator = allocator(4096);
+        let (size, align) = (70_000usize, 4096usize);
+
+        // Warm up so first-touch commits are not counted as growth.
+        for _ in 0..8 {
+            if let Ok(ptr) = allocator.allocate(size, align) {
+                assert_eq!(unsafe { allocator.deallocate(ptr) }, Ok(()));
+                assert_eq!(allocator.flush_quarantine(), Ok(()));
+            }
+        }
+        let settled = allocator.primary_committed_bytes();
+
+        for round in 0..64 {
+            let ptr = match allocator.allocate(size, align) {
+                Ok(ptr) => ptr,
+                Err(error) => {
+                    // With the leak present the area is exhausted
+                    // within a few dozen rounds; that is the failure.
+                    assert!(false, "round {round}: allocation failed with {error:?}");
+                    return;
+                }
+            };
+            assert_eq!(unsafe { allocator.deallocate(ptr) }, Ok(()));
+            assert_eq!(allocator.flush_quarantine(), Ok(()));
+        }
+
+        assert_eq!(
+            allocator.primary_committed_bytes(),
+            settled,
+            "committed memory grew across steady-state over-aligned cycles"
+        );
     }
 }
