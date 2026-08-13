@@ -871,7 +871,10 @@ impl<
         let block = make_metadata_block_for_volume(
             BLOCK_TYPE_HXBLOB_INDEX_TREE,
             self.system_volume.root_object_id,
-            lba,
+            MetadataBlockSite {
+                lba,
+                generation: self.metadata_generation(),
+            },
             &payload[..4 + written * 92],
             args.0,
             args.1,
@@ -907,7 +910,10 @@ impl<
         let root = make_metadata_block_for_volume(
             BLOCK_TYPE_HXBLOB_INDEX_TREE_ROOT,
             self.system_volume.root_object_id,
-            lba,
+            MetadataBlockSite {
+                lba,
+                generation: self.metadata_generation(),
+            },
             &root_payload[..16 + leaf_count * 8],
             args.0,
             args.1,
@@ -941,7 +947,10 @@ impl<
                 leaves.push(make_metadata_block_for_volume(
                     BLOCK_TYPE_HXBLOB_INDEX_TREE_LEAF,
                     self.system_volume.root_object_id,
-                    leaf_lba,
+                    MetadataBlockSite {
+                        lba: leaf_lba,
+                        generation: self.metadata_generation(),
+                    },
                     &payload[..4 + leaf_count_records * 92],
                     args.0,
                     args.1,
@@ -963,7 +972,10 @@ impl<
         make_metadata_block_for_volume(
             BLOCK_TYPE_HXBLOB_MERKLE_TREE,
             self.system_volume.root_object_id,
-            lba,
+            MetadataBlockSite {
+                lba,
+                generation: self.metadata_generation(),
+            },
             &payload[..4],
             args.0,
             args.1,
@@ -1424,7 +1436,7 @@ impl<
             // incompressible full block on an encrypted volume is
             // stored as a two-slot extent
             // (`EXTENT_FLAG_MULTI_SLOT`, `block_count = 2`).
-            let (physical_block, kind) = self.write_data_blocks(data, object)?;
+            let (physical_block, generation, kind) = self.write_data_blocks(data, object)?;
             let (flags, block_count, compression) = match kind {
                 ExtentWriteKind::Plain => (0, 1, None),
                 ExtentWriteKind::Compressed(meta) => (EXTENT_FLAG_COMPRESSED, 1, Some(meta)),
@@ -1437,6 +1449,7 @@ impl<
                     physical_block,
                     block_count,
                     flags,
+                    generation,
                 },
                 compression,
             })?;
@@ -2899,11 +2912,40 @@ impl<
     /// loud `Unsupported` failure, which made media files,
     /// archives and already-compressed data unwritable on
     /// encrypted volumes.
+    /// Reserve `count` physical blocks for file data and report the
+    /// generation to seal them under.
+    ///
+    /// Every data block goes through here so that block reuse, when
+    /// the allocator starts handing back freed extents, has exactly
+    /// one place to become safe: the generation returned here is what
+    /// the AES-GCM nonce is built from, and it must be strictly
+    /// greater than any previous tenancy of the same block.
+    ///
+    /// Today allocation is still the append-only `next_lba` bump, so
+    /// every block is fresh and generation 0 is correct by
+    /// construction. `block_generation` is the seam that makes this
+    /// honest rather than accidental.
+    fn reserve_data_blocks(&mut self, count: u64) -> FixedResult<(u64, u64)> {
+        let start = self.next_lba;
+        let generation = self.block_generation(start);
+        self.next_lba = self.next_lba.checked_add(count).ok_or(HxfsError::NoSpace)?;
+        Ok((start, generation))
+    }
+
+    /// The generation to seal a freshly reserved block under.
+    ///
+    /// A block that has never been handed out before is generation 0.
+    /// Once the allocator can return freed blocks, this consults the
+    /// per-block tenancy count instead, and the nonce changes with it.
+    fn block_generation(&self, _physical_block: u64) -> u64 {
+        0
+    }
+
     fn write_data_blocks(
         &mut self,
         data: &[u8],
         object: ObjectDescriptor,
-    ) -> FixedResult<(u64, ExtentWriteKind)> {
+    ) -> FixedResult<(u64, u64, ExtentWriteKind)> {
         // The LZ4 worst-case output bound is
         // `16 + 4 + input_len * 110 / 100` (lz4_flex
         // `get_maximum_output_size`); a scratch the size of the
@@ -2961,12 +3003,12 @@ impl<
             encrypted && block_bytes.len() > crate::extent_crypto::EXTENT_PLAINTEXT_BYTES;
         #[cfg(not(feature = "crypto-aes-gcm"))]
         let multi_slot = false;
-        let start = self.next_lba;
         if multi_slot {
             self.quota_admits(2 * BLOCK_SIZE_U64, 0)?;
         } else {
             self.quota_admits(BLOCK_SIZE_U64, 0)?;
         }
+        let (start, generation) = self.reserve_data_blocks(if multi_slot { 2 } else { 1 })?;
         // Two-slot path: split the incompressible plaintext at the
         // envelope capacity and encrypt each half in its own slot.
         // (Only reachable with `crypto-aes-gcm`; `multi_slot` is
@@ -2986,6 +3028,7 @@ impl<
             crate::extent_crypto::encrypt_extent_block(
                 key,
                 start,
+                generation,
                 &self.volume_uuid,
                 head,
                 &mut slot0,
@@ -2995,6 +3038,7 @@ impl<
             crate::extent_crypto::encrypt_extent_block(
                 key,
                 start + 1,
+                generation,
                 &self.volume_uuid,
                 tail,
                 &mut slot1,
@@ -3002,8 +3046,7 @@ impl<
             .map_err(|_| HxfsError::BadBlock)?;
             self.store.write_blocks(start, 1, &slot0)?;
             self.store.write_blocks(start + 1, 1, &slot1)?;
-            self.next_lba = self.next_lba.checked_add(2).ok_or(HxfsError::NoSpace)?;
-            return Ok((start, ExtentWriteKind::MultiSlot));
+            return Ok((start, generation, ExtentWriteKind::MultiSlot));
         }
         // Stage B.3 wire: when the volume is encrypted,
         // the on-disk extent block is the AES-256-GCM
@@ -3019,6 +3062,7 @@ impl<
             crate::extent_crypto::encrypt_extent_block(
                 key,
                 start,
+                generation,
                 &self.volume_uuid,
                 block_bytes,
                 &mut ciphertext,
@@ -3045,12 +3089,11 @@ impl<
             block
         };
         self.store.write_blocks(start, 1, &block)?;
-        self.next_lba = self.next_lba.checked_add(1).ok_or(HxfsError::NoSpace)?;
         let kind = match compression {
             Some(meta) => ExtentWriteKind::Compressed(meta),
             None => ExtentWriteKind::Plain,
         };
-        Ok((start, kind))
+        Ok((start, generation, kind))
     }
 
     fn copy_extents(&mut self, object_id: u64, out: &mut [u8]) -> FixedResult<()> {
@@ -3114,6 +3157,7 @@ impl<
             let mut dec1 = [0u8; BLOCK_SIZE];
             let plain0 = match self.decrypt_extent_block_if_encrypted(
                 extent.physical_block,
+                extent.generation,
                 &slot0,
                 &mut dec0,
             ) {
@@ -3125,6 +3169,7 @@ impl<
             };
             let plain1 = match self.decrypt_extent_block_if_encrypted(
                 extent.physical_block + 1,
+                extent.generation,
                 &slot1,
                 &mut dec1,
             ) {
@@ -3168,6 +3213,7 @@ impl<
             // does not re-read the same bytes.
             let plain: &[u8] = match self.decrypt_extent_block_if_encrypted(
                 extent.physical_block + extent_block as u64,
+                extent.generation,
                 &scratch,
                 &mut decrypted,
             ) {
@@ -3241,10 +3287,15 @@ impl<
                 .read_blocks(extent.physical_block + 1, 1, &mut slot1)?;
             let mut dec0 = [0u8; BLOCK_SIZE];
             let mut dec1 = [0u8; BLOCK_SIZE];
-            let plain0 =
-                self.decrypt_extent_block_if_encrypted(extent.physical_block, &slot0, &mut dec0)?;
+            let plain0 = self.decrypt_extent_block_if_encrypted(
+                extent.physical_block,
+                extent.generation,
+                &slot0,
+                &mut dec0,
+            )?;
             let plain1 = self.decrypt_extent_block_if_encrypted(
                 extent.physical_block + 1,
+                extent.generation,
                 &slot1,
                 &mut dec1,
             )?;
@@ -3265,6 +3316,7 @@ impl<
             .read_blocks(extent.physical_block + block_offset, 1, &mut scratch)?;
         let plain: &[u8] = self.decrypt_extent_block_if_encrypted(
             extent.physical_block + block_offset,
+            extent.generation,
             &scratch,
             &mut decrypted,
         )?;
@@ -3294,6 +3346,7 @@ impl<
     fn decrypt_extent_block_if_encrypted<'a>(
         &self,
         physical_block: u64,
+        generation: u64,
         scratch: &'a [u8; BLOCK_SIZE],
         decrypted: &'a mut [u8; BLOCK_SIZE],
     ) -> FixedResult<&'a [u8]> {
@@ -3302,6 +3355,7 @@ impl<
             crate::extent_crypto::decrypt_extent_block(
                 key,
                 physical_block,
+                generation,
                 &self.volume_uuid,
                 scratch,
                 decrypted,
@@ -3311,7 +3365,7 @@ impl<
         }
         #[cfg(not(feature = "crypto-aes-gcm"))]
         {
-            let _ = (physical_block, decrypted);
+            let _ = (physical_block, generation, decrypted);
         }
         Ok(scratch)
     }
@@ -3406,7 +3460,10 @@ impl<
         make_metadata_block_for_volume(
             BLOCK_TYPE_DIRECTORY,
             object_id,
-            lba,
+            MetadataBlockSite {
+                lba,
+                generation: self.metadata_generation(),
+            },
             &payload[..16 + written * DIR_RECORD_BYTES],
             args.0,
             args.1,
@@ -3422,6 +3479,22 @@ impl<
     /// builder. Defined as a tuple expression so the cfg
     /// attributes can sit on the field values, not on the
     /// expression itself.
+    /// Generation to seal encrypted metadata blocks under.
+    ///
+    /// Metadata blocks are copy-on-write — a checkpoint writes them to
+    /// freshly bumped LBAs rather than overwriting the previous copy —
+    /// so today no metadata LBA is ever encrypted twice. Binding the
+    /// checkpoint sequence anyway means that stops being an accident:
+    /// if a future change ever rewrites a metadata block in place, the
+    /// nonce moves with the sequence instead of silently repeating.
+    ///
+    /// The value is written into `BlockHeader::generation`, and the
+    /// read path feeds that field back into the AEAD, so writer and
+    /// reader cannot drift apart.
+    fn metadata_generation(&self) -> u64 {
+        self.superblock.sequence_number
+    }
+
     #[cfg(feature = "crypto-aes-gcm")]
     fn encryption_args(
         &self,
@@ -3532,6 +3605,13 @@ impl<
                             payload[offset + 32..offset + 36]
                                 .copy_from_slice(&meta.payload_crc32c.to_le_bytes());
                         }
+                        // Bytes 36..40 were reserved-zero in the
+                        // original v2 record, so writing the
+                        // generation here keeps the record size and
+                        // every tree geometry unchanged, and an old
+                        // volume still reads back generation 0.
+                        payload[offset + 36..offset + 40]
+                            .copy_from_slice(&(extent.extent.generation as u32).to_le_bytes());
                     }
                     written += 1;
                 }
@@ -3542,7 +3622,10 @@ impl<
         let block = make_metadata_block_for_volume(
             block_type,
             object_id,
-            lba,
+            MetadataBlockSite {
+                lba,
+                generation: self.metadata_generation(),
+            },
             &payload[..16 + written * record_bytes],
             args.0,
             args.1,
@@ -3577,7 +3660,10 @@ impl<
         let root = make_metadata_block_for_volume(
             BLOCK_TYPE_EXTENT_TREE_ROOT,
             object_id,
-            lba,
+            MetadataBlockSite {
+                lba,
+                generation: self.metadata_generation(),
+            },
             &root_payload[..root_payload_len],
             args_enc,
             args_key.as_ref(),
@@ -3616,7 +3702,10 @@ impl<
                 leaves.push(make_metadata_block_for_volume(
                     BLOCK_TYPE_EXTENT_TREE_LEAF,
                     object_id,
-                    leaf_lba,
+                    MetadataBlockSite {
+                        lba: leaf_lba,
+                        generation: self.metadata_generation(),
+                    },
                     &leaf_payload[..EXTENT_LEAF_RECORDS * EXTENT_RECORD_BYTES_V2],
                     args_enc,
                     args_key.as_ref(),
@@ -3649,6 +3738,10 @@ impl<
                 payload[offset + 32..offset + 36]
                     .copy_from_slice(&meta.payload_crc32c.to_le_bytes());
             }
+            // See `build_extent_table_block`: the reserved tail of the
+            // v2 record carries the generation.
+            payload[offset + 36..offset + 40]
+                .copy_from_slice(&(extent.extent.generation as u32).to_le_bytes());
         }
     }
 
@@ -3750,7 +3843,10 @@ impl<
         let block = make_metadata_block_for_volume(
             BLOCK_TYPE_ALLOCATION_TREE,
             self.system_volume.root_object_id,
-            lba,
+            MetadataBlockSite {
+                lba,
+                generation: self.metadata_generation(),
+            },
             &payload[..16 + written * 32],
             args.0,
             args.1,
@@ -3783,7 +3879,10 @@ impl<
         let root = make_metadata_block_for_volume(
             BLOCK_TYPE_ALLOCATION_TREE_ROOT,
             self.system_volume.root_object_id,
-            lba,
+            MetadataBlockSite {
+                lba,
+                generation: self.metadata_generation(),
+            },
             &root_payload[..16 + leaf_count * 8],
             args.0,
             args.1,
@@ -3810,7 +3909,10 @@ impl<
                 leaves.push(make_metadata_block_for_volume(
                     BLOCK_TYPE_ALLOCATION_TREE_LEAF,
                     self.system_volume.root_object_id,
-                    leaf_lba,
+                    MetadataBlockSite {
+                        lba: leaf_lba,
+                        generation: self.metadata_generation(),
+                    },
                     &payload[..ALLOC_LEAF_RECORDS * 32],
                     args.0,
                     args.1,
@@ -3868,7 +3970,10 @@ impl<
         let block = make_metadata_block_for_volume(
             BLOCK_TYPE_REFCOUNT_TREE,
             self.system_volume.root_object_id,
-            lba,
+            MetadataBlockSite {
+                lba,
+                generation: self.metadata_generation(),
+            },
             &payload[..16 + written * 24],
             args.0,
             args.1,
@@ -3901,7 +4006,10 @@ impl<
         let root = make_metadata_block_for_volume(
             BLOCK_TYPE_REFCOUNT_TREE_ROOT,
             self.system_volume.root_object_id,
-            lba,
+            MetadataBlockSite {
+                lba,
+                generation: self.metadata_generation(),
+            },
             &root_payload[..16 + leaf_count * 8],
             args.0,
             args.1,
@@ -3926,7 +4034,10 @@ impl<
                 leaves.push(make_metadata_block_for_volume(
                     BLOCK_TYPE_REFCOUNT_TREE_LEAF,
                     self.system_volume.root_object_id,
-                    leaf_lba,
+                    MetadataBlockSite {
+                        lba: leaf_lba,
+                        generation: self.metadata_generation(),
+                    },
                     &payload[..REFCOUNT_LEAF_RECORDS * 24],
                     args.0,
                     args.1,
@@ -3990,7 +4101,10 @@ impl<
         let block = make_metadata_block_for_volume(
             BLOCK_TYPE_BACKREF_TREE,
             self.system_volume.root_object_id,
-            lba,
+            MetadataBlockSite {
+                lba,
+                generation: self.metadata_generation(),
+            },
             &payload[..16 + written * 40],
             args.0,
             args.1,
@@ -4024,7 +4138,10 @@ impl<
         let root = make_metadata_block_for_volume(
             BLOCK_TYPE_BACKREF_TREE_ROOT,
             self.system_volume.root_object_id,
-            lba,
+            MetadataBlockSite {
+                lba,
+                generation: self.metadata_generation(),
+            },
             &root_payload[..16 + leaf_count * 8],
             args.0,
             args.1,
@@ -4052,7 +4169,10 @@ impl<
                 leaves.push(make_metadata_block_for_volume(
                     BLOCK_TYPE_BACKREF_TREE_LEAF,
                     self.system_volume.root_object_id,
-                    leaf_lba,
+                    MetadataBlockSite {
+                        lba: leaf_lba,
+                        generation: self.metadata_generation(),
+                    },
                     &payload[..BACKREF_LEAF_RECORDS * 40],
                     args.0,
                     args.1,
@@ -4117,7 +4237,10 @@ impl<
         make_metadata_block_for_volume(
             BLOCK_TYPE_QUOTA_TREE,
             self.system_volume.root_object_id,
-            lba,
+            MetadataBlockSite {
+                lba,
+                generation: self.metadata_generation(),
+            },
             &payload[..16 + written * 56],
             args.0,
             args.1,
@@ -4344,22 +4467,43 @@ fn make_metadata_block(block_type: u32, owner: u64, lba: u64, payload: &[u8]) ->
 /// volume table, and object table are *not* encrypted even on
 /// an encrypted volume because they carry global state needed
 /// to find the encryption key (per `docs/STAGE_B_PLAN.md` B.1).
+/// Where a metadata block lives and which tenancy of that location
+/// it is.
+///
+/// Grouped into one value because the LBA and the generation are
+/// never meaningful apart: together they are what the AEAD nonce is
+/// built from, so passing one without the other is always a bug.
+#[derive(Clone, Copy)]
+struct MetadataBlockSite {
+    /// LBA the block will occupy.
+    lba: u64,
+    /// Checkpoint sequence this block is written under.
+    ///
+    /// Only read on builds with `crypto-aes-gcm`: a plaintext volume
+    /// has no AEAD to feed it into. The field is still populated
+    /// unconditionally so the two builds cannot drift apart.
+    #[cfg_attr(not(feature = "crypto-aes-gcm"), allow(dead_code))]
+    generation: u64,
+}
+
 #[cfg(feature = "crypto-aes-gcm")]
 fn make_metadata_block_for_volume(
     block_type: u32,
     owner: u64,
-    lba: u64,
+    site: MetadataBlockSite,
     payload: &[u8],
     volume_encrypted: bool,
     metadata_key: Option<&[u8; 32]>,
     volume_uuid: &crate::format::Uuid,
 ) -> FixedResult<[u8; BLOCK_SIZE]> {
+    let lba = site.lba;
     if volume_encrypted && is_encrypted_block_type(block_type) {
         let key = metadata_key.ok_or(HxfsError::EncryptedPolicyInvalid)?;
         return crate::encrypted_metadata::make_encrypted_metadata_block(
             block_type,
             owner,
             lba,
+            site.generation,
             payload,
             key,
             volume_uuid,
@@ -4379,13 +4523,13 @@ fn make_metadata_block_for_volume(
 fn make_metadata_block_for_volume(
     block_type: u32,
     owner: u64,
-    lba: u64,
+    site: MetadataBlockSite,
     payload: &[u8],
     _volume_encrypted: bool,
     _metadata_key: Option<&[u8; 32]>,
     _volume_uuid: &crate::format::Uuid,
 ) -> FixedResult<[u8; BLOCK_SIZE]> {
-    Ok(make_metadata_block(block_type, owner, lba, payload))
+    Ok(make_metadata_block(block_type, owner, site.lba, payload))
 }
 
 /// Stage B.1: which metadata block types carry the encrypted

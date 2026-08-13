@@ -103,6 +103,7 @@ pub fn make_encrypted_metadata_block(
     block_type: u32,
     owner: u64,
     lba: u64,
+    generation: u64,
     plaintext: &[u8],
     metadata_key: &[u8; SUBKEY_BYTES],
     volume_uuid: &Uuid,
@@ -121,7 +122,9 @@ pub fn make_encrypted_metadata_block(
     block[0..4].copy_from_slice(&block_type.to_le_bytes());
     block[4..6].copy_from_slice(&6u16.to_le_bytes());
     block[6..8].copy_from_slice(&(HEADER_BYTES as u16).to_le_bytes());
-    block[8..16].copy_from_slice(&1u64.to_le_bytes());
+    // The header generation is what the reader feeds back into the
+    // AEAD, so it must be the value we encrypt under, not a constant.
+    block[8..16].copy_from_slice(&generation.to_le_bytes());
     block[16..24].copy_from_slice(&owner.to_le_bytes());
     block[24..32].copy_from_slice(&lba.to_le_bytes());
     // `payload_bytes` reports the on-disk size of the *encrypted*
@@ -134,6 +137,7 @@ pub fn make_encrypted_metadata_block(
     let written = crypto_aes_gcm::encrypt_block(
         metadata_key,
         lba,
+        generation,
         volume_uuid,
         &padded,
         ciphertext_with_nonce,
@@ -177,6 +181,7 @@ pub fn decrypt_metadata_block_in_place(
     let written = crypto_aes_gcm::decrypt_block(
         metadata_key,
         header.self_lba,
+        header.generation,
         volume_uuid,
         ciphertext,
         &mut plaintext,
@@ -422,7 +427,7 @@ mod tests {
         for (index, byte) in plaintext.iter_mut().enumerate() {
             *byte = (index & 0xff) as u8;
         }
-        let block = make_encrypted_metadata_block(0xdead_beef, 42, 100, &plaintext, &key, &id)
+        let block = make_encrypted_metadata_block(0xdead_beef, 42, 100, 0, &plaintext, &key, &id)
             .expect("encrypt must succeed");
         // Header is plaintext: type_version must be 6.
         assert_eq!(&block[4..6], &6u16.to_le_bytes());
@@ -451,7 +456,8 @@ mod tests {
         let key = test_metadata_key();
         let id = test_volume_uuid();
         let plaintext = [0xaau8; METADATA_PLAINTEXT_BYTES];
-        let block = make_encrypted_metadata_block(1, 0, 1, &plaintext, &key, &id).expect("encrypt");
+        let block =
+            make_encrypted_metadata_block(1, 0, 1, 0, &plaintext, &key, &id).expect("encrypt");
         let header = crate::parse_header(&block).expect("header");
         let mut wrong_key = key;
         wrong_key[0] ^= 0xff;
@@ -470,7 +476,7 @@ mod tests {
         let id = test_volume_uuid();
         let plaintext = [0x55u8; METADATA_PLAINTEXT_BYTES];
         let mut block =
-            make_encrypted_metadata_block(1, 0, 7, &plaintext, &key, &id).expect("encrypt");
+            make_encrypted_metadata_block(1, 0, 7, 0, &plaintext, &key, &id).expect("encrypt");
         // Flip one byte of the encrypted payload (after the nonce).
         block[HEADER_BYTES + 12 + 5] ^= 0x01;
         let header = crate::parse_header(&block).expect("header");
@@ -500,7 +506,7 @@ mod tests {
         let id = test_volume_uuid();
         let plaintext = [0u8; METADATA_PLAINTEXT_BYTES + 1];
         assert_eq!(
-            make_encrypted_metadata_block(1, 0, 1, &plaintext, &key, &id),
+            make_encrypted_metadata_block(1, 0, 1, 0, &plaintext, &key, &id),
             Err(EncryptedMetadataError::PlaintextTooLong)
         );
     }

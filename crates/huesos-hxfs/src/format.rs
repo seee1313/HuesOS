@@ -466,6 +466,19 @@ pub struct ExtentRecord {
     pub block_count: u32,
     /// Extent flags.
     pub flags: u32,
+    /// How many times this physical block has been handed out.
+    ///
+    /// Mixed into the AES-GCM nonce and AAD for the extent's data
+    /// block, so re-allocating a freed block produces a different
+    /// (key, nonce) pair than its previous tenant did. Without this
+    /// the allocator could not reuse a block on an encrypted volume
+    /// at all: a repeated GCM nonce leaks the XOR of the two
+    /// plaintexts and the GHASH authentication key.
+    ///
+    /// `0` means "first tenancy", which is what every extent written
+    /// before this field existed implicitly used, so v1 and v2
+    /// records without it decrypt unchanged.
+    pub generation: u64,
 }
 
 /// Lightweight directory handle for the read-only prototype.
