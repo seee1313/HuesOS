@@ -487,6 +487,61 @@ impl HxfsBlobView {
         Ok(self.size)
     }
 
+    /// Send a ReadAt request for this view without waiting.
+    ///
+    /// A blob read is served out of the filesystem, which reaches the
+    /// device through the block client -- and on the boot path that
+    /// client is pumped by the very loop that would be blocking here.
+    /// Waiting inline for the answer therefore deadlocks: the service
+    /// cannot make progress until the caller returns. Split send from
+    /// receive so a caller owning a main loop polls across ticks.
+    pub fn begin_read_at(&self, offset: u64, len: usize) -> Result<u64> {
+        let requested = len.min(abi::HXFS_MAX_INLINE_WRITE_BYTES);
+        write_native_request(
+            &self.channel,
+            abi::HxfsOp::ReadAt,
+            abi::HxfsHandleKind::BlobView,
+            offset,
+            requested as u64,
+            &[],
+        )
+    }
+
+    /// Check once for the answer to a [`Self::begin_read_at`].
+    ///
+    /// `Ok(None)` means "not yet": come back on the next tick without
+    /// re-sending, because the service answers each request exactly
+    /// once and a duplicate would desynchronise this channel.
+    pub fn poll_read<'a>(&self, request_id: u64, out: &'a mut [u8]) -> Result<Option<&'a [u8]>> {
+        let mut message = [0u8; NATIVE_MESSAGE_BYTES];
+        loop {
+            let n = match self.channel.read_into(&mut message) {
+                Ok(n) => n,
+                Err(ErrorCode::ShouldWait) | Err(ErrorCode::TimedOut) => return Ok(None),
+                Err(error) => return Err(error),
+            };
+            if n < abi::HXFS_RESPONSE_BYTES {
+                return Err(ErrorCode::InvalidArgs);
+            }
+            let Some(response) = decode_response(&message[..abi::HXFS_RESPONSE_BYTES]) else {
+                return Err(ErrorCode::InvalidArgs);
+            };
+            if response.request_id != request_id {
+                continue;
+            }
+            if response.status != abi::HxfsStatus::Ok {
+                return Err(status_to_error(response.status));
+            }
+            let payload_len = response.payload_len as usize;
+            if n != abi::HXFS_RESPONSE_BYTES + payload_len || payload_len > out.len() {
+                return Err(ErrorCode::InvalidArgs);
+            }
+            let start = abi::HXFS_RESPONSE_BYTES;
+            out[..payload_len].copy_from_slice(&message[start..start + payload_len]);
+            return Ok(Some(&out[..payload_len]));
+        }
+    }
+
     /// Read at most `out.len()` bytes starting at `offset`.
     pub fn read_at<'a>(&self, offset: u64, out: &'a mut [u8]) -> Result<&'a [u8]> {
         let requested = out.len().min(abi::HXFS_MAX_INLINE_WRITE_BYTES);

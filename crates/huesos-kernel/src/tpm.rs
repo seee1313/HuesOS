@@ -143,7 +143,7 @@ impl CrbTransport for MmioCrb {
             };
         }
         let size = u32::from_be_bytes([header[2], header[3], header[4], header[5]]) as usize;
-        if size < huesos_tpm::HEADER_BYTES || size > CRB_BUFFER_BYTES {
+        if !(huesos_tpm::HEADER_BYTES..=CRB_BUFFER_BYTES).contains(&size) {
             return Err(CrbError::ResponseTooLarge);
         }
         if size > out.len() {

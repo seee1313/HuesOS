@@ -28,7 +28,7 @@
 //! capability layer's job (see `manifest.rs`); resolving only answers
 //! "give me these exact bytes, or fail".
 
-use libcanvas::{Channel, ErrorCode, Vmo};
+use libcanvas::{ErrorCode, Vmo};
 
 /// Bytes in a content hash (SHA-256).
 pub const PACKAGE_HASH_BYTES: usize = 32;
@@ -109,77 +109,107 @@ fn hex_value(byte: u8) -> Option<u8> {
     }
 }
 
-/// Resolve a package by content hash through an Hxfs client channel.
+/// Incremental streaming of a blob view into a VMO.
 ///
-/// The channel must be an attached Hxfs client (the same kind
-/// `open:hxfs` hands to any other client); the resolver speaks the
-/// native ABI over it and does not need any DriverManager-specific
-/// privilege.
-pub fn resolve_package(
-    hxfs: &Channel,
-    hash: &[u8; PACKAGE_HASH_BYTES],
-) -> Result<ResolvedPackage, ResolveError> {
-    let view = libcanvas::hxfs::open_blob_on(hxfs, hash).map_err(map_open_error)?;
-    resolve_from_view(view, *hash)
-}
-
-/// Stream an already-opened blob view into a VMO.
-///
-/// Split out of [`resolve_package`] so a caller driving its own main
-/// loop can open the view without blocking (send the request, poll
-/// across ticks) and then stream it here. The streaming half is safe
-/// to run inline: it talks to a dedicated per-view channel that only
-/// this caller holds, so there is no queue of other clients' answers
-/// to wait behind.
-pub fn resolve_from_view(
+/// A caller that owns the boot main loop must never wait inline for
+/// blob bytes: they are served by Hxfs, which reaches
+/// the device through a block client pumped by that same loop. This
+/// state machine performs exactly one non-blocking step per tick and
+/// reports whether the package is ready.
+pub struct PackageStream {
     view: libcanvas::hxfs::HxfsBlobView,
     hash: [u8; PACKAGE_HASH_BYTES],
-) -> Result<ResolvedPackage, ResolveError> {
-    let hash = &hash;
-    let len = view.size();
-    if len == 0 {
-        // A zero-length ELF is never launchable; treat it as
-        // corruption rather than handing `spawn_elf_from_vmo` an
-        // empty image to reject less informatively.
-        return Err(ResolveError::Corrupt);
-    }
-    if len > MAX_PACKAGE_BYTES {
-        return Err(ResolveError::TooLarge);
-    }
-    let vmo = Vmo::create(len).map_err(|_| ResolveError::OutOfMemory)?;
-    let mut offset = 0u64;
-    let mut chunk = [0u8; READ_CHUNK_BYTES];
-    while offset < len {
-        let want = ((len - offset) as usize).min(READ_CHUNK_BYTES);
-        let bytes = view
-            .read_at(offset, &mut chunk[..want])
-            .map_err(ResolveError::Protocol)?;
-        if bytes.is_empty() {
-            // Short read before the declared end: the service and the
-            // index disagree about this object's length, which is a
-            // corrupt package, not a transient condition to retry.
+    vmo: Vmo,
+    len: u64,
+    offset: u64,
+    pending: Option<u64>,
+}
+
+impl PackageStream {
+    /// Begin streaming `view`, validating its declared size.
+    pub fn new(
+        view: libcanvas::hxfs::HxfsBlobView,
+        hash: [u8; PACKAGE_HASH_BYTES],
+    ) -> Result<Self, ResolveError> {
+        let len = view.size();
+        if len == 0 {
             return Err(ResolveError::Corrupt);
         }
-        let written = vmo
-            .write(offset, bytes)
+        if len > MAX_PACKAGE_BYTES {
+            return Err(ResolveError::TooLarge);
+        }
+        let vmo = Vmo::create(len).map_err(|_| ResolveError::OutOfMemory)?;
+        Ok(Self {
+            view,
+            hash,
+            vmo,
+            len,
+            offset: 0,
+            pending: None,
+        })
+    }
+
+    /// Advance one step. `Ok(None)` means "call again next tick".
+    pub fn poll(&mut self) -> Result<Option<ResolvedPackage>, ResolveError> {
+        if self.offset >= self.len {
+            return self.finish();
+        }
+        let want = ((self.len - self.offset) as usize).min(READ_CHUNK_BYTES);
+        let request_id = match self.pending {
+            Some(id) => id,
+            None => {
+                let id = self
+                    .view
+                    .begin_read_at(self.offset, want)
+                    .map_err(ResolveError::Protocol)?;
+                self.pending = Some(id);
+                id
+            }
+        };
+        let mut chunk = [0u8; READ_CHUNK_BYTES];
+        let bytes = match self.view.poll_read(request_id, &mut chunk[..want]) {
+            Ok(Some(bytes)) => bytes,
+            Ok(None) => return Ok(None),
+            Err(error) => return Err(ResolveError::Protocol(error)),
+        };
+        self.pending = None;
+        if bytes.is_empty() {
+            // Short read before the declared end: the service and the
+            // index disagree about this object's length.
+            return Err(ResolveError::Corrupt);
+        }
+        let written = self
+            .vmo
+            .write(self.offset, bytes)
             .map_err(|_| ResolveError::OutOfMemory)?;
         if written != bytes.len() {
             return Err(ResolveError::OutOfMemory);
         }
-        offset += bytes.len() as u64;
+        self.offset += bytes.len() as u64;
+        if self.offset >= self.len {
+            return self.finish();
+        }
+        Ok(None)
     }
-    Ok(ResolvedPackage {
-        vmo,
-        len,
-        hash: *hash,
-    })
+
+    fn finish(&mut self) -> Result<Option<ResolvedPackage>, ResolveError> {
+        let vmo = core::mem::replace(
+            &mut self.vmo,
+            Vmo::create(1).map_err(|_| ResolveError::OutOfMemory)?,
+        );
+        Ok(Some(ResolvedPackage {
+            vmo,
+            len: self.len,
+            hash: self.hash,
+        }))
+    }
 }
 
 /// Classify an open failure into a resolver error.
 ///
 /// Public because a caller that opens the view itself (to avoid
 /// blocking its main loop) must classify the failure the same way
-/// `resolve_package` would; otherwise "missing" and "corrupt" collapse
+/// the resolver would; otherwise "missing" and "corrupt" collapse
 /// into one opaque protocol error at exactly the call site that cares
 /// about the difference.
 pub fn map_open_error(error: ErrorCode) -> ResolveError {

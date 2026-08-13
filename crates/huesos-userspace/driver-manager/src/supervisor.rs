@@ -154,8 +154,13 @@ pub struct DriverManager {
     package_probe_announced: bool,
     /// Whether the probe has logged that it is waiting for a channel.
     package_probe_waiting_logged: bool,
-    /// Main-loop ticks the probe may still wait for an answer.
-    package_probe_retries: u32,
+    /// Deadline (kernel monotonic 100 Hz ticks) for the probe.
+    ///
+    /// A retry COUNT is the wrong unit here: the main loop spins as
+    /// fast as the scheduler allows, so a budget of N iterations
+    /// expires in milliseconds while the service is legitimately busy
+    /// behind the NVMe load. The probe waits on wall time instead.
+    package_probe_deadline: Option<u64>,
     /// Id of the store request already sent, if any.
     package_probe_request: Option<u64>,
     /// Id of the resolve (open) request already sent, if any.
@@ -166,6 +171,10 @@ pub struct DriverManager {
     /// keeps a small fixed table of them, so the probe must store
     /// exactly once and resume at the resolve step on later ticks.
     package_probe_hash: Option<[u8; 32]>,
+    /// Streaming state for reading the resolved view across ticks.
+    package_probe_stream: Option<crate::package_resolver::PackageStream>,
+    /// Id of the negative-case (absent hash) open request, if sent.
+    package_probe_absent_request: Option<u64>,
     acpi_manager: Option<ManagedHost>,
     acpi_tables: Option<Vmo>,
     acpi_broker: Option<Handle>,
@@ -286,10 +295,12 @@ impl DriverManager {
             package_probe_done: false,
             package_probe_announced: false,
             package_probe_waiting_logged: false,
-            package_probe_retries: 20_000,
+            package_probe_deadline: None,
             package_probe_request: None,
             package_probe_resolve_request: None,
             package_probe_hash: None,
+            package_probe_stream: None,
+            package_probe_absent_request: None,
             acpi_manager: None,
             acpi_tables: None,
             acpi_broker: None,
@@ -1150,6 +1161,28 @@ impl DriverManager {
     /// This runs against the live service on the boot path because a
     /// resolver that only works in a host unit test is exactly the
     /// kind of "wired up" this gate is meant to reject.
+    /// Whether the probe has run out of wall-clock budget.
+    ///
+    /// The deadline is armed on the first call and measured against
+    /// the kernel's 100 Hz monotonic clock, so a busy service is
+    /// waited on for a fixed number of SECONDS rather than a fixed
+    /// number of main-loop iterations.
+    fn package_probe_expired(&mut self) -> bool {
+        const PROBE_BUDGET_TICKS: u64 = 100 * 60;
+        let Ok(now) = libcanvas::system::monotonic_ticks() else {
+            // No clock: fail open rather than ending the probe on a
+            // condition that has nothing to do with storage.
+            return false;
+        };
+        match self.package_probe_deadline {
+            Some(deadline) => now >= deadline,
+            None => {
+                self.package_probe_deadline = Some(now.saturating_add(PROBE_BUDGET_TICKS));
+                false
+            }
+        }
+    }
+
     fn probe_package_resolving(&mut self) {
         if self.package_probe_done {
             return;
@@ -1218,8 +1251,7 @@ impl DriverManager {
                         // would store the blob again and consume
                         // another endpoint from the service's fixed
                         // table.
-                        self.package_probe_retries = self.package_probe_retries.saturating_sub(1);
-                        if self.package_probe_retries == 0 {
+                        if self.package_probe_expired() {
                             self.package_probe_done = true;
                             println!("[driver-manager] package probe: service never answered");
                         }
@@ -1270,10 +1302,23 @@ impl DriverManager {
             return;
         }
 
+        // Once the view has been handed over, the open phase is DONE:
+        // its answer was dequeued by the poll that produced the
+        // stream, so re-polling for it on the next tick would wait
+        // forever for a message that has already been consumed.
+        if self.package_probe_stream.is_some() {
+            self.drive_package_stream(parsed, payload);
+            return;
+        }
+        // Same reasoning for the negative case: its request has been
+        // sent, so the open phase must not be re-entered.
+        if self.package_probe_absent_request.is_some() {
+            self.check_absent_hash(parsed, payload);
+            return;
+        }
+
         // Open the view the same non-blocking way as the store: send
-        // once, poll on later ticks. The streaming half that follows
-        // is inline, because it runs over the view's own channel
-        // where no other client's answers can be queued ahead of it.
+        // once, poll on later ticks.
         let resolve_id = match self.package_probe_resolve_request {
             Some(id) => id,
             None => match libcanvas::hxfs::begin_open_blob_on(channel, &parsed) {
@@ -1294,8 +1339,7 @@ impl DriverManager {
         let view = match libcanvas::hxfs::poll_blob_view_on(channel, parsed, resolve_id) {
             Ok(Some(view)) => view,
             Ok(None) => {
-                self.package_probe_retries = self.package_probe_retries.saturating_sub(1);
-                if self.package_probe_retries == 0 {
+                if self.package_probe_expired() {
                     self.package_probe_done = true;
                     println!("[driver-manager] package probe: resolve never answered");
                 }
@@ -1309,29 +1353,13 @@ impl DriverManager {
             }
         };
 
-        match crate::package_resolver::resolve_from_view(view, parsed) {
-            Ok(package) => {
-                if package.len != payload.len() as u64 {
-                    println!(
-                        "[driver-manager] package probe: length {} != {}",
-                        package.len,
-                        payload.len()
-                    );
-                    return;
-                }
-                let mut check = [0u8; 64];
-                let read = package.vmo.read(0, &mut check[..payload.len()]);
-                if read != Ok(payload.len()) || &check[..payload.len()] != payload {
-                    println!("[driver-manager] package probe: VMO contents differ");
-                    return;
-                }
-                // The resolved package must carry the identity it was
-                // asked for. A launcher trusts this field to decide
-                // what it is about to execute.
-                if package.hash != parsed {
-                    println!("[driver-manager] package probe: resolved hash differs");
-                    return;
-                }
+        // Streaming the view is ALSO non-blocking. The blob bytes are
+        // served by Hxfs, which reaches the device through the block
+        // client this very loop pumps; waiting inline for a chunk
+        // deadlocks the boot path against itself.
+        match crate::package_resolver::PackageStream::new(view, parsed) {
+            Ok(stream) => {
+                self.package_probe_stream = Some(stream);
             }
             Err(error) => {
                 self.package_probe_done = true;
@@ -1339,31 +1367,122 @@ impl DriverManager {
                 return;
             }
         }
+        self.drive_package_stream(parsed, payload);
+    }
 
-        // Past the resolve: whatever happens now is a verdict, not a
-        // reason to come back next tick.
-        self.package_probe_done = true;
-
-        // An unknown hash must fail, not resolve to the nearest thing.
-        //
-        // This one stays a single send followed by a bounded wait for
-        // the matching answer: the expected outcome is a NotFound
-        // status, and a status response cannot be polled across ticks
-        // the way a handle transfer can without a second state
-        // machine for a case that is meant to fail immediately.
-        let absent = [0x5Au8; 32];
-        match crate::package_resolver::resolve_package(channel, &absent) {
-            Err(crate::package_resolver::ResolveError::NotFound) => {}
-            Err(other) => {
-                println!("[driver-manager] package probe: absent hash gave {other:?}");
+    /// Advance the package stream, then run the negative case.
+    ///
+    /// Split out of the probe body so the tick that receives the view
+    /// and every later tick take the same path: the open phase is
+    /// finished, only streaming and the absent-hash check remain.
+    fn drive_package_stream(&mut self, parsed: [u8; 32], payload: &[u8]) {
+        let Some(stream) = self.package_probe_stream.as_mut() else {
+            return;
+        };
+        let package = match stream.poll() {
+            Ok(Some(package)) => package,
+            Ok(None) => {
+                if self.package_probe_expired() {
+                    self.package_probe_done = true;
+                    println!("[driver-manager] package probe: view read never completed");
+                }
                 return;
             }
-            Ok(_) => {
+            Err(error) => {
+                self.package_probe_done = true;
+                println!("[driver-manager] package probe: resolve failed ({error:?})");
+                return;
+            }
+        };
+        self.package_probe_stream = None;
+        if package.len != payload.len() as u64 {
+            self.package_probe_done = true;
+            println!(
+                "[driver-manager] package probe: length {} != {}",
+                package.len,
+                payload.len()
+            );
+            return;
+        }
+        let mut check = [0u8; 64];
+        let read = package.vmo.read(0, &mut check[..payload.len()]);
+        if read != Ok(payload.len()) || &check[..payload.len()] != payload {
+            self.package_probe_done = true;
+            println!("[driver-manager] package probe: VMO contents differ");
+            return;
+        }
+        // The resolved package must carry the identity it was asked
+        // for. A launcher trusts this field to decide what it is
+        // about to execute.
+        if package.hash != parsed {
+            self.package_probe_done = true;
+            println!("[driver-manager] package probe: resolved hash differs");
+            return;
+        }
+        self.check_absent_hash(parsed, payload);
+    }
+
+    /// Negative case: an unknown hash must fail, not resolve.
+    fn check_absent_hash(&mut self, hash: [u8; 32], payload: &[u8]) {
+        // Move the channel out for the duration of the call: the
+        // handlers below need `&mut self`, and the channel lives in
+        // `self`. It is put back on every exit path.
+        let Some(channel) = self.hxfs_client.take() else {
+            return;
+        };
+        self.check_absent_hash_on(&channel, hash, payload);
+        self.hxfs_client = Some(channel);
+    }
+
+    fn check_absent_hash_on(&mut self, channel: &Channel, hash: [u8; 32], payload: &[u8]) {
+        // An unknown hash must fail, not resolve to the nearest thing.
+        // Same non-blocking discipline: send once, poll across ticks.
+        let absent = [0x5Au8; 32];
+        let absent_id = match self.package_probe_absent_request {
+            Some(id) => id,
+            None => match libcanvas::hxfs::begin_open_blob_on(channel, &absent) {
+                Ok(id) => {
+                    self.package_probe_absent_request = Some(id);
+                    id
+                }
+                Err(error) => {
+                    self.package_probe_done = true;
+                    println!(
+                        "[driver-manager] package probe: absent request failed ({})",
+                        error.as_str()
+                    );
+                    return;
+                }
+            },
+        };
+        match libcanvas::hxfs::poll_blob_view_on(channel, absent, absent_id) {
+            Ok(Some(_view)) => {
+                self.package_probe_done = true;
                 println!("[driver-manager] package probe: absent hash resolved to an object");
                 return;
             }
+            Ok(None) => {
+                if self.package_probe_expired() {
+                    self.package_probe_done = true;
+                    println!("[driver-manager] package probe: absent hash never answered");
+                }
+                return;
+            }
+            Err(error) => {
+                // Past this point the outcome is a verdict, not a
+                // reason to come back next tick.
+                self.package_probe_done = true;
+                match crate::package_resolver::map_open_error(error) {
+                    crate::package_resolver::ResolveError::NotFound => {}
+                    other => {
+                        println!("[driver-manager] package probe: absent hash gave {other:?}");
+                        return;
+                    }
+                }
+            }
         }
 
+        let hex = hash_to_hex(&hash);
         println!(
             "[driver-manager] package-resolve-ok bytes={} hash={}",
             payload.len(),
@@ -1534,7 +1653,18 @@ impl DriverManager {
 
     fn poll_nvme_host(&mut self) {
         let mut buf = [0u8; 64];
+        // Bounded per tick. Under the high queue-depth soak the NVMe
+        // host produces messages continuously, so an unbounded drain
+        // never returns and every later service in the main loop --
+        // including the package probe -- is starved for the life of
+        // the run. Draining "until empty" is only safe against a peer
+        // that eventually goes quiet.
+        let mut budget = 64u32;
         loop {
+            budget = match budget.checked_sub(1) {
+                Some(remaining) => remaining,
+                None => return,
+            };
             let Some(host) = self.nvme_host.as_ref() else {
                 return;
             };
@@ -1608,7 +1738,15 @@ impl DriverManager {
 
     fn poll_acpi_manager(&mut self) {
         let mut buffer = [0u8; 64];
+        // Bounded per tick, as with the NVMe host: the ACPI manager
+        // emits a periodic heartbeat, so a peer that is never quiet
+        // turns "drain until empty" into "never return".
+        let mut budget = 64u32;
         loop {
+            budget = match budget.checked_sub(1) {
+                Some(remaining) => remaining,
+                None => return,
+            };
             let Some(host) = self.acpi_manager.as_ref() else {
                 return;
             };
