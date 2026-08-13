@@ -120,6 +120,22 @@ pub fn resolve_package(
     hash: &[u8; PACKAGE_HASH_BYTES],
 ) -> Result<ResolvedPackage, ResolveError> {
     let view = libcanvas::hxfs::open_blob_on(hxfs, hash).map_err(map_open_error)?;
+    resolve_from_view(view, *hash)
+}
+
+/// Stream an already-opened blob view into a VMO.
+///
+/// Split out of [`resolve_package`] so a caller driving its own main
+/// loop can open the view without blocking (send the request, poll
+/// across ticks) and then stream it here. The streaming half is safe
+/// to run inline: it talks to a dedicated per-view channel that only
+/// this caller holds, so there is no queue of other clients' answers
+/// to wait behind.
+pub fn resolve_from_view(
+    view: libcanvas::hxfs::HxfsBlobView,
+    hash: [u8; PACKAGE_HASH_BYTES],
+) -> Result<ResolvedPackage, ResolveError> {
+    let hash = &hash;
     let len = view.size();
     if len == 0 {
         // A zero-length ELF is never launchable; treat it as

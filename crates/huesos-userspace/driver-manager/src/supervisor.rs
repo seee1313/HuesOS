@@ -158,6 +158,8 @@ pub struct DriverManager {
     package_probe_retries: u32,
     /// Id of the store request already sent, if any.
     package_probe_request: Option<u64>,
+    /// Id of the resolve (open) request already sent, if any.
+    package_probe_resolve_request: Option<u64>,
     /// Hash of the probe blob, once stored.
     ///
     /// The store step hands back a live view handle and the service
@@ -286,6 +288,7 @@ impl DriverManager {
             package_probe_waiting_logged: false,
             package_probe_retries: 20_000,
             package_probe_request: None,
+            package_probe_resolve_request: None,
             package_probe_hash: None,
             acpi_manager: None,
             acpi_tables: None,
@@ -1247,7 +1250,48 @@ impl DriverManager {
             return;
         }
 
-        match crate::package_resolver::resolve_package(channel, &parsed) {
+        // Open the view the same non-blocking way as the store: send
+        // once, poll on later ticks. The streaming half that follows
+        // is inline, because it runs over the view's own channel
+        // where no other client's answers can be queued ahead of it.
+        let resolve_id = match self.package_probe_resolve_request {
+            Some(id) => id,
+            None => match libcanvas::hxfs::begin_open_blob_on(channel, &parsed) {
+                Ok(id) => {
+                    self.package_probe_resolve_request = Some(id);
+                    id
+                }
+                Err(error) => {
+                    self.package_probe_done = true;
+                    println!(
+                        "[driver-manager] package probe: resolve request failed ({})",
+                        error.as_str()
+                    );
+                    return;
+                }
+            },
+        };
+        let view = match libcanvas::hxfs::poll_blob_view_on(channel, parsed, resolve_id) {
+            Ok(Some(view)) => view,
+            Ok(None) => {
+                self.package_probe_retries = self.package_probe_retries.saturating_sub(1);
+                if self.package_probe_retries == 0 {
+                    self.package_probe_done = true;
+                    println!("[driver-manager] package probe: resolve never answered");
+                }
+                return;
+            }
+            Err(error) => {
+                self.package_probe_done = true;
+                println!(
+                    "[driver-manager] package probe: resolve failed ({})",
+                    error.as_str()
+                );
+                return;
+            }
+        };
+
+        match crate::package_resolver::resolve_from_view(view, parsed) {
             Ok(package) => {
                 if package.len != payload.len() as u64 {
                     println!(
@@ -1276,11 +1320,20 @@ impl DriverManager {
         self.package_probe_done = true;
 
         // An unknown hash must fail, not resolve to the nearest thing.
+        //
+        // This one stays a single send followed by a bounded wait for
+        // the matching answer: the expected outcome is a NotFound
+        // status, and a status response cannot be polled across ticks
+        // the way a handle transfer can without a second state
+        // machine for a case that is meant to fail immediately.
         let absent = [0x5Au8; 32];
-        match crate::package_resolver::resolve_package(channel, &absent) {
-            Err(crate::package_resolver::ResolveError::NotFound) => {}
+        match libcanvas::hxfs::open_blob_on(channel, &absent) {
+            Err(ErrorCode::NotFound) => {}
             Err(other) => {
-                println!("[driver-manager] package probe: absent hash gave {other:?}");
+                println!(
+                    "[driver-manager] package probe: absent hash gave {}",
+                    other.as_str()
+                );
                 return;
             }
             Ok(_) => {
