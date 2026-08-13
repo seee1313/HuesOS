@@ -175,7 +175,14 @@ pub fn resolve_from_view(
     })
 }
 
-fn map_open_error(error: ErrorCode) -> ResolveError {
+/// Classify an open failure into a resolver error.
+///
+/// Public because a caller that opens the view itself (to avoid
+/// blocking its main loop) must classify the failure the same way
+/// `resolve_package` would; otherwise "missing" and "corrupt" collapse
+/// into one opaque protocol error at exactly the call site that cares
+/// about the difference.
+pub fn map_open_error(error: ErrorCode) -> ResolveError {
     match error {
         ErrorCode::NotFound => ResolveError::NotFound,
         // The service reports a failed content-hash check as an

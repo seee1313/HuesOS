@@ -543,7 +543,10 @@ fn emit_sealed_key_blob(contents: &mut String) {
 /// Decode an even-length hex string.
 fn decode_hex(text: &str) -> Option<Vec<u8>> {
     let text = text.trim();
-    if text.is_empty() || text.len() % 2 != 0 || !text.chars().all(|c| c.is_ascii_hexdigit()) {
+    if text.is_empty()
+        || !text.len().is_multiple_of(2)
+        || !text.chars().all(|c| c.is_ascii_hexdigit())
+    {
         return None;
     }
     let mut bytes = Vec::with_capacity(text.len() / 2);

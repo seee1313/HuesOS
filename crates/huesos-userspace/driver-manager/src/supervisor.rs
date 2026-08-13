@@ -1238,15 +1238,36 @@ impl DriverManager {
             }
         };
 
-        // Round-trip the hash through its text form, the way an
-        // on-volume package index carries it.
+        // Round-trip the hash through the index format, the way a
+        // real launch resolves a package: a launcher is given a NAME,
+        // reads the on-volume index, and only then has a hash. Going
+        // straight from a hash it already held would skip the half of
+        // the path that turns a name into one.
         let hex = hash_to_hex(&hash);
-        let Some(parsed) = crate::package_resolver::parse_hash_hex(&hex) else {
-            println!("[driver-manager] package probe: hash did not round-trip through hex");
+        let mut index_line = [0u8; 80];
+        let name = b"probe-package ";
+        index_line[..name.len()].copy_from_slice(name);
+        index_line[name.len()..name.len() + 64].copy_from_slice(&hex);
+        let index_len = name.len() + 64;
+
+        let mut entries: [Option<crate::package_resolver::PackageEntry>; 4] = [None; 4];
+        let found =
+            crate::package_resolver::parse_package_index(&index_line[..index_len], &mut entries);
+        if found != 1 {
+            println!("[driver-manager] package probe: index parsed {found} entries, expected 1");
+            return;
+        }
+        let Some(Some(entry)) = entries.first() else {
+            println!("[driver-manager] package probe: index entry missing");
             return;
         };
+        if entry.name() != "probe-package" {
+            println!("[driver-manager] package probe: index name differs");
+            return;
+        }
+        let parsed = entry.hash;
         if parsed != hash {
-            println!("[driver-manager] package probe: hex round-trip mismatch");
+            println!("[driver-manager] package probe: index hash round-trip mismatch");
             return;
         }
 
@@ -1283,10 +1304,8 @@ impl DriverManager {
             }
             Err(error) => {
                 self.package_probe_done = true;
-                println!(
-                    "[driver-manager] package probe: resolve failed ({})",
-                    error.as_str()
-                );
+                let classified = crate::package_resolver::map_open_error(error);
+                println!("[driver-manager] package probe: resolve failed ({classified:?})");
                 return;
             }
         };
@@ -1305,6 +1324,13 @@ impl DriverManager {
                 let read = package.vmo.read(0, &mut check[..payload.len()]);
                 if read != Ok(payload.len()) || &check[..payload.len()] != payload {
                     println!("[driver-manager] package probe: VMO contents differ");
+                    return;
+                }
+                // The resolved package must carry the identity it was
+                // asked for. A launcher trusts this field to decide
+                // what it is about to execute.
+                if package.hash != parsed {
+                    println!("[driver-manager] package probe: resolved hash differs");
                     return;
                 }
             }
@@ -1327,13 +1353,10 @@ impl DriverManager {
         // the way a handle transfer can without a second state
         // machine for a case that is meant to fail immediately.
         let absent = [0x5Au8; 32];
-        match libcanvas::hxfs::open_blob_on(channel, &absent) {
-            Err(ErrorCode::NotFound) => {}
+        match crate::package_resolver::resolve_package(channel, &absent) {
+            Err(crate::package_resolver::ResolveError::NotFound) => {}
             Err(other) => {
-                println!(
-                    "[driver-manager] package probe: absent hash gave {}",
-                    other.as_str()
-                );
+                println!("[driver-manager] package probe: absent hash gave {other:?}");
                 return;
             }
             Ok(_) => {
