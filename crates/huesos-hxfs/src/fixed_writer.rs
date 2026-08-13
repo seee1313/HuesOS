@@ -269,6 +269,16 @@ pub struct FixedHxfsWriter<
     pending_free: [Option<FreeRange>; MAX_EXTENTS],
     /// Blocks that survived quarantine and may be allocated again.
     free_space: [Option<FreeRange>; MAX_EXTENTS],
+    /// Extents pinned by live snapshots.
+    ///
+    /// A snapshot is a second owner of every extent the volume held
+    /// when it was taken. Unlinking a file drops the *live* reference
+    /// but not the snapshot's, and without somewhere to record that,
+    /// the free path would hand a snapshot's blocks back to the
+    /// allocator and the snapshot would read whatever overwrote them.
+    /// Boxed for the same reason as the page cache: this is sized by
+    /// MAX_EXTENTS and must not sit on the construction stack.
+    snapshot_refs: alloc::boxed::Box<RefcountBtree<MAX_EXTENTS>>,
     dirty: bool,
 }
 
@@ -414,6 +424,7 @@ impl<
             cache_volume_id: crate::page_cache::volume_id_of(&superblock.instance_uuid),
             page_cache: alloc::boxed::Box::new(crate::page_cache::FixedPageCache::new()),
             pending_free: [None; MAX_EXTENTS],
+            snapshot_refs: alloc::boxed::Box::new(RefcountBtree::new()),
             free_space: [None; MAX_EXTENTS],
             dirty: false,
         };
@@ -3313,6 +3324,14 @@ impl<
         // Freed blocks may be re-handed out to a different object;
         // their cached plaintext must not survive the free.
         self.invalidate_cached_range(start_block, start_block.saturating_add(block_count));
+        // A snapshot holding this extent is a second owner. Freeing
+        // it here would let the allocator re-issue blocks the
+        // snapshot still reads through, so the snapshot would quietly
+        // return another object's data. The extent becomes reclaimable
+        // again when the last snapshot referencing it is deleted.
+        if self.snapshot_refs.covers(start_block, block_count) {
+            return;
+        }
         // Never reclaim into the metadata region: those blocks are
         // owned by the checkpoint/superblock layout, not by extents.
         if start_block < self.reserved_block_floor() {
@@ -3530,6 +3549,121 @@ impl<
                 index += 1;
             }
         }
+    }
+
+    /// Pin every live extent under a new snapshot.
+    ///
+    /// Called when a snapshot is created. Each live extent gains one
+    /// reference, so a later unlink drops the live owner without
+    /// making the blocks reclaimable while the snapshot needs them.
+    ///
+    /// Returns the number of extents pinned.
+    pub fn retain_extents_for_snapshot(&mut self) -> FixedResult<usize> {
+        let mut pinned = 0usize;
+        let mut index = 0usize;
+        while index < self.extents.len() {
+            if let Some(extent) = self.extents[index] {
+                if extent.extent.flags & EXTENT_FLAG_HOLE == 0 {
+                    let start = extent.extent.physical_block;
+                    let count = u64::from(extent.extent.block_count);
+                    match self.snapshot_refs.increment(start, count) {
+                        Ok(_) => {}
+                        Err(crate::ref_tree::RefTreeError::NotFound) => {
+                            // First snapshot to pin this extent. The
+                            // tree counts snapshot holders only -- the
+                            // live tree tracks its own ownership -- so
+                            // one snapshot is a count of one.
+                            self.snapshot_refs
+                                .insert(RefcountRecord {
+                                    start_block: start,
+                                    block_count: count,
+                                    refcount: 1,
+                                })
+                                .map_err(|_| HxfsError::BadTree)?;
+                        }
+                        Err(_) => return Err(HxfsError::BadTree),
+                    }
+                    pinned += 1;
+                }
+            }
+            index += 1;
+        }
+        self.snapshot_refs
+            .validate()
+            .map_err(|_| HxfsError::BadTree)?;
+        Ok(pinned)
+    }
+
+    /// Release the extents a deleted snapshot was pinning.
+    ///
+    /// Extents whose last snapshot reference goes away become
+    /// reclaimable, and those already unlinked by the live tree are
+    /// handed to the free path here -- this is where the space a
+    /// deleted snapshot was holding actually comes back.
+    ///
+    /// Returns the number of extents released to the free path.
+    pub fn release_extents_for_snapshot(&mut self, pinned: &[(u64, u64)]) -> FixedResult<usize> {
+        let mut released = 0usize;
+        for (start, count) in pinned.iter().copied() {
+            match self.snapshot_refs.decrement(start, count) {
+                Ok(0) | Err(crate::ref_tree::RefTreeError::NotFound) => {
+                    // No snapshot pins this extent any more. If the
+                    // live tree still owns it the extent stays put;
+                    // free_extent_range is the single place that
+                    // decides, and it re-checks the barrier.
+                    if !self.extent_is_live(start, count) {
+                        self.free_extent_range(start, count);
+                        released += 1;
+                    }
+                }
+                Ok(_) => {}
+                Err(_) => return Err(HxfsError::BadTree),
+            }
+        }
+        self.snapshot_refs
+            .validate()
+            .map_err(|_| HxfsError::BadTree)?;
+        Ok(released)
+    }
+
+    /// Whether a live extent still occupies exactly this range.
+    fn extent_is_live(&self, start_block: u64, block_count: u64) -> bool {
+        self.extents.iter().flatten().any(|extent| {
+            extent.extent.flags & EXTENT_FLAG_HOLE == 0
+                && extent.extent.physical_block == start_block
+                && u64::from(extent.extent.block_count) == block_count
+        })
+    }
+
+    /// Extents a snapshot taken now would pin.
+    pub fn live_extent_ranges(&self) -> alloc::vec::Vec<(u64, u64)> {
+        self.extents
+            .iter()
+            .flatten()
+            .filter(|extent| extent.extent.flags & EXTENT_FLAG_HOLE == 0)
+            .map(|extent| {
+                (
+                    extent.extent.physical_block,
+                    u64::from(extent.extent.block_count),
+                )
+            })
+            .collect()
+    }
+
+    /// Whether any block of `[start, start + count)` sits in the
+    /// reusable pool or is queued to join it.
+    ///
+    /// Total pool size is the wrong question for snapshot tests: the
+    /// pool also absorbs retired checkpoint metadata, which moves for
+    /// reasons that have nothing to do with snapshots.
+    pub fn range_is_reclaimable(&self, start_block: u64, block_count: u64) -> bool {
+        let end = start_block.saturating_add(block_count);
+        let overlaps = |range: &FreeRange| {
+            let range_end = range.start_block.saturating_add(range.block_count);
+            range.start_block < end && start_block < range_end
+        };
+        self.free_space.iter().flatten().any(overlaps)
+            || self.pending_free.iter().flatten().any(overlaps)
     }
 
     /// Physical bytes currently sitting in the reusable pool.
@@ -6104,6 +6238,154 @@ mod tests {
             ),
             "a write that adds blocks past the limit must be refused"
         );
+    }
+
+    /// A snapshot is a second owner of every extent live when it was
+    /// taken. Unlinking the file drops the live reference, but the
+    /// blocks must NOT return to the allocator: the snapshot still
+    /// reads through them, and reissuing them would make it return
+    /// whatever overwrote its data.
+    #[test]
+    fn snapshot_pinned_blocks_are_not_reclaimed_on_unlink() {
+        let Ok(seed) = HxfsWriter::new(INSTANCE, VOLUME) else {
+            assert!(false, "seed writer should initialize");
+            return;
+        };
+        let store = MemStore::from_image(seed.image());
+        let Ok(mut mounted) = FixedHxfsWriter::<MemStore, 16, 32, 32>::mount(store) else {
+            assert!(false, "fixed writer should mount");
+            return;
+        };
+        let Ok(file) = mounted.create_file_path("/pinned") else {
+            assert!(false, "file should be created");
+            return;
+        };
+        assert!(mounted
+            .write_file_at(file, 0, b"snapshot-visible-payload")
+            .is_ok());
+        assert!(mounted.publish_checkpoint().is_ok());
+
+        let pinned = mounted.live_extent_ranges();
+        assert!(!pinned.is_empty(), "the written file must own extents");
+        assert!(mounted.retain_extents_for_snapshot().is_ok());
+
+        assert!(mounted.unlink_path("/pinned").is_ok());
+        assert!(mounted.publish_checkpoint().is_ok());
+        for (start, count) in pinned.iter().copied() {
+            assert!(
+                !mounted.range_is_reclaimable(start, count),
+                "blocks a live snapshot still reads must not become reusable"
+            );
+        }
+
+        // Deleting the snapshot drops the last reference, and the
+        // space the snapshot was holding finally comes back.
+        let Ok(released) = mounted.release_extents_for_snapshot(&pinned) else {
+            assert!(false, "snapshot release should succeed");
+            return;
+        };
+        assert!(released > 0, "the deleted snapshot must release extents");
+        assert!(mounted.publish_checkpoint().is_ok());
+        for (start, count) in pinned.iter().copied() {
+            assert!(
+                mounted.range_is_reclaimable(start, count),
+                "deleting the last snapshot must reclaim its blocks"
+            );
+        }
+    }
+
+    /// Deleting a snapshot must not free blocks the live tree still
+    /// owns. The refcount, not the deletion, decides.
+    #[test]
+    fn snapshot_deletion_keeps_blocks_the_live_tree_still_owns() {
+        let Ok(seed) = HxfsWriter::new(INSTANCE, VOLUME) else {
+            assert!(false, "seed writer should initialize");
+            return;
+        };
+        let store = MemStore::from_image(seed.image());
+        let Ok(mut mounted) = FixedHxfsWriter::<MemStore, 16, 32, 32>::mount(store) else {
+            assert!(false, "fixed writer should mount");
+            return;
+        };
+        let Ok(file) = mounted.create_file_path("/kept") else {
+            assert!(false, "file should be created");
+            return;
+        };
+        assert!(mounted.write_file_at(file, 0, b"still-referenced").is_ok());
+        assert!(mounted.publish_checkpoint().is_ok());
+
+        let pinned = mounted.live_extent_ranges();
+        assert!(mounted.retain_extents_for_snapshot().is_ok());
+
+        // The file is never unlinked, so releasing the snapshot must
+        // reclaim nothing at all.
+        let Ok(released) = mounted.release_extents_for_snapshot(&pinned) else {
+            assert!(false, "snapshot release should succeed");
+            return;
+        };
+        assert_eq!(released, 0, "a live file's blocks must not be released");
+        assert!(mounted.publish_checkpoint().is_ok());
+        for (start, count) in pinned.iter().copied() {
+            assert!(!mounted.range_is_reclaimable(start, count));
+        }
+        // And the data is still readable.
+        let mut buffer = [0u8; 32];
+        let Ok(read) = mounted.read_file_at(file, 0, &mut buffer) else {
+            assert!(false, "the live file must still be readable");
+            return;
+        };
+        assert_eq!(&buffer[..read], b"still-referenced");
+    }
+
+    /// Two snapshots over the same extent need two releases. If one
+    /// deletion freed the blocks, the surviving snapshot would read
+    /// reissued space.
+    #[test]
+    fn blocks_are_reclaimed_only_after_the_last_snapshot_is_deleted() {
+        let Ok(seed) = HxfsWriter::new(INSTANCE, VOLUME) else {
+            assert!(false, "seed writer should initialize");
+            return;
+        };
+        let store = MemStore::from_image(seed.image());
+        let Ok(mut mounted) = FixedHxfsWriter::<MemStore, 16, 32, 32>::mount(store) else {
+            assert!(false, "fixed writer should mount");
+            return;
+        };
+        let Ok(file) = mounted.create_file_path("/twice") else {
+            assert!(false, "file should be created");
+            return;
+        };
+        assert!(mounted.write_file_at(file, 0, b"two-snapshots").is_ok());
+        assert!(mounted.publish_checkpoint().is_ok());
+
+        let pinned = mounted.live_extent_ranges();
+        assert!(mounted.retain_extents_for_snapshot().is_ok());
+        assert!(mounted.retain_extents_for_snapshot().is_ok());
+
+        assert!(mounted.unlink_path("/twice").is_ok());
+        assert!(mounted.publish_checkpoint().is_ok());
+
+        // First snapshot deleted: one reference remains.
+        let Ok(released) = mounted.release_extents_for_snapshot(&pinned) else {
+            assert!(false, "first release should succeed");
+            return;
+        };
+        assert_eq!(released, 0, "one surviving snapshot must hold the blocks");
+        assert!(mounted.publish_checkpoint().is_ok());
+        for (start, count) in pinned.iter().copied() {
+            assert!(!mounted.range_is_reclaimable(start, count));
+        }
+
+        // Second deleted: the last reference goes, the space returns.
+        let Ok(released) = mounted.release_extents_for_snapshot(&pinned) else {
+            assert!(false, "second release should succeed");
+            return;
+        };
+        assert!(released > 0, "the last deletion must release the extents");
+        assert!(mounted.publish_checkpoint().is_ok());
+        for (start, count) in pinned.iter().copied() {
+            assert!(mounted.range_is_reclaimable(start, count));
+        }
     }
 
     #[test]
