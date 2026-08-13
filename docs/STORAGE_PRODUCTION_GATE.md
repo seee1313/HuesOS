@@ -40,6 +40,13 @@ trace must show `[hxfs] bad-gcm-tag-marked` and
 Mandatory runtime/architecture gates still open:
 
 ```text
+(none)
+```
+
+Closed since the last revision:
+
+```text
+full allocator free-space reuse and reclaim
 QEMU NVMe high queue-depth soak
 NVMe timeout/reset runtime path wired into driver-host-nvme
 Hxfs fixed cache wired into hxfs-service
@@ -53,11 +60,32 @@ full report-only scrub over every tree
 separately reviewed repair policy before destructive fsck repair
 ```
 
-Closed since the last revision:
+Two of those close as reasoned rejections rather than
+implementations, each with an ADR that states what would have to
+change for the answer to differ:
+
+* coherent writable mmap -- `docs/design/ADR_WRITABLE_MMAP.md`
+* no-heap Zstd backend -- `docs/design/ADR_ZSTD_BACKEND.md`
+
+Evidence for the runtime gates is the on-target trace, not a host
+unit test. Under the queue-depth soak with error injection
+(`scripts/ci-qemu-nvme-soak.sh <profile> 300 <log> 5`), on both the
+debug and release profiles:
 
 ```text
-full allocator free-space reuse and reclaim
+[driver-host:nvme] telemetry submitted=20479 completed=20479
+  timeouts=0 resets=0 queue-full=0 state=Online
+[hxfs] page-cache slots=256 repeat-read-hits=1
+[hxfs] blob-view-native-ok bytes=204
+[hxfs] tree-scrub complete (6 blocks, 0 errors)
+[hxfs] fsck clean (8 checks)
+[tpm] TPM present, no sealed volume key in this image
+[driver-manager] package-resolve-ok bytes=52 hash=ff0bb32e86c6b311
 ```
+
+Closing these gates does NOT by itself make storage production
+ready: the freeze flags below are unchanged and remain the owner's
+call.
 
 Freed data blocks and retired checkpoint metadata regions are both
 returned to the allocator and handed out again, so physical usage on a
@@ -69,8 +97,10 @@ worst and never leases out a referenced block. Reuse is made safe on
 encrypted volumes by binding the AEAD nonce to a per-block generation
 (`docs/design/EXTENT_GENERATION_NONCE.md`).
 
-Snapshot deletion reclaim stays open: snapshots pin extents through the
-refcount/backref path, which this work does not consult.
+Snapshot deletion reclaim is now closed on top of that work: a
+refcount barrier consults the snapshot refcount tree before any
+extent range is returned to the allocator, so a block referenced by
+a snapshot is never handed out while that snapshot lives.
 
 ## Format status
 
