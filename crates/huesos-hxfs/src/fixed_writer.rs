@@ -776,19 +776,71 @@ impl<
             BLOCK_TYPE_BACKREF_TREE_ROOT,
             BLOCK_TYPE_BACKREF_TREE,
         )?;
-        // Quota tree is always single-block.
-        let mut block = [0u8; BLOCK_SIZE];
-        if self.checkpoint.quota_tree_lba != 0 {
-            match self.read_mounted_metadata_block(
-                self.checkpoint.quota_tree_lba,
-                BLOCK_TYPE_QUOTA_TREE,
-                self.system_volume.root_object_id,
+        // The Hxblob index is a multi-block tree in its own right.
+        // Leaving it out meant a scrub reported a clean volume while
+        // the tree naming every content-addressed object was
+        // unreadable.
+        check_root_or_single(
+            self,
+            self.checkpoint.hxblob_index_tree_lba,
+            BLOCK_TYPE_HXBLOB_INDEX_TREE_ROOT,
+            BLOCK_TYPE_HXBLOB_INDEX_TREE,
+        )?;
+
+        // Remaining roots are single-block. Each is optional: a zero
+        // LBA means the feature is not in use on this volume, which
+        // is not a finding. A non-zero LBA that will not decode is.
+        let mut check_single = |this: &mut Self, lba: u64, block_type: u32| {
+            if lba == 0 {
+                return;
+            }
+            let mut block = [0u8; BLOCK_SIZE];
+            match this.read_mounted_metadata_block(
+                lba,
+                block_type,
+                this.system_volume.root_object_id,
                 &mut block,
             ) {
                 Ok(_) => blocks += 1,
                 Err(_) => errors += 1,
             }
-        }
+        };
+        check_single(self, self.checkpoint.quota_tree_lba, BLOCK_TYPE_QUOTA_TREE);
+        // Policy trees decide how bytes are encrypted and compressed.
+        // A volume whose policy tree is corrupt can still serve reads
+        // from cache and looks healthy until the first cold read.
+        check_single(
+            self,
+            self.checkpoint.encryption_policy_tree_lba,
+            BLOCK_TYPE_ENCRYPTION_POLICY_TREE,
+        );
+        check_single(
+            self,
+            self.checkpoint.compression_policy_tree_lba,
+            BLOCK_TYPE_COMPRESSION_POLICY_TREE,
+        );
+        check_single(
+            self,
+            self.checkpoint.hxblob_merkle_tree_lba,
+            BLOCK_TYPE_HXBLOB_MERKLE_TREE,
+        );
+        // v5 topology: these describe where the volume lives, so a
+        // silent failure here surfaces as a mount that finds nothing.
+        check_single(
+            self,
+            self.checkpoint.virtual_volume_tree_lba,
+            BLOCK_TYPE_VIRTUAL_VOLUME_TREE,
+        );
+        check_single(
+            self,
+            self.checkpoint.gpt_summary_lba,
+            BLOCK_TYPE_GPT_SUMMARY,
+        );
+        check_single(
+            self,
+            self.checkpoint.install_manifest_lba,
+            BLOCK_TYPE_INSTALL_MANIFEST,
+        );
         Ok((blocks, errors))
     }
 
@@ -6237,6 +6289,52 @@ mod tests {
                 Err(HxfsError::NoSpace) | Err(HxfsError::QuotaExceeded)
             ),
             "a write that adds blocks past the limit must be refused"
+        );
+    }
+
+    /// The full tree scrub must cover every checkpoint root, not just
+    /// the four storage trees it started with. A corrupt policy or
+    /// index root is invisible to an object walk: reads served from
+    /// cache still succeed, and the volume looks healthy right up to
+    /// the first cold read.
+    #[test]
+    fn tree_scrub_reports_a_corrupt_non_storage_root() {
+        let Ok(seed) = HxfsWriter::new(INSTANCE, VOLUME) else {
+            assert!(false, "seed writer should initialize");
+            return;
+        };
+        let store = MemStore::from_image(seed.image());
+        let Ok(mut mounted) = FixedHxfsWriter::<MemStore, 16, 32, 32>::mount(store) else {
+            assert!(false, "fixed writer should mount");
+            return;
+        };
+        let Ok(file) = mounted.create_file_path("/data") else {
+            assert!(false, "file should be created");
+            return;
+        };
+        assert!(mounted.write_file_at(file, 0, b"payload").is_ok());
+        assert!(mounted.publish_checkpoint().is_ok());
+
+        let Ok((_, errors)) = mounted.scrub_all() else {
+            assert!(false, "the tree scrub should run");
+            return;
+        };
+        assert_eq!(errors, 0, "a freshly published volume must scrub clean");
+
+        // Point a non-storage root at a block that is not the tree it
+        // claims to be. Before every root was walked this scrubbed
+        // clean, which is the failure this test exists to prevent.
+        let victim = mounted.checkpoint.quota_tree_lba;
+        assert!(victim != 0, "the volume must have a quota root to corrupt");
+        mounted.checkpoint.encryption_policy_tree_lba = victim;
+
+        let Ok((_, errors)) = mounted.scrub_all() else {
+            assert!(false, "the tree scrub should run");
+            return;
+        };
+        assert!(
+            errors > 0,
+            "a root that does not decode as its declared tree must be reported"
         );
     }
 

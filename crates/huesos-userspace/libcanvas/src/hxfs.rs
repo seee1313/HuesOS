@@ -525,6 +525,100 @@ pub fn open_blob_on(channel: &Channel, hash: &[u8; 32]) -> Result<HxfsBlobView> 
     read_blob_view_on(channel, *hash, request_id)
 }
 
+/// Send a CreateBlob request without waiting for the answer.
+///
+/// Returns the request id to poll with. Splitting send from receive
+/// is what lets a caller with its own main loop wait across ticks
+/// instead of spinning: re-sending the request on every tick creates
+/// a fresh blob endpoint each time and exhausts the service's fixed
+/// table, which is a self-inflicted NoSpace that looks like a
+/// storage fault.
+pub fn begin_create_blob_on(channel: &Channel, data: &[u8]) -> Result<u64> {
+    write_native_request(
+        channel,
+        abi::HxfsOp::CreateBlob,
+        abi::HxfsHandleKind::None,
+        0,
+        0,
+        data,
+    )
+}
+
+/// Send an OpenBlob request without waiting for the answer.
+pub fn begin_open_blob_on(channel: &Channel, hash: &[u8; 32]) -> Result<u64> {
+    write_native_request(
+        channel,
+        abi::HxfsOp::OpenBlob,
+        abi::HxfsHandleKind::BlobView,
+        0,
+        0,
+        hash,
+    )
+}
+
+/// Check once for the answer to an already-sent blob request.
+///
+/// `Ok(None)` means "not yet" -- the caller should come back on its
+/// next tick. Responses to other requests are discarded here, so a
+/// slow answer to an abandoned request cannot be mistaken for this
+/// one.
+pub fn poll_blob_view_on(
+    channel: &Channel,
+    hash: [u8; 32],
+    request_id: u64,
+) -> Result<Option<HxfsBlobView>> {
+    let mut buf = [0u8; NATIVE_MESSAGE_BYTES];
+    loop {
+        match channel.read_optional_handle(&mut buf) {
+            Ok((n, Some(handle))) => {
+                if n < abi::HXFS_RESPONSE_BYTES {
+                    return Err(ErrorCode::InvalidArgs);
+                }
+                let Some(response) = decode_response(&buf[..abi::HXFS_RESPONSE_BYTES]) else {
+                    return Err(ErrorCode::InvalidArgs);
+                };
+                if response.request_id != request_id {
+                    drop(handle);
+                    continue;
+                }
+                if response.status != abi::HxfsStatus::Ok {
+                    return Err(status_to_error(response.status));
+                }
+                if response.handle_kind != abi::HxfsHandleKind::BlobView {
+                    return Err(ErrorCode::WrongType);
+                }
+                if response.rights & abi::rights::WRITE != 0 {
+                    return Err(ErrorCode::Internal);
+                }
+                let mut resolved = hash;
+                if response.payload_len as usize == 32 {
+                    let start = abi::HXFS_RESPONSE_BYTES;
+                    let end = start + 32;
+                    if n >= end {
+                        resolved.copy_from_slice(&buf[start..end]);
+                    }
+                }
+                return Ok(Some(HxfsBlobView {
+                    channel: Channel::from_handle(handle),
+                    hash: resolved,
+                    size: response.value,
+                }));
+            }
+            Ok((n, None)) => {
+                if let Some(response) = decode_response(&buf[..n.min(abi::HXFS_RESPONSE_BYTES)]) {
+                    if response.request_id != request_id {
+                        continue;
+                    }
+                    return Err(status_to_error(response.status));
+                }
+                return Err(ErrorCode::InvalidArgs);
+            }
+            Err(ErrorCode::ShouldWait) | Err(ErrorCode::TimedOut) => return Ok(None),
+            Err(error) => return Err(error),
+        }
+    }
+}
+
 /// Store a blob over a borrowed Hxfs client channel.
 pub fn create_blob_on(channel: &Channel, data: &[u8]) -> Result<HxfsBlobView> {
     let request_id = write_native_request(

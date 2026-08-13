@@ -2003,6 +2003,18 @@ fn run_reliability_checks(fs: &mut MountedHxfs) {
         ),
         Err(error) => println!("[hxfs] scrub failed: {:?}", error),
     }
+    // Full tree scrub: every checkpoint root on disk, read back
+    // through the decrypt-aware path. The live scrub above walks
+    // objects; this one walks the trees that describe them, so a
+    // corrupt policy or index root cannot hide behind healthy
+    // objects.
+    match fs.scrub_all() {
+        Ok((blocks, errors)) => println!(
+            "[hxfs] tree-scrub complete ({} blocks, {} errors)",
+            blocks, errors
+        ),
+        Err(error) => println!("[hxfs] tree-scrub failed: {:?}", error),
+    }
     // Structural fsck: persisted roots + object model.
     let fsck = fs.fsck();
     if fsck.errors == 0 {

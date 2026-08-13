@@ -154,6 +154,10 @@ pub struct DriverManager {
     package_probe_announced: bool,
     /// Whether the probe has logged that it is waiting for a channel.
     package_probe_waiting_logged: bool,
+    /// Main-loop ticks the probe may still wait for an answer.
+    package_probe_retries: u32,
+    /// Id of the store request already sent, if any.
+    package_probe_request: Option<u64>,
     /// Hash of the probe blob, once stored.
     ///
     /// The store step hands back a live view handle and the service
@@ -280,6 +284,8 @@ impl DriverManager {
             package_probe_done: false,
             package_probe_announced: false,
             package_probe_waiting_logged: false,
+            package_probe_retries: 20_000,
+            package_probe_request: None,
             package_probe_hash: None,
             acpi_manager: None,
             acpi_tables: None,
@@ -1164,27 +1170,69 @@ impl DriverManager {
         // so re-storing on every retry would exhaust the table and
         // report NoSpace -- a self-inflicted failure that looks like
         // a storage bug.
+        //
+        // The request is also SENT exactly once. DriverManager owns
+        // the boot main loop, so it must not block in a spin waiting
+        // for the service; it sends, then polls on later ticks. An
+        // earlier version blocked instead, and sizing that spin was
+        // hopeless: too short and the probe reported a timeout
+        // against a service that was merely busy behind the NVMe
+        // load, too long and the boot loop stalled.
         let hash = match self.package_probe_hash {
             Some(hash) => hash,
-            None => match libcanvas::hxfs::create_blob_on(channel, payload) {
-                Ok(view) => {
-                    let hash = *view.hash();
-                    // Release the endpoint before resolving: the
-                    // resolve opens its own view, and the table is
-                    // small enough that holding both is wasteful.
-                    drop(view);
-                    self.package_probe_hash = Some(hash);
-                    hash
+            None => {
+                let request_id = match self.package_probe_request {
+                    Some(id) => id,
+                    None => match libcanvas::hxfs::begin_create_blob_on(channel, payload) {
+                        Ok(id) => {
+                            self.package_probe_request = Some(id);
+                            id
+                        }
+                        Err(error) => {
+                            self.package_probe_done = true;
+                            println!(
+                                "[driver-manager] package probe: store request failed ({})",
+                                error.as_str()
+                            );
+                            return;
+                        }
+                    },
+                };
+                match libcanvas::hxfs::poll_blob_view_on(channel, [0u8; 32], request_id) {
+                    Ok(Some(view)) => {
+                        let hash = *view.hash();
+                        // Release the endpoint before resolving: the
+                        // resolve opens its own view, and the table is
+                        // small enough that holding both is wasteful.
+                        drop(view);
+                        self.package_probe_hash = Some(hash);
+                        self.package_probe_request = None;
+                        hash
+                    }
+                    Ok(None) => {
+                        // Not answered yet. Come back next tick
+                        // WITHOUT re-sending: a second CreateBlob
+                        // would store the blob again and consume
+                        // another endpoint from the service's fixed
+                        // table.
+                        self.package_probe_retries =
+                            self.package_probe_retries.saturating_sub(1);
+                        if self.package_probe_retries == 0 {
+                            self.package_probe_done = true;
+                            println!("[driver-manager] package probe: service never answered");
+                        }
+                        return;
+                    }
+                    Err(error) => {
+                        self.package_probe_done = true;
+                        println!(
+                            "[driver-manager] package probe: store failed ({})",
+                            error.as_str()
+                        );
+                        return;
+                    }
                 }
-                Err(error) => {
-                    self.package_probe_done = true;
-                    println!(
-                        "[driver-manager] package probe: store failed ({})",
-                        error.as_str()
-                    );
-                    return;
-                }
-            },
+            }
         };
 
         // Round-trip the hash through its text form, the way an

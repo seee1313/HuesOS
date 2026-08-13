@@ -171,6 +171,54 @@ if [[ "$inject" == "3" ]]; then
     qemu_monitor=(-monitor "unix:build/qemu-monitor.sock,server=on,wait=off")
 fi
 
+# A software TPM, when the host has one. The kernel's KeyProvider
+# unseals the volume key from PCR-bound storage, and that path can only
+# be exercised against a real TPM 2.0 command interface -- a stub would
+# validate the stub. Absence is not fatal: the guest falls back to the
+# build-time key and says so, which is also a case worth soaking.
+qemu_tpm=()
+swtpm_pid=""
+if [[ "${SOAK_TPM:-1}" == "1" ]] && command -v swtpm >/dev/null 2>&1; then
+    tpm_state="build/swtpm-state"
+    tpm_sock="build/swtpm-sock"
+    rm -rf "$tpm_state" "$tpm_sock"
+    mkdir -p "$tpm_state"
+    swtpm socket \
+        --tpmstate "dir=$tpm_state" \
+        --ctrl "type=unixio,path=$tpm_sock" \
+        --tpm2 \
+        --flags not-need-init,startup-clear \
+        >build/swtpm.log 2>&1 &
+    swtpm_pid=$!
+    # Wait for the control socket rather than sleeping a fixed time:
+    # QEMU fails to start outright if the socket is not there yet.
+    for _ in $(seq 1 50); do
+        [[ -S "$tpm_sock" ]] && break
+        sleep 0.1
+    done
+    if [[ -S "$tpm_sock" ]]; then
+        qemu_tpm=(
+            -chardev "socket,id=chrtpm,path=$tpm_sock"
+            -tpmdev emulator,id=tpm0,chardev=chrtpm
+            -device tpm-crb,tpmdev=tpm0
+        )
+        echo "[soak] swtpm attached (tpm-crb)"
+    else
+        echo "[soak] swtpm did not expose its socket; continuing without a TPM"
+        kill "$swtpm_pid" 2>/dev/null || true
+        swtpm_pid=""
+    fi
+else
+    echo "[soak] no swtpm on this host; continuing without a TPM"
+fi
+cleanup_swtpm() {
+    if [[ -n "$swtpm_pid" ]]; then
+        kill "$swtpm_pid" 2>/dev/null || true
+        wait "$swtpm_pid" 2>/dev/null || true
+    fi
+}
+trap cleanup_swtpm EXIT
+
 qemu_nvme=()
 case "$nvme_layout" in
     split)
@@ -202,7 +250,7 @@ esac
 set +e
 if [[ "$inject" == "3" ]]; then
     rm -f build/qemu-monitor.sock
-    qemu-system-x86_64 "${qemu_common[@]}" "${qemu_nvme[@]}" "${qemu_monitor[@]}" &
+    qemu-system-x86_64 "${qemu_common[@]}" "${qemu_nvme[@]}" "${qemu_tpm[@]}" "${qemu_monitor[@]}" &
     qemu_pid=$!
     status=124
     waited=0
@@ -220,7 +268,7 @@ if [[ "$inject" == "3" ]]; then
     kill "$qemu_pid" 2>/dev/null
     wait "$qemu_pid" 2>/dev/null
 else
-    timeout "${seconds}s" qemu-system-x86_64 "${qemu_common[@]}" "${qemu_nvme[@]}"
+    timeout "${seconds}s" qemu-system-x86_64 "${qemu_common[@]}" "${qemu_nvme[@]}" "${qemu_tpm[@]}"
     status=$?
 fi
 set -e

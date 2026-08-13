@@ -162,7 +162,17 @@ pub fn object_init() {
         crate::tpm::UnsealOutcome::Failed => {
             tpm_log("[tpm] unseal failed");
         }
-        crate::tpm::UnsealOutcome::NoTpm | crate::tpm::UnsealOutcome::NoSealedBlob => {}
+        // Not failures, but not silence either: "no TPM" and "a TPM
+        // with nothing sealed to it" are different states, and a
+        // silent boot makes them indistinguishable from a TPM that
+        // was probed successfully. That ambiguity is what makes a
+        // TPM integration impossible to verify from a boot log.
+        crate::tpm::UnsealOutcome::NoTpm => {
+            tpm_log("[tpm] no TPM 2.0 CRB interface present");
+        }
+        crate::tpm::UnsealOutcome::NoSealedBlob => {
+            tpm_log("[tpm] TPM present, no sealed volume key in this image");
+        }
     }
     if outcome != crate::tpm::UnsealOutcome::Installed {
         // Development/plain builds: the build-time blob
