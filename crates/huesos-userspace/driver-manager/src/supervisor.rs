@@ -150,6 +150,16 @@ pub struct DriverManager {
     hxfs_client: Option<Channel>,
     /// Whether the Hxblob package-resolve probe has already run.
     package_probe_done: bool,
+    /// Whether the probe has logged that it started.
+    package_probe_announced: bool,
+    /// Whether the probe has logged that it is waiting for a channel.
+    package_probe_waiting_logged: bool,
+    /// Hash of the probe blob, once stored.
+    ///
+    /// The store step hands back a live view handle and the service
+    /// keeps a small fixed table of them, so the probe must store
+    /// exactly once and resume at the resolve step on later ticks.
+    package_probe_hash: Option<[u8; 32]>,
     acpi_manager: Option<ManagedHost>,
     acpi_tables: Option<Vmo>,
     acpi_broker: Option<Handle>,
@@ -268,6 +278,9 @@ impl DriverManager {
             hxfs_ready: false,
             hxfs_client: None,
             package_probe_done: false,
+            package_probe_announced: false,
+            package_probe_waiting_logged: false,
+            package_probe_hash: None,
             acpi_manager: None,
             acpi_tables: None,
             acpi_broker: None,
@@ -698,6 +711,7 @@ impl DriverManager {
             self.poll_input_host();
             self.poll_nvme_host();
             self.poll_hxfs_service();
+            self.probe_package_resolving();
             self.poll_acpi_manager();
             // Multi-channel poll: cannot block on one fd without starving others.
             // Yield cooperatively; hot IRQ path is already blocking in the host.
@@ -1095,9 +1109,11 @@ impl DriverManager {
             return;
         }
         let Some(hxfs) = self.hxfs_service.as_ref() else {
+            println!("[driver-manager] package probe: no hxfs service handle");
             return;
         };
         let Ok((client_end, server_end)) = Channel::pair() else {
+            println!("[driver-manager] package probe: channel pair failed");
             return;
         };
         if hxfs
@@ -1130,24 +1146,46 @@ impl DriverManager {
             return;
         }
         let Some(channel) = self.hxfs_client.as_ref() else {
+            if !self.package_probe_waiting_logged {
+                self.package_probe_waiting_logged = true;
+                println!("[driver-manager] package probe: waiting for a client channel");
+            }
             return;
         };
-        self.package_probe_done = true;
+        if !self.package_probe_announced {
+            self.package_probe_announced = true;
+            println!("[driver-manager] package probe: starting");
+        }
 
         // A package index as it would be read off the volume.
         let payload = b"\x7fELF-huesos-package-resolve-probe-payload-0123456789";
-        let view = match libcanvas::hxfs::create_blob_on(channel, payload) {
-            Ok(view) => view,
-            Err(error) => {
-                println!(
-                    "[driver-manager] package probe: store failed ({})",
-                    error.as_str()
-                );
-                return;
-            }
+        // Store exactly once. Each create hands back a live view
+        // handle and the service keeps a small fixed table of them,
+        // so re-storing on every retry would exhaust the table and
+        // report NoSpace -- a self-inflicted failure that looks like
+        // a storage bug.
+        let hash = match self.package_probe_hash {
+            Some(hash) => hash,
+            None => match libcanvas::hxfs::create_blob_on(channel, payload) {
+                Ok(view) => {
+                    let hash = *view.hash();
+                    // Release the endpoint before resolving: the
+                    // resolve opens its own view, and the table is
+                    // small enough that holding both is wasteful.
+                    drop(view);
+                    self.package_probe_hash = Some(hash);
+                    hash
+                }
+                Err(error) => {
+                    self.package_probe_done = true;
+                    println!(
+                        "[driver-manager] package probe: store failed ({})",
+                        error.as_str()
+                    );
+                    return;
+                }
+            },
         };
-        let hash = *view.hash();
-        drop(view);
 
         // Round-trip the hash through its text form, the way an
         // on-volume package index carries it.
@@ -1179,10 +1217,15 @@ impl DriverManager {
                 }
             }
             Err(error) => {
+                self.package_probe_done = true;
                 println!("[driver-manager] package probe: resolve failed ({error:?})");
                 return;
             }
         }
+
+        // Past the resolve: whatever happens now is a verdict, not a
+        // reason to come back next tick.
+        self.package_probe_done = true;
 
         // An unknown hash must fail, not resolve to the nearest thing.
         let absent = [0x5Au8; 32];
@@ -1408,7 +1451,6 @@ impl DriverManager {
                     self.hxfs_service = Some(host);
                     println!("[driver-manager] Hxfs service ready");
                     self.attach_own_hxfs_client();
-                    self.probe_package_resolving();
                     return;
                 }
                 Ok(n) if &buf[..n] == protocol::HXFS_SERVICE_UNAVAILABLE.as_bytes() => {

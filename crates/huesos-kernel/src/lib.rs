@@ -12,6 +12,7 @@ extern crate alloc;
 
 pub mod boot;
 pub mod boot_key;
+pub mod tpm;
 pub mod extable;
 pub mod init;
 pub mod mem;

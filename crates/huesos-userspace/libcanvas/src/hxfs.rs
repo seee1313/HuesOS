@@ -81,7 +81,7 @@ impl Hxfs {
     /// returning the handle, so a successful open means the bytes are
     /// intact, not merely present.
     pub fn open_blob(&self, hash: &[u8; 32]) -> Result<HxfsBlobView> {
-        write_native_request(
+        let request_id = write_native_request(
             &self.channel,
             abi::HxfsOp::OpenBlob,
             abi::HxfsHandleKind::BlobView,
@@ -89,14 +89,14 @@ impl Hxfs {
             0,
             hash,
         )?;
-        self.read_blob_view(*hash)
+        self.read_blob_view(*hash, request_id)
     }
 
     /// Store `data` as a content-addressed blob and return a view of
     /// it. Storing identical bytes twice yields the same blob rather
     /// than an error.
     pub fn create_blob(&self, data: &[u8]) -> Result<HxfsBlobView> {
-        write_native_request(
+        let request_id = write_native_request(
             &self.channel,
             abi::HxfsOp::CreateBlob,
             abi::HxfsHandleKind::None,
@@ -104,11 +104,11 @@ impl Hxfs {
             0,
             data,
         )?;
-        self.read_blob_view([0u8; 32])
+        self.read_blob_view([0u8; 32], request_id)
     }
 
-    fn read_blob_view(&self, hash: [u8; 32]) -> Result<HxfsBlobView> {
-        read_blob_view_on(&self.channel, hash)
+    fn read_blob_view(&self, hash: [u8; 32], request_id: u64) -> Result<HxfsBlobView> {
+        read_blob_view_on(&self.channel, hash, request_id)
     }
 
     /// Create a directory by absolute path through the native Hxfs ABI.
@@ -480,7 +480,7 @@ impl HxfsBlobView {
             &[],
         )?;
         let mut response = [0u8; NATIVE_MESSAGE_BYTES];
-        let n = read_native_payload(&self.channel, &mut response)?;
+        let n = read_native_payload_bounded(&self.channel, &mut response)?;
         if n == 32 {
             self.hash.copy_from_slice(&response[..32]);
         }
@@ -499,7 +499,7 @@ impl HxfsBlobView {
             &[],
         )?;
         let mut response = [0u8; NATIVE_MESSAGE_BYTES];
-        let n = read_native_payload(&self.channel, &mut response)?;
+        let n = read_native_payload_bounded(&self.channel, &mut response)?;
         if n > out.len() {
             return Err(ErrorCode::InvalidArgs);
         }
@@ -514,7 +514,7 @@ impl HxfsBlobView {
 /// state and cannot hand ownership to an [`Hxfs`], so the blob path is
 /// also available as free functions over `&Channel`.
 pub fn open_blob_on(channel: &Channel, hash: &[u8; 32]) -> Result<HxfsBlobView> {
-    write_native_request(
+    let request_id = write_native_request(
         channel,
         abi::HxfsOp::OpenBlob,
         abi::HxfsHandleKind::BlobView,
@@ -522,12 +522,12 @@ pub fn open_blob_on(channel: &Channel, hash: &[u8; 32]) -> Result<HxfsBlobView> 
         0,
         hash,
     )?;
-    read_blob_view_on(channel, *hash)
+    read_blob_view_on(channel, *hash, request_id)
 }
 
 /// Store a blob over a borrowed Hxfs client channel.
 pub fn create_blob_on(channel: &Channel, data: &[u8]) -> Result<HxfsBlobView> {
-    write_native_request(
+    let request_id = write_native_request(
         channel,
         abi::HxfsOp::CreateBlob,
         abi::HxfsHandleKind::None,
@@ -535,18 +535,52 @@ pub fn create_blob_on(channel: &Channel, data: &[u8]) -> Result<HxfsBlobView> {
         0,
         data,
     )?;
-    read_blob_view_on(channel, [0u8; 32])
+    read_blob_view_on(channel, [0u8; 32], request_id)
 }
 
-fn read_blob_view_on(channel: &Channel, hash: [u8; 32]) -> Result<HxfsBlobView> {
+fn read_blob_view_on(
+    channel: &Channel,
+    hash: [u8; 32],
+    request_id: u64,
+) -> Result<HxfsBlobView> {
         let mut buf = [0u8; NATIVE_MESSAGE_BYTES];
+        // Bounded wait, but deliberately a GENEROUS one, and the
+        // caller must not retry on expiry.
+        //
+        // The native protocol has no request/response correlation:
+        // `request_id` is a constant and nobody checks it. So a
+        // caller that gives up on a request the service is still
+        // going to answer leaves that answer queued, and the next
+        // request on the same channel reads the stale one. With a
+        // handle-carrying response that also means receiving a view
+        // of the wrong object -- the failure looks like a storage
+        // bug and is really a client bug.
+        //
+        // The budget therefore bounds a service that is genuinely
+        // dead (so the supervisor cannot wedge), and expiry is
+        // terminal for this channel rather than something to retry.
+        let mut budget = 4_000_000u32;
         loop {
+            budget = match budget.checked_sub(1) {
+                Some(remaining) => remaining,
+                None => return Err(ErrorCode::TimedOut),
+            };
             match channel.read_optional_handle(&mut buf) {
                 Ok((n, Some(handle))) => {
-                    let Some(response) = decode_response(&buf[..n.min(abi::HXFS_RESPONSE_BYTES)])
-                    else {
+                    if n < abi::HXFS_RESPONSE_BYTES {
+                        return Err(ErrorCode::InvalidArgs);
+                    }
+                    let Some(response) = decode_response(&buf[..abi::HXFS_RESPONSE_BYTES]) else {
                         return Err(ErrorCode::InvalidArgs);
                     };
+                    if response.request_id != request_id {
+                        // A response to an earlier request on this
+                        // channel. Adopting it would hand back a view
+                        // of the wrong object; drop the handle and
+                        // keep waiting for ours.
+                        drop(handle);
+                        continue;
+                    }
                     if response.status != abi::HxfsStatus::Ok {
                         return Err(status_to_error(response.status));
                     }
@@ -560,15 +594,31 @@ fn read_blob_view_on(channel: &Channel, hash: [u8; 32]) -> Result<HxfsBlobView> 
                     if response.rights & abi::rights::WRITE != 0 {
                         return Err(ErrorCode::Internal);
                     }
+                    // CreateBlob answers with the content hash in the
+                    // payload, because only the service can compute
+                    // it. OpenBlob already knows it (the caller asked
+                    // by hash), so the request hash stands.
+                    let mut resolved = hash;
+                    let payload_len = response.payload_len as usize;
+                    if payload_len == 32 {
+                        let start = abi::HXFS_RESPONSE_BYTES;
+                        let end = start + 32;
+                        if n >= end {
+                            resolved.copy_from_slice(&buf[start..end]);
+                        }
+                    }
                     return Ok(HxfsBlobView {
                         channel: Channel::from_handle(handle),
-                        hash,
+                        hash: resolved,
                         size: response.value,
                     });
                 }
                 Ok((n, None)) => {
                     if let Some(response) = decode_response(&buf[..n.min(abi::HXFS_RESPONSE_BYTES)])
                     {
+                        if response.request_id != request_id {
+                            continue;
+                        }
                         return Err(status_to_error(response.status));
                     }
                     return Err(ErrorCode::InvalidArgs);
@@ -581,6 +631,20 @@ fn read_blob_view_on(channel: &Channel, hash: [u8; 32]) -> Result<HxfsBlobView> 
         }
 }
 
+/// Monotonic request id for the native protocol.
+///
+/// The service echoes `request_id` back, so a response whose id does
+/// not match the request just sent is a leftover from an earlier
+/// exchange on the same channel. Without this the two are
+/// indistinguishable and a client that ever abandons a request reads
+/// answers one message out of step from then on -- including handle
+/// transfers, i.e. a view of the wrong object.
+static NEXT_REQUEST_ID: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
+
+fn next_request_id() -> u64 {
+    NEXT_REQUEST_ID.fetch_add(1, core::sync::atomic::Ordering::Relaxed)
+}
+
 fn write_native_request(
     channel: &Channel,
     op: abi::HxfsOp,
@@ -588,10 +652,11 @@ fn write_native_request(
     arg0: u64,
     arg1: u64,
     payload: &[u8],
-) -> Result<()> {
+) -> Result<u64> {
     if payload.len() > abi::HXFS_MAX_INLINE_WRITE_BYTES {
         return Err(ErrorCode::InvalidArgs);
     }
+    let request_id = next_request_id();
     let payload_len = payload.len() as u32;
     let request = abi::HxfsRequest {
         version: abi::HXFS_PROTOCOL_VERSION,
@@ -602,7 +667,7 @@ fn write_native_request(
         } else {
             abi::request_flags::INLINE_PAYLOAD
         },
-        request_id: 1,
+        request_id,
         handle_id: 0,
         handle_kind,
         rights: abi::rights::ALL,
@@ -616,7 +681,8 @@ fn write_native_request(
     message[..abi::HXFS_REQUEST_BYTES].copy_from_slice(&request);
     message[abi::HXFS_REQUEST_BYTES..abi::HXFS_REQUEST_BYTES + payload.len()]
         .copy_from_slice(payload);
-    channel.write(&message[..abi::HXFS_REQUEST_BYTES + payload.len()])
+    channel.write(&message[..abi::HXFS_REQUEST_BYTES + payload.len()])?;
+    Ok(request_id)
 }
 
 fn read_native_handle(channel: &Channel, expected_kind: abi::HxfsHandleKind) -> Result<Channel> {
@@ -660,6 +726,54 @@ fn read_native_status(channel: &Channel) -> Result<abi::HxfsResponse> {
         return Ok(response);
     }
     Err(status_to_error(response.status))
+}
+
+/// Bounded variant of [`read_native_payload`].
+///
+/// The blob paths are reachable from DriverManager's boot path, where
+/// a service that stops answering must surface as `TimedOut` rather
+/// than parking the supervisor forever in a blocking read.
+fn read_native_payload_bounded(channel: &Channel, out: &mut [u8]) -> Result<usize> {
+    let mut message = [0u8; NATIVE_MESSAGE_BYTES];
+    // Scheduler ticks, not wall time: generous enough for a device
+    // read behind the service, short enough that a wedged service is
+    // reported rather than waited on. One expiry is not a verdict --
+    // the service may simply be busy with another client -- so retry
+    // within a bounded budget and only then report TimedOut.
+    // As in `read_blob_view_on`: keep waiting for the answer to the
+    // request we already sent. Abandoning it would desynchronise the
+    // channel, because responses carry no request correlation.
+    let mut attempts = 4_000u32;
+    let n = loop {
+        match channel.read_into_timeout(&mut message, 1024) {
+            Ok(n) => break n,
+            Err(ErrorCode::TimedOut) | Err(ErrorCode::ShouldWait) => {
+                attempts = match attempts.checked_sub(1) {
+                    Some(remaining) => remaining,
+                    None => return Err(ErrorCode::TimedOut),
+                };
+                crate::process::yield_now();
+            }
+            Err(error) => return Err(error),
+        }
+    };
+    if n < abi::HXFS_RESPONSE_BYTES {
+        return Err(ErrorCode::InvalidArgs);
+    }
+    let Some(response) = decode_response(&message[..abi::HXFS_RESPONSE_BYTES]) else {
+        return Err(ErrorCode::InvalidArgs);
+    };
+    if response.status != abi::HxfsStatus::Ok {
+        return Err(status_to_error(response.status));
+    }
+    let payload_len = response.payload_len as usize;
+    if n != abi::HXFS_RESPONSE_BYTES + payload_len || payload_len > out.len() {
+        return Err(ErrorCode::InvalidArgs);
+    }
+    out[..payload_len].copy_from_slice(
+        &message[abi::HXFS_RESPONSE_BYTES..abi::HXFS_RESPONSE_BYTES + payload_len],
+    );
+    Ok(payload_len)
 }
 
 fn read_native_payload(channel: &Channel, out: &mut [u8]) -> Result<usize> {

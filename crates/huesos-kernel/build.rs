@@ -204,6 +204,7 @@ fn emit_boot_key_blob() {
     } else {
         contents.push_str("pub const BOOT_VOLUME_KEY_BLOB: Option<[u8; 32]> = None;\n");
     }
+    emit_sealed_key_blob(&mut contents);
     if let Err(error) = std::fs::File::create(&path).and_then(|mut file| {
         file.write_all(contents.as_bytes())?;
         Ok(())
@@ -484,4 +485,72 @@ fn write_bootfs(path: &Path, files: &[BootFsFile]) {
     }
 
     fs::write(path, image).expect("failed to write BOOTFS image");
+}
+
+/// Emit the sealed volume-key blob from `HUESOS_SEALED_KEY_HEX`.
+///
+/// Format: `<parent-handle-hex>:<public-hex>:<private-hex>`, as
+/// produced by `tools/tpm-seal.sh`. Absent or malformed -> `None`,
+/// and the kernel falls back to whatever `HUESOS_VOLUME_KEY_HEX`
+/// provided (nothing, on a production build).
+fn emit_sealed_key_blob(contents: &mut String) {
+    println!("cargo:rerun-if-env-changed=HUESOS_SEALED_KEY_HEX");
+    contents.push_str(
+        "/// A volume key sealed to a TPM PCR policy.\n\
+         pub struct SealedKeyBlob {\n\
+         \x20   /// Persistent handle of the sealing parent.\n\
+         \x20   pub parent: u32,\n\
+         \x20   /// TPM2B_PUBLIC area.\n\
+         \x20   pub public: &'static [u8],\n\
+         \x20   /// TPM2B_PRIVATE area.\n\
+         \x20   pub private: &'static [u8],\n\
+         }\n",
+    );
+    let value = env::var("HUESOS_SEALED_KEY_HEX").unwrap_or_default();
+    let trimmed = value.trim();
+    let mut parts = trimmed.split(':');
+    let parsed = (|| {
+        let parent = u32::from_str_radix(parts.next()?.trim_start_matches("0x"), 16).ok()?;
+        let public = decode_hex(parts.next()?)?;
+        let private = decode_hex(parts.next()?)?;
+        if parts.next().is_some() || public.is_empty() || private.is_empty() {
+            return None;
+        }
+        Some((parent, public, private))
+    })();
+    match parsed {
+        Some((parent, public, private)) => {
+            contents.push_str(
+                "pub const SEALED_VOLUME_KEY_BLOB: Option<SealedKeyBlob> = Some(SealedKeyBlob {\n",
+            );
+            contents.push_str(&format!("    parent: 0x{parent:08x},\n"));
+            contents.push_str("    public: &[");
+            for byte in &public {
+                contents.push_str(&format!("0x{byte:02x},"));
+            }
+            contents.push_str("],\n    private: &[");
+            for byte in &private {
+                contents.push_str(&format!("0x{byte:02x},"));
+            }
+            contents.push_str("],\n});\n");
+        }
+        None => {
+            contents.push_str("pub const SEALED_VOLUME_KEY_BLOB: Option<SealedKeyBlob> = None;\n");
+        }
+    }
+}
+
+/// Decode an even-length hex string.
+fn decode_hex(text: &str) -> Option<Vec<u8>> {
+    let text = text.trim();
+    if text.is_empty() || text.len() % 2 != 0 || !text.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(text.len() / 2);
+    let mut index = 0usize;
+    while index < text.len() {
+        bytes.push(u8::from_str_radix(&text[index..index + 2], 16).ok()?);
+        index += 2;
+    }
+    Some(bytes)
 }

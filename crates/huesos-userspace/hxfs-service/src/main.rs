@@ -241,6 +241,22 @@ impl HxfsRuntime {
         }
     }
 
+    /// Drop every client and blob endpoint held by the boot
+    /// self-check.
+    ///
+    /// Called once the check has printed its verdict, so the service
+    /// enters its serving loop with the same empty tables a
+    /// production build starts with.
+    #[cfg(feature = "hxblob")]
+    fn release_self_check_state(&mut self) {
+        for slot in self.clients.iter_mut() {
+            *slot = None;
+        }
+        for slot in self.blobs.iter_mut() {
+            *slot = None;
+        }
+    }
+
     fn attach_client(&mut self, channel: Channel) {
         let Some(slot) = self.clients.iter_mut().find(|slot| slot.is_none()) else {
             println!("[hxfs] client table full");
@@ -939,6 +955,12 @@ impl HxfsRuntime {
         let Some(client) = self.clients[index].as_ref() else {
             return;
         };
+        // The content hash travels back as the payload. On CreateBlob
+        // the caller cannot know it -- the hash is computed from the
+        // bytes by the filesystem -- and without it the client has a
+        // view it can read but an object it can never name again,
+        // which is precisely what a content-addressed store is for.
+        let mut frame = [0u8; huesos_abi::hxfs::HXFS_RESPONSE_BYTES + 32];
         let response = make_response(
             request,
             ResponseMeta {
@@ -954,12 +976,11 @@ impl HxfsRuntime {
                 value: size,
                 flags: response_flags::HANDLE_TRANSFERRED,
             },
-            0,
+            32,
         );
-        if client
-            .write_handle(&response, client_end.into_handle())
-            .is_err()
-        {
+        frame[..huesos_abi::hxfs::HXFS_RESPONSE_BYTES].copy_from_slice(&response);
+        frame[huesos_abi::hxfs::HXFS_RESPONSE_BYTES..].copy_from_slice(&hash);
+        if client.write_handle(&frame, client_end.into_handle()).is_err() {
             return;
         }
         *slot = Some(BlobEndpoint {
@@ -1740,7 +1761,6 @@ pub extern "C" fn _start() -> ! {
     let mut fs = fs;
     #[cfg(feature = "synthetic-key")]
     run_boot_self_check(&mut fs);
-    let _ = bootstrap.write(b"service:hxfs:ready");
     // The runtime (and the stack-resident MountedHxfs with its
     // fixed extent array) lives on the HEAP: at Stage E capacities
     // the writer is ~32 KiB and the 128 KiB user stack must stay
@@ -1755,6 +1775,13 @@ pub extern "C" fn _start() -> ! {
     // what the gate is about.
     #[cfg(feature = "hxblob")]
     run_blob_view_check(&mut runtime);
+    // Announce readiness only once the self-checks are done. The
+    // marker is a promise that the next request will be served:
+    // announcing first and then spending seconds inside a boot check
+    // makes the first client request time out against a service that
+    // said it was ready, which is exactly what it means for a
+    // readiness signal to be wrong.
+    let _ = bootstrap.write(b"service:hxfs:ready");
     loop {
         runtime.poll(&bootstrap);
         runtime.stats_since = runtime.stats_since.wrapping_add(1);
@@ -2663,6 +2690,15 @@ fn run_blob_view_check(runtime: &mut HxfsRuntime) {
     }
 
     println!("[hxfs] blob-view-native-ok bytes={}", payload.len());
+
+    // Release everything the check occupied. Both tables are small
+    // fixed arrays, and a boot self-check that keeps a client slot and
+    // a blob endpoint for the life of the process is a self-check that
+    // shrinks the service it is validating. The blob endpoints matter
+    // most: the first real client's view lands in a later slot, and a
+    // stale endpoint in an earlier one is polled forever against a
+    // peer that will never speak again.
+    runtime.release_self_check_state();
 }
 
 /// Encode and send one native request.
