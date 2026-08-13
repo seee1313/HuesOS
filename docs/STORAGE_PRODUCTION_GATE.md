@@ -44,7 +44,6 @@ QEMU NVMe high queue-depth soak
 NVMe timeout/reset runtime path wired into driver-host-nvme
 Hxfs fixed cache wired into hxfs-service
 coherent writable mmap or explicit decision to keep writable mmap disabled
-full allocator free-space reuse and reclaim
 snapshot deletion reclaim through refcount/backref
 BlobView native service operations
 DriverManager package resolving from Hxblob
@@ -53,6 +52,25 @@ no-heap Zstd backend audit or final rejection
 full report-only scrub over every tree
 separately reviewed repair policy before destructive fsck repair
 ```
+
+Closed since the last revision:
+
+```text
+full allocator free-space reuse and reclaim
+```
+
+Freed data blocks and retired checkpoint metadata regions are both
+returned to the allocator and handed out again, so physical usage on a
+create/delete workload settles into a fixed band instead of growing
+without bound. Blocks are quarantined until the checkpoint that
+released them is durable, and the free pool is rebuilt from the live
+extent table at mount rather than persisted, so a crash leaks space at
+worst and never leases out a referenced block. Reuse is made safe on
+encrypted volumes by binding the AEAD nonce to a per-block generation
+(`docs/design/EXTENT_GENERATION_NONCE.md`).
+
+Snapshot deletion reclaim stays open: snapshots pin extents through the
+refcount/backref path, which this work does not consult.
 
 ## Format status
 
