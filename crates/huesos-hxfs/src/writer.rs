@@ -601,6 +601,9 @@ impl HxfsWriter {
             physical_block: start_lba,
             block_count: blocks,
             flags: 0,
+            // The seed writer lays out a fresh image: every block is
+            // written exactly once, so first tenancy.
+            generation: 0,
         });
         let covered = u64::from(blocks) * BLOCK_SIZE_U64;
         if logical_size > covered {
@@ -609,6 +612,9 @@ impl HxfsWriter {
                 physical_block: 0,
                 block_count: ((logical_size - covered).div_ceil(BLOCK_SIZE_U64)) as u32,
                 flags: EXTENT_FLAG_HOLE,
+                // A hole occupies no physical block, so it is never
+                // encrypted and its generation is immaterial.
+                generation: 0,
             });
         }
         Ok(extents)

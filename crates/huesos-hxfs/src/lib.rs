@@ -1264,6 +1264,11 @@ pub(crate) fn parse_extent_record(block: &[u8], offset: usize) -> Result<ExtentR
         physical_block: read_u64(block, offset + 8)?,
         block_count: read_u32(block, offset + 16)?,
         flags: read_u32(block, offset + 20)?,
+        // A v1 record predates block reuse: 32 bytes with nowhere to
+        // put a generation, and every block it names was written
+        // exactly once. Generation 0 is precisely the nonce those
+        // blocks were sealed under, so they keep decrypting.
+        generation: 0,
     };
     if record.block_count == 0 {
         return Err(HxfsError::BadTree);
@@ -1316,6 +1321,11 @@ pub(crate) fn parse_extent_record_v2(
     let algorithm = read_u32(block, offset + 24)?;
     let compressed_bytes = read_u32(block, offset + 28)?;
     let payload_crc32c = read_u32(block, offset + 32)?;
+    // Bytes 36..40 of the 40-byte v2 record were reserved and always
+    // written as zero, so an existing volume reads back generation 0
+    // — the value its blocks were actually encrypted under. That is
+    // what makes this a compatible extension rather than a migration.
+    let generation = u64::from(read_u32(block, offset + 36)?);
     if block_count == 0 {
         return Err(HxfsError::BadTree);
     }
@@ -1363,6 +1373,7 @@ pub(crate) fn parse_extent_record_v2(
             physical_block,
             block_count,
             flags,
+            generation,
         },
         meta,
     ))
@@ -1657,6 +1668,7 @@ fn copy_extent_with_keys<R: BlockReader>(
         extent_crypto::decrypt_extent_block(
             key,
             extent.physical_block,
+            extent.generation,
             &volume_uuid,
             &slot0,
             &mut dec0,
@@ -1665,6 +1677,7 @@ fn copy_extent_with_keys<R: BlockReader>(
         extent_crypto::decrypt_extent_block(
             key,
             extent.physical_block + 1,
+            extent.generation,
             &volume_uuid,
             &slot1,
             &mut dec1,
@@ -1740,6 +1753,7 @@ fn copy_extent_with_keys<R: BlockReader>(
                     extent_crypto::decrypt_extent_block(
                         key,
                         physical_block,
+                        extent.generation,
                         &volume_uuid,
                         &scratch,
                         &mut compressed_after_decrypt,
@@ -1771,6 +1785,7 @@ fn copy_extent_with_keys<R: BlockReader>(
                     extent_crypto::decrypt_extent_block(
                         key,
                         physical_block,
+                        extent.generation,
                         &volume_uuid,
                         &scratch,
                         &mut compressed_after_decrypt,
@@ -1784,6 +1799,7 @@ fn copy_extent_with_keys<R: BlockReader>(
                     extent_crypto::decrypt_extent_block(
                         key,
                         physical_block,
+                        extent.generation,
                         &volume_uuid,
                         &scratch,
                         &mut decompressed,

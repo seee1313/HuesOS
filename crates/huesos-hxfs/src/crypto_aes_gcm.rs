@@ -98,6 +98,7 @@ pub enum AeadError {
 pub fn encrypt_block(
     key: &[u8; 32],
     lba: u64,
+    generation: u64,
     volume_uuid: &[u8; 16],
     plaintext: &[u8],
     out: &mut [u8],
@@ -106,7 +107,7 @@ pub fn encrypt_block(
         return Err(AeadError::PlaintextTooLong);
     }
     let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(key));
-    let nonce_bytes = build_nonce(lba, volume_uuid);
+    let nonce_bytes = build_nonce(lba, generation, volume_uuid);
     let nonce = Nonce::from_slice(&nonce_bytes);
 
     // The RustCrypto `Aead::encrypt` takes the AAD separately; we
@@ -115,7 +116,7 @@ pub fn encrypt_block(
     // different block within the same volume. Without AAD, a
     // ciphertext for lba=42 could be re-decrypted at lba=43 and the
     // tag would still verify.
-    let aad = build_aad(lba, volume_uuid);
+    let aad = build_aad(lba, generation, volume_uuid);
     let ciphertext = cipher
         .encrypt(
             nonce,
@@ -145,6 +146,7 @@ pub fn encrypt_block(
 pub fn decrypt_block(
     key: &[u8; 32],
     lba: u64,
+    generation: u64,
     volume_uuid: &[u8; 16],
     ciphertext_with_nonce: &[u8],
     out: &mut [u8],
@@ -153,20 +155,23 @@ pub fn decrypt_block(
         return Err(AeadError::EngineError);
     }
     let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(key));
-    // We rebuild the nonce from (lba, volume_uuid) rather than trust
-    // the one on disk: the on-disk nonce MUST match what we build, or
-    // the AAD will not match either, so a transplanting attack is
-    // caught by the AAD binding.
-    let expected_nonce = build_nonce(lba, volume_uuid);
+    // We rebuild the nonce from (lba, generation, volume_uuid) rather
+    // than trust the one on disk: the on-disk nonce MUST match what we
+    // build, or the AAD will not match either, so a transplanting
+    // attack is caught by the AAD binding. Including the generation
+    // means a stale ciphertext left behind by a previous tenant of a
+    // reused block is rejected here rather than decrypted as if it
+    // belonged to the current file.
+    let expected_nonce = build_nonce(lba, generation, volume_uuid);
     let on_disk_nonce = &ciphertext_with_nonce[..NONCE_BYTES];
     if on_disk_nonce != expected_nonce {
         // The nonce on disk does not match what we expect for this
-        // (lba, volume_uuid) pair. This is a strong signal that the
+        // (lba, generation, volume_uuid) triple. This is a strong signal that the
         // block has been transplanted from a different location.
         return Err(AeadError::BadTag);
     }
     let nonce = Nonce::from_slice(&expected_nonce);
-    let aad = build_aad(lba, volume_uuid);
+    let aad = build_aad(lba, generation, volume_uuid);
     let plaintext = cipher
         .decrypt(
             nonce,
@@ -189,23 +194,49 @@ pub fn decrypt_block(
 /// LBA), `B4..=B11` = `volume_uuid[0..8]`. The high 4 bytes of the
 /// 64-bit LBA are unused; the full 16-byte UUID is mixed into the
 /// AAD instead.
-fn build_nonce(lba: u64, volume_uuid: &[u8; 16]) -> [u8; NONCE_BYTES] {
+fn build_nonce(lba: u64, generation: u64, volume_uuid: &[u8; 16]) -> [u8; NONCE_BYTES] {
     let mut nonce = [0u8; NONCE_BYTES];
     let lba_bytes = lba.to_le_bytes();
-    nonce[..4].copy_from_slice(&lba_bytes[..4]);
-    nonce[4..NONCE_BYTES].copy_from_slice(&volume_uuid[..NONCE_BYTES - 4]);
+    let generation_bytes = generation.to_le_bytes();
+    // 48 bits of block address, 32 bits of generation, 16 bits of UUID.
+    //
+    // The generation is what makes a *reused* block safe: the same
+    // LBA written twice gets two different nonces, so the (key,
+    // nonce) pair is never repeated. Without it, reusing a block
+    // would repeat a GCM nonce, which leaks the XOR of the two
+    // plaintexts and — far worse — the GHASH authentication key,
+    // letting an attacker forge tags. The filesystem currently only
+    // ever bumps `next_lba`, which is the sole reason the old
+    // (lba, uuid) nonce was sound; block reuse is what this field
+    // is here to permit.
+    //
+    // Widening the block field from 32 to 48 bits also closes a
+    // latent aliasing bug: at 32 bits, block N and block N + 2^32
+    // (16 TiB apart) shared a nonce.
+    nonce[..6].copy_from_slice(&lba_bytes[..6]);
+    nonce[6..10].copy_from_slice(&generation_bytes[..4]);
+    // The UUID is not a secret and provides no replay protection —
+    // cross-volume separation comes from the per-volume HKDF subkey,
+    // and the full UUID stays in the AAD. Two bytes here are enough
+    // to keep volumes from colliding in the clear.
+    nonce[10..NONCE_BYTES].copy_from_slice(&volume_uuid[..NONCE_BYTES - 10]);
     nonce
 }
 
 /// Build the additional authenticated data for the AEAD.
 ///
-/// We bind `lba` (8 B) and the full `volume_uuid` (16 B) into the AAD
-/// so a ciphertext cannot be transplanted across blocks or volumes.
-/// The total AAD is 24 bytes, well within GCM's limit.
-fn build_aad(lba: u64, volume_uuid: &[u8; 16]) -> [u8; 24] {
-    let mut aad = [0u8; 24];
+/// We bind `lba` (8 B), the full `volume_uuid` (16 B) and the full
+/// `generation` (8 B) into the AAD so a ciphertext cannot be
+/// transplanted across blocks, volumes, or tenancies of the same
+/// block. The nonce only carries truncated forms of the block and
+/// generation; the AAD carries both in full, so a pair that collides
+/// in the nonce still fails the tag check.
+/// The total AAD is 32 bytes, well within GCM's limit.
+fn build_aad(lba: u64, generation: u64, volume_uuid: &[u8; 16]) -> [u8; 32] {
+    let mut aad = [0u8; 32];
     aad[..8].copy_from_slice(&lba.to_le_bytes());
     aad[8..24].copy_from_slice(volume_uuid);
+    aad[24..32].copy_from_slice(&generation.to_le_bytes());
     aad
 }
 
@@ -242,7 +273,7 @@ mod tests {
             *byte = (index & 0xff) as u8;
         }
         let mut ciphertext = [0u8; MAX_PLAINTEXT_BYTES + NONCE_BYTES + TAG_BYTES];
-        let written = encrypt_block(&key, 42, &id, &plaintext, &mut ciphertext)
+        let written = encrypt_block(&key, 42, 0, &id, &plaintext, &mut ciphertext)
             .expect("encrypt must succeed for valid input");
         assert_eq!(written, MAX_PLAINTEXT_BYTES + NONCE_BYTES + TAG_BYTES);
         // Ciphertext must not equal plaintext.
@@ -252,7 +283,7 @@ mod tests {
         );
 
         let mut out = [0u8; MAX_PLAINTEXT_BYTES];
-        let read = decrypt_block(&key, 42, &id, &ciphertext[..written], &mut out)
+        let read = decrypt_block(&key, 42, 0, &id, &ciphertext[..written], &mut out)
             .expect("decrypt must succeed with the right key");
         assert_eq!(read, MAX_PLAINTEXT_BYTES);
         assert_eq!(out, plaintext);
@@ -264,10 +295,10 @@ mod tests {
         let id = test_volume_id();
         let plaintext = b"hello, hxfs";
         let mut ciphertext = [0u8; 64];
-        let written = encrypt_block(&key, 1, &id, plaintext, &mut ciphertext)
+        let written = encrypt_block(&key, 1, 0, &id, plaintext, &mut ciphertext)
             .expect("short plaintext is fine");
         let mut out = [0u8; 64];
-        let read = decrypt_block(&key, 1, &id, &ciphertext[..written], &mut out)
+        let read = decrypt_block(&key, 1, 0, &id, &ciphertext[..written], &mut out)
             .expect("decrypt must succeed");
         assert_eq!(&out[..read], plaintext);
     }
@@ -278,12 +309,12 @@ mod tests {
         let id = test_volume_id();
         let plaintext = [0xaau8; 128];
         let mut ciphertext = [0u8; 256];
-        let written = encrypt_block(&key, 7, &id, &plaintext, &mut ciphertext).expect("encrypt");
+        let written = encrypt_block(&key, 7, 0, &id, &plaintext, &mut ciphertext).expect("encrypt");
         // Flip one byte of the ciphertext.
         ciphertext[NONCE_BYTES + 4] ^= 0x01;
         let mut out = [0u8; 128];
         assert_eq!(
-            decrypt_block(&key, 7, &id, &ciphertext[..written], &mut out),
+            decrypt_block(&key, 7, 0, &id, &ciphertext[..written], &mut out),
             Err(AeadError::BadTag)
         );
     }
@@ -294,12 +325,13 @@ mod tests {
         let id = test_volume_id();
         let plaintext = [0x55u8; 64];
         let mut ciphertext = [0u8; 128];
-        let written = encrypt_block(&key, 11, &id, &plaintext, &mut ciphertext).expect("encrypt");
+        let written =
+            encrypt_block(&key, 11, 0, &id, &plaintext, &mut ciphertext).expect("encrypt");
         let mut wrong_key = key;
         wrong_key[0] ^= 0xff;
         let mut out = [0u8; 64];
         assert_eq!(
-            decrypt_block(&wrong_key, 11, &id, &ciphertext[..written], &mut out),
+            decrypt_block(&wrong_key, 11, 0, &id, &ciphertext[..written], &mut out),
             Err(AeadError::BadTag)
         );
     }
@@ -310,13 +342,14 @@ mod tests {
         let id = test_volume_id();
         let plaintext = [0x77u8; 64];
         let mut ciphertext = [0u8; 128];
-        let written = encrypt_block(&key, 100, &id, &plaintext, &mut ciphertext).expect("encrypt");
+        let written =
+            encrypt_block(&key, 100, 0, &id, &plaintext, &mut ciphertext).expect("encrypt");
         // Decrypt with a different LBA: the on-disk nonce does not
         // match the rebuilt nonce, so we get BadTag before the AEAD
         // ever sees the wrong nonce.
         let mut out = [0u8; 64];
         assert_eq!(
-            decrypt_block(&key, 101, &id, &ciphertext[..written], &mut out),
+            decrypt_block(&key, 101, 0, &id, &ciphertext[..written], &mut out),
             Err(AeadError::BadTag)
         );
     }
@@ -328,7 +361,7 @@ mod tests {
         let plaintext = [0u8; MAX_PLAINTEXT_BYTES + 1];
         let mut out = [0u8; 4096];
         assert_eq!(
-            encrypt_block(&key, 1, &id, &plaintext, &mut out),
+            encrypt_block(&key, 1, 0, &id, &plaintext, &mut out),
             Err(AeadError::PlaintextTooLong)
         );
     }
@@ -337,20 +370,136 @@ mod tests {
     fn different_volume_id_produces_different_ciphertext() {
         let key = test_key();
         let id_a = test_volume_id();
-        // Mutate byte 5, which falls inside the nonce's volume-uuid
-        // window (bytes 4..=11 of the nonce). This is the byte a
-        // transplanting attack would have to flip to move a
-        // ciphertext to a different volume.
+        // Byte 5 of the UUID no longer reaches the nonce: the nonce
+        // now spends its 12 bytes on 48 bits of block address, 32
+        // bits of generation, and only the first 2 UUID bytes. The
+        // full UUID is still bound through the AAD, so a ciphertext
+        // still cannot be replayed onto another volume — the tag
+        // stops it even when the nonce is identical. Assert that
+        // stronger property directly.
         let mut id_b = id_a;
         id_b[5] ^= 0x01;
         let plaintext = b"same plaintext, different volume";
         let mut ct_a = [0u8; 128];
         let mut ct_b = [0u8; 128];
-        let len_a = encrypt_block(&key, 1, &id_a, plaintext, &mut ct_a).expect("a");
-        let len_b = encrypt_block(&key, 1, &id_b, plaintext, &mut ct_b).expect("b");
-        // Nonces differ because volume_uuid differs.
-        assert_ne!(&ct_a[..NONCE_BYTES], &ct_b[..NONCE_BYTES]);
-        // Ciphertexts also differ.
+        let len_a = encrypt_block(&key, 1, 0, &id_a, plaintext, &mut ct_a).expect("a");
+        let len_b = encrypt_block(&key, 1, 0, &id_b, plaintext, &mut ct_b).expect("b");
+        // The nonce is deliberately the same here (the differing byte
+        // is outside its UUID window), which is exactly why the AAD
+        // has to carry the whole UUID.
+        assert_eq!(&ct_a[..NONCE_BYTES], &ct_b[..NONCE_BYTES]);
+        // Ciphertexts still differ, because the AAD differs.
         assert_ne!(&ct_a[NONCE_BYTES..len_a], &ct_b[NONCE_BYTES..len_b]);
+        // And volume A's ciphertext must not decrypt as volume B's.
+        let mut out = [0u8; MAX_PLAINTEXT_BYTES];
+        assert_eq!(
+            decrypt_block(&key, 1, 0, &id_b, &ct_a[..len_a], &mut out),
+            Err(AeadError::BadTag),
+            "a ciphertext must not verify under a different volume UUID"
+        );
+        // A UUID byte that *is* in the nonce window still moves it.
+        let mut id_c = id_a;
+        id_c[0] ^= 0x01;
+        let mut ct_c = [0u8; 128];
+        let Ok(_) = encrypt_block(&key, 1, 0, &id_c, plaintext, &mut ct_c) else {
+            assert!(false, "encrypt must succeed");
+            return;
+        };
+        assert_ne!(&ct_a[..NONCE_BYTES], &ct_c[..NONCE_BYTES]);
+    }
+    /// The property that lets the allocator reuse a block at all: the
+    /// same LBA under a different generation must produce a different
+    /// nonce, and therefore a different keystream.
+    ///
+    /// If this ever regresses, reusing a freed block would encrypt new
+    /// plaintext under a nonce that block already used — a GCM nonce
+    /// repeat, which leaks the XOR of the two plaintexts and the GHASH
+    /// authentication key (allowing tag forgery). This test is the
+    /// guard on that.
+    #[test]
+    fn generation_changes_the_nonce_for_the_same_block() {
+        let key = test_key();
+        let id = test_volume_id();
+        let plaintext = b"same block, second tenant";
+        let mut first = [0u8; 128];
+        let mut second = [0u8; 128];
+        let Ok(len_a) = encrypt_block(&key, 4096, 0, &id, plaintext, &mut first) else {
+            assert!(false, "generation 0 must encrypt");
+            return;
+        };
+        let Ok(len_b) = encrypt_block(&key, 4096, 1, &id, plaintext, &mut second) else {
+            assert!(false, "generation 1 must encrypt");
+            return;
+        };
+
+        assert_ne!(
+            &first[..NONCE_BYTES],
+            &second[..NONCE_BYTES],
+            "a reused block must not repeat its nonce"
+        );
+        assert_ne!(
+            &first[NONCE_BYTES..len_a],
+            &second[NONCE_BYTES..len_b],
+            "identical plaintext at one LBA must not produce identical ciphertext across generations"
+        );
+    }
+
+    /// A stale ciphertext left behind by the previous tenant of a
+    /// reused block must not decrypt for the new tenant.
+    #[test]
+    fn a_previous_generation_ciphertext_does_not_verify() {
+        let key = test_key();
+        let id = test_volume_id();
+        let mut sealed = [0u8; 128];
+        let Ok(len) = encrypt_block(&key, 77, 3, &id, b"tenant three", &mut sealed) else {
+            assert!(false, "sealing must succeed");
+            return;
+        };
+
+        let mut out = [0u8; MAX_PLAINTEXT_BYTES];
+        assert_eq!(
+            decrypt_block(&key, 77, 4, &id, &sealed[..len], &mut out),
+            Err(AeadError::BadTag),
+            "generation 4 must reject a block sealed under generation 3"
+        );
+        // The rightful generation still reads it back.
+        let Ok(read) = decrypt_block(&key, 77, 3, &id, &sealed[..len], &mut out) else {
+            assert!(false, "the rightful generation must still decrypt");
+            return;
+        };
+        assert_eq!(&out[..12], b"tenant three", "len {read}");
+    }
+
+    /// Sweep a range of (block, generation) pairs and assert every
+    /// nonce is distinct. Catches an encoding that lets a high
+    /// generation collide with a neighbouring block, which is how a
+    /// hand-rolled bit layout usually fails.
+    #[test]
+    fn nonces_are_unique_across_blocks_and_generations() {
+        let id = test_volume_id();
+        let mut seen: alloc::vec::Vec<[u8; NONCE_BYTES]> = alloc::vec::Vec::new();
+        for block in [0u64, 1, 2, 4095, 4096, 1 << 20, (1 << 32) - 1, 1 << 32] {
+            for generation in [0u64, 1, 2, 255, 65_535, (1 << 32) - 1] {
+                let nonce = build_nonce(block, generation, &id);
+                assert!(
+                    !seen.contains(&nonce),
+                    "nonce collision at block {block} generation {generation}"
+                );
+                seen.push(nonce);
+            }
+        }
+    }
+
+    /// The old layout truncated the LBA to 32 bits, so block N and
+    /// block N + 2^32 shared a nonce on a volume past 16 TiB. The
+    /// widened field must keep them apart.
+    #[test]
+    fn blocks_four_gigablocks_apart_no_longer_alias() {
+        let id = test_volume_id();
+        assert_ne!(
+            build_nonce(7, 0, &id),
+            build_nonce(7 + (1u64 << 32), 0, &id),
+            "48-bit block field must distinguish blocks 2^32 apart"
+        );
     }
 }

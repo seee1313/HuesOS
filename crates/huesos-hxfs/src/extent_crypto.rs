@@ -92,6 +92,7 @@ pub const EXTENT_ENCRYPTED_BYTES: usize =
 pub fn encrypt_extent_block(
     key: &[u8; 32],
     physical_block: u64,
+    generation: u64,
     volume_uuid: &Uuid,
     compressed_plaintext: &[u8],
     out: &mut [u8],
@@ -112,6 +113,7 @@ pub fn encrypt_extent_block(
     let written = crypto_aes_gcm::encrypt_block(
         key,
         physical_block,
+        generation,
         volume_uuid,
         &padded,
         &mut out[..EXTENT_ENCRYPTED_BYTES],
@@ -137,6 +139,7 @@ pub fn encrypt_extent_block(
 pub fn decrypt_extent_block(
     key: &[u8; 32],
     physical_block: u64,
+    generation: u64,
     volume_uuid: &Uuid,
     block: &[u8; BLOCK_SIZE],
     out: &mut [u8],
@@ -150,7 +153,7 @@ pub fn decrypt_extent_block(
     // ignored.
     let encrypted = &block[..EXTENT_ENCRYPTED_BYTES];
     let plaintext_len =
-        crypto_aes_gcm::decrypt_block(key, physical_block, volume_uuid, encrypted, out)
+        crypto_aes_gcm::decrypt_block(key, physical_block, generation, volume_uuid, encrypted, out)
             .map_err(|_| ExtentCryptoError::BadTag)?;
     if plaintext_len != EXTENT_PLAINTEXT_BYTES {
         return Err(ExtentCryptoError::EngineError);
@@ -244,7 +247,8 @@ mod tests {
             *byte = (index & 0xff) as u8;
         }
         let mut out = [0u8; EXTENT_ENCRYPTED_BYTES];
-        let written = encrypt_extent_block(&key, 42, &id, &compressed, &mut out).expect("encrypt");
+        let written =
+            encrypt_extent_block(&key, 42, 0, &id, &compressed, &mut out).expect("encrypt");
         assert_eq!(written, EXTENT_ENCRYPTED_BYTES);
         let mut block = [0u8; BLOCK_SIZE];
         // Stage B.3 wire: the on-disk extent block holds the
@@ -255,7 +259,7 @@ mod tests {
         // of the block.
         block[..written].copy_from_slice(&out[..written]);
         let mut plaintext = [0u8; EXTENT_PLAINTEXT_BYTES];
-        let read = decrypt_extent_block(&key, 42, &id, &block, &mut plaintext).expect("decrypt");
+        let read = decrypt_extent_block(&key, 42, 0, &id, &block, &mut plaintext).expect("decrypt");
         assert_eq!(read, EXTENT_PLAINTEXT_BYTES);
         assert_eq!(&plaintext[..compressed.len()], &compressed[..]);
         // Trailing padding bytes are zero.
@@ -275,7 +279,7 @@ mod tests {
         let id = test_volume_uuid();
         let compressed = [0xa5u8; 512];
         let mut out = [0u8; EXTENT_ENCRYPTED_BYTES];
-        encrypt_extent_block(&key, 7, &id, &compressed, &mut out).expect("encrypt");
+        encrypt_extent_block(&key, 7, 0, &id, &compressed, &mut out).expect("encrypt");
         let mut block = [0u8; BLOCK_SIZE];
         block[..EXTENT_ENCRYPTED_BYTES].copy_from_slice(&out[..EXTENT_ENCRYPTED_BYTES]);
         // Flip a byte in the ciphertext region (after the
@@ -283,7 +287,7 @@ mod tests {
         block[12 + 10] ^= 0x01;
         let mut plaintext = [0u8; EXTENT_PLAINTEXT_BYTES];
         assert_eq!(
-            decrypt_extent_block(&key, 7, &id, &block, &mut plaintext),
+            decrypt_extent_block(&key, 7, 0, &id, &block, &mut plaintext),
             Err(ExtentCryptoError::BadTag)
         );
     }
@@ -294,14 +298,14 @@ mod tests {
         let id = test_volume_uuid();
         let compressed = [0x77u8; 256];
         let mut out = [0u8; EXTENT_ENCRYPTED_BYTES];
-        encrypt_extent_block(&key, 11, &id, &compressed, &mut out).expect("encrypt");
+        encrypt_extent_block(&key, 11, 0, &id, &compressed, &mut out).expect("encrypt");
         let mut block = [0u8; BLOCK_SIZE];
         block[..EXTENT_ENCRYPTED_BYTES].copy_from_slice(&out[..EXTENT_ENCRYPTED_BYTES]);
         let mut wrong_key = key;
         wrong_key[0] ^= 0xff;
         let mut plaintext = [0u8; EXTENT_PLAINTEXT_BYTES];
         assert_eq!(
-            decrypt_extent_block(&wrong_key, 11, &id, &block, &mut plaintext),
+            decrypt_extent_block(&wrong_key, 11, 0, &id, &block, &mut plaintext),
             Err(ExtentCryptoError::BadTag)
         );
     }
@@ -312,7 +316,7 @@ mod tests {
         let id = test_volume_uuid();
         let compressed = [0x33u8; 256];
         let mut out = [0u8; EXTENT_ENCRYPTED_BYTES];
-        encrypt_extent_block(&key, 100, &id, &compressed, &mut out).expect("encrypt");
+        encrypt_extent_block(&key, 100, 0, &id, &compressed, &mut out).expect("encrypt");
         let mut block = [0u8; BLOCK_SIZE];
         block[..EXTENT_ENCRYPTED_BYTES].copy_from_slice(&out[..EXTENT_ENCRYPTED_BYTES]);
         // Decrypt with a different physical_block: the
@@ -320,7 +324,7 @@ mod tests {
         // the AEAD returns BadTag.
         let mut plaintext = [0u8; EXTENT_PLAINTEXT_BYTES];
         assert_eq!(
-            decrypt_extent_block(&key, 101, &id, &block, &mut plaintext),
+            decrypt_extent_block(&key, 101, 0, &id, &block, &mut plaintext),
             Err(ExtentCryptoError::BadTag)
         );
     }
@@ -332,7 +336,7 @@ mod tests {
         let too_long = [0u8; EXTENT_PLAINTEXT_BYTES + 1];
         let mut out = [0u8; EXTENT_ENCRYPTED_BYTES];
         assert_eq!(
-            encrypt_extent_block(&key, 1, &id, &too_long, &mut out),
+            encrypt_extent_block(&key, 1, 0, &id, &too_long, &mut out),
             Err(ExtentCryptoError::PlaintextTooLong)
         );
     }
@@ -344,7 +348,7 @@ mod tests {
         let compressed = [0u8; 16];
         let mut too_small = [0u8; 8];
         assert_eq!(
-            encrypt_extent_block(&key, 1, &id, &compressed, &mut too_small),
+            encrypt_extent_block(&key, 1, 0, &id, &compressed, &mut too_small),
             Err(ExtentCryptoError::OutputTooSmall)
         );
     }
