@@ -9,13 +9,17 @@ use alloc::boxed::Box;
 use core::panic::PanicInfo;
 use huesos_abi::hxfs::{
     request_flags, response_flags, rights as hxfs_rights, HxfsHandleKind, HxfsOp, HxfsRequest,
-    HxfsResponse, HxfsStatus, HXFS_MAX_INLINE_WRITE_BYTES, HXFS_REQUEST_BYTES, HXFS_RESPONSE_BYTES,
+    HxfsStatus,
 };
 use huesos_hxfs::fixed_writer::FixedHxfsWriter;
 use huesos_hxfs::format::{DirectoryHandle, FileHandle};
 use huesos_hxfs::reader::BlockReader;
 use huesos_hxfs::recovery::{replay_journal, BlockStore, ReplayOutcome};
 use huesos_hxfs::HxfsError;
+use huesos_hxfs_proto::{
+    decode_native_message, encode_response, make_response, split_two_strings, status_for_error,
+    write_size_info, ResponseMeta, MAX_NATIVE_REQUEST_BYTES, POLL_BUF_BYTES,
+};
 use libcanvas::{println, Channel, ErrorCode, Vmo};
 
 /// A.6 live mount: the hxfs-service is the production
@@ -49,27 +53,9 @@ const MAX_CLIENTS: usize = 4;
 const MAX_FILE_HANDLES: usize = 8;
 const MAX_DIR_HANDLES: usize = 8;
 const MAX_READ_BYTES: usize = 4096;
-const MAX_NATIVE_REQUEST_BYTES: usize = HXFS_REQUEST_BYTES + HXFS_MAX_INLINE_WRITE_BYTES;
-// `poll_client` / `poll_file` / `poll_dir` allocate a scratch
-// buffer on the stack every time they are entered. The full
-// Receive buffer capacity for every channel this service polls.
-//
-// This MUST be at least `MAX_NATIVE_REQUEST_BYTES`, the largest
-// message the ABI lets a client send. It used to be 256 bytes, on
-// the reasoning that the largest request actually seen in the boot
-// smoke was an `OPEN_FILE <name>`. That was a latent deadlock: the
-// kernel returns `BytesTooSmall` for an oversized message WITHOUT
-// dequeuing it (`huesos-object/src/channel.rs`), so a client that
-// legitimately sent a 4 KiB inline `WriteAt` left a message at the
-// head of the queue that this service could never drain — the
-// channel wedged permanently and the client blocked forever.
-//
-// The buffer cannot live on the stack at this size: the
-// `mount_from_bootstrap` -> `FixedHxfsWriter::mount` chain already
-// runs close to the 128 KiB stack limit. It lives in a field of
-// `HxfsRuntime`, which is heap-allocated (`Box::new`), so the full
-// ABI-sized buffer costs no stack at all.
-const POLL_BUF_BYTES: usize = MAX_NATIVE_REQUEST_BYTES;
+// `MAX_NATIVE_REQUEST_BYTES` and `POLL_BUF_BYTES` live in
+// `huesos-hxfs-proto`, where the sizing rule that keeps a channel
+// from wedging is unit tested on the host.
 // Sized to fit the `mount_from_bootstrap` -> `FixedHxfsWriter::mount`
 // stack frame inside `USER_STACK_SIZE` (128 KiB since the
 // follow-up that added the boot write self-check; 64 KiB before,
@@ -147,16 +133,7 @@ type MountedHxfs = FixedHxfsWriter<
     SERVICE_MAX_EXTENTS,
 >;
 
-#[derive(Clone, Copy)]
-struct ResponseMeta {
-    status: HxfsStatus,
-    handle_kind: HxfsHandleKind,
-    handle_id: u64,
-    rights: u64,
-    object_id: u64,
-    value: u64,
-    flags: u32,
-}
+// `ResponseMeta` comes from `huesos-hxfs-proto`.
 
 struct FileEndpoint {
     channel: Channel,
@@ -1419,40 +1396,6 @@ fn is_odirect_deny(request: &[u8]) -> bool {
     strip_prefix(request, b"OPEN_FILE O_DIRECT ").is_some()
 }
 
-fn decode_native_message(bytes: &[u8]) -> Option<(HxfsRequest, &[u8])> {
-    if bytes.len() < HXFS_REQUEST_BYTES {
-        return None;
-    }
-    let request = HxfsRequest::decode(&bytes[..HXFS_REQUEST_BYTES])?;
-    let payload_len = request.payload_len as usize;
-    if bytes.len() != HXFS_REQUEST_BYTES.checked_add(payload_len)? {
-        return None;
-    }
-    Some((request, &bytes[HXFS_REQUEST_BYTES..]))
-}
-
-fn make_response(
-    request: HxfsRequest,
-    meta: ResponseMeta,
-    payload_len: u32,
-) -> [u8; HXFS_RESPONSE_BYTES] {
-    HxfsResponse {
-        version: huesos_abi::hxfs::HXFS_PROTOCOL_VERSION,
-        reserved0: 0,
-        status: meta.status,
-        flags: meta.flags,
-        request_id: request.request_id,
-        handle_id: meta.handle_id,
-        handle_kind: meta.handle_kind,
-        rights: meta.rights,
-        object_id: meta.object_id,
-        value: meta.value,
-        payload_len,
-        reserved1: 0,
-    }
-    .encode()
-}
-
 fn write_response_to_channel(
     channel: &Channel,
     request: HxfsRequest,
@@ -1460,12 +1403,9 @@ fn write_response_to_channel(
     payload: &[u8],
 ) {
     let mut out = [0u8; MAX_NATIVE_REQUEST_BYTES];
-    let payload_len = payload.len().min(HXFS_MAX_INLINE_WRITE_BYTES);
-    let response = make_response(request, meta, payload_len as u32);
-    out[..HXFS_RESPONSE_BYTES].copy_from_slice(&response);
-    out[HXFS_RESPONSE_BYTES..HXFS_RESPONSE_BYTES + payload_len]
-        .copy_from_slice(&payload[..payload_len]);
-    let _ = channel.write(&out[..HXFS_RESPONSE_BYTES + payload_len]);
+    if let Some(total) = encode_response(request, meta, payload, &mut out) {
+        let _ = channel.write(&out[..total]);
+    }
 }
 
 fn error_meta(status: HxfsStatus) -> ResponseMeta {
@@ -1478,68 +1418,6 @@ fn error_meta(status: HxfsStatus) -> ResponseMeta {
         value: 0,
         flags: 0,
     }
-}
-
-fn status_for_error(error: HxfsError) -> HxfsStatus {
-    match error {
-        HxfsError::NotFound => HxfsStatus::NotFound,
-        HxfsError::AlreadyExists => HxfsStatus::AlreadyExists,
-        HxfsError::WrongType | HxfsError::DirectoryNotEmpty => HxfsStatus::WrongType,
-        HxfsError::NeedsRecovery | HxfsError::BadJournal => HxfsStatus::NeedsRecovery,
-        HxfsError::Io => HxfsStatus::IoError,
-        HxfsError::NoSpace | HxfsError::QuotaExceeded => HxfsStatus::NoSpace,
-        HxfsError::Compression => HxfsStatus::IoError,
-        HxfsError::Unsupported | HxfsError::UnsupportedFormat => HxfsStatus::Unsupported,
-        HxfsError::EncryptedVolumeKeyUnavailable
-        | HxfsError::EncryptedPolicyUnknown
-        | HxfsError::EncryptedPolicyInvalid => HxfsStatus::EncryptedUnavailable,
-        HxfsError::BufferTooSmall
-        | HxfsError::OutOfRange
-        | HxfsError::BadChecksum
-        | HxfsError::BadBlock
-        | HxfsError::BadTree
-        | HxfsError::BadName => HxfsStatus::Invalid,
-    }
-}
-
-fn split_two_strings(bytes: &[u8]) -> Option<(&str, &str)> {
-    let split = bytes.iter().position(|&byte| byte == 0)?;
-    let left = core::str::from_utf8(&bytes[..split]).ok()?;
-    let right = core::str::from_utf8(&bytes[split + 1..]).ok()?;
-    if left.is_empty() || right.is_empty() {
-        return None;
-    }
-    Some((left, right))
-}
-
-fn write_size_info(out: &mut [u8], size: u64) -> usize {
-    let prefix = b"size=";
-    let mut len = prefix.len().min(out.len());
-    out[..len].copy_from_slice(&prefix[..len]);
-    let mut tmp = [0u8; 20];
-    let mut value = size;
-    let mut idx = tmp.len();
-    if value == 0 {
-        idx -= 1;
-        tmp[idx] = b'0';
-    }
-    while value != 0 {
-        idx -= 1;
-        tmp[idx] = b'0' + (value % 10) as u8;
-        value /= 10;
-    }
-    for &byte in &tmp[idx..] {
-        if len >= out.len() {
-            break;
-        }
-        out[len] = byte;
-        len += 1;
-    }
-    if len < out.len() {
-        out[len] = b'\n';
-        len += 1;
-    }
-    len
 }
 
 #[unsafe(no_mangle)]
@@ -1796,6 +1674,7 @@ fn run_reliability_checks(fs: &mut MountedHxfs) {
     // (QuotaExceeded) and the allocator gate (NoSpace, which is
     // the user-visible "quota breach" error per the roadmap) prove
     // enforcement, so either is accepted.
+    //
     //
     // The headroom is exactly one block. It used to be two, which
     // happened to work only because `committed_physical_bytes` then

@@ -159,11 +159,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "huesos-hxfs-proto"
+version = "0.1.0"
+dependencies = [
+ "huesos-abi",
+ "huesos-hxfs",
+]
+
+[[package]]
 name = "huesos-hxfs-service"
 version = "0.1.0"
 dependencies = [
  "huesos-abi",
  "huesos-hxfs",
+ "huesos-hxfs-proto",
  "libcanvas",
 ]
 

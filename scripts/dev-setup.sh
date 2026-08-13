@@ -83,11 +83,31 @@ if command -v rustup >/dev/null 2>&1 && [[ "$CHECK_ONLY" == 0 ]]; then
     # clippy, x86_64-unknown-none). A bare `rustup show` in the repo root
     # triggers the install of exactly that set.
     info "syncing pinned toolchain and components (this may take a few minutes)"
-    rustup show >/dev/null
+    if ! rustup show >/dev/null; then
+        fail "rustup could not materialise the pinned toolchain ($CHANNEL)"
+        exit 1
+    fi
     # rust-src is what -Z build-std needs; assert it explicitly because a
     # partially-installed toolchain fails later with a confusing error.
-    rustup component add rust-src clippy rustfmt --toolchain "$CHANNEL" >/dev/null 2>&1 || true
-    ok "toolchain ready: $(cargo --version)"
+    # Report the failure instead of swallowing it: a missing rust-src turns
+    # into an unreadable build-std error thousands of lines later.
+    if ! rustup component add rust-src clippy rustfmt --toolchain "$CHANNEL" >/dev/null 2>&1; then
+        warn "could not add rust-src/clippy/rustfmt to $CHANNEL; verification below will say if it matters"
+    fi
+
+    # Do not announce success on the strength of rustup's exit code alone.
+    # A toolchain can be registered and still be unusable — the cargo shim
+    # loses its +x bit, ~/.rustup/toolchains gets pruned — and the earlier
+    # version of this block reported `[ ok ] toolchain ready:` with an empty
+    # version string and exited 0, because the failing `$(cargo --version)`
+    # was a command substitution inside an argument, which `set -e` does not
+    # catch. Run the probe as its own statement and check it.
+    if ! CARGO_VERSION="$(cargo --version 2>&1)"; then
+        fail "toolchain is registered but cargo is not runnable: $CARGO_VERSION"
+        fail "typically a lost +x bit: chmod +x ~/.cargo/bin/* and re-run"
+        exit 1
+    fi
+    ok "toolchain ready: $CARGO_VERSION"
 fi
 
 # ------------------------------------------------------------ system tools --
@@ -168,9 +188,72 @@ printf '  %-22s %s\n' "qemu"    "$(command -v qemu-system-x86_64 >/dev/null 2>&1
 printf '  %-22s %s\n' "xorriso" "$(command -v xorriso >/dev/null 2>&1 && xorriso --version 2>&1 | head -1 || echo MISSING)"
 
 echo
+
+# --------------------------------------------------------------- verify --
+
+# The report above only proves the binaries answer `--version`. The thing
+# that actually breaks in practice is `-Z build-std=`, which needs rust-src
+# present for the pinned channel and a working x86_64-unknown-none target.
+# Prove it on a throwaway crate rather than letting the first real
+# `make test` be the discovery.
+VERIFY_FAILED=0
+if [[ "$CHECK_ONLY" == 0 ]] && command -v cargo >/dev/null 2>&1; then
+    info "verifying the toolchain can actually build (-Z build-std=)"
+    PROBE="$(mktemp -d)"
+    trap 'rm -rf "$PROBE"' EXIT
+    mkdir -p "$PROBE/src"
+    cat > "$PROBE/Cargo.toml" <<'PROBE_EOF'
+[package]
+name = "huesos-setup-probe"
+version = "0.0.0"
+edition = "2021"
+
+[workspace]
+PROBE_EOF
+    echo '#![no_std] pub fn probe() -> u32 { 1 }' > "$PROBE/src/lib.rs"
+    if (cd "$PROBE" && cargo build \
+            --target x86_64-unknown-none \
+            -Z build-std=core \
+            >/dev/null 2>&1); then
+        ok "build-std probe compiled for x86_64-unknown-none"
+    else
+        VERIFY_FAILED=1
+        fail "the pinned toolchain cannot build for x86_64-unknown-none"
+        fail "check: rustup component add rust-src --toolchain $CHANNEL"
+        fail "       rustup target add x86_64-unknown-none --toolchain $CHANNEL"
+    fi
+    rm -rf "$PROBE"
+    trap - EXIT
+fi
+
+echo
 if command -v qemu-system-x86_64 >/dev/null 2>&1; then
     info "gates available:  make audit-check | make clippy | make test | make run"
 else
     info "gates available:  make audit-check | make clippy | make test"
     warn "'make run' (QEMU boot smoke) unavailable — mark on-target work UNVERIFIED per CONTRIBUTING §6"
 fi
+
+# Exit non-zero when the environment cannot run the gates, so this script is
+# usable as a CI precondition and in `&&` chains. Previously it returned 0
+# unconditionally, which is what let a broken setup look healthy.
+MISSING_CORE=()
+for tool in cargo rustc python3; do
+    command -v "$tool" >/dev/null 2>&1 || MISSING_CORE+=("$tool")
+done
+
+if [[ ${#MISSING_CORE[@]} -gt 0 ]]; then
+    echo
+    fail "missing tools required by the gates: ${MISSING_CORE[*]}"
+    exit 1
+fi
+
+if [[ "$VERIFY_FAILED" == 1 ]]; then
+    echo
+    fail "environment is incomplete: the build-std probe did not compile"
+    exit 1
+fi
+
+echo
+ok "environment ready"
+

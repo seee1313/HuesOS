@@ -2518,3 +2518,118 @@ The allocator crate carries 58 unit tests, including adversarial ones:
 header corruption is rejected, double-free is rejected, alignment is honoured
 across reuse, and a steady-state churn loop asserts no leak. It is included in
 `make test` and in the ASan workflow.
+
+## Allocator fuzz harness and service protocol extraction
+
+Follow-up to the Scudo port, in the same series. Adds
+`huesos-scudo-fuzz` (randomized allocate/free churn asserting no
+overlap, no aliasing, honoured alignment, refused double frees and a
+committed-memory plateau) and `huesos-hxfs-proto` (the Hxfs service's
+wire-protocol rules, extracted so they are unit testable on the host).
+
+### Where the new unsafe lives
+
+All seven new sites are in `crates/huesos-scudo-fuzz/src/lib.rs`, and
+all of them are the fuzz harness acting as the allocator's caller:
+
+| Sites | What | Why it must be unsafe |
+| ---: | --- | --- |
+| 4 | `Allocator::deallocate` calls | `deallocate` is an `unsafe fn` (it reads the chunk header below a caller-supplied pointer). Three free live pointers the harness itself allocated; one deliberately double-frees to assert the allocator refuses it. |
+| 1 | `usable_size` | Same contract: an `unsafe fn` taking a raw pointer. |
+| 1 | `write_bytes` over a fresh allocation | Writing the whole block is what proves no two live allocations overlap; the address arithmetic alone would not catch aliasing. |
+| 1 | Reading a tagged byte back | Verifies the block still holds its tag, i.e. nothing else was handed the same memory. |
+
+Every one operates on a pointer the harness received from the
+allocator and tracks in its own live set, so the safety contract is
+discharged by construction. There is no unsafe in
+`huesos-hxfs-proto`: it is `#![deny(unsafe_code)]`.
+
+### Safety-budget delta (measured)
+
+```
+unsafe_blocks:    348 -> 355 (+7, all in the fuzz harness).
+unsafe_functions:  73 ->  73 (unchanged).
+unsafe_impls:      33 ->  33 (unchanged).
+static_mut:         1 ->   1 (unchanged).
+unwrap_calls:      25 ->  25 (unchanged).
+expect_calls:      60 ->  60 (unchanged).
+panic_macros:       6 ->   6 (unchanged).
+```
+
+The harness is wired into `make test` and the AddressSanitizer job, so
+the pointer arithmetic it exercises is also checked under
+instrumentation.
+
+## Over-aligned secondary fix and its regression tests
+
+CI caught `usable_size` returning **less** than the caller requested
+for an over-aligned secondary allocation (`size = 85997`,
+`usable_size = 85984`). The investigation found a real defect with a
+worse second symptom, and closing it added nine unsafe sites — all of
+them in test code exercising the allocator's existing `unsafe fn` API.
+
+### The defect
+
+An over-aligned request is padded by `align` before it reaches the
+secondary, so the secondary commits a block sized from `size + align +
+HEADER_BYTES`. `deallocate` and `usable_size` both re-derived that
+block size from `header.request_size` alone, which is the *user's*
+size — the padding was lost. Consequences:
+
+- **Leak (the serious one).** Freeing decommitted
+  `page_align_up(size + header)` bytes where allocation had committed
+  `page_align_up(size + align + header)`. For `size = 70000,
+  align = 8192` that is 8 KiB never returned, every cycle. The block
+  was also filed in the reuse cache under the wrong `payload_size`, so
+  it could never be reused for the size it actually was.
+- **Under-reported `usable_size`** — the harmless symptom CI happened
+  to trip on first.
+
+Both are confined to the over-aligned *secondary* path. The primary
+path is correct: its stride is `HEADER_BYTES + chunk_size`, so a whole
+class chunk really is body space. Decommit was always `<=` commit, so
+the guard pages were never touched and no memory was corrupted.
+
+The fix records `log2(align)` in the header's `class` field — unused
+for secondary chunks, and `0` keeps its old meaning of "not
+over-aligned" — and reconstructs the padded size from it in both
+places, with checked arithmetic so a corrupt header reports
+`Corruption` instead of underflowing.
+
+### New unsafe sites (+9)
+
+| Sites | File | Why it must be unsafe |
+| ---: | --- | --- |
+| 6 | `huesos-scudo/src/lib.rs` (tests) | Two regression tests calling the allocator's `unsafe fn` API: `deallocate` on pointers they own, and `write_bytes`/`read` across the extent `usable_size` reports, which is what proves the reported extent is real memory rather than an optimistic number. |
+| 1 | `huesos-scudo/src/chunk.rs` (tests) | `corrupted_header_is_detected` now flips its target byte *through the same raw pointer* the header was written through. Mutating the backing array directly made the compiler treat the header store as dead (it cannot see the raw-pointer read that follows) and emit an `unused_assignments` warning — a warning that would fail the `-D warnings` gate. |
+| 2 | `huesos-scudo-fuzz/src/lib.rs` | The harness now writes and reads back the full `usable_size` extent, not just the requested size. |
+
+All nine operate on pointers the test itself obtained from the
+allocator and still owns, so each contract is discharged by
+construction.
+
+### Safety-budget delta (measured)
+
+```
+unsafe_blocks:    355 -> 364 (+9, all in test code).
+unsafe_functions:  73 ->  73 (unchanged).
+unsafe_impls:      33 ->  33 (unchanged).
+static_mut:         1 ->   1 (unchanged).
+unwrap_calls:      25 ->  25 (unchanged).
+expect_calls:      60 ->  60 (unchanged).
+panic_macros:       6 ->   6 (unchanged).
+```
+
+Per-file surface for `crates/huesos-scudo/src/lib.rs` rises 32 -> 38.
+
+### Why the existing tests missed it
+
+`usable_size_is_at_least_the_request` only ever passed `align = 8`,
+which is below `MIN_ALIGNMENT` and so never reaches the over-aligned
+path at all. The fuzzer found it only because a seed happened to pair
+a large size with a large alignment. Both new tests were confirmed to
+fail with the fix reverted:
+`over_aligned_secondary_reports_and_returns_its_whole_block` catches
+the under-report directly, and
+`repeated_over_aligned_secondary_cycles_do_not_grow_committed_memory`
+catches the leak, which a single round trip hides.

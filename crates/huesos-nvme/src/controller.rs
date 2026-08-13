@@ -20,6 +20,21 @@ use crate::queue_plan::{plan_queues, InterruptMode, QueuePlan, QueuePlanInput};
 // case) but absorbs realistic emulation jitter.
 const IO_POLL_BUDGET: u32 = 50_000_000;
 
+/// PRP-list pages allocated beyond the first, for chaining.
+///
+/// With 4 KiB pages one list page addresses 511 data pages once its
+/// last slot is spent on the chain pointer, so 1 + 4 pages cover
+/// 2045 data pages — just over 8 MiB, comfortably above the 1 MiB
+/// MDTS cap this driver advertises. `setup_prp` rejects anything that
+/// still does not fit rather than programming a truncated list.
+const MAX_EXTRA_PRP_LIST_PAGES: usize = 4;
+
+/// Upper bound on planned PRP-list slots, sized for the largest
+/// transfer the allocated list pages can describe (5 pages x 512
+/// slots). Kept as a stack array so the I/O path stays allocation
+/// free, which the no-heap NVMe DriverHost policy requires.
+const MAX_PRP_SLOTS: usize = (1 + MAX_EXTRA_PRP_LIST_PAGES) * 512;
+
 use crate::regs::{aqa, cap, cc, csts, off};
 use crate::transport::NvmeTransport;
 
@@ -127,6 +142,11 @@ pub struct Controller<T: NvmeTransport> {
     io_data_buf: u64,
     io_data_buf_size: u64,
     io_prp_list: u64,
+    // Additional PRP-list pages for chaining. `io_prp_list` is the
+    // first; these follow it. A transfer needing more entries than one
+    // page can hold links pages together through the last slot of each.
+    io_prp_list_extra: [u64; MAX_EXTRA_PRP_LIST_PAGES],
+    io_prp_list_count: usize,
     // Capabilities (validated during init).
     mdts: u32,
     max_queue_size: u16,
@@ -169,6 +189,8 @@ impl<T: NvmeTransport> Controller<T> {
             io_data_buf: 0,
             io_data_buf_size: 0,
             io_prp_list: 0,
+            io_prp_list_extra: [0; MAX_EXTRA_PRP_LIST_PAGES],
+            io_prp_list_count: 0,
             mdts: 0,
             max_queue_size: 0,
         }
@@ -391,6 +413,15 @@ impl<T: NvmeTransport> Controller<T> {
         self.io_data_buf_size = self.mdts as u64;
         self.io_data_buf = self.dma_alloc_zeroed(self.io_data_buf_size, ps)?;
         self.io_prp_list = self.dma_alloc_zeroed(ps, ps)?;
+        // Chain pages: allocated up front so the I/O path never
+        // allocates. Each must be page aligned because the chain
+        // pointer names a page base.
+        let mut extra = 0usize;
+        while extra < MAX_EXTRA_PRP_LIST_PAGES {
+            self.io_prp_list_extra[extra] = self.dma_alloc_zeroed(ps, ps)?;
+            extra += 1;
+        }
+        self.io_prp_list_count = 1 + MAX_EXTRA_PRP_LIST_PAGES;
 
         self.admin_command(build::identify(
             identify::NAMESPACE,
@@ -511,23 +542,50 @@ impl<T: NvmeTransport> Controller<T> {
                 crate::prp::rest_page(base, offset, page_size, 0),
             )),
             _ => {
-                let entries = crate::prp::rest_count(offset, length, page_size);
-                // One list page holds `ps / 8` entries. Chaining
-                // across several list pages is still not implemented;
-                // reject rather than program a truncated list. The
-                // NVMe host caps its I/O well below this.
-                if entries as u64 * 8 > ps || self.io_prp_list == 0 {
+                if self.io_prp_list == 0 {
                     return Err(NvmeError::InvalidPrp);
                 }
-                let list = self.io_prp_list;
+                // Collect the list pages: the first plus however many
+                // chain pages were allocated at init.
+                let mut pages = [0u64; 1 + MAX_EXTRA_PRP_LIST_PAGES];
+                pages[0] = self.io_prp_list;
+                let available = self.io_prp_list_count.min(pages.len()).max(1);
+                let mut i = 1usize;
+                while i < available {
+                    pages[i] = self.io_prp_list_extra[i - 1];
+                    i += 1;
+                }
+
+                // Plan the layout, including chain pointers. A
+                // transfer too large for the allocated pages is
+                // rejected here: programming a partial list would let
+                // the device DMA into whatever the unwritten slots
+                // happen to hold.
+                let mut slots = [crate::prp::ListSlot {
+                    list_page: 0,
+                    slot: 0,
+                    value: 0,
+                    is_chain: false,
+                }; MAX_PRP_SLOTS];
+                let planned = crate::prp::plan_list(
+                    base,
+                    offset,
+                    length,
+                    page_size,
+                    &pages[..available],
+                    &mut slots,
+                )
+                .ok_or(NvmeError::InvalidPrp)?;
+
                 let mut index = 0usize;
-                while index < entries {
-                    let entry = crate::prp::rest_page(base, offset, page_size, index);
+                while index < planned {
+                    let entry = slots[index];
+                    let page = pages[entry.list_page];
                     self.t
-                        .dma_write(list + (index as u64) * 8, &entry.to_le_bytes());
+                        .dma_write(page + (entry.slot as u64) * 8, &entry.value.to_le_bytes());
                     index += 1;
                 }
-                Ok((crate::prp::prp1(base, offset), list))
+                Ok((crate::prp::prp1(base, offset), self.io_prp_list))
             }
         }
     }
@@ -800,6 +858,68 @@ mod tests {
         };
         assert_eq!(aligned_prp1, ps * 4);
         assert_eq!(aligned_prp2, ps * 5, "PRP2 is the second page base");
+    }
+
+    /// A transfer needing more PRP entries than one list page can
+    /// hold must chain to a second list page, not be rejected.
+    ///
+    /// Before chaining existed, `setup_prp` returned `InvalidPrp`
+    /// here, which made the advertised MDTS a promise the driver
+    /// could not keep.
+    #[test]
+    fn setup_prp_chains_across_list_pages() {
+        let mock = MockNvme::new(1 << 26, 1024, 9);
+        let mut c = Controller::new(mock, 0, 1 << 26);
+        assert!(c.init().is_ok());
+        let ps = c.page_size as u64;
+        let per_page = (c.page_size / 8) as u64;
+
+        // One more data page than a single list page can address once
+        // its last slot is spent on the chain pointer.
+        let data_pages = per_page + 2;
+        let nbytes = data_pages * ps;
+        let buf = ps * 16;
+
+        let Ok((prp1, prp2)) = c.setup_prp(buf, nbytes) else {
+            assert!(false, "a chained transfer must be accepted");
+            return;
+        };
+        assert_eq!(prp1, buf);
+        assert_eq!(prp2, c.io_prp_list, "PRP2 names the first list page");
+
+        // Last slot of the first list page must point at the second
+        // list page, not at a data page.
+        let mut raw = [0u8; 8];
+        c.t.dma_read(c.io_prp_list + (per_page - 1) * 8, &mut raw);
+        let chain = u64::from_le_bytes(raw);
+        assert_eq!(
+            chain, c.io_prp_list_extra[0],
+            "last slot must chain to the next list page"
+        );
+
+        // Data entries stay page-aligned and sequential across the
+        // chain boundary.
+        c.t.dma_read(c.io_prp_list, &mut raw);
+        assert_eq!(u64::from_le_bytes(raw), buf + ps);
+        c.t.dma_read(c.io_prp_list + (per_page - 2) * 8, &mut raw);
+        assert_eq!(u64::from_le_bytes(raw), buf + (per_page - 1) * ps);
+        // First slot of the chained page continues the sequence.
+        c.t.dma_read(c.io_prp_list_extra[0], &mut raw);
+        assert_eq!(u64::from_le_bytes(raw), buf + per_page * ps);
+    }
+
+    /// A transfer larger than every allocated list page can describe
+    /// must be refused, never programmed as a truncated list.
+    #[test]
+    fn setup_prp_rejects_transfers_beyond_list_capacity() {
+        let mock = MockNvme::new(1 << 26, 1024, 9);
+        let mut c = Controller::new(mock, 0, 1 << 26);
+        assert!(c.init().is_ok());
+        let ps = c.page_size as u64;
+        let per_page = (c.page_size / 8) as u64;
+        // Far beyond 5 list pages' worth of data pages.
+        let nbytes = per_page * (2 + MAX_EXTRA_PRP_LIST_PAGES as u64) * ps;
+        assert_eq!(c.setup_prp(ps * 16, nbytes), Err(NvmeError::InvalidPrp));
     }
 
     #[test]

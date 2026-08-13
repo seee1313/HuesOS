@@ -37,6 +37,7 @@ test:
 	RUST_MIN_STACK=16777216 cargo test -p huesos-abi -p huesos-arch -p huesos-elf -p huesos-pmm -p huesos-object -p huesos-fb \
 		-p huesos-syscalls -p huesos-fat -p huesos-alloc -p huesos-uacpi -p huesos-kernel \
 		-p huesos-scudo \
+		-p huesos-scudo-fuzz \
 		-p huesos-blobfs \
 		-p huesos-lifecycle \
 		-p huesos-ioapic \
@@ -47,6 +48,7 @@ test:
 		-p hues-async \
 		-p huesos-nvme \
 		-p huesos-hxfs \
+		-p huesos-hxfs-proto \
 		-p huesos-pci \
 		-p huesos-quota \
 		--target x86_64-unknown-linux-gnu -Z build-std=
