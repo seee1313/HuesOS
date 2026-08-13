@@ -4746,6 +4746,47 @@ mod tests {
     /// nothing subtracted when `clear_extents` dropped the blocks.
     /// A long-lived job doing write/delete churn was therefore
     /// eventually refused writes on a volume that was in fact empty.
+    /// Mirrors the on-target quota probe in hxfs-service: pin the
+    /// volume limit one block above current usage, then write two
+    /// 4 KiB blocks to the same file. The first must be admitted and
+    /// the second refused.
+    ///
+    /// The NVMe soak asserts this as `[hxfs] quota-enforced-ok`.
+    #[test]
+    fn volume_quota_refuses_the_block_past_the_limit() {
+        let Ok(seed) = HxfsWriter::new(INSTANCE, VOLUME) else {
+            assert!(false, "seed writer should initialize");
+            return;
+        };
+        let store = MemStore::from_image(seed.image());
+        let Ok(mut mounted) = FixedHxfsWriter::<MemStore, 16, 32, 32>::mount(store) else {
+            assert!(false, "fixed writer should mount");
+            return;
+        };
+
+        let base = mounted.committed_physical_bytes();
+        assert!(mounted.set_quota_limits(base + 4096, 0).is_ok());
+
+        let root = mounted.root_directory();
+        let Ok(file) = mounted.create_file_child(root, "probe-quota.bin") else {
+            assert!(false, "create must succeed");
+            return;
+        };
+        let chunk = [0x42u8; 4096];
+        let first = mounted.write_file_at(file, 0, &chunk);
+        assert!(first.is_ok(), "first block must fit: {first:?}");
+        let Ok(file) = first else { return };
+
+        let second = mounted.write_file_at(file, 4096, &chunk);
+        assert!(
+            matches!(
+                second,
+                Err(HxfsError::QuotaExceeded) | Err(HxfsError::NoSpace)
+            ),
+            "second block must breach the quota, got {second:?}"
+        );
+    }
+
     #[test]
     fn job_quota_is_credited_when_extents_are_released() {
         let Ok(seed) = HxfsWriter::new(INSTANCE, VOLUME) else {

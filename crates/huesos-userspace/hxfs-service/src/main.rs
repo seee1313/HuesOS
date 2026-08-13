@@ -1796,8 +1796,18 @@ fn run_reliability_checks(fs: &mut MountedHxfs) {
     // (QuotaExceeded) and the allocator gate (NoSpace, which is
     // the user-visible "quota breach" error per the roadmap) prove
     // enforcement, so either is accepted.
+    //
+    // The headroom is exactly one block. It used to be two, which
+    // happened to work only because `committed_physical_bytes` then
+    // reported the append high-water mark and so already counted a
+    // block the probe had not written yet. Now that the figure
+    // counts live extents (the quota-leak fix), two blocks of
+    // headroom admit both writes and the probe never sees the
+    // limit. Derive the headroom from the block size rather than
+    // hardcoding it, so this cannot drift again.
+    use huesos_hxfs::format::BLOCK_SIZE_U64;
     let base = fs.committed_physical_bytes();
-    if fs.set_quota_limits(base + 8192, 0).is_err() {
+    if fs.set_quota_limits(base + BLOCK_SIZE_U64, 0).is_err() {
         println!("[hxfs] quota-probe-failed (set_quota_limits)");
         return;
     }
