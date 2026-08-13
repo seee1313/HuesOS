@@ -632,97 +632,92 @@ pub fn create_blob_on(channel: &Channel, data: &[u8]) -> Result<HxfsBlobView> {
     read_blob_view_on(channel, [0u8; 32], request_id)
 }
 
-fn read_blob_view_on(
-    channel: &Channel,
-    hash: [u8; 32],
-    request_id: u64,
-) -> Result<HxfsBlobView> {
-        let mut buf = [0u8; NATIVE_MESSAGE_BYTES];
-        // Bounded wait, but deliberately a GENEROUS one, and the
-        // caller must not retry on expiry.
-        //
-        // The native protocol has no request/response correlation:
-        // `request_id` is a constant and nobody checks it. So a
-        // caller that gives up on a request the service is still
-        // going to answer leaves that answer queued, and the next
-        // request on the same channel reads the stale one. With a
-        // handle-carrying response that also means receiving a view
-        // of the wrong object -- the failure looks like a storage
-        // bug and is really a client bug.
-        //
-        // The budget therefore bounds a service that is genuinely
-        // dead (so the supervisor cannot wedge), and expiry is
-        // terminal for this channel rather than something to retry.
-        let mut budget = 4_000_000u32;
-        loop {
-            budget = match budget.checked_sub(1) {
-                Some(remaining) => remaining,
-                None => return Err(ErrorCode::TimedOut),
-            };
-            match channel.read_optional_handle(&mut buf) {
-                Ok((n, Some(handle))) => {
-                    if n < abi::HXFS_RESPONSE_BYTES {
-                        return Err(ErrorCode::InvalidArgs);
-                    }
-                    let Some(response) = decode_response(&buf[..abi::HXFS_RESPONSE_BYTES]) else {
-                        return Err(ErrorCode::InvalidArgs);
-                    };
-                    if response.request_id != request_id {
-                        // A response to an earlier request on this
-                        // channel. Adopting it would hand back a view
-                        // of the wrong object; drop the handle and
-                        // keep waiting for ours.
-                        drop(handle);
-                        continue;
-                    }
-                    if response.status != abi::HxfsStatus::Ok {
-                        return Err(status_to_error(response.status));
-                    }
-                    if response.handle_kind != abi::HxfsHandleKind::BlobView {
-                        return Err(ErrorCode::WrongType);
-                    }
-                    // A blob view that arrived with write rights would
-                    // mean the service disagrees with the ABI about
-                    // blob immutability; refuse rather than paper over
-                    // it.
-                    if response.rights & abi::rights::WRITE != 0 {
-                        return Err(ErrorCode::Internal);
-                    }
-                    // CreateBlob answers with the content hash in the
-                    // payload, because only the service can compute
-                    // it. OpenBlob already knows it (the caller asked
-                    // by hash), so the request hash stands.
-                    let mut resolved = hash;
-                    let payload_len = response.payload_len as usize;
-                    if payload_len == 32 {
-                        let start = abi::HXFS_RESPONSE_BYTES;
-                        let end = start + 32;
-                        if n >= end {
-                            resolved.copy_from_slice(&buf[start..end]);
-                        }
-                    }
-                    return Ok(HxfsBlobView {
-                        channel: Channel::from_handle(handle),
-                        hash: resolved,
-                        size: response.value,
-                    });
-                }
-                Ok((n, None)) => {
-                    if let Some(response) = decode_response(&buf[..n.min(abi::HXFS_RESPONSE_BYTES)])
-                    {
-                        if response.request_id != request_id {
-                            continue;
-                        }
-                        return Err(status_to_error(response.status));
-                    }
+fn read_blob_view_on(channel: &Channel, hash: [u8; 32], request_id: u64) -> Result<HxfsBlobView> {
+    let mut buf = [0u8; NATIVE_MESSAGE_BYTES];
+    // Bounded wait, but deliberately a GENEROUS one, and the
+    // caller must not retry on expiry.
+    //
+    // The native protocol has no request/response correlation:
+    // `request_id` is a constant and nobody checks it. So a
+    // caller that gives up on a request the service is still
+    // going to answer leaves that answer queued, and the next
+    // request on the same channel reads the stale one. With a
+    // handle-carrying response that also means receiving a view
+    // of the wrong object -- the failure looks like a storage
+    // bug and is really a client bug.
+    //
+    // The budget therefore bounds a service that is genuinely
+    // dead (so the supervisor cannot wedge), and expiry is
+    // terminal for this channel rather than something to retry.
+    let mut budget = 4_000_000u32;
+    loop {
+        budget = match budget.checked_sub(1) {
+            Some(remaining) => remaining,
+            None => return Err(ErrorCode::TimedOut),
+        };
+        match channel.read_optional_handle(&mut buf) {
+            Ok((n, Some(handle))) => {
+                if n < abi::HXFS_RESPONSE_BYTES {
                     return Err(ErrorCode::InvalidArgs);
                 }
-                Err(ErrorCode::ShouldWait) | Err(ErrorCode::TimedOut) => {
-                    crate::process::yield_now();
+                let Some(response) = decode_response(&buf[..abi::HXFS_RESPONSE_BYTES]) else {
+                    return Err(ErrorCode::InvalidArgs);
+                };
+                if response.request_id != request_id {
+                    // A response to an earlier request on this
+                    // channel. Adopting it would hand back a view
+                    // of the wrong object; drop the handle and
+                    // keep waiting for ours.
+                    drop(handle);
+                    continue;
                 }
-                Err(error) => return Err(error),
+                if response.status != abi::HxfsStatus::Ok {
+                    return Err(status_to_error(response.status));
+                }
+                if response.handle_kind != abi::HxfsHandleKind::BlobView {
+                    return Err(ErrorCode::WrongType);
+                }
+                // A blob view that arrived with write rights would
+                // mean the service disagrees with the ABI about
+                // blob immutability; refuse rather than paper over
+                // it.
+                if response.rights & abi::rights::WRITE != 0 {
+                    return Err(ErrorCode::Internal);
+                }
+                // CreateBlob answers with the content hash in the
+                // payload, because only the service can compute
+                // it. OpenBlob already knows it (the caller asked
+                // by hash), so the request hash stands.
+                let mut resolved = hash;
+                let payload_len = response.payload_len as usize;
+                if payload_len == 32 {
+                    let start = abi::HXFS_RESPONSE_BYTES;
+                    let end = start + 32;
+                    if n >= end {
+                        resolved.copy_from_slice(&buf[start..end]);
+                    }
+                }
+                return Ok(HxfsBlobView {
+                    channel: Channel::from_handle(handle),
+                    hash: resolved,
+                    size: response.value,
+                });
             }
+            Ok((n, None)) => {
+                if let Some(response) = decode_response(&buf[..n.min(abi::HXFS_RESPONSE_BYTES)]) {
+                    if response.request_id != request_id {
+                        continue;
+                    }
+                    return Err(status_to_error(response.status));
+                }
+                return Err(ErrorCode::InvalidArgs);
+            }
+            Err(ErrorCode::ShouldWait) | Err(ErrorCode::TimedOut) => {
+                crate::process::yield_now();
+            }
+            Err(error) => return Err(error),
         }
+    }
 }
 
 /// Monotonic request id for the native protocol.

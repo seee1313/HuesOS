@@ -2633,3 +2633,79 @@ fail with the fix reverted:
 the under-report directly, and
 `repeated_over_aligned_secondary_cycles_do_not_grow_committed_memory`
 catches the leak, which a single round trip hides.
+
+## Phase 4: TPM 2.0 CRB driver
+
+### Why the surface grows at all
+
+The KeyProvider gate needs the kernel to talk to a real TPM. A TPM 2.0
+CRB interface is a memory-mapped device: there is no way to read its
+interface identifier, drive its control registers, or move bytes
+through its command and response buffers without volatile access to
+mapped MMIO. Every unsafe unit below is that, and nothing else --
+there is no pointer arithmetic on Rust objects, no lifetime
+extension, no aliasing of kernel memory.
+
+### `crates/huesos-kernel/src/tpm.rs` — 6 unsafe blocks
+
+Each is a volatile access to the CRB window whose HHDM alias is
+established once in `map`, and each is bounds-checked against
+`CRB_MMIO_BYTES` before the access.
+
+1. `present()` — one 32-bit read at offset 0. Reading the interface
+   identifier has no side effects, and the check exists precisely so
+   an absent TPM is detected instead of waiting out every poll budget
+   on a machine that has none. An all-ones or all-zeroes read is
+   treated as "no device".
+2. `read_reg()` — one 32-bit register read, offset bounds-checked
+   against the mapped window first. Volatile because a poll loop that
+   observed a hoisted value would spin forever on a device that has
+   already changed state.
+3. `write_reg()` — one 32-bit register write, same bounds check. The
+   targets are architected control registers (`CTRL_REQ`, `CTRL_START`,
+   `CTRL_CANCEL`, locality).
+4. `write_command()` — byte writes into the command buffer, guarded by
+   `bytes.len() > CRB_BUFFER_BYTES` so the loop index cannot leave the
+   buffer.
+5. `read_response()` header read — the 10-byte header sits at the
+   start of the response buffer, well inside the window. The length is
+   taken from the header rather than assumed.
+6. `read_response()` body read — bounded by the header's declared
+   size, which is validated against both `CRB_BUFFER_BYTES` and the
+   caller's buffer before any byte is copied. Copying the whole window
+   instead would hand the parser trailing bytes from the previous
+   command, which is how a stale response gets parsed as a fresh one.
+
+### Why not fewer
+
+Merging the register accessors would not reduce the count, only hide
+it behind a helper that still performs the same volatile access. The
+byte loops could be replaced with `copy_nonoverlapping`, but that
+trades six well-bounded accesses for one unbounded one and loses the
+volatile semantics the device requires.
+
+### Safety-budget delta (measured)
+
+```
+unsafe_blocks:    364 -> 370 (+6, all in crates/huesos-kernel/src/tpm.rs).
+unsafe_functions:  73 ->  73 (unchanged).
+unsafe_impls:      33 ->  33 (unchanged).
+static_mut:         1 ->   1 (unchanged).
+unwrap_calls:      25 ->  25 (unchanged).
+expect_calls:      60 ->  60 (unchanged).
+panic_macros:       6 ->  13 (+7, all in crates/huesos-tpm/tests/simulated_tpm.rs).
+```
+
+The panic growth is entirely in an integration test, where a panic is
+how a test reports failure. They are deliberately not `assert!(false)`
+-- each one prints the unexpected value (`got {other:?}`), which is
+the difference between "unseal failed" and knowing it failed with
+`PolicyMismatch` rather than `Timeout`.
+
+### Mutation check
+
+`seal.rs` was mutated to return `Ok` where it reports `POLICY_FAIL`;
+the simulated-TPM test caught it. A sealing implementation that
+cannot distinguish "policy satisfied" from "policy failed" is worse
+than no sealing at all, since it reports success while handing out the
+key on a tampered boot chain.

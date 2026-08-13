@@ -980,7 +980,10 @@ impl HxfsRuntime {
         );
         frame[..huesos_abi::hxfs::HXFS_RESPONSE_BYTES].copy_from_slice(&response);
         frame[huesos_abi::hxfs::HXFS_RESPONSE_BYTES..].copy_from_slice(&hash);
-        if client.write_handle(&frame, client_end.into_handle()).is_err() {
+        if client
+            .write_handle(&frame, client_end.into_handle())
+            .is_err()
+        {
             return;
         }
         *slot = Some(BlobEndpoint {

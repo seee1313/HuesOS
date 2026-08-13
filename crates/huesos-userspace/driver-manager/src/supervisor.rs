@@ -1218,8 +1218,7 @@ impl DriverManager {
                         // would store the blob again and consume
                         // another endpoint from the service's fixed
                         // table.
-                        self.package_probe_retries =
-                            self.package_probe_retries.saturating_sub(1);
+                        self.package_probe_retries = self.package_probe_retries.saturating_sub(1);
                         if self.package_probe_retries == 0 {
                             self.package_probe_done = true;
                             println!("[driver-manager] package probe: service never answered");
