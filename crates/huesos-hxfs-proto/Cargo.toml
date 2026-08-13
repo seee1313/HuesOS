@@ -1,0 +1,9 @@
+[package]
+name = "huesos-hxfs-proto"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[dependencies]
+huesos-abi = { path = "../huesos-abi" }
+huesos-hxfs = { path = "../huesos-hxfs" }

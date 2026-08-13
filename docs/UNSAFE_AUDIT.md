@@ -2518,3 +2518,44 @@ The allocator crate carries 58 unit tests, including adversarial ones:
 header corruption is rejected, double-free is rejected, alignment is honoured
 across reuse, and a steady-state churn loop asserts no leak. It is included in
 `make test` and in the ASan workflow.
+
+## Allocator fuzz harness and service protocol extraction
+
+Follow-up to the Scudo port, in the same series. Adds
+`huesos-scudo-fuzz` (randomized allocate/free churn asserting no
+overlap, no aliasing, honoured alignment, refused double frees and a
+committed-memory plateau) and `huesos-hxfs-proto` (the Hxfs service's
+wire-protocol rules, extracted so they are unit testable on the host).
+
+### Where the new unsafe lives
+
+All seven new sites are in `crates/huesos-scudo-fuzz/src/lib.rs`, and
+all of them are the fuzz harness acting as the allocator's caller:
+
+| Sites | What | Why it must be unsafe |
+| ---: | --- | --- |
+| 4 | `Allocator::deallocate` calls | `deallocate` is an `unsafe fn` (it reads the chunk header below a caller-supplied pointer). Three free live pointers the harness itself allocated; one deliberately double-frees to assert the allocator refuses it. |
+| 1 | `usable_size` | Same contract: an `unsafe fn` taking a raw pointer. |
+| 1 | `write_bytes` over a fresh allocation | Writing the whole block is what proves no two live allocations overlap; the address arithmetic alone would not catch aliasing. |
+| 1 | Reading a tagged byte back | Verifies the block still holds its tag, i.e. nothing else was handed the same memory. |
+
+Every one operates on a pointer the harness received from the
+allocator and tracks in its own live set, so the safety contract is
+discharged by construction. There is no unsafe in
+`huesos-hxfs-proto`: it is `#![deny(unsafe_code)]`.
+
+### Safety-budget delta (measured)
+
+```
+unsafe_blocks:    348 -> 355 (+7, all in the fuzz harness).
+unsafe_functions:  73 ->  73 (unchanged).
+unsafe_impls:      33 ->  33 (unchanged).
+static_mut:         1 ->   1 (unchanged).
+unwrap_calls:      25 ->  25 (unchanged).
+expect_calls:      60 ->  60 (unchanged).
+panic_macros:       6 ->   6 (unchanged).
+```
+
+The harness is wired into `make test` and the AddressSanitizer job, so
+the pointer arithmetic it exercises is also checked under
+instrumentation.

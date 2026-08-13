@@ -1,12 +1,12 @@
 {
-  "rust_files": 228,
-  "rust_lines": 80319,
+  "rust_files": 230,
+  "rust_lines": 81544,
   "totals": {
     "expect_calls": 60,
     "panic_macros": 6,
     "static_mut": 1,
     "todo_markers": 1,
-    "unsafe_blocks": 348,
+    "unsafe_blocks": 355,
     "unsafe_functions": 73,
     "unsafe_impls": 33,
     "unwrap_calls": 25
@@ -50,6 +50,7 @@
     "crates/huesos-object/src/lib.rs": 1,
     "crates/huesos-object/src/vmo.rs": 4,
     "crates/huesos-pmm/src/lib.rs": 7,
+    "crates/huesos-scudo-fuzz/src/lib.rs": 7,
     "crates/huesos-scudo/src/backend.rs": 8,
     "crates/huesos-scudo/src/chunk.rs": 31,
     "crates/huesos-scudo/src/lib.rs": 32,

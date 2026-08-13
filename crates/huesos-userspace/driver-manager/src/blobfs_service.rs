@@ -8,22 +8,18 @@ use crate::protocol;
 use crate::volume_service::VolumeManagerService;
 use huesos_abi::rights;
 use huesos_blobfs::{
-    parse_entry_record, parse_hash_hex, parse_superblock_prefix, BlobEntry, BlobFsError, BlobHash,
-    Sha256, Superblock, ENTRY_BYTES, SUPERBLOCK_BYTES,
+    blob_length_is_admissible, next_previous_end, parse_entry_record, parse_hash_hex,
+    parse_superblock_prefix, validate_entry, BlobEntry, BlobFsError, BlobHash, Sha256, Superblock,
+    ENTRY_BYTES, SUPERBLOCK_BYTES,
 };
 use libcanvas::{println, Channel, ErrorCode, Vmo};
 
 const MAX_BLOBFS_CLIENTS: usize = 4;
 const MAX_BLOB_LIST_RESPONSE: usize = 1024;
 const MAX_BLOCK_BYTES: usize = 4096;
-/// Largest blob this service will materialise into a VMO.
-///
-/// `entry.length` comes from the on-disk table, which is untrusted
-/// input, and it decides the size of the `Vmo::create` below. Without
-/// a ceiling a corrupted or hostile table could name a multi-gigabyte
-/// blob and have the service try to allocate it before a single byte
-/// is hash-checked. 64 MiB is far above any blob the bootfs carries.
-const MAX_BLOB_BYTES: u64 = 64 * 1024 * 1024;
+// The blob-size ceiling and the layout rules live in
+// `huesos-blobfs`, where they are unit tested; see
+// `blob_length_is_admissible` and `validate_entry`.
 
 /// DriverManager-owned BlobFS read-only service.
 pub struct BlobFsService {
@@ -274,10 +270,7 @@ impl BlobFsService {
             if entry.hash == hash {
                 return read_payload_to_vmo(&mut mount.device, mount.block_size, entry);
             }
-            previous_end = entry
-                .offset
-                .saturating_add(entry.length)
-                .max(entry.offset.saturating_add(1));
+            previous_end = next_previous_end(entry);
             blob_index += 1;
         }
         Err(BlobFsError::NotFound)
@@ -299,7 +292,7 @@ fn read_payload_to_vmo(
     // is attacker-influenced and is only proven honest once the
     // payload hashes correctly, which cannot happen until after the
     // VMO exists.
-    if entry.length > MAX_BLOB_BYTES {
+    if !blob_length_is_admissible(entry) {
         return Err(BlobFsError::BadLayout);
     }
     let vmo = Vmo::create(entry.length).map_err(|_| BlobFsError::BadLayout)?;
@@ -366,24 +359,6 @@ fn read_exact(
             .map_err(|_| BlobFsError::BadLayout)?;
         out[copied..copied + chunk].copy_from_slice(&scratch[within..within + chunk]);
         copied += chunk;
-    }
-    Ok(())
-}
-
-fn validate_entry(
-    superblock: Superblock,
-    entry: BlobEntry,
-    previous_end: u64,
-) -> Result<(), BlobFsError> {
-    if entry.flags != 0 || entry.offset < superblock.data_offset {
-        return Err(BlobFsError::BadLayout);
-    }
-    let end = entry
-        .offset
-        .checked_add(entry.length)
-        .ok_or(BlobFsError::BadLayout)?;
-    if end > superblock.image_size || entry.offset < previous_end {
-        return Err(BlobFsError::Overlap);
     }
     Ok(())
 }

@@ -283,6 +283,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "huesos-hxfs-proto"
+version = "0.1.0"
+dependencies = [
+ "huesos-abi",
+ "huesos-hxfs",
+]
+
+[[package]]
 name = "huesos-ioapic"
 version = "0.1.0"
 
@@ -359,6 +367,13 @@ version = "0.1.0"
 [[package]]
 name = "huesos-scudo"
 version = "0.1.0"
+
+[[package]]
+name = "huesos-scudo-fuzz"
+version = "0.1.0"
+dependencies = [
+ "huesos-scudo",
+]
 
 [[package]]
 name = "huesos-syscalls"

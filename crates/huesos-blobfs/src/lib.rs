@@ -142,6 +142,58 @@ impl<'a> BlobFs<'a> {
 }
 
 /// Parse a lowercase/uppercase 64-character hex digest.
+/// Largest blob a streaming reader will materialise, in bytes.
+///
+/// `BlobEntry::length` comes from the on-disk table, which is only
+/// proven honest once the payload hashes correctly — and that cannot
+/// happen until after the buffer has been allocated. A corrupt or
+/// hostile table could otherwise ask a reader to reserve an arbitrary
+/// amount of memory before any check runs.
+pub const MAX_BLOB_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Validate one table entry against the running layout invariant.
+///
+/// `previous_end` is the end offset of the preceding entry (or
+/// [`Superblock::data_offset`] for the first). Entries must be inside
+/// the image, carry no unknown flags, and never start before their
+/// predecessor ended.
+pub fn validate_entry(
+    superblock: Superblock,
+    entry: BlobEntry,
+    previous_end: u64,
+) -> Result<(), BlobFsError> {
+    if entry.flags != 0 || entry.offset < superblock.data_offset {
+        return Err(BlobFsError::BadLayout);
+    }
+    let end = entry
+        .offset
+        .checked_add(entry.length)
+        .ok_or(BlobFsError::BadLayout)?;
+    if end > superblock.image_size || entry.offset < previous_end {
+        return Err(BlobFsError::Overlap);
+    }
+    Ok(())
+}
+
+/// The `previous_end` to carry into the next entry's validation.
+///
+/// A zero-length blob would otherwise leave `previous_end` unchanged,
+/// letting the following entry legally start at the same offset and
+/// defeating the anti-overlap rule; the `+1` floor keeps the sequence
+/// strictly advancing.
+pub fn next_previous_end(entry: BlobEntry) -> u64 {
+    entry
+        .offset
+        .saturating_add(entry.length)
+        .max(entry.offset.saturating_add(1))
+}
+
+/// Whether a reader may materialise `entry` in memory.
+pub fn blob_length_is_admissible(entry: BlobEntry) -> bool {
+    entry.length <= MAX_BLOB_BYTES
+}
+
+/// Parse a 64-character lowercase hex string into a [`BlobHash`].
 pub fn parse_hash_hex(input: &[u8]) -> Option<BlobHash> {
     if input.len() != HASH_BYTES * 2 {
         return None;
@@ -503,6 +555,81 @@ impl Sha256 {
 
 #[cfg(test)]
 mod tests {
+
+    /// Regression for audit finding #8: the read path validated every
+    /// entry against `data_offset` instead of the running
+    /// `previous_end`, which made the anti-overlap rule vacuous — a
+    /// table `mount` rejects could still be read from.
+    #[test]
+    fn accumulated_previous_end_rejects_overlap() {
+        let superblock = Superblock {
+            blob_count: 2,
+            table_offset: 4096,
+            data_offset: 8192,
+            image_size: 1 << 20,
+        };
+        let first = BlobEntry {
+            hash: [0u8; 32],
+            offset: 8192,
+            length: 4096,
+            flags: 0,
+        };
+        // Starts inside the first blob: illegal, but it IS >=
+        // data_offset, so validating against data_offset would pass.
+        let overlapping = BlobEntry {
+            hash: [1u8; 32],
+            offset: 8192 + 2048,
+            length: 1024,
+            flags: 0,
+        };
+
+        assert!(validate_entry(superblock, first, superblock.data_offset).is_ok());
+        assert!(
+            validate_entry(superblock, overlapping, superblock.data_offset).is_ok(),
+            "the vacuous check the read path used to perform accepts this"
+        );
+        let previous_end = next_previous_end(first);
+        assert_eq!(
+            validate_entry(superblock, overlapping, previous_end),
+            Err(BlobFsError::Overlap),
+            "carrying previous_end must reject the overlap"
+        );
+    }
+
+    /// A zero-length blob must still advance `previous_end`, or the
+    /// next entry may legally reuse its offset (audit finding #7).
+    #[test]
+    fn zero_length_blob_still_advances_previous_end() {
+        let empty = BlobEntry {
+            hash: [0u8; 32],
+            offset: 8192,
+            length: 0,
+            flags: 0,
+        };
+        assert_eq!(next_previous_end(empty), 8193);
+    }
+
+    #[test]
+    fn oversized_blob_length_is_inadmissible() {
+        let ok = BlobEntry {
+            hash: [0u8; 32],
+            offset: 8192,
+            length: MAX_BLOB_BYTES,
+            flags: 0,
+        };
+        let too_big = BlobEntry {
+            hash: [0u8; 32],
+            offset: 8192,
+            length: MAX_BLOB_BYTES + 1,
+            flags: 0,
+        };
+        assert!(blob_length_is_admissible(ok));
+        assert!(
+            !blob_length_is_admissible(too_big),
+            "an untrusted length must be bounded before allocation"
+        );
+    }
+
     use super::*;
     extern crate std;
     use std::vec;
