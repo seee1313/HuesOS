@@ -16,6 +16,7 @@ mod acpi_broker;
 mod callbacks;
 mod channel;
 mod debug;
+mod entropy;
 mod framebuffer;
 mod handle;
 mod job;
@@ -50,9 +51,10 @@ use huesos_abi::{
 
 pub use callbacks::{
     set_clock_fn, set_cpu_mask_fn, set_current_cpu_fn, set_debug_write_fn, set_exit_fn,
-    set_process_create_fn, set_process_create_in_job_fn, set_resource_map_fn, set_shutdown_fn,
-    set_thread_start_fn, set_vmar_map_fn, set_vmar_protect_fn, set_vmar_unmap_fn, set_yield_fn,
-    ProcessCreateFn, ProcessCreateInJobFn, ResourceMapFn, ThreadStartFn, VmarMapFn, VmarOpFn,
+    set_heap_extend_fn, set_process_create_fn, set_process_create_in_job_fn, set_resource_map_fn,
+    set_shutdown_fn, set_thread_start_fn, set_vmar_map_fn, set_vmar_protect_fn, set_vmar_unmap_fn,
+    set_yield_fn, HeapExtendFn, ProcessCreateFn, ProcessCreateInJobFn, ResourceMapFn,
+    ThreadStartFn, VmarMapFn, VmarOpFn,
 };
 
 /// Result type for syscalls: `Ok(value)` or a negative error code.
@@ -128,6 +130,8 @@ pub fn dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> Syscal
         S::PortRead => port_interrupt::sys_port_read(a1 as HandleValue, a2 as *mut PortPacket, a3),
         S::PortQueue => port_interrupt::sys_port_queue(a1 as HandleValue, a2 as *const PortPacket),
         S::VolumeKeyGet => key::sys_volume_key_get(a1 as *mut [u8; 32]),
+        S::SystemGetEntropy => entropy::sys_system_get_entropy(a1 as *mut u8, a2 as usize),
+        S::VmarHeapExtend => entropy::sys_vmar_heap_extend(a1 as *const huesos_abi::HeapExtendArgs),
         S::InterruptCreate => {
             port_interrupt::sys_interrupt_create(a1 as u32, a2 as *mut HandleValue)
         }

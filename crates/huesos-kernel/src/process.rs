@@ -179,7 +179,12 @@ fn finish_process_creation(
             huesos_object::unregister_object(process.koid());
             return Err(ErrorCode::NoMemory);
         };
-        let heap_end = USER_HEAP_BASE + USER_HEAP_SIZE;
+        // Commit only the bootstrap prefix; the rest of the window is
+        // reserved address space the process grows through
+        // `VmarHeapExtend` as its allocator needs it. Committing all
+        // 18 MiB here burned 4608 frames per process even for the
+        // processes that never allocate a byte.
+        let heap_end = USER_HEAP_BASE + USER_HEAP_EAGER_PAGES * PAGE_SIZE;
         let mut addr = USER_HEAP_BASE;
         while addr < heap_end {
             let page: Page<Size4KiB> = Page::containing_address(VirtAddr::new(addr));
@@ -804,6 +809,134 @@ pub fn protect_vmar_mapping(vmar: &Vmar, args: VmarOpArgs) -> Result<u64, ErrorC
         crate::scheduler::online_remote_cpu_count(),
     );
     Ok(args.addr)
+}
+
+/// Number of heap pages committed eagerly at process creation.
+///
+/// Before the `VmarHeapExtend` syscall existed the launcher had to
+/// commit the *entire* 18 MiB window (4608 frames) to every process,
+/// including the many that never allocate, because a process had no
+/// way to ask for more later. With on-demand commit the launcher only
+/// needs enough for an allocator to bootstrap its first region; the
+/// rest is reserved address space that costs nothing until used.
+const USER_HEAP_EAGER_PAGES: u64 = 16;
+
+/// Commit or decommit pages inside the calling process's own heap window.
+///
+/// This is the `mmap`/`munmap` substitute for a ring-3 process that
+/// holds no handle to its own VMAR. Authority is implicit and
+/// deliberately minimal: the range is expressed as an offset into
+/// `[USER_HEAP_BASE, USER_HEAP_BASE + USER_HEAP_SIZE)` and clamped to
+/// that window, so this syscall can never name, map, or free memory
+/// outside the caller's own pre-reserved heap. No handle, resource, or
+/// right can be escalated through it.
+///
+/// Committing is idempotent per page: an already-committed page is
+/// left alone rather than failing the whole request, so an allocator
+/// can re-commit a region without tracking kernel state exactly.
+/// Decommitting frees the backing frames, so the heap can shrink.
+pub fn heap_extend_current(args: huesos_abi::HeapExtendArgs) -> Result<u64, ErrorCode> {
+    use huesos_abi::heap_op;
+
+    if args.reserved != 0 {
+        return Err(ErrorCode::InvalidArgs);
+    }
+    if args.len == 0
+        || !args.offset.is_multiple_of(PAGE_SIZE)
+        || !args.len.is_multiple_of(PAGE_SIZE)
+        || args.op > heap_op::DECOMMIT
+    {
+        return Err(ErrorCode::InvalidArgs);
+    }
+    // Checked arithmetic: a wrapping end would otherwise let a huge
+    // offset+len pair pass a naive `end <= HEAP_SIZE` test.
+    let end = args
+        .offset
+        .checked_add(args.len)
+        .ok_or(ErrorCode::InvalidArgs)?;
+    if end > USER_HEAP_SIZE {
+        return Err(ErrorCode::InvalidArgs);
+    }
+
+    let process = huesos_object::current_process().ok_or(ErrorCode::AccessDenied)?;
+    // Serialize against the validated user-copy layer: a page must not
+    // be unmapped while a syscall is copying through it.
+    let _memory_guard = process.user_memory_lock.lock();
+
+    let base = USER_HEAP_BASE + args.offset;
+    let page_count = (args.len / PAGE_SIZE) as usize;
+
+    let mut runtime_guard = process.address_space.lock();
+    let runtime = runtime_guard
+        .as_mut()
+        .and_then(|runtime| runtime.downcast_mut::<ProcessRuntime>())
+        .ok_or(ErrorCode::BadHandle)?;
+    let address_space = runtime.address_space_mut().ok_or(ErrorCode::BadHandle)?;
+
+    if args.op == heap_op::COMMIT {
+        let mut committed = 0usize;
+        let result = (|| -> Result<(), ErrorCode> {
+            for index in 0..page_count {
+                let page = Page::<Size4KiB>::containing_address(VirtAddr::new(
+                    base + index as u64 * PAGE_SIZE,
+                ));
+                if address_space.is_user_page_mapped(page) {
+                    continue;
+                }
+                address_space
+                    .map_new_user_page(page, flags::USER_RW | PageTableFlags::NO_EXECUTE)
+                    .map_err(|error| match error {
+                        UserPageError::OutOfMemory => ErrorCode::NoMemory,
+                        UserPageError::NotInitialized => ErrorCode::Internal,
+                        UserPageError::AlreadyMapped => ErrorCode::Busy,
+                        UserPageError::ParentHugePage
+                        | UserPageError::NotMapped
+                        | UserPageError::InvalidFrameAddress => ErrorCode::InvalidArgs,
+                    })?;
+                committed += 1;
+            }
+            Ok(())
+        })();
+
+        if let Err(error) = result {
+            // Roll the transaction back: a partially grown heap would
+            // hand the allocator a region with a hole in it.
+            for index in (0..page_count).rev() {
+                if committed == 0 {
+                    break;
+                }
+                let page = Page::<Size4KiB>::containing_address(VirtAddr::new(
+                    base + index as u64 * PAGE_SIZE,
+                ));
+                if address_space.unmap_and_release_user_page(page).is_ok() {
+                    committed -= 1;
+                }
+            }
+            return Err(error);
+        }
+        // Newly mapped pages were absent before, so no CPU can hold a
+        // stale positive TLB entry for them; nothing to shoot down.
+        return Ok(base);
+    }
+
+    // DECOMMIT
+    for index in 0..page_count {
+        let page =
+            Page::<Size4KiB>::containing_address(VirtAddr::new(base + index as u64 * PAGE_SIZE));
+        // Tolerate holes: decommitting an uncommitted page is a no-op,
+        // not an error, so an allocator may release a range it only
+        // partially committed.
+        let _ = address_space.unmap_and_release_user_page(page);
+    }
+    drop(runtime_guard);
+    // Removing mappings *does* require invalidating other CPUs, or a
+    // stale TLB entry would keep a freed frame reachable from ring 3.
+    huesos_arch::paging::shootdown_range(
+        base,
+        base + args.len,
+        crate::scheduler::online_remote_cpu_count(),
+    );
+    Ok(base)
 }
 
 /// Start a suspended userspace thread.

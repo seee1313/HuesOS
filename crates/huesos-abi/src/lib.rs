@@ -308,13 +308,63 @@ pub enum Syscall {
     /// baked into this kernel build (plain-volume deployments).
     /// Stage D bootloader KeyProvider handoff.
     VolumeKeyGet = 59,
+    /// Fill a userspace buffer with kernel CSPRNG bytes. `a1` is the
+    /// destination pointer, `a2` the length in bytes (at most
+    /// [`MAX_ENTROPY_BYTES`]). Returns the number of bytes written.
+    ///
+    /// The hardened userspace allocator needs unpredictable bytes for
+    /// its chunk-header cookie; without this the integrity checksum
+    /// would be forgeable from a constant. Returns `Unavailable` if
+    /// the kernel pool was never seeded, rather than serving
+    /// deterministic output.
+    SystemGetEntropy = 60,
+    /// Commit or decommit pages inside the caller's own reserved heap
+    /// window (`USER_HEAP_BASE .. +USER_HEAP_SIZE`). `a1` points to a
+    /// [`HeapExtendArgs`].
+    ///
+    /// This is the `mmap`/`munmap` substitute for a process that has
+    /// no handle to its own VMAR. The kernel clamps every request to
+    /// the caller's heap window, so it cannot name memory the caller
+    /// does not already own and needs no additional capability.
+    VmarHeapExtend = 61,
+}
+
+/// Maximum number of bytes one [`Syscall::SystemGetEntropy`] call
+/// will produce. Callers needing more must loop; the cap bounds the
+/// time spent generating keystream with interrupts enabled.
+pub const MAX_ENTROPY_BYTES: usize = 256;
+
+/// Operation selector for [`Syscall::VmarHeapExtend`].
+pub mod heap_op {
+    /// Commit (map fresh zeroed pages) the requested range.
+    pub const COMMIT: u32 = 0;
+    /// Decommit (unmap and free) the requested range.
+    pub const DECOMMIT: u32 = 1;
+}
+
+/// Arguments for [`Syscall::VmarHeapExtend`].
+///
+/// `offset` and `len` are relative to [`USER_HEAP_BASE`] and must be
+/// 4 KiB-aligned; the kernel rejects any range extending past
+/// [`USER_HEAP_SIZE`].
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HeapExtendArgs {
+    /// Byte offset from `USER_HEAP_BASE`, 4 KiB-aligned.
+    pub offset: u64,
+    /// Length in bytes, 4 KiB-aligned and non-zero.
+    pub len: u64,
+    /// One of [`heap_op::COMMIT`] / [`heap_op::DECOMMIT`].
+    pub op: u32,
+    /// Reserved; must be zero.
+    pub reserved: u32,
 }
 
 impl Syscall {
     /// Total number of defined syscalls (i.e. one past the highest
     /// currently-assigned number). The dispatcher uses this to reject
     /// obviously-out-of-range numbers before a `match`.
-    pub const COUNT: u64 = 60;
+    pub const COUNT: u64 = 62;
 
     /// Convert a raw syscall number back into a [`Syscall`], if valid.
     pub const fn from_raw(n: u64) -> Option<Self> {
@@ -379,6 +429,8 @@ impl Syscall {
             57 => Self::InterruptCreateForResource,
             58 => Self::PortQueue,
             59 => Self::VolumeKeyGet,
+            60 => Self::SystemGetEntropy,
+            61 => Self::VmarHeapExtend,
             _ => return None,
         })
     }
@@ -1185,7 +1237,9 @@ mod tests {
         assert_eq!(Syscall::InterruptCreateForResource as u64, 57);
         assert_eq!(Syscall::PortQueue as u64, 58);
         assert_eq!(Syscall::VolumeKeyGet as u64, 59);
-        assert_eq!(Syscall::COUNT, 60);
+        assert_eq!(Syscall::SystemGetEntropy as u64, 60);
+        assert_eq!(Syscall::VmarHeapExtend as u64, 61);
+        assert_eq!(Syscall::COUNT, 62);
         assert_eq!(Syscall::from_raw(28), Some(Syscall::VmoCreateEx));
         assert_eq!(Syscall::from_raw(30), Some(Syscall::VmarProtect));
         assert_eq!(Syscall::from_raw(31), Some(Syscall::ChannelPeek));
@@ -1223,7 +1277,9 @@ mod tests {
         );
         assert_eq!(Syscall::from_raw(58), Some(Syscall::PortQueue));
         assert_eq!(Syscall::from_raw(59), Some(Syscall::VolumeKeyGet));
-        assert_eq!(Syscall::from_raw(60), None);
+        assert_eq!(Syscall::from_raw(60), Some(Syscall::SystemGetEntropy));
+        assert_eq!(Syscall::from_raw(61), Some(Syscall::VmarHeapExtend));
+        assert_eq!(Syscall::from_raw(62), None);
     }
 
     #[test]

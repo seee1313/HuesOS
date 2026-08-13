@@ -205,10 +205,21 @@ impl PageCache {
     }
 
     /// Drop every entry whose `extent_physical_block` matches
-    /// `invalidated_extent`. Called from the write path
-    /// before the on-disk extent is overwritten, so a
-    /// subsequent read returns the new bytes, not a stale
-    /// decompressed copy from the cache.
+    /// `invalidated_extent`, so a subsequent read returns fresh
+    /// bytes rather than a stale decompressed copy.
+    ///
+    /// **Not currently called from any write path.** The docs here
+    /// used to claim it was, which was misleading: the page cache
+    /// lives in [`crate::Hxfs`], which is a read-only mount, and the
+    /// mutating [`crate::fixed_writer::FixedHxfsWriter`] has no cache
+    /// at all. No stale read is reachable today because no cache and
+    /// no writer ever share a mount.
+    ///
+    /// This is a correctness prerequisite, not dead weight: the first
+    /// change that gives the writer a page cache — or lets a mount do
+    /// both — MUST call this before overwriting an extent, or reads
+    /// will silently return pre-write data. It is kept, tested, and
+    /// documented for that reason.
     pub fn invalidate_extent(&mut self, invalidated_extent: u64) {
         for entry in &mut self.slots {
             if entry.occupied && entry.extent_physical_block == invalidated_extent {

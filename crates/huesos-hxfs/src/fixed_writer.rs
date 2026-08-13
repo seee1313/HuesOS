@@ -1244,22 +1244,49 @@ impl<
                 }
                 let copy_from = start.max(extent_start);
                 let copy_to = end.min(extent_end);
-                let window = copy_to - copy_from;
-                // The range touches exactly one logical block of
-                // this single-block extent; read it with a fixed
-                // 4 KiB buffer (no object-sized allocation).
-                let block_offset = (copy_from - extent_start) / BLOCK_SIZE_U64;
-                let mut block = [0u8; BLOCK_SIZE];
-                self.read_extent_block(
-                    extent.extent,
-                    extent.compression,
-                    block_offset,
-                    &mut block,
-                )?;
-                let within = (copy_from - extent_start) as usize % BLOCK_SIZE;
-                let out_off = (copy_from - start) as usize;
-                out[out_off..out_off + window as usize]
-                    .copy_from_slice(&block[within..within + window as usize]);
+
+                // Walk the window one logical block at a time.
+                //
+                // An extent may span many blocks: `write_file_data`
+                // in `writer.rs` emits a single extent with
+                // `block_count = N` for any file above 4 KiB, and
+                // that is what `tools/hxfs-seed` and `mkhxfs.py`
+                // write. The previous code assumed the window fell
+                // inside one block and copied `window` bytes out of
+                // a 4 KiB buffer, so a read crossing a block
+                // boundary in a multi-block extent panicked with
+                // "range end index 8192 out of range for slice of
+                // length 4096" — reachable from an ordinary
+                // unprivileged `read_at`, which takes the whole
+                // filesystem service down with it.
+                let mut cursor = copy_from;
+                while cursor < copy_to {
+                    let block_offset = (cursor - extent_start) / BLOCK_SIZE_U64;
+                    let within = ((cursor - extent_start) % BLOCK_SIZE_U64) as usize;
+                    // Bytes left in this block, clipped to the window.
+                    let chunk =
+                        core::cmp::min((BLOCK_SIZE - within) as u64, copy_to - cursor) as usize;
+                    let out_off = (cursor - start) as usize;
+                    // Defensive bound: `out` is `count` bytes and the
+                    // window was clipped to `end`, so this holds, but
+                    // a slice index is not the place to find out.
+                    if out_off
+                        .checked_add(chunk)
+                        .is_none_or(|end_index| end_index > out.len())
+                    {
+                        return Err(HxfsError::OutOfRange);
+                    }
+
+                    let mut block = [0u8; BLOCK_SIZE];
+                    self.read_extent_block(
+                        extent.extent,
+                        extent.compression,
+                        block_offset,
+                        &mut block,
+                    )?;
+                    out[out_off..out_off + chunk].copy_from_slice(&block[within..within + chunk]);
+                    cursor += chunk as u64;
+                }
             }
             index += 1;
         }
@@ -1366,15 +1393,26 @@ impl<
         // translates to the user-facing NoSpace error at the
         // mount boundary.
         let delta_bytes = u64::try_from(data.len()).map_err(|_| HxfsError::OutOfRange)?;
-        self.check_volume_quota(delta_bytes, 0)?;
-        // Stage E (Phase-2): per-Job quota enforcement.
-        self.check_job_quota(delta_bytes, 0)?;
 
+        // Release the extents this write replaces BEFORE charging the
+        // quota. A full rewrite (`offset == 0`) drops every existing
+        // extent of the file, so those blocks must not be counted as
+        // still-in-use when deciding whether the new write fits;
+        // charging first made an in-place rewrite of a file that
+        // exactly filled its quota fail even though usage would not
+        // change. Validation that can reject the write already
+        // happened above, so dropping the extents here does not
+        // discard data for a call that then fails.
         if offset == 0 {
-            self.clear_extents(file.object_id);
+            let released = self.clear_extents(file.object_id);
+            self.release_job_bytes(released);
         } else if offset != object.size || !offset.is_multiple_of(BLOCK_SIZE_U64) {
             return Err(HxfsError::Unsupported);
         }
+
+        self.check_volume_quota(delta_bytes, 0)?;
+        // Stage E (Phase-2): per-Job quota enforcement.
+        self.check_job_quota(delta_bytes, 0)?;
 
         if !data.is_empty() {
             let logical_block = offset / BLOCK_SIZE_U64;
@@ -1464,12 +1502,42 @@ impl<
 
     /// A.5 helper: return the number of physical bytes
     /// already committed to data blocks on the volume.
-    /// Computed from the next-LBA pointer because the
-    /// fixed-capacity MVP reserves contiguous LBAs for
-    /// the volume table; the boundary is `next_lba - 1`
-    /// (the last committed data LBA).
+    ///
+    /// This counts the blocks **currently referenced by live
+    /// extents**, not the high-water mark of the append pointer.
+    ///
+    /// It used to be derived from `next_lba`, which only ever grows:
+    /// an in-place rewrite calls `clear_extents` and then appends the
+    /// new blocks at fresh LBAs, so every overwrite permanently
+    /// inflated the reported usage even though the file's size never
+    /// changed. Rewriting one 4 KiB file 32 times reported 168 KiB of
+    /// usage for 4 KiB of data, and a volume with a quota eventually
+    /// refused writes it had room for.
+    ///
+    /// Counting live extents makes the figure reflect what the volume
+    /// actually holds. Space behind dropped extents is not yet
+    /// reclaimed on the media (the MVP appends rather than reusing
+    /// LBAs), but it is no longer charged to the quota, which is the
+    /// user-visible contract.
     pub fn committed_physical_bytes(&self) -> u64 {
-        self.next_lba.saturating_sub(1) * BLOCK_SIZE_U64
+        let mut blocks = 0u64;
+        let mut index = 0usize;
+        while index < self.extents.len() {
+            if let Some(entry) = self.extents[index] {
+                // Hole extents describe unwritten logical range and
+                // occupy no media.
+                if entry.extent.flags & EXTENT_FLAG_HOLE == 0 {
+                    let count = if entry.extent.flags & EXTENT_FLAG_MULTI_SLOT != 0 {
+                        1
+                    } else {
+                        u64::from(entry.extent.block_count)
+                    };
+                    blocks = blocks.saturating_add(count);
+                }
+            }
+            index += 1;
+        }
+        blocks.saturating_mul(BLOCK_SIZE_U64)
     }
 
     /// Truncate or sparsely extend a file.
@@ -1479,6 +1547,49 @@ impl<
             return Err(HxfsError::WrongType);
         }
         object.descriptor.size = new_size;
+
+        // Drop extents that now lie entirely past the new end of
+        // file, and re-derive `record_count`.
+        //
+        // Previously this function touched only `descriptor.size`.
+        // The orphaned extents stayed in the table, so they kept
+        // being charged to the volume quota, kept being visited by
+        // `fsck`/`scrub`, and left `record_count` disagreeing with
+        // the number of extents `load_extents` would find after a
+        // remount — the count the reader trusts to size its walk.
+        let mut released_blocks = 0u64;
+        let mut index = 0usize;
+        while index < self.extents.len() {
+            if let Some(entry) = self.extents[index] {
+                if entry.object_id == file.object_id {
+                    let logical = if entry.extent.flags & EXTENT_FLAG_MULTI_SLOT != 0 {
+                        1
+                    } else {
+                        u64::from(entry.extent.block_count)
+                    };
+                    let extent_start = entry.extent.logical_block * BLOCK_SIZE_U64;
+                    // Keep any extent that still holds a live byte.
+                    // A partially truncated extent is retained whole:
+                    // the tail bytes are unreachable through
+                    // `descriptor.size`, and splitting an extent here
+                    // would need a fresh allocation on a path that
+                    // must not fail.
+                    if extent_start >= new_size && logical > 0 {
+                        if entry.extent.flags & EXTENT_FLAG_HOLE == 0 {
+                            released_blocks = released_blocks.saturating_add(logical);
+                        }
+                        self.extents[index] = None;
+                    }
+                }
+            }
+            index += 1;
+        }
+
+        // Truncation frees media, so it must credit the per-Job
+        // quota just like a delete or a full rewrite does.
+        self.release_job_bytes(released_blocks.saturating_mul(BLOCK_SIZE_U64));
+
+        self.update_file_record_count(file.object_id)?;
         self.dirty = true;
         self.file_handle(file.object_id)
     }
@@ -1544,7 +1655,8 @@ impl<
         }
         self.dir_entries[index] = None;
         self.remove_object(object_id);
-        self.clear_extents(object_id);
+        let released = self.clear_extents(object_id);
+        self.release_job_bytes(released);
         self.dirty = true;
         Ok(())
     }
@@ -2547,17 +2659,63 @@ impl<
         Ok(())
     }
 
-    fn clear_extents(&mut self, object_id: u64) {
+    /// Drop every extent of `object_id`, returning the number of
+    /// physical bytes those extents occupied.
+    ///
+    /// The caller uses the return value to credit the per-Job quota,
+    /// which — unlike the volume counter — cannot be re-derived from
+    /// the extent table because extents do not record which job
+    /// wrote them.
+    fn clear_extents(&mut self, object_id: u64) -> u64 {
+        let mut blocks = 0u64;
         let mut index = 0usize;
         while index < self.extents.len() {
-            if self.extents[index]
-                .map(|extent| extent.object_id == object_id)
-                .unwrap_or(false)
-            {
-                self.extents[index] = None;
+            if let Some(entry) = self.extents[index] {
+                if entry.object_id == object_id {
+                    if entry.extent.flags & EXTENT_FLAG_HOLE == 0 {
+                        let count = if entry.extent.flags & EXTENT_FLAG_MULTI_SLOT != 0 {
+                            1
+                        } else {
+                            u64::from(entry.extent.block_count)
+                        };
+                        blocks = blocks.saturating_add(count);
+                    }
+                    self.extents[index] = None;
+                }
             }
             index += 1;
         }
+        blocks.saturating_mul(BLOCK_SIZE_U64)
+    }
+
+    /// Give `bytes` back to the active job's quota.
+    ///
+    /// `check_job_quota` only ever added, so a long-lived job that
+    /// repeatedly wrote and deleted files marched towards its limit
+    /// and was eventually refused writes on a volume that was in fact
+    /// empty. Releasing extents has to reverse the charge.
+    ///
+    /// The credit goes to the job that is active at release time,
+    /// which is the same job that is charged for a rewrite on this
+    /// path. Extents carry no job id, so a file deleted under a
+    /// different job than the one that wrote it credits the deleter;
+    /// tracking per-extent ownership would need an on-disk format
+    /// change and is out of scope here. The bound that matters —
+    /// usage never diverging upwards from reality for a job that
+    /// writes and deletes its own files — holds.
+    fn release_job_bytes(&mut self, bytes: u64) {
+        if bytes == 0 {
+            return;
+        }
+        let Some(job_id) = self.active_job else {
+            return;
+        };
+        let uuid = job_uuid(job_id);
+        let Ok(mut record) = self.quota_tree.get(uuid) else {
+            return;
+        };
+        record.physical_used_bytes = record.physical_used_bytes.saturating_sub(bytes);
+        let _ = self.quota_tree.upsert(record);
     }
 
     fn update_directory_record_count(&mut self, object_id: u64) -> FixedResult<()> {
@@ -2687,10 +2845,12 @@ impl<
         {
             return Err(HxfsError::NoSpace);
         }
-        let current_bytes = self
-            .next_lba
-            .checked_mul(BLOCK_SIZE_U64)
-            .ok_or(HxfsError::OutOfRange)?;
+        // Charge live extents, not the append high-water mark.
+        // `next_lba` only grows, so deriving usage from it charged
+        // the volume for every block an in-place rewrite had already
+        // released — the same defect fixed in
+        // `committed_physical_bytes`, which this path did not share.
+        let current_bytes = self.committed_physical_bytes();
         let next_bytes = current_bytes
             .checked_add(additional_bytes)
             .ok_or(HxfsError::OutOfRange)?;
@@ -4366,6 +4526,352 @@ mod tests {
         assert_eq!(&out[..5], b"fixed");
     }
 
+    /// Regression: reading across a block boundary inside a
+    /// multi-block extent used to panic with an out-of-range slice
+    /// index instead of returning data.
+    ///
+    /// `HxfsWriter::create_file` emits ONE extent with
+    /// `block_count = N` for any file larger than 4 KiB — the same
+    /// shape `tools/hxfs-seed` and `mkhxfs.py` produce — so this is
+    /// the layout a real seeded image has. The read path assumed a
+    /// window never spanned more than one block, so an ordinary
+    /// unprivileged `read_at` crashed the filesystem service.
+    #[test]
+    fn read_file_at_spans_multi_block_extents() {
+        const FILE_BYTES: usize = BLOCK_SIZE * 3;
+        let Ok(mut seed) = HxfsWriter::new(INSTANCE, VOLUME) else {
+            assert!(false, "seed writer should initialize");
+            return;
+        };
+        // A recognisable pattern so a mis-copied block is visible.
+        let mut payload = vec![0u8; FILE_BYTES];
+        for (index, byte) in payload.iter_mut().enumerate() {
+            *byte = (index % 251) as u8;
+        }
+        assert!(seed.create_file("/big.bin", &payload).is_ok());
+        // The writer stages nodes in memory; commit lays the single
+        // multi-block extent down into the image.
+        assert!(seed.commit().is_ok());
+
+        let store = MemStore::from_image(seed.image());
+        let Ok(mut mounted) = FixedHxfsWriter::<MemStore, 16, 32, 32>::mount(store) else {
+            assert!(false, "fixed writer should mount");
+            return;
+        };
+        let Ok(file) = mounted.open_path("/big.bin") else {
+            assert!(false, "seeded file should open");
+            return;
+        };
+
+        // Whole-file read: the window covers all three blocks.
+        let mut out = vec![0u8; FILE_BYTES];
+        assert_eq!(mounted.read_file_at(file, 0, &mut out), Ok(FILE_BYTES));
+        assert_eq!(out, payload, "full read must reproduce the file");
+
+        // Unaligned read straddling two block boundaries.
+        let offset = (BLOCK_SIZE - 100) as u64;
+        let len = BLOCK_SIZE + 200;
+        let mut partial = vec![0u8; len];
+        assert_eq!(mounted.read_file_at(file, offset, &mut partial), Ok(len));
+        assert_eq!(
+            partial,
+            payload[offset as usize..offset as usize + len],
+            "unaligned cross-block read must reproduce the file"
+        );
+
+        // A read starting inside the last block still terminates at
+        // the file's real end.
+        let tail_offset = (BLOCK_SIZE * 2 + 4000) as u64;
+        let mut tail = vec![0u8; BLOCK_SIZE];
+        let expected_tail = FILE_BYTES - tail_offset as usize;
+        assert_eq!(
+            mounted.read_file_at(file, tail_offset, &mut tail),
+            Ok(expected_tail)
+        );
+        assert_eq!(&tail[..expected_tail], &payload[tail_offset as usize..]);
+    }
+
+    /// Regression: truncation must release the extents it orphans
+    /// and keep `record_count` consistent with the extent table.
+    #[test]
+    fn truncate_releases_extents_and_updates_record_count() {
+        let Ok(seed) = HxfsWriter::new(INSTANCE, VOLUME) else {
+            assert!(false, "seed writer should initialize");
+            return;
+        };
+        let store = MemStore::from_image(seed.image());
+        let Ok(mut mounted) = FixedHxfsWriter::<MemStore, 16, 32, 32>::mount(store) else {
+            assert!(false, "fixed writer should mount");
+            return;
+        };
+        let Ok(file) = mounted.create_file_path("/trunc.bin") else {
+            assert!(false, "file should be created");
+            return;
+        };
+
+        // Three separate single-block extents.
+        let block = [0x11u8; BLOCK_SIZE];
+        let mut handle = file;
+        for index in 0..3u64 {
+            match mounted.write_file_at(handle, index * BLOCK_SIZE_U64, &block) {
+                Ok(next) => handle = next,
+                Err(error) => {
+                    assert!(false, "write {index} failed: {error:?}");
+                    return;
+                }
+            }
+        }
+        let full_usage = mounted.committed_physical_bytes();
+
+        // Truncate to one block: the last two extents are orphaned.
+        let Ok(handle) = mounted.truncate_file(handle, BLOCK_SIZE_U64) else {
+            assert!(false, "truncate should succeed");
+            return;
+        };
+
+        assert!(
+            mounted.committed_physical_bytes() < full_usage,
+            "truncation must release the blocks it orphans"
+        );
+
+        let Ok(object) = mounted.object(handle.object_id) else {
+            assert!(false, "object should still exist");
+            return;
+        };
+        assert_eq!(object.descriptor.size, BLOCK_SIZE_U64);
+        assert_eq!(
+            u64::from(object.descriptor.record_count),
+            1,
+            "record_count must match the surviving extent count"
+        );
+
+        // The surviving data is still readable.
+        let mut out = [0u8; BLOCK_SIZE];
+        assert_eq!(mounted.read_file_at(handle, 0, &mut out), Ok(BLOCK_SIZE));
+        assert_eq!(out, block);
+    }
+
+    /// Regression: rewriting a file in place must not inflate the
+    /// volume's reported physical usage.
+    ///
+    /// `committed_physical_bytes` used to be derived from the
+    /// monotonic `next_lba`, so each overwrite charged the volume
+    /// again for space the file had released. A quota'd volume
+    /// eventually rejected writes that fit.
+    #[test]
+    fn in_place_rewrite_does_not_inflate_physical_usage() {
+        let Ok(seed) = HxfsWriter::new(INSTANCE, VOLUME) else {
+            assert!(false, "seed writer should initialize");
+            return;
+        };
+        let store = MemStore::from_image(seed.image());
+        let Ok(mut mounted) = FixedHxfsWriter::<MemStore, 16, 32, 32>::mount(store) else {
+            assert!(false, "fixed writer should mount");
+            return;
+        };
+        let Ok(file) = mounted.create_file_path("/rewrite.bin") else {
+            assert!(false, "file should be created");
+            return;
+        };
+
+        let payload = [0xa5u8; 1024];
+        let Ok(file) = mounted.write_file_at(file, 0, &payload) else {
+            assert!(false, "first write should succeed");
+            return;
+        };
+        let after_first = mounted.committed_physical_bytes();
+
+        // Rewrite the same file many times. Usage must stay flat:
+        // each rewrite drops the old extent and adds one of equal
+        // size.
+        let mut handle = file;
+        for round in 0..32 {
+            match mounted.write_file_at(handle, 0, &payload) {
+                Ok(next) => handle = next,
+                Err(error) => {
+                    assert!(false, "rewrite {round} failed: {error:?}");
+                    return;
+                }
+            }
+        }
+        assert_eq!(
+            mounted.committed_physical_bytes(),
+            after_first,
+            "in-place rewrite must not grow reported physical usage"
+        );
+    }
+
+    /// A volume whose quota exactly fits one copy of a file must
+    /// still accept rewriting that file.
+    #[test]
+    fn rewrite_is_allowed_at_exact_quota() {
+        let Ok(seed) = HxfsWriter::new(INSTANCE, VOLUME) else {
+            assert!(false, "seed writer should initialize");
+            return;
+        };
+        let store = MemStore::from_image(seed.image());
+        let Ok(mut mounted) = FixedHxfsWriter::<MemStore, 16, 32, 32>::mount(store) else {
+            assert!(false, "fixed writer should mount");
+            return;
+        };
+        let Ok(file) = mounted.create_file_path("/tight.bin") else {
+            assert!(false, "file should be created");
+            return;
+        };
+        let payload = [0x5au8; 2048];
+        let Ok(file) = mounted.write_file_at(file, 0, &payload) else {
+            assert!(false, "first write should succeed");
+            return;
+        };
+
+        // Pin the byte quota to exactly what the volume now uses.
+        // The object limit stays generous: this test is about the
+        // physical-bytes charge, and a zero object limit would be
+        // breached by the objects that already exist.
+        let used = mounted.committed_physical_bytes();
+        assert!(mounted.set_quota_limits(used, u64::MAX).is_ok());
+
+        // Rewriting the same bytes needs no additional space: the
+        // old extent is released before the new one is charged.
+        assert!(
+            mounted.write_file_at(file, 0, &payload).is_ok(),
+            "rewrite at exact quota must be admitted"
+        );
+    }
+
+    /// A job that writes and deletes its own files in a loop must
+    /// not march towards its physical limit.
+    ///
+    /// `check_job_quota` only ever added to `physical_used_bytes`;
+    /// nothing subtracted when `clear_extents` dropped the blocks.
+    /// A long-lived job doing write/delete churn was therefore
+    /// eventually refused writes on a volume that was in fact empty.
+    /// Mirrors the on-target quota probe in hxfs-service: pin the
+    /// volume limit one block above current usage, then write two
+    /// 4 KiB blocks to the same file. The first must be admitted and
+    /// the second refused.
+    ///
+    /// The NVMe soak asserts this as `[hxfs] quota-enforced-ok`.
+    #[test]
+    fn volume_quota_refuses_the_block_past_the_limit() {
+        let Ok(seed) = HxfsWriter::new(INSTANCE, VOLUME) else {
+            assert!(false, "seed writer should initialize");
+            return;
+        };
+        let store = MemStore::from_image(seed.image());
+        let Ok(mut mounted) = FixedHxfsWriter::<MemStore, 16, 32, 32>::mount(store) else {
+            assert!(false, "fixed writer should mount");
+            return;
+        };
+
+        let base = mounted.committed_physical_bytes();
+        assert!(mounted.set_quota_limits(base + 4096, 0).is_ok());
+
+        let root = mounted.root_directory();
+        let Ok(file) = mounted.create_file_child(root, "probe-quota.bin") else {
+            assert!(false, "create must succeed");
+            return;
+        };
+        let chunk = [0x42u8; 4096];
+        let first = mounted.write_file_at(file, 0, &chunk);
+        assert!(first.is_ok(), "first block must fit: {first:?}");
+        let Ok(file) = first else { return };
+
+        let second = mounted.write_file_at(file, 4096, &chunk);
+        assert!(
+            matches!(
+                second,
+                Err(HxfsError::QuotaExceeded) | Err(HxfsError::NoSpace)
+            ),
+            "second block must breach the quota, got {second:?}"
+        );
+    }
+
+    #[test]
+    fn job_quota_is_credited_when_extents_are_released() {
+        let Ok(seed) = HxfsWriter::new(INSTANCE, VOLUME) else {
+            assert!(false, "seed writer should initialize");
+            return;
+        };
+        let store = MemStore::from_image(seed.image());
+        let Ok(mut mounted) = FixedHxfsWriter::<MemStore, 16, 32, 32>::mount(store) else {
+            assert!(false, "fixed writer should mount");
+            return;
+        };
+
+        const JOB: u64 = 7;
+        // Room for a handful of blocks, far less than the churn below
+        // would accumulate if releases were not credited.
+        assert!(mounted.set_job_quota(JOB, 64 * 1024, u64::MAX).is_ok());
+        mounted.set_active_job(Some(JOB));
+
+        let payload = [0xa5u8; 4096];
+        let mut round = 0;
+        while round < 24 {
+            let Ok(handle) = mounted.create_file_path("/churn.bin") else {
+                assert!(false, "create must succeed on round {round}");
+                return;
+            };
+            let written = mounted.write_file_at(handle, 0, &payload);
+            assert!(written.is_ok(), "write must succeed on round {round}");
+            assert!(
+                mounted.unlink_path("/churn.bin").is_ok(),
+                "unlink must succeed on round {round}"
+            );
+            round += 1;
+        }
+
+        // After deleting everything it wrote, the job's charge must be
+        // back to zero rather than 24 blocks' worth.
+        let (used, _objects) = mounted.job_quota_usage(JOB);
+        assert_eq!(used, 0, "released extents must be credited back");
+    }
+
+    /// Truncation frees media, so it must credit the job quota too.
+    #[test]
+    fn job_quota_is_credited_on_truncate() {
+        let Ok(seed) = HxfsWriter::new(INSTANCE, VOLUME) else {
+            assert!(false, "seed writer should initialize");
+            return;
+        };
+        let store = MemStore::from_image(seed.image());
+        let Ok(mut mounted) = FixedHxfsWriter::<MemStore, 16, 32, 32>::mount(store) else {
+            assert!(false, "fixed writer should mount");
+            return;
+        };
+
+        const JOB: u64 = 11;
+        assert!(mounted.set_job_quota(JOB, 0, u64::MAX).is_ok());
+        mounted.set_active_job(Some(JOB));
+
+        let Ok(handle) = mounted.create_file_path("/big.bin") else {
+            assert!(false, "create must succeed");
+            return;
+        };
+        // `write_file_at` takes at most one block per call, so build
+        // a three-block file by appending.
+        let payload = [0x5au8; 4096];
+        let mut handle = handle;
+        let mut block = 0u64;
+        while block < 3 {
+            let Ok(next) = mounted.write_file_at(handle, block * 4096, &payload) else {
+                assert!(false, "write of block {block} must succeed");
+                return;
+            };
+            handle = next;
+            block += 1;
+        }
+        let (before, _) = mounted.job_quota_usage(JOB);
+        assert!(before > 0, "a written file must charge the job");
+
+        assert!(mounted.truncate_file(handle, 0).is_ok());
+        let (after, _) = mounted.job_quota_usage(JOB);
+        assert!(
+            after < before,
+            "truncation must return bytes to the job quota ({before} -> {after})"
+        );
+    }
+
     #[test]
     fn fixed_writer_enforces_object_and_physical_quota() {
         let Ok(seed) = HxfsWriter::new(INSTANCE, VOLUME) else {
@@ -4389,16 +4895,36 @@ mod tests {
             assert!(false, "fixed writer should mount");
             return;
         };
-        let limit = mounted.charged_physical_bytes();
-        assert!(limit.is_ok());
-        let Ok(limit) = limit else { return };
+        // Physical quota: pin the limit to the volume's live usage
+        // after one file has been written, then confirm a write that
+        // genuinely adds blocks is refused.
+        //
+        // The limit is taken from `committed_physical_bytes` — the
+        // same live-extent metric quota enforcement uses. It used to
+        // be taken from `charged_physical_bytes` (the monotonic
+        // append high-water mark); the two agreed only because usage
+        // never went down, which was the quota-leak bug.
+        let first = mounted.create_file_path("/file");
+        assert!(first.is_ok());
+        let Ok(first) = first else { return };
+        assert!(mounted.write_file_at(first, 0, b"payload").is_ok());
+
+        let limit = mounted.committed_physical_bytes();
+        assert!(limit > 0, "a written file must consume physical bytes");
         assert!(mounted.set_quota_limits(limit, 0).is_ok());
-        let file = mounted.create_file_path("/file");
-        assert!(file.is_ok());
-        let Ok(file) = file else { return };
-        assert_eq!(
-            mounted.write_file_at(file, 0, b"x"),
-            Err(HxfsError::NoSpace)
+
+        let second = mounted.create_file_path("/file2");
+        assert!(second.is_ok());
+        let Ok(second) = second else { return };
+        // Either quota gate may fire first: `check_volume_quota`
+        // reports `QuotaExceeded` and the allocator-level
+        // `quota_admits` reports `NoSpace`. Both mean refused.
+        assert!(
+            matches!(
+                mounted.write_file_at(second, 0, b"x"),
+                Err(HxfsError::NoSpace) | Err(HxfsError::QuotaExceeded)
+            ),
+            "a write that adds blocks past the limit must be refused"
         );
     }
 

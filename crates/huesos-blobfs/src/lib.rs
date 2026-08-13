@@ -279,7 +279,17 @@ fn validate_layout_and_hashes(image: &[u8], sb: Superblock) -> Result<(), BlobFs
         if sha256(payload) != entry.hash {
             return Err(BlobFsError::HashMismatch);
         }
-        previous_end = end;
+        // Advance past this entry, but always by at least one byte.
+        //
+        // A zero-length blob has `end == entry.offset`, which would
+        // leave `previous_end` unchanged and let the *next* entry
+        // legally claim the very same offset. Repeated across the
+        // table that defeats the anti-overlap rule entirely: an
+        // image can declare thousands of entries that all point at
+        // one payload, and mount then hashes that payload once per
+        // entry. Requiring strict forward progress keeps every
+        // entry's start distinct.
+        previous_end = end.max(entry.offset.saturating_add(1));
         index += 1;
     }
     Ok(())
@@ -524,7 +534,12 @@ mod tests {
             cursor = align_up(cursor, PAYLOAD_ALIGNMENT);
             image.resize(cursor as usize, 0);
         }
-        image[32..40].copy_from_slice(&(image.len() as u64).to_le_bytes());
+        // Bind the length before the mutable borrow: `image.len()`
+        // inside the `copy_from_slice` argument borrows `image`
+        // immutably while `image[32..40]` holds it mutably (E0502),
+        // which is why this test module never compiled.
+        let image_len = image.len() as u64;
+        image[32..40].copy_from_slice(&image_len.to_le_bytes());
         image
     }
 
@@ -576,6 +591,38 @@ mod tests {
         };
         let second = SUPERBLOCK_BYTES + ENTRY_BYTES;
         image[second + 32..second + 40].copy_from_slice(&first_offset.to_le_bytes());
+        assert_eq!(BlobFs::mount(&image).err(), Some(BlobFsError::Overlap));
+    }
+
+    /// A zero-length blob must not let a later entry reuse its
+    /// offset. Before the `max(offset + 1)` fix, `previous_end`
+    /// stayed put across an empty entry and the following entry
+    /// could point at the same payload, bypassing the anti-overlap
+    /// rule for the whole rest of the table.
+    #[test]
+    fn zero_length_blob_does_not_disable_overlap_checking() {
+        // Entry 0 is empty, entries 1 and 2 both claim one offset.
+        let mut image = build_image(&[b"", b"gamma", b"delta"]);
+
+        let second = SUPERBLOCK_BYTES + ENTRY_BYTES;
+        let third = SUPERBLOCK_BYTES + ENTRY_BYTES * 2;
+        let Ok(second_offset) = read_u64(&image[second + 32..], 0) else {
+            assert!(false, "test image must contain second entry offset");
+            return;
+        };
+        // Point the third entry's payload at the second's.
+        image[third + 32..third + 40].copy_from_slice(&second_offset.to_le_bytes());
+
+        assert_eq!(BlobFs::mount(&image).err(), Some(BlobFsError::Overlap));
+    }
+
+    /// An image made entirely of zero-length entries at one offset
+    /// must be rejected rather than accepted and re-hashed per entry.
+    #[test]
+    fn repeated_zero_length_entries_are_rejected() {
+        let image = build_image(&[b"", b"", b""]);
+        // All three empty payloads sit at the same aligned offset;
+        // strict forward progress makes the second one an overlap.
         assert_eq!(BlobFs::mount(&image).err(), Some(BlobFsError::Overlap));
     }
 

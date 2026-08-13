@@ -197,7 +197,9 @@ pub fn syscall_init() {
     huesos_syscalls::set_vmar_unmap_fn(crate::process::unmap_vmar_mapping);
     huesos_syscalls::set_vmar_protect_fn(crate::process::protect_vmar_mapping);
     huesos_syscalls::set_resource_map_fn(crate::process::map_resource_into_current);
+    huesos_syscalls::set_heap_extend_fn(crate::process::heap_extend_current);
     huesos_syscalls::set_thread_start_fn(crate::process::start_thread);
+    seed_kernel_entropy();
     huesos_arch::irq_callback::set_irq_callback(handle_irq);
 
     huesos_object::set_scheduler_hooks(
@@ -206,6 +208,42 @@ pub fn syscall_init() {
         crate::scheduler::wake_task,
     );
     huesos_object::wait::set_ticks_fn(crate::scheduler::global_ticks);
+}
+
+/// Seed the kernel entropy pool used by `SystemGetEntropy`.
+///
+/// Sources, best first:
+///
+/// - `RDRAND`, when the CPU advertises it. Eight independent 64-bit
+///   draws are mixed in, so the pool inherits the hardware DRNG's
+///   entropy directly.
+/// - The timestamp counter, sampled between draws. On a machine with
+///   no `RDRAND` (older hardware, some hypervisor configurations)
+///   this is the only source, and it is weak: boot-time TSC values
+///   are correlated across identical machines. That limitation is
+///   recorded in `docs/UNSAFE_AUDIT.md` and the allocator treats the
+///   cookie as defence-in-depth, not a secret it can rely on alone.
+///
+/// Called once from [`syscall_init`], before any userspace process
+/// can issue a syscall.
+fn seed_kernel_entropy() {
+    let mut material = [0u8; 96];
+    let mut offset = 0usize;
+    let push = |value: u64, material: &mut [u8; 96], offset: &mut usize| {
+        if *offset + 8 <= material.len() {
+            material[*offset..*offset + 8].copy_from_slice(&value.to_le_bytes());
+            *offset += 8;
+        }
+    };
+
+    for _ in 0..8 {
+        if let Some(value) = huesos_arch::rdrand64() {
+            push(value, &mut material, &mut offset);
+        }
+        push(huesos_arch::rdtsc(), &mut material, &mut offset);
+    }
+
+    huesos_object::entropy::seed(&material[..offset]);
 }
 
 fn handle_irq(irq: u8, d: u64) {

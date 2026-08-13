@@ -357,6 +357,10 @@ name = "huesos-quota"
 version = "0.1.0"
 
 [[package]]
+name = "huesos-scudo"
+version = "0.1.0"
+
+[[package]]
 name = "huesos-syscalls"
 version = "0.1.0"
 dependencies = [
@@ -381,10 +385,6 @@ dependencies = [
  "cc",
  "huesos-arch",
 ]
-
-[[package]]
-name = "huesos-user-alloc"
-version = "0.1.0"
 
 [[package]]
 name = "huesos-waitset"

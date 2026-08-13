@@ -11,7 +11,7 @@ members = [
     "crates/huesos-abi",
     "crates/huesos-fb",
     "crates/huesos-alloc",
-    "crates/huesos-user-alloc",
+    "crates/huesos-scudo",
     "crates/huesos-fat",
     "crates/huesos-blobfs",
     "crates/huesos-hxfs",

@@ -11,7 +11,6 @@ path = "src/main.rs"
 libcanvas = { path = "../libcanvas" }
 huesos-abi = { path = "../../huesos-abi" }
 huesos-hxfs = { path = "../../huesos-hxfs" }
-huesos-user-alloc = { path = "../../huesos-user-alloc" }
 
 [features]
 # Stage B.5 test wiring (never enabled in a production build):

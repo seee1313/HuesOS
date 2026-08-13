@@ -2402,3 +2402,119 @@ unwrap_calls:      25 ->  25 (unchanged).
 expect_calls:      21 ->  21 (unchanged).
 panic_macros:       5 ->   5 (unchanged).
 ```
+
+## Scudo allocator port (huesos-scudo, libcanvas heap, kernel primitives)
+
+This is the dedicated safety-budget review required by CONTRIBUTING for a
+budget increase. It replaces the previous userspace allocator
+(`huesos-user-alloc`, deleted in the same change) with a Rust port of the
+Scudo hardened allocator architecture, plus the two kernel primitives that
+port needs.
+
+### Why the surface grows
+
+`huesos-user-alloc` was a bump/free-list allocator with 17 unsafe blocks and
+two exploitable defects (report findings #1 and #2: a free-list break that
+leaked memory under churn, and an ignored `layout.align()`). A hardened
+allocator is strictly more unsafe code than a naive one, because the hardening
+*is* the pointer work: checksummed chunk headers, state machine transitions
+validated on every free, quarantine, and size-class segregation all live at
+the raw-pointer layer. The trade accepted here is more audited unsafe in one
+reviewed crate in exchange for removing a class of silent heap corruption.
+
+### Where the new unsafe lives
+
+Measured with `tools/audit-safety.py`; the split between production and test
+code was counted per file against each `#[cfg(test)]` boundary.
+
+| File | Total | Production | Tests |
+| --- | ---: | ---: | ---: |
+| `crates/huesos-scudo/src/chunk.rs` | 31 | 8 | 23 |
+| `crates/huesos-scudo/src/lib.rs` | 33 | 9 | 24 |
+| `crates/huesos-scudo/src/backend.rs` | 9 | 1 | 8 |
+| `crates/huesos-scudo/src/primary.rs` | 6 | 5 | 1 |
+| `crates/huesos-scudo/src/secondary.rs` | 2 | 2 | 0 |
+| `crates/huesos-userspace/libcanvas/src/heap.rs` | 12 | 12 | 0 |
+| `crates/huesos-arch/src/x86_64/paging.rs` | +5 | +5 | 0 |
+| `crates/huesos-arch/src/lib.rs` | +1 | +1 | 0 |
+
+Over half of the new surface (56 of 99 sites) is in `#[cfg(test)]` blocks (or
+the `test-backend` feature module) that deliberately poke at headers and raw
+allocations — that is the corruption testing, and it is counted honestly rather
+than hidden behind helpers.
+
+### Justification per production site
+
+**`chunk.rs` (8) — the header primitive.** `write_header`, `read_header` and
+`read_header_expecting` are `unsafe fn` with a documented contract: the address
+16 bytes below `header_end` must be a writable, 16-byte-aligned address inside
+a block the allocator owns. Internally each does aligned 64-bit loads/stores.
+This is irreducible: the header sits in the allocation itself, so it can only
+be reached through a raw pointer. Mitigation is that *every* read validates a
+checksum keyed on the chunk address before the caller sees a header, so a
+corrupted or attacker-forged header is rejected (`HeaderError::BadChecksum`)
+instead of trusted. A wild pointer passed to `free` fails the checksum because
+the key includes the address.
+
+**`lib.rs` (9) — allocator entry points.** Two calls into
+`Primary/Secondary::finish_allocation`, three `chunk::write_header` /
+`read_header` calls on the alloc/free path, and `usable_size` and `deallocate`
+as `unsafe fn`. `deallocate` takes a caller-supplied raw pointer and reads the
+header below it, so the `unsafe` marker is required (clippy's
+`not_unsafe_ptr_arg_deref` flags the alternative); the documented contract is
+that the pointer is null or one this allocator returned.
+Each is the point where a validated offset becomes a pointer handed to the
+caller. The state machine is enforced here: free reads the header expecting
+`Allocated`, so double-free is caught and turned into an error rather than
+list corruption.
+
+**`backend.rs` (1) — `unsafe trait Backend`.** The trait is unsafe because the
+allocator dereferences pointers derived from `base()`, so an implementor that
+lies about its reserved window is unsound. The contract is documented on the
+trait: the window stays reserved for the allocator's lifetime, `commit` leaves
+the range readable, writable and zeroed, and `decommit` only touches memory the
+backend handed out.
+
+**`primary.rs` (5) and `secondary.rs` (2).** Free-list link read/write inside
+recycled blocks (the classic intrusive-list-in-free-memory technique — the
+memory is owned and not aliased while it is on the list), and the header write
+that finalises an allocation.
+
+**`libcanvas/src/heap.rs` (12) — the process-wide adapter.** `unsafe impl
+Backend for HeapWindow` (upholds the trait contract via the `VmarHeapExtend`
+syscall against the process's own fixed heap window), `unsafe fn init` (must
+run once before any allocation), `unsafe impl Sync` and `unsafe impl
+GlobalAlloc` with `alloc`/`dealloc`, plus `UnsafeCell` derefs. The `Sync` claim
+rests on a documented invariant: HuesOS userspace services are single-threaded,
+so no two threads can reach the cell. This is the one assumption worth
+re-reviewing the day a service gains a second thread; it is called out at the
+`unsafe impl Sync` site.
+
+**`huesos-arch` (+6) — kernel primitives.** `unmap_and_release_user_page` and
+`is_user_page_mapped` in `paging.rs` (page-table walks through the physical
+offset mapping, plus a frame deallocation), and `rdrand64` in `lib.rs` (the
+`RDRAND` instruction, guarded by a `has_rdrand` CPUID check). These back the
+`VmarHeapExtend` and entropy syscalls that the allocator needs; both clamp
+their operands to the caller's own heap window in the syscall layer.
+
+### Offsetting reduction
+
+Deleting `huesos-user-alloc` removes 17 unsafe blocks. `unsafe_impls` drops
+from 35 to 33 despite the two new impls in `heap.rs`.
+
+### Safety-budget delta (measured)
+
+```
+unsafe_blocks:    273 -> 348 (+75; +99 new, -17 from huesos-user-alloc, -7 net elsewhere).
+unsafe_functions:  66 ->  73 (+7).
+unsafe_impls:      35 ->  33 (-2).
+static_mut:         1 ->   1 (unchanged).
+unwrap_calls:      25 ->  25 (unchanged).
+expect_calls:      60 ->  60 (unchanged).
+panic_macros:       6 ->   6 (unchanged).
+```
+
+The allocator crate carries 58 unit tests, including adversarial ones:
+header corruption is rejected, double-free is rejected, alignment is honoured
+across reuse, and a steady-state churn loop asserts no leak. It is included in
+`make test` and in the ASan workflow.

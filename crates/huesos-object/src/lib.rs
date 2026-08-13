@@ -29,6 +29,8 @@ mod vmo;
 pub mod wait;
 
 pub mod boot_key;
+/// Kernel entropy pool (ChaCha20 DRBG) backing `SystemGetEntropy`.
+pub mod entropy;
 
 pub use acpi_broker::{AcpiBroker, PciFunctionGrant, SystemIoGrant};
 pub use channel::{
