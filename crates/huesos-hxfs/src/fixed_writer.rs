@@ -131,6 +131,26 @@ struct ObjectPlan {
     record_count: u32,
 }
 
+/// A contiguous run of physical blocks that no live extent references.
+///
+/// Used for both halves of the reclaim path: the quarantine list of
+/// blocks freed by the running transaction, and the pool of blocks
+/// that are safe to hand out again.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FreeRange {
+    /// First physical block of the run.
+    start_block: u64,
+    /// Length of the run in 4 KiB blocks.
+    block_count: u64,
+}
+
+impl FreeRange {
+    /// Exclusive end block, saturating rather than wrapping.
+    fn end_block(self) -> u64 {
+        self.start_block.saturating_add(self.block_count)
+    }
+}
+
 /// Fixed-capacity mutable Hxfs over a writable block store.
 pub struct FixedHxfsWriter<
     S: BlockStore,
@@ -206,6 +226,20 @@ pub struct FixedHxfsWriter<
     extents: [Option<FixedExtent>; MAX_EXTENTS],
     next_object_id: u64,
     next_lba: u64,
+    /// Blocks whose last reference was dropped by the transaction that
+    /// is still being built, and which are therefore *not* yet safe to
+    /// reuse.
+    ///
+    /// A block sits here until the checkpoint that removes its last
+    /// reference is published. Handing it out earlier would let one
+    /// checkpoint both free and re-seal the same block, which breaks
+    /// the generation scheme (both tenancies would derive the same
+    /// nonce from the same sequence number) and would leave a crash
+    /// before the checkpoint with the block claimed by two extents at
+    /// once.
+    pending_free: [Option<FreeRange>; MAX_EXTENTS],
+    /// Blocks that survived quarantine and may be allocated again.
+    free_space: [Option<FreeRange>; MAX_EXTENTS],
     dirty: bool,
 }
 
@@ -348,6 +382,8 @@ impl<
             extents: [const { None }; MAX_EXTENTS],
             next_object_id: 1,
             next_lba: 1,
+            pending_free: [None; MAX_EXTENTS],
+            free_space: [None; MAX_EXTENTS],
             dirty: false,
         };
         mounted.load_object_tree()?;
@@ -356,6 +392,7 @@ impl<
         mounted.load_quota_tree()?;
         mounted.next_object_id = mounted.compute_next_object_id();
         mounted.next_lba = mounted.compute_next_lba()?;
+        mounted.rebuild_free_space();
         Ok(mounted)
     }
 
@@ -1681,6 +1718,16 @@ impl<
             return Ok(self.checkpoint.sequence_number);
         }
         let old_checkpoint_lba = self.superblock.checkpoint_lba;
+        // The checkpoint is copy-on-write: the whole metadata region
+        // (object trees, the volume/allocation/refcount/backref/quota
+        // trees, the Hxblob blocks, the checkpoint and its journal) is
+        // rebuilt at `next_lba` and the old copy is abandoned. Left
+        // alone that marches upwards forever, which is the same
+        // `NoSpace`-on-an-empty-volume defect as the data-block leak,
+        // just with a bigger step. Remember where the outgoing region
+        // lives so it can be recycled once it stops being the backup.
+        let retired_metadata_start = self.metadata_region_start();
+        let retired_metadata_end = self.next_lba.max(self.superblock.journal_end_lba);
         let sequence = self.superblock.sequence_number.saturating_add(1).max(1);
         let live_objects = self.live_object_count();
         let target_count = live_objects.checked_add(7).ok_or(HxfsError::NoSpace)?;
@@ -1733,7 +1780,37 @@ impl<
         };
         let extra_total =
             (extra_total + alloc_leaf_blocks + refcount_leaf_blocks + backref_leaf_blocks) as u64;
-        let target_start_lba = self.next_lba;
+        let hxblob_count = {
+            #[cfg(feature = "hxblob")]
+            {
+                self.hxblob_index.record_count()
+            }
+            #[cfg(not(feature = "hxblob"))]
+            {
+                0usize
+            }
+        };
+        let hxblob_leaf_blocks = if hxblob_count > HXBLOB_LEAF_RECORDS {
+            hxblob_count.div_ceil(HXBLOB_LEAF_RECORDS)
+        } else {
+            0
+        };
+
+        // Place the new metadata region in reclaimed space when a
+        // large enough run exists, and only extend the volume when it
+        // does not. Anchoring it at `next_lba` unconditionally is what
+        // made the high-water mark climb forever even after the data
+        // blocks themselves were being recycled: the metadata region
+        // is rewritten wholesale on every checkpoint and dwarfs the
+        // file data on a churning volume.
+        let metadata_span = live_objects as u64
+            + extra_total
+            + 5
+            + u64::from(record_count) * 2
+            + hxblob_leaf_blocks as u64;
+        let target_start_lba = self
+            .take_free_blocks(metadata_span)
+            .unwrap_or(self.next_lba);
         let object_table_lba = target_start_lba + live_objects as u64 + extra_total;
         let volume_table_lba = object_table_lba + 1;
         let allocation_tree_lba = volume_table_lba + 1;
@@ -1750,21 +1827,6 @@ impl<
         // Phase-2 packages: the Hxblob index may span multiple
         // blocks (root + leaves); reserve space for the leaves
         // between the index root and the Merkle block.
-        let hxblob_count = {
-            #[cfg(feature = "hxblob")]
-            {
-                self.hxblob_index.record_count()
-            }
-            #[cfg(not(feature = "hxblob"))]
-            {
-                0usize
-            }
-        };
-        let hxblob_leaf_blocks = if hxblob_count > HXBLOB_LEAF_RECORDS {
-            hxblob_count.div_ceil(HXBLOB_LEAF_RECORDS)
-        } else {
-            0
-        };
         let hxblob_index_tree_lba = quota_tree_lba + 1;
         let hxblob_leaves_end = hxblob_index_tree_lba + 1 + hxblob_leaf_blocks as u64;
         let hxblob_merkle_tree_lba = hxblob_leaves_end;
@@ -2017,6 +2079,23 @@ impl<
             slot += 1;
         }
         self.next_lba = journal_end_lba;
+        // The checkpoint that dropped the last reference to these
+        // blocks is now durable, so they are safe to hand out again
+        // and any new tenancy will carry a higher sequence number.
+        // This also releases the metadata region retired by the
+        // *previous* checkpoint, which has just stopped being the
+        // backup.
+        self.promote_pending_free();
+        // Retire the region this checkpoint superseded. It is still
+        // referenced by `backup_checkpoint_lba`, so it must survive
+        // exactly one more checkpoint: quarantining it here means it
+        // is promoted by the next `publish_checkpoint`, which is
+        // precisely when it stops being the rollback target. The
+        // one-checkpoint retention the format already guarantees is
+        // therefore unchanged.
+        if retired_metadata_end > retired_metadata_start {
+            self.free_retired_metadata(retired_metadata_start, retired_metadata_end);
+        }
         self.dirty = false;
         Ok(sequence)
     }
@@ -2673,7 +2752,8 @@ impl<
     }
 
     /// Drop every extent of `object_id`, returning the number of
-    /// physical bytes those extents occupied.
+    /// physical bytes those extents occupied, and quarantine the
+    /// physical blocks for reuse after the next checkpoint.
     ///
     /// The caller uses the return value to credit the per-Job quota,
     /// which — unlike the volume counter — cannot be re-derived from
@@ -2692,6 +2772,10 @@ impl<
                             u64::from(entry.extent.block_count)
                         };
                         blocks = blocks.saturating_add(count);
+                        // Hand the physical blocks back. Dropping the
+                        // slot alone is what made deletes never return
+                        // space to the volume.
+                        self.free_extent_range(entry.extent.physical_block, count);
                     }
                     self.extents[index] = None;
                 }
@@ -2820,6 +2904,89 @@ impl<
         next.max(2)
     }
 
+    /// Rebuild the reusable pool from the live extent table.
+    ///
+    /// Everything between the metadata floor and the high-water mark
+    /// that no live extent claims is free space: either a hole left by
+    /// a delete whose checkpoint landed, or a block leaked by a crash
+    /// between the free and the checkpoint. Deriving the pool from the
+    /// live extents rather than from a persisted free list means a
+    /// torn free list can never hand out a block that is still in use,
+    /// and it recovers leaked blocks for free.
+    ///
+    /// This is why reclaim needs no on-disk free-list format: the
+    /// truth is the extent table, and it is already checkpointed.
+    fn rebuild_free_space(&mut self) {
+        self.pending_free = [None; MAX_EXTENTS];
+        self.free_space = [None; MAX_EXTENTS];
+        let floor = self.reserved_block_floor();
+        let limit = self.metadata_region_start();
+        if limit <= floor {
+            return;
+        }
+        // Collect the live runs, sorted, then emit the gaps.
+        let mut live: [Option<FreeRange>; MAX_EXTENTS] = [None; MAX_EXTENTS];
+        let mut count = 0usize;
+        let mut index = 0usize;
+        while index < self.extents.len() {
+            if let Some(entry) = self.extents[index] {
+                if entry.extent.flags & EXTENT_FLAG_HOLE == 0 {
+                    let blocks = if entry.extent.flags & EXTENT_FLAG_MULTI_SLOT != 0 {
+                        1
+                    } else {
+                        u64::from(entry.extent.block_count)
+                    };
+                    if blocks != 0 && count < live.len() {
+                        live[count] = Some(FreeRange {
+                            start_block: entry.extent.physical_block,
+                            block_count: blocks,
+                        });
+                        count += 1;
+                    }
+                }
+            }
+            index += 1;
+        }
+        let mut i = 1usize;
+        while i < count {
+            let mut j = i;
+            while j > 0 {
+                let (prev, cur) = (live[j - 1], live[j]);
+                match (prev, cur) {
+                    (Some(a), Some(b)) if b.start_block < a.start_block => {
+                        live[j - 1] = Some(b);
+                        live[j] = Some(a);
+                    }
+                    _ => break,
+                }
+                j -= 1;
+            }
+            i += 1;
+        }
+        let mut cursor = floor;
+        let mut slot = 0usize;
+        while slot < count {
+            if let Some(range) = live[slot] {
+                if range.start_block > cursor {
+                    let gap = range.start_block - cursor;
+                    self.insert_free_range(FreeRange {
+                        start_block: cursor,
+                        block_count: gap,
+                    });
+                }
+                cursor = cursor.max(range.end_block());
+            }
+            slot += 1;
+        }
+        if limit > cursor {
+            self.insert_free_range(FreeRange {
+                start_block: cursor,
+                block_count: limit - cursor,
+            });
+        }
+        self.coalesce_free_space();
+    }
+
     fn compute_next_lba(&self) -> FixedResult<u64> {
         let mut max_lba = self.superblock.checkpoint_lba;
         max_lba = max_lba.max(self.system_volume.object_table_lba);
@@ -2926,19 +3093,299 @@ impl<
     /// construction. `block_generation` is the seam that makes this
     /// honest rather than accidental.
     fn reserve_data_blocks(&mut self, count: u64) -> FixedResult<(u64, u64)> {
+        if count == 0 {
+            return Err(HxfsError::OutOfRange);
+        }
+        // Reuse before extending. Without this the volume only ever
+        // grows and a create/delete service eventually fails with
+        // `NoSpace` on a filesystem that is actually empty.
+        if let Some(start) = self.take_free_blocks(count) {
+            return Ok((start, self.block_generation(start)));
+        }
         let start = self.next_lba;
-        let generation = self.block_generation(start);
         self.next_lba = self.next_lba.checked_add(count).ok_or(HxfsError::NoSpace)?;
-        Ok((start, generation))
+        Ok((start, self.block_generation(start)))
     }
 
     /// The generation to seal a freshly reserved block under.
     ///
-    /// A block that has never been handed out before is generation 0.
-    /// Once the allocator can return freed blocks, this consults the
-    /// per-block tenancy count instead, and the nonce changes with it.
+    /// This is the checkpoint sequence the block is being written
+    /// under, i.e. one past the sequence currently on disk, which is
+    /// exactly what `publish_checkpoint` will stamp.
+    ///
+    /// Correctness rests on the quarantine in `free_extent_range`: a
+    /// block cannot be freed and re-handed-out within one checkpoint,
+    /// so two tenancies of the same block always fall under different
+    /// sequence numbers, and (key, nonce) is never repeated. See
+    /// `docs/design/EXTENT_GENERATION_NONCE.md`.
     fn block_generation(&self, _physical_block: u64) -> u64 {
-        0
+        self.superblock.sequence_number.saturating_add(1).max(1)
+    }
+
+    /// Carve `count` blocks out of the reusable pool, if any run is
+    /// large enough. First fit, splitting the remainder back in.
+    fn take_free_blocks(&mut self, count: u64) -> Option<u64> {
+        let mut index = 0usize;
+        while index < self.free_space.len() {
+            if let Some(range) = self.free_space[index] {
+                if range.block_count >= count {
+                    let start = range.start_block;
+                    if range.block_count == count {
+                        self.free_space[index] = None;
+                    } else {
+                        self.free_space[index] = Some(FreeRange {
+                            start_block: start.saturating_add(count),
+                            block_count: range.block_count - count,
+                        });
+                    }
+                    return Some(start);
+                }
+            }
+            index += 1;
+        }
+        None
+    }
+
+    /// Quarantine a run of blocks released by the current transaction.
+    ///
+    /// Overflowing the quarantine is not an error: the blocks simply
+    /// stay allocated and are recovered by the free-space rebuild on
+    /// the next mount. Leaking space is recoverable, handing out a
+    /// block that is still referenced is not.
+    fn free_extent_range(&mut self, start_block: u64, block_count: u64) {
+        if block_count == 0 || start_block == 0 {
+            return;
+        }
+        // Never reclaim into the metadata region: those blocks are
+        // owned by the checkpoint/superblock layout, not by extents.
+        if start_block < self.reserved_block_floor() {
+            return;
+        }
+        if start_block.saturating_add(block_count) > self.metadata_region_start() {
+            return;
+        }
+        let mut index = 0usize;
+        while index < self.pending_free.len() {
+            if self.pending_free[index].is_none() {
+                self.pending_free[index] = Some(FreeRange {
+                    start_block,
+                    block_count,
+                });
+                return;
+            }
+            index += 1;
+        }
+    }
+
+    /// Quarantine `[start, end)` minus every block a live extent still
+    /// occupies.
+    ///
+    /// The retired checkpoint region is only *mostly* metadata: on a
+    /// volume seeded by `HxfsWriter` the data blocks of existing files
+    /// sit inside the same span, below the checkpoint. Freeing the
+    /// span wholesale handed those live blocks to the next write and
+    /// destroyed the file — the probe lost `/keep.bin` on cycle two.
+    /// So punch the live extents out of the range and quarantine only
+    /// the gaps.
+    fn free_retired_metadata(&mut self, start: u64, end: u64) {
+        let mut cursor = start;
+        // Walk the range in ascending order, skipping over each live
+        // extent that intersects it.
+        while cursor < end {
+            let mut next_live_start = end;
+            let mut next_live_end = end;
+            let mut index = 0usize;
+            while index < self.extents.len() {
+                if let Some(entry) = self.extents[index] {
+                    if entry.extent.flags & EXTENT_FLAG_HOLE == 0 {
+                        let blocks = if entry.extent.flags & EXTENT_FLAG_MULTI_SLOT != 0 {
+                            1
+                        } else {
+                            u64::from(entry.extent.block_count)
+                        };
+                        let live_start = entry.extent.physical_block;
+                        let live_end = live_start.saturating_add(blocks);
+                        if live_end > cursor && live_start < next_live_start && live_start < end {
+                            next_live_start = live_start.max(cursor);
+                            next_live_end = live_end;
+                        }
+                    }
+                }
+                index += 1;
+            }
+            if next_live_start > cursor {
+                self.free_extent_range(cursor, next_live_start - cursor);
+            }
+            cursor = if next_live_end > cursor {
+                next_live_end
+            } else {
+                cursor.saturating_add(1)
+            };
+        }
+    }
+
+    /// First block that extent data may occupy. Block 0 is the
+    /// superblock.
+    fn reserved_block_floor(&self) -> u64 {
+        1
+    }
+
+    /// First block of the contiguous metadata region, i.e. the
+    /// exclusive upper bound of the reclaimable area.
+    ///
+    /// `publish_checkpoint` lays every metadata structure out from
+    /// `target_start_lba` upwards -- object trees, the object/volume/
+    /// allocation/refcount/backref/quota trees and their leaves, the
+    /// Hxblob blocks, the checkpoint itself and the journal -- and
+    /// data extents always sit below it. Several of those structures
+    /// span a root plus a variable number of leaf blocks whose extent
+    /// is not recorded anywhere the mount path can see, so rather than
+    /// trying to enumerate them, reclaim stops at the lowest metadata
+    /// LBA we know about and never looks inside that region.
+    ///
+    /// Being conservative here costs at worst some unreclaimed blocks;
+    /// being wrong the other way hands a live metadata block to a data
+    /// write, which is silent corruption. An earlier draft derived the
+    /// pool from the gaps below `next_lba` and did exactly that: it
+    /// leased out the refcount/backref/quota blocks and broke an
+    /// encrypted round-trip test.
+    fn metadata_region_start(&self) -> u64 {
+        let mut ceiling = self.next_lba;
+        let mut lower = |lba: u64| {
+            if lba != 0 && lba < ceiling {
+                ceiling = lba;
+            }
+        };
+        lower(self.superblock.checkpoint_lba);
+        lower(self.superblock.backup_checkpoint_lba);
+        lower(self.superblock.journal_start_lba);
+        lower(self.system_volume.object_table_lba);
+        lower(self.checkpoint.volume_table_lba);
+        lower(self.checkpoint.allocation_tree_lba);
+        lower(self.checkpoint.refcount_tree_lba);
+        lower(self.checkpoint.backref_tree_lba);
+        lower(self.checkpoint.quota_tree_lba);
+        lower(self.checkpoint.encryption_policy_tree_lba);
+        lower(self.checkpoint.compression_policy_tree_lba);
+        lower(self.checkpoint.hxblob_index_tree_lba);
+        lower(self.checkpoint.hxblob_merkle_tree_lba);
+        lower(self.checkpoint.virtual_volume_tree_lba);
+        lower(self.checkpoint.gpt_summary_lba);
+        lower(self.checkpoint.install_manifest_lba);
+        let mut index = 0usize;
+        while index < self.objects.len() {
+            if let Some(object) = self.objects[index] {
+                let tree_lba = object.descriptor.tree_lba;
+                if tree_lba != 0 && tree_lba < ceiling {
+                    ceiling = tree_lba;
+                }
+            }
+            index += 1;
+        }
+        ceiling
+    }
+
+    /// Promote the quarantined blocks of a published checkpoint into
+    /// the reusable pool, coalescing adjacent runs.
+    ///
+    /// Called only from `publish_checkpoint`, after the new checkpoint
+    /// is durable: at that point no live extent references these
+    /// blocks on disk, and any future tenancy is stamped with a
+    /// strictly greater sequence number.
+    fn promote_pending_free(&mut self) {
+        let mut index = 0usize;
+        while index < self.pending_free.len() {
+            if let Some(range) = self.pending_free[index].take() {
+                self.insert_free_range(range);
+            }
+            index += 1;
+        }
+        self.coalesce_free_space();
+    }
+
+    /// Add one run to the reusable pool, dropping it if the pool is
+    /// full (see `free_extent_range` on why leaking is the safe way
+    /// to fail).
+    fn insert_free_range(&mut self, range: FreeRange) {
+        let mut index = 0usize;
+        while index < self.free_space.len() {
+            if self.free_space[index].is_none() {
+                self.free_space[index] = Some(range);
+                return;
+            }
+            index += 1;
+        }
+    }
+
+    /// Sort the pool by start block and merge touching runs, so that
+    /// repeated small frees still satisfy a later multi-block request.
+    fn coalesce_free_space(&mut self) {
+        let len = self.free_space.len();
+        // Compact the occupied slots to the front.
+        let mut write = 0usize;
+        let mut read = 0usize;
+        while read < len {
+            if let Some(range) = self.free_space[read] {
+                self.free_space[read] = None;
+                self.free_space[write] = Some(range);
+                write += 1;
+            }
+            read += 1;
+        }
+        // Insertion sort by start block; the pool is small and mostly
+        // ordered already.
+        let mut i = 1usize;
+        while i < write {
+            let mut j = i;
+            while j > 0 {
+                let (prev, cur) = (self.free_space[j - 1], self.free_space[j]);
+                match (prev, cur) {
+                    (Some(a), Some(b)) if b.start_block < a.start_block => {
+                        self.free_space[j - 1] = Some(b);
+                        self.free_space[j] = Some(a);
+                    }
+                    _ => break,
+                }
+                j -= 1;
+            }
+            i += 1;
+        }
+        // Merge adjacent runs.
+        let mut index = 0usize;
+        while index + 1 < write {
+            let merged = match (self.free_space[index], self.free_space[index + 1]) {
+                (Some(a), Some(b)) if a.end_block() == b.start_block => Some(FreeRange {
+                    start_block: a.start_block,
+                    block_count: a.block_count.saturating_add(b.block_count),
+                }),
+                _ => None,
+            };
+            if let Some(merged) = merged {
+                self.free_space[index] = Some(merged);
+                let mut shift = index + 1;
+                while shift + 1 < write {
+                    self.free_space[shift] = self.free_space[shift + 1];
+                    shift += 1;
+                }
+                self.free_space[shift] = None;
+                write -= 1;
+            } else {
+                index += 1;
+            }
+        }
+    }
+
+    /// Physical bytes currently sitting in the reusable pool.
+    pub fn reclaimable_physical_bytes(&self) -> u64 {
+        let mut blocks = 0u64;
+        let mut index = 0usize;
+        while index < self.free_space.len() {
+            if let Some(range) = self.free_space[index] {
+                blocks = blocks.saturating_add(range.block_count);
+            }
+            index += 1;
+        }
+        blocks.saturating_mul(BLOCK_SIZE_U64)
     }
 
     fn write_data_blocks(
@@ -3535,6 +3982,24 @@ impl<
     /// without the `crypto-aes-gcm` feature both halves are
     /// `None`/default; the wrapper falls through to the plain
     /// v5 builder.
+    /// Does any extent of `object_id` carry a non-zero generation?
+    ///
+    /// Such an object cannot be serialized as a v1 record without
+    /// losing the generation, and losing the generation makes the
+    /// extent undecryptable.
+    fn object_needs_generation(&self, object_id: u64) -> bool {
+        let mut index = 0usize;
+        while index < self.extents.len() {
+            if let Some(entry) = self.extents[index] {
+                if entry.object_id == object_id && entry.extent.generation != 0 {
+                    return true;
+                }
+            }
+            index += 1;
+        }
+        false
+    }
+
     fn build_extent_block(
         &mut self,
         object_id: u64,
@@ -3559,12 +4024,21 @@ impl<
         // outside any compression policy keep the v1 block type so
         // old-style volumes read exactly as before.
         let object = self.object(object_id)?.descriptor;
+        // The v2 record is also required to carry a non-zero
+        // generation: bytes [36..40) only exist in the 40-byte
+        // layout. Choosing the record purely on the compression
+        // policy silently dropped the generation of an encrypted
+        // volume that compresses nothing, so the block was sealed
+        // under generation N but read back under 0 and the AEAD tag
+        // check failed. Caught by
+        // `b1_b2_encrypted_volume_write_then_read_round_trip`.
         let v2 = crate::resolve_compression_for_object(
             &self.system_volume,
             &self.compression_policies,
             object,
         )
-        .is_some();
+        .is_some()
+            || self.object_needs_generation(object_id);
         let record_bytes = if v2 {
             EXTENT_RECORD_BYTES_V2
         } else {
@@ -4592,8 +5066,15 @@ mod tests {
 
     impl MemStore {
         fn from_image(image: &[u8]) -> Self {
+            Self::from_image_with_blocks(image, BLOCKS)
+        }
+
+        /// Same, but with an explicit device size. The churn tests
+        /// need a device big enough that hitting the end of it cannot
+        /// be mistaken for the allocator refusing to grow.
+        fn from_image_with_blocks(image: &[u8], blocks: usize) -> Self {
             let mut store = Self {
-                image: vec![0; BLOCK_SIZE * BLOCKS],
+                image: vec![0; BLOCK_SIZE * blocks],
                 flushes: 0,
             };
             store.image[..image.len()].copy_from_slice(image);
@@ -4630,6 +5111,244 @@ mod tests {
         fn flush(&mut self) -> Result<(), HxfsError> {
             self.flushes += 1;
             Ok(())
+        }
+    }
+
+    /// Churn a volume and assert the physical high-water mark stops
+    /// growing.
+    ///
+    /// This is the Scope D defect in one test: before reclaim, every
+    /// create/delete cycle leaked both the data block and the whole
+    /// copy-on-write metadata region, so a long-lived service hit
+    /// `NoSpace` on a filesystem that was actually empty.
+    #[test]
+    fn repeated_create_delete_stops_growing_the_volume() {
+        let Ok(mut seed) = HxfsWriter::new(INSTANCE, VOLUME) else {
+            assert!(false, "seed writer should initialize");
+            return;
+        };
+        assert!(seed.create_file("/keep.bin", b"keep").is_ok());
+        assert!(seed.commit().is_ok());
+        let store = MemStore::from_image_with_blocks(seed.image(), 4096);
+        let Ok(mut fs) = FixedHxfsWriter::<MemStore, 16, 32, 32>::mount(store) else {
+            assert!(false, "mount should succeed");
+            return;
+        };
+        let mut charged = Vec::new();
+        for i in 0..14u32 {
+            let name = alloc::format!("/churn{i}.bin");
+            let Ok(handle) = fs.create_file_path(&name) else {
+                assert!(false, "create should succeed on cycle {i}");
+                return;
+            };
+            if fs.write_file_at(handle, 0, &[0xABu8; BLOCK_SIZE]).is_err() {
+                assert!(false, "write should succeed on cycle {i}");
+                return;
+            }
+            if let Err(e) = fs.publish_checkpoint() {
+                assert!(false, "checkpoint should succeed on cycle {i}: {e:?}");
+                return;
+            }
+            if fs.unlink_path(&name).is_err() {
+                assert!(false, "unlink should succeed on cycle {i}");
+                return;
+            }
+            if let Err(e) = fs.publish_checkpoint() {
+                assert!(false, "checkpoint should succeed on cycle {i}: {e:?}");
+                return;
+            }
+            let Ok(bytes) = fs.charged_physical_bytes() else {
+                assert!(false, "charged bytes should be computable");
+                return;
+            };
+            charged.push(bytes);
+        }
+        // The volume reaches a steady state: the checkpoint region
+        // ping-pongs between reclaimed runs, so usage oscillates
+        // within a fixed band instead of climbing. Assert the band
+        // itself is bounded -- the last cycles must not exceed the
+        // peak of the early ones.
+        let early_peak = charged[..6].iter().copied().max().unwrap_or_default();
+        let late_peak = charged[6..].iter().copied().max().unwrap_or_default();
+        assert!(
+            late_peak <= early_peak,
+            "physical high-water kept growing across churn: {charged:?}"
+        );
+        // And the very last cycle must be nowhere near a monotonic
+        // append: 14 cycles of an append-only allocator would charge
+        // well past 3 MiB (measured before the fix).
+        assert!(
+            charged[13] < 1_000_000,
+            "volume still grows roughly linearly with churn: {charged:?}"
+        );
+    }
+
+    /// The blocks of a deleted file must actually come back, and the
+    /// file that was left alone must survive the reuse.
+    #[test]
+    fn deleted_blocks_are_handed_out_again_without_corrupting_live_data() {
+        let Ok(mut seed) = HxfsWriter::new(INSTANCE, VOLUME) else {
+            assert!(false, "seed writer should initialize");
+            return;
+        };
+        assert!(seed.create_file("/keep.bin", b"keep").is_ok());
+        assert!(seed.commit().is_ok());
+        let store = MemStore::from_image(seed.image());
+        let Ok(mut fs) = FixedHxfsWriter::<MemStore, 16, 32, 32>::mount(store) else {
+            assert!(false, "mount should succeed");
+            return;
+        };
+        let mut seen = Vec::new();
+        for i in 0..8u32 {
+            let name = alloc::format!("/reuse{i}.bin");
+            let Ok(handle) = fs.create_file_path(&name) else {
+                assert!(false, "create should succeed");
+                return;
+            };
+            if fs.write_file_at(handle, 0, &[0x5Au8; BLOCK_SIZE]).is_err() {
+                assert!(false, "write should succeed");
+                return;
+            }
+            // Track only the churn file's own block. Collecting every
+            // live extent would also pick up `/keep.bin` on every
+            // cycle and make "a block repeated" trivially true even
+            // with reclaim disabled.
+            let mut index = 0usize;
+            while index < fs.extents.len() {
+                if let Some(entry) = fs.extents[index] {
+                    if entry.object_id == handle.object_id
+                        && entry.extent.flags & EXTENT_FLAG_HOLE == 0
+                    {
+                        seen.push(entry.extent.physical_block);
+                    }
+                }
+                index += 1;
+            }
+            let _ = fs.publish_checkpoint();
+            let _ = fs.unlink_path(&name);
+            let _ = fs.publish_checkpoint();
+        }
+        // Some physical block must have been handed out more than
+        // once; an append-only allocator never repeats.
+        let mut repeated = false;
+        let mut i = 0usize;
+        while i < seen.len() && !repeated {
+            let mut j = i + 1;
+            while j < seen.len() {
+                if seen[i] == seen[j] {
+                    repeated = true;
+                    break;
+                }
+                j += 1;
+            }
+            i += 1;
+        }
+        assert!(repeated, "no physical block was ever reused: {seen:?}");
+
+        // And the untouched file still reads back correctly.
+        let store = fs.into_store();
+        let image: Vec<u8> = store.as_slice().to_vec();
+        let reader = SliceBlockReader::new(&image);
+        let Ok(mut ro) = Hxfs::mount(reader) else {
+            assert!(false, "read-only mount should succeed after churn");
+            return;
+        };
+        let Ok(kept) = ro.open_path("/keep.bin") else {
+            assert!(false, "the untouched file was destroyed by reuse");
+            return;
+        };
+        let mut out = [0u8; 8];
+        assert_eq!(ro.read_file(kept, &mut out), Ok(4));
+        assert_eq!(&out[..4], b"keep");
+    }
+
+    /// A block freed by the running transaction must not be reissued
+    /// before its checkpoint is durable.
+    ///
+    /// This is what keeps `generation = sequence + 1` sound: if one
+    /// checkpoint could both free and re-seal a block, both tenancies
+    /// would derive the same GCM nonce.
+    #[test]
+    fn freed_blocks_are_quarantined_until_the_checkpoint_lands() {
+        let Ok(mut seed) = HxfsWriter::new(INSTANCE, VOLUME) else {
+            assert!(false, "seed writer should initialize");
+            return;
+        };
+        assert!(seed.create_file("/keep.bin", b"keep").is_ok());
+        assert!(seed.commit().is_ok());
+        let store = MemStore::from_image(seed.image());
+        let Ok(mut fs) = FixedHxfsWriter::<MemStore, 16, 32, 32>::mount(store) else {
+            assert!(false, "mount should succeed");
+            return;
+        };
+        let Ok(handle) = fs.create_file_path("/doomed.bin") else {
+            assert!(false, "create should succeed");
+            return;
+        };
+        if fs.write_file_at(handle, 0, &[0x11u8; BLOCK_SIZE]).is_err() {
+            assert!(false, "write should succeed");
+            return;
+        }
+        let _ = fs.publish_checkpoint();
+        let before = fs.reclaimable_physical_bytes();
+        if fs.unlink_path("/doomed.bin").is_err() {
+            assert!(false, "unlink should succeed");
+            return;
+        }
+        assert_eq!(
+            fs.reclaimable_physical_bytes(),
+            before,
+            "a block freed by the open transaction must stay quarantined"
+        );
+        let _ = fs.publish_checkpoint();
+        assert!(
+            fs.reclaimable_physical_bytes() > before,
+            "the checkpoint is durable, so the block must now be reusable"
+        );
+    }
+
+    /// Reclaim must never lease out a block that a live extent still
+    /// occupies, even though those blocks sit inside the retired
+    /// checkpoint region.
+    #[test]
+    fn live_extents_are_excluded_from_the_retired_metadata_region() {
+        let Ok(mut seed) = HxfsWriter::new(INSTANCE, VOLUME) else {
+            assert!(false, "seed writer should initialize");
+            return;
+        };
+        assert!(seed.create_file("/a.bin", b"aaaa").is_ok());
+        assert!(seed.create_file("/b.bin", b"bbbb").is_ok());
+        assert!(seed.commit().is_ok());
+        let store = MemStore::from_image(seed.image());
+        let Ok(mut fs) = FixedHxfsWriter::<MemStore, 16, 32, 32>::mount(store) else {
+            assert!(false, "mount should succeed");
+            return;
+        };
+        let _ = fs.publish_checkpoint();
+        let _ = fs.publish_checkpoint();
+        // Every reusable run must be disjoint from every live extent.
+        let mut slot = 0usize;
+        while slot < fs.free_space.len() {
+            if let Some(range) = fs.free_space[slot] {
+                let mut index = 0usize;
+                while index < fs.extents.len() {
+                    if let Some(entry) = fs.extents[index] {
+                        if entry.extent.flags & EXTENT_FLAG_HOLE == 0 {
+                            let live_start = entry.extent.physical_block;
+                            let live_end =
+                                live_start.saturating_add(u64::from(entry.extent.block_count));
+                            let overlaps =
+                                range.start_block < live_end && live_start < range.end_block();
+                            assert!(
+                                !overlaps,
+                                "free run {range:?} overlaps live extent [{live_start},{live_end})"
+                            );
+                        }
+                    }
+                    index += 1;
+                }
+            }
+            slot += 1;
         }
     }
 

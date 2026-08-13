@@ -1,6 +1,6 @@
 # Extent generations: making a reclaimed block safe to re-encrypt
 
-Status: in progress (Scope D, step 1 of 3).
+Status: complete (Scope D). Generation-bound nonces plus block reclaim.
 
 ## The problem this solves
 
@@ -49,9 +49,12 @@ Reusing a freed LBA would encrypt different plaintext under the *same*
 So the reclaim work cannot start with the allocator. It has to start
 by making the nonce unique across reuses.
 
-Metadata is unaffected: it uses AES-XTS (`crypto.rs`), which is
-tweak-based and designed for a sector to be rewritten in place.
-Only data extents (`extent_crypto.rs`) are at risk.
+Metadata is **not** exempt. There are two metadata paths, and only one
+of them is XTS: `crypto.rs` is tweak-based and safe to rewrite in
+place, but `encrypted_metadata.rs` is GCM with a nonce derived from the
+LBA, exactly like the extent path. Both GCM callers therefore take a
+generation. Metadata blocks source it from `BlockHeader.generation`,
+which the header CRC already covers.
 
 ## The fix: an explicit generation counter
 
@@ -146,15 +149,56 @@ Forward compatibility is not claimed: a volume that has reused a block
 the intended direction — an old reader must not silently accept a
 reused block.
 
+## How reclaim uses this
+
+The allocator recycles blocks in two places, and both are bounded by
+the same rule: a block freed by the transaction now being built is
+*quarantined*, not reused, until the checkpoint that dropped its last
+reference is durable.
+
+- `clear_extents` quarantines the data blocks of a deleted or
+  rewritten object.
+- `publish_checkpoint` quarantines the metadata region it just
+  superseded. The checkpoint is copy-on-write and rewrites that whole
+  region every time, so on a churning volume it, not the file data,
+  dominates growth. It stays claimed for one further checkpoint
+  because `backup_checkpoint_lba` still points at it; quarantining it
+  means it is released exactly when it stops being the rollback
+  target, so the format's one-checkpoint retention is unchanged.
+
+`publish_checkpoint` then places the *new* metadata region in a
+reclaimed run when one is large enough, and only extends the volume
+when none is. Without that the high-water mark still climbed linearly
+even though data blocks were being recycled.
+
+The generation of a newly issued block is `sequence_number + 1`: the
+checkpoint it is being written under. The quarantine is what makes
+that sound. A block cannot be freed and re-issued inside one
+checkpoint, so two tenancies of a block always fall under different
+sequence numbers and (key, nonce) never repeats.
+
+Two invariants the reclaim path must respect, both learned from tests
+that caught the violation:
+
+- The retired metadata region can contain live data extents (a volume
+  seeded by `HxfsWriter` puts file data below the checkpoint). Live
+  extents are punched out of the range before it is quarantined;
+  freeing it wholesale destroyed an untouched file.
+- A non-zero generation forces the 40-byte v2 extent record, since
+  bytes `[36..40)` do not exist in the v1 layout. Selecting the record
+  on the compression policy alone silently dropped the generation of
+  an encrypted volume that compresses nothing, and the block then
+  failed its tag check on read.
+
+Free space is **not** persisted as a free list. It is rebuilt at mount
+from the live extent table: everything below the metadata region that
+no live extent claims is free. A torn free list can therefore never
+hand out a block that is still in use, and blocks leaked by a crash
+between a free and its checkpoint are recovered automatically.
+
 ## Scope boundary
 
-This document covers step 1: the generation reaches the crypto layer
-and is persisted. Steps 2 and 3 (reading the allocation tree at mount,
-freeing blocks on unlink/rewrite, and the reclaim tests) build on it
-and are described in the Scope D plan.
-
-Until step 2 lands, every generation is 0 and behaviour is byte-for-
-byte identical to today. The regression tests for this step therefore
-assert both halves: that generation 0 reproduces the current
-ciphertext, and that bumping the generation changes the nonce, the
-tag, and the ciphertext for identical plaintext at the same LBA.
+Snapshot-deletion reclaim (gate item 6) is still open: snapshots pin
+extents through a separate refcount path that this work does not
+touch. Freeing a snapshotted block would need the refcount tree
+consulted before quarantine, and is deliberately left out.
