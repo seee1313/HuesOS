@@ -111,6 +111,11 @@ pub struct Controller<T: NvmeTransport> {
     page_size: u32,
     doorbell_stride: u32,
     dma_next: u64,
+    /// Base of the DMA window. `dma_next` is a bump pointer, so a
+    /// controller reset must rewind to this before re-running init;
+    /// otherwise every reset permanently consumes the pool and the
+    /// third or fourth one fails with `OutOfDma`.
+    dma_base: u64,
     dma_end: u64,
     dma_valid: bool,
     // Admin queue.
@@ -150,6 +155,8 @@ pub struct Controller<T: NvmeTransport> {
     // Capabilities (validated during init).
     mdts: u32,
     max_queue_size: u16,
+    /// Config of the last successful init, replayed by `reset()`.
+    last_config: Option<ControllerConfig>,
 }
 
 impl<T: NvmeTransport> Controller<T> {
@@ -165,6 +172,7 @@ impl<T: NvmeTransport> Controller<T> {
             page_size: 4096,
             doorbell_stride: 4,
             dma_next: dma_base,
+            dma_base,
             dma_end,
             dma_valid,
             admin_sq: 0,
@@ -193,6 +201,7 @@ impl<T: NvmeTransport> Controller<T> {
             io_prp_list_count: 0,
             mdts: 0,
             max_queue_size: 0,
+            last_config: None,
         }
     }
 
@@ -351,6 +360,33 @@ impl<T: NvmeTransport> Controller<T> {
         }
     }
 
+    /// Reset the controller and rebuild admin/I/O queues from scratch.
+    ///
+    /// This is the recovery half of the timeout path: a command that
+    /// never completes leaves the controller with queues the host can
+    /// no longer reason about (the device may still complete the
+    /// command later and write into a slot the host has reused), so
+    /// the only safe move is CC.EN=0 followed by a full
+    /// re-initialization.
+    ///
+    /// Queue state is rebuilt rather than reused: doorbells, phase
+    /// bits and command ids all restart from zero on the device side,
+    /// so keeping the host-side copies would desynchronize the two.
+    ///
+    /// Replays the configuration of the last successful init, so a
+    /// controller brought up with multiple I/O queues comes back with
+    /// the same shape. Returns `NotReady` if the controller was never
+    /// initialized.
+    pub fn reset(&mut self) -> Result<ControllerInitInfo, NvmeError> {
+        let config = self.last_config.ok_or(NvmeError::NotReady)?;
+        let capv = self.t.read64(off::CAP);
+        // Best-effort disable. A controller that is already wedged may
+        // never clear CSTS.RDY; that is not a reason to skip the
+        // re-init attempt, since CC.EN=0 has still been written.
+        let _ = self.disable_controller(capv);
+        self.init_with_config(config)
+    }
+
     /// Initialize the controller with a conservative single-queue polling plan.
     pub fn init(&mut self) -> Result<(), NvmeError> {
         self.init_with_config(ControllerConfig::single_queue_polling())
@@ -364,6 +400,26 @@ impl<T: NvmeTransport> Controller<T> {
         &mut self,
         config: ControllerConfig,
     ) -> Result<ControllerInitInfo, NvmeError> {
+        // Init allocates every queue and buffer from the DMA bump
+        // allocator. Re-running it after a reset must start from the
+        // same base, or each recovery would leak the whole previous
+        // set of queues and the pool would run dry.
+        self.dma_next = self.dma_base;
+        self.last_config = Some(config);
+        // Host-side queue state must match a freshly enabled
+        // controller, since CC.EN=0 makes the device restart its
+        // doorbells, phase bits and command ids from zero. Doing this
+        // here rather than in `reset()` keeps one definition of "a
+        // just-initialized controller" for both the first bring-up
+        // and every recovery.
+        self.admin_sq_tail = 0;
+        self.admin_cq_head = 0;
+        self.admin_cq_phase = true;
+        self.io_sq_tail = 0;
+        self.io_cq_head = 0;
+        self.io_cq_phase = true;
+        self.cid = 0;
+        self.io_queue_count = 0;
         let capv = self.t.read64(off::CAP);
         self.page_size = cap::min_page_size(capv) as u32;
         self.doorbell_stride = cap::doorbell_stride_bytes(capv);
@@ -788,6 +844,61 @@ mod tests {
         assert!(c.init().is_ok());
         assert_eq!(c.namespace_size(), 1024);
         assert_eq!(c.lba_size(), 512);
+    }
+
+    /// A reset must leave the controller usable again.
+    #[test]
+    fn reset_rebuilds_the_controller_and_io_keeps_working() {
+        let mock = MockNvme::new(1 << 20, 1024, 9);
+        let mut c = Controller::new(mock, 0, 1 << 20);
+        assert!(c.init().is_ok());
+        let data = [0x5Au8; 512];
+        assert!(c.write(0, 1, &data).is_ok());
+
+        assert!(c.reset().is_ok(), "reset must bring the controller back");
+
+        // Namespace geometry must be re-identified, not stale.
+        assert_eq!(c.namespace_size(), 1024);
+        assert_eq!(c.lba_size(), 512);
+        // And I/O must work against the rebuilt queues.
+        let mut read = [0u8; 512];
+        assert!(c.read(0, 1, &mut read).is_ok());
+        assert_eq!(read, data, "data written before the reset must survive");
+    }
+
+    /// Resets must not leak the DMA pool.
+    ///
+    /// Queues and buffers come from a bump allocator, so re-running
+    /// init without rewinding it consumes the window a few resets in
+    /// and recovery starts failing with `OutOfDma` — exactly when the
+    /// device is already misbehaving and recovery matters most.
+    #[test]
+    fn repeated_resets_do_not_exhaust_the_dma_pool() {
+        let mock = MockNvme::new(1 << 20, 1024, 9);
+        let mut c = Controller::new(mock, 0, 1 << 20);
+        assert!(c.init().is_ok());
+        let after_first_init = c.dma_next;
+        let mut round = 0u32;
+        while round < 32 {
+            let outcome = c.reset();
+            assert!(outcome.is_ok(), "reset {round} failed: {outcome:?}");
+            assert_eq!(
+                c.dma_next, after_first_init,
+                "reset {round} did not rewind the DMA bump pointer"
+            );
+            round += 1;
+        }
+        let mut read = [0u8; 512];
+        assert!(c.read(0, 1, &mut read).is_ok(), "I/O after 32 resets");
+    }
+
+    /// Resetting a controller that was never initialized is a
+    /// programming error, not a silent no-op.
+    #[test]
+    fn reset_before_init_is_rejected() {
+        let mock = MockNvme::new(1 << 20, 1024, 9);
+        let mut c = Controller::new(mock, 0, 1 << 20);
+        assert_eq!(c.reset().err(), Some(NvmeError::NotReady));
     }
 
     #[test]

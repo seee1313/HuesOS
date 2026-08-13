@@ -358,6 +358,62 @@ mod tests {
 
     const VOLUME: Uuid = [1; 16];
 
+    /// Writable mmap is refused by decision, not by omission.
+    ///
+    /// See `docs/design/ADR_WRITABLE_MMAP.md`. A writable mapping
+    /// would make the MMU a second writer into the same extents as
+    /// `write_file_at`, with its own ordering against the checkpoint.
+    /// If someone ever makes this return `ReadOnlySnapshot`, they have
+    /// to come back and change the ADR too.
+    #[test]
+    fn writable_mmap_is_refused_by_policy() {
+        let request = MmapRequest {
+            offset: 0,
+            length: BLOCK_SIZE_U64,
+            writable: true,
+            encrypted: false,
+            compressed: false,
+        };
+        assert_eq!(decide_mmap(request), Ok(MmapDecision::DenyWritable));
+    }
+
+    /// An encrypted or compressed extent has no on-disk byte image a
+    /// mapping could expose, so it is refused before writability is
+    /// even considered.
+    #[test]
+    fn transformed_extents_cannot_be_mapped_at_all() {
+        let encrypted = MmapRequest {
+            offset: 0,
+            length: BLOCK_SIZE_U64,
+            writable: false,
+            encrypted: true,
+            compressed: false,
+        };
+        assert_eq!(decide_mmap(encrypted), Ok(MmapDecision::DenyTransformed));
+        let compressed = MmapRequest {
+            offset: 0,
+            length: BLOCK_SIZE_U64,
+            writable: false,
+            encrypted: false,
+            compressed: true,
+        };
+        assert_eq!(decide_mmap(compressed), Ok(MmapDecision::DenyTransformed));
+    }
+
+    /// Read-only mappings of plain files stay available: the ADR
+    /// narrows mmap, it does not remove it.
+    #[test]
+    fn read_only_mmap_of_a_plain_file_is_allowed() {
+        let request = MmapRequest {
+            offset: 0,
+            length: BLOCK_SIZE_U64,
+            writable: false,
+            encrypted: false,
+            compressed: false,
+        };
+        assert_eq!(decide_mmap(request), Ok(MmapDecision::ReadOnlySnapshot));
+    }
+
     fn key(block: u64) -> CacheKey {
         CacheKey {
             volume_uuid: VOLUME,

@@ -45,6 +45,15 @@ pub const MAX_QUOTA_RECORDS: usize = 16;
 /// mount; persisting the marker on disk is a Stage C+ item.
 pub const MAX_BAD_EXTENTS: usize = 16;
 
+/// Decoded pages the mounted writer caches.
+///
+/// 256 * 4 KiB = 1 MiB, held inline in the mount. The service's user
+/// heap is 18 MiB and the mount is already boxed, so this is the
+/// largest cache that leaves comfortable headroom for request
+/// buffers; the host-side `PageCache` default of 16 MiB would not
+/// fit at all. Raising it is a heap-budget decision, not a free win.
+pub const PAGE_CACHE_SLOTS: usize = 256;
+
 /// Stage C: report-only live scrub summary.
 ///
 /// The scrub walks every live object: it re-validates each
@@ -237,6 +246,26 @@ pub struct FixedHxfsWriter<
     /// nonce from the same sequence number) and would leave a crash
     /// before the checkpoint with the block claimed by two extents at
     /// once.
+    /// Volume identity used as the page-cache key namespace.
+    ///
+    /// Derived from the superblock instance UUID at mount so the
+    /// cache key survives remount of a *different* volume through
+    /// the same service without aliasing.
+    cache_volume_id: u64,
+    /// Decoded-page cache for the read path.
+    ///
+    /// The service mounts through `FixedHxfsWriter`, so without this
+    /// every read went to the device and paid decrypt+decompress
+    /// again, even for a block just read. `Hxfs` (the read-only
+    /// reader) had a cache; the writer, which is what production
+    /// actually runs, did not.
+    ///
+    /// Boxed, not inline: 256 pages is 1 MiB, and the mount is
+    /// constructed by value before being boxed by the caller, so an
+    /// inline array of that size blows the 2 MiB test/thread stack on
+    /// the way in. One allocation at mount keeps the property that
+    /// actually matters -- zero allocation on the I/O path.
+    page_cache: alloc::boxed::Box<crate::page_cache::FixedPageCache<PAGE_CACHE_SLOTS>>,
     pending_free: [Option<FreeRange>; MAX_EXTENTS],
     /// Blocks that survived quarantine and may be allocated again.
     free_space: [Option<FreeRange>; MAX_EXTENTS],
@@ -382,6 +411,8 @@ impl<
             extents: [const { None }; MAX_EXTENTS],
             next_object_id: 1,
             next_lba: 1,
+            cache_volume_id: crate::page_cache::volume_id_of(&superblock.instance_uuid),
+            page_cache: alloc::boxed::Box::new(crate::page_cache::FixedPageCache::new()),
             pending_free: [None; MAX_EXTENTS],
             free_space: [None; MAX_EXTENTS],
             dirty: false,
@@ -844,6 +875,103 @@ impl<
             offset += n;
         }
         Ok(out)
+    }
+
+    /// Content hash of `data` under the volume's blob-hash function.
+    ///
+    /// Exposed so callers that need the identity of a payload (for
+    /// example to answer "this blob already exists" with a handle
+    /// rather than an error) do not have to carry a second copy of
+    /// the hash function and risk it drifting from this one.
+    #[cfg(feature = "hxblob")]
+    pub fn content_hash(&self, data: &[u8]) -> BlobHash {
+        sha256(data)
+    }
+
+    /// Metadata for a stored blob: its object id and byte length.
+    ///
+    /// Lets a caller size a read without materialising the payload,
+    /// which `get_blob` must do because it returns an owned `Vec`.
+    /// The native BlobView protocol path needs the size before it can
+    /// answer `GetInfo` or bound a ranged read.
+    #[cfg(feature = "hxblob")]
+    pub fn blob_info(&self, hash: &BlobHash) -> FixedResult<(u64, u64)> {
+        let record = self
+            .hxblob_index
+            .lookup(hash)
+            .map_err(|_| HxfsError::NotFound)?;
+        Ok((record.object_id, record.size))
+    }
+
+    /// Read a byte range of a blob into `out`, returning the number of
+    /// bytes copied (short at end-of-blob, zero past the end).
+    ///
+    /// This is the read path behind a BlobView handle. It deliberately
+    /// does not go through `get_blob`: a package-sized blob would be
+    /// copied into a heap `Vec` on every request, which on an 18 MiB
+    /// user heap is how the service dies serving a large package.
+    #[cfg(feature = "hxblob")]
+    pub fn read_blob_at(
+        &mut self,
+        hash: &BlobHash,
+        offset: u64,
+        out: &mut [u8],
+    ) -> FixedResult<usize> {
+        let record = self
+            .hxblob_index
+            .lookup(hash)
+            .map_err(|_| HxfsError::NotFound)?;
+        if offset >= record.size {
+            return Ok(0);
+        }
+        let name = hex_encode(hash);
+        let blob_dir = self.blob_shard_directory(hash)?;
+        let file = self
+            .open_child_file(blob_dir, &name)
+            .map_err(|_| HxfsError::NotFound)?;
+        let remaining = record.size - offset;
+        let count = out.len().min(remaining as usize);
+        let mut copied = 0usize;
+        while copied < count {
+            let chunk = (count - copied).min(BLOCK_SIZE);
+            let n = self.read_file_at(
+                file,
+                offset + copied as u64,
+                &mut out[copied..copied + chunk],
+            )?;
+            if n == 0 {
+                break;
+            }
+            copied += n;
+        }
+        Ok(copied)
+    }
+
+    /// Verify a blob against its content hash by re-reading it.
+    ///
+    /// Hxblob objects are content-addressed, so the hash is not just a
+    /// name: it is a checksum the volume promises. Re-hashing on
+    /// demand is what turns "the extent decrypted" into "these are the
+    /// bytes that were stored". Used by the native open path and by
+    /// scrub.
+    #[cfg(feature = "hxblob")]
+    pub fn verify_blob(&mut self, hash: &BlobHash) -> FixedResult<bool> {
+        use sha2::{Digest, Sha256};
+        let (_, size) = self.blob_info(hash)?;
+        let mut hasher = Sha256::new();
+        let mut buf = [0u8; BLOCK_SIZE];
+        let mut offset = 0u64;
+        while offset < size {
+            let want = ((size - offset) as usize).min(BLOCK_SIZE);
+            let n = self.read_blob_at(hash, offset, &mut buf[..want])?;
+            if n == 0 {
+                return Ok(false);
+            }
+            hasher.update(&buf[..n]);
+            offset += n as u64;
+        }
+        let digest = hasher.finalize();
+        Ok(digest.as_slice() == hash.as_slice())
     }
 
     /// Stage F: list all Hxblob content hashes.
@@ -3152,10 +3280,39 @@ impl<
     /// stay allocated and are recovered by the free-space rebuild on
     /// the next mount. Leaking space is recoverable, handing out a
     /// block that is still referenced is not.
+    /// Drop cached pages for the physical range `[start, end)`.
+    ///
+    /// Every path that changes what a physical block holds must go
+    /// through here. A page cache that misses one such path does not
+    /// merely serve stale data: after a block is freed and handed to
+    /// another file it serves the *previous file's* plaintext, which
+    /// is a confidentiality bug, not a performance bug.
+    /// Page-cache hit/miss counters since mount.
+    ///
+    /// Exposed so the service can print them in its telemetry line
+    /// and so the soak harness can assert the cache is actually being
+    /// hit -- a cache nobody can observe is a cache nobody can prove
+    /// works.
+    pub fn page_cache_stats(&self) -> (u64, u64) {
+        (self.page_cache.hits(), self.page_cache.misses())
+    }
+
+    /// Number of pages the mounted cache can hold.
+    pub fn page_cache_capacity(&self) -> usize {
+        self.page_cache.capacity()
+    }
+
+    fn invalidate_cached_range(&mut self, start: u64, end: u64) {
+        self.page_cache.invalidate_range(start, end);
+    }
+
     fn free_extent_range(&mut self, start_block: u64, block_count: u64) {
         if block_count == 0 || start_block == 0 {
             return;
         }
+        // Freed blocks may be re-handed out to a different object;
+        // their cached plaintext must not survive the free.
+        self.invalidate_cached_range(start_block, start_block.saturating_add(block_count));
         // Never reclaim into the metadata region: those blocks are
         // owned by the checkpoint/superblock layout, not by extents.
         if start_block < self.reserved_block_floor() {
@@ -3493,6 +3650,8 @@ impl<
             .map_err(|_| HxfsError::BadBlock)?;
             self.store.write_blocks(start, 1, &slot0)?;
             self.store.write_blocks(start + 1, 1, &slot1)?;
+            // The blocks just changed underneath any cached page.
+            self.invalidate_cached_range(start, start + 2);
             return Ok((start, generation, ExtentWriteKind::MultiSlot));
         }
         // Stage B.3 wire: when the volume is encrypted,
@@ -3536,6 +3695,8 @@ impl<
             block
         };
         self.store.write_blocks(start, 1, &block)?;
+        // The block just changed underneath any cached page.
+        self.invalidate_cached_range(start, start + 1);
         let kind = match compression {
             Some(meta) => ExtentWriteKind::Compressed(meta),
             None => ExtentWriteKind::Plain,
@@ -3641,58 +3802,25 @@ impl<
             // Two-slot extents are an encrypted-volume concept.
             return Err(HxfsError::BadTree);
         }
-        let mut scratch = [0u8; BLOCK_SIZE];
-        let mut decrypted = [0u8; BLOCK_SIZE];
-        let mut decompressed = [0u8; BLOCK_SIZE];
+        // Whole-object read goes through the same per-block path as the
+        // range read, so both share one decode path and one cache.
+        // Duplicating the decrypt/decompress logic here is what let
+        // the whole-file path bypass the page cache entirely.
+        let mut block = [0u8; BLOCK_SIZE];
         let mut copied = start;
         while copied < copy_end {
             let logical_delta = copied - start;
-            let extent_block = logical_delta / BLOCK_SIZE;
+            let extent_block = (logical_delta / BLOCK_SIZE) as u64;
             let within = logical_delta % BLOCK_SIZE;
-            self.store
-                .read_blocks(extent.physical_block + extent_block as u64, 1, &mut scratch)?;
-            // Stage B.3 wire + completion: decrypt the envelope
-            // when the volume is encrypted, then decompress the
-            // payload when the record carries a compression
-            // descriptor (CRC-verified). A bad AEAD tag or a
-            // payload CRC mismatch surfaces as `HxfsError::Compression`
-            // and the extent is marked bad (Stage C) so a retry
-            // does not re-read the same bytes.
-            let plain: &[u8] = match self.decrypt_extent_block_if_encrypted(
-                extent.physical_block + extent_block as u64,
-                extent.generation,
-                &scratch,
-                &mut decrypted,
-            ) {
-                Ok(plain) => plain,
+            match self.read_extent_block(extent, compression, extent_block, &mut block) {
+                Ok(()) => {}
                 Err(error) => {
-                    self.mark_bad_extent(extent.physical_block + extent_block as u64);
+                    self.mark_bad_extent(extent.physical_block + extent_block);
                     return Err(error);
                 }
-            };
-            let block_slice: &[u8] = if let Some(meta) = compression {
-                let payload = &plain[..meta.compressed_bytes as usize];
-                let descriptor = crate::compression::CompressedExtent {
-                    logical_block: extent.logical_block,
-                    physical_block: extent.physical_block,
-                    uncompressed_bytes: BLOCK_SIZE as u32,
-                    compressed_bytes: meta.compressed_bytes,
-                    algorithm: meta.algorithm,
-                    payload_crc32c: meta.payload_crc32c,
-                };
-                match crate::compression::decompress_block(&descriptor, payload, &mut decompressed)
-                {
-                    Ok(()) => &decompressed[..],
-                    Err(_) => {
-                        self.mark_bad_extent(extent.physical_block + extent_block as u64);
-                        return Err(HxfsError::Compression);
-                    }
-                }
-            } else {
-                plain
-            };
+            }
             let chunk = (copy_end - copied).min(BLOCK_SIZE - within);
-            out[copied..copied + chunk].copy_from_slice(&block_slice[within..within + chunk]);
+            out[copied..copied + chunk].copy_from_slice(&block[within..within + chunk]);
             copied += chunk;
         }
         Ok(())
@@ -3710,6 +3838,18 @@ impl<
         block_offset: u64,
         out: &mut [u8; BLOCK_SIZE],
     ) -> FixedResult<()> {
+        // Cache lookup before any device access. The key is the
+        // physical block actually read, not the logical one, so a
+        // block that gets reallocated to another file cannot be
+        // served from a stale slot as long as invalidation runs on
+        // free (see `invalidate_cached_extent`).
+        let cache_block = extent.physical_block + block_offset;
+        if self
+            .page_cache
+            .lookup(self.cache_volume_id, cache_block, 0, out)
+        {
+            return Ok(());
+        }
         // Two-slot extent: one logical block spans two encrypted
         // envelopes (`EXTENT_FLAG_MULTI_SLOT`, `block_count = 2`).
         // The single-slot path below would silently return only
@@ -3750,6 +3890,8 @@ impl<
             out[..crate::extent_crypto::EXTENT_PLAINTEXT_BYTES]
                 .copy_from_slice(&plain0[..crate::extent_crypto::EXTENT_PLAINTEXT_BYTES]);
             out[crate::extent_crypto::EXTENT_PLAINTEXT_BYTES..].copy_from_slice(&plain1[..tail]);
+            self.page_cache
+                .insert(self.cache_volume_id, cache_block, 0, out);
             return Ok(());
         }
         #[cfg(not(feature = "crypto-aes-gcm"))]
@@ -3784,6 +3926,8 @@ impl<
         } else {
             out.copy_from_slice(plain);
         }
+        self.page_cache
+            .insert(self.cache_volume_id, cache_block, 0, out);
         Ok(())
     }
 
@@ -5185,6 +5329,177 @@ mod tests {
 
     /// The blocks of a deleted file must actually come back, and the
     /// file that was left alone must survive the reuse.
+    #[test]
+    fn repeated_reads_of_one_file_are_served_from_the_page_cache() {
+        let Ok(mut seed) = HxfsWriter::new(INSTANCE, VOLUME) else {
+            assert!(false, "seed writer should initialize");
+            return;
+        };
+        assert!(seed.create_file("/cached.bin", b"cache-me").is_ok());
+        assert!(seed.commit().is_ok());
+        let store = MemStore::from_image(seed.image());
+        let Ok(mut fs) = FixedHxfsWriter::<MemStore, 16, 32, 32>::mount(store) else {
+            assert!(false, "mount should succeed");
+            return;
+        };
+        let Ok(handle) = fs.open_path("/cached.bin") else {
+            assert!(false, "open should succeed");
+            return;
+        };
+        let mut out = [0u8; 8];
+        assert!(fs.read_file_at(handle, 0, &mut out).is_ok());
+        let (hits_after_first, misses_after_first) = fs.page_cache_stats();
+        assert_eq!(hits_after_first, 0, "first read cannot hit an empty cache");
+        assert!(misses_after_first > 0, "first read must record a miss");
+        for _ in 0..4 {
+            assert!(fs.read_file_at(handle, 0, &mut out).is_ok());
+            assert_eq!(&out, b"cache-me");
+        }
+        let (hits, misses) = fs.page_cache_stats();
+        assert!(hits >= 4, "repeat reads should hit: hits={hits}");
+        assert_eq!(
+            misses, misses_after_first,
+            "repeat reads must not go back to the device"
+        );
+    }
+
+    #[test]
+    fn overwriting_a_block_invalidates_its_cached_page() {
+        let Ok(mut seed) = HxfsWriter::new(INSTANCE, VOLUME) else {
+            assert!(false, "seed writer should initialize");
+            return;
+        };
+        assert!(seed.create_file("/rw.bin", b"first-content").is_ok());
+        assert!(seed.commit().is_ok());
+        let store = MemStore::from_image(seed.image());
+        let Ok(mut fs) = FixedHxfsWriter::<MemStore, 16, 32, 32>::mount(store) else {
+            assert!(false, "mount should succeed");
+            return;
+        };
+        let Ok(handle) = fs.open_path("/rw.bin") else {
+            assert!(false, "open should succeed");
+            return;
+        };
+        let mut out = [0u8; 13];
+        assert!(fs.read_file_at(handle, 0, &mut out).is_ok());
+        assert_eq!(&out, b"first-content");
+        // Read-after-write correctness across checkpoints.
+        //
+        // Note this test does NOT fail if invalidation is removed:
+        // copy-on-write hands each overwrite a fresh physical block,
+        // and the extent record follows it, so the read never asks
+        // for the stale key. The invalidation guarantee itself is
+        // pinned by
+        // `a_recycled_block_never_serves_the_previous_tenants_bytes`,
+        // which was verified to fail with invalidation disabled.
+        // This test guards the ordinary path: overwrite, publish,
+        // read back.
+        if fs.write_file_at(handle, 0, b"second-conten").is_err() {
+            assert!(false, "overwrite should succeed");
+            return;
+        }
+        // Publish, so the pre-overwrite block is retired into the
+        // free pool. hxfs is copy-on-write: without a checkpoint the
+        // overwrite lands on a fresh block and the stale cached page
+        // is never consulted, which would make this test pass even
+        // with invalidation removed.
+        if fs.publish_checkpoint().is_err() {
+            assert!(false, "checkpoint should succeed");
+            return;
+        }
+        let mut after = [0u8; 13];
+        assert!(fs.read_file_at(handle, 0, &mut after).is_ok());
+        assert_eq!(
+            &after, b"second-conten",
+            "read after write must not be served from a stale cached page"
+        );
+        // Second cycle. The first overwrite retired the original
+        // block into the pool, so this write is handed that block
+        // back -- the same physical block whose *first* contents are
+        // still in the cache from the very first read. This is the
+        // case that actually exercises invalidation.
+        if fs.write_file_at(handle, 0, b"third-content").is_err() {
+            assert!(false, "second overwrite should succeed");
+            return;
+        }
+        if fs.publish_checkpoint().is_err() {
+            assert!(false, "checkpoint should succeed");
+            return;
+        }
+        let mut third = [0u8; 13];
+        assert!(fs.read_file_at(handle, 0, &mut third).is_ok());
+        assert_eq!(
+            &third, b"third-content",
+            "a rewritten block must not serve its earlier cached contents"
+        );
+    }
+
+    #[test]
+    fn a_recycled_block_never_serves_the_previous_tenants_bytes() {
+        let Ok(mut seed) = HxfsWriter::new(INSTANCE, VOLUME) else {
+            assert!(false, "seed writer should initialize");
+            return;
+        };
+        assert!(seed.create_file("/keep.bin", b"keep").is_ok());
+        assert!(seed.commit().is_ok());
+        let store = MemStore::from_image(seed.image());
+        let Ok(mut fs) = FixedHxfsWriter::<MemStore, 16, 32, 32>::mount(store) else {
+            assert!(false, "mount should succeed");
+            return;
+        };
+        // Churn: create a file, read it (populating the cache),
+        // delete it, then create another. Reclaim hands the freed
+        // block back out, so the new file lands on a block whose
+        // plaintext the cache may still hold. Leaking it across the
+        // free would be a confidentiality bug.
+        let mut leaked = false;
+        for i in 0..6u32 {
+            let victim = alloc::format!("/secret{i}.bin");
+            let Ok(handle) = fs.create_file_path(&victim) else {
+                assert!(false, "create should succeed");
+                return;
+            };
+            let secret = [0xA5u8; 64];
+            if fs.write_file_at(handle, 0, &secret).is_err() {
+                assert!(false, "write should succeed");
+                return;
+            }
+            let mut sink = [0u8; 64];
+            assert!(fs.read_file_at(handle, 0, &mut sink).is_ok());
+            assert_eq!(sink, secret);
+            if fs.unlink_path(&victim).is_err() {
+                assert!(false, "unlink should succeed");
+                return;
+            }
+            // Publish so the unlinked file's blocks leave quarantine
+            // and re-enter the allocation pool; that is the only way
+            // the successor can land on the victim's block.
+            if fs.publish_checkpoint().is_err() {
+                assert!(false, "checkpoint should succeed");
+                return;
+            }
+            let successor = alloc::format!("/public{i}.bin");
+            let Ok(next) = fs.create_file_path(&successor) else {
+                assert!(false, "create should succeed");
+                return;
+            };
+            let public = [0x11u8; 64];
+            if fs.write_file_at(next, 0, &public).is_err() {
+                assert!(false, "write should succeed");
+                return;
+            }
+            let mut read_back = [0u8; 64];
+            assert!(fs.read_file_at(next, 0, &mut read_back).is_ok());
+            if read_back != public {
+                leaked = true;
+            }
+        }
+        assert!(
+            !leaked,
+            "a recycled block served stale plaintext from the page cache"
+        );
+    }
+
     #[test]
     fn deleted_blocks_are_handed_out_again_without_corrupting_live_data() {
         let Ok(mut seed) = HxfsWriter::new(INSTANCE, VOLUME) else {

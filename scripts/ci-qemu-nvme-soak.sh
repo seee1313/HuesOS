@@ -41,8 +41,17 @@ elif [[ "$inject" == "4" ]]; then
     # (stress-ok) for sustained NVMe/page-cache load.
     export HUESOS_HXFS_SERVICE_FEATURES=synthetic-key
     seed_args=()
+elif [[ "$inject" == "5" ]]; then
+    # Mode 5: high queue-depth soak (production gate). Same workload
+    # as mode 4, but QEMU exposes a multi-queue NVMe controller and
+    # the guest gets more vCPUs, so the driver plans and drives one
+    # I/O queue per CPU with a deep submission queue instead of the
+    # single shallow queue the other modes exercise. This is the mode
+    # that can surface doorbell/phase bugs and queue-full handling.
+    export HUESOS_HXFS_SERVICE_FEATURES=synthetic-key
+    seed_args=()
 fi
-if [[ "$inject" == "1" || "$inject" == "2" || "$inject" == "3" || "$inject" == "4" ]]; then
+if [[ "$inject" == "1" || "$inject" == "2" || "$inject" == "3" || "$inject" == "4" || "$inject" == "5" ]]; then
     # Stage D: the synthetic volume key is baked into the KERNEL as
     # the bootloader key blob (single source of truth: the seed
     # tool's --print-volume-key-hex). The service receives it via
@@ -116,7 +125,7 @@ if [[ "$need_create" == "1" ]]; then
         echo "[soak] image too small for Hxfs (need >= 32 KiB)" >&2
         exit 1
     fi
-    if [[ "$inject" == "1" || "$inject" == "2" || "$inject" == "3" || "$inject" == "4" ]]; then
+    if [[ "$inject" == "1" || "$inject" == "2" || "$inject" == "3" || "$inject" == "4" || "$inject" == "5" ]]; then
         # Seeded modes: an encrypted+compressed volume with a
         # seed.bin file. Modes 1/2 corrupt the seed data block;
         # mode 3 leaves it intact for the shutdown cycle.
@@ -132,11 +141,21 @@ if [[ "$need_create" == "1" ]]; then
     echo "$inject" > "$mode_file"
 fi
 
+# High queue-depth mode needs more vCPUs than the default soak: the
+# driver plans one I/O queue per CPU, so a 2-vCPU guest can never
+# exercise more than two queues no matter what the controller offers.
+soak_smp=2
+soak_mem=512M
+if [[ "$inject" == "5" ]]; then
+    soak_smp="${SOAK_SMP:-4}"
+    soak_mem="${SOAK_MEM:-768M}"
+fi
+
 qemu_common=(
     -machine q35
     -cpu qemu64
-    -smp 2
-    -m 512M
+    -smp "$soak_smp"
+    -m "$soak_mem"
     -bios "$ovmf"
     -cdrom build/huesos.iso
     -drive id=nvme0,if=none,format=raw,file="$nvme_img"
@@ -158,7 +177,18 @@ case "$nvme_layout" in
         # Modern QEMU model: create controller and namespace explicitly. This
         # avoids booting a controller with no active namespace on hosts where
         # the legacy `drive=` shortcut is not accepted as a namespace.
-        qemu_nvme=(-device nvme,serial=huesosnvme,id=nvme-ctrl -device nvme-ns,drive=nvme0,bus=nvme-ctrl,nsid=1)
+        if [[ "$inject" == "5" ]]; then
+            # High queue-depth: advertise one I/O queue per vCPU plus
+            # headroom, MSI-X vectors to match, and a deep submission
+            # queue. `max_ioqpairs` is what lets the driver's per-CPU
+            # queue plan actually create more than one pair.
+            qemu_nvme=(
+                -device "nvme,serial=huesosnvme,id=nvme-ctrl,max_ioqpairs=${SOAK_IOQPAIRS:-8},msix_qsize=${SOAK_MSIX_QSIZE:-16},mdts=7"
+                -device nvme-ns,drive=nvme0,bus=nvme-ctrl,nsid=1
+            )
+        else
+            qemu_nvme=(-device nvme,serial=huesosnvme,id=nvme-ctrl -device nvme-ns,drive=nvme0,bus=nvme-ctrl,nsid=1)
+        fi
         ;;
     legacy)
         qemu_nvme=(-device nvme,serial=huesosnvme,drive=nvme0)
@@ -255,6 +285,22 @@ elif [[ "$inject" == "4" ]]; then
         "[hxfs] fsck clean"
         "[hxfs] quota-enforced-ok"
     )
+elif [[ "$inject" == "5" ]]; then
+    # High queue-depth soak: the same workload as mode 4, but the
+    # controller must have come up with more than one I/O queue and
+    # the reliability counters must show a clean run -- no timeouts
+    # and no controller resets under sustained multi-queue load.
+    required+=(
+        "[hxfs] self-check ok"
+        "[hxfs] write-roundtrip-ok"
+        "[hxfs] stage-e-16mib-ok"
+        "[hxfs] stress-ok"
+        "[hxfs] scrub complete"
+        "[hxfs] fsck clean"
+        "[hxfs] blob-view-native-ok"
+        "[driver-manager] package-resolve-ok"
+        "[driver-host:nvme] telemetry"
+    )
 elif [[ "$inject" == "3" ]]; then
     # Graceful-shutdown cycle: the encrypted volume must mount and
     # self-check cleanly, then the userspace shutdown chain must
@@ -271,6 +317,71 @@ elif [[ "$inject" == "3" ]]; then
         "[shutdown] all CPUs halted"
     )
 fi
+# The high queue-depth gate is only meaningful if the controller
+# actually came up multi-queue. A run that silently fell back to a
+# single I/O queue would satisfy every marker above while testing
+# nothing the other modes do not already cover, so assert on the
+# reported queue count and on clean reliability counters.
+if [[ "$inject" == "5" ]]; then
+    queues="$(sed -n 's/.*\[driver-host:nvme\] identified .*queues=\([0-9]*\).*/\1/p' "$log" | tail -1)"
+    if [[ -z "$queues" ]]; then
+        echo "[soak] could not read the I/O queue count from the log" >&2
+        exit 1
+    fi
+    if (( queues < 2 )); then
+        echo "[soak] high queue-depth mode came up with only $queues I/O queue(s)" >&2
+        exit 1
+    fi
+    echo "[soak] high queue-depth: $queues I/O queues"
+    if grep -Fq "[driver-host:nvme] controller-reset-failed" "$log"; then
+        echo "[soak] controller reset failed during the high queue-depth soak" >&2
+        exit 1
+    fi
+    telemetry="$(grep -F '[driver-host:nvme] telemetry' "$log" | tail -1)"
+    echo "[soak] $telemetry"
+    if [[ "$telemetry" != *"state=Online"* ]]; then
+        echo "[soak] controller did not end the soak Online: $telemetry" >&2
+        exit 1
+    fi
+    # The boot-time snapshot always reads submitted=0. Requiring a
+    # non-trivial submitted count is what makes this a load gate
+    # rather than a "the driver printed a line" gate.
+    submitted="$(sed -n 's/.*telemetry submitted=\([0-9]*\).*/\1/p' <<<"$telemetry")"
+    if [[ -z "$submitted" ]] || (( submitted < 512 )); then
+        echo "[soak] high queue-depth soak did not drive enough I/O (submitted=${submitted:-none})" >&2
+        exit 1
+    fi
+    completed="$(sed -n 's/.*completed=\([0-9]*\).*/\1/p' <<<"$telemetry")"
+    timeouts="$(sed -n 's/.*timeouts=\([0-9]*\).*/\1/p' <<<"$telemetry")"
+    if [[ -n "$timeouts" ]] && (( timeouts > 0 )); then
+        echo "[soak] $timeouts command timeout(s) under multi-queue load" >&2
+        exit 1
+    fi
+    echo "[soak] high queue-depth: submitted=$submitted completed=$completed timeouts=${timeouts:-0}"
+fi
+
+# The hxfs page cache is only a gate if the service's own mount is
+# the thing being hit. The service prints its counters after two
+# reads of the same file; require a hit on the repeat read, so a
+# cache that is present but never consulted fails the gate.
+cache_line="$(grep -F '[hxfs] page-cache' "$log" | tail -1)"
+if [[ -n "$cache_line" ]]; then
+    echo "[soak] $cache_line"
+    repeat_hits="$(sed -n 's/.*repeat-read-hits=\([0-9]*\).*/\1/p' <<<"$cache_line")"
+    if [[ -z "$repeat_hits" ]] || (( repeat_hits < 1 )); then
+        echo "[soak] hxfs page cache did not serve the repeat read: $cache_line" >&2
+        exit 1
+    fi
+    cache_slots="$(sed -n 's/.*page-cache slots=\([0-9]*\).*/\1/p' <<<"$cache_line")"
+    if [[ -z "$cache_slots" ]] || (( cache_slots < 1 )); then
+        echo "[soak] hxfs mounted without a page cache: $cache_line" >&2
+        exit 1
+    fi
+else
+    echo "[soak] hxfs page-cache marker absent" >&2
+    exit 1
+fi
+
 for marker in "${required[@]}"; do
     if ! grep -Fq "$marker" "$log"; then
         echo "[soak] missing marker: $marker" >&2

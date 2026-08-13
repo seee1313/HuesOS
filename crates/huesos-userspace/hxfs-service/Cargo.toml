@@ -14,6 +14,12 @@ huesos-hxfs = { path = "../../huesos-hxfs" }
 huesos-hxfs-proto = { path = "../../huesos-hxfs-proto" }
 
 [features]
+# Hxblob content-addressed object store: the native BlobView
+# protocol operations (OpenBlob/CreateBlob and the read-only view
+# handle). Separate from `synthetic-key` because this is a
+# production capability, not test wiring -- `synthetic-key` merely
+# turns it on for the soak image as well.
+hxblob = ["huesos-hxfs/hxblob"]
 # Stage B.5 test wiring (never enabled in a production build):
 # mounts encrypted+compressed volumes with the synthetic key
 # context and runs the boot self-check that the qemu-nvme soak
@@ -23,7 +29,7 @@ huesos-hxfs-proto = { path = "../../huesos-hxfs-proto" }
 synthetic-key = [
     "huesos-hxfs/crypto-aes-gcm",
     "huesos-hxfs/compression-engines",
-    "huesos-hxfs/hxblob",
+    "hxblob",
 ]
 
 [profile.release]

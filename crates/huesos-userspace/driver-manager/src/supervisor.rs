@@ -145,6 +145,11 @@ pub struct DriverManager {
     hxfs_service: Option<ManagedHost>,
     hxfs_failed: bool,
     hxfs_ready: bool,
+    /// Hxfs client channel DriverManager uses for its own package
+    /// resolving, separate from the channels it hands to clients.
+    hxfs_client: Option<Channel>,
+    /// Whether the Hxblob package-resolve probe has already run.
+    package_probe_done: bool,
     acpi_manager: Option<ManagedHost>,
     acpi_tables: Option<Vmo>,
     acpi_broker: Option<Handle>,
@@ -261,6 +266,8 @@ impl DriverManager {
             hxfs_service: None,
             hxfs_failed: false,
             hxfs_ready: false,
+            hxfs_client: None,
+            package_probe_done: false,
             acpi_manager: None,
             acpi_tables: None,
             acpi_broker: None,
@@ -1075,6 +1082,129 @@ impl DriverManager {
             .open_for_registry(registry, &mut self.volume, nvme_bootstrap, nvme_online);
     }
 
+    /// Attach a DriverManager-owned client channel to the Hxfs
+    /// service.
+    ///
+    /// Package resolving must not borrow a client's channel: replies
+    /// would interleave with that client's traffic. DriverManager gets
+    /// its own attachment, using exactly the same `hxfs-client`
+    /// mechanism any other process uses, so resolving carries no
+    /// special privilege.
+    fn attach_own_hxfs_client(&mut self) {
+        if self.hxfs_client.is_some() {
+            return;
+        }
+        let Some(hxfs) = self.hxfs_service.as_ref() else {
+            return;
+        };
+        let Ok((client_end, server_end)) = Channel::pair() else {
+            return;
+        };
+        if hxfs
+            .bootstrap
+            .write_handle(
+                protocol::ATTACH_HXFS_CLIENT.as_bytes(),
+                server_end.into_handle(),
+            )
+            .is_err()
+        {
+            println!("[driver-manager] could not attach package-resolver client");
+            return;
+        }
+        self.hxfs_client = Some(client_end);
+    }
+
+    /// Prove the Hxblob resolve path end to end.
+    ///
+    /// Stores a small package image as a content-addressed blob, then
+    /// resolves it back by hash into a VMO -- the same call a launch
+    /// would make before handing the VMO to `spawn_elf_from_vmo`. Also
+    /// checks that an unknown hash fails cleanly rather than
+    /// resolving to something else.
+    ///
+    /// This runs against the live service on the boot path because a
+    /// resolver that only works in a host unit test is exactly the
+    /// kind of "wired up" this gate is meant to reject.
+    fn probe_package_resolving(&mut self) {
+        if self.package_probe_done {
+            return;
+        }
+        let Some(channel) = self.hxfs_client.as_ref() else {
+            return;
+        };
+        self.package_probe_done = true;
+
+        // A package index as it would be read off the volume.
+        let payload = b"\x7fELF-huesos-package-resolve-probe-payload-0123456789";
+        let view = match libcanvas::hxfs::create_blob_on(channel, payload) {
+            Ok(view) => view,
+            Err(error) => {
+                println!(
+                    "[driver-manager] package probe: store failed ({})",
+                    error.as_str()
+                );
+                return;
+            }
+        };
+        let hash = *view.hash();
+        drop(view);
+
+        // Round-trip the hash through its text form, the way an
+        // on-volume package index carries it.
+        let hex = hash_to_hex(&hash);
+        let Some(parsed) = crate::package_resolver::parse_hash_hex(&hex) else {
+            println!("[driver-manager] package probe: hash did not round-trip through hex");
+            return;
+        };
+        if parsed != hash {
+            println!("[driver-manager] package probe: hex round-trip mismatch");
+            return;
+        }
+
+        match crate::package_resolver::resolve_package(channel, &parsed) {
+            Ok(package) => {
+                if package.len != payload.len() as u64 {
+                    println!(
+                        "[driver-manager] package probe: length {} != {}",
+                        package.len,
+                        payload.len()
+                    );
+                    return;
+                }
+                let mut check = [0u8; 64];
+                let read = package.vmo.read(0, &mut check[..payload.len()]);
+                if read != Ok(payload.len()) || &check[..payload.len()] != payload {
+                    println!("[driver-manager] package probe: VMO contents differ");
+                    return;
+                }
+            }
+            Err(error) => {
+                println!("[driver-manager] package probe: resolve failed ({error:?})");
+                return;
+            }
+        }
+
+        // An unknown hash must fail, not resolve to the nearest thing.
+        let absent = [0x5Au8; 32];
+        match crate::package_resolver::resolve_package(channel, &absent) {
+            Err(crate::package_resolver::ResolveError::NotFound) => {}
+            Err(other) => {
+                println!("[driver-manager] package probe: absent hash gave {other:?}");
+                return;
+            }
+            Ok(_) => {
+                println!("[driver-manager] package probe: absent hash resolved to an object");
+                return;
+            }
+        }
+
+        println!(
+            "[driver-manager] package-resolve-ok bytes={} hash={}",
+            payload.len(),
+            core::str::from_utf8(&hex[..16]).unwrap_or("?")
+        );
+    }
+
     fn open_hxfs_service(&mut self) {
         let Some(registry) = self.registry_channel.as_ref() else {
             return;
@@ -1277,6 +1407,8 @@ impl DriverManager {
                     self.hxfs_failed = false;
                     self.hxfs_service = Some(host);
                     println!("[driver-manager] Hxfs service ready");
+                    self.attach_own_hxfs_client();
+                    self.probe_package_resolving();
                     return;
                 }
                 Ok(n) if &buf[..n] == protocol::HXFS_SERVICE_UNAVAILABLE.as_bytes() => {
@@ -1395,4 +1527,17 @@ impl DriverManager {
             println!("[driver-manager] unknown input-host message");
         }
     }
+}
+
+/// Lowercase hex of a content hash, as a package index stores it.
+fn hash_to_hex(hash: &[u8; 32]) -> [u8; 64] {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = [0u8; 64];
+    let mut index = 0usize;
+    while index < 32 {
+        out[index * 2] = HEX[(hash[index] >> 4) as usize];
+        out[index * 2 + 1] = HEX[(hash[index] & 0x0f) as usize];
+        index += 1;
+    }
+    out
 }

@@ -148,10 +148,20 @@ pub fn validate_compressed_extent(extent: CompressedExtent) -> Result<(), Compre
 }
 
 /// Return whether this build links a codec engine for `algorithm`.
+///
+/// Zstd is deliberately **not** available on any build: see
+/// `docs/design/ADR_ZSTD_BACKEND.md`. Reporting it as available
+/// whenever `compression-engines` was on was wrong -- the policy
+/// resolver uses this to decide whether it may select a codec, so it
+/// could hand `COMPRESSION_ZSTD` to a write path that then fails with
+/// `EngineUnavailable` at the point of writing user data, instead of
+/// the policy being rejected up front.
 pub const fn engine_available(algorithm: u32) -> bool {
     match algorithm {
         COMPRESSION_NONE => true,
-        COMPRESSION_LZ4 | COMPRESSION_ZSTD => cfg!(feature = "compression-engines"),
+        COMPRESSION_LZ4 => cfg!(feature = "compression-engines"),
+        // Reserved on-disk id with no engine behind it, by decision.
+        COMPRESSION_ZSTD => false,
         _ => false,
     }
 }
@@ -389,6 +399,37 @@ pub fn resolve_compression_policy(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Zstd is a reserved id with no engine, on every build.
+    ///
+    /// See `docs/design/ADR_ZSTD_BACKEND.md`. The policy resolver
+    /// consults `engine_available` before selecting a codec, so if
+    /// this ever reports true the write path will accept a Zstd
+    /// policy and then fail while writing user data.
+    #[test]
+    fn zstd_is_never_reported_as_an_available_engine() {
+        assert!(!engine_available(COMPRESSION_ZSTD));
+        assert!(engine_available(COMPRESSION_NONE));
+    }
+
+    /// A Zstd extent must be refused, not silently mis-decoded.
+    #[test]
+    fn decoding_a_zstd_extent_is_refused() {
+        let payload = [0u8; 16];
+        let extent = CompressedExtent {
+            logical_block: 0,
+            physical_block: 10,
+            uncompressed_bytes: 4096,
+            compressed_bytes: payload.len() as u32,
+            algorithm: COMPRESSION_ZSTD,
+            payload_crc32c: crate::crc32c::crc32c(&payload),
+        };
+        let mut out = [0u8; 4096];
+        assert_eq!(
+            decompress_block(&extent, &payload, &mut out),
+            Err(CompressionError::EngineUnavailable)
+        );
+    }
 
     #[test]
     fn validates_compression_policies() {

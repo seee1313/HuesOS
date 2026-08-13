@@ -20,11 +20,19 @@ use huesos_abi::block::{
 use huesos_nvme::controller::{Controller, ControllerConfig, NvmeError};
 use huesos_nvme::device::{BarRegion, DeviceResources, DmaRegion};
 use huesos_nvme::pci_transport::PciMmioTransport;
+use huesos_nvme::reliability::{NvmeTelemetry, ResetController, ResetState};
 use libcanvas::{println, Channel, ErrorCode, Handle, Interrupt, Port, Vmo};
 
 const REQUIRED_RESOURCES: usize = 3;
 const RESOURCE_LABEL_PREFIX: &[u8] = b"resource:";
 const RESOURCE_TRANSFER_COMPLETE: &[u8] = b"resource:transfer-complete";
+/// Ticks a controller reset may take before the device is declared
+/// permanently failed. Ticks advance once per served request, so this
+/// is a bound on attempts, not on wall-clock time.
+const MAX_RESET_TICKS: u64 = 16;
+/// Emit the reliability snapshot every this many controller
+/// operations.
+const TELEMETRY_REPORT_INTERVAL: u64 = 512;
 const LABEL_CAP: usize = 96;
 const MMIO_MAP_ADDR: u64 = 0x0000_7000_0000_0000;
 const DMA_MAP_ADDR: u64 = 0x0000_7100_0000_0000;
@@ -126,6 +134,17 @@ struct DriverRuntime {
     controller: Controller<PciMmioTransport>,
     interrupt_state: InterruptState,
     clients: [Option<BlockClient>; MAX_BLOCK_CLIENTS],
+    /// Controller recovery state machine. A command that never
+    /// completes leaves the device in a state the host cannot reason
+    /// about, so the timeout path escalates to a controller reset
+    /// instead of retrying into the void.
+    reset_controller: ResetController,
+    /// Reliability counters surfaced in the soak log.
+    telemetry: NvmeTelemetry,
+    /// Monotonic tick, bumped per served request. The driver has no
+    /// clock of its own; this only has to order events for the reset
+    /// state machine, not measure real time.
+    tick: u64,
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -439,6 +458,11 @@ fn bring_up_controller(
         controller,
         interrupt_state,
         clients: [const { None }; MAX_BLOCK_CLIENTS],
+        // Reset must finish within this many ticks (one tick per
+        // served request) before the controller is declared dead.
+        reset_controller: ResetController::new(MAX_RESET_TICKS),
+        telemetry: NvmeTelemetry::default(),
+        tick: 0,
     })
 }
 
@@ -479,30 +503,108 @@ fn bind_interrupts(irq: &ResourceSlot) -> Result<InterruptState, &'static str> {
     Ok(state)
 }
 
-/// Run a controller operation, retrying once on
-/// [`NvmeError::Timeout`]. QEMU's NVMe emulation under TCG on a
-/// contended CI runner can occasionally take longer than the
-/// completion-poll budget to post a CQE even though the request is
-/// valid (the failure mode seen as an intermittent `Io` from the
-/// Hxfs service's checkpoint publish). The request is idempotent
-/// (same LBA, same buffer), so one re-issue absorbs the transient;
-/// a second timeout surfaces to the client as IoError and the
-/// client's own transport retry takes over.
-fn controller_op_retry<F>(op: &str, lba: u64, mut run: F) -> Result<(), NvmeError>
-where
-    F: FnMut() -> Result<(), NvmeError>,
-{
-    match run() {
-        Ok(()) => Ok(()),
-        Err(NvmeError::Timeout) => {
-            println!("[driver-host:nvme] {op} lba={lba} timed out; retrying once");
-            run()
-        }
-        Err(error) => Err(error),
-    }
-}
-
 impl DriverRuntime {
+    /// Run one controller operation, escalating a timeout to a full
+    /// controller reset.
+    ///
+    /// The old behaviour was to re-issue the command once and give
+    /// up. That absorbs a slow CQE under TCG, but it is the wrong
+    /// response to a genuinely wedged controller: the device may
+    /// still complete the original command later and write into a
+    /// queue slot the host has since reused. NVMe has exactly one
+    /// remedy for that, CC.EN=0 followed by re-initialization, and
+    /// until it runs no further I/O may be submitted.
+    ///
+    /// So: retry once for the transient case, and if the retry also
+    /// times out, reset the controller and try once more on the
+    /// rebuilt queues. A controller that cannot be reset is marked
+    /// `Failed` and every later request is refused rather than
+    /// silently hanging.
+    fn controller_op<F>(&mut self, op: &str, lba: u64, mut run: F) -> Result<(), NvmeError>
+    where
+        F: FnMut(&mut Controller<PciMmioTransport>) -> Result<(), NvmeError>,
+    {
+        self.tick = self.tick.saturating_add(1);
+        // Re-report periodically. A single boot-time snapshot always
+        // reads submitted=0, which would let the soak assert on a
+        // marker that proves nothing about the run.
+        if self.tick.is_multiple_of(TELEMETRY_REPORT_INTERVAL) {
+            self.report_telemetry();
+        }
+        if matches!(self.reset_controller.state(), ResetState::Failed) {
+            return Err(NvmeError::NotReady);
+        }
+        self.telemetry.record_submit();
+        match run(&mut self.controller) {
+            Ok(()) => {
+                self.telemetry.record_complete();
+                return Ok(());
+            }
+            Err(NvmeError::Timeout) => {}
+            Err(error) => return Err(error),
+        }
+
+        // First timeout: the transient case. QEMU's NVMe emulation
+        // under TCG on a contended runner can post a CQE later than
+        // the poll budget allows. The request is idempotent (same
+        // LBA, same buffer), so one re-issue is safe.
+        self.telemetry.record_timeout();
+        println!("[driver-host:nvme] {op} lba={lba} timed out; retrying once");
+        match run(&mut self.controller) {
+            Ok(()) => {
+                self.telemetry.record_complete();
+                return Ok(());
+            }
+            Err(NvmeError::Timeout) => {}
+            Err(error) => return Err(error),
+        }
+
+        // Second timeout: treat the controller as wedged.
+        self.telemetry.record_timeout();
+        self.reset_controller.command_timed_out(self.tick);
+        println!("[driver-host:nvme] {op} lba={lba} timed out twice; resetting controller");
+        if self.reset_controller.begin_reset(self.tick).is_err() {
+            return Err(NvmeError::Timeout);
+        }
+        match self.controller.reset() {
+            Ok(info) => {
+                self.telemetry.record_reset();
+                // The hardware is back; drive the state machine
+                // through re-identify to Online.
+                self.tick = self.tick.saturating_add(1);
+                self.reset_controller.poll_reset(self.tick, true);
+                self.reset_controller.reidentify_complete();
+                println!(
+                    "[driver-host:nvme] controller-reset-ok queues={} resets={}",
+                    info.io_queue_count, self.telemetry.resets
+                );
+            }
+            Err(error) => {
+                // Let the state machine time the reset out so the
+                // controller ends up Failed rather than wedged in
+                // Resetting forever.
+                self.tick = self.tick.saturating_add(MAX_RESET_TICKS + 1);
+                let state = self.reset_controller.poll_reset(self.tick, false);
+                println!(
+                    "[driver-host:nvme] controller-reset-failed err={} state={state:?}",
+                    nvme_error_label(error)
+                );
+                return Err(error);
+            }
+        }
+
+        // One attempt on the rebuilt queues. A failure here is a real
+        // I/O error for the client.
+        self.telemetry.record_submit();
+        let outcome = run(&mut self.controller);
+        if outcome.is_ok() {
+            self.telemetry.record_complete();
+        } else {
+            self.telemetry.record_timeout();
+        }
+        outcome
+    }
+
     fn poll(&mut self, bootstrap: &Channel) {
         let _keep_irq_handles_alive = self.interrupt_state.keepalive_marker();
         self.poll_bootstrap(bootstrap);
@@ -607,7 +709,7 @@ impl DriverRuntime {
         match request.op {
             AsyncBlockOp::Info => self.send_info(index),
             AsyncBlockOp::Flush => {
-                match controller_op_retry("flush", 0, || self.controller.flush()) {
+                match self.controller_op("flush", 0, |controller| controller.flush()) {
                     Ok(()) => AsyncBlockStatus::Ok,
                     Err(_) => AsyncBlockStatus::IoError,
                 }
@@ -617,7 +719,25 @@ impl DriverRuntime {
         }
     }
 
+    /// Emit reliability counters so a soak run can assert on them
+    /// rather than on the absence of a crash.
+    fn report_telemetry(&self) {
+        println!(
+            "[driver-host:nvme] telemetry submitted={} completed={} timeouts={} resets={} queue-full={} state={:?}",
+            self.telemetry.submitted,
+            self.telemetry.completed,
+            self.telemetry.timeouts,
+            self.telemetry.resets,
+            self.telemetry.queue_full,
+            self.reset_controller.state()
+        );
+    }
+
     fn send_info(&mut self, index: usize) -> AsyncBlockStatus {
+        // The Hxfs service asks for geometry once at mount; piggyback
+        // the reliability snapshot on it so every boot logs a
+        // baseline even when nothing goes wrong.
+        self.report_telemetry();
         let info = AsyncBlockInfo {
             namespace_id: 1,
             block_size: self.controller.lba_size(),
@@ -648,14 +768,15 @@ impl DriverRuntime {
                 .max(1)
                 .min(request.block_count - done_blocks);
             let chunk_bytes = chunk_blocks as usize * block_size;
-            if controller_op_retry("read", request.lba + u64::from(done_blocks), || {
-                self.controller.read(
-                    request.lba + u64::from(done_blocks),
-                    chunk_blocks as u16,
-                    &mut scratch[..chunk_bytes],
-                )
-            })
-            .is_err()
+            if self
+                .controller_op("read", request.lba + u64::from(done_blocks), |controller| {
+                    controller.read(
+                        request.lba + u64::from(done_blocks),
+                        chunk_blocks as u16,
+                        &mut scratch[..chunk_bytes],
+                    )
+                })
+                .is_err()
             {
                 return AsyncBlockStatus::IoError;
             }
@@ -701,14 +822,19 @@ impl DriverRuntime {
                 Ok(read) if read == chunk_bytes => {}
                 _ => return AsyncBlockStatus::IoError,
             }
-            if controller_op_retry("write", request.lba + u64::from(done_blocks), || {
-                self.controller.write(
+            if self
+                .controller_op(
+                    "write",
                     request.lba + u64::from(done_blocks),
-                    chunk_blocks as u16,
-                    &scratch[..chunk_bytes],
+                    |controller| {
+                        controller.write(
+                            request.lba + u64::from(done_blocks),
+                            chunk_blocks as u16,
+                            &scratch[..chunk_bytes],
+                        )
+                    },
                 )
-            })
-            .is_err()
+                .is_err()
             {
                 return AsyncBlockStatus::IoError;
             }

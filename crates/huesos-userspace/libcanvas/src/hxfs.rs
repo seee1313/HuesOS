@@ -20,6 +20,18 @@ pub struct HxfsFile {
     channel: Channel,
 }
 
+/// Read-only view of an Hxblob content-addressed object.
+///
+/// There is deliberately no write path on this type. Blobs are named
+/// by the hash of their contents, so a mutation would either change
+/// the name or break it; callers that need different bytes create a
+/// different blob.
+pub struct HxfsBlobView {
+    channel: Channel,
+    hash: [u8; 32],
+    size: u64,
+}
+
 impl Hxfs {
     /// Open Hxfs through DriverManager registry.
     pub fn open(registry: &Channel) -> Result<Self> {
@@ -61,6 +73,42 @@ impl Hxfs {
         let mut request = [0u8; 320];
         let len = write_prefixed_path(&mut request, b"OPEN_FILE ", path)?;
         self.channel_to_file(&request[..len])
+    }
+
+    /// Open an existing blob by its 32-byte content hash.
+    ///
+    /// The service verifies the object against its hash before
+    /// returning the handle, so a successful open means the bytes are
+    /// intact, not merely present.
+    pub fn open_blob(&self, hash: &[u8; 32]) -> Result<HxfsBlobView> {
+        write_native_request(
+            &self.channel,
+            abi::HxfsOp::OpenBlob,
+            abi::HxfsHandleKind::BlobView,
+            0,
+            0,
+            hash,
+        )?;
+        self.read_blob_view(*hash)
+    }
+
+    /// Store `data` as a content-addressed blob and return a view of
+    /// it. Storing identical bytes twice yields the same blob rather
+    /// than an error.
+    pub fn create_blob(&self, data: &[u8]) -> Result<HxfsBlobView> {
+        write_native_request(
+            &self.channel,
+            abi::HxfsOp::CreateBlob,
+            abi::HxfsHandleKind::None,
+            0,
+            0,
+            data,
+        )?;
+        self.read_blob_view([0u8; 32])
+    }
+
+    fn read_blob_view(&self, hash: [u8; 32]) -> Result<HxfsBlobView> {
+        read_blob_view_on(&self.channel, hash)
     }
 
     /// Create a directory by absolute path through the native Hxfs ABI.
@@ -410,6 +458,129 @@ fn write_prefixed_path(out: &mut [u8], prefix: &[u8], path: &str) -> Result<usiz
     Ok(total)
 }
 
+impl HxfsBlobView {
+    /// Size of the blob in bytes.
+    pub fn size(&self) -> u64 {
+        self.size
+    }
+
+    /// Content hash the view was opened under.
+    pub fn hash(&self) -> &[u8; 32] {
+        &self.hash
+    }
+
+    /// Refresh size and hash from the service.
+    pub fn info(&mut self) -> Result<u64> {
+        write_native_request(
+            &self.channel,
+            abi::HxfsOp::GetInfo,
+            abi::HxfsHandleKind::BlobView,
+            0,
+            0,
+            &[],
+        )?;
+        let mut response = [0u8; NATIVE_MESSAGE_BYTES];
+        let n = read_native_payload(&self.channel, &mut response)?;
+        if n == 32 {
+            self.hash.copy_from_slice(&response[..32]);
+        }
+        Ok(self.size)
+    }
+
+    /// Read at most `out.len()` bytes starting at `offset`.
+    pub fn read_at<'a>(&self, offset: u64, out: &'a mut [u8]) -> Result<&'a [u8]> {
+        let requested = out.len().min(abi::HXFS_MAX_INLINE_WRITE_BYTES);
+        write_native_request(
+            &self.channel,
+            abi::HxfsOp::ReadAt,
+            abi::HxfsHandleKind::BlobView,
+            offset,
+            requested as u64,
+            &[],
+        )?;
+        let mut response = [0u8; NATIVE_MESSAGE_BYTES];
+        let n = read_native_payload(&self.channel, &mut response)?;
+        if n > out.len() {
+            return Err(ErrorCode::InvalidArgs);
+        }
+        out[..n].copy_from_slice(&response[..n]);
+        Ok(&out[..n])
+    }
+}
+
+/// Open a blob over a borrowed Hxfs client channel.
+///
+/// DriverManager keeps its Hxfs client channel inside its own service
+/// state and cannot hand ownership to an [`Hxfs`], so the blob path is
+/// also available as free functions over `&Channel`.
+pub fn open_blob_on(channel: &Channel, hash: &[u8; 32]) -> Result<HxfsBlobView> {
+    write_native_request(
+        channel,
+        abi::HxfsOp::OpenBlob,
+        abi::HxfsHandleKind::BlobView,
+        0,
+        0,
+        hash,
+    )?;
+    read_blob_view_on(channel, *hash)
+}
+
+/// Store a blob over a borrowed Hxfs client channel.
+pub fn create_blob_on(channel: &Channel, data: &[u8]) -> Result<HxfsBlobView> {
+    write_native_request(
+        channel,
+        abi::HxfsOp::CreateBlob,
+        abi::HxfsHandleKind::None,
+        0,
+        0,
+        data,
+    )?;
+    read_blob_view_on(channel, [0u8; 32])
+}
+
+fn read_blob_view_on(channel: &Channel, hash: [u8; 32]) -> Result<HxfsBlobView> {
+        let mut buf = [0u8; NATIVE_MESSAGE_BYTES];
+        loop {
+            match channel.read_optional_handle(&mut buf) {
+                Ok((n, Some(handle))) => {
+                    let Some(response) = decode_response(&buf[..n.min(abi::HXFS_RESPONSE_BYTES)])
+                    else {
+                        return Err(ErrorCode::InvalidArgs);
+                    };
+                    if response.status != abi::HxfsStatus::Ok {
+                        return Err(status_to_error(response.status));
+                    }
+                    if response.handle_kind != abi::HxfsHandleKind::BlobView {
+                        return Err(ErrorCode::WrongType);
+                    }
+                    // A blob view that arrived with write rights would
+                    // mean the service disagrees with the ABI about
+                    // blob immutability; refuse rather than paper over
+                    // it.
+                    if response.rights & abi::rights::WRITE != 0 {
+                        return Err(ErrorCode::Internal);
+                    }
+                    return Ok(HxfsBlobView {
+                        channel: Channel::from_handle(handle),
+                        hash,
+                        size: response.value,
+                    });
+                }
+                Ok((n, None)) => {
+                    if let Some(response) = decode_response(&buf[..n.min(abi::HXFS_RESPONSE_BYTES)])
+                    {
+                        return Err(status_to_error(response.status));
+                    }
+                    return Err(ErrorCode::InvalidArgs);
+                }
+                Err(ErrorCode::ShouldWait) | Err(ErrorCode::TimedOut) => {
+                    crate::process::yield_now();
+                }
+                Err(error) => return Err(error),
+            }
+        }
+}
+
 fn write_native_request(
     channel: &Channel,
     op: abi::HxfsOp,
@@ -533,6 +704,11 @@ fn status_to_error(status: abi::HxfsStatus) -> ErrorCode {
         abi::HxfsStatus::NoSpace => ErrorCode::NoMemory,
         abi::HxfsStatus::Unsupported => ErrorCode::NotSupported,
         abi::HxfsStatus::EncryptedUnavailable => ErrorCode::AccessDenied,
+        // Not `NotFound`: the object exists and the device read
+        // succeeded, but its contents no longer hash to the name it
+        // was requested under. Mapping it to a miss would let silent
+        // corruption of an immutable object look routine.
+        abi::HxfsStatus::CorruptObject => ErrorCode::Internal,
     }
 }
 
