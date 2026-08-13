@@ -16,6 +16,14 @@ use libcanvas::{println, Channel, ErrorCode, Vmo};
 const MAX_BLOBFS_CLIENTS: usize = 4;
 const MAX_BLOB_LIST_RESPONSE: usize = 1024;
 const MAX_BLOCK_BYTES: usize = 4096;
+/// Largest blob this service will materialise into a VMO.
+///
+/// `entry.length` comes from the on-disk table, which is untrusted
+/// input, and it decides the size of the `Vmo::create` below. Without
+/// a ceiling a corrupted or hostile table could name a multi-gigabyte
+/// blob and have the service try to allocate it before a single byte
+/// is hash-checked. 64 MiB is far above any blob the bootfs carries.
+const MAX_BLOB_BYTES: u64 = 64 * 1024 * 1024;
 
 /// DriverManager-owned BlobFS read-only service.
 pub struct BlobFsService {
@@ -247,6 +255,13 @@ impl BlobFsService {
         let Some(mount) = self.mount.as_mut() else {
             return Err(BlobFsError::BadLayout);
         };
+        // Re-validate with the SAME accumulated `previous_end` the
+        // mount-time check uses. Passing `data_offset` here instead
+        // made the anti-overlap rule vacuous on the read path: every
+        // entry was compared against the start of the data region
+        // rather than the end of its predecessor, so a table that
+        // mount would reject could still be read from.
+        let mut previous_end = mount.superblock.data_offset;
         let mut blob_index = 0u32;
         while blob_index < mount.superblock.blob_count {
             let entry = read_entry(
@@ -255,10 +270,14 @@ impl BlobFsService {
                 mount.superblock,
                 blob_index,
             )?;
+            validate_entry(mount.superblock, entry, previous_end)?;
             if entry.hash == hash {
-                validate_entry(mount.superblock, entry, mount.superblock.data_offset)?;
                 return read_payload_to_vmo(&mut mount.device, mount.block_size, entry);
             }
+            previous_end = entry
+                .offset
+                .saturating_add(entry.length)
+                .max(entry.offset.saturating_add(1));
             blob_index += 1;
         }
         Err(BlobFsError::NotFound)
@@ -276,6 +295,13 @@ fn read_payload_to_vmo(
     block_size: u32,
     entry: BlobEntry,
 ) -> Result<Vmo, BlobFsError> {
+    // Bound the allocation before trusting the table: `entry.length`
+    // is attacker-influenced and is only proven honest once the
+    // payload hashes correctly, which cannot happen until after the
+    // VMO exists.
+    if entry.length > MAX_BLOB_BYTES {
+        return Err(BlobFsError::BadLayout);
+    }
     let vmo = Vmo::create(entry.length).map_err(|_| BlobFsError::BadLayout)?;
     let mut scratch = [0u8; MAX_BLOCK_BYTES];
     let mut hasher = Sha256::new();

@@ -236,7 +236,7 @@ fn track_userspace_inputs(userspace_root: &Path) {
         );
     }
     // The userspace binaries embed workspace crates (huesos-hxfs,
-    // huesos-abi, huesos-user-alloc); a change there must re-run
+    // huesos-abi, huesos-scudo); a change there must re-run
     // this build script so the recompiled binaries are re-embedded.
     // Without this, cargo considers the build script fresh (its
     // side-effect outputs are invisible to fingerprints) and the
@@ -244,7 +244,7 @@ fn track_userspace_inputs(userspace_root: &Path) {
     for crate_dir in [
         "crates/huesos-hxfs",
         "crates/huesos-abi",
-        "crates/huesos-user-alloc",
+        "crates/huesos-scudo",
     ] {
         println!("cargo:rerun-if-changed={crate_dir}");
         println!("cargo:rerun-if-changed={crate_dir}/src");

@@ -16,7 +16,6 @@ use huesos_hxfs::format::{DirectoryHandle, FileHandle};
 use huesos_hxfs::reader::BlockReader;
 use huesos_hxfs::recovery::{replay_journal, BlockStore, ReplayOutcome};
 use huesos_hxfs::HxfsError;
-use huesos_user_alloc::UserAllocator;
 use libcanvas::{println, Channel, ErrorCode, Vmo};
 
 /// A.6 live mount: the hxfs-service is the production
@@ -29,30 +28,21 @@ use libcanvas::{println, Channel, ErrorCode, Vmo};
 /// of the user address space for the heap and the
 /// allocator grows into that region.
 #[global_allocator]
-static HEAP: UserAllocator = UserAllocator::new();
+static HEAP: libcanvas::heap::ScudoHeap = libcanvas::heap::ScudoHeap::new();
 
-/// Initialise the heap at the user address range the
-/// kernel reserved for userspace heap. The range is
-/// `huesos_abi::USER_HEAP_BASE` and is mapped by the
-/// process launcher (`huesos-kernel/src/process.rs`) for
-/// every user process; for the MVP the hxfs-service heap
-/// is the full 256 KiB region.
-const HEAP_BASE: usize = huesos_abi::USER_HEAP_BASE as usize;
-const HEAP_SIZE: usize = huesos_abi::USER_HEAP_SIZE as usize;
-
-fn init_heap() {
-    // SAFETY: the heap region is reserved AND MAPPED for the
-    // hxfs-service by the kernel process launcher (Stage A.6
-    // intent; the mapping was missing until Stage B.5 and the
-    // service's first allocation faulted at USER_HEAP_BASE);
-    // the linker places the service's BSS/data at a
-    // non-overlapping range; the 256 KiB region is private to
-    // this process. The Userspace allocator is `no_std` and
-    // lives in `huesos-user-alloc`; its `init` function takes
-    // a raw pointer and is unsafe by signature.
-    unsafe {
-        HEAP.init(HEAP_BASE as *mut u8, HEAP_SIZE);
-    }
+/// Initialise the hardened heap.
+///
+/// The allocator (`huesos-scudo`) grows the process's reserved heap
+/// window on demand through `VmarHeapExtend`, so nothing but the
+/// kernel's small bootstrap prefix is committed until the service
+/// actually allocates. Its chunk-header cookie comes from kernel
+/// entropy; if that is unavailable the heap stays uninitialised and
+/// every allocation returns null, which the caller reports rather
+/// than running with forgeable heap metadata.
+fn init_heap() -> bool {
+    // SAFETY: called exactly once, before the first allocation, and
+    // before any additional thread could exist in this process.
+    unsafe { HEAP.init() }
 }
 
 const MAX_CLIENTS: usize = 4;
@@ -62,17 +52,24 @@ const MAX_READ_BYTES: usize = 4096;
 const MAX_NATIVE_REQUEST_BYTES: usize = HXFS_REQUEST_BYTES + HXFS_MAX_INLINE_WRITE_BYTES;
 // `poll_client` / `poll_file` / `poll_dir` allocate a scratch
 // buffer on the stack every time they are entered. The full
-// `MAX_NATIVE_REQUEST_BYTES` (4 KiB) is enough to overflow the
-// stack once `mount_from_bootstrap` and `FixedHxfsWriter::mount`
-// are on the same call chain, which is the chain that runs on the
-// first `runtime.poll` after `[hxfs] service started`. The hxfs
-// service is a single-process loop and the largest request it
-// actually services in qemu-nvme-boot is a directory
-// `OPEN_FILE <name>` whose name is at most `MAX_NAME_BYTES` (255)
-// bytes; 256 bytes is plenty. The `MAX_NATIVE_REQUEST_BYTES` ABI
-// constant is preserved for `write_response_to_channel` (which
-// only runs once per request).
-const POLL_BUF_BYTES: usize = 256;
+// Receive buffer capacity for every channel this service polls.
+//
+// This MUST be at least `MAX_NATIVE_REQUEST_BYTES`, the largest
+// message the ABI lets a client send. It used to be 256 bytes, on
+// the reasoning that the largest request actually seen in the boot
+// smoke was an `OPEN_FILE <name>`. That was a latent deadlock: the
+// kernel returns `BytesTooSmall` for an oversized message WITHOUT
+// dequeuing it (`huesos-object/src/channel.rs`), so a client that
+// legitimately sent a 4 KiB inline `WriteAt` left a message at the
+// head of the queue that this service could never drain — the
+// channel wedged permanently and the client blocked forever.
+//
+// The buffer cannot live on the stack at this size: the
+// `mount_from_bootstrap` -> `FixedHxfsWriter::mount` chain already
+// runs close to the 128 KiB stack limit. It lives in a field of
+// `HxfsRuntime`, which is heap-allocated (`Box::new`), so the full
+// ABI-sized buffer costs no stack at all.
+const POLL_BUF_BYTES: usize = MAX_NATIVE_REQUEST_BYTES;
 // Sized to fit the `mount_from_bootstrap` -> `FixedHxfsWriter::mount`
 // stack frame inside `USER_STACK_SIZE` (128 KiB since the
 // follow-up that added the boot write self-check; 64 KiB before,
@@ -173,6 +170,10 @@ struct DirEndpoint {
 
 struct HxfsRuntime {
     fs: Box<MountedHxfs>,
+    /// Receive buffer shared by every poll loop. Heap-resident (this
+    /// whole struct is boxed) so a full ABI-sized message can be
+    /// received without putting 4 KiB on the stack.
+    poll_buf: Box<[u8; POLL_BUF_BYTES]>,
     clients: [Option<Channel>; MAX_CLIENTS],
     files: [Option<FileEndpoint>; MAX_FILE_HANDLES],
     dirs: [Option<DirEndpoint>; MAX_DIR_HANDLES],
@@ -185,6 +186,7 @@ impl HxfsRuntime {
     fn new(fs: Box<MountedHxfs>) -> Self {
         Self {
             fs,
+            poll_buf: Box::new([0u8; POLL_BUF_BYTES]),
             clients: [const { None }; MAX_CLIENTS],
             files: [const { None }; MAX_FILE_HANDLES],
             dirs: [const { None }; MAX_DIR_HANDLES],
@@ -237,21 +239,33 @@ impl HxfsRuntime {
     }
 
     fn poll_client(&mut self, index: usize) {
-        let mut buf = [0u8; POLL_BUF_BYTES];
-        loop {
-            let Some(client) = self.clients[index].as_ref() else {
-                return;
-            };
-            match client.read_into(&mut buf) {
+        // Borrow the heap buffer out of `self` for the duration of
+        // the loop so the `&mut self` handler calls stay legal, and
+        // put it back on every exit path.
+        let mut buf = core::mem::replace(&mut self.poll_buf, Box::new([0u8; POLL_BUF_BYTES]));
+        while let Some(client) = self.clients[index].as_ref() {
+            match client.read_into(buf.as_mut_slice()) {
                 Ok(n) => self.handle_client_request(index, &buf[..n]),
-                Err(ErrorCode::ShouldWait) | Err(ErrorCode::TimedOut) => return,
+                Err(ErrorCode::ShouldWait) | Err(ErrorCode::TimedOut) => break,
                 Err(ErrorCode::PeerClosed) => {
                     self.clients[index] = None;
-                    return;
+                    break;
                 }
-                Err(_) => return,
+                Err(error) => {
+                    // The buffer is ABI-sized, so `BytesTooSmall`
+                    // means the peer sent something larger than the
+                    // ABI permits. The kernel leaves such a message
+                    // queued, so simply returning would wedge this
+                    // channel forever. Drop the client instead: the
+                    // peer violated the protocol and the endpoint
+                    // cannot be drained.
+                    println!("[hxfs] client {index} dropped: {error:?}");
+                    self.clients[index] = None;
+                    break;
+                }
             }
         }
+        self.poll_buf = buf;
     }
 
     fn handle_client_request(&mut self, index: usize, request: &[u8]) {
@@ -682,15 +696,12 @@ impl HxfsRuntime {
     }
 
     fn poll_file(&mut self, index: usize) {
-        let mut buf = [0u8; POLL_BUF_BYTES];
-        loop {
-            let Some(endpoint) = self.files[index].as_ref() else {
-                return;
-            };
-            match endpoint.channel.read_into(&mut buf) {
+        let mut buf = core::mem::replace(&mut self.poll_buf, Box::new([0u8; POLL_BUF_BYTES]));
+        while let Some(endpoint) = self.files[index].as_ref() {
+            match endpoint.channel.read_into(buf.as_mut_slice()) {
                 Ok(n) if decode_native_message(&buf[..n]).is_some() => {
                     let Some((native, payload)) = decode_native_message(&buf[..n]) else {
-                        return;
+                        break;
                     };
                     self.handle_file_native(index, native, payload);
                 }
@@ -698,14 +709,21 @@ impl HxfsRuntime {
                 Ok(n) if &buf[..n] == b"READ" => self.file_read_inline(index),
                 Ok(n) if &buf[..n] == b"READ_VMO" => self.file_read_vmo(index),
                 Ok(_) => self.write_file(index, b"err:hxfs-file-invalid"),
-                Err(ErrorCode::ShouldWait) | Err(ErrorCode::TimedOut) => return,
+                Err(ErrorCode::ShouldWait) | Err(ErrorCode::TimedOut) => break,
                 Err(ErrorCode::PeerClosed) => {
                     self.files[index] = None;
-                    return;
+                    break;
                 }
-                Err(_) => return,
+                Err(error) => {
+                    // See `poll_client`: an undrainable message would
+                    // wedge this endpoint permanently.
+                    println!("[hxfs] file {index} dropped: {error:?}");
+                    self.files[index] = None;
+                    break;
+                }
             }
         }
+        self.poll_buf = buf;
     }
 
     fn file_info(&self, index: usize) {
@@ -940,32 +958,41 @@ impl HxfsRuntime {
     }
 
     fn poll_dir(&mut self, index: usize) {
-        let mut buf = [0u8; POLL_BUF_BYTES];
-        loop {
-            let Some(endpoint) = self.dirs[index].as_ref() else {
-                return;
-            };
-            match endpoint.channel.read_into(&mut buf) {
+        let mut buf = core::mem::replace(&mut self.poll_buf, Box::new([0u8; POLL_BUF_BYTES]));
+        while let Some(endpoint) = self.dirs[index].as_ref() {
+            match endpoint.channel.read_into(buf.as_mut_slice()) {
                 Ok(n) if decode_native_message(&buf[..n]).is_some() => {
                     let Some((native, payload)) = decode_native_message(&buf[..n]) else {
-                        return;
+                        break;
                     };
                     self.handle_dir_native(index, native, payload);
                 }
                 Ok(n) if &buf[..n] == b"LIST" => self.dir_list(index),
                 Ok(n) if buf[..n].starts_with(b"OPEN_FILE ") => {
-                    let name = &buf[b"OPEN_FILE ".len()..n];
-                    self.dir_open_file(index, name);
+                    let name_end = n;
+                    let name_start = b"OPEN_FILE ".len();
+                    // Copy the name out before calling back into
+                    // `&mut self`: `buf` is borrowed from the same
+                    // struct the handler mutates.
+                    let mut name = [0u8; 256];
+                    let len = (name_end - name_start).min(name.len());
+                    name[..len].copy_from_slice(&buf[name_start..name_start + len]);
+                    self.dir_open_file(index, &name[..len]);
                 }
                 Ok(_) => self.write_dir(index, b"err:hxfs-dir-invalid"),
-                Err(ErrorCode::ShouldWait) | Err(ErrorCode::TimedOut) => return,
+                Err(ErrorCode::ShouldWait) | Err(ErrorCode::TimedOut) => break,
                 Err(ErrorCode::PeerClosed) => {
                     self.dirs[index] = None;
-                    return;
+                    break;
                 }
-                Err(_) => return,
+                Err(error) => {
+                    println!("[hxfs] dir {index} dropped: {error:?}");
+                    self.dirs[index] = None;
+                    break;
+                }
             }
         }
+        self.poll_buf = buf;
     }
 
     fn dir_list(&mut self, index: usize) {
@@ -1521,10 +1548,17 @@ pub extern "C" fn _start() -> ! {
     // A.6 live mount: the production mount path
     // (mount_with_policies) allocates a Vec to hold the
     // per-volume compression policy table, so the heap has
-    // to be live before mount_from_bootstrap runs. The init
-    // helper is idempotent on subsequent calls but we only
-    // run it once at boot.
-    init_heap();
+    // to be live before mount_from_bootstrap runs.
+    //
+    // Initialisation can only fail if the kernel entropy pool is
+    // unavailable, which would leave the allocator's header
+    // checksum keyed by a predictable cookie. Refuse to run rather
+    // than serve a filesystem on an unhardened heap: every
+    // allocation would return null immediately afterwards anyway.
+    if !init_heap() {
+        println!("[hxfs] fatal: heap init failed (no kernel entropy)");
+        libcanvas::process::exit(-1);
+    }
     let bootstrap = libcanvas::channel::bootstrap();
     let Some(fs) = mount_from_bootstrap(&bootstrap) else {
         // Send the explicit unavailable marker, then exit so
@@ -1649,8 +1683,8 @@ fn run_boot_self_check(fs: &mut MountedHxfs) {
     // put_blob / get_blob. A full 4096-byte single-block blob used
     // to fault on target (the userspace allocator reused a too-small
     // freed block for the read buffer and the chunked fill wrote
-    // past it); huesos-user-alloc now has a size-aware free list, so
-    // 4096 bytes - the full single-block size - is the probe.
+    // past it); the Scudo port serves it from a validated size
+    // class, so 4096 bytes - the full single-block size - is the probe.
     {
         let mut payload = alloc::vec![0u8; 4096];
         let mut i = 0usize;
@@ -2246,18 +2280,21 @@ fn panic(info: &PanicInfo) -> ! {
     // console: the soak harness needs to see WHY the service died,
     // not just that it did.
     let _ = writeln!(libcanvas::debug::DebugWriter, "[hxfs] PANIC: {info:?}");
-    // Allocator diagnostics: if the panic is an OOM this shows how
-    // full the bump region was and whether the free list still has
-    // reusable blocks.
-    let state = HEAP.debug_state();
-    let _ = writeln!(
-        libcanvas::debug::DebugWriter,
-        "[hxfs] heap: used={} last_oom={} free_list_len={} bump8192={} freed8192={}",
-        state.bump_used_bytes,
-        state.last_oom_size,
-        state.free_list_len,
-        state.bump_8192_count,
-        state.freed_8192_count
-    );
+    // Allocator diagnostics: on an OOM panic this shows how much the
+    // heap was actually holding, and a non-zero corruption count
+    // points at a bad free rather than genuine exhaustion.
+    if let Some(stats) = HEAP.stats() {
+        let _ = writeln!(
+            libcanvas::debug::DebugWriter,
+            "[hxfs] heap: live={} allocs={} frees={} oom={} corruption={}",
+            stats.live_bytes,
+            stats.allocations,
+            stats.deallocations,
+            stats.oom_failures,
+            stats.corruption_failures
+        );
+    } else {
+        let _ = writeln!(libcanvas::debug::DebugWriter, "[hxfs] heap: uninitialised");
+    }
     libcanvas::process::exit(-1);
 }

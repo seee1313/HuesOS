@@ -164,12 +164,11 @@ version = "0.1.0"
 dependencies = [
  "huesos-abi",
  "huesos-hxfs",
- "huesos-user-alloc",
  "libcanvas",
 ]
 
 [[package]]
-name = "huesos-user-alloc"
+name = "huesos-scudo"
 version = "0.1.0"
 
 [[package]]
@@ -193,6 +192,7 @@ version = "0.1.0"
 dependencies = [
  "huesos-abi",
  "huesos-blobfs",
+ "huesos-scudo",
 ]
 
 [[package]]

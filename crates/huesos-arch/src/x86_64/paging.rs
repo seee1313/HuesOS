@@ -557,6 +557,74 @@ impl AddressSpace {
         Ok(())
     }
 
+    /// Unmap one 4 KiB user page and return its frame to the PMM **iff**
+    /// this address space owns that frame.
+    ///
+    /// This is the decommit half of the userspace heap-window syscall
+    /// (`VmarHeapExtend`). It differs from [`Self::unmap_user_page`] in
+    /// that it also releases the physical frame, which is only correct
+    /// for frames this address space allocated itself via
+    /// [`Self::map_new_user_page`].
+    ///
+    /// Ownership is checked against `owned_frames` before freeing, and
+    /// the entry is removed in the same step. Skipping that bookkeeping
+    /// would leave the frame queued for a second release in
+    /// [`Self::destroy`] — a double free. Frames backing a VMO mapping
+    /// are not owned here and are only unmapped.
+    pub fn unmap_and_release_user_page(
+        &mut self,
+        page: Page<Size4KiB>,
+    ) -> Result<(), UserPageError> {
+        use x86_64::structures::paging::mapper::UnmapError;
+
+        let virt = phys_to_virt(self.pml4_frame.start_address().as_u64());
+        // SAFETY: identical unique-PML4 invariant to try_map_user_page.
+        let table: &mut PageTable = unsafe { &mut *virt.as_mut_ptr() };
+        let phys_offset = VirtAddr::new(*HHDM_OFFSET.lock());
+        // SAFETY: table and physical offset describe this owned address space.
+        let mut mapper = unsafe { OffsetPageTable::new(table, phys_offset) };
+        let (frame, flush) = mapper.unmap(page).map_err(|error| match error {
+            UnmapError::PageNotMapped => UserPageError::NotMapped,
+            UnmapError::ParentEntryHugePage => UserPageError::ParentHugePage,
+            UnmapError::InvalidFrameAddress(_) => UserPageError::InvalidFrameAddress,
+        })?;
+        flush.ignore();
+
+        let frame_addr = frame.start_address().as_u64();
+        if let Some(index) = self
+            .owned_frames
+            .iter()
+            .position(|owned| *owned == frame_addr)
+        {
+            self.owned_frames.swap_remove(index);
+            // SAFETY: the frame was allocated by map_new_user_page for
+            // this address space, was just removed from the page tables
+            // above, and has now been removed from owned_frames, so no
+            // mapping and no later destroy() pass can reach it again.
+            unsafe { PmmFrameAllocator.deallocate_frame(frame) };
+        }
+        Ok(())
+    }
+
+    /// Whether a user page is currently mapped in this address space.
+    pub fn is_user_page_mapped(&self, page: Page<Size4KiB>) -> bool {
+        use x86_64::structures::paging::mapper::TranslateResult;
+        use x86_64::structures::paging::Translate;
+
+        let virt = phys_to_virt(self.pml4_frame.start_address().as_u64());
+        // SAFETY: pml4_frame is owned by this AddressSpace and HHDM maps
+        // every page-table frame for its full lifetime. The mapper is
+        // used read-only here.
+        let table: &mut PageTable = unsafe { &mut *virt.as_mut_ptr() };
+        let phys_offset = VirtAddr::new(*HHDM_OFFSET.lock());
+        // SAFETY: table is the PML4 owned by this address space.
+        let mapper = unsafe { OffsetPageTable::new(table, phys_offset) };
+        !matches!(
+            mapper.translate(page.start_address()),
+            TranslateResult::NotMapped
+        )
+    }
+
     /// Update permissions on one mapped 4 KiB user page in this address space.
     pub fn protect_user_page(
         &mut self,

@@ -36,7 +36,8 @@ test:
 	# when the hxblob index field is also present. 16 MiB is enough.
 	RUST_MIN_STACK=16777216 cargo test -p huesos-abi -p huesos-arch -p huesos-elf -p huesos-pmm -p huesos-object -p huesos-fb \
 		-p huesos-syscalls -p huesos-fat -p huesos-alloc -p huesos-uacpi -p huesos-kernel \
-		-p huesos-user-alloc \
+		-p huesos-scudo \
+		-p huesos-blobfs \
 		-p huesos-lifecycle \
 		-p huesos-ioapic \
 		-p huesos-extable \

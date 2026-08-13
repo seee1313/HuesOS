@@ -478,30 +478,58 @@ impl<T: NvmeTransport> Controller<T> {
 
     // --- I/O queue ---
 
+    /// Compute PRP1/PRP2 for a transfer, delegating the layout rules
+    /// to the audited [`crate::prp`] module.
+    ///
+    /// The previous implementation computed page addresses as
+    /// `buf + n * page_size`, which silently assumed `buf` was page
+    /// aligned. For an unaligned buffer that names the wrong physical
+    /// pages: the device would then DMA over memory the driver never
+    /// intended to expose. It also derived the page count from
+    /// `nbytes` alone, ignoring the offset within the first page, so
+    /// a transfer straddling one extra page programmed one PRP entry
+    /// too few.
+    ///
+    /// `prp::pages_touched` and `prp::fill_rest` handle both cases
+    /// (that is what they were written and unit-tested for), so this
+    /// function now routes through them instead of duplicating —
+    /// incorrectly — the same arithmetic.
     fn setup_prp(&mut self, buf: u64, nbytes: u64) -> Result<(u64, u64), NvmeError> {
         let ps = self.page_size as u64;
-        if nbytes <= ps {
-            return Ok((buf, 0));
+        let page_size = self.page_size;
+        // The offset of the buffer within its own page: this is what
+        // the old code dropped.
+        let offset = (buf & (ps - 1)) as u32;
+        let base = buf - u64::from(offset);
+        let length = u32::try_from(nbytes).map_err(|_| NvmeError::InvalidPrp)?;
+
+        let pages = crate::prp::pages_touched(offset, length, page_size);
+        match pages {
+            0 | 1 => Ok((crate::prp::prp1(base, offset), 0)),
+            2 => Ok((
+                crate::prp::prp1(base, offset),
+                crate::prp::rest_page(base, offset, page_size, 0),
+            )),
+            _ => {
+                let entries = crate::prp::rest_count(offset, length, page_size);
+                // One list page holds `ps / 8` entries. Chaining
+                // across several list pages is still not implemented;
+                // reject rather than program a truncated list. The
+                // NVMe host caps its I/O well below this.
+                if entries as u64 * 8 > ps || self.io_prp_list == 0 {
+                    return Err(NvmeError::InvalidPrp);
+                }
+                let list = self.io_prp_list;
+                let mut index = 0usize;
+                while index < entries {
+                    let entry = crate::prp::rest_page(base, offset, page_size, index);
+                    self.t
+                        .dma_write(list + (index as u64) * 8, &entry.to_le_bytes());
+                    index += 1;
+                }
+                Ok((crate::prp::prp1(base, offset), list))
+            }
         }
-        let pages = nbytes.div_ceil(ps) as usize;
-        if pages == 2 {
-            return Ok((buf, buf + ps));
-        }
-        let entries = pages - 1;
-        if entries as u64 * 8 > ps || self.io_prp_list == 0 {
-            // PRP-list chaining is not implemented yet; reject transfers that
-            // would need more than one list page instead of programming an
-            // invalid contiguous list.
-            return Err(NvmeError::InvalidPrp);
-        }
-        let list = self.io_prp_list;
-        let mut i = 0;
-        while i < entries {
-            let e = buf + ((i + 1) as u64) * ps;
-            self.t.dma_write(list + (i as u64) * 8, &e.to_le_bytes());
-            i += 1;
-        }
-        Ok((buf, list))
     }
 
     fn submit_io(&mut self, mut sqe: Sqe) -> u16 {
@@ -719,6 +747,59 @@ mod tests {
         let mut read = [0u8; 512];
         assert!(c.read(0, 1, &mut read).is_ok());
         assert_eq!(read, data);
+    }
+
+    /// `setup_prp` must derive page addresses from the buffer's own
+    /// page base, not from the buffer address itself.
+    ///
+    /// The old implementation returned `buf + n * page_size`, which
+    /// for an unaligned buffer names addresses that are not page
+    /// bases at all — the device would DMA to the wrong physical
+    /// pages. It also ignored the offset when counting pages, so a
+    /// transfer that straddles one more page than `nbytes / ps`
+    /// suggests programmed too few entries.
+    #[test]
+    fn setup_prp_handles_unaligned_buffers() {
+        let mock = MockNvme::new(1 << 21, 1024, 9);
+        let mut c = Controller::new(mock, 0, 1 << 21);
+        assert!(c.init().is_ok());
+        let ps = c.page_size as u64;
+
+        // A buffer sitting half a page in. 2 pages' worth of bytes
+        // starting mid-page touches THREE pages.
+        let unaligned = (ps * 4) + (ps / 2);
+        let Ok((prp1, prp2)) = c.setup_prp(unaligned, ps * 2) else {
+            assert!(false, "unaligned three-page transfer must be accepted");
+            return;
+        };
+        assert_eq!(prp1, unaligned, "PRP1 is the first byte address");
+        assert_ne!(prp2, 0, "three pages require a PRP list");
+        assert_eq!(prp2, c.io_prp_list);
+
+        // The first list entry must be the NEXT page boundary, which
+        // is `ps * 5` — not `unaligned + ps`.
+        let mut entry = [0u8; 8];
+        c.t.dma_read(c.io_prp_list, &mut entry);
+        assert_eq!(
+            u64::from_le_bytes(entry),
+            ps * 5,
+            "list entries must be page-aligned bases"
+        );
+
+        // An unaligned transfer that fits inside one page needs no PRP2.
+        let Ok((_, small_prp2)) = c.setup_prp(unaligned, 16) else {
+            assert!(false, "single-page transfer must be accepted");
+            return;
+        };
+        assert_eq!(small_prp2, 0);
+
+        // Exactly two pages from an aligned base uses a direct PRP2.
+        let Ok((aligned_prp1, aligned_prp2)) = c.setup_prp(ps * 4, ps * 2) else {
+            assert!(false, "two-page transfer must be accepted");
+            return;
+        };
+        assert_eq!(aligned_prp1, ps * 4);
+        assert_eq!(aligned_prp2, ps * 5, "PRP2 is the second page base");
     }
 
     #[test]

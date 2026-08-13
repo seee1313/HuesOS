@@ -1,0 +1,13 @@
+[package]
+name = "huesos-scudo"
+version = "0.1.0"
+edition = "2021"
+description = "Hardened userspace allocator for HuesOS, following the LLVM Scudo architecture."
+
+[dependencies]
+# no_std; the platform backend is supplied by the embedding program.
+
+[features]
+# Exposes `backend::TestBackend` (a buffer-backed Backend) to
+# downstream integration tests. Enabled automatically under `cfg(test)`.
+test-backend = []

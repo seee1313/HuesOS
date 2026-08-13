@@ -11,6 +11,10 @@ name = "huesos-blobfs"
 version = "0.1.0"
 
 [[package]]
+name = "huesos-scudo"
+version = "0.1.0"
+
+[[package]]
 name = "huesos-shutdown-broker"
 version = "0.1.0"
 dependencies = [
@@ -24,4 +28,5 @@ version = "0.1.0"
 dependencies = [
  "huesos-abi",
  "huesos-blobfs",
+ "huesos-scudo",
 ]
