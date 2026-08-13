@@ -182,7 +182,11 @@ pub fn finish_command(out: &mut [u8], len: usize) -> Result<(), TpmCommandError>
 }
 
 /// Append bytes to a command being built.
-pub(crate) fn push(out: &mut [u8], cursor: &mut usize, bytes: &[u8]) -> Result<(), TpmCommandError> {
+pub(crate) fn push(
+    out: &mut [u8],
+    cursor: &mut usize,
+    bytes: &[u8],
+) -> Result<(), TpmCommandError> {
     let end = cursor
         .checked_add(bytes.len())
         .ok_or(TpmCommandError::BufferTooSmall)?;

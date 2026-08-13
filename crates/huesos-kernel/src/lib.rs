@@ -12,7 +12,6 @@ extern crate alloc;
 
 pub mod boot;
 pub mod boot_key;
-pub mod tpm;
 pub mod extable;
 pub mod init;
 pub mod mem;
@@ -22,6 +21,7 @@ pub mod scheduler;
 pub mod shutdown;
 pub mod smp;
 pub mod task;
+pub mod tpm;
 
 /// Ring-0 async runtime: per-CPU executor with reactor model.
 pub mod async_rt;

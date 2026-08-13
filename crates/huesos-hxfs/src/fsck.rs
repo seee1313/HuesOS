@@ -1,7 +1,10 @@
-//! Report-only Hxfs fsck/scrub policy core.
+//! Hxfs fsck/scrub policy core, plus the repair planner built on it.
 //!
-//! Stage W starts with detection, not repair. Repair is deliberately excluded
-//! until the exact destructive semantics are reviewed.
+//! Detection came first and repair stayed out until the destructive
+//! semantics were reviewed; that review is `docs/design/HXFS_REPAIR_POLICY.md`
+//! and this module implements it. The planner is deliberately separate from
+//! the executor: a plan can be inspected, printed, and refused without
+//! anything on the volume having changed yet.
 
 use crate::format::*;
 
@@ -395,5 +398,321 @@ mod tests {
         assert!(!report
             .findings()
             .contains(&Some(FsckFinding::QuotaMismatch)));
+    }
+}
+
+/// What a repair is permitted to do to a finding.
+///
+/// The class, not the finding, decides the permission. See
+/// `docs/design/HXFS_REPAIR_POLICY.md`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RepairClass {
+    /// The correct value is recomputable from data the volume still
+    /// holds. Rewriting it discards nothing.
+    Derivable,
+    /// Consistency can only be restored by discarding something that
+    /// might be live. Requires explicit destructive consent.
+    Destructive,
+    /// No independent source of truth exists. Repair would be a guess
+    /// with a checksum on it, so the pass refuses instead.
+    Refuse,
+}
+
+/// Classify a finding under the repair policy.
+pub const fn classify(finding: FsckFinding) -> RepairClass {
+    match finding {
+        // Totals are a cache of the live objects; the objects win.
+        FsckFinding::QuotaMismatch => RepairClass::Derivable,
+        // Rebuilding reference state can drop references it cannot
+        // attribute to a live owner.
+        FsckFinding::ReferenceMismatch => RepairClass::Destructive,
+        // The tree cannot be interpreted without its feature bit, so
+        // it can only be detached, never validated.
+        FsckFinding::UnexpectedRoot { .. } => RepairClass::Destructive,
+        // Synthesising a missing root hides every object it indexed
+        // behind a clean-looking volume.
+        FsckFinding::MissingRequiredRoot { .. } => RepairClass::Refuse,
+        // Clearing unknown feature bits mounts an on-disk format this
+        // build does not implement.
+        FsckFinding::BadFeatureSet => RepairClass::Refuse,
+        // Not corruption: the journal holds the correct values and is
+        // about to write them.
+        FsckFinding::NeedsJournalReplay => RepairClass::Refuse,
+    }
+}
+
+/// Why a repair pass declined to act.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RepairRefusal {
+    /// The volume is mid-recovery; replay owns these values.
+    JournalReplayPending,
+    /// A finding with no trustworthy source of truth was present, so
+    /// the whole pass refused rather than repairing around it.
+    Unrepairable {
+        /// The finding that forced the refusal.
+        finding: FsckFinding,
+    },
+    /// The plan contains destructive actions and the caller did not
+    /// grant destructive consent.
+    ConsentRequired,
+    /// More actions than the plan can hold.
+    PlanOverflow,
+}
+
+/// A single intended repair action.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RepairAction {
+    /// The finding this action answers.
+    pub finding: FsckFinding,
+    /// The permission class the action runs under.
+    pub class: RepairClass,
+}
+
+/// An ordered, inspectable set of intended repairs.
+///
+/// Building a plan changes nothing. A caller that wants a dry run
+/// builds the plan and prints it.
+pub struct RepairPlan<const N: usize> {
+    actions: [Option<RepairAction>; N],
+    destructive: u32,
+}
+
+impl<const N: usize> Default for RepairPlan<N> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<const N: usize> RepairPlan<N> {
+    /// Create an empty plan.
+    pub const fn new() -> Self {
+        Self {
+            actions: [const { None }; N],
+            destructive: 0,
+        }
+    }
+
+    /// Planned actions, in the order they would be applied.
+    pub const fn actions(&self) -> &[Option<RepairAction>; N] {
+        &self.actions
+    }
+
+    /// Number of planned actions.
+    pub fn action_count(&self) -> usize {
+        self.actions.iter().filter(|slot| slot.is_some()).count()
+    }
+
+    /// How many planned actions may discard live data.
+    pub const fn destructive_count(&self) -> u32 {
+        self.destructive
+    }
+
+    /// Whether the plan would change anything.
+    pub fn is_empty(&self) -> bool {
+        self.action_count() == 0
+    }
+
+    fn push(&mut self, action: RepairAction) -> Result<(), RepairRefusal> {
+        for slot in self.actions.iter_mut() {
+            if slot.is_none() {
+                if action.class == RepairClass::Destructive {
+                    self.destructive = self.destructive.saturating_add(1);
+                }
+                *slot = Some(action);
+                return Ok(());
+            }
+        }
+        Err(RepairRefusal::PlanOverflow)
+    }
+}
+
+/// Caller authorisation for actions that may discard live data.
+///
+/// A distinct type rather than a bool field: a caller that has not
+/// considered destructive repair cannot grant it by copying an
+/// example and leaving a flag set.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DestructiveConsent {
+    /// Only derivable repairs may be applied.
+    Withheld,
+    /// Destructive repairs are authorised for this pass.
+    Granted,
+}
+
+/// Build a repair plan from a scrub report.
+///
+/// Enforces the ordering rules from the policy: replay before repair,
+/// refuse before repair, report before applying.
+pub fn plan_repairs<const N: usize, const M: usize>(
+    report: &FsckReport<M>,
+    consent: DestructiveConsent,
+) -> Result<RepairPlan<N>, RepairRefusal> {
+    // Rule 1: a volume mid-recovery has a journal that is about to
+    // overwrite whatever we would repair, and findings taken from the
+    // un-replayed state may be artefacts of it.
+    for finding in report.findings().iter().flatten() {
+        if *finding == FsckFinding::NeedsJournalReplay {
+            return Err(RepairRefusal::JournalReplayPending);
+        }
+    }
+
+    // Rule 2: refuse as a whole rather than repairing around an
+    // unexplained structural fault. Partial repair yields a volume
+    // that looks healthier than it is.
+    for finding in report.findings().iter().flatten() {
+        if classify(*finding) == RepairClass::Refuse {
+            return Err(RepairRefusal::Unrepairable { finding: *finding });
+        }
+    }
+
+    let mut plan = RepairPlan::new();
+    // Derivable actions first: they discard nothing, so if a later
+    // destructive action is refused the safe work is still described.
+    for finding in report.findings().iter().flatten() {
+        if classify(*finding) == RepairClass::Derivable {
+            plan.push(RepairAction {
+                finding: *finding,
+                class: RepairClass::Derivable,
+            })?;
+        }
+    }
+    for finding in report.findings().iter().flatten() {
+        if classify(*finding) == RepairClass::Destructive {
+            plan.push(RepairAction {
+                finding: *finding,
+                class: RepairClass::Destructive,
+            })?;
+        }
+    }
+
+    if plan.destructive_count() > 0 && consent == DestructiveConsent::Withheld {
+        return Err(RepairRefusal::ConsentRequired);
+    }
+    Ok(plan)
+}
+
+#[cfg(test)]
+mod repair_tests {
+    use super::*;
+
+    fn report_with(findings: &[FsckFinding]) -> FsckReport<8> {
+        let mut report = FsckReport::new();
+        for finding in findings {
+            report.record(*finding);
+        }
+        report
+    }
+
+    /// A quota total is a cache of the live objects, so it can be
+    /// rewritten without discarding anything and needs no consent.
+    #[test]
+    fn derivable_findings_are_planned_without_consent() {
+        let report = report_with(&[FsckFinding::QuotaMismatch]);
+        let Ok(plan) = plan_repairs::<8, 8>(&report, DestructiveConsent::Withheld) else {
+            assert!(false, "a derivable repair must not require consent");
+            return;
+        };
+        assert_eq!(plan.action_count(), 1);
+        assert_eq!(plan.destructive_count(), 0);
+    }
+
+    /// Rebuilding reference state can drop references it cannot
+    /// attribute to a live owner, so it must not happen silently.
+    #[test]
+    fn destructive_findings_require_explicit_consent() {
+        let report = report_with(&[FsckFinding::ReferenceMismatch]);
+        assert_eq!(
+            plan_repairs::<8, 8>(&report, DestructiveConsent::Withheld).err(),
+            Some(RepairRefusal::ConsentRequired)
+        );
+        let Ok(plan) = plan_repairs::<8, 8>(&report, DestructiveConsent::Granted) else {
+            assert!(false, "granted consent must allow the plan");
+            return;
+        };
+        assert_eq!(plan.destructive_count(), 1);
+    }
+
+    /// Synthesising a missing root would present a clean volume whose
+    /// indexed objects are all unreachable. Consent cannot buy this.
+    #[test]
+    fn unrepairable_findings_are_refused_even_with_consent() {
+        let report = report_with(&[FsckFinding::MissingRequiredRoot {
+            root: FsckRoot::Refcount,
+        }]);
+        assert_eq!(
+            plan_repairs::<8, 8>(&report, DestructiveConsent::Granted).err(),
+            Some(RepairRefusal::Unrepairable {
+                finding: FsckFinding::MissingRequiredRoot {
+                    root: FsckRoot::Refcount,
+                }
+            })
+        );
+    }
+
+    /// Rule 2: a repairable finding sitting next to an unexplained
+    /// structural fault must not be repaired on its own. Doing so
+    /// leaves a volume that looks healthier than it is and strips
+    /// evidence from the next scrub.
+    #[test]
+    fn one_unrepairable_finding_refuses_the_whole_pass() {
+        let report = report_with(&[FsckFinding::QuotaMismatch, FsckFinding::BadFeatureSet]);
+        assert_eq!(
+            plan_repairs::<8, 8>(&report, DestructiveConsent::Granted).err(),
+            Some(RepairRefusal::Unrepairable {
+                finding: FsckFinding::BadFeatureSet
+            })
+        );
+    }
+
+    /// Rule 1: the journal is about to write the correct values, and
+    /// findings read from the un-replayed state may be artefacts of
+    /// it. Replay outranks every other repair, including derivable
+    /// ones that would otherwise be safe.
+    #[test]
+    fn pending_journal_replay_outranks_every_other_repair() {
+        let report = report_with(&[FsckFinding::QuotaMismatch, FsckFinding::NeedsJournalReplay]);
+        assert_eq!(
+            plan_repairs::<8, 8>(&report, DestructiveConsent::Granted).err(),
+            Some(RepairRefusal::JournalReplayPending)
+        );
+    }
+
+    /// Derivable actions are ordered ahead of destructive ones, so a
+    /// pass that stops early has still described the work that
+    /// discards nothing.
+    #[test]
+    fn derivable_actions_are_ordered_before_destructive_ones() {
+        let report = report_with(&[FsckFinding::ReferenceMismatch, FsckFinding::QuotaMismatch]);
+        let Ok(plan) = plan_repairs::<8, 8>(&report, DestructiveConsent::Granted) else {
+            assert!(false, "the plan must build with consent");
+            return;
+        };
+        let Some(Some(first)) = plan.actions().first() else {
+            assert!(false, "the plan must have a first action");
+            return;
+        };
+        assert_eq!(first.class, RepairClass::Derivable);
+    }
+
+    /// A clean volume must produce a plan that would change nothing.
+    #[test]
+    fn a_clean_report_plans_no_work() {
+        let report = report_with(&[]);
+        let Ok(plan) = plan_repairs::<8, 8>(&report, DestructiveConsent::Withheld) else {
+            assert!(false, "a clean report must plan cleanly");
+            return;
+        };
+        assert!(plan.is_empty());
+    }
+
+    /// A plan that cannot hold every action must refuse rather than
+    /// silently apply a truncated repair.
+    #[test]
+    fn a_plan_too_small_for_its_actions_refuses() {
+        let report = report_with(&[FsckFinding::QuotaMismatch, FsckFinding::QuotaMismatch]);
+        assert_eq!(
+            plan_repairs::<1, 8>(&report, DestructiveConsent::Granted).err(),
+            Some(RepairRefusal::PlanOverflow)
+        );
     }
 }

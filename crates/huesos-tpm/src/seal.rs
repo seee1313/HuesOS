@@ -260,11 +260,10 @@ pub fn unseal_volume_key<T: CrbTransport>(
     push_u16(&mut command_buf, &mut cursor, 0)?;
     push(&mut command_buf, &mut cursor, &[0u8])?;
     push_u16(&mut command_buf, &mut cursor, 0)?;
-    let auth_size = u32::try_from(cursor - auth_start - 4)
-        .map_err(|_| TpmCommandError::BufferTooSmall)?;
+    let auth_size =
+        u32::try_from(cursor - auth_start - 4).map_err(|_| TpmCommandError::BufferTooSmall)?;
     command_buf[auth_start..auth_start + 4].copy_from_slice(&auth_size.to_be_bytes());
-    let private_len =
-        u16::try_from(sealed.private().len()).map_err(|_| SealError::BlobTooLarge)?;
+    let private_len = u16::try_from(sealed.private().len()).map_err(|_| SealError::BlobTooLarge)?;
     push_u16(&mut command_buf, &mut cursor, private_len)?;
     push(&mut command_buf, &mut cursor, sealed.private())?;
     let public_len = u16::try_from(sealed.public().len()).map_err(|_| SealError::BlobTooLarge)?;
@@ -312,8 +311,8 @@ fn unseal_loaded<T: CrbTransport>(
     push_u16(&mut command_buf, &mut cursor, 0)?;
     push(&mut command_buf, &mut cursor, &[0u8])?;
     push_u16(&mut command_buf, &mut cursor, 0)?;
-    let auth_size = u32::try_from(cursor - auth_start - 4)
-        .map_err(|_| TpmCommandError::BufferTooSmall)?;
+    let auth_size =
+        u32::try_from(cursor - auth_start - 4).map_err(|_| TpmCommandError::BufferTooSmall)?;
     command_buf[auth_start..auth_start + 4].copy_from_slice(&auth_size.to_be_bytes());
     finish_command(&mut command_buf, cursor)?;
 
@@ -358,8 +357,8 @@ pub fn seal_volume_key<T: CrbTransport>(
     push_u16(&mut command_buf, &mut cursor, 0)?;
     push(&mut command_buf, &mut cursor, &[0u8])?;
     push_u16(&mut command_buf, &mut cursor, 0)?;
-    let auth_size = u32::try_from(cursor - auth_start - 4)
-        .map_err(|_| TpmCommandError::BufferTooSmall)?;
+    let auth_size =
+        u32::try_from(cursor - auth_start - 4).map_err(|_| TpmCommandError::BufferTooSmall)?;
     command_buf[auth_start..auth_start + 4].copy_from_slice(&auth_size.to_be_bytes());
 
     // TPM2B_SENSITIVE_CREATE: empty auth, the key as sensitive data.
@@ -383,10 +382,10 @@ pub fn seal_volume_key<T: CrbTransport>(
     let public_body = cursor;
     push_u16(&mut command_buf, &mut cursor, 0x0008)?; // TPM_ALG_KEYEDHASH
     push_u16(&mut command_buf, &mut cursor, 0x000B)?; // nameAlg SHA-256
-    // objectAttributes: fixedTPM | fixedParent. Deliberately NOT
-    // userWithAuth: the object must be usable only through the policy
-    // session, otherwise an empty password would unseal it and the PCR
-    // binding would be decorative.
+                                                      // objectAttributes: fixedTPM | fixedParent. Deliberately NOT
+                                                      // userWithAuth: the object must be usable only through the policy
+                                                      // session, otherwise an empty password would unseal it and the PCR
+                                                      // binding would be decorative.
     push_u32(&mut command_buf, &mut cursor, 0x0000_0012)?;
     push_u16(
         &mut command_buf,
@@ -396,8 +395,8 @@ pub fn seal_volume_key<T: CrbTransport>(
     push(&mut command_buf, &mut cursor, policy_digest)?;
     push_u16(&mut command_buf, &mut cursor, 0x0010)?; // TPM_ALG_NULL scheme
     push_u16(&mut command_buf, &mut cursor, 0)?; // unique
-    let public_size = u16::try_from(cursor - public_body)
-        .map_err(|_| TpmCommandError::BufferTooSmall)?;
+    let public_size =
+        u16::try_from(cursor - public_body).map_err(|_| TpmCommandError::BufferTooSmall)?;
     command_buf[public_start..public_start + 2].copy_from_slice(&public_size.to_be_bytes());
 
     push_u16(&mut command_buf, &mut cursor, 0)?; // outsideInfo

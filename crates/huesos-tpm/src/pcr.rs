@@ -99,11 +99,7 @@ impl PcrSelection {
     }
 
     /// Encode as a `TPML_PCR_SELECTION` with a single SHA-256 bank.
-    pub(crate) fn encode(
-        &self,
-        out: &mut [u8],
-        cursor: &mut usize,
-    ) -> Result<(), TpmCommandError> {
+    pub(crate) fn encode(&self, out: &mut [u8], cursor: &mut usize) -> Result<(), TpmCommandError> {
         push_u32(out, cursor, 1)?;
         push_u16(out, cursor, ALG_SHA256)?;
         push(out, cursor, &[3u8])?;
@@ -243,6 +239,9 @@ mod tests {
         let mut cursor = 0usize;
         assert!(selection.encode(&mut buf, &mut cursor).is_ok());
         // count=1, alg=SHA256, sizeofSelect=3, bitmap.
-        assert_eq!(&buf[..cursor], &[0, 0, 0, 1, 0x00, 0x0B, 3, 0x01, 0x00, 0x00]);
+        assert_eq!(
+            &buf[..cursor],
+            &[0, 0, 0, 1, 0x00, 0x0B, 3, 0x01, 0x00, 0x00]
+        );
     }
 }
