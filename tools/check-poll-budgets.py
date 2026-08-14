@@ -63,29 +63,62 @@ WATCHED = [
 # Receive calls that can block a drain open indefinitely.
 RECV = re.compile(r"\b(read_into|read_optional_handle|read_handle|recv)\s*\(")
 
-# An unconditional `loop {`. `while let` and `for` are bounded by their
-# own condition, so they are not the shape this gate is about.
-UNBOUNDED_LOOP = re.compile(r"^\s*(\}\s*)?loop\s*\{", re.MULTILINE)
+# Loop shapes that can spin indefinitely on a channel.
+#
+# `loop {` is the obvious one. `while let Some(x) = <slot>` is just as
+# dangerous here and was originally excluded on the theory that it is
+# "bounded by its own condition" -- it is not: the condition tests a
+# service slot that stays occupied for the life of the connection, so
+# the loop only ends when the peer goes quiet. poll_client, poll_file
+# and poll_dir are all this shape, so excluding it meant the gate was
+# silently ignoring three of the functions it exists to protect.
+#
+# `for` IS genuinely bounded by its iterator and stays excluded.
+UNBOUNDED_LOOP = re.compile(
+    r"^\s*(\}\s*)?(loop\s*\{|while\s+let\b|while\s+(?!let\b)[^\n{]*\{)",
+    re.MULTILINE,
+)
 
-# A per-tick budget of any spelling (`budget`, `POLL_BUDGET_PER_TICK`,
-# `remaining_budget`, ...). We deliberately match loosely: the point is
-# that the author thought about boundedness, not a specific identifier.
-BUDGET = re.compile(r"\bbudget\b", re.IGNORECASE)
+# Evidence that the loop is bounded. Two legitimate shapes:
+#
+#   * a per-tick message budget (`budget`, `POLL_BUDGET_PER_TICK`, ...)
+#     for a steady-state poll that must yield back to its siblings;
+#   * a wall-clock deadline (`deadline`, `MOUNT_HANDOFF_BUDGET_TICKS`,
+#     `monotonic_ticks`) for a one-shot handshake that legitimately
+#     waits, but must not wait forever.
+#
+# Matching only `budget` was itself a hole: mount_from_bootstrap was
+# rewritten to use a `deadline` and the gate went on reporting the file
+# clean, so a revert to an unbounded wait would have gone unnoticed.
+# Match either spelling of "the author bounded this".
+BOUNDED = re.compile(r"\b(budget|deadline|monotonic_ticks)\b", re.IGNORECASE)
 
 # (file suffix, function name) -> reason. Each exemption is a claim that
 # the loop is bounded by something other than a budget; state why.
-EXEMPT = {
-    (
-        "hxfs-service/src/main.rs",
-        "mount_from_bootstrap",
-    ): (
-        "one-shot mount handshake run before the service loop starts, not a "
-        "steady-state poll: it must block until the volume handle arrives or "
-        "there is nothing to serve at all."
-    ),
-}
+#
+# Currently empty, and that is the intended state. mount_from_bootstrap
+# used to be listed here as "must block until the volume arrives"; it
+# now bounds itself in wall time instead, because "block until it
+# arrives" and "block forever with no message" are different contracts
+# and only the first one is a design.
+EXEMPT: dict[tuple[str, str], str] = {}
 
 FN_START = re.compile(r"^([ \t]*)(?:pub(?:\([^)]*\))?\s+)?(?:async\s+)?fn\s+(\w+)", re.MULTILINE)
+
+LINE_COMMENT = re.compile(r"//[^\n]*")
+BLOCK_COMMENT = re.compile(r"/\*.*?\*/", re.DOTALL)
+
+
+def strip_comments(text: str) -> str:
+    """Remove Rust comments so evidence is read from CODE, not prose.
+
+    This matters more than it looks. The first version of this gate
+    matched the raw body, so the explanatory comment above a loop
+    ("... the deadline is armed lazily ...") satisfied the check on its
+    own: deleting the actual deadline logic left the gate green. A gate
+    that a comment can satisfy is not a gate.
+    """
+    return LINE_COMMENT.sub("", BLOCK_COMMENT.sub("", text))
 
 
 def function_bodies(text: str):
@@ -126,7 +159,8 @@ def check_file(root: Path, rel: str) -> list[str]:
 
     failures: list[str] = []
     text = path.read_text(encoding="utf-8", errors="replace")
-    for name, line_no, body in function_bodies(text):
+    for name, line_no, raw_body in function_bodies(text):
+        body = strip_comments(raw_body)
         if not UNBOUNDED_LOOP.search(body) or not RECV.search(body):
             continue
         exempt_key = next(
@@ -134,11 +168,11 @@ def check_file(root: Path, rel: str) -> list[str]:
         )
         if exempt_key is not None:
             continue
-        if BUDGET.search(body):
+        if BOUNDED.search(body):
             continue
         failures.append(
-            f"{rel}:{line_no}: `{name}` drains a channel in an unbounded "
-            f"`loop` with no per-tick budget"
+            f"{rel}:{line_no}: `{name}` drains a channel in a loop with "
+            f"neither a per-tick budget nor a wall-clock deadline"
         )
     return failures
 
@@ -166,12 +200,19 @@ def main() -> int:
         print()
         print(f"poll-budget gate failed: {len(failures)} unbounded drain(s).")
         print(
-            "Rule: a `poll_*` in a shared cooperative loop must serve at most "
-            "POLL_BUDGET_PER_TICK messages and then return, so the other "
-            "endpoints in the same pass are not starved by one talkative peer. "
-            "Copy the `budget = match budget.checked_sub(1)` prologue from "
-            "`poll_nvme_host`. If the loop really is bounded some other way, "
-            "add it to EXEMPT in tools/check-poll-budgets.py with a reason."
+            "Rule: a loop that reads a channel in a shared cooperative "
+            "service must bound itself, in one of two ways.\n"
+            "  * Steady-state poll (poll_client, poll_nvme_host, ...): serve "
+            "at most POLL_BUDGET_PER_TICK messages, then return so the other "
+            "endpoints in the same pass are not starved by one talkative "
+            "peer. Copy the `budget = match budget.checked_sub(1)` prologue "
+            "from `poll_nvme_host`.\n"
+            "  * One-shot handshake (mount_from_bootstrap): it may legitimately "
+            "wait, but not forever -- arm a deadline against "
+            "`libcanvas::system::monotonic_ticks()` and report why it gave up.\n"
+            "Evidence is read from code with comments stripped, so a comment "
+            "mentioning a budget will not satisfy this gate. If a loop really "
+            "is bounded some other way, add it to EXEMPT with a reason."
         )
         return 1
 

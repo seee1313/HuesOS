@@ -1662,8 +1662,34 @@ impl HxfsRuntime {
     }
 }
 
+/// Wall-clock budget for the block-device handoff, in kernel 100 Hz
+/// monotonic ticks.
+///
+/// Generous on purpose: the handoff waits on DriverManager probing
+/// PCI, attaching the NVMe controller and identifying a namespace,
+/// which is slow on a debug build under a loaded CI runner. The
+/// budget exists to convert "hangs forever" into "reports why and
+/// exits", not to police normal boot latency.
+const MOUNT_HANDOFF_BUDGET_TICKS: u64 = 100 * 90;
+
 fn mount_from_bootstrap(bootstrap: &Channel) -> Option<Box<MountedHxfs>> {
     let mut buf = [0u8; 64];
+    // Bound the handoff in WALL TIME. This loop is the one place the
+    // service is allowed to block -- it has nothing to serve until
+    // the volume arrives -- but "block until it arrives" and "block
+    // forever" are different contracts. A peer that holds the
+    // channel open and never sends the handle (a DriverManager that
+    // died after connecting, an NVMe controller that never
+    // enumerates) would otherwise park the service in yield_now()
+    // for the life of the machine, with no message and no exit.
+    //
+    // A retry COUNT would be the wrong unit: this loop yields, so it
+    // spins as fast as the scheduler allows and a fixed number of
+    // iterations expires in milliseconds while the device is
+    // legitimately still coming up. The deadline is armed lazily on
+    // the first wait so slow toolchain startup is not charged
+    // against it.
+    let mut deadline: Option<u64> = None;
     loop {
         match bootstrap.read_optional_handle(&mut buf) {
             Ok((n, Some(handle))) if &buf[..n] == b"hxfs:block-device" => {
@@ -1769,6 +1795,29 @@ fn mount_from_bootstrap(bootstrap: &Channel) -> Option<Box<MountedHxfs>> {
             Ok((_n, Some(handle))) => drop(handle),
             Ok((_n, None)) => {}
             Err(ErrorCode::ShouldWait) | Err(ErrorCode::TimedOut) => {
+                // Only a wait can time out; a message of any kind
+                // means the peer is alive, so the budget is not
+                // consumed by a chatty-but-correct handoff.
+                // A clock read that FAILS leaves the deadline
+                // unchanged and the loop waits on: aborting a mount
+                // because the clock syscall misbehaved would fail a
+                // healthy volume for a reason unrelated to storage.
+                if let Ok(now) = libcanvas::system::monotonic_ticks() {
+                    match deadline {
+                        Some(limit) if now >= limit => {
+                            println!(
+                                "[hxfs] no block device handed over within {} s; giving up",
+                                MOUNT_HANDOFF_BUDGET_TICKS / 100
+                            );
+                            println!("[hxfs] hint: DriverManager never sent hxfs:block-device");
+                            return None;
+                        }
+                        Some(_) => {}
+                        None => {
+                            deadline = Some(now.saturating_add(MOUNT_HANDOFF_BUDGET_TICKS));
+                        }
+                    }
+                }
                 libcanvas::process::yield_now();
             }
             Err(_) => return None,
