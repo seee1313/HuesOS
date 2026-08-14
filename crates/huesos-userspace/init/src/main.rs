@@ -159,26 +159,39 @@ pub extern "C" fn _start() -> ! {
         // boot: NVMe enumeration plus the Hxfs mount dominates, and the
         // handoff below is what makes it start.
         ui.begin(b"storage", &mut logger);
+        // The handoff occupies the first quarter of the stage and the
+        // work it triggers occupies the rest. Progress is monotonic, so
+        // these must not overlap DriverManager's own reports, which
+        // start at 30.
         send_bootfs_vmo(&mut logger, channel, &bootfs);
-        ui.step(b"storage", 15);
+        ui.step(b"storage", 5);
         send_acpi_tables_vmo(&mut logger, channel, &acpi_tables);
-        ui.step(b"storage", 30);
+        ui.step(b"storage", 10);
         send_acpi_broker(&mut logger, channel, acpi_broker);
-        ui.step(b"storage", 45);
+        ui.step(b"storage", 15);
         send_storage_boot_info_vmo(&mut logger, channel, &storage_boot_info);
-        ui.step(b"storage", 60);
+        ui.step(b"storage", 20);
         send_manifest_grants(
             &mut logger,
             channel,
             &bootfs,
             b"/manifests/input-host.hdriver",
         );
-        ui.step(b"storage", 80);
-        send_nvme_boot_grants(&mut logger, channel, &storage_boot_info);
-        // DriverManager owns the NVMe/Hxfs bring-up from here; init has
-        // no separate ready message for it, so the stage closes once
-        // its grants are delivered.
-        ui.end(b"storage", StageState::Done, &mut logger);
+        ui.step(b"storage", 25);
+        if !send_nvme_boot_grants(&mut logger, channel, &storage_boot_info) {
+            // No controller to bring up: nothing will ever report on
+            // this stage, so settle it now instead of holding the boot
+            // until its deadline expires.
+            ui.end(b"storage", StageState::Skipped, &mut logger);
+        }
+        // The stage deliberately stays open here. Handing over the
+        // grants is where DriverManager's work *starts*: it then
+        // enumerates the NVMe controller, mounts Hxfs and brings the
+        // filesystem service online, which is the longest stretch of
+        // the boot. Closing the stage now would fill a quarter of the
+        // bar and then show nothing for several seconds. DriverManager
+        // reports the rest over this same channel and closes the stage
+        // with `storage:ready`.
     }
 
     // DriverManager owns the isolated ACPI manager launch because it receives
@@ -213,6 +226,13 @@ pub extern "C" fn _start() -> ! {
     }
     if let Some((_, channel)) = &terminal {
         ui.wait_ready(b"terminal", channel, &mut logger);
+    }
+
+    // Stages DriverManager drives (storage) are still in flight; pump
+    // its channel until they settle so the last frame the user sees is
+    // a finished bar rather than one frozen mid-way.
+    if let Some((_, channel)) = &driver_manager {
+        ui.drain(channel, &mut logger);
     }
 
     // Final frame while init still owns the display, then hand the
@@ -582,7 +602,15 @@ fn send_manifest_grants(
     }
 }
 
-fn send_nvme_boot_grants(logger: &mut InitLogger, dm_bootstrap: &Channel, storage: &Vmo) {
+/// Mint and transfer the NVMe boot resources.
+///
+/// Returns whether a controller was actually handed over. The caller
+/// needs this: with no NVMe function there is nothing to enumerate and
+/// no filesystem to mount, so the storage stage must be marked skipped
+/// rather than left waiting for a bring-up that will never be
+/// attempted. A serial-only or diskless boot is a normal
+/// configuration, not a failure.
+fn send_nvme_boot_grants(logger: &mut InitLogger, dm_bootstrap: &Channel, storage: &Vmo) -> bool {
     use libcanvas::manifest::ResourceGrant;
     use libcanvas::resource::{kind, Resource};
     use libcanvas::storage_boot;
@@ -596,7 +624,7 @@ fn send_nvme_boot_grants(logger: &mut InitLogger, dm_bootstrap: &Channel, storag
                 "[init] NVMe boot grants skipped: storage boot-info read failed: {}",
                 error.as_str()
             );
-            return;
+            return false;
         }
     };
     let Some(info) = storage_boot::decode(&bytes[..read]) else {
@@ -604,14 +632,14 @@ fn send_nvme_boot_grants(logger: &mut InitLogger, dm_bootstrap: &Channel, storag
             logger,
             "[init] NVMe boot grants skipped: bad storage boot-info"
         );
-        return;
+        return false;
     };
     if info.nvme_count == 0 {
         init_logln!(
             logger,
             "[init] NVMe boot grants skipped: no NVMe PCI function"
         );
-        return;
+        return false;
     }
 
     let nvme = info.nvme[0];
@@ -702,6 +730,7 @@ fn send_nvme_boot_grants(logger: &mut InitLogger, dm_bootstrap: &Channel, storag
             error.as_str()
         ),
     }
+    true
 }
 
 fn format_grants_complete_label(out: &mut [u8], driver: &str) -> usize {

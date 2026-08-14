@@ -122,9 +122,24 @@ impl BootUi {
     /// then jumped, which is precisely the behaviour the weighting was
     /// introduced to avoid.
     pub fn step(&mut self, id: &[u8], percent: u8) {
+        self.report(id, percent);
+    }
+
+    /// Record progress for `id`, starting the stage if a report
+    /// arrives before init formally began it.
+    ///
+    /// Auto-start matters for stages another process drives: the first
+    /// thing init hears about the Hxfs mount may be `storage:progress`,
+    /// and a report for a stage still marked pending would otherwise be
+    /// dropped by `report_progress`.
+    fn report(&mut self, id: &[u8], percent: u8) {
         let Some(index) = self.progress.index_of(id) else {
             return;
         };
+        if self.progress.stages()[index].state == StageState::Pending {
+            let tick = self.now();
+            self.progress.start(index, tick);
+        }
         self.progress.report_progress(index, percent);
         self.render();
     }
@@ -157,20 +172,34 @@ impl BootUi {
         loop {
             match channel.read_into(&mut buf) {
                 Ok(n) => match parse_report(&buf[..n]) {
-                    ServiceReport::Ready { .. } => {
+                    // Reports are routed by the name the service sends,
+                    // not by the stage init happens to be waiting on. A
+                    // single bootstrap channel carries traffic for
+                    // several stages: DriverManager owns the NVMe and
+                    // Hxfs bring-up, so `storage:progress:NN` arrives on
+                    // the same channel init is using to wait for
+                    // `driver-manager:ready`. Matching on the waited-for
+                    // stage would drop exactly the reports that describe
+                    // the longest part of the boot.
+                    ServiceReport::Ready { name } if name == id => {
                         self.end(id, StageState::Done, logger);
                         return StageState::Done;
                     }
-                    ServiceReport::Degraded { .. } => {
+                    ServiceReport::Degraded { name } if name == id => {
                         // A real answer, not a failure: the service is
                         // up with reduced function. Settle the stage so
                         // the boot proceeds, but record it honestly.
                         self.end(id, StageState::Degraded, logger);
                         return StageState::Degraded;
                     }
-                    ServiceReport::Progress { percent, .. } => {
-                        self.progress.report_progress(index, percent);
-                        self.render();
+                    ServiceReport::Ready { name } => {
+                        self.end(name, StageState::Done, logger);
+                    }
+                    ServiceReport::Degraded { name } => {
+                        self.end(name, StageState::Degraded, logger);
+                    }
+                    ServiceReport::Progress { name, percent } => {
+                        self.report(name, percent);
                     }
                     ServiceReport::Other => {
                         let text = core::str::from_utf8(&buf[..n]).unwrap_or("<non-utf8>");
@@ -215,6 +244,67 @@ impl BootUi {
                 );
                 self.end(id, StageState::Failed, logger);
                 return StageState::Failed;
+            }
+        }
+    }
+
+    /// Pump `channel` until every stage has settled or their deadlines
+    /// expire.
+    ///
+    /// Stages another process drives finish after init has run out of
+    /// its own work. Without this the boot would reach the framebuffer
+    /// handoff with the storage stage still open, and the last thing on
+    /// screen would be a bar frozen mid-way — the failure mode this
+    /// whole design exists to avoid.
+    pub fn drain(&mut self, channel: &Channel, logger: &mut InitLogger) {
+        let mut buf = [0u8; 64];
+        let mut spins: u32 = 0;
+        while !self.progress.all_settled() {
+            match channel.read_into(&mut buf) {
+                Ok(n) => match parse_report(&buf[..n]) {
+                    ServiceReport::Ready { name } => self.end(name, StageState::Done, logger),
+                    ServiceReport::Degraded { name } => {
+                        self.end(name, StageState::Degraded, logger)
+                    }
+                    ServiceReport::Progress { name, percent } => self.report(name, percent),
+                    ServiceReport::Other => {
+                        let text = core::str::from_utf8(&buf[..n]).unwrap_or("<non-utf8>");
+                        crate::init_logln!(logger, "[init] says {}", text);
+                    }
+                },
+                Err(ErrorCode::ShouldWait) | Err(ErrorCode::TimedOut) => {
+                    libcanvas::process::yield_now();
+                    self.render();
+                }
+                Err(error) => {
+                    crate::init_logln!(logger, "[init] drain read failed: {}", error.as_str());
+                    return;
+                }
+            }
+
+            spins = spins.saturating_add(1);
+            match self.now() {
+                Some(now) => {
+                    // Expire whatever is still outstanding, each against
+                    // its own configured deadline.
+                    for index in 0..self.progress.stages().len() {
+                        if self.progress.expired(index, now, TICKS_PER_SEC) {
+                            let id = self.progress.stages()[index].id;
+                            crate::init_logln!(
+                                logger,
+                                "[init] {} did not report ready within {}s",
+                                id.as_str(),
+                                self.progress.stages()[index].timeout_secs
+                            );
+                            self.end(id.as_bytes(), StageState::Failed, logger);
+                        }
+                    }
+                }
+                None if spins >= POLL_BUDGET => {
+                    crate::init_logln!(logger, "[init] drain exhausted (no clock)");
+                    return;
+                }
+                None => {}
             }
         }
     }
