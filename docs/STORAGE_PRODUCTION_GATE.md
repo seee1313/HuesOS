@@ -31,7 +31,20 @@ python3 tools/storage-bench.py --iterations 10
 bash scripts/ci-qemu-nvme-soak.sh release 300
 bash scripts/ci-qemu-nvme-soak.sh release 300 /tmp/qemu-nvme-gcm-inject.log 1
 python3 tools/hxfs-scrub.py <installed-hxfs-image>
+bash scripts/ci-qemu-nvme-soak.sh release 180 /tmp/qemu-nvme-no-tpm.log 6
+bash scripts/ci-qemu-powerfail.sh release ci-artifacts 2
 ```
+
+(Mode 6 is the no-TPM gate: a plain volume on a machine with no TPM
+and no key must mount and serve normally. Most real hardware looks
+like this, so a build that only mounts when a key is available would
+refuse to boot on it.)
+
+(`ci-qemu-powerfail.sh` is the crash-consistency gate: SIGKILL QEMU
+mid-write, inspect the dirty image offline, then require the same
+image to boot again unattended with `fsck clean` and `scrub complete`.
+An fsck finding after a power cut means the committed state was not
+crash-consistent.)
 
 (The second soak invocation is the Stage B.5 fault-injection gate:
 seeded encrypted+compressed volume with a flipped GCM bit; the

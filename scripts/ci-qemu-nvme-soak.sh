@@ -282,6 +282,47 @@ if [[ "$inject" == "3" ]]; then
     fi
     kill "$qemu_pid" 2>/dev/null
     wait "$qemu_pid" 2>/dev/null
+elif [[ -n "${SOAK_KILL_AFTER:-}" ]]; then
+    # Power-fail harness: run until the guest reports it is in the
+    # middle of the write workload, then SIGKILL QEMU with no
+    # shutdown, no flush and no chance for the guest to close the
+    # volume. Marker assertions are skipped on purpose -- this run is
+    # not supposed to finish anything; the recovery boot that follows
+    # is what asserts. See scripts/ci-qemu-powerfail.sh.
+    qemu-system-x86_64 "${qemu_common[@]}" "${qemu_nvme[@]}" "${qemu_tpm[@]}" &
+    qemu_pid=$!
+    killed=0
+    waited=0
+    while [[ $waited -lt "$seconds" ]]; do
+        if grep -Fq "$SOAK_KILL_AFTER" "$log" 2>/dev/null; then
+            # Let the workload get past the marker and into the next
+            # transaction, so the kill lands mid-write rather than on
+            # a quiescent, just-committed volume.
+            sleep "${SOAK_KILL_DELAY:-3}"
+            echo "[soak] power-fail: SIGKILL after marker '$SOAK_KILL_AFTER'"
+            kill -9 "$qemu_pid" 2>/dev/null
+            killed=1
+            break
+        fi
+        if ! kill -0 "$qemu_pid" 2>/dev/null; then
+            break
+        fi
+        sleep 2
+        waited=$((waited + 2))
+    done
+    wait "$qemu_pid" 2>/dev/null
+    set -e
+    if [[ "$killed" != 1 ]]; then
+        echo "[soak] power-fail: marker '$SOAK_KILL_AFTER' never appeared; nothing was killed" >&2
+        wc -l "$log" >&2; head -2000 "$log" >&2 || true
+        exit 1
+    fi
+    if grep -Fq 'KERNEL PANIC' "$log" || grep -Fq '[hxfs] PANIC' "$log"; then
+        echo "[soak] power-fail: guest panicked BEFORE the kill" >&2
+        exit 1
+    fi
+    echo "[soak] power-fail: guest killed mid-write; image left dirty on purpose"
+    exit 0
 else
     timeout "${seconds}s" qemu-system-x86_64 "${qemu_common[@]}" "${qemu_nvme[@]}" "${qemu_tpm[@]}"
     status=$?
