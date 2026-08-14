@@ -65,6 +65,22 @@ def digest(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def write_report(path: Path, text: str) -> None:
+    """Write a report, creating the parent directory if needed.
+
+    The default output lands in ``build/``, which does not exist on a
+    fresh checkout — CI clones the repo and runs the gate before
+    anything has created a build directory. Failing there reports a
+    Python traceback about a missing path instead of a benchmark
+    result, which is a confusing way to learn that nothing was built
+    yet.
+    """
+    parent = path.parent
+    if parent and not parent.exists():
+        parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text + "\n")
+
+
 def capture(cmd: list[str]) -> str:
     """SHA-256 of a tool's stdout, for output-shape regressions."""
     result = subprocess.run(cmd, cwd=ROOT, check=True, capture_output=True)
@@ -304,14 +320,14 @@ def main() -> int:
     text = json.dumps(report, indent=2, sort_keys=True)
 
     if args.update_baseline:
-        args.update_baseline.write_text(text + "\n")
+        write_report(args.update_baseline, text)
         print(f"baseline written to {args.update_baseline}", file=sys.stderr)
         print(text)
         return 0
 
     print(text)
     if args.output:
-        args.output.write_text(text + "\n")
+        write_report(args.output, text)
 
     failures: list[str] = []
 

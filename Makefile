@@ -80,6 +80,7 @@ audit-check:
 # baseline deliberately with:
 #   python3 tools/storage-bench.py --update-baseline tools/baselines/storage-bench.json
 bench-check:
+	mkdir -p build
 	python3 tools/storage-bench.py --iterations 3 --blocks 256 \
 		--baseline tools/baselines/storage-bench.json --self-compare \
 		--output build/storage-bench.json
