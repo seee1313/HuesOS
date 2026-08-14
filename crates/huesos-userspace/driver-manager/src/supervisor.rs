@@ -145,6 +145,15 @@ pub struct DriverManager {
     hxfs_service: Option<ManagedHost>,
     hxfs_failed: bool,
     hxfs_ready: bool,
+    /// Highest storage-stage percentage already flushed to init.
+    storage_progress_sent: u8,
+    /// Highest storage-stage percentage already reported to init.
+    ///
+    /// The boot splash requires monotonic progress, and these
+    /// milestones can be observed more than once (a re-registration,
+    /// a repeated ready message). Tracking the high-water mark here
+    /// keeps DriverManager from ever asking the bar to move backwards.
+    storage_progress: u8,
     /// Hxfs client channel DriverManager uses for its own package
     /// resolving, separate from the channels it hands to clients.
     hxfs_client: Option<Channel>,
@@ -301,6 +310,8 @@ impl DriverManager {
             hxfs_service: None,
             hxfs_failed: false,
             hxfs_ready: false,
+            storage_progress: 0,
+            storage_progress_sent: 0,
             hxfs_client: None,
             package_probe_done: false,
             package_probe_announced: false,
@@ -743,9 +754,57 @@ impl DriverManager {
             self.poll_hxfs_service();
             self.probe_package_resolving();
             self.poll_acpi_manager();
+            self.flush_storage_progress(&init_bootstrap);
             // Multi-channel poll: cannot block on one fd without starving others.
             // Yield cooperatively; hot IRQ path is already blocking in the host.
             libcanvas::process::yield_now();
+        }
+    }
+
+    /// Record a storage-stage milestone for the boot splash.
+    ///
+    /// Milestones are named after observable events rather than
+    /// elapsed time, because DriverManager cannot predict how long a
+    /// controller takes to enumerate. Reporting position in a known
+    /// sequence is honest; reporting a guessed fraction of a duration
+    /// is not.
+    fn storage_milestone(&mut self, percent: u8) {
+        if percent > self.storage_progress {
+            self.storage_progress = percent;
+        }
+    }
+
+    /// Push any unreported storage progress to init.
+    ///
+    /// Sent from the main loop rather than from the message handlers so
+    /// the bootstrap channel does not have to be threaded through every
+    /// one of them. A failed write is dropped on purpose: the splash is
+    /// cosmetic, and a full or closed channel must never stall the
+    /// boot it is describing.
+    fn flush_storage_progress(&mut self, init_bootstrap: &Channel) {
+        if self.storage_progress <= self.storage_progress_sent {
+            return;
+        }
+        let percent = self.storage_progress;
+        let mut message = [0u8; 24];
+        let body = b"storage:progress:";
+        message[..body.len()].copy_from_slice(body);
+        let mut len = body.len();
+        if percent >= 100 {
+            message[len..len + 3].copy_from_slice(b"100");
+            len += 3;
+        } else {
+            if percent >= 10 {
+                message[len] = b'0' + percent / 10;
+                len += 1;
+            }
+            message[len] = b'0' + percent % 10;
+            len += 1;
+        }
+        let _ = init_bootstrap.write(&message[..len]);
+        self.storage_progress_sent = percent;
+        if percent >= 100 {
+            let _ = init_bootstrap.write(b"storage:ready");
         }
     }
 
@@ -1753,6 +1812,7 @@ impl DriverManager {
                     self.hxfs_failed = false;
                     self.hxfs_service = Some(host);
                     println!("[driver-manager] Hxfs service ready");
+                    self.storage_milestone(100);
                     self.attach_own_hxfs_client();
                     return;
                 }
@@ -1824,6 +1884,7 @@ impl DriverManager {
     fn handle_nvme_host_message(&mut self, msg: &[u8]) {
         if msg == protocol::NVME_HOST_STARTING.as_bytes() {
             println!("[driver-manager] NVMe DriverHost starting");
+            self.storage_milestone(35);
         } else if msg == protocol::NVME_HOST_RESOURCES_READY.as_bytes()
             || msg == protocol::NVME_BLOCK_READY.as_bytes()
         {
@@ -1832,6 +1893,7 @@ impl DriverManager {
                 "[driver-manager] registered Stage-A block:nvme resources from {}",
                 owner
             );
+            self.storage_milestone(45);
         } else if msg == protocol::NVME_BLOCK_IDENTIFIED.as_bytes() {
             let owner = self.registry.owner("block:nvme").unwrap_or("unknown-host");
             println!(
@@ -1839,6 +1901,8 @@ impl DriverManager {
                 owner
             );
             self.registry.mark_online("block:nvme");
+            // Controller enumerated; the Hxfs mount is what remains.
+            self.storage_milestone(60);
         } else if msg == protocol::NVME_BLOCK_BRINGUP_FAILED.as_bytes() {
             println!("[driver-manager] NVMe controller bring-up failed");
             self.registry.mark_failed("block:nvme");

@@ -64,13 +64,23 @@ for marker in \
     '[shutdown-broker] ready' \
     '[acpi-manager] broker deny-by-default self-test OK' \
     '[init] launched terminal' \
-    '[terminal] keyboard service online, starting shell'; do
+    '[terminal] keyboard service online, starting shell' \
+    '[init] stage selftest ok' \
+    '[init] stage summary ok selftest' \
+    '[init] stage summary ok terminal' \
+    '[init] boot stages complete:'; do
     if ! grep -Fq "$marker" "$log"; then
         echo "missing boot marker: $marker" >&2
         tail -200 "$log" >&2
         exit 1
     fi
 done
+
+# The stage markers above are the boot-progress model's own output: a
+# stage that never settles, or a splash that stops driving the progress
+# bar, no longer hides behind an otherwise green log. 'boot stages
+# complete:' is matched without its verdict because a serial-only smoke
+# legitimately reports 'degraded' (no framebuffer, no NVMe).
 
 # Regressions that must NOT appear on the happy path. These messages
 # indicate a subsystem the user-visible flow depends on failed silently
@@ -82,7 +92,11 @@ for regression in \
     '[init] shutdown-broker: IoPort resource mint failed' \
     '[init] shutdown-broker: PowerControl mint failed' \
     '[terminal] failed to open keyboard service' \
-    '[init] waitset self-test FAILED'; do
+    '[init] waitset self-test FAILED' \
+    '[init] stage selftest FAILED' \
+    '[init] stage terminal FAILED' \
+    '[init] stage shutdown-broker FAILED' \
+    '[init] stage storage FAILED'; do
     if grep -Fq "$regression" "$log"; then
         echo "regression marker present: $regression" >&2
         tail -200 "$log" >&2

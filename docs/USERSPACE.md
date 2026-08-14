@@ -344,6 +344,26 @@ Points worth knowing:
   `/etc/init.conf`. Miss it and the stage is marked failed, the
   indicator turns red, and init prints which stage did not answer. The
   boot then continues to the next stage.
+* **A stage can have two reporters.** `storage` is the live example:
+  init owns 0-25% (it hands the boot VMO and the PCI grants to
+  DriverManager and steps the bar itself), then DriverManager takes
+  over from 35% with milestones tied to observable events — NVMe host
+  starting (35), Stage-A resources registered (45), namespace
+  identified (60), Hxfs mounted (100). Because both write into the
+  same monotonic high-water mark, the split needs no coordination
+  beyond not overlapping the ranges. Tie milestones to events, never
+  to elapsed time: a percentage that advances on a timer is a
+  progress-shaped animation, not progress.
+* **Report from the poll loop, not from the work.** DriverManager
+  records the milestone where the event happens and flushes it once
+  per iteration of its main loop, so a blocked or full channel can
+  never stall the bring-up path. Write errors are dropped on purpose:
+  the bar is cosmetic, the boot is not.
+* **If the peer will never exist, settle the stage.** When init finds
+  no NVMe function it marks `storage` skipped immediately instead of
+  letting the stage sit until its deadline expires — a diskless or
+  serial-only boot should not pay 30 seconds for a device that was
+  never there.
 * **Your stage must exist in the config** for any of this to show up.
   Stages are data, not code: adding `stage.mything=20` to
   `/etc/init.conf` is enough for init to give your service a band, a
