@@ -639,6 +639,15 @@ pub const INIT_STORAGE_BOOT_INFO_HANDLE: HandleValue = 5;
 /// [`Syscall::FramebufferBlit`]; the kernel rejects any blit whose
 /// `a1` is not a live caller-owned `FrameDraw` resource.
 pub const INIT_FRAME_DRAW_HANDLE: HandleValue = 6;
+/// Read-only HBI kernel command line installed in the initial process.
+///
+/// Init parses `init.`-prefixed keys from this blob to override its
+/// boot configuration. Delivering it as a VMO reuses the mechanism
+/// already used for BOOTFS and the ACPI archive rather than adding a
+/// syscall, and keeps the command line read-only in userspace. The
+/// handle is absent when the bootloader supplied no command line;
+/// callers must treat that as "no overrides", not as an error.
+pub const INIT_CMDLINE_HANDLE: HandleValue = 7;
 
 /// Stable process exit codes used when the kernel terminates a process after
 /// an unhandled ring-3 CPU exception.
@@ -1328,6 +1337,7 @@ mod tests {
         // And lock the INIT_FRAME_DRAW_HANDLE slot so the kernel-side
         // handle table that init relies on does not silently renumber.
         assert_eq!(super::INIT_FRAME_DRAW_HANDLE, 6);
+        assert_eq!(super::INIT_CMDLINE_HANDLE, 7);
         assert_eq!(super::INIT_STORAGE_BOOT_INFO_HANDLE, 5);
     }
 

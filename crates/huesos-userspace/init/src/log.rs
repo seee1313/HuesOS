@@ -1,9 +1,18 @@
 //! Init logging helpers.
 //!
-//! Init writes every message to the kernel debug UART and, while it owns the
-//! display, mirrors those messages onto a small framebuffer console. Once the
-//! terminal service starts, init deliberately stops framebuffer logging so the
-//! terminal owns the screen.
+//! Init writes every message to the kernel debug UART, always and in
+//! full. The UART is not a user-facing surface: it is the only channel
+//! that survives a machine that dies before the terminal starts, and
+//! the CI soak gates grep it for markers. Silencing it to make the boot
+//! look tidy would trade real diagnostic capability for cosmetics, so
+//! no configuration key can turn it off.
+//!
+//! The framebuffer console is the opposite. It is off by default now
+//! that the boot splash owns the screen, and is enabled only when the
+//! configuration asks for technical output (`log.screen=on`), when no
+//! splash could be created, or when a stage fails. Once the terminal
+//! service starts, init stops drawing entirely so the terminal owns the
+//! display.
 
 use core::fmt::{self, Write};
 use libcanvas::framebuffer::Canvas;
@@ -20,18 +29,36 @@ pub struct InitLogger {
 }
 
 impl InitLogger {
-    /// Create a logger. If no framebuffer is available, logging silently
-    /// falls back to UART-only output.
+    /// Create a UART-only logger.
+    ///
+    /// The framebuffer console starts disabled because init cannot yet
+    /// know whether the operator asked for it: the configuration lives
+    /// in BOOTFS and on the kernel command line, both of which are read
+    /// after the logger exists. Call [`InitLogger::enable_framebuffer`]
+    /// once the configuration is known.
     pub fn new() -> Self {
-        let mut logger = Self {
-            screen: FramebufferLog::new().ok(),
-        };
-        if let Some(screen) = logger.screen.as_mut() {
-            screen.write_line("HuesOS init log");
-            screen.write_line("----------------");
-            screen.render();
+        Self { screen: None }
+    }
+
+    /// Turn on framebuffer mirroring.
+    ///
+    /// Returns `false` when no framebuffer console could be created, so
+    /// the caller can report the fallback rather than assume the
+    /// operator is seeing the log they asked for.
+    pub fn enable_framebuffer(&mut self) -> bool {
+        if self.screen.is_some() {
+            return true;
         }
-        logger
+        match FramebufferLog::new() {
+            Ok(mut screen) => {
+                screen.write_line("HuesOS init log");
+                screen.write_line("----------------");
+                screen.render();
+                self.screen = Some(screen);
+                true
+            }
+            Err(_) => false,
+        }
     }
 
     /// Write one formatted log line to UART and, if enabled, framebuffer.

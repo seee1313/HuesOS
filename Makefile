@@ -39,6 +39,7 @@ test:
 		-p huesos-scudo \
 		-p huesos-scudo-fuzz \
 		-p huesos-blobfs \
+		-p huesos-bootux \
 		-p huesos-lifecycle \
 		-p huesos-ioapic \
 		-p huesos-extable \

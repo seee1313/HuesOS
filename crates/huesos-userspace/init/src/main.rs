@@ -9,9 +9,14 @@
 #![no_std]
 #![no_main]
 
+mod boot_ui;
 mod log;
+mod splash;
 
+use boot_ui::BootUi;
 use core::panic::PanicInfo;
+use huesos_bootux::config::InitConfig;
+use huesos_bootux::progress::StageState;
 use libcanvas::{Channel, ErrorCode, Process, Vmo};
 use log::InitLogger;
 
@@ -19,6 +24,67 @@ macro_rules! init_logln {
     ($logger:expr, $($arg:tt)*) => {{
         $logger.line(format_args!($($arg)*));
     }};
+}
+pub(crate) use init_logln;
+
+/// Largest `/etc/init.conf` init will read. The shipped file is under
+/// 2 KiB; the cap bounds the stack buffer and rejects a corrupt BOOTFS
+/// entry claiming an absurd length rather than trusting it.
+const MAX_CONFIG_BYTES: usize = 4096;
+
+/// Load boot configuration from BOOTFS, then let the kernel command
+/// line override it.
+///
+/// Ordering matters: the command line is the escape hatch used when a
+/// machine will not boot far enough to rebuild an image, so it must win
+/// over the file.
+fn load_config(logger: &mut InitLogger, bootfs: &Vmo) -> InitConfig {
+    let mut config = InitConfig::new().with_default_stages();
+    let mut buf = [0u8; MAX_CONFIG_BYTES];
+
+    match find_bootfs_entry(bootfs, b"/etc/init.conf") {
+        Ok(entry) => {
+            let len = (entry.len as usize).min(MAX_CONFIG_BYTES);
+            match bootfs.read(entry.offset, &mut buf[..len]) {
+                Ok(read) => {
+                    config.parse_file(&buf[..read]);
+                    init_logln!(logger, "[init] config: /etc/init.conf ({} bytes)", read);
+                }
+                Err(error) => {
+                    init_logln!(logger, "[init] config read failed: {}", error.as_str());
+                }
+            }
+        }
+        Err(_) => {
+            init_logln!(
+                logger,
+                "[init] config: /etc/init.conf absent, using defaults"
+            );
+        }
+    }
+
+    // Absent command line is the common case, not an error.
+    let cmdline = Vmo::take_init_cmdline();
+    match cmdline.read(0, &mut buf) {
+        Ok(read) if read > 0 => {
+            config.parse_cmdline(&buf[..read], b"init.");
+            init_logln!(logger, "[init] config: kernel cmdline applied");
+        }
+        _ => {}
+    }
+
+    config.finish();
+    if config.unknown_keys > 0 || config.bad_values > 0 {
+        // Never fatal: a typo in a splash colour must not stop a
+        // machine from booting. Reported so it stays discoverable.
+        init_logln!(
+            logger,
+            "[init] config: {} unknown key(s), {} bad value(s) ignored",
+            config.unknown_keys,
+            config.bad_values
+        );
+    }
+    config
 }
 
 static DRIVER_MANAGER_ELF: &[u8] = include_bytes!(env!("HUESOS_DRIVER_MANAGER_PATH"));
@@ -46,36 +112,73 @@ pub extern "C" fn _start() -> ! {
     let acpi_broker = libcanvas::Handle::take_init_acpi_broker();
     init_logln!(logger, "[init] hello from ring3 userspace, via libcanvas");
 
+    let config = load_config(&mut logger, &bootfs);
+    let mut ui = BootUi::new(&config, &mut logger);
+    if ui.log_screen && !logger.enable_framebuffer() {
+        init_logln!(logger, "[init] framebuffer log requested but unavailable");
+    }
+
+    ui.begin(b"selftest", &mut logger);
     if libcanvas::diagnostics::user_pointer_guard_smoke_test() {
         init_logln!(logger, "[init] user pointer guard smoke OK");
     } else {
         init_logln!(logger, "[init] user pointer guard smoke FAILED");
     }
 
+    // The self-checks are the longest stretch of the boot in which
+    // nothing else reports, so init reports its own progress through
+    // them. The percentages are step counts, not timings: they are
+    // honest about position in the sequence rather than pretending to
+    // predict duration.
     run_vmo_check(&mut logger);
+    ui.step(b"selftest", 12);
     run_channel_check(&mut logger);
+    ui.step(b"selftest", 25);
     run_monotonic_clock_check(&mut logger);
+    ui.step(b"selftest", 37);
     run_smp_affinity_check(&mut logger);
+    ui.step(b"selftest", 50);
     run_process_wait_check(&mut logger);
+    ui.step(b"selftest", 62);
     run_waitset_check(&mut logger);
+    ui.step(b"selftest", 75);
     run_fault_isolation_check(&mut logger);
+    ui.step(b"selftest", 87);
     run_shutdown_authorization_check(&mut logger);
+    ui.end(b"selftest", StageState::Done, &mut logger);
 
+    ui.begin(b"driver-manager", &mut logger);
     let driver_manager = launch_service(&mut logger, "driver-manager", DRIVER_MANAGER_ELF);
+    if driver_manager.is_none() {
+        ui.end(b"driver-manager", StageState::Failed, &mut logger);
+    }
 
     if let Some((_, channel)) = &driver_manager {
-        read_ready_message(&mut logger, "driver-manager", channel);
+        ui.wait_ready(b"driver-manager", channel, &mut logger);
+        // Storage is a distinct stage because it is the long pole of the
+        // boot: NVMe enumeration plus the Hxfs mount dominates, and the
+        // handoff below is what makes it start.
+        ui.begin(b"storage", &mut logger);
         send_bootfs_vmo(&mut logger, channel, &bootfs);
+        ui.step(b"storage", 15);
         send_acpi_tables_vmo(&mut logger, channel, &acpi_tables);
+        ui.step(b"storage", 30);
         send_acpi_broker(&mut logger, channel, acpi_broker);
+        ui.step(b"storage", 45);
         send_storage_boot_info_vmo(&mut logger, channel, &storage_boot_info);
+        ui.step(b"storage", 60);
         send_manifest_grants(
             &mut logger,
             channel,
             &bootfs,
             b"/manifests/input-host.hdriver",
         );
+        ui.step(b"storage", 80);
         send_nvme_boot_grants(&mut logger, channel, &storage_boot_info);
+        // DriverManager owns the NVMe/Hxfs bring-up from here; init has
+        // no separate ready message for it, so the stage closes once
+        // its grants are delivered.
+        ui.end(b"storage", StageState::Done, &mut logger);
     }
 
     // DriverManager owns the isolated ACPI manager launch because it receives
@@ -89,22 +192,48 @@ pub extern "C" fn _start() -> ! {
     // (IoPort 0x64 + PowerControl), transfers them to the broker, and
     // marks the broker critical so a broker crash before it delivers
     // the halt triggers the kernel-side critical-exit fallback.
+    ui.begin(b"shutdown-broker", &mut logger);
     let shutdown_broker = launch_shutdown_broker(&mut logger);
+    ui.end(
+        b"shutdown-broker",
+        if shutdown_broker.is_some() {
+            StageState::Done
+        } else {
+            StageState::Failed
+        },
+        &mut logger,
+    );
 
     let registry_pair = create_driver_manager_registry_channel(&mut logger, &driver_manager);
 
+    ui.begin(b"terminal", &mut logger);
+    let terminal = launch_service(&mut logger, "terminal", TERMINAL_ELF);
+    if terminal.is_none() {
+        ui.end(b"terminal", StageState::Failed, &mut logger);
+    }
+    if let Some((_, channel)) = &terminal {
+        ui.wait_ready(b"terminal", channel, &mut logger);
+    }
+
+    // Final frame while init still owns the display, then hand the
+    // screen over. Anything drawn after this point would fight the
+    // terminal for the framebuffer.
+    ui.finish(&mut logger);
+    let boot_failed = ui.any_failed();
     init_logln!(
         logger,
-        "[init] framebuffer log handoff: starting terminal service"
+        "[init] framebuffer handoff: terminal owns the display"
     );
     logger.release_framebuffer();
+    drop(ui);
 
-    let terminal = launch_service(&mut logger, "terminal", TERMINAL_ELF);
     if let Some((_, channel)) = &terminal {
-        read_ready_message(&mut logger, "terminal", channel);
         send_terminal_registry_channel(&mut logger, channel, registry_pair);
     }
 
+    if boot_failed {
+        init_logln!(logger, "[init] boot completed with stage failures");
+    }
     init_logln!(
         logger,
         "[init] service launch complete; parking as init supervisor"
@@ -951,35 +1080,6 @@ fn fallback_legacy_shutdown(logger: &mut InitLogger) {
             error.as_str()
         );
     }
-}
-
-fn read_ready_message(logger: &mut InitLogger, name: &str, channel: &Channel) {
-    let mut buf = [0u8; 64];
-    // Cooperative poll with a high attempt budget. Under SMP the service may
-    // be scheduled much later; avoid timed-park here (timeout arming is still
-    // young) so a stuck waiter cannot freeze init.
-    for _ in 0..8_000 {
-        match channel.read_into(&mut buf) {
-            Ok(n) => {
-                let msg = core::str::from_utf8(&buf[..n]).unwrap_or("<non-utf8>");
-                init_logln!(logger, "[init] {} says {}", name, msg);
-                return;
-            }
-            Err(ErrorCode::ShouldWait) | Err(ErrorCode::TimedOut) => {
-                libcanvas::process::yield_now();
-            }
-            Err(e) => {
-                init_logln!(
-                    logger,
-                    "[init] {} bootstrap read failed: {}",
-                    name,
-                    e.as_str()
-                );
-                return;
-            }
-        }
-    }
-    init_logln!(logger, "[init] {} did not send ready message yet", name);
 }
 
 fn run_monotonic_clock_check(logger: &mut InitLogger) {

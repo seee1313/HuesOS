@@ -26,6 +26,16 @@ impl Vmo {
         Self::from_abi_owned(huesos_abi::INIT_BOOTFS_HANDLE)
     }
 
+    /// Take ownership of the read-only kernel command line installed only
+    /// in the initial process by the kernel.
+    ///
+    /// The handle is absent when the bootloader supplied no command
+    /// line, in which case ordinary VMO syscalls on the returned
+    /// wrapper fail; callers should treat that as "no overrides".
+    pub fn take_init_cmdline() -> Self {
+        Self::from_abi_owned(huesos_abi::INIT_CMDLINE_HANDLE)
+    }
+
     /// Take ownership of the immutable validated ACPI table archive installed
     /// only in the initial process by the kernel.
     pub fn take_init_acpi_tables() -> Self {
