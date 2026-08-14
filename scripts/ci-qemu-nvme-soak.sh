@@ -41,8 +41,32 @@ elif [[ "$inject" == "4" ]]; then
     # (stress-ok) for sustained NVMe/page-cache load.
     export HUESOS_HXFS_SERVICE_FEATURES=synthetic-key
     seed_args=()
+elif [[ "$inject" == "6" ]]; then
+    # Mode 6: NO-TPM gate. A clean plain (unencrypted) volume on a
+    # machine with no TPM and no bootloader key blob. Most real
+    # hardware looks like this, so the failure it guards against is
+    # severe: a build that only mounts when a key is present would
+    # refuse to boot on any machine without a TPM. The volume key is
+    # deliberately NOT exported below, and SOAK_TPM=0 keeps swtpm
+    # away even on a runner that has it installed.
+    export HUESOS_HXFS_SERVICE_FEATURES=synthetic-key
+    export SOAK_TPM=0
+    seed_args=(--plain)
+elif [[ "$inject" == "5" ]]; then
+    # Mode 5: high queue-depth soak (production gate). Same workload
+    # as mode 4, but QEMU exposes a multi-queue NVMe controller and
+    # the guest gets more vCPUs, so the driver plans and drives one
+    # I/O queue per CPU with a deep submission queue instead of the
+    # single shallow queue the other modes exercise. This is the mode
+    # that can surface doorbell/phase bugs and queue-full handling.
+    export HUESOS_HXFS_SERVICE_FEATURES=synthetic-key
+    seed_args=()
 fi
-if [[ "$inject" == "1" || "$inject" == "2" || "$inject" == "3" || "$inject" == "4" ]]; then
+if [[ "$inject" == "6" ]]; then
+    # Mode 6 only: seed the WAD blob but hand the guest NO key at
+    # all, so the mount has to succeed on its own merits.
+    seed_args+=(--seed-blob-file build/wad-header.bin)
+elif [[ "$inject" == "1" || "$inject" == "2" || "$inject" == "3" || "$inject" == "4" || "$inject" == "5" ]]; then
     # Stage D: the synthetic volume key is baked into the KERNEL as
     # the bootloader key blob (single source of truth: the seed
     # tool's --print-volume-key-hex). The service receives it via
@@ -116,7 +140,7 @@ if [[ "$need_create" == "1" ]]; then
         echo "[soak] image too small for Hxfs (need >= 32 KiB)" >&2
         exit 1
     fi
-    if [[ "$inject" == "1" || "$inject" == "2" || "$inject" == "3" || "$inject" == "4" ]]; then
+    if [[ "$inject" == "1" || "$inject" == "2" || "$inject" == "3" || "$inject" == "4" || "$inject" == "5" || "$inject" == "6" ]]; then
         # Seeded modes: an encrypted+compressed volume with a
         # seed.bin file. Modes 1/2 corrupt the seed data block;
         # mode 3 leaves it intact for the shutdown cycle.
@@ -132,11 +156,21 @@ if [[ "$need_create" == "1" ]]; then
     echo "$inject" > "$mode_file"
 fi
 
+# High queue-depth mode needs more vCPUs than the default soak: the
+# driver plans one I/O queue per CPU, so a 2-vCPU guest can never
+# exercise more than two queues no matter what the controller offers.
+soak_smp=2
+soak_mem=512M
+if [[ "$inject" == "5" ]]; then
+    soak_smp="${SOAK_SMP:-4}"
+    soak_mem="${SOAK_MEM:-768M}"
+fi
+
 qemu_common=(
     -machine q35
     -cpu qemu64
-    -smp 2
-    -m 512M
+    -smp "$soak_smp"
+    -m "$soak_mem"
     -bios "$ovmf"
     -cdrom build/huesos.iso
     -drive id=nvme0,if=none,format=raw,file="$nvme_img"
@@ -152,13 +186,72 @@ if [[ "$inject" == "3" ]]; then
     qemu_monitor=(-monitor "unix:build/qemu-monitor.sock,server=on,wait=off")
 fi
 
+# A software TPM, when the host has one. The kernel's KeyProvider
+# unseals the volume key from PCR-bound storage, and that path can only
+# be exercised against a real TPM 2.0 command interface -- a stub would
+# validate the stub. Absence is not fatal: the guest falls back to the
+# build-time key and says so, which is also a case worth soaking.
+qemu_tpm=()
+swtpm_pid=""
+if [[ "${SOAK_TPM:-1}" == "1" ]] && command -v swtpm >/dev/null 2>&1; then
+    tpm_state="build/swtpm-state"
+    tpm_sock="build/swtpm-sock"
+    rm -rf "$tpm_state" "$tpm_sock"
+    mkdir -p "$tpm_state"
+    swtpm socket \
+        --tpmstate "dir=$tpm_state" \
+        --ctrl "type=unixio,path=$tpm_sock" \
+        --tpm2 \
+        --flags not-need-init,startup-clear \
+        >build/swtpm.log 2>&1 &
+    swtpm_pid=$!
+    # Wait for the control socket rather than sleeping a fixed time:
+    # QEMU fails to start outright if the socket is not there yet.
+    for _ in $(seq 1 50); do
+        [[ -S "$tpm_sock" ]] && break
+        sleep 0.1
+    done
+    if [[ -S "$tpm_sock" ]]; then
+        qemu_tpm=(
+            -chardev "socket,id=chrtpm,path=$tpm_sock"
+            -tpmdev emulator,id=tpm0,chardev=chrtpm
+            -device tpm-crb,tpmdev=tpm0
+        )
+        echo "[soak] swtpm attached (tpm-crb)"
+    else
+        echo "[soak] swtpm did not expose its socket; continuing without a TPM"
+        kill "$swtpm_pid" 2>/dev/null || true
+        swtpm_pid=""
+    fi
+else
+    echo "[soak] no swtpm on this host; continuing without a TPM"
+fi
+cleanup_swtpm() {
+    if [[ -n "$swtpm_pid" ]]; then
+        kill "$swtpm_pid" 2>/dev/null || true
+        wait "$swtpm_pid" 2>/dev/null || true
+    fi
+}
+trap cleanup_swtpm EXIT
+
 qemu_nvme=()
 case "$nvme_layout" in
     split)
         # Modern QEMU model: create controller and namespace explicitly. This
         # avoids booting a controller with no active namespace on hosts where
         # the legacy `drive=` shortcut is not accepted as a namespace.
-        qemu_nvme=(-device nvme,serial=huesosnvme,id=nvme-ctrl -device nvme-ns,drive=nvme0,bus=nvme-ctrl,nsid=1)
+        if [[ "$inject" == "5" ]]; then
+            # High queue-depth: advertise one I/O queue per vCPU plus
+            # headroom, MSI-X vectors to match, and a deep submission
+            # queue. `max_ioqpairs` is what lets the driver's per-CPU
+            # queue plan actually create more than one pair.
+            qemu_nvme=(
+                -device "nvme,serial=huesosnvme,id=nvme-ctrl,max_ioqpairs=${SOAK_IOQPAIRS:-8},msix_qsize=${SOAK_MSIX_QSIZE:-16},mdts=7"
+                -device nvme-ns,drive=nvme0,bus=nvme-ctrl,nsid=1
+            )
+        else
+            qemu_nvme=(-device nvme,serial=huesosnvme,id=nvme-ctrl -device nvme-ns,drive=nvme0,bus=nvme-ctrl,nsid=1)
+        fi
         ;;
     legacy)
         qemu_nvme=(-device nvme,serial=huesosnvme,drive=nvme0)
@@ -172,7 +265,7 @@ esac
 set +e
 if [[ "$inject" == "3" ]]; then
     rm -f build/qemu-monitor.sock
-    qemu-system-x86_64 "${qemu_common[@]}" "${qemu_nvme[@]}" "${qemu_monitor[@]}" &
+    qemu-system-x86_64 "${qemu_common[@]}" "${qemu_nvme[@]}" "${qemu_tpm[@]}" "${qemu_monitor[@]}" &
     qemu_pid=$!
     status=124
     waited=0
@@ -189,8 +282,49 @@ if [[ "$inject" == "3" ]]; then
     fi
     kill "$qemu_pid" 2>/dev/null
     wait "$qemu_pid" 2>/dev/null
+elif [[ -n "${SOAK_KILL_AFTER:-}" ]]; then
+    # Power-fail harness: run until the guest reports it is in the
+    # middle of the write workload, then SIGKILL QEMU with no
+    # shutdown, no flush and no chance for the guest to close the
+    # volume. Marker assertions are skipped on purpose -- this run is
+    # not supposed to finish anything; the recovery boot that follows
+    # is what asserts. See scripts/ci-qemu-powerfail.sh.
+    qemu-system-x86_64 "${qemu_common[@]}" "${qemu_nvme[@]}" "${qemu_tpm[@]}" &
+    qemu_pid=$!
+    killed=0
+    waited=0
+    while [[ $waited -lt "$seconds" ]]; do
+        if grep -Fq "$SOAK_KILL_AFTER" "$log" 2>/dev/null; then
+            # Let the workload get past the marker and into the next
+            # transaction, so the kill lands mid-write rather than on
+            # a quiescent, just-committed volume.
+            sleep "${SOAK_KILL_DELAY:-3}"
+            echo "[soak] power-fail: SIGKILL after marker '$SOAK_KILL_AFTER'"
+            kill -9 "$qemu_pid" 2>/dev/null
+            killed=1
+            break
+        fi
+        if ! kill -0 "$qemu_pid" 2>/dev/null; then
+            break
+        fi
+        sleep 2
+        waited=$((waited + 2))
+    done
+    wait "$qemu_pid" 2>/dev/null
+    set -e
+    if [[ "$killed" != 1 ]]; then
+        echo "[soak] power-fail: marker '$SOAK_KILL_AFTER' never appeared; nothing was killed" >&2
+        wc -l "$log" >&2; head -2000 "$log" >&2 || true
+        exit 1
+    fi
+    if grep -Fq 'KERNEL PANIC' "$log" || grep -Fq '[hxfs] PANIC' "$log"; then
+        echo "[soak] power-fail: guest panicked BEFORE the kill" >&2
+        exit 1
+    fi
+    echo "[soak] power-fail: guest killed mid-write; image left dirty on purpose"
+    exit 0
 else
-    timeout "${seconds}s" qemu-system-x86_64 "${qemu_common[@]}" "${qemu_nvme[@]}"
+    timeout "${seconds}s" qemu-system-x86_64 "${qemu_common[@]}" "${qemu_nvme[@]}" "${qemu_tpm[@]}"
     status=$?
 fi
 set -e
@@ -255,6 +389,47 @@ elif [[ "$inject" == "4" ]]; then
         "[hxfs] fsck clean"
         "[hxfs] quota-enforced-ok"
     )
+elif [[ "$inject" == "5" ]]; then
+    # High queue-depth soak: the same workload as mode 4, but the
+    # controller must have come up with more than one I/O queue and
+    # the reliability counters must show a clean run -- no timeouts
+    # and no controller resets under sustained multi-queue load.
+    required+=(
+        "[hxfs] self-check ok"
+        "[hxfs] write-roundtrip-ok"
+        "[hxfs] stage-e-16mib-ok"
+        "[hxfs] stress-ok"
+        "[hxfs] scrub complete"
+        "[hxfs] fsck clean"
+        "[hxfs] blob-view-native-ok"
+        "[driver-manager] package-resolve-ok"
+        "[driver-host:nvme] telemetry"
+    )
+elif [[ "$inject" == "6" ]]; then
+    # No-TPM gate: a plain volume on a machine with no TPM and no
+    # key must mount and serve normally. Asserting the ordinary
+    # markers is the whole point -- "works without a TPM" means the
+    # same self-check, write path and object store as every other
+    # mode, not a reduced subset.
+    required+=(
+        "[hxfs] no volume key available; plain volumes only"
+        "[hxfs] self-check ok"
+        "[hxfs] write-roundtrip-ok"
+        "[hxfs] multi-slot-write-ok"
+        "[hxfs] scrub complete"
+        "[hxfs] fsck clean"
+        "[hxfs] stage-f-blob-ok"
+    )
+    # A key must NOT have appeared from anywhere: if one did, the
+    # gate passed for the wrong reason and proves nothing.
+    if grep -Fq "[tpm] volume key unsealed" "$log"; then
+        echo "[soak] no-TPM gate ran WITH a volume key; the gate is void" >&2
+        exit 1
+    fi
+    if ! grep -Fq "[tpm] no TPM 2.0 CRB interface present" "$log"; then
+        echo "[soak] no-TPM gate: expected the kernel to report an absent TPM" >&2
+        exit 1
+    fi
 elif [[ "$inject" == "3" ]]; then
     # Graceful-shutdown cycle: the encrypted volume must mount and
     # self-check cleanly, then the userspace shutdown chain must
@@ -271,6 +446,89 @@ elif [[ "$inject" == "3" ]]; then
         "[shutdown] all CPUs halted"
     )
 fi
+# The high queue-depth gate is only meaningful if the controller
+# actually came up multi-queue. A run that silently fell back to a
+# single I/O queue would satisfy every marker above while testing
+# nothing the other modes do not already cover, so assert on the
+# reported queue count and on clean reliability counters.
+if [[ "$inject" == "5" ]]; then
+    queues="$(sed -n 's/.*\[driver-host:nvme\] identified .*queues=\([0-9]*\).*/\1/p' "$log" | tail -1)"
+    if [[ -z "$queues" ]]; then
+        echo "[soak] could not read the I/O queue count from the log" >&2
+        exit 1
+    fi
+    if (( queues < 2 )); then
+        echo "[soak] high queue-depth mode came up with only $queues I/O queue(s)" >&2
+        exit 1
+    fi
+    echo "[soak] high queue-depth: $queues I/O queues"
+    if grep -Fq "[driver-host:nvme] controller-reset-failed" "$log"; then
+        echo "[soak] controller reset failed during the high queue-depth soak" >&2
+        exit 1
+    fi
+    # Same `|| true` reasoning as the page-cache line below.
+    telemetry="$(grep -F '[driver-host:nvme] telemetry' "$log" | tail -1 || true)"
+    if [[ -z "$telemetry" ]]; then
+        echo "[soak] no NVMe telemetry line in the log" >&2
+        exit 1
+    fi
+    echo "[soak] $telemetry"
+    if [[ "$telemetry" != *"state=Online"* ]]; then
+        echo "[soak] controller did not end the soak Online: $telemetry" >&2
+        exit 1
+    fi
+    # The boot-time snapshot always reads submitted=0. Requiring a
+    # non-trivial submitted count is what makes this a load gate
+    # rather than a "the driver printed a line" gate.
+    submitted="$(sed -n 's/.*telemetry submitted=\([0-9]*\).*/\1/p' <<<"$telemetry")"
+    if [[ -z "$submitted" ]] || (( submitted < 512 )); then
+        echo "[soak] high queue-depth soak did not drive enough I/O (submitted=${submitted:-none})" >&2
+        exit 1
+    fi
+    completed="$(sed -n 's/.*completed=\([0-9]*\).*/\1/p' <<<"$telemetry")"
+    timeouts="$(sed -n 's/.*timeouts=\([0-9]*\).*/\1/p' <<<"$telemetry")"
+    if [[ -n "$timeouts" ]] && (( timeouts > 0 )); then
+        echo "[soak] $timeouts command timeout(s) under multi-queue load" >&2
+        exit 1
+    fi
+    echo "[soak] high queue-depth: submitted=$submitted completed=$completed timeouts=${timeouts:-0}"
+fi
+
+# The hxfs page cache is only a gate if the service's own mount is
+# the thing being hit. The service prints its counters after two
+# reads of the same file; require a hit on the repeat read, so a
+# cache that is present but never consulted fails the gate.
+#
+# The counters come from the boot self-check, which is compiled in
+# only under the `synthetic-key` feature -- that is, only for the
+# seeded modes. Mode 0 boots a production build against a blank
+# volume: it has no self-check, so it can never print the marker and
+# demanding one failed the job for a condition the build cannot
+# satisfy. Apply the gate to the modes that actually run the probe.
+# `|| true`: under `set -euo pipefail` a grep that matches nothing
+# exits 1 and kills the script HERE, before the checks below can
+# report anything -- which is exactly how this failure presented:
+# a silent exit 1 with no diagnostic at all.
+cache_line="$(grep -F '[hxfs] page-cache' "$log" | tail -1 || true)"
+if [[ "$inject" == "0" ]]; then
+    echo "[soak] mode 0 is a production build with no boot self-check; page-cache gate not applicable"
+elif [[ -n "$cache_line" ]]; then
+    echo "[soak] $cache_line"
+    repeat_hits="$(sed -n 's/.*repeat-read-hits=\([0-9]*\).*/\1/p' <<<"$cache_line")"
+    if [[ -z "$repeat_hits" ]] || (( repeat_hits < 1 )); then
+        echo "[soak] hxfs page cache did not serve the repeat read: $cache_line" >&2
+        exit 1
+    fi
+    cache_slots="$(sed -n 's/.*page-cache slots=\([0-9]*\).*/\1/p' <<<"$cache_line")"
+    if [[ -z "$cache_slots" ]] || (( cache_slots < 1 )); then
+        echo "[soak] hxfs mounted without a page cache: $cache_line" >&2
+        exit 1
+    fi
+else
+    echo "[soak] hxfs page-cache marker absent" >&2
+    exit 1
+fi
+
 for marker in "${required[@]}"; do
     if ! grep -Fq "$marker" "$log"; then
         echo "[soak] missing marker: $marker" >&2

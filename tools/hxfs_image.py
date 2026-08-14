@@ -238,11 +238,24 @@ def parse_superblock(image: bytes) -> dict[str, object]:
 
 
 def inspect_image(path: Path) -> dict[str, object]:
-    image = path.read_bytes()
-    superblock = parse_superblock(image)
-    checkpoint_lba = int(superblock["checkpoint_lba"])
-    start = checkpoint_lba * BLOCK_SIZE
-    checkpoint = image[start:start + BLOCK_SIZE]
+    # Read the two blocks we need by seeking, never the whole file.
+    # Soak and power-fail images are multi-gigabyte and the previous
+    # `path.read_bytes()` raised MemoryError on any normal machine --
+    # which meant the offline inspection step could not run against
+    # exactly the images it exists to inspect.
+    size = path.stat().st_size
+    if size < BLOCK_SIZE:
+        raise ValueError("image too small")
+    with path.open("rb") as handle:
+        superblock = parse_superblock(handle.read(BLOCK_SIZE))
+        checkpoint_lba = int(superblock["checkpoint_lba"])
+        start = checkpoint_lba * BLOCK_SIZE
+        if start + BLOCK_SIZE > size:
+            raise ValueError(
+                f"checkpoint LBA {checkpoint_lba} lies past the end of the image"
+            )
+        handle.seek(start)
+        checkpoint = handle.read(BLOCK_SIZE)
     if int.from_bytes(checkpoint[32:36], "little") != metadata_crc32c(checkpoint):
         raise ValueError("bad checkpoint checksum")
     base = int.from_bytes(checkpoint[6:8], "little")
@@ -256,7 +269,7 @@ def inspect_image(path: Path) -> dict[str, object]:
         "gpt_summary_lba": int.from_bytes(checkpoint[base + 112:base + 120], "little"),
         "install_manifest_lba": int.from_bytes(checkpoint[base + 120:base + 128], "little"),
     }
-    return {"path": str(path), "bytes": len(image), "superblock": superblock, "checkpoint_roots": roots}
+    return {"path": str(path), "bytes": size, "superblock": superblock, "checkpoint_roots": roots}
 
 
 def print_json(data: object) -> None:

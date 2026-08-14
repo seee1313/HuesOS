@@ -88,6 +88,19 @@ pub enum HxfsOp {
     ReadAt = 14,
     /// List a directory handle lexicographically.
     ListDirectory = 15,
+    /// Open an existing Hxblob object by content hash, yielding a
+    /// [`HxfsHandleKind::BlobView`] handle.
+    ///
+    /// The payload is the 32-byte raw content hash. Blobs are
+    /// content-addressed and immutable, so the handle carries read
+    /// rights only; there is no blob equivalent of `WriteAt`.
+    OpenBlob = 16,
+    /// Store an inline payload as an Hxblob object, returning its
+    /// content hash and a read handle for it.
+    ///
+    /// Storing an identical payload twice is not an error: the hash
+    /// is the identity, so the second call returns the same blob.
+    CreateBlob = 17,
 }
 
 impl HxfsOp {
@@ -110,6 +123,8 @@ impl HxfsOp {
             13 => Some(Self::DeleteSnapshot),
             14 => Some(Self::ReadAt),
             15 => Some(Self::ListDirectory),
+            16 => Some(Self::OpenBlob),
+            17 => Some(Self::CreateBlob),
             _ => None,
         }
     }
@@ -141,6 +156,14 @@ pub enum HxfsStatus {
     Unsupported = 9,
     /// Encrypted volume is unavailable because no valid key provider exists.
     EncryptedUnavailable = 10,
+    /// A content-addressed object failed its integrity check: the
+    /// bytes read back do not hash to the requested content hash.
+    ///
+    /// Distinct from [`Self::IoError`]: the device returned data
+    /// successfully, and distinct from [`Self::NotFound`]: the blob
+    /// exists. Collapsing this into either would let silent
+    /// corruption of an immutable object look like a routine miss.
+    CorruptObject = 11,
 }
 
 impl HxfsStatus {
@@ -158,6 +181,7 @@ impl HxfsStatus {
             8 => Some(Self::NoSpace),
             9 => Some(Self::Unsupported),
             10 => Some(Self::EncryptedUnavailable),
+            11 => Some(Self::CorruptObject),
             _ => None,
         }
     }
@@ -181,9 +205,23 @@ pub mod rights {
     pub const TRANSFER: u64 = 1 << 6;
     /// Duplicate the handle with equal or reduced rights.
     pub const DUPLICATE: u64 = 1 << 7;
+    /// Store new content-addressed objects through a volume handle.
+    ///
+    /// Separate from [`CREATE`]: a caller allowed to create files in
+    /// its own directory is not automatically allowed to add objects
+    /// to the volume-wide blob store, which is shared across
+    /// packages and deduplicated by hash.
+    pub const BLOB_CREATE: u64 = 1 << 8;
     /// All rights currently defined by the v1 Hxfs ABI.
-    pub const ALL: u64 =
-        READ | WRITE | CREATE | MODIFY_DIRECTORY | SYNC | SNAPSHOT | TRANSFER | DUPLICATE;
+    pub const ALL: u64 = READ
+        | WRITE
+        | CREATE
+        | MODIFY_DIRECTORY
+        | SYNC
+        | SNAPSHOT
+        | TRANSFER
+        | DUPLICATE
+        | BLOB_CREATE;
 }
 
 /// Request flags.

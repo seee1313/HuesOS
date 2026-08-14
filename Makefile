@@ -51,6 +51,7 @@ test:
 		-p huesos-hxfs-proto \
 		-p huesos-pci \
 		-p huesos-quota \
+		-p huesos-tpm \
 		--target x86_64-unknown-linux-gnu -Z build-std=
 
 audit:
@@ -67,6 +68,7 @@ audit-check:
 	python3 tools/check-lock-policy.py
 	python3 tools/check-policy-crates.py
 	python3 tools/check-hues-async-noalloc.py
+	python3 tools/check-poll-budgets.py
 	python3 tools/check-huesos-object-lock-policy.py
 	python3 tools/fmt-all.py --check
 

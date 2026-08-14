@@ -142,11 +142,44 @@ pub fn object_init() {
     huesos_object::init();
     huesos_object::set_phys_to_virt(|p| huesos_arch::paging::phys_to_virt(p).as_u64());
     huesos_object::set_cpu_id_callback(|| unsafe { huesos_arch::cpu_local::current_cpu_index() });
-    // Stage D bootloader key blob: install the build-time volume
-    // key (HUESOS_VOLUME_KEY_HEX) before any userspace process can
-    // call VolumeKeyGet. None on plain builds.
-    if let Some(key) = crate::boot_key::BOOT_VOLUME_KEY_BLOB {
-        huesos_object::boot_key::set_boot_volume_key(key);
+    // Stage D key provider. The TPM comes first: a key sealed to a
+    // PCR policy is the real provider, and the build-time blob is
+    // the development fallback it replaces. Installing the fallback
+    // first and letting the TPM overwrite it would mean a machine
+    // whose boot chain was tampered with still mounts, using the key
+    // compiled into the image -- the exact outcome sealing exists to
+    // prevent.
+    let outcome = crate::tpm::init_volume_key();
+    match outcome {
+        crate::tpm::UnsealOutcome::Installed => {
+            tpm_log("[tpm] volume key unsealed (PCR policy satisfied)");
+        }
+        crate::tpm::UnsealOutcome::PolicyMismatch => {
+            // Deliberately fatal for encrypted volumes: no key is
+            // installed, so the mount is refused downstream.
+            tpm_log("[tpm] unseal refused: PCR policy mismatch (boot chain changed)");
+        }
+        crate::tpm::UnsealOutcome::Failed => {
+            tpm_log("[tpm] unseal failed");
+        }
+        // Not failures, but not silence either: "no TPM" and "a TPM
+        // with nothing sealed to it" are different states, and a
+        // silent boot makes them indistinguishable from a TPM that
+        // was probed successfully. That ambiguity is what makes a
+        // TPM integration impossible to verify from a boot log.
+        crate::tpm::UnsealOutcome::NoTpm => {
+            tpm_log("[tpm] no TPM 2.0 CRB interface present");
+        }
+        crate::tpm::UnsealOutcome::NoSealedBlob => {
+            tpm_log("[tpm] TPM present, no sealed volume key in this image");
+        }
+    }
+    if outcome != crate::tpm::UnsealOutcome::Installed {
+        // Development/plain builds: the build-time blob
+        // (HUESOS_VOLUME_KEY_HEX), or nothing at all.
+        if let Some(key) = crate::boot_key::BOOT_VOLUME_KEY_BLOB {
+            huesos_object::boot_key::set_boot_volume_key(key);
+        }
     }
 }
 
@@ -271,4 +304,14 @@ fn debug_write(b: &[u8]) {
     for &c in b {
         let _ = w.write_char(c as char);
     }
+}
+
+/// Serial log line for the TPM bring-up path.
+///
+/// The kernel has no `println!` of its own at this point in init;
+/// the storage bring-up uses the same direct serial writer.
+fn tpm_log(message: &str) {
+    use core::fmt::Write;
+    let mut writer = huesos_arch::serial::SerialWriter;
+    let _ = writeln!(writer, "{}", message);
 }

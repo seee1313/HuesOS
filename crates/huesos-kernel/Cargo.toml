@@ -7,6 +7,7 @@ license.workspace = true
 build = "build.rs"
 
 [dependencies]
+huesos-tpm = { path = "../huesos-tpm" }
 huesos-arch = { path = "../huesos-arch" }
 huesos-hal = { path = "../huesos-hal" }
 huesos-object = { path = "../huesos-object" }

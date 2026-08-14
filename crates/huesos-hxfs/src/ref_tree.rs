@@ -144,6 +144,19 @@ impl<const N: usize> RefcountBtree<N> {
         }
     }
 
+    /// Whether any record covers a block of `[start, start + count)`.
+    ///
+    /// Unlike [`Self::is_reclaimable`], this asks "is this pinned at
+    /// all", which is the question a free path has: an extent held by
+    /// even one other owner must not go back to the allocator.
+    pub fn covers(&self, start_block: u64, block_count: u64) -> bool {
+        let end = start_block.saturating_add(block_count);
+        self.records.iter().flatten().any(|record| {
+            let record_end = record.start_block.saturating_add(record.block_count);
+            record.start_block < end && start_block < record_end
+        })
+    }
+
     /// Validate sort order and non-overlap invariants.
     pub fn validate(&self) -> Result<(), RefTreeError> {
         let mut previous_end = 0u64;

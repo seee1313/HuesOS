@@ -318,3 +318,228 @@ where
     cache.insert(volume_id, extent_physical_block, page_index, page.clone());
     Ok(page)
 }
+
+/// Fixed-capacity, allocation-free page cache.
+///
+/// [`PageCache`] holds its pages in a `Vec` and is sized at 4096
+/// entries -- 16 MiB. That is fine for the host-side reader, but the
+/// service mounts a `FixedHxfsWriter` on an 18 MiB user heap, so the
+/// `Vec` cache would claim nearly the whole heap and put the storage
+/// service one allocation away from OOM under load. It also breaks
+/// the fixed-writer contract: that type exists precisely so the
+/// storage path performs no dynamic allocation while serving I/O.
+///
+/// This variant stores `N` pages inline and never allocates.
+/// Capacity is a policy choice at the mount site rather than a
+/// global constant.
+///
+/// Eviction is FIFO by a rotating hand, matching [`PageCache`]: the
+/// boot/serve working set is largely sequential, so recency
+/// bookkeeping buys little for the extra state.
+pub struct FixedPageCache<const N: usize> {
+    /// `true` once the slot holds a real page.
+    occupied: [bool; N],
+    /// Volume id of the cached page, so a multi-volume mount cannot
+    /// alias two volumes onto one slot.
+    volume_id: [u64; N],
+    /// Physical block of the extent the page came from.
+    extent_physical_block: [u64; N],
+    /// Page index within that extent.
+    page_index: [u32; N],
+    /// CRC32C of the cached bytes, verified on every hit.
+    page_crc: [u32; N],
+    /// The cached page bytes.
+    pages: [[u8; BLOCK_SIZE]; N],
+    /// Next slot to overwrite when nothing is free.
+    hand: usize,
+    /// Hits since mount.
+    hits: u64,
+    /// Misses since mount.
+    misses: u64,
+}
+
+impl<const N: usize> FixedPageCache<N> {
+    /// Construct an empty cache. Every slot starts unoccupied, so a
+    /// zeroed page buffer is never mistaken for real data.
+    pub const fn new() -> Self {
+        Self {
+            occupied: [false; N],
+            volume_id: [0; N],
+            extent_physical_block: [0; N],
+            page_index: [0; N],
+            page_crc: [0; N],
+            pages: [[0u8; BLOCK_SIZE]; N],
+            hand: 0,
+            hits: 0,
+            misses: 0,
+        }
+    }
+
+    /// Cache hits since mount.
+    pub fn hits(&self) -> u64 {
+        self.hits
+    }
+
+    /// Cache misses since mount.
+    pub fn misses(&self) -> u64 {
+        self.misses
+    }
+
+    /// Number of pages the cache can hold.
+    pub const fn capacity(&self) -> usize {
+        N
+    }
+
+    fn slot_of(&self, volume_id: u64, extent_physical_block: u64, page_index: u32) -> usize {
+        if N == 0 {
+            return 0;
+        }
+        let hash = hash_key(volume_id, extent_physical_block, page_index);
+        (hash as usize) % N
+    }
+
+    /// Look up a page, copying it into `out` on a hit.
+    ///
+    /// A slot whose CRC no longer matches its contents is dropped and
+    /// reported as a miss: serving a silently corrupted page would
+    /// turn a memory fault into what looks like on-disk corruption.
+    pub fn lookup(
+        &mut self,
+        volume_id: u64,
+        extent_physical_block: u64,
+        page_index: u32,
+        out: &mut [u8; BLOCK_SIZE],
+    ) -> bool {
+        if N == 0 {
+            self.misses = self.misses.wrapping_add(1);
+            return false;
+        }
+        let start = self.slot_of(volume_id, extent_physical_block, page_index);
+        // Bounded probe: at most 8 slots, so a degenerate key
+        // distribution cannot stall the read path.
+        let probe = if N < 8 { N } else { 8 };
+        for step in 0..probe {
+            let index = (start + step) % N;
+            if !self.occupied[index] {
+                self.misses = self.misses.wrapping_add(1);
+                return false;
+            }
+            if self.volume_id[index] == volume_id
+                && self.extent_physical_block[index] == extent_physical_block
+                && self.page_index[index] == page_index
+            {
+                if crc32c(&self.pages[index]) != self.page_crc[index] {
+                    self.occupied[index] = false;
+                    self.misses = self.misses.wrapping_add(1);
+                    return false;
+                }
+                out.copy_from_slice(&self.pages[index]);
+                self.hits = self.hits.wrapping_add(1);
+                return true;
+            }
+        }
+        self.misses = self.misses.wrapping_add(1);
+        false
+    }
+
+    /// Insert a decoded page. Overwrites an existing entry for the
+    /// same key, otherwise takes a free slot near the hash,
+    /// otherwise evicts through the FIFO hand.
+    pub fn insert(
+        &mut self,
+        volume_id: u64,
+        extent_physical_block: u64,
+        page_index: u32,
+        page: &[u8; BLOCK_SIZE],
+    ) {
+        if N == 0 {
+            return;
+        }
+        let start = self.slot_of(volume_id, extent_physical_block, page_index);
+        let probe = if N < 8 { N } else { 8 };
+        let mut target: Option<usize> = None;
+        for step in 0..probe {
+            let index = (start + step) % N;
+            if !self.occupied[index] {
+                target = Some(index);
+                break;
+            }
+            if self.volume_id[index] == volume_id
+                && self.extent_physical_block[index] == extent_physical_block
+                && self.page_index[index] == page_index
+            {
+                target = Some(index);
+                break;
+            }
+        }
+        let index = match target {
+            Some(index) => index,
+            None => {
+                let index = self.hand % N;
+                self.hand = (self.hand + 1) % N;
+                index
+            }
+        };
+        self.occupied[index] = true;
+        self.volume_id[index] = volume_id;
+        self.extent_physical_block[index] = extent_physical_block;
+        self.page_index[index] = page_index;
+        self.pages[index].copy_from_slice(page);
+        self.page_crc[index] = crc32c(page);
+    }
+
+    /// Drop every page belonging to `physical_block`.
+    ///
+    /// Called whenever an extent is rewritten, freed, or reallocated.
+    /// Missing one of those call sites is how a page cache starts
+    /// serving a previous file's plaintext out of a recycled block.
+    pub fn invalidate_extent(&mut self, physical_block: u64) {
+        for index in 0..N {
+            if self.occupied[index] && self.extent_physical_block[index] == physical_block {
+                self.occupied[index] = false;
+            }
+        }
+    }
+
+    /// Drop every page in the physical block range `[start, end)`.
+    /// Reclaim frees whole spans at once, so it invalidates by range.
+    pub fn invalidate_range(&mut self, start: u64, end: u64) {
+        for index in 0..N {
+            if self.occupied[index]
+                && self.extent_physical_block[index] >= start
+                && self.extent_physical_block[index] < end
+            {
+                self.occupied[index] = false;
+            }
+        }
+    }
+
+    /// Drop every page. Used on unmount and on any state change the
+    /// cache cannot reason about precisely.
+    pub fn clear(&mut self) {
+        for index in 0..N {
+            self.occupied[index] = false;
+        }
+        self.hand = 0;
+    }
+}
+
+impl<const N: usize> Default for FixedPageCache<N> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Derive a stable cache-key namespace from a volume UUID.
+///
+/// The page cache is keyed by (volume, physical block, page); mixing
+/// the volume UUID in means remounting a different volume through the
+/// same service cannot hit another volume's cached plaintext even if
+/// the physical block numbers coincide.
+pub fn volume_id_of(uuid: &crate::format::Uuid) -> u64 {
+    let mut low = [0u8; 8];
+    let mut high = [0u8; 8];
+    low.copy_from_slice(&uuid[..8]);
+    high.copy_from_slice(&uuid[8..]);
+    u64::from_le_bytes(low) ^ u64::from_le_bytes(high).rotate_left(32)
+}

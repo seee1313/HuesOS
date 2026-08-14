@@ -445,7 +445,23 @@ impl NvmeTransport for MockNvme {
                 if val & cc::EN != 0 {
                     self.csts |= csts::RDY;
                 } else {
+                    // CC.EN=0 is a controller reset: the device drops
+                    // its queues, and its doorbell/phase state
+                    // restarts from zero. Modelling that matters for
+                    // the timeout-recovery path -- a mock that kept
+                    // the old admin queue would let a broken reset
+                    // implementation pass by reusing state the real
+                    // device has already thrown away.
                     self.csts &= !csts::RDY;
+                    self.admin_sq_head = 0;
+                    self.admin_sq_tail = 0;
+                    self.admin_cq_head = 0;
+                    self.admin_cq_phase = true;
+                    self.admin_size = 0;
+                    self.aqa = 0;
+                    self.asq = 0;
+                    self.acq = 0;
+                    self.io = [const { None }; 16];
                 }
             }
             off::AQA => {

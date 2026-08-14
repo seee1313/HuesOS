@@ -75,6 +75,24 @@ pub fn required_rights(op: HxfsOp, kind: HxfsHandleKind) -> Result<u64, Security
             HxfsHandleKind::Volume | HxfsHandleKind::Snapshot => Ok(rights::SNAPSHOT),
             _ => Err(SecurityError::WrongKind),
         },
+        // Opening a blob by content hash is a read of the volume's
+        // object store, so it is reachable from a volume or root
+        // handle -- but not from a directory or file handle, which
+        // name objects by path rather than by hash.
+        HxfsOp::OpenBlob => match kind {
+            HxfsHandleKind::None | HxfsHandleKind::Volume | HxfsHandleKind::BlobView => {
+                Ok(rights::READ)
+            }
+            _ => Err(SecurityError::WrongKind),
+        },
+        // Storing a blob needs the dedicated BLOB_CREATE right, not
+        // plain CREATE: the blob store is volume-wide and shared
+        // across packages, so permission to create files in one
+        // directory must not imply permission to add objects to it.
+        HxfsOp::CreateBlob => match kind {
+            HxfsHandleKind::None | HxfsHandleKind::Volume => Ok(rights::BLOB_CREATE),
+            _ => Err(SecurityError::WrongKind),
+        },
     }
 }
 
@@ -182,6 +200,77 @@ mod tests {
             payload_len: 0,
             reserved1: 0,
         }
+    }
+
+    /// A BlobView handle is a view of an immutable, content-addressed
+    /// object. Every mutating operation must be refused by kind, not
+    /// merely fail later in the service: an accepted `WriteAt` on a
+    /// blob would break the invariant that the hash names the bytes.
+    #[test]
+    fn blob_view_handles_refuse_every_mutating_operation() {
+        for op in [
+            HxfsOp::WriteAt,
+            HxfsOp::Truncate,
+            HxfsOp::CreateFile,
+            HxfsOp::Mkdir,
+            HxfsOp::Symlink,
+            HxfsOp::Rename,
+            HxfsOp::Unlink,
+            HxfsOp::CreateBlob,
+        ] {
+            assert_eq!(
+                required_rights(op, HxfsHandleKind::BlobView),
+                Err(SecurityError::WrongKind),
+                "{op:?} must not be reachable through a BlobView handle"
+            );
+        }
+    }
+
+    #[test]
+    fn blob_view_handles_allow_read_and_info() {
+        assert_eq!(
+            required_rights(HxfsOp::ReadAt, HxfsHandleKind::BlobView),
+            Ok(rights::READ)
+        );
+        assert_eq!(
+            required_rights(HxfsOp::GetInfo, HxfsHandleKind::BlobView),
+            Ok(0)
+        );
+        assert_eq!(
+            required_rights(HxfsOp::OpenBlob, HxfsHandleKind::BlobView),
+            Ok(rights::READ)
+        );
+    }
+
+    /// Storing a blob must not be reachable with plain CREATE. The
+    /// blob store is volume-wide, so a caller holding CREATE on its
+    /// own directory would otherwise be able to add objects other
+    /// packages resolve against.
+    #[test]
+    fn creating_a_blob_requires_the_dedicated_blob_right() {
+        assert_eq!(
+            required_rights(HxfsOp::CreateBlob, HxfsHandleKind::Volume),
+            Ok(rights::BLOB_CREATE)
+        );
+        assert_ne!(rights::BLOB_CREATE & rights::CREATE, rights::BLOB_CREATE);
+        let with_create_only = request(HxfsOp::CreateBlob, HxfsHandleKind::Volume, rights::CREATE);
+        assert!(matches!(
+            validate_request_rights(with_create_only),
+            Err(SecurityError::MissingRights { .. })
+        ));
+        let with_blob_right = request(
+            HxfsOp::CreateBlob,
+            HxfsHandleKind::Volume,
+            rights::BLOB_CREATE,
+        );
+        assert_eq!(validate_request_rights(with_blob_right), Ok(()));
+    }
+
+    /// `rights::ALL` must cover every defined right, or a request
+    /// carrying a legitimate new right is rejected as unknown.
+    #[test]
+    fn all_rights_includes_the_blob_create_right() {
+        assert_eq!(rights::ALL & rights::BLOB_CREATE, rights::BLOB_CREATE);
     }
 
     #[test]

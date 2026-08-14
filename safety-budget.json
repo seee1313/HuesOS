@@ -3,10 +3,10 @@
   "rust_lines": 81753,
   "totals": {
     "expect_calls": 60,
-    "panic_macros": 6,
+    "panic_macros": 13,
     "static_mut": 1,
     "todo_markers": 1,
-    "unsafe_blocks": 364,
+    "unsafe_blocks": 370,
     "unsafe_functions": 73,
     "unsafe_impls": 33,
     "unwrap_calls": 25
@@ -45,6 +45,7 @@
     "crates/huesos-kernel/src/scheduler.rs": 9,
     "crates/huesos-kernel/src/smp.rs": 9,
     "crates/huesos-kernel/src/task.rs": 7,
+    "crates/huesos-kernel/src/tpm.rs": 6,
     "crates/huesos-nvme/src/pci_transport.rs": 6,
     "crates/huesos-object/src/irq_guard.rs": 2,
     "crates/huesos-object/src/lib.rs": 1,

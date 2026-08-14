@@ -1,0 +1,134 @@
+[2J[01;01H[=3h[2J[01;01H[2J[01;01H[=3h[2J[01;01H[2J[01;01H[=3h[2J[01;01HBdsDxe: loading Boot0001 "UEFI QEMU DVD-ROM QM00005 " from PciRoot(0x0)/Pci(0x1F,0x2)/Sata(0x2,0xFFFF,0x0)
+BdsDxe: starting Boot0001 "UEFI QEMU DVD-ROM QM00005 " from PciRoot(0x0)/Pci(0x1F,0x2)/Sata(0x2,0xFFFF,0x0)
+[2J[01;01H[01;01H[2J[01;01H[01;01H[HuesOS] Bootloader handed over control
+[PMM] Reserved HBI image: phys_addr=0x16125000, length=48972256
+[storage] reserved boot DMA pool: phys=0x3800000, len=0x4000000
+[uACPI] starting uACPI, version 6.0.0
+[uACPI] RSDP 0x000000001F77E014 00000024 v02 (BOCHS )
+[uACPI] XSDT 0x000000001F77D0E8 00000054 v01 (BOCHS  BXPC    )
+[uACPI] DSDT 0x000000001F77A000 0000214B v01 (BOCHS  BXPC    )
+[uACPI] FACP 0x000000001F779000 000000F4 v03 (BOCHS  BXPC    )
+[uACPI] APIC 0x000000001F778000 00000080 v03 (BOCHS  BXPC    )
+[uACPI] HPET 0x000000001F777000 00000038 v01 (BOCHS  BXPC    )
+[uACPI] MCFG 0x000000001F776000 0000003C v01 (BOCHS  BXPC    )
+[uACPI] WAET 0x000000001F775000 00000028 v01 (BOCHS  BXPC    )
+[uACPI] BGRT 0x000000001F774000 00000038 v01 (INTEL  EDK2    )
+[uACPI] validated ACPI table graph and MADT
+[uACPI] built immutable Ring-3 table archive
+[uACPI] derived bounded FADT SystemIO policy
+[tpm] TPM present, no sealed volume key in this image
+[SMP] MADT parsed 2 CPUs found
+[IOAPIC] routed keyboard IRQ1
+[SMP] LAPIC timer count=624387
+[SMP] Booting AP 1
+[SMP] AP 1 online (waiting for release)
+[SMP] AP 1 ready
+[SMP] bringup done, APs ready=1
+HBI v2.1 parsed. Entries: 0x4
+[storage] boot info: dma=0x3800000+0x4000000, nvme_count=0
+[extable] installed 2 recoverable-copy entries
+[SMP] APs released to run
+HuesOS v0.1.0 on CPU 0
+PMM: 61520/268435456 frames (240 MiB)
+FB: 1280x800@32
+[SMP] AP 1 scheduling
+[init] installed immutable ACPI table archive VMO
+[init] installed deny-by-default ACPI broker capability
+[init] installed storage boot-info VMO
+[init] installed FrameDraw capability (handle 6)
+[kernel] entering userspace: rip=0x4011c0 rsp=0x7ffffefffff8 cs=0x23 ss=0x1b
+[init] hello from ring3 userspace, via libcanvas
+[init] user pointer guard smoke OK
+[init] VMO read/write round-trip OK
+[init] channel IPC round-trip OK
+[init] monotonic clock OK (10-tick wait measured 11 ticks)
+[kernel] entering userspace: rip=0x400030 rsp=0x7ffffefffff8 cs=0x23 ss=0x1b
+[fault-probe] triggering cpu
+[init] SMP affinity self-test OK (child ran on CPU 1)
+[kernel] entering userspace: rip=0x400030 rsp=0x7ffffefffff8 cs=0x23 ss=0x1b
+[fault-probe] triggering wait
+[init] ProcessWait lifecycle OK (blocked wake)
+[init] waitset self-test starting
+[init] waitset self-test channel-readable OK
+[init] waitset self-test channel-timeout OK
+[init] waitset self-test port-timeout OK
+[init] waitset self-test peer-closed OK
+[init] waitset self-test OK
+[kernel] entering userspace: rip=0x400030 rsp=0x7ffffefffff8 cs=0x23 ss=0x1b
+[fault-probe] triggering page
+[user-fault] process=fault-probe koid=36 task=4294967298 cpu=0 reason=PAGE FAULT rip=0x400001 address=0x10000 error=0x4 action=terminate-process code=-4097
+[kernel] entering userspace: rip=0x400030 rsp=0x7ffffefffff8 cs=0x23 ss=0x1b
+[fault-probe] triggering opcode
+[user-fault] process=fault-probe koid=44 task=8589934594 cpu=0 reason=INVALID OPCODE rip=0x40017a address=0x0 error=0x0 action=terminate-process code=-4099
+[kernel] entering userspace: rip=0x400030 rsp=0x7ffffefffff8 cs=0x23 ss=0x1b
+[fault-probe] triggering gpf
+[user-fault] process=fault-probe koid=52 task=12884901890 cpu=0 reason=GENERAL PROTECTION FAULT rip=0x400129 address=0x0 error=0x0 action=terminate-process code=-4098
+[kernel] entering userspace: rip=0x400030 rsp=0x7ffffefffff8 cs=0x23 ss=0x1b
+[fault-probe] triggering divide
+[user-fault] process=fault-probe koid=60 task=17179869186 cpu=0 reason=DIVIDE ERROR rip=0x4002fa address=0x0 error=0x0 action=terminate-process code=-4100
+[init] user fault isolation OK (#PF/#UD/#GP/#DE contained)
+[kernel] entering userspace: rip=0x400030 rsp=0x7ffffefffff8 cs=0x23 ss=0x1b
+[fault-probe] triggering shutdown
+[init] shutdown authorization OK (unprivileged caller denied)
+[init] launched driver-manager
+[kernel] entering userspace: rip=0x40b590 rsp=0x7ffffefffff8 cs=0x23 ss=0x1b
+[driver-manager] started in userspace
+[driver-manager] package probe: waiting for a client channel
+[init] driver-manager says driver-manager:degraded
+[init] passed HBI BOOTFS VMO to DriverManager
+[driver-manager] received BOOTFS VMO from init
+[driver-manager] BOOTFS mounted
+[driver-manager] boot driver manifest: nvme elf=/drivers/driver-host-nvme.elf manifest=/manifests/nvme.hdriver
+[init] passed ACPI table archive to DriverManager
+[driver-manager] received immutable ACPI table archive
+[init] transferred ACPI broker capability
+[driver-manager] received unique ACPI broker capability
+[driver-manager] launched isolated Ring-3 ACPI manager
+[kernel] entering userspace: rip=0x400140 rsp=0x7ffffefffff8 cs=0x23 ss=0x1b
+[acpi-manager] isolated Ring-3 service started
+[acpi-manager] validated 7 ACPI tables, 7 physical ranges indexed
+[acpi-manager] broker deny-by-default self-test OK
+[driver-manager] ACPI manager archive validation ready
+[init] passed storage boot-info VMO to DriverManager
+[driver-manager] received storage boot-info VMO
+[driver-manager] storage boot-info: dma=0x3800000+0x4000000 nvme_count=0
+[init] manifest input-host: minting 2 resource grant(s)
+[init] manifest input-host: transferred 2/2 resource handle(s) to DriverManager
+[init] manifest input-host: signalled grants-complete to DriverManager[driver-manager] grants-complete for input-host
+[driver-manager] manifest: host=input-host services=1 irqs=1 io_ports=1
+[driver-manager] capability: service=keyboard required=1
+[driver-manager] capability: irq=1
+[driver-manager] capability: io=0x60+1
+[driver-manager] manifest loaded: host=input-host elf=/drivers/input-host.elf
+[driver-manager] launched DriverHost input-host
+[driver-manager] forwarded 2/2 resource handle(s) to input-host
+[kernel] entering userspace: rip=0x400780 rsp=0x7ffffefffff8 cs=0x23 ss=0x1b
+[driver-host:input] started
+[driver-host:input] received manifest resource #1: resource:input-host:ioport:0x60:0x1:excl
+[driver-host:input] received manifest resource #2: resource:input-host:irq:0x1:0x1:excl
+[driver-host:input] retained 2 manifest resource handle(s)
+[driver-host:input] keyboard IRQ bound to Port
+
+[driver-manager] input DriverHost starting
+[driver-manager] registered service keyboard from input-host
+[driver-manager] input DriverHost ready
+[init] NVMe boot grants skipped: no NVMe PCI function
+[kernel] entering userspace: rip=0x4002c0 rsp=0x7ffffefffff8 cs=0x23 ss=0x1b
+[shutdown-broker] started
+[init] shutdown-broker: spawned
+[init] shutdown-broker: marked critical
+[shutdown-broker] ready; awaiting shutdown command
+[init] shutdown-broker: ready
+[init] passed registry channel to DriverManager
+[driver-manager] received service registry channel from init
+[init] framebuffer log handoff: starting terminal service
+[init] launched terminal
+[kernel] entering userspace: rip=0x408fc0 rsp=0x7ffffefffff8 cs=0x23 ss=0x1b
+[terminal] started in userspace
+[init] terminal says terminal:ready
+[init] passed DriverManager registry to terminal
+[init] service launch complete; parking as init supervisor
+[driver-manager] opened keyboard service channel for client
+[driver-host:input] attached keyboard client
+[driver-manager] opened filesystem service channel for client
+[terminal] keyboard service online, starting shell

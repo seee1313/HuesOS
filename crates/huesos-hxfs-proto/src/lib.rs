@@ -380,4 +380,67 @@ mod tests {
         assert!(n <= small.len());
         assert_eq!(&small[..n], b"size=12");
     }
+
+    /// A CreateBlob response carries a 32-byte content hash after the
+    /// fixed header, and the frame the service builds must declare
+    /// exactly that much payload.
+    ///
+    /// Regression: the service originally answered CreateBlob with a
+    /// bare header, so the caller received a readable view of an
+    /// object whose name it could never learn -- useless in a
+    /// content-addressed store.
+    #[test]
+    fn create_blob_frame_carries_the_content_hash() {
+        let request = request(HxfsOp::CreateBlob, 0);
+        let hash = [0xA7u8; 32];
+        let meta = ResponseMeta {
+            status: huesos_abi::hxfs::HxfsStatus::Ok,
+            handle_kind: huesos_abi::hxfs::HxfsHandleKind::BlobView,
+            handle_id: 9,
+            rights: huesos_abi::hxfs::rights::READ,
+            object_id: 0,
+            value: 52,
+            flags: huesos_abi::hxfs::response_flags::HANDLE_TRANSFERRED,
+        };
+        let mut out = [0u8; MAX_NATIVE_REQUEST_BYTES];
+        let Some(total) = encode_response(request, meta, &hash, &mut out) else {
+            assert!(false, "a 32-byte payload must encode");
+            return;
+        };
+        assert_eq!(total, HXFS_RESPONSE_BYTES + 32);
+        let Some(decoded) = HxfsResponse::decode(&out[..HXFS_RESPONSE_BYTES]) else {
+            assert!(false, "the header must decode");
+            return;
+        };
+        assert_eq!(decoded.payload_len, 32);
+        assert_eq!(&out[HXFS_RESPONSE_BYTES..total], &hash);
+    }
+
+    /// The response must echo the request id, so a client can tell an
+    /// answer to its own request from one left over on the channel.
+    ///
+    /// Regression: `request_id` used to be a constant nobody checked.
+    /// A client that abandoned one request then read every later
+    /// answer one message out of step -- and for a handle-carrying
+    /// response that means adopting a view of the wrong object.
+    #[test]
+    fn responses_echo_the_request_id() {
+        let mut request = request(HxfsOp::OpenBlob, 0);
+        request.request_id = 0xDEAD_BEEF;
+        let meta = ResponseMeta {
+            status: huesos_abi::hxfs::HxfsStatus::Ok,
+            handle_kind: huesos_abi::hxfs::HxfsHandleKind::BlobView,
+            handle_id: 1,
+            rights: huesos_abi::hxfs::rights::READ,
+            object_id: 0,
+            value: 0,
+            flags: 0,
+        };
+        let encoded = make_response(request, meta, 0);
+        let Some(decoded) = HxfsResponse::decode(&encoded) else {
+            assert!(false, "the header must decode");
+            return;
+        };
+        assert_eq!(decoded.request_id, 0xDEAD_BEEF);
+    }
 }

@@ -29,6 +29,7 @@ members = [
     "crates/huesos-nvme",
     "crates/huesos-pci",
     "crates/huesos-quota",
+    "crates/huesos-tpm",
 ]
 resolver = "2"
 exclude = ["tools"]

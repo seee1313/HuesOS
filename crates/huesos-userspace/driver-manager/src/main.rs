@@ -14,6 +14,7 @@ mod bootfs;
 mod devfs_service;
 mod fs_service;
 mod manifest;
+mod package_resolver;
 mod protocol;
 mod registry;
 mod supervisor;

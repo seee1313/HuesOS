@@ -20,6 +20,8 @@ use huesos_hxfs_proto::{
     decode_native_message, encode_response, make_response, split_two_strings, status_for_error,
     write_size_info, ResponseMeta, MAX_NATIVE_REQUEST_BYTES, POLL_BUF_BYTES,
 };
+#[cfg(feature = "hxblob")]
+use libcanvas::Handle;
 use libcanvas::{println, Channel, ErrorCode, Vmo};
 
 /// A.6 live mount: the hxfs-service is the production
@@ -52,6 +54,20 @@ fn init_heap() -> bool {
 const MAX_CLIENTS: usize = 4;
 const MAX_FILE_HANDLES: usize = 8;
 const MAX_DIR_HANDLES: usize = 8;
+/// Concurrently open BlobView handles.
+#[cfg(feature = "hxblob")]
+///
+/// Blob views are read-only and short-lived (resolve a package, read
+/// it, close), so the ceiling is deliberately lower than the file
+/// table; each slot costs a channel plus a 32-byte hash.
+const MAX_BLOB_HANDLES: usize = 8;
+
+/// Messages one endpoint may be served per service-loop tick.
+///
+/// Every client, file, dir and blob shares a single loop, so a peer
+/// that never stops talking would starve all the others if its slot
+/// were drained "until empty".
+const POLL_BUDGET_PER_TICK: u32 = 64;
 const MAX_READ_BYTES: usize = 4096;
 // `MAX_NATIVE_REQUEST_BYTES` and `POLL_BUF_BYTES` live in
 // `huesos-hxfs-proto`, where the sizing rule that keeps a channel
@@ -145,6 +161,20 @@ struct DirEndpoint {
     handle: DirectoryHandle,
 }
 
+/// A live BlobView handle.
+///
+/// Hxblob objects are content-addressed and immutable, so the
+/// endpoint stores the hash rather than an object id: the hash is the
+/// identity, it stays valid across checkpoints and reallocations, and
+/// it lets every read re-check that the bytes still hash to what the
+/// caller asked for.
+#[cfg(feature = "hxblob")]
+struct BlobEndpoint {
+    channel: Channel,
+    hash: [u8; 32],
+    size: u64,
+}
+
 struct HxfsRuntime {
     fs: Box<MountedHxfs>,
     /// Receive buffer shared by every poll loop. Heap-resident (this
@@ -154,6 +184,8 @@ struct HxfsRuntime {
     clients: [Option<Channel>; MAX_CLIENTS],
     files: [Option<FileEndpoint>; MAX_FILE_HANDLES],
     dirs: [Option<DirEndpoint>; MAX_DIR_HANDLES],
+    #[cfg(feature = "hxblob")]
+    blobs: [Option<BlobEndpoint>; MAX_BLOB_HANDLES],
     // Stage E (Production polish): runtime knobs (sysctl-like).
     stats_interval_ticks: u32,
     stats_since: u32,
@@ -167,6 +199,8 @@ impl HxfsRuntime {
             clients: [const { None }; MAX_CLIENTS],
             files: [const { None }; MAX_FILE_HANDLES],
             dirs: [const { None }; MAX_DIR_HANDLES],
+            #[cfg(feature = "hxblob")]
+            blobs: [const { None }; MAX_BLOB_HANDLES],
             stats_interval_ticks: 0,
             stats_since: 0,
         }
@@ -189,11 +223,29 @@ impl HxfsRuntime {
             self.poll_dir(dir);
             dir += 1;
         }
+        #[cfg(feature = "hxblob")]
+        {
+            let mut blob = 0usize;
+            while blob < self.blobs.len() {
+                self.poll_blob(blob);
+                blob += 1;
+            }
+        }
     }
 
     fn poll_bootstrap(&mut self, bootstrap: &Channel) {
         let mut buf = [0u8; 64];
+        // Bounded per tick. An endpoint whose peer keeps talking must
+        // not hold the service loop inside one slot: the other
+        // clients, files, dirs and blobs are served by the SAME loop,
+        // so an unbounded drain here is a fairness bug that presents
+        // as an unrelated client hanging.
+        let mut budget = POLL_BUDGET_PER_TICK;
         loop {
+            budget = match budget.checked_sub(1) {
+                Some(remaining) => remaining,
+                None => return,
+            };
             match bootstrap.read_optional_handle(&mut buf) {
                 Ok((n, Some(handle))) if &buf[..n] == b"hxfs-client" => {
                     self.attach_client(Channel::from_handle(handle));
@@ -203,6 +255,22 @@ impl HxfsRuntime {
                 Err(ErrorCode::ShouldWait) | Err(ErrorCode::TimedOut) => return,
                 Err(_) => return,
             }
+        }
+    }
+
+    /// Drop every client and blob endpoint held by the boot
+    /// self-check.
+    ///
+    /// Called once the check has printed its verdict, so the service
+    /// enters its serving loop with the same empty tables a
+    /// production build starts with.
+    #[cfg(feature = "hxblob")]
+    fn release_self_check_state(&mut self) {
+        for slot in self.clients.iter_mut() {
+            *slot = None;
+        }
+        for slot in self.blobs.iter_mut() {
+            *slot = None;
         }
     }
 
@@ -220,7 +288,17 @@ impl HxfsRuntime {
         // the loop so the `&mut self` handler calls stay legal, and
         // put it back on every exit path.
         let mut buf = core::mem::replace(&mut self.poll_buf, Box::new([0u8; POLL_BUF_BYTES]));
+        // Bounded per tick. An endpoint whose peer keeps talking must
+        // not hold the service loop inside one slot: the other
+        // clients, files, dirs and blobs are served by the SAME loop,
+        // so an unbounded drain here is a fairness bug that presents
+        // as an unrelated client hanging.
+        let mut budget = POLL_BUDGET_PER_TICK;
         while let Some(client) = self.clients[index].as_ref() {
+            budget = match budget.checked_sub(1) {
+                Some(remaining) => remaining,
+                None => break,
+            };
             match client.read_into(buf.as_mut_slice()) {
                 Ok(n) => self.handle_client_request(index, &buf[..n]),
                 Err(ErrorCode::ShouldWait) | Err(ErrorCode::TimedOut) => break,
@@ -349,6 +427,10 @@ impl HxfsRuntime {
             HxfsOp::Rename => self.client_rename_native(index, request, payload),
             HxfsOp::Unlink => self.client_unlink_native(index, request, payload),
             HxfsOp::Fsync | HxfsOp::Checkpoint => self.client_checkpoint_native(index, request),
+            #[cfg(feature = "hxblob")]
+            HxfsOp::OpenBlob => self.client_open_blob_native(index, request, payload),
+            #[cfg(feature = "hxblob")]
+            HxfsOp::CreateBlob => self.client_create_blob_native(index, request, payload),
             _ => self.write_client_status(index, request, HxfsStatus::Unsupported),
         }
     }
@@ -674,7 +756,17 @@ impl HxfsRuntime {
 
     fn poll_file(&mut self, index: usize) {
         let mut buf = core::mem::replace(&mut self.poll_buf, Box::new([0u8; POLL_BUF_BYTES]));
+        // Bounded per tick. An endpoint whose peer keeps talking must
+        // not hold the service loop inside one slot: the other
+        // clients, files, dirs and blobs are served by the SAME loop,
+        // so an unbounded drain here is a fairness bug that presents
+        // as an unrelated client hanging.
+        let mut budget = POLL_BUDGET_PER_TICK;
         while let Some(endpoint) = self.files[index].as_ref() {
+            budget = match budget.checked_sub(1) {
+                Some(remaining) => remaining,
+                None => break,
+            };
             match endpoint.channel.read_into(buf.as_mut_slice()) {
                 Ok(n) if decode_native_message(&buf[..n]).is_some() => {
                     let Some((native, payload)) = decode_native_message(&buf[..n]) else {
@@ -811,6 +903,266 @@ impl HxfsRuntime {
         }
     }
 
+    /// Open an existing blob by content hash.
+    ///
+    /// The payload is the raw 32-byte hash, not hex: this is the
+    /// binary protocol, and hex would double the bytes for no gain.
+    /// The blob is verified against its hash before the handle is
+    /// returned, so a caller that receives a BlobView knows the
+    /// object it names is intact -- an immutable object that fails
+    /// its own checksum is corruption, and reporting it as `NotFound`
+    /// would hide that.
+    #[cfg(feature = "hxblob")]
+    fn client_open_blob_native(&mut self, index: usize, request: HxfsRequest, payload: &[u8]) {
+        let Some(hash) = blob_hash_from_payload(payload) else {
+            self.write_client_status(index, request, HxfsStatus::Invalid);
+            return;
+        };
+        let size = match self.fs.blob_info(&hash) {
+            Ok((_, size)) => size,
+            Err(error) => {
+                self.write_client_status(index, request, status_for_error(error));
+                return;
+            }
+        };
+        match self.fs.verify_blob(&hash) {
+            Ok(true) => {}
+            Ok(false) => {
+                println!("[hxfs] blob-corrupt on open");
+                self.write_client_status(index, request, HxfsStatus::CorruptObject);
+                return;
+            }
+            Err(error) => {
+                self.write_client_status(index, request, status_for_error(error));
+                return;
+            }
+        }
+        self.return_blob_to_client(index, request, hash, size);
+    }
+
+    /// Store an inline payload as a blob and return a view of it.
+    ///
+    /// Re-storing identical bytes is not an error. The hash is the
+    /// identity, so the correct answer to "create this blob" when it
+    /// already exists is a handle to the existing object; returning
+    /// `AlreadyExists` would force every caller to implement the same
+    /// lookup-then-create race.
+    #[cfg(feature = "hxblob")]
+    fn client_create_blob_native(&mut self, index: usize, request: HxfsRequest, payload: &[u8]) {
+        if payload.is_empty() {
+            self.write_client_status(index, request, HxfsStatus::Invalid);
+            return;
+        }
+        let hash = match self.fs.put_blob(payload) {
+            Ok(hash) => hash,
+            Err(HxfsError::AlreadyExists) => {
+                // Content-addressed: the object is already stored and
+                // by definition holds these exact bytes, so the right
+                // answer is a view of it, not an error. The hash comes
+                // from the filesystem's own hasher rather than a
+                // second copy of SHA-256 in the service.
+                self.fs.content_hash(payload)
+            }
+            Err(error) => {
+                self.write_client_status(index, request, status_for_error(error));
+                return;
+            }
+        };
+        let size = payload.len() as u64;
+        self.return_blob_to_client(index, request, hash, size);
+    }
+
+    /// Mint a BlobView endpoint and hand its client end back.
+    #[cfg(feature = "hxblob")]
+    fn return_blob_to_client(
+        &mut self,
+        index: usize,
+        request: HxfsRequest,
+        hash: [u8; 32],
+        size: u64,
+    ) {
+        let Some(slot) = self.blobs.iter_mut().find(|slot| slot.is_none()) else {
+            self.write_client_status(index, request, HxfsStatus::NoSpace);
+            return;
+        };
+        let Ok((client_end, server_end)) = Channel::pair() else {
+            self.write_client_status(index, request, HxfsStatus::NoSpace);
+            return;
+        };
+        let Some(client) = self.clients[index].as_ref() else {
+            return;
+        };
+        // The content hash travels back as the payload. On CreateBlob
+        // the caller cannot know it -- the hash is computed from the
+        // bytes by the filesystem -- and without it the client has a
+        // view it can read but an object it can never name again,
+        // which is precisely what a content-addressed store is for.
+        let mut frame = [0u8; huesos_abi::hxfs::HXFS_RESPONSE_BYTES + 32];
+        let response = make_response(
+            request,
+            ResponseMeta {
+                status: HxfsStatus::Ok,
+                handle_kind: HxfsHandleKind::BlobView,
+                handle_id: blob_handle_id(&hash),
+                // Read-only by construction. A BlobView never carries
+                // WRITE: the object it names is immutable, and the
+                // rights word is the only thing a client inspects
+                // before deciding whether a write is worth trying.
+                rights: hxfs_rights::READ,
+                object_id: 0,
+                value: size,
+                flags: response_flags::HANDLE_TRANSFERRED,
+            },
+            32,
+        );
+        frame[..huesos_abi::hxfs::HXFS_RESPONSE_BYTES].copy_from_slice(&response);
+        frame[huesos_abi::hxfs::HXFS_RESPONSE_BYTES..].copy_from_slice(&hash);
+        if client
+            .write_handle(&frame, client_end.into_handle())
+            .is_err()
+        {
+            return;
+        }
+        *slot = Some(BlobEndpoint {
+            channel: server_end,
+            hash,
+            size,
+        });
+    }
+
+    #[cfg(feature = "hxblob")]
+    fn poll_blob(&mut self, index: usize) {
+        // Bounded per tick. An endpoint whose peer keeps talking must
+        // not hold the service loop inside one slot: the other
+        // clients, files, dirs and blobs are served by the SAME loop,
+        // so an unbounded drain here is a fairness bug that presents
+        // as an unrelated client hanging.
+        let mut budget = POLL_BUDGET_PER_TICK;
+        loop {
+            budget = match budget.checked_sub(1) {
+                Some(remaining) => remaining,
+                None => return,
+            };
+            let Some(endpoint) = self.blobs[index].as_ref() else {
+                return;
+            };
+            let mut buf = core::mem::replace(&mut self.poll_buf, Box::new([0u8; POLL_BUF_BYTES]));
+            let read = endpoint.channel.read_into(&mut buf[..]);
+            let outcome = match read {
+                Ok(n) => Some(n),
+                Err(ErrorCode::ShouldWait) | Err(ErrorCode::TimedOut) => None,
+                Err(ErrorCode::PeerClosed) => {
+                    self.blobs[index] = None;
+                    None
+                }
+                Err(_) => None,
+            };
+            let Some(n) = outcome else {
+                self.poll_buf = buf;
+                return;
+            };
+            if let Some((request, payload)) = decode_native_message(&buf[..n]) {
+                self.handle_blob_native(index, request, payload);
+            }
+            self.poll_buf = buf;
+        }
+    }
+
+    #[cfg(feature = "hxblob")]
+    fn handle_blob_native(&mut self, index: usize, request: HxfsRequest, _payload: &[u8]) {
+        match request.op {
+            HxfsOp::GetInfo => self.blob_info_native(index, request),
+            HxfsOp::ReadAt => self.blob_read_native(index, request),
+            // Everything else is refused by kind rather than by
+            // failing later: a blob is immutable, so there is no
+            // operation that could succeed here.
+            _ => self.write_blob_status(index, request, HxfsStatus::WrongType),
+        }
+    }
+
+    #[cfg(feature = "hxblob")]
+    fn blob_info_native(&mut self, index: usize, request: HxfsRequest) {
+        let Some(endpoint) = self.blobs[index].as_ref() else {
+            return;
+        };
+        let (hash, size) = (endpoint.hash, endpoint.size);
+        self.write_blob_response(
+            index,
+            request,
+            HxfsStatus::Ok,
+            size,
+            response_flags::INLINE_PAYLOAD,
+            &hash,
+        );
+    }
+
+    #[cfg(feature = "hxblob")]
+    fn blob_read_native(&mut self, index: usize, request: HxfsRequest) {
+        let Some(endpoint) = self.blobs[index].as_ref() else {
+            return;
+        };
+        let hash = endpoint.hash;
+        let requested = if request.arg1 == 0 {
+            MAX_READ_BYTES
+        } else {
+            match usize::try_from(request.arg1) {
+                Ok(value) => value.min(MAX_READ_BYTES),
+                Err(_) => {
+                    self.write_blob_status(index, request, HxfsStatus::Invalid);
+                    return;
+                }
+            }
+        };
+        let mut out = [0u8; MAX_READ_BYTES];
+        match self
+            .fs
+            .read_blob_at(&hash, request.arg0, &mut out[..requested])
+        {
+            Ok(n) => self.write_blob_response(
+                index,
+                request,
+                HxfsStatus::Ok,
+                n as u64,
+                response_flags::INLINE_PAYLOAD,
+                &out[..n],
+            ),
+            Err(error) => self.write_blob_status(index, request, status_for_error(error)),
+        }
+    }
+
+    #[cfg(feature = "hxblob")]
+    fn write_blob_status(&self, index: usize, request: HxfsRequest, status: HxfsStatus) {
+        self.write_blob_response(index, request, status, 0, 0, &[]);
+    }
+
+    #[cfg(feature = "hxblob")]
+    fn write_blob_response(
+        &self,
+        index: usize,
+        request: HxfsRequest,
+        status: HxfsStatus,
+        value: u64,
+        flags: u32,
+        payload: &[u8],
+    ) {
+        if let Some(endpoint) = self.blobs[index].as_ref() {
+            write_response_to_channel(
+                &endpoint.channel,
+                request,
+                ResponseMeta {
+                    status,
+                    handle_kind: HxfsHandleKind::BlobView,
+                    handle_id: blob_handle_id(&endpoint.hash),
+                    rights: hxfs_rights::READ,
+                    object_id: 0,
+                    value,
+                    flags,
+                },
+                payload,
+            );
+        }
+    }
+
     fn handle_file_native(&mut self, index: usize, request: HxfsRequest, payload: &[u8]) {
         match request.op {
             HxfsOp::GetInfo => self.file_info_native(index, request),
@@ -936,7 +1288,17 @@ impl HxfsRuntime {
 
     fn poll_dir(&mut self, index: usize) {
         let mut buf = core::mem::replace(&mut self.poll_buf, Box::new([0u8; POLL_BUF_BYTES]));
+        // Bounded per tick. An endpoint whose peer keeps talking must
+        // not hold the service loop inside one slot: the other
+        // clients, files, dirs and blobs are served by the SAME loop,
+        // so an unbounded drain here is a fairness bug that presents
+        // as an unrelated client hanging.
+        let mut budget = POLL_BUDGET_PER_TICK;
         while let Some(endpoint) = self.dirs[index].as_ref() {
+            budget = match budget.checked_sub(1) {
+                Some(remaining) => remaining,
+                None => break,
+            };
             match endpoint.channel.read_into(buf.as_mut_slice()) {
                 Ok(n) if decode_native_message(&buf[..n]).is_some() => {
                     let Some((native, payload)) = decode_native_message(&buf[..n]) else {
@@ -1354,15 +1716,50 @@ fn mount_from_bootstrap(bootstrap: &Channel) -> Option<Box<MountedHxfs>> {
                         let key = libcanvas::system::get_volume_key().ok().flatten();
                         let enc = [huesos_hxfs::synthetic_key::encryption_policy()];
                         let comp = [huesos_hxfs::synthetic_key::compression_policy()];
+                        if key.is_none() {
+                            // No TPM, and no bootloader blob either.
+                            // A PLAIN volume must still mount: most
+                            // machines have no TPM, and refusing to
+                            // boot them would make the whole system
+                            // unusable to prove a point about a
+                            // feature their volume does not use.
+                            //
+                            // An ENCRYPTED volume is a different
+                            // matter and is still refused below: the
+                            // bytes are AEAD-sealed, so "carry on
+                            // without encryption" is not an option
+                            // anyone can implement -- there is no
+                            // key with which to read them. The
+                            // failure is reported as exactly that
+                            // rather than as a generic mount error.
+                            println!("[hxfs] no volume key available; plain volumes only");
+                        }
                         FixedHxfsWriter::mount_with_policies(reader, &enc, &comp, key.as_ref())
                     }
                     #[cfg(not(feature = "synthetic-key"))]
                     {
-                        FixedHxfsWriter::mount_with_policies(reader, &[], &[], None)
+                        // Production build: take the key if the
+                        // platform has one. A machine without a TPM
+                        // still mounts its plain volume; only an
+                        // encrypted volume needs the key, and that
+                        // case is reported distinctly below.
+                        let key = libcanvas::system::get_volume_key().ok().flatten();
+                        FixedHxfsWriter::mount_with_policies(reader, &[], &[], key.as_ref())
                     }
                 };
                 match mounted {
                     Ok(fs) => return Some(Box::new(fs)),
+                    Err(huesos_hxfs::HxfsError::EncryptedVolumeKeyUnavailable) => {
+                        // Distinguish "this machine has no TPM" from
+                        // "the filesystem is broken". Only the former
+                        // is actionable by the operator, and a
+                        // generic mount error hides which one it is.
+                        println!(
+                            "[hxfs] mount refused: volume is encrypted but no key is available"
+                        );
+                        println!("[hxfs] hint: this build needs a TPM-sealed or bootloader key");
+                        return None;
+                    }
                     Err(error) => {
                         println!("[hxfs] mount failed: {:?}", error);
                         return None;
@@ -1459,7 +1856,6 @@ pub extern "C" fn _start() -> ! {
     let mut fs = fs;
     #[cfg(feature = "synthetic-key")]
     run_boot_self_check(&mut fs);
-    let _ = bootstrap.write(b"service:hxfs:ready");
     // The runtime (and the stack-resident MountedHxfs with its
     // fixed extent array) lives on the HEAP: at Stage E capacities
     // the writer is ~32 KiB and the 128 KiB user stack must stay
@@ -1467,6 +1863,20 @@ pub extern "C" fn _start() -> ! {
     // buffers per frame on the mount call chain). The 256 KiB
     // userspace heap fits it comfortably.
     let mut runtime = Box::new(HxfsRuntime::new(fs));
+    // Phase-4 gate: exercise the native BlobView operations over a
+    // real channel pair, through the same dispatch a client uses.
+    // Calling `put_blob`/`get_blob` directly would prove the storage
+    // layer works and say nothing about the protocol path, which is
+    // what the gate is about.
+    #[cfg(feature = "hxblob")]
+    run_blob_view_check(&mut runtime);
+    // Announce readiness only once the self-checks are done. The
+    // marker is a promise that the next request will be served:
+    // announcing first and then spending seconds inside a boot check
+    // makes the first client request time out against a service that
+    // said it was ready, which is exactly what it means for a
+    // readiness signal to be wrong.
+    let _ = bootstrap.write(b"service:hxfs:ready");
     loop {
         runtime.poll(&bootstrap);
         runtime.stats_since = runtime.stats_since.wrapping_add(1);
@@ -1646,6 +2056,48 @@ fn run_boot_self_check(fs: &mut MountedHxfs) {
     run_reliability_checks(fs);
 }
 
+#[cfg(feature = "synthetic-key")]
+/// Exercise and report the mounted page cache.
+///
+/// The cache lives in `FixedHxfsWriter`, so "the service has a cache"
+/// is only true if the service's own mount is the one being hit. This
+/// reads one file twice and prints the counters; the soak harness
+/// asserts on the marker, which is what turns the gate from "code
+/// exists" into "code ran under load".
+///
+/// The file read here must be one this boot WROTE, never the seeded
+/// `seed.bin`: the fault-injection soak modes deliberately corrupt
+/// that seed, so its second read fails its integrity check, is never
+/// served from cache, and the gate fails on a healthy cache. That is
+/// a broken test, not a broken cache -- it is why this runs after the
+/// write round-trip rather than before it.
+fn run_page_cache_check(fs: &mut MountedHxfs) {
+    let root = fs.root_directory();
+    let Ok(file) = fs.open_child_file(root, "probe-compress.bin") else {
+        println!("[hxfs] page-cache: probe file missing");
+        return;
+    };
+    let mut buf = [0u8; 4096];
+    // Two reads: the first populates, the second must hit.
+    if let Err(error) = fs.read_file(file, &mut buf) {
+        println!("[hxfs] page-cache: first read failed ({error:?})");
+        return;
+    }
+    let (hits_before, _) = fs.page_cache_stats();
+    if let Err(error) = fs.read_file(file, &mut buf) {
+        println!("[hxfs] page-cache: repeat read failed ({error:?})");
+        return;
+    }
+    let (hits_after, misses) = fs.page_cache_stats();
+    println!(
+        "[hxfs] page-cache slots={} hits={} misses={} repeat-read-hits={}",
+        fs.page_cache_capacity(),
+        hits_after,
+        misses,
+        hits_after.saturating_sub(hits_before)
+    );
+}
+
 /// Stage C: live scrub, structural fsck and quota enforcement
 /// probes, all through the production write/read paths.
 #[cfg(feature = "synthetic-key")]
@@ -1659,6 +2111,18 @@ fn run_reliability_checks(fs: &mut MountedHxfs) {
             summary.errors
         ),
         Err(error) => println!("[hxfs] scrub failed: {:?}", error),
+    }
+    // Full tree scrub: every checkpoint root on disk, read back
+    // through the decrypt-aware path. The live scrub above walks
+    // objects; this one walks the trees that describe them, so a
+    // corrupt policy or index root cannot hide behind healthy
+    // objects.
+    match fs.scrub_all() {
+        Ok((blocks, errors)) => println!(
+            "[hxfs] tree-scrub complete ({} blocks, {} errors)",
+            blocks, errors
+        ),
+        Err(error) => println!("[hxfs] tree-scrub failed: {:?}", error),
     }
     // Structural fsck: persisted roots + object model.
     let fsck = fs.fsck();
@@ -1822,6 +2286,10 @@ fn write_roundtrip_check(fs: &mut MountedHxfs) {
             Ok(file) => match fs.read_file(file, &mut cbuf) {
                 Ok(n) if n == 512 && cbuf[..n] == expected[..] => {
                     println!("[hxfs] write-roundtrip-ok");
+                    // The cache gate needs a file that is known good
+                    // on every soak mode; this one was just written
+                    // and verified by this boot.
+                    run_page_cache_check(fs);
                 }
                 Ok(n) => println!("[hxfs] write-roundtrip: mismatch (n={n}, expected 512)"),
                 Err(error) => println!("[hxfs] write-roundtrip: read failed ({:?})", error),
@@ -2186,4 +2654,247 @@ fn panic(info: &PanicInfo) -> ! {
         let _ = writeln!(libcanvas::debug::DebugWriter, "[hxfs] heap: uninitialised");
     }
     libcanvas::process::exit(-1);
+}
+
+/// Decode a raw 32-byte content hash from a request payload.
+#[cfg(feature = "hxblob")]
+fn blob_hash_from_payload(payload: &[u8]) -> Option<[u8; 32]> {
+    if payload.len() != 32 {
+        return None;
+    }
+    let mut hash = [0u8; 32];
+    hash.copy_from_slice(payload);
+    Some(hash)
+}
+
+/// Stable handle id for a blob view.
+///
+/// Blobs have no object id a client should depend on (the backing
+/// file can be reallocated), so the id is derived from the content
+/// hash: stable for the same content, distinct across blobs.
+#[cfg(feature = "hxblob")]
+fn blob_handle_id(hash: &[u8; 32]) -> u64 {
+    let mut id = [0u8; 8];
+    id.copy_from_slice(&hash[..8]);
+    u64::from_le_bytes(id)
+}
+
+/// On-target check of the native BlobView protocol path.
+///
+/// Drives CreateBlob -> BlobView -> GetInfo/ReadAt over a real
+/// channel pair, plus the two refusals that matter: a write on an
+/// immutable object, and an open of a hash that is not stored.
+#[cfg(feature = "hxblob")]
+fn run_blob_view_check(runtime: &mut HxfsRuntime) {
+    let Ok((client, server)) = Channel::pair() else {
+        println!("[hxfs] blob-view: no channel");
+        return;
+    };
+    runtime.attach_client(server);
+    let payload = b"HuesOS native BlobView object path 0123456789abcdef".repeat(4);
+
+    // 1. CreateBlob over the wire.
+    if send_native(
+        &client,
+        HxfsOp::CreateBlob,
+        HxfsHandleKind::None,
+        0,
+        0,
+        &payload,
+    )
+    .is_err()
+    {
+        println!("[hxfs] blob-view: create send failed");
+        return;
+    }
+    runtime.poll_client(0);
+    let Some((status, kind, rights, size, view)) = recv_native_handle(&client) else {
+        println!("[hxfs] blob-view: no create response");
+        return;
+    };
+    if status != HxfsStatus::Ok || kind != HxfsHandleKind::BlobView {
+        println!(
+            "[hxfs] blob-view: create status {:?} kind {:?}",
+            status, kind
+        );
+        return;
+    }
+    // An immutable object must never be handed out writable.
+    if rights & hxfs_rights::WRITE != 0 {
+        println!("[hxfs] blob-view: handle carried WRITE rights");
+        return;
+    }
+    if size != payload.len() as u64 {
+        println!("[hxfs] blob-view: size {} != {}", size, payload.len());
+        return;
+    }
+    let Some(view) = view else {
+        println!("[hxfs] blob-view: create returned no handle");
+        return;
+    };
+    let view = Channel::from_handle(view);
+
+    // 2. GetInfo returns the content hash.
+    if send_native(&view, HxfsOp::GetInfo, HxfsHandleKind::BlobView, 0, 0, &[]).is_err() {
+        println!("[hxfs] blob-view: info send failed");
+        return;
+    }
+    runtime.poll_blob(0);
+    let mut hash = [0u8; 32];
+    match recv_native_payload(&view, &mut hash) {
+        Some((HxfsStatus::Ok, 32)) => {}
+        other => {
+            println!("[hxfs] blob-view: info {:?}", other);
+            return;
+        }
+    }
+
+    // 3. ReadAt returns the stored bytes.
+    if send_native(
+        &view,
+        HxfsOp::ReadAt,
+        HxfsHandleKind::BlobView,
+        0,
+        payload.len() as u64,
+        &[],
+    )
+    .is_err()
+    {
+        println!("[hxfs] blob-view: read send failed");
+        return;
+    }
+    runtime.poll_blob(0);
+    let mut read_back = [0u8; 256];
+    let Some((HxfsStatus::Ok, n)) = recv_native_payload(&view, &mut read_back) else {
+        println!("[hxfs] blob-view: read failed");
+        return;
+    };
+    if n != payload.len() || read_back[..n] != payload[..] {
+        println!("[hxfs] blob-view: read mismatch ({} bytes)", n);
+        return;
+    }
+
+    // 4. A write through a BlobView must be refused by kind.
+    if send_native(&view, HxfsOp::WriteAt, HxfsHandleKind::BlobView, 0, 0, b"x").is_err() {
+        println!("[hxfs] blob-view: write send failed");
+        return;
+    }
+    runtime.poll_blob(0);
+    let mut sink = [0u8; 8];
+    match recv_native_payload(&view, &mut sink) {
+        Some((HxfsStatus::WrongType, _)) => {}
+        other => {
+            println!("[hxfs] blob-view: write was not refused ({:?})", other);
+            return;
+        }
+    }
+
+    // 5. Opening an unknown hash reports NotFound, not a stale view.
+    let absent = [0xEEu8; 32];
+    if send_native(
+        &client,
+        HxfsOp::OpenBlob,
+        HxfsHandleKind::BlobView,
+        0,
+        0,
+        &absent,
+    )
+    .is_err()
+    {
+        println!("[hxfs] blob-view: open send failed");
+        return;
+    }
+    runtime.poll_client(0);
+    let mut sink = [0u8; 8];
+    match recv_native_payload(&client, &mut sink) {
+        Some((HxfsStatus::NotFound, _)) => {}
+        other => {
+            println!("[hxfs] blob-view: absent blob gave {:?}", other);
+            return;
+        }
+    }
+
+    println!("[hxfs] blob-view-native-ok bytes={}", payload.len());
+
+    // Release everything the check occupied. Both tables are small
+    // fixed arrays, and a boot self-check that keeps a client slot and
+    // a blob endpoint for the life of the process is a self-check that
+    // shrinks the service it is validating. The blob endpoints matter
+    // most: the first real client's view lands in a later slot, and a
+    // stale endpoint in an earlier one is polled forever against a
+    // peer that will never speak again.
+    runtime.release_self_check_state();
+}
+
+/// Encode and send one native request.
+#[cfg(feature = "hxblob")]
+fn send_native(
+    channel: &Channel,
+    op: HxfsOp,
+    kind: HxfsHandleKind,
+    arg0: u64,
+    arg1: u64,
+    payload: &[u8],
+) -> Result<(), ErrorCode> {
+    let request = HxfsRequest {
+        version: huesos_abi::hxfs::HXFS_PROTOCOL_VERSION,
+        reserved0: 0,
+        op,
+        flags: if payload.is_empty() {
+            0
+        } else {
+            request_flags::INLINE_PAYLOAD
+        },
+        request_id: 7,
+        handle_id: 0,
+        handle_kind: kind,
+        rights: hxfs_rights::ALL,
+        arg0,
+        arg1,
+        payload_len: payload.len() as u32,
+        reserved1: 0,
+    };
+    let mut frame = [0u8; POLL_BUF_BYTES];
+    let header = request.encode();
+    frame[..header.len()].copy_from_slice(&header);
+    frame[header.len()..header.len() + payload.len()].copy_from_slice(payload);
+    channel.write(&frame[..header.len() + payload.len()])
+}
+
+/// Receive a response that carries a transferred handle.
+#[cfg(feature = "hxblob")]
+#[allow(clippy::type_complexity)]
+fn recv_native_handle(
+    channel: &Channel,
+) -> Option<(HxfsStatus, HxfsHandleKind, u64, u64, Option<Handle>)> {
+    let mut buf = [0u8; 128];
+    let (n, handle) = channel.read_optional_handle(&mut buf).ok()?;
+    let response = huesos_abi::hxfs::HxfsResponse::decode(
+        &buf[..n.min(huesos_abi::hxfs::HXFS_RESPONSE_BYTES)],
+    )?;
+    Some((
+        response.status,
+        response.handle_kind,
+        response.rights,
+        response.value,
+        handle,
+    ))
+}
+
+/// Receive a response and copy its inline payload into `out`.
+#[cfg(feature = "hxblob")]
+fn recv_native_payload(channel: &Channel, out: &mut [u8]) -> Option<(HxfsStatus, usize)> {
+    let mut buf = [0u8; POLL_BUF_BYTES];
+    let n = channel.read_into(&mut buf).ok()?;
+    if n < huesos_abi::hxfs::HXFS_RESPONSE_BYTES {
+        return None;
+    }
+    let response =
+        huesos_abi::hxfs::HxfsResponse::decode(&buf[..huesos_abi::hxfs::HXFS_RESPONSE_BYTES])?;
+    let payload_len = (response.payload_len as usize).min(out.len());
+    out[..payload_len].copy_from_slice(
+        &buf[huesos_abi::hxfs::HXFS_RESPONSE_BYTES
+            ..huesos_abi::hxfs::HXFS_RESPONSE_BYTES + payload_len],
+    );
+    Some((response.status, payload_len))
 }

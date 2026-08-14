@@ -311,6 +311,7 @@ dependencies = [
  "huesos-pci",
  "huesos-pmm",
  "huesos-syscalls",
+ "huesos-tpm",
  "huesos-uacpi",
  "linked_list_allocator",
  "log",
@@ -391,6 +392,13 @@ dependencies = [
  "log",
  "spin",
  "x86_64",
+]
+
+[[package]]
+name = "huesos-tpm"
+version = "0.1.0"
+dependencies = [
+ "huesos-abi",
 ]
 
 [[package]]

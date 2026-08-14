@@ -320,3 +320,30 @@ Filesystem-backed discovery/loading is still future work.
 - **Calling `Canvas::present()` with coordinates or a size beyond the real
   screen** — the kernel's blit clips to the real framebuffer bounds; you
   won't corrupt memory, you'll just not see the out-of-bounds part drawn.
+- **Draining a channel "until `ShouldWait`" in a shared service loop** —
+  this is the fairness bug that is hardest to recognise from the
+  symptom. DriverManager and hxfs-service are single-threaded and
+  cooperative: one pass serves every host, client, file, dir and blob.
+  A drain loop is only bounded if the peer eventually goes quiet, and
+  under load (the high queue-depth NVMe soak, for one) it does not —
+  so `poll_*` never returns and everything scheduled after it in the
+  same pass is starved for the life of the run. It does not look like
+  a fairness bug; it looks like some unrelated service hanging.
+  Give each `poll_*` a per-tick budget:
+
+  ```rust
+  let mut budget = POLL_BUDGET_PER_TICK;
+  loop {
+      budget = match budget.checked_sub(1) {
+          Some(remaining) => remaining,
+          None => return, // resume on the next tick
+      };
+      // ... read_into / handle ...
+  }
+  ```
+
+  Watch the early-exit path: if the function took ownership of state
+  (`Option::take`, `core::mem::replace` on a buffer), it must put it
+  back before returning, so leave via `break` rather than `return`
+  where a tail restores it. `tools/check-poll-budgets.py` enforces
+  the rule in CI.

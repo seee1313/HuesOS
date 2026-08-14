@@ -68,6 +68,8 @@ def run_seed_tool(args: argparse.Namespace) -> int:
         command.append("--inject-bad-gcm-tag")
     if args.inject_bad_crc:
         command.append("--inject-bad-crc")
+    if args.plain:
+        command.append("--plain")
     if args.seed_blob_file:
         command.append("--seed-blob-file")
         command.append(str(args.seed_blob_file))
@@ -114,6 +116,11 @@ def main() -> int:
         "--inject-bad-crc",
         action="store_true",
         help="Seed mode (plain volume): flip one byte of the seed file's first compressed payload",
+    )
+    parser.add_argument(
+        "--plain",
+        action="store_true",
+        help="Seed mode: build a clean unencrypted volume (no-TPM gate)",
     )
     parser.add_argument(
         "--seed-blob-file",
