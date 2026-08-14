@@ -223,6 +223,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "huesos-bootux"
+version = "0.1.0"
+
+[[package]]
 name = "huesos-decoder-fuzz"
 version = "0.1.0"
 dependencies = [
