@@ -210,6 +210,16 @@ pub struct DriverManager {
 
 const MAX_TRACKED_HOSTS: usize = 8;
 
+/// Messages one channel may be served per main-loop tick.
+///
+/// DriverManager owns the boot main loop: every host, the registry
+/// and the Hxblob package probe are driven from the same pass. A
+/// peer that keeps talking must therefore never hold the loop inside
+/// a single `poll_*`. Draining "until empty" is only safe against a
+/// peer that eventually goes quiet, which the NVMe host under the
+/// high queue-depth soak is not.
+const POLL_BUDGET_PER_TICK: u32 = 64;
+
 struct ManagedHost {
     process: Process,
     bootstrap: Channel,
@@ -982,7 +992,17 @@ impl DriverManager {
 
     fn poll_init_bootstrap(&mut self, init_bootstrap: &Channel) {
         let mut buf = [0u8; 96];
+        // Bounded per tick, as in `poll_nvme_host`: a peer that keeps
+        // talking must never hold the boot main loop inside one
+        // stage. Draining "until empty" is only safe against a peer
+        // that eventually goes quiet.
+        let mut budget = POLL_BUDGET_PER_TICK;
         loop {
+            budget = match budget.checked_sub(1) {
+                Some(remaining) => remaining,
+                None => return,
+            };
+
             // Use `read_optional_handle` so we consume every message
             // exactly once regardless of whether it carries a
             // transferred handle. The old `read_handle` path would
@@ -1060,7 +1080,16 @@ impl DriverManager {
 
     fn poll_registry_requests(&mut self) {
         let mut buf = [0u8; 64];
+        // Bounded per tick like every other `poll_*`. Each request
+        // here spawns or hands out a service, so a client looping on
+        // OPEN_* would otherwise pin the boot loop in this function
+        // while the hosts it just asked for never get polled.
+        let mut budget = POLL_BUDGET_PER_TICK;
         loop {
+            budget = match budget.checked_sub(1) {
+                Some(remaining) => remaining,
+                None => return,
+            };
             let Some(registry) = self.registry_channel.as_ref() else {
                 return;
             };
@@ -1632,7 +1661,16 @@ impl DriverManager {
 
     fn poll_input_host(&mut self) {
         let mut buf = [0u8; 64];
+        // Bounded per tick, as in `poll_nvme_host`: a peer that keeps
+        // talking must never hold the boot main loop inside one
+        // stage. Draining "until empty" is only safe against a peer
+        // that eventually goes quiet.
+        let mut budget = POLL_BUDGET_PER_TICK;
         loop {
+            budget = match budget.checked_sub(1) {
+                Some(remaining) => remaining,
+                None => return,
+            };
             let Some(host) = self.input_host.as_ref() else {
                 return;
             };
@@ -1659,7 +1697,7 @@ impl DriverManager {
         // including the package probe -- is starved for the life of
         // the run. Draining "until empty" is only safe against a peer
         // that eventually goes quiet.
-        let mut budget = 64u32;
+        let mut budget = POLL_BUDGET_PER_TICK;
         loop {
             budget = match budget.checked_sub(1) {
                 Some(remaining) => remaining,
@@ -1696,7 +1734,19 @@ impl DriverManager {
             return;
         };
         let _keep_process_alive = &host.process;
+        // Bounded per tick, as in `poll_nvme_host`: a peer that keeps
+        // talking must never hold the boot main loop inside one
+        // stage. Draining "until empty" is only safe against a peer
+        // that eventually goes quiet.
+        let mut budget = POLL_BUDGET_PER_TICK;
         loop {
+            budget = match budget.checked_sub(1) {
+                Some(remaining) => remaining,
+                None => {
+                    self.hxfs_service = Some(host);
+                    return;
+                }
+            };
             match host.bootstrap.read_into(&mut buf) {
                 Ok(n) if &buf[..n] == protocol::HXFS_READY.as_bytes() => {
                     self.hxfs_ready = true;
@@ -1741,7 +1791,7 @@ impl DriverManager {
         // Bounded per tick, as with the NVMe host: the ACPI manager
         // emits a periodic heartbeat, so a peer that is never quiet
         // turns "drain until empty" into "never return".
-        let mut budget = 64u32;
+        let mut budget = POLL_BUDGET_PER_TICK;
         loop {
             budget = match budget.checked_sub(1) {
                 Some(remaining) => remaining,

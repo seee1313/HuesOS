@@ -61,6 +61,13 @@ const MAX_DIR_HANDLES: usize = 8;
 /// it, close), so the ceiling is deliberately lower than the file
 /// table; each slot costs a channel plus a 32-byte hash.
 const MAX_BLOB_HANDLES: usize = 8;
+
+/// Messages one endpoint may be served per service-loop tick.
+///
+/// Every client, file, dir and blob shares a single loop, so a peer
+/// that never stops talking would starve all the others if its slot
+/// were drained "until empty".
+const POLL_BUDGET_PER_TICK: u32 = 64;
 const MAX_READ_BYTES: usize = 4096;
 // `MAX_NATIVE_REQUEST_BYTES` and `POLL_BUF_BYTES` live in
 // `huesos-hxfs-proto`, where the sizing rule that keeps a channel
@@ -228,7 +235,17 @@ impl HxfsRuntime {
 
     fn poll_bootstrap(&mut self, bootstrap: &Channel) {
         let mut buf = [0u8; 64];
+        // Bounded per tick. An endpoint whose peer keeps talking must
+        // not hold the service loop inside one slot: the other
+        // clients, files, dirs and blobs are served by the SAME loop,
+        // so an unbounded drain here is a fairness bug that presents
+        // as an unrelated client hanging.
+        let mut budget = POLL_BUDGET_PER_TICK;
         loop {
+            budget = match budget.checked_sub(1) {
+                Some(remaining) => remaining,
+                None => return,
+            };
             match bootstrap.read_optional_handle(&mut buf) {
                 Ok((n, Some(handle))) if &buf[..n] == b"hxfs-client" => {
                     self.attach_client(Channel::from_handle(handle));
@@ -271,7 +288,17 @@ impl HxfsRuntime {
         // the loop so the `&mut self` handler calls stay legal, and
         // put it back on every exit path.
         let mut buf = core::mem::replace(&mut self.poll_buf, Box::new([0u8; POLL_BUF_BYTES]));
+        // Bounded per tick. An endpoint whose peer keeps talking must
+        // not hold the service loop inside one slot: the other
+        // clients, files, dirs and blobs are served by the SAME loop,
+        // so an unbounded drain here is a fairness bug that presents
+        // as an unrelated client hanging.
+        let mut budget = POLL_BUDGET_PER_TICK;
         while let Some(client) = self.clients[index].as_ref() {
+            budget = match budget.checked_sub(1) {
+                Some(remaining) => remaining,
+                None => break,
+            };
             match client.read_into(buf.as_mut_slice()) {
                 Ok(n) => self.handle_client_request(index, &buf[..n]),
                 Err(ErrorCode::ShouldWait) | Err(ErrorCode::TimedOut) => break,
@@ -729,7 +756,17 @@ impl HxfsRuntime {
 
     fn poll_file(&mut self, index: usize) {
         let mut buf = core::mem::replace(&mut self.poll_buf, Box::new([0u8; POLL_BUF_BYTES]));
+        // Bounded per tick. An endpoint whose peer keeps talking must
+        // not hold the service loop inside one slot: the other
+        // clients, files, dirs and blobs are served by the SAME loop,
+        // so an unbounded drain here is a fairness bug that presents
+        // as an unrelated client hanging.
+        let mut budget = POLL_BUDGET_PER_TICK;
         while let Some(endpoint) = self.files[index].as_ref() {
+            budget = match budget.checked_sub(1) {
+                Some(remaining) => remaining,
+                None => break,
+            };
             match endpoint.channel.read_into(buf.as_mut_slice()) {
                 Ok(n) if decode_native_message(&buf[..n]).is_some() => {
                     let Some((native, payload)) = decode_native_message(&buf[..n]) else {
@@ -995,7 +1032,17 @@ impl HxfsRuntime {
 
     #[cfg(feature = "hxblob")]
     fn poll_blob(&mut self, index: usize) {
+        // Bounded per tick. An endpoint whose peer keeps talking must
+        // not hold the service loop inside one slot: the other
+        // clients, files, dirs and blobs are served by the SAME loop,
+        // so an unbounded drain here is a fairness bug that presents
+        // as an unrelated client hanging.
+        let mut budget = POLL_BUDGET_PER_TICK;
         loop {
+            budget = match budget.checked_sub(1) {
+                Some(remaining) => remaining,
+                None => return,
+            };
             let Some(endpoint) = self.blobs[index].as_ref() else {
                 return;
             };
@@ -1241,7 +1288,17 @@ impl HxfsRuntime {
 
     fn poll_dir(&mut self, index: usize) {
         let mut buf = core::mem::replace(&mut self.poll_buf, Box::new([0u8; POLL_BUF_BYTES]));
+        // Bounded per tick. An endpoint whose peer keeps talking must
+        // not hold the service loop inside one slot: the other
+        // clients, files, dirs and blobs are served by the SAME loop,
+        // so an unbounded drain here is a fairness bug that presents
+        // as an unrelated client hanging.
+        let mut budget = POLL_BUDGET_PER_TICK;
         while let Some(endpoint) = self.dirs[index].as_ref() {
+            budget = match budget.checked_sub(1) {
+                Some(remaining) => remaining,
+                None => break,
+            };
             match endpoint.channel.read_into(buf.as_mut_slice()) {
                 Ok(n) if decode_native_message(&buf[..n]).is_some() => {
                     let Some((native, payload)) = decode_native_message(&buf[..n]) else {
