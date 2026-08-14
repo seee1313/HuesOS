@@ -44,7 +44,11 @@ refuse to boot on it.)
 mid-write, inspect the dirty image offline, then require the same
 image to boot again unattended with `fsck clean` and `scrub complete`.
 An fsck finding after a power cut means the committed state was not
-crash-consistent.)
+crash-consistent. The kill instant is randomised per cycle so the gate
+samples different interleavings -- mid-checkpoint, between journal
+write and superblock update -- rather than re-proving one of them. The
+seed is printed on every run and forced with `POWERFAIL_SEED=<seed>`,
+so a failure is replayable instead of being written off as flake.)
 
 (The second soak invocation is the Stage B.5 fault-injection gate:
 seeded encrypted+compressed volume with a flipped GCM bit; the
