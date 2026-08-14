@@ -1886,7 +1886,6 @@ fn run_boot_self_check(fs: &mut MountedHxfs) {
     if is_odirect_deny(b"OPEN_FILE O_DIRECT seed.bin") {
         println!("[hxfs] odirect-deny-ok");
     }
-    run_page_cache_check(fs);
     let root = fs.root_directory();
     match fs.open_child_file(root, huesos_hxfs::synthetic_key::SEED_FILE_NAME) {
         Ok(file) => {
@@ -2027,26 +2026,41 @@ fn run_boot_self_check(fs: &mut MountedHxfs) {
 ///
 /// The cache lives in `FixedHxfsWriter`, so "the service has a cache"
 /// is only true if the service's own mount is the one being hit. This
-/// reads the seed file twice and prints the counters; the soak
-/// harness asserts on the marker, which is what turns the gate from
-/// "code exists" into "code ran under load".
+/// reads one file twice and prints the counters; the soak harness
+/// asserts on the marker, which is what turns the gate from "code
+/// exists" into "code ran under load".
+///
+/// The file read here must be one this boot WROTE, never the seeded
+/// `seed.bin`: the fault-injection soak modes deliberately corrupt
+/// that seed, so its second read fails its integrity check, is never
+/// served from cache, and the gate fails on a healthy cache. That is
+/// a broken test, not a broken cache -- it is why this runs after the
+/// write round-trip rather than before it.
 fn run_page_cache_check(fs: &mut MountedHxfs) {
     let root = fs.root_directory();
-    if let Ok(file) = fs.open_child_file(root, huesos_hxfs::synthetic_key::SEED_FILE_NAME) {
-        let mut buf = [0u8; 4096];
-        // Two reads: the first populates, the second must hit.
-        let _ = fs.read_file(file, &mut buf);
-        let (hits_before, _) = fs.page_cache_stats();
-        let _ = fs.read_file(file, &mut buf);
-        let (hits_after, misses) = fs.page_cache_stats();
-        println!(
-            "[hxfs] page-cache slots={} hits={} misses={} repeat-read-hits={}",
-            fs.page_cache_capacity(),
-            hits_after,
-            misses,
-            hits_after.saturating_sub(hits_before)
-        );
+    let Ok(file) = fs.open_child_file(root, "probe-compress.bin") else {
+        println!("[hxfs] page-cache: probe file missing");
+        return;
+    };
+    let mut buf = [0u8; 4096];
+    // Two reads: the first populates, the second must hit.
+    if let Err(error) = fs.read_file(file, &mut buf) {
+        println!("[hxfs] page-cache: first read failed ({error:?})");
+        return;
     }
+    let (hits_before, _) = fs.page_cache_stats();
+    if let Err(error) = fs.read_file(file, &mut buf) {
+        println!("[hxfs] page-cache: repeat read failed ({error:?})");
+        return;
+    }
+    let (hits_after, misses) = fs.page_cache_stats();
+    println!(
+        "[hxfs] page-cache slots={} hits={} misses={} repeat-read-hits={}",
+        fs.page_cache_capacity(),
+        hits_after,
+        misses,
+        hits_after.saturating_sub(hits_before)
+    );
 }
 
 /// Stage C: live scrub, structural fsck and quota enforcement
@@ -2237,6 +2251,10 @@ fn write_roundtrip_check(fs: &mut MountedHxfs) {
             Ok(file) => match fs.read_file(file, &mut cbuf) {
                 Ok(n) if n == 512 && cbuf[..n] == expected[..] => {
                     println!("[hxfs] write-roundtrip-ok");
+                    // The cache gate needs a file that is known good
+                    // on every soak mode; this one was just written
+                    // and verified by this boot.
+                    run_page_cache_check(fs);
                 }
                 Ok(n) => println!("[hxfs] write-roundtrip: mismatch (n={n}, expected 512)"),
                 Err(error) => println!("[hxfs] write-roundtrip: read failed ({:?})", error),
