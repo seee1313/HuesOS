@@ -878,6 +878,20 @@ impl<
         self.mkdir_child(base, &shard_name)
     }
 
+    /// Content-address `data` into the Hxblob store and return its
+    /// SHA-256 hash.
+    ///
+    /// The payload is written to `blobs/b{hash[0] % 8}/<hex-hash>` and
+    /// registered in the on-volume Hxblob index. Storing an object that
+    /// is already present is rejected with [`HxfsError::AlreadyExists`]
+    /// rather than silently deduplicated, so a caller that believes it
+    /// is creating a new object learns that it is not.
+    ///
+    /// # Errors
+    ///
+    /// - [`HxfsError::AlreadyExists`] if `hash` is already indexed.
+    /// - [`HxfsError::NoSpace`] if the index is full (`MAX_HXBLOBS`) or
+    ///   the volume cannot fit the payload.
     #[cfg(feature = "hxblob")]
     pub fn put_blob(&mut self, data: &[u8]) -> FixedResult<BlobHash> {
         let hash = sha256(data);
