@@ -46,6 +46,53 @@ This runs, e.g.:
 Crates tied to real hardware (`huesos-arch`, SMP, full process/scheduler)
 are validated by QEMU boots rather than host mocks.
 
+## Static gates (`make audit-check`)
+
+Seven dependency-free checks run before every PR and in CI. They exist
+because each one encodes a rule that a reviewer had already failed to
+enforce by reading:
+
+```bash
+make audit-check     # all seven
+make fmt-check       # the last one on its own
+```
+
+| Gate | Rule it enforces |
+|------|------------------|
+| `check-safety-budget.py` | `unsafe` count per crate may not exceed the pinned budget in `safety-budget.json`; raising it is a deliberate, reviewed act |
+| `check-lock-policy.py` | kernel, arch and uACPI use ranked locks, so lock order stays checkable |
+| `check-policy-crates.py` | every policy crate is a workspace member, forbids `unsafe`, has host tests and a current design doc |
+| `check-hues-async-noalloc.py` | `crates/hues-async/**` never allocates — no `alloc`, no heap collection, tests included |
+| `check-huesos-object-lock-policy.py` | no bare `spin::Mutex` outside `irq_guard.rs` |
+| `check-poll-budgets.py` | every channel-draining loop in a shared service is bounded (see below) |
+| `fmt-all.py --check` | formatting across the kernel workspace **and** the 11 standalone userspace crates, which plain `cargo fmt --all` does not reach |
+
+### The poll-budget gate
+
+DriverManager owns the boot main loop; hxfs-service owns the filesystem
+service loop. Both are single-threaded and cooperative, so one pass
+serves every host, client, file, dir and blob view. A loop that drains
+a channel "until `ShouldWait`" is only bounded if the peer eventually
+goes quiet — and under the high queue-depth NVMe soak it does not. The
+result is not recognisable as a fairness bug: it looks like some
+unrelated service hanging.
+
+The gate requires one of two shapes, read from **code with comments
+stripped** (an early version accepted a comment mentioning a budget,
+which made it worthless):
+
+- steady-state `poll_*`: a `POLL_BUDGET_PER_TICK` counter, then return;
+- one-shot handshake (`mount_from_bootstrap`): a wall-clock deadline
+  against `monotonic_ticks()`, reporting what never arrived.
+
+`while let Some(x) = <slot>` counts as unbounded here — the slot stays
+occupied for the whole connection, so the loop ends only when the peer
+stops talking, which is the assumption being forbidden.
+
+When changing this gate, verify it still **fails**: reintroduce an
+unbounded drain, confirm it is caught by name, then revert. A gate that
+cannot fail is worse than no gate, because it is trusted.
+
 ## Integration Test: Full Boot (QEMU)
 
 ```bash
@@ -205,6 +252,69 @@ user address. It must return through the fixup path and print:
 A missing or malformed extable must not be treated as a successful test; the
 kernel stops in the test image before launching userspace.
 
+## Storage soak and fault injection
+
+`scripts/ci-qemu-nvme-soak.sh <profile> <seconds> <log> <mode>` boots the
+system against a real QEMU NVMe controller with an Hxfs v5 image. The
+mode selects what is seeded and which markers are required:
+
+| Mode | What it proves |
+|------|----------------|
+| `0` | Base boot: production build, blank volume, no `synthetic-key`. Has **no** boot self-check, so the page-cache gate does not apply to it |
+| `1` | Encrypted volume with a flipped GCM tag → `bad-gcm-tag-marked`, service keeps serving |
+| `2` | Plain volume with a corrupted payload CRC → `bad-checksum-marked` |
+| `3` | Graceful shutdown cycle through to `all CPUs halted` |
+| `4` | Stress: repeated 16 MiB write/read cycles |
+| `5` | High queue-depth: multi-queue controller, asserts queue count and clean reliability counters |
+| `6` | **No TPM**: plain volume, `SOAK_TPM=0`, no key handed to the guest |
+
+Mode 6 asserts the *ordinary* markers — self-check, write path, scrub,
+fsck, object store. "Works without a TPM" has to mean the same
+filesystem, not a reduced one. It also fails if a volume key appears
+from anywhere, since that would pass the gate for the wrong reason.
+Most real hardware has no TPM, so a build that only mounts when a key
+exists would refuse to boot on it.
+
+The image is reused between runs only when `<img>.mode` matches the
+requested mode. After changing seeding logic, delete both:
+
+```bash
+rm -f build/nvme-soak.img build/nvme-soak.img.mode
+```
+
+### Power-fail (crash consistency)
+
+```bash
+bash scripts/ci-qemu-powerfail.sh <profile> <log-dir> <cycles>
+```
+
+Every other QEMU job shuts the guest down politely or kills an idle
+one. This one cuts power the way a real machine loses it — SIGKILL
+mid-write, dirty cache, open transaction, NVMe commands in flight —
+then requires the same image to boot again unattended:
+
+1. **crash** — kill some seconds after the write path is confirmed live;
+2. **offline** — inspect the dirty image from the host; no readable
+   superblock or checkpoint at all is a format bug, not a recovery case;
+3. **recover** — boot the same image: `self-check ok`, `fsck clean`,
+   `scrub complete`, no panic.
+
+"It booted" is not the pass condition. An fsck finding after a power
+cut means the committed state was not crash-consistent.
+
+The kill instant is randomised per cycle so successive cycles sample
+different interleavings rather than re-proving one. Delays are a
+shuffle of the range, not independent draws — independent draws
+collide, and a repeated instant buys nothing. The seed is printed on
+every run and every failure prints the seed and delay:
+
+```bash
+POWERFAIL_SEED=<seed> bash scripts/ci-qemu-powerfail.sh debug build 2
+```
+
+Reproducing a failure exactly is the difference between a bug and
+"CI was flaky once".
+
 ## Kernel Panic Screen Test
 
 Normal images never panic intentionally. To exercise the fatal path, build an
@@ -248,33 +358,52 @@ Kernel is higher-half (`0xffffffff80000000`+). For AP issues, QEMU
 `-d int,cpu_reset -D qemu.log` is invaluable (triple-fault dumps show ESP,
 CR3, EFER).
 
-## CI Workflow (suggested)
+## CI Workflow
 
-```yaml
-name: Test
-on: [push, pull_request]
-jobs:
-  build:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - run: rustup toolchain install nightly --component rust-src,llvm-tools-preview
-      - run: sudo apt-get update && sudo apt-get install -y qemu-system-x86 xorriso mtools
-      # OVMF + Limine are vendored in third_party/
-      - run: make build
-      - run: make test
-      - run: make iso
-      - name: Boot smoke test (2 CPUs)
-        run: |
-          timeout 45 qemu-system-x86_64 \
-            -machine q35 -cpu qemu64 -smp 2 -m 512M \
-            -bios third_party/ovmf/OVMF.fd \
-            -cdrom build/huesos.iso \
-            -net none -serial stdio -display none \
-            -no-reboot -no-shutdown 2>/tmp/huesos.log || true
-          grep -q "channel IPC round-trip OK" /tmp/huesos.log
-          grep -q "APs ready=1" /tmp/huesos.log || grep -q "MADT parsed 1" /tmp/huesos.log
+CI is `.github/workflows/hardening.yml` (plus `sanitizers.yml` for the
+address-sanitizer run). It is the source of truth; this list is a map,
+not a spec:
+
+| Job | What it runs |
+|-----|--------------|
+| `static-safety` | `make audit-check` — the seven gates above |
+| `qemu-boot` | boot smoke, 1 and 2 CPUs |
+| `qemu-nvme-boot` | base NVMe soak, mode 0 |
+| `qemu-nvme-gcm-inject` | mode 1 |
+| `qemu-nvme-crc-inject` | mode 2 |
+| `qemu-nvme-no-tpm` | mode 6, debug **and** release |
+| `qemu-nvme-powerfail` | crash/recovery cycles, debug **and** release |
+| `qemu-nvme-shutdown-cycle` | mode 3 |
+| `qemu-nvme-stress` | mode 4 |
+| `qemu-nvme-long-soak` | one bounded pass of `scripts/soak-long.sh` (~2 h) |
+| `qemu-extable-smoke` | recoverable-copy fixup path |
+
+`swtpm` and `swtpm-tools` are installed in every QEMU job, so the
+TPM-backed key path is exercised rather than silently skipped. Mode 6
+still runs without a TPM by configuration (`SOAK_TPM=0`), which is the
+point: it must prove the guest ignores an available TPM deliberately,
+not that the runner happened to lack one.
+
+The full 24 h soak of Stage E.3 is **not** a CI job — GitHub caps jobs
+at 6 h. It is an operator-triggered local gate via
+`scripts/soak-long.sh`.
+
+### Before opening a PR
+
+```bash
+python3 tools/fmt-all.py --check
+CARGO_BUILD_JOBS=1 make clippy      # -D warnings
+CARGO_BUILD_JOBS=1 make test
+make audit-check
+git diff --check
 ```
+
+Note `CARGO_BUILD_JOBS=1`: a parallel kernel build needs more RAM than
+a small machine has, and the OOM kill surfaces as an unrelated-looking
+failure. Also note that a userspace-binary compile error is reported by
+Cargo as `failed to run custom build command for huesos-kernel` — the
+real error is further down the log, so capture it to a file and search
+for `^error`.
 
 ## Performance Notes
 
