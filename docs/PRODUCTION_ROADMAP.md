@@ -32,6 +32,34 @@ errors must not panic.
   bring-up already delivers
 - Cross-architecture portability beyond x86_64
 
+## Where the project stands (updated after PR #181)
+
+The **storage production gate** — the eleven mandatory gates in
+[STORAGE_PRODUCTION_GATE.md](STORAGE_PRODUCTION_GATE.md) — has no
+open mandatory items left. Two of the eleven were closed by a
+*reasoned refusal* with an ADR rather than an implementation:
+
+- coherent writable `mmap` — [ADR_WRITABLE_MMAP.md](design/ADR_WRITABLE_MMAP.md)
+- no-heap Zstd — [ADR_ZSTD_BACKEND.md](design/ADR_ZSTD_BACKEND.md)
+
+A refusal is a legitimate close only because the alternative is
+recorded and the cost of the road not taken is stated. Read those two
+before proposing either feature again.
+
+Two flags in that document remain deliberately unset:
+
+| Flag | Value | Why |
+|------|-------|-----|
+| `v5 production freeze` | not approved | freezing an on-disk format is irreversible; it should follow a period of running the format, not the merge that finished it |
+| `storage production-ready` | false | see the open Stage E tracks below |
+
+**What is genuinely not done: Stage E (Operations).** E.1 runtime
+knobs and E.2 structured observation are not started; E.3 long-haul
+soak and E.4 reproducible benchmarks are partially landed. This is
+the honest blocker for calling storage production-ready: the system
+survives faults, but an operator cannot yet observe it or detect a
+performance regression. Per-track status is inline under Stage E.
+
 ## Stage index
 
 | Stage | Theme | Exit signal |
@@ -533,6 +561,9 @@ production-grade.
 **Exit criterion.** A user can change a knob at runtime and see
 the effect in the on-target trace.
 
+**Status: not started.** No `RuntimeKnobs` struct and no sysctl-style
+syscall exist in the tree.
+
 ### Track E.2 — Structured observation
 
 - A `sys_observation_read` syscall returns a `Vec<u8>` of
@@ -543,6 +574,9 @@ the effect in the on-target trace.
 **Exit criterion.** A `qemu-nvme-soak` with `OBSERVATION_DEST=`
 produces a single log file with both the on-target text and
 the structured records.
+
+**Status: not started.** No `sys_observation_read` syscall exists; the
+on-target trace is still plain text only.
 
 ### Track E.3 — Long-haul soak
 
@@ -555,6 +589,18 @@ the structured records.
 trace envelope green; a regression in any of throughput, error
 counts, or recovery events fails the harness.
 
+**Status: partially landed.** `scripts/soak-long.sh` exists and CI
+runs ONE bounded pass (~2 h) as `qemu-nvme-long-soak`; GitHub caps a
+job at 6 h, so the literal 24 h run stays an operator-triggered local
+gate. The throughput/error/recovery regression comparison is NOT
+implemented — the harness asserts the trace envelope, not a delta
+against a previous run — so this track is not closed.
+
+Adjacent crash coverage that DID land (PR #181): the power-fail gate
+`scripts/ci-qemu-powerfail.sh` cuts power mid-write at a randomised,
+seeded instant and requires unattended clean recovery. That is a
+different axis from long-haul duration and does not close E.3.
+
 ### Track E.4 — Reproducible benchmarks
 
 - `tools/storage-bench.py` produces a JSON report of read /
@@ -566,6 +612,10 @@ counts, or recovery events fails the harness.
 **Exit criterion.** The bench harness produces a JSON report
 that is bit-identical across two runs of the same commit on the
 same hardware; the report is small enough to attach to a PR.
+
+**Status: partially landed.** `tools/storage-bench.py` exists, but it
+is not wired into any CI job and there is no >5% regression gate, so
+nothing currently detects a throughput regression.
 
 ---
 
