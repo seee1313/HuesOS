@@ -236,6 +236,15 @@ pub unsafe fn kmain(boot_info: BootInfo) -> ! {
         dbg("\n");
         Some(bootfs)
     });
+    // The HBI command line is delivered to init as a read-only VMO so
+    // boot behaviour can be changed from the bootloader without
+    // rebuilding the image. The kernel keeps consuming its own flags
+    // (panic_test, extable_test) directly; this handoff exists for the
+    // `init.`-prefixed keys init parses itself.
+    let cmdline_image = boot_info.hbi_image.and_then(|hbi_data| {
+        let hbi = boot::hbi::HbiImage::parse(hbi_data).ok()?;
+        hbi.get_module(boot::hbi::ModuleType::Cmdline).ok()
+    });
     let storage_boot_info = boot::storage::build_storage_boot_info(boot_dma_pool);
 
     init::framebuffer_init(boot_info.framebuffer);
@@ -279,6 +288,7 @@ pub unsafe fn kmain(boot_info: BootInfo) -> ! {
         acpi_archive.as_deref(),
         acpi_system_io,
         storage_boot_info.as_slice(),
+        cmdline_image,
     );
 
     // BSP idle: timer IRQ drives the scheduler; opportunistically reap.
@@ -314,6 +324,7 @@ fn spawn_init_process(
     acpi_archive: Option<&[u8]>,
     acpi_system_io: alloc::vec::Vec<huesos_object::SystemIoGrant>,
     storage_boot_info: &[u8],
+    cmdline_image: Option<&[u8]>,
 ) {
     use huesos_object::KernelObject;
 
@@ -351,6 +362,16 @@ fn spawn_init_process(
             }
         } else {
             dbg("[init] failed to install ACPI table archive VMO\n");
+        }
+    }
+    // Absent or empty command line is the common case and not an
+    // error: init falls back to /etc/init.conf and its built-in
+    // defaults when the handle is missing.
+    if let Some(bytes) = cmdline_image.filter(|bytes| !bytes.is_empty()) {
+        if install_readonly_vmo(&spawned.process, huesos_abi::INIT_CMDLINE_HANDLE, bytes) {
+            dbg("[init] installed kernel command line VMO\n");
+        } else {
+            dbg("[init] failed to install kernel command line VMO\n");
         }
     }
     if storage_boot_info.is_empty() {
