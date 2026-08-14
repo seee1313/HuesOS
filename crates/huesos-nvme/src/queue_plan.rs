@@ -37,6 +37,13 @@ pub struct QueuePlanInput {
     pub msix_available: bool,
     /// Whether MSI setup succeeded.
     pub msi_available: bool,
+    /// Operator cap on queue depth (Stage E.1 `nvme.max_queue_depth`).
+    ///
+    /// The plan takes the smallest of this, the compiled-in baseline,
+    /// and what the controller advertises. `0` means "no operator
+    /// opinion", which is the value a caller that predates the knob
+    /// passes by leaving the field defaulted.
+    pub max_queue_depth: u16,
 }
 
 /// Planned queue topology and DMA footprint.
@@ -75,7 +82,18 @@ pub fn plan_queues(input: QueuePlanInput) -> Option<QueuePlan> {
     if max_entries == 0 || input.cpu_count == 0 {
         return None;
     }
-    let depth = HUESOS_NVME_QUEUE_DEPTH.min(max_entries as u16).max(2);
+    // The operator cap is applied alongside the hardware limit rather
+    // than instead of it: a knob may only ever lower the depth, never
+    // raise it past what the controller says it supports.
+    let operator_cap = if input.max_queue_depth == 0 {
+        u16::MAX
+    } else {
+        input.max_queue_depth
+    };
+    let depth = HUESOS_NVME_QUEUE_DEPTH
+        .min(max_entries as u16)
+        .min(operator_cap)
+        .max(2);
     let io_queue_count = input.cpu_count.clamp(1, 64);
     let interrupt_mode = if input.msix_available {
         InterruptMode::Msix
@@ -119,6 +137,7 @@ mod tests {
             cap_mqes: 1023,
             msix_available: true,
             msi_available: true,
+            max_queue_depth: 0,
         }) else {
             assert!(false, "plan should exist");
             return;
@@ -136,6 +155,7 @@ mod tests {
             cap_mqes: 63,
             msix_available: false,
             msi_available: true,
+            max_queue_depth: 0,
         }) else {
             assert!(false, "plan should exist");
             return;
@@ -146,12 +166,102 @@ mod tests {
     }
 
     #[test]
+    fn operator_cap_lowers_the_planned_depth() {
+        // Stage E.1: the nvme.max_queue_depth knob is the operator's
+        // response to a controller that misbehaves at full depth.
+        let Some(plan) = plan_queues(QueuePlanInput {
+            cpu_count: 4,
+            cap_mqes: 1023,
+            msix_available: true,
+            msi_available: true,
+            max_queue_depth: 32,
+        }) else {
+            assert!(false, "plan should exist");
+            return;
+        };
+        assert_eq!(plan.io_depth, 32);
+        assert_eq!(plan.admin_depth, 32);
+    }
+
+    #[test]
+    fn operator_cap_cannot_raise_depth_past_the_hardware_limit() {
+        // A knob may only ever lower the depth. Asking for more than
+        // the controller advertises must not produce queues the device
+        // cannot service.
+        let Some(plan) = plan_queues(QueuePlanInput {
+            cpu_count: 2,
+            cap_mqes: 63,
+            msix_available: true,
+            msi_available: true,
+            max_queue_depth: 4096,
+        }) else {
+            assert!(false, "plan should exist");
+            return;
+        };
+        assert_eq!(plan.io_depth, 64);
+    }
+
+    #[test]
+    fn operator_cap_cannot_raise_depth_past_the_compiled_baseline() {
+        let Some(plan) = plan_queues(QueuePlanInput {
+            cpu_count: 2,
+            cap_mqes: 4095,
+            msix_available: true,
+            msi_available: true,
+            max_queue_depth: 4096,
+        }) else {
+            assert!(false, "plan should exist");
+            return;
+        };
+        assert_eq!(plan.io_depth, HUESOS_NVME_QUEUE_DEPTH);
+    }
+
+    #[test]
+    fn zero_operator_cap_means_no_opinion() {
+        // Callers that predate the knob leave the field at zero and
+        // must keep the behaviour they had before it existed.
+        let uncapped = plan_queues(QueuePlanInput {
+            cpu_count: 4,
+            cap_mqes: 1023,
+            msix_available: true,
+            msi_available: true,
+            max_queue_depth: 0,
+        });
+        let baseline = plan_queues(QueuePlanInput {
+            cpu_count: 4,
+            cap_mqes: 1023,
+            msix_available: true,
+            msi_available: true,
+            max_queue_depth: HUESOS_NVME_QUEUE_DEPTH,
+        });
+        assert_eq!(uncapped, baseline);
+    }
+
+    #[test]
+    fn operator_cap_still_respects_the_two_entry_floor() {
+        // A queue shallower than two entries cannot make forward
+        // progress; the floor wins over the knob.
+        let Some(plan) = plan_queues(QueuePlanInput {
+            cpu_count: 1,
+            cap_mqes: 255,
+            msix_available: true,
+            msi_available: true,
+            max_queue_depth: 1,
+        }) else {
+            assert!(false, "plan should exist");
+            return;
+        };
+        assert_eq!(plan.io_depth, 2);
+    }
+
+    #[test]
     fn falls_back_to_polling() {
         let Some(plan) = plan_queues(QueuePlanInput {
             cpu_count: 1,
             cap_mqes: 255,
             msix_available: false,
             msi_available: false,
+            max_queue_depth: 0,
         }) else {
             assert!(false, "plan should exist");
             return;
@@ -167,6 +277,7 @@ mod tests {
                 cap_mqes: 255,
                 msix_available: true,
                 msi_available: true,
+                max_queue_depth: 0,
             }),
             None
         );
@@ -180,6 +291,7 @@ mod tests {
                 cap_mqes: 0,
                 msix_available: true,
                 msi_available: true,
+                max_queue_depth: 0,
             })
             .map(|plan| plan.admin_depth),
             Some(2)
@@ -193,6 +305,7 @@ mod tests {
             cap_mqes: 1023,
             msix_available: true,
             msi_available: true,
+            max_queue_depth: 0,
         }) else {
             assert!(false, "plan should exist");
             return;

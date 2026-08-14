@@ -150,6 +150,7 @@ fn parse_resource_grant(val: &[u8]) -> Option<ResourceGrant> {
         b"irq" => ResourceKindAbi::Irq,
         b"pwr" | b"powercontrol" => ResourceKindAbi::PowerControl,
         b"dma" | b"dmapool" => ResourceKindAbi::DmaPool,
+        b"sysctl" | b"systemcontrol" => ResourceKindAbi::SystemControl,
         _ => return None,
     };
     let base = parse_u64_lit(base)?;

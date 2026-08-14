@@ -327,12 +327,78 @@ pub enum Syscall {
     /// the caller's heap window, so it cannot name memory the caller
     /// does not already own and needs no additional capability.
     VmarHeapExtend = 61,
+    /// Read one runtime knob. `a1` is a [`KnobIdAbi`] tag, `a2` is a
+    /// `*mut u64` output pointer. Unrestricted: knowing the current
+    /// scrub interval is not a capability, and refusing to tell a
+    /// process the value it is already subject to buys nothing.
+    SystemKnobGet = 62,
+    /// Write one runtime knob. `a1` is a [`KnobIdAbi`] tag, `a2` is the
+    /// requested value, `a3` is a `*mut u64` output pointer receiving
+    /// the value actually applied after clamping.
+    ///
+    /// Gated on possession of a [`ResourceKindAbi::SystemControl`]
+    /// handle, passed in `a4`. A knob write changes global behaviour —
+    /// turning log verbosity to zero blinds the whole system — so it is
+    /// an authority, unlike a read.
+    SystemKnobSet = 63,
+    /// Drain structured observation records. `a1` is the sequence
+    /// number to resume from (`0` for everything held), `a2` is a
+    /// `*mut u8` output buffer, `a3` is its length in bytes. Returns
+    /// bytes written, always a multiple of the record size.
+    ///
+    /// Unrestricted for the same reason as [`Self::SystemKnobGet`]: the
+    /// records are diagnostics, and an aggregator that needs a
+    /// capability to collect them is an aggregator that will not be
+    /// running when it matters.
+    SystemObservationRead = 64,
 }
 
 /// Maximum number of bytes one [`Syscall::SystemGetEntropy`] call
 /// will produce. Callers needing more must loop; the cap bounds the
 /// time spent generating keystream with interrupts enabled.
 pub const MAX_ENTROPY_BYTES: usize = 256;
+
+/// Bytes in one observation record on the wire. Mirrors
+/// `huesos_object::observation::OBSERVATION_RECORD_SIZE`; the two are
+/// kept in step by `observation_record_size_matches_object_crate` in
+/// the `huesos-syscalls` tests.
+pub const OBSERVATION_RECORD_SIZE: usize = 32;
+
+/// Maximum bytes one [`Syscall::SystemObservationRead`] call will
+/// produce. Bounds the time spent copying with the ring lock held; a
+/// caller wanting more loops on the returned sequence number.
+pub const MAX_OBSERVATION_BYTES: usize = 4096;
+
+/// Wire-format knob selector for [`Syscall::SystemKnobGet`] and
+/// [`Syscall::SystemKnobSet`].
+///
+/// Values match `huesos_object::knobs::KnobId` numerically so the
+/// syscall handler can round-trip the tag without a lookup table.
+#[repr(u32)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum KnobIdAbi {
+    /// Background scrub interval, in seconds. `0` disables scrubbing.
+    ScrubIntervalSecs = 0,
+    /// Retries before a recoverable read is given up on.
+    RecoveryRetryCount = 1,
+    /// Log verbosity, 0 (quiet) to 4 (trace).
+    LogVerbosity = 2,
+    /// Cap on the NVMe queue depth actually used.
+    NvmeMaxQueueDepth = 3,
+}
+
+impl KnobIdAbi {
+    /// Decode a wire value without constructing an invalid Rust enum.
+    pub const fn from_raw(raw: u32) -> Option<Self> {
+        Some(match raw {
+            0 => Self::ScrubIntervalSecs,
+            1 => Self::RecoveryRetryCount,
+            2 => Self::LogVerbosity,
+            3 => Self::NvmeMaxQueueDepth,
+            _ => return None,
+        })
+    }
+}
 
 /// Operation selector for [`Syscall::VmarHeapExtend`].
 pub mod heap_op {
@@ -364,7 +430,7 @@ impl Syscall {
     /// Total number of defined syscalls (i.e. one past the highest
     /// currently-assigned number). The dispatcher uses this to reject
     /// obviously-out-of-range numbers before a `match`.
-    pub const COUNT: u64 = 62;
+    pub const COUNT: u64 = 65;
 
     /// Convert a raw syscall number back into a [`Syscall`], if valid.
     pub const fn from_raw(n: u64) -> Option<Self> {
@@ -431,6 +497,9 @@ impl Syscall {
             59 => Self::VolumeKeyGet,
             60 => Self::SystemGetEntropy,
             61 => Self::VmarHeapExtend,
+            62 => Self::SystemKnobGet,
+            63 => Self::SystemKnobSet,
+            64 => Self::SystemObservationRead,
             _ => return None,
         })
     }
@@ -478,6 +547,17 @@ pub enum ResourceKindAbi {
     /// because `sys_resource_create` is gated on the root-supervisor
     /// KOID predicate.
     FrameDraw = 6,
+    /// Authority to change system-wide runtime knobs via
+    /// [`Syscall::SystemKnobSet`]. A binary capability with no
+    /// meaningful `base`/`len`, exactly like [`Self::PowerControl`],
+    /// from which it is deliberately kept separate: "may power off the
+    /// machine" and "may turn down log verbosity" are different
+    /// authorities, and collapsing them would force every process that
+    /// needs the smaller one to be trusted with the larger.
+    ///
+    /// Minted exclusively by the root userspace supervisor (`init`) and
+    /// transferred to the processes that legitimately tune the system.
+    SystemControl = 7,
 }
 
 impl ResourceKindAbi {
@@ -490,6 +570,7 @@ impl ResourceKindAbi {
             4 => Self::PowerControl,
             5 => Self::DmaPool,
             6 => Self::FrameDraw,
+            7 => Self::SystemControl,
             _ => return None,
         })
     }
@@ -1164,7 +1245,8 @@ pub struct ResourceMapArgs {
 #[cfg(test)]
 mod tests {
     use super::{
-        hbi_boot, rights, vmar_flags, ErrorCode, ResourceKindAbi, ResourceMapArgs, Syscall,
+        hbi_boot, rights, vmar_flags, ErrorCode, KnobIdAbi, ResourceKindAbi, ResourceMapArgs,
+        Syscall, MAX_OBSERVATION_BYTES, OBSERVATION_RECORD_SIZE,
     };
 
     #[test]
@@ -1248,7 +1330,10 @@ mod tests {
         assert_eq!(Syscall::VolumeKeyGet as u64, 59);
         assert_eq!(Syscall::SystemGetEntropy as u64, 60);
         assert_eq!(Syscall::VmarHeapExtend as u64, 61);
-        assert_eq!(Syscall::COUNT, 62);
+        assert_eq!(Syscall::SystemKnobGet as u64, 62);
+        assert_eq!(Syscall::SystemKnobSet as u64, 63);
+        assert_eq!(Syscall::SystemObservationRead as u64, 64);
+        assert_eq!(Syscall::COUNT, 65);
         assert_eq!(Syscall::from_raw(28), Some(Syscall::VmoCreateEx));
         assert_eq!(Syscall::from_raw(30), Some(Syscall::VmarProtect));
         assert_eq!(Syscall::from_raw(31), Some(Syscall::ChannelPeek));
@@ -1288,7 +1373,10 @@ mod tests {
         assert_eq!(Syscall::from_raw(59), Some(Syscall::VolumeKeyGet));
         assert_eq!(Syscall::from_raw(60), Some(Syscall::SystemGetEntropy));
         assert_eq!(Syscall::from_raw(61), Some(Syscall::VmarHeapExtend));
-        assert_eq!(Syscall::from_raw(62), None);
+        assert_eq!(Syscall::from_raw(62), Some(Syscall::SystemKnobGet));
+        assert_eq!(Syscall::from_raw(63), Some(Syscall::SystemKnobSet));
+        assert_eq!(Syscall::from_raw(64), Some(Syscall::SystemObservationRead));
+        assert_eq!(Syscall::from_raw(65), None);
     }
 
     #[test]
@@ -1313,6 +1401,7 @@ mod tests {
             ResourceKindAbi::PowerControl,
             ResourceKindAbi::DmaPool,
             ResourceKindAbi::FrameDraw,
+            ResourceKindAbi::SystemControl,
         ] {
             let raw = kind as u32;
             assert_eq!(ResourceKindAbi::from_raw(raw), Some(kind));
@@ -1323,8 +1412,41 @@ mod tests {
             ResourceKindAbi::from_raw(6),
             Some(ResourceKindAbi::FrameDraw)
         );
-        assert_eq!(ResourceKindAbi::from_raw(7), None);
+        assert_eq!(
+            ResourceKindAbi::from_raw(7),
+            Some(ResourceKindAbi::SystemControl)
+        );
+        assert_eq!(ResourceKindAbi::from_raw(8), None);
         assert_eq!(ResourceKindAbi::from_raw(u32::MAX), None);
+    }
+
+    #[test]
+    fn knob_id_abi_round_trip() {
+        // These cross the syscall boundary; renumbering them silently
+        // repoints an operator's command at a different knob.
+        for &id in &[
+            KnobIdAbi::ScrubIntervalSecs,
+            KnobIdAbi::RecoveryRetryCount,
+            KnobIdAbi::LogVerbosity,
+            KnobIdAbi::NvmeMaxQueueDepth,
+        ] {
+            assert_eq!(KnobIdAbi::from_raw(id as u32), Some(id));
+        }
+        assert_eq!(KnobIdAbi::ScrubIntervalSecs as u32, 0);
+        assert_eq!(KnobIdAbi::RecoveryRetryCount as u32, 1);
+        assert_eq!(KnobIdAbi::LogVerbosity as u32, 2);
+        assert_eq!(KnobIdAbi::NvmeMaxQueueDepth as u32, 3);
+        assert_eq!(KnobIdAbi::from_raw(4), None);
+        assert_eq!(KnobIdAbi::from_raw(u32::MAX), None);
+    }
+
+    #[test]
+    fn observation_limits_are_record_aligned() {
+        // A cap that is not a whole number of records would let a
+        // caller ask for a buffer that can never be filled exactly.
+        assert_eq!(OBSERVATION_RECORD_SIZE, 32);
+        assert_eq!(MAX_OBSERVATION_BYTES % OBSERVATION_RECORD_SIZE, 0);
+        assert!(MAX_OBSERVATION_BYTES >= OBSERVATION_RECORD_SIZE);
     }
 
     #[test]

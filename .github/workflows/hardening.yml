@@ -33,6 +33,19 @@ jobs:
         env:
           CARGO_BUILD_JOBS: "1"
         run: make test
+      # Stage E.4: the deterministic half of the report must match the
+      # committed baseline byte for byte; the timing half is compared
+      # against a second run in this same job, so runner-to-runner
+      # variance cannot fail the gate.
+      - name: Storage benchmark regression gate
+        run: make bench-check
+      - name: Upload benchmark report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: storage-bench
+          path: build/storage-bench.json
+          if-no-files-found: warn
 
   qemu-boot:
     runs-on: ubuntu-24.04

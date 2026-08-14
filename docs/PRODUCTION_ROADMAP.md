@@ -51,14 +51,18 @@ Two flags in that document remain deliberately unset:
 | Flag | Value | Why |
 |------|-------|-----|
 | `v5 production freeze` | not approved | freezing an on-disk format is irreversible; it should follow a period of running the format, not the merge that finished it |
-| `storage production-ready` | false | see the open Stage E tracks below |
+| `storage production-ready` | false | Stage E.3 (long-haul soak) is still open; see below |
 
-**What is genuinely not done: Stage E (Operations).** E.1 runtime
-knobs and E.2 structured observation are not started; E.3 long-haul
-soak and E.4 reproducible benchmarks are partially landed. This is
-the honest blocker for calling storage production-ready: the system
-survives faults, but an operator cannot yet observe it or detect a
-performance regression. Per-track status is inline under Stage E.
+**What is genuinely not done: Stage E.3 (long-haul soak).** E.1
+runtime knobs, E.2 structured observation and E.4 reproducible
+benchmarks have landed; an operator can now tune the system at runtime,
+collect machine-readable records from the same serial capture as the
+text trace, and have CI fail on a benchmark regression. What remains is
+duration: `scripts/soak-long.sh` runs one bounded ~2 h pass in CI, and
+the throughput/error/recovery comparison against a previous run is
+still not implemented, so nothing yet proves the system is healthy at
+24 h. That is the remaining honest blocker for calling storage
+production-ready. Per-track status is inline under Stage E.
 
 ## Stage index
 
@@ -561,8 +565,25 @@ production-grade.
 **Exit criterion.** A user can change a knob at runtime and see
 the effect in the on-target trace.
 
-**Status: not started.** No `RuntimeKnobs` struct and no sysctl-style
-syscall exist in the tree.
+**Status: landed.** `huesos_object::knobs` holds a fixed, closed knob
+set (`scrub.interval_secs`, `recovery.retry_count`, `log.verbosity`,
+`nvme.max_queue_depth`) behind an `IrqSafeMutex`, with defaults equal to
+the constants the code used before. `SystemKnobGet` (62) reads
+unrestricted; `SystemKnobSet` (63) requires a
+`ResourceKind::SystemControl` capability, deliberately separate from
+`PowerControl` so tuning authority is not halting authority. Writes
+clamp into each knob's bounds and report what was applied rather than
+failing, because a knob is a lever pulled under pressure.
+
+Operator path: `init.knob.<name>=<value>` on the kernel command line;
+init mints the capability, applies each knob, and logs the result.
+
+**Exit criterion met.** With `init.knob.nvme.max_queue_depth=32` the
+on-target trace reads `[driver-host:nvme] queue depth=32 (knob cap=32)`
+against `queue depth=256 (knob cap=256)` on an otherwise identical boot.
+The knob can only ever *lower* the depth: it is applied alongside the
+controller's advertised limit and the compiled-in baseline, never
+instead of them.
 
 ### Track E.2 — Structured observation
 
@@ -575,8 +596,27 @@ syscall exist in the tree.
 produces a single log file with both the on-target text and
 the structured records.
 
-**Status: not started.** No `sys_observation_read` syscall exists; the
-on-target trace is still plain text only.
+**Status: landed.** `huesos_object::observation` keeps a fixed 256-entry
+ring of 32-byte `#[repr(C)]` records (sequence, timestamp, class, code,
+detail) with overwrite-oldest semantics and a dropped-record counter.
+`SystemObservationRead` (64) drains it into a caller buffer.
+
+The roadmap text above says `Vec<u8>`; the implementation deliberately
+does not allocate. The moments worth observing are disproportionately
+the moments when memory is short, and an allocation failure inside the
+code that records failures is a diagnostic dead end. Recording is
+infallible by construction — `record()` returns nothing and cannot fail
+— so observability can never change the behaviour of the thing it
+observes.
+
+Monotonic sequence numbers let a reader detect exactly what it missed
+when the ring wraps; a gap is reported rather than silently closed.
+
+**Exit criterion met.** init dumps the ring to the UART as
+`[observe] <hex>` lines at the end of boot, so one serial capture holds
+both the text trace and the structured records.
+`tools/observation-decode.py` turns those lines back into records (text
+or JSON, with gap detection).
 
 ### Track E.3 — Long-haul soak
 
@@ -613,9 +653,31 @@ different axis from long-haul duration and does not close E.3.
 that is bit-identical across two runs of the same commit on the
 same hardware; the report is small enough to attach to a PR.
 
-**Status: partially landed.** `tools/storage-bench.py` exists, but it
-is not wired into any CI job and there is no >5% regression gate, so
-nothing currently detects a throughput regression.
+**Status: landed, with the exit criterion corrected.** The criterion as
+written — a JSON report bit-identical across two runs — cannot hold for
+a report containing wall-clock timings; the same binary on the same
+machine varies between runs. A gate built on that premise either never
+fires or fires constantly, and one that fires constantly gets disabled.
+
+The report is therefore split, and each half is checked the way it can
+actually be checked:
+
+* `deterministic` — counters, image sizes, and SHA-256 digests of tool
+  output. Bit-identical across runs of the same commit, and compared
+  byte-exactly against `tools/baselines/storage-bench.json`. Any
+  difference is a real functional change.
+* `timings` — wall-clock milliseconds, compared with a percentage
+  tolerance (default 25%) and, by default, only against a second run in
+  the same invocation (`--self-compare`). Comparing timings against a
+  committed baseline recorded on other hardware is opt-in
+  (`--baseline-timings`) because it produces false failures otherwise —
+  notably on a cold checkout, where the first run pays to build the
+  Rust seed tool.
+
+`make bench-check` runs both halves and is wired into the
+`static-safety` CI job, which uploads the report as an artifact. Refresh
+the baseline deliberately with `--update-baseline`; it lands as a
+visible diff in the PR that changes it.
 
 ---
 

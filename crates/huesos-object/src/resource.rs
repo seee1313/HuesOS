@@ -67,6 +67,14 @@ pub enum ResourceKind {
     /// processes over a channel. See
     /// `docs/ARCHITECTURE_ROADMAP.md` § framebuffer.
     FrameDraw = 6,
+    /// Authority to change system-wide runtime knobs
+    /// (`Syscall::SystemKnobSet`). A binary capability with no
+    /// meaningful base/len, deliberately distinct from
+    /// [`Self::PowerControl`]: tuning the system and halting it are
+    /// different authorities, and a process that needs the former
+    /// should not have to be trusted with the latter. Minted by the
+    /// root supervisor (`init`) and transferred over a channel.
+    SystemControl = 7,
 }
 
 /// Reason a `Resource::try_create*` call was rejected.

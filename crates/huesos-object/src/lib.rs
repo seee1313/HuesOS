@@ -31,6 +31,12 @@ pub mod wait;
 pub mod boot_key;
 /// Kernel entropy pool (ChaCha20 DRBG) backing `SystemGetEntropy`.
 pub mod entropy;
+/// Operator-tunable runtime knobs (Stage E.1) backing `SystemKnobGet` /
+/// `SystemKnobSet`.
+pub mod knobs;
+/// Structured observation records (Stage E.2) backing
+/// `SystemObservationRead`.
+pub mod observation;
 
 pub use acpi_broker::{AcpiBroker, PciFunctionGrant, SystemIoGrant};
 pub use channel::{

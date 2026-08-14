@@ -26,6 +26,24 @@ pub mod tpm;
 /// Ring-0 async runtime: per-CPU executor with reactor model.
 pub mod async_rt;
 
+/// Event codes for structured observation records (Stage E.2).
+///
+/// Codes are namespaced by the record's `ObservationClass`, so the same
+/// numeric code may mean different things under `Boot` and `Recovery`.
+/// They are consumed by `tools/observation-decode.py`, which means they
+/// are an interface: append, never renumber.
+pub mod observation_code {
+    /// `Boot`: kernel subsystems are up and init is about to be
+    /// spawned. Detail carries the number of online CPUs.
+    pub const KERNEL_READY: u32 = 1;
+    /// `Recovery`: the synthetic `.ex_table` probe took a page fault
+    /// inside a user-copy and recovered, as designed.
+    pub const EXTABLE_PROBE_RECOVERED: u32 = 2;
+    /// `Error`: the synthetic `.ex_table` probe did not recover.
+    /// Detail carries the returned error code, sign-extended.
+    pub const EXTABLE_PROBE_FAILED: u32 = 3;
+}
+
 pub use huesos_pmm::MemoryRegion;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -283,6 +301,15 @@ pub unsafe fn kmain(boot_info: BootInfo) -> ! {
     }
 
     log_boot_banner(&boot_info);
+    // First structured record of the boot: everything the kernel needs
+    // is up and the first userspace process is about to exist. The
+    // detail carries the CPU count so an aggregator can tell an SMP
+    // boot from a uniprocessor one without parsing the banner text.
+    huesos_object::observation::record(
+        huesos_object::observation::ObservationClass::Boot,
+        observation_code::KERNEL_READY,
+        smp::ap_ready_count() as u64 + 1,
+    );
     spawn_init_process(
         bootfs_image,
         acpi_archive.as_deref(),
@@ -551,11 +578,25 @@ fn run_extable_synthetic_probe() {
                 writer,
                 "[extable-test] recovered synthetic user-copy fault OK"
             );
+            // A fault that was detected and repaired: this is what the
+            // Recovery class is for, and it is the one place in the
+            // kernel that provably exercises the recovery path on every
+            // boot that asks for it.
+            huesos_object::observation::record(
+                huesos_object::observation::ObservationClass::Recovery,
+                observation_code::EXTABLE_PROBE_RECOVERED,
+                0,
+            );
         }
         Err(error) => {
             let _ = writeln!(
                 writer,
                 "[extable-test] FAILED: probe returned {error:?} instead of recovered fault"
+            );
+            huesos_object::observation::record(
+                huesos_object::observation::ObservationClass::Error,
+                observation_code::EXTABLE_PROBE_FAILED,
+                error as i32 as i64 as u64,
             );
         }
     }
