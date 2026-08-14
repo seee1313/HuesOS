@@ -326,6 +326,64 @@ fn build_bootfs_image(manifest_dir: &Path, inputs: BootfsInputs<'_>) -> PathBuf 
             data: b"Welcome to HuesOS BOOTFS\nTry: ls /, ls /manifests, cat /welcome.txt\n".to_vec(),
         },
         BootFsFile {
+            // Boot UX configuration. Shipped with every value commented
+            // out: the built-in defaults are the intended experience,
+            // and the file exists so an operator can see what is
+            // tunable without reading the source. Kernel command-line
+            // `init.` keys override anything set here.
+            path: "/etc/init.conf",
+            data: br#"# HuesOS init boot configuration.
+#
+# Every setting below is shown at its built-in default. Uncomment to
+# change. Kernel command-line keys of the form init.<key>=<value>
+# override this file, which is the escape hatch when a machine will
+# not boot far enough to rebuild an image.
+#
+# Serial (UART) logging is always full and is deliberately not
+# configurable here: it is the only channel that survives a machine
+# that dies before the terminal starts, and CI greps it.
+
+# Show technical log text on screen instead of the splash.
+# log.screen = off
+
+# Draw the graphical splash. Turning it off implies log.screen=on,
+# because a blank screen with no diagnostics helps nobody.
+# splash = on
+# splash.spinner = on
+
+# Gradient and accent colours, #RRGGBB or RRGGBB.
+# splash.top = #0A0E22
+# splash.bottom = #04060E
+# splash.accent = #5AC8FF
+
+# Progress weights. Relative, not percentages: the bar divides its
+# width in proportion to these. Storage dominates because NVMe
+# enumeration plus the Hxfs mount takes longer than everything else
+# combined, and an unweighted bar would stall mid-boot then jump.
+# stage.selftest = 5
+# stage.driver-manager = 10
+# stage.storage = 30
+# stage.shutdown-broker = 8
+# stage.terminal = 12
+
+# Labels shown under the bar.
+# stage.storage.label = Probing storage controller
+
+# Per-stage deadlines in seconds. On expiry the stage is marked
+# failed, the indicator turns red, and the boot continues visibly
+# rather than hanging in silence.
+# timeout.default = 30
+# timeout.storage = 60
+
+# A stage that is not listed above can be declared here and it will
+# appear on the bar with no code change:
+# stage.network = 20
+# stage.network.label = Bringing up network
+# timeout.network = 45
+"#
+            .to_vec(),
+        },
+        BootFsFile {
             path: "/manifests/input-host.hdriver",
             // Legacy `irq=`/`ioport=` fields are retained for parser
             // back-compat during the manifest-driven-grants rollout;

@@ -11,9 +11,14 @@ name = "huesos-blobfs"
 version = "0.1.0"
 
 [[package]]
+name = "huesos-bootux"
+version = "0.1.0"
+
+[[package]]
 name = "huesos-init"
 version = "0.1.0"
 dependencies = [
+ "huesos-bootux",
  "libcanvas",
 ]
 

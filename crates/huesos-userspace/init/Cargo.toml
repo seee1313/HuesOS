@@ -9,6 +9,7 @@ path = "src/main.rs"
 
 [dependencies]
 libcanvas = { path = "../libcanvas", features = ["kernel-smoke-tests"] }
+huesos-bootux = { path = "../../huesos-bootux" }
 
 [profile.release]
 opt-level = 1

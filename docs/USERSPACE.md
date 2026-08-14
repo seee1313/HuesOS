@@ -303,6 +303,54 @@ To add a program today:
 
 Filesystem-backed discovery/loading is still future work.
 
+## Reporting boot progress from a service
+
+Init draws a boot splash and advances a progress bar as services come
+up. A service participates through the bootstrap channel it already
+has — there is no progress syscall, and none is wanted: a syscall
+would have to be capability-gated, and it would let any service move
+the global bar. On the channel, a service can only influence its own
+band.
+
+Three messages are understood, all plain ASCII:
+
+```text
+<name>:ready              // done; the stage fills and turns green
+<name>:degraded           // up, but with reduced function
+<name>:progress:<0..100>  // optional, any number of times
+```
+
+`progress` is what keeps a long stage from looking hung. If your
+service takes several seconds — enumerating a bus, mounting a volume —
+send it as you go:
+
+```rust
+let bootstrap = libcanvas::channel::bootstrap();
+let _ = bootstrap.write(b"storage:progress:40");
+// ... more work ...
+let _ = bootstrap.write(b"storage:ready");
+```
+
+Points worth knowing:
+
+* **Progress is monotonic per stage.** A lower value than one already
+  reported is ignored. A bar that goes backwards reads as a fault even
+  when nothing is wrong.
+* **`degraded` is not a failure.** Use it when the service is usable
+  but something is missing — DriverManager sends it when it comes up
+  without a keyboard. The boot continues, the summary says `degraded`
+  rather than `all ok`, and no red banner appears.
+* **Silence is not free.** Every stage has a wall-clock deadline from
+  `/etc/init.conf`. Miss it and the stage is marked failed, the
+  indicator turns red, and init prints which stage did not answer. The
+  boot then continues to the next stage.
+* **Your stage must exist in the config** for any of this to show up.
+  Stages are data, not code: adding `stage.mything=20` to
+  `/etc/init.conf` is enough for init to give your service a band, a
+  label, and a deadline without touching init's source.
+
+Full configuration reference: `docs/design/INIT_BOOT_UX.md`.
+
 ## Common mistakes (and what happens when you make them)
 
 - **Forgetting `#![no_std]`/`#![no_main]` or a panic handler** — compile
