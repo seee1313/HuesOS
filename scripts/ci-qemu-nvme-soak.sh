@@ -466,7 +466,12 @@ if [[ "$inject" == "5" ]]; then
         echo "[soak] controller reset failed during the high queue-depth soak" >&2
         exit 1
     fi
-    telemetry="$(grep -F '[driver-host:nvme] telemetry' "$log" | tail -1)"
+    # Same `|| true` reasoning as the page-cache line below.
+    telemetry="$(grep -F '[driver-host:nvme] telemetry' "$log" | tail -1 || true)"
+    if [[ -z "$telemetry" ]]; then
+        echo "[soak] no NVMe telemetry line in the log" >&2
+        exit 1
+    fi
     echo "[soak] $telemetry"
     if [[ "$telemetry" != *"state=Online"* ]]; then
         echo "[soak] controller did not end the soak Online: $telemetry" >&2
@@ -493,8 +498,21 @@ fi
 # the thing being hit. The service prints its counters after two
 # reads of the same file; require a hit on the repeat read, so a
 # cache that is present but never consulted fails the gate.
-cache_line="$(grep -F '[hxfs] page-cache' "$log" | tail -1)"
-if [[ -n "$cache_line" ]]; then
+#
+# The counters come from the boot self-check, which is compiled in
+# only under the `synthetic-key` feature -- that is, only for the
+# seeded modes. Mode 0 boots a production build against a blank
+# volume: it has no self-check, so it can never print the marker and
+# demanding one failed the job for a condition the build cannot
+# satisfy. Apply the gate to the modes that actually run the probe.
+# `|| true`: under `set -euo pipefail` a grep that matches nothing
+# exits 1 and kills the script HERE, before the checks below can
+# report anything -- which is exactly how this failure presented:
+# a silent exit 1 with no diagnostic at all.
+cache_line="$(grep -F '[hxfs] page-cache' "$log" | tail -1 || true)"
+if [[ "$inject" == "0" ]]; then
+    echo "[soak] mode 0 is a production build with no boot self-check; page-cache gate not applicable"
+elif [[ -n "$cache_line" ]]; then
     echo "[soak] $cache_line"
     repeat_hits="$(sed -n 's/.*repeat-read-hits=\([0-9]*\).*/\1/p' <<<"$cache_line")"
     if [[ -z "$repeat_hits" ]] || (( repeat_hits < 1 )); then
