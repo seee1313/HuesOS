@@ -347,3 +347,34 @@ Filesystem-backed discovery/loading is still future work.
   back before returning, so leave via `break` rather than `return`
   where a tail restores it. `tools/check-poll-budgets.py` enforces
   the rule in CI.
+
+  A `while let Some(x) = <slot>` loop is the same hazard wearing a
+  different hat: the condition tests a service slot that stays
+  occupied for the whole connection, so it ends only when the peer
+  goes quiet — which is the thing you cannot assume. Budget it too.
+- **Blocking "until the handle arrives" with no time limit** — a
+  one-shot handshake such as `mount_from_bootstrap` is allowed to
+  block; it has nothing to serve yet. What it must not do is block
+  *forever*: a peer that connects and then dies, or a device that
+  never enumerates, would park the service in `yield_now()` for the
+  life of the machine with no message and no exit. Arm a deadline
+  against `libcanvas::system::monotonic_ticks()` (100 Hz), report
+  what did not arrive, and give up:
+
+  ```rust
+  let mut deadline: Option<u64> = None;
+  // ... in the ShouldWait arm:
+  match libcanvas::system::monotonic_ticks() {
+      Ok(now) => match deadline {
+          Some(limit) if now >= limit => return None, // say why first
+          Some(_) => {}
+          None => deadline = Some(now.saturating_add(BUDGET_TICKS)),
+      },
+      Err(_) => {} // no clock: wait rather than fail a healthy mount
+  }
+  ```
+
+  A retry *count* is the wrong unit for this: the loop yields, so it
+  spins as fast as the scheduler allows and a fixed iteration count
+  expires in milliseconds while the device is legitimately still
+  coming up. Use wall time.
