@@ -185,15 +185,21 @@ pub enum UnsealOutcome {
 /// Called during kernel init, before userspace can call
 /// `VolumeKeyGet`.
 pub fn init_volume_key() -> UnsealOutcome {
-    let Some(sealed) = crate::boot_key::SEALED_VOLUME_KEY_BLOB else {
-        return UnsealOutcome::NoSealedBlob;
-    };
+    // Probe the hardware BEFORE looking at the sealed blob. The
+    // outcome is reported in the boot log and read by operators and
+    // by the no-TPM CI gate, so "no sealed key in this image" must
+    // not be printed on a machine that has no TPM at all -- that
+    // reading of the log sends someone hunting for a missing key on
+    // hardware that could never have held one.
     let Some(mut tpm) = MmioCrb::map() else {
         return UnsealOutcome::NoTpm;
     };
     if !tpm.present() {
         return UnsealOutcome::NoTpm;
     }
+    let Some(sealed) = crate::boot_key::SEALED_VOLUME_KEY_BLOB else {
+        return UnsealOutcome::NoSealedBlob;
+    };
     if huesos_tpm::crb::request_locality(&mut tpm).is_err() {
         return UnsealOutcome::NoTpm;
     }

@@ -1716,15 +1716,50 @@ fn mount_from_bootstrap(bootstrap: &Channel) -> Option<Box<MountedHxfs>> {
                         let key = libcanvas::system::get_volume_key().ok().flatten();
                         let enc = [huesos_hxfs::synthetic_key::encryption_policy()];
                         let comp = [huesos_hxfs::synthetic_key::compression_policy()];
+                        if key.is_none() {
+                            // No TPM, and no bootloader blob either.
+                            // A PLAIN volume must still mount: most
+                            // machines have no TPM, and refusing to
+                            // boot them would make the whole system
+                            // unusable to prove a point about a
+                            // feature their volume does not use.
+                            //
+                            // An ENCRYPTED volume is a different
+                            // matter and is still refused below: the
+                            // bytes are AEAD-sealed, so "carry on
+                            // without encryption" is not an option
+                            // anyone can implement -- there is no
+                            // key with which to read them. The
+                            // failure is reported as exactly that
+                            // rather than as a generic mount error.
+                            println!("[hxfs] no volume key available; plain volumes only");
+                        }
                         FixedHxfsWriter::mount_with_policies(reader, &enc, &comp, key.as_ref())
                     }
                     #[cfg(not(feature = "synthetic-key"))]
                     {
-                        FixedHxfsWriter::mount_with_policies(reader, &[], &[], None)
+                        // Production build: take the key if the
+                        // platform has one. A machine without a TPM
+                        // still mounts its plain volume; only an
+                        // encrypted volume needs the key, and that
+                        // case is reported distinctly below.
+                        let key = libcanvas::system::get_volume_key().ok().flatten();
+                        FixedHxfsWriter::mount_with_policies(reader, &[], &[], key.as_ref())
                     }
                 };
                 match mounted {
                     Ok(fs) => return Some(Box::new(fs)),
+                    Err(huesos_hxfs::HxfsError::EncryptedVolumeKeyUnavailable) => {
+                        // Distinguish "this machine has no TPM" from
+                        // "the filesystem is broken". Only the former
+                        // is actionable by the operator, and a
+                        // generic mount error hides which one it is.
+                        println!(
+                            "[hxfs] mount refused: volume is encrypted but no key is available"
+                        );
+                        println!("[hxfs] hint: this build needs a TPM-sealed or bootloader key");
+                        return None;
+                    }
                     Err(error) => {
                         println!("[hxfs] mount failed: {:?}", error);
                         return None;

@@ -48,6 +48,13 @@ struct Args {
     seed_size: usize,
     inject_bad_gcm_tag: bool,
     inject_bad_crc: bool,
+    /// Build a clean PLAIN (unencrypted) volume.
+    ///
+    /// Distinct from `--inject-bad-crc`, which also produces a plain
+    /// volume but deliberately corrupts it. The no-TPM gate needs a
+    /// plain volume that is intact, to prove a machine with no key
+    /// still mounts and serves normally.
+    plain: bool,
     seed_blob_file: Option<std::path::PathBuf>,
 }
 
@@ -55,7 +62,7 @@ fn usage() -> ! {
     eprintln!(
         "usage: huesos-hxfs-seed --output PATH [--blocks N] [--instance-uuid HEX] \
          [--volume-uuid HEX] [--seed-file NAME] [--seed-size BYTES] \
-         [--inject-bad-gcm-tag] [--inject-bad-crc]"
+         [--inject-bad-gcm-tag] [--inject-bad-crc] [--plain]"
     );
     std::process::exit(2);
 }
@@ -83,6 +90,7 @@ fn parse_args() -> Args {
     let mut seed_size = 3584usize;
     let mut inject_bad_gcm_tag = false;
     let mut inject_bad_crc = false;
+    let mut plain = false;
     let mut seed_blob_file: Option<std::path::PathBuf> = None;
     let mut index = 1usize;
     let args: Vec<String> = std::env::args().collect();
@@ -144,6 +152,7 @@ fn parse_args() -> Args {
             }
             "--inject-bad-gcm-tag" => inject_bad_gcm_tag = true,
             "--inject-bad-crc" => inject_bad_crc = true,
+            "--plain" => plain = true,
             "--seed-blob-file" => {
                 index += 1;
                 seed_blob_file = Some(std::path::PathBuf::from(
@@ -174,6 +183,10 @@ fn parse_args() -> Args {
         eprintln!("--inject-bad-gcm-tag and --inject-bad-crc are mutually exclusive");
         std::process::exit(2);
     }
+    if plain && inject_bad_gcm_tag {
+        eprintln!("--plain builds an unencrypted volume; there is no GCM tag to corrupt");
+        std::process::exit(2);
+    }
     Args {
         output,
         blocks,
@@ -183,6 +196,7 @@ fn parse_args() -> Args {
         seed_size,
         inject_bad_gcm_tag,
         inject_bad_crc,
+        plain,
         seed_blob_file,
     }
 }
@@ -541,7 +555,7 @@ fn main() {
     // (also with the LZ4 policy) so the seeded-file corruption is
     // detected by the compressed-payload CRC32C instead of the GCM
     // tag.
-    let encrypted = !args.inject_bad_crc;
+    let encrypted = !args.inject_bad_crc && !args.plain;
     let boot_image = huesos_hxfs::synthetic_image::build_boot_image(
         args.instance_uuid,
         args.volume_uuid,

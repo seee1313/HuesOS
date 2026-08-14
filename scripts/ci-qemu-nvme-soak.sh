@@ -41,6 +41,17 @@ elif [[ "$inject" == "4" ]]; then
     # (stress-ok) for sustained NVMe/page-cache load.
     export HUESOS_HXFS_SERVICE_FEATURES=synthetic-key
     seed_args=()
+elif [[ "$inject" == "6" ]]; then
+    # Mode 6: NO-TPM gate. A clean plain (unencrypted) volume on a
+    # machine with no TPM and no bootloader key blob. Most real
+    # hardware looks like this, so the failure it guards against is
+    # severe: a build that only mounts when a key is present would
+    # refuse to boot on any machine without a TPM. The volume key is
+    # deliberately NOT exported below, and SOAK_TPM=0 keeps swtpm
+    # away even on a runner that has it installed.
+    export HUESOS_HXFS_SERVICE_FEATURES=synthetic-key
+    export SOAK_TPM=0
+    seed_args=(--plain)
 elif [[ "$inject" == "5" ]]; then
     # Mode 5: high queue-depth soak (production gate). Same workload
     # as mode 4, but QEMU exposes a multi-queue NVMe controller and
@@ -51,7 +62,11 @@ elif [[ "$inject" == "5" ]]; then
     export HUESOS_HXFS_SERVICE_FEATURES=synthetic-key
     seed_args=()
 fi
-if [[ "$inject" == "1" || "$inject" == "2" || "$inject" == "3" || "$inject" == "4" || "$inject" == "5" ]]; then
+if [[ "$inject" == "6" ]]; then
+    # Mode 6 only: seed the WAD blob but hand the guest NO key at
+    # all, so the mount has to succeed on its own merits.
+    seed_args+=(--seed-blob-file build/wad-header.bin)
+elif [[ "$inject" == "1" || "$inject" == "2" || "$inject" == "3" || "$inject" == "4" || "$inject" == "5" ]]; then
     # Stage D: the synthetic volume key is baked into the KERNEL as
     # the bootloader key blob (single source of truth: the seed
     # tool's --print-volume-key-hex). The service receives it via
@@ -125,7 +140,7 @@ if [[ "$need_create" == "1" ]]; then
         echo "[soak] image too small for Hxfs (need >= 32 KiB)" >&2
         exit 1
     fi
-    if [[ "$inject" == "1" || "$inject" == "2" || "$inject" == "3" || "$inject" == "4" || "$inject" == "5" ]]; then
+    if [[ "$inject" == "1" || "$inject" == "2" || "$inject" == "3" || "$inject" == "4" || "$inject" == "5" || "$inject" == "6" ]]; then
         # Seeded modes: an encrypted+compressed volume with a
         # seed.bin file. Modes 1/2 corrupt the seed data block;
         # mode 3 leaves it intact for the shutdown cycle.
@@ -349,6 +364,31 @@ elif [[ "$inject" == "5" ]]; then
         "[driver-manager] package-resolve-ok"
         "[driver-host:nvme] telemetry"
     )
+elif [[ "$inject" == "6" ]]; then
+    # No-TPM gate: a plain volume on a machine with no TPM and no
+    # key must mount and serve normally. Asserting the ordinary
+    # markers is the whole point -- "works without a TPM" means the
+    # same self-check, write path and object store as every other
+    # mode, not a reduced subset.
+    required+=(
+        "[hxfs] no volume key available; plain volumes only"
+        "[hxfs] self-check ok"
+        "[hxfs] write-roundtrip-ok"
+        "[hxfs] multi-slot-write-ok"
+        "[hxfs] scrub complete"
+        "[hxfs] fsck clean"
+        "[hxfs] stage-f-blob-ok"
+    )
+    # A key must NOT have appeared from anywhere: if one did, the
+    # gate passed for the wrong reason and proves nothing.
+    if grep -Fq "[tpm] volume key unsealed" "$log"; then
+        echo "[soak] no-TPM gate ran WITH a volume key; the gate is void" >&2
+        exit 1
+    fi
+    if ! grep -Fq "[tpm] no TPM 2.0 CRB interface present" "$log"; then
+        echo "[soak] no-TPM gate: expected the kernel to report an absent TPM" >&2
+        exit 1
+    fi
 elif [[ "$inject" == "3" ]]; then
     # Graceful-shutdown cycle: the encrypted volume must mount and
     # self-check cleanly, then the userspace shutdown chain must
