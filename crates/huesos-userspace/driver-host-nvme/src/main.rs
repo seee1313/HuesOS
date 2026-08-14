@@ -429,10 +429,20 @@ fn bring_up_controller(
         Ok(count) => count.max(1),
         Err(_) => 1,
     };
+    // Stage E.1: an operator who has found that this controller
+    // misbehaves at full depth caps it with
+    // `init.knob.nvme.max_queue_depth=N` and reboots, without a
+    // rebuild. Reading the knob cannot fail meaningfully — a kernel
+    // that does not know the syscall simply has no opinion to offer —
+    // so an error is treated as "uncapped".
+    let max_queue_depth = libcanvas::system::knob_get(libcanvas::system::KnobId::NvmeMaxQueueDepth)
+        .map(|value| u16::try_from(value).unwrap_or(u16::MAX))
+        .unwrap_or(0);
     let config = ControllerConfig {
         cpu_count,
         msix_available: interrupt_first && irq.len > 1,
         msi_available: interrupt_first && irq.len == 1,
+        max_queue_depth,
     };
     let info = controller.init_with_config(config).map_err(|error| {
         let detail = match error {
@@ -453,6 +463,15 @@ fn bring_up_controller(
         irq.base,
         irq.len,
         interrupt_state.count
+    );
+    // Stage E.1 exit criterion: the knob's effect has to be visible in
+    // the on-target trace, not merely stored. Print the depth actually
+    // planned alongside the cap that was asked for, so an operator can
+    // confirm the setting took and see when the hardware limit, rather
+    // than the knob, is what bound it.
+    println!(
+        "[driver-host:nvme] queue depth={} (knob cap={})",
+        info.queue_plan.io_depth, max_queue_depth
     );
     Ok(DriverRuntime {
         controller,

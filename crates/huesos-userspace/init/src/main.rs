@@ -69,6 +69,10 @@ fn load_config(logger: &mut InitLogger, bootfs: &Vmo) -> InitConfig {
         Ok(read) if read > 0 => {
             config.parse_cmdline(&buf[..read], b"init.");
             init_logln!(logger, "[init] config: kernel cmdline applied");
+            // Runtime knobs share the cmdline but not the config
+            // struct: they live in the kernel, not in init's own
+            // presentation settings.
+            apply_cmdline_knobs(logger, &buf[..read]);
         }
         _ => {}
     }
@@ -254,6 +258,12 @@ pub extern "C" fn _start() -> ! {
     if boot_failed {
         init_logln!(logger, "[init] boot completed with stage failures");
     }
+
+    // Stage E.2: emit the kernel's structured observation records on the
+    // serial console as hex, so an off-target collector gets the machine
+    // readable channel alongside the text trace from the same capture.
+    // `tools/observation-decode.py` turns these lines back into records.
+    dump_observation_records(&mut logger);
     init_logln!(
         logger,
         "[init] service launch complete; parking as init supervisor"
@@ -752,7 +762,8 @@ fn format_grant_label(
     // shutdown-broker's manifest / label matcher compact. "framedraw"
     // is the short wire label for FrameDraw — init is the only process
     // that mints a FrameDraw resource and it transfers it to legitimate
-    // graphics consumers over a channel.
+    // graphics consumers over a channel. "sysctl" is the short wire
+    // label for SystemControl, the authority to write runtime knobs.
     let kind = match grant.kind {
         ResourceKind::IoPort => "ioport",
         ResourceKind::Mmio => "mmio",
@@ -760,6 +771,7 @@ fn format_grant_label(
         ResourceKind::PowerControl => "pwr",
         ResourceKind::DmaPool => "dma",
         ResourceKind::FrameDraw => "framedraw",
+        ResourceKind::SystemControl => "sysctl",
     };
     let mode = if grant.exclusive { "excl" } else { "shared" };
     let mut w = FixedWriter::new(out);
@@ -911,6 +923,162 @@ fn create_driver_manager_registry_channel(
             None
         }
     }
+}
+
+/// Apply `knob.<name>=<value>` settings from the kernel command line
+/// (Stage E.1).
+///
+/// This is the operator path that makes runtime knobs real: a machine
+/// that misbehaves at high NVMe queue depth can be booted with
+/// `init.knob.nvme.max_queue_depth=32` without rebuilding anything.
+/// init mints the `SystemControl` capability for itself, applies the
+/// requested knobs, and logs what actually took effect — which may
+/// differ from what was asked for, because the kernel clamps.
+///
+/// A bad knob name or value is logged and skipped. A typo on the
+/// command line must never stop a machine from booting; that is the
+/// same rule the rest of the config parser follows.
+fn apply_cmdline_knobs(logger: &mut InitLogger, cmdline: &[u8]) {
+    use libcanvas::resource::{Resource, ResourceKind};
+    use libcanvas::system::KnobId;
+
+    // Names match huesos_object::knobs::KnobId::name(), so what an
+    // operator types matches what the trace prints back.
+    const KNOBS: &[(&[u8], KnobId)] = &[
+        (b"scrub.interval_secs", KnobId::ScrubIntervalSecs),
+        (b"recovery.retry_count", KnobId::RecoveryRetryCount),
+        (b"log.verbosity", KnobId::LogVerbosity),
+        (b"nvme.max_queue_depth", KnobId::NvmeMaxQueueDepth),
+    ];
+
+    // Cheap pre-check: minting the capability is pointless if no knob
+    // was requested, and the common boot asks for none.
+    let wanted = cmdline
+        .split(|byte| byte.is_ascii_whitespace())
+        .any(|token| token.starts_with(b"init.knob."));
+    if !wanted {
+        return;
+    }
+
+    let capability = match Resource::create(ResourceKind::SystemControl, 0, 1, true) {
+        Ok(resource) => resource,
+        Err(error) => {
+            init_logln!(
+                logger,
+                "[init] knob: SystemControl mint failed: {}",
+                error.as_str()
+            );
+            return;
+        }
+    };
+
+    for token in cmdline.split(|byte| byte.is_ascii_whitespace()) {
+        let Some(rest) = token.strip_prefix(b"init.knob.".as_slice()) else {
+            continue;
+        };
+        let Some(eq) = rest.iter().position(|byte| *byte == b'=') else {
+            init_logln!(logger, "[init] knob: missing '=' in cmdline token");
+            continue;
+        };
+        let (name, value) = (&rest[..eq], &rest[eq + 1..]);
+        let Some((_, id)) = KNOBS.iter().find(|(known, _)| *known == name) else {
+            init_logln!(logger, "[init] knob: unknown knob {}", ascii_str(name));
+            continue;
+        };
+        let Some(parsed) = parse_u64_ascii(value) else {
+            init_logln!(logger, "[init] knob: bad value for {}", ascii_str(name));
+            continue;
+        };
+        match libcanvas::system::knob_set(*id, parsed, capability.handle().raw()) {
+            Ok(applied) => init_logln!(
+                logger,
+                "[init] knob {} = {} (requested {})",
+                ascii_str(name),
+                applied,
+                parsed
+            ),
+            Err(error) => init_logln!(
+                logger,
+                "[init] knob {} failed: {}",
+                ascii_str(name),
+                error.as_str()
+            ),
+        }
+    }
+}
+
+/// Parse a decimal `u64` from ASCII, rejecting anything else.
+///
+/// Returns `None` on an empty string, a non-digit, or overflow, so a
+/// nonsense value is skipped rather than silently becoming zero.
+fn parse_u64_ascii(bytes: &[u8]) -> Option<u64> {
+    if bytes.is_empty() {
+        return None;
+    }
+    let mut value: u64 = 0;
+    for byte in bytes {
+        if !byte.is_ascii_digit() {
+            return None;
+        }
+        value = value.checked_mul(10)?;
+        value = value.checked_add(u64::from(byte - b'0'))?;
+    }
+    Some(value)
+}
+
+/// Print the kernel's structured observation ring to the UART as hex.
+///
+/// One log line per record keeps each line short enough to survive a
+/// serial capture, and means a truncated line costs one record rather
+/// than the whole batch. Failures are logged and ignored: observability
+/// must never be able to fail the boot it is observing.
+fn dump_observation_records(logger: &mut InitLogger) {
+    use libcanvas::system::OBSERVATION_RECORD_SIZE;
+
+    // 32 records per call; the loop continues from the last sequence
+    // seen, so a fuller ring simply takes more iterations.
+    let mut buffer = [0u8; OBSERVATION_RECORD_SIZE * 32];
+    let mut after = 0u64;
+    let mut total = 0usize;
+    // Bounded: the ring holds a fixed number of records, so this can
+    // only run as many times as it takes to drain it once.
+    for _ in 0..16 {
+        let written = match libcanvas::system::observation_read(after, &mut buffer) {
+            Ok(0) => break,
+            Ok(written) => written,
+            Err(error) => {
+                init_logln!(logger, "[init] observation read failed: {}", error.as_str());
+                return;
+            }
+        };
+        let count = written / OBSERVATION_RECORD_SIZE;
+        for i in 0..count {
+            let record = &buffer[i * OBSERVATION_RECORD_SIZE..(i + 1) * OBSERVATION_RECORD_SIZE];
+            let mut line = [0u8; OBSERVATION_RECORD_SIZE * 2];
+            for (j, byte) in record.iter().enumerate() {
+                const HEX: &[u8; 16] = b"0123456789abcdef";
+                line[j * 2] = HEX[usize::from(byte >> 4)];
+                line[j * 2 + 1] = HEX[usize::from(byte & 0x0f)];
+            }
+            init_logln!(logger, "[observe] {}", ascii_str(&line));
+            // The sequence is the first little-endian u64 of the record.
+            let mut sequence_bytes = [0u8; 8];
+            sequence_bytes.copy_from_slice(&record[0..8]);
+            after = u64::from_le_bytes(sequence_bytes) + 1;
+        }
+        total += count;
+        if count == 0 {
+            break;
+        }
+    }
+    init_logln!(logger, "[init] observation records dumped: {}", total);
+}
+
+/// Interpret a byte slice as ASCII for logging, replacing anything
+/// unprintable. The hex encoder above only ever produces ASCII, so this
+/// is a total function in practice.
+fn ascii_str(bytes: &[u8]) -> &str {
+    core::str::from_utf8(bytes).unwrap_or("<non-ascii>")
 }
 
 fn send_terminal_registry_channel(

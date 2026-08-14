@@ -71,16 +71,17 @@ pub(crate) fn sys_resource_create(
         ResourceKindAbi::PowerControl => ResourceKind::PowerControl,
         ResourceKindAbi::DmaPool => ResourceKind::DmaPool,
         ResourceKindAbi::FrameDraw => ResourceKind::FrameDraw,
+        ResourceKindAbi::SystemControl => ResourceKind::SystemControl,
     };
 
-    // `PowerControl` and `FrameDraw` are binary capabilities with no
-    // meaningful range; force base/len to (0, 1) at mint time so
-    // overlap-checked collisions deterministically fire only on
-    // genuine double-mint attempts. Every other kind keeps the
-    // caller-supplied range.
+    // `PowerControl`, `FrameDraw` and `SystemControl` are binary
+    // capabilities with no meaningful range; force base/len to (0, 1)
+    // at mint time so overlap-checked collisions deterministically
+    // fire only on genuine double-mint attempts. Every other kind
+    // keeps the caller-supplied range.
     let (mint_base, mint_len) = if matches!(
         kernel_kind,
-        ResourceKind::PowerControl | ResourceKind::FrameDraw
+        ResourceKind::PowerControl | ResourceKind::FrameDraw | ResourceKind::SystemControl
     ) {
         (0, 1)
     } else {

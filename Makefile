@@ -8,7 +8,7 @@ CARGO_BUILD := cargo build -p huesos-boot $(CARGO_FLAGS)
 
 ISO := build/huesos.iso
 
-.PHONY: all build build-release run run-release iso iso-release clean fmt fmt-check test policy-check storage-gate audit audit-check clippy
+.PHONY: all build build-release run run-release iso iso-release clean fmt fmt-check test policy-check storage-gate audit audit-check bench-check clippy
 
 all: build
 
@@ -72,6 +72,18 @@ audit-check:
 	python3 tools/check-poll-budgets.py
 	python3 tools/check-huesos-object-lock-policy.py
 	python3 tools/fmt-all.py --check
+
+# Stage E.4: the deterministic half of the storage benchmark is
+# compared byte-exactly against the committed baseline, and the timing
+# half is compared against a second run in the same invocation so that
+# cross-machine variance cannot produce a false failure. Refresh the
+# baseline deliberately with:
+#   python3 tools/storage-bench.py --update-baseline tools/baselines/storage-bench.json
+bench-check:
+	mkdir -p build
+	python3 tools/storage-bench.py --iterations 3 --blocks 256 \
+		--baseline tools/baselines/storage-bench.json --self-compare \
+		--output build/storage-bench.json
 
 clippy:
 	bash scripts/clippy.sh

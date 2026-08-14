@@ -210,6 +210,10 @@ pub fn syscall_init() {
     huesos_syscalls::set_exit_fn(crate::scheduler::exit_current_task);
     huesos_syscalls::set_debug_write_fn(debug_write);
     huesos_syscalls::set_clock_fn(crate::scheduler::global_ticks);
+    // Stamp observation records with the same monotonic tick source the
+    // text trace uses, so the two channels can be correlated line by
+    // record when diagnosing an incident.
+    huesos_object::observation::set_clock(crate::scheduler::global_ticks);
     huesos_syscalls::set_cpu_mask_fn(crate::scheduler::online_cpu_mask);
     huesos_syscalls::set_current_cpu_fn(crate::scheduler::current_cpu_index);
     huesos_syscalls::set_shutdown_fn(crate::shutdown::request);

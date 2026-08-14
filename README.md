@@ -199,6 +199,12 @@ redistributing combined binaries or ISOs.
 See [docs/TESTING.md](docs/TESTING.md) for unit tests, multi-core QEMU
 expectations, and CI setup.
 
+## Operating a running system
+
+Runtime knobs, structured observation records, and the benchmark
+regression gate are documented in
+[docs/OPERATIONS.md](docs/OPERATIONS.md).
+
 ## Roadmap
 
 See [docs/ROADMAP.md](docs/ROADMAP.md) for planned improvements.

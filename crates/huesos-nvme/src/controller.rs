@@ -79,6 +79,10 @@ pub struct ControllerConfig {
     pub msix_available: bool,
     /// Whether MSI metadata/resources are available.
     pub msi_available: bool,
+    /// Operator cap on queue depth from the `nvme.max_queue_depth`
+    /// runtime knob. `0` means the operator has expressed no opinion
+    /// and only the hardware limit applies.
+    pub max_queue_depth: u16,
 }
 
 impl ControllerConfig {
@@ -88,6 +92,7 @@ impl ControllerConfig {
             cpu_count: 1,
             msix_available: false,
             msi_available: false,
+            max_queue_depth: 0,
         }
     }
 }
@@ -430,6 +435,7 @@ impl<T: NvmeTransport> Controller<T> {
             cap_mqes: mqes_entries.saturating_sub(1),
             msix_available: config.msix_available,
             msi_available: config.msi_available,
+            max_queue_depth: config.max_queue_depth,
         })
         .ok_or(NvmeError::InvalidArgs)?;
         self.admin_size = plan.admin_depth.min(mqes_entries).max(2);
@@ -1098,6 +1104,7 @@ mod tests {
             cpu_count: 4,
             msix_available: true,
             msi_available: true,
+            max_queue_depth: 0,
         });
         assert!(info.is_ok());
         let Ok(info) = info else {
