@@ -186,9 +186,12 @@ Exit criterion:
 
 # Stage B — Configuration transport policy core
 
-Status: **NOT STARTED**
+Status: **IN PROGRESS**
 
 ## B.1 Address and width model
+
+Implementation status: checked address/offset/width/error types land in PCI-1;
+transport call sites move off ad-hoc encoding in PCI-2.
 
 Extend `huesos-pci` with checked, safe types:
 
@@ -858,10 +861,11 @@ host-tested. No kernel bootstrap code is removed before Stage J closes.
 
 | Track | Status | Evidence |
 |---|---|---|
-| A.1 Normative architecture | Drafted | `PCI_MANAGER_ARCHITECTURE.md` |
-| A.2 ABI vocabulary | Drafted | architecture §§6, 12–14 |
-| A.3 Migration map | Drafted | architecture §2 + roadmap A.3 |
-| B–O | Not started | no production claim |
+| A.1 Normative architecture | Complete | merged architecture document |
+| A.2 ABI vocabulary | Complete (design) | architecture §§6, 12–14 |
+| A.3 Migration map | Complete | architecture §2 + roadmap A.3 |
+| B.1 Checked address vocabulary | In progress | PCI-1 types/tests; transport adoption follows in PCI-2 |
+| B.2–O | Not started | no production claim |
 
 Update this table in every PCI stage PR. A track may be marked complete only
 with its exit criterion and verification command/log named in the PR.
