@@ -19,6 +19,8 @@ use alloc::vec::Vec;
 pub mod capability;
 /// ACPI MCFG allocation-table decoding and validation.
 pub mod mcfg;
+/// Firmware BAR/bridge-window validation and bus-to-CPU translation.
+pub mod resource_validation;
 /// Immutable, generation-tagged PCI bridge topology snapshots.
 pub mod topology;
 
