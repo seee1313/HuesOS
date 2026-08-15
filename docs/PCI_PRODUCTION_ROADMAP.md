@@ -350,6 +350,11 @@ Status: **IN PROGRESS**
 
 ## D.1 Read-only userspace enumeration
 
+Implementation status: PCI-5 lands the immutable generation-tagged topology
+policy, including multi-segment roots, bridge parent resolution, deterministic
+ordering, and malformed-graph rejection. Feeding it from live userspace config
+reads and publishing the inventory remain open.
+
 Build immutable topology snapshots without programming devices.
 
 Required coverage:
@@ -888,8 +893,9 @@ host-tested. No kernel bootstrap code is removed before Stage J closes.
 | B.3 Legacy access planner | Complete | common-subset plans; kernel shim migrated |
 | C.1 MCFG decoding | In progress | policy parser complete; live ACPI handoff/QEMU open |
 | C.2 Root descriptor ABI | In progress | bounded wire format complete; AML producer open |
+| D.1 Topology snapshots | In progress | policy graph complete; live enumeration/publication open |
 | D.2 Capability parsing | Complete (policy) | bounded conventional/extended decoders; NVMe bootstrap hardened |
-| B.4, C.3, D.1, D.3–O | Not started | no production claim |
+| B.4, C.3, D.3–O | Not started | no production claim |
 
 Update this table in every PCI stage PR. A track may be marked complete only
 with its exit criterion and verification command/log named in the PR.
