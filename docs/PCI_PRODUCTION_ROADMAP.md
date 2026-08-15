@@ -346,7 +346,7 @@ Exit criterion:
 
 # Stage D — Topology and capability enumeration
 
-Status: **NOT STARTED**
+Status: **IN PROGRESS**
 
 ## D.1 Read-only userspace enumeration
 
@@ -367,6 +367,11 @@ Exit criterion:
 - QEMU and synthetic topology dumps are deterministic and generation tagged.
 
 ## D.2 Capability parsing
+
+Implementation status: **complete (policy core) in PCI-4**. Conventional and
+PCIe extended lists share bounded checked decoders; the current NVMe bootstrap
+now rejects malformed or duplicate interrupt capabilities rather than using a
+partial view. Live ECAM inventory integration remains part of D.1/H.2.
 
 Extend current MSI/MSI-X parsing to conventional and ECAM-only extended
 capabilities.
@@ -883,7 +888,8 @@ host-tested. No kernel bootstrap code is removed before Stage J closes.
 | B.3 Legacy access planner | Complete | common-subset plans; kernel shim migrated |
 | C.1 MCFG decoding | In progress | policy parser complete; live ACPI handoff/QEMU open |
 | C.2 Root descriptor ABI | In progress | bounded wire format complete; AML producer open |
-| B.4, C.3–O | Not started | no production claim |
+| D.2 Capability parsing | Complete (policy) | bounded conventional/extended decoders; NVMe bootstrap hardened |
+| B.4, C.3, D.1, D.3–O | Not started | no production claim |
 
 Update this table in every PCI stage PR. A track may be marked complete only
 with its exit criterion and verification command/log named in the PR.
