@@ -2405,7 +2405,13 @@ impl<
             0,
             ROOT_STATE_CLEAN,
         );
-        self.write_journaled_target(
+        // The final clean root is journal data, not an ordinary target at
+        // this stage. Writing it to LBA 0 here would publish the new
+        // checkpoint before the RECOVERING marker is durable, so a power loss
+        // could expose a clean root whose target writes have not reached
+        // stable media. Keep the old clean root authoritative until the
+        // journal is flushed and RECOVERING has been published.
+        self.write_deferred_journal_target(
             0,
             &final_superblock,
             sequence,
@@ -5273,8 +5279,65 @@ impl<
         flags: u32,
     ) -> FixedResult<()> {
         self.store.write_blocks(target_lba, 1, block)?;
-        let metadata_lba = journal_start_lba + u64::from(record_index) * 2;
-        let data_lba = metadata_lba + 1;
+        self.write_journal_copy(
+            target_lba,
+            block,
+            sequence,
+            record_index,
+            record_count,
+            journal_start_lba,
+            final_checkpoint_lba,
+            flags,
+        )
+    }
+
+    /// Write a journal record and its full target copy without applying the
+    /// target yet. Used for the final clean superblock so LBA 0 remains the old
+    /// clean root until the RECOVERING marker has become durable.
+    #[allow(clippy::too_many_arguments)]
+    fn write_deferred_journal_target(
+        &mut self,
+        target_lba: u64,
+        block: &[u8; BLOCK_SIZE],
+        sequence: u64,
+        record_index: u32,
+        record_count: u32,
+        journal_start_lba: u64,
+        final_checkpoint_lba: u64,
+        flags: u32,
+    ) -> FixedResult<()> {
+        self.write_journal_copy(
+            target_lba,
+            block,
+            sequence,
+            record_index,
+            record_count,
+            journal_start_lba,
+            final_checkpoint_lba,
+            flags,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn write_journal_copy(
+        &mut self,
+        target_lba: u64,
+        block: &[u8; BLOCK_SIZE],
+        sequence: u64,
+        record_index: u32,
+        record_count: u32,
+        journal_start_lba: u64,
+        final_checkpoint_lba: u64,
+        flags: u32,
+    ) -> FixedResult<()> {
+        let metadata_lba = journal_start_lba
+            .checked_add(
+                u64::from(record_index)
+                    .checked_mul(2)
+                    .ok_or(HxfsError::NoSpace)?,
+            )
+            .ok_or(HxfsError::NoSpace)?;
+        let data_lba = metadata_lba.checked_add(1).ok_or(HxfsError::NoSpace)?;
         let journal = build_journal_record_block(
             sequence,
             record_index,
@@ -5626,10 +5689,10 @@ mod tests {
     /// Store that simulates power loss immediately before the final clean
     /// superblock is republished.
     ///
-    /// `publish_checkpoint` writes LBA 0 three times: first as the journal's
-    /// fully prepared final target, then as the durable RECOVERING root, and
-    /// finally as the clean commit point. Refusing the third write leaves the
-    /// exact image that a power cut after the RECOVERING flush would leave.
+    /// `publish_checkpoint` writes LBA 0 twice: first as the durable
+    /// RECOVERING root, then as the clean commit point. Refusing the second
+    /// write leaves the exact image that a power cut after the RECOVERING flush
+    /// would leave.
     struct FailFinalSuperblockStore {
         inner: MemStore,
         lba_zero_writes: u32,
@@ -5654,7 +5717,7 @@ mod tests {
         fn write_blocks(&mut self, lba: u64, blocks: u32, input: &[u8]) -> Result<(), HxfsError> {
             if lba == 0 {
                 self.lba_zero_writes = self.lba_zero_writes.saturating_add(1);
-                if self.lba_zero_writes == 3 {
+                if self.lba_zero_writes == 2 {
                     return Err(HxfsError::Io);
                 }
             }
@@ -5663,6 +5726,239 @@ mod tests {
 
         fn flush(&mut self) -> Result<(), HxfsError> {
             self.inner.flush()
+        }
+    }
+
+    /// Records every superblock state submitted to LBA 0 during a
+    /// checkpoint. The initial image is installed before this wrapper is
+    /// created, so the trace contains publication writes only.
+    struct RootTraceStore {
+        inner: MemStore,
+        root_states: Vec<u32>,
+    }
+
+    impl RootTraceStore {
+        fn new(inner: MemStore) -> Self {
+            Self {
+                inner,
+                root_states: Vec::new(),
+            }
+        }
+    }
+
+    impl BlockReader for RootTraceStore {
+        fn read_blocks(&mut self, lba: u64, blocks: u32, out: &mut [u8]) -> Result<(), HxfsError> {
+            self.inner.read_blocks(lba, blocks, out)
+        }
+    }
+
+    impl BlockStore for RootTraceStore {
+        fn write_blocks(&mut self, lba: u64, blocks: u32, input: &[u8]) -> Result<(), HxfsError> {
+            if lba == 0 && blocks == 1 {
+                let state_offset = HEADER_BYTES + 112;
+                let state = input
+                    .get(state_offset..state_offset + 4)
+                    .and_then(|bytes| bytes.try_into().ok())
+                    .map(u32::from_le_bytes)
+                    .ok_or(HxfsError::BadBlock)?;
+                self.root_states.push(state);
+            }
+            self.inner.write_blocks(lba, blocks, input)
+        }
+
+        fn flush(&mut self) -> Result<(), HxfsError> {
+            self.inner.flush()
+        }
+    }
+
+    /// Fails before one selected checkpoint write/flush operation. Writes that
+    /// completed before the failure remain visible, modelling the strongest
+    /// persistence case; recovery must still produce a complete old or new
+    /// state rather than a mixture.
+    struct CrashStore {
+        inner: MemStore,
+        fail_at: Option<usize>,
+        operation: usize,
+    }
+
+    impl CrashStore {
+        fn new(inner: MemStore) -> Self {
+            Self {
+                inner,
+                fail_at: None,
+                operation: 0,
+            }
+        }
+
+        fn arm(&mut self, fail_at: Option<usize>) {
+            self.fail_at = fail_at;
+            self.operation = 0;
+        }
+
+        fn before_operation(&mut self) -> FixedResult<()> {
+            let current = self.operation;
+            self.operation = self.operation.saturating_add(1);
+            if self.fail_at == Some(current) {
+                Err(HxfsError::Io)
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    impl BlockReader for CrashStore {
+        fn read_blocks(&mut self, lba: u64, blocks: u32, out: &mut [u8]) -> Result<(), HxfsError> {
+            self.inner.read_blocks(lba, blocks, out)
+        }
+    }
+
+    impl BlockStore for CrashStore {
+        fn write_blocks(&mut self, lba: u64, blocks: u32, input: &[u8]) -> Result<(), HxfsError> {
+            self.before_operation()?;
+            self.inner.write_blocks(lba, blocks, input)
+        }
+
+        fn flush(&mut self) -> Result<(), HxfsError> {
+            self.before_operation()?;
+            self.inner.flush()
+        }
+    }
+
+    #[test]
+    fn checkpoint_publishes_recovering_before_the_new_clean_root() {
+        let Ok(seed) = HxfsWriter::new(INSTANCE, VOLUME) else {
+            assert!(false, "seed writer should initialize");
+            return;
+        };
+        let store = RootTraceStore::new(MemStore::from_image_with_blocks(seed.image(), 4096));
+        let Ok(mut fs) = FixedHxfsWriter::<RootTraceStore, 16, 32, 32>::mount(store) else {
+            assert!(false, "fixed writer should mount");
+            return;
+        };
+        let Ok(file) = fs.create_file_path("/atomic.bin") else {
+            assert!(false, "file creation should succeed");
+            return;
+        };
+        assert!(fs.write_file_at(file, 0, b"new state").is_ok());
+        assert!(fs.publish_checkpoint().is_ok());
+        let store = fs.into_store();
+        assert_eq!(
+            store.root_states.as_slice(),
+            &[ROOT_STATE_RECOVERING, ROOT_STATE_CLEAN],
+            "the old clean root must remain authoritative until RECOVERING is published"
+        );
+    }
+
+    #[test]
+    fn every_checkpoint_operation_failure_recovers_one_complete_version() {
+        fn execute(
+            image: &[u8],
+            fail_at: Option<usize>,
+        ) -> FixedResult<(FixedResult<u64>, CrashStore)> {
+            let store = CrashStore::new(MemStore::from_image_with_blocks(image, 4096));
+            let mut fs = FixedHxfsWriter::<CrashStore, 16, 32, 64>::mount(store)?;
+            let state = fs.open_path("/state.bin")?;
+            let _ = fs.write_file_at(state, 0, b"new-state")?;
+            fs.unlink_path("/delete.bin")?;
+            let created = fs.create_file_path("/new.bin")?;
+            let _ = fs.write_file_at(created, 0, b"created")?;
+            fs.store_mut().arm(fail_at);
+            let result = fs.publish_checkpoint();
+            Ok((result, fs.into_store()))
+        }
+
+        fn read_path(
+            fs: &mut FixedHxfsWriter<MemStore, 16, 32, 64>,
+            path: &str,
+        ) -> Option<Vec<u8>> {
+            let file = fs.open_path(path).ok()?;
+            let mut buffer = [0u8; 32];
+            let read = fs.read_file_at(file, 0, &mut buffer).ok()?;
+            Some(buffer[..read].to_vec())
+        }
+
+        fn inspect(mut store: MemStore) -> FixedResult<(u32, u64, bool, bool)> {
+            let root_before_recovery = read_superblock(&mut store, 0)?;
+            if root_before_recovery.root_state == ROOT_STATE_RECOVERING {
+                let _ = crate::recovery::replay_journal(&mut store)?;
+            }
+            let mut fs = FixedHxfsWriter::<MemStore, 16, 32, 64>::mount(store)?;
+            let keep = read_path(&mut fs, "/keep.bin");
+            let state = read_path(&mut fs, "/state.bin");
+            let deleted = read_path(&mut fs, "/delete.bin");
+            let created = read_path(&mut fs, "/new.bin");
+            let stable_ok = keep.as_deref() == Some(b"stable".as_slice());
+            let old = stable_ok
+                && state.as_deref() == Some(b"old-state".as_slice())
+                && deleted.as_deref() == Some(b"delete-me".as_slice())
+                && created.is_none();
+            let new = stable_ok
+                && state.as_deref() == Some(b"new-state".as_slice())
+                && deleted.is_none()
+                && created.as_deref() == Some(b"created".as_slice());
+            Ok((
+                root_before_recovery.root_state,
+                root_before_recovery.sequence_number,
+                old,
+                new,
+            ))
+        }
+
+        let Ok(mut seed) = HxfsWriter::new(INSTANCE, VOLUME) else {
+            assert!(false, "seed writer should initialize");
+            return;
+        };
+        assert!(seed.create_file("/keep.bin", b"stable").is_ok());
+        assert!(seed.create_file("/state.bin", b"old-state").is_ok());
+        assert!(seed.create_file("/delete.bin", b"delete-me").is_ok());
+        assert!(seed.commit().is_ok());
+        let image = seed.image().to_vec();
+        let mut initial_store = MemStore::from_image_with_blocks(&image, 4096);
+        let Ok(initial_root) = read_superblock(&mut initial_store, 0) else {
+            assert!(false, "initial root should decode");
+            return;
+        };
+
+        let Ok((successful, successful_store)) = execute(&image, None) else {
+            assert!(false, "successful checkpoint setup should run");
+            return;
+        };
+        assert!(successful.is_ok());
+        let operation_count = successful_store.operation;
+        let Ok((state, sequence, old, new)) = inspect(successful_store.inner) else {
+            assert!(false, "successful checkpoint should inspect");
+            return;
+        };
+        assert_eq!(state, ROOT_STATE_CLEAN);
+        assert_eq!(sequence, initial_root.sequence_number + 1);
+        assert!(!old && new, "successful checkpoint must publish only B");
+
+        for fail_at in 0..operation_count {
+            let Ok((result, failed_store)) = execute(&image, Some(fail_at)) else {
+                assert!(false, "checkpoint setup failed at operation {fail_at}");
+                return;
+            };
+            assert_eq!(
+                result,
+                Err(HxfsError::Io),
+                "operation {fail_at} was not reached"
+            );
+            let Ok((root_state, sequence, old, new)) = inspect(failed_store.inner) else {
+                assert!(false, "failure {fail_at} left an unrecoverable image");
+                return;
+            };
+            assert!(
+                old ^ new,
+                "failure {fail_at} produced a mixed state: old={old} new={new}"
+            );
+            if root_state == ROOT_STATE_CLEAN && sequence == initial_root.sequence_number {
+                assert!(old, "old clean root must expose A at failure {fail_at}");
+            } else {
+                assert!(
+                    new,
+                    "RECOVERING/new clean root must converge to B at failure {fail_at}"
+                );
+            }
         }
     }
 
@@ -5730,7 +6026,7 @@ mod tests {
 
         assert_eq!(fs.publish_checkpoint(), Err(HxfsError::Io));
         let failed_store = fs.into_store();
-        assert_eq!(failed_store.lba_zero_writes, 3);
+        assert_eq!(failed_store.lba_zero_writes, 2);
         let mut store = failed_store.inner;
         let Ok(recovering) = read_superblock(&mut store, 0) else {
             assert!(false, "the durable recovering root should decode");
@@ -5810,7 +6106,7 @@ mod tests {
             "the fault store must cut power before the final clean root"
         );
         let failed_store = fs.into_store();
-        assert_eq!(failed_store.lba_zero_writes, 3);
+        assert_eq!(failed_store.lba_zero_writes, 2);
         let mut store = failed_store.inner;
         let Ok(recovering) = read_superblock(&mut store, 0) else {
             assert!(false, "the durable recovering root should decode");
