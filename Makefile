@@ -8,7 +8,7 @@ CARGO_BUILD := cargo build -p huesos-boot $(CARGO_FLAGS)
 
 ISO := build/huesos.iso
 
-.PHONY: all build build-release run run-release iso iso-release clean fmt fmt-check test policy-check storage-gate audit audit-check bench-check clippy
+.PHONY: all build build-release run run-release iso iso-release clean fmt fmt-check test test-hxfs-features policy-check storage-gate audit audit-check bench-check clippy
 
 all: build
 
@@ -54,6 +54,15 @@ test:
 		-p huesos-quota \
 		-p huesos-tpm \
 		--target x86_64-unknown-linux-gnu -Z build-std=
+
+# The ordinary host suite builds huesos-hxfs without optional engines. This
+# second gate is the production storage composition used by the encrypted
+# NVMe soak: encryption + compression + Hxblob must work together, not only as
+# three independently green feature sets.
+test-hxfs-features:
+	RUST_MIN_STACK=16777216 cargo test -p huesos-hxfs \
+		--target x86_64-unknown-linux-gnu -Z build-std= \
+		--no-default-features --features crypto-aes-gcm,compression-engines,hxblob
 
 audit:
 	python3 tools/audit-safety.py
