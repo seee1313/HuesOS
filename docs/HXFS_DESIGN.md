@@ -1000,8 +1000,17 @@ Properties:
 - uses no `alloc` in the production module;
 - serves the canonical `huesos_abi::hxfs` native request/response protocol;
 - supports explicit checkpoint/fsync publication through the v2 journal;
+- keeps the old clean LBA-0 root authoritative while fresh COW targets and the
+  complete journal are flushed; the new clean root is staged as journal data
+  only, then publication proceeds `RECOVERING -> flush -> CLEAN -> flush`;
 - keeps the legacy read-only string commands for compatibility while native
   clients move to the ABI path.
+
+The checkpoint contract is atomic at the filesystem version level. A crash
+before `RECOVERING` is submitted exposes the complete old checkpoint. A
+persisted `RECOVERING` root replays to the complete new checkpoint; a persisted
+new clean root exposes it directly. Host fault injection stops before every
+write and flush in the fixed writer and rejects any old/new mixture.
 
 Initial fixed-capacity `hxfs-service` limits:
 

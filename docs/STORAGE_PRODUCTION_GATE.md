@@ -73,6 +73,33 @@ a plain file and an Hxblob payload. The Hxblob case crosses the single-leaf
 index capacity so root-plus-leaves geometry is covered. This focused host proof
 complements, but does not replace, the QEMU power-fail gate above.
 
+### Atomic checkpoint publication boundary
+
+Hxfs uses the strict old-before-`RECOVERING` contract. Copy-on-write targets and
+all journal metadata/data copies are written and flushed while LBA 0 remains the
+old clean root. The new clean superblock is present only as the final journal
+payload at this stage; it is deliberately not applied through the ordinary
+target-write path. Publication order is:
+
+```text
+write fresh COW targets + complete journal (final clean root is journal data only)
+flush
+write RECOVERING root pointing to the old checkpoint and complete journal
+flush
+write new CLEAN root
+flush
+```
+
+Therefore a failure before the `RECOVERING` write leaves the old version
+reachable. A persisted `RECOVERING` root replays to the complete new version,
+and a persisted new clean root exposes the complete new version directly. A
+host crash matrix fails before every individual checkpoint write and flush,
+then replays/remounts the resulting image and requires one complete version:
+unchanged file plus either all old mutations or all new mutations, never a
+mixture. A separate root-write trace requires the only publication sequence to
+be exactly `RECOVERING -> CLEAN`; the historical premature `CLEAN -> RECOVERING
+-> CLEAN` sequence is rejected.
+
 (The second soak invocation is the Stage B.5 fault-injection gate:
 seeded encrypted+compressed volume with a flipped GCM bit; the
 trace must show `[hxfs] bad-gcm-tag-marked` and

@@ -39,7 +39,10 @@ This runs, e.g.:
   after the `RECOVERING` root is durable but before the final clean root,
   replay the journal, remount, and verify payload bytes. The Hxblob case uses a
   multi-leaf index so its two extra journal records and leaf geometry cannot be
-  omitted by a clean-path-only test.
+  omitted by a clean-path-only test. The root publication trace must be exactly
+  `RECOVERING -> CLEAN`, and an exhaustive host matrix fails before every
+  checkpoint write/flush operation, then requires a complete old or complete
+  new filesystem state after replay — never mixed metadata.
 - The host-testable **policy crates** (`huesos-lifecycle`, `huesos-ioapic`,
   `huesos-extable`, `huesos-waitset`, `huesos-proclife`, `huesos-handlemove`)
   are pure decision/encoding models with focused host suites: lifecycle
