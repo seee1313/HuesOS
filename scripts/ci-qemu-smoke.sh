@@ -63,6 +63,8 @@ for marker in \
     '[driver-host:input] keyboard IRQ bound to Port' \
     '[shutdown-broker] ready' \
     '[acpi-manager] broker deny-by-default self-test OK' \
+    '[pci-manager] ready without root descriptors; fail-closed' \
+    '[driver-manager] PCI manager ready (no roots; fail-closed)' \
     '[init] launched terminal' \
     '[terminal] keyboard service online, starting shell' \
     '[init] stage selftest ok' \
@@ -89,6 +91,9 @@ done
 for regression in \
     '[driver-manager] input DriverHost did not become ready in time' \
     '[driver-manager] keyboard service requested before ready' \
+    '[driver-manager] PCI manager restart budget exhausted' \
+    '[driver-manager] malformed PCI manager control message' \
+    '[pci-manager] PANIC' \
     '[init] shutdown-broker: IoPort resource mint failed' \
     '[init] shutdown-broker: PowerControl mint failed' \
     '[terminal] failed to open keyboard service' \

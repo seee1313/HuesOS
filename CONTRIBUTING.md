@@ -94,7 +94,7 @@ or move the test to a downstream crate that is allowed to allocate. See
 ## 1b. Formatting is enforced across kernel and userspace (hard gate)
 
 `cargo fmt --all` on the root workspace formats the 25 kernel/library crates
-listed in the root `Cargo.toml`. It does **not** touch the 8 standalone
+listed in the root `Cargo.toml`. It does **not** touch the standalone
 userspace crates under `crates/huesos-userspace/` — they are intentionally
 excluded from the workspace (they target ring-3 with their own linker
 script and are built by `huesos-kernel/build.rs`).
