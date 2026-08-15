@@ -454,9 +454,15 @@ Exit criterion:
 
 # Stage F — Firmware-preserving resource planner
 
-Status: **NOT STARTED**
+Status: **IN PROGRESS**
 
 ## F.1 Pure allocation model
+
+Implementation status: PCI-7 lands deterministic firmware-preserving
+allocation for pre-sized BAR/window requirements, including parent-domain
+placement, translation, fixed-resource preservation, and no-space refusal.
+Bottom-up requirement aggregation and configurable hotplug reserves remain
+open.
 
 Input is a topology snapshot, root apertures, resource requirements, and fixed
 assignments. Output is an immutable plan; hardware is never touched.
@@ -901,7 +907,8 @@ host-tested. No kernel bootstrap code is removed before Stage J closes.
 | D.1 Topology snapshots | In progress | policy graph complete; live enumeration/publication open |
 | D.2 Capability parsing | Complete (policy) | bounded conventional/extended decoders; NVMe bootstrap hardened |
 | E.2 Firmware assignment validator | Complete (policy) | translated status report + overlap/forwarding checks |
-| B.4, C.3, D.3, E.1, F–O | Not started | no production claim |
+| F.1 Firmware-preserving allocator | In progress | deterministic pre-sized planning complete; aggregation/reserves open |
+| B.4, C.3, D.3, E.1, F.2–O | Not started | no production claim |
 
 Update this table in every PCI stage PR. A track may be marked complete only
 with its exit criterion and verification command/log named in the PR.
