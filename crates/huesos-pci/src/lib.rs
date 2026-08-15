@@ -31,6 +31,12 @@ pub enum ConfigError {
     DeviceOutOfRange,
     /// Function number is outside the base-profile `0..8` range.
     FunctionOutOfRange,
+    /// Bus range is inverted or otherwise malformed.
+    InvalidBusRange,
+    /// Addressed bus is not covered by the selected root/window.
+    BusOutOfRange,
+    /// Physical config-window base violates backend alignment.
+    MisalignedBase,
     /// Access starts or ends outside the selected configuration space.
     OffsetOutOfRange,
     /// Offset is not naturally aligned for the access width.
@@ -196,6 +202,224 @@ impl ConfigOffset {
     /// Exclusive end offset.
     pub const fn end(self) -> u16 {
         self.value + self.width.bytes()
+    }
+}
+
+/// Bytes reserved by ECAM for one bus (32 devices × 8 functions × 4 KiB).
+pub const ECAM_BUS_BYTES: u64 = 1 << 20;
+/// Bytes reserved by ECAM for one device on a bus.
+pub const ECAM_DEVICE_BYTES: u64 = 1 << 15;
+/// Bytes reserved by ECAM for one function.
+pub const ECAM_FUNCTION_BYTES: u64 = 1 << 12;
+/// PCI Configuration Mechanism #1 address port.
+pub const LEGACY_CONFIG_ADDRESS_PORT: u16 = 0x0cf8;
+/// PCI Configuration Mechanism #1 data port.
+pub const LEGACY_CONFIG_DATA_PORT: u16 = 0x0cfc;
+
+/// One validated PCI Express ECAM allocation window.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct EcamRegion {
+    base: u64,
+    segment: u16,
+    start_bus: u8,
+    end_bus: u8,
+    end_exclusive: u64,
+}
+
+impl EcamRegion {
+    /// Construct a checked ECAM region.
+    ///
+    /// `base` names configuration page zero for `start_bus`, matching the ACPI
+    /// MCFG allocation record semantics.
+    pub const fn try_new(
+        base: u64,
+        segment: u16,
+        start_bus: u8,
+        end_bus: u8,
+    ) -> Result<Self, ConfigError> {
+        if start_bus > end_bus {
+            return Err(ConfigError::InvalidBusRange);
+        }
+        if !base.is_multiple_of(ECAM_BUS_BYTES) {
+            return Err(ConfigError::MisalignedBase);
+        }
+        let bus_count = (end_bus as u64) - (start_bus as u64) + 1;
+        let Some(span) = bus_count.checked_mul(ECAM_BUS_BYTES) else {
+            return Err(ConfigError::AddressOverflow);
+        };
+        let Some(end_exclusive) = base.checked_add(span) else {
+            return Err(ConfigError::AddressOverflow);
+        };
+        Ok(Self {
+            base,
+            segment,
+            start_bus,
+            end_bus,
+            end_exclusive,
+        })
+    }
+
+    /// Physical base of the ECAM window.
+    pub const fn base(self) -> u64 {
+        self.base
+    }
+
+    /// PCI segment group served by this region.
+    pub const fn segment(self) -> u16 {
+        self.segment
+    }
+
+    /// First bus served by this region.
+    pub const fn start_bus(self) -> u8 {
+        self.start_bus
+    }
+
+    /// Last bus served by this region, inclusive.
+    pub const fn end_bus(self) -> u8 {
+        self.end_bus
+    }
+
+    /// Exclusive physical end of the ECAM window.
+    pub const fn end_exclusive(self) -> u64 {
+        self.end_exclusive
+    }
+
+    /// Whether the region can address this PCI function.
+    pub const fn contains(self, address: PciAddress) -> bool {
+        address.segment() == self.segment
+            && address.bus() >= self.start_bus
+            && address.bus() <= self.end_bus
+    }
+
+    /// Plan one checked ECAM access without dereferencing physical memory.
+    pub const fn plan(
+        self,
+        address: PciAddress,
+        offset: ConfigOffset,
+    ) -> Result<EcamAccessPlan, ConfigError> {
+        if address.segment() != self.segment {
+            return Err(ConfigError::UnsupportedSegment);
+        }
+        if address.bus() < self.start_bus || address.bus() > self.end_bus {
+            return Err(ConfigError::BusOutOfRange);
+        }
+        if offset.end() > ENHANCED_CONFIG_BYTES {
+            return Err(ConfigError::OffsetOutOfRange);
+        }
+
+        let bus_index = (address.bus() as u64) - (self.start_bus as u64);
+        let Some(bus_offset) = bus_index.checked_mul(ECAM_BUS_BYTES) else {
+            return Err(ConfigError::AddressOverflow);
+        };
+        let Some(device_offset) = (address.device() as u64).checked_mul(ECAM_DEVICE_BYTES) else {
+            return Err(ConfigError::AddressOverflow);
+        };
+        let Some(function_offset) = (address.function() as u64).checked_mul(ECAM_FUNCTION_BYTES)
+        else {
+            return Err(ConfigError::AddressOverflow);
+        };
+        let Some(after_bus) = self.base.checked_add(bus_offset) else {
+            return Err(ConfigError::AddressOverflow);
+        };
+        let Some(after_device) = after_bus.checked_add(device_offset) else {
+            return Err(ConfigError::AddressOverflow);
+        };
+        let Some(after_function) = after_device.checked_add(function_offset) else {
+            return Err(ConfigError::AddressOverflow);
+        };
+        let Some(physical_address) = after_function.checked_add(offset.value() as u64) else {
+            return Err(ConfigError::AddressOverflow);
+        };
+        let Some(access_end) = physical_address.checked_add(offset.width().bytes() as u64) else {
+            return Err(ConfigError::AddressOverflow);
+        };
+        if access_end > self.end_exclusive {
+            return Err(ConfigError::AddressOverflow);
+        }
+        Ok(EcamAccessPlan {
+            physical_address,
+            width: offset.width(),
+        })
+    }
+}
+
+/// Physical ECAM access produced by [`EcamRegion::plan`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct EcamAccessPlan {
+    physical_address: u64,
+    width: ConfigWidth,
+}
+
+impl EcamAccessPlan {
+    /// Physical address to access through an uncached ECAM mapping.
+    pub const fn physical_address(self) -> u64 {
+        self.physical_address
+    }
+
+    /// Access width.
+    pub const fn width(self) -> ConfigWidth {
+        self.width
+    }
+}
+
+/// One PCI Configuration Mechanism #1 cycle plan.
+///
+/// The hardware transport performs a dword access through CF8/CFC. Byte and
+/// word operations use [`Self::extract`] and [`Self::merge`] so unrelated
+/// lanes are preserved.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LegacyConfigPlan {
+    address_register: u32,
+    shift: u8,
+    width: ConfigWidth,
+}
+
+impl LegacyConfigPlan {
+    /// Build a checked segment-0 conventional-config access plan.
+    pub const fn try_new(address: PciAddress, offset: ConfigOffset) -> Result<Self, ConfigError> {
+        if address.segment() != 0 {
+            return Err(ConfigError::UnsupportedSegment);
+        }
+        if offset.end() > CONVENTIONAL_CONFIG_BYTES {
+            return Err(ConfigError::UnsupportedAccess);
+        }
+        let aligned_offset = offset.value() & !0x3;
+        let address_register = 0x8000_0000
+            | ((address.bus() as u32) << 16)
+            | ((address.device() as u32) << 11)
+            | ((address.function() as u32) << 8)
+            | (aligned_offset as u32);
+        Ok(Self {
+            address_register,
+            shift: ((offset.value() & 0x3) * 8) as u8,
+            width: offset.width(),
+        })
+    }
+
+    /// Value written to port [`LEGACY_CONFIG_ADDRESS_PORT`].
+    pub const fn address_register(self) -> u32 {
+        self.address_register
+    }
+
+    /// Data port used for the aligned dword cycle.
+    pub const fn data_port(self) -> u16 {
+        LEGACY_CONFIG_DATA_PORT
+    }
+
+    /// Access width requested by the caller.
+    pub const fn width(self) -> ConfigWidth {
+        self.width
+    }
+
+    /// Extract the requested byte/word/dword from one CFC dword read.
+    pub const fn extract(self, dword: u32) -> u32 {
+        (dword >> self.shift) & self.width.value_mask()
+    }
+
+    /// Merge a byte/word/dword into a previously read CFC dword.
+    pub const fn merge(self, original: u32, value: u32) -> u32 {
+        let shifted_mask = self.width.value_mask() << self.shift;
+        (original & !shifted_mask) | ((value << self.shift) & shifted_mask)
     }
 }
 
@@ -735,6 +959,201 @@ mod tests {
             ConfigOffset::try_new(0x100, ConfigWidth::Dword, ConfigSpaceKind::Conventional),
             Err(ConfigError::OffsetOutOfRange)
         );
+    }
+
+    #[test]
+    fn ecam_region_validates_alignment_range_and_overflow() {
+        assert_eq!(
+            EcamRegion::try_new(0xE000_0001, 0, 0, 0),
+            Err(ConfigError::MisalignedBase)
+        );
+        assert_eq!(
+            EcamRegion::try_new(0xE000_0000, 0, 8, 7),
+            Err(ConfigError::InvalidBusRange)
+        );
+        let overflowing_base = u64::MAX & !(ECAM_BUS_BYTES - 1);
+        assert_eq!(
+            EcamRegion::try_new(overflowing_base, 0, 0, 0),
+            Err(ConfigError::AddressOverflow)
+        );
+    }
+
+    #[test]
+    fn ecam_plan_uses_region_relative_bus_number() {
+        let Ok(region) = EcamRegion::try_new(0x8000_0000, 7, 32, 47) else {
+            assert!(false, "valid ECAM region should construct");
+            return;
+        };
+        let Ok(address) = PciAddress::try_new(7, 34, 3, 4) else {
+            assert!(false, "valid PCI address should construct");
+            return;
+        };
+        let Ok(offset) =
+            ConfigOffset::try_new(0x234, ConfigWidth::Dword, ConfigSpaceKind::Enhanced)
+        else {
+            assert!(false, "valid enhanced offset should construct");
+            return;
+        };
+        let Ok(plan) = region.plan(address, offset) else {
+            assert!(false, "address inside region should plan");
+            return;
+        };
+        let expected = 0x8000_0000
+            + 2 * ECAM_BUS_BYTES
+            + 3 * ECAM_DEVICE_BYTES
+            + 4 * ECAM_FUNCTION_BYTES
+            + 0x234;
+        assert_eq!(plan.physical_address(), expected);
+        assert_eq!(plan.width(), ConfigWidth::Dword);
+        assert!(region.contains(address));
+    }
+
+    #[test]
+    fn ecam_plan_rejects_wrong_segment_and_bus() {
+        let Ok(region) = EcamRegion::try_new(0x9000_0000, 3, 64, 79) else {
+            assert!(false, "valid ECAM region should construct");
+            return;
+        };
+        let Ok(offset) = ConfigOffset::try_new(0, ConfigWidth::Dword, ConfigSpaceKind::Enhanced)
+        else {
+            assert!(false, "zero dword offset should construct");
+            return;
+        };
+        let Ok(wrong_segment) = PciAddress::try_new(4, 64, 0, 0) else {
+            assert!(false, "valid address should construct");
+            return;
+        };
+        assert_eq!(
+            region.plan(wrong_segment, offset),
+            Err(ConfigError::UnsupportedSegment)
+        );
+        let Ok(wrong_bus) = PciAddress::try_new(3, 80, 0, 0) else {
+            assert!(false, "valid address should construct");
+            return;
+        };
+        assert_eq!(
+            region.plan(wrong_bus, offset),
+            Err(ConfigError::BusOutOfRange)
+        );
+    }
+
+    #[test]
+    fn ecam_plan_reaches_exact_last_function_byte() {
+        let Ok(region) = EcamRegion::try_new(0xA000_0000, 0, 0, 0) else {
+            assert!(false, "single-bus ECAM region should construct");
+            return;
+        };
+        let Ok(address) = PciAddress::try_new(0, 0, 31, 7) else {
+            assert!(false, "last function should construct");
+            return;
+        };
+        let Ok(offset) = ConfigOffset::try_new(4095, ConfigWidth::Byte, ConfigSpaceKind::Enhanced)
+        else {
+            assert!(false, "last enhanced byte should construct");
+            return;
+        };
+        let Ok(plan) = region.plan(address, offset) else {
+            assert!(false, "last ECAM byte should plan");
+            return;
+        };
+        assert_eq!(plan.physical_address() + 1, region.end_exclusive());
+    }
+
+    #[test]
+    fn legacy_plan_encodes_cf8_and_preserves_subdword_lanes() {
+        let Ok(address) = PciAddress::try_new(0, 2, 3, 4) else {
+            assert!(false, "valid legacy address should construct");
+            return;
+        };
+        let Ok(offset) =
+            ConfigOffset::try_new(0x12, ConfigWidth::Word, ConfigSpaceKind::Conventional)
+        else {
+            assert!(false, "aligned word offset should construct");
+            return;
+        };
+        let Ok(plan) = LegacyConfigPlan::try_new(address, offset) else {
+            assert!(false, "segment-zero conventional access should plan");
+            return;
+        };
+        assert_eq!(
+            plan.address_register(),
+            0x8000_0000 | (2 << 16) | (3 << 11) | (4 << 8) | 0x10
+        );
+        assert_eq!(plan.data_port(), LEGACY_CONFIG_DATA_PORT);
+        assert_eq!(plan.extract(0xAABB_CCDD), 0xAABB);
+        assert_eq!(plan.merge(0x1122_3344, 0xABCD), 0xABCD_3344);
+    }
+
+    #[test]
+    fn legacy_plan_rejects_nonzero_segment_and_extended_offset() {
+        let Ok(offset) =
+            ConfigOffset::try_new(0, ConfigWidth::Dword, ConfigSpaceKind::Conventional)
+        else {
+            assert!(false, "zero dword offset should construct");
+            return;
+        };
+        let Ok(segment_one) = PciAddress::try_new(1, 0, 0, 0) else {
+            assert!(false, "valid nonzero-segment address should construct");
+            return;
+        };
+        assert_eq!(
+            LegacyConfigPlan::try_new(segment_one, offset),
+            Err(ConfigError::UnsupportedSegment)
+        );
+
+        let Ok(segment_zero) = PciAddress::try_new(0, 0, 0, 0) else {
+            assert!(false, "valid segment-zero address should construct");
+            return;
+        };
+        let Ok(extended) =
+            ConfigOffset::try_new(0x100, ConfigWidth::Dword, ConfigSpaceKind::Enhanced)
+        else {
+            assert!(false, "enhanced offset should construct");
+            return;
+        };
+        assert_eq!(
+            LegacyConfigPlan::try_new(segment_zero, extended),
+            Err(ConfigError::UnsupportedAccess)
+        );
+    }
+
+    #[test]
+    fn ecam_and_legacy_plans_agree_on_common_function_offset() {
+        let Ok(address) = PciAddress::try_new(0, 5, 17, 2) else {
+            assert!(false, "common-subset address should construct");
+            return;
+        };
+        let Ok(offset) =
+            ConfigOffset::try_new(0x3c, ConfigWidth::Dword, ConfigSpaceKind::Conventional)
+        else {
+            assert!(false, "common-subset offset should construct");
+            return;
+        };
+        let Ok(ecam) = EcamRegion::try_new(0xB000_0000, 0, 0, 255) else {
+            assert!(false, "full segment-zero ECAM region should construct");
+            return;
+        };
+        let Ok(ecam_plan) = ecam.plan(address, offset) else {
+            assert!(false, "ECAM common access should plan");
+            return;
+        };
+        let Ok(legacy_plan) = LegacyConfigPlan::try_new(address, offset) else {
+            assert!(false, "legacy common access should plan");
+            return;
+        };
+        let ecam_relative = ecam_plan.physical_address() - ecam.base();
+        assert_eq!(
+            ecam_relative,
+            u64::from(address.bus()) * ECAM_BUS_BYTES
+                + u64::from(address.device()) * ECAM_DEVICE_BYTES
+                + u64::from(address.function()) * ECAM_FUNCTION_BYTES
+                + u64::from(offset.value())
+        );
+        let legacy = legacy_plan.address_register();
+        assert_eq!(((legacy >> 16) & 0xff) as u8, address.bus());
+        assert_eq!(((legacy >> 11) & 0x1f) as u8, address.device());
+        assert_eq!(((legacy >> 8) & 0x7) as u8, address.function());
+        assert_eq!((legacy & 0xfc) as u16, offset.value());
     }
 
     fn nvme_device() -> MockPciDevice {
