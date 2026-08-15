@@ -287,9 +287,13 @@ Exit criterion:
 
 # Stage C — Firmware and root-bridge discovery
 
-Status: **NOT STARTED**
+Status: **IN PROGRESS**
 
 ## C.1 MCFG archive path
+
+Implementation status: PCI-3 lands the bounded checksum/reserved/range/overlap
+parser and multi-segment ECAM records. Transport from the live ACPI service and
+QEMU evidence remain open.
 
 ACPI manager exports validated MCFG entries to the PCI Manager bootstrap.
 
@@ -308,6 +312,9 @@ Exit criterion:
 - malformed synthetic MCFG inputs fail without kernel fault.
 
 ## C.2 Root bridge descriptors
+
+Implementation status: PCI-3 lands the versioned bounded ABI for roots and
+translated apertures. Producing it from `_SEG`/`_BBN`/`_CRS` remains open.
 
 Resolve `_SEG`, `_BBN`, and `_CRS` into immutable root descriptors. MCFG is not
 used as an MMIO/BAR aperture source.
@@ -874,7 +881,9 @@ host-tested. No kernel bootstrap code is removed before Stage J closes.
 | B.1 Checked address vocabulary | Complete | PCI-1 types + PCI-2 bootstrap adoption |
 | B.2 ECAM access planner | Complete (policy) | checked region-relative plans and boundary tests |
 | B.3 Legacy access planner | Complete | common-subset plans; kernel shim migrated |
-| B.4–O | Not started | no production claim |
+| C.1 MCFG decoding | In progress | policy parser complete; live ACPI handoff/QEMU open |
+| C.2 Root descriptor ABI | In progress | bounded wire format complete; AML producer open |
+| B.4, C.3–O | Not started | no production claim |
 
 Update this table in every PCI stage PR. A track may be marked complete only
 with its exit criterion and verification command/log named in the PR.
