@@ -8,6 +8,7 @@ use crate::protocol;
 use crate::protocol::MANIFEST_GRANTS_COMPLETE_PREFIX;
 use crate::registry::{ServiceRegistry, ServiceState};
 use crate::volume_service::VolumeManagerService;
+use huesos_abi::pci_manager;
 use libcanvas::{hbi_boot, println, storage_boot, Channel, ErrorCode, Handle, Process, Vmo};
 
 /// Fallback embedded DriverHost image (same binary packaged into BOOTFS).
@@ -185,6 +186,12 @@ pub struct DriverManager {
     /// Id of the negative-case (absent hash) open request, if sent.
     package_probe_absent_request: Option<u64>,
     acpi_manager: Option<ManagedHost>,
+    /// Privileged userspace PCI Manager. PCI-9 starts it without physical
+    /// config authority; no-root readiness is explicitly fail-closed.
+    pci_manager: Option<ManagedHost>,
+    pci_manager_generation: u64,
+    pci_manager_restart: pci_manager::RestartBackoff,
+    pci_manager_ready: bool,
     acpi_tables: Option<Vmo>,
     acpi_broker: Option<Handle>,
     registry_channel: Option<Channel>,
@@ -228,6 +235,8 @@ const MAX_TRACKED_HOSTS: usize = 8;
 /// peer that eventually goes quiet, which the NVMe host under the
 /// high queue-depth soak is not.
 const POLL_BUDGET_PER_TICK: u32 = 64;
+const PCI_MANAGER_MAX_RESTARTS: u8 = 3;
+const PCI_MANAGER_RESTART_BASE_TICKS: u64 = 100;
 
 struct ManagedHost {
     process: Process,
@@ -323,6 +332,10 @@ impl DriverManager {
             package_probe_stream: None,
             package_probe_absent_request: None,
             acpi_manager: None,
+            pci_manager: None,
+            pci_manager_generation: 0,
+            pci_manager_restart: pci_manager::RestartBackoff::new(),
+            pci_manager_ready: false,
             acpi_tables: None,
             acpi_broker: None,
             registry_channel: None,
@@ -754,6 +767,8 @@ impl DriverManager {
             self.poll_hxfs_service();
             self.probe_package_resolving();
             self.poll_acpi_manager();
+            self.poll_pci_manager();
+            self.try_start_pci_manager();
             self.flush_storage_progress(&init_bootstrap);
             // Multi-channel poll: cannot block on one fd without starving others.
             // Yield cooperatively; hot IRQ path is already blocking in the host.
@@ -862,6 +877,88 @@ impl DriverManager {
         }
         println!("[driver-manager] launched read-only Hxfs service");
         self.hxfs_service = Some(ManagedHost { process, bootstrap });
+    }
+
+    fn try_start_pci_manager(&mut self) {
+        if self.pci_manager.is_some() || !self.bootfs_loaded {
+            return;
+        }
+        let now = libcanvas::system::monotonic_ticks().unwrap_or(0);
+        if !self
+            .pci_manager_restart
+            .can_attempt(now, PCI_MANAGER_MAX_RESTARTS)
+        {
+            return;
+        }
+        let Some(bootfs) = self.fs.bootfs() else {
+            return;
+        };
+        let Ok(Some(entry)) = bootfs.get_entry("/services/pci-manager.elf") else {
+            println!("[driver-manager] PCI manager ELF missing from BOOTFS");
+            self.schedule_pci_manager_restart();
+            return;
+        };
+        let Some(bootfs_vmo) = self.fs.vmo() else {
+            return;
+        };
+        let launched = libcanvas::process::spawn_elf_from_vmo(
+            "pci-manager",
+            bootfs_vmo,
+            entry.offset,
+            entry.len,
+        );
+        let Ok((process, bootstrap)) = launched else {
+            println!("[driver-manager] failed to launch PCI manager");
+            self.schedule_pci_manager_restart();
+            return;
+        };
+        let Some(generation) = self.pci_manager_generation.checked_add(1) else {
+            println!("[driver-manager] PCI manager generation exhausted; fail-closed");
+            self.pci_manager_restart.exhaust();
+            return;
+        };
+        self.pci_manager_generation = generation.max(1);
+        let mut message = [0u8; pci_manager::MESSAGE_BYTES];
+        let Some(length) = pci_manager::encode(
+            pci_manager::Message::hello(self.pci_manager_generation),
+            &mut message,
+        ) else {
+            println!("[driver-manager] PCI manager hello encode failed");
+            self.schedule_pci_manager_restart();
+            return;
+        };
+        if bootstrap.write(&message[..length]).is_err() {
+            println!("[driver-manager] PCI manager hello delivery failed");
+            self.schedule_pci_manager_restart();
+            return;
+        }
+        self.pci_manager_ready = false;
+        self.pci_manager = Some(ManagedHost { process, bootstrap });
+        println!(
+            "[driver-manager] launched restartable PCI manager generation {}",
+            self.pci_manager_generation
+        );
+    }
+
+    fn schedule_pci_manager_restart(&mut self) {
+        self.pci_manager = None;
+        self.pci_manager_ready = false;
+        let now = libcanvas::system::monotonic_ticks().unwrap_or(0);
+        if !self.pci_manager_restart.record_failure(
+            now,
+            PCI_MANAGER_MAX_RESTARTS,
+            PCI_MANAGER_RESTART_BASE_TICKS,
+        ) {
+            println!(
+                "[driver-manager] PCI manager restart budget exhausted; new PCI operations disabled"
+            );
+            return;
+        }
+        println!(
+            "[driver-manager] PCI manager unavailable; fail-closed restart {}/{} scheduled",
+            self.pci_manager_restart.failures(),
+            PCI_MANAGER_MAX_RESTARTS - 1
+        );
     }
 
     fn try_start_acpi_manager(&mut self) {
@@ -1090,6 +1187,7 @@ impl DriverManager {
                     // `docs/ARCHITECTURE_ROADMAP.md` §4.
                     self.try_start_pending_hosts();
                     self.try_start_acpi_manager();
+                    self.try_start_pci_manager();
                 }
                 Ok((n, Some(handle))) if &buf[..n] == protocol::ACPI_TABLES_VMO.as_bytes() => {
                     println!("[driver-manager] received immutable ACPI table archive");
@@ -1842,6 +1940,48 @@ impl DriverManager {
                     // busy-poll on the closed channel cannot resume.
                     return;
                 }
+            }
+        }
+    }
+
+    fn poll_pci_manager(&mut self) {
+        let Some(host) = self.pci_manager.take() else {
+            return;
+        };
+        let _keep_process_alive = &host.process;
+        let mut bytes = [0u8; pci_manager::MESSAGE_BYTES];
+        match host.bootstrap.read_into(&mut bytes) {
+            Ok(length) => {
+                let Some(message) = pci_manager::decode(&bytes[..length]) else {
+                    println!("[driver-manager] malformed PCI manager control message");
+                    self.schedule_pci_manager_restart();
+                    return;
+                };
+                if message.manager_generation != self.pci_manager_generation {
+                    println!("[driver-manager] stale PCI manager generation ignored");
+                    self.pci_manager = Some(host);
+                    return;
+                }
+                match (message.opcode, message.status) {
+                    (pci_manager::Opcode::Ready, pci_manager::Status::NoRootsFailClosed) => {
+                        self.pci_manager_ready = true;
+                        self.pci_manager_restart.record_ready();
+                        println!("[driver-manager] PCI manager ready (no roots; fail-closed)");
+                    }
+                    (pci_manager::Opcode::Heartbeat, _) => {}
+                    _ => println!("[driver-manager] unexpected PCI manager control message"),
+                }
+                self.pci_manager = Some(host);
+            }
+            Err(ErrorCode::ShouldWait) | Err(ErrorCode::TimedOut) => {
+                self.pci_manager = Some(host);
+            }
+            Err(error) => {
+                println!(
+                    "[driver-manager] PCI manager channel failed: {}; disabling new PCI operations",
+                    error.as_str()
+                );
+                self.schedule_pci_manager_restart();
             }
         }
     }
