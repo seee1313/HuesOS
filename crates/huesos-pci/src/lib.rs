@@ -15,6 +15,9 @@
 extern crate alloc;
 use alloc::vec::Vec;
 
+/// ACPI MCFG allocation-table decoding and validation.
+pub mod mcfg;
+
 /// Bytes in conventional PCI configuration space.
 pub const CONVENTIONAL_CONFIG_BYTES: u16 = 256;
 /// Bytes in PCI Express enhanced configuration space.
