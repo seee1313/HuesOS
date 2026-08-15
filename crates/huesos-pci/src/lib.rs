@@ -17,6 +17,8 @@ use alloc::vec::Vec;
 
 /// Bounded conventional and PCIe extended capability-list decoding.
 pub mod capability;
+/// Generation-safe DeviceLease lifecycle policy.
+pub mod lease;
 /// ACPI MCFG allocation-table decoding and validation.
 pub mod mcfg;
 /// Deterministic firmware-preserving BAR/window allocation plans.
