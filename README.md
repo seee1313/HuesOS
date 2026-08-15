@@ -172,8 +172,11 @@ hardening effort is tracked in
 [docs/UNSAFE_AUDIT.md](docs/UNSAFE_AUDIT.md),
 [docs/OBJECT_LIFECYCLE.md](docs/OBJECT_LIFECYCLE.md),
 [docs/VMAR_TRANSACTIONS.md](docs/VMAR_TRANSACTIONS.md), and
-[docs/ALLOCATOR_HARDENING.md](docs/ALLOCATOR_HARDENING.md). The host-testable
-policy crates are each documented in
+[docs/ALLOCATOR_HARDENING.md](docs/ALLOCATOR_HARDENING.md). The approved
+userspace PCI Manager architecture and its staged production gates are defined
+in [docs/PCI_MANAGER_ARCHITECTURE.md](docs/PCI_MANAGER_ARCHITECTURE.md) and
+[docs/PCI_PRODUCTION_ROADMAP.md](docs/PCI_PRODUCTION_ROADMAP.md). The
+host-testable policy crates are each documented in
 [docs/OBJECT_LIFECYCLE_POLICY.md](docs/OBJECT_LIFECYCLE_POLICY.md),
 [docs/IOAPIC_ROUTING.md](docs/IOAPIC_ROUTING.md),
 [docs/RECOVERABLE_COPIES.md](docs/RECOVERABLE_COPIES.md),
