@@ -13,12 +13,14 @@ use huesos_abi::storage_boot::{
     NVME_FLAG_INTX_PRESENT, NVME_FLAG_MSIX_ENABLED, NVME_FLAG_MSIX_PRESENT, NVME_FLAG_MSI_ENABLED,
     NVME_FLAG_MSI_PRESENT,
 };
-use huesos_pci::{command, parse_interrupt_capabilities, Bar, ClassCode, ConfigSpace};
+use huesos_pci::{
+    command, parse_interrupt_capabilities, Bar, ClassCode, ConfigOffset, ConfigSpace,
+    ConfigSpaceKind, ConfigWidth, LegacyConfigPlan, PciAddress, LEGACY_CONFIG_ADDRESS_PORT,
+    LEGACY_CONFIG_DATA_PORT,
+};
 
 use crate::init::BootDmaPool;
 
-const PCI_CONFIG_ADDRESS: u16 = 0x0cf8;
-const PCI_CONFIG_DATA: u16 = 0x0cfc;
 const MAX_BUSES: u16 = 256;
 const MAX_DEVICES: u8 = 32;
 const MAX_FUNCTIONS: u8 = 8;
@@ -33,13 +35,6 @@ const MSIX_CONTROL_ENABLE: u16 = 1 << 15;
 const MSI_CONTROL_ENABLE: u16 = 1;
 const MSI_CONTROL_MME_MASK: u16 = 0x7 << 4;
 const MSI_CONTROL_64BIT: u16 = 1 << 7;
-
-#[derive(Clone, Copy)]
-struct PciLocation {
-    bus: u8,
-    device: u8,
-    function: u8,
-}
 
 #[derive(Clone, Copy)]
 struct Bar0Info {
@@ -81,13 +76,10 @@ fn discover_nvme_functions(info: &mut StorageBootInfo) {
         while device < MAX_DEVICES && info.nvme_count < storage_boot::MAX_NVME_FUNCTIONS {
             let mut function = 0u8;
             while function < MAX_FUNCTIONS && info.nvme_count < storage_boot::MAX_NVME_FUNCTIONS {
-                let location = PciLocation {
-                    bus: bus as u8,
-                    device,
-                    function,
-                };
-                if let Some(entry) = inspect_function(location) {
-                    let _ = info.push_nvme(entry);
+                if let Ok(location) = PciAddress::try_new(0, bus as u8, device, function) {
+                    if let Some(entry) = inspect_function(location) {
+                        let _ = info.push_nvme(entry);
+                    }
                 }
                 function += 1;
             }
@@ -97,7 +89,7 @@ fn discover_nvme_functions(info: &mut StorageBootInfo) {
     }
 }
 
-fn inspect_function(location: PciLocation) -> Option<NvmeBootFunction> {
+fn inspect_function(location: PciAddress) -> Option<NvmeBootFunction> {
     let vendor = read_config_u16(location, huesos_pci::off::VENDOR_ID);
     if vendor == 0xffff {
         return None;
@@ -130,9 +122,9 @@ fn inspect_function(location: PciLocation) -> Option<NvmeBootFunction> {
     let route = configure_interrupts(location, &bar0, &interrupts, flags);
 
     Some(NvmeBootFunction {
-        bus: location.bus,
-        device: location.device,
-        function: location.function,
+        bus: location.bus(),
+        device: location.device(),
+        function: location.function(),
         interrupt_pin: interrupts.intx_pin.unwrap_or(0),
         vendor_id: config.vendor_id(),
         device_id: config.device_id(),
@@ -150,7 +142,7 @@ fn inspect_function(location: PciLocation) -> Option<NvmeBootFunction> {
 }
 
 fn configure_interrupts(
-    location: PciLocation,
+    location: PciAddress,
     bar0: &Bar0Info,
     interrupts: &huesos_pci::InterruptCapabilities,
     base_flags: u32,
@@ -173,7 +165,7 @@ fn configure_interrupts(
 }
 
 fn try_configure_msix(
-    location: PciLocation,
+    location: PciAddress,
     bar0: &Bar0Info,
     msix: huesos_pci::MsixCapability,
     base_flags: u32,
@@ -216,7 +208,7 @@ fn try_configure_msix(
 }
 
 fn try_configure_msi(
-    location: PciLocation,
+    location: PciAddress,
     msi: huesos_pci::MsiCapability,
     base_flags: u32,
 ) -> Option<InterruptRoute> {
@@ -276,7 +268,7 @@ fn msi_message_address() -> u32 {
     MSI_MESSAGE_ADDRESS_BASE | ((huesos_arch::lapic::id() & 0xff) << 12)
 }
 
-fn enable_device_bus_master(location: PciLocation) {
+fn enable_device_bus_master(location: PciAddress) {
     let command = read_config_u16(location, huesos_pci::off::COMMAND);
     write_config_u16(
         location,
@@ -285,7 +277,7 @@ fn enable_device_bus_master(location: PciLocation) {
     );
 }
 
-fn read_config_space(location: PciLocation) -> ConfigSpace {
+fn read_config_space(location: PciAddress) -> ConfigSpace {
     let mut bytes = [0u8; 256];
     let mut offset = 0usize;
     while offset < bytes.len() {
@@ -296,7 +288,7 @@ fn read_config_space(location: PciLocation) -> ConfigSpace {
     ConfigSpace(bytes)
 }
 
-fn size_bar0(location: PciLocation, config: &ConfigSpace) -> Option<Bar0Info> {
+fn size_bar0(location: PciAddress, config: &ConfigSpace) -> Option<Bar0Info> {
     let lo = config.bar_raw(0)?;
     if lo & 1 != 0 {
         return None;
@@ -346,54 +338,71 @@ fn size_bar0(location: PciLocation, config: &ConfigSpace) -> Option<Bar0Info> {
     Some(Bar0Info { base, len: size })
 }
 
-fn read_config_u16(location: PciLocation, offset: usize) -> u16 {
-    let value = read_config_u32(location, offset & !0x3);
-    let shift = ((offset & 0x2) * 8) as u32;
-    ((value >> shift) & 0xffff) as u16
+fn legacy_plan(
+    location: PciAddress,
+    offset: usize,
+    width: ConfigWidth,
+) -> Option<LegacyConfigPlan> {
+    let raw_offset = u16::try_from(offset).ok()?;
+    let offset = ConfigOffset::try_new(raw_offset, width, ConfigSpaceKind::Conventional).ok()?;
+    LegacyConfigPlan::try_new(location, offset).ok()
 }
 
-fn write_config_u16(location: PciLocation, offset: usize, value: u16) {
-    let aligned = offset & !0x3;
-    let mut current = read_config_u32(location, aligned);
-    let shift = ((offset & 0x2) * 8) as u32;
-    current &= !(0xffffu32 << shift);
-    current |= u32::from(value) << shift;
-    write_config_u32(location, aligned, current);
+fn read_config_u16(location: PciAddress, offset: usize) -> u16 {
+    let Some(plan) = legacy_plan(location, offset, ConfigWidth::Word) else {
+        return u16::MAX;
+    };
+    plan.extract(read_legacy_dword(plan.address_register())) as u16
 }
 
-fn config_address(location: PciLocation, offset: usize) -> u32 {
-    0x8000_0000
-        | ((location.bus as u32) << 16)
-        | ((location.device as u32) << 11)
-        | ((location.function as u32) << 8)
-        | ((offset as u32) & 0xfc)
+fn write_config_u16(location: PciAddress, offset: usize, value: u16) {
+    let Some(plan) = legacy_plan(location, offset, ConfigWidth::Word) else {
+        return;
+    };
+    let current = read_legacy_dword(plan.address_register());
+    write_legacy_dword(
+        plan.address_register(),
+        plan.merge(current, u32::from(value)),
+    );
 }
 
-fn read_config_u32(location: PciLocation, offset: usize) -> u32 {
+fn read_config_u32(location: PciAddress, offset: usize) -> u32 {
+    let Some(plan) = legacy_plan(location, offset, ConfigWidth::Dword) else {
+        return u32::MAX;
+    };
+    read_legacy_dword(plan.address_register())
+}
+
+fn write_config_u32(location: PciAddress, offset: usize, value: u32) {
+    let Some(plan) = legacy_plan(location, offset, ConfigWidth::Dword) else {
+        return;
+    };
+    write_legacy_dword(plan.address_register(), value);
+}
+
+fn read_legacy_dword(address: u32) -> u32 {
     use x86_64::instructions::port::Port;
 
-    let address = config_address(location, offset);
     // SAFETY: CF8/CFC are the architected x86 PCI Configuration Mechanism #1
-    // ports. This boot-only scanner performs aligned DWORD config accesses and
-    // restores any BAR/command state it temporarily changes during sizing.
+    // ports. The checked LegacyConfigPlan supplied the complete aligned address
+    // cycle, and this boot-only scanner is the sole accessor at this stage.
     unsafe {
-        let mut addr = Port::<u32>::new(PCI_CONFIG_ADDRESS);
-        let mut data = Port::<u32>::new(PCI_CONFIG_DATA);
+        let mut addr = Port::<u32>::new(LEGACY_CONFIG_ADDRESS_PORT);
+        let mut data = Port::<u32>::new(LEGACY_CONFIG_DATA_PORT);
         addr.write(address);
         data.read()
     }
 }
 
-fn write_config_u32(location: PciLocation, offset: usize, value: u32) {
+fn write_legacy_dword(address: u32, value: u32) {
     use x86_64::instructions::port::Port;
 
-    let address = config_address(location, offset);
-    // SAFETY: same CF8/CFC contract as `read_config_u32`; callers only write
-    // standard PCI config registers while the BSP is still single-threaded for
-    // storage discovery purposes.
+    // SAFETY: same CF8/CFC contract as `read_legacy_dword`; callers provide a
+    // checked plan and only mutate standard registers during BSP boot storage
+    // discovery. BAR sizing restores all temporarily changed state.
     unsafe {
-        let mut addr = Port::<u32>::new(PCI_CONFIG_ADDRESS);
-        let mut data = Port::<u32>::new(PCI_CONFIG_DATA);
+        let mut addr = Port::<u32>::new(LEGACY_CONFIG_ADDRESS_PORT);
+        let mut data = Port::<u32>::new(LEGACY_CONFIG_DATA_PORT);
         addr.write(address);
         data.write(value);
     }
