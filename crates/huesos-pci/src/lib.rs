@@ -15,6 +15,190 @@
 extern crate alloc;
 use alloc::vec::Vec;
 
+/// Bytes in conventional PCI configuration space.
+pub const CONVENTIONAL_CONFIG_BYTES: u16 = 256;
+/// Bytes in PCI Express enhanced configuration space.
+pub const ENHANCED_CONFIG_BYTES: u16 = 4096;
+
+/// Error returned by checked PCI configuration-address operations.
+///
+/// Transport implementations may preserve a more detailed internal error, but
+/// policy code uses these stable classes so malformed firmware, unsupported
+/// access, device absence, and hardware failure are never conflated.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ConfigError {
+    /// Device number is outside the conventional `0..32` range.
+    DeviceOutOfRange,
+    /// Function number is outside the base-profile `0..8` range.
+    FunctionOutOfRange,
+    /// Access starts or ends outside the selected configuration space.
+    OffsetOutOfRange,
+    /// Offset is not naturally aligned for the access width.
+    MisalignedAccess,
+    /// The selected backend cannot represent this PCI segment.
+    UnsupportedSegment,
+    /// The selected backend cannot represent the requested operation.
+    UnsupportedAccess,
+    /// Checked address calculation overflowed.
+    AddressOverflow,
+    /// No function is present at the requested address.
+    NotPresent,
+    /// Firmware or a hardware-owned structure is malformed.
+    MalformedFirmware,
+    /// The physical configuration transport failed.
+    Transport,
+}
+
+/// Current routing address of one PCI function.
+///
+/// This value is not a stable device identity: hotplug or bus-number
+/// reallocation may move a device to another BDF. Long-lived authority uses a
+/// separate DeviceId/lease generation as defined by
+/// `docs/PCI_MANAGER_ARCHITECTURE.md`.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct PciAddress {
+    segment: u16,
+    bus: u8,
+    device: u8,
+    function: u8,
+}
+
+impl PciAddress {
+    /// Construct a checked segment:bus:device.function address.
+    pub const fn try_new(
+        segment: u16,
+        bus: u8,
+        device: u8,
+        function: u8,
+    ) -> Result<Self, ConfigError> {
+        if device >= 32 {
+            return Err(ConfigError::DeviceOutOfRange);
+        }
+        if function >= 8 {
+            return Err(ConfigError::FunctionOutOfRange);
+        }
+        Ok(Self {
+            segment,
+            bus,
+            device,
+            function,
+        })
+    }
+
+    /// PCI segment group.
+    pub const fn segment(self) -> u16 {
+        self.segment
+    }
+
+    /// Bus number.
+    pub const fn bus(self) -> u8 {
+        self.bus
+    }
+
+    /// Device number (`0..31`).
+    pub const fn device(self) -> u8 {
+        self.device
+    }
+
+    /// Function number (`0..7` in the base profile).
+    pub const fn function(self) -> u8 {
+        self.function
+    }
+}
+
+/// Width of one PCI configuration-space access.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub enum ConfigWidth {
+    /// One byte.
+    Byte = 1,
+    /// Two bytes.
+    Word = 2,
+    /// Four bytes.
+    Dword = 4,
+}
+
+impl ConfigWidth {
+    /// Width in bytes.
+    pub const fn bytes(self) -> u16 {
+        self as u16
+    }
+
+    /// Bit mask covering one value of this width.
+    pub const fn value_mask(self) -> u32 {
+        match self {
+            Self::Byte => 0xff,
+            Self::Word => 0xffff,
+            Self::Dword => u32::MAX,
+        }
+    }
+}
+
+/// Addressable configuration-space profile.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ConfigSpaceKind {
+    /// Conventional PCI configuration space (`0..256`).
+    Conventional,
+    /// PCI Express enhanced configuration space (`0..4096`).
+    Enhanced,
+}
+
+impl ConfigSpaceKind {
+    /// Addressable byte length.
+    pub const fn bytes(self) -> u16 {
+        match self {
+            Self::Conventional => CONVENTIONAL_CONFIG_BYTES,
+            Self::Enhanced => ENHANCED_CONFIG_BYTES,
+        }
+    }
+}
+
+/// Checked offset and width for one configuration-space access.
+///
+/// Keeping width with the offset prevents a caller from validating one byte and
+/// later issuing a four-byte access at the same numeric offset.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ConfigOffset {
+    value: u16,
+    width: ConfigWidth,
+}
+
+impl ConfigOffset {
+    /// Validate natural alignment and the complete half-open access range.
+    pub const fn try_new(
+        value: u16,
+        width: ConfigWidth,
+        space: ConfigSpaceKind,
+    ) -> Result<Self, ConfigError> {
+        let bytes = width.bytes();
+        if !value.is_multiple_of(bytes) {
+            return Err(ConfigError::MisalignedAccess);
+        }
+        let Some(end) = value.checked_add(bytes) else {
+            return Err(ConfigError::OffsetOutOfRange);
+        };
+        if end > space.bytes() {
+            return Err(ConfigError::OffsetOutOfRange);
+        }
+        Ok(Self { value, width })
+    }
+
+    /// Byte offset from the start of the function's configuration space.
+    pub const fn value(self) -> u16 {
+        self.value
+    }
+
+    /// Access width validated with this offset.
+    pub const fn width(self) -> ConfigWidth {
+        self.width
+    }
+
+    /// Exclusive end offset.
+    pub const fn end(self) -> u16 {
+        self.value + self.width.bytes()
+    }
+}
+
 /// Standard PCI configuration-space register offsets.
 #[allow(missing_docs)]
 pub mod off {
@@ -445,6 +629,113 @@ impl MockPciBus {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pci_address_accepts_full_base_profile_boundaries() {
+        let Ok(low) = PciAddress::try_new(0, 0, 0, 0) else {
+            assert!(false, "lowest PCI address should be valid");
+            return;
+        };
+        assert_eq!(
+            (low.segment(), low.bus(), low.device(), low.function()),
+            (0, 0, 0, 0)
+        );
+
+        let Ok(high) = PciAddress::try_new(u16::MAX, u8::MAX, 31, 7) else {
+            assert!(false, "highest base-profile PCI address should be valid");
+            return;
+        };
+        assert_eq!(high.segment(), u16::MAX);
+        assert_eq!(high.bus(), u8::MAX);
+        assert_eq!(high.device(), 31);
+        assert_eq!(high.function(), 7);
+    }
+
+    #[test]
+    fn pci_address_rejects_invalid_device_and_function() {
+        assert_eq!(
+            PciAddress::try_new(0, 0, 32, 0),
+            Err(ConfigError::DeviceOutOfRange)
+        );
+        assert_eq!(
+            PciAddress::try_new(0, 0, 0, 8),
+            Err(ConfigError::FunctionOutOfRange)
+        );
+    }
+
+    #[test]
+    fn config_width_masks_match_wire_widths() {
+        assert_eq!(ConfigWidth::Byte.bytes(), 1);
+        assert_eq!(ConfigWidth::Byte.value_mask(), 0xff);
+        assert_eq!(ConfigWidth::Word.bytes(), 2);
+        assert_eq!(ConfigWidth::Word.value_mask(), 0xffff);
+        assert_eq!(ConfigWidth::Dword.bytes(), 4);
+        assert_eq!(ConfigWidth::Dword.value_mask(), u32::MAX);
+    }
+
+    #[test]
+    fn conventional_offsets_cover_exact_last_accesses() {
+        let Ok(byte) = ConfigOffset::try_new(
+            CONVENTIONAL_CONFIG_BYTES - 1,
+            ConfigWidth::Byte,
+            ConfigSpaceKind::Conventional,
+        ) else {
+            assert!(false, "last conventional byte should be valid");
+            return;
+        };
+        assert_eq!(byte.value(), 255);
+        assert_eq!(byte.end(), 256);
+
+        assert!(
+            ConfigOffset::try_new(254, ConfigWidth::Word, ConfigSpaceKind::Conventional).is_ok()
+        );
+        assert!(
+            ConfigOffset::try_new(252, ConfigWidth::Dword, ConfigSpaceKind::Conventional).is_ok()
+        );
+        assert_eq!(
+            ConfigOffset::try_new(256, ConfigWidth::Byte, ConfigSpaceKind::Conventional),
+            Err(ConfigError::OffsetOutOfRange)
+        );
+    }
+
+    #[test]
+    fn enhanced_offsets_cover_exact_last_accesses() {
+        assert!(ConfigOffset::try_new(4095, ConfigWidth::Byte, ConfigSpaceKind::Enhanced).is_ok());
+        assert!(ConfigOffset::try_new(4094, ConfigWidth::Word, ConfigSpaceKind::Enhanced).is_ok());
+        let Ok(dword) = ConfigOffset::try_new(4092, ConfigWidth::Dword, ConfigSpaceKind::Enhanced)
+        else {
+            assert!(false, "last enhanced dword should be valid");
+            return;
+        };
+        assert_eq!(dword.end(), ENHANCED_CONFIG_BYTES);
+        assert_eq!(
+            ConfigOffset::try_new(4096, ConfigWidth::Byte, ConfigSpaceKind::Enhanced),
+            Err(ConfigError::OffsetOutOfRange)
+        );
+    }
+
+    #[test]
+    fn config_offsets_reject_misaligned_accesses() {
+        assert_eq!(
+            ConfigOffset::try_new(1, ConfigWidth::Word, ConfigSpaceKind::Conventional),
+            Err(ConfigError::MisalignedAccess)
+        );
+        assert_eq!(
+            ConfigOffset::try_new(2, ConfigWidth::Dword, ConfigSpaceKind::Enhanced),
+            Err(ConfigError::MisalignedAccess)
+        );
+    }
+
+    #[test]
+    fn enhanced_only_offset_is_rejected_by_conventional_profile() {
+        assert!(
+            ConfigOffset::try_new(0x100, ConfigWidth::Dword, ConfigSpaceKind::Enhanced).is_ok()
+        );
+        assert_eq!(
+            ConfigOffset::try_new(0x100, ConfigWidth::Dword, ConfigSpaceKind::Conventional),
+            Err(ConfigError::OffsetOutOfRange)
+        );
+    }
 
     fn nvme_device() -> MockPciDevice {
         let mut config = ConfigSpace::zeroed();
