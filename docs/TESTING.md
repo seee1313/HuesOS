@@ -372,7 +372,7 @@ not a spec:
 
 | Job | What it runs |
 |-----|--------------|
-| `static-safety` | `make audit-check` — the seven gates above |
+| `static-safety` | `make audit-check`, Clippy, the ordinary host suite, and `make test-hxfs-features` for the combined encryption + compression + Hxblob storage build |
 | `qemu-boot` | boot smoke, 1 and 2 CPUs |
 | `qemu-nvme-boot` | base NVMe soak, mode 0 |
 | `qemu-nvme-gcm-inject` | mode 1 |
