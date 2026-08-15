@@ -140,6 +140,115 @@ struct ObjectPlan {
     record_count: u32,
 }
 
+/// Checked geometry of one checkpoint transaction, relative to its first
+/// target block.
+///
+/// Journal records consume two blocks each (metadata + full target copy).
+/// Tree leaves are target blocks but do not get independent journal records:
+/// their root record covers the complete tree publication. Keeping those two
+/// counts separate prevents a leaf-capacity change from silently moving the
+/// journal over live media.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct TransactionShape {
+    /// Number of target blocks before the journal starts.
+    target_blocks: u64,
+    /// Number of metadata/data record pairs in the journal.
+    record_count: u32,
+    /// Complete transaction span: targets followed by the journal.
+    total_blocks: u64,
+}
+
+impl TransactionShape {
+    /// Plan the transaction without assigning an absolute LBA.
+    fn plan(
+        live_objects: usize,
+        extra_tree_blocks: u64,
+        hxblob_leaf_blocks: u64,
+        hxblob_enabled: bool,
+    ) -> FixedResult<Self> {
+        // Non-object target roots: object table, volume table, allocation,
+        // refcount, backref, quota, and checkpoint.
+        const BASE_TARGET_BLOCKS: u64 = 7;
+        // The seven roots above plus the final superblock record.
+        const BASE_RECORDS: u64 = 8;
+        // Hxblob adds an index root and a Merkle root. Index leaves are
+        // accounted separately because the root's journal record covers them.
+        const HXBLOB_TARGET_BLOCKS: u64 = 2;
+        const HXBLOB_RECORDS: u64 = 2;
+
+        let object_blocks = u64::try_from(live_objects).map_err(|_| HxfsError::NoSpace)?;
+        let feature_target_blocks = if hxblob_enabled {
+            HXBLOB_TARGET_BLOCKS
+                .checked_add(hxblob_leaf_blocks)
+                .ok_or(HxfsError::NoSpace)?
+        } else {
+            0
+        };
+        let target_blocks = object_blocks
+            .checked_add(extra_tree_blocks)
+            .and_then(|value| value.checked_add(BASE_TARGET_BLOCKS))
+            .and_then(|value| value.checked_add(feature_target_blocks))
+            .ok_or(HxfsError::NoSpace)?;
+        let feature_records = if hxblob_enabled { HXBLOB_RECORDS } else { 0 };
+        let record_count_u64 = object_blocks
+            .checked_add(BASE_RECORDS)
+            .and_then(|value| value.checked_add(feature_records))
+            .ok_or(HxfsError::NoSpace)?;
+        let record_count = u32::try_from(record_count_u64).map_err(|_| HxfsError::NoSpace)?;
+        let journal_blocks = record_count_u64.checked_mul(2).ok_or(HxfsError::NoSpace)?;
+        let total_blocks = target_blocks
+            .checked_add(journal_blocks)
+            .ok_or(HxfsError::NoSpace)?;
+        Ok(Self {
+            target_blocks,
+            record_count,
+            total_blocks,
+        })
+    }
+}
+
+/// Assigns record indexes and refuses to let the emitted sequence disagree
+/// with the transaction's advertised record count.
+struct JournalCursor {
+    next: u32,
+    total: u32,
+}
+
+impl JournalCursor {
+    const fn new(total: u32) -> Self {
+        Self { next: 0, total }
+    }
+
+    /// Claim a non-final record. The last slot is reserved exclusively for the
+    /// clean superblock carrying `JOURNAL_RECORD_FLAG_FINAL_SUPERBLOCK`.
+    fn regular(&mut self) -> FixedResult<u32> {
+        if self.next >= self.total.saturating_sub(1) {
+            return Err(HxfsError::BadJournal);
+        }
+        let index = self.next;
+        self.next += 1;
+        Ok(index)
+    }
+
+    /// Claim the one final record and prove it is the declared last slot.
+    fn final_record(&mut self) -> FixedResult<u32> {
+        if self.next.checked_add(1) != Some(self.total) {
+            return Err(HxfsError::BadJournal);
+        }
+        let index = self.next;
+        self.next += 1;
+        Ok(index)
+    }
+
+    fn finish(self) -> FixedResult<()> {
+        if self.next == self.total {
+            Ok(())
+        } else {
+            Err(HxfsError::BadJournal)
+        }
+    }
+}
+
 /// A contiguous run of physical blocks that no live extent references.
 ///
 /// Used for both halves of the reclaim path: the quarantine list of
@@ -1055,10 +1164,8 @@ impl<
     #[cfg(feature = "hxblob")]
     pub fn list_blobs(&self) -> alloc::vec::Vec<BlobHash> {
         let mut out = alloc::vec::Vec::new();
-        for record in self.hxblob_index.records() {
-            if let Some(record) = record {
-                out.push(record.hash);
-            }
+        for record in self.hxblob_index.records().iter().flatten() {
+            out.push(record.hash);
         }
         out
     }
@@ -1069,11 +1176,12 @@ impl<
         self.hxblob_index.record_count()
     }
 
-    /// Stage F: serialize the Hxblob index tree into one metadata
-    /// block. Wire layout: `count(4)` then `count` records of 92
-    /// bytes (`hash(32) + object_id(8) + size(8) + merkle_root(32)
-    /// + merkle_tree_lba(8) + flags(4)`); one block holds 44
-    /// records (bounded by MAX_HXBLOBS = 32).
+    /// Stage F: serialize the Hxblob index tree into metadata blocks.
+    ///
+    /// Wire layout: `count(4)` then `count` records of 92 bytes
+    /// (`hash(32) + object_id(8) + size(8) + merkle_root(32) +
+    /// merkle_tree_lba(8) + flags(4)`). One leaf holds 44 records;
+    /// [`MAX_HXBLOBS`] bounds the complete root-plus-leaves tree.
     #[cfg(feature = "hxblob")]
     fn build_hxblob_index_block(
         &self,
@@ -1935,14 +2043,12 @@ impl<
         let retired_metadata_end = self.next_lba.max(self.superblock.journal_end_lba);
         let sequence = self.superblock.sequence_number.saturating_add(1).max(1);
         let live_objects = self.live_object_count();
-        let target_count = live_objects.checked_add(7).ok_or(HxfsError::NoSpace)?;
-        if target_count == 0 {
-            return Err(HxfsError::NoSpace);
-        }
-        let record_count = u32::try_from(target_count + 1).map_err(|_| HxfsError::NoSpace)?;
-        // Stage E: the target area must account for extent-tree
-        // leaves so the journal area starts after ALL target blocks.
-        let mut extra_total = 0usize;
+        // Stage E: the target area must account for extent-tree leaves so the
+        // journal starts after every object tree. Keep these leaves separate
+        // from the allocation/refcount/backref leaves below: object-table
+        // placement only skips object-tree leaves, while each metadata-tree
+        // root advances over its own leaves later in the layout.
+        let mut object_leaf_blocks = 0usize;
         let mut object_slot = 0usize;
         while object_slot < self.objects.len() {
             if let Some(object) = self.objects[object_slot] {
@@ -1950,7 +2056,9 @@ impl<
                     object.descriptor.object_type,
                     OBJECT_TYPE_FILE | OBJECT_TYPE_SYMLINK
                 ) {
-                    extra_total += self.extent_blocks_for_object(object.descriptor.object_id) - 1;
+                    object_leaf_blocks = object_leaf_blocks
+                        .checked_add(self.extent_blocks_for_object(object.descriptor.object_id) - 1)
+                        .ok_or(HxfsError::NoSpace)?;
                 }
             }
             object_slot += 1;
@@ -1983,8 +2091,12 @@ impl<
         } else {
             0
         };
-        let extra_total =
-            (extra_total + alloc_leaf_blocks + refcount_leaf_blocks + backref_leaf_blocks) as u64;
+        let extra_total = object_leaf_blocks
+            .checked_add(alloc_leaf_blocks)
+            .and_then(|value| value.checked_add(refcount_leaf_blocks))
+            .and_then(|value| value.checked_add(backref_leaf_blocks))
+            .and_then(|value| u64::try_from(value).ok())
+            .ok_or(HxfsError::NoSpace)?;
         let hxblob_count = {
             #[cfg(feature = "hxblob")]
             {
@@ -2008,40 +2120,89 @@ impl<
         // blocks themselves were being recycled: the metadata region
         // is rewritten wholesale on every checkpoint and dwarfs the
         // file data on a churning volume.
-        let metadata_span = live_objects as u64
-            + extra_total
-            + 5
-            + u64::from(record_count) * 2
-            + hxblob_leaf_blocks as u64;
+        //
+        // The old expression hand-maintained a `+5` target prefix and
+        // a separate journal record count. It under-reserved the target
+        // area and, with Hxblob enabled, omitted the index and Merkle
+        // journal records entirely. A reclaimed run could therefore be
+        // four blocks shorter than the writes placed into it, while a
+        // crash in RECOVERING state produced an unreplayable journal.
+        let shape = TransactionShape::plan(
+            live_objects,
+            extra_total,
+            hxblob_leaf_blocks as u64,
+            cfg!(feature = "hxblob"),
+        )?;
+        let record_count = shape.record_count;
+        let metadata_span = shape.total_blocks;
         let target_start_lba = self
             .take_free_blocks(metadata_span)
             .unwrap_or(self.next_lba);
-        let object_table_lba = target_start_lba + live_objects as u64 + extra_total;
-        let volume_table_lba = object_table_lba + 1;
-        let allocation_tree_lba = volume_table_lba + 1;
-        // Each multi-block tree's leaves live immediately after its
-        // root; everything after them must be shifted.
-        let alloc_leaves_end = allocation_tree_lba + 1 + alloc_leaf_blocks as u64;
+        let object_table_lba = target_start_lba
+            .checked_add(u64::try_from(live_objects).map_err(|_| HxfsError::NoSpace)?)
+            .and_then(|value| value.checked_add(object_leaf_blocks as u64))
+            .ok_or(HxfsError::NoSpace)?;
+        let volume_table_lba = object_table_lba.checked_add(1).ok_or(HxfsError::NoSpace)?;
+        let allocation_tree_lba = volume_table_lba.checked_add(1).ok_or(HxfsError::NoSpace)?;
+        // Each multi-block tree's leaves live immediately after its root;
+        // everything after them must be shifted exactly once.
+        let alloc_leaves_end = allocation_tree_lba
+            .checked_add(1)
+            .and_then(|value| value.checked_add(alloc_leaf_blocks as u64))
+            .ok_or(HxfsError::NoSpace)?;
         let refcount_tree_lba = alloc_leaves_end;
-        let refcount_leaves_end = refcount_tree_lba + 1 + refcount_leaf_blocks as u64;
+        let refcount_leaves_end = refcount_tree_lba
+            .checked_add(1)
+            .and_then(|value| value.checked_add(refcount_leaf_blocks as u64))
+            .ok_or(HxfsError::NoSpace)?;
         let backref_tree_lba = refcount_leaves_end;
-        let backref_leaves_end = backref_tree_lba + 1 + backref_leaf_blocks as u64;
+        let backref_leaves_end = backref_tree_lba
+            .checked_add(1)
+            .and_then(|value| value.checked_add(backref_leaf_blocks as u64))
+            .ok_or(HxfsError::NoSpace)?;
         let quota_tree_lba = backref_leaves_end;
-        // Stage F: the Hxblob index + Merkle blocks live between
-        // the quota tree and the checkpoint.
-        // Phase-2 packages: the Hxblob index may span multiple
-        // blocks (root + leaves); reserve space for the leaves
-        // between the index root and the Merkle block.
-        let hxblob_index_tree_lba = quota_tree_lba + 1;
-        let hxblob_leaves_end = hxblob_index_tree_lba + 1 + hxblob_leaf_blocks as u64;
-        let hxblob_merkle_tree_lba = hxblob_leaves_end;
-        let checkpoint_lba = hxblob_merkle_tree_lba + 1;
-        let journal_start_lba = checkpoint_lba + 1;
-        let journal_end_lba = journal_start_lba + u64::from(record_count) * 2;
+        // Stage F: an Hxblob build places its index + Merkle blocks between
+        // the quota tree and the checkpoint. A build without Hxblob does not
+        // reserve two phantom target blocks: the shape and actual LBA layout
+        // must describe the same range.
+        #[cfg(feature = "hxblob")]
+        let (hxblob_index_tree_lba, hxblob_merkle_tree_lba, checkpoint_lba) = {
+            let index = quota_tree_lba.checked_add(1).ok_or(HxfsError::NoSpace)?;
+            let leaves_end = index
+                .checked_add(1)
+                .and_then(|value| value.checked_add(hxblob_leaf_blocks as u64))
+                .ok_or(HxfsError::NoSpace)?;
+            let checkpoint = leaves_end.checked_add(1).ok_or(HxfsError::NoSpace)?;
+            (index, leaves_end, checkpoint)
+        };
+        #[cfg(not(feature = "hxblob"))]
+        let (hxblob_index_tree_lba, hxblob_merkle_tree_lba, checkpoint_lba) = (
+            0u64,
+            0u64,
+            quota_tree_lba.checked_add(1).ok_or(HxfsError::NoSpace)?,
+        );
+        let journal_start_lba = checkpoint_lba.checked_add(1).ok_or(HxfsError::NoSpace)?;
+        let journal_end_lba = journal_start_lba
+            .checked_add(
+                u64::from(record_count)
+                    .checked_mul(2)
+                    .ok_or(HxfsError::NoSpace)?,
+            )
+            .ok_or(HxfsError::NoSpace)?;
+        let actual_target_blocks = journal_start_lba
+            .checked_sub(target_start_lba)
+            .ok_or(HxfsError::BadJournal)?;
+        let actual_total_blocks = journal_end_lba
+            .checked_sub(target_start_lba)
+            .ok_or(HxfsError::BadJournal)?;
+        if actual_target_blocks != shape.target_blocks || actual_total_blocks != shape.total_blocks
+        {
+            return Err(HxfsError::BadJournal);
+        }
         self.quota_allows_media_blocks(journal_end_lba)?;
         let mut plans = [const { None }; MAX_OBJECTS];
 
-        let mut record_index = 0u32;
+        let mut journal = JournalCursor::new(record_count);
         let mut block_offset = 0u64;
         let mut object_slot = 0usize;
         while object_slot < self.objects.len() {
@@ -2060,7 +2221,7 @@ impl<
                     tree_lba,
                     &block,
                     sequence,
-                    record_index,
+                    journal.regular()?,
                     record_count,
                     journal_start_lba,
                     checkpoint_lba,
@@ -2072,7 +2233,6 @@ impl<
                     self.store.write_blocks(leaf_lba, 1, leaf)?;
                 }
                 block_offset += 1 + leaves.len() as u64;
-                record_index += 1;
             }
             object_slot += 1;
         }
@@ -2082,13 +2242,12 @@ impl<
             object_table_lba,
             &object_block,
             sequence,
-            record_index,
+            journal.regular()?,
             record_count,
             journal_start_lba,
             checkpoint_lba,
             0,
         )?;
-        record_index += 1;
 
         let volume_block =
             self.build_volume_table_block(object_table_lba, live_objects as u32, volume_table_lba)?;
@@ -2096,13 +2255,12 @@ impl<
             volume_table_lba,
             &volume_block,
             sequence,
-            record_index,
+            journal.regular()?,
             record_count,
             journal_start_lba,
             checkpoint_lba,
             0,
         )?;
-        record_index += 1;
 
         let (allocation_block, allocation_leaves) =
             self.build_allocation_tree_block(allocation_tree_lba)?;
@@ -2110,7 +2268,7 @@ impl<
             allocation_tree_lba,
             &allocation_block,
             sequence,
-            record_index,
+            journal.regular()?,
             record_count,
             journal_start_lba,
             checkpoint_lba,
@@ -2119,7 +2277,6 @@ impl<
         for (alloc_leaf_lba, leaf) in (allocation_tree_lba + 1..).zip(allocation_leaves.iter()) {
             self.store.write_blocks(alloc_leaf_lba, 1, leaf)?;
         }
-        record_index += 1;
 
         let (refcount_block, refcount_leaves) =
             self.build_refcount_tree_block(refcount_tree_lba)?;
@@ -2127,7 +2284,7 @@ impl<
             refcount_tree_lba,
             &refcount_block,
             sequence,
-            record_index,
+            journal.regular()?,
             record_count,
             journal_start_lba,
             checkpoint_lba,
@@ -2136,7 +2293,6 @@ impl<
         for (refcount_leaf_lba, leaf) in (refcount_tree_lba + 1..).zip(refcount_leaves.iter()) {
             self.store.write_blocks(refcount_leaf_lba, 1, leaf)?;
         }
-        record_index += 1;
 
         let (backref_block, backref_leaves) =
             self.build_backref_tree_block(backref_tree_lba, sequence)?;
@@ -2144,7 +2300,7 @@ impl<
             backref_tree_lba,
             &backref_block,
             sequence,
-            record_index,
+            journal.regular()?,
             record_count,
             journal_start_lba,
             checkpoint_lba,
@@ -2153,20 +2309,18 @@ impl<
         for (backref_leaf_lba, leaf) in (backref_tree_lba + 1..).zip(backref_leaves.iter()) {
             self.store.write_blocks(backref_leaf_lba, 1, leaf)?;
         }
-        record_index += 1;
 
         let quota_block = self.build_quota_tree_block(quota_tree_lba, journal_end_lba)?;
         self.write_journaled_target(
             quota_tree_lba,
             &quota_block,
             sequence,
-            record_index,
+            journal.regular()?,
             record_count,
             journal_start_lba,
             checkpoint_lba,
             0,
         )?;
-        record_index += 1;
 
         // Stage F: write the Hxblob index + Merkle blocks (they are
         // part of the target area and covered by the journal).
@@ -2181,7 +2335,7 @@ impl<
                 hxblob_index_tree_lba,
                 &hxblob_index_block,
                 sequence,
-                record_index,
+                journal.regular()?,
                 record_count,
                 journal_start_lba,
                 checkpoint_lba,
@@ -2191,22 +2345,17 @@ impl<
             for (leaf_lba, leaf) in (hxblob_index_tree_lba + 1..).zip(hxblob_index_leaves.iter()) {
                 self.store.write_blocks(leaf_lba, 1, leaf)?;
             }
-            record_index += 1;
             self.write_journaled_target(
                 hxblob_merkle_tree_lba,
                 &hxblob_merkle_block,
                 sequence,
-                record_index,
+                journal.regular()?,
                 record_count,
                 journal_start_lba,
                 checkpoint_lba,
                 0,
             )?;
-            record_index += 1;
         }
-        #[cfg(not(feature = "hxblob"))]
-        let (hxblob_index_tree_lba, hxblob_merkle_tree_lba) = (0u64, 0u64);
-
         let checkpoint_block = build_checkpoint_block(
             sequence,
             volume_table_lba,
@@ -2228,13 +2377,12 @@ impl<
             checkpoint_lba,
             &checkpoint_block,
             sequence,
-            record_index,
+            journal.regular()?,
             record_count,
             journal_start_lba,
             checkpoint_lba,
             0,
         )?;
-        record_index += 1;
 
         let final_superblock = make_superblock_block(
             self.superblock.instance_uuid,
@@ -2248,12 +2396,14 @@ impl<
             0,
             &final_superblock,
             sequence,
-            record_index,
+            journal.final_record()?,
             record_count,
             journal_start_lba,
             checkpoint_lba,
             JOURNAL_RECORD_FLAG_FINAL_SUPERBLOCK,
         )?;
+
+        journal.finish()?;
 
         self.store.flush()?;
         let recovering = make_superblock_block(
@@ -5393,6 +5543,8 @@ fn read_u64(bytes: &[u8], offset: usize) -> FixedResult<u64> {
 mod tests {
     use super::*;
     use crate::reader::{BlockReader, SliceBlockReader};
+    #[cfg(feature = "hxblob")]
+    use crate::recovery::{replay_journal, ReplayOutcome};
     use crate::writer::HxfsWriter;
     use crate::Hxfs;
     extern crate std;
@@ -5456,6 +5608,218 @@ mod tests {
             self.flushes += 1;
             Ok(())
         }
+    }
+
+    /// Store that simulates power loss immediately before the final clean
+    /// superblock is republished.
+    ///
+    /// `publish_checkpoint` writes LBA 0 three times: first as the journal's
+    /// fully prepared final target, then as the durable RECOVERING root, and
+    /// finally as the clean commit point. Refusing the third write leaves the
+    /// exact image that a power cut after the RECOVERING flush would leave.
+    struct FailFinalSuperblockStore {
+        inner: MemStore,
+        lba_zero_writes: u32,
+    }
+
+    impl FailFinalSuperblockStore {
+        fn new(inner: MemStore) -> Self {
+            Self {
+                inner,
+                lba_zero_writes: 0,
+            }
+        }
+    }
+
+    impl BlockReader for FailFinalSuperblockStore {
+        fn read_blocks(&mut self, lba: u64, blocks: u32, out: &mut [u8]) -> Result<(), HxfsError> {
+            self.inner.read_blocks(lba, blocks, out)
+        }
+    }
+
+    impl BlockStore for FailFinalSuperblockStore {
+        fn write_blocks(&mut self, lba: u64, blocks: u32, input: &[u8]) -> Result<(), HxfsError> {
+            if lba == 0 {
+                self.lba_zero_writes = self.lba_zero_writes.saturating_add(1);
+                if self.lba_zero_writes == 3 {
+                    return Err(HxfsError::Io);
+                }
+            }
+            self.inner.write_blocks(lba, blocks, input)
+        }
+
+        fn flush(&mut self) -> Result<(), HxfsError> {
+            self.inner.flush()
+        }
+    }
+
+    #[test]
+    fn transaction_shape_accounts_for_optional_hxblob_targets() {
+        let Ok(base) = TransactionShape::plan(3, 4, 5, false) else {
+            assert!(false, "base shape should be representable");
+            return;
+        };
+        assert_eq!(
+            base,
+            TransactionShape {
+                target_blocks: 14,
+                record_count: 11,
+                total_blocks: 36,
+            }
+        );
+
+        let Ok(hxblob) = TransactionShape::plan(3, 4, 5, true) else {
+            assert!(false, "Hxblob shape should be representable");
+            return;
+        };
+        assert_eq!(
+            hxblob,
+            TransactionShape {
+                target_blocks: 21,
+                record_count: 13,
+                total_blocks: 47,
+            }
+        );
+        assert_eq!(hxblob.record_count - base.record_count, 2);
+        assert_eq!(hxblob.target_blocks - base.target_blocks, 7);
+    }
+
+    #[test]
+    fn journal_cursor_reserves_the_declared_last_record_for_final() {
+        let mut journal = JournalCursor::new(3);
+        assert_eq!(journal.final_record(), Err(HxfsError::BadJournal));
+        assert_eq!(journal.regular(), Ok(0));
+        assert_eq!(journal.regular(), Ok(1));
+        assert_eq!(journal.regular(), Err(HxfsError::BadJournal));
+        assert_eq!(journal.final_record(), Ok(2));
+        assert_eq!(journal.finish(), Ok(()));
+    }
+
+    #[test]
+    fn plain_checkpoint_replays_after_recovering_root_power_loss() {
+        let Ok(seed) = HxfsWriter::new(INSTANCE, VOLUME) else {
+            assert!(false, "seed writer should initialize");
+            return;
+        };
+        let backing = MemStore::from_image_with_blocks(seed.image(), 4096);
+        let store = FailFinalSuperblockStore::new(backing);
+        let Ok(mut fs) = FixedHxfsWriter::<FailFinalSuperblockStore, 16, 32, 32>::mount(store)
+        else {
+            assert!(false, "fixed writer should mount");
+            return;
+        };
+        let Ok(file) = fs.create_file_path("/replay.bin") else {
+            assert!(false, "file creation should succeed");
+            return;
+        };
+        let payload = b"plain journal replay payload";
+        assert!(fs.write_file_at(file, 0, payload).is_ok());
+
+        assert_eq!(fs.publish_checkpoint(), Err(HxfsError::Io));
+        let failed_store = fs.into_store();
+        assert_eq!(failed_store.lba_zero_writes, 3);
+        let mut store = failed_store.inner;
+        let Ok(recovering) = read_superblock(&mut store, 0) else {
+            assert!(false, "the durable recovering root should decode");
+            return;
+        };
+        assert_eq!(recovering.root_state, ROOT_STATE_RECOVERING);
+        assert!(matches!(
+            crate::recovery::replay_journal(&mut store),
+            Ok(crate::recovery::ReplayOutcome::Replayed { .. })
+        ));
+
+        let Ok(mut remounted) = FixedHxfsWriter::<MemStore, 16, 32, 32>::mount(store) else {
+            assert!(false, "recovered volume should remount");
+            return;
+        };
+        let Ok(file) = remounted.open_path("/replay.bin") else {
+            assert!(false, "recovered file should exist");
+            return;
+        };
+        let mut read_back = [0u8; 32];
+        let Ok(read) = remounted.read_file_at(file, 0, &mut read_back) else {
+            assert!(false, "recovered file should be readable");
+            return;
+        };
+        assert_eq!(&read_back[..read], payload);
+    }
+
+    /// An Hxblob-enabled checkpoint must replay after power is lost with the
+    /// durable root in RECOVERING state.
+    ///
+    /// Hxblob adds two journaled targets (the index and Merkle blocks). A
+    /// historical hand-maintained record count omitted both, so replay treated
+    /// the Merkle record as the declared final record and rejected it because
+    /// it did not carry FINAL_SUPERBLOCK. A normal clean checkpoint still
+    /// mounted, which is why ordinary round-trip tests did not expose the bug.
+    #[cfg(feature = "hxblob")]
+    #[test]
+    fn hxblob_checkpoint_replays_after_recovering_root_power_loss() {
+        let Ok(seed) = HxfsWriter::new(INSTANCE, VOLUME) else {
+            assert!(false, "seed writer should initialize");
+            return;
+        };
+        let backing = MemStore::from_image_with_blocks(seed.image(), 4096);
+        let store = FailFinalSuperblockStore::new(backing);
+        let Ok(mut fs) = FixedHxfsWriter::<FailFinalSuperblockStore, 64, 128, 256>::mount(store)
+        else {
+            assert!(false, "fixed writer should mount");
+            return;
+        };
+        // Cross the single-block Hxblob-index capacity so recovery also
+        // covers the index root + leaf layout, not only an empty-leaf tree.
+        let mut expected = [0u8; 16];
+        let mut final_hash = None;
+        let mut blob_index = 0usize;
+        while blob_index <= HXBLOB_LEAF_RECORDS {
+            let mut payload = [0u8; 16];
+            payload[..8].copy_from_slice(&(blob_index as u64).to_le_bytes());
+            payload[8..].copy_from_slice(b"hxreplay");
+            let Ok(hash) = fs.put_blob(&payload) else {
+                assert!(false, "blob {blob_index} creation should succeed");
+                return;
+            };
+            if blob_index == HXBLOB_LEAF_RECORDS {
+                expected = payload;
+                final_hash = Some(hash);
+            }
+            blob_index += 1;
+        }
+        let Some(hash) = final_hash else {
+            assert!(false, "the final blob hash should be recorded");
+            return;
+        };
+
+        assert_eq!(
+            fs.publish_checkpoint(),
+            Err(HxfsError::Io),
+            "the fault store must cut power before the final clean root"
+        );
+        let failed_store = fs.into_store();
+        assert_eq!(failed_store.lba_zero_writes, 3);
+        let mut store = failed_store.inner;
+        let Ok(recovering) = read_superblock(&mut store, 0) else {
+            assert!(false, "the durable recovering root should decode");
+            return;
+        };
+        assert_eq!(recovering.root_state, ROOT_STATE_RECOVERING);
+
+        let replay = replay_journal(&mut store);
+        assert!(
+            matches!(replay, Ok(ReplayOutcome::Replayed { .. })),
+            "Hxblob journal must replay, got {replay:?}"
+        );
+
+        let Ok(mut remounted) = FixedHxfsWriter::<MemStore, 64, 128, 256>::mount(store) else {
+            assert!(false, "recovered Hxblob volume should remount");
+            return;
+        };
+        let Ok(read_back) = remounted.get_blob(&hash) else {
+            assert!(false, "recovered blob should be readable");
+            return;
+        };
+        assert_eq!(read_back.as_slice(), expected.as_slice());
     }
 
     /// Churn a volume and assert the physical high-water mark stops

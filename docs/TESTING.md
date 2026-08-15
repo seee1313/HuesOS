@@ -34,6 +34,12 @@ This runs, e.g.:
 - `huesos-object`: bounded Channel/Port queue admission, batch handle-move
   validation, and quota exhaustion are host-tested; the kernel scheduler also
   carries a pending-wake handshake for SMP enqueue-to-park races.
+- `huesos-hxfs`: checkpoint geometry is checked against the actual target and
+  journal LBA spans. Plain and Hxblob-enabled regressions simulate power loss
+  after the `RECOVERING` root is durable but before the final clean root,
+  replay the journal, remount, and verify payload bytes. The Hxblob case uses a
+  multi-leaf index so its two extra journal records and leaf geometry cannot be
+  omitted by a clean-path-only test.
 - The host-testable **policy crates** (`huesos-lifecycle`, `huesos-ioapic`,
   `huesos-extable`, `huesos-waitset`, `huesos-proclife`, `huesos-handlemove`)
   are pure decision/encoding models with focused host suites: lifecycle

@@ -50,6 +50,29 @@ write and superblock update -- rather than re-proving one of them. The
 seed is printed on every run and forced with `POWERFAIL_SEED=<seed>`,
 so a failure is replayable instead of being written off as flake.)
 
+### Checkpoint journal geometry invariant
+
+`FixedHxfsWriter` plans the target area and journal as one checked
+transaction shape. The declared record count must equal the number of
+records actually emitted; a cursor reserves the declared last slot for
+the `FINAL_SUPERBLOCK` record and refuses both early finalization and
+extra records. The actual LBA layout is compared with the planned target
+and total spans before any journal record is emitted.
+
+This is a correctness boundary, not bookkeeping. The previous handwritten
+counts omitted the Hxblob index and Merkle records when the `hxblob` feature
+was enabled. A clean checkpoint appeared healthy, but a power loss after the
+`RECOVERING` root became durable made replay stop at the Merkle record and
+return `BadJournal`. The same handwritten layout also under-reserved reclaimed
+transaction space and counted allocation/refcount/backref leaves both as an
+early gap and at their real positions.
+
+Host regressions now cut the final clean-superblock write after the recovering
+root has been flushed, replay the resulting image, remount it, and verify both
+a plain file and an Hxblob payload. The Hxblob case crosses the single-leaf
+index capacity so root-plus-leaves geometry is covered. This focused host proof
+complements, but does not replace, the QEMU power-fail gate above.
+
 (The second soak invocation is the Stage B.5 fault-injection gate:
 seeded encrypted+compressed volume with a flipped GCM bit; the
 trace must show `[hxfs] bad-gcm-tag-marked` and
