@@ -15,6 +15,8 @@
 extern crate alloc;
 use alloc::vec::Vec;
 
+/// Bounded conventional and PCIe extended capability-list decoding.
+pub mod capability;
 /// ACPI MCFG allocation-table decoding and validation.
 pub mod mcfg;
 
@@ -476,6 +478,11 @@ impl ConfigSpace {
         ConfigSpace([0; 256])
     }
 
+    /// Raw conventional configuration bytes.
+    pub const fn as_bytes(&self) -> &[u8; 256] {
+        &self.0
+    }
+
     fn read_u16(&self, off: usize) -> u16 {
         u16::from_le_bytes([self.0[off], self.0[off + 1]])
     }
@@ -695,9 +702,12 @@ pub struct InterruptCapabilities {
 }
 
 /// Parse legacy/MSI/MSI-X interrupt metadata from a conventional PCI config
-/// space. Capability-list traversal is bounded and rejects malformed cycles by
-/// capping the walk to the 48 possible DWORD-aligned capability slots.
-pub fn parse_interrupt_capabilities(config: &ConfigSpace) -> InterruptCapabilities {
+/// space. The shared bounded capability decoder rejects cycles, malformed
+/// pointers, duplicate singleton interrupt capabilities, and truncated bodies
+/// instead of returning a partial interrupt view.
+pub fn parse_interrupt_capabilities(
+    config: &ConfigSpace,
+) -> Result<InterruptCapabilities, capability::CapabilityError> {
     let mut out = InterruptCapabilities {
         intx_line: (config.interrupt_line() != 0xff).then_some(config.interrupt_line()),
         intx_pin: (config.interrupt_pin() != 0).then_some(config.interrupt_pin()),
@@ -705,28 +715,34 @@ pub fn parse_interrupt_capabilities(config: &ConfigSpace) -> InterruptCapabiliti
         msix: None,
     };
 
-    let Some(mut ptr) = config.capability_pointer() else {
-        return out;
-    };
-    let mut steps = 0usize;
-    while steps < 48 && (0x40..=0xFC).contains(&ptr) {
-        let off = ptr as usize;
-        let cap_id = config.0[off];
-        let next = config.0[off + 1] & 0xFC;
-        match cap_id {
-            capability_id::MSI if off + 4 <= config.0.len() => {
+    for capability in capability::parse_conventional(config.as_bytes())? {
+        let off = capability.offset as usize;
+        match capability.id {
+            capability_id::MSI => {
+                if out.msi.is_some() {
+                    return Err(capability::CapabilityError::DuplicateCapability);
+                }
+                if off.checked_add(4).is_none_or(|end| end > config.0.len()) {
+                    return Err(capability::CapabilityError::Truncated);
+                }
                 let control = config.read_u16(off + 2);
                 let mmc = (control >> 1) & 0x7;
                 out.msi = Some(MsiCapability {
-                    offset: ptr,
+                    offset: capability.offset,
                     vector_count: 1u16 << mmc,
                 });
             }
-            capability_id::MSIX if off + 12 <= config.0.len() => {
+            capability_id::MSIX => {
+                if out.msix.is_some() {
+                    return Err(capability::CapabilityError::DuplicateCapability);
+                }
+                if off.checked_add(12).is_none_or(|end| end > config.0.len()) {
+                    return Err(capability::CapabilityError::Truncated);
+                }
                 let control = config.read_u16(off + 2);
                 let table = config.read_u32(off + 4);
                 out.msix = Some(MsixCapability {
-                    offset: ptr,
+                    offset: capability.offset,
                     table_size: (control & 0x07ff).saturating_add(1),
                     table_bir: (table & 0x7) as u8,
                     table_offset: table & !0x7,
@@ -734,13 +750,8 @@ pub fn parse_interrupt_capabilities(config: &ConfigSpace) -> InterruptCapabiliti
             }
             _ => {}
         }
-        if next == 0 || next == ptr {
-            break;
-        }
-        ptr = next;
-        steps += 1;
     }
-    out
+    Ok(out)
 }
 
 /// Compute a memory BAR's size from its size mask (the value read back after
@@ -1295,7 +1306,10 @@ mod tests {
         config.write_u16(0x52, 3);
         config.write_u32(0x54, 0x2000 | 2);
 
-        let caps = parse_interrupt_capabilities(&config);
+        let Ok(caps) = parse_interrupt_capabilities(&config) else {
+            assert!(false, "valid interrupt capabilities should parse");
+            return;
+        };
         assert_eq!(caps.intx_line, Some(11));
         assert_eq!(caps.intx_pin, Some(1));
         assert_eq!(caps.msi.map(|m| m.vector_count), Some(4));
@@ -1307,15 +1321,42 @@ mod tests {
     }
 
     #[test]
-    fn capability_walk_is_bounded_on_self_cycle() {
+    fn interrupt_capability_walk_rejects_self_cycle() {
         let mut config = ConfigSpace::zeroed();
         config.set_ids(0x8086, 0x5845);
         config.write_u16(off::STATUS, status::CAPABILITIES_LIST);
         config.0[off::CAPABILITY_POINTER] = 0x40;
         config.0[0x40] = capability_id::MSI;
         config.0[0x41] = 0x40;
-        let caps = parse_interrupt_capabilities(&config);
-        assert_eq!(caps.msi.map(|m| m.offset), Some(0x40));
+        assert_eq!(
+            parse_interrupt_capabilities(&config),
+            Err(capability::CapabilityError::Cycle)
+        );
+    }
+
+    #[test]
+    fn interrupt_capability_walk_rejects_duplicate_and_truncated_bodies() {
+        let mut duplicate = ConfigSpace::zeroed();
+        duplicate.write_u16(off::STATUS, status::CAPABILITIES_LIST);
+        duplicate.0[off::CAPABILITY_POINTER] = 0x40;
+        duplicate.0[0x40] = capability_id::MSI;
+        duplicate.0[0x41] = 0x50;
+        duplicate.0[0x50] = capability_id::MSI;
+        duplicate.0[0x51] = 0;
+        assert_eq!(
+            parse_interrupt_capabilities(&duplicate),
+            Err(capability::CapabilityError::DuplicateCapability)
+        );
+
+        let mut truncated = ConfigSpace::zeroed();
+        truncated.write_u16(off::STATUS, status::CAPABILITIES_LIST);
+        truncated.0[off::CAPABILITY_POINTER] = 0xf8;
+        truncated.0[0xf8] = capability_id::MSIX;
+        truncated.0[0xf9] = 0;
+        assert_eq!(
+            parse_interrupt_capabilities(&truncated),
+            Err(capability::CapabilityError::Truncated)
+        );
     }
 
     #[test]
