@@ -6,9 +6,15 @@ QEMU (`-smp 1` and `-smp 2`). This roadmap covers what's next, roughly in
 priority order.
 
 Storage/NVMe/Hxfs production planning is tracked in the dedicated
-[Storage / NVMe / FS Roadmap](STORAGE_NVME_FS_ROADMAP.md). The current storage
+[Storage / NVMe / FS Roadmap](STORAGE_NVME_FS_ROADMAP_v1.md). The current storage
 state is a strong foundation through Hxfs Stage I, not yet full production
 mutable Hxfs.
+
+PCI/PCIe modernization is tracked in
+[PCI Manager Architecture](PCI_MANAGER_ARCHITECTURE.md) and the dedicated
+[PCI Production Roadmap](PCI_PRODUCTION_ROADMAP.md). The current kernel
+CF8/CFC NVMe bootstrap remains a migration shim; PCI production-ready is false
+until the userspace manager path and its release gates close.
 
 ## Done (recent)
 
