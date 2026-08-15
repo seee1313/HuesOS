@@ -190,8 +190,9 @@ Status: **IN PROGRESS**
 
 ## B.1 Address and width model
 
-Implementation status: checked address/offset/width/error types land in PCI-1;
-transport call sites move off ad-hoc encoding in PCI-2.
+Implementation status: complete across PCI-1/PCI-2. Checked vocabulary landed
+first; PCI-2 removes the current kernel bootstrap shim's ad-hoc CF8 encoding in
+favor of the shared planner.
 
 Extend `huesos-pci` with checked, safe types:
 
@@ -216,6 +217,9 @@ Exit criterion:
 
 ## B.2 ECAM access planning
 
+Implementation status: **complete (policy core) in PCI-2**; physical ECAM
+mapping/execution remains Stage H.
+
 Implement pure checked ECAM address calculation from a validated MCFG window.
 No physical pointer dereference belongs in this track.
 
@@ -235,6 +239,9 @@ Exit criterion:
   on-target backend.
 
 ## B.3 Legacy access planning
+
+Implementation status: **complete in PCI-2**, including migration of the
+current kernel NVMe bootstrap shim to checked plans.
 
 Implement a pure CF8 address planner for the common subset:
 
@@ -864,8 +871,10 @@ host-tested. No kernel bootstrap code is removed before Stage J closes.
 | A.1 Normative architecture | Complete | merged architecture document |
 | A.2 ABI vocabulary | Complete (design) | architecture §§6, 12–14 |
 | A.3 Migration map | Complete | architecture §2 + roadmap A.3 |
-| B.1 Checked address vocabulary | In progress | PCI-1 types/tests; transport adoption follows in PCI-2 |
-| B.2–O | Not started | no production claim |
+| B.1 Checked address vocabulary | Complete | PCI-1 types + PCI-2 bootstrap adoption |
+| B.2 ECAM access planner | Complete (policy) | checked region-relative plans and boundary tests |
+| B.3 Legacy access planner | Complete | common-subset plans; kernel shim migrated |
+| B.4–O | Not started | no production claim |
 
 Update this table in every PCI stage PR. A track may be marked complete only
 with its exit criterion and verification command/log named in the PR.
