@@ -106,7 +106,13 @@ fn inspect_function(location: PciAddress) -> Option<NvmeBootFunction> {
         return None;
     }
 
-    let interrupts = parse_interrupt_capabilities(&config);
+    let interrupts = match parse_interrupt_capabilities(&config) {
+        Ok(interrupts) => interrupts,
+        Err(_) => {
+            log_line("[storage] ignoring NVMe with malformed PCI capability list");
+            return None;
+        }
+    };
     let mut flags = 0u32;
     if interrupts.intx_line.is_some() {
         flags |= NVME_FLAG_INTX_PRESENT;
