@@ -60,8 +60,10 @@ use crate::{crypto_aes_gcm, Uuid};
 /// AEAD envelope is the same on every encrypted block
 /// regardless of where it lives in the on-disk format). An
 /// extent block is `4096 = 4028 plaintext + 12 nonce + 16 tag
-/// + 40 zero-pad`; the AEAD authenticates only the first
-/// 4028 bytes, and the read path ignores the trailing 40.
+/// + 40 zero-pad`.
+///
+/// The AEAD authenticates only the first 4028 bytes, and the read
+/// path ignores the trailing 40.
 pub const EXTENT_PLAINTEXT_BYTES: usize = crypto_aes_gcm::MAX_PLAINTEXT_BYTES;
 
 /// Total on-disk size of the encrypted extent block body:

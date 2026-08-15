@@ -645,6 +645,19 @@ impl<
                                     continue;
                                 }
                             };
+                            // Scrub verifies physical media, not cached decoded
+                            // pages. Drop every cached page for this extent
+                            // before reading it so corruption that appeared
+                            // after an earlier read cannot be hidden by a cache
+                            // hit. Multi-slot extents carry their physical slot
+                            // count in `block_count`, so the same range covers
+                            // both encrypted envelopes.
+                            if extent.extent.flags & EXTENT_FLAG_HOLE == 0 {
+                                let start = extent.extent.physical_block;
+                                let end =
+                                    start.saturating_add(u64::from(extent.extent.block_count));
+                                self.invalidate_cached_range(start, end);
+                            }
                             let mut buf = vec![0u8; logical * BLOCK_SIZE];
                             match self.copy_extent(extent.extent, extent.compression, &mut buf) {
                                 Ok(()) => {

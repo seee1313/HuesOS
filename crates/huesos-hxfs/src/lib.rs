@@ -3439,7 +3439,6 @@ fn stage_e_16mib_file_uses_extent_tree_and_round_trips() {
 #[test]
 fn stage_f_hxblob_round_trip_survives_remount() {
     use crate::fixed_writer::FixedHxfsWriter;
-    use crate::reader::SliceBlockReader;
     use crate::recovery::BlockStore;
     use crate::writer::VecBlockStore;
 
@@ -3452,7 +3451,7 @@ fn stage_f_hxblob_round_trip_survives_remount() {
         assert!(false, "boot write must succeed: {:?}", e);
         return;
     }
-    let Ok(mut writer) = FixedHxfsWriter::<_, 16, 32, 256>::mount_with_policies(
+    let Ok(writer) = FixedHxfsWriter::<_, 16, 32, 256>::mount_with_policies(
         store,
         &policies,
         &comps,
@@ -3611,8 +3610,7 @@ fn stage_e2_job_quota_round_trip() {
         assert!(false, "remount image write must succeed: {:?}", e);
         return;
     }
-    let Ok(mut fs) =
-        FixedHxfsWriter::<_, 16, 32, 64>::mount_with_policies(remount, &[], &comps, None)
+    let Ok(fs) = FixedHxfsWriter::<_, 16, 32, 64>::mount_with_policies(remount, &[], &comps, None)
     else {
         assert!(false, "remount must succeed");
         return;
