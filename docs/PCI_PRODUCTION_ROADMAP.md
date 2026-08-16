@@ -4,7 +4,10 @@
 - **Target:** x86_64 UEFI/ACPI systems with PCI/PCIe, NVMe, xHCI, and
   future network and graphics DriverHosts
 - **Architecture:**
-  [PCI_MANAGER_ARCHITECTURE.md](PCI_MANAGER_ARCHITECTURE.md)
+  [PCI_MANAGER_ARCHITECTURE.md](PCI_MANAGER_ARCHITECTURE.md) and
+  [ACPI_RING3.md](ACPI_RING3.md)
+- **Execution plan:**
+  [ACPI_PCI_IMPLEMENTATION_PLAN.md](ACPI_PCI_IMPLEMENTATION_PLAN.md)
 
 This roadmap turns the approved HuesOS userspace PCI Manager architecture into
 small, reviewable delivery stages. It is intentionally stricter than a feature
@@ -24,7 +27,10 @@ HuesOS PCI/PCIe is production-ready only when all of the following are true:
   segments where present.
 - ECAM and legacy CF8/CFC common-subset paths are independently tested.
 - bridge-aware enumeration replaces the flat all-BDF boot scan.
-- one userspace `pci-manager` is the only configuration writer.
+- one userspace `pci-manager` is the only physical configuration executor;
+- AML config reads are mediated through it and first-phase writes are denied;
+- HMCF config windows and HPCI root resources are bound to one immutable ACPI
+  snapshot and independently validated;
 - individual drivers receive only per-device MMIO/IRQ/DMA authority.
 - valid firmware assignments are preserved and conflicts are rejected.
 - DeviceLease generation/revocation prevents BDF-reuse and stale-resource ABA.
@@ -57,7 +63,11 @@ Every stage PR must:
 8. preserve the current NVMe boot path until its replacement is proven;
 9. avoid combining policy, kernel mechanism, userspace orchestration, and
    driver migration into one unreviewable diff;
-10. identify rollback behavior before mutating hardware.
+10. identify rollback behavior before mutating hardware;
+11. bind ACPI/PCI payloads and capabilities to explicit process and firmware
+    snapshot generations;
+12. never add a raw physical/ECAM/CF8 grant as a temporary shortcut around the
+    approved dynamic mint and mediation paths.
 
 A stage may contain several PRs. "Code exists" and "production path uses it"
 are separate states.
@@ -100,7 +110,7 @@ outside its granted buffers.
 |---|---|---|
 | **A** | Architecture and contracts | Approved normative docs; no unresolved ownership or identity ambiguity |
 | **B** | Config transport policy core | Host-tested ECAM/legacy plans and checked `PciAddress` model |
-| **C** | Firmware/root-bridge discovery | Validated MCFG + ACPI root descriptors reach userspace |
+| **C** | Firmware/root-bridge discovery | Snapshot-bound HMCF + AML-produced HPCI reach PCI Manager |
 | **D** | Topology and capabilities | Deterministic multi-segment bridge graph and bounded capability traversal |
 | **E** | Firmware resource validation | BAR/window inventory is conflict-free or explicitly rejected |
 | **F** | Resource planner | Deterministic firmware-preserving allocation with rollback plan |
@@ -125,6 +135,8 @@ Status: **IN PROGRESS**
 Deliver:
 
 - `docs/PCI_MANAGER_ARCHITECTURE.md`;
+- `docs/ACPI_RING3.md`;
+- `docs/ACPI_PCI_IMPLEMENTATION_PLAN.md`;
 - authority and trust boundaries;
 - config backend semantics;
 - address vs identity model;
@@ -146,6 +158,10 @@ Specify, without necessarily implementing:
 
 ```text
 PciAddress
+FirmwareSnapshotId
+ManagerGeneration
+HmcfConfigWindow
+PciConfigMint
 DeviceId
 LeaseGeneration
 PciRootBridgeDescriptor
@@ -289,35 +305,49 @@ Exit criterion:
 
 Status: **IN PROGRESS**
 
-## C.1 MCFG archive path
+## C.1 Archive v2 and HMCF config windows
 
-Implementation status: PCI-3 lands the bounded checksum/reserved/range/overlap
-parser and multi-segment ECAM records. Transport from the live ACPI service and
-QEMU evidence remain open.
+Implementation status: PCI-3 lands the bounded MCFG parser and multi-segment
+ECAM policy records. The live path still lacks archive-v2 RSDP publication,
+HMCF ABI/producer, dynamic capability mint, and QEMU evidence.
 
-ACPI manager exports validated MCFG entries to the PCI Manager bootstrap.
+`acpi-manager` exports validated MCFG entries as an immutable, pointer-free
+HMCF snapshot through DriverManager. HMCF identifies config transports only;
+it is not a root bridge or BAR-aperture description.
 
 Required behavior:
 
+- archive v2 includes validated RSDP and a complete physical-to-VMO index;
 - checksum and SDT length already validated by the ACPI archive;
 - MCFG reserved field zero;
 - record count bounded;
 - segment and bus ranges validated;
 - physical config span checked against overflow;
-- conflicts reported per entry.
+- HMCF carries firmware snapshot and producer generations;
+- DriverManager retains/forwards but does not semantically interpret HMCF;
+- kernel dynamic mint independently cross-checks HMCF against archive MCFG;
+- arbitrary, widened, stale, overlapping, RAM-aliasing, or overflowing ranges
+  are rejected;
+- initial ECAM capability is read-only, uncached, and NX;
+- conflicts are reported per entry/domain.
 
 Exit criterion:
 
-- QEMU Q35 reports one ECAM root through the userspace bootstrap path;
-- malformed synthetic MCFG inputs fail without kernel fault.
+- QEMU Q35 reports one accepted HMCF config domain and exact ECAM capability
+  through the userspace bootstrap path;
+- malformed synthetic MCFG/HMCF and stale mint inputs fail without kernel fault;
+- no public device binding or config write occurs.
 
 ## C.2 Root bridge descriptors
 
-Implementation status: PCI-3 lands the versioned bounded ABI for roots and
-translated apertures. Producing it from `_SEG`/`_BBN`/`_CRS` remains open.
+Implementation status: PCI-3 lands the versioned bounded HPCI ABI for roots and
+translated apertures. Archive-v2 startup, isolated full uACPI runtime,
+mediated OperationRegions, namespace initialization, and the AML producer
+remain open.
 
-Resolve `_SEG`, `_BBN`, and `_CRS` into immutable root descriptors. MCFG is not
-used as an MMIO/BAR aperture source.
+The separately built Ring-3 uACPI runtime resolves `_SEG`, `_BBN`, and `_CRS`
+into immutable HPCI root descriptors. HPCI is bound to the same firmware
+snapshot as HMCF. MCFG is not used as an MMIO/BAR aperture source.
 
 Required tests:
 
@@ -326,12 +356,17 @@ Required tests:
 - multiple roots and segments;
 - overlapping firmware apertures;
 - absent optional methods;
-- bus range outside MCFG;
-- bounded AML response sizes/timeouts.
+- bus range outside HMCF;
+- HMCF/HPCI snapshot-generation mismatch;
+- bounded AML response sizes/timeouts;
+- manager crash/restart and last-good snapshot freeze semantics.
 
 Exit criterion:
 
-- planner input contains explicit allocatable apertures for each root.
+- planner input contains explicit allocatable apertures for each root;
+- Q35 root descriptors travel `acpi-manager → DriverManager → pci-manager`;
+- incomplete roots may be visible diagnostically but remain unbound and receive
+  no lease.
 
 ## C.3 Legacy routing and ownership
 
@@ -355,7 +390,9 @@ policy, including multi-segment roots, bridge parent resolution, deterministic
 ordering, and malformed-graph rejection. Feeding it from live userspace config
 reads and publishing the inventory remain open.
 
-Build immutable topology snapshots without programming devices.
+Build immutable topology snapshots without programming devices. Functions
+seen before complete HPCI may be published only as
+`FirmwareResourcesUnavailable`, read-only and unbound.
 
 Required coverage:
 
@@ -560,32 +597,42 @@ Status: **IN PROGRESS**
 
 Implementation status: PCI-9 lands the separately built BOOTFS service,
 versioned binary hello/ready/heartbeat protocol, DriverManager supervision,
-bounded restart backoff, and explicit no-root fail-closed readiness. Config
-and root authorities are intentionally absent until C.1/C.2 and G.2 land.
+bounded restart backoff, and explicit no-root fail-closed readiness. HMCF/HPCI,
+dynamic config mint, ACPI mediation, and root/config authority remain open.
 
-Launch `pci-manager` from BOOTFS with the unique config/root authority and ACPI
-root descriptors.
+DriverManager launches `pci-manager`, retains immutable firmware snapshots,
+requests exact config capabilities with its unique snapshot-bound mint
+authority, and transfers HMCF/HPCI plus capabilities to matching manager
+generations. DriverManager does not map those capabilities or own PCI policy.
 
 Exit criterion:
 
 - a second process cannot acquire overlapping config authority;
+- arbitrary physical ranges cannot be minted;
+- HMCF/HPCI and capabilities reject stale manager/snapshot generations;
 - manager crash is visible to the root supervisor;
 - boot does not silently fall back without a status marker.
 
 ## H.2 Config backend execution
 
-Wire policy plans to audited privileged boundaries:
+Wire policy plans to audited privileged boundaries in two sub-phases:
 
-- uncached/NX ECAM mapping;
-- exclusive CF8/CFC dword access;
-- one serialized writer;
-- bounded read/write operations;
-- structured write/readback observations.
+1. read-only AML/bootstrap and inventory:
+   - snapshot-bound read-only uncached/NX ECAM mapping;
+   - exclusive CF8/CFC dword access held only by `pci-manager`;
+   - dedicated bounded ACPI→PCI read mediation;
+   - every write denied and observed;
+2. later B.4-approved mutation:
+   - one serialized writer;
+   - named write classes and expected readback masks;
+   - rollback data and structured write/readback observations.
 
 Exit criterion:
 
 - QEMU ECAM and forced-legacy runs enumerate the same segment-0 common
-  inventory.
+  inventory;
+- first-phase logs prove no config write occurred;
+- no write path activates before B.4 exit criteria are met.
 
 ## H.3 Driver binding
 
@@ -885,20 +932,35 @@ PCI production-ready remains false while any of these are true:
 
 ## 5. Immediate next PR sequence
 
-The first implementation cascade after this documentation lands is:
+PCI-1 through PCI-9 are merged policy/bootstrap foundations. The next
+implementation cascade is the AP series defined in full, including branch,
+owner/agent, merge, rollback, and verification rules, in
+[ACPI_PCI_IMPLEMENTATION_PLAN.md](ACPI_PCI_IMPLEMENTATION_PLAN.md).
 
 ```text
-PCI-1  PciAddress / ConfigOffset / ConfigWidth / ConfigError
-PCI-2  checked ECAM + CF8/CFC access planners and conformance vectors
-PCI-3  MCFG parser/root-descriptor wire format
-PCI-4  conventional + extended capability parsing hardening
-PCI-5  bridge-aware immutable topology snapshots
-PCI-6  firmware BAR/window validator
-PCI-7  pure firmware-preserving allocator
+AP-0   ACPI/PCI authority documentation reconciliation (this docs batch)
+AP-1   ACPI archive-v2 ABI and complete translation policy
+AP-2   sealed kernel RSDP-complete snapshot producer
+AP-3   isolated full userspace uACPI build with denied callbacks
+AP-4   bounded userspace allocation/time/synchronization primitives
+AP-5   archive-only uACPI table mapping
+AP-6   generation-safe ACPI Manager supervision and last-good freeze state
+AP-7   HMCF ABI and MCFG producer
+AP-8   dynamic snapshot-bound config capability mint
+AP-9   DriverManager → PCI Manager HMCF/authority handoff
+AP-10  dedicated mediated AML PCI reads; writes denied
+AP-11  approved SystemIO/SystemMemory OperationRegion mediation
+AP-12  IRQ/deferred-work lifecycle and teardown
+AP-13  isolated full AML namespace load
+AP-14  bounded namespace initialization and _PIC
+AP-15  _SEG/_BBN/_CRS HPCI producer and consistency validation
+AP-16  diagnostic read-only/unbound PCI inventory
 ```
 
-No on-target configuration write is added before PCI-1 through PCI-3 are
-host-tested. No kernel bootstrap code is removed before Stage J closes.
+AP-11 is blocked on the explicit SystemMemory/SystemIO grant-derivation
+architecture checkpoint. Config writes remain blocked on B.4 and are not part
+of AP-1 through AP-16. No kernel bootstrap code is removed before Stage J
+closes.
 
 ---
 
@@ -906,20 +968,25 @@ host-tested. No kernel bootstrap code is removed before Stage J closes.
 
 | Track | Status | Evidence |
 |---|---|---|
-| A.1 Normative architecture | Complete | merged architecture document |
-| A.2 ABI vocabulary | Complete (design) | architecture §§6, 12–14 |
-| A.3 Migration map | Complete | architecture §2 + roadmap A.3 |
+| A.1 Normative architecture | Complete (design) | PCI + Ring-3 ACPI authority docs; AP execution plan |
+| A.2 ABI vocabulary | In progress | HPCI complete; HMCF/snapshot/mint/mediation ABIs planned in AP-1/AP-7/AP-10 |
+| A.3 Migration map | Complete | architecture §2 + roadmap A.3 + AP plan |
+| ACPI archive v2 | Not started | AP-1/AP-2; current v1 lacks RSDP and complete index |
+| Full Ring-3 uACPI | Not started | AP-3 through AP-14; kernel crate remains barebones |
+| ACPI supervision | In progress | current archive validator launches once; generation/restart/freeze work is AP-6 |
 | B.1 Checked address vocabulary | Complete | PCI-1 types + PCI-2 bootstrap adoption |
 | B.2 ECAM access planner | Complete (policy) | checked region-relative plans and boundary tests |
 | B.3 Legacy access planner | Complete | common-subset plans; kernel shim migrated |
-| C.1 MCFG decoding | In progress | policy parser complete; live ACPI handoff/QEMU open |
-| C.2 Root descriptor ABI | In progress | bounded wire format complete; AML producer open |
-| D.1 Topology snapshots | In progress | policy graph complete; live enumeration/publication open |
+| C.1 HMCF/config authority | In progress | MCFG policy parser complete; archive-v2/HMCF/mint/handoff AP-1–AP-10 open |
+| C.2 Root descriptor ABI | In progress | bounded HPCI wire format complete; Ring-3 AML producer AP-13–AP-15 open |
+| D.1 Topology snapshots | In progress | policy graph complete; snapshot-bound diagnostic inventory AP-16 open |
 | D.2 Capability parsing | Complete (policy) | bounded conventional/extended decoders; NVMe bootstrap hardened |
 | E.2 Firmware assignment validator | Complete (policy) | translated status report + overlap/forwarding checks |
 | F.1 Firmware-preserving allocator | In progress | deterministic pre-sized planning complete; aggregation/reserves open |
 | G.1 DeviceLease policy | Complete (policy) | generation-safe lifecycle and fail-closed transition tests |
-| H.1 PCI Manager bootstrap | In progress | process/protocol/restart skeleton; root/config authority open |
+| H.1 PCI Manager bootstrap | In progress | process/restart skeleton complete; HMCF/mint/ACPI mediation AP-7–AP-10 open |
+| AP-0 authority reconciliation | In review | normative docs + owner/agent execution plan |
+| AP-1–AP-16 | Not started | must merge in documented batches/order |
 | B.4, C.3, D.3, E.1, F.2–F.3, G.2–G.3, H.2–O | Not started | no production claim |
 
 Update this table in every PCI stage PR. A track may be marked complete only

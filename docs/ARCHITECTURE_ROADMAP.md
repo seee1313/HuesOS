@@ -22,9 +22,13 @@ The PCI/PCIe subsystem now has its own approved normative architecture and
 production delivery plan:
 [PCI_MANAGER_ARCHITECTURE.md](PCI_MANAGER_ARCHITECTURE.md) defines the
 userspace PCI Manager, configuration authority, DeviceLease, DMA, hotplug, and
-rebalance model; [PCI_PRODUCTION_ROADMAP.md](PCI_PRODUCTION_ROADMAP.md) defines
-the staged implementation and release gates. Those documents supersede any
-older PCI-specific sketch in this general roadmap.
+rebalance model; [ACPI_RING3.md](ACPI_RING3.md) defines the isolated firmware
+runtime and ACPI→PCI authority boundary;
+[PCI_PRODUCTION_ROADMAP.md](PCI_PRODUCTION_ROADMAP.md) defines the staged
+release gates; and
+[ACPI_PCI_IMPLEMENTATION_PLAN.md](ACPI_PCI_IMPLEMENTATION_PLAN.md) is the
+ordered owner/agent PR plan. Those documents supersede any older PCI/ACPI
+sketch in this general roadmap.
 
 ---
 

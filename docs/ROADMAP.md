@@ -11,10 +11,13 @@ state is a strong foundation through Hxfs Stage I, not yet full production
 mutable Hxfs.
 
 PCI/PCIe modernization is tracked in
-[PCI Manager Architecture](PCI_MANAGER_ARCHITECTURE.md) and the dedicated
-[PCI Production Roadmap](PCI_PRODUCTION_ROADMAP.md). The current kernel
-CF8/CFC NVMe bootstrap remains a migration shim; PCI production-ready is false
-until the userspace manager path and its release gates close.
+[PCI Manager Architecture](PCI_MANAGER_ARCHITECTURE.md), the isolated
+[Ring-3 ACPI Architecture](ACPI_RING3.md), the dedicated
+[PCI Production Roadmap](PCI_PRODUCTION_ROADMAP.md), and the ordered
+[ACPI → PCI Implementation PR Plan](ACPI_PCI_IMPLEMENTATION_PLAN.md). The
+current kernel CF8/CFC NVMe bootstrap remains a migration shim; PCI
+production-ready is false until the userspace manager path and its release
+gates close.
 
 ## Done (recent)
 

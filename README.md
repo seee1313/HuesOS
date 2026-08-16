@@ -175,8 +175,11 @@ hardening effort is tracked in
 [docs/ALLOCATOR_HARDENING.md](docs/ALLOCATOR_HARDENING.md). The approved
 userspace PCI Manager architecture and its staged production gates are defined
 in [docs/PCI_MANAGER_ARCHITECTURE.md](docs/PCI_MANAGER_ARCHITECTURE.md) and
-[docs/PCI_PRODUCTION_ROADMAP.md](docs/PCI_PRODUCTION_ROADMAP.md). The
-host-testable policy crates are each documented in
+[docs/PCI_PRODUCTION_ROADMAP.md](docs/PCI_PRODUCTION_ROADMAP.md). The matching
+Ring-3 firmware boundary and shared owner/agent delivery sequence are defined in
+[docs/ACPI_RING3.md](docs/ACPI_RING3.md) and
+[docs/ACPI_PCI_IMPLEMENTATION_PLAN.md](docs/ACPI_PCI_IMPLEMENTATION_PLAN.md).
+The host-testable policy crates are each documented in
 [docs/OBJECT_LIFECYCLE_POLICY.md](docs/OBJECT_LIFECYCLE_POLICY.md),
 [docs/IOAPIC_ROUTING.md](docs/IOAPIC_ROUTING.md),
 [docs/RECOVERABLE_COPIES.md](docs/RECOVERABLE_COPIES.md),
