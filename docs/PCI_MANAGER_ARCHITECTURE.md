@@ -11,7 +11,10 @@ not silently change the trust boundaries, ownership model, or lifecycle
 invariants described here.
 
 The staged delivery plan and production exit criteria are tracked separately in
-[PCI_PRODUCTION_ROADMAP.md](PCI_PRODUCTION_ROADMAP.md).
+[PCI_PRODUCTION_ROADMAP.md](PCI_PRODUCTION_ROADMAP.md). The firmware/AML trust
+boundary is normative in [ACPI_RING3.md](ACPI_RING3.md), and the shared
+owner/agent PR sequence is maintained in
+[ACPI_PCI_IMPLEMENTATION_PLAN.md](ACPI_PCI_IMPLEMENTATION_PLAN.md).
 
 ---
 
@@ -25,8 +28,18 @@ drivers run in separate userspace processes and receive only the resources of
 one assigned device.
 
 ```text
-ACPI manager / firmware archive
-        │  root bridges, MCFG, _CRS, _PRT, hotplug events
+kernel barebones ACPI → immutable archive v2
+        │
+        ▼
+DriverManager (snapshot cache, generations, capability transport)
+        │
+        ├── acpi-manager
+        │     ├── MCFG → HMCF config-window snapshot
+        │     └── _SEG/_BBN/_CRS → HPCI root snapshot
+        │
+        ├── HMCF + unique mint authority → kernel cross-check
+        │     └── exact ECAM/CF8 capabilities
+        │
         ▼
 ┌──────────────────────────────────────────────────────────────┐
 │ pci-manager (privileged userspace component)                 │
@@ -46,7 +59,7 @@ ACPI manager / firmware archive
 
 Kernel mechanisms:
   Process + Handle rights + Resource + Interrupt + VMO/VMAR
-  future DeviceLease revocation + DmaDomain/IOMMU
+  snapshot-bound config mint + future DeviceLease/DmaDomain/IOMMU
 ```
 
 The architecture intentionally combines lessons from several systems:
@@ -102,9 +115,9 @@ pci-manager discovers/configures NVMe
    binding, topology, BAR planning, and hotplug orchestration live in
    userspace. The kernel enforces capabilities, mappings, interrupts, process
    teardown, and DMA isolation where hardware permits it.
-2. **One configuration writer.** Only `pci-manager` may write PCI
-   configuration space. A DriverHost never receives an ECAM window or CF8/CFC
-   authority.
+2. **One configuration executor.** Only `pci-manager` performs physical PCI
+   configuration reads or writes. ACPI and DriverHosts use bounded mediated
+   operations and never receive an ECAM window or CF8/CFC authority.
 3. **Fine-grained driver authority.** A DriverHost receives only one device's
    approved MMIO/I/O ranges, interrupt handles, DMA domain/pool, and service
    channels.
@@ -155,11 +168,19 @@ proven.
 
 The initial PCI TCB contains:
 
-- the kernel's capability, mapping, interrupt, and process teardown paths;
-- ACPI table validation and the root-bridge descriptor producer;
+- the kernel's capability, mapping, dynamic config-mint, interrupt, and process
+  teardown paths;
+- barebones ACPI table validation and sealed archive construction;
+- the isolated `acpi-manager` root-bridge descriptor producer;
 - `pci-manager`;
-- the component/root supervisor that launches `pci-manager` with its unique
-  authority.
+- the component/root supervisor that retains immutable snapshots and launches
+  both managers with generation-bound authority.
+
+`acpi-manager` is in the firmware-policy TCB but outside the kernel
+memory-safety TCB. It receives no raw physical-memory or PCI-config authority.
+DriverManager is trusted to transport handles and enforce lifecycle ordering,
+but it does not interpret HMCF/HPCI semantically or perform configuration
+access.
 
 Individual DriverHosts are outside the memory-safety TCB when an IOMMU domain
 is active. Without an IOMMU, any bus-mastering driver remains part of the
@@ -172,22 +193,53 @@ pool.
 is transport-specific but exposed to the manager through one internal
 `ConfigAccess` abstraction.
 
-Target grants:
+Target grants are minted dynamically from immutable firmware data rather than
+from caller-supplied physical ranges:
 
 ```text
-ECAM root:
-  read/write uncached mapping of validated MCFG config windows
+DriverManager:
+  unique PciConfigMint authority bound to firmware_snapshot_id
+  may request and transfer exact config capabilities
+  may not map or execute them
+
+Initial ECAM root:
+  read-only uncached/NX mapping exactly matching one accepted HMCF/MCFG window
+
+Later write-capable ECAM root:
+  separate authority upgrade after HPCI + B.4 write-policy gates
 
 Legacy root:
-  exclusive dword I/O authority for 0xCF8/0xCFC
+  exact exclusive dword I/O authority for 0xCF8/0xCFC
   segment 0 only, conventional 256-byte space only
+  transferred only to pci-manager
 ```
 
-A future kernel `PciConfig` object/syscall may replace direct ECAM/port grants
-if audit evidence shows that mediation materially reduces risk. The userspace
-ownership rule does not depend on which mechanism is selected.
+The mint syscall independently decodes HMCF and cross-checks it against MCFG in
+the bound sealed ACPI archive. Unknown, widened, stale, overflowing, overlapping,
+or RAM-aliasing records fail closed. HPCI alone never mints config authority.
 
-### 5.3 Driver-facing mediation
+A future kernel `PciConfig` execution object may replace direct ECAM/port grants
+only through a separately approved architecture change if audit evidence shows
+that mediation materially reduces risk. The userspace ownership rule does not
+depend on the physical transport mechanism.
+
+### 5.3 ACPI-facing mediation
+
+Full Ring-3 uACPI may require PCI Config OperationRegion access while loading or
+initializing the namespace. `acpi-manager` does not receive ECAM/CF8 authority
+and does not use the kernel ACPI broker for PCI.
+
+DriverManager connects it to `pci-manager` through a private, versioned channel.
+The first phase supports bounded reads only and carries both manager
+generations, `firmware_snapshot_id`, segment:BDF, offset, width, and correlation
+ID. `pci-manager` performs the physical read. Every write is rejected and
+observed until B.4 lands.
+
+The existing append-only ACPI broker opcode numbers `PciRead` and `PciWrite`
+remain reserved but permanently hard-denied; no kernel backend or PCI grant is
+implemented for them.
+
+### 5.4 Driver-facing mediation
 
 Drivers do not receive raw configuration authority. They use a per-device IPC
 protocol offered by `pci-manager`, with operations such as:
@@ -312,8 +364,13 @@ normative:
 
 ### 7.2 ECAM backend
 
-MCFG supplies one or more enhanced configuration windows. Address calculation
-uses checked arithmetic:
+MCFG supplies one or more enhanced configuration windows. `acpi-manager`
+publishes their validated pointer-free representation as a bounded HMCF
+snapshot. HMCF is transported and retained by DriverManager, independently
+validated by `pci-manager`, and cross-checked by the kernel before any exact
+mapping capability is minted. HMCF does not describe allocatable BAR apertures.
+
+Address calculation uses checked arithmetic:
 
 ```text
 ecam = base
@@ -329,10 +386,13 @@ Validation requirements:
 - bus lies inside exactly one applicable segment window;
 - physical `base + span` does not overflow;
 - windows do not overlap inconsistently;
-- region is mapped uncached/NX;
+- HMCF snapshot and manager generations match the bound archive/mint request;
+- kernel cross-check finds an exact canonical MCFG record, never a userspace
+  physical-range assertion;
+- the initial region is mapped read-only, uncached, and NX;
 - offset is within `[0, 4096)`;
 - firmware-reserved and RAM ranges cannot alias the ECAM mapping;
-- malformed MCFG disables only the affected root/segment and emits an
+- malformed MCFG/HMCF disables only the affected config domain and emits an
   observation record.
 
 ### 7.3 Legacy CF8/CFC backend
@@ -371,9 +431,17 @@ Production resource allocation also needs ACPI host-bridge information:
 - hotplug notifications and slot metadata where firmware exposes them.
 
 The ACPI service publishes immutable, validated `PciRootBridgeDescriptor`
-records. `pci-manager` does not evaluate arbitrary AML while holding the
-configuration transaction lock. ACPI requests required by hotplug are issued
-as bounded asynchronous operations outside the planner.
+(HPCI) records through DriverManager. HPCI is generation-bound to the same
+`firmware_snapshot_id` as HMCF. DriverManager validates only the envelope and
+retains a last-good read-only VMO; `pci-manager` independently validates record
+semantics and HMCF/HPCI segment/bus consistency.
+
+`pci-manager` does not evaluate arbitrary AML while holding the configuration
+transaction lock. ACPI requests required by hotplug are issued as bounded
+asynchronous operations outside the planner. An ACPI manager crash retains the
+last-good static snapshots for existing devices but freezes new leases,
+binding, hotplug, rebalance, BDF reuse, and topology-generation advancement
+until restart and revalidation.
 
 A root descriptor includes at least:
 
@@ -411,10 +479,15 @@ Required behavior:
   available;
 - retain unknown devices and unknown capabilities in the inventory rather than
   dropping them;
+- a function observed through HMCF before complete HPCI may appear only with
+  `FirmwareResourcesUnavailable`; it is read-only, unbound, and receives no
+  lease;
 - publish a deterministic topology ordering;
-- record the config backend and snapshot generation.
+- record config backend, ACPI/PCI manager generations, and firmware snapshot
+  generation.
 
-The snapshot is the source for driver matching and planning. A hotplug event
+Only a snapshot rooted in accepted HPCI is a source for driver matching and
+planning. A hotplug event
 creates a new snapshot; it never mutates a graph while clients iterate it.
 
 ---
@@ -730,6 +803,12 @@ DMA mode accepted, and the hardware reached an operational state.
 - topology snapshots are immutable and generation tagged;
 - no config or topology lock is held while waiting for a DriverHost response;
 - no manager lock is held across ACPI IPC;
+- AML PCI requests carry both process generations and a snapshot ID; stale
+  requests/replies are rejected;
+- DriverManager never replaces a last-good HMCF/HPCI snapshot implicitly after
+  ACPI restart;
+- while ACPI is unavailable, existing non-ACPI-dependent operations may
+  continue but new lifecycle/topology work remains frozen;
 - rebalance uses explicit transaction state, not lock ownership, to span
   asynchronous quiesce/resume operations;
 - IRQ/hotplug callbacks enqueue bounded events and do not perform enumeration
@@ -744,6 +823,11 @@ DMA mode accepted, and the hardware reached an operational state.
 Required structured records include:
 
 ```text
+ACPI archive/snapshot generation accepted/rejected
+HMCF accepted/rejected
+config capability mint accepted/rejected
+ACPI mediated config read/denied write/timeout
+ACPI manager crash/restart/frozen-snapshot state
 root bridge accepted/rejected
 config backend selected
 function discovered/removed
@@ -768,21 +852,26 @@ or JSON form so field failures can be reproduced in host tests.
 
 The following are release-blocking invariants:
 
-1. Only `pci-manager` can write PCI configuration space.
-2. A DriverHost cannot map another device's BAR.
-3. Numeric overlap checks are atomic and use half-open checked ranges.
-4. BDF reuse cannot revive an old handle or lease.
-5. No BAR/window lies outside a declared root aperture.
-6. No two live exclusive resources overlap.
-7. No device is marked Online before BAR/IRQ/DMA setup and readback succeed.
-8. Bus mastering is off while resources are moved or revoked.
-9. Old MMIO/IRQ/DMA authority is invalid before an address is reassigned.
-10. Surprise removal cannot leave a driver serving successful I/O.
-11. Trusted DMA mode is never represented as IOMMU isolation.
-12. Config, capability, and topology walks are bounded on malformed hardware.
-13. A failed rebalance publishes neither a partial topology nor partially
+1. Only `pci-manager` can execute PCI configuration reads or writes; the first
+   AML mediation phase permits reads only.
+2. Dynamic ECAM/CF8 minting accepts no naked physical range and succeeds only
+   after HMCF matches MCFG in the bound immutable ACPI snapshot.
+3. `acpi-manager` and the kernel ACPI broker never receive ECAM/CF8 authority;
+   legacy ACPI broker PCI opcodes remain hard-denied.
+4. A DriverHost cannot map another device's BAR.
+5. Numeric overlap checks are atomic and use half-open checked ranges.
+6. BDF reuse cannot revive an old handle or lease.
+7. No BAR/window lies outside a declared root aperture.
+8. No two live exclusive resources overlap.
+9. No device is marked Online before BAR/IRQ/DMA setup and readback succeed.
+10. Bus mastering is off while resources are moved or revoked.
+11. Old MMIO/IRQ/DMA authority is invalid before an address is reassigned.
+12. Surprise removal cannot leave a driver serving successful I/O.
+13. Trusted DMA mode is never represented as IOMMU isolation.
+14. Config, capability, and topology walks are bounded on malformed hardware.
+15. A failed rebalance publishes neither a partial topology nor partially
     restored leases.
-14. The boot NVMe shim and `pci-manager` never configure the same live function
+16. The boot NVMe shim and `pci-manager` never configure the same live function
     concurrently during migration.
 
 ---
@@ -791,7 +880,11 @@ The following are release-blocking invariants:
 
 ### Host tests
 
-- MCFG/root descriptor validation and overlap rejection;
+- archive-v2 RSDP/SDT/physical-translation completeness and overflow rejection;
+- MCFG/HMCF/root descriptor validation and overlap rejection;
+- snapshot-bound config mint rejection for stale, widened, unknown, and
+  RAM-aliasing records;
+- ACPI mediated config reads and unconditional first-phase write denial;
 - ECAM/legacy access planning and overflow/alignment boundaries;
 - conventional and extended capability cycles/truncation;
 - bridge topology loops, duplicate BDFs, depth/node limits;
@@ -806,6 +899,10 @@ The following are release-blocking invariants:
 
 ### QEMU tests
 
+- Q35/OVMF archive-v2, HMCF, dynamic ECAM mint, and HPCI bootstrap markers;
+- full Ring-3 namespace load before public PCI inventory;
+- mediated AML config reads with all first-phase writes denied;
+- ACPI manager crash/restart with last-good snapshot freeze semantics;
 - Q35/OVMF ECAM enumeration;
 - forced legacy backend on segment 0;
 - multifunction and nested bridge synthetic topologies;
@@ -853,6 +950,12 @@ specified.
   <https://genode.org/documentation/genode-foundations/25.05/under_the_hood/Execution_on_the_NOVA_microhypervisor_(base-nova).html>
 - Barrelfish architecture overview, SKB/Kaluga/device capabilities:
   <https://barrelfish.org/publications/TN-000-Overview.pdf>
+- Barrelfish ACPI root publication and PCI-domain bootstrap:
+  <https://barrelfish.org/publications/TN-019-DeviceDriver.pdf>
+- uACPI host API and userspace-runtime examples:
+  <https://uacpi.github.io/>
+- ACPI PCI host-bridge requirements:
+  <https://docs.kernel.org/PCI/acpi-info.html>
 - seL4 capDL hardware capability model:
   <https://docs.sel4.systems/projects/capdl/lang-spec.html>
 - Linux PCI API documentation:
@@ -868,7 +971,18 @@ specified.
 
 - PCI enumeration and binding policy belongs to a privileged userspace
   `pci-manager`.
-- Only `pci-manager` writes configuration space.
+- Only `pci-manager` executes configuration-space reads or writes; ACPI and
+  drivers use mediated protocols.
+- HMCF config windows and HPCI root resources are separate immutable ABIs bound
+  to one firmware snapshot.
+- DriverManager retains snapshots and generations but owns no AML or PCI
+  policy.
+- ECAM/CF8 capabilities are minted dynamically only after kernel cross-check of
+  HMCF against MCFG in the bound sealed archive.
+- The first AML PCI phase permits mediated reads only; writes fail closed.
+- Legacy ACPI broker PCI opcodes remain reserved and permanently hard-denied.
+- ACPI manager failure retains last-good snapshots for existing devices while
+  freezing new PCI lifecycle operations until revalidation.
 - Individual DriverHosts receive narrow device resources and mediated control
   operations, not ECAM/CF8 authority.
 - ECAM and CF8/CFC are equal on their common segment-0 conventional-config
