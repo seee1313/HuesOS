@@ -554,9 +554,14 @@ Exit criterion:
 
 # Stage H — Userspace PCI Manager
 
-Status: **NOT STARTED**
+Status: **IN PROGRESS**
 
 ## H.1 Component bootstrap
+
+Implementation status: PCI-9 lands the separately built BOOTFS service,
+versioned binary hello/ready/heartbeat protocol, DriverManager supervision,
+bounded restart backoff, and explicit no-root fail-closed readiness. Config
+and root authorities are intentionally absent until C.1/C.2 and G.2 land.
 
 Launch `pci-manager` from BOOTFS with the unique config/root authority and ACPI
 root descriptors.
@@ -914,7 +919,8 @@ host-tested. No kernel bootstrap code is removed before Stage J closes.
 | E.2 Firmware assignment validator | Complete (policy) | translated status report + overlap/forwarding checks |
 | F.1 Firmware-preserving allocator | In progress | deterministic pre-sized planning complete; aggregation/reserves open |
 | G.1 DeviceLease policy | Complete (policy) | generation-safe lifecycle and fail-closed transition tests |
-| B.4, C.3, D.3, E.1, F.2–F.3, G.2–O | Not started | no production claim |
+| H.1 PCI Manager bootstrap | In progress | process/protocol/restart skeleton; root/config authority open |
+| B.4, C.3, D.3, E.1, F.2–F.3, G.2–G.3, H.2–O | Not started | no production claim |
 
 Update this table in every PCI stage PR. A track may be marked complete only
 with its exit criterion and verification command/log named in the PR.

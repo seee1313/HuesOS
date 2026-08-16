@@ -34,6 +34,10 @@ This runs, e.g.:
 - `huesos-object`: bounded Channel/Port queue admission, batch handle-move
   validation, and quota exhaustion are host-tested; the kernel scheduler also
   carries a pending-wake handshake for SMP enqueue-to-park races.
+- `huesos-abi::pci_manager`: fixed hello/ready/heartbeat messages reject short,
+  unknown, and zero-generation inputs. QEMU smoke requires both the isolated
+  service's no-root fail-closed marker and DriverManager's matching supervised
+  readiness marker.
 - `huesos-hxfs`: checkpoint geometry is checked against the actual target and
   journal LBA spans. Plain and Hxblob-enabled regressions simulate power loss
   after the `RECOVERING` root is durable but before the final clean root,
@@ -74,7 +78,7 @@ make fmt-check       # the last one on its own
 | `check-hues-async-noalloc.py` | `crates/hues-async/**` never allocates — no `alloc`, no heap collection, tests included |
 | `check-huesos-object-lock-policy.py` | no bare `spin::Mutex` outside `irq_guard.rs` |
 | `check-poll-budgets.py` | every channel-draining loop in a shared service is bounded (see below) |
-| `fmt-all.py --check` | formatting across the kernel workspace **and** the 11 standalone userspace crates, which plain `cargo fmt --all` does not reach |
+| `fmt-all.py --check` | formatting across the kernel workspace **and every standalone userspace crate**, which plain `cargo fmt --all` does not reach |
 
 ### The poll-budget gate
 

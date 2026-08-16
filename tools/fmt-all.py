@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Format (or check formatting of) every Rust crate in the HuesOS repository.
 
-The workspace `cargo fmt --all` covers the 25 crates declared in the root
-`Cargo.toml`, but the 8 standalone userspace binaries under
+The workspace `cargo fmt --all` covers the crates declared in the root
+`Cargo.toml`, but the standalone userspace binaries under
 `crates/huesos-userspace/` are intentionally excluded from the workspace (they
 target ring-3 with a separate linker script and are built by
 `huesos-kernel/build.rs`). Without this helper it is trivial to land a PR that

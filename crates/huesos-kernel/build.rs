@@ -100,6 +100,14 @@ fn main() {
         &[],
         &[],
     );
+    let pci_manager = build_userspace_program(
+        &userspace_root,
+        "pci-manager",
+        "huesos-pci-manager",
+        profile,
+        &[],
+        &[],
+    );
     let shutdown_broker = build_userspace_program(
         &userspace_root,
         "shutdown-broker",
@@ -144,6 +152,7 @@ fn main() {
             nvme_driver_host: &nvme_driver_host,
             hxfs_service: &hxfs_service,
             acpi_manager: &acpi_manager,
+            pci_manager: &pci_manager,
             shutdown_broker: &shutdown_broker,
             terminal: &terminal,
             doom: &doom,
@@ -222,6 +231,7 @@ fn track_userspace_inputs(userspace_root: &Path) {
         "driver-host-nvme",
         "hxfs-service",
         "acpi-manager",
+        "pci-manager",
         "shutdown-broker",
         "terminal",
         "doom",
@@ -312,6 +322,7 @@ struct BootfsInputs<'a> {
     nvme_driver_host: &'a Path,
     hxfs_service: &'a Path,
     acpi_manager: &'a Path,
+    pci_manager: &'a Path,
     shutdown_broker: &'a Path,
     terminal: &'a Path,
     doom: &'a Path,
@@ -439,6 +450,10 @@ fn build_bootfs_image(manifest_dir: &Path, inputs: BootfsInputs<'_>) -> PathBuf 
         BootFsFile {
             path: "/services/acpi-manager.elf",
             data: read_build_input(inputs.acpi_manager, "ACPI manager ELF"),
+        },
+        BootFsFile {
+            path: "/services/pci-manager.elf",
+            data: read_build_input(inputs.pci_manager, "PCI manager ELF"),
         },
         BootFsFile {
             path: "/services/shutdown-broker.elf",
