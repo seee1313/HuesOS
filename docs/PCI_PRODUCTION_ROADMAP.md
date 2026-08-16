@@ -505,9 +505,14 @@ Exit criterion:
 
 # Stage G — DeviceLease and revocation
 
-Status: **NOT STARTED**
+Status: **IN PROGRESS**
 
 ## G.1 Lease policy core
+
+Implementation status: **complete (policy) in PCI-8**. Device identity,
+generation, relocation class, DMA isolation mode, resource-mint/I/O gates, and
+fail-closed lifecycle transitions are host-tested. Kernel object enforcement
+remains G.2.
 
 Implement a safe host-testable state machine:
 
@@ -908,7 +913,8 @@ host-tested. No kernel bootstrap code is removed before Stage J closes.
 | D.2 Capability parsing | Complete (policy) | bounded conventional/extended decoders; NVMe bootstrap hardened |
 | E.2 Firmware assignment validator | Complete (policy) | translated status report + overlap/forwarding checks |
 | F.1 Firmware-preserving allocator | In progress | deterministic pre-sized planning complete; aggregation/reserves open |
-| B.4, C.3, D.3, E.1, F.2–O | Not started | no production claim |
+| G.1 DeviceLease policy | Complete (policy) | generation-safe lifecycle and fail-closed transition tests |
+| B.4, C.3, D.3, E.1, F.2–F.3, G.2–O | Not started | no production claim |
 
 Update this table in every PCI stage PR. A track may be marked complete only
 with its exit criterion and verification command/log named in the PR.
