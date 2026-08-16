@@ -19,6 +19,10 @@ use alloc::vec::Vec;
 pub mod capability;
 /// ACPI MCFG allocation-table decoding and validation.
 pub mod mcfg;
+/// Firmware BAR/bridge-window validation and bus-to-CPU translation.
+pub mod resource_validation;
+/// Immutable, generation-tagged PCI bridge topology snapshots.
+pub mod topology;
 
 /// Bytes in conventional PCI configuration space.
 pub const CONVENTIONAL_CONFIG_BYTES: u16 = 256;
@@ -75,6 +79,14 @@ pub struct PciAddress {
 }
 
 impl PciAddress {
+    /// Segment 0, bus 0, device 0, function 0.
+    pub const ZERO: Self = Self {
+        segment: 0,
+        bus: 0,
+        device: 0,
+        function: 0,
+    };
+
     /// Construct a checked segment:bus:device.function address.
     pub const fn try_new(
         segment: u16,
