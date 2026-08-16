@@ -304,7 +304,13 @@ fn resource_shape_valid(topology: &TopologySnapshot, resource: FirmwareResource)
             }
         }
         ResourceRegister::BridgeWindow(index) => {
-            if index >= 3
+            let class_matches = matches!(
+                (index, resource.class),
+                (0, ResourceClass::Io)
+                    | (1, ResourceClass::Mmio32)
+                    | (2, ResourceClass::PrefetchableMemory)
+            );
+            if !class_matches
                 || !matches!(
                     topology.find(resource.owner).map(|node| node.function.kind),
                     Some(FunctionKind::PciBridge { .. })
