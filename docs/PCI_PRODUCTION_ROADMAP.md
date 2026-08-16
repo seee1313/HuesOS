@@ -190,8 +190,9 @@ Status: **IN PROGRESS**
 
 ## B.1 Address and width model
 
-Implementation status: checked address/offset/width/error types land in PCI-1;
-transport call sites move off ad-hoc encoding in PCI-2.
+Implementation status: complete across PCI-1/PCI-2. Checked vocabulary landed
+first; PCI-2 removes the current kernel bootstrap shim's ad-hoc CF8 encoding in
+favor of the shared planner.
 
 Extend `huesos-pci` with checked, safe types:
 
@@ -216,6 +217,9 @@ Exit criterion:
 
 ## B.2 ECAM access planning
 
+Implementation status: **complete (policy core) in PCI-2**; physical ECAM
+mapping/execution remains Stage H.
+
 Implement pure checked ECAM address calculation from a validated MCFG window.
 No physical pointer dereference belongs in this track.
 
@@ -235,6 +239,9 @@ Exit criterion:
   on-target backend.
 
 ## B.3 Legacy access planning
+
+Implementation status: **complete in PCI-2**, including migration of the
+current kernel NVMe bootstrap shim to checked plans.
 
 Implement a pure CF8 address planner for the common subset:
 
@@ -280,9 +287,13 @@ Exit criterion:
 
 # Stage C — Firmware and root-bridge discovery
 
-Status: **NOT STARTED**
+Status: **IN PROGRESS**
 
 ## C.1 MCFG archive path
+
+Implementation status: PCI-3 lands the bounded checksum/reserved/range/overlap
+parser and multi-segment ECAM records. Transport from the live ACPI service and
+QEMU evidence remain open.
 
 ACPI manager exports validated MCFG entries to the PCI Manager bootstrap.
 
@@ -301,6 +312,9 @@ Exit criterion:
 - malformed synthetic MCFG inputs fail without kernel fault.
 
 ## C.2 Root bridge descriptors
+
+Implementation status: PCI-3 lands the versioned bounded ABI for roots and
+translated apertures. Producing it from `_SEG`/`_BBN`/`_CRS` remains open.
 
 Resolve `_SEG`, `_BBN`, and `_CRS` into immutable root descriptors. MCFG is not
 used as an MMIO/BAR aperture source.
@@ -332,9 +346,14 @@ Exit criterion:
 
 # Stage D — Topology and capability enumeration
 
-Status: **NOT STARTED**
+Status: **IN PROGRESS**
 
 ## D.1 Read-only userspace enumeration
+
+Implementation status: PCI-5 lands the immutable generation-tagged topology
+policy, including multi-segment roots, bridge parent resolution, deterministic
+ordering, and malformed-graph rejection. Feeding it from live userspace config
+reads and publishing the inventory remain open.
 
 Build immutable topology snapshots without programming devices.
 
@@ -353,6 +372,11 @@ Exit criterion:
 - QEMU and synthetic topology dumps are deterministic and generation tagged.
 
 ## D.2 Capability parsing
+
+Implementation status: **complete (policy core) in PCI-4**. Conventional and
+PCIe extended lists share bounded checked decoders; the current NVMe bootstrap
+now rejects malformed or duplicate interrupt capabilities rather than using a
+partial view. Live ECAM inventory integration remains part of D.1/H.2.
 
 Extend current MSI/MSI-X parsing to conventional and ECAM-only extended
 capabilities.
@@ -386,7 +410,7 @@ Exit criterion:
 
 # Stage E — Firmware resource validation
 
-Status: **NOT STARTED**
+Status: **IN PROGRESS**
 
 ## E.1 BAR inventory
 
@@ -407,6 +431,11 @@ Exit criterion:
 
 ## E.2 Firmware assignment validator
 
+Implementation status: PCI-6 lands the pure validator and canonical status
+report, including explicit bus-to-CPU translation, collision checks, and
+parent-window forwarding. Supplying BAR/window inventory from live enumeration
+remains E.1/D.1 work.
+
 Validate that:
 
 - every BAR lies in a matching root/bridge aperture;
@@ -425,9 +454,15 @@ Exit criterion:
 
 # Stage F — Firmware-preserving resource planner
 
-Status: **NOT STARTED**
+Status: **IN PROGRESS**
 
 ## F.1 Pure allocation model
+
+Implementation status: PCI-7 lands deterministic firmware-preserving
+allocation for pre-sized BAR/window requirements, including parent-domain
+placement, translation, fixed-resource preservation, and no-space refusal.
+Bottom-up requirement aggregation and configurable hotplug reserves remain
+open.
 
 Input is a topology snapshot, root apertures, resource requirements, and fixed
 assignments. Output is an immutable plan; hardware is never touched.
@@ -470,9 +505,14 @@ Exit criterion:
 
 # Stage G — DeviceLease and revocation
 
-Status: **NOT STARTED**
+Status: **IN PROGRESS**
 
 ## G.1 Lease policy core
+
+Implementation status: **complete (policy) in PCI-8**. Device identity,
+generation, relocation class, DMA isolation mode, resource-mint/I/O gates, and
+fail-closed lifecycle transitions are host-tested. Kernel object enforcement
+remains G.2.
 
 Implement a safe host-testable state machine:
 
@@ -514,9 +554,14 @@ Exit criterion:
 
 # Stage H — Userspace PCI Manager
 
-Status: **NOT STARTED**
+Status: **IN PROGRESS**
 
 ## H.1 Component bootstrap
+
+Implementation status: PCI-9 lands the separately built BOOTFS service,
+versioned binary hello/ready/heartbeat protocol, DriverManager supervision,
+bounded restart backoff, and explicit no-root fail-closed readiness. Config
+and root authorities are intentionally absent until C.1/C.2 and G.2 land.
 
 Launch `pci-manager` from BOOTFS with the unique config/root authority and ACPI
 root descriptors.
@@ -864,8 +909,18 @@ host-tested. No kernel bootstrap code is removed before Stage J closes.
 | A.1 Normative architecture | Complete | merged architecture document |
 | A.2 ABI vocabulary | Complete (design) | architecture §§6, 12–14 |
 | A.3 Migration map | Complete | architecture §2 + roadmap A.3 |
-| B.1 Checked address vocabulary | In progress | PCI-1 types/tests; transport adoption follows in PCI-2 |
-| B.2–O | Not started | no production claim |
+| B.1 Checked address vocabulary | Complete | PCI-1 types + PCI-2 bootstrap adoption |
+| B.2 ECAM access planner | Complete (policy) | checked region-relative plans and boundary tests |
+| B.3 Legacy access planner | Complete | common-subset plans; kernel shim migrated |
+| C.1 MCFG decoding | In progress | policy parser complete; live ACPI handoff/QEMU open |
+| C.2 Root descriptor ABI | In progress | bounded wire format complete; AML producer open |
+| D.1 Topology snapshots | In progress | policy graph complete; live enumeration/publication open |
+| D.2 Capability parsing | Complete (policy) | bounded conventional/extended decoders; NVMe bootstrap hardened |
+| E.2 Firmware assignment validator | Complete (policy) | translated status report + overlap/forwarding checks |
+| F.1 Firmware-preserving allocator | In progress | deterministic pre-sized planning complete; aggregation/reserves open |
+| G.1 DeviceLease policy | Complete (policy) | generation-safe lifecycle and fail-closed transition tests |
+| H.1 PCI Manager bootstrap | In progress | process/protocol/restart skeleton; root/config authority open |
+| B.4, C.3, D.3, E.1, F.2–F.3, G.2–G.3, H.2–O | Not started | no production claim |
 
 Update this table in every PCI stage PR. A track may be marked complete only
 with its exit criterion and verification command/log named in the PR.

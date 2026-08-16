@@ -38,6 +38,11 @@ pub mod acpi_archive;
 /// DriverManager.
 pub mod storage_boot;
 
+/// PCI Manager root-bridge descriptor protocol.
+pub mod pci;
+/// PCI Manager bootstrap and lifecycle control protocol.
+pub mod pci_manager;
+
 /// HBI boot-driver manifest ABI.
 pub mod hbi_boot {
     /// Magic for `/storage/boot-drivers.manifest`.
