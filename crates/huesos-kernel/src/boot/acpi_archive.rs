@@ -3,8 +3,8 @@
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 use huesos_abi::acpi_broker::{
-    MAX_ARCHIVE_BYTES, MAX_TABLES, MAX_TABLE_BYTES, TABLE_ARCHIVE_ENTRY_BYTES,
-    TABLE_ARCHIVE_HEADER_BYTES, TABLE_ARCHIVE_MAGIC, VERSION,
+    ARCHIVE_V1_VERSION, MAX_ARCHIVE_BYTES, MAX_TABLES, MAX_TABLE_BYTES, TABLE_ARCHIVE_ENTRY_BYTES,
+    TABLE_ARCHIVE_HEADER_BYTES, TABLE_ARCHIVE_MAGIC,
 };
 
 /// Failure while snapshotting uACPI's validated table set.
@@ -123,7 +123,7 @@ pub fn build() -> Result<Vec<u8>, ArchiveBuildError> {
 
 fn encode_header(output: &mut [u8], count: u32, total_size: u64) {
     output[..8].copy_from_slice(&TABLE_ARCHIVE_MAGIC);
-    output[8..10].copy_from_slice(&VERSION.to_le_bytes());
+    output[8..10].copy_from_slice(&ARCHIVE_V1_VERSION.to_le_bytes());
     output[10..12].copy_from_slice(&TABLE_ARCHIVE_HEADER_BYTES.to_le_bytes());
     output[12..16].copy_from_slice(&count.to_le_bytes());
     output[16..24].copy_from_slice(&total_size.to_le_bytes());
