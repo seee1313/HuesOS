@@ -38,6 +38,10 @@ This runs, e.g.:
   unknown, and zero-generation inputs. QEMU smoke requires both the isolated
   service's no-root fail-closed marker and DriverManager's matching supervised
   readiness marker.
+- `huesos-uacpi-runtime`: AP-3 compiles the full pinned interpreter in a
+  separate userspace crate while every host callback remains fail-closed. Run
+  `bash scripts/test-uacpi-runtime.sh` to link every callback and execute the
+  denial smoke under ASan/UBSan. This does not claim namespace/AML readiness.
 - `huesos-hxfs`: checkpoint geometry is checked against the actual target and
   journal LBA spans. Plain and Hxblob-enabled regressions simulate power loss
   after the `RECOVERING` root is durable but before the final clean root,
