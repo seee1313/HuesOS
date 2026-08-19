@@ -1,7 +1,8 @@
 # uACPI integration
 
-- **Status:** kernel barebones table subsystem implemented; Ring-3 full AML
-  runtime not implemented
+- **Status:** kernel barebones table subsystem implemented; AP-3 isolated full
+  interpreter build scaffold implemented with every host callback fail-closed;
+  Ring-3 AML execution not implemented
 - **Architecture:** [ACPI_RING3.md](ACPI_RING3.md)
 - **Delivery plan:**
   [ACPI_PCI_IMPLEMENTATION_PLAN.md](ACPI_PCI_IMPLEMENTATION_PLAN.md)
@@ -46,17 +47,19 @@ or exposes full-operation-region callbacks.
 
 ### 2.2 Userspace runtime crate
 
-A separate future `huesos-uacpi-runtime` crate is linked only into
-`acpi-manager`. It compiles the full uACPI source set without barebones mode and
-provides the audited Ring-3 host boundary.
+The separate `huesos-uacpi-runtime` crate compiles the full uACPI source set
+without barebones mode and is intended to link only into `acpi-manager`. AP-3
+lands the build and a complete C-signature-checked host callback table, but all
+callbacks remain denied/unavailable and the production manager does not yet
+link or execute it.
 
 The separation is physical, not just a Cargo feature selected on one shared
 kernel crate. This prevents feature unification or a build-configuration error
 from silently linking AML execution into the kernel.
 
-The userspace runtime initially links with every privileged callback
-fail-closed. Individual callback families become active only in their own PR
-after the corresponding capability protocol and negative tests exist.
+Individual callback families become active only in their own PR after the
+corresponding capability protocol and negative tests exist. The AP-3 host smoke
+links the full C runtime and executes denial checks under ASan/UBSan.
 
 ---
 

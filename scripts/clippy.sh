@@ -33,7 +33,7 @@ done
         cargo clippy --release -- -D warnings
 )
 
-for program in driver-host-input driver-host-nvme hxfs-service terminal doom fault-probe acpi-manager pci-manager shutdown-broker; do
+for program in driver-host-input driver-host-nvme hxfs-service terminal doom fault-probe acpi-manager uacpi-runtime pci-manager shutdown-broker; do
     (
         cd "crates/huesos-userspace/$program"
         cargo clippy --release -- -D warnings
