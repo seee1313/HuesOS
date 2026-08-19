@@ -201,6 +201,16 @@ impl Vmar {
         Self(unsafe { Handle::from_raw(raw) })
     }
 
+    /// Build a VMAR wrapper from an owned generic handle received over IPC.
+    pub fn from_handle(handle: Handle) -> Self {
+        Self(handle)
+    }
+
+    /// Consume this VMAR and return its owned generic handle.
+    pub fn into_handle(self) -> Handle {
+        self.0
+    }
+
     /// Reserve a child VMAR range inside this VMAR.
     pub fn create_child(&self, addr: u64, len: u64) -> crate::Result<Vmar> {
         let mut child: HandleValue = INVALID_HANDLE;

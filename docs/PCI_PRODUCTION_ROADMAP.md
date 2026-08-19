@@ -972,7 +972,7 @@ closes.
 | A.2 ABI vocabulary | In progress | HPCI complete; HMCF/snapshot/mint/mediation ABIs planned in AP-1/AP-7/AP-10 |
 | A.3 Migration map | Complete | architecture §2 + roadmap A.3 + AP plan |
 | ACPI archive v2 | Complete (bootstrap) | AP-1/AP-2 merged; Q35 v2 snapshot accepted in Ring 3 |
-| Full Ring-3 uACPI | In progress | AP-3 build merged; AP-4 primitives in review; mapping/AML AP-5–AP-14 open |
+| Full Ring-3 uACPI | In progress | AP-3 merged; AP-4 primitives + AP-5 archive-only mapping in review; AML AP-6–AP-14 open |
 | ACPI supervision | In progress | current archive validator launches once; generation/restart/freeze work is AP-6 |
 | B.1 Checked address vocabulary | Complete | PCI-1 types + PCI-2 bootstrap adoption |
 | B.2 ECAM access planner | Complete (policy) | checked region-relative plans and boundary tests |

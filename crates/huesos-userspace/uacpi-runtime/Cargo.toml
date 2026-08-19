@@ -9,6 +9,7 @@ build = "build.rs"
 path = "src/lib.rs"
 
 [dependencies]
+huesos-abi = { path = "../../huesos-abi" }
 libcanvas = { path = "../libcanvas" }
 spin = "0.9"
 

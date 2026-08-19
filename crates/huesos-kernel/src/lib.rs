@@ -384,7 +384,11 @@ fn spawn_init_process(
         dbg("[init] HBI BOOTFS module unavailable\n");
     }
     if let Some(bytes) = acpi_archive {
-        if install_readonly_vmo(&spawned.process, huesos_abi::INIT_ACPI_TABLES_HANDLE, bytes) {
+        if install_readonly_mappable_vmo(
+            &spawned.process,
+            huesos_abi::INIT_ACPI_TABLES_HANDLE,
+            bytes,
+        ) {
             dbg("[init] installed immutable ACPI table archive VMO\n");
             if install_acpi_broker(&spawned.process, acpi_system_io) {
                 dbg("[init] installed deny-by-default ACPI broker capability\n");
@@ -450,6 +454,23 @@ fn install_readonly_vmo(
     slot: huesos_abi::HandleValue,
     bytes: &[u8],
 ) -> bool {
+    install_immutable_vmo(process, slot, bytes, false)
+}
+
+fn install_readonly_mappable_vmo(
+    process: &huesos_object::Process,
+    slot: huesos_abi::HandleValue,
+    bytes: &[u8],
+) -> bool {
+    install_immutable_vmo(process, slot, bytes, true)
+}
+
+fn install_immutable_vmo(
+    process: &huesos_object::Process,
+    slot: huesos_abi::HandleValue,
+    bytes: &[u8],
+    mappable: bool,
+) -> bool {
     use huesos_object::{Handle, KernelObject, Rights};
 
     let Ok(vmo) = huesos_object::Vmo::new_in_job(bytes.len(), Some(process.job())) else {
@@ -460,7 +481,10 @@ fn install_readonly_vmo(
     }
     let koid = vmo.koid();
     huesos_object::register_object(vmo);
-    let rights = Rights::READ | Rights::DUPLICATE | Rights::TRANSFER;
+    let mut rights = Rights::READ | Rights::DUPLICATE | Rights::TRANSFER;
+    if mappable {
+        rights |= Rights::MAP;
+    }
     if process
         .handles
         .insert_at(slot, Handle::new(koid, rights))

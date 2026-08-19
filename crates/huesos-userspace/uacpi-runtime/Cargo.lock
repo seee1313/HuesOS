@@ -35,6 +35,7 @@ name = "huesos-uacpi-runtime"
 version = "0.1.0"
 dependencies = [
  "cc",
+ "huesos-abi",
  "libcanvas",
  "spin",
 ]

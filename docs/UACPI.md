@@ -1,9 +1,8 @@
 # uACPI integration
 
 - **Status:** kernel barebones/archive-v2 bootstrap implemented; AP-3 isolated
-  full interpreter build merged; AP-4 process-local allocation, time,
-  synchronization, and dispatch callbacks in progress; Ring-3 AML execution
-  not implemented
+  full interpreter build merged; AP-4 process primitives and AP-5 archive-only
+  table mapping in progress; Ring-3 AML execution not implemented
 - **Architecture:** [ACPI_RING3.md](ACPI_RING3.md)
 - **Delivery plan:**
   [ACPI_PCI_IMPLEMENTATION_PLAN.md](ACPI_PCI_IMPLEMENTATION_PLAN.md)
@@ -121,14 +120,17 @@ routing remain kernel mechanisms.
 
 ### 4.2 Immutable table mapping
 
-The full runtime maps ACPI archive v2 read-only. Its
+AP-5 adds the runtime mechanism to map ACPI archive v2 once at a fixed
+userspace address with read-only/non-executable VMAR permissions. The archive
+VMO must carry `READ | MAP` and the manager must receive its own root VMAR
+capability; AP-6 supplies the generation-safe bootstrap transport. The runtime
+retains both handles and revalidates the mapped bytes before publication.
+
 `uacpi_kernel_get_rsdp()` returns the original physical RSDP address recorded in
 the archive, and `uacpi_kernel_map()` translates only ranges represented by the
-archive's physical-to-VMO index.
-
-This callback never performs a physical-map syscall and never maps AML-selected
-SystemMemory. A request outside one complete archive translation record returns
-`UACPI_MAP_FAILED`.
+archive's physical-to-VMO index. It never performs a physical-map syscall and
+never maps AML-selected SystemMemory. A zero, overflowing, cross-record, gap,
+or out-of-index request returns `UACPI_MAP_FAILED`.
 
 ### 4.3 Privileged hardware callbacks
 

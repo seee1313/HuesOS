@@ -2,18 +2,21 @@
 //!
 //! This crate deliberately compiles the complete pinned uACPI source set
 //! separately from the kernel's permanent `UACPI_BAREBONES_MODE` crate. AP-4
-//! activates only process-local allocation, time, synchronization, and ACPI
-//! dispatch suppression. It grants no table map, SystemIO, SystemMemory, PCI,
-//! interrupt, reset, or power authority. Later AP stages replace callback
-//! families only after their capability protocols and negative tests exist.
+//! activates process-local primitives; AP-5 adds only read-only translation
+//! from an installed archive-v2 VMO. It grants no raw physical map, SystemIO,
+//! SystemMemory, PCI, interrupt, reset, or power authority. Later AP stages
+//! replace callback families only after their capability protocols and negative
+//! tests exist.
 
 #![no_std]
 #![warn(missing_docs)]
 
 extern crate alloc;
 
+mod archive;
 mod primitives;
 
+pub use archive::{install_archive, ArchiveInstallError, ArchiveMappingInfo};
 pub use primitives::dispatch_suppressed;
 
 /// Pinned vendored uACPI revision compiled by this runtime scaffold.
@@ -30,12 +33,12 @@ pub const fn privileged_callbacks_enabled() -> bool {
 /// Build-stage identity used in diagnostics and tests.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RuntimeStage {
-    /// Full interpreter linked with process-local primitives; every hardware
-    /// callback remains denied or unavailable.
-    ProcessPrimitivesReady,
+    /// Process-local primitives and archive-only table translation are ready;
+    /// every hardware callback remains denied or unavailable.
+    ArchiveMapReady,
 }
 
 /// Return the current immutable runtime build stage.
 pub const fn runtime_stage() -> RuntimeStage {
-    RuntimeStage::ProcessPrimitivesReady
+    RuntimeStage::ArchiveMapReady
 }

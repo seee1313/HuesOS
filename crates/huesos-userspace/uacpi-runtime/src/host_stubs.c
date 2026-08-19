@@ -8,6 +8,7 @@
  * reviews rather than weakening these defaults in place.
  */
 
+#ifndef HUESOS_UACPI_RUST_ARCHIVE
 uacpi_status uacpi_kernel_get_rsdp(uacpi_phys_addr *out_rsdp_address)
 {
     if (out_rsdp_address)
@@ -27,6 +28,7 @@ void uacpi_kernel_unmap(void *address, uacpi_size length)
     (void)address;
     (void)length;
 }
+#endif
 
 void uacpi_kernel_log(uacpi_log_level level, const uacpi_char *message)
 {

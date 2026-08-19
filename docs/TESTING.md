@@ -43,8 +43,9 @@ This runs, e.g.:
   time, mutex, event, and dispatch callbacks. From a temporary directory (so
   the bare-metal Cargo config is not selected), run
   `cargo test --manifest-path <repo>/crates/huesos-userspace/uacpi-runtime/Cargo.toml`
-  for the four primitive tests. Run `bash scripts/test-uacpi-runtime.sh` to link
-  every callback and execute the remaining privileged-denial smoke under
+  for the primitive plus archive-translation tests (six after AP-5). Run
+  `bash scripts/test-uacpi-runtime.sh` to link every callback and execute the
+  remaining privileged-denial smoke under
   ASan/UBSan. This does not claim namespace/AML readiness.
 - `huesos-hxfs`: checkpoint geometry is checked against the actual target and
   journal LBA spans. Plain and Hxblob-enabled regressions simulate power loss
