@@ -13,19 +13,32 @@ use super::{Process, Thread, Vmar};
 /// map an initial stack, create a suspended main thread, and start it with
 /// a bootstrap channel installed as handle 1 in the child.
 pub fn spawn_elf(name: &str, elf: &[u8]) -> crate::Result<(Process, Channel)> {
-    spawn_elf_with_affinity(name, elf, None)
+    spawn_elf_with_stack(name, elf, huesos_abi::USER_STACK_DEFAULT_SIZE)
+}
+
+/// Load a static ELF with an explicit per-process stack profile.
+pub fn spawn_elf_with_stack(
+    name: &str,
+    elf: &[u8],
+    stack_size: u64,
+) -> crate::Result<(Process, Channel)> {
+    spawn_elf_with_affinity(name, elf, None, stack_size)
 }
 
 /// Load a static ELF image into a new process with an explicit home CPU.
 pub fn spawn_elf_on_cpu(name: &str, elf: &[u8], cpu: usize) -> crate::Result<(Process, Channel)> {
-    spawn_elf_with_affinity(name, elf, Some(cpu))
+    spawn_elf_with_affinity(name, elf, Some(cpu), huesos_abi::USER_STACK_DEFAULT_SIZE)
 }
 
 fn spawn_elf_with_affinity(
     name: &str,
     elf: &[u8],
     home_cpu: Option<usize>,
+    stack_size: u64,
 ) -> crate::Result<(Process, Channel)> {
+    if !huesos_abi::valid_user_stack_size(stack_size) {
+        return Err(crate::ErrorCode::InvalidArgs);
+    }
     let image = elf::parse_elf(elf).ok_or(crate::ErrorCode::InvalidArgs)?;
     if name == "doom" {
         crate::println!("[doom-launch] ELF parsed, creating process");
@@ -53,7 +66,7 @@ fn spawn_elf_with_affinity(
     if name == "doom" {
         crate::println!("[doom-launch] mapping stack and starting thread");
     }
-    map_initial_stack(&root_vmar)?;
+    map_initial_stack(&root_vmar, stack_size)?;
     let thread = Thread::create(&process, "main")?;
     // iretq enters directly, so synthesize SysV's post-call alignment.
     let bootstrap = thread.start(image.entry, initial_user_rsp(huesos_abi::USER_STACK_TOP))?;
@@ -70,7 +83,19 @@ pub fn spawn_elf_from_vmo(
     offset: u64,
     len: u64,
 ) -> crate::Result<(Process, Channel)> {
-    let (process, _root_vmar, bootstrap) = spawn_elf_from_vmo_with_vmar(name, vmo, offset, len)?;
+    spawn_elf_from_vmo_with_stack(name, vmo, offset, len, huesos_abi::USER_STACK_DEFAULT_SIZE)
+}
+
+/// Load a VMO-backed ELF with an explicit per-process stack profile.
+pub fn spawn_elf_from_vmo_with_stack(
+    name: &str,
+    vmo: &Vmo,
+    offset: u64,
+    len: u64,
+    stack_size: u64,
+) -> crate::Result<(Process, Channel)> {
+    let (process, _root_vmar, bootstrap) =
+        spawn_elf_from_vmo_with_vmar_and_stack(name, vmo, offset, len, stack_size)?;
     Ok((process, bootstrap))
 }
 
@@ -82,7 +107,27 @@ pub fn spawn_elf_from_vmo_with_vmar(
     offset: u64,
     len: u64,
 ) -> crate::Result<(Process, Vmar, Channel)> {
-    if len == 0 || offset.checked_add(len).is_none() {
+    spawn_elf_from_vmo_with_vmar_and_stack(
+        name,
+        vmo,
+        offset,
+        len,
+        huesos_abi::USER_STACK_DEFAULT_SIZE,
+    )
+}
+
+/// Load/start a VMO-backed ELF, retain its VMAR, and select stack size.
+pub fn spawn_elf_from_vmo_with_vmar_and_stack(
+    name: &str,
+    vmo: &Vmo,
+    offset: u64,
+    len: u64,
+    stack_size: u64,
+) -> crate::Result<(Process, Vmar, Channel)> {
+    if len == 0
+        || offset.checked_add(len).is_none()
+        || !huesos_abi::valid_user_stack_size(stack_size)
+    {
         return Err(crate::ErrorCode::InvalidArgs);
     }
     // Read the ELF header and program-header table into a bounded temporary
@@ -122,7 +167,7 @@ pub fn spawn_elf_from_vmo_with_vmar(
         i += 1;
     }
 
-    map_initial_stack(&root_vmar)?;
+    map_initial_stack(&root_vmar, stack_size)?;
     let thread = Thread::create(&process, "main")?;
     let bootstrap = thread.start(image.entry, initial_user_rsp(huesos_abi::USER_STACK_TOP))?;
     Ok((process, root_vmar, bootstrap))
@@ -248,14 +293,17 @@ fn map_load_segment_from_vmo(
     Ok(())
 }
 
-fn map_initial_stack(root_vmar: &Vmar) -> crate::Result<()> {
-    let stack_bottom = huesos_abi::USER_STACK_TOP - huesos_abi::USER_STACK_SIZE;
-    let stack = Vmo::create(huesos_abi::USER_STACK_SIZE)?;
+fn map_initial_stack(root_vmar: &Vmar, stack_size: u64) -> crate::Result<()> {
+    if !huesos_abi::valid_user_stack_size(stack_size) {
+        return Err(crate::ErrorCode::InvalidArgs);
+    }
+    let stack_bottom = huesos_abi::USER_STACK_TOP - stack_size;
+    let stack = Vmo::create(stack_size)?;
     root_vmar.map(
         &stack,
         0,
         stack_bottom,
-        huesos_abi::USER_STACK_SIZE,
+        stack_size,
         huesos_abi::vmar_flags::READ
             | huesos_abi::vmar_flags::WRITE
             | huesos_abi::vmar_flags::USER

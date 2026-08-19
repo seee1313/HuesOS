@@ -280,7 +280,7 @@ mod tests {
         let Some(end) = addr.checked_add(len as u64) else {
             return false;
         };
-        addr >= USER_ASPACE_BASE && addr < USER_ASPACE_END && end > addr && end <= USER_ASPACE_END
+        (USER_ASPACE_BASE..USER_ASPACE_END).contains(&addr) && end > addr && end <= USER_ASPACE_END
     }
 
     #[test]

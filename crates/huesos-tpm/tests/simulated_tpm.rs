@@ -13,7 +13,7 @@
 
 use huesos_tpm::crb::{ctrl_req, ctrl_sts, loc_ctrl, loc_sts, reg, CrbError, CrbTransport};
 use huesos_tpm::pcr::{PcrSelection, PCR_DIGEST_BYTES, PCR_KERNEL_MEASUREMENT};
-use huesos_tpm::seal::{unseal_volume_key, SealError, SealedKey, VolumeKey, VOLUME_KEY_BYTES};
+use huesos_tpm::seal::{unseal_volume_key, SealError, SealedKey, VOLUME_KEY_BYTES};
 use huesos_tpm::{command, read_u32, response_code, HEADER_BYTES};
 
 /// A minimal TPM 2.0 responder speaking the CRB register protocol.
@@ -124,13 +124,7 @@ impl SimTpm {
 impl CrbTransport for SimTpm {
     fn read_reg(&self, offset: usize) -> u32 {
         match offset {
-            reg::LOC_STS => {
-                if self.granted {
-                    loc_sts::GRANTED
-                } else {
-                    0
-                }
-            }
+            reg::LOC_STS => u32::from(self.granted) * loc_sts::GRANTED,
             reg::CTRL_STS => {
                 let mut value = 0;
                 if self.error {

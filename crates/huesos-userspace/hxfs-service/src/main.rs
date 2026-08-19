@@ -1672,8 +1672,39 @@ impl HxfsRuntime {
 /// exits", not to police normal boot latency.
 const MOUNT_HANDOFF_BUDGET_TICKS: u64 = 100 * 90;
 
+fn receive_key_grant(
+    request: huesos_abi::key_broker::GrantRequest,
+    channel: Channel,
+) -> Result<Option<libcanvas::system::VolumeKey>, ErrorCode> {
+    let mut bytes = [0u8; huesos_abi::key_broker::GRANT_REPLY_BYTES];
+    let length = channel.read_into_timeout(&mut bytes, MOUNT_HANDOFF_BUDGET_TICKS)?;
+    let reply = huesos_abi::key_broker::GrantReply::decode(&bytes[..length])
+        .ok_or(ErrorCode::InvalidArgs)?;
+    clear_secret(&mut bytes);
+    if reply.generation() != request.generation {
+        return Err(ErrorCode::AccessDenied);
+    }
+    match reply.status() {
+        huesos_abi::key_broker::GrantStatus::Granted => {
+            let key = reply.key().ok_or(ErrorCode::Internal)?;
+            Ok(Some(libcanvas::system::VolumeKey::from_broker_reply(*key)))
+        }
+        huesos_abi::key_broker::GrantStatus::NotFound => Ok(None),
+        huesos_abi::key_broker::GrantStatus::StaleGeneration
+        | huesos_abi::key_broker::GrantStatus::Denied => Err(ErrorCode::AccessDenied),
+    }
+}
+
+fn clear_secret(secret: &mut [u8]) {
+    for byte in secret {
+        *byte = 0;
+        let _ = core::hint::black_box(*byte);
+    }
+}
+
 fn mount_from_bootstrap(bootstrap: &Channel) -> Option<Box<MountedHxfs>> {
     let mut buf = [0u8; 64];
+    let mut volume_key: Option<libcanvas::system::VolumeKey> = None;
     // Bound the handoff in WALL TIME. This loop is the one place the
     // service is allowed to block -- it has nothing to serve until
     // the volume arrives -- but "block until it arrives" and "block
@@ -1692,6 +1723,32 @@ fn mount_from_bootstrap(bootstrap: &Channel) -> Option<Box<MountedHxfs>> {
     let mut deadline: Option<u64> = None;
     loop {
         match bootstrap.read_optional_handle(&mut buf) {
+            Ok((n, Some(handle)))
+                if huesos_abi::key_broker::GrantRequest::decode(&buf[..n]).is_some() =>
+            {
+                let Some(request) = huesos_abi::key_broker::GrantRequest::decode(&buf[..n]) else {
+                    drop(handle);
+                    return None;
+                };
+                match receive_key_grant(request, Channel::from_handle(handle)) {
+                    Ok(key) => {
+                        volume_key = key;
+                        println!(
+                            "[hxfs] accepted generation-bound key grant {} ({})",
+                            request.generation,
+                            if volume_key.is_some() {
+                                "key"
+                            } else {
+                                "plain-only"
+                            }
+                        );
+                    }
+                    Err(error) => {
+                        println!("[hxfs] key grant rejected: {}", error.as_str());
+                        return None;
+                    }
+                }
+            }
             Ok((n, Some(handle))) if &buf[..n] == b"hxfs:block-device" => {
                 let channel = Channel::from_handle(handle);
                 let Ok(device) = libcanvas::block::BlockDevice::from_channel(channel) else {
@@ -1715,64 +1772,16 @@ fn mount_from_bootstrap(bootstrap: &Channel) -> Option<Box<MountedHxfs>> {
                         return None;
                     }
                 }
-                // A.6 live mount: the production path is
-                // mount_with_policies so the volume's encryption
-                // and compression policy tables (resolved from
-                // the on-disk volume table at mount time) are
-                // honored at every read and write. The MVP
-                // hxfs-service does not yet plumb those tables
-                // through its bootstrap channel, so it passes
-                // empty tables and accepts only plain volumes;
-                // a future revision (Track D.2, TPM-backed key
-                // provider) will read the tables from the
-                // volume descriptor and pass them here. The
-                // synthetic-key (Stage B.5) build passes the
-                // matching test-only policy tables so the soak
-                // image mounts and the self-check can read it.
-                let mounted = {
-                    #[cfg(feature = "synthetic-key")]
-                    {
-                        // Stage D key handoff: the volume key comes
-                        // from the kernel's bootloader blob
-                        // (VolumeKeyGet), not from baked-in
-                        // userspace material. When the kernel has no
-                        // key, an encrypted volume is rejected with
-                        // EncryptedVolumeKeyUnavailable — the
-                        // security gate working as intended.
-                        let key = libcanvas::system::get_volume_key().ok().flatten();
-                        let enc = [huesos_hxfs::synthetic_key::encryption_policy()];
-                        let comp = [huesos_hxfs::synthetic_key::compression_policy()];
-                        if key.is_none() {
-                            // No TPM, and no bootloader blob either.
-                            // A PLAIN volume must still mount: most
-                            // machines have no TPM, and refusing to
-                            // boot them would make the whole system
-                            // unusable to prove a point about a
-                            // feature their volume does not use.
-                            //
-                            // An ENCRYPTED volume is a different
-                            // matter and is still refused below: the
-                            // bytes are AEAD-sealed, so "carry on
-                            // without encryption" is not an option
-                            // anyone can implement -- there is no
-                            // key with which to read them. The
-                            // failure is reported as exactly that
-                            // rather than as a generic mount error.
-                            println!("[hxfs] no volume key available; plain volumes only");
-                        }
-                        FixedHxfsWriter::mount_with_policies(reader, &enc, &comp, key.as_ref())
-                    }
-                    #[cfg(not(feature = "synthetic-key"))]
-                    {
-                        // Production build: take the key if the
-                        // platform has one. A machine without a TPM
-                        // still mounts its plain volume; only an
-                        // encrypted volume needs the key, and that
-                        // case is reported distinctly below.
-                        let key = libcanvas::system::get_volume_key().ok().flatten();
-                        FixedHxfsWriter::mount_with_policies(reader, &[], &[], key.as_ref())
-                    }
-                };
+                // HxFS v6 makes the checkpoint's versioned policy roots the
+                // only encryption/compression policy source. Test features may
+                // enable additional probes, but they cannot alter mount policy.
+                let key = volume_key
+                    .as_ref()
+                    .map(libcanvas::system::VolumeKey::as_bytes);
+                if key.is_none() {
+                    println!("[hxfs] no volume key available; plain volumes only");
+                }
+                let mounted = FixedHxfsWriter::mount_from_disk(reader, key);
                 match mounted {
                     Ok(fs) => return Some(Box::new(fs)),
                     Err(huesos_hxfs::HxfsError::EncryptedVolumeKeyUnavailable) => {

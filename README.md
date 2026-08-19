@@ -68,6 +68,11 @@ see [Known Limitations](#known-limitations) and
   8×8 modes retained as `font tty` / `font compact`
 - ✅ DoomGeneric userspace port with Freedoom Phase 1, custom non-POSIX libc,
   Canvas video, Channel keyboard input, and monotonic timing (silent first cut)
+- ✅ Userspace NVMe DriverHost and HxFS v6 on real QEMU block devices, with
+  versioned on-disk policy roots, 64-bit AEAD generations, journal replay,
+  power-fail testing, scrub/fsck, quotas, compression and Hxblob
+- ✅ Capability-gated KeyBroker: the kernel relinquishes the volume key once;
+  supervised HxFS generations receive single-use grant channels
 
 All of the above is exercised live by `huesos-init` on every boot — built
 against `libcanvas` — which creates a VMO, does a channel round-trip,
@@ -103,8 +108,9 @@ Default `scripts/run.sh` uses `-smp 2`.
 ## Known Limitations
 
 - IOAPIC routing currently covers only the PS/2 keyboard IRQ1, with legacy PIC fallback; general device IRQ routing is not complete
-- No filesystem on real block devices yet (BOOTFS is RAM; FAT crate is
-  library-ready, not wired as the production VFS backend)
+- NVMe + HxFS v6 works end-to-end in QEMU, including journal replay,
+  corruption injection and power-fail recovery; bare-metal storage support is
+  still experimental and first boots must use `STORAGE_OFF=1`
 - Exited-process address spaces and kernel stacks are reaped, but finished task
   metadata is retained and the global object registry still needs a complete
   strong/weak-reference lifecycle (ordinary last-handle close does not yet
@@ -135,6 +141,11 @@ Current reported bare-metal success includes an MSI Modern 15 B5M laptop.
 ## Quick Start
 
 ```bash
+# On a fresh Debian/Ubuntu/Arena environment, restore the pinned toolchain,
+# QEMU, TPM tools, cargo-audit/cargo-fuzz and local Git metadata.
+bash scripts/restore-dev-env.sh
+source "$HOME/.cargo/env"
+
 # Build the kernel (also builds and embeds the userspace init binary)
 make build
 

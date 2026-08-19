@@ -69,6 +69,7 @@ pub struct LoadedElf {
 /// Load `data` (the raw ELF file bytes) into the address space represented
 /// by `loader`, mapping each `PT_LOAD` segment.
 pub fn load<L: Loader>(data: &[u8], loader: &mut L) -> Result<LoadedElf, ElfLoadError<L::Error>> {
+    validate_elf64_header(data)?;
     let elf = ElfFile::new(data).map_err(ElfLoadError::ParseError)?;
 
     use xmas_elf::header::Type as HeaderType;
@@ -98,6 +99,53 @@ pub fn load<L: Loader>(data: &[u8], loader: &mut L) -> Result<LoadedElf, ElfLoad
         entry_point: elf.header.pt2.entry_point(),
         highest_addr,
     })
+}
+
+fn validate_elf64_header<E>(data: &[u8]) -> Result<(), ElfLoadError<E>> {
+    const ELF64_HEADER_BYTES: usize = 64;
+    const ELF64_PROGRAM_HEADER_BYTES: usize = 56;
+    if data.len() < ELF64_HEADER_BYTES || data.get(..4) != Some(b"\x7fELF") {
+        return Err(ElfLoadError::ParseError("truncated or invalid ELF magic"));
+    }
+    // xmas-elf 0.10's generic parser accepts ELF32 and malformed program-header
+    // geometry that its ELF64 `program_iter` later indexes as slices. Reject
+    // those shapes before constructing the iterator used in ring 0.
+    if data[4] != 2 || data[5] != 1 || data[6] != 1 {
+        return Err(ElfLoadError::Unsupported(
+            "only little-endian ELF64 version 1 is supported",
+        ));
+    }
+    let ehsize = read_u16(data, 52).ok_or(ElfLoadError::ParseError("missing e_ehsize"))?;
+    let phentsize = read_u16(data, 54).ok_or(ElfLoadError::ParseError("missing e_phentsize"))?;
+    let phnum = read_u16(data, 56).ok_or(ElfLoadError::ParseError("missing e_phnum"))?;
+    let phoff = read_u64(data, 32).ok_or(ElfLoadError::ParseError("missing e_phoff"))?;
+    if usize::from(ehsize) != ELF64_HEADER_BYTES
+        || (phnum != 0 && usize::from(phentsize) != ELF64_PROGRAM_HEADER_BYTES)
+    {
+        return Err(ElfLoadError::ParseError("invalid ELF64 header geometry"));
+    }
+    let table_bytes = u64::from(phnum)
+        .checked_mul(u64::from(phentsize))
+        .ok_or(ElfLoadError::SegmentOutOfBounds)?;
+    let table_end = phoff
+        .checked_add(table_bytes)
+        .ok_or(ElfLoadError::SegmentOutOfBounds)?;
+    if table_end > data.len() as u64 {
+        return Err(ElfLoadError::SegmentOutOfBounds);
+    }
+    Ok(())
+}
+
+fn read_u16(data: &[u8], offset: usize) -> Option<u16> {
+    let bytes = data.get(offset..offset + 2)?;
+    Some(u16::from_le_bytes([bytes[0], bytes[1]]))
+}
+
+fn read_u64(data: &[u8], offset: usize) -> Option<u64> {
+    let bytes = data.get(offset..offset + 8)?;
+    Some(u64::from_le_bytes([
+        bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+    ]))
 }
 
 fn load_segment<L: Loader>(
@@ -328,6 +376,23 @@ mod tests {
         assert!(matches!(
             result,
             Err(ElfLoadError::Mapping(InjectedFailure))
+        ));
+    }
+
+    #[test]
+    fn rejects_fuzzed_elf32_shape_without_panicking() {
+        // Coverage-guided fuzzing reached xmas-elf::program_iter with this
+        // ELF32/truncated geometry and triggered an out-of-bounds slice panic.
+        let bytes = [
+            0x7f, 0x45, 0x4c, 0x46, 0x01, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x20, 0x46,
+            0x01, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x20, 0x46, 0x7f, 0x45, 0x4c, 0x46,
+            0x01, 0xfe, 0xfe, 0x00, 0x00, 0x00, 0x00, 0x15, 0x45, 0x46, 0x7f, 0x45, 0x4c, 0x46,
+            0x01, 0xfe, 0xfe, 0x00, 0x00, 0x00, 0x00, 0x15, 0x45, 0x4c, 0x46, 0x46, 0xfe, 0xfe,
+        ];
+        let mut loader = FakeLoader::new();
+        assert!(matches!(
+            load(&bytes, &mut loader),
+            Err(ElfLoadError::Unsupported(_)) | Err(ElfLoadError::ParseError(_))
         ));
     }
 

@@ -89,7 +89,7 @@ impl WrappedVolumeKey {
 /// zeroizes the key bytes; this makes the type `!Copy` on purpose
 /// so the compiler refuses accidental `let a = b;` copies of live
 /// key material across scopes.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct Aes256XtsKey {
     /// AES data key.
     pub data_key: [u8; 32],
@@ -120,9 +120,11 @@ impl Aes256XtsKey {
     pub fn zeroize(&mut self) {
         for byte in self.data_key.iter_mut() {
             *byte = 0;
+            let _ = core::hint::black_box(*byte);
         }
         for byte in self.tweak_key.iter_mut() {
             *byte = 0;
+            let _ = core::hint::black_box(*byte);
         }
     }
 }
@@ -578,7 +580,7 @@ mod tests {
             return;
         };
         let borrowed = handle.borrow();
-        assert_eq!(borrowed, expected);
+        assert!(borrowed == expected);
         // The borrow is a working copy; mutating it must not affect
         // the handle's internal key.
         drop(borrowed);

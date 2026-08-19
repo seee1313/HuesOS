@@ -99,6 +99,7 @@ static DRIVER_MANAGER_ELF: &[u8] = include_bytes!(env!("HUESOS_DRIVER_MANAGER_PA
 static TERMINAL_ELF: &[u8] = include_bytes!(env!("HUESOS_TERMINAL_PATH"));
 static FAULT_PROBE_ELF: &[u8] = include_bytes!(env!("HUESOS_FAULT_PROBE_PATH"));
 static SHUTDOWN_BROKER_ELF: &[u8] = include_bytes!(env!("HUESOS_SHUTDOWN_BROKER_PATH"));
+static KEY_BROKER_ELF: &[u8] = include_bytes!(env!("HUESOS_KEY_BROKER_PATH"));
 
 const BOOTFS_HEADER_SIZE: u64 = 16;
 const BOOTFS_ENTRY_SIZE: u64 = 216;
@@ -155,10 +156,43 @@ pub extern "C" fn _start() -> ! {
     run_shutdown_authorization_check(&mut logger);
     ui.end(b"selftest", StageState::Done, &mut logger);
 
+    ui.begin(b"key-broker", &mut logger);
+    let mut key_broker = launch_key_broker(&mut logger);
+    ui.end(
+        b"key-broker",
+        if key_broker.is_some() {
+            StageState::Done
+        } else {
+            StageState::Failed
+        },
+        &mut logger,
+    );
+
     ui.begin(b"driver-manager", &mut logger);
     let driver_manager = launch_service(&mut logger, "driver-manager", DRIVER_MANAGER_ELF);
     if driver_manager.is_none() {
         ui.end(b"driver-manager", StageState::Failed, &mut logger);
+    }
+
+    if let Some(manager_channel) = key_broker
+        .as_mut()
+        .and_then(|(_, _, manager_channel)| manager_channel.take())
+    {
+        if let Some((_, dm_channel)) = &driver_manager {
+            match dm_channel
+                .write_handle(b"key-broker:manager-channel", manager_channel.into_handle())
+            {
+                Ok(()) => init_logln!(
+                    logger,
+                    "[init] delegated unique KeyBroker authority to DriverManager"
+                ),
+                Err((error, _handle)) => init_logln!(
+                    logger,
+                    "[init] KeyBroker authority transfer failed: {}",
+                    error.as_str()
+                ),
+            }
+        }
     }
 
     if let Some((_, channel)) = &driver_manager {
@@ -280,7 +314,7 @@ pub extern "C" fn _start() -> ! {
     let mut supervisor_message = [0u8; 64];
     let mut doom_process: Option<Process> = None;
     loop {
-        let _keep_services_alive = &driver_manager;
+        let _keep_services_alive = (&driver_manager, &key_broker);
         if let Some((_, channel)) = &terminal {
             match channel.read_optional_handle(&mut supervisor_message) {
                 Ok((n, None)) if &supervisor_message[..n] == b"system:shutdown" => {
@@ -784,6 +818,7 @@ fn format_grant_label(
         ResourceKind::DmaPool => "dma",
         ResourceKind::FrameDraw => "framedraw",
         ResourceKind::SystemControl => "sysctl",
+        ResourceKind::VolumeKey => "volume-key",
     };
     let mode = if grant.exclusive { "excl" } else { "shared" };
     let mut w = FixedWriter::new(out);
@@ -1123,6 +1158,114 @@ fn launch_service(logger: &mut InitLogger, name: &str, elf: &[u8]) -> Option<(Pr
         }
         Err(e) => {
             init_logln!(logger, "[init] failed to launch {}: {}", name, e.as_str());
+            None
+        }
+    }
+}
+
+/// Launch the isolated KeyBroker and delegate a unique manager channel.
+///
+/// The `VolumeKey` Resource is transferred, never duplicated. KeyBroker uses
+/// it to atomically move the master key out of the kernel, while the manager
+/// channel is later moved into DriverManager so only supervised HxFS
+/// generations can receive a one-shot grant endpoint.
+fn launch_key_broker(logger: &mut InitLogger) -> Option<(Process, Channel, Option<Channel>)> {
+    use libcanvas::resource::{kind, Resource};
+
+    let authority = match Resource::create(kind::VOLUME_KEY, 0, 0, true) {
+        Ok(authority) => authority,
+        Err(error) => {
+            init_logln!(
+                logger,
+                "[init] key-broker: authority mint failed: {}",
+                error.as_str()
+            );
+            return None;
+        }
+    };
+    let (manager_client, manager_server) = match Channel::pair() {
+        Ok(pair) => pair,
+        Err(error) => {
+            init_logln!(
+                logger,
+                "[init] key-broker: manager channel failed: {}",
+                error.as_str()
+            );
+            return None;
+        }
+    };
+    let manager_client =
+        match manager_client.restrict(libcanvas::rights::WRITE | libcanvas::rights::TRANSFER) {
+            Ok(channel) => channel,
+            Err(error) => {
+                init_logln!(
+                    logger,
+                    "[init] key-broker: client right reduction failed: {}",
+                    error.as_str()
+                );
+                return None;
+            }
+        };
+    let manager_server =
+        match manager_server.restrict(libcanvas::rights::READ | libcanvas::rights::TRANSFER) {
+            Ok(channel) => channel,
+            Err(error) => {
+                init_logln!(
+                    logger,
+                    "[init] key-broker: server right reduction failed: {}",
+                    error.as_str()
+                );
+                return None;
+            }
+        };
+    let (process, bootstrap) = match libcanvas::process::spawn_elf("key-broker", KEY_BROKER_ELF) {
+        Ok(pair) => pair,
+        Err(error) => {
+            init_logln!(
+                logger,
+                "[init] key-broker: spawn failed: {}",
+                error.as_str()
+            );
+            return None;
+        }
+    };
+    if let Err((error, _handle)) =
+        bootstrap.write_handle(b"key-broker:volume-key-authority", authority.into_handle())
+    {
+        init_logln!(
+            logger,
+            "[init] key-broker: authority transfer failed: {}",
+            error.as_str()
+        );
+        return None;
+    }
+    if let Err((error, _handle)) =
+        bootstrap.write_handle(b"key-broker:manager-channel", manager_server.into_handle())
+    {
+        init_logln!(
+            logger,
+            "[init] key-broker: manager transfer failed: {}",
+            error.as_str()
+        );
+        return None;
+    }
+
+    let mut message = [0u8; 64];
+    match bootstrap.read_into_timeout(&mut message, 3_000) {
+        Ok(length) if &message[..length] == b"key-broker:ready" => {
+            init_logln!(logger, "[init] key-broker ready");
+            Some((process, bootstrap, Some(manager_client)))
+        }
+        Ok(_) => {
+            init_logln!(logger, "[init] key-broker returned unexpected readiness");
+            None
+        }
+        Err(error) => {
+            init_logln!(
+                logger,
+                "[init] key-broker readiness failed: {}",
+                error.as_str()
+            );
             None
         }
     }

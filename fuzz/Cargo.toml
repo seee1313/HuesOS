@@ -1,0 +1,30 @@
+[package]
+name = "huesos-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+huesos-abi = { path = "../crates/huesos-abi" }
+huesos-elf = { path = "../crates/huesos-elf" }
+
+[[bin]]
+name = "abi_decoders"
+path = "fuzz_targets/abi_decoders.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "elf_loader"
+path = "fuzz_targets/elf_loader.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]
+members = ["."]

@@ -37,12 +37,15 @@ pub mod io_policy;
 pub mod o_direct;
 pub mod observability;
 pub mod page_cache;
+pub mod policy_table;
 pub mod quota;
 pub mod quota_tree;
 pub mod reader;
 pub mod recovery;
 pub mod ref_tree;
 pub mod scrub;
+#[cfg(feature = "crypto-aes-gcm")]
+mod secret;
 pub mod security_policy;
 #[cfg(feature = "crypto-aes-gcm")]
 pub mod synthetic_image;
@@ -91,6 +94,11 @@ pub enum HxfsError {
     /// data-unit size, or the key provider is offline). The mount
     /// cannot proceed.
     EncryptedPolicyInvalid,
+    /// On-disk compression policy descriptor is unknown or malformed.
+    CompressionPolicyInvalid,
+    /// A v5 volume was mounted for compatibility and requires an explicit
+    /// migration before any mutation can be published.
+    LegacyReadOnly,
     /// Metadata tree/table is malformed.
     BadTree,
     /// Path or object was not found.
@@ -140,7 +148,7 @@ pub struct Hxfs<R: BlockReader> {
     /// lifetime of the mount and zeroized on drop. `None` for
     /// plain volumes.
     #[cfg(feature = "crypto-aes-gcm")]
-    metadata_key: Option<[u8; 32]>,
+    metadata_key: Option<crate::secret::SecretKey>,
     /// Stage B.3: derived extent subkey for this volume. Used
     /// to wrap the *compressed* payload of every data extent
     /// on the read path. Independent from `metadata_key`
@@ -148,7 +156,7 @@ pub struct Hxfs<R: BlockReader> {
     /// does not also leak data extents. `None` for plain
     /// volumes.
     #[cfg(feature = "crypto-aes-gcm")]
-    extent_key: Option<[u8; 32]>,
+    extent_key: Option<crate::secret::SecretKey>,
     /// Caller-supplied per-volume compression policy table. An
     /// object whose `compression_policy_id` is non-zero is
     /// resolved through this table at read time; an object whose
@@ -180,6 +188,37 @@ impl<R: BlockReader> Hxfs<R> {
     /// volume is plain.
     pub fn mount(reader: R) -> Result<Self, HxfsError> {
         Self::mount_with_keys(reader, &[], None)
+    }
+
+    /// Mount HxFS using the versioned policy tables referenced by its checkpoint.
+    ///
+    /// This is the production entry point. A v6 encrypted/compressed volume is
+    /// never configured by build features or bootstrap policy arrays; ids are
+    /// resolved exclusively from the authenticated on-disk policy roots.
+    pub fn mount_from_disk(
+        mut reader: R,
+        volume_key: Option<&[u8; 32]>,
+    ) -> Result<Self, HxfsError> {
+        let superblock = read_superblock(&mut reader, 0)?;
+        let checkpoint = read_checkpoint(
+            &mut reader,
+            superblock.checkpoint_lba,
+            superblock.sequence_number,
+        )?;
+        let encryption_policies = crate::policy_table::read_encryption_policies(
+            &mut reader,
+            checkpoint.encryption_policy_tree_lba,
+        )?;
+        let compression_policies = crate::policy_table::read_compression_policies(
+            &mut reader,
+            checkpoint.compression_policy_tree_lba,
+        )?;
+        Self::mount_with_policies(
+            reader,
+            &encryption_policies,
+            &compression_policies,
+            volume_key,
+        )
     }
 
     /// Mount a read-only Hxfs instance, resolving the system
@@ -266,7 +305,7 @@ impl<R: BlockReader> Hxfs<R> {
                 &mut key,
             )
             .map_err(|_| HxfsError::EncryptedPolicyInvalid)?;
-            Some(key)
+            Some(crate::secret::SecretKey::new(key))
         } else {
             None
         };
@@ -280,7 +319,7 @@ impl<R: BlockReader> Hxfs<R> {
             let mut key = [0u8; 32];
             extent_crypto::derive_extent_key_for_volume(ikm, &superblock.instance_uuid, &mut key)
                 .map_err(|_| HxfsError::EncryptedPolicyInvalid)?;
-            Some(key)
+            Some(crate::secret::SecretKey::new(key))
         } else {
             None
         };
@@ -785,8 +824,19 @@ impl<R: BlockReader> Hxfs<R> {
                 }
             }
         }
+        let legacy = self.superblock.format_version == LEGACY_FORMAT_VERSION;
+        let versioned_record_bytes = if legacy {
+            LEGACY_EXTENT_RECORD_BYTES_V2
+        } else {
+            EXTENT_RECORD_BYTES_V2
+        };
+        let records_per_leaf = if legacy {
+            LEGACY_EXTENT_LEAF_RECORDS
+        } else {
+            EXTENT_LEAF_RECORDS
+        };
         let record_bytes = match single_block {
-            Some((_, BLOCK_TYPE_EXTENT_TABLE_V2)) | None => EXTENT_RECORD_BYTES_V2,
+            Some((_, BLOCK_TYPE_EXTENT_TABLE_V2)) | None => versioned_record_bytes,
             _ => EXTENT_RECORD_BYTES,
         };
         let count = object.record_count;
@@ -805,8 +855,8 @@ impl<R: BlockReader> Hxfs<R> {
                 block_ref = &block;
                 offset = header.header_bytes as usize + 16 + index as usize * record_bytes;
             } else {
-                let leaf_index = (index as usize) / EXTENT_LEAF_RECORDS;
-                let within = (index as usize) % EXTENT_LEAF_RECORDS;
+                let leaf_index = (index as usize) / records_per_leaf;
+                let within = (index as usize) % records_per_leaf;
                 if leaf_index >= leaves.len() {
                     return Err(HxfsError::BadTree);
                 }
@@ -818,10 +868,14 @@ impl<R: BlockReader> Hxfs<R> {
                 );
                 let _ = leaf_header?;
                 block_ref = &leaf_buf;
-                offset = HEADER_BYTES + within * EXTENT_RECORD_BYTES_V2;
+                offset = HEADER_BYTES + within * versioned_record_bytes;
             }
-            let (extent, meta) = if record_bytes == EXTENT_RECORD_BYTES_V2 {
-                parse_extent_record_v2(block_ref, offset)?
+            let (extent, meta) = if record_bytes == versioned_record_bytes {
+                if legacy {
+                    parse_extent_record_v2_legacy(block_ref, offset)?
+                } else {
+                    parse_extent_record_v2(block_ref, offset)?
+                }
             } else {
                 (parse_extent_record(block_ref, offset)?, None)
             };
@@ -862,7 +916,7 @@ impl<R: BlockReader> Hxfs<R> {
                 extent_crypto::resolve_extent_encryption_for_object(&self.system_volume, &object);
             #[cfg(feature = "crypto-aes-gcm")]
             let extent_key: Option<&[u8; 32]> = if extent_is_encrypted {
-                self.extent_key.as_ref()
+                self.extent_key.as_ref().map(|key| &**key)
             } else {
                 None
             };
@@ -953,6 +1007,7 @@ impl<R: BlockReader> Hxfs<R> {
             let key = self
                 .metadata_key
                 .as_ref()
+                .map(|key| &**key)
                 .ok_or(HxfsError::EncryptedPolicyInvalid)?;
             encrypted_metadata::decrypt_metadata_block_in_place(
                 out,
@@ -1000,16 +1055,22 @@ pub(crate) fn read_superblock<R: BlockReader>(
     let incompatible_features = read_u64(&block, base + 104)?;
     let root_state = read_u32(&block, base + 112)?;
     let root_flags = read_u32(&block, base + 116)?;
-    if format_version != FORMAT_VERSION
-        || type_system_version != TYPE_SYSTEM_VERSION
-        || block_size as usize != BLOCK_SIZE
-    {
+    let version_pair_valid = (format_version == FORMAT_VERSION
+        && type_system_version == TYPE_SYSTEM_VERSION)
+        || (format_version == LEGACY_FORMAT_VERSION
+            && type_system_version == LEGACY_TYPE_SYSTEM_VERSION);
+    if !version_pair_valid || block_size as usize != BLOCK_SIZE {
         return Err(HxfsError::UnsupportedFormat);
     }
+    let required_incompat = if format_version == FORMAT_VERSION {
+        BASE_INCOMPAT_FEATURES
+    } else {
+        LEGACY_BASE_INCOMPAT_FEATURES
+    };
     if compatible_features & !SUPPORTED_COMPAT_FEATURES != 0
         || ro_compatible_features & !SUPPORTED_RO_COMPAT_FEATURES != 0
         || incompatible_features & !SUPPORTED_INCOMPAT_FEATURES != 0
-        || incompatible_features & BASE_INCOMPAT_FEATURES != BASE_INCOMPAT_FEATURES
+        || incompatible_features & required_incompat != required_incompat
     {
         return Err(HxfsError::UnsupportedFormat);
     }
@@ -1276,12 +1337,11 @@ pub(crate) fn parse_extent_record(block: &[u8], offset: usize) -> Result<ExtentR
     Ok(record)
 }
 
-/// Byte width of a v2 extent-table record
-/// ([`BLOCK_TYPE_EXTENT_TABLE_V2`]). The v1 record is 32 bytes;
-/// the v2 record adds an optional per-extent compression
-/// descriptor (algorithm, compressed payload length, payload
-/// CRC32C) in the 8 bytes that v1 leaves unused.
-pub(crate) const EXTENT_RECORD_BYTES_V2: usize = 40;
+/// Byte width of a v6 extent-table record. The v6 record retains the
+/// compression descriptor and stores the complete 64-bit generation.
+pub(crate) const EXTENT_RECORD_BYTES_V2: usize = 48;
+/// Byte width of the read-compatible v5 record with a 32-bit generation.
+pub(crate) const LEGACY_EXTENT_RECORD_BYTES_V2: usize = 40;
 
 /// Per-extent compression descriptor carried by a v2
 /// extent-table record. `Some` means the on-disk block is the
@@ -1321,11 +1381,12 @@ pub(crate) fn parse_extent_record_v2(
     let algorithm = read_u32(block, offset + 24)?;
     let compressed_bytes = read_u32(block, offset + 28)?;
     let payload_crc32c = read_u32(block, offset + 32)?;
-    // Bytes 36..40 of the 40-byte v2 record were reserved and always
-    // written as zero, so an existing volume reads back generation 0
-    // — the value its blocks were actually encrypted under. That is
-    // what makes this a compatible extension rather than a migration.
-    let generation = u64::from(read_u32(block, offset + 36)?);
+    // v6 reserves bytes 36..40 and stores the full generation in 40..48.
+    // A non-zero reserved field is a future record shape and must fail closed.
+    if read_u32(block, offset + 36)? != 0 {
+        return Err(HxfsError::BadTree);
+    }
+    let generation = read_u64(block, offset + 40)?;
     if block_count == 0 {
         return Err(HxfsError::BadTree);
     }
@@ -1379,6 +1440,20 @@ pub(crate) fn parse_extent_record_v2(
     ))
 }
 
+/// Parse a legacy v5 40-byte extent record and widen its stored generation.
+pub(crate) fn parse_extent_record_v2_legacy(
+    block: &[u8],
+    offset: usize,
+) -> Result<(ExtentRecord, Option<ExtentCompressionMeta>), HxfsError> {
+    let source = block
+        .get(offset..offset + LEGACY_EXTENT_RECORD_BYTES_V2)
+        .ok_or(HxfsError::BadTree)?;
+    let mut widened = [0u8; EXTENT_RECORD_BYTES_V2];
+    widened[..36].copy_from_slice(&source[..36]);
+    widened[40..48].copy_from_slice(&u64::from(read_u32(source, 36)?).to_le_bytes());
+    parse_extent_record_v2(&widened, 0)
+}
+
 /// Stage E: parse the payload of an extent tree ROOT block.
 ///
 /// Returns the leaf LBAs. The root payload is
@@ -1415,7 +1490,12 @@ pub(crate) fn parse_extent_tree_root(block: &[u8]) -> Result<alloc::vec::Vec<u64
 mod extent_record_v2_tests {
     use super::*;
 
-    fn make_v2_record(flags: u32, algorithm: u32, compressed_bytes: u32, crc: u32) -> [u8; 40] {
+    fn make_v2_record(
+        flags: u32,
+        algorithm: u32,
+        compressed_bytes: u32,
+        crc: u32,
+    ) -> [u8; EXTENT_RECORD_BYTES_V2] {
         let mut record = [0u8; EXTENT_RECORD_BYTES_V2];
         record[0..8].copy_from_slice(&7u64.to_le_bytes());
         record[8..16].copy_from_slice(&42u64.to_le_bytes());
@@ -2658,10 +2738,11 @@ fn write_then_read_encrypted_compressed_volume() {
 
     // ---- Phase 2: on-disk layout reflects the policy tables ----
     let v2_count = count_metadata_blocks(&image, BLOCK_TYPE_EXTENT_TABLE_V2);
+    let leaf_count = count_metadata_blocks(&image, BLOCK_TYPE_EXTENT_TREE_LEAF);
     let v1_count = count_metadata_blocks(&image, BLOCK_TYPE_EXTENT_TABLE);
     assert!(
-        v2_count >= 1,
-        "the compressed seed.bin must have at least one v2 extent table (journal + final copies)"
+        v2_count + leaf_count >= 1,
+        "the compressed seed.bin must have a v6 extent table or tree leaf"
     );
     assert!(
         v1_count >= 1,
@@ -2673,12 +2754,12 @@ fn write_then_read_encrypted_compressed_volume() {
     while (lba + 1) * BLOCK_SIZE <= image.len() {
         let base = lba * BLOCK_SIZE;
         if let Some(bt) = le_u32_at(&image, base) {
-            if bt == BLOCK_TYPE_EXTENT_TABLE_V2 {
+            if matches!(bt, BLOCK_TYPE_EXTENT_TABLE_V2 | BLOCK_TYPE_EXTENT_TREE_LEAF) {
                 let tv =
                     u16::from_le_bytes(image[base + 4..base + 6].try_into().ok().unwrap_or([0, 0]));
                 let hb =
                     u16::from_le_bytes(image[base + 6..base + 8].try_into().ok().unwrap_or([0, 0]));
-                if matches!(tv, 1 | 6) && hb as usize == HEADER_BYTES {
+                if tv == 6 && hb as usize == HEADER_BYTES {
                     v2_lba = Some(lba);
                 }
             }
@@ -2688,7 +2769,7 @@ fn write_then_read_encrypted_compressed_volume() {
     let v2_lba = match v2_lba {
         Some(v) => v,
         None => {
-            assert!(false, "v2 extent table block not found");
+            assert!(false, "v6 extent record block not found");
             return;
         }
     };
@@ -2705,7 +2786,7 @@ fn write_then_read_encrypted_compressed_volume() {
     );
     assert_eq!(
         v2_tv, 6,
-        "v2 extent table must be encrypted (type_version 6)"
+        "v6 extent record block must be encrypted (type_version 6)"
     );
     // The first recorded data block is seed.bin chunk 0; its
     // envelope region must not contain the plaintext pattern.
@@ -2731,13 +2812,8 @@ fn write_then_read_encrypted_compressed_volume() {
 
     // ---- Phase 3: remount and read back byte-for-byte ----
     let reader = SliceBlockReader::new(&image);
-    let Ok(mut fs) = Hxfs::mount_with_policies(
-        reader,
-        &policies,
-        &comps,
-        Some(&crate::synthetic_key::VOLUME_KEY),
-    ) else {
-        assert!(false, "remount with policies must succeed");
+    let Ok(mut fs) = Hxfs::mount_from_disk(reader, Some(&crate::synthetic_key::VOLUME_KEY)) else {
+        assert!(false, "remount from on-disk policy roots must succeed");
         return;
     };
     assert!(fs.encryption().is_some());

@@ -58,6 +58,9 @@ for marker in \
     '[init] channel IPC round-trip OK' \
     '[init] monotonic clock OK' \
     '[init] waitset self-test OK' \
+    '[key-broker] kernel key moved; state=plain-only' \
+    '[init] delegated unique KeyBroker authority to DriverManager' \
+    '[driver-manager] received unique KeyBroker generation authority' \
     '[driver-manager] launched DriverHost input-host' \
     '[driver-host:input] started' \
     '[driver-host:input] retained' \

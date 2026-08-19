@@ -8,7 +8,7 @@ use crate::protocol;
 use crate::protocol::MANIFEST_GRANTS_COMPLETE_PREFIX;
 use crate::registry::{ServiceRegistry, ServiceState};
 use crate::volume_service::VolumeManagerService;
-use huesos_abi::{acpi_manager, pci_manager};
+use huesos_abi::{acpi_manager, key_broker, pci_manager};
 use libcanvas::{hbi_boot, println, storage_boot, Channel, ErrorCode, Handle, Process, Vmo};
 
 /// Fallback embedded DriverHost image (same binary packaged into BOOTFS).
@@ -144,6 +144,9 @@ pub struct DriverManager {
     input_host: Option<ManagedHost>,
     nvme_host: Option<ManagedHost>,
     hxfs_service: Option<ManagedHost>,
+    /// Unique generation-grant authority delegated by init.
+    key_broker: Option<Channel>,
+    hxfs_generation: u64,
     hxfs_failed: bool,
     hxfs_ready: bool,
     /// Highest storage-stage percentage already flushed to init.
@@ -323,6 +326,8 @@ impl DriverManager {
             input_host: None,
             nvme_host: None,
             hxfs_service: None,
+            key_broker: None,
+            hxfs_generation: 0,
             hxfs_failed: false,
             hxfs_ready: false,
             storage_progress: 0,
@@ -864,17 +869,74 @@ impl DriverManager {
         let Some(bootfs_vmo) = self.fs.vmo() else {
             return;
         };
-        let launched = libcanvas::process::spawn_elf_from_vmo(
+        let launched = libcanvas::process::spawn_elf_from_vmo_with_stack(
             "hxfs-service",
             bootfs_vmo,
             entry.offset,
             entry.len,
+            huesos_abi::USER_STACK_HXFS_SIZE,
         );
         let Ok((process, bootstrap)) = launched else {
             println!("[driver-manager] failed to launch Hxfs service");
             self.hxfs_failed = true;
             return;
         };
+        let Some(next_generation) = self.hxfs_generation.checked_add(1) else {
+            println!("[driver-manager] Hxfs generation exhausted; fail-closed");
+            self.hxfs_failed = true;
+            return;
+        };
+        let Some(broker) = self.key_broker.as_ref() else {
+            println!("[driver-manager] no KeyBroker authority; Hxfs launch denied");
+            self.hxfs_failed = true;
+            return;
+        };
+        let Ok((service_grant, broker_grant)) = Channel::pair() else {
+            println!("[driver-manager] key grant channel creation failed");
+            self.hxfs_failed = true;
+            return;
+        };
+        let Ok(service_grant) =
+            service_grant.restrict(huesos_abi::rights::READ | huesos_abi::rights::TRANSFER)
+        else {
+            println!("[driver-manager] Hxfs grant right reduction failed");
+            self.hxfs_failed = true;
+            return;
+        };
+        let Ok(broker_grant) =
+            broker_grant.restrict(huesos_abi::rights::WRITE | huesos_abi::rights::TRANSFER)
+        else {
+            println!("[driver-manager] broker grant right reduction failed");
+            self.hxfs_failed = true;
+            return;
+        };
+        let request = key_broker::GrantRequest::new(next_generation);
+        let request_bytes = request.encode();
+        if let Err((error, _handle)) =
+            broker.write_handle(&request_bytes, broker_grant.into_handle())
+        {
+            println!(
+                "[driver-manager] KeyBroker grant request failed: {}",
+                error.as_str()
+            );
+            self.hxfs_failed = true;
+            return;
+        }
+        if let Err((error, _handle)) =
+            bootstrap.write_handle(&request_bytes, service_grant.into_handle())
+        {
+            println!(
+                "[driver-manager] Hxfs key grant transfer failed: {}",
+                error.as_str()
+            );
+            self.hxfs_failed = true;
+            return;
+        }
+        self.hxfs_generation = next_generation;
+        println!(
+            "[driver-manager] issued one-shot Hxfs key grant generation {}",
+            self.hxfs_generation
+        );
         if let Err((error, _handle)) = bootstrap.write_handle(
             protocol::HXFS_BLOCK_DEVICE.as_bytes(),
             block_channel.into_handle(),
@@ -886,7 +948,10 @@ impl DriverManager {
             self.hxfs_failed = true;
             return;
         }
-        println!("[driver-manager] launched read-only Hxfs service");
+        println!(
+            "[driver-manager] launched Hxfs service stack_bytes={}",
+            huesos_abi::USER_STACK_HXFS_SIZE
+        );
         self.hxfs_service = Some(ManagedHost { process, bootstrap });
     }
 
@@ -1303,6 +1368,15 @@ impl DriverManager {
                     println!("[driver-manager] received unique ACPI broker capability");
                     self.acpi_broker = Some(handle);
                     self.try_start_acpi_manager();
+                }
+                Ok((n, Some(handle))) if &buf[..n] == protocol::KEY_BROKER_MANAGER.as_bytes() => {
+                    if self.key_broker.is_some() {
+                        println!("[driver-manager] duplicate KeyBroker authority rejected");
+                        drop(handle);
+                    } else {
+                        println!("[driver-manager] received unique KeyBroker generation authority");
+                        self.key_broker = Some(Channel::from_handle(handle));
+                    }
                 }
                 Ok((n, Some(handle))) if buf[..n].starts_with(RESOURCE_LABEL_PREFIX) => {
                     // Manifest-driven resource grant from init

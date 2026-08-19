@@ -1,0 +1,8 @@
+[package]
+name = "hxfs-migrate"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[dependencies]
+huesos-hxfs = { path = "../../crates/huesos-hxfs", features = ["crypto-aes-gcm", "compression-engines", "hxblob"] }

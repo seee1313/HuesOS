@@ -8,11 +8,13 @@ CARGO_FLAGS := $(if $(filter release,$(PROFILE)),--release,)
 # Build the boot crate (which produces the final kernel ELF "huesos-boot").
 # We build explicitly with -p to avoid pulling in dev tools (clap etc.)
 # that require std and break no_std kernel builds.
-CARGO_BUILD := cargo build -p huesos-boot $(CARGO_FLAGS)
+CARGO_BUILD := cargo build -p huesos-boot $(CARGO_FLAGS) \
+	-Z build-std=core,compiler_builtins,alloc \
+	-Z build-std-features=compiler-builtins-mem
 
 ISO := build/huesos.iso
 
-.PHONY: all build build-release run run-release iso iso-release clean fmt fmt-check test test-hxfs-features policy-check storage-gate audit audit-check bench-check clippy
+.PHONY: all build build-release run run-release iso iso-release clean fmt fmt-check test test-hxfs-features migration-check policy-check storage-gate audit audit-check bench-check clippy
 
 all: build
 
@@ -68,6 +70,11 @@ test-hxfs-features:
 		--target x86_64-unknown-linux-gnu -Z build-std= \
 		--no-default-features --features crypto-aes-gcm,compression-engines,hxblob
 
+# Explicit HxFS v5 -> v6 migration: legacy mounts stay read-only until this
+# journaled host tool publishes v6 policy roots and 64-bit generations.
+migration-check:
+	bash scripts/test-hxfs-migration.sh
+
 audit:
 	python3 tools/audit-safety.py
 
@@ -84,6 +91,7 @@ audit-check:
 	python3 tools/check-hues-async-noalloc.py
 	python3 tools/check-poll-budgets.py
 	python3 tools/check-huesos-object-lock-policy.py
+	python3 tools/check-doc-links.py
 	python3 tools/fmt-all.py --check
 
 # Stage E.4: the deterministic half of the storage benchmark is

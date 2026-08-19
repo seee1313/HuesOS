@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Small dependency-free helpers for Hxfs v5 development images/tools."""
+"""Small dependency-free helpers for HxFS v6 development images/tools."""
 
 from __future__ import annotations
 
@@ -11,8 +11,8 @@ FORMAT_GUID = bytes([
     0x48, 0x78, 0x66, 0x73, 0x2D, 0x48, 0x75, 0x65,
     0x73, 0x4F, 0x53, 0x2D, 0x76, 0x31, 0x00, 0x01,
 ])
-FORMAT_VERSION = 5
-TYPE_SYSTEM_VERSION = 5
+FORMAT_VERSION = 6
+TYPE_SYSTEM_VERSION = 6
 BLOCK_TYPE_SUPERBLOCK = 1
 BLOCK_TYPE_CHECKPOINT = 2
 BLOCK_TYPE_VOLUME_TABLE = 3
@@ -20,7 +20,7 @@ BLOCK_TYPE_OBJECT_TABLE = 4
 BLOCK_TYPE_DIRECTORY = 5
 OBJECT_TYPE_DIRECTORY = 2
 VOLUME_FLAG_SYSTEM = 1
-BASE_INCOMPAT_FEATURES = (1 << 0) | (1 << 1) | (1 << 2) | (1 << 4) | (1 << 6)
+BASE_INCOMPAT_FEATURES = (1 << 0) | (1 << 1) | (1 << 2) | (1 << 4) | (1 << 6) | (1 << 8)
 ROOT_STATE_CLEAN = 1
 
 
@@ -129,7 +129,7 @@ def build_empty_image_stream(
     instance_uuid: bytes,
     volume_uuid: bytes,
 ) -> None:
-    """Write an Hxfs v5 empty image to `out_path` without buffering the full
+    """Write an HxFS v6 empty image to `out_path` without buffering the full
     file in memory.
 
     The original `build_empty_image` materializes the entire image as a
@@ -265,6 +265,12 @@ def inspect_image(path: Path) -> dict[str, object]:
         "refcount_tree_lba": int.from_bytes(checkpoint[base + 48:base + 56], "little"),
         "backref_tree_lba": int.from_bytes(checkpoint[base + 56:base + 64], "little"),
         "quota_tree_lba": int.from_bytes(checkpoint[base + 64:base + 72], "little"),
+        "encryption_policy_tree_lba": int.from_bytes(
+            checkpoint[base + 72:base + 80], "little"
+        ),
+        "compression_policy_tree_lba": int.from_bytes(
+            checkpoint[base + 80:base + 88], "little"
+        ),
         "virtual_volume_tree_lba": int.from_bytes(checkpoint[base + 104:base + 112], "little"),
         "gpt_summary_lba": int.from_bytes(checkpoint[base + 112:base + 120], "little"),
         "install_manifest_lba": int.from_bytes(checkpoint[base + 120:base + 128], "little"),

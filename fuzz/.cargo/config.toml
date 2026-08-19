@@ -1,0 +1,5 @@
+# Fuzz targets run on the host with libFuzzer/ASan. Override the kernel
+# workspace's custom-target build-std setting so host `std` is linked once.
+[unstable]
+build-std = []
+build-std-features = []

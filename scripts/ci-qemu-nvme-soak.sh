@@ -115,7 +115,7 @@ elif [[ ! -f "$mode_file" ]] || [[ "$(cat "$mode_file" 2>/dev/null)" != "$inject
 fi
 if [[ "$need_create" == "1" ]]; then
     rm -f "$nvme_img"
-    echo "[soak] creating Hxfs v5 image: $nvme_img ($nvme_size)"
+    echo "[soak] creating HxFS v6 image: $nvme_img ($nvme_size)"
     # The QEMU NVMe namespace exposes a 512-byte LBA, so the on-disk
     # size in bytes is also the number of LBAs. Hxfs uses 4 KiB
     # internal blocks, so the Hxfs block count is on-disk bytes
@@ -345,8 +345,15 @@ fi
 required=(
     "[driver-host:nvme] identified"
     "[driver-manager] registered identified block:nvme namespace"
+    "[driver-manager] received unique KeyBroker generation authority"
+    "[driver-manager] issued one-shot Hxfs key grant generation 1"
+    "[driver-manager] launched Hxfs service stack_bytes=2097152"
+    "[hxfs] accepted generation-bound key grant 1"
     "[hxfs] service started"
 )
+if [[ "$inject" == "1" || "$inject" == "2" || "$inject" == "3" || "$inject" == "4" || "$inject" == "5" ]]; then
+    required+=("[key-broker] one-shot handoff verified")
+fi
 if [[ "$inject" == "1" || "$inject" == "2" ]]; then
     # Injection modes: the boot self-check must have detected the
     # seeded corruption with the precise marker (mode 1: GCM tag on

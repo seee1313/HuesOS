@@ -15,6 +15,9 @@
 #![no_std]
 #![warn(missing_docs)]
 
+/// Versioned userspace KeyBroker grant protocol.
+pub mod key_broker;
+
 /// Ring-3 ACPI manager broker and immutable table-archive protocol.
 pub mod acpi_broker;
 /// Ring-3 ACPI manager lifecycle and supervision protocol.
@@ -310,11 +313,11 @@ pub enum Syscall {
     /// Queue one packet to a Port. `a1` is a Port handle with WRITE rights,
     /// `a2=*const PortPacket`.
     PortQueue = 58,
-    /// Copy the bootloader/kernel volume key blob into `a1`
-    /// (`*mut [u8; 32]`). Returns `NotFound` when no key blob was
-    /// baked into this kernel build (plain-volume deployments).
-    /// Stage D bootloader KeyProvider handoff.
-    VolumeKeyGet = 59,
+    /// Atomically move the boot volume key out of the kernel. `a1` must name
+    /// a caller-owned [`ResourceKindAbi::VolumeKey`] capability and `a2` is
+    /// `*mut [u8; 32]`. The key can be taken only once; later calls return
+    /// `NotFound`. Ordinary applications never receive this capability.
+    VolumeKeyTake = 59,
     /// Fill a userspace buffer with kernel CSPRNG bytes. `a1` is the
     /// destination pointer, `a2` the length in bytes (at most
     /// [`MAX_ENTROPY_BYTES`]). Returns the number of bytes written.
@@ -501,7 +504,7 @@ impl Syscall {
             56 => Self::ResourceMap,
             57 => Self::InterruptCreateForResource,
             58 => Self::PortQueue,
-            59 => Self::VolumeKeyGet,
+            59 => Self::VolumeKeyTake,
             60 => Self::SystemGetEntropy,
             61 => Self::VmarHeapExtend,
             62 => Self::SystemKnobGet,
@@ -565,6 +568,10 @@ pub enum ResourceKindAbi {
     /// Minted exclusively by the root userspace supervisor (`init`) and
     /// transferred to the processes that legitimately tune the system.
     SystemControl = 7,
+    /// One-shot authority to move the boot volume key from the kernel into
+    /// the isolated KeyBroker. This binary capability is non-duplicable by
+    /// default and is transferred only by the root supervisor.
+    VolumeKey = 8,
 }
 
 impl ResourceKindAbi {
@@ -578,6 +585,7 @@ impl ResourceKindAbi {
             5 => Self::DmaPool,
             6 => Self::FrameDraw,
             7 => Self::SystemControl,
+            8 => Self::VolumeKey,
             _ => return None,
         })
     }
@@ -811,19 +819,25 @@ pub const USER_ASPACE_SIZE: u64 = USER_ASPACE_END - USER_ASPACE_BASE;
 
 /// Top of the initial stack used by the userspace process launcher.
 pub const USER_STACK_TOP: u64 = 0x0000_7fff_ff00_0000;
-/// Size of the initial userspace stack mapped by the userspace process launcher.
+/// Minimum stack accepted by the process launcher.
+pub const USER_STACK_MIN_SIZE: u64 = 64 * 1024;
+/// Default stack for ordinary userspace services.
+pub const USER_STACK_DEFAULT_SIZE: u64 = 512 * 1024;
+/// Maximum stack accepted by the process launcher.
+pub const USER_STACK_MAX_SIZE: u64 = 2 * 1024 * 1024;
+/// HxFS service stack profile. Its mount path constructs bounded metadata
+/// arrays before moving long-lived state to the heap.
+pub const USER_STACK_HXFS_SIZE: u64 = USER_STACK_MAX_SIZE;
+/// Initial init-process stack mapped by the kernel.
 ///
-/// 2 MiB. The stack has been raised repeatedly as the hxfs-service
-/// boot call chain grew: 64 KiB overflowed, then 128 KiB, 512 KiB
-/// and 1 MiB (mount constructs the writer's fixed arrays - 4200
-/// extents plus per-object slots - on the stack before moving it to
-/// the heap, and the load/crypto/self-check frames sit on top).
-/// The 1 MiB ceiling was hit again on target after the Hxblob read
-/// path gained a two-slot compose step: the mount frame sits within
-/// a few KiB of the mapping and any inlining shift tips it over.
-/// The mapping is virtual reservation, so 2 MiB is cheap for every
-/// process and gives the mount chain real headroom.
-pub const USER_STACK_SIZE: u64 = 4096 * 512;
+/// Kept as a compatibility alias for privileged launch code; child launchers
+/// select an explicit per-process profile.
+pub const USER_STACK_SIZE: u64 = USER_STACK_DEFAULT_SIZE;
+
+/// Validate a requested userspace stack size.
+pub const fn valid_user_stack_size(size: u64) -> bool {
+    size >= USER_STACK_MIN_SIZE && size <= USER_STACK_MAX_SIZE && size.is_multiple_of(4096)
+}
 
 /// Base of the userspace heap region mapped by the process launcher.
 ///
@@ -1334,7 +1348,7 @@ mod tests {
         assert_eq!(Syscall::ResourceMap as u64, 56);
         assert_eq!(Syscall::InterruptCreateForResource as u64, 57);
         assert_eq!(Syscall::PortQueue as u64, 58);
-        assert_eq!(Syscall::VolumeKeyGet as u64, 59);
+        assert_eq!(Syscall::VolumeKeyTake as u64, 59);
         assert_eq!(Syscall::SystemGetEntropy as u64, 60);
         assert_eq!(Syscall::VmarHeapExtend as u64, 61);
         assert_eq!(Syscall::SystemKnobGet as u64, 62);
@@ -1377,7 +1391,7 @@ mod tests {
             Some(Syscall::InterruptCreateForResource)
         );
         assert_eq!(Syscall::from_raw(58), Some(Syscall::PortQueue));
-        assert_eq!(Syscall::from_raw(59), Some(Syscall::VolumeKeyGet));
+        assert_eq!(Syscall::from_raw(59), Some(Syscall::VolumeKeyTake));
         assert_eq!(Syscall::from_raw(60), Some(Syscall::SystemGetEntropy));
         assert_eq!(Syscall::from_raw(61), Some(Syscall::VmarHeapExtend));
         assert_eq!(Syscall::from_raw(62), Some(Syscall::SystemKnobGet));
@@ -1409,6 +1423,7 @@ mod tests {
             ResourceKindAbi::DmaPool,
             ResourceKindAbi::FrameDraw,
             ResourceKindAbi::SystemControl,
+            ResourceKindAbi::VolumeKey,
         ] {
             let raw = kind as u32;
             assert_eq!(ResourceKindAbi::from_raw(raw), Some(kind));
@@ -1423,7 +1438,11 @@ mod tests {
             ResourceKindAbi::from_raw(7),
             Some(ResourceKindAbi::SystemControl)
         );
-        assert_eq!(ResourceKindAbi::from_raw(8), None);
+        assert_eq!(
+            ResourceKindAbi::from_raw(8),
+            Some(ResourceKindAbi::VolumeKey)
+        );
+        assert_eq!(ResourceKindAbi::from_raw(9), None);
         assert_eq!(ResourceKindAbi::from_raw(u32::MAX), None);
     }
 
@@ -1468,6 +1487,22 @@ mod tests {
         assert_eq!(super::INIT_FRAME_DRAW_HANDLE, 6);
         assert_eq!(super::INIT_CMDLINE_HANDLE, 7);
         assert_eq!(super::INIT_STORAGE_BOOT_INFO_HANDLE, 5);
+    }
+
+    #[test]
+    fn per_process_stack_profiles_are_bounded_and_aligned() {
+        assert!(super::valid_user_stack_size(super::USER_STACK_DEFAULT_SIZE));
+        assert!(super::valid_user_stack_size(super::USER_STACK_HXFS_SIZE));
+        assert!(!super::valid_user_stack_size(
+            super::USER_STACK_MIN_SIZE - 4096
+        ));
+        assert!(!super::valid_user_stack_size(
+            super::USER_STACK_MAX_SIZE + 4096
+        ));
+        assert!(!super::valid_user_stack_size(
+            super::USER_STACK_DEFAULT_SIZE + 1
+        ));
+        assert_eq!(super::USER_STACK_SIZE, super::USER_STACK_DEFAULT_SIZE);
     }
 
     #[test]

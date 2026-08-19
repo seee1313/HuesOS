@@ -6,8 +6,8 @@
 //! ([`VOLUME_KEY`]): the seed tool writes the volume with it, the
 //! soak harness exports its hex to the kernel build
 //! (`HUESOS_VOLUME_KEY_HEX`, see `huesos-kernel/build.rs`), the
-//! kernel serves it through the `VolumeKeyGet` syscall, and the
-//! service passes it to `mount_with_keys`. There is no implicit
+//! kernel moves it once into KeyBroker, and a generation-bound grant
+//! delivers it to the service for `mount_with_keys`. There is no implicit
 //! placeholder key material in the library anymore: an encrypted
 //! volume without a key context is rejected with
 //! `EncryptedVolumeKeyUnavailable`.
