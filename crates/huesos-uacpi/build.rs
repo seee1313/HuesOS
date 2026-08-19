@@ -32,11 +32,16 @@ fn main() {
         .define("UACPI_DEFAULT_LOG_LEVEL", "UACPI_LOG_INFO")
         .flag_if_supported("-ffreestanding")
         .flag_if_supported("-fno-stack-protector")
-        .flag_if_supported("-fno-pic")
-        .flag_if_supported("-mno-red-zone")
-        .flag_if_supported("-mcmodel=large")
         .warnings(true)
         .extra_warnings(true);
+    // Bare-metal kernel objects use the large static code model. Host tests
+    // link as PIE and therefore must retain cc-rs's default PIC mode.
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("none") {
+        build
+            .flag_if_supported("-fno-pic")
+            .flag_if_supported("-mno-red-zone")
+            .flag_if_supported("-mcmodel=large");
+    }
     for source in sources {
         build.file(vendor.join("source").join(source));
     }
