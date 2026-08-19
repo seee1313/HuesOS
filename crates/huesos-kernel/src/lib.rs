@@ -228,6 +228,9 @@ pub unsafe fn kmain(boot_info: BootInfo) -> ! {
     let extable_test_requested = boot_info
         .hbi_image
         .is_some_and(cmdline_requests_extable_test);
+    let storage_off_requested = boot_info
+        .hbi_image
+        .is_some_and(cmdline_requests_storage_off);
     init::object_init();
 
     if firmware_tables_mapped && uacpi_tables_ready {
@@ -267,7 +270,8 @@ pub unsafe fn kmain(boot_info: BootInfo) -> ! {
         let hbi = boot::hbi::HbiImage::parse(hbi_data).ok()?;
         hbi.get_module(boot::hbi::ModuleType::Cmdline).ok()
     });
-    let storage_boot_info = boot::storage::build_storage_boot_info(boot_dma_pool);
+    let storage_boot_info =
+        boot::storage::build_storage_boot_info(boot_dma_pool, storage_off_requested);
 
     init::framebuffer_init(boot_info.framebuffer);
     huesos_arch::fault::set_kernel_fault_handler(crate::panic::from_cpu_fault);
@@ -565,6 +569,10 @@ fn cmdline_requests_panic_test(hbi_data: &[u8]) -> bool {
 
 fn cmdline_requests_extable_test(hbi_data: &[u8]) -> bool {
     cmdline_flag_present(hbi_data, b"extable_test=1")
+}
+
+fn cmdline_requests_storage_off(hbi_data: &[u8]) -> bool {
+    cmdline_flag_present(hbi_data, huesos_abi::storage_boot::STORAGE_OFF_TOKEN)
 }
 
 fn cmdline_flag_present(hbi_data: &[u8], needle: &[u8]) -> bool {
