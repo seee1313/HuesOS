@@ -184,9 +184,13 @@ pub unsafe fn kmain(boot_info: BootInfo) -> ! {
         }
     });
     let acpi_archive = if uacpi_tables_ready {
-        match boot::acpi_archive::build() {
+        match boot_info
+            .rsdp_addr
+            .ok_or(boot::acpi_archive::ArchiveBuildError::InvalidRsdp)
+            .and_then(boot::acpi_archive::build)
+        {
             Ok(archive) => {
-                dbg("[uACPI] built immutable Ring-3 table archive\n");
+                dbg("[uACPI] built immutable Ring-3 table archive v2\n");
                 Some(archive)
             }
             Err(error) => {

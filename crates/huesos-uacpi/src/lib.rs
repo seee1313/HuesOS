@@ -42,6 +42,10 @@ pub enum Error {
     InvalidTableLength,
     /// uACPI returned inconsistent table metadata.
     InvalidTableMetadata,
+    /// The copied RSDP signature, revision, length, or checksum was invalid.
+    InvalidRsdp,
+    /// The FADT-referenced FACS was malformed or could not be mapped.
+    InvalidFacs,
 }
 
 #[repr(C)]
@@ -223,6 +227,121 @@ impl Drop for Table {
         // Drop runs once and uACPI accepts the same descriptor for unref.
         unsafe { uacpi_table_unref(&mut self.inner) };
     }
+}
+
+/// Immutable RSDP bytes and their original physical identity.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RsdpSnapshot {
+    /// Original bootloader-provided physical address.
+    pub physical_address: u64,
+    /// RSDP revision byte.
+    pub revision: u8,
+    /// Exact validated 20- or 36-byte RSDP.
+    pub bytes: &'static [u8],
+}
+
+/// Immutable FACS bytes referenced by the installed FADT.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FacsSnapshot {
+    /// Original firmware physical address.
+    pub physical_address: u64,
+    /// FACS version byte.
+    pub version: u8,
+    /// Complete FACS bytes. FACS has no ACPI checksum.
+    pub bytes: &'static [u8],
+}
+
+/// Validate and snapshot the boot RSDP through the retained kernel HHDM.
+pub fn rsdp_snapshot(physical_address: u64) -> Result<RsdpSnapshot, Error> {
+    if physical_address == 0 {
+        return Err(Error::MissingRsdp);
+    }
+    let first = physical_bytes(physical_address, 20).map_err(|_| Error::InvalidRsdp)?;
+    if first[..8] != *b"RSD PTR " || checksum(first) != 0 {
+        return Err(Error::InvalidRsdp);
+    }
+    let revision = first[15];
+    let length = match revision {
+        0 => 20,
+        2.. => 36,
+        _ => return Err(Error::InvalidRsdp),
+    };
+    let bytes = physical_bytes(physical_address, length).map_err(|_| Error::InvalidRsdp)?;
+    if revision >= 2 && (read_u32(bytes, 20) != Some(36) || checksum(bytes) != 0) {
+        return Err(Error::InvalidRsdp);
+    }
+    Ok(RsdpSnapshot {
+        physical_address,
+        revision,
+        bytes,
+    })
+}
+
+/// Snapshot the FADT-selected FACS when present.
+///
+/// Barebones uACPI installs the DSDT but deliberately postpones FACS
+/// installation because full mode needs a permanent writable mapping. The
+/// immutable Ring-3 archive still needs the original FACS bytes, so this helper
+/// follows uACPI's compatibility choice: use the legacy 32-bit address when it
+/// is non-zero, otherwise use the extended address.
+pub fn facs_snapshot() -> Result<Option<FacsSnapshot>, Error> {
+    let fadt = Table::find(b"FACP")?;
+    let bytes = fadt.bytes()?;
+    let legacy = read_u32(bytes, 36).ok_or(Error::InvalidFacs)? as u64;
+    let extended = read_u64(bytes, 132).map_or(0, core::convert::identity);
+    let physical_address = if legacy != 0 { legacy } else { extended };
+    if physical_address == 0 {
+        return Ok(None);
+    }
+    let header = physical_bytes(physical_address, 36).map_err(|_| Error::InvalidFacs)?;
+    if header[..4] != *b"FACS" {
+        return Err(Error::InvalidFacs);
+    }
+    let length = read_u32(header, 4).ok_or(Error::InvalidFacs)? as usize;
+    if !(64..=MAX_TABLE_BYTES).contains(&length)
+        || physical_address.checked_add(length as u64).is_none()
+    {
+        return Err(Error::InvalidFacs);
+    }
+    let bytes = physical_bytes(physical_address, length).map_err(|_| Error::InvalidFacs)?;
+    if bytes[..4] != *b"FACS" || read_u32(bytes, 4) != Some(length as u32) {
+        return Err(Error::InvalidFacs);
+    }
+    Ok(Some(FacsSnapshot {
+        physical_address,
+        version: bytes[32],
+        bytes,
+    }))
+}
+
+fn physical_bytes(address: u64, length: usize) -> Result<&'static [u8], Error> {
+    if length == 0 || address.checked_add(length as u64).is_none() {
+        return Err(Error::InvalidTableLength);
+    }
+    let pointer = uacpi_kernel_map(address, length);
+    if pointer as usize == usize::MAX {
+        return Err(Error::InvalidTableLength);
+    }
+    // SAFETY: uacpi_kernel_map established an HHDM mapping for the complete
+    // checked range. Firmware mappings are retained for the kernel lifetime,
+    // so the immutable view remains valid during archive construction.
+    Ok(unsafe { core::slice::from_raw_parts(pointer.cast::<u8>(), length) })
+}
+
+fn checksum(bytes: &[u8]) -> u8 {
+    bytes.iter().fold(0u8, |sum, byte| sum.wrapping_add(*byte))
+}
+
+fn read_u32(bytes: &[u8], offset: usize) -> Option<u32> {
+    let value = bytes.get(offset..offset + 4)?;
+    Some(u32::from_le_bytes([value[0], value[1], value[2], value[3]]))
+}
+
+fn read_u64(bytes: &[u8], offset: usize) -> Option<u64> {
+    let value = bytes.get(offset..offset + 8)?;
+    Some(u64::from_le_bytes([
+        value[0], value[1], value[2], value[3], value[4], value[5], value[6], value[7],
+    ]))
 }
 
 /// Return the pinned upstream uACPI revision.
