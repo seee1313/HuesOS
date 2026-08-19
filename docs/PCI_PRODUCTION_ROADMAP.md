@@ -971,7 +971,7 @@ closes.
 | A.1 Normative architecture | Complete (design) | PCI + Ring-3 ACPI authority docs; AP execution plan |
 | A.2 ABI vocabulary | In progress | HPCI complete; HMCF/snapshot/mint/mediation ABIs planned in AP-1/AP-7/AP-10 |
 | A.3 Migration map | Complete | architecture §2 + roadmap A.3 + AP plan |
-| ACPI archive v2 | Not started | AP-1/AP-2; current v1 lacks RSDP and complete index |
+| ACPI archive v2 | In progress | AP-1 adds ABI/dual streaming validator; AP-2 producer remains open |
 | Full Ring-3 uACPI | Not started | AP-3 through AP-14; kernel crate remains barebones |
 | ACPI supervision | In progress | current archive validator launches once; generation/restart/freeze work is AP-6 |
 | B.1 Checked address vocabulary | Complete | PCI-1 types + PCI-2 bootstrap adoption |

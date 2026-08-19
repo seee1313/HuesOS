@@ -728,8 +728,8 @@ Each PR adds one row or updates the corresponding row in the live PCI roadmap:
 
 | PR | State | Merge commit | Host evidence | QEMU evidence | Hardware evidence | Blocker |
 |---|---|---|---|---|---|---|
-| AP-0 | docs | pending | `make audit-check` | n/a | n/a | merge |
-| AP-1 | not started | — | — | n/a | n/a | AP-0 |
+| AP-0 | complete | `fea733f` | repository gates green | n/a | n/a | — |
+| AP-1 | in review | pending | archive-v2 ABI/streaming validator tests | n/a | n/a | merge |
 | AP-2 | not started | — | — | — | n/a | AP-1 |
 | AP-3 | not started | — | — | n/a | n/a | AP-2 |
 | AP-4…AP-16 | not started | — | — | — | — | ordered dependencies |

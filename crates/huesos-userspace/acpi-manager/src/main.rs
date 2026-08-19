@@ -1,18 +1,16 @@
 //! Isolated Ring-3 ACPI manager bootstrap.
 //!
-//! This stage validates the immutable table archive and establishes lifecycle
-//! supervision. Full uACPI namespace/AML execution is added only after the
-//! privileged broker channel and deny-by-default resource grants are present.
+//! This stage validates version-1 or version-2 immutable table archives and
+//! establishes lifecycle supervision. Full uACPI namespace/AML execution is
+//! added only after the privileged callbacks and deny-by-default resource
+//! grants land in their dedicated stages.
 
 #![no_std]
 #![no_main]
 
 use core::panic::PanicInfo;
-use huesos_abi::acpi_archive::PhysicalIndex;
-use huesos_abi::acpi_broker::{
-    TableArchiveEntry, MAX_ARCHIVE_BYTES, MAX_TABLES, MAX_TABLE_BYTES, TABLE_ARCHIVE_ENTRY_BYTES,
-    TABLE_ARCHIVE_HEADER_BYTES, TABLE_ARCHIVE_MAGIC, VERSION,
-};
+use huesos_abi::acpi_archive::{ArchiveReadError, ArchiveReader, ArchiveSummary};
+use huesos_abi::acpi_broker::{ArchiveError, MAX_ARCHIVE_BYTES, VERSION};
 use libcanvas::{println, wait_any, Channel, ErrorCode, Signals, Vmo, WaitItem};
 
 const ARCHIVE_MESSAGE: &[u8] = b"acpi-tables-vmo";
@@ -29,15 +27,20 @@ pub extern "C" fn _start() -> ! {
         libcanvas::process::exit(-1);
     };
     match validate_archive(&archive) {
-        Ok((table_count, index)) => {
+        Ok(summary) => {
             println!(
-                "[acpi-manager] validated {} ACPI tables, {} physical ranges indexed",
-                table_count,
-                index.len()
+                "[acpi-manager] validated ACPI archive v{}: {} tables, {} physical mappings, snapshot {}",
+                summary.version,
+                summary.table_count,
+                summary.mapping_count,
+                summary.firmware_snapshot_id
             );
         }
         Err(error) => {
-            println!("[acpi-manager] invalid table archive: {}", error.as_str());
+            println!(
+                "[acpi-manager] invalid table archive: {}",
+                archive_error_name(error)
+            );
             let _ = bootstrap.write(b"acpi-manager:archive-failed");
             libcanvas::process::exit(-2);
         }
@@ -125,121 +128,37 @@ fn verify_deny_by_default(broker: &libcanvas::acpi_broker::AcpiBroker) -> bool {
     })
 }
 
-#[derive(Clone, Copy)]
-enum ArchiveError {
-    Header,
-    Count,
-    Range,
-    Read,
+struct VmoArchiveReader<'a> {
+    vmo: &'a Vmo,
 }
 
-impl ArchiveError {
-    const fn as_str(self) -> &'static str {
-        match self {
-            Self::Header => "header",
-            Self::Count => "table count",
-            Self::Range => "table range",
-            Self::Read => "short VMO read",
+impl ArchiveReader for VmoArchiveReader<'_> {
+    fn read_exact_at(&self, offset: u64, output: &mut [u8]) -> Result<(), ArchiveReadError> {
+        match self.vmo.read(offset, output) {
+            Ok(length) if length == output.len() => Ok(()),
+            Ok(_) | Err(_) => Err(ArchiveReadError),
         }
     }
 }
 
-fn validate_archive(vmo: &Vmo) -> Result<(u32, PhysicalIndex), ArchiveError> {
-    let mut header = [0u8; TABLE_ARCHIVE_HEADER_BYTES as usize];
-    read_exact(vmo, 0, &mut header)?;
-    if header[..8] != TABLE_ARCHIVE_MAGIC
-        || u16_at(&header, 8)? != VERSION
-        || u16_at(&header, 10)? != TABLE_ARCHIVE_HEADER_BYTES
-    {
-        return Err(ArchiveError::Header);
-    }
-    let count = u32_at(&header, 12)?;
-    let total_size = u64_at(&header, 16)?;
-    if count > MAX_TABLES || total_size > MAX_ARCHIVE_BYTES {
-        return Err(ArchiveError::Count);
-    }
-    let metadata_end = (TABLE_ARCHIVE_HEADER_BYTES as u64)
-        .checked_add(
-            u64::from(count)
-                .checked_mul(TABLE_ARCHIVE_ENTRY_BYTES as u64)
-                .ok_or(ArchiveError::Range)?,
-        )
-        .ok_or(ArchiveError::Range)?;
-    if metadata_end > total_size {
-        return Err(ArchiveError::Range);
-    }
-
-    let mut previous_end = metadata_end;
-    let mut index = PhysicalIndex::empty();
-    let mut raw = [0u8; TABLE_ARCHIVE_ENTRY_BYTES];
-    for index_in_archive in 0..count {
-        let offset = u64::from(TABLE_ARCHIVE_HEADER_BYTES)
-            + u64::from(index_in_archive) * TABLE_ARCHIVE_ENTRY_BYTES as u64;
-        read_exact(vmo, offset, &mut raw)?;
-        // SAFETY: raw is a 32-byte buffer matching TableArchiveEntry's repr(C)
-        // layout; read_unaligned tolerates the unaligned slice base.
-        let entry: TableArchiveEntry =
-            unsafe { core::ptr::read_unaligned(raw.as_ptr().cast::<TableArchiveEntry>()) };
-        if entry.reserved != [0; 3] {
-            return Err(ArchiveError::Header);
-        }
-        if !(36..=MAX_TABLE_BYTES).contains(&entry.length) || entry.offset < metadata_end {
-            return Err(ArchiveError::Range);
-        }
-        if entry.physical_address != 0
-            && entry
-                .physical_address
-                .checked_add(u64::from(entry.length))
-                .is_none()
-        {
-            return Err(ArchiveError::Range);
-        }
-        if entry.offset < previous_end {
-            return Err(ArchiveError::Range);
-        }
-        let end = entry
-            .offset
-            .checked_add(u64::from(entry.length))
-            .ok_or(ArchiveError::Range)?;
-        if end > total_size {
-            return Err(ArchiveError::Range);
-        }
-        // Only firmware physical ranges back the deny-by-default map index
-        // that the future Ring-3 uACPI map callback must consult.
-        if entry.physical_address != 0 {
-            let _ = index.insert(entry.physical_address, u64::from(entry.length));
-        }
-        previous_end = end;
-    }
-    if total_size != 0 {
-        let mut probe = [0u8; 1];
-        read_exact(vmo, total_size - 1, &mut probe)?;
-    }
-    Ok((count, index))
+fn validate_archive(vmo: &Vmo) -> Result<ArchiveSummary, ArchiveError> {
+    let reader = VmoArchiveReader { vmo };
+    huesos_abi::acpi_archive::validate(&reader, MAX_ARCHIVE_BYTES)
 }
 
-fn read_exact(vmo: &Vmo, offset: u64, output: &mut [u8]) -> Result<(), ArchiveError> {
-    match vmo.read(offset, output) {
-        Ok(length) if length == output.len() => Ok(()),
-        Ok(_) | Err(_) => Err(ArchiveError::Read),
+const fn archive_error_name(error: ArchiveError) -> &'static str {
+    match error {
+        ArchiveError::Format => "format",
+        ArchiveError::UnsupportedVersion => "unsupported version",
+        ArchiveError::Metadata => "metadata",
+        ArchiveError::Range => "range",
+        ArchiveError::Overlap => "overlap",
+        ArchiveError::Reserved => "reserved field",
+        ArchiveError::Checksum => "checksum",
+        ArchiveError::Translation => "physical translation",
+        ArchiveError::Capacity => "capacity",
+        ArchiveError::Read => "short VMO read",
     }
-}
-
-fn u16_at(bytes: &[u8], offset: usize) -> Result<u16, ArchiveError> {
-    let range = bytes.get(offset..offset + 2).ok_or(ArchiveError::Header)?;
-    Ok(u16::from_le_bytes([range[0], range[1]]))
-}
-
-fn u32_at(bytes: &[u8], offset: usize) -> Result<u32, ArchiveError> {
-    let range = bytes.get(offset..offset + 4).ok_or(ArchiveError::Header)?;
-    Ok(u32::from_le_bytes([range[0], range[1], range[2], range[3]]))
-}
-
-fn u64_at(bytes: &[u8], offset: usize) -> Result<u64, ArchiveError> {
-    let range = bytes.get(offset..offset + 8).ok_or(ArchiveError::Header)?;
-    Ok(u64::from_le_bytes([
-        range[0], range[1], range[2], range[3], range[4], range[5], range[6], range[7],
-    ]))
 }
 
 #[panic_handler]

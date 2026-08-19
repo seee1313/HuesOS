@@ -3,7 +3,14 @@
 //! untrusted processes never receive it.
 
 /// Current ACPI broker protocol version.
+///
+/// This version is independent from the immutable table-archive version. The
+/// original implementation used the same value for both protocols; keeping
+/// separate constants prevents an archive format change from silently changing
+/// broker message acceptance.
 pub const VERSION: u16 = 1;
+/// Legacy immutable table-archive format version.
+pub const ARCHIVE_V1_VERSION: u16 = 1;
 /// Maximum exact-width access accepted by the protocol.
 pub const MAX_ACCESS_WIDTH: u8 = 4;
 /// Magic at the start of a read-only ACPI table archive VMO.
@@ -206,7 +213,7 @@ pub struct Response {
 pub struct TableArchiveHeader {
     /// [`TABLE_ARCHIVE_MAGIC`].
     pub magic: [u8; 8],
-    /// Archive format version, currently 1.
+    /// Legacy archive format version, [`ARCHIVE_V1_VERSION`].
     pub version: u16,
     /// Size of this header in bytes.
     pub header_size: u16,
@@ -241,6 +248,8 @@ pub struct TableArchiveEntry {
 pub enum ArchiveError {
     /// Magic or archive version does not match this ABI.
     Format,
+    /// The archive version is well-formed but unsupported by this decoder.
+    UnsupportedVersion,
     /// Header or entry count is inconsistent.
     Metadata,
     /// A table has an invalid length or offset.
@@ -249,6 +258,14 @@ pub enum ArchiveError {
     Overlap,
     /// Reserved entry fields were nonzero.
     Reserved,
+    /// A checksum or table signature did not match the archived bytes.
+    Checksum,
+    /// A physical-to-VMO mapping was missing, duplicated, or inconsistent.
+    Translation,
+    /// A bounded index or count could not represent every accepted record.
+    Capacity,
+    /// The backing VMO/slice did not return all requested bytes.
+    Read,
 }
 
 /// Validate archive metadata before a consumer reads any table bytes.
@@ -259,7 +276,7 @@ pub fn validate_archive_layout(
     header: &TableArchiveHeader,
     entries: &[TableArchiveEntry],
 ) -> Result<(), ArchiveError> {
-    if header.magic != TABLE_ARCHIVE_MAGIC || header.version != VERSION {
+    if header.magic != TABLE_ARCHIVE_MAGIC || header.version != ARCHIVE_V1_VERSION {
         return Err(ArchiveError::Format);
     }
     if header.header_size != TABLE_ARCHIVE_HEADER_BYTES
@@ -364,7 +381,7 @@ mod tests {
         let metadata = (TABLE_ARCHIVE_HEADER_BYTES as usize + TABLE_ARCHIVE_ENTRY_BYTES) as u64;
         let header = TableArchiveHeader {
             magic: TABLE_ARCHIVE_MAGIC,
-            version: VERSION,
+            version: ARCHIVE_V1_VERSION,
             header_size: TABLE_ARCHIVE_HEADER_BYTES,
             table_count: 1,
             total_size: metadata + 64,
@@ -382,7 +399,7 @@ mod tests {
     fn rejects_archive_metadata_overlap() {
         let header = TableArchiveHeader {
             magic: TABLE_ARCHIVE_MAGIC,
-            version: VERSION,
+            version: ARCHIVE_V1_VERSION,
             header_size: TABLE_ARCHIVE_HEADER_BYTES,
             table_count: 1,
             total_size: 4096,
