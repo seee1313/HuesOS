@@ -4,6 +4,10 @@ version = "0.1.0"
 edition = "2021"
 license = "MIT"
 
+[features]
+default = []
+restart-smoke = []
+
 [[bin]]
 name = "huesos-acpi-manager"
 path = "src/main.rs"

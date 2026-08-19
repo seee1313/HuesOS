@@ -8,7 +8,7 @@ use crate::protocol;
 use crate::protocol::MANIFEST_GRANTS_COMPLETE_PREFIX;
 use crate::registry::{ServiceRegistry, ServiceState};
 use crate::volume_service::VolumeManagerService;
-use huesos_abi::pci_manager;
+use huesos_abi::{acpi_manager, pci_manager};
 use libcanvas::{hbi_boot, println, storage_boot, Channel, ErrorCode, Handle, Process, Vmo};
 
 /// Fallback embedded DriverHost image (same binary packaged into BOOTFS).
@@ -186,6 +186,10 @@ pub struct DriverManager {
     /// Id of the negative-case (absent hash) open request, if sent.
     package_probe_absent_request: Option<u64>,
     acpi_manager: Option<ManagedHost>,
+    acpi_manager_generation: u64,
+    acpi_manager_restart: acpi_manager::RestartBackoff,
+    acpi_manager_ready: bool,
+    acpi_availability: acpi_manager::AvailabilityPolicy,
     /// Privileged userspace PCI Manager. PCI-9 starts it without physical
     /// config authority; no-root readiness is explicitly fail-closed.
     pci_manager: Option<ManagedHost>,
@@ -235,6 +239,8 @@ const MAX_TRACKED_HOSTS: usize = 8;
 /// peer that eventually goes quiet, which the NVMe host under the
 /// high queue-depth soak is not.
 const POLL_BUDGET_PER_TICK: u32 = 64;
+const ACPI_MANAGER_MAX_RESTARTS: u8 = 3;
+const ACPI_MANAGER_RESTART_BASE_TICKS: u64 = 10;
 const PCI_MANAGER_MAX_RESTARTS: u8 = 3;
 const PCI_MANAGER_RESTART_BASE_TICKS: u64 = 100;
 
@@ -332,6 +338,10 @@ impl DriverManager {
             package_probe_stream: None,
             package_probe_absent_request: None,
             acpi_manager: None,
+            acpi_manager_generation: 0,
+            acpi_manager_restart: acpi_manager::RestartBackoff::new(),
+            acpi_manager_ready: false,
+            acpi_availability: acpi_manager::AvailabilityPolicy::new(),
             pci_manager: None,
             pci_manager_generation: 0,
             pci_manager_restart: pci_manager::RestartBackoff::new(),
@@ -767,6 +777,7 @@ impl DriverManager {
             self.poll_hxfs_service();
             self.probe_package_resolving();
             self.poll_acpi_manager();
+            self.try_start_acpi_manager();
             self.poll_pci_manager();
             self.try_start_pci_manager();
             self.flush_storage_progress(&init_bootstrap);
@@ -969,30 +980,73 @@ impl DriverManager {
         {
             return;
         }
+        let now = libcanvas::system::monotonic_ticks().unwrap_or(0);
+        if !self
+            .acpi_manager_restart
+            .can_attempt(now, ACPI_MANAGER_MAX_RESTARTS)
+        {
+            return;
+        }
         let Some(bootfs) = self.fs.bootfs() else {
             return;
         };
         let Ok(Some(entry)) = bootfs.get_entry("/services/acpi-manager.elf") else {
             println!("[driver-manager] ACPI manager ELF missing from BOOTFS");
+            self.schedule_acpi_manager_restart();
             return;
         };
         let Some(bootfs_vmo) = self.fs.vmo() else {
             return;
         };
-        let launched = libcanvas::process::spawn_elf_from_vmo(
+        let launched = libcanvas::process::spawn_elf_from_vmo_with_vmar(
             "acpi-manager",
             bootfs_vmo,
             entry.offset,
             entry.len,
         );
-        let Ok((process, bootstrap)) = launched else {
+        let Ok((process, root_vmar, bootstrap)) = launched else {
             println!("[driver-manager] failed to launch isolated ACPI manager");
+            self.schedule_acpi_manager_restart();
             return;
         };
-        let Some(archive) = self.acpi_tables.take() else {
+        let Some(generation) = self.acpi_manager_generation.checked_add(1) else {
+            println!("[driver-manager] ACPI manager generation exhausted; degraded mode");
+            self.acpi_manager_restart.exhaust();
+            self.acpi_availability.record_runtime_failure();
             return;
         };
-        if let Err((error, handle)) = bootstrap.write_handle(
+        self.acpi_manager_generation = generation.max(1);
+        let hello_flags = if cfg!(feature = "acpi-restart-smoke") {
+            acpi_manager::HELLO_FLAG_INJECT_PRE_READY_EXIT
+        } else {
+            0
+        };
+        let mut message = [0u8; acpi_manager::MESSAGE_BYTES];
+        let Some(length) = acpi_manager::encode(
+            acpi_manager::Message::hello(self.acpi_manager_generation, hello_flags),
+            &mut message,
+        ) else {
+            self.schedule_acpi_manager_restart();
+            return;
+        };
+        if bootstrap.write(&message[..length]).is_err() {
+            println!("[driver-manager] ACPI manager hello delivery failed");
+            self.schedule_acpi_manager_restart();
+            return;
+        }
+
+        let Some(archive_source) = self.acpi_tables.as_ref() else {
+            self.schedule_acpi_manager_restart();
+            return;
+        };
+        let archive_rights =
+            huesos_abi::rights::READ | huesos_abi::rights::MAP | huesos_abi::rights::TRANSFER;
+        let Ok(archive) = archive_source.duplicate(archive_rights) else {
+            println!("[driver-manager] failed to duplicate ACPI archive");
+            self.schedule_acpi_manager_restart();
+            return;
+        };
+        if let Err((error, _archive)) = bootstrap.write_handle(
             protocol::ACPI_MANAGER_TABLES.as_bytes(),
             archive.into_handle(),
         ) {
@@ -1000,24 +1054,71 @@ impl DriverManager {
                 "[driver-manager] failed to transfer ACPI table archive: {}",
                 error.as_str()
             );
-            self.acpi_tables = Some(Vmo::from_handle(handle));
+            self.schedule_acpi_manager_restart();
             return;
         }
-        let Some(broker) = self.acpi_broker.take() else {
+
+        let Some(broker_source) = self.acpi_broker.as_ref() else {
+            self.schedule_acpi_manager_restart();
             return;
         };
-        if let Err((error, broker)) =
+        let broker_rights =
+            huesos_abi::rights::READ | huesos_abi::rights::WRITE | huesos_abi::rights::TRANSFER;
+        let Ok(broker) = broker_source.duplicate(broker_rights) else {
+            println!("[driver-manager] failed to duplicate ACPI broker capability");
+            self.schedule_acpi_manager_restart();
+            return;
+        };
+        if let Err((error, _broker)) =
             bootstrap.write_handle(protocol::ACPI_MANAGER_BROKER.as_bytes(), broker)
         {
             println!(
                 "[driver-manager] failed to transfer ACPI broker capability: {}",
                 error.as_str()
             );
-            self.acpi_broker = Some(broker);
+            self.schedule_acpi_manager_restart();
             return;
         }
-        println!("[driver-manager] launched isolated Ring-3 ACPI manager");
+        if let Err((error, _vmar)) = bootstrap.write_handle(
+            protocol::ACPI_MANAGER_SELF_VMAR.as_bytes(),
+            root_vmar.into_handle(),
+        ) {
+            println!(
+                "[driver-manager] failed to transfer ACPI self VMAR: {}",
+                error.as_str()
+            );
+            self.schedule_acpi_manager_restart();
+            return;
+        }
+
+        self.acpi_manager_ready = false;
+        println!(
+            "[driver-manager] launched restartable ACPI manager generation {}",
+            self.acpi_manager_generation
+        );
         self.acpi_manager = Some(ManagedHost { process, bootstrap });
+    }
+
+    fn schedule_acpi_manager_restart(&mut self) {
+        self.acpi_manager = None;
+        self.acpi_manager_ready = false;
+        self.acpi_availability.record_runtime_failure();
+        let now = libcanvas::system::monotonic_ticks().unwrap_or(0);
+        if !self.acpi_manager_restart.record_failure(
+            now,
+            ACPI_MANAGER_MAX_RESTARTS,
+            ACPI_MANAGER_RESTART_BASE_TICKS,
+        ) {
+            println!(
+                "[driver-manager] ACPI manager restart budget exhausted; runtime ACPI degraded"
+            );
+            return;
+        }
+        println!(
+            "[driver-manager] ACPI manager unavailable; frozen restart {}/{} scheduled",
+            self.acpi_manager_restart.failures(),
+            ACPI_MANAGER_MAX_RESTARTS - 1
+        );
     }
 
     fn describe_manifest(&self) {
@@ -1987,34 +2088,69 @@ impl DriverManager {
     }
 
     fn poll_acpi_manager(&mut self) {
-        let mut buffer = [0u8; 64];
-        // Bounded per tick, as with the NVMe host: the ACPI manager
-        // emits a periodic heartbeat, so a peer that is never quiet
-        // turns "drain until empty" into "never return".
+        let Some(host) = self.acpi_manager.take() else {
+            return;
+        };
+        let _keep_process_alive = &host.process;
+        let mut bytes = [0u8; acpi_manager::MESSAGE_BYTES];
         let mut budget = POLL_BUDGET_PER_TICK;
         loop {
             budget = match budget.checked_sub(1) {
                 Some(remaining) => remaining,
-                None => return,
-            };
-            let Some(host) = self.acpi_manager.as_ref() else {
-                return;
-            };
-            let _keep_process_alive = &host.process;
-            match host.bootstrap.read_into(&mut buffer) {
-                Ok(length) if &buffer[..length] == protocol::ACPI_MANAGER_READY.as_bytes() => {
-                    println!("[driver-manager] ACPI manager archive validation ready");
+                None => {
+                    self.acpi_manager = Some(host);
+                    return;
                 }
-                Ok(length) if &buffer[..length] == protocol::ACPI_HEARTBEAT.as_bytes() => {
-                    self.acpi_heartbeat_count = self.acpi_heartbeat_count.wrapping_add(1);
+            };
+            match host.bootstrap.read_into(&mut bytes) {
+                Ok(length) => {
+                    let Some(message) = acpi_manager::decode(&bytes[..length]) else {
+                        println!("[driver-manager] malformed ACPI manager control message");
+                        self.schedule_acpi_manager_restart();
+                        return;
+                    };
+                    if message.manager_generation != self.acpi_manager_generation {
+                        println!("[driver-manager] stale ACPI manager generation ignored");
+                        continue;
+                    }
+                    match (message.opcode, message.status) {
+                        (acpi_manager::Opcode::Ready, acpi_manager::Status::ArchiveBrokerReady) => {
+                            self.acpi_manager_ready = true;
+                            self.acpi_manager_restart.record_ready();
+                            self.acpi_availability.record_runtime_ready();
+                            println!(
+                                "[driver-manager] ACPI manager ready generation {} tables {}",
+                                message.manager_generation, message.detail
+                            );
+                        }
+                        (acpi_manager::Opcode::Heartbeat, acpi_manager::Status::Ok) => {
+                            self.acpi_heartbeat_count = self.acpi_heartbeat_count.wrapping_add(1);
+                        }
+                        (acpi_manager::Opcode::Failed, status) => {
+                            println!(
+                                "[driver-manager] ACPI manager reported failure status {} detail {}",
+                                status as i32, message.detail
+                            );
+                            self.schedule_acpi_manager_restart();
+                            return;
+                        }
+                        _ => {
+                            println!("[driver-manager] unexpected ACPI manager control message");
+                            self.schedule_acpi_manager_restart();
+                            return;
+                        }
+                    }
                 }
-                Ok(_) => {}
-                Err(ErrorCode::ShouldWait) => return,
+                Err(ErrorCode::ShouldWait) | Err(ErrorCode::TimedOut) => {
+                    self.acpi_manager = Some(host);
+                    return;
+                }
                 Err(error) => {
                     println!(
                         "[driver-manager] ACPI manager channel failed: {}",
                         error.as_str()
                     );
+                    self.schedule_acpi_manager_restart();
                     return;
                 }
             }

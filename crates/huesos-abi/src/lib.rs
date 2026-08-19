@@ -17,6 +17,8 @@
 
 /// Ring-3 ACPI manager broker and immutable table-archive protocol.
 pub mod acpi_broker;
+/// Ring-3 ACPI manager lifecycle and supervision protocol.
+pub mod acpi_manager;
 
 /// Async BlockDevice wire protocol.
 pub mod block;

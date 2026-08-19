@@ -1,8 +1,8 @@
 # uACPI integration
 
-- **Status:** kernel barebones table subsystem implemented; AP-3 isolated full
-  interpreter build scaffold implemented with every host callback fail-closed;
-  Ring-3 AML execution not implemented
+- **Status:** kernel barebones/archive-v2 bootstrap implemented; AP-3 isolated
+  full interpreter build merged; AP-4/AP-5 runtime mechanisms and AP-6
+  generation-safe supervision in progress; Ring-3 AML execution not implemented
 - **Architecture:** [ACPI_RING3.md](ACPI_RING3.md)
 - **Delivery plan:**
   [ACPI_PCI_IMPLEMENTATION_PLAN.md](ACPI_PCI_IMPLEMENTATION_PLAN.md)
@@ -96,18 +96,22 @@ The Ring-3 host callbacks are grouped by authority and land incrementally.
 
 ### 4.1 Process-local runtime primitives
 
-Implemented inside the userspace runtime/libcanvas boundary:
+AP-4 implements these callbacks inside the userspace runtime/libcanvas
+boundary, without enabling AML or hardware access:
 
-- sized allocation/free and zeroed allocation;
-- strictly monotonic nanoseconds;
-- bounded microsecond stall;
-- scheduler-backed millisecond sleep;
-- non-recursive mutexes with exact uACPI timeout semantics;
+- sized allocation/free and zeroed allocation through the embedding process's
+  global allocator;
+- monotonic nanoseconds derived from the current 100 Hz hardware clock;
+- bounded microsecond stall and cooperative tick-rounded millisecond sleep;
+- non-recursive mutexes with exact uACPI timeout values;
 - semaphore-like counted events;
 - process-local spin/dispatch guards;
-- stable userspace thread identity;
-- bounded deferred work queues and completion barriers;
-- firmware fatal/breakpoint policy.
+- stable identity for the current single userspace thread.
+
+Mutex, event, and spin handles come from independent 64-slot fixed registries;
+exhaustion returns null instead of aliasing an existing object. Deferred work,
+firmware fatal/breakpoint handling, and IRQ delivery remain fail-closed until
+their later AP stages.
 
 Ring-3 code cannot execute privileged interrupt-disable instructions. uACPI's
 interrupt-state callbacks are represented as suppression/restoration of ACPI
@@ -116,14 +120,17 @@ routing remain kernel mechanisms.
 
 ### 4.2 Immutable table mapping
 
-The full runtime maps ACPI archive v2 read-only. Its
+AP-5 adds the runtime mechanism to map ACPI archive v2 once at a fixed
+userspace address with read-only/non-executable VMAR permissions. The archive
+VMO must carry `READ | MAP` and the manager must receive its own root VMAR
+capability; AP-6 supplies the generation-safe bootstrap transport. The runtime
+retains both handles and revalidates the mapped bytes before publication.
+
 `uacpi_kernel_get_rsdp()` returns the original physical RSDP address recorded in
 the archive, and `uacpi_kernel_map()` translates only ranges represented by the
-archive's physical-to-VMO index.
-
-This callback never performs a physical-map syscall and never maps AML-selected
-SystemMemory. A request outside one complete archive translation record returns
-`UACPI_MAP_FAILED`.
+archive's physical-to-VMO index. It never performs a physical-map syscall and
+never maps AML-selected SystemMemory. A zero, overflowing, cross-record, gap,
+or out-of-index request returns `UACPI_MAP_FAILED`.
 
 ### 4.3 Privileged hardware callbacks
 
@@ -208,9 +215,12 @@ On `acpi-manager` termination:
 6. release runtime objects and archive mappings;
 7. report a structured reason and generation to DriverManager.
 
-DriverManager retains the canonical archive and last-good HMCF/HPCI snapshots,
-applies restart backoff, and freezes new PCI lifecycle operations while the
-runtime is unavailable. Existing drivers may continue only with already
+AP-6 makes DriverManager retain duplicable archive/broker capabilities, assigns
+non-zero manager generations, transfers the child self-VMAR, validates binary
+ready/heartbeat/failure messages, and applies bounded restart backoff. It
+freezes new ACPI-dependent lifecycle work while the runtime is unavailable.
+Future HMCF/HPCI stages attach actual last-good snapshots to the already
+host-tested freeze policy. Existing drivers may continue only with already
 granted resources and operations that do not need new AML evaluation.
 
 A fatal AML request, namespace timeout, work-queue overflow, malformed result,

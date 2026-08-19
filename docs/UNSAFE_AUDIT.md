@@ -166,6 +166,36 @@ measured global unsafe-block count remains 370. The dedicated per-file budget
 for `crates/huesos-uacpi/src/lib.rs` grows from 12 to 13 and the manager falls
 from one block to zero.
 
+## Ring-3 uACPI allocation boundary
+
+AP-4 adds three unsafe blocks in
+`crates/huesos-userspace/uacpi-runtime/src/primitives.rs`: process-allocator
+allocation, zeroed allocation, and deallocation. Both allocation callbacks
+construct one checked 16-byte-aligned `Layout`; `UACPI_SIZED_FREES` makes the
+foreign caller return the exact original size to the matching free callback.
+Null and unrepresentable requests fail without dereference. Synchronization,
+time, event, and dispatch callbacks use atomics and fixed safe Rust registries
+and add no unsafe code.
+
+The global budget changes from 370 to 373, all three blocks are localized in
+this one reviewed allocator adapter, and unsafe-function/impl/static-mut and
+panic-like counts do not grow.
+
+## Ring-3 archive mapping boundary
+
+AP-5 adds two unsafe blocks in
+`crates/huesos-userspace/uacpi-runtime/src/archive.rs`. The first constructs an
+immutable slice only after `VmarMap` succeeds at the fixed archive address with
+`READ | USER | SPECIFIC` and without write/execute flags; retained VMO/VMAR
+handles keep the frames and mapping alive. The mapped bytes are immediately
+revalidated against the streaming archive-v2 summary. The second writes the
+validated original RSDP physical address to uACPI's non-null output pointer.
+Every physical map request thereafter is safe range arithmetic over the sealed
+mapping directory and cannot call a physical-map syscall.
+
+The global budget changes from 373 to 375. No unsafe function/impl, raw hardware
+access, writable archive mapping, or panic-like call is added.
+
 ## Remaining high-priority boundaries
 
 ### Allocator internals

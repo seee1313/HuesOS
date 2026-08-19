@@ -8,6 +8,7 @@
  * reviews rather than weakening these defaults in place.
  */
 
+#ifndef HUESOS_UACPI_RUST_ARCHIVE
 uacpi_status uacpi_kernel_get_rsdp(uacpi_phys_addr *out_rsdp_address)
 {
     if (out_rsdp_address)
@@ -27,6 +28,7 @@ void uacpi_kernel_unmap(void *address, uacpi_size length)
     (void)address;
     (void)length;
 }
+#endif
 
 void uacpi_kernel_log(uacpi_log_level level, const uacpi_char *message)
 {
@@ -177,6 +179,7 @@ uacpi_status uacpi_kernel_io_write32(
     return UACPI_STATUS_DENIED;
 }
 
+#ifndef HUESOS_UACPI_RUST_PRIMITIVES
 void *uacpi_kernel_alloc(uacpi_size size)
 {
     (void)size;
@@ -318,6 +321,7 @@ void uacpi_kernel_unlock_spinlock(
     (void)handle;
     (void)flags;
 }
+#endif
 
 uacpi_status uacpi_kernel_schedule_work(
     uacpi_work_type type, uacpi_work_handler handler, uacpi_handle context)

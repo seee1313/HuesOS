@@ -70,6 +70,18 @@ pub fn spawn_elf_from_vmo(
     offset: u64,
     len: u64,
 ) -> crate::Result<(Process, Channel)> {
+    let (process, _root_vmar, bootstrap) = spawn_elf_from_vmo_with_vmar(name, vmo, offset, len)?;
+    Ok((process, bootstrap))
+}
+
+/// Load/start a VMO-backed ELF and retain the child root VMAR for explicit
+/// capability transfer to self-mapping runtimes such as `acpi-manager`.
+pub fn spawn_elf_from_vmo_with_vmar(
+    name: &str,
+    vmo: &Vmo,
+    offset: u64,
+    len: u64,
+) -> crate::Result<(Process, Vmar, Channel)> {
     if len == 0 || offset.checked_add(len).is_none() {
         return Err(crate::ErrorCode::InvalidArgs);
     }
@@ -113,7 +125,7 @@ pub fn spawn_elf_from_vmo(
     map_initial_stack(&root_vmar)?;
     let thread = Thread::create(&process, "main")?;
     let bootstrap = thread.start(image.entry, initial_user_rsp(huesos_abi::USER_STACK_TOP))?;
-    Ok((process, bootstrap))
+    Ok((process, root_vmar, bootstrap))
 }
 
 fn initial_user_rsp(stack_top: u64) -> u64 {

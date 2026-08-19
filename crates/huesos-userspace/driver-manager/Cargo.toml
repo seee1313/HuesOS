@@ -3,6 +3,10 @@ name = "huesos-driver-manager"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+default = []
+acpi-restart-smoke = []
+
 [[bin]]
 name = "huesos-driver-manager"
 path = "src/main.rs"
