@@ -392,7 +392,10 @@ fn send_bootfs_vmo(logger: &mut InitLogger, dm_bootstrap: &Channel, bootfs: &Vmo
 
 fn send_acpi_tables_vmo(logger: &mut InitLogger, dm_bootstrap: &Channel, tables: &Vmo) {
     let duplicate = tables.duplicate(
-        libcanvas::rights::READ | libcanvas::rights::DUPLICATE | libcanvas::rights::TRANSFER,
+        libcanvas::rights::READ
+            | libcanvas::rights::MAP
+            | libcanvas::rights::DUPLICATE
+            | libcanvas::rights::TRANSFER,
     );
     let Ok(vmo) = duplicate else {
         init_logln!(logger, "[init] ACPI table archive unavailable");

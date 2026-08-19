@@ -52,10 +52,8 @@ pub const ACPI_BROKER: &str = "acpi-broker";
 pub const ACPI_MANAGER_TABLES: &str = "acpi-tables-vmo";
 /// DriverManager passes the unique broker capability to the ACPI manager.
 pub const ACPI_MANAGER_BROKER: &str = "acpi-broker";
-/// ACPI manager completed archive validation.
-pub const ACPI_MANAGER_READY: &str = "acpi-manager:ready";
-/// ACPI manager heartbeat.
-pub const ACPI_HEARTBEAT: &str = "heartbeat:acpi";
+/// DriverManager passes the child process's own root VMAR capability.
+pub const ACPI_MANAGER_SELF_VMAR: &str = "acpi-self-vmar";
 /// Client asks DriverManager to open FileSystemService.
 pub const OPEN_FILESYSTEM: &str = "open:filesystem";
 /// Client asks DriverManager to open DevFS.

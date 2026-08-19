@@ -1,9 +1,8 @@
-//! Isolated Ring-3 ACPI manager bootstrap.
+//! Supervised isolated Ring-3 ACPI manager bootstrap.
 //!
-//! This stage validates version-1 or version-2 immutable table archives and
-//! establishes lifecycle supervision. Full uACPI namespace/AML execution is
-//! added only after the privileged callbacks and deny-by-default resource
-//! grants land in their dedicated stages.
+//! AP-6 validates generation-tagged lifecycle control plus retained archive,
+//! broker, and self-VMAR capabilities. Full uACPI namespace execution remains
+//! disabled until the later AML stages.
 
 #![no_std]
 #![no_main]
@@ -11,106 +10,197 @@
 use core::panic::PanicInfo;
 use huesos_abi::acpi_archive::{ArchiveReadError, ArchiveReader, ArchiveSummary};
 use huesos_abi::acpi_broker::{ArchiveError, MAX_ARCHIVE_BYTES, VERSION};
-use libcanvas::{println, wait_any, Channel, ErrorCode, Signals, Vmo, WaitItem};
+use huesos_abi::acpi_manager;
+use libcanvas::{println, wait_any, Channel, ErrorCode, Signals, Vmar, Vmo, WaitItem};
 
-const ARCHIVE_MESSAGE: &[u8] = b"acpi-tables-vmo";
-const BROKER_MESSAGE: &[u8] = b"acpi-broker";
+struct BootstrapInputs {
+    generation: Option<u64>,
+    hello_flags: u32,
+    archive: Option<Vmo>,
+    broker: Option<libcanvas::acpi_broker::AcpiBroker>,
+    self_vmar: Option<Vmar>,
+}
+
+impl BootstrapInputs {
+    const fn new() -> Self {
+        Self {
+            generation: None,
+            hello_flags: 0,
+            archive: None,
+            broker: None,
+            self_vmar: None,
+        }
+    }
+
+    fn complete(&self) -> bool {
+        self.generation.is_some()
+            && self.archive.is_some()
+            && self.broker.is_some()
+            && self.self_vmar.is_some()
+    }
+}
 
 #[unsafe(no_mangle)]
 pub extern "C" fn _start() -> ! {
     println!("[acpi-manager] isolated Ring-3 service started");
     let bootstrap = libcanvas::channel::bootstrap();
-    let _ = bootstrap.write(b"acpi-manager:starting");
-
-    let Some(archive) = receive_archive(&bootstrap) else {
-        let _ = bootstrap.write(b"acpi-manager:archive-failed");
+    let Some(mut inputs) = receive_bootstrap(&bootstrap) else {
         libcanvas::process::exit(-1);
     };
-    match validate_archive(&archive) {
-        Ok(summary) => {
-            println!(
-                "[acpi-manager] validated ACPI archive v{}: {} tables, {} physical mappings, snapshot {}",
-                summary.version,
-                summary.table_count,
-                summary.mapping_count,
-                summary.firmware_snapshot_id
-            );
-        }
+    let Some(generation) = inputs.generation else {
+        libcanvas::process::exit(-2);
+    };
+
+    #[cfg(feature = "restart-smoke")]
+    if generation == 1 && inputs.hello_flags & acpi_manager::HELLO_FLAG_INJECT_PRE_READY_EXIT != 0 {
+        println!("[acpi-manager] injected pre-ready exit generation 1");
+        libcanvas::process::exit(-70);
+    }
+
+    let Some(archive) = inputs.archive.take() else {
+        send_failure(
+            &bootstrap,
+            generation,
+            acpi_manager::Status::MissingCapability,
+            1,
+        );
+        libcanvas::process::exit(-3);
+    };
+    let summary = match validate_archive(&archive) {
+        Ok(summary) => summary,
         Err(error) => {
             println!(
                 "[acpi-manager] invalid table archive: {}",
                 archive_error_name(error)
             );
-            let _ = bootstrap.write(b"acpi-manager:archive-failed");
-            libcanvas::process::exit(-2);
+            send_failure(
+                &bootstrap,
+                generation,
+                acpi_manager::Status::InvalidArchive,
+                error as u32,
+            );
+            libcanvas::process::exit(-4);
         }
-    }
-    let Some(broker) = receive_broker(&bootstrap) else {
-        let _ = bootstrap.write(b"acpi-manager:broker-failed");
-        libcanvas::process::exit(-3);
+    };
+    println!(
+        "[acpi-manager] validated ACPI archive v{}: {} tables, {} physical mappings, snapshot {}",
+        summary.version, summary.table_count, summary.mapping_count, summary.firmware_snapshot_id
+    );
+
+    let Some(broker) = inputs.broker.take() else {
+        send_failure(
+            &bootstrap,
+            generation,
+            acpi_manager::Status::MissingCapability,
+            2,
+        );
+        libcanvas::process::exit(-5);
     };
     if !verify_deny_by_default(&broker) {
         println!("[acpi-manager] broker deny-by-default self-test failed");
-        let _ = bootstrap.write(b"acpi-manager:broker-failed");
-        libcanvas::process::exit(-4);
+        send_failure(
+            &bootstrap,
+            generation,
+            acpi_manager::Status::BrokerDenied,
+            0,
+        );
+        libcanvas::process::exit(-6);
     }
     println!("[acpi-manager] broker deny-by-default self-test OK");
-    let _ = bootstrap.write(b"acpi-manager:ready");
 
-    let mut yields = 0u32;
+    let Some(_self_vmar) = inputs.self_vmar.take() else {
+        send_failure(
+            &bootstrap,
+            generation,
+            acpi_manager::Status::MissingCapability,
+            3,
+        );
+        libcanvas::process::exit(-7);
+    };
+    if !send_control(
+        &bootstrap,
+        acpi_manager::Message::ready(generation, summary.table_count),
+    ) {
+        libcanvas::process::exit(-8);
+    }
+    println!(
+        "[acpi-manager] generation {} archive/broker capabilities ready",
+        generation
+    );
+
+    let mut fallback_ticks = 0u64;
+    let mut last_heartbeat = monotonic_or(&mut fallback_ticks);
     loop {
-        yields = yields.wrapping_add(1);
-        if yields == 0 {
-            let _ = bootstrap.write(b"heartbeat:acpi");
+        let now = monotonic_or(&mut fallback_ticks);
+        if now.saturating_sub(last_heartbeat) >= 100 {
+            let heartbeat = acpi_manager::Message {
+                opcode: acpi_manager::Opcode::Heartbeat,
+                manager_generation: generation,
+                status: acpi_manager::Status::Ok,
+                detail: 0,
+            };
+            if !send_control(&bootstrap, heartbeat) {
+                libcanvas::process::exit(-9);
+            }
+            last_heartbeat = now;
         }
         libcanvas::process::yield_now();
     }
 }
 
-fn receive_archive(bootstrap: &Channel) -> Option<Vmo> {
-    let mut message = [0u8; 32];
+fn receive_bootstrap(bootstrap: &Channel) -> Option<BootstrapInputs> {
+    let mut inputs = BootstrapInputs::new();
+    let mut bytes = [0u8; 64];
     let items = [WaitItem::new(
         bootstrap.handle().raw(),
         Signals::READABLE | Signals::PEER_CLOSED,
         0,
     )];
-    loop {
+    while !inputs.complete() {
         wait_any(&items, 0).ok()?;
         loop {
-            match bootstrap.read_optional_handle(&mut message) {
-                Ok((length, Some(handle))) if &message[..length] == ARCHIVE_MESSAGE => {
-                    return Some(Vmo::from_handle(handle));
+            match bootstrap.read_optional_handle(&mut bytes) {
+                Ok((length, Some(handle)))
+                    if &bytes[..length] == acpi_manager::TABLES_VMO_LABEL =>
+                {
+                    if inputs.archive.is_some() {
+                        drop(handle);
+                        return None;
+                    }
+                    inputs.archive = Some(Vmo::from_handle(handle));
+                }
+                Ok((length, Some(handle))) if &bytes[..length] == acpi_manager::BROKER_LABEL => {
+                    if inputs.broker.is_some() {
+                        drop(handle);
+                        return None;
+                    }
+                    inputs.broker = Some(libcanvas::acpi_broker::AcpiBroker::from_handle(handle));
+                }
+                Ok((length, Some(handle))) if &bytes[..length] == acpi_manager::SELF_VMAR_LABEL => {
+                    if inputs.self_vmar.is_some() {
+                        drop(handle);
+                        return None;
+                    }
+                    inputs.self_vmar = Some(Vmar::from_handle(handle));
                 }
                 Ok((_length, Some(handle))) => drop(handle),
-                Ok((_length, None)) => {}
+                Ok((length, None)) => {
+                    let message = acpi_manager::decode(&bytes[..length])?;
+                    if message.opcode != acpi_manager::Opcode::Hello
+                        || message.status != acpi_manager::Status::Ok
+                        || inputs.generation.is_some()
+                    {
+                        return None;
+                    }
+                    inputs.generation = Some(message.manager_generation);
+                    inputs.hello_flags = message.detail;
+                }
                 Err(ErrorCode::ShouldWait) | Err(ErrorCode::TimedOut) => break,
                 Err(_) => return None,
             }
         }
     }
-}
-
-fn receive_broker(bootstrap: &Channel) -> Option<libcanvas::acpi_broker::AcpiBroker> {
-    let mut message = [0u8; 32];
-    let items = [WaitItem::new(
-        bootstrap.handle().raw(),
-        Signals::READABLE | Signals::PEER_CLOSED,
-        0,
-    )];
-    loop {
-        wait_any(&items, 0).ok()?;
-        loop {
-            match bootstrap.read_optional_handle(&mut message) {
-                Ok((length, Some(handle))) if &message[..length] == BROKER_MESSAGE => {
-                    return Some(libcanvas::acpi_broker::AcpiBroker::from_handle(handle));
-                }
-                Ok((_length, Some(handle))) => drop(handle),
-                Ok((_length, None)) => {}
-                Err(ErrorCode::ShouldWait) | Err(ErrorCode::TimedOut) => break,
-                Err(_) => return None,
-            }
-        }
-    }
+    Some(inputs)
 }
 
 fn verify_deny_by_default(broker: &libcanvas::acpi_broker::AcpiBroker) -> bool {
@@ -126,6 +216,36 @@ fn verify_deny_by_default(broker: &libcanvas::acpi_broker::AcpiBroker) -> bool {
         response.status == huesos_abi::acpi_broker::Status::AccessDenied as i32
             && response.request_id == request.request_id
     })
+}
+
+fn send_failure(bootstrap: &Channel, generation: u64, status: acpi_manager::Status, detail: u32) {
+    let _ = send_control(
+        bootstrap,
+        acpi_manager::Message {
+            opcode: acpi_manager::Opcode::Failed,
+            manager_generation: generation,
+            status,
+            detail,
+        },
+    );
+}
+
+fn send_control(bootstrap: &Channel, message: acpi_manager::Message) -> bool {
+    let mut bytes = [0u8; acpi_manager::MESSAGE_BYTES];
+    let Some(length) = acpi_manager::encode(message, &mut bytes) else {
+        return false;
+    };
+    bootstrap.write(&bytes[..length]).is_ok()
+}
+
+fn monotonic_or(fallback: &mut u64) -> u64 {
+    match libcanvas::system::monotonic_ticks() {
+        Ok(ticks) => ticks,
+        Err(_) => {
+            *fallback = fallback.saturating_add(1);
+            *fallback
+        }
+    }
 }
 
 struct VmoArchiveReader<'a> {
