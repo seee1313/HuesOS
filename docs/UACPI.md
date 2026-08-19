@@ -1,8 +1,9 @@
 # uACPI integration
 
-- **Status:** kernel barebones table subsystem implemented; AP-3 isolated full
-  interpreter build scaffold implemented with every host callback fail-closed;
-  Ring-3 AML execution not implemented
+- **Status:** kernel barebones/archive-v2 bootstrap implemented; AP-3 isolated
+  full interpreter build merged; AP-4 process-local allocation, time,
+  synchronization, and dispatch callbacks in progress; Ring-3 AML execution
+  not implemented
 - **Architecture:** [ACPI_RING3.md](ACPI_RING3.md)
 - **Delivery plan:**
   [ACPI_PCI_IMPLEMENTATION_PLAN.md](ACPI_PCI_IMPLEMENTATION_PLAN.md)
@@ -96,18 +97,22 @@ The Ring-3 host callbacks are grouped by authority and land incrementally.
 
 ### 4.1 Process-local runtime primitives
 
-Implemented inside the userspace runtime/libcanvas boundary:
+AP-4 implements these callbacks inside the userspace runtime/libcanvas
+boundary, without enabling AML or hardware access:
 
-- sized allocation/free and zeroed allocation;
-- strictly monotonic nanoseconds;
-- bounded microsecond stall;
-- scheduler-backed millisecond sleep;
-- non-recursive mutexes with exact uACPI timeout semantics;
+- sized allocation/free and zeroed allocation through the embedding process's
+  global allocator;
+- monotonic nanoseconds derived from the current 100 Hz hardware clock;
+- bounded microsecond stall and cooperative tick-rounded millisecond sleep;
+- non-recursive mutexes with exact uACPI timeout values;
 - semaphore-like counted events;
 - process-local spin/dispatch guards;
-- stable userspace thread identity;
-- bounded deferred work queues and completion barriers;
-- firmware fatal/breakpoint policy.
+- stable identity for the current single userspace thread.
+
+Mutex, event, and spin handles come from independent 64-slot fixed registries;
+exhaustion returns null instead of aliasing an existing object. Deferred work,
+firmware fatal/breakpoint handling, and IRQ delivery remain fail-closed until
+their later AP stages.
 
 Ring-3 code cannot execute privileged interrupt-disable instructions. uACPI's
 interrupt-state callbacks are represented as suppression/restoration of ACPI

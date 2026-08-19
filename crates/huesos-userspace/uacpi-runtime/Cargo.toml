@@ -8,6 +8,10 @@ build = "build.rs"
 [lib]
 path = "src/lib.rs"
 
+[dependencies]
+libcanvas = { path = "../libcanvas" }
+spin = "0.9"
+
 [build-dependencies]
 cc = "1.2"
 

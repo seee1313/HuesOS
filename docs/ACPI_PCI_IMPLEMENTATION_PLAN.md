@@ -729,10 +729,11 @@ Each PR adds one row or updates the corresponding row in the live PCI roadmap:
 | PR | State | Merge commit | Host evidence | QEMU evidence | Hardware evidence | Blocker |
 |---|---|---|---|---|---|---|
 | AP-0 | complete | `fea733f` | repository gates green | n/a | n/a | — |
-| AP-1 | in review | pending | archive-v2 ABI/streaming validator tests | n/a | n/a | merge |
-| AP-2 | in review | pending | pure encoder + full repository gates | Q35/OVMF release SMP2: 8 tables/9 mappings | n/a | AP-1 |
-| AP-3 | in review | pending | target build + fail-closed ASan/UBSan smoke | n/a | n/a | AP-2 |
-| AP-4…AP-16 | not started | — | — | — | — | ordered dependencies |
+| AP-1 | complete | `0c45f00` | archive-v2 ABI/61 ABI tests | n/a | n/a | — |
+| AP-2 | complete | `8d7fc8c` | pure encoder + repository gates | Q35/OVMF release SMP2: 8 tables/9 mappings | n/a | — |
+| AP-3 | complete | `57d8203` | target build + fail-closed ASan/UBSan smoke | n/a | n/a | — |
+| AP-4 | in review | pending | 4 primitive host tests + target build | n/a | n/a | merge |
+| AP-5…AP-16 | not started | — | — | — | — | ordered dependencies |
 
 A row says `Complete` only after its exit criteria and actual verification logs
 are named in the merged PR. Policy-only completion never closes an on-target

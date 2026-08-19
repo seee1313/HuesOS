@@ -19,14 +19,61 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d45db016d36b838f563236e9193d0ee6ce38f3f68b6c94e914b4929c96bbb890"
 
 [[package]]
+name = "huesos-abi"
+version = "0.1.0"
+
+[[package]]
+name = "huesos-blobfs"
+version = "0.1.0"
+
+[[package]]
+name = "huesos-scudo"
+version = "0.1.0"
+
+[[package]]
 name = "huesos-uacpi-runtime"
 version = "0.1.0"
 dependencies = [
  "cc",
+ "libcanvas",
+ "spin",
 ]
+
+[[package]]
+name = "libcanvas"
+version = "0.1.0"
+dependencies = [
+ "huesos-abi",
+ "huesos-blobfs",
+ "huesos-scudo",
+]
+
+[[package]]
+name = "lock_api"
+version = "0.4.14"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "224399e74b87b5f3557511d98dff8b14089b3dadafcab6bb93eab67d3aace965"
+dependencies = [
+ "scopeguard",
+]
+
+[[package]]
+name = "scopeguard"
+version = "1.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
 
 [[package]]
 name = "shlex"
 version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
+
+[[package]]
+name = "spin"
+version = "0.9.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3763264f6b73151db08c50ff20d7d8a0b8796e021cdea7ceedad07b80155fa0e"
+dependencies = [
+ "lock_api",
+]

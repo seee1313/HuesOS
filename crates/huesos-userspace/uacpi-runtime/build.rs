@@ -28,6 +28,9 @@ fn main() {
     build
         .include(vendor.join("include"))
         .define("UACPI_USE_BUILTIN_STRING", None)
+        .define("UACPI_NATIVE_ALLOC_ZEROED", None)
+        .define("UACPI_SIZED_FREES", None)
+        .define("HUESOS_UACPI_RUST_PRIMITIVES", None)
         .define("UACPI_DEFAULT_LOG_LEVEL", "UACPI_LOG_INFO")
         .flag_if_supported("-ffreestanding")
         .flag_if_supported("-fno-stack-protector")

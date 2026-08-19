@@ -39,9 +39,13 @@ This runs, e.g.:
   service's no-root fail-closed marker and DriverManager's matching supervised
   readiness marker.
 - `huesos-uacpi-runtime`: AP-3 compiles the full pinned interpreter in a
-  separate userspace crate while every host callback remains fail-closed. Run
-  `bash scripts/test-uacpi-runtime.sh` to link every callback and execute the
-  denial smoke under ASan/UBSan. This does not claim namespace/AML readiness.
+  separate userspace crate; AP-4 activates only process-local allocation,
+  time, mutex, event, and dispatch callbacks. From a temporary directory (so
+  the bare-metal Cargo config is not selected), run
+  `cargo test --manifest-path <repo>/crates/huesos-userspace/uacpi-runtime/Cargo.toml`
+  for the four primitive tests. Run `bash scripts/test-uacpi-runtime.sh` to link
+  every callback and execute the remaining privileged-denial smoke under
+  ASan/UBSan. This does not claim namespace/AML readiness.
 - `huesos-hxfs`: checkpoint geometry is checked against the actual target and
   journal LBA spans. Plain and Hxblob-enabled regressions simulate power loss
   after the `RECOVERING` root is durable but before the final clean root,
