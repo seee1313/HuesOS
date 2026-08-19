@@ -149,6 +149,23 @@ origin and checksum status. Archive construction cross-checks metadata against
 the independently referenced table bytes before exposing any firmware address
 to Ring 3.
 
+## uACPI RSDP/FACS snapshot boundary
+
+Archive v2 adds one unsafe block in `huesos-uacpi::physical_bytes` to turn an
+HHDM mapping into an immutable byte slice. The only production callers supply
+the bootloader-provided RSDP address or the FADT-selected FACS address. Before
+the slice is returned, the helper rejects zero length and address overflow and
+requires the fallible HHDM mapping to succeed. RSDP signature, revision, exact
+20/36-byte length, and both checksums are validated; FACS signature and bounded
+declared length are validated separately because FACS has no checksum. The
+kernel copies both objects immediately into a sealed archive and never exposes
+the HHDM pointer to Ring 3.
+
+AP-1 removed the ACPI Manager's manual `read_unaligned` archive decoder, so the
+measured global unsafe-block count remains 370. The dedicated per-file budget
+for `crates/huesos-uacpi/src/lib.rs` grows from 12 to 13 and the manager falls
+from one block to zero.
+
 ## Remaining high-priority boundaries
 
 ### Allocator internals

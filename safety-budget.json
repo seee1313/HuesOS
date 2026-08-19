@@ -61,7 +61,7 @@
     "crates/huesos-syscalls/src/resource.rs": 2,
     "crates/huesos-syscalls/src/user_access.rs": 6,
     "crates/huesos-syscalls/src/user_memory.rs": 7,
-    "crates/huesos-uacpi/src/lib.rs": 12,
+    "crates/huesos-uacpi/src/lib.rs": 13,
     "crates/huesos-userspace/acpi-manager/src/main.rs": 1,
     "crates/huesos-userspace/doom/src/main.rs": 9,
     "crates/huesos-userspace/driver-host-nvme/src/main.rs": 3,

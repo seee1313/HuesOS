@@ -730,7 +730,7 @@ Each PR adds one row or updates the corresponding row in the live PCI roadmap:
 |---|---|---|---|---|---|---|
 | AP-0 | complete | `fea733f` | repository gates green | n/a | n/a | — |
 | AP-1 | in review | pending | archive-v2 ABI/streaming validator tests | n/a | n/a | merge |
-| AP-2 | not started | — | — | — | n/a | AP-1 |
+| AP-2 | in review | pending | pure encoder + full repository gates | Q35/OVMF required | n/a | AP-1 |
 | AP-3 | not started | — | — | n/a | n/a | AP-2 |
 | AP-4…AP-16 | not started | — | — | — | — | ordered dependencies |
 

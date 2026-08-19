@@ -50,8 +50,9 @@ fi
 # green under a broken user experience.
 for marker in \
     '[uACPI] validated ACPI table graph and MADT' \
-    '[uACPI] built immutable Ring-3 table archive' \
+    '[uACPI] built immutable Ring-3 table archive v2' \
     '[uACPI] derived bounded FADT SystemIO policy' \
+    '[acpi-manager] validated ACPI archive v2:' \
     '[init] hello from ring3 userspace, via libcanvas' \
     '[init] VMO read/write round-trip OK' \
     '[init] channel IPC round-trip OK' \
