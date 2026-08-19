@@ -84,6 +84,38 @@ jobs:
           path: ci-artifacts/
           if-no-files-found: warn
 
+  qemu-acpi-restart:
+    # AP-6 lifecycle gate: generation one exits before readiness. The root
+    # supervisor must retain/duplicate archive+broker capabilities, freeze new
+    # ACPI-dependent work, and bring generation two to structured readiness
+    # while unrelated DriverHosts continue.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            gcc xorriso qemu-system-x86 swtpm swtpm-tools
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install nightly-2026-03-01 --profile minimal \
+            --component rust-src,llvm-tools-preview
+          rustup default nightly-2026-03-01
+      - name: ACPI Manager restart smoke
+        env:
+          CARGO_BUILD_JOBS: "1"
+          ARTIFACT_DIR: ci-artifacts
+        run: bash scripts/ci-qemu-acpi-restart-smoke.sh release 2 120
+      - name: Upload serial log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: qemu-acpi-restart-release-smp2
+          path: ci-artifacts/
+          if-no-files-found: warn
+
   qemu-nvme-boot:
     # End-to-end NVMe DriverHost + hxfs-service smoke. Boots QEMU with a
     # real -device nvme,serial=huesosnvme backed by a 4 GiB Hxfs v5

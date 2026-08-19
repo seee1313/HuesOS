@@ -64,6 +64,7 @@ for marker in \
     '[driver-host:input] keyboard IRQ bound to Port' \
     '[shutdown-broker] ready' \
     '[acpi-manager] broker deny-by-default self-test OK' \
+    '[driver-manager] ACPI manager ready generation' \
     '[pci-manager] ready without root descriptors; fail-closed' \
     '[driver-manager] PCI manager ready (no roots; fail-closed)' \
     '[init] launched terminal' \
@@ -92,6 +93,9 @@ done
 for regression in \
     '[driver-manager] input DriverHost did not become ready in time' \
     '[driver-manager] keyboard service requested before ready' \
+    '[driver-manager] ACPI manager restart budget exhausted' \
+    '[driver-manager] malformed ACPI manager control message' \
+    '[acpi-manager] PANIC' \
     '[driver-manager] PCI manager restart budget exhausted' \
     '[driver-manager] malformed PCI manager control message' \
     '[pci-manager] PANIC' \

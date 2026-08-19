@@ -121,6 +121,18 @@ cannot fail is worse than no gate, because it is trusted.
 make run          # default scripts/run.sh uses -smp 2
 ```
 
+AP-6 adds a generation/restart gate:
+
+```bash
+bash scripts/ci-qemu-acpi-restart-smoke.sh release 2 120
+```
+
+The test builds ACPI Manager generation one with a pre-ready exit injection,
+requires DriverManager to retain and duplicate the sealed archive/broker,
+observes frozen restart scheduling, and requires generation two readiness while
+the input DriverHost remains alive. The ordinary QEMU smoke separately proves
+generation one reaches readiness without injection.
+
 ### Expected serial (abbreviated, multi-core)
 
 ```text
@@ -390,6 +402,7 @@ not a spec:
 |-----|--------------|
 | `static-safety` | `make audit-check`, Clippy, the ordinary host suite, and `make test-hxfs-features` for the combined encryption + compression + Hxblob storage build |
 | `qemu-boot` | boot smoke, 1 and 2 CPUs |
+| `qemu-acpi-restart` | AP-6 pre-ready failure, retained capabilities, frozen restart, generation-two readiness |
 | `qemu-nvme-boot` | base NVMe soak, mode 0 |
 | `qemu-nvme-gcm-inject` | mode 1 |
 | `qemu-nvme-crc-inject` | mode 2 |

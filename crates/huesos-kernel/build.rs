@@ -81,6 +81,18 @@ fn main() {
         &hxfs_env,
         &hxfs_args_refs,
     );
+    println!("cargo:rerun-if-env-changed=HUESOS_ACPI_RESTART_SMOKE");
+    let acpi_restart_smoke = env::var_os("HUESOS_ACPI_RESTART_SMOKE").is_some();
+    let driver_manager_args = if acpi_restart_smoke {
+        ["--features", "acpi-restart-smoke"].as_slice()
+    } else {
+        [].as_slice()
+    };
+    let acpi_manager_args = if acpi_restart_smoke {
+        ["--features", "restart-smoke"].as_slice()
+    } else {
+        [].as_slice()
+    };
     let driver_manager = build_userspace_program(
         &userspace_root,
         "driver-manager",
@@ -90,7 +102,7 @@ fn main() {
             "HUESOS_INPUT_DRIVER_HOST_PATH",
             input_driver_host.as_os_str(),
         )],
-        &[],
+        driver_manager_args,
     );
     let acpi_manager = build_userspace_program(
         &userspace_root,
@@ -98,7 +110,7 @@ fn main() {
         "huesos-acpi-manager",
         profile,
         &[],
-        &[],
+        acpi_manager_args,
     );
     let pci_manager = build_userspace_program(
         &userspace_root,

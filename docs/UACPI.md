@@ -1,8 +1,8 @@
 # uACPI integration
 
 - **Status:** kernel barebones/archive-v2 bootstrap implemented; AP-3 isolated
-  full interpreter build merged; AP-4 process primitives and AP-5 archive-only
-  table mapping in progress; Ring-3 AML execution not implemented
+  full interpreter build merged; AP-4/AP-5 runtime mechanisms and AP-6
+  generation-safe supervision in progress; Ring-3 AML execution not implemented
 - **Architecture:** [ACPI_RING3.md](ACPI_RING3.md)
 - **Delivery plan:**
   [ACPI_PCI_IMPLEMENTATION_PLAN.md](ACPI_PCI_IMPLEMENTATION_PLAN.md)
@@ -215,9 +215,12 @@ On `acpi-manager` termination:
 6. release runtime objects and archive mappings;
 7. report a structured reason and generation to DriverManager.
 
-DriverManager retains the canonical archive and last-good HMCF/HPCI snapshots,
-applies restart backoff, and freezes new PCI lifecycle operations while the
-runtime is unavailable. Existing drivers may continue only with already
+AP-6 makes DriverManager retain duplicable archive/broker capabilities, assigns
+non-zero manager generations, transfers the child self-VMAR, validates binary
+ready/heartbeat/failure messages, and applies bounded restart backoff. It
+freezes new ACPI-dependent lifecycle work while the runtime is unavailable.
+Future HMCF/HPCI stages attach actual last-good snapshots to the already
+host-tested freeze policy. Existing drivers may continue only with already
 granted resources and operations that do not need new AML evaluation.
 
 A fatal AML request, namespace timeout, work-queue overflow, malformed result,

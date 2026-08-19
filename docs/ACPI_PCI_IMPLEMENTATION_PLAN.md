@@ -734,7 +734,8 @@ Each PR adds one row or updates the corresponding row in the live PCI roadmap:
 | AP-3 | complete | `57d8203` | target build + fail-closed ASan/UBSan smoke | n/a | n/a | — |
 | AP-4 | in review | pending | 4 primitive host tests + target build | n/a | n/a | merge |
 | AP-5 | in review | pending | 2 archive translation tests + target build | n/a | n/a | AP-4 |
-| AP-6…AP-16 | not started | — | — | — | — | ordered dependencies |
+| AP-6 | in review | pending | 3 lifecycle/freeze ABI tests + feature Clippy | normal + injected restart Q35 release SMP2 | n/a | AP-5 |
+| AP-7…AP-16 | not started | — | — | — | — | ordered dependencies |
 
 A row says `Complete` only after its exit criteria and actual verification logs
 are named in the merged PR. Policy-only completion never closes an on-target

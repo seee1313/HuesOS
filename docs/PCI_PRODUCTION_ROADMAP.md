@@ -972,8 +972,8 @@ closes.
 | A.2 ABI vocabulary | In progress | HPCI complete; HMCF/snapshot/mint/mediation ABIs planned in AP-1/AP-7/AP-10 |
 | A.3 Migration map | Complete | architecture §2 + roadmap A.3 + AP plan |
 | ACPI archive v2 | Complete (bootstrap) | AP-1/AP-2 merged; Q35 v2 snapshot accepted in Ring 3 |
-| Full Ring-3 uACPI | In progress | AP-3 merged; AP-4 primitives + AP-5 archive-only mapping in review; AML AP-6–AP-14 open |
-| ACPI supervision | In progress | current archive validator launches once; generation/restart/freeze work is AP-6 |
+| Full Ring-3 uACPI | In progress | AP-4/AP-5 mechanisms + AP-6 supervised transport in review; AML AP-7–AP-14 open |
+| ACPI supervision | In progress | AP-6 generation protocol, retained capabilities, restart/backoff/freeze in review; HMCF last-good publication open |
 | B.1 Checked address vocabulary | Complete | PCI-1 types + PCI-2 bootstrap adoption |
 | B.2 ECAM access planner | Complete (policy) | checked region-relative plans and boundary tests |
 | B.3 Legacy access planner | Complete | common-subset plans; kernel shim migrated |
