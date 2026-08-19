@@ -38,7 +38,7 @@ const MAX_CONFIG_BYTES: usize = 4096;
 /// Ordering matters: the command line is the escape hatch used when a
 /// machine will not boot far enough to rebuild an image, so it must win
 /// over the file.
-fn load_config(logger: &mut InitLogger, bootfs: &Vmo) -> InitConfig {
+fn load_config(logger: &mut InitLogger, bootfs: &Vmo) -> (InitConfig, bool) {
     let mut config = InitConfig::new().with_default_stages();
     let mut buf = [0u8; MAX_CONFIG_BYTES];
 
@@ -64,6 +64,9 @@ fn load_config(logger: &mut InitLogger, bootfs: &Vmo) -> InitConfig {
     }
 
     // Absent command line is the common case, not an error.
+    // The cmdline VMO handle is consumed here; parse the storage
+    // kill switch from the same bytes so we do not try to reopen it.
+    let mut storage_off = false;
     let cmdline = Vmo::take_init_cmdline();
     match cmdline.read(0, &mut buf) {
         Ok(read) if read > 0 => {
@@ -73,6 +76,7 @@ fn load_config(logger: &mut InitLogger, bootfs: &Vmo) -> InitConfig {
             // struct: they live in the kernel, not in init's own
             // presentation settings.
             apply_cmdline_knobs(logger, &buf[..read]);
+            storage_off = libcanvas::storage_boot::storage_off_requested(&buf[..read]);
         }
         _ => {}
     }
@@ -88,7 +92,7 @@ fn load_config(logger: &mut InitLogger, bootfs: &Vmo) -> InitConfig {
             config.bad_values
         );
     }
-    config
+    (config, storage_off)
 }
 
 static DRIVER_MANAGER_ELF: &[u8] = include_bytes!(env!("HUESOS_DRIVER_MANAGER_PATH"));
@@ -116,7 +120,7 @@ pub extern "C" fn _start() -> ! {
     let acpi_broker = libcanvas::Handle::take_init_acpi_broker();
     init_logln!(logger, "[init] hello from ring3 userspace, via libcanvas");
 
-    let config = load_config(&mut logger, &bootfs);
+    let (config, storage_off) = load_config(&mut logger, &bootfs);
     let mut ui = BootUi::new(&config, &mut logger);
     if ui.log_screen && !logger.enable_framebuffer() {
         init_logln!(logger, "[init] framebuffer log requested but unavailable");
@@ -182,7 +186,12 @@ pub extern "C" fn _start() -> ! {
             b"/manifests/input-host.hdriver",
         );
         ui.step(b"storage", 25);
-        if !send_nvme_boot_grants(&mut logger, channel, &storage_boot_info) {
+        if storage_off {
+            // Kernel already skipped PCI/NVMe discovery. Do not mint
+            // grants even if a stale boot-info VMO claimed a function.
+            init_logln!(logger, "[init] storage disabled by init.storage=off");
+            ui.end(b"storage", StageState::Skipped, &mut logger);
+        } else if !send_nvme_boot_grants(&mut logger, channel, &storage_boot_info) {
             // No controller to bring up: nothing will ever report on
             // this stage, so settle it now instead of holding the boot
             // until its deadline expires.

@@ -440,6 +440,39 @@ jobs:
           path: ci-artifacts/
           if-no-files-found: warn
 
+  qemu-storage-off:
+    # Fail-closed storage switch: QEMU presents a real NVMe device,
+    # the HBI command line asks for init.storage=off, and the guest
+    # must reach the terminal without programming the controller or
+    # mutating the backing image. This is the gate for USB boots on
+    # machines whose system disk we must not touch.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            gcc xorriso qemu-system-x86
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install nightly-2026-03-01 --profile minimal \
+            --component rust-src,llvm-tools-preview
+          rustup default nightly-2026-03-01
+      - name: Storage-off QEMU smoke
+        env:
+          CARGO_BUILD_JOBS: "1"
+          ARTIFACT_DIR: ci-artifacts
+        run: bash scripts/ci-qemu-storage-off-smoke.sh release 2 120
+      - name: Upload serial log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: qemu-storage-off-release-smp2
+          path: ci-artifacts/
+          if-no-files-found: warn
+
   qemu-extable-smoke:
     # Boot QEMU with an HBI cmdline that asks the kernel to fire the
     # synthetic recoverable-copy probe, then verify the serial log

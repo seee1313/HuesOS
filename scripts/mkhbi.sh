@@ -39,9 +39,15 @@ if [ -z "${BOOTFS_PATH}" ] || [ ! -f "${BOOTFS_PATH}" ]; then
     exit 1
 fi
 
-# 3. Create cmdline and platform dummy files if they don't exist
+# 3. Create cmdline and platform dummy files if they don't exist.
+# STORAGE_OFF=1 overwrites the file so a leftover extable/panic token
+# cannot sneak into a hardware ISO, and so a leftover storage-off
+# token cannot poison the next ordinary `make iso`.
 CMDLINE_TXT="${OUTPUT_DIR}/cmdline.txt"
-if [ ! -f "${CMDLINE_TXT}" ]; then
+if [ "${STORAGE_OFF:-}" = "1" ]; then
+    echo "init.storage=off" > "${CMDLINE_TXT}"
+    echo "[HBI] command line: init.storage=off (STORAGE_OFF=1)"
+elif [ ! -f "${CMDLINE_TXT}" ]; then
     echo "init_args=foo" > "${CMDLINE_TXT}"
 fi
 

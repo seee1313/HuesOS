@@ -366,10 +366,23 @@ capture serial plus a monitor `screendump`. The assertions are:
 The exact safety model and expected output are documented in
 [FAULTS_AND_PANIC.md](FAULTS_AND_PANIC.md).
 
+## Storage kill-switch smoke
+
+```bash
+bash scripts/ci-qemu-storage-off-smoke.sh release 2 120
+```
+
+QEMU is given a real `-device nvme` backed by a fresh raw image, and the
+HBI command line contains `init.storage=off`. The guest must print the
+kernel and init disable markers, must not print `[storage] nvme0` or
+`[driver-host:nvme] identified`, must still launch the terminal, and the
+image SHA-256 must be unchanged. CI runs this as `qemu-storage-off`.
+
 ## Real Hardware Smoke Tests
 
-See [HARDWARE.md](HARDWARE.md). First recorded laptop success: MSI Modern 15
-B5M (AMD Ryzen 5 5625U).
+See [HARDWARE.md](HARDWARE.md). One guest-laptop report exists (MSI Modern 15
+B5M, AMD Ryzen 5 5625U). First boots of a disk that already holds another OS
+must use `STORAGE_OFF=1`.
 
 ### GDB Debugging
 
@@ -411,6 +424,7 @@ not a spec:
 | `qemu-nvme-shutdown-cycle` | mode 3 |
 | `qemu-nvme-stress` | mode 4 |
 | `qemu-nvme-long-soak` | one bounded pass of `scripts/soak-long.sh` (~2 h) |
+| `qemu-storage-off` | NVMe present, `init.storage=off`, image hash unchanged |
 | `qemu-extable-smoke` | recoverable-copy fixup path |
 
 `swtpm` and `swtpm-tools` are installed in every QEMU job, so the

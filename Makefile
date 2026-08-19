@@ -1,4 +1,8 @@
 PROFILE ?= debug
+# Set STORAGE_OFF=1 to bake `init.storage=off` into the HBI command
+# line. The kernel then skips PCI/NVMe discovery so a USB boot cannot
+# program MSI or bus-master a live NVMe. Default remains storage on.
+STORAGE_OFF ?=
 CARGO_FLAGS := $(if $(filter release,$(PROFILE)),--release,)
 
 # Build the boot crate (which produces the final kernel ELF "huesos-boot").
@@ -19,10 +23,10 @@ build-release:
 	$(MAKE) build PROFILE=release
 
 iso: build
-	bash scripts/mkiso.sh $(PROFILE)
+	STORAGE_OFF=$(STORAGE_OFF) bash scripts/mkiso.sh $(PROFILE)
 
 iso-release: build-release
-	bash scripts/mkiso.sh release
+	STORAGE_OFF=$(STORAGE_OFF) bash scripts/mkiso.sh release
 
 run: iso
 	bash scripts/run.sh $(PROFILE)

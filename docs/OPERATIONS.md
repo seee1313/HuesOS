@@ -24,6 +24,24 @@ to enumerate at runtime and no way for a process to invent one.
 | `log.verbosity` | 1 | 0–4 | 0 quiet, 1 errors and lifecycle, 4 per-extent trace. Leave at 1 outside an investigation. |
 | `nvme.max_queue_depth` | 256 | 1–65536 | Caps the NVMe queue depth actually used. The response to a controller that misbehaves at full depth. |
 
+### Disabling storage on a live disk
+
+```text
+init.storage=off
+```
+
+Exact whitespace-delimited token, baked into the HBI command-line
+module (`STORAGE_OFF=1 make iso`, or write it into `build/cmdline.txt`
+before `make iso`). When present the kernel **does not** scan PCI for
+NVMe, size BARs, program MSI/MSI-X, or enable bus-master. Init then
+skips NVMe resource grants and DriverManager never launches
+`driver-host-nvme`. Use this for the first USB boot of a machine whose
+internal NVMe holds another OS.
+
+This is not a runtime knob: it has to win before Stage-A discovery
+writes config space. A typo (`init.storage=offx`, bare `storage=off`)
+does not match and storage stays on.
+
 ### Setting a knob at boot
 
 ```text

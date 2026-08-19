@@ -22,6 +22,28 @@ pub const MAX_ENCODED_BYTES: usize = HEADER_BYTES + MAX_NVME_FUNCTIONS * NVME_EN
 
 /// Storage boot-info header flag: a DMA pool was reserved.
 pub const FLAG_DMA_POOL_PRESENT: u32 = 1 << 0;
+
+/// HBI/kernel command-line token that disables all NVMe/PCI storage
+/// discovery and userspace NVMe grants.
+///
+/// Exact whitespace-delimited match. `init.storage=offx` and
+/// unprefixed `storage=off` do not count.
+pub const STORAGE_OFF_TOKEN: &[u8] = b"init.storage=off";
+
+/// Whether `cmdline` contains `needle` as a whole whitespace-delimited token.
+pub fn cmdline_has_token(cmdline: &[u8], needle: &[u8]) -> bool {
+    if needle.is_empty() {
+        return false;
+    }
+    cmdline
+        .split(|byte| byte.is_ascii_whitespace())
+        .any(|token| token == needle)
+}
+
+/// Whether the boot command line requested the storage kill switch.
+pub fn storage_off_requested(cmdline: &[u8]) -> bool {
+    cmdline_has_token(cmdline, STORAGE_OFF_TOKEN)
+}
 /// NVMe entry flag: legacy INTx line is present in `irq_line`.
 pub const NVME_FLAG_INTX_PRESENT: u32 = 1 << 0;
 /// NVMe entry flag: MSI capability was present in PCI config space.
@@ -350,6 +372,22 @@ mod tests {
             return;
         };
         assert!(decode(&bytes[..len - 1]).is_none());
+    }
+
+    #[test]
+    fn storage_off_token_is_exact_and_delimited() {
+        assert!(!storage_off_requested(b""));
+        assert!(storage_off_requested(b"init.storage=off"));
+        assert!(storage_off_requested(
+            b"panic_test=1 init.storage=off extable_test=1"
+        ));
+        assert!(storage_off_requested(b"init.storage=off\n"));
+        assert!(!storage_off_requested(b"init.storage=offx"));
+        assert!(!storage_off_requested(b"xinit.storage=off"));
+        assert!(!storage_off_requested(b"storage=off"));
+        assert!(!storage_off_requested(b"init.storage=on"));
+        assert!(!storage_off_requested(b"init.storage="));
+        assert!(!cmdline_has_token(b"foo bar", b""));
     }
 
     #[test]

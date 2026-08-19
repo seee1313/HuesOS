@@ -50,7 +50,13 @@ struct InterruptRoute {
 }
 
 /// Build an encoded storage boot-info blob for init.
-pub fn build_storage_boot_info(dma_pool: Option<BootDmaPool>) -> Vec<u8> {
+///
+/// When `storage_off` is true the kernel must not touch PCI config or
+/// NVMe MMIO: no BAR sizing, no MSI/MSI-X programming, no bus-master
+/// enable. The encoded blob still carries an optional DMA-pool
+/// reservation so userspace sees a consistent descriptor with
+/// `nvme_count = 0`.
+pub fn build_storage_boot_info(dma_pool: Option<BootDmaPool>, storage_off: bool) -> Vec<u8> {
     let mut info = StorageBootInfo::empty();
     if let Some(pool) = dma_pool {
         info.flags |= FLAG_DMA_POOL_PRESENT;
@@ -60,7 +66,11 @@ pub fn build_storage_boot_info(dma_pool: Option<BootDmaPool>) -> Vec<u8> {
         };
     }
 
-    discover_nvme_functions(&mut info);
+    if storage_off {
+        log_line("[storage] disabled by init.storage=off");
+    } else {
+        discover_nvme_functions(&mut info);
+    }
 
     let mut encoded = alloc::vec![0u8; storage_boot::MAX_ENCODED_BYTES];
     let len = storage_boot::encode(&info, &mut encoded).unwrap_or(0);

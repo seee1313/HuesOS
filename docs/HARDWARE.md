@@ -8,7 +8,23 @@ This document records real-machine smoke tests reported by developers/users.
 It is not a certification matrix yet; it is a lightweight compatibility log so
 we can track which firmware/GPU/CPU combinations have booted beyond QEMU.
 
+## First boot of a machine that already has another OS
+
+Do **not** install Limine onto the internal EFI system partition and do
+**not** let HuesOS talk to the internal NVMe until the storage kill
+switch has been proven on that box.
+
+1. Build a USB ISO that disables storage: `make iso STORAGE_OFF=1`.
+2. Boot from the firmware boot menu (one-shot). Do not change boot order.
+3. Confirm serial/framebuffer shows `[storage] disabled by init.storage=off`
+   and that the original OS still boots after you remove the stick.
+
+See [OPERATIONS.md](OPERATIONS.md#disabling-storage-on-a-live-disk).
+
 ## Successful smoke tests
+
+The entry below is a **single guest-laptop report**, not a project
+machine and not a repeated soak. Treat it as one data point.
 
 ### MSI Modern 15 B5M
 

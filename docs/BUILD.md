@@ -98,6 +98,9 @@ projects — that's expected.
 ```bash
 make iso            # debug
 make iso-release    # release
+
+# USB / first real-machine boot: do not program the internal NVMe
+make iso STORAGE_OFF=1
 ```
 
 `make iso` also builds `tools/hbi-gen` and packages `build/huesos.hbi`
