@@ -1,5 +1,11 @@
 # SMP in HuesOS
 
+> **Implementation status:** this document describes the currently shipped
+> SMP path. The approved production replacement is specified in
+> [`SMP_V2.md`](SMP_V2.md) and [`SCHEDULER_V2.md`](SCHEDULER_V2.md); those
+> documents are target architecture, not claims about current code. Research
+> rationale is recorded in [`SCHEDULER_RESEARCH.md`](SCHEDULER_RESEARCH.md).
+
 This document describes the multi-processor bring-up path as implemented
 and verified under QEMU (`-smp 2`).
 

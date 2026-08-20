@@ -171,10 +171,20 @@ it through init-owned IPC rather than receiving global power authority. See
 
 ## Scheduler
 
-- **Fair**: CFS-like virtual runtime in a rank-balanced WAVL tree
-- **Deadline**: capacity/period with EDF priority over Fair
-- Preemption from LAPIC timer (~100 Hz after Div16 calibration)
-- Cross-core spawn uses online-CPU least-loaded placement + reschedule IPI
+Current implementation:
+
+- **Fair**: CFS-like virtual runtime in an ordered tree;
+- **Deadline**: best-effort capacity/period with EDF priority over Fair;
+- preemption from a periodic LAPIC timer;
+- per-CPU scheduler locks and directed reschedule IPI.
+
+The approved production replacement is specified in
+[SCHEDULER_V2.md](SCHEDULER_V2.md) and [SMP_V2.md](SMP_V2.md). It introduces
+request-based EEVDF, Job→Thread fairness, owner-only runqueues, bitmap remote
+operations, CBS/IRQ reservations, full/lazy kernel preemption, automatic
+migration, x2APIC/TSC-deadline, three SMT policies, eager xstate, and
+PCID/INVPCID. These are target properties and must not be attributed to the
+current implementation before their exit gates pass.
 
 ## Framebuffer & Graphics
 
