@@ -717,6 +717,13 @@ fn try_token_steal_for_idle_cpu(target_cpu: usize) {
 
 fn run_current_cpu_scheduler_interrupt(hardware_tick: bool) {
     huesos_arch::interrupts::disable();
+    if !huesos_arch::preemption::can_preempt() && !hardware_tick {
+        // Preemption is temporarily disabled. Honour the reschedule request
+        // by marking a deferred flag but do not switch. The outermost
+        // preemption re-enable will check and take the switch.
+        huesos_arch::interrupts::enable();
+        return;
+    }
     let cpu = cpu_id();
     process_runqueue_token_mailbox(cpu);
     if hardware_tick && cpu == 0 {
@@ -767,8 +774,15 @@ pub fn init() {
     huesos_arch::timer_callback::set_reschedule_callback(&|| {
         run_current_cpu_scheduler_interrupt(false);
     });
+    huesos_arch::preemption::set_reschedule_hook(deferred_reschedule_hook);
 
     mark_cpu_online();
+}
+
+/// Called from the outermost PreemptionGuard drop when a reschedule was
+/// deferred while preemption was disabled.
+fn deferred_reschedule_hook() {
+    run_current_cpu_scheduler_interrupt(false);
 }
 
 /// Yield the current task (cooperative).
