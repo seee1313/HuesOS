@@ -29,6 +29,7 @@ members = [
     "crates/huesos-nvme",
     "crates/huesos-pci",
     "crates/huesos-quota",
+    "crates/huesos-sched",
     "crates/huesos-tpm",
     "crates/huesos-bootux",
 ]

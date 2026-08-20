@@ -22,6 +22,7 @@ POLICY_CRATES = {
     "huesos-proclife": "DYNAMIC_PROCESSES.md",
     "huesos-handlemove": "HANDLE_TRANSFER.md",
     "huesos-quota": "QUOTAS.md",
+    "huesos-sched": "SCHEDULER_V2.md",
 }
 
 

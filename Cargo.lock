@@ -425,6 +425,10 @@ name = "huesos-quota"
 version = "0.1.0"
 
 [[package]]
+name = "huesos-sched"
+version = "0.1.0"
+
+[[package]]
 name = "huesos-scudo"
 version = "0.1.0"
 
