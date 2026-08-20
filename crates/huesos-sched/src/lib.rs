@@ -1473,6 +1473,185 @@ impl CbsMigration {
     }
 }
 
+/// Capability-backed SMT trust identity. Zero is reserved for no domain.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[repr(transparent)]
+pub struct TrustDomainId(u64);
+
+impl TrustDomainId {
+    pub const fn new(raw: u64) -> Option<Self> {
+        if raw == 0 {
+            None
+        } else {
+            Some(Self(raw))
+        }
+    }
+
+    pub const fn raw(self) -> u64 {
+        self.0
+    }
+}
+
+/// Boot-time SMT security policy.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SmtPolicy {
+    /// Sibling CPUs are kept offline by topology policy.
+    Off,
+    /// Simultaneous userspace execution requires one TrustDomain.
+    Isolated,
+    /// No TrustDomain compatibility check.
+    Trusted,
+}
+
+/// Pure physical-core gate model. Runtime integration uses an atomic epoch
+/// protocol but must preserve these claim/release rules.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SmtCoreGate {
+    policy: SmtPolicy,
+    active_domain: Option<TrustDomainId>,
+    active_siblings: CpuMask,
+    epoch: u64,
+}
+
+/// SMT core-gate refusal.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SmtGateError {
+    SmtDisabled,
+    IncompatibleDomain,
+    AlreadyActive,
+    NotActive,
+}
+
+impl SmtCoreGate {
+    pub const fn new(policy: SmtPolicy) -> Self {
+        Self {
+            policy,
+            active_domain: None,
+            active_siblings: CpuMask::empty(),
+            epoch: 0,
+        }
+    }
+
+    pub const fn policy(self) -> SmtPolicy {
+        self.policy
+    }
+
+    pub const fn active_domain(self) -> Option<TrustDomainId> {
+        self.active_domain
+    }
+
+    pub const fn active_siblings(self) -> CpuMask {
+        self.active_siblings
+    }
+
+    pub const fn epoch(self) -> u64 {
+        self.epoch
+    }
+
+    /// Claim permission to return one sibling CPU to userspace.
+    pub fn claim(&mut self, cpu: CpuIndex, domain: TrustDomainId) -> Result<u64, SmtGateError> {
+        if self.active_siblings.contains(cpu) {
+            return Err(SmtGateError::AlreadyActive);
+        }
+        match self.policy {
+            SmtPolicy::Off => return Err(SmtGateError::SmtDisabled),
+            SmtPolicy::Isolated => {
+                if self.active_domain.is_some_and(|active| active != domain) {
+                    return Err(SmtGateError::IncompatibleDomain);
+                }
+                self.active_domain = Some(domain);
+            }
+            SmtPolicy::Trusted => {}
+        }
+        self.active_siblings.insert(cpu);
+        self.epoch = self.epoch.wrapping_add(1).max(1);
+        Ok(self.epoch)
+    }
+
+    /// Release one sibling. The isolated cookie is cleared only when the last
+    /// userspace sibling leaves the core.
+    pub fn release(&mut self, cpu: CpuIndex) -> Result<u64, SmtGateError> {
+        if !self.active_siblings.contains(cpu) {
+            return Err(SmtGateError::NotActive);
+        }
+        self.active_siblings.remove(cpu);
+        if self.active_siblings.is_empty() {
+            self.active_domain = None;
+        }
+        self.epoch = self.epoch.wrapping_add(1).max(1);
+        Ok(self.epoch)
+    }
+}
+
+/// Bounded IRQ event accounting used by hard-top-half/threaded-owner
+/// integration. A bit wakes the owner, while this count preserves multiple
+/// edge/MSI arrivals that coalesce into that one wake.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct IrqEventState {
+    pending: u32,
+    storm_limit: u32,
+    masked: bool,
+    stormed: bool,
+}
+
+/// IRQ event configuration error.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IrqEventError {
+    ZeroLimit,
+}
+
+impl IrqEventState {
+    pub const fn new(storm_limit: u32) -> Result<Self, IrqEventError> {
+        if storm_limit == 0 {
+            return Err(IrqEventError::ZeroLimit);
+        }
+        Ok(Self {
+            pending: 0,
+            storm_limit,
+            masked: false,
+            stormed: false,
+        })
+    }
+
+    /// Record one hard interrupt. The counter saturates; reaching the limit
+    /// asks the hardware integration to mask/quarantine the source.
+    pub fn arrive(&mut self) {
+        self.pending = self.pending.saturating_add(1);
+        if self.pending >= self.storm_limit {
+            self.masked = true;
+            self.stormed = true;
+        }
+    }
+
+    /// Consume at most `budget` events in threaded context.
+    pub fn consume(&mut self, budget: u32) -> u32 {
+        let consumed = self.pending.min(budget);
+        self.pending -= consumed;
+        consumed
+    }
+
+    /// Rearm a source only after threaded work drained every known event.
+    pub fn rearm(&mut self) -> bool {
+        if self.pending != 0 {
+            return false;
+        }
+        self.masked = false;
+        true
+    }
+
+    pub const fn pending(self) -> u32 {
+        self.pending
+    }
+
+    pub const fn masked(self) -> bool {
+        self.masked
+    }
+
+    pub const fn stormed(self) -> bool {
+        self.stormed
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1806,6 +1985,50 @@ mod tests {
             runtime.charge(1_051, 101),
             Err(CbsRuntimeError::BudgetExhausted)
         );
+    }
+
+    #[test]
+    fn isolated_smt_gate_refuses_cross_domain_coexecution() {
+        let a = TrustDomainId::new(1).unwrap_or_else(|| unreachable!());
+        let b = TrustDomainId::new(2).unwrap_or_else(|| unreachable!());
+        let mut gate = SmtCoreGate::new(SmtPolicy::Isolated);
+        assert!(gate.claim(cpu(0), a).is_ok());
+        assert!(gate.claim(cpu(1), a).is_ok());
+        assert_eq!(gate.claim(cpu(2), b), Err(SmtGateError::IncompatibleDomain));
+        assert!(gate.release(cpu(0)).is_ok());
+        assert_eq!(gate.active_domain(), Some(a));
+        assert!(gate.release(cpu(1)).is_ok());
+        assert_eq!(gate.active_domain(), None);
+        assert!(gate.claim(cpu(2), b).is_ok());
+    }
+
+    #[test]
+    fn smt_off_and_trusted_modes_have_explicitly_different_rules() {
+        let a = TrustDomainId::new(1).unwrap_or_else(|| unreachable!());
+        let b = TrustDomainId::new(2).unwrap_or_else(|| unreachable!());
+        let mut off = SmtCoreGate::new(SmtPolicy::Off);
+        assert_eq!(off.claim(cpu(0), a), Err(SmtGateError::SmtDisabled));
+        let mut trusted = SmtCoreGate::new(SmtPolicy::Trusted);
+        assert!(trusted.claim(cpu(0), a).is_ok());
+        assert!(trusted.claim(cpu(1), b).is_ok());
+    }
+
+    #[test]
+    fn irq_counter_preserves_coalesced_edges_and_masks_a_storm() {
+        let mut irq = IrqEventState::new(3).unwrap_or_else(|_| unreachable!());
+        irq.arrive();
+        irq.arrive();
+        irq.arrive();
+        irq.arrive();
+        assert_eq!(irq.pending(), 4);
+        assert!(irq.masked());
+        assert!(irq.stormed());
+        assert_eq!(irq.consume(2), 2);
+        assert!(!irq.rearm());
+        assert_eq!(irq.consume(8), 2);
+        assert!(irq.rearm());
+        assert!(!irq.masked());
+        assert!(irq.stormed());
     }
 
     #[test]
