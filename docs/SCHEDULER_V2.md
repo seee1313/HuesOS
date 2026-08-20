@@ -725,7 +725,15 @@ claims about the whole kernel.
 - `c0ea92f`: added strict distributed Job-cap accounting, conservative fixed
   refill rings, CBS runtime accounting, and target-first migration protocol
   models.
-- Current integration work installs Task-owned preemption/migration guard
-  storage at every context switch and retains early-boot CpuLocal guards. The
-  existing scheduler algorithm and lock-based remote mutation remain until the
-  owner-only runqueue replacement lands.
+- `3a019d7`: Task-owned preemption/migration guard storage is installed at
+  every context switch, with CpuLocal bootstrap guards before Scheduler init;
+  the audited unsafe switch boundary is centralized and SMP4 QEMU passed.
+- `b428099`: added pure three-mode SMT TrustDomain gate and bounded IRQ
+  event/storm models.
+- `04dd8d4`: added a fixed 8192-slot Task directory model with coherent
+  owner/local-index publication, generation validation, and coalesced pending
+  operations.
+
+The existing scheduler algorithm and lock-based remote mutation remain until
+stable IDs and the owner-only runqueue replacement are integrated into the
+kernel.
