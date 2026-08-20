@@ -225,6 +225,17 @@ pub struct TaskLocation {
     pub local_index: u16,
 }
 
+impl TaskDirectory {
+    /// Return the currently published TaskId for a slot, if any generation
+    /// is live. The inbox drain uses this to map a slot number (stored as a
+    /// bitmap bit) to the full identity needed for [`take_operations`].
+    pub fn published_id(&self, slot: usize) -> Option<TaskId> {
+        let entry = self.entries.get(slot)?;
+        let raw = entry.published_id.load(Ordering::Acquire);
+        TaskId::from_raw(raw)
+    }
+}
+
 /// Directory lookup/publication failure.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DirectoryError {
