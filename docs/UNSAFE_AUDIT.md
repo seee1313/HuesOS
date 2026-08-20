@@ -2756,3 +2756,54 @@ the simulated-TPM test caught it. A sealing implementation that
 cannot distinguish "policy satisfied" from "policy failed" is worse
 than no sealing at all, since it reports success while handing out the
 key on a tampered boot chain.
+
+## Scheduler v2: Task-owned execution-guard handoff
+
+### New boundary
+
+Fully preemptible kernel contexts require preemption and migration nesting to
+travel with the Task rather than remain in a CPU-global variable. `CpuLocal`
+therefore holds a pointer to the currently running Task's
+`huesos_sched::ExecutionGuards`. Scheduler initialization points it at the
+stable idle Task; every context switch installs the selected stable Task field
+with local interrupts disabled.
+
+### `crates/huesos-arch/src/x86_64/cpu_local.rs`
+
+The audited additions are:
+
+1. `update_current_execution_guards` loads and mutates the installed pointer
+   while local interrupts are disabled. The pointer names either the CpuLocal
+   embedded bootstrap guards or a live current Task. A current Task cannot be
+   reclaimed or migrated during this critical section.
+2. `current_execution_guards` copies the same state under the same interrupt
+   exclusion.
+3. `install_execution_guards` is an unsafe function because only Scheduler
+   ownership can prove that the pointed-to Task field remains live and that no
+   interrupt/context switch separates publication from the corresponding
+   stack switch.
+
+The pointer is appended after the assembly-visible CpuLocal fields; existing
+`user_rsp` and `kernel_rsp` offsets remain 40 and 48 and are still locked by
+static assertions.
+
+### `crates/huesos-kernel/src/scheduler.rs`
+
+Repeated context-switch unsafe blocks were consolidated into
+`perform_context_switch`. It installs the incoming guard pointer immediately
+before the assembly switch, after dropping the scheduler lock. This reduces
+the scheduler's audited unsafe surface while giving the pointer handoff one
+reviewable boundary.
+
+### Safety-budget delta (measured)
+
+```text
+unsafe_blocks:     374 -> 374 (unchanged overall)
+unsafe_functions:   73 ->  74 (+1 install_execution_guards contract)
+unsafe_impls:       33 ->  33 (unchanged)
+cpu_local surface:  15 ->  19 (+4 audited units above)
+scheduler surface:   9 ->   6 (-3 through switch centralization)
+```
+
+No unsafe operation is added to `huesos-sched`; the policy/state crate remains
+`#![forbid(unsafe_code)]` and host-testable.

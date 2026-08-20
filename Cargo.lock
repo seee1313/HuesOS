@@ -369,6 +369,7 @@ dependencies = [
  "huesos-object",
  "huesos-pci",
  "huesos-pmm",
+ "huesos-sched",
  "huesos-syscalls",
  "huesos-tpm",
  "huesos-uacpi",

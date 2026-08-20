@@ -310,6 +310,25 @@ pub fn online_remote_cpu_count() -> usize {
 /// Saved CPU context for a task.
 pub type SchedContext = huesos_arch::context_switch::Context;
 
+#[derive(Clone, Copy)]
+struct SwitchTarget {
+    old: *mut SchedContext,
+    new: *const SchedContext,
+    new_guards: *mut huesos_sched::ExecutionGuards,
+}
+
+/// Install the incoming Task's preemption/migration state immediately before
+/// switching stacks. Every caller has already dropped the scheduler lock and
+/// keeps local interrupts disabled.
+fn perform_context_switch(target: SwitchTarget) {
+    // SAFETY: Task allocations are stable while schedulable; the scheduler
+    // selected `new`, owns its guard state, and disabled local interrupts.
+    unsafe {
+        huesos_arch::cpu_local::install_execution_guards(target.new_guards);
+        huesos_arch::context_switch::context_switch(target.old, target.new);
+    }
+}
+
 /// Scheduling policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SchedPolicy {
@@ -441,7 +460,7 @@ impl Scheduler {
         }
     }
 
-    fn tick(&mut self) -> Option<(*mut SchedContext, *const SchedContext)> {
+    fn tick(&mut self) -> Option<SwitchTarget> {
         self.ticks += 1;
 
         // 1. Release Deadline tasks whose period has ended
@@ -540,8 +559,13 @@ impl Scheduler {
 
         let old_ptr = &raw mut self.tasks[old_index].context;
         let new_ptr = &raw const self.tasks[self.current].context;
+        let new_guards = &raw mut self.tasks[self.current].execution_guards;
 
-        Some((old_ptr, new_ptr))
+        Some(SwitchTarget {
+            old: old_ptr,
+            new: new_ptr,
+            new_guards,
+        })
     }
 
     fn add_existing_task(&mut self, cpu: usize, mut task: Box<Task>) -> u64 {
@@ -734,11 +758,8 @@ fn run_current_cpu_scheduler_interrupt(hardware_tick: bool) {
         huesos_object::wait::notify_tick(MONOTONIC_TICKS.load(Ordering::SeqCst));
     }
 
-    if let Some((old_ptr, new_ptr)) = switch_context {
-        // Safety: interrupts are disabled; pointers point to active Vec
-        unsafe {
-            huesos_arch::context_switch::context_switch(old_ptr, new_ptr);
-        }
+    if let Some(target) = switch_context {
+        perform_context_switch(target);
     }
     huesos_arch::interrupts::enable();
 }
@@ -746,6 +767,8 @@ fn run_current_cpu_scheduler_interrupt(hardware_tick: bool) {
 /// Initialize the scheduler for the current CPU and register the timer callback.
 /// Called once per CPU.
 pub fn init() {
+    let was_enabled = x86_64::instructions::interrupts::are_enabled();
+    huesos_arch::interrupts::disable();
     let cpu = cpu_id();
     let mut guard = PER_CPU_SCHEDULERS[cpu].lock();
     unsafe { register_scheduler_ptr(&mut *guard) };
@@ -755,7 +778,14 @@ pub fn init() {
             *b"idle\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0",
         )
     });
+    let idle_guards = &raw mut guard.tasks[0].execution_guards;
     drop(guard);
+    // SAFETY: task zero is a stable Box retained by this CPU's scheduler for
+    // its complete online lifetime; local interrupts remain disabled.
+    unsafe { huesos_arch::cpu_local::install_execution_guards(idle_guards) };
+    if was_enabled {
+        huesos_arch::interrupts::enable();
+    }
 
     huesos_arch::timer_callback::set_timer_callback(&|| {
         run_current_cpu_scheduler_interrupt(true);
@@ -776,10 +806,8 @@ pub fn yield_now() {
     let switch_context = guard.tick();
     drop(guard); // Release the lock before performing context switch!
 
-    if let Some((old_ptr, new_ptr)) = switch_context {
-        unsafe {
-            huesos_arch::context_switch::context_switch(old_ptr, new_ptr);
-        }
+    if let Some(target) = switch_context {
+        perform_context_switch(target);
     }
     huesos_arch::interrupts::enable();
 }
@@ -826,16 +854,19 @@ pub fn park_current() {
                 guard.apply_task_environment(0);
                 let old_ptr = &raw mut guard.tasks[old].context;
                 let new_ptr = &raw const guard.tasks[0].context;
-                Some((old_ptr, new_ptr))
+                let new_guards = &raw mut guard.tasks[0].execution_guards;
+                Some(SwitchTarget {
+                    old: old_ptr,
+                    new: new_ptr,
+                    new_guards,
+                })
             })
         } else {
             None
         };
         drop(guard);
-        if let Some((old_ptr, new_ptr)) = switch_context {
-            unsafe {
-                huesos_arch::context_switch::context_switch(old_ptr, new_ptr);
-            }
+        if let Some(target) = switch_context {
+            perform_context_switch(target);
         }
     }
     huesos_arch::interrupts::enable();
@@ -1113,10 +1144,8 @@ pub fn exit_current_task(code: i64) -> ! {
         let switch_context = guard.tick();
         drop(guard);
 
-        if let Some((old_ptr, new_ptr)) = switch_context {
-            unsafe {
-                huesos_arch::context_switch::context_switch(old_ptr, new_ptr);
-            }
+        if let Some(target) = switch_context {
+            perform_context_switch(target);
         }
         huesos_arch::interrupts::enable();
         huesos_arch::hlt();
@@ -1195,10 +1224,8 @@ fn switch_away_from_finished(cpu: usize) -> ! {
         let switch_context = guard.tick();
         drop(guard);
 
-        if let Some((old_ptr, new_ptr)) = switch_context {
-            unsafe {
-                huesos_arch::context_switch::context_switch(old_ptr, new_ptr);
-            }
+        if let Some(target) = switch_context {
+            perform_context_switch(target);
         }
         huesos_arch::interrupts::enable();
         huesos_arch::hlt();

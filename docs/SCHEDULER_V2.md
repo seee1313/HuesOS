@@ -710,3 +710,22 @@ Every implementation PR must keep this design synchronized and add:
 - benchmark baseline and hardware identity.
 
 Any architectural deviation requires explicit owner approval before code.
+
+## 24. Implementation ledger (v2 branch)
+
+This ledger records partial integration without turning target properties into
+claims about the whole kernel.
+
+- `7e080fc`: added the `huesos-sched` no-unsafe policy crate with stable
+  8192-slot Task IDs, 256-bit CPU masks, lifecycle/guard oracles, a two-level
+  atomic Task inbox, request-based EEVDF oracle, and 80% CBS admission model.
+- `073bdac`: MADT parsing now validates Local x2APIC records, wide ACPI UIDs,
+  duplicate identities, and 64-bit LAPIC address overrides. The existing
+  xAPIC startup backend refuses rather than truncates wide destinations.
+- `c0ea92f`: added strict distributed Job-cap accounting, conservative fixed
+  refill rings, CBS runtime accounting, and target-first migration protocol
+  models.
+- Current integration work installs Task-owned preemption/migration guard
+  storage at every context switch and retains early-boot CpuLocal guards. The
+  existing scheduler algorithm and lock-based remote mutation remain until the
+  owner-only runqueue replacement lands.

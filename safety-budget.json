@@ -7,7 +7,7 @@
     "static_mut": 1,
     "todo_markers": 1,
     "unsafe_blocks": 375,
-    "unsafe_functions": 73,
+    "unsafe_functions": 74,
     "unsafe_impls": 33,
     "unwrap_calls": 25
   },
@@ -20,7 +20,7 @@
     "crates/huesos-arch/src/x86_64/ap_boot.rs": 3,
     "crates/huesos-arch/src/x86_64/context_switch.rs": 6,
     "crates/huesos-arch/src/x86_64/cpu.rs": 6,
-    "crates/huesos-arch/src/x86_64/cpu_local.rs": 15,
+    "crates/huesos-arch/src/x86_64/cpu_local.rs": 19,
     "crates/huesos-arch/src/x86_64/fault.rs": 3,
     "crates/huesos-arch/src/x86_64/gdt.rs": 5,
     "crates/huesos-arch/src/x86_64/idt.rs": 5,
