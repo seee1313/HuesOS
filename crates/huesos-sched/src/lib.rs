@@ -1001,6 +1001,478 @@ impl AdmissionControl {
     }
 }
 
+/// Distributed aggregate Job bandwidth accounting. CPU-local reservations
+/// remove shared-cache writes from each context switch while the global
+/// unissued pool strictly bounds total capacity handed out in one period.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct JobBandwidth<const CPUS: usize> {
+    quota_ns: u64,
+    period_ns: u64,
+    period_start_ns: u64,
+    generation: u64,
+    unissued_ns: u64,
+    local_ns: [u64; CPUS],
+    charged_ns: u64,
+}
+
+/// Job bandwidth control failure.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BandwidthError {
+    InvalidConfiguration,
+    CpuOutOfRange,
+    Arithmetic,
+    InsufficientLocalRuntime,
+}
+
+impl<const CPUS: usize> JobBandwidth<CPUS> {
+    pub fn new(quota_ns: u64, period_ns: u64, start_ns: u64) -> Result<Self, BandwidthError> {
+        let system_capacity = u128::from(period_ns)
+            .checked_mul(CPUS as u128)
+            .ok_or(BandwidthError::Arithmetic)?;
+        if CPUS == 0
+            || CPUS > MAX_CPUS
+            || quota_ns == 0
+            || period_ns == 0
+            || u128::from(quota_ns) > system_capacity
+        {
+            return Err(BandwidthError::InvalidConfiguration);
+        }
+        Ok(Self {
+            quota_ns,
+            period_ns,
+            period_start_ns: start_ns,
+            generation: 1,
+            unissued_ns: quota_ns,
+            local_ns: [0; CPUS],
+            charged_ns: 0,
+        })
+    }
+
+    pub const fn quota_ns(&self) -> u64 {
+        self.quota_ns
+    }
+
+    pub const fn period_ns(&self) -> u64 {
+        self.period_ns
+    }
+
+    pub const fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    pub const fn unissued_ns(&self) -> u64 {
+        self.unissued_ns
+    }
+
+    pub const fn charged_ns(&self) -> u64 {
+        self.charged_ns
+    }
+
+    pub fn local_ns(&self, cpu: usize) -> Option<u64> {
+        self.local_ns.get(cpu).copied()
+    }
+
+    /// Reserve at most `slice_ns` for one CPU. The returned runtime is already
+    /// deducted from the global pool and therefore cannot contribute to cap
+    /// overshoot even if several CPUs reserve concurrently in integration.
+    pub fn reserve_local(&mut self, cpu: usize, slice_ns: u64) -> Result<u64, BandwidthError> {
+        let local = self
+            .local_ns
+            .get_mut(cpu)
+            .ok_or(BandwidthError::CpuOutOfRange)?;
+        let granted = slice_ns.min(self.unissued_ns);
+        *local = local
+            .checked_add(granted)
+            .ok_or(BandwidthError::Arithmetic)?;
+        self.unissued_ns -= granted;
+        Ok(granted)
+    }
+
+    /// Charge runtime from a previously reserved local slice.
+    pub fn charge_local(&mut self, cpu: usize, runtime_ns: u64) -> Result<(), BandwidthError> {
+        let local = self
+            .local_ns
+            .get_mut(cpu)
+            .ok_or(BandwidthError::CpuOutOfRange)?;
+        if *local < runtime_ns {
+            return Err(BandwidthError::InsufficientLocalRuntime);
+        }
+        *local -= runtime_ns;
+        self.charged_ns = self
+            .charged_ns
+            .checked_add(runtime_ns)
+            .ok_or(BandwidthError::Arithmetic)?;
+        Ok(())
+    }
+
+    /// Return a CPU's unused slice to the current-period global pool.
+    pub fn return_local(&mut self, cpu: usize) -> Result<u64, BandwidthError> {
+        let local = self
+            .local_ns
+            .get_mut(cpu)
+            .ok_or(BandwidthError::CpuOutOfRange)?;
+        let returned = *local;
+        *local = 0;
+        self.unissued_ns = self
+            .unissued_ns
+            .checked_add(returned)
+            .ok_or(BandwidthError::Arithmetic)?;
+        Ok(returned)
+    }
+
+    /// Start the period containing `now_ns`. Outstanding old-generation local
+    /// reservations expire rather than leaking into the new cap.
+    pub fn replenish_if_due(&mut self, now_ns: u64) -> Result<bool, BandwidthError> {
+        let elapsed = now_ns.saturating_sub(self.period_start_ns);
+        if elapsed < self.period_ns {
+            return Ok(false);
+        }
+        let periods = elapsed / self.period_ns;
+        self.period_start_ns = self
+            .period_start_ns
+            .checked_add(
+                periods
+                    .checked_mul(self.period_ns)
+                    .ok_or(BandwidthError::Arithmetic)?,
+            )
+            .ok_or(BandwidthError::Arithmetic)?;
+        self.generation = self.generation.wrapping_add(1).max(1);
+        self.unissued_ns = self.quota_ns;
+        self.local_ns.fill(0);
+        self.charged_ns = 0;
+        Ok(true)
+    }
+
+    /// Runtime issued in this generation, including charged and still-local
+    /// slices. This can never exceed `quota_ns`.
+    pub const fn issued_ns(&self) -> u64 {
+        self.quota_ns - self.unissued_ns
+    }
+}
+
+/// One sporadic-server replenishment.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Refill {
+    pub eligible_ns: u64,
+    pub amount_ns: u64,
+}
+
+/// Fixed-size refill queue. Overflow is merged into the latest eligibility
+/// time, which can delay service but never grants service early.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RefillRing<const N: usize> {
+    entries: [Option<Refill>; N],
+}
+
+/// Refill queue failure.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RefillError {
+    InvalidConfiguration,
+    ZeroAmount,
+    Arithmetic,
+}
+
+impl<const N: usize> RefillRing<N> {
+    pub const fn new() -> Self {
+        Self { entries: [None; N] }
+    }
+
+    pub fn schedule(&mut self, refill: Refill) -> Result<(), RefillError> {
+        if N == 0 {
+            return Err(RefillError::InvalidConfiguration);
+        }
+        if refill.amount_ns == 0 {
+            return Err(RefillError::ZeroAmount);
+        }
+        if let Some(empty) = self.entries.iter_mut().find(|entry| entry.is_none()) {
+            *empty = Some(refill);
+            return Ok(());
+        }
+
+        let latest_index = self
+            .entries
+            .iter()
+            .enumerate()
+            .max_by_key(|(_, entry)| entry.map(|value| value.eligible_ns).unwrap_or(0))
+            .map(|(index, _)| index)
+            .ok_or(RefillError::InvalidConfiguration)?;
+        let latest = self.entries[latest_index].ok_or(RefillError::InvalidConfiguration)?;
+        self.entries[latest_index] = Some(Refill {
+            eligible_ns: latest.eligible_ns.max(refill.eligible_ns),
+            amount_ns: latest
+                .amount_ns
+                .checked_add(refill.amount_ns)
+                .ok_or(RefillError::Arithmetic)?,
+        });
+        Ok(())
+    }
+
+    /// Remove and sum all replenishments eligible by `now_ns`.
+    pub fn take_eligible(&mut self, now_ns: u64) -> Result<u64, RefillError> {
+        let mut total = 0u64;
+        for entry in &mut self.entries {
+            if entry.is_some_and(|refill| refill.eligible_ns <= now_ns) {
+                let refill = entry.take().ok_or(RefillError::InvalidConfiguration)?;
+                total = total
+                    .checked_add(refill.amount_ns)
+                    .ok_or(RefillError::Arithmetic)?;
+            }
+        }
+        Ok(total)
+    }
+
+    pub fn next_eligible(&self) -> Option<u64> {
+        self.entries
+            .iter()
+            .flatten()
+            .map(|refill| refill.eligible_ns)
+            .min()
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.iter().filter(|entry| entry.is_some()).count()
+    }
+
+    pub const fn entries(&self) -> &[Option<Refill>; N] {
+        &self.entries
+    }
+}
+
+impl<const N: usize> Default for RefillRing<N> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Runtime state of one CBS/sporadic scheduling context.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CbsRuntime<const REFILLS: usize> {
+    reservation: CbsReservation,
+    remaining_ns: u64,
+    absolute_deadline_ns: u64,
+    refills: RefillRing<REFILLS>,
+}
+
+/// Runtime CBS error.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CbsRuntimeError {
+    BudgetExhausted,
+    Arithmetic,
+    Refill(RefillError),
+}
+
+impl From<RefillError> for CbsRuntimeError {
+    fn from(error: RefillError) -> Self {
+        Self::Refill(error)
+    }
+}
+
+impl<const REFILLS: usize> CbsRuntime<REFILLS> {
+    pub fn new(reservation: CbsReservation, now_ns: u64) -> Result<Self, CbsRuntimeError> {
+        if REFILLS == 0 {
+            return Err(CbsRuntimeError::Refill(RefillError::InvalidConfiguration));
+        }
+        Ok(Self {
+            reservation,
+            remaining_ns: reservation.capacity_ns,
+            absolute_deadline_ns: now_ns
+                .checked_add(reservation.deadline_ns)
+                .ok_or(CbsRuntimeError::Arithmetic)?,
+            refills: RefillRing::new(),
+        })
+    }
+
+    pub const fn reservation(self) -> CbsReservation {
+        self.reservation
+    }
+
+    pub const fn remaining_ns(self) -> u64 {
+        self.remaining_ns
+    }
+
+    pub const fn absolute_deadline_ns(self) -> u64 {
+        self.absolute_deadline_ns
+    }
+
+    pub const fn refills(&self) -> &RefillRing<REFILLS> {
+        &self.refills
+    }
+
+    /// Charge execution and schedule that exact service for replenishment one
+    /// period later. Migration overhead is passed here like ordinary runtime.
+    pub fn charge(&mut self, now_ns: u64, runtime_ns: u64) -> Result<(), CbsRuntimeError> {
+        if runtime_ns > self.remaining_ns {
+            return Err(CbsRuntimeError::BudgetExhausted);
+        }
+        if runtime_ns == 0 {
+            return Ok(());
+        }
+        self.remaining_ns -= runtime_ns;
+        self.refills.schedule(Refill {
+            eligible_ns: now_ns
+                .checked_add(self.reservation.period_ns)
+                .ok_or(CbsRuntimeError::Arithmetic)?,
+            amount_ns: runtime_ns,
+        })?;
+        Ok(())
+    }
+
+    /// Apply legally eligible replenishments. Budget is capped at configured
+    /// capacity even if conservative refill merging delayed several entries.
+    pub fn replenish(&mut self, now_ns: u64) -> Result<u64, CbsRuntimeError> {
+        let available = self.refills.take_eligible(now_ns)?;
+        let previous = self.remaining_ns;
+        self.remaining_ns = self
+            .remaining_ns
+            .checked_add(available)
+            .ok_or(CbsRuntimeError::Arithmetic)?
+            .min(self.reservation.capacity_ns);
+        if now_ns >= self.absolute_deadline_ns && self.remaining_ns != 0 {
+            let periods = (now_ns - self.absolute_deadline_ns) / self.reservation.period_ns + 1;
+            self.absolute_deadline_ns = self
+                .absolute_deadline_ns
+                .checked_add(
+                    periods
+                        .checked_mul(self.reservation.period_ns)
+                        .ok_or(CbsRuntimeError::Arithmetic)?,
+                )
+                .ok_or(CbsRuntimeError::Arithmetic)?;
+        }
+        Ok(self.remaining_ns - previous)
+    }
+
+    pub const fn runnable(self) -> bool {
+        self.remaining_ns != 0
+    }
+}
+
+/// Two-phase CBS migration transaction states.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CbsMigrationState {
+    Proposed,
+    TargetReserved,
+    SourceDetached,
+    TargetCommitted,
+    Complete,
+    RolledBack,
+}
+
+/// Policy oracle for target-first automatic CBS migration.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CbsMigration {
+    generation: u64,
+    source: CpuIndex,
+    target: CpuIndex,
+    utilization_ppm: u32,
+    state: CbsMigrationState,
+}
+
+/// Invalid migration protocol transition.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CbsMigrationError {
+    SameCpu,
+    ZeroGeneration,
+    WrongState,
+}
+
+impl CbsMigration {
+    pub const fn propose(
+        generation: u64,
+        source: CpuIndex,
+        target: CpuIndex,
+        utilization_ppm: u32,
+    ) -> Result<Self, CbsMigrationError> {
+        if generation == 0 {
+            return Err(CbsMigrationError::ZeroGeneration);
+        }
+        if source.as_usize() == target.as_usize() {
+            return Err(CbsMigrationError::SameCpu);
+        }
+        Ok(Self {
+            generation,
+            source,
+            target,
+            utilization_ppm,
+            state: CbsMigrationState::Proposed,
+        })
+    }
+
+    pub const fn generation(self) -> u64 {
+        self.generation
+    }
+
+    pub const fn source(self) -> CpuIndex {
+        self.source
+    }
+
+    pub const fn target(self) -> CpuIndex {
+        self.target
+    }
+
+    pub const fn utilization_ppm(self) -> u32 {
+        self.utilization_ppm
+    }
+
+    pub const fn state(self) -> CbsMigrationState {
+        self.state
+    }
+
+    pub fn target_reserved(&mut self) -> Result<(), CbsMigrationError> {
+        self.transition(
+            CbsMigrationState::Proposed,
+            CbsMigrationState::TargetReserved,
+        )
+    }
+
+    pub fn source_detached(&mut self) -> Result<(), CbsMigrationError> {
+        self.transition(
+            CbsMigrationState::TargetReserved,
+            CbsMigrationState::SourceDetached,
+        )
+    }
+
+    pub fn target_committed(&mut self) -> Result<(), CbsMigrationError> {
+        self.transition(
+            CbsMigrationState::SourceDetached,
+            CbsMigrationState::TargetCommitted,
+        )
+    }
+
+    /// Source admission is released only after the target commit.
+    pub fn source_released(&mut self) -> Result<(), CbsMigrationError> {
+        self.transition(
+            CbsMigrationState::TargetCommitted,
+            CbsMigrationState::Complete,
+        )
+    }
+
+    pub fn rollback(&mut self) -> Result<(), CbsMigrationError> {
+        match self.state {
+            CbsMigrationState::Proposed
+            | CbsMigrationState::TargetReserved
+            | CbsMigrationState::SourceDetached => {
+                self.state = CbsMigrationState::RolledBack;
+                Ok(())
+            }
+            CbsMigrationState::TargetCommitted
+            | CbsMigrationState::Complete
+            | CbsMigrationState::RolledBack => Err(CbsMigrationError::WrongState),
+        }
+    }
+
+    fn transition(
+        &mut self,
+        expected: CbsMigrationState,
+        next: CbsMigrationState,
+    ) -> Result<(), CbsMigrationError> {
+        if self.state != expected {
+            return Err(CbsMigrationError::WrongState);
+        }
+        self.state = next;
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1267,5 +1739,94 @@ mod tests {
     fn utilization_rounds_up_so_admission_never_undercharges() {
         let reservation = CbsReservation::new(1, 3, 3).unwrap_or_else(|_| unreachable!());
         assert_eq!(reservation.utilization_ppm(), Ok(333_334));
+    }
+
+    #[test]
+    fn job_local_slices_never_issue_more_than_the_global_cap() {
+        let mut bandwidth =
+            JobBandwidth::<4>::new(1_000, 1_000, 0).unwrap_or_else(|_| unreachable!());
+        assert_eq!(bandwidth.reserve_local(0, 300), Ok(300));
+        assert_eq!(bandwidth.reserve_local(1, 300), Ok(300));
+        assert_eq!(bandwidth.reserve_local(2, 300), Ok(300));
+        assert_eq!(bandwidth.reserve_local(3, 300), Ok(100));
+        assert_eq!(bandwidth.issued_ns(), 1_000);
+        assert_eq!(bandwidth.reserve_local(0, 300), Ok(0));
+        assert_eq!(bandwidth.charge_local(0, 200), Ok(()));
+        assert_eq!(bandwidth.return_local(0), Ok(100));
+        assert_eq!(bandwidth.unissued_ns(), 100);
+        assert_eq!(bandwidth.charged_ns(), 200);
+        assert_eq!(bandwidth.replenish_if_due(999), Ok(false));
+        assert_eq!(bandwidth.replenish_if_due(1_000), Ok(true));
+        assert_eq!(bandwidth.unissued_ns(), 1_000);
+        assert_eq!(bandwidth.charged_ns(), 0);
+        assert_eq!(bandwidth.generation(), 2);
+    }
+
+    #[test]
+    fn job_bandwidth_rejects_more_than_system_capacity() {
+        assert_eq!(
+            JobBandwidth::<2>::new(2_001, 1_000, 0),
+            Err(BandwidthError::InvalidConfiguration)
+        );
+    }
+
+    #[test]
+    fn full_refill_ring_merges_at_latest_time_never_early() {
+        let mut ring = RefillRing::<2>::new();
+        ring.schedule(Refill {
+            eligible_ns: 10,
+            amount_ns: 5,
+        })
+        .unwrap_or_else(|_| unreachable!());
+        ring.schedule(Refill {
+            eligible_ns: 20,
+            amount_ns: 7,
+        })
+        .unwrap_or_else(|_| unreachable!());
+        ring.schedule(Refill {
+            eligible_ns: 15,
+            amount_ns: 3,
+        })
+        .unwrap_or_else(|_| unreachable!());
+        assert_eq!(ring.take_eligible(15), Ok(5));
+        assert_eq!(ring.take_eligible(19), Ok(0));
+        assert_eq!(ring.take_eligible(20), Ok(10));
+    }
+
+    #[test]
+    fn cbs_spent_runtime_returns_only_after_one_period() {
+        let reservation = CbsReservation::new(100, 1_000, 1_000).unwrap_or_else(|_| unreachable!());
+        let mut runtime = CbsRuntime::<4>::new(reservation, 0).unwrap_or_else(|_| unreachable!());
+        assert_eq!(runtime.charge(50, 60), Ok(()));
+        assert_eq!(runtime.remaining_ns(), 40);
+        assert_eq!(runtime.replenish(1_049), Ok(0));
+        assert_eq!(runtime.replenish(1_050), Ok(60));
+        assert_eq!(runtime.remaining_ns(), 100);
+        assert_eq!(
+            runtime.charge(1_051, 101),
+            Err(CbsRuntimeError::BudgetExhausted)
+        );
+    }
+
+    #[test]
+    fn cbs_migration_requires_target_commit_before_source_release() {
+        let mut migration =
+            CbsMigration::propose(7, cpu(0), cpu(3), 250_000).unwrap_or_else(|_| unreachable!());
+        assert_eq!(
+            migration.source_released(),
+            Err(CbsMigrationError::WrongState)
+        );
+        assert_eq!(migration.target_reserved(), Ok(()));
+        assert_eq!(migration.source_detached(), Ok(()));
+        assert_eq!(migration.target_committed(), Ok(()));
+        assert_eq!(migration.source_released(), Ok(()));
+        assert_eq!(migration.state(), CbsMigrationState::Complete);
+        assert_eq!(migration.rollback(), Err(CbsMigrationError::WrongState));
+
+        let mut rollback =
+            CbsMigration::propose(8, cpu(0), cpu(3), 250_000).unwrap_or_else(|_| unreachable!());
+        assert_eq!(rollback.target_reserved(), Ok(()));
+        assert_eq!(rollback.rollback(), Ok(()));
+        assert_eq!(rollback.state(), CbsMigrationState::RolledBack);
     }
 }
