@@ -232,6 +232,7 @@ pub enum DirectoryError {
     StaleIdentity,
     Busy,
     PendingOperations,
+    NotAllocated,
 }
 
 /// One stable Task-directory slot. The sequence is an owner-written seqlock;
@@ -277,6 +278,10 @@ impl TaskDirectory {
 
     /// Publish or migrate an identity. Integration guarantees one owner writer
     /// for a slot; odd/even sequence publication protects lock-free readers.
+    ///
+    /// A slot may be republished with a *new generation of the same slot*:
+    /// that is the slot-reuse path and is safe because stale references carry
+    /// the old generation and therefore never match the new full identity.
     pub fn publish(
         &self,
         id: TaskId,
@@ -288,8 +293,13 @@ impl TaskDirectory {
         }
         let entry = &self.entries[id.slot()];
         let current = entry.published_id.load(Ordering::Acquire);
-        if current != 0 && current != id.raw() {
-            return Err(DirectoryError::StaleIdentity);
+        if current != 0 {
+            let Some(existing) = TaskId::from_raw(current) else {
+                return Err(DirectoryError::StaleIdentity);
+            };
+            if existing.slot() != id.slot() {
+                return Err(DirectoryError::StaleIdentity);
+            }
         }
         entry.sequence.fetch_add(1, Ordering::AcqRel); // odd
         entry
@@ -370,6 +380,95 @@ impl TaskDirectory {
 }
 
 impl Default for TaskDirectory {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Global Task-slot allocator with per-slot generation counters.
+///
+/// Slot reuse always advances the generation; a slot whose generation space is
+/// exhausted is retired permanently. This is the bounded allocation used by
+/// kernel Task creation so Task IDs never encode a CPU and stale IDs from one
+/// generation cannot collide with the next.
+pub struct TaskSlotAllocator {
+    words: [AtomicU64; MAX_TASKS / 64],
+    generations: [AtomicU64; MAX_TASKS],
+}
+
+impl TaskSlotAllocator {
+    pub const fn new() -> Self {
+        Self {
+            words: [const { AtomicU64::new(0) }; MAX_TASKS / 64],
+            generations: [const { AtomicU64::new(0) }; MAX_TASKS],
+        }
+    }
+
+    /// Allocate a global slot and its next non-zero generation.
+    pub fn allocate(&self) -> Option<(usize, u64)> {
+        for word_index in 0..self.words.len() {
+            let mut word = self.words[word_index].load(Ordering::Acquire);
+            loop {
+                if word == u64::MAX {
+                    break;
+                }
+                let bit = (!word).trailing_zeros() as usize;
+                let mask = 1u64 << bit;
+                match self.words[word_index].compare_exchange_weak(
+                    word,
+                    word | mask,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                ) {
+                    Ok(_) => {
+                        let slot = word_index * 64 + bit;
+                        let previous = self.generations[slot].fetch_add(1, Ordering::Relaxed);
+                        if previous == u64::MAX {
+                            // Generation space exhausted. Leave the slot bit
+                            // set so it is retired and never reused.
+                            return None;
+                        }
+                        return Some((slot, previous + 1));
+                    }
+                    Err(observed) => word = observed,
+                }
+            }
+        }
+        None
+    }
+
+    /// Release a slot for reuse with an advanced generation.
+    pub fn free(&self, slot: usize) -> Result<(), DirectoryError> {
+        if slot >= MAX_TASKS {
+            return Err(DirectoryError::InvalidLocalIndex);
+        }
+        let word_index = slot / 64;
+        let mask = 1u64 << (slot % 64);
+        let mut word = self.words[word_index].load(Ordering::Acquire);
+        loop {
+            if word & mask == 0 {
+                return Err(DirectoryError::NotAllocated);
+            }
+            match self.words[word_index].compare_exchange_weak(
+                word,
+                word & !mask,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Ok(()),
+                Err(observed) => word = observed,
+            }
+        }
+    }
+
+    /// Whether a slot is currently allocated (audit/test helper).
+    pub fn is_allocated(&self, slot: usize) -> bool {
+        slot < MAX_TASKS
+            && self.words[slot / 64].load(Ordering::Acquire) & (1u64 << (slot % 64)) != 0
+    }
+}
+
+impl Default for TaskSlotAllocator {
     fn default() -> Self {
         Self::new()
     }
@@ -1897,6 +1996,65 @@ mod tests {
         let next = id.next_generation().unwrap_or_else(|| unreachable!());
         assert_eq!(DIRECTORY.publish(next, cpu(2), 8), Ok(()));
         assert_eq!(DIRECTORY.locate(id), Err(DirectoryError::StaleIdentity));
+    }
+
+    #[test]
+    fn slot_allocator_reuses_slots_with_advancing_generations() {
+        let allocator = TaskSlotAllocator::new();
+        let (first_slot, first_generation) = allocator.allocate().unwrap_or_else(|| unreachable!());
+        let (second_slot, _) = allocator.allocate().unwrap_or_else(|| unreachable!());
+        assert_ne!(first_slot, second_slot);
+        assert_eq!(first_generation, 1);
+        assert!(allocator.is_allocated(first_slot));
+        allocator
+            .free(first_slot)
+            .unwrap_or_else(|_| unreachable!());
+        assert!(!allocator.is_allocated(first_slot));
+        assert_eq!(
+            allocator.free(first_slot),
+            Err(DirectoryError::NotAllocated)
+        );
+        let (reused_slot, reused_generation) =
+            allocator.allocate().unwrap_or_else(|| unreachable!());
+        assert_eq!(reused_slot, first_slot);
+        assert_eq!(reused_generation, 2);
+    }
+
+    #[test]
+    fn slot_allocator_exhausts_exactly_at_capacity() {
+        let allocator = TaskSlotAllocator::new();
+        let mut count = 0usize;
+        while let Some(_) = allocator.allocate() {
+            count += 1;
+        }
+        assert_eq!(count, MAX_TASKS);
+        assert!(allocator.allocate().is_none());
+        allocator.free(3).unwrap_or_else(|_| unreachable!());
+        let (slot, generation) = allocator.allocate().unwrap_or_else(|| unreachable!());
+        assert_eq!(slot, 3);
+        assert_eq!(generation, 2);
+    }
+
+    #[test]
+    fn task_directory_republishes_a_new_generation_of_the_same_slot() {
+        static DIRECTORY: TaskDirectory = TaskDirectory::new();
+        let first = TaskId::new(123, 1).unwrap_or_else(|| unreachable!());
+        let second = TaskId::new(123, 2).unwrap_or_else(|| unreachable!());
+        DIRECTORY
+            .publish(first, cpu(0), 1)
+            .unwrap_or_else(|_| unreachable!());
+        DIRECTORY
+            .publish(second, cpu(5), 9)
+            .unwrap_or_else(|_| unreachable!());
+        assert_eq!(
+            DIRECTORY.locate(second),
+            Ok(TaskLocation {
+                owner: cpu(5),
+                local_index: 9,
+            })
+        );
+        // The old generation must no longer resolve.
+        assert_eq!(DIRECTORY.locate(first), Err(DirectoryError::StaleIdentity));
     }
 
     #[test]

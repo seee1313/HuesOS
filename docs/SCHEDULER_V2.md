@@ -733,7 +733,13 @@ claims about the whole kernel.
 - `04dd8d4`: added a fixed 8192-slot Task directory model with coherent
   owner/local-index publication, generation validation, and coalesced pending
   operations.
+- Current kernel integration: the Scheduler now uses `huesos_sched::TaskId`
+  (global slot + generation) with CPU ownership held in a fixed Task
+  directory. Migration keeps the ID and republishes the owner; the 128-entry
+  alias table and CPU-encoded ID layout were removed. A global 8192-slot
+  allocator advances generations on reuse and retires slots only on
+  generation overflow. `make test`, safety/policy gates, and QEMU debug SMP4
+  pass with this layout.
 
-The existing scheduler algorithm and lock-based remote mutation remain until
-stable IDs and the owner-only runqueue replacement are integrated into the
-kernel.
+The existing scheduler algorithm and token-based remote mutation remain until
+the owner-only runqueue replacement is integrated into the kernel.

@@ -29,44 +29,24 @@ use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use huesos_arch::{LockRank, RankedIrqSafeTicketLock};
 use huesos_lifecycle::{InsertOutcome, TaskGraveyard};
 use huesos_object::{KernelObject, Process};
+use huesos_sched::{CpuIndex, TaskDirectory, TaskId as V2TaskId, TaskLocation, TaskSlotAllocator};
 use x86_64::VirtAddr;
 
 /// Maximum number of CPUs supported.
 pub const MAX_CPUS: usize = 64;
 
-// Task IDs are opaque capabilities, not bare vector indexes. The high byte
-// identifies a CPU, the next 24 bits identify a slot generation, and the low
-// 32 bits identify the slot. A delayed wake carrying an older generation can
-// therefore never wake an unrelated task after slot reuse.
-const TASK_CPU_SHIFT: u32 = 56;
-const TASK_GENERATION_SHIFT: u32 = 32;
-const TASK_GENERATION_MASK: u32 = 0x00ff_ffff;
-const TASK_INDEX_MASK: u64 = 0xffff_ffff;
+// Task IDs are opaque capabilities implemented by `huesos_sched::TaskId`: a
+// global slot index plus a slot generation. CPU ownership is deliberately NOT
+// encoded in the ID; migration publishes a new owner through the directory and
+// keeps the identity stable. A delayed wake carrying an older generation can
+// therefore never wake an unrelated task after slot reuse, and no alias table
+// is needed when a task migrates.
+static TASK_DIRECTORY: TaskDirectory = TaskDirectory::new();
+static TASK_SLOTS: TaskSlotAllocator = TaskSlotAllocator::new();
 
-const fn encode_task_id(cpu: usize, generation: u32, index: usize) -> u64 {
-    ((cpu as u64) << TASK_CPU_SHIFT)
-        | (((generation & TASK_GENERATION_MASK) as u64) << TASK_GENERATION_SHIFT)
-        | (index as u64 & TASK_INDEX_MASK)
-}
-
-const fn task_cpu(id: u64) -> usize {
-    (id >> TASK_CPU_SHIFT) as usize
-}
-
-const fn task_generation(id: u64) -> u32 {
-    ((id >> TASK_GENERATION_SHIFT) as u32) & TASK_GENERATION_MASK
-}
-
-const fn task_index(id: u64) -> usize {
-    (id & TASK_INDEX_MASK) as usize
-}
-
-const fn next_task_generation(previous: u32) -> Option<u32> {
-    if previous >= TASK_GENERATION_MASK {
-        None
-    } else {
-        Some(previous + 1)
-    }
+/// Resolve a Task ID to its current owner and owner-local queue slot.
+fn task_location(id: u64) -> Option<TaskLocation> {
+    TASK_DIRECTORY.locate(V2TaskId::from_raw(id)?).ok()
 }
 
 /// Bit N set => dense CPU index N is online for load-balancing/IPI routing.
@@ -91,14 +71,8 @@ static TOKEN_MAILBOX_REQUEST_ID: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new
 static NEXT_TOKEN_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 
 const STEAL_OPT_IN_FLAG: u32 = huesos_abi::scheduler_flags::STEAL_OPT_IN;
-const TASK_ID_ALIAS_SLOTS: usize = 128;
-static TASK_ID_ALIAS_OLD: [AtomicU64; TASK_ID_ALIAS_SLOTS] =
-    [const { AtomicU64::new(0) }; TASK_ID_ALIAS_SLOTS];
-static TASK_ID_ALIAS_NEW: [AtomicU64; TASK_ID_ALIAS_SLOTS] =
-    [const { AtomicU64::new(0) }; TASK_ID_ALIAS_SLOTS];
 static TASK_STEAL_ATTEMPTS: AtomicU64 = AtomicU64::new(0);
 static TASK_STEAL_SUCCESSES: AtomicU64 = AtomicU64::new(0);
-static NEXT_STEAL_ALIAS_SLOT: AtomicUsize = AtomicUsize::new(0);
 
 struct RunqueueTokenGuard {
     cpu: usize,
@@ -235,35 +209,6 @@ fn acquire_runqueue_token(cpu: usize) -> Option<RunqueueTokenGuard> {
     None
 }
 
-fn record_task_id_alias(old: u64, new: u64) {
-    if old == 0 || new == 0 || old == new {
-        return;
-    }
-    let slot = NEXT_STEAL_ALIAS_SLOT.fetch_add(1, Ordering::Relaxed) % TASK_ID_ALIAS_SLOTS;
-    TASK_ID_ALIAS_NEW[slot].store(new, Ordering::Release);
-    TASK_ID_ALIAS_OLD[slot].store(old, Ordering::Release);
-}
-
-fn resolve_task_id_alias(mut id: u64) -> u64 {
-    for _ in 0..4 {
-        let mut next = id;
-        for index in 0..TASK_ID_ALIAS_SLOTS {
-            if TASK_ID_ALIAS_OLD[index].load(Ordering::Acquire) == id {
-                let candidate = TASK_ID_ALIAS_NEW[index].load(Ordering::Acquire);
-                if candidate != 0 {
-                    next = candidate;
-                }
-                break;
-            }
-        }
-        if next == id {
-            break;
-        }
-        id = next;
-    }
-    id
-}
-
 /// Hardware-timer-driven monotonic clock. Only CPU 0 advances it, so SMP does
 /// not make time run faster. Cooperative yields never affect this clock.
 static MONOTONIC_TICKS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
@@ -356,9 +301,6 @@ static PER_CPU_SCHEDULERS: [RankedIrqSafeTicketLock<Scheduler>; MAX_CPUS] =
     [const { RankedIrqSafeTicketLock::new(Scheduler::new(), LockRank::SCHEDULER) }; MAX_CPUS];
 
 struct TaskSlot {
-    generation: u32,
-    /// Permanently set before a generation could wrap and recreate an old ID.
-    retired: bool,
     // The allocation keeps Context addresses stable while the slot vector
     // grows. Reuse replaces the value only after the old task was reaped.
     task: Box<Task>,
@@ -379,6 +321,8 @@ impl DerefMut for TaskSlot {
 }
 
 struct Scheduler {
+    /// Dense CPU index owning this scheduler instance (set at init).
+    cpu: usize,
     tasks: Vec<TaskSlot>,
     /// Reaped reusable indexes. Each index appears at most once.
     free_slots: Vec<usize>,
@@ -390,6 +334,7 @@ struct Scheduler {
 impl Scheduler {
     const fn new() -> Self {
         Self {
+            cpu: 0,
             tasks: Vec::new(),
             free_slots: Vec::new(),
             current: 0,
@@ -398,40 +343,44 @@ impl Scheduler {
         }
     }
 
-    fn add_task(&mut self, cpu: usize, create: impl FnOnce(u64) -> Task) -> u64 {
-        let reusable = loop {
+    /// Create a task with a fresh stable global ID and publish its location.
+    ///
+    /// Returns `None` when the global 8192-slot Task capacity is exhausted.
+    fn add_task(&mut self, cpu: usize, create: impl FnOnce(u64) -> Task) -> Option<u64> {
+        let index = loop {
             let Some(index) = self.free_slots.pop() else {
-                break None;
+                break self.tasks.len();
             };
             let Some(slot) = self.tasks.get_mut(index) else {
                 continue;
             };
-            if slot.retired || !matches!(&slot.kind, TaskKind::Reaped) {
-                continue;
+            if matches!(&slot.kind, TaskKind::Reaped) {
+                break index;
             }
-            if let Some(generation) = next_task_generation(slot.generation) {
-                break Some((index, generation));
-            }
-            // Defensive retirement if a corrupted/stale free-list entry ever
-            // names an exhausted slot. The task constructor is not consumed.
-            slot.retired = true;
         };
 
-        let (index, generation) = reusable.unwrap_or((self.tasks.len(), 0));
+        let (slot, generation) = TASK_SLOTS.allocate()?;
+        let Some(task_id) = V2TaskId::new(slot, generation) else {
+            let _ = TASK_SLOTS.free(slot);
+            return None;
+        };
+        let id = task_id.raw();
+        // Publish before insertion: nobody can observe this fresh identity
+        // until the creator is handed the returned ID.
+        let owner = CpuIndex::new(cpu)?;
+        if TASK_DIRECTORY.publish(task_id, owner, index).is_err() {
+            let _ = TASK_SLOTS.free(slot);
+            return None;
+        }
 
-        let id = encode_task_id(cpu, generation, index);
         let task = create(id);
         let policy = task.sched_policy;
         if index == self.tasks.len() {
             self.tasks.push(TaskSlot {
-                generation,
-                retired: false,
                 task: Box::new(task),
             });
         } else {
             let slot = &mut self.tasks[index];
-            slot.generation = generation;
-            slot.retired = false;
             *slot.task = task;
         }
         if index > 0 {
@@ -439,13 +388,56 @@ impl Scheduler {
                 self.fair_queue.insert(vruntime, id);
             }
         }
-        id
+        Some(id)
     }
 
+    /// Insert a migrated Task that keeps its existing global identity.
+    fn add_existing_task(&mut self, cpu: usize, task: Box<Task>) -> Option<u64> {
+        let index = loop {
+            let Some(index) = self.free_slots.pop() else {
+                break self.tasks.len();
+            };
+            let Some(slot) = self.tasks.get_mut(index) else {
+                continue;
+            };
+            if matches!(&slot.kind, TaskKind::Reaped) {
+                break index;
+            }
+        };
+        let id = task.id;
+        let policy = task.sched_policy;
+        let Some(task_id) = V2TaskId::from_raw(id) else {
+            return None;
+        };
+        let owner = CpuIndex::new(cpu)?;
+        if TASK_DIRECTORY.publish(task_id, owner, index).is_err() {
+            return None;
+        }
+        if index == self.tasks.len() {
+            self.tasks.push(TaskSlot { task });
+        } else {
+            let slot = &mut self.tasks[index];
+            slot.task = task;
+        }
+        if let SchedPolicy::Fair { vruntime, .. } = policy {
+            self.fair_queue.insert(vruntime, id);
+        }
+        Some(id)
+    }
+
+    /// Whether `id` currently names a live Task on *this* CPU at the
+    /// directory's local index. The full identity comparison rejects stale
+    /// generations from the same reused slot.
     fn task_matches(&self, id: u64) -> bool {
+        let Some(location) = task_location(id) else {
+            return false;
+        };
+        if location.owner.as_usize() != self.cpu {
+            return false;
+        }
         self.tasks
-            .get(task_index(id))
-            .is_some_and(|slot| slot.generation == task_generation(id) && slot.id == id)
+            .get(location.local_index as usize)
+            .is_some_and(|slot| slot.id == id)
     }
 
     fn apply_task_environment(&self, idx: usize) {
@@ -535,16 +527,24 @@ impl Scheduler {
         // Skip tasks that finished or are blocked (parked on a wait queue).
         if next_idx == 0 {
             while let Some(task_id) = self.fair_queue.pop_min() {
-                let idx = task_index(task_id);
-                if self.task_matches(task_id) {
-                    let task = &self.tasks[idx];
-                    if task.finished.load(Ordering::Relaxed) || task.blocked.load(Ordering::Relaxed)
-                    {
-                        continue;
-                    }
-                    next_idx = idx;
-                    break;
+                let Some(location) = task_location(task_id) else {
+                    continue;
+                };
+                if location.owner.as_usize() != self.cpu {
+                    continue;
                 }
+                let idx = location.local_index as usize;
+                let Some(task) = self.tasks.get(idx) else {
+                    continue;
+                };
+                if task.id != task_id {
+                    continue;
+                }
+                if task.finished.load(Ordering::Relaxed) || task.blocked.load(Ordering::Relaxed) {
+                    continue;
+                }
+                next_idx = idx;
+                break;
             }
         }
 
@@ -568,44 +568,6 @@ impl Scheduler {
         })
     }
 
-    fn add_existing_task(&mut self, cpu: usize, mut task: Box<Task>) -> u64 {
-        let reusable = loop {
-            let Some(index) = self.free_slots.pop() else {
-                break None;
-            };
-            let Some(slot) = self.tasks.get_mut(index) else {
-                continue;
-            };
-            if slot.retired || !matches!(&slot.kind, TaskKind::Reaped) {
-                continue;
-            }
-            if let Some(generation) = next_task_generation(slot.generation) {
-                break Some((index, generation));
-            }
-            slot.retired = true;
-        };
-        let (index, generation) = reusable.unwrap_or((self.tasks.len(), 0));
-        let id = encode_task_id(cpu, generation, index);
-        task.id = id;
-        let policy = task.sched_policy;
-        if index == self.tasks.len() {
-            self.tasks.push(TaskSlot {
-                generation,
-                retired: false,
-                task,
-            });
-        } else {
-            let slot = &mut self.tasks[index];
-            slot.generation = generation;
-            slot.retired = false;
-            slot.task = task;
-        }
-        if let SchedPolicy::Fair { vruntime, .. } = policy {
-            self.fair_queue.insert(vruntime, id);
-        }
-        id
-    }
-
     fn has_ready_non_idle(&self) -> bool {
         if !self.fair_queue.is_empty() {
             return true;
@@ -625,15 +587,23 @@ impl Scheduler {
     fn take_stealable_task(&mut self, victim_cpu: usize, target_cpu: usize) -> Option<Box<Task>> {
         let mut skipped = Vec::new();
         while let Some((vruntime, task_id)) = self.fair_queue.pop_min_key() {
-            if !self.task_matches(task_id) {
+            let Some(location) = task_location(task_id) else {
+                continue;
+            };
+            if location.owner.as_usize() != victim_cpu {
                 continue;
             }
-            let idx = task_index(task_id);
+            let idx = location.local_index as usize;
+            let Some(task) = self.tasks.get(idx) else {
+                continue;
+            };
+            if task.id != task_id {
+                continue;
+            }
             if idx == 0 || idx == self.current {
                 skipped.push((vruntime, task_id));
                 continue;
             }
-            let task = &self.tasks[idx];
             if task.finished.load(Ordering::Relaxed) || task.blocked.load(Ordering::Relaxed) {
                 continue;
             }
@@ -731,12 +701,15 @@ fn try_token_steal_for_idle_cpu(target_cpu: usize) {
         let Some(task) = moved else {
             continue;
         };
-        let old_id = task.id;
-        let new_id = {
+        // The Task keeps its stable global ID; add_existing_task publishes the
+        // new owner/local slot through the directory. No alias is recorded.
+        let added = {
             let mut target = PER_CPU_SCHEDULERS[target_cpu].lock();
             target.add_existing_task(target_cpu, task)
         };
-        record_task_id_alias(old_id, new_id);
+        if added.is_none() {
+            continue;
+        }
         TASK_STEAL_SUCCESSES.fetch_add(1, Ordering::Relaxed);
         return;
     }
@@ -771,8 +744,9 @@ pub fn init() {
     huesos_arch::interrupts::disable();
     let cpu = cpu_id();
     let mut guard = PER_CPU_SCHEDULERS[cpu].lock();
+    guard.cpu = cpu;
     unsafe { register_scheduler_ptr(&mut *guard) };
-    guard.add_task(cpu, |id| {
+    let _idle_id = guard.add_task(cpu, |id| {
         Task::new_idle(
             id,
             *b"idle\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0",
@@ -907,12 +881,14 @@ pub(crate) fn replenish_deadline_on_unblock(
 /// before `park_current` set `blocked=true` (swap would early-return and the
 /// subsequent park would sleep forever).
 pub fn wake_task(task_id: u64) {
-    let task_id = resolve_task_id_alias(task_id);
-    let cpu = task_cpu(task_id);
+    let Some(location) = task_location(task_id) else {
+        return;
+    };
+    let cpu = location.owner.as_usize();
     if cpu >= MAX_CPUS {
         return;
     }
-    let idx = task_index(task_id);
+    let idx = location.local_index as usize;
     let Some(_token) = acquire_runqueue_token(cpu) else {
         return;
     };
@@ -979,13 +955,15 @@ pub fn current_task_id() -> Option<u64> {
 /// task may be migrated by opt-in token stealing because no rank-40 pending
 /// startup record is keyed by its task id anymore.
 pub(crate) fn mark_user_entry_consumed(task_id: u64) {
-    let task_id = resolve_task_id_alias(task_id);
-    let cpu = task_cpu(task_id);
+    let Some(location) = task_location(task_id) else {
+        return;
+    };
+    let cpu = location.owner.as_usize();
     if cpu >= MAX_CPUS {
         return;
     }
+    let idx = location.local_index as usize;
     let guard = PER_CPU_SCHEDULERS[cpu].lock();
-    let idx = task_index(task_id);
     if guard.task_matches(task_id) {
         guard.tasks[idx]
             .startup_pending
@@ -1002,9 +980,12 @@ pub fn global_ticks() -> u64 {
 /// Set the scheduling policy for a task by its ID.
 pub fn set_sched_policy(task_id: u64, policy: SchedPolicy) {
     huesos_arch::interrupts::disable();
-    let task_id = resolve_task_id_alias(task_id);
-    let cpu = task_cpu(task_id);
-    let idx = task_index(task_id);
+    let Some(location) = task_location(task_id) else {
+        huesos_arch::interrupts::enable();
+        return;
+    };
+    let cpu = location.owner.as_usize();
+    let idx = location.local_index as usize;
     if cpu < MAX_CPUS {
         let Some(_token) = acquire_runqueue_token(cpu) else {
             huesos_arch::interrupts::enable();
@@ -1034,8 +1015,9 @@ pub fn set_sched_policy(task_id: u64, policy: SchedPolicy) {
     huesos_arch::interrupts::enable();
 }
 
-/// Spawn a new kernel thread.
-pub fn spawn_kernel_thread(name: &[u8; 32], entry: extern "C" fn() -> !) -> u64 {
+/// Spawn a new kernel thread. Returns `None` when the global Task capacity
+/// is exhausted.
+pub fn spawn_kernel_thread(name: &[u8; 32], entry: extern "C" fn() -> !) -> Option<u64> {
     huesos_arch::interrupts::disable();
     let cpu = cpu_id();
     let mut guard = PER_CPU_SCHEDULERS[cpu].lock();
@@ -1080,7 +1062,7 @@ pub fn spawn_user_thread_on_cpu(
     // Drive the policy transition before publishing the first runnable task.
     let _ = process.start();
     let mut guard = PER_CPU_SCHEDULERS[cpu].lock();
-    let id = guard.add_task(cpu, |id| {
+    let Some(id) = guard.add_task(cpu, |id| {
         Task::new_user(
             id,
             *name,
@@ -1088,7 +1070,11 @@ pub fn spawn_user_thread_on_cpu(
             crate::process::user_entry_trampoline,
             cr3,
         )
-    });
+    }) else {
+        drop(guard);
+        huesos_arch::interrupts::enable();
+        return None;
+    };
     drop(guard);
     // Publish startup metadata only after releasing the rank-60 scheduler.
     // Interrupts remain disabled, so this CPU cannot run the new task before
@@ -1314,8 +1300,11 @@ pub fn reap_finished_tasks() {
         // This lock is acquired before any scheduler lock, preventing a
         // scheduler -> pending-entry inversion during task-slot reclamation.
         crate::process::cancel_user_entry(task_id);
-        let cpu = task_cpu(task_id);
-        let idx = task_index(task_id);
+        let Some(location) = task_location(task_id) else {
+            continue;
+        };
+        let cpu = location.owner.as_usize();
+        let idx = location.local_index as usize;
         if cpu >= MAX_CPUS {
             continue;
         }
@@ -1339,17 +1328,16 @@ pub fn reap_finished_tasks() {
                 // Release the stack and Process Arc before publishing the slot.
                 slot.kernel_stack = alloc::vec::Vec::new();
                 slot.kind = TaskKind::Reaped;
-                if slot.generation >= TASK_GENERATION_MASK {
-                    // Never permit generation wrap to recreate a historical ID.
-                    slot.retired = true;
-                    false
-                } else {
-                    true
-                }
+                true
             }
         };
         if reusable {
             guard.free_slots.push(idx);
+            // Release the global slot so a later task reuses it under a fresh
+            // generation. Generation overflow retires the slot permanently.
+            if let Some(id) = V2TaskId::from_raw(task_id) {
+                let _ = TASK_SLOTS.free(id.slot());
+            }
         }
     }
 
@@ -1384,23 +1372,19 @@ mod task_id_tests {
     use super::*;
 
     #[test]
-    fn task_id_fields_round_trip_without_aliasing() {
-        let id = encode_task_id(63, 0x00ab_cdef, 0xfedc_ba98);
-        assert_eq!(task_cpu(id), 63);
-        assert_eq!(task_generation(id), 0x00ab_cdef);
-        assert_eq!(task_index(id), 0xfedc_ba98);
-
-        let next_cpu = encode_task_id(62, 0x00ab_cdef, 0xfedc_ba98);
-        let next_generation = encode_task_id(63, 0x00ab_cdf0, 0xfedc_ba98);
-        assert_ne!(id, next_cpu);
-        assert_ne!(id, next_generation);
-    }
-
-    #[test]
-    fn generation_exhaustion_retires_instead_of_wrapping() {
-        assert_eq!(next_task_generation(0), Some(1));
-        assert_eq!(next_task_generation(41), Some(42));
-        assert_eq!(next_task_generation(TASK_GENERATION_MASK), None);
+    fn global_task_ids_do_not_encode_cpu_ownership() {
+        // Two tasks created for different CPUs must remain distinct even when
+        // the local queue index coincides: the global slot separates them.
+        let first = V2TaskId::new(10, 1).and_then(|id| Some(id.raw()));
+        let second = V2TaskId::new(11, 1).and_then(|id| Some(id.raw()));
+        let (a, b) = (first.unwrap_or(0), second.unwrap_or(0));
+        assert_ne!(a, b);
+        assert_eq!(V2TaskId::from_raw(a).map(|id| id.slot()), Some(10));
+        assert_eq!(V2TaskId::from_raw(a).map(|id| id.generation()), Some(1));
+        assert!(
+            task_location(a).is_none(),
+            "unpublished id must not resolve"
+        );
     }
 
     // --- EDF replenishment on unblock ---
