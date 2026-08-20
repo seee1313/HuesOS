@@ -6,6 +6,7 @@ rustflags = [
     "-C", "link-arg=-Tscripts/linker.ld",
     "-C", "link-arg=-no-pie",
     "-C", "relocation-model=static",
+    "--cfg", "curve25519_dalek_backend=\"serial\"",
 ]
 
 [unstable]

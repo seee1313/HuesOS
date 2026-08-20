@@ -2,7 +2,17 @@
 
 use core::sync::atomic::{AtomicBool, Ordering};
 
+static SMEP_ENABLED: AtomicBool = AtomicBool::new(false);
 static SMAP_ENABLED: AtomicBool = AtomicBool::new(false);
+
+/// Per-CPU architectural supervisor-memory hardening state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MemoryProtectionStatus {
+    /// Supervisor execution prevention is active.
+    pub smep: bool,
+    /// Supervisor access prevention is active.
+    pub smap: bool,
+}
 
 /// Read the initial xAPIC identifier from CPUID leaf 1.
 pub fn apic_id() -> u32 {
@@ -45,7 +55,7 @@ pub fn enable_sse() {
 /// logical CPU treats the `NO_EXECUTE` page-table bit as valid before the
 /// kernel installs any W^X mapping. Once SMAP is active, supervisor access to
 /// user pages is possible only while a [`UserAccessGuard`] exists.
-pub fn enable_memory_protection() {
+pub fn enable_memory_protection() -> MemoryProtectionStatus {
     let features = core::arch::x86_64::__cpuid_count(7, 0).ebx;
     let smep = features & (1 << 7) != 0;
     let smap = features & (1 << 20) != 0;
@@ -82,7 +92,17 @@ pub fn enable_memory_protection() {
             );
         }
     }
+    SMEP_ENABLED.store(smep, Ordering::Release);
     SMAP_ENABLED.store(smap, Ordering::Release);
+    MemoryProtectionStatus { smep, smap }
+}
+
+/// Read the status published by [`enable_memory_protection`] on this CPU.
+pub fn memory_protection_status() -> MemoryProtectionStatus {
+    MemoryProtectionStatus {
+        smep: SMEP_ENABLED.load(Ordering::Acquire),
+        smap: SMAP_ENABLED.load(Ordering::Acquire),
+    }
 }
 
 /// Scoped permission for audited supervisor access to validated user pages.

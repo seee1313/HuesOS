@@ -524,3 +524,45 @@ jobs:
           name: qemu-extable-${{ matrix.profile }}-smp2
           path: ci-artifacts/
           if-no-files-found: warn
+
+  verified-boot-hardening:
+    # Security/release chain gates. QEMU is used for deterministic CI only;
+    # physical Intel/AMD/NVMe/TPM evidence is collected separately before merge.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        gate: [hbi-signature, smep-smap, key-broker-crash, tpm-sealed-key, secure-boot]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            gcc xorriso qemu-system-x86 swtpm swtpm-tools tpm2-tools \
+            openssl sbsigntool socat ovmf mtools python3-virt-firmware efitools
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install nightly-2026-03-01 --profile minimal \
+            --component rust-src,llvm-tools-preview
+          rustup default nightly-2026-03-01
+      - name: Run hardening gate
+        env:
+          CARGO_BUILD_JOBS: "1"
+          ARTIFACT_DIR: ci-artifacts
+        run: |
+          case '${{ matrix.gate }}' in
+            hbi-signature) bash scripts/ci-qemu-hbi-signature-smoke.sh debug 120 ;;
+            smep-smap) bash scripts/ci-qemu-smep-smap-smoke.sh release 120 ;;
+            key-broker-crash) bash scripts/ci-qemu-key-broker-fail-smoke.sh debug 180 ;;
+            tpm-sealed-key) bash scripts/ci-qemu-tpm-sealed-key-smoke.sh debug 120 ;;
+            secure-boot) bash scripts/ci-qemu-secure-boot-smoke.sh debug 45 ;;
+          esac
+      - name: Upload serial logs
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: verified-boot-${{ matrix.gate }}
+          path: ci-artifacts/
+          if-no-files-found: warn

@@ -12,7 +12,7 @@
 //! the NVMe MockNvme was too lenient to catch earlier in this phase.
 
 use huesos_tpm::crb::{ctrl_req, ctrl_sts, loc_ctrl, loc_sts, reg, CrbError, CrbTransport};
-use huesos_tpm::pcr::{PcrSelection, PCR_DIGEST_BYTES, PCR_KERNEL_MEASUREMENT};
+use huesos_tpm::pcr::{volume_key_policy_selection, PcrSelection, PCR_DIGEST_BYTES};
 use huesos_tpm::seal::{unseal_volume_key, SealError, SealedKey, VOLUME_KEY_BYTES};
 use huesos_tpm::{command, read_u32, response_code, HEADER_BYTES};
 
@@ -38,6 +38,8 @@ struct SimTpm {
     wedge: bool,
     /// Commands seen, in order.
     seen: Vec<u32>,
+    /// Return one `TPM_RC_RETRY` for this command before processing it.
+    retry_once_for: Option<u32>,
 }
 
 impl SimTpm {
@@ -56,6 +58,7 @@ impl SimTpm {
             live_handles: 0,
             wedge: false,
             seen: Vec::new(),
+            retry_once_for: None,
         }
     }
 
@@ -75,6 +78,11 @@ impl SimTpm {
             return;
         };
         self.seen.push(code);
+        if self.retry_once_for == Some(code) {
+            self.retry_once_for = None;
+            self.header(response_code::RETRY, &[]);
+            return;
+        }
         match code {
             command::LOAD => {
                 self.live_handles += 1;
@@ -178,9 +186,9 @@ impl CrbTransport for SimTpm {
 }
 
 fn selection() -> PcrSelection {
-    match PcrSelection::single(PCR_KERNEL_MEASUREMENT) {
+    match volume_key_policy_selection() {
         Some(selection) => selection,
-        None => panic!("PCR 12 must be a valid index"),
+        None => panic!("PCR 7 + 12 must be valid indexes"),
     }
 }
 
@@ -202,6 +210,28 @@ fn unseal_succeeds_when_pcrs_match() {
         Err(error) => panic!("matching PCRs must unseal: {error:?}"),
     };
     assert_eq!(key.as_bytes(), &[0x5A; VOLUME_KEY_BYTES]);
+}
+
+/// A real TPM may temporarily return `TPM_RC_RETRY`. The command must be
+/// submitted again rather than turning a valid sealed object into a boot
+/// failure.
+#[test]
+fn transient_retry_is_resubmitted() {
+    let measurement = [0x19; PCR_DIGEST_BYTES];
+    let mut tpm = SimTpm::new(measurement, measurement);
+    tpm.retry_once_for = Some(command::START_AUTH_SESSION);
+    let Ok(key) = unseal_volume_key(&mut tpm, 0x8100_0000, &blob(), &selection()) else {
+        assert!(false, "transient TPM retry must recover");
+        return;
+    };
+    assert_eq!(key.as_bytes(), &[0x5A; VOLUME_KEY_BYTES]);
+    assert_eq!(
+        tpm.seen
+            .iter()
+            .filter(|&&code| code == command::START_AUTH_SESSION)
+            .count(),
+        2
+    );
 }
 
 /// The security-relevant case: a different boot chain measured into

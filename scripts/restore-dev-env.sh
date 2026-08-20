@@ -5,8 +5,8 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TOOLCHAIN="nightly-2026-03-01"
-BASE_SHA="${HUESOS_BASE_SHA:-c7b0792254c7f7367d54456382db8815485687cd}"
-BRANCH="${HUESOS_BRANCH:-huesos-dev/security-production-consolidation}"
+BASE_SHA="${HUESOS_BASE_SHA:-84c677ccca5f70bf5953758e7c6d3aa9d28bb424}"
+BRANCH="${HUESOS_BRANCH:-huesos-dev/verified-boot-tpm-smep-hardening}"
 REMOTE="${HUESOS_REMOTE:-https://github.com/seee1313/HuesOS.git}"
 INSTALL_SYSTEM_DEPS="${INSTALL_SYSTEM_DEPS:-1}"
 INSTALL_CARGO_TOOLS="${INSTALL_CARGO_TOOLS:-1}"
@@ -36,14 +36,16 @@ restore_rust() {
 restore_system_deps() {
     [[ "$INSTALL_SYSTEM_DEPS" == "1" ]] || return 0
     local missing=0
-    for command in gcc xorriso qemu-system-x86_64 swtpm socat; do
+    for command in gcc xorriso qemu-system-x86_64 swtpm socat tpm2_createpolicy openssl \
+        sbsign virt-fw-vars mcopy; do
         command -v "$command" >/dev/null 2>&1 || missing=1
     done
     [[ "$missing" == "1" ]] || return 0
     log "installing QEMU/ISO/TPM host packages"
     sudo apt-get update -qq
     sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
-        gcc xorriso qemu-system-x86 swtpm swtpm-tools socat
+        gcc xorriso qemu-system-x86 swtpm swtpm-tools tpm2-tools \
+        openssl sbsigntool socat ovmf mtools python3-virt-firmware efitools
 }
 
 restore_cargo_tools() {

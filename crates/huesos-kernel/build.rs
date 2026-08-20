@@ -26,6 +26,7 @@ fn main() {
     // into the isolated KeyBroker. Without the variable the blob is
     // None and encrypted volumes cannot be mounted.
     emit_boot_key_blob();
+    emit_hbi_verify_key();
 
     // The production HxFS service always contains AES-GCM, compression and
     // Hxblob engines; versioned on-disk policy roots decide whether they are
@@ -70,12 +71,26 @@ fn main() {
         &hxfs_args_refs,
     );
     println!("cargo:rerun-if-env-changed=HUESOS_ACPI_RESTART_SMOKE");
+    println!("cargo:rerun-if-env-changed=HUESOS_KEY_BROKER_FEATURES");
     let acpi_restart_smoke = env::var_os("HUESOS_ACPI_RESTART_SMOKE").is_some();
-    let driver_manager_args = if acpi_restart_smoke {
-        ["--features", "acpi-restart-smoke"].as_slice()
-    } else {
-        [].as_slice()
-    };
+    let key_broker_features = env::var("HUESOS_KEY_BROKER_FEATURES").unwrap_or_default();
+    let mut driver_manager_features = Vec::new();
+    if acpi_restart_smoke {
+        driver_manager_features.push("acpi-restart-smoke");
+    }
+    if key_broker_features
+        .split(',')
+        .any(|feature| feature.trim() == "fail-after-first-grant")
+    {
+        driver_manager_features.push("key-broker-fail-smoke");
+    }
+    let mut driver_manager_args: Vec<String> = Vec::new();
+    if !driver_manager_features.is_empty() {
+        driver_manager_args.push("--features".to_string());
+        driver_manager_args.push(driver_manager_features.join(","));
+    }
+    let driver_manager_args_refs: Vec<&str> =
+        driver_manager_args.iter().map(String::as_str).collect();
     let acpi_manager_args = if acpi_restart_smoke {
         ["--features", "restart-smoke"].as_slice()
     } else {
@@ -90,7 +105,7 @@ fn main() {
             "HUESOS_INPUT_DRIVER_HOST_PATH",
             input_driver_host.as_os_str(),
         )],
-        driver_manager_args,
+        &driver_manager_args_refs,
     );
     let acpi_manager = build_userspace_program(
         &userspace_root,
@@ -116,13 +131,19 @@ fn main() {
         &[],
         &[],
     );
+    let mut key_broker_args: Vec<String> = Vec::new();
+    if !key_broker_features.is_empty() {
+        key_broker_args.push("--features".to_string());
+        key_broker_args.push(key_broker_features);
+    }
+    let key_broker_args_refs: Vec<&str> = key_broker_args.iter().map(String::as_str).collect();
     let key_broker = build_userspace_program(
         &userspace_root,
         "key-broker",
         "huesos-key-broker",
         profile,
         &[],
-        &[],
+        &key_broker_args_refs,
     );
     let doom = build_userspace_program(&userspace_root, "doom", "huesos-doom", profile, &[], &[]);
     // Soak shutdown-cycle wiring (qemu-nvme-soak inject=3): the
@@ -185,19 +206,62 @@ fn main() {
     println!("cargo:rustc-env=HUESOS_INIT_PATH={}", init.display());
 }
 
+/// Embed the Ed25519 public key that verifies signed HBI v2.2 images.
+fn emit_hbi_verify_key() {
+    use std::io::Write;
+    println!("cargo:rerun-if-env-changed=HUESOS_HBI_VERIFY_KEY_HEX");
+    let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap_or_default());
+    let path = out_dir.join("hbi_verify_key.rs");
+    let parsed = env::var("HUESOS_HBI_VERIFY_KEY_HEX")
+        .ok()
+        .and_then(|value| decode_hex(&value))
+        .filter(|bytes| bytes.len() == 32);
+    let mut contents = String::from("// Generated HBI Ed25519 verification key.\n");
+    match parsed {
+        Some(bytes) => {
+            contents.push_str("pub const HBI_VERIFY_KEY_CONFIGURED: bool = true;\n");
+            contents.push_str("pub const HBI_VERIFY_KEY: [u8; 32] = [");
+            for byte in bytes {
+                contents.push_str(&format!("0x{byte:02x},"));
+            }
+            contents.push_str("];\n");
+        }
+        None => {
+            contents.push_str("pub const HBI_VERIFY_KEY_CONFIGURED: bool = false;\n");
+            contents.push_str("pub const HBI_VERIFY_KEY: [u8; 32] = [0; 32];\n");
+        }
+    }
+    if let Err(error) = std::fs::File::create(&path).and_then(|mut file| {
+        file.write_all(contents.as_bytes())?;
+        Ok(())
+    }) {
+        eprintln!("failed to write {}: {error}", path.display());
+        std::process::exit(1);
+    }
+}
+
 /// Emit `$OUT_DIR/boot_key.rs` from `HUESOS_VOLUME_KEY_HEX` (64
 /// hex chars -> `Some([u8; 32])`, absent/invalid -> `None`).
 /// The kernel's `boot_key` module `include!`s it.
 fn emit_boot_key_blob() {
     use std::io::Write;
     println!("cargo:rerun-if-env-changed=HUESOS_VOLUME_KEY_HEX");
+    println!("cargo:rerun-if-env-changed=HUESOS_ALLOW_INSECURE_BUILD_KEY");
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap_or_default());
     let path = out_dir.join("boot_key.rs");
     let value = env::var("HUESOS_VOLUME_KEY_HEX").unwrap_or_default();
     let trimmed = value.trim();
+    let allow_insecure = env::var("HUESOS_ALLOW_INSECURE_BUILD_KEY").as_deref() == Ok("1");
+    let key_is_valid = trimmed.len() == 64 && trimmed.chars().all(|c| c.is_ascii_hexdigit());
+    if key_is_valid && !allow_insecure {
+        eprintln!(
+            "HUESOS_VOLUME_KEY_HEX is development-only; set HUESOS_ALLOW_INSECURE_BUILD_KEY=1 explicitly"
+        );
+        std::process::exit(1);
+    }
     let mut contents =
         String::from("// Generated by build.rs from HUESOS_VOLUME_KEY_HEX. Do not edit.\n");
-    if trimmed.len() == 64 && trimmed.chars().all(|c| c.is_ascii_hexdigit()) {
+    if key_is_valid {
         let mut bytes = Vec::with_capacity(32);
         let mut index = 0usize;
         while index < 32 {
@@ -222,7 +286,6 @@ fn emit_boot_key_blob() {
     } else {
         contents.push_str("pub const BOOT_VOLUME_KEY_BLOB: Option<[u8; 32]> = None;\n");
     }
-    emit_sealed_key_blob(&mut contents);
     if let Err(error) = std::fs::File::create(&path).and_then(|mut file| {
         file.write_all(contents.as_bytes())?;
         Ok(())
@@ -341,7 +404,7 @@ struct BootfsInputs<'a> {
 fn build_bootfs_image(manifest_dir: &Path, inputs: BootfsInputs<'_>) -> PathBuf {
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
     let bootfs_path = out_dir.join("huesos.bootfs");
-    let files = vec![
+    let mut files = vec![
         BootFsFile {
             path: "/welcome.txt",
             data: b"Welcome to HuesOS BOOTFS\nTry: ls /, ls /manifests, cat /welcome.txt\n".to_vec(),
@@ -485,12 +548,40 @@ fn build_bootfs_image(manifest_dir: &Path, inputs: BootfsInputs<'_>) -> PathBuf 
             ),
         },
     ];
+    let hash_manifest = build_bootfs_hash_manifest(&files);
+    files.push(BootFsFile {
+        path: "/manifests/bootfs.sha256",
+        data: hash_manifest,
+    });
     write_bootfs(&bootfs_path, &files);
     println!(
         "cargo:rerun-if-changed={}",
         manifest_dir.join("build.rs").display()
     );
     bootfs_path
+}
+
+fn build_bootfs_hash_manifest(files: &[BootFsFile]) -> Vec<u8> {
+    use sha2::{Digest, Sha256};
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut manifest = Vec::new();
+    for file in files {
+        let trusted = file.path.ends_with(".elf")
+            || file.path.ends_with(".hdriver")
+            || file.path == "/storage/boot-drivers.manifest";
+        if !trusted {
+            continue;
+        }
+        let digest = Sha256::digest(&file.data);
+        for byte in digest {
+            manifest.push(HEX[(byte >> 4) as usize]);
+            manifest.push(HEX[(byte & 0x0f) as usize]);
+        }
+        manifest.extend_from_slice(b"  ");
+        manifest.extend_from_slice(file.path.as_bytes());
+        manifest.push(b'\n');
+    }
+    manifest
 }
 
 fn build_boot_driver_manifest() -> Vec<u8> {
@@ -568,59 +659,6 @@ fn write_bootfs(path: &Path, files: &[BootFsFile]) {
     }
 
     fs::write(path, image).expect("failed to write BOOTFS image");
-}
-
-/// Emit the sealed volume-key blob from `HUESOS_SEALED_KEY_HEX`.
-///
-/// Format: `<parent-handle-hex>:<public-hex>:<private-hex>`, as
-/// produced by `tools/tpm-seal.sh`. Absent or malformed -> `None`,
-/// and the kernel falls back to whatever `HUESOS_VOLUME_KEY_HEX`
-/// provided (nothing, on a production build).
-fn emit_sealed_key_blob(contents: &mut String) {
-    println!("cargo:rerun-if-env-changed=HUESOS_SEALED_KEY_HEX");
-    contents.push_str(
-        "/// A volume key sealed to a TPM PCR policy.\n\
-         pub struct SealedKeyBlob {\n\
-         \x20   /// Persistent handle of the sealing parent.\n\
-         \x20   pub parent: u32,\n\
-         \x20   /// TPM2B_PUBLIC area.\n\
-         \x20   pub public: &'static [u8],\n\
-         \x20   /// TPM2B_PRIVATE area.\n\
-         \x20   pub private: &'static [u8],\n\
-         }\n",
-    );
-    let value = env::var("HUESOS_SEALED_KEY_HEX").unwrap_or_default();
-    let trimmed = value.trim();
-    let mut parts = trimmed.split(':');
-    let parsed = (|| {
-        let parent = u32::from_str_radix(parts.next()?.trim_start_matches("0x"), 16).ok()?;
-        let public = decode_hex(parts.next()?)?;
-        let private = decode_hex(parts.next()?)?;
-        if parts.next().is_some() || public.is_empty() || private.is_empty() {
-            return None;
-        }
-        Some((parent, public, private))
-    })();
-    match parsed {
-        Some((parent, public, private)) => {
-            contents.push_str(
-                "pub const SEALED_VOLUME_KEY_BLOB: Option<SealedKeyBlob> = Some(SealedKeyBlob {\n",
-            );
-            contents.push_str(&format!("    parent: 0x{parent:08x},\n"));
-            contents.push_str("    public: &[");
-            for byte in &public {
-                contents.push_str(&format!("0x{byte:02x},"));
-            }
-            contents.push_str("],\n    private: &[");
-            for byte in &private {
-                contents.push_str(&format!("0x{byte:02x},"));
-            }
-            contents.push_str("],\n});\n");
-        }
-        None => {
-            contents.push_str("pub const SEALED_VOLUME_KEY_BLOB: Option<SealedKeyBlob> = None;\n");
-        }
-    }
 }
 
 /// Decode an even-length hex string.

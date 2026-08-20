@@ -202,14 +202,13 @@ pub enum ChannelMessageData {
 
 impl ChannelMessageData {
     /// Build payload storage from an owned vector, inlining when possible.
-    pub fn from_vec(data: Vec<u8>) -> Self {
+    pub fn from_vec(mut data: Vec<u8>) -> Self {
         if data.len() <= CHANNEL_INLINE_BYTES {
             let mut bytes = [0u8; CHANNEL_INLINE_BYTES];
-            bytes[..data.len()].copy_from_slice(&data);
-            Self::Inline {
-                len: data.len(),
-                bytes,
-            }
+            let len = data.len();
+            bytes[..len].copy_from_slice(&data);
+            clear_bytes(&mut data);
+            Self::Inline { len, bytes }
         } else {
             Self::Heap(data)
         }
@@ -247,6 +246,20 @@ impl ChannelMessageData {
             Self::Inline { len, bytes } => &bytes[..*len],
             Self::Heap(data) => data.as_slice(),
         }
+    }
+
+    fn clear(&mut self) {
+        match self {
+            Self::Inline { len, bytes } => clear_bytes(&mut bytes[..*len]),
+            Self::Heap(data) => clear_bytes(data),
+        }
+    }
+}
+
+fn clear_bytes(bytes: &mut [u8]) {
+    for byte in bytes {
+        *byte = 0;
+        let _ = core::hint::black_box(*byte);
     }
 }
 
@@ -399,8 +412,10 @@ impl ChannelMessage {
 
 impl Drop for ChannelMessage {
     fn drop(&mut self) {
-        // If the message is discarded (peer closed, buffer dropped), release
-        // the handle-count holds that kept objects alive in flight.
+        // Channel payloads may contain KeyBroker replies. Clear all message
+        // bytes before inline/heap storage is reused, then release in-flight
+        // handle holds.
+        self.data.clear();
         self.handles.close_all();
     }
 }

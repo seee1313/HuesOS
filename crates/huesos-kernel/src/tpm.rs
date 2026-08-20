@@ -26,7 +26,10 @@
 //! the documented behaviour for machines without a TPM.
 
 use huesos_tpm::crb::{CrbError, CrbTransport};
-use huesos_tpm::pcr::{PcrSelection, PCR_KERNEL_MEASUREMENT};
+use huesos_tpm::pcr::{
+    pcr_extend, pcr_read, volume_key_policy_selection, PCR_KERNEL_MEASUREMENT,
+    PCR_SECURE_BOOT_POLICY,
+};
 use huesos_tpm::seal::{unseal_volume_key, SealError, SealedKey};
 
 /// Architected CRB MMIO base for a PC Client TPM (TCG PTP).
@@ -43,6 +46,60 @@ const CRB_RSP_BUFFER: usize = 0x0080;
 
 /// Largest command/response the driver moves through the window.
 const CRB_BUFFER_BYTES: usize = 0xF80;
+const SEALED_MODULE_MAGIC: &[u8; 8] = b"HSEALV1\0";
+const SEALED_MODULE_HEADER_BYTES: usize = 32;
+
+struct SealedModule<'a> {
+    parent: u32,
+    public: &'a [u8],
+    private: &'a [u8],
+}
+
+fn decode_sealed_module(bytes: &[u8]) -> Option<SealedModule<'_>> {
+    if bytes.len() < SEALED_MODULE_HEADER_BYTES
+        || bytes.get(..8) != Some(SEALED_MODULE_MAGIC.as_slice())
+        || read_u32(bytes, 8)? != 1
+        || bytes.get(24..32)?.iter().any(|byte| *byte != 0)
+    {
+        return None;
+    }
+    let parent = read_u32(bytes, 12)?;
+    let public_len = read_u32(bytes, 16)? as usize;
+    let private_len = read_u32(bytes, 20)? as usize;
+    let public_end = SEALED_MODULE_HEADER_BYTES.checked_add(public_len)?;
+    let private_end = public_end.checked_add(private_len)?;
+    if private_end != bytes.len() {
+        return None;
+    }
+    // `tpm2_create -u/-r` writes canonical TPM2B_PUBLIC and
+    // TPM2B_PRIVATE files, including each area's big-endian u16 size prefix.
+    // The command marshaller below adds those prefixes itself, so retain the
+    // canonical tool output in the signed module but pass only each TPM2B
+    // payload into `SealedKey`.
+    let public = decode_tpm2b(bytes.get(SEALED_MODULE_HEADER_BYTES..public_end)?)?;
+    let private = decode_tpm2b(bytes.get(public_end..private_end)?)?;
+    Some(SealedModule {
+        parent,
+        public,
+        private,
+    })
+}
+
+fn decode_tpm2b(bytes: &[u8]) -> Option<&[u8]> {
+    let size = usize::from(u16::from_be_bytes([*bytes.first()?, *bytes.get(1)?]));
+    if size == 0
+        || size > huesos_tpm::seal::SEALED_BLOB_MAX_BYTES
+        || size.checked_add(2)? != bytes.len()
+    {
+        return None;
+    }
+    bytes.get(2..)
+}
+
+fn read_u32(bytes: &[u8], offset: usize) -> Option<u32> {
+    let raw = bytes.get(offset..offset + 4)?;
+    Some(u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]))
+}
 
 /// A CRB TPM reached through a mapped MMIO window.
 pub struct MmioCrb {
@@ -184,29 +241,46 @@ pub enum UnsealOutcome {
 ///
 /// Called during kernel init, before userspace can call
 /// `VolumeKeyTake`.
-pub fn init_volume_key() -> UnsealOutcome {
-    // Probe the hardware BEFORE looking at the sealed blob. The
-    // outcome is reported in the boot log and read by operators and
-    // by the no-TPM CI gate, so "no sealed key in this image" must
-    // not be printed on a machine that has no TPM at all -- that
-    // reading of the log sends someone hunting for a missing key on
-    // hardware that could never have held one.
+pub fn init_volume_key(
+    boot_measurement: &[u8; 32],
+    sealed_key_module: Option<&[u8]>,
+) -> UnsealOutcome {
+    // Probe hardware before looking at image policy so logs distinguish an
+    // absent TPM from a TPM with no provisioned sealed object.
     let Some(mut tpm) = MmioCrb::map() else {
         return UnsealOutcome::NoTpm;
     };
-    if !tpm.present() {
+    if !tpm.present() || huesos_tpm::crb::request_locality(&mut tpm).is_err() {
         return UnsealOutcome::NoTpm;
     }
-    let Some(sealed) = crate::boot_key::SEALED_VOLUME_KEY_BLOB else {
-        return UnsealOutcome::NoSealedBlob;
-    };
-    if huesos_tpm::crb::request_locality(&mut tpm).is_err() {
-        return UnsealOutcome::NoTpm;
+
+    // PCR 12 is OS-controlled. Extend the domain-separated digest only after
+    // HBI signature verification; PCR 7 was populated by firmware Secure Boot.
+    if pcr_extend(&mut tpm, PCR_KERNEL_MEASUREMENT, boot_measurement).is_err() {
+        huesos_tpm::crb::relinquish_locality(&mut tpm);
+        return UnsealOutcome::Failed;
     }
-    let Ok(blob) = SealedKey::new(sealed.public, sealed.private) else {
+    let Ok(Some(pcr7)) = pcr_read(&mut tpm, PCR_SECURE_BOOT_POLICY) else {
+        huesos_tpm::crb::relinquish_locality(&mut tpm);
         return UnsealOutcome::Failed;
     };
-    let Some(selection) = PcrSelection::single(PCR_KERNEL_MEASUREMENT) else {
+    let Ok(Some(pcr12)) = pcr_read(&mut tpm, PCR_KERNEL_MEASUREMENT) else {
+        huesos_tpm::crb::relinquish_locality(&mut tpm);
+        return UnsealOutcome::Failed;
+    };
+    log_pcr(PCR_SECURE_BOOT_POLICY, &pcr7);
+    log_pcr(PCR_KERNEL_MEASUREMENT, &pcr12);
+
+    let Some(sealed) = sealed_key_module.and_then(decode_sealed_module) else {
+        huesos_tpm::crb::relinquish_locality(&mut tpm);
+        return UnsealOutcome::NoSealedBlob;
+    };
+    let Ok(blob) = SealedKey::new(sealed.public, sealed.private) else {
+        huesos_tpm::crb::relinquish_locality(&mut tpm);
+        return UnsealOutcome::Failed;
+    };
+    let Some(selection) = volume_key_policy_selection() else {
+        huesos_tpm::crb::relinquish_locality(&mut tpm);
         return UnsealOutcome::Failed;
     };
     let outcome = match unseal_volume_key(&mut tpm, sealed.parent, &blob, &selection) {
@@ -215,8 +289,68 @@ pub fn init_volume_key() -> UnsealOutcome {
             UnsealOutcome::Installed
         }
         Err(SealError::PolicyMismatch) => UnsealOutcome::PolicyMismatch,
-        Err(_) => UnsealOutcome::Failed,
+        Err(error) => {
+            use core::fmt::Write;
+            let mut writer = huesos_arch::serial::SerialWriter;
+            let _ = writeln!(writer, "[tpm] unseal detail: {error:?}");
+            UnsealOutcome::Failed
+        }
     };
     huesos_tpm::crb::relinquish_locality(&mut tpm);
     outcome
+}
+
+fn log_pcr(index: u32, value: &[u8; 32]) {
+    use core::fmt::Write;
+    let mut writer = huesos_arch::serial::SerialWriter;
+    let _ = write!(writer, "[tpm] PCR{index}=");
+    for byte in value {
+        let _ = write!(writer, "{byte:02x}");
+    }
+    let _ = writeln!(writer);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn module(public: &[u8], private: &[u8]) -> alloc::vec::Vec<u8> {
+        let mut public_tpm2b = alloc::vec::Vec::new();
+        public_tpm2b.extend_from_slice(&(public.len() as u16).to_be_bytes());
+        public_tpm2b.extend_from_slice(public);
+        let mut private_tpm2b = alloc::vec::Vec::new();
+        private_tpm2b.extend_from_slice(&(private.len() as u16).to_be_bytes());
+        private_tpm2b.extend_from_slice(private);
+
+        let mut bytes = alloc::vec::Vec::new();
+        bytes.extend_from_slice(SEALED_MODULE_MAGIC);
+        bytes.extend_from_slice(&1u32.to_le_bytes());
+        bytes.extend_from_slice(&0x8100_0001u32.to_le_bytes());
+        bytes.extend_from_slice(&(public_tpm2b.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&(private_tpm2b.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&[0u8; 8]);
+        bytes.extend_from_slice(&public_tpm2b);
+        bytes.extend_from_slice(&private_tpm2b);
+        bytes
+    }
+
+    #[test]
+    fn signed_sealed_module_decodes_exact_lengths() {
+        let bytes = module(b"public", b"private");
+        let Some(decoded) = decode_sealed_module(&bytes) else {
+            assert!(false, "valid sealed module must decode");
+            return;
+        };
+        assert_eq!(decoded.parent, 0x8100_0001);
+        assert_eq!(decoded.public, b"public");
+        assert_eq!(decoded.private, b"private");
+    }
+
+    #[test]
+    fn sealed_module_rejects_truncation_and_reserved_bytes() {
+        let mut bytes = module(b"public", b"private");
+        assert!(decode_sealed_module(&bytes[..bytes.len() - 1]).is_none());
+        bytes[24] = 1;
+        assert!(decode_sealed_module(&bytes).is_none());
+    }
 }

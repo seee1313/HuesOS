@@ -1,5 +1,16 @@
-//! HBI v2.1 Parser for HuesOS.
-//! Safe parser with no unsafe pointer casts outside of very narrow validated regions.
+//! Signed HBI v2.2 parser for HuesOS.
+//! Safe structural parsing plus fail-closed Ed25519 verification before modules
+//! become visible to privileged boot code.
+
+use ed25519_dalek::{Signature, VerifyingKey};
+
+include!(concat!(env!("OUT_DIR"), "/hbi_verify_key.rs"));
+
+const HBI_VERSION: u32 = 0x0002_0002;
+const HBI_FLAG_SIGNED: u32 = 1;
+const SIGNATURE_ALGORITHM_ED25519: u32 = 1;
+const SIGNATURE_TRAILER_BYTES: usize = 72;
+const SIGNATURE_MAGIC: &[u8; 8] = b"HUESIG1\0";
 
 /// Types of modules that can be present in an HBI image.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -13,6 +24,9 @@ pub enum ModuleType {
     Cmdline = 3,
     /// Platform-specific data (device tree like).
     Platform = 4,
+    /// TPM2B public/private volume-key object, signed but excluded from PCR12
+    /// to avoid a sealed-policy circular dependency.
+    SealedKey = 5,
     /// Unknown module type.
     Unknown,
 }
@@ -24,6 +38,7 @@ impl From<u32> for ModuleType {
             2 => ModuleType::Bootfs,
             3 => ModuleType::Cmdline,
             4 => ModuleType::Platform,
+            5 => ModuleType::SealedKey,
             _ => ModuleType::Unknown,
         }
     }
@@ -35,7 +50,7 @@ impl From<u32> for ModuleType {
 pub struct GlobalHeader {
     /// Magic bytes: "HUESOS_H".
     pub magic: [u8; 8],
-    /// Version of the HBI format (currently 0x0002_0001).
+    /// Version of the HBI format (currently signed v2.2 / `0x0002_0002`).
     pub version: u32,
     /// Flags (reserved for future use).
     pub flags: u32,
@@ -108,6 +123,12 @@ pub enum HbiError {
     EntryMismatch,
     /// A module payload failed its recorded CRC32 check.
     ChecksumMismatch,
+    /// This kernel was built without an HBI verification public key.
+    MissingVerificationKey,
+    /// Signed-image flags/trailer metadata are absent or malformed.
+    InvalidSignatureMetadata,
+    /// Ed25519 verification failed.
+    InvalidSignature,
 }
 
 impl<'a> HbiImage<'a> {
@@ -121,6 +142,17 @@ impl<'a> HbiImage<'a> {
     /// - Directory entry offset/length bounds against the buffer.
     /// - Directory entry ↔ EntryHeader type_id consistency.
     pub fn parse(data: &'a [u8]) -> Result<Self, HbiError> {
+        if !HBI_VERIFY_KEY_CONFIGURED {
+            return Err(HbiError::MissingVerificationKey);
+        }
+        Self::parse_with_key(data, &HBI_VERIFY_KEY)
+    }
+
+    /// Parse and verify with an explicit Ed25519 public key.
+    ///
+    /// Exposed for deterministic host tests and key-rotation tooling; boot code
+    /// uses [`Self::parse`] with the key embedded at kernel build time.
+    pub fn parse_with_key(data: &'a [u8], public_key: &[u8; 32]) -> Result<Self, HbiError> {
         const HEADER_SIZE: usize = core::mem::size_of::<GlobalHeader>();
         /// Sanity upper bound on directory entries. The boot image generator
         /// produces a handful of entries (kernel, bootfs, cmdline, platform);
@@ -138,16 +170,65 @@ impl<'a> HbiImage<'a> {
             return Err(HbiError::InvalidMagic);
         }
 
-        if header.version != 0x0002_0001 {
+        if header.version != HBI_VERSION {
             return Err(HbiError::UnsupportedVersion);
         }
-
-        // Validate image_size: if non-zero, it must match the actual buffer.
-        // A zero image_size is tolerated for forward-compatibility with
-        // pre-release tooling that did not populate the field.
-        if header.image_size != 0 && header.image_size as usize != data.len() {
+        if header.image_size as usize != data.len() {
             return Err(HbiError::ImageSizeMismatch);
         }
+        if header.flags != HBI_FLAG_SIGNED
+            || u32::from_le_bytes([
+                header.reserved[0],
+                header.reserved[1],
+                header.reserved[2],
+                header.reserved[3],
+            ]) != SIGNATURE_ALGORITHM_ED25519
+            || u32::from_le_bytes([
+                header.reserved[4],
+                header.reserved[5],
+                header.reserved[6],
+                header.reserved[7],
+            ]) as usize
+                != SIGNATURE_TRAILER_BYTES
+            || header.reserved[16..].iter().any(|byte| *byte != 0)
+        {
+            return Err(HbiError::InvalidSignatureMetadata);
+        }
+        let signed_len = u64::from_le_bytes([
+            header.reserved[8],
+            header.reserved[9],
+            header.reserved[10],
+            header.reserved[11],
+            header.reserved[12],
+            header.reserved[13],
+            header.reserved[14],
+            header.reserved[15],
+        ]) as usize;
+        let expected_signed_len = data
+            .len()
+            .checked_sub(SIGNATURE_TRAILER_BYTES)
+            .ok_or(HbiError::InvalidSignatureMetadata)?;
+        if signed_len != expected_signed_len || signed_len < HEADER_SIZE {
+            return Err(HbiError::InvalidSignatureMetadata);
+        }
+        let trailer = data
+            .get(signed_len..)
+            .ok_or(HbiError::InvalidSignatureMetadata)?;
+        if trailer.get(..8) != Some(SIGNATURE_MAGIC.as_slice()) {
+            return Err(HbiError::InvalidSignatureMetadata);
+        }
+        let mut signature_bytes = [0u8; 64];
+        signature_bytes.copy_from_slice(
+            trailer
+                .get(8..72)
+                .ok_or(HbiError::InvalidSignatureMetadata)?,
+        );
+        let verifying_key =
+            VerifyingKey::from_bytes(public_key).map_err(|_| HbiError::InvalidSignatureMetadata)?;
+        let signature = Signature::from_bytes(&signature_bytes);
+        verifying_key
+            .verify_strict(&data[..signed_len], &signature)
+            .map_err(|_| HbiError::InvalidSignature)?;
 
         let num_entries = header.num_entries as usize;
         if num_entries > MAX_ENTRIES {
@@ -155,7 +236,7 @@ impl<'a> HbiImage<'a> {
         }
 
         let header_size = header.header_size as usize;
-        if header_size < HEADER_SIZE || data.len() < header_size {
+        if header_size < HEADER_SIZE || signed_len < header_size {
             return Err(HbiError::BufferTooSmall);
         }
 
@@ -168,7 +249,7 @@ impl<'a> HbiImage<'a> {
             .checked_add(entries_byte_len)
             .ok_or(HbiError::ParseError)?;
 
-        if entries_end > data.len() || entries_end > header_size {
+        if entries_end > signed_len || entries_end > header_size {
             return Err(HbiError::BufferTooSmall);
         }
 
@@ -192,14 +273,14 @@ impl<'a> HbiImage<'a> {
             let entry_header_end = eh_offset
                 .checked_add(core::mem::size_of::<EntryHeader>())
                 .ok_or(HbiError::InvalidOffset)?;
-            if entry_header_end > data.len() {
+            if entry_header_end > signed_len {
                 return Err(HbiError::InvalidOffset);
             }
             let payload_start = entry_header_end;
             let payload_end = payload_start
                 .checked_add(entry.length as usize)
                 .ok_or(HbiError::InvalidOffset)?;
-            if payload_end > data.len() {
+            if payload_end > signed_len {
                 return Err(HbiError::InvalidOffset);
             }
 
@@ -312,73 +393,87 @@ fn crc32(bytes: &[u8]) -> u32 {
 mod tests {
     use super::*;
     use alloc::vec;
+    use ed25519_dalek::{Signer, SigningKey};
 
-    #[test]
-    fn test_hbi_parse_invalid_magic() {
-        let data = [0u8; 128];
-        let result = HbiImage::parse(&data);
-        assert!(matches!(result, Err(HbiError::InvalidMagic)));
-    }
+    const TEST_SEED: [u8; 32] = [0x42; 32];
 
-    #[test]
-    fn test_hbi_parse_too_small() {
-        let data = [0u8; 10];
-        let result = HbiImage::parse(&data);
-        assert!(matches!(result, Err(HbiError::BufferTooSmall)));
-    }
-
-    #[test]
-    fn test_hbi_parse_valid_header() {
-        let mut data = vec![0u8; 128];
-        let header = GlobalHeader {
-            magic: *b"HUESOS_H",
-            version: 0x0002_0001,
-            flags: 0,
-            num_entries: 0,
-            header_size: core::mem::size_of::<GlobalHeader>() as u32,
-            image_size: 128,
-            arch_id: 0,
-            reserved: [0; 36],
-        };
-
-        let header_bytes = unsafe {
-            core::slice::from_raw_parts(
-                &header as *const GlobalHeader as *const u8,
-                core::mem::size_of::<GlobalHeader>(),
-            )
-        };
-        data[..core::mem::size_of::<GlobalHeader>()].copy_from_slice(header_bytes);
-
-        let result = HbiImage::parse(&data);
-        assert!(result.is_ok());
-        let hbi = result.unwrap();
-        assert_eq!(hbi.get_num_entries(), 0);
-    }
-
-    /// Build the first 32 bytes of an HBI global header directly (no unsafe
-    /// transmute), filling the rest of `data` with zeroes.
-    fn write_minimal_header(data: &mut [u8], num_entries: u32, image_size: u64) {
+    fn signed_fixture(num_entries: u32) -> (alloc::vec::Vec<u8>, [u8; 32]) {
+        let key = SigningKey::from_bytes(&TEST_SEED);
+        let public = key.verifying_key().to_bytes();
+        let signed_len = 128usize;
+        let image_size = signed_len + SIGNATURE_TRAILER_BYTES;
+        let mut data = vec![0u8; signed_len];
         data[..8].copy_from_slice(b"HUESOS_H");
-        data[8..12].copy_from_slice(&0x0002_0001u32.to_le_bytes()); // version
-        data[12..16].copy_from_slice(&0u32.to_le_bytes()); // flags
+        data[8..12].copy_from_slice(&HBI_VERSION.to_le_bytes());
+        data[12..16].copy_from_slice(&HBI_FLAG_SIGNED.to_le_bytes());
         data[16..20].copy_from_slice(&num_entries.to_le_bytes());
-        data[20..24].copy_from_slice(&(core::mem::size_of::<GlobalHeader>() as u32).to_le_bytes()); // header_size
-        data[24..32].copy_from_slice(&image_size.to_le_bytes());
+        data[20..24].copy_from_slice(&(core::mem::size_of::<GlobalHeader>() as u32).to_le_bytes());
+        data[24..32].copy_from_slice(&(image_size as u64).to_le_bytes());
+        data[36..40].copy_from_slice(&SIGNATURE_ALGORITHM_ED25519.to_le_bytes());
+        data[40..44].copy_from_slice(&(SIGNATURE_TRAILER_BYTES as u32).to_le_bytes());
+        data[44..52].copy_from_slice(&(signed_len as u64).to_le_bytes());
+        let signature = key.sign(&data);
+        data.extend_from_slice(SIGNATURE_MAGIC);
+        data.extend_from_slice(&signature.to_bytes());
+        (data, public)
     }
 
     #[test]
-    fn test_hbi_parse_image_size_mismatch() {
-        let mut data = vec![0u8; 128];
-        write_minimal_header(&mut data, 0, 999); // wrong image_size
-        let result = HbiImage::parse(&data);
-        assert!(matches!(result, Err(HbiError::ImageSizeMismatch)));
+    fn signed_header_verifies() {
+        let (data, public) = signed_fixture(0);
+        let Ok(image) = HbiImage::parse_with_key(&data, &public) else {
+            assert!(false, "valid signed fixture must verify");
+            return;
+        };
+        assert_eq!(image.get_num_entries(), 0);
     }
 
     #[test]
-    fn test_hbi_parse_too_many_entries() {
-        let mut data = vec![0u8; 128];
-        write_minimal_header(&mut data, 257, 0); // above MAX_ENTRIES
-        let result = HbiImage::parse(&data);
-        assert!(matches!(result, Err(HbiError::TooManyEntries)));
+    fn invalid_magic_and_short_input_are_rejected() {
+        let (mut data, public) = signed_fixture(0);
+        data[0] = 0;
+        assert!(matches!(
+            HbiImage::parse_with_key(&data, &public),
+            Err(HbiError::InvalidMagic)
+        ));
+        assert!(matches!(
+            HbiImage::parse_with_key(&[0u8; 10], &public),
+            Err(HbiError::BufferTooSmall)
+        ));
+    }
+
+    #[test]
+    fn image_size_and_entry_count_are_bounded() {
+        let (mut bad_size, public) = signed_fixture(0);
+        bad_size[24..32].copy_from_slice(&999u64.to_le_bytes());
+        assert!(matches!(
+            HbiImage::parse_with_key(&bad_size, &public),
+            Err(HbiError::ImageSizeMismatch)
+        ));
+
+        let (too_many, public) = signed_fixture(257);
+        assert!(matches!(
+            HbiImage::parse_with_key(&too_many, &public),
+            Err(HbiError::TooManyEntries)
+        ));
+    }
+
+    #[test]
+    fn tamper_and_wrong_key_fail_signature() {
+        let (mut tampered, public) = signed_fixture(0);
+        tampered[100] ^= 1;
+        assert!(matches!(
+            HbiImage::parse_with_key(&tampered, &public),
+            Err(HbiError::InvalidSignature)
+        ));
+
+        let (data, _) = signed_fixture(0);
+        let wrong = SigningKey::from_bytes(&[0x24; 32])
+            .verifying_key()
+            .to_bytes();
+        assert!(matches!(
+            HbiImage::parse_with_key(&data, &wrong),
+            Err(HbiError::InvalidSignature)
+        ));
     }
 }

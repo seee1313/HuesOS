@@ -98,6 +98,12 @@ pub struct BootInfo<'a> {
 /// active HHDM, firmware tables, framebuffer, modules, and memory map.
 pub unsafe fn kmain(boot_info: BootInfo) -> ! {
     huesos_arch::init_early();
+    let protection = huesos_arch::cpu::memory_protection_status();
+    if protection.smep && protection.smap {
+        dbg("[security] BSP SMEP=on SMAP=on\n");
+    } else {
+        dbg("[security] BSP degraded: SMEP/SMAP unavailable on this CPU\n");
+    }
     if let Err(error) = init::pmm_init(boot_info.memory_regions, boot_info.hhdm_offset) {
         // PMM init runs before heap, panic handler, and framebuffer are
         // ready, so surface the diagnostic on early serial and halt the
@@ -165,6 +171,45 @@ pub unsafe fn kmain(boot_info: BootInfo) -> ! {
             huesos_arch::hlt();
         }
     }
+
+    // Signed HBI is the trust boundary for BOOTFS, command line and platform
+    // data. Verify exactly once before any module bytes influence policy.
+    let verified_hbi = match boot_info.hbi_image {
+        Some(bytes) => match boot::hbi::HbiImage::parse(bytes) {
+            Ok(image) => {
+                dbg("[HBI] Ed25519 signature verified (v2.2)\n");
+                image
+            }
+            Err(error) => {
+                use core::fmt::Write;
+                let mut writer = huesos_arch::serial::SerialWriter;
+                let _ = writeln!(writer, "[HBI] signature verification failed: {error:?}");
+                loop {
+                    huesos_arch::hlt();
+                }
+            }
+        },
+        None => {
+            dbg("[HBI] signed boot image missing; fail-closed halt\n");
+            loop {
+                huesos_arch::hlt();
+            }
+        }
+    };
+
+    let boot_measurement = match boot::measurement::pcr12_digest(&verified_hbi) {
+        Ok(digest) => digest,
+        Err(error) => {
+            use core::fmt::Write;
+            let mut writer = huesos_arch::serial::SerialWriter;
+            let _ = writeln!(writer, "[measure] boot measurement failed: {error:?}");
+            loop {
+                huesos_arch::hlt();
+            }
+        }
+    };
+    dbg("[measure] signed kernel/HBI/cmdline digest ready for PCR 12\n");
+
     let uacpi_tables_ready = boot_info.rsdp_addr.is_some_and(|rsdp| {
         if let Err(error) = huesos_uacpi::initialize_tables(rsdp) {
             use core::fmt::Write;
@@ -224,14 +269,13 @@ pub unsafe fn kmain(boot_info: BootInfo) -> ! {
         alloc::vec::Vec::new()
     };
 
-    let panic_test_requested = boot_info.hbi_image.is_some_and(cmdline_requests_panic_test);
-    let extable_test_requested = boot_info
-        .hbi_image
-        .is_some_and(cmdline_requests_extable_test);
-    let storage_off_requested = boot_info
-        .hbi_image
-        .is_some_and(cmdline_requests_storage_off);
-    init::object_init();
+    let panic_test_requested = cmdline_requests_panic_test(&verified_hbi);
+    let extable_test_requested = cmdline_requests_extable_test(&verified_hbi);
+    let storage_off_requested = cmdline_requests_storage_off(&verified_hbi);
+    let sealed_key_module = verified_hbi
+        .get_module(boot::hbi::ModuleType::SealedKey)
+        .ok();
+    init::object_init(boot_measurement, sealed_key_module);
 
     if firmware_tables_mapped && uacpi_tables_ready {
         match huesos_uacpi::Table::find(b"APIC").and_then(|table| {
@@ -253,23 +297,24 @@ pub unsafe fn kmain(boot_info: BootInfo) -> ! {
         dbg("[ACPI] validated table access unavailable; continuing uniprocessor\n");
     }
 
-    let bootfs_image = boot_info.hbi_image.and_then(|hbi_data| {
-        let hbi = boot::hbi::HbiImage::parse(hbi_data).ok()?;
-        let bootfs = hbi.get_module(boot::hbi::ModuleType::Bootfs).ok()?;
-        dbg("HBI v2.1 parsed. Entries: ");
-        dbg_num(hbi.get_num_entries() as u64);
-        dbg("\n");
-        Some(bootfs)
-    });
-    // The HBI command line is delivered to init as a read-only VMO so
-    // boot behaviour can be changed from the bootloader without
-    // rebuilding the image. The kernel keeps consuming its own flags
-    // (panic_test, extable_test) directly; this handoff exists for the
-    // `init.`-prefixed keys init parses itself.
-    let cmdline_image = boot_info.hbi_image.and_then(|hbi_data| {
-        let hbi = boot::hbi::HbiImage::parse(hbi_data).ok()?;
-        hbi.get_module(boot::hbi::ModuleType::Cmdline).ok()
-    });
+    let bootfs_image = match verified_hbi.get_module(boot::hbi::ModuleType::Bootfs) {
+        Ok(bootfs) => {
+            dbg("HBI v2.2 parsed. Entries: ");
+            dbg_num(verified_hbi.get_num_entries() as u64);
+            dbg("\n");
+            Some(bootfs)
+        }
+        Err(error) => {
+            use core::fmt::Write;
+            let mut writer = huesos_arch::serial::SerialWriter;
+            let _ = writeln!(writer, "[HBI] required BOOTFS missing: {error:?}");
+            loop {
+                huesos_arch::hlt();
+            }
+        }
+    };
+    // The verified HBI command line is delivered to init as a read-only VMO.
+    let cmdline_image = verified_hbi.get_module(boot::hbi::ModuleType::Cmdline).ok();
     let storage_boot_info =
         boot::storage::build_storage_boot_info(boot_dma_pool, storage_off_requested);
 
@@ -563,25 +608,20 @@ fn install_frame_draw_capability(process: &huesos_object::Process) -> bool {
     true
 }
 
-fn cmdline_requests_panic_test(hbi_data: &[u8]) -> bool {
-    cmdline_flag_present(hbi_data, b"panic_test=1")
+fn cmdline_requests_panic_test(image: &boot::hbi::HbiImage<'_>) -> bool {
+    cmdline_flag_present(image, b"panic_test=1")
 }
 
-fn cmdline_requests_extable_test(hbi_data: &[u8]) -> bool {
-    cmdline_flag_present(hbi_data, b"extable_test=1")
+fn cmdline_requests_extable_test(image: &boot::hbi::HbiImage<'_>) -> bool {
+    cmdline_flag_present(image, b"extable_test=1")
 }
 
-fn cmdline_requests_storage_off(hbi_data: &[u8]) -> bool {
-    cmdline_flag_present(hbi_data, huesos_abi::storage_boot::STORAGE_OFF_TOKEN)
+fn cmdline_requests_storage_off(image: &boot::hbi::HbiImage<'_>) -> bool {
+    cmdline_flag_present(image, huesos_abi::storage_boot::STORAGE_OFF_TOKEN)
 }
 
-fn cmdline_flag_present(hbi_data: &[u8], needle: &[u8]) -> bool {
-    use crate::boot::hbi::{HbiImage, ModuleType};
-
-    let Ok(image) = HbiImage::parse(hbi_data) else {
-        return false;
-    };
-    let Ok(cmdline) = image.get_module(ModuleType::Cmdline) else {
+fn cmdline_flag_present(image: &boot::hbi::HbiImage<'_>, needle: &[u8]) -> bool {
+    let Ok(cmdline) = image.get_module(boot::hbi::ModuleType::Cmdline) else {
         return false;
     };
     cmdline

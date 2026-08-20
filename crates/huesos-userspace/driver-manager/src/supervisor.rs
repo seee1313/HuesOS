@@ -955,6 +955,44 @@ impl DriverManager {
         self.hxfs_service = Some(ManagedHost { process, bootstrap });
     }
 
+    /// Adversarial lifecycle probe used only by the KeyBroker crash smoke.
+    ///
+    /// Generation one has already mounted and completed its on-target checks.
+    /// The injected broker exits immediately after that grant. Submit the next
+    /// monotonically increasing generation on the same unique authority and
+    /// require the channel to be closed: no replacement broker and no ambient
+    /// key source may make a new encrypted HxFS generation launchable.
+    #[cfg(feature = "key-broker-fail-smoke")]
+    fn probe_key_broker_fail_closed(&self) {
+        let Some(next_generation) = self.hxfs_generation.checked_add(1) else {
+            println!("[driver-manager] KeyBroker crash probe FAILED: generation exhausted");
+            return;
+        };
+        let Some(broker) = self.key_broker.as_ref() else {
+            println!("[driver-manager] KeyBroker crash probe FAILED: authority missing");
+            return;
+        };
+        let Ok((_unused_service_end, broker_reply_end)) = Channel::pair() else {
+            println!("[driver-manager] KeyBroker crash probe FAILED: channel creation");
+            return;
+        };
+        let request = key_broker::GrantRequest::new(next_generation).encode();
+        match broker.write_handle(&request, broker_reply_end.into_handle()) {
+            Err((ErrorCode::PeerClosed, _returned)) => println!(
+                "[driver-manager] new encrypted Hxfs generation {} denied after KeyBroker exit",
+                next_generation
+            ),
+            Err((error, _returned)) => println!(
+                "[driver-manager] KeyBroker crash probe FAILED: {}",
+                error.as_str()
+            ),
+            Ok(()) => println!(
+                "[driver-manager] KeyBroker crash probe FAILED: generation {} request accepted",
+                next_generation
+            ),
+        }
+    }
+
     fn try_start_pci_manager(&mut self) {
         if self.pci_manager.is_some() || !self.bootfs_loaded {
             return;
@@ -2087,6 +2125,8 @@ impl DriverManager {
                     println!("[driver-manager] Hxfs service ready");
                     self.storage_milestone(100);
                     self.attach_own_hxfs_client();
+                    #[cfg(feature = "key-broker-fail-smoke")]
+                    self.probe_key_broker_fail_closed();
                     return;
                 }
                 Ok(n) if &buf[..n] == protocol::HXFS_SERVICE_UNAVAILABLE.as_bytes() => {

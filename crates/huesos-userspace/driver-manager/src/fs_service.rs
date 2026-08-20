@@ -24,7 +24,7 @@ impl FileSystemService {
     pub fn install_bootfs(&mut self, vmo: Vmo) {
         match BootFs::new(vmo) {
             Ok(bootfs) => {
-                println!("[driver-manager] BOOTFS mounted");
+                println!("[driver-manager] BOOTFS hash manifest verified and mounted");
                 self.bootfs = Some(bootfs);
             }
             Err(e) => println!("[driver-manager] invalid BOOTFS image: {}", e.as_str()),

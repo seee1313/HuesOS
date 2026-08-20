@@ -226,6 +226,45 @@ pub fn execute<T: CrbTransport>(
     Ok((header, read))
 }
 
+/// Maximum number of complete command submissions after a transient TPM
+/// response. This keeps a broken device from turning early boot into an
+/// unbounded loop while still following the TPM 2.0 requirement to resubmit
+/// commands that return `TPM_RC_RETRY`, `TPM_RC_YIELDED`, or
+/// `TPM_RC_TESTING`.
+pub const TRANSIENT_RETRY_BUDGET: u32 = 8;
+
+/// Execute a command, resubmitting it after a bounded set of TPM-defined
+/// transient responses.
+///
+/// A transient response means the command did not complete. The exact same
+/// command bytes are therefore safe to submit again, including commands that
+/// carry a policy session. Non-transient responses are returned unchanged so
+/// callers can distinguish policy and authorization failures.
+pub fn execute_with_retry<T: CrbTransport>(
+    transport: &mut T,
+    command: &[u8],
+    response: &mut [u8],
+) -> Result<(ResponseHeader, usize), TpmCommandError> {
+    let mut retries_left = TRANSIENT_RETRY_BUDGET;
+    loop {
+        let result = execute(transport, command, response)?;
+        let transient = matches!(
+            result.0.code,
+            response_code::RETRY | response_code::YIELDED | response_code::TESTING
+        );
+        if !transient || retries_left == 0 {
+            return Ok(result);
+        }
+        retries_left -= 1;
+        // Do not hammer a discrete TPM between complete command exchanges.
+        // `poll_tick` is a CPU pause on hardware and advances simulated time
+        // in host tests.
+        for _ in 0..256 {
+            transport.poll_tick();
+        }
+    }
+}
+
 /// Execute and require `TPM_RC_SUCCESS`, returning the response body
 /// (everything after the header).
 pub fn execute_ok<'a, T: CrbTransport>(
@@ -233,7 +272,7 @@ pub fn execute_ok<'a, T: CrbTransport>(
     command: &[u8],
     response: &'a mut [u8],
 ) -> Result<&'a [u8], TpmCommandError> {
-    let (header, read) = execute(transport, command, response)?;
+    let (header, read) = execute_with_retry(transport, command, response)?;
     if header.code != response_code::SUCCESS {
         return Err(TpmCommandError::Tpm(header.code));
     }

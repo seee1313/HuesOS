@@ -138,7 +138,7 @@ pub fn heap_init() -> Result<(), huesos_arch::paging::KernelPageError> {
     Ok(())
 }
 
-pub fn object_init() {
+pub fn object_init(boot_measurement: [u8; 32], sealed_key_module: Option<&[u8]>) {
     huesos_object::init();
     huesos_object::set_phys_to_virt(|p| huesos_arch::paging::phys_to_virt(p).as_u64());
     huesos_object::set_cpu_id_callback(|| unsafe { huesos_arch::cpu_local::current_cpu_index() });
@@ -149,7 +149,7 @@ pub fn object_init() {
     // whose boot chain was tampered with still mounts, using the key
     // compiled into the image -- the exact outcome sealing exists to
     // prevent.
-    let outcome = crate::tpm::init_volume_key();
+    let outcome = crate::tpm::init_volume_key(&boot_measurement, sealed_key_module);
     match outcome {
         crate::tpm::UnsealOutcome::Installed => {
             tpm_log("[tpm] volume key unsealed (PCR policy satisfied)");

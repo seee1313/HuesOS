@@ -10,7 +10,9 @@
 #![no_main]
 
 use core::panic::PanicInfo;
-use huesos_abi::key_broker::{GrantReply, GrantRequest, GrantStatus, GRANT_REQUEST_BYTES};
+use huesos_abi::key_broker::{
+    GrantReply, GrantRequest, GrantStatus, GrantTracker, GRANT_REQUEST_BYTES,
+};
 use libcanvas::{println, wait_any, Channel, ErrorCode, Handle, Signals, WaitItem};
 
 const AUTHORITY_LABEL: &[u8] = b"key-broker:volume-key-authority";
@@ -28,6 +30,17 @@ pub extern "C" fn _start() -> ! {
         let _ = bootstrap.write(MISSING_BOOTSTRAP);
         libcanvas::process::exit(-1);
     };
+
+    // A Channel handle is not VolumeKey authority. Prove the syscall rejects a
+    // wrong object type without consuming the one-shot kernel key.
+    match libcanvas::system::take_volume_key(manager.handle()) {
+        Err(ErrorCode::WrongType) => println!("[key-broker] ambient/wrong-type key take denied"),
+        Ok(Some(unexpected)) => {
+            drop(unexpected);
+            libcanvas::process::exit(-6);
+        }
+        _ => libcanvas::process::exit(-7),
+    }
 
     let key = match libcanvas::system::take_volume_key(&authority) {
         Ok(key) => key,
@@ -64,9 +77,9 @@ pub extern "C" fn _start() -> ! {
     );
     let _ = bootstrap.write(READY);
 
-    let mut last_generation = 0u64;
+    let mut generations = GrantTracker::new();
     loop {
-        if !poll_manager(&manager, key.as_ref(), &mut last_generation) {
+        if !poll_manager(&manager, key.as_ref(), &mut generations) {
             println!("[key-broker] manager channel closed; exiting");
             libcanvas::process::exit(-3);
         }
@@ -127,7 +140,7 @@ fn receive_bootstrap(bootstrap: &Channel) -> Option<(Handle, Channel)> {
 fn poll_manager(
     manager: &Channel,
     key: Option<&libcanvas::system::VolumeKey>,
-    last_generation: &mut u64,
+    generations: &mut GrantTracker,
 ) -> bool {
     let mut request_bytes = [0u8; GRANT_REQUEST_BYTES];
     let mut budget = POLL_BUDGET;
@@ -146,14 +159,13 @@ fn poll_manager(
                     );
                     continue;
                 };
-                if request.generation <= *last_generation {
+                if let Err(status) = generations.admit(request.generation) {
                     send_reply(
                         &reply_channel,
-                        GrantReply::without_key(request.generation, GrantStatus::StaleGeneration),
+                        GrantReply::without_key(request.generation, status),
                     );
                     continue;
                 }
-                *last_generation = request.generation;
                 match key {
                     Some(key) => send_reply(
                         &reply_channel,
@@ -163,6 +175,11 @@ fn poll_manager(
                         &reply_channel,
                         GrantReply::without_key(request.generation, GrantStatus::NotFound),
                     ),
+                }
+                #[cfg(feature = "fail-after-first-grant")]
+                if generations.last_generation() == 1 {
+                    println!("[key-broker] injected post-grant exit; future generations denied until reboot");
+                    libcanvas::process::exit(77);
                 }
             }
             Ok((_length, None)) => {

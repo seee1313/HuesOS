@@ -380,6 +380,82 @@ fn legacy_v5_is_read_only_until_explicit_migration() {
 }
 
 #[test]
+fn every_migration_write_and_flush_recovers_complete_v5_or_v6() {
+    fn legacy_image() -> Vec<u8> {
+        let Ok(seed) = HxfsWriter::new(INSTANCE, VOLUME) else {
+            return Vec::new();
+        };
+        let mut image = seed.image().to_vec();
+        image[56..60].copy_from_slice(&LEGACY_FORMAT_VERSION.to_le_bytes());
+        image[60..64].copy_from_slice(&LEGACY_TYPE_SYSTEM_VERSION.to_le_bytes());
+        let features = BASE_INCOMPAT_FEATURES & !FEATURE_INCOMPAT_V6_POLICY_TABLES_AND_GENERATION;
+        image[144..152].copy_from_slice(&features.to_le_bytes());
+        image[32..36].fill(0);
+        let crc = metadata_crc32c(&image[..BLOCK_SIZE]);
+        image[32..36].copy_from_slice(&crc.to_le_bytes());
+        image
+    }
+
+    fn execute(
+        image: &[u8],
+        fail_at: Option<usize>,
+    ) -> FixedResult<(FixedResult<u64>, CrashStore)> {
+        let store = CrashStore::new(MemStore::from_image_with_blocks(image, 4096));
+        let mut fs = FixedHxfsWriter::<CrashStore, 16, 32, 64>::mount(store)?;
+        fs.store_mut().arm(fail_at);
+        let result = fs.migrate_legacy_to_v6(&[], &[]);
+        Ok((result, fs.into_store()))
+    }
+
+    fn inspect(mut store: MemStore) -> FixedResult<(bool, bool)> {
+        let root = read_superblock(&mut store, 0)?;
+        if root.root_state == ROOT_STATE_RECOVERING {
+            let _ = crate::recovery::replay_journal(&mut store)?;
+        }
+        let root = read_superblock(&mut store, 0)?;
+        let old = root.format_version == LEGACY_FORMAT_VERSION
+            && FixedHxfsWriter::<MemStore, 16, 32, 64>::mount(MemStore::from_image_with_blocks(
+                store.as_slice(),
+                4096,
+            ))
+            .is_ok_and(|fs| fs.is_legacy_read_only());
+        let new = root.format_version == FORMAT_VERSION
+            && Hxfs::mount_from_disk(SliceBlockReader::new(store.as_slice()), None).is_ok();
+        Ok((old, new))
+    }
+
+    let image = legacy_image();
+    assert!(!image.is_empty());
+    let Ok((success, successful_store)) = execute(&image, None) else {
+        assert!(false, "successful migration setup must run");
+        return;
+    };
+    assert!(success.is_ok());
+    let operation_count = successful_store.operation;
+    let Ok((old, new)) = inspect(successful_store.inner) else {
+        assert!(false, "successful migration must inspect");
+        return;
+    };
+    assert!(!old && new);
+
+    for fail_at in 0..operation_count {
+        let Ok((result, failed_store)) = execute(&image, Some(fail_at)) else {
+            assert!(false, "migration setup failed at operation {fail_at}");
+            return;
+        };
+        assert_eq!(result, Err(HxfsError::Io));
+        let Ok((old, new)) = inspect(failed_store.inner) else {
+            assert!(false, "migration failure {fail_at} was unrecoverable");
+            return;
+        };
+        assert!(
+            old ^ new,
+            "migration failure {fail_at} exposed mixed v5/v6 state"
+        );
+    }
+}
+
+#[test]
 fn transaction_shape_accounts_for_optional_hxblob_targets() {
     let Ok(base) = TransactionShape::plan(3, 4, 5, false) else {
         assert!(false, "base shape should be representable");

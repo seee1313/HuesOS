@@ -49,6 +49,7 @@ fi
 # PR-D and was fixed in this PR) turns CI red instead of merging
 # green under a broken user experience.
 for marker in \
+    '[HBI] Ed25519 signature verified (v2.2)' \
     '[uACPI] validated ACPI table graph and MADT' \
     '[uACPI] built immutable Ring-3 table archive v2' \
     '[uACPI] derived bounded FADT SystemIO policy' \
@@ -61,6 +62,7 @@ for marker in \
     '[key-broker] kernel key moved; state=plain-only' \
     '[init] delegated unique KeyBroker authority to DriverManager' \
     '[driver-manager] received unique KeyBroker generation authority' \
+    '[driver-manager] BOOTFS hash manifest verified and mounted' \
     '[driver-manager] launched DriverHost input-host' \
     '[driver-host:input] started' \
     '[driver-host:input] retained' \
