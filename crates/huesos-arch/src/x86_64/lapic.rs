@@ -23,19 +23,19 @@ static TIMER_INITIAL_COUNT: AtomicU32 = AtomicU32::new(0);
 /// `phys` must be the LAPIC MMIO base reported by validated MADT/MSR state,
 /// and `hhdm_offset` must name the active direct map. Call exactly once before
 /// any LAPIC register access.
-pub unsafe fn set_base(phys: u32, hhdm_offset: u64) {
+pub unsafe fn set_base(phys: u64, hhdm_offset: u64) {
     // LAPIC is MMIO: must be uncacheable. WB mapping can hang IPI delivery
     // status polls forever (writes never reach the device).
     use x86_64::structures::paging::PageTableFlags;
     let _ = crate::x86_64::paging::map_hhdm_range_flags(
-        phys as u64,
+        phys,
         0x1000,
         PageTableFlags::PRESENT
             | PageTableFlags::WRITABLE
             | PageTableFlags::NO_CACHE
             | PageTableFlags::NO_EXECUTE,
     );
-    LAPIC_BASE.store(hhdm_offset + phys as u64, Ordering::Relaxed);
+    LAPIC_BASE.store(hhdm_offset + phys, Ordering::Relaxed);
 }
 
 fn base() -> u64 {

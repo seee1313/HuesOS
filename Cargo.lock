@@ -252,6 +252,7 @@ dependencies = [
  "bitflags 2.13.0",
  "huesos-ioapic",
  "huesos-pmm",
+ "huesos-sched",
  "log",
  "pic8259",
  "spin",
