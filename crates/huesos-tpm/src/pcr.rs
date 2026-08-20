@@ -30,15 +30,19 @@ pub const ALG_SHA256: u16 = 0x000B;
 /// A SHA-256 PCR digest.
 pub type PcrValue = [u8; PCR_DIGEST_BYTES];
 
-/// PCR index HuesOS binds the volume key to.
-///
-/// PCR 12 is in the OS-controlled range and is where the boot chain
-/// records the kernel measurement. PCRs 0-7 belong to the firmware:
-/// binding to those would make the volume unmountable after any
-/// unrelated UEFI update, which in practice trains people to keep a
-/// plaintext recovery key next to the machine -- a worse outcome than
-/// the narrower binding.
+/// Firmware Secure Boot policy PCR.
+pub const PCR_SECURE_BOOT_POLICY: u32 = 7;
+/// HuesOS-controlled signed kernel/HBI/cmdline measurement PCR.
 pub const PCR_KERNEL_MEASUREMENT: u32 = 12;
+
+/// Volume-key policy approved for the verified boot chain: firmware Secure
+/// Boot state plus the HuesOS measurement extended by the kernel.
+pub fn volume_key_policy_selection() -> Option<PcrSelection> {
+    let mut selection = PcrSelection::new();
+    selection.add(PCR_SECURE_BOOT_POLICY)?;
+    selection.add(PCR_KERNEL_MEASUREMENT)?;
+    Some(selection)
+}
 
 /// A selection of PCRs within the SHA-256 bank.
 ///
@@ -227,6 +231,18 @@ mod tests {
         let mut selection = PcrSelection::new();
         assert_eq!(selection.add(99), None);
         assert!(selection.is_empty());
+    }
+
+    #[test]
+    fn volume_key_policy_selects_secure_boot_and_huesos_measurement() {
+        let Some(selection) = volume_key_policy_selection() else {
+            assert!(false, "PCR 7 + 12 selection must be representable");
+            return;
+        };
+        assert!(selection.contains(PCR_SECURE_BOOT_POLICY));
+        assert!(selection.contains(PCR_KERNEL_MEASUREMENT));
+        assert_eq!(selection.bitmap(), [0x80, 0x10, 0x00]);
+        assert_eq!(selection.count(), 2);
     }
 
     #[test]

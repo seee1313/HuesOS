@@ -25,7 +25,7 @@
 //! constant in the binary" to "unsealed by the TPM against a measured
 //! boot".
 
-use crate::crb::{execute, execute_ok, CrbTransport, TpmCommandError};
+use crate::crb::{execute_ok, execute_with_retry, CrbTransport, TpmCommandError};
 use crate::pcr::{PcrSelection, PCR_DIGEST_BYTES};
 use crate::{
     begin_command, command, finish_command, push, push_u16, push_u32, read_u16, response_code, tag,
@@ -199,7 +199,7 @@ pub fn start_pcr_policy_session<T: CrbTransport>(
     finish_command(&mut policy_buf, cursor)?;
 
     let mut response_buf = [0u8; MAX_MESSAGE_BYTES];
-    match execute(transport, &policy_buf[..cursor], &mut response_buf) {
+    match execute_with_retry(transport, &policy_buf[..cursor], &mut response_buf) {
         Ok((header, _)) if header.code == response_code::SUCCESS => Ok(handle),
         Ok((header, _)) if header.code == response_code::POLICY_FAIL => {
             flush_context(transport, handle);
@@ -234,7 +234,7 @@ pub fn flush_context<T: CrbTransport>(transport: &mut T, handle: u32) {
         return;
     }
     let mut response_buf = [0u8; MAX_MESSAGE_BYTES];
-    let _ = execute(transport, &command_buf[..cursor], &mut response_buf);
+    let _ = execute_with_retry(transport, &command_buf[..cursor], &mut response_buf);
 }
 
 /// Unseal a volume key previously sealed to a PCR policy.
@@ -272,7 +272,7 @@ pub fn unseal_volume_key<T: CrbTransport>(
     finish_command(&mut command_buf, cursor)?;
 
     let mut response_buf = [0u8; MAX_MESSAGE_BYTES];
-    let (header, read) = execute(transport, &command_buf[..cursor], &mut response_buf)?;
+    let (header, read) = execute_with_retry(transport, &command_buf[..cursor], &mut response_buf)?;
     if header.code == response_code::INTEGRITY {
         // The blob does not belong to this TPM, or it was altered.
         return Err(SealError::PolicyMismatch);
@@ -317,7 +317,7 @@ fn unseal_loaded<T: CrbTransport>(
     finish_command(&mut command_buf, cursor)?;
 
     let mut response_buf = [0u8; MAX_MESSAGE_BYTES];
-    let (header, read) = execute(transport, &command_buf[..cursor], &mut response_buf)?;
+    let (header, read) = execute_with_retry(transport, &command_buf[..cursor], &mut response_buf)?;
     if header.code == response_code::POLICY_FAIL || header.code == response_code::AUTH_FAIL {
         return Err(SealError::PolicyMismatch);
     }

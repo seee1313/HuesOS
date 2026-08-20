@@ -174,7 +174,14 @@ pub unsafe extern "C" fn ap_entry() -> ! {
 
     // SIMD and supervisor-memory protection bits are per logical CPU.
     huesos_arch::cpu::enable_sse();
-    huesos_arch::cpu::enable_memory_protection();
+    let protection = huesos_arch::cpu::enable_memory_protection();
+    log_line("[security] AP ");
+    log_num(lapic_id as u64);
+    if protection.smep && protection.smap {
+        log_line(" SMEP=on SMAP=on\n");
+    } else {
+        log_line(" degraded: SMEP/SMAP unavailable\n");
+    }
 
     // Per-CPU GDT/TSS.
     let gdt = huesos_arch::gdt::PerCpuGdt::new();

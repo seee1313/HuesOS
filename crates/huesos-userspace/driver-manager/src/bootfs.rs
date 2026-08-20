@@ -6,6 +6,9 @@ const MAGIC: &[u8; 8] = b"HBOOTFS1";
 const HEADER_SIZE: u64 = 16;
 const ENTRY_SIZE: u64 = 216;
 const PATH_SIZE: usize = 192;
+const HASH_MANIFEST_PATH: &str = "/manifests/bootfs.sha256";
+const MAX_HASH_MANIFEST_BYTES: usize = 8192;
+const MAX_HASH_RECORDS: usize = 32;
 
 /// BOOTFS archive backed by a transferred VMO.
 pub struct BootFs {
@@ -19,6 +22,23 @@ pub struct Entry {
     pub len: u64,
 }
 
+#[derive(Clone, Copy)]
+struct HashRecord {
+    path: [u8; PATH_SIZE],
+    path_len: usize,
+    hash: [u8; 32],
+}
+
+impl HashRecord {
+    const fn empty() -> Self {
+        Self {
+            path: [0; PATH_SIZE],
+            path_len: 0,
+            hash: [0; 32],
+        }
+    }
+}
+
 impl BootFs {
     /// Parse BOOTFS header from `vmo`.
     pub fn new(vmo: Vmo) -> libcanvas::Result<Self> {
@@ -28,7 +48,97 @@ impl BootFs {
             return Err(libcanvas::ErrorCode::InvalidArgs);
         }
         let file_count = read_u32(&header[8..12]);
-        Ok(Self { vmo, file_count })
+        let bootfs = Self { vmo, file_count };
+        bootfs.verify_hash_manifest()?;
+        Ok(bootfs)
+    }
+
+    fn verify_hash_manifest(&self) -> libcanvas::Result<()> {
+        let Some(manifest) = self.get_entry(HASH_MANIFEST_PATH)? else {
+            return Err(libcanvas::ErrorCode::AccessDenied);
+        };
+        if manifest.len as usize > MAX_HASH_MANIFEST_BYTES {
+            return Err(libcanvas::ErrorCode::InvalidArgs);
+        }
+        let mut bytes = [0u8; MAX_HASH_MANIFEST_BYTES];
+        let length = self
+            .vmo
+            .read(manifest.offset, &mut bytes[..manifest.len as usize])?;
+        if length != manifest.len as usize {
+            return Err(libcanvas::ErrorCode::InvalidArgs);
+        }
+
+        let mut records = [HashRecord::empty(); MAX_HASH_RECORDS];
+        let mut record_count = 0usize;
+        for line in bytes[..length].split(|byte| *byte == b'\n') {
+            if line.is_empty() {
+                continue;
+            }
+            if line.len() < 67 || &line[64..66] != b"  " || record_count >= records.len() {
+                return Err(libcanvas::ErrorCode::InvalidArgs);
+            }
+            let path = &line[66..];
+            if path.is_empty() || path.len() >= PATH_SIZE || path[0] != b'/' {
+                return Err(libcanvas::ErrorCode::InvalidArgs);
+            }
+            let hash = huesos_blobfs::parse_hash_hex(&line[..64])
+                .ok_or(libcanvas::ErrorCode::InvalidArgs)?;
+            if records[..record_count]
+                .iter()
+                .any(|record| &record.path[..record.path_len] == path)
+            {
+                return Err(libcanvas::ErrorCode::InvalidArgs);
+            }
+            records[record_count].path[..path.len()].copy_from_slice(path);
+            records[record_count].path_len = path.len();
+            records[record_count].hash = hash;
+            record_count += 1;
+        }
+
+        for record in &records[..record_count] {
+            let path = core::str::from_utf8(&record.path[..record.path_len])
+                .map_err(|_| libcanvas::ErrorCode::InvalidArgs)?;
+            let Some(entry) = self.get_entry(path)? else {
+                return Err(libcanvas::ErrorCode::NotFound);
+            };
+            let actual = self.hash_entry(entry)?;
+            if actual != record.hash {
+                return Err(libcanvas::ErrorCode::AccessDenied);
+            }
+        }
+
+        // Completeness: every executable/authority manifest must be hash-locked.
+        let mut index = 0u32;
+        while index < self.file_count {
+            let raw = self.read_raw_entry(index)?;
+            let path_len = entry_path_len(&raw);
+            let path = &raw[..path_len];
+            if trusted_boot_path(path)
+                && !records[..record_count]
+                    .iter()
+                    .any(|record| &record.path[..record.path_len] == path)
+            {
+                return Err(libcanvas::ErrorCode::AccessDenied);
+            }
+            index += 1;
+        }
+        Ok(())
+    }
+
+    fn hash_entry(&self, entry: Entry) -> libcanvas::Result<[u8; 32]> {
+        let mut sha = huesos_blobfs::Sha256::new();
+        let mut buffer = [0u8; 4096];
+        let mut offset = 0u64;
+        while offset < entry.len {
+            let count = (entry.len - offset).min(buffer.len() as u64) as usize;
+            let read = self.vmo.read(entry.offset + offset, &mut buffer[..count])?;
+            if read != count {
+                return Err(libcanvas::ErrorCode::InvalidArgs);
+            }
+            sha = sha.update(&buffer[..count]);
+            offset += count as u64;
+        }
+        Ok(sha.finish())
     }
 
     /// Read a file into `out`, returning bytes copied.
@@ -109,6 +219,12 @@ fn entry_path_len(entry: &[u8; ENTRY_SIZE as usize]) -> usize {
         len += 1;
     }
     len
+}
+
+fn trusted_boot_path(path: &[u8]) -> bool {
+    path.ends_with(b".elf")
+        || path.ends_with(b".hdriver")
+        || path == b"/storage/boot-drivers.manifest"
 }
 
 fn path_matches_prefix(path: &[u8], prefix: &[u8]) -> bool {

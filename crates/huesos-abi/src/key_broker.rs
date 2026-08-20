@@ -16,6 +16,33 @@ const REQUEST_MAGIC: u32 = 0x4b42_4752; // "KBGR"
 const REPLY_MAGIC: u32 = 0x4b42_5250; // "KBRP"
 const OPCODE_GRANT: u16 = 1;
 
+/// Monotonic generation admission state held by KeyBroker.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct GrantTracker {
+    last_generation: u64,
+}
+
+impl GrantTracker {
+    /// Empty tracker; generation zero remains reserved.
+    pub const fn new() -> Self {
+        Self { last_generation: 0 }
+    }
+
+    /// Admit a strictly newer generation and reject replay/backwards movement.
+    pub fn admit(&mut self, generation: u64) -> Result<(), GrantStatus> {
+        if generation == 0 || generation <= self.last_generation {
+            return Err(GrantStatus::StaleGeneration);
+        }
+        self.last_generation = generation;
+        Ok(())
+    }
+
+    /// Highest generation admitted so far.
+    pub const fn last_generation(&self) -> u64 {
+        self.last_generation
+    }
+}
+
 /// Request carried with a newly-created, single-use reply channel.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct GrantRequest {
@@ -213,6 +240,17 @@ fn read_u64(bytes: &[u8], offset: usize) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tracker_rejects_zero_replay_and_backwards_generations() {
+        let mut tracker = GrantTracker::new();
+        assert_eq!(tracker.admit(0), Err(GrantStatus::StaleGeneration));
+        assert_eq!(tracker.admit(4), Ok(()));
+        assert_eq!(tracker.admit(4), Err(GrantStatus::StaleGeneration));
+        assert_eq!(tracker.admit(3), Err(GrantStatus::StaleGeneration));
+        assert_eq!(tracker.admit(5), Ok(()));
+        assert_eq!(tracker.last_generation(), 5);
+    }
 
     #[test]
     fn request_round_trip_and_rejects_generation_zero() {

@@ -19,7 +19,8 @@ ISO := build/huesos.iso
 all: build
 
 build:
-	$(CARGO_BUILD)
+	bash scripts/ensure-hbi-signing-key.sh
+	HUESOS_HBI_VERIFY_KEY_HEX="$$(cat build/hbi-verify-key.hex)" $(CARGO_BUILD)
 
 build-release:
 	$(MAKE) build PROFILE=release

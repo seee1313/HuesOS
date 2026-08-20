@@ -1,11 +1,12 @@
 use clap::Parser;
 use crc32fast::Hasher;
-use std::fs::{self, File};
-use std::io::{Write, BufWriter};
+use ed25519_dalek::pkcs8::DecodePrivateKey;
+use ed25519_dalek::{Signer, SigningKey};
+use std::fs;
 use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
-#[command(author, version, about = "HuesOS Boot Image Generator v2.1")]
+#[command(author, version, about = "HuesOS signed Boot Image Generator v2.2")]
 struct Args {
     #[arg(short, long)]
     kernel: PathBuf,
@@ -17,23 +18,15 @@ struct Args {
     platform: PathBuf,
     #[arg(short, long)]
     output: PathBuf,
+    /// PKCS#8 PEM Ed25519 private key. Production keys must live outside the repository.
+    #[arg(long)]
+    signing_key: PathBuf,
+    /// Optional signed TPM sealed-key module produced after PCR provisioning.
+    #[arg(long)]
+    sealed_key: Option<PathBuf>,
 }
 
-#[repr(C)]
-#[derive(Debug, Clone, Copy)]
-struct GlobalHeader {
-    magic: [u8; 8],
-    version: u32,
-    flags: u32,
-    num_entries: u32,
-    header_size: u32,
-    image_size: u64,
-    arch_id: u32,
-    reserved: [u8; 36],
-}
-
-#[repr(C)]
-#[derive(Debug, Clone, Copy)]
+#[derive(Clone, Copy)]
 struct DirectoryEntry {
     type_id: u32,
     offset: u32,
@@ -41,126 +34,187 @@ struct DirectoryEntry {
     flags: u32,
 }
 
-#[repr(C)]
-#[derive(Debug, Clone, Copy)]
-struct EntryHeader {
-    type_id: u32,
-    flags: u32,
-    length: u32,
-    extra: u32,
-    crc32: u32,
-    reserved: u32,
-}
+const GLOBAL_HEADER_BYTES: usize = 72;
+const DIRECTORY_ENTRY_BYTES: usize = 16;
+const ENTRY_HEADER_BYTES: usize = 24;
+const SIGNATURE_TRAILER_BYTES: usize = 72;
+const HBI_VERSION: u32 = 0x0002_0002;
+const HBI_FLAG_SIGNED: u32 = 1;
+const SIGNATURE_ALGORITHM_ED25519: u32 = 1;
+const SIGNATURE_MAGIC: &[u8; 8] = b"HUESIG1\0";
 
-const TYPE_KERNEL: u32 = 0x00000001;
-const TYPE_BOOTFS: u32 = 0x00000002;
-const TYPE_CMDLINE: u32 = 0x00000003;
-const TYPE_PLATFORM: u32 = 0x00000004;
+const TYPE_KERNEL: u32 = 1;
+const TYPE_BOOTFS: u32 = 2;
+const TYPE_CMDLINE: u32 = 3;
+const TYPE_PLATFORM: u32 = 4;
+const TYPE_SEALED_KEY: u32 = 5;
 
-const FLAG_REQUIRED: u32 = 0x80000000;
-const FLAG_CRITICAL: u32 = 0x40000000;
-const FLAG_EXECUTABLE: u32 = 0x00000004;
+const FLAG_REQUIRED: u32 = 0x8000_0000;
+const FLAG_CRITICAL: u32 = 0x4000_0000;
+const FLAG_EXECUTABLE: u32 = 0x0000_0004;
 
-fn align_up(val: u64, align: u64) -> u64 {
-    (val + align - 1) & !(align - 1)
+fn align_up(value: usize, align: usize) -> Result<usize, &'static str> {
+    value
+        .checked_add(align - 1)
+        .map(|sum| sum & !(align - 1))
+        .ok_or("HBI offset overflow")
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
+    let private_pem = fs::read_to_string(&args.signing_key)?;
+    let signing_key = SigningKey::from_pkcs8_pem(&private_pem)?;
 
-    let kernel_data = fs::read(&args.kernel)?;
-    let bootfs_data = fs::read(&args.bootfs)?;
-    let cmdline_data = fs::read_to_string(&args.cmdline)?;
-    let platform_data = fs::read(&args.platform)?;
-
-    let payloads = [
-        (TYPE_KERNEL, kernel_data.as_slice(), FLAG_REQUIRED | FLAG_CRITICAL | FLAG_EXECUTABLE, 0),
-        (TYPE_BOOTFS, bootfs_data.as_slice(), FLAG_REQUIRED | FLAG_CRITICAL, 0),
-        (TYPE_CMDLINE, cmdline_data.as_bytes(), 0, 0),
-        (TYPE_PLATFORM, platform_data.as_slice(), FLAG_REQUIRED | FLAG_CRITICAL, 0),
+    let mut payloads: Vec<(u32, Vec<u8>, u32, u32)> = vec![
+        (
+            TYPE_KERNEL,
+            fs::read(&args.kernel)?,
+            FLAG_REQUIRED | FLAG_CRITICAL | FLAG_EXECUTABLE,
+            0,
+        ),
+        (
+            TYPE_BOOTFS,
+            fs::read(&args.bootfs)?,
+            FLAG_REQUIRED | FLAG_CRITICAL,
+            0,
+        ),
+        (TYPE_CMDLINE, fs::read(&args.cmdline)?, 0, 0),
+        (
+            TYPE_PLATFORM,
+            fs::read(&args.platform)?,
+            FLAG_REQUIRED | FLAG_CRITICAL,
+            0,
+        ),
     ];
+    if let Some(path) = &args.sealed_key {
+        payloads.push((
+            TYPE_SEALED_KEY,
+            fs::read(path)?,
+            FLAG_REQUIRED | FLAG_CRITICAL,
+            0,
+        ));
+    }
 
-    let num_entries = payloads.len() as u32;
-    let header_size = core::mem::size_of::<GlobalHeader>()
-        + (num_entries as usize * core::mem::size_of::<DirectoryEntry>());
-    let mut current_offset = align_up(header_size as u64, 8);
-    let mut directory = Vec::new();
-
-    for (type_id, data, flags, _extra) in &payloads {
-        let length = data.len() as u32;
-
+    let header_size = GLOBAL_HEADER_BYTES
+        .checked_add(payloads.len() * DIRECTORY_ENTRY_BYTES)
+        .ok_or("HBI header overflow")?;
+    let mut current_offset = align_up(header_size, 8)?;
+    let mut directory = Vec::with_capacity(payloads.len());
+    for (type_id, data, flags, _) in &payloads {
+        let length = u32::try_from(data.len()).map_err(|_| "HBI payload exceeds u32")?;
         directory.push(DirectoryEntry {
             type_id: *type_id,
-            offset: current_offset as u32,
+            offset: u32::try_from(current_offset).map_err(|_| "HBI offset exceeds u32")?,
             length,
             flags: *flags,
         });
-
-        // EntryHeader is 24 bytes (6 × u32). Must match size_of::<EntryHeader>()
-        // and the kernel parser in huesos-kernel::boot::hbi.
-        current_offset += core::mem::size_of::<EntryHeader>() as u64
-            + align_up(length as u64, 8);
+        current_offset = current_offset
+            .checked_add(ENTRY_HEADER_BYTES)
+            .and_then(|value| value.checked_add(align_up(data.len(), 8).ok()?))
+            .ok_or("HBI image overflow")?;
     }
+    let signed_len = current_offset;
+    let image_size = signed_len
+        .checked_add(SIGNATURE_TRAILER_BYTES)
+        .ok_or("HBI signature trailer overflow")?;
 
-    let file = File::create(&args.output)?;
-    let mut writer = BufWriter::new(file);
-
-    let global_header = GlobalHeader {
-        magic: *b"HUESOS_H",
-        version: 0x0002_0001,
-        flags: 0,
-        num_entries,
-        header_size: header_size as u32,
-        image_size: current_offset,
-        arch_id: 0,
-        reserved: [0; 36],
-    };
-
-    unsafe {
-        let header_ptr = &global_header as *const GlobalHeader as *const u8;
-        let header_slice = std::slice::from_raw_parts(header_ptr, core::mem::size_of::<GlobalHeader>());
-        writer.write_all(header_slice)?;
-    }
-
+    let mut image = Vec::new();
+    image
+        .try_reserve_exact(image_size)
+        .map_err(|_| "cannot allocate HBI image")?;
+    write_global_header(
+        &mut image,
+        payloads.len(),
+        header_size,
+        image_size,
+        signed_len,
+    )?;
     for entry in &directory {
-        unsafe {
-            let entry_ptr = entry as *const DirectoryEntry as *const u8;
-            let entry_slice = std::slice::from_raw_parts(entry_ptr, core::mem::size_of::<DirectoryEntry>());
-            writer.write_all(entry_slice)?;
-        }
+        push_u32(&mut image, entry.type_id);
+        push_u32(&mut image, entry.offset);
+        push_u32(&mut image, entry.length);
+        push_u32(&mut image, entry.flags);
     }
+    image.resize(align_up(image.len(), 8)?, 0);
 
     for (type_id, data, flags, extra) in &payloads {
-        let length = data.len() as u32;
+        if image.len() != directory
+            .iter()
+            .find(|entry| entry.type_id == *type_id)
+            .map(|entry| entry.offset as usize)
+            .ok_or("directory entry missing")?
+        {
+            return Err("directory/payload offset drift".into());
+        }
         let mut hasher = Hasher::new();
         hasher.update(data);
-        let crc = hasher.finalize();
-
-        let entry_header = EntryHeader {
-            type_id: *type_id,
-            flags: *flags,
-            length,
-            extra: *extra,
-            crc32: crc,
-            reserved: 0,
-        };
-
-        unsafe {
-            let eh_ptr = &entry_header as *const EntryHeader as *const u8;
-            let eh_slice = std::slice::from_raw_parts(eh_ptr, core::mem::size_of::<EntryHeader>());
-            writer.write_all(eh_slice)?;
-        }
-
-        writer.write_all(data)?;
-        
-        let padding = (8 - (length % 8)) % 8;
-        if padding > 0 {
-            writer.write_all(&[0u8; 8][..padding as usize])?;
-        }
+        push_u32(&mut image, *type_id);
+        push_u32(&mut image, *flags);
+        push_u32(
+            &mut image,
+            u32::try_from(data.len()).map_err(|_| "payload length overflow")?,
+        );
+        push_u32(&mut image, *extra);
+        push_u32(&mut image, hasher.finalize());
+        push_u32(&mut image, 0);
+        image.extend_from_slice(data);
+        image.resize(align_up(image.len(), 8)?, 0);
+    }
+    if image.len() != signed_len {
+        return Err("signed length drift".into());
     }
 
-    writer.flush()?;
-    println!("HBI v2.1 image created successfully at {:?}", args.output);
-    println!("Total size: {} bytes", current_offset);
+    let signature = signing_key.sign(&image);
+    image.extend_from_slice(SIGNATURE_MAGIC);
+    image.extend_from_slice(&signature.to_bytes());
+    if image.len() != image_size {
+        return Err("final image size drift".into());
+    }
+    fs::write(&args.output, &image)?;
+    println!("Signed HBI v2.2 image created at {:?}", args.output);
+    println!("Signed bytes: {signed_len}; total bytes: {image_size}");
     Ok(())
+}
+
+fn write_global_header(
+    out: &mut Vec<u8>,
+    entries: usize,
+    header_size: usize,
+    image_size: usize,
+    signed_len: usize,
+) -> Result<(), &'static str> {
+    out.extend_from_slice(b"HUESOS_H");
+    push_u32(out, HBI_VERSION);
+    push_u32(out, HBI_FLAG_SIGNED);
+    push_u32(out, u32::try_from(entries).map_err(|_| "entry count overflow")?);
+    push_u32(
+        out,
+        u32::try_from(header_size).map_err(|_| "header size overflow")?,
+    );
+    push_u64(
+        out,
+        u64::try_from(image_size).map_err(|_| "image size overflow")?,
+    );
+    push_u32(out, 0); // x86_64 architecture id
+    let mut reserved = [0u8; 36];
+    reserved[0..4].copy_from_slice(&SIGNATURE_ALGORITHM_ED25519.to_le_bytes());
+    reserved[4..8].copy_from_slice(&(SIGNATURE_TRAILER_BYTES as u32).to_le_bytes());
+    reserved[8..16].copy_from_slice(
+        &u64::try_from(signed_len)
+            .map_err(|_| "signed size overflow")?
+            .to_le_bytes(),
+    );
+    out.extend_from_slice(&reserved);
+    if out.len() != GLOBAL_HEADER_BYTES {
+        return Err("global header layout drift");
+    }
+    Ok(())
+}
+
+fn push_u32(out: &mut Vec<u8>, value: u32) {
+    out.extend_from_slice(&value.to_le_bytes());
+}
+
+fn push_u64(out: &mut Vec<u8>, value: u64) {
+    out.extend_from_slice(&value.to_le_bytes());
 }

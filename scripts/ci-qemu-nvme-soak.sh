@@ -72,6 +72,7 @@ elif [[ "$inject" == "1" || "$inject" == "2" || "$inject" == "3" || "$inject" ==
     # tool's --print-volume-key-hex). The service receives it via
     # the VolumeKeyGet syscall; without it an encrypted volume
     # cannot mount, which is the security gate.
+    export HUESOS_ALLOW_INSECURE_BUILD_KEY=1
     export HUESOS_VOLUME_KEY_HEX="$(bash tools/hxfs-seed.sh --print-volume-key-hex)"
     # Phase-2 packages (step 3): every seeded mode also stores a WAD
     # header (first 3072 bytes of freedoom1.wad) as an Hxblob object

@@ -56,13 +56,26 @@ if [ ! -f "${PLATFORM_BIN}" ]; then
     echo -n -e "\x01\x02\x03\x04" > "${PLATFORM_BIN}"
 fi
 
-# 4. Run hbi-gen
-echo "[HBI] Generating HBI image at ${OUTPUT_HBI}..."
+# 4. Sign with the same Ed25519 key whose public half was embedded at kernel
+# build time. The helper rejects an external/private-key mismatch.
+bash scripts/ensure-hbi-signing-key.sh
+SIGNING_KEY="$(cat build/hbi-signing-key.path)"
+SEALED_ARGS=()
+if [[ -n "${HUESOS_SEALED_KEY_MODULE:-}" ]]; then
+    [[ -f "$HUESOS_SEALED_KEY_MODULE" ]] || {
+        echo "sealed-key module not found: $HUESOS_SEALED_KEY_MODULE" >&2
+        exit 1
+    }
+    SEALED_ARGS=(--sealed-key "$HUESOS_SEALED_KEY_MODULE")
+fi
+echo "[HBI] Generating signed HBI image at ${OUTPUT_HBI}..."
 ./tools/hbi-gen/target/x86_64-unknown-linux-gnu/release/hbi-gen \
     --kernel "${KERNEL}" \
     --bootfs "${BOOTFS_PATH}" \
     --cmdline "${CMDLINE_TXT}" \
     --platform "${PLATFORM_BIN}" \
+    --signing-key "${SIGNING_KEY}" \
+    "${SEALED_ARGS[@]}" \
     --output "${OUTPUT_HBI}"
 
 echo "[HBI] Done!"

@@ -7,6 +7,7 @@ requiring a separate download/build step:
 - `BOOTX64.EFI`, `BOOTIA32.EFI` — UEFI bootloader executables
 - `limine-bios.sys`, `limine-bios-cd.bin` — BIOS boot stages
 - `limine-uefi-cd.bin` — UEFI El Torito boot image for CD/ISO media
+- `limine.c`, `limine-bios-hdd.h` — matching host utility source, compiled locally to enroll the configuration hash for Secure Boot
 - `LICENSE` — Limine's own license (BSD-2-Clause)
 
 Source: https://github.com/limine-bootloader/limine (branch `v9.x-binary`)
@@ -16,7 +17,7 @@ To refresh these with a newer Limine release:
 ```bash
 git clone --branch v9.x-binary --depth 1 \
     https://github.com/limine-bootloader/limine.git /tmp/limine-bin
-cp /tmp/limine-bin/{BOOTX64.EFI,BOOTIA32.EFI,limine-bios.sys,limine-bios-cd.bin,limine-uefi-cd.bin,LICENSE} \
+cp /tmp/limine-bin/{BOOTX64.EFI,BOOTIA32.EFI,limine-bios.sys,limine-bios-cd.bin,limine-uefi-cd.bin,limine.c,limine-bios-hdd.h,LICENSE} \
     third_party/limine/
 ```
 

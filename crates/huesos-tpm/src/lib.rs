@@ -92,6 +92,13 @@ pub mod response_code {
     pub const AUTH_FAIL: u32 = 0x0000_098E;
     /// Integrity check on a loaded blob failed.
     pub const INTEGRITY: u32 = 0x0000_099F;
+    /// The TPM could not start the command and requires the identical command
+    /// to be submitted again.
+    pub const RETRY: u32 = 0x0000_0922;
+    /// The TPM yielded while processing the command; the caller may retry it.
+    pub const YIELDED: u32 = 0x0000_0908;
+    /// The TPM is still completing self-test; the caller may retry later.
+    pub const TESTING: u32 = 0x0000_090A;
 }
 
 /// Bytes in a TPM 2.0 command/response header: tag, size, code.

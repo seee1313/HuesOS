@@ -6,6 +6,7 @@ edition = "2021"
 [features]
 default = []
 acpi-restart-smoke = []
+key-broker-fail-smoke = []
 
 [[bin]]
 name = "huesos-driver-manager"
