@@ -733,13 +733,31 @@ claims about the whole kernel.
 - `04dd8d4`: added a fixed 8192-slot Task directory model with coherent
   owner/local-index publication, generation validation, and coalesced pending
   operations.
-- Current kernel integration: the Scheduler now uses `huesos_sched::TaskId`
-  (global slot + generation) with CPU ownership held in a fixed Task
-  directory. Migration keeps the ID and republishes the owner; the 128-entry
-  alias table and CPU-encoded ID layout were removed. A global 8192-slot
-  allocator advances generations on reuse and retires slots only on
+- `30439e4`: kernel Scheduler transitioned to `huesos_sched::TaskId` (global
+  slot + generation). Migration keeps the ID and republishes the owner; the
+  128-entry alias table and CPU-encoded ID layout were removed. A global
+  8192-slot allocator advances generations on reuse and retires slots only on
   generation overflow. `make test`, safety/policy gates, and QEMU debug SMP4
   pass with this layout.
+- `a871025`: preemption guards (`ExecutionGuards`) are connected to the
+  reschedule hook so the outermost guard release runs a deferred scheduler
+  tick when a task was rescheduled while preemption-disabled. This is the
+  first building block for fully preemptible kernel context switching.
+- `2118719`: added `TaskDirectory::published_id(slot)` so inbox-drain paths
+  can recover the full TaskId from a slot number without a prior locate call.
 
-The existing scheduler algorithm and token-based remote mutation remain until
-the owner-only runqueue replacement is integrated into the kernel.
+Remaining:
+
+- Remote operation inbox integration (replacing the synchronous token protocol
+  with allocation-free async bitmap wake/kill/policy operations).
+- Owner-only runqueue mutation (eliminating per-CPU scheduler ticket locks).
+- Request-based EEVDF selection replacing `tick()` linear scan and BTreeSet.
+- Job/ResourceDomain hierarchy integration.
+- Monotonic clock, TSC-deadline/one-shot timer, and cross-CPU skew report.
+- CBS, hard caps, and automatic migration.
+- Threaded IRQ, kernel IRQ thread, storm containment.
+- Topology-aware CPU selection, xAPIC/x2APIC backend.
+- SMT off/isolated/rusted gates with trust capabilities.
+- Eager XSAVE and SIMD enablement.
+- PCID/INVPCID/active address-space management.
+- Stress tests, benchmark harness, and bare-metal evidence collection.
