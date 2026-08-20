@@ -218,6 +218,173 @@ impl TaskId {
     }
 }
 
+/// Published global Task location.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TaskLocation {
+    pub owner: CpuIndex,
+    pub local_index: u16,
+}
+
+/// Directory lookup/publication failure.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DirectoryError {
+    InvalidLocalIndex,
+    StaleIdentity,
+    Busy,
+    PendingOperations,
+}
+
+/// One stable Task-directory slot. The sequence is an owner-written seqlock;
+/// readers never observe an owner from one migration generation and a local
+/// index from another.
+pub struct TaskDirectoryEntry {
+    sequence: AtomicU64,
+    published_id: AtomicU64,
+    owner: AtomicU64,
+    local_index: AtomicU64,
+    pending_operations: AtomicU64,
+}
+
+impl TaskDirectoryEntry {
+    pub const fn new() -> Self {
+        Self {
+            sequence: AtomicU64::new(0),
+            published_id: AtomicU64::new(0),
+            owner: AtomicU64::new(0),
+            local_index: AtomicU64::new(0),
+            pending_operations: AtomicU64::new(0),
+        }
+    }
+}
+
+impl Default for TaskDirectoryEntry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Fixed global mapping from stable Task slots to owner-local queue slots.
+pub struct TaskDirectory {
+    entries: [TaskDirectoryEntry; MAX_TASKS],
+}
+
+impl TaskDirectory {
+    pub const fn new() -> Self {
+        Self {
+            entries: [const { TaskDirectoryEntry::new() }; MAX_TASKS],
+        }
+    }
+
+    /// Publish or migrate an identity. Integration guarantees one owner writer
+    /// for a slot; odd/even sequence publication protects lock-free readers.
+    pub fn publish(
+        &self,
+        id: TaskId,
+        owner: CpuIndex,
+        local_index: usize,
+    ) -> Result<(), DirectoryError> {
+        if local_index >= MAX_TASKS || local_index > u16::MAX as usize {
+            return Err(DirectoryError::InvalidLocalIndex);
+        }
+        let entry = &self.entries[id.slot()];
+        let current = entry.published_id.load(Ordering::Acquire);
+        if current != 0 && current != id.raw() {
+            return Err(DirectoryError::StaleIdentity);
+        }
+        entry.sequence.fetch_add(1, Ordering::AcqRel); // odd
+        entry
+            .owner
+            .store(owner.as_usize() as u64, Ordering::Relaxed);
+        entry
+            .local_index
+            .store(local_index as u64, Ordering::Relaxed);
+        entry.published_id.store(id.raw(), Ordering::Release);
+        entry.sequence.fetch_add(1, Ordering::Release); // even
+        Ok(())
+    }
+
+    /// Read one coherent location. Contention is reported instead of spinning
+    /// without bound in IRQ-adjacent callers.
+    pub fn locate(&self, id: TaskId) -> Result<TaskLocation, DirectoryError> {
+        let entry = &self.entries[id.slot()];
+        for _ in 0..8 {
+            let before = entry.sequence.load(Ordering::Acquire);
+            if before & 1 != 0 {
+                core::hint::spin_loop();
+                continue;
+            }
+            if entry.published_id.load(Ordering::Acquire) != id.raw() {
+                return Err(DirectoryError::StaleIdentity);
+            }
+            let owner = entry.owner.load(Ordering::Relaxed) as usize;
+            let local_index = entry.local_index.load(Ordering::Relaxed) as usize;
+            let after = entry.sequence.load(Ordering::Acquire);
+            if before == after {
+                return Ok(TaskLocation {
+                    owner: CpuIndex::new(owner).ok_or(DirectoryError::StaleIdentity)?,
+                    local_index: u16::try_from(local_index)
+                        .map_err(|_| DirectoryError::InvalidLocalIndex)?,
+                });
+            }
+        }
+        Err(DirectoryError::Busy)
+    }
+
+    /// Coalesce operation flags after validating the exact generation.
+    pub fn publish_operations(&self, id: TaskId, operations: u64) -> Result<bool, DirectoryError> {
+        let entry = &self.entries[id.slot()];
+        if entry.published_id.load(Ordering::Acquire) != id.raw() {
+            return Err(DirectoryError::StaleIdentity);
+        }
+        let previous = entry
+            .pending_operations
+            .fetch_or(operations, Ordering::AcqRel);
+        Ok(previous & operations != operations)
+    }
+
+    /// Owner takes all operation flags for local application.
+    pub fn take_operations(&self, id: TaskId) -> Result<u64, DirectoryError> {
+        let entry = &self.entries[id.slot()];
+        if entry.published_id.load(Ordering::Acquire) != id.raw() {
+            return Err(DirectoryError::StaleIdentity);
+        }
+        Ok(entry.pending_operations.swap(0, Ordering::AcqRel))
+    }
+
+    /// Clear a dead identity only after every inbox/operation reference drains.
+    pub fn clear(&self, id: TaskId) -> Result<(), DirectoryError> {
+        let entry = &self.entries[id.slot()];
+        if entry.published_id.load(Ordering::Acquire) != id.raw() {
+            return Err(DirectoryError::StaleIdentity);
+        }
+        if entry.pending_operations.load(Ordering::Acquire) != 0 {
+            return Err(DirectoryError::PendingOperations);
+        }
+        entry.sequence.fetch_add(1, Ordering::AcqRel);
+        entry.published_id.store(0, Ordering::Release);
+        entry.owner.store(0, Ordering::Relaxed);
+        entry.local_index.store(0, Ordering::Relaxed);
+        entry.sequence.fetch_add(1, Ordering::Release);
+        Ok(())
+    }
+}
+
+impl Default for TaskDirectory {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Remote operation bits stored in [`TaskDirectory`].
+pub mod task_operations {
+    pub const WAKE: u64 = 1 << 0;
+    pub const KILL: u64 = 1 << 1;
+    pub const AFFINITY: u64 = 1 << 2;
+    pub const POLICY: u64 = 1 << 3;
+    pub const THROTTLE: u64 = 1 << 4;
+    pub const MIGRATION: u64 = 1 << 5;
+}
+
 /// Preemption behavior selected at boot.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PreemptionProfile {
@@ -1689,6 +1856,47 @@ mod tests {
         assert!(TaskId::new(MAX_TASKS, 1).is_none());
         assert!(TaskId::new(0, 0).is_none());
         assert!(TaskId::from_raw(0).is_none());
+    }
+
+    #[test]
+    fn task_directory_preserves_stable_id_across_owner_migration() {
+        static DIRECTORY: TaskDirectory = TaskDirectory::new();
+        let id = TaskId::new(7000, 1).unwrap_or_else(|| unreachable!());
+        DIRECTORY
+            .publish(id, cpu(1), 14)
+            .unwrap_or_else(|_| unreachable!());
+        assert_eq!(
+            DIRECTORY.locate(id),
+            Ok(TaskLocation {
+                owner: cpu(1),
+                local_index: 14,
+            })
+        );
+        DIRECTORY
+            .publish(id, cpu(9), 3)
+            .unwrap_or_else(|_| unreachable!());
+        assert_eq!(
+            DIRECTORY.locate(id),
+            Ok(TaskLocation {
+                owner: cpu(9),
+                local_index: 3,
+            })
+        );
+        assert_eq!(
+            DIRECTORY.publish_operations(id, task_operations::WAKE),
+            Ok(true)
+        );
+        assert_eq!(
+            DIRECTORY.publish_operations(id, task_operations::WAKE),
+            Ok(false)
+        );
+        assert_eq!(DIRECTORY.clear(id), Err(DirectoryError::PendingOperations));
+        assert_eq!(DIRECTORY.take_operations(id), Ok(task_operations::WAKE));
+        assert_eq!(DIRECTORY.clear(id), Ok(()));
+        assert_eq!(DIRECTORY.locate(id), Err(DirectoryError::StaleIdentity));
+        let next = id.next_generation().unwrap_or_else(|| unreachable!());
+        assert_eq!(DIRECTORY.publish(next, cpu(2), 8), Ok(()));
+        assert_eq!(DIRECTORY.locate(id), Err(DirectoryError::StaleIdentity));
     }
 
     #[test]
