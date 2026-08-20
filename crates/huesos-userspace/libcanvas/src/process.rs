@@ -5,8 +5,11 @@ mod launcher;
 mod lifecycle;
 mod objects;
 
-pub use launcher::spawn_elf;
 pub use launcher::spawn_elf_on_cpu;
-pub use launcher::{spawn_elf_from_vmo, spawn_elf_from_vmo_with_vmar};
+pub use launcher::{spawn_elf, spawn_elf_with_stack};
+pub use launcher::{
+    spawn_elf_from_vmo, spawn_elf_from_vmo_with_stack, spawn_elf_from_vmo_with_vmar,
+    spawn_elf_from_vmo_with_vmar_and_stack,
+};
 pub use lifecycle::{exit, yield_now};
 pub use objects::{Process, Thread, Vmar, CHILD_BOOTSTRAP_HANDLE};

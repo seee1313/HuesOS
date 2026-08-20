@@ -5,7 +5,7 @@
 //!
 //! Until now the volume key was baked into the kernel image at build
 //! time (`HUESOS_VOLUME_KEY_HEX`) and handed to the storage service
-//! through the `VolumeKeyGet` syscall. That is a key sitting in
+//! through the capability-gated KeyBroker path. That is still a key sitting in
 //! plaintext inside the boot image: anyone who can read the image can
 //! read the key, and "full disk encryption" against an attacker with
 //! the disk is then theatre.

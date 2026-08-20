@@ -1238,7 +1238,7 @@ tools/hxfs-install-layout.py
 tools/hxfs_image.py
 ```
 
-These are dependency-free Python tools for creating a minimal Hxfs v5 image,
+These are dependency-free Python tools for creating a minimal HxFS v6 image,
 inspecting root/checkpoint metadata, and printing an install layout plan.
 
 Stage W adds report-only fsck/scrub foundations:
@@ -1294,8 +1294,8 @@ make storage-gate
 Current status remains:
 
 ```text
-Hxfs v5 foundation schema: documented
-Hxfs v5 production freeze: not approved
+HxFS v6 policy/generation schema: documented
+HxFS v6 production freeze: not approved
 storage production-ready: false
 ```
 

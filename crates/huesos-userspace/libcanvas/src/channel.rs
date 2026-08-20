@@ -58,6 +58,17 @@ impl Channel {
         Ok(Channel::from_handle(handle))
     }
 
+    /// Replace this endpoint with a reduced-rights, non-amplifying handle.
+    ///
+    /// KeyBroker control/grant endpoints use this before transfer to remove
+    /// `DUPLICATE`; the returned capability can never recover a right omitted
+    /// here. The original handle is closed after the reduced duplicate exists.
+    pub fn restrict(self, rights: u32) -> crate::Result<Channel> {
+        let handle = self.0.duplicate(rights)?;
+        drop(self);
+        Ok(Channel::from_handle(handle))
+    }
+
     /// Create a connected pair of channel endpoints. Sending on one is
     /// received on the other, and vice versa.
     pub fn pair() -> crate::Result<(Channel, Channel)> {

@@ -72,6 +72,7 @@ pub(crate) fn sys_resource_create(
         ResourceKindAbi::DmaPool => ResourceKind::DmaPool,
         ResourceKindAbi::FrameDraw => ResourceKind::FrameDraw,
         ResourceKindAbi::SystemControl => ResourceKind::SystemControl,
+        ResourceKindAbi::VolumeKey => ResourceKind::VolumeKey,
     };
 
     // `PowerControl`, `FrameDraw` and `SystemControl` are binary
@@ -81,7 +82,10 @@ pub(crate) fn sys_resource_create(
     // keeps the caller-supplied range.
     let (mint_base, mint_len) = if matches!(
         kernel_kind,
-        ResourceKind::PowerControl | ResourceKind::FrameDraw | ResourceKind::SystemControl
+        ResourceKind::PowerControl
+            | ResourceKind::FrameDraw
+            | ResourceKind::SystemControl
+            | ResourceKind::VolumeKey
     ) {
         (0, 1)
     } else {

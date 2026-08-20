@@ -20,7 +20,7 @@
 //! This supersedes `HUESOS_VOLUME_KEY_HEX`, which baked the key into
 //! the kernel image in plaintext. The handoff *shape* is unchanged --
 //! the key still lands in `huesos_object::boot_key` and is served by
-//! the `VolumeKeyGet` syscall -- so the storage service does not need
+//! the one-shot KeyBroker handoff -- so the storage service does not need
 //! to know where the key came from. Only the source changes, from "a
 //! constant in the binary" to "unsealed by the TPM against a measured
 //! boot".

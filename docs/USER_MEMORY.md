@@ -141,10 +141,12 @@ libcanvas diagnostics module.
 
 This layer does not replace the remaining architectural work:
 
-- distinguish CPL3 faults from kernel faults and terminate only the offending
-  process;
-- add fault-recoverable copies before `VmarUnmap`;
-- enable SMEP and SMAP with explicit access windows;
-- fuzz syscall pointer/length combinations;
-- add QEMU tests that intentionally pass unmapped, read-only, boundary, and
-  kernel-half addresses.
+- enable SMEP and SMAP with explicit access windows on every CPU;
+- add coverage-guided syscall pointer/length fuzzing beyond the current
+  deterministic and QEMU adversarial matrix;
+- add a real cross-CPU mapping-mutation race probe once intra-process threads
+  are exposed to userspace.
+
+Already landed: CPL3 fault isolation, recoverable extable copies,
+`VmarUnmap`/`VmarProtect` locking and QEMU probes for unmapped, read-only and
+kernel-half pointers.

@@ -23,14 +23,10 @@ REQUIRED_PATHS = [
     Path("scripts/ci-qemu-nvme-soak.sh"),
 ]
 RUNTIME_BLOCKERS = [
-    "QEMU NVMe high queue-depth soak",
-    "driver-host-nvme runtime timeout/reset wiring",
-    "hxfs-service fixed cache integration",
-    "snapshot deletion reclaim",
-    "BlobView service operations",
-    "TPM/bootloader KeyProvider integration",
-    "full tree scrub traversal",
-    "destructive fsck repair policy approval",
+    "independent security review of KeyBroker and HxFS v6",
+    "owner-approved HxFS v6 format freeze",
+    "two-vendor disposable-NVMe bare-metal matrix",
+    "real-hardware TPM PCR success/mismatch evidence",
 ]
 
 

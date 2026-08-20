@@ -52,7 +52,7 @@ authors = ["HuesOS Team"]
 license = "MIT"
 
 [workspace.dependencies]
-spin = "0.9"
+spin = "0.9.9"
 bitflags = "2.6"
 bit_field = "0.10"
 lock_api = "0.4"

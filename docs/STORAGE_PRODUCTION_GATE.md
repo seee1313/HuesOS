@@ -3,7 +3,7 @@
 Status: **not production-ready / not format-frozen**.
 
 This document is the Stage Z gate checklist. It deliberately does **not** mark
-Hxfs v5 or the storage stack as production-ready. The current implementation is
+HxFS v6 or the storage stack as production-ready. The current implementation is
 a strong production-oriented foundation, but several runtime gates remain.
 
 ## Required gates before production-ready
@@ -105,11 +105,16 @@ seeded encrypted+compressed volume with a flipped GCM bit; the
 trace must show `[hxfs] bad-gcm-tag-marked` and
 `[hxfs] odirect-deny-ok` with the service still serving.)
 
-Mandatory runtime/architecture gates still open:
+Mandatory release-approval gates still open:
 
 ```text
-(none)
+independent security review of KeyBroker and HxFS v6
+owner-approved HxFS v6 format freeze
+two-vendor disposable-NVMe bare-metal matrix
+real-hardware TPM PCR success/mismatch evidence
 ```
+
+These cannot be closed by QEMU or by the author reviewing their own PR.
 
 Closed since the last revision:
 
@@ -172,7 +177,7 @@ a snapshot is never handed out while that snapshot lives.
 
 ## Format status
 
-Current format: **Hxfs v5 foundation**.
+Current format: **HxFS v6 foundation** (v5 read-only; explicit migration).
 
 Freeze status:
 

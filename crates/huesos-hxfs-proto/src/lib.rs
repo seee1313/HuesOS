@@ -147,7 +147,9 @@ pub fn status_for_error(error: HxfsError) -> HxfsStatus {
         HxfsError::Io => HxfsStatus::IoError,
         HxfsError::NoSpace | HxfsError::QuotaExceeded => HxfsStatus::NoSpace,
         HxfsError::Compression => HxfsStatus::IoError,
-        HxfsError::Unsupported | HxfsError::UnsupportedFormat => HxfsStatus::Unsupported,
+        HxfsError::Unsupported | HxfsError::UnsupportedFormat | HxfsError::LegacyReadOnly => {
+            HxfsStatus::Unsupported
+        }
         HxfsError::EncryptedVolumeKeyUnavailable
         | HxfsError::EncryptedPolicyUnknown
         | HxfsError::EncryptedPolicyInvalid => HxfsStatus::EncryptedUnavailable,
@@ -156,7 +158,8 @@ pub fn status_for_error(error: HxfsError) -> HxfsStatus {
         | HxfsError::BadChecksum
         | HxfsError::BadBlock
         | HxfsError::BadTree
-        | HxfsError::BadName => HxfsStatus::Invalid,
+        | HxfsError::BadName
+        | HxfsError::CompressionPolicyInvalid => HxfsStatus::Invalid,
     }
 }
 

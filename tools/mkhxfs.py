@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Create a minimal Hxfs v5 development image.
+"""Create a minimal HxFS v6 development image.
 
 Plain empty images are built in-process (memory-resident for small
 images, sparse-streaming for large ones). A seeded image (an

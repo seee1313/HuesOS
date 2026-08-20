@@ -14,6 +14,15 @@ huesos-hxfs = { path = "../../huesos-hxfs" }
 huesos-hxfs-proto = { path = "../../huesos-hxfs-proto" }
 
 [features]
+default = ["production"]
+# The production service always contains the audited crypto/compression engines
+# and Hxblob protocol. On-disk policy roots decide whether a volume uses them;
+# build features are never a mount-policy source.
+production = [
+    "huesos-hxfs/crypto-aes-gcm",
+    "huesos-hxfs/compression-engines",
+    "hxblob",
+]
 # Hxblob content-addressed object store: the native BlobView
 # protocol operations (OpenBlob/CreateBlob and the read-only view
 # handle). Separate from `synthetic-key` because this is a
@@ -26,11 +35,7 @@ hxblob = ["huesos-hxfs/hxblob"]
 # asserts on. The Stage D TPM-backed KeyProvider replaces this
 # whole path. Enabled by the soak harness via
 # HUESOS_HXFS_SERVICE_FEATURES (see huesos-kernel/build.rs).
-synthetic-key = [
-    "huesos-hxfs/crypto-aes-gcm",
-    "huesos-hxfs/compression-engines",
-    "hxblob",
-]
+synthetic-key = ["production"]
 
 [profile.release]
 opt-level = 2

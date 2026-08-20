@@ -22,38 +22,26 @@ fn main() {
 
     // Stage D bootloader key blob: the soak harness (and a real
     // bootloader chain later) feeds the volume key hex here; the
-    // kernel embeds it as a static the VolumeKeyGet syscall serves
-    // to the storage service. Without the variable the blob is
+    // kernel embeds it as a static the one-shot VolumeKeyTake syscall moves
+    // into the isolated KeyBroker. Without the variable the blob is
     // None and encrypted volumes cannot be mounted.
     emit_boot_key_blob();
 
-    // Stage B.5: the soak harness builds the ISO with
-    // HUESOS_HXFS_SERVICE_FEATURES=synthetic-key so the embedded
-    // hxfs-service can mount the encrypted+compressed soak volume
-    // and run its boot self-check. Production builds leave the
-    // variable unset and the test wiring stays out of the binary.
-    //
-    // The synthetic-key build pulls the RustCrypto AES-GCM stack
-    // into the no-SIMD userspace target. The `aes` and `polyval`
-    // crates compile their x86 fast paths (AES-NI / CLMUL) for any
-    // x86_64 target regardless of the target's SIMD features, and
-    // the userspace target deliberately disables SSE2 (kernel
-    // context switch does not save XMM state), so the fast paths
-    // crash LLVM codegen. Both crates ship the official soft
-    // escape hatch (`aes_force_soft` / `polyval_force_soft`); the
-    // flags are injected only for this build invocation and only
-    // when test features are requested.
+    // The production HxFS service always contains AES-GCM, compression and
+    // Hxblob engines; versioned on-disk policy roots decide whether they are
+    // used. `synthetic-key` now enables probes only and cannot change mount
+    // policy. The userspace target has no saved SIMD state, so RustCrypto's
+    // official software backends are mandatory for every service build.
     let hxfs_service_features = env::var("HUESOS_HXFS_SERVICE_FEATURES").unwrap_or_default();
     println!("cargo:rerun-if-env-changed=HUESOS_HXFS_SERVICE_FEATURES");
     let mut hxfs_args: Vec<String> = Vec::new();
-    let mut hxfs_env: Vec<(&str, &OsStr)> = Vec::new();
+    let hxfs_env: Vec<(&str, &OsStr)> = vec![(
+        "RUSTFLAGS",
+        OsStr::new("--cfg aes_force_soft --cfg polyval_force_soft"),
+    )];
     if !hxfs_service_features.is_empty() {
         hxfs_args.push("--features".to_string());
         hxfs_args.push(hxfs_service_features);
-        hxfs_env.push((
-            "RUSTFLAGS",
-            OsStr::new("--cfg aes_force_soft --cfg polyval_force_soft"),
-        ));
     }
     let hxfs_args_refs: Vec<&str> = hxfs_args.iter().map(String::as_str).collect();
 
@@ -128,6 +116,14 @@ fn main() {
         &[],
         &[],
     );
+    let key_broker = build_userspace_program(
+        &userspace_root,
+        "key-broker",
+        "huesos-key-broker",
+        profile,
+        &[],
+        &[],
+    );
     let doom = build_userspace_program(&userspace_root, "doom", "huesos-doom", profile, &[], &[]);
     // Soak shutdown-cycle wiring (qemu-nvme-soak inject=3): the
     // harness exports HUESOS_TERMINAL_FEATURES=soak-shutdown so the
@@ -181,6 +177,7 @@ fn main() {
             ("HUESOS_FAULT_PROBE_PATH", fault_probe.as_os_str()),
             ("HUESOS_ACPI_MANAGER_PATH", acpi_manager.as_os_str()),
             ("HUESOS_SHUTDOWN_BROKER_PATH", shutdown_broker.as_os_str()),
+            ("HUESOS_KEY_BROKER_PATH", key_broker.as_os_str()),
         ],
         &[],
     );
@@ -245,6 +242,7 @@ fn track_userspace_inputs(userspace_root: &Path) {
         "acpi-manager",
         "pci-manager",
         "shutdown-broker",
+        "key-broker",
         "terminal",
         "doom",
         "fault-probe",

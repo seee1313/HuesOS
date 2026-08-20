@@ -75,6 +75,9 @@ pub enum ResourceKind {
     /// should not have to be trusted with the latter. Minted by the
     /// root supervisor (`init`) and transferred over a channel.
     SystemControl = 7,
+    /// One-shot authority to move the boot volume key into the isolated
+    /// userspace KeyBroker. Binary capability; no address range semantics.
+    VolumeKey = 8,
 }
 
 /// Reason a `Resource::try_create*` call was rejected.

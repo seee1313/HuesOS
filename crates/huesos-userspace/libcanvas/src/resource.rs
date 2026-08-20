@@ -114,6 +114,8 @@ pub mod kind {
     pub const POWER_CONTROL: ResourceKindAbi = ResourceKindAbi::PowerControl;
     /// Preallocated DMA pool capability for userspace DriverHosts.
     pub const DMA_POOL: ResourceKindAbi = ResourceKindAbi::DmaPool;
+    /// One-shot boot volume-key transfer authority for KeyBroker.
+    pub const VOLUME_KEY: ResourceKindAbi = ResourceKindAbi::VolumeKey;
 }
 
 /// Safe wrapper over an `IoPort` [`Resource`] handle. Provides typed

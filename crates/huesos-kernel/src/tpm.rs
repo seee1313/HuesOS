@@ -3,9 +3,9 @@
 //! Wires `huesos-tpm` to real hardware: maps the CRB MMIO window at
 //! the architected address and, if a sealed volume-key blob was built
 //! into the image, unseals it into `huesos_object::boot_key` before
-//! userspace starts. The `VolumeKeyGet` syscall then serves it exactly
-//! as it served the build-time key, so the storage service is
-//! unchanged.
+//! userspace starts. The capability-gated `VolumeKeyTake` syscall then
+//! moves it exactly once into KeyBroker; the storage service receives only a
+//! generation-bound grant.
 //!
 //! # Why the key stops being a build-time constant
 //!
@@ -183,7 +183,7 @@ pub enum UnsealOutcome {
 /// Unseal the built-in sealed volume key and install it.
 ///
 /// Called during kernel init, before userspace can call
-/// `VolumeKeyGet`.
+/// `VolumeKeyTake`.
 pub fn init_volume_key() -> UnsealOutcome {
     // Probe the hardware BEFORE looking at the sealed blob. The
     // outcome is reported in the boot log and read by operators and

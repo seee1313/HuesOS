@@ -20,12 +20,12 @@ without killing the process.
 ## What changed
 
 1. New immutable capability kind
-   [`ResourceKind::FrameDraw`](../../crates/huesos-abi/src/lib.rs),
+   [`ResourceKind::FrameDraw`](../crates/huesos-abi/src/lib.rs),
    wire value `6`, kernel kind value `6`. Binary capability, no
    meaningful `base`/`len` (force `(0, 1)` at mint time, mirroring
    `PowerControl`).
 2. New ABI constant
-   [`huesos_abi::INIT_FRAME_DRAW_HANDLE = 6`](../../crates/huesos-abi/src/lib.rs).
+   [`huesos_abi::INIT_FRAME_DRAW_HANDLE = 6`](../crates/huesos-abi/src/lib.rs).
    The kernel installs a freshly-minted `FrameDraw` Resource at this
    slot in the initial process's handle table during boot, in the same
    step that installs `INIT_BOOTFS_HANDLE`, `INIT_ACPI_BROKER_HANDLE`,
@@ -33,7 +33,7 @@ without killing the process.
 3. `Syscall::FramebufferBlit = 13` now takes a `HandleValue` capability
    handle in `a1` and a `*const FramebufferBlitArgs` in `a2`. The
    kernel-side handler calls
-   [`require_resource_of_kind(a1, ResourceKind::FrameDraw)`](../../crates/huesos-syscalls/src/resource.rs)
+   [`require_resource_of_kind(a1, ResourceKind::FrameDraw)`](../crates/huesos-syscalls/src/resource.rs)
    **before** it dereferences `a2`, so a forged or stale handle cannot
    leak information about the caller's address space or about the
    kernel's framebuffer geometry.

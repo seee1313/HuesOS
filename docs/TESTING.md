@@ -289,7 +289,7 @@ kernel stops in the test image before launching userspace.
 ## Storage soak and fault injection
 
 `scripts/ci-qemu-nvme-soak.sh <profile> <seconds> <log> <mode>` boots the
-system against a real QEMU NVMe controller with an Hxfs v5 image. The
+system against a real QEMU NVMe controller with an HxFS v6 image. The
 mode selects what is seeded and which markers are required:
 
 | Mode | What it proves |

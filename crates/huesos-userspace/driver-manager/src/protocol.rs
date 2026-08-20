@@ -48,6 +48,8 @@ pub const RESOURCE_TRANSFER_COMPLETE: &str = "resource:transfer-complete";
 pub const ACPI_TABLES_VMO: &str = "acpi-tables-vmo";
 /// Init passes the unique deny-by-default ACPI broker capability.
 pub const ACPI_BROKER: &str = "acpi-broker";
+/// Init delegates the unique KeyBroker generation-grant channel.
+pub const KEY_BROKER_MANAGER: &str = "key-broker:manager-channel";
 /// DriverManager passes the archive to the isolated ACPI manager.
 pub const ACPI_MANAGER_TABLES: &str = "acpi-tables-vmo";
 /// DriverManager passes the unique broker capability to the ACPI manager.

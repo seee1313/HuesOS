@@ -17,7 +17,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Install Rust toolchain
         run: |
           rustup toolchain install nightly-2026-03-01 --profile minimal \
@@ -29,6 +29,10 @@ jobs:
         env:
           CARGO_BUILD_JOBS: "1"
         run: make clippy
+      - name: RustSec dependency audit
+        run: |
+          cargo install cargo-audit --locked --version 0.22.2
+          cargo audit --deny warnings
       - name: Host tests
         env:
           CARGO_BUILD_JOBS: "1"
@@ -37,6 +41,10 @@ jobs:
         env:
           CARGO_BUILD_JOBS: "1"
         run: make test-hxfs-features
+      - name: HxFS v5 to v6 migration gate
+        env:
+          CARGO_BUILD_JOBS: "1"
+        run: make migration-check
       # Stage E.4: the deterministic half of the report must match the
       # committed baseline byte for byte; the timing half is compared
       # against a second run in this same job, so runner-to-runner
@@ -45,7 +53,7 @@ jobs:
         run: make bench-check
       - name: Upload benchmark report
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: storage-bench
           path: build/storage-bench.json
@@ -58,9 +66,9 @@ jobs:
       fail-fast: false
       matrix:
         profile: [debug, release]
-        cpus: [1, 2]
+        cpus: [1, 2, 4, 8]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Install system dependencies
         run: |
           sudo apt-get update
@@ -78,7 +86,7 @@ jobs:
         run: bash scripts/ci-qemu-smoke.sh ${{ matrix.profile }} ${{ matrix.cpus }} 120
       - name: Upload serial log
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: qemu-${{ matrix.profile }}-smp${{ matrix.cpus }}
           path: ci-artifacts/
@@ -92,7 +100,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Install system dependencies
         run: |
           sudo apt-get update
@@ -110,7 +118,7 @@ jobs:
         run: bash scripts/ci-qemu-acpi-restart-smoke.sh release 2 120
       - name: Upload serial log
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: qemu-acpi-restart-release-smp2
           path: ci-artifacts/
@@ -136,7 +144,7 @@ jobs:
         profile: [debug, release]
         cpus: [2]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Install system dependencies
         run: |
           sudo apt-get update
@@ -154,7 +162,7 @@ jobs:
         run: bash scripts/ci-qemu-nvme-soak.sh ${{ matrix.profile }} 120
       - name: Upload serial log
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: qemu-nvme-${{ matrix.profile }}-smp${{ matrix.cpus }}
           path: ci-artifacts/
@@ -182,7 +190,7 @@ jobs:
         profile: [release]
         cpus: [2]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Install system dependencies
         run: |
           sudo apt-get update
@@ -200,7 +208,7 @@ jobs:
         run: bash scripts/ci-qemu-nvme-soak.sh ${{ matrix.profile }} 180 ci-artifacts/qemu-nvme-gcm-inject.log 1
       - name: Upload serial log
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: qemu-nvme-gcm-inject-${{ matrix.profile }}-smp${{ matrix.cpus }}
           path: ci-artifacts/
@@ -222,7 +230,7 @@ jobs:
         profile: [release]
         cpus: [2]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Install system dependencies
         run: |
           sudo apt-get update
@@ -240,7 +248,7 @@ jobs:
         run: bash scripts/ci-qemu-nvme-soak.sh ${{ matrix.profile }} 180 ci-artifacts/qemu-nvme-crc-inject.log 2
       - name: Upload serial log
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: qemu-nvme-crc-inject-${{ matrix.profile }}-smp${{ matrix.cpus }}
           path: ci-artifacts/
@@ -264,7 +272,7 @@ jobs:
         profile: [debug, release]
         cpus: [2]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Install system dependencies
         run: |
           sudo apt-get update
@@ -282,7 +290,7 @@ jobs:
         run: bash scripts/ci-qemu-nvme-soak.sh ${{ matrix.profile }} 180 ci-artifacts/qemu-nvme-no-tpm.log 6
       - name: Upload serial log
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: qemu-nvme-no-tpm-${{ matrix.profile }}-smp${{ matrix.cpus }}
           path: ci-artifacts/
@@ -306,7 +314,7 @@ jobs:
       matrix:
         profile: [debug, release]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Install system dependencies
         run: |
           sudo apt-get update
@@ -323,7 +331,7 @@ jobs:
         run: bash scripts/ci-qemu-powerfail.sh ${{ matrix.profile }} ci-artifacts 2
       - name: Upload serial logs
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: qemu-nvme-powerfail-${{ matrix.profile }}
           path: ci-artifacts/
@@ -344,7 +352,7 @@ jobs:
         profile: [release]
         cpus: [2]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Install system dependencies
         run: |
           sudo apt-get update
@@ -362,7 +370,7 @@ jobs:
         run: bash scripts/ci-qemu-nvme-soak.sh ${{ matrix.profile }} 180 ci-artifacts/qemu-nvme-shutdown-cycle.log 3
       - name: Upload serial log
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: qemu-nvme-shutdown-cycle-${{ matrix.profile }}-smp${{ matrix.cpus }}
           path: ci-artifacts/
@@ -379,7 +387,7 @@ jobs:
         profile: [release]
         cpus: [2]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Install system dependencies
         run: |
           sudo apt-get update
@@ -397,7 +405,7 @@ jobs:
         run: bash scripts/ci-qemu-nvme-soak.sh ${{ matrix.profile }} 200 ci-artifacts/qemu-nvme-stress.log 4
       - name: Upload serial log
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: qemu-nvme-stress-${{ matrix.profile }}-smp${{ matrix.cpus }}
           path: ci-artifacts/
@@ -416,7 +424,7 @@ jobs:
         profile: [release]
         cpus: [2]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Install system dependencies
         run: |
           sudo apt-get update
@@ -434,7 +442,7 @@ jobs:
         run: bash scripts/soak-long.sh 1 release ci-artifacts/long-soak
       - name: Upload serial logs
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: qemu-nvme-long-soak-${{ matrix.profile }}-smp${{ matrix.cpus }}
           path: ci-artifacts/
@@ -449,7 +457,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Install system dependencies
         run: |
           sudo apt-get update
@@ -467,7 +475,7 @@ jobs:
         run: bash scripts/ci-qemu-storage-off-smoke.sh release 2 120
       - name: Upload serial log
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: qemu-storage-off-release-smp2
           path: ci-artifacts/
@@ -493,7 +501,7 @@ jobs:
       matrix:
         profile: [debug, release]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Install system dependencies
         run: |
           sudo apt-get update
@@ -511,7 +519,7 @@ jobs:
         run: bash scripts/ci-qemu-extable-smoke.sh ${{ matrix.profile }} 2 120
       - name: Upload serial log
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: qemu-extable-${{ matrix.profile }}-smp2
           path: ci-artifacts/

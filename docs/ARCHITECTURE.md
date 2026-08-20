@@ -27,43 +27,30 @@ interaction and hands off a fully set up long-mode environment).
 
 ## Crate Structure
 
-```
-crates/
-├── huesos-boot        # Limine ELF entry point, memmap / HHDM / modules handoff
-├── huesos-arch        # x86_64: GDT/TSS, IDT, paging, SMP, LAPIC, syscall, serial
-├── huesos-hal         # Thin hardware abstraction layer
-├── huesos-pmm         # Physical memory manager (bitmap frame allocator)
-├── huesos-alloc       # Buddy + slab kernel allocator (no_std)
-├── huesos-fat         # FAT16/32 library (no_std; not yet the production VFS)
-├── huesos-object      # Kernel objects: Vmo, Channel, Process, Thread, Job, Handle/Rights
-├── huesos-abi         # Shared kernel<->userspace ABI (syscall numbers, errors)
-├── huesos-fb          # Framebuffer driver (bounds-checked blit)
-├── huesos-syscalls    # Syscall dispatch
-├── huesos-elf         # ELF64 loader
-├── huesos-uacpi       # uACPI integration: table archive, Ring-3 broker boundary
-├── huesos-kernel      # Scheduler (Fair/Deadline), SMP, process/thread, HBI parse
-├── huesos-user-alloc  # Userspace allocator
-├── huesos-lifecycle   # Policy: object/task lifecycle, bounded zombie reclamation
-├── huesos-ioapic      # Policy: I/O APIC routing (redirection codec, ISO, vectors)
-├── huesos-extable     # Policy: exception/fixup table for recoverable copies
-├── huesos-waitset     # Policy: multi-object wait (Any/All, cancel, timeout)
-├── huesos-proclife    # Policy: process lifecycle state machine (exit/wait/reap)
-├── huesos-handlemove  # Policy: handle-transfer semantics (rights, atomic move)
-├── huesos-decoder-fuzz # Host fuzz harness for ACPI decoders
-└── huesos-userspace/
-    ├── libcanvas      # Safe userspace syscall library
-    ├── init           # ring3 init
-    ├── driver-manager # userspace driver supervisor + BOOTFS FS service
-    └── ...            # driver hosts / terminal
+The root workspace contains the kernel plus host-testable `no_std` libraries;
+standalone ring-3 binaries have their own target/linker configuration.
+
+```text
+boot/kernel: huesos-boot, huesos-kernel, huesos-arch, huesos-pmm,
+             huesos-alloc, huesos-object, huesos-syscalls, huesos-abi
+hardware:    huesos-pci, huesos-ioapic, huesos-nvme, huesos-tpm,
+             huesos-uacpi, huesos-hal, huesos-fb
+storage:     huesos-hxfs, huesos-hxfs-proto, huesos-blobfs, huesos-fat
+policy/test: huesos-lifecycle, huesos-proclife, huesos-handlemove,
+             huesos-waitset, huesos-extable, huesos-quota, hues-async,
+             huesos-decoder-fuzz, huesos-scudo-fuzz
+userspace:   libcanvas, init, driver-manager, driver-host-input,
+             driver-host-nvme, hxfs-service, key-broker, acpi-manager,
+             pci-manager, shutdown-broker, terminal, doom, fault-probe
 ```
 
-Tools (outside the no_std workspace): `tools/hbi-gen` builds HBI v2.1 images.
+`tools/hbi-gen` builds HBI v2.1 images; `tools/hxfs-migrate` performs explicit
+journaled HxFS v5→v6 migration. Coverage-guided targets live under `fuzz/`.
 
-The `Policy:` crates are host-testable decision/encoding models extracted from
-the privileged paths (see the [README](../README.md) and
-[ROADMAP.md](ROADMAP.md)). They are `no_std`, dependency-free, and unit-tested
-on the host, but are not yet wired into the running kernel; each one's `docs/`
-page describes the intended privileged integration.
+Policy crates remain independently host-testable. Their documentation now
+states whether each one is a model only or is integrated into a privileged
+runtime path; the existence of a policy crate alone is never treated as
+on-target evidence.
 
 ## Boot Flow
 

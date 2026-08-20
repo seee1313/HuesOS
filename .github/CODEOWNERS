@@ -1,0 +1,8 @@
+# Security-critical low-level code requires explicit owner review.
+* @seee1313
+/crates/huesos-arch/ @seee1313
+/crates/huesos-kernel/ @seee1313
+/crates/huesos-syscalls/ @seee1313
+/crates/huesos-hxfs/ @seee1313
+/crates/huesos-tpm/ @seee1313
+/.github/workflows/ @seee1313

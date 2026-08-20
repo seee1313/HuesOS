@@ -1,4 +1,4 @@
-//! Hxfs v5 on-disk constants and stable decoded records.
+//! HxFS v6 on-disk constants and stable decoded records.
 
 /// Hxfs format GUID. Not an ASCII magic string; this is the stable format type
 /// identity used by mount validation.
@@ -6,11 +6,16 @@ pub const FORMAT_GUID: [u8; 16] = [
     0x48, 0x78, 0x66, 0x73, 0x2d, 0x48, 0x75, 0x65, 0x73, 0x4f, 0x53, 0x2d, 0x76, 0x31, 0x00, 0x01,
 ];
 
-/// Hxfs v5 linear format version. v5 adds GPT cooperation and virtual-volume
-/// topology roots to the checkpoint.
-pub const FORMAT_VERSION: u32 = 5;
-/// Hxfs v5 metadata type-system version.
-pub const TYPE_SYSTEM_VERSION: u32 = 5;
+/// HxFS v6 linear format version. v6 activates versioned policy-tree roots
+/// and stores the full 64-bit extent generation used by AEAD nonces.
+pub const FORMAT_VERSION: u32 = 6;
+/// HxFS v6 metadata type-system version.
+pub const TYPE_SYSTEM_VERSION: u32 = 6;
+/// Last read-compatible format. v5 volumes are accepted read-only and require
+/// an explicit host-tool migration before mutation.
+pub const LEGACY_FORMAT_VERSION: u32 = 5;
+/// Type-system version paired with [`LEGACY_FORMAT_VERSION`].
+pub const LEGACY_TYPE_SYSTEM_VERSION: u32 = 5;
 /// Hxfs v5 block size.
 pub const BLOCK_SIZE: usize = 4096;
 /// Hxfs v5 block size as u64.
@@ -98,8 +103,11 @@ pub const BLOCK_TYPE_EXTENT_TREE_LEAF: u32 = 21;
 pub const EXTENT_TREE_ROOT_MAGIC: u32 = 0x4558_5452; // "EXTR"
 /// Version of the extent tree root payload.
 pub const EXTENT_TREE_ROOT_VERSION: u32 = 1;
-/// Number of v2 records a leaf block holds (`4056 / 40`).
-pub const EXTENT_LEAF_RECORDS: usize = 101;
+/// Number of v6 records a leaf block holds. `83 * 48 = 3984`, which fits
+/// both a plaintext metadata payload and the 4028-byte AES-GCM envelope.
+pub const EXTENT_LEAF_RECORDS: usize = 83;
+/// Number of legacy v5 records a leaf block holds (`4056 / 40`).
+pub const LEGACY_EXTENT_LEAF_RECORDS: usize = 101;
 /// Maximum extents per object (one root + leaves).
 pub const EXTENT_TREE_MAX_RECORDS: usize = EXTENT_LEAF_RECORDS * EXTENT_LEAF_RECORDS;
 
@@ -195,12 +203,18 @@ pub const FEATURE_INCOMPAT_V4_POLICY_AND_BLOB_TREES: u64 = 1 << 4;
 pub const FEATURE_INCOMPAT_HXBLOB_INDEX: u64 = 1 << 5;
 /// Incompatible feature: v5 virtual-volume/GPT topology roots are present.
 pub const FEATURE_INCOMPAT_V5_VOLUME_TOPOLOGY: u64 = 1 << 6;
-/// Incompatible features required for a normal v5 mutable Hxfs image.
-pub const BASE_INCOMPAT_FEATURES: u64 = FEATURE_INCOMPAT_V2_ROOT_STORE
+/// Incompatible features required by a legacy v5 image.
+pub const LEGACY_BASE_INCOMPAT_FEATURES: u64 = FEATURE_INCOMPAT_V2_ROOT_STORE
     | FEATURE_INCOMPAT_MUTABLE_JOURNAL
     | FEATURE_INCOMPAT_V3_STORAGE_TREES
     | FEATURE_INCOMPAT_V4_POLICY_AND_BLOB_TREES
     | FEATURE_INCOMPAT_V5_VOLUME_TOPOLOGY;
+/// Incompatible feature: policy roots are authoritative and extent records
+/// carry a full 64-bit generation.
+pub const FEATURE_INCOMPAT_V6_POLICY_TABLES_AND_GENERATION: u64 = 1 << 8;
+/// Incompatible features required for a normal v6 mutable HxFS image.
+pub const BASE_INCOMPAT_FEATURES: u64 =
+    LEGACY_BASE_INCOMPAT_FEATURES | FEATURE_INCOMPAT_V6_POLICY_TABLES_AND_GENERATION;
 /// Incompatible feature: v6 encrypted metadata blocks are present.
 /// A v5 reader that does not know this feature must reject the
 /// volume with [`HxfsError::UnsupportedFormat`] rather than try
@@ -214,7 +228,8 @@ pub const FEATURE_INCOMPAT_V6_ENCRYPTED_METADATA: u64 = 1 << 7;
 pub const SUPPORTED_INCOMPAT_FEATURES: u64 = BASE_INCOMPAT_FEATURES
     | FEATURE_INCOMPAT_QUOTA_ENFORCEMENT
     | FEATURE_INCOMPAT_HXBLOB_INDEX
-    | FEATURE_INCOMPAT_V6_ENCRYPTED_METADATA;
+    | FEATURE_INCOMPAT_V6_ENCRYPTED_METADATA
+    | FEATURE_INCOMPAT_V6_POLICY_TABLES_AND_GENERATION;
 /// Compatible features supported by this implementation.
 pub const SUPPORTED_COMPAT_FEATURES: u64 = 0;
 /// Read-only-compatible features supported by this implementation.

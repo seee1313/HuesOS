@@ -21,19 +21,61 @@ pub fn current_cpu() -> crate::Result<usize> {
     raw::decode(value).map(|cpu| cpu as usize)
 }
 
-/// Copy the bootloader volume key blob (Stage D key handoff).
+/// In-memory boot volume key owned by KeyBroker.
 ///
-/// `Ok(None)` when this kernel build has no key blob (plain-volume
-/// deployments); an encrypted volume then cannot be mounted, which
-/// is the Stage D security gate. The storage service passes the
-/// key to `Hxfs::mount_with_keys`.
-pub fn get_volume_key() -> crate::Result<Option<[u8; 32]>> {
+/// This type deliberately has no `Debug`, `Clone`, or `Copy` implementation.
+/// Its bytes are cleared on drop before the backing stack/heap memory can be
+/// reused.
+pub struct VolumeKey([u8; 32]);
+
+impl VolumeKey {
+    /// Construct from a validated KeyBroker reply.
+    ///
+    /// This does not grant authority by itself: the bytes can only arrive over
+    /// the generation-bound channel endpoint DriverManager transferred to the
+    /// supervised HxFS process.
+    pub fn from_broker_reply(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
+    /// Borrow the key for subkey derivation or a single-use broker reply.
+    pub fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+impl Drop for VolumeKey {
+    fn drop(&mut self) {
+        for byte in self.0.iter_mut() {
+            *byte = 0;
+            let _ = core::hint::black_box(*byte);
+        }
+    }
+}
+
+/// Atomically move the boot volume key out of the kernel.
+///
+/// `authority` must name the unique `ResourceKind::VolumeKey` capability
+/// minted by init for KeyBroker. The syscall is one-shot: after a successful
+/// call the kernel no longer retains the key. `Ok(None)` means this boot has no
+/// sealed/build-time key and only plain volumes may mount.
+pub fn take_volume_key(authority: &crate::Handle) -> crate::Result<Option<VolumeKey>> {
     let mut key = [0u8; 32];
-    let ret = raw::syscall1(Syscall::VolumeKeyGet, &mut key as *mut [u8; 32] as u64);
+    let ret = raw::syscall2(
+        Syscall::VolumeKeyTake,
+        authority.raw() as u64,
+        &mut key as *mut [u8; 32] as u64,
+    );
     match raw::decode(ret) {
-        Ok(_) => Ok(Some(key)),
+        Ok(_) => Ok(Some(VolumeKey(key))),
         Err(crate::ErrorCode::NotFound) => Ok(None),
-        Err(error) => Err(error),
+        Err(error) => {
+            for byte in key.iter_mut() {
+                *byte = 0;
+                let _ = core::hint::black_box(*byte);
+            }
+            Err(error)
+        }
     }
 }
 

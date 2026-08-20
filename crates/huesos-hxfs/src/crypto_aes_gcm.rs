@@ -26,14 +26,12 @@
 //!
 //! # Nonce construction
 //!
-//! The 12-byte nonce is built from the block LBA and the volume
-//! UUID: `nonce[0..4] = lba.to_le_bytes()`, `nonce[4..12] =
-//! volume_uuid[0..8]`. This is deterministic (so the block can be
-//! re-decrypted without storing a nonce on disk) and gives a unique
-//! `(volume_id, block_lba)` pair per block. GCM requires unique
-//! nonces per (key, plaintext) pair; `(volume_id, block_lba)` is
-//! unique by construction because block LBAs do not collide across
-//! volumes that have distinct UUIDs.
+//! The 12-byte nonce is `LBA[0..4] || generation[0..8]`. HxFS v6 persists
+//! the complete 64-bit generation in each extent record and binds the full
+//! `(LBA, generation, UUID)` tuple as AAD. Reissued blocks therefore never
+//! repeat a `(key, nonce)` pair. The 32-bit LBA field deliberately caps an
+//! encrypted volume at 16 TiB; larger LBAs fail closed. Cross-volume separation
+//! comes from HKDF with the full UUID as salt.
 //!
 //! # Authentication
 //!
@@ -80,6 +78,8 @@ pub enum AeadError {
     /// The RustCrypto `aes-gcm` crate rejected the key or nonce
     /// shape. This should be unreachable for the sizes we use.
     EngineError,
+    /// LBA exceeds the v6 encrypted-volume nonce domain (16 TiB).
+    NonceDomainExceeded,
 }
 
 /// Encrypt a 4 KiB block of plaintext under a 32-byte subkey.
@@ -107,7 +107,7 @@ pub fn encrypt_block(
         return Err(AeadError::PlaintextTooLong);
     }
     let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(key));
-    let nonce_bytes = build_nonce(lba, generation, volume_uuid);
+    let nonce_bytes = build_nonce(lba, generation, volume_uuid)?;
     let nonce = Nonce::from_slice(&nonce_bytes);
 
     // The RustCrypto `Aead::encrypt` takes the AAD separately; we
@@ -162,7 +162,7 @@ pub fn decrypt_block(
     // means a stale ciphertext left behind by a previous tenant of a
     // reused block is rejected here rather than decrypted as if it
     // belonged to the current file.
-    let expected_nonce = build_nonce(lba, generation, volume_uuid);
+    let expected_nonce = build_nonce(lba, generation, volume_uuid)?;
     let on_disk_nonce = &ciphertext_with_nonce[..NONCE_BYTES];
     if on_disk_nonce != expected_nonce {
         // The nonce on disk does not match what we expect for this
@@ -188,39 +188,20 @@ pub fn decrypt_block(
     Ok(plaintext.len())
 }
 
-/// Build the 12-byte GCM nonce from a block LBA and a volume UUID.
+/// Build the HxFS v6 12-byte GCM nonce.
 ///
-/// Layout: `B0..=B3` = `lba.to_le_bytes()[..4]` (low 4 bytes of the
-/// LBA), `B4..=B11` = `volume_uuid[0..8]`. The high 4 bytes of the
-/// 64-bit LBA are unused; the full 16-byte UUID is mixed into the
-/// AAD instead.
-fn build_nonce(lba: u64, generation: u64, volume_uuid: &[u8; 16]) -> [u8; NONCE_BYTES] {
+/// Layout: low 32 bits of LBA followed by the complete 64-bit generation.
+/// The full UUID is authenticated as AAD and separates the HKDF-derived key.
+fn build_nonce(
+    lba: u64,
+    generation: u64,
+    _volume_uuid: &[u8; 16],
+) -> Result<[u8; NONCE_BYTES], AeadError> {
+    let lba = u32::try_from(lba).map_err(|_| AeadError::NonceDomainExceeded)?;
     let mut nonce = [0u8; NONCE_BYTES];
-    let lba_bytes = lba.to_le_bytes();
-    let generation_bytes = generation.to_le_bytes();
-    // 48 bits of block address, 32 bits of generation, 16 bits of UUID.
-    //
-    // The generation is what makes a *reused* block safe: the same
-    // LBA written twice gets two different nonces, so the (key,
-    // nonce) pair is never repeated. Without it, reusing a block
-    // would repeat a GCM nonce, which leaks the XOR of the two
-    // plaintexts and — far worse — the GHASH authentication key,
-    // letting an attacker forge tags. The filesystem currently only
-    // ever bumps `next_lba`, which is the sole reason the old
-    // (lba, uuid) nonce was sound; block reuse is what this field
-    // is here to permit.
-    //
-    // Widening the block field from 32 to 48 bits also closes a
-    // latent aliasing bug: at 32 bits, block N and block N + 2^32
-    // (16 TiB apart) shared a nonce.
-    nonce[..6].copy_from_slice(&lba_bytes[..6]);
-    nonce[6..10].copy_from_slice(&generation_bytes[..4]);
-    // The UUID is not a secret and provides no replay protection —
-    // cross-volume separation comes from the per-volume HKDF subkey,
-    // and the full UUID stays in the AAD. Two bytes here are enough
-    // to keep volumes from colliding in the clear.
-    nonce[10..NONCE_BYTES].copy_from_slice(&volume_uuid[..NONCE_BYTES - 10]);
-    nonce
+    nonce[..4].copy_from_slice(&lba.to_le_bytes());
+    nonce[4..12].copy_from_slice(&generation.to_le_bytes());
+    Ok(nonce)
 }
 
 /// Build the additional authenticated data for the AEAD.
@@ -371,12 +352,10 @@ mod tests {
         let key = test_key();
         let id_a = test_volume_id();
         // Byte 5 of the UUID no longer reaches the nonce: the nonce
-        // now spends its 12 bytes on 48 bits of block address, 32
-        // bits of generation, and only the first 2 UUID bytes. The
-        // full UUID is still bound through the AAD, so a ciphertext
-        // still cannot be replayed onto another volume — the tag
-        // stops it even when the nonce is identical. Assert that
-        // stronger property directly.
+        // v6 spends all 12 nonce bytes on LBA + the complete generation.
+        // Volume separation comes from the per-volume HKDF key in production,
+        // while the full UUID is also bound through AAD. This unit test uses
+        // one direct test key, so it proves the AAD anti-transplant property.
         let mut id_b = id_a;
         id_b[5] ^= 0x01;
         let plaintext = b"same plaintext, different volume";
@@ -397,7 +376,8 @@ mod tests {
             Err(AeadError::BadTag),
             "a ciphertext must not verify under a different volume UUID"
         );
-        // A UUID byte that *is* in the nonce window still moves it.
+        // UUID is intentionally absent from the nonce; production derives a
+        // different key for each UUID and AAD authenticates it in this layer.
         let mut id_c = id_a;
         id_c[0] ^= 0x01;
         let mut ct_c = [0u8; 128];
@@ -405,7 +385,7 @@ mod tests {
             assert!(false, "encrypt must succeed");
             return;
         };
-        assert_ne!(&ct_a[..NONCE_BYTES], &ct_c[..NONCE_BYTES]);
+        assert_eq!(&ct_a[..NONCE_BYTES], &ct_c[..NONCE_BYTES]);
     }
     /// The property that lets the allocator reuse a block at all: the
     /// same LBA under a different generation must produce a different
@@ -478,9 +458,12 @@ mod tests {
     fn nonces_are_unique_across_blocks_and_generations() {
         let id = test_volume_id();
         let mut seen: alloc::vec::Vec<[u8; NONCE_BYTES]> = alloc::vec::Vec::new();
-        for block in [0u64, 1, 2, 4095, 4096, 1 << 20, (1 << 32) - 1, 1 << 32] {
-            for generation in [0u64, 1, 2, 255, 65_535, (1 << 32) - 1] {
-                let nonce = build_nonce(block, generation, &id);
+        for block in [0u64, 1, 2, 4095, 4096, 1 << 20, (1 << 32) - 1] {
+            for generation in [0u64, 1, 2, 255, 65_535, 1 << 32, u64::MAX] {
+                let Ok(nonce) = build_nonce(block, generation, &id) else {
+                    assert!(false, "nonce-domain pair must encode");
+                    return;
+                };
                 assert!(
                     !seen.contains(&nonce),
                     "nonce collision at block {block} generation {generation}"
@@ -490,16 +473,15 @@ mod tests {
         }
     }
 
-    /// The old layout truncated the LBA to 32 bits, so block N and
-    /// block N + 2^32 shared a nonce on a volume past 16 TiB. The
-    /// widened field must keep them apart.
+    /// v6 spends the nonce bits on the complete generation and therefore
+    /// fails closed beyond the explicit 16 TiB encrypted-volume domain.
     #[test]
-    fn blocks_four_gigablocks_apart_no_longer_alias() {
+    fn block_beyond_nonce_domain_is_rejected() {
         let id = test_volume_id();
-        assert_ne!(
-            build_nonce(7, 0, &id),
-            build_nonce(7 + (1u64 << 32), 0, &id),
-            "48-bit block field must distinguish blocks 2^32 apart"
+        assert!(build_nonce(u32::MAX as u64, u64::MAX, &id).is_ok());
+        assert_eq!(
+            build_nonce(u32::MAX as u64 + 1, 0, &id),
+            Err(AeadError::NonceDomainExceeded)
         );
     }
 }
