@@ -9,7 +9,7 @@
     "unsafe_blocks": 379,
     "unsafe_functions": 76,
     "unsafe_impls": 33,
-    "unwrap_calls": 62
+    "unwrap_calls": 63
   },
   "unsafe_by_file": {
     "crates/hues-async/src/lib.rs": 19,

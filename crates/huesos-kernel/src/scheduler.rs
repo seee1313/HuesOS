@@ -30,8 +30,8 @@ use huesos_sched::{
     clock::TscClock,
     eevdf::{EevdfKey, EevdfTree},
     job::{JobId, JobState},
-    task_operations, CpuIndex, TaskDirectory, TaskId as V2TaskId, TaskInbox, TaskLocation,
-    TaskSlotAllocator,
+    task_operations, AdmissionControl, CbsReservation, CpuIndex, TaskDirectory, TaskId as V2TaskId,
+    TaskInbox, TaskLocation, TaskSlotAllocator,
 };
 use x86_64::VirtAddr;
 
@@ -57,6 +57,12 @@ static CPU_INBOX: [TaskInbox; MAX_CPUS] = [const { TaskInbox::new() }; MAX_CPUS]
 /// Kernel Job accounting. Slot 0 is the root/system Job; all tasks default
 /// to it until a privileged policy assigns them a resource domain.
 static JOB_TABLE: spin::Once<RankedIrqSafeTicketLock<JobState<MAX_CPUS>>> = spin::Once::new();
+/// Per-CPU CBS + threaded-IRQ admission ceilings. The initial 80% ceiling is
+/// shared by all reservations on a CPU; the remaining 20% is reserved for
+/// Fair work, hard IRQs, IPIs, and scheduler overhead.
+static CBS_ADMISSION: [RankedIrqSafeTicketLock<AdmissionControl>; MAX_CPUS] = [const {
+    RankedIrqSafeTicketLock::new(AdmissionControl::production_default(), LockRank::SCHEDULER)
+}; MAX_CPUS];
 
 /// Resolve a Task ID to its current owner and owner-local queue slot.
 fn task_location(id: u64) -> Option<TaskLocation> {
@@ -972,6 +978,47 @@ pub fn monotonic_ns() -> u64 {
 /// Whether the TSC clock is invariant (non-degraded).
 pub fn tsc_clock_invariant() -> bool {
     huesos_arch::lapic::tsc_invariant()
+}
+
+/// Try to reserve CBS/IRQ CPU bandwidth on `cpu`.
+///
+/// Returns `Ok(())` when the reservation fits under the shared 80% ceiling;
+/// `Err(())` when it would overcommit. Reservations are owned by the
+/// scheduling-control capability layer; ordinary threads cannot create them.
+/// A successful reservation must later be released with [`cbs_release`] or
+/// the CPU admission budget will leak.
+pub fn cbs_try_admit(cpu: usize, capacity_ns: u64, period_ns: u64) -> Result<(), ()> {
+    if cpu >= MAX_CPUS {
+        return Err(());
+    }
+    let Ok(reservation) = CbsReservation::new(capacity_ns, period_ns, period_ns) else {
+        return Err(());
+    };
+    CBS_ADMISSION[cpu]
+        .lock()
+        .reserve(reservation)
+        .map(|_| ())
+        .map_err(|_| ())
+}
+
+/// Release previously admitted CBS/IRQ bandwidth on `cpu`.
+pub fn cbs_release(cpu: usize, capacity_ns: u64, period_ns: u64) -> Result<(), ()> {
+    if cpu >= MAX_CPUS {
+        return Err(());
+    }
+    let Ok(reservation) = CbsReservation::new(capacity_ns, period_ns, period_ns) else {
+        return Err(());
+    };
+    let ppm = reservation.utilization_ppm().map_err(|_| ())?;
+    CBS_ADMISSION[cpu].lock().release_ppm(ppm).map_err(|_| ())
+}
+
+/// Current admitted utilization on `cpu` in ppm (0..1_000_000).
+pub fn cbs_admitted_ppm(cpu: usize) -> u32 {
+    if cpu >= MAX_CPUS {
+        return 0;
+    }
+    CBS_ADMISSION[cpu].lock().admitted_ppm()
 }
 
 /// Set the scheduling policy for a task by its ID.
