@@ -41,23 +41,25 @@ impl TscClock {
         // 1e9 * 2^shift / f rounded up. Choose the largest shift that keeps
         // multiplier < 2^32 so the multiply fits comfortably in 64 bits for
         // reasonable cycle deltas (we use 128-bit mul anyway).
-        let mut shift = 32u32;
-        let mut multiplier = 0u64;
+        // Largest shift that keeps the multiplier <= u64::MAX.
+        let mut shift = 64u32;
         loop {
+            if shift == 0 {
+                return Err(ClockError::Overflow);
+            }
             let scaled = 1_000_000_000u128
                 .checked_shl(shift)
                 .ok_or(ClockError::Overflow)?;
             let m = scaled.div_ceil(u128::from(frequency_hz));
-            if m > u128::from(u64::MAX) {
-                if shift == 0 {
-                    return Err(ClockError::Overflow);
-                }
-                shift -= 1;
-                continue;
+            if m <= u128::from(u64::MAX) {
+                break;
             }
-            multiplier = m as u64;
-            break;
+            shift -= 1;
         }
+        let scaled = 1_000_000_000u128
+            .checked_shl(shift)
+            .ok_or(ClockError::Overflow)?;
+        let multiplier = scaled.div_ceil(u128::from(frequency_hz)) as u64;
         Ok(Self {
             frequency_hz,
             multiplier,

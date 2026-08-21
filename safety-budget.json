@@ -2,11 +2,11 @@
   "rust_files": 230,
   "rust_lines": 81753,
   "totals": {
-    "expect_calls": 77,
+    "expect_calls": 78,
     "panic_macros": 13,
     "static_mut": 1,
     "todo_markers": 1,
-    "unsafe_blocks": 377,
+    "unsafe_blocks": 379,
     "unsafe_functions": 76,
     "unsafe_impls": 33,
     "unwrap_calls": 51
@@ -26,7 +26,7 @@
     "crates/huesos-arch/src/x86_64/idt.rs": 5,
     "crates/huesos-arch/src/x86_64/interrupts.rs": 2,
     "crates/huesos-arch/src/x86_64/ioapic.rs": 3,
-    "crates/huesos-arch/src/x86_64/lapic.rs": 14,
+    "crates/huesos-arch/src/x86_64/lapic.rs": 16,
     "crates/huesos-arch/src/x86_64/mod.rs": 6,
     "crates/huesos-arch/src/x86_64/paging.rs": 34,
     "crates/huesos-arch/src/x86_64/pit.rs": 1,

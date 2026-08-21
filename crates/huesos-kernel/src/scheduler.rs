@@ -27,6 +27,7 @@ use huesos_arch::{LockRank, RankedIrqSafeTicketLock};
 use huesos_lifecycle::{InsertOutcome, TaskGraveyard};
 use huesos_object::{KernelObject, Process};
 use huesos_sched::{
+    clock::TscClock,
     eevdf::{EevdfKey, EevdfTree},
     task_operations, CpuIndex, TaskDirectory, TaskId as V2TaskId, TaskInbox, TaskLocation,
     TaskSlotAllocator,
@@ -213,6 +214,11 @@ fn acquire_runqueue_token(cpu: usize) -> Option<RunqueueTokenGuard> {
 /// Hardware-timer-driven monotonic clock. Only CPU 0 advances it, so SMP does
 /// not make time run faster. Cooperative yields never affect this clock.
 static MONOTONIC_TICKS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Fixed-point TSC clock, calibrated once during late init. Used for
+/// nanosecond scheduling time; the periodic LAPIC tick remains the wait
+/// clock until the tickless deadline path replaces it.
+static TSC_CLOCK: spin::Once<TscClock> = spin::Once::new();
 
 /// Mark the current CPU as online for task placement.
 pub fn mark_cpu_online() {
@@ -610,6 +616,16 @@ fn run_current_cpu_scheduler_interrupt(hardware_tick: bool) {
 /// Initialize the scheduler for the current CPU and register the timer callback.
 /// Called once per CPU.
 pub fn init() {
+    // Calibrate the TSC once (on whichever CPU reaches init first; all APs
+    // share the BSP-derived frequency via the static).
+    TSC_CLOCK.call_once(|| {
+        let hz = huesos_arch::lapic::calibrate_tsc_hz();
+        TscClock::from_frequency(hz).unwrap_or_else(|_| {
+            // Fallback: 1 GHz keeps conversions finite even if calibration
+            // is unusable; the boot log below flags it as degraded.
+            TscClock::from_frequency(1_000_000_000).expect("1 GHz fallback")
+        })
+    });
     let was_enabled = x86_64::instructions::interrupts::are_enabled();
     huesos_arch::interrupts::disable();
     let cpu = cpu_id();
@@ -912,6 +928,22 @@ pub(crate) fn mark_user_entry_consumed(task_id: u64) {
 /// fine; we use the current CPU's scheduler ticks).
 pub fn global_ticks() -> u64 {
     MONOTONIC_TICKS.load(Ordering::SeqCst)
+}
+
+/// Monotonic time in nanoseconds derived from the invariant TSC.
+///
+/// Returns 0 before `scheduler::init` has calibrated the clock. Degraded
+/// (approximate) when the TSC is not invariant.
+pub fn monotonic_ns() -> u64 {
+    let Some(clock) = TSC_CLOCK.get() else {
+        return 0;
+    };
+    clock.cycles_to_ns(huesos_arch::rdtsc())
+}
+
+/// Whether the TSC clock is invariant (non-degraded).
+pub fn tsc_clock_invariant() -> bool {
+    huesos_arch::lapic::tsc_invariant()
 }
 
 /// Set the scheduling policy for a task by its ID.

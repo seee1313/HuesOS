@@ -241,6 +241,57 @@ pub unsafe fn timer_arm_tsc_deadline(deadline_tsc: u64, vector: u8) {
     }
 }
 
+/// Whether the TSC is invariant (stable across P/C states).
+///
+/// Invariant TSC is reported by CPUID.7.0:EDX[8] on modern x86. Without it,
+/// TSC-based timing is degraded (frequency may change); callers must treat
+/// the clock as approximate.
+pub fn tsc_invariant() -> bool {
+    let leaf7 = core::arch::x86_64::__cpuid(0x7);
+    let leaf8000 = core::arch::x86_64::__cpuid(0x8000_0007);
+    leaf7.edx & (1 << 8) != 0 && leaf8000.edx & (1 << 8) != 0
+}
+
+/// Calibrate the TSC frequency against the PIT (50 ms window).
+///
+/// Returns cycles per second. Disables interrupts for the measurement.
+/// Rough but adequate for scheduler accounting; the periodic LAPIC timer
+/// remains the authoritative tick source.
+pub fn calibrate_tsc_hz() -> u64 {
+    use x86_64::instructions::port::Port;
+    let saved = x86_64::instructions::interrupts::are_enabled();
+    x86_64::instructions::interrupts::disable();
+    let mut cmd: Port<u8> = Port::new(0x43);
+    let mut data0: Port<u8> = Port::new(0x40);
+    const DIVIDER: u16 = 59_659; // 50 ms @ 1.193182 MHz
+    unsafe {
+        cmd.write(0x30);
+        data0.write((DIVIDER & 0xFF) as u8);
+        data0.write((DIVIDER >> 8) as u8);
+    }
+    let start = crate::rdtsc();
+    unsafe {
+        let mut last = 0xFFFFu16;
+        while (data0.read() as u16) != last {
+            last = data0.read() as u16;
+        }
+        loop {
+            let a = data0.read() as u16;
+            let b = data0.read() as u16;
+            if a == b && b != last {
+                break;
+            }
+        }
+    }
+    let end = crate::rdtsc();
+    if saved {
+        x86_64::instructions::interrupts::enable();
+    }
+    let delta = end.wrapping_sub(start);
+    // 50 ms => cycles * 20 per second.
+    delta.saturating_mul(20).max(1)
+}
+
 /// Calibrate the LAPIC timer against the PIT.
 /// Returns the initial count value for ~100 Hz periodic timer.
 pub fn calibrate_timer() -> u32 {
