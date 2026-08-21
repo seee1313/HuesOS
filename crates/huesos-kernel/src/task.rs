@@ -55,6 +55,8 @@ pub struct Task {
     pub startup_pending: core::sync::atomic::AtomicBool,
     /// Scheduling policy.
     pub sched_policy: crate::scheduler::SchedPolicy,
+    /// Resource/Job domain this task is charged to. Defaults to the root job.
+    pub job_id: huesos_sched::job::JobId,
     /// Nested preemption/migration guards carried with this Task across CPU
     /// switches. The scheduler installs its stable address into CpuLocal.
     pub execution_guards: huesos_sched::ExecutionGuards,
@@ -87,6 +89,7 @@ impl Task {
                 vruntime: 0,
             },
             execution_guards: huesos_sched::ExecutionGuards::new(),
+            job_id: huesos_sched::job::JobId::ROOT,
         }
     }
 
@@ -107,6 +110,7 @@ impl Task {
                 vruntime: 0,
             },
             execution_guards: huesos_sched::ExecutionGuards::new(),
+            job_id: huesos_sched::job::JobId::ROOT,
         }
     }
 
@@ -140,6 +144,7 @@ impl Task {
                 vruntime: 0,
             },
             execution_guards: huesos_sched::ExecutionGuards::new(),
+            job_id: huesos_sched::job::JobId::ROOT,
         }
     }
 
@@ -180,6 +185,7 @@ impl Task {
                 vruntime: 0,
             },
             execution_guards: huesos_sched::ExecutionGuards::new(),
+            job_id: huesos_sched::job::JobId::ROOT,
         }
     }
 

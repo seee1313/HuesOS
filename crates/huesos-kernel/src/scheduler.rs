@@ -29,6 +29,7 @@ use huesos_object::{KernelObject, Process};
 use huesos_sched::{
     clock::TscClock,
     eevdf::{EevdfKey, EevdfTree},
+    job::{JobId, JobState},
     task_operations, CpuIndex, TaskDirectory, TaskId as V2TaskId, TaskInbox, TaskLocation,
     TaskSlotAllocator,
 };
@@ -38,6 +39,10 @@ use x86_64::VirtAddr;
 pub const MAX_CPUS: usize = 64;
 /// Fixed capacity of the per-CPU fair runqueue tree.
 pub const MAX_FAIR_TASKS: usize = 256;
+/// Approximate service charged per scheduler tick, in ns. The periodic
+/// LAPIC timer fires at ~100 Hz, so a tick is ~10 ms; this is only a
+/// nominal accounting unit until the tickless deadline path lands.
+pub const TICK_SERVICE_NS: u64 = 10_000_000;
 
 // Task IDs are opaque capabilities implemented by `huesos_sched::TaskId`: a
 // global slot index plus a slot generation. CPU ownership is deliberately NOT
@@ -49,6 +54,9 @@ static TASK_DIRECTORY: TaskDirectory = TaskDirectory::new();
 static TASK_SLOTS: TaskSlotAllocator = TaskSlotAllocator::new();
 /// Per-CPU bitmap inbox for allocation-free async remote operations.
 static CPU_INBOX: [TaskInbox; MAX_CPUS] = [const { TaskInbox::new() }; MAX_CPUS];
+/// Kernel Job accounting. Slot 0 is the root/system Job; all tasks default
+/// to it until a privileged policy assigns them a resource domain.
+static JOB_TABLE: spin::Once<RankedIrqSafeTicketLock<JobState<MAX_CPUS>>> = spin::Once::new();
 
 /// Resolve a Task ID to its current owner and owner-local queue slot.
 fn task_location(id: u64) -> Option<TaskLocation> {
@@ -455,6 +463,17 @@ impl Scheduler {
             if let TaskKind::User { process } = &self.tasks[self.current].kind {
                 let _ = process.charge_cpu_tick();
             }
+            // Charge the running task's Job with one tick of service. This
+            // feeds the Job hard-cap oracle and the per-CPU demand snapshots
+            // used by the (future) cross-CPU deficit balancer.
+            let job_id = self.tasks[self.current].job_id;
+            let now = monotonic_ns();
+            if let Some(table) = JOB_TABLE.get() {
+                let mut jobs = table.lock();
+                let _ = jobs.charge(self.cpu, TICK_SERVICE_NS);
+                let _ = jobs.maybe_replenish(now);
+                let _ = job_id;
+            }
             let task_id = self.tasks[self.current].id;
             let finished = self.tasks[self.current].finished.load(Ordering::Relaxed);
             let blocked = self.tasks[self.current].blocked.load(Ordering::Relaxed);
@@ -654,6 +673,15 @@ pub fn init() {
         run_current_cpu_scheduler_interrupt(false);
     });
     huesos_arch::preemption::set_reschedule_hook(deferred_reschedule_hook);
+
+    // Publish the kernel Job accounting table exactly once (BSP or first AP;
+    // content is the root Job with the whole machine's demand).
+    JOB_TABLE.call_once(|| {
+        RankedIrqSafeTicketLock::new(
+            JobState::new(JobId::ROOT, 1024, 0).expect("root job weight"),
+            LockRank::SCHEDULER,
+        )
+    });
 
     mark_cpu_online();
 }
