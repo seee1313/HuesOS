@@ -2875,3 +2875,42 @@ reporting success to the caller.
 All other safety keys are unchanged: no unsafe code was added, the tree itself
 remains `#![forbid(unsafe_code)]`, and the randomized invariant test still
 passes (including the restored `rebalance_after_insert` path).
+
+## Scheduler v2: allocation-free remote wake inbox
+
+### Change
+
+`wake_task` no longer acquires a remote runqueue token (which could spin for
+100k iterations). Same-CPU wakes apply directly under the local scheduler
+lock; remote wakes publish a `WAKE` operation into the target CPU's
+fixed-size bitmap inbox (`CPU_INBOX[cpu].publish`) and send at most one
+coalesced reschedule IPI. The owner drains the inbox at its next scheduler
+entry and applies the wake under its own lock.
+
+### Budget delta
+
+- `unsafe_blocks: 375 -> 376` (+1)
+- `unsafe_functions: 74 -> 75` (+1)
+- All other keys unchanged.
+
+### Why the new unsafe surface is bounded
+
+The added unsafe surface is exactly the two call sites of the extracted
+`apply_local_wake` helper, which mutates `guard.tasks[idx]` while the caller
+holds the scheduler lock and after `task_matches` validated both `idx` and
+the full identity. Both call sites are:
+
+1. `process_inbox_wake` — local lock held, `idx` from the directory
+   location validated by `task_matches(raw_id)`;
+2. the same-CPU branch of `wake_task` — local lock held, `idx` from
+   `task_location(task_id)` validated by `task_matches(task_id)`.
+
+The helper is `unsafe fn` because it takes `&mut Scheduler` (not a guard) and
+mutates `tasks[idx]`; the safety contract is the caller-owned lock plus the
+identity check. No raw pointer arithmetic, no lifetime extension, no
+unbounded access. This mirrors the TPM/EEVDF audit pattern: growth is the
+mechanism, not unsafe code.
+
+The remote-wake path itself is 100% safe: `TaskInbox::publish` is atomic
+`fetch_or`, `TaskDirectory::publish_operations` is a validated `fetch_or`,
+and the IPI is coalesced by the inbox's armed flag.

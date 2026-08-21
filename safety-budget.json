@@ -6,8 +6,8 @@
     "panic_macros": 13,
     "static_mut": 1,
     "todo_markers": 1,
-    "unsafe_blocks": 375,
-    "unsafe_functions": 74,
+    "unsafe_blocks": 376,
+    "unsafe_functions": 75,
     "unsafe_impls": 33,
     "unwrap_calls": 47
   },

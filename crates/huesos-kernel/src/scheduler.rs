@@ -28,7 +28,8 @@ use huesos_lifecycle::{InsertOutcome, TaskGraveyard};
 use huesos_object::{KernelObject, Process};
 use huesos_sched::{
     eevdf::{EevdfKey, EevdfTree},
-    CpuIndex, TaskDirectory, TaskId as V2TaskId, TaskLocation, TaskSlotAllocator,
+    task_operations, CpuIndex, TaskDirectory, TaskId as V2TaskId, TaskInbox, TaskLocation,
+    TaskSlotAllocator,
 };
 use x86_64::VirtAddr;
 
@@ -45,6 +46,8 @@ pub const MAX_FAIR_TASKS: usize = 256;
 // is needed when a task migrates.
 static TASK_DIRECTORY: TaskDirectory = TaskDirectory::new();
 static TASK_SLOTS: TaskSlotAllocator = TaskSlotAllocator::new();
+/// Per-CPU bitmap inbox for allocation-free async remote operations.
+static CPU_INBOX: [TaskInbox; MAX_CPUS] = [const { TaskInbox::new() }; MAX_CPUS];
 
 /// Resolve a Task ID to its current owner and owner-local queue slot.
 fn task_location(id: u64) -> Option<TaskLocation> {
@@ -748,6 +751,9 @@ fn run_current_cpu_scheduler_interrupt(hardware_tick: bool) {
         return;
     }
     let cpu = cpu_id();
+    // Drain pending remote operations (wakes) from the allocation-free inbox
+    // before making a scheduling decision.
+    CPU_INBOX[cpu].drain(|slot| process_inbox_wake(cpu, slot));
     process_runqueue_token_mailbox(cpu);
     if hardware_tick && cpu == 0 {
         MONOTONIC_TICKS.fetch_add(1, Ordering::SeqCst);
@@ -812,6 +818,7 @@ fn deferred_reschedule_hook() {
 pub fn yield_now() {
     huesos_arch::interrupts::disable();
     let cpu = cpu_id();
+    CPU_INBOX[cpu].drain(|slot| process_inbox_wake(cpu, slot));
     process_runqueue_token_mailbox(cpu);
     let mut guard = PER_CPU_SCHEDULERS[cpu].lock();
     let switch_context = guard.tick();
@@ -917,27 +924,11 @@ pub(crate) fn replenish_deadline_on_unblock(
 /// This closes the lost-wakeup race where `wake` arrived after enqueue but
 /// before `park_current` set `blocked=true` (swap would early-return and the
 /// subsequent park would sleep forever).
-pub fn wake_task(task_id: u64) {
-    let Some(location) = task_location(task_id) else {
-        return;
-    };
-    let cpu = location.owner.as_usize();
-    if cpu >= MAX_CPUS {
-        return;
-    }
-    let idx = location.local_index as usize;
-    let Some(_token) = acquire_runqueue_token(cpu) else {
-        return;
-    };
-    let mut guard = PER_CPU_SCHEDULERS[cpu].lock();
-    if !guard.task_matches(task_id) {
-        return;
-    }
-    // Read scheduler-local tick count here so the Deadline replenishment
-    // path below (which mutably borrows a task from `guard.tasks`) does
-    // not need to alias-borrow `guard.ticks` at the same time.
-    let now = guard.ticks;
+/// Apply the wake policy for a task confirmed on this CPU. The caller owns
+/// the scheduler lock; `idx` has been validated by `task_matches`.
+unsafe fn apply_local_wake(guard: &mut Scheduler, now: u64, task_id: u64, idx: usize) {
     let task = &mut guard.tasks[idx];
+    debug_assert_eq!(task.id, task_id, "wake must target the validated identity");
     if task.finished.load(Ordering::Relaxed) {
         task.blocked.store(false, Ordering::SeqCst);
         task.wake_pending.store(false, Ordering::SeqCst);
@@ -951,11 +942,6 @@ pub fn wake_task(task_id: u64) {
         return;
     }
     task.wake_pending.store(false, Ordering::SeqCst);
-    // Fold both policy paths under one mutable-task borrow so the borrow
-    // checker sees a single scope. The Fair path collects (vruntime, id)
-    // into `fair_reinsert` and applies the fair_queue mutation *after*
-    // the task borrow ends; the Deadline path rebases deadline + refills
-    // budget in place under the same borrow via the pure helper.
     let fair_reinsert = match &mut task.sched_policy {
         SchedPolicy::Fair { vruntime, .. } => Some((*vruntime, task.id)),
         SchedPolicy::Deadline {
@@ -969,16 +955,70 @@ pub fn wake_task(task_id: u64) {
         }
     };
     if let Some((vr, id)) = fair_reinsert {
-        // insert is idempotent enough if we remove first (wavl may allow
-        // dup — remove first).
         let _ = guard.fair_queue.remove(fair_key_of(vr, id));
         guard
             .fair_queue
             .insert(fair_key_of(vr, id), u128::from(vr))
             .expect("fair queue capacity");
     }
-    drop(guard);
-    if cpu != cpu_id() {
+}
+
+/// Process one pending WAKE operation from the calling CPU's inbox.
+fn process_inbox_wake(cpu: usize, slot: usize) {
+    let Some(id) = TASK_DIRECTORY.published_id(slot) else {
+        return;
+    };
+    let raw_id = id.raw();
+    let Some(location) = task_location(raw_id) else {
+        return;
+    };
+    if location.owner.as_usize() != cpu {
+        return;
+    }
+    let idx = location.local_index as usize;
+    let mut guard = PER_CPU_SCHEDULERS[cpu].lock();
+    if !guard.task_matches(raw_id) {
+        return;
+    }
+    let now = guard.ticks;
+    // SAFETY: the scheduler lock is held and `idx` was validated by
+    // task_matches against the directory location.
+    unsafe { apply_local_wake(&mut *guard, now, raw_id, idx) };
+}
+
+/// Wake a previously parked task. Safe to call from IRQ context (port queue).
+///
+/// Same-CPU wakes are applied directly under the local scheduler lock.
+/// Remote wakes publish a WAKE operation into the target CPU's allocation-free
+/// bitmap inbox and send at most one coalesced reschedule IPI; the owner CPU
+/// applies the wake during its next scheduler drain. No remote runqueue lock
+/// is ever taken, so the caller never waits on another CPU.
+pub fn wake_task(task_id: u64) {
+    let Some(location) = task_location(task_id) else {
+        return;
+    };
+    let cpu = location.owner.as_usize();
+    if cpu >= MAX_CPUS {
+        return;
+    }
+    if cpu == cpu_id() {
+        let idx = location.local_index as usize;
+        let mut guard = PER_CPU_SCHEDULERS[cpu].lock();
+        if guard.task_matches(task_id) {
+            let now = guard.ticks;
+            // SAFETY: local scheduler lock held and idx validated above.
+            unsafe { apply_local_wake(&mut *guard, now, task_id, idx) };
+        }
+        return;
+    }
+    let Some(id) = V2TaskId::from_raw(task_id) else {
+        return;
+    };
+    let _ = TASK_DIRECTORY.publish_operations(id, task_operations::WAKE);
+    let Some(result) = CPU_INBOX[cpu].publish(id.slot()) else {
+        return;
+    };
+    if result.send_ipi {
         if let Some(apic_id) = lapic_id_for_cpu_index(cpu) {
             huesos_arch::lapic::ipi_reschedule(apic_id);
         }
