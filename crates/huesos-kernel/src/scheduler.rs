@@ -75,10 +75,6 @@ static TOKEN_MAILBOX_REQUESTER: [AtomicUsize; MAX_CPUS] = [const { AtomicUsize::
 static TOKEN_MAILBOX_REQUEST_ID: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
 static NEXT_TOKEN_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 
-const STEAL_OPT_IN_FLAG: u32 = huesos_abi::scheduler_flags::STEAL_OPT_IN;
-static TASK_STEAL_ATTEMPTS: AtomicU64 = AtomicU64::new(0);
-static TASK_STEAL_SUCCESSES: AtomicU64 = AtomicU64::new(0);
-
 struct RunqueueTokenGuard {
     cpu: usize,
     remote: bool,
@@ -398,42 +394,6 @@ impl Scheduler {
         Some(id)
     }
 
-    /// Insert a migrated Task that keeps its existing global identity.
-    fn add_existing_task(&mut self, cpu: usize, task: Box<Task>) -> Option<u64> {
-        let index = loop {
-            let Some(index) = self.free_slots.pop() else {
-                break self.tasks.len();
-            };
-            let Some(slot) = self.tasks.get_mut(index) else {
-                continue;
-            };
-            if matches!(&slot.kind, TaskKind::Reaped) {
-                break index;
-            }
-        };
-        let id = task.id;
-        let policy = task.sched_policy;
-        let Some(task_id) = V2TaskId::from_raw(id) else {
-            return None;
-        };
-        let owner = CpuIndex::new(cpu)?;
-        if TASK_DIRECTORY.publish(task_id, owner, index).is_err() {
-            return None;
-        }
-        if index == self.tasks.len() {
-            self.tasks.push(TaskSlot { task });
-        } else {
-            let slot = &mut self.tasks[index];
-            slot.task = task;
-        }
-        if let SchedPolicy::Fair { vruntime, .. } = policy {
-            self.fair_queue
-                .insert(fair_key_of(vruntime, id), u128::from(vruntime))
-                .expect("fair queue capacity");
-        }
-        Some(id)
-    }
-
     /// Whether `id` currently names a live Task on *this* CPU at the
     /// directory's local index. The full identity comparison rejects stale
     /// generations from the same reused slot.
@@ -580,83 +540,6 @@ impl Scheduler {
         })
     }
 
-    fn has_ready_non_idle(&self) -> bool {
-        if !self.fair_queue.is_empty() {
-            return true;
-        }
-        for task in self.tasks.iter().skip(1) {
-            if task.finished.load(Ordering::Relaxed) || task.blocked.load(Ordering::Relaxed) {
-                continue;
-            }
-            if matches!(task.sched_policy, SchedPolicy::Deadline { remaining_budget, .. } if remaining_budget > 0)
-            {
-                return true;
-            }
-        }
-        false
-    }
-
-    fn take_stealable_task(&mut self, victim_cpu: usize, target_cpu: usize) -> Option<Box<Task>> {
-        let mut skipped = Vec::new();
-        while let Some(key) = self.fair_queue.pop_min() {
-            let vruntime = key.virtual_start as u64;
-            let task_id = key.task_id;
-            let Some(location) = task_location(task_id) else {
-                continue;
-            };
-            if location.owner.as_usize() != victim_cpu {
-                continue;
-            }
-            let idx = location.local_index as usize;
-            let Some(task) = self.tasks.get(idx) else {
-                continue;
-            };
-            if task.id != task_id {
-                continue;
-            }
-            if idx == 0 || idx == self.current {
-                skipped.push((vruntime, task_id));
-                continue;
-            }
-            if task.finished.load(Ordering::Relaxed) || task.blocked.load(Ordering::Relaxed) {
-                continue;
-            }
-            if task.startup_pending.load(Ordering::Acquire) {
-                skipped.push((vruntime, task_id));
-                continue;
-            }
-            let stealable = match &task.kind {
-                TaskKind::User { process } => {
-                    process.steal_opt_in(STEAL_OPT_IN_FLAG)
-                        && process.affinity_mask() & (1u64 << target_cpu) != 0
-                }
-                TaskKind::Kernel | TaskKind::Reaped => false,
-            };
-            if !stealable {
-                skipped.push((vruntime, task_id));
-                continue;
-            }
-            for (vr, id) in skipped {
-                self.fair_queue
-                    .insert(fair_key_of(vr, id), u128::from(vr))
-                    .expect("fair queue capacity");
-            }
-            let replacement = Box::new(Task::new_reaped(task_id));
-            let moved = core::mem::replace(&mut self.tasks[idx].task, replacement);
-            self.tasks[idx].kind = TaskKind::Reaped;
-            self.tasks[idx].finished.store(true, Ordering::Release);
-            self.free_slots.push(idx);
-            let _ = victim_cpu;
-            return Some(moved);
-        }
-        for (vr, id) in skipped {
-            self.fair_queue
-                .insert(fair_key_of(vr, id), u128::from(vr))
-                .expect("fair queue capacity");
-        }
-        None
-    }
-
     fn current_task(&self) -> Option<&Task> {
         self.tasks.get(self.current).map(|slot| &**slot)
     }
@@ -690,55 +573,6 @@ fn lapic_id_for_cpu_index(cpu: usize) -> Option<u8> {
 unsafe fn register_scheduler_ptr(sched: *mut Scheduler) {
     let ptr = huesos_arch::cpu_local::cpu_local_ptr();
     unsafe { (*ptr).scheduler = sched as *mut () };
-}
-
-#[allow(
-    dead_code,
-    reason = "future idle-task/deferred scheduler hook; never called from hard timer IRQ"
-)]
-fn try_token_steal_for_idle_cpu(target_cpu: usize) {
-    if target_cpu >= MAX_CPUS
-        || !is_cpu_online(target_cpu)
-        || huesos_object::steal_opt_in_process_count() == 0
-    {
-        return;
-    }
-    {
-        let guard = PER_CPU_SCHEDULERS[target_cpu].lock();
-        if guard.current != 0 || guard.has_ready_non_idle() {
-            return;
-        }
-    }
-
-    let mask = online_cpu_mask();
-    for offset in 1..MAX_CPUS {
-        let victim_cpu = (target_cpu + offset) % MAX_CPUS;
-        if victim_cpu == target_cpu || mask & (1u64 << victim_cpu) == 0 {
-            continue;
-        }
-        TASK_STEAL_ATTEMPTS.fetch_add(1, Ordering::Relaxed);
-        let Some(_token) = acquire_runqueue_token(victim_cpu) else {
-            continue;
-        };
-        let moved = {
-            let mut victim = PER_CPU_SCHEDULERS[victim_cpu].lock();
-            victim.take_stealable_task(victim_cpu, target_cpu)
-        };
-        let Some(task) = moved else {
-            continue;
-        };
-        // The Task keeps its stable global ID; add_existing_task publishes the
-        // new owner/local slot through the directory. No alias is recorded.
-        let added = {
-            let mut target = PER_CPU_SCHEDULERS[target_cpu].lock();
-            target.add_existing_task(target_cpu, task)
-        };
-        if added.is_none() {
-            continue;
-        }
-        TASK_STEAL_SUCCESSES.fetch_add(1, Ordering::Relaxed);
-        return;
-    }
 }
 
 fn run_current_cpu_scheduler_interrupt(hardware_tick: bool) {
