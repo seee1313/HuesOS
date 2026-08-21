@@ -211,6 +211,36 @@ pub fn timer_stop() {
     write_reg(REG_TIMER_INIT_COUNT, 0);
 }
 
+/// Arm the LAPIC timer in TSC-deadline mode.
+///
+/// Programs the LVT entry for TSC-deadline delivery on `vector` and writes
+/// the absolute TSC value at which the timer must fire. This is a one-shot
+/// deadline: the caller re-arms after every interrupt. Falls back to a
+/// no-op when the TSC-deadline feature bit (CPUID.1:ECX[24]) is absent; the
+/// periodic/one-shot count-based path remains the fallback.
+///
+/// # Safety
+/// Must not be called before `set_base` and `init`.
+pub unsafe fn timer_arm_tsc_deadline(deadline_tsc: u64, vector: u8) {
+    if base() == 0 {
+        return;
+    }
+    // LVT timer: TSC-deadline mode, unmasked, fixed vector.
+    let lvt = (vector as u32) | (TimerMode::TscDeadline as u32);
+    write_reg(REG_LVT_TIMER, lvt);
+    // IA32_TSC_DEADLINE (0x6E0): writing any value arms the timer; writing 0
+    // disarms. A deadline in the past fires immediately.
+    unsafe {
+        core::arch::asm!(
+            "wrmsr",
+            in("ecx") 0x6E0u32,
+            in("edx") (deadline_tsc >> 32) as u32,
+            in("eax") deadline_tsc as u32,
+            options(nomem, nostack),
+        );
+    }
+}
+
 /// Calibrate the LAPIC timer against the PIT.
 /// Returns the initial count value for ~100 Hz periodic timer.
 pub fn calibrate_timer() -> u32 {

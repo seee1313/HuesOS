@@ -11,6 +11,7 @@
 
 extern crate alloc;
 
+pub mod clock;
 pub mod eevdf;
 
 use core::sync::atomic::{fence, AtomicBool, AtomicU64, Ordering};

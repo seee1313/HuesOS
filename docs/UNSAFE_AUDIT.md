@@ -2914,3 +2914,24 @@ mechanism, not unsafe code.
 The remote-wake path itself is 100% safe: `TaskInbox::publish` is atomic
 `fetch_or`, `TaskDirectory::publish_operations` is a validated `fetch_or`,
 and the IPI is coalesced by the inbox's armed flag.
+
+## Scheduler v2: TSC-deadline timer arm and fixed-point clock
+
+### Change
+
+- `huesos-sched/src/clock.rs`: `TscClock` converts invariant-TSC cycles to
+  nanoseconds with a fixed-point multiplier/shift pair (host-tested,
+  sub-nanosecond round-trip error at 1 ns resolution over common frequencies).
+- `huesos-arch/src/x86_64/lapic.rs`: `timer_arm_tsc_deadline` programs the
+  LVT timer in TSC-deadline mode and writes `IA32_TSC_DEADLINE` (0x6E0).
+
+### Budget delta
+
+- `unsafe_blocks: 376 -> 377` (+1)
+- `unsafe_functions: 75 -> 76` (+1)
+
+The new unsafe unit is the single `wrmsr` in `timer_arm_tsc_deadline`
+(two registers + one immediate MSR index; `options(nomem,nostack)`). It is
+guarded by a `base() != 0` check and callable only after `set_base`/`init`.
+The clock module adds zero unsafe surface (it lives in the
+`#![forbid(unsafe_code)]` crate).
