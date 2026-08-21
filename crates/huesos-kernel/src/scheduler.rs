@@ -234,6 +234,19 @@ fn acquire_runqueue_token(cpu: usize) -> Option<RunqueueTokenGuard> {
 /// not make time run faster. Cooperative yields never affect this clock.
 static MONOTONIC_TICKS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
+// --- Scheduler observability counters (aggregate, for boot/CI evidence) ---
+
+/// Total completed context switches across all CPUs.
+static OBS_CTX_SWITCHES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// Remote wake publications routed through the inbox.
+static OBS_REMOTE_WAKES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// Coalesced reschedule IPIs actually sent.
+static OBS_RESCHED_IPIS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// Inbox drain passes (unique slots processed).
+static OBS_INBOX_DRAINS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// Per-CPU IRQ event storm accounting (pending/masked), aggregated.
+static OBS_IRQ_STORM_MASKS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
 /// Fixed-point TSC clock, calibrated once during late init. Used for
 /// nanosecond scheduling time; the periodic LAPIC tick remains the wait
 /// clock until the tickless deadline path replaces it.
@@ -292,6 +305,7 @@ struct SwitchTarget {
 /// switching stacks. Every caller has already dropped the scheduler lock and
 /// keeps local interrupts disabled.
 fn perform_context_switch(target: SwitchTarget) {
+    OBS_CTX_SWITCHES.fetch_add(1, Ordering::Relaxed);
     // SAFETY: Task allocations are stable while schedulable; the scheduler
     // selected `new`, owns its guard state, and disabled local interrupts.
     unsafe {
@@ -623,7 +637,13 @@ fn run_current_cpu_scheduler_interrupt(hardware_tick: bool) {
     let cpu = cpu_id();
     // Drain pending remote operations (wakes) from the allocation-free inbox
     // before making a scheduling decision.
-    CPU_INBOX[cpu].drain(|slot| process_inbox_task(cpu, slot));
+    let drained = CPU_INBOX[cpu].drain(|slot| process_inbox_task(cpu, slot));
+    if drained > 0 {
+        OBS_INBOX_DRAINS.fetch_add(
+            u64::try_from(drained).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+    }
     process_runqueue_token_mailbox(cpu);
     if hardware_tick && cpu == 0 {
         MONOTONIC_TICKS.fetch_add(1, Ordering::SeqCst);
@@ -955,11 +975,13 @@ pub fn wake_task(task_id: u64) {
     let Some(id) = V2TaskId::from_raw(task_id) else {
         return;
     };
+    OBS_REMOTE_WAKES.fetch_add(1, Ordering::Relaxed);
     let _ = TASK_DIRECTORY.publish_operations(id, task_operations::WAKE);
     let Some(result) = CPU_INBOX[cpu].publish(id.slot()) else {
         return;
     };
     if result.send_ipi {
+        OBS_RESCHED_IPIS.fetch_add(1, Ordering::Relaxed);
         if let Some(apic_id) = lapic_id_for_cpu_index(cpu) {
             huesos_arch::lapic::ipi_reschedule(apic_id);
         }
@@ -1053,6 +1075,33 @@ pub fn cbs_admitted_ppm(cpu: usize) -> u32 {
         return 0;
     }
     CBS_ADMISSION[cpu].lock().admitted_ppm()
+}
+
+/// Scheduler observability snapshot (aggregate since boot).
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct SchedStats {
+    pub context_switches: u64,
+    pub remote_wakes: u64,
+    pub resched_ipis: u64,
+    pub inbox_drains: u64,
+    pub irq_storm_masks: u64,
+}
+
+/// Read the scheduler observability counters.
+pub fn sched_stats() -> SchedStats {
+    SchedStats {
+        context_switches: OBS_CTX_SWITCHES.load(Ordering::Relaxed),
+        remote_wakes: OBS_REMOTE_WAKES.load(Ordering::Relaxed),
+        resched_ipis: OBS_RESCHED_IPIS.load(Ordering::Relaxed),
+        inbox_drains: OBS_INBOX_DRAINS.load(Ordering::Relaxed),
+        irq_storm_masks: OBS_IRQ_STORM_MASKS.load(Ordering::Relaxed),
+    }
+}
+
+/// Record that an IRQ source was masked due to a storm/budget violation.
+/// Called by the IRQ layer when it quarantines a misbehaving source.
+pub fn irq_storm_masked() {
+    OBS_IRQ_STORM_MASKS.fetch_add(1, Ordering::Relaxed);
 }
 
 /// Set the scheduling policy for a task by its ID.
