@@ -746,7 +746,11 @@ claims about the whole kernel.
 - `2118719`: added `TaskDirectory::published_id(slot)` so inbox-drain paths
   can recover the full TaskId from a slot number without a prior locate call.
 
-Remaining:
+- `scripts/restore-arena-env.sh` is kept OUT of the repository per owner
+  request; the copy used in this workspace lives at
+  `~/workspace-tools/restore-arena-env.sh` and restores rustup, cargo tools,
+  system packages, git metadata, executable bits, and the persistent SSH key
+  from `$HOME/.ssh/huesos_deploy`.
 
 - Remote operation inbox integration (replacing the synchronous token protocol
   with allocation-free async bitmap wake/kill/policy operations).
