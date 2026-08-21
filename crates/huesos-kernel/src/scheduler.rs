@@ -753,7 +753,7 @@ fn run_current_cpu_scheduler_interrupt(hardware_tick: bool) {
     let cpu = cpu_id();
     // Drain pending remote operations (wakes) from the allocation-free inbox
     // before making a scheduling decision.
-    CPU_INBOX[cpu].drain(|slot| process_inbox_wake(cpu, slot));
+    CPU_INBOX[cpu].drain(|slot| process_inbox_task(cpu, slot));
     process_runqueue_token_mailbox(cpu);
     if hardware_tick && cpu == 0 {
         MONOTONIC_TICKS.fetch_add(1, Ordering::SeqCst);
@@ -818,7 +818,7 @@ fn deferred_reschedule_hook() {
 pub fn yield_now() {
     huesos_arch::interrupts::disable();
     let cpu = cpu_id();
-    CPU_INBOX[cpu].drain(|slot| process_inbox_wake(cpu, slot));
+    CPU_INBOX[cpu].drain(|slot| process_inbox_task(cpu, slot));
     process_runqueue_token_mailbox(cpu);
     let mut guard = PER_CPU_SCHEDULERS[cpu].lock();
     let switch_context = guard.tick();
@@ -963,12 +963,19 @@ unsafe fn apply_local_wake(guard: &mut Scheduler, now: u64, task_id: u64, idx: u
     }
 }
 
-/// Process one pending WAKE operation from the calling CPU's inbox.
-fn process_inbox_wake(cpu: usize, slot: usize) {
+/// Process one pending remote operation for a Task owned by this CPU.
+///
+/// The operation flags are taken from the Task directory before the owner
+/// lock is acquired, so the drain never double-applies a wake.
+fn process_inbox_task(cpu: usize, slot: usize) {
     let Some(id) = TASK_DIRECTORY.published_id(slot) else {
         return;
     };
     let raw_id = id.raw();
+    let operations = TASK_DIRECTORY.take_operations(id).unwrap_or(0);
+    if operations == 0 {
+        return;
+    }
     let Some(location) = task_location(raw_id) else {
         return;
     };
@@ -980,10 +987,26 @@ fn process_inbox_wake(cpu: usize, slot: usize) {
     if !guard.task_matches(raw_id) {
         return;
     }
-    let now = guard.ticks;
-    // SAFETY: the scheduler lock is held and `idx` was validated by
-    // task_matches against the directory location.
-    unsafe { apply_local_wake(&mut *guard, now, raw_id, idx) };
+    if operations & task_operations::WAKE != 0 {
+        let now = guard.ticks;
+        // SAFETY: the scheduler lock is held and `idx` was validated by
+        // task_matches against the directory location.
+        unsafe { apply_local_wake(&mut *guard, now, raw_id, idx) };
+    }
+    if operations & task_operations::POLICY != 0 {
+        // Control-plane policy requests carry payload applied synchronously
+        // by set_sched_policy under the owner lock. A flag-only POLICY bit
+        // (possible if the publisher raced a migration) is consumed by
+        // re-evaluating the task's current fair key.
+        if let SchedPolicy::Fair { vruntime, .. } = guard.tasks[idx].sched_policy {
+            let key = fair_key_of(vruntime, raw_id);
+            let _ = guard.fair_queue.remove(key);
+            guard
+                .fair_queue
+                .insert(key, u128::from(vruntime))
+                .expect("fair queue capacity");
+        }
+    }
 }
 
 /// Wake a previously parked task. Safe to call from IRQ context (port queue).
@@ -1066,35 +1089,35 @@ pub fn set_sched_policy(task_id: u64, policy: SchedPolicy) {
     };
     let cpu = location.owner.as_usize();
     let idx = location.local_index as usize;
-    if cpu < MAX_CPUS {
-        let Some(_token) = acquire_runqueue_token(cpu) else {
-            huesos_arch::interrupts::enable();
-            return;
-        };
-        let mut guard = PER_CPU_SCHEDULERS[cpu].lock();
-
-        if !guard.task_matches(task_id) {
-            drop(guard);
-            huesos_arch::interrupts::enable();
-            return;
-        }
-        let old_policy = Some(guard.tasks[idx].sched_policy);
-
-        if let Some(SchedPolicy::Fair { vruntime, .. }) = old_policy {
-            let _ = guard.fair_queue.remove(fair_key_of(vruntime, task_id));
-        }
-
-        if let Some(task) = guard.tasks.get_mut(idx) {
-            task.sched_policy = policy;
-        }
-
-        if let SchedPolicy::Fair { vruntime, .. } = policy {
-            guard
-                .fair_queue
-                .insert(fair_key_of(vruntime, task_id), u128::from(vruntime))
-                .expect("fair queue capacity");
-        }
+    if cpu >= MAX_CPUS {
+        huesos_arch::interrupts::enable();
+        return;
     }
+    // Policy changes are control-plane operations: rare and allowed to
+    // briefly take the owner scheduler lock so the mutation is applied
+    // synchronously with correct payload semantics. The hot scheduling
+    // path (wake/tick) never takes this path.
+    let Some(_token) = acquire_runqueue_token(cpu) else {
+        huesos_arch::interrupts::enable();
+        return;
+    };
+    let mut guard = PER_CPU_SCHEDULERS[cpu].lock();
+    if !guard.task_matches(task_id) {
+        drop(guard);
+        huesos_arch::interrupts::enable();
+        return;
+    }
+    if let Some(SchedPolicy::Fair { vruntime, .. }) = Some(guard.tasks[idx].sched_policy) {
+        let _ = guard.fair_queue.remove(fair_key_of(vruntime, task_id));
+    }
+    guard.tasks[idx].sched_policy = policy;
+    if let SchedPolicy::Fair { vruntime, .. } = policy {
+        guard
+            .fair_queue
+            .insert(fair_key_of(vruntime, task_id), u128::from(vruntime))
+            .expect("fair queue capacity");
+    }
+    drop(guard);
     huesos_arch::interrupts::enable();
 }
 
