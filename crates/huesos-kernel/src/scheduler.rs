@@ -43,6 +43,11 @@ pub const MAX_FAIR_TASKS: usize = 256;
 /// LAPIC timer fires at ~100 Hz, so a tick is ~10 ms; this is only a
 /// nominal accounting unit until the tickless deadline path lands.
 pub const TICK_SERVICE_NS: u64 = 10_000_000;
+/// Nominal tick period in ns used to re-arm the TSC-deadline timer.
+pub const TICK_NS: u64 = 10_000_000;
+/// Whether this CPU runs the one-shot TSC-deadline scheduler timer.
+static TSC_DEADLINE_ACTIVE: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
 
 // Task IDs are opaque capabilities implemented by `huesos_sched::TaskId`: a
 // global slot index plus a slot generation. CPU ownership is deliberately NOT
@@ -630,6 +635,16 @@ fn run_current_cpu_scheduler_interrupt(hardware_tick: bool) {
     if hardware_tick {
         // Wake any waiters whose timeout expired against hardware time.
         huesos_object::wait::notify_tick(MONOTONIC_TICKS.load(Ordering::SeqCst));
+        // One-shot TSC-deadline mode: re-arm the next deadline now that this
+        // tick has been serviced. The periodic LAPIC path is untouched.
+        if TSC_DEADLINE_ACTIVE.load(Ordering::Relaxed) {
+            if let Some(clock) = TSC_CLOCK.get() {
+                let now = huesos_arch::rdtsc();
+                let deadline = now.saturating_add(clock.ns_to_cycles(TICK_NS));
+                // SAFETY: LAPIC base/init already ran for this CPU.
+                unsafe { huesos_arch::lapic::timer_arm_tsc_deadline(deadline, 0x20) };
+            }
+        }
     }
 
     if let Some(target) = switch_context {
@@ -679,6 +694,25 @@ pub fn init() {
         run_current_cpu_scheduler_interrupt(false);
     });
     huesos_arch::preemption::set_reschedule_hook(deferred_reschedule_hook);
+
+    // Transition to the one-shot TSC-deadline scheduler timer when the TSC
+    // is invariant (stable across P/C states). The periodic LAPIC fallback
+    // remains active otherwise; a forced flag is available for testing the
+    // deadline path under QEMU/KVM where TSC is often already invariant.
+    let force_deadline = core::option_env!("HUESOS_FORCE_TSC_DEADLINE").is_some();
+    if huesos_arch::lapic::tsc_deadline_supported()
+        && (huesos_arch::lapic::tsc_invariant() || force_deadline)
+        && TSC_CLOCK.get().is_some()
+    {
+        TSC_DEADLINE_ACTIVE.store(true, Ordering::Relaxed);
+        // Disarm the periodic count so the one-shot deadline owns the vector.
+        huesos_arch::lapic::timer_stop();
+        let clock = TSC_CLOCK.get().expect("TSC clock published");
+        let now = huesos_arch::rdtsc();
+        let deadline = now.saturating_add(clock.ns_to_cycles(TICK_NS));
+        // SAFETY: LAPIC init completed before scheduler init.
+        unsafe { huesos_arch::lapic::timer_arm_tsc_deadline(deadline, 0x20) };
+    }
 
     // Publish the kernel Job accounting table exactly once (BSP or first AP;
     // content is the root Job with the whole machine's demand).

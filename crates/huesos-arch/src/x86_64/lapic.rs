@@ -241,6 +241,15 @@ pub unsafe fn timer_arm_tsc_deadline(deadline_tsc: u64, vector: u8) {
     }
 }
 
+/// Whether the CPU exposes the TSC-deadline timer mode (CPUID.1:ECX[24]).
+///
+/// Without this feature, writing IA32_TSC_DEADLINE (0x6E0) raises #GP; the
+/// scheduler must use the count-based periodic/one-shot path instead.
+pub fn tsc_deadline_supported() -> bool {
+    let leaf1 = core::arch::x86_64::__cpuid(1);
+    leaf1.ecx & (1 << 24) != 0
+}
+
 /// Whether the TSC is invariant (stable across P/C states).
 ///
 /// Invariant TSC is reported by CPUID.7.0:EDX[8] on modern x86. Without it,
