@@ -765,3 +765,25 @@ claims about the whole kernel.
 - Eager XSAVE and SIMD enablement.
 - PCID/INVPCID/active address-space management.
 - Stress tests, benchmark harness, and bare-metal evidence collection.
+
+## 25. Implementation ledger (scheduler-smp-production-v2)
+
+- `41e1ed3` Job hierarchy: `JobId`, per-CPU `JobState` (runnable/demand/
+  service), hard cap oracle, fixed Job table with generation-safe slot reuse.
+- `bafa106` Kernel: Task carries a `JobId`; per-tick service is charged to the
+  task's Job through a kernel `JobState` table (root Job by default).
+- `b807bfd` Kernel CBS admission API: per-CPU `AdmissionControl` at the shared
+  80% ceiling with `cbs_try_admit`/`cbs_release`/`cbs_admitted_ppm`.
+- `b9c9f25` Tickless scheduler timer: transitions to one-shot TSC-deadline
+  when CPUID 0x1F/invtsc and a calibrated clock are available, with periodic
+  LAPIC fallback; verified under QEMU `-cpu max`.
+- `7352cb0` Observability: `SchedStats` counters (context switches, remote
+  wakes, reschedule IPIs, inbox drains, IRQ storm masks) + `irq_storm_masked`.
+- `6fb547e` Hardware models: `XsaveModel` (CPUID 0xD layout), `PcidTable`
+  (generation-safe ASID allocation), `CpuTopology` (leaf 0x1F parsing).
+- `SCHEDULER_BENCHMARK.md` + `scripts/sched-bench-host.sh`: deterministic host
+  harness; physical thresholds to be committed from real hardware.
+
+Still explicit non-goals of this phase: runtime CPU hotplug, NUMA, and
+enabling userspace SIMD / CR4.PCIDE in the boot path (models are ready; the
+switches themselves require the full physical gate).
