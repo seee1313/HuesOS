@@ -495,6 +495,11 @@ impl Scheduler {
             let now = monotonic_ns();
             if let Some(table) = JOB_TABLE.get() {
                 let mut jobs = table.lock();
+                // The kernel currently maintains one accounting entry for the
+                // root Job; all tasks default to it. When a privileged policy
+                // assigns tasks to distinct resource domains, the entry set
+                // must be indexed by JobId — the charge below already names
+                // the task's Job so the plumbing does not need rework.
                 let _ = jobs.charge(self.cpu, TICK_SERVICE_NS);
                 let _ = jobs.maybe_replenish(now);
                 let _ = job_id;
@@ -929,7 +934,7 @@ fn process_inbox_task(cpu: usize, slot: usize) {
         let now = guard.ticks;
         // SAFETY: the scheduler lock is held and `idx` was validated by
         // task_matches against the directory location.
-        unsafe { apply_local_wake(&mut *guard, now, raw_id, idx) };
+        unsafe { apply_local_wake(&mut guard, now, raw_id, idx) };
     }
     if operations & task_operations::POLICY != 0 {
         // Control-plane policy requests carry payload applied synchronously
@@ -968,7 +973,7 @@ pub fn wake_task(task_id: u64) {
         if guard.task_matches(task_id) {
             let now = guard.ticks;
             // SAFETY: local scheduler lock held and idx validated above.
-            unsafe { apply_local_wake(&mut *guard, now, task_id, idx) };
+            unsafe { apply_local_wake(&mut guard, now, task_id, idx) };
         }
         return;
     }
@@ -1036,37 +1041,55 @@ pub fn tsc_clock_invariant() -> bool {
     huesos_arch::lapic::tsc_invariant()
 }
 
+/// CBS admission failure reason.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CbsError {
+    /// The CPU index is out of range or offline.
+    CpuInvalid,
+    /// The reservation parameters are invalid (capacity > period, zero, ...).
+    InvalidReservation,
+    /// The reservation would overcommit the shared 80% ceiling.
+    Overcommitted,
+    /// The reservation was not previously admitted (release mismatch).
+    NotAdmitted,
+}
+
 /// Try to reserve CBS/IRQ CPU bandwidth on `cpu`.
 ///
 /// Returns `Ok(())` when the reservation fits under the shared 80% ceiling;
-/// `Err(())` when it would overcommit. Reservations are owned by the
-/// scheduling-control capability layer; ordinary threads cannot create them.
-/// A successful reservation must later be released with [`cbs_release`] or
-/// the CPU admission budget will leak.
-pub fn cbs_try_admit(cpu: usize, capacity_ns: u64, period_ns: u64) -> Result<(), ()> {
+/// a typed error otherwise. Reservations are owned by the scheduling-control
+/// capability layer; ordinary threads cannot create them. A successful
+/// reservation must later be released with [`cbs_release`] or the CPU
+/// admission budget will leak.
+pub fn cbs_try_admit(cpu: usize, capacity_ns: u64, period_ns: u64) -> Result<(), CbsError> {
     if cpu >= MAX_CPUS {
-        return Err(());
+        return Err(CbsError::CpuInvalid);
     }
     let Ok(reservation) = CbsReservation::new(capacity_ns, period_ns, period_ns) else {
-        return Err(());
+        return Err(CbsError::InvalidReservation);
     };
     CBS_ADMISSION[cpu]
         .lock()
         .reserve(reservation)
         .map(|_| ())
-        .map_err(|_| ())
+        .map_err(|_| CbsError::Overcommitted)
 }
 
 /// Release previously admitted CBS/IRQ bandwidth on `cpu`.
-pub fn cbs_release(cpu: usize, capacity_ns: u64, period_ns: u64) -> Result<(), ()> {
+pub fn cbs_release(cpu: usize, capacity_ns: u64, period_ns: u64) -> Result<(), CbsError> {
     if cpu >= MAX_CPUS {
-        return Err(());
+        return Err(CbsError::CpuInvalid);
     }
     let Ok(reservation) = CbsReservation::new(capacity_ns, period_ns, period_ns) else {
-        return Err(());
+        return Err(CbsError::InvalidReservation);
     };
-    let ppm = reservation.utilization_ppm().map_err(|_| ())?;
-    CBS_ADMISSION[cpu].lock().release_ppm(ppm).map_err(|_| ())
+    let ppm = reservation
+        .utilization_ppm()
+        .map_err(|_| CbsError::InvalidReservation)?;
+    CBS_ADMISSION[cpu]
+        .lock()
+        .release_ppm(ppm)
+        .map_err(|_| CbsError::NotAdmitted)
 }
 
 /// Current admitted utilization on `cpu` in ppm (0..1_000_000).

@@ -274,9 +274,9 @@ impl<const N: usize> EevdfTree<N> {
         let right = self.node_ref(slot).right;
         let parent = self.node_ref(slot).parent;
 
-        if left.is_some() && right.is_some() {
+        if let (Some(_), Some(successor_root)) = (left, right) {
             // Find in-order successor (min of right subtree).
-            let mut succ = right.unwrap();
+            let mut succ = successor_root;
             while let Some(l) = self.node_ref(succ).left {
                 succ = l;
             }
@@ -365,17 +365,14 @@ impl<const N: usize> EevdfTree<N> {
 
     /// WAVL rebalance after an insert starting at the inserted node.
     fn rebalance_after_insert(&mut self, mut node: usize) {
-        loop {
-            let Some(parent) = self.node_ref(node).parent else {
-                break;
-            };
+        while let Some(parent) = self.node_ref(node).parent {
             let parent_rank = self.node_ref(parent).rank;
             let child_rank = self.node_ref(node).rank;
             if parent_rank > child_rank + 1 {
                 let is_left_child = self.node_ref(parent).left == Some(node);
                 if is_left_child {
                     if self.node_ref(node).right.is_some() {
-                        let grand = self.node_ref(node).right.unwrap();
+                        let grand = self.node_ref(node).right.expect("right child present");
                         self.rotate_left(node);
                         self.rotate_right(parent);
                         self.node_mut_ref(grand).rank += 1;
@@ -386,7 +383,7 @@ impl<const N: usize> EevdfTree<N> {
                         node = parent;
                     }
                 } else if self.node_ref(node).left.is_some() {
-                    let grand = self.node_ref(node).left.unwrap();
+                    let grand = self.node_ref(node).left.expect("left child present");
                     self.rotate_right(node);
                     self.rotate_left(parent);
                     self.node_mut_ref(grand).rank += 1;
@@ -421,7 +418,7 @@ impl<const N: usize> EevdfTree<N> {
             let max = left_rank.max(right_rank);
             if min == 0 && max > 1 {
                 if left_rank > right_rank {
-                    let child = self.node_ref(node).left.unwrap();
+                    let child = self.node_ref(node).left.expect("left child present");
                     let child_left = self.nodes[child]
                         .as_ref()
                         .expect("live")
@@ -435,7 +432,7 @@ impl<const N: usize> EevdfTree<N> {
                         .map(|r| self.node_ref(r).rank)
                         .unwrap_or(0);
                     if child_right > child_left {
-                        let grand = self.node_ref(child).right.unwrap();
+                        let grand = self.node_ref(child).right.expect("grandchild present");
                         self.rotate_left(child);
                         self.rotate_right(node);
                         self.node_mut_ref(grand).rank += 1;
@@ -447,7 +444,7 @@ impl<const N: usize> EevdfTree<N> {
                         node = child;
                     }
                 } else {
-                    let child = self.node_ref(node).right.unwrap();
+                    let child = self.node_ref(node).right.expect("right child present");
                     let child_left = self.nodes[child]
                         .as_ref()
                         .expect("live")
@@ -461,7 +458,7 @@ impl<const N: usize> EevdfTree<N> {
                         .map(|r| self.node_ref(r).rank)
                         .unwrap_or(0);
                     if child_left > child_right {
-                        let grand = self.node_ref(child).left.unwrap();
+                        let grand = self.node_ref(child).left.expect("grandchild present");
                         self.rotate_right(child);
                         self.rotate_left(node);
                         self.node_mut_ref(grand).rank += 1;
@@ -484,7 +481,7 @@ impl<const N: usize> EevdfTree<N> {
 
     /// Rotate subtree right around `y` (y becomes left child of x).
     fn rotate_right(&mut self, y: usize) {
-        let x = self.node_ref(y).left.unwrap();
+        let x = self.node_ref(y).left.expect("rotation left child present");
         let b = self.node_ref(x).right;
         let p = self.node_ref(y).parent;
         self.node_mut_ref(x).right = Some(y);
@@ -510,7 +507,10 @@ impl<const N: usize> EevdfTree<N> {
 
     /// Rotate subtree left around `x`.
     fn rotate_left(&mut self, x: usize) {
-        let y = self.node_ref(x).right.unwrap();
+        let y = self
+            .node_ref(x)
+            .right
+            .expect("rotation right child present");
         let b = self.node_ref(y).left;
         let p = self.node_ref(x).parent;
         self.node_mut_ref(y).left = Some(x);

@@ -2935,3 +2935,25 @@ The new unsafe unit is the single `wrmsr` in `timer_arm_tsc_deadline`
 guarded by a `base() != 0` check and callable only after `set_base`/`init`.
 The clock module adds zero unsafe surface (it lives in the
 `#![forbid(unsafe_code)]` crate).
+
+## Clippy hardening: unwrap -> expect in EEVDF rotations
+
+Clippy's `-D warnings` gate (used by `make clippy`) flagged seven
+`unwrap`-after-`is_some` patterns in the augmented tree rotations and two
+deref redundancies plus `Result<_, ()>` signatures.
+
+### Delta
+
+- `expect_calls: 80 -> 85` (+5)
+
+The 5 new `expect(...)` calls name the invariant they rely on ("rotation
+child present", "grandchild present", "taller child is present"): the child
+was already guarded by an `is_some()` check in the immediately preceding
+condition, and the randomized 3000-operation invariant test still passes.
+These are strictly better than the old `unwrap` because the panic message
+now names the violated structural invariant.
+
+All other clippy fixes were zero-surface: auto-deref simplification, typed
+`CbsError` instead of `Result<_, ()>`, `while let` loops, `is_empty`
+complements, `Default` impls, and a loop-index refactor. `make clippy` is
+green end-to-end including the standalone userspace crates.

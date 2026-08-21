@@ -1517,6 +1517,11 @@ impl<const N: usize> RefillRing<N> {
         self.entries.iter().filter(|entry| entry.is_some()).count()
     }
 
+    /// Whether the ring holds no pending replenishments.
+    pub fn is_empty(&self) -> bool {
+        self.entries.iter().all(|entry| entry.is_none())
+    }
+
     pub const fn entries(&self) -> &[Option<Refill>; N] {
         &self.entries
     }

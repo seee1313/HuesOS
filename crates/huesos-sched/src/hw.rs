@@ -53,10 +53,10 @@ impl XsaveModel {
         // Total size is the sum of enabled user components' sizes (standard
         // format), plus the 512-byte legacy header.
         let mut size = 512usize;
-        for index in 0..64 {
+        for (index, component_size) in components.iter().copied().enumerate() {
             if xcr0 & (1u64 << index) != 0 {
                 size = size
-                    .checked_add(components[index] as usize)
+                    .checked_add(component_size as usize)
                     .ok_or(XsaveError::Oversized)?;
             }
         }
@@ -166,6 +166,12 @@ impl<const MAX_PCIDS: usize> PcidTable<MAX_PCIDS> {
             return 0;
         }
         self.active[pcid]
+    }
+}
+
+impl<const MAX_PCIDS: usize> Default for PcidTable<MAX_PCIDS> {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

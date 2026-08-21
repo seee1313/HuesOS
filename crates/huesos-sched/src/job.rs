@@ -54,6 +54,12 @@ impl JobCpuLoad {
     }
 }
 
+impl Default for JobCpuLoad {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Aggregate Job state used by the balancing/accounting oracle.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct JobState<const CPUS: usize> {
@@ -239,6 +245,12 @@ impl JobTable {
     /// Whether a Job slot is currently allocated.
     pub fn is_allocated(&self, index: usize) -> bool {
         index < MAX_JOBS && self.used[index / 64] & (1u64 << (index % 64)) != 0
+    }
+}
+
+impl Default for JobTable {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

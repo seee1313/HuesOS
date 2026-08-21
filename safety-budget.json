@@ -2,7 +2,7 @@
   "rust_files": 230,
   "rust_lines": 81753,
   "totals": {
-    "expect_calls": 80,
+    "expect_calls": 85,
     "panic_macros": 13,
     "static_mut": 1,
     "todo_markers": 1,
