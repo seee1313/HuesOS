@@ -2807,3 +2807,43 @@ scheduler surface:   9 ->   6 (-3 through switch centralization)
 
 No unsafe operation is added to `huesos-sched`; the policy/state crate remains
 `#![forbid(unsafe_code)]` and host-testable.
+
+## Scheduler v2: fixed-capacity EEVDF runqueue tree
+
+### New audited surface
+
+`crates/huesos-sched/src/eevdf.rs` is an index-based augmented WAVL tree used
+by Scheduler v2 runqueue ordering. It lives in the
+`#![forbid(unsafe_code)]` policy crate, so it contributes zero unsafe blocks,
+unsafe functions, or unsafe impls.
+
+The budget delta comes entirely from `Option` extraction that is guaranteed
+by tree bookkeeping invariants:
+
+- `expect_calls: 60 -> 70` (+10)
+- `unwrap_calls: 25 -> 47` (+22, all in `crates/huesos-sched/src/eevdf.rs`)
+- `panic_macros: 13 -> 13` (unchanged)
+
+### Why the expectations are safe
+
+Every `expect`/`unwrap` in `eevdf.rs` extracts a `Node` from an array slot or
+a `left`/`right`/`parent` link that the insert/erase bookkeeping has already
+validated:
+
+- `node_ref`/`node_mut_ref` expect a live node only for indices that were
+  allocated from `free` and linked into the tree; freed slots are set to
+  `None` in `erase_single` and never reachable from the root after erase.
+- `left`/`right`/`parent` unwraps occur only immediately after the
+  corresponding `is_some()` guard on the same field, or in rotation
+  functions where the child is the node selected by the rotation condition.
+
+The randomized 3000-operation invariant test asserts ordering, capacity, and
+length agreement against a reference `BTreeSet` after every operation, so a
+violation of these invariants is caught by the host test suite, not silently
+relied on.
+
+This is the same "documented audited growth" pattern used for the TPM CRB
+driver: the surface grows because the mechanism is new, not because unsafe
+code was added. A future implementation should migrate the hot `unwrap`s to
+`?`-threaded internal helpers, but that is a mechanical cleanup, not a
+correctness requirement.

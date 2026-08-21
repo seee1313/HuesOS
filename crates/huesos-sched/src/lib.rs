@@ -9,6 +9,10 @@
 #![no_std]
 #![forbid(unsafe_code)]
 
+extern crate alloc;
+
+pub mod eevdf;
+
 use core::sync::atomic::{fence, AtomicBool, AtomicU64, Ordering};
 
 /// Maximum logical CPUs represented by Scheduler v2 masks.
