@@ -159,6 +159,7 @@ impl<const N: usize> EevdfTree<N> {
                 }
             }
         }
+        self.rebalance_after_insert(slot);
         self.refresh_ancestors(slot);
         Ok(())
     }

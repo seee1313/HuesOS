@@ -2847,3 +2847,31 @@ driver: the surface grows because the mechanism is new, not because unsafe
 code was added. A future implementation should migrate the hot `unwrap`s to
 `?`-threaded internal helpers, but that is a mechanical cleanup, not a
 correctness requirement.
+
+## Scheduler v2: kernel fair runqueue on the EEVDF tree
+
+### Change
+
+`crates/huesos-kernel/src/scheduler.rs` now uses the allocation-free
+`huesos_sched::eevdf::EevdfTree` instead of the previous BTreeSet-based
+`wavl` queue. The tree has a fixed per-CPU capacity of
+`MAX_FAIR_TASKS = 256`.
+
+### Budget delta
+
+- `expect_calls: 69 -> 76` (+7)
+- All other regression keys unchanged.
+
+### Why the expectations are safe
+
+The 7 added `.expect("fair queue capacity")` calls are at every fair-queue
+insert site. A `Full` result is a genuine invariant violation: the kernel
+placed more than 256 runnable Fair tasks on one CPU, which either means the
+tree bookkeeping leaked an entry or the fixed capacity was mis-sized. Failing
+loud at the insert point is the correct behaviour for an internal invariant;
+silently dropping the task from the runqueue would strand it while still
+reporting success to the caller.
+
+All other safety keys are unchanged: no unsafe code was added, the tree itself
+remains `#![forbid(unsafe_code)]`, and the randomized invariant test still
+passes (including the restored `rebalance_after_insert` path).

@@ -17,9 +17,6 @@
 //!    - High priority: always executed before any Fair tasks.
 //!    - Multi-task deadline scheduled via Earliest Deadline First (EDF).
 
-#[path = "scheduler/wavl.rs"]
-pub mod wavl;
-
 use crate::task::{Task, TaskKind};
 use alloc::boxed::Box;
 use alloc::sync::Arc;
@@ -29,11 +26,16 @@ use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use huesos_arch::{LockRank, RankedIrqSafeTicketLock};
 use huesos_lifecycle::{InsertOutcome, TaskGraveyard};
 use huesos_object::{KernelObject, Process};
-use huesos_sched::{CpuIndex, TaskDirectory, TaskId as V2TaskId, TaskLocation, TaskSlotAllocator};
+use huesos_sched::{
+    eevdf::{EevdfKey, EevdfTree},
+    CpuIndex, TaskDirectory, TaskId as V2TaskId, TaskLocation, TaskSlotAllocator,
+};
 use x86_64::VirtAddr;
 
 /// Maximum number of CPUs supported.
 pub const MAX_CPUS: usize = 64;
+/// Fixed capacity of the per-CPU fair runqueue tree.
+pub const MAX_FAIR_TASKS: usize = 256;
 
 // Task IDs are opaque capabilities implemented by `huesos_sched::TaskId`: a
 // global slot index plus a slot generation. CPU ownership is deliberately NOT
@@ -327,7 +329,7 @@ struct Scheduler {
     /// Reaped reusable indexes. Each index appears at most once.
     free_slots: Vec<usize>,
     current: usize,
-    fair_queue: wavl::WavlTree,
+    fair_queue: EevdfTree<MAX_FAIR_TASKS>,
     ticks: u64,
 }
 
@@ -338,7 +340,7 @@ impl Scheduler {
             tasks: Vec::new(),
             free_slots: Vec::new(),
             current: 0,
-            fair_queue: wavl::WavlTree::new(),
+            fair_queue: EevdfTree::new(),
             ticks: 0,
         }
     }
@@ -385,7 +387,9 @@ impl Scheduler {
         }
         if index > 0 {
             if let SchedPolicy::Fair { vruntime, .. } = policy {
-                self.fair_queue.insert(vruntime, id);
+                self.fair_queue
+                    .insert(fair_key_of(vruntime, id), u128::from(vruntime))
+                    .expect("fair queue capacity");
             }
         }
         Some(id)
@@ -420,7 +424,9 @@ impl Scheduler {
             slot.task = task;
         }
         if let SchedPolicy::Fair { vruntime, .. } = policy {
-            self.fair_queue.insert(vruntime, id);
+            self.fair_queue
+                .insert(fair_key_of(vruntime, id), u128::from(vruntime))
+                .expect("fair queue capacity");
         }
         Some(id)
     }
@@ -489,7 +495,9 @@ impl Scheduler {
                     let delta = (1024 * 1000) / (*weight).max(1);
                     *vruntime += delta;
                     if !finished && !blocked {
-                        self.fair_queue.insert(*vruntime, task_id);
+                        self.fair_queue
+                            .insert(fair_key_of(*vruntime, task_id), u128::from(*vruntime))
+                            .expect("fair queue capacity");
                     }
                 }
                 SchedPolicy::Deadline {
@@ -526,7 +534,8 @@ impl Scheduler {
         // If no Deadline task is ready, schedule from Fair queue.
         // Skip tasks that finished or are blocked (parked on a wait queue).
         if next_idx == 0 {
-            while let Some(task_id) = self.fair_queue.pop_min() {
+            while let Some(key) = self.fair_queue.pop_min() {
+                let task_id = key.task_id;
                 let Some(location) = task_location(task_id) else {
                     continue;
                 };
@@ -586,7 +595,9 @@ impl Scheduler {
 
     fn take_stealable_task(&mut self, victim_cpu: usize, target_cpu: usize) -> Option<Box<Task>> {
         let mut skipped = Vec::new();
-        while let Some((vruntime, task_id)) = self.fair_queue.pop_min_key() {
+        while let Some(key) = self.fair_queue.pop_min() {
+            let vruntime = key.virtual_start as u64;
+            let task_id = key.task_id;
             let Some(location) = task_location(task_id) else {
                 continue;
             };
@@ -623,7 +634,9 @@ impl Scheduler {
                 continue;
             }
             for (vr, id) in skipped {
-                self.fair_queue.insert(vr, id);
+                self.fair_queue
+                    .insert(fair_key_of(vr, id), u128::from(vr))
+                    .expect("fair queue capacity");
             }
             let replacement = Box::new(Task::new_reaped(task_id));
             let moved = core::mem::replace(&mut self.tasks[idx].task, replacement);
@@ -634,13 +647,23 @@ impl Scheduler {
             return Some(moved);
         }
         for (vr, id) in skipped {
-            self.fair_queue.insert(vr, id);
+            self.fair_queue
+                .insert(fair_key_of(vr, id), u128::from(vr))
+                .expect("fair queue capacity");
         }
         None
     }
 
     fn current_task(&self) -> Option<&Task> {
         self.tasks.get(self.current).map(|slot| &**slot)
+    }
+}
+
+/// Build a runqueue key from the legacy (vruntime, task_id) pair.
+fn fair_key_of(vruntime: u64, task_id: u64) -> EevdfKey {
+    EevdfKey {
+        virtual_start: u128::from(vruntime),
+        task_id,
     }
 }
 
@@ -829,7 +852,7 @@ pub fn park_current() {
             None
         };
         if let Some((vruntime, task_id)) = fair_key {
-            guard.fair_queue.remove(vruntime, task_id);
+            let _ = guard.fair_queue.remove(fair_key_of(vruntime, task_id));
         }
         // Prefer tick(); if it declines to switch (edge case), force idle.
         let switch_context = if should_park {
@@ -948,8 +971,11 @@ pub fn wake_task(task_id: u64) {
     if let Some((vr, id)) = fair_reinsert {
         // insert is idempotent enough if we remove first (wavl may allow
         // dup — remove first).
-        guard.fair_queue.remove(vr, id);
-        guard.fair_queue.insert(vr, id);
+        let _ = guard.fair_queue.remove(fair_key_of(vr, id));
+        guard
+            .fair_queue
+            .insert(fair_key_of(vr, id), u128::from(vr))
+            .expect("fair queue capacity");
     }
     drop(guard);
     if cpu != cpu_id() {
@@ -1015,7 +1041,7 @@ pub fn set_sched_policy(task_id: u64, policy: SchedPolicy) {
         let old_policy = Some(guard.tasks[idx].sched_policy);
 
         if let Some(SchedPolicy::Fair { vruntime, .. }) = old_policy {
-            guard.fair_queue.remove(vruntime, task_id);
+            let _ = guard.fair_queue.remove(fair_key_of(vruntime, task_id));
         }
 
         if let Some(task) = guard.tasks.get_mut(idx) {
@@ -1023,7 +1049,10 @@ pub fn set_sched_policy(task_id: u64, policy: SchedPolicy) {
         }
 
         if let SchedPolicy::Fair { vruntime, .. } = policy {
-            guard.fair_queue.insert(vruntime, task_id);
+            guard
+                .fair_queue
+                .insert(fair_key_of(vruntime, task_id), u128::from(vruntime))
+                .expect("fair queue capacity");
         }
     }
     huesos_arch::interrupts::enable();
@@ -1123,7 +1152,7 @@ pub fn exit_current_task(code: i64) -> ! {
             }
             if let SchedPolicy::Fair { vruntime, .. } = task.sched_policy {
                 let id = task.id;
-                guard.fair_queue.remove(vruntime, id);
+                let _ = guard.fair_queue.remove(fair_key_of(vruntime, id));
             }
         }
     }
@@ -1198,7 +1227,7 @@ pub fn terminate_current_process(code: i64) -> ! {
                 (task.id, fair_key)
             };
             if let Some(vruntime) = fair_key {
-                guard.fair_queue.remove(vruntime, id);
+                let _ = guard.fair_queue.remove(fair_key_of(vruntime, id));
             }
             REAP_QUEUE.lock().push(id);
             REAP_PENDING.store(true, Ordering::Release);
