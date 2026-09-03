@@ -252,6 +252,7 @@ dependencies = [
  "bitflags 2.13.0",
  "huesos-ioapic",
  "huesos-pmm",
+ "huesos-sched",
  "log",
  "pic8259",
  "spin",
@@ -368,6 +369,7 @@ dependencies = [
  "huesos-object",
  "huesos-pci",
  "huesos-pmm",
+ "huesos-sched",
  "huesos-syscalls",
  "huesos-tpm",
  "huesos-uacpi",
@@ -422,6 +424,10 @@ version = "0.1.0"
 
 [[package]]
 name = "huesos-quota"
+version = "0.1.0"
+
+[[package]]
+name = "huesos-sched"
 version = "0.1.0"
 
 [[package]]

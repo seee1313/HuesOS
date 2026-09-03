@@ -23,19 +23,19 @@ static TIMER_INITIAL_COUNT: AtomicU32 = AtomicU32::new(0);
 /// `phys` must be the LAPIC MMIO base reported by validated MADT/MSR state,
 /// and `hhdm_offset` must name the active direct map. Call exactly once before
 /// any LAPIC register access.
-pub unsafe fn set_base(phys: u32, hhdm_offset: u64) {
+pub unsafe fn set_base(phys: u64, hhdm_offset: u64) {
     // LAPIC is MMIO: must be uncacheable. WB mapping can hang IPI delivery
     // status polls forever (writes never reach the device).
     use x86_64::structures::paging::PageTableFlags;
     let _ = crate::x86_64::paging::map_hhdm_range_flags(
-        phys as u64,
+        phys,
         0x1000,
         PageTableFlags::PRESENT
             | PageTableFlags::WRITABLE
             | PageTableFlags::NO_CACHE
             | PageTableFlags::NO_EXECUTE,
     );
-    LAPIC_BASE.store(hhdm_offset + phys as u64, Ordering::Relaxed);
+    LAPIC_BASE.store(hhdm_offset + phys, Ordering::Relaxed);
 }
 
 fn base() -> u64 {
@@ -209,6 +209,96 @@ pub fn timer_stop() {
     }
     write_reg(REG_LVT_TIMER, 0x0001_0000); // masked
     write_reg(REG_TIMER_INIT_COUNT, 0);
+}
+
+/// Arm the LAPIC timer in TSC-deadline mode.
+///
+/// Programs the LVT entry for TSC-deadline delivery on `vector` and writes
+/// the absolute TSC value at which the timer must fire. This is a one-shot
+/// deadline: the caller re-arms after every interrupt. Falls back to a
+/// no-op when the TSC-deadline feature bit (CPUID.1:ECX[24]) is absent; the
+/// periodic/one-shot count-based path remains the fallback.
+///
+/// # Safety
+/// Must not be called before `set_base` and `init`.
+pub unsafe fn timer_arm_tsc_deadline(deadline_tsc: u64, vector: u8) {
+    if base() == 0 {
+        return;
+    }
+    // LVT timer: TSC-deadline mode, unmasked, fixed vector.
+    let lvt = (vector as u32) | (TimerMode::TscDeadline as u32);
+    write_reg(REG_LVT_TIMER, lvt);
+    // IA32_TSC_DEADLINE (0x6E0): writing any value arms the timer; writing 0
+    // disarms. A deadline in the past fires immediately.
+    unsafe {
+        core::arch::asm!(
+            "wrmsr",
+            in("ecx") 0x6E0u32,
+            in("edx") (deadline_tsc >> 32) as u32,
+            in("eax") deadline_tsc as u32,
+            options(nomem, nostack),
+        );
+    }
+}
+
+/// Whether the CPU exposes the TSC-deadline timer mode (CPUID.1:ECX[24]).
+///
+/// Without this feature, writing IA32_TSC_DEADLINE (0x6E0) raises #GP; the
+/// scheduler must use the count-based periodic/one-shot path instead.
+pub fn tsc_deadline_supported() -> bool {
+    let leaf1 = core::arch::x86_64::__cpuid(1);
+    leaf1.ecx & (1 << 24) != 0
+}
+
+/// Whether the TSC is invariant (stable across P/C states).
+///
+/// Invariant TSC is reported by CPUID.7.0:EDX[8] on modern x86. Without it,
+/// TSC-based timing is degraded (frequency may change); callers must treat
+/// the clock as approximate.
+pub fn tsc_invariant() -> bool {
+    let leaf7 = core::arch::x86_64::__cpuid(0x7);
+    let leaf8000 = core::arch::x86_64::__cpuid(0x8000_0007);
+    leaf7.edx & (1 << 8) != 0 && leaf8000.edx & (1 << 8) != 0
+}
+
+/// Calibrate the TSC frequency against the PIT (50 ms window).
+///
+/// Returns cycles per second. Disables interrupts for the measurement.
+/// Rough but adequate for scheduler accounting; the periodic LAPIC timer
+/// remains the authoritative tick source.
+pub fn calibrate_tsc_hz() -> u64 {
+    use x86_64::instructions::port::Port;
+    let saved = x86_64::instructions::interrupts::are_enabled();
+    x86_64::instructions::interrupts::disable();
+    let mut cmd: Port<u8> = Port::new(0x43);
+    let mut data0: Port<u8> = Port::new(0x40);
+    const DIVIDER: u16 = 59_659; // 50 ms @ 1.193182 MHz
+    unsafe {
+        cmd.write(0x30);
+        data0.write((DIVIDER & 0xFF) as u8);
+        data0.write((DIVIDER >> 8) as u8);
+    }
+    let start = crate::rdtsc();
+    unsafe {
+        let mut last = 0xFFFFu16;
+        while (data0.read() as u16) != last {
+            last = data0.read() as u16;
+        }
+        loop {
+            let a = data0.read() as u16;
+            let b = data0.read() as u16;
+            if a == b && b != last {
+                break;
+            }
+        }
+    }
+    let end = crate::rdtsc();
+    if saved {
+        x86_64::instructions::interrupts::enable();
+    }
+    let delta = end.wrapping_sub(start);
+    // 50 ms => cycles * 20 per second.
+    delta.saturating_mul(20).max(1)
 }
 
 /// Calibrate the LAPIC timer against the PIT.

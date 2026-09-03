@@ -710,3 +710,80 @@ Every implementation PR must keep this design synchronized and add:
 - benchmark baseline and hardware identity.
 
 Any architectural deviation requires explicit owner approval before code.
+
+## 24. Implementation ledger (v2 branch)
+
+This ledger records partial integration without turning target properties into
+claims about the whole kernel.
+
+- `7e080fc`: added the `huesos-sched` no-unsafe policy crate with stable
+  8192-slot Task IDs, 256-bit CPU masks, lifecycle/guard oracles, a two-level
+  atomic Task inbox, request-based EEVDF oracle, and 80% CBS admission model.
+- `073bdac`: MADT parsing now validates Local x2APIC records, wide ACPI UIDs,
+  duplicate identities, and 64-bit LAPIC address overrides. The existing
+  xAPIC startup backend refuses rather than truncates wide destinations.
+- `c0ea92f`: added strict distributed Job-cap accounting, conservative fixed
+  refill rings, CBS runtime accounting, and target-first migration protocol
+  models.
+- `3a019d7`: Task-owned preemption/migration guard storage is installed at
+  every context switch, with CpuLocal bootstrap guards before Scheduler init;
+  the audited unsafe switch boundary is centralized and SMP4 QEMU passed.
+- `b428099`: added pure three-mode SMT TrustDomain gate and bounded IRQ
+  event/storm models.
+- `04dd8d4`: added a fixed 8192-slot Task directory model with coherent
+  owner/local-index publication, generation validation, and coalesced pending
+  operations.
+- `30439e4`: kernel Scheduler transitioned to `huesos_sched::TaskId` (global
+  slot + generation). Migration keeps the ID and republishes the owner; the
+  128-entry alias table and CPU-encoded ID layout were removed. A global
+  8192-slot allocator advances generations on reuse and retires slots only on
+  generation overflow. `make test`, safety/policy gates, and QEMU debug SMP4
+  pass with this layout.
+- `a871025`: preemption guards (`ExecutionGuards`) are connected to the
+  reschedule hook so the outermost guard release runs a deferred scheduler
+  tick when a task was rescheduled while preemption-disabled. This is the
+  first building block for fully preemptible kernel context switching.
+- `2118719`: added `TaskDirectory::published_id(slot)` so inbox-drain paths
+  can recover the full TaskId from a slot number without a prior locate call.
+
+- `scripts/restore-arena-env.sh` is kept OUT of the repository per owner
+  request; the copy used in this workspace lives at
+  `~/workspace-tools/restore-arena-env.sh` and restores rustup, cargo tools,
+  system packages, git metadata, executable bits, and the persistent SSH key
+  from `$HOME/.ssh/huesos_deploy`.
+
+- Remote operation inbox integration (replacing the synchronous token protocol
+  with allocation-free async bitmap wake/kill/policy operations).
+- Owner-only runqueue mutation (eliminating per-CPU scheduler ticket locks).
+- Request-based EEVDF selection replacing `tick()` linear scan and BTreeSet.
+- Job/ResourceDomain hierarchy integration.
+- Monotonic clock, TSC-deadline/one-shot timer, and cross-CPU skew report.
+- CBS, hard caps, and automatic migration.
+- Threaded IRQ, kernel IRQ thread, storm containment.
+- Topology-aware CPU selection, xAPIC/x2APIC backend.
+- SMT off/isolated/rusted gates with trust capabilities.
+- Eager XSAVE and SIMD enablement.
+- PCID/INVPCID/active address-space management.
+- Stress tests, benchmark harness, and bare-metal evidence collection.
+
+## 25. Implementation ledger (scheduler-smp-production-v2)
+
+- `41e1ed3` Job hierarchy: `JobId`, per-CPU `JobState` (runnable/demand/
+  service), hard cap oracle, fixed Job table with generation-safe slot reuse.
+- `bafa106` Kernel: Task carries a `JobId`; per-tick service is charged to the
+  task's Job through a kernel `JobState` table (root Job by default).
+- `b807bfd` Kernel CBS admission API: per-CPU `AdmissionControl` at the shared
+  80% ceiling with `cbs_try_admit`/`cbs_release`/`cbs_admitted_ppm`.
+- `b9c9f25` Tickless scheduler timer: transitions to one-shot TSC-deadline
+  when CPUID 0x1F/invtsc and a calibrated clock are available, with periodic
+  LAPIC fallback; verified under QEMU `-cpu max`.
+- `7352cb0` Observability: `SchedStats` counters (context switches, remote
+  wakes, reschedule IPIs, inbox drains, IRQ storm masks) + `irq_storm_masked`.
+- `6fb547e` Hardware models: `XsaveModel` (CPUID 0xD layout), `PcidTable`
+  (generation-safe ASID allocation), `CpuTopology` (leaf 0x1F parsing).
+- `SCHEDULER_BENCHMARK.md` + `scripts/sched-bench-host.sh`: deterministic host
+  harness; physical thresholds to be committed from real hardware.
+
+Still explicit non-goals of this phase: runtime CPU hotplug, NUMA, and
+enabling userspace SIMD / CR4.PCIDE in the boot path (models are ready; the
+switches themselves require the full physical gate).

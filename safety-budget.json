@@ -2,14 +2,14 @@
   "rust_files": 230,
   "rust_lines": 81753,
   "totals": {
-    "expect_calls": 60,
+    "expect_calls": 85,
     "panic_macros": 13,
     "static_mut": 1,
     "todo_markers": 1,
-    "unsafe_blocks": 375,
-    "unsafe_functions": 73,
+    "unsafe_blocks": 382,
+    "unsafe_functions": 76,
     "unsafe_impls": 33,
-    "unwrap_calls": 25
+    "unwrap_calls": 69
   },
   "unsafe_by_file": {
     "crates/hues-async/src/lib.rs": 19,
@@ -20,13 +20,13 @@
     "crates/huesos-arch/src/x86_64/ap_boot.rs": 3,
     "crates/huesos-arch/src/x86_64/context_switch.rs": 6,
     "crates/huesos-arch/src/x86_64/cpu.rs": 6,
-    "crates/huesos-arch/src/x86_64/cpu_local.rs": 15,
+    "crates/huesos-arch/src/x86_64/cpu_local.rs": 19,
     "crates/huesos-arch/src/x86_64/fault.rs": 3,
     "crates/huesos-arch/src/x86_64/gdt.rs": 5,
     "crates/huesos-arch/src/x86_64/idt.rs": 5,
     "crates/huesos-arch/src/x86_64/interrupts.rs": 2,
     "crates/huesos-arch/src/x86_64/ioapic.rs": 3,
-    "crates/huesos-arch/src/x86_64/lapic.rs": 12,
+    "crates/huesos-arch/src/x86_64/lapic.rs": 17,
     "crates/huesos-arch/src/x86_64/mod.rs": 6,
     "crates/huesos-arch/src/x86_64/paging.rs": 34,
     "crates/huesos-arch/src/x86_64/pit.rs": 1,
@@ -42,7 +42,7 @@
     "crates/huesos-kernel/src/lib.rs": 2,
     "crates/huesos-kernel/src/mem/alloc.rs": 12,
     "crates/huesos-kernel/src/process.rs": 3,
-    "crates/huesos-kernel/src/scheduler.rs": 9,
+    "crates/huesos-kernel/src/scheduler.rs": 11,
     "crates/huesos-kernel/src/smp.rs": 9,
     "crates/huesos-kernel/src/task.rs": 7,
     "crates/huesos-kernel/src/tpm.rs": 6,
@@ -80,6 +80,7 @@
     "crates/huesos-userspace/libcanvas/src/resource.rs": 1,
     "crates/huesos-userspace/libcanvas/src/signal.rs": 1,
     "crates/huesos-userspace/libcanvas/src/vmo.rs": 3,
-    "crates/huesos-userspace/terminal/src/screen.rs": 2
+    "crates/huesos-userspace/terminal/src/screen.rs": 2,
+    "crates/huesos-sched/src/eevdf.rs": 0
   }
 }

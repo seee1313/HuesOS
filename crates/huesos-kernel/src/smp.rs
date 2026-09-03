@@ -96,12 +96,22 @@ pub fn bringup_aps(madt_bytes: &[u8], hhdm_offset: u64) {
         let Some(cpu) = madt.cpus[i] else {
             continue;
         };
-        if cpu.apic_id == bsp_lapic_id as u8 {
+        if cpu.apic_id == bsp_lapic_id {
             continue;
         }
         if ap_index >= ap_count {
             break;
         }
+        let Ok(startup_apic_id) = u8::try_from(cpu.apic_id) else {
+            // Parsed and retained correctly, but the current INIT/SIPI backend
+            // is xAPIC-only. Never truncate a wide destination; x2APIC startup
+            // is introduced by the v2 APIC backend commit.
+            log_line("[SMP] AP ");
+            log_num(u64::from(cpu.apic_id));
+            log_line(" unavailable: x2APIC startup backend not active\n");
+            ap_index += 1;
+            continue;
+        };
 
         let stack = &ap_stacks[ap_index];
         let stack_top = stack.as_ptr().wrapping_add(stack.len()) as u64;
@@ -113,7 +123,7 @@ pub fn bringup_aps(madt_bytes: &[u8], hhdm_offset: u64) {
         let ready_before = AP_READY_COUNT.load(Ordering::Relaxed);
 
         unsafe {
-            huesos_arch::ap_boot::boot_ap(cpu.apic_id, stack_top, ap_entry as *const () as u64);
+            huesos_arch::ap_boot::boot_ap(startup_apic_id, stack_top, ap_entry as *const () as u64);
         }
 
         // Wait until the AP finished local init (before the run-gate).

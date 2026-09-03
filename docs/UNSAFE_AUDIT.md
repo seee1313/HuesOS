@@ -2756,3 +2756,204 @@ the simulated-TPM test caught it. A sealing implementation that
 cannot distinguish "policy satisfied" from "policy failed" is worse
 than no sealing at all, since it reports success while handing out the
 key on a tampered boot chain.
+
+## Scheduler v2: Task-owned execution-guard handoff
+
+### New boundary
+
+Fully preemptible kernel contexts require preemption and migration nesting to
+travel with the Task rather than remain in a CPU-global variable. `CpuLocal`
+therefore holds a pointer to the currently running Task's
+`huesos_sched::ExecutionGuards`. Scheduler initialization points it at the
+stable idle Task; every context switch installs the selected stable Task field
+with local interrupts disabled.
+
+### `crates/huesos-arch/src/x86_64/cpu_local.rs`
+
+The audited additions are:
+
+1. `update_current_execution_guards` loads and mutates the installed pointer
+   while local interrupts are disabled. The pointer names either the CpuLocal
+   embedded bootstrap guards or a live current Task. A current Task cannot be
+   reclaimed or migrated during this critical section.
+2. `current_execution_guards` copies the same state under the same interrupt
+   exclusion.
+3. `install_execution_guards` is an unsafe function because only Scheduler
+   ownership can prove that the pointed-to Task field remains live and that no
+   interrupt/context switch separates publication from the corresponding
+   stack switch.
+
+The pointer is appended after the assembly-visible CpuLocal fields; existing
+`user_rsp` and `kernel_rsp` offsets remain 40 and 48 and are still locked by
+static assertions.
+
+### `crates/huesos-kernel/src/scheduler.rs`
+
+Repeated context-switch unsafe blocks were consolidated into
+`perform_context_switch`. It installs the incoming guard pointer immediately
+before the assembly switch, after dropping the scheduler lock. This reduces
+the scheduler's audited unsafe surface while giving the pointer handoff one
+reviewable boundary.
+
+### Safety-budget delta (measured)
+
+```text
+unsafe_blocks:     374 -> 374 (unchanged overall)
+unsafe_functions:   73 ->  74 (+1 install_execution_guards contract)
+unsafe_impls:       33 ->  33 (unchanged)
+cpu_local surface:  15 ->  19 (+4 audited units above)
+scheduler surface:   9 ->   6 (-3 through switch centralization)
+```
+
+No unsafe operation is added to `huesos-sched`; the policy/state crate remains
+`#![forbid(unsafe_code)]` and host-testable.
+
+## Scheduler v2: fixed-capacity EEVDF runqueue tree
+
+### New audited surface
+
+`crates/huesos-sched/src/eevdf.rs` is an index-based augmented WAVL tree used
+by Scheduler v2 runqueue ordering. It lives in the
+`#![forbid(unsafe_code)]` policy crate, so it contributes zero unsafe blocks,
+unsafe functions, or unsafe impls.
+
+The budget delta comes entirely from `Option` extraction that is guaranteed
+by tree bookkeeping invariants:
+
+- `expect_calls: 60 -> 70` (+10)
+- `unwrap_calls: 25 -> 47` (+22, all in `crates/huesos-sched/src/eevdf.rs`)
+- `panic_macros: 13 -> 13` (unchanged)
+
+### Why the expectations are safe
+
+Every `expect`/`unwrap` in `eevdf.rs` extracts a `Node` from an array slot or
+a `left`/`right`/`parent` link that the insert/erase bookkeeping has already
+validated:
+
+- `node_ref`/`node_mut_ref` expect a live node only for indices that were
+  allocated from `free` and linked into the tree; freed slots are set to
+  `None` in `erase_single` and never reachable from the root after erase.
+- `left`/`right`/`parent` unwraps occur only immediately after the
+  corresponding `is_some()` guard on the same field, or in rotation
+  functions where the child is the node selected by the rotation condition.
+
+The randomized 3000-operation invariant test asserts ordering, capacity, and
+length agreement against a reference `BTreeSet` after every operation, so a
+violation of these invariants is caught by the host test suite, not silently
+relied on.
+
+This is the same "documented audited growth" pattern used for the TPM CRB
+driver: the surface grows because the mechanism is new, not because unsafe
+code was added. A future implementation should migrate the hot `unwrap`s to
+`?`-threaded internal helpers, but that is a mechanical cleanup, not a
+correctness requirement.
+
+## Scheduler v2: kernel fair runqueue on the EEVDF tree
+
+### Change
+
+`crates/huesos-kernel/src/scheduler.rs` now uses the allocation-free
+`huesos_sched::eevdf::EevdfTree` instead of the previous BTreeSet-based
+`wavl` queue. The tree has a fixed per-CPU capacity of
+`MAX_FAIR_TASKS = 256`.
+
+### Budget delta
+
+- `expect_calls: 69 -> 76` (+7)
+- All other regression keys unchanged.
+
+### Why the expectations are safe
+
+The 7 added `.expect("fair queue capacity")` calls are at every fair-queue
+insert site. A `Full` result is a genuine invariant violation: the kernel
+placed more than 256 runnable Fair tasks on one CPU, which either means the
+tree bookkeeping leaked an entry or the fixed capacity was mis-sized. Failing
+loud at the insert point is the correct behaviour for an internal invariant;
+silently dropping the task from the runqueue would strand it while still
+reporting success to the caller.
+
+All other safety keys are unchanged: no unsafe code was added, the tree itself
+remains `#![forbid(unsafe_code)]`, and the randomized invariant test still
+passes (including the restored `rebalance_after_insert` path).
+
+## Scheduler v2: allocation-free remote wake inbox
+
+### Change
+
+`wake_task` no longer acquires a remote runqueue token (which could spin for
+100k iterations). Same-CPU wakes apply directly under the local scheduler
+lock; remote wakes publish a `WAKE` operation into the target CPU's
+fixed-size bitmap inbox (`CPU_INBOX[cpu].publish`) and send at most one
+coalesced reschedule IPI. The owner drains the inbox at its next scheduler
+entry and applies the wake under its own lock.
+
+### Budget delta
+
+- `unsafe_blocks: 375 -> 376` (+1)
+- `unsafe_functions: 74 -> 75` (+1)
+- All other keys unchanged.
+
+### Why the new unsafe surface is bounded
+
+The added unsafe surface is exactly the two call sites of the extracted
+`apply_local_wake` helper, which mutates `guard.tasks[idx]` while the caller
+holds the scheduler lock and after `task_matches` validated both `idx` and
+the full identity. Both call sites are:
+
+1. `process_inbox_wake` — local lock held, `idx` from the directory
+   location validated by `task_matches(raw_id)`;
+2. the same-CPU branch of `wake_task` — local lock held, `idx` from
+   `task_location(task_id)` validated by `task_matches(task_id)`.
+
+The helper is `unsafe fn` because it takes `&mut Scheduler` (not a guard) and
+mutates `tasks[idx]`; the safety contract is the caller-owned lock plus the
+identity check. No raw pointer arithmetic, no lifetime extension, no
+unbounded access. This mirrors the TPM/EEVDF audit pattern: growth is the
+mechanism, not unsafe code.
+
+The remote-wake path itself is 100% safe: `TaskInbox::publish` is atomic
+`fetch_or`, `TaskDirectory::publish_operations` is a validated `fetch_or`,
+and the IPI is coalesced by the inbox's armed flag.
+
+## Scheduler v2: TSC-deadline timer arm and fixed-point clock
+
+### Change
+
+- `huesos-sched/src/clock.rs`: `TscClock` converts invariant-TSC cycles to
+  nanoseconds with a fixed-point multiplier/shift pair (host-tested,
+  sub-nanosecond round-trip error at 1 ns resolution over common frequencies).
+- `huesos-arch/src/x86_64/lapic.rs`: `timer_arm_tsc_deadline` programs the
+  LVT timer in TSC-deadline mode and writes `IA32_TSC_DEADLINE` (0x6E0).
+
+### Budget delta
+
+- `unsafe_blocks: 376 -> 377` (+1)
+- `unsafe_functions: 75 -> 76` (+1)
+
+The new unsafe unit is the single `wrmsr` in `timer_arm_tsc_deadline`
+(two registers + one immediate MSR index; `options(nomem,nostack)`). It is
+guarded by a `base() != 0` check and callable only after `set_base`/`init`.
+The clock module adds zero unsafe surface (it lives in the
+`#![forbid(unsafe_code)]` crate).
+
+## Clippy hardening: unwrap -> expect in EEVDF rotations
+
+Clippy's `-D warnings` gate (used by `make clippy`) flagged seven
+`unwrap`-after-`is_some` patterns in the augmented tree rotations and two
+deref redundancies plus `Result<_, ()>` signatures.
+
+### Delta
+
+- `expect_calls: 80 -> 85` (+5)
+
+The 5 new `expect(...)` calls name the invariant they rely on ("rotation
+child present", "grandchild present", "taller child is present"): the child
+was already guarded by an `is_some()` check in the immediately preceding
+condition, and the randomized 3000-operation invariant test still passes.
+These are strictly better than the old `unwrap` because the panic message
+now names the violated structural invariant.
+
+All other clippy fixes were zero-surface: auto-deref simplification, typed
+`CbsError` instead of `Result<_, ()>`, `while let` loops, `is_empty`
+complements, `Default` impls, and a loop-index refactor. `make clippy` is
+green end-to-end including the standalone userspace crates.

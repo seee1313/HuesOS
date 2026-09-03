@@ -15,5 +15,6 @@ bit_field = { workspace = true }
 static_assertions = { workspace = true }
 huesos-pmm = { path = "../huesos-pmm" }
 huesos-ioapic = { path = "../huesos-ioapic" }
+huesos-sched = { path = "../huesos-sched" }
 
 log = { workspace = true }

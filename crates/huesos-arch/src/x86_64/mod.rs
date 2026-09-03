@@ -14,6 +14,7 @@ pub mod irq_callback;
 pub mod lapic;
 pub mod paging;
 pub mod pit;
+pub mod preemption;
 pub mod serial;
 pub mod syscall;
 pub mod timer_callback;
