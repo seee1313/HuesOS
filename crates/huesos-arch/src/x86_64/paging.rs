@@ -5,7 +5,7 @@
 //! bump range.
 
 use crate::{LockRank, RankedIrqSafeTicketLock};
-use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use x86_64::registers::control::{Cr3, Cr3Flags};
 use x86_64::structures::paging::{
     FrameAllocator, FrameDeallocator, Mapper, OffsetPageTable, Page, PageTable, PageTableFlags,
@@ -14,7 +14,11 @@ use x86_64::structures::paging::{
 use x86_64::{PhysAddr, VirtAddr};
 
 const TLB_SHOOTDOWN_VECTOR: u8 = 0xF3;
-static TLB_ACTIVE: AtomicBool = AtomicBool::new(false);
+/// Sequence number of the shootdown request whose acknowledgements are
+/// currently being counted; 0 = no request in flight.
+static TLB_REQ_SEQ: AtomicU64 = AtomicU64::new(0);
+/// Monotonic sequence source for shootdown requests.
+static TLB_SEQ: AtomicU64 = AtomicU64::new(0);
 static TLB_START: AtomicU64 = AtomicU64::new(0);
 static TLB_END: AtomicU64 = AtomicU64::new(0);
 static TLB_ACKS: AtomicUsize = AtomicUsize::new(0);
@@ -22,7 +26,11 @@ static TLB_ACKS: AtomicUsize = AtomicUsize::new(0);
 /// Invalidate the requested range on the local CPU as part of an active
 /// cross-CPU TLB shootdown request.
 pub fn handle_tlb_shootdown() {
-    if !TLB_ACTIVE.load(Ordering::Acquire) {
+    // Acknowledge only the request that is in flight when this IPI is
+    // handled. A delayed IPI from a finished (or superseded) request must
+    // not count toward the current request's acknowledgement budget.
+    let seq = TLB_REQ_SEQ.load(Ordering::Acquire);
+    if seq == 0 {
         return;
     }
     let mut page = TLB_START.load(Ordering::Acquire);
@@ -31,14 +39,25 @@ pub fn handle_tlb_shootdown() {
         crate::x86_64::cpu::invlpg(page);
         page = page.saturating_add(4096);
     }
-    TLB_ACKS.fetch_add(1, Ordering::Release);
+    if TLB_REQ_SEQ.load(Ordering::Acquire) == seq {
+        TLB_ACKS.fetch_add(1, Ordering::Release);
+    }
 }
 
 /// Invalidate a virtual-address range on every online CPU.
 ///
-/// The caller supplies the number of remote online CPUs expected to acknowledge
-/// the IPI. The request is serialized by the kernel VMAR mutation lock; this
-/// architecture primitive only owns the fixed atomic mailbox and IPI handshake.
+/// The caller supplies the number of remote online CPUs expected to
+/// acknowledge the IPI.
+///
+/// # Serialization contract
+/// This primitive owns a single global mailbox (start/end/acks/seq), so
+/// **exactly one shootdown may be in flight system-wide**. Every kernel
+/// call site holds the VMAR mutation lock across the call. The sequence
+/// tag makes a contract violation detectable — the sender stops waiting
+/// on a foreign (possibly reset) ack counter and reports the violation on
+/// the console — instead of silently accepting the wrong request's
+/// acknowledgements or spinning on a reset counter with interrupts
+/// disabled.
 pub fn shootdown_range(start: u64, end: u64, expected_remote: usize) {
     let start = start & !0xfff;
     let end = end.saturating_add(0xfff) & !0xfff;
@@ -46,12 +65,20 @@ pub fn shootdown_range(start: u64, end: u64, expected_remote: usize) {
         return;
     }
 
+    // Tag this request with a fresh sequence number. 0 is reserved for
+    // "idle"; the counter is 64-bit, so wraparound is not a practical
+    // concern for this workload.
+    let mut seq = TLB_SEQ.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+    if seq == 0 {
+        seq = 1;
+    }
+
     let interrupts_were_enabled = x86_64::instructions::interrupts::are_enabled();
     x86_64::instructions::interrupts::disable();
     TLB_START.store(start, Ordering::Relaxed);
     TLB_END.store(end, Ordering::Relaxed);
     TLB_ACKS.store(0, Ordering::Relaxed);
-    TLB_ACTIVE.store(true, Ordering::Release);
+    TLB_REQ_SEQ.store(seq, Ordering::Release);
 
     crate::x86_64::lapic::broadcast_excluding_self(TLB_SHOOTDOWN_VECTOR);
     let mut page = start;
@@ -59,12 +86,31 @@ pub fn shootdown_range(start: u64, end: u64, expected_remote: usize) {
         crate::x86_64::cpu::invlpg(page);
         page = page.saturating_add(4096);
     }
-    while TLB_ACKS.load(Ordering::Acquire) < expected_remote {
+    // Wait for every remote CPU to acknowledge THIS request. If the
+    // in-flight seq changes underneath us, a concurrent shootdown broke
+    // the serialization contract: stop waiting on a foreign ack counter
+    // rather than spinning on it with interrupts disabled. Our own range
+    // is already invalidated locally; the violation is reported below.
+    while TLB_REQ_SEQ.load(Ordering::Acquire) == seq
+        && TLB_ACKS.load(Ordering::Acquire) < expected_remote
+    {
         core::hint::spin_loop();
     }
-    TLB_ACTIVE.store(false, Ordering::Release);
+    // Clear the in-flight marker only if we are still the request in
+    // flight; a successor has already replaced the mailbox and owns it.
+    let superseded = TLB_REQ_SEQ
+        .compare_exchange(seq, 0, Ordering::AcqRel, Ordering::Acquire)
+        .is_err();
     if interrupts_were_enabled {
         x86_64::instructions::interrupts::enable();
+    }
+    if superseded {
+        use core::fmt::Write;
+        let mut w = crate::x86_64::serial::SerialWriter;
+        let _ = writeln!(
+            &mut w,
+            "[tlb-shootdown] ERROR: concurrent shootdown detected; request {seq} completed without verified remote invalidation"
+        );
     }
 }
 

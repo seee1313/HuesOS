@@ -411,11 +411,12 @@ pub fn map_resource_into_current(
         return Err(error);
     }
 
-    huesos_arch::paging::shootdown_range(
-        args.addr,
-        args.addr + args.len,
-        crate::scheduler::online_remote_cpu_count(),
-    );
+    // No TLB shootdown: the overlap check guarantees these page-table
+    // entries were absent, so no CPU can hold a stale positive
+    // translation for them (the same argument as the HeapExtend COMMIT
+    // path). An IPI handshake here would also run the global shootdown
+    // mailbox without the VMAR mutation lock, breaking the shootdown's
+    // one-request-in-flight contract.
     Ok(args.addr)
 }
 
@@ -973,6 +974,10 @@ pub fn heap_extend_current(args: huesos_abi::HeapExtendArgs) -> Result<u64, Erro
     drop(runtime_guard);
     // Removing mappings *does* require invalidating other CPUs, or a
     // stale TLB entry would keep a freed frame reachable from ring 3.
+    // The shootdown's global mailbox is only safe with one request in
+    // flight system-wide, so hold the VMAR mutation lock across the IPI
+    // handshake, matching the unmap/protect transaction paths.
+    let _mutation_guard = VMAR_MUTATION_LOCK.lock();
     huesos_arch::paging::shootdown_range(
         base,
         base + args.len,
