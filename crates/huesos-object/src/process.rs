@@ -348,6 +348,12 @@ impl Process {
         self.lifecycle.lock().state()
     }
 
+    /// Whether this process has started (its first thread has started).
+    /// False while the process is still in the `Created` launch window.
+    pub fn has_started(&self) -> bool {
+        self.lifecycle.lock().is_running()
+    }
+
     /// Register one blocking exit waiter. Returns false if the process has
     /// already exited and the caller should observe the stored status without
     /// parking.

@@ -449,6 +449,7 @@ pub(crate) fn sys_vmar_map(args_ptr: *const VmarMapArgs) -> SyscallResult {
     let vmar = vmar_obj
         .downcast_ref::<huesos_object::Vmar>()
         .ok_or(ErrorCode::WrongType)?;
+    vmar_map_authorize(vmar, &proc)?;
 
     let vmo_obj = huesos_object::lookup_object(vmo_handle.koid).ok_or(ErrorCode::BadHandle)?;
     let vmo = vmo_obj
@@ -458,6 +459,30 @@ pub(crate) fn sys_vmar_map(args_ptr: *const VmarMapArgs) -> SyscallResult {
     let map = (*VMAR_MAP_FN.lock()).ok_or(ErrorCode::NotSupported)?;
     let mapped = map(vmar, vmo, args)?;
     Ok(mapped as i64)
+}
+
+/// Address-space authorization for `sys_vmar_map`.
+///
+/// A VMAR handle names an address space. The owning process may always
+/// install mappings into it. Until the owning process starts, any process
+/// may: during the launch window the launcher installs the child's initial
+/// ELF image into the child's root VMAR while the child is still `Created`.
+/// Once the first thread has started, a VMAR handle held by any other
+/// process is inert. That rule — not transfer restrictions — is what makes
+/// it safe for a root VMAR handle to cross a channel boundary, e.g. a
+/// launcher forwarding its child's own root VMAR to the child.
+pub(crate) fn vmar_map_authorize(
+    vmar: &huesos_object::Vmar,
+    caller: &huesos_object::Process,
+) -> Result<(), ErrorCode> {
+    if vmar.process() == caller.koid() {
+        return Ok(());
+    }
+    let owner = huesos_object::lookup_process(vmar.process()).ok_or(ErrorCode::BadHandle)?;
+    if owner.has_started() {
+        return Err(ErrorCode::AccessDenied);
+    }
+    Ok(())
 }
 
 pub(crate) fn sys_vmar_unmap(args_ptr: *const VmarOpArgs) -> SyscallResult {
@@ -573,4 +598,34 @@ fn process_for_wait(
         return Err(ErrorCode::AccessDenied);
     }
     huesos_object::lookup_process(h.koid).ok_or(ErrorCode::WrongType)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::vmar_map_authorize;
+    use huesos_abi::ErrorCode;
+    use huesos_object::{KernelObject, Process, Vmar};
+
+    /// `sys_vmar_map` must let the VMAR's owner map into its own address
+    /// space at any time, and let anyone else (the launcher installing the
+    /// initial image) only during the launch window, i.e. before the
+    /// owning process's first thread starts.
+    #[test]
+    fn vmar_map_authorizes_owner_and_launch_window() {
+        let child = Process::new("child");
+        let launcher = Process::new("launcher");
+        let vmar = Vmar::new_root(child.koid(), 0x10000, 0x100000);
+        huesos_object::register_process(child.clone());
+        // Launch window: child is still `Created`.
+        assert_eq!(vmar_map_authorize(&vmar, &launcher), Ok(()));
+        assert_eq!(vmar_map_authorize(&vmar, &child), Ok(()));
+        // After start, only the owner keeps the capability.
+        child.start();
+        assert_eq!(
+            vmar_map_authorize(&vmar, &launcher),
+            Err(ErrorCode::AccessDenied)
+        );
+        assert_eq!(vmar_map_authorize(&vmar, &child), Ok(()));
+        let _ = huesos_object::unregister_object(child.koid());
+    }
 }

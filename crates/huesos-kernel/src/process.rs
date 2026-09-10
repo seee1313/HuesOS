@@ -213,12 +213,16 @@ const ALL_VMAR_FLAGS: u32 = vmar_flags::READ
     | vmar_flags::USER
     | vmar_flags::SPECIFIC;
 
-/// Map a VMO into a process root VMAR at a fixed userspace address.
+/// Map a VMO into a process VMAR at a fixed userspace address.
 ///
-/// First-cut VMAR policy is deliberately strict: page-aligned VMO offsets,
-/// page-aligned fixed addresses, root VMAR only, user mappings only, and no
-/// W+X pages. Later commits can add child VMAR allocation and first-fit
-/// address selection without changing the ABI shape.
+/// VMAR policy is deliberately strict: page-aligned VMO offsets,
+/// page-aligned fixed addresses, user mappings only, and no W+X pages.
+/// The target may be the process root VMAR or a child VMAR of that
+/// process (both are bookkeeping views over the process's single address
+/// space; the record is stored in the VMAR the caller named). Map
+/// authorization is scoped to the VMAR's owning process (see
+/// `vmar_map_authorize` in the syscall layer), so in steady state a
+/// caller can only ever name VMARs of its own process.
 pub fn map_vmo_into_vmar(
     vmar: &Vmar,
     vmo: &huesos_object::Vmo,
@@ -237,9 +241,12 @@ pub fn map_vmo_into_vmar(
         .and_then(|runtime| runtime.downcast_mut::<ProcessRuntime>())
         .ok_or(ErrorCode::BadHandle)?;
 
-    if runtime.root_vmar.process() != vmar.process() {
-        return Err(ErrorCode::AccessDenied);
-    }
+    // The runtime was resolved from `vmar.process()`, so any VMAR object
+    // reached through it belongs to the address space we are about to
+    // mutate; the process-identity comparison that lived here used to be
+    // a tautology (always false) and has been retired in favor of this
+    // structural invariant guard.
+    debug_assert_eq!(runtime.root_vmar.process(), vmar.process());
 
     let page_flags = page_flags_from_vmar_flags(args.flags)?;
     let first_vmo_page = (args.vmo_offset / PAGE_SIZE) as usize;
