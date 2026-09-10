@@ -821,6 +821,49 @@ pub fn protect_vmar_mapping(vmar: &Vmar, args: VmarOpArgs) -> Result<u64, ErrorC
 /// rest is reserved address space that costs nothing until used.
 const USER_HEAP_EAGER_PAGES: u64 = 16;
 
+/// Outcome of processing one page of a `HeapExtend` COMMIT request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HeapCommitStep {
+    /// The page was already committed before this call; leave it alone.
+    Skip,
+    /// The page was committed by this call.
+    Committed,
+    /// Committing the page failed; the loop must stop.
+    Fail(ErrorCode),
+}
+
+/// Pure model of the `HeapExtend` COMMIT loop, extracted from the syscall
+/// body so the rollback policy is host-testable without page tables.
+///
+/// Walks `page_count` pages; `step(index)` decides what happens to page
+/// `index`. Returns the indices this call actually committed, in commit
+/// order, together with the first error. That list is the rollback set:
+/// on failure the caller releases exactly these pages. A counter-based
+/// rollback (unmap whatever is mapped, stopping at zero) destroys pages
+/// that were committed before the call whenever the request straddles
+/// them, corrupting live heap allocations and handing their frames back
+/// to the PMM while the syscall returns an error as if nothing happened.
+pub fn heap_commit_pages<C>(
+    page_count: usize,
+    mut step: C,
+) -> (alloc::vec::Vec<usize>, Result<(), ErrorCode>)
+where
+    C: FnMut(usize) -> HeapCommitStep,
+{
+    let mut committed = alloc::vec::Vec::new();
+    let result = (|| -> Result<(), ErrorCode> {
+        for index in 0..page_count {
+            match step(index) {
+                HeapCommitStep::Skip => {}
+                HeapCommitStep::Committed => committed.push(index),
+                HeapCommitStep::Fail(error) => return Err(error),
+            }
+        }
+        Ok(())
+    })();
+    (committed, result)
+}
+
 /// Commit or decommit pages inside the calling process's own heap window.
 ///
 /// This is the `mmap`/`munmap` substitute for a ring-3 process that
@@ -874,43 +917,42 @@ pub fn heap_extend_current(args: huesos_abi::HeapExtendArgs) -> Result<u64, Erro
     let address_space = runtime.address_space_mut().ok_or(ErrorCode::BadHandle)?;
 
     if args.op == heap_op::COMMIT {
-        let mut committed = 0usize;
-        let result = (|| -> Result<(), ErrorCode> {
-            for index in 0..page_count {
-                let page = Page::<Size4KiB>::containing_address(VirtAddr::new(
-                    base + index as u64 * PAGE_SIZE,
-                ));
-                if address_space.is_user_page_mapped(page) {
-                    continue;
-                }
-                address_space
+        let (committed_indices, result) = heap_commit_pages(page_count, |index| {
+            let page = Page::<Size4KiB>::containing_address(VirtAddr::new(
+                base + index as u64 * PAGE_SIZE,
+            ));
+            if address_space.is_user_page_mapped(page) {
+                // Idempotent re-commit: already committed before this call.
+                HeapCommitStep::Skip
+            } else {
+                match address_space
                     .map_new_user_page(page, flags::USER_RW | PageTableFlags::NO_EXECUTE)
-                    .map_err(|error| match error {
+                {
+                    Ok(_) => HeapCommitStep::Committed,
+                    Err(error) => HeapCommitStep::Fail(match error {
                         UserPageError::OutOfMemory => ErrorCode::NoMemory,
                         UserPageError::NotInitialized => ErrorCode::Internal,
                         UserPageError::AlreadyMapped => ErrorCode::Busy,
                         UserPageError::ParentHugePage
                         | UserPageError::NotMapped
                         | UserPageError::InvalidFrameAddress => ErrorCode::InvalidArgs,
-                    })?;
-                committed += 1;
+                    }),
+                }
             }
-            Ok(())
-        })();
+        });
 
         if let Err(error) = result {
             // Roll the transaction back: a partially grown heap would
-            // hand the allocator a region with a hole in it.
-            for index in (0..page_count).rev() {
-                if committed == 0 {
-                    break;
-                }
+            // hand the allocator a region with a hole in it. Release
+            // exactly the pages this call committed, in reverse order —
+            // never a page that was already mapped before the call (the
+            // re-commit pattern) and never a page at or beyond the
+            // failing index; both may hold live allocations.
+            for &index in committed_indices.iter().rev() {
                 let page = Page::<Size4KiB>::containing_address(VirtAddr::new(
                     base + index as u64 * PAGE_SIZE,
                 ));
-                if address_space.unmap_and_release_user_page(page).is_ok() {
-                    committed -= 1;
-                }
+                let _ = address_space.unmap_and_release_user_page(page);
             }
             return Err(error);
         }
@@ -1175,6 +1217,61 @@ pub fn teardown_process(process: &Process) {
 #[cfg(test)]
 mod tests {
     use super::initial_user_rsp;
+    use super::{heap_commit_pages, HeapCommitStep};
+    use huesos_abi::ErrorCode;
+
+    // Regression: the COMMIT rollback must release only the pages the
+    // failing call committed. The allocator re-commits growing regions
+    // (already-committed prefix, holes, and tail committed by earlier
+    // calls), so a request can straddle pages that were mapped before the
+    // call. The old counter-based rollback (unmap from the range end until
+    // the counter hit zero) released those live pages — and pages beyond
+    // the failure point — while returning NoMemory as if nothing happened.
+    #[test]
+    fn heap_commit_rollback_releases_only_pages_this_call_committed() {
+        // Pre-state: an earlier call committed [0..8) and page 19.
+        let mut mapped = [false; 20];
+        for i in 0..8 {
+            mapped[i] = true;
+        }
+        mapped[19] = true;
+
+        let fail_at = 12usize;
+        let (committed, result) = heap_commit_pages(20, |index| {
+            if mapped[index] {
+                HeapCommitStep::Skip
+            } else if index == fail_at {
+                HeapCommitStep::Fail(ErrorCode::NoMemory)
+            } else {
+                mapped[index] = true;
+                HeapCommitStep::Committed
+            }
+        });
+        assert_eq!(result, Err(ErrorCode::NoMemory));
+        // Exactly the gap this call filled — no prefix, no tail, nothing
+        // at or beyond the failing index.
+        assert_eq!(committed, alloc::vec![8usize, 9, 10, 11]);
+
+        // Apply the documented rollback: release exactly `committed`, in
+        // reverse order, and verify every pre-existing page survived.
+        for &index in committed.iter().rev() {
+            mapped[index] = false;
+        }
+        for i in 0..8 {
+            assert!(mapped[i], "previously committed page {i} was released");
+        }
+        assert!(
+            mapped[19],
+            "tail page committed before the call was released"
+        );
+    }
+
+    #[test]
+    fn heap_commit_full_recommit_commits_nothing() {
+        let (committed, result) = heap_commit_pages(4, |_| HeapCommitStep::Skip);
+        assert_eq!(result, Ok(()));
+        assert!(committed.is_empty());
+    }
 
     // SysV x86_64: (RSP + 8) % 16 == 0 on function entry, equivalently
     // RSP % 16 == 8. If this ever regresses, userspace SSE/AVX prologues
