@@ -52,7 +52,10 @@ User-approved decisions for PR `huesos-dev/hxfs-stage-b-io-pipeline`.
   at `0x70000000` on target. The process launcher now maps the
   fixed 256 KiB RW heap region for every process at creation
   (`finish_process_creation`), and the service's `HEAP_BASE` /
-  `HEAP_SIZE` come from `huesos_abi`. Also fixed while debugging
+  `HEAP_SIZE` come from `huesos_abi`. (Superseded since: the eager
+  region is now 64 KiB — `USER_HEAP_EAGER_PAGES` = 16 pages — plus a
+  bounded 18 MiB lazy-growth window the Scudo heap extends on demand
+  via `VmarHeapExtend`; see `docs/USER_MEMORY.md`.) Also fixed while debugging
   the soak: the writer's mount path decrypts v6 metadata *and*
   encrypted dirent names (the latter with the
   `ENCRYPTED_DIRENT_MIN_BODY` length discriminator, since the

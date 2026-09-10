@@ -13,12 +13,23 @@ are intentionally not treated as the versioned project baseline unless they are
 copied into `docs/` in a dedicated review. The versioned baseline remains this
 file plus `safety-budget.json`.
 
-At the current baseline (`safety-budget.json`) the repository contains 193
-first-party Rust files and 54,388 Rust lines. The measured surface is **265**
-unsafe blocks, **63** unsafe functions, **29** unsafe impls, one `static mut`,
-**25** unwrap calls, **21** expect calls, and **5** panic macros. Prior baseline
-values are retained in the changelog sections below so that any deviation
-between historical narrative and the current file is auditable.
+At the current baseline the repository contains 272 first-party Rust files
+and ~108,900 Rust lines. The measured surface (via `tools/audit-safety.py`)
+is **381** unsafe blocks, **76** unsafe functions, **33** unsafe impls, one
+`static mut`, **60** unwrap calls, **85** expect calls, and **13** panic
+macros. `safety-budget.json` stores the *maximums* the CI gate may not
+exceed (currently 382 / 76 / 33 / 1 / 69 / 85 / 13), not an exact snapshot.
+Prior baseline values are retained in the changelog sections below so that
+any deviation between historical narrative and the current file is
+auditable.
+
+> Drift note (2026-09, audit-fixes branch): since the last documented
+> changelog section (`unwrap_calls: 25 -> 47` in the EEVDF tree section) the
+> measured unwrap surface grew to 60 without a dedicated-review record, and
+> the budget maximum was raised to 69 in ordinary commits. CONTRIBUTING §1
+> requires a dedicated review for budget changes; the gap between the
+> measured value (60) and the maximum (69) should be closed by a
+> re-baseline review before any further growth is accepted.
 
 The baseline moved from `(unsafe_blocks=225, unwrap_calls=25)` to
 `(unsafe_blocks=232, unwrap_calls=30)` on the NVMe `PciMmioTransport`

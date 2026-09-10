@@ -231,6 +231,16 @@ report, other CPUs receive a panic-stop IPI, and no CPU reboots. See
 - No global namespaces — capabilities via handles.
 - Rights checked on handle-touching syscalls; handle duplication can only
   preserve or reduce rights, never add rights absent from the source.
+- VMAR capabilities are scoped to their owner: every VMAR-mutating
+  syscall authorizes against the VMAR's owning process. `VmarMap`
+  allows the owner at any time and, before the owning process's first
+  thread starts, the launcher installing the initial image; after start,
+  a VMAR handle held by any other process is inert. `VmarUnmap`,
+  `VmarProtect`, and `VmarCreateChild` require the caller to own the
+  VMAR outright. This keeps the parent-forwards-child's-root-VMAR
+  bootstrap flow (e.g. driver-manager to acpi-manager) working while a
+  forwarded handle can never install, overlap-block, or re-flag
+  mappings in another running process's address space.
 - W^X on user pages (`NO_EXECUTE` requires `EFER.NXE` on **every** CPU).
 - Syscall user pointers are range-checked and page-table-checked before an
   audited copy; kernel-half pointers and supervisor-only mappings are rejected.

@@ -450,3 +450,45 @@ pub(crate) fn sys_channel_consume(args_ptr: *const ChannelConsumeArgs) -> Syscal
     )?;
     Ok(0)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::validate_move_dispositions;
+    use huesos_abi::ErrorCode;
+    use huesos_object::{Handle, KernelObject, Process, Rights, Vmar};
+
+    /// Regression pin for the isolated-service bootstrap flow: the launcher
+    /// (driver-manager) holds a copy of the child's root VMAR and forwards it
+    /// over the bootstrap channel to the child (acpi-manager), which then maps
+    /// the ACPI archive into its own address space. That move must be
+    /// admitted by channel transfer validation. The security property is
+    /// enforced at the syscall layer instead: `sys_vmar_map` authorizes a
+    /// mapping only for the VMAR's owner (or during the launch window), so a
+    /// VMAR handle held by any unrelated process is inert.
+    #[test]
+    fn launcher_can_forward_child_root_vmar() {
+        let child = Process::new("acpi-manager");
+        let launcher = Process::new("driver-manager");
+        let vmar = Vmar::new_root(child.koid(), 0x10000, 0x100000);
+        let hv = launcher.handles.add(Handle::new(
+            vmar.koid(),
+            Rights::DEFAULT | Rights::SET_PROPERTY,
+        ));
+        assert_eq!(validate_move_dispositions(&launcher, &[hv]), Ok(()));
+    }
+
+    /// Handles without the TRANSFER right are still rejected at the channel
+    /// boundary; the restriction is rights-based, not object-type-based.
+    #[test]
+    fn vmar_handle_without_transfer_right_is_rejected() {
+        let child = Process::new("acpi-manager");
+        let launcher = Process::new("driver-manager");
+        let vmar = Vmar::new_root(child.koid(), 0x10000, 0x100000);
+        let no_transfer = Rights::READ | Rights::WRITE | Rights::SET_PROPERTY;
+        let hv = launcher.handles.add(Handle::new(vmar.koid(), no_transfer));
+        assert_eq!(
+            validate_move_dispositions(&launcher, &[hv]),
+            Err(ErrorCode::AccessDenied)
+        );
+    }
+}

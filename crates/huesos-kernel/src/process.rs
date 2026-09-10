@@ -213,12 +213,16 @@ const ALL_VMAR_FLAGS: u32 = vmar_flags::READ
     | vmar_flags::USER
     | vmar_flags::SPECIFIC;
 
-/// Map a VMO into a process root VMAR at a fixed userspace address.
+/// Map a VMO into a process VMAR at a fixed userspace address.
 ///
-/// First-cut VMAR policy is deliberately strict: page-aligned VMO offsets,
-/// page-aligned fixed addresses, root VMAR only, user mappings only, and no
-/// W+X pages. Later commits can add child VMAR allocation and first-fit
-/// address selection without changing the ABI shape.
+/// VMAR policy is deliberately strict: page-aligned VMO offsets,
+/// page-aligned fixed addresses, user mappings only, and no W+X pages.
+/// The target may be the process root VMAR or a child VMAR of that
+/// process (both are bookkeeping views over the process's single address
+/// space; the record is stored in the VMAR the caller named). Map
+/// authorization is scoped to the VMAR's owning process (see
+/// `vmar_map_authorize` in the syscall layer), so in steady state a
+/// caller can only ever name VMARs of its own process.
 pub fn map_vmo_into_vmar(
     vmar: &Vmar,
     vmo: &huesos_object::Vmo,
@@ -237,9 +241,12 @@ pub fn map_vmo_into_vmar(
         .and_then(|runtime| runtime.downcast_mut::<ProcessRuntime>())
         .ok_or(ErrorCode::BadHandle)?;
 
-    if runtime.root_vmar.process() != vmar.process() {
-        return Err(ErrorCode::AccessDenied);
-    }
+    // The runtime was resolved from `vmar.process()`, so any VMAR object
+    // reached through it belongs to the address space we are about to
+    // mutate; the process-identity comparison that lived here used to be
+    // a tautology (always false) and has been retired in favor of this
+    // structural invariant guard.
+    debug_assert_eq!(runtime.root_vmar.process(), vmar.process());
 
     let page_flags = page_flags_from_vmar_flags(args.flags)?;
     let first_vmo_page = (args.vmo_offset / PAGE_SIZE) as usize;
@@ -411,11 +418,12 @@ pub fn map_resource_into_current(
         return Err(error);
     }
 
-    huesos_arch::paging::shootdown_range(
-        args.addr,
-        args.addr + args.len,
-        crate::scheduler::online_remote_cpu_count(),
-    );
+    // No TLB shootdown: the overlap check guarantees these page-table
+    // entries were absent, so no CPU can hold a stale positive
+    // translation for them (the same argument as the HeapExtend COMMIT
+    // path). An IPI handshake here would also run the global shootdown
+    // mailbox without the VMAR mutation lock, breaking the shootdown's
+    // one-request-in-flight contract.
     Ok(args.addr)
 }
 
@@ -821,6 +829,49 @@ pub fn protect_vmar_mapping(vmar: &Vmar, args: VmarOpArgs) -> Result<u64, ErrorC
 /// rest is reserved address space that costs nothing until used.
 const USER_HEAP_EAGER_PAGES: u64 = 16;
 
+/// Outcome of processing one page of a `HeapExtend` COMMIT request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HeapCommitStep {
+    /// The page was already committed before this call; leave it alone.
+    Skip,
+    /// The page was committed by this call.
+    Committed,
+    /// Committing the page failed; the loop must stop.
+    Fail(ErrorCode),
+}
+
+/// Pure model of the `HeapExtend` COMMIT loop, extracted from the syscall
+/// body so the rollback policy is host-testable without page tables.
+///
+/// Walks `page_count` pages; `step(index)` decides what happens to page
+/// `index`. Returns the indices this call actually committed, in commit
+/// order, together with the first error. That list is the rollback set:
+/// on failure the caller releases exactly these pages. A counter-based
+/// rollback (unmap whatever is mapped, stopping at zero) destroys pages
+/// that were committed before the call whenever the request straddles
+/// them, corrupting live heap allocations and handing their frames back
+/// to the PMM while the syscall returns an error as if nothing happened.
+pub fn heap_commit_pages<C>(
+    page_count: usize,
+    mut step: C,
+) -> (alloc::vec::Vec<usize>, Result<(), ErrorCode>)
+where
+    C: FnMut(usize) -> HeapCommitStep,
+{
+    let mut committed = alloc::vec::Vec::new();
+    let result = (|| -> Result<(), ErrorCode> {
+        for index in 0..page_count {
+            match step(index) {
+                HeapCommitStep::Skip => {}
+                HeapCommitStep::Committed => committed.push(index),
+                HeapCommitStep::Fail(error) => return Err(error),
+            }
+        }
+        Ok(())
+    })();
+    (committed, result)
+}
+
 /// Commit or decommit pages inside the calling process's own heap window.
 ///
 /// This is the `mmap`/`munmap` substitute for a ring-3 process that
@@ -874,43 +925,42 @@ pub fn heap_extend_current(args: huesos_abi::HeapExtendArgs) -> Result<u64, Erro
     let address_space = runtime.address_space_mut().ok_or(ErrorCode::BadHandle)?;
 
     if args.op == heap_op::COMMIT {
-        let mut committed = 0usize;
-        let result = (|| -> Result<(), ErrorCode> {
-            for index in 0..page_count {
-                let page = Page::<Size4KiB>::containing_address(VirtAddr::new(
-                    base + index as u64 * PAGE_SIZE,
-                ));
-                if address_space.is_user_page_mapped(page) {
-                    continue;
-                }
-                address_space
+        let (committed_indices, result) = heap_commit_pages(page_count, |index| {
+            let page = Page::<Size4KiB>::containing_address(VirtAddr::new(
+                base + index as u64 * PAGE_SIZE,
+            ));
+            if address_space.is_user_page_mapped(page) {
+                // Idempotent re-commit: already committed before this call.
+                HeapCommitStep::Skip
+            } else {
+                match address_space
                     .map_new_user_page(page, flags::USER_RW | PageTableFlags::NO_EXECUTE)
-                    .map_err(|error| match error {
+                {
+                    Ok(_) => HeapCommitStep::Committed,
+                    Err(error) => HeapCommitStep::Fail(match error {
                         UserPageError::OutOfMemory => ErrorCode::NoMemory,
                         UserPageError::NotInitialized => ErrorCode::Internal,
                         UserPageError::AlreadyMapped => ErrorCode::Busy,
                         UserPageError::ParentHugePage
                         | UserPageError::NotMapped
                         | UserPageError::InvalidFrameAddress => ErrorCode::InvalidArgs,
-                    })?;
-                committed += 1;
+                    }),
+                }
             }
-            Ok(())
-        })();
+        });
 
         if let Err(error) = result {
             // Roll the transaction back: a partially grown heap would
-            // hand the allocator a region with a hole in it.
-            for index in (0..page_count).rev() {
-                if committed == 0 {
-                    break;
-                }
+            // hand the allocator a region with a hole in it. Release
+            // exactly the pages this call committed, in reverse order —
+            // never a page that was already mapped before the call (the
+            // re-commit pattern) and never a page at or beyond the
+            // failing index; both may hold live allocations.
+            for &index in committed_indices.iter().rev() {
                 let page = Page::<Size4KiB>::containing_address(VirtAddr::new(
                     base + index as u64 * PAGE_SIZE,
                 ));
-                if address_space.unmap_and_release_user_page(page).is_ok() {
-                    committed -= 1;
-                }
+                let _ = address_space.unmap_and_release_user_page(page);
             }
             return Err(error);
         }
@@ -931,6 +981,10 @@ pub fn heap_extend_current(args: huesos_abi::HeapExtendArgs) -> Result<u64, Erro
     drop(runtime_guard);
     // Removing mappings *does* require invalidating other CPUs, or a
     // stale TLB entry would keep a freed frame reachable from ring 3.
+    // The shootdown's global mailbox is only safe with one request in
+    // flight system-wide, so hold the VMAR mutation lock across the IPI
+    // handshake, matching the unmap/protect transaction paths.
+    let _mutation_guard = VMAR_MUTATION_LOCK.lock();
     huesos_arch::paging::shootdown_range(
         base,
         base + args.len,
@@ -1175,6 +1229,61 @@ pub fn teardown_process(process: &Process) {
 #[cfg(test)]
 mod tests {
     use super::initial_user_rsp;
+    use super::{heap_commit_pages, HeapCommitStep};
+    use huesos_abi::ErrorCode;
+
+    // Regression: the COMMIT rollback must release only the pages the
+    // failing call committed. The allocator re-commits growing regions
+    // (already-committed prefix, holes, and tail committed by earlier
+    // calls), so a request can straddle pages that were mapped before the
+    // call. The old counter-based rollback (unmap from the range end until
+    // the counter hit zero) released those live pages — and pages beyond
+    // the failure point — while returning NoMemory as if nothing happened.
+    #[test]
+    fn heap_commit_rollback_releases_only_pages_this_call_committed() {
+        // Pre-state: an earlier call committed [0..8) and page 19.
+        let mut mapped = [false; 20];
+        for i in 0..8 {
+            mapped[i] = true;
+        }
+        mapped[19] = true;
+
+        let fail_at = 12usize;
+        let (committed, result) = heap_commit_pages(20, |index| {
+            if mapped[index] {
+                HeapCommitStep::Skip
+            } else if index == fail_at {
+                HeapCommitStep::Fail(ErrorCode::NoMemory)
+            } else {
+                mapped[index] = true;
+                HeapCommitStep::Committed
+            }
+        });
+        assert_eq!(result, Err(ErrorCode::NoMemory));
+        // Exactly the gap this call filled — no prefix, no tail, nothing
+        // at or beyond the failing index.
+        assert_eq!(committed, alloc::vec![8usize, 9, 10, 11]);
+
+        // Apply the documented rollback: release exactly `committed`, in
+        // reverse order, and verify every pre-existing page survived.
+        for &index in committed.iter().rev() {
+            mapped[index] = false;
+        }
+        for i in 0..8 {
+            assert!(mapped[i], "previously committed page {i} was released");
+        }
+        assert!(
+            mapped[19],
+            "tail page committed before the call was released"
+        );
+    }
+
+    #[test]
+    fn heap_commit_full_recommit_commits_nothing() {
+        let (committed, result) = heap_commit_pages(4, |_| HeapCommitStep::Skip);
+        assert_eq!(result, Ok(()));
+        assert!(committed.is_empty());
+    }
 
     // SysV x86_64: (RSP + 8) % 16 == 0 on function entry, equivalently
     // RSP % 16 == 8. If this ever regresses, userspace SSE/AVX prologues
