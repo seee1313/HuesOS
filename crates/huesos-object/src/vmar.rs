@@ -340,11 +340,56 @@ impl KernelObject for Vmar {
 }
 
 fn ranges_overlap(a_base: u64, a_size: u64, b_base: u64, b_size: u64) -> bool {
+    // An empty range overlaps nothing. (This used to count as an overlap
+    // — a trap for future callers; current call sites all pass
+    // validated non-zero sizes, so the behavior change is invisible to
+    // them.)
+    if a_size == 0 || b_size == 0 {
+        return false;
+    }
     let Some(a_end) = a_base.checked_add(a_size) else {
         return true;
     };
     let Some(b_end) = b_base.checked_add(b_size) else {
         return true;
     };
-    a_size == 0 || b_size == 0 || (a_base < b_end && b_base < a_end)
+    a_base < b_end && b_base < a_end
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ranges_overlap, Vmar, VmarError, VmarMapping};
+    use crate::Koid;
+
+    #[test]
+    fn empty_ranges_do_not_overlap() {
+        assert!(!ranges_overlap(0x1000, 0, 0x1000, 0x1000));
+        assert!(!ranges_overlap(0x1000, 0x1000, 0x1000, 0));
+        assert!(!ranges_overlap(0x1000, 0, 0x2000, 0));
+    }
+
+    #[test]
+    fn overlapping_and_adjacent_ranges() {
+        assert!(ranges_overlap(0x1000, 0x1000, 0x1000, 0x1000));
+        assert!(ranges_overlap(0x1000, 0x1000, 0x1fff, 0x1000));
+        assert!(!ranges_overlap(0x1000, 0x1000, 0x2000, 0x1000));
+    }
+
+    #[test]
+    fn zero_size_candidate_is_rejected_as_invalid_not_overlap() {
+        let root = Vmar::new_root(Koid(1), 0x10000, 0x100000);
+        let base = VmarMapping {
+            base: 0x10000,
+            size: 0x1000,
+            vmo: Koid(2),
+            vmo_offset: 0,
+            flags: 0,
+        };
+        assert!(root.record_mapping(base).is_ok());
+        // A zero-size candidate must fail with InvalidRange (from
+        // contains_range), not be reported as overlapping the existing
+        // mapping.
+        let empty = VmarMapping { size: 0, ..base };
+        assert_eq!(root.record_mapping(empty), Err(VmarError::InvalidRange));
+    }
 }
