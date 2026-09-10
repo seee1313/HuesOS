@@ -47,9 +47,16 @@ at the transaction boundary.
 
 Empty intermediate tables created by a failed transaction remain owned by the
 address space and are reclaimed by its normal recursive destruction. Data
-frames remain VMO-owned throughout rollback. The MVP mutation API requires an
-exact existing mapping range; splitting mappings and child VMAR trees remain
-future work.
+frames remain VMO-owned throughout rollback. The user-heap COMMIT path
+(`heap_commit_pages`) tracks the exact indices of the pages it maps itself
+and releases only those on a later page-installation failure; pages that
+were already mapped are skipped and left as-is.
+
+Splitting mappings and child VMAR trees are now implemented: `VmarUnmap`
+and `VmarProtect` accept a page-aligned subrange covered by one mapping and
+split the record transactionally, and `VmarCreateChild` creates a child
+VMAR inside its parent's reserved range. Mappings can be installed into
+either the root or a child VMAR.
 
 ## Finished task ownership
 
