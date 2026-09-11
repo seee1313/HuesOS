@@ -55,7 +55,8 @@ User-approved decisions for PR `huesos-dev/hxfs-stage-b-io-pipeline`.
   `HEAP_SIZE` come from `huesos_abi`. (Superseded since: the eager
   region is now 64 KiB — `USER_HEAP_EAGER_PAGES` = 16 pages — plus a
   bounded 18 MiB lazy-growth window the Scudo heap extends on demand
-  via `VmarHeapExtend`; see `docs/USER_MEMORY.md`.) Also fixed while debugging
+  via `VmarHeapExtend`; see the `USER_HEAP_*` doc comments in
+  `huesos-abi` and the Scudo section of `docs/UNSAFE_AUDIT.md`.) Also fixed while debugging
   the soak: the writer's mount path decrypts v6 metadata *and*
   encrypted dirent names (the latter with the
   `ENCRYPTED_DIRENT_MIN_BODY` length discriminator, since the
