@@ -246,4 +246,11 @@ report, other CPUs receive a panic-stop IPI, and no CPU reboots. See
   audited copy; kernel-half pointers and supervisor-only mappings are rejected.
 - Per-call transfer limits bound attacker-controlled temporary allocations.
 - Jobs exist but do not yet enforce aggregate quotas.
-- SMEP/SMAP and fault-recoverable copies remain future hardening.
+- SMEP/SMAP are enabled through CPUID-gated CR4 updates on every CPU
+  (the QEMU `qemu64` smoke matrix lacks the feature and reports
+  "degraded: SMEP/SMAP unavailable"; the bits are set on supporting
+  hardware).
+- Fault-recoverable user copies are implemented (extable): the ring-0
+  `#PF` path consults the fixup table, and the user-memory bulk-copy
+  and typed-ABI helpers are extable-covered — see
+  `docs/RECOVERABLE_COPIES.md`.
