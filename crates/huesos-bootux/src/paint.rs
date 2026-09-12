@@ -213,7 +213,9 @@ pub fn layout(width: u32, height: u32, cell_h: u32, stage_count: usize) -> Layou
     // Defensive: an oversized custom stage table must not run into the
     // bar — shrink the pitch instead of overflowing the frame.
     if list_y + list_h + 8 > bar_y {
-        let room = bar_y.saturating_sub(list_y + 8).min(height.saturating_sub(list_y + 8));
+        let room = bar_y
+            .saturating_sub(list_y + 8)
+            .min(height.saturating_sub(list_y + 8));
         line_h = (room / lines).max(cell_h.min(16));
         list_h = lines * line_h;
     }
@@ -320,8 +322,14 @@ mod tests {
             for stage_count in [5usize, crate::config::MAX_STAGES] {
                 let layout = layout(w, h, 13, stage_count);
                 assert!(layout.bar_x + layout.bar_w <= w, "bar overflows at {w}x{h}");
-                assert!(layout.bar_y + layout.bar_h <= h, "bar below frame at {w}x{h}");
-                assert!(layout.list_y + layout.list_h <= h, "list below frame at {w}x{h}");
+                assert!(
+                    layout.bar_y + layout.bar_h <= h,
+                    "bar below frame at {w}x{h}"
+                );
+                assert!(
+                    layout.list_y + layout.list_h <= h,
+                    "list below frame at {w}x{h}"
+                );
                 // Brand line fits one font row below its origin.
                 assert!(layout.brand_y + 13 <= h, "brand at {w}x{h}");
                 // The status list ends well above the progress bar, so
@@ -376,23 +384,43 @@ mod tests {
         use crate::progress::StageState;
         let unit = "HuesOS Storage Service";
         assert_eq!(
-            format!("{prefix}{unit}{suffix}", prefix = line_prefix(StageState::Running), suffix = line_suffix(StageState::Running)),
+            format!(
+                "{prefix}{unit}{suffix}",
+                prefix = line_prefix(StageState::Running),
+                suffix = line_suffix(StageState::Running)
+            ),
             "Starting HuesOS Storage Service..."
         );
         assert_eq!(
-            format!("{prefix}{unit}{suffix}", prefix = line_prefix(StageState::Done), suffix = line_suffix(StageState::Done)),
+            format!(
+                "{prefix}{unit}{suffix}",
+                prefix = line_prefix(StageState::Done),
+                suffix = line_suffix(StageState::Done)
+            ),
             "Started HuesOS Storage Service."
         );
         assert_eq!(
-            format!("{prefix}{unit}{suffix}", prefix = line_prefix(StageState::Degraded), suffix = line_suffix(StageState::Degraded)),
+            format!(
+                "{prefix}{unit}{suffix}",
+                prefix = line_prefix(StageState::Degraded),
+                suffix = line_suffix(StageState::Degraded)
+            ),
             "Started HuesOS Storage Service (degraded)."
         );
         assert_eq!(
-            format!("{prefix}{unit}{suffix}", prefix = line_prefix(StageState::Failed), suffix = line_suffix(StageState::Failed)),
+            format!(
+                "{prefix}{unit}{suffix}",
+                prefix = line_prefix(StageState::Failed),
+                suffix = line_suffix(StageState::Failed)
+            ),
             "Failed to start HuesOS Storage Service."
         );
         assert_eq!(
-            format!("{prefix}{unit}{suffix}", prefix = line_prefix(StageState::Skipped), suffix = line_suffix(StageState::Skipped)),
+            format!(
+                "{prefix}{unit}{suffix}",
+                prefix = line_prefix(StageState::Skipped),
+                suffix = line_suffix(StageState::Skipped)
+            ),
             "HuesOS Storage Service not started."
         );
     }
@@ -422,5 +450,4 @@ mod tests {
             Rgb::new(255, 255, 255)
         );
     }
-
 }

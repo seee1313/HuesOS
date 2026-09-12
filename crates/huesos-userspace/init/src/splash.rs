@@ -89,7 +89,12 @@ impl Splash {
     /// UART-only and the caller enables the text console instead.
     pub fn new(config: &InitConfig) -> Option<Self> {
         let canvas = Canvas::new_fullscreen().ok()?;
-        let layout = paint::layout(canvas.width(), canvas.height(), CELL_H, config.stages().len());
+        let layout = paint::layout(
+            canvas.width(),
+            canvas.height(),
+            CELL_H,
+            config.stages().len(),
+        );
         // The splash carries the image's own version unless the operator
         // overrode it in config; an empty configured version is the
         // "not set" marker, not a request for a blank brand line.
@@ -266,7 +271,11 @@ impl Splash {
                 line_suffix(stage.state),
             );
             let text = core::str::from_utf8(&message[..written]).unwrap_or("");
-            self.draw_line(layout.list_y + row * layout.line_h, stage_tag(stage.state), text);
+            self.draw_line(
+                layout.list_y + row * layout.line_h,
+                stage_tag(stage.state),
+                text,
+            );
             row += 1;
         }
 
@@ -278,15 +287,14 @@ impl Splash {
             let (tag, message) = if failed {
                 (paint::StageTag::Failed, "Failed to reach HuesOS Shell.")
             } else if degraded {
-                (paint::StageTag::Warn, "Reached target HuesOS Shell (degraded).")
+                (
+                    paint::StageTag::Warn,
+                    "Reached target HuesOS Shell (degraded).",
+                )
             } else {
                 (paint::StageTag::Ok, "Reached target HuesOS Shell.")
             };
-            self.draw_line(
-                layout.list_y + row * layout.line_h,
-                tag,
-                message,
-            );
+            self.draw_line(layout.list_y + row * layout.line_h, tag, message);
             self.draw_line(
                 layout.list_y + (row + 1) * layout.line_h,
                 paint::StageTag::Blank,
@@ -295,9 +303,12 @@ impl Splash {
         }
 
         let bottom = (layout.list_y + layout.list_h).min(layout.height);
-        let _ = self
-            .canvas
-            .present_region(0, layout.list_y, layout.width, bottom.saturating_sub(layout.list_y));
+        let _ = self.canvas.present_region(
+            0,
+            layout.list_y,
+            layout.width,
+            bottom.saturating_sub(layout.list_y),
+        );
     }
 
     /// One status line: fixed-width tag column, then the message.
@@ -359,9 +370,12 @@ impl Splash {
                 FONT,
             );
         }
-        let _ = self
-            .canvas
-            .present_region(0, y, layout.width, (CELL_H + 2).min(layout.height.saturating_sub(y)));
+        let _ = self.canvas.present_region(
+            0,
+            y,
+            layout.width,
+            (CELL_H + 2).min(layout.height.saturating_sub(y)),
+        );
     }
 
     /// Paint the final frame, forcing a redraw even if the bar value is
@@ -389,7 +403,11 @@ impl Splash {
 /// appearing — flips the signature, which is exactly when the list band
 /// needs repainting.
 fn list_signature(progress: &BootProgress) -> u64 {
-    let mut signature = if progress.all_settled() { 1u64 << 56 } else { 0 };
+    let mut signature = if progress.all_settled() {
+        1u64 << 56
+    } else {
+        0
+    };
     for (index, stage) in progress.stages().iter().enumerate() {
         let code = match stage.state {
             StageState::Pending => 0u64,
