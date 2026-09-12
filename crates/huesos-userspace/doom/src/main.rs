@@ -95,13 +95,56 @@ pub extern "C" fn _start() -> ! {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn DG_Init() {
+    // Collect the bootstrap capabilities *before* creating any canvas:
+    // the `FrameDraw` duplicate is stored on the canvas at construction,
+    // and without it every present would bounce AccessDenied and Doom
+    // would run with a frozen screen behind it (init keeps its own copy,
+    // so the terminal would keep redrawing over the game anyway).
+    let bootstrap = libcanvas::channel::bootstrap();
+    let mut message = [0u8; 32];
+    let mut frame_draw: Option<huesos_abi::HandleValue> = None;
+    loop {
+        match bootstrap.read_optional_handle(&mut message) {
+            Ok((n, Some(handle))) if &message[..n] == b"keyboard" => {
+                STATE.with(|state| state.keyboard = Some(Channel::from_handle(handle)));
+            }
+            Ok((n, Some(handle))) if &message[..n] == b"framedraw" => {
+                frame_draw = Some(handle.raw());
+                libcanvas::println!("[doom] FrameDraw capability received");
+            }
+            Ok((20, Some(handle))) if &message[..4] == b"wad\0" => {
+                let offset = read_u64(&message[4..12]);
+                let len = read_u64(&message[12..20]);
+                STATE.with(|state| {
+                    state.wad = Some(Vmo::from_handle(handle));
+                    state.wad_offset = offset;
+                    state.wad_len = len;
+                });
+            }
+            Ok(_) | Err(ErrorCode::ShouldWait | ErrorCode::TimedOut | ErrorCode::InvalidArgs) => {
+                libcanvas::process::yield_now();
+            }
+            Err(_) => break,
+        }
+        let ready = STATE.with(|state| state.keyboard.is_some() && state.wad.is_some())
+            && frame_draw.is_some();
+        if ready {
+            break;
+        }
+    }
+    core::mem::forget(bootstrap);
+
     if let Ok(info) = libcanvas::framebuffer::info() {
         let output_bpp = (info.bpp as u32).div_ceil(8);
         let (width, height) = adaptive_output_size(info.width, info.height);
         if output_bpp == 4 {
             // Clear pixels outside the bounded game viewport once. Subsequent
             // frames present only the smaller Doom canvas.
-            if let Ok(background) = Canvas::new_fullscreen() {
+            let background = match frame_draw {
+                Some(cap) => Canvas::new_fullscreen_with_cap(cap),
+                None => Canvas::new_fullscreen(),
+            };
+            if let Ok(background) = background {
                 let _ = background.fill_rect(0, 0, info.width, info.height, 3, 6, 12);
                 let _ = background.present();
             }
@@ -122,45 +165,25 @@ pub extern "C" fn DG_Init() {
             state.output_y = info.height.saturating_sub(height) / 2;
             state.output_bpp = output_bpp;
             state.canvas = if output_bpp == 4 {
-                Canvas::new(width, height).ok()
+                match frame_draw {
+                    Some(cap) => Canvas::new_with_cap(width, height, cap).ok(),
+                    None => Canvas::new(width, height).ok(),
+                }
             } else {
                 state.output_width = DOOM_WIDTH as u32;
                 state.output_height = DOOM_HEIGHT as u32;
                 state.output_x = 0;
                 state.output_y = 0;
                 state.output_bpp = 4;
-                Canvas::new(DOOM_WIDTH as u32, DOOM_HEIGHT as u32).ok()
+                match frame_draw {
+                    Some(cap) => {
+                        Canvas::new_with_cap(DOOM_WIDTH as u32, DOOM_HEIGHT as u32, cap).ok()
+                    }
+                    None => Canvas::new(DOOM_WIDTH as u32, DOOM_HEIGHT as u32).ok(),
+                }
             };
         });
     }
-
-    let bootstrap = libcanvas::channel::bootstrap();
-    let mut message = [0u8; 32];
-    loop {
-        match bootstrap.read_optional_handle(&mut message) {
-            Ok((n, Some(handle))) if &message[..n] == b"keyboard" => {
-                STATE.with(|state| state.keyboard = Some(Channel::from_handle(handle)));
-            }
-            Ok((20, Some(handle))) if &message[..4] == b"wad\0" => {
-                let offset = read_u64(&message[4..12]);
-                let len = read_u64(&message[12..20]);
-                STATE.with(|state| {
-                    state.wad = Some(Vmo::from_handle(handle));
-                    state.wad_offset = offset;
-                    state.wad_len = len;
-                });
-            }
-            Ok(_) | Err(ErrorCode::ShouldWait | ErrorCode::TimedOut | ErrorCode::InvalidArgs) => {
-                libcanvas::process::yield_now();
-            }
-            Err(_) => break,
-        }
-        let ready = STATE.with(|state| state.keyboard.is_some() && state.wad.is_some());
-        if ready {
-            break;
-        }
-    }
-    core::mem::forget(bootstrap);
 }
 
 fn adaptive_output_size(framebuffer_width: u32, framebuffer_height: u32) -> (u32, u32) {

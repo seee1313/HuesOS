@@ -5,7 +5,7 @@ use crate::commands::execute_line;
 use crate::println;
 use crate::screen::Screen;
 use crate::snake;
-use libcanvas::{Channel, ErrorCode};
+use libcanvas::{Channel, ErrorCode, HandleValue};
 
 const INPUT_MAX: usize = 128;
 
@@ -17,6 +17,9 @@ pub struct Shell {
     keyboard: Channel,
     filesystem: Option<Channel>,
     supervisor: Channel,
+    /// `FrameDraw` capability delivered by init; `None` on serial-only
+    /// boots or when init's transfer failed.
+    frame_draw: Option<HandleValue>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -49,8 +52,13 @@ fn decode_keyboard_event(msg: &[u8]) -> Option<Key> {
 
 impl Shell {
     /// Create shell screen using an already-open keyboard service channel.
-    pub fn new(keyboard: Channel, filesystem: Option<Channel>, supervisor: Channel) -> Self {
-        let mut screen = Screen::new();
+    pub fn new(
+        keyboard: Channel,
+        filesystem: Option<Channel>,
+        supervisor: Channel,
+        frame_draw: Option<HandleValue>,
+    ) -> Self {
+        let mut screen = Screen::new_with_cap(frame_draw);
         screen.clear();
         screen.write_line("HuesOS Terminal");
         screen.write_line("Type 'help' to list available commands.");
@@ -64,6 +72,7 @@ impl Shell {
             keyboard,
             filesystem,
             supervisor,
+            frame_draw,
         };
         shell.prompt();
         shell.screen.render();
@@ -155,7 +164,7 @@ impl Shell {
                     self.run_doom();
                 } else if trimmed == "snake" || trimmed == "snake hard" {
                     let hard = trimmed.ends_with("hard");
-                    snake::run(&self.keyboard, hard);
+                    snake::run(&self.keyboard, hard, self.frame_draw);
                     self.redraw_after_game(hard);
                 } else if trimmed == "shutdown" {
                     self.request_shutdown();

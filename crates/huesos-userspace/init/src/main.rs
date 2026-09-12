@@ -296,6 +296,12 @@ pub extern "C" fn _start() -> ! {
 
     if let Some((_, channel)) = &terminal {
         send_terminal_registry_channel(&mut logger, channel, registry_pair);
+        // The screen handoff above stops init's own drawing; from this
+        // point the terminal must be able to blit on its own. Deliver
+        // the FrameDraw duplicate after the final frame is on screen so
+        // the first pixels the terminal presents do not race init's
+        // last present.
+        send_frame_draw_capability(&mut logger, channel, "terminal");
     }
 
     if boot_failed {
@@ -403,7 +409,12 @@ fn launch_doom(
             .write_handle(&metadata, wad_vmo.into_handle())
             .map_err(|(error, _handle)| error)?;
 
-        init_logln!(logger, "[init] Doom keyboard and read-only WAD VMO passed");
+        // Doom renders fullscreen and would otherwise blit with the
+        // init-only FrameDraw slot (AccessDenied on every frame, exactly
+        // the frozen-screen failure mode). It receives its own duplicate
+        // like the terminal did at handoff.
+        send_frame_draw_capability(logger, &bootstrap, "doom");
+        init_logln!(logger, "[init] Doom keyboard, WAD VMO and FrameDraw passed");
         terminal.write(b"doom:started")?;
         Ok(process)
     })();
@@ -1421,6 +1432,54 @@ fn launch_shutdown_broker(logger: &mut InitLogger) -> Option<(Process, Channel)>
             return None;
         }
         libcanvas::process::yield_now();
+    }
+}
+
+/// Deliver a `FrameDraw` capability duplicate to a graphics consumer.
+///
+/// The kernel mints exactly one exclusive `FrameDraw` resource and
+/// installs it at `INIT_FRAME_DRAW_HANDLE` in the initial process. A second *mint* of the kind is impossible — the
+/// per-kind overlap check rejects any other resource over `[0, 1)` —
+/// so several consumers (terminal, doom, ...) are onboarded by
+/// duplicating the installed handle and transferring each duplicate
+/// over the consumer's bootstrap channel. Every consumer ends up
+/// holding a live handle to the same single resource; the kernel's
+/// per-caller blit check stays the only gate, and no new authority is
+/// ever minted.
+///
+/// Without this handoff every consumer's blit bounces with
+/// `AccessDenied` (their handle tables hold no `FrameDraw` slot), and
+/// the screen freezes on the last frame init itself drew.
+fn send_frame_draw_capability(logger: &mut InitLogger, bootstrap: &Channel, consumer: &str) {
+    let installed = libcanvas::handle::Handle::take_init_frame_draw();
+    let duplicate_rights = libcanvas::rights::DUPLICATE
+        | libcanvas::rights::TRANSFER
+        | libcanvas::rights::READ
+        | libcanvas::rights::WRITE;
+    let duplicate = match installed.duplicate(duplicate_rights) {
+        Ok(duplicate) => duplicate,
+        Err(error) => {
+            init_logln!(
+                logger,
+                "[init] FrameDraw duplicate for {} failed: {}",
+                consumer,
+                error.as_str()
+            );
+            return;
+        }
+    };
+    match bootstrap.write_handle(b"framedraw", duplicate) {
+        Ok(()) => init_logln!(
+            logger,
+            "[init] FrameDraw capability transferred to {}",
+            consumer
+        ),
+        Err((error, _handle)) => init_logln!(
+            logger,
+            "[init] FrameDraw transfer to {} failed: {}",
+            consumer,
+            error.as_str()
+        ),
     }
 }
 

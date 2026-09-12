@@ -593,7 +593,16 @@ fn install_frame_draw_capability(process: &huesos_object::Process) -> bool {
     let koid = resource.koid();
     // `Resource::try_create_exclusive` already registered the
     // resource in the global registry; do not register_object again.
-    let rights = Rights::READ | Rights::WRITE | Rights::TRANSFER;
+    //
+    // `DUPLICATE` is load-bearing: a second *mint* of `FrameDraw` is
+    // impossible (the per-kind overlap check rejects another exclusive
+    // or shared resource over `[0, 1)`), yet several legitimate
+    // graphics consumers (terminal, doom, ...) each need a live handle
+    // in their own table for the per-caller blit check. init therefore
+    // duplicates this installed handle and transfers each duplicate
+    // over a channel; every consumer ends up holding a handle to the
+    // same single resource, and no new authority is ever minted.
+    let rights = Rights::READ | Rights::WRITE | Rights::TRANSFER | Rights::DUPLICATE;
     if process
         .handles
         .insert_at(

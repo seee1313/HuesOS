@@ -40,6 +40,18 @@ impl Handle {
         unsafe { Self::from_raw(huesos_abi::INIT_ACPI_BROKER_HANDLE) }
     }
 
+    /// Take ownership of the `FrameDraw` capability installed only in the
+    /// initial process by the kernel.
+    ///
+    /// init uses this to duplicate the single exclusive `FrameDraw`
+    /// resource and deliver a handle to each graphics consumer over a
+    /// channel; see `docs/ARCHITECTURE_ROADMAP.md` § framebuffer.
+    pub fn take_init_frame_draw() -> Self {
+        // SAFETY: the kernel installs exactly one FrameDraw handle at
+        // this reserved slot in the initial process and nowhere else.
+        unsafe { Self::from_raw(huesos_abi::INIT_FRAME_DRAW_HANDLE) }
+    }
+
     /// Consume this `Handle` without closing the underlying kernel handle,
     /// returning the raw value. Use this when transferring ownership
     /// elsewhere (e.g. sending it over a channel) instead of letting this

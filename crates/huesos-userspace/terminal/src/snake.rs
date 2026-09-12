@@ -20,7 +20,7 @@
 //! coupling simulation rate to frame rate in a step-based game.
 
 use libcanvas::framebuffer::{Canvas, TextFont};
-use libcanvas::{Channel, ErrorCode};
+use libcanvas::{Channel, ErrorCode, HandleValue};
 
 const GRID_W: usize = 32;
 const GRID_H: usize = 18;
@@ -268,8 +268,12 @@ fn interpolation_alpha(now: u64, start: u64, end: u64) -> u16 {
 }
 
 /// Run Snake. `hard` enables random hazard events every 2 apples.
-pub fn run(keyboard: &Channel, hard: bool) {
-    let Ok(canvas) = Canvas::new_fullscreen() else {
+pub fn run(keyboard: &Channel, hard: bool, frame_draw: Option<HandleValue>) {
+    let canvas = match frame_draw {
+        Some(cap) => Canvas::new_fullscreen_with_cap(cap),
+        None => Canvas::new_fullscreen(),
+    };
+    let Ok(canvas) = canvas else {
         return;
     };
 
