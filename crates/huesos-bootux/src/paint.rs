@@ -1,19 +1,16 @@
 //! Splash geometry and colour maths.
 //!
 //! Kept free of any framebuffer dependency so the arithmetic that is
-//! easy to get wrong — gradient interpolation, bar fill width, spinner
-//! phase, layout on odd resolutions — is unit-tested on the host. The
-//! init crate supplies pixels; this module only decides values.
+//! easy to get wrong — gradient interpolation, bar fill width, status
+//! line formatting, layout on odd resolutions — is unit-tested on the
+//! host. The init crate supplies pixels; this module only decides
+//! values.
 //!
 //! All integer maths. Init has no FPU state guarantee and no reason to
 //! pull in soft-float for a background.
 
 use crate::config::Rgb;
 use crate::progress::SCALE;
-
-/// Spinner arm count. Twelve reads as smooth at the ~15 Hz repaint rate
-/// the boot loop can sustain without stealing time from service launch.
-pub const SPINNER_ARMS: u32 = 12;
 
 /// Linearly interpolate a vertical gradient at scanline `y`.
 ///
@@ -79,128 +76,161 @@ pub fn blend(a: Rgb, b: Rgb, alpha: u8) -> Rgb {
 pub struct Layout {
     pub width: u32,
     pub height: u32,
+    /// Top-left origin of the brand line ("HuesOS <version>").
+    pub brand_x: u32,
+    pub brand_y: u32,
+    /// Left margin of the systemd-style status list.
+    pub list_x: u32,
+    /// Top scanline of the first status line.
+    pub list_y: u32,
+    /// Row pitch of the status list.
+    pub line_h: u32,
+    /// Total height of the status list block (stages + final lines).
+    pub list_h: u32,
     pub bar_x: u32,
     pub bar_y: u32,
     pub bar_w: u32,
     pub bar_h: u32,
-    pub label_x: u32,
-    pub label_y: u32,
-    /// Centre of the wordmark; the renderer draws scaled glyphs around
-    /// it (see [`wordmark_width`]/[`wordmark_height`]).
-    pub wordmark_x: u32,
-    pub wordmark_y: u32,
-    /// Integer scale of the wordmark glyphs (2 on small panels, 3 on
-    /// 1080p+).
-    pub wordmark_scale: u32,
-    /// Top scanline of the version line in the bottom margin.
-    pub version_y: u32,
-    pub spinner_cx: u32,
-    pub spinner_cy: u32,
-    pub spinner_r: u32,
-    /// Top scanline of the region the bar/label repaint each frame.
-    /// (The spinner paints its own region separately.)
-    pub dirty_y: u32,
-    /// Height of that region.
-    pub dirty_h: u32,
 }
 
-/// Cell width of the Cozette 6x13 glyphs the wordmark is drawn from.
-pub const WORDMARK_CELL_W: u32 = 6;
-/// Cell height of the Cozette 6x13 glyphs the wordmark is drawn from.
-pub const WORDMARK_CELL_H: u32 = 13;
-/// Glyph count of the "HuesOS" wordmark.
-pub const WORDMARK_LEN: usize = 6;
+/// Column width (glyph cells) of the status-list tag. Fixed at eight so
+/// the message column starts on the same scanline for every line.
+pub const TAG_LEN: usize = 8;
 
-/// Integer glyph scale for the wordmark at a given resolution: 3 on
-/// 1080p and up, 2 everywhere else. Two scales instead of continuous
-/// sizing keeps the glyphs crisp (whole-pixel blocks) and the maths
-/// branch-free.
-pub fn wordmark_scale(height: u32) -> u32 {
-    if height >= 1024 {
-        3
-    } else {
-        2
+/// Fixed palette of the systemd-style status list. Muted on purpose:
+/// the dark boot gradient is the canvas, the list is the signal.
+pub const COLOR_OK: Rgb = Rgb::new(96, 190, 120);
+pub const COLOR_WARN: Rgb = Rgb::new(212, 180, 110);
+pub const COLOR_FAIL: Rgb = Rgb::new(255, 96, 96);
+pub const COLOR_SKIP: Rgb = Rgb::new(110, 120, 150);
+/// Message text next to a tag (and the untagged "Starting ..." lines).
+pub const COLOR_MSG: Rgb = Rgb::new(150, 170, 205);
+
+/// Tag state of one status line, mirroring systemd's `[  OK  ]` /
+/// `[FAILED]` console format.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StageTag {
+    Ok,
+    Warn,
+    Failed,
+    Skip,
+    /// Started but not settled yet: blank tag column, like systemd's
+    /// untagged `Starting ...` line.
+    Starting,
+    /// No tag at all (e.g. the final "Startup complete." line).
+    Blank,
+}
+
+/// Map a stage state onto its line tag.
+pub fn stage_tag(state: crate::progress::StageState) -> StageTag {
+    use crate::progress::StageState;
+    match state {
+        StageState::Done => StageTag::Ok,
+        StageState::Degraded => StageTag::Warn,
+        StageState::Failed => StageTag::Failed,
+        StageState::Skipped => StageTag::Skip,
+        StageState::Running => StageTag::Starting,
+        StageState::Pending => StageTag::Blank,
     }
 }
 
-/// Pixel width of the wordmark at a scale.
-pub fn wordmark_width(scale: u32) -> u32 {
-    WORDMARK_LEN as u32 * WORDMARK_CELL_W * scale
+/// The fixed-width tag column for a line.
+pub fn tag_text(tag: StageTag) -> &'static str {
+    match tag {
+        StageTag::Ok => "[  OK  ]",
+        StageTag::Warn => "[WARN  ]",
+        StageTag::Failed => "[FAILED]",
+        StageTag::Skip => "[SKIP  ]",
+        StageTag::Starting | StageTag::Blank => "        ",
+    }
 }
 
-/// Pixel height of the wordmark at a scale.
-pub fn wordmark_height(scale: u32) -> u32 {
-    WORDMARK_CELL_H * scale
+/// Tag colour for a line.
+pub fn tag_color(tag: StageTag) -> Rgb {
+    match tag {
+        StageTag::Ok => COLOR_OK,
+        StageTag::Warn => COLOR_WARN,
+        StageTag::Failed => COLOR_FAIL,
+        StageTag::Skip => COLOR_SKIP,
+        StageTag::Starting | StageTag::Blank => COLOR_MSG,
+    }
+}
+
+/// Message text around the unit name: `prefix + unit + suffix`.
+///
+/// systemd reads "Starting X...", "Started X.", "Failed to start X." —
+/// the unit name is the stage's display name, supplied by the caller.
+pub fn line_prefix(state: crate::progress::StageState) -> &'static str {
+    use crate::progress::StageState;
+    match state {
+        StageState::Running => "Starting ",
+        StageState::Done => "Started ",
+        StageState::Degraded => "Started ",
+        StageState::Failed => "Failed to start ",
+        StageState::Skipped | StageState::Pending => "",
+    }
+}
+
+pub fn line_suffix(state: crate::progress::StageState) -> &'static str {
+    use crate::progress::StageState;
+    match state {
+        StageState::Running => "...",
+        StageState::Done => ".",
+        StageState::Degraded => " (degraded).",
+        StageState::Failed => ".",
+        StageState::Skipped => " not started.",
+        StageState::Pending => "",
+    }
 }
 
 /// Compute the splash layout.
 ///
-/// The composition, top to bottom: wordmark centred in the upper half,
-/// the small alive-indicator ring beneath it, a thin progress bar at
-/// 62% of height, the stage label under the bar, and a version line in
-/// the bottom margin. Everything is centred; the bar keeps its 44%-of-
-/// width band, clamped so it stays sane from 640x480 VGA to a 2560x1600
-/// panel.
-pub fn layout(width: u32, height: u32, title_px: u32, label_px: u32) -> Layout {
+/// The composition, top to bottom: a small brand line ("HuesOS
+/// <version>") in the top-left corner, the systemd-style service
+/// status list in the upper-middle, and a thin overall progress bar in
+/// the bottom margin. Everything is left-aligned like a real boot
+/// console; the bar keeps its 44%-of-width band, clamped so it stays
+/// sane from 640x480 VGA to a 2560x1600 panel.
+pub fn layout(width: u32, height: u32, cell_h: u32, stage_count: usize) -> Layout {
+    let margin = (width / 24).clamp(24, 72);
+    let brand_y = margin / 2;
+
     let bar_w = (width * 44 / 100)
         .clamp(160, 900)
         .min(width.saturating_sub(32));
-    // Thin, Windows-style bar: a few pixels, not a chunky slab.
+    // Thin bar: a few pixels, not a chunky slab.
     let bar_h = (height / 160).clamp(2, 5);
     let bar_x = (width.saturating_sub(bar_w)) / 2;
-    let bar_y = height * 62 / 100;
+    let bar_y = height * 88 / 100;
 
-    // Wordmark + ring as one vertically centred block at 40% of height,
-    // the position serious boot screens settle on (logo above the
-    // lower-third, progress below).
-    let scale = wordmark_scale(height);
-    let wordmark_h = wordmark_height(scale);
-    // Small ring: status, not ornament.
-    let spinner_r = (height / 44).clamp(8, 18);
-    let gap = (height / 40).clamp(12, 36);
-    let block_h = wordmark_h + gap + spinner_r * 2;
-    let block_centre = height * 40 / 100;
-    let block_top = block_centre
-        .saturating_sub(block_h / 2)
-        .max((height / 40).min(24));
-    let wordmark_y = block_top;
-    let spinner_cx = width / 2;
-    let spinner_cy = wordmark_y + wordmark_h + gap + spinner_r;
-    let wordmark_x = width / 2;
-
-    let label_x = width / 2;
-    let label_y = bar_y + bar_h + (height / 60).clamp(8, 26);
-
-    // Version line: bottom margin above the frame edge, small font.
-    let version_y = height.saturating_sub((height / 22).clamp(18, 34));
-
-    // The animated region spans the bar and the label line beneath it.
-    // The gradient, wordmark, and version line are painted once and
-    // never re-uploaded.
-    let dirty_y = bar_y.saturating_sub(bar_h);
-    let dirty_bottom = (label_y + label_px + 4).min(height);
-    let dirty_h = dirty_bottom.saturating_sub(dirty_y);
-
-    let _ = title_px;
+    // Status list: one row per stage plus the two final lines
+    // ("Reached target ..." / "Startup complete."). Row pitch grows
+    // with the panel but never crowds the 6x13 glyphs.
+    let lines = (stage_count + 2).max(1) as u32;
+    let mut line_h = (height / 34).clamp(18, 26);
+    let list_y = (height * 30 / 100).max((height / 40).min(24));
+    let mut list_h = lines * line_h;
+    // Defensive: an oversized custom stage table must not run into the
+    // bar — shrink the pitch instead of overflowing the frame.
+    if list_y + list_h + 8 > bar_y {
+        let room = bar_y.saturating_sub(list_y + 8).min(height.saturating_sub(list_y + 8));
+        line_h = (room / lines).max(cell_h.min(16));
+        list_h = lines * line_h;
+    }
 
     Layout {
         width,
         height,
+        brand_x: margin,
+        brand_y,
+        list_x: margin,
+        list_y,
+        line_h,
+        list_h,
         bar_x,
         bar_y,
         bar_w,
         bar_h,
-        label_x,
-        label_y,
-        wordmark_x,
-        wordmark_y,
-        wordmark_scale: scale,
-        version_y,
-        spinner_cx,
-        spinner_cy,
-        spinner_r,
-        dirty_y,
-        dirty_h,
     }
 }
 
@@ -211,31 +241,6 @@ pub fn layout(width: u32, height: u32, title_px: u32, label_px: u32) -> Layout {
 pub fn bar_fill_width(bar_w: u32, permille: u32) -> u32 {
     let permille = permille.min(SCALE);
     ((bar_w as u64 * permille as u64) / SCALE as u64) as u32
-}
-
-/// Brightness of spinner arm `arm` at animation `frame`, 0..=255.
-///
-/// A comet tail: the leading arm is brightest and brightness falls off
-/// around the ring, which reads as rotation without needing to erase
-/// the previous frame separately.
-pub fn spinner_arm_alpha(arm: u32, frame: u32) -> u8 {
-    let arms = SPINNER_ARMS;
-    let head = frame % arms;
-    let distance = (arms + head - (arm % arms)) % arms;
-    let falloff = 255u32.saturating_sub(distance * (255 / arms));
-    falloff.max(24) as u8
-}
-
-/// Centre `text_px` wide text on `centre`, clamped to the frame.
-pub fn centre_text_x(centre: u32, text_len: usize, cell_w: u32, width: u32) -> u32 {
-    let text_px = text_len as u32 * cell_w;
-    let half = text_px / 2;
-    let x = centre.saturating_sub(half);
-    if x + text_px > width {
-        width.saturating_sub(text_px)
-    } else {
-        x
-    }
 }
 
 #[cfg(test)]
@@ -302,23 +307,9 @@ mod tests {
     }
 
     #[test]
-    fn wordmark_scale_switches_at_1080p() {
-        assert_eq!(wordmark_scale(480), 2);
-        assert_eq!(wordmark_scale(768), 2);
-        assert_eq!(wordmark_scale(1023), 2);
-        assert_eq!(wordmark_scale(1024), 3);
-        assert_eq!(wordmark_scale(1600), 3);
-        // Widths/heights track the scale and stay inside a 640-wide frame.
-        assert_eq!(wordmark_width(2), 72);
-        assert_eq!(wordmark_width(3), 108);
-        assert_eq!(wordmark_height(2), 26);
-        assert_eq!(wordmark_height(3), 39);
-        assert!(wordmark_width(2) < 640);
-    }
-
-    #[test]
     fn layout_stays_inside_the_frame() {
-        // Includes the awkward small mode and a large panel.
+        // Includes the awkward small mode, a large panel, and both the
+        // default five-stage table and the 12-stage max.
         for (w, h) in [
             (640, 480),
             (800, 600),
@@ -326,82 +317,95 @@ mod tests {
             (1920, 1080),
             (2560, 1600),
         ] {
-            let layout = layout(w, h, 16, 13);
-            assert!(layout.bar_x + layout.bar_w <= w, "bar overflows at {w}x{h}");
-            assert!(
-                layout.bar_y + layout.bar_h <= h,
-                "bar below frame at {w}x{h}"
-            );
-            assert!(
-                layout.dirty_y + layout.dirty_h <= h,
-                "dirty region at {w}x{h}"
-            );
-            assert!(layout.dirty_h > 0);
-            assert!(
-                layout.spinner_cy > layout.spinner_r,
-                "spinner clipped at {w}x{h}"
-            );
-            assert!(layout.label_y < h);
-            // Wordmark: centred, inside the frame, above the ring.
-            let half = wordmark_width(layout.wordmark_scale) / 2;
-            assert!(
-                layout.wordmark_x >= half && layout.wordmark_x + half <= w,
-                "wordmark overflows at {w}x{h}"
-            );
-            assert!(
-                layout.wordmark_y + wordmark_height(layout.wordmark_scale)
-                    <= layout.spinner_cy - layout.spinner_r,
-                "wordmark overlaps ring at {w}x{h}"
-            );
-            // Ring sits above the bar.
-            assert!(
-                layout.spinner_cy + layout.spinner_r <= layout.bar_y,
-                "ring overlaps bar at {w}x{h}"
-            );
-            // Version line: a full small-font row fits below it.
-            assert!(
-                layout.version_y + WORDMARK_CELL_H <= h,
-                "version at {w}x{h}"
-            );
+            for stage_count in [5usize, crate::config::MAX_STAGES] {
+                let layout = layout(w, h, 13, stage_count);
+                assert!(layout.bar_x + layout.bar_w <= w, "bar overflows at {w}x{h}");
+                assert!(layout.bar_y + layout.bar_h <= h, "bar below frame at {w}x{h}");
+                assert!(layout.list_y + layout.list_h <= h, "list below frame at {w}x{h}");
+                // Brand line fits one font row below its origin.
+                assert!(layout.brand_y + 13 <= h, "brand at {w}x{h}");
+                // The status list ends well above the progress bar, so
+                // the two independently presented bands never overlap.
+                assert!(
+                    layout.list_y + layout.list_h + 8 <= layout.bar_y,
+                    "list touches bar at {w}x{h}"
+                );
+                // Rows are tall enough for the 13px glyphs.
+                assert!(layout.line_h >= 13, "crowded rows at {w}x{h}");
+                assert_eq!(layout.list_h, (stage_count + 2) as u32 * layout.line_h);
+            }
         }
     }
 
     #[test]
-    fn dirty_region_covers_bar_and_label() {
-        let layout = layout(1024, 768, 16, 13);
-        assert!(layout.dirty_y <= layout.bar_y);
-        assert!(layout.dirty_y + layout.dirty_h >= layout.bar_y + layout.bar_h);
-        assert!(layout.dirty_y + layout.dirty_h >= layout.label_y);
+    fn layout_left_margins_match_between_brand_and_list() {
+        // The brand line and the status list share one left margin,
+        // which is what makes the composition read as a console.
+        let layout = layout(1024, 768, 13, 5);
+        assert_eq!(layout.brand_x, layout.list_x);
     }
 
     #[test]
-    fn dirty_region_excludes_the_static_gradient_above() {
-        // The point of the partial upload: the spinner and title sit
-        // outside the per-frame region, so a frame is a few thousand
-        // pixels rather than the whole screen.
-        let layout = layout(1024, 768, 16, 13);
-        assert!(layout.dirty_h < layout.height / 2);
+    fn status_lines_use_the_systemd_console_format() {
+        use crate::progress::StageState;
+        // Settled stages.
+        assert_eq!(tag_text(stage_tag(StageState::Done)), "[  OK  ]");
+        assert_eq!(tag_text(stage_tag(StageState::Degraded)), "[WARN  ]");
+        assert_eq!(tag_text(stage_tag(StageState::Failed)), "[FAILED]");
+        assert_eq!(tag_text(stage_tag(StageState::Skipped)), "[SKIP  ]");
+        // Running and pending stages carry no tag, like systemd's
+        // untagged "Starting ..." lines.
+        assert_eq!(tag_text(stage_tag(StageState::Running)), "        ");
+        assert_eq!(tag_text(stage_tag(StageState::Pending)), "        ");
+        // The tag column is fixed width for every tag.
+        assert_eq!(TAG_LEN, 8);
+        for tag in [
+            StageTag::Ok,
+            StageTag::Warn,
+            StageTag::Failed,
+            StageTag::Skip,
+            StageTag::Starting,
+            StageTag::Blank,
+        ] {
+            assert_eq!(tag_text(tag).len(), TAG_LEN);
+        }
     }
 
     #[test]
-    fn spinner_head_is_brightest_and_wraps() {
-        let head = spinner_arm_alpha(0, 0);
-        let tail = spinner_arm_alpha(1, 0);
-        assert!(head > tail);
-        // One full revolution returns to the same pattern.
+    fn status_lines_read_like_systemd_messages() {
+        use crate::progress::StageState;
+        let unit = "HuesOS Storage Service";
         assert_eq!(
-            spinner_arm_alpha(3, 5),
-            spinner_arm_alpha(3, 5 + SPINNER_ARMS)
+            format!("{prefix}{unit}{suffix}", prefix = line_prefix(StageState::Running), suffix = line_suffix(StageState::Running)),
+            "Starting HuesOS Storage Service..."
+        );
+        assert_eq!(
+            format!("{prefix}{unit}{suffix}", prefix = line_prefix(StageState::Done), suffix = line_suffix(StageState::Done)),
+            "Started HuesOS Storage Service."
+        );
+        assert_eq!(
+            format!("{prefix}{unit}{suffix}", prefix = line_prefix(StageState::Degraded), suffix = line_suffix(StageState::Degraded)),
+            "Started HuesOS Storage Service (degraded)."
+        );
+        assert_eq!(
+            format!("{prefix}{unit}{suffix}", prefix = line_prefix(StageState::Failed), suffix = line_suffix(StageState::Failed)),
+            "Failed to start HuesOS Storage Service."
+        );
+        assert_eq!(
+            format!("{prefix}{unit}{suffix}", prefix = line_prefix(StageState::Skipped), suffix = line_suffix(StageState::Skipped)),
+            "HuesOS Storage Service not started."
         );
     }
 
     #[test]
-    fn spinner_never_fully_dark() {
-        for frame in 0..SPINNER_ARMS * 2 {
-            for arm in 0..SPINNER_ARMS {
-                assert!(spinner_arm_alpha(arm, frame) >= 24);
-            }
-        }
+    fn tag_colors_are_distinct_and_readable() {
+        assert_eq!(tag_color(StageTag::Ok), COLOR_OK);
+        assert_eq!(tag_color(StageTag::Warn), COLOR_WARN);
+        assert_eq!(tag_color(StageTag::Failed), COLOR_FAIL);
+        assert_eq!(tag_color(StageTag::Skip), COLOR_SKIP);
+        assert_eq!(tag_color(StageTag::Starting), COLOR_MSG);
+        // Success and failure must never be confused.
+        assert_ne!(tag_color(StageTag::Ok), tag_color(StageTag::Failed));
     }
 
     #[test]
@@ -419,11 +423,4 @@ mod tests {
         );
     }
 
-    #[test]
-    fn centred_text_never_leaves_the_frame() {
-        assert_eq!(centre_text_x(512, 10, 6, 1024), 512 - 30);
-        // Text wider than the screen clamps to zero rather than wrapping.
-        assert_eq!(centre_text_x(512, 400, 6, 1024), 0);
-        assert_eq!(centre_text_x(0, 10, 6, 1024), 0);
-    }
 }

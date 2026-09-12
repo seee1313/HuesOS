@@ -117,14 +117,14 @@ pub struct InitConfig {
     pub log_screen: bool,
     /// Draw the graphical splash.
     pub splash: bool,
-    /// Small dot ring under the wordmark — the "the machine is alive"
-    /// indicator serious systems keep (Windows-style), deliberately
-    /// small so it reads as status, not ornament. Off with
-    /// `splash.spinner=off`.
+    /// Legacy key, parsed for config compatibility and ignored by the
+    /// renderer: the systemd-style status list replaced the dot ring
+    /// (the list's `Starting ...` lines carry the "the machine is
+    /// alive" signal now). `splash.spinner=off` still parses.
     pub spinner: bool,
-    /// Version line under the splash. Empty falls back to the build's
-    /// `CARGO_PKG_VERSION`, so an image carries its own version unless
-    /// the operator overrides it.
+    /// Version in the brand line ("HuesOS <version>"). Empty falls back
+    /// to the build's `CARGO_PKG_VERSION`, so an image carries its own
+    /// version unless the operator overrides it.
     pub version: InlineStr<MAX_VERSION>,
     pub top: Rgb,
     pub bottom: Rgb,
