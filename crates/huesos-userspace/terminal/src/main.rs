@@ -16,7 +16,7 @@ mod shell;
 mod snake;
 
 use core::panic::PanicInfo;
-use libcanvas::{println, Channel, ErrorCode, HandleValue};
+use libcanvas::{println, Channel, ErrorCode, Handle};
 use shell::Shell;
 
 #[unsafe(no_mangle)]
@@ -62,15 +62,18 @@ const FRAME_DRAW_MAX_POLLS: u32 = 100;
 /// Wait for the DriverManager registry channel *and* the `FrameDraw`
 /// capability duplicate on the bootstrap channel.
 ///
-/// Returns the registry channel plus the raw `FrameDraw` handle when it
-/// arrived. The terminal's `Screen` needs that capability to blit; without
-/// it every `Canvas::present` would bounce `AccessDenied` and the screen
-/// would freeze on init's last frame, so a missing capability is reported
-/// rather than silently drawn around.
-fn wait_for_bootstrap(bootstrap: &Channel) -> (Channel, Option<HandleValue>) {
+/// Returns the registry channel plus the owned `FrameDraw` capability
+/// handle when it arrived. The terminal's `Screen` needs that capability
+/// to blit; without it every `Canvas::present` would bounce `AccessDenied`
+/// and the screen would freeze on init's last frame, so a missing
+/// capability is reported rather than silently drawn around. The returned
+/// `Handle` is RAII: whoever holds it keeps the kernel capability open,
+/// and dropping it revokes the terminal's right to blit, so the Shell
+/// keeps it alive for the process lifetime.
+fn wait_for_bootstrap(bootstrap: &Channel) -> (Channel, Option<Handle>) {
     let mut buf = [0u8; 64];
     let mut registry: Option<Channel> = None;
-    let mut frame_draw: Option<HandleValue> = None;
+    let mut frame_draw: Option<Handle> = None;
     let mut polls = 0u32;
 
     loop {
@@ -79,7 +82,14 @@ fn wait_for_bootstrap(bootstrap: &Channel) -> (Channel, Option<HandleValue>) {
                 registry = Some(Channel::from_handle(handle));
             }
             Ok((n, Some(handle))) if &buf[..n] == b"framedraw" => {
-                frame_draw = Some(handle.raw());
+                // Keep the RAII handle itself: it owns the kernel handle and
+                // closes it on drop. Copying only the raw value and letting
+                // the Handle drop would close the FrameDraw capability
+                // immediately, and the freed slot would be reused for an
+                // unrelated object (every later blit then bounces
+                // WrongType with the screen frozen on init's last frame).
+                // The Shell holds this Handle for the process lifetime.
+                frame_draw = Some(handle);
                 println!("[terminal] FrameDraw capability received");
             }
             Ok((n, Some(_handle))) => {
@@ -101,7 +111,7 @@ fn wait_for_bootstrap(bootstrap: &Channel) -> (Channel, Option<HandleValue>) {
         }
 
         if registry.is_some() {
-            if let Some(frame_draw) = frame_draw {
+            if let Some(frame_draw) = frame_draw.take() {
                 if let Some(registry) = registry.take() {
                     return (registry, Some(frame_draw));
                 }

@@ -5,7 +5,7 @@ use crate::commands::execute_line;
 use crate::println;
 use crate::screen::Screen;
 use crate::snake;
-use libcanvas::{Channel, ErrorCode, HandleValue};
+use libcanvas::{Channel, ErrorCode, Handle};
 
 const INPUT_MAX: usize = 128;
 
@@ -18,8 +18,11 @@ pub struct Shell {
     filesystem: Option<Channel>,
     supervisor: Channel,
     /// `FrameDraw` capability delivered by init; `None` on serial-only
-    /// boots or when init's transfer failed.
-    frame_draw: Option<HandleValue>,
+    /// boots or when init's transfer failed. The RAII `Handle` keeps the
+    /// kernel capability open for the whole process lifetime — every
+    /// Canvas the shell creates (screen, snake) only borrows the raw
+    /// value, so dropping this would revoke the terminal's blit right.
+    frame_draw: Option<Handle>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -56,9 +59,9 @@ impl Shell {
         keyboard: Channel,
         filesystem: Option<Channel>,
         supervisor: Channel,
-        frame_draw: Option<HandleValue>,
+        frame_draw: Option<Handle>,
     ) -> Self {
-        let mut screen = Screen::new_with_cap(frame_draw);
+        let mut screen = Screen::new_with_cap(frame_draw.as_ref().map(|h| h.raw()));
         screen.clear();
         screen.write_line("HuesOS Terminal");
         screen.write_line("Type 'help' to list available commands.");
@@ -164,7 +167,11 @@ impl Shell {
                     self.run_doom();
                 } else if trimmed == "snake" || trimmed == "snake hard" {
                     let hard = trimmed.ends_with("hard");
-                    snake::run(&self.keyboard, hard, self.frame_draw);
+                    snake::run(
+                        &self.keyboard,
+                        hard,
+                        self.frame_draw.as_ref().map(|h| h.raw()),
+                    );
                     self.redraw_after_game(hard);
                 } else if trimmed == "shutdown" {
                     self.request_shutdown();
