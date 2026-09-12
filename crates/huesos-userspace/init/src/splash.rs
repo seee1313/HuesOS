@@ -4,6 +4,17 @@
 //! colour arithmetic lives in `huesos-bootux` so it can be unit-tested
 //! on the host; this module is the part that must touch pixels.
 //!
+//! ## Look
+//!
+//! A systemd-style boot console: a small "HuesOS <version>" brand line
+//! in the top-left corner, then one status line per service —
+//! `Starting X...` while a stage runs, `[  OK  ] Started X.` when it
+//! settles, `[WARN  ]` for a degraded result, `[FAILED]` for a failure,
+//! `[SKIP  ]` for a deliberately unrun stage — and, once every stage has
+//! reported, the two closing lines `Reached target HuesOS Shell.` and
+//! `Startup complete.`. A thin overall progress bar sits in the bottom
+//! margin.
+//!
 //! ## Buffering
 //!
 //! Double buffering is inherent here rather than hand-rolled. A
@@ -20,16 +31,19 @@
 //! `VmoWrite`, which is enough at this rate, and dropping the shadow
 //! took this file's unsafe surface to zero.
 //!
-//! What still matters is the *blit*, so each frame presents only the
-//! rectangles that changed: the bar band and the spinner box. The
-//! gradient behind them is painted once and re-presented only where it
-//! was disturbed.
+//! What still matters is the *blit*, so the frame is split into two
+//! independently presented bands: the status list (redrawn only when a
+//! stage *state* changes — the few times a boot actually moves) and the
+//! progress bar (redrawn when the permille changes). The gradient and
+//! the brand line are painted once and re-presented only where they
+//! were disturbed.
 
 use huesos_bootux::config::{InitConfig, InlineStr, Rgb, MAX_VERSION};
 use huesos_bootux::paint::{
-    self, bar_fill_width, centre_text_x, gradient_at, spinner_arm_alpha, Layout, SPINNER_ARMS,
+    self, bar_fill_width, gradient_at, line_prefix, line_suffix, stage_tag, tag_color, tag_text,
+    Layout, COLOR_FAIL, COLOR_MSG, TAG_LEN,
 };
-use huesos_bootux::progress::{BootProgress, StageState, SCALE};
+use huesos_bootux::progress::{BootProgress, Stage, StageState, SCALE};
 use libcanvas::framebuffer::{Canvas, TextFont};
 
 const FONT: TextFont = TextFont::Cozette6x13;
@@ -39,9 +53,8 @@ const CELL_H: u32 = 13;
 const TITLE: &str = "HuesOS";
 
 const COLOR_TITLE: Rgb = Rgb::new(228, 238, 255);
-const COLOR_LABEL: Rgb = Rgb::new(150, 170, 205);
+const COLOR_VERSION: Rgb = Rgb::new(120, 135, 170);
 const COLOR_TRACK: Rgb = Rgb::new(30, 38, 62);
-const COLOR_FAIL: Rgb = Rgb::new(255, 96, 96);
 
 /// The splash surface.
 pub struct Splash {
@@ -50,10 +63,17 @@ pub struct Splash {
     top: Rgb,
     bottom: Rgb,
     accent: Rgb,
+    /// Legacy config key (`splash.spinner`). The systemd-style status
+    /// list replaced the dot ring; the key is still parsed for config
+    /// compatibility and ignored by the renderer, so the field is kept
+    /// only to document that the parser saw it.
+    #[allow(dead_code)]
     spinner: bool,
-    frame: u32,
     last_permille: u32,
-    /// Version line for the bottom margin. Resolved from config in
+    /// Bit-packed stage states plus the settled flag; the list band is
+    /// redrawn only when this changes.
+    last_signature: u64,
+    /// Version for the brand line. Resolved from config in
     /// [`Splash::new`], falling back to the build's own package version
     /// when the operator did not override it.
     version: InlineStr<MAX_VERSION>,
@@ -69,10 +89,15 @@ impl Splash {
     /// UART-only and the caller enables the text console instead.
     pub fn new(config: &InitConfig) -> Option<Self> {
         let canvas = Canvas::new_fullscreen().ok()?;
-        let layout = paint::layout(canvas.width(), canvas.height(), CELL_H, CELL_H);
+        let layout = paint::layout(
+            canvas.width(),
+            canvas.height(),
+            CELL_H,
+            config.stages().len(),
+        );
         // The splash carries the image's own version unless the operator
         // overrode it in config; an empty configured version is the
-        // "not set" marker, not a request for a blank footer.
+        // "not set" marker, not a request for a blank brand line.
         let version = if config.version.is_empty() {
             InlineStr::from_bytes(env!("CARGO_PKG_VERSION").as_bytes())
         } else {
@@ -85,8 +110,8 @@ impl Splash {
             bottom: config.bottom,
             accent: config.accent,
             spinner: config.spinner,
-            frame: 0,
             last_permille: u32::MAX,
+            last_signature: u64::MAX,
             version,
             background_ready: false,
         };
@@ -94,9 +119,9 @@ impl Splash {
         Some(splash)
     }
 
-    /// Paint the gradient, wordmark, and version line, then present the
-    /// whole frame once. All of it is static for the boot's lifetime, so
-    /// it is uploaded exactly once and never touched again.
+    /// Paint the gradient and the brand line, then present the whole
+    /// frame once. All of it is static for the boot's lifetime, so it
+    /// is uploaded exactly once and never touched again.
     fn paint_background(&mut self) {
         let width = self.canvas.width();
         let height = self.canvas.height();
@@ -110,69 +135,61 @@ impl Splash {
                 return;
             }
         }
-        // Wordmark, scaled 2–3× so the small bitmap font reads as a logo.
-        let scale = self.layout.wordmark_scale;
-        let wordmark_x = centre_text_x(self.layout.wordmark_x, TITLE.len(), CELL_W * scale, width);
-        let _ = self.canvas.draw_text_scaled(
-            wordmark_x,
-            self.layout.wordmark_y,
+        // Brand line, top-left: product name in title colour, version
+        // dimmed so it reads as metadata rather than a second logo.
+        let layout = self.layout;
+        let _ = self.canvas.draw_text_with_font(
+            layout.brand_x,
+            layout.brand_y,
             TITLE,
             COLOR_TITLE.r,
             COLOR_TITLE.g,
             COLOR_TITLE.b,
             FONT,
-            scale,
         );
-        // Version line in the bottom margin, dimmed so it reads as a
-        // footer rather than competing with the status label.
-        let dim = paint::shade(COLOR_LABEL, 120, 255);
-        let version_x = centre_text_x(width / 2, self.version.as_bytes().len(), CELL_W, width);
+        let version_x = layout.brand_x + (TITLE.len() as u32 + 1) * CELL_W;
         let _ = self.canvas.draw_text_with_font(
             version_x,
-            self.layout.version_y,
+            layout.brand_y,
             self.version.as_str(),
-            dim.r,
-            dim.g,
-            dim.b,
+            COLOR_VERSION.r,
+            COLOR_VERSION.g,
+            COLOR_VERSION.b,
             FONT,
         );
         self.background_ready = self.canvas.present().is_ok();
     }
 
-    /// Redraw the animated parts: spinner, bar, and status label.
+    /// Redraw whatever changed: the status list and/or the progress bar.
     ///
     /// Safe to call on every poll iteration; it returns early when
-    /// nothing that affects pixels has changed.
+    /// neither band changed. The list signature changes only on stage
+    /// state transitions, so a long "Starting ..." phase re-uploads the
+    /// list once and then just moves the bar.
     pub fn render(&mut self, progress: &mut BootProgress) {
         if !self.background_ready {
             return;
         }
         let permille = progress.permille();
-        let changed = permille != self.last_permille;
-        if !changed && !self.spinner {
+        let bar_changed = permille != self.last_permille;
+        let signature = list_signature(progress);
+        let list_changed = signature != self.last_signature;
+        if !bar_changed && !list_changed {
             return;
         }
-        self.last_permille = permille;
-        self.frame = self.frame.wrapping_add(1);
 
-        let failed = progress.any_failed();
-        let label = progress.current_label();
-        let layout = self.layout;
-
-        self.repaint_band(layout.dirty_y, layout.dirty_h);
-        self.draw_bar(permille, failed);
-        self.draw_label(label, failed);
-        let _ = self
-            .canvas
-            .present_region(0, layout.dirty_y, layout.width, layout.dirty_h);
-
-        if self.spinner {
-            self.draw_spinner(failed);
+        if bar_changed {
+            self.last_permille = permille;
+            self.draw_bar_band(permille, progress.any_failed());
+        }
+        if list_changed {
+            self.last_signature = signature;
+            self.draw_list(progress);
         }
     }
 
     /// Restore the gradient across a horizontal band, erasing the
-    /// previous frame's bar and label without a full-screen clear.
+    /// previous frame's content without a full-screen clear.
     fn repaint_band(&self, y: u32, height: u32) {
         let bottom = (y + height).min(self.layout.height);
         for row in y..bottom {
@@ -181,6 +198,16 @@ impl Splash {
                 .canvas
                 .fill_rect(0, row, self.layout.width, 1, color.r, color.g, color.b);
         }
+    }
+
+    /// Redraw the progress bar in its band and present the band.
+    fn draw_bar_band(&mut self, permille: u32, failed: bool) {
+        let layout = self.layout;
+        let band_y = layout.bar_y.saturating_sub(2);
+        let band_h = (layout.bar_h + 6).min(layout.height.saturating_sub(band_y));
+        self.repaint_band(band_y, band_h);
+        self.draw_bar(permille, failed);
+        let _ = self.canvas.present_region(0, band_y, layout.width, band_h);
     }
 
     fn draw_bar(&self, permille: u32, failed: bool) {
@@ -224,56 +251,90 @@ impl Splash {
         }
     }
 
-    fn draw_label(&self, label: &str, failed: bool) {
-        let color = if failed { COLOR_FAIL } else { COLOR_LABEL };
-        let x = centre_text_x(self.layout.label_x, label.len(), CELL_W, self.layout.width);
-        let _ = self.canvas.draw_text_with_font(
-            x,
-            self.layout.label_y,
-            label,
-            color.r,
-            color.g,
-            color.b,
-            FONT,
+    /// Redraw the whole status list and present its band.
+    fn draw_list(&self, progress: &BootProgress) {
+        let layout = self.layout;
+        self.repaint_band(layout.list_y, layout.list_h);
+
+        let mut row = 0u32;
+        for stage in progress.stages() {
+            // systemd shows a unit only once it has started: Pending
+            // stages have no line at all.
+            if stage.state == StageState::Pending {
+                continue;
+            }
+            let mut message = [0u8; 80];
+            let written = format_line(
+                &mut message,
+                line_prefix(stage.state),
+                unit_name(stage),
+                line_suffix(stage.state),
+            );
+            let text = core::str::from_utf8(&message[..written]).unwrap_or("");
+            self.draw_line(
+                layout.list_y + row * layout.line_h,
+                stage_tag(stage.state),
+                text,
+            );
+            row += 1;
+        }
+
+        // Every stage has reported: close the boot with the target
+        // lines, systemd-style.
+        if progress.all_settled() {
+            let failed = progress.any_failed();
+            let degraded = progress.any_degraded();
+            let (tag, message) = if failed {
+                (paint::StageTag::Failed, "Failed to reach HuesOS Shell.")
+            } else if degraded {
+                (
+                    paint::StageTag::Warn,
+                    "Reached target HuesOS Shell (degraded).",
+                )
+            } else {
+                (paint::StageTag::Ok, "Reached target HuesOS Shell.")
+            };
+            self.draw_line(layout.list_y + row * layout.line_h, tag, message);
+            self.draw_line(
+                layout.list_y + (row + 1) * layout.line_h,
+                paint::StageTag::Blank,
+                "Startup complete.",
+            );
+        }
+
+        let bottom = (layout.list_y + layout.list_h).min(layout.height);
+        let _ = self.canvas.present_region(
+            0,
+            layout.list_y,
+            layout.width,
+            bottom.saturating_sub(layout.list_y),
         );
     }
 
-    /// A ring of square arms with a comet-tail brightness falloff.
-    ///
-    /// Squares rather than arcs: a filled rect per arm is a handful of
-    /// row writes, while a rasterised arc would need per-pixel trig
-    /// that init has no business doing during boot.
-    fn draw_spinner(&self, failed: bool) {
+    /// One status line: fixed-width tag column, then the message.
+    fn draw_line(&self, y: u32, tag: paint::StageTag, message: &str) {
         let layout = self.layout;
-        let base = if failed { COLOR_FAIL } else { self.accent };
-        let arm_size = (layout.spinner_r / 4).max(2);
-        for arm in 0..SPINNER_ARMS {
-            let (dx, dy) = ring_offset(arm, layout.spinner_r);
-            let x = (layout.spinner_cx as i32 + dx - arm_size as i32 / 2).max(0) as u32;
-            let y = (layout.spinner_cy as i32 + dy - arm_size as i32 / 2).max(0) as u32;
-            if x + arm_size >= layout.width || y + arm_size >= layout.height {
-                continue;
-            }
-            let alpha = spinner_arm_alpha(arm, self.frame);
-            // Blend against the gradient behind the arm so a dim arm
-            // fades into the background instead of leaving a dark box.
-            let backdrop = gradient_at(self.top, self.bottom, y, layout.height);
-            let color = paint::blend(base, backdrop, alpha);
-            let _ = self
-                .canvas
-                .fill_rect(x, y, arm_size, arm_size, color.r, color.g, color.b);
-        }
-        let side = layout.spinner_r * 2 + arm_size + 4;
-        let x = layout
-            .spinner_cx
-            .saturating_sub(layout.spinner_r + arm_size);
-        let y = layout
-            .spinner_cy
-            .saturating_sub(layout.spinner_r + arm_size);
-        let width = side.min(layout.width.saturating_sub(x));
-        let height = side.min(layout.height.saturating_sub(y));
-        if width > 0 && height > 0 {
-            let _ = self.canvas.present_region(x, y, width, height);
+        let tag_color = tag_color(tag);
+        let _ = self.canvas.draw_text_with_font(
+            layout.list_x,
+            y,
+            tag_text(tag),
+            tag_color.r,
+            tag_color.g,
+            tag_color.b,
+            FONT,
+        );
+        if !message.is_empty() {
+            let message_x = layout.list_x + TAG_LEN as u32 * CELL_W;
+            let _ = self.canvas.draw_text_with_font(
+                message_x,
+                y,
+                message,
+                COLOR_MSG.r,
+                COLOR_MSG.g,
+                COLOR_MSG.b,
+                FONT,
+            );
         }
     }
 
@@ -289,15 +350,16 @@ impl Splash {
             return;
         };
         let layout = self.layout;
-        let y = layout.label_y + CELL_H * 2;
-        if y + CELL_H >= layout.height {
+        // Just below the status list, inside the message column.
+        let y = layout.list_y + layout.list_h + 4;
+        if y + CELL_H >= layout.bar_y {
             return;
         }
         self.repaint_band(y, CELL_H + 2);
         let mut line = [0u8; 96];
         let written = format_failure(&mut line, failed.id.as_bytes());
         if let Ok(text) = core::str::from_utf8(&line[..written]) {
-            let x = centre_text_x(layout.label_x, written, CELL_W, layout.width);
+            let x = layout.list_x + TAG_LEN as u32 * CELL_W;
             let _ = self.canvas.draw_text_with_font(
                 x,
                 y,
@@ -308,13 +370,19 @@ impl Splash {
                 FONT,
             );
         }
-        let _ = self.canvas.present_region(0, y, layout.width, CELL_H + 2);
+        let _ = self.canvas.present_region(
+            0,
+            y,
+            layout.width,
+            (CELL_H + 2).min(layout.height.saturating_sub(y)),
+        );
     }
 
     /// Paint the final frame, forcing a redraw even if the bar value is
     /// unchanged.
     pub fn finish(&mut self, progress: &mut BootProgress) {
         self.last_permille = u32::MAX;
+        self.last_signature = u64::MAX;
         self.render(progress);
         if progress.any_failed() {
             self.render_failure(progress);
@@ -330,38 +398,71 @@ impl Splash {
     }
 }
 
-/// Integer ring coordinates for spinner arm `arm`.
-///
-/// A twelve-entry table instead of trig: exact, branch-free, and it
-/// keeps the boot path free of any float or libm dependency. Values are
-/// cos/sin scaled by 1024.
-fn ring_offset(arm: u32, radius: u32) -> (i32, i32) {
-    const COS: [i32; 12] = [
-        1024, 887, 512, 0, -512, -887, -1024, -887, -512, 0, 512, 887,
-    ];
-    const SIN: [i32; 12] = [
-        0, 512, 887, 1024, 887, 512, 0, -512, -887, -1024, -887, -512,
-    ];
-    let index = (arm % SPINNER_ARMS) as usize;
-    let radius = radius as i32;
-    (COS[index] * radius / 1024, SIN[index] * radius / 1024)
+/// Bit-packed snapshot of the list's content: four bits per stage state
+/// plus the settled flag. Any state change — or the final lines
+/// appearing — flips the signature, which is exactly when the list band
+/// needs repainting.
+fn list_signature(progress: &BootProgress) -> u64 {
+    let mut signature = if progress.all_settled() {
+        1u64 << 56
+    } else {
+        0
+    };
+    for (index, stage) in progress.stages().iter().enumerate() {
+        let code = match stage.state {
+            StageState::Pending => 0u64,
+            StageState::Running => 1,
+            StageState::Done => 2,
+            StageState::Failed => 3,
+            StageState::Degraded => 4,
+            StageState::Skipped => 5,
+        };
+        signature |= code << (index * 4);
+    }
+    signature
+}
+
+/// systemd-style unit name for a stage id. Custom stages fall back to
+/// the operator-configured label.
+fn unit_name(stage: &Stage) -> &str {
+    match stage.id.as_str() {
+        "selftest" => "HuesOS Kernel Self-Test",
+        "driver-manager" => "HuesOS Driver Manager",
+        "storage" => "HuesOS Storage Service",
+        "shutdown-broker" => "HuesOS Power Control",
+        "terminal" => "HuesOS Terminal",
+        "key-broker" => "HuesOS Key Broker",
+        _ => stage.label.as_str(),
+    }
+}
+
+/// Render `prefix + unit + suffix` into `out`, returning the byte count
+/// written.
+fn format_line(out: &mut [u8], prefix: &str, unit: &str, suffix: &str) -> usize {
+    let mut written = 0;
+    for bytes in [prefix.as_bytes(), unit.as_bytes(), suffix.as_bytes()] {
+        for byte in bytes {
+            if written < out.len() {
+                out[written] = *byte;
+                written += 1;
+            }
+        }
+    }
+    written
 }
 
 /// Render `"stage '<id>' did not report ready"` into `out`, returning
 /// the byte count written.
 fn format_failure(out: &mut [u8], id: &[u8]) -> usize {
     let mut written = 0;
-    let mut push = |bytes: &[u8], written: &mut usize| {
+    for bytes in [b"stage '", id, b"' did not report ready"] {
         for byte in bytes {
-            if *written < out.len() {
-                out[*written] = *byte;
-                *written += 1;
+            if written < out.len() {
+                out[written] = *byte;
+                written += 1;
             }
         }
-    };
-    push(b"stage '", &mut written);
-    push(id, &mut written);
-    push(b"' did not report ready", &mut written);
+    }
     written
 }
 

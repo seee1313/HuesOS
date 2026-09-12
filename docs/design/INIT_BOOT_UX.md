@@ -48,12 +48,12 @@ log.screen      = off | on        # technical log text on screen
 splash          = on | off        # off implies log.screen=on
 splash.top      = RRGGBB          # gradient start
 splash.bottom   = RRGGBB          # gradient end
-splash.accent   = RRGGBB          # bar fill, spinner, ok marks
-splash.spinner  = on | off        # small dot ring under the wordmark
-splash.version  = <text>          # footer line; default is the build's
+splash.accent   = RRGGBB          # bar fill
+splash.spinner  = on | off        # legacy key, ignored by the renderer
+splash.version  = <text>          # brand line; default is the build's
                                   # CARGO_PKG_VERSION
 stage.<id>      = <weight>        # progress weight, any positive int
-stage.<id>.label= <text>          # shown under the bar
+stage.<id>.label= <text>          # fallback name in the status list
 timeout.default = <seconds>
 timeout.<id>    = <seconds>
 ```
@@ -105,45 +105,57 @@ is wrong.
 
 ## Look
 
-The default composition, top to bottom:
+The splash is a systemd-style boot console: a status line per
+service, not a logo composition. Default layout, top to bottom:
 
-* **Wordmark** — "HuesOS" centred in the upper half, rendered from the
-  Cozette 6x13 glyphs at an integer scale (2× below 1080p, 3× at 1080p
-  and up) so the small bitmap font reads as a logo without any vector
-  rasterisation.
-* **Alive ring** — a small dot ring under the wordmark
-  (`splash.spinner`, on by default): the Windows-style "the machine is
-  still working" indicator, deliberately small so it reads as status,
-  not ornament.
-* **Progress bar** — a thin (2–5 px) centred bar at 62% of height with
-  the stage label beneath it.
-* **Version line** — the build's `CARGO_PKG_VERSION` (overridable with
-  `splash.version`) in the bottom margin, dimmed.
+* **Brand line** — "HuesOS <version>" in the top-left corner: the
+  product name in title colour, the version dimmed (overridable with
+  `splash.version`, defaulting to the build's `CARGO_PKG_VERSION`).
+* **Status list** — one line per stage, left-aligned, shown as soon as
+  the stage starts (pending stages have no line at all, exactly like
+  systemd):
+  * `Starting HuesOS Storage Service...` — stage running, no tag;
+  * `[  OK  ] Started HuesOS Storage Service.` — green, settled;
+  * `[WARN  ] Started HuesOS Storage Service (degraded).` — amber;
+  * `[FAILED] Failed to start HuesOS Storage Service.` — red;
+  * `[SKIP  ] HuesOS Storage Service not started.` — dim.
+* **Target lines** — once every stage has reported, two closing
+  lines: `[  OK  ] Reached target HuesOS Shell.` (or `[FAILED]`
+  "Failed to reach …" / `[WARN  ]` "… (degraded)" when applicable)
+  and the untagged `Startup complete.`.
+* **Progress bar** — a thin (2–5 px) centred bar in the bottom
+  margin (88% of height), the overall weighted progress.
 
-The wordmark, gradient, and version line are painted once at startup
-and never re-uploaded; the per-frame region is the bar/label band, and
-the ring presents its own small box.
+Stage ids map to human unit names ("HuesOS Kernel Self-Test",
+"HuesOS Driver Manager", "HuesOS Storage Service", "HuesOS Power
+Control", "HuesOS Terminal", "HuesOS Key Broker"); custom stages use
+their configured label. All line formats live in `huesos-bootux`
+(`paint::tag_text`, `line_prefix`, `line_suffix`) and are unit-tested
+on the host, so the console format cannot drift silently.
+
+`splash.spinner` remains a parsed (ignored) key for config
+compatibility: the status list's `Starting …` lines carry the
+"the machine is alive" signal.
+
+The gradient and the brand line are painted once at startup and never
+re-uploaded. The frame is split into two independently presented
+bands: the status list (repainted only on a stage *state* change —
+a few times per boot) and the progress bar (repainted when the
+permille moves), so a long `Starting …` phase re-uploads the list
+once and then just moves the bar.
 
 ## Rendering
 
 `Canvas` already draws into a process-owned VMO and blits with
 `present()`, so double buffering is inherent — userspace never
 touches video memory, and a partially drawn frame is never visible.
-What matters for flicker is not the buffer but the *upload*: the
-splash composes a full frame into a static shadow buffer and uploads
-only the dirty region.
+The VMO *is* the back buffer; the splash keeps no shadow copy.
 
-The shadow is a `static` byte array, not a heap allocation, because
-init is `no_std` with no allocator. The terminal already does this
-(`SHADOW_CAPACITY`, 16 MiB, covers 2560x1600x4); the splash uses the
-same size for the same reason.
-
-Cost control: the gradient is the expensive part (every pixel, every
-frame) and it never changes, so it is painted once into the shadow
-at startup. Animation frames repaint only the bar, spinner, and
-label rows, then upload just those scanlines with
-`upload_shadow_region` + `present_region`. A spinner tick is a few
-thousand pixels, not a full screen.
+What matters for flicker is the *upload*: each band restores the
+gradient across its rows (a handful of `fill_rect` calls) and uploads
+only those scanlines with `present_region`. A list repaint is a few
+hundred rows of text; a bar tick is a few rows. A full screen is
+uploaded exactly once, at startup.
 
 The gradient is computed per scanline with integer arithmetic —
 there is no FPU state guarantee in init and no soft-float dependency
@@ -159,11 +171,12 @@ says so.
 Now each stage has a wall-clock deadline from `monotonic_ticks()`
 (iteration counts are meaningless here — the loop yields, so it
 spins as fast as the scheduler allows). On expiry the stage is
-marked failed, its indicator turns red, and the splash switches to
-diagnostic mode: it prints the failed stage and the tail of the init
-log on screen, regardless of `log.screen`. The boot continues to the
-next stage, because a missing optional service is not a reason to
-refuse to boot, but it continues *visibly*.
+marked failed: its line in the status list turns into a red
+`[FAILED] Failed to start …`, and the splash draws a diagnostic
+line under the list — `stage '<id>' did not report ready` —
+regardless of `log.screen`. The boot continues to the next stage,
+because a missing optional service is not a reason to refuse to
+boot, but it continues *visibly*.
 
 A clock read failure leaves the deadline unarmed and falls back to
 waiting — refusing to boot because the clock syscall misbehaved

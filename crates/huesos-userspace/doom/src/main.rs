@@ -6,7 +6,7 @@
 use core::cell::UnsafeCell;
 use core::panic::PanicInfo;
 use libcanvas::framebuffer::Canvas;
-use libcanvas::{Channel, ErrorCode, Vmo};
+use libcanvas::{Channel, ErrorCode, Handle, Vmo};
 
 const DOOM_WIDTH: usize = 640;
 const DOOM_HEIGHT: usize = 400;
@@ -14,6 +14,11 @@ const SCALE_CHUNK_SIZE: usize = 1024 * 1024;
 
 struct DoomState {
     canvas: Option<Canvas>,
+    /// RAII owner of the `FrameDraw` capability delivered by init. The
+    /// Canvas only stores the raw handle value, so this must stay alive
+    /// for the process lifetime or every frame blits with a reused,
+    /// wrong-type slot and the screen freezes.
+    frame_draw: Option<Handle>,
     keyboard: Option<Channel>,
     wad: Option<Vmo>,
     wad_offset: u64,
@@ -30,6 +35,7 @@ impl DoomState {
     const fn new() -> Self {
         Self {
             canvas: None,
+            frame_draw: None,
             keyboard: None,
             wad: None,
             wad_offset: 0,
@@ -102,14 +108,17 @@ pub extern "C" fn DG_Init() {
     // so the terminal would keep redrawing over the game anyway).
     let bootstrap = libcanvas::channel::bootstrap();
     let mut message = [0u8; 32];
-    let mut frame_draw: Option<huesos_abi::HandleValue> = None;
+    // RAII-owned: the kernel capability stays open while this Handle is
+    // alive. Copying only the raw value would close the capability on
+    // drop and every later blit would bounce WrongType.
+    let mut frame_draw: Option<Handle> = None;
     loop {
         match bootstrap.read_optional_handle(&mut message) {
             Ok((n, Some(handle))) if &message[..n] == b"keyboard" => {
                 STATE.with(|state| state.keyboard = Some(Channel::from_handle(handle)));
             }
             Ok((n, Some(handle))) if &message[..n] == b"framedraw" => {
-                frame_draw = Some(handle.raw());
+                frame_draw = Some(handle);
                 libcanvas::println!("[doom] FrameDraw capability received");
             }
             Ok((20, Some(handle))) if &message[..4] == b"wad\0" => {
@@ -133,6 +142,11 @@ pub extern "C" fn DG_Init() {
         }
     }
     core::mem::forget(bootstrap);
+
+    // Keep the kernel capability alive for the process lifetime: the
+    // canvases below only borrow the raw handle value.
+    STATE.with(|state| state.frame_draw = frame_draw);
+    let frame_draw = STATE.with(|state| state.frame_draw.as_ref().map(|h| h.raw()));
 
     if let Ok(info) = libcanvas::framebuffer::info() {
         let output_bpp = (info.bpp as u32).div_ceil(8);
