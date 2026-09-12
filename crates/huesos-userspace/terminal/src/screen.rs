@@ -10,6 +10,7 @@ use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use libcanvas::framebuffer::{Canvas, TextFont};
+use libcanvas::HandleValue;
 
 const ROWS: usize = 54;
 const COLS: usize = 168;
@@ -228,8 +229,21 @@ impl Screen {
     /// Create a terminal screen. Serial-only boots remain operational when a
     /// framebuffer canvas is unavailable.
     pub fn new() -> Self {
+        Self::new_with_cap(None)
+    }
+
+    /// Create a terminal screen that blits using the `FrameDraw` capability
+    /// delivered by init. `None` falls back to the default init-process
+    /// slot, which only works for init itself — every other process must be
+    /// handed a real capability or its blits bounce `AccessDenied` and the
+    /// screen freezes on init's last frame.
+    pub fn new_with_cap(frame_draw: Option<HandleValue>) -> Self {
+        let canvas = match frame_draw {
+            Some(cap) => Canvas::new_fullscreen_with_cap(cap).ok(),
+            None => Canvas::new_fullscreen().ok(),
+        };
         Self {
-            canvas: Canvas::new_fullscreen().ok(),
+            canvas,
             cells: [[b' '; COLS]; ROWS],
 
             row: 0,

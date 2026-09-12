@@ -473,6 +473,94 @@ impl Canvas {
         self.draw_text_with_font(x, y, text, r, g, b, TextFont::Cozette6x13)
     }
 
+    /// Draw text with an explicit built-in font, scaled by an integer
+    /// factor: each glyph pixel becomes a `scale`×`scale` block.
+    ///
+    /// This is how the boot splash renders its wordmark — a small
+    /// bitmap font drawn at 2–3× reads as a proper logo without any
+    /// vector rasterisation or soft-float in a `no_std` init.
+    #[allow(clippy::too_many_arguments)]
+    pub fn draw_text_scaled(
+        &self,
+        x: u32,
+        y: u32,
+        text: &str,
+        r: u8,
+        g: u8,
+        b: u8,
+        font: TextFont,
+        scale: u32,
+    ) -> crate::Result<()> {
+        // 8× is the largest scale that can still fit on a 640-wide
+        // frame; clamp rather than reject so a misconfigured scale is
+        // cosmetic, not fatal.
+        let scale = scale.clamp(1, 8);
+        let cell_w = font.cell_w().saturating_mul(scale);
+        let mut cx = x;
+        for ch in text.chars() {
+            if ch == '\n' {
+                continue;
+            }
+            self.draw_glyph_scaled(cx, y, ch, r, g, b, font, scale)?;
+            cx = cx.saturating_add(cell_w);
+        }
+        Ok(())
+    }
+
+    /// Draw a single glyph at integer `scale` (see [`draw_text_scaled`]).
+    #[allow(clippy::too_many_arguments)]
+    fn draw_glyph_scaled(
+        &self,
+        x: u32,
+        y: u32,
+        ch: char,
+        r: u8,
+        g: u8,
+        b: u8,
+        font: TextFont,
+        scale: u32,
+    ) -> crate::Result<()> {
+        match font {
+            TextFont::Cozette6x13 => {
+                let fallback: [u8; crate::font6x13::CELL_H] =
+                    [0b0011_1111; crate::font6x13::CELL_H];
+                let bitmap = crate::font6x13::glyph(ch).unwrap_or(&fallback);
+                for (row, bits) in bitmap.iter().enumerate() {
+                    let py = y.saturating_add(row as u32 * scale);
+                    if py >= self.info.height {
+                        break;
+                    }
+                    for col in 0..crate::font6x13::CELL_W as u32 {
+                        if bits & (1 << col) != 0 {
+                            let px = x.saturating_add(col * scale);
+                            if px < self.info.width {
+                                self.fill_rect(px, py, scale, scale, r, g, b)?;
+                            }
+                        }
+                    }
+                }
+            }
+            TextFont::Tty8x16 | TextFont::Compact8x8 => {
+                let bitmap = crate::font8x8::glyph(ch).unwrap_or(&[0xFF; 8]);
+                for (row, bits) in bitmap.iter().enumerate() {
+                    let py = y.saturating_add(row as u32 * scale);
+                    if py >= self.info.height {
+                        break;
+                    }
+                    for col in 0..8u32 {
+                        if bits & (1 << col) != 0 {
+                            let px = x.saturating_add(col * scale);
+                            if px < self.info.width {
+                                self.fill_rect(px, py, scale, scale, r, g, b)?;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Draw text with an explicit built-in font. Cell width comes
     /// from [`TextFont::cell_w`], so callers do not hard-code
     /// per-font advance widths.

@@ -70,6 +70,20 @@ same `write_handle` pattern the shutdown-broker launch uses for
 into its own handle table, looks up the value, and passes it to
 `Canvas::new_fullscreen_with_cap`.
 
+The resource itself stays a **single exclusive object**: a second
+*mint* of `FrameDraw` is impossible (the per-kind overlap check
+rejects any other resource over `[0, 1)`), yet several consumers each
+need a live handle in their own table for the per-caller blit check.
+So the kernel installs the capability with `Rights::DUPLICATE`, and
+init fans the authority out by **duplicating** the installed handle
+and transferring each duplicate over the consumer's bootstrap
+channel — every consumer ends up holding a handle to the same single
+`FrameDraw` resource, and no new authority is ever minted. The
+terminal receives its duplicate at the screen handoff (after init's
+final frame, so the first terminal blit cannot race init's last
+present); Doom receives one at launch, before it creates any canvas,
+because the capability is stored on a `Canvas` at construction.
+
 A graphics process that never received a `FrameDraw` handle cannot
 manufacture one (mint is gated), cannot steal one (mint is exclusive
 and the slot is taken by init), and cannot use a foreign handle

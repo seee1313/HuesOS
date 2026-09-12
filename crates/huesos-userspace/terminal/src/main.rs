@@ -16,7 +16,7 @@ mod shell;
 mod snake;
 
 use core::panic::PanicInfo;
-use libcanvas::{println, Channel, ErrorCode};
+use libcanvas::{println, Channel, ErrorCode, HandleValue};
 use shell::Shell;
 
 #[unsafe(no_mangle)]
@@ -31,7 +31,7 @@ pub extern "C" fn _start() -> ! {
     // registry setup (helps under QEMU TCG scheduling).
     libcanvas::process::yield_now();
 
-    let registry = wait_for_registry(&bootstrap);
+    let (registry, frame_draw) = wait_for_bootstrap(&bootstrap);
     let keyboard = match open_service(&registry, b"open:keyboard", b"service:keyboard:channel") {
         Ok(channel) => channel,
         Err(e) => {
@@ -46,20 +46,75 @@ pub extern "C" fn _start() -> ! {
         open_service(&registry, b"open:filesystem", b"service:filesystem:channel").ok();
 
     println!("[terminal] keyboard service online, starting shell");
-    let mut shell = Shell::new(keyboard, filesystem, bootstrap);
+    let mut shell = Shell::new(keyboard, filesystem, bootstrap, frame_draw);
     shell.run();
 }
 
-fn wait_for_registry(bootstrap: &Channel) -> Channel {
+/// Maximum number of bootstrap polls after the registry arrives before we
+/// give up waiting for the `framedraw` capability. The registry and the
+/// FrameDraw duplicate are written back-to-back by init, so a healthy boot
+/// delivers both before the first poll returns. The bound only guards
+/// against init failing the transfer: a missing capability degrades the
+/// terminal to a serial-only shell instead of wedging the whole boot, which
+/// would be a strictly worse failure mode than a blank screen.
+const FRAME_DRAW_MAX_POLLS: u32 = 100;
+
+/// Wait for the DriverManager registry channel *and* the `FrameDraw`
+/// capability duplicate on the bootstrap channel.
+///
+/// Returns the registry channel plus the raw `FrameDraw` handle when it
+/// arrived. The terminal's `Screen` needs that capability to blit; without
+/// it every `Canvas::present` would bounce `AccessDenied` and the screen
+/// would freeze on init's last frame, so a missing capability is reported
+/// rather than silently drawn around.
+fn wait_for_bootstrap(bootstrap: &Channel) -> (Channel, Option<HandleValue>) {
     let mut buf = [0u8; 64];
+    let mut registry: Option<Channel> = None;
+    let mut frame_draw: Option<HandleValue> = None;
+    let mut polls = 0u32;
+
     loop {
-        match bootstrap.read_channel_handle(&mut buf) {
-            Ok((n, channel)) if &buf[..n] == b"driver-manager-registry" => return channel,
-            Ok((_n, _channel)) => println!("[terminal] ignored unknown bootstrap handle message"),
+        match bootstrap.read_optional_handle(&mut buf) {
+            Ok((n, Some(handle))) if &buf[..n] == b"driver-manager-registry" => {
+                registry = Some(Channel::from_handle(handle));
+            }
+            Ok((n, Some(handle))) if &buf[..n] == b"framedraw" => {
+                frame_draw = Some(handle.raw());
+                println!("[terminal] FrameDraw capability received");
+            }
+            Ok((n, Some(_handle))) => {
+                println!(
+                    "[terminal] ignored unknown bootstrap handle message: {}",
+                    core::str::from_utf8(&buf[..n]).unwrap_or("<non-utf8>")
+                );
+            }
+            Ok((n, None)) => {
+                println!(
+                    "[terminal] ignored bootstrap control message: {}",
+                    core::str::from_utf8(&buf[..n]).unwrap_or("<non-utf8>")
+                );
+            }
             Err(ErrorCode::ShouldWait) | Err(ErrorCode::InvalidArgs) | Err(ErrorCode::TimedOut) => {
                 libcanvas::process::yield_now();
             }
-            Err(e) => println!("[terminal] registry wait failed: {}", e.as_str()),
+            Err(e) => println!("[terminal] bootstrap wait failed: {}", e.as_str()),
+        }
+
+        if registry.is_some() {
+            if let Some(frame_draw) = frame_draw {
+                if let Some(registry) = registry.take() {
+                    return (registry, Some(frame_draw));
+                }
+                continue;
+            }
+            polls = polls.saturating_add(1);
+            if polls >= FRAME_DRAW_MAX_POLLS {
+                println!("[terminal] FrameDraw not received; continuing without a framebuffer");
+                if let Some(registry) = registry.take() {
+                    return (registry, None);
+                }
+                continue;
+            }
         }
     }
 }

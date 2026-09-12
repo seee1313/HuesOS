@@ -49,7 +49,9 @@ splash          = on | off        # off implies log.screen=on
 splash.top      = RRGGBB          # gradient start
 splash.bottom   = RRGGBB          # gradient end
 splash.accent   = RRGGBB          # bar fill, spinner, ok marks
-splash.spinner  = on | off
+splash.spinner  = on | off        # small dot ring under the wordmark
+splash.version  = <text>          # footer line; default is the build's
+                                  # CARGO_PKG_VERSION
 stage.<id>      = <weight>        # progress weight, any positive int
 stage.<id>.label= <text>          # shown under the bar
 timeout.default = <seconds>
@@ -100,6 +102,27 @@ its own band.
 The bar is monotonic: a stage that reports 60 then 40 stays at 60. A
 progress bar that goes backwards reads as a fault even when nothing
 is wrong.
+
+## Look
+
+The default composition, top to bottom:
+
+* **Wordmark** — "HuesOS" centred in the upper half, rendered from the
+  Cozette 6x13 glyphs at an integer scale (2× below 1080p, 3× at 1080p
+  and up) so the small bitmap font reads as a logo without any vector
+  rasterisation.
+* **Alive ring** — a small dot ring under the wordmark
+  (`splash.spinner`, on by default): the Windows-style "the machine is
+  still working" indicator, deliberately small so it reads as status,
+  not ornament.
+* **Progress bar** — a thin (2–5 px) centred bar at 62% of height with
+  the stage label beneath it.
+* **Version line** — the build's `CARGO_PKG_VERSION` (overridable with
+  `splash.version`) in the bottom margin, dimmed.
+
+The wordmark, gradient, and version line are painted once at startup
+and never re-uploaded; the per-frame region is the bar/label band, and
+the ring presents its own small box.
 
 ## Rendering
 

@@ -85,41 +85,98 @@ pub struct Layout {
     pub bar_h: u32,
     pub label_x: u32,
     pub label_y: u32,
-    pub title_x: u32,
-    pub title_y: u32,
+    /// Centre of the wordmark; the renderer draws scaled glyphs around
+    /// it (see [`wordmark_width`]/[`wordmark_height`]).
+    pub wordmark_x: u32,
+    pub wordmark_y: u32,
+    /// Integer scale of the wordmark glyphs (2 on small panels, 3 on
+    /// 1080p+).
+    pub wordmark_scale: u32,
+    /// Top scanline of the version line in the bottom margin.
+    pub version_y: u32,
     pub spinner_cx: u32,
     pub spinner_cy: u32,
     pub spinner_r: u32,
-    /// Top scanline of the region the animation repaints each frame.
+    /// Top scanline of the region the bar/label repaint each frame.
+    /// (The spinner paints its own region separately.)
     pub dirty_y: u32,
     /// Height of that region.
     pub dirty_h: u32,
 }
 
+/// Cell width of the Cozette 6x13 glyphs the wordmark is drawn from.
+pub const WORDMARK_CELL_W: u32 = 6;
+/// Cell height of the Cozette 6x13 glyphs the wordmark is drawn from.
+pub const WORDMARK_CELL_H: u32 = 13;
+/// Glyph count of the "HuesOS" wordmark.
+pub const WORDMARK_LEN: usize = 6;
+
+/// Integer glyph scale for the wordmark at a given resolution: 3 on
+/// 1080p and up, 2 everywhere else. Two scales instead of continuous
+/// sizing keeps the glyphs crisp (whole-pixel blocks) and the maths
+/// branch-free.
+pub fn wordmark_scale(height: u32) -> u32 {
+    if height >= 1024 {
+        3
+    } else {
+        2
+    }
+}
+
+/// Pixel width of the wordmark at a scale.
+pub fn wordmark_width(scale: u32) -> u32 {
+    WORDMARK_LEN as u32 * WORDMARK_CELL_W * scale
+}
+
+/// Pixel height of the wordmark at a scale.
+pub fn wordmark_height(scale: u32) -> u32 {
+    WORDMARK_CELL_H * scale
+}
+
 /// Compute the splash layout.
 ///
-/// The bar is centred horizontally at 44% of width, clamped so it stays
-/// sane on both a 640x480 VGA fallback and a 2560x1600 panel.
+/// The composition, top to bottom: wordmark centred in the upper half,
+/// the small alive-indicator ring beneath it, a thin progress bar at
+/// 62% of height, the stage label under the bar, and a version line in
+/// the bottom margin. Everything is centred; the bar keeps its 44%-of-
+/// width band, clamped so it stays sane from 640x480 VGA to a 2560x1600
+/// panel.
 pub fn layout(width: u32, height: u32, title_px: u32, label_px: u32) -> Layout {
     let bar_w = (width * 44 / 100)
         .clamp(160, 900)
         .min(width.saturating_sub(32));
-    let bar_h = (height / 90).clamp(4, 14);
+    // Thin, Windows-style bar: a few pixels, not a chunky slab.
+    let bar_h = (height / 160).clamp(2, 5);
     let bar_x = (width.saturating_sub(bar_w)) / 2;
     let bar_y = height * 62 / 100;
 
-    let spinner_r = (height / 22).clamp(10, 34);
+    // Wordmark + ring as one vertically centred block at 40% of height,
+    // the position serious boot screens settle on (logo above the
+    // lower-third, progress below).
+    let scale = wordmark_scale(height);
+    let wordmark_h = wordmark_height(scale);
+    // Small ring: status, not ornament.
+    let spinner_r = (height / 44).clamp(8, 18);
+    let gap = (height / 40).clamp(12, 36);
+    let block_h = wordmark_h + gap + spinner_r * 2;
+    let block_centre = height * 40 / 100;
+    let block_top = block_centre
+        .saturating_sub(block_h / 2)
+        .max((height / 40).min(24));
+    let wordmark_y = block_top;
     let spinner_cx = width / 2;
-    let spinner_cy = height * 38 / 100;
-
-    let title_x = width / 2;
-    let title_y = spinner_cy + spinner_r + (height / 24).clamp(12, 44);
+    let spinner_cy = wordmark_y + wordmark_h + gap + spinner_r;
+    let wordmark_x = width / 2;
 
     let label_x = width / 2;
     let label_y = bar_y + bar_h + (height / 60).clamp(8, 26);
 
+    // Version line: bottom margin above the frame edge, small font.
+    let version_y = height.saturating_sub((height / 22).clamp(18, 34));
+
     // The animated region spans the bar and the label line beneath it.
-    // The gradient above is painted once and never re-uploaded.
+    // The gradient, wordmark, and version line are painted once and
+    // never re-uploaded.
     let dirty_y = bar_y.saturating_sub(bar_h);
     let dirty_bottom = (label_y + label_px + 4).min(height);
     let dirty_h = dirty_bottom.saturating_sub(dirty_y);
@@ -135,8 +192,10 @@ pub fn layout(width: u32, height: u32, title_px: u32, label_px: u32) -> Layout {
         bar_h,
         label_x,
         label_y,
-        title_x,
-        title_y,
+        wordmark_x,
+        wordmark_y,
+        wordmark_scale: scale,
+        version_y,
         spinner_cx,
         spinner_cy,
         spinner_r,
@@ -243,6 +302,21 @@ mod tests {
     }
 
     #[test]
+    fn wordmark_scale_switches_at_1080p() {
+        assert_eq!(wordmark_scale(480), 2);
+        assert_eq!(wordmark_scale(768), 2);
+        assert_eq!(wordmark_scale(1023), 2);
+        assert_eq!(wordmark_scale(1024), 3);
+        assert_eq!(wordmark_scale(1600), 3);
+        // Widths/heights track the scale and stay inside a 640-wide frame.
+        assert_eq!(wordmark_width(2), 72);
+        assert_eq!(wordmark_width(3), 108);
+        assert_eq!(wordmark_height(2), 26);
+        assert_eq!(wordmark_height(3), 39);
+        assert!(wordmark_width(2) < 640);
+    }
+
+    #[test]
     fn layout_stays_inside_the_frame() {
         // Includes the awkward small mode and a large panel.
         for (w, h) in [
@@ -268,6 +342,27 @@ mod tests {
                 "spinner clipped at {w}x{h}"
             );
             assert!(layout.label_y < h);
+            // Wordmark: centred, inside the frame, above the ring.
+            let half = wordmark_width(layout.wordmark_scale) / 2;
+            assert!(
+                layout.wordmark_x >= half && layout.wordmark_x + half <= w,
+                "wordmark overflows at {w}x{h}"
+            );
+            assert!(
+                layout.wordmark_y + wordmark_height(layout.wordmark_scale)
+                    <= layout.spinner_cy - layout.spinner_r,
+                "wordmark overlaps ring at {w}x{h}"
+            );
+            // Ring sits above the bar.
+            assert!(
+                layout.spinner_cy + layout.spinner_r <= layout.bar_y,
+                "ring overlaps bar at {w}x{h}"
+            );
+            // Version line: a full small-font row fits below it.
+            assert!(
+                layout.version_y + WORDMARK_CELL_H <= h,
+                "version at {w}x{h}"
+            );
         }
     }
 
