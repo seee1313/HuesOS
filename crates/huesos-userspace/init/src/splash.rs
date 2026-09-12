@@ -25,7 +25,7 @@
 //! gradient behind them is painted once and re-presented only where it
 //! was disturbed.
 
-use huesos_bootux::config::{InitConfig, Rgb};
+use huesos_bootux::config::{InitConfig, InlineStr, Rgb, MAX_VERSION};
 use huesos_bootux::paint::{
     self, bar_fill_width, centre_text_x, gradient_at, spinner_arm_alpha, Layout, SPINNER_ARMS,
 };
@@ -53,6 +53,10 @@ pub struct Splash {
     spinner: bool,
     frame: u32,
     last_permille: u32,
+    /// Version line for the bottom margin. Resolved from config in
+    /// [`Splash::new`], falling back to the build's own package version
+    /// when the operator did not override it.
+    version: InlineStr<MAX_VERSION>,
     /// Set once the static background has been painted.
     background_ready: bool,
 }
@@ -66,6 +70,14 @@ impl Splash {
     pub fn new(config: &InitConfig) -> Option<Self> {
         let canvas = Canvas::new_fullscreen().ok()?;
         let layout = paint::layout(canvas.width(), canvas.height(), CELL_H, CELL_H);
+        // The splash carries the image's own version unless the operator
+        // overrode it in config; an empty configured version is the
+        // "not set" marker, not a request for a blank footer.
+        let version = if config.version.is_empty() {
+            InlineStr::from_bytes(env!("CARGO_PKG_VERSION").as_bytes())
+        } else {
+            config.version
+        };
         let mut splash = Self {
             canvas,
             layout,
@@ -75,13 +87,16 @@ impl Splash {
             spinner: config.spinner,
             frame: 0,
             last_permille: u32::MAX,
+            version,
             background_ready: false,
         };
         splash.paint_background();
         Some(splash)
     }
 
-    /// Paint the gradient and title, then present the whole frame once.
+    /// Paint the gradient, wordmark, and version line, then present the
+    /// whole frame once. All of it is static for the boot's lifetime, so
+    /// it is uploaded exactly once and never touched again.
     fn paint_background(&mut self) {
         let width = self.canvas.width();
         let height = self.canvas.height();
@@ -95,14 +110,30 @@ impl Splash {
                 return;
             }
         }
-        let title_x = centre_text_x(self.layout.title_x, TITLE.len(), CELL_W, width);
-        let _ = self.canvas.draw_text_with_font(
-            title_x,
-            self.layout.title_y,
+        // Wordmark, scaled 2–3× so the small bitmap font reads as a logo.
+        let scale = self.layout.wordmark_scale;
+        let wordmark_x = centre_text_x(self.layout.wordmark_x, TITLE.len(), CELL_W * scale, width);
+        let _ = self.canvas.draw_text_scaled(
+            wordmark_x,
+            self.layout.wordmark_y,
             TITLE,
             COLOR_TITLE.r,
             COLOR_TITLE.g,
             COLOR_TITLE.b,
+            FONT,
+            scale,
+        );
+        // Version line in the bottom margin, dimmed so it reads as a
+        // footer rather than competing with the status label.
+        let dim = paint::shade(COLOR_LABEL, 120, 255);
+        let version_x = centre_text_x(width / 2, self.version.as_bytes().len(), CELL_W, width);
+        let _ = self.canvas.draw_text_with_font(
+            version_x,
+            self.layout.version_y,
+            self.version.as_str(),
+            dim.r,
+            dim.g,
+            dim.b,
             FONT,
         );
         self.background_ready = self.canvas.present().is_ok();

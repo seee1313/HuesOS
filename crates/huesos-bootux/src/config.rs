@@ -26,6 +26,9 @@ pub const MAX_LABEL: usize = 32;
 /// Maximum bytes retained for a stage id.
 pub const MAX_ID: usize = 24;
 
+/// Maximum bytes retained for the splash version line.
+pub const MAX_VERSION: usize = 24;
+
 /// Default per-stage timeout when the config does not override it.
 pub const DEFAULT_TIMEOUT_SECS: u32 = 30;
 
@@ -114,7 +117,15 @@ pub struct InitConfig {
     pub log_screen: bool,
     /// Draw the graphical splash.
     pub splash: bool,
+    /// Small dot ring under the wordmark — the "the machine is alive"
+    /// indicator serious systems keep (Windows-style), deliberately
+    /// small so it reads as status, not ornament. Off with
+    /// `splash.spinner=off`.
     pub spinner: bool,
+    /// Version line under the splash. Empty falls back to the build's
+    /// `CARGO_PKG_VERSION`, so an image carries its own version unless
+    /// the operator overrides it.
+    pub version: InlineStr<MAX_VERSION>,
     pub top: Rgb,
     pub bottom: Rgb,
     pub accent: Rgb,
@@ -144,7 +155,12 @@ impl InitConfig {
         Self {
             log_screen: false,
             splash: true,
+            // The spinner is now a small dot ring under the wordmark
+            // (Windows-style "the machine is alive" indicator) rather
+            // than a large ornament; it stays on by default and can be
+            // disabled with `splash.spinner=off`.
             spinner: true,
+            version: InlineStr::empty(),
             top: Rgb::new(10, 14, 34),
             bottom: Rgb::new(4, 6, 14),
             accent: Rgb::new(90, 200, 255),
@@ -289,6 +305,9 @@ impl InitConfig {
                 Some(rgb) => self.accent = rgb,
                 None => self.bad_values += 1,
             },
+            b"splash.version" => {
+                self.version = InlineStr::from_bytes(value);
+            }
             b"timeout.default" => match parse_u32(value) {
                 Some(secs) => self.default_timeout_secs = secs,
                 None => self.bad_values += 1,
@@ -570,6 +589,19 @@ mod tests {
         assert_eq!(config.accent, Rgb::new(0x5A, 0xC8, 0xFF));
         assert_eq!(config.bad_values, 0);
         assert_eq!(config.unknown_keys, 0);
+    }
+
+    #[test]
+    fn splash_version_key_parses_and_truncates() {
+        let mut config = InitConfig::new();
+        assert!(config.version.is_empty());
+        config.parse_file(b"splash.version=0.1.0 (build 42)\n");
+        assert_eq!(config.version.as_str(), "0.1.0 (build 42)");
+        assert_eq!(config.bad_values, 0);
+
+        let mut long = InitConfig::new();
+        long.parse_file(b"splash.version=012345678901234567890123456789\n");
+        assert_eq!(long.version.as_bytes().len(), MAX_VERSION);
     }
 
     #[test]
