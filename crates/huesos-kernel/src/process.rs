@@ -4,7 +4,9 @@
 use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use huesos_abi::{vmar_flags, ErrorCode, ResourceMapArgs, VmarMapArgs, VmarOpArgs};
+use huesos_abi::{
+    vmar_flags, ErrorCode, ResourceMapArgs, ResourceUnmapArgs, VmarMapArgs, VmarOpArgs,
+};
 use huesos_arch::gdt;
 use huesos_arch::paging::{flags, AddressSpace, UserPageError};
 use huesos_arch::{LockRank, RankedIrqSafeTicketLock};
@@ -55,12 +57,21 @@ impl ProcessRuntime {
         })
     }
 
-    /// CR3 value for scheduling this process.
-    pub fn cr3(&self) -> u64 {
+    /// CR3 value for scheduling this process, or `None` once the runtime's
+    /// address space has been destroyed (see [`ProcessRuntime::drop`]).
+    ///
+    /// Returning `None` rather than `0` matters: a CR3 of `0` is a *valid
+    /// encoding* of a page-table base that points at physical address 0,
+    /// which is not a page table. A caller that silently received `0` and
+    /// published it into a `Context` would load it on the next switch and
+    /// triple-fault with no error path to blame. Forcing the caller to
+    /// handle the `None` arms the failure at the only place that can act on
+    /// it (spawn), matching the `address_space_mut().ok_or(NotInitialized)`
+    /// pattern used throughout this file.
+    pub fn cr3(&self) -> Option<u64> {
         self.address_space
             .as_ref()
             .map(|address_space| address_space.phys_addr().as_u64())
-            .unwrap_or(0)
     }
 
     fn address_space_mut(&mut self) -> Option<&mut AddressSpace> {
@@ -425,6 +436,131 @@ pub fn map_resource_into_current(
     // mailbox without the VMAR mutation lock, breaking the shootdown's
     // one-request-in-flight contract.
     Ok(args.addr)
+}
+
+/// Remove the `Mmio` or `DmaPool` Resource mapping that
+/// [`map_resource_into_current`] installed into the caller's root VMAR.
+///
+/// The inverse of [`map_resource_into_current`]: the (addr, len) pair
+/// must exactly match the recorded resource mapping, and that mapping
+/// must be backed by the resource the caller presents. The physical
+/// range and page permissions are recovered from the recorded mapping
+/// (not from the arguments), so a caller can neither unmap a range it
+/// never mapped nor point the operation at another resource's pages.
+///
+/// Resource pages are unmapped but *not released*: their frames are
+/// hardware (an MMIO window, a DMA pool), not PMM allocations, and
+/// returning them to the allocator would be a double free. Removing a
+/// translation *can* leave stale TLB entries on other CPUs, so a
+/// cross-CPU shootdown runs under the VMAR mutation lock — the same
+/// one-request-in-flight contract as the generic unmap/protect
+/// transaction paths.
+pub fn unmap_resource_from_current(
+    resource: &Resource,
+    args: ResourceUnmapArgs,
+) -> Result<u64, ErrorCode> {
+    validate_resource_unmap_args(resource, args)?;
+    let process = huesos_object::current_process().ok_or(ErrorCode::AccessDenied)?;
+    let _memory_guard = process.user_memory_lock.lock();
+    // Hold the VMAR mutation lock across the IPI handshake: the
+    // shootdown's global mailbox is only safe with one request in flight
+    // system-wide.
+    let _mutation_guard = VMAR_MUTATION_LOCK.lock();
+
+    let mut runtime_guard = process.address_space.lock();
+    let runtime = runtime_guard
+        .as_mut()
+        .and_then(|runtime| runtime.downcast_mut::<ProcessRuntime>())
+        .ok_or(ErrorCode::BadHandle)?;
+    let root_vmar = Arc::clone(&runtime.root_vmar);
+    if root_vmar.process() != process.koid() {
+        return Err(ErrorCode::AccessDenied);
+    }
+    // The recorded mapping must exist, exactly cover the requested
+    // range, and be backed by the resource the caller presents.
+    let mapping = root_vmar
+        .mapping_covering(args.addr, args.len)
+        .ok_or(ErrorCode::NotFound)?;
+    if mapping.base != args.addr || mapping.size != args.len || mapping.vmo != resource.koid() {
+        return Err(ErrorCode::NotFound);
+    }
+
+    let address_space = runtime.address_space_mut().ok_or(ErrorCode::BadHandle)?;
+    let page_count = (args.len / PAGE_SIZE) as usize;
+    // Physical base of the recorded mapping; the rollback remap below
+    // needs it if the unmap transaction fails halfway.
+    let phys_base = resource.base() + mapping.vmo_offset + (args.addr - mapping.base);
+    let page_flags = resource_page_flags(resource.kind(), mapping.flags)?;
+
+    // `unmapped` counts the pages successfully released before the
+    // current one — exactly the rollback set if this iteration fails.
+    for (unmapped, index) in (0..page_count).enumerate() {
+        let page = Page::<Size4KiB>::containing_address(VirtAddr::new(
+            args.addr + index as u64 * PAGE_SIZE,
+        ));
+        if address_space.unmap_user_page(page).is_err() {
+            // Roll back every page this call already unmapped so the
+            // caller's mapping stays intact: a half-unmapped device
+            // window is worse than none.
+            remap_resource_pages(address_space, args.addr, phys_base, page_flags, unmapped)?;
+            return Err(ErrorCode::Internal);
+        }
+    }
+    if !root_vmar.remove_mapping(mapping) {
+        remap_resource_pages(address_space, args.addr, phys_base, page_flags, page_count)?;
+        return Err(ErrorCode::Internal);
+    }
+    // Release the kernel reference the map transaction took: the
+    // mapping is what kept the resource alive beyond its last user
+    // handle.
+    huesos_object::note_kernel_ref_close(resource.koid());
+    // The map path guaranteed the PTEs were absent (no shootdown needed);
+    // unmap does not — other CPUs may still hold the translations this
+    // call just invalidated.
+    huesos_arch::paging::shootdown_range(
+        args.addr,
+        args.addr + args.len,
+        crate::scheduler::online_remote_cpu_count(),
+    );
+    Ok(args.addr)
+}
+
+/// Reinstall `count` pages of a resource mapping starting at
+/// `virt_base` over `phys_base` (rollback helper for the unmap
+/// transaction).
+fn remap_resource_pages(
+    address_space: &mut AddressSpace,
+    virt_base: u64,
+    phys_base: u64,
+    flags: PageTableFlags,
+    count: usize,
+) -> Result<(), ErrorCode> {
+    for index in 0..count {
+        let page = Page::<Size4KiB>::containing_address(VirtAddr::new(
+            virt_base + index as u64 * PAGE_SIZE,
+        ));
+        let frame = PhysFrame::<Size4KiB>::containing_address(PhysAddr::new(
+            phys_base + index as u64 * PAGE_SIZE,
+        ));
+        address_space
+            .try_map_user_page(page, frame, flags)
+            .map_err(|_| ErrorCode::Internal)?;
+    }
+    Ok(())
+}
+
+fn validate_resource_unmap_args(
+    resource: &Resource,
+    args: ResourceUnmapArgs,
+) -> Result<(), ErrorCode> {
+    if args.len == 0 || !args.addr.is_multiple_of(PAGE_SIZE) || !args.len.is_multiple_of(PAGE_SIZE)
+    {
+        return Err(ErrorCode::InvalidArgs);
+    }
+    if !matches!(resource.kind(), ResourceKind::Mmio | ResourceKind::DmaPool) {
+        return Err(ErrorCode::WrongType);
+    }
+    Ok(())
 }
 
 fn validate_resource_map_args(resource: &Resource, args: ResourceMapArgs) -> Result<(), ErrorCode> {
@@ -1087,7 +1223,18 @@ pub fn spawn_from_elf(name: &str, elf_bytes: &[u8]) -> Result<SpawnedProcess, Sp
         addr += 4096;
     }
 
-    let cr3 = runtime.cr3();
+    // The stack loop above just ran through `address_space_mut()`, so a
+    // `None` here would mean the address space vanished mid-spawn — treat
+    // it as the same fatal, roll-back-and-fail condition rather than
+    // publishing a context with no valid CR3.
+    let cr3 = match runtime.cr3() {
+        Some(cr3) => cr3,
+        None => {
+            runtime.destroy();
+            huesos_object::unregister_object(process.koid());
+            return Err(SpawnError::Paging(UserPageError::NotInitialized));
+        }
+    };
     *process.address_space.lock() =
         Some(Box::new(runtime) as Box<dyn core::any::Any + Send + Sync>);
 

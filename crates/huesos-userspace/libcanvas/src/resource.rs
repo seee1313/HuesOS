@@ -7,7 +7,7 @@
 //! future component_manager. See `docs/ARCHITECTURE_ROADMAP.md` §4.
 
 use crate::{raw, Handle, Result};
-use huesos_abi::{HandleValue, ResourceMapArgs, Syscall, INVALID_HANDLE};
+use huesos_abi::{HandleValue, ResourceMapArgs, ResourceUnmapArgs, Syscall, INVALID_HANDLE};
 
 pub use huesos_abi::ResourceKindAbi as ResourceKind;
 
@@ -52,6 +52,14 @@ impl Resource {
         map_self(self.handle(), resource_offset, addr, len, flags)
     }
 
+    /// Remove a mapping installed by [`Resource::map_self`]. The (addr, len)
+    /// pair must exactly match the range that resource mapping recorded; the
+    /// kernel invalidates the pages and performs a cross-CPU TLB shootdown
+    /// before returning. Only `Mmio` and `DmaPool` resources are accepted.
+    pub fn unmap_self(&self, addr: u64, len: u64) -> Result<u64> {
+        unmap_self(self.handle(), addr, len)
+    }
+
     /// Consume `self` and yield the raw handle for transfer semantics
     /// (e.g. `channel.write_with_handle(&msg, resource.into_raw())`),
     /// suppressing `Drop` so the receiver becomes the owner.
@@ -88,6 +96,22 @@ pub fn map_self(
     };
     let ret = raw::syscall1(Syscall::ResourceMap, &args as *const _ as u64);
     raw::decode(ret).map(|mapped| mapped as u64)
+}
+
+/// Remove a Resource mapping installed by [`map_self`] at exactly the
+/// recorded (addr, len) range. Prefer [`Resource::unmap_self`] when the
+/// caller owns a typed wrapper; this free function is convenient for
+/// DriverHosts that keep bootstrap resources as generic [`Handle`]
+/// values. Fails with `NotFound` unless a matching mapping exists in
+/// this process for this same resource.
+pub fn unmap_self(resource: &Handle, addr: u64, len: u64) -> Result<u64> {
+    let args = ResourceUnmapArgs {
+        resource: resource.raw(),
+        addr,
+        len,
+    };
+    let ret = raw::syscall1(Syscall::ResourceUnmap, &args as *const _ as u64);
+    raw::decode(ret).map(|unmapped| unmapped as u64)
 }
 
 /// Mark the target process as critical (see the kernel

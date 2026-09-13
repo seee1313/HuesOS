@@ -1,7 +1,9 @@
 //! Scheduler/kernel callbacks registered by `huesos-kernel`.
 
 use alloc::sync::Arc;
-use huesos_abi::{ErrorCode, HeapExtendArgs, ResourceMapArgs, VmarMapArgs, VmarOpArgs};
+use huesos_abi::{
+    ErrorCode, HeapExtendArgs, ResourceMapArgs, ResourceUnmapArgs, VmarMapArgs, VmarOpArgs,
+};
 use spin::Mutex;
 
 /// Global yield callback (set by kernel scheduler to avoid circular deps).
@@ -41,6 +43,10 @@ pub type VmarOpFn = fn(&huesos_object::Vmar, VmarOpArgs) -> Result<u64, ErrorCod
 /// Kernel callback type used to map an `Mmio`/`DmaPool` Resource into the
 /// caller's root VMAR.
 pub type ResourceMapFn = fn(&huesos_object::Resource, ResourceMapArgs) -> Result<u64, ErrorCode>;
+/// Kernel callback type used to remove a Resource mapping installed by
+/// [`ResourceMapFn`].
+pub type ResourceUnmapFn =
+    fn(&huesos_object::Resource, ResourceUnmapArgs) -> Result<u64, ErrorCode>;
 /// Kernel callback type used to commit/decommit pages in the calling
 /// process's own reserved heap window (`VmarHeapExtend`).
 pub type HeapExtendFn = fn(HeapExtendArgs) -> Result<u64, ErrorCode>;
@@ -59,6 +65,8 @@ pub(crate) static VMAR_UNMAP_FN: Mutex<Option<VmarOpFn>> = Mutex::new(None);
 pub(crate) static VMAR_PROTECT_FN: Mutex<Option<VmarOpFn>> = Mutex::new(None);
 /// Global Resource-map callback.
 pub(crate) static RESOURCE_MAP_FN: Mutex<Option<ResourceMapFn>> = Mutex::new(None);
+/// Global Resource-unmap callback.
+pub(crate) static RESOURCE_UNMAP_FN: Mutex<Option<ResourceUnmapFn>> = Mutex::new(None);
 /// Global heap-extend callback (set by the kernel process layer).
 pub(crate) static HEAP_EXTEND_FN: Mutex<Option<HeapExtendFn>> = Mutex::new(None);
 /// Global thread-start callback (set by the kernel scheduler/process layer).
@@ -127,6 +135,11 @@ pub fn set_vmar_protect_fn(f: VmarOpFn) {
 /// Set the Resource-map function. Called once by kernel init.
 pub fn set_resource_map_fn(f: ResourceMapFn) {
     *RESOURCE_MAP_FN.lock() = Some(f);
+}
+
+/// Set the Resource-unmap function. Called once by kernel init.
+pub fn set_resource_unmap_fn(f: ResourceUnmapFn) {
+    *RESOURCE_UNMAP_FN.lock() = Some(f);
 }
 
 /// Set the heap-extend function. Called once by kernel init.

@@ -116,7 +116,9 @@ On-target, these are backed by kernel-provided capabilities:
 
 The ABI side has a `ResourceKindAbi::DmaPool` / object `ResourceKind::DmaPool`
 capability, a storage boot-info VMO (`huesos_abi::storage_boot`), and
-`ResourceMapArgs` for fixed-address self-mapping.
+`ResourceMapArgs` / `ResourceUnmapArgs` for fixed-address self-mapping
+(`Syscall::ResourceMap` / `Syscall::ResourceUnmap`, the latter removing a
+previously recorded mapping with a cross-CPU TLB shootdown).
 
 ## Block protocol / DriverManager registry
 
