@@ -492,8 +492,9 @@ pub fn unmap_resource_from_current(
     let phys_base = resource.base() + mapping.vmo_offset + (args.addr - mapping.base);
     let page_flags = resource_page_flags(resource.kind(), mapping.flags)?;
 
-    let mut unmapped = 0usize;
-    for index in 0..page_count {
+    // `unmapped` counts the pages successfully released before the
+    // current one — exactly the rollback set if this iteration fails.
+    for (unmapped, index) in (0..page_count).enumerate() {
         let page = Page::<Size4KiB>::containing_address(VirtAddr::new(
             args.addr + index as u64 * PAGE_SIZE,
         ));
@@ -504,7 +505,6 @@ pub fn unmap_resource_from_current(
             remap_resource_pages(address_space, args.addr, phys_base, page_flags, unmapped)?;
             return Err(ErrorCode::Internal);
         }
-        unmapped += 1;
     }
     if !root_vmar.remove_mapping(mapping) {
         remap_resource_pages(address_space, args.addr, phys_base, page_flags, page_count)?;
