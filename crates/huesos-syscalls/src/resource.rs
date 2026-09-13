@@ -10,13 +10,15 @@
 //! Zircon model where a resource handle *is* the capability. See
 //! `docs/ARCHITECTURE_ROADMAP.md` §2 and §3 for the design.
 
-use huesos_abi::{vmar_flags, ErrorCode, HandleValue, ResourceKindAbi, ResourceMapArgs};
+use huesos_abi::{
+    vmar_flags, ErrorCode, HandleValue, ResourceKindAbi, ResourceMapArgs, ResourceUnmapArgs,
+};
 use huesos_object::{
     current_process, unregister_object, Handle, KernelObject, KernelObjectExt, Process, Resource,
     ResourceError, ResourceKind, Rights,
 };
 
-use crate::callbacks::RESOURCE_MAP_FN;
+use crate::callbacks::{RESOURCE_MAP_FN, RESOURCE_UNMAP_FN};
 use crate::user_memory;
 use crate::SyscallResult;
 
@@ -145,6 +147,32 @@ pub(crate) fn sys_resource_map(args_ptr: *const ResourceMapArgs) -> SyscallResul
         .ok_or(ErrorCode::WrongType)?;
     let map = (*RESOURCE_MAP_FN.lock()).ok_or(ErrorCode::NotSupported)?;
     map(resource, args).map(|addr| addr as i64)
+}
+
+/// Remove a Resource mapping installed by [`sys_resource_map`].
+///
+/// Authority is the same capability that performed the map: the caller
+/// must present the live `Resource` handle whose mapping is being
+/// removed. The kernel recovers the physical range and permissions from
+/// the recorded VMAR mapping (not from the arguments), so a caller cannot
+/// unmap a range they never mapped or point the operation at a different
+/// resource's pages.
+pub(crate) fn sys_resource_unmap(args_ptr: *const ResourceUnmapArgs) -> SyscallResult {
+    let args = user_memory::read_value(args_ptr)?;
+    let caller = current_process().ok_or(ErrorCode::AccessDenied)?;
+    let handle = caller
+        .handles
+        .get(args.resource)
+        .ok_or(ErrorCode::BadHandle)?;
+    if !handle.has_rights(Rights::READ) {
+        return Err(ErrorCode::AccessDenied);
+    }
+    let object = huesos_object::lookup_object(handle.koid).ok_or(ErrorCode::BadHandle)?;
+    let resource = object
+        .downcast_ref::<Resource>()
+        .ok_or(ErrorCode::WrongType)?;
+    let unmap = (*RESOURCE_UNMAP_FN.lock()).ok_or(ErrorCode::NotSupported)?;
+    unmap(resource, args).map(|addr| addr as i64)
 }
 
 pub(crate) fn sys_process_mark_critical(process_handle: HandleValue) -> SyscallResult {

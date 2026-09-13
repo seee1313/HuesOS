@@ -234,6 +234,7 @@ pub fn syscall_init() {
     huesos_syscalls::set_vmar_unmap_fn(crate::process::unmap_vmar_mapping);
     huesos_syscalls::set_vmar_protect_fn(crate::process::protect_vmar_mapping);
     huesos_syscalls::set_resource_map_fn(crate::process::map_resource_into_current);
+    huesos_syscalls::set_resource_unmap_fn(crate::process::unmap_resource_from_current);
     huesos_syscalls::set_heap_extend_fn(crate::process::heap_extend_current);
     huesos_syscalls::set_thread_start_fn(crate::process::start_thread);
     seed_kernel_entropy();

@@ -361,6 +361,15 @@ pub enum Syscall {
     /// capability to collect them is an aggregator that will not be
     /// running when it matters.
     SystemObservationRead = 64,
+    /// Unmap a range that a previous [`Self::ResourceMap`] call installed in
+    /// the caller's root VMAR. `a1` points to [`ResourceUnmapArgs`]. The
+    /// (addr, len) pair must exactly match the range that resource mapping
+    /// recorded; partial unmap of a resource mapping is refused (a mapping
+    /// either exists in full or not at all). The kernel invalidates the
+    /// pages and performs a cross-CPU TLB shootdown before returning, so a
+    /// stale translation on another CPU cannot keep the physical range
+    /// reachable from ring 3 after this call.
+    ResourceUnmap = 65,
 }
 
 /// Maximum number of bytes one [`Syscall::SystemGetEntropy`] call
@@ -440,7 +449,7 @@ impl Syscall {
     /// Total number of defined syscalls (i.e. one past the highest
     /// currently-assigned number). The dispatcher uses this to reject
     /// obviously-out-of-range numbers before a `match`.
-    pub const COUNT: u64 = 65;
+    pub const COUNT: u64 = 66;
 
     /// Convert a raw syscall number back into a [`Syscall`], if valid.
     pub const fn from_raw(n: u64) -> Option<Self> {
@@ -510,6 +519,7 @@ impl Syscall {
             62 => Self::SystemKnobGet,
             63 => Self::SystemKnobSet,
             64 => Self::SystemObservationRead,
+            65 => Self::ResourceUnmap,
             _ => return None,
         })
     }
@@ -1263,11 +1273,31 @@ pub struct ResourceMapArgs {
     pub flags: u32,
 }
 
+/// Arguments for [`Syscall::ResourceUnmap`].
+///
+/// The (addr, len) pair must exactly match a range that a prior
+/// [`Syscall::ResourceMap`] recorded for this same resource in the
+/// caller's root VMAR. `resource_offset` and `flags` have no role here:
+/// the kernel recovers the original physical range and permissions from
+/// the recorded mapping itself.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ResourceUnmapArgs {
+    /// Resource handle owned by the caller — the same capability the
+    /// range was mapped with.
+    pub resource: HandleValue,
+    /// Start of the recorded mapping to remove. Must be page-aligned.
+    pub addr: u64,
+    /// Length of the recorded mapping, in bytes. Must be non-zero and
+    /// page-aligned.
+    pub len: u64,
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         hbi_boot, rights, vmar_flags, ErrorCode, KnobIdAbi, ResourceKindAbi, ResourceMapArgs,
-        Syscall, MAX_OBSERVATION_BYTES, OBSERVATION_RECORD_SIZE,
+        ResourceUnmapArgs, Syscall, MAX_OBSERVATION_BYTES, OBSERVATION_RECORD_SIZE,
     };
 
     #[test]
@@ -1354,7 +1384,8 @@ mod tests {
         assert_eq!(Syscall::SystemKnobGet as u64, 62);
         assert_eq!(Syscall::SystemKnobSet as u64, 63);
         assert_eq!(Syscall::SystemObservationRead as u64, 64);
-        assert_eq!(Syscall::COUNT, 65);
+        assert_eq!(Syscall::ResourceUnmap as u64, 65);
+        assert_eq!(Syscall::COUNT, 66);
         assert_eq!(Syscall::from_raw(28), Some(Syscall::VmoCreateEx));
         assert_eq!(Syscall::from_raw(30), Some(Syscall::VmarProtect));
         assert_eq!(Syscall::from_raw(31), Some(Syscall::ChannelPeek));
@@ -1397,7 +1428,8 @@ mod tests {
         assert_eq!(Syscall::from_raw(62), Some(Syscall::SystemKnobGet));
         assert_eq!(Syscall::from_raw(63), Some(Syscall::SystemKnobSet));
         assert_eq!(Syscall::from_raw(64), Some(Syscall::SystemObservationRead));
-        assert_eq!(Syscall::from_raw(65), None);
+        assert_eq!(Syscall::from_raw(65), Some(Syscall::ResourceUnmap));
+        assert_eq!(Syscall::from_raw(66), None);
     }
 
     #[test]
@@ -1411,6 +1443,21 @@ mod tests {
         };
         assert_eq!(args.resource, 7);
         assert_eq!(args.len, 0x2000);
+    }
+
+    #[test]
+    fn resource_unmap_args_layout_smoke() {
+        let args = ResourceUnmapArgs {
+            resource: 7,
+            addr: 0x7000_0000_0000,
+            len: 0x2000,
+        };
+        assert_eq!(args.resource, 7);
+        assert_eq!(args.addr, 0x7000_0000_0000);
+        assert_eq!(args.len, 0x2000);
+        // 24 bytes: the kernel copies this from user memory in one
+        // validated read, so the field layout is part of the ABI.
+        assert_eq!(core::mem::size_of::<ResourceUnmapArgs>(), 24);
     }
 
     #[test]
