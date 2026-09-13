@@ -55,12 +55,21 @@ impl ProcessRuntime {
         })
     }
 
-    /// CR3 value for scheduling this process.
-    pub fn cr3(&self) -> u64 {
+    /// CR3 value for scheduling this process, or `None` once the runtime's
+    /// address space has been destroyed (see [`ProcessRuntime::drop`]).
+    ///
+    /// Returning `None` rather than `0` matters: a CR3 of `0` is a *valid
+    /// encoding* of a page-table base that points at physical address 0,
+    /// which is not a page table. A caller that silently received `0` and
+    /// published it into a `Context` would load it on the next switch and
+    /// triple-fault with no error path to blame. Forcing the caller to
+    /// handle the `None` arms the failure at the only place that can act on
+    /// it (spawn), matching the `address_space_mut().ok_or(NotInitialized)`
+    /// pattern used throughout this file.
+    pub fn cr3(&self) -> Option<u64> {
         self.address_space
             .as_ref()
             .map(|address_space| address_space.phys_addr().as_u64())
-            .unwrap_or(0)
     }
 
     fn address_space_mut(&mut self) -> Option<&mut AddressSpace> {
@@ -1087,7 +1096,18 @@ pub fn spawn_from_elf(name: &str, elf_bytes: &[u8]) -> Result<SpawnedProcess, Sp
         addr += 4096;
     }
 
-    let cr3 = runtime.cr3();
+    // The stack loop above just ran through `address_space_mut()`, so a
+    // `None` here would mean the address space vanished mid-spawn — treat
+    // it as the same fatal, roll-back-and-fail condition rather than
+    // publishing a context with no valid CR3.
+    let cr3 = match runtime.cr3() {
+        Some(cr3) => cr3,
+        None => {
+            runtime.destroy();
+            huesos_object::unregister_object(process.koid());
+            return Err(SpawnError::Paging(UserPageError::NotInitialized));
+        }
+    };
     *process.address_space.lock() =
         Some(Box::new(runtime) as Box<dyn core::any::Any + Send + Sync>);
 
