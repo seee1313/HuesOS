@@ -341,19 +341,19 @@ fn every_checkpoint_operation_failure_recovers_one_complete_version() {
 }
 
 #[test]
-fn legacy_v5_is_read_only_until_explicit_migration() {
+fn legacy_v6_is_read_only_until_explicit_migration() {
     let Ok(seed) = HxfsWriter::new(INSTANCE, VOLUME) else {
         assert!(false, "seed writer should initialize");
         return;
     };
     let mut image = seed.image().to_vec();
-    // Downgrade the empty fixture's root-store version and feature bit.
-    // It has no versioned extents, so this is a valid minimal v5 image.
+    // Downgrade the empty fixture's root-store version pair. It has no
+    // blobs, so the Hxblob record-layout difference between v6 and v7
+    // does not change any on-disk block and this is a valid minimal v6
+    // image: the v6 feature set is the same bit set v7 requires.
     image[56..60].copy_from_slice(&LEGACY_FORMAT_VERSION.to_le_bytes());
     image[60..64].copy_from_slice(&LEGACY_TYPE_SYSTEM_VERSION.to_le_bytes());
-    let legacy_features =
-        BASE_INCOMPAT_FEATURES & !FEATURE_INCOMPAT_V6_POLICY_TABLES_AND_GENERATION;
-    image[144..152].copy_from_slice(&legacy_features.to_le_bytes());
+    image[144..152].copy_from_slice(&BASE_INCOMPAT_FEATURES.to_le_bytes());
     image[32..36].fill(0);
     let crc = metadata_crc32c(&image[..BLOCK_SIZE]);
     image[32..36].copy_from_slice(&crc.to_le_bytes());
@@ -368,7 +368,7 @@ fn legacy_v5_is_read_only_until_explicit_migration() {
         mounted.create_file_path("/forbidden"),
         Err(HxfsError::LegacyReadOnly)
     );
-    assert!(mounted.migrate_legacy_to_v6(&[], &[]).is_ok());
+    assert!(mounted.migrate_legacy_to_v7(&[], &[]).is_ok());
     assert!(!mounted.is_legacy_read_only());
     assert_eq!(mounted.superblock().format_version, FORMAT_VERSION);
     assert_ne!(mounted.checkpoint().encryption_policy_tree_lba, 0);
@@ -380,16 +380,20 @@ fn legacy_v5_is_read_only_until_explicit_migration() {
 }
 
 #[test]
-fn every_migration_write_and_flush_recovers_complete_v5_or_v6() {
+fn every_migration_write_and_flush_recovers_complete_v6_or_v7() {
     fn legacy_image() -> Vec<u8> {
         let Ok(seed) = HxfsWriter::new(INSTANCE, VOLUME) else {
             return Vec::new();
         };
+        // Downgrade the empty fixture's root-store version pair to the
+        // legacy v6 pair. The fixture has no blobs, so the Hxblob
+        // record-layout difference (92 vs 96 bytes) changes no
+        // on-disk block. A v6 image requires the v6 policy feature
+        // bit, so the v7 base set is stamped as-is.
         let mut image = seed.image().to_vec();
         image[56..60].copy_from_slice(&LEGACY_FORMAT_VERSION.to_le_bytes());
         image[60..64].copy_from_slice(&LEGACY_TYPE_SYSTEM_VERSION.to_le_bytes());
-        let features = BASE_INCOMPAT_FEATURES & !FEATURE_INCOMPAT_V6_POLICY_TABLES_AND_GENERATION;
-        image[144..152].copy_from_slice(&features.to_le_bytes());
+        image[144..152].copy_from_slice(&BASE_INCOMPAT_FEATURES.to_le_bytes());
         image[32..36].fill(0);
         let crc = metadata_crc32c(&image[..BLOCK_SIZE]);
         image[32..36].copy_from_slice(&crc.to_le_bytes());
@@ -403,7 +407,7 @@ fn every_migration_write_and_flush_recovers_complete_v5_or_v6() {
         let store = CrashStore::new(MemStore::from_image_with_blocks(image, 4096));
         let mut fs = FixedHxfsWriter::<CrashStore, 16, 32, 64>::mount(store)?;
         fs.store_mut().arm(fail_at);
-        let result = fs.migrate_legacy_to_v6(&[], &[]);
+        let result = fs.migrate_legacy_to_v7(&[], &[]);
         Ok((result, fs.into_store()))
     }
 
@@ -450,7 +454,7 @@ fn every_migration_write_and_flush_recovers_complete_v5_or_v6() {
         };
         assert!(
             old ^ new,
-            "migration failure {fail_at} exposed mixed v5/v6 state"
+            "migration failure {fail_at} exposed mixed v6/v7 state"
         );
     }
 }
@@ -1688,4 +1692,260 @@ fn fixed_writer_renames_and_unlinks_without_heap() {
         return;
     };
     assert_eq!(fs.open_path("/tmp/b.txt").err(), Some(HxfsError::NotFound));
+}
+
+/// Stage F.2: the refcount lifecycle of a stored Hxblob object.
+///
+/// `put_blob` stores the object at one (the creator's view). Open/close
+/// pairs move it up and down; releasing below zero is a handle
+/// bookkeeping defect and must be rejected with a precise error rather
+/// than clamped, or a buggy client could make an in-use object
+/// GC-eligible.
+#[cfg(feature = "hxblob")]
+#[test]
+fn hxblob_refcount_lifecycle_rejects_double_release() {
+    let Ok(seed) = HxfsWriter::new(INSTANCE, VOLUME) else {
+        assert!(false, "seed writer should initialize");
+        return;
+    };
+    let store = MemStore::from_image(seed.image());
+    let Ok(mut fs) = FixedHxfsWriter::<MemStore, 16, 32, 64>::mount(store) else {
+        assert!(false, "fixed writer should mount");
+        return;
+    };
+    let Ok(hash) = fs.put_blob(b"refcount lifecycle payload") else {
+        assert!(false, "put should succeed");
+        return;
+    };
+    // put stores the object at one (the creator's view).
+    assert_eq!(
+        fs.acquire_blob_ref(&hash),
+        Ok(2),
+        "open must take the second ref"
+    );
+    assert_eq!(
+        fs.release_blob_ref(&hash),
+        Ok(1),
+        "close must drop the open ref"
+    );
+    assert_eq!(
+        fs.release_blob_ref(&hash),
+        Ok(0),
+        "releasing the stored ref must reach zero"
+    );
+    assert_eq!(
+        fs.release_blob_ref(&hash),
+        Err(HxfsError::RefcountZero),
+        "a double release must be rejected, not clamped"
+    );
+    // Opening a released (but not yet collected) blob resurrects it.
+    assert_eq!(
+        fs.acquire_blob_ref(&hash),
+        Ok(1),
+        "open after release must resurrect"
+    );
+    assert_eq!(
+        fs.acquire_blob_ref(&[0u8; 32]),
+        Err(HxfsError::NotFound),
+        "acquiring an unindexed hash must fail"
+    );
+}
+
+/// Stage F.2: refcounts survive a remount, so a blob released before a
+/// reboot stays reclaimable after it, and an unreleased one does not.
+#[cfg(feature = "hxblob")]
+#[test]
+fn hxblob_refcount_persists_across_remount() {
+    let Ok(seed) = HxfsWriter::new(INSTANCE, VOLUME) else {
+        assert!(false, "seed writer should initialize");
+        return;
+    };
+    let store = MemStore::from_image(seed.image());
+    let Ok(mut fs) = FixedHxfsWriter::<MemStore, 16, 32, 64>::mount(store) else {
+        assert!(false, "fixed writer should mount");
+        return;
+    };
+    let released = fs.put_blob(b"released before reboot");
+    let kept = fs.put_blob(b"kept across reboot");
+    let Ok(released) = released else { return };
+    let Ok(kept) = kept else { return };
+    assert_eq!(fs.release_blob_ref(&released), Ok(0));
+    assert!(fs.publish_checkpoint().is_ok());
+    let image: Vec<u8> = fs.into_store().as_slice().to_vec();
+
+    let store = MemStore::from_image(&image);
+    let Ok(mut fs) = FixedHxfsWriter::<MemStore, 16, 32, 64>::mount(store) else {
+        assert!(false, "volume should remount");
+        return;
+    };
+    // The released blob is still at zero after the remount: acquiring
+    // must land exactly on one.
+    assert_eq!(fs.acquire_blob_ref(&released), Ok(1));
+    // The kept blob is still at one: acquiring must land on two.
+    assert_eq!(fs.acquire_blob_ref(&kept), Ok(2));
+    assert_eq!(fs.release_blob_ref(&released), Ok(0));
+    assert_eq!(fs.release_blob_ref(&kept), Ok(1));
+}
+
+/// Stage F.3: a GC pass reclaims exactly the zero-refcount objects and
+/// commits them in one checkpoint that survives a remount.
+#[cfg(feature = "hxblob")]
+#[test]
+fn hxblob_gc_reclaims_zero_refcount_blobs_and_keeps_the_rest() {
+    let Ok(seed) = HxfsWriter::new(INSTANCE, VOLUME) else {
+        assert!(false, "seed writer should initialize");
+        return;
+    };
+    let store = MemStore::from_image(seed.image());
+    let Ok(mut fs) = FixedHxfsWriter::<MemStore, 16, 32, 64>::mount(store) else {
+        assert!(false, "fixed writer should mount");
+        return;
+    };
+    let payload_a = b"gc victim payload";
+    let payload_b = b"gc survivor payload";
+    let Ok(hash_a) = fs.put_blob(payload_a) else {
+        return;
+    };
+    let Ok(hash_b) = fs.put_blob(payload_b) else {
+        return;
+    };
+    assert_eq!(fs.release_blob_ref(&hash_a), Ok(0));
+    // hash_b keeps its stored reference: a GC pass must not touch it.
+
+    let report = fs.gc_blobs();
+    let Ok(report) = report else { return };
+    assert_eq!(
+        report.considered, 2,
+        "the pass must examine the whole index"
+    );
+    assert_eq!(
+        report.reclaimed, 1,
+        "exactly the released blob must be reclaimed"
+    );
+    assert_eq!(report.skipped, 0);
+    assert_eq!(report.freed_bytes, payload_a.len() as u64);
+
+    assert_eq!(
+        fs.get_blob(&hash_a),
+        Err(HxfsError::NotFound),
+        "a reclaimed blob must be gone"
+    );
+    let Ok(bytes_b) = fs.get_blob(&hash_b) else {
+        assert!(false, "the survivor must still be readable");
+        return;
+    };
+    assert_eq!(
+        bytes_b.as_slice(),
+        payload_b as &[u8],
+        "an unreleased blob must survive the pass"
+    );
+    assert_eq!(fs.blob_count(), 1);
+
+    // The pass committed its own checkpoint: the reclaimed state
+    // survives a remount.
+    let image: Vec<u8> = fs.into_store().as_slice().to_vec();
+    let store = MemStore::from_image(&image);
+    let Ok(mut fs) = FixedHxfsWriter::<MemStore, 16, 32, 64>::mount(store) else {
+        assert!(false, "volume should remount after GC");
+        return;
+    };
+    assert_eq!(fs.get_blob(&hash_a).is_err(), true);
+    let Ok(bytes_b) = fs.get_blob(&hash_b) else {
+        assert!(false, "the survivor must survive the remount");
+        return;
+    };
+    assert_eq!(bytes_b.as_slice(), payload_b as &[u8]);
+}
+
+/// Stage F.2 + F.3: after the GC has reclaimed a blob, opening it
+/// fails with the precise not-found error (open after free).
+#[cfg(feature = "hxblob")]
+#[test]
+fn hxblob_open_after_gc_is_not_found() {
+    let Ok(seed) = HxfsWriter::new(INSTANCE, VOLUME) else {
+        assert!(false, "seed writer should initialize");
+        return;
+    };
+    let store = MemStore::from_image(seed.image());
+    let Ok(mut fs) = FixedHxfsWriter::<MemStore, 16, 32, 64>::mount(store) else {
+        assert!(false, "fixed writer should mount");
+        return;
+    };
+    let Ok(hash) = fs.put_blob(b"freed object payload") else {
+        return;
+    };
+    assert_eq!(fs.release_blob_ref(&hash), Ok(0));
+    let Ok(report) = fs.gc_blobs() else { return };
+    assert_eq!(report.reclaimed, 1);
+    assert_eq!(
+        fs.acquire_blob_ref(&hash),
+        Err(HxfsError::NotFound),
+        "open after free must be rejected"
+    );
+}
+
+/// Stage F.3: a crash mid-GC (during the GC's own checkpoint commit)
+/// must recover to the same on-disk state a clean GC pass produces.
+#[cfg(feature = "hxblob")]
+#[test]
+fn hxblob_gc_crash_recovers_to_clean_gc_state() {
+    let Ok(seed) = HxfsWriter::new(INSTANCE, VOLUME) else {
+        assert!(false, "seed writer should initialize");
+        return;
+    };
+    let backing = MemStore::from_image(seed.image());
+    let store = FailFinalSuperblockStore::new(backing);
+    let Ok(mut fs) = FixedHxfsWriter::<FailFinalSuperblockStore, 16, 32, 64>::mount(store) else {
+        assert!(false, "fixed writer should mount");
+        return;
+    };
+    let payload_a = b"gc crash victim";
+    let payload_b = b"gc crash survivor";
+    let Ok(hash_a) = fs.put_blob(payload_a) else {
+        return;
+    };
+    let Ok(hash_b) = fs.put_blob(payload_b) else {
+        return;
+    };
+    assert_eq!(fs.release_blob_ref(&hash_a), Ok(0));
+
+    // The GC's checkpoint commit cuts power before the final clean
+    // root: the image is exactly what a crash mid-GC leaves behind.
+    assert_eq!(
+        fs.gc_blobs(),
+        Err(HxfsError::Io),
+        "the fault store must cut power during the GC commit"
+    );
+    let failed_store = fs.into_store();
+    assert_eq!(failed_store.lba_zero_writes, 2);
+    let mut store = failed_store.inner;
+    let Ok(recovering) = read_superblock(&mut store, 0) else {
+        assert!(false, "the durable recovering root should decode");
+        return;
+    };
+    assert_eq!(recovering.root_state, ROOT_STATE_RECOVERING);
+    assert!(
+        matches!(
+            crate::recovery::replay_journal(&mut store),
+            Ok(crate::recovery::ReplayOutcome::Replayed { .. })
+        ),
+        "the GC journal must replay"
+    );
+
+    let Ok(mut fs) = FixedHxfsWriter::<MemStore, 16, 32, 64>::mount(store) else {
+        assert!(false, "volume should remount after the crash");
+        return;
+    };
+    // Same state a clean GC pass produces: the victim is gone, the
+    // survivor is intact.
+    assert_eq!(
+        fs.get_blob(&hash_a).is_err(),
+        true,
+        "victim must be reclaimed"
+    );
+    let Ok(bytes_b) = fs.get_blob(&hash_b) else {
+        assert!(false, "the survivor must survive the crash");
+        return;
+    };
+    assert_eq!(bytes_b.as_slice(), payload_b as &[u8]);
 }

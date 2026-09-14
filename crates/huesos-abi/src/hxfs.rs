@@ -101,6 +101,11 @@ pub enum HxfsOp {
     /// Storing an identical payload twice is not an error: the hash
     /// is the identity, so the second call returns the same blob.
     CreateBlob = 17,
+    /// Run one Hxblob garbage-collection pass: every zero-refcount
+    /// object is reclaimed and the pass commits its own checkpoint.
+    /// No payload; the response `value` field carries the number of
+    /// reclaimed objects.
+    GcBlobs = 18,
 }
 
 impl HxfsOp {
@@ -125,6 +130,7 @@ impl HxfsOp {
             15 => Some(Self::ListDirectory),
             16 => Some(Self::OpenBlob),
             17 => Some(Self::CreateBlob),
+            18 => Some(Self::GcBlobs),
             _ => None,
         }
     }
@@ -164,6 +170,10 @@ pub enum HxfsStatus {
     /// exists. Collapsing this into either would let silent
     /// corruption of an immutable object look like a routine miss.
     CorruptObject = 11,
+    /// A blob refcount release was requested while the refcount was
+    /// already zero (close without open, or double close). The
+    /// object is left untouched.
+    RefcountZero = 12,
 }
 
 impl HxfsStatus {
@@ -182,6 +192,7 @@ impl HxfsStatus {
             9 => Some(Self::Unsupported),
             10 => Some(Self::EncryptedUnavailable),
             11 => Some(Self::CorruptObject),
+            12 => Some(Self::RefcountZero),
             _ => None,
         }
     }

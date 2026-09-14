@@ -70,7 +70,11 @@ pub fn required_rights(op: HxfsOp, kind: HxfsHandleKind) -> Result<u64, Security
             HxfsHandleKind::File => Ok(rights::WRITE),
             _ => Err(SecurityError::WrongKind),
         },
-        HxfsOp::Fsync | HxfsOp::Checkpoint => Ok(rights::SYNC),
+        // GC commits a checkpoint, so it carries the same SYNC right
+        // as Fsync/Checkpoint: a client that may force a durable
+        // flush may run a maintenance pass, and no stronger
+        // authority is implied.
+        HxfsOp::Fsync | HxfsOp::Checkpoint | HxfsOp::GcBlobs => Ok(rights::SYNC),
         HxfsOp::CreateSnapshot | HxfsOp::DeleteSnapshot => match kind {
             HxfsHandleKind::Volume | HxfsHandleKind::Snapshot => Ok(rights::SNAPSHOT),
             _ => Err(SecurityError::WrongKind),

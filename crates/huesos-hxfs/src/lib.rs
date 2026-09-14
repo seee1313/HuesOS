@@ -126,6 +126,11 @@ pub enum HxfsError {
     /// kernel translates this to the user-facing NoSpace
     /// error at the mount boundary.
     QuotaExceeded,
+    /// Stage F.2: a blob refcount release was requested while the
+    /// refcount was already zero (close without open, or double
+    /// close). The object is left untouched; the caller must fix
+    /// its handle bookkeeping rather than force the count.
+    RefcountZero,
 }
 
 /// Mounted read-only Hxfs instance.

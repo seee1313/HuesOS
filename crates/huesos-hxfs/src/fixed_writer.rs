@@ -164,6 +164,24 @@ impl FreeRange {
     }
 }
 
+/// Stage F.3: outcome of one garbage-collection pass.
+#[cfg(feature = "hxblob")]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct GcReport {
+    /// Index records examined by the pass (the whole index).
+    pub considered: u64,
+    /// Objects fully reclaimed: directory entry removed, extents
+    /// released, index record deleted, all committed in one
+    /// checkpoint.
+    pub reclaimed: u64,
+    /// Candidates that could not be reclaimed (missing directory
+    /// entry, or the unlink failed) and were left intact with their
+    /// index record.
+    pub skipped: u64,
+    /// Sum of the reclaimed records' declared blob sizes.
+    pub freed_bytes: u64,
+}
+
 /// Fixed-capacity mutable Hxfs over a writable block store.
 pub struct FixedHxfsWriter<
     S: BlockStore,
@@ -478,13 +496,14 @@ impl<
         self.legacy_read_only
     }
 
-    /// Explicitly migrate a compatibility-mounted v5 volume to v6.
+    /// Explicitly migrate a compatibility-mounted v6 volume to v7.
     ///
     /// Callers must provide the policy descriptors used to mount the legacy
-    /// volume. The next journaled checkpoint writes authoritative v6 policy
-    /// roots and 64-bit extent generations; ordinary mutation never performs
-    /// this transition implicitly.
-    pub fn migrate_legacy_to_v6(
+    /// volume. The next journaled checkpoint rewrites the Hxblob index in
+    /// the v7 96-byte record layout (every legacy blob records the
+    /// conservative refcount of one) and stamps the v7 version pair;
+    /// ordinary mutation never performs this transition implicitly.
+    pub fn migrate_legacy_to_v7(
         &mut self,
         encryption_policies: &[crate::crypto::EncryptionPolicy],
         compression_policies: &[crate::compression::CompressionPolicy],
@@ -1020,6 +1039,13 @@ impl<
             self.write_file_at(file, offset as u64, &data[offset..offset + n])?;
             offset += n;
         }
+        // Stage F.2: the stored object starts with one reference — the
+        // creator's view. The caller that receives the hash holds that
+        // reference; when its last handle on the blob is closed the
+        // refcount reaches zero and the object becomes reclaimable by
+        // `gc_blobs`. Re-storing identical bytes is `AlreadyExists`
+        // (above) and the caller must `acquire_blob_ref` for the view
+        // it will hand out, so dedup never double-charges.
         self.hxblob_index
             .insert(HxblobIndexRecord {
                 hash,
@@ -1027,10 +1053,144 @@ impl<
                 size: data.len() as u64,
                 merkle_root: hash,
                 merkle_tree_lba: 0,
+                refcount: 1,
                 flags: 0,
             })
             .map_err(|_| HxfsError::NoSpace)?;
+        self.dirty = true;
         Ok(hash)
+    }
+
+    /// Stage F.2: acquire one reference on an existing Hxblob object.
+    ///
+    /// Every live handle (`OpenBlob`, or the dedup view returned for a
+    /// re-stored payload) must hold exactly one refcount; the handle's
+    /// close calls [`release_blob_ref`](Self::release_blob_ref). A
+    /// blob already at zero (explicitly released, not yet collected)
+    /// is resurrected: opening is a new reference, and the GC only
+    /// reclaims objects at zero.
+    ///
+    /// # Errors
+    ///
+    /// - [`HxfsError::NotFound`] if the hash is not indexed.
+    #[cfg(feature = "hxblob")]
+    pub fn acquire_blob_ref(&mut self, hash: &BlobHash) -> FixedResult<u32> {
+        let record = self
+            .hxblob_index
+            .lookup(hash)
+            .map_err(|_| HxfsError::NotFound)?;
+        let next = record.refcount.saturating_add(1);
+        self.hxblob_index
+            .set_refcount(hash, next)
+            .map_err(|_| HxfsError::NotFound)?;
+        self.dirty = true;
+        Ok(next)
+    }
+
+    /// Stage F.2: release one reference on an existing Hxblob object.
+    ///
+    /// The matching call for a handle close. Releasing below zero is a
+    /// handle-bookkeeping defect (close without open, or double close)
+    /// and is rejected with [`HxfsError::RefcountZero`] rather than
+    /// forced: silently clamping would let a buggy client make an
+    /// in-use object GC-eligible.
+    ///
+    /// # Errors
+    ///
+    /// - [`HxfsError::NotFound`] if the hash is not indexed.
+    /// - [`HxfsError::RefcountZero`] if the refcount is already zero.
+    #[cfg(feature = "hxblob")]
+    pub fn release_blob_ref(&mut self, hash: &BlobHash) -> FixedResult<u32> {
+        let record = self
+            .hxblob_index
+            .lookup(hash)
+            .map_err(|_| HxfsError::NotFound)?;
+        if record.refcount == 0 {
+            return Err(HxfsError::RefcountZero);
+        }
+        let next = record.refcount - 1;
+        self.hxblob_index
+            .set_refcount(hash, next)
+            .map_err(|_| HxfsError::NotFound)?;
+        self.dirty = true;
+        Ok(next)
+    }
+
+    /// Stage F.3: one garbage-collection pass over the Hxblob store.
+    ///
+    /// The pass walks the object graph from the Hxblob index: every
+    /// record at refcount zero is a candidate, and a candidate is
+    /// reclaimed only if its backing file is still reachable exactly
+    /// where `put_blob` placed it (the `blobs/b{shard}/<hex>` shard
+    /// directory). Reclaiming goes through the ordinary `unlink_child`
+    /// path — directory entry removed, object deleted, extents
+    /// released, quota returned — so a GC crash can never leave
+    /// dangling extents that the allocator does not know about.
+    ///
+    /// The whole pass is one journaled checkpoint: in-memory
+    /// mutations happen first, then [`publish_checkpoint`] commits
+    /// them atomically. A crash before the commit leaves the volume
+    /// exactly as the pass found it; a crash during the commit is
+    /// replayed by journal recovery to the same state a clean pass
+    /// produces, which is the Stage F.3 exit criterion.
+    ///
+    /// Objects with a non-zero refcount, and candidates whose
+    /// directory entry is missing (the object was already removed by
+    /// some other path), are left untouched and counted in
+    /// [`GcReport::skipped`].
+    ///
+    /// # Errors
+    ///
+    /// - [`HxfsError::LegacyReadOnly`] on a legacy read-only volume.
+    /// - [`HxfsError::Io`]/[`HxfsError::NoSpace`] if the final
+    ///   checkpoint cannot be published.
+    #[cfg(feature = "hxblob")]
+    pub fn gc_blobs(&mut self) -> FixedResult<GcReport> {
+        self.ensure_mutable_v6()?;
+        let mut report = GcReport::default();
+        report.considered = self.hxblob_index.record_count() as u64;
+        let zero_refs: alloc::vec::Vec<BlobHash> = self
+            .hxblob_index
+            .records()
+            .iter()
+            .flatten()
+            .filter(|record| record.refcount == 0)
+            .map(|record| record.hash)
+            .collect();
+        if zero_refs.is_empty() {
+            return Ok(report);
+        }
+        let base = self.blobs_directory()?;
+        for hash in &zero_refs {
+            let record = match self.hxblob_index.lookup(hash) {
+                Ok(record) if record.refcount == 0 => record,
+                _ => continue,
+            };
+            let shard_name = alloc::format!("b{}", hash[0] % 8);
+            let shard = match self.open_child_dir(base, &shard_name) {
+                Ok(shard) => shard,
+                Err(_) => {
+                    report.skipped += 1;
+                    continue;
+                }
+            };
+            let name = hex_encode(hash);
+            match self.unlink_child(shard, &name) {
+                Ok(()) => {
+                    if self.hxblob_index.remove(hash).is_ok() {
+                        report.reclaimed += 1;
+                        report.freed_bytes += record.size;
+                    } else {
+                        report.skipped += 1;
+                    }
+                }
+                Err(_) => report.skipped += 1,
+            }
+        }
+        if report.reclaimed > 0 {
+            self.publish_checkpoint()?;
+        }
+        Ok(report)
     }
 
     /// Stage F: read an Hxblob object back by content hash.
@@ -1174,10 +1334,11 @@ impl<
 
     /// Stage F: serialize the Hxblob index tree into metadata blocks.
     ///
-    /// Wire layout: `count(4)` then `count` records of 92 bytes
-    /// (`hash(32) + object_id(8) + size(8) + merkle_root(32) +
-    /// merkle_tree_lba(8) + flags(4)`). One leaf holds 44 records;
-    /// [`MAX_HXBLOBS`] bounds the complete root-plus-leaves tree.
+    /// Wire layout (v7): `count(4)` then `count` records of
+    /// [`HXBLOB_RECORD_BYTES`] (`hash(32) + object_id(8) + size(8) +
+    /// merkle_root(32) + merkle_tree_lba(8) + refcount(4) + flags(4)`).
+    /// One leaf holds [`HXBLOB_LEAF_RECORDS`] records; [`MAX_HXBLOBS`]
+    /// bounds the complete root-plus-leaves tree.
     #[cfg(feature = "hxblob")]
     fn build_hxblob_index_block(
         &self,
@@ -1200,17 +1361,11 @@ impl<
         payload[0..4].copy_from_slice(&(count as u32).to_le_bytes());
         let mut written = 0usize;
         for record in &records {
-            let offset = 4 + written * 92;
-            if offset + 92 > payload.len() {
+            let offset = 4 + written * HXBLOB_RECORD_BYTES;
+            if offset + HXBLOB_RECORD_BYTES > payload.len() {
                 return Err(HxfsError::NoSpace);
             }
-            payload[offset..offset + 32].copy_from_slice(&record.hash);
-            payload[offset + 32..offset + 40].copy_from_slice(&record.object_id.to_le_bytes());
-            payload[offset + 40..offset + 48].copy_from_slice(&record.size.to_le_bytes());
-            payload[offset + 48..offset + 80].copy_from_slice(&record.merkle_root);
-            payload[offset + 80..offset + 88]
-                .copy_from_slice(&record.merkle_tree_lba.to_le_bytes());
-            payload[offset + 88..offset + 92].copy_from_slice(&record.flags.to_le_bytes());
+            write_hxblob_index_record(&mut payload, offset, record);
             written += 1;
         }
         let args = self.encryption_args();
@@ -1221,7 +1376,7 @@ impl<
                 lba,
                 generation: self.metadata_generation(),
             },
-            &payload[..4 + written * 92],
+            &payload[..4 + written * HXBLOB_RECORD_BYTES],
             args.0,
             args.1,
             args.2,
@@ -1275,18 +1430,13 @@ impl<
             if within == 0 {
                 payload = [0u8; BLOCK_SIZE - HEADER_BYTES];
                 // The leaf records its own record count, like the
-                // single-block index: min(44, remaining records).
+                // single-block index: min(HXBLOB_LEAF_RECORDS,
+                // remaining records).
                 let this_leaf_count = (records.len() - record_index).min(HXBLOB_LEAF_RECORDS);
                 payload[0..4].copy_from_slice(&(this_leaf_count as u32).to_le_bytes());
             }
-            let offset = 4 + within * 92;
-            payload[offset..offset + 32].copy_from_slice(&record.hash);
-            payload[offset + 32..offset + 40].copy_from_slice(&record.object_id.to_le_bytes());
-            payload[offset + 40..offset + 48].copy_from_slice(&record.size.to_le_bytes());
-            payload[offset + 48..offset + 80].copy_from_slice(&record.merkle_root);
-            payload[offset + 80..offset + 88]
-                .copy_from_slice(&record.merkle_tree_lba.to_le_bytes());
-            payload[offset + 88..offset + 92].copy_from_slice(&record.flags.to_le_bytes());
+            let offset = 4 + within * HXBLOB_RECORD_BYTES;
+            write_hxblob_index_record(&mut payload, offset, record);
             record_index += 1;
             if within == HXBLOB_LEAF_RECORDS - 1 || record_index == count {
                 let leaf_count_records = record_index.min(HXBLOB_LEAF_RECORDS);
@@ -1297,7 +1447,7 @@ impl<
                         lba: leaf_lba,
                         generation: self.metadata_generation(),
                     },
-                    &payload[..4 + leaf_count_records * 92],
+                    &payload[..4 + leaf_count_records * HXBLOB_RECORD_BYTES],
                     args.0,
                     args.1,
                     args.2,
@@ -2728,6 +2878,22 @@ impl<
         // (BLOCK_TYPE_HXBLOB_INDEX_TREE_ROOT + leaves). Try the
         // root first; a single-block index fails validation with
         // BadBlock.
+        // Stage F.2: the on-disk record layout depends on the
+        // volume's format version. v7 records carry a refcount
+        // (96 bytes); legacy v6 records do not (92 bytes) and load
+        // with an implicit refcount of one so a GC pass can never
+        // reclaim a blob that was never explicitly released.
+        let legacy = self.superblock.format_version != FORMAT_VERSION;
+        let record_bytes = if legacy {
+            LEGACY_HXBLOB_RECORD_BYTES
+        } else {
+            HXBLOB_RECORD_BYTES
+        };
+        let records_per_leaf = if legacy {
+            LEGACY_HXBLOB_LEAF_RECORDS
+        } else {
+            HXBLOB_LEAF_RECORDS
+        };
         let header = match self.read_mounted_metadata_block(
             lba,
             BLOCK_TYPE_HXBLOB_INDEX_TREE_ROOT,
@@ -2750,8 +2916,8 @@ impl<
                 }
                 let mut index = 0usize;
                 while index < count {
-                    let offset = base + 4 + index * 92;
-                    self.insert_hxblob_record(&single, offset)?;
+                    let offset = base + 4 + index * record_bytes;
+                    self.insert_hxblob_record(&single, offset, legacy)?;
                     index += 1;
                 }
                 return Ok(());
@@ -2777,13 +2943,13 @@ impl<
             )?;
             let leaf_base = leaf_header.header_bytes as usize;
             let count = read_u32(&leaf, leaf_base)? as usize;
-            if count > HXBLOB_LEAF_RECORDS {
+            if count > records_per_leaf {
                 return Err(HxfsError::BadTree);
             }
             let mut index = 0usize;
             while index < count {
-                let offset = leaf_base + 4 + index * 92;
-                self.insert_hxblob_record(&leaf, offset)?;
+                let offset = leaf_base + 4 + index * record_bytes;
+                self.insert_hxblob_record(&leaf, offset, legacy)?;
                 loaded += 1;
                 index += 1;
             }
@@ -2796,9 +2962,17 @@ impl<
     }
 
     /// Insert one Hxblob index record parsed from `block` at
-    /// `offset` (92-byte wire record).
+    /// `offset`. v7 records are 96 bytes and carry a refcount; legacy
+    /// v6 records are 92 bytes and load with refcount one (the
+    /// conservative default: a blob from before Stage F.2 has no
+    /// explicit release and must not be GC-eligible by accident).
     #[cfg(feature = "hxblob")]
-    fn insert_hxblob_record(&mut self, block: &[u8], offset: usize) -> FixedResult<()> {
+    fn insert_hxblob_record(
+        &mut self,
+        block: &[u8],
+        offset: usize,
+        legacy: bool,
+    ) -> FixedResult<()> {
         let mut hash = [0u8; 32];
         hash.copy_from_slice(block.get(offset..offset + 32).ok_or(HxfsError::BadTree)?);
         let object_id = read_u64(block, offset + 32)?;
@@ -2810,7 +2984,14 @@ impl<
                 .ok_or(HxfsError::BadTree)?,
         );
         let merkle_tree_lba = read_u64(block, offset + 80)?;
-        let flags = read_u32(block, offset + 88)?;
+        let (refcount, flags) = if legacy {
+            let flags = read_u32(block, offset + 88)?;
+            (1, flags)
+        } else {
+            let refcount = read_u32(block, offset + 88)?;
+            let flags = read_u32(block, offset + 92)?;
+            (refcount, flags)
+        };
         self.hxblob_index
             .insert(HxblobIndexRecord {
                 hash,
@@ -2818,6 +2999,7 @@ impl<
                 size,
                 merkle_root,
                 merkle_tree_lba,
+                refcount,
                 flags,
             })
             .map_err(|_| HxfsError::BadTree)
@@ -5712,6 +5894,20 @@ fn sha256(data: &[u8]) -> BlobHash {
 
 #[cfg(feature = "hxblob")]
 /// Stage F: lowercase hex encoding (used for blob file names).
+/// Serialize one v7 Hxblob index record at `offset` (see
+/// [`HXBLOB_RECORD_BYTES`]).
+#[cfg(feature = "hxblob")]
+fn write_hxblob_index_record(payload: &mut [u8], offset: usize, record: &HxblobIndexRecord) {
+    payload[offset..offset + 32].copy_from_slice(&record.hash);
+    payload[offset + 32..offset + 40].copy_from_slice(&record.object_id.to_le_bytes());
+    payload[offset + 40..offset + 48].copy_from_slice(&record.size.to_le_bytes());
+    payload[offset + 48..offset + 80].copy_from_slice(&record.merkle_root);
+    payload[offset + 80..offset + 88].copy_from_slice(&record.merkle_tree_lba.to_le_bytes());
+    payload[offset + 88..offset + 92].copy_from_slice(&record.refcount.to_le_bytes());
+    payload[offset + 92..offset + 96].copy_from_slice(&record.flags.to_le_bytes());
+}
+
+#[cfg(feature = "hxblob")]
 fn hex_encode(bytes: &[u8]) -> alloc::string::String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut out = alloc::string::String::with_capacity(bytes.len() * 2);

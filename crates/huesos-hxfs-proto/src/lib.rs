@@ -160,6 +160,7 @@ pub fn status_for_error(error: HxfsError) -> HxfsStatus {
         | HxfsError::BadTree
         | HxfsError::BadName
         | HxfsError::CompressionPolicyInvalid => HxfsStatus::Invalid,
+        HxfsError::RefcountZero => HxfsStatus::RefcountZero,
     }
 }
 
