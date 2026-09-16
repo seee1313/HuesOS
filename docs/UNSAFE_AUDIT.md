@@ -14,22 +14,25 @@ copied into `docs/` in a dedicated review. The versioned baseline remains this
 file plus `safety-budget.json`.
 
 At the current baseline the repository contains 272 first-party Rust files
-and ~108,900 Rust lines. The measured surface (via `tools/audit-safety.py`)
-is **381** unsafe blocks, **76** unsafe functions, **33** unsafe impls, one
-`static mut`, **60** unwrap calls, **85** expect calls, and **13** panic
+and ~109,900 Rust lines. The measured surface (via `tools/audit-safety.py`)
+is **382** unsafe blocks, **76** unsafe functions, **33** unsafe impls, one
+`static mut`, **22** unwrap calls, **62** expect calls, and **15** panic
 macros. `safety-budget.json` stores the *maximums* the CI gate may not
-exceed (currently 382 / 76 / 33 / 1 / 69 / 85 / 13), not an exact snapshot.
+exceed (currently 382 / 76 / 33 / 1 / 22 / 62 / 15), not an exact snapshot.
 Prior baseline values are retained in the changelog sections below so that
 any deviation between historical narrative and the current file is
 auditable.
 
-> Drift note (2026-09, audit-fixes branch): since the last documented
-> changelog section (`unwrap_calls: 25 -> 47` in the EEVDF tree section) the
-> measured unwrap surface grew to 60 without a dedicated-review record, and
-> the budget maximum was raised to 69 in ordinary commits. CONTRIBUTING §1
-> requires a dedicated review for budget changes; the gap between the
-> measured value (60) and the maximum (69) should be closed by a
-> re-baseline review before any further growth is accepted.
+> Drift note (2026-09, audit-fixes branch) — RESOLVED: the measured unwrap
+> surface had grown to 60 while the budget maximum sat at 69 (plus idle
+> per-file slack in three entries). The gap was closed by `8ceeade`
+> (`chore(audit): rebaseline the safety budget to current counts`), a
+> *shrink* of the budget to the audited current values (`unwrap_calls` 69 →
+> 60, `unsafe_blocks` 383 → 382, lapic/hbi/acpi-manager per-file entries
+> tightened). Shrinking the budget needs no dedicated growth review; the
+> commit message carries the justification, and this note records that the
+> re-baseline requirement is satisfied. The next changelog section is the
+> first budget movement on top of the re-baselined numbers.
 
 The baseline moved from `(unsafe_blocks=225, unwrap_calls=25)` to
 `(unsafe_blocks=232, unwrap_calls=30)` on the NVMe `PciMmioTransport`
@@ -313,8 +316,19 @@ validated user-copy layer rejects bad pointers before any of these paths):
   SMP panic path.
 - `huesos-kernel`: `panic!("intentional panic requested by HBI cmdline
   panic_test=1")`. Intentional test hook for the panic screen (a feature).
+- `huesos-kernel::scheduler`: `panic!("fair queue insert failed: {e:?}")`.
+  Contract guard for the per-CPU fair runqueue (see "Scheduler v2:
+  panic-free EEVDF tree"): both error arms are kernel bugs, not resource
+  pressure — `Full` means more than MAX_FAIR_TASKS runnable fair tasks on
+  one CPU, `InvariantBroken` means corrupted EEVDF tree bookkeeping.
+  Consolidates the five former `expect("fair queue capacity")` insert sites
+  into one named fail-stop guard.
+- `huesos-kernel::scheduler`: `panic!("fair queue pop_min failed: {e:?}")`.
+  Same contract for the fair-queue drain loop: a corrupted queue must not
+  be treated as empty, because a silent `None` would strand the remaining
+  fair tasks in the runqueue (silent-stall failure mode).
 
-(5 `expect`, 2 `panic!` in Ring-0 runtime.)
+(5 `expect`, 4 `panic!` in Ring-0 runtime.)
 
 ### Ring-3 runtime -- FIXED
 
@@ -2968,3 +2982,98 @@ All other clippy fixes were zero-surface: auto-deref simplification, typed
 `CbsError` instead of `Result<_, ()>`, `while let` loops, `is_empty`
 complements, `Default` impls, and a loop-index refactor. `make clippy` is
 green end-to-end including the standalone userspace crates.
+
+## Scheduler v2: panic-free EEVDF tree (budget delta: −38 unwrap / −23 expect / +2 panic)
+
+### What changed
+
+`crates/huesos-sched/src/eevdf.rs` no longer panics. This closes the follow-up
+recorded under "Scheduler v2: fixed-capacity EEVDF runqueue tree" ("A future
+implementation should migrate the hot `unwrap`s to `?`-threaded internal
+helpers"): every internal operation now threads `Result<(), EevdfTreeError>`,
+and the 18 in-place `expect`s (live-node invariant, rotation children,
+grandchild presence) are gone. The crate's test modules (`eevdf`, `job`, `hw`,
+`clock`) no longer call `.unwrap()` either.
+
+The public error type gains a third variant, `InvariantBroken`: a linked index
+(root, child pointer, or caller-owned slot) that does not hold a live node. It
+is the tree's *corruption report*, not a resource error, and it is unreachable
+from a well-formed caller.
+
+The one signature that had to widen is `pop_min`: `Option<EevdfKey>` →
+`Result<Option<EevdfKey>, EevdfTreeError>`. The reason is the consumer, not the
+tree: the per-CPU fair-queue drain loop in `huesos-kernel::scheduler` must not
+be able to treat a corrupted queue as empty, because a silent `None` there
+would strand every remaining fair task in the runqueue — the silent-stall
+failure mode this project actively hunts. A partial *read* cannot strand a
+task, so the read-only walks (`peek_min`, `min_start`, `find_key`,
+`pick_eligible`, `collect_sorted`, `contains`) keep degrading gracefully on a
+missing slot instead of reporting.
+
+The single consumer consolidates its five duplicated
+`.expect("fair queue capacity")` insert sites into one `fair_queue_insert`
+fail-stop guard and matches the `pop_min` `Err` arm into the same fail-stop.
+
+The `huesos-sched` test modules now use match-based `expect_ok!` /
+`expect_some!` helpers (the same pattern as `crates/huesos-nvme/src/buffer_pool.rs`)
+that report with `assert!(false, ...)` and `return` — the budget-allowed
+diagnostic per CONTRIBUTING §1 — instead of `.unwrap()` / `.expect()`.
+
+### Why the panic budget grows by two
+
+The two new `panic!` macros are the dedicated named invariant guards the
+project's fail-stop policy requires. They replace, not supplement, existing
+panicking surface (the five `expect("fair queue capacity")` sites disappear),
+so the net panic surface of the *scheduler* falls from 7 to 4 while the
+*tree* falls from 18 `expect`s to zero:
+
+1. `panic!("fair queue insert failed: {e:?}")` in `fair_queue_insert` — both
+   error arms (`Full`, `InvariantBroken`) are genuine kernel bugs, not resource
+   pressure. Failing loudly is the same decision as the pre-existing
+   `expect("fair queue capacity")` sites; the +1 here is the cost of giving one
+   named guard a message that distinguishes the two arms instead of mislabelling
+   a corruption as "capacity".
+2. `panic!("fair queue pop_min failed: {e:?}")` in the fair-queue drain loop —
+   a corrupted queue must not be treated as empty (see above).
+
+Both are Ring-0 invariants with stable, greppable messages and are listed in
+the "Ring-0 runtime invariants" section of the panicking-surface audit above.
+
+### Mutation check
+
+- The randomized 3000-operation invariant test (vs a `BTreeSet` oracle:
+  ordering, `peek_min`, length, sorted drain) still passes, and now exercises
+  the widened `pop_min` result type end-to-end (`Ok(Some(..))` per key,
+  `Ok(None)` on exhaustion).
+- The `NotFound` (duplicate) and `Full` arms are covered by the existing
+  `remove_is_exact_and_missing_is_rejected` / `capacity_is_hard` tests, which
+  assert the `Result` arms directly.
+- No behavioral change for any well-formed caller: on a healthy tree
+  `node_ref` / `node_mut_ref` always succeed, so the threaded `?`s never fire
+  and the observable insert/remove/selection sequence is byte-for-byte the
+  same as before the refactor.
+
+### Safety-budget delta (measured)
+
+```
+unwrap_calls:    60 -> 22  (−38: eevdf 16, job 11, hw 7, clock 4 — all test code)
+expect_calls:    85 -> 62  (−23: eevdf 18 production, scheduler 5 insert sites)
+panic_macros:    13 -> 15  (+2: the two named invariant guards above)
+unsafe_blocks:   382 (unchanged); unsafe_functions / unsafe_impls / static_mut
+                 unchanged
+```
+
+`safety-budget.json` was re-baselined to the audited current values in the same
+commit (the `8ceeade` convention).
+
+### Verification
+
+- `cargo test -p huesos-sched` (pinned toolchain, host target): 48/48 pass,
+  including the randomized invariant test.
+- `make test`: full host suite, 933 pass / 0 fail.
+- `make audit-check`: all gates green at 382 / 76 / 33 / 1 / 22 / 62 / 15.
+- `CARGO_BUILD_JOBS=1 make clippy`: clean across the workspace and every
+  standalone userspace crate.
+- `make build` (x86_64-huesos target, kernel + embedded userspace ELFs): clean.
+- QEMU smoke: `bash scripts/ci-qemu-smoke.sh debug 2 120` — see the commit's
+  verification note for the observed serial markers.

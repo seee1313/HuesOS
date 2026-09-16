@@ -1,8 +1,11 @@
 [2J[01;01H[=3h[2J[01;01H[2J[01;01H[=3h[2J[01;01H[2J[01;01H[=3h[2J[01;01HBdsDxe: loading Boot0001 "UEFI QEMU DVD-ROM QM00005 " from PciRoot(0x0)/Pci(0x1F,0x2)/Sata(0x2,0xFFFF,0x0)
 BdsDxe: starting Boot0001 "UEFI QEMU DVD-ROM QM00005 " from PciRoot(0x0)/Pci(0x1F,0x2)/Sata(0x2,0xFFFF,0x0)
 [2J[01;01H[01;01H[2J[01;01H[01;01H[HuesOS] Bootloader handed over control
-[PMM] Reserved HBI image: phys_addr=0x16125000, length=48972256
+[security] BSP degraded: SMEP/SMAP unavailable on this CPU
+[PMM] Reserved HBI image: phys_addr=0x15537000, length=53835976
 [storage] reserved boot DMA pool: phys=0x3800000, len=0x4000000
+[HBI] Ed25519 signature verified (v2.2)
+[measure] signed kernel/HBI/cmdline digest ready for PCR 12
 [uACPI] starting uACPI, version 6.0.0
 [uACPI] RSDP 0x000000001F77E014 00000024 v02 (BOCHS )
 [uACPI] XSDT 0x000000001F77D0E8 00000054 v01 (BOCHS  BXPC    )
@@ -14,30 +17,36 @@ BdsDxe: starting Boot0001 "UEFI QEMU DVD-ROM QM00005 " from PciRoot(0x0)/Pci(0x1
 [uACPI] WAET 0x000000001F775000 00000028 v01 (BOCHS  BXPC    )
 [uACPI] BGRT 0x000000001F774000 00000038 v01 (INTEL  EDK2    )
 [uACPI] validated ACPI table graph and MADT
-[uACPI] built immutable Ring-3 table archive
+[uACPI] built immutable Ring-3 table archive v2
 [uACPI] derived bounded FADT SystemIO policy
-[tpm] TPM present, no sealed volume key in this image
+[tpm] no TPM 2.0 CRB interface present
 [SMP] MADT parsed 2 CPUs found
 [IOAPIC] routed keyboard IRQ1
-[SMP] LAPIC timer count=624387
+[SMP] LAPIC timer count=623778
 [SMP] Booting AP 1
+[security] AP 1 degraded: SMEP/SMAP unavailable
 [SMP] AP 1 online (waiting for release)
 [SMP] AP 1 ready
 [SMP] bringup done, APs ready=1
-HBI v2.1 parsed. Entries: 0x4
+HBI v2.2 parsed. Entries: 0x4
 [storage] boot info: dma=0x3800000+0x4000000, nvme_count=0
 [extable] installed 2 recoverable-copy entries
 [SMP] APs released to run
-HuesOS v0.1.0 on CPU 0
-PMM: 61520/268435456 frames (240 MiB)
+[SMP] AP HuesOS v10.1.0 scheduling
+ on CPU 0
+PMM: 58464/268435456 frames (228 MiB)
 FB: 1280x800@32
-[SMP] AP 1 scheduling
 [init] installed immutable ACPI table archive VMO
 [init] installed deny-by-default ACPI broker capability
+[init] installed kernel command line VMO
 [init] installed storage boot-info VMO
 [init] installed FrameDraw capability (handle 6)
-[kernel] entering userspace: rip=0x4011c0 rsp=0x7ffffefffff8 cs=0x23 ss=0x1b
+[kernel] entering userspace: rip=0x400b00 rsp=0x7ffffefffff8 cs=0x23 ss=0x1b
 [init] hello from ring3 userspace, via libcanvas
+[init] config: /etc/init.conf (1716 bytes)
+[init] config: kernel cmdline applied
+[init] splash: 1280x800, 5 stages
+[init] stage selftest start: Checking kernel interfaces
 [init] user pointer guard smoke OK
 [init] VMO read/write round-trip OK
 [init] channel IPC round-trip OK
@@ -56,50 +65,68 @@ FB: 1280x800@32
 [init] waitset self-test OK
 [kernel] entering userspace: rip=0x400030 rsp=0x7ffffefffff8 cs=0x23 ss=0x1b
 [fault-probe] triggering page
-[user-fault] process=fault-probe koid=36 task=4294967298 cpu=0 reason=PAGE FAULT rip=0x400001 address=0x10000 error=0x4 action=terminate-process code=-4097
+[user-fault] process=fault-probe koid=37 task=24579 cpu=0 reason=PAGE FAULT rip=0x400001 address=0x10000 error=0x4 action=terminate-process code=-4097
 [kernel] entering userspace: rip=0x400030 rsp=0x7ffffefffff8 cs=0x23 ss=0x1b
 [fault-probe] triggering opcode
-[user-fault] process=fault-probe koid=44 task=8589934594 cpu=0 reason=INVALID OPCODE rip=0x40017a address=0x0 error=0x0 action=terminate-process code=-4099
+[user-fault] process=fault-probe koid=45 task=32771 cpu=0 reason=INVALID OPCODE rip=0x40017a address=0x0 error=0x0 action=terminate-process code=-4099
 [kernel] entering userspace: rip=0x400030 rsp=0x7ffffefffff8 cs=0x23 ss=0x1b
 [fault-probe] triggering gpf
-[user-fault] process=fault-probe koid=52 task=12884901890 cpu=0 reason=GENERAL PROTECTION FAULT rip=0x400129 address=0x0 error=0x0 action=terminate-process code=-4098
+[user-fault] process=fault-probe koid=53 task=40963 cpu=0 reason=GENERAL PROTECTION FAULT rip=0x400129 address=0x0 error=0x0 action=terminate-process code=-4098
 [kernel] entering userspace: rip=0x400030 rsp=0x7ffffefffff8 cs=0x23 ss=0x1b
 [fault-probe] triggering divide
-[user-fault] process=fault-probe koid=60 task=17179869186 cpu=0 reason=DIVIDE ERROR rip=0x4002fa address=0x0 error=0x0 action=terminate-process code=-4100
+[user-fault] process=fault-probe koid=61 task=49155 cpu=0 reason=DIVIDE ERROR rip=0x4002fa address=0x0 error=0x0 action=terminate-process code=-4100
 [init] user fault isolation OK (#PF/#UD/#GP/#DE contained)
 [kernel] entering userspace: rip=0x400030 rsp=0x7ffffefffff8 cs=0x23 ss=0x1b
 [fault-probe] triggering shutdown
 [init] shutdown authorization OK (unprivileged caller denied)
+[init] stage selftest ok
+[kernel] entering userspace: rip=0x400260 rsp=0x7ffffefffff8 cs=0x23 ss=0x1b
+[key-broker] started
+[key-broker] ambient/wrong-type key take denied
+[key-broker] kernel key moved; state=plain-only
+[init] key-broker ready
+[init] stage driver-manager start: Starting driver manager
 [init] launched driver-manager
-[kernel] entering userspace: rip=0x40b590 rsp=0x7ffffefffff8 cs=0x23 ss=0x1b
+[init] delegated unique KeyBroker authority to DriverManager
+[kernel] entering userspace: rip=0x40d230 rsp=0x7ffffefffff8 cs=0x23 ss=0x1b
 [driver-manager] started in userspace
+[driver-manager] received unique KeyBroker generation authority
 [driver-manager] package probe: waiting for a client channel
-[init] driver-manager says driver-manager:degraded
+[init] stage driver-manager degraded
+[init] stage storage start: Probing storage controller
 [init] passed HBI BOOTFS VMO to DriverManager
-[driver-manager] received BOOTFS VMO from init
-[driver-manager] BOOTFS mounted
-[driver-manager] boot driver manifest: nvme elf=/drivers/driver-host-nvme.elf manifest=/manifests/nvme.hdriver
 [init] passed ACPI table archive to DriverManager
-[driver-manager] received immutable ACPI table archive
 [init] transferred ACPI broker capability
-[driver-manager] received unique ACPI broker capability
-[driver-manager] launched isolated Ring-3 ACPI manager
-[kernel] entering userspace: rip=0x400140 rsp=0x7ffffefffff8 cs=0x23 ss=0x1b
-[acpi-manager] isolated Ring-3 service started
-[acpi-manager] validated 7 ACPI tables, 7 physical ranges indexed
-[acpi-manager] broker deny-by-default self-test OK
-[driver-manager] ACPI manager archive validation ready
+[driver-manager] received BOOTFS VMO from init
 [init] passed storage boot-info VMO to DriverManager
-[driver-manager] received storage boot-info VMO
-[driver-manager] storage boot-info: dma=0x3800000+0x4000000 nvme_count=0
 [init] manifest input-host: minting 2 resource grant(s)
 [init] manifest input-host: transferred 2/2 resource handle(s) to DriverManager
-[init] manifest input-host: signalled grants-complete to DriverManager[driver-manager] grants-complete for input-host
+[init] manifest input-host: signalled grants-complete to DriverManager
+[init] NVMe boot grants skipped: no NVMe PCI function
+[init] stage storage skipped
+[init] stage shutdown-broker start: Arming power control
+[driver-manager] BOOTFS hash manifest verified and mounted
+[driver-manager] boot driver manifest: nvme elf=/drivers/driver-host-nvme.elf manifest=/manifests/nvme.hdriver
+[driver-manager] launched restartable PCI manager generation 1
+[driver-manager] received immutable ACPI table archive
+[driver-manager] received unique ACPI broker capability
+[driver-manager] launched restartable ACPI manager generation 1
+[driver-manager] received storage boot-info VMO
+[driver-manager] storage boot-info: dma=0x3800000+0x4000000 nvme_count=0
+[driver-manager] grants-complete for input-host
 [driver-manager] manifest: host=input-host services=1 irqs=1 io_ports=1
 [driver-manager] capability: service=keyboard required=1
 [driver-manager] capability: irq=1
 [driver-manager] capability: io=0x60+1
 [driver-manager] manifest loaded: host=input-host elf=/drivers/input-host.elf
+[kernel] entering userspace: rip=0x400020 rsp=0x7ffffefffff8 cs=0x23 ss=0x1b
+[pci-manager] userspace service started (configuration disabled)
+[pci-manager] ready without root descriptors; fail-closed
+[kernel] entering userspace: rip=0x400820 rsp=0x7ffffefffff8 cs=0x23 ss=0x1b
+[acpi-manager] isolated Ring-3 service started
+[acpi-manager] validated ACPI archive v2: 8 tables, 9 physical mappings, snapshot 1
+[acpi-manager] broker deny-by-default self-test OK
+[acpi-manager] generation 1 archive/broker capabilities ready
 [driver-manager] launched DriverHost input-host
 [driver-manager] forwarded 2/2 resource handle(s) to input-host
 [kernel] entering userspace: rip=0x400780 rsp=0x7ffffefffff8 cs=0x23 ss=0x1b
@@ -108,26 +135,38 @@ FB: 1280x800@32
 [driver-host:input] received manifest resource #2: resource:input-host:irq:0x1:0x1:excl
 [driver-host:input] retained 2 manifest resource handle(s)
 [driver-host:input] keyboard IRQ bound to Port
-
+[init] shutdown-broker: spawned
+[init] shutdown-broker: marked critical
+[kernel] entering userspace: rip=0x4002c0 rsp=0x7ffffefffff8 cs=0x23 ss=0x1b
+[shutdown-broker] started
+[shutdown-broker] ready; awaiting shutdown command
 [driver-manager] input DriverHost starting
 [driver-manager] registered service keyboard from input-host
 [driver-manager] input DriverHost ready
-[init] NVMe boot grants skipped: no NVMe PCI function
-[kernel] entering userspace: rip=0x4002c0 rsp=0x7ffffefffff8 cs=0x23 ss=0x1b
-[shutdown-broker] started
-[init] shutdown-broker: spawned
-[init] shutdown-broker: marked critical
-[shutdown-broker] ready; awaiting shutdown command
+[driver-manager] ACPI manager ready generation 1 tables 8
+[driver-manager] PCI manager ready (no roots; fail-closed)
 [init] shutdown-broker: ready
+[init] stage shutdown-broker ok
 [init] passed registry channel to DriverManager
+[init] stage terminal start: Starting terminal
 [driver-manager] received service registry channel from init
-[init] framebuffer log handoff: starting terminal service
 [init] launched terminal
 [kernel] entering userspace: rip=0x408fc0 rsp=0x7ffffefffff8 cs=0x23 ss=0x1b
 [terminal] started in userspace
-[init] terminal says terminal:ready
+[init] stage terminal ok
+[init] stage summary ok selftest
+[init] stage summary ~~ driver-manager
+[init] stage summary -- storage
+[init] stage summary ok shutdown-broker
+[init] stage summary ok terminal
+[init] boot stages complete: degraded
+[init] framebuffer handoff: terminal owns the display
 [init] passed DriverManager registry to terminal
+[init] FrameDraw capability transferred to terminal
+[observe] 0100000000000000000000000000000001000000010000000200000000000000
+[init] observation records dumped: 1
 [init] service launch complete; parking as init supervisor
+[terminal] FrameDraw capability received
 [driver-manager] opened keyboard service channel for client
 [driver-host:input] attached keyboard client
 [driver-manager] opened filesystem service channel for client
