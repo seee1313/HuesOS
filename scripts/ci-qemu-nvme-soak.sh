@@ -540,7 +540,7 @@ fi
 for marker in "${required[@]}"; do
     if ! grep -Fq "$marker" "$log"; then
         echo "[soak] missing marker: $marker" >&2
-        echo "[soak] last 200 serial lines:" >&2
+        echo "[soak] full serial log (head 2000 lines):" >&2
         wc -l "$log" >&2; head -2000 "$log" >&2 || true
         exit 1
     fi

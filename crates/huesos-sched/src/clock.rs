@@ -132,6 +132,26 @@ impl TscClock {
 mod tests {
     use super::*;
 
+    // Helper: unpack a Result in a test without calling unwrap. CONTRIBUTING
+    // rule 1 forbids the unwrap / expect / panic macros including in tests;
+    // an assert!(false, ...) is the budget-allowed diagnostic, and `return`
+    // after it keeps the types sound for the remainder of the test body.
+    macro_rules! expect_ok {
+        ($expr:expr, $msg:literal) => {
+            match $expr {
+                Ok(value) => value,
+                Err(err) => {
+                    assert!(
+                        false,
+                        concat!("expected Ok: ", $msg, " (got {err:?})"),
+                        err = err
+                    );
+                    return;
+                }
+            }
+        };
+    }
+
     #[test]
     fn rejects_implausible_frequencies() {
         assert_eq!(
@@ -147,7 +167,10 @@ mod tests {
     #[test]
     fn conversion_matches_integer_math_at_round_trip_points() {
         // 2.4 GHz: 2_400_000_000 cycles == 1_000_000_000 ns.
-        let clock = TscClock::from_frequency(2_400_000_000).unwrap();
+        let clock = expect_ok!(
+            TscClock::from_frequency(2_400_000_000),
+            "TscClock::from_frequency"
+        );
         assert_eq!(clock.cycles_to_ns(2_400_000_000), 1_000_000_000);
         assert_eq!(clock.ns_to_cycles(1_000_000_000), 2_400_000_000);
     }
@@ -161,7 +184,7 @@ mod tests {
             3_600_000_000,
             5_000_000_000,
         ] {
-            let clock = TscClock::from_frequency(hz).unwrap();
+            let clock = expect_ok!(TscClock::from_frequency(hz), "TscClock::from_frequency");
             // Sample ~1 second of cycles at 4096 points.
             let err = clock.max_round_trip_error_ns(4096);
             assert!(err <= 1, "freq {hz}: round-trip error {err} ns > 1");
@@ -170,7 +193,10 @@ mod tests {
 
     #[test]
     fn ns_to_cycles_rounds_up_never_early() {
-        let clock = TscClock::from_frequency(3_000_000_000).unwrap();
+        let clock = expect_ok!(
+            TscClock::from_frequency(3_000_000_000),
+            "TscClock::from_frequency"
+        );
         // 1 ns at 3 GHz is exactly 3 cycles; ensure no truncation below.
         assert!(clock.ns_to_cycles(1) >= 3);
         assert!(clock.ns_to_cycles(0) == 0);
@@ -178,7 +204,10 @@ mod tests {
 
     #[test]
     fn large_delta_saturates_safely() {
-        let clock = TscClock::from_frequency(2_400_000_000).unwrap();
+        let clock = expect_ok!(
+            TscClock::from_frequency(2_400_000_000),
+            "TscClock::from_frequency"
+        );
         let ns = clock.cycles_to_ns(u64::MAX);
         assert!(ns > 0);
         assert!(clock.ns_to_cycles(ns) <= u64::MAX);

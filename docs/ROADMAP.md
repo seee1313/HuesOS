@@ -21,6 +21,29 @@ gates close.
 
 ## Done (recent)
 
+### Panic-free EEVDF tree: `?`-threaded internals, `huesos-sched` tests unwrap-free
+- `crates/huesos-sched/src/eevdf.rs` no longer panics: every internal
+  operation threads `Result<(), EevdfTreeError>` (new `InvariantBroken`
+  variant), closing the "migrate the hot unwraps to `?`-threaded internal
+  helpers" follow-up recorded under the Scheduler v2 tree landing.
+- `pop_min` now returns `Result<Option<EevdfKey>, _>` so a corrupted
+  runqueue can never be silently treated as empty (silent task stranding —
+  the failure mode this project hunts); read-only walks keep degrading
+  gracefully on a missing slot.
+- The scheduler's five duplicate `expect("fair queue capacity")` insert sites
+  collapse into one `fair_queue_insert` fail-stop guard, and the fair-queue
+  drain loop fails stop on the `pop_min` error arm.
+- `huesos-sched` test modules (`eevdf`, `job`, `hw`, `clock`) use the
+  match-based `expect_ok!` / `expect_some!` helpers (the NVMe `buffer_pool`
+  pattern); zero `.unwrap()` / `.expect()` remain in the crate.
+- Safety-budget delta: `unwrap_calls` 60 → 22 (−38), `expect_calls` 85 → 62
+  (−23), `panic_macros` 13 → 15 (+2 named invariant guards, reviewed in
+  `docs/UNSAFE_AUDIT.md`).
+- Verified: `cargo test -p huesos-sched` 48/48 (incl. the 3000-op randomized
+  invariant test), `make test` 933 pass / 0 fail, `make audit-check`,
+  `CARGO_BUILD_JOBS=1 make clippy`, `make build`, and the QEMU boot smoke
+  (`ci-qemu-smoke.sh debug 2 120`).
+
 ### Type-enforced `IrqSafeMutex` for all of `huesos-object`, replacing the ad-hoc `IrqGuard` fix
 - Field verification of the previous "IRQ-safe guards" fix (see below) found
   the keyboard self-deadlock still occurred, just less often — the manually

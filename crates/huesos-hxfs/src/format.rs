@@ -6,16 +6,22 @@ pub const FORMAT_GUID: [u8; 16] = [
     0x48, 0x78, 0x66, 0x73, 0x2d, 0x48, 0x75, 0x65, 0x73, 0x4f, 0x53, 0x2d, 0x76, 0x31, 0x00, 0x01,
 ];
 
-/// HxFS v6 linear format version. v6 activates versioned policy-tree roots
-/// and stores the full 64-bit extent generation used by AEAD nonces.
-pub const FORMAT_VERSION: u32 = 6;
-/// HxFS v6 metadata type-system version.
-pub const TYPE_SYSTEM_VERSION: u32 = 6;
-/// Last read-compatible format. v5 volumes are accepted read-only and require
-/// an explicit host-tool migration before mutation.
-pub const LEGACY_FORMAT_VERSION: u32 = 5;
+/// HxFS v7 linear format version. v7 widens the Hxblob index record with
+/// a persistent refcount (92 -> 96 bytes, 44 -> 42 records per leaf) so
+/// the Stage F.2/F.3 refcount + garbage-collection machinery can run.
+/// v6 volumes carry no refcount; they mount read-only and every Hxblob
+/// record loads with an implicit refcount of one, so a GC pass can
+/// never reclaim a blob that was never explicitly released.
+pub const FORMAT_VERSION: u32 = 7;
+/// HxFS v7 metadata type-system version.
+pub const TYPE_SYSTEM_VERSION: u32 = 7;
+/// Last read-compatible format. v6 volumes are accepted read-only and
+/// require an explicit host-tool migration (`hxfs-migrate`) before
+/// mutation. Their Hxblob index records are the 92-byte v6 layout
+/// without a refcount field.
+pub const LEGACY_FORMAT_VERSION: u32 = 6;
 /// Type-system version paired with [`LEGACY_FORMAT_VERSION`].
-pub const LEGACY_TYPE_SYSTEM_VERSION: u32 = 5;
+pub const LEGACY_TYPE_SYSTEM_VERSION: u32 = 6;
 /// Hxfs v5 block size.
 pub const BLOCK_SIZE: usize = 4096;
 /// Hxfs v5 block size as u64.
@@ -184,8 +190,16 @@ pub const BLOCK_TYPE_HXBLOB_INDEX_TREE_LEAF: u32 = 29;
 pub const HXBLOB_TREE_ROOT_MAGIC: u32 = 0x4842_4c42; // "HBLB"
 /// Version of the Hxblob index tree root payload.
 pub const HXBLOB_TREE_ROOT_VERSION: u32 = 1;
-/// Number of 92-byte index records a leaf holds (`(4056 - 4) / 92`).
-pub const HXBLOB_LEAF_RECORDS: usize = 44;
+/// Number of 96-byte v7 index records a leaf holds (`(4056 - 4) / 96`).
+pub const HXBLOB_LEAF_RECORDS: usize = 42;
+/// Number of 92-byte v6 index records a legacy leaf held.
+pub const LEGACY_HXBLOB_LEAF_RECORDS: usize = 44;
+/// Wire size of one v7 Hxblob index record:
+/// `hash(32) + object_id(8) + size(8) + merkle_root(32) +
+/// merkle_tree_lba(8) + refcount(4) + flags(4)`.
+pub const HXBLOB_RECORD_BYTES: usize = 96;
+/// Wire size of one legacy v6 Hxblob index record (no refcount).
+pub const LEGACY_HXBLOB_RECORD_BYTES: usize = 92;
 /// Maximum Hxblob objects per volume (one root + leaves).
 pub const HXBLOB_TREE_MAX_RECORDS: usize = HXBLOB_LEAF_RECORDS * HXBLOB_LEAF_RECORDS;
 
@@ -203,12 +217,13 @@ pub const FEATURE_INCOMPAT_V4_POLICY_AND_BLOB_TREES: u64 = 1 << 4;
 pub const FEATURE_INCOMPAT_HXBLOB_INDEX: u64 = 1 << 5;
 /// Incompatible feature: v5 virtual-volume/GPT topology roots are present.
 pub const FEATURE_INCOMPAT_V5_VOLUME_TOPOLOGY: u64 = 1 << 6;
-/// Incompatible features required by a legacy v5 image.
+/// Incompatible features required by a legacy v6 image.
 pub const LEGACY_BASE_INCOMPAT_FEATURES: u64 = FEATURE_INCOMPAT_V2_ROOT_STORE
     | FEATURE_INCOMPAT_MUTABLE_JOURNAL
     | FEATURE_INCOMPAT_V3_STORAGE_TREES
     | FEATURE_INCOMPAT_V4_POLICY_AND_BLOB_TREES
-    | FEATURE_INCOMPAT_V5_VOLUME_TOPOLOGY;
+    | FEATURE_INCOMPAT_V5_VOLUME_TOPOLOGY
+    | FEATURE_INCOMPAT_V6_POLICY_TABLES_AND_GENERATION;
 /// Incompatible feature: policy roots are authoritative and extent records
 /// carry a full 64-bit generation.
 pub const FEATURE_INCOMPAT_V6_POLICY_TABLES_AND_GENERATION: u64 = 1 << 8;

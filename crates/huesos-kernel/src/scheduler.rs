@@ -425,9 +425,7 @@ impl Scheduler {
         }
         if index > 0 {
             if let SchedPolicy::Fair { vruntime, .. } = policy {
-                self.fair_queue
-                    .insert(fair_key_of(vruntime, id), u128::from(vruntime))
-                    .expect("fair queue capacity");
+                fair_queue_insert(&mut self.fair_queue, vruntime, id);
             }
         }
         Some(id)
@@ -513,9 +511,7 @@ impl Scheduler {
                     let delta = (1024 * 1000) / (*weight).max(1);
                     *vruntime += delta;
                     if !finished && !blocked {
-                        self.fair_queue
-                            .insert(fair_key_of(*vruntime, task_id), u128::from(*vruntime))
-                            .expect("fair queue capacity");
+                        fair_queue_insert(&mut self.fair_queue, *vruntime, task_id);
                     }
                 }
                 SchedPolicy::Deadline {
@@ -552,7 +548,16 @@ impl Scheduler {
         // If no Deadline task is ready, schedule from Fair queue.
         // Skip tasks that finished or are blocked (parked on a wait queue).
         if next_idx == 0 {
-            while let Some(key) = self.fair_queue.pop_min() {
+            loop {
+                let key = match self.fair_queue.pop_min() {
+                    Ok(Some(key)) => key,
+                    Ok(None) => break,
+                    // Bookkeeping corruption: fail stop. Treating a corrupted
+                    // queue as empty would silently strand the remaining fair
+                    // tasks (the silent-stall failure mode this project
+                    // hunts).
+                    Err(e) => panic!("fair queue pop_min failed: {e:?}"),
+                };
                 let task_id = key.task_id;
                 let Some(location) = task_location(task_id) else {
                     continue;
@@ -605,6 +610,20 @@ fn fair_key_of(vruntime: u64, task_id: u64) -> EevdfKey {
     EevdfKey {
         virtual_start: u128::from(vruntime),
         task_id,
+    }
+}
+
+/// Insert a fair task into the per-CPU queue, failing stop on any error.
+///
+/// Both error arms are genuine kernel bugs, not resource pressure: `Full`
+/// means more than MAX_FAIR_TASKS runnable fair tasks are present on one CPU,
+/// and `InvariantBroken` means the tree's internal bookkeeping is corrupted.
+/// Failing loudly here keeps a corrupted runqueue from being silently
+/// treated as empty, which would strand the remaining fair tasks.
+fn fair_queue_insert(queue: &mut EevdfTree<MAX_FAIR_TASKS>, vruntime: u64, task_id: u64) {
+    match queue.insert(fair_key_of(vruntime, task_id), u128::from(vruntime)) {
+        Ok(()) => {}
+        Err(e) => panic!("fair queue insert failed: {e:?}"),
     }
 }
 
@@ -899,10 +918,7 @@ unsafe fn apply_local_wake(guard: &mut Scheduler, now: u64, task_id: u64, idx: u
     };
     if let Some((vr, id)) = fair_reinsert {
         let _ = guard.fair_queue.remove(fair_key_of(vr, id));
-        guard
-            .fair_queue
-            .insert(fair_key_of(vr, id), u128::from(vr))
-            .expect("fair queue capacity");
+        fair_queue_insert(&mut guard.fair_queue, vr, id);
     }
 }
 
@@ -944,10 +960,7 @@ fn process_inbox_task(cpu: usize, slot: usize) {
         if let SchedPolicy::Fair { vruntime, .. } = guard.tasks[idx].sched_policy {
             let key = fair_key_of(vruntime, raw_id);
             let _ = guard.fair_queue.remove(key);
-            guard
-                .fair_queue
-                .insert(key, u128::from(vruntime))
-                .expect("fair queue capacity");
+            fair_queue_insert(&mut guard.fair_queue, vruntime, raw_id);
         }
     }
 }
@@ -1159,10 +1172,7 @@ pub fn set_sched_policy(task_id: u64, policy: SchedPolicy) {
     }
     guard.tasks[idx].sched_policy = policy;
     if let SchedPolicy::Fair { vruntime, .. } = policy {
-        guard
-            .fair_queue
-            .insert(fair_key_of(vruntime, task_id), u128::from(vruntime))
-            .expect("fair queue capacity");
+        fair_queue_insert(&mut guard.fair_queue, vruntime, task_id);
     }
     drop(guard);
     huesos_arch::interrupts::enable();

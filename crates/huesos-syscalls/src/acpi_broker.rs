@@ -30,9 +30,10 @@ pub(crate) fn sys_acpi_broker_call(
         .get(broker_handle)
         .ok_or(ErrorCode::BadHandle)?;
     let required = match validated.opcode {
-        Opcode::SystemIoRead | Opcode::PciRead => Rights::READ,
+        Opcode::SystemIoRead | Opcode::PciRead | Opcode::MmioRead => Rights::READ,
         Opcode::SystemIoWrite
         | Opcode::PciWrite
+        | Opcode::MmioWrite
         | Opcode::InstallInterrupt
         | Opcode::RemoveInterrupt
         | Opcode::Reset
