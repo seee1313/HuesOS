@@ -43,6 +43,13 @@ pub struct HxblobIndexRecord {
     pub merkle_root: BlobHash,
     /// Merkle metadata tree LBA, or zero for single-chunk blobs.
     pub merkle_tree_lba: u64,
+    /// Stage F.2 reference count: one per stored object plus one per
+    /// live handle (`put_blob` stores it at one; every `OpenBlob`
+    /// acquires, every handle close releases). A record at zero is
+    /// explicitly released and reclaimable by the Stage F.3 GC pass.
+    /// v6 records carry no such field and load as one, so a legacy
+    /// blob can never be reclaimed without an explicit release.
+    pub refcount: u32,
     /// Write-once flags. Reserved bits must be zero.
     pub flags: u32,
 }
@@ -127,6 +134,43 @@ impl<const N: usize> HxblobIndexTree<N> {
         while index < self.records.len() {
             if let Some(record) = self.records[index] {
                 if &record.hash == hash {
+                    return Ok(record);
+                }
+            }
+            index += 1;
+        }
+        Err(HxblobTreeError::NotFound)
+    }
+
+    /// Stage F.2: set the record's refcount in place.
+    ///
+    /// The hash (the sort key) never changes, so the sorted layout is
+    /// preserved and no re-sort is needed.
+    pub fn set_refcount(&mut self, hash: &BlobHash, refcount: u32) -> Result<(), HxblobTreeError> {
+        let mut index = 0usize;
+        while index < self.records.len() {
+            if let Some(record) = self.records[index] {
+                if record.hash == *hash {
+                    self.records[index] = Some(HxblobIndexRecord { refcount, ..record });
+                    return Ok(());
+                }
+            }
+            index += 1;
+        }
+        Err(HxblobTreeError::NotFound)
+    }
+
+    /// Stage F.3: remove a record, returning it.
+    ///
+    /// The GC calls this after the backing object's directory entry has
+    /// been removed through the normal unlink path, so a failed unlink
+    /// keeps the record (and the object) intact.
+    pub fn remove(&mut self, hash: &BlobHash) -> Result<HxblobIndexRecord, HxblobTreeError> {
+        let mut index = 0usize;
+        while index < self.records.len() {
+            if let Some(record) = self.records[index] {
+                if record.hash == *hash {
+                    self.records[index] = None;
                     return Ok(record);
                 }
             }
@@ -340,6 +384,7 @@ mod tests {
             size: 4096,
             merkle_root: hash(byte.wrapping_add(1)),
             merkle_tree_lba: 100 + object_id,
+            refcount: 1,
             flags: 0,
         }
     }
