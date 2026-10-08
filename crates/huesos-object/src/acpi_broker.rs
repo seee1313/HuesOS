@@ -265,8 +265,12 @@ mod tests {
             ..Request::default()
         }
         .validate();
-        assert!(read.as_ref().is_ok_and(|request| broker.authorizes(request)));
-        assert!(write.as_ref().is_ok_and(|request| !broker.authorizes(request)));
+        assert!(read
+            .as_ref()
+            .is_ok_and(|request| broker.authorizes(request)));
+        assert!(write
+            .as_ref()
+            .is_ok_and(|request| !broker.authorizes(request)));
         // A read starting outside the granted range is denied.
         let outside = Request {
             version: VERSION,
@@ -276,6 +280,8 @@ mod tests {
             ..Request::default()
         }
         .validate();
-        assert!(outside.as_ref().is_ok_and(|request| !broker.authorizes(request)));
+        assert!(outside
+            .as_ref()
+            .is_ok_and(|request| !broker.authorizes(request)));
     }
 }

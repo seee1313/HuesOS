@@ -70,14 +70,7 @@ impl Gas {
             return None;
         }
         let address = u64::from_le_bytes([
-            bytes[4],
-            bytes[5],
-            bytes[6],
-            bytes[7],
-            bytes[8],
-            bytes[9],
-            bytes[10],
-            bytes[11],
+            bytes[4], bytes[5], bytes[6], bytes[7], bytes[8], bytes[9], bytes[10], bytes[11],
         ]);
         Some(Gas {
             address_space: AddressSpace::from_raw(bytes[0]),
