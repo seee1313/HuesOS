@@ -15,13 +15,11 @@ use core::ops::{Deref, DerefMut};
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use x86_64::instructions::interrupts;
 
-pub use huesos_sync::{LockRank, LockRankError};
 use huesos_sync::RankTracker;
+pub use huesos_sync::{LockRank, LockRankError};
 
 /// Number of hardware-thread rank trackers. This matches `cpu_local::MAX_CPUS`.
 const MAX_RANK_TRACKERS: usize = 64;
-
-
 
 struct RankTrackerSlot(UnsafeCell<RankTracker>);
 
@@ -38,7 +36,6 @@ unsafe impl Sync for RankTrackerSlot {}
 
 static RANK_TRACKERS: [RankTrackerSlot; MAX_RANK_TRACKERS] =
     [const { RankTrackerSlot::new() }; MAX_RANK_TRACKERS];
-
 
 fn with_rank_tracker<R>(operation: impl FnOnce(&mut RankTracker) -> R) -> Result<R, LockRankError> {
     // SAFETY: every path that uses ranked locks runs after per-CPU GS setup;
