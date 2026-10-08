@@ -183,6 +183,21 @@ impl Hxfs {
         read_native_status(&self.channel).map(|_| ())
     }
 
+    /// Stage F.3: run one Hxblob garbage-collection pass on the
+    /// service. Reclaims every zero-refcount object and commits the
+    /// pass's checkpoint; returns the number of objects reclaimed.
+    pub fn gc_blobs(&self) -> Result<u64> {
+        write_native_request(
+            &self.channel,
+            abi::HxfsOp::GcBlobs,
+            abi::HxfsHandleKind::Volume,
+            0,
+            0,
+            &[],
+        )?;
+        read_native_status(&self.channel).map(|response| response.value)
+    }
+
     fn channel_to_dir(&self, request: &[u8]) -> Result<HxfsDirectory> {
         self.channel.write(request)?;
         let mut buf = [0u8; 64];
@@ -967,6 +982,10 @@ fn status_to_error(status: abi::HxfsStatus) -> ErrorCode {
         // was requested under. Mapping it to a miss would let silent
         // corruption of an immutable object look routine.
         abi::HxfsStatus::CorruptObject => ErrorCode::Internal,
+        // A release below zero is a caller bookkeeping defect (close
+        // without open, double close): the request is invalid against
+        // the current state, the object itself is untouched.
+        abi::HxfsStatus::RefcountZero => ErrorCode::InvalidArgs,
     }
 }
 

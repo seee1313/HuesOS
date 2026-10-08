@@ -270,7 +270,15 @@ impl HxfsRuntime {
             *slot = None;
         }
         for slot in self.blobs.iter_mut() {
-            *slot = None;
+            if let Some(endpoint) = slot.take() {
+                // Stage F.2: every self-check view held one reference;
+                // dropping the table releases them so the self-check
+                // blobs stay exactly as reference-counted as any
+                // client blob.
+                if let Err(error) = self.fs.release_blob_ref(&endpoint.hash) {
+                    println!("[hxfs] blob-ref underflow on self-check release: {error:?}");
+                }
+            }
         }
     }
 
@@ -427,6 +435,31 @@ impl HxfsRuntime {
             HxfsOp::Rename => self.client_rename_native(index, request, payload),
             HxfsOp::Unlink => self.client_unlink_native(index, request, payload),
             HxfsOp::Fsync | HxfsOp::Checkpoint => self.client_checkpoint_native(index, request),
+            #[cfg(feature = "hxblob")]
+            HxfsOp::GcBlobs => {
+                // Stage F.3: production GC entry point. The pass
+                // commits its own checkpoint, so the reclaimed state
+                // is durable by the time the response is written.
+                match self.fs.gc_blobs() {
+                    Ok(report) => {
+                        println!(
+                            "[hxfs] gc considered={} reclaimed={} skipped={} freed={}B",
+                            report.considered, report.reclaimed, report.skipped, report.freed_bytes
+                        );
+                        self.write_client_response(
+                            index,
+                            request,
+                            HxfsStatus::Ok,
+                            HxfsHandleKind::Volume,
+                            0,
+                            hxfs_rights::ALL,
+                            self.fs.volume_info().root_object_id,
+                            report.reclaimed,
+                        );
+                    }
+                    Err(error) => self.write_client_status(index, request, status_for_error(error)),
+                }
+            }
             #[cfg(feature = "hxblob")]
             HxfsOp::OpenBlob => self.client_open_blob_native(index, request, payload),
             #[cfg(feature = "hxblob")]
@@ -937,6 +970,14 @@ impl HxfsRuntime {
                 return;
             }
         }
+        // Stage F.2: the view the client is about to hold is one
+        // reference for as long as the client keeps the channel open;
+        // the matching release happens in `poll_blob` when the peer
+        // closes.
+        if let Err(error) = self.fs.acquire_blob_ref(&hash) {
+            self.write_client_status(index, request, status_for_error(error));
+            return;
+        }
         self.return_blob_to_client(index, request, hash, size);
     }
 
@@ -954,14 +995,23 @@ impl HxfsRuntime {
             return;
         }
         let hash = match self.fs.put_blob(payload) {
+            // The new object's stored reference (one) IS the view we
+            // are about to hand out, so no extra acquire is needed.
             Ok(hash) => hash,
             Err(HxfsError::AlreadyExists) => {
                 // Content-addressed: the object is already stored and
                 // by definition holds these exact bytes, so the right
                 // answer is a view of it, not an error. The hash comes
                 // from the filesystem's own hasher rather than a
-                // second copy of SHA-256 in the service.
-                self.fs.content_hash(payload)
+                // second copy of SHA-256 in the service. That view is
+                // an OPEN, so it takes a Stage F.2 reference like any
+                // OpenBlob.
+                let hash = self.fs.content_hash(payload);
+                if let Err(error) = self.fs.acquire_blob_ref(&hash) {
+                    self.write_client_status(index, request, status_for_error(error));
+                    return;
+                }
+                hash
             }
             Err(error) => {
                 self.write_client_status(index, request, status_for_error(error));
@@ -1052,7 +1102,15 @@ impl HxfsRuntime {
                 Ok(n) => Some(n),
                 Err(ErrorCode::ShouldWait) | Err(ErrorCode::TimedOut) => None,
                 Err(ErrorCode::PeerClosed) => {
-                    self.blobs[index] = None;
+                    // Stage F.2: the closed view held one reference;
+                    // dropping the endpoint releases it. An underflow
+                    // here is a service bookkeeping bug, so it is
+                    // logged loudly rather than retried or ignored.
+                    if let Some(endpoint) = self.blobs[index].take() {
+                        if let Err(error) = self.fs.release_blob_ref(&endpoint.hash) {
+                            println!("[hxfs] blob-ref underflow on close: {error:?}");
+                        }
+                    }
                     None
                 }
                 Err(_) => None,
@@ -2684,8 +2742,82 @@ impl HxfsRuntime {
             self.write_client(index, reply.as_bytes());
             return true;
         }
+        // Stage F.2: text-protocol refcount controls. BLOB_OPEN takes
+        // one reference (resurrecting a released blob), BLOB_CLOSE
+        // releases one; a close that would run the count below zero
+        // is refused with err:refcount-zero so the precise
+        // HxfsError::RefcountZero is visible end-to-end.
+        if let Some(rest) = strip_prefix(request, b"BLOB_OPEN ") {
+            let Some(hash) = hash_from_text_command(rest) else {
+                self.write_client(index, b"err:bad-hash");
+                return true;
+            };
+            match self.fs.acquire_blob_ref(&hash) {
+                Ok(count) => {
+                    println!("[hxfs] blob-open refcount={}", count);
+                    self.write_client(index, b"open-ok");
+                }
+                Err(e) => {
+                    println!("[hxfs] blob-open failed: {:?}", e);
+                    self.write_client(index, b"err:not-found");
+                }
+            }
+            return true;
+        }
+        if let Some(rest) = strip_prefix(request, b"BLOB_CLOSE ") {
+            let Some(hash) = hash_from_text_command(rest) else {
+                self.write_client(index, b"err:bad-hash");
+                return true;
+            };
+            match self.fs.release_blob_ref(&hash) {
+                Ok(count) => {
+                    println!("[hxfs] blob-close refcount={}", count);
+                    self.write_client(index, b"close-ok");
+                }
+                Err(HxfsError::RefcountZero) => {
+                    println!("[hxfs] blob-close refused: refcount already zero");
+                    self.write_client(index, b"err:refcount-zero");
+                }
+                Err(e) => {
+                    println!("[hxfs] blob-close failed: {:?}", e);
+                    self.write_client(index, b"err:not-found");
+                }
+            }
+            return true;
+        }
+        // Stage F.3: run one GC pass over the blob store and report
+        // it. The pass commits its own checkpoint, so the reclaimed
+        // state is durable by the time the reply is written.
+        if request == b"BLOB_GC" {
+            match self.fs.gc_blobs() {
+                Ok(report) => {
+                    println!(
+                        "[hxfs] gc considered={} reclaimed={} skipped={} freed={}B",
+                        report.considered, report.reclaimed, report.skipped, report.freed_bytes
+                    );
+                    self.write_client(index, b"gc-ok");
+                }
+                Err(e) => {
+                    println!("[hxfs] gc failed: {:?}", e);
+                    self.write_client(index, b"err:gc");
+                }
+            }
+            return true;
+        }
         false
     }
+}
+
+/// Decode a 32-byte hash from a text-protocol blob command argument.
+#[cfg(feature = "synthetic-key")]
+fn hash_from_text_command(rest: &[u8]) -> Option<[u8; 32]> {
+    let hash = hex_decode(rest)?;
+    if hash.len() != 32 {
+        return None;
+    }
+    let mut hash_bytes = [0u8; 32];
+    hash_bytes.copy_from_slice(&hash);
+    Some(hash_bytes)
 }
 
 #[panic_handler]

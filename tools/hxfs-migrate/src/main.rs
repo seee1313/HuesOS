@@ -1,9 +1,9 @@
 use huesos_hxfs::compression::{CompressionPolicy, COMPRESSION_LZ4, COMPRESSION_ZSTD};
 use huesos_hxfs::crypto::{EncryptionPolicy, KeyProvider, ALGORITHM_AES_XTS, DATA_UNIT_BYTES_4K};
 use huesos_hxfs::fixed_writer::FixedHxfsWriter;
-use huesos_hxfs::recovery::BlockStore;
 use huesos_hxfs::format::{BLOCK_SIZE, FORMAT_VERSION, LEGACY_FORMAT_VERSION};
 use huesos_hxfs::reader::BlockReader;
+use huesos_hxfs::recovery::BlockStore;
 use huesos_hxfs::HxfsError;
 use std::env;
 use std::fs::{File, OpenOptions};
@@ -108,7 +108,10 @@ fn main() {
 fn migrate(mut options: Options) -> Result<(), String> {
     let version = read_format_version(&options.image)?;
     if version == FORMAT_VERSION {
-        println!("{} is already HxFS v{FORMAT_VERSION}", options.image.display());
+        println!(
+            "{} is already HxFS v{FORMAT_VERSION}",
+            options.image.display()
+        );
         clear_optional_key(&mut options.key);
         return Ok(());
     }
@@ -140,10 +143,12 @@ fn migrate(mut options: Options) -> Result<(), String> {
         return Err("source changed format during migration".to_string());
     }
     let sequence = mounted
-        .migrate_legacy_to_v6(&options.encryption, &options.compression)
+        .migrate_legacy_to_v7(&options.encryption, &options.compression)
         .map_err(|error| format!("journaled migration: {error:?}"))?;
     let mut store = mounted.into_store();
-    store.flush().map_err(|error| format!("final flush: {error:?}"))?;
+    store
+        .flush()
+        .map_err(|error| format!("final flush: {error:?}"))?;
     clear_optional_key(&mut options.key);
     println!(
         "migrated {} to HxFS v{} at checkpoint sequence {}",
@@ -209,7 +214,11 @@ fn parse_options() -> Result<Options, String> {
 
 fn parse_compression_policy(text: &str) -> Result<CompressionPolicy, String> {
     let mut fields = text.split(':');
-    let policy_id = parse_u32(fields.next().ok_or_else(|| "missing policy id".to_string())?)?;
+    let policy_id = parse_u32(
+        fields
+            .next()
+            .ok_or_else(|| "missing policy id".to_string())?,
+    )?;
     let algorithm = match fields.next() {
         Some("lz4") => COMPRESSION_LZ4,
         Some("zstd") => COMPRESSION_ZSTD,

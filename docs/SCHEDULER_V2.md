@@ -234,6 +234,11 @@ The ready queue is an index-based augmented WAVL tree:
 - each subtree caches minimum virtual finish;
 - insert, remove, reweight, and selection are `O(log n)`;
 - no allocator call occurs in enqueue, dequeue, account, or pick-next;
+- the tree is panic-free: mutation operations thread
+  `Result<(), EevdfTreeError>` (a corrupted bookkeeping state surfaces as
+  `InvariantBroken` and fails stop at the one scheduler boundary), while
+  read-only walks degrade gracefully on a missing slot (see
+  `docs/UNSAFE_AUDIT.md` § "Scheduler v2: panic-free EEVDF tree");
 - randomized tests verify ordering, ranks, augmentation, uniqueness, and
   generation validity after every operation.
 

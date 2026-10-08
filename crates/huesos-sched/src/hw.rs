@@ -247,6 +247,26 @@ impl CpuTopology {
 mod tests {
     use super::*;
 
+    // Helper: unpack a Result in a test without calling unwrap. CONTRIBUTING
+    // rule 1 forbids the unwrap / expect / panic macros including in tests;
+    // an assert!(false, ...) is the budget-allowed diagnostic, and `return`
+    // after it keeps the types sound for the remainder of the test body.
+    macro_rules! expect_ok {
+        ($expr:expr, $msg:literal) => {
+            match $expr {
+                Ok(value) => value,
+                Err(err) => {
+                    assert!(
+                        false,
+                        concat!("expected Ok: ", $msg, " (got {err:?})"),
+                        err = err
+                    );
+                    return;
+                }
+            }
+        };
+    }
+
     #[test]
     fn xsave_layout_sums_enabled_user_components() {
         // Standard components: 0=SSE(0x40), 1=AVX(0x100), 2..5=MPX(0x40 each).
@@ -257,7 +277,10 @@ mod tests {
             (0, 0x40, 1),    // subleaf 3: MPX BNDCSR
         ];
         // XCR0 = SSE|AVX = 0b11
-        let model = XsaveModel::from_cpuid(&leaves, 0b11).unwrap();
+        let model = expect_ok!(
+            XsaveModel::from_cpuid(&leaves, 0b11),
+            "XsaveModel::from_cpuid"
+        );
         let layout = model.layout();
         assert_eq!(layout.align, 64);
         assert_eq!(layout.size, 512 + 0x40 + 0x100);
@@ -272,22 +295,22 @@ mod tests {
     #[test]
     fn pcid_slots_reuse_only_after_full_deactivation() {
         let mut table = PcidTable::<8>::new();
-        let (pcid_a, gen_a) = table.allocate().unwrap();
+        let (pcid_a, gen_a) = expect_ok!(table.allocate(), "first allocate");
         assert!(pcid_a != 0);
-        table.activate(pcid_a, gen_a, 1).unwrap();
+        expect_ok!(table.activate(pcid_a, gen_a, 1), "activate cpu 1");
         assert!(table.is_active(pcid_a, gen_a));
         // Deactivate on one CPU, still active on none -> reusable.
-        table.deactivate(pcid_a, gen_a, 1).unwrap();
+        expect_ok!(table.deactivate(pcid_a, gen_a, 1), "deactivate cpu 1");
         assert!(!table.is_active(pcid_a, gen_a));
         // But the same generation can be re-activated.
-        table.activate(pcid_a, gen_a, 2).unwrap();
+        expect_ok!(table.activate(pcid_a, gen_a, 2), "activate cpu 2");
         assert!(table.is_active(pcid_a, gen_a));
     }
 
     #[test]
     fn pcid_generation_mismatch_is_rejected() {
         let mut table = PcidTable::<4>::new();
-        let (pcid, gen) = table.allocate().unwrap();
+        let (pcid, gen) = expect_ok!(table.allocate(), "allocate");
         assert_eq!(table.activate(pcid, gen + 1, 0), Err(PcidError::InUse));
     }
 
@@ -299,7 +322,10 @@ mod tests {
             (0, 0x0001, 0x0000_0001, 0),    // SMT level: logical 2
             (0, 0x0007, 0x0000_0002, 0),    // core level: logical 8
         ];
-        let topo = CpuTopology::from_leaf_1f(&leaves).unwrap();
+        let topo = expect_ok!(
+            CpuTopology::from_leaf_1f(&leaves),
+            "CpuTopology::from_leaf_1f"
+        );
         assert_eq!(topo.smt_per_core, 2);
         assert_eq!(topo.cores_per_package, 8);
         assert_eq!(topo.logical_per_package, 8);
