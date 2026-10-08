@@ -551,8 +551,13 @@ fn install_acpi_broker(
 ) -> bool {
     use huesos_object::{Handle, KernelObject, Rights};
 
-    let broker =
-        huesos_object::AcpiBroker::with_policy(system_io, alloc::vec::Vec::new(), false, false);
+    let broker = huesos_object::AcpiBroker::with_policy(
+        system_io,
+        alloc::vec::Vec::new(),
+        alloc::vec::Vec::new(),
+        false,
+        false,
+    );
     let koid = broker.koid();
     huesos_object::register_object(broker);
     let rights = Rights::READ | Rights::WRITE | Rights::DUPLICATE | Rights::TRANSFER;

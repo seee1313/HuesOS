@@ -46,6 +46,10 @@ pub enum Opcode {
     Reset = 7,
     /// Request the firmware S5 power-off path after policy authorization.
     PowerOff = 8,
+    /// Exact-width MMIO read from a granted firmware range.
+    MmioRead = 9,
+    /// Exact-width MMIO write to a granted firmware range.
+    MmioWrite = 10,
 }
 
 impl Opcode {
@@ -60,6 +64,8 @@ impl Opcode {
             6 => Some(Self::RemoveInterrupt),
             7 => Some(Self::Reset),
             8 => Some(Self::PowerOff),
+            9 => Some(Self::MmioRead),
+            10 => Some(Self::MmioWrite),
             _ => None,
         }
     }
@@ -67,7 +73,12 @@ impl Opcode {
     const fn uses_width(self) -> bool {
         matches!(
             self,
-            Self::SystemIoRead | Self::SystemIoWrite | Self::PciRead | Self::PciWrite
+            Self::SystemIoRead
+                | Self::SystemIoWrite
+                | Self::PciRead
+                | Self::PciWrite
+                | Self::MmioRead
+                | Self::MmioWrite
         )
     }
 }
