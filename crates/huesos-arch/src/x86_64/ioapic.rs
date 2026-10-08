@@ -182,6 +182,17 @@ impl RouteRecord {
     };
 }
 
+#[derive(Clone, Copy)]
+struct RouteRequest {
+    gsi: u32,
+    primary_event: u64,
+    alias_event: Option<u64>,
+    config: RouteConfig,
+    destination_apic_id: u32,
+    forced_vector: Option<u8>,
+    permanent: bool,
+}
+
 struct IoApicState {
     initialized: bool,
     controllers: [Controller; MAX_IOAPICS],
@@ -206,9 +217,11 @@ impl IoApicState {
     }
 }
 
+type AffinityValidator = fn(u32) -> bool;
+
 static IOAPIC_STATE: RankedIrqSafeTicketLock<IoApicState> =
     RankedIrqSafeTicketLock::new(IoApicState::new(), LockRank::ARCHITECTURE);
-static AFFINITY_VALIDATOR: RankedIrqSafeTicketLock<Option<fn(u32) -> bool>> =
+static AFFINITY_VALIDATOR: RankedIrqSafeTicketLock<Option<AffinityValidator>> =
     RankedIrqSafeTicketLock::new(None, LockRank::ARCHITECTURE);
 
 /// Install a kernel callback that accepts only APIC IDs of scheduler-online
@@ -362,13 +375,15 @@ pub fn init_keyboard(madt_bytes: &[u8]) -> Result<(), IoApicError> {
     let destination = super::lapic::id();
     let route = route_locked(
         &mut state,
-        gsi,
-        legacy_event_key(u32::from(irq)),
-        alias,
-        config,
-        destination,
-        Some(KEYBOARD_VECTOR),
-        true,
+        RouteRequest {
+            gsi,
+            primary_event: legacy_event_key(u32::from(irq)),
+            alias_event: alias,
+            config,
+            destination_apic_id: destination,
+            forced_vector: Some(KEYBOARD_VECTOR),
+            permanent: true,
+        },
     )?;
     KEYBOARD_GSI.store(route.gsi, Ordering::Release);
     ROUTED_LEGACY_IRQS.fetch_or(1u32 << irq, Ordering::AcqRel);
@@ -394,13 +409,15 @@ pub fn route_legacy_irq(irq: u8) -> Result<IoApicRoute, IoApicError> {
     let alias = (gsi != u32::from(irq)).then_some(gsi_event_key(gsi));
     route_locked(
         &mut state,
-        gsi,
-        legacy_event_key(u32::from(irq)),
-        alias,
-        config,
-        super::lapic::id(),
-        None,
-        false,
+        RouteRequest {
+            gsi,
+            primary_event: legacy_event_key(u32::from(irq)),
+            alias_event: alias,
+            config,
+            destination_apic_id: super::lapic::id(),
+            forced_vector: None,
+            permanent: false,
+        },
     )
 }
 
@@ -435,13 +452,15 @@ pub fn route_gsi(
     }
     route_locked(
         &mut state,
-        gsi,
-        gsi_event_key(gsi),
-        alias,
-        config,
-        destination_apic_id,
-        None,
-        false,
+        RouteRequest {
+            gsi,
+            primary_event: gsi_event_key(gsi),
+            alias_event: alias,
+            config,
+            destination_apic_id,
+            forced_vector: None,
+            permanent: false,
+        },
     )
 }
 
@@ -472,10 +491,7 @@ pub fn acquire_gsi_interrupt_route(gsi: u32) -> Option<bool> {
             return None;
         }
         match state.overrides.find_gsi(gsi).filter(|entry| entry.bus == 0) {
-            Some(entry) => match entry.config() {
-                Some(config) => config,
-                None => return None,
-            },
+            Some(entry) => entry.config()?,
             None if gsi < 16 => RouteConfig::isa_default(),
             None => RouteConfig::pci_intx_default(),
         }
@@ -842,14 +858,17 @@ pub fn dispatch_vector_with_data(vector: u8, data: u64) {
 
 fn route_locked(
     state: &mut IoApicState,
-    gsi: u32,
-    primary_event: u64,
-    alias_event: Option<u64>,
-    config: RouteConfig,
-    destination_apic_id: u32,
-    forced_vector: Option<u8>,
-    permanent: bool,
+    request: RouteRequest,
 ) -> Result<IoApicRoute, IoApicError> {
+    let RouteRequest {
+        gsi,
+        primary_event,
+        alias_event,
+        config,
+        destination_apic_id,
+        forced_vector,
+        permanent,
+    } = request;
     if !state.initialized {
         return Err(IoApicError::NotInitialized);
     }

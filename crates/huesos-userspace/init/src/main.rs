@@ -1595,10 +1595,9 @@ fn lifecycle_wait_iterations() -> usize {
 ///
 /// Each iteration spawns a probe child that yields before exiting, so the
 /// kernel must exercise wait registration, scheduler park/wake, lifecycle
-/// publication and exit-code delivery every single time. A single pass
-/// (run_process_wait_check) proves the path works; this proves it keeps
-/// working under repetition, which is where stale-generation and
-/// reaper-timing bugs surface.
+/// publication and exit-code delivery every single time. A single blocked
+/// wait proves the path works; this proves it keeps working under repetition,
+/// which is where stale-generation and reaper-timing bugs surface.
 fn run_process_wait_stress(logger: &mut InitLogger) {
     let iterations = lifecycle_wait_iterations();
     for index in 0..iterations {
@@ -1660,36 +1659,6 @@ fn run_process_wait_stress(logger: &mut InitLogger) {
         mode,
         iterations
     );
-}
-
-fn run_process_wait_check(logger: &mut InitLogger) {
-    let Ok((process, bootstrap)) = libcanvas::process::spawn_elf("wait-probe", FAULT_PROBE_ELF)
-    else {
-        init_logln!(logger, "[init] ProcessWait lifecycle FAILED (launch)");
-        return;
-    };
-    if bootstrap.write(b"wait").is_err() {
-        init_logln!(logger, "[init] ProcessWait lifecycle FAILED (command)");
-        return;
-    }
-    drop(bootstrap);
-
-    // Unlike the early-boot polling helper, this deliberately parks in the
-    // blocking syscall. The child yields before exit, so QEMU must exercise
-    // registration, park, wake, and lifecycle exit publication.
-    match process.wait_exit() {
-        Ok(0) => init_logln!(logger, "[init] ProcessWait lifecycle OK (blocked wake)"),
-        Ok(code) => init_logln!(
-            logger,
-            "[init] ProcessWait lifecycle FAILED (exit code {})",
-            code
-        ),
-        Err(error) => init_logln!(
-            logger,
-            "[init] ProcessWait lifecycle FAILED ({})",
-            error.as_str()
-        ),
-    }
 }
 
 fn run_shutdown_authorization_check(logger: &mut InitLogger) {
