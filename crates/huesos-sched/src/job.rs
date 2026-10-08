@@ -258,31 +258,64 @@ impl Default for JobTable {
 mod tests {
     use super::*;
 
+    // Helpers: unpack a Result / Option in a test without calling unwrap.
+    // CONTRIBUTING rule 1 forbids the unwrap / expect / panic macros including
+    // in tests; an assert!(false, ...) is the budget-allowed diagnostic, and
+    // `return` after it keeps the types sound for the remainder of the test
+    // body.
+    macro_rules! expect_ok {
+        ($expr:expr, $msg:literal) => {
+            match $expr {
+                Ok(value) => value,
+                Err(err) => {
+                    assert!(
+                        false,
+                        concat!("expected Ok: ", $msg, " (got {err:?})"),
+                        err = err
+                    );
+                    return;
+                }
+            }
+        };
+    }
+
+    macro_rules! expect_some {
+        ($expr:expr, $msg:literal) => {
+            match $expr {
+                Some(value) => value,
+                None => {
+                    assert!(false, concat!("expected Some: ", $msg));
+                    return;
+                }
+            }
+        };
+    }
+
     fn job(id: u32) -> JobId {
         JobId::new(id).unwrap_or_else(|| unreachable!())
     }
 
     #[test]
     fn job_state_tracks_per_cpu_demand_and_service() {
-        let mut state = JobState::<4>::new(job(7), 1024, 1_000_000).unwrap();
-        state.thread_ready(0, 1024).unwrap();
-        state.thread_ready(0, 512).unwrap();
-        state.thread_ready(2, 1024).unwrap();
+        let mut state = expect_ok!(JobState::<4>::new(job(7), 1024, 1_000_000), "JobState::new");
+        expect_ok!(state.thread_ready(0, 1024), "thread_ready (0, 1024)");
+        expect_ok!(state.thread_ready(0, 512), "thread_ready (0, 512)");
+        expect_ok!(state.thread_ready(2, 1024), "thread_ready (2, 1024)");
         assert_eq!(state.runnable_total, 3);
         assert_eq!(state.per_cpu[0].runnable, 2);
         assert_eq!(state.demand_total(), 2560);
-        state.charge(0, 100).unwrap();
+        expect_ok!(state.charge(0, 100), "charge (0, 100)");
         assert_eq!(state.per_cpu[0].service_ns, 100);
         assert_eq!(state.service_total_ns, 100);
         assert!(!state.capped(50));
-        state.thread_blocked(2, 1024).unwrap();
+        expect_ok!(state.thread_blocked(2, 1024), "thread_blocked (2, 1024)");
         assert_eq!(state.runnable_total, 2);
     }
 
     #[test]
     fn job_hard_cap_replenishes_after_period() {
-        let mut state = JobState::<1>::new(job(3), 1024, 1000).unwrap();
-        state.charge(0, 1000).unwrap();
+        let mut state = expect_ok!(JobState::<1>::new(job(3), 1024, 1000), "JobState::new");
+        expect_ok!(state.charge(0, 1000), "charge (0, 1000)");
         assert!(state.capped(500));
         // Window still active at 999 ns.
         assert!(!state.maybe_replenish(999));
@@ -296,12 +329,12 @@ mod tests {
     fn job_table_reserves_root_and_reuses_slots_with_generations() {
         let mut table = JobTable::new();
         assert!(table.is_allocated(0));
-        let first = table.allocate().unwrap();
+        let first = expect_some!(table.allocate(), "first allocate");
         assert_ne!(first.index, 0);
         assert_eq!(first.generation, 1);
-        table.free(first).unwrap();
+        expect_ok!(table.free(first), "free first");
         assert!(!table.is_allocated(first.index));
-        let second = table.allocate().unwrap();
+        let second = expect_some!(table.allocate(), "second allocate");
         assert_eq!(second.index, first.index);
         assert_eq!(second.generation, 2);
         assert_eq!(
