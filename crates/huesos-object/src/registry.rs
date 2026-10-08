@@ -31,8 +31,8 @@ use huesos_lifecycle::RefAccount;
 
 use crate::irq_guard::IrqSafeMutex;
 use crate::{
-    Channel, Interrupt, Job, KernelObject, KernelObjectExt, Koid, Port, Process, Resource,
-    ResourceError, Signal,
+    Channel, Interrupt, InterruptRouteKind, Job, KernelObject, KernelObjectExt, Koid, Port,
+    Process, Resource, ResourceError, Signal,
 };
 
 struct RegistryState {
@@ -44,7 +44,7 @@ struct RegistryState {
     /// through the same well-tested API.
     accounts: BTreeMap<Koid, RefAccount>,
     processes: BTreeMap<Koid, Arc<Process>>,
-    interrupts: BTreeMap<u8, Vec<Arc<Interrupt>>>,
+    interrupts: BTreeMap<(InterruptRouteKind, u32), Vec<Arc<Interrupt>>>,
 }
 
 impl RegistryState {
@@ -279,19 +279,19 @@ pub fn register_interrupt(interrupt: Arc<Interrupt>) {
         let mut state = REGISTRY.lock();
         state
             .interrupts
-            .entry(interrupt.irq())
+            .entry((interrupt.route_kind(), interrupt.irq()))
             .or_default()
             .push(Arc::clone(&interrupt));
     }
     register_object(interrupt);
 }
 
-/// Snapshot interrupt listeners for an IRQ.
-pub fn lookup_interrupts_by_irq(irq: u8) -> Vec<Arc<Interrupt>> {
+/// Snapshot interrupt listeners for a typed legacy IRQ/vector or raw GSI.
+pub fn lookup_interrupts_by_irq(route_kind: InterruptRouteKind, irq: u32) -> Vec<Arc<Interrupt>> {
     REGISTRY
         .lock()
         .interrupts
-        .get(&irq)
+        .get(&(route_kind, irq))
         .cloned()
         .unwrap_or_default()
 }

@@ -239,6 +239,12 @@ pub fn syscall_init() {
     huesos_syscalls::set_thread_start_fn(crate::process::start_thread);
     seed_kernel_entropy();
     huesos_arch::irq_callback::set_irq_callback(handle_irq);
+    huesos_arch::ioapic::set_affinity_validator(ioapic_target_online);
+    huesos_object::set_interrupt_route_hooks(
+        acquire_interrupt_route,
+        acknowledge_interrupt_route,
+        release_interrupt_route,
+    );
 
     huesos_object::set_scheduler_hooks(
         crate::scheduler::current_task_id,
@@ -284,10 +290,53 @@ fn seed_kernel_entropy() {
     huesos_object::entropy::seed(&material[..offset]);
 }
 
-fn handle_irq(irq: u8, d: u64) {
-    for i in huesos_object::lookup_interrupts_by_irq(irq) {
-        i.signal(huesos_abi::PORT_PACKET_INTERRUPT, d);
+fn handle_irq(raw_event_key: u64, d: u64) {
+    let Some(event_key) = huesos_abi::InterruptEventKey::from_raw(raw_event_key) else {
+        return;
+    };
+    for interrupt in huesos_object::lookup_interrupts_by_irq(event_key.kind(), event_key.number()) {
+        interrupt.signal(huesos_abi::PORT_PACKET_INTERRUPT, d);
     }
+}
+
+fn acquire_interrupt_route(kind: huesos_object::InterruptRouteKind, irq: u32) -> Option<bool> {
+    match kind {
+        huesos_object::InterruptRouteKind::LegacyOrVector => {
+            huesos_arch::ioapic::acquire_interrupt_route(irq)
+        }
+        huesos_object::InterruptRouteKind::Gsi => {
+            huesos_arch::ioapic::acquire_gsi_interrupt_route(irq)
+        }
+    }
+}
+
+fn acknowledge_interrupt_route(kind: huesos_object::InterruptRouteKind, irq: u32) -> bool {
+    match kind {
+        huesos_object::InterruptRouteKind::LegacyOrVector => {
+            huesos_arch::ioapic::acknowledge_interrupt_route(irq).is_ok()
+        }
+        huesos_object::InterruptRouteKind::Gsi => {
+            huesos_arch::ioapic::acknowledge_gsi_interrupt_route(irq).is_ok()
+        }
+    }
+}
+
+fn release_interrupt_route(kind: huesos_object::InterruptRouteKind, irq: u32) {
+    match kind {
+        huesos_object::InterruptRouteKind::LegacyOrVector => {
+            huesos_arch::ioapic::release_interrupt_route(irq)
+        }
+        huesos_object::InterruptRouteKind::Gsi => {
+            huesos_arch::ioapic::release_gsi_interrupt_route(irq)
+        }
+    }
+}
+
+fn ioapic_target_online(apic_id: u32) -> bool {
+    (0..huesos_sched::MAX_CPUS).any(|cpu| {
+        crate::scheduler::is_cpu_online(cpu)
+            && huesos_arch::cpu_local::lapic_id_for_index(cpu) == Some(apic_id)
+    })
 }
 
 extern "C" fn handle_syscall(f: &mut huesos_arch::syscall::SyscallFrame) {

@@ -185,6 +185,7 @@ fn run_driver_loop(port: Port, bootstrap: libcanvas::Channel) -> ! {
     let mut keyboard_client: Option<libcanvas::Channel> = None;
     let mut decoder = KeyboardDecoder::new();
     let mut scancode_count: u64 = 0;
+    let mut a_make_logged = false;
 
     // Event-driven: park on either the IRQ Port or the bootstrap
     // Channel. Zero CPU is spent when the keyboard is idle. When a
@@ -240,6 +241,7 @@ fn run_driver_loop(port: Port, bootstrap: libcanvas::Channel) -> ! {
                 &mut decoder,
                 &bootstrap,
                 &mut scancode_count,
+                &mut a_make_logged,
             );
         }
         if bootstrap_ready {
@@ -257,6 +259,7 @@ fn drain_keyboard_port(
     decoder: &mut KeyboardDecoder,
     bootstrap: &libcanvas::Channel,
     scancode_count: &mut u64,
+    a_make_logged: &mut bool,
 ) {
     loop {
         match port.read() {
@@ -265,6 +268,10 @@ fn drain_keyboard_port(
             {
                 let scancode = packet.data[1] as u8;
                 *scancode_count = scancode_count.wrapping_add(1);
+                if !*a_make_logged && scancode == 0x1e {
+                    println!("[driver-host:input] PS/2 make code 0x1e delivered to Port");
+                    *a_make_logged = true;
+                }
                 if let Some(event) = decoder.feed(scancode) {
                     send_keyboard_event(keyboard_client, event);
                 }

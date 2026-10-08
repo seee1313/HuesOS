@@ -107,7 +107,7 @@ Default `scripts/run.sh` uses `-smp 2`.
 
 ## Known Limitations
 
-- IOAPIC routing currently covers only the PS/2 keyboard IRQ1, with legacy PIC fallback; general device IRQ routing is not complete
+- The multi-controller IOAPIC route manager, dynamic external-vector IDT stubs, capability-authorized IRQ/GSI objects, and level-route acknowledgement path are implemented. A QEMU SMP2 QMP test injects a PS/2 key and confirms its IRQ packet reaches the userspace Port; non-keyboard raw-GSI delivery, level ACK/re-enable, and real-hardware integration validation remain.
 - NVMe + HxFS v6 works end-to-end in QEMU, including journal replay,
   corruption injection and power-fail recovery; bare-metal storage support is
   still experimental and first boots must use `STORAGE_OFF=1`
@@ -124,14 +124,12 @@ Default `scripts/run.sh` uses `-smp 2`.
   and user-visible Job quota controls are not yet complete
 - Framebuffer text is ASCII-only (no Unicode shaping, by design)
 
-> Note: several of the items above (I/O APIC routing, object/task teardown,
-> multi-object waits, process lifecycle, handle-transfer semantics) now have
-> host-testable **policy cores** in dedicated crates (`huesos-ioapic`,
-> `huesos-lifecycle`, `huesos-waitset`, `huesos-proclife`,
-> `huesos-handlemove`, `huesos-extable`). These model the decisions/encodings
-> but do not yet change the running kernel; the limitations above describe the
-> kernel's current on-target behavior, which is unchanged until those cores are
-> integrated and verified.
+> Note: the I/O APIC policy core is integrated into the kernel's route manager
+> and its generic path is being validated; keyboard IRQ1 retains PIC fallback.
+> Other listed policy crates (`huesos-lifecycle`, `huesos-waitset`,
+> `huesos-proclife`, `huesos-handlemove`, `huesos-extable`) model decisions that
+> are integrated to varying degrees. The limitation bullets above distinguish
+> implemented code from behavior that has passed on-target testing.
 
 ## Hardware Compatibility
 

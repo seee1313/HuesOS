@@ -92,6 +92,36 @@ jobs:
           path: ci-artifacts/
           if-no-files-found: warn
 
+  qemu-ioapic-live:
+    # Inject an actual PS/2 edge interrupt after route binding and prove that
+    # its packet crosses the IOAPIC/IDT/kernel bridge into a userspace Port.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            gcc xorriso qemu-system-x86
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install nightly-2026-03-01 --profile minimal \
+            --component rust-src,llvm-tools-preview
+          rustup default nightly-2026-03-01
+      - name: QEMU IOAPIC live-delivery smoke
+        env:
+          CARGO_BUILD_JOBS: "1"
+          ARTIFACT_DIR: ci-artifacts
+        run: bash scripts/ci-qemu-ioapic-delivery.sh debug 2 120
+      - name: Upload serial log
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: qemu-ioapic-live-smp2
+          path: ci-artifacts/
+          if-no-files-found: warn
+
   qemu-acpi-restart:
     # AP-6 lifecycle gate: generation one exits before readiness. The root
     # supervisor must retain/duplicate archive+broker capabilities, freeze new

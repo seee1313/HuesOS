@@ -79,7 +79,7 @@ pub(crate) fn sys_interrupt_create(irq: u32, out: *mut HandleValue) -> SyscallRe
     if irq != KEYBOARD_IRQ {
         return Err(ErrorCode::NotSupported);
     }
-    install_interrupt_handle(irq, out)
+    install_interrupt_object(huesos_object::Interrupt::new(irq), out)
 }
 
 pub(crate) fn sys_interrupt_create_for_resource(
@@ -87,8 +87,25 @@ pub(crate) fn sys_interrupt_create_for_resource(
     irq: u32,
     out: *mut HandleValue,
 ) -> SyscallResult {
+    if irq >= 16 && !(0xD0..=0xDF).contains(&irq) {
+        return Err(ErrorCode::NotSupported);
+    }
+    validate_irq_resource(resource_handle, irq)?;
     user_memory::validate_write(out)?;
-    let irq_u8 = u8::try_from(irq).map_err(|_| ErrorCode::InvalidArgs)?;
+    install_interrupt_object(huesos_object::Interrupt::new(irq), out)
+}
+
+pub(crate) fn sys_interrupt_create_gsi_for_resource(
+    resource_handle: HandleValue,
+    gsi: u32,
+    out: *mut HandleValue,
+) -> SyscallResult {
+    validate_irq_resource(resource_handle, gsi)?;
+    user_memory::validate_write(out)?;
+    install_interrupt_object(huesos_object::Interrupt::new_gsi(gsi), out)
+}
+
+fn validate_irq_resource(resource_handle: HandleValue, irq_or_gsi: u32) -> Result<(), ErrorCode> {
     let proc = current_proc()?;
     let handle = proc
         .handles
@@ -101,24 +118,44 @@ pub(crate) fn sys_interrupt_create_for_resource(
     let resource = object
         .downcast_ref::<Resource>()
         .ok_or(ErrorCode::WrongType)?;
-    if !resource.contains(ResourceKind::Irq, u64::from(irq_u8), 1) {
+    if !resource.contains(ResourceKind::Irq, u64::from(irq_or_gsi), 1) {
         return Err(ErrorCode::AccessDenied);
     }
-    install_interrupt_handle(irq, out)
+    Ok(())
 }
 
-fn install_interrupt_handle(irq: u32, out: *mut HandleValue) -> SyscallResult {
-    let irq = u8::try_from(irq).map_err(|_| ErrorCode::InvalidArgs)?;
-    let interrupt = huesos_object::Interrupt::new(irq);
+fn install_interrupt_object(
+    interrupt: alloc::sync::Arc<huesos_object::Interrupt>,
+    out: *mut HandleValue,
+) -> SyscallResult {
+    let proc = current_proc()?;
     let koid = interrupt.koid();
     huesos_object::register_interrupt(interrupt);
-
-    let proc = current_proc()?;
     proc.handles
         .add_with_commit(Handle::new(koid, Rights::DEFAULT), |handle| {
             user_memory::write_value(out, &handle)
         })
         .map(|_| 0)
+}
+
+pub(crate) fn sys_interrupt_acknowledge(interrupt_handle: HandleValue) -> SyscallResult {
+    let proc = current_proc()?;
+    let interrupt_h = proc
+        .handles
+        .get(interrupt_handle)
+        .ok_or(ErrorCode::BadHandle)?;
+    if !interrupt_h.has_rights(Rights::WRITE) {
+        return Err(ErrorCode::AccessDenied);
+    }
+    let interrupt_obj =
+        huesos_object::lookup_object(interrupt_h.koid).ok_or(ErrorCode::BadHandle)?;
+    let interrupt = interrupt_obj
+        .downcast_ref::<huesos_object::Interrupt>()
+        .ok_or(ErrorCode::WrongType)?;
+    interrupt
+        .acknowledge()
+        .map_err(|_| ErrorCode::NotSupported)?;
+    Ok(0)
 }
 
 pub(crate) fn sys_interrupt_bind_port(
@@ -150,6 +187,8 @@ pub(crate) fn sys_interrupt_bind_port(
         .downcast_arc::<huesos_object::Port>()
         .map_err(|_| ErrorCode::WrongType)?;
 
-    interrupt.bind_port(port, key);
+    interrupt
+        .bind_port(port, key)
+        .map_err(|_| ErrorCode::NotSupported)?;
     Ok(0)
 }

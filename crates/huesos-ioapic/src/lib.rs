@@ -17,13 +17,14 @@
 //!   System Interrupt with explicit polarity/trigger flags — the entry the
 //!   existing privileged MADT parser (`huesos-arch::x86_64::acpi`) does not yet
 //!   consume.
-//! - [`VectorAllocator`]: hands out device-IRQ vectors from a safe range that
-//!   avoids the CPU exceptions, the LAPIC timer vector, the panic-stop /
-//!   shutdown-stop IPIs, and the spurious vector.
-//! - [`IoApicDescriptor`] and [`route_gsi`]: choose which I/O APIC owns a GSI
-//!   and the redirection index (pin) within it.
-//! - [`entry_for_legacy_irq`]: ties the pieces together to build a redirection
-//!   entry for a legacy ISA IRQ.
+//! - [`VectorAllocator`]: hands out device-IRQ vectors from the reserved
+//!   I/O-APIC range, excluding vectors owned by keyboard/MSI/IPI handlers.
+//! - [`IoApicDescriptor`], [`validate_ioapic_descriptors`], and [`route_gsi`]:
+//!   validate non-overlapping controller ranges and choose the I/O APIC that
+//!   owns a GSI and its redirection pin.
+//! - [`RouteConfig`], [`route_config_for_legacy_irq`], and
+//!   [`entry_for_gsi`]: construct redirection entries for both legacy ISA
+//!   sources and arbitrary GSI routes.
 //!
 //! ## What does NOT live here
 //!
@@ -160,6 +161,34 @@ impl TriggerMode {
     /// Encode to a single bit.
     pub fn to_bit(self) -> bool {
         matches!(self, Self::Level)
+    }
+}
+
+/// Electrical/trigger configuration for one I/O-APIC input pin.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RouteConfig {
+    /// Active signal polarity.
+    pub polarity: PinPolarity,
+    /// Edge- or level-sensitive delivery.
+    pub trigger: TriggerMode,
+}
+
+impl RouteConfig {
+    /// ISA bus defaults for a legacy source without a MADT override.
+    pub const fn isa_default() -> Self {
+        Self {
+            polarity: PinPolarity::ActiveHigh,
+            trigger: TriggerMode::Edge,
+        }
+    }
+
+    /// PCI INTx defaults when no firmware `_PRT`/link information is
+    /// available: active-low, level-triggered.
+    pub const fn pci_intx_default() -> Self {
+        Self {
+            polarity: PinPolarity::ActiveLow,
+            trigger: TriggerMode::Level,
+        }
     }
 }
 
@@ -361,6 +390,23 @@ impl SourceOverride {
             _ => TriggerMode::Edge,
         }
     }
+
+    /// Decode the MADT flags while rejecting reserved encodings. `None` means
+    /// the firmware supplied polarity or trigger value `0b10`, which must not
+    /// be guessed when programming a live interrupt route.
+    pub fn config(&self) -> Option<RouteConfig> {
+        let polarity = match self.flags & 0b11 {
+            0b00 | 0b01 => PinPolarity::ActiveHigh,
+            0b11 => PinPolarity::ActiveLow,
+            _ => return None,
+        };
+        let trigger = match (self.flags >> 2) & 0b11 {
+            0b00 | 0b01 => TriggerMode::Edge,
+            0b11 => TriggerMode::Level,
+            _ => return None,
+        };
+        Some(RouteConfig { polarity, trigger })
+    }
 }
 
 /// Maximum source overrides retained by [`SourceOverrideTable`].
@@ -421,6 +467,34 @@ impl SourceOverrideTable {
         }
         None
     }
+
+    /// Look up the ISA source alias for a GSI, if firmware defines one.
+    pub fn find_gsi(&self, gsi: u32) -> Option<SourceOverride> {
+        for override_entry in self.iter() {
+            if override_entry.bus == 0 && override_entry.gsi == gsi {
+                return Some(*override_entry);
+            }
+        }
+        None
+    }
+
+    /// Resolve the electrical configuration for a legacy source, validating
+    /// reserved MADT encodings. Sources without an override use ISA defaults.
+    pub fn config_for_legacy_irq(&self, legacy_irq: u8) -> Option<RouteConfig> {
+        match self.find(legacy_irq) {
+            Some(override_entry) => override_entry.config(),
+            None => Some(RouteConfig::isa_default()),
+        }
+    }
+
+    /// Resolve a GSI's electrical configuration from an ISA source override.
+    /// Non-ISA GSIs have no configuration in MADT and must be configured by
+    /// their bus/device policy instead.
+    pub fn config_for_gsi(&self, gsi: u32) -> Option<RouteConfig> {
+        self.find_gsi(gsi)
+            .filter(|override_entry| override_entry.bus == 0)
+            .and_then(|override_entry| override_entry.config())
+    }
 }
 
 /// Parse MADT Interrupt Source Override (type 2) entries from a MADT byte
@@ -458,15 +532,27 @@ pub fn parse_source_overrides(table: &[u8]) -> Option<SourceOverrideTable> {
             return None;
         }
         let entry = table.get(cursor..next)?;
-        if entry_type == 2 && entry_len >= 10 && out.count < out.entries.len() {
-            let gsi = u32::from_le_bytes(entry.get(4..8)?.try_into().ok()?);
-            let flags = u16::from_le_bytes(entry.get(8..10)?.try_into().ok()?);
-            out.entries[out.count] = Some(SourceOverride {
+        if entry_type == 2 {
+            if entry_len < 10 || out.count == out.entries.len() {
+                return None;
+            }
+            let override_entry = SourceOverride {
                 bus: entry[2],
                 source: entry[3],
-                gsi,
-                flags,
-            });
+                gsi: u32::from_le_bytes(entry.get(4..8)?.try_into().ok()?),
+                flags: u16::from_le_bytes(entry.get(8..10)?.try_into().ok()?),
+            };
+            if override_entry.bus != 0
+                || override_entry.config().is_none()
+                || out.iter().any(|known| {
+                    known.bus == override_entry.bus
+                        && (known.source == override_entry.source
+                            || known.gsi == override_entry.gsi)
+                })
+            {
+                return None;
+            }
+            out.entries[out.count] = Some(override_entry);
             out.count += 1;
         }
         cursor = next;
@@ -478,13 +564,15 @@ pub fn parse_source_overrides(table: &[u8]) -> Option<SourceOverrideTable> {
 // Device-vector allocation
 // ---------------------------------------------------------------------------
 
-/// Lowest device-IRQ vector. Below this are the CPU exceptions (0x00-0x1F) and
-/// the LAPIC timer vector (0x20).
+/// First vector in the dynamically allocated I/O-APIC IRQ range. Vectors
+/// below this are exceptions, the LAPIC timer, or reserved compatibility
+/// vectors.
 pub const DEVICE_VECTOR_START: u8 = 0x30;
 
-/// Highest device-IRQ vector. Above this are the panic-stop (0xF1),
-/// shutdown-stop (0xF2) IPIs and the spurious vector (0xFF).
-pub const DEVICE_VECTOR_END: u8 = 0xEF;
+/// Last dynamically allocated I/O-APIC vector. `0xD0..=0xDF` is reserved for
+/// the statically installed NVMe MSI/MSI-X handlers; `0xF0..=0xF3` is reserved
+/// for scheduler, stop, and TLB-shootdown IPIs.
+pub const DEVICE_VECTOR_END: u8 = 0xCF;
 
 /// Whether `vector` is in the HuesOS external-device IRQ vector range.
 pub fn is_device_vector(vector: u8) -> bool {
@@ -506,7 +594,7 @@ pub struct VectorAllocator {
 impl VectorAllocator {
     /// An allocator over the inclusive range `[start, end]`. If `start > end`
     /// the range is empty and every allocation fails.
-    pub fn new(start: u8, end: u8) -> Self {
+    pub const fn new(start: u8, end: u8) -> Self {
         Self {
             used: [false; 256],
             start,
@@ -518,7 +606,7 @@ impl VectorAllocator {
 
     /// An allocator over the default device-IRQ range
     /// ([`DEVICE_VECTOR_START`], [`DEVICE_VECTOR_END`]).
-    pub fn device_default() -> Self {
+    pub const fn device_default() -> Self {
         Self::new(DEVICE_VECTOR_START, DEVICE_VECTOR_END)
     }
 
@@ -611,6 +699,55 @@ pub struct IoApicDescriptor {
     pub pin_count: u32,
 }
 
+/// Why a discovered I/O-APIC GSI range set is unsafe to route.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IoApicDescriptorError {
+    /// A discovered controller has no redirection entries.
+    EmptyRange,
+    /// `gsi_base + pin_count` extends beyond the GSI address space.
+    RangeOverflow,
+    /// Two records advertise the same controller ID.
+    DuplicateId,
+    /// Two controllers claim at least one common GSI.
+    OverlappingRanges,
+}
+
+/// Validate controller identifiers and the half-open GSI ranges reported by
+/// the hardware. The privileged driver calls this after reading each
+/// controller's redirection-table size and before accepting any route.
+pub fn validate_ioapic_descriptors(
+    io_apics: &[IoApicDescriptor],
+) -> Result<(), IoApicDescriptorError> {
+    let mut i = 0usize;
+    while i < io_apics.len() {
+        let current = io_apics[i];
+        if current.pin_count == 0 {
+            return Err(IoApicDescriptorError::EmptyRange);
+        }
+        let end = u64::from(current.gsi_base) + u64::from(current.pin_count);
+        if end > u64::from(u32::MAX) + 1 {
+            return Err(IoApicDescriptorError::RangeOverflow);
+        }
+        let mut j = i + 1;
+        while j < io_apics.len() {
+            let other = io_apics[j];
+            if current.id == other.id {
+                return Err(IoApicDescriptorError::DuplicateId);
+            }
+            let other_end = u64::from(other.gsi_base) + u64::from(other.pin_count);
+            if other.pin_count != 0
+                && u64::from(current.gsi_base) < other_end
+                && u64::from(other.gsi_base) < end
+            {
+                return Err(IoApicDescriptorError::OverlappingRanges);
+            }
+            j += 1;
+        }
+        i += 1;
+    }
+    Ok(())
+}
+
 /// Select the I/O APIC that owns `gsi` and the redirection index (pin) within
 /// it, returning `(ioapic_id, redirection_index)`.
 ///
@@ -622,7 +759,8 @@ pub fn route_gsi(io_apics: &[IoApicDescriptor], gsi: u32) -> Option<(u8, u32)> {
     for apic in io_apics {
         if apic.pin_count > 0 {
             known_pins = true;
-            if gsi >= apic.gsi_base && gsi < apic.gsi_base.saturating_add(apic.pin_count) {
+            let end = u64::from(apic.gsi_base) + u64::from(apic.pin_count);
+            if gsi >= apic.gsi_base && u64::from(gsi) < end {
                 return Some((apic.id, gsi - apic.gsi_base));
             }
         }
@@ -694,17 +832,36 @@ pub fn entry_for_legacy_irq(
 ) -> Option<(u32, RedirectionEntry)> {
     let destination = ioapic_physical_destination(destination_apic_id)?;
     let gsi = overrides.resolve_gsi(legacy_irq);
-    let (polarity, trigger) = match overrides.find(legacy_irq) {
-        Some(override_entry) => (override_entry.polarity(), override_entry.trigger()),
-        None => (PinPolarity::ActiveHigh, TriggerMode::Edge),
-    };
+    let config = overrides.config_for_legacy_irq(legacy_irq)?;
     let vector = allocate_device_vector(vectors)?;
     let entry = RedirectionEntry::masked()
         .with_vector(vector)
         .with_destination(destination)
-        .with_polarity(polarity)
-        .with_trigger(trigger);
+        .with_polarity(config.polarity)
+        .with_trigger(config.trigger);
     Some((gsi, entry))
+}
+
+/// Build a masked redirection entry for an arbitrary GSI using explicit
+/// electrical configuration and an already selected vector. This is the
+/// primitive used by PCI/ACPI interrupt routing; unlike
+/// [`entry_for_legacy_irq`], it never guesses how an un-described GSI is wired.
+pub fn entry_for_gsi(
+    config: RouteConfig,
+    vector: u8,
+    destination_apic_id: u32,
+) -> Option<RedirectionEntry> {
+    if !is_device_vector(vector) {
+        return None;
+    }
+    let destination = ioapic_physical_destination(destination_apic_id)?;
+    Some(
+        RedirectionEntry::masked()
+            .with_vector(vector)
+            .with_destination(destination)
+            .with_polarity(config.polarity)
+            .with_trigger(config.trigger),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -1001,6 +1158,49 @@ mod tests {
     }
 
     #[test]
+    fn rejects_reserved_override_flags_and_duplicate_sources() {
+        let invalid_flags = madt_with_iso(1, 1, 0b0010);
+        assert_eq!(parse_source_overrides(&invalid_flags), None);
+        let mut unsupported_bus = madt_with_iso(1, 1, 0);
+        unsupported_bus[46] = 1;
+        assert_eq!(parse_source_overrides(&unsupported_bus), None);
+
+        let mut duplicate = madt_with_iso(1, 1, 0);
+        duplicate.resize(64, 0);
+        duplicate[4..8].copy_from_slice(&64u32.to_le_bytes());
+        duplicate[54] = 2;
+        duplicate[55] = 10;
+        duplicate[56] = 0;
+        duplicate[57] = 1;
+        duplicate[58..62].copy_from_slice(&2u32.to_le_bytes());
+        duplicate[62..64].copy_from_slice(&0u16.to_le_bytes());
+        assert_eq!(parse_source_overrides(&duplicate), None);
+
+        duplicate[57] = 2;
+        duplicate[58..62].copy_from_slice(&1u32.to_le_bytes());
+        assert_eq!(parse_source_overrides(&duplicate), None);
+    }
+
+    #[test]
+    fn rejects_no_space_for_additional_source_overrides() {
+        let mut table = vec![0u8; 44 + 17 * 10];
+        table[..4].copy_from_slice(b"APIC");
+        let table_len = table.len() as u32;
+        table[4..8].copy_from_slice(&table_len.to_le_bytes());
+        table[36..40].copy_from_slice(&0xfee0_0000u32.to_le_bytes());
+        for index in 0..17 {
+            let at = 44 + index * 10;
+            table[at] = 2;
+            table[at + 1] = 10;
+            table[at + 2] = 0;
+            table[at + 3] = index as u8;
+            table[at + 4..at + 8].copy_from_slice(&(index as u32).to_le_bytes());
+            table[at + 8..at + 10].copy_from_slice(&0u16.to_le_bytes());
+        }
+        assert_eq!(parse_source_overrides(&table), None);
+    }
+
+    #[test]
     fn parses_no_overrides_as_empty_table() {
         // A MADT with a Local APIC entry (type 0), no ISOs.
         let mut table = vec![0u8; 52];
@@ -1049,7 +1249,7 @@ mod tests {
     #[test]
     fn default_range_capacity_and_bounds() {
         let alloc = VectorAllocator::device_default();
-        assert_eq!(alloc.capacity(), (0xEF - 0x30 + 1) as usize);
+        assert_eq!(alloc.capacity(), (0xCF - 0x30 + 1) as usize);
         assert_eq!(alloc.used_count(), 0);
         assert!(!is_device_vector(0x20));
         assert!(is_device_vector(DEVICE_VECTOR_START));
@@ -1133,7 +1333,74 @@ mod tests {
         assert_eq!(alloc.used_count(), 0);
     }
 
-    // --- route_gsi ---
+    // --- controller-range validation and GSI selection ---
+
+    #[test]
+    fn accepts_adjacent_non_overlapping_ioapic_ranges() {
+        let apics = [
+            IoApicDescriptor {
+                id: 0,
+                gsi_base: 0,
+                pin_count: 24,
+            },
+            IoApicDescriptor {
+                id: 1,
+                gsi_base: 24,
+                pin_count: 24,
+            },
+        ];
+        assert_eq!(validate_ioapic_descriptors(&apics), Ok(()));
+    }
+
+    #[test]
+    fn rejects_empty_overlapping_duplicate_and_overflow_ranges() {
+        assert_eq!(
+            validate_ioapic_descriptors(&[IoApicDescriptor {
+                id: 0,
+                gsi_base: 0,
+                pin_count: 0,
+            }]),
+            Err(IoApicDescriptorError::EmptyRange)
+        );
+        assert_eq!(
+            validate_ioapic_descriptors(&[
+                IoApicDescriptor {
+                    id: 0,
+                    gsi_base: 0,
+                    pin_count: 24,
+                },
+                IoApicDescriptor {
+                    id: 1,
+                    gsi_base: 23,
+                    pin_count: 24,
+                },
+            ]),
+            Err(IoApicDescriptorError::OverlappingRanges)
+        );
+        assert_eq!(
+            validate_ioapic_descriptors(&[
+                IoApicDescriptor {
+                    id: 7,
+                    gsi_base: 0,
+                    pin_count: 24,
+                },
+                IoApicDescriptor {
+                    id: 7,
+                    gsi_base: 24,
+                    pin_count: 24,
+                },
+            ]),
+            Err(IoApicDescriptorError::DuplicateId)
+        );
+        assert_eq!(
+            validate_ioapic_descriptors(&[IoApicDescriptor {
+                id: 0,
+                gsi_base: u32::MAX,
+                pin_count: 2,
+            }]),
+            Err(IoApicDescriptorError::RangeOverflow)
+        );
+    }
 
     #[test]
     fn route_gsi_by_explicit_range() {
@@ -1252,6 +1519,34 @@ mod tests {
         // Range now exhausted.
         let second = entry_for_legacy_irq(2, &overrides, &mut vectors, 0x00);
         assert_eq!(second, None);
+    }
+
+    #[test]
+    fn arbitrary_gsi_entry_uses_explicit_pci_intx_configuration() {
+        let entry = entry_for_gsi(RouteConfig::pci_intx_default(), 0x42, 3);
+        assert!(entry.is_some(), "valid GSI route should build");
+        if let Some(entry) = entry {
+            assert_eq!(entry.vector, 0x42);
+            assert_eq!(entry.destination, 3);
+            assert_eq!(entry.pin_polarity, PinPolarity::ActiveLow);
+            assert_eq!(entry.trigger_mode, TriggerMode::Level);
+            assert!(entry.masked);
+        }
+        assert_eq!(entry_for_gsi(RouteConfig::isa_default(), 0xD0, 0), None);
+        assert_eq!(entry_for_gsi(RouteConfig::isa_default(), 0x42, 256), None);
+    }
+
+    #[test]
+    fn invalid_reserved_override_flags_refuse_a_legacy_route() {
+        let overrides = table_with(&[SourceOverride {
+            bus: 0,
+            source: 5,
+            gsi: 5,
+            flags: 0b0010,
+        }]);
+        let mut vectors = VectorAllocator::new(0x40, 0x40);
+        assert_eq!(entry_for_legacy_irq(5, &overrides, &mut vectors, 0), None);
+        assert_eq!(vectors.used_count(), 0);
     }
 
     #[test]

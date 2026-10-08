@@ -148,6 +148,12 @@ pub fn dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> Syscal
             a2 as u32,
             a3 as *mut HandleValue,
         ),
+        S::InterruptCreateGsiForResource => port_interrupt::sys_interrupt_create_gsi_for_resource(
+            a1 as HandleValue,
+            a2 as u32,
+            a3 as *mut HandleValue,
+        ),
+        S::InterruptAcknowledge => port_interrupt::sys_interrupt_acknowledge(a1 as HandleValue),
         S::InterruptBindPort => {
             port_interrupt::sys_interrupt_bind_port(a1 as HandleValue, a2 as HandleValue, a3)
         }

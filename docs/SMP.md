@@ -89,7 +89,9 @@ qemu-system-x86_64 ... -smp 2 -serial stdio -d int,cpu_reset -D qemu.log
 
 ## What is not done yet
 
-- IOAPIC / full IRQ affinity
+- Userspace IRQ-affinity syscall/API and non-keyboard raw-GSI plus level
+  ACK/re-enable validation (QEMU currently covers actual keyboard edge delivery;
+  the architecture route manager's affinity operation is implemented)
 - Work-stealing / fair migration heuristics
 - Per-AP PIT-free high-precision timer calibration refinements
 - Unparking APs for dedicated IRQ threads

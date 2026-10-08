@@ -58,6 +58,23 @@ pub fn bringup_aps(madt_bytes: &[u8], hhdm_offset: u64) {
                     "unsupported APIC destination"
                 }
                 huesos_arch::ioapic::IoApicError::Verification => "readback mismatch",
+                huesos_arch::ioapic::IoApicError::TooManyControllers => "controller limit exceeded",
+                huesos_arch::ioapic::IoApicError::InvalidControllerRange => {
+                    "invalid or overlapping GSI ranges"
+                }
+                huesos_arch::ioapic::IoApicError::InvalidOverrideFlags => {
+                    "reserved source-override flags"
+                }
+                huesos_arch::ioapic::IoApicError::NoVector => "no free interrupt vector",
+                huesos_arch::ioapic::IoApicError::AlreadyInitialized => "already initialized",
+                huesos_arch::ioapic::IoApicError::NotInitialized => "not initialized",
+                huesos_arch::ioapic::IoApicError::RouteConflict => "route conflict",
+                huesos_arch::ioapic::IoApicError::RouteNotFound => "route not found",
+                huesos_arch::ioapic::IoApicError::Busy => "level route still in service",
+                huesos_arch::ioapic::IoApicError::DestinationOffline => "destination CPU offline",
+                huesos_arch::ioapic::IoApicError::InvalidSourceOverrideGsi => {
+                    "MADT override GSI has no owning controller pin"
+                }
             });
             log_line("\n");
         }

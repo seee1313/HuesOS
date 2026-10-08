@@ -44,7 +44,11 @@ pub use channel::{
     ChannelSendFailure, CHANNEL_INLINE_BYTES, CHANNEL_INLINE_HANDLES,
 };
 pub use handle::{Handle, HandleTable, HandleTableError, HandleValue, Rights, INVALID_HANDLE};
-pub use interrupt::{Interrupt, InterruptBinding};
+pub use interrupt::{
+    set_interrupt_route_hooks, Interrupt, InterruptBindError, InterruptBinding,
+    InterruptRouteAcknowledgeFn, InterruptRouteAcquireFn, InterruptRouteKind,
+    InterruptRouteReleaseFn,
+};
 pub use job::{flush_pending_quota_notifications, Job};
 pub use koid::{alloc_koid, Koid};
 pub use object::{KernelObject, KernelObjectExt, ObjectType};
@@ -356,7 +360,7 @@ mod tests {
         register_object(port.clone());
 
         let interrupt = Interrupt::new(1);
-        interrupt.bind_port(port.clone(), 0xabc);
+        assert!(interrupt.bind_port(port.clone(), 0xabc).is_ok());
         interrupt.signal(1, 0x1e);
 
         let Some(packet) = port.read() else {
@@ -371,6 +375,63 @@ mod tests {
         assert_eq!(packet.data[2], 1);
 
         unregister_object(port_koid);
+    }
+
+    static ROUTE_ACK_COUNT: AtomicU64 = AtomicU64::new(0);
+
+    fn test_route_acquire(_: InterruptRouteKind, _: u32) -> Option<bool> {
+        Some(true)
+    }
+
+    fn test_route_acknowledge(_: InterruptRouteKind, _: u32) -> bool {
+        ROUTE_ACK_COUNT.fetch_add(1, Ordering::SeqCst);
+        true
+    }
+
+    fn test_route_release(_: InterruptRouteKind, _: u32) {}
+
+    #[test]
+    fn irq_registry_keeps_gsi_and_vector_namespaces_separate() {
+        let legacy_or_vector = Interrupt::new(0xD1);
+        let raw_gsi = Interrupt::new_gsi(0xD1);
+        let legacy_koid = legacy_or_vector.koid();
+        let gsi_koid = raw_gsi.koid();
+        register_interrupt(legacy_or_vector.clone());
+        register_interrupt(raw_gsi.clone());
+
+        let legacy_listeners = lookup_interrupts_by_irq(InterruptRouteKind::LegacyOrVector, 0xD1);
+        let gsi_listeners = lookup_interrupts_by_irq(InterruptRouteKind::Gsi, 0xD1);
+        assert_eq!(legacy_listeners.len(), 1);
+        assert_eq!(gsi_listeners.len(), 1);
+        assert_eq!(legacy_listeners[0].koid(), legacy_koid);
+        assert_eq!(gsi_listeners[0].koid(), gsi_koid);
+
+        unregister_object(legacy_koid);
+        unregister_object(gsi_koid);
+    }
+
+    #[test]
+    fn level_interrupt_acknowledges_only_queued_events() {
+        set_interrupt_route_hooks(
+            test_route_acquire,
+            test_route_acknowledge,
+            test_route_release,
+        );
+        let port = match Port::new() {
+            Ok(port) => port,
+            Err(_) => return,
+        };
+        let interrupt = Interrupt::new_gsi(0x1234);
+        assert!(interrupt.bind_port(port.clone(), 0x44).is_ok());
+        interrupt.signal(1, 0);
+        assert!(port.read().is_some());
+
+        ROUTE_ACK_COUNT.store(0, Ordering::SeqCst);
+        assert!(interrupt.acknowledge().is_ok());
+        assert!(interrupt.acknowledge().is_ok());
+        assert_eq!(ROUTE_ACK_COUNT.load(Ordering::SeqCst), 1);
+        assert_eq!(interrupt.route_kind(), InterruptRouteKind::Gsi);
+        assert_eq!(interrupt.irq(), 0x1234);
     }
 
     #[test]

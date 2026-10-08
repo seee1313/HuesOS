@@ -169,6 +169,19 @@ PMM: ... frames (... MiB)
 Single-core (`-smp 1`) still works: MADT reports 1 CPU, no AP boot lines,
 same userspace pipeline.
 
+### IOAPIC live keyboard delivery
+
+```bash
+bash scripts/ci-qemu-ioapic-delivery.sh debug 2 120
+```
+
+The test boots q35/UEFI with SMP2, waits for the input DriverHost to bind its
+keyboard Port, injects the `a` key through QMP, and requires the PS/2 make code
+`0x1e` to be read from an IRQ packet in userspace. This validates the physical
+keyboard edge route through the IOAPIC, IDT, kernel IRQ bridge, Port, and
+DriverHost; it is not a test of arbitrary PCI GSI delivery or level-triggered
+ACK/re-enable. Use `release` as the first argument to exercise a release image.
+
 ### Failure signals
 
 | Symptom | Likely area |
@@ -428,7 +441,8 @@ not a spec:
 | Job | What it runs |
 |-----|--------------|
 | `static-safety` | `make audit-check`, Clippy, the ordinary host suite, and `make test-hxfs-features` for the combined encryption + compression + Hxblob storage build |
-| `qemu-boot` | boot smoke, 1 and 2 CPUs |
+| `qemu-boot` | boot smoke across SMP 1/2/4/8 |
+| `qemu-ioapic-live` | QMP-injected PS/2 edge IRQ reaches a userspace Port on SMP2 |
 | `qemu-acpi-restart` | AP-6 pre-ready failure, retained capabilities, frozen restart, generation-two readiness |
 | `qemu-nvme-boot` | base NVMe soak, mode 0 |
 | `qemu-nvme-gcm-inject` | mode 1 |
