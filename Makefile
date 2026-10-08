@@ -41,7 +41,7 @@ test:
 	# The 16 MiB host test mounts a writer with an 8192-extent fixed
 	# array on the stack; the default test-thread stack overflows
 	# when the hxblob index field is also present. 16 MiB is enough.
-	RUST_MIN_STACK=16777216 cargo test -p huesos-abi -p huesos-arch -p huesos-elf -p huesos-pmm -p huesos-object -p huesos-fb \
+	RUST_MIN_STACK=16777216 cargo test -p huesos-abi -p huesos-arch -p huesos-sync -p huesos-elf -p huesos-pmm -p huesos-object -p huesos-fb \
 		-p huesos-syscalls -p huesos-fat -p huesos-alloc -p huesos-uacpi -p huesos-kernel \
 		-p huesos-scudo \
 		-p huesos-scudo-fuzz \
