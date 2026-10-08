@@ -30,6 +30,7 @@ members = [
     "crates/huesos-pci",
     "crates/huesos-quota",
     "crates/huesos-sched",
+    "crates/huesos-sync",
     "crates/huesos-tpm",
     "crates/huesos-bootux",
 ]

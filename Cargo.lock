@@ -253,6 +253,7 @@ dependencies = [
  "huesos-ioapic",
  "huesos-pmm",
  "huesos-sched",
+ "huesos-sync",
  "log",
  "pic8259",
  "spin",
@@ -440,6 +441,10 @@ version = "0.1.0"
 dependencies = [
  "huesos-scudo",
 ]
+
+[[package]]
+name = "huesos-sync"
+version = "0.1.0"
 
 [[package]]
 name = "huesos-syscalls"
