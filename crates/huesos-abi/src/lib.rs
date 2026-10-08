@@ -106,6 +106,13 @@ pub mod hbi_boot {
 /// and exercised directly by host tests.
 pub mod broker_policy;
 
+/// Generic Address Structure (GAS) decoding for ACPI register blocks.
+///
+/// Turns the packed 12-byte firmware layout from FADT/AML into a typed view
+/// so the Ring-3 broker can route a register to the correct capability class
+/// (SystemIO vs SystemMemory vs PCI config) without firmware tables present.
+pub mod gas;
+
 /// Syscall number enumeration. The numeric value (not the variant name) is
 /// what actually crosses the ABI boundary in `rax`, so **never remove or
 /// reorder a variant** — only ever append new ones. Removing a syscall
