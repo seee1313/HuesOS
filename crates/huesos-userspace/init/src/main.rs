@@ -147,7 +147,7 @@ pub extern "C" fn _start() -> ! {
     ui.step(b"selftest", 37);
     run_smp_affinity_check(&mut logger);
     ui.step(b"selftest", 50);
-    run_process_wait_check(&mut logger);
+    run_process_wait_stress(&mut logger);
     ui.step(b"selftest", 62);
     run_waitset_check(&mut logger);
     ui.step(b"selftest", 75);
@@ -1578,6 +1578,88 @@ fn wait_process_exit(process: &Process) -> libcanvas::Result<i64> {
         libcanvas::process::yield_now();
     }
     Err(ErrorCode::TimedOut)
+}
+
+/// Number of blocking `ProcessWait` wakes the self-test drives.
+///
+/// 32 is the ordinary smoke; CI sets `HUESOS_LIFECYCLE_WAIT_STRESS=256` for
+/// the soak matrix. The value is baked in at build time by the kernel crate.
+fn lifecycle_wait_iterations() -> usize {
+    match option_env!("HUESOS_LIFECYCLE_WAIT_STRESS") {
+        Some("256") => 256,
+        _ => 32,
+    }
+}
+
+/// Drive the blocking `ProcessWait` path repeatedly.
+///
+/// Each iteration spawns a probe child that yields before exiting, so the
+/// kernel must exercise wait registration, scheduler park/wake, lifecycle
+/// publication and exit-code delivery every single time. A single pass
+/// (run_process_wait_check) proves the path works; this proves it keeps
+/// working under repetition, which is where stale-generation and
+/// reaper-timing bugs surface.
+fn run_process_wait_stress(logger: &mut InitLogger) {
+    let iterations = lifecycle_wait_iterations();
+    for index in 0..iterations {
+        let Ok((process, bootstrap)) = libcanvas::process::spawn_elf("wait-probe", FAULT_PROBE_ELF)
+        else {
+            init_logln!(
+                logger,
+                "[init] ProcessWait lifecycle FAILED (launch at {})",
+                index
+            );
+            return;
+        };
+        if bootstrap.write(b"wait").is_err() {
+            init_logln!(
+                logger,
+                "[init] ProcessWait lifecycle FAILED (command at {})",
+                index
+            );
+            return;
+        }
+        drop(bootstrap);
+        // The child yields before exit, so this must exercise wait registration,
+        // scheduler park/wake, lifecycle publication, and exit-code delivery.
+        match process.wait_exit() {
+            Ok(0) => {
+                if (index + 1) % 32 == 0 && index + 1 != iterations {
+                    init_logln!(
+                        logger,
+                        "[init] ProcessWait lifecycle progress {}/{}",
+                        index + 1,
+                        iterations
+                    );
+                }
+            }
+            Ok(code) => {
+                init_logln!(
+                    logger,
+                    "[init] ProcessWait lifecycle FAILED (exit {} at {})",
+                    code,
+                    index
+                );
+                return;
+            }
+            Err(error) => {
+                init_logln!(
+                    logger,
+                    "[init] ProcessWait lifecycle FAILED ({} at {})",
+                    error.as_str(),
+                    index
+                );
+                return;
+            }
+        }
+    }
+    let mode = if iterations == 256 { "soak" } else { "smoke" };
+    init_logln!(
+        logger,
+        "[init] ProcessWait lifecycle {} OK ({} blocked wakes)",
+        mode,
+        iterations
+    );
 }
 
 fn run_process_wait_check(logger: &mut InitLogger) {

@@ -58,6 +58,7 @@ for marker in \
     '[init] VMO read/write round-trip OK' \
     '[init] channel IPC round-trip OK' \
     '[init] monotonic clock OK' \
+    '[init] ProcessWait lifecycle smoke OK (32 blocked wakes)' \
     '[init] waitset self-test OK' \
     '[key-broker] kernel key moved; state=plain-only' \
     '[init] delegated unique KeyBroker authority to DriverManager' \
