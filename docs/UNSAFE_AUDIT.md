@@ -3077,3 +3077,19 @@ commit (the `8ceeade` convention).
 - `make build` (x86_64-huesos target, kernel + embedded userspace ELFs): clean.
 - QEMU smoke: `bash scripts/ci-qemu-smoke.sh debug 2 120` — see the commit's
   verification note for the observed serial markers.
+
+### Typed user-copy validity and output padding
+
+The syscall typed-copy helpers now require the module-private, sealed
+`UserRecord` allowlist. Primitive implementations accept every initialized bit
+pattern; exhaustive record patterns and `encode_field<T: UserRecord>` admit
+only those fields. Fixed x86-64 size/alignment/offset assertions prevent silent
+ABI drift. `assume_init` remains after the complete recoverable copy succeeds;
+a partial fault returns before constructing a value.
+
+Typed output copies no longer view Rust records (including implicit padding)
+as byte slices. Fields are encoded into initialized zeroed stack storage, then
+copied with the existing extable routine and process memory lock. This removes
+uninitialized-padding reads from typed output while preserving ABI stride.
+No new unsafe implementation, block or function is introduced. The allowlist
+must stay private; any new record requires field-validity and layout review.

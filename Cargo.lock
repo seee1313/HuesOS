@@ -462,6 +462,7 @@ dependencies = [
  "huesos-waitset",
  "log",
  "spin",
+ "static_assertions",
  "x86_64",
 ]
 

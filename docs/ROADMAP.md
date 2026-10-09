@@ -21,6 +21,14 @@ gates close.
 
 ## Done (recent)
 
+### Typed syscall record hardening
+- Replace the internal Copy-only typed-copy contract with a sealed audited
+  record allowlist; encode output fields with zero padding instead of reading
+  potentially uninitialized C-layout padding.
+- Verification is recorded in the corresponding change's commit/PR; this entry
+  does not assert bare-metal verification.
+
+
 ### Panic-free EEVDF tree: `?`-threaded internals, `huesos-sched` tests unwrap-free
 - `crates/huesos-sched/src/eevdf.rs` no longer panics: every internal
   operation threads `Result<(), EevdfTreeError>` (new `InvariantBroken`

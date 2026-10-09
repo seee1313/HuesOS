@@ -150,3 +150,15 @@ This layer does not replace the remaining architectural work:
 Already landed: CPL3 fault isolation, recoverable extable copies,
 `VmarUnmap`/`VmarProtect` locking and QEMU probes for unmapped, read-only and
 kernel-half pointers.
+
+## Typed record allowlist
+
+Typed reads require the private sealed `UserRecord` contract, not merely `Copy`.
+Only integers, raw pointers, arrays of approved fields, and explicitly audited
+ABI records are admitted. Exhaustive field patterns force review when a record
+changes. Enums, booleans, references and arbitrary caller-defined records are
+not admitted. Output records are encoded field by field into initialized zeroed
+bytes: implicit C-layout padding is never read from a Rust value or disclosed.
+Layout, field offsets, and syscall numbers are unchanged. Typed output staging
+uses bounded stack buffers (128 bytes per value, 256 bytes per output array),
+covering all current call sites without new allocations or `NoMemory` paths.

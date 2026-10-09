@@ -39,6 +39,7 @@ mod system;
 /// into user_access.
 pub mod user_access;
 mod user_memory;
+mod user_record;
 mod util;
 mod vmo;
 mod waitset;
