@@ -141,7 +141,8 @@ libcanvas diagnostics module.
 
 This layer does not replace the remaining architectural work:
 
-- enable SMEP and SMAP with explicit access windows on every CPU;
+- validate SMEP/SMAP on supporting physical CPUs; CPUID-gated enablement
+  and explicit user-access windows already exist, with degraded-mode reporting;
 - add coverage-guided syscall pointer/length fuzzing beyond the current
   deterministic and QEMU adversarial matrix;
 - add a real cross-CPU mapping-mutation race probe once intra-process threads

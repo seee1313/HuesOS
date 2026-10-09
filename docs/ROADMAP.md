@@ -5,10 +5,11 @@ scheduler → ring3 → syscalls → VMO/Channel IPC) is working and verified in
 QEMU (`-smp 1` and `-smp 2`). This roadmap covers what's next, roughly in
 priority order.
 
-Storage/NVMe/Hxfs production planning is tracked in the dedicated
-[Storage / NVMe / FS Roadmap](STORAGE_NVME_FS_ROADMAP_v1.md). The current storage
-state is a strong foundation through Hxfs Stage I, not yet full production
-mutable Hxfs.
+Current status and evidence boundaries are summarized in [STATUS.md](STATUS.md).
+Storage work is tracked in [PRODUCTION_ROADMAP.md](PRODUCTION_ROADMAP.md) and
+release approval in [STORAGE_PRODUCTION_GATE.md](STORAGE_PRODUCTION_GATE.md).
+The [v1 storage roadmap](STORAGE_NVME_FS_ROADMAP_v1.md) is archived history.
+Mutable HxFS exists, but storage remains not production-ready/not format-frozen.
 
 PCI/PCIe modernization is tracked in
 [PCI Manager Architecture](PCI_MANAGER_ARCHITECTURE.md), the isolated
@@ -259,7 +260,9 @@ gates close.
 - Per-CPU GDT/TSS/IDT, `CpuLocal` via `GS_BASE`, per-CPU scheduler + idle
 - Shared LAPIC timer calibration (BSP vs PIT); APs reuse the count
 - LAPIC EOI on vector 0x20; PIC EOI retained for keyboard path
-- Online-CPU load balancing; IPI reschedule on remote spawn
+- Historical MVP balancing/remote spawn milestone; current owner-local,
+  token-mediated placement has no global automatic load-average balancer
+  (see [ARCHITECTURE.md](ARCHITECTURE.md)).
 - Per-CPU STAR/LSTAR/SFMASK (user tasks may run on APs without `#UD`)
 - HHDM base-rev-3 fixes: map ACPI tables; identity-map low trampoline
   pages; LAPIC MMIO mapped uncached

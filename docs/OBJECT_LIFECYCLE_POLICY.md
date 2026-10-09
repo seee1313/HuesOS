@@ -74,12 +74,14 @@ The kernel uses the policy in the following bounded, reviewable ways:
    `record_exit_with_generation`. The graveyard never invents a second
    identity for a lifecycle-managed exit, and the kernel accounts the policy's
    `Evicted` outcome when the bounded FIFO overwrites an old record.
-3. Deferred reaping asks the typed `Process` object whether the stored
-   generation has been observed and reaps records whose process object is gone.
-   The FIFO bound remains the safety net for unobserved exits.
-4. `RefAccount` remains a reference model for the registry's collection path;
-   it documents and host-tests the accounting invariants rather than running in
-   the hot path.
+3. Deferred reaping queries the typed `Process` object's exit generation and
+   also reaps records whose process object is gone. Despite the method name,
+   `observed_exit_generation` currently checks that matching exit identity is
+   published, not that a caller successfully copied it to userspace. The FIFO
+   bound still limits retained records; it is not an acknowledgement protocol.
+4. The registry uses `RefAccount` directly for handle/kernel-reference
+   accounting and the collection decision. Host tests exercise the same policy
+   implementation; physical lifetime still depends on actual Arc owners.
 
 ## What still requires on-target verification
 

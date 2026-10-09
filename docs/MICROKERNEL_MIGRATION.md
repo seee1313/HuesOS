@@ -1,5 +1,9 @@
 # HuesOS microkernel migration plan
 
+> Historical migration decisions; the bullets preserve the original sequence
+> and superseded choices. They are not a current NotSupported/feature list.
+> See [STATUS.md](STATUS.md) and [DYNAMIC_PROCESSES.md](DYNAMIC_PROCESSES.md).
+
 This file records the user-approved direction for the driver/userspace
 migration so implementation work stays explicit and reviewable.
 

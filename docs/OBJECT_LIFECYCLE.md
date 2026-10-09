@@ -101,9 +101,12 @@ processes while monitoring free-frame and object counts.
 ## Remaining work
 
 - Add public diagnostic counters for QEMU/bare-metal soak tests.
-- Make VMAR page-table mutation and mapping-reference recording one rollback-
-  capable transaction.
-- Reclaim finished Task metadata, not only stacks.
+- Extend fault/soak evidence for the existing transactional VMAR mapping path
+  ([VMAR_TRANSACTIONS.md](VMAR_TRANSACTIONS.md)); it is not merely planned.
+- Verify finished Task slot recycling and bounded exit metadata under long SMP
+  churn; implementation uses generation-bearing identities rather than keeping
+  every task tombstone forever.
 - Replace remaining object-specific explicit unregister calls with typed RAII
   ownership where practical.
-- Add per-Job handle/memory quotas to bound intentional retention.
+- Complete per-handle/page-table hard accounting; hierarchical Job/VMO memory
+  and CPU tick accounting already exist ([QUOTAS.md](QUOTAS.md)).

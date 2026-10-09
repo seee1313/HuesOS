@@ -10,17 +10,20 @@ exercise VMOs and Channel IPC — including multi-core bring-up under QEMU
 
 ## Status: MVP + SMP
 
+Current implementation/evidence map: [docs/STATUS.md](docs/STATUS.md).
+Reading order: [docs/INDEX.md](docs/INDEX.md). Workflow definitions and historical
+roadmap checkmarks are not substitutes for results on a specific commit.
+
 This is still a minimum viable microkernel, not a production OS. It proves
 out the full pipeline end-to-end with no stubs in the paths it exercises.
-SMP (INIT-SIPI-SIPI, per-CPU GDT/TSS/IDT/scheduler, LAPIC timer, load
-balance) is now verified in QEMU. Scope remains intentionally narrow —
+SMP (INIT-SIPI-SIPI, per-CPU GDT/TSS/IDT/scheduler and LAPIC timer) is now verified in QEMU. Scope remains intentionally narrow —
 see [Known Limitations](#known-limitations) and
 [docs/ROADMAP.md](docs/ROADMAP.md) for what's next.
 
 ## Verified Working
 
 - ✅ UEFI boot via Limine (protocol 0.6.5, **base revision 3**)
-- ✅ **HBI v2.1** boot image packaging (`tools/hbi-gen` + `scripts/mkhbi.sh`)
+- ✅ **signed HBI v2.2** boot image packaging (`tools/hbi-gen` + `scripts/mkhbi.sh`)
   loaded as a Limine module; kernel parser in `huesos-kernel::boot::hbi`
 - ✅ Physical memory manager: bitmap frame allocator over the real Limine
   memory map (not a hardcoded range); HBI image protected via `reserve_range`
@@ -41,8 +44,8 @@ see [Known Limitations](#known-limitations) and
   (white diagnostics on a red framebuffer plus emergency serial output)
 - ✅ **SMP**: MADT parse, INIT-SIPI-SIPI, per-CPU GDT/TSS/IDT/CpuLocal
   (GS_BASE), per-CPU scheduler with idle task, shared LAPIC timer
-  calibration, LAPIC EOI on vector 0x20, online-CPU load balancing, IPI
-  reschedule on remote spawn
+  calibration, LAPIC EOI on vector 0x20, online-CPU placement and token-mediated remote operations; no global
+  load-average-based automatic balancing
 - ✅ Scheduler: Fair (CFS-like WAVL-tree) + Deadline (EDF) policies, not
   just plain round-robin
 - ✅ Buddy + slab kernel heap (`huesos-alloc`, 64 MiB heap, `page_size`-aware)
@@ -93,7 +96,7 @@ FileSystemService, and monitors heartbeats. The terminal paints via
 [SMP] AP 1 online (waiting for release)
 [SMP] AP 1 ready
 [SMP] bringup done, APs ready=1
-HBI v2.1 parsed. Entries: 0x4
+[HBI] Ed25519 signature verified (v2.2)
 [SMP] APs released to run
 [SMP] AP 1 scheduling
 HuesOS v0.1.0 on CPU 0
@@ -107,21 +110,27 @@ Default `scripts/run.sh` uses `-smp 2`.
 
 ## Known Limitations
 
-- The multi-controller IOAPIC route manager, dynamic external-vector IDT stubs, capability-authorized IRQ/GSI objects, and level-route acknowledgement path are implemented. A QEMU SMP2 QMP test injects a PS/2 key and confirms its IRQ packet reaches the userspace Port; non-keyboard raw-GSI delivery, level ACK/re-enable, and real-hardware integration validation remain.
+- The multi-controller IOAPIC route manager, dynamic external-vector IDT stubs, capability-authorized IRQ/GSI objects, and level-route acknowledgement path are implemented. A QEMU SMP2 QMP test injects a PS/2 key and confirms its IRQ packet reaches the userspace Port; a separate QEMU edu probe covers kernel-Port raw-GSI delivery and level
+  ACK/re-enable. The corresponding ring3 syscall path and physical validation
+  remain separate; see [docs/IOAPIC_ROUTING.md](docs/IOAPIC_ROUTING.md).
 - NVMe + HxFS v6 works end-to-end in QEMU, including journal replay,
   corruption injection and power-fail recovery; bare-metal storage support is
   still experimental and first boots must use `STORAGE_OFF=1`
-- Exited-process address spaces and kernel stacks are reaped, but finished task
-  metadata is retained and the global object registry still needs a complete
-  strong/weak-reference lifecycle (ordinary last-handle close does not yet
-  unregister every object)
+- Registry collection now uses handle and kernel-reference accounts; deferred
+  teardown releases address spaces/stacks and recycles generation-bearing task
+  slots. Bounded exit records remain for observation. Long-running resource
+  baseline return and concurrent cancellation still require dedicated stress
+  evidence. The current reaper-style slot reuse also has a known pending-operation
+  carry-over gap; see [docs/TASK_GENERATIONS.md](docs/TASK_GENERATIONS.md) and
+  [docs/OBJECT_LIFECYCLE.md](docs/OBJECT_LIFECYCLE.md)
 - Dynamic process launch and blocking `ProcessWait` work; multi-object wait
   (`WaitSetWait` syscall + `libcanvas::wait_any` / `wait_all`) is landed,
   but supervision and cancellation remain MVP-level
 - No dynamic loading / relocations (static ELF only)
-- Capability rights are enforced on current handle syscalls; VMO memory and
-  bounded IPC queue quotas are active, but handle/CPU/page-table accounting
-  and user-visible Job quota controls are not yet complete
+- Capability rights and public Job quota controls are implemented; VMO memory,
+  CPU ticks and bounded IPC queues have active accounting. Per-handle hard caps
+  and page-table metadata accounting remain incomplete; see
+  [docs/QUOTAS.md](docs/QUOTAS.md)
 - Framebuffer text is ASCII-only (no Unicode shaping, by design)
 
 > Note: the I/O APIC policy core is integrated into the kernel's route manager
@@ -261,7 +270,7 @@ HuesOS/
 │       └── ...            # driver hosts / terminal
 ├── scripts/               # QEMU runner, ISO builder, HBI packager, Limine config
 ├── tools/
-│   ├── hbi-gen            # HBI v2.1 image generator
+│   ├── hbi-gen            # Signed HBI v2.2 image generator
 │   └── fontgen/           # 8x8 bitmap font generator
 ├── third_party/           # Vendored Limine + OVMF binaries
 ├── docs/                  # Documentation
@@ -274,10 +283,11 @@ the privileged kernel paths as part of the ongoing hardening effort (see
 [docs/ROADMAP.md](docs/ROADMAP.md)). They are `no_std`, dependency-free, and
 unit-tested on the host. Integration status differs per crate: `huesos-quota`'s
 bounded Channel/Port queue admission and VMO memory accounting are already
-active in the kernel (see [docs/QUOTAS.md](docs/QUOTAS.md)), while the other
-Policy crates remain host-only decision models pending on-target wiring. Each
-one's `docs/` page describes its intended privileged integration and what
-still requires on-target (QEMU/bare-metal) verification.
+active in the kernel (see [docs/QUOTAS.md](docs/QUOTAS.md)), while lifecycle/reference accounting, process lifecycle, handle-transfer
+validation, recoverable copies, multi-object waits and IOAPIC routing also have
+integrated paths. Integration depth and test scope differ: consult
+[docs/STATUS.md](docs/STATUS.md) and each subsystem document rather than treating
+all policy crates as host-only or fully verified.
 
 The `huesos-pci`, `huesos-nvme`, and `hues-async` crates are new hardware and
 runtime infrastructure (not policy models): `huesos-pci` is a host-tested

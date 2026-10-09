@@ -1,5 +1,10 @@
 # HuesOS Architectural Weaknesses Analysis
 
+> Historical analysis, not a current defect inventory. Several observations
+> (including DMA allocation, NVMe completion wiring and launch architecture)
+> have subsequent changes. Compare [../STATUS.md](../STATUS.md), subsystem
+> contracts and current code before treating a recommendation as still open.
+
 **Status: Analysis complete. Recommendations prioritized by impact.**
 
 ## Executive Summary

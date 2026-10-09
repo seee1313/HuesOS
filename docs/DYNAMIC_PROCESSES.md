@@ -1,8 +1,10 @@
 # Dynamic Processes: Process Lifecycle Policy (`huesos-proclife`)
 
-Status: **policy + host tests landed; the kernel Process object now owns the
-policy state machine and `ProcessWait` accounts waiters. Full graveyard/reap
-integration and on-target lifecycle stress remain.**
+Status: **ProcessLifecycle and waiter accounting are integrated in Process;
+exit ports, bounded graveyard recording and deferred teardown are wired.**
+Default QEMU boot has a 32-exit probe. Concurrent cancellation, full resource
+baseline return and longer reaper/identity stress remain separate evidence.
+See [STATUS.md](STATUS.md) and [TESTING.md](TESTING.md).
 
 This document describes the host-testable crate `huesos-proclife` and how it is
 intended to plug into the kernel. It supports
@@ -13,9 +15,9 @@ signals for exit, teardown/reaping).
 ## Scope
 
 An MVP split launch already exists (`ProcessCreate`, `VmarMap`, `ThreadCreate`,
-`ThreadStart`, and `libcanvas::process::spawn_elf`). The remaining work is the
-lifecycle *around* that path: observing exit via blocking waits / port signals,
-and reaping. This crate models the **per-process state machine** that governs
+`ThreadStart`, and `libcanvas::process::spawn_elf`). Lifecycle around that path includes implemented blocking waits, exit port
+signals and deferred reaping; the remaining work is deeper failure/stress
+coverage and resource accounting. This crate models the **per-process state machine** that governs
 those decisions so the logic can be tested without the scheduler.
 
 ## Relationship to `huesos-lifecycle`
@@ -88,8 +90,9 @@ automatic balancing.
 
 The scheduler copies this lifecycle-owned generation unchanged into its bounded
 finished-task graveyard via `record_exit_with_generation`, accounts overflow
-`Evicted` outcomes, and reaps by asking the `Process` object whether the stored
-generation has been observed. Deferred reaping and supervisor packets therefore
+`Evicted` outcomes, and reaps using the `Process` object's exit-generation
+query. That query currently checks published identity, not successful userspace
+observation. Deferred reaping and supervisor packets therefore
 refer to the same `(koid, generation)` exit identity without direct scheduler
 access to `ProcState`.
 
@@ -103,19 +106,19 @@ immediately.
 The remaining integration work is future-facing:
 
 1. add stress/diagnostic coverage for graveyard eviction counters;
-3. charge/release handle, page-table, and CPU quota resources only after the
-   policy transition permits it.
+2. complete handle/page-table hard accounting and validate resource release
+   against lifecycle transitions; CPU tick charging already exists.
 
 ## What still requires on-target verification
 
-- Driving transitions from the real scheduler/process subsystem.
-- Waking `ProcessWait` and emitting port packets on exit under `-smp 1/2`.
+- Extend evidence beyond the default ProcessWait boot probe: concurrent waits,
+  exit-port delivery failures and cancellation under SMP.
 - Reap gating with concurrent waiters, and koid/generation reuse behavior.
 - Loading ELF images from a VFS instead of build-time `include_bytes!` (the
   broader #5 goal; the VFS itself is Short-Term #7).
 
-These need the full toolchain (pinned nightly + `build-std`, QEMU/OVMF) and were
-not runnable where this crate was authored.
+These need the full toolchain (pinned nightly + `build-std`, QEMU/OVMF).
+Historical author-environment limits are not a current runtime status.
 
 ## Tests (host)
 

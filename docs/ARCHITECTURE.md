@@ -2,6 +2,10 @@
 
 ## Overview
 
+For the reviewed implementation/evidence snapshot and document authority, see
+[STATUS.md](STATUS.md). Production Scheduler/SMP v2 documents describe targets;
+only boundaries stated as current below should be attributed to this runtime.
+
 HuesOS is a **microkernel** for x86_64, inspired by Google Zircon (Fuchsia).
 It boots exclusively via **UEFI**, loaded directly by the **Limine**
 bootloader as a higher-half ELF64 executable (not a legacy multiboot image,
@@ -11,8 +15,8 @@ interaction and hands off a fully set up long-mode environment).
 ## Design Principles
 
 1. **Minimal Kernel** — Drivers, filesystems, and network stack are meant to
-   live in userspace (only bootstrap keyboard/serial/timer paths live
-   in-kernel today).
+   live in userspace. Bootstrap keyboard/serial/timer, IRQ mediation and the
+   capability-gated framebuffer/panic drawing path remain in kernel today.
 2. **Capability-Based Security** — Resources are accessed through handles
    with rights (`huesos-object::Rights`).
 3. **Message-Passing IPC** — Channels are the primary IPC primitive.
@@ -120,12 +124,13 @@ map. The kernel therefore:
   + slab; exposed as `GlobalAlloc` after `heap_init`.
 - **VMOs**: real 4 KiB physical frames.
 
-## HBI (HuesOS Boot Image) v2.1
+## HBI (HuesOS Boot Image) v2.2
 
 On-disk layout (generator: `tools/hbi-gen`, parser:
 `huesos-kernel::boot::hbi`):
 
-- Global header (`HUESOS_H`, version `0x0002_0001`)
+- Global header (`HUESOS_H`, version `0x0002_0002`) and Ed25519 signature
+  verified before module parsing; see [VERIFIED_BOOT_TPM.md](VERIFIED_BOOT_TPM.md)
 - Directory entries (`type_id`, `offset`, `length`, `flags`)
 - Per-module `EntryHeader` (**24 bytes** = 6×`u32`) + payload + 8-byte pad
 
@@ -159,10 +164,10 @@ info/blit, yield/exit/debug write.
 Raw caller pointers are never dereferenced by individual syscall handlers.
 `huesos-syscalls::user_memory` validates ABI bounds plus every active
 page-table level (`PRESENT`, `USER_ACCESSIBLE`, and `WRITABLE` for outputs),
-then performs the only audited raw copies. Argument records are snapshotted
-once, and blocking/dequeueing calls preflight outputs before side effects.
+then performs the only audited raw copies. Typed records use the sealed UserRecord allowlist and zero-padded output
+encoding. Argument records are snapshotted once, and blocking/dequeueing calls preflight outputs before side effects.
 See [USER_MEMORY.md](USER_MEMORY.md) for the complete contract, limits, review
-checklist, and the required upgrade before VMAR unmap/protect is introduced.
+checklist and the existing lock/extable contract for VMAR unmap/protect.
 
 `ClockGetMonotonic` exposes a hardware-tick clock independent of yields and SMP
 CPU count. `SystemShutdown` is restricted to the init KOID; terminal requests
@@ -245,7 +250,9 @@ report, other CPUs receive a panic-stop IPI, and no CPU reboots. See
 - Syscall user pointers are range-checked and page-table-checked before an
   audited copy; kernel-half pointers and supervisor-only mappings are rejected.
 - Per-call transfer limits bound attacker-controlled temporary allocations.
-- Jobs exist but do not yet enforce aggregate quotas.
+- Jobs own a hierarchical quota tree; VMO memory and scheduler CPU ticks are
+  charged and public Job control syscalls exist. Per-handle and page-table
+  metadata hard limits remain incomplete; see [QUOTAS.md](QUOTAS.md).
 - SMEP/SMAP are enabled through CPUID-gated CR4 updates on every CPU
   (the QEMU `qemu64` smoke matrix lacks the feature and reports
   "degraded: SMEP/SMAP unavailable"; the bits are set on supporting
