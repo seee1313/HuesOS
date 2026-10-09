@@ -235,7 +235,8 @@ consuming a queued message/event. See [USER_MEMORY.md](USER_MEMORY.md).
 
 Init runs a bounded blocking `ProcessWait` stress probe before fault isolation.
 Each `fault-probe` child receives `wait`, yields once, then exits with code
-zero. The parent must register a waiter, park, wake, and receive that code.
+zero. The parent invokes the blocking-capable wait API and receives that code.
+Scheduling determines whether any particular call actually parks.
 
 The kernel build passes only the whitelisted build setting
 `HUESOS_LIFECYCLE_WAIT_STRESS=32|256` to init; any missing or invalid value
@@ -248,17 +249,20 @@ cmdline or a new syscall ABI.
   [init] ProcessWait lifecycle smoke OK (32 blocked wakes)
   ```
 
-- The `qemu-lifecycle-soak` matrix runs 256 exits on SMP 1 and SMP 2 and
-  requires:
+- A dedicated test build with `HUESOS_LIFECYCLE_WAIT_STRESS=256` runs 256
+  exits and emits:
 
   ```text
   [init] ProcessWait lifecycle soak OK (256 blocked wakes)
   ```
 
-The latter emits progress every 32 exits and exercises a full
-`TaskGraveyard<256>`-sized sequence of lifecycle records. The normal matrix
-uses a 360-second QEMU budget because repeated process launch/exit is slow
-under TCG; the 256-exit soak has a separate 1500-second budget. This remains a
+The first wait invokes the blocking-capable API, but scheduling determines
+whether each call actually parks: the marker wording does not establish
+32 or 256 blocked wakes. The latter emits progress every 32 exits. It does not prove the graveyard
+fills or evicts: deferred reaping may remove each observed record immediately.
+The committed QEMU script defaults to 120 seconds; callers can pass 360 for
+slow TCG boot. No dedicated qemu-lifecycle-soak job exists in the reviewed
+workflow. Longer 256-exit runs need an explicit build and timeout. This remains a
 bounded regression/soak test rather than a proof of an unbounded-duration SMP
 run.
 

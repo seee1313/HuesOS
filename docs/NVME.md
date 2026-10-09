@@ -19,9 +19,15 @@ A userspace NVMe driver running as a ring-3 DriverHost process, built on
 64 MiB DMA pool, no heap allocation after initialization, interrupt-first I/O
 (MSI-X → MSI → polling fallback), per-CPU I/O queues with depth 256, 1 MiB max
 request size, and async BlockDevice protocol over Channel submissions plus Port
-completions. BlobFS/Hxfs/VFS mounting comes later.
+completions. This is the original staged goal; BlobFS/HxFS/VFS integration
+now exists. Consult [STATUS.md](STATUS.md) and
+[STORAGE_PRODUCTION_GATE.md](STORAGE_PRODUCTION_GATE.md) for current limits.
 
 ## Layering
+
+The diagram below records the original staged implementation order. Labels
+such as "later slice" are historical milestones, not a current status table;
+use [STATUS.md](STATUS.md) and the production gate for current boundaries.
 
 ```
 +------------------------------------------------------------+
@@ -187,7 +193,9 @@ Remaining later work:
 
 - Replace the current synchronous per-request server execution with fully async
   queue-slot tracking driven directly by the bound MSI-X/MSI Port.
-- Data-path on-target read/write/blob-open soak under QEMU `-device nvme` and
-  hardware.
+- Physical data-path validation remains open. QEMU data-path/queue-depth gates
+  are documented in [STORAGE_PRODUCTION_GATE.md](STORAGE_PRODUCTION_GATE.md);
+  this document does not assert a new test result.
 - Multiple namespaces beyond the current system namespace-first policy.
-- Hxfs read-only prototype.
+- Mutable HxFS foundation is documented in [HXFS_V6.md](HXFS_V6.md); storage
+  release approval remains governed by [STORAGE_PRODUCTION_GATE.md](STORAGE_PRODUCTION_GATE.md).

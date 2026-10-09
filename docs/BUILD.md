@@ -19,8 +19,9 @@ for OVMF" problem across Debian/Ubuntu/Arch/Fedora/macOS.
 ### Install Rust nightly
 
 ```bash
-rustup toolchain install nightly
-rustup component add rust-src llvm-tools-preview rustfmt --toolchain nightly
+rustup toolchain install nightly-2026-03-01 --profile minimal \
+  --component rust-src,llvm-tools-preview,rustfmt,clippy \
+  --target x86_64-unknown-none
 ```
 
 (The pinned `rust-toolchain.toml` in this repo will select the right
@@ -104,7 +105,7 @@ make iso STORAGE_OFF=1
 ```
 
 `make iso` also builds `tools/hbi-gen` and packages `build/huesos.hbi`
-(HBI v2.1) via `scripts/mkhbi.sh`, then embeds kernel + HBI into the ISO
+(signed HBI v2.2) via `scripts/mkhbi.sh`, then embeds kernel + HBI into the ISO
 per `scripts/limine.conf` (`module_path` for the HBI).
 
 Output: `build/huesos.iso` — a hybrid BIOS+UEFI bootable ISO built with

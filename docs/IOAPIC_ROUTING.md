@@ -7,9 +7,9 @@ interrupts to bound userspace ports, and release routes with their object
 lifecycle. Level-triggered routes are masked before LAPIC EOI and require a
 userspace acknowledgement after device service. A QEMU SMP2 test now injects a
 PS/2 key through QMP and observes its IOAPIC-delivered IRQ packet arrive at the
-userspace keyboard Port. Direct non-keyboard raw-GSI delivery, level-route
-ACK/re-enable under an asserted device, and real-hardware verification remain
-pending.
+userspace keyboard Port. A separate QEMU edu kernel-Port probe covers raw GSI
+and level ACK/re-enable (see below); the corresponding userspace syscall path
+and physical verification remain pending.
 
 The implementation supports Immediate #2 in [ROADMAP.md](ROADMAP.md), while
 retaining the 8259 as a boot-time fallback. It does not add interrupt
