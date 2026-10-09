@@ -22,6 +22,16 @@ gates close.
 
 ## Done (recent)
 
+### Process lifecycle regression matrix
+- Test actual Process/ProcessWait objects for late and repeated observation,
+  distinct async wakers, counted waiter release and competing exits. Exercise
+  4096 exits against the bounded graveyard and stale full TaskId operations
+  after sequential helper clear/reuse; include huesos-sched in make test.
+  The current reaper's pending-operation carry-over defect remains open.
+- Init repeats ProcessWait and ProcessGetExitCode after each child exit; the
+  QEMU boot gate requires its dedicated repeated-observation marker.
+- Scope and verification limits: [PROCESS_LIFECYCLE_REGRESSIONS.md](PROCESS_LIFECYCLE_REGRESSIONS.md).
+
 ### Typed syscall record hardening
 - Replace the internal Copy-only typed-copy contract with a sealed audited
   record allowlist; encode output fields with zero padding instead of reading
