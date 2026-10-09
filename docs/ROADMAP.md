@@ -299,6 +299,14 @@ gates close.
   errors are policy, not bugs.
 - Full design doc: `docs/design/ASYNC_ARCHITECTURE.md`
 
+### Syscall error-path regression coverage
+- Add host regressions against actual IPC send rollback and handle publication
+  transactions; assert reference-account and registry state as well as errors.
+- Distinguish deterministic queue/staging exhaustion from allocator OOM, and
+  injected commit failures from actual ring-3 pointer faults.
+
+
+
 ## Immediate — COMPLETE ✅
 
 **Status:** CLOSED. All four Immediate tracks are implemented in `main`:

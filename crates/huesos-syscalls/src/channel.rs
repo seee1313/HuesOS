@@ -492,3 +492,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "error_regressions.rs"]
+mod error_regressions;

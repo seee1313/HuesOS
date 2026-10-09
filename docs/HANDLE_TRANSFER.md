@@ -122,3 +122,18 @@ Duplicate (keeps source, reduces rights), empty-disposition no-op, and —
 critically — atomicity: `NoSuchHandle`, `MissingRight` (including
 `Duplicate` requiring `DUPLICATE`), `AlreadyStaged`, and `DestinationFull` each
 leave **both** tables unchanged.
+
+## Error-path transaction regressions
+
+The syscall crate host suite exercises the real handle-table commit helpers and
+`send_or_restore`, not a duplicate policy model: duplicate/missing source slots,
+short inline staging, failed pair/duplicate/receive publication, closed peers,
+full queue admission and undersized receives. Assertions check exact slots,
+rights, per-object reference counts, registry collection, message cookies and
+successful queue reuse. Tests use distinct KOIDs and need no global test context.
+
+Commit callbacks inject `InvalidArgs` at the copy-out boundary. These tests do
+not execute a faulting user pointer, inject global allocator exhaustion, or prove
+physical-page reclamation by themselves. A separate object-crate regression
+uses its serialized real PMM fixture to check exact frame return after a failed
+VMO publication. QEMU user-pointer probes remain separate.
