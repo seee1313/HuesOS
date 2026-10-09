@@ -9,8 +9,20 @@
 #![no_std]
 #![warn(missing_docs)]
 
-use xmas_elf::program::{ProgramHeader, Type};
-use xmas_elf::ElfFile;
+/// ELF64 header size; `e_ehsize` must match.
+const ELF64_HEADER_BYTES: usize = 64;
+/// ELF64 program header size; `e_phentsize` must match when `e_phnum != 0`.
+const ELF64_PROGRAM_HEADER_BYTES: usize = 56;
+/// `e_type` value for a non-PIE executable.
+const ET_EXEC: u16 = 2;
+/// `p_type` value for a loadable segment.
+const PT_LOAD: u32 = 1;
+/// `p_flags` execute bit.
+const PF_X: u32 = 1;
+/// `p_flags` write bit.
+const PF_W: u32 = 2;
+/// `p_flags` read bit.
+const PF_R: u32 = 4;
 
 /// Page size assumed by the loader (must match the target architecture).
 pub const PAGE_SIZE: u64 = 4096;
@@ -68,48 +80,61 @@ pub struct LoadedElf {
 
 /// Load `data` (the raw ELF file bytes) into the address space represented
 /// by `loader`, mapping each `PT_LOAD` segment.
+///
+/// The ELF header and program header table are decoded field by field with
+/// byte-wise little-endian reads. Nothing here requires the input, or the
+/// table offsets inside it, to be naturally aligned. A typed-struct reader
+/// (xmas-elf over `zero::read`) panicked on an unaligned `e_phoff`, and the
+/// kernel must not panic on a malformed or hostile binary.
 pub fn load<L: Loader>(data: &[u8], loader: &mut L) -> Result<LoadedElf, ElfLoadError<L::Error>> {
     validate_elf64_header(data)?;
-    let elf = ElfFile::new(data).map_err(ElfLoadError::ParseError)?;
 
-    use xmas_elf::header::Type as HeaderType;
-    match elf.header.pt2.type_().as_type() {
-        HeaderType::Executable => {}
-        _ => {
-            return Err(ElfLoadError::Unsupported(
-                "only ET_EXEC binaries are supported",
-            ))
-        }
+    let e_type = read_u16(data, 16).ok_or(ElfLoadError::ParseError("missing e_type"))?;
+    if e_type != ET_EXEC {
+        return Err(ElfLoadError::Unsupported(
+            "only ET_EXEC binaries are supported",
+        ));
     }
+    let entry_point = read_u64(data, 24).ok_or(ElfLoadError::ParseError("missing e_entry"))?;
+    let phoff = read_u64(data, 32).ok_or(ElfLoadError::ParseError("missing e_phoff"))?;
+    let phnum = read_u16(data, 56).ok_or(ElfLoadError::ParseError("missing e_phnum"))?;
 
     let mut highest_addr = 0u64;
-
-    for ph in elf.program_iter() {
-        if ph.get_type() != Ok(Type::Load) {
+    let mut loadable_segments = 0usize;
+    for index in 0..usize::from(phnum) {
+        let ph = read_program_header(data, phoff, index)?;
+        if ph.p_type != PT_LOAD {
             continue;
         }
-        load_segment(&elf, &ph, data, loader)?;
-        let seg_end = ph.virtual_addr() + ph.mem_size();
+        load_segment(&ph, data, loader)?;
+        loadable_segments += 1;
+        let seg_end = ph
+            .p_vaddr
+            .checked_add(ph.p_memsz)
+            .ok_or(ElfLoadError::SegmentOutOfBounds)?;
         if seg_end > highest_addr {
             highest_addr = seg_end;
         }
     }
 
+    // An executable with no PT_LOAD segment has nothing mapped at its entry
+    // point. Refuse it instead of returning a successful but unrunnable load.
+    if loadable_segments == 0 {
+        return Err(ElfLoadError::ParseError("no PT_LOAD segments"));
+    }
+
     Ok(LoadedElf {
-        entry_point: elf.header.pt2.entry_point(),
+        entry_point,
         highest_addr,
     })
 }
 
 fn validate_elf64_header<E>(data: &[u8]) -> Result<(), ElfLoadError<E>> {
-    const ELF64_HEADER_BYTES: usize = 64;
-    const ELF64_PROGRAM_HEADER_BYTES: usize = 56;
     if data.len() < ELF64_HEADER_BYTES || data.get(..4) != Some(b"\x7fELF") {
         return Err(ElfLoadError::ParseError("truncated or invalid ELF magic"));
     }
-    // xmas-elf 0.10's generic parser accepts ELF32 and malformed program-header
-    // geometry that its ELF64 `program_iter` later indexes as slices. Reject
-    // those shapes before constructing the iterator used in ring 0.
+    // Only ELF64 little-endian version 1 is accepted. Other shapes are
+    // rejected here, before any field is decoded.
     if data[4] != 2 || data[5] != 1 || data[6] != 1 {
         return Err(ElfLoadError::Unsupported(
             "only little-endian ELF64 version 1 is supported",
@@ -136,49 +161,92 @@ fn validate_elf64_header<E>(data: &[u8]) -> Result<(), ElfLoadError<E>> {
     Ok(())
 }
 
+/// Decoded fields of one ELF64 program header.
+#[derive(Clone, Copy, Debug)]
+struct ProgramHeader {
+    p_type: u32,
+    p_flags: u32,
+    p_offset: u64,
+    p_vaddr: u64,
+    p_filesz: u64,
+    p_memsz: u64,
+}
+
+/// Decode program header `index` from the table at `phoff`. Every field is
+/// read with a byte-wise little-endian load, so `phoff` may be any value.
+fn read_program_header<E>(
+    data: &[u8],
+    phoff: u64,
+    index: usize,
+) -> Result<ProgramHeader, ElfLoadError<E>> {
+    let truncated = ElfLoadError::ParseError("truncated program header");
+    let entry_offset = (index as u64)
+        .checked_mul(ELF64_PROGRAM_HEADER_BYTES as u64)
+        .and_then(|rel| phoff.checked_add(rel))
+        .ok_or(ElfLoadError::SegmentOutOfBounds)?;
+    let base = usize::try_from(entry_offset).map_err(|_| ElfLoadError::SegmentOutOfBounds)?;
+    Ok(ProgramHeader {
+        p_type: read_u32(data, base).ok_or(truncated)?,
+        p_flags: read_u32(data, base + 4)
+            .ok_or(ElfLoadError::ParseError("truncated program header"))?,
+        p_offset: read_u64(data, base + 8)
+            .ok_or(ElfLoadError::ParseError("truncated program header"))?,
+        p_vaddr: read_u64(data, base + 16)
+            .ok_or(ElfLoadError::ParseError("truncated program header"))?,
+        p_filesz: read_u64(data, base + 32)
+            .ok_or(ElfLoadError::ParseError("truncated program header"))?,
+        p_memsz: read_u64(data, base + 40)
+            .ok_or(ElfLoadError::ParseError("truncated program header"))?,
+    })
+}
+
 fn read_u16(data: &[u8], offset: usize) -> Option<u16> {
-    let bytes = data.get(offset..offset + 2)?;
+    let end = offset.checked_add(2)?;
+    let bytes = data.get(offset..end)?;
     Some(u16::from_le_bytes([bytes[0], bytes[1]]))
 }
 
+fn read_u32(data: &[u8], offset: usize) -> Option<u32> {
+    let end = offset.checked_add(4)?;
+    let bytes = data.get(offset..end)?;
+    Some(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+}
+
 fn read_u64(data: &[u8], offset: usize) -> Option<u64> {
-    let bytes = data.get(offset..offset + 8)?;
+    let end = offset.checked_add(8)?;
+    let bytes = data.get(offset..end)?;
     Some(u64::from_le_bytes([
         bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
     ]))
 }
 
 fn load_segment<L: Loader>(
-    elf: &ElfFile,
     ph: &ProgramHeader,
     file_data: &[u8],
     loader: &mut L,
 ) -> Result<(), ElfLoadError<L::Error>> {
     let flags = SegmentFlags {
-        read: ph.flags().is_read(),
-        write: ph.flags().is_write(),
-        execute: ph.flags().is_execute(),
+        read: ph.p_flags & PF_R != 0,
+        write: ph.p_flags & PF_W != 0,
+        execute: ph.p_flags & PF_X != 0,
     };
 
-    let vaddr_start = ph.virtual_addr();
-    let file_off = ph.offset() as usize;
-    let file_size = ph.file_size() as usize;
-    let mem_size = ph.mem_size();
+    let vaddr_start = ph.p_vaddr;
+    let file_off = usize::try_from(ph.p_offset).map_err(|_| ElfLoadError::SegmentOutOfBounds)?;
+    let file_size = usize::try_from(ph.p_filesz).map_err(|_| ElfLoadError::SegmentOutOfBounds)?;
+    let mem_size = ph.p_memsz;
 
     // A well-formed PT_LOAD segment always has file_size <= mem_size (the
     // file only ever provides *initial* contents; anything beyond
     // file_size up to mem_size is BSS-style zero-fill). Reject anything
     // else up front rather than let later arithmetic silently do the
     // wrong thing.
-    if file_size as u64 > mem_size {
+    if ph.p_filesz > mem_size {
         return Err(ElfLoadError::SegmentOutOfBounds);
     }
 
     // Bounds-check the claimed file range against the actual file data
-    // *before* slicing into it. `file_off + file_size` on attacker- or
-    // corruption-controlled values could also overflow `usize` on a
-    // pathological input, so check with checked arithmetic rather than a
-    // plain `+`.
+    // *before* slicing into it, with checked arithmetic throughout.
     let file_end = file_off
         .checked_add(file_size)
         .ok_or(ElfLoadError::SegmentOutOfBounds)?;
@@ -190,12 +258,12 @@ fn load_segment<L: Loader>(
     let mem_end = vaddr_start
         .checked_add(mem_size)
         .ok_or(ElfLoadError::SegmentOutOfBounds)?;
-    let page_end = align_up(mem_end, PAGE_SIZE);
+    let page_end = align_up(mem_end, PAGE_SIZE).ok_or(ElfLoadError::SegmentOutOfBounds)?;
 
     let segment_bytes = &file_data[file_off..file_end];
 
     let seg_file_end = vaddr_start
-        .checked_add(file_size as u64)
+        .checked_add(ph.p_filesz)
         .ok_or(ElfLoadError::SegmentOutOfBounds)?;
 
     let mut page = page_start;
@@ -226,7 +294,6 @@ fn load_segment<L: Loader>(
         page += PAGE_SIZE;
     }
 
-    let _ = elf; // reserved for future use (e.g. relocations)
     Ok(())
 }
 
@@ -234,8 +301,9 @@ fn align_down(addr: u64, align: u64) -> u64 {
     addr & !(align - 1)
 }
 
-fn align_up(addr: u64, align: u64) -> u64 {
-    (addr + align - 1) & !(align - 1)
+/// Round `addr` up to `align`, or `None` if the result would overflow.
+fn align_up(addr: u64, align: u64) -> Option<u64> {
+    addr.checked_add(align - 1).map(|v| v & !(align - 1))
 }
 
 #[cfg(test)]
@@ -279,9 +347,11 @@ mod tests {
     #[test]
     fn align_helpers() {
         assert_eq!(align_down(0x1234, 0x1000), 0x1000);
-        assert_eq!(align_up(0x1234, 0x1000), 0x2000);
+        assert_eq!(align_up(0x1234, 0x1000), Some(0x2000));
         assert_eq!(align_down(0x1000, 0x1000), 0x1000);
-        assert_eq!(align_up(0x1000, 0x1000), 0x1000);
+        assert_eq!(align_up(0x1000, 0x1000), Some(0x1000));
+        // Rounding past u64::MAX must report overflow rather than wrap.
+        assert_eq!(align_up(u64::MAX, 0x1000), None);
     }
 
     #[test]
@@ -381,7 +451,7 @@ mod tests {
 
     #[test]
     fn rejects_fuzzed_elf32_shape_without_panicking() {
-        // Coverage-guided fuzzing reached xmas-elf::program_iter with this
+        // Coverage-guided fuzzing reached the program-header walk with this
         // ELF32/truncated geometry and triggered an out-of-bounds slice panic.
         let bytes = [
             0x7f, 0x45, 0x4c, 0x46, 0x01, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x20, 0x46,
@@ -433,6 +503,60 @@ mod tests {
         let mut loader = FakeLoader::new();
         let result = load(&elf, &mut loader);
         assert!(matches!(result, Err(ElfLoadError::SegmentOutOfBounds)));
+    }
+
+    #[test]
+    fn loads_program_header_table_at_unaligned_offset() {
+        // e_phoff = 0x41 is not 8-byte aligned. The loader must decode the
+        // table byte-wise and must not panic on the misalignment.
+        let base = build_minimal_elf(128, 16, 16, 256);
+        let mut elf = alloc::vec![0u8; 256];
+        elf[..64].copy_from_slice(&base[..64]);
+        elf[32..40].copy_from_slice(&0x41u64.to_le_bytes()); // e_phoff
+        elf[0x41..0x41 + 56].copy_from_slice(&base[64..120]);
+        let mut loader = FakeLoader::new();
+        let result = load(&elf, &mut loader);
+        assert!(result.is_ok(), "unaligned e_phoff must load: {:?}", result);
+        if let Ok(loaded) = result {
+            assert_eq!(loaded.entry_point, 0x400050);
+            assert_eq!(loaded.highest_addr, 0x400010);
+        }
+        assert_eq!(loader.pages.len(), 1);
+    }
+
+    #[test]
+    fn rejects_fuzzed_unaligned_phoff_without_panicking() {
+        // Input from the CI elf_loader fuzz job (crash-ecd7a96b...). Its
+        // e_phoff is 38, which made xmas-elf panic on an unaligned typed
+        // read. The program header there is not PT_LOAD, so the image has
+        // no loadable segment and must be rejected as a parse error.
+        const CRASH: [u8; 101] = [
+            127, 69, 76, 70, 2, 1, 1, 127, 0, 0, 0, 127, 69, 76, 70, 0, 2, 0, 0, 0, 0, 0, 46, 218,
+            218, 218, 218, 218, 218, 218, 218, 64, 38, 0, 0, 0, 0, 0, 0, 0, 218, 218, 218, 218,
+            218, 218, 38, 37, 255, 191, 37, 37, 64, 0, 56, 0, 1, 0, 0, 0, 0, 0, 0, 46, 235, 0, 152,
+            86, 86, 86, 86, 86, 86, 86, 86, 86, 86, 86, 86, 86, 86, 86, 86, 86, 86, 86, 86, 86, 86,
+            86, 86, 86, 86, 86, 86, 86, 152, 152, 152, 152, 39,
+        ];
+        let mut loader = FakeLoader::new();
+        let result = load(&CRASH, &mut loader);
+        assert!(
+            matches!(result, Err(ElfLoadError::ParseError(_))),
+            "expected ParseError, got {:?}",
+            result
+        );
+        assert!(loader.pages.is_empty());
+    }
+
+    #[test]
+    fn rejects_executable_without_pt_load() {
+        // Valid header, but the single program header is PT_NOTE (4).
+        let mut elf = build_minimal_elf(128, 16, 16, 256);
+        elf[64..68].copy_from_slice(&4u32.to_le_bytes());
+        let mut loader = FakeLoader::new();
+        assert!(matches!(
+            load(&elf, &mut loader),
+            Err(ElfLoadError::ParseError("no PT_LOAD segments"))
+        ));
     }
 
     #[test]

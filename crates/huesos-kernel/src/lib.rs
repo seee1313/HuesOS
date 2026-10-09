@@ -57,9 +57,9 @@ static INIT_BINARY_STORAGE: AlignedBytes<INIT_BINARY_LEN> =
 
 /// Statically embedded, explicitly aligned init ELF image.
 ///
-/// `xmas-elf` reads typed ELF records and requires natural alignment. Relying
-/// on incidental linker placement of `include_bytes!` caused boot panics when
-/// unrelated code-size changes shifted this array.
+/// `huesos-elf` decodes ELF fields byte-wise and does not need alignment. The
+/// explicit wrapper still keeps the embedded image at a fixed, documented
+/// placement, so layout changes elsewhere cannot silently move it.
 pub static INIT_BINARY: &[u8] = &INIT_BINARY_STORAGE.0;
 static INIT_PROCESS_KOID: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
@@ -271,6 +271,7 @@ pub unsafe fn kmain(boot_info: BootInfo) -> ! {
 
     let panic_test_requested = cmdline_requests_panic_test(&verified_hbi);
     let extable_test_requested = cmdline_requests_extable_test(&verified_hbi);
+    let irq_test_requested = cmdline_requests_irq_test(&verified_hbi);
     let storage_off_requested = cmdline_requests_storage_off(&verified_hbi);
     let sealed_key_module = verified_hbi
         .get_module(boot::hbi::ModuleType::SealedKey)
@@ -348,6 +349,10 @@ pub unsafe fn kmain(boot_info: BootInfo) -> ! {
     // APs finished local init during bringup_aps and are spinning on the
     // run-gate; release them now that the timer callback + PIC are live.
     smp::release_aps();
+
+    if irq_test_requested {
+        boot::irq_probe::run();
+    }
 
     if panic_test_requested {
         panic!("intentional panic requested by HBI cmdline panic_test=1");
@@ -624,6 +629,10 @@ fn install_frame_draw_capability(process: &huesos_object::Process) -> bool {
 
 fn cmdline_requests_panic_test(image: &boot::hbi::HbiImage<'_>) -> bool {
     cmdline_flag_present(image, b"panic_test=1")
+}
+
+fn cmdline_requests_irq_test(image: &boot::hbi::HbiImage<'_>) -> bool {
+    cmdline_flag_present(image, b"irq_test=1")
 }
 
 fn cmdline_requests_extable_test(image: &boot::hbi::HbiImage<'_>) -> bool {

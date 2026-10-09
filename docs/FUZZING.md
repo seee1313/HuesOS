@@ -25,3 +25,12 @@ an ELF32/truncated program-header geometry. HuesOS now pre-validates ELF64
 class, endianness, header sizes and the complete program-header table before
 constructing the dependency iterator; the reproducer is retained in
 `huesos-elf` tests.
+
+A later CI `elf_loader` run panicked in `zero::read` (`assertion failed:
+addr & (align_of::<T>() - 1) == 0`) for an input whose `e_phoff` was 38. The
+dependency read typed program headers at an unaligned address. The fix
+removes `xmas-elf` from `huesos-elf` entirely: the ELF64 header and program
+headers are decoded byte-wise with `from_le_bytes`, so no alignment is
+required. Two regression tests keep the CI input and an unaligned
+program-header table, and an image with no `PT_LOAD` segment is now rejected
+with `ParseError` instead of returning a success with nothing mapped.

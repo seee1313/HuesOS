@@ -353,11 +353,9 @@ extern "C" fn handle_syscall(f: &mut huesos_arch::syscall::SyscallFrame) {
 }
 
 fn debug_write(b: &[u8]) {
-    use core::fmt::Write;
-    let mut w = huesos_arch::serial::SerialWriter;
-    for &c in b {
-        let _ = w.write_char(c as char);
-    }
+    // One lock for the whole userspace chunk: keeps a DebugWrite line intact
+    // against kernel log lines emitted on other CPUs.
+    huesos_arch::serial::write_bytes(b);
 }
 
 /// Serial log line for the TPM bring-up path.

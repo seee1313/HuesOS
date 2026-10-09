@@ -103,11 +103,21 @@ installed, only the current CPU is accepted.
 
 ## Remaining verification and scope limits
 
-- Extend the QEMU test beyond the keyboard's dedicated edge route to prove a
-  non-keyboard raw-GSI route and typed GSI event reaches a userspace Port.
-- Exercise level-triggered device ACK/re-enable on an asserted device, route
-  drop/release, conflicting routes, and online/offline affinity rejection in an
-  integration test.
+- **Done (kernel-side)**: `irq_test=1` boot probe
+  (`crates/huesos-kernel/src/boot/irq_probe.rs`, gated by
+  `scripts/ci-qemu-irq-level-smoke.sh`) drives QEMU's `edu` PCI device, a real
+  level-triggered INTx source. It proves on target that a non-keyboard raw GSI
+  (GSI 11 under the CI Q35 machine) is acquired, delivered to a bound Port, kept
+  masked while asserted and unacknowledged, and redelivered after deassert plus
+  `Interrupt::acknowledge`. The probe uses a kernel Port, so the
+  userspace syscall path (`InterruptCreateGsiForResource`, `InterruptAcknowledge`,
+  `libcanvas`) is still unverified on target.
+- Extend the QEMU test to the userspace path: a Resource-minted raw-GSI Interrupt
+  created through syscall 66, read from a userspace Port, and acknowledged
+  through syscall 67.
+- Route drop/release after the probe, conflicting routes, and online/offline
+  affinity rejection are not yet exercised in an integration test. Level ACK and
+  re-enable on an asserted device are now covered by the kernel-side probe.
 - Supply PCI `_PRT`/link-device electrical data instead of relying on the
   documented PCI INTx default for non-ISA GSIs.
 - Add interrupt remapping or logical destination support before routing to

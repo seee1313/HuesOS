@@ -21,6 +21,17 @@ gates close.
 
 ## Done (recent)
 
+### Raw-GSI level-interrupt probe on QEMU `edu` (kernel-side)
+- `irq_test=1` boot probe (`boot/irq_probe.rs`) drives QEMU's `edu` PCI device,
+  a real level INTx source. On a Q35 SMP2 boot the firmware routes it to GSI 11.
+- Verified on target by `scripts/ci-qemu-irq-level-smoke.sh`: raw GSI route
+  bound to a Port, first delivery, route kept masked while asserted and
+  unacknowledged, and redelivery after deassert plus `Interrupt::acknowledge`.
+- Remaining: the same proof through the userspace syscall path (66/67), and
+  route drop/affinity tests. See `docs/IOAPIC_ROUTING.md`.
+- Safety-budget delta: two MMIO volatile sites, dedicated review in
+  `docs/UNSAFE_AUDIT.md` § "Raw-GSI level-probe MMIO boundary".
+
 ### Panic-free EEVDF tree: `?`-threaded internals, `huesos-sched` tests unwrap-free
 - `crates/huesos-sched/src/eevdf.rs` no longer panics: every internal
   operation threads `Result<(), EevdfTreeError>` (new `InvariantBroken`

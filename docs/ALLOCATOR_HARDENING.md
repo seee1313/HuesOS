@@ -48,6 +48,9 @@ The hardening pass changed kernel code layout and exposed a separate latent bug:
 typed reads. Init happened to be aligned before and panicked in `zero` after an
 unrelated layout shift. The embedded init ELF now lives in an explicit 16-byte
 aligned static wrapper; boot correctness no longer depends on linker accident.
+`huesos-elf` no longer depends on `xmas-elf`, so the loader itself no longer
+requires alignment (see `docs/FUZZING.md`). The wrapper stays as a fixed,
+documented placement.
 
 ## Tests
 

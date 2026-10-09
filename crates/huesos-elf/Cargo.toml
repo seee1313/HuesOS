@@ -6,5 +6,4 @@ authors.workspace = true
 license.workspace = true
 
 [dependencies]
-xmas-elf = "0.10"
 log = { workspace = true }
