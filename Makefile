@@ -48,6 +48,7 @@ test:
 		-p huesos-blobfs \
 		-p huesos-bootux \
 		-p huesos-lifecycle \
+		-p huesos-sched \
 		-p huesos-ioapic \
 		-p huesos-extable \
 		-p huesos-waitset \

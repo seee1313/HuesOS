@@ -852,3 +852,6 @@ mod tests {
         assert!(!account.try_collect());
     }
 }
+
+#[cfg(test)]
+mod graveyard_regressions;

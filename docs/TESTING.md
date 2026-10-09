@@ -533,3 +533,17 @@ of disallowed fields). Approved records have compile-time x86-64 size,
 alignment and field-offset assertions. Output tests cover WaitSetResult tail
 padding and the complete 256-byte, 16-result array boundary. These are host
 checks, not proof of an on-target pointer fault or hardware behavior.
+
+## Repeated ProcessWait observation gate
+
+Host and on-target regression boundaries are documented in
+[PROCESS_LIFECYCLE_REGRESSIONS.md](PROCESS_LIFECYCLE_REGRESSIONS.md).
+Init now repeats `wait_exit` and `poll_exit` on each still-live process handle
+after the first successful exit observation. The default QEMU smoke also
+requires `[init] ProcessWait repeated observation OK`.
+
+The first wait may take the blocking path; a yielding child alone does not
+prove that the parent parked on every iteration. Repeated wait/query must
+observe the original status without consuming it. This gate does not run or
+prove a 256-exit graveyard-eviction soak; the script's default timeout remains
+120 seconds unless overridden by the caller.

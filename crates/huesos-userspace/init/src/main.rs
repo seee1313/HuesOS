@@ -1623,6 +1623,17 @@ fn run_process_wait_stress(logger: &mut InitLogger) {
         // scheduler park/wake, lifecycle publication, and exit-code delivery.
         match process.wait_exit() {
             Ok(0) => {
+                // The handle remains live after observation/reaping. A late
+                // ProcessWait must return the stored status without parking,
+                // and ProcessGetExitCode must report the identical result.
+                if process.wait_exit() != Ok(0) || process.poll_exit() != Ok(Some(0)) {
+                    init_logln!(
+                        logger,
+                        "[init] ProcessWait lifecycle FAILED (repeat observation at {})",
+                        index
+                    );
+                    return;
+                }
                 if (index + 1) % 32 == 0 && index + 1 != iterations {
                     init_logln!(
                         logger,
@@ -1652,6 +1663,7 @@ fn run_process_wait_stress(logger: &mut InitLogger) {
             }
         }
     }
+    init_logln!(logger, "[init] ProcessWait repeated observation OK");
     let mode = if iterations == 256 { "soak" } else { "smoke" };
     init_logln!(
         logger,

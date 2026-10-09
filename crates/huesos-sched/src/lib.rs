@@ -2442,3 +2442,6 @@ mod tests {
         assert_eq!(rollback.state(), CbsMigrationState::RolledBack);
     }
 }
+
+#[cfg(test)]
+mod generation_regressions;

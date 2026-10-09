@@ -466,3 +466,7 @@ impl ProcessAsyncExt for Process {
         ProcessWait::new(self)
     }
 }
+
+#[cfg(test)]
+#[path = "process_regressions.rs"]
+mod regressions;
