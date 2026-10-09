@@ -21,6 +21,13 @@ gates close.
 
 ## Done (recent)
 
+### Typed syscall record hardening
+- Replace the internal Copy-only typed-copy contract with a sealed audited
+  record allowlist; encode output fields with zero padding instead of reading
+  potentially uninitialized C-layout padding.
+- Verification is recorded in the corresponding change's commit/PR; this entry
+  does not assert bare-metal verification.
+
 ### Raw-GSI level-interrupt probe on QEMU `edu` (kernel-side)
 - `irq_test=1` boot probe (`boot/irq_probe.rs`) drives QEMU's `edu` PCI device,
   a real level INTx source. On a Q35 SMP2 boot the firmware routes it to GSI 11.

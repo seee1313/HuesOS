@@ -512,3 +512,12 @@ No formal benchmarking yet. Rough QEMU/TCG observations:
 - Scheduler tick ~100 Hz via calibrated LAPIC timer (Div16).
 - Under TCG, long MMIO spin loops (e.g. unbounded ICR DS wait) can look
   like hangs — keep delivery-status polls capped.
+
+## Typed user-copy host gates
+
+`make test` includes sealed-record trait rejection assertions (bool, char,
+enums, references, nonzero integers, fat pointers, unlisted records and arrays
+of disallowed fields). Approved records have compile-time x86-64 size,
+alignment and field-offset assertions. Output tests cover WaitSetResult tail
+padding and the complete 256-byte, 16-result array boundary. These are host
+checks, not proof of an on-target pointer fault or hardware behavior.
