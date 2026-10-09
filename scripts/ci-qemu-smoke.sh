@@ -38,8 +38,9 @@ if grep -q 'KERNEL PANIC' "$log"; then
 fi
 # Require stable markers for the full happy-path boot chain, from bootloader
 # through the terminal shell. These checks catch stalled service launches.
-# Ring-3 and kernel serial writes can interleave on SMP; the ACPI-manager
-# validation is therefore checked with separate stable prefix/suffix fragments.
+# Ring-3 and kernel serial writes can interleave on SMP. Check ACPI validation
+# with stable fragments; terminal readiness below replaces its splittable
+# "[init] launched terminal" line as proof of successful startup.
 for marker in \
     '[HBI] Ed25519 signature verified (v2.2)' \
     '[uACPI] validated ACPI table graph and MADT' \
@@ -66,7 +67,6 @@ for marker in \
     '[driver-manager] ACPI manager ready generation' \
     '[pci-manager] ready without root descriptors; fail-closed' \
     '[driver-manager] PCI manager ready (no roots; fail-closed)' \
-    '[init] launched terminal' \
     '[terminal] keyboard service online, starting shell' \
     '[init] stage selftest ok' \
     '[init] stage summary ok selftest' \

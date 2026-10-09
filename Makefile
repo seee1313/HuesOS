@@ -71,8 +71,8 @@ test-hxfs-features:
 		--target x86_64-unknown-linux-gnu -Z build-std= \
 		--no-default-features --features crypto-aes-gcm,compression-engines,hxblob
 
-# Explicit HxFS v5 -> v6 migration: legacy mounts stay read-only until this
-# journaled host tool publishes v6 policy roots and 64-bit generations.
+# Explicit HxFS v6 -> v7 migration: legacy mounts stay read-only until this
+# journaled host tool publishes v7 Hxblob refcounts and format stamps.
 migration-check:
 	bash scripts/test-hxfs-migration.sh
 

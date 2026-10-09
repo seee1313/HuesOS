@@ -41,7 +41,7 @@ jobs:
         env:
           CARGO_BUILD_JOBS: "1"
         run: make test-hxfs-features
-      - name: HxFS v5 to v6 migration gate
+      - name: HxFS v6 to v7 migration gate
         env:
           CARGO_BUILD_JOBS: "1"
         run: make migration-check

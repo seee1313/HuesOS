@@ -75,11 +75,12 @@ journal. A crash can therefore expose either the complete old policy set or the
 complete new one, never a volume descriptor referring to a partially-written
 policy table.
 
-## v5 compatibility and explicit migration
+## v6 compatibility and explicit migration
 
-A v5 volume is accepted for compatibility but `FixedHxfsWriter` marks it
+A v6 volume is accepted for compatibility but `FixedHxfsWriter` marks it
 read-only. Mutation APIs return `LegacyReadOnly`; there is no implicit
-"upgrade on first write".
+"upgrade on first write". The explicit host tool migrates v6 volumes to the
+current v7 format.
 
 Dry-run and migrate explicitly:
 
@@ -104,14 +105,14 @@ The migration is a normal journaled checkpoint publication. The tool defaults
 to dry-run, uses a dedicated 32-MiB host thread stack for bounded migration
 state, and clears the supplied key buffer before returning.
 
-CI runs `make migration-check`, which creates a v5 fixture, proves ordinary
-mutation is denied, performs the migration and requires non-zero policy roots
-in the resulting v6 checkpoint.
+CI runs `make migration-check`, which creates a v6 fixture, performs the
+migration and requires a v7 checkpoint with non-zero policy roots. The host
+suite separately verifies that ordinary mutation of a legacy mount is denied.
 
 ## Verification
 
 - default HxFS host suite;
 - combined `crypto-aes-gcm,compression-engines,hxblob` suite;
-- explicit v5 -> v6 migration smoke;
+- explicit v6 -> v7 migration smoke;
 - encrypted QEMU NVMe mount through KeyBroker and on-disk policy roots;
 - GCM corruption injection and power-fail/replay gates.

@@ -491,7 +491,7 @@ impl<
         Ok(mounted)
     }
 
-    /// Whether this compatibility mount requires explicit v5 -> v6 migration.
+    /// Whether this compatibility mount requires explicit v6 -> v7 migration.
     pub const fn is_legacy_read_only(&self) -> bool {
         self.legacy_read_only
     }
