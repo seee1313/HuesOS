@@ -90,7 +90,7 @@ fn main() {
         }
     };
     let result = std::thread::Builder::new()
-        .name("hxfs-v5-v6-migration".to_string())
+        .name("hxfs-v6-v7-migration".to_string())
         .stack_size(MIGRATION_STACK_BYTES)
         .spawn(move || migrate(options))
         .and_then(|thread| {

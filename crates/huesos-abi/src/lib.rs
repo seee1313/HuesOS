@@ -113,6 +113,62 @@ pub mod broker_policy;
 /// (SystemIO vs SystemMemory vs PCI config) without firmware tables present.
 pub mod gas;
 
+/// Namespace for keys emitted through the kernel IRQ-to-port bridge.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+#[repr(u8)]
+pub enum InterruptEventKind {
+    /// Legacy ISA IRQ or pre-routed MSI/MSI-X vector.
+    LegacyOrVector = 0,
+    /// Explicit raw Global System Interrupt.
+    Gsi = 1,
+}
+
+/// Typed IRQ bridge key packed into one atomic-friendly `u64`.
+///
+/// The high 32 bits hold [`InterruptEventKind`], and the low 32 bits hold the
+/// IRQ/vector/GSI number. This prevents a raw GSI from colliding with a
+/// legacy-IRQ or MSI-vector key that has the same numeric value.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct InterruptEventKey {
+    kind: InterruptEventKind,
+    number: u32,
+}
+
+impl InterruptEventKey {
+    /// Construct a typed event key.
+    pub const fn new(kind: InterruptEventKind, number: u32) -> Self {
+        Self { kind, number }
+    }
+
+    /// Event-key namespace.
+    pub const fn kind(self) -> InterruptEventKind {
+        self.kind
+    }
+
+    /// Numeric interrupt identifier.
+    pub const fn number(self) -> u32 {
+        self.number
+    }
+
+    /// Encode the key as `(namespace << 32) | number`.
+    pub const fn raw(self) -> u64 {
+        ((self.kind as u64) << 32) | self.number as u64
+    }
+
+    /// Decode a raw event key, rejecting unassigned namespaces.
+    pub const fn from_raw(raw: u64) -> Option<Self> {
+        let kind = match raw >> 32 {
+            0 => InterruptEventKind::LegacyOrVector,
+            1 => InterruptEventKind::Gsi,
+            _ => return None,
+        };
+        Some(Self {
+            kind,
+            number: raw as u32,
+        })
+    }
+}
+
 /// Syscall number enumeration. The numeric value (not the variant name) is
 /// what actually crosses the ABI boundary in `rax`, so **never remove or
 /// reorder a variant** — only ever append new ones. Removing a syscall
@@ -315,7 +371,9 @@ pub enum Syscall {
     /// fixed userspace address. `a1` points to [`ResourceMapArgs`].
     ResourceMap = 56,
     /// Create an Interrupt object authorized by an `Irq` Resource. `a1` is the
-    /// Resource handle, `a2` is the IRQ/vector, `a3=*mut HandleValue`.
+    /// Resource handle, `a2` is a legacy ISA IRQ (`0..16`) or pre-routed
+    /// MSI/MSI-X vector (`0xD0..=0xDF`), `a3=*mut HandleValue`. Raw GSIs use
+    /// [`Self::InterruptCreateGsiForResource`].
     InterruptCreateForResource = 57,
     /// Queue one packet to a Port. `a1` is a Port handle with WRITE rights,
     /// `a2=*const PortPacket`.
@@ -377,6 +435,14 @@ pub enum Syscall {
     /// stale translation on another CPU cannot keep the physical range
     /// reachable from ring 3 after this call.
     ResourceUnmap = 65,
+    /// Create an Interrupt object for an explicit raw GSI authorized by an
+    /// `Irq` Resource. Unlike `InterruptCreateForResource`, `a2` is always a
+    /// GSI and is never interpreted as a legacy IRQ or MSI vector; `a1` is the
+    /// Resource handle and `a3=*mut HandleValue`.
+    InterruptCreateGsiForResource = 66,
+    /// Acknowledge one delivered level-triggered interrupt after device service.
+    /// `a1` is an Interrupt handle with WRITE rights.
+    InterruptAcknowledge = 67,
 }
 
 /// Maximum number of bytes one [`Syscall::SystemGetEntropy`] call
@@ -456,7 +522,7 @@ impl Syscall {
     /// Total number of defined syscalls (i.e. one past the highest
     /// currently-assigned number). The dispatcher uses this to reject
     /// obviously-out-of-range numbers before a `match`.
-    pub const COUNT: u64 = 66;
+    pub const COUNT: u64 = 68;
 
     /// Convert a raw syscall number back into a [`Syscall`], if valid.
     pub const fn from_raw(n: u64) -> Option<Self> {
@@ -527,6 +593,8 @@ impl Syscall {
             63 => Self::SystemKnobSet,
             64 => Self::SystemObservationRead,
             65 => Self::ResourceUnmap,
+            66 => Self::InterruptCreateGsiForResource,
+            67 => Self::InterruptAcknowledge,
             _ => return None,
         })
     }
@@ -1303,9 +1371,20 @@ pub struct ResourceUnmapArgs {
 #[cfg(test)]
 mod tests {
     use super::{
-        hbi_boot, rights, vmar_flags, ErrorCode, KnobIdAbi, ResourceKindAbi, ResourceMapArgs,
-        ResourceUnmapArgs, Syscall, MAX_OBSERVATION_BYTES, OBSERVATION_RECORD_SIZE,
+        hbi_boot, rights, vmar_flags, ErrorCode, InterruptEventKey, InterruptEventKind, KnobIdAbi,
+        ResourceKindAbi, ResourceMapArgs, ResourceUnmapArgs, Syscall, MAX_OBSERVATION_BYTES,
+        OBSERVATION_RECORD_SIZE,
     };
+
+    #[test]
+    fn interrupt_event_keys_preserve_namespace_and_full_u32_number() {
+        let legacy = InterruptEventKey::new(InterruptEventKind::LegacyOrVector, u32::MAX);
+        let gsi = InterruptEventKey::new(InterruptEventKind::Gsi, u32::MAX);
+        assert_ne!(legacy.raw(), gsi.raw());
+        assert_eq!(InterruptEventKey::from_raw(legacy.raw()), Some(legacy));
+        assert_eq!(InterruptEventKey::from_raw(gsi.raw()), Some(gsi));
+        assert_eq!(InterruptEventKey::from_raw(u64::MAX), None);
+    }
 
     #[test]
     fn boot_driver_manifest_header_validates() {
@@ -1392,7 +1471,9 @@ mod tests {
         assert_eq!(Syscall::SystemKnobSet as u64, 63);
         assert_eq!(Syscall::SystemObservationRead as u64, 64);
         assert_eq!(Syscall::ResourceUnmap as u64, 65);
-        assert_eq!(Syscall::COUNT, 66);
+        assert_eq!(Syscall::InterruptCreateGsiForResource as u64, 66);
+        assert_eq!(Syscall::InterruptAcknowledge as u64, 67);
+        assert_eq!(Syscall::COUNT, 68);
         assert_eq!(Syscall::from_raw(28), Some(Syscall::VmoCreateEx));
         assert_eq!(Syscall::from_raw(30), Some(Syscall::VmarProtect));
         assert_eq!(Syscall::from_raw(31), Some(Syscall::ChannelPeek));
@@ -1436,7 +1517,12 @@ mod tests {
         assert_eq!(Syscall::from_raw(63), Some(Syscall::SystemKnobSet));
         assert_eq!(Syscall::from_raw(64), Some(Syscall::SystemObservationRead));
         assert_eq!(Syscall::from_raw(65), Some(Syscall::ResourceUnmap));
-        assert_eq!(Syscall::from_raw(66), None);
+        assert_eq!(
+            Syscall::from_raw(66),
+            Some(Syscall::InterruptCreateGsiForResource)
+        );
+        assert_eq!(Syscall::from_raw(67), Some(Syscall::InterruptAcknowledge));
+        assert_eq!(Syscall::from_raw(68), None);
     }
 
     #[test]

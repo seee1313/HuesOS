@@ -22,7 +22,7 @@ If a class is unavailable, record it as missing evidence; do not substitute QEMU
 5. Build a separately signed image with only the command line changed. Boot against the same TPM object and capture PCR-policy rejection and encrypted-volume refusal.
 6. Run the KeyBroker crash image and capture: broker exit after grant 1, continued HxFS self-check/write markers, and generation 2 denial until reboot.
 7. Attempt an unsigned Limine image with Secure Boot still enabled. Capture firmware rejection and verify that `[HuesOS] Bootloader handed over control` is absent.
-8. Run the HxFS v5→v6 migration power-fail plan, cutting power after each harness-selected write/flush point. Every recovered image must be complete read-only v5 or mountable v6; mixed state is a failure.
+8. Run the HxFS v6→v7 migration power-fail plan, cutting power after each harness-selected write/flush point. Every recovered image must be complete read-only v6 or mountable v7; mixed state is a failure.
 
 Do not use a production data namespace. TPM ownership and Secure Boot enrollment can make a machine unbootable if performed incorrectly; retain the platform's owner-approved recovery media and key backups.
 

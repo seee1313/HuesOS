@@ -14,6 +14,7 @@ bitflags = { workspace = true }
 bit_field = { workspace = true }
 static_assertions = { workspace = true }
 huesos-pmm = { path = "../huesos-pmm" }
+huesos-abi = { path = "../huesos-abi" }
 huesos-ioapic = { path = "../huesos-ioapic" }
 huesos-sync = { path = "../huesos-sync" }
 huesos-sched = { path = "../huesos-sched" }

@@ -2,8 +2,10 @@
 
 use crate::{LockRank, RankedIrqSafeTicketLock};
 
-/// IRQ callback signature: `(legacy_pic_irq, event_data)`.
-pub type IrqCallback = fn(u8, u64);
+/// IRQ callback signature: `(typed event key, event_data)`. Event keys are
+/// encoded by `huesos_abi::InterruptEventKey` so raw GSIs cannot collide with
+/// legacy IRQ or MSI-vector keys.
+pub type IrqCallback = fn(u64, u64);
 
 static IRQ_CALLBACK: RankedIrqSafeTicketLock<Option<IrqCallback>> =
     RankedIrqSafeTicketLock::new(None, LockRank::ARCHITECTURE);
@@ -14,9 +16,9 @@ pub fn set_irq_callback(callback: IrqCallback) {
 }
 
 /// Emit an IRQ event to the registered callback, if any.
-pub fn emit(irq: u8, data: u64) {
+pub fn emit(event_key: u64, data: u64) {
     let callback = *IRQ_CALLBACK.lock();
     if let Some(callback) = callback {
-        callback(irq, data);
+        callback(event_key, data);
     }
 }

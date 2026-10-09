@@ -44,8 +44,8 @@ userspace:   libcanvas, init, driver-manager, driver-host-input,
              pci-manager, shutdown-broker, terminal, doom, fault-probe
 ```
 
-`tools/hbi-gen` builds HBI v2.1 images; `tools/hxfs-migrate` performs explicit
-journaled HxFS v5→v6 migration. Coverage-guided targets live under `fuzz/`.
+`tools/hbi-gen` builds HBI v2.2 images; `tools/hxfs-migrate` performs explicit
+journaled HxFS v6→v7 migration. Coverage-guided targets live under `fuzz/`.
 
 Policy crates remain independently host-testable. Their documentation now
 states whether each one is a model only or is integrated into a privileged

@@ -54,6 +54,9 @@ fn dispatch(info: FaultInfo) -> ! {
 
 static IDT: Lazy<InterruptDescriptorTable> = Lazy::new(|| {
     let mut idt = InterruptDescriptorTable::new();
+    // One dedicated stub per dynamic I/O-APIC vector: x86-64 does not expose
+    // the active vector through InterruptStackFrame itself.
+    super::ioapic_vectors::install(&mut idt);
     idt.divide_error.set_handler_fn(divide_error_handler);
     idt.breakpoint.set_handler_fn(breakpoint_handler);
     idt.invalid_opcode.set_handler_fn(invalid_opcode_handler);
@@ -243,7 +246,14 @@ nvme_msi_handler!(nvme_msi_handler_15, 15);
 fn pci_msi_ack(vector: u8) {
     super::cpu::clear_user_access();
     super::lapic::eoi();
-    crate::x86_64::irq_callback::emit(vector, 0);
+    crate::x86_64::irq_callback::emit(
+        huesos_abi::InterruptEventKey::new(
+            huesos_abi::InterruptEventKind::LegacyOrVector,
+            u32::from(vector),
+        )
+        .raw(),
+        0,
+    );
 }
 
 extern "x86-interrupt" fn keyboard_handler(_stack_frame: InterruptStackFrame) {
@@ -268,10 +278,15 @@ fn keyboard_irq_ack(pic: bool) {
         unsafe {
             super::interrupts::PICS.lock().notify_end_of_interrupt(33);
         }
+        crate::x86_64::irq_callback::emit(
+            huesos_abi::InterruptEventKey::new(huesos_abi::InterruptEventKind::LegacyOrVector, 1)
+                .raw(),
+            scancode as u64,
+        );
     } else {
         super::lapic::eoi();
+        super::ioapic::dispatch_vector_with_data(super::ioapic::KEYBOARD_VECTOR, scancode as u64);
     }
-    crate::x86_64::irq_callback::emit(1, scancode as u64);
 }
 
 #[cfg(test)]

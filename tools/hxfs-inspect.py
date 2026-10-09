@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Inspect an HxFS v6 image and print root metadata as JSON."""
+"""Inspect an HxFS image and print root metadata as JSON."""
 
 from __future__ import annotations
 

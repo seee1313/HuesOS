@@ -10,6 +10,7 @@ pub mod gdt;
 pub mod idt;
 pub mod interrupts;
 pub mod ioapic;
+mod ioapic_vectors;
 pub mod irq_callback;
 pub mod lapic;
 pub mod paging;

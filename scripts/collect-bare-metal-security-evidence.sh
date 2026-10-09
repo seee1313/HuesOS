@@ -89,7 +89,7 @@ case "$case_name" in
     migration)
         # Migration harnesses may use platform-specific markers; retain the raw
         # log and require the operator to supply the final complete-state line.
-        require 'migration recovery: complete v5 or v6' || failed=1
+        require 'migration recovery: complete v6 or v7' || failed=1
         ;;
     *) echo "unknown EVIDENCE_CASE: $case_name" >&2; exit 2 ;;
 esac

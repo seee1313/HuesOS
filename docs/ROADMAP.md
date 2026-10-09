@@ -365,29 +365,31 @@ next-stage expansion items; they are not blockers for the Immediate milestone.
   extable fault-recovery proof.
 
 ### 2. IOAPIC interrupt routing
-- **Current**: LAPIC timer on all CPUs; keyboard IRQ1 is routed through an
-  integrated masked-first I/O APIC path with PIC fallback.
+- **Current**: LAPIC timer on all CPUs; keyboard IRQ1 uses an integrated
+  masked-first I/O APIC path with PIC fallback. A multi-controller route manager
+  now supports additional legacy IRQs and explicitly typed raw GSIs.
 - **Policy core landed**: `huesos-ioapic` — host-tested redirection-entry codec,
-  MADT Interrupt Source Override parsing, vector allocation, and GSI→I/O APIC
-  routing (see [IOAPIC_ROUTING.md](IOAPIC_ROUTING.md)).
-- **Route verification landed**: the policy helper refuses non-device vectors
-  and skips reserved vectors in misconfigured ranges; host tests cover
-  non-identity IRQ1 source overrides and level-triggered LAPIC
-  EOI requirements, and the privileged keyboard route now reads back the I/O
-  APIC redirection entry after unmasking. A mismatch masks the entry again and
-  leaves the PIC fallback active.
-- **Production-safe x2APIC/route foundation landed**: I/O APIC destination
-  construction is x2APIC-aware and refuses APIC IDs that cannot be represented
-  in the classic 8-bit redirection-entry destination field, preventing silent
-  truncation. The privileged route core is generic over legacy IRQ/vector and
-  records routed IRQs in a bitmap; IRQ1 remains the only enabled route until
-  matching IDT handlers and device drivers are installed. PIC fallback is
-  intentionally retained for production hardware until broader coverage proves
-  it safe to remove.
-- **Immediate status**: complete for the current hardware matrix. Future work is
-  additive: interrupt remapping/x2APIC logical destination support, multi-device
-  route enablement as drivers appear, and eventual PIC fallback removal after
-  bare-metal validation.
+  strict MADT Interrupt Source Override parsing, vector allocation in
+  `0x30..=0xCF`, controller-range validation, and GSI→I/O APIC routing (see
+  [IOAPIC_ROUTING.md](IOAPIC_ROUTING.md)).
+- **Kernel route integration landed**: all discovered I/O APIC pins are masked
+  and read back at initialization; GSI routes are installed masked-first with
+  verified readback and SMP-serialized IOREGSEL/IOWIN access. Dynamic vectors
+  share a generic IDT/IRQ bridge. Interrupt-object bind/drop owns route
+  acquire/release, and level-triggered sources are masked before LAPIC EOI and
+  re-enabled by `Interrupt::acknowledge()` after device service. Active level
+  routes are single-owner.
+- **Affinity and limits**: destination APIC IDs above 255 and CPUs not reported
+  scheduler-online are rejected. ACPI `_PRT`/link-device resolution and
+  interrupt remapping remain out of scope; the current raw-GSI convenience
+  route uses PCI INTx defaults for non-ISA GSIs when no more precise data is
+  available.
+- **Verification status**: policy/object/ABI/syscall tests and host builds have
+  passed. The QEMU SMP2 QMP test injects a PS/2 key and observes its IRQ packet
+  reach the userspace Port through the keyboard IOAPIC route. Non-keyboard raw
+  GSI delivery, level ACK/re-enable, route release/affinity integration, and
+  bare-metal firmware validation remain open. PIC fallback remains until
+  broader coverage establishes it is safe to remove.
 
 ### 3. Process/task and object teardown (mostly done)
 - **Current**: exited-process stacks, private page tables, and address-space-
@@ -669,7 +671,7 @@ Closed items:
 These were deliberately excluded to keep the first MVP's surface area
 achievable — several are now partially landed (SMP, BOOTFS, FAT lib):
 
-- ~~SMP~~ → core path done; IOAPIC keyboard path done, general routing still open
+- ~~SMP / IOAPIC routing~~ → SMP core and the generic IOAPIC route manager are implemented; QEMU/physical validation of device delivery and level ACK remains open
 - Any filesystem on real block devices
 - Networking
 - Full process teardown / wait

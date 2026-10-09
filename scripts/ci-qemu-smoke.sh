@@ -36,24 +36,18 @@ if grep -q 'KERNEL PANIC' "$log"; then
     tail -200 "$log" >&2
     exit 1
 fi
-# Boot markers that must appear in the QEMU log for the test to pass.
-# These cover the critical boot path: bootloader → kernel → userspace init.
-# Additional service markers (acpi-manager, driver-manager, terminal) are
-# commented out pending service launch integration — see docs/ROADMAP.md.
-#
-# Boot markers that must appear in the QEMU log for the test to pass.
-# These now cover the full happy-path boot chain, kernel → init →
-# DriverManager → DriverHosts → shutdown-broker → terminal shell
-# ready, so a regression that leaves any of them stranded (e.g. the
-# manifest-grants-race-with-BOOTFS-VMO delivery bug that shipped in
-# PR-D and was fixed in this PR) turns CI red instead of merging
-# green under a broken user experience.
+# Require stable markers for the full happy-path boot chain, from bootloader
+# through the terminal shell. These checks catch stalled service launches.
+# Ring-3 and kernel serial writes can interleave on SMP. Check ACPI validation
+# with stable fragments; terminal readiness below replaces its splittable
+# "[init] launched terminal" line as proof of successful startup.
 for marker in \
     '[HBI] Ed25519 signature verified (v2.2)' \
     '[uACPI] validated ACPI table graph and MADT' \
     '[uACPI] built immutable Ring-3 table archive v2' \
     '[uACPI] derived bounded FADT SystemIO policy' \
-    '[acpi-manager] validated ACPI archive v2:' \
+    '[acpi-manager] validated ACPI archive v' \
+    'physical mappings, snapshot' \
     '[init] hello from ring3 userspace, via libcanvas' \
     '[init] VMO read/write round-trip OK' \
     '[init] channel IPC round-trip OK' \
@@ -73,7 +67,6 @@ for marker in \
     '[driver-manager] ACPI manager ready generation' \
     '[pci-manager] ready without root descriptors; fail-closed' \
     '[driver-manager] PCI manager ready (no roots; fail-closed)' \
-    '[init] launched terminal' \
     '[terminal] keyboard service online, starting shell' \
     '[init] stage selftest ok' \
     '[init] stage summary ok selftest' \
