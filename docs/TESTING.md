@@ -68,6 +68,18 @@ This runs, e.g.:
 Crates tied to real hardware (`huesos-arch`, SMP, full process/scheduler)
 are validated by QEMU boots rather than host mocks.
 
+## Syscall transaction failure regressions
+
+`make test` exercises invalid output ranges and excessive sizes through actual
+syscall dispatch where rejection precedes CR3/current-process access. It also
+injects commit failures into real handle-table helpers and tests closed-peer,
+queue-full and undersized-receive IPC paths. The object suite uses its existing
+serialized PMM fixture to require exact frame reclamation after VMO publication
+failure and exact preservation of free frames after VMO allocation OOM.
+No test replaces active page-table permissions with a host mock. Invalid pointer
+ranges are limited to ABI-bound rejection; fault recovery still needs QEMU.
+
+
 ## Static gates (`make audit-check`)
 
 Seven dependency-free checks run before every PR and in CI. They exist

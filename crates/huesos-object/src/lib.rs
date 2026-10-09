@@ -147,6 +147,7 @@ mod tests {
         // return Err, not panic/abort the process (which, in the real
         // kernel, means "not take down the whole machine").
         with_fresh_env(huesos_pmm::FRAME_SIZE * 4, || {
+            let free_before = huesos_pmm::free_frames();
             let huge = Vmo::new(1024 * 1024 * 1024); // 1 GiB, way more than 4 frames
             assert!(
                 huge.is_err(),
@@ -156,8 +157,39 @@ mod tests {
             // The PMM must not have leaked partial allocations from the
             // failed attempt: we should still be able to allocate whatever
             // frames were actually available.
+            assert_eq!(
+                huesos_pmm::free_frames(),
+                free_before,
+                "failed VMO allocation must return every frame"
+            );
+        });
+    }
+
+    #[test]
+    fn vmo_publication_fault_returns_all_frames_and_collects_registry_entry() {
+        with_fresh_env(huesos_pmm::FRAME_SIZE * 8, || {
             let free_before = huesos_pmm::free_frames();
-            assert!(free_before > 0, "failed VMO::new must not leak frames");
+            let vmo = Vmo::new(2 * huesos_pmm::FRAME_SIZE as usize);
+            assert!(vmo.is_ok());
+            let Ok(vmo) = vmo else {
+                return;
+            };
+            let koid = vmo.koid();
+            register_object(vmo);
+            assert_eq!(huesos_pmm::free_frames(), free_before - 2);
+            let table = HandleTable::new();
+            let mut attempted = 0;
+            assert_eq!(
+                table.add_with_commit(Handle::new(koid, Rights::DEFAULT_VMO), |slot| {
+                    attempted = slot;
+                    Err::<(), _>(huesos_abi::ErrorCode::InvalidArgs)
+                }),
+                Err(huesos_abi::ErrorCode::InvalidArgs)
+            );
+            assert!(table.get(attempted).is_none());
+            assert!(lookup_object(koid).is_none());
+            assert_eq!(object_ref_counts(koid), (0, 0));
+            assert_eq!(huesos_pmm::free_frames(), free_before);
         });
     }
 
