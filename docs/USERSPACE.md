@@ -263,6 +263,12 @@ This writes to the kernel's serial debug console via the `DebugWrite`
 syscall — there's no real terminal/stdout device yet, so this is what
 you'll see in `make run`'s output.
 
+`print!`/`println!` format each line into a 512-byte local buffer and issue
+one `DebugWrite` per newline (or per 512 bytes). The kernel holds the serial
+lock for the whole chunk, so one line is not split by output from another
+CPU. Do not expect a single `println!` to produce one syscall per format
+argument.
+
 ## Building your program
 
 Every userspace program needs:

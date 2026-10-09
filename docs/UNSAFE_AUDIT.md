@@ -261,6 +261,38 @@ comment:
 Unsafe added only to silence the compiler or wrap a safe syscall helper is not
 accepted.
 
+## Raw-GSI level-probe MMIO boundary (`irq_probe.rs`)
+
+Dedicated safety-budget review for the `irq_test=1` boot self-test
+(`crates/huesos-kernel/src/boot/irq_probe.rs`). It adds two `unsafe` blocks,
+both volatile 32-bit accesses to the BAR0 window of QEMU's `edu` test device.
+
+Answers to the review rules above:
+
+1. Invariant: the address is inside the BAR0 window, mapped uncached by
+   `map_mmio_window` (HHDM, `PRESENT|WRITABLE|NO_CACHE|NO_EXECUTE`), and the
+   offset is a 4-byte-aligned register (`0x00`, `0x60`, `0x64`).
+2. Established by `find_edu` + `size_bar0` (BAR decode and sizing, config space
+   restored) and `map_mmio_window`, both in `boot/storage.rs`.
+3. Valid for the whole probe, which runs once on the BSP and unmaps nothing.
+4. No aliasing: the probe is the only accessor, and the device is not claimed
+   by any other driver on a boot that requests `irq_test=1`.
+5. Bounds: window length comes from the decoded BAR; the identification
+   register is checked (`0x010000ed`) before any raise/ack write.
+6. Firmware input: a malformed BAR or a non-`edu` device fails closed before the
+   MMIO path. Normal boots never reach it because the probe is gated on the HBI
+   command line.
+7. No safe wrapper exists in the kernel for a PCI BAR window. The existing
+   volatile MMIO in `tpm.rs` and `storage.rs` is private to those modules and
+   has no generic 32-bit read/write helper.
+8. Test: `scripts/ci-qemu-irq-level-smoke.sh` (QEMU `-device edu`). It requires
+   the identification-dependent delivery markers, and a missing marker fails CI.
+
+Budget delta (measured with `tools/audit-safety.py`): HEAD measured
+`unsafe_blocks = 381`, and `safety-budget.json` still recorded 382 at HEAD. This
+change measures 383 (+2 from `irq_probe.rs`), so the baseline is set to 383.
+`safety-budget.json` also gains a per-file entry for `irq_probe.rs` (2).
+
 ## Panicking-surface audit (`unwrap` / `expect` / `panic!`)
 
 Companion to the unsafe audit above, this section categorizes the *panicking*

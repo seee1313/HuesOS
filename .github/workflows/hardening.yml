@@ -555,6 +555,41 @@ jobs:
           path: ci-artifacts/
           if-no-files-found: warn
 
+  qemu-irq-level-smoke:
+    # Boot QEMU with `irq_test=1` and a `-device edu` INTx source, then
+    # require the raw-GSI level-route markers: route bound to a Port,
+    # masked while asserted, and redelivered after acknowledge.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        profile: [debug, release]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            gcc xorriso qemu-system-x86 swtpm swtpm-tools
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install nightly-2026-03-01 --profile minimal \
+            --component rust-src,llvm-tools-preview
+          rustup default nightly-2026-03-01
+      - name: Extable smoke (synthetic recoverable-copy probe)
+        env:
+          CARGO_BUILD_JOBS: "1"
+          ARTIFACT_DIR: ci-artifacts
+        run: bash scripts/ci-qemu-irq-level-smoke.sh ${{ matrix.profile }} 2 150
+      - name: Upload serial log
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: qemu-irq-level-${{ matrix.profile }}-smp2
+          path: ci-artifacts/
+          if-no-files-found: warn
+
   verified-boot-hardening:
     # Security/release chain gates. QEMU is used for deterministic CI only;
     # physical Intel/AMD/NVMe/TPM evidence is collected separately before merge.

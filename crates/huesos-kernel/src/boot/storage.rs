@@ -37,9 +37,9 @@ const MSI_CONTROL_MME_MASK: u16 = 0x7 << 4;
 const MSI_CONTROL_64BIT: u16 = 1 << 7;
 
 #[derive(Clone, Copy)]
-struct Bar0Info {
-    base: u64,
-    len: u64,
+pub(crate) struct Bar0Info {
+    pub(crate) base: u64,
+    pub(crate) len: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -252,7 +252,10 @@ fn try_configure_msi(
     })
 }
 
-fn map_mmio_window(phys: u64, len: u64) -> Result<(), huesos_arch::paging::KernelPageError> {
+pub(crate) fn map_mmio_window(
+    phys: u64,
+    len: u64,
+) -> Result<(), huesos_arch::paging::KernelPageError> {
     use x86_64::structures::paging::PageTableFlags;
     huesos_arch::paging::map_hhdm_range_flags(
         phys,
@@ -293,7 +296,7 @@ fn enable_device_bus_master(location: PciAddress) {
     );
 }
 
-fn read_config_space(location: PciAddress) -> ConfigSpace {
+pub(crate) fn read_config_space(location: PciAddress) -> ConfigSpace {
     let mut bytes = [0u8; 256];
     let mut offset = 0usize;
     while offset < bytes.len() {
@@ -304,7 +307,7 @@ fn read_config_space(location: PciAddress) -> ConfigSpace {
     ConfigSpace(bytes)
 }
 
-fn size_bar0(location: PciAddress, config: &ConfigSpace) -> Option<Bar0Info> {
+pub(crate) fn size_bar0(location: PciAddress, config: &ConfigSpace) -> Option<Bar0Info> {
     let lo = config.bar_raw(0)?;
     if lo & 1 != 0 {
         return None;
@@ -364,14 +367,14 @@ fn legacy_plan(
     LegacyConfigPlan::try_new(location, offset).ok()
 }
 
-fn read_config_u16(location: PciAddress, offset: usize) -> u16 {
+pub(crate) fn read_config_u16(location: PciAddress, offset: usize) -> u16 {
     let Some(plan) = legacy_plan(location, offset, ConfigWidth::Word) else {
         return u16::MAX;
     };
     plan.extract(read_legacy_dword(plan.address_register())) as u16
 }
 
-fn write_config_u16(location: PciAddress, offset: usize, value: u16) {
+pub(crate) fn write_config_u16(location: PciAddress, offset: usize, value: u16) {
     let Some(plan) = legacy_plan(location, offset, ConfigWidth::Word) else {
         return;
     };
@@ -382,21 +385,21 @@ fn write_config_u16(location: PciAddress, offset: usize, value: u16) {
     );
 }
 
-fn read_config_u32(location: PciAddress, offset: usize) -> u32 {
+pub(crate) fn read_config_u32(location: PciAddress, offset: usize) -> u32 {
     let Some(plan) = legacy_plan(location, offset, ConfigWidth::Dword) else {
         return u32::MAX;
     };
     read_legacy_dword(plan.address_register())
 }
 
-fn write_config_u32(location: PciAddress, offset: usize, value: u32) {
+pub(crate) fn write_config_u32(location: PciAddress, offset: usize, value: u32) {
     let Some(plan) = legacy_plan(location, offset, ConfigWidth::Dword) else {
         return;
     };
     write_legacy_dword(plan.address_register(), value);
 }
 
-fn read_legacy_dword(address: u32) -> u32 {
+pub(crate) fn read_legacy_dword(address: u32) -> u32 {
     use x86_64::instructions::port::Port;
 
     // SAFETY: CF8/CFC are the architected x86 PCI Configuration Mechanism #1
@@ -410,7 +413,7 @@ fn read_legacy_dword(address: u32) -> u32 {
     }
 }
 
-fn write_legacy_dword(address: u32, value: u32) {
+pub(crate) fn write_legacy_dword(address: u32, value: u32) {
     use x86_64::instructions::port::Port;
 
     // SAFETY: same CF8/CFC contract as `read_legacy_dword`; callers provide a

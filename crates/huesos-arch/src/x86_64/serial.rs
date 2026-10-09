@@ -35,15 +35,47 @@ pub fn emergency_write(s: &str) {
     }
 }
 
+/// Write a byte slice while holding the serial lock for the whole slice.
+///
+/// Callers that emit one logical log line must use this (or `SerialWriter`'s
+/// `write_fmt`) rather than per-byte `write_byte`: separate lock
+/// acquisitions let another CPU's output land in the middle of the line, and
+/// the boot smoke greps for whole lines.
+pub fn write_bytes(bytes: &[u8]) {
+    let mut port = SERIAL.lock();
+    for &b in bytes {
+        port.send(b);
+    }
+}
+
+/// Adapter that writes formatted text into an already-locked port.
+struct LockedPortWriter<'a>(&'a mut SerialPort);
+
+impl fmt::Write for LockedPortWriter<'_> {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        for b in s.bytes() {
+            self.0.send(b);
+        }
+        Ok(())
+    }
+}
+
 /// Writer for `core::fmt::Write`.
 pub struct SerialWriter;
 
 impl fmt::Write for SerialWriter {
     fn write_str(&mut self, s: &str) -> fmt::Result {
-        let mut port = SERIAL.lock();
-        for b in s.bytes() {
-            port.send(b);
-        }
+        write_bytes(s.as_bytes());
         Ok(())
+    }
+
+    /// Format the whole argument list under one lock acquisition, so a
+    /// `writeln!` line is never split by another CPU's output.
+    ///
+    /// Formatting must not re-enter the serial console; a `Display` impl that
+    /// logs would deadlock here.
+    fn write_fmt(&mut self, args: fmt::Arguments<'_>) -> fmt::Result {
+        let mut port = SERIAL.lock();
+        fmt::write(&mut LockedPortWriter(&mut port), args)
     }
 }
