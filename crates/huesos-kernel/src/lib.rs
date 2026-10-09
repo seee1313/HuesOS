@@ -57,9 +57,9 @@ static INIT_BINARY_STORAGE: AlignedBytes<INIT_BINARY_LEN> =
 
 /// Statically embedded, explicitly aligned init ELF image.
 ///
-/// `xmas-elf` reads typed ELF records and requires natural alignment. Relying
-/// on incidental linker placement of `include_bytes!` caused boot panics when
-/// unrelated code-size changes shifted this array.
+/// `huesos-elf` decodes ELF fields byte-wise and does not need alignment. The
+/// explicit wrapper still keeps the embedded image at a fixed, documented
+/// placement, so layout changes elsewhere cannot silently move it.
 pub static INIT_BINARY: &[u8] = &INIT_BINARY_STORAGE.0;
 static INIT_PROCESS_KOID: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
