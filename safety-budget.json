@@ -6,7 +6,7 @@
     "panic_macros": 15,
     "static_mut": 1,
     "todo_markers": 1,
-    "unsafe_blocks": 382,
+    "unsafe_blocks": 383,
     "unsafe_functions": 76,
     "unsafe_impls": 33,
     "unwrap_calls": 22
@@ -36,6 +36,7 @@
     "crates/huesos-fat/src/lib.rs": 5,
     "crates/huesos-fb/src/lib.rs": 7,
     "crates/huesos-kernel/src/boot/hbi.rs": 3,
+    "crates/huesos-kernel/src/boot/irq_probe.rs": 2,
     "crates/huesos-kernel/src/boot/storage.rs": 3,
     "crates/huesos-kernel/src/extable.rs": 4,
     "crates/huesos-kernel/src/init.rs": 5,

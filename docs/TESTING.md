@@ -376,6 +376,27 @@ POWERFAIL_SEED=<seed> bash scripts/ci-qemu-powerfail.sh debug build 2
 Reproducing a failure exactly is the difference between a bug and
 "CI was flaky once".
 
+## Raw-GSI level interrupt smoke
+
+`scripts/ci-qemu-irq-level-smoke.sh <profile> <cpus> <timeout>` boots with the
+HBI command line `irq_test=1` and QEMU `-device edu`. The `edu` device raises a
+level-triggered INTx line when software writes its raise register. The kernel
+probe (`boot/irq_probe.rs`) then requires these markers, in order:
+
+```text
+[irq-test] edu INTx pin 1 -> GSI 11
+[irq-test] raw GSI route acquired and bound to Port
+[irq-test] level IRQ delivered to Port
+[irq-test] level route stayed masked until acknowledge
+[irq-test] level re-enable after acknowledge OK
+[irq-test] raw GSI level route self-test OK
+```
+
+A `[irq-test] FAILED:` line or a kernel panic fails the script. The probe runs
+on the BSP after interrupts are enabled and has a 3-second delivery timeout. It
+exercises the kernel Port path only. The userspace raw-GSI syscalls are not yet
+covered (see `docs/IOAPIC_ROUTING.md`).
+
 ## Kernel Panic Screen Test
 
 Normal images never panic intentionally. To exercise the fatal path, build an
@@ -454,6 +475,7 @@ not a spec:
 | `qemu-nvme-long-soak` | one bounded pass of `scripts/soak-long.sh` (~2 h) |
 | `qemu-storage-off` | NVMe present, `init.storage=off`, image hash unchanged |
 | `qemu-extable-smoke` | recoverable-copy fixup path |
+| `qemu-irq-level-smoke` | raw-GSI level route masked/acknowledged/redelivered (`irq_test=1`) |
 
 `swtpm` and `swtpm-tools` are installed in every QEMU job, so the
 TPM-backed key path is exercised rather than silently skipped. Mode 6
