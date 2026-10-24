@@ -24,8 +24,8 @@ Include:
 ## Supported versions
 
 Only the current `main` branch receives security fixes. There are no stable
-releases or format-compatibility guarantees yet. HxFS v5 is read-compatible but
-mutation requires the explicit v6 migration tool.
+releases or format-compatibility guarantees yet. HxFS v6 is supported
+read-only; mutation requires explicit migration to v7 with `hxfs-migrate`.
 
 ## Disclosure
 

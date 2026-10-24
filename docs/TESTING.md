@@ -82,12 +82,12 @@ ranges are limited to ABI-bound rejection; fault recovery still needs QEMU.
 
 ## Static gates (`make audit-check`)
 
-Seven dependency-free checks run before every PR and in CI. They exist
-because each one encodes a rule that a reviewer had already failed to
-enforce by reading:
+Eight repository checks run before every PR and in CI. They exist because
+each one encodes a rule that a reviewer had already failed to enforce by
+reading:
 
 ```bash
-make audit-check     # all seven
+make audit-check     # all eight
 make fmt-check       # the last one on its own
 ```
 
@@ -99,6 +99,7 @@ make fmt-check       # the last one on its own
 | `check-hues-async-noalloc.py` | `crates/hues-async/**` never allocates — no `alloc`, no heap collection, tests included |
 | `check-huesos-object-lock-policy.py` | no bare `spin::Mutex` outside `irq_guard.rs` |
 | `check-poll-budgets.py` | every channel-draining loop in a shared service is bounded (see below) |
+| `check-doc-links.py` | every relative Markdown link in the README and `docs/` resolves to an existing workspace path |
 | `fmt-all.py --check` | formatting across the kernel workspace **and every standalone userspace crate**, which plain `cargo fmt --all` does not reach |
 
 ### The poll-budget gate
@@ -156,7 +157,7 @@ generation one reaches readiness without injection.
 [SMP] AP 1 online (waiting for release)
 [SMP] AP 1 ready
 [SMP] bringup done, APs ready=1
-HBI v2.1 parsed. Entries: 0x4
+HBI v2.2 parsed. Entries: 0x4
 [SMP] APs released to run
 [SMP] AP 1 scheduling
 HuesOS v0.1.0 on CPU 0
@@ -332,7 +333,7 @@ kernel stops in the test image before launching userspace.
 ## Storage soak and fault injection
 
 `scripts/ci-qemu-nvme-soak.sh <profile> <seconds> <log> <mode>` boots the
-system against a real QEMU NVMe controller with an HxFS v6 image. The
+system against a real QEMU NVMe controller with an HxFS development image. The
 mode selects what is seeded and which markers are required:
 
 | Mode | What it proves |

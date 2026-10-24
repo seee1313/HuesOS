@@ -1,8 +1,7 @@
 # HuesOS status and evidence map
 
-Status reviewed against `main` at `71776eb` (2026-10-09). This is a versioned
+Status reviewed against `main` at `92b0eac` (2026-10-09). This is a versioned
 snapshot, not a live dashboard and not a claim that every current CI job passed.
-The later lifecycle-regression branch is deliberately not assumed merged here.
 
 ## Read this first
 
@@ -15,12 +14,12 @@ A checked box in an old roadmap is not a current release approval.
 | Boot and ring3 | Limine UEFI, independent address spaces, ELF launch and syscalls | Host ELF/PMM/object suites; `scripts/ci-qemu-smoke.sh` checks ring3, VMO, IPC and terminal markers | One MSI Modern 15 B5M smoke report; not a compatibility certification |
 | Signed boot image | HBI v2.2 signature verification; development keys are not release keys | `scripts/ci-qemu-hbi-signature-smoke.sh`, secure-boot/TPM scripts are configured gates | Physical Secure Boot/TPM security matrix remains required |
 | User-copy | Bounds/page-table validation, process memory lock, extable copies; sealed typed record allowlist and zeroed output padding | Syscall host suite; default user-pointer diagnostics; `scripts/ci-qemu-smep-smap-smoke.sh` on CPU max | Real CPU feature evidence must distinguish enabled controls from degraded mode |
-| Objects and processes | Registry uses RefAccount; ProcessLifecycle, exit status, counted waiters, port notifications, deferred teardown and bounded graveyard wired | Object/policy host suites and 32-exit init probe; inspect run logs, not marker wording alone | Full-system baseline return, cancellations and longer concurrent storms need separate evidence |
-| Task identities and SMP | Global TaskSlotAllocator/TaskDirectory; stable generation-bearing TaskId; owner-local scheduling and token-mediated remote operations | `huesos-sched` host tests exist; base make test does not explicitly select this package. Kernel and QEMU boot tests are complementary | Known pending-operation carry-over in the current reaper-style reuse sequence; see TASK_GENERATIONS. CPU ownership is not encoded in TaskId. EEVDF/CBS/SMP v2 target design is only partially integrated |
+| Objects and processes | Registry uses RefAccount; ProcessLifecycle, exit status, counted waiters, port notifications, deferred teardown and bounded graveyard wired | Object/policy host suites, actual-object exit/wait regressions, 4096-exit bounded-graveyard tests and 32-exit init probe with repeated observation; inspect run logs, not marker wording alone | Full-system baseline return, cancellations and longer concurrent storms need separate evidence |
+| Task identities and SMP | Global TaskSlotAllocator/TaskDirectory; stable generation-bearing TaskId; owner-local scheduling and token-mediated remote operations | `huesos-sched` host tests are selected by `make test`; generation-helper regressions cover sequential reuse and stale operations. Kernel and QEMU boot tests are complementary | Known pending-operation carry-over in the current reaper-style reuse sequence; sequential helper tests do not close that integration gap. See TASK_GENERATIONS. CPU ownership is not encoded in TaskId. EEVDF/CBS/SMP v2 target design is only partially integrated |
 | IRQ routing | Multi-controller route manager, dynamic vectors, typed IRQ/GSI objects, level ACK | IOAPIC host tests; keyboard QMP userspace test; edu level/raw-GSI kernel probe | Kernel-Port probe is not proof of raw-GSI userspace syscall path or real-device coverage |
 | Job quotas | Hierarchical Job tree, VMO memory/CPU tick charging and bounded IPC queues; public Job controls | Quota/object host suites; integration stress still required | Per-handle hard caps and page-table metadata accounting are not complete |
 | ACPI / PCI | Kernel immutable ACPI archive and broker; isolated userspace uACPI runtime; current PCI bootstrap/migration shim | Host decoders; ACPI restart/boot gates | Full AML/PCI-manager production stages remain separate release blockers |
-| NVMe / HxFS | Userspace driver and mutable filesystem foundation, versioned policies and recovery paths; production status remains false | Host/storage feature gates and QEMU fault/soak scripts; no new storage test result asserted by this docs change | Dedicated two-vendor NVMe, format approval and independent security review remain open; no physical storage verification inferred from the laptop report |
+| NVMe / HxFS | Userspace driver and mutable HxFS v7 foundation; read-only v6 compatibility with explicit migration; versioned policies and recovery paths; production status remains false | Host/storage feature gates and QEMU fault/soak scripts; inspect per-commit results | Dedicated two-vendor NVMe, v7 format approval and independent security review remain open; no physical storage verification inferred from the laptop report |
 | Framebuffer / terminal | Capability-gated drawing remains in kernel; userspace Canvas, terminal and games | Host framebuffer tests; terminal boot gate; visual/game tests have separate procedures | No Unicode shaping, GPU acceleration or desktop compositor claimed |
 
 ## Which documents are authoritative?

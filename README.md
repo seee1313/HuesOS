@@ -71,19 +71,22 @@ see [Known Limitations](#known-limitations) and
   8×8 modes retained as `font tty` / `font compact`
 - ✅ DoomGeneric userspace port with Freedoom Phase 1, custom non-POSIX libc,
   Canvas video, Channel keyboard input, and monotonic timing (silent first cut)
-- ✅ Userspace NVMe DriverHost and HxFS v6 on real QEMU block devices, with
-  versioned on-disk policy roots, 64-bit AEAD generations, journal replay,
-  power-fail testing, scrub/fsck, quotas, compression and Hxblob
+- ✅ Userspace NVMe DriverHost and mutable HxFS v7 on QEMU block devices, with
+  read-only v6 compatibility and explicit migration, versioned on-disk policy
+  roots, 64-bit AEAD generations, journal replay, power-fail testing,
+  scrub/fsck, quotas, compression and Hxblob
 - ✅ Capability-gated KeyBroker: the kernel relinquishes the volume key once;
   supervised HxFS generations receive single-use grant channels
 
-All of the above is exercised live by `huesos-init` on every boot — built
-against `libcanvas` — which creates a VMO, does a channel round-trip,
-mirrors logs to the framebuffer, then launches DriverManager and the
-framebuffer terminal. DriverManager starts an `input-host` DriverHost,
-registers the keyboard service, mounts a RAM BOOTFS image as
-FileSystemService, and monitors heartbeats. The terminal paints via
-`Canvas` and runs a built-in mini shell.
+`huesos-init`, built against `libcanvas`, exercises the core boot path on every
+boot: it creates a VMO, performs a channel round-trip, mirrors logs to the
+framebuffer, then launches DriverManager and the framebuffer terminal.
+DriverManager starts an `input-host` DriverHost, registers the keyboard
+service, mounts a RAM BOOTFS image as FileSystemService, and monitors
+heartbeats. The terminal paints via `Canvas` and runs a built-in mini shell.
+Storage, security, fault-injection and game features have dedicated test gates;
+an ordinary boot does not imply every one of those paths was exercised. See
+[docs/TESTING.md](docs/TESTING.md).
 
 ### QEMU multi-core smoke (expected)
 
@@ -113,9 +116,10 @@ Default `scripts/run.sh` uses `-smp 2`.
 - The multi-controller IOAPIC route manager, dynamic external-vector IDT stubs, capability-authorized IRQ/GSI objects, and level-route acknowledgement path are implemented. A QEMU SMP2 QMP test injects a PS/2 key and confirms its IRQ packet reaches the userspace Port; a separate QEMU edu probe covers kernel-Port raw-GSI delivery and level
   ACK/re-enable. The corresponding ring3 syscall path and physical validation
   remain separate; see [docs/IOAPIC_ROUTING.md](docs/IOAPIC_ROUTING.md).
-- NVMe + HxFS v6 works end-to-end in QEMU, including journal replay,
-  corruption injection and power-fail recovery; bare-metal storage support is
-  still experimental and first boots must use `STORAGE_OFF=1`
+- NVMe + mutable HxFS v7 works end-to-end in QEMU, including journal replay,
+  corruption injection and power-fail recovery. HxFS v6 mounts read-only until
+  explicit migration. Bare-metal storage support is still experimental and
+  first boots must use `STORAGE_OFF=1`
 - Registry collection now uses handle and kernel-reference accounts; deferred
   teardown releases address spaces/stacks and recycles generation-bearing task
   slots. Bounded exit records remain for observation. Long-running resource
@@ -251,7 +255,7 @@ HuesOS/
 │   ├── huesos-elf         # ELF64 loader
 │   ├── huesos-uacpi       # uACPI integration: table archive, Ring-3 broker boundary
 │   ├── huesos-kernel      # Scheduler (Fair/Deadline), SMP, process/thread, HBI parse
-│   ├── huesos-user-alloc  # Userspace allocator
+│   ├── huesos-sched       # Host-testable scheduler models and task identities
 │   ├── huesos-lifecycle   # Policy: object/task lifecycle, bounded zombie reclamation
 │   ├── huesos-ioapic      # Policy: I/O APIC routing (redirection codec, ISO, vectors)
 │   ├── huesos-extable     # Policy: exception/fixup table for recoverable copies
