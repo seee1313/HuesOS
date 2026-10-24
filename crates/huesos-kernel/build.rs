@@ -19,6 +19,7 @@ fn main() {
     let profile = "release";
 
     track_userspace_inputs(&userspace_root);
+    println!("cargo:rerun-if-env-changed=CARGO_TARGET_DIR");
     println!("cargo:rerun-if-env-changed=HUESOS_LIFECYCLE_WAIT_STRESS");
     let lifecycle_wait_stress = env::var("HUESOS_LIFECYCLE_WAIT_STRESS")
         .ok()
@@ -353,6 +354,20 @@ fn track_userspace_inputs(userspace_root: &Path) {
     println!("cargo:rerun-if-changed=../../third_party/freedoom/freedoom1.wad");
 }
 
+fn userspace_target_dir(program_dir: &Path) -> PathBuf {
+    let Some(configured) = env::var_os("CARGO_TARGET_DIR").filter(|value| !value.is_empty()) else {
+        return program_dir.join("target");
+    };
+    let configured = PathBuf::from(configured);
+    if configured.is_absolute() {
+        configured
+    } else {
+        // Nested Cargo resolves a relative target directory against its
+        // working directory, which is the standalone program's directory.
+        program_dir.join(configured)
+    }
+}
+
 fn build_userspace_program(
     userspace_root: &Path,
     dir_name: &str,
@@ -362,6 +377,7 @@ fn build_userspace_program(
     extra_args: &[&str],
 ) -> PathBuf {
     let program_dir = userspace_root.join(dir_name);
+    let target_dir = userspace_target_dir(&program_dir);
     let mut command = Command::new(env::var("CARGO").unwrap_or_else(|_| "cargo".into()));
     command
         .current_dir(&program_dir)
@@ -380,8 +396,7 @@ fn build_userspace_program(
         panic!("building {bin_name} userspace binary failed");
     }
 
-    let bin_path = program_dir
-        .join("target")
+    let bin_path = target_dir
         .join("x86_64-huesos-userspace")
         .join(profile)
         .join(bin_name);
