@@ -247,6 +247,7 @@ impl TaskDirectory {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DirectoryError {
     InvalidLocalIndex,
+    InvalidOperations,
     StaleIdentity,
     Busy,
     PendingOperations,
@@ -261,6 +262,8 @@ pub struct TaskDirectoryEntry {
     published_id: AtomicU64,
     owner: AtomicU64,
     local_index: AtomicU64,
+    // High bits carry the complete generation; low TASK_INDEX_BITS hold flags.
+    // A stale producer/consumer must CAS both together, never check then OR/swap.
     pending_operations: AtomicU64,
 }
 
@@ -326,6 +329,19 @@ impl TaskDirectory {
         entry
             .local_index
             .store(local_index as u64, Ordering::Relaxed);
+        // Owner writers are serialized by the scheduler lock. Preserve flags
+        // on same-generation migration; replace the entire tagged word on reuse.
+        let tag = id.generation() << TASK_INDEX_BITS;
+        let _ =
+            entry
+                .pending_operations
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |state| {
+                    Some(if state & !TASK_INDEX_MASK == tag {
+                        state
+                    } else {
+                        tag
+                    })
+                });
         entry.published_id.store(id.raw(), Ordering::Release);
         entry.sequence.fetch_add(1, Ordering::Release); // even
         Ok(())
@@ -358,36 +374,76 @@ impl TaskDirectory {
         Err(DirectoryError::Busy)
     }
 
-    /// Coalesce operation flags after validating the exact generation.
+    /// Coalesce flags atomically with generation validation. Lock-free: no
+    /// owner-held lock can block an IRQ publisher. Retry only on a competing CAS.
     pub fn publish_operations(&self, id: TaskId, operations: u64) -> Result<bool, DirectoryError> {
+        if operations & !task_operations::ALL != 0 {
+            return Err(DirectoryError::InvalidOperations);
+        }
         let entry = &self.entries[id.slot()];
         if entry.published_id.load(Ordering::Acquire) != id.raw() {
             return Err(DirectoryError::StaleIdentity);
         }
         let previous = entry
             .pending_operations
-            .fetch_or(operations, Ordering::AcqRel);
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |state| {
+                operation_update(state, id, operations, false)
+            })
+            .map_err(|_| DirectoryError::StaleIdentity)?;
         Ok(previous & operations != operations)
     }
 
-    /// Owner takes all operation flags for local application.
+    /// Take flags without allowing a delayed old consumer to clear a successor.
     pub fn take_operations(&self, id: TaskId) -> Result<u64, DirectoryError> {
         let entry = &self.entries[id.slot()];
         if entry.published_id.load(Ordering::Acquire) != id.raw() {
             return Err(DirectoryError::StaleIdentity);
         }
-        Ok(entry.pending_operations.swap(0, Ordering::AcqRel))
+        let previous = entry
+            .pending_operations
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |state| {
+                operation_update(state, id, 0, true)
+            })
+            .map_err(|_| DirectoryError::StaleIdentity)?;
+        Ok(previous & TASK_INDEX_MASK)
     }
 
-    /// Clear a dead identity only after every inbox/operation reference drains.
+    /// Clear an idle identity; fail without mutation if operations are pending.
+    /// The owner must serialize this with publish/retire (kernel scheduler lock).
     pub fn clear(&self, id: TaskId) -> Result<(), DirectoryError> {
+        self.unpublish(id, false)
+    }
+
+    /// Retire a finished task, discarding its pending operations before slot reuse.
+    /// The owner must serialize this with publish/clear and stop local execution
+    /// first. Delayed remote publishers/consumers cannot touch another generation.
+    pub fn retire(&self, id: TaskId) -> Result<(), DirectoryError> {
+        self.unpublish(id, true)
+    }
+
+    fn unpublish(&self, id: TaskId, discard_pending: bool) -> Result<(), DirectoryError> {
         let entry = &self.entries[id.slot()];
         if entry.published_id.load(Ordering::Acquire) != id.raw() {
             return Err(DirectoryError::StaleIdentity);
         }
-        if entry.pending_operations.load(Ordering::Acquire) != 0 {
-            return Err(DirectoryError::PendingOperations);
-        }
+        entry
+            .pending_operations
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |state| {
+                if state >> TASK_INDEX_BITS != id.generation()
+                    || (!discard_pending && state & TASK_INDEX_MASK != 0)
+                {
+                    None
+                } else {
+                    Some(0)
+                }
+            })
+            .map_err(|state| {
+                if state >> TASK_INDEX_BITS == id.generation() {
+                    DirectoryError::PendingOperations
+                } else {
+                    DirectoryError::StaleIdentity
+                }
+            })?;
         entry.sequence.fetch_add(1, Ordering::AcqRel);
         entry.published_id.store(0, Ordering::Release);
         entry.owner.store(0, Ordering::Relaxed);
@@ -395,6 +451,19 @@ impl TaskDirectory {
         entry.sequence.fetch_add(1, Ordering::Release);
         Ok(())
     }
+}
+
+/// Pure CAS transition shared by producer and consumer. The atomic retry must
+/// re-run this check against the observed replacement word after a failed CAS.
+fn operation_update(state: u64, id: TaskId, operations: u64, take: bool) -> Option<u64> {
+    if state >> TASK_INDEX_BITS != id.generation() {
+        return None;
+    }
+    Some(if take {
+        state & !TASK_INDEX_MASK
+    } else {
+        state | operations
+    })
 }
 
 impl Default for TaskDirectory {
@@ -500,6 +569,9 @@ pub mod task_operations {
     pub const POLICY: u64 = 1 << 3;
     pub const THROTTLE: u64 = 1 << 4;
     pub const MIGRATION: u64 = 1 << 5;
+    /// Public flags must fit below the complete 51-bit generation tag.
+    pub const ALL: u64 = WAKE | KILL | AFFINITY | POLICY | THROTTLE | MIGRATION;
+    const _: () = assert!(ALL <= super::TASK_INDEX_MASK);
 }
 
 /// Preemption behavior selected at boot.
@@ -2078,6 +2150,32 @@ mod tests {
         );
         // The old generation must no longer resolve.
         assert_eq!(DIRECTORY.locate(first), Err(DirectoryError::StaleIdentity));
+    }
+
+    #[test]
+    fn task_directory_reuse_does_not_inherit_pending_operations() {
+        static DIRECTORY: TaskDirectory = TaskDirectory::new();
+        let Some(first) = TaskId::new(124, 1) else {
+            assert!(false, "valid first identity");
+            return;
+        };
+        let Some(second) = first.next_generation() else {
+            assert!(false, "valid replacement identity");
+            return;
+        };
+        assert_eq!(DIRECTORY.publish(first, cpu(0), 1), Ok(()));
+        assert_eq!(
+            DIRECTORY.publish_operations(first, task_operations::WAKE),
+            Ok(true)
+        );
+        // Match the current kernel reuse boundary: no directory clear/drain
+        // occurs between retiring the old occupant and publishing its successor.
+        assert_eq!(DIRECTORY.publish(second, cpu(0), 1), Ok(()));
+        assert_eq!(
+            DIRECTORY.publish_operations(first, task_operations::WAKE),
+            Err(DirectoryError::StaleIdentity)
+        );
+        assert_eq!(DIRECTORY.take_operations(second), Ok(0));
     }
 
     #[test]

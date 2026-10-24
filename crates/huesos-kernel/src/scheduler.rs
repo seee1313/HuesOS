@@ -924,17 +924,13 @@ unsafe fn apply_local_wake(guard: &mut Scheduler, now: u64, task_id: u64, idx: u
 
 /// Process one pending remote operation for a Task owned by this CPU.
 ///
-/// The operation flags are taken from the Task directory before the owner
-/// lock is acquired, so the drain never double-applies a wake.
+/// Validate the owner and live occupant under its scheduler lock before taking
+/// flags. In particular a stale inbox bit must not consume another CPU's work.
 fn process_inbox_task(cpu: usize, slot: usize) {
     let Some(id) = TASK_DIRECTORY.published_id(slot) else {
         return;
     };
     let raw_id = id.raw();
-    let operations = TASK_DIRECTORY.take_operations(id).unwrap_or(0);
-    if operations == 0 {
-        return;
-    }
     let Some(location) = task_location(raw_id) else {
         return;
     };
@@ -944,6 +940,10 @@ fn process_inbox_task(cpu: usize, slot: usize) {
     let idx = location.local_index as usize;
     let mut guard = PER_CPU_SCHEDULERS[cpu].lock();
     if !guard.task_matches(raw_id) {
+        return;
+    }
+    let operations = TASK_DIRECTORY.take_operations(id).unwrap_or(0);
+    if operations == 0 {
         return;
     }
     if operations & task_operations::WAKE != 0 {
@@ -994,7 +994,12 @@ pub fn wake_task(task_id: u64) {
         return;
     };
     OBS_REMOTE_WAKES.fetch_add(1, Ordering::Relaxed);
-    let _ = TASK_DIRECTORY.publish_operations(id, task_operations::WAKE);
+    if TASK_DIRECTORY
+        .publish_operations(id, task_operations::WAKE)
+        .is_err()
+    {
+        return;
+    }
     let Some(result) = CPU_INBOX[cpu].publish(id.slot()) else {
         return;
     };
@@ -1488,6 +1493,16 @@ pub fn reap_finished_tasks() {
             if !slot.finished.load(Ordering::Acquire) || matches!(&slot.kind, TaskKind::Reaped) {
                 false
             } else {
+                // Invalidate the tagged operation state before releasing either
+                // slot. A delayed producer/consumer can no longer affect reuse.
+                let Some(id) = V2TaskId::from_raw(task_id) else {
+                    continue;
+                };
+                if TASK_DIRECTORY.retire(id).is_err() {
+                    // Keep the allocation quarantined if identity validation
+                    // fails; never publish a reusable slot with a live directory.
+                    continue;
+                }
                 // Release the stack and Process Arc before publishing the slot.
                 slot.kernel_stack = alloc::vec::Vec::new();
                 slot.kind = TaskKind::Reaped;
