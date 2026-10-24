@@ -94,6 +94,19 @@ resulting ELF binary into the kernel image via `include_bytes!`. This means
 the very first `cargo build` will look like it's compiling two independent
 projects — that's expected.
 
+To place host and embedded userspace artifacts under one custom root, set an
+absolute `CARGO_TARGET_DIR`; the nested standalone Cargo invocations use the
+same directory when locating their ELF binaries:
+
+```bash
+CARGO_TARGET_DIR=/tmp/huesos-target make test
+```
+
+Relative values are also supported, but Cargo resolves them against each
+invocation's working directory. Use an absolute path when the intent is to
+share one external target directory across the kernel and every userspace
+program.
+
 ## Create a Bootable ISO
 
 ```bash
