@@ -1,0 +1,44 @@
+HuesOS Dev #2: generation-tagged task operations
+Base: 92b0eac1fbeba5b41c48b7f48106d2aebfedce02
+Toolchain: nightly-2026-03-01 (rustc 1.96.0-nightly 38c0de8dc)
+All commands executed on this change's source tree, before committing evidence.
+
+Implemented boundary:
+- pending_operations stores all 51 generation bits and operation flags in one u64;
+- producer OR and consumer drain validate the tag in the atomic CAS transition;
+- same-generation publication preserves flags; replacement publication resets them;
+- retire invalidates/discards operations before the kernel releases a task slot;
+- inbox drain validates owner/occupant under the owner scheduler lock before take.
+
+Checks (CARGO_BUILD_JOBS=1; ~/.cargo/bin on PATH):
+PASS make audit-check (all 7 static policies + workspace/standalone formatting)
+PASS make test: 1034 passed / 0 failed / 5 existing ignored, including 57 scheduler tests
+PASS CARGO_UNSTABLE_JSON_TARGET_SPEC=true make clippy (full script, -D warnings)
+PASS 100 repetitions of the 8 generation_regressions tests with --test-threads=4
+PASS bash scripts/ci-qemu-smoke.sh debug 2 120
+PASS bash scripts/ci-qemu-smoke.sh release 2 120
+PASS bash scripts/ci-qemu-smoke.sh release 1 120
+PASS bash scripts/ci-qemu-smoke.sh release 4 120
+PASS git diff --check
+
+The ordinary make clippy invocation first failed in nested hxfs-service build:
+  .json target specs require -Zjson-target-spec
+The full rerun above explicitly propagates the JSON-target setting through env;
+no unrelated build-script/config change is included in this patch.
+
+Safety budget unchanged: 383 unsafe blocks / 76 unsafe functions / 33 unsafe
+impls / 1 static mut / 22 unwrap calls / 62 expect calls / 15 panic macros.
+No ABI syscall/layout change, new allocation, lock or unsafe code introduced.
+
+Before-fix evidence:
+The added no-clear reuse regression returned Ok(1) (old WAKE) instead of Ok(0).
+See reproducer-before-fix.txt. The same regression passes with this patch.
+
+Limits:
+QEMU boot exercises the ordinary 32-exit ProcessWait/repeated-observation probes,
+not a new on-target adversarial reuse/remote-publication stress scenario.
+The 16384-cycle retire/reallocate test and delayed-CAS/concurrency probes are
+host helper tests. No bare-metal test, long resource-baseline soak, formal
+memory-model verification, or full production scheduler migration proof claimed.
+The existing generation-exhaustion policy and unrelated lifecycle/resource
+accounting gaps are not changed. Documentation updates are delegated separately.

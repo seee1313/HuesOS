@@ -1,0 +1,16 @@
+
+running 1 test
+
+thread 'tests::task_directory_reuse_does_not_inherit_pending_operations' (2138) panicked at crates/huesos-sched/src/lib.rs:2106:9:
+assertion `left == right` failed
+  left: Ok(1)
+ right: Ok(0)
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test tests::task_directory_reuse_does_not_inherit_pending_operations ... FAILED
+
+failures:
+
+failures:
+    tests::task_directory_reuse_does_not_inherit_pending_operations
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 50 filtered out; finished in 0.00s

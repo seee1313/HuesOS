@@ -1,0 +1,228 @@
+[2J[01;01H[=3h[2J[01;01H[2J[01;01H[=3h[2J[01;01H[2J[01;01H[=3h[2J[01;01HBdsDxe: loading Boot0001 "UEFI QEMU DVD-ROM QM00005 " from PciRoot(0x0)/Pci(0x1F,0x2)/Sata(0x2,0xFFFF,0x0)
+BdsDxe: starting Boot0001 "UEFI QEMU DVD-ROM QM00005 " from PciRoot(0x0)/Pci(0x1F,0x2)/Sata(0x2,0xFFFF,0x0)
+[2J[01;01H[01;01H[2J[01;01H[01;01H[HuesOS] Bootloader handed over control
+[security] BSP degraded: SMEP/SMAP unavailable on this CPU
+[PMM] Reserved HBI image: phys_addr=0x17a3f000, length=34457000
+[storage] reserved boot DMA pool: phys=0x3800000, len=0x4000000
+[HBI] Ed25519 signature verified (v2.2)
+[measure] signed kernel/HBI/cmdline digest ready for PCR 12
+[uACPI] starting uACPI, version 6.0.0
+[uACPI] RSDP 0x000000001F77E014 00000024 v02 (BOCHS )
+[uACPI] XSDT 0x000000001F77D0E8 00000054 v01 (BOCHS  BXPC    )
+[uACPI] DSDT 0x000000001F77A000 000020F8 v01 (BOCHS  BXPC    )
+[uACPI] FACP 0x000000001F779000 000000F4 v03 (BOCHS  BXPC    )
+[uACPI] APIC 0x000000001F778000 00000078 v03 (BOCHS  BXPC    )
+[uACPI] HPET 0x000000001F777000 00000038 v01 (BOCHS  BXPC    )
+[uACPI] MCFG 0x000000001F776000 0000003C v01 (BOCHS  BXPC    )
+[uACPI] WAET 0x000000001F775000 00000028 v01 (BOCHS  BXPC    )
+[uACPI] BGRT 0x000000001F774000 00000038 v01 (INTEL  EDK2    )
+[uACPI] validated ACPI table graph and MADT
+[uACPI] built immutable Ring-3 table archive v2
+[uACPI] derived bounded FADT SystemIO policy
+[tpm] no TPM 2.0 CRB interface present
+[SMP] MADT parsed 1 CPUs found
+[IOAPIC] routed keyboard IRQ1
+[SMP] LAPIC timer count=625410
+HBI v2.2 parsed. Entries: 0x4
+[storage] boot info: dma=0x3800000+0x4000000, nvme_count=0
+[extable] installed 2 recoverable-copy entries
+[SMP] APs released to run
+HuesOS v0.1.0 on CPU 0
+PMM: 67957/268435456 frames (265 MiB)
+FB: 1280x800@32
+[init] installed immutable ACPI table archive VMO
+[init] installed deny-by-default ACPI broker capability
+[init] installed kernel command line VMO
+[init] installed storage boot-info VMO
+[init] installed FrameDraw capability (handle 6)
+[kernel] entering userspace: rip=0x400b00 rsp=0x7ffffefffff8 cs=0x23 ss=0x1b
+[init] hello from ring3 userspace, via libcanvas
+[init] config: /etc/init.conf (1716 bytes)
+[init] config: kernel cmdline applied
+[init] splash: 1280x800, 5 stages
+[init] stage selftest start: Checking kernel interfaces
+[init] user pointer guard smoke OK
+[init] VMO read/write round-trip OK
+[init] channel IPC round-trip OK
+[init] monotonic clock OK (10-tick wait measured 11 ticks)
+[init] SMP affinity self-test skipped (single CPU)
+[kernel] entering userspace: rip=0x400030 rsp=0x7ffffefffff8 cs=0x23 ss=0x1b
+[fault-probe] triggering wait
+[kernel] entering userspace: rip=0x400030 rsp=0x7ffffefffff8 cs=0x23 ss=0x1b
+[fault-probe] triggering wait
+[kernel] entering userspace: rip=0x400030 rsp=0x7ffffefffff8 cs=0x23 ss=0x1b
+[fault-probe] triggering wait
+[kernel] entering userspace: rip=0x400030 rsp=0x7ffffefffff8 cs=0x23 ss=0x1b
+[fault-probe] triggering wait
+[kernel] entering userspace: rip=0x400030 rsp=0x7ffffefffff8 cs=0x23 ss=0x1b
+[fault-probe] triggering wait
+[kernel] entering userspace: rip=0x400030 rsp=0x7ffffefffff8 cs=0x23 ss=0x1b
+[fault-probe] triggering wait
+[kernel] entering userspace: rip=0x400030 rsp=0x7ffffefffff8 cs=0x23 ss=0x1b
+[fault-probe] triggering wait
+[kernel] entering userspace: rip=0x400030 rsp=0x7ffffefffff8 cs=0x23 ss=0x1b
+[fault-probe] triggering wait
+[kernel] entering userspace: rip=0x400030 rsp=0x7ffffefffff8 cs=0x23 ss=0x1b
+[fault-probe] triggering wait
+[kernel] entering userspace: rip=0x400030 rsp=0x7ffffefffff8 cs=0x23 ss=0x1b
+[fault-probe] triggering wait
+[kernel] entering userspace: rip=0x400030 rsp=0x7ffffefffff8 cs=0x23 ss=0x1b
+[fault-probe] triggering wait
+[kernel] entering userspace: rip=0x400030 rsp=0x7ffffefffff8 cs=0x23 ss=0x1b
+[fault-probe] triggering wait
+[kernel] entering userspace: rip=0x400030 rsp=0x7ffffefffff8 cs=0x23 ss=0x1b
+[fault-probe] triggering wait
+[kernel] entering userspace: rip=0x400030 rsp=0x7ffffefffff8 cs=0x23 ss=0x1b
+[fault-probe] triggering wait
+[kernel] entering userspace: rip=0x400030 rsp=0x7ffffefffff8 cs=0x23 ss=0x1b
+[fault-probe] triggering wait
+[kernel] entering userspace: rip=0x400030 rsp=0x7ffffefffff8 cs=0x23 ss=0x1b
+[fault-probe] triggering wait
+[kernel] entering userspace: rip=0x400030 rsp=0x7ffffefffff8 cs=0x23 ss=0x1b
+[fault-probe] triggering wait
+[kernel] entering userspace: rip=0x400030 rsp=0x7ffffefffff8 cs=0x23 ss=0x1b
+[fault-probe] triggering wait
+[kernel] entering userspace: rip=0x400030 rsp=0x7ffffefffff8 cs=0x23 ss=0x1b
+[fault-probe] triggering wait
+[kernel] entering userspace: rip=0x400030 rsp=0x7ffffefffff8 cs=0x23 ss=0x1b
+[fault-probe] triggering wait
+[kernel] entering userspace: rip=0x400030 rsp=0x7ffffefffff8 cs=0x23 ss=0x1b
+[fault-probe] triggering wait
+[kernel] entering userspace: rip=0x400030 rsp=0x7ffffefffff8 cs=0x23 ss=0x1b
+[fault-probe] triggering wait
+[kernel] entering userspace: rip=0x400030 rsp=0x7ffffefffff8 cs=0x23 ss=0x1b
+[fault-probe] triggering wait
+[kernel] entering userspace: rip=0x400030 rsp=0x7ffffefffff8 cs=0x23 ss=0x1b
+[fault-probe] triggering wait
+[kernel] entering userspace: rip=0x400030 rsp=0x7ffffefffff8 cs=0x23 ss=0x1b
+[fault-probe] triggering wait
+[kernel] entering userspace: rip=0x400030 rsp=0x7ffffefffff8 cs=0x23 ss=0x1b
+[fault-probe] triggering wait
+[kernel] entering userspace: rip=0x400030 rsp=0x7ffffefffff8 cs=0x23 ss=0x1b
+[fault-probe] triggering wait
+[kernel] entering userspace: rip=0x400030 rsp=0x7ffffefffff8 cs=0x23 ss=0x1b
+[fault-probe] triggering wait
+[kernel] entering userspace: rip=0x400030 rsp=0x7ffffefffff8 cs=0x23 ss=0x1b
+[fault-probe] triggering wait
+[kernel] entering userspace: rip=0x400030 rsp=0x7ffffefffff8 cs=0x23 ss=0x1b
+[fault-probe] triggering wait
+[kernel] entering userspace: rip=0x400030 rsp=0x7ffffefffff8 cs=0x23 ss=0x1b
+[fault-probe] triggering wait
+[kernel] entering userspace: rip=0x400030 rsp=0x7ffffefffff8 cs=0x23 ss=0x1b
+[fault-probe] triggering wait
+[init] ProcessWait repeated observation OK
+[init] ProcessWait lifecycle smoke OK (32 blocked wakes)
+[init] waitset self-test starting
+[init] waitset self-test channel-readable OK
+[init] waitset self-test channel-timeout OK
+[init] waitset self-test port-timeout OK
+[init] waitset self-test peer-closed OK
+[init] waitset self-test OK
+[kernel] entering userspace: rip=0x400030 rsp=0x7ffffefffff8 cs=0x23 ss=0x1b
+[fault-probe] triggering page
+[user-fault] process=fault-probe koid=277 task=270338 cpu=0 reason=PAGE FAULT rip=0x400001 address=0x10000 error=0x4 action=terminate-process code=-4097
+[kernel] entering userspace: rip=0x400030 rsp=0x7ffffefffff8 cs=0x23 ss=0x1b
+[fault-probe] triggering opcode
+[user-fault] process=fault-probe koid=285 task=278530 cpu=0 reason=INVALID OPCODE rip=0x40016e address=0x0 error=0x0 action=terminate-process code=-4099
+[kernel] entering userspace: rip=0x400030 rsp=0x7ffffefffff8 cs=0x23 ss=0x1b
+[fault-probe] triggering gpf
+[user-fault] process=fault-probe koid=293 task=286722 cpu=0 reason=GENERAL PROTECTION FAULT rip=0x40011e address=0x0 error=0x0 action=terminate-process code=-4098
+[kernel] entering userspace: rip=0x400030 rsp=0x7ffffefffff8 cs=0x23 ss=0x1b
+[fault-probe] triggering divide
+[user-fault] process=fault-probe koid=301 task=294914 cpu=0 reason=DIVIDE ERROR rip=0x400251 address=0x0 error=0x0 action=terminate-process code=-4100
+[init] user fault isolation OK (#PF/#UD/#GP/#DE contained)
+[kernel] entering userspace: rip=0x400030 rsp=0x7ffffefffff8 cs=0x23 ss=0x1b
+[fault-probe] triggering shutdown
+[init] shutdown authorization OK (unprivileged caller denied)
+[init] stage selftest ok
+[kernel] entering userspace: rip=0x400160 rsp=0x7ffffefffff8 cs=0x23 ss=0x1b
+[key-broker] started
+[key-broker] ambient/wrong-type key take denied
+[key-broker] kernel key moved; state=plain-only
+[init] key-broker ready
+[init] stage driver-manager start: Starting driver manager
+[init] launched driver-manager
+[init] delegated unique KeyBroker authority to DriverManager
+[kernel] entering userspace: rip=0x40cee0 rsp=0x7ffffefffff8 cs=0x23 ss=0x1b
+[driver-manager] started in userspace
+[driver-manager] received unique KeyBroker generation authority
+[driver-manager] package probe: waiting for a client channel
+[init] stage driver-manager degraded
+[init] stage storage start: Probing storage controller
+[init] passed HBI BOOTFS VMO to DriverManager
+[init] passed ACPI table archive to DriverManager
+[init] transferred ACPI broker capability
+[init] passed storage boot-info VMO to DriverManager
+[driver-manager] received BOOTFS VMO from init
+[init] manifest input-host: minting 2 resource grant(s)
+[init] manifest input-host: transferred 2/2 resource handle(s) to DriverManager
+[init] manifest input-host: signalled grants-complete to DriverManager
+[init] NVMe boot grants skipped: no NVMe PCI function
+[init] stage storage skipped
+[init] stage shutdown-broker start: Arming power control
+[init] shutdown-broker: spawned
+[init] shutdown-broker: marked critical
+[kernel] entering userspace: rip=0x400190 rsp=0x7ffffefffff8 cs=0x23 ss=0x1b
+[shutdown-broker] started
+[shutdown-broker] ready; awaiting shutdown command
+[driver-manager] BOOTFS hash manifest verified and mounted
+[driver-manager] boot driver manifest: nvme elf=/drivers/driver-host-nvme.elf manifest=/manifests/nvme.hdriver
+[driver-manager] launched restartable PCI manager generation 1
+[driver-manager] received immutable ACPI table archive
+[driver-manager] received unique ACPI broker capability
+[kernel] entering userspace: rip=0x400020 rsp=0x7ffffefffff8 cs=0x23 ss=0x1b
+[pci-manager] userspace service started (configuration disabled)
+[pci-manager] ready without root descriptors; fail-closed
+[init] shutdown-broker: ready
+[init] stage shutdown-broker ok
+[driver-manager] launched restartable ACPI manager generation 1
+[driver-manager] received storage boot-info VMO
+[driver-manager] storage boot-info: dma=0x3800000+0x4000000 nvme_count=0
+[driver-manager] grants-complete for input-host
+[driver-manager] manifest: host=input-host services=1 irqs=1 io_ports=1
+[driver-manager] capability: service=keyboard required=1
+[driver-manager] capability: irq=1
+[driver-manager] capability: io=0x60+1
+[driver-manager] manifest loaded: host=input-host elf=/drivers/input-host.elf
+[driver-manager] launched DriverHost input-host
+[driver-manager] forwarded 2/2 resource handle(s) to input-host
+[kernel] entering userspace: rip=0x400720 rsp=0x7ffffefffff8 cs=0x23 ss=0x1b
+[kernel] entering userspace: rip=0x4007b0 rsp=0x7ffffefffff8 cs=0x23 ss=0x1b
+[driver-host:input] started
+[driver-host:input] received manifest resource #1: resource:input-host:ioport:0x60:0x1:excl
+[driver-host:input] received manifest resource #2: resource:input-host:irq:0x1:0x1:excl
+[driver-host:input] retained 2 manifest resource handle(s)
+[driver-host:input] keyboard IRQ bound to Port
+[acpi-manager] isolated Ring-3 service started
+[acpi-manager] validated ACPI archive v2: 8 tables, 9 physical mappings, snapshot 1
+[acpi-manager] broker deny-by-default self-test OK
+[acpi-manager] generation 1 archive/broker capabilities ready
+[driver-manager] input DriverHost starting
+[driver-manager] registered service keyboard from input-host
+[driver-manager] input DriverHost ready
+[driver-manager] ACPI manager ready generation 1 tables 8
+[driver-manager] PCI manager ready (no roots; fail-closed)
+[init] passed registry channel to DriverManager
+[init] stage terminal start: Starting terminal
+[driver-manager] received service registry channel from init
+[init] launched terminal
+[kernel] entering userspace: rip=0x408fa0 rsp=0x7ffffefffff8 cs=0x23 ss=0x1b
+[terminal] started in userspace
+[init] stage terminal ok
+[init] stage summary ok selftest
+[init] stage summary ~~ driver-manager
+[init] stage summary -- storage
+[init] stage summary ok shutdown-broker
+[init] stage summary ok terminal
+[init] boot stages complete: degraded
+[init] framebuffer handoff: terminal owns the display
+[init] passed DriverManager registry to terminal
+[init] FrameDraw capability transferred to terminal
+[observe] 0100000000000000000000000000000001000000010000000100000000000000
+[init] observation records dumped: 1
+[init] service launch complete; parking as init supervisor
+[terminal] FrameDraw capability received
+[driver-manager] opened keyboard service channel for client
+[driver-host:input] attached keyboard client
+[driver-manager] opened filesystem service channel for client
+[terminal] keyboard service online, starting shell
