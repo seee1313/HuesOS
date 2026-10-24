@@ -1,0 +1,59 @@
+HuesOS Dev #2: writable current-format image generation
+Base: d972fa037bd2b1034e8ba4a6dc78a4dc13147e47
+Toolchain: nightly-2026-03-01
+All checks executed locally on this patch before evidence commit.
+
+Implemented:
+- mkhxfs.py default delegates to Rust FixedHxfsWriter (--empty), not a Python
+  copy of the current wire format; current format constants come from Rust.
+- Plain, uncompressed, logically empty root; no synthetic key/policy configured.
+- Existing Python layouts are explicitly named legacy-v6 fixtures and selected
+  only via --legacy-v6; no implicit upgrade of existing user volumes.
+- Same-directory temporary output + replace after successful generation; errors
+  preserve existing destination. Sparse host IO enforces requested capacity.
+- v6 migration gate explicitly generates a legacy fixture, migrates, then proves
+  write/checkpoint/remount with the production mount entry point.
+- QEMU test-image cache tags include canonical Rust format version, so old
+  mode-0 fixtures do not silently bypass generation of the new current format.
+- Added make image-check and a CI step. Refreshed benchmark digest baseline for
+  intentional v6 -> current writer layout change (not a relaxed threshold).
+
+Verified:
+PASS make audit-check (safety/lock/policy/alloc/poll/link/format gates)
+PASS make test: 1034 passed, 0 failed, 5 existing ignored
+PASS make test-hxfs-features: 262 passed, 0 failed
+PASS make image-check: 6 Python integration tests, 4 Rust tool tests,
+     standalone tool formatting and production-bin Clippy -D warnings
+     Current images: 256, 4096, 1048576 blocks (1 MiB, 16 MiB, sparse 4 GiB).
+     Each is mounted, written across 3 blocks, checkpointed, reopened, read and
+     verified; deletion + another checkpoint/remount restores empty root.
+     Legacy fixtures: read-only create/checkpoint rejection, unchanged SHA-256.
+     Seeded encrypted/plain/GCM-injected/CRC-injected generation still works.
+     Failed format/invalid requests preserve destination and clean temporary files.
+PASS make migration-check (includes post-migration write/remount)
+PASS make bench-check (deterministic baseline + timing self-comparison)
+PASS CARGO_UNSTABLE_JSON_TARGET_SPEC=true make clippy (full workspace/userspace)
+PASS Python compilation and Bash syntax checks for touched scripts
+PASS git diff --check
+
+QEMU release / qemu64 / SMP2 / 512 MiB, 128 MiB NVMe, 180 seconds each:
+PASS ci-qemu-nvme-soak.sh mode 0: new unseeded default, production mount
+     Explicitly started with legacy v6 fixture + old mode tag 0; final harness
+     rebuilt it using tag 0:format-7 and booted the current image.
+PASS mode 6: seeded plain/no-TPM, write/read + storage reliability markers
+PASS mode 1: seeded encrypted + GCM corruption detection, writes, fsck/scrub
+PASS mode 2: seeded plain + CRC corruption detection, writes, fsck/scrub
+The final matrix ran a byte-identical snapshot of the tracked harness to avoid
+live-edit interference. Harness SHA-256: 297a6a25a976bbeeee8ab67a7305ac312a2ffd82051555972399a30040005266
+Final logs only are retained here. An intermediate run during an edit of the
+live shell script was invalidated and rerun; it is not counted as verification.
+Tool unit tests require RUST_MIN_STACK=16777216 (wired into image-check), just
+as the repository's host suite does; the initial default-stack attempt aborted.
+
+Safety budget unchanged: 383/76/33/1/22/62/15. No kernel/ABI source changes.
+No hardware test, long soak, power-cut durability certification, or format freeze
+claim. Mode 0 has no guest write self-check: write/remount is independently
+proved by the host gate; mode 6 exercises the seeded guest write path.
+Documentation files are delegated to the documentation owner and unchanged.
+The default current-image path now needs the pinned Rust toolchain; only the
+explicit legacy fixture path remains Python-only.

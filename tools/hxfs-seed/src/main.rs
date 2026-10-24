@@ -22,15 +22,14 @@
 //! which delegates here) so the host target is pinned explicitly.
 
 use std::fs::File;
-use std::io::Write;
 use std::os::unix::fs::FileExt;
 use std::path::PathBuf;
 
 use huesos_hxfs::fixed_writer::FixedHxfsWriter;
 use huesos_hxfs::reader::BlockReader;
 use huesos_hxfs::recovery::BlockStore;
-use huesos_hxfs::synthetic_key;
 use huesos_hxfs::synthetic_image::BOOT_IMAGE_BLOCKS;
+use huesos_hxfs::synthetic_key;
 use huesos_hxfs::HxfsError;
 
 /// Maximum seed file size: the writer's extent table is a single
@@ -41,6 +40,7 @@ const MAX_SEED_BYTES: usize = 100 * 4096 + 4096;
 
 struct Args {
     output: PathBuf,
+    empty: bool,
     blocks: u64,
     instance_uuid: [u8; 16],
     volume_uuid: [u8; 16],
@@ -62,7 +62,7 @@ fn usage() -> ! {
     eprintln!(
         "usage: huesos-hxfs-seed --output PATH [--blocks N] [--instance-uuid HEX] \
          [--volume-uuid HEX] [--seed-file NAME] [--seed-size BYTES] \
-         [--inject-bad-gcm-tag] [--inject-bad-crc] [--plain]"
+         [--inject-bad-gcm-tag] [--inject-bad-crc] [--plain] [--empty]"
     );
     std::process::exit(2);
 }
@@ -83,6 +83,7 @@ fn parse_hex_uuid(text: &str) -> Option<[u8; 16]> {
 
 fn parse_args() -> Args {
     let mut output = None;
+    let mut empty = false;
     let mut blocks = 1_048_576u64; // 4 GiB default, matching the soak image
     let mut instance_uuid = [0x11; 16];
     let mut volume_uuid = [0x22; 16];
@@ -153,14 +154,15 @@ fn parse_args() -> Args {
             "--inject-bad-gcm-tag" => inject_bad_gcm_tag = true,
             "--inject-bad-crc" => inject_bad_crc = true,
             "--plain" => plain = true,
+            "--empty" => empty = true,
             "--seed-blob-file" => {
                 index += 1;
-                seed_blob_file = Some(std::path::PathBuf::from(
-                    args.get(index).unwrap_or_else(|| {
+                seed_blob_file = Some(std::path::PathBuf::from(args.get(index).unwrap_or_else(
+                    || {
                         eprintln!("--seed-blob-file requires a path");
                         std::process::exit(2);
-                    }),
-                ));
+                    },
+                )));
             }
             other => {
                 eprintln!("unknown argument: {other}");
@@ -174,9 +176,7 @@ fn parse_args() -> Args {
         usage();
     });
     if seed_size == 0 || seed_size > MAX_SEED_BYTES {
-        eprintln!(
-            "--seed-size must be in 1..={MAX_SEED_BYTES} (single-block extent table limit)"
-        );
+        eprintln!("--seed-size must be in 1..={MAX_SEED_BYTES} (single-block extent table limit)");
         std::process::exit(2);
     }
     if inject_bad_gcm_tag && inject_bad_crc {
@@ -187,8 +187,20 @@ fn parse_args() -> Args {
         eprintln!("--plain builds an unencrypted volume; there is no GCM tag to corrupt");
         std::process::exit(2);
     }
+    if empty
+        && (inject_bad_gcm_tag
+            || inject_bad_crc
+            || seed_blob_file.is_some()
+            || args
+                .iter()
+                .any(|arg| arg == "--seed-file" || arg == "--seed-size"))
+    {
+        eprintln!("--empty cannot be combined with seed injection or blob options");
+        std::process::exit(2);
+    }
     Args {
         output,
+        empty,
         blocks,
         instance_uuid,
         volume_uuid,
@@ -204,14 +216,11 @@ fn parse_args() -> Args {
 /// Block store over a sparse host file.
 struct FileStore {
     file: File,
+    bytes: u64,
 }
 
 impl FileStore {
-    fn open_with(
-        path: &std::path::Path,
-        blocks: u64,
-        truncate: bool,
-    ) -> Result<Self, String> {
+    fn open_with(path: &std::path::Path, blocks: u64, truncate: bool) -> Result<Self, String> {
         use std::fs::OpenOptions;
         // read+write: the writer both writes the boot image and
         // reads blocks back at mount; File::create alone is
@@ -221,12 +230,15 @@ impl FileStore {
         if truncate {
             options.truncate(true);
         }
+        let bytes = blocks.checked_mul(4096).ok_or("image size overflow")?;
+        if blocks < BOOT_IMAGE_BLOCKS as u64 {
+            return Err("image is smaller than the bootstrap metadata".to_string());
+        }
         let file = options
             .open(path)
             .map_err(|e| format!("open {}: {e}", path.display()))?;
-        file.set_len(blocks * 4096)
-            .map_err(|e| format!("set_len: {e}"))?;
-        Ok(Self { file })
+        file.set_len(bytes).map_err(|e| format!("set_len: {e}"))?;
+        Ok(Self { file, bytes })
     }
 
     fn create(path: &std::path::Path, blocks: u64) -> Result<Self, String> {
@@ -236,21 +248,23 @@ impl FileStore {
 
 impl BlockReader for FileStore {
     fn read_blocks(&mut self, lba: u64, blocks: u32, out: &mut [u8]) -> Result<(), HxfsError> {
-        let offset = lba
-            .checked_mul(4096)
-            .ok_or(HxfsError::OutOfRange)?;
+        let offset = lba.checked_mul(4096).ok_or(HxfsError::OutOfRange)?;
         let want = (blocks as u64)
             .checked_mul(4096)
             .ok_or(HxfsError::OutOfRange)?;
         let want = usize::try_from(want).map_err(|_| HxfsError::OutOfRange)?;
+        if offset
+            .checked_add(want as u64)
+            .is_none_or(|end| end > self.bytes)
+        {
+            return Err(HxfsError::OutOfRange);
+        }
         if want > out.len() {
             return Err(HxfsError::OutOfRange);
         }
-        let got = self.file.read_at(&mut out[..want], offset).map_err(|_| HxfsError::Io)?;
-        if got < want {
-            out[got..want].fill(0);
-        }
-        Ok(())
+        self.file
+            .read_exact_at(&mut out[..want], offset)
+            .map_err(|_| HxfsError::Io)
     }
 }
 
@@ -263,11 +277,19 @@ impl BlockStore for FileStore {
             return Err(HxfsError::OutOfRange);
         }
         let offset = lba.checked_mul(4096).ok_or(HxfsError::OutOfRange)?;
-        self.file.write_all_at(input, offset).map_err(|_| HxfsError::Io)
+        if offset
+            .checked_add(expected)
+            .is_none_or(|end| end > self.bytes)
+        {
+            return Err(HxfsError::OutOfRange);
+        }
+        self.file
+            .write_all_at(input, offset)
+            .map_err(|_| HxfsError::Io)
     }
 
     fn flush(&mut self) -> Result<(), HxfsError> {
-        self.file.flush().map_err(|_| HxfsError::Io)
+        self.file.sync_all().map_err(|_| HxfsError::Io)
     }
 }
 
@@ -424,6 +446,35 @@ mod tests {
     }
 
     #[test]
+    fn sparse_store_rejects_io_beyond_requested_capacity() {
+        let path =
+            std::env::temp_dir().join(format!("huesos-store-bounds-{}.img", std::process::id()));
+        let mut store = FileStore::create(&path, 8).expect("create bounded store");
+        let mut block = [0u8; 4096];
+        assert_eq!(
+            store.read_blocks(8, 1, &mut block),
+            Err(HxfsError::OutOfRange)
+        );
+        assert_eq!(store.write_blocks(8, 1, &block), Err(HxfsError::OutOfRange));
+        assert_eq!(
+            store.write_blocks(u64::MAX, 1, &block),
+            Err(HxfsError::OutOfRange)
+        );
+        assert_eq!(store.file.metadata().expect("metadata").len(), 8 * 4096);
+        assert!(FileStore::create(&path, u64::MAX).is_err());
+        assert_eq!(
+            store
+                .file
+                .metadata()
+                .expect("metadata after rejection")
+                .len(),
+            8 * 4096
+        );
+        drop(store);
+        std::fs::remove_file(path).expect("remove fixture");
+    }
+
+    #[test]
     fn seeded_image_mounts_and_seed_file_round_trips() {
         let image = build_test_image(InjectMode::None);
         let policies = [synthetic_key::encryption_policy()];
@@ -431,14 +482,20 @@ mod tests {
 
         // Read-side remount (the host-test path).
         let reader = SliceBlockReader::new(&image);
-        let mut fs = Hxfs::mount_with_policies(reader, &policies, &comps, Some(&synthetic_key::VOLUME_KEY)).expect("mount");
+        let mut fs =
+            Hxfs::mount_with_policies(reader, &policies, &comps, Some(&synthetic_key::VOLUME_KEY))
+                .expect("mount");
         let file = fs.open_path("/seed.bin").expect("open seed.bin");
         let mut buf = [0u8; 4096];
         let n = fs.read_file(file, &mut buf).expect("read seed.bin");
         assert_eq!(n, 3584, "seed file length must match");
         let mut expected = [0u8; 4096];
         fill_compressible_chunk(&mut expected, 0);
-        assert_eq!(&buf[..3584], &expected[..3584], "seed bytes must round-trip");
+        assert_eq!(
+            &buf[..3584],
+            &expected[..3584],
+            "seed bytes must round-trip"
+        );
 
         // Writer-side remount of the PUBLISHED image: this is
         // exactly the path the hxfs-service takes at boot (mount
@@ -470,7 +527,9 @@ mod tests {
             .open_child_file(root, synthetic_key::SEED_FILE_NAME)
             .expect("writer open seed.bin");
         let mut buf = [0u8; 4096];
-        let n = writer.read_file(file, &mut buf).expect("writer read seed.bin");
+        let n = writer
+            .read_file(file, &mut buf)
+            .expect("writer read seed.bin");
         assert_eq!(n, 3584, "writer seed file length must match");
         assert_eq!(
             &buf[..3584],
@@ -486,7 +545,9 @@ mod tests {
         let policies = [synthetic_key::encryption_policy()];
         let comps = [synthetic_key::compression_policy()];
         // Metadata is intact: the volume must still mount.
-        let mut fs = Hxfs::mount_with_policies(reader, &policies, &comps, Some(&synthetic_key::VOLUME_KEY)).expect("mount");
+        let mut fs =
+            Hxfs::mount_with_policies(reader, &policies, &comps, Some(&synthetic_key::VOLUME_KEY))
+                .expect("mount");
         let file = fs.open_path("/seed.bin").expect("open seed.bin");
         let mut buf = [0u8; 4096];
         assert_eq!(
@@ -494,11 +555,7 @@ mod tests {
             Some(HxfsError::Compression),
             "the injected bad GCM tag must surface as the precise error"
         );
-        assert_eq!(
-            fs.bad_extents().len(),
-            1,
-            "the bad extent must be marked"
-        );
+        assert_eq!(fs.bad_extents().len(), 1, "the bad extent must be marked");
     }
 
     #[test]
@@ -508,8 +565,7 @@ mod tests {
         let comps = [synthetic_key::compression_policy()];
         // Plain volume: metadata is intact, so it must still mount.
         let reader = SliceBlockReader::new(&image);
-        let mut fs =
-            Hxfs::mount_with_policies(reader, &policies, &comps, None).expect("mount");
+        let mut fs = Hxfs::mount_with_policies(reader, &policies, &comps, None).expect("mount");
         let file = fs.open_path("/seed.bin").expect("open seed.bin");
         let mut buf = [0u8; 4096];
         assert_eq!(
@@ -517,15 +573,15 @@ mod tests {
             Some(HxfsError::Compression),
             "the injected bad CRC must surface as the precise error"
         );
-        assert_eq!(
-            fs.bad_extents().len(),
-            1,
-            "the bad extent must be marked"
-        );
+        assert_eq!(fs.bad_extents().len(), 1, "the bad extent must be marked");
     }
 }
 
 fn main() {
+    if std::env::args().any(|arg| arg == "--print-format-version") {
+        println!("{}", huesos_hxfs::format::FORMAT_VERSION);
+        return;
+    }
     // Stage D: single source of truth for the synthetic volume key.
     // The soak harness feeds this hex to the kernel build
     // (HUESOS_VOLUME_KEY_HEX) so the bootloader key blob in the
@@ -539,6 +595,17 @@ fn main() {
         return;
     }
     let args = parse_args();
+    if args.empty {
+        if let Err(error) = format_empty(&args) {
+            fail(&error);
+        }
+        println!(
+            "[hxfs-seed] wrote empty current-format image {} ({} blocks)",
+            args.output.display(),
+            args.blocks
+        );
+        return;
+    }
     let store = match FileStore::create(&args.output, args.blocks) {
         Ok(store) => store,
         Err(e) => fail(&e),
@@ -615,7 +682,10 @@ fn main() {
         // the volume still mounts; the self-check read must hit the
         // bad tag and report `bad-gcm-tag-marked`.
         let mut block = [0u8; 4096];
-        if let Err(e) = writer.store_mut().read_blocks(first_extent_lba, 1, &mut block) {
+        if let Err(e) = writer
+            .store_mut()
+            .read_blocks(first_extent_lba, 1, &mut block)
+        {
             fail(&format!("read for injection failed: {e:?}"));
         }
         block[12 + 40] ^= 0x01;
@@ -633,7 +703,10 @@ fn main() {
         // descriptor CRC32C fails on read and the service reports
         // `bad-checksum-marked`.
         let mut block = [0u8; 4096];
-        if let Err(e) = writer.store_mut().read_blocks(first_extent_lba, 1, &mut block) {
+        if let Err(e) = writer
+            .store_mut()
+            .read_blocks(first_extent_lba, 1, &mut block)
+        {
             fail(&format!("read for injection failed: {e:?}"));
         }
         block[8] ^= 0x01;
@@ -696,6 +769,36 @@ fn main() {
         ranges.len(),
         mode,
     );
+}
+
+/// Build the current plain format through the same writer that publishes seeded
+/// images. The bootstrap's placeholder is removed before the first checkpoint;
+/// the published directory is empty and no synthetic key or compression
+/// descriptor is configured. This is not a secure-erasure operation.
+fn format_empty(args: &Args) -> Result<(), String> {
+    let mut store = FileStore::create(&args.output, args.blocks)?;
+    let bootstrap = huesos_hxfs::synthetic_image::build_boot_image(
+        args.instance_uuid,
+        args.volume_uuid,
+        false,
+        0,
+        0,
+    );
+    store
+        .write_blocks(0, BOOT_IMAGE_BLOCKS as u32, &bootstrap)
+        .map_err(|error| format!("write bootstrap: {error:?}"))?;
+    let mut writer = FixedHxfsWriter::<FileStore, 16, 32, 128>::mount_from_disk(store, None)
+        .map_err(|error| format!("mount empty bootstrap: {error:?}"))?;
+    writer
+        .unlink_path("/seed.bin")
+        .map_err(|error| format!("remove bootstrap placeholder: {error:?}"))?;
+    writer
+        .publish_checkpoint()
+        .map_err(|error| format!("publish empty checkpoint: {error:?}"))?;
+    writer
+        .into_store()
+        .flush()
+        .map_err(|error| format!("flush image: {error:?}"))
 }
 
 fn hex_encode(bytes: &[u8]) -> String {

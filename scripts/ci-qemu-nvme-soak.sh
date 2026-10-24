@@ -105,18 +105,22 @@ fi
 # encrypted (gcm) image must not be reused by a plain run (the
 # service would reject it with EncryptedPolicyUnknown) and vice
 # versa. A mode marker next to the image records its creator; the
-# image is (re)created when missing OR when the marker differs.
+# image is (re)created when missing OR when the marker differs. Include the
+# canonical Rust format version: an old mode-0 v6 fixture is not a writable
+# current image. This invalidates harness fixtures, never migrates user disks.
+current_format="$(bash tools/hxfs-seed.sh --print-format-version)"
+mode_tag="${inject}:format-${current_format}"
 mode_file="$nvme_img.mode"
 need_create=0
 if [[ ! -f "$nvme_img" ]]; then
     need_create=1
-elif [[ ! -f "$mode_file" ]] || [[ "$(cat "$mode_file" 2>/dev/null)" != "$inject" ]]; then
-    echo "[soak] image mode mismatch (marker=$(cat "$mode_file" 2>/dev/null || echo none), want=$inject); recreating"
+elif [[ ! -f "$mode_file" ]] || [[ "$(cat "$mode_file" 2>/dev/null)" != "$mode_tag" ]]; then
+    echo "[soak] image mode mismatch (marker=$(cat "$mode_file" 2>/dev/null || echo none), want=$mode_tag); recreating"
     need_create=1
 fi
 if [[ "$need_create" == "1" ]]; then
     rm -f "$nvme_img"
-    echo "[soak] creating HxFS v6 image: $nvme_img ($nvme_size)"
+    echo "[soak] creating HxFS v${current_format} image: $nvme_img ($nvme_size)"
     # The QEMU NVMe namespace exposes a 512-byte LBA, so the on-disk
     # size in bytes is also the number of LBAs. Hxfs uses 4 KiB
     # internal blocks, so the Hxfs block count is on-disk bytes
@@ -154,7 +158,7 @@ if [[ "$need_create" == "1" ]]; then
     else
         python3 tools/mkhxfs.py --output "$nvme_img" --blocks "$hxfs_blocks" >/dev/null
     fi
-    echo "$inject" > "$mode_file"
+    echo "$mode_tag" > "$mode_file"
 fi
 
 # High queue-depth mode needs more vCPUs than the default soak: the

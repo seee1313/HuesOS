@@ -1,0 +1,41 @@
+cargo fmt --manifest-path tools/hxfs-seed/Cargo.toml --all -- --check
+python3 tools/test-hxfs-images.py
+test_current_images_are_empty_writable_and_sparse (__main__.ImageGate.test_current_images_are_empty_writable_and_sparse) ... current image write/checkpoint/remount gate OK (v7)
+current image write/checkpoint/remount gate OK (v7)
+current image write/checkpoint/remount gate OK (v7)
+ok
+test_explicit_legacy_fixtures_remain_read_only (__main__.ImageGate.test_explicit_legacy_fixtures_remain_read_only) ... legacy read-only gate OK (v6)
+legacy read-only gate OK (v6)
+ok
+test_invalid_requests_preserve_destination_and_clean_temporary_files (__main__.ImageGate.test_invalid_requests_preserve_destination_and_clean_temporary_files) ... ok
+test_legacy_builders_are_byte_identical (__main__.ImageGate.test_legacy_builders_are_byte_identical) ... ok
+test_repeated_generation_is_deterministic (__main__.ImageGate.test_repeated_generation_is_deterministic) ... ok
+test_seeded_modes_still_generate_current_format (__main__.ImageGate.test_seeded_modes_still_generate_current_format) ... ok
+
+----------------------------------------------------------------------
+Ran 6 tests in 2.426s
+
+OK
+RUST_MIN_STACK=16777216 cargo test --manifest-path tools/hxfs-seed/Cargo.toml \
+	--target x86_64-unknown-linux-gnu -Z build-std=
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.05s
+     Running unittests src/main.rs (tools/hxfs-seed/target/x86_64-unknown-linux-gnu/debug/deps/huesos_hxfs_seed-605df88edb773f55)
+
+running 4 tests
+test tests::injected_image_still_mounts_and_bad_tag_surfaces_precisely ... ok
+test tests::injected_crc_image_still_mounts_and_checksum_fails_precisely ... ok
+test tests::sparse_store_rejects_io_beyond_requested_capacity ... ok
+test tests::seeded_image_mounts_and_seed_file_round_trips ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.09s
+
+     Running unittests src/bin/hxfs-image-check.rs (tools/hxfs-seed/target/x86_64-unknown-linux-gnu/debug/deps/hxfs_image_check-447060c3f9b8a336)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+cargo clippy --manifest-path tools/hxfs-seed/Cargo.toml --bins \
+	--target x86_64-unknown-linux-gnu -Z build-std= -- -D warnings
+    Checking huesos-hxfs-seed v0.1.0 (/home/user/HuesOS/tools/hxfs-seed)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.23s

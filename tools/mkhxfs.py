@@ -1,12 +1,8 @@
 #!/usr/bin/env python3
-"""Create a minimal HxFS v6 development image.
+"""Create a current-format HxFS image, or an explicit legacy-v6 fixture.
 
-Plain empty images are built in-process (memory-resident for small
-images, sparse-streaming for large ones). A seeded image (an
-encrypted + compressed volume with a `seed.bin` file, used by the
-qemu-nvme soak) is delegated to the `huesos-hxfs-seed` Rust tool so
-the on-disk format and the crypto are produced by the same code the
-product uses — never reimplemented in Python.
+Current empty and seeded images are published by the Rust FixedHxfsWriter.
+Only --legacy-v6 uses the frozen Python bootstrap builders, for migration tests.
 """
 
 from __future__ import annotations
@@ -15,12 +11,13 @@ import argparse
 import os
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
-from hxfs_image import build_empty_image, build_empty_image_stream
+from hxfs_image import build_legacy_v6_image, build_legacy_v6_image_stream
 
 
-# Memory-resident builder is only used for tiny development images
+# The legacy-only memory-resident builder is used for tiny fixtures
 # (loopback smoke, single-block unit tests). Anything bigger than this
 # is built via the streaming variant so a developer or CI runner does
 # not need to allocate the whole image in Python heap.
@@ -41,15 +38,16 @@ def parse_uuid(text: str) -> bytes:
 
 
 def run_seed_tool(args: argparse.Namespace) -> int:
-    """Delegate a seeded image to the Rust hxfs-seed tool.
+    """Delegate current empty or seeded generation to the Rust image tool.
 
-    Single source of truth for the v6-encrypted + compressed volume
+    Single source of truth for the current encrypted + compressed volume
     format: the tool uses the same FixedHxfsWriter and the same
     synthetic key module as the on-target service.
     """
     root = Path(__file__).resolve().parents[1]
     tool = root / "tools" / "hxfs-seed.sh"
     command = [
+        "bash",
         str(tool),
         "--output",
         str(args.output),
@@ -59,11 +57,12 @@ def run_seed_tool(args: argparse.Namespace) -> int:
         args.instance_uuid.hex(),
         "--volume-uuid",
         args.volume_uuid.hex(),
-        "--seed-file",
-        args.seed_file,
-        "--seed-size",
-        str(args.seed_size),
     ]
+    if args.seed_file is None:
+        command.append("--empty")
+    else:
+        seed_size = SEED_DEFAULT_SIZE if args.seed_size is None else args.seed_size
+        command.extend(["--seed-file", args.seed_file, "--seed-size", str(seed_size)])
     if args.inject_bad_gcm_tag:
         command.append("--inject-bad-gcm-tag")
     if args.inject_bad_crc:
@@ -104,7 +103,7 @@ def main() -> int:
     parser.add_argument(
         "--seed-size",
         type=int,
-        default=SEED_DEFAULT_SIZE,
+        default=None,
         help="Seed mode: seed file size in bytes (default 3584)",
     )
     parser.add_argument(
@@ -128,20 +127,46 @@ def main() -> int:
         default=None,
         help="Seed mode: store this file (ELF/WAD) as an Hxblob object",
     )
+    parser.add_argument(
+        "--legacy-v6", action="store_true",
+        help="Create a read-only legacy v6 fixture for explicit migration tests",
+    )
     args = parser.parse_args()
-    if args.seed_file is not None:
-        return run_seed_tool(args)
-    if args.blocks <= IN_MEMORY_BLOCK_LIMIT:
-        image = build_empty_image(args.blocks, args.instance_uuid, args.volume_uuid)
-        args.output.parent.mkdir(parents=True, exist_ok=True)
-        args.output.write_bytes(image)
-        print(f"wrote {args.output} ({len(image)} bytes)")
-    else:
-        build_empty_image_stream(
-            args.output, args.blocks, args.instance_uuid, args.volume_uuid
-        )
-        size_bytes = args.blocks * 4096
-        print(f"wrote {args.output} ({size_bytes} bytes, streaming)")
+    if not 8 <= args.blocks <= (2**63 - 1) // 4096:
+        parser.error("--blocks must describe an image of at least 8 blocks within host file limits")
+    seed_options = (
+        args.seed_size is not None or args.inject_bad_gcm_tag
+        or args.inject_bad_crc or args.plain or args.seed_blob_file is not None
+    )
+    if args.seed_file is None and seed_options:
+        parser.error("seed options require --seed-file")
+    if args.legacy_v6 and args.seed_file is not None:
+        parser.error("--legacy-v6 cannot be combined with seeded generation")
+    # Build next to the destination and publish only after successful formatting.
+    # A small/invalid image must not truncate an existing disk image.
+    destination = args.output
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix=".mkhxfs-", dir=destination.parent)
+    os.close(fd)
+    args.output = Path(temporary)
+    try:
+        if args.legacy_v6:
+            if args.blocks <= IN_MEMORY_BLOCK_LIMIT:
+                args.output.write_bytes(build_legacy_v6_image(
+                    args.blocks, args.instance_uuid, args.volume_uuid,
+                ))
+            else:
+                build_legacy_v6_image_stream(
+                    args.output, args.blocks, args.instance_uuid, args.volume_uuid,
+                )
+        else:
+            status = run_seed_tool(args)
+            if status:
+                return status
+        os.replace(args.output, destination)
+        print(f"wrote {destination} ({args.blocks * 4096} bytes)")
+    finally:
+        args.output.unlink(missing_ok=True)
     return 0
 
 

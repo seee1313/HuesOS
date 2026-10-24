@@ -1,0 +1,12 @@
+[soak] profile=release seconds=180 log=/home/user/audit-evidence/dev2-hxfs/qemu-current-mode0.log nvme_img=build/dev2-hxfs-current-nvme.img layout=split inject=0
+[soak] building ISO before NVMe soak
+   Compiling huesos-kernel v0.1.0 (/home/user/HuesOS/crates/huesos-kernel)
+   Compiling huesos-boot v0.1.0 (/home/user/HuesOS/crates/huesos-boot)
+    Finished `release` profile [optimized] target(s) in 9.88s
+    Finished `release` profile [optimized] target(s) in 0.07s
+[soak] image mode mismatch (marker=0, want=0:format-7); recreating
+[soak] creating HxFS v7 image: build/dev2-hxfs-current-nvme.img (128M)
+[soak] swtpm attached (tpm-crb)
+qemu-system-x86_64: terminating on signal 15 from pid 69851 (timeout)
+[soak] mode 0 is a production build with no boot self-check; page-cache gate not applicable
+[soak] markers present

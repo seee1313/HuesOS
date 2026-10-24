@@ -41,6 +41,10 @@ jobs:
         env:
           CARGO_BUILD_JOBS: "1"
         run: make test-hxfs-features
+      - name: HxFS current image write and remount gate
+        env:
+          CARGO_BUILD_JOBS: "1"
+        run: make image-check
       - name: HxFS v6 to v7 migration gate
         env:
           CARGO_BUILD_JOBS: "1"

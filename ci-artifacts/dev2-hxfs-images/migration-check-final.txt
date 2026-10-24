@@ -1,0 +1,4 @@
+bash scripts/test-hxfs-migration.sh
+migrated build/hxfs-migrate-v6-smoke.img to HxFS v7 at checkpoint sequence 2
+HxFS v6 -> v7 migration smoke OK
+current image write/checkpoint/remount gate OK (v7)

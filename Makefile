@@ -14,7 +14,7 @@ CARGO_BUILD := cargo build -p huesos-boot $(CARGO_FLAGS) \
 
 ISO := build/huesos.iso
 
-.PHONY: all build build-release run run-release iso iso-release clean fmt fmt-check test test-hxfs-features migration-check policy-check storage-gate audit audit-check bench-check clippy
+.PHONY: all build build-release run run-release iso iso-release clean fmt fmt-check test test-hxfs-features migration-check image-check policy-check storage-gate audit audit-check bench-check clippy
 
 all: build
 
@@ -71,6 +71,15 @@ test-hxfs-features:
 	RUST_MIN_STACK=16777216 cargo test -p huesos-hxfs \
 		--target x86_64-unknown-linux-gnu -Z build-std= \
 		--no-default-features --features crypto-aes-gcm,compression-engines,hxblob
+
+# Current-format image generation + real writer round-trip; legacy stays read-only.
+image-check:
+	cargo fmt --manifest-path tools/hxfs-seed/Cargo.toml --all -- --check
+	python3 tools/test-hxfs-images.py
+	RUST_MIN_STACK=16777216 cargo test --manifest-path tools/hxfs-seed/Cargo.toml \
+		--target x86_64-unknown-linux-gnu -Z build-std=
+	cargo clippy --manifest-path tools/hxfs-seed/Cargo.toml --bins \
+		--target x86_64-unknown-linux-gnu -Z build-std= -- -D warnings
 
 # Explicit HxFS v6 -> v7 migration: legacy mounts stay read-only until this
 # journaled host tool publishes v7 Hxblob refcounts and format stamps.
