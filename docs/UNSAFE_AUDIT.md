@@ -13,12 +13,12 @@ are intentionally not treated as the versioned project baseline unless they are
 copied into `docs/` in a dedicated review. The versioned baseline remains this
 file plus `safety-budget.json`.
 
-At the current baseline the repository contains 272 first-party Rust files
+At the current baseline the repository contains 273 first-party Rust files
 and ~109,900 Rust lines. The measured surface (via `tools/audit-safety.py`)
-is **382** unsafe blocks, **76** unsafe functions, **33** unsafe impls, one
+is **383** unsafe blocks, **76** unsafe functions, **33** unsafe impls, one
 `static mut`, **22** unwrap calls, **62** expect calls, and **15** panic
 macros. `safety-budget.json` stores the *maximums* the CI gate may not
-exceed (currently 382 / 76 / 33 / 1 / 22 / 62 / 15), not an exact snapshot.
+exceed (currently 383 / 76 / 33 / 1 / 22 / 62 / 15), not an exact snapshot.
 Prior baseline values are retained in the changelog sections below so that
 any deviation between historical narrative and the current file is
 auditable.
