@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Small dependency-free helpers for HxFS v6 development images/tools."""
+"""HxFS inspection helpers and explicit legacy-v6 fixture builders."""
 
 from __future__ import annotations
 
@@ -11,8 +11,8 @@ FORMAT_GUID = bytes([
     0x48, 0x78, 0x66, 0x73, 0x2D, 0x48, 0x75, 0x65,
     0x73, 0x4F, 0x53, 0x2D, 0x76, 0x31, 0x00, 0x01,
 ])
-FORMAT_VERSION = 6
-TYPE_SYSTEM_VERSION = 6
+LEGACY_FORMAT_VERSION = 6
+LEGACY_TYPE_SYSTEM_VERSION = 6
 BLOCK_TYPE_SUPERBLOCK = 1
 BLOCK_TYPE_CHECKPOINT = 2
 BLOCK_TYPE_VOLUME_TABLE = 3
@@ -71,7 +71,7 @@ def make_block(block_type: int, owner: int, lba: int, payload: bytes) -> bytes:
     return bytes(block)
 
 
-def build_empty_image(size_blocks: int, instance_uuid: bytes, volume_uuid: bytes) -> bytes:
+def build_legacy_v6_image(size_blocks: int, instance_uuid: bytes, volume_uuid: bytes) -> bytes:
     if size_blocks < 8:
         raise ValueError("Hxfs image needs at least 8 blocks")
     if len(instance_uuid) != 16 or len(volume_uuid) != 16:
@@ -80,8 +80,8 @@ def build_empty_image(size_blocks: int, instance_uuid: bytes, volume_uuid: bytes
 
     super_payload = bytearray(120)
     super_payload[0:16] = FORMAT_GUID
-    super_payload[16:20] = le32(FORMAT_VERSION)
-    super_payload[20:24] = le32(TYPE_SYSTEM_VERSION)
+    super_payload[16:20] = le32(LEGACY_FORMAT_VERSION)
+    super_payload[20:24] = le32(LEGACY_TYPE_SYSTEM_VERSION)
     super_payload[24:40] = instance_uuid
     super_payload[40:48] = le64(1)
     super_payload[48:52] = le32(BLOCK_SIZE)
@@ -123,7 +123,7 @@ def build_empty_image(size_blocks: int, instance_uuid: bytes, volume_uuid: bytes
     return bytes(image)
 
 
-def build_empty_image_stream(
+def build_legacy_v6_image_stream(
     out_path: Path,
     size_blocks: int,
     instance_uuid: bytes,
@@ -132,7 +132,7 @@ def build_empty_image_stream(
     """Write an HxFS v6 empty image to `out_path` without buffering the full
     file in memory.
 
-    The original `build_empty_image` materializes the entire image as a
+    The original `build_legacy_v6_image` materializes the entire image as a
     `bytearray`, which fails with `MemoryError` for any realistic NVMe
     target (a 4 GiB QEMU image needs 4 GiB of resident Python heap, far
     beyond the budget a developer or CI runner is willing to spend on a
@@ -154,8 +154,8 @@ def build_empty_image_stream(
 
     super_payload = bytearray(120)
     super_payload[0:16] = FORMAT_GUID
-    super_payload[16:20] = le32(FORMAT_VERSION)
-    super_payload[20:24] = le32(TYPE_SYSTEM_VERSION)
+    super_payload[16:20] = le32(LEGACY_FORMAT_VERSION)
+    super_payload[20:24] = le32(LEGACY_TYPE_SYSTEM_VERSION)
     super_payload[24:40] = instance_uuid
     super_payload[40:48] = le64(1)
     super_payload[48:52] = le32(BLOCK_SIZE)

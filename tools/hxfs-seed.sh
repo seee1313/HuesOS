@@ -11,4 +11,4 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 export PATH="$HOME/.cargo/bin:$PATH"
 
 exec cargo run --quiet --manifest-path "$ROOT/tools/hxfs-seed/Cargo.toml" \
-    --target x86_64-unknown-linux-gnu -Z build-std= -- "$@"
+    --bin huesos-hxfs-seed --target x86_64-unknown-linux-gnu -Z build-std= -- "$@"

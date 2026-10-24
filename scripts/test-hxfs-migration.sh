@@ -5,7 +5,7 @@ root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$root"
 image="build/hxfs-migrate-v6-smoke.img"
 mkdir -p build
-python3 tools/mkhxfs.py --output "$image" --blocks 4096 >/dev/null
+python3 tools/mkhxfs.py --output "$image" --blocks 4096 --legacy-v6 >/dev/null
 python3 - "$image" <<'PY'
 import json
 import subprocess
@@ -35,3 +35,7 @@ assert report["checkpoint_roots"]["encryption_policy_tree_lba"] != 0
 assert report["checkpoint_roots"]["compression_policy_tree_lba"] != 0
 print("HxFS v6 -> v7 migration smoke OK")
 PY
+
+# The explicit upgrade must be writable through the production mount entry point.
+cargo run --quiet --manifest-path tools/hxfs-seed/Cargo.toml \
+    --bin hxfs-image-check --target x86_64-unknown-linux-gnu -Z build-std= -- "$image"

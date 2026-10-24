@@ -1,0 +1,3 @@
+Original main/default Python builder: 6
+legacy read-only gate OK (v6)
+Original default is legacy read-only: real writer rejects create and checkpoint with LegacyReadOnly.

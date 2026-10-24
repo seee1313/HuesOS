@@ -1,0 +1,13 @@
+[soak] profile=release seconds=180 log=/home/user/audit-evidence/dev2-hxfs/qemu-plain-mode6.log nvme_img=build/dev2-hxfs-no-tpm.img layout=split inject=6
+[soak] building ISO before NVMe soak
+   Compiling huesos-kernel v0.1.0 (/home/user/HuesOS/crates/huesos-kernel)
+   Compiling huesos-boot v0.1.0 (/home/user/HuesOS/crates/huesos-boot)
+    Finished `release` profile [optimized] target(s) in 9.33s
+    Finished `release` profile [optimized] target(s) in 0.04s
+[soak] image mode mismatch (marker=6, want=6:format-7); recreating
+[soak] creating HxFS v7 image: build/dev2-hxfs-no-tpm.img (128M)
+[soak] creating seeded Hxfs image (inject=6): build/dev2-hxfs-no-tpm.img
+[soak] no swtpm on this host; continuing without a TPM
+qemu-system-x86_64: terminating on signal 15 from pid 75850 (timeout)
+[soak] [hxfs] page-cache slots=256 hits=2 misses=2 repeat-read-hits=1
+[soak] markers present

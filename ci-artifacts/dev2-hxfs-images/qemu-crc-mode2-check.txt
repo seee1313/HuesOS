@@ -1,0 +1,12 @@
+[soak] profile=release seconds=180 log=/home/user/audit-evidence/dev2-hxfs/qemu-crc-mode2.log nvme_img=build/dev2-hxfs-crc.img layout=split inject=2
+[soak] building ISO before NVMe soak
+   Compiling huesos-kernel v0.1.0 (/home/user/HuesOS/crates/huesos-kernel)
+   Compiling huesos-boot v0.1.0 (/home/user/HuesOS/crates/huesos-boot)
+    Finished `release` profile [optimized] target(s) in 8.66s
+    Finished `release` profile [optimized] target(s) in 0.04s
+[soak] creating HxFS v7 image: build/dev2-hxfs-crc.img (128M)
+[soak] creating seeded Hxfs image (inject=2): build/dev2-hxfs-crc.img
+[soak] swtpm attached (tpm-crb)
+qemu-system-x86_64: terminating on signal 15 from pid 84334 (timeout)
+[soak] [hxfs] page-cache slots=256 hits=2 misses=2 repeat-read-hits=1
+[soak] markers present

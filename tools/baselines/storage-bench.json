@@ -3,8 +3,8 @@
     "hxfs_tools": {
       "blocks": 256,
       "image_bytes": 1048576,
-      "image_sha256": "6627d154663f9906b739b5c237c97fbc67a72d90b1c3555efbacc58d040f7888",
-      "inspect_stdout_sha256": "1cc3f178639e27c643f1ed548a1f69fc8440cb8236221d402230d4c85e669082",
+      "image_sha256": "56ec70a6e4d459cace9ee48b51e8b50e7743d9f714c286188c75ec907957a9b7",
+      "inspect_stdout_sha256": "a800d26f605b9e307ff5da5c7d62c301ecdd3c1b87bc6c8f7f9f052054e26515",
       "iterations": 3,
       "scrub_stdout_sha256": "6870d255fba4b70089723b354a23d45f2df62ca234caf8fec2a3ad94ef3ac4aa"
     },
@@ -18,10 +18,10 @@
   },
   "timings": {
     "hxfs_tools": {
-      "inspect_avg_ms": 44.564,
-      "mkhxfs_avg_ms": 69.029,
-      "scrub_avg_ms": 45.727,
-      "seed_image_avg_ms": 165.403
+      "inspect_avg_ms": 42.865,
+      "mkhxfs_avg_ms": 271.019,
+      "scrub_avg_ms": 43.28,
+      "seed_image_avg_ms": 155.861
     }
   }
 }
