@@ -341,7 +341,7 @@ mod tests {
 
     // Production-gate security hardening coverage: each test
     // pins one invariant from the rights/path/quota contract in
-    // docs/STORAGE_NVME_FS_ROADMAP.md §O (Stage X).
+    // the rights/path/quota contract in `docs/PRODUCTION_ROADMAP.md`.
     //
     //   X1 feat(abi): define Hxfs handle rights
     //   X2 feat(hxfs-service): enforce rights and request quotas

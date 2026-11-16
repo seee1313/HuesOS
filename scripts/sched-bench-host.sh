@@ -3,8 +3,8 @@
 #
 # Runs the full huesos-sched policy suite (invariant + randomized tests),
 # the kernel scheduler host tests, and prints an aggregate summary that can
-# be attached to PRs as host evidence. This is NOT bare-metal evidence; see
-# docs/BARE_METAL_SECURITY_EVIDENCE.md.
+# be attached to PRs as host evidence. This is NOT bare-metal evidence;
+# physical hardware runs are owner-gated and have no checked-in checklist yet.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

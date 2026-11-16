@@ -1,7 +1,9 @@
 # HuesOS Production-Readiness Roadmap
 
-This document replaces the versioned `STORAGE_NVME_FS_ROADMAP.md` for
-the current push toward a production-grade system. Stages here are
+This document replaces the versioned v1 storage/NVMe/FS roadmap
+(`STORAGE_NVME_FS_ROADMAP_v1.md`, removed in the 2026-11 docs-hygiene
+pass; see git history) for the current push toward a production-grade
+system. Stages here are
 **producers of production behaviour**, not feature families; a stage
 ends only when the system can serve real workloads without operator
 intervention, not when a feature compiles.
@@ -772,8 +774,9 @@ the build is still green).
 
 - Stage B track 4 (`O_DIRECT`) is **deny-by-default** today.
   When the page cache lands, the policy will be reviewed.
-  See `docs/STORAGE_NVME_FS_ROADMAP.md` for the deferred
-  work.
+  The deferred direct-I/O reconsideration is tracked here and in
+  `STORAGE_PRODUCTION_GATE.md`; the v1 roadmap that originally
+  carried it was removed in the 2026-11 docs-hygiene pass (git history).
 - Stage D track 5 (secure boot chain) depends on Track D.4
   (signed HBI). The order is: signed HBI first, then
   secure boot chain on top of it.
@@ -783,20 +786,18 @@ the build is still green).
 
 ## See also
 
-- `docs/STORAGE_NVME_FS_ROADMAP.md` — the versioned predecessor
-  for Stages P and Q. Closed when P3 + Q3 land.
 - `docs/ARCHITECTURE_ROADMAP.md` — the long-term HueOS component
   framework direction. Not replaced by this document; this
   document zooms in on the storage / security / operations
   slice needed to make the system deployable.
 - `docs/FRAMEBUFFER_POLICY.md` — the capability-gated display
   surface (Track D.6). Closed.
-- `docs/MICROKERNEL_MIGRATION.md` — the driver/userspace
-  migration. Closed: every driver in the current tree is
-  either a kernel platform service (PCI, HAL, IOAPIC, ACPI
-  parser, framebuffer, ELF, PMM) or a userspace driver
-  (NVMe, input). No further driver migrations are planned
-  in this roadmap.
+- The driver/userspace migration is closed: every driver in the
+  current tree is either a kernel platform service (PCI, HAL, IOAPIC,
+  ACPI parser, framebuffer, ELF, PMM) or a userspace driver (NVMe,
+  input). No further driver migrations are planned in this roadmap.
+  (The migration plan document was removed in the 2026-11 docs-hygiene
+  pass; its history is in git.)
 
 ## Stage E1 — Scale: multi-block trees  (landed as PR `hxfs-stage-e-scale-extents`)
 

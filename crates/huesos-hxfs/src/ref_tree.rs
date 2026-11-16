@@ -467,7 +467,7 @@ mod tests {
 
     // Production-gate refcount and backref coverage: each test pins
     // one invariant from the snapshot-reclaim contract in
-    // docs/STORAGE_NVME_FS_ROADMAP.md §F (Stage N).
+    // the snapshot-reclaim contract in `docs/PRODUCTION_ROADMAP.md`.
     //
     //   N4 feat(hxfs): reclaim blocks on snapshot deletion
     //   N5 test(hxfs): add snapshot reclaim and crash tests

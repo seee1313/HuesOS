@@ -74,4 +74,4 @@ bash scripts/ci-qemu-key-broker-fail-smoke.sh debug 180
 bash scripts/ci-qemu-smep-smap-smoke.sh release 120
 ```
 
-These are QEMU/swtpm CI gates, not bare-metal evidence. Physical evidence required before merge is described in `docs/BARE_METAL_SECURITY_EVIDENCE.md`.
+These are QEMU/swtpm CI gates, not bare-metal evidence. Physical evidence required before merge is owner-gated hardware testing; no public evidence checklist exists in the tree.

@@ -45,10 +45,12 @@ roadmap as a current feature list.
 
 ## Historical material
 
-[STORAGE_NVME_FS_ROADMAP_v1.md](STORAGE_NVME_FS_ROADMAP_v1.md) is archived.
-[design/ARCHITECTURAL_ANALYSIS.md](design/ARCHITECTURAL_ANALYSIS.md) retains earlier
-findings; [MICROKERNEL_MIGRATION.md](MICROKERNEL_MIGRATION.md) retains migration
-choices. Read them for rationale, not current verification status.
+Archived and closed documents (the v1 storage roadmap, the microkernel
+migration plan, the early architectural-weaknesses analysis, closed stage
+plans such as the Stage B I/O pipeline plan) were removed in the 2026-11
+docs-hygiene pass. Their content is reachable via git history; current design
+intent lives in the target designs listed above. Read git log for the
+rationale behind earlier decisions, not current verification status.
 
 This is a curated entry point, not an exhaustive list of every file. Existing
 subsystem documents and cross-links retain their original paths.
