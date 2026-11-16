@@ -20,23 +20,6 @@ pub struct SystemIoGrant {
     pub write: bool,
 }
 
-/// One PCI function granted to the ACPI manager.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct PciFunctionGrant {
-    /// PCI segment group.
-    pub segment: u16,
-    /// Bus number.
-    pub bus: u8,
-    /// Device number, 0..31.
-    pub device: u8,
-    /// Function number, 0..7.
-    pub function: u8,
-    /// Configuration reads are permitted.
-    pub read: bool,
-    /// Configuration writes are permitted.
-    pub write: bool,
-}
-
 /// One firmware MMIO range granted to the ACPI manager.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct MmioGrant {
@@ -54,7 +37,6 @@ pub struct MmioGrant {
 pub struct AcpiBroker {
     koid: Koid,
     system_io: Vec<SystemIoGrant>,
-    pci: Vec<PciFunctionGrant>,
     mmio: Vec<MmioGrant>,
     allow_reset: bool,
     allow_power_off: bool,
@@ -63,14 +45,18 @@ pub struct AcpiBroker {
 impl AcpiBroker {
     /// Construct a broker with no privileged grants.
     pub fn deny_all() -> Arc<Self> {
-        Self::with_policy(Vec::new(), Vec::new(), Vec::new(), false, false)
+        Self::with_policy(Vec::new(), Vec::new(), false, false)
     }
 
     /// Construct an immutable broker policy from firmware-derived grants.
     /// Callers must pass only resources parsed from validated uACPI tables.
+    ///
+    /// PCI configuration access is deliberately absent: the legacy broker
+    /// opcodes remain decodable in [`huesos_abi::acpi_broker`] but can
+    /// never be authorized (AP-10). The only path to configuration space
+    /// is the dedicated mediated channel to the supervised PCI Manager.
     pub fn with_policy(
         system_io: Vec<SystemIoGrant>,
-        pci: Vec<PciFunctionGrant>,
         mmio: Vec<MmioGrant>,
         allow_reset: bool,
         allow_power_off: bool,
@@ -78,7 +64,6 @@ impl AcpiBroker {
         Arc::new(Self {
             koid: alloc_koid(),
             system_io,
-            pci,
             mmio,
             allow_reset,
             allow_power_off,
@@ -89,7 +74,10 @@ impl AcpiBroker {
     pub fn authorizes(&self, request: &ValidRequest) -> bool {
         match request.opcode {
             Opcode::SystemIoRead | Opcode::SystemIoWrite => self.authorizes_system_io(request),
-            Opcode::PciRead | Opcode::PciWrite => self.authorizes_pci(request),
+            // AP-10: PCI configuration opcodes are never authorizable,
+            // under any grant. AML reaches configuration space only via
+            // the mediated ACPI → PCI channel served by PCI Manager.
+            Opcode::PciRead | Opcode::PciWrite => false,
             Opcode::MmioRead | Opcode::MmioWrite => self.authorizes_mmio(request),
             Opcode::Reset => self.allow_reset,
             Opcode::PowerOff => self.allow_power_off,
@@ -132,33 +120,6 @@ impl AcpiBroker {
                 _ => false,
             };
             operation_allowed && start >= grant.base && end <= grant_end
-        })
-    }
-
-    fn authorizes_pci(&self, request: &ValidRequest) -> bool {
-        let segment = (request.address >> 32) as u16;
-        let bus = (request.address >> 24) as u8;
-        let device = ((request.address >> 19) & 0x1f) as u8;
-        let function = ((request.address >> 16) & 0x07) as u8;
-        let offset = (request.address & 0x0fff) as u16;
-        if request.address & 0xffff_0000_0000_f000 != 0
-            || offset
-                .checked_add(request.width as u16)
-                .is_none_or(|end| end > 4096)
-        {
-            return false;
-        }
-        self.pci.iter().any(|grant| {
-            let operation_allowed = match request.opcode {
-                Opcode::PciRead => grant.read,
-                Opcode::PciWrite => grant.write,
-                _ => false,
-            };
-            operation_allowed
-                && grant.segment == segment
-                && grant.bus == bus
-                && grant.device == device
-                && grant.function == function
         })
     }
 }
@@ -207,7 +168,6 @@ mod tests {
                 write: false,
             }],
             Vec::new(),
-            Vec::new(),
             false,
             false,
         );
@@ -238,7 +198,6 @@ mod tests {
     #[test]
     fn mmio_grant_is_exact_and_directional() {
         let broker = AcpiBroker::with_policy(
-            Vec::new(),
             Vec::new(),
             alloc::vec![MmioGrant {
                 base: 0xFEC0_0000,
@@ -283,5 +242,39 @@ mod tests {
         assert!(outside
             .as_ref()
             .is_ok_and(|request| !broker.authorizes(request)));
+    }
+}
+
+#[cfg(test)]
+mod pci_denial_tests {
+    use super::*;
+    use huesos_abi::acpi_broker::{Request, VERSION};
+
+    fn pci_request(opcode: Opcode) -> ValidRequest {
+        Request {
+            version: VERSION,
+            opcode: opcode as u16,
+            width: 4,
+            address: (0x1234 << 32) | (0 << 24) | (0 << 19) | (0 << 16),
+            ..Request::default()
+        }
+        .validate()
+        .unwrap_or_else(|_| {
+            assert!(false, "structurally valid PCI request");
+            loop {}
+        })
+    }
+
+    #[test]
+    fn pci_read_and_write_are_never_authorizable() {
+        // AP-10: even with a maximally permissive policy object, PCI
+        // configuration opcodes must answer denial. A future regression
+        // that re-enables `authorizes_pci` fails here.
+        let broker = AcpiBroker::with_policy(Vec::new(), Vec::new(), true, true);
+        assert!(!broker.authorizes(&pci_request(Opcode::PciRead)));
+        assert!(!broker.authorizes(&pci_request(Opcode::PciWrite)));
+        let denied = AcpiBroker::deny_all();
+        assert!(!denied.authorizes(&pci_request(Opcode::PciRead)));
+        assert!(!denied.authorizes(&pci_request(Opcode::PciWrite)));
     }
 }
