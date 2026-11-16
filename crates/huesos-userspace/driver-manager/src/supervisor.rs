@@ -1120,7 +1120,16 @@ impl DriverManager {
         };
         self.acpi_manager_generation = generation.max(1);
         let hello_flags = if cfg!(feature = "acpi-restart-smoke") {
+            // Full crash cascade: generation 1 exits before readiness,
+            // generation 2 exits right after readiness, generation 3+ emit a
+            // foreign-generation heartbeat that must be ignored.
             acpi_manager::HELLO_FLAG_INJECT_PRE_READY_EXIT
+                | acpi_manager::HELLO_FLAG_INJECT_POST_READY_EXIT
+                | acpi_manager::HELLO_FLAG_INJECT_STALE_HEARTBEAT
+        } else if cfg!(feature = "acpi-restart-budget-smoke") {
+            // Every generation exits before readiness, exhausting the bounded
+            // restart budget and forcing the explicit degraded state.
+            acpi_manager::HELLO_FLAG_INJECT_PRE_READY_ALWAYS
         } else {
             0
         };

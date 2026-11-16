@@ -87,6 +87,66 @@ mod tests {
         }
     }
 
+    struct SliceReader<'a>(&'a [u8]);
+
+    impl acpi_archive::ArchiveReader for SliceReader<'_> {
+        fn read_exact_at(
+            &self,
+            offset: u64,
+            output: &mut [u8],
+        ) -> Result<(), acpi_archive::ArchiveReadError> {
+            let start = usize::try_from(offset).map_err(|_| acpi_archive::ArchiveReadError)?;
+            let end = start
+                .checked_add(output.len())
+                .ok_or(acpi_archive::ArchiveReadError)?;
+            output.copy_from_slice(
+                self.0
+                    .get(start..end)
+                    .ok_or(acpi_archive::ArchiveReadError)?,
+            );
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn fuzz_v2_header_decode_never_panics() {
+        let mut rng = Lcg::new(0xC0FFEE11);
+        let mut buf = [0u8; acpi_archive::HEADER_BYTES];
+        for _ in 0..10_000u32 {
+            rng.fill(&mut buf);
+            // The translated table-map path decodes fixed headers; arbitrary
+            // bytes must produce a Result, never a panic.
+            let _ = acpi_archive::decode_v2_header(&buf);
+        }
+    }
+
+    #[test]
+    fn fuzz_v2_mapping_decode_never_panics() {
+        let mut rng = Lcg::new(0xBADC0DE5);
+        let mut buf = [0u8; acpi_archive::MAPPING_ENTRY_BYTES];
+        for _ in 0..10_000u32 {
+            rng.fill(&mut buf);
+            let _ = acpi_archive::decode_v2_mapping(&buf);
+        }
+    }
+
+    #[test]
+    fn fuzz_archive_validate_never_panics() {
+        let mut rng = Lcg::new(0x0F0F0F0F);
+        let mut buf = [0u8; 2048];
+        for i in 0..5_000u32 {
+            rng.fill(&mut buf);
+            if i % 2 == 0 {
+                // Half the corpus carries a plausible magic + v2 version so
+                // the deeper validation paths are reached; the rest is noise.
+                buf[..8].copy_from_slice(&TABLE_ARCHIVE_MAGIC);
+                buf[8..10].copy_from_slice(&acpi_archive::VERSION.to_le_bytes());
+            }
+            let reader = SliceReader(&buf);
+            let _ = acpi_archive::validate(&reader, buf.len() as u64);
+        }
+    }
+
     #[test]
     fn fuzz_opcode_from_raw_never_panics() {
         let mut rng = Lcg::new(0xFEED_FACE_CAFE_BEEF);

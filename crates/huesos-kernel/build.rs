@@ -77,12 +77,17 @@ fn main() {
         &hxfs_args_refs,
     );
     println!("cargo:rerun-if-env-changed=HUESOS_ACPI_RESTART_SMOKE");
+    println!("cargo:rerun-if-env-changed=HUESOS_ACPI_BUDGET_SMOKE");
     println!("cargo:rerun-if-env-changed=HUESOS_KEY_BROKER_FEATURES");
     let acpi_restart_smoke = env::var_os("HUESOS_ACPI_RESTART_SMOKE").is_some();
+    let acpi_budget_smoke = env::var_os("HUESOS_ACPI_BUDGET_SMOKE").is_some();
     let key_broker_features = env::var("HUESOS_KEY_BROKER_FEATURES").unwrap_or_default();
     let mut driver_manager_features = Vec::new();
     if acpi_restart_smoke {
         driver_manager_features.push("acpi-restart-smoke");
+    }
+    if acpi_budget_smoke {
+        driver_manager_features.push("acpi-restart-budget-smoke");
     }
     if key_broker_features
         .split(',')
@@ -97,7 +102,7 @@ fn main() {
     }
     let driver_manager_args_refs: Vec<&str> =
         driver_manager_args.iter().map(String::as_str).collect();
-    let acpi_manager_args = if acpi_restart_smoke {
+    let acpi_manager_args = if acpi_restart_smoke || acpi_budget_smoke {
         ["--features", "restart-smoke"].as_slice()
     } else {
         [].as_slice()
@@ -354,9 +359,20 @@ fn track_userspace_inputs(userspace_root: &Path) {
     println!("cargo:rerun-if-changed=../../third_party/freedoom/freedoom1.wad");
 }
 
-fn userspace_target_dir(program_dir: &Path) -> PathBuf {
+fn userspace_target_dir(program_dir: &Path, variant: &[&str]) -> PathBuf {
     let Some(configured) = env::var_os("CARGO_TARGET_DIR").filter(|value| !value.is_empty()) else {
-        return program_dir.join("target");
+        let base = program_dir.join("target");
+        if variant.is_empty() {
+            return base;
+        }
+        // Fork the target directory per feature selection. Cargo does not
+        // re-link the final artifact when switching back to a previously
+        // built feature set, so reusing one directory silently embeds a
+        // stale smoke binary in the image.
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        variant.join("\u{1f}").hash(&mut hasher);
+        return base.with_file_name(format!("target-smoke-{:016x}", hasher.finish()));
     };
     let configured = PathBuf::from(configured);
     if configured.is_absolute() {
@@ -377,7 +393,7 @@ fn build_userspace_program(
     extra_args: &[&str],
 ) -> PathBuf {
     let program_dir = userspace_root.join(dir_name);
-    let target_dir = userspace_target_dir(&program_dir);
+    let target_dir = userspace_target_dir(&program_dir, extra_args);
     let mut command = Command::new(env::var("CARGO").unwrap_or_else(|_| "cargo".into()));
     command
         .current_dir(&program_dir)
@@ -388,6 +404,9 @@ fn build_userspace_program(
     for &(key, value) in extra_env {
         command.env(key, value);
     }
+    // Keep Cargo's output directory in lockstep with `bin_path` below,
+    // including the per-feature fork used by the smoke builds.
+    command.arg("--target-dir").arg(&target_dir);
 
     let status = command
         .status()

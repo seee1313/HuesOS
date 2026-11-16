@@ -1,6 +1,6 @@
 # HuesOS status and evidence map
 
-Status reviewed against `main` at `9140f85` (2026-11-16). This is a versioned
+Status reviewed against `main` at `20ebe2f` (2026-11-16). This is a versioned
 snapshot, not a live dashboard and not a claim that every current CI job passed.
 Docs-only follow-ups do not change implementation status.
 
@@ -19,7 +19,7 @@ A checked box in an old roadmap is not a current release approval.
 | Task identities and SMP | Global TaskSlotAllocator/TaskDirectory; stable generation-bearing TaskId; owner-local scheduling and token-mediated remote operations; retire-at-reap drains and counts pending remote operations | `huesos-sched` host tests are selected by `make test`; generation-helper regressions cover sequential reuse, stale operations, atomic drain at retire, and replacement-generation isolation. Kernel and QEMU boot tests are complementary | SMP termination/reschedule-IPI race behavior still requires on-target evidence; directory-level carry-over is closed. CPU ownership is not encoded in TaskId. EEVDF/CBS/SMP v2 target design is only partially integrated |
 | IRQ routing | Multi-controller route manager, dynamic vectors, typed IRQ/GSI objects, level ACK | IOAPIC host tests; keyboard QMP userspace test; edu level/raw-GSI kernel probe | Kernel-Port probe is not proof of raw-GSI userspace syscall path or real-device coverage |
 | Job quotas | Hierarchical Job tree, VMO memory/CPU tick charging and bounded IPC queues; public Job controls | Quota/object host suites; integration stress still required | Per-handle hard caps and page-table metadata accounting are not complete |
-| ACPI / PCI | Kernel immutable ACPI archive and broker; isolated userspace uACPI runtime; current PCI bootstrap/migration shim | Host decoders; ACPI restart/boot gates | Full AML/PCI-manager production stages remain separate release blockers |
+| ACPI / PCI | Kernel immutable ACPI archive and broker; isolated userspace uACPI runtime (host tests extended to the plan's required cases); ACPI Manager supervision on main: generation-safe retained archive/broker duplicates, structured control protocol, bounded backoff, last-good freeze policy; PCI bootstrap remains the migration shim | Host decoders/ABI suites; QEMU Q35/OVMF SMP2: full boot gate, injected restart cascade (pre-ready → post-ready → stale heartbeat ignored), restart-budget exhaustion into degraded mode (release; cascade also debug) | Full AML/PCI-manager production stages remain separate release blockers; bare-metal firmware corpus not claimed |
 | NVMe / HxFS | Userspace driver and mutable HxFS v7 foundation; read-only v6 compatibility with explicit migration; versioned policies and recovery paths; production status remains false | Host/storage feature gates and QEMU fault/soak scripts; inspect per-commit results | Dedicated two-vendor NVMe, v7 format approval and independent security review remain open; no physical storage verification inferred from the laptop report |
 | Framebuffer / terminal | Capability-gated drawing remains in kernel; userspace Canvas, terminal and games | Host framebuffer tests; terminal boot gate; visual/game tests have separate procedures | No Unicode shaping, GPU acceleration or desktop compositor claimed |
 

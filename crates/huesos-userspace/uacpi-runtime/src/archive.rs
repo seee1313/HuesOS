@@ -217,10 +217,15 @@ fn translate_archive(
 
 #[cfg(test)]
 mod tests {
+    extern crate std;
+
     use super::*;
     use huesos_abi::acpi_archive::{
-        encode_v2_mapping, PhysicalMappingEntry, MAPPING_KIND_RSDP, MAPPING_KIND_TABLE,
+        encode_v2_mapping, PhysicalMappingEntry, RsdpDescriptor, MAPPING_KIND_RSDP,
+        MAPPING_KIND_TABLE,
     };
+    use std::vec;
+    use std::vec::Vec;
 
     #[test]
     fn translation_accepts_only_contained_indexed_ranges() {
@@ -286,5 +291,268 @@ mod tests {
             page_round_up(u64::MAX),
             Err(ArchiveInstallError::InvalidGeometry)
         );
+    }
+
+    // Synthetic firmware graph matching the failing-closed archive shape:
+    // RSDP -> XSDT -> FADT/DSDT/FACS with adjacent physical ranges. PHYS
+    // addresses are laid out back-to-back so "start in one record, end in
+    // the next" is a real geometry, not an artificial gap.
+    struct GraphFixture {
+        bytes: Vec<u8>,
+        header: ArchiveV2Header,
+        rsdp_phys: u64,
+        xsdt_phys: u64,
+        fadt_phys: u64,
+        dsdt_phys: u64,
+        facs_phys: u64,
+        rsdp_off: u64,
+        xsdt_off: u64,
+        fadt_off: u64,
+        dsdt_off: u64,
+        facs_off: u64,
+        dsdt_len: u64,
+    }
+
+    fn graph_archive() -> GraphFixture {
+        const RSDP_LEN: u64 = 36;
+        const XSDT_LEN: u64 = 128;
+        const FADT_LEN: u64 = 244;
+        const DSDT_LEN: u64 = 4100;
+        const FACS_LEN: u64 = 64;
+
+        let rsdp_phys = 0xE0000u64;
+        let xsdt_phys = rsdp_phys + RSDP_LEN; // 0xE0024
+        let fadt_phys = xsdt_phys + XSDT_LEN; // 0xE00A4
+        let dsdt_phys = 0xE1000u64; // unindexed gap between FADT end and DSDT
+        let facs_phys = dsdt_phys + DSDT_LEN; // adjacent to DSDT
+
+        let mappings_offset = acpi_archive::HEADER_BYTES as u64;
+        let payload_offset = mappings_offset + 5 * MAPPING_ENTRY_BYTES as u64; // 256
+        let rsdp_off = payload_offset;
+        let xsdt_off = rsdp_off + RSDP_LEN; // 292
+        let fadt_off = xsdt_off + XSDT_LEN; // 420
+        let dsdt_off = fadt_off + FADT_LEN; // 664, crosses the 4 KiB archive boundary
+        let facs_off = dsdt_off + DSDT_LEN; // 4764
+        let total_size = facs_off + FACS_LEN; // 4828
+
+        let entries = [
+            (rsdp_phys, rsdp_off, RSDP_LEN, MAPPING_KIND_RSDP),
+            (xsdt_phys, xsdt_off, XSDT_LEN, MAPPING_KIND_TABLE),
+            (fadt_phys, fadt_off, FADT_LEN, MAPPING_KIND_TABLE),
+            (dsdt_phys, dsdt_off, DSDT_LEN, MAPPING_KIND_TABLE),
+            (facs_phys, facs_off, FACS_LEN, MAPPING_KIND_TABLE),
+        ];
+
+        let mut bytes = vec![0u8; total_size as usize];
+        for (index, &(physical_address, offset, length, kind)) in entries.iter().enumerate() {
+            let entry = PhysicalMappingEntry {
+                physical_address,
+                offset,
+                length,
+                kind,
+            };
+            let start = acpi_archive::HEADER_BYTES + index * MAPPING_ENTRY_BYTES;
+            assert_eq!(
+                encode_v2_mapping(&entry, &mut bytes[start..start + MAPPING_ENTRY_BYTES]),
+                Ok(())
+            );
+        }
+
+        let header = ArchiveV2Header {
+            total_size,
+            firmware_snapshot_id: 7,
+            table_count: 5,
+            mapping_count: 5,
+            table_entries_offset: mappings_offset,
+            mappings_offset,
+            payload_offset,
+            rsdp: RsdpDescriptor {
+                physical_address: rsdp_phys,
+                offset: rsdp_off,
+                length: RSDP_LEN as u32,
+                mapping_index: 0,
+                revision: 2,
+            },
+        };
+
+        GraphFixture {
+            bytes,
+            header,
+            rsdp_phys,
+            xsdt_phys,
+            fadt_phys,
+            dsdt_phys,
+            facs_phys,
+            rsdp_off,
+            xsdt_off,
+            fadt_off,
+            dsdt_off,
+            facs_off,
+            dsdt_len: DSDT_LEN,
+        }
+    }
+
+    #[test]
+    fn synthetic_rsdp_xsdt_fadt_dsdt_facs_graph_translates() {
+        let fixture = graph_archive();
+        let header = &fixture.header;
+        let bytes = fixture.bytes.as_slice();
+        for (phys, offset, length) in [
+            (fixture.rsdp_phys, fixture.rsdp_off, 36u64),
+            (fixture.xsdt_phys, fixture.xsdt_off, 128),
+            (fixture.fadt_phys, fixture.fadt_off, 244),
+            (fixture.dsdt_phys, fixture.dsdt_off, fixture.dsdt_len),
+            (fixture.facs_phys, fixture.facs_off, 64),
+        ] {
+            assert_eq!(
+                translate_archive(bytes, header, phys, length),
+                usize::try_from(offset).ok(),
+                "phys {phys:#x} len {length}"
+            );
+        }
+        // Full-table sized requests: exact length succeeds, one byte more fails.
+        assert_eq!(
+            translate_archive(bytes, header, fixture.xsdt_phys, 129),
+            None
+        );
+        assert_eq!(
+            translate_archive(bytes, header, fixture.dsdt_phys, fixture.dsdt_len),
+            Some(fixture.dsdt_off as usize)
+        );
+        assert_eq!(
+            translate_archive(bytes, header, fixture.dsdt_phys, fixture.dsdt_len + 1),
+            None
+        );
+        // Sub-range inside a record, including an unaligned start, is arithmetic.
+        assert_eq!(
+            translate_archive(bytes, header, fixture.xsdt_phys + 3, 8),
+            Some(fixture.xsdt_off as usize + 3)
+        );
+        // Released original RSDP is serviceable from the translated archive.
+        assert_eq!(
+            translate_archive(bytes, header, fixture.rsdp_phys, 8),
+            Some(fixture.rsdp_off as usize)
+        );
+    }
+
+    #[test]
+    fn adjacent_records_gaps_and_ecam_ranges_are_rejected() {
+        let fixture = graph_archive();
+        let header = &fixture.header;
+        let bytes = fixture.bytes.as_slice();
+        // One range covering the tail of RSDP and the head of XSDT spans two
+        // adjacent records; it must not be silently merged.
+        assert_eq!(
+            translate_archive(bytes, header, fixture.rsdp_phys + 32, 16),
+            None
+        );
+        // Back-to-back DSDT/FACS: a range may not straddle the boundary.
+        let dsdt_end = fixture.dsdt_phys + fixture.dsdt_len;
+        assert_eq!(translate_archive(bytes, header, dsdt_end - 4, 8), None);
+        // Unindexed RAM gap between FADT end and DSDT start.
+        assert_eq!(translate_archive(bytes, header, 0xE0600, 8), None);
+        // ECAM-like and IOAPIC-like MMIO addresses are not indexed either.
+        assert_eq!(translate_archive(bytes, header, 0x8000_0000, 0x1000), None);
+        assert_eq!(translate_archive(bytes, header, 0xFEC0_0000, 4), None);
+        // Zero-length requests are rejected even at a valid record start.
+        assert_eq!(translate_archive(bytes, header, fixture.rsdp_phys, 0), None);
+    }
+
+    #[test]
+    fn page_boundary_range_inside_one_record_is_accepted() {
+        let fixture = graph_archive();
+        let header = &fixture.header;
+        let bytes = fixture.bytes.as_slice();
+        // The DSDT record straddles the 4 KiB archive page boundary (file
+        // offsets 664..4764). Ask for the range that crosses file offset 4096.
+        let file_offset = 4090u64;
+        let phys = fixture.dsdt_phys + (file_offset - fixture.dsdt_off);
+        assert_eq!(
+            translate_archive(bytes, header, phys, 16),
+            Some(file_offset as usize)
+        );
+        // The full remainder of the record, ending exactly at its end.
+        let remainder = fixture.dsdt_off + fixture.dsdt_len - file_offset;
+        assert_eq!(
+            translate_archive(bytes, header, phys, remainder),
+            Some(file_offset as usize)
+        );
+        // One byte past the record end is a two-records (or overflow) request.
+        assert_eq!(translate_archive(bytes, header, phys, remainder + 1), None);
+    }
+
+    #[test]
+    fn unmap_is_a_process_lifetime_bookkeeping_noop() {
+        // The full uACPI unmap entry point must never try to release the
+        // sealed VMO mapping; it is bookkeeping only, for any pointer/length.
+        uacpi_kernel_unmap(core::ptr::null_mut(), 0);
+        uacpi_kernel_unmap(ARCHIVE_MAP_BASE as *mut c_void, 4096);
+    }
+
+    // Deterministic LCG so the decode/translate fuzz runs are reproducible
+    // across machines without pulling in a random dependency.
+    struct Lcg(u64);
+
+    impl Lcg {
+        fn new(seed: u64) -> Self {
+            Self(seed)
+        }
+
+        fn next(&mut self) -> u64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            self.0
+        }
+
+        fn byte(&mut self) -> u8 {
+            (self.next() & 0xff) as u8
+        }
+
+        fn word(&mut self) -> u16 {
+            (self.next() & 0xffff) as u16
+        }
+    }
+
+    #[test]
+    fn translator_never_panics_on_random_archives() {
+        let mut rng = Lcg::new(0x853c49e6748fea9b);
+        let total = (acpi_archive::HEADER_BYTES + 4 * MAPPING_ENTRY_BYTES + 64) as u64;
+        let payload_base = (acpi_archive::HEADER_BYTES + 4 * MAPPING_ENTRY_BYTES) as u64;
+        for _ in 0..2_000u32 {
+            let mut bytes = vec![0u8; total as usize];
+            let mapping_count = rng.byte() % 4;
+            for index in 0..mapping_count {
+                let entry = PhysicalMappingEntry {
+                    physical_address: rng.next() % 0x0010_0000,
+                    offset: payload_base + u64::from(rng.word()) % 64,
+                    length: u64::from(rng.word()) % 512,
+                    kind: 1 + (rng.byte() & 1),
+                };
+                let start = acpi_archive::HEADER_BYTES + usize::from(index) * MAPPING_ENTRY_BYTES;
+                assert_eq!(
+                    encode_v2_mapping(&entry, &mut bytes[start..start + MAPPING_ENTRY_BYTES]),
+                    Ok(())
+                );
+            }
+            let header = ArchiveV2Header {
+                total_size: total,
+                firmware_snapshot_id: 1 + u64::from(rng.word()),
+                table_count: 0,
+                mapping_count: u32::from(mapping_count),
+                table_entries_offset: acpi_archive::HEADER_BYTES as u64,
+                mappings_offset: acpi_archive::HEADER_BYTES as u64,
+                payload_offset: payload_base,
+                rsdp: RsdpDescriptor::default(),
+            };
+            let query_address = rng.next() % 0x0012_0000;
+            let query_length = u64::from(rng.next() % 1024);
+            // The valuable property: no panic, and any success stays in bounds.
+            if let Some(offset) = translate_archive(&bytes, &header, query_address, query_length) {
+                assert!(query_length != 0);
+                assert!(offset as u64 + query_length <= header.total_size);
+            }
+        }
     }
 }

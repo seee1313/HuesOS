@@ -14,8 +14,21 @@ pub const BROKER_LABEL: &[u8] = b"acpi-broker";
 pub const SELF_VMAR_LABEL: &[u8] = b"acpi-self-vmar";
 /// Test-only hello detail: generation one exits before readiness.
 pub const HELLO_FLAG_INJECT_PRE_READY_EXIT: u32 = 1 << 0;
+/// Test-only hello detail: the second generation exits right after readiness
+/// is announced, proving restart from the crash-after-ready window.
+pub const HELLO_FLAG_INJECT_POST_READY_EXIT: u32 = 1 << 1;
+/// Test-only hello detail: the third and later generations emit one
+/// foreign-generation heartbeat after readiness, proving stale control bytes
+/// cannot move supervised state.
+pub const HELLO_FLAG_INJECT_STALE_HEARTBEAT: u32 = 1 << 2;
+/// Test-only hello detail: every generation exits before readiness,
+/// proving the bounded restart budget and the explicit degraded state.
+pub const HELLO_FLAG_INJECT_PRE_READY_ALWAYS: u32 = 1 << 3;
 /// All hello flags known by version 1.
-pub const HELLO_FLAGS_V1: u32 = HELLO_FLAG_INJECT_PRE_READY_EXIT;
+pub const HELLO_FLAGS_V1: u32 = HELLO_FLAG_INJECT_PRE_READY_EXIT
+    | HELLO_FLAG_INJECT_POST_READY_EXIT
+    | HELLO_FLAG_INJECT_STALE_HEARTBEAT
+    | HELLO_FLAG_INJECT_PRE_READY_ALWAYS;
 
 /// Lifecycle control operation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
