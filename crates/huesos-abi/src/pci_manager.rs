@@ -12,6 +12,16 @@ pub const VERSION: u16 = 1;
 pub const MESSAGE_BYTES: usize = 24;
 /// Future VMO-handle label carrying `huesos_abi::pci::RootBridgeTable` bytes.
 pub const ROOT_TABLE_VMO_LABEL: &[u8] = b"pci-roots-vmo";
+/// Label carrying the bounded, immutable `huesos_abi::hmcf` snapshot to
+/// one PCI Manager generation. The VMO grants `READ | TRANSFER` only;
+/// DriverManager transfers a duplicate, never its retained origin, and
+/// the receiver must treat it as immutable.
+pub const HMCF_VMO_LABEL: &[u8] = b"pci-hmcf-vmo";
+/// Label carrying one read-only ECAM capability (`Mmio`, `READ |
+/// TRANSFER` rights). One message per `huesos_abi::hmcf` record, sent
+/// in canonical record order; the receiver matches the `i`-th
+/// `CONFIG_ECAM_LABEL` handle to the `i`-th HMCF record.
+pub const CONFIG_ECAM_LABEL: &[u8] = b"pci-config-ecam";
 
 /// Control operation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -27,6 +37,12 @@ pub enum Opcode {
     RootTableAccepted = 4,
     /// Future root-table VMO was rejected.
     RootTableRejected = 5,
+    /// DriverManager ends the config-authority transfer burst with
+    /// this message. `detail` carries the number of read-only ECAM
+    /// capabilities that preceded it (`0` when no authority could be
+    /// minted — the manager must stay fail-closed). Sent at most
+    /// once per manager generation, only after a `Hello`.
+    AuthorityComplete = 6,
 }
 
 impl Opcode {
@@ -37,6 +53,7 @@ impl Opcode {
             3 => Some(Self::Heartbeat),
             4 => Some(Self::RootTableAccepted),
             5 => Some(Self::RootTableRejected),
+            6 => Some(Self::AuthorityComplete),
             _ => None,
         }
     }
@@ -55,6 +72,13 @@ pub enum Status {
     InvalidMessage = -1,
     /// Root descriptor table was rejected.
     InvalidRootTable = -2,
+    /// Manager completed fail-closed bootstrap **and** accepted the
+    /// read-only config authority handoff (HMCF decoded, ECAM
+    /// capabilities received and mapped read-only). Distinguished
+    /// from [`Status::NoRootsFailClosed`] so supervisors can record
+    /// the upgrade; every PCI configuration read still requires the
+    /// AP-10 mediation protocol.
+    ConfigAuthorityReady = 2,
 }
 
 impl Status {
@@ -64,6 +88,7 @@ impl Status {
             1 => Some(Self::NoRootsFailClosed),
             -1 => Some(Self::InvalidMessage),
             -2 => Some(Self::InvalidRootTable),
+            2 => Some(Self::ConfigAuthorityReady),
             _ => None,
         }
     }
@@ -100,6 +125,29 @@ impl Message {
             manager_generation,
             status: Status::NoRootsFailClosed,
             detail: 0,
+        }
+    }
+
+    /// Ready response sent after the read-only config authority
+    /// handoff validated: `window_count` ECAM capabilities are mapped
+    /// read-only. PCI configuration reads remain mediation-only.
+    pub const fn ready_config_authority(manager_generation: u64, window_count: u32) -> Self {
+        Self {
+            opcode: Opcode::Ready,
+            manager_generation,
+            status: Status::ConfigAuthorityReady,
+            detail: window_count,
+        }
+    }
+
+    /// End-of-authority-burst sentinel; `window_count` ECAM
+    /// capabilities (`0` = none, stay fail-closed).
+    pub const fn authority_complete(manager_generation: u64, window_count: u32) -> Self {
+        Self {
+            opcode: Opcode::AuthorityComplete,
+            manager_generation,
+            status: Status::Ok,
+            detail: window_count,
         }
     }
 }
@@ -249,7 +297,13 @@ mod tests {
 
     #[test]
     fn hello_and_fail_closed_ready_round_trip() {
-        for message in [Message::hello(7), Message::ready_without_roots(7)] {
+        for message in [
+            Message::hello(7),
+            Message::ready_without_roots(7),
+            Message::ready_config_authority(7, 2),
+            Message::authority_complete(7, 2),
+            Message::authority_complete(7, 0),
+        ] {
             let mut bytes = [0u8; MESSAGE_BYTES];
             let Some(length) = encode(message, &mut bytes) else {
                 assert!(false, "valid message should encode");
