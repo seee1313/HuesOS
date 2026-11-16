@@ -32,12 +32,22 @@ impl Handle {
         self.0
     }
 
+    /// Take ownership of a kernel-reserved fixed init slot.
+    ///
+    /// `raw` must name a slot the kernel reserves for exactly one
+    /// init-owned handle; callers assert that by construction (the
+    /// slot constants come from `huesos-abi`).
+    fn take_fixed_init_handle(raw: HandleValue) -> Self {
+        // SAFETY: every caller passes a kernel-reserved init slot
+        // constant; the kernel installs exactly one owned handle per
+        // such slot and init calls each take function at most once.
+        unsafe { Self::from_raw(raw) }
+    }
+
     /// Take ownership of the fixed ACPI broker capability installed only in
     /// the initial process by the kernel.
     pub fn take_init_acpi_broker() -> Self {
-        // SAFETY: the kernel reserves this slot for exactly one init-owned
-        // broker handle; init calls this once before transferring ownership.
-        unsafe { Self::from_raw(huesos_abi::INIT_ACPI_BROKER_HANDLE) }
+        Self::take_fixed_init_handle(huesos_abi::INIT_ACPI_BROKER_HANDLE)
     }
 
     /// Take ownership of the `FrameDraw` capability installed only in the
@@ -47,9 +57,31 @@ impl Handle {
     /// resource and deliver a handle to each graphics consumer over a
     /// channel; see `docs/ARCHITECTURE_ROADMAP.md` § framebuffer.
     pub fn take_init_frame_draw() -> Self {
-        // SAFETY: the kernel installs exactly one FrameDraw handle at
-        // this reserved slot in the initial process and nowhere else.
-        unsafe { Self::from_raw(huesos_abi::INIT_FRAME_DRAW_HANDLE) }
+        Self::take_fixed_init_handle(huesos_abi::INIT_FRAME_DRAW_HANDLE)
+    }
+
+    /// Take ownership of the unique `PciConfigMint` authority installed
+    /// only in the initial process by the kernel (AP-8).
+    ///
+    /// init transfers it (never duplicates it) to DriverManager, which
+    /// is the only component allowed to mint generation-bound,
+    /// read-only PCI configuration capabilities; see
+    /// `docs/ACPI_PCI_IMPLEMENTATION_PLAN.md` AP-9.
+    pub fn take_init_config_mint() -> Self {
+        Self::take_fixed_init_handle(huesos_abi::INIT_CONFIG_MINT_HANDLE)
+    }
+
+    /// Wrap a batch of raw handle values installed in this process's
+    /// table by one syscall into owned RAII handles. Used by the
+    /// `PciConfigMint` wrapper: the mint installs exactly one owned
+    /// handle per reported slot. Slots past `count` are left `None`.
+    pub(crate) fn fill_kernel_batch(out: &mut [Option<Self>], values: &[HandleValue]) {
+        for (slot, &value) in out.iter_mut().zip(values.iter()) {
+            // SAFETY: `values` comes straight from a syscall that
+            // installed one owned handle per entry in this process's
+            // table; each raw value is wrapped exactly once, here.
+            *slot = Some(unsafe { Self::from_raw(value) });
+        }
     }
 
     /// Consume this `Handle` without closing the underlying kernel handle,

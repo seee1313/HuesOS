@@ -50,6 +50,11 @@ pub const ACPI_TABLES_VMO: &str = "acpi-tables-vmo";
 pub const ACPI_BROKER: &str = "acpi-broker";
 /// Init delegates the unique KeyBroker generation-grant channel.
 pub const KEY_BROKER_MANAGER: &str = "key-broker:manager-channel";
+/// Init delegates the unique `PciConfigMint` authority (AP-8). DriverManager
+/// is the only component besides `init` that ever holds it; it mints
+/// generation-bound read-only ECAM capabilities for PCI Manager and never
+/// duplicates or re-transfers the authority itself.
+pub const CONFIG_MINT_AUTHORITY: &str = "pci-config-mint:manager-authority";
 /// DriverManager passes the archive to the isolated ACPI manager.
 pub const ACPI_MANAGER_TABLES: &str = "acpi-tables-vmo";
 /// DriverManager passes the unique broker capability to the ACPI manager.
