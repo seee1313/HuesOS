@@ -50,6 +50,7 @@ pub mod storage_boot;
 /// PCI Manager root-bridge descriptor protocol.
 pub mod pci;
 /// PCI Manager bootstrap and lifecycle control protocol.
+pub mod pci_config;
 pub mod pci_manager;
 
 /// HBI boot-driver manifest ABI.
