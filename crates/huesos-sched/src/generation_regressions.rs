@@ -131,7 +131,7 @@ fn migration_preserves_pending_flags_but_reuse_discards_them() {
         DIRECTORY.publish_operations(id, task_operations::WAKE),
         Ok(true)
     );
-    assert_eq!(DIRECTORY.retire(id), Ok(()));
+    assert_eq!(DIRECTORY.retire(id), Ok(task_operations::WAKE));
     assert_eq!(DIRECTORY.published_id(id.slot()), None);
     assert_eq!(
         DIRECTORY.publish_operations(id, task_operations::WAKE),
@@ -211,7 +211,7 @@ fn delayed_cas_cannot_publish_into_or_consume_a_replacement() {
         assert!(false);
         return;
     };
-    assert_eq!(DIRECTORY.retire(old), Ok(()));
+    assert_eq!(DIRECTORY.retire(old), Ok(task_operations::WAKE));
     assert_eq!(DIRECTORY.publish(next, owner, 0), Ok(()));
     assert_eq!(
         DIRECTORY.publish_operations(next, task_operations::WAKE),
@@ -288,7 +288,12 @@ fn stale_producers_and_consumers_cannot_cross_concurrent_slot_churn() {
             });
         }
         start.wait();
-        assert_eq!(DIRECTORY.retire(old), Ok(()));
+        // Threads race POLICY publishes/drains; the mask reported at retire
+        // time may carry zero or more POLICY bits, nothing else.
+        match DIRECTORY.retire(old) {
+            Ok(mask) => assert_eq!(mask & !task_operations::POLICY, 0),
+            Err(_) => assert!(false, "retire must succeed for the live generation"),
+        }
         for generation in 2..=4096 {
             let Some(current) = TaskId::new(old.slot(), generation) else {
                 assert!(false);
@@ -304,7 +309,7 @@ fn stale_producers_and_consumers_cannot_cross_concurrent_slot_churn() {
                 DIRECTORY.take_operations(current),
                 Ok(task_operations::WAKE)
             );
-            assert_eq!(DIRECTORY.retire(current), Ok(()));
+            assert_eq!(DIRECTORY.retire(current), Ok(0));
         }
         stop.store(true, Ordering::Release);
     });
@@ -344,9 +349,140 @@ fn reaper_retirement_recycles_more_than_global_capacity_without_carry_over() {
             Ok(true)
         );
         // Exact kernel release order: retire directory before freeing global slot.
-        assert_eq!(DIRECTORY.retire(id), Ok(()));
+        assert_eq!(DIRECTORY.retire(id), Ok(task_operations::ALL));
         assert_eq!(DIRECTORY.published_id(slot), None);
         assert_eq!(ALLOCATOR.free(slot), Ok(()));
         previous = Some(id);
     }
+}
+
+// Drain semantics for the kernel reaper: retire() reports the operation bits
+// that were pending on the dying identity, atomically in the same publication
+// step that unpublishes it. The replacement generation never observes them.
+#[test]
+fn retire_reports_pending_remote_operations_atomically() {
+    static DIRECTORY: TaskDirectory = TaskDirectory::new();
+    let Some(owner) = CpuIndex::new(0) else {
+        assert!(false);
+        return;
+    };
+    let Some(old) = TaskId::new(21, 1) else {
+        assert!(false);
+        return;
+    };
+    assert_eq!(DIRECTORY.publish(old, owner, 2), Ok(()));
+    assert_eq!(
+        DIRECTORY.publish_operations(old, task_operations::WAKE),
+        Ok(true)
+    );
+    assert_eq!(
+        DIRECTORY.publish_operations(old, task_operations::MIGRATION),
+        Ok(true)
+    );
+    assert_eq!(
+        DIRECTORY.retire(old),
+        Ok(task_operations::WAKE | task_operations::MIGRATION)
+    );
+    // One-shot: a second drain of the same identity reports nothing and fails.
+    assert_eq!(DIRECTORY.retire(old), Err(DirectoryError::StaleIdentity));
+    assert_eq!(
+        DIRECTORY.take_operations(old),
+        Err(DirectoryError::StaleIdentity)
+    );
+}
+
+#[test]
+fn retire_reports_empty_mask_when_no_operations_pending() {
+    static DIRECTORY: TaskDirectory = TaskDirectory::new();
+    let Some(owner) = CpuIndex::new(0) else {
+        assert!(false);
+        return;
+    };
+    let Some(id) = TaskId::new(22, 1) else {
+        assert!(false);
+        return;
+    };
+    assert_eq!(DIRECTORY.publish(id, owner, 1), Ok(()));
+    assert_eq!(DIRECTORY.retire(id), Ok(0));
+}
+
+#[test]
+fn replacement_generation_never_inherits_discarded_remote_operations() {
+    static DIRECTORY: TaskDirectory = TaskDirectory::new();
+    static ALLOCATOR: TaskSlotAllocator = TaskSlotAllocator::new();
+    let Some(owner) = CpuIndex::new(0) else {
+        assert!(false);
+        return;
+    };
+    let Some((slot, generation)) = ALLOCATOR.allocate() else {
+        assert!(false);
+        return;
+    };
+    let Some(old) = TaskId::new(slot, generation) else {
+        assert!(false);
+        return;
+    };
+    assert_eq!(DIRECTORY.publish(old, owner, 5), Ok(()));
+    assert_eq!(
+        DIRECTORY.publish_operations(old, task_operations::WAKE | task_operations::KILL),
+        Ok(true)
+    );
+    // Exact kernel release order: retire (draining at retire), mark local
+    // slot Reaped, then free the global slot for reuse.
+    assert_eq!(
+        DIRECTORY.retire(old),
+        Ok(task_operations::WAKE | task_operations::KILL)
+    );
+    assert_eq!(ALLOCATOR.free(slot), Ok(()));
+    let Some((reused, next_generation)) = ALLOCATOR.allocate() else {
+        assert!(false);
+        return;
+    };
+    assert_eq!(reused, slot);
+    let Some(current) = TaskId::new(reused, next_generation) else {
+        assert!(false);
+        return;
+    };
+    assert_eq!(DIRECTORY.publish(current, owner, 5), Ok(()));
+    assert_eq!(DIRECTORY.take_operations(current), Ok(0));
+}
+
+#[test]
+fn publish_replacement_discards_stale_flags_even_without_retire() {
+    // Defense-in-depth contract, pinned so it cannot silently regress: if a
+    // bug ever frees the global slot without retiring the directory first,
+    // publish() still replaces the whole generation-tagged word on reuse, so
+    // the stale flags never reach the replacement identity.
+    static DIRECTORY: TaskDirectory = TaskDirectory::new();
+    static ALLOCATOR: TaskSlotAllocator = TaskSlotAllocator::new();
+    let Some(owner) = CpuIndex::new(0) else {
+        assert!(false);
+        return;
+    };
+    let Some((slot, generation)) = ALLOCATOR.allocate() else {
+        assert!(false);
+        return;
+    };
+    let Some(old) = TaskId::new(slot, generation) else {
+        assert!(false);
+        return;
+    };
+    assert_eq!(DIRECTORY.publish(old, owner, 3), Ok(()));
+    assert_eq!(
+        DIRECTORY.publish_operations(old, task_operations::WAKE),
+        Ok(true)
+    );
+    // Bug-for-bug replay of the legacy sequence: free without retire.
+    assert_eq!(ALLOCATOR.free(slot), Ok(()));
+    let Some((reused, next_generation)) = ALLOCATOR.allocate() else {
+        assert!(false);
+        return;
+    };
+    assert_eq!(reused, slot);
+    let Some(current) = TaskId::new(reused, next_generation) else {
+        assert!(false);
+        return;
+    };
+    assert_eq!(DIRECTORY.publish(current, owner, 3), Ok(()));
+    assert_eq!(DIRECTORY.take_operations(current), Ok(0));
 }

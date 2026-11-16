@@ -26,7 +26,10 @@ gates close.
   distinct async wakers, counted waiter release and competing exits. Exercise
   4096 exits against the bounded graveyard and stale full TaskId operations
   after sequential helper clear/reuse; include huesos-sched in make test.
-  The current reaper's pending-operation carry-over defect remains open.
+  The reaper's pending-operation carry-over defect is closed at the
+  directory/integration level: `TaskDirectory::retire` atomically reports and
+  discards pending remote operations, the kernel counts them, and replacement
+  generations are pinned by host regressions (see TASK_GENERATIONS.md).
 - Init repeats ProcessWait and ProcessGetExitCode after each child exit; the
   QEMU boot gate requires its dedicated repeated-observation marker.
 - Scope and verification limits: [PROCESS_LIFECYCLE_REGRESSIONS.md](PROCESS_LIFECYCLE_REGRESSIONS.md).

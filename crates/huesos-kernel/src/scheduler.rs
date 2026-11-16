@@ -246,6 +246,13 @@ static OBS_RESCHED_IPIS: core::sync::atomic::AtomicU64 = core::sync::atomic::Ato
 static OBS_INBOX_DRAINS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 /// Per-CPU IRQ event storm accounting (pending/masked), aggregated.
 static OBS_IRQ_STORM_MASKS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// Total remote-operation bits discarded at reap time; they were pending on
+/// the dying identity and are dropped, never applied to the replacement.
+static OBS_REAP_DISCARDED_OP_FLAGS: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+/// Tasks with at least one pending remote operation discarded at reap.
+static OBS_REAP_TASKS_WITH_DISCARDED_OPS: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
 
 /// Fixed-point TSC clock, calibrated once during late init. Used for
 /// nanosecond scheduling time; the periodic LAPIC tick remains the wait
@@ -1126,6 +1133,10 @@ pub struct SchedStats {
     pub resched_ipis: u64,
     pub inbox_drains: u64,
     pub irq_storm_masks: u64,
+    /// Total remote-operation bits discarded at reap (dying identity).
+    pub reap_discarded_op_flags: u64,
+    /// Tasks that had remote operations pending at reap.
+    pub reap_tasks_with_discarded_ops: u64,
 }
 
 /// Read the scheduler observability counters.
@@ -1136,6 +1147,8 @@ pub fn sched_stats() -> SchedStats {
         resched_ipis: OBS_RESCHED_IPIS.load(Ordering::Relaxed),
         inbox_drains: OBS_INBOX_DRAINS.load(Ordering::Relaxed),
         irq_storm_masks: OBS_IRQ_STORM_MASKS.load(Ordering::Relaxed),
+        reap_discarded_op_flags: OBS_REAP_DISCARDED_OP_FLAGS.load(Ordering::Relaxed),
+        reap_tasks_with_discarded_ops: OBS_REAP_TASKS_WITH_DISCARDED_OPS.load(Ordering::Relaxed),
     }
 }
 
@@ -1495,13 +1508,24 @@ pub fn reap_finished_tasks() {
             } else {
                 // Invalidate the tagged operation state before releasing either
                 // slot. A delayed producer/consumer can no longer affect reuse.
+                // Pending remote operations on the dying identity are drained
+                // and counted, never applied or carried into the replacement.
                 let Some(id) = V2TaskId::from_raw(task_id) else {
                     continue;
                 };
-                if TASK_DIRECTORY.retire(id).is_err() {
-                    // Keep the allocation quarantined if identity validation
-                    // fails; never publish a reusable slot with a live directory.
-                    continue;
+                match TASK_DIRECTORY.retire(id) {
+                    Ok(discarded) => {
+                        if discarded != 0 {
+                            OBS_REAP_DISCARDED_OP_FLAGS
+                                .fetch_add(discarded.count_ones() as u64, Ordering::Relaxed);
+                            OBS_REAP_TASKS_WITH_DISCARDED_OPS.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                    Err(_) => {
+                        // Keep the allocation quarantined if identity validation
+                        // fails; never publish a reusable slot with a live directory.
+                        continue;
+                    }
                 }
                 // Release the stack and Process Arc before publishing the slot.
                 slot.kernel_stack = alloc::vec::Vec::new();

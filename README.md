@@ -124,8 +124,9 @@ Default `scripts/run.sh` uses `-smp 2`.
   teardown releases address spaces/stacks and recycles generation-bearing task
   slots. Bounded exit records remain for observation. Long-running resource
   baseline return and concurrent cancellation still require dedicated stress
-  evidence. The current reaper-style slot reuse also has a known pending-operation
-  carry-over gap; see [docs/TASK_GENERATIONS.md](docs/TASK_GENERATIONS.md) and
+  evidence. Pending remote-operation carry-over at reap is closed (drain-at-retire
+  with observability counters; see [docs/TASK_GENERATIONS.md](docs/TASK_GENERATIONS.md));
+  SMP termination/reschedule-IPI race evidence on target remains open, see
   [docs/OBJECT_LIFECYCLE.md](docs/OBJECT_LIFECYCLE.md)
 - Dynamic process launch and blocking `ProcessWait` work; multi-object wait
   (`WaitSetWait` syscall + `libcanvas::wait_any` / `wait_all`) is landed,
