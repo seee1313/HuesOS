@@ -8,8 +8,8 @@
 //!
 //! The descriptors themselves are pure data (host-tested). The kernel-side
 //! population -- discovering the device, mapping the BAR, and allocating
-//! DMA-coherent pages as VMOs -- is on-target; see
-//! `docs/NVME_KERNEL_PLUMBING.md`.
+//! DMA-coherent pages as VMOs -- landed with the Stage B MSI-X/MSI wiring;
+//! see `docs/NVME.md` and `docs/STATUS.md`.
 
 /// A PCI Base Address Region (BAR) granted to a driver.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

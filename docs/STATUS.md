@@ -1,7 +1,8 @@
 # HuesOS status and evidence map
 
-Status reviewed against `main` at `92b0eac` (2026-10-09). This is a versioned
+Status reviewed against `main` at `9140f85` (2026-11-16). This is a versioned
 snapshot, not a live dashboard and not a claim that every current CI job passed.
+Docs-only follow-ups do not change implementation status.
 
 ## Read this first
 
@@ -35,21 +36,22 @@ A checked box in an old roadmap is not a current release approval.
 - **Physical reports:** [HARDWARE.md](HARDWARE.md). The report lists host hardware;
   listing an NVMe, network or Bluetooth device does not imply HuesOS tested it.
 - **Release blockers:** [STORAGE_PRODUCTION_GATE.md](STORAGE_PRODUCTION_GATE.md),
-  [PCI_PRODUCTION_ROADMAP.md](PCI_PRODUCTION_ROADMAP.md),
-  [BARE_METAL_SECURITY_EVIDENCE.md](BARE_METAL_SECURITY_EVIDENCE.md).
+  [PCI_PRODUCTION_ROADMAP.md](PCI_PRODUCTION_ROADMAP.md). Bare-metal /
+  physical-hardware evidence for Secure Boot, TPM and storage remains
+  owner-gated; there is no public evidence checklist in the tree.
 - **Target designs:** [SCHEDULER_V2.md](SCHEDULER_V2.md), [SMP_V2.md](SMP_V2.md),
   [ACPI_RING3.md](ACPI_RING3.md), [PCI_MANAGER_ARCHITECTURE.md](PCI_MANAGER_ARCHITECTURE.md).
   Design acceptance is not implementation completion.
 - **Current work queues:** [ROADMAP.md](ROADMAP.md),
   [PRODUCTION_ROADMAP.md](PRODUCTION_ROADMAP.md),
   [ACPI_PCI_IMPLEMENTATION_PLAN.md](ACPI_PCI_IMPLEMENTATION_PLAN.md).
-- **History:** [STORAGE_NVME_FS_ROADMAP_v1.md](STORAGE_NVME_FS_ROADMAP_v1.md) is
-  explicitly archived; [design/ARCHITECTURAL_ANALYSIS.md](design/ARCHITECTURAL_ANALYSIS.md)
-  and [MICROKERNEL_MIGRATION.md](MICROKERNEL_MIGRATION.md) contain historical findings
-  and decisions, not an up-to-date feature checklist.
+- **History:** archived/closed material (the v1 storage roadmap, the
+  microkernel migration plan, the early architectural-weaknesses analysis,
+  closed stage plans) was removed in the 2026-11 docs-hygiene pass. Migration
+  and storage history lives in git; current design intent lives in the
+  target designs listed above — not in the removed files.
 
-See [INDEX.md](INDEX.md) for a newcomer reading order. Historical files keep their
-paths so existing links and PR references remain usable.
+See [INDEX.md](INDEX.md) for a newcomer reading order.
 
 ## Maintenance contract
 

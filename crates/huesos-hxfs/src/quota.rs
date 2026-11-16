@@ -153,7 +153,7 @@ mod tests {
     }
 
     // Production-gate quota coverage: each test pins one admission
-    // contract from docs/STORAGE_NVME_FS_ROADMAP.md §G (Stage O).
+    // contract from the production gate (`docs/PRODUCTION_ROADMAP.md`, Track C.4).
     //
     //   O1 feat(hxfs): persist quota tree descriptors
     //   O2 feat(hxfs): enforce physical-byte quota in allocator path

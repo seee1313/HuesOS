@@ -38,7 +38,8 @@ The physical gate requires, on Intel and AMD hardware with SMT on/off:
 - Host harness output: attach the log from `scripts/sched-bench-host.sh`.
 - QEMU logs: attach serial logs from `scripts/ci-qemu-smoke.sh` (SMP 1/2/4/8)
   and the hardening gates.
-- Bare metal: `docs/BARE_METAL_SECURITY_EVIDENCE.md` + collector script.
+- Bare metal: owner-gated hardware run; no checked-in collector script or
+  evidence checklist exists yet.
 
 ## Thresholds
 

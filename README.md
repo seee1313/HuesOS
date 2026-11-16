@@ -190,7 +190,6 @@ non-rebooting red panic screen are specified in
 [docs/TTY_FONT.md](docs/TTY_FONT.md) for terminal font modes, and
 [docs/DOOM.md](docs/DOOM.md) for the GPL userspace game port. The ongoing
 hardening effort is tracked in
-[docs/OPTIMIZATION_SAFETY_PROGRAM.md](docs/OPTIMIZATION_SAFETY_PROGRAM.md),
 [docs/UNSAFE_AUDIT.md](docs/UNSAFE_AUDIT.md),
 [docs/OBJECT_LIFECYCLE.md](docs/OBJECT_LIFECYCLE.md),
 [docs/VMAR_TRANSACTIONS.md](docs/VMAR_TRANSACTIONS.md), and

@@ -110,8 +110,9 @@ scope for this PR.
 
 ## Why not move the driver to userspace?
 
-`docs/MICROKERNEL_MIGRATION.md` covers the broader direction. The
-framebuffer driver is the **one** graphics device that does not move
+The driver/userspace migration direction is settled (git history carries
+the migration plan, removed in the 2026-11 docs-hygiene pass). The framebuffer
+driver is the **one** graphics device that does not move
 to a userspace driver-host because:
 
 - it is the only graphics output the kernel panic screen, the

@@ -1,6 +1,7 @@
 # ACPI → PCI implementation PR plan
 
-- **Status:** approved execution plan; implementation has not started
+- **Status:** approved execution plan; AP-0…AP-3 complete, AP-4/AP-5/AP-6 in
+  review (not merged), AP-7 onwards not started — see the progress ledger in §7.
 - **Owners:** HuesOS project owner + implementation agent
 - **Architecture:** [ACPI_RING3.md](ACPI_RING3.md) and
   [PCI_MANAGER_ARCHITECTURE.md](PCI_MANAGER_ARCHITECTURE.md)

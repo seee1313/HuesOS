@@ -302,7 +302,7 @@ mod tests {
 
     // Production-gate scrub/fsck coverage: each test pins one
     // invariant from the report-only scrub path in
-    // docs/STORAGE_NVME_FS_ROADMAP.md §N (Stage W).
+    // the scrub/fsck contract in `docs/PRODUCTION_ROADMAP.md`, Tracks C.2/C.3.
     //
     //   W1 feat(hxfs): add metadata tree scrub walker
     //   W2 feat(hxfs): validate extent ownership and backrefs

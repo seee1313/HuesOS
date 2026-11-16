@@ -274,7 +274,7 @@ mod tests {
 
     // Production-gate volume-topology coverage: each test pins
     // one invariant from the virtual-volume rules in
-    // docs/STORAGE_NVME_FS_ROADMAP.md §L (Stage T).
+    // the virtual-volume rules in `docs/PRODUCTION_ROADMAP.md`.
     //
     //   T1 feat(volume): add GPT-backed system volume discovery
     //   T2 feat(hxfs): persist virtual volume table

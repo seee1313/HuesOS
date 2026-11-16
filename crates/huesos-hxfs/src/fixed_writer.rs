@@ -5764,7 +5764,7 @@ fn make_metadata_block(block_type: u32, owner: u64, lba: u64, payload: &[u8]) ->
 /// set and the volume is encrypted. Superblock, checkpoint,
 /// volume table, and object table are *not* encrypted even on
 /// an encrypted volume because they carry global state needed
-/// to find the encryption key (per `docs/STAGE_B_PLAN.md` B.1).
+/// to find the encryption key (per `docs/PRODUCTION_ROADMAP.md`, Track B.1).
 /// Where a metadata block lives and which tenancy of that location
 /// it is.
 ///
@@ -5834,7 +5834,7 @@ fn make_metadata_block_for_volume(
 /// payload on an encrypted volume. The superblock, checkpoint,
 /// volume table, and object table stay plaintext because they
 /// are needed to bootstrap the encryption key (see
-/// `docs/STAGE_B_PLAN.md` B.1).
+/// `docs/PRODUCTION_ROADMAP.md`, Track B.1).
 #[cfg(feature = "crypto-aes-gcm")]
 fn is_encrypted_block_type(block_type: u32) -> bool {
     matches!(

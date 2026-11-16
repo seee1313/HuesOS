@@ -1,7 +1,13 @@
 # Hxfs — HuesOS File System design (Stage G)
 
-Status: **Stage G design baseline**. No Hxfs code is introduced by this file.
-Implementation must not start until this design is reviewed/accepted.
+Status: **design baseline, accepted and implemented**. This file documents the
+object/volume-store model that the `huesos-hxfs` crate implements (see
+[HXFS_V6.md](HXFS_V6.md) for the on-disk format versioning and
+[PRODUCTION_ROADMAP.md](PRODUCTION_ROADMAP.md) /
+[STORAGE_PRODUCTION_GATE.md](STORAGE_PRODUCTION_GATE.md) for the current
+production boundary — mutable HxFS exists, but storage remains
+not production-ready / not format-frozen). Keep this file as the design
+record; do not treat its Stage-G scope section as a current feature list.
 
 Hxfs is the primary mutable user filesystem for HuesOS. It is designed for the
 HuesOS storage model:

@@ -364,7 +364,7 @@ mod tests {
 
     // Production-gate NVMe reliability coverage: each test pins
     // one invariant from the timeout/reset contract in
-    // docs/STORAGE_NVME_FS_ROADMAP.md §M (Stage U).
+    // the production-gate NVMe reliability contract (`docs/PRODUCTION_ROADMAP.md`).
     //
     //   U1 feat(nvme): implement multi-slot async completion tracking
     //   U2 feat(nvme): add command timeout and reset policy

@@ -8,7 +8,6 @@ priority order.
 Current status and evidence boundaries are summarized in [STATUS.md](STATUS.md).
 Storage work is tracked in [PRODUCTION_ROADMAP.md](PRODUCTION_ROADMAP.md) and
 release approval in [STORAGE_PRODUCTION_GATE.md](STORAGE_PRODUCTION_GATE.md).
-The [v1 storage roadmap](STORAGE_NVME_FS_ROADMAP_v1.md) is archived history.
 Mutable HxFS exists, but storage remains not production-ready/not format-frozen.
 
 PCI/PCIe modernization is tracked in
