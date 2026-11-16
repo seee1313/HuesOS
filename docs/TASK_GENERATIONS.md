@@ -32,10 +32,15 @@ TaskId bound is not implemented by that failure path; do not infer it from
 4. Reaping resolves the directory and validates the complete task identity;
    stale/duplicate entries are discarded before the current-task check.
 5. Current reaping releases the global allocation after marking the owner-local
-   occupant Reaped; a replacement publishes a fresh generation. The current
-   kernel reaper does not call TaskDirectory::clear or drain its operation bits
-   here. Do not attribute the directory helper's stronger clear contract to
-   this integration without a separate change and verification.
+   occupant Reaped; a replacement publishes a fresh generation. Reaping drains
+   remote operations at retire time: `TaskDirectory::retire` atomically reports
+   the pending operation mask in the same publication step that discards it, so
+   no pending bit can leak into the replacement generation. The kernel counts
+   drained bits and affected tasks in observability counters
+   (`sched_stats().reap_discarded_op_flags` / `reap_tasks_with_discarded_ops`).
+   Pending remote operations on a dying identity are dropped, never applied.
+   Do not substitute the directory `clear` contract (which fails while
+   operations are pending) for `retire` here.
 6. CPU ownership is separate from identity; any remote operation must validate
    the published full identity and obey owner/runqueue-token contracts.
 
@@ -72,13 +77,36 @@ separate from the bounded process-exit graveyard.
 
 ## Tests
 
-Host tests cover ID field isolation and the helper's non-wrapping increment
-contract. This does not prove kernel retirement at the 51-bit boundary.
-A deterministic host probe of the current reaper-style helper sequence
-(old WAKE → free/reallocate without clear → publish replacement → take) returns
-the old WAKE bit for the replacement, rather than zero. This is a known
-integration gap; a full kernel reproduction and a synchronized publication/
-reclamation fix remain open. Ordinary QEMU boot does not close it.
+Host tests (`crates/huesos-sched/src/generation_regressions.rs`) cover ID
+field isolation, the non-wrapping generation increment, checked `clear`,
+forced retirement, generation-tagged CAS interleavings, concurrent
+publication, and the reuse sequence including the kernel release order
+(retire → mark Reaped → free global slot → allocate → publish → take).
+The pending-operation carry-over at reap is closed at the directory and
+integration level:
+
+- `retire_reports_pending_remote_operations_atomically` — retire returns
+  exactly the pending WAKE|MIGRATION mask, one-shot; the identity is
+  unpublished and later operations fail with `StaleIdentity`.
+- `retire_reports_empty_mask_when_no_operations_pending` — clean retire
+  reports zero.
+- `replacement_generation_never_inherits_discarded_remote_operations` — the
+  exact kernel release order; the replacement generation's take reports
+  `Ok(0)`.
+- `publish_replacement_discards_stale_flags_even_without_retire` —
+  defense-in-depth: even if the global slot were freed without retiring,
+  `publish` replaces the generation-tagged word on reuse, so stale flags
+  never reach the replacement.
+- `stale_producers_and_consumers_cannot_cross_concurrent_slot_churn` —
+  concurrent publishers/consumers across a retire and repeated reuse.
+- `reaper_retirement_recycles_more_than_global_capacity_without_carry_over` —
+  2×-capacity recycle with the retire-before-free order.
+
+Drain-at-retire is an intentional drop: remote operations on a dying identity
+are not applied, forwarded, or retried. They are only counted, for boot/CI
+evidence and future soak tooling. If a dying identity shows a non-zero
+`reap_discarded_op_flags`, that is a signal about the remote publisher, not a
+scheduling invariant violation.
 
 Kernel validation additionally requires:
 
@@ -87,3 +115,6 @@ Kernel validation additionally requires:
 - duplicate reaper entries while the replacement task is current;
 - SMP process termination and reschedule IPI races;
 - Clippy with warnings denied and release QEMU SMP boot.
+
+The directory/integration level is host-tested; the on-target items above
+are not closed by host tests. Ordinary QEMU boot does not close them either.

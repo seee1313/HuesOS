@@ -411,22 +411,27 @@ impl TaskDirectory {
     /// Clear an idle identity; fail without mutation if operations are pending.
     /// The owner must serialize this with publish/retire (kernel scheduler lock).
     pub fn clear(&self, id: TaskId) -> Result<(), DirectoryError> {
-        self.unpublish(id, false)
+        self.unpublish(id, false).map(|_| ())
     }
 
     /// Retire a finished task, discarding its pending operations before slot reuse.
     /// The owner must serialize this with publish/clear and stop local execution
     /// first. Delayed remote publishers/consumers cannot touch another generation.
-    pub fn retire(&self, id: TaskId) -> Result<(), DirectoryError> {
+    ///
+    /// Returns the mask of operation bits that were pending on the retired
+    /// identity and were discarded in the same atomic publication step, so the
+    /// caller can account for them. Operation bits for a dead task are dropped,
+    /// never applied or forwarded to the replacement generation.
+    pub fn retire(&self, id: TaskId) -> Result<u64, DirectoryError> {
         self.unpublish(id, true)
     }
 
-    fn unpublish(&self, id: TaskId, discard_pending: bool) -> Result<(), DirectoryError> {
+    fn unpublish(&self, id: TaskId, discard_pending: bool) -> Result<u64, DirectoryError> {
         let entry = &self.entries[id.slot()];
         if entry.published_id.load(Ordering::Acquire) != id.raw() {
             return Err(DirectoryError::StaleIdentity);
         }
-        entry
+        let previous = entry
             .pending_operations
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |state| {
                 if state >> TASK_INDEX_BITS != id.generation()
@@ -444,12 +449,18 @@ impl TaskDirectory {
                     DirectoryError::StaleIdentity
                 }
             })?;
+        // Pending bits of a dying identity are reported, never carried over.
+        let discarded = if discard_pending {
+            previous & TASK_INDEX_MASK
+        } else {
+            0
+        };
         entry.sequence.fetch_add(1, Ordering::AcqRel);
         entry.published_id.store(0, Ordering::Release);
         entry.owner.store(0, Ordering::Relaxed);
         entry.local_index.store(0, Ordering::Relaxed);
         entry.sequence.fetch_add(1, Ordering::Release);
-        Ok(())
+        Ok(discarded)
     }
 }
 
