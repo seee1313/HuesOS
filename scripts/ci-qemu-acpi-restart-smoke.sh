@@ -77,6 +77,7 @@ case "$scenario" in
             '[driver-manager] ACPI manager ready generation 3'
             '[acpi-manager] injected foreign-generation heartbeat 2 (self 3)'
             '[driver-manager] stale ACPI manager generation ignored'
+            '[driver-manager] dropped stale HMCF from generation 2'
             '[driver-host:input] retained'
             '[init] boot stages complete:'
         )

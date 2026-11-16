@@ -607,10 +607,13 @@ mod tests {
     };
 
     fn record(segment: u16, start_bus: u8, end_bus: u8, ecam_base: u64) -> HmcfRecord {
-        let Ok(record) = HmcfRecord::new(segment, start_bus, end_bus, ecam_base) else {
-            panic!("fixture record must construct");
-        };
-        record
+        match HmcfRecord::new(segment, start_bus, end_bus, ecam_base) {
+            Ok(record) => record,
+            Err(_) => {
+                assert!(false, "fixture record must construct");
+                ZERO_RECORD
+            }
+        }
     }
 
     fn sample_records() -> [HmcfRecord; 3] {
@@ -628,10 +631,13 @@ mod tests {
         records: &[HmcfRecord],
     ) -> ([u8; MAX_BYTES], usize) {
         let mut output = [0u8; MAX_BYTES];
-        let Ok(total) = encode(snapshot, generation, records, &mut output) else {
-            panic!("fixture must encode");
-        };
-        (output, total)
+        match encode(snapshot, generation, records, &mut output) {
+            Ok(total) => (output, total),
+            Err(_) => {
+                assert!(false, "fixture must encode");
+                (output, 0)
+            }
+        }
     }
 
     /// Recompute the checksum of an image in place (fixture helper for
@@ -647,7 +653,8 @@ mod tests {
         let records = sample_records();
         let (image, total) = encoded_image(SNAPSHOT, GENERATION, &records);
         let Ok(view) = decode(&image[..total]) else {
-            panic!("encoded image must decode");
+            assert!(false, "encoded image must decode");
+            return;
         };
         assert_eq!(view.firmware_snapshot_id(), SNAPSHOT);
         assert_eq!(view.producer_generation(), GENERATION);
@@ -690,7 +697,8 @@ mod tests {
         ];
         let (image, total) = encoded_image(SNAPSHOT, GENERATION, &records);
         let Ok(view) = decode(&image[..total]) else {
-            panic!("adjacent windows must decode");
+            assert!(false, "adjacent windows must decode");
+            return;
         };
         assert_eq!(view.record_count(), 3);
     }
@@ -741,7 +749,8 @@ mod tests {
         let (image, total) = encoded_image(SNAPSHOT, GENERATION, &records);
         assert_eq!(total, MAX_BYTES);
         let Ok(view) = decode(&image) else {
-            panic!("maximum set must decode");
+            assert!(false, "maximum set must decode");
+            return;
         };
         assert_eq!(view.record_count() as u32, MAX_RECORDS);
         assert_eq!(view.records().count(), MAX_RECORDS as usize);
@@ -924,7 +933,8 @@ mod tests {
     fn binding_check_rejects_stale_generation_and_snapshot() {
         let (image, total) = encoded_image(SNAPSHOT, GENERATION, &sample_records());
         let Ok(view) = decode(&image[..total]) else {
-            panic!("encoded image must decode");
+            assert!(false, "encoded image must decode");
+            return;
         };
         assert_eq!(view.check_binding(GENERATION, SNAPSHOT), Ok(()));
         assert_eq!(

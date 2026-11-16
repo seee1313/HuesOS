@@ -1,16 +1,21 @@
 //! Supervised isolated Ring-3 ACPI manager bootstrap.
 //!
 //! AP-6 validates generation-tagged lifecycle control plus retained archive,
-//! broker, and self-VMAR capabilities. Full uACPI namespace execution remains
-//! disabled until the later AML stages.
+//! broker, and self-VMAR capabilities. AP-7 additionally interprets the
+//! archived `MCFG` table and publishes one bounded, immutable `HMCF`
+//! config-window snapshot for DriverManager to retain. Full uACPI namespace
+//! execution remains disabled until the later AML stages.
 
 #![no_std]
 #![no_main]
 
 use core::panic::PanicInfo;
-use huesos_abi::acpi_archive::{ArchiveReadError, ArchiveReader, ArchiveSummary};
+use huesos_abi::acpi_archive::{
+    ArchiveReadError, ArchiveReader, ArchiveSummary, TABLE_ENTRY_BYTES,
+};
 use huesos_abi::acpi_broker::{ArchiveError, MAX_ARCHIVE_BYTES, VERSION};
 use huesos_abi::acpi_manager;
+use huesos_abi::hmcf;
 use libcanvas::{println, wait_any, Channel, ErrorCode, Signals, Vmar, Vmo, WaitItem};
 
 struct BootstrapInputs {
@@ -94,6 +99,11 @@ pub extern "C" fn _start() -> ! {
         "[acpi-manager] validated ACPI archive v{}: {} tables, {} physical mappings, snapshot {}",
         summary.version, summary.table_count, summary.mapping_count, summary.firmware_snapshot_id
     );
+    // AP-7: publish the bounded HMCF snapshot from the archived MCFG.
+    // Never blocks readiness: absence of a valid MCFG is reported and
+    // the lifecycle continues fail-closed (no HMCF, no config
+    // authority downstream).
+    publish_hmcf(&bootstrap, generation, &archive, &summary);
 
     let Some(broker) = inputs.broker.take() else {
         send_failure(
@@ -296,6 +306,190 @@ impl ArchiveReader for VmoArchiveReader<'_> {
             Ok(length) if length == output.len() => Ok(()),
             Ok(_) | Err(_) => Err(ArchiveReadError),
         }
+    }
+}
+
+/// Interpret the archived `MCFG` table and publish one bounded,
+/// immutable `HMCF` config-window snapshot on `bootstrap`.
+///
+/// Fail-closed at every step: any inconsistency — archive mutation
+/// under us, an ambiguous or invalid MCFG, an identity mismatch —
+/// means no HMCF is published. Readiness is unaffected; consumers
+/// stay fail-closed until a valid bound snapshot arrives.
+fn publish_hmcf(bootstrap: &Channel, generation: u64, archive: &Vmo, summary: &ArchiveSummary) {
+    let mut header = [0u8; huesos_abi::acpi_archive::HEADER_BYTES];
+    if !vmo_read_exact(archive, 0, &mut header) {
+        println!("[acpi-manager] failed to re-read archive header; HMCF not published");
+        return;
+    }
+    let Ok(header_v2) = huesos_abi::acpi_archive::decode_v2_header(&header) else {
+        println!("[acpi-manager] archive header rejected on re-read; HMCF not published");
+        return;
+    };
+    if header_v2.firmware_snapshot_id != summary.firmware_snapshot_id {
+        println!("[acpi-manager] archive snapshot changed under us; HMCF not published");
+        return;
+    }
+
+    // Locate the MCFG table. At most one is accepted; ambiguity is
+    // rejected rather than guessed.
+    let mut mcfg: Option<(u64, u32)> = None;
+    for index in 0..header_v2.table_count {
+        let entry_offset =
+            header_v2.table_entries_offset + u64::from(index) * TABLE_ENTRY_BYTES as u64;
+        let mut entry_bytes = [0u8; TABLE_ENTRY_BYTES];
+        if !vmo_read_exact(archive, entry_offset, &mut entry_bytes) {
+            println!(
+                "[acpi-manager] table directory truncated at entry {}; HMCF not published",
+                index
+            );
+            return;
+        }
+        let Ok(entry) = huesos_abi::acpi_archive::decode_v2_table_entry(&entry_bytes) else {
+            println!(
+                "[acpi-manager] table directory entry {} invalid; HMCF not published",
+                index
+            );
+            return;
+        };
+        if entry.signature == *b"MCFG" {
+            if mcfg.is_some() {
+                println!("[acpi-manager] multiple MCFG tables in archive; HMCF not published");
+                return;
+            }
+            mcfg = Some((entry.offset, entry.length));
+        }
+    }
+    let Some((mcfg_offset, mcfg_length)) = mcfg else {
+        println!("[acpi-manager] no MCFG table in archive; HMCF not published");
+        return;
+    };
+    const MCFG_MAX_BYTES: usize = huesos_pci::mcfg::MCFG_HEADER_BYTES
+        + huesos_pci::mcfg::MAX_MCFG_ALLOCATIONS * huesos_pci::mcfg::MCFG_ALLOCATION_BYTES;
+    let length = mcfg_length as usize;
+    if !(huesos_pci::mcfg::MCFG_HEADER_BYTES..=MCFG_MAX_BYTES).contains(&length) {
+        println!(
+            "[acpi-manager] MCFG table length {} out of bounds; HMCF not published",
+            length
+        );
+        return;
+    }
+    let mut mcfg_bytes = [0u8; MCFG_MAX_BYTES];
+    if !vmo_read_exact(archive, mcfg_offset, &mut mcfg_bytes[..length]) {
+        println!("[acpi-manager] MCFG table read failed; HMCF not published");
+        return;
+    }
+    let (window_count, windows) = match huesos_pci::mcfg::decode_all(&mcfg_bytes[..length]) {
+        Ok(decoded) => decoded,
+        Err(error) => {
+            println!(
+                "[acpi-manager] MCFG validation failed: {}; HMCF not published",
+                mcfg_error_name(error)
+            );
+            return;
+        }
+    };
+    if window_count == 0 {
+        println!("[acpi-manager] MCFG contains no allocations; HMCF not published");
+        return;
+    }
+
+    const EMPTY: hmcf::HmcfRecord = hmcf::HmcfRecord {
+        segment: 0,
+        start_bus: 0,
+        end_bus: 0,
+        ecam_base: 0,
+        span_bytes: 0,
+        flags: 0,
+    };
+    let mut records = [EMPTY; hmcf::MAX_RECORDS as usize];
+    for (slot, region) in records.iter_mut().zip(windows.iter().take(window_count)) {
+        let Ok(record) = hmcf::HmcfRecord::new(
+            region.segment(),
+            region.start_bus(),
+            region.end_bus(),
+            region.base(),
+        ) else {
+            println!("[acpi-manager] ECAM window failed derivation; HMCF not published");
+            return;
+        };
+        *slot = record;
+    }
+    let count = window_count;
+    let mut image = [0u8; hmcf::MAX_BYTES];
+    let Ok(total) = hmcf::encode(
+        summary.firmware_snapshot_id,
+        generation,
+        &records[..count],
+        &mut image,
+    ) else {
+        println!("[acpi-manager] HMCF encoding rejected; HMCF not published");
+        return;
+    };
+
+    let vmo = match Vmo::create(total as u64) {
+        Ok(vmo) => vmo,
+        Err(_) => {
+            println!("[acpi-manager] failed to create HMCF VMO; HMCF not published");
+            return;
+        }
+    };
+    match vmo.write(0, &image[..total]) {
+        Ok(written) if written == total => {}
+        _ => {
+            println!("[acpi-manager] failed to fill HMCF VMO; HMCF not published");
+            return;
+        }
+    }
+    // Publish read-only from every handle that leaves this process:
+    // duplicate with READ|DUPLICATE|TRANSFER (no WRITE, no MAP), then
+    // drop our own write-capable handle so the bytes are immutable
+    // system-wide from this point on.
+    let rights =
+        huesos_abi::rights::READ | huesos_abi::rights::DUPLICATE | huesos_abi::rights::TRANSFER;
+    let Ok(duplicate) = vmo.duplicate(rights) else {
+        println!("[acpi-manager] failed to seal HMCF VMO rights; HMCF not published");
+        return;
+    };
+    drop(vmo);
+    if let Err((error, _handle)) =
+        bootstrap.write_handle(acpi_manager::HMCF_VMO_LABEL, duplicate.into_handle())
+    {
+        println!("[acpi-manager] HMCF transfer failed: {}", error.as_str());
+        return;
+    }
+    println!(
+        "[acpi-manager] published HMCF: {} window(s), snapshot {}, generation {}",
+        count, summary.firmware_snapshot_id, generation
+    );
+}
+
+/// Read exactly `buf.len()` bytes from the archive VMO at `offset`.
+fn vmo_read_exact(vmo: &Vmo, offset: u64, buf: &mut [u8]) -> bool {
+    let mut filled = 0usize;
+    while filled < buf.len() {
+        let Some(cursor) = offset.checked_add(filled as u64) else {
+            return false;
+        };
+        match vmo.read(cursor, &mut buf[filled..]) {
+            Ok(0) => return false,
+            Ok(read_bytes) => filled += read_bytes,
+            Err(_) => return false,
+        }
+    }
+    true
+}
+
+const fn mcfg_error_name(error: huesos_pci::mcfg::McfgError) -> &'static str {
+    match error {
+        huesos_pci::mcfg::McfgError::BadSignature => "bad signature",
+        huesos_pci::mcfg::McfgError::BadLength => "bad length",
+        huesos_pci::mcfg::McfgError::BadChecksum => "bad checksum",
+        huesos_pci::mcfg::McfgError::ReservedNonZero => "reserved field non-zero",
+        huesos_pci::mcfg::McfgError::TooManyAllocations => "too many allocations",
+        huesos_pci::mcfg::McfgError::InvalidAllocation(_) => "invalid allocation",
+        huesos_pci::mcfg::McfgError::Overlap => "overlapping windows",
+        huesos_pci::mcfg::McfgError::NoMemory => "allocation failure",
     }
 }
 

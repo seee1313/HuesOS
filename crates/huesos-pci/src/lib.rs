@@ -12,20 +12,26 @@
 #![cfg_attr(not(test), no_std)]
 #![warn(missing_docs)]
 
+#[cfg(feature = "alloc")]
 extern crate alloc;
+#[cfg(feature = "alloc")]
 use alloc::vec::Vec;
 
 /// Bounded conventional and PCIe extended capability-list decoding.
+#[cfg(feature = "alloc")]
 pub mod capability;
 /// Generation-safe DeviceLease lifecycle policy.
 pub mod lease;
 /// ACPI MCFG allocation-table decoding and validation.
 pub mod mcfg;
 /// Deterministic firmware-preserving BAR/window allocation plans.
+#[cfg(feature = "alloc")]
 pub mod resource_planner;
 /// Firmware BAR/bridge-window validation and bus-to-CPU translation.
+#[cfg(feature = "alloc")]
 pub mod resource_validation;
 /// Immutable, generation-tagged PCI bridge topology snapshots.
+#[cfg(feature = "alloc")]
 pub mod topology;
 
 /// Bytes in conventional PCI configuration space.
@@ -721,6 +727,7 @@ pub struct InterruptCapabilities {
 /// space. The shared bounded capability decoder rejects cycles, malformed
 /// pointers, duplicate singleton interrupt capabilities, and truncated bodies
 /// instead of returning a partial interrupt view.
+#[cfg(feature = "alloc")]
 pub fn parse_interrupt_capabilities(
     config: &ConfigSpace,
 ) -> Result<InterruptCapabilities, capability::CapabilityError> {
@@ -854,12 +861,14 @@ impl MockPciDevice {
 }
 
 /// A mock PCI bus: a set of devices with class-code discovery.
+#[cfg(feature = "alloc")]
 #[derive(Clone, Default)]
 pub struct MockPciBus {
     /// The devices present on the bus.
     pub devices: Vec<MockPciDevice>,
 }
 
+#[cfg(feature = "alloc")]
 impl MockPciBus {
     /// An empty bus.
     pub fn new() -> Self {
