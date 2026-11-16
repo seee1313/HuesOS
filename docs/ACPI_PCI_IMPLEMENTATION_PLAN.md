@@ -4,7 +4,9 @@
   merged earlier; `huesos-dev/ap4-ap5-ap6-batch2` extends the required host
   suites/tests and re-verifies the AP-6 gates on Q35/OVMF SMP2: startup success,
   injected restart cascade and restart-budget exhaustion, release and debug for
-  the cascade); AP-7 onwards not started — see the progress ledger in §7.
+  the cascade); AP-7 implemented on `huesos-dev/ap7-hmcf-wire` (bounded HMCF
+  wire format, producer publication from the archived MCFG, DriverManager
+  retain) — AP-8 onwards not started; see the progress ledger in §7.
 - **Owners:** HuesOS project owner + implementation agent
 - **Architecture:** [ACPI_RING3.md](ACPI_RING3.md) and
   [PCI_MANAGER_ARCHITECTURE.md](PCI_MANAGER_ARCHITECTURE.md)
@@ -739,7 +741,8 @@ Each PR adds one row or updates the corresponding row in the live PCI roadmap:
 | AP-4 | complete | `huesos-dev/ap4-ap5-ap6-batch2` (suite extension; mechanisms already on main) | 15 primitive host tests + target build + Clippy: timeout trio (0 / finite 30 ms / `0xFFFF` wake from a foreign release), recursion rejection, signal-before-wait, multiple signals, reset, count saturation, teardown/slot-reuse, monotonicity/overflow, allocation-failure points, registry exhaustion, dispatch nesting, stable thread id | n/a | n/a | — |
 | AP-5 | complete | `huesos-dev/ap4-ap5-ap6-batch2` (suite extension; mechanisms already on main) | 7 archive host tests: synthetic RSDP→XSDT→FADT/DSDT/FACS graph, unaligned and full-table boundaries, page-boundary ranges inside one record, adjacent-record/gap/ECAM/MMIO rejection, 2000-iteration translator fuzz; decoder ASan fuzz extended (v2 header/mapping/validate, `huesos-decoder-fuzz`); fail-closed ASan/UBSan smoke passes | n/a | n/a | — |
 | AP-6 | complete | `huesos-dev/ap4-ap5-ap6-batch2` | 3 lifecycle/freeze ABI tests + feature Clippy (`acpi-restart-smoke`, `acpi-restart-budget-smoke`) | Q35/OVMF SMP2 release: boot gate; injected restart cascade `gen1 pre-ready exit → frozen restart → gen2 ready → post-ready exit → gen3 ready → foreign-generation heartbeat ignored (`[driver-manager] stale ACPI manager generation ignored`)`; restart budget exhaustion (`gen1..3 pre-ready → [driver-manager] ACPI manager restart budget exhausted; runtime ACPI degraded`). Cascade gate also passes on debug. `scripts/ci-qemu-acpi-restart-smoke.sh restart|budget`; CI `qemu-acpi-restart` runs both. AML/PCI authority not enabled | n/a | — |
-| AP-7…AP-16 | not started | — | — | — | — | ordered dependencies |
+| AP-7 | complete | `huesos-dev/ap7-hmcf-wire` | 17 HMCF host tests (`cargo test -p huesos-abi hmcf`): multi-segment/non-zero start bus/adjacent windows, canonical-order requirement, duplicates, reserved fields/count/checksum provenance/physical-span overflow, stale generation/snapshot binding rejection, 64-record maximum round-trip, deterministic encoding; `huesos-abi` 94 total; MCFG overlap/multi-segment coverage stays in `huesos-pci`; feature Clippy (`restart-smoke`, `acpi-restart-smoke`, `acpi-restart-budget-smoke`); fmt 15 groups clean | Q35/OVMF SMP2 release happy path with new required markers `[acpi-manager] published HMCF` and `[driver-manager] retained HMCF` (`[driver-manager] HMCF rejected` wired as a regression marker); in the injected cascade the gen-2 snapshot is dropped on restart scheduling and gen-3 republishes (stale-generation drop path) | n/a | — |
+| AP-8…AP-16 | not started | — | — | — | — | ordered dependencies |
 
 A row says `Complete` only after its exit criteria and actual verification logs
 are named in the merged PR. Policy-only completion never closes an on-target

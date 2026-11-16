@@ -56,6 +56,11 @@ pub const ACPI_MANAGER_TABLES: &str = "acpi-tables-vmo";
 pub const ACPI_MANAGER_BROKER: &str = "acpi-broker";
 /// DriverManager passes the child process's own root VMAR capability.
 pub const ACPI_MANAGER_SELF_VMAR: &str = "acpi-self-vmar";
+/// ACPI manager transfers the validated `HMCF` config-window snapshot
+/// with this label. The VMO carries `READ | DUPLICATE | TRANSFER` rights
+/// only; DriverManager validates the envelope/size/generation and
+/// retains it immutably for the current manager generation.
+pub const ACPI_MANAGER_HMCF: &str = "acpi-hmcf-vmo";
 /// Client asks DriverManager to open FileSystemService.
 pub const OPEN_FILESYSTEM: &str = "open:filesystem";
 /// Client asks DriverManager to open DevFS.

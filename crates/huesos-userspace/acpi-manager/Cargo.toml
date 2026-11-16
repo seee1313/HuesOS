@@ -15,6 +15,7 @@ path = "src/main.rs"
 [dependencies]
 libcanvas = { path = "../libcanvas" }
 huesos-abi = { path = "../../huesos-abi" }
+huesos-pci = { path = "../../huesos-pci", default-features = false }
 
 [profile.release]
 opt-level = 2

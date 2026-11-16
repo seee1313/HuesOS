@@ -10,3 +10,11 @@ license.workspace = true
 # and a mock PCI bus. The actual config-space access mechanism (ECAM MMIO or
 # port 0xCF8/0xCFC) is on-target.
 [dependencies]
+
+# `alloc` gates the host-side Vec-based API (`parse` and the mock
+# helpers). The Ring-3 `acpi-manager` depends on this crate with
+# `default-features = false`, so its build contains no allocator
+# references at all.
+[features]
+default = ["alloc"]
+alloc = []

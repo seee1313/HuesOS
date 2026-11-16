@@ -66,6 +66,8 @@ for marker in \
     '[shutdown-broker] ready' \
     '[acpi-manager] broker deny-by-default self-test OK' \
     '[driver-manager] ACPI manager ready generation' \
+    '[acpi-manager] published HMCF' \
+    '[driver-manager] retained HMCF' \
     '[pci-manager] ready without root descriptors; fail-closed' \
     '[driver-manager] PCI manager ready (no roots; fail-closed)' \
     '[terminal] keyboard service online, starting shell' \
@@ -95,6 +97,7 @@ for regression in \
     '[driver-manager] keyboard service requested before ready' \
     '[driver-manager] ACPI manager restart budget exhausted' \
     '[driver-manager] malformed ACPI manager control message' \
+    '[driver-manager] HMCF rejected' \
     '[acpi-manager] PANIC' \
     '[driver-manager] PCI manager restart budget exhausted' \
     '[driver-manager] malformed PCI manager control message' \

@@ -4,6 +4,7 @@
 //! this decoder independently validates the byte-level MCFG contract before an
 //! ECAM physical range reaches PCI policy code.
 
+#[cfg(feature = "alloc")]
 use alloc::vec::Vec;
 
 use crate::{ConfigError, EcamRegion};
@@ -39,8 +40,34 @@ pub enum McfgError {
     NoMemory,
 }
 
-/// Decode and validate one complete ACPI MCFG table.
-pub fn parse(bytes: &[u8]) -> Result<Vec<EcamRegion>, McfgError> {
+impl crate::EcamRegion {
+    /// Uninitialised slot filler for the bounded decode buffer.
+    ///
+    /// Never observable outside this crate: every slot is overwritten
+    /// with a validated region before any consumer reads it (the decode
+    /// returns the written count and callers slice `..count`).
+    pub(crate) const fn placeholder() -> Self {
+        Self {
+            base: 0,
+            segment: 0,
+            start_bus: 0,
+            end_bus: 0,
+            end_exclusive: 0,
+        }
+    }
+}
+
+/// Decode and validate one complete ACPI MCFG table without allocating.
+///
+/// Performs exactly the same checks as `parse()` (signature, length,
+/// checksum, reserved fields, allocation bound, per-window validation and
+/// overlap rejection), but writes the windows into a fixed buffer and
+/// returns the count. This is the entry point for heap-less callers
+/// (the Ring-3 `acpi-manager`, which is `no_std` and deliberately carries
+/// no global allocator).
+pub fn decode_all(
+    bytes: &[u8],
+) -> Result<(usize, [crate::EcamRegion; MAX_MCFG_ALLOCATIONS]), McfgError> {
     if bytes.len() < MCFG_HEADER_BYTES {
         return Err(McfgError::BadLength);
     }
@@ -69,11 +96,8 @@ pub fn parse(bytes: &[u8]) -> Result<Vec<EcamRegion>, McfgError> {
     if count > MAX_MCFG_ALLOCATIONS {
         return Err(McfgError::TooManyAllocations);
     }
-    let mut regions = Vec::new();
-    regions
-        .try_reserve_exact(count)
-        .map_err(|_| McfgError::NoMemory)?;
 
+    let mut regions = [crate::EcamRegion::placeholder(); MAX_MCFG_ALLOCATIONS];
     let mut index = 0usize;
     while index < count {
         let offset = MCFG_HEADER_BYTES + index * MCFG_ALLOCATION_BYTES;
@@ -84,17 +108,28 @@ pub fn parse(bytes: &[u8]) -> Result<Vec<EcamRegion>, McfgError> {
         if read_u32(bytes, offset + 12).ok_or(McfgError::BadLength)? != 0 {
             return Err(McfgError::ReservedNonZero);
         }
-        let region = EcamRegion::try_new(base, segment, start_bus, end_bus)
+        let region = crate::EcamRegion::try_new(base, segment, start_bus, end_bus)
             .map_err(McfgError::InvalidAllocation)?;
-        for previous in &regions {
+        for previous in regions.iter().take(index) {
             if regions_overlap(*previous, region) {
                 return Err(McfgError::Overlap);
             }
         }
-        regions.push(region);
+        regions[index] = region;
         index += 1;
     }
-    Ok(regions)
+    Ok((count, regions))
+}
+
+/// Decode and validate one complete ACPI MCFG table.
+#[cfg(feature = "alloc")]
+pub fn parse(bytes: &[u8]) -> Result<Vec<EcamRegion>, McfgError> {
+    let (count, regions) = decode_all(bytes)?;
+    let mut vec = Vec::new();
+    vec.try_reserve_exact(count)
+        .map_err(|_| McfgError::NoMemory)?;
+    vec.extend_from_slice(&regions[..count]);
+    Ok(vec)
 }
 
 fn regions_overlap(a: EcamRegion, b: EcamRegion) -> bool {
@@ -349,5 +384,75 @@ mod tests {
             parse(&table(&allocations)),
             Err(McfgError::TooManyAllocations)
         );
+    }
+}
+
+#[cfg(test)]
+mod decode_all_tests {
+    use super::*;
+    use alloc::vec;
+
+    fn table(allocations: &[(u64, u16, u8, u8)]) -> alloc::vec::Vec<u8> {
+        let mut bytes = vec![0u8; MCFG_HEADER_BYTES + allocations.len() * MCFG_ALLOCATION_BYTES];
+        bytes[0..4].copy_from_slice(b"MCFG");
+        let length = bytes.len() as u32;
+        bytes[4..8].copy_from_slice(&length.to_le_bytes());
+        bytes[8] = 1;
+        for (index, (base, segment, start_bus, end_bus)) in allocations.iter().enumerate() {
+            let offset = MCFG_HEADER_BYTES + index * MCFG_ALLOCATION_BYTES;
+            bytes[offset..offset + 8].copy_from_slice(&base.to_le_bytes());
+            bytes[offset + 8..offset + 10].copy_from_slice(&segment.to_le_bytes());
+            bytes[offset + 10] = *start_bus;
+            bytes[offset + 11] = *end_bus;
+        }
+        bytes[9] = 0;
+        let sum = bytes
+            .iter()
+            .fold(0u8, |value, byte| value.wrapping_add(*byte));
+        bytes[9] = 0u8.wrapping_sub(sum);
+        bytes
+    }
+
+    #[test]
+    fn decode_all_matches_parse_exactly() {
+        let bytes = table(&[(0x8000_0000, 0, 0, 63), (0x9000_0000, 7, 128, 143)]);
+        let Ok((count, windows)) = decode_all(&bytes) else {
+            assert!(false, "valid MCFG must decode");
+            return;
+        };
+        assert_eq!(count, 2);
+        let Ok(regions) = parse(&bytes) else {
+            assert!(false, "valid MCFG must parse");
+            return;
+        };
+        assert_eq!(&windows[..count], regions.as_slice());
+    }
+
+    #[test]
+    fn decode_all_reports_identical_failures() {
+        let bytes = table(&[(0x8000_0000, 0, 0, 63)]);
+        // Corrupted payload byte breaks the checksum identically.
+        let mut corrupted = bytes.clone();
+        corrupted[50] ^= 0x01;
+        assert_eq!(
+            decode_all(&corrupted).map(|_| ()),
+            parse(&corrupted).map(|_| ())
+        );
+        // Truncated table fails the same way.
+        let truncated = &bytes[..bytes.len() - 4];
+        assert_eq!(
+            decode_all(truncated).map(|_| ()),
+            parse(truncated).map(|_| ())
+        );
+    }
+
+    #[test]
+    fn decode_all_accepts_empty_allocation_set() {
+        let bytes = table(&[]);
+        let Ok((count, _)) = decode_all(&bytes) else {
+            assert!(false, "zero-allocation MCFG must decode");
+            return;
+        };
+        assert_eq!(count, 0);
     }
 }

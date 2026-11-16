@@ -8,7 +8,7 @@ use crate::protocol;
 use crate::protocol::MANIFEST_GRANTS_COMPLETE_PREFIX;
 use crate::registry::{ServiceRegistry, ServiceState};
 use crate::volume_service::VolumeManagerService;
-use huesos_abi::{acpi_manager, key_broker, pci_manager};
+use huesos_abi::{acpi_archive, acpi_manager, hmcf, key_broker, pci_manager};
 use libcanvas::{hbi_boot, println, storage_boot, Channel, ErrorCode, Handle, Process, Vmo};
 
 /// Fallback embedded DriverHost image (same binary packaged into BOOTFS).
@@ -201,6 +201,11 @@ pub struct DriverManager {
     pci_manager_ready: bool,
     acpi_tables: Option<Vmo>,
     acpi_broker: Option<Handle>,
+    /// Immutable validated `HMCF` config-window snapshot retained for
+    /// the current ACPI manager generation. Absent until one arrives;
+    /// dropped on every manager restart so a stale generation can
+    /// never be mistaken for the current one.
+    hmcf: Option<Vmo>,
     registry_channel: Option<Channel>,
     fs: FileSystemService,
     volume: VolumeManagerService,
@@ -353,6 +358,7 @@ impl DriverManager {
             pci_manager_ready: false,
             acpi_tables: None,
             acpi_broker: None,
+            hmcf: None,
             registry_channel: None,
             fs: FileSystemService::new(),
             volume: VolumeManagerService::new(),
@@ -1214,6 +1220,14 @@ impl DriverManager {
     fn schedule_acpi_manager_restart(&mut self) {
         self.acpi_manager = None;
         self.acpi_manager_ready = false;
+        // A snapshot from the previous generation can never bind to the
+        // next one; drop it so only a fresh validated HMCF remains.
+        if self.hmcf.take().is_some() {
+            println!(
+                "[driver-manager] dropped stale HMCF from generation {}",
+                self.acpi_manager_generation
+            );
+        }
         self.acpi_availability.record_runtime_failure();
         let now = libcanvas::system::monotonic_ticks().unwrap_or(0);
         if !self.acpi_manager_restart.record_failure(
@@ -2210,12 +2224,98 @@ impl DriverManager {
         }
     }
 
+    /// Validate and retain one `HMCF` config-window snapshot received
+    /// from the current ACPI manager generation.
+    ///
+    /// Envelope/size/generation only: the full image is checked for
+    /// magic, version, declared size, reserved fields, count bound,
+    /// checksum consistency, per-record arithmetic, canonical order and
+    /// the producer-generation/snapshot binding. PCI semantics stay
+    /// with the producer (MCFG validation) and the kernel mint
+    /// cross-check; this function never interprets ECAM meaning.
+    ///
+    /// On any rejection the VMO is dropped and the ACPI lifecycle
+    /// continues untouched — no snapshot means downstream minting
+    /// stays fail-closed. The supervised process is not restarted for
+    /// a bad snapshot; a malicious or buggy producer cannot escalate
+    /// through this path.
+    fn retain_hmcf(&mut self, handle: Handle) {
+        let vmo = Vmo::from_handle(handle);
+        let mut header = [0u8; hmcf::HEADER_BYTES];
+        let declared = if read_vmo_exact(&vmo, 0, &mut header) {
+            match hmcf::declared_size(&header) {
+                Ok(total) => total,
+                Err(error) => {
+                    println!("[driver-manager] HMCF rejected: {}", hmcf_error_name(error));
+                    return;
+                }
+            }
+        } else {
+            println!("[driver-manager] HMCF rejected: short header read");
+            return;
+        };
+        let mut image = [0u8; hmcf::MAX_BYTES];
+        if !read_vmo_exact(&vmo, 0, &mut image[..declared]) {
+            println!("[driver-manager] HMCF rejected: short image read");
+            return;
+        }
+        // Split validation from retention so every rejection path
+        // drops the VMO exactly once by simply returning.
+        let view = match hmcf::decode(&image[..declared]) {
+            Ok(view) => view,
+            Err(error) => {
+                println!("[driver-manager] HMCF rejected: {}", hmcf_error_name(error));
+                return;
+            }
+        };
+        // The image must belong to the *current* supervised
+        // generation and to the snapshot identity of the archive
+        // bound to this manager, never to values the image merely
+        // carries.
+        let mut archive_header = [0u8; acpi_archive::HEADER_BYTES];
+        let expected_snapshot = self
+            .acpi_tables
+            .as_ref()
+            .and_then(|tables| {
+                if read_vmo_exact(tables, 0, &mut archive_header) {
+                    acpi_archive::decode_v2_header(&archive_header).ok()
+                } else {
+                    None
+                }
+            })
+            .map(|header| header.firmware_snapshot_id);
+        let Some(expected_snapshot) = expected_snapshot else {
+            println!("[driver-manager] HMCF rejected: bound archive unavailable");
+            return;
+        };
+        if let Err(error) = view.check_binding(self.acpi_manager_generation, expected_snapshot) {
+            println!(
+                "[driver-manager] HMCF rejected: {} (generation {}, snapshot {})",
+                hmcf_error_name(error),
+                self.acpi_manager_generation,
+                expected_snapshot
+            );
+            return;
+        }
+        println!(
+            "[driver-manager] retained HMCF: {} window(s), snapshot {}, generation {}",
+            view.record_count(),
+            expected_snapshot,
+            self.acpi_manager_generation
+        );
+        // Replacing a retained snapshot can only happen across
+        // generations (the current one was dropped on restart), so the
+        // replaced snapshot is stale by definition.
+        self.hmcf = Some(vmo);
+        self.acpi_availability.record_snapshot();
+    }
+
     fn poll_acpi_manager(&mut self) {
         let Some(host) = self.acpi_manager.take() else {
             return;
         };
         let _keep_process_alive = &host.process;
-        let mut bytes = [0u8; acpi_manager::MESSAGE_BYTES];
+        let mut bytes = [0u8; 64];
         let mut budget = POLL_BUDGET_PER_TICK;
         loop {
             budget = match budget.checked_sub(1) {
@@ -2225,8 +2325,24 @@ impl DriverManager {
                     return;
                 }
             };
-            match host.bootstrap.read_into(&mut bytes) {
-                Ok(length) => {
+            // `read_optional_handle` dispatches every message
+            // exactly once regardless of whether it carries a
+            // transferred handle. The HMCF snapshot arrives as one
+            // labelled handle-bearing message and must not be
+            // confused with the plain control stream.
+            match host.bootstrap.read_optional_handle(&mut bytes) {
+                Ok((length, Some(handle)))
+                    if &bytes[..length] == protocol::ACPI_MANAGER_HMCF.as_bytes() =>
+                {
+                    self.retain_hmcf(handle);
+                    continue;
+                }
+                Ok((_length, Some(handle))) => {
+                    println!("[driver-manager] unexpected ACPI manager handle message");
+                    drop(handle);
+                    continue;
+                }
+                Ok((length, None)) => {
                     let Some(message) = acpi_manager::decode(&bytes[..length]) else {
                         println!("[driver-manager] malformed ACPI manager control message");
                         self.schedule_acpi_manager_restart();
@@ -2356,4 +2472,38 @@ fn hash_to_hex(hash: &[u8; 32]) -> [u8; 64] {
         index += 1;
     }
     out
+}
+
+/// Read exactly `buf.len()` bytes from a VMO at `offset`.
+fn read_vmo_exact(vmo: &Vmo, offset: u64, buf: &mut [u8]) -> bool {
+    let mut filled = 0usize;
+    while filled < buf.len() {
+        let Some(cursor) = offset.checked_add(filled as u64) else {
+            return false;
+        };
+        match vmo.read(cursor, &mut buf[filled..]) {
+            Ok(0) => return false,
+            Ok(read_bytes) => filled += read_bytes,
+            Err(_) => return false,
+        }
+    }
+    true
+}
+
+const fn hmcf_error_name(error: hmcf::HmcfError) -> &'static str {
+    match error {
+        hmcf::HmcfError::Truncated => "truncated image",
+        hmcf::HmcfError::Format => "malformed envelope",
+        hmcf::HmcfError::Reserved => "reserved field non-zero",
+        hmcf::HmcfError::Count => "invalid record count",
+        hmcf::HmcfError::Checksum => "checksum mismatch",
+        hmcf::HmcfError::BusRange => "invalid bus range",
+        hmcf::HmcfError::MisalignedBase => "misaligned ECAM base",
+        hmcf::HmcfError::Span => "window span mismatch",
+        hmcf::HmcfError::AddressOverflow => "physical span overflow",
+        hmcf::HmcfError::NotCanonical => "non-canonical record order",
+        hmcf::HmcfError::Overlap => "overlapping windows",
+        hmcf::HmcfError::StaleGeneration => "stale producer generation",
+        hmcf::HmcfError::SnapshotMismatch => "snapshot mismatch",
+    }
 }
