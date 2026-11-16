@@ -39,7 +39,16 @@ gates close.
   (pre-ready → ready → post-ready → restart → stale heartbeat ignored, stale
   HMCF generation dropped) and restart-budget exhaustion into degraded mode
   (`scripts/ci-qemu-acpi-restart-smoke.sh restart|budget`; cascade also on
-  debug). AML/PCI authority not enabled. AP-8 onwards not started. See
+  debug). The kernel now holds a snapshot-bound config-mint authority
+  (AP-8, `huesos-dev/ap8-config-mint`): a unique boot-minted `PciConfigMint`
+  capability for the root supervisor only, a bounded mint request that
+  accepts an HMCF VMO and generation metadata (never a physical range), an
+  independent kernel decode of HMCF and the bound archive-v2 MCFG with
+  canonical-subset and usable-RAM-alias checks, and read-only, non-
+  executable, uncached ECAM capabilities (Mmio mappings are always
+  `NO_CACHE`; resource mappings reject `EXECUTE`). No consumer exists yet —
+  DriverManager→PCI Manager authority handoff is AP-9. AML/PCI config
+  authority remains otherwise disabled. AP-9 onwards not started. See
   ACPI_PCI_IMPLEMENTATION_PLAN.md §7.
 
 ### Process lifecycle regression matrix
