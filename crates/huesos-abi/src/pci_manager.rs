@@ -22,6 +22,20 @@ pub const HMCF_VMO_LABEL: &[u8] = b"pci-hmcf-vmo";
 /// in canonical record order; the receiver matches the `i`-th
 /// `CONFIG_ECAM_LABEL` handle to the `i`-th HMCF record.
 pub const CONFIG_ECAM_LABEL: &[u8] = b"pci-config-ecam";
+/// Label carrying the legacy CF8/CFC `IoPort` capability (`READ | WRITE |
+/// TRANSFER`) minted for PCI segment 0. Sent only when the supervisor
+/// requests the legacy backend with [`HELLO_FLAG_FORCE_LEGACY`]; never
+/// sent otherwise.
+pub const LEGACY_IOPORT_LABEL: &[u8] = b"pci-legacy-ioport";
+
+/// Configuration override: serve configuration reads through the
+/// legacy CF8/CFC mechanism (#1) even though ECAM authority is mapped.
+/// Intended for conformance testing of the legacy common subset; the
+/// manager still requires the legacy `IoPort` capability to be granted
+/// with this flag, otherwise reads answer `NotReady`.
+pub const HELLO_FLAG_FORCE_LEGACY: u32 = 1 << 0;
+/// All hello flags known by version 1.
+pub const HELLO_FLAGS_V1: u32 = HELLO_FLAG_FORCE_LEGACY;
 
 /// Control operation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -110,11 +124,16 @@ pub struct Message {
 impl Message {
     /// Supervisor hello for one manager process incarnation.
     pub const fn hello(manager_generation: u64) -> Self {
+        Self::hello_with_flags(manager_generation, 0)
+    }
+
+    /// Hello with explicit configuration override flags (`HELLO_FLAGS_V1`).
+    pub const fn hello_with_flags(manager_generation: u64, flags: u32) -> Self {
         Self {
             opcode: Opcode::Hello,
             manager_generation,
             status: Status::Ok,
-            detail: 0,
+            detail: flags,
         }
     }
 
@@ -209,7 +228,10 @@ impl RestartBackoff {
 
 /// Encode one control message.
 pub fn encode(message: Message, out: &mut [u8]) -> Option<usize> {
-    if out.len() < MESSAGE_BYTES || message.manager_generation == 0 {
+    if out.len() < MESSAGE_BYTES
+        || message.manager_generation == 0
+        || (message.opcode == Opcode::Hello && message.detail & !HELLO_FLAGS_V1 != 0)
+    {
         return None;
     }
     out[..MESSAGE_BYTES].fill(0);
@@ -234,7 +256,9 @@ pub fn decode(bytes: &[u8]) -> Option<Message> {
     let manager_generation = read_u64(bytes, 8)?;
     let status = Status::from_raw(read_i32(bytes, 16)?)?;
     let detail = read_u32(bytes, 20)?;
-    if manager_generation == 0 {
+    if manager_generation == 0
+        || (opcode == Opcode::Hello && detail & !HELLO_FLAGS_V1 != 0)
+    {
         return None;
     }
     Some(Message {
@@ -296,6 +320,23 @@ mod tests {
     use super::*;
 
     #[test]
+    fn hello_rejects_unknown_flags() {
+        let mut bytes = [0u8; MESSAGE_BYTES];
+        assert!(encode(Message::hello_with_flags(7, 1 << 4), &mut bytes).is_none());
+        let mut raw = [0u8; MESSAGE_BYTES];
+        assert!(encode(Message::hello(7), &mut raw).is_some());
+        raw[20] = 0x10; // poke an unknown flag bit into detail
+        assert_eq!(decode(&raw), None);
+        assert!(decode(&encode_or_fail(Message::hello_with_flags(7, HELLO_FLAG_FORCE_LEGACY))).is_some());
+    }
+
+    fn encode_or_fail(message: Message) -> [u8; MESSAGE_BYTES] {
+        let mut bytes = [0u8; MESSAGE_BYTES];
+        encode(message, &mut bytes).expect("valid message encodes");
+        bytes
+    }
+
+    #[test]
     fn hello_and_fail_closed_ready_round_trip() {
         for message in [
             Message::hello(7),
@@ -303,6 +344,7 @@ mod tests {
             Message::ready_config_authority(7, 2),
             Message::authority_complete(7, 2),
             Message::authority_complete(7, 0),
+            Message::hello_with_flags(7, HELLO_FLAG_FORCE_LEGACY),
         ] {
             let mut bytes = [0u8; MESSAGE_BYTES];
             let Some(length) = encode(message, &mut bytes) else {

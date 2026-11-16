@@ -59,6 +59,7 @@
 #![warn(missing_docs)]
 
 pub mod acpi_broker;
+pub mod pci_mediation;
 pub mod blobfs;
 pub mod block;
 pub mod channel;

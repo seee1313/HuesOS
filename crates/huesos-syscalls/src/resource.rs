@@ -261,3 +261,68 @@ pub(crate) fn sys_ioport_read8(resource_handle: HandleValue, port: u32) -> Sysca
     let byte: u8 = unsafe { x86_64::instructions::port::Port::<u8>::new(port_u16).read() };
     Ok(i64::from(byte))
 }
+
+/// Shared capability/range/alignment gate for the 16- and 32-bit I/O port
+/// operations (AP-10). Mirrors [`sys_ioport_read8`]: the caller must own an
+/// `IoPort` resource whose `[base, base+len)` range contains the access, and
+/// the access must be naturally aligned for its width. Rights are enforced
+/// by minting discipline (kind-2 legacy authority carries READ|WRITE); the
+/// 8-bit path applies the same kind+range contract, and the wider forms
+/// only add the alignment check the instruction requires.
+fn ioport_check(
+    resource_handle: HandleValue,
+    port: u32,
+    width: u64,
+) -> Result<u16, ErrorCode> {
+    let guard = require_resource_of_kind(resource_handle, ResourceKind::IoPort)?;
+    let resource = guard
+        .downcast_ref::<Resource>()
+        .ok_or(ErrorCode::WrongType)?;
+    let port_u16 = u16::try_from(port).map_err(|_| ErrorCode::InvalidArgs)?;
+    if u64::from(port_u16) & (width - 1) != 0 {
+        return Err(ErrorCode::InvalidArgs);
+    }
+    if !resource.contains(ResourceKind::IoPort, u64::from(port_u16), width) {
+        return Err(ErrorCode::AccessDenied);
+    }
+    Ok(port_u16)
+}
+
+pub(crate) fn sys_ioport_read16(resource_handle: HandleValue, port: u32) -> SyscallResult {
+    let port_u16 = ioport_check(resource_handle, port, 2)?;
+    // SAFETY: the port lies inside a range the caller was granted; the
+    // ranged capability check above has been performed. `Port::read`
+    // performs a single `in` instruction to the validated port.
+    let value: u16 = unsafe { x86_64::instructions::port::Port::<u16>::new(port_u16).read() };
+    Ok(i64::from(value))
+}
+
+pub(crate) fn sys_ioport_write16(
+    resource_handle: HandleValue,
+    port: u32,
+    value: u32,
+) -> SyscallResult {
+    let port_u16 = ioport_check(resource_handle, port, 2)?;
+    let narrowed = (value & 0xffff) as u16;
+    // SAFETY: same capability contract as sys_ioport_read16 above.
+    unsafe { x86_64::instructions::port::Port::<u16>::new(port_u16).write(narrowed) };
+    Ok(0)
+}
+
+pub(crate) fn sys_ioport_read32(resource_handle: HandleValue, port: u32) -> SyscallResult {
+    let port_u16 = ioport_check(resource_handle, port, 4)?;
+    // SAFETY: same capability contract as sys_ioport_read16 above.
+    let value: u32 = unsafe { x86_64::instructions::port::Port::<u32>::new(port_u16).read() };
+    Ok(i64::from(value))
+}
+
+pub(crate) fn sys_ioport_write32(
+    resource_handle: HandleValue,
+    port: u32,
+    value: u32,
+) -> SyscallResult {
+    let port_u16 = ioport_check(resource_handle, port, 4)?;
+    // SAFETY: same capability contract as sys_ioport_read16 above.
+    unsafe { x86_64::instructions::port::Port::<u32>::new(port_u16).write(value) };
+    Ok(0)
+}

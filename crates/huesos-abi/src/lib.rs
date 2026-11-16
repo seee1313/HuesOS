@@ -52,6 +52,8 @@ pub mod pci;
 /// PCI Manager bootstrap and lifecycle control protocol.
 pub mod pci_config;
 pub mod pci_manager;
+/// Dedicated ACPI ↔ PCI configuration read mediation protocol (AP-10).
+pub mod pci_mediation;
 
 /// HBI boot-driver manifest ABI.
 pub mod hbi_boot {
@@ -467,6 +469,21 @@ pub enum Syscall {
     /// written, or a negative error. Any partial failure rolls back every
     /// capability minted by the call.
     PciConfigMint = 68,
+    /// Read one 16-bit value from an x86 I/O port. `a1` is an `IoPort`
+    /// [`Resource`](../../huesos_object/struct.Resource.html) handle owned by
+    /// the caller, `a2` is the port number (inside the resource's
+    /// `[base, base+len)` range and 2-byte aligned). Used by the
+    /// capability-gated legacy configuration mechanism (#1).
+    IoPortRead16 = 69,
+    /// Write one 16-bit value to an x86 I/O port. Same contract as
+    /// [`Self::IoPortRead16`]; `a3` is the value.
+    IoPortWrite16 = 70,
+    /// Read one 32-bit value from an x86 I/O port. Same contract as
+    /// [`Self::IoPortRead16`] with 4-byte alignment.
+    IoPortRead32 = 71,
+    /// Write one 32-bit value to an x86 I/O port. Same contract as
+    /// [`Self::IoPortRead32`]; `a3` is the value.
+    IoPortWrite32 = 72,
 }
 
 /// Maximum number of bytes one [`Syscall::SystemGetEntropy`] call
@@ -546,7 +563,7 @@ impl Syscall {
     /// Total number of defined syscalls (i.e. one past the highest
     /// currently-assigned number). The dispatcher uses this to reject
     /// obviously-out-of-range numbers before a `match`.
-    pub const COUNT: u64 = 68;
+    pub const COUNT: u64 = 73;
 
     /// Convert a raw syscall number back into a [`Syscall`], if valid.
     pub const fn from_raw(n: u64) -> Option<Self> {
@@ -620,6 +637,10 @@ impl Syscall {
             66 => Self::InterruptCreateGsiForResource,
             67 => Self::InterruptAcknowledge,
             68 => Self::PciConfigMint,
+            69 => Self::IoPortRead16,
+            70 => Self::IoPortWrite16,
+            71 => Self::IoPortRead32,
+            72 => Self::IoPortWrite32,
             _ => return None,
         })
     }
@@ -1476,6 +1497,10 @@ mod tests {
         assert_eq!(Syscall::HardHalt as u64, 36);
         assert_eq!(Syscall::IoPortWrite8 as u64, 37);
         assert_eq!(Syscall::IoPortRead8 as u64, 38);
+        assert_eq!(Syscall::IoPortRead16 as u64, 69);
+        assert_eq!(Syscall::IoPortWrite16 as u64, 70);
+        assert_eq!(Syscall::IoPortRead32 as u64, 71);
+        assert_eq!(Syscall::IoPortWrite32 as u64, 72);
         assert_eq!(Syscall::ProcessSetAffinity as u64, 39);
         assert_eq!(Syscall::SystemCpuCount as u64, 40);
         assert_eq!(Syscall::SystemCurrentCpu as u64, 41);
@@ -1505,7 +1530,7 @@ mod tests {
         assert_eq!(Syscall::ResourceUnmap as u64, 65);
         assert_eq!(Syscall::InterruptCreateGsiForResource as u64, 66);
         assert_eq!(Syscall::InterruptAcknowledge as u64, 67);
-        assert_eq!(Syscall::COUNT, 68);
+        assert_eq!(Syscall::COUNT, 73);
         assert_eq!(Syscall::from_raw(28), Some(Syscall::VmoCreateEx));
         assert_eq!(Syscall::from_raw(30), Some(Syscall::VmarProtect));
         assert_eq!(Syscall::from_raw(31), Some(Syscall::ChannelPeek));
@@ -1555,7 +1580,11 @@ mod tests {
         );
         assert_eq!(Syscall::from_raw(67), Some(Syscall::InterruptAcknowledge));
         assert_eq!(Syscall::from_raw(68), Some(Syscall::PciConfigMint));
-        assert_eq!(Syscall::from_raw(69), None);
+        assert_eq!(Syscall::from_raw(69), Some(Syscall::IoPortRead16));
+        assert_eq!(Syscall::from_raw(70), Some(Syscall::IoPortWrite16));
+        assert_eq!(Syscall::from_raw(71), Some(Syscall::IoPortRead32));
+        assert_eq!(Syscall::from_raw(72), Some(Syscall::IoPortWrite32));
+        assert_eq!(Syscall::from_raw(73), None);
     }
 
     #[test]
