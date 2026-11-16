@@ -1,8 +1,12 @@
 # uACPI integration
 
-- **Status:** kernel barebones/archive-v2 bootstrap implemented; AP-3 isolated
-  full interpreter build merged; AP-4/AP-5 runtime mechanisms and AP-6
-  generation-safe supervision in progress; Ring-3 AML execution not implemented
+- **Status:** kernel barebones/archive-v2 bootstrap implemented; AP-4/AP-5
+  runtime mechanisms on main with the plan's required host tests (timeout trio,
+  recursion, event saturation/teardown, overflow, allocation-failure points,
+  synthetic RSDP→FACS graph, page-boundary, translator fuzz; decoder ASan fuzz
+  for the v2 wire format); AP-6 generation-safe supervision on main with QEMU
+  Q35/OVMF SMP2 restart-cascade and restart-budget gates; Ring-3 AML execution
+  not implemented
 - **Architecture:** [ACPI_RING3.md](ACPI_RING3.md)
 - **Delivery plan:**
   [ACPI_PCI_IMPLEMENTATION_PLAN.md](ACPI_PCI_IMPLEMENTATION_PLAN.md)

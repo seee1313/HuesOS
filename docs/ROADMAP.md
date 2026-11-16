@@ -21,6 +21,22 @@ gates close.
 
 ## Done (recent)
 
+### ACPI→PCI Batch 2 (AP-4…AP-6)
+- The isolated userspace uACPI runtime carries process-local primitives and an
+  archive-v2 read-only table map (AP-4/AP-5); the host suites were extended to
+  the plan's required tests (timeout trio, recursion, event saturation/teardown,
+  overflow, allocation-failure points, synthetic RSDP→FACS graph, page-boundary
+  ranges, translator fuzz; decoder ASan fuzz for the v2 wire format). ACPI
+  Manager supervision is generation-safe: retained archive/broker duplicates,
+  structured control protocol, bounded backoff and the last-good freeze policy
+  (AP-6). Verified by host suites (uacpi-runtime 22, decoder-fuzz 6, huesos-abi
+  77) and by QEMU Q35/OVMF SMP2: full boot gate, injected restart cascade
+  (pre-ready → ready → post-ready → restart → stale heartbeat ignored) and
+  restart-budget exhaustion into degraded mode
+  (`scripts/ci-qemu-acpi-restart-smoke.sh restart|budget`; cascade also on
+  debug). AML/PCI authority not enabled. AP-7 onwards not started. See
+  ACPI_PCI_IMPLEMENTATION_PLAN.md §7.
+
 ### Process lifecycle regression matrix
 - Test actual Process/ProcessWait objects for late and repeated observation,
   distinct async wakers, counted waiter release and competing exits. Exercise

@@ -43,10 +43,19 @@ This runs, e.g.:
   time, mutex, event, and dispatch callbacks. From a temporary directory (so
   the bare-metal Cargo config is not selected), run
   `cargo test --manifest-path <repo>/crates/huesos-userspace/uacpi-runtime/Cargo.toml`
-  for the primitive plus archive-translation tests (six after AP-5). Run
-  `bash scripts/test-uacpi-runtime.sh` to link every callback and execute the
-  remaining privileged-denial smoke under
-  ASan/UBSan. This does not claim namespace/AML readiness.
+  for the primitive plus archive-translation tests (twenty-two: timeout trio
+  zero/finite/infinite, recursion rejection, event signal-before-wait,
+  multiple-signal, reset, saturation, teardown and slot-reuse races,
+  monotonicity/overflow, allocation-failure points, registry exhaustion,
+  dispatch nesting, synthetic RSDP→XSDT→FADT/DSDT/FACS translation graph,
+  unaligned and full-table boundaries, page-boundary-in-record, adjacent-record
+  and gap rejection, and a deterministic 2000-iteration translator fuzz). The
+  suites are serialized because the callbacks and fixtures share process-global
+  registries. Run `bash scripts/test-uacpi-runtime.sh` to link every callback
+  and execute the remaining privileged-denial smoke under
+  ASan/UBSan. Decoder-side ASan coverage for the v2 wire format runs through
+  `cargo test -p huesos-decoder-fuzz` (wired into the sanitizer CI job). This
+  does not claim namespace/AML readiness.
 - `huesos-hxfs`: checkpoint geometry is checked against the actual target and
   journal LBA spans. Plain and Hxblob-enabled regressions simulate power loss
   after the `RECOVERING` root is durable but before the final clean root,
@@ -134,17 +143,14 @@ cannot fail is worse than no gate, because it is trusted.
 make run          # default scripts/run.sh uses -smp 2
 ```
 
-AP-6 adds a generation/restart gate:
+AP-6 adds two generation/restart gates:
 
 ```bash
-bash scripts/ci-qemu-acpi-restart-smoke.sh release 2 120
+bash scripts/ci-qemu-acpi-restart-smoke.sh release 2 120 restart
+bash scripts/ci-qemu-acpi-restart-smoke.sh release 2 120 budget
 ```
 
-The test builds ACPI Manager generation one with a pre-ready exit injection,
-requires DriverManager to retain and duplicate the sealed archive/broker,
-observes frozen restart scheduling, and requires generation two readiness while
-the input DriverHost remains alive. The ordinary QEMU smoke separately proves
-generation one reaches readiness without injection.
+`restart` (the default, also handled by plain `bash scripts/ci-qemu-acpi-restart-smoke.sh release 2 120`) boots an injected crash cascade: generation one exits before readiness (crash-before-archive-accept), generation two becomes ready and then exits right after readiness (crash-after-ready), and generation three becomes ready and emits one foreign-generation heartbeat that DriverManager must ignore (stale control bytes). The gate requires the frozen restart scheduling markers, readiness of generations two and three, the stale-generation-ignored marker, a live input DriverHost, and no kernel panic. `budget` exits every generation before readiness until the bounded restart budget trips into the explicit degraded state; the gate requires the exhaustion marker, a completed degraded boot, a live input DriverHost, and that no ACPI readiness marker appears. Both keep AML/PCI authority disabled. The ordinary QEMU smoke separately proves the no-injection happy path. The CI `qemu-acpi-restart` job runs both scenarios on release SMP2.
 
 ### Expected serial (abbreviated, multi-core)
 
@@ -481,7 +487,7 @@ not a spec:
 | `static-safety` | `make audit-check`, Clippy, the ordinary host suite, and `make test-hxfs-features` for the combined encryption + compression + Hxblob storage build |
 | `qemu-boot` | boot smoke across SMP 1/2/4/8 |
 | `qemu-ioapic-live` | QMP-injected PS/2 edge IRQ reaches a userspace Port on SMP2 |
-| `qemu-acpi-restart` | AP-6 pre-ready failure, retained capabilities, frozen restart, generation-two readiness |
+| `qemu-acpi-restart` | AP-6 lifecycle gates: injected restart cascade (pre-ready, post-ready, stale heartbeat) and restart-budget exhaustion into degraded mode, both release SMP2 |
 | `qemu-nvme-boot` | base NVMe soak, mode 0 |
 | `qemu-nvme-gcm-inject` | mode 1 |
 | `qemu-nvme-crc-inject` | mode 2 |

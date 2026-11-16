@@ -42,6 +42,8 @@ done
         cargo clippy --release -- -D warnings
     HUESOS_INPUT_DRIVER_HOST_PATH="$TMP/input-host" \
         cargo clippy --release --features acpi-restart-smoke -- -D warnings
+    HUESOS_INPUT_DRIVER_HOST_PATH="$TMP/input-host" \
+        cargo clippy --release --features acpi-restart-budget-smoke -- -D warnings
 )
 
 for program in driver-host-input driver-host-nvme hxfs-service terminal doom fault-probe acpi-manager uacpi-runtime pci-manager shutdown-broker key-broker; do

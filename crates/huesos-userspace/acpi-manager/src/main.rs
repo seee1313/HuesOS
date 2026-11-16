@@ -56,6 +56,14 @@ pub extern "C" fn _start() -> ! {
         println!("[acpi-manager] injected pre-ready exit generation 1");
         libcanvas::process::exit(-70);
     }
+    #[cfg(feature = "restart-smoke")]
+    if inputs.hello_flags & acpi_manager::HELLO_FLAG_INJECT_PRE_READY_ALWAYS != 0 {
+        println!(
+            "[acpi-manager] injected pre-ready exit generation {}",
+            generation
+        );
+        libcanvas::process::exit(-71);
+    }
 
     let Some(archive) = inputs.archive.take() else {
         send_failure(
@@ -127,6 +135,36 @@ pub extern "C" fn _start() -> ! {
         "[acpi-manager] generation {} archive/broker capabilities ready",
         generation
     );
+
+    // Crash-after-readiness smoke: announce readiness, then die. The next
+    // generation observes a peer-closed channel after a recorded Ready.
+    #[cfg(feature = "restart-smoke")]
+    if generation == 2 && inputs.hello_flags & acpi_manager::HELLO_FLAG_INJECT_POST_READY_EXIT != 0
+    {
+        println!("[acpi-manager] injected post-ready exit generation 2");
+        libcanvas::process::exit(-72);
+    }
+
+    // Stale-control smoke: a single heartbeat carrying a foreign generation
+    // must be ignored by DriverManager's generation check.
+    #[cfg(feature = "restart-smoke")]
+    if generation >= 3 && inputs.hello_flags & acpi_manager::HELLO_FLAG_INJECT_STALE_HEARTBEAT != 0
+    {
+        let _ = send_control(
+            &bootstrap,
+            acpi_manager::Message {
+                opcode: acpi_manager::Opcode::Heartbeat,
+                manager_generation: generation - 1,
+                status: acpi_manager::Status::Ok,
+                detail: 0,
+            },
+        );
+        println!(
+            "[acpi-manager] injected foreign-generation heartbeat {} (self {})",
+            generation - 1,
+            generation
+        );
+    }
 
     let mut fallback_ticks = 0u64;
     let mut last_heartbeat = monotonic_or(&mut fallback_ticks);

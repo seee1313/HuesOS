@@ -419,7 +419,14 @@ fn cooperative_yield() {
 
 #[cfg(test)]
 mod tests {
+    extern crate std;
+
     use super::*;
+
+    // The callbacks and the fixtures operate on process-global registries.
+    // Serialize the suite so one test cannot reset another test's slots
+    // mid-flight (which is exactly what the 5 ms foreign-release window hits).
+    static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn reset() {
         *MUTEXES.lock() = [MutexSlot::EMPTY; SYNC_SLOT_COUNT];
@@ -431,6 +438,7 @@ mod tests {
 
     #[test]
     fn allocation_time_mutex_event_and_dispatch_contracts() {
+        let _serial_guard = SERIAL.lock().unwrap_or_else(|error| error.into_inner());
         reset();
 
         let allocation = uacpi_kernel_alloc(37);
@@ -474,6 +482,7 @@ mod tests {
 
     #[test]
     fn fixed_registries_exhaust_without_aliasing() {
+        let _serial_guard = SERIAL.lock().unwrap_or_else(|error| error.into_inner());
         reset();
         let mut handles = [core::ptr::null_mut(); SYNC_SLOT_COUNT];
         for slot in &mut handles {
@@ -488,6 +497,7 @@ mod tests {
 
     #[test]
     fn invalid_handles_fail_closed() {
+        let _serial_guard = SERIAL.lock().unwrap_or_else(|error| error.into_inner());
         reset();
         let invalid = (SYNC_SLOT_COUNT + 1) as *mut c_void;
         assert_eq!(uacpi_kernel_acquire_mutex(invalid, 0), UACPI_STATUS_DENIED);
@@ -498,9 +508,245 @@ mod tests {
 
     #[test]
     fn allocation_layout_is_bounded_and_max_aligned() {
+        let _serial_guard = SERIAL.lock().unwrap_or_else(|error| error.into_inner());
         assert!(allocation_layout(0).is_some_and(|layout| {
             layout.size() == 1 && layout.align() == ALLOCATION_ALIGNMENT
         }));
         assert!(allocation_layout(usize::MAX).is_none());
     }
+
+    #[test]
+    fn timeout_trio_zero_finite_and_infinite() {
+        let _serial_guard = SERIAL.lock().unwrap_or_else(|error| error.into_inner());
+        reset();
+        // Own no lock; a foreign thread holding the mutex exercises the wait
+        // paths. Slot 0 is forced into the foreign-locked state directly.
+        let mutex = uacpi_kernel_create_mutex();
+        assert!(!mutex.is_null());
+        {
+            let mut slots = MUTEXES.lock();
+            slots[0].locked = true;
+            slots[0].owner = 999;
+        }
+
+        // Zero timeout: exactly one attempt, then TIMEOUT.
+        let ticks_before = FALLBACK_TICKS.load(Ordering::Acquire);
+        assert_eq!(uacpi_kernel_acquire_mutex(mutex, 0), UACPI_STATUS_TIMEOUT);
+        assert_eq!(FALLBACK_TICKS.load(Ordering::Acquire), ticks_before);
+
+        // Finite timeout (30 ms at 10 ms/tick): waits for three ticks, then TIMEOUT.
+        assert_eq!(uacpi_kernel_acquire_mutex(mutex, 30), UACPI_STATUS_TIMEOUT);
+        let elapsed = FALLBACK_TICKS.load(Ordering::Acquire) - ticks_before;
+        assert!(
+            elapsed >= 3,
+            "finite timeout did not consume ticks: {elapsed}"
+        );
+
+        // Infinite timeout (u16::MAX): the pre-satisfied case answers immediately.
+        {
+            let mut slots = MUTEXES.lock();
+            slots[0].locked = false;
+            slots[0].owner = 0;
+        }
+        assert_eq!(uacpi_kernel_acquire_mutex(mutex, u16::MAX), UACPI_STATUS_OK);
+        uacpi_kernel_release_mutex(mutex);
+        // The indefinite branch is encoded as "no deadline".
+        assert!(finite_deadline(u16::MAX).is_none());
+        assert!(finite_deadline(0).is_none());
+        uacpi_kernel_free_mutex(mutex);
+    }
+
+    #[test]
+    fn finite_deadline_rounds_ms_up_to_ticks() {
+        let _serial_guard = SERIAL.lock().unwrap_or_else(|error| error.into_inner());
+        reset();
+        let base = now_ticks();
+        assert_eq!(finite_deadline(1), Some(base + 1));
+        assert_eq!(finite_deadline(10), Some(base + 1));
+        assert_eq!(finite_deadline(11), Some(base + 2));
+        assert_eq!(finite_deadline(100), Some(base + 10));
+    }
+
+    #[test]
+    fn infinite_timeout_waits_for_foreign_release() {
+        let _serial_guard = SERIAL.lock().unwrap_or_else(|error| error.into_inner());
+        reset();
+        let mutex = uacpi_kernel_create_mutex();
+        assert!(!mutex.is_null());
+        {
+            let mut slots = MUTEXES.lock();
+            slots[0].locked = true;
+            slots[0].owner = 999;
+        }
+        let releaser = std::thread::spawn(|| {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            let mut slots = MUTEXES.lock();
+            slots[0].locked = false;
+            slots[0].owner = 0;
+        });
+        // An unbounded wait must not time out while the foreign owner holds the
+        // mutex; it completes only after the releaser runs.
+        assert_eq!(uacpi_kernel_acquire_mutex(mutex, u16::MAX), UACPI_STATUS_OK);
+        assert!(releaser.join().is_ok(), "releaser thread panicked");
+        uacpi_kernel_release_mutex(mutex);
+        uacpi_kernel_free_mutex(mutex);
+    }
+
+    #[test]
+    fn recursion_is_rejected_instead_of_deadlocking() {
+        let _serial_guard = SERIAL.lock().unwrap_or_else(|error| error.into_inner());
+        reset();
+        let mutex = uacpi_kernel_create_mutex();
+        assert_eq!(uacpi_kernel_acquire_mutex(mutex, 0), UACPI_STATUS_OK);
+        // Same-thread recursion never borrows the timeout path.
+        assert_eq!(uacpi_kernel_acquire_mutex(mutex, 0), UACPI_STATUS_DENIED);
+        assert_eq!(
+            uacpi_kernel_acquire_mutex(mutex, u16::MAX),
+            UACPI_STATUS_DENIED
+        );
+        uacpi_kernel_release_mutex(mutex);
+        assert_eq!(uacpi_kernel_acquire_mutex(mutex, 0), UACPI_STATUS_OK);
+        uacpi_kernel_release_mutex(mutex);
+        uacpi_kernel_free_mutex(mutex);
+    }
+
+    #[test]
+    fn event_signal_before_wait_and_multiple_signals() {
+        let _serial_guard = SERIAL.lock().unwrap_or_else(|error| error.into_inner());
+        reset();
+        let event = uacpi_kernel_create_event();
+        assert!(!event.is_null());
+        // Signals raised before the first wait are preserved and consumable.
+        uacpi_kernel_signal_event(event);
+        uacpi_kernel_signal_event(event);
+        uacpi_kernel_signal_event(event);
+        assert!(uacpi_kernel_wait_for_event(event, 0));
+        assert!(uacpi_kernel_wait_for_event(event, 0));
+        assert!(uacpi_kernel_wait_for_event(event, 0));
+        // All pending counts consumed; the next wait fails immediately.
+        assert!(!uacpi_kernel_wait_for_event(event, 0));
+        uacpi_kernel_free_event(event);
+    }
+
+    #[test]
+    fn event_signal_saturation_does_not_wrap() {
+        let _serial_guard = SERIAL.lock().unwrap_or_else(|error| error.into_inner());
+        reset();
+        let event = uacpi_kernel_create_event();
+        assert!(!event.is_null());
+        EVENTS.lock()[0].count = u32::MAX;
+        uacpi_kernel_signal_event(event);
+        assert_eq!(EVENTS.lock()[0].count, u32::MAX);
+        // All saturated counts remain consumable.
+        assert!(uacpi_kernel_wait_for_event(event, 0));
+        assert_eq!(EVENTS.lock()[0].count, u32::MAX - 1);
+        uacpi_kernel_free_event(event);
+    }
+
+    #[test]
+    fn event_teardown_discards_counts_and_slot_reuse_is_clean() {
+        let _serial_guard = SERIAL.lock().unwrap_or_else(|error| error.into_inner());
+        reset();
+        let event = uacpi_kernel_create_event();
+        uacpi_kernel_signal_event(event);
+        uacpi_kernel_free_event(event);
+        // Stale handle is inert after teardown.
+        assert!(!uacpi_kernel_wait_for_event(event, 0));
+        uacpi_kernel_signal_event(event);
+        uacpi_kernel_reset_event(event);
+        // Slot reuse starts from count == 0, not the discarded residue.
+        let reused = uacpi_kernel_create_event();
+        assert_eq!(reused, event);
+        assert!(!uacpi_kernel_wait_for_event(reused, 0));
+        uacpi_kernel_free_event(reused);
+    }
+
+    #[test]
+    fn mutex_teardown_rejects_locked_handles() {
+        let _serial_guard = SERIAL.lock().unwrap_or_else(|error| error.into_inner());
+        reset();
+        let mutex = uacpi_kernel_create_mutex();
+        assert_eq!(uacpi_kernel_acquire_mutex(mutex, 0), UACPI_STATUS_OK);
+        // A locked mutex cannot disappear underneath its owner.
+        uacpi_kernel_free_mutex(mutex);
+        assert!(MUTEXES.lock()[0].allocated);
+        uacpi_kernel_release_mutex(mutex);
+        uacpi_kernel_free_mutex(mutex);
+        assert!(!MUTEXES.lock()[0].allocated);
+    }
+
+    #[test]
+    fn allocation_failure_points_fail_closed() {
+        let _serial_guard = SERIAL.lock().unwrap_or_else(|error| error.into_inner());
+        reset();
+        // usize::MAX layouts cannot be constructed; both alloc callbacks report failure.
+        assert!(uacpi_kernel_alloc(usize::MAX).is_null());
+        assert!(uacpi_kernel_alloc_zeroed(usize::MAX).is_null());
+        assert_eq!(
+            uacpi_kernel_acquire_mutex(core::ptr::null_mut(), 0),
+            UACPI_STATUS_DENIED
+        );
+        // Fixed registries report exhaustion instead of reusing a live slot.
+        let mut mutexes = [core::ptr::null_mut(); SYNC_SLOT_COUNT];
+        for handle in &mut mutexes {
+            *handle = uacpi_kernel_create_mutex();
+            assert!(!handle.is_null());
+        }
+        assert!(uacpi_kernel_create_mutex().is_null());
+        let mut spinlocks = [core::ptr::null_mut(); SYNC_SLOT_COUNT];
+        for handle in &mut spinlocks {
+            *handle = uacpi_kernel_create_spinlock();
+            assert!(!handle.is_null());
+        }
+        assert!(uacpi_kernel_create_spinlock().is_null());
+        for handle in spinlocks {
+            uacpi_kernel_free_spinlock(handle);
+        }
+        for handle in mutexes {
+            uacpi_kernel_free_mutex(handle);
+        }
+    }
+
+    #[test]
+    fn monotonicity_and_overflow_boundaries() {
+        let _serial_guard = SERIAL.lock().unwrap_or_else(|error| error.into_inner());
+        reset();
+        assert_eq!(uacpi_kernel_get_nanoseconds_since_boot(), 0);
+        FALLBACK_TICKS.store(2, Ordering::Release);
+        assert_eq!(uacpi_kernel_get_nanoseconds_since_boot(), 20_000_000);
+        // Tick-to-nanosecond conversion saturates instead of wrapping.
+        FALLBACK_TICKS.store(u64::MAX, Ordering::Release);
+        assert_eq!(uacpi_kernel_get_nanoseconds_since_boot(), u64::MAX);
+        // Deadline arithmetic saturates at u64::MAX.
+        FALLBACK_TICKS.store(u64::MAX - 1, Ordering::Release);
+        assert_eq!(finite_deadline(100), Some(u64::MAX));
+        reset();
+        assert_eq!(uacpi_kernel_get_nanoseconds_since_boot(), 0);
+    }
+
+    #[test]
+    fn stable_thread_id_and_dispatch_nesting() {
+        let _serial_guard = SERIAL.lock().unwrap_or_else(|error| error.into_inner());
+        reset();
+        let first = uacpi_kernel_get_thread_id();
+        assert!(!first.is_null());
+        assert_eq!(first as usize, uacpi_kernel_get_thread_id() as usize);
+        let base = uacpi_kernel_disable_interrupts();
+        let nested = uacpi_kernel_disable_interrupts();
+        assert_eq!(nested, base + 1);
+        assert!(dispatch_suppressed());
+        uacpi_kernel_restore_interrupts(nested);
+        assert!(dispatch_suppressed());
+        uacpi_kernel_restore_interrupts(base);
+        assert!(!dispatch_suppressed());
+    }
+
+    // The suite intentionally does not exercise a host-allocator OOM: the host
+    // global allocator cannot be forced to fail deterministically. Every
+    // uACPI-visible allocation *point* instead fails through the two
+    // deterministic paths above (layout construction and registry exhaustion).
+    // Callbacks never block while holding the allocator-internal lock (they
+    // call the process heap directly) and hold only the process-local spin
+    // slot mutexes, which are leaf locks; no IRQ-delivery path runs in this
+    // crate, so no IRQ lock can be held across any callback.
 }
