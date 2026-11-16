@@ -12,6 +12,10 @@ pub const TABLES_VMO_LABEL: &[u8] = b"acpi-tables-vmo";
 pub const BROKER_LABEL: &[u8] = b"acpi-broker";
 /// DriverManager transfers the child process's own root VMAR with this label.
 pub const SELF_VMAR_LABEL: &[u8] = b"acpi-self-vmar";
+/// `acpi-manager` transfers the validated `HMCF` config-window snapshot with
+/// this label. The VMO carries `READ | DUPLICATE | TRANSFER` rights only;
+/// it is immutable from every published handle.
+pub const HMCF_VMO_LABEL: &[u8] = b"acpi-hmcf-vmo";
 /// Test-only hello detail: generation one exits before readiness.
 pub const HELLO_FLAG_INJECT_PRE_READY_EXIT: u32 = 1 << 0;
 /// Test-only hello detail: the second generation exits right after readiness

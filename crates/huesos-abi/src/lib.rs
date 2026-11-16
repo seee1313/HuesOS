@@ -39,6 +39,10 @@ pub mod hxfs;
 /// range index before any userspace mapping.
 pub mod acpi_archive;
 
+/// Validated PCI configuration-window snapshot (`HMCF`) published by
+/// `acpi-manager` and retained by DriverManager.
+pub mod hmcf;
+
 /// Boot-time storage hardware metadata shared from the kernel to init and
 /// DriverManager.
 pub mod storage_boot;
