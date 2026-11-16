@@ -969,7 +969,7 @@ closes.
 | Track | Status | Evidence |
 |---|---|---|
 | A.1 Normative architecture | Complete (design) | PCI + Ring-3 ACPI authority docs; AP execution plan |
-| A.2 ABI vocabulary | In progress | HPCI complete; HMCF/snapshot/mint/mediation ABIs planned in AP-1/AP-7/AP-10 |
+| A.2 ABI vocabulary | In progress | HPCI complete; HMCF/snapshot/mint ABIs complete; mediation ABI implemented on `huesos-dev/ap10-config-mediation` (AP-10) |
 | A.3 Migration map | Complete | architecture §2 + roadmap A.3 + AP plan |
 | ACPI archive v2 | Complete (bootstrap) | AP-1/AP-2 merged; Q35 v2 snapshot accepted in Ring 3 |
 | Full Ring-3 uACPI | In progress | AP-4/AP-5 mechanisms + AP-6 supervised transport in review; AML AP-7–AP-14 open |
@@ -977,16 +977,18 @@ closes.
 | B.1 Checked address vocabulary | Complete | PCI-1 types + PCI-2 bootstrap adoption |
 | B.2 ECAM access planner | Complete (policy) | checked region-relative plans and boundary tests |
 | B.3 Legacy access planner | Complete | common-subset plans; kernel shim migrated |
-| C.1 HMCF/config authority | In progress | MCFG policy parser complete; archive-v2/HMCF/mint/handoff AP-1–AP-10 open |
+| C.1 HMCF/config authority | In progress | MCFG policy parser complete; archive-v2/HMCF/mint/handoff implemented (AP-1–AP-10; AP-10 in review) |
 | C.2 Root descriptor ABI | In progress | bounded HPCI wire format complete; Ring-3 AML producer AP-13–AP-15 open |
 | D.1 Topology snapshots | In progress | policy graph complete; snapshot-bound diagnostic inventory AP-16 open |
 | D.2 Capability parsing | Complete (policy) | bounded conventional/extended decoders; NVMe bootstrap hardened |
 | E.2 Firmware assignment validator | Complete (policy) | translated status report + overlap/forwarding checks |
 | F.1 Firmware-preserving allocator | In progress | deterministic pre-sized planning complete; aggregation/reserves open |
 | G.1 DeviceLease policy | Complete (policy) | generation-safe lifecycle and fail-closed transition tests |
-| H.1 PCI Manager bootstrap | In progress | process/restart skeleton complete; HMCF/mint/ACPI mediation AP-7–AP-10 open |
+| H.1 PCI Manager bootstrap | In progress | process/restart skeleton complete; HMCF/mint handoff complete; ACPI mediation implemented on branch (AP-10) |
 | AP-0 authority reconciliation | In review | normative docs + owner/agent execution plan |
-| AP-1–AP-16 | Not started | must merge in documented batches/order |
+| AP-1–AP-9 | Merged | merged to main via batched PRs |
+| AP-10 | Implemented on `huesos-dev/ap10-config-mediation`, in review | mediation channel end to end; QEMU evidence pending CI `qemu-pci-mediation` |
+| AP-11–AP-16 | Not started | must merge in documented batches/order |
 | B.4, C.3, D.3, E.1, F.2–F.3, G.2–G.3, H.2–O | Not started | no production claim |
 
 Update this table in every PCI stage PR. A track may be marked complete only
