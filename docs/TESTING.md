@@ -38,6 +38,18 @@ This runs, e.g.:
   unknown, and zero-generation inputs. QEMU smoke requires both the isolated
   service's no-root fail-closed marker and DriverManager's matching supervised
   readiness marker.
+- `huesos-abi::hmcf`: the validated config-window snapshot (`HMCF`, AP-7).
+  Seventeen host tests cover multiple segments and non-zero start buses,
+  adjacent windows, the encode-time overlap rejection, empty/oversized record
+  sets (0 and 65+ windows), the 64-record maximum round-trip, canonical
+  ordering on encode and its requirement on the wire, duplicate ordering
+  keys, reserved fields and flags, count/size agreement, wrapping byte-sum
+  checksum provenance (including the checksum field), physical-span
+  overflow, binding to the firmware snapshot and producer generation
+  (`StaleGeneration`/`SnapshotMismatch`), deterministic encoding, and the
+  declared-size two-phase read helper. The MCFG decoder's own coverage
+  (multiple allocations, non-zero start bus, overlap rejection, checksum)
+  remains in `huesos-pci`.
 - `huesos-uacpi-runtime`: AP-3 compiles the full pinned interpreter in a
   separate userspace crate; AP-4 activates only process-local allocation,
   time, mutex, event, and dispatch callbacks. From a temporary directory (so
@@ -151,6 +163,8 @@ bash scripts/ci-qemu-acpi-restart-smoke.sh release 2 120 budget
 ```
 
 `restart` (the default, also handled by plain `bash scripts/ci-qemu-acpi-restart-smoke.sh release 2 120`) boots an injected crash cascade: generation one exits before readiness (crash-before-archive-accept), generation two becomes ready and then exits right after readiness (crash-after-ready), and generation three becomes ready and emits one foreign-generation heartbeat that DriverManager must ignore (stale control bytes). The gate requires the frozen restart scheduling markers, readiness of generations two and three, the stale-generation-ignored marker, a live input DriverHost, and no kernel panic. `budget` exits every generation before readiness until the bounded restart budget trips into the explicit degraded state; the gate requires the exhaustion marker, a completed degraded boot, a live input DriverHost, and that no ACPI readiness marker appears. Both keep AML/PCI authority disabled. The ordinary QEMU smoke separately proves the no-injection happy path. The CI `qemu-acpi-restart` job runs both scenarios on release SMP2.
+
+AP-7 extends the plain QEMU smoke with two required markers and one regression marker: a healthy boot must show `[acpi-manager] published HMCF` (the MCFG-decode produced a bounded immutable snapshot) and `[driver-manager] retained HMCF` (the envelope/size/generation were validated and the snapshot retained for the current generation); `[driver-manager] HMCF rejected` must never appear. The restart scenario re-uses the plain gate, so the injected cascade also proves the generation-2 snapshot is dropped when DriverManager schedules the restart (stale snapshots cannot outlive their generation) and generation 3 publishes a fresh one. The HMCF bytes are checksum-protected for consistency only; they are not authentication, and no ECAM mapping or PCI config authority is enabled — the mint path lands with AP-8/AP-9.
 
 ### Expected serial (abbreviated, multi-core)
 

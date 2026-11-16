@@ -29,12 +29,17 @@ gates close.
   ranges, translator fuzz; decoder ASan fuzz for the v2 wire format). ACPI
   Manager supervision is generation-safe: retained archive/broker duplicates,
   structured control protocol, bounded backoff and the last-good freeze policy
-  (AP-6). Verified by host suites (uacpi-runtime 22, decoder-fuzz 6, huesos-abi
-  77) and by QEMU Q35/OVMF SMP2: full boot gate, injected restart cascade
-  (pre-ready → ready → post-ready → restart → stale heartbeat ignored) and
-  restart-budget exhaustion into degraded mode
+  (AP-6). The validated HMCF config-window snapshot is now produced from the
+  archived MCFG by `acpi-manager` and retained by DriverManager under the
+  current generation (AP-7): bounded pointer-free wire format, canonical
+  encoding, envelope/size/generation validation, immutable VMO, no ECAM
+  mapping or PCI authority. Verified by host suites (uacpi-runtime 22,
+  decoder-fuzz 6, huesos-abi 94 incl. 17 HMCF tests) and by QEMU Q35/OVMF SMP2:
+  full boot gate, injected restart cascade
+  (pre-ready → ready → post-ready → restart → stale heartbeat ignored, stale
+  HMCF generation dropped) and restart-budget exhaustion into degraded mode
   (`scripts/ci-qemu-acpi-restart-smoke.sh restart|budget`; cascade also on
-  debug). AML/PCI authority not enabled. AP-7 onwards not started. See
+  debug). AML/PCI authority not enabled. AP-8 onwards not started. See
   ACPI_PCI_IMPLEMENTATION_PLAN.md §7.
 
 ### Process lifecycle regression matrix
