@@ -448,6 +448,25 @@ pub enum Syscall {
     /// Acknowledge one delivered level-triggered interrupt after device service.
     /// `a1` is an Interrupt handle with WRITE rights.
     InterruptAcknowledge = 67,
+    /// Mint snapshot-bound PCI configuration capabilities. `a1` is the
+    /// caller-owned `PciConfigMint` [`Resource`](../../huesos_object/struct.Resource.html)
+    /// handle minted uniquely for the root supervisor at boot. `a2` points
+    /// to a [`pci_config::PciConfigMintRequest`], `a3` is a `*mut HandleValue`
+    /// output array, and `a4` is its capacity in handles.
+    ///
+    /// The request carries no physical address: the kernel independently
+    /// decodes the `HMCF` image in the caller-supplied VMO, requires it to
+    /// match the identity and window set of the archive-v2 snapshot the
+    /// boot kernel built itself, rejects any record not exactly backed by
+    /// the bound `MCFG` (widening, shifting, replaying, RAM aliases), and
+    /// only then creates capabilities. `kind = 1` (`MINT_KIND_ECAM_WINDOWS`)
+    /// installs one read-only `Mmio` capability per window (max
+    /// [`hmcf::MAX_RECORDS`]) with READ|TRANSFER rights; `kind = 2`
+    /// (`MINT_KIND_LEGACY_CF8_CFC`) installs the fixed `0xCF8..0x100`
+    /// port-I/O authority for PCI segment 0. Returns the number of handles
+    /// written, or a negative error. Any partial failure rolls back every
+    /// capability minted by the call.
+    PciConfigMint = 68,
 }
 
 /// Maximum number of bytes one [`Syscall::SystemGetEntropy`] call
@@ -600,6 +619,7 @@ impl Syscall {
             65 => Self::ResourceUnmap,
             66 => Self::InterruptCreateGsiForResource,
             67 => Self::InterruptAcknowledge,
+            68 => Self::PciConfigMint,
             _ => return None,
         })
     }
@@ -834,6 +854,13 @@ pub const INIT_FRAME_DRAW_HANDLE: HandleValue = 6;
 /// handle is absent when the bootloader supplied no command line;
 /// callers must treat that as "no overrides", not as an error.
 pub const INIT_CMDLINE_HANDLE: HandleValue = 7;
+/// Unique `PciConfigMint` [`Resource`](../../huesos_object/struct.Resource.html)
+/// authority installed in the initial process. Minted once by the kernel
+/// at boot for the root supervisor only; it is the sole authority that
+/// lets a process call [`Syscall::PciConfigMint`]. `init` transfers the
+/// handle to the supervised driver stack over a channel; the kernel never
+/// mints a second one.
+pub const INIT_CONFIG_MINT_HANDLE: HandleValue = 8;
 
 /// Stable process exit codes used when the kernel terminates a process after
 /// an unhandled ring-3 CPU exception.
@@ -1527,7 +1554,8 @@ mod tests {
             Some(Syscall::InterruptCreateGsiForResource)
         );
         assert_eq!(Syscall::from_raw(67), Some(Syscall::InterruptAcknowledge));
-        assert_eq!(Syscall::from_raw(68), None);
+        assert_eq!(Syscall::from_raw(68), Some(Syscall::PciConfigMint));
+        assert_eq!(Syscall::from_raw(69), None);
     }
 
     #[test]
@@ -1631,6 +1659,7 @@ mod tests {
         // handle table that init relies on does not silently renumber.
         assert_eq!(super::INIT_FRAME_DRAW_HANDLE, 6);
         assert_eq!(super::INIT_CMDLINE_HANDLE, 7);
+        assert_eq!(super::INIT_CONFIG_MINT_HANDLE, 8);
         assert_eq!(super::INIT_STORAGE_BOOT_INFO_HANDLE, 5);
     }
 

@@ -67,6 +67,7 @@ macro_rules! record {
     };
 }
 record!(huesos_abi::HeapExtendArgs, 24, 8, offset => 0, len => 8, op => 16, reserved => 20);
+record!(huesos_abi::pci_config::PciConfigMintRequest, 32, 8, version => 0, kind => 2, reserved => 4, firmware_snapshot_id => 8, producer_generation => 16, hmcf_vmo => 24);
 record!(huesos_abi::FramebufferInfo, 20, 4, width => 0, height => 4, pitch => 8, bpp => 12, red_mask_size => 14, red_mask_shift => 15, green_mask_size => 16, green_mask_shift => 17, blue_mask_size => 18, blue_mask_shift => 19);
 record!(huesos_abi::FramebufferBlitArgs, 40, 8, vmo => 0, vmo_offset => 8, src_width => 16, src_height => 20, src_stride => 24, dst_x => 28, dst_y => 32);
 record!(huesos_abi::ChannelReadEtcArgs, 56, 8, channel => 0, bytes => 8, bytes_capacity => 16, out_bytes => 24, handles => 32, handles_capacity => 40, out_handles => 48);

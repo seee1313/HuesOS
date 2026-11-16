@@ -68,6 +68,8 @@ for marker in \
     '[driver-manager] ACPI manager ready generation' \
     '[acpi-manager] published HMCF' \
     '[driver-manager] retained HMCF' \
+    '[acpi] config mint authority installed: snapshot' \
+    '[init] installed PciConfigMint capability (handle 8)' \
     '[pci-manager] ready without root descriptors; fail-closed' \
     '[driver-manager] PCI manager ready (no roots; fail-closed)' \
     '[terminal] keyboard service online, starting shell' \
@@ -98,6 +100,8 @@ for regression in \
     '[driver-manager] ACPI manager restart budget exhausted' \
     '[driver-manager] malformed ACPI manager control message' \
     '[driver-manager] HMCF rejected' \
+    '[acpi] config mint authority disabled:' \
+    '[init] failed to install PciConfigMint capability' \
     '[acpi-manager] PANIC' \
     '[driver-manager] PCI manager restart budget exhausted' \
     '[driver-manager] malformed PCI manager control message' \
