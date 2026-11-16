@@ -15,6 +15,7 @@ extern crate alloc;
 mod acpi_broker;
 mod callbacks;
 mod channel;
+pub mod config_mint;
 mod debug;
 mod entropy;
 mod framebuffer;
@@ -155,6 +156,12 @@ pub fn dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> Syscal
             a3 as *mut HandleValue,
         ),
         S::InterruptAcknowledge => port_interrupt::sys_interrupt_acknowledge(a1 as HandleValue),
+        S::PciConfigMint => config_mint::sys_pci_config_mint(
+            a1 as HandleValue,
+            a2 as *const huesos_abi::pci_config::PciConfigMintRequest,
+            a3 as *mut HandleValue,
+            a4,
+        ),
         S::InterruptBindPort => {
             port_interrupt::sys_interrupt_bind_port(a1 as HandleValue, a2 as HandleValue, a3)
         }

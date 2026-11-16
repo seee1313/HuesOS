@@ -78,6 +78,15 @@ pub enum ResourceKind {
     /// One-shot authority to move the boot volume key into the isolated
     /// userspace KeyBroker. Binary capability; no address range semantics.
     VolumeKey = 8,
+    /// Authority to invoke [`crate::abi::Syscall::PciConfigMint`]. A binary
+    /// capability with no meaningful base/len (forced to `(0, 1)` at mint
+    /// time). Minted exactly once by the kernel at boot for the root
+    /// userspace supervisor (`init`) and transferred by init to the
+    /// supervised driver stack; `sys_resource_create` cannot mint it, so no
+    /// other process can obtain one. It authorizes the snapshot-bound
+    /// mint of PCI configuration capabilities described by
+    /// `docs/ACPI_PCI_IMPLEMENTATION_PLAN.md` (AP-8).
+    PciConfigMint = 9,
 }
 
 /// Reason a `Resource::try_create*` call was rejected.

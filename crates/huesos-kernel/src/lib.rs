@@ -277,6 +277,7 @@ pub unsafe fn kmain(boot_info: BootInfo) -> ! {
         .get_module(boot::hbi::ModuleType::SealedKey)
         .ok();
     init::object_init(boot_measurement, sealed_key_module);
+    install_config_mint_authority(acpi_archive.as_deref(), boot_info.memory_regions);
 
     if firmware_tables_mapped && uacpi_tables_ready {
         match huesos_uacpi::Table::find(b"APIC").and_then(|table| {
@@ -492,6 +493,13 @@ fn spawn_init_process(
     } else {
         dbg("[init] failed to install FrameDraw capability\n");
     }
+    // Snapshot-bound config-mint authority (AP-8). Minted once, for
+    // the root supervisor only; no other process can obtain one.
+    if install_pci_config_mint_capability(&spawned.process) {
+        dbg("[init] installed PciConfigMint capability (handle 8)\n");
+    } else {
+        dbg("[init] failed to install PciConfigMint capability\n");
+    }
 
     let name = *b"init\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0";
     let _ = scheduler::spawn_user_thread(
@@ -501,6 +509,135 @@ fn spawn_init_process(
         spawned.user_rsp,
         spawned.cr3,
     );
+}
+
+/// Extract the MCFG table from the boot archive and hand the
+/// snapshot-bound config-mint authority to the syscall layer (AP-8).
+///
+/// Fail-closed at every step: any inconsistency — no archive, invalid
+/// MCFG, ambiguity — leaves the authority uninstalled, and
+/// `Syscall::PciConfigMint` then answers `NotSupported`. No config
+/// capability can be minted without the kernel's own boot-time view of
+/// the firmware's config windows.
+fn install_config_mint_authority(archive: Option<&[u8]>, memory_regions: &[MemoryRegion]) {
+    use huesos_abi::acpi_archive::{self, ArchiveReader};
+
+    let fail = |reason: &str| {
+        use core::fmt::Write;
+        let mut writer = huesos_arch::serial::SerialWriter;
+        let _ = writeln!(writer, "[acpi] config mint authority disabled: {reason}");
+    };
+
+    let Some(bytes) = archive else {
+        fail("no ACPI archive");
+        return;
+    };
+    let mut header = [0u8; acpi_archive::HEADER_BYTES];
+    if bytes.read_exact_at(0, &mut header).is_err() {
+        fail("archive header unreadable");
+        return;
+    }
+    let Ok(header_v2) = acpi_archive::decode_v2_header(&header) else {
+        fail("archive header rejected");
+        return;
+    };
+
+    // Locate the single MCFG table; ambiguity is rejected, never guessed.
+    let mut mcfg: Option<(u64, usize)> = None;
+    for index in 0..header_v2.table_count {
+        let entry_offset = header_v2.table_entries_offset
+            + u64::from(index) * acpi_archive::TABLE_ENTRY_BYTES as u64;
+        let mut entry_bytes = [0u8; acpi_archive::TABLE_ENTRY_BYTES];
+        if bytes.read_exact_at(entry_offset, &mut entry_bytes).is_err() {
+            fail("table directory truncated");
+            return;
+        }
+        let Ok(entry) = acpi_archive::decode_v2_table_entry(&entry_bytes) else {
+            fail("table directory entry invalid");
+            return;
+        };
+        if entry.signature == *b"MCFG" {
+            if mcfg.is_some() {
+                fail("multiple MCFG tables in archive");
+                return;
+            }
+            mcfg = Some((entry.offset, entry.length as usize));
+        }
+    }
+    let Some((mcfg_offset, mcfg_length)) = mcfg else {
+        fail("no MCFG table in archive");
+        return;
+    };
+    const MCFG_MAX_BYTES: usize = huesos_pci::mcfg::MCFG_HEADER_BYTES
+        + huesos_pci::mcfg::MAX_MCFG_ALLOCATIONS * huesos_pci::mcfg::MCFG_ALLOCATION_BYTES;
+    if !(huesos_pci::mcfg::MCFG_HEADER_BYTES..=MCFG_MAX_BYTES).contains(&mcfg_length) {
+        fail("MCFG table length out of bounds");
+        return;
+    }
+    let mut mcfg_bytes = [0u8; MCFG_MAX_BYTES];
+    if bytes
+        .read_exact_at(mcfg_offset, &mut mcfg_bytes[..mcfg_length])
+        .is_err()
+    {
+        fail("MCFG table read failed");
+        return;
+    }
+    let Ok((count, regions)) = huesos_pci::mcfg::decode_all(&mcfg_bytes[..mcfg_length]) else {
+        fail("MCFG validation failed");
+        return;
+    };
+    if count == 0 {
+        fail("MCFG contains no allocations");
+        return;
+    }
+    const MAX_WINDOWS: usize = huesos_pci::mcfg::MAX_MCFG_ALLOCATIONS;
+    let mut allocations = [huesos_abi::pci_config::EcamAllocation {
+        segment: 0,
+        start_bus: 0,
+        end_bus: 0,
+        ecam_base: 0,
+        span_bytes: 1 << 20,
+    }; MAX_WINDOWS];
+    for (index, region) in regions.iter().take(count).enumerate() {
+        allocations[index] = huesos_abi::pci_config::EcamAllocation {
+            segment: region.segment(),
+            start_bus: region.start_bus(),
+            end_bus: region.end_bus(),
+            ecam_base: region.base(),
+            span_bytes: region.end_exclusive() - region.base(),
+        };
+    }
+
+    // Retain usable-RAM regions for the alias check. Regions beyond the
+    // bound are dropped: the stash is a filter, not a memory model.
+    let mut usable = [(0u64, 0u64); huesos_syscalls::config_mint::MAX_RAM_REGIONS];
+    let mut usable_count = 0usize;
+    for region in memory_regions.iter() {
+        if usable_count == usable.len() {
+            break;
+        }
+        if region.usable && region.length > 0 {
+            usable[usable_count] = (region.base, region.length);
+            usable_count += 1;
+        }
+    }
+
+    let authority = huesos_syscalls::config_mint::ConfigAuthority::new(
+        header_v2.firmware_snapshot_id,
+        &allocations[..count],
+        &usable[..usable_count],
+    );
+    if huesos_syscalls::config_mint::install_config_authority(authority) {
+        use core::fmt::Write;
+        let mut writer = huesos_arch::serial::SerialWriter;
+        let _ = writeln!(
+            writer,
+            "[acpi] config mint authority installed: snapshot {} window(s) {}",
+            header_v2.firmware_snapshot_id, count
+        );
+    } else {
+        fail("authority already installed");
+    }
 }
 
 fn install_readonly_vmo(
@@ -594,6 +731,40 @@ fn install_acpi_broker(
 /// running without a `FrameDraw` handle — its first blit will then
 /// return `AccessDenied`, exactly the same observable behaviour the
 /// system would have if the user never started the boot.
+/// Install the [`huesos_abi::INIT_CONFIG_MINT_HANDLE`] capability for
+/// the initial process. Minted once as a binary `PciConfigMint`
+/// [`Resource`] exclusively for the root supervisor; it is the sole
+/// authority that lets a process call
+/// [`huesos_abi::Syscall::PciConfigMint`]. `sys_resource_create` cannot
+/// mint this kind, so the uniqueness does not depend on userspace good
+/// behaviour. `init` hands the handle to the supervised driver stack
+/// over a channel when it launches the ACPI/PCI managers (AP-9);
+/// no mapping or PCI authority is granted by this capability alone.
+fn install_pci_config_mint_capability(process: &huesos_object::Process) -> bool {
+    use huesos_object::{Handle, KernelObject, Resource, ResourceKind, Rights};
+
+    let Ok(resource) = Resource::try_create_exclusive(ResourceKind::PciConfigMint, 0, 1) else {
+        return false;
+    };
+    let koid = resource.koid();
+    // `DUPLICATE` is deliberately absent: the authority is unique and a
+    // copy would defeat the minted-once accounting. `TRANSFER` lets
+    // init hand the single handle to the supervised driver stack.
+    let rights = Rights::READ | Rights::TRANSFER;
+    if process
+        .handles
+        .insert_at(
+            huesos_abi::INIT_CONFIG_MINT_HANDLE,
+            Handle::new(koid, rights),
+        )
+        .is_err()
+    {
+        huesos_object::unregister_object(koid);
+        return false;
+    }
+    true
+}
+
 fn install_frame_draw_capability(process: &huesos_object::Process) -> bool {
     use huesos_object::{Handle, KernelObject, Resource, ResourceKind, Rights};
 
