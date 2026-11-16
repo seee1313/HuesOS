@@ -57,8 +57,12 @@ gates close.
   and maps every window read-only (`READ|USER|SPECIFIC`; kernel `NO_CACHE`,
   no `EXECUTE`), reporting `read-only config authority ready`; a degraded
   ACPI path settles it into explicit fail-closed `no firmware snapshot`.
-  AML reads and any topology publication remain disabled. AP-10 onwards not
-  started. See
+  AML reads stay mediated: AP-10 (`huesos-dev/ap10-config-mediation`) adds the
+  dedicated ACPI→PCI read-mediation channel — AML-visible configuration
+  reads are served by PCI Manager, every write is denied, the legacy
+  broker PCI opcodes are permanently unauthorizable, and QEMU evidence is
+  pending CI (`qemu-pci-mediation`). No topology publication. AP-11
+  onwards not started. See
   ACPI_PCI_IMPLEMENTATION_PLAN.md §7.
 
 ### Process lifecycle regression matrix

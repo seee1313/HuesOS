@@ -8,7 +8,9 @@ use crate::protocol;
 use crate::protocol::MANIFEST_GRANTS_COMPLETE_PREFIX;
 use crate::registry::{ServiceRegistry, ServiceState};
 use crate::volume_service::VolumeManagerService;
-use huesos_abi::{acpi_archive, acpi_manager, hmcf, key_broker, pci_config, pci_manager};
+use huesos_abi::{
+    acpi_archive, acpi_manager, hmcf, key_broker, pci_config, pci_manager, pci_mediation,
+};
 use libcanvas::{hbi_boot, println, storage_boot, Channel, ErrorCode, Handle, Process, Vmo};
 
 /// Fallback embedded DriverHost image (same binary packaged into BOOTFS).
@@ -214,6 +216,12 @@ pub struct DriverManager {
     /// Whether the current PCI Manager generation received its config
     /// authority burst (or the explicit authority-settled sentinel).
     config_authority_handed_off: bool,
+    /// Whether the current PCI Manager generation reported
+    /// [`pci_manager::Status::ConfigAuthorityReady`].
+    pci_config_authority_ready: bool,
+    /// Whether the private ACPI ↔ PCI mediation channel pair was
+    /// established for the current (PCI, ACPI) generation combination.
+    config_mediation_established: bool,
     /// ACPI config authority decision reached its final state for the
     /// current ACPI generation (ready processed or restart budget
     /// exhausted). Gates the settle-with-zero sentinel so a PCI Manager
@@ -374,6 +382,8 @@ impl DriverManager {
             hmcf: None,
             config_mint: None,
             config_authority_handed_off: false,
+            pci_config_authority_ready: false,
+            config_mediation_established: false,
             acpi_authority_settled: false,
             registry_channel: None,
             fs: FileSystemService::new(),
@@ -1054,11 +1064,16 @@ impl DriverManager {
             return;
         };
         self.pci_manager_generation = generation.max(1);
+        let hello = if cfg!(feature = "pci-force-legacy") {
+            pci_manager::Message::hello_with_flags(
+                self.pci_manager_generation,
+                pci_manager::HELLO_FLAG_FORCE_LEGACY,
+            )
+        } else {
+            pci_manager::Message::hello(self.pci_manager_generation)
+        };
         let mut message = [0u8; pci_manager::MESSAGE_BYTES];
-        let Some(length) = pci_manager::encode(
-            pci_manager::Message::hello(self.pci_manager_generation),
-            &mut message,
-        ) else {
+        let Some(length) = pci_manager::encode(hello, &mut message) else {
             println!("[driver-manager] PCI manager hello encode failed");
             self.schedule_pci_manager_restart();
             return;
@@ -1069,6 +1084,7 @@ impl DriverManager {
             return;
         }
         self.pci_manager_ready = false;
+        self.pci_config_authority_ready = false;
         self.config_authority_handed_off = false;
         self.pci_manager = Some(ManagedHost { process, bootstrap });
         println!(
@@ -1084,6 +1100,8 @@ impl DriverManager {
     fn schedule_pci_manager_restart(&mut self) {
         self.pci_manager = None;
         self.pci_manager_ready = false;
+        self.pci_config_authority_ready = false;
+        self.config_mediation_established = false;
         let now = libcanvas::system::monotonic_ticks().unwrap_or(0);
         if !self.pci_manager_restart.record_failure(
             now,
@@ -1241,6 +1259,7 @@ impl DriverManager {
     fn schedule_acpi_manager_restart(&mut self) {
         self.acpi_manager = None;
         self.acpi_manager_ready = false;
+        self.config_mediation_established = false;
         // A snapshot from the previous generation can never bind to the
         // next one; drop it so only a fresh validated HMCF remains. The
         // authority decision is undecided again until the next ACPI
@@ -2246,25 +2265,134 @@ impl DriverManager {
                     }
                     (pci_manager::Opcode::Ready, pci_manager::Status::ConfigAuthorityReady) => {
                         self.pci_manager_ready = true;
+                        self.pci_config_authority_ready = true;
                         self.pci_manager_restart.record_ready();
-                        println!(
-                            "[driver-manager] PCI manager ready (read-only config authority, windows {})",
-                            message.detail
-                        );
+                        if cfg!(feature = "pci-force-legacy") {
+                            println!("[driver-manager] PCI manager ready (legacy CF8/CFC backend)");
+                        } else {
+                            println!(
+                                "[driver-manager] PCI manager ready (read-only config authority, windows {})",
+                                message.detail
+                            );
+                        }
                     }
                     (pci_manager::Opcode::Heartbeat, _) => {}
                     _ => println!("[driver-manager] unexpected PCI manager control message"),
                 }
                 self.pci_manager = Some(host);
+                self.maybe_publish_mediation();
             }
             Err(ErrorCode::ShouldWait) | Err(ErrorCode::TimedOut) => {
                 self.pci_manager = Some(host);
+                self.maybe_publish_mediation();
             }
             Err(error) => {
                 println!(
                     "[driver-manager] PCI manager channel failed: {}; disabling new PCI operations",
                     error.as_str()
                 );
+                self.schedule_pci_manager_restart();
+            }
+        }
+    }
+
+    /// Create and transfer the private ACPI ↔ PCI mediation channel
+    /// pair once both supervised managers in the current combination
+    /// are ready (and PCI configuration authority is granted).
+    ///
+    /// One end goes to PCI Manager (label
+    /// [`pci_mediation::MEDIATION_CHANNEL_LABEL`]) as the serving side,
+    /// the other to the ACPI manager as the requesting side, followed by
+    /// a plain `pci-config-read-gen:<pci generation>` announcement on the
+    /// ACPI manager's bootstrap channel so the requester can bind its
+    /// requests to the right PCI generation.
+    ///
+    /// Idempotent per (PCI, ACPI) generation combination; both restarts
+    /// reset `config_mediation_established` so the pair is rebuilt. If
+    /// either transfer fails, both ends are dropped and the affected
+    /// manager is restarted so a fresh pair is attempted next time.
+    fn maybe_publish_mediation(&mut self) {
+        if self.config_mediation_established {
+            return;
+        }
+        if !self.pci_config_authority_ready || !self.acpi_manager_ready {
+            return;
+        }
+        let Some(pci) = self.pci_manager.take() else {
+            return;
+        };
+        let Some(acpi) = self.acpi_manager.take() else {
+            self.pci_manager = Some(pci);
+            return;
+        };
+        let pci = pci;
+        let acpi = acpi;
+        let _keep_processes_alive = (&pci.process, &acpi.process);
+        let pair = Channel::pair();
+        let setup = (|| {
+            let (pci_end, acpi_end) = pair.ok()?;
+            match pci.bootstrap.write_handle(
+                pci_mediation::MEDIATION_CHANNEL_LABEL,
+                pci_end.into_handle(),
+            ) {
+                Ok(()) => {}
+                Err((_error, returned)) => {
+                    drop(returned);
+                    return None;
+                }
+            }
+            match acpi.bootstrap.write_handle(
+                pci_mediation::MEDIATION_CHANNEL_LABEL,
+                acpi_end.into_handle(),
+            ) {
+                Ok(()) => {}
+                Err((_error, returned)) => {
+                    drop(returned);
+                    return None;
+                }
+            }
+            // Announcement: plain bytes on the ACPI bootstrap channel.
+            // Ordering is guaranteed by channel FIFO semantics: the
+            // channel end precedes this announcement.
+            let mut announce = [0u8; 64];
+            let prefix = pci_mediation::MEDIATION_GENERATION_PREFIX;
+            announce[..prefix.len()].copy_from_slice(prefix);
+            let mut length = prefix.len();
+            let mut digits = [0u8; 20];
+            let mut digit_count = 0usize;
+            let mut value = self.pci_manager_generation;
+            loop {
+                digits[digit_count] = b'0' + (value % 10) as u8;
+                digit_count += 1;
+                value /= 10;
+                if value == 0 {
+                    break;
+                }
+            }
+            for index in 0..digit_count {
+                announce[length] = digits[digit_count - 1 - index];
+                length += 1;
+            }
+            acpi.bootstrap.write(&announce[..length]).ok()?;
+            Some(())
+        })();
+        match setup {
+            Some(()) => {
+                self.config_mediation_established = true;
+                println!(
+                    "[driver-manager] mediation channel pair established for pci generation {} acpi generation {}",
+                    self.pci_manager_generation, self.acpi_manager_generation
+                );
+                self.pci_manager = Some(pci);
+                self.acpi_manager = Some(acpi);
+            }
+            None => {
+                println!(
+                    "[driver-manager] mediation channel pair failed; restarting supervised managers"
+                );
+                drop(acpi);
+                drop(pci);
+                self.schedule_acpi_manager_restart();
                 self.schedule_pci_manager_restart();
             }
         }
@@ -2330,9 +2458,15 @@ impl DriverManager {
                     self.settle_config_authority(host);
                     return;
                 };
+                let force_legacy = cfg!(feature = "pci-force-legacy");
+                let expected_capabilities = if force_legacy { 1 } else { record_count };
                 let request = pci_config::PciConfigMintRequest {
                     version: pci_config::MINT_REQUEST_VERSION,
-                    kind: pci_config::MINT_KIND_ECAM_WINDOWS,
+                    kind: if force_legacy {
+                        pci_config::MINT_KIND_LEGACY_CF8_CFC
+                    } else {
+                        pci_config::MINT_KIND_ECAM_WINDOWS
+                    },
                     reserved: 0,
                     firmware_snapshot_id: snapshot,
                     producer_generation,
@@ -2340,11 +2474,11 @@ impl DriverManager {
                 };
                 match libcanvas::pci_config::mint(authority, &request) {
                     Ok(mut capabilities) => {
-                        if capabilities.len() != record_count {
+                        if capabilities.len() != expected_capabilities {
                             println!(
-                                "[driver-manager] config capability mint rejected: {} capability(ies) for {} HMCF record(s)",
+                                "[driver-manager] config capability mint rejected: {} capability(ies), expected {}",
                                 capabilities.len(),
-                                record_count
+                                expected_capabilities
                             );
                             self.settle_config_authority(host);
                             return;
@@ -2353,8 +2487,9 @@ impl DriverManager {
                             &host,
                             hmcf_vmo,
                             &mut capabilities,
-                            record_count,
+                            expected_capabilities,
                             self.pci_manager_generation,
+                            force_legacy,
                         ) {
                             // Mid-burst failure: drop the host so the
                             // child exits on PEER_CLOSED and the restart
@@ -2368,10 +2503,17 @@ impl DriverManager {
                         }
                         self.config_authority_handed_off = true;
                         self.pci_manager = Some(host);
-                        println!(
-                            "[driver-manager] minted {} read-only config capability(ies) for PCI manager generation {} (snapshot {})",
-                            record_count, self.pci_manager_generation, snapshot
-                        );
+                        if force_legacy {
+                            println!(
+                                "[driver-manager] minted legacy CF8/CFC capability for PCI manager generation {} (snapshot {})",
+                                self.pci_manager_generation, snapshot
+                            );
+                        } else {
+                            println!(
+                                "[driver-manager] minted {} read-only config capability(ies) for PCI manager generation {} (snapshot {})",
+                                record_count, self.pci_manager_generation, snapshot
+                            );
+                        }
                     }
                     Err(error) => {
                         println!(
@@ -2556,6 +2698,7 @@ impl DriverManager {
                             );
                             self.acpi_authority_settled = true;
                             self.handoff_config_authority();
+                            self.maybe_publish_mediation();
                         }
                         (acpi_manager::Opcode::Heartbeat, acpi_manager::Status::Ok) => {
                             self.acpi_heartbeat_count = self.acpi_heartbeat_count.wrapping_add(1);
@@ -2680,6 +2823,7 @@ fn send_config_authority_burst(
     capabilities: &mut libcanvas::pci_config::MintedConfigCapabilities,
     count: usize,
     generation: u64,
+    force_legacy: bool,
 ) -> bool {
     let Ok(hmcf_duplicate) =
         hmcf_vmo.duplicate(huesos_abi::rights::READ | huesos_abi::rights::TRANSFER)
@@ -2697,23 +2841,42 @@ fn send_config_authority_burst(
         );
         return false;
     }
-    for index in 0..count {
-        let Some(handle) = capabilities.take(index) else {
+    if force_legacy {
+        let Some(handle) = capabilities.take(0) else {
             println!(
-                "[driver-manager] config authority transfer failed: capability {} missing",
-                index
+                "[driver-manager] config authority transfer failed: legacy capability missing"
             );
             return false;
         };
         if let Err((error, _handle)) = host
             .bootstrap
-            .write_handle(pci_manager::CONFIG_ECAM_LABEL, handle)
+            .write_handle(pci_manager::LEGACY_IOPORT_LABEL, handle)
         {
             println!(
                 "[driver-manager] config authority transfer failed: {}",
                 error.as_str()
             );
             return false;
+        }
+    } else {
+        for index in 0..count {
+            let Some(handle) = capabilities.take(index) else {
+                println!(
+                    "[driver-manager] config authority transfer failed: capability {} missing",
+                    index
+                );
+                return false;
+            };
+            if let Err((error, _handle)) = host
+                .bootstrap
+                .write_handle(pci_manager::CONFIG_ECAM_LABEL, handle)
+            {
+                println!(
+                    "[driver-manager] config authority transfer failed: {}",
+                    error.as_str()
+                );
+                return false;
+            }
         }
     }
     let message = pci_manager::Message::authority_complete(generation, count as u32);

@@ -38,7 +38,7 @@ pub mod knobs;
 /// `SystemObservationRead`.
 pub mod observation;
 
-pub use acpi_broker::{AcpiBroker, PciFunctionGrant, SystemIoGrant};
+pub use acpi_broker::{AcpiBroker, SystemIoGrant};
 pub use channel::{
     Channel, ChannelCreateError, ChannelMessage, ChannelRecvError, ChannelSendError,
     ChannelSendFailure, CHANNEL_INLINE_BYTES, CHANNEL_INLINE_HANDLES,

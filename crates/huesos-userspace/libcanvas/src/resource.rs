@@ -187,6 +187,49 @@ impl IoPort {
         let value = raw::decode(ret)?;
         Ok(value as u8)
     }
+
+    /// Write one 16-bit value to `port`. `port` must be 2-byte aligned
+    /// and inside the resource range; `port == 0xCF8` (legacy config
+    /// address) is the motivating client.
+    pub fn write_u16(&self, port: u16, value: u16) -> Result<()> {
+        let ret = raw::syscall3(
+            Syscall::IoPortWrite16,
+            self.handle.raw() as u64,
+            port as u64,
+            u64::from(value),
+        );
+        raw::decode(ret)?;
+        Ok(())
+    }
+
+    /// Read one 16-bit value from `port`. Same contract as
+    /// [`Self::write_u16`].
+    pub fn read_u16(&self, port: u16) -> Result<u16> {
+        let ret = raw::syscall2(Syscall::IoPortRead16, self.handle.raw() as u64, port as u64);
+        let value = raw::decode(ret)?;
+        Ok(value as u16)
+    }
+
+    /// Write one 32-bit value to `port`. `port` must be 4-byte aligned
+    /// and inside the resource range.
+    pub fn write_u32(&self, port: u16, value: u32) -> Result<()> {
+        let ret = raw::syscall3(
+            Syscall::IoPortWrite32,
+            self.handle.raw() as u64,
+            port as u64,
+            u64::from(value),
+        );
+        raw::decode(ret)?;
+        Ok(())
+    }
+
+    /// Read one 32-bit value from `port`. Same contract as
+    /// [`Self::write_u32`].
+    pub fn read_u32(&self, port: u16) -> Result<u32> {
+        let ret = raw::syscall2(Syscall::IoPortRead32, self.handle.raw() as u64, port as u64);
+        let value = raw::decode(ret)?;
+        Ok(value as u32)
+    }
 }
 
 /// Invoke the kernel's capability-gated atomic halt. Never returns on

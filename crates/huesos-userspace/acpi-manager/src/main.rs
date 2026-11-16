@@ -178,6 +178,8 @@ pub extern "C" fn _start() -> ! {
 
     let mut fallback_ticks = 0u64;
     let mut last_heartbeat = monotonic_or(&mut fallback_ticks);
+    let mut mediation: Option<libcanvas::pci_mediation::MediationRequester> = None;
+    let mut last_self_test: Option<u64> = None;
     loop {
         let now = monotonic_or(&mut fallback_ticks);
         if now.saturating_sub(last_heartbeat) >= 100 {
@@ -192,7 +194,112 @@ pub extern "C" fn _start() -> ! {
             }
             last_heartbeat = now;
         }
+        drain_mediation_bootstrap(
+            &bootstrap,
+            &mut mediation,
+            &mut last_self_test,
+            generation,
+            summary.firmware_snapshot_id,
+        );
         libcanvas::process::yield_now();
+    }
+}
+
+/// Drain any mediation-channel traffic that arrives after readiness:
+/// the one private channel end (label
+/// [`huesos_abi::pci_mediation::MEDIATION_CHANNEL_LABEL`]) and the
+/// plain `pci-config-read-gen:<generation>` announcement that binds the
+/// PCI Manager generation. Once both are present and the PCI generation
+/// differs from the last self-tested one, a bounded self-test runs to
+/// produce structured boot evidence (one known host-bridge read plus an
+/// attempt write that must be denied before hardware access).
+fn drain_mediation_bootstrap(
+    bootstrap: &Channel,
+    mediation: &mut Option<libcanvas::pci_mediation::MediationRequester>,
+    last_self_test: &mut Option<u64>,
+    generation: u64,
+    firmware_snapshot_id: u64,
+) {
+    let mut bytes = [0u8; 64];
+    for _ in 0..4 {
+        match bootstrap.read_optional_handle(&mut bytes) {
+            Ok((length, Some(handle)))
+                if &bytes[..length] == huesos_abi::pci_mediation::MEDIATION_CHANNEL_LABEL =>
+            {
+                if mediation.is_none() {
+                    *mediation = Some(libcanvas::pci_mediation::MediationRequester::new(
+                        Channel::from_handle(handle),
+                        generation,
+                        firmware_snapshot_id,
+                    ));
+                } else {
+                    drop(handle);
+                }
+            }
+            Ok((_length, Some(handle))) => drop(handle),
+            Ok((length, None)) => {
+                if let Some(pci_generation) = parse_generation_announcement(&bytes[..length]) {
+                    if let Some(requester) = mediation.as_mut() {
+                        requester.set_pci_generation(pci_generation);
+                    }
+                }
+            }
+            Err(ErrorCode::ShouldWait) | Err(ErrorCode::TimedOut) => break,
+            Err(_) => break,
+        }
+    }
+    if let Some(pci_generation) = mediation
+        .as_ref()
+        .and_then(libcanvas::pci_mediation::MediationRequester::pci_generation)
+    {
+        if *last_self_test != Some(pci_generation) {
+            *last_self_test = Some(pci_generation);
+            if let Some(requester) = mediation.as_ref() {
+                run_mediation_self_test(requester);
+            }
+        }
+    }
+}
+
+/// Parse `pci-config-read-gen:<decimal>` with a non-zero result.
+fn parse_generation_announcement(bytes: &[u8]) -> Option<u64> {
+    let rest = bytes.strip_prefix(huesos_abi::pci_mediation::MEDIATION_GENERATION_PREFIX)?;
+    if rest.is_empty() || rest.len() > 20 {
+        return None;
+    }
+    let mut value = 0u64;
+    for &digit in rest {
+        if !digit.is_ascii_digit() {
+            return None;
+        }
+        value = value
+            .checked_mul(10)?
+            .checked_add(u64::from(digit - b'0'))?;
+    }
+    (value != 0).then_some(value)
+}
+
+/// One bounded probe through the mediation channel. Pure evidence:
+/// failures are logged, never fatal.
+fn run_mediation_self_test(requester: &libcanvas::pci_mediation::MediationRequester) {
+    match requester.read(0, 0, 0, 0, 0x00, 4) {
+        Ok(value) => println!(
+            "[acpi-manager] pci-mediation self-test: read=ok vendor-nonzero={}",
+            (value & 0xffff) != 0 && (value & 0xffff) != 0xffff
+        ),
+        Err(error) => println!(
+            "[acpi-manager] pci-mediation self-test: read={}",
+            error.as_str()
+        ),
+    }
+    // Host bridges reject configuration writes to the vendor/device ID
+    // register; either way the mediator must answer denial.
+    match requester.write_denied(0, 0, 0, 0, 0x00, 4) {
+        Ok(()) => println!("[acpi-manager] pci-mediation self-test: write=denied"),
+        Err(error) => println!(
+            "[acpi-manager] pci-mediation self-test: write={}",
+            error.as_str()
+        ),
     }
 }
 

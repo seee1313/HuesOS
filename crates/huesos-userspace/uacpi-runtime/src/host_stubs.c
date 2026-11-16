@@ -36,6 +36,9 @@ void uacpi_kernel_log(uacpi_log_level level, const uacpi_char *message)
     (void)message;
 }
 
+#ifndef HUESOS_UACPI_RUST_PCI
+/* AP-10: the Rust callbacks in src/pci.rs replace this family in the
+ * userspace build. The default stays fail-closed for the host smoke. */
 uacpi_status uacpi_kernel_pci_device_open(
     uacpi_pci_address address, uacpi_handle *out_handle)
 {
@@ -106,6 +109,7 @@ uacpi_status uacpi_kernel_pci_write32(
     (void)value;
     return UACPI_STATUS_DENIED;
 }
+#endif /* HUESOS_UACPI_RUST_PCI */
 
 uacpi_status uacpi_kernel_io_map(
     uacpi_io_addr base, uacpi_size length, uacpi_handle *out_handle)

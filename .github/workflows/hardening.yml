@@ -126,6 +126,44 @@ jobs:
           path: ci-artifacts/
           if-no-files-found: warn
 
+  qemu-pci-mediation:
+    # AP-10: the dedicated ACPI ↔ PCI mediation channel. The `ecam`
+    # scenario is the ordinary Q35 boot; the `legacy` scenario forces
+    # the conformance-only CF8/CFC common-subset backend through
+    # HUESOS_PCI_FORCE_LEGACY=1 (both managers are rebuilt with their
+    # matching features). Both must show the mediation pair established
+    # by DriverManager and a bounded self-test probe issued through the
+    # channel by the ACPI manager; neither may publish an inventory.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            gcc xorriso qemu-system-x86 swtpm swtpm-tools
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install nightly-2026-03-01 --profile minimal \
+            --component rust-src,llvm-tools-preview
+          rustup default nightly-2026-03-01
+      - name: PCI mediation smoke (ECAM backend)
+        env:
+          CARGO_BUILD_JOBS: "1"
+        run: bash scripts/ci-qemu-pci-mediation-smoke.sh release 2 120 ecam
+      - name: PCI mediation smoke (forced legacy CF8/CFC backend)
+        env:
+          CARGO_BUILD_JOBS: "1"
+        run: bash scripts/ci-qemu-pci-mediation-smoke.sh release 2 120 legacy
+      - name: Upload serial log
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: qemu-pci-mediation-release-smp2
+          path: ci-artifacts/
+          if-no-files-found: warn
+
   qemu-acpi-restart:
     # AP-6 lifecycle gates, scenario `restart` and scenario `budget`. The root
     # supervisor must retain/duplicate archive+broker capabilities, freeze new

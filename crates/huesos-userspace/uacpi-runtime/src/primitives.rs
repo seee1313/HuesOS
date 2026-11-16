@@ -79,26 +79,46 @@ pub fn dispatch_suppressed() -> bool {
     DISPATCH_DEPTH.load(Ordering::Acquire) != 0
 }
 
-/// Allocate one max-align-compatible uACPI object from the process allocator.
-#[unsafe(no_mangle)]
-pub extern "C" fn uacpi_kernel_alloc(size: usize) -> *mut c_void {
+/// Store one scalar into caller-validated output storage. All host
+/// callbacks that write `out_*` results funnel through this single site
+/// so the crate's unsafe surface stays minimal and auditable.
+pub(crate) fn store_scalar<T>(slot: *mut T, value: T) {
+    // SAFETY: callers validate the output pointer non-null before
+    // calling and the pointee outlives the call (uACPI stack frame);
+    // each call writes exactly one `T`.
+    unsafe {
+        *slot = value;
+    }
+}
+
+/// Shared allocator front-end. `zeroed` selects zero-filled frames;
+/// the allocation contract (max-align, handed to uACPI, returned through
+/// the matching sized-free callback) is identical either way.
+fn alloc_impl(size: usize, zeroed: bool) -> *mut c_void {
     let Some(layout) = allocation_layout(size) else {
         return core::ptr::null_mut();
     };
     // SAFETY: layout is valid and the returned pointer is handed to uACPI,
-    // which returns it through the matching sized-free callback.
-    unsafe { alloc(layout).cast() }
+    // which returns it through the matching sized-free callback. On the
+    // zeroed path every byte is additionally initialized.
+    unsafe {
+        match zeroed {
+            true => alloc_zeroed(layout).cast(),
+            false => alloc(layout).cast(),
+        }
+    }
+}
+
+/// Allocate one max-align-compatible uACPI object from the process allocator.
+#[unsafe(no_mangle)]
+pub extern "C" fn uacpi_kernel_alloc(size: usize) -> *mut c_void {
+    alloc_impl(size, false)
 }
 
 /// Allocate one zero-filled max-align-compatible uACPI object.
 #[unsafe(no_mangle)]
 pub extern "C" fn uacpi_kernel_alloc_zeroed(size: usize) -> *mut c_void {
-    let Some(layout) = allocation_layout(size) else {
-        return core::ptr::null_mut();
-    };
-    // SAFETY: same allocation contract as uacpi_kernel_alloc; alloc_zeroed
-    // additionally initializes every byte in the valid layout.
-    unsafe { alloc_zeroed(layout).cast() }
+    alloc_impl(size, true)
 }
 
 /// Release an allocation using uACPI's exact size hint.

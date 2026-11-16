@@ -229,35 +229,93 @@ pub(crate) fn sys_ioport_write8(
     port: u32,
     value: u32,
 ) -> SyscallResult {
-    let guard = require_resource_of_kind(resource_handle, ResourceKind::IoPort)?;
-    let resource = guard
-        .downcast_ref::<Resource>()
-        .ok_or(ErrorCode::WrongType)?;
-    // Port must fit in u16 (x86 architectural limit) and lie entirely
-    // inside the resource's granted range.
-    let port_u16 = u16::try_from(port).map_err(|_| ErrorCode::InvalidArgs)?;
-    if !resource.contains(ResourceKind::IoPort, u64::from(port_u16), 1) {
-        return Err(ErrorCode::AccessDenied);
-    }
-    let byte = (value & 0xff) as u8;
-    // SAFETY: the port is inside a range the caller was granted; the
-    // ranged capability check above has been performed under the
-    // current handle-table lock. `Port::write` performs a single `out`
-    // instruction to a validated port.
-    unsafe { x86_64::instructions::port::Port::<u8>::new(port_u16).write(byte) };
+    let port_u16 = ioport_check(resource_handle, port, 1)?;
+    ioport_write(port_u16, 1, u64::from(value));
     Ok(0)
 }
 
 pub(crate) fn sys_ioport_read8(resource_handle: HandleValue, port: u32) -> SyscallResult {
+    let port_u16 = ioport_check(resource_handle, port, 1)?;
+    Ok(ioport_read(port_u16, 1) as i64)
+}
+
+/// Shared capability/range/alignment gate for the 8/16/32-bit I/O port
+/// operations. The caller must own an `IoPort` resource whose
+/// `[base, base+len)` range contains the access, and the access must be
+/// naturally aligned for its width. Rights are enforced by minting
+/// discipline (the legacy CF8/CFC authority carries READ|WRITE); the
+/// alignment check the wider instructions require is applied for every
+/// width.
+fn ioport_check(resource_handle: HandleValue, port: u32, width: u64) -> Result<u16, ErrorCode> {
     let guard = require_resource_of_kind(resource_handle, ResourceKind::IoPort)?;
     let resource = guard
         .downcast_ref::<Resource>()
         .ok_or(ErrorCode::WrongType)?;
     let port_u16 = u16::try_from(port).map_err(|_| ErrorCode::InvalidArgs)?;
-    if !resource.contains(ResourceKind::IoPort, u64::from(port_u16), 1) {
+    if width != 0 && u64::from(port_u16) & (width - 1) != 0 {
+        return Err(ErrorCode::InvalidArgs);
+    }
+    if !resource.contains(ResourceKind::IoPort, u64::from(port_u16), width) {
         return Err(ErrorCode::AccessDenied);
     }
-    // SAFETY: same capability contract as sys_ioport_write8 above.
-    let byte: u8 = unsafe { x86_64::instructions::port::Port::<u8>::new(port_u16).read() };
-    Ok(i64::from(byte))
+    Ok(port_u16)
+}
+
+/// Perform one `in` instruction of the given width. The port has already
+/// passed [`ioport_check`]; rights are enforced by minting discipline.
+fn ioport_read(port: u16, width: u64) -> u64 {
+    // SAFETY: the port lies inside a range the caller was granted; the
+    // capability gate has been performed. Each arm executes exactly one
+    // `in` instruction of the requested (naturally aligned) width.
+    unsafe {
+        match width {
+            1 => u64::from(x86_64::instructions::port::Port::<u8>::new(port).read()),
+            2 => u64::from(x86_64::instructions::port::Port::<u16>::new(port).read()),
+            _ => u64::from(x86_64::instructions::port::Port::<u32>::new(port).read()),
+        }
+    }
+}
+
+/// Perform one `out` instruction of the given width. Same contract as
+/// [`ioport_read`].
+fn ioport_write(port: u16, width: u64, value: u64) {
+    // SAFETY: same capability contract as `ioport_read`; each arm
+    // executes exactly one `out` instruction of the requested width.
+    unsafe {
+        match width {
+            1 => x86_64::instructions::port::Port::<u8>::new(port).write(value as u8),
+            2 => x86_64::instructions::port::Port::<u16>::new(port).write(value as u16),
+            _ => x86_64::instructions::port::Port::<u32>::new(port).write(value as u32),
+        }
+    }
+}
+
+pub(crate) fn sys_ioport_read16(resource_handle: HandleValue, port: u32) -> SyscallResult {
+    let port_u16 = ioport_check(resource_handle, port, 2)?;
+    Ok(ioport_read(port_u16, 2) as i64)
+}
+
+pub(crate) fn sys_ioport_write16(
+    resource_handle: HandleValue,
+    port: u32,
+    value: u32,
+) -> SyscallResult {
+    let port_u16 = ioport_check(resource_handle, port, 2)?;
+    ioport_write(port_u16, 2, u64::from(value));
+    Ok(0)
+}
+
+pub(crate) fn sys_ioport_read32(resource_handle: HandleValue, port: u32) -> SyscallResult {
+    let port_u16 = ioport_check(resource_handle, port, 4)?;
+    Ok(ioport_read(port_u16, 4) as i64)
+}
+
+pub(crate) fn sys_ioport_write32(
+    resource_handle: HandleValue,
+    port: u32,
+    value: u32,
+) -> SyscallResult {
+    let port_u16 = ioport_check(resource_handle, port, 4)?;
+    ioport_write(port_u16, 4, u64::from(value));
+    Ok(0)
 }

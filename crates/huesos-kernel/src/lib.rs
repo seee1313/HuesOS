@@ -693,13 +693,11 @@ fn install_acpi_broker(
 ) -> bool {
     use huesos_object::{Handle, KernelObject, Rights};
 
-    let broker = huesos_object::AcpiBroker::with_policy(
-        system_io,
-        alloc::vec::Vec::new(),
-        alloc::vec::Vec::new(),
-        false,
-        false,
-    );
+    // AP-10: the PCI grant list is gone — the broker can never
+    // authorize PCI configuration opcodes. Configuration access flows
+    // through the dedicated mediated channel to PCI Manager.
+    let broker =
+        huesos_object::AcpiBroker::with_policy(system_io, alloc::vec::Vec::new(), false, false);
     let koid = broker.koid();
     huesos_object::register_object(broker);
     let rights = Rights::READ | Rights::WRITE | Rights::DUPLICATE | Rights::TRANSFER;
