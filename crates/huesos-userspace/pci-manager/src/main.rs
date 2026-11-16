@@ -12,6 +12,23 @@
 //! PCI configuration space byte is ever read and no topology is
 //! exposed; AML-mediated access lands with AP-10.
 //!
+//! AP-10 additionally:
+//!
+//! * accepts one private mediation channel end (label
+//!   [`huesos_abi::pci_mediation::MEDIATION_CHANNEL_LABEL`]) once the
+//!   configuration authority is granted, and serves fixed-size
+//!   [`huesos_abi::pci_mediation::Request`]s on it;
+//! * performs the physical configuration access itself — read-only
+//!   ECAM mappings for the normal backend, or the legacy CF8/CFC
+//!   common subset under the conformance-only `force-legacy` feature;
+//! * answers every write attempt with [`huesos_abi::pci_mediation::Status::AccessDenied`]
+//!   before any hardware access;
+//! * binds requests to both manager generations plus the retained
+//!   `HMCF` snapshot identity (stale requests are answered, never
+//!   executed);
+//! * logs one structured observation line per request (op, status,
+//!   latency, backend) with stable `obs key=value` keys for CI.
+//!
 //! Readiness is two-phase: an immediate fail-closed `Ready` at
 //! startup (unchanged contract), then — only after a valid authority
 //! burst decodes, validates and maps — a `Ready` with
@@ -23,12 +40,21 @@
 use core::panic::PanicInfo;
 use huesos_abi::hmcf;
 use huesos_abi::pci_manager::{self, Message, Opcode, Status, MESSAGE_BYTES};
+use huesos_abi::pci_mediation::{
+    self, Opcode as MediationOpcode, Request, Response, Status as MediationStatus, ValidRequest,
+    ValidationError,
+};
+#[cfg(not(feature = "force-legacy"))]
 use huesos_abi::vmar_flags;
 use libcanvas::{println, wait_any, Channel, ErrorCode, Handle, Signals, Vmo, WaitItem};
+
+#[cfg(feature = "force-legacy")]
+use libcanvas::resource::IoPort;
 
 /// Private, per-manager mapping base for the read-only ECAM windows.
 /// Each window is mapped at the next page boundary after the previous
 /// one; the region is far from the heap and stack reservations.
+#[cfg(not(feature = "force-legacy"))]
 const CONFIG_WINDOW_VA_BASE: u64 = 0x0000_0001_0000_0000;
 
 #[unsafe(no_mangle)]
@@ -65,6 +91,9 @@ pub extern "C" fn _start() -> ! {
             Err(ErrorCode::ShouldWait) | Err(ErrorCode::TimedOut) => {}
             Err(_) => libcanvas::process::exit(0),
         }
+        if authority.authorized {
+            serve_mediation(&mut authority, hello.manager_generation);
+        }
 
         yields = yields.wrapping_add(1);
         if yields.is_multiple_of(65_536) {
@@ -87,10 +116,34 @@ struct ConfigAuthority {
     hmcf: Option<Vmo>,
     ecam: [Option<Handle>; hmcf::MAX_RECORDS as usize],
     ecam_count: usize,
+    /// Retained decoded window table, filled in canonical record order
+    /// by `finish_authority`. Never re-decoded; the mapping bases below
+    /// are the only valid targets for configuration reads.
+    windows: [Option<WindowMapping>; hmcf::MAX_RECORDS as usize],
+    windows_len: usize,
+    firmware_snapshot_id: u64,
+    producer_generation: u64,
+    #[cfg(feature = "force-legacy")]
+    legacy_ioport: Option<IoPort>,
+    mediation: Option<Channel>,
     /// A fail-closed verdict was already reported; further bursts are
     /// ignored rather than double-reported.
     verdict_sent: bool,
     authorized: bool,
+}
+
+/// One retained, mapped configuration window.
+#[derive(Clone, Copy)]
+struct WindowMapping {
+    segment: u16,
+    bus_start: u8,
+    bus_end: u8,
+    /// First byte addressable in the mapped read-only region.
+    #[cfg_attr(feature = "force-legacy", allow(dead_code))]
+    va_base: u64,
+    /// Total mapped span in bytes.
+    #[cfg_attr(feature = "force-legacy", allow(dead_code))]
+    span_bytes: u64,
 }
 
 impl Default for ConfigAuthority {
@@ -99,6 +152,13 @@ impl Default for ConfigAuthority {
             hmcf: None,
             ecam: [const { None }; hmcf::MAX_RECORDS as usize],
             ecam_count: 0,
+            windows: [const { None }; hmcf::MAX_RECORDS as usize],
+            windows_len: 0,
+            firmware_snapshot_id: 0,
+            producer_generation: 0,
+            #[cfg(feature = "force-legacy")]
+            legacy_ioport: None,
+            mediation: None,
             verdict_sent: false,
             authorized: false,
         }
@@ -115,15 +175,34 @@ fn handle_authority_message(
     manager_generation: u64,
 ) -> bool {
     if authority.authorized {
-        // Nothing more is accepted once authority is granted; a stray
-        // handle must not accumulate.
-        if handle.is_some() {
-            drop(handle);
+        // The only post-authority capability accepted is the one private
+        // mediation channel end. Anything else is dropped without a word.
+        if let Some(handle) = handle {
+            if bytes == huesos_abi::pci_mediation::MEDIATION_CHANNEL_LABEL
+                && authority.mediation.is_none()
+            {
+                authority.mediation = Some(Channel::from_handle(handle));
+                println!(
+                    "[pci-manager] mediation channel established generation {}",
+                    manager_generation
+                );
+            } else {
+                drop(handle);
+            }
         }
         return true;
     }
     match handle {
         Some(handle) => {
+            #[cfg(feature = "force-legacy")]
+            if bytes == pci_manager::LEGACY_IOPORT_LABEL {
+                if authority.legacy_ioport.is_some() {
+                    println!("[pci-manager] legacy backend rejected: duplicate capability");
+                    return reject_authority(bootstrap, authority, manager_generation);
+                }
+                authority.legacy_ioport = Some(IoPort::from_handle(handle));
+                return true;
+            }
             if bytes == pci_manager::HMCF_VMO_LABEL {
                 if authority.hmcf.is_some() {
                     println!("[pci-manager] HMCF rejected: duplicate snapshot");
@@ -223,63 +302,143 @@ fn finish_authority(
             return reject_authority(bootstrap, authority, manager_generation);
         }
     };
+    #[cfg_attr(feature = "force-legacy", allow(unused_variables))]
     let record_count = view.record_count();
-    if authority.ecam_count != record_count || declared_count as usize != record_count {
-        println!(
-            "[pci-manager] HMCF rejected: {} capability(ies) for {} record(s)",
-            authority.ecam_count, record_count
-        );
-        return reject_authority(bootstrap, authority, manager_generation);
-    }
-
-    // Map every window read-only at private virtual addresses. The
-    // kernel enforces READ-only (the capability carries no WRITE
-    // right), `NO_CACHE` for Mmio resources and no executable mapping;
-    // validation here is the cheap userspace half of the contract.
-    let mut next_va = CONFIG_WINDOW_VA_BASE;
-    let mut mapped = 0usize;
-    for (index, record) in view.records().enumerate() {
-        if record.ecam_base & 0xF_FFFF != 0 || record.span_bytes & 0xF_FFFF != 0 {
-            println!("[pci-manager] HMCF rejected: misaligned window geometry");
+    #[cfg(feature = "force-legacy")]
+    {
+        // Forced legacy backend: exactly one IoPort capability
+        // (CF8/CFC) is expected, no ECAM windows. The HMCF image is
+        // still required: requests are bound to its generations and
+        // snapshot identity, and its bus maps bound the common subset.
+        if authority.legacy_ioport.is_none() {
+            println!("[pci-manager] legacy backend requires the CF8/CFC capability");
             return reject_authority(bootstrap, authority, manager_generation);
         }
-        let Some(handle) = authority.ecam[index].take() else {
-            println!("[pci-manager] HMCF rejected: capability {} missing", index);
-            return reject_authority(bootstrap, authority, manager_generation);
-        };
-        let result = libcanvas::resource::map_self(
-            &handle,
-            0,
-            next_va,
-            record.span_bytes,
-            vmar_flags::READ | vmar_flags::USER | vmar_flags::SPECIFIC,
-        );
-        // The mapping keeps the resource alive via a kernel reference;
-        // the userspace handle is safe to drop after mapping.
-        drop(handle);
-        if let Err(error) = result {
+        if declared_count != 1 {
             println!(
-                "[pci-manager] read-only config authority map rejected: {}",
-                error.as_str()
+                "[pci-manager] legacy backend rejected: {} declared capability(ies), expected 1",
+                declared_count
             );
             return reject_authority(bootstrap, authority, manager_generation);
         }
-        mapped += 1;
-        next_va = next_va.saturating_add(record.span_bytes);
+        if authority.ecam_count != 0 {
+            println!("[pci-manager] legacy backend rejected: ECAM capability in legacy burst");
+            return reject_authority(bootstrap, authority, manager_generation);
+        }
+        // Retain the window table (bus maps and segment ids) without
+        // mapping anything; reads go through CF8/CFC.
+        let mut windows_len = 0usize;
+        for record in view.records() {
+            if windows_len >= authority.windows.len() {
+                break;
+            }
+            authority.windows[windows_len] = Some(WindowMapping {
+                segment: record.segment,
+                bus_start: record.start_bus,
+                bus_end: record.end_bus,
+                va_base: 0,
+                span_bytes: record.span_bytes,
+            });
+            windows_len += 1;
+        }
+        authority.windows_len = windows_len;
+        authority.firmware_snapshot_id = view.firmware_snapshot_id();
+        authority.producer_generation = view.producer_generation();
+        authority.authorized = true;
+        println!(
+            "[pci-manager] legacy CF8/CFC config reads ready: snapshot {}, producer generation {}",
+            authority.firmware_snapshot_id, authority.producer_generation
+        );
+        println!(
+            "[pci-manager] obs backend=legacy-cf8-cfc windows={} snapshot={}",
+            windows_len, authority.firmware_snapshot_id
+        );
+        let _ = send(
+            bootstrap,
+            Message::ready_config_authority(manager_generation, 1),
+        );
+        true
+    }
+    #[cfg(not(feature = "force-legacy"))]
+    {
+        if authority.ecam_count != record_count || declared_count as usize != record_count {
+            println!(
+                "[pci-manager] HMCF rejected: {} capability(ies) for {} record(s)",
+                authority.ecam_count, record_count
+            );
+            return reject_authority(bootstrap, authority, manager_generation);
+        }
     }
 
-    authority.authorized = true;
-    println!(
+    #[cfg(not(feature = "force-legacy"))]
+    {
+        // Map every window read-only at private virtual addresses. The
+        // kernel enforces READ-only (the capability carries no WRITE
+        // right), `NO_CACHE` for Mmio resources and no executable mapping;
+        // validation here is the cheap userspace half of the contract.
+        let mut next_va = CONFIG_WINDOW_VA_BASE;
+        let mut mapped = 0usize;
+        for (index, record) in view.records().enumerate() {
+            if record.ecam_base & 0xF_FFFF != 0 || record.span_bytes & 0xF_FFFF != 0 {
+                println!("[pci-manager] HMCF rejected: misaligned window geometry");
+                return reject_authority(bootstrap, authority, manager_generation);
+            }
+            let Some(handle) = authority.ecam[index].take() else {
+                println!("[pci-manager] HMCF rejected: capability {} missing", index);
+                return reject_authority(bootstrap, authority, manager_generation);
+            };
+            let window_va = next_va;
+            let result = libcanvas::resource::map_self(
+                &handle,
+                0,
+                window_va,
+                record.span_bytes,
+                vmar_flags::READ | vmar_flags::USER | vmar_flags::SPECIFIC,
+            );
+            // The mapping keeps the resource alive via a kernel reference;
+            // the userspace handle is safe to drop after mapping.
+            drop(handle);
+            if let Err(error) = result {
+                println!(
+                    "[pci-manager] read-only config authority map rejected: {}",
+                    error.as_str()
+                );
+                return reject_authority(bootstrap, authority, manager_generation);
+            }
+            if mapped < authority.windows.len() {
+                authority.windows[mapped] = Some(WindowMapping {
+                    segment: record.segment,
+                    bus_start: record.start_bus,
+                    bus_end: record.end_bus,
+                    va_base: window_va,
+                    span_bytes: record.span_bytes,
+                });
+            }
+            mapped += 1;
+            next_va = next_va.saturating_add(record.span_bytes);
+        }
+        authority.windows_len = mapped;
+        authority.firmware_snapshot_id = view.firmware_snapshot_id();
+        authority.producer_generation = view.producer_generation();
+
+        authority.authorized = true;
+        println!(
         "[pci-manager] read-only config authority ready: {} window(s), snapshot {}, producer generation {}",
         mapped,
         view.firmware_snapshot_id(),
         view.producer_generation()
     );
-    let _ = send(
-        bootstrap,
-        Message::ready_config_authority(manager_generation, mapped as u32),
-    );
-    true
+        println!(
+            "[pci-manager] obs backend=ecam windows={} snapshot={}",
+            mapped,
+            view.firmware_snapshot_id()
+        );
+        let _ = send(
+            bootstrap,
+            Message::ready_config_authority(manager_generation, mapped as u32),
+        );
+        true
+    }
 }
 
 fn read_vmo_exact(vmo: &Vmo, offset: u64, buf: &mut [u8]) -> bool {
@@ -350,4 +509,261 @@ const fn hmcf_error_name(error: hmcf::HmcfError) -> &'static str {
         hmcf::HmcfError::StaleGeneration => "stale producer generation",
         hmcf::HmcfError::SnapshotMismatch => "snapshot mismatch",
     }
+}
+
+// ---------------------------------------------------------------------------
+// AP-10 mediation serving
+
+const MEDIATION_DRAIN_BUDGET: u32 = 8;
+#[cfg(not(feature = "force-legacy"))]
+const SPAN_PER_BUS: u64 = 1024 * 1024;
+
+/// Drain a bounded number of queued mediation requests.
+fn serve_mediation(authority: &mut ConfigAuthority, manager_generation: u64) {
+    if authority.mediation.is_none() {
+        return;
+    }
+    for _ in 0..MEDIATION_DRAIN_BUDGET {
+        let next = {
+            let Some(channel) = authority.mediation.as_ref() else {
+                break;
+            };
+            let mut bytes = [0u8; pci_mediation::REQUEST_BYTES];
+            channel.read_into(&mut bytes).map(|length| (bytes, length))
+        };
+        match next {
+            Ok((bytes, length)) => {
+                let Some(channel) = authority.mediation.as_ref() else {
+                    break;
+                };
+                handle_mediation_request(channel, &bytes[..length], authority, manager_generation);
+            }
+            Err(ErrorCode::ShouldWait) | Err(ErrorCode::TimedOut) => break,
+            Err(_) => {
+                println!("[pci-manager] obs mediation peer-closed");
+                authority.mediation = None;
+                break;
+            }
+        }
+    }
+}
+
+fn respond(channel: &Channel, request: &Request, status: MediationStatus, value: u64) {
+    let mut bytes = [0u8; pci_mediation::RESPONSE_BYTES];
+    let response = Response::for_request(request, status, value);
+    let Some(length) = pci_mediation::encode_response(&response, &mut bytes) else {
+        return;
+    };
+    let _ = channel.write(&bytes[..length]);
+}
+
+fn handle_mediation_request(
+    channel: &Channel,
+    bytes: &[u8],
+    authority: &ConfigAuthority,
+    manager_generation: u64,
+) {
+    let start = libcanvas::system::monotonic_ticks().unwrap_or(0);
+    let Some(request) = pci_mediation::decode_request(bytes) else {
+        let response = Response {
+            version: pci_mediation::VERSION,
+            reserved: 0,
+            status: MediationStatus::InvalidRequest as i32,
+            correlation_id: 0,
+            pci_generation: manager_generation,
+            acpi_generation: 0,
+            value: 0,
+        };
+        let mut out = [0u8; pci_mediation::RESPONSE_BYTES];
+        if let Some(length) = pci_mediation::encode_response(&response, &mut out) {
+            let _ = channel.write(&out[..length]);
+        }
+        println!("[pci-manager] obs mediation op=unknown status=invalid-request correlation=0");
+        return;
+    };
+    let valid = match request.validate() {
+        Ok(valid) => valid,
+        Err(error) => {
+            respond(channel, &request, MediationStatus::InvalidRequest, 0);
+            println!(
+                "[pci-manager] obs mediation op=unknown status=invalid-request correlation={} error={}",
+                request.correlation_id,
+                validation_error_name(error)
+            );
+            return;
+        }
+    };
+    // Every write variant is denied before any hardware access.
+    if valid.opcode == MediationOpcode::Write {
+        respond(channel, &request, MediationStatus::AccessDenied, 0);
+        println!(
+            "[pci-manager] obs mediation op=write status=denied reason=policy correlation={}",
+            valid.correlation_id
+        );
+        return;
+    }
+    if valid.pci_generation != manager_generation
+        || valid.acpi_generation != authority.producer_generation
+    {
+        respond(channel, &request, MediationStatus::StaleGeneration, 0);
+        println!(
+            "[pci-manager] obs mediation op=read status=stale-generation correlation={}",
+            valid.correlation_id
+        );
+        return;
+    }
+    if valid.firmware_snapshot_id != authority.firmware_snapshot_id {
+        respond(channel, &request, MediationStatus::SnapshotMismatch, 0);
+        println!(
+            "[pci-manager] obs mediation op=read status=snapshot-mismatch correlation={}",
+            valid.correlation_id
+        );
+        return;
+    }
+    match perform_read(authority, &valid) {
+        Ok(value) => {
+            respond(channel, &request, MediationStatus::Ok, value);
+            let latency = libcanvas::system::monotonic_ticks()
+                .unwrap_or(0)
+                .saturating_sub(start);
+            let absent: u64 = if value == all_ones(valid.width) { 1 } else { 0 };
+            println!(
+                "[pci-manager] obs mediation op=read status=ok seg={} bus={} dev={} fn={} off=0x{:x} width={} correlation={} absent={} latency-ticks={}",
+                valid.segment,
+                valid.bus,
+                valid.device,
+                valid.function,
+                valid.offset,
+                valid.width,
+                valid.correlation_id,
+                absent,
+                latency
+            );
+        }
+        Err(ReadFailure::NoWindow) => {
+            respond(channel, &request, MediationStatus::NotFound, 0);
+            println!(
+                "[pci-manager] obs mediation op=read status=not-found correlation={}",
+                valid.correlation_id
+            );
+        }
+        #[cfg(feature = "force-legacy")]
+        Err(ReadFailure::LegacyOutOfSubset) => {
+            respond(channel, &request, MediationStatus::NotFound, 0);
+            println!(
+                "[pci-manager] obs mediation op=read status=not-found reason=common-subset correlation={}",
+                valid.correlation_id
+            );
+        }
+        #[cfg(feature = "force-legacy")]
+        Err(ReadFailure::BackendUnavailable) => {
+            respond(channel, &request, MediationStatus::NotReady, 0);
+            println!(
+                "[pci-manager] obs mediation op=read status=not-ready correlation={}",
+                valid.correlation_id
+            );
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ReadFailure {
+    NoWindow,
+    #[cfg(feature = "force-legacy")]
+    LegacyOutOfSubset,
+    #[cfg(feature = "force-legacy")]
+    BackendUnavailable,
+}
+
+/// Whether any retained HMCF record covers `(segment, bus)`.
+#[cfg(feature = "force-legacy")]
+fn bus_covered(authority: &ConfigAuthority, segment: u16, bus: u8) -> bool {
+    authority.windows[..authority.windows_len]
+        .iter()
+        .flatten()
+        .any(|window| window.segment == segment && bus >= window.bus_start && bus <= window.bus_end)
+}
+
+fn all_ones(width: u8) -> u64 {
+    match width {
+        1 => 0xFF,
+        2 => 0xFFFF,
+        _ => 0xFFFF_FFFF,
+    }
+}
+
+const fn validation_error_name(error: ValidationError) -> &'static str {
+    match error {
+        ValidationError::Version => "version",
+        ValidationError::Opcode => "opcode",
+        ValidationError::Reserved => "reserved",
+        ValidationError::Width => "width",
+        ValidationError::Alignment => "alignment",
+        ValidationError::DeviceFunction => "device-function",
+        ValidationError::Generation => "generation",
+        ValidationError::Snapshot => "snapshot",
+    }
+}
+
+#[cfg(feature = "force-legacy")]
+fn perform_read(authority: &ConfigAuthority, request: &ValidRequest) -> Result<u64, ReadFailure> {
+    let Some(legacy) = authority.legacy_ioport.as_ref() else {
+        return Err(ReadFailure::BackendUnavailable);
+    };
+    if !bus_covered(authority, request.segment, request.bus) {
+        return Err(ReadFailure::NoWindow);
+    }
+    // The legacy mechanism cannot address the extended configuration
+    // space; only the 256-byte common subset is served.
+    if u64::from(request.offset) + u64::from(request.width) > 256 {
+        return Err(ReadFailure::LegacyOutOfSubset);
+    }
+    let address = 0x8000_0000u32
+        | (u32::from(request.bus) << 16)
+        | (u32::from(request.device) << 11)
+        | (u32::from(request.function) << 8)
+        | (u32::from(request.offset) & 0xFC);
+    legacy
+        .write_u32(0x0CF8, address)
+        .map_err(|_| ReadFailure::BackendUnavailable)?;
+    let port = 0x0CFC + (request.offset & 0x3);
+    match request.width {
+        1 => legacy.read_u8(port).map(u64::from),
+        2 => legacy.read_u16(port).map(u64::from),
+        _ => legacy.read_u32(port).map(u64::from),
+    }
+    .map_err(|_| ReadFailure::BackendUnavailable)
+}
+
+#[cfg(not(feature = "force-legacy"))]
+fn perform_read(authority: &ConfigAuthority, request: &ValidRequest) -> Result<u64, ReadFailure> {
+    let Some(window) = authority.windows[..authority.windows_len]
+        .iter()
+        .flatten()
+        .find(|window| {
+            window.segment == request.segment
+                && request.bus >= window.bus_start
+                && request.bus <= window.bus_end
+        })
+    else {
+        return Err(ReadFailure::NoWindow);
+    };
+    let function_offset = (request.bus - window.bus_start) as u64 * SPAN_PER_BUS
+        + (u64::from(request.device) << 15)
+        + (u64::from(request.function) << 12)
+        + u64::from(request.offset);
+    if function_offset + u64::from(request.width) > window.span_bytes {
+        return Err(ReadFailure::NoWindow);
+    }
+    let address = window.va_base + function_offset;
+    // The mapped window is read-only and NO_CACHE; `function_offset +
+    // width` was validated against the window span right above and
+    // `offset` is aligned to `width` by the request validator. The load
+    // is exactly as wide as the validated request.
+    let value = match request.width {
+        1 => u64::from(libcanvas::channel::mmio_load::<u8>(address)),
+        2 => u64::from(libcanvas::channel::mmio_load::<u16>(address)),
+        _ => u64::from(libcanvas::channel::mmio_load::<u32>(address)),
+    };
+    Ok(value)
 }

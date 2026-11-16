@@ -80,10 +80,10 @@ impl Channel {
             &mut h1 as *mut HandleValue as u64,
         );
         raw::decode(ret)?;
-        Ok((
-            Channel(unsafe { Handle::from_raw(h0) }),
-            Channel(unsafe { Handle::from_raw(h1) }),
-        ))
+        // SAFETY: ChannelCreate installed one owned handle per out-slot;
+        // each raw value is wrapped exactly once, here.
+        let (handle0, handle1) = unsafe { (Handle::from_raw(h0), Handle::from_raw(h1)) };
+        Ok((Channel(handle0), Channel(handle1)))
     }
 
     /// Send a message (raw bytes; no handle transfer support in this safe
@@ -242,4 +242,23 @@ impl Channel {
         let n = self.read_into(&mut buf)?;
         Ok((buf, n))
     }
+}
+
+// ---------------------------------------------------------------------------
+// Read-only MMIO load helper (AP-10)
+
+/// Volatile load of one `T` from a read-only mapped MMIO region.
+///
+/// The PCI Manager uses this for the read-only ECAM configuration windows
+/// it validated against its retained `HMCF` snapshot and mapped itself;
+/// the kernel installed those mappings read-only `NO_CACHE`, so no device
+/// side effect can escape through this helper. The caller must pass an
+/// address with at least `size_of::<T>()` bytes of live mapping (ECAM
+/// windows and the mediation request validator jointly enforce both the
+/// bounds and the width alignment).
+pub fn mmio_load<T: Copy>(address: u64) -> T {
+    // SAFETY: the caller guarantees `address` points at `size_of::<T>()`
+    // readable bytes inside a live read-only mapping it owns; ECAM window
+    // geometry and the request validator enforce bounds and alignment.
+    unsafe { core::ptr::read_volatile(address as *const T) }
 }

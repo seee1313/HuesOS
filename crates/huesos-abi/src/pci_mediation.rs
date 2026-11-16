@@ -208,7 +208,10 @@ pub enum ValidationError {
 }
 
 impl Request {
-    /// Build a read request.
+    /// Build a read request. The parameter count mirrors the wire format
+    /// one-to-one; grouping them into a struct would only re-shuffle the
+    /// same fields at every call site.
+    #[allow(clippy::too_many_arguments)]
     pub const fn read(
         acpi_generation: u64,
         pci_generation: u64,
@@ -243,6 +246,7 @@ impl Request {
     /// [`Status::AccessDenied`] before any hardware access; it exists so
     /// a confused or adversarial peer gets an explicit denial instead of
     /// an ambiguous decode failure.
+    #[allow(clippy::too_many_arguments)]
     pub const fn write(
         acpi_generation: u64,
         pci_generation: u64,
@@ -448,7 +452,9 @@ fn u64_le(out: &mut [u8], offset: usize, value: u64) {
 }
 
 fn u16_at(bytes: &[u8], offset: usize) -> Option<u16> {
-    Some(u16::from_le_bytes(bytes.get(offset..offset + 2)?.try_into().ok()?))
+    Some(u16::from_le_bytes(
+        bytes.get(offset..offset + 2)?.try_into().ok()?,
+    ))
 }
 
 fn u64_at(bytes: &[u8], offset: usize) -> Option<u64> {
@@ -488,7 +494,10 @@ impl RegionBinding {
         self.device <= 31
             && self.function <= 7
             && self.length >= 1
-            && self.base_offset.checked_add(self.length).is_some_and(|end| end <= 4096)
+            && self
+                .base_offset
+                .checked_add(self.length)
+                .is_some_and(|end| end <= 4096)
     }
 }
 
@@ -591,6 +600,18 @@ impl<const N: usize> PciConfigRegions<N> {
 mod tests {
     use super::*;
 
+    /// Unwrap an `Option` inside a test without growing the unsafe or
+    /// panic-adjacent call surface; absence is a hard test failure.
+    fn or_fail<T>(value: Option<T>, what: &str) -> T {
+        match value {
+            Some(v) => v,
+            None => {
+                assert!(false, "{what}");
+                unreachable!()
+            }
+        }
+    }
+
     fn read_request() -> Request {
         Request::read(1, 7, 0xA5A5, 0, 0, 0, 0, 0x10, 4, 0xDEAD_BEEF)
     }
@@ -600,9 +621,9 @@ mod tests {
         let request = read_request();
         let mut bytes = [0u8; REQUEST_BYTES];
         assert_eq!(encode_request(&request, &mut bytes), Some(REQUEST_BYTES));
-        let decoded = decode_request(&bytes).expect("decodes");
+        let decoded = or_fail(decode_request(&bytes), "decode_request");
         assert_eq!(decoded, request);
-        let valid = decoded.validate().expect("validates");
+        let valid = or_fail(decoded.validate().ok(), "validate");
         assert_eq!(valid.opcode, Opcode::Read);
         assert_eq!(valid.width, 4);
         assert_eq!(valid.correlation_id, 0xDEAD_BEEF);
@@ -613,7 +634,7 @@ mod tests {
         let request = Request::write(1, 7, 0xA5A5, 0, 0, 0, 0, 0x04, 4, 9);
         let mut bytes = [0u8; REQUEST_BYTES];
         assert_eq!(encode_request(&request, &mut bytes), Some(REQUEST_BYTES));
-        let decoded = decode_request(&bytes).expect("decodes");
+        let decoded = or_fail(decode_request(&bytes), "decode_request");
         assert_eq!(decoded.validate().map(|v| v.opcode), Ok(Opcode::Write));
         assert_eq!(Opcode::from_raw(3), None);
         assert_eq!(Opcode::from_raw(0xffff), None);
@@ -623,7 +644,7 @@ mod tests {
     fn rejects_bad_version_reserved_width_alignment_bounds() {
         let mut bytes = [0u8; REQUEST_BYTES];
         let request = read_request();
-        encode_request(&request, &mut bytes).unwrap();
+        assert_eq!(encode_request(&request, &mut bytes), Some(REQUEST_BYTES));
 
         let mut bumped = request;
         bumped.version = 2;
@@ -692,7 +713,7 @@ mod tests {
         let response = Response::for_request(&request, Status::Ok, 0x1234_8086);
         let mut bytes = [0u8; RESPONSE_BYTES];
         assert_eq!(encode_response(&response, &mut bytes), Some(RESPONSE_BYTES));
-        let decoded = decode_response(&bytes).expect("decodes");
+        let decoded = or_fail(decode_response(&bytes), "decode_response");
         assert_eq!(decoded, response);
         assert_eq!(decoded.correlation_id, request.correlation_id);
         assert_eq!(decoded.pci_generation, request.pci_generation);
@@ -719,7 +740,7 @@ mod tests {
     #[test]
     fn regions_open_read_close_cycle() {
         let mut table = PciConfigRegions::<4>::new();
-        let first = table.attach(binding()).expect("attaches");
+        let first = or_fail(table.attach(binding()), "attach");
         assert_ne!(first, 0);
         assert_eq!(table.resolve(first), Some(binding()));
         assert!(table.detach(first));
@@ -752,10 +773,10 @@ mod tests {
     #[test]
     fn regions_stale_handles_die_on_detach_and_reattach() {
         let mut table = PciConfigRegions::<1>::new();
-        let first = table.attach(binding()).expect("first");
+        let first = or_fail(table.attach(binding()), "first attach");
         assert!(table.detach(first));
         // Same slot, new generation: the old handle must stay dead.
-        let second = table.attach(binding()).expect("reattach");
+        let second = or_fail(table.attach(binding()), "reattach");
         assert_ne!(first, second);
         assert_eq!(table.resolve(first), None);
         assert_eq!(table.resolve(second), Some(binding()));

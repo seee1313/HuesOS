@@ -256,9 +256,7 @@ pub fn decode(bytes: &[u8]) -> Option<Message> {
     let manager_generation = read_u64(bytes, 8)?;
     let status = Status::from_raw(read_i32(bytes, 16)?)?;
     let detail = read_u32(bytes, 20)?;
-    if manager_generation == 0
-        || (opcode == Opcode::Hello && detail & !HELLO_FLAGS_V1 != 0)
-    {
+    if manager_generation == 0 || (opcode == Opcode::Hello && detail & !HELLO_FLAGS_V1 != 0) {
         return None;
     }
     Some(Message {
@@ -327,12 +325,16 @@ mod tests {
         assert!(encode(Message::hello(7), &mut raw).is_some());
         raw[20] = 0x10; // poke an unknown flag bit into detail
         assert_eq!(decode(&raw), None);
-        assert!(decode(&encode_or_fail(Message::hello_with_flags(7, HELLO_FLAG_FORCE_LEGACY))).is_some());
+        assert!(decode(&encode_or_fail(Message::hello_with_flags(
+            7,
+            HELLO_FLAG_FORCE_LEGACY
+        )))
+        .is_some());
     }
 
     fn encode_or_fail(message: Message) -> [u8; MESSAGE_BYTES] {
         let mut bytes = [0u8; MESSAGE_BYTES];
-        encode(message, &mut bytes).expect("valid message encodes");
+        assert!(encode(message, &mut bytes).is_some());
         bytes
     }
 

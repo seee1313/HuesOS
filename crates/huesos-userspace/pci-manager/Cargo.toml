@@ -1,3 +1,8 @@
+[features]
+default = []
+# AP-10 conformance knob: require the legacy CF8/CFC backend for reads.
+force-legacy = []
+
 [package]
 name = "huesos-pci-manager"
 version = "0.1.0"

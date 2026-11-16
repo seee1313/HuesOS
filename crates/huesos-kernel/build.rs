@@ -79,6 +79,7 @@ fn main() {
     println!("cargo:rerun-if-env-changed=HUESOS_ACPI_RESTART_SMOKE");
     println!("cargo:rerun-if-env-changed=HUESOS_ACPI_BUDGET_SMOKE");
     println!("cargo:rerun-if-env-changed=HUESOS_KEY_BROKER_FEATURES");
+    println!("cargo:rerun-if-env-changed=HUESOS_PCI_FORCE_LEGACY");
     let acpi_restart_smoke = env::var_os("HUESOS_ACPI_RESTART_SMOKE").is_some();
     let acpi_budget_smoke = env::var_os("HUESOS_ACPI_BUDGET_SMOKE").is_some();
     let key_broker_features = env::var("HUESOS_KEY_BROKER_FEATURES").unwrap_or_default();
@@ -95,6 +96,13 @@ fn main() {
     {
         driver_manager_features.push("key-broker-fail-smoke");
     }
+    // AP-10 conformance knob: force the legacy CF8/CFC common subset
+    // instead of ECAM. Builds both managers with matching features and is
+    // intended only for the forced-legacy QEMU smoke.
+    let pci_force_legacy = matches!(env::var("HUESOS_PCI_FORCE_LEGACY").as_deref(), Ok("1"));
+    if pci_force_legacy {
+        driver_manager_features.push("pci-force-legacy");
+    }
     let mut driver_manager_args: Vec<String> = Vec::new();
     if !driver_manager_features.is_empty() {
         driver_manager_args.push("--features".to_string());
@@ -104,6 +112,11 @@ fn main() {
         driver_manager_args.iter().map(String::as_str).collect();
     let acpi_manager_args = if acpi_restart_smoke || acpi_budget_smoke {
         ["--features", "restart-smoke"].as_slice()
+    } else {
+        [].as_slice()
+    };
+    let pci_manager_args = if pci_force_legacy {
+        ["--features", "force-legacy"].as_slice()
     } else {
         [].as_slice()
     };
@@ -132,7 +145,7 @@ fn main() {
         "huesos-pci-manager",
         profile,
         &[],
-        &[],
+        pci_manager_args,
     );
     let shutdown_broker = build_userspace_program(
         &userspace_root,

@@ -10,8 +10,11 @@ use crate::{Channel, ErrorCode};
 use huesos_abi::pci_mediation::{self, Opcode, Request, Status, RESPONSE_BYTES};
 
 /// Default bounded wait for one mediation round trip, in monotonic
-/// ticks (same clock as [`crate::system::monotonic_ticks`]).
-pub const DEFAULT_TIMEOUT_TICKS: u64 = 1_000;
+/// ticks (10 ms per tick — 100 ms). The PCI Manager drains the
+/// mediation channel on every scheduling iteration, so a healthy peer
+/// answers long before this bound; the bound exists so a stuck or
+/// dead peer degrades to an error instead of a hung caller.
+pub const DEFAULT_TIMEOUT_TICKS: u64 = 10;
 
 /// One endpoint of the mediation channel, with the requester's identity
 /// baked in so callers cannot forge generations ad hoc.
@@ -49,7 +52,10 @@ impl MediationRequester {
     /// Whether the underlying peer is gone (e.g. PCI Manager restarted).
     pub fn is_peer_closed(&self) -> bool {
         // Zero-capacity read probes liveness without consuming a message.
-        matches!(self.channel.read_etc(&mut [], &mut []), Err(ErrorCode::PeerClosed))
+        matches!(
+            self.channel.read_etc(&mut [], &mut []),
+            Err(ErrorCode::PeerClosed)
+        )
     }
 
     /// Mediated configuration read. `width` ∈ {1, 2, 4}.
@@ -62,7 +68,16 @@ impl MediationRequester {
         offset: u16,
         width: u8,
     ) -> Result<u64, AccessError> {
-        self.call(Opcode::Read, segment, bus, device, function, offset, width, 0)
+        self.call(
+            Opcode::Read,
+            segment,
+            bus,
+            device,
+            function,
+            offset,
+            width,
+            0,
+        )
     }
 
     /// Mediated write attempt. Always answered [`Status::AccessDenied`]
@@ -77,7 +92,16 @@ impl MediationRequester {
         offset: u16,
         width: u8,
     ) -> Result<(), AccessError> {
-        match self.call(Opcode::Write, segment, bus, device, function, offset, width, 0) {
+        match self.call(
+            Opcode::Write,
+            segment,
+            bus,
+            device,
+            function,
+            offset,
+            width,
+            0,
+        ) {
             Err(AccessError::Denied) => Ok(()),
             Err(error) => Err(error),
             Ok(_) => Err(AccessError::Internal),
@@ -206,4 +230,3 @@ impl AccessError {
         }
     }
 }
-
