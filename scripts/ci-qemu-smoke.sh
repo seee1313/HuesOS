@@ -70,6 +70,10 @@ for marker in \
     '[driver-manager] retained HMCF' \
     '[acpi] config mint authority installed: snapshot' \
     '[init] installed PciConfigMint capability (handle 8)' \
+    '[init] delegated unique PciConfigMint authority to DriverManager' \
+    '[driver-manager] received unique PciConfigMint authority' \
+    '[driver-manager] PCI manager ready (read-only config authority' \
+    '[pci-manager] read-only config authority ready' \
     '[pci-manager] ready without root descriptors; fail-closed' \
     '[driver-manager] PCI manager ready (no roots; fail-closed)' \
     '[terminal] keyboard service online, starting shell' \
@@ -102,6 +106,13 @@ for regression in \
     '[driver-manager] HMCF rejected' \
     '[acpi] config mint authority disabled:' \
     '[init] failed to install PciConfigMint capability' \
+    '[init] config mint authority transfer failed' \
+    '[driver-manager] duplicate PciConfigMint authority rejected' \
+    '[driver-manager] config capability mint rejected' \
+    '[driver-manager] config authority transfer failed' \
+    '[pci-manager] HMCF rejected' \
+    '[pci-manager] no firmware snapshot' \
+    '[pci-manager] read-only config authority map rejected' \
     '[acpi-manager] PANIC' \
     '[driver-manager] PCI manager restart budget exhausted' \
     '[driver-manager] malformed PCI manager control message' \

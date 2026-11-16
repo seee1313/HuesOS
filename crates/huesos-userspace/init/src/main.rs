@@ -195,6 +195,26 @@ pub extern "C" fn _start() -> ! {
         }
     }
 
+    // Delegate the unique PciConfigMint authority (AP-8) to
+    // DriverManager; it mints generation-bound, read-only configuration
+    // capabilities for the supervised PCI Manager on every (re)start.
+    // The handle carries no DUPLICATE right: this transfer is the only
+    // path the authority ever takes out of `init`.
+    if let Some((_, dm_channel)) = &driver_manager {
+        let mint = libcanvas::handle::Handle::take_init_config_mint();
+        match dm_channel.write_handle(b"pci-config-mint:manager-authority", mint) {
+            Ok(()) => init_logln!(
+                logger,
+                "[init] delegated unique PciConfigMint authority to DriverManager"
+            ),
+            Err((error, _handle)) => init_logln!(
+                logger,
+                "[init] config mint authority transfer failed: {}",
+                error.as_str()
+            ),
+        }
+    }
+
     if let Some((_, channel)) = &driver_manager {
         ui.wait_ready(b"driver-manager", channel, &mut logger);
         // Storage is a distinct stage because it is the long pole of the

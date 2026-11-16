@@ -48,7 +48,17 @@ gates close.
   executable, uncached ECAM capabilities (Mmio mappings are always
   `NO_CACHE`; resource mappings reject `EXECUTE`). No consumer exists yet —
   DriverManager→PCI Manager authority handoff is AP-9. AML/PCI config
-  authority remains otherwise disabled. AP-9 onwards not started. See
+  authority remains otherwise disabled. The handoff itself is implemented
+  (AP-9, `huesos-dev/ap9-config-authority-handoff`): `init` delegates the
+  unique mint authority to DriverManager, which mints a fresh generation-bound
+  read-only ECAM capability set per PCI Manager generation (canonical HMCF
+  order, snapshot/generation-bound), attaches the HMCF snapshot and an
+  explicit end-of-burst sentinel, and PCI Manager independently validates
+  and maps every window read-only (`READ|USER|SPECIFIC`; kernel `NO_CACHE`,
+  no `EXECUTE`), reporting `read-only config authority ready`; a degraded
+  ACPI path settles it into explicit fail-closed `no firmware snapshot`.
+  AML reads and any topology publication remain disabled. AP-10 onwards not
+  started. See
   ACPI_PCI_IMPLEMENTATION_PLAN.md §7.
 
 ### Process lifecycle regression matrix

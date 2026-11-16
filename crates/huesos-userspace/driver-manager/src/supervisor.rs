@@ -8,7 +8,7 @@ use crate::protocol;
 use crate::protocol::MANIFEST_GRANTS_COMPLETE_PREFIX;
 use crate::registry::{ServiceRegistry, ServiceState};
 use crate::volume_service::VolumeManagerService;
-use huesos_abi::{acpi_archive, acpi_manager, hmcf, key_broker, pci_manager};
+use huesos_abi::{acpi_archive, acpi_manager, hmcf, key_broker, pci_config, pci_manager};
 use libcanvas::{hbi_boot, println, storage_boot, Channel, ErrorCode, Handle, Process, Vmo};
 
 /// Fallback embedded DriverHost image (same binary packaged into BOOTFS).
@@ -206,6 +206,19 @@ pub struct DriverManager {
     /// dropped on every manager restart so a stale generation can
     /// never be mistaken for the current one.
     hmcf: Option<Vmo>,
+    /// Unique `PciConfigMint` authority delegated by `init` (AP-8/9).
+    /// DriverManager is the only process besides `init` that holds it.
+    /// Never duplicated, never re-transferred; used only to mint
+    /// generation-bound read-only ECAM capabilities for the PCI Manager.
+    config_mint: Option<Handle>,
+    /// Whether the current PCI Manager generation received its config
+    /// authority burst (or the explicit authority-settled sentinel).
+    config_authority_handed_off: bool,
+    /// ACPI config authority decision reached its final state for the
+    /// current ACPI generation (ready processed or restart budget
+    /// exhausted). Gates the settle-with-zero sentinel so a PCI Manager
+    /// started before ACPI settles is not told "no snapshot" prematurely.
+    acpi_authority_settled: bool,
     registry_channel: Option<Channel>,
     fs: FileSystemService,
     volume: VolumeManagerService,
@@ -359,6 +372,9 @@ impl DriverManager {
             acpi_tables: None,
             acpi_broker: None,
             hmcf: None,
+            config_mint: None,
+            config_authority_handed_off: false,
+            acpi_authority_settled: false,
             registry_channel: None,
             fs: FileSystemService::new(),
             volume: VolumeManagerService::new(),
@@ -1053,11 +1069,16 @@ impl DriverManager {
             return;
         }
         self.pci_manager_ready = false;
+        self.config_authority_handed_off = false;
         self.pci_manager = Some(ManagedHost { process, bootstrap });
         println!(
             "[driver-manager] launched restartable PCI manager generation {}",
             self.pci_manager_generation
         );
+        // If the ACPI authority already settled (e.g. a restart after
+        // readiness), mint and hand off right away; otherwise the
+        // handoff is attempted when the retained HMCF appears.
+        self.handoff_config_authority();
     }
 
     fn schedule_pci_manager_restart(&mut self) {
@@ -1221,13 +1242,16 @@ impl DriverManager {
         self.acpi_manager = None;
         self.acpi_manager_ready = false;
         // A snapshot from the previous generation can never bind to the
-        // next one; drop it so only a fresh validated HMCF remains.
+        // next one; drop it so only a fresh validated HMCF remains. The
+        // authority decision is undecided again until the next ACPI
+        // manager becomes ready (or its restart budget is exhausted).
         if self.hmcf.take().is_some() {
             println!(
                 "[driver-manager] dropped stale HMCF from generation {}",
                 self.acpi_manager_generation
             );
         }
+        self.acpi_authority_settled = false;
         self.acpi_availability.record_runtime_failure();
         let now = libcanvas::system::monotonic_ticks().unwrap_or(0);
         if !self.acpi_manager_restart.record_failure(
@@ -1238,6 +1262,8 @@ impl DriverManager {
             println!(
                 "[driver-manager] ACPI manager restart budget exhausted; runtime ACPI degraded"
             );
+            self.acpi_authority_settled = true;
+            self.handoff_config_authority();
             return;
         }
         println!(
@@ -1437,6 +1463,18 @@ impl DriverManager {
                     } else {
                         println!("[driver-manager] received unique KeyBroker generation authority");
                         self.key_broker = Some(Channel::from_handle(handle));
+                    }
+                }
+                Ok((n, Some(handle)))
+                    if &buf[..n] == protocol::CONFIG_MINT_AUTHORITY.as_bytes() =>
+                {
+                    if self.config_mint.is_some() {
+                        println!("[driver-manager] duplicate PciConfigMint authority rejected");
+                        drop(handle);
+                    } else {
+                        println!("[driver-manager] received unique PciConfigMint authority");
+                        self.config_mint = Some(handle);
+                        self.handoff_config_authority();
                     }
                 }
                 Ok((n, Some(handle))) if buf[..n].starts_with(RESOURCE_LABEL_PREFIX) => {
@@ -2206,6 +2244,14 @@ impl DriverManager {
                         self.pci_manager_restart.record_ready();
                         println!("[driver-manager] PCI manager ready (no roots; fail-closed)");
                     }
+                    (pci_manager::Opcode::Ready, pci_manager::Status::ConfigAuthorityReady) => {
+                        self.pci_manager_ready = true;
+                        self.pci_manager_restart.record_ready();
+                        println!(
+                            "[driver-manager] PCI manager ready (read-only config authority, windows {})",
+                            message.detail
+                        );
+                    }
                     (pci_manager::Opcode::Heartbeat, _) => {}
                     _ => println!("[driver-manager] unexpected PCI manager control message"),
                 }
@@ -2222,6 +2268,152 @@ impl DriverManager {
                 self.schedule_pci_manager_restart();
             }
         }
+    }
+
+    /// Mint (or settle) the read-only PCI config authority for the
+    /// current PCI Manager generation.
+    ///
+    /// Idempotent per PCI Manager generation: at most one authority
+    /// burst (HMCF duplicate + one ECAM capability per HMCF record in
+    /// canonical order + the [`pci_manager::Opcode::AuthorityComplete`]
+    /// sentinel) is sent before the generation exits. A settle
+    /// sentinel with `window_count == 0` is only sent once the ACPI
+    /// authority decision is final for the current generation (ACPI
+    /// ready processed, or its restart budget exhausted) — a PCI
+    /// Manager started before ACPI settles keeps waiting instead of
+    /// being told a premature "no snapshot".
+    ///
+    /// Minting never happens on ACPI generation renewals once the PCI
+    /// Manager already holds a burst (physical ECAM windows do not
+    /// move); a PCI Manager restart replays a fresh, validated mint
+    /// from the retained HMCF.
+    fn handoff_config_authority(&mut self) {
+        if self.config_authority_handed_off {
+            return;
+        }
+        let Some(host) = self.pci_manager.take() else {
+            return;
+        };
+        let _keep_process_alive = &host.process;
+
+        // Re-decode the retained snapshot for its identity fields
+        // rather than caching them: the image is tiny and the decode
+        // is the same one retain_hmcf already ran.
+        let decoded = self.hmcf.as_ref().and_then(|vmo| {
+            let mut header = [0u8; hmcf::HEADER_BYTES];
+            if !read_vmo_exact(vmo, 0, &mut header) {
+                return None;
+            }
+            let declared = hmcf::declared_size(&header).ok()?;
+            let mut image = [0u8; hmcf::MAX_BYTES];
+            if !read_vmo_exact(vmo, 0, &mut image[..declared]) {
+                return None;
+            }
+            hmcf::decode(&image[..declared]).ok().map(|view| {
+                (
+                    view.firmware_snapshot_id(),
+                    view.producer_generation(),
+                    view.record_count(),
+                )
+            })
+        });
+
+        match decoded {
+            Some((snapshot, producer_generation, record_count)) => {
+                let Some(authority) = self.config_mint.as_ref() else {
+                    println!("[driver-manager] config capability mint rejected: authority missing");
+                    self.settle_config_authority(host);
+                    return;
+                };
+                let Some(hmcf_vmo) = self.hmcf.as_ref() else {
+                    println!("[driver-manager] config capability mint rejected: snapshot vanished");
+                    self.settle_config_authority(host);
+                    return;
+                };
+                let request = pci_config::PciConfigMintRequest {
+                    version: pci_config::MINT_REQUEST_VERSION,
+                    kind: pci_config::MINT_KIND_ECAM_WINDOWS,
+                    reserved: 0,
+                    firmware_snapshot_id: snapshot,
+                    producer_generation,
+                    hmcf_vmo: hmcf_vmo.handle().raw(),
+                };
+                match libcanvas::pci_config::mint(authority, &request) {
+                    Ok(mut capabilities) => {
+                        if capabilities.len() != record_count {
+                            println!(
+                                "[driver-manager] config capability mint rejected: {} capability(ies) for {} HMCF record(s)",
+                                capabilities.len(),
+                                record_count
+                            );
+                            self.settle_config_authority(host);
+                            return;
+                        }
+                        if !send_config_authority_burst(
+                            &host,
+                            hmcf_vmo,
+                            &mut capabilities,
+                            record_count,
+                            self.pci_manager_generation,
+                        ) {
+                            // Mid-burst failure: drop the host so the
+                            // child exits on PEER_CLOSED and the restart
+                            // path re-mints a fresh, complete burst.
+                            println!(
+                                "[driver-manager] config authority transfer failed; restarting PCI manager"
+                            );
+                            drop(host);
+                            self.schedule_pci_manager_restart();
+                            return;
+                        }
+                        self.config_authority_handed_off = true;
+                        self.pci_manager = Some(host);
+                        println!(
+                            "[driver-manager] minted {} read-only config capability(ies) for PCI manager generation {} (snapshot {})",
+                            record_count, self.pci_manager_generation, snapshot
+                        );
+                    }
+                    Err(error) => {
+                        println!(
+                            "[driver-manager] config capability mint rejected: {}",
+                            error.as_str()
+                        );
+                        self.settle_config_authority(host);
+                    }
+                }
+            }
+            None => {
+                if self.hmcf.is_some() {
+                    println!(
+                        "[driver-manager] config capability mint rejected: retained HMCF unreadable"
+                    );
+                    self.settle_config_authority(host);
+                    return;
+                }
+                if self.acpi_authority_settled {
+                    // ACPI authority decision is final: no snapshot will
+                    // ever come this generation; settle the child.
+                    self.settle_config_authority(host);
+                } else {
+                    // ACPI not settled yet; keep the child waiting.
+                    self.pci_manager = Some(host);
+                }
+            }
+        }
+    }
+
+    /// Send the explicit zero-capability sentinel so the PCI Manager
+    /// can settle into its fail-closed state. Delivery failure is not
+    /// fatal: the child already reported fail-closed readiness and
+    /// stays that way forever.
+    fn settle_config_authority(&mut self, host: ManagedHost) {
+        let message = pci_manager::Message::authority_complete(self.pci_manager_generation, 0);
+        let mut bytes = [0u8; pci_manager::MESSAGE_BYTES];
+        if let Some(length) = pci_manager::encode(message, &mut bytes) {
+            let _ = host.bootstrap.write(&bytes[..length]);
+        }
+        self.config_authority_handed_off = true;
+        self.pci_manager = Some(host);
     }
 
     /// Validate and retain one `HMCF` config-window snapshot received
@@ -2308,6 +2500,7 @@ impl DriverManager {
         // replaced snapshot is stale by definition.
         self.hmcf = Some(vmo);
         self.acpi_availability.record_snapshot();
+        self.handoff_config_authority();
     }
 
     fn poll_acpi_manager(&mut self) {
@@ -2361,6 +2554,8 @@ impl DriverManager {
                                 "[driver-manager] ACPI manager ready generation {} tables {}",
                                 message.manager_generation, message.detail
                             );
+                            self.acpi_authority_settled = true;
+                            self.handoff_config_authority();
                         }
                         (acpi_manager::Opcode::Heartbeat, acpi_manager::Status::Ok) => {
                             self.acpi_heartbeat_count = self.acpi_heartbeat_count.wrapping_add(1);
@@ -2472,6 +2667,65 @@ fn hash_to_hex(hash: &[u8; 32]) -> [u8; 64] {
         index += 1;
     }
     out
+}
+
+/// Deliver one read-only config authority burst to a PCI Manager
+/// bootstrap channel: an HMCF duplicate (`READ | TRANSFER`), one
+/// labelled read-only ECAM capability per HMCF record (canonical
+/// order), then the `AuthorityComplete` sentinel. Returns `false` if
+/// any step fails; the caller restarts the generation.
+fn send_config_authority_burst(
+    host: &ManagedHost,
+    hmcf_vmo: &Vmo,
+    capabilities: &mut libcanvas::pci_config::MintedConfigCapabilities,
+    count: usize,
+    generation: u64,
+) -> bool {
+    let Ok(hmcf_duplicate) =
+        hmcf_vmo.duplicate(huesos_abi::rights::READ | huesos_abi::rights::TRANSFER)
+    else {
+        println!("[driver-manager] config capability mint rejected: HMCF duplicate failed");
+        return false;
+    };
+    if let Err((error, _hmcf)) = host
+        .bootstrap
+        .write_handle(pci_manager::HMCF_VMO_LABEL, hmcf_duplicate.into_handle())
+    {
+        println!(
+            "[driver-manager] config authority transfer failed: {}",
+            error.as_str()
+        );
+        return false;
+    }
+    for index in 0..count {
+        let Some(handle) = capabilities.take(index) else {
+            println!(
+                "[driver-manager] config authority transfer failed: capability {} missing",
+                index
+            );
+            return false;
+        };
+        if let Err((error, _handle)) = host
+            .bootstrap
+            .write_handle(pci_manager::CONFIG_ECAM_LABEL, handle)
+        {
+            println!(
+                "[driver-manager] config authority transfer failed: {}",
+                error.as_str()
+            );
+            return false;
+        }
+    }
+    let message = pci_manager::Message::authority_complete(generation, count as u32);
+    let mut bytes = [0u8; pci_manager::MESSAGE_BYTES];
+    let Some(length) = pci_manager::encode(message, &mut bytes) else {
+        return false;
+    };
+    if host.bootstrap.write(&bytes[..length]).is_err() {
+        println!("[driver-manager] config authority sentinel delivery failed");
+        return false;
+    }
+    true
 }
 
 /// Read exactly `buf.len()` bytes from a VMO at `offset`.
