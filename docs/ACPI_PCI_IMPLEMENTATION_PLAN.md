@@ -163,9 +163,11 @@ Approved:
 
 ### Gate B — SystemMemory/SystemIO grant derivation
 
-**Must be approved before AP-11 begins.** The first fixed FADT SystemIO policy
-is already bounded, but general AML OperationRegions need an independent grant
-source. The decision must specify:
+**Owner-proposed direction recorded:** see [ACPI_GATE_B_POLICY.md](ACPI_GATE_B_POLICY.md).
+The current broker is not yet compliant with that policy, and the proposal does
+not by itself activate any handler or close the AP-11 gate. The first fixed
+FADT SystemIO policy is already bounded, but general AML OperationRegions need
+an independent grant source. The decision must specify:
 
 - which UEFI/E820 memory types may back SystemMemory;
 - how RAM, kernel image, page tables, DMA buffers, ECAM, BARs, and other live
