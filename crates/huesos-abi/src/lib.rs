@@ -56,6 +56,8 @@ pub mod pci_config;
 pub mod pci_manager;
 /// Dedicated ACPI ↔ PCI configuration read mediation protocol (AP-10).
 pub mod pci_mediation;
+/// Preliminary read-only HPCI/HMCF cross-validation helpers.
+pub mod pci_root_validation;
 
 /// HBI boot-driver manifest ABI.
 pub mod hbi_boot {
