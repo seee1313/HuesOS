@@ -55,10 +55,12 @@ policy does not claim safe real-hardware operation or PCI production readiness.
 ## Implementation status
 
 `huesos_abi::acpi_region_policy` supplies preliminary pure range and snapshot
-checks, with no hardware side effects. **It is not connected to the broker**:
-the current FADT policy still grants SMI_CMD, the syscall backend only executes
-SystemIO, the deny set and NVS derivation are not wired, and the full uACPI
-runtime is not active in `acpi-manager`. No AP-11 through AP-16 exit criterion
+checks, with no hardware side effects. **It is not connected to the broker**.
+The legacy FADT SystemIO grant derivation rejects SMI_CMD and fixed deny-list
+port overlaps, including an overlapping SystemIO RESET_REG; it does not yet
+account for dynamic DriverHost grants. The syscall backend only executes
+SystemIO, the complete deny set and NVS derivation are not wired, and the full
+uACPI runtime is not active in `acpi-manager`. No AP-11 through AP-16 exit criterion
 is closed by this document or by the policy helper alone. Implementation must
 resolve resource tracking and races before granting access, enforce write-value
 rules and masks in the broker, and provide the required negative and on-target

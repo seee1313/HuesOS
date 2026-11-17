@@ -35,8 +35,29 @@ fn parse_fadt_system_io(bytes: &[u8]) -> Result<Vec<SystemIoGrant>, PolicyError>
         .try_reserve_exact(MAX_FADT_GRANTS)
         .map_err(|_| PolicyError::OutOfMemory)?;
 
-    // SMI command: ACPI enable/disable bytes are written to this port.
-    add_grant(&mut grants, read_u32(bytes, 48)?, 1, false, true);
+    // Do not grant SMI_CMD. Also filter all candidate blocks below so a
+    // malicious overlapping descriptor cannot re-authorize that port.
+    let smi_cmd = read_u32(bytes, 48)?;
+    let reset_io = if bytes.len() >= 128 && bytes[116] == 1 {
+        let address = u64::from_le_bytes([
+            bytes[120], bytes[121], bytes[122], bytes[123], bytes[124], bytes[125], bytes[126],
+            bytes[127],
+        ]);
+        // Cover bit offset and declared access size as well as bit width;
+        // unknown encodings fail closed rather than underestimating the range.
+        let access_bytes = match bytes[119] {
+            0 => 1,
+            1 => 1,
+            2 => 2,
+            3 => 4,
+            4 => 8,
+            _ => return Err(PolicyError::InvalidFadt),
+        };
+        let described_bytes = (u64::from(bytes[117]) + u64::from(bytes[118])).div_ceil(8);
+        Some((address, described_bytes.max(access_bytes)))
+    } else {
+        None
+    };
 
     let pm1_event_len = bytes[88];
     add_grant(&mut grants, read_u32(bytes, 56)?, pm1_event_len, true, true);
@@ -62,6 +83,29 @@ fn parse_fadt_system_io(bytes: &[u8]) -> Result<Vec<SystemIoGrant>, PolicyError>
     add_grant(&mut grants, read_u32(bytes, 76)?, bytes[91], true, false);
     add_grant(&mut grants, read_u32(bytes, 80)?, bytes[92], true, true);
     add_grant(&mut grants, read_u32(bytes, 84)?, bytes[93], true, true);
+    // Fixed architectural exclusions. Reject the entire overlapping candidate,
+    // never silently split it. Dynamic DriverHost resource conflicts still
+    // require independent lifetime-aware enforcement before AP-11 is enabled.
+    const DENY: [(u64, u64); 7] = [
+        (0xcf8, 8),
+        (0x60, 1),
+        (0x64, 1),
+        (0x3f8, 8),
+        (0x20, 2),
+        (0xa0, 2),
+        (0x40, 4),
+    ];
+    grants.retain(|grant| {
+        let start = u64::from(grant.base);
+        let end = start + u64::from(grant.length);
+        let intersects = |base: u64, len: u64| {
+            base.checked_add(len)
+                .is_none_or(|stop| start < stop && base < end)
+        };
+        !DENY.iter().any(|&(base, len)| intersects(base, len))
+            && (smi_cmd == 0 || !intersects(u64::from(smi_cmd), 1))
+            && reset_io.is_none_or(|(base, len)| !intersects(base, len))
+    });
     Ok(grants)
 }
 
@@ -111,7 +155,10 @@ mod tests {
         fadt[92] = 2;
 
         let grants = parse_fadt_system_io(&fadt);
-        assert_eq!(grants.as_ref().map(|ranges| ranges.len()), Ok(4));
+        assert_eq!(grants.as_ref().map(|ranges| ranges.len()), Ok(3));
+        assert!(grants
+            .as_ref()
+            .is_ok_and(|ranges| ranges.iter().all(|range| range.base != 0xb2)));
         assert!(grants.as_ref().is_ok_and(|ranges| {
             ranges
                 .iter()
@@ -120,6 +167,20 @@ mod tests {
         assert!(grants
             .as_ref()
             .is_ok_and(|ranges| { ranges.iter().all(|range| range.base != 0xffff) }));
+    }
+
+    #[test]
+    fn rejects_fixed_denies_and_aliases_of_smi_and_reset() {
+        for forbidden in [0xcf8u32, 0x60, 0x64, 0x3f8, 0x20, 0xa0, 0x40, 0xb2, 0x500] {
+            let mut fadt = [0u8; 128];
+            fadt[48..52].copy_from_slice(&0xb2u32.to_le_bytes());
+            fadt[56..60].copy_from_slice(&forbidden.to_le_bytes());
+            fadt[88] = 1;
+            fadt[116] = 1; // SystemIO reset GAS
+            fadt[117] = 8;
+            fadt[120..128].copy_from_slice(&0x500u64.to_le_bytes());
+            assert!(parse_fadt_system_io(&fadt).is_ok_and(|ranges| ranges.is_empty()));
+        }
     }
 
     #[test]
