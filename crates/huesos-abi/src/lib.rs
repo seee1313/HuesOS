@@ -22,6 +22,8 @@ pub mod key_broker;
 pub mod acpi_broker;
 /// Ring-3 ACPI manager lifecycle and supervision protocol.
 pub mod acpi_manager;
+/// Pure, fail-closed checks for independently derived ACPI region grants.
+pub mod acpi_region_policy;
 
 /// Async BlockDevice wire protocol.
 pub mod block;
