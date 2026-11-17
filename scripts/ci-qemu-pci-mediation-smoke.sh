@@ -33,12 +33,14 @@ case "$scenario" in
 esac
 
 mkdir -p "$artifact_dir"
+# Both scenarios reuse the plain boot gate; pass the scenario so its required
+# PCI readiness markers match the backend actually built into the ISO.
 if [[ "$scenario" == "legacy" ]]; then
     HUESOS_PCI_FORCE_LEGACY=1 ARTIFACT_DIR="$artifact_dir" \
-        bash "$(dirname "$0")/ci-qemu-smoke.sh" "$profile" "$cpus" "$timeout_seconds"
+        bash "$(dirname "$0")/ci-qemu-smoke.sh" "$profile" "$cpus" "$timeout_seconds" "$scenario"
 else
     ARTIFACT_DIR="$artifact_dir" \
-        bash "$(dirname "$0")/ci-qemu-smoke.sh" "$profile" "$cpus" "$timeout_seconds"
+        bash "$(dirname "$0")/ci-qemu-smoke.sh" "$profile" "$cpus" "$timeout_seconds" "$scenario"
 fi
 
 log="$artifact_dir/qemu-${profile}-smp${cpus}.log"
