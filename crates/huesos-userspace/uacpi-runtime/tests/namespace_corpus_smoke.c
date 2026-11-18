@@ -25,8 +25,15 @@ typedef struct HuesPciRootDesc {
     uacpi_u8 has_bbn;
     uacpi_u16 aperture_start;
     uacpi_u16 aperture_count;
-    uacpi_u16 _pad;
+    uacpi_u16 prt_start;
+    uacpi_u16 prt_count;
+    uacpi_u8 osc_status;
+    uacpi_u8 _pad;
     uacpi_u32 flags;
+    uacpi_u32 osc_support;
+    uacpi_u32 osc_requested_control;
+    uacpi_u32 osc_granted_control;
+    uacpi_u32 osc_error_flags;
 } HuesPciRootDesc;
 
 typedef struct HuesPciApertureDesc {
@@ -39,12 +46,25 @@ typedef struct HuesPciApertureDesc {
     uacpi_u64 len;
 } HuesPciApertureDesc;
 
+typedef struct HuesPciPrtEntryDesc {
+    uacpi_u16 root_index;
+    uacpi_u8 device;
+    uacpi_u8 pin;
+    uacpi_u32 gsi;
+    uacpi_u8 source_kind;
+    uacpi_u8 link_active;
+    uacpi_u8 triggering;
+    uacpi_u8 polarity;
+} HuesPciPrtEntryDesc;
+
 typedef struct HuesPciRootsOut {
     uacpi_u16 root_count;
     uacpi_u16 aperture_count;
-    uacpi_u32 _pad;
+    uacpi_u16 prt_count;
+    uacpi_u16 _pad;
     HuesPciRootDesc roots[16];
     HuesPciApertureDesc apertures[64];
+    HuesPciPrtEntryDesc prt_entries[256];
 } HuesPciRootsOut;
 
 extern int hues_uacpi_collect_pci_roots(HuesPciRootsOut *out);
@@ -791,6 +811,148 @@ int main(void)
         hues_uacpi_initialize_namespace(5, 64, &pic_st) != UACPI_STATUS_OK ||
         hues_uacpi_collect_pci_roots(&roots_out) == UACPI_STATUS_OK) {
         fprintf(stderr, "AP-15 case 7 conflicting _BBN check failed\n");
+        return 1;
+    }
+    uacpi_state_reset();
+
+    /*
+     * AP-18 Case 8: _PRT (Direct GSI + Active Link Device LNKA + Disabled Link LNKB)
+     * plus _OSC Query-mode Masked response.
+     */
+    static const uint8_t ap18_prt_osc_masked_aml[] = {
+        /* [0] Scope(\_SB_) */
+        0x10, 0x40, 0x00, 0x5C, '_', 'S', 'B', '_',
+        /* [8] Device(LNKA): 2 + 40 = 42 bytes -> [8..49] */
+        0x5B, 0x82, 0x28, 'L', 'N', 'K', 'A',
+        0x08, '_', 'H', 'I', 'D', 0x0C, 0x41, 0xD0, 0x0C, 0x0F,
+        0x14, 0x09, '_', 'S', 'T', 'A', 0x00, 0xA4, 0x0A, 0x0B,
+        0x08, '_', 'C', 'R', 'S', 0x11, 0x09, 0x0A, 0x06,
+        0x23, 0x00, 0x08, 0x18, /* IRQ {11} Level, ActiveLow, Shared */
+        0x79, 0x00,
+        /* [50] Device(LNKB): 2 + 25 = 27 bytes -> [50..76] (present, disabled _STA = 0x09) */
+        0x5B, 0x82, 0x19, 'L', 'N', 'K', 'B',
+        0x08, '_', 'H', 'I', 'D', 0x0C, 0x41, 0xD0, 0x0C, 0x0F,
+        0x14, 0x09, '_', 'S', 'T', 'A', 0x00, 0xA4, 0x0A, 0x09,
+        /* [77] Device(PCI0) */
+        0x5B, 0x82, 0x40, 0x00, 'P', 'C', 'I', '0',
+        0x08, '_', 'H', 'I', 'D', 0x0C, 0x41, 0xD0, 0x0A, 0x08,
+        0x14, 0x09, '_', 'S', 'T', 'A', 0x00, 0xA4, 0x0A, 0x0F,
+        /* Name(_CRS, Buffer(18) { WordBusNumber(0..=3), EndTag }) */
+        0x08, '_', 'C', 'R', 'S', 0x11, 0x15, 0x0A, 18,
+        0x88, 0x0D, 0x00, 0x02, 0x0C, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00, 0x04, 0x00,
+        0x79, 0x00,
+        /* Name(_PRT, Package(3) { DirectGSI(16), LNKA, LNKB }) */
+        0x08, '_', 'P', 'R', 'T',
+        0x12, 0x2B, 0x03,
+        /* Entry 0: dev 1, pin 0, direct GSI 16 (12 bytes) */
+        0x12, 0x0B, 0x04, 0x0C, 0xFF, 0xFF, 0x01, 0x00, 0x00, 0x00, 0x0A, 16,
+        /* Entry 1: dev 2, pin 1, LNKA (14 bytes) */
+        0x12, 0x0D, 0x04, 0x0C, 0xFF, 0xFF, 0x02, 0x00, 0x01, 'L', 'N', 'K', 'A', 0x00,
+        /* Entry 2: dev 3, pin 2, LNKB (15 bytes) */
+        0x12, 0x0E, 0x04, 0x0C, 0xFF, 0xFF, 0x03, 0x00, 0x0A, 0x02, 'L', 'N', 'K', 'B', 0x00,
+        /* Method(_OSC, 4) { CreateDWordField(Arg3,0,CDW1); CreateDWordField(Arg3,8,CDW3); CDW1=0x10; CDW3=0x09; Return(Arg3) } */
+        0x14, 0x25, '_', 'O', 'S', 'C', 0x04,
+        0x8A, 0x6B, 0x00, 'C', 'D', 'W', '1',
+        0x8A, 0x6B, 0x0A, 0x08, 'C', 'D', 'W', '3',
+        0x70, 0x0A, 0x10, 'C', 'D', 'W', '1',
+        0x70, 0x0A, 0x09, 'C', 'D', 'W', '3',
+        0xA4, 0x6B,
+    };
+    uint8_t prt_osc_buf[sizeof(ap18_prt_osc_masked_aml)];
+    memcpy(prt_osc_buf, ap18_prt_osc_masked_aml, sizeof(ap18_prt_osc_masked_aml));
+    size_t sb8_pkg = sizeof(ap18_prt_osc_masked_aml) - 1;
+    size_t pci8_pkg = sizeof(ap18_prt_osc_masked_aml) - 79;
+    prt_osc_buf[1] = (uint8_t)(0x40 | (sb8_pkg & 0x0Fu));
+    prt_osc_buf[2] = (uint8_t)(sb8_pkg >> 4);
+    prt_osc_buf[79] = (uint8_t)(0x40 | (pci8_pkg & 0x0Fu));
+    prt_osc_buf[80] = (uint8_t)(pci8_pkg >> 4);
+
+    setup_corpus(prt_osc_buf, sizeof(prt_osc_buf));
+    if (hues_uacpi_load_namespace(5, 64) != UACPI_STATUS_OK ||
+        hues_uacpi_initialize_namespace(5, 64, &pic_st) != UACPI_STATUS_OK) {
+        fprintf(stderr, "AP-18 case 8 namespace init failed\n");
+        return 1;
+    }
+    int collect_st = hues_uacpi_collect_pci_roots(&roots_out);
+    if (collect_st != UACPI_STATUS_OK) {
+        fprintf(stderr, "AP-18 case 8 _PRT/_OSC collection failed: st=%d (%s)\n",
+                collect_st, uacpi_status_to_string(collect_st));
+        return 1;
+    }
+    if (roots_out.root_count != 1 || roots_out.prt_count != 3 ||
+        roots_out.roots[0].prt_count != 3 ||
+        roots_out.roots[0].osc_status != 2 || /* HUES_OSC_MASKED */
+        roots_out.roots[0].osc_granted_control != 0x09u ||
+        roots_out.roots[0].osc_error_flags != 0x10u ||
+        roots_out.prt_entries[0].device != 1 || roots_out.prt_entries[0].pin != 0 ||
+        roots_out.prt_entries[0].gsi != 16 || roots_out.prt_entries[0].source_kind != 1 ||
+        roots_out.prt_entries[1].device != 2 || roots_out.prt_entries[1].pin != 1 ||
+        roots_out.prt_entries[1].gsi != 11 || roots_out.prt_entries[1].source_kind != 2 ||
+        roots_out.prt_entries[1].link_active != 1 ||
+        roots_out.prt_entries[1].triggering != 1 || roots_out.prt_entries[1].polarity != 1 ||
+        roots_out.prt_entries[2].device != 3 || roots_out.prt_entries[2].pin != 2 ||
+        roots_out.prt_entries[2].gsi != 0 || roots_out.prt_entries[2].source_kind != 3 ||
+        roots_out.prt_entries[2].link_active != 0) {
+        fprintf(stderr,
+                "AP-18 case 8 mismatch: prt=%u osc=%u granted=0x%x err=0x%x "
+                "e1(gsi=%u sk=%u trig=%u pol=%u) e2(sk=%u)\n",
+                roots_out.prt_count, roots_out.roots[0].osc_status,
+                roots_out.roots[0].osc_granted_control, roots_out.roots[0].osc_error_flags,
+                roots_out.prt_entries[1].gsi, roots_out.prt_entries[1].source_kind,
+                roots_out.prt_entries[1].triggering, roots_out.prt_entries[1].polarity,
+                roots_out.prt_entries[2].source_kind);
+        return 1;
+    }
+    uacpi_state_reset();
+
+    /*
+     * AP-18 Case 9: Verify _OSC strictly sends Query bit (Arg3[0] & 1 == 1).
+     * AML checks (CDW1 & 1): if set -> CDW1 = 0 (Granted), else -> CDW1 = 2 (Failure).
+     */
+    static const uint8_t ap18_osc_query_aml[] = {
+        /* [0] Scope(\_SB_) */
+        0x10, 0x40, 0x00, 0x5C, '_', 'S', 'B', '_',
+        /* [8] Device(PCI0) */
+        0x5B, 0x82, 0x40, 0x00, 'P', 'C', 'I', '0',
+        0x08, '_', 'H', 'I', 'D', 0x0C, 0x41, 0xD0, 0x0A, 0x08,
+        0x14, 0x09, '_', 'S', 'T', 'A', 0x00, 0xA4, 0x0A, 0x0F,
+        0x08, '_', 'C', 'R', 'S', 0x11, 0x15, 0x0A, 18,
+        0x88, 0x0D, 0x00, 0x02, 0x0C, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00, 0x04, 0x00,
+        0x79, 0x00,
+        /* Method(_OSC, 4) */
+        0x14, 0x28, '_', 'O', 'S', 'C', 0x04,
+        0x8A, 0x6B, 0x00, 'C', 'D', 'W', '1',
+        0x7B, 'C', 'D', 'W', '1', 0x01, 0x60, /* And(CDW1, 1, Local0) */
+        0xA0, 0x08, 0x60, 0x70, 0x00, 'C', 'D', 'W', '1', /* If(Local0) { CDW1 = 0 } */
+        0xA1, 0x08, 0x70, 0x0A, 0x02, 'C', 'D', 'W', '1', /* Else { CDW1 = 2 } */
+        0xA4, 0x6B,
+    };
+    uint8_t osc_query_buf[sizeof(ap18_osc_query_aml)];
+    memcpy(osc_query_buf, ap18_osc_query_aml, sizeof(ap18_osc_query_aml));
+    size_t sb9_pkg = sizeof(ap18_osc_query_aml) - 1;
+    size_t pci9_pkg = sizeof(ap18_osc_query_aml) - 10;
+    osc_query_buf[1] = (uint8_t)(0x40 | (sb9_pkg & 0x0Fu));
+    osc_query_buf[2] = (uint8_t)(sb9_pkg >> 4);
+    osc_query_buf[10] = (uint8_t)(0x40 | (pci9_pkg & 0x0Fu));
+    osc_query_buf[11] = (uint8_t)(pci9_pkg >> 4);
+
+    setup_corpus(osc_query_buf, sizeof(osc_query_buf));
+    if (hues_uacpi_load_namespace(5, 64) != UACPI_STATUS_OK ||
+        hues_uacpi_initialize_namespace(5, 64, &pic_st) != UACPI_STATUS_OK ||
+        hues_uacpi_collect_pci_roots(&roots_out) != UACPI_STATUS_OK) {
+        fprintf(stderr, "AP-18 case 9 _OSC query collection failed\n");
+        return 1;
+    }
+    if (roots_out.root_count != 1 ||
+        roots_out.roots[0].osc_status != 1 || /* HUES_OSC_GRANTED */
+        roots_out.roots[0].osc_error_flags != 0 ||
+        roots_out.roots[0].osc_granted_control != roots_out.roots[0].osc_requested_control) {
+        fprintf(stderr, "AP-18 case 9 _OSC query check failed: osc=%u err=0x%x granted=0x%x\n",
+                roots_out.roots[0].osc_status,
+                roots_out.roots[0].osc_error_flags,
+                roots_out.roots[0].osc_granted_control);
         return 1;
     }
     uacpi_state_reset();

@@ -418,9 +418,28 @@ fn publish_hpci(
         return false;
     }
     println!(
-        "[acpi-manager] published HPCI: {} root(s), {} aperture(s), snapshot {}, generation {}",
-        table.root_count, table.aperture_count, firmware_snapshot_id, generation
+        "[acpi-manager] published HPCI: {} root(s), {} aperture(s), {} prt(s), snapshot {}, generation {}",
+        table.root_count,
+        table.aperture_count,
+        table.prt_count,
+        firmware_snapshot_id,
+        generation
     );
+    for idx in 0..table.root_count {
+        let root = table.roots[idx];
+        println!(
+            "[acpi-manager] root[{}] seg={} bus={}..={} prt={} osc={:?} req=0x{:x} granted=0x{:x} err=0x{:x}",
+            idx,
+            root.segment,
+            root.start_bus,
+            root.end_bus,
+            root.prt_count,
+            root.osc_status,
+            root.osc_requested_control,
+            root.osc_granted_control,
+            root.osc_error_flags
+        );
+    }
     true
 }
 

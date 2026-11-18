@@ -3,8 +3,9 @@
 
 use huesos_abi::hmcf;
 use huesos_abi::pci::{
-    self, Aperture, ApertureKind, ConfigBackend, ConsistencyError, RootBridge, RootBridgeTable,
-    MAX_APERTURES, MAX_ENCODED_BYTES, MAX_ROOTS,
+    self, Aperture, ApertureKind, ConfigBackend, ConsistencyError, OscStatus, PrtEntry,
+    PrtSourceKind, RootBridge, RootBridgeTable, MAX_APERTURES, MAX_ENCODED_BYTES, MAX_PRT_ENTRIES,
+    MAX_ROOTS,
 };
 
 #[repr(C)]
@@ -17,8 +18,15 @@ struct RawPciRootDesc {
     has_bbn: u8,
     aperture_start: u16,
     aperture_count: u16,
-    _pad: u16,
+    prt_start: u16,
+    prt_count: u16,
+    osc_status: u8,
+    _pad: u8,
     flags: u32,
+    osc_support: u32,
+    osc_requested_control: u32,
+    osc_granted_control: u32,
+    osc_error_flags: u32,
 }
 
 impl RawPciRootDesc {
@@ -31,8 +39,15 @@ impl RawPciRootDesc {
             has_bbn: 0,
             aperture_start: 0,
             aperture_count: 0,
+            prt_start: 0,
+            prt_count: 0,
+            osc_status: 0,
             _pad: 0,
             flags: 0,
+            osc_support: 0,
+            osc_requested_control: 0,
+            osc_granted_control: 0,
+            osc_error_flags: 0,
         }
     }
 }
@@ -64,12 +79,42 @@ impl RawPciApertureDesc {
 }
 
 #[repr(C)]
+#[derive(Clone, Copy)]
+struct RawPciPrtEntryDesc {
+    root_index: u16,
+    device: u8,
+    pin: u8,
+    gsi: u32,
+    source_kind: u8,
+    link_active: u8,
+    triggering: u8,
+    polarity: u8,
+}
+
+impl RawPciPrtEntryDesc {
+    const fn zero() -> Self {
+        Self {
+            root_index: 0,
+            device: 0,
+            pin: 0,
+            gsi: 0,
+            source_kind: 0,
+            link_active: 0,
+            triggering: 0,
+            polarity: 0,
+        }
+    }
+}
+
+#[repr(C)]
 struct RawPciRootsOut {
     root_count: u16,
     aperture_count: u16,
-    _pad: u32,
+    prt_count: u16,
+    _pad: u16,
     roots: [RawPciRootDesc; MAX_ROOTS],
     apertures: [RawPciApertureDesc; MAX_APERTURES],
+    prt_entries: [RawPciPrtEntryDesc; MAX_PRT_ENTRIES],
 }
 
 impl RawPciRootsOut {
@@ -77,9 +122,11 @@ impl RawPciRootsOut {
         Self {
             root_count: 0,
             aperture_count: 0,
+            prt_count: 0,
             _pad: 0,
             roots: [RawPciRootDesc::zero(); MAX_ROOTS],
             apertures: [RawPciApertureDesc::zero(); MAX_APERTURES],
+            prt_entries: [RawPciPrtEntryDesc::zero(); MAX_PRT_ENTRIES],
         }
     }
 }
@@ -125,6 +172,25 @@ fn aperture_kind_from_raw(raw: u8) -> Option<ApertureKind> {
     }
 }
 
+fn osc_status_from_raw(raw: u8) -> Option<OscStatus> {
+    match raw {
+        0 => Some(OscStatus::NotPresent),
+        1 => Some(OscStatus::Granted),
+        2 => Some(OscStatus::Masked),
+        3 => Some(OscStatus::Failed),
+        _ => None,
+    }
+}
+
+fn prt_source_kind_from_raw(raw: u8) -> Option<PrtSourceKind> {
+    match raw {
+        1 => Some(PrtSourceKind::DirectGsi),
+        2 => Some(PrtSourceKind::PciLinkDevice),
+        3 => Some(PrtSourceKind::UnresolvedLink),
+        _ => None,
+    }
+}
+
 /// Discover `PNP0A03`/`PNP0A08` PCI roots from the initialized uACPI
 /// namespace, evaluate bounded `_SEG`, `_BBN`, and `_CRS` resources, validate
 /// consistency against `hmcf_bytes`, and encode the canonical `HPCI` blob.
@@ -154,7 +220,12 @@ pub fn collect_and_encode_hpci(
 
     let root_count = usize::from(raw.root_count);
     let aperture_count = usize::from(raw.aperture_count);
-    if root_count == 0 || root_count > MAX_ROOTS || aperture_count > MAX_APERTURES {
+    let prt_count = usize::from(raw.prt_count);
+    if root_count == 0
+        || root_count > MAX_ROOTS
+        || aperture_count > MAX_APERTURES
+        || prt_count > MAX_PRT_ENTRIES
+    {
         return Err(RootCollectError::Consistency(ConsistencyError::EmptyRoots));
     }
 
@@ -178,6 +249,9 @@ pub fn collect_and_encode_hpci(
                 ConsistencyError::MissingHmcfCoverage,
             ));
         };
+        let Some(osc_status) = osc_status_from_raw(raw_root.osc_status) else {
+            return Err(RootCollectError::Encode(pci::Error::UnknownKind));
+        };
         let root = RootBridge {
             root_id: canonical_root_id(
                 snapshot_id,
@@ -193,6 +267,13 @@ pub fn collect_and_encode_hpci(
             ecam_base,
             aperture_start: raw_root.aperture_start,
             aperture_count: raw_root.aperture_count,
+            prt_start: raw_root.prt_start,
+            prt_count: raw_root.prt_count,
+            osc_status,
+            osc_support: raw_root.osc_support,
+            osc_requested_control: raw_root.osc_requested_control,
+            osc_granted_control: raw_root.osc_granted_control,
+            osc_error_flags: raw_root.osc_error_flags,
         };
         if !table.push_root(root) {
             return Err(RootCollectError::Encode(pci::Error::BadLength));
@@ -212,6 +293,25 @@ pub fn collect_and_encode_hpci(
             len: raw_ap.len,
         };
         if !table.push_aperture(ap) {
+            return Err(RootCollectError::Encode(pci::Error::BadLength));
+        }
+    }
+
+    for raw_prt in &raw.prt_entries[..prt_count] {
+        let Some(source_kind) = prt_source_kind_from_raw(raw_prt.source_kind) else {
+            return Err(RootCollectError::Encode(pci::Error::UnknownKind));
+        };
+        let entry = PrtEntry {
+            root_index: raw_prt.root_index,
+            device: raw_prt.device,
+            pin: raw_prt.pin,
+            gsi: raw_prt.gsi,
+            source_kind,
+            link_active: raw_prt.link_active != 0,
+            triggering: raw_prt.triggering,
+            polarity: raw_prt.polarity,
+        };
+        if !table.push_prt(entry) {
             return Err(RootCollectError::Encode(pci::Error::BadLength));
         }
     }
