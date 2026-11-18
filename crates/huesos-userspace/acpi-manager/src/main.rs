@@ -125,6 +125,22 @@ pub extern "C" fn _start() -> ! {
         libcanvas::process::exit(-6);
     }
     println!("[acpi-manager] broker deny-by-default self-test OK");
+    match huesos_uacpi_runtime::namespace::load_namespace(summary.firmware_snapshot_id) {
+        Ok(ns) => println!(
+            "[acpi-manager] AML namespace loaded (snapshot {}, degraded={})",
+            ns.snapshot_id, ns.degraded_opregions
+        ),
+        Err(()) => {
+            println!("[acpi-manager] AML namespace load failed");
+            send_failure(
+                &bootstrap,
+                generation,
+                acpi_manager::Status::BrokerDenied,
+                0,
+            );
+            libcanvas::process::exit(-7);
+        }
+    }
 
     let Some(_self_vmar) = inputs.self_vmar.take() else {
         send_failure(

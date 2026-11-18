@@ -16,8 +16,10 @@
 extern crate alloc;
 
 mod archive;
+pub mod namespace;
 mod pci;
 mod primitives;
+pub mod work;
 
 pub use archive::{install_archive, ArchiveInstallError, ArchiveMappingInfo};
 pub use pci::{install_pci_mediation, pci_mediation_installed};
