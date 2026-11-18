@@ -567,7 +567,8 @@ fn decode_bridge_windows(
     Ok(())
 }
 
-fn root_id_of(topology: &TopologySnapshot, owner: PciAddress) -> Option<u64> {
+/// Resolve the owning PCI root bridge ID for `owner` by walking `topology` parent links.
+pub fn root_id_of(topology: &TopologySnapshot, owner: PciAddress) -> Option<u64> {
     let mut parent = topology.find(owner).map(|node| node.parent);
     let mut remaining = crate::topology::MAX_TOPOLOGY_DEPTH + 1;
     while remaining != 0 {

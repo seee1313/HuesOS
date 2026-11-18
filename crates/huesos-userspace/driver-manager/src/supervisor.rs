@@ -238,6 +238,12 @@ pub struct DriverManager {
     /// Whether the current PCI Manager generation reported
     /// [`pci_manager::Status::WriteAuthorityReady`] (AP-17).
     pci_write_authority_ready: bool,
+    /// Read-only `DeviceLease` handles received from PCI Manager (AP-21).
+    pci_bound_leases: [Option<Handle>; 16],
+    pci_bound_leases_len: usize,
+    /// Narrow lease-minted `Resource` handles received from PCI Manager (AP-21).
+    pci_bound_resources: [Option<Handle>; 32],
+    pci_bound_resources_len: usize,
     /// Whether the private ACPI ↔ PCI mediation channel pair was
     /// established for the current (PCI, ACPI) generation combination.
     config_mediation_established: bool,
@@ -412,6 +418,10 @@ impl DriverManager {
             pci_roots_handed_off: false,
             pci_write_upgrade_requested: false,
             pci_write_authority_ready: false,
+            pci_bound_leases: [const { None }; 16],
+            pci_bound_leases_len: 0,
+            pci_bound_resources: [const { None }; 32],
+            pci_bound_resources_len: 0,
             config_mediation_established: false,
             acpi_authority_settled: false,
             registry_channel: None,
@@ -1118,6 +1128,14 @@ impl DriverManager {
         self.pci_device_lease_handed_off = false;
         self.pci_write_upgrade_requested = false;
         self.pci_write_authority_ready = false;
+        for slot in &mut self.pci_bound_leases {
+            *slot = None;
+        }
+        self.pci_bound_leases_len = 0;
+        for slot in &mut self.pci_bound_resources {
+            *slot = None;
+        }
+        self.pci_bound_resources_len = 0;
         self.pci_manager = Some(ManagedHost { process, bootstrap });
         println!(
             "[driver-manager] launched restartable PCI manager generation {}",
@@ -1138,6 +1156,14 @@ impl DriverManager {
         self.pci_roots_handed_off = false;
         self.pci_write_upgrade_requested = false;
         self.pci_write_authority_ready = false;
+        for slot in &mut self.pci_bound_leases {
+            *slot = None;
+        }
+        self.pci_bound_leases_len = 0;
+        for slot in &mut self.pci_bound_resources {
+            *slot = None;
+        }
+        self.pci_bound_resources_len = 0;
         self.config_mediation_established = false;
         let now = libcanvas::system::monotonic_ticks().unwrap_or(0);
         if !self.pci_manager_restart.record_failure(
@@ -2310,120 +2336,152 @@ impl DriverManager {
             return;
         };
         let _keep_process_alive = &host.process;
-        let mut bytes = [0u8; pci_manager::MESSAGE_BYTES];
-        match host.bootstrap.read_into(&mut bytes) {
-            Ok(length) => {
-                let Some(message) = pci_manager::decode(&bytes[..length]) else {
-                    println!("[driver-manager] malformed PCI manager control message");
-                    self.schedule_pci_manager_restart();
-                    return;
-                };
-                if message.manager_generation != self.pci_manager_generation {
-                    println!("[driver-manager] stale PCI manager generation ignored");
-                    self.pci_manager = Some(host);
-                    return;
-                }
-                match (message.opcode, message.status) {
-                    (pci_manager::Opcode::Ready, pci_manager::Status::NoRootsFailClosed) => {
-                        self.pci_manager_ready = true;
-                        self.pci_manager_restart.record_ready();
-                        println!("[driver-manager] PCI manager ready (no roots; fail-closed)");
-                    }
-                    (pci_manager::Opcode::Ready, pci_manager::Status::ConfigAuthorityReady) => {
-                        self.pci_manager_ready = true;
-                        self.pci_config_authority_ready = true;
-                        self.pci_manager_restart.record_ready();
-                        if cfg!(feature = "pci-force-legacy") {
-                            println!("[driver-manager] PCI manager ready (legacy CF8/CFC backend)");
+        let mut bytes = [0u8; 64];
+        for _ in 0..32 {
+            match host.bootstrap.read_optional_handle(&mut bytes) {
+                Ok((length, Some(handle))) => {
+                    let label = &bytes[..length];
+                    if label == pci_manager::DEVICE_LEASE_RO_LABEL {
+                        if libcanvas::device_lease::query(&handle).is_ok()
+                            && self.pci_bound_leases_len < self.pci_bound_leases.len()
+                        {
+                            self.pci_bound_leases[self.pci_bound_leases_len] = Some(handle);
+                            self.pci_bound_leases_len += 1;
                         } else {
+                            drop(handle);
+                        }
+                    } else if label == pci_manager::LEASE_RESOURCE_LABEL {
+                        if self.pci_bound_resources_len < self.pci_bound_resources.len() {
+                            self.pci_bound_resources[self.pci_bound_resources_len] = Some(handle);
+                            self.pci_bound_resources_len += 1;
+                        } else {
+                            drop(handle);
+                        }
+                    } else {
+                        drop(handle);
+                    }
+                    continue;
+                }
+                Ok((length, None)) => {
+                    let Some(message) = pci_manager::decode(&bytes[..length]) else {
+                        println!("[driver-manager] malformed PCI manager control message");
+                        self.schedule_pci_manager_restart();
+                        return;
+                    };
+                    if message.manager_generation != self.pci_manager_generation {
+                        println!("[driver-manager] stale PCI manager generation ignored");
+                        self.pci_manager = Some(host);
+                        return;
+                    }
+                    match (message.opcode, message.status) {
+                        (pci_manager::Opcode::Ready, pci_manager::Status::NoRootsFailClosed) => {
+                            self.pci_manager_ready = true;
+                            self.pci_manager_restart.record_ready();
+                            println!("[driver-manager] PCI manager ready (no roots; fail-closed)");
+                        }
+                        (pci_manager::Opcode::Ready, pci_manager::Status::ConfigAuthorityReady) => {
+                            self.pci_manager_ready = true;
+                            self.pci_config_authority_ready = true;
+                            self.pci_manager_restart.record_ready();
+                            if cfg!(feature = "pci-force-legacy") {
+                                println!(
+                                    "[driver-manager] PCI manager ready (legacy CF8/CFC backend)"
+                                );
+                            } else {
+                                println!(
+                                    "[driver-manager] PCI manager ready (read-only config authority, windows {})",
+                                    message.detail
+                                );
+                            }
+                        }
+                        (pci_manager::Opcode::RootTableAccepted, pci_manager::Status::Ok) => {
                             println!(
-                                "[driver-manager] PCI manager ready (read-only config authority, windows {})",
+                                "[driver-manager] PCI manager accepted HPCI root table: {} root(s)",
+                                message.detail
+                            );
+                            if !self.pci_write_upgrade_requested && self.acpi_hpci_eligible {
+                                self.pci_write_upgrade_requested = true;
+                                let upgrade_msg = if cfg!(feature = "pci-force-legacy") {
+                                    pci_manager::Message::write_authority_complete(
+                                        self.pci_manager_generation,
+                                        1,
+                                    )
+                                } else {
+                                    pci_manager::Message::prepare_write_upgrade(
+                                        self.pci_manager_generation,
+                                        0,
+                                    )
+                                };
+                                let mut out = [0u8; pci_manager::MESSAGE_BYTES];
+                                if let Some(len) = pci_manager::encode(upgrade_msg, &mut out) {
+                                    let _ = host.bootstrap.write(&out[..len]);
+                                }
+                            }
+                        }
+                        (pci_manager::Opcode::WriteUpgradePrepared, pci_manager::Status::Ok) => {
+                            self.pci_manager = Some(host);
+                            self.handoff_write_config_authority();
+                            self.maybe_publish_mediation();
+                            self.maybe_handoff_pci_roots();
+                            return;
+                        }
+                        (
+                            pci_manager::Opcode::WriteAuthorityReady,
+                            pci_manager::Status::WriteAuthorityReady,
+                        ) => {
+                            self.pci_write_authority_ready = true;
+                            println!(
+                                "[driver-manager] PCI manager ready (write-capable config authority, windows {})",
                                 message.detail
                             );
                         }
-                    }
-                    (pci_manager::Opcode::RootTableAccepted, pci_manager::Status::Ok) => {
-                        println!(
-                            "[driver-manager] PCI manager accepted HPCI root table: {} root(s)",
-                            message.detail
-                        );
-                        if !self.pci_write_upgrade_requested && self.acpi_hpci_eligible {
-                            self.pci_write_upgrade_requested = true;
-                            let upgrade_msg = if cfg!(feature = "pci-force-legacy") {
-                                pci_manager::Message::write_authority_complete(
-                                    self.pci_manager_generation,
-                                    1,
-                                )
-                            } else {
-                                pci_manager::Message::prepare_write_upgrade(
-                                    self.pci_manager_generation,
-                                    0,
-                                )
-                            };
-                            let mut out = [0u8; pci_manager::MESSAGE_BYTES];
-                            if let Some(len) = pci_manager::encode(upgrade_msg, &mut out) {
-                                let _ = host.bootstrap.write(&out[..len]);
-                            }
+                        (
+                            pci_manager::Opcode::RootTableRejected,
+                            pci_manager::Status::InvalidRootTable,
+                        ) => {
+                            println!("[driver-manager] PCI manager rejected HPCI root table");
                         }
+                        (pci_manager::Opcode::InventoryPublished, pci_manager::Status::Ok) => {
+                            println!(
+                                "[driver-manager] PCI diagnostic inventory published: {} function(s) (FirmwareResourcesAvailable)",
+                                message.detail
+                            );
+                        }
+                        (
+                            pci_manager::Opcode::InventoryPublished,
+                            pci_manager::Status::FirmwareResourcesUnavailable,
+                        ) => {
+                            println!(
+                                "[driver-manager] PCI diagnostic inventory published: {} function(s) (FirmwareResourcesUnavailable)",
+                                message.detail
+                            );
+                        }
+                        (pci_manager::Opcode::DriverBindingPublished, pci_manager::Status::Ok) => {
+                            println!(
+                                "[driver-manager] obs h3-handoff bound={} ro_leases={} minted_resources={}",
+                                message.detail,
+                                self.pci_bound_leases_len,
+                                self.pci_bound_resources_len
+                            );
+                        }
+                        (pci_manager::Opcode::Heartbeat, _) => {}
+                        _ => println!("[driver-manager] unexpected PCI manager control message"),
                     }
-                    (pci_manager::Opcode::WriteUpgradePrepared, pci_manager::Status::Ok) => {
-                        self.pci_manager = Some(host);
-                        self.handoff_write_config_authority();
-                        self.maybe_publish_mediation();
-                        self.maybe_handoff_pci_roots();
-                        return;
-                    }
-                    (
-                        pci_manager::Opcode::WriteAuthorityReady,
-                        pci_manager::Status::WriteAuthorityReady,
-                    ) => {
-                        self.pci_write_authority_ready = true;
-                        println!(
-                            "[driver-manager] PCI manager ready (write-capable config authority, windows {})",
-                            message.detail
-                        );
-                    }
-                    (
-                        pci_manager::Opcode::RootTableRejected,
-                        pci_manager::Status::InvalidRootTable,
-                    ) => {
-                        println!("[driver-manager] PCI manager rejected HPCI root table");
-                    }
-                    (pci_manager::Opcode::InventoryPublished, pci_manager::Status::Ok) => {
-                        println!(
-                            "[driver-manager] PCI diagnostic inventory published: {} function(s) (FirmwareResourcesAvailable)",
-                            message.detail
-                        );
-                    }
-                    (
-                        pci_manager::Opcode::InventoryPublished,
-                        pci_manager::Status::FirmwareResourcesUnavailable,
-                    ) => {
-                        println!(
-                            "[driver-manager] PCI diagnostic inventory published: {} function(s) (FirmwareResourcesUnavailable)",
-                            message.detail
-                        );
-                    }
-                    (pci_manager::Opcode::Heartbeat, _) => {}
-                    _ => println!("[driver-manager] unexpected PCI manager control message"),
                 }
-                self.pci_manager = Some(host);
-                self.maybe_publish_mediation();
-                self.maybe_handoff_pci_roots();
-            }
-            Err(ErrorCode::ShouldWait) | Err(ErrorCode::TimedOut) => {
-                self.pci_manager = Some(host);
-                self.maybe_publish_mediation();
-                self.maybe_handoff_pci_roots();
-            }
-            Err(error) => {
-                println!(
-                    "[driver-manager] PCI manager channel failed: {}; disabling new PCI operations",
-                    error.as_str()
-                );
-                self.schedule_pci_manager_restart();
+                Err(ErrorCode::ShouldWait) | Err(ErrorCode::TimedOut) => break,
+                Err(error) => {
+                    println!(
+                        "[driver-manager] PCI manager channel failed: {}; disabling new PCI operations",
+                        error.as_str()
+                    );
+                    self.schedule_pci_manager_restart();
+                    return;
+                }
             }
         }
+        self.pci_manager = Some(host);
+        self.maybe_publish_mediation();
+        self.maybe_handoff_pci_roots();
     }
 
     /// Create and transfer the private ACPI ↔ PCI mediation channel

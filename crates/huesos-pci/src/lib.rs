@@ -23,6 +23,9 @@ pub mod bar_sizing;
 /// Bounded conventional and PCIe extended capability-list decoding.
 #[cfg(feature = "alloc")]
 pub mod capability;
+/// Manifest-driven PCI driver binding, interrupt transaction planning, and DMA pools (H.3 + I).
+#[cfg(feature = "alloc")]
+pub mod driver_binding;
 /// Diagnostic read-only PCI bus inventory and availability state (AP-16).
 #[cfg(feature = "alloc")]
 pub mod inventory;

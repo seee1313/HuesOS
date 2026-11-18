@@ -51,9 +51,19 @@ use huesos_abi::pci_mediation::{
 };
 #[cfg(not(feature = "force-legacy"))]
 use huesos_abi::vmar_flags;
+use huesos_abi::{rights, ResourceKindAbi};
 use huesos_pci::bar_sizing::{self, NoActiveLeases};
+use huesos_pci::capability;
+use huesos_pci::driver_binding::{
+    self, BindingDecision, ClassMatch, DeviceMatchRule, DmaPoolGrant, DriverManifestSpec,
+    FunctionIdentity, InterruptAllocatorContext, InterruptMode, IrqPreference, MsiCapabilityInfo,
+    MsixCapabilityInfo, PrtRouteInfo,
+};
 use huesos_pci::inventory::{
     ConfigReader, DiagnosticInventory, FirmwareResourceAvailability, InventoryManager,
+};
+use huesos_pci::lease::{
+    DeviceId, DeviceLeasePolicy, DmaIsolation, LeaseEvent, LeaseGeneration, RelocationClass,
 };
 use huesos_pci::resource_planner::{self, ResourcePlan};
 use huesos_pci::resource_validation::{
@@ -165,6 +175,8 @@ struct ConfigAuthority {
     leases: Vec<ActiveDeviceLease>,
     /// Whether the Stage G.3 `DeviceGone` self-check ran for this generation.
     gone_probe_done: bool,
+    /// Whether Stage H.3 driver binding and Stage I resource handoff ran.
+    binding_published: bool,
     #[cfg_attr(feature = "force-legacy", allow(dead_code))]
     rw_ecam: [Option<Handle>; hmcf::MAX_RECORDS as usize],
     #[cfg_attr(feature = "force-legacy", allow(dead_code))]
@@ -223,6 +235,7 @@ impl Default for ConfigAuthority {
             device_lease_authority: None,
             leases: Vec::new(),
             gone_probe_done: false,
+            binding_published: false,
             rw_ecam: [const { None }; hmcf::MAX_RECORDS as usize],
             rw_ecam_count: 0,
             writable: false,
@@ -271,7 +284,7 @@ fn handle_authority_message(
                     authority.device_lease_authority = Some(handle);
                     println!("[pci-manager] received DeviceLeaseAuthority");
                     if authority.resource_plan.is_some() && authority.leases.is_empty() {
-                        establish_device_leases(authority);
+                        establish_device_leases(bootstrap, authority, manager_generation);
                     }
                 } else {
                     drop(handle);
@@ -968,7 +981,7 @@ fn finish_write_authority(
         authority.writable = true;
         authority.write_upgrading = false;
         if verify_b4_write_policy(authority, 1) {
-            run_live_bar_inventory_and_planner(authority);
+            run_live_bar_inventory_and_planner(bootstrap, authority, manager_generation);
             let _ = send(
                 bootstrap,
                 Message::write_authority_ready(manager_generation, 1),
@@ -1025,7 +1038,7 @@ fn finish_write_authority(
         authority.writable = true;
         authority.write_upgrading = false;
         if verify_b4_write_policy(authority, mapped) {
-            run_live_bar_inventory_and_planner(authority);
+            run_live_bar_inventory_and_planner(bootstrap, authority, manager_generation);
             let _ = send(
                 bootstrap,
                 Message::write_authority_ready(manager_generation, mapped as u32),
@@ -1211,7 +1224,11 @@ fn resource_status_label(status: ResourceStatus) -> &'static str {
     }
 }
 
-fn run_live_bar_inventory_and_planner(authority: &mut ConfigAuthority) {
+fn run_live_bar_inventory_and_planner(
+    bootstrap: &Channel,
+    authority: &mut ConfigAuthority,
+    manager_generation: u64,
+) {
     let Some(table) = authority.roots.as_ref() else {
         return;
     };
@@ -1329,10 +1346,14 @@ fn run_live_bar_inventory_and_planner(authority: &mut ConfigAuthority) {
     );
     authority.live_validation = Some(live.validation);
     authority.resource_plan = Some(plan);
-    establish_device_leases(authority);
+    establish_device_leases(bootstrap, authority, manager_generation);
 }
 
-fn establish_device_leases(authority: &mut ConfigAuthority) {
+fn establish_device_leases(
+    bootstrap: &Channel,
+    authority: &mut ConfigAuthority,
+    manager_generation: u64,
+) {
     let Some(lease_auth) = authority.device_lease_authority.as_ref() else {
         return;
     };
@@ -1349,54 +1370,419 @@ fn establish_device_leases(authority: &mut ConfigAuthority) {
         run_device_gone_self_check(lease_auth, snapshot_id);
     }
 
-    if !authority.leases.is_empty() {
-        return;
+    if authority.leases.is_empty() {
+        for node in inv.snapshot.nodes() {
+            let addr = node.function.address;
+            let Some(packed) =
+                pack_pci_address(addr.segment(), addr.bus(), addr.device(), addr.function())
+            else {
+                continue;
+            };
+            let device_id = packed | (1u64 << 32);
+            let Ok(handle) =
+                libcanvas::device_lease::create(lease_auth, device_id, snapshot_id, packed)
+            else {
+                println!(
+                    "[pci-manager] obs g2-lease bdf={:02x}:{:02x}.{} status=create-failed",
+                    addr.bus(),
+                    addr.device(),
+                    addr.function()
+                );
+                continue;
+            };
+            let Ok(info) = libcanvas::device_lease::query(&handle) else {
+                println!(
+                    "[pci-manager] obs g2-lease bdf={:02x}:{:02x}.{} status=query-failed",
+                    addr.bus(),
+                    addr.device(),
+                    addr.function()
+                );
+                continue;
+            };
+            println!(
+                "[pci-manager] obs g2-lease bdf={:02x}:{:02x}.{} device_id=0x{:x} gen={} snapshot=0x{:016x} status=ok",
+                addr.bus(),
+                addr.device(),
+                addr.function(),
+                info.device_id,
+                info.generation,
+                info.firmware_snapshot_id
+            );
+            authority.leases.push(ActiveDeviceLease {
+                address: addr,
+                device_id: info.device_id,
+                generation: info.generation,
+                handle,
+            });
+        }
     }
 
-    for node in inv.snapshot.nodes() {
-        let addr = node.function.address;
-        let Some(packed) =
-            pack_pci_address(addr.segment(), addr.bus(), addr.device(), addr.function())
-        else {
-            continue;
-        };
-        let device_id = packed | (1u64 << 32);
-        let Ok(handle) =
-            libcanvas::device_lease::create(lease_auth, device_id, snapshot_id, packed)
-        else {
-            println!(
-                "[pci-manager] obs g2-lease bdf={:02x}:{:02x}.{} status=create-failed",
-                addr.bus(),
-                addr.device(),
-                addr.function()
-            );
-            continue;
-        };
-        let Ok(info) = libcanvas::device_lease::query(&handle) else {
-            println!(
-                "[pci-manager] obs g2-lease bdf={:02x}:{:02x}.{} status=query-failed",
-                addr.bus(),
-                addr.device(),
-                addr.function()
-            );
-            continue;
-        };
-        println!(
-            "[pci-manager] obs g2-lease bdf={:02x}:{:02x}.{} device_id=0x{:x} gen={} snapshot=0x{:016x} status=ok",
-            addr.bus(),
-            addr.device(),
-            addr.function(),
-            info.device_id,
-            info.generation,
-            info.firmware_snapshot_id
-        );
-        authority.leases.push(ActiveDeviceLease {
-            address: addr,
-            device_id: info.device_id,
-            generation: info.generation,
-            handle,
-        });
+    if !authority.binding_published && !authority.leases.is_empty() {
+        authority.binding_published = true;
+        run_driver_binding_and_handoff(bootstrap, authority, manager_generation);
     }
+}
+
+fn run_driver_binding_and_handoff(
+    bootstrap: &Channel,
+    authority: &ConfigAuthority,
+    manager_generation: u64,
+) {
+    let Some(inv) = authority.inventory.last_good() else {
+        return;
+    };
+    let Some(plan) = authority.resource_plan.as_ref() else {
+        return;
+    };
+    let Some(validation) = authority.live_validation.as_ref() else {
+        return;
+    };
+    let Some(roots) = authority.roots.as_ref() else {
+        return;
+    };
+
+    let manifests = [
+        DriverManifestSpec {
+            driver_name: "nvme-host",
+            match_rule: DeviceMatchRule {
+                vendor_id: None,
+                device_id: None,
+                subsystem_vendor_id: None,
+                subsystem_id: None,
+                revision_id: None,
+                class: Some(ClassMatch {
+                    base: 0x01,
+                    sub: 0x08,
+                    prog_if: Some(0x02),
+                }),
+                required_capability_id: None,
+            },
+            relocation: RelocationClass::Fixed,
+            irq_preference: IrqPreference::MsixThenMsiThenIntx,
+            max_vectors: 4,
+            allow_polling_fallback: true,
+        },
+        DriverManifestSpec {
+            driver_name: "ahci-host",
+            match_rule: DeviceMatchRule {
+                vendor_id: None,
+                device_id: None,
+                subsystem_vendor_id: None,
+                subsystem_id: None,
+                revision_id: None,
+                class: Some(ClassMatch {
+                    base: 0x01,
+                    sub: 0x06,
+                    prog_if: Some(0x01),
+                }),
+                required_capability_id: None,
+            },
+            relocation: RelocationClass::Fixed,
+            irq_preference: IrqPreference::MsiThenIntx,
+            max_vectors: 1,
+            allow_polling_fallback: false,
+        },
+    ];
+
+    let mut transport = ReadWriteTransport {
+        windows: &authority.windows,
+        windows_len: authority.windows_len,
+        writable: authority.writable,
+        #[cfg(feature = "force-legacy")]
+        legacy_ioport: authority.legacy_ioport.as_ref(),
+    };
+    let mut bound_count = 0u32;
+
+    for lease in &authority.leases {
+        let Some(node) = inv
+            .snapshot
+            .nodes()
+            .iter()
+            .find(|n| n.function.address == lease.address)
+        else {
+            continue;
+        };
+
+        let mut cfg = [0u8; 256];
+        for dword_idx in 0..64usize {
+            let off = (dword_idx * 4) as u16;
+            let val = transport
+                .read_width(lease.address, off, ConfigWidth::Dword)
+                .unwrap_or(0xFFFF_FFFF);
+            let bytes = val.to_le_bytes();
+            cfg[dword_idx * 4..dword_idx * 4 + 4].copy_from_slice(&bytes);
+        }
+
+        let revision_id = cfg[0x08];
+        let header_type = cfg[0x0E] & 0x7F;
+        let (subsystem_vendor_id, subsystem_id) = if header_type == 0 {
+            (
+                u16::from_le_bytes([cfg[0x2C], cfg[0x2D]]),
+                u16::from_le_bytes([cfg[0x2E], cfg[0x2F]]),
+            )
+        } else {
+            (0, 0)
+        };
+        let interrupt_pin = cfg[0x3D];
+        let current_command = u16::from_le_bytes([cfg[0x04], cfg[0x05]]);
+        let caps = capability::parse_conventional(&cfg).unwrap_or_default();
+
+        let ident = FunctionIdentity {
+            function: node.function,
+            revision_id,
+            subsystem_vendor_id,
+            subsystem_id,
+            interrupt_pin,
+            capabilities: &caps,
+        };
+
+        let Ok(dev_id) = DeviceId::try_new(lease.device_id) else {
+            continue;
+        };
+        let Ok(gen_id) = LeaseGeneration::try_new(lease.generation) else {
+            continue;
+        };
+        let Ok(mut policy) = DeviceLeasePolicy::try_new(
+            dev_id,
+            gen_id,
+            lease.address,
+            RelocationClass::Fixed,
+            DmaIsolation::Trusted,
+        ) else {
+            continue;
+        };
+        let _ = policy.apply(gen_id, LeaseEvent::Configure);
+
+        let decision = match driver_binding::match_driver(&ident, &policy, gen_id, &manifests) {
+            Ok(d) => d,
+            Err(_) => continue,
+        };
+
+        let fc = node.function.class_code;
+        match decision {
+            BindingDecision::Unbound => {
+                println!(
+                    "[pci-manager] obs h3-bind bdf={:02x}:{:02x}.{} vendor=0x{:04x} device=0x{:04x} class={:02x}:{:02x}:{:02x} decision=unbound",
+                    lease.address.bus(),
+                    lease.address.device(),
+                    lease.address.function(),
+                    node.function.vendor_id,
+                    node.function.device_id,
+                    fc.class,
+                    fc.subclass,
+                    fc.prog_if
+                );
+            }
+            BindingDecision::Matched {
+                manifest_index,
+                score,
+            } => {
+                let manifest = &manifests[manifest_index];
+                bound_count = bound_count.saturating_add(1);
+                println!(
+                    "[pci-manager] obs h3-bind bdf={:02x}:{:02x}.{} vendor=0x{:04x} device=0x{:04x} class={:02x}:{:02x}:{:02x} decision=matched driver={} score={}",
+                    lease.address.bus(),
+                    lease.address.device(),
+                    lease.address.function(),
+                    node.function.vendor_id,
+                    node.function.device_id,
+                    fc.class,
+                    fc.subclass,
+                    fc.prog_if,
+                    manifest.driver_name,
+                    score
+                );
+
+                let mut msix_info: Option<MsixCapabilityInfo> = None;
+                let mut msi_info: Option<MsiCapabilityInfo> = None;
+                for &cap in &caps {
+                    if cap.id == driver_binding::PCI_CAP_ID_MSIX && msix_info.is_none() {
+                        msix_info = driver_binding::decode_msix_capability(
+                            &mut transport,
+                            lease.address,
+                            cap,
+                        );
+                    } else if cap.id == driver_binding::PCI_CAP_ID_MSI && msi_info.is_none() {
+                        msi_info = driver_binding::decode_msi_capability(
+                            &mut transport,
+                            lease.address,
+                            cap,
+                        );
+                    }
+                }
+
+                let prt_info = if interrupt_pin > 0 {
+                    bar_sizing::root_id_of(&inv.snapshot, lease.address).and_then(|root_id| {
+                        let root_idx = roots.roots[..roots.root_count]
+                            .iter()
+                            .position(|r| r.root_id == root_id)?;
+                        roots
+                            .root_prt(root_idx)
+                            .iter()
+                            .find(|e| {
+                                e.device == lease.address.device() && e.pin == interrupt_pin - 1
+                            })
+                            .map(|e| PrtRouteInfo {
+                                gsi: e.gsi,
+                                triggering: e.triggering,
+                                polarity: e.polarity,
+                            })
+                    })
+                } else {
+                    None
+                };
+
+                let irq_ctx = InterruptAllocatorContext {
+                    destination_apic_id: 0,
+                    interrupt_remapping_active: false,
+                    available_vectors: 16,
+                    next_base_vector: 0xD0,
+                };
+                let Ok(irq_plan) = driver_binding::plan_interrupt_transaction(
+                    lease.address,
+                    &policy,
+                    gen_id,
+                    manifest,
+                    plan,
+                    msix_info,
+                    msi_info,
+                    prt_info,
+                    irq_ctx,
+                    current_command,
+                ) else {
+                    println!(
+                        "[pci-manager] obs i1-irq bdf={:02x}:{:02x}.{} status=plan-failed",
+                        lease.address.bus(),
+                        lease.address.device(),
+                        lease.address.function()
+                    );
+                    continue;
+                };
+
+                let all_writes_valid = irq_plan
+                    .writes
+                    .iter()
+                    .all(|w| write_policy::validate_write_request(w).is_ok());
+
+                let mut minted_handles: Vec<Handle> = Vec::new();
+                for res in validation.resources() {
+                    if res.resource.owner != lease.address {
+                        continue;
+                    }
+                    let Some(cpu_base) = res.cpu_base else {
+                        continue;
+                    };
+                    if res.resource.len == 0 {
+                        continue;
+                    }
+                    let kind = match res.resource.class {
+                        ResourceClass::Io => ResourceKindAbi::IoPort,
+                        ResourceClass::Mmio32
+                        | ResourceClass::Mmio64
+                        | ResourceClass::PrefetchableMemory => ResourceKindAbi::Mmio,
+                    };
+                    if let Ok(h) = libcanvas::device_lease::mint_resource(
+                        &lease.handle,
+                        kind,
+                        lease.generation,
+                        cpu_base,
+                        res.resource.len,
+                        true,
+                    ) {
+                        minted_handles.push(h);
+                    }
+                }
+
+                let (mode_str, irq_num) = match irq_plan.mode {
+                    InterruptMode::Msix { base_vector, .. } => ("msix", base_vector),
+                    InterruptMode::Msi { base_vector, .. } => ("msi", base_vector),
+                    InterruptMode::Intx { gsi, .. } => ("intx", gsi),
+                    InterruptMode::Polling => ("polling", 0),
+                };
+                if let InterruptMode::Intx { gsi, .. } = irq_plan.mode {
+                    if let Ok(irq_h) = libcanvas::device_lease::mint_resource(
+                        &lease.handle,
+                        ResourceKindAbi::Irq,
+                        lease.generation,
+                        u64::from(gsi),
+                        1,
+                        false,
+                    ) {
+                        minted_handles.push(irq_h);
+                    }
+                } else if let InterruptMode::Msi {
+                    base_vector,
+                    vector_count,
+                    ..
+                }
+                | InterruptMode::Msix {
+                    base_vector,
+                    vector_count,
+                    ..
+                } = irq_plan.mode
+                {
+                    if let Ok(irq_h) = libcanvas::device_lease::mint_resource(
+                        &lease.handle,
+                        ResourceKindAbi::Irq,
+                        lease.generation,
+                        u64::from(base_vector),
+                        u64::from(vector_count),
+                        true,
+                    ) {
+                        minted_handles.push(irq_h);
+                    }
+                }
+
+                let mut ro_lease_mint_denied = false;
+                if let Ok(ro_lease) = lease.handle.duplicate(rights::READ | rights::TRANSFER) {
+                    ro_lease_mint_denied = matches!(
+                        libcanvas::device_lease::mint_resource(
+                            &ro_lease,
+                            ResourceKindAbi::Mmio,
+                            lease.generation,
+                            0xFEE0_0000,
+                            0x1000,
+                            true,
+                        ),
+                        Err(ErrorCode::AccessDenied)
+                    );
+                    let _ = bootstrap.write_handle(pci_manager::DEVICE_LEASE_RO_LABEL, ro_lease);
+                }
+                let minted_count = minted_handles.len();
+                for res_handle in minted_handles {
+                    let _ = bootstrap.write_handle(pci_manager::LEASE_RESOURCE_LABEL, res_handle);
+                }
+
+                let dma_desc = DmaPoolGrant::try_new(&policy, gen_id, 0x0, 0x0, 0x1000).ok();
+                let isolation_str = dma_desc.map_or("Trusted", |d| d.isolation_label());
+
+                println!(
+                    "[pci-manager] obs i1-irq bdf={:02x}:{:02x}.{} mode={} irq={} writes={} valid_b4={} minted={} ro_lease_mint_denied={}",
+                    lease.address.bus(),
+                    lease.address.device(),
+                    lease.address.function(),
+                    mode_str,
+                    irq_num,
+                    irq_plan.writes.len(),
+                    all_writes_valid,
+                    minted_count,
+                    ro_lease_mint_denied
+                );
+                println!(
+                    "[pci-manager] obs i2-dma bdf={:02x}:{:02x}.{} isolation={}",
+                    lease.address.bus(),
+                    lease.address.device(),
+                    lease.address.function(),
+                    isolation_str
+                );
+            }
+        }
+    }
+
+    let _ = send(
+        bootstrap,
+        Message::driver_binding_published(manager_generation, bound_count),
+    );
 }
 
 fn run_device_gone_self_check(lease_auth: &Handle, snapshot_id: u64) {
