@@ -37,9 +37,12 @@
 #![no_std]
 #![no_main]
 
+extern crate alloc;
+
+use alloc::vec::Vec;
 use core::panic::PanicInfo;
 use huesos_abi::hmcf;
-use huesos_abi::pci::{self as abi_pci, RootBridgeTable};
+use huesos_abi::pci::{self as abi_pci, ApertureKind, RootBridgeTable};
 use huesos_abi::pci_manager::{self, Message, Opcode, Status, MESSAGE_BYTES};
 use huesos_abi::pci_mediation::{
     self, Opcode as MediationOpcode, Request, Response, Status as MediationStatus, ValidRequest,
@@ -47,10 +50,18 @@ use huesos_abi::pci_mediation::{
 };
 #[cfg(not(feature = "force-legacy"))]
 use huesos_abi::vmar_flags;
+use huesos_pci::inventory::{
+    ConfigReader, DiagnosticInventory, FirmwareResourceAvailability, InventoryManager,
+};
+use huesos_pci::resource_validation::{ResourceClass, RootAperture};
+use huesos_pci::topology::RootBus;
 use libcanvas::{println, wait_any, Channel, ErrorCode, Handle, Signals, Vmo, WaitItem};
 
 #[cfg(feature = "force-legacy")]
 use libcanvas::resource::IoPort;
+
+#[global_allocator]
+static HEAP: libcanvas::heap::ScudoHeap = libcanvas::heap::ScudoHeap::new();
 
 /// Private, per-manager mapping base for the read-only ECAM windows.
 /// Each window is mapped at the next page boundary after the previous
@@ -60,6 +71,12 @@ const CONFIG_WINDOW_VA_BASE: u64 = 0x0000_0001_0000_0000;
 
 #[unsafe(no_mangle)]
 pub extern "C" fn _start() -> ! {
+    // SAFETY: called once at process startup before any allocation or
+    // additional thread exists.
+    if unsafe { !HEAP.init() } {
+        libcanvas::debug::write_str("[pci-manager] hardened heap init failed\n");
+        libcanvas::process::exit(-10);
+    }
     println!("[pci-manager] userspace service started (configuration disabled)");
     let bootstrap = libcanvas::channel::bootstrap();
     let Some(hello) = receive_hello(&bootstrap) else {
@@ -126,6 +143,8 @@ struct ConfigAuthority {
     producer_generation: u64,
     /// Validated `HPCI` root-bridge table forwarded after ACPI init (AP-15).
     roots: Option<RootBridgeTable>,
+    /// Diagnostic read-only inventory state (AP-16).
+    inventory: InventoryManager,
     #[cfg(feature = "force-legacy")]
     legacy_ioport: Option<IoPort>,
     mediation: Option<Channel>,
@@ -160,6 +179,7 @@ impl Default for ConfigAuthority {
             firmware_snapshot_id: 0,
             producer_generation: 0,
             roots: None,
+            inventory: InventoryManager::new(),
             #[cfg(feature = "force-legacy")]
             legacy_ioport: None,
             mediation: None,
@@ -179,8 +199,8 @@ fn handle_authority_message(
     manager_generation: u64,
 ) -> bool {
     if authority.authorized {
-        // Post-authority handles: the private mediation channel end and,
-        // once ACPI namespace init completes, the validated `HPCI` root table.
+        // Post-authority messages: the private mediation channel end,
+        // the validated `HPCI` root table, or ACPI crash-freeze signals.
         if let Some(handle) = handle {
             if bytes == huesos_abi::pci_mediation::MEDIATION_CHANNEL_LABEL
                 && authority.mediation.is_none()
@@ -194,6 +214,17 @@ fn handle_authority_message(
                 accept_root_table(bootstrap, handle, authority, manager_generation);
             } else {
                 drop(handle);
+            }
+        } else if let Some(message) = pci_manager::decode(bytes) {
+            if message.manager_generation == manager_generation
+                && message.opcode == Opcode::AcpiGenerationFrozen
+            {
+                handle_acpi_frozen(
+                    bootstrap,
+                    authority,
+                    manager_generation,
+                    message.detail != 0,
+                );
             }
         }
         return true;
@@ -274,6 +305,14 @@ fn accept_root_table(
     manager_generation: u64,
 ) {
     let vmo = Vmo::from_handle(handle);
+    if authority.inventory.is_frozen() {
+        reject_root_table(
+            bootstrap,
+            manager_generation,
+            "inventory frozen after ACPI failure",
+        );
+        return;
+    }
     if authority.roots.is_some() {
         reject_root_table(bootstrap, manager_generation, "duplicate root table");
         return;
@@ -348,7 +387,6 @@ fn accept_root_table(
 
     let root_count = table.root_count;
     let aperture_count = table.aperture_count;
-    authority.roots = Some(table);
     println!(
         "[pci-manager] accepted HPCI root table: {} root(s), {} aperture(s)",
         root_count, aperture_count
@@ -361,6 +399,209 @@ fn accept_root_table(
             status: Status::Ok,
             detail: root_count as u32,
         },
+    );
+    publish_inventory_from_hpci(bootstrap, authority, &table, manager_generation);
+    authority.roots = Some(table);
+}
+
+struct ReadOnlyTransport<'a> {
+    windows: &'a [Option<WindowMapping>],
+    windows_len: usize,
+    #[cfg(feature = "force-legacy")]
+    legacy_ioport: Option<&'a IoPort>,
+}
+
+impl<'a> ConfigReader for ReadOnlyTransport<'a> {
+    fn read_u32(
+        &mut self,
+        segment: u16,
+        bus: u8,
+        device: u8,
+        function: u8,
+        offset: u16,
+    ) -> Option<u32> {
+        read_raw_u32(
+            self.windows,
+            self.windows_len,
+            #[cfg(feature = "force-legacy")]
+            self.legacy_ioport,
+            segment,
+            bus,
+            device,
+            function,
+            offset,
+        )
+    }
+}
+
+fn aperture_class(kind: ApertureKind) -> ResourceClass {
+    match kind {
+        ApertureKind::Io => ResourceClass::Io,
+        ApertureKind::Mmio32 => ResourceClass::Mmio32,
+        ApertureKind::Mmio64 => ResourceClass::Mmio64,
+        ApertureKind::PrefetchableMemory => ResourceClass::PrefetchableMemory,
+    }
+}
+
+fn publish_inventory_from_hpci(
+    bootstrap: &Channel,
+    authority: &mut ConfigAuthority,
+    table: &RootBridgeTable,
+    manager_generation: u64,
+) {
+    let mut roots = Vec::new();
+    for root in &table.roots[..table.root_count] {
+        roots.push(RootBus {
+            root_id: root.root_id,
+            segment: root.segment,
+            start_bus: root.start_bus,
+            end_bus: root.end_bus,
+        });
+    }
+    let mut apertures = Vec::new();
+    for ap in &table.apertures[..table.aperture_count] {
+        let Some(owner) = table.roots.get(usize::from(ap.root_index)) else {
+            continue;
+        };
+        apertures.push(RootAperture {
+            root_id: owner.root_id,
+            class: aperture_class(ap.kind),
+            pci_base: ap.pci_base,
+            cpu_base: ap.cpu_base,
+            len: ap.len,
+        });
+    }
+
+    let mut transport = ReadOnlyTransport {
+        windows: &authority.windows,
+        windows_len: authority.windows_len,
+        #[cfg(feature = "force-legacy")]
+        legacy_ioport: authority.legacy_ioport.as_ref(),
+    };
+    match authority
+        .inventory
+        .publish_from_roots(&mut transport, &roots, &apertures)
+    {
+        Ok(inv) => {
+            log_diagnostic_inventory(inv);
+            let _ = send(
+                bootstrap,
+                Message::inventory_published(
+                    manager_generation,
+                    inv.snapshot.nodes().len() as u32,
+                    inv.availability == FirmwareResourceAvailability::Available,
+                ),
+            );
+        }
+        Err(err) => {
+            println!(
+                "[pci-manager] diagnostic PCI inventory build skipped: {:?}",
+                err
+            );
+        }
+    }
+}
+
+fn handle_acpi_frozen(
+    bootstrap: &Channel,
+    authority: &mut ConfigAuthority,
+    manager_generation: u64,
+    no_hpci: bool,
+) {
+    if let Some(preserved) = authority.inventory.last_good() {
+        let gen = preserved.generation;
+        let nodes = preserved.snapshot.nodes().len();
+        authority.inventory.freeze();
+        println!(
+            "[pci-manager] ACPI frozen; preserved diagnostic PCI inventory gen={} functions={} config-writes=0",
+            gen, nodes
+        );
+        return;
+    }
+
+    if no_hpci && !authority.inventory.is_frozen() {
+        let mut fallback_roots = Vec::new();
+        for (idx, window) in authority.windows[..authority.windows_len]
+            .iter()
+            .flatten()
+            .enumerate()
+        {
+            fallback_roots.push(RootBus {
+                root_id: (idx as u64) + 1,
+                segment: window.segment,
+                start_bus: window.bus_start,
+                end_bus: window.bus_end,
+            });
+        }
+        let mut transport = ReadOnlyTransport {
+            windows: &authority.windows,
+            windows_len: authority.windows_len,
+            #[cfg(feature = "force-legacy")]
+            legacy_ioport: authority.legacy_ioport.as_ref(),
+        };
+        if let Ok(inv) = authority
+            .inventory
+            .publish_unavailable(&mut transport, &fallback_roots)
+        {
+            log_diagnostic_inventory(inv);
+            let _ = send(
+                bootstrap,
+                Message::inventory_published(
+                    manager_generation,
+                    inv.snapshot.nodes().len() as u32,
+                    false,
+                ),
+            );
+        }
+    }
+    authority.inventory.freeze();
+}
+
+fn log_diagnostic_inventory(inv: &DiagnosticInventory) {
+    let mut res_valid = 0usize;
+    let mut res_unrouteable = 0usize;
+    let mut res_conflict = 0usize;
+    if let Some(report) = inv.validation.as_ref() {
+        for entry in report.resources() {
+            match entry.status {
+                huesos_pci::resource_validation::ResourceStatus::Valid
+                | huesos_pci::resource_validation::ResourceStatus::Fixed => res_valid += 1,
+                huesos_pci::resource_validation::ResourceStatus::Unrouteable => {
+                    res_unrouteable += 1
+                }
+                huesos_pci::resource_validation::ResourceStatus::Conflicting => res_conflict += 1,
+                _ => {}
+            }
+        }
+    }
+    for node in inv.snapshot.nodes() {
+        let addr = node.function.address;
+        println!(
+            "[pci-manager] obs inv-dev gen={} seg={} bdf={:02x}:{:02x}.{} vendor=0x{:04x} dev=0x{:04x} class={:02x}:{:02x}:{:02x} depth={} resources={}",
+            inv.generation,
+            addr.segment(),
+            addr.bus(),
+            addr.device(),
+            addr.function(),
+            node.function.vendor_id,
+            node.function.device_id,
+            node.function.class_code.class,
+            node.function.class_code.subclass,
+            node.function.class_code.prog_if,
+            node.depth,
+            inv.availability.as_str()
+        );
+    }
+    println!(
+        "[pci-manager] published diagnostic PCI inventory: gen={} roots={} functions={} resources={} valid-res={} unrouteable-res={} conflict-res={} config-writes={}",
+        inv.generation,
+        inv.snapshot.roots().len(),
+        inv.snapshot.nodes().len(),
+        inv.availability.as_str(),
+        res_valid,
+        res_unrouteable,
+        res_conflict,
+        inv.config_writes
     );
 }
 
@@ -819,6 +1060,62 @@ const fn validation_error_name(error: ValidationError) -> &'static str {
         ValidationError::Generation => "generation",
         ValidationError::Snapshot => "snapshot",
     }
+}
+
+#[cfg(feature = "force-legacy")]
+#[allow(clippy::too_many_arguments)]
+fn read_raw_u32(
+    windows: &[Option<WindowMapping>],
+    windows_len: usize,
+    legacy_ioport: Option<&IoPort>,
+    segment: u16,
+    bus: u8,
+    device: u8,
+    function: u8,
+    offset: u16,
+) -> Option<u32> {
+    let legacy = legacy_ioport?;
+    let covered = windows[..windows_len].iter().flatten().any(|window| {
+        window.segment == segment && bus >= window.bus_start && bus <= window.bus_end
+    });
+    if !covered || offset >= 256 || (offset & 3) != 0 || device >= 32 || function >= 8 {
+        return None;
+    }
+    let address = 0x8000_0000u32
+        | (u32::from(bus) << 16)
+        | (u32::from(device) << 11)
+        | (u32::from(function) << 8)
+        | u32::from(offset);
+    legacy.write_u32(0x0CF8, address).ok()?;
+    legacy.read_u32(0x0CFC).ok()
+}
+
+#[cfg(not(feature = "force-legacy"))]
+fn read_raw_u32(
+    windows: &[Option<WindowMapping>],
+    windows_len: usize,
+    segment: u16,
+    bus: u8,
+    device: u8,
+    function: u8,
+    offset: u16,
+) -> Option<u32> {
+    if (offset & 3) != 0 || device >= 32 || function >= 8 {
+        return None;
+    }
+    let window = windows[..windows_len].iter().flatten().find(|window| {
+        window.segment == segment && bus >= window.bus_start && bus <= window.bus_end
+    })?;
+    let function_offset = (bus - window.bus_start) as u64 * SPAN_PER_BUS
+        + (u64::from(device) << 15)
+        + (u64::from(function) << 12)
+        + u64::from(offset);
+    if function_offset + 4 > window.span_bytes {
+        return None;
+    }
+    Some(libcanvas::channel::mmio_load::<u32>(
+        window.va_base + function_offset,
+    ))
 }
 
 #[cfg(feature = "force-legacy")]

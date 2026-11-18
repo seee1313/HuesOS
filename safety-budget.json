@@ -83,6 +83,7 @@
     "crates/huesos-userspace/libcanvas/src/resource.rs": 1,
     "crates/huesos-userspace/libcanvas/src/signal.rs": 1,
     "crates/huesos-userspace/libcanvas/src/vmo.rs": 3,
+    "crates/huesos-userspace/pci-manager/src/main.rs": 1,
     "crates/huesos-userspace/terminal/src/screen.rs": 2,
     "crates/huesos-sched/src/eevdf.rs": 0
   }

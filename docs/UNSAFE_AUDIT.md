@@ -3159,3 +3159,16 @@ within the 383 cap at 382):
   FFI call to `hues_uacpi_collect_pci_roots(&mut raw)` passing a mutable pointer
   to stack-allocated `RawPciRootsOut`, whose C helper writes only within fixed
   `HUES_MAX_PCI_ROOTS` (`16`) and `HUES_MAX_PCI_APERTURES` (`64`) bounds.
+
+## AP-16 diagnostic read-only PCI inventory
+
+AP-16 adds read-only PCI topology and firmware-resource availability reporting
+inside `pci-manager` via `huesos-pci::inventory`, adding one audited `unsafe`
+block (total `unsafe_blocks` reaches the 383 cap at 383):
+
+- `crates/huesos-userspace/pci-manager/src/main.rs` (`1` unsafe block):
+  one-time `HEAP.init()` at `_start` before any allocation or additional thread
+  exists (`ScudoHeap` as `#[global_allocator]`, matching `acpi-manager` and
+  `hxfs-service`). All PCI bus scanning uses read-only `huesos_pci::inventory`
+  through ECAM `mmio_load` (or `force-legacy` common-subset reads) with zero
+  config writes.

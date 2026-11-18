@@ -1302,6 +1302,7 @@ impl DriverManager {
                 self.acpi_manager_generation
             );
         }
+        self.notify_pci_acpi_frozen(false);
         self.acpi_authority_settled = false;
         self.acpi_availability.record_runtime_failure();
         let now = libcanvas::system::monotonic_ticks().unwrap_or(0);
@@ -2320,6 +2321,21 @@ impl DriverManager {
                     ) => {
                         println!("[driver-manager] PCI manager rejected HPCI root table");
                     }
+                    (pci_manager::Opcode::InventoryPublished, pci_manager::Status::Ok) => {
+                        println!(
+                            "[driver-manager] PCI diagnostic inventory published: {} function(s) (FirmwareResourcesAvailable)",
+                            message.detail
+                        );
+                    }
+                    (
+                        pci_manager::Opcode::InventoryPublished,
+                        pci_manager::Status::FirmwareResourcesUnavailable,
+                    ) => {
+                        println!(
+                            "[driver-manager] PCI diagnostic inventory published: {} function(s) (FirmwareResourcesUnavailable)",
+                            message.detail
+                        );
+                    }
                     (pci_manager::Opcode::Heartbeat, _) => {}
                     _ => println!("[driver-manager] unexpected PCI manager control message"),
                 }
@@ -2761,9 +2777,31 @@ impl DriverManager {
         self.hpci = Some(vmo);
     }
 
+    fn notify_pci_acpi_frozen(&self, no_hpci: bool) {
+        if !self.pci_config_authority_ready {
+            return;
+        }
+        let Some(host) = self.pci_manager.as_ref() else {
+            return;
+        };
+        let message =
+            pci_manager::Message::acpi_generation_frozen(self.pci_manager_generation, no_hpci);
+        let mut bytes = [0u8; pci_manager::MESSAGE_BYTES];
+        if let Some(len) = pci_manager::encode(message, &mut bytes) {
+            let _ = host.bootstrap.write(&bytes[..len]);
+        }
+    }
+
     fn maybe_handoff_pci_roots(&mut self) {
-        if self.pci_roots_handed_off || !self.acpi_hpci_eligible || !self.pci_config_authority_ready
-        {
+        if self.pci_roots_handed_off || !self.pci_config_authority_ready {
+            return;
+        }
+        if self.acpi_namespace_initialized && !self.acpi_hpci_eligible {
+            self.pci_roots_handed_off = true;
+            self.notify_pci_acpi_frozen(true);
+            return;
+        }
+        if !self.acpi_hpci_eligible {
             return;
         }
         let (Some(host), Some(hpci_vmo)) = (self.pci_manager.as_ref(), self.hpci.as_ref()) else {

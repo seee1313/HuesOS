@@ -57,6 +57,13 @@ pub enum Opcode {
     /// minted — the manager must stay fail-closed). Sent at most
     /// once per manager generation, only after a `Hello`.
     AuthorityComplete = 6,
+    /// DriverManager freezes new inventory generations when ACPI crashes,
+    /// restarts, or fails initialization (`detail=1` when no HPCI roots
+    /// were ever published).
+    AcpiGenerationFrozen = 7,
+    /// PCI Manager published one immutable read-only diagnostic inventory
+    /// snapshot (`detail` carries discovered function count).
+    InventoryPublished = 8,
 }
 
 impl Opcode {
@@ -68,6 +75,8 @@ impl Opcode {
             4 => Some(Self::RootTableAccepted),
             5 => Some(Self::RootTableRejected),
             6 => Some(Self::AuthorityComplete),
+            7 => Some(Self::AcpiGenerationFrozen),
+            8 => Some(Self::InventoryPublished),
             _ => None,
         }
     }
@@ -93,6 +102,9 @@ pub enum Status {
     /// the upgrade; every PCI configuration read still requires the
     /// AP-10 mediation protocol.
     ConfigAuthorityReady = 2,
+    /// Diagnostic inventory was built without complete validated ACPI
+    /// roots/apertures (`FirmwareResourcesUnavailable`).
+    FirmwareResourcesUnavailable = 3,
 }
 
 impl Status {
@@ -103,6 +115,7 @@ impl Status {
             -1 => Some(Self::InvalidMessage),
             -2 => Some(Self::InvalidRootTable),
             2 => Some(Self::ConfigAuthorityReady),
+            3 => Some(Self::FirmwareResourcesUnavailable),
             _ => None,
         }
     }
@@ -167,6 +180,39 @@ impl Message {
             manager_generation,
             status: Status::Ok,
             detail: window_count,
+        }
+    }
+
+    /// Notify PCI Manager to freeze new inventory generations while preserving
+    /// its last-good diagnostic snapshot.
+    pub const fn acpi_generation_frozen(manager_generation: u64, no_hpci: bool) -> Self {
+        Self {
+            opcode: Opcode::AcpiGenerationFrozen,
+            manager_generation,
+            status: if no_hpci {
+                Status::FirmwareResourcesUnavailable
+            } else {
+                Status::Ok
+            },
+            detail: if no_hpci { 1 } else { 0 },
+        }
+    }
+
+    /// Report that diagnostic read-only PCI inventory was published.
+    pub const fn inventory_published(
+        manager_generation: u64,
+        function_count: u32,
+        resources_available: bool,
+    ) -> Self {
+        Self {
+            opcode: Opcode::InventoryPublished,
+            manager_generation,
+            status: if resources_available {
+                Status::Ok
+            } else {
+                Status::FirmwareResourcesUnavailable
+            },
+            detail: function_count,
         }
     }
 }
@@ -412,5 +458,19 @@ mod tests {
         state.exhaust();
         assert_eq!(state.failures(), u8::MAX);
         assert!(!state.can_attempt(u64::MAX, u8::MAX));
+    }
+
+    #[test]
+    fn ap16_inventory_and_freeze_messages_round_trip() {
+        for msg in [
+            Message::acpi_generation_frozen(4, false),
+            Message::acpi_generation_frozen(4, true),
+            Message::inventory_published(4, 12, true),
+            Message::inventory_published(4, 3, false),
+        ] {
+            let mut bytes = [0u8; MESSAGE_BYTES];
+            assert_eq!(encode(msg, &mut bytes), Some(MESSAGE_BYTES));
+            assert_eq!(decode(&bytes), Some(msg));
+        }
     }
 }
