@@ -262,6 +262,10 @@ pub struct DriverManager {
     nvme_heartbeat_count: u64,
     bootfs_loaded: bool,
     storage_boot: Option<storage_boot::StorageBootInfo>,
+    storage_off: bool,
+    storage_skipped_pending: bool,
+    storage_skipped_sent: bool,
+    nvme_lease_ro: Option<Handle>,
     nvme_boot_driver: Option<BootDriverSpec>,
     /// Resource handles received from init but not yet forwarded to
     /// their target drivers. Indexed implicitly by driver name via a
@@ -434,6 +438,10 @@ impl DriverManager {
             nvme_heartbeat_count: 0,
             bootfs_loaded: false,
             storage_boot: None,
+            storage_off: false,
+            storage_skipped_pending: false,
+            storage_skipped_sent: false,
+            nvme_lease_ro: None,
             nvme_boot_driver: None,
             pending_resources: [
                 PendingResources::empty(),
@@ -498,9 +506,10 @@ impl DriverManager {
         }
         if self.bootfs_loaded
             && self.nvme_host.is_none()
+            && !self.storage_off
+            && self.nvme_lease_ro.is_some()
             && self.driver_grants_ready(NVME_DRIVER_NAME)
             && self.nvme_boot_driver.is_some()
-            && self.storage_boot_has_nvme()
         {
             self.start_nvme_host();
         }
@@ -712,31 +721,17 @@ impl DriverManager {
             println!("[driver-manager] storage boot-info parse failed");
             return;
         };
-        println!(
-            "[driver-manager] storage boot-info: dma={:#x}+{:#x} nvme_count={}",
-            info.dma_pool.base, info.dma_pool.len, info.nvme_count
-        );
-        if info.nvme_count > 0 {
-            let nvme = info.nvme[0];
-            println!(
-                "[driver-manager] NVMe PCI function: {:02x}:{:02x}.{} bar0={:#x}+{:#x} irq={} flags={:#x}",
-                nvme.bus,
-                nvme.device,
-                nvme.function,
-                nvme.bar0_base,
-                nvme.bar0_len,
-                nvme.irq_line,
-                nvme.flags
-            );
+        if info.storage_off() {
+            self.storage_off = true;
         }
+        println!(
+            "[driver-manager] storage boot-info: dma={:#x}+{:#x} storage_off={}",
+            info.dma_pool.base,
+            info.dma_pool.len,
+            info.storage_off()
+        );
         self.storage_boot = Some(info);
         self.try_start_pending_hosts();
-    }
-
-    fn storage_boot_has_nvme(&self) -> bool {
-        self.storage_boot
-            .as_ref()
-            .is_some_and(|info| info.nvme_count > 0)
     }
 
     fn load_boot_driver_manifest(&mut self) {
@@ -812,6 +807,9 @@ impl DriverManager {
         match launched {
             Ok((process, bootstrap)) => {
                 println!("[driver-manager] launched NVMe DriverHost from HBI BOOTFS");
+                if let Some(ro_lease) = self.nvme_lease_ro.take() {
+                    let _ = bootstrap.write_handle(pci_manager::DEVICE_LEASE_RO_LABEL, ro_lease);
+                }
                 self.forward_pending_resources(manifest.name_as_str(), &bootstrap, &process);
                 self.nvme_host = Some(ManagedHost { process, bootstrap });
                 self.wait_for_nvme_host_ready();
@@ -884,6 +882,10 @@ impl DriverManager {
     /// cosmetic, and a full or closed channel must never stall the
     /// boot it is describing.
     fn flush_storage_progress(&mut self, init_bootstrap: &Channel) {
+        if self.storage_skipped_pending && !self.storage_skipped_sent {
+            let _ = init_bootstrap.write(b"storage:skipped");
+            self.storage_skipped_sent = true;
+        }
         if self.storage_progress <= self.storage_progress_sent {
             return;
         }
@@ -1103,14 +1105,15 @@ impl DriverManager {
             return;
         };
         self.pci_manager_generation = generation.max(1);
-        let hello = if cfg!(feature = "pci-force-legacy") {
-            pci_manager::Message::hello_with_flags(
-                self.pci_manager_generation,
-                pci_manager::HELLO_FLAG_FORCE_LEGACY,
-            )
-        } else {
-            pci_manager::Message::hello(self.pci_manager_generation)
-        };
+        let mut hello_flags = 0u32;
+        if cfg!(feature = "pci-force-legacy") {
+            hello_flags |= pci_manager::HELLO_FLAG_FORCE_LEGACY;
+        }
+        if self.storage_off {
+            hello_flags |= pci_manager::HELLO_FLAG_STORAGE_OFF;
+        }
+        let hello =
+            pci_manager::Message::hello_with_flags(self.pci_manager_generation, hello_flags);
         let mut message = [0u8; pci_manager::MESSAGE_BYTES];
         let Some(length) = pci_manager::encode(hello, &mut message) else {
             println!("[driver-manager] PCI manager hello encode failed");
@@ -1549,6 +1552,9 @@ impl DriverManager {
                 Ok((n, Some(handle))) if &buf[..n] == protocol::STORAGE_BOOT_VMO.as_bytes() => {
                     println!("[driver-manager] received storage boot-info VMO");
                     self.install_storage_boot_info(Vmo::from_handle(handle));
+                }
+                Ok((n, None)) if &buf[..n] == b"storage:off" => {
+                    self.storage_off = true;
                 }
                 Ok((n, Some(handle))) if &buf[..n] == protocol::ACPI_BROKER.as_bytes() => {
                     println!("[driver-manager] received unique ACPI broker capability");
@@ -2336,7 +2342,7 @@ impl DriverManager {
             return;
         };
         let _keep_process_alive = &host.process;
-        let mut bytes = [0u8; 64];
+        let mut bytes = [0u8; 96];
         for _ in 0..32 {
             match host.bootstrap.read_optional_handle(&mut bytes) {
                 Ok((length, Some(handle))) => {
@@ -2350,6 +2356,14 @@ impl DriverManager {
                         } else {
                             drop(handle);
                         }
+                    } else if label == pci_manager::DEVICE_LEASE_NVME_RO_LABEL {
+                        if libcanvas::device_lease::query(&handle).is_ok() {
+                            self.nvme_lease_ro = Some(handle);
+                        } else {
+                            drop(handle);
+                        }
+                    } else if label.starts_with(RESOURCE_LABEL_PREFIX) {
+                        self.record_resource_handle(label, handle);
                     } else if label == pci_manager::LEASE_RESOURCE_LABEL {
                         if self.pci_bound_resources_len < self.pci_bound_resources.len() {
                             self.pci_bound_resources[self.pci_bound_resources_len] = Some(handle);
@@ -2463,6 +2477,12 @@ impl DriverManager {
                                 self.pci_bound_leases_len,
                                 self.pci_bound_resources_len
                             );
+                            if !self.storage_off && self.nvme_lease_ro.is_some() {
+                                self.mark_driver_grants_ready(NVME_DRIVER_NAME);
+                                self.try_start_pending_hosts();
+                            } else if !self.storage_off {
+                                self.storage_skipped_pending = true;
+                            }
                         }
                         (pci_manager::Opcode::Heartbeat, _) => {}
                         _ => println!("[driver-manager] unexpected PCI manager control message"),

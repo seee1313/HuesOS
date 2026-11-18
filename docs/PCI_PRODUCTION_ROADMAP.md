@@ -682,7 +682,7 @@ Exit criterion:
 
 # Stage J — NVMe migration
 
-Status: **NOT STARTED**
+Status: **DONE (AP-22)**
 
 ## J.1 Dual-path equivalence
 

@@ -237,13 +237,18 @@ pub extern "C" fn _start() -> ! {
         // work it triggers occupies the rest. Progress is monotonic, so
         // these must not overlap DriverManager's own reports, which
         // start at 30.
-        send_bootfs_vmo(&mut logger, channel, &bootfs);
-        ui.step(b"storage", 5);
-        send_acpi_tables_vmo(&mut logger, channel, &acpi_tables);
-        ui.step(b"storage", 10);
-        send_acpi_broker(&mut logger, channel, acpi_broker);
-        ui.step(b"storage", 15);
+        // Send storage boot-info (DMA pool + kill switch) before BOOTFS
+        // so DriverManager knows `storage_off` before launching pci-manager.
         send_storage_boot_info_vmo(&mut logger, channel, &storage_boot_info);
+        if storage_off {
+            let _ = channel.write(b"storage:off");
+        }
+        ui.step(b"storage", 5);
+        send_bootfs_vmo(&mut logger, channel, &bootfs);
+        ui.step(b"storage", 10);
+        send_acpi_tables_vmo(&mut logger, channel, &acpi_tables);
+        ui.step(b"storage", 15);
+        send_acpi_broker(&mut logger, channel, acpi_broker);
         ui.step(b"storage", 20);
         send_manifest_grants(
             &mut logger,
@@ -253,14 +258,11 @@ pub extern "C" fn _start() -> ! {
         );
         ui.step(b"storage", 25);
         if storage_off {
-            // Kernel already skipped PCI/NVMe discovery. Do not mint
-            // grants even if a stale boot-info VMO claimed a function.
+            // Kernel already skipped storage and pci-manager leaves NVMe unbound.
             init_logln!(logger, "[init] storage disabled by init.storage=off");
             ui.end(b"storage", StageState::Skipped, &mut logger);
-        } else if !send_nvme_boot_grants(&mut logger, channel, &storage_boot_info) {
-            // No controller to bring up: nothing will ever report on
-            // this stage, so settle it now instead of holding the boot
-            // until its deadline expires.
+        } else if !send_boot_dma_pool_grant(&mut logger, channel, &storage_boot_info) {
+            // No DMA pool available for NVMe.
             ui.end(b"storage", StageState::Skipped, &mut logger);
         }
         // The stage deliberately stays open here. Handing over the
@@ -702,14 +704,14 @@ fn send_manifest_grants(
 }
 
 /// Mint and transfer the NVMe boot resources.
-///
-/// Returns whether a controller was actually handed over. The caller
-/// needs this: with no NVMe function there is nothing to enumerate and
-/// no filesystem to mount, so the storage stage must be marked skipped
-/// rather than left waiting for a bring-up that will never be
-/// attempted. A serial-only or diskless boot is a normal
-/// configuration, not a failure.
-fn send_nvme_boot_grants(logger: &mut InitLogger, dm_bootstrap: &Channel, storage: &Vmo) -> bool {
+/// Transfer only the generic boot DMA pool Resource capability to
+/// DriverManager (Stage J.3). PCI enumeration, BAR MMIO, and MSI/MSI-X IRQ
+/// minting are performed exclusively by `pci-manager` via `DeviceLease`.
+fn send_boot_dma_pool_grant(
+    logger: &mut InitLogger,
+    dm_bootstrap: &Channel,
+    storage: &Vmo,
+) -> bool {
     use libcanvas::manifest::ResourceGrant;
     use libcanvas::resource::{kind, Resource};
     use libcanvas::storage_boot;
@@ -720,7 +722,7 @@ fn send_nvme_boot_grants(logger: &mut InitLogger, dm_bootstrap: &Channel, storag
         Err(error) => {
             init_logln!(
                 logger,
-                "[init] NVMe boot grants skipped: storage boot-info read failed: {}",
+                "[init] boot DMA pool skipped: storage boot-info read failed: {}",
                 error.as_str()
             );
             return false;
@@ -729,107 +731,55 @@ fn send_nvme_boot_grants(logger: &mut InitLogger, dm_bootstrap: &Channel, storag
     let Some(info) = storage_boot::decode(&bytes[..read]) else {
         init_logln!(
             logger,
-            "[init] NVMe boot grants skipped: bad storage boot-info"
+            "[init] boot DMA pool skipped: bad storage boot-info"
         );
         return false;
     };
-    if info.nvme_count == 0 {
-        init_logln!(
-            logger,
-            "[init] NVMe boot grants skipped: no NVMe PCI function"
-        );
+    if info.storage_off() || !info.dma_pool.is_present() {
         return false;
     }
 
-    let nvme = info.nvme[0];
-    let grants = [
-        ResourceGrant {
-            kind: kind::MMIO,
-            base: nvme.bar0_base,
-            len: nvme.bar0_len,
-            exclusive: true,
-        },
-        ResourceGrant {
-            kind: kind::IRQ,
-            base: nvme.irq_line as u64,
-            len: u64::from(nvme.irq_vector_count.max(1)),
-            exclusive: true,
-        },
-        ResourceGrant {
-            kind: kind::DMA_POOL,
-            base: info.dma_pool.base,
-            len: info.dma_pool.len,
-            exclusive: true,
-        },
-    ];
-
-    init_logln!(
-        logger,
-        "[init] NVMe boot grants: pci={:02x}:{:02x}.{} bar0={:#x}+{:#x} irq={} count={} flags={:#x} dma={:#x}+{:#x}",
-        nvme.bus,
-        nvme.device,
-        nvme.function,
-        nvme.bar0_base,
-        nvme.bar0_len,
-        nvme.irq_line,
-        nvme.irq_vector_count,
-        nvme.flags,
-        info.dma_pool.base,
-        info.dma_pool.len
-    );
-
-    let mut sent = 0usize;
-    let mut idx = 0usize;
-    while idx < grants.len() {
-        let grant = grants[idx];
-        let resource = match Resource::create(grant.kind, grant.base, grant.len, grant.exclusive) {
-            Ok(resource) => resource,
-            Err(error) => {
-                init_logln!(
-                    logger,
-                    "[init] NVMe boot grant {:?} base={:#x} len={:#x} failed: {}",
-                    grant.kind,
-                    grant.base,
-                    grant.len,
-                    error.as_str()
-                );
-                idx += 1;
-                continue;
-            }
-        };
-        let mut label = [0u8; 96];
-        let label_len = format_grant_label(&mut label, "driver-host-nvme", &grant);
-        let payload = &label[..label_len.min(label.len())];
-        match dm_bootstrap.write_handle(payload, resource.into_handle()) {
-            Ok(()) => sent += 1,
-            Err((error, _handle)) => init_logln!(
+    let grant = ResourceGrant {
+        kind: kind::DMA_POOL,
+        base: info.dma_pool.base,
+        len: info.dma_pool.len,
+        exclusive: true,
+    };
+    let resource = match Resource::create(grant.kind, grant.base, grant.len, grant.exclusive) {
+        Ok(resource) => resource,
+        Err(error) => {
+            init_logln!(
                 logger,
-                "[init] NVMe boot grant transfer failed for {}: {}",
-                core::str::from_utf8(payload).unwrap_or("?"),
+                "[init] boot DMA pool base={:#x} len={:#x} failed: {}",
+                grant.base,
+                grant.len,
                 error.as_str()
-            ),
+            );
+            return false;
         }
-        idx += 1;
-    }
-    init_logln!(
-        logger,
-        "[init] NVMe boot grants: transferred {}/{} resource handle(s)",
-        sent,
-        grants.len()
-    );
-
+    };
     let mut label = [0u8; 96];
-    let len = format_grants_complete_label(&mut label, "driver-host-nvme");
-    let payload = &label[..len.min(label.len())];
-    match dm_bootstrap.write(payload) {
-        Ok(()) => init_logln!(logger, "[init] NVMe boot grants-complete signalled"),
-        Err(error) => init_logln!(
-            logger,
-            "[init] NVMe boot grants-complete failed: {}",
-            error.as_str()
-        ),
+    let label_len = format_grant_label(&mut label, "driver-host-nvme", &grant);
+    let payload = &label[..label_len.min(label.len())];
+    match dm_bootstrap.write_handle(payload, resource.into_handle()) {
+        Ok(()) => {
+            init_logln!(
+                logger,
+                "[init] boot DMA pool transferred: dma={:#x}+{:#x}",
+                info.dma_pool.base,
+                info.dma_pool.len
+            );
+            true
+        }
+        Err((error, _handle)) => {
+            init_logln!(
+                logger,
+                "[init] boot DMA pool transfer failed: {}",
+                error.as_str()
+            );
+            false
+        }
     }
-    true
 }
 
 fn format_grants_complete_label(out: &mut [u8], driver: &str) -> usize {
