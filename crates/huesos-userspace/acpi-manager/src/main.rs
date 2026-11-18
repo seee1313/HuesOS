@@ -13,7 +13,7 @@ use core::panic::PanicInfo;
 use huesos_abi::acpi_archive::{
     ArchiveReadError, ArchiveReader, ArchiveSummary, TABLE_ENTRY_BYTES,
 };
-use huesos_abi::acpi_broker::{ArchiveError, MAX_ARCHIVE_BYTES, VERSION};
+use huesos_abi::acpi_broker::{ArchiveError, MAX_ARCHIVE_BYTES};
 use huesos_abi::acpi_manager;
 use huesos_abi::hmcf;
 use libcanvas::{println, wait_any, Channel, ErrorCode, Signals, Vmar, Vmo, WaitItem};
@@ -359,18 +359,17 @@ fn receive_bootstrap(bootstrap: &Channel) -> Option<BootstrapInputs> {
 }
 
 fn verify_deny_by_default(broker: &libcanvas::acpi_broker::AcpiBroker) -> bool {
-    let request = huesos_abi::acpi_broker::Request {
-        version: VERSION,
-        opcode: huesos_abi::acpi_broker::Opcode::SystemIoRead as u16,
-        width: 1,
-        request_id: 1,
-        address: 0x80,
-        ..huesos_abi::acpi_broker::Request::default()
-    };
-    broker.call(&request).is_ok_and(|response| {
+    let io_denied = broker.system_io_read(0x80, 1, 1, 1).is_ok_and(|response| {
         response.status == huesos_abi::acpi_broker::Status::AccessDenied as i32
-            && response.request_id == request.request_id
-    })
+            && response.request_id == 1
+    });
+    let mmio_denied = broker
+        .mmio_read(0xFEE0_0000, 4, 1, 2)
+        .is_ok_and(|response| {
+            response.status == huesos_abi::acpi_broker::Status::AccessDenied as i32
+                && response.request_id == 2
+        });
+    io_denied && mmio_denied
 }
 
 fn send_failure(bootstrap: &Channel, generation: u64, status: acpi_manager::Status, detail: u32) {
