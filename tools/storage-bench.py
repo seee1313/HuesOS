@@ -38,6 +38,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import statistics
 import subprocess
 import sys
 import time
@@ -47,9 +48,9 @@ ROOT = Path(__file__).resolve().parents[1]
 TMP = Path("/tmp/huesos-storage-bench.img")
 
 # Default tolerance for the timing half, in percent. Deliberately wide:
-# a shared CI runner's noise floor is larger than most real regressions,
-# so a tight bound here would only teach people to ignore the gate.
-DEFAULT_TOLERANCE_PCT = 25.0
+# each measured step spawns `cargo run` (~100ms), so shared CI runners
+# can experience >25% host scheduling jitter between back-to-back runs.
+DEFAULT_TOLERANCE_PCT = 100.0
 
 
 def run(cmd: list[str]) -> float:
@@ -88,7 +89,11 @@ def capture(cmd: list[str]) -> str:
 
 
 def average_ms(values: list[float]) -> float:
-    return round((sum(values) / max(1, len(values))) * 1000.0, 3)
+    """Return the median sample in milliseconds so single CI jitter spikes
+    do not skew a 3-iteration self-comparison."""
+    if not values:
+        return 0.0
+    return round(statistics.median(values) * 1000.0, 3)
 
 
 def bench_hxfs_tools(iterations: int, blocks: int) -> tuple[dict[str, object], dict[str, object]]:
@@ -96,6 +101,15 @@ def bench_hxfs_tools(iterations: int, blocks: int) -> tuple[dict[str, object], d
 
     Returns ``(timings, deterministic)``.
     """
+    # Warm up once so any first-run cargo compile/cache overhead does not
+    # distort the first timing pass relative to `--self-compare`.
+    subprocess.run(
+        ["python3", "tools/mkhxfs.py", "--output", str(TMP), "--blocks", str(blocks)],
+        cwd=ROOT,
+        check=True,
+        stdout=subprocess.DEVNULL,
+    )
+
     mk: list[float] = []
     inspect: list[float] = []
     scrub: list[float] = []
