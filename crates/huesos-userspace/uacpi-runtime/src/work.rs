@@ -1,10 +1,20 @@
 //! Generation-safe CPU0-affine deferred work queue and IRQ lifecycle
 //! state for `uacpi-runtime` (AP-12). Zero `unsafe` in this module.
 
+use core::ffi::c_void;
 use spin::Mutex;
+
+use crate::primitives::store_scalar;
+
+const UACPI_STATUS_OK: i32 = 0;
+const UACPI_STATUS_INVALID_ARGUMENT: i32 = 7;
+const UACPI_STATUS_OUT_OF_MEMORY: i32 = 2;
+const UACPI_STATUS_TIMEOUT: i32 = 18;
+const UACPI_STATUS_DENIED: i32 = 20;
 
 const MAX_WORK_ITEMS: usize = 64;
 const MAX_IRQ_HANDLERS: usize = 8;
+const WORK_COMPLETION_MAX_STEPS: usize = 1024;
 
 /// Kind of deferred uACPI work.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -145,5 +155,85 @@ pub fn wait_for_work_completion(max_steps: usize) -> bool {
         if let Some(work) = item {
             let _ = (work.generation, work.kind, work.id);
         }
+    }
+}
+
+/// uACPI host callback: install an interrupt handler authorized by `AcpiBroker`.
+#[unsafe(no_mangle)]
+pub extern "C" fn uacpi_kernel_install_interrupt_handler(
+    irq: u32,
+    handler: *const c_void,
+    _context: *mut c_void,
+    out_irq_handle: *mut *mut c_void,
+) -> i32 {
+    if out_irq_handle.is_null() {
+        return UACPI_STATUS_INVALID_ARGUMENT;
+    }
+    if handler.is_null() {
+        store_scalar(out_irq_handle, core::ptr::null_mut());
+        return UACPI_STATUS_INVALID_ARGUMENT;
+    }
+    if let Err(status) = crate::broker::authorize_install_interrupt(irq) {
+        store_scalar(out_irq_handle, core::ptr::null_mut());
+        return status;
+    }
+    if install_irq(irq).is_err() {
+        let _ = crate::broker::authorize_remove_interrupt(irq);
+        store_scalar(out_irq_handle, core::ptr::null_mut());
+        return UACPI_STATUS_DENIED;
+    }
+    let opaque = (usize::try_from(irq).unwrap_or(0)).saturating_add(1);
+    store_scalar(out_irq_handle, opaque as *mut c_void);
+    UACPI_STATUS_OK
+}
+
+/// uACPI host callback: uninstall a previously installed interrupt handler.
+#[unsafe(no_mangle)]
+pub extern "C" fn uacpi_kernel_uninstall_interrupt_handler(
+    _handler: *const c_void,
+    irq_handle: *mut c_void,
+) -> i32 {
+    let Some(raw) = (irq_handle as usize).checked_sub(1) else {
+        return UACPI_STATUS_INVALID_ARGUMENT;
+    };
+    let Ok(irq) = u32::try_from(raw) else {
+        return UACPI_STATUS_INVALID_ARGUMENT;
+    };
+    if uninstall_irq(irq).is_err() {
+        return UACPI_STATUS_DENIED;
+    }
+    let _ = crate::broker::authorize_remove_interrupt(irq);
+    UACPI_STATUS_OK
+}
+
+/// uACPI host callback: enqueue deferred GPE or Notify work on CPU0.
+#[unsafe(no_mangle)]
+pub extern "C" fn uacpi_kernel_schedule_work(
+    work_type: u32,
+    handler: *const c_void,
+    context: *mut c_void,
+) -> i32 {
+    if handler.is_null() {
+        return UACPI_STATUS_INVALID_ARGUMENT;
+    }
+    let kind = match work_type {
+        0 => WorkKind::Gpe,
+        1 => WorkKind::Notification,
+        _ => return UACPI_STATUS_INVALID_ARGUMENT,
+    };
+    let id = (handler as usize as u64) ^ (context as usize as u64);
+    match schedule_work(kind, id) {
+        Ok(()) => UACPI_STATUS_OK,
+        Err(()) => UACPI_STATUS_OUT_OF_MEMORY,
+    }
+}
+
+/// uACPI host callback: drain interrupt callbacks and queued deferred work.
+#[unsafe(no_mangle)]
+pub extern "C" fn uacpi_kernel_wait_for_work_completion() -> i32 {
+    if wait_for_work_completion(WORK_COMPLETION_MAX_STEPS) {
+        UACPI_STATUS_OK
+    } else {
+        UACPI_STATUS_TIMEOUT
     }
 }

@@ -16,13 +16,18 @@
 extern crate alloc;
 
 mod archive;
+mod broker;
 pub mod namespace;
 mod pci;
 mod primitives;
 pub mod work;
 
 pub use archive::{install_archive, ArchiveInstallError, ArchiveMappingInfo};
-pub use pci::{install_pci_mediation, pci_mediation_installed};
+pub use broker::{broker_installed, had_degraded_opregion, install_broker};
+pub use pci::{
+    install_or_refresh_pci_mediation, install_pci_mediation, pci_mediation_installed,
+    run_mediation_self_test,
+};
 pub use primitives::dispatch_suppressed;
 
 /// Pinned vendored uACPI revision compiled by this runtime scaffold.

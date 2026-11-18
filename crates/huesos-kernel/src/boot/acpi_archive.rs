@@ -65,10 +65,12 @@ struct MappingBuild {
 pub fn build(rsdp_physical: u64) -> Result<Vec<u8>, ArchiveBuildError> {
     let rsdp =
         huesos_uacpi::rsdp_snapshot(rsdp_physical).map_err(|_| ArchiveBuildError::InvalidRsdp)?;
+    let rxsdt = huesos_uacpi::rxsdt_snapshot(&rsdp).map_err(|_| ArchiveBuildError::InvalidTable)?;
     let facs = huesos_uacpi::facs_snapshot().map_err(|_| ArchiveBuildError::InvalidFacs)?;
     let installed_count = huesos_uacpi::table_count();
     let total_entries = installed_count
         .checked_add(usize::from(facs.is_some()))
+        .and_then(|count| count.checked_add(1))
         .ok_or(ArchiveBuildError::TooManyTables)?;
     if total_entries > MAX_TABLES as usize {
         return Err(ArchiveBuildError::TooManyTables);
@@ -109,6 +111,28 @@ pub fn build(rsdp_physical: u64) -> Result<Vec<u8>, ArchiveBuildError> {
             revision,
             flags: 0,
             physical_address: metadata.physical_address.unwrap_or(0),
+            offset: 0,
+            length,
+            instance,
+            mapping_index: NO_MAPPING_INDEX,
+        });
+    }
+
+    if !entries
+        .iter()
+        .any(|entry| entry.physical_address == rxsdt.physical_address)
+    {
+        let length = u32::try_from(rxsdt.bytes.len()).map_err(|_| ArchiveBuildError::TooLarge)?;
+        if !(36..=MAX_TABLE_BYTES).contains(&length) {
+            return Err(ArchiveBuildError::InvalidTable);
+        }
+        let instance = next_instance(&mut instances, rxsdt.signature)?;
+        entries.push(Entry {
+            source: EntrySource::Borrowed(rxsdt.bytes),
+            signature: rxsdt.signature,
+            revision: rxsdt.revision,
+            flags: 0,
+            physical_address: rxsdt.physical_address,
             offset: 0,
             length,
             instance,

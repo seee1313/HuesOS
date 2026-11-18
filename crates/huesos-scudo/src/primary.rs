@@ -111,15 +111,31 @@ impl Primary {
         // a comparable number of chunks across classes.
         let total_weight: usize = CLASS_SIZES.iter().sum();
         let usable = area_size & !(PAGE_SIZE - 1);
+        let total_pages = usable / PAGE_SIZE;
+
+        // Guarantee every size class a meaningful floor when the window is
+        // large so small classes (16–128 B) are not starved to a single 4 KiB
+        // page while the remaining budget still scales proportionally with
+        // chunk size.
+        let floor_pages = if total_pages >= NUM_CLASSES * 64 {
+            64
+        } else if total_pages >= NUM_CLASSES * 8 {
+            2
+        } else {
+            1
+        };
+        let floor_bytes = floor_pages * PAGE_SIZE;
+        let reserved_for_floors = (NUM_CLASSES * floor_bytes).min(usable);
+        let extra_bytes = usable.saturating_sub(reserved_for_floors);
 
         let mut cursor = area_offset;
         for (index, class) in classes.iter_mut().enumerate() {
             let weight = CLASS_SIZES[index];
-            let share = ((usable / total_weight.max(1)) * weight) & !(PAGE_SIZE - 1);
-            // Never hand a class less than one page, and never more
-            // than what is left in the area.
+            let extra = (((extra_bytes as u128 * weight as u128) / total_weight.max(1) as u128)
+                as usize)
+                & !(PAGE_SIZE - 1);
             let remaining = (area_offset + usable).saturating_sub(cursor);
-            let size = share.max(PAGE_SIZE).min(remaining);
+            let size = (floor_bytes + extra).max(PAGE_SIZE).min(remaining);
             class.region_offset = cursor;
             class.region_size = size;
             cursor += size;

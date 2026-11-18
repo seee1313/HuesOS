@@ -18,6 +18,9 @@ use huesos_abi::acpi_manager;
 use huesos_abi::hmcf;
 use libcanvas::{println, wait_any, Channel, ErrorCode, Signals, Vmar, Vmo, WaitItem};
 
+#[global_allocator]
+static HEAP: libcanvas::heap::ScudoHeap = libcanvas::heap::ScudoHeap::new();
+
 struct BootstrapInputs {
     generation: Option<u64>,
     hello_flags: u32,
@@ -47,6 +50,12 @@ impl BootstrapInputs {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn _start() -> ! {
+    // SAFETY: called once at process startup before any allocation or
+    // additional thread exists.
+    if unsafe { !HEAP.init() } {
+        libcanvas::debug::write_str("[acpi-manager] hardened heap init failed\n");
+        libcanvas::process::exit(-10);
+    }
     println!("[acpi-manager] isolated Ring-3 service started");
     let bootstrap = libcanvas::channel::bootstrap();
     let Some(mut inputs) = receive_bootstrap(&bootstrap) else {
@@ -105,6 +114,26 @@ pub extern "C" fn _start() -> ! {
     // authority downstream).
     publish_hmcf(&bootstrap, generation, &archive, &summary);
 
+    let Some(self_vmar) = inputs.self_vmar.take() else {
+        send_failure(
+            &bootstrap,
+            generation,
+            acpi_manager::Status::MissingCapability,
+            3,
+        );
+        libcanvas::process::exit(-7);
+    };
+    if let Err(err) = huesos_uacpi_runtime::install_archive(archive, self_vmar) {
+        println!("[acpi-manager] archive installation failed: {:?}", err);
+        send_failure(
+            &bootstrap,
+            generation,
+            acpi_manager::Status::InvalidArchive,
+            0,
+        );
+        libcanvas::process::exit(-7);
+    }
+
     let Some(broker) = inputs.broker.take() else {
         send_failure(
             &bootstrap,
@@ -125,13 +154,24 @@ pub extern "C" fn _start() -> ! {
         libcanvas::process::exit(-6);
     }
     println!("[acpi-manager] broker deny-by-default self-test OK");
+    if !huesos_uacpi_runtime::install_broker(broker, summary.firmware_snapshot_id) {
+        println!("[acpi-manager] broker runtime installation failed");
+        send_failure(
+            &bootstrap,
+            generation,
+            acpi_manager::Status::BrokerDenied,
+            0,
+        );
+        libcanvas::process::exit(-6);
+    }
+    huesos_uacpi_runtime::work::reset_generation(generation);
     match huesos_uacpi_runtime::namespace::load_namespace(summary.firmware_snapshot_id) {
         Ok(ns) => println!(
             "[acpi-manager] AML namespace loaded (snapshot {}, degraded={})",
             ns.snapshot_id, ns.degraded_opregions
         ),
-        Err(()) => {
-            println!("[acpi-manager] AML namespace load failed");
+        Err(err) => {
+            println!("[acpi-manager] AML namespace load failed: {:?}", err);
             send_failure(
                 &bootstrap,
                 generation,
@@ -142,15 +182,6 @@ pub extern "C" fn _start() -> ! {
         }
     }
 
-    let Some(_self_vmar) = inputs.self_vmar.take() else {
-        send_failure(
-            &bootstrap,
-            generation,
-            acpi_manager::Status::MissingCapability,
-            3,
-        );
-        libcanvas::process::exit(-7);
-    };
     if !send_control(
         &bootstrap,
         acpi_manager::Message::ready(generation, summary.table_count),
@@ -194,8 +225,9 @@ pub extern "C" fn _start() -> ! {
 
     let mut fallback_ticks = 0u64;
     let mut last_heartbeat = monotonic_or(&mut fallback_ticks);
-    let mut mediation: Option<libcanvas::pci_mediation::MediationRequester> = None;
-    let mut last_self_test: Option<u64> = None;
+    let mut pending_mediation: Option<Channel> = None;
+    let mut last_pci_generation: Option<u64> = None;
+    let mut namespace_initialized = false;
     loop {
         let now = monotonic_or(&mut fallback_ticks);
         if now.saturating_sub(last_heartbeat) >= 100 {
@@ -212,8 +244,9 @@ pub extern "C" fn _start() -> ! {
         }
         drain_mediation_bootstrap(
             &bootstrap,
-            &mut mediation,
-            &mut last_self_test,
+            &mut pending_mediation,
+            &mut last_pci_generation,
+            &mut namespace_initialized,
             generation,
             summary.firmware_snapshot_id,
         );
@@ -225,14 +258,15 @@ pub extern "C" fn _start() -> ! {
 /// the one private channel end (label
 /// [`huesos_abi::pci_mediation::MEDIATION_CHANNEL_LABEL`]) and the
 /// plain `pci-config-read-gen:<generation>` announcement that binds the
-/// PCI Manager generation. Once both are present and the PCI generation
-/// differs from the last self-tested one, a bounded self-test runs to
-/// produce structured boot evidence (one known host-bridge read plus an
-/// attempt write that must be denied before hardware access).
+/// PCI Manager generation. Once both are present, install/refresh the
+/// mediation requester in `uacpi-runtime`, run the bounded self-test, and
+/// (once per `acpi-manager` generation) execute AP-14 namespace
+/// initialization (`_PIC(IOAPIC)`, `_REG`, `_STA`, `_INI`).
 fn drain_mediation_bootstrap(
     bootstrap: &Channel,
-    mediation: &mut Option<libcanvas::pci_mediation::MediationRequester>,
-    last_self_test: &mut Option<u64>,
+    pending_mediation: &mut Option<Channel>,
+    last_pci_generation: &mut Option<u64>,
+    namespace_initialized: &mut bool,
     generation: u64,
     firmware_snapshot_id: u64,
 ) {
@@ -242,21 +276,31 @@ fn drain_mediation_bootstrap(
             Ok((length, Some(handle)))
                 if &bytes[..length] == huesos_abi::pci_mediation::MEDIATION_CHANNEL_LABEL =>
             {
-                if mediation.is_none() {
-                    *mediation = Some(libcanvas::pci_mediation::MediationRequester::new(
-                        Channel::from_handle(handle),
-                        generation,
-                        firmware_snapshot_id,
-                    ));
-                } else {
-                    drop(handle);
-                }
+                *pending_mediation = Some(Channel::from_handle(handle));
             }
             Ok((_length, Some(handle))) => drop(handle),
             Ok((length, None)) => {
                 if let Some(pci_generation) = parse_generation_announcement(&bytes[..length]) {
-                    if let Some(requester) = mediation.as_mut() {
-                        requester.set_pci_generation(pci_generation);
+                    if *last_pci_generation != Some(pci_generation) {
+                        if let Some(channel) = pending_mediation.take() {
+                            if huesos_uacpi_runtime::install_or_refresh_pci_mediation(
+                                channel,
+                                generation,
+                                pci_generation,
+                                firmware_snapshot_id,
+                            ) {
+                                *last_pci_generation = Some(pci_generation);
+                                huesos_uacpi_runtime::run_mediation_self_test();
+                                if !*namespace_initialized {
+                                    *namespace_initialized = true;
+                                    run_namespace_initialize(
+                                        bootstrap,
+                                        generation,
+                                        firmware_snapshot_id,
+                                    );
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -264,14 +308,38 @@ fn drain_mediation_bootstrap(
             Err(_) => break,
         }
     }
-    if let Some(pci_generation) = mediation
-        .as_ref()
-        .and_then(libcanvas::pci_mediation::MediationRequester::pci_generation)
-    {
-        if *last_self_test != Some(pci_generation) {
-            *last_self_test = Some(pci_generation);
-            if let Some(requester) = mediation.as_ref() {
-                run_mediation_self_test(requester);
+}
+
+fn run_namespace_initialize(bootstrap: &Channel, generation: u64, firmware_snapshot_id: u64) {
+    match huesos_uacpi_runtime::namespace::initialize_namespace(firmware_snapshot_id) {
+        Ok(init) => {
+            println!(
+                "[acpi-manager] AML namespace initialized (snapshot {}, degraded={}, hpci_eligible={}, detail=0x{:x}, pic_status={})",
+                init.snapshot_id,
+                init.degraded,
+                init.hpci_eligible,
+                init.detail_flags,
+                init.pic_status
+            );
+            let msg = acpi_manager::Message::namespace_initialized(
+                generation,
+                init.degraded,
+                init.detail_flags,
+            );
+            if !send_control(bootstrap, msg) {
+                libcanvas::process::exit(-10);
+            }
+        }
+        Err(err) => {
+            println!("[acpi-manager] AML namespace initialize failed: {:?}", err);
+            let msg = acpi_manager::Message {
+                opcode: acpi_manager::Opcode::NamespaceInitialized,
+                manager_generation: generation,
+                status: acpi_manager::Status::NamespaceInitFailed,
+                detail: acpi_manager::INIT_DETAIL_AML_ERROR,
+            };
+            if !send_control(bootstrap, msg) {
+                libcanvas::process::exit(-10);
             }
         }
     }
@@ -293,30 +361,6 @@ fn parse_generation_announcement(bytes: &[u8]) -> Option<u64> {
             .checked_add(u64::from(digit - b'0'))?;
     }
     (value != 0).then_some(value)
-}
-
-/// One bounded probe through the mediation channel. Pure evidence:
-/// failures are logged, never fatal.
-fn run_mediation_self_test(requester: &libcanvas::pci_mediation::MediationRequester) {
-    match requester.read(0, 0, 0, 0, 0x00, 4) {
-        Ok(value) => println!(
-            "[acpi-manager] pci-mediation self-test: read=ok vendor-nonzero={}",
-            (value & 0xffff) != 0 && (value & 0xffff) != 0xffff
-        ),
-        Err(error) => println!(
-            "[acpi-manager] pci-mediation self-test: read={}",
-            error.as_str()
-        ),
-    }
-    // Host bridges reject configuration writes to the vendor/device ID
-    // register; either way the mediator must answer denial.
-    match requester.write_denied(0, 0, 0, 0, 0x00, 4) {
-        Ok(()) => println!("[acpi-manager] pci-mediation self-test: write=denied"),
-        Err(error) => println!(
-            "[acpi-manager] pci-mediation self-test: write={}",
-            error.as_str()
-        ),
-    }
 }
 
 fn receive_bootstrap(bootstrap: &Channel) -> Option<BootstrapInputs> {

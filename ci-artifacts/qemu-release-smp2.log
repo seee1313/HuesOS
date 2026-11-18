@@ -2,7 +2,7 @@
 BdsDxe: starting Boot0001 "UEFI QEMU DVD-ROM QM00005 " from PciRoot(0x0)/Pci(0x1F,0x2)/Sata(0x2,0xFFFF,0x0)
 [2J[01;01H[01;01H[2J[01;01H[01;01H[HuesOS] Bootloader handed over control
 [security] BSP degraded: SMEP/SMAP unavailable on this CPU
-[PMM] Reserved HBI image: phys_addr=0x17a0c000, length=34526448
+[PMM] Reserved HBI image: phys_addr=0x179d3000, length=34753840
 [storage] reserved boot DMA pool: phys=0x3800000, len=0x4000000
 [HBI] Ed25519 signature verified (v2.2)
 [measure] signed kernel/HBI/cmdline digest ready for PCR 12
@@ -18,11 +18,12 @@ BdsDxe: starting Boot0001 "UEFI QEMU DVD-ROM QM00005 " from PciRoot(0x0)/Pci(0x1
 [uACPI] BGRT 0x000000001F774000 00000038 v01 (INTEL  EDK2    )
 [uACPI] validated ACPI table graph and MADT
 [uACPI] built immutable Ring-3 table archive v2
+[uACPI] derived bounded FADT SystemIO policy
 [tpm] no TPM 2.0 CRB interface present
 [acpi] config mint authority installed: snapshot 1 window(s) 1
 [SMP] MADT parsed 2 CPUs found
 [IOAPIC] routed keyboard IRQ1
-[SMP] LAPIC timer count=625012
+[SMP] LAPIC timer count=624548
 [SMP] Booting AP 1
 [security] AP 1 degraded: SMEP/SMAP unavailable
 [SMP] AP 1 online (waiting for release)
@@ -32,10 +33,10 @@ HBI v2.2 parsed. Entries: 0x4
 [storage] boot info: dma=0x3800000+0x4000000, nvme_count=0
 [extable] installed 2 recoverable-copy entries
 [SMP] APs released to run
-HuesOS v0.1.0 on CPU 0
-PMM: 67893/268435456 frames (265 MiB)
+[SMP] AP HuesOS v0.1.0 on CPU 0
+1 scheduling
+PMM: 67836/268435456 frames (264 MiB)
 FB: 1280x800@32
-[SMP] AP 1 scheduling
 [init] installed immutable ACPI table archive VMO
 [init] installed deny-by-default ACPI broker capability
 [init] installed kernel command line VMO
@@ -153,7 +154,7 @@ FB: 1280x800@32
 [init] launched driver-manager
 [init] delegated unique KeyBroker authority to DriverManager
 [init] delegated unique PciConfigMint authority to DriverManager
-[kernel] entering userspace: rip=0x40e280 rsp=0x7ffffefffff8 cs=0x23 ss=0x1b
+[kernel] entering userspace: rip=0x40e420 rsp=0x7ffffefffff8 cs=0x23 ss=0x1b
 [driver-manager] started in userspace
 [driver-manager] received unique KeyBroker generation authority
 [driver-manager] received unique PciConfigMint authority
@@ -164,9 +165,9 @@ FB: 1280x800@32
 [init] passed ACPI table archive to DriverManager
 [init] transferred ACPI broker capability
 [init] passed storage boot-info VMO to DriverManager
-[driver-manager] received BOOTFS VMO from init
 [init] manifest input-host: minting 2 resource grant(s)
 [init] manifest input-host: transferred 2/2 resource handle(s) to DriverManager
+[driver-manager] received BOOTFS VMO from init
 [init] manifest input-host: signalled grants-complete to DriverManager
 [init] NVMe boot grants skipped: no NVMe PCI function
 [init] stage storage skipped
@@ -176,10 +177,10 @@ FB: 1280x800@32
 [kernel] entering userspace: rip=0x400190 rsp=0x7ffffefffff8 cs=0x23 ss=0x1b
 [shutdown-broker] started
 [shutdown-broker] ready; awaiting shutdown command
-[driver-manager] BOOTFS hash manifest verified and mounted
-[driver-manager] boot driver manifest: nvme elf=/drivers/driver-host-nvme.elf manifest=/manifests/nvme.hdriver
 [init] shutdown-broker: ready
 [init] stage shutdown-broker ok
+[driver-manager] BOOTFS hash manifest verified and mounted
+[driver-manager] boot driver manifest: nvme elf=/drivers/driver-host-nvme.elf manifest=/manifests/nvme.hdriver
 [driver-manager] launched restartable PCI manager generation 1
 [driver-manager] received immutable ACPI table archive
 [driver-manager] received unique ACPI broker capability
@@ -191,47 +192,69 @@ FB: 1280x800@32
 [driver-manager] capability: service=keyboard required=1
 [driver-manager] capability: irq=1
 [driver-manager] capability: io=0x60+1
-[driver-manager] manifest loaded: host=input-host elf=/drivers/input-host.elf
 [kernel] entering userspace: rip=0x400020 rsp=0x7ffffefffff8 cs=0x23 ss=0x1b
 [pci-manager] userspace service started (configuration disabled)
 [pci-manager] ready without root descriptors; fail-closed
-[kernel] entering userspace: rip=0x4001d0 rsp=0x7ffffefffff8 cs=0x23 ss=0x1b
+[kernel] entering userspace: rip=0x401490 rsp=0x7ffffefffff8 cs=0x23 ss=0x1b
 [acpi-manager] isolated Ring-3 service started
-[acpi-manager] validated ACPI archive v2: 8 tables, 9 physical mappings, snapshot 1
+[acpi-manager] validated ACPI archive v2: 9 tables, 10 physical mappings, snapshot 1
 [acpi-manager] published HMCF: 1 window(s), snapshot 1, generation 1
 [acpi-manager] broker deny-by-default self-test OK
+[uacpi] starting uACPI, version 6.0.0
+[uacpi] RSDP 0x000000001F77E014 00000024 v02 (BOCHS )
+[uacpi] XSDT 0x000000001F77D0E8 00000054 v01 (BOCHS  BXPC    )
+[uacpi] DSDT 0x000000001F77A000 0000214B v01 (BOCHS  BXPC    )
+[uacpi] FACP 0x000000001F779000 000000F4 v03 (BOCHS  BXPC    )
+[uacpi] APIC 0x000000001F778000 00000080 v03 (BOCHS  BXPC    )
+[uacpi] HPET 0x000000001F777000 00000038 v01 (BOCHS  BXPC    )
+[uacpi] MCFG 0x000000001F776000 0000003C v01 (BOCHS  BXPC    )
+[uacpi] WAET 0x000000001F775000 00000028 v01 (BOCHS  BXPC    )
+[uacpi] BGRT 0x000000001F774000 00000038 v01 (INTEL  EDK2    )
+[uacpi] FACS 0x000000001F7DD000 00000040
+[uacpi] successfully loaded 1 AML blob, 1709 ops in 20ms (avg 85450/s)
+[acpi-manager] AML namespace loaded (snapshot 1, degraded=false)
 [acpi-manager] generation 1 archive/broker capabilities ready
-[kernel] entering userspace: rip=0x4007b0 rsp=0x7ffffefffff8 cs=0x23 ss=0x1b
-[driver-host:input] started
+[driver-manager] manifest loaded: host=input-host elf=/drivers/input-host.elf
 [driver-manager] launched DriverHost input-host
 [driver-manager] forwarded 2/2 resource handle(s) to input-host
-[driver-manager] input DriverHost starting
+[kernel] entering userspace: rip=0x4007b0 rsp=0x7ffffefffff8 cs=0x23 ss=0x1b
+[driver-host:input] started
 [driver-host:input] received manifest resource #1: resource:input-host:ioport:0x60:0x1:excl
 [driver-host:input] received manifest resource #2: resource:input-host:irq:0x1:0x1:excl
 [driver-host:input] retained 2 manifest resource handle(s)
 [driver-host:input] keyboard IRQ bound to Port
-[driver-manager] registered service keyboard from input-host
-[driver-manager] input DriverHost ready
-[driver-manager] retained HMCF: 1 window(s), snapshot 1, generation 1
-[driver-manager] minted 1 read-only config capability(ies) for PCI manager generation 1 (snapshot 1)
-[driver-manager] ACPI manager ready generation 1 tables 8
-[driver-manager] PCI manager ready (no roots; fail-closed)
 [init] passed registry channel to DriverManager
 [init] stage terminal start: Starting terminal
+[driver-manager] input DriverHost starting
+[driver-manager] registered service keyboard from input-host
+[driver-manager] input DriverHost ready
 [driver-manager] received service registry channel from init
+[driver-manager] retained HMCF: 1 window(s), snapshot 1, generation 1
+[driver-manager] minted 1 read-only config capability(ies) for PCI manager generation 1 (snapshot 1)
+[driver-manager] ACPI manager ready generation 1 tables 9
+[driver-manager] PCI manager ready (no roots; fail-closed)
 [pci-manager] read-only config authority ready: 1 window(s), snapshot 1, producer generation 1
 [pci-manager] obs backend=ecam windows=1 snapshot=1
+[kernel] entering userspace: rip=0x408fa0 rsp=0x7ffffefffff8 cs=0x23 ss=0x1b
+[terminal] started in userspace
 [driver-manager] PCI manager ready (read-only config authority, windows 1)
 [driver-manager] mediation channel pair established for pci generation 1 acpi generation 1
 [pci-manager] mediation channel established generation 1
+[init] launched terminal
+[init] stage terminal ok
 [pci-manager] obs mediation op=read status=ok seg=0 bus=0 dev=0 fn=0 off=0x0 width=4 correlation=0 absent=0 latency-ticks=0
 [acpi-manager] pci-mediation self-test: read=ok vendor-nonzero=true
 [pci-manager] obs mediation op=write status=denied reason=policy correlation=0
 [acpi-manager] pci-mediation self-test: write=denied
-[init] launched terminal
-[kernel] entering userspace: rip=0x408fa0 rsp=0x7ffffefffff8 cs=0x23 ss=0x1b
-[terminal] started in userspace
-[init] stage terminal ok
+[uacpi] unable to perform IO (SystemIO) operation region \_SB_.PCI0.PRES.PRST: the requested action has been denied
+[uacpi] aborting method invocation due to previous error: the requested action has been denied
+[uacpi]     #0 in \_SB_.PCI0.PRES._INI()+6/6 at StoreOp
+[pci-manager] obs mediation op=read status=ok seg=0 bus=0 dev=31 fn=0 off=0x60 width=1 correlation=0 absent=0 latency-ticks=0
+[pci-manager] obs mediation op=read status=ok seg=0 bus=0 dev=31 fn=0 off=0x61 width=1 correlation=0 absent=0 latency-ticks=0
+[pci-manager] obs mediation op=read status=ok seg=0 bus=0 dev=31 fn=0 off=0x62 width=1 correlation=0 absent=0 latency-ticks=0
+[pci-manager] obs mediation op=read status=ok seg=0 bus=0 dev=31 fn=0 off=0x63 width=1 correlation=0 absent=0 latency-ticks=0
+[pci-manager] obs mediation op=read status=ok seg=0 bus=0 dev=31 fn=0 off=0x68 width=1 correlation=0 absent=0 latency-ticks=0
+[pci-manager] obs mediation op=read status=ok seg=0 bus=0 dev=31 fn=0 off=0x69 width=1 correlation=0 absent=0 latency-ticks=0
 [init] stage summary ok selftest
 [init] stage summary ~~ driver-manager
 [init] stage summary -- storage
@@ -244,8 +267,24 @@ FB: 1280x800@32
 [observe] 0100000000000000000000000000000001000000010000000200000000000000
 [init] observation records dumped: 1
 [init] service launch complete; parking as init supervisor
+[pci-manager] obs mediation op=read status=ok seg=0 bus=0 dev=31 fn=0 off=0x6a width=1 correlation=0 absent=0 latency-ticks=0
 [terminal] FrameDraw capability received
 [driver-manager] opened keyboard service channel for client
 [driver-host:input] attached keyboard client
+[pci-manager] obs mediation op=read status=ok seg=0 bus=0 dev=31 fn=0 off=0x6b width=1 correlation=0 absent=0 latency-ticks=0
 [driver-manager] opened filesystem service channel for client
+[uacpi] unable to perform IO (SystemMemory) operation region \_SB_.HPET.HPTM: the requested action has been denied
+[uacpi] aborting method invocation due to previous error: the requested action has been denied
+[uacpi]     #0 in \_SB_.HPET._STA()+5/48 at ReadFieldAsInteger
+[uacpi] unable to perform IO (SystemIO) operation region \_SB_.PCI0.PRES.PRST: the requested action has been denied
+[uacpi] aborting method invocation due to previous error: the requested action has been denied
+[uacpi]     #0 in \_SB_.CPUS.CSTA()+44/97 at StoreOp
+[uacpi]     #1 in \_SB_.CPUS.C000._STA()+6/6 at MethodCall1Args
+[uacpi] unable to perform IO (SystemIO) operation region \_SB_.PCI0.PRES.PRST: the requested action has been denied
+[uacpi] aborting method invocation due to previous error: the requested action has been denied
+[uacpi]     #0 in \_SB_.CPUS.CSTA()+44/97 at StoreOp
+[uacpi]     #1 in \_SB_.CPUS.C001._STA()+6/6 at MethodCall1Args
+[uacpi] namespace initialization done in 70ms: 36 devices, 0 thermal zones
+[acpi-manager] AML namespace initialized (snapshot 1, degraded=true, hpci_eligible=false, detail=0xa, pic_status=0)
 [terminal] keyboard service online, starting shell
+[driver-manager] ACPI namespace initialized generation 1 hpci_eligible=false status=3 detail=0xa (HMCF retained)

@@ -107,4 +107,32 @@ impl AcpiBroker {
             ..Request::default()
         })
     }
+
+    /// Request broker authorization to install an ACPI interrupt (e.g. SCI).
+    pub fn install_interrupt(&self, irq: u32, request_id: u64) -> Result<Response> {
+        self.call(&Request {
+            version: VERSION,
+            opcode: Opcode::InstallInterrupt as u16,
+            width: 0,
+            request_id,
+            address: u64::from(irq),
+            value: 0,
+            argument: 0,
+            ..Request::default()
+        })
+    }
+
+    /// Request broker authorization to remove an ACPI interrupt.
+    pub fn remove_interrupt(&self, irq: u32, request_id: u64) -> Result<Response> {
+        self.call(&Request {
+            version: VERSION,
+            opcode: Opcode::RemoveInterrupt as u16,
+            width: 0,
+            request_id,
+            address: u64::from(irq),
+            value: 0,
+            argument: 0,
+            ..Request::default()
+        })
+    }
 }

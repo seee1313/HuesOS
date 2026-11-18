@@ -692,7 +692,15 @@ fn install_immutable_vmo(
 ) -> bool {
     use huesos_object::{Handle, KernelObject, Rights};
 
-    let Ok(vmo) = huesos_object::Vmo::new_in_job(bytes.len(), Some(process.job())) else {
+    let alloc_size = if mappable {
+        let Some(size) = bytes.len().div_ceil(4096).max(1).checked_mul(4096) else {
+            return false;
+        };
+        size
+    } else {
+        bytes.len()
+    };
+    let Ok(vmo) = huesos_object::Vmo::new_in_job(alloc_size, Some(process.job())) else {
         return false;
     };
     if vmo.write(0, bytes) != bytes.len() {

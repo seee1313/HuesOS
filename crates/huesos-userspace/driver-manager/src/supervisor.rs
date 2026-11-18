@@ -195,6 +195,9 @@ pub struct DriverManager {
     acpi_manager_restart: acpi_manager::RestartBackoff,
     acpi_manager_ready: bool,
     acpi_availability: acpi_manager::AvailabilityPolicy,
+    acpi_init_watchdog: acpi_manager::WatchdogDeadline,
+    acpi_namespace_initialized: bool,
+    acpi_hpci_eligible: bool,
     /// Privileged userspace PCI Manager. PCI-9 starts it without physical
     /// config authority; no-root readiness is explicitly fail-closed.
     pci_manager: Option<ManagedHost>,
@@ -270,6 +273,7 @@ const MAX_TRACKED_HOSTS: usize = 8;
 const POLL_BUDGET_PER_TICK: u32 = 64;
 const ACPI_MANAGER_MAX_RESTARTS: u8 = 3;
 const ACPI_MANAGER_RESTART_BASE_TICKS: u64 = 10;
+const ACPI_MANAGER_INIT_WATCHDOG_TICKS: u64 = 1000;
 const PCI_MANAGER_MAX_RESTARTS: u8 = 3;
 const PCI_MANAGER_RESTART_BASE_TICKS: u64 = 100;
 
@@ -373,6 +377,9 @@ impl DriverManager {
             acpi_manager_restart: acpi_manager::RestartBackoff::new(),
             acpi_manager_ready: false,
             acpi_availability: acpi_manager::AvailabilityPolicy::new(),
+            acpi_init_watchdog: acpi_manager::WatchdogDeadline::new(),
+            acpi_namespace_initialized: false,
+            acpi_hpci_eligible: false,
             pci_manager: None,
             pci_manager_generation: 0,
             pci_manager_restart: pci_manager::RestartBackoff::new(),
@@ -1249,6 +1256,13 @@ impl DriverManager {
         }
 
         self.acpi_manager_ready = false;
+        self.acpi_namespace_initialized = false;
+        self.acpi_hpci_eligible = false;
+        self.acpi_init_watchdog.arm(
+            self.acpi_manager_generation,
+            now,
+            ACPI_MANAGER_INIT_WATCHDOG_TICKS,
+        );
         println!(
             "[driver-manager] launched restartable ACPI manager generation {}",
             self.acpi_manager_generation
@@ -1259,6 +1273,9 @@ impl DriverManager {
     fn schedule_acpi_manager_restart(&mut self) {
         self.acpi_manager = None;
         self.acpi_manager_ready = false;
+        self.acpi_init_watchdog.disarm();
+        self.acpi_namespace_initialized = false;
+        self.acpi_hpci_eligible = false;
         self.config_mediation_established = false;
         // A snapshot from the previous generation can never bind to the
         // next one; drop it so only a fresh validated HMCF remains. The
@@ -2379,6 +2396,14 @@ impl DriverManager {
         match setup {
             Some(()) => {
                 self.config_mediation_established = true;
+                if !self.acpi_namespace_initialized {
+                    let now = libcanvas::system::monotonic_ticks().unwrap_or(0);
+                    self.acpi_init_watchdog.arm(
+                        self.acpi_manager_generation,
+                        now,
+                        ACPI_MANAGER_INIT_WATCHDOG_TICKS,
+                    );
+                }
                 println!(
                     "[driver-manager] mediation channel pair established for pci generation {} acpi generation {}",
                     self.pci_manager_generation, self.acpi_manager_generation
@@ -2646,6 +2671,18 @@ impl DriverManager {
     }
 
     fn poll_acpi_manager(&mut self) {
+        let now = libcanvas::system::monotonic_ticks().unwrap_or(0);
+        if self
+            .acpi_init_watchdog
+            .is_expired(self.acpi_manager_generation, now)
+        {
+            println!(
+                "[driver-manager] ACPI manager init watchdog expired for generation {}; scheduling restart",
+                self.acpi_manager_generation
+            );
+            self.schedule_acpi_manager_restart();
+            return;
+        }
         let Some(host) = self.acpi_manager.take() else {
             return;
         };
@@ -2690,6 +2727,7 @@ impl DriverManager {
                     match (message.opcode, message.status) {
                         (acpi_manager::Opcode::Ready, acpi_manager::Status::ArchiveBrokerReady) => {
                             self.acpi_manager_ready = true;
+                            self.acpi_init_watchdog.disarm();
                             self.acpi_manager_restart.record_ready();
                             self.acpi_availability.record_runtime_ready();
                             println!(
@@ -2699,6 +2737,31 @@ impl DriverManager {
                             self.acpi_authority_settled = true;
                             self.handoff_config_authority();
                             self.maybe_publish_mediation();
+                        }
+                        (
+                            acpi_manager::Opcode::NamespaceInitialized,
+                            acpi_manager::Status::NamespaceInitOk,
+                        ) => {
+                            self.acpi_init_watchdog.disarm();
+                            self.acpi_namespace_initialized = true;
+                            self.acpi_hpci_eligible = true;
+                            println!(
+                                "[driver-manager] ACPI namespace initialized generation {} hpci_eligible=true detail=0x{:x}",
+                                message.manager_generation, message.detail
+                            );
+                        }
+                        (
+                            acpi_manager::Opcode::NamespaceInitialized,
+                            status @ (acpi_manager::Status::NamespaceInitDegraded
+                            | acpi_manager::Status::NamespaceInitFailed),
+                        ) => {
+                            self.acpi_init_watchdog.disarm();
+                            self.acpi_namespace_initialized = true;
+                            self.acpi_hpci_eligible = false;
+                            println!(
+                                "[driver-manager] ACPI namespace initialized generation {} hpci_eligible=false status={} detail=0x{:x} (HMCF retained)",
+                                message.manager_generation, status as i32, message.detail
+                            );
                         }
                         (acpi_manager::Opcode::Heartbeat, acpi_manager::Status::Ok) => {
                             self.acpi_heartbeat_count = self.acpi_heartbeat_count.wrapping_add(1);

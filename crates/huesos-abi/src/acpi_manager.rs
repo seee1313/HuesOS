@@ -46,6 +46,8 @@ pub enum Opcode {
     Heartbeat = 3,
     /// Manager reports a structured bootstrap/runtime failure.
     Failed = 4,
+    /// ACPI Manager completed AP-14 `_PIC` + `_STA`/`_INI`/`_REG` init.
+    NamespaceInitialized = 5,
 }
 
 impl Opcode {
@@ -55,6 +57,7 @@ impl Opcode {
             2 => Some(Self::Ready),
             3 => Some(Self::Heartbeat),
             4 => Some(Self::Failed),
+            5 => Some(Self::NamespaceInitialized),
             _ => None,
         }
     }
@@ -68,6 +71,11 @@ pub enum Status {
     Ok = 0,
     /// Archive, broker, and mapping authority are validated and retained.
     ArchiveBrokerReady = 1,
+    /// Bounded namespace initialization succeeded cleanly; HPCI eligible.
+    NamespaceInitOk = 2,
+    /// Namespace initialization degraded (OpRegion/PCI write/method issue);
+    /// base ACPI service and HMCF remain alive, HPCI is withheld.
+    NamespaceInitDegraded = 3,
     /// Message bytes or generation were invalid.
     InvalidMessage = -1,
     /// Archive validation failed.
@@ -76,6 +84,8 @@ pub enum Status {
     BrokerDenied = -3,
     /// One mandatory capability was absent or malformed.
     MissingCapability = -4,
+    /// Namespace initialization failed fatally.
+    NamespaceInitFailed = -5,
 }
 
 impl Status {
@@ -83,14 +93,34 @@ impl Status {
         match raw {
             0 => Some(Self::Ok),
             1 => Some(Self::ArchiveBrokerReady),
+            2 => Some(Self::NamespaceInitOk),
+            3 => Some(Self::NamespaceInitDegraded),
             -1 => Some(Self::InvalidMessage),
             -2 => Some(Self::InvalidArchive),
             -3 => Some(Self::BrokerDenied),
             -4 => Some(Self::MissingCapability),
+            -5 => Some(Self::NamespaceInitFailed),
             _ => None,
         }
     }
 }
+
+/// Detail bit: `_PIC` evaluation existed and failed.
+pub const INIT_DETAIL_PIC_FAILED: u32 = 1 << 0;
+/// Detail bit: an OpRegion access was denied or unsupported (`EC`/`GPIO`/`SMBus`).
+pub const INIT_DETAIL_DENIED_OPREGION: u32 = 1 << 1;
+/// Detail bit: an AML method attempted a denied PCI configuration write.
+pub const INIT_DETAIL_DENIED_PCI_WRITE: u32 = 1 << 2;
+/// Detail bit: uACPI logged a critical AML execution/init error.
+pub const INIT_DETAIL_AML_ERROR: u32 = 1 << 3;
+/// Detail bit: an external or internal watchdog deadline expired.
+pub const INIT_DETAIL_WATCHDOG_EXPIRED: u32 = 1 << 4;
+/// All AP-14 namespace-init detail flags.
+pub const INIT_DETAIL_MASK: u32 = INIT_DETAIL_PIC_FAILED
+    | INIT_DETAIL_DENIED_OPREGION
+    | INIT_DETAIL_DENIED_PCI_WRITE
+    | INIT_DETAIL_AML_ERROR
+    | INIT_DETAIL_WATCHDOG_EXPIRED;
 
 /// One fixed lifecycle message.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -124,6 +154,68 @@ impl Message {
             status: Status::ArchiveBrokerReady,
             detail: table_count,
         }
+    }
+
+    /// Construct AP-14 namespace-initialization status.
+    pub const fn namespace_initialized(
+        manager_generation: u64,
+        degraded: bool,
+        detail: u32,
+    ) -> Self {
+        Self {
+            opcode: Opcode::NamespaceInitialized,
+            manager_generation,
+            status: if degraded {
+                Status::NamespaceInitDegraded
+            } else {
+                Status::NamespaceInitOk
+            },
+            detail: detail & INIT_DETAIL_MASK,
+        }
+    }
+}
+
+/// Bounded external deadline watchdog used by `driver-manager` to catch
+/// wedged AML bootstrap/initialization phases independent of uACPI's inner
+/// `uacpi_context_set_loop_timeout`.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct WatchdogDeadline {
+    deadline_tick: Option<u64>,
+    generation: u64,
+}
+
+impl WatchdogDeadline {
+    /// Disarmed watchdog.
+    pub const fn new() -> Self {
+        Self {
+            deadline_tick: None,
+            generation: 0,
+        }
+    }
+
+    /// Arm the watchdog for `generation` to expire at `now.saturating_add(timeout_ticks)`.
+    pub fn arm(&mut self, generation: u64, now: u64, timeout_ticks: u64) {
+        self.generation = generation;
+        self.deadline_tick = Some(now.saturating_add(timeout_ticks.max(1)));
+    }
+
+    /// Disarm the watchdog.
+    pub fn disarm(&mut self) {
+        self.deadline_tick = None;
+        self.generation = 0;
+    }
+
+    /// Whether the watchdog is armed for `generation` and `now >= deadline_tick`.
+    pub const fn is_expired(&self, generation: u64, now: u64) -> bool {
+        match self.deadline_tick {
+            Some(deadline) => self.generation == generation && now >= deadline,
+            None => false,
+        }
+    }
+
+    /// Whether the watchdog is currently armed.
+    pub const fn is_armed(&self) -> bool {
+        self.deadline_tick.is_some()
     }
 }
 
@@ -301,7 +393,12 @@ mod tests {
 
     #[test]
     fn lifecycle_messages_round_trip_and_reject_stale_shapes() {
-        for message in [Message::hello(7, 0), Message::ready(7, 12)] {
+        for message in [
+            Message::hello(7, 0),
+            Message::ready(7, 12),
+            Message::namespace_initialized(7, false, 0),
+            Message::namespace_initialized(7, true, INIT_DETAIL_DENIED_PCI_WRITE),
+        ] {
             let mut bytes = [0u8; MESSAGE_BYTES];
             assert_eq!(encode(message, &mut bytes), Some(MESSAGE_BYTES));
             assert_eq!(decode(&bytes), Some(message));
@@ -310,6 +407,21 @@ mod tests {
         assert_eq!(encode(Message::hello(0, 0), &mut bytes), None);
         assert_eq!(encode(Message::hello(1, u32::MAX), &mut bytes), None);
         assert_eq!(decode(&bytes[..MESSAGE_BYTES - 1]), None);
+    }
+
+    #[test]
+    fn watchdog_deadline_arms_checks_generation_and_disarms() {
+        let mut wd = WatchdogDeadline::new();
+        assert!(!wd.is_armed());
+        assert!(!wd.is_expired(1, 100));
+        wd.arm(3, 50, 100);
+        assert!(wd.is_armed());
+        assert!(!wd.is_expired(3, 149));
+        assert!(wd.is_expired(3, 150));
+        assert!(!wd.is_expired(2, 500));
+        wd.disarm();
+        assert!(!wd.is_armed());
+        assert!(!wd.is_expired(3, 500));
     }
 
     #[test]
