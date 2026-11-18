@@ -49,6 +49,9 @@ pub const MINT_KIND_ECAM_WINDOWS: u16 = 1;
 /// Mint the fixed legacy configuration I/O-port authority
 /// (`0xCF8..0x100`, mechanism #1) for PCI segment 0.
 pub const MINT_KIND_LEGACY_CF8_CFC: u16 = 2;
+/// Upgrade ECAM windows to read-write `Mmio` capabilities after validated
+/// `HPCI` roots and B.4 write-policy gating (AP-17).
+pub const MINT_KIND_ECAM_WINDOWS_RW: u16 = 3;
 /// Base of the fixed legacy configuration I/O-port window.
 pub const LEGACY_CF8_CFC_BASE: u64 = 0x0CF8;
 /// Width of the fixed legacy configuration I/O-port window: `0xCF8`
@@ -64,8 +67,8 @@ pub const MINT_REQUEST_BYTES: usize = 32;
 pub struct PciConfigMintRequest {
     /// Must equal [`MINT_REQUEST_VERSION`].
     pub version: u16,
-    /// One of [`MINT_KIND_ECAM_WINDOWS`] or [`MINT_KIND_LEGACY_CF8_CFC`];
-    /// anything else is rejected.
+    /// One of [`MINT_KIND_ECAM_WINDOWS`], [`MINT_KIND_LEGACY_CF8_CFC`], or
+    /// [`MINT_KIND_ECAM_WINDOWS_RW`]; anything else is rejected.
     pub kind: u16,
     /// Reserved; must be zero.
     pub reserved: u32,
@@ -115,7 +118,10 @@ impl PciConfigMintRequest {
         if self.version != MINT_REQUEST_VERSION {
             return Err(MintRequestError::Version);
         }
-        if !matches!(self.kind, MINT_KIND_ECAM_WINDOWS | MINT_KIND_LEGACY_CF8_CFC) {
+        if !matches!(
+            self.kind,
+            MINT_KIND_ECAM_WINDOWS | MINT_KIND_LEGACY_CF8_CFC | MINT_KIND_ECAM_WINDOWS_RW
+        ) {
             return Err(MintRequestError::Kind);
         }
         if self.reserved != 0 {
@@ -436,6 +442,9 @@ mod tests {
         req.producer_generation = 3;
         req.hmcf_vmo = 0;
         assert_eq!(req.validate(), Err(MintRequestError::Handle));
+        req.hmcf_vmo = 9;
+        req.kind = MINT_KIND_ECAM_WINDOWS_RW;
+        assert_eq!(req.validate(), Ok(()));
         assert_eq!(
             PciConfigMintRequest::default().validate(),
             Err(MintRequestError::Identity)
@@ -450,6 +459,7 @@ mod tests {
         );
         assert_eq!(MINT_KIND_ECAM_WINDOWS, 1);
         assert_eq!(MINT_KIND_LEGACY_CF8_CFC, 2);
+        assert_eq!(MINT_KIND_ECAM_WINDOWS_RW, 3);
         assert_eq!(LEGACY_CF8_CFC_BASE, 0x0CF8);
         assert_eq!(LEGACY_CF8_CFC_LEN, 8);
     }

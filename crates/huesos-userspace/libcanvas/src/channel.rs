@@ -247,18 +247,31 @@ impl Channel {
 // ---------------------------------------------------------------------------
 // Read-only MMIO load helper (AP-10)
 
-/// Volatile load of one `T` from a read-only mapped MMIO region.
+/// Volatile load of one `T` from a mapped MMIO region.
 ///
-/// The PCI Manager uses this for the read-only ECAM configuration windows
+/// The PCI Manager uses this for the ECAM configuration windows
 /// it validated against its retained `HMCF` snapshot and mapped itself;
-/// the kernel installed those mappings read-only `NO_CACHE`, so no device
+/// the kernel installed those mappings `NO_CACHE`, so no device
 /// side effect can escape through this helper. The caller must pass an
 /// address with at least `size_of::<T>()` bytes of live mapping (ECAM
 /// windows and the mediation request validator jointly enforce both the
 /// bounds and the width alignment).
 pub fn mmio_load<T: Copy>(address: u64) -> T {
     // SAFETY: the caller guarantees `address` points at `size_of::<T>()`
-    // readable bytes inside a live read-only mapping it owns; ECAM window
+    // readable bytes inside a live mapping it owns; ECAM window
     // geometry and the request validator enforce bounds and alignment.
     unsafe { core::ptr::read_volatile(address as *const T) }
+}
+
+/// Volatile store of one `T` into a write-capable mapped MMIO region (AP-17).
+///
+/// The caller must pass an address with at least `size_of::<T>()` writable
+/// bytes inside a live write-capable mapping it owns; ECAM window geometry
+/// and the `huesos-pci::write_policy` validator jointly enforce offset bounds,
+/// alignment, and class/mask policy before calling this helper.
+pub fn mmio_store<T: Copy>(address: u64, value: T) {
+    // SAFETY: the caller guarantees `address` points at `size_of::<T>()`
+    // writable bytes inside a live write-capable mapping it owns; ECAM window
+    // geometry and the B.4 write-policy validator enforce bounds and alignment.
+    unsafe { core::ptr::write_volatile(address as *mut T, value) }
 }

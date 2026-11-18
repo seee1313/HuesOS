@@ -36,6 +36,8 @@ pub mod resource_validation;
 /// Immutable, generation-tagged PCI bridge topology snapshots.
 #[cfg(feature = "alloc")]
 pub mod topology;
+/// Audited PCI configuration write policy and write/readback transactions (B.4).
+pub mod write_policy;
 
 /// Bytes in conventional PCI configuration space.
 pub const CONVENTIONAL_CONFIG_BYTES: u16 = 256;

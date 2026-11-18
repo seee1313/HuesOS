@@ -115,6 +115,12 @@ required=(
     '[pci-manager] published diagnostic PCI inventory:'
     'config-writes=0'
     '[driver-manager] PCI diagnostic inventory published:'
+    '[acpi-manager] pci-mediation self-test: write=denied'
+    '[pci-manager] obs mediation op=write status=denied reason=policy'
+    '[pci-manager] obs b4-write class=CommandControl bdf=00:00.0 offset=0x04 width=2'
+    '[pci-manager] write-capable config authority ready:'
+    'b4-policy=verified'
+    '[driver-manager] PCI manager ready (write-capable config authority'
     '[acpi-manager] published HMCF'
     '[driver-manager] retained HMCF'
     '[acpi] config mint authority installed: snapshot'
@@ -128,6 +134,7 @@ case "$scenario" in
         required+=(
             '[driver-manager] PCI manager ready (read-only config authority'
             '[pci-manager] read-only config authority ready'
+            'write-capable config capability(ies) for PCI manager'
         )
         ;;
     legacy)
@@ -184,6 +191,13 @@ regressions=(
     '[pci-manager] HMCF rejected'
     '[pci-manager] no firmware snapshot'
     '[pci-manager] read-only config authority map rejected'
+    '[driver-manager] write config authority mint rejected'
+    '[driver-manager] write config authority transfer failed'
+    '[pci-manager] write upgrade rejected'
+    '[pci-manager] write authority rejected'
+    '[pci-manager] write-capable config authority map rejected'
+    '[pci-manager] b4-policy negative check failed'
+    '[pci-manager] b4-policy idempotent write failed'
     '[acpi-manager] PANIC'
     '[driver-manager] PCI manager restart budget exhausted'
     '[driver-manager] malformed PCI manager control message'

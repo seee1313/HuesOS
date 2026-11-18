@@ -30,7 +30,7 @@ use crate::SyscallResult;
 use huesos_abi::hmcf;
 use huesos_abi::pci_config::{
     self, verify_hmcf_against_mcfg, EcamAllocation, MINT_KIND_ECAM_WINDOWS,
-    MINT_KIND_LEGACY_CF8_CFC,
+    MINT_KIND_ECAM_WINDOWS_RW, MINT_KIND_LEGACY_CF8_CFC,
 };
 use huesos_abi::{ErrorCode, HandleValue};
 use huesos_object::{
@@ -183,7 +183,7 @@ pub(crate) fn sys_pci_config_mint(
         let mut minted = [(0u64, 0u64); MAX_WINDOWS];
         let mut count = 0usize;
         match request.kind {
-            MINT_KIND_ECAM_WINDOWS => {
+            MINT_KIND_ECAM_WINDOWS | MINT_KIND_ECAM_WINDOWS_RW => {
                 for record in view.records() {
                     minted[count] = (record.ecam_base, record.span_bytes);
                     count += 1;
@@ -237,15 +237,19 @@ pub(crate) fn sys_pci_config_mint(
         created[index] = Some(resource);
     }
 
-    // ECAM capabilities are read-only on purpose: they grant the right to
-    // observe configuration space, never to write it. The legacy
-    // CF8/CFC window carries READ|WRITE because configuration mechanism
-    // #1 requires writing the address port even for a read; write
-    // policy for AML config cycles is enforced one layer up (AP-10).
-    let rights = if request.kind == MINT_KIND_LEGACY_CF8_CFC {
-        Rights::READ | Rights::WRITE | Rights::TRANSFER
-    } else {
-        Rights::READ | Rights::TRANSFER
+    // Initial ECAM capabilities are read-only on purpose: they grant the
+    // right to observe configuration space, never to write it. After
+    // HPCI roots are accepted and B.4 write-policy enforcement is active,
+    // DriverManager can upgrade ECAM via `MINT_KIND_ECAM_WINDOWS_RW`
+    // (once the RO mappings/handles are released so exclusivity holds).
+    // The legacy CF8/CFC window always carries READ|WRITE because
+    // configuration mechanism #1 requires writing the address port even
+    // for a read; write policy is enforced by `pci-manager` (AP-10/AP-17).
+    let rights = match request.kind {
+        MINT_KIND_LEGACY_CF8_CFC | MINT_KIND_ECAM_WINDOWS_RW => {
+            Rights::READ | Rights::WRITE | Rights::TRANSFER
+        }
+        _ => Rights::READ | Rights::TRANSFER,
     };
 
     // Phase B: install handles into the caller's table. On any failure
