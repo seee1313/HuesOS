@@ -13,7 +13,11 @@ use crate::resource_validation::{
     ValidationReport,
 };
 use crate::topology::{FunctionKind, Parent, TopologySnapshot};
-use crate::PciAddress;
+use crate::write_policy::{
+    execute_checked_write, ConfigReadWriteTransport, HeaderKind, WriteClass, WritePolicyError,
+    WriteRequest, WriteTransactionRecord, OFFSET_BAR0, OFFSET_BRIDGE_IO_BASE,
+};
+use crate::{ConfigWidth, PciAddress, ENHANCED_CONFIG_BYTES};
 
 /// Maximum planned resources in one transaction.
 pub const MAX_PLANNED_RESOURCES: usize = 2048;
@@ -533,6 +537,332 @@ fn range_contains(outer_base: u64, outer_len: u64, inner_base: u64, inner_len: u
         && inner_base.saturating_add(inner_len) <= outer_base.saturating_add(outer_len)
 }
 
+/// One staged configuration-space register mutation with rollback metadata (Stage F.2).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PlannedWrite {
+    /// Target PCI routing address.
+    pub owner: PciAddress,
+    /// PCI header layout of `owner`.
+    pub header_kind: HeaderKind,
+    /// B.4 write policy class.
+    pub class: WriteClass,
+    /// Register offset.
+    pub offset: u16,
+    /// Access width.
+    pub width: ConfigWidth,
+    /// Original register value read before commit (used for rollback).
+    pub old_value: u32,
+    /// Planned new register value.
+    pub new_value: u32,
+    /// Bit mask modified in the register.
+    pub write_mask: u32,
+    /// Readback verification mask enforced after write.
+    pub expected_readback_mask: u32,
+}
+
+impl PlannedWrite {
+    /// Convert this planned mutation into an inverse rollback [`WriteRequest`].
+    pub const fn as_rollback_request(self) -> WriteRequest {
+        WriteRequest {
+            address: self.owner,
+            header_kind: self.header_kind,
+            class: self.class,
+            offset: self.offset,
+            width: self.width,
+            max_config_bytes: ENHANCED_CONFIG_BYTES,
+            value: self.old_value,
+            write_mask: self.write_mask,
+            expected_readback_mask: self.expected_readback_mask,
+            allowlist_entry: None,
+        }
+    }
+
+    /// Convert this planned mutation into a forward [`WriteRequest`].
+    pub const fn as_forward_request(self) -> WriteRequest {
+        WriteRequest {
+            address: self.owner,
+            header_kind: self.header_kind,
+            class: self.class,
+            offset: self.offset,
+            width: self.width,
+            max_config_bytes: ENHANCED_CONFIG_BYTES,
+            value: self.new_value,
+            write_mask: self.write_mask,
+            expected_readback_mask: self.expected_readback_mask,
+            allowlist_entry: None,
+        }
+    }
+}
+
+/// Ordered hardware commit plan with explicit rollback sequence (Stage F.2).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CommitPlan {
+    topology_generation: u64,
+    writes: Vec<PlannedWrite>,
+}
+
+impl CommitPlan {
+    /// Topology generation this commit plan targets.
+    pub const fn topology_generation(&self) -> u64 {
+        self.topology_generation
+    }
+
+    /// Forward writes ordered parent-bridge-first, then endpoints.
+    pub fn writes(&self) -> &[PlannedWrite] {
+        &self.writes
+    }
+
+    /// Rollback writes for the entire plan (reverse execution order).
+    pub fn rollback_writes(&self) -> impl Iterator<Item = PlannedWrite> + '_ {
+        self.writes.iter().rev().copied()
+    }
+}
+
+/// Result of executing a [`CommitPlan`] against hardware.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CommitError {
+    /// Step `failed_step` failed and all prior steps `0..failed_step` were cleanly rolled back.
+    RolledBack {
+        /// Zero-based index of the failing forward step.
+        failed_step: usize,
+        /// Underlying B.4 write error.
+        error: WritePolicyError,
+    },
+    /// Step `failed_step` failed AND rolling back `rollback_step` also failed.
+    RollbackFailed {
+        /// Zero-based index of the failing forward step.
+        failed_step: usize,
+        /// Zero-based index of the step whose rollback failed.
+        rollback_step: usize,
+        /// Underlying B.4 write error on rollback.
+        error: WritePolicyError,
+    },
+    /// Bounded buffer allocation failed.
+    NoMemory,
+}
+
+/// Build an ordered [`CommitPlan`] for all newly-assigned entries in `plan` (Stage F.2).
+///
+/// Firmware-preserved (`!newly_assigned()`) resources are never mutated.
+pub fn build_commit_plan(
+    topology: &TopologySnapshot,
+    plan: &ResourcePlan,
+    transport: &mut impl ConfigReadWriteTransport,
+) -> Result<CommitPlan, PlanError> {
+    let mut staged: Vec<(u8, u8, PlannedWrite)> = Vec::new();
+
+    for resource in plan.resources() {
+        if !resource.newly_assigned() {
+            continue;
+        }
+        let node = topology
+            .find(resource.owner)
+            .ok_or(PlanError::MissingTopology)?;
+        let header_kind = match node.function.kind {
+            FunctionKind::Endpoint => HeaderKind::Type0Endpoint,
+            FunctionKind::PciBridge { .. } => HeaderKind::Type1Bridge,
+        };
+        let kind_order = match resource.register {
+            ResourceRegister::BridgeWindow(_) => 0u8,
+            ResourceRegister::Bar(_) => 1u8,
+        };
+
+        match resource.register {
+            ResourceRegister::Bar(bar_idx) => {
+                let offset = OFFSET_BAR0 + u16::from(bar_idx) * 4;
+                let old_lo = transport
+                    .read_width(resource.owner, offset, ConfigWidth::Dword)
+                    .ok_or(PlanError::MissingTopology)?;
+                let is_io = (old_lo & 1) == 1;
+                let is_64bit = !is_io && ((old_lo >> 1) & 0x3) == 0x2;
+                let lo_mask = if is_io { !0x3u32 } else { !0xFu32 };
+                let new_lo = (resource.pci_base as u32) & lo_mask;
+
+                let write_mask = if resource.len <= u64::from(u32::MAX) {
+                    !((resource.len as u32).wrapping_sub(1)) & lo_mask
+                } else {
+                    0
+                };
+                if write_mask != 0 {
+                    staged.try_reserve(1).map_err(|_| PlanError::NoMemory)?;
+                    staged.push((
+                        node.depth,
+                        kind_order,
+                        PlannedWrite {
+                            owner: resource.owner,
+                            header_kind,
+                            class: WriteClass::Bar,
+                            offset,
+                            width: ConfigWidth::Dword,
+                            old_value: old_lo & lo_mask,
+                            new_value: new_lo,
+                            write_mask,
+                            expected_readback_mask: write_mask,
+                        },
+                    ));
+                }
+
+                if is_64bit {
+                    let hi_offset = offset + 4;
+                    let old_hi = transport
+                        .read_width(resource.owner, hi_offset, ConfigWidth::Dword)
+                        .ok_or(PlanError::MissingTopology)?;
+                    let new_hi = (resource.pci_base >> 32) as u32;
+                    staged.try_reserve(1).map_err(|_| PlanError::NoMemory)?;
+                    staged.push((
+                        node.depth,
+                        kind_order,
+                        PlannedWrite {
+                            owner: resource.owner,
+                            header_kind,
+                            class: WriteClass::Bar,
+                            offset: hi_offset,
+                            width: ConfigWidth::Dword,
+                            old_value: old_hi,
+                            new_value: new_hi,
+                            write_mask: u32::MAX,
+                            expected_readback_mask: u32::MAX,
+                        },
+                    ));
+                }
+            }
+            ResourceRegister::BridgeWindow(win_idx) => {
+                let end = resource
+                    .pci_base
+                    .checked_add(resource.len)
+                    .and_then(|v| v.checked_sub(1))
+                    .ok_or(PlanError::ArithmeticOverflow)?;
+                match win_idx {
+                    0 => {
+                        let old_io = transport
+                            .read_width(resource.owner, OFFSET_BRIDGE_IO_BASE, ConfigWidth::Word)
+                            .ok_or(PlanError::MissingTopology)?;
+                        let base_nibble = ((resource.pci_base >> 12) & 0xF) as u32;
+                        let limit_nibble = ((end >> 12) & 0xF) as u32;
+                        let new_io = ((limit_nibble << 4) << 8) | (base_nibble << 4);
+                        staged.try_reserve(1).map_err(|_| PlanError::NoMemory)?;
+                        staged.push((
+                            node.depth,
+                            kind_order,
+                            PlannedWrite {
+                                owner: resource.owner,
+                                header_kind,
+                                class: WriteClass::BridgeWindow,
+                                offset: OFFSET_BRIDGE_IO_BASE,
+                                width: ConfigWidth::Word,
+                                old_value: old_io & 0xF0F0,
+                                new_value: new_io & 0xF0F0,
+                                write_mask: 0xF0F0,
+                                expected_readback_mask: 0xF0F0,
+                            },
+                        ));
+                    }
+                    1 => {
+                        let old_mem = transport
+                            .read_width(resource.owner, 0x20, ConfigWidth::Dword)
+                            .ok_or(PlanError::MissingTopology)?;
+                        let base_bits = ((resource.pci_base >> 16) & 0xFFF0) as u32;
+                        let limit_bits = ((end >> 16) & 0xFFF0) as u32;
+                        let new_mem = (limit_bits << 16) | base_bits;
+                        staged.try_reserve(1).map_err(|_| PlanError::NoMemory)?;
+                        staged.push((
+                            node.depth,
+                            kind_order,
+                            PlannedWrite {
+                                owner: resource.owner,
+                                header_kind,
+                                class: WriteClass::BridgeWindow,
+                                offset: 0x20,
+                                width: ConfigWidth::Dword,
+                                old_value: old_mem & 0xFFF0_FFF0,
+                                new_value: new_mem,
+                                write_mask: 0xFFF0_FFF0,
+                                expected_readback_mask: 0xFFF0_FFF0,
+                            },
+                        ));
+                    }
+                    2 => {
+                        let old_pref = transport
+                            .read_width(resource.owner, 0x24, ConfigWidth::Dword)
+                            .ok_or(PlanError::MissingTopology)?;
+                        let base_bits = ((resource.pci_base >> 16) & 0xFFF0) as u32;
+                        let limit_bits = ((end >> 16) & 0xFFF0) as u32;
+                        let new_pref = (limit_bits << 16) | base_bits;
+                        staged.try_reserve(1).map_err(|_| PlanError::NoMemory)?;
+                        staged.push((
+                            node.depth,
+                            kind_order,
+                            PlannedWrite {
+                                owner: resource.owner,
+                                header_kind,
+                                class: WriteClass::BridgeWindow,
+                                offset: 0x24,
+                                width: ConfigWidth::Dword,
+                                old_value: old_pref & 0xFFF0_FFF0,
+                                new_value: new_pref,
+                                write_mask: 0xFFF0_FFF0,
+                                expected_readback_mask: 0xFFF0_FFF0,
+                            },
+                        ));
+                    }
+                    _ => return Err(PlanError::InvalidRequirement),
+                }
+            }
+        }
+    }
+
+    staged.sort_by_key(|(depth, kind_order, w)| (*depth, *kind_order, w.owner, w.offset));
+    let mut writes = Vec::new();
+    writes
+        .try_reserve_exact(staged.len())
+        .map_err(|_| PlanError::NoMemory)?;
+    for (_, _, w) in staged {
+        writes.push(w);
+    }
+    Ok(CommitPlan {
+        topology_generation: plan.topology_generation(),
+        writes,
+    })
+}
+
+/// Execute `commit_plan` step-by-step through B.4 `execute_checked_write`.
+///
+/// On any failure at step `i`, automatically rolls back steps `(i - 1)..=0` in
+/// reverse order using each step's `old_value`.
+pub fn execute_commit_plan(
+    commit_plan: &CommitPlan,
+    transport: &mut impl ConfigReadWriteTransport,
+) -> Result<Vec<WriteTransactionRecord>, CommitError> {
+    let mut records = Vec::new();
+    records
+        .try_reserve_exact(commit_plan.writes().len())
+        .map_err(|_| CommitError::NoMemory)?;
+
+    for (step, write) in commit_plan.writes().iter().enumerate() {
+        let req = write.as_forward_request();
+        match execute_checked_write(transport, &req) {
+            Ok(rec) => records.push(rec),
+            Err(err) => {
+                for rev_idx in (0..step).rev() {
+                    let rb_req = commit_plan.writes()[rev_idx].as_rollback_request();
+                    if let Err(rb_err) = execute_checked_write(transport, &rb_req) {
+                        return Err(CommitError::RollbackFailed {
+                            failed_step: step,
+                            rollback_step: rev_idx,
+                            error: rb_err,
+                        });
+                    }
+                }
+                return Err(CommitError::RolledBack {
+                    failed_step: step,
+                    error: err,
+                });
+            }
+        }
+    }
+    Ok(records)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -788,5 +1118,120 @@ mod tests {
             plan_firmware_preserving(&topology, &apertures, &validation),
             Err(PlanError::InvalidRequirement)
         );
+    }
+
+    struct CommitMockTransport {
+        bridge_mem_win: u32,
+        bar0: u32,
+        bar1: u32,
+        fail_on_write_call: Option<usize>,
+        write_calls: usize,
+    }
+
+    impl CommitMockTransport {
+        fn new() -> Self {
+            Self {
+                bridge_mem_win: 0,
+                bar0: 0,
+                bar1: 0,
+                fail_on_write_call: None,
+                write_calls: 0,
+            }
+        }
+    }
+
+    impl ConfigReadWriteTransport for CommitMockTransport {
+        fn read_width(
+            &mut self,
+            owner: PciAddress,
+            offset: u16,
+            _width: ConfigWidth,
+        ) -> Option<u32> {
+            match (owner.bus(), owner.device(), offset) {
+                (0, 1, 0x20) => Some(self.bridge_mem_win),
+                (1, 0, 0x10) => Some(self.bar0),
+                (1, 1, 0x10) => Some(self.bar1),
+                _ => Some(0),
+            }
+        }
+
+        fn write_width(
+            &mut self,
+            owner: PciAddress,
+            offset: u16,
+            _width: ConfigWidth,
+            value: u32,
+        ) -> bool {
+            self.write_calls += 1;
+            if self.fail_on_write_call == Some(self.write_calls) {
+                return false;
+            }
+            match (owner.bus(), owner.device(), offset) {
+                (0, 1, 0x20) => {
+                    self.bridge_mem_win = value & 0xFFF0_FFF0;
+                    true
+                }
+                (1, 0, 0x10) => {
+                    self.bar0 = value & 0xFFFF_F000;
+                    true
+                }
+                (1, 1, 0x10) => {
+                    self.bar1 = value & 0xFFFF_F000;
+                    true
+                }
+                _ => false,
+            }
+        }
+    }
+
+    #[test]
+    fn commit_plan_executes_and_rolls_back_cleanly_on_injected_fault() {
+        let Ok(topology) = topology() else {
+            return;
+        };
+        let apertures = [aperture(0x1000_0000)];
+        let resources = [
+            window(false),
+            bar(address(1, 0), None),
+            bar(address(1, 1), None),
+        ];
+        let Ok(validation) = validated(&topology, &apertures, &resources) else {
+            return;
+        };
+        let Ok(plan) = plan_firmware_preserving(&topology, &apertures, &validation) else {
+            return;
+        };
+        let mut transport = CommitMockTransport::new();
+        let Ok(commit_plan) = build_commit_plan(&topology, &plan, &mut transport) else {
+            assert!(false, "commit plan should build");
+            return;
+        };
+        assert_eq!(commit_plan.writes().len(), 3);
+        assert_eq!(commit_plan.writes()[0].offset, 0x20); // bridge window first!
+
+        // Fault injection on step 3 (third write call): steps 1 and 2 must roll back to 0!
+        transport.fail_on_write_call = Some(3);
+        let err = execute_commit_plan(&commit_plan, &mut transport);
+        assert_eq!(
+            err,
+            Err(CommitError::RolledBack {
+                failed_step: 2,
+                error: WritePolicyError::TransportWriteFailed,
+            })
+        );
+        assert_eq!(transport.bridge_mem_win, 0);
+        assert_eq!(transport.bar0, 0);
+        assert_eq!(transport.bar1, 0);
+
+        // Retry without fault injection succeeds completely.
+        transport.fail_on_write_call = None;
+        let Ok(recs) = execute_commit_plan(&commit_plan, &mut transport) else {
+            assert!(false, "commit plan should succeed without fault injection");
+            return;
+        };
+        assert_eq!(recs.len(), 3);
+        assert_eq!(transport.bridge_mem_win, 0x80F0_8000);
+        assert_eq!(transport.bar0, 0x8000_0000);
+        assert_eq!(transport.bar1, 0x8000_1000);
     }
 }
