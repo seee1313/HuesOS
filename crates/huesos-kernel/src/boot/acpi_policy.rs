@@ -132,6 +132,59 @@ pub fn derive_broker_policy(
         snapshot_id,
         read_u32(bytes, 80)? as u64,
         bytes[92] as u64,
+        read_u32(bytes, 60)? as u64,
+        pm1_event_len as u64,
+        true,
+        true,
+    );
+    add_io_candidate(
+        &mut io_grants,
+        &deny,
+        deny_complete,
+        snapshot_id,
+        read_u32(bytes, 64)? as u64,
+        pm1_control_len as u64,
+        true,
+        true,
+    );
+    add_io_candidate(
+        &mut io_grants,
+        &deny,
+        deny_complete,
+        snapshot_id,
+        read_u32(bytes, 68)? as u64,
+        pm1_control_len as u64,
+        true,
+        true,
+    );
+    add_io_candidate(
+        &mut io_grants,
+        &deny,
+        deny_complete,
+        snapshot_id,
+        read_u32(bytes, 72)? as u64,
+        bytes[90] as u64,
+        true,
+        true,
+    );
+    // PM_TMR is read-only.
+    add_io_candidate(
+        &mut io_grants,
+        &deny,
+        deny_complete,
+        snapshot_id,
+        read_u32(bytes, 76)? as u64,
+        bytes[91] as u64,
+        true,
+        false,
+    );
+    add_io_candidate(
+        &mut io_grants,
+        &deny,
+        deny_complete,
+        snapshot_id,
+        read_u32(bytes, 80)? as u64,
+        bytes[92] as u64,
         true,
         true,
     );
