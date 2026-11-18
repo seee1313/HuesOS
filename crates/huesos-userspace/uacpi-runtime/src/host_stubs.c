@@ -1,4 +1,5 @@
 #include <uacpi/kernel_api.h>
+#include <uacpi/uacpi.h>
 #include <uacpi/status.h>
 
 /*
@@ -339,4 +340,13 @@ uacpi_status uacpi_kernel_schedule_work(
 uacpi_status uacpi_kernel_wait_for_work_completion(void)
 {
     return UACPI_STATUS_DENIED;
+}
+
+int huesos_uacpi_load_namespace(void)
+{
+    uacpi_status st = uacpi_initialize(UACPI_FLAG_NO_ACPI_MODE);
+    if (st != UACPI_STATUS_OK)
+        return (int)st;
+    st = uacpi_namespace_load();
+    return (int)st;
 }
