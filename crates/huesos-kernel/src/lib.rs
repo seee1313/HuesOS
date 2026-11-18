@@ -276,6 +276,14 @@ pub unsafe fn kmain(boot_info: BootInfo) -> ! {
         (alloc::vec::Vec::new(), alloc::vec::Vec::new())
     };
 
+    let allowed_irqs = if uacpi_tables_ready && acpi_snapshot_id != 0 {
+        boot::acpi_policy::fadt_sci_irq()
+            .into_iter()
+            .collect::<alloc::vec::Vec<_>>()
+    } else {
+        alloc::vec::Vec::new()
+    };
+
     let panic_test_requested = cmdline_requests_panic_test(&verified_hbi);
     let extable_test_requested = cmdline_requests_extable_test(&verified_hbi);
     let irq_test_requested = cmdline_requests_irq_test(&verified_hbi);
@@ -382,6 +390,7 @@ pub unsafe fn kmain(boot_info: BootInfo) -> ! {
         acpi_snapshot_id,
         acpi_system_io,
         acpi_mmio,
+        allowed_irqs,
         storage_boot_info.as_slice(),
         cmdline_image,
     );
@@ -414,12 +423,14 @@ fn log_boot_banner(boot_info: &BootInfo) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn spawn_init_process(
     bootfs_image: Option<&[u8]>,
     acpi_archive: Option<&[u8]>,
     acpi_snapshot_id: u64,
     acpi_system_io: alloc::vec::Vec<huesos_object::SystemIoGrant>,
     acpi_mmio: alloc::vec::Vec<huesos_object::MmioGrant>,
+    allowed_irqs: alloc::vec::Vec<u32>,
     storage_boot_info: &[u8],
     cmdline_image: Option<&[u8]>,
 ) {
@@ -461,6 +472,7 @@ fn spawn_init_process(
                 acpi_snapshot_id,
                 acpi_system_io,
                 acpi_mmio,
+                allowed_irqs,
             ) {
                 dbg("[init] installed deny-by-default ACPI broker capability\n");
             } else {
@@ -708,14 +720,21 @@ fn install_acpi_broker(
     snapshot_id: u64,
     system_io: alloc::vec::Vec<huesos_object::SystemIoGrant>,
     mmio: alloc::vec::Vec<huesos_object::MmioGrant>,
+    allowed_irqs: alloc::vec::Vec<u32>,
 ) -> bool {
     use huesos_object::{Handle, KernelObject, Rights};
 
     // AP-10: the PCI grant list is gone — the broker can never
     // authorize PCI configuration opcodes. Configuration access flows
     // through the dedicated mediated channel to PCI Manager.
-    let broker =
-        huesos_object::AcpiBroker::with_snapshot_policy(snapshot_id, system_io, mmio, false, false);
+    let broker = huesos_object::AcpiBroker::with_full_policy(
+        snapshot_id,
+        system_io,
+        mmio,
+        allowed_irqs,
+        false,
+        false,
+    );
     let koid = broker.koid();
     huesos_object::register_object(broker);
     let rights = Rights::READ | Rights::WRITE | Rights::DUPLICATE | Rights::TRANSFER;

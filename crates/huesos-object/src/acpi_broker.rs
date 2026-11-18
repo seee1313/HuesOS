@@ -50,6 +50,7 @@ pub struct AcpiBroker {
     firmware_snapshot_id: u64,
     system_io: Vec<SystemIoGrant>,
     mmio: Vec<MmioGrant>,
+    allowed_irqs: Vec<u32>,
     allow_reset: bool,
     allow_power_off: bool,
     rate_limiter: IrqSafeMutex<RateLimiter>,
@@ -80,11 +81,31 @@ impl AcpiBroker {
         allow_reset: bool,
         allow_power_off: bool,
     ) -> Arc<Self> {
+        Self::with_full_policy(
+            firmware_snapshot_id,
+            system_io,
+            mmio,
+            Vec::new(),
+            allow_reset,
+            allow_power_off,
+        )
+    }
+
+    /// Construct a snapshot-bound immutable broker policy with explicit IRQ grants.
+    pub fn with_full_policy(
+        firmware_snapshot_id: u64,
+        system_io: Vec<SystemIoGrant>,
+        mmio: Vec<MmioGrant>,
+        allowed_irqs: Vec<u32>,
+        allow_reset: bool,
+        allow_power_off: bool,
+    ) -> Arc<Self> {
         Arc::new(Self {
             koid: alloc_koid(),
             firmware_snapshot_id,
             system_io,
             mmio,
+            allowed_irqs,
             allow_reset,
             allow_power_off,
             rate_limiter: IrqSafeMutex::new(RateLimiter::new(100_000, 4096)),
@@ -127,7 +148,12 @@ impl AcpiBroker {
             Opcode::MmioRead | Opcode::MmioWrite => self.authorizes_mmio(request),
             Opcode::Reset => self.allow_reset,
             Opcode::PowerOff => self.allow_power_off,
-            Opcode::InstallInterrupt | Opcode::RemoveInterrupt => false,
+            Opcode::InstallInterrupt | Opcode::RemoveInterrupt => {
+                let Ok(gsi) = u32::try_from(request.address) else {
+                    return false;
+                };
+                self.allowed_irqs.contains(&gsi)
+            }
         }
     }
 

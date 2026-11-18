@@ -140,6 +140,57 @@ pub fn derive_broker_policy(
         &deny,
         deny_complete,
         snapshot_id,
+        read_u32(bytes, 64)? as u64,
+        pm1_control_len as u64,
+        true,
+        true,
+    );
+    add_io_candidate(
+        &mut io_grants,
+        &deny,
+        deny_complete,
+        snapshot_id,
+        read_u32(bytes, 68)? as u64,
+        pm1_control_len as u64,
+        true,
+        true,
+    );
+    add_io_candidate(
+        &mut io_grants,
+        &deny,
+        deny_complete,
+        snapshot_id,
+        read_u32(bytes, 72)? as u64,
+        bytes[90] as u64,
+        true,
+        true,
+    );
+    // PM_TMR is read-only.
+    add_io_candidate(
+        &mut io_grants,
+        &deny,
+        deny_complete,
+        snapshot_id,
+        read_u32(bytes, 76)? as u64,
+        bytes[91] as u64,
+        true,
+        false,
+    );
+    add_io_candidate(
+        &mut io_grants,
+        &deny,
+        deny_complete,
+        snapshot_id,
+        read_u32(bytes, 80)? as u64,
+        bytes[92] as u64,
+        true,
+        true,
+    );
+    add_io_candidate(
+        &mut io_grants,
+        &deny,
+        deny_complete,
+        snapshot_id,
         read_u32(bytes, 84)? as u64,
         bytes[93] as u64,
         true,
@@ -211,6 +262,15 @@ pub fn derive_broker_policy(
 
     let _ = &mut deny;
     Ok((io_grants, mmio_grants))
+}
+
+/// Read `SCI_INT` (offset 46, `u16`) from the uACPI-validated FADT.
+pub fn fadt_sci_irq() -> Option<u32> {
+    let table = huesos_uacpi::Table::find(b"FACP").ok()?;
+    let bytes = table.bytes().ok()?;
+    let field = bytes.get(46..48)?;
+    let sci = u16::from_le_bytes([field[0], field[1]]);
+    (sci != 0).then_some(u32::from(sci))
 }
 
 /// Legacy wrapper for callers/tests that only inspect FADT SystemIO grants.

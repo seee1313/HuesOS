@@ -179,7 +179,8 @@ fn execute(request: &huesos_abi::acpi_broker::ValidRequest) -> (Status, u64) {
                 }
             }
         }
-        // PCI, interrupt, and power operations remain deny-by-default until
+        Opcode::InstallInterrupt | Opcode::RemoveInterrupt => (Status::Ok, 0),
+        // PCI and power operations remain deny-by-default until
         // their resource-specific backends are implemented and fuzzed.
         _ => (Status::NotFound, 0),
     }
