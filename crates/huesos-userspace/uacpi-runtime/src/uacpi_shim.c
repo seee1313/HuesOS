@@ -187,11 +187,38 @@ uacpi_i64 hues_uacpi_namespace_phase(
 
 #define HUES_MAX_PCI_ROOTS 16
 #define HUES_MAX_PCI_APERTURES 64
+#define HUES_MAX_PCI_PRT_ENTRIES 256
 #define HUES_APERTURE_KIND_IO 1
 #define HUES_APERTURE_KIND_MMIO32 2
 #define HUES_APERTURE_KIND_MMIO64 3
 #define HUES_APERTURE_KIND_PREFETCH 4
 #define HUES_APERTURE_FLAG_FIXED (1u << 1)
+
+#define HUES_ROOT_FLAG_INTX_ROUTING (1u << 2)
+
+#define HUES_PRT_SOURCE_DIRECT_GSI 1
+#define HUES_PRT_SOURCE_LINK_DEVICE 2
+#define HUES_PRT_SOURCE_UNRESOLVED_LINK 3
+
+#define HUES_OSC_NOT_PRESENT 0
+#define HUES_OSC_GRANTED 1
+#define HUES_OSC_MASKED 2
+#define HUES_OSC_FAILED 3
+
+#define HUES_OSC_FLAG_QUERY (1u << 0)
+#define HUES_OSC_ERR_FAILURE (1u << 1)
+#define HUES_OSC_ERR_UNRECOGNIZED_UUID (1u << 2)
+#define HUES_OSC_ERR_UNRECOGNIZED_REV (1u << 3)
+#define HUES_OSC_ERR_MASKED (1u << 4)
+
+#define HUES_OSC_SUPPORT_EXT_CFG (1u << 0)
+#define HUES_OSC_SUPPORT_SEGMENT_GROUPS (1u << 3)
+#define HUES_OSC_SUPPORT_MSI (1u << 4)
+
+#define HUES_OSC_CTRL_HOTPLUG (1u << 0)
+#define HUES_OSC_CTRL_PME (1u << 2)
+#define HUES_OSC_CTRL_AER (1u << 3)
+#define HUES_OSC_CTRL_CAPABILITY (1u << 4)
 
 typedef struct HuesPciRootDesc {
     uacpi_u16 segment;
@@ -201,8 +228,15 @@ typedef struct HuesPciRootDesc {
     uacpi_u8 has_bbn;
     uacpi_u16 aperture_start;
     uacpi_u16 aperture_count;
-    uacpi_u16 _pad;
+    uacpi_u16 prt_start;
+    uacpi_u16 prt_count;
+    uacpi_u8 osc_status;
+    uacpi_u8 _pad;
     uacpi_u32 flags;
+    uacpi_u32 osc_support;
+    uacpi_u32 osc_requested_control;
+    uacpi_u32 osc_granted_control;
+    uacpi_u32 osc_error_flags;
 } HuesPciRootDesc;
 
 typedef struct HuesPciApertureDesc {
@@ -215,12 +249,25 @@ typedef struct HuesPciApertureDesc {
     uacpi_u64 len;
 } HuesPciApertureDesc;
 
+typedef struct HuesPciPrtEntryDesc {
+    uacpi_u16 root_index;
+    uacpi_u8 device;
+    uacpi_u8 pin;
+    uacpi_u32 gsi;
+    uacpi_u8 source_kind;
+    uacpi_u8 link_active;
+    uacpi_u8 triggering;
+    uacpi_u8 polarity;
+} HuesPciPrtEntryDesc;
+
 typedef struct HuesPciRootsOut {
     uacpi_u16 root_count;
     uacpi_u16 aperture_count;
-    uacpi_u32 _pad;
+    uacpi_u16 prt_count;
+    uacpi_u16 _pad;
     HuesPciRootDesc roots[HUES_MAX_PCI_ROOTS];
     HuesPciApertureDesc apertures[HUES_MAX_PCI_APERTURES];
+    HuesPciPrtEntryDesc prt_entries[HUES_MAX_PCI_PRT_ENTRIES];
 } HuesPciRootsOut;
 
 struct root_crs_ctx {
@@ -366,6 +413,228 @@ static uacpi_iteration_decision on_root_crs(void *user, uacpi_resource *res)
     return UACPI_ITERATION_DECISION_CONTINUE;
 }
 
+struct link_crs_ctx {
+    uacpi_u32 gsi;
+    uacpi_u8 triggering;
+    uacpi_u8 polarity;
+    uacpi_bool found;
+};
+
+static uacpi_iteration_decision on_link_crs(void *user, uacpi_resource *res)
+{
+    struct link_crs_ctx *ctx = (struct link_crs_ctx *)user;
+    if (res->type == UACPI_RESOURCE_TYPE_IRQ && res->irq.num_irqs > 0) {
+        ctx->gsi = (uacpi_u32)res->irq.irqs[0];
+        ctx->triggering = (res->irq.triggering == UACPI_TRIGGERING_LEVEL) ? 1 : 0;
+        ctx->polarity = (res->irq.polarity == UACPI_POLARITY_ACTIVE_LOW) ? 1 : 0;
+        ctx->found = UACPI_TRUE;
+        return UACPI_ITERATION_DECISION_BREAK;
+    }
+    if (res->type == UACPI_RESOURCE_TYPE_EXTENDED_IRQ && res->extended_irq.num_irqs > 0) {
+        ctx->gsi = res->extended_irq.irqs[0];
+        ctx->triggering = (res->extended_irq.triggering == UACPI_TRIGGERING_LEVEL) ? 1 : 0;
+        ctx->polarity = (res->extended_irq.polarity == UACPI_POLARITY_ACTIVE_LOW) ? 1 : 0;
+        ctx->found = UACPI_TRUE;
+        return UACPI_ITERATION_DECISION_BREAK;
+    }
+    return UACPI_ITERATION_DECISION_CONTINUE;
+}
+
+static uacpi_status collect_root_prt(
+    uacpi_namespace_node *node,
+    HuesPciRootsOut *out,
+    uacpi_u16 root_index)
+{
+    HuesPciRootDesc *root = &out->roots[root_index];
+    uacpi_pci_routing_table *prt = UACPI_NULL;
+    uacpi_status st;
+    uacpi_size i;
+
+    root->prt_start = out->prt_count;
+    root->prt_count = 0;
+
+    st = uacpi_get_pci_routing_table(node, &prt);
+    if (st == UACPI_STATUS_NOT_FOUND)
+        return UACPI_STATUS_OK;
+    if (st != UACPI_STATUS_OK || prt == UACPI_NULL)
+        return st;
+
+    for (i = 0; i < prt->num_entries; ++i) {
+        const uacpi_pci_routing_table_entry *src = &prt->entries[i];
+        uacpi_u32 dev = (src->address >> 16) & 0x1Fu;
+        HuesPciPrtEntryDesc *dst;
+
+        if (src->pin >= 4) {
+            uacpi_free_pci_routing_table(prt);
+            return UACPI_STATUS_INVALID_ARGUMENT;
+        }
+        if (out->prt_count >= HUES_MAX_PCI_PRT_ENTRIES) {
+            uacpi_free_pci_routing_table(prt);
+            return UACPI_STATUS_OUT_OF_MEMORY;
+        }
+        dst = &out->prt_entries[out->prt_count++];
+        uacpi_memzero(dst, sizeof(*dst));
+        dst->root_index = root_index;
+        dst->device = (uacpi_u8)dev;
+        dst->pin = src->pin;
+
+        if (src->source == UACPI_NULL) {
+            dst->gsi = src->index;
+            dst->source_kind = HUES_PRT_SOURCE_DIRECT_GSI;
+            dst->link_active = 1;
+            dst->triggering = 1;
+            dst->polarity = 1;
+        } else {
+            uacpi_u32 sta = 0;
+            uacpi_status sta_st = uacpi_eval_sta(src->source, &sta);
+            struct link_crs_ctx lctx = {
+                .gsi = 0,
+                .triggering = 1,
+                .polarity = 1,
+                .found = UACPI_FALSE,
+            };
+            uacpi_status crs_st = UACPI_STATUS_NOT_FOUND;
+            if (sta_st == UACPI_STATUS_OK && (sta & 0x01u) != 0u) {
+                crs_st = uacpi_for_each_device_resource(
+                    src->source, "_CRS", on_link_crs, &lctx);
+                if (crs_st != UACPI_STATUS_OK && crs_st != UACPI_STATUS_NOT_FOUND) {
+                    uacpi_free_pci_routing_table(prt);
+                    return crs_st;
+                }
+            } else if (sta_st != UACPI_STATUS_OK && sta_st != UACPI_STATUS_NOT_FOUND) {
+                uacpi_free_pci_routing_table(prt);
+                return sta_st;
+            }
+            if ((sta & 0x03u) == 0x03u && lctx.found && lctx.gsi > 0u) {
+                dst->gsi = lctx.gsi;
+                dst->source_kind = HUES_PRT_SOURCE_LINK_DEVICE;
+                dst->link_active = 1;
+                dst->triggering = lctx.triggering;
+                dst->polarity = lctx.polarity;
+            } else {
+                dst->gsi = 0;
+                dst->source_kind = HUES_PRT_SOURCE_UNRESOLVED_LINK;
+                dst->link_active = 0;
+                dst->triggering = lctx.triggering;
+                dst->polarity = lctx.polarity;
+            }
+        }
+        root->prt_count++;
+    }
+
+    if (root->prt_count > 0)
+        root->flags |= HUES_ROOT_FLAG_INTX_ROUTING;
+
+    uacpi_free_pci_routing_table(prt);
+    return UACPI_STATUS_OK;
+}
+
+static uacpi_status query_root_osc(
+    uacpi_namespace_node *node,
+    HuesPciRootDesc *root)
+{
+    /* PCI Express Host Bridge _OSC UUID: 33DB4D5B-1FF7-401C-9657-7441C03DD766 */
+    static const uacpi_u8 pcie_osc_uuid[16] = {
+        0x5B, 0x4D, 0xDB, 0x33, 0xF7, 0x1F, 0x1C, 0x40,
+        0x96, 0x57, 0x74, 0x41, 0xC0, 0x3D, 0xD7, 0x66,
+    };
+    const uacpi_u32 support =
+        HUES_OSC_SUPPORT_EXT_CFG | HUES_OSC_SUPPORT_SEGMENT_GROUPS | HUES_OSC_SUPPORT_MSI;
+    const uacpi_u32 req_ctrl =
+        HUES_OSC_CTRL_HOTPLUG | HUES_OSC_CTRL_PME | HUES_OSC_CTRL_AER | HUES_OSC_CTRL_CAPABILITY;
+    uacpi_u8 cap_buf[12];
+    uacpi_object *args_arr[4] = { UACPI_NULL, UACPI_NULL, UACPI_NULL, UACPI_NULL };
+    uacpi_object_array args;
+    uacpi_object *ret_obj = UACPI_NULL;
+    uacpi_data_view ret_view;
+    uacpi_status st;
+    uacpi_u32 out_status;
+    uacpi_u32 out_ctrl;
+
+    /* Strictly Query mode (DWORD 0 bit 0 = 1): do not claim native control before Stage K. */
+    cap_buf[0] = (uacpi_u8)(HUES_OSC_FLAG_QUERY & 0xFFu);
+    cap_buf[1] = 0;
+    cap_buf[2] = 0;
+    cap_buf[3] = 0;
+    cap_buf[4] = (uacpi_u8)(support & 0xFFu);
+    cap_buf[5] = (uacpi_u8)((support >> 8) & 0xFFu);
+    cap_buf[6] = (uacpi_u8)((support >> 16) & 0xFFu);
+    cap_buf[7] = (uacpi_u8)((support >> 24) & 0xFFu);
+    cap_buf[8] = (uacpi_u8)(req_ctrl & 0xFFu);
+    cap_buf[9] = (uacpi_u8)((req_ctrl >> 8) & 0xFFu);
+    cap_buf[10] = (uacpi_u8)((req_ctrl >> 16) & 0xFFu);
+    cap_buf[11] = (uacpi_u8)((req_ctrl >> 24) & 0xFFu);
+
+    args_arr[0] = uacpi_object_create_buffer((uacpi_data_view){ .const_bytes = pcie_osc_uuid, .length = 16 });
+    args_arr[1] = uacpi_object_create_integer(1);
+    args_arr[2] = uacpi_object_create_integer(3);
+    args_arr[3] = uacpi_object_create_buffer((uacpi_data_view){ .const_bytes = cap_buf, .length = 12 });
+    if (!args_arr[0] || !args_arr[1] || !args_arr[2] || !args_arr[3]) {
+        st = UACPI_STATUS_OUT_OF_MEMORY;
+        goto cleanup;
+    }
+
+    args.objects = args_arr;
+    args.count = 4;
+    st = uacpi_eval_buffer(node, "_OSC", &args, &ret_obj);
+    if (st == UACPI_STATUS_NOT_FOUND) {
+        root->osc_status = HUES_OSC_NOT_PRESENT;
+        root->osc_support = 0;
+        root->osc_requested_control = 0;
+        root->osc_granted_control = 0;
+        root->osc_error_flags = 0;
+        st = UACPI_STATUS_OK;
+        goto cleanup;
+    }
+
+    root->osc_support = support;
+    root->osc_requested_control = req_ctrl;
+
+    if (st != UACPI_STATUS_OK || ret_obj == UACPI_NULL) {
+        root->osc_status = HUES_OSC_FAILED;
+        root->osc_granted_control = 0;
+        root->osc_error_flags = HUES_OSC_ERR_FAILURE;
+        goto cleanup;
+    }
+
+    if (uacpi_object_get_buffer(ret_obj, &ret_view) != UACPI_STATUS_OK ||
+        ret_view.length < 12 || ret_view.const_bytes == UACPI_NULL) {
+        root->osc_status = HUES_OSC_FAILED;
+        root->osc_granted_control = 0;
+        root->osc_error_flags = HUES_OSC_ERR_FAILURE;
+        goto cleanup;
+    }
+
+    out_status = (uacpi_u32)ret_view.const_bytes[0]
+        | ((uacpi_u32)ret_view.const_bytes[1] << 8)
+        | ((uacpi_u32)ret_view.const_bytes[2] << 16)
+        | ((uacpi_u32)ret_view.const_bytes[3] << 24);
+    out_ctrl = (uacpi_u32)ret_view.const_bytes[8]
+        | ((uacpi_u32)ret_view.const_bytes[9] << 8)
+        | ((uacpi_u32)ret_view.const_bytes[10] << 16)
+        | ((uacpi_u32)ret_view.const_bytes[11] << 24);
+
+    root->osc_granted_control = out_ctrl;
+    root->osc_error_flags = out_status & ~HUES_OSC_FLAG_QUERY;
+
+    if ((out_status & (HUES_OSC_ERR_FAILURE | HUES_OSC_ERR_UNRECOGNIZED_UUID | HUES_OSC_ERR_UNRECOGNIZED_REV)) != 0u) {
+        root->osc_status = HUES_OSC_FAILED;
+    } else if ((out_status & HUES_OSC_ERR_MASKED) != 0u || (out_ctrl & req_ctrl) != req_ctrl) {
+        root->osc_status = HUES_OSC_MASKED;
+    } else {
+        root->osc_status = HUES_OSC_GRANTED;
+    }
+
+cleanup:
+    if (ret_obj != UACPI_NULL)
+        uacpi_object_unref(ret_obj);
+    for (uacpi_size idx = 0; idx < 4; ++idx) {
+        if (args_arr[idx] != UACPI_NULL)
+            uacpi_object_unref(args_arr[idx]);
+    }
+    return st;
+}
+
 struct roots_find_ctx {
     HuesPciRootsOut *out;
     uacpi_status error;
@@ -386,6 +655,7 @@ static uacpi_iteration_decision on_pci_root(
     HuesPciRootDesc *root = &fctx->out->roots[root_idx];
     uacpi_memzero(root, sizeof(*root));
     root->aperture_start = fctx->out->aperture_count;
+    root->prt_start = fctx->out->prt_count;
 
     uacpi_u64 seg = 0;
     uacpi_status st = uacpi_eval_simple_integer(node, "_SEG", &seg);
@@ -424,6 +694,18 @@ static uacpi_iteration_decision on_pci_root(
     }
     if (cctx.error != UACPI_STATUS_OK) {
         fctx->error = cctx.error;
+        return UACPI_ITERATION_DECISION_BREAK;
+    }
+
+    st = collect_root_prt(node, fctx->out, root_idx);
+    if (st != UACPI_STATUS_OK) {
+        fctx->error = st;
+        return UACPI_ITERATION_DECISION_BREAK;
+    }
+
+    st = query_root_osc(node, root);
+    if (st != UACPI_STATUS_OK) {
+        fctx->error = st;
         return UACPI_ITERATION_DECISION_BREAK;
     }
 

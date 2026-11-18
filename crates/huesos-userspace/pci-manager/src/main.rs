@@ -426,10 +426,37 @@ fn accept_root_table(
 
     let root_count = table.root_count;
     let aperture_count = table.aperture_count;
+    let prt_count = table.prt_count;
     println!(
-        "[pci-manager] accepted HPCI root table: {} root(s), {} aperture(s)",
-        root_count, aperture_count
+        "[pci-manager] accepted HPCI root table: {} root(s), {} aperture(s), {} prt(s)",
+        root_count, aperture_count, prt_count
     );
+    for idx in 0..root_count {
+        let root = table.roots[idx];
+        let mut direct_prt = 0usize;
+        let mut link_prt = 0usize;
+        let mut unresolved_prt = 0usize;
+        for entry in table.root_prt(idx) {
+            match entry.source_kind {
+                abi_pci::PrtSourceKind::DirectGsi => direct_prt += 1,
+                abi_pci::PrtSourceKind::PciLinkDevice => link_prt += 1,
+                abi_pci::PrtSourceKind::UnresolvedLink => unresolved_prt += 1,
+            }
+        }
+        println!(
+            "[pci-manager] root[{}] seg={} bus={}..={} prt(direct={}, link={}, unresolved={}) osc={:?} granted=0x{:x} err=0x{:x}",
+            idx,
+            root.segment,
+            root.start_bus,
+            root.end_bus,
+            direct_prt,
+            link_prt,
+            unresolved_prt,
+            root.osc_status,
+            root.osc_granted_control,
+            root.osc_error_flags
+        );
+    }
     let _ = send(
         bootstrap,
         Message {
