@@ -3172,3 +3172,19 @@ block (total `unsafe_blocks` reaches the 383 cap at 383):
   `hxfs-service`). All PCI bus scanning uses read-only `huesos_pci::inventory`
   through ECAM `mmio_load` (or `force-legacy` common-subset reads) with zero
   config writes.
+
+## AP-17 config write policy and ECAM RW upgrade
+
+AP-17 adds B.4 class/mask/readback config write-policy enforcement in
+`huesos-pci::write_policy`, the post-`HPCI` `MINT_KIND_ECAM_WINDOWS_RW` upgrade
+in `huesos-syscalls/src/config_mint.rs`, and checked write execution in
+`pci-manager` (while keeping AML `PCI_Config` writes denied with
+`AccessDenied` and diagnostic inventory `config-writes=0`), adding one audited
+`unsafe` block (total `unsafe_blocks` is `384`):
+
+- `crates/huesos-userspace/libcanvas/src/channel.rs` (`1` additional unsafe block,
+  file total `8`): `mmio_store<T>(address, value)` wraps
+  `core::ptr::write_volatile` for `pci-manager` writes into mapped
+  write-capable `NO_CACHE` ECAM windows after `huesos_pci::write_policy`
+  class, offset, alignment, write-mask, and non-zero `expected_readback_mask`
+  validation passes.

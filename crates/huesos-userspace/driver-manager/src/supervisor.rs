@@ -228,6 +228,12 @@ pub struct DriverManager {
     /// Whether the current PCI Manager generation already received the
     /// `HPCI` root-bridge table for this boot/generation pair.
     pci_roots_handed_off: bool,
+    /// Whether DriverManager initiated the B.4 write-authority upgrade
+    /// after `HPCI` acceptance (AP-17).
+    pci_write_upgrade_requested: bool,
+    /// Whether the current PCI Manager generation reported
+    /// [`pci_manager::Status::WriteAuthorityReady`] (AP-17).
+    pci_write_authority_ready: bool,
     /// Whether the private ACPI ↔ PCI mediation channel pair was
     /// established for the current (PCI, ACPI) generation combination.
     config_mediation_established: bool,
@@ -398,6 +404,8 @@ impl DriverManager {
             config_authority_handed_off: false,
             pci_config_authority_ready: false,
             pci_roots_handed_off: false,
+            pci_write_upgrade_requested: false,
+            pci_write_authority_ready: false,
             config_mediation_established: false,
             acpi_authority_settled: false,
             registry_channel: None,
@@ -1101,6 +1109,8 @@ impl DriverManager {
         self.pci_manager_ready = false;
         self.pci_config_authority_ready = false;
         self.config_authority_handed_off = false;
+        self.pci_write_upgrade_requested = false;
+        self.pci_write_authority_ready = false;
         self.pci_manager = Some(ManagedHost { process, bootstrap });
         println!(
             "[driver-manager] launched restartable PCI manager generation {}",
@@ -1117,6 +1127,8 @@ impl DriverManager {
         self.pci_manager_ready = false;
         self.pci_config_authority_ready = false;
         self.pci_roots_handed_off = false;
+        self.pci_write_upgrade_requested = false;
+        self.pci_write_authority_ready = false;
         self.config_mediation_established = false;
         let now = libcanvas::system::monotonic_ticks().unwrap_or(0);
         if !self.pci_manager_restart.record_failure(
@@ -2314,6 +2326,41 @@ impl DriverManager {
                             "[driver-manager] PCI manager accepted HPCI root table: {} root(s)",
                             message.detail
                         );
+                        if !self.pci_write_upgrade_requested && self.acpi_hpci_eligible {
+                            self.pci_write_upgrade_requested = true;
+                            let upgrade_msg = if cfg!(feature = "pci-force-legacy") {
+                                pci_manager::Message::write_authority_complete(
+                                    self.pci_manager_generation,
+                                    1,
+                                )
+                            } else {
+                                pci_manager::Message::prepare_write_upgrade(
+                                    self.pci_manager_generation,
+                                    0,
+                                )
+                            };
+                            let mut out = [0u8; pci_manager::MESSAGE_BYTES];
+                            if let Some(len) = pci_manager::encode(upgrade_msg, &mut out) {
+                                let _ = host.bootstrap.write(&out[..len]);
+                            }
+                        }
+                    }
+                    (pci_manager::Opcode::WriteUpgradePrepared, pci_manager::Status::Ok) => {
+                        self.pci_manager = Some(host);
+                        self.handoff_write_config_authority();
+                        self.maybe_publish_mediation();
+                        self.maybe_handoff_pci_roots();
+                        return;
+                    }
+                    (
+                        pci_manager::Opcode::WriteAuthorityReady,
+                        pci_manager::Status::WriteAuthorityReady,
+                    ) => {
+                        self.pci_write_authority_ready = true;
+                        println!(
+                            "[driver-manager] PCI manager ready (write-capable config authority, windows {})",
+                            message.detail
+                        );
                     }
                     (
                         pci_manager::Opcode::RootTableRejected,
@@ -2777,6 +2824,8 @@ impl DriverManager {
         self.hpci = Some(vmo);
     }
 
+    /// Notify PCI Manager to freeze new inventory generations when ACPI crashes
+    /// or completes without usable `HPCI`.
     fn notify_pci_acpi_frozen(&self, no_hpci: bool) {
         if !self.pci_config_authority_ready {
             return;
@@ -2828,6 +2877,120 @@ impl DriverManager {
             "[driver-manager] forwarded HPCI root table to PCI manager generation {}",
             self.pci_manager_generation
         );
+    }
+
+    /// Mint and deliver write-capable ECAM capabilities after `pci-manager`
+    /// has accepted `HPCI` and released its initial read-only ECAM mappings (AP-17).
+    fn handoff_write_config_authority(&mut self) {
+        if self.pci_write_authority_ready || !self.acpi_hpci_eligible {
+            return;
+        }
+        let Some(host) = self.pci_manager.take() else {
+            return;
+        };
+        let _keep_process_alive = &host.process;
+
+        let decoded = self.hmcf.as_ref().and_then(|vmo| {
+            let mut header = [0u8; hmcf::HEADER_BYTES];
+            if !read_vmo_exact(vmo, 0, &mut header) {
+                return None;
+            }
+            let declared = hmcf::declared_size(&header).ok()?;
+            let mut image = [0u8; hmcf::MAX_BYTES];
+            if !read_vmo_exact(vmo, 0, &mut image[..declared]) {
+                return None;
+            }
+            hmcf::decode(&image[..declared]).ok().map(|view| {
+                (
+                    view.firmware_snapshot_id(),
+                    view.producer_generation(),
+                    view.record_count(),
+                )
+            })
+        });
+
+        let Some((snapshot, producer_generation, record_count)) = decoded else {
+            println!("[driver-manager] write config authority mint rejected: HMCF unreadable");
+            self.pci_manager = Some(host);
+            return;
+        };
+        let (Some(authority), Some(hmcf_vmo)) = (self.config_mint.as_ref(), self.hmcf.as_ref())
+        else {
+            println!("[driver-manager] write config authority mint rejected: authority missing");
+            self.pci_manager = Some(host);
+            return;
+        };
+        let request = pci_config::PciConfigMintRequest {
+            version: pci_config::MINT_REQUEST_VERSION,
+            kind: pci_config::MINT_KIND_ECAM_WINDOWS_RW,
+            reserved: 0,
+            firmware_snapshot_id: snapshot,
+            producer_generation,
+            hmcf_vmo: hmcf_vmo.handle().raw(),
+        };
+        match libcanvas::pci_config::mint(authority, &request) {
+            Ok(mut capabilities) => {
+                if capabilities.len() != record_count {
+                    println!(
+                        "[driver-manager] write config authority mint rejected: {} capability(ies), expected {}",
+                        capabilities.len(),
+                        record_count
+                    );
+                    self.pci_manager = Some(host);
+                    return;
+                }
+                for index in 0..record_count {
+                    let Some(handle) = capabilities.take(index) else {
+                        println!(
+                            "[driver-manager] write config authority transfer failed: capability {} missing",
+                            index
+                        );
+                        drop(host);
+                        self.schedule_pci_manager_restart();
+                        return;
+                    };
+                    if let Err((error, _handle)) = host
+                        .bootstrap
+                        .write_handle(pci_manager::CONFIG_ECAM_RW_LABEL, handle)
+                    {
+                        println!(
+                            "[driver-manager] write config authority transfer failed: {}",
+                            error.as_str()
+                        );
+                        drop(host);
+                        self.schedule_pci_manager_restart();
+                        return;
+                    }
+                }
+                let sentinel = pci_manager::Message::write_authority_complete(
+                    self.pci_manager_generation,
+                    record_count as u32,
+                );
+                let mut bytes = [0u8; pci_manager::MESSAGE_BYTES];
+                if let Some(len) = pci_manager::encode(sentinel, &mut bytes) {
+                    if host.bootstrap.write(&bytes[..len]).is_err() {
+                        println!(
+                            "[driver-manager] write config authority sentinel delivery failed"
+                        );
+                        drop(host);
+                        self.schedule_pci_manager_restart();
+                        return;
+                    }
+                }
+                self.pci_manager = Some(host);
+                println!(
+                    "[driver-manager] minted {} write-capable config capability(ies) for PCI manager generation {} (snapshot {})",
+                    record_count, self.pci_manager_generation, snapshot
+                );
+            }
+            Err(error) => {
+                println!(
+                    "[driver-manager] write config authority mint rejected: {}",
+                    error.as_str()
+                );
+                self.pci_manager = Some(host);
+            }
+        }
     }
 
     fn poll_acpi_manager(&mut self) {

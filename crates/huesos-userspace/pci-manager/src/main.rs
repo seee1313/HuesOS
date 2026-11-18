@@ -55,6 +55,11 @@ use huesos_pci::inventory::{
 };
 use huesos_pci::resource_validation::{ResourceClass, RootAperture};
 use huesos_pci::topology::RootBus;
+use huesos_pci::write_policy::{
+    self, ConfigReadWriteTransport, HeaderKind, WriteClass, WritePolicyError, WriteRequest,
+    COMMAND_WRITABLE_MASK, OFFSET_COMMAND,
+};
+use huesos_pci::{ConfigWidth, PciAddress, CONVENTIONAL_CONFIG_BYTES, ENHANCED_CONFIG_BYTES};
 use libcanvas::{println, wait_any, Channel, ErrorCode, Handle, Signals, Vmo, WaitItem};
 
 #[cfg(feature = "force-legacy")]
@@ -145,6 +150,12 @@ struct ConfigAuthority {
     roots: Option<RootBridgeTable>,
     /// Diagnostic read-only inventory state (AP-16).
     inventory: InventoryManager,
+    #[cfg_attr(feature = "force-legacy", allow(dead_code))]
+    rw_ecam: [Option<Handle>; hmcf::MAX_RECORDS as usize],
+    #[cfg_attr(feature = "force-legacy", allow(dead_code))]
+    rw_ecam_count: usize,
+    writable: bool,
+    write_upgrading: bool,
     #[cfg(feature = "force-legacy")]
     legacy_ioport: Option<IoPort>,
     mediation: Option<Channel>,
@@ -155,17 +166,20 @@ struct ConfigAuthority {
 }
 
 /// One retained, mapped configuration window.
-#[derive(Clone, Copy)]
 struct WindowMapping {
     segment: u16,
     bus_start: u8,
     bus_end: u8,
-    /// First byte addressable in the mapped read-only region.
+    /// First byte addressable in the mapped region.
     #[cfg_attr(feature = "force-legacy", allow(dead_code))]
     va_base: u64,
     /// Total mapped span in bytes.
     #[cfg_attr(feature = "force-legacy", allow(dead_code))]
     span_bytes: u64,
+    /// Retained Mmio capability handle so RO->RW upgrade can unmap and
+    /// release the read-only resource cleanly (AP-17).
+    #[cfg(not(feature = "force-legacy"))]
+    resource: Option<Handle>,
 }
 
 impl Default for ConfigAuthority {
@@ -180,6 +194,10 @@ impl Default for ConfigAuthority {
             producer_generation: 0,
             roots: None,
             inventory: InventoryManager::new(),
+            rw_ecam: [const { None }; hmcf::MAX_RECORDS as usize],
+            rw_ecam_count: 0,
+            writable: false,
+            write_upgrading: false,
             #[cfg(feature = "force-legacy")]
             legacy_ioport: None,
             mediation: None,
@@ -212,19 +230,40 @@ fn handle_authority_message(
                 );
             } else if bytes == pci_manager::ROOT_TABLE_VMO_LABEL {
                 accept_root_table(bootstrap, handle, authority, manager_generation);
+            } else if bytes == pci_manager::CONFIG_ECAM_RW_LABEL {
+                if !authority.writable && authority.rw_ecam_count < authority.rw_ecam.len() {
+                    authority.rw_ecam[authority.rw_ecam_count] = Some(handle);
+                    authority.rw_ecam_count += 1;
+                } else {
+                    drop(handle);
+                }
             } else {
                 drop(handle);
             }
         } else if let Some(message) = pci_manager::decode(bytes) {
-            if message.manager_generation == manager_generation
-                && message.opcode == Opcode::AcpiGenerationFrozen
-            {
-                handle_acpi_frozen(
-                    bootstrap,
-                    authority,
-                    manager_generation,
-                    message.detail != 0,
-                );
+            if message.manager_generation == manager_generation {
+                match message.opcode {
+                    Opcode::AcpiGenerationFrozen => {
+                        handle_acpi_frozen(
+                            bootstrap,
+                            authority,
+                            manager_generation,
+                            message.detail != 0,
+                        );
+                    }
+                    Opcode::PrepareWriteUpgrade => {
+                        prepare_write_upgrade(bootstrap, authority, manager_generation);
+                    }
+                    Opcode::WriteAuthorityComplete => {
+                        finish_write_authority(
+                            bootstrap,
+                            authority,
+                            manager_generation,
+                            message.detail,
+                        );
+                    }
+                    _ => {}
+                }
             }
         }
         return true;
@@ -752,10 +791,8 @@ fn finish_authority(
                 record.span_bytes,
                 vmar_flags::READ | vmar_flags::USER | vmar_flags::SPECIFIC,
             );
-            // The mapping keeps the resource alive via a kernel reference;
-            // the userspace handle is safe to drop after mapping.
-            drop(handle);
             if let Err(error) = result {
+                drop(handle);
                 println!(
                     "[pci-manager] read-only config authority map rejected: {}",
                     error.as_str()
@@ -769,7 +806,10 @@ fn finish_authority(
                     bus_end: record.end_bus,
                     va_base: window_va,
                     span_bytes: record.span_bytes,
+                    resource: Some(handle),
                 });
+            } else {
+                drop(handle);
             }
             mapped += 1;
             next_va = next_va.saturating_add(record.span_bytes);
@@ -795,6 +835,291 @@ fn finish_authority(
             Message::ready_config_authority(manager_generation, mapped as u32),
         );
         true
+    }
+}
+
+fn prepare_write_upgrade(
+    bootstrap: &Channel,
+    authority: &mut ConfigAuthority,
+    manager_generation: u64,
+) {
+    if authority.writable || authority.write_upgrading {
+        return;
+    }
+    #[cfg(feature = "force-legacy")]
+    {
+        let _ = (bootstrap, manager_generation);
+    }
+    #[cfg(not(feature = "force-legacy"))]
+    {
+        let mut unmapped = 0usize;
+        for window in authority.windows[..authority.windows_len]
+            .iter_mut()
+            .flatten()
+        {
+            let Some(handle) = window.resource.take() else {
+                println!("[pci-manager] write upgrade rejected: missing RO capability");
+                return;
+            };
+            if let Err(error) =
+                libcanvas::resource::unmap_self(&handle, window.va_base, window.span_bytes)
+            {
+                println!(
+                    "[pci-manager] write upgrade unmap failed: {}",
+                    error.as_str()
+                );
+                window.resource = Some(handle);
+                return;
+            }
+            drop(handle);
+            window.va_base = 0;
+            unmapped += 1;
+        }
+        authority.write_upgrading = true;
+        authority.rw_ecam_count = 0;
+        let _ = send(
+            bootstrap,
+            Message::write_upgrade_prepared(manager_generation, unmapped as u32),
+        );
+    }
+}
+
+fn finish_write_authority(
+    bootstrap: &Channel,
+    authority: &mut ConfigAuthority,
+    manager_generation: u64,
+    declared_count: u32,
+) {
+    if authority.writable {
+        return;
+    }
+    #[cfg(feature = "force-legacy")]
+    {
+        if authority.legacy_ioport.is_none() || declared_count != 1 {
+            println!("[pci-manager] legacy write authority rejected");
+            return;
+        }
+        authority.writable = true;
+        authority.write_upgrading = false;
+        if verify_b4_write_policy(authority, 1) {
+            let _ = send(
+                bootstrap,
+                Message::write_authority_ready(manager_generation, 1),
+            );
+        } else {
+            authority.writable = false;
+        }
+    }
+    #[cfg(not(feature = "force-legacy"))]
+    {
+        if !authority.write_upgrading
+            || authority.rw_ecam_count != authority.windows_len
+            || declared_count as usize != authority.windows_len
+        {
+            println!(
+                "[pci-manager] write authority rejected: {} capability(ies) for {} window(s)",
+                authority.rw_ecam_count, authority.windows_len
+            );
+            return;
+        }
+        let mut next_va = CONFIG_WINDOW_VA_BASE;
+        let mut mapped = 0usize;
+        for index in 0..authority.windows_len {
+            let Some(window) = authority.windows[index].as_mut() else {
+                return;
+            };
+            let Some(handle) = authority.rw_ecam[index].take() else {
+                println!(
+                    "[pci-manager] write authority rejected: missing RW handle {}",
+                    index
+                );
+                return;
+            };
+            let window_va = next_va;
+            if let Err(error) = libcanvas::resource::map_self(
+                &handle,
+                0,
+                window_va,
+                window.span_bytes,
+                vmar_flags::READ | vmar_flags::WRITE | vmar_flags::USER | vmar_flags::SPECIFIC,
+            ) {
+                drop(handle);
+                println!(
+                    "[pci-manager] write-capable config authority map rejected: {}",
+                    error.as_str()
+                );
+                return;
+            }
+            window.va_base = window_va;
+            window.resource = Some(handle);
+            next_va = next_va.saturating_add(window.span_bytes);
+            mapped += 1;
+        }
+        authority.writable = true;
+        authority.write_upgrading = false;
+        if verify_b4_write_policy(authority, mapped) {
+            let _ = send(
+                bootstrap,
+                Message::write_authority_ready(manager_generation, mapped as u32),
+            );
+        } else {
+            authority.writable = false;
+        }
+    }
+}
+
+struct ReadWriteTransport<'a> {
+    windows: &'a [Option<WindowMapping>],
+    windows_len: usize,
+    writable: bool,
+    #[cfg(feature = "force-legacy")]
+    legacy_ioport: Option<&'a IoPort>,
+}
+
+impl<'a> ConfigReadWriteTransport for ReadWriteTransport<'a> {
+    fn read_width(&mut self, address: PciAddress, offset: u16, width: ConfigWidth) -> Option<u32> {
+        read_raw_width(
+            self.windows,
+            self.windows_len,
+            #[cfg(feature = "force-legacy")]
+            self.legacy_ioport,
+            address.segment(),
+            address.bus(),
+            address.device(),
+            address.function(),
+            offset,
+            width,
+        )
+    }
+
+    fn write_width(
+        &mut self,
+        address: PciAddress,
+        offset: u16,
+        width: ConfigWidth,
+        value: u32,
+    ) -> bool {
+        if !self.writable {
+            return false;
+        }
+        write_raw_width(
+            self.windows,
+            self.windows_len,
+            #[cfg(feature = "force-legacy")]
+            self.legacy_ioport,
+            address.segment(),
+            address.bus(),
+            address.device(),
+            address.function(),
+            offset,
+            width,
+            value,
+        )
+    }
+}
+
+fn verify_b4_write_policy(authority: &ConfigAuthority, window_count: usize) -> bool {
+    let max_config_bytes = if cfg!(feature = "force-legacy") {
+        CONVENTIONAL_CONFIG_BYTES
+    } else {
+        ENHANCED_CONFIG_BYTES
+    };
+    let mut transport = ReadWriteTransport {
+        windows: &authority.windows,
+        windows_len: authority.windows_len,
+        writable: authority.writable,
+        #[cfg(feature = "force-legacy")]
+        legacy_ioport: authority.legacy_ioport.as_ref(),
+    };
+
+    // 1. Negative B.4 gates: Forbidden, ReadOnlyIdentity, MissingReadbackMask.
+    let forbidden = WriteRequest {
+        address: PciAddress::ZERO,
+        header_kind: HeaderKind::Type0Endpoint,
+        class: WriteClass::Forbidden,
+        offset: OFFSET_COMMAND,
+        width: ConfigWidth::Word,
+        max_config_bytes,
+        value: 0,
+        write_mask: 0x0001,
+        expected_readback_mask: 0x0001,
+        allowlist_entry: None,
+    };
+    if write_policy::execute_checked_write(&mut transport, &forbidden)
+        != Err(WritePolicyError::ForbiddenClass)
+    {
+        println!("[pci-manager] b4-policy negative check failed: Forbidden");
+        return false;
+    }
+
+    let read_only = WriteRequest {
+        class: WriteClass::ReadOnlyIdentity,
+        offset: 0x00,
+        ..forbidden
+    };
+    if write_policy::execute_checked_write(&mut transport, &read_only)
+        != Err(WritePolicyError::ReadOnlyClass)
+    {
+        println!("[pci-manager] b4-policy negative check failed: ReadOnlyIdentity");
+        return false;
+    }
+
+    let missing_mask = WriteRequest {
+        class: WriteClass::CommandControl,
+        expected_readback_mask: 0,
+        ..forbidden
+    };
+    if write_policy::execute_checked_write(&mut transport, &missing_mask)
+        != Err(WritePolicyError::MissingReadbackMask)
+    {
+        println!("[pci-manager] b4-policy negative check failed: MissingReadbackMask");
+        return false;
+    }
+
+    // 2. Idempotent CommandControl write + readback check on 00:00.0 (preserves existing bits).
+    let Some(current_cmd) =
+        transport.read_width(PciAddress::ZERO, OFFSET_COMMAND, ConfigWidth::Word)
+    else {
+        println!("[pci-manager] b4-policy command read failed");
+        return false;
+    };
+    let idempotent = WriteRequest {
+        address: PciAddress::ZERO,
+        header_kind: HeaderKind::Type0Endpoint,
+        class: WriteClass::CommandControl,
+        offset: OFFSET_COMMAND,
+        width: ConfigWidth::Word,
+        max_config_bytes,
+        value: current_cmd & COMMAND_WRITABLE_MASK,
+        write_mask: COMMAND_WRITABLE_MASK,
+        expected_readback_mask: COMMAND_WRITABLE_MASK,
+        allowlist_entry: None,
+    };
+    match write_policy::execute_checked_write(&mut transport, &idempotent) {
+        Ok(record) => {
+            println!(
+                "[pci-manager] obs b4-write class={} bdf=00:00.0 offset=0x{:02x} width={} before=0x{:04x} written=0x{:04x} readback=0x{:04x} mask=0x{:04x} status=ok",
+                record.class.as_str(),
+                record.offset,
+                record.width.bytes(),
+                record.before_value,
+                record.written_value,
+                record.readback_value,
+                record.expected_readback_mask
+            );
+            println!(
+                "[pci-manager] write-capable config authority ready: {} window(s), b4-policy=verified",
+                window_count
+            );
+            true
+        }
+        Err(error) => {
+            println!(
+                "[pci-manager] b4-policy idempotent write failed: {}",
+                error.as_str()
+            );
+            false
+        }
     }
 }
 
@@ -877,7 +1202,7 @@ const SPAN_PER_BUS: u64 = 1024 * 1024;
 
 /// Drain a bounded number of queued mediation requests.
 fn serve_mediation(authority: &mut ConfigAuthority, manager_generation: u64) {
-    if authority.mediation.is_none() {
+    if authority.mediation.is_none() || authority.write_upgrading {
         return;
     }
     for _ in 0..MEDIATION_DRAIN_BUDGET {
@@ -1179,4 +1504,175 @@ fn perform_read(authority: &ConfigAuthority, request: &ValidRequest) -> Result<u
         _ => u64::from(libcanvas::channel::mmio_load::<u32>(address)),
     };
     Ok(value)
+}
+
+#[cfg(feature = "force-legacy")]
+#[allow(clippy::too_many_arguments)]
+fn read_raw_width(
+    windows: &[Option<WindowMapping>],
+    windows_len: usize,
+    legacy_ioport: Option<&IoPort>,
+    segment: u16,
+    bus: u8,
+    device: u8,
+    function: u8,
+    offset: u16,
+    width: ConfigWidth,
+) -> Option<u32> {
+    let legacy = legacy_ioport?;
+    let covered = windows[..windows_len].iter().flatten().any(|window| {
+        window.segment == segment && bus >= window.bus_start && bus <= window.bus_end
+    });
+    let width_bytes = width.bytes();
+    if !covered
+        || device >= 32
+        || function >= 8
+        || (offset & (width_bytes - 1)) != 0
+        || u32::from(offset) + u32::from(width_bytes) > 256
+    {
+        return None;
+    }
+    let address = 0x8000_0000u32
+        | (u32::from(bus) << 16)
+        | (u32::from(device) << 11)
+        | (u32::from(function) << 8)
+        | (u32::from(offset) & 0xFC);
+    legacy.write_u32(0x0CF8, address).ok()?;
+    let port = 0x0CFC + (offset & 0x3);
+    match width {
+        ConfigWidth::Byte => legacy.read_u8(port).ok().map(u32::from),
+        ConfigWidth::Word => legacy.read_u16(port).ok().map(u32::from),
+        ConfigWidth::Dword => legacy.read_u32(port).ok(),
+    }
+}
+
+#[cfg(not(feature = "force-legacy"))]
+#[allow(clippy::too_many_arguments)]
+fn read_raw_width(
+    windows: &[Option<WindowMapping>],
+    windows_len: usize,
+    segment: u16,
+    bus: u8,
+    device: u8,
+    function: u8,
+    offset: u16,
+    width: ConfigWidth,
+) -> Option<u32> {
+    let width_bytes = width.bytes();
+    if device >= 32
+        || function >= 8
+        || (offset & (width_bytes - 1)) != 0
+        || u32::from(offset) + u32::from(width_bytes) > 4096
+    {
+        return None;
+    }
+    let window = windows[..windows_len].iter().flatten().find(|window| {
+        window.segment == segment && bus >= window.bus_start && bus <= window.bus_end
+    })?;
+    if window.va_base == 0 {
+        return None;
+    }
+    let function_offset = (bus - window.bus_start) as u64 * SPAN_PER_BUS
+        + (u64::from(device) << 15)
+        + (u64::from(function) << 12)
+        + u64::from(offset);
+    if function_offset + u64::from(width_bytes) > window.span_bytes {
+        return None;
+    }
+    let address = window.va_base + function_offset;
+    Some(match width {
+        ConfigWidth::Byte => u32::from(libcanvas::channel::mmio_load::<u8>(address)),
+        ConfigWidth::Word => u32::from(libcanvas::channel::mmio_load::<u16>(address)),
+        ConfigWidth::Dword => libcanvas::channel::mmio_load::<u32>(address),
+    })
+}
+
+#[cfg(feature = "force-legacy")]
+#[allow(clippy::too_many_arguments)]
+fn write_raw_width(
+    windows: &[Option<WindowMapping>],
+    windows_len: usize,
+    legacy_ioport: Option<&IoPort>,
+    segment: u16,
+    bus: u8,
+    device: u8,
+    function: u8,
+    offset: u16,
+    width: ConfigWidth,
+    value: u32,
+) -> bool {
+    let Some(legacy) = legacy_ioport else {
+        return false;
+    };
+    let covered = windows[..windows_len].iter().flatten().any(|window| {
+        window.segment == segment && bus >= window.bus_start && bus <= window.bus_end
+    });
+    let width_bytes = width.bytes();
+    if !covered
+        || device >= 32
+        || function >= 8
+        || (offset & (width_bytes - 1)) != 0
+        || u32::from(offset) + u32::from(width_bytes) > 256
+    {
+        return false;
+    }
+    let address = 0x8000_0000u32
+        | (u32::from(bus) << 16)
+        | (u32::from(device) << 11)
+        | (u32::from(function) << 8)
+        | (u32::from(offset) & 0xFC);
+    if legacy.write_u32(0x0CF8, address).is_err() {
+        return false;
+    }
+    let port = 0x0CFC + (offset & 0x3);
+    match width {
+        ConfigWidth::Byte => legacy.write_u8(port, value as u8).is_ok(),
+        ConfigWidth::Word => legacy.write_u16(port, value as u16).is_ok(),
+        ConfigWidth::Dword => legacy.write_u32(port, value).is_ok(),
+    }
+}
+
+#[cfg(not(feature = "force-legacy"))]
+#[allow(clippy::too_many_arguments)]
+fn write_raw_width(
+    windows: &[Option<WindowMapping>],
+    windows_len: usize,
+    segment: u16,
+    bus: u8,
+    device: u8,
+    function: u8,
+    offset: u16,
+    width: ConfigWidth,
+    value: u32,
+) -> bool {
+    let width_bytes = width.bytes();
+    if device >= 32
+        || function >= 8
+        || (offset & (width_bytes - 1)) != 0
+        || u32::from(offset) + u32::from(width_bytes) > 4096
+    {
+        return false;
+    }
+    let Some(window) = windows[..windows_len].iter().flatten().find(|window| {
+        window.segment == segment && bus >= window.bus_start && bus <= window.bus_end
+    }) else {
+        return false;
+    };
+    if window.va_base == 0 {
+        return false;
+    }
+    let function_offset = (bus - window.bus_start) as u64 * SPAN_PER_BUS
+        + (u64::from(device) << 15)
+        + (u64::from(function) << 12)
+        + u64::from(offset);
+    if function_offset + u64::from(width_bytes) > window.span_bytes {
+        return false;
+    }
+    let address = window.va_base + function_offset;
+    match width {
+        ConfigWidth::Byte => libcanvas::channel::mmio_store::<u8>(address, value as u8),
+        ConfigWidth::Word => libcanvas::channel::mmio_store::<u16>(address, value as u16),
+        ConfigWidth::Dword => libcanvas::channel::mmio_store::<u32>(address, value),
+    }
+    true
 }

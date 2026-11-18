@@ -462,10 +462,12 @@ pub fn unmap_resource_from_current(
     validate_resource_unmap_args(resource, args)?;
     let process = huesos_object::current_process().ok_or(ErrorCode::AccessDenied)?;
     let _memory_guard = process.user_memory_lock.lock();
-    // Hold the VMAR mutation lock across the IPI handshake: the
-    // shootdown's global mailbox is only safe with one request in flight
-    // system-wide.
-    let _mutation_guard = VMAR_MUTATION_LOCK.lock();
+    // Do not hold VMAR_MUTATION_LOCK (LockRank::PROCESS) across
+    // `unmap_user_page` or `note_kernel_ref_close`, which acquire
+    // LockRank::ARCHITECTURE (`HHDM_OFFSET`) and LockRank::REGISTRY
+    // (`REGISTRY`). Serialize page-table mutation with the per-process
+    // address-space lock, drop it, release the kernel ref, and then hold
+    // VMAR_MUTATION_LOCK only across the cross-CPU shootdown mailbox.
 
     let mut runtime_guard = process.address_space.lock();
     let runtime = runtime_guard
@@ -510,13 +512,18 @@ pub fn unmap_resource_from_current(
         remap_resource_pages(address_space, args.addr, phys_base, page_flags, page_count)?;
         return Err(ErrorCode::Internal);
     }
+    drop(runtime_guard);
+    drop(_memory_guard);
+
     // Release the kernel reference the map transaction took: the
     // mapping is what kept the resource alive beyond its last user
     // handle.
     huesos_object::note_kernel_ref_close(resource.koid());
     // The map path guaranteed the PTEs were absent (no shootdown needed);
     // unmap does not — other CPUs may still hold the translations this
-    // call just invalidated.
+    // call just invalidated. Hold VMAR_MUTATION_LOCK across the global
+    // shootdown mailbox.
+    let _mutation_guard = VMAR_MUTATION_LOCK.lock();
     huesos_arch::paging::shootdown_range(
         args.addr,
         args.addr + args.len,

@@ -22,6 +22,10 @@ pub const HMCF_VMO_LABEL: &[u8] = b"pci-hmcf-vmo";
 /// in canonical record order; the receiver matches the `i`-th
 /// `CONFIG_ECAM_LABEL` handle to the `i`-th HMCF record.
 pub const CONFIG_ECAM_LABEL: &[u8] = b"pci-config-ecam";
+/// Label carrying one upgraded read-write ECAM capability (`Mmio`,
+/// `READ | WRITE | TRANSFER` rights) after validated `HPCI` roots and
+/// B.4 write-policy enforcement (AP-17).
+pub const CONFIG_ECAM_RW_LABEL: &[u8] = b"pci-config-ecam-rw";
 /// Label carrying the legacy CF8/CFC `IoPort` capability (`READ | WRITE |
 /// TRANSFER`) minted for PCI segment 0. Sent only when the supervisor
 /// requests the legacy backend with [`HELLO_FLAG_FORCE_LEGACY`]; never
@@ -64,6 +68,17 @@ pub enum Opcode {
     /// PCI Manager published one immutable read-only diagnostic inventory
     /// snapshot (`detail` carries discovered function count).
     InventoryPublished = 8,
+    /// DriverManager instructs PCI Manager to unmap and release its read-only
+    /// ECAM windows before minting write-capable ECAM capabilities (AP-17).
+    PrepareWriteUpgrade = 9,
+    /// PCI Manager unmapped and released its read-only ECAM windows (AP-17).
+    WriteUpgradePrepared = 10,
+    /// DriverManager ends the write-capable ECAM capability burst (`detail`
+    /// carries window count) (AP-17).
+    WriteAuthorityComplete = 11,
+    /// PCI Manager mapped write-capable config authority and verified B.4
+    /// write policy (`detail` carries window count) (AP-17).
+    WriteAuthorityReady = 12,
 }
 
 impl Opcode {
@@ -77,6 +92,10 @@ impl Opcode {
             6 => Some(Self::AuthorityComplete),
             7 => Some(Self::AcpiGenerationFrozen),
             8 => Some(Self::InventoryPublished),
+            9 => Some(Self::PrepareWriteUpgrade),
+            10 => Some(Self::WriteUpgradePrepared),
+            11 => Some(Self::WriteAuthorityComplete),
+            12 => Some(Self::WriteAuthorityReady),
             _ => None,
         }
     }
@@ -105,6 +124,9 @@ pub enum Status {
     /// Diagnostic inventory was built without complete validated ACPI
     /// roots/apertures (`FirmwareResourcesUnavailable`).
     FirmwareResourcesUnavailable = 3,
+    /// Manager upgraded to write-capable configuration authority under
+    /// `huesos-pci::write_policy` enforcement (AP-17).
+    WriteAuthorityReady = 4,
 }
 
 impl Status {
@@ -116,6 +138,7 @@ impl Status {
             -2 => Some(Self::InvalidRootTable),
             2 => Some(Self::ConfigAuthorityReady),
             3 => Some(Self::FirmwareResourcesUnavailable),
+            4 => Some(Self::WriteAuthorityReady),
             _ => None,
         }
     }
@@ -213,6 +236,49 @@ impl Message {
                 Status::FirmwareResourcesUnavailable
             },
             detail: function_count,
+        }
+    }
+
+    /// Ask PCI Manager to unmap and drop its read-only ECAM windows before
+    /// minting write-capable ECAM capabilities (AP-17).
+    pub const fn prepare_write_upgrade(manager_generation: u64, window_count: u32) -> Self {
+        Self {
+            opcode: Opcode::PrepareWriteUpgrade,
+            manager_generation,
+            status: Status::Ok,
+            detail: window_count,
+        }
+    }
+
+    /// Acknowledge that read-only ECAM windows have been unmapped and dropped.
+    pub const fn write_upgrade_prepared(manager_generation: u64, window_count: u32) -> Self {
+        Self {
+            opcode: Opcode::WriteUpgradePrepared,
+            manager_generation,
+            status: Status::Ok,
+            detail: window_count,
+        }
+    }
+
+    /// End-of-write-upgrade-burst sentinel (`window_count` RW ECAM capabilities,
+    /// or `1` for already-RW legacy CF8/CFC).
+    pub const fn write_authority_complete(manager_generation: u64, window_count: u32) -> Self {
+        Self {
+            opcode: Opcode::WriteAuthorityComplete,
+            manager_generation,
+            status: Status::Ok,
+            detail: window_count,
+        }
+    }
+
+    /// Report that write-capable configuration authority is active under B.4
+    /// write policy (`window_count` windows).
+    pub const fn write_authority_ready(manager_generation: u64, window_count: u32) -> Self {
+        Self {
+            opcode: Opcode::WriteAuthorityReady,
+            manager_generation,
+            status: Status::WriteAuthorityReady,
+            detail: window_count,
         }
     }
 }
@@ -467,6 +533,10 @@ mod tests {
             Message::acpi_generation_frozen(4, true),
             Message::inventory_published(4, 12, true),
             Message::inventory_published(4, 3, false),
+            Message::prepare_write_upgrade(4, 1),
+            Message::write_upgrade_prepared(4, 1),
+            Message::write_authority_complete(4, 1),
+            Message::write_authority_ready(4, 1),
         ] {
             let mut bytes = [0u8; MESSAGE_BYTES];
             assert_eq!(encode(msg, &mut bytes), Some(MESSAGE_BYTES));
