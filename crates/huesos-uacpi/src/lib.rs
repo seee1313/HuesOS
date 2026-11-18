@@ -251,6 +251,19 @@ pub struct FacsSnapshot {
     pub bytes: &'static [u8],
 }
 
+/// Immutable root SDT (`XSDT` or `RSDT`) bytes referenced by the boot RSDP.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RxsdtSnapshot {
+    /// Original firmware physical address.
+    pub physical_address: u64,
+    /// Four-byte root SDT signature (`XSDT` or `RSDT`).
+    pub signature: [u8; 4],
+    /// SDT revision byte.
+    pub revision: u8,
+    /// Complete checksum-validated SDT bytes.
+    pub bytes: &'static [u8],
+}
+
 /// Validate and snapshot the boot RSDP through the retained kernel HHDM.
 pub fn rsdp_snapshot(physical_address: u64) -> Result<RsdpSnapshot, Error> {
     if physical_address == 0 {
@@ -273,6 +286,48 @@ pub fn rsdp_snapshot(physical_address: u64) -> Result<RsdpSnapshot, Error> {
     Ok(RsdpSnapshot {
         physical_address,
         revision,
+        bytes,
+    })
+}
+
+/// Validate and snapshot the RSDP-selected root SDT (`XSDT` or `RSDT`)
+/// through the retained kernel HHDM.
+pub fn rxsdt_snapshot(rsdp: &RsdpSnapshot) -> Result<RxsdtSnapshot, Error> {
+    let xsdt_address = if rsdp.revision > 1 {
+        read_u64(rsdp.bytes, 24).unwrap_or(0)
+    } else {
+        0
+    };
+    let rsdt_address = read_u32(rsdp.bytes, 16).unwrap_or(0) as u64;
+    let (physical_address, expected_sig) = if xsdt_address != 0 {
+        (xsdt_address, *b"XSDT")
+    } else if rsdt_address != 0 {
+        (rsdt_address, *b"RSDT")
+    } else {
+        return Err(Error::InvalidRsdp);
+    };
+
+    let header = physical_bytes(physical_address, 36).map_err(|_| Error::InvalidTableLength)?;
+    if header[..4] != expected_sig {
+        return Err(Error::InvalidTableMetadata);
+    }
+    let length = read_u32(header, 4).ok_or(Error::InvalidTableLength)? as usize;
+    if !(36..=MAX_TABLE_BYTES).contains(&length)
+        || physical_address.checked_add(length as u64).is_none()
+    {
+        return Err(Error::InvalidTableLength);
+    }
+    let bytes = physical_bytes(physical_address, length).map_err(|_| Error::InvalidTableLength)?;
+    if bytes[..4] != expected_sig
+        || read_u32(bytes, 4) != Some(length as u32)
+        || checksum(bytes) != 0
+    {
+        return Err(Error::InvalidTableMetadata);
+    }
+    Ok(RxsdtSnapshot {
+        physical_address,
+        signature: expected_sig,
+        revision: bytes[8],
         bytes,
     })
 }

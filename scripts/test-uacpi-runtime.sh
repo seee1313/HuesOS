@@ -54,6 +54,25 @@ UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1" \
 
 echo "uACPI full-runtime fail-closed ASan/UBSan smoke passed"
 
+"$CC_BIN" \
+    -std=c11 -O1 -g -Wall -Wextra -Werror \
+    -fno-omit-frame-pointer -fsanitize=address,undefined \
+    -DUACPI_USE_BUILTIN_STRING \
+    -DUACPI_NATIVE_ALLOC_ZEROED \
+    -DUACPI_SIZED_FREES \
+    -DUACPI_DEFAULT_LOG_LEVEL=UACPI_LOG_INFO \
+    -I"$VENDOR/include" \
+    "${args[@]}" \
+    "$RUNTIME/src/uacpi_shim.c" \
+    "$RUNTIME/tests/namespace_corpus_smoke.c" \
+    -o "$TMP/uacpi-namespace-corpus-smoke"
+
+ASAN_OPTIONS="detect_leaks=1:halt_on_error=1" \
+UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1" \
+    "$TMP/uacpi-namespace-corpus-smoke"
+
+echo "uACPI AML namespace corpus ASan/UBSan smoke passed"
+
 # AP-10: the Rust PCI_CONFIG callback family replaces the C stubs in the
 # userspace target. Assert each symbol is defined exactly once in the
 # compiled Rust rlib so a signature drift cannot hide behind an

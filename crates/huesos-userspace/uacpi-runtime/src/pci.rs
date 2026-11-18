@@ -60,6 +60,77 @@ pub fn install_pci_mediation(
     true
 }
 
+/// Install the mediation endpoint or refresh it when `pci_generation`
+/// advances across a `pci-manager` restart.
+pub fn install_or_refresh_pci_mediation(
+    channel: Channel,
+    acpi_generation: u64,
+    pci_generation: u64,
+    firmware_snapshot_id: u64,
+) -> bool {
+    if acpi_generation == 0 || pci_generation == 0 || firmware_snapshot_id == 0 {
+        return false;
+    }
+    let mut mediation = MEDIATION.lock();
+    if let Some(current) = mediation.as_ref() {
+        if current
+            .pci_generation()
+            .is_some_and(|existing| pci_generation <= existing)
+        {
+            return false;
+        }
+    }
+    let mut requester = MediationRequester::new(channel, acpi_generation, firmware_snapshot_id);
+    requester.set_pci_generation(pci_generation);
+    *mediation = Some(requester);
+    true
+}
+
+/// Run one bounded self-test probe through the installed mediation channel
+/// (read host-bridge ID + verify configuration write denial) without tripping
+/// runtime AML PCI-write degradation flags.
+pub fn run_mediation_self_test() {
+    let mediation = MEDIATION.lock();
+    let Some(requester) = mediation.as_ref() else {
+        return;
+    };
+    match requester.read(0, 0, 0, 0, 0x00, 4) {
+        Ok(value) => {
+            #[cfg(not(test))]
+            libcanvas::println!(
+                "[acpi-manager] pci-mediation self-test: read=ok vendor-nonzero={}",
+                (value & 0xffff) != 0 && (value & 0xffff) != 0xffff
+            );
+            #[cfg(test)]
+            let _ = value;
+        }
+        Err(error) => {
+            #[cfg(not(test))]
+            libcanvas::println!(
+                "[acpi-manager] pci-mediation self-test: read={}",
+                error.as_str()
+            );
+            #[cfg(test)]
+            let _ = error;
+        }
+    }
+    match requester.write_denied(0, 0, 0, 0, 0x00, 4) {
+        Ok(()) => {
+            #[cfg(not(test))]
+            libcanvas::println!("[acpi-manager] pci-mediation self-test: write=denied");
+        }
+        Err(error) => {
+            #[cfg(not(test))]
+            libcanvas::println!(
+                "[acpi-manager] pci-mediation self-test: write={}",
+                error.as_str()
+            );
+            #[cfg(test)]
+            let _ = error;
+        }
+    }
+}
+
 /// Whether the mediation endpoint was installed in this process.
 pub fn pci_mediation_installed() -> bool {
     MEDIATION.lock().is_some()
@@ -220,7 +291,15 @@ pci_read_handler!(
 
 /// uACPI host callback: configuration writes are never executed.
 #[unsafe(no_mangle)]
-pub extern "C" fn uacpi_kernel_pci_write8(_handle: *mut c_void, _offset: usize, _value: u8) -> i32 {
+pub extern "C" fn uacpi_kernel_pci_write8(_handle: *mut c_void, offset: usize, _value: u8) -> i32 {
+    #[cfg(not(test))]
+    libcanvas::println!(
+        "[uacpi-rt] denied PCI config write width=1 offset=0x{:x}",
+        offset
+    );
+    #[cfg(test)]
+    let _ = offset;
+    crate::broker::note_denied_pci_write();
     UACPI_STATUS_DENIED
 }
 
@@ -228,9 +307,17 @@ pub extern "C" fn uacpi_kernel_pci_write8(_handle: *mut c_void, _offset: usize, 
 #[unsafe(no_mangle)]
 pub extern "C" fn uacpi_kernel_pci_write16(
     _handle: *mut c_void,
-    _offset: usize,
+    offset: usize,
     _value: u16,
 ) -> i32 {
+    #[cfg(not(test))]
+    libcanvas::println!(
+        "[uacpi-rt] denied PCI config write width=2 offset=0x{:x}",
+        offset
+    );
+    #[cfg(test)]
+    let _ = offset;
+    crate::broker::note_denied_pci_write();
     UACPI_STATUS_DENIED
 }
 
@@ -238,8 +325,16 @@ pub extern "C" fn uacpi_kernel_pci_write16(
 #[unsafe(no_mangle)]
 pub extern "C" fn uacpi_kernel_pci_write32(
     _handle: *mut c_void,
-    _offset: usize,
+    offset: usize,
     _value: u32,
 ) -> i32 {
+    #[cfg(not(test))]
+    libcanvas::println!(
+        "[uacpi-rt] denied PCI config write width=4 offset=0x{:x}",
+        offset
+    );
+    #[cfg(test)]
+    let _ = offset;
+    crate::broker::note_denied_pci_write();
     UACPI_STATUS_DENIED
 }

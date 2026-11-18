@@ -367,6 +367,24 @@ fn track_userspace_inputs(userspace_root: &Path) {
     );
     println!(
         "cargo:rerun-if-changed={}",
+        userspace_root.join("uacpi-runtime").join("src").display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        userspace_root
+            .join("uacpi-runtime")
+            .join("build.rs")
+            .display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        userspace_root
+            .join("uacpi-runtime")
+            .join("Cargo.toml")
+            .display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
         userspace_root.join("user_linker.ld").display()
     );
     println!("cargo:rerun-if-changed=../../third_party/freedoom/freedoom1.wad");

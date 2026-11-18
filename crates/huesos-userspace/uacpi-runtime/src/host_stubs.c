@@ -30,11 +30,13 @@ void uacpi_kernel_unmap(void *address, uacpi_size length)
 }
 #endif
 
+#ifndef HUESOS_UACPI_RUST_LOG
 void uacpi_kernel_log(uacpi_log_level level, const uacpi_char *message)
 {
     (void)level;
     (void)message;
 }
+#endif
 
 #ifndef HUESOS_UACPI_RUST_PCI
 /* AP-10: the Rust callbacks in src/pci.rs replace this family in the
@@ -111,6 +113,7 @@ uacpi_status uacpi_kernel_pci_write32(
 }
 #endif /* HUESOS_UACPI_RUST_PCI */
 
+#ifndef HUESOS_UACPI_RUST_IO
 uacpi_status uacpi_kernel_io_map(
     uacpi_io_addr base, uacpi_size length, uacpi_handle *out_handle)
 {
@@ -182,6 +185,7 @@ uacpi_status uacpi_kernel_io_write32(
     (void)value;
     return UACPI_STATUS_DENIED;
 }
+#endif /* HUESOS_UACPI_RUST_IO */
 
 #ifndef HUESOS_UACPI_RUST_PRIMITIVES
 void *uacpi_kernel_alloc(uacpi_size size)
@@ -275,7 +279,9 @@ void uacpi_kernel_reset_event(uacpi_handle handle)
 {
     (void)handle;
 }
+#endif
 
+#ifndef HUESOS_UACPI_RUST_WORK
 uacpi_status uacpi_kernel_handle_firmware_request(
     uacpi_firmware_request *request)
 {
@@ -302,7 +308,9 @@ uacpi_status uacpi_kernel_uninstall_interrupt_handler(
     (void)irq_handle;
     return UACPI_STATUS_DENIED;
 }
+#endif
 
+#ifndef HUESOS_UACPI_RUST_PRIMITIVES
 uacpi_handle uacpi_kernel_create_spinlock(void)
 {
     return UACPI_NULL;
@@ -327,6 +335,7 @@ void uacpi_kernel_unlock_spinlock(
 }
 #endif
 
+#ifndef HUESOS_UACPI_RUST_WORK
 uacpi_status uacpi_kernel_schedule_work(
     uacpi_work_type type, uacpi_work_handler handler, uacpi_handle context)
 {
@@ -340,3 +349,4 @@ uacpi_status uacpi_kernel_wait_for_work_completion(void)
 {
     return UACPI_STATUS_DENIED;
 }
+#endif

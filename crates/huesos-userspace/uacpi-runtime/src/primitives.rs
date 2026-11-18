@@ -5,6 +5,7 @@
 //! and bounded fixed-capacity synchronization registries.
 
 use alloc::alloc::{alloc, alloc_zeroed, dealloc};
+use alloc::vec::Vec;
 use core::alloc::Layout;
 use core::ffi::c_void;
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -14,7 +15,7 @@ const UACPI_STATUS_OK: i32 = 0;
 const UACPI_STATUS_TIMEOUT: i32 = 18;
 const UACPI_STATUS_DENIED: i32 = 20;
 const ALLOCATION_ALIGNMENT: usize = 16;
-const SYNC_SLOT_COUNT: usize = 64;
+const SYNC_SLOT_COUNT: usize = 4096;
 const TICK_NANOSECONDS: u64 = 10_000_000;
 const TICK_MILLISECONDS: u64 = 10;
 const THREAD_ID: usize = 1;
@@ -63,12 +64,9 @@ impl SpinSlot {
     };
 }
 
-static MUTEXES: Mutex<[MutexSlot; SYNC_SLOT_COUNT]> =
-    Mutex::new([MutexSlot::EMPTY; SYNC_SLOT_COUNT]);
-static EVENTS: Mutex<[EventSlot; SYNC_SLOT_COUNT]> =
-    Mutex::new([EventSlot::EMPTY; SYNC_SLOT_COUNT]);
-static SPINLOCKS: Mutex<[SpinSlot; SYNC_SLOT_COUNT]> =
-    Mutex::new([SpinSlot::EMPTY; SYNC_SLOT_COUNT]);
+static MUTEXES: Mutex<Vec<MutexSlot>> = Mutex::new(Vec::new());
+static EVENTS: Mutex<Vec<EventSlot>> = Mutex::new(Vec::new());
+static SPINLOCKS: Mutex<Vec<SpinSlot>> = Mutex::new(Vec::new());
 
 fn allocation_layout(size: usize) -> Option<Layout> {
     Layout::from_size_align(size.max(1), ALLOCATION_ALIGNMENT).ok()
@@ -96,17 +94,24 @@ pub(crate) fn store_scalar<T>(slot: *mut T, value: T) {
 /// the matching sized-free callback) is identical either way.
 fn alloc_impl(size: usize, zeroed: bool) -> *mut c_void {
     let Some(layout) = allocation_layout(size) else {
+        #[cfg(not(test))]
+        libcanvas::println!("[uacpi-rt] bad alloc layout size={}", size);
         return core::ptr::null_mut();
     };
     // SAFETY: layout is valid and the returned pointer is handed to uACPI,
     // which returns it through the matching sized-free callback. On the
     // zeroed path every byte is additionally initialized.
-    unsafe {
+    let ptr: *mut c_void = unsafe {
         match zeroed {
             true => alloc_zeroed(layout).cast(),
             false => alloc(layout).cast(),
         }
+    };
+    #[cfg(not(test))]
+    if ptr.is_null() {
+        libcanvas::println!("[uacpi-rt] alloc OOM size={} zeroed={}", size, zeroed);
     }
+    ptr
 }
 
 /// Allocate one max-align-compatible uACPI object from the process allocator.
@@ -163,7 +168,7 @@ pub extern "C" fn uacpi_kernel_sleep(milliseconds: u64) {
     }
 }
 
-/// Allocate one non-recursive mutex handle from the fixed registry.
+/// Allocate one non-recursive mutex handle from the bounded registry.
 #[unsafe(no_mangle)]
 pub extern "C" fn uacpi_kernel_create_mutex() -> *mut c_void {
     let mut slots = MUTEXES.lock();
@@ -177,7 +182,16 @@ pub extern "C" fn uacpi_kernel_create_mutex() -> *mut c_void {
             return handle_from_index(index);
         }
     }
-    core::ptr::null_mut()
+    if slots.len() >= SYNC_SLOT_COUNT || slots.try_reserve(1).is_err() {
+        return core::ptr::null_mut();
+    }
+    let index = slots.len();
+    slots.push(MutexSlot {
+        allocated: true,
+        locked: false,
+        owner: 0,
+    });
+    handle_from_index(index)
 }
 
 /// Free one unlocked mutex handle. Invalid handles are ignored fail-closed.
@@ -187,8 +201,10 @@ pub extern "C" fn uacpi_kernel_free_mutex(handle: *mut c_void) {
         return;
     };
     let mut slots = MUTEXES.lock();
-    if slots[index].allocated && !slots[index].locked {
-        slots[index] = MutexSlot::EMPTY;
+    if let Some(slot) = slots.get_mut(index) {
+        if slot.allocated && !slot.locked {
+            *slot = MutexSlot::EMPTY;
+        }
     }
 }
 
@@ -202,7 +218,9 @@ pub extern "C" fn uacpi_kernel_acquire_mutex(handle: *mut c_void, timeout: u16) 
     loop {
         {
             let mut slots = MUTEXES.lock();
-            let slot = &mut slots[index];
+            let Some(slot) = slots.get_mut(index) else {
+                return UACPI_STATUS_DENIED;
+            };
             if !slot.allocated {
                 return UACPI_STATUS_DENIED;
             }
@@ -229,10 +247,11 @@ pub extern "C" fn uacpi_kernel_release_mutex(handle: *mut c_void) {
         return;
     };
     let mut slots = MUTEXES.lock();
-    let slot = &mut slots[index];
-    if slot.allocated && slot.locked && slot.owner == THREAD_ID {
-        slot.locked = false;
-        slot.owner = 0;
+    if let Some(slot) = slots.get_mut(index) {
+        if slot.allocated && slot.locked && slot.owner == THREAD_ID {
+            slot.locked = false;
+            slot.owner = 0;
+        }
     }
 }
 
@@ -249,7 +268,15 @@ pub extern "C" fn uacpi_kernel_create_event() -> *mut c_void {
             return handle_from_index(index);
         }
     }
-    core::ptr::null_mut()
+    if slots.len() >= SYNC_SLOT_COUNT || slots.try_reserve(1).is_err() {
+        return core::ptr::null_mut();
+    }
+    let index = slots.len();
+    slots.push(EventSlot {
+        allocated: true,
+        count: 0,
+    });
+    handle_from_index(index)
 }
 
 /// Free an event handle and discard its pending count.
@@ -259,8 +286,10 @@ pub extern "C" fn uacpi_kernel_free_event(handle: *mut c_void) {
         return;
     };
     let mut slots = EVENTS.lock();
-    if slots[index].allocated {
-        slots[index] = EventSlot::EMPTY;
+    if let Some(slot) = slots.get_mut(index) {
+        if slot.allocated {
+            *slot = EventSlot::EMPTY;
+        }
     }
 }
 
@@ -274,7 +303,9 @@ pub extern "C" fn uacpi_kernel_wait_for_event(handle: *mut c_void, timeout: u16)
     loop {
         {
             let mut slots = EVENTS.lock();
-            let slot = &mut slots[index];
+            let Some(slot) = slots.get_mut(index) else {
+                return false;
+            };
             if !slot.allocated {
                 return false;
             }
@@ -297,9 +328,10 @@ pub extern "C" fn uacpi_kernel_signal_event(handle: *mut c_void) {
         return;
     };
     let mut slots = EVENTS.lock();
-    let slot = &mut slots[index];
-    if slot.allocated {
-        slot.count = slot.count.saturating_add(1);
+    if let Some(slot) = slots.get_mut(index) {
+        if slot.allocated {
+            slot.count = slot.count.saturating_add(1);
+        }
     }
 }
 
@@ -310,8 +342,10 @@ pub extern "C" fn uacpi_kernel_reset_event(handle: *mut c_void) {
         return;
     };
     let mut slots = EVENTS.lock();
-    if slots[index].allocated {
-        slots[index].count = 0;
+    if let Some(slot) = slots.get_mut(index) {
+        if slot.allocated {
+            slot.count = 0;
+        }
     }
 }
 
@@ -346,7 +380,15 @@ pub extern "C" fn uacpi_kernel_create_spinlock() -> *mut c_void {
             return handle_from_index(index);
         }
     }
-    core::ptr::null_mut()
+    if slots.len() >= SYNC_SLOT_COUNT || slots.try_reserve(1).is_err() {
+        return core::ptr::null_mut();
+    }
+    let index = slots.len();
+    slots.push(SpinSlot {
+        allocated: true,
+        locked: false,
+    });
+    handle_from_index(index)
 }
 
 /// Free one unlocked process-local spin/dispatch lock.
@@ -356,8 +398,10 @@ pub extern "C" fn uacpi_kernel_free_spinlock(handle: *mut c_void) {
         return;
     };
     let mut slots = SPINLOCKS.lock();
-    if slots[index].allocated && !slots[index].locked {
-        slots[index] = SpinSlot::EMPTY;
+    if let Some(slot) = slots.get_mut(index) {
+        if slot.allocated && !slot.locked {
+            *slot = SpinSlot::EMPTY;
+        }
     }
 }
 
@@ -371,7 +415,9 @@ pub extern "C" fn uacpi_kernel_lock_spinlock(handle: *mut c_void) -> usize {
     loop {
         {
             let mut slots = SPINLOCKS.lock();
-            let slot = &mut slots[index];
+            let Some(slot) = slots.get_mut(index) else {
+                return previous_dispatch;
+            };
             if !slot.allocated {
                 return previous_dispatch;
             }
@@ -389,8 +435,10 @@ pub extern "C" fn uacpi_kernel_lock_spinlock(handle: *mut c_void) -> usize {
 pub extern "C" fn uacpi_kernel_unlock_spinlock(handle: *mut c_void, flags: usize) {
     if let Some(index) = index_from_handle(handle) {
         let mut slots = SPINLOCKS.lock();
-        if slots[index].allocated {
-            slots[index].locked = false;
+        if let Some(slot) = slots.get_mut(index) {
+            if slot.allocated {
+                slot.locked = false;
+            }
         }
     }
     uacpi_kernel_restore_interrupts(flags);
@@ -449,9 +497,9 @@ mod tests {
     static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn reset() {
-        *MUTEXES.lock() = [MutexSlot::EMPTY; SYNC_SLOT_COUNT];
-        *EVENTS.lock() = [EventSlot::EMPTY; SYNC_SLOT_COUNT];
-        *SPINLOCKS.lock() = [SpinSlot::EMPTY; SYNC_SLOT_COUNT];
+        MUTEXES.lock().clear();
+        EVENTS.lock().clear();
+        SPINLOCKS.lock().clear();
         DISPATCH_DEPTH.store(0, Ordering::Release);
         FALLBACK_TICKS.store(0, Ordering::Release);
     }

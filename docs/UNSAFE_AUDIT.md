@@ -3125,3 +3125,25 @@ copied with the existing extable routine and process memory lock. This removes
 uninitialized-padding reads from typed output while preserving ABI stride.
 No new unsafe implementation, block or function is introduced. The allowlist
 must stay private; any new record requires field-validity and layout review.
+
+## AP-13 real uACPI initialization and AML namespace load in Ring 3
+
+AP-13 wires real `uacpi_initialize(UACPI_FLAG_NO_ACPI_MODE)` + `uacpi_namespace_load()`
+inside isolated Ring-3 `acpi-manager` and adds two audited `unsafe` blocks
+(total `unsafe_blocks` remains within the 383 cap at 381):
+
+- `crates/huesos-userspace/acpi-manager/src/main.rs` (`1` unsafe block):
+  one-time `HEAP.init()` at `_start` before any allocation or additional thread
+  exists (`ScudoHeap` as `#[global_allocator]`, matching `hxfs-service` /
+  `driver-host-nvme`).
+- `crates/huesos-userspace/uacpi-runtime/src/namespace.rs` (`1` unsafe block):
+  FFI call to `hues_uacpi_namespace_phase(phase, loop_timeout_secs, max_stack_depth)`
+  in `uacpi_shim.c` covering both AP-13 namespace load and AP-14 `_PIC(IOAPIC)` /
+  `_REG` / `_STA` / `_INI` initialization after archive, broker, and mediation
+  capabilities are validated and installed.
+
+The new `uacpi-runtime/src/broker.rs` and `uacpi-runtime/src/work.rs` host
+callbacks (SystemIO, `SystemMemory` OpRegion broker mediation, IRQ/work-queue
+dispatch, and bounded value-passed `LogLine` logging) keep `0` `unsafe` blocks
+by funneling scalar writes through `primitives::store_scalar` and unpacking C
+region/log structs in `uacpi_shim.c`.

@@ -33,6 +33,9 @@ fn main() {
         .define("HUESOS_UACPI_RUST_PRIMITIVES", None)
         .define("HUESOS_UACPI_RUST_ARCHIVE", None)
         .define("HUESOS_UACPI_RUST_PCI", None)
+        .define("HUESOS_UACPI_RUST_IO", None)
+        .define("HUESOS_UACPI_RUST_WORK", None)
+        .define("HUESOS_UACPI_RUST_LOG", None)
         .define("UACPI_DEFAULT_LOG_LEVEL", "UACPI_LOG_INFO")
         .flag_if_supported("-ffreestanding")
         .flag_if_supported("-fno-stack-protector")
@@ -48,10 +51,12 @@ fn main() {
         build.file(vendor.join("source").join(source));
     }
     build.file("src/host_stubs.c");
+    build.file("src/uacpi_shim.c");
     build.compile("huesos_uacpi_runtime_fail_closed");
 
     println!("cargo:rerun-if-changed=../../../third_party/uacpi/source");
     println!("cargo:rerun-if-changed=../../../third_party/uacpi/include");
     println!("cargo:rerun-if-changed=../../../third_party/uacpi/UPSTREAM");
     println!("cargo:rerun-if-changed=src/host_stubs.c");
+    println!("cargo:rerun-if-changed=src/uacpi_shim.c");
 }
