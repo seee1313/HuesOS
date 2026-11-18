@@ -132,8 +132,6 @@ pub fn derive_broker_policy(
         snapshot_id,
         read_u32(bytes, 80)? as u64,
         bytes[92] as u64,
-        read_u32(bytes, 60)? as u64,
-        pm1_event_len as u64,
         true,
         true,
     );
