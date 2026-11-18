@@ -64,6 +64,7 @@ pub fn reset_generation(new_generation: u64) {
 
 /// Install an IRQ handler for `gsi` in the current generation.
 /// Rejects duplicates.
+#[allow(clippy::result_unit_err)]
 pub fn install_irq(gsi: u32) -> Result<(), ()> {
     let mut state = WORK_STATE.lock();
     let gen = state.generation;
@@ -89,6 +90,7 @@ pub fn install_irq(gsi: u32) -> Result<(), ()> {
 }
 
 /// Remove an IRQ handler for `gsi` in the current generation.
+#[allow(clippy::result_unit_err)]
 pub fn uninstall_irq(gsi: u32) -> Result<(), ()> {
     let mut state = WORK_STATE.lock();
     let gen = state.generation;
@@ -104,6 +106,7 @@ pub fn uninstall_irq(gsi: u32) -> Result<(), ()> {
 }
 
 /// Enqueue a bounded CPU0-affine work item. Returns `Err(())` on overflow.
+#[allow(clippy::result_unit_err)]
 pub fn schedule_work(kind: WorkKind, id: u64) -> Result<(), ()> {
     let mut state = WORK_STATE.lock();
     if state.len >= MAX_WORK_ITEMS {

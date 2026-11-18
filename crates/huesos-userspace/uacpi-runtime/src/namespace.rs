@@ -17,6 +17,7 @@ pub struct NamespaceLoadStatus {
 
 /// Load the DSDT/SSDT AML namespace for `snapshot_id` without running
 /// `_STA`, `_INI`, or `_REG` (reserved for AP-14).
+#[allow(clippy::result_unit_err)]
 pub fn load_namespace(snapshot_id: u64) -> Result<NamespaceLoadStatus, ()> {
     if snapshot_id == 0 {
         return Err(());
