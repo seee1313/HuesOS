@@ -112,7 +112,7 @@ pub extern "C" fn _start() -> ! {
     // Never blocks readiness: absence of a valid MCFG is reported and
     // the lifecycle continues fail-closed (no HMCF, no config
     // authority downstream).
-    publish_hmcf(&bootstrap, generation, &archive, &summary);
+    let hmcf_image = publish_hmcf(&bootstrap, generation, &archive, &summary);
 
     let Some(self_vmar) = inputs.self_vmar.take() else {
         send_failure(
@@ -249,6 +249,7 @@ pub extern "C" fn _start() -> ! {
             &mut namespace_initialized,
             generation,
             summary.firmware_snapshot_id,
+            hmcf_image.as_ref().map(|(buf, len)| &buf[..*len]),
         );
         libcanvas::process::yield_now();
     }
@@ -261,7 +262,8 @@ pub extern "C" fn _start() -> ! {
 /// PCI Manager generation. Once both are present, install/refresh the
 /// mediation requester in `uacpi-runtime`, run the bounded self-test, and
 /// (once per `acpi-manager` generation) execute AP-14 namespace
-/// initialization (`_PIC(IOAPIC)`, `_REG`, `_STA`, `_INI`).
+/// initialization (`_PIC(IOAPIC)`, `_REG`, `_STA`, `_INI`) followed by AP-15
+/// `HPCI` root-bridge publication when eligible.
 fn drain_mediation_bootstrap(
     bootstrap: &Channel,
     pending_mediation: &mut Option<Channel>,
@@ -269,6 +271,7 @@ fn drain_mediation_bootstrap(
     namespace_initialized: &mut bool,
     generation: u64,
     firmware_snapshot_id: u64,
+    hmcf_bytes: Option<&[u8]>,
 ) {
     let mut bytes = [0u8; 64];
     for _ in 0..4 {
@@ -297,6 +300,7 @@ fn drain_mediation_bootstrap(
                                         bootstrap,
                                         generation,
                                         firmware_snapshot_id,
+                                        hmcf_bytes,
                                     );
                                 }
                             }
@@ -310,7 +314,12 @@ fn drain_mediation_bootstrap(
     }
 }
 
-fn run_namespace_initialize(bootstrap: &Channel, generation: u64, firmware_snapshot_id: u64) {
+fn run_namespace_initialize(
+    bootstrap: &Channel,
+    generation: u64,
+    firmware_snapshot_id: u64,
+    hmcf_bytes: Option<&[u8]>,
+) {
     match huesos_uacpi_runtime::namespace::initialize_namespace(firmware_snapshot_id) {
         Ok(init) => {
             println!(
@@ -321,10 +330,28 @@ fn run_namespace_initialize(bootstrap: &Channel, generation: u64, firmware_snaps
                 init.detail_flags,
                 init.pic_status
             );
+            let mut detail_flags = init.detail_flags;
+            if init.hpci_eligible {
+                if let Some(hmcf) = hmcf_bytes {
+                    if !publish_hpci(bootstrap, generation, firmware_snapshot_id, hmcf) {
+                        detail_flags |= acpi_manager::INIT_DETAIL_AML_ERROR;
+                    }
+                } else {
+                    println!(
+                        "[acpi-manager] HMCF absent; withholding HPCI publication (snapshot {})",
+                        firmware_snapshot_id
+                    );
+                }
+            } else {
+                println!(
+                    "[acpi-manager] withholding HPCI due to blocking init flags 0x{:x}",
+                    detail_flags
+                );
+            }
             let msg = acpi_manager::Message::namespace_initialized(
                 generation,
-                init.degraded,
-                init.detail_flags,
+                init.degraded || acpi_manager::detail_blocks_hpci(detail_flags),
+                detail_flags,
             );
             if !send_control(bootstrap, msg) {
                 libcanvas::process::exit(-10);
@@ -343,6 +370,58 @@ fn run_namespace_initialize(bootstrap: &Channel, generation: u64, firmware_snaps
             }
         }
     }
+}
+
+fn publish_hpci(
+    bootstrap: &Channel,
+    generation: u64,
+    firmware_snapshot_id: u64,
+    hmcf_bytes: &[u8],
+) -> bool {
+    let mut hpci_buf = [0u8; huesos_abi::pci::MAX_ENCODED_BYTES];
+    let (hpci_len, table) = match huesos_uacpi_runtime::roots::collect_and_encode_hpci(
+        firmware_snapshot_id,
+        hmcf_bytes,
+        &mut hpci_buf,
+    ) {
+        Ok(res) => res,
+        Err(error) => {
+            println!(
+                "[acpi-manager] HPCI root collection failed (withholding HPCI): {:?}",
+                error
+            );
+            return false;
+        }
+    };
+    let Ok(vmo) = Vmo::create(hpci_len as u64) else {
+        println!("[acpi-manager] failed to create HPCI VMO; withholding HPCI");
+        return false;
+    };
+    match vmo.write(0, &hpci_buf[..hpci_len]) {
+        Ok(written) if written == hpci_len => {}
+        _ => {
+            println!("[acpi-manager] failed to populate HPCI VMO; withholding HPCI");
+            return false;
+        }
+    }
+    let rights =
+        huesos_abi::rights::READ | huesos_abi::rights::DUPLICATE | huesos_abi::rights::TRANSFER;
+    let Ok(duplicate) = vmo.duplicate(rights) else {
+        println!("[acpi-manager] failed to seal HPCI VMO rights; withholding HPCI");
+        return false;
+    };
+    drop(vmo);
+    if let Err((error, _handle)) =
+        bootstrap.write_handle(acpi_manager::HPCI_VMO_LABEL, duplicate.into_handle())
+    {
+        println!("[acpi-manager] HPCI transfer failed: {}", error.as_str());
+        return false;
+    }
+    println!(
+        "[acpi-manager] published HPCI: {} root(s), {} aperture(s), snapshot {}, generation {}",
+        table.root_count, table.aperture_count, firmware_snapshot_id, generation
+    );
+    true
 }
 
 /// Parse `pci-config-read-gen:<decimal>` with a non-zero result.
@@ -482,19 +561,24 @@ impl ArchiveReader for VmoArchiveReader<'_> {
 /// under us, an ambiguous or invalid MCFG, an identity mismatch —
 /// means no HMCF is published. Readiness is unaffected; consumers
 /// stay fail-closed until a valid bound snapshot arrives.
-fn publish_hmcf(bootstrap: &Channel, generation: u64, archive: &Vmo, summary: &ArchiveSummary) {
+fn publish_hmcf(
+    bootstrap: &Channel,
+    generation: u64,
+    archive: &Vmo,
+    summary: &ArchiveSummary,
+) -> Option<([u8; hmcf::MAX_BYTES], usize)> {
     let mut header = [0u8; huesos_abi::acpi_archive::HEADER_BYTES];
     if !vmo_read_exact(archive, 0, &mut header) {
         println!("[acpi-manager] failed to re-read archive header; HMCF not published");
-        return;
+        return None;
     }
     let Ok(header_v2) = huesos_abi::acpi_archive::decode_v2_header(&header) else {
         println!("[acpi-manager] archive header rejected on re-read; HMCF not published");
-        return;
+        return None;
     };
     if header_v2.firmware_snapshot_id != summary.firmware_snapshot_id {
         println!("[acpi-manager] archive snapshot changed under us; HMCF not published");
-        return;
+        return None;
     }
 
     // Locate the MCFG table. At most one is accepted; ambiguity is
@@ -509,26 +593,26 @@ fn publish_hmcf(bootstrap: &Channel, generation: u64, archive: &Vmo, summary: &A
                 "[acpi-manager] table directory truncated at entry {}; HMCF not published",
                 index
             );
-            return;
+            return None;
         }
         let Ok(entry) = huesos_abi::acpi_archive::decode_v2_table_entry(&entry_bytes) else {
             println!(
                 "[acpi-manager] table directory entry {} invalid; HMCF not published",
                 index
             );
-            return;
+            return None;
         };
         if entry.signature == *b"MCFG" {
             if mcfg.is_some() {
                 println!("[acpi-manager] multiple MCFG tables in archive; HMCF not published");
-                return;
+                return None;
             }
             mcfg = Some((entry.offset, entry.length));
         }
     }
     let Some((mcfg_offset, mcfg_length)) = mcfg else {
         println!("[acpi-manager] no MCFG table in archive; HMCF not published");
-        return;
+        return None;
     };
     const MCFG_MAX_BYTES: usize = huesos_pci::mcfg::MCFG_HEADER_BYTES
         + huesos_pci::mcfg::MAX_MCFG_ALLOCATIONS * huesos_pci::mcfg::MCFG_ALLOCATION_BYTES;
@@ -538,12 +622,12 @@ fn publish_hmcf(bootstrap: &Channel, generation: u64, archive: &Vmo, summary: &A
             "[acpi-manager] MCFG table length {} out of bounds; HMCF not published",
             length
         );
-        return;
+        return None;
     }
     let mut mcfg_bytes = [0u8; MCFG_MAX_BYTES];
     if !vmo_read_exact(archive, mcfg_offset, &mut mcfg_bytes[..length]) {
         println!("[acpi-manager] MCFG table read failed; HMCF not published");
-        return;
+        return None;
     }
     let (window_count, windows) = match huesos_pci::mcfg::decode_all(&mcfg_bytes[..length]) {
         Ok(decoded) => decoded,
@@ -552,12 +636,12 @@ fn publish_hmcf(bootstrap: &Channel, generation: u64, archive: &Vmo, summary: &A
                 "[acpi-manager] MCFG validation failed: {}; HMCF not published",
                 mcfg_error_name(error)
             );
-            return;
+            return None;
         }
     };
     if window_count == 0 {
         println!("[acpi-manager] MCFG contains no allocations; HMCF not published");
-        return;
+        return None;
     }
 
     const EMPTY: hmcf::HmcfRecord = hmcf::HmcfRecord {
@@ -577,7 +661,7 @@ fn publish_hmcf(bootstrap: &Channel, generation: u64, archive: &Vmo, summary: &A
             region.base(),
         ) else {
             println!("[acpi-manager] ECAM window failed derivation; HMCF not published");
-            return;
+            return None;
         };
         *slot = record;
     }
@@ -590,21 +674,21 @@ fn publish_hmcf(bootstrap: &Channel, generation: u64, archive: &Vmo, summary: &A
         &mut image,
     ) else {
         println!("[acpi-manager] HMCF encoding rejected; HMCF not published");
-        return;
+        return None;
     };
 
     let vmo = match Vmo::create(total as u64) {
         Ok(vmo) => vmo,
         Err(_) => {
             println!("[acpi-manager] failed to create HMCF VMO; HMCF not published");
-            return;
+            return None;
         }
     };
     match vmo.write(0, &image[..total]) {
         Ok(written) if written == total => {}
         _ => {
             println!("[acpi-manager] failed to fill HMCF VMO; HMCF not published");
-            return;
+            return None;
         }
     }
     // Publish read-only from every handle that leaves this process:
@@ -615,19 +699,20 @@ fn publish_hmcf(bootstrap: &Channel, generation: u64, archive: &Vmo, summary: &A
         huesos_abi::rights::READ | huesos_abi::rights::DUPLICATE | huesos_abi::rights::TRANSFER;
     let Ok(duplicate) = vmo.duplicate(rights) else {
         println!("[acpi-manager] failed to seal HMCF VMO rights; HMCF not published");
-        return;
+        return None;
     };
     drop(vmo);
     if let Err((error, _handle)) =
         bootstrap.write_handle(acpi_manager::HMCF_VMO_LABEL, duplicate.into_handle())
     {
         println!("[acpi-manager] HMCF transfer failed: {}", error.as_str());
-        return;
+        return None;
     }
     println!(
         "[acpi-manager] published HMCF: {} window(s), snapshot {}, generation {}",
         count, summary.firmware_snapshot_id, generation
     );
+    Some((image, total))
 }
 
 /// Read exactly `buf.len()` bytes from the archive VMO at `offset`.

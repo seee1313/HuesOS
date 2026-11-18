@@ -20,6 +20,7 @@ mod broker;
 pub mod namespace;
 mod pci;
 mod primitives;
+pub mod roots;
 pub mod work;
 
 pub use archive::{install_archive, ArchiveInstallError, ArchiveMappingInfo};

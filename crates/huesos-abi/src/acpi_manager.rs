@@ -16,6 +16,9 @@ pub const SELF_VMAR_LABEL: &[u8] = b"acpi-self-vmar";
 /// this label. The VMO carries `READ | DUPLICATE | TRANSFER` rights only;
 /// it is immutable from every published handle.
 pub const HMCF_VMO_LABEL: &[u8] = b"acpi-hmcf-vmo";
+/// `acpi-manager` transfers the validated `HPCI` PCI root-bridge table with
+/// this label. The VMO carries `READ | DUPLICATE | TRANSFER` rights only.
+pub const HPCI_VMO_LABEL: &[u8] = b"acpi-hpci-vmo";
 /// Test-only hello detail: generation one exits before readiness.
 pub const HELLO_FLAG_INJECT_PRE_READY_EXIT: u32 = 1 << 0;
 /// Test-only hello detail: the second generation exits right after readiness
@@ -121,6 +124,16 @@ pub const INIT_DETAIL_MASK: u32 = INIT_DETAIL_PIC_FAILED
     | INIT_DETAIL_DENIED_PCI_WRITE
     | INIT_DETAIL_AML_ERROR
     | INIT_DETAIL_WATCHDOG_EXPIRED;
+
+/// Detail flags that permanently block HPCI publication for this manager
+/// generation even when non-root devices also experienced OpRegion denials.
+pub const INIT_HPCI_BLOCKING_MASK: u32 =
+    INIT_DETAIL_PIC_FAILED | INIT_DETAIL_DENIED_PCI_WRITE | INIT_DETAIL_WATCHDOG_EXPIRED;
+
+/// Whether `detail` carries a hard blocker that forbids HPCI root publication.
+pub const fn detail_blocks_hpci(detail: u32) -> bool {
+    (detail & INIT_HPCI_BLOCKING_MASK) != 0
+}
 
 /// One fixed lifecycle message.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

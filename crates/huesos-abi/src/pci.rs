@@ -252,6 +252,110 @@ pub enum Error {
     BufferTooSmall,
 }
 
+/// Cross-table validation error between `HPCI` and `HMCF`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ConsistencyError {
+    /// Standalone `HPCI` structural/range validation failed.
+    RootTable(Error),
+    /// Root table contains zero root bridges.
+    EmptyRoots,
+    /// Two roots share the same `root_id`.
+    DuplicateRootId,
+    /// Two roots in the same segment claim overlapping bus numbers.
+    OverlappingRoots,
+    /// Two apertures overlap in the same address space.
+    OverlappingApertures,
+    /// A root's `(segment, start_bus..=end_bus)` is not covered by `HMCF`.
+    MissingHmcfCoverage,
+    /// A root's `ecam_base` does not match the covering `HMCF` window.
+    EcamMismatch,
+    /// A root MMIO aperture overlaps an `HMCF` ECAM physical window.
+    ApertureOverlapsEcam,
+}
+
+/// Validate `table` canonically (unique IDs, disjoint root bus ranges and
+/// apertures) and verify consistency against a decoded `HMCF` snapshot.
+pub fn validate_roots_and_hmcf(
+    table: &RootBridgeTable,
+    hmcf: &crate::hmcf::HmcfView<'_>,
+) -> Result<(), ConsistencyError> {
+    validate(table).map_err(ConsistencyError::RootTable)?;
+    if table.root_count == 0 {
+        return Err(ConsistencyError::EmptyRoots);
+    }
+
+    let roots = &table.roots[..table.root_count];
+    for (i, a) in roots.iter().enumerate() {
+        for b in &roots[i + 1..] {
+            if a.root_id == b.root_id {
+                return Err(ConsistencyError::DuplicateRootId);
+            }
+            if a.segment == b.segment && a.start_bus <= b.end_bus && b.start_bus <= a.end_bus {
+                return Err(ConsistencyError::OverlappingRoots);
+            }
+        }
+
+        let mut covered = false;
+        for record in hmcf.records() {
+            if record.segment == a.segment
+                && a.start_bus >= record.start_bus
+                && a.end_bus <= record.end_bus
+            {
+                if a.backend == ConfigBackend::Ecam {
+                    let bus_offset = u64::from(a.start_bus - record.start_bus);
+                    let expected_ecam = record
+                        .ecam_base
+                        .checked_add(bus_offset << 20)
+                        .ok_or(ConsistencyError::EcamMismatch)?;
+                    if a.ecam_base != expected_ecam {
+                        return Err(ConsistencyError::EcamMismatch);
+                    }
+                }
+                covered = true;
+                break;
+            }
+        }
+        if !covered {
+            return Err(ConsistencyError::MissingHmcfCoverage);
+        }
+    }
+
+    let apertures = &table.apertures[..table.aperture_count];
+    for (i, a) in apertures.iter().enumerate() {
+        let a_cpu_end = a.cpu_base + a.len;
+        let a_pci_end = a.pci_base + a.len;
+        let a_is_io = a.kind == ApertureKind::Io;
+
+        if !a_is_io {
+            for record in hmcf.records() {
+                let rec_end = record.ecam_base.saturating_add(record.span_bytes);
+                if a.cpu_base < rec_end && record.ecam_base < a_cpu_end {
+                    return Err(ConsistencyError::ApertureOverlapsEcam);
+                }
+            }
+        }
+
+        for b in &apertures[i + 1..] {
+            let b_is_io = b.kind == ApertureKind::Io;
+            if a_is_io != b_is_io {
+                continue;
+            }
+            let b_cpu_end = b.cpu_base + b.len;
+            if a.cpu_base < b_cpu_end && b.cpu_base < a_cpu_end {
+                return Err(ConsistencyError::OverlappingApertures);
+            }
+            if a.root_index == b.root_index {
+                let b_pci_end = b.pci_base + b.len;
+                if a.pci_base < b_pci_end && b.pci_base < a_pci_end {
+                    return Err(ConsistencyError::OverlappingApertures);
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
 /// Encode a canonical version-1 root table.
 pub fn encode(table: &RootBridgeTable, out: &mut [u8]) -> Result<usize, Error> {
     validate(table)?;
@@ -297,8 +401,8 @@ pub fn encode(table: &RootBridgeTable, out: &mut [u8]) -> Result<usize, Error> {
     Ok(total)
 }
 
-/// Decode and validate one exact root-table blob.
-pub fn decode(bytes: &[u8]) -> Result<RootBridgeTable, Error> {
+/// Return the exact declared wire length of a `HPCI` header slice.
+pub fn declared_size(bytes: &[u8]) -> Result<usize, Error> {
     if bytes.len() < HEADER_BYTES {
         return Err(Error::BadLength);
     }
@@ -325,13 +429,21 @@ pub fn decode(bytes: &[u8]) -> Result<RootBridgeTable, Error> {
     let apertures_bytes = aperture_count
         .checked_mul(APERTURE_ENTRY_BYTES)
         .ok_or(Error::BadLength)?;
-    let total = HEADER_BYTES
+    HEADER_BYTES
         .checked_add(roots_bytes)
         .and_then(|value| value.checked_add(apertures_bytes))
-        .ok_or(Error::BadLength)?;
+        .ok_or(Error::BadLength)
+}
+
+/// Decode and validate one exact root-table blob.
+pub fn decode(bytes: &[u8]) -> Result<RootBridgeTable, Error> {
+    let total = declared_size(bytes)?;
     if bytes.len() != total {
         return Err(Error::BadLength);
     }
+    let root_count = read_u16(bytes, 12)? as usize;
+    let aperture_count = read_u16(bytes, 14)? as usize;
+    let roots_bytes = root_count * ROOT_ENTRY_BYTES;
 
     let mut table = RootBridgeTable::empty();
     let aperture_base = HEADER_BYTES + roots_bytes;
@@ -678,5 +790,119 @@ mod tests {
         let mut flags = bytes;
         flags[aperture_base + 4..aperture_base + 8].copy_from_slice(&u32::MAX.to_le_bytes());
         assert_eq!(decode(&flags[..len]), Err(Error::UnknownFlags));
+    }
+
+    fn encode_test_hmcf(
+        records: &[crate::hmcf::HmcfRecord],
+    ) -> ([u8; crate::hmcf::MAX_BYTES], usize) {
+        let mut buf = [0u8; crate::hmcf::MAX_BYTES];
+        let ok = crate::hmcf::encode(1, 1, records, &mut buf).is_ok();
+        assert!(ok);
+        let declared = match crate::hmcf::declared_size(&buf) {
+            Ok(sz) => sz,
+            Err(_) => 0,
+        };
+        assert!(declared > 0);
+        (buf, declared)
+    }
+
+    #[test]
+    fn validate_roots_and_hmcf_checks_coverage_overlaps_and_ecam() {
+        let rec_res = crate::hmcf::HmcfRecord::new(0, 0, 255, 0xb000_0000);
+        assert!(rec_res.is_ok());
+        let Ok(rec) = rec_res else {
+            return;
+        };
+        let (buf, declared) = encode_test_hmcf(&[rec]);
+        let hmcf_res = crate::hmcf::decode(&buf[..declared]);
+        assert!(hmcf_res.is_ok());
+        let Ok(hmcf) = hmcf_res else {
+            return;
+        };
+
+        let mut table = RootBridgeTable::empty();
+        assert!(table.push_root(RootBridge {
+            root_id: 10,
+            segment: 0,
+            start_bus: 0,
+            end_bus: 63,
+            backend: ConfigBackend::Ecam,
+            flags: 0,
+            ecam_base: 0xb000_0000,
+            aperture_start: 0,
+            aperture_count: 1,
+        }));
+        assert!(table.push_root(RootBridge {
+            root_id: 20,
+            segment: 0,
+            start_bus: 64,
+            end_bus: 127,
+            backend: ConfigBackend::Ecam,
+            flags: 0,
+            ecam_base: 0xb000_0000 + (64u64 << 20),
+            aperture_start: 1,
+            aperture_count: 1,
+        }));
+        assert!(table.push_aperture(Aperture {
+            root_index: 0,
+            kind: ApertureKind::Mmio32,
+            flags: 0,
+            pci_base: 0x8000_0000,
+            cpu_base: 0x8000_0000,
+            len: 0x1000_0000,
+        }));
+        assert!(table.push_aperture(Aperture {
+            root_index: 1,
+            kind: ApertureKind::Io,
+            flags: 0,
+            pci_base: 0xc000,
+            cpu_base: 0xc000,
+            len: 0x1000,
+        }));
+        assert_eq!(validate_roots_and_hmcf(&table, &hmcf), Ok(()));
+
+        // Overlapping root bus range fails.
+        let mut overlap = table;
+        overlap.roots[1].start_bus = 63;
+        overlap.roots[1].ecam_base = 0xb000_0000 + (63u64 << 20);
+        assert_eq!(
+            validate_roots_and_hmcf(&overlap, &hmcf),
+            Err(ConsistencyError::OverlappingRoots)
+        );
+
+        // ECAM mismatch fails.
+        let mut mismatch = table;
+        mismatch.roots[1].ecam_base = 0xb000_0000;
+        assert_eq!(
+            validate_roots_and_hmcf(&mismatch, &hmcf),
+            Err(ConsistencyError::EcamMismatch)
+        );
+
+        // Root outside HMCF fails.
+        let mut uncovered = table;
+        uncovered.roots[1].segment = 1;
+        assert_eq!(
+            validate_roots_and_hmcf(&uncovered, &hmcf),
+            Err(ConsistencyError::MissingHmcfCoverage)
+        );
+
+        // Aperture overlapping MCFG/HMCF ECAM window fails.
+        let mut ecam_overlap = table;
+        ecam_overlap.apertures[0].cpu_base = 0xb000_0000;
+        ecam_overlap.apertures[0].pci_base = 0xb000_0000;
+        assert_eq!(
+            validate_roots_and_hmcf(&ecam_overlap, &hmcf),
+            Err(ConsistencyError::ApertureOverlapsEcam)
+        );
+
+        // Crossing/overlapping apertures across roots fail.
+        let mut ap_overlap = table;
+        ap_overlap.apertures[1].kind = ApertureKind::Mmio32;
+        ap_overlap.apertures[1].pci_base = 0x8800_0000;
+        ap_overlap.apertures[1].cpu_base = 0x8800_0000;
+        assert_eq!(
+            validate_roots_and_hmcf(&ap_overlap, &hmcf),
+            Err(ConsistencyError::OverlappingApertures)
+        );
     }
 }

@@ -200,7 +200,30 @@ pub fn entry_count() -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use core::sync::atomic::AtomicBool;
     use huesos_arch::fault::{FaultInfo, FaultKind};
+
+    static TEST_LOCK: AtomicBool = AtomicBool::new(false);
+
+    struct TestGuard;
+
+    impl TestGuard {
+        fn lock() -> Self {
+            while TEST_LOCK
+                .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+                .is_err()
+            {
+                core::hint::spin_loop();
+            }
+            Self
+        }
+    }
+
+    impl Drop for TestGuard {
+        fn drop(&mut self) {
+            TEST_LOCK.store(false, Ordering::Release);
+        }
+    }
 
     fn fault_at(rip: u64, cs_ring: u64) -> FaultInfo {
         FaultInfo {
@@ -224,6 +247,7 @@ mod tests {
 
     #[test]
     fn try_recover_returns_none_when_unpublished_or_out_of_range() {
+        let _guard = TestGuard::lock();
         // Empty snapshot: try_recover returns None uniformly.
         publish_test_snapshot(Vec::new());
         assert_eq!(try_recover(fault_at(0, 0)), None);
@@ -232,6 +256,7 @@ mod tests {
 
     #[test]
     fn try_recover_maps_covered_rip_to_fixup() {
+        let _guard = TestGuard::lock();
         publish_test_snapshot(alloc::vec![
             FixupRange {
                 start_rip: 0x1000,
@@ -254,6 +279,7 @@ mod tests {
 
     #[test]
     fn try_recover_ignores_userspace_faults() {
+        let _guard = TestGuard::lock();
         publish_test_snapshot(alloc::vec![FixupRange {
             start_rip: 0x1000,
             end_rip: 0x1010,
