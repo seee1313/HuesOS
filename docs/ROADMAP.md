@@ -1,762 +1,212 @@
 # HuesOS Roadmap
 
+**Snapshot baseline:** `main` at `ba1f439` (2026-11-18).
+
 The MVP boot-to-userspace pipeline (Limine → PMM → paging → SMP-aware
 scheduler → ring3 → syscalls → VMO/Channel IPC) is working and verified in
-QEMU (`-smp 1` and `-smp 2`). This roadmap covers what's next, roughly in
-priority order.
+QEMU (`-smp 1` and `-smp 2`). This roadmap organizes active work by subsystem
+and keeps a compact ledger of recently completed milestones.
 
-Current status and evidence boundaries are summarized in [STATUS.md](STATUS.md).
-Storage work is tracked in [PRODUCTION_ROADMAP.md](PRODUCTION_ROADMAP.md) and
-release approval in [STORAGE_PRODUCTION_GATE.md](STORAGE_PRODUCTION_GATE.md).
-Mutable HxFS exists, but storage remains not production-ready/not format-frozen.
+Authoritative status and evidence boundaries live in [STATUS.md](STATUS.md).
+Storage details live in [PRODUCTION_ROADMAP.md](PRODUCTION_ROADMAP.md) and
+[STORAGE_PRODUCTION_GATE.md](STORAGE_PRODUCTION_GATE.md); mutable HxFS v7
+exists, while `storage production-ready` and format freeze remain `false`.
 
-PCI/PCIe modernization is tracked in
-[PCI Manager Architecture](PCI_MANAGER_ARCHITECTURE.md), the isolated
-[Ring-3 ACPI Architecture](ACPI_RING3.md), the dedicated
-[PCI Production Roadmap](PCI_PRODUCTION_ROADMAP.md), and the ordered
+PCI/PCIe and Ring-3 ACPI modernization are specified in
+[PCI Manager Architecture](PCI_MANAGER_ARCHITECTURE.md),
+[Ring-3 ACPI Architecture](ACPI_RING3.md),
+[PCI Production Roadmap](PCI_PRODUCTION_ROADMAP.md), and
 [ACPI → PCI Implementation PR Plan](ACPI_PCI_IMPLEMENTATION_PLAN.md). The
-current kernel CF8/CFC NVMe bootstrap remains a migration shim; PCI
-production-ready is false until the userspace manager path and its release
-gates close.
+kernel CF8/CFC NVMe bootstrap (`crates/huesos-kernel/src/boot/storage.rs`)
+remains a migration shim and `PCI production-ready` remains `false`.
+
+---
+
+## Active Subsystems Roadmap
+
+### 1. PCI / PCIe & Ring-3 ACPI (AP-17+ — Stages B.4…O)
+
+AP-0 through AP-16 established the isolated Ring-3 `uacpi-runtime`, `acpi-manager`
+supervision, `HMCF` config-window snapshots, `PciConfigMint` capability minting,
+mediated `PCI_Config`/`SystemIO`/`SystemMemory` reads, generation-safe ACPI IRQ
+grants, namespace load/init, `HPCI` root-bridge discovery, and root-bound
+read-only diagnostic PCI inventory. The next ordered stages turn read-only
+discovery into active device ownership:
+
+- **AP-17 (`B.4` — Audited config write policy & transactions):** bounded
+  config-space write policy and write/readback verification transactions
+  (Command register, BAR sizing/enable, bridge windows) owned solely by
+  `pci-manager`; AML config writes remain denied unless explicitly justified.
+- **AP-18 (`C.3` — `_PRT` and `_OSC` ownership):** evaluate ACPI `_PRT`
+  (PCI interrupt routing tables) and `_OSC` (host/OS control negotiation) in
+  Ring-3 `uacpi-runtime` and carry validated routing/control metadata to
+  `pci-manager`.
+- **AP-19 (`E.1` + `F.2` — Live BAR inventory & rollback-verified planner):**
+  live BAR sizing/validation integrated with `huesos-pci::resource_planner`
+  for deterministic firmware-preserving allocation and explicit rollback plans.
+- **AP-20 (`G.2` + `G.3` — Kernel `DeviceLease` & `DeviceGone`):** kernel-enforced
+  per-device lease object bound to `(DeviceId, LeaseGeneration, FirmwareSnapshotId)`,
+  preventing BDF-reuse / stale-resource ABA and delivering `DeviceGone` revocation
+  signals.
+- **AP-21 (`H.3` + `I` — Driver binding & narrow BAR/IRQ/DMA handoff):**
+  `pci-manager` + `driver-manager` driver binding that mints narrow per-device
+  BAR MMIO, MSI-X/MSI/INTx IRQ, and bounded DMA pool handles strictly through
+  active `DeviceLease` grants.
+- **AP-22 (`J` — NVMe migration & kernel PCI shim removal):** migrate system
+  NVMe boot/binding completely to `pci-manager` + `driver-host-nvme` and delete
+  the legacy kernel CF8/CFC scan in `crates/huesos-kernel/src/boot/storage.rs`.
+- **Later (`Stages K–O`):** reserved-space hotplug and surprise-removal
+  fail-stop (`K`), restart-based and opt-in `QuiesceRemap` rebalance (`L`–`M`),
+  IOMMU isolated DMA domains (VT-d / AMD-Vi, `N`), and multi-machine
+  bare-metal production qualification (`O`).
+
+### 2. Storage & HxFS (`PRODUCTION_ROADMAP.md` / `STORAGE_PRODUCTION_GATE.md`)
+
+HxFS v7 read/write/checkpoint foundations, encrypted metadata/filenames/extents
+(Stage B), runtime knobs/structured observation/reproducible benchmarks
+(Stages E.1/E.2/E.4), and Hxblob/service foundations (Stage F) have landed,
+while `v7 format freeze` and `storage production-ready` remain deliberately
+`false`. Remaining work to close the storage track:
+
+- **Stage E.3 — 24-hour long-haul soak & run-to-run comparison:** extend the
+  bounded ~2 h `scripts/soak-long.sh` pass to a full 24 h endurance run with
+  automated throughput/error/recovery delta checks against a prior baseline.
+- **Stage C — Full reliability closure:** complete end-to-end fault-injection
+  and recovery verification for media error handling, online `fsck`, and
+  online `scrub` across power-loss and LBA-corruption matrices.
+- **Stage D — Hardware security closure:** execute the owner-gated physical
+  TPM PCR sealing and Secure Boot verification matrix on real hardware (beyond
+  QEMU OVMF + `swtpm` smoke gates).
+- **Multi-vendor NVMe qualification & format freeze:** sustain persistent
+  `hxfs-service` workloads across at least two distinct NVMe controller/SSD
+  vendors before approving an irreversible on-disk HxFS v7 format freeze.
+
+### 3. Networking (Medium Term #9)
+
+No network driver or TCP/IP stack exists yet. Planned incremental delivery:
+
+- **Userspace `virtio-net` DriverHost:** implement a capability-scoped network
+  device driver host (`driver-host-net`) using bounded DMA descriptor rings,
+  `WaitSet` / `Port` completion notifications, and `DeviceLease`-mediated
+  BAR/IRQ grants once AP-20/AP-21 land (or manifest-scoped MMIO/IRQ in a
+  staging harness).
+- **Userspace TCP/IP stack:** isolated, quota-bounded protocol service
+  (Ethernet, ARP, IPv4, ICMP, UDP, TCP) communicating with clients over
+  Channel/VMO IPC without adding protocol parsing to Ring-0.
+- **QEMU & real-NIC follow-ups:** automated QEMU user-net / tap smoke tests
+  (DHCP/ARP/ICMP/UDP/TCP echo), followed later by real hardware NIC drivers
+  (e.g., Intel `e1000e`/`igc`) under the IOMMU isolated profile.
+
+### 4. Platform, Userspace & Long-Term Hardening
+
+- **VFS-backed process execution:** replace build-time `include_bytes!` BOOTFS
+  ELF embedding for non-bootstrap applications with dynamic loading from
+  persistent HxFS / BlobFS volumes.
+- **Userspace environment & toolchain:** expand `libcanvas`, freestanding C/POSIX
+  compatibility surfaces, interactive shell utilities, and work toward a
+  self-hosting toolchain.
+- **Additional device classes (post PCI/Storage/Net):** USB xHCI host controller
+  driver host and audio output (PC Speaker SFX / HD Audio).
+- **Kernel & CPU security hardening:** KASLR, full physical-CPU SMEP/SMAP
+  verification matrices, and IOMMU (VT-d / AMD-Vi) DMA isolation.
+
+---
 
 ## Done (recent)
 
-### ACPI→PCI Batch 2 (AP-4…AP-6)
-- The isolated userspace uACPI runtime carries process-local primitives and an
-  archive-v2 read-only table map (AP-4/AP-5); the host suites were extended to
-  the plan's required tests (timeout trio, recursion, event saturation/teardown,
-  overflow, allocation-failure points, synthetic RSDP→FACS graph, page-boundary
-  ranges, translator fuzz; decoder ASan fuzz for the v2 wire format). ACPI
-  Manager supervision is generation-safe: retained archive/broker duplicates,
-  structured control protocol, bounded backoff and the last-good freeze policy
-  (AP-6). The validated HMCF config-window snapshot is now produced from the
-  archived MCFG by `acpi-manager` and retained by DriverManager under the
-  current generation (AP-7): bounded pointer-free wire format, canonical
-  encoding, envelope/size/generation validation, immutable VMO, no ECAM
-  mapping or PCI authority. Verified by host suites (uacpi-runtime 22,
-  decoder-fuzz 6, huesos-abi 94 incl. 17 HMCF tests) and by QEMU Q35/OVMF SMP2:
-  full boot gate, injected restart cascade
-  (pre-ready → ready → post-ready → restart → stale heartbeat ignored, stale
-  HMCF generation dropped) and restart-budget exhaustion into degraded mode
-  (`scripts/ci-qemu-acpi-restart-smoke.sh restart|budget`; cascade also on
-  debug). The kernel now holds a snapshot-bound config-mint authority
-  (AP-8, `huesos-dev/ap8-config-mint`): a unique boot-minted `PciConfigMint`
-  capability for the root supervisor only, a bounded mint request that
-  accepts an HMCF VMO and generation metadata (never a physical range), an
-  independent kernel decode of HMCF and the bound archive-v2 MCFG with
-  canonical-subset and usable-RAM-alias checks, and read-only, non-
-  executable, uncached ECAM capabilities (Mmio mappings are always
-  `NO_CACHE`; resource mappings reject `EXECUTE`). No consumer exists yet —
-  DriverManager→PCI Manager authority handoff is AP-9. AML/PCI config
-  authority remains otherwise disabled. The handoff itself is implemented
-  (AP-9, `huesos-dev/ap9-config-authority-handoff`): `init` delegates the
-  unique mint authority to DriverManager, which mints a fresh generation-bound
-  read-only ECAM capability set per PCI Manager generation (canonical HMCF
-  order, snapshot/generation-bound), attaches the HMCF snapshot and an
-  explicit end-of-burst sentinel, and PCI Manager independently validates
-  and maps every window read-only (`READ|USER|SPECIFIC`; kernel `NO_CACHE`,
-  no `EXECUTE`), reporting `read-only config authority ready`; a degraded
-  ACPI path settles it into explicit fail-closed `no firmware snapshot`.
-  AML reads stay mediated: AP-10 (`huesos-dev/ap10-config-mediation`) adds the
-  dedicated ACPI→PCI read-mediation channel — AML-visible configuration
-  reads are served by PCI Manager, every write is denied, the legacy
-  broker PCI opcodes are permanently unauthorizable, and QEMU evidence is
-  pending CI (`qemu-pci-mediation`). No topology publication. AP-11
-  onwards not started. See
-  ACPI_PCI_IMPLEMENTATION_PLAN.md §7.
+### ACPI→PCI Bring-Up Series (AP-4…AP-16)
+- **AP-4 / AP-5 / AP-6 (uACPI primitives, archive-v2, supervision):** isolated
+  Ring-3 `uacpi-runtime` extended with process-local primitives and archive-v2
+  read-only table maps; `acpi-manager` supervision enforces generation-safe
+  retained archive/broker handles, bounded backoff, and last-good freeze
+  (`scripts/ci-qemu-acpi-restart-smoke.sh restart|budget`).
+- **AP-7 (`huesos-dev/ap7-hmcf-wire`):** validated `HMCF` ECAM config-window
+  snapshot produced by `acpi-manager` and retained by `driver-manager` under the
+  active ACPI generation.
+- **AP-8 (`d100388`, PR #245):** kernel `PciConfigMint` one-shot root
+  capability (`init` only), bounded mint requests bound to HMCF + archive-v2
+  MCFG with canonical-subset and usable-RAM-alias checks, minting read-only,
+  non-executable, `NO_CACHE` ECAM mappings.
+- **AP-9 (`b66895d`, PR #246):** `init` delegates `PciConfigMint` to
+  `driver-manager`, which mints generation-bound read-only ECAM capabilities per
+  `pci-manager` generation and transitions readiness from fail-closed to
+  `read-only config authority ready`.
+- **AP-10 (`6ad1f78`, PR #247; `3050c5c`, PR #248):** dedicated ACPI→PCI
+  `PCI_Config` read mediation channel served by `pci-manager`; all config
+  writes denied; legacy broker PCI opcodes permanently unauthorizable;
+  scenario-aware ECAM/forced-legacy QEMU smoke gates.
+- **AP-11 (`9fc854c`, PR #249; `18242b3`, PR #250):** Gate B range policy and
+  kernel-broker mediation for ACPI `SystemIO` and `SystemMemory`
+  `OperationRegion` accesses (`huesos_abi::acpi_region_policy`,
+  `acpi_policy.rs`), preserving sacred denies and snapshot bindings.
+- **AP-12 (`f007150`, PR #251):** generation-safe ACPI IRQ grants and CPU0
+  deferred-work queue (`uacpi-runtime::work`), keeping AML interrupt/work
+  dispatch bounded and generation-checked.
+- **AP-13 / AP-14 (`92e7be9`, PR #252; `9c9c625`, PR #254):** isolated Ring-3
+  uACPI AML namespace load (`_PIC(IOAPIC)`), bounded `uacpi_namespace_initialize`,
+  writable FACS shadow in `uacpi_shim.c`, and host ASan/UBSan namespace corpus
+  tests (`scripts/test-uacpi-runtime.sh`).
+- **AP-15 (`a192cfe`, PR #255):** Ring-3 uACPI root-bridge discovery (`_HID`
+  `PNP0A03`/`PNP0A08`, `_CRS`, `_BBN`/`_SEG`) producing validated `HPCI`
+  `RootBridgeTable` VMOs (`acpi-manager` → `driver-manager` → `pci-manager`)
+  with HMCF cross-checks and ECAM/forced-legacy QEMU parity.
+- **AP-16 (`ba1f439`, PR #256):** `huesos-pci::inventory` and `pci-manager`
+  read-only diagnostic PCI inventory enumeration bound to validated `HPCI` roots
+  with `FirmwareResourceAvailability` status, zero config writes/BAR sizing
+  mutations, crash-freeze inventory retention, and CI stabilization for
+  `tools/storage-bench.py` (`--self-compare` warmup/median) and
+  `extable::tests` (`SORTED_PTR` host-test serialization).
 
-### Process lifecycle regression matrix
-- Test actual Process/ProcessWait objects for late and repeated observation,
-  distinct async wakers, counted waiter release and competing exits. Exercise
-  4096 exits against the bounded graveyard and stale full TaskId operations
-  after sequential helper clear/reuse; include huesos-sched in make test.
-  The reaper's pending-operation carry-over defect is closed at the
-  directory/integration level: `TaskDirectory::retire` atomically reports and
-  discards pending remote operations, the kernel counts them, and replacement
-  generations are pinned by host regressions (see TASK_GENERATIONS.md).
-- Init repeats ProcessWait and ProcessGetExitCode after each child exit; the
-  QEMU boot gate requires its dedicated repeated-observation marker.
-- Scope and verification limits: [PROCESS_LIFECYCLE_REGRESSIONS.md](PROCESS_LIFECYCLE_REGRESSIONS.md).
+### Core Kernel, Security, Scheduler & Quotas (Immediate #1–#4, Short-Term #5–#6, Medium-Term #8 & #10 — COMPLETE ✅)
+- **Immediate #1 — Recoverable copies, VMAR splits & SMEP/SMAP:** `huesos-extable`,
+  `.ex_table` asm primitives for bulk & typed user copies, `VmarCreateChild` /
+  split `VmarUnmap` / `VmarProtect`, and `qemu-extable-smoke` (`extable_test=1`).
+- **Immediate #2 — IOAPIC routing:** `huesos-ioapic` policy crate, masked-first
+  multi-controller GSI routing, dynamic IDT bridge, and kernel `edu` level-IRQ
+  probe (`scripts/ci-qemu-irq-level-smoke.sh`); userspace raw-GSI path and
+  `_PRT` integration remain open under AP-18/AP-21.
+- **Immediate #3 & Short-Term #5 — Process/object lifecycle & dynamic processes:**
+  `huesos-lifecycle` `RefAccount` registry, `huesos-proclife` state machine,
+  `ProcessBindExitPort`, `TaskDirectory::retire` drain, bounded graveyard, and
+  32-exit repeated-observation init tests ([PROCESS_LIFECYCLE_REGRESSIONS.md](PROCESS_LIFECYCLE_REGRESSIONS.md)).
+- **Immediate #4 & Short-Term #6 — Wait primitives & handle transfer:**
+  `huesos-waitset` + `Syscall::WaitSetWait`, level-triggered `Signal` objects,
+  and transactional all-or-nothing `huesos-handlemove` handle transfer in
+  `ChannelWrite`.
+- **Medium-Term #8 & #10 — Job quotas & scheduler polish (+ 16-item stabilization):**
+  hierarchical `Job` tree (`JobDefault`/`JobCreate`/`JobSetLimits`/`JobBindQuotaPort`
+  /`ProcessCreateInJob`), panic-free `huesos-sched` EEVDF (`?`-threaded internals),
+  EDF replenish-on-unblock, opt-in token-based Fair task stealing, dedicated
+  non-timer reschedule IPI, and deferred quota-exhaustion packets.
+- **Locking & static safety gates:** type-enforced `IrqSafeMutex<T>` across
+  `huesos-object` + `tools/check-huesos-object-lock-policy.py`, `hues-async`
+  alloc-free CI gate, ranked privileged locks, sealed typed syscall allowlists,
+  and zero runtime `unwrap`/`expect`/`panic` policy (`safety-budget.json`).
 
-### Typed syscall record hardening
-- Replace the internal Copy-only typed-copy contract with a sealed audited
-  record allowlist; encode output fields with zero padding instead of reading
-  potentially uninitialized C-layout padding.
-- Verification is recorded in the corresponding change's commit/PR; this entry
-  does not assert bare-metal verification.
+### Userspace Platform, Terminal, Input & Storage Foundation (Short-Term #7 foundation)
+- **Userspace drivers, terminal & shutdown (PR-C…PR-G):** manifest-driven
+  `Resource` capability grants (`IoPort`/`Mmio`/`Irq`/`PowerControl`), full
+  migration of PS/2 input to event-driven `driver-host-input`, deletion of
+  `huesos-arch::x86_64::keyboard`, userspace `shutdown-broker` + `Syscall::HardHalt`,
+  Cozette 6×13 TTY font + buffered 16 MiB shadow terminal renderer, monotonic
+  Snake, and Freedoom/DoomGeneric port.
+- **NVMe & HxFS v7 foundation (Stages A–F foundation):** `driver-host-nvme`
+  (64 MiB boot DMA pool, MSI-X→MSI→polling, per-CPU queues, async BlockDevice
+  Channel+Port, VolumeManager), read-only BlobFS & DevFS handle namespace, and
+  `hxfs-service` / `huesos-hxfs` v7 COW + encrypted/compressed pipeline +
+  journaled crash-consistency harness (`scripts/ci-qemu-powerfail.sh`).
 
-### Raw-GSI level-interrupt probe on QEMU `edu` (kernel-side)
-- `irq_test=1` boot probe (`boot/irq_probe.rs`) drives QEMU's `edu` PCI device,
-  a real level INTx source. On a Q35 SMP2 boot the firmware routes it to GSI 11.
-- Verified on target by `scripts/ci-qemu-irq-level-smoke.sh`: raw GSI route
-  bound to a Port, first delivery, route kept masked while asserted and
-  unacknowledged, and redelivery after deassert plus `Interrupt::acknowledge`.
-- Remaining: the same proof through the userspace syscall path (66/67), and
-  route drop/affinity tests. See `docs/IOAPIC_ROUTING.md`.
-- Safety-budget delta: two MMIO volatile sites, dedicated review in
-  `docs/UNSAFE_AUDIT.md` § "Raw-GSI level-probe MMIO boundary".
-
-### Panic-free EEVDF tree: `?`-threaded internals, `huesos-sched` tests unwrap-free
-- `crates/huesos-sched/src/eevdf.rs` no longer panics: every internal
-  operation threads `Result<(), EevdfTreeError>` (new `InvariantBroken`
-  variant), closing the "migrate the hot unwraps to `?`-threaded internal
-  helpers" follow-up recorded under the Scheduler v2 tree landing.
-- `pop_min` now returns `Result<Option<EevdfKey>, _>` so a corrupted
-  runqueue can never be silently treated as empty (silent task stranding —
-  the failure mode this project hunts); read-only walks keep degrading
-  gracefully on a missing slot.
-- The scheduler's five duplicate `expect("fair queue capacity")` insert sites
-  collapse into one `fair_queue_insert` fail-stop guard, and the fair-queue
-  drain loop fails stop on the `pop_min` error arm.
-- `huesos-sched` test modules (`eevdf`, `job`, `hw`, `clock`) use the
-  match-based `expect_ok!` / `expect_some!` helpers (the NVMe `buffer_pool`
-  pattern); zero `.unwrap()` / `.expect()` remain in the crate.
-- Safety-budget delta: `unwrap_calls` 60 → 22 (−38), `expect_calls` 85 → 62
-  (−23), `panic_macros` 13 → 15 (+2 named invariant guards, reviewed in
-  `docs/UNSAFE_AUDIT.md`).
-- Verified: `cargo test -p huesos-sched` 48/48 (incl. the 3000-op randomized
-  invariant test), `make test` 933 pass / 0 fail, `make audit-check`,
-  `CARGO_BUILD_JOBS=1 make clippy`, `make build`, and the QEMU boot smoke
-  (`ci-qemu-smoke.sh debug 2 120`).
-
-### Type-enforced `IrqSafeMutex` for all of `huesos-object`, replacing the ad-hoc `IrqGuard` fix
-- Field verification of the previous "IRQ-safe guards" fix (see below) found
-  the keyboard self-deadlock still occurred, just less often — the manually
-  curated set of guarded locks missed `wait::PARK_FN`/`WAKE_FN` (called from
-  `WaitQueue::wake_one`, which the keyboard IRQ1 bridge reaches through
-  `Interrupt::signal` -> `Port::queue`), proving the fix approach itself
-  (convention over enforcement) was the real gap.
-- Replaced every `spin::Mutex` in `huesos-object` with a new
-  `crate::irq_guard::IrqSafeMutex<T>` (Zircon `Guard<SpinLock, IrqSave>`
-  style): the type makes it impossible to `.lock()` without disabling local
-  interrupts, so a future call site cannot reintroduce this bug by omission.
-  New CI gate `tools/check-huesos-object-lock-policy.py` (in `make
-  audit-check`) rejects any bare `spin::Mutex` in the crate going forward.
-- Also applied a seL4-inspired secondary hardening: `Interrupt::signal` (the
-  actual IRQ handler body) no longer looks anything up in the global object
-  registry — `InterruptBinding` now caches the bound `Port`'s `Arc` at
-  `bind_port` time instead of re-resolving a `Koid` on every interrupt.
-  Needed a new safe `KernelObjectExt::downcast_arc` (zero `unsafe`, via a
-  blanket `AsAnyArc` trait and `alloc`'s own `Arc::downcast`).
-- Zero new safety-budget surface: mechanical lock-type migration, no new
-  `unsafe`. Full writeup in `docs/UNSAFE_AUDIT.md` § "huesos-object
-  migration to type-enforced `IrqSafeMutex`".
-- Verified: `cargo test -p huesos-object` (39/39, including updated
-  `interrupt_signal_queues_port_packet`), `cargo build -p huesos-boot
-  --release` (full kernel + every embedded userspace ELF), `make
-  audit-check` (6/6 gates), `clippy -D warnings`, `make test` (full host
-  suite) all green locally. A fresh QEMU soak-with-continuous-typing test
-  is still the authoritative signal that this closes the hazard completely
-  (see docs/TESTING.md); not run in this sandbox.
-
-### Fixed keyboard self-deadlock: IRQ-safe guards for `huesos-object` registry/Port/Interrupt/WaitQueue locks
-- Root cause: the keyboard IRQ1 bridge (`Interrupt::signal` -> `Port::queue`
-  -> `WaitQueue::wake_one`) and the timer IRQ (`wait::notify_tick`) share
-  several plain `spin::Mutex` locks (`REGISTRY`, `Port::packets`/`quota`,
-  `Interrupt::binding`, `WaitQueue::waiters`/`async_wakers`, the wait-timeout
-  table) with ordinary syscall-context code that runs with interrupts
-  enabled (`PortRead`, `InterruptBindPort`, `WaitSetWait`'s poll loop,
-  `ProcessWait`'s timeout path). A keystroke or timer tick landing on the
-  same CPU while syscall-context code already holds one of these locks
-  self-deadlocks that CPU: the IRQ handler cannot get the lock, and the
-  lock holder cannot resume because it is preempted inside the IRQ handler
-  that is spinning on it. This reproduced as "keyboard input works for a
-  few seconds, then the terminal or the entire system freezes solid", with
-  the local CPU's timer tick stopping and no panic message — a single-CPU
-  hazard, not an SMP race, so it did not require `-smp 2` to trigger.
-- Fixed with a new crate-local `huesos_object::irq_guard::IrqGuard`, a
-  verbatim reuse of `huesos-pmm`'s existing IRQ-mask-around-`lock()` pattern
-  (see `docs/UNSAFE_AUDIT.md` "PMM IRQ-guard boundary"), applied to every
-  affected lock. `huesos-object` still cannot depend on
-  `huesos-arch::RankedIrqSafeTicketLock` without losing host-testability, so
-  this closes the gap `docs/LOCK_ORDER.md` had flagged as outstanding
-  ("Legacy `spin::Mutex` instances remain in the platform-neutral object
-  and syscall crates... must move to a host-testable shared ranked-lock
-  core") without requiring that larger migration.
-- Safety-budget delta: `unsafe_blocks` 245 -> 247 (+2; the same two `cli`/
-  `sti` `asm!` sites as the PMM guard, gated to real kernel builds and a
-  no-op under host tests). Full writeup and verification log in
-  `docs/UNSAFE_AUDIT.md` § "huesos-object IRQ-guard boundary".
-- Verified: `cargo test -p huesos-object` (all 39 tests, unchanged
-  behavior on host target), `cargo build -p huesos-boot --release`,
-  `cargo clippy -D warnings` / `scripts/clippy.sh`, `make test` (full host
-  suite), `make audit-check` (5/5 gates) all green locally. QEMU boot/
-  keyboard-under-load verification is via CI's `qemu-boot` matrix per
-  `docs/TESTING.md`.
-
-### Fixed flaky `qemu-boot (release, 1)` CI hang: callback-mutex guard held across `park_current`
-- Root cause: `huesos_object::wait::park_current` (and five other, lower-risk
-  call sites) called `f()` while still holding the `MutexGuard` from
-  `*PARK_FN.lock()`, because `if let Some(f) = *MUTEX.lock() { f() }` extends
-  the lock's temporary lifetime across the whole body. `park_current` performs
-  a real context switch and may not return for an arbitrary time, so any
-  other task/CPU calling `park_current`/`wake_task` before the first one was
-  woken spun forever on the mutex with interrupts disabled — stopping the
-  timer tick permanently and hanging the system with no panic message. This
-  is the actual cause of the `qemu-boot (release, 1)` CI flakiness (not a bug
-  in the `sys_waitset_wait`/shutdown-broker fixes from PR #127, which remain
-  correct and necessary on their own).
-- Fixed by copying the `Option<fn>` out of the lock into a local before
-  calling it, matching the pattern already used (and commented) in
-  `huesos_syscalls::process::sys_yield`. Applied to
-  `huesos_object::wait::{park_current, wake_task, current_task_id,
-  now_ticks}`, `huesos_object::registry::current_cpu`,
-  `huesos_syscalls::waitset::current_tick`, and
-  `huesos_syscalls::debug::sys_debug_write`.
-- Zero safety-budget impact (pure safe-Rust lock-scope fix, no new
-  `unsafe`). Full writeup in `docs/UNSAFE_AUDIT.md`.
-- Verified: `bash scripts/ci-qemu-smoke.sh release 1 120` green 5/5 under
-  artificial host CPU load that previously reproduced the hang; `debug 1`,
-  `debug 2`, `release 2`, and both `ci-qemu-extable-smoke.sh` profiles also
-  re-verified green.
-
-### NVMe host-test unwraps retired; `unwrap_calls` back to 25
-- The five `.unwrap()` calls introduced by NVMe `buffer_pool` host tests
-  (previously tracked as Immediate #0b) have been rewritten around an
-  `expect_some!` `match`-based helper. CONTRIBUTING §1 is again satisfied
-  100%: no `.unwrap()` / `.expect()` / `panic!()` outside the historical
-  Ring-0 invariants explicitly documented in `docs/UNSAFE_AUDIT.md`.
-- `safety-budget.json` tightened `unwrap_calls: 30 → 25` in the same commit.
-
-### `hues-async` alloc-free rule enforced in CI
-- New gate `tools/check-hues-async-noalloc.py` rejects any use of the
-  `alloc` crate or any heap-backed collection / smart-pointer under
-  `crates/hues-async/**` (production and tests). Wired into
-  `make audit-check` and therefore into the `static-safety` CI job.
-- Rationale and full list of banned identifiers documented in
-  [ASYNC_RUNTIME.md](ASYNC_RUNTIME.md#project-rule-no-allocations-ever) and
-  cross-linked from `CONTRIBUTING.md § 1a`.
-- Current `crates/hues-async/` code passes the gate with zero changes.
-
-### Host-testable policy cores + contribution rules + safety audit
-- Seven `no_std`, dependency-free, host-unit-tested **policy crates** extracted
-  from the privileged paths, each with a `docs/` design page describing its
-  intended kernel integration and what still needs on-target verification:
-  - `huesos-lifecycle` — bounded zombie reclamation + two-counter collection
-    model (Immediate #3).
-  - `huesos-ioapic` — I/O APIC redirection-entry codec, MADT Interrupt Source
-    Override parsing, device-vector allocation, GSI→I/O APIC routing (#2).
-  - `huesos-extable` — exception/fixup table for recoverable user-copies (#1).
-  - `huesos-waitset` — multi-object wait/cancel/timeout dispatch (#4).
-  - `huesos-proclife` — per-process lifecycle state machine and exit/wait/reap
-    coordination (Short-Term #5).
-  - `huesos-handlemove` — rights monotonicity + all-or-nothing transactional
-    handle transfer (Short-Term #6).
-  - `huesos-quota` — flat and hierarchical resource admission for memory,
-    handles, and CPU ticks (Medium-Term #8).
-- These model decisions/encodings remain host-testable; bounded Channel/Port
-  queue admission now uses the quota core, while the I/O APIC MMIO writes,
-  fault-handler fixup, multi-wait syscall, full Job accounting, and complete
-  policy-crate replacement of object-specific paths still need on-target
-  verification.
-- `CONTRIBUTING.md` with strict rules (safety budget, ranked-lock policy,
-  Conventional Commits, host-test requirement, Definition of Done).
-- Panicking-surface audit (`docs/UNSAFE_AUDIT.md`): every `unwrap`/`expect`/
-  `panic!` site categorized (build scripts, budgeted tests, Ring-0 invariants);
-  the one Ring-3 runtime unwrap (terminal parser) replaced with a defensive
-  `let-else`. `unwrap_calls` was tightened `26 → 25` at that point, then later
-  raised to **30** (+5) by the NVMe `PciMmioTransport` host tests; see
-  `docs/UNSAFE_AUDIT.md § "NVMe PciMmioTransport MMIO/DMA boundary"` for the
-  retroactive dedicated-review record. Retiring those five NVMe test unwraps
-  and returning to `unwrap_calls = 25` is tracked as follow-up cleanup.
-
-### Buffered terminal renderer / post-game stall fix
-- Root cause isolated to per-pixel/per-scanline VMO syscalls during Terminal repaint
-- Static 16 MiB userspace shadow framebuffer; no per-frame heap allocation
-- Local glyph rasterization + bounded 1 MiB uploads + one present
-- Removed duplicate post-Snake terminal render
-- Doom Q-exit regression restores Terminal in 60–80 ms under QEMU TCG
-
-### TTY font + DoomGeneric/Freedoom userspace port
-- Custom TTY-style 8×16 default font; original 8×8 retained as compact mode
-- GPL-2.0 DoomGeneric isolated as a separate process; MIT kernel unchanged
-- BSD-licensed Freedoom Phase 1 with pinned SHA-256
-- Purpose-built freestanding C compatibility layer, no Linux/POSIX syscall ABI
-- Canvas video, monotonic game timing, transferred keyboard service Channel
-- Bounded large-ELF VMO copies, inactive-child page-table mapping optimization,
-  SysV entry-stack alignment, and per-CPU SSE enablement
-- First stable release is silent; privileged PC Speaker SFX remains next
-
-### Monotonic clock, full-screen Snake, and orderly shutdown
-- Hardware-timer monotonic syscall unaffected by yields or online CPU count
-- Snake pacing moved entirely off RDTSC to 100 Hz monotonic deadlines
-- Resolution-adaptive full-screen board, refreshed HUD/grid/object visuals
-- Terminal `shutdown` request routed through init supervisor IPC
-- Init-KOID authorization for `SystemShutdown`; unprivileged callers denied
-- Non-ACPI halt: PS/2 interfaces quiesced, LAPIC timer stopped, peer CPUs
-  stopped by IPI, final safe-to-power-off screen retained
-- QEMU keyboard-injection and framebuffer screenshot tests
-
-### Ring-3 fault isolation + SMP kernel panic
-- CPL-aware dispatch for #PF, #GP, #UD, #DE, and #AC; #DF is always fatal
-- Unhandled userspace exceptions terminate the complete process with stable
-  `ProcessWait` codes while unrelated services continue
-- Cross-CPU process termination, reschedule IPI, and CR3-safe deferred teardown
-- Single-owner kernel panic, panic-stop IPI, lock-free emergency serial path
-- Allocation-free white-on-red framebuffer diagnostics; no automatic reboot
-- Embedded faulting child plus debug/SMP QEMU containment smoke test
-- Trusted `panic_test=1` HBI hook and screenshot-based panic renderer test
-
-### Syscall user-memory boundary
-- Central validated user-copy layer; syscall handlers no longer directly
-  dereference caller pointers
-- Full ABI-bound and active page-table walk (`PRESENT`, `USER_ACCESSIBLE`,
-  `WRITABLE` for outputs), including multi-page ranges and huge-page leaves
-- Single-fetch ABI records and output preflight before blocking/side effects;
-  RAII `DeferGuard` rollback undoes handle-table insertions and object
-  registrations when user-memory delivery fails after side effects
-- Bounded VMO/Channel/debug/framebuffer temporary transfers with fallible
-  allocation
-- Handle duplication restricted to equal or reduced rights
-- Detailed contract and review checklist in `docs/USER_MEMORY.md`
-
-### SMP / LAPIC (core path) — verified in QEMU
-- MADT parse, INIT-SIPI-SIPI trampoline (stack + far jmp into long mode,
-  `EFER.NXE`)
-- Per-CPU GDT/TSS/IDT, `CpuLocal` via `GS_BASE`, per-CPU scheduler + idle
-- Shared LAPIC timer calibration (BSP vs PIT); APs reuse the count
-- LAPIC EOI on vector 0x20; PIC EOI retained for keyboard path
-- Historical MVP balancing/remote spawn milestone; current owner-local,
-  token-mediated placement has no global automatic load-average balancer
-  (see [ARCHITECTURE.md](ARCHITECTURE.md)).
-- Per-CPU STAR/LSTAR/SFMASK (user tasks may run on APs without `#UD`)
-- HHDM base-rev-3 fixes: map ACPI tables; identity-map low trampoline
-  pages; LAPIC MMIO mapped uncached
-
-### HBI / FAT / alloc hardening
-- HBI v2.1 gen/parser `EntryHeader` stride alignment (24 bytes)
-- HBI parser validates image_size vs buffer length, caps num_entries at 256,
-  checks per-directory-entry offset/length bounds, and cross-checks
-  DirectoryEntry ↔ EntryHeader type_id consistency
-- ELF loader and PMM use checked/saturating arithmetic for segment-end and
-  region-end computations; paging map_phys_range rejects overflow ranges
-- FAT BPB field widths + FAT16 EOC thresholds
-- Buddy allocator stores and uses `page_size`
-
-### Blocking waits + reaper (feature/wait-reaper-stability)
-- Wait queues + `park`/`wake` hooks from the scheduler
-- Blocking `ChannelRead` / `PortRead` (flag arg) and blocking `ProcessWait`
-- Handle transfer-on-write validates batches before removal and restores moved
-  handles when bounded queue admission fails; the normative policy crate is
-  not yet the direct implementation of the privileged table operations
-- `Vmo` Drop returns physical frames when the object is explicitly released;
-  exit path frees kernel stacks via reaper
-- `AddressSpace::destroy` frees owned user frames + private page tables
-- Process teardown clears handle table; driver-host input uses blocking Port
-- Registry VMAR mapping acquires the VMO kernel lifetime reference atomically
-  with object lookup
-- Process lifecycle owns exit generation; the scheduler records that exact
-  `(koid, generation)` identity in its bounded task graveyard, avoiding a
-  second, mismatched ABA identifier during deferred reaping
-- Channel and Port queues use bounded per-object quota admission; overflow is
-  observable as a normal error/drop counter rather than an unbounded allocation
-- Timed waits: `ChannelRead`/`PortRead` mode `>=2` = timeout in ticks + `TimedOut`
-- The scheduler uses a pending-wake handshake to close the enqueue-to-park SMP
-  lost-wakeup window; `WaitQueue::prepare` / `PreparedWait::park` / `cancel`
-  closes the remaining check-to-enqueue gap in every blocking path (Channel
-  recv, Port read, ProcessWait). `hues-async` is integrated as a ring-0
-  allocation-free primitive for the early-boot ProcessWait path; async primitives
-  (Recv, Sleep, ProcessWait) use the WaitQueue ↔ Waker bridge; sys_waitset_wait
-  multiplexes across objects; keyboard IRQ → reactor wake bridge;
-  QEMU init now
-  also exercises a blocking `ProcessWait` wake after a yielding child exit in
-  the debug/release, SMP 1/2 smoke matrix
-
-### Async architecture (ring 0 + ring 3 universal async)
-- `hues-async` Executor generic over `Backend` trait: `KernelBackend`
-  (ring 0, SMP-ready) and `UserBackend` (ring 3, single-threaded)
-- `scope_on(fut, &backend)` drives non-'static futures; `spawn` requires
-  `'static` futures in executor slots. Clear separation.
-- Reactor = scheduler: timer callback drains events and wakes tasks.
-  No separate reactor thread. `async_rt::run_sync(fut)` is the kernel
-  async entry point.
-- Completion model: inline metadata (PortPacket), shared ring/CQ
-  (NVMe I/O), peek & claim (Channel IPC with cookie-gated consume)
-- Lock rules: never hold a ranked lock across `.await`. Capacity
-  errors are policy, not bugs.
-- Full design doc: `docs/design/ASYNC_ARCHITECTURE.md`
-
-### Syscall error-path regression coverage
-- Add host regressions against actual IPC send rollback and handle publication
-  transactions; assert reference-account and registry state as well as errors.
-- Distinguish deterministic queue/staging exhaustion from allocator OOM, and
-  injected commit failures from actual ring-3 pointer faults.
-
-
-
-## Immediate — COMPLETE ✅
-
-**Status:** CLOSED. All four Immediate tracks are implemented in `main`:
-recoverable user copies + child/splitting VMARs, production-safe IOAPIC routing,
-`huesos-proclife`-backed process lifecycle/reaper integration, and public
-level-triggered Signal objects integrated with `WaitSetWait`.
-
-Notes remaining under this section are explicitly future-facing validation or
-next-stage expansion items; they are not blockers for the Immediate milestone.
-
-### 1. Recoverable copies, VMAR unmap/protect, and SMEP/SMAP
-- **Current**: `VmarUnmap` and `VmarProtect` operate on exact mappings under
-  Process user-copy locking and a global mutation lock; cross-CPU TLB shootdown
-  is required before returning to ring 3.
-- **Policy core landed**: `huesos-extable` — host-tested fixup-table data
-  structure and lookup (see [RECOVERABLE_COPIES.md](RECOVERABLE_COPIES.md)).
-- **Plumbing landed (H1)**: kernel-side `crate::extable` module + arch-side
-  `set_kernel_recover_hook` + IDT `#PF` re-entry that redirects RIP to a
-  `fixup_rip` when the extable covers the fault.
-- **Macro infrastructure landed (H2 follow-up, part 1 of 3)**:
-  `huesos-syscalls::user_access::recoverable_copy_{from,to}_user` are
-  `asm!`-based user-copy primitives that emit their own `.ex_table`
-  entries via `.pushsection`. `crate::extable::install` now reads the
-  linker-emitted `[__huesos_ex_table_start, __huesos_ex_table_end)`
-  range, sorts it, validates the non-overlap invariant via
-  `Extable::new_sorted`, and publishes the sorted snapshot behind a
-  lock-free `AtomicPtr`. Kernel boots log
-  `[extable] installed N recoverable-copy entries`. See
-  `docs/UNSAFE_AUDIT.md § "Extable macro infrastructure"` for the
-  safety-budget review.
-- **Wire-up landed (H2 follow-up, part 2 of 3)**: `copy_from_user` /
-  `copy_to_user` in `huesos-syscalls::user_memory` now go through
-  `user_access::recoverable_copy_{from,to}_user`. `readelf .ex_table`
-  reports 2 entries × 24 bytes, each pointing at the exact 2-byte
-  `rep movsb` opcode in the corresponding copy helper. VMO reads and
-  Channel messages (the paths that dominate bulk userspace byte
-  traffic) are now covered.
-- **Smoke probe landed (H2 follow-up, part 3 of 4)**: kernel-side
-  `huesos_syscalls::user_access::synthetic_recoverable_copy_probe`,
-  gated by HBI cmdline `extable_test=1` and dispatched from `kmain`.
-  New CI job `qemu-extable-smoke` in `.github/workflows/hardening.yml`
-  runs in matrix `{debug, release}` (both profiles so a release/LTO
-  regression — the historical failure mode of `651cc1c revert` —
-  surfaces even if the debug boot smoke is green) and requires the
-  positive `[extable-test] recovered synthetic user-copy fault OK`
-  serial-log marker plus absence of `KERNEL PANIC` and
-  `[extable-test] FAILED`. See `docs/UNSAFE_AUDIT.md § "Extable smoke
-  probe"` for the design rationale (kernel-side synthetic vs.
-  userspace race).
-- **Typed ABI wire-up landed (H2 follow-up, part 4 of 4)**:
-  `read_value` / `read_array` / `write_value` / `write_array` now
-  route through typed helpers built on the same recoverable
-  `rep movsb` user-access primitive. Small syscall records and
-  handle/wait result arrays now share the same post-validation fault
-  recovery as bulk VMO/Channel byte copies.
-- **Child VMAR hierarchy + split ops landed**: `VmarCreateChild` reserves
-  nested VMAR ranges append-only in the ABI; mappings may be installed into
-  child VMARs; partial `VmarUnmap` / `VmarProtect` split mapping metadata
-  transactionally while preserving VMO lifetime refs. Existing exact-range
-  callers keep working unchanged.
-- **Immediate status**: complete for the current userspace threading model.
-  A real cross-CPU unmap-vs-copy race probe remains gated on future
-  intra-process threading; the current CI probe is the kernel-side synthetic
-  extable fault-recovery proof.
-
-### 2. IOAPIC interrupt routing
-- **Current**: LAPIC timer on all CPUs; keyboard IRQ1 uses an integrated
-  masked-first I/O APIC path with PIC fallback. A multi-controller route manager
-  now supports additional legacy IRQs and explicitly typed raw GSIs.
-- **Policy core landed**: `huesos-ioapic` — host-tested redirection-entry codec,
-  strict MADT Interrupt Source Override parsing, vector allocation in
-  `0x30..=0xCF`, controller-range validation, and GSI→I/O APIC routing (see
-  [IOAPIC_ROUTING.md](IOAPIC_ROUTING.md)).
-- **Kernel route integration landed**: all discovered I/O APIC pins are masked
-  and read back at initialization; GSI routes are installed masked-first with
-  verified readback and SMP-serialized IOREGSEL/IOWIN access. Dynamic vectors
-  share a generic IDT/IRQ bridge. Interrupt-object bind/drop owns route
-  acquire/release, and level-triggered sources are masked before LAPIC EOI and
-  re-enabled by `Interrupt::acknowledge()` after device service. Active level
-  routes are single-owner.
-- **Affinity and limits**: destination APIC IDs above 255 and CPUs not reported
-  scheduler-online are rejected. ACPI `_PRT`/link-device resolution and
-  interrupt remapping remain out of scope; the current raw-GSI convenience
-  route uses PCI INTx defaults for non-ISA GSIs when no more precise data is
-  available.
-- **Verification status**: policy/object/ABI/syscall tests and host builds have
-  passed. The QEMU SMP2 QMP test injects a PS/2 key and observes its IRQ packet
-  reach the userspace Port through the keyboard IOAPIC route. Non-keyboard raw
-  GSI delivery, level ACK/re-enable, route release/affinity integration, and
-  bare-metal firmware validation remain open. PIC fallback remains until
-  broader coverage establishes it is safe to remove.
-
-### 3. Process/task and object teardown (mostly done)
-- **Current**: exited-process stacks, private page tables, and address-space-
-  owned frames are reaped; process teardown clears its handle table. The
-  global object registry now backs each object with a
-  `huesos_lifecycle::RefAccount` (host-tested two-counter model), and
-  `note_handle_close` / `note_kernel_ref_close` invoke `try_collect` — the
-  registry `Arc` is dropped on last-handle close for ordinary objects.
-- **Policy core landed**: `huesos-lifecycle` — host-tested bounded zombie
-  reclamation and the two-counter (handle/kernel refs) collection model (see
-  [OBJECT_LIFECYCLE_POLICY.md](OBJECT_LIFECYCLE_POLICY.md)).
-- **Landed**: registry migration from split `handle_counts` + `kernel_refs`
-  maps to one `BTreeMap<Koid, RefAccount>`; ABA-style stale-koid resurrection
-  is impossible because `open_*` on a collected account is a no-op. New
-  regression test `once_collected_object_stays_gone_and_ignores_stale_notes`.
-- **Process lifecycle replacement landed**: `Process.lifecycle` is now a
-  private `huesos-proclife::ProcessLifecycle` policy object reached only
-  through typed methods; scheduler/reaper code no longer inspects process
-  `ProcState` directly. Finished-task metadata is recorded through
-  `TaskGraveyard::record_exit_with_generation`, and overflow eviction outcome
-  is accounted explicitly.
-- **Immediate status**: complete. Remaining lifecycle work is future-facing
-  observability/stress coverage, not a missing Immediate architecture piece.
-
-### 4. Blocking syscalls / wait primitives (mostly done)
-- **Current**: Channel/Port block + tick timeouts (`TimedOut`); ProcessWait.
-- **Policy core landed**: `huesos-waitset` — host-tested multi-object wait
-  dispatch (Any/All, cancel, deadline) (see
-  [MULTI_OBJECT_WAIT.md](MULTI_OBJECT_WAIT.md)).
-- **Landed**: `Syscall::WaitSetWait` (#33) in `huesos-syscalls::waitset`
-  plus the `libcanvas::wait_any` / `wait_all` typed wrappers in userspace.
-  ABI signal constants (`huesos_abi::signals::{READABLE, WRITABLE,
-  CANCELED, PEER_CLOSED, SIGNALED}`) live in `huesos-abi` with a host test
-  that pins their numeric layout to `huesos_waitset::Signals`.
-- **Signal object landed**: append-only public ABI `SignalCreate` /
-  `SignalSet` / `SignalClear`, `ObjectType::Signal`, `libcanvas::Signal`, and
-  `WaitSetWait` `SIGNALED` support. Signal state is level-triggered: `set`
-  stays active until `clear`, and handle close wakes pending waiters so they can
-  report `CANCELED`.
-- **Immediate status**: complete. Future work is richer wait diagnostics and
-  higher-level userspace event abstractions built on `Signal`.
-
-## Short Term
-
-### 5. Multiple/dynamic userspace processes — COMPLETE ✅
-- **Current**: split launch exists (`ProcessCreate`, `VmarMap`,
-  `ThreadCreate`, `ThreadStart`) and init can launch embedded child ELF
-  images through `libcanvas::process::spawn_elf`.
-- **Policy core landed**: `huesos-proclife` — host-tested per-process lifecycle
-  state machine (Created→Running→Exited→Reaped) with exit/wait/reap
-  coordination and an exit-info payload (see
-  [DYNAMIC_PROCESSES.md](DYNAMIC_PROCESSES.md)).
-- **Exit notifications landed**: `ProcessBindExitPort` lets a supervisor bind a
-  Port to a process. On exit, the kernel queues a `PORT_PACKET_PROCESS_EXIT`
-  packet carrying `(koid, generation, exit_code)` plus the user key; late binds
-  to an already-exited process queue immediately.
-- **Short-Term #5 status**: complete for the current launch model. Loading ELF
-  images from VFS instead of build-time `include_bytes!` is tracked under
-  Short-Term #7 (real VFS + userspace drivers), not as a blocker for #5.
-
-### 6. Handle transfer semantics — COMPLETE ✅
-- **Current**: `ChannelWrite` validates moved handles through the
-  `huesos-handlemove` policy model, removes them as one handle-table batch, and
-  restores the original slots when bounded queue admission fails; in-flight
-  messages retain handle-count ownership until receipt or drop.
-- **Policy core integrated**: the syscall path builds internal
-  `Disposition { op: Move }` entries for the existing handle-array ABI and runs
-  the host-tested all-or-nothing policy before touching the real handle table.
-  Missing handles, missing `TRANSFER`, repeated handles, and capacity failures
-  map to stable syscall errors without partial mutation.
-- **Short-Term #6 status**: complete for the current public ABI. A future
-  `ChannelWriteEtc`-style API with public Duplicate/reduced-right dispositions
-  can be added append-only when userspace needs it.
-
-### 7. Real VFS + drivers in userspace
-- BOOTFS is live as a RAM archive; `huesos-fat` exists as a library.
-- **NVMe Stage A/B + MSI-X/MSI landed**: DmaPool resource capability, manifest
-  parsing for `resource=dma:...`, HBI `.img` boot-driver contract, userspace
-  `driver-host-nvme`, strict NVMe resource-label parsing, Identify
-  Controller/Namespace parsers, per-CPU queue/DMA planning, async BlockDevice
-  Channel+Port protocol, client completion tracker, DriverManager registry
-  reservation for `open:block:nvme`, 64 MiB boot DMA pool reservation,
-  kernel PCI NVMe BAR0/IRQ/MSI/MSI-X metadata discovery, kernel MSI-X table
-  programming with MSI fallback, storage boot-info VMO carrying vector ranges,
-  dynamic init-minted `Mmio`/`Irq`/`DmaPool` grants, DriverManager launch of
-  `driver-host-nvme` from HBI BOOTFS, `ResourceMap` self-mapping for `Mmio` and
-  `DmaPool`, Resource-authorized Interrupt creation, BAR/DMA mapping in the
-  DriverHost, controller reset/enable, admin-queue setup, Identify
-  Controller/Namespace on target, 1 MiB max request clamp, PRP-list support
-  within one list page, per-CPU queue creation planning/commands, real
-  DriverManager `service:block:nvme:channel` handoff, VMO buffer registration,
-  Port-based completions, `libcanvas::block::BlockDevice` helpers, and Stage-D
-  VolumeManager system volume handles optimized strictly for NVMe/SSD raw
-  namespaces.
-- **Agreed production targets**: HBI `.img` driver loading, 64 MiB preallocated
-  DMA pool, no heap after driver init, MSI-X→MSI→polling fallback, per-CPU
-  queues depth 256, and 1 MiB max request size.
-- **BlobFS/DevFS Stage E/F landed**: `huesos-blobfs` defines read-only BlobFS v1
-  (superblock, blob table, SHA-256 hashes, overlap/hash validation) optimized for
-  immutable NVMe/SSD random access. DriverManager can mount BlobFS over the
-  system Volume fs-candidate, list hashes, and return verified blob VMOs by hash.
-  DevFS exposes a runtime handle namespace (`open:devfs`) with `/dev/block/system`
-  returning a Volume handle and `/dev/nvme0/ns1` returning a range-relative
-  BlockDevice handle. DevFS remains a handle resolver, not a disk filesystem.
-- **Hxfs Stage-G design + read-only prototype landed**: `docs/HXFS_DESIGN.md`
-  defines the object/volume-store model, NVMe/SSD-only media assumptions, COW +
-  sequential checkpoint/journal architecture, virtual-volume policy,
-  encryption/integrity rules, Hxblob relationship, and read-only prototype
-  scope. `crates/huesos-hxfs` implements the read-only parser over a `BlockReader`
-  trait, validates metadata CRC32C, parses superblock/checkpoint/volume/object
-  tables, resolves paths, and reads regular files by extents in host tests. A
-  separate `hxfs-service` userspace process now mounts the VolumeManager
-  filesystem-candidate BlockDevice and exposes directory/file handles over
-  async channels.
-- **Hxfs Stage-H COW writer foundation landed**: `crates/huesos-hxfs::writer`
-  implements append-only COW mutation over Hxfs images with mkdir, create,
-  path-level symlink, overwrite, truncate/sparse extension, rename, unlink,
-  checkpoint commit, and read-only snapshot create/delete/open in host tests.
-- **Hxfs Stage-I advanced policy modules landed**: `allocator`, `quota`,
-  `crypto`, `compression`, `hxblob`, `io_policy`, and `scrub` cover the advanced
-  features discussed: 16 GiB NVMe/SSD allocation zones, pending TRIM, physical
-  byte/object quotas, AES-XTS key wrapping descriptors and hardware/software
-  backend selection, compression policy validation, Hxblob hash→ObjectId indexing
-  and Merkle planning, async parallel read-ahead/direct-I/O/write hints, and
-  online scrub reporting. Encrypted volumes are still rejected by runtime mount
-  paths until the actual AES-XTS key/crypto engines land.
-- **Needed**: on-target NVMe/SSD data-path soak, then persistent Hxfs write
-  service over BlockDevice plus production crypto/compression engines. A future
-  performance slice can replace the current synchronous service execution with
-  deeper async queue-slot tracking, but Stage C's public Channel+Port service
-  contract, Stage D's Volume handles, Stage E's BlobFS read path, Stage F's DevFS
-  handle namespace, Stage G's Hxfs read-only service path, Stage H's host-tested
-  COW writer, and Stage I's advanced policy models are now present.
-- **PS/2 driver ownership (fully migrated as of PR-E)**: the scancode
-  decoder, shift-state machine, and key-event dispatch live only in the
-  userspace `driver-host:input` process. The kernel keeps a
-  two-instruction IRQ1 shim in the IDT that reads port 0x60 and
-  forwards the raw byte via `irq_callback::emit(1, byte)`. **The
-  `huesos-arch::x86_64::keyboard` module has been deleted**; the 8042
-  quiesce sequence executed on the shutdown path is now driven by the
-  userspace `shutdown-broker` component through its IoPort resource.
-  The legacy `SystemShutdown` kernel path no longer touches PS/2 at
-  all — `interrupts::disable()` already masks IRQ delivery before the
-  LAPIC halt sequence, so no spurious event can reach a dead handler.
-- **Manifest-driven resource grants (landed as PR-C)**: `Resource`
-  capability objects (`ObjectType::Resource`, kinds
-  `IoPort`/`Mmio`/`Irq`, shared/exclusive semantics) are minted
-  kernel-side by the root supervisor via `Syscall::ResourceCreate`;
-  driver manifests declare fine-grained `resource=<kind>:<base>:<len>:<mode>`
-  and `critical=true` lines that init reads out of BOOTFS and turns
-  into per-driver handle grants transferred through DriverManager. See
-  `docs/ARCHITECTURE_ROADMAP.md` §2/§4.
-- **Userspace shutdown-broker + `sys_hard_halt` + critical-process
-  fallback (landed as PR-D)**: capability-gated atomic halt via a new
-  `PowerControl` resource kind, `Syscall::HardHalt = 36`, and safe
-  8042 quiesce through `Syscall::IoPortWrite8`/`IoPortRead8`. The
-  userspace `shutdown-broker` component holds an IoPort(0x64) grant
-  and a PowerControl grant; init marks it critical, and the terminal
-  `system:shutdown` command now routes through it. If the broker
-  crashes before delivering the halt, the kernel's critical-exit
-  hook forces `hard_halt` itself (Fuchsia's "critical to root job"
-  analogue). DriverManager forward layer + input-host verification
-  close the PR-C limitation end-to-end: manifest-minted resource
-  handles now reach the driver process they were declared for.
-  `keyboard::prepare_shutdown` is deleted in PR-E; see the item
-  above.
-- **`huesos-arch::x86_64::keyboard` module deletion (landed as PR-E)**:
-  the last kernel-side PS/2 code is gone. The module file is removed
-  and `mod.rs` no longer declares it. Legacy `SystemShutdown`
-  continues to work as a broker-unavailable fallback but skips the
-  historical `out 0x64, 0xAD/0xA7` sequence entirely.
-- **Input UX quality: Cozette 6x13 font + event-driven PS/2 driver
-  (landed as PR-F)**: replaces the 8x8-upscaled-to-8x16 pixelated
-  terminal text with the Cozette bitmap font (6×13, MIT), doubling
-  usable terminal cells from 44×96 to 54×168. The input-host
-  driver loop is rewritten around `wait_any([bootstrap, port])` so
-  it spends zero CPU when the keyboard is idle and dispatches
-  key events at IPI-plus-context-switch latency instead of at
-  scheduler-yield granularity. `tools/fontgen/bdf2rs.py` is the
-  new regenerator for the font tables from an upstream `.bdf`
-  release; both `libcanvas::font6x13` and `huesos_fb::font6x13`
-  ship the same glyph data.
-- **Init service integration ordering + CI happy-path markers
-  (landed as PR-G)**: explicit
-  `manifest:grants-complete:<driver>` barrier on the init → DM
-  bootstrap channel so DriverManager cannot spawn an input host
-  before init has finished minting its Resource grants; tightened
-  8042 port ownership so `input-host` owns only 0x60 and
-  `shutdown-broker` owns only 0x64, removing the exclusive-mint
-  collision that used to leave the broker unspawned; and a
-  significantly expanded `scripts/ci-qemu-smoke.sh` marker set
-  covering every step of the healthy boot chain up to
-  `[terminal] keyboard service online, starting shell` plus an
-  anti-marker set that fails CI on any known "silent stall"
-  line. Closes the class of bug where a userspace regression
-  leaves the terminal wedged waiting for a service that never
-  came up while CI stays green because early-boot self-tests
-  still print.
-
-## Medium Term
-
-### 8. Capabilities & resource quotas — COMPLETE ✅
-- **Current**: `Job` owns a shared hierarchical quota tree, Processes attach to
-  Jobs, VMO physical-frame allocation is charged/released, scheduler CPU ticks
-  are charged to the owning Job, and bounded Channel/Port queues use local quota
-  admission (see [QUOTAS.md](QUOTAS.md)).
-- **Public Job API landed**: append-only `JobDefault`, `JobCreate`,
-  `JobSetLimits`, `JobBindQuotaPort`, and `ProcessCreateInJob` expose controlled
-  child-Job creation, per-Job limit replacement, and process creation inside a
-  selected child Job.
-- **Exhaustion supervision landed**: failed Job charges queue
-  `PORT_PACKET_QUOTA_EXHAUSTED` to bound supervisor Ports instead of killing the
-  process automatically. Packet payload carries `(job_koid, resource_id,
-  attempted_amount)`.
-- **Medium-Term #8 status**: complete for active quota resources. Future work is
-  finer-grained accounting classes (for example separate page-table metadata
-  counters) and QEMU/SMP stress coverage for charge/release races.
-
-### 9. Networking
-- virtio-net driver + a userspace TCP/IP stack.
-
-### 10. Scheduler polish — COMPLETE ✅
-- **Landed**: EDF replenish-on-unblock. A Deadline task blocked for
-  longer than one period would previously wake with a stale (past)
-  deadline and be given infinite priority by EDF, starving every other
-  Deadline task. `wake_task` now rebases `deadline = now + period` and
-  refills `remaining_budget` — matching a standard Constant Bandwidth
-  Server. Pure helper `replenish_deadline_on_unblock` covered by three
-  host tests including overflow saturation.
-- **Landed**: token-based opt-in Fair task stealing. A process must set
-  `scheduler_flags::STEAL_OPT_IN` before its initial thread starts; idle CPUs
-  may then request a victim runqueue token and steal only ready Fair user tasks
-  whose affinity mask includes the target CPU. The scheduler keeps no global
-  load average and does not perform global balancing.
-- **Safety invariant**: migrated tasks receive a fresh task id on the target CPU
-  and an old→new alias is retained for stale references. Tasks that have not yet
-  consumed their initial user-entry record are not stealable, preserving startup
-  lookup correctness.
-- **Medium-Term #10 status**: complete for the approved per-CPU/token SMP model.
-  Future polish is diagnostic/telemetry work rather than a missing scheduler
-  architecture item.
-
-## Regression / Stabilization after Medium Term #8/#10 — CLOSED ✅
-
-A post-landing audit of Medium Term #8/#10 found 16 stabilization items around
-scheduler stealing, Job/quota capabilities, deferred notifications, VMAR rollback
-accounting, and diagnostics. The fixes are intentionally tracked as a separate
-regression section instead of downgrading the Medium Term milestones: #8 and #10
-remain feature-complete for their approved architecture, while this section
-records the hardening pass that made the landing production-safe.
-
-Closed items:
-
-- token stealing no longer runs from the hard LAPIC timer path;
-- reschedule IPIs use a dedicated non-timer vector;
-- late runqueue token grants are canceled/released safely;
-- quota exhaustion packets are deferred out of charge/scheduler critical paths;
-- default Job handles are non-mutating; mutable Job control requires explicit
-  delegated capability rights;
-- unpublished child Job quota nodes roll back;
-- failed child-VMAR reservations have refcount regression coverage;
-- bound Port references are accounted with registry kernel refs;
-- exit packets are queued outside binding-list locks;
-- waitset boot self-test has per-step markers;
-- Job limit tightening below current usage is rejected;
-- Job diagnostic naming is append-only via `JobSetName`;
-- token stealing is gated on an opt-in process count;
-- lock-policy CI guards the scheduler stealer against lower-rank process calls;
-- external incident audit files are documented as non-versioned unless copied
-  into `docs/` intentionally.
-
-## Long Term
-
-- KASLR, SMAP/SMEP, other hardening.
-- Self-hosting toolchain.
+---
 
 ## Explicitly Out of Scope for the Original MVP
 
-These were deliberately excluded to keep the first MVP's surface area
-achievable — several are now partially landed (SMP, BOOTFS, FAT lib):
+Tracked for historical context from the initial MVP boundary:
 
-- ~~SMP / IOAPIC routing~~ → SMP core and the generic IOAPIC route manager are implemented; QEMU/physical validation of device delivery and level ACK remains open
-- Any filesystem on real block devices
-- Networking
-- Full process teardown / wait
+- ~~SMP / IOAPIC routing~~ → SMP core and generic IOAPIC route manager landed;
+  userspace raw-GSI validation and ACPI `_PRT` integration continue under
+  PCI/ACPI AP-18+.
+- ~~Any filesystem on real block devices~~ → `driver-host-nvme` + HxFS v7
+  foundation landed; storage production gate closure tracked in §2 above.
+- Networking → tracked in §3 above.
+- ~~Full process teardown / wait~~ → closed under Immediate #3/#4 and
+  Short-Term #5.
