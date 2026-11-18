@@ -249,11 +249,18 @@ pub unsafe fn kmain(boot_info: BootInfo) -> ! {
         None
     };
 
-    let acpi_system_io = if uacpi_tables_ready {
-        match boot::acpi_policy::fadt_system_io_grants() {
-            Ok(grants) => {
+    let acpi_snapshot_id = acpi_archive
+        .as_deref()
+        .and_then(|bytes| bytes.get(..huesos_abi::acpi_archive::HEADER_BYTES))
+        .and_then(|hdr| huesos_abi::acpi_archive::decode_v2_header(hdr).ok())
+        .map(|header| header.firmware_snapshot_id)
+        .unwrap_or(0);
+
+    let (acpi_system_io, acpi_mmio) = if uacpi_tables_ready && acpi_snapshot_id != 0 {
+        match boot::acpi_policy::derive_broker_policy(acpi_snapshot_id, boot_info.memory_regions) {
+            Ok((io_grants, mmio_grants)) => {
                 dbg("[uACPI] derived bounded FADT SystemIO policy\n");
-                grants
+                (io_grants, mmio_grants)
             }
             Err(error) => {
                 use core::fmt::Write;
@@ -262,11 +269,11 @@ pub unsafe fn kmain(boot_info: BootInfo) -> ! {
                     writer,
                     "[uACPI] FADT SystemIO policy unavailable: {error:?}; broker denies all"
                 );
-                alloc::vec::Vec::new()
+                (alloc::vec::Vec::new(), alloc::vec::Vec::new())
             }
         }
     } else {
-        alloc::vec::Vec::new()
+        (alloc::vec::Vec::new(), alloc::vec::Vec::new())
     };
 
     let panic_test_requested = cmdline_requests_panic_test(&verified_hbi);
@@ -372,7 +379,9 @@ pub unsafe fn kmain(boot_info: BootInfo) -> ! {
     spawn_init_process(
         bootfs_image,
         acpi_archive.as_deref(),
+        acpi_snapshot_id,
         acpi_system_io,
+        acpi_mmio,
         storage_boot_info.as_slice(),
         cmdline_image,
     );
@@ -408,7 +417,9 @@ fn log_boot_banner(boot_info: &BootInfo) {
 fn spawn_init_process(
     bootfs_image: Option<&[u8]>,
     acpi_archive: Option<&[u8]>,
+    acpi_snapshot_id: u64,
     acpi_system_io: alloc::vec::Vec<huesos_object::SystemIoGrant>,
+    acpi_mmio: alloc::vec::Vec<huesos_object::MmioGrant>,
     storage_boot_info: &[u8],
     cmdline_image: Option<&[u8]>,
 ) {
@@ -445,7 +456,12 @@ fn spawn_init_process(
             bytes,
         ) {
             dbg("[init] installed immutable ACPI table archive VMO\n");
-            if install_acpi_broker(&spawned.process, acpi_system_io) {
+            if install_acpi_broker(
+                &spawned.process,
+                acpi_snapshot_id,
+                acpi_system_io,
+                acpi_mmio,
+            ) {
                 dbg("[init] installed deny-by-default ACPI broker capability\n");
             } else {
                 dbg("[init] failed to install ACPI broker capability\n");
@@ -689,7 +705,9 @@ fn install_immutable_vmo(
 
 fn install_acpi_broker(
     process: &huesos_object::Process,
+    snapshot_id: u64,
     system_io: alloc::vec::Vec<huesos_object::SystemIoGrant>,
+    mmio: alloc::vec::Vec<huesos_object::MmioGrant>,
 ) -> bool {
     use huesos_object::{Handle, KernelObject, Rights};
 
@@ -697,7 +715,7 @@ fn install_acpi_broker(
     // authorize PCI configuration opcodes. Configuration access flows
     // through the dedicated mediated channel to PCI Manager.
     let broker =
-        huesos_object::AcpiBroker::with_policy(system_io, alloc::vec::Vec::new(), false, false);
+        huesos_object::AcpiBroker::with_snapshot_policy(snapshot_id, system_io, mmio, false, false);
     let koid = broker.koid();
     huesos_object::register_object(broker);
     let rights = Rights::READ | Rights::WRITE | Rights::DUPLICATE | Rights::TRANSFER;

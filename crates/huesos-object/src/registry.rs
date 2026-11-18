@@ -273,6 +273,29 @@ pub(crate) fn try_register_resource_locked(candidate: Arc<Resource>) -> Result<(
     Ok(())
 }
 
+/// Return `true` if `[base, base + len)` intersects any live [`Resource`] of
+/// `kind` (or `DmaPool` when `kind == ResourceKind::Mmio`) in `REGISTRY`.
+pub fn has_resource_conflict(kind: crate::ResourceKind, base: u64, len: u64) -> bool {
+    if len == 0 {
+        return true;
+    }
+    let state = REGISTRY.lock();
+    for existing in state.objects.values() {
+        if existing.object_type() != crate::ObjectType::Resource {
+            continue;
+        }
+        let Some(other) = existing.downcast_ref::<Resource>() else {
+            continue;
+        };
+        let relevant = other.kind() == kind
+            || (kind == crate::ResourceKind::Mmio && other.kind() == crate::ResourceKind::DmaPool);
+        if relevant && other.intersects(base, len) {
+            return true;
+        }
+    }
+    false
+}
+
 /// Register an interrupt for both object lookup and IRQ fanout.
 pub fn register_interrupt(interrupt: Arc<Interrupt>) {
     {

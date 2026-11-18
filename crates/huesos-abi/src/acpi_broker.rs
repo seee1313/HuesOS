@@ -154,22 +154,41 @@ impl Request {
             return Err(ValidationError::Reserved);
         }
         if opcode.uses_width() {
-            if !(self.width == 1 || self.width == 2 || self.width == MAX_ACCESS_WIDTH) {
+            let valid_width = match opcode {
+                Opcode::MmioRead | Opcode::MmioWrite => {
+                    matches!(self.width, 1 | 2 | 4 | 8)
+                }
+                _ => matches!(self.width, 1 | 2 | 4),
+            };
+            if !valid_width {
                 return Err(ValidationError::Width);
             }
             if self.address & (self.width as u64 - 1) != 0 {
                 return Err(ValidationError::Alignment);
             }
-            let max_value = if self.width == 4 {
-                u32::MAX as u64
+            let Some(end) = self.address.checked_add(u64::from(self.width)) else {
+                return Err(ValidationError::Alignment);
+            };
+            if matches!(opcode, Opcode::SystemIoRead | Opcode::SystemIoWrite) && end > 0x1_0000 {
+                return Err(ValidationError::Alignment);
+            }
+            let max_value = if self.width == 8 {
+                u64::MAX
             } else {
                 (1u64 << (self.width as u32 * 8)) - 1
             };
-            if matches!(opcode, Opcode::SystemIoWrite | Opcode::PciWrite) && self.value > max_value
+            if matches!(
+                opcode,
+                Opcode::SystemIoWrite | Opcode::MmioWrite | Opcode::PciWrite
+            ) && self.value > max_value
             {
                 return Err(ValidationError::Value);
             }
-            if matches!(opcode, Opcode::SystemIoRead | Opcode::PciRead) && self.value != 0 {
+            if matches!(
+                opcode,
+                Opcode::SystemIoRead | Opcode::MmioRead | Opcode::PciRead
+            ) && self.value != 0
+            {
                 return Err(ValidationError::Value);
             }
         } else if self.width != 0 || self.value != 0 {
