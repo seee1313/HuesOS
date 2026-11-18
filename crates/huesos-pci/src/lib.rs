@@ -20,6 +20,9 @@ use alloc::vec::Vec;
 /// Bounded conventional and PCIe extended capability-list decoding.
 #[cfg(feature = "alloc")]
 pub mod capability;
+/// Diagnostic read-only PCI bus inventory and availability state (AP-16).
+#[cfg(feature = "alloc")]
+pub mod inventory;
 /// Generation-safe DeviceLease lifecycle policy.
 pub mod lease;
 /// ACPI MCFG allocation-table decoding and validation.
