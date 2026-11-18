@@ -423,6 +423,7 @@ fn log_boot_banner(boot_info: &BootInfo) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn spawn_init_process(
     bootfs_image: Option<&[u8]>,
     acpi_archive: Option<&[u8]>,
