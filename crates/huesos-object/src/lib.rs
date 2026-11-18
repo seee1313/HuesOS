@@ -11,6 +11,7 @@ extern crate alloc;
 
 mod acpi_broker;
 mod channel;
+mod device_lease;
 mod handle;
 mod interrupt;
 mod irq_guard;
@@ -42,6 +43,9 @@ pub use acpi_broker::{AcpiBroker, MmioGrant, SystemIoGrant};
 pub use channel::{
     Channel, ChannelCreateError, ChannelMessage, ChannelRecvError, ChannelSendError,
     ChannelSendFailure, CHANNEL_INLINE_BYTES, CHANNEL_INLINE_HANDLES,
+};
+pub use device_lease::{
+    DeviceLease, DeviceLeaseError, DeviceLeaseSnapshot, DeviceLeaseState, PORT_PACKET_DEVICE_GONE,
 };
 pub use handle::{Handle, HandleTable, HandleTableError, HandleValue, Rights, INVALID_HANDLE};
 pub use interrupt::{

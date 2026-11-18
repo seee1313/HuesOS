@@ -118,6 +118,9 @@ fn validate_irq_resource(resource_handle: HandleValue, irq_or_gsi: u32) -> Resul
     let resource = object
         .downcast_ref::<Resource>()
         .ok_or(ErrorCode::WrongType)?;
+    if !resource.is_lease_active() {
+        return Err(ErrorCode::AccessDenied);
+    }
     if !resource.contains(ResourceKind::Irq, u64::from(irq_or_gsi), 1) {
         return Err(ErrorCode::AccessDenied);
     }

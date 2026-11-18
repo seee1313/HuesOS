@@ -91,6 +91,10 @@ record!(huesos_abi::ResourceMapArgs, 40, 8, resource => 0, resource_offset => 8,
 record!(huesos_abi::ResourceUnmapArgs, 24, 8, resource => 0, addr => 8, len => 16);
 record!(huesos_abi::acpi_broker::Request, 40, 8, version => 0, opcode => 2, width => 4, reserved => 5, request_id => 8, address => 16, value => 24, argument => 32);
 record!(huesos_abi::acpi_broker::Response, 24, 8, version => 0, reserved => 2, status => 4, request_id => 8, value => 16);
+record!(huesos_abi::pci_lease::DeviceLeaseCreateArgs, 32, 8, authority => 0, flags => 4, device_id => 8, firmware_snapshot_id => 16, pci_address_packed => 24);
+record!(huesos_abi::pci_lease::DeviceLeaseMintResourceArgs, 40, 8, lease => 0, kind => 4, expected_generation => 8, base => 16, len => 24, exclusive => 32, reserved => 36);
+record!(huesos_abi::pci_lease::DeviceLeaseBindPortArgs, 24, 8, lease => 0, port => 4, key => 8, flags => 16, reserved => 20);
+record!(huesos_abi::pci_lease::DeviceLeaseInfo, 40, 8, device_id => 0, generation => 8, firmware_snapshot_id => 16, pci_address_packed => 24, state => 32, revoked => 36);
 
 #[cfg(test)]
 mod tests {

@@ -43,6 +43,7 @@ use alloc::vec::Vec;
 use core::panic::PanicInfo;
 use huesos_abi::hmcf;
 use huesos_abi::pci::{self as abi_pci, ApertureKind, RootBridgeTable};
+use huesos_abi::pci_lease::pack_pci_address;
 use huesos_abi::pci_manager::{self, Message, Opcode, Status, MESSAGE_BYTES};
 use huesos_abi::pci_mediation::{
     self, Opcode as MediationOpcode, Request, Response, Status as MediationStatus, ValidRequest,
@@ -64,7 +65,7 @@ use huesos_pci::write_policy::{
     COMMAND_WRITABLE_MASK, OFFSET_COMMAND,
 };
 use huesos_pci::{ConfigWidth, PciAddress, CONVENTIONAL_CONFIG_BYTES, ENHANCED_CONFIG_BYTES};
-use libcanvas::{println, wait_any, Channel, ErrorCode, Handle, Signals, Vmo, WaitItem};
+use libcanvas::{println, wait_any, Channel, ErrorCode, Handle, Port, Signals, Vmo, WaitItem};
 
 #[cfg(feature = "force-legacy")]
 use libcanvas::resource::IoPort;
@@ -102,7 +103,7 @@ pub extern "C" fn _start() -> ! {
     let mut authority = ConfigAuthority::default();
     let mut yields = 0u32;
     loop {
-        let mut bytes = [0u8; MESSAGE_BYTES];
+        let mut bytes = [0u8; 64];
         match bootstrap.read_optional_handle(&mut bytes) {
             Ok((length, handle)) => {
                 if !handle_authority_message(
@@ -158,6 +159,12 @@ struct ConfigAuthority {
     live_validation: Option<ValidationReport>,
     /// Firmware-preserving resource plan (Stage F.2 / AP-19).
     resource_plan: Option<ResourcePlan>,
+    /// Kernel `DeviceLeaseAuthority` capability (AP-20).
+    device_lease_authority: Option<Handle>,
+    /// Active kernel `DeviceLease` handles per discovered PCI function (AP-20).
+    leases: Vec<ActiveDeviceLease>,
+    /// Whether the Stage G.3 `DeviceGone` self-check ran for this generation.
+    gone_probe_done: bool,
     #[cfg_attr(feature = "force-legacy", allow(dead_code))]
     rw_ecam: [Option<Handle>; hmcf::MAX_RECORDS as usize],
     #[cfg_attr(feature = "force-legacy", allow(dead_code))]
@@ -171,6 +178,15 @@ struct ConfigAuthority {
     /// ignored rather than double-reported.
     verdict_sent: bool,
     authorized: bool,
+}
+
+/// Retained kernel `DeviceLease` for one discovered PCI function (AP-20).
+#[allow(dead_code)]
+struct ActiveDeviceLease {
+    address: PciAddress,
+    device_id: u64,
+    generation: u64,
+    handle: Handle,
 }
 
 /// One retained, mapped configuration window.
@@ -204,6 +220,9 @@ impl Default for ConfigAuthority {
             inventory: InventoryManager::new(),
             live_validation: None,
             resource_plan: None,
+            device_lease_authority: None,
+            leases: Vec::new(),
+            gone_probe_done: false,
             rw_ecam: [const { None }; hmcf::MAX_RECORDS as usize],
             rw_ecam_count: 0,
             writable: false,
@@ -244,6 +263,16 @@ fn handle_authority_message(
                 if !authority.writable && authority.rw_ecam_count < authority.rw_ecam.len() {
                     authority.rw_ecam[authority.rw_ecam_count] = Some(handle);
                     authority.rw_ecam_count += 1;
+                } else {
+                    drop(handle);
+                }
+            } else if bytes == pci_manager::DEVICE_LEASE_AUTHORITY_LABEL {
+                if authority.device_lease_authority.is_none() {
+                    authority.device_lease_authority = Some(handle);
+                    println!("[pci-manager] received DeviceLeaseAuthority");
+                    if authority.resource_plan.is_some() && authority.leases.is_empty() {
+                        establish_device_leases(authority);
+                    }
                 } else {
                     drop(handle);
                 }
@@ -1300,6 +1329,128 @@ fn run_live_bar_inventory_and_planner(authority: &mut ConfigAuthority) {
     );
     authority.live_validation = Some(live.validation);
     authority.resource_plan = Some(plan);
+    establish_device_leases(authority);
+}
+
+fn establish_device_leases(authority: &mut ConfigAuthority) {
+    let Some(lease_auth) = authority.device_lease_authority.as_ref() else {
+        return;
+    };
+    let Some(inv) = authority.inventory.last_good() else {
+        return;
+    };
+    let snapshot_id = authority.firmware_snapshot_id;
+    if snapshot_id == 0 {
+        return;
+    }
+
+    if !authority.gone_probe_done {
+        authority.gone_probe_done = true;
+        run_device_gone_self_check(lease_auth, snapshot_id);
+    }
+
+    if !authority.leases.is_empty() {
+        return;
+    }
+
+    for node in inv.snapshot.nodes() {
+        let addr = node.function.address;
+        let Some(packed) =
+            pack_pci_address(addr.segment(), addr.bus(), addr.device(), addr.function())
+        else {
+            continue;
+        };
+        let device_id = packed | (1u64 << 32);
+        let Ok(handle) =
+            libcanvas::device_lease::create(lease_auth, device_id, snapshot_id, packed)
+        else {
+            println!(
+                "[pci-manager] obs g2-lease bdf={:02x}:{:02x}.{} status=create-failed",
+                addr.bus(),
+                addr.device(),
+                addr.function()
+            );
+            continue;
+        };
+        let Ok(info) = libcanvas::device_lease::query(&handle) else {
+            println!(
+                "[pci-manager] obs g2-lease bdf={:02x}:{:02x}.{} status=query-failed",
+                addr.bus(),
+                addr.device(),
+                addr.function()
+            );
+            continue;
+        };
+        println!(
+            "[pci-manager] obs g2-lease bdf={:02x}:{:02x}.{} device_id=0x{:x} gen={} snapshot=0x{:016x} status=ok",
+            addr.bus(),
+            addr.device(),
+            addr.function(),
+            info.device_id,
+            info.generation,
+            info.firmware_snapshot_id
+        );
+        authority.leases.push(ActiveDeviceLease {
+            address: addr,
+            device_id: info.device_id,
+            generation: info.generation,
+            handle,
+        });
+    }
+}
+
+fn run_device_gone_self_check(lease_auth: &Handle, snapshot_id: u64) {
+    let probe_device_id = u64::MAX;
+    let Some(packed) = pack_pci_address(0, 0xff, 0x1f, 0x07) else {
+        return;
+    };
+    let Ok(probe_lease) =
+        libcanvas::device_lease::create(lease_auth, probe_device_id, snapshot_id, packed)
+    else {
+        println!("[pci-manager] obs g3-gone probe=create-failed");
+        return;
+    };
+    let Ok(port) = Port::create() else {
+        println!("[pci-manager] obs g3-gone probe=port-failed");
+        return;
+    };
+    if libcanvas::device_lease::bind_gone_port(&probe_lease, &port, 0xA920).is_err() {
+        println!("[pci-manager] obs g3-gone probe=bind-failed");
+        return;
+    }
+    if libcanvas::device_lease::revoke(&probe_lease, 1, 0).is_err() {
+        println!("[pci-manager] obs g3-gone probe=revoke-failed");
+        return;
+    }
+    let Ok(packet) = port.read() else {
+        println!("[pci-manager] obs g3-gone probe=missing-packet");
+        return;
+    };
+    let post_revoke = libcanvas::device_lease::mint_resource(
+        &probe_lease,
+        huesos_abi::ResourceKindAbi::Mmio,
+        1,
+        0xFEE0_0000,
+        0x1000,
+        true,
+    );
+    let post_revoke_ok = matches!(post_revoke, Err(ErrorCode::AccessDenied));
+    let packet_ok = packet.key == 0xA920
+        && packet.packet_type == libcanvas::PORT_PACKET_DEVICE_GONE
+        && packet.data[0] == probe_device_id
+        && packet.data[1] == 1
+        && packet.data[2] == snapshot_id;
+    println!(
+        "[pci-manager] obs g3-gone probe={} pkt_type={} dev_id=0x{:x} post_revoke_denied={}",
+        if packet_ok && post_revoke_ok {
+            "ok"
+        } else {
+            "failed"
+        },
+        packet.packet_type,
+        packet.data[0],
+        post_revoke_ok
+    );
 }
 
 fn read_vmo_exact(vmo: &Vmo, offset: u64, buf: &mut [u8]) -> bool {

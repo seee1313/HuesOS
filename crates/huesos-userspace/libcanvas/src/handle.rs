@@ -71,6 +71,16 @@ impl Handle {
         Self::take_fixed_init_handle(huesos_abi::INIT_CONFIG_MINT_HANDLE)
     }
 
+    /// Take ownership of the unique `DeviceLeaseAuthority` capability installed
+    /// only in the initial process by the kernel (AP-20).
+    pub fn take_init_device_lease_authority() -> Self {
+        Self::take_fixed_init_handle(huesos_abi::INIT_DEVICE_LEASE_AUTH_HANDLE)
+    }
+
+    pub(crate) fn from_syscall_out(raw: HandleValue) -> Self {
+        Self::take_fixed_init_handle(raw)
+    }
+
     /// Wrap a batch of raw handle values installed in this process's
     /// table by one syscall into owned RAII handles. Used by the
     /// `PciConfigMint` wrapper: the mint installs exactly one owned

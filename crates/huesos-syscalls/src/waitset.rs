@@ -173,6 +173,12 @@ fn update_waitset_signals(
             }
         }
 
+        if let Some(lease) = obj.downcast_ref::<huesos_object::DeviceLease>() {
+            if lease.is_revoked() {
+                active = active.union(Signals::SIGNALED).union(Signals::PEER_CLOSED);
+            }
+        }
+
         waitset.set_active(item.key, active);
     }
     Ok(0)
@@ -188,6 +194,8 @@ fn enqueue_waiters(objects: &[Arc<dyn huesos_object::KernelObject>], task: hueso
             process.exit_waiters.enqueue(task);
         } else if let Some(signal) = obj.downcast_ref::<huesos_object::Signal>() {
             signal.wait_queue().enqueue(task);
+        } else if let Some(lease) = obj.downcast_ref::<huesos_object::DeviceLease>() {
+            lease.wait_queue().enqueue(task);
         }
     }
 }
@@ -202,6 +210,8 @@ fn remove_waiters(objects: &[Arc<dyn huesos_object::KernelObject>], task: huesos
             process.exit_waiters.remove(task);
         } else if let Some(signal) = obj.downcast_ref::<huesos_object::Signal>() {
             signal.wait_queue().remove(task);
+        } else if let Some(lease) = obj.downcast_ref::<huesos_object::DeviceLease>() {
+            lease.wait_queue().remove(task);
         }
     }
 }

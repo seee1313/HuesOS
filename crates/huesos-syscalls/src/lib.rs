@@ -17,6 +17,7 @@ mod callbacks;
 mod channel;
 pub mod config_mint;
 mod debug;
+mod device_lease;
 mod entropy;
 mod framebuffer;
 mod handle;
@@ -222,5 +223,23 @@ pub fn dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> Syscal
             process::sys_process_create_in_job(a1 as *const ProcessCreateInJobArgs)
         }
         S::JobSetName => job::sys_job_set_name(a1 as *const JobSetNameArgs),
+        S::DeviceLeaseCreate => device_lease::sys_device_lease_create(
+            a1 as *const huesos_abi::pci_lease::DeviceLeaseCreateArgs,
+            a2 as *mut HandleValue,
+        ),
+        S::DeviceLeaseMintResource => device_lease::sys_device_lease_mint_resource(
+            a1 as *const huesos_abi::pci_lease::DeviceLeaseMintResourceArgs,
+            a2 as *mut HandleValue,
+        ),
+        S::DeviceLeaseRevoke => {
+            device_lease::sys_device_lease_revoke(a1 as HandleValue, a2, a3 as u32)
+        }
+        S::DeviceLeaseBindGonePort => device_lease::sys_device_lease_bind_gone_port(
+            a1 as *const huesos_abi::pci_lease::DeviceLeaseBindPortArgs,
+        ),
+        S::DeviceLeaseQuery => device_lease::sys_device_lease_query(
+            a1 as HandleValue,
+            a2 as *mut huesos_abi::pci_lease::DeviceLeaseInfo,
+        ),
     }
 }
