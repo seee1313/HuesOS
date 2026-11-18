@@ -251,7 +251,8 @@ pub unsafe fn kmain(boot_info: BootInfo) -> ! {
 
     let acpi_snapshot_id = acpi_archive
         .as_deref()
-        .and_then(|bytes| huesos_abi::acpi_archive::decode_v2_header(bytes).ok())
+        .and_then(|bytes| bytes.get(..huesos_abi::acpi_archive::HEADER_BYTES))
+        .and_then(|hdr| huesos_abi::acpi_archive::decode_v2_header(hdr).ok())
         .map(|header| header.firmware_snapshot_id)
         .unwrap_or(0);
 
