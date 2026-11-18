@@ -4,7 +4,10 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::any::Any;
 use huesos_abi::acpi_broker::{Opcode, ValidRequest};
+use huesos_abi::acpi_region_policy::WriteClass;
+use huesos_abi::broker_policy::{AuditLog, AuditOutcome, RateLimiter};
 
+use crate::irq_guard::IrqSafeMutex;
 use crate::{alloc_koid, KernelObject, Koid, ObjectType};
 
 /// Exact SystemIO range granted to one ACPI manager instance.
@@ -18,6 +21,10 @@ pub struct SystemIoGrant {
     pub read: bool,
     /// Write operations are permitted.
     pub write: bool,
+    /// Write class when `write` is true.
+    pub write_class: Option<WriteClass>,
+    /// Allowed write bitmask when `write` is true.
+    pub write_mask: u64,
 }
 
 /// One firmware MMIO range granted to the ACPI manager.
@@ -31,31 +38,43 @@ pub struct MmioGrant {
     pub read: bool,
     /// Writes are permitted.
     pub write: bool,
+    /// Write class when `write` is true.
+    pub write_class: Option<WriteClass>,
+    /// Allowed write bitmask when `write` is true.
+    pub write_mask: u64,
 }
 
 /// Immutable authority consulted before privileged ACPI broker operations.
 pub struct AcpiBroker {
     koid: Koid,
+    firmware_snapshot_id: u64,
     system_io: Vec<SystemIoGrant>,
     mmio: Vec<MmioGrant>,
     allow_reset: bool,
     allow_power_off: bool,
+    rate_limiter: IrqSafeMutex<RateLimiter>,
+    audit_log: IrqSafeMutex<AuditLog<64>>,
 }
 
 impl AcpiBroker {
     /// Construct a broker with no privileged grants.
     pub fn deny_all() -> Arc<Self> {
-        Self::with_policy(Vec::new(), Vec::new(), false, false)
+        Self::with_snapshot_policy(0, Vec::new(), Vec::new(), false, false)
     }
 
     /// Construct an immutable broker policy from firmware-derived grants.
-    /// Callers must pass only resources parsed from validated uACPI tables.
-    ///
-    /// PCI configuration access is deliberately absent: the legacy broker
-    /// opcodes remain decodable in [`huesos_abi::acpi_broker`] but can
-    /// never be authorized (AP-10). The only path to configuration space
-    /// is the dedicated mediated channel to the supervised PCI Manager.
     pub fn with_policy(
+        system_io: Vec<SystemIoGrant>,
+        mmio: Vec<MmioGrant>,
+        allow_reset: bool,
+        allow_power_off: bool,
+    ) -> Arc<Self> {
+        Self::with_snapshot_policy(0, system_io, mmio, allow_reset, allow_power_off)
+    }
+
+    /// Construct a snapshot-bound immutable broker policy from firmware-derived grants.
+    pub fn with_snapshot_policy(
+        firmware_snapshot_id: u64,
         system_io: Vec<SystemIoGrant>,
         mmio: Vec<MmioGrant>,
         allow_reset: bool,
@@ -63,15 +82,42 @@ impl AcpiBroker {
     ) -> Arc<Self> {
         Arc::new(Self {
             koid: alloc_koid(),
+            firmware_snapshot_id,
             system_io,
             mmio,
             allow_reset,
             allow_power_off,
+            rate_limiter: IrqSafeMutex::new(RateLimiter::new(100_000, 4096)),
+            audit_log: IrqSafeMutex::new(AuditLog::new()),
         })
+    }
+
+    /// Snapshot identity bound to this broker policy.
+    pub fn firmware_snapshot_id(&self) -> u64 {
+        self.firmware_snapshot_id
+    }
+
+    /// Record an authorization decision in the bounded audit log.
+    pub fn record_audit(&self, opcode: u8, outcome: AuditOutcome, argument: u64) {
+        self.audit_log.lock().record(opcode, outcome, argument);
+    }
+
+    /// Enforce per-window rate limit for broker operations.
+    pub fn check_rate_limit(&self, tick: u64) -> bool {
+        self.rate_limiter.lock().try_acquire(tick)
     }
 
     /// Test both operation type and immutable resource allowlist.
     pub fn authorizes(&self, request: &ValidRequest) -> bool {
+        if self.firmware_snapshot_id != 0
+            && matches!(
+                request.opcode,
+                Opcode::SystemIoRead | Opcode::SystemIoWrite | Opcode::MmioRead | Opcode::MmioWrite
+            )
+            && request.argument != self.firmware_snapshot_id
+        {
+            return false;
+        }
         match request.opcode {
             Opcode::SystemIoRead | Opcode::SystemIoWrite => self.authorizes_system_io(request),
             // AP-10: PCI configuration opcodes are never authorizable,
@@ -98,7 +144,12 @@ impl AcpiBroker {
             };
             let operation_allowed = match request.opcode {
                 Opcode::SystemIoRead => grant.read,
-                Opcode::SystemIoWrite => grant.write,
+                Opcode::SystemIoWrite => {
+                    grant.write
+                        && grant.write_class.is_some()
+                        && grant.write_mask != 0
+                        && (request.value & !grant.write_mask) == 0
+                }
                 _ => false,
             };
             operation_allowed && port >= grant.base && end <= grant_end
@@ -116,7 +167,12 @@ impl AcpiBroker {
             };
             let operation_allowed = match request.opcode {
                 Opcode::MmioRead => grant.read,
-                Opcode::MmioWrite => grant.write,
+                Opcode::MmioWrite => {
+                    grant.write
+                        && grant.write_class.is_some()
+                        && grant.write_mask != 0
+                        && (request.value & !grant.write_mask) == 0
+                }
                 _ => false,
             };
             operation_allowed && start >= grant.base && end <= grant_end
@@ -166,6 +222,8 @@ mod tests {
                 length: 4,
                 read: true,
                 write: false,
+                write_class: None,
+                write_mask: 0,
             }],
             Vec::new(),
             false,
@@ -204,6 +262,8 @@ mod tests {
                 length: 0x1000,
                 read: true,
                 write: false,
+                write_class: None,
+                write_mask: 0,
             }],
             false,
             false,

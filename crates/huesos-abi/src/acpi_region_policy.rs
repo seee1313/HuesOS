@@ -47,6 +47,17 @@ impl Range {
     }
 }
 
+/// Named write class for Gate B write authorization.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WriteClass {
+    /// Fixed FADT power-management / GPE register block.
+    FadtPm,
+    /// Boot memory-map `ACPI_NVS` region.
+    AcpiNvs,
+    /// Explicit static board-specific write policy.
+    BoardSpecific,
+}
+
 /// Independently derived, snapshot-bound authority. Board-specific writes
 /// additionally require class/mask enforcement outside this simple model;
 /// this type must not be used on its own to grant such writes.
@@ -62,6 +73,17 @@ pub struct Grant {
     pub write: bool,
     /// Identity of the firmware snapshot from which the grant was derived.
     pub snapshot_id: u64,
+}
+
+/// Extended Gate B grant carrying an explicit write class and bitmask.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PolicyGrant {
+    /// Base range, direction, and snapshot binding.
+    pub base: Grant,
+    /// Named write class when `base.write` is true.
+    pub write_class: Option<WriteClass>,
+    /// Allowed write bits (must be non-zero when `base.write` is true).
+    pub write_mask: u64,
 }
 
 /// An independently identified forbidden range.
@@ -146,6 +168,29 @@ pub fn authorizes(
         Direction::Read => grant.read,
         Direction::Write => grant.write,
     }
+}
+
+/// Authorize an exact access against a [`PolicyGrant`], enforcing write class
+/// and non-zero `write_mask` on writes.
+pub fn authorizes_policy(
+    grant: PolicyGrant,
+    deny: &[DenyRange],
+    deny_set_complete: bool,
+    access: Access,
+    write_value: u64,
+) -> bool {
+    if !authorizes(grant.base, deny, deny_set_complete, access) {
+        return false;
+    }
+    if access.direction == Direction::Write {
+        if grant.write_class.is_none() || grant.write_mask == 0 {
+            return false;
+        }
+        if (write_value & !grant.write_mask) != 0 {
+            return false;
+        }
+    }
+    true
 }
 
 #[cfg(test)]

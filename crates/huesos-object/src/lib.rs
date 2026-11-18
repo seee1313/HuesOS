@@ -38,7 +38,7 @@ pub mod knobs;
 /// `SystemObservationRead`.
 pub mod observation;
 
-pub use acpi_broker::{AcpiBroker, SystemIoGrant};
+pub use acpi_broker::{AcpiBroker, MmioGrant, SystemIoGrant};
 pub use channel::{
     Channel, ChannelCreateError, ChannelMessage, ChannelRecvError, ChannelSendError,
     ChannelSendFailure, CHANNEL_INLINE_BYTES, CHANNEL_INLINE_HANDLES,
@@ -56,10 +56,11 @@ pub use port::{Port, PortCreateError, PortPacket, PortQueueError};
 pub use process::{steal_opt_in_process_count, Process, ProcessExitPortError};
 pub(crate) use registry::phys_to_virt;
 pub use registry::{
-    acquire_kernel_ref, collect_exited_process, current_process, lookup_interrupts_by_irq,
-    lookup_object, lookup_process, note_handle_close, note_handle_open, note_kernel_ref_close,
-    note_kernel_ref_open, object_ref_counts, register_interrupt, register_object, register_process,
-    root_job, set_cpu_id_callback, set_current_process, set_phys_to_virt, unregister_object,
+    acquire_kernel_ref, collect_exited_process, current_process, has_resource_conflict,
+    lookup_interrupts_by_irq, lookup_object, lookup_process, note_handle_close, note_handle_open,
+    note_kernel_ref_close, note_kernel_ref_open, object_ref_counts, register_interrupt,
+    register_object, register_process, root_job, set_cpu_id_callback, set_current_process,
+    set_phys_to_virt, unregister_object,
 };
 pub use resource::{Resource, ResourceError, ResourceKind};
 pub use signal::Signal;
