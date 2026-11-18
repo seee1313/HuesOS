@@ -1,6 +1,6 @@
 //! Isolated userspace AML namespace load (AP-13) and initialization (AP-14).
 
-use huesos_abi::acpi_manager::{INIT_DETAIL_AML_ERROR, INIT_DETAIL_PIC_FAILED};
+use huesos_abi::acpi_manager::{detail_blocks_hpci, INIT_DETAIL_AML_ERROR, INIT_DETAIL_PIC_FAILED};
 
 /// Bounded AML loop-iteration timeout (seconds) enforced by uACPI.
 pub const AML_LOOP_TIMEOUT_SECS: u32 = 5;
@@ -121,12 +121,13 @@ pub fn initialize_namespace(snapshot_id: u64) -> Result<NamespaceInitStatus, Nam
     let degraded = detail_flags != 0
         || crate::broker::had_degraded_opregion()
         || crate::broker::had_logged_aml_error();
+    let hpci_eligible = !detail_blocks_hpci(detail_flags);
 
     Ok(NamespaceInitStatus {
         snapshot_id,
         initialized: true,
         degraded,
-        hpci_eligible: !degraded,
+        hpci_eligible,
         detail_flags,
         pic_status,
         init_status,

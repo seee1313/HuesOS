@@ -211,6 +211,9 @@ pub struct DriverManager {
     /// dropped on every manager restart so a stale generation can
     /// never be mistaken for the current one.
     hmcf: Option<Vmo>,
+    /// Validated `HPCI` root-bridge table received from the current
+    /// ACPI manager generation after bounded namespace initialization.
+    hpci: Option<Vmo>,
     /// Unique `PciConfigMint` authority delegated by `init` (AP-8/9).
     /// DriverManager is the only process besides `init` that holds it.
     /// Never duplicated, never re-transferred; used only to mint
@@ -222,6 +225,9 @@ pub struct DriverManager {
     /// Whether the current PCI Manager generation reported
     /// [`pci_manager::Status::ConfigAuthorityReady`].
     pci_config_authority_ready: bool,
+    /// Whether the current PCI Manager generation already received the
+    /// `HPCI` root-bridge table for this boot/generation pair.
+    pci_roots_handed_off: bool,
     /// Whether the private ACPI ↔ PCI mediation channel pair was
     /// established for the current (PCI, ACPI) generation combination.
     config_mediation_established: bool,
@@ -387,9 +393,11 @@ impl DriverManager {
             acpi_tables: None,
             acpi_broker: None,
             hmcf: None,
+            hpci: None,
             config_mint: None,
             config_authority_handed_off: false,
             pci_config_authority_ready: false,
+            pci_roots_handed_off: false,
             config_mediation_established: false,
             acpi_authority_settled: false,
             registry_channel: None,
@@ -1108,6 +1116,7 @@ impl DriverManager {
         self.pci_manager = None;
         self.pci_manager_ready = false;
         self.pci_config_authority_ready = false;
+        self.pci_roots_handed_off = false;
         self.config_mediation_established = false;
         let now = libcanvas::system::monotonic_ticks().unwrap_or(0);
         if !self.pci_manager_restart.record_failure(
@@ -1284,6 +1293,12 @@ impl DriverManager {
         if self.hmcf.take().is_some() {
             println!(
                 "[driver-manager] dropped stale HMCF from generation {}",
+                self.acpi_manager_generation
+            );
+        }
+        if self.hpci.take().is_some() {
+            println!(
+                "[driver-manager] dropped stale HPCI from generation {}",
                 self.acpi_manager_generation
             );
         }
@@ -2293,15 +2308,29 @@ impl DriverManager {
                             );
                         }
                     }
+                    (pci_manager::Opcode::RootTableAccepted, pci_manager::Status::Ok) => {
+                        println!(
+                            "[driver-manager] PCI manager accepted HPCI root table: {} root(s)",
+                            message.detail
+                        );
+                    }
+                    (
+                        pci_manager::Opcode::RootTableRejected,
+                        pci_manager::Status::InvalidRootTable,
+                    ) => {
+                        println!("[driver-manager] PCI manager rejected HPCI root table");
+                    }
                     (pci_manager::Opcode::Heartbeat, _) => {}
                     _ => println!("[driver-manager] unexpected PCI manager control message"),
                 }
                 self.pci_manager = Some(host);
                 self.maybe_publish_mediation();
+                self.maybe_handoff_pci_roots();
             }
             Err(ErrorCode::ShouldWait) | Err(ErrorCode::TimedOut) => {
                 self.pci_manager = Some(host);
                 self.maybe_publish_mediation();
+                self.maybe_handoff_pci_roots();
             }
             Err(error) => {
                 println!(
@@ -2670,6 +2699,99 @@ impl DriverManager {
         self.handoff_config_authority();
     }
 
+    /// Validate and retain one `HPCI` root-bridge table received from
+    /// the current ACPI manager generation against the already-retained `HMCF`.
+    fn retain_hpci(&mut self, handle: Handle) {
+        let vmo = Vmo::from_handle(handle);
+        let Some(hmcf_vmo) = self.hmcf.as_ref() else {
+            println!("[driver-manager] HPCI rejected: no retained HMCF");
+            return;
+        };
+        let mut hmcf_hdr = [0u8; hmcf::HEADER_BYTES];
+        if !read_vmo_exact(hmcf_vmo, 0, &mut hmcf_hdr) {
+            println!("[driver-manager] HPCI rejected: retained HMCF header unreadable");
+            return;
+        }
+        let Ok(hmcf_declared) = hmcf::declared_size(&hmcf_hdr) else {
+            println!("[driver-manager] HPCI rejected: retained HMCF header invalid");
+            return;
+        };
+        let mut hmcf_buf = [0u8; hmcf::MAX_BYTES];
+        if !read_vmo_exact(hmcf_vmo, 0, &mut hmcf_buf[..hmcf_declared]) {
+            println!("[driver-manager] HPCI rejected: retained HMCF body unreadable");
+            return;
+        }
+        let Ok(hmcf_view) = hmcf::decode(&hmcf_buf[..hmcf_declared]) else {
+            println!("[driver-manager] HPCI rejected: retained HMCF decode failed");
+            return;
+        };
+
+        let mut hpci_hdr = [0u8; huesos_abi::pci::HEADER_BYTES];
+        if !read_vmo_exact(&vmo, 0, &mut hpci_hdr) {
+            println!("[driver-manager] HPCI rejected: short header read");
+            return;
+        }
+        let declared = match huesos_abi::pci::declared_size(&hpci_hdr) {
+            Ok(len) => len,
+            Err(error) => {
+                println!("[driver-manager] HPCI rejected: {:?}", error);
+                return;
+            }
+        };
+        let mut hpci_buf = [0u8; huesos_abi::pci::MAX_ENCODED_BYTES];
+        if !read_vmo_exact(&vmo, 0, &mut hpci_buf[..declared]) {
+            println!("[driver-manager] HPCI rejected: short image read");
+            return;
+        }
+        let table = match huesos_abi::pci::decode(&hpci_buf[..declared]) {
+            Ok(table) => table,
+            Err(error) => {
+                println!("[driver-manager] HPCI rejected: {:?}", error);
+                return;
+            }
+        };
+        if let Err(error) = huesos_abi::pci::validate_roots_and_hmcf(&table, &hmcf_view) {
+            println!("[driver-manager] HPCI consistency rejected: {:?}", error);
+            return;
+        }
+        println!(
+            "[driver-manager] retained HPCI: {} root(s), {} aperture(s), generation {}",
+            table.root_count, table.aperture_count, self.acpi_manager_generation
+        );
+        self.hpci = Some(vmo);
+    }
+
+    fn maybe_handoff_pci_roots(&mut self) {
+        if self.pci_roots_handed_off || !self.acpi_hpci_eligible || !self.pci_config_authority_ready
+        {
+            return;
+        }
+        let (Some(host), Some(hpci_vmo)) = (self.pci_manager.as_ref(), self.hpci.as_ref()) else {
+            return;
+        };
+        let Ok(duplicate) =
+            hpci_vmo.duplicate(huesos_abi::rights::READ | huesos_abi::rights::TRANSFER)
+        else {
+            println!("[driver-manager] HPCI duplicate failed; withholding forwarding");
+            return;
+        };
+        if let Err((error, _handle)) = host
+            .bootstrap
+            .write_handle(pci_manager::ROOT_TABLE_VMO_LABEL, duplicate.into_handle())
+        {
+            println!(
+                "[driver-manager] HPCI transfer to PCI manager failed: {}",
+                error.as_str()
+            );
+            return;
+        }
+        self.pci_roots_handed_off = true;
+        println!(
+            "[driver-manager] forwarded HPCI root table to PCI manager generation {}",
+            self.pci_manager_generation
+        );
+    }
+
     fn poll_acpi_manager(&mut self) {
         let now = libcanvas::system::monotonic_ticks().unwrap_or(0);
         if self
@@ -2709,6 +2831,10 @@ impl DriverManager {
                     self.retain_hmcf(handle);
                     continue;
                 }
+                Ok((length, Some(handle))) if &bytes[..length] == acpi_manager::HPCI_VMO_LABEL => {
+                    self.retain_hpci(handle);
+                    continue;
+                }
                 Ok((_length, Some(handle))) => {
                     println!("[driver-manager] unexpected ACPI manager handle message");
                     drop(handle);
@@ -2744,11 +2870,12 @@ impl DriverManager {
                         ) => {
                             self.acpi_init_watchdog.disarm();
                             self.acpi_namespace_initialized = true;
-                            self.acpi_hpci_eligible = true;
+                            self.acpi_hpci_eligible = self.hpci.is_some();
                             println!(
-                                "[driver-manager] ACPI namespace initialized generation {} hpci_eligible=true detail=0x{:x}",
-                                message.manager_generation, message.detail
+                                "[driver-manager] ACPI namespace initialized generation {} hpci_eligible={} detail=0x{:x}",
+                                message.manager_generation, self.acpi_hpci_eligible, message.detail
                             );
+                            self.maybe_handoff_pci_roots();
                         }
                         (
                             acpi_manager::Opcode::NamespaceInitialized,
@@ -2757,11 +2884,18 @@ impl DriverManager {
                         ) => {
                             self.acpi_init_watchdog.disarm();
                             self.acpi_namespace_initialized = true;
-                            self.acpi_hpci_eligible = false;
+                            let eligible = status != acpi_manager::Status::NamespaceInitFailed
+                                && !acpi_manager::detail_blocks_hpci(message.detail)
+                                && self.hpci.is_some();
+                            if !eligible {
+                                self.hpci = None;
+                            }
+                            self.acpi_hpci_eligible = eligible;
                             println!(
-                                "[driver-manager] ACPI namespace initialized generation {} hpci_eligible=false status={} detail=0x{:x} (HMCF retained)",
-                                message.manager_generation, status as i32, message.detail
+                                "[driver-manager] ACPI namespace initialized generation {} hpci_eligible={} status={} detail=0x{:x} (HMCF retained)",
+                                message.manager_generation, eligible, status as i32, message.detail
                             );
+                            self.maybe_handoff_pci_roots();
                         }
                         (acpi_manager::Opcode::Heartbeat, acpi_manager::Status::Ok) => {
                             self.acpi_heartbeat_count = self.acpi_heartbeat_count.wrapping_add(1);

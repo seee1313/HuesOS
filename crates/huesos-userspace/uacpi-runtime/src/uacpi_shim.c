@@ -2,8 +2,10 @@
 #include <uacpi/context.h>
 #include <uacpi/internal/context.h>
 #include <uacpi/kernel_api.h>
+#include <uacpi/namespace.h>
 #include <uacpi/opregion.h>
 #include <uacpi/platform/libc.h>
+#include <uacpi/resources.h>
 #include <uacpi/status.h>
 #include <uacpi/uacpi.h>
 #include <uacpi/utilities.h>
@@ -181,6 +183,277 @@ uacpi_i64 hues_uacpi_namespace_phase(
         return (uacpi_i64)packed;
     }
     return (uacpi_i64)(uacpi_i32)UACPI_STATUS_INVALID_ARGUMENT;
+}
+
+#define HUES_MAX_PCI_ROOTS 16
+#define HUES_MAX_PCI_APERTURES 64
+#define HUES_APERTURE_KIND_IO 1
+#define HUES_APERTURE_KIND_MMIO32 2
+#define HUES_APERTURE_KIND_MMIO64 3
+#define HUES_APERTURE_KIND_PREFETCH 4
+#define HUES_APERTURE_FLAG_FIXED (1u << 1)
+
+typedef struct HuesPciRootDesc {
+    uacpi_u16 segment;
+    uacpi_u8 start_bus;
+    uacpi_u8 end_bus;
+    uacpi_u8 has_bus_range;
+    uacpi_u8 has_bbn;
+    uacpi_u16 aperture_start;
+    uacpi_u16 aperture_count;
+    uacpi_u16 _pad;
+    uacpi_u32 flags;
+} HuesPciRootDesc;
+
+typedef struct HuesPciApertureDesc {
+    uacpi_u16 root_index;
+    uacpi_u8 kind;
+    uacpi_u8 _pad;
+    uacpi_u32 flags;
+    uacpi_u64 pci_base;
+    uacpi_u64 cpu_base;
+    uacpi_u64 len;
+} HuesPciApertureDesc;
+
+typedef struct HuesPciRootsOut {
+    uacpi_u16 root_count;
+    uacpi_u16 aperture_count;
+    uacpi_u32 _pad;
+    HuesPciRootDesc roots[HUES_MAX_PCI_ROOTS];
+    HuesPciApertureDesc apertures[HUES_MAX_PCI_APERTURES];
+} HuesPciRootsOut;
+
+struct root_crs_ctx {
+    HuesPciRootsOut *out;
+    uacpi_u16 root_index;
+    uacpi_status error;
+};
+
+static uacpi_status push_root_address(
+    struct root_crs_ctx *ctx,
+    const uacpi_resource_address_common *common,
+    uacpi_u64 min,
+    uacpi_u64 max,
+    uacpi_u64 tra,
+    uacpi_u64 len,
+    uacpi_bool is_addr64)
+{
+    HuesPciRootDesc *root = &ctx->out->roots[ctx->root_index];
+    uacpi_u64 cpu_base;
+    uacpi_u32 flags = 0;
+    uacpi_u8 kind;
+
+    /* Only ResourceProducer descriptors define downstream root apertures. */
+    if (common->direction != UACPI_PRODUCER)
+        return UACPI_STATUS_OK;
+
+    if (len == 0)
+        return UACPI_STATUS_INVALID_ARGUMENT;
+    if (min > UINT64_MAX - len)
+        return UACPI_STATUS_INVALID_ARGUMENT;
+    if (common->fixed_min_address == UACPI_ADDRESS_FIXED &&
+        common->fixed_max_address == UACPI_ADDRESS_FIXED) {
+        if (max < min || (max - min) != (len - 1))
+            return UACPI_STATUS_INVALID_ARGUMENT;
+        flags |= HUES_APERTURE_FLAG_FIXED;
+    }
+
+    if (common->type == UACPI_RANGE_BUS) {
+        if (tra != 0 || min > 0xFFu || max > 0xFFu || max < min ||
+            len > 256u || (max - min) != (len - 1)) {
+            return UACPI_STATUS_INVALID_ARGUMENT;
+        }
+        if (root->has_bus_range)
+            return UACPI_STATUS_INVALID_ARGUMENT;
+        if (root->has_bbn && (uacpi_u8)min != root->start_bus)
+            return UACPI_STATUS_INVALID_ARGUMENT;
+        root->start_bus = (uacpi_u8)min;
+        root->end_bus = (uacpi_u8)max;
+        root->has_bus_range = 1;
+        return UACPI_STATUS_OK;
+    }
+
+    if (common->type != UACPI_RANGE_IO && common->type != UACPI_RANGE_MEMORY)
+        return UACPI_STATUS_OK;
+
+    if (min > UINT64_MAX - tra)
+        return UACPI_STATUS_INVALID_ARGUMENT;
+    cpu_base = min + tra;
+    if (cpu_base > UINT64_MAX - len)
+        return UACPI_STATUS_INVALID_ARGUMENT;
+
+    if (common->type == UACPI_RANGE_IO) {
+        kind = HUES_APERTURE_KIND_IO;
+    } else if (common->attribute.memory.caching == UACPI_PREFETCHABLE) {
+        kind = HUES_APERTURE_KIND_PREFETCH;
+    } else if (!is_addr64 && (min + len) <= 0x100000000ULL) {
+        kind = HUES_APERTURE_KIND_MMIO32;
+    } else if ((min + len) <= 0x100000000ULL && (cpu_base + len) <= 0x100000000ULL) {
+        kind = HUES_APERTURE_KIND_MMIO32;
+    } else {
+        kind = HUES_APERTURE_KIND_MMIO64;
+    }
+
+    if (ctx->out->aperture_count >= HUES_MAX_PCI_APERTURES)
+        return UACPI_STATUS_OUT_OF_MEMORY;
+
+    HuesPciApertureDesc *ap = &ctx->out->apertures[ctx->out->aperture_count++];
+    ap->root_index = ctx->root_index;
+    ap->kind = kind;
+    ap->_pad = 0;
+    ap->flags = flags;
+    ap->pci_base = min;
+    ap->cpu_base = cpu_base;
+    ap->len = len;
+    root->aperture_count++;
+    return UACPI_STATUS_OK;
+}
+
+static uacpi_iteration_decision on_root_crs(void *user, uacpi_resource *res)
+{
+    struct root_crs_ctx *ctx = (struct root_crs_ctx *)user;
+    uacpi_status st = UACPI_STATUS_OK;
+
+    switch (res->type) {
+    case UACPI_RESOURCE_TYPE_ADDRESS16:
+        st = push_root_address(
+            ctx,
+            &res->address16.common,
+            res->address16.minimum,
+            res->address16.maximum,
+            res->address16.translation_offset,
+            res->address16.address_length,
+            UACPI_FALSE);
+        break;
+    case UACPI_RESOURCE_TYPE_ADDRESS32:
+        st = push_root_address(
+            ctx,
+            &res->address32.common,
+            res->address32.minimum,
+            res->address32.maximum,
+            res->address32.translation_offset,
+            res->address32.address_length,
+            UACPI_FALSE);
+        break;
+    case UACPI_RESOURCE_TYPE_ADDRESS64:
+        st = push_root_address(
+            ctx,
+            &res->address64.common,
+            res->address64.minimum,
+            res->address64.maximum,
+            res->address64.translation_offset,
+            res->address64.address_length,
+            UACPI_TRUE);
+        break;
+    case UACPI_RESOURCE_TYPE_ADDRESS64_EXTENDED:
+        st = push_root_address(
+            ctx,
+            &res->address64_extended.common,
+            res->address64_extended.minimum,
+            res->address64_extended.maximum,
+            res->address64_extended.translation_offset,
+            res->address64_extended.address_length,
+            UACPI_TRUE);
+        break;
+    default:
+        break;
+    }
+
+    if (st != UACPI_STATUS_OK) {
+        ctx->error = st;
+        return UACPI_ITERATION_DECISION_BREAK;
+    }
+    return UACPI_ITERATION_DECISION_CONTINUE;
+}
+
+struct roots_find_ctx {
+    HuesPciRootsOut *out;
+    uacpi_status error;
+};
+
+static uacpi_iteration_decision on_pci_root(
+    void *user, uacpi_namespace_node *node, uacpi_u32 depth)
+{
+    struct roots_find_ctx *fctx = (struct roots_find_ctx *)user;
+    (void)depth;
+
+    if (fctx->out->root_count >= HUES_MAX_PCI_ROOTS) {
+        fctx->error = UACPI_STATUS_OUT_OF_MEMORY;
+        return UACPI_ITERATION_DECISION_BREAK;
+    }
+
+    uacpi_u16 root_idx = fctx->out->root_count;
+    HuesPciRootDesc *root = &fctx->out->roots[root_idx];
+    uacpi_memzero(root, sizeof(*root));
+    root->aperture_start = fctx->out->aperture_count;
+
+    uacpi_u64 seg = 0;
+    uacpi_status st = uacpi_eval_simple_integer(node, "_SEG", &seg);
+    if (st == UACPI_STATUS_NOT_FOUND) {
+        seg = 0;
+    } else if (st != UACPI_STATUS_OK || seg > 0xFFFFu) {
+        fctx->error = (st != UACPI_STATUS_OK) ? st : UACPI_STATUS_INVALID_ARGUMENT;
+        return UACPI_ITERATION_DECISION_BREAK;
+    }
+    root->segment = (uacpi_u16)seg;
+
+    uacpi_u64 bbn = 0;
+    st = uacpi_eval_simple_integer(node, "_BBN", &bbn);
+    if (st == UACPI_STATUS_NOT_FOUND) {
+        root->has_bbn = 0;
+        root->start_bus = 0;
+        root->end_bus = 0;
+    } else if (st != UACPI_STATUS_OK || bbn > 0xFFu) {
+        fctx->error = (st != UACPI_STATUS_OK) ? st : UACPI_STATUS_INVALID_ARGUMENT;
+        return UACPI_ITERATION_DECISION_BREAK;
+    } else {
+        root->has_bbn = 1;
+        root->start_bus = (uacpi_u8)bbn;
+        root->end_bus = (uacpi_u8)bbn;
+    }
+
+    struct root_crs_ctx cctx = {
+        .out = fctx->out,
+        .root_index = root_idx,
+        .error = UACPI_STATUS_OK,
+    };
+    st = uacpi_for_each_device_resource(node, "_CRS", on_root_crs, &cctx);
+    if (st != UACPI_STATUS_OK) {
+        fctx->error = st;
+        return UACPI_ITERATION_DECISION_BREAK;
+    }
+    if (cctx.error != UACPI_STATUS_OK) {
+        fctx->error = cctx.error;
+        return UACPI_ITERATION_DECISION_BREAK;
+    }
+
+    fctx->out->root_count++;
+    return UACPI_ITERATION_DECISION_CONTINUE;
+}
+
+int hues_uacpi_collect_pci_roots(HuesPciRootsOut *out)
+{
+    static const uacpi_char *const root_hids[] = {
+        "PNP0A08",
+        "PNP0A03",
+        UACPI_NULL,
+    };
+    struct roots_find_ctx fctx;
+    uacpi_status st;
+
+    if (out == UACPI_NULL)
+        return (int)UACPI_STATUS_INVALID_ARGUMENT;
+
+    uacpi_memzero(out, sizeof(*out));
+    fctx.out = out;
+    fctx.error = UACPI_STATUS_OK;
+
+    st = uacpi_find_devices_at(uacpi_namespace_root(), root_hids, on_pci_root, &fctx);
+    if (st != UACPI_STATUS_OK)
+        return (int)st;
+    if (fctx.error != UACPI_STATUS_OK)
+        return (int)fctx.error;
+    return (int)UACPI_STATUS_OK;
 }
 
 #ifdef HUESOS_UACPI_RUST_LOG

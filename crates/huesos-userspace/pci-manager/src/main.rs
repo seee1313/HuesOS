@@ -39,6 +39,7 @@
 
 use core::panic::PanicInfo;
 use huesos_abi::hmcf;
+use huesos_abi::pci::{self as abi_pci, RootBridgeTable};
 use huesos_abi::pci_manager::{self, Message, Opcode, Status, MESSAGE_BYTES};
 use huesos_abi::pci_mediation::{
     self, Opcode as MediationOpcode, Request, Response, Status as MediationStatus, ValidRequest,
@@ -123,6 +124,8 @@ struct ConfigAuthority {
     windows_len: usize,
     firmware_snapshot_id: u64,
     producer_generation: u64,
+    /// Validated `HPCI` root-bridge table forwarded after ACPI init (AP-15).
+    roots: Option<RootBridgeTable>,
     #[cfg(feature = "force-legacy")]
     legacy_ioport: Option<IoPort>,
     mediation: Option<Channel>,
@@ -156,6 +159,7 @@ impl Default for ConfigAuthority {
             windows_len: 0,
             firmware_snapshot_id: 0,
             producer_generation: 0,
+            roots: None,
             #[cfg(feature = "force-legacy")]
             legacy_ioport: None,
             mediation: None,
@@ -175,8 +179,8 @@ fn handle_authority_message(
     manager_generation: u64,
 ) -> bool {
     if authority.authorized {
-        // The only post-authority capability accepted is the one private
-        // mediation channel end. Anything else is dropped without a word.
+        // Post-authority handles: the private mediation channel end and,
+        // once ACPI namespace init completes, the validated `HPCI` root table.
         if let Some(handle) = handle {
             if bytes == huesos_abi::pci_mediation::MEDIATION_CHANNEL_LABEL
                 && authority.mediation.is_none()
@@ -186,6 +190,8 @@ fn handle_authority_message(
                     "[pci-manager] mediation channel established generation {}",
                     manager_generation
                 );
+            } else if bytes == pci_manager::ROOT_TABLE_VMO_LABEL {
+                accept_root_table(bootstrap, handle, authority, manager_generation);
             } else {
                 drop(handle);
             }
@@ -246,6 +252,116 @@ fn handle_authority_message(
             }
         }
     }
+}
+
+fn reject_root_table(bootstrap: &Channel, manager_generation: u64, reason: &str) {
+    println!("[pci-manager] rejected HPCI root table: {}", reason);
+    let _ = send(
+        bootstrap,
+        Message {
+            opcode: Opcode::RootTableRejected,
+            manager_generation,
+            status: Status::InvalidRootTable,
+            detail: 0,
+        },
+    );
+}
+
+fn accept_root_table(
+    bootstrap: &Channel,
+    handle: Handle,
+    authority: &mut ConfigAuthority,
+    manager_generation: u64,
+) {
+    let vmo = Vmo::from_handle(handle);
+    if authority.roots.is_some() {
+        reject_root_table(bootstrap, manager_generation, "duplicate root table");
+        return;
+    }
+    let Some(hmcf_vmo) = authority.hmcf.as_ref() else {
+        reject_root_table(bootstrap, manager_generation, "retained HMCF absent");
+        return;
+    };
+    let mut hmcf_hdr = [0u8; hmcf::HEADER_BYTES];
+    if !read_vmo_exact(hmcf_vmo, 0, &mut hmcf_hdr) {
+        reject_root_table(bootstrap, manager_generation, "HMCF header unreadable");
+        return;
+    }
+    let Ok(hmcf_declared) = hmcf::declared_size(&hmcf_hdr) else {
+        reject_root_table(bootstrap, manager_generation, "HMCF header invalid");
+        return;
+    };
+    let mut hmcf_buf = [0u8; hmcf::MAX_BYTES];
+    if !read_vmo_exact(hmcf_vmo, 0, &mut hmcf_buf[..hmcf_declared]) {
+        reject_root_table(bootstrap, manager_generation, "HMCF body unreadable");
+        return;
+    }
+    let Ok(hmcf_view) = hmcf::decode(&hmcf_buf[..hmcf_declared]) else {
+        reject_root_table(bootstrap, manager_generation, "HMCF decode failed");
+        return;
+    };
+
+    let mut hpci_hdr = [0u8; abi_pci::HEADER_BYTES];
+    if !read_vmo_exact(&vmo, 0, &mut hpci_hdr) {
+        reject_root_table(bootstrap, manager_generation, "short HPCI header read");
+        return;
+    }
+    let Ok(declared) = abi_pci::declared_size(&hpci_hdr) else {
+        reject_root_table(bootstrap, manager_generation, "malformed HPCI header");
+        return;
+    };
+    let mut hpci_buf = [0u8; abi_pci::MAX_ENCODED_BYTES];
+    if !read_vmo_exact(&vmo, 0, &mut hpci_buf[..declared]) {
+        reject_root_table(bootstrap, manager_generation, "short HPCI body read");
+        return;
+    }
+    let Ok(table) = abi_pci::decode(&hpci_buf[..declared]) else {
+        reject_root_table(bootstrap, manager_generation, "HPCI decode failed");
+        return;
+    };
+    if abi_pci::validate_roots_and_hmcf(&table, &hmcf_view).is_err() {
+        reject_root_table(
+            bootstrap,
+            manager_generation,
+            "HPCI failed HMCF consistency validation",
+        );
+        return;
+    }
+    for root in &table.roots[..table.root_count] {
+        let covered_by_window = authority.windows[..authority.windows_len]
+            .iter()
+            .flatten()
+            .any(|w| {
+                w.segment == root.segment
+                    && root.start_bus >= w.bus_start
+                    && root.end_bus <= w.bus_end
+            });
+        if !covered_by_window {
+            reject_root_table(
+                bootstrap,
+                manager_generation,
+                "HPCI root outside mapped config windows",
+            );
+            return;
+        }
+    }
+
+    let root_count = table.root_count;
+    let aperture_count = table.aperture_count;
+    authority.roots = Some(table);
+    println!(
+        "[pci-manager] accepted HPCI root table: {} root(s), {} aperture(s)",
+        root_count, aperture_count
+    );
+    let _ = send(
+        bootstrap,
+        Message {
+            opcode: Opcode::RootTableAccepted,
+            manager_generation,
+            status: Status::Ok,
+            detail: root_count as u32,
+        },
+    );
 }
 
 /// Report the fail-closed verdict once per generation.

@@ -17,6 +17,38 @@ extern int hues_uacpi_initialize_namespace(
     uacpi_u32 max_stack_depth,
     int *out_pic_status);
 
+typedef struct HuesPciRootDesc {
+    uacpi_u16 segment;
+    uacpi_u8 start_bus;
+    uacpi_u8 end_bus;
+    uacpi_u8 has_bus_range;
+    uacpi_u8 has_bbn;
+    uacpi_u16 aperture_start;
+    uacpi_u16 aperture_count;
+    uacpi_u16 _pad;
+    uacpi_u32 flags;
+} HuesPciRootDesc;
+
+typedef struct HuesPciApertureDesc {
+    uacpi_u16 root_index;
+    uacpi_u8 kind;
+    uacpi_u8 _pad;
+    uacpi_u32 flags;
+    uacpi_u64 pci_base;
+    uacpi_u64 cpu_base;
+    uacpi_u64 len;
+} HuesPciApertureDesc;
+
+typedef struct HuesPciRootsOut {
+    uacpi_u16 root_count;
+    uacpi_u16 aperture_count;
+    uacpi_u32 _pad;
+    HuesPciRootDesc roots[16];
+    HuesPciApertureDesc apertures[64];
+} HuesPciRootsOut;
+
+extern int hues_uacpi_collect_pci_roots(HuesPciRootsOut *out);
+
 /*
  * Host ASan/UBSan test exercising the real uACPI initialization and AML
  * namespace-load path (`hues_uacpi_load_namespace`) against both a valid
@@ -640,6 +672,125 @@ int main(void)
         hues_uacpi_initialize_namespace(1, 64, &pic_st) != UACPI_STATUS_OK ||
         g_error_logs == 0) {
         fprintf(stderr, "AP-14 case 5 loop timeout check failed\n");
+        return 1;
+    }
+    uacpi_state_reset();
+
+    /*
+     * AP-15 Case 6: PNP0A08 root without _SEG/_BBN (defaults to seg 0, bus 0),
+     * _CRS with WordBusNumber(0..=3), Consumer WordIO(0xCF8..=0xCFF -> ignored),
+     * Producer WordIO(0x1000..=0x1FFF), Producer DWordMemory(0x80000000..=0x8FFFFFFF),
+     * and Producer Prefetchable QWordMemory(0x400000000..=0x4FFFFFFFF, _TRA=0x100000000).
+     */
+    static const uint8_t ap15_root_aml[] = {
+        /* Scope(\_SB_) pkg_len: 5 + (2 + 4 + 10 + 10 + 6 + 3 + 2 + 128) = 170 = 0xAA -> 0x4A 0x0A */
+        0x10, 0x4A, 0x0A, 0x5C, '_', 'S', 'B', '_',
+        /* Device(PCI0) pkg_len: 2 + 4 + 10 + 10 + 128 = 154? wait: compute dynamically below! */
+        0x5B, 0x82, 0x4A, 0x09, 'P', 'C', 'I', '0',
+        /* Name(_HID, EISAID("PNP0A08")) */
+        0x08, '_', 'H', 'I', 'D', 0x0C, 0x41, 0xD0, 0x0A, 0x08,
+        /* Method(_STA, 0) { Return(0x0F) } */
+        0x14, 0x09, '_', 'S', 'T', 'A', 0x00, 0xA4, 0x0A, 0x0F,
+        /* Name(_CRS, Buffer(118)) -> 0x08,'_','C','R','S', 0x11, 0x4C,0x07, 0x0A,118 */
+        0x08, '_', 'C', 'R', 'S',
+        0x11, 0x49, 0x07, 0x0A, 118,
+        /* WordBusNumber(Producer, 0..=3, len=4) [16 bytes] */
+        0x88, 0x0D, 0x00, 0x02, 0x0C, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00, 0x04, 0x00,
+        /* WordIO(Consumer, 0x0CF8..=0x0CFF, len=8) [16 bytes] */
+        0x88, 0x0D, 0x00, 0x01, 0x0D, 0x03,
+        0x00, 0x00, 0xF8, 0x0C, 0xFF, 0x0C, 0x00, 0x00, 0x08, 0x00,
+        /* WordIO(Producer, 0x1000..=0x1FFF, len=0x1000) [16 bytes] */
+        0x88, 0x0D, 0x00, 0x01, 0x0C, 0x03,
+        0x00, 0x00, 0x00, 0x10, 0xFF, 0x1F, 0x00, 0x00, 0x00, 0x10,
+        /* DWordMemory(Producer, NonCacheable, 0x80000000..=0x8FFFFFFF, len=0x10000000) [26 bytes] */
+        0x87, 0x17, 0x00, 0x00, 0x0C, 0x01,
+        0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x80,
+        0xFF, 0xFF, 0xFF, 0x8F,
+        0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x10,
+        /* QWordMemory(Producer, Prefetchable, 0x400000000..=0x4FFFFFFFF, tra=0x100000000, len=0x100000000) [46 bytes? 3+43=46] */
+        /* Note: 16+16+16+26+46+2 = 122 bytes! */
+        0x8A, 0x2B, 0x00, 0x00, 0x0C, 0x07,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00,
+        0xFF, 0xFF, 0xFF, 0xFF, 0x04, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
+        /* EndTag [2 bytes] */
+        0x79, 0x00,
+    };
+    uint8_t root_aml_buf[sizeof(ap15_root_aml)];
+    memcpy(root_aml_buf, ap15_root_aml, sizeof(ap15_root_aml));
+    /* Fix Buffer(122) length + pkg_len + Device/Scope pkg_lens cleanly */
+    size_t crs_buf_len = sizeof(ap15_root_aml) - 46; /* 122 bytes */
+    size_t crs_pkg = 2 + 2 + crs_buf_len;            /* 126 bytes (pkg_len + BytePrefix + len + payload) */
+    size_t dev_pkg = sizeof(ap15_root_aml) - 10;     /* everything after 0x5B 0x82 */
+    size_t sb_pkg = sizeof(ap15_root_aml) - 1;       /* everything after 0x10 */
+    root_aml_buf[1] = (uint8_t)(0x40 | (sb_pkg & 0x0Fu));
+    root_aml_buf[2] = (uint8_t)(sb_pkg >> 4);
+    root_aml_buf[10] = (uint8_t)(0x40 | (dev_pkg & 0x0Fu));
+    root_aml_buf[11] = (uint8_t)(dev_pkg >> 4);
+    root_aml_buf[42] = (uint8_t)(0x40 | (crs_pkg & 0x0Fu));
+    root_aml_buf[43] = (uint8_t)(crs_pkg >> 4);
+    root_aml_buf[45] = (uint8_t)crs_buf_len;
+
+    setup_corpus(root_aml_buf, sizeof(root_aml_buf));
+    if (hues_uacpi_load_namespace(5, 64) != UACPI_STATUS_OK ||
+        hues_uacpi_initialize_namespace(5, 64, &pic_st) != UACPI_STATUS_OK) {
+        fprintf(stderr, "AP-15 case 6 namespace init failed\n");
+        return 1;
+    }
+    HuesPciRootsOut roots_out;
+    if (hues_uacpi_collect_pci_roots(&roots_out) != UACPI_STATUS_OK ||
+        roots_out.root_count != 1 || roots_out.aperture_count != 3 ||
+        roots_out.roots[0].segment != 0 ||
+        roots_out.roots[0].start_bus != 0 ||
+        roots_out.roots[0].end_bus != 3 ||
+        roots_out.apertures[0].kind != 1 ||
+        roots_out.apertures[0].pci_base != 0x1000ULL ||
+        roots_out.apertures[1].kind != 2 ||
+        roots_out.apertures[1].pci_base != 0x80000000ULL ||
+        roots_out.apertures[2].kind != 4 ||
+        roots_out.apertures[2].pci_base != 0x400000000ULL ||
+        roots_out.apertures[2].cpu_base != 0x500000000ULL) {
+        fprintf(stderr, "AP-15 case 6 root collection mismatch (roots=%u aps=%u)\n",
+                roots_out.root_count, roots_out.aperture_count);
+        return 1;
+    }
+    uacpi_state_reset();
+
+    /* AP-15 Case 7: Conflicting _BBN=1 vs _CRS bus 0..=3 fails closed. */
+    static const uint8_t ap15_bad_bbn_aml[] = {
+        /* Scope(\_SB_) */
+        0x10, 0x43, 0x03, 0x5C, '_', 'S', 'B', '_',
+        /* Device(PCI0) */
+        0x5B, 0x82, 0x4A, 0x02, 'P', 'C', 'I', '0',
+        0x08, '_', 'H', 'I', 'D', 0x0C, 0x41, 0xD0, 0x0A, 0x03,
+        /* Name(_BBN, 1) */
+        0x08, '_', 'B', 'B', 'N', 0x01,
+        0x14, 0x09, '_', 'S', 'T', 'A', 0x00, 0xA4, 0x0A, 0x0F,
+        /* Name(_CRS, Buffer(18) { WordBusNumber(0..=3), EndTag }) */
+        0x08, '_', 'C', 'R', 'S', 0x11, 0x15, 0x0A, 18,
+        0x88, 0x0D, 0x00, 0x02, 0x0C, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00, 0x04, 0x00,
+        0x79, 0x00,
+    };
+    uint8_t bad_bbn_buf[sizeof(ap15_bad_bbn_aml)];
+    memcpy(bad_bbn_buf, ap15_bad_bbn_aml, sizeof(ap15_bad_bbn_aml));
+    size_t bad_dev_pkg = sizeof(ap15_bad_bbn_aml) - 10; /* 57 -> 0x49 0x03 */
+    size_t bad_sb_pkg = sizeof(ap15_bad_bbn_aml) - 1;  /* 66 -> 0x42 0x04 */
+    bad_bbn_buf[1] = (uint8_t)(0x40 | (bad_sb_pkg & 0x0Fu));
+    bad_bbn_buf[2] = (uint8_t)(bad_sb_pkg >> 4);
+    bad_bbn_buf[10] = (uint8_t)(0x40 | (bad_dev_pkg & 0x0Fu));
+    bad_bbn_buf[11] = (uint8_t)(bad_dev_pkg >> 4);
+
+    setup_corpus(bad_bbn_buf, sizeof(bad_bbn_buf));
+    if (hues_uacpi_load_namespace(5, 64) != UACPI_STATUS_OK ||
+        hues_uacpi_initialize_namespace(5, 64, &pic_st) != UACPI_STATUS_OK ||
+        hues_uacpi_collect_pci_roots(&roots_out) == UACPI_STATUS_OK) {
+        fprintf(stderr, "AP-15 case 7 conflicting _BBN check failed\n");
         return 1;
     }
     uacpi_state_reset();

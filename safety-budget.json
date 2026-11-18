@@ -67,6 +67,7 @@
     "crates/huesos-userspace/uacpi-runtime/src/archive.rs": 2,
     "crates/huesos-userspace/uacpi-runtime/src/namespace.rs": 1,
     "crates/huesos-userspace/uacpi-runtime/src/primitives.rs": 3,
+    "crates/huesos-userspace/uacpi-runtime/src/roots.rs": 1,
     "crates/huesos-userspace/doom/src/main.rs": 9,
     "crates/huesos-userspace/driver-host-nvme/src/main.rs": 3,
     "crates/huesos-userspace/fault-probe/src/main.rs": 4,

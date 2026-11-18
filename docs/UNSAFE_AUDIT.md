@@ -3147,3 +3147,15 @@ callbacks (SystemIO, `SystemMemory` OpRegion broker mediation, IRQ/work-queue
 dispatch, and bounded value-passed `LogLine` logging) keep `0` `unsafe` blocks
 by funneling scalar writes through `primitives::store_scalar` and unpacking C
 region/log structs in `uacpi_shim.c`.
+
+## AP-15 HPCI root-bridge producer and cross-check
+
+AP-15 wires `PNP0A03`/`PNP0A08` root discovery, `_SEG`/`_BBN`/`_CRS` evaluation,
+`HPCI` VMO publication, `driver-manager` validation/forwarding, and `pci-manager`
+acceptance, adding one audited `unsafe` block (total `unsafe_blocks` remains
+within the 383 cap at 382):
+
+- `crates/huesos-userspace/uacpi-runtime/src/roots.rs` (`1` unsafe block):
+  FFI call to `hues_uacpi_collect_pci_roots(&mut raw)` passing a mutable pointer
+  to stack-allocated `RawPciRootsOut`, whose C helper writes only within fixed
+  `HUES_MAX_PCI_ROOTS` (`16`) and `HUES_MAX_PCI_APERTURES` (`64`) bounds.
