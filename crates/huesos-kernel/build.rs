@@ -658,7 +658,7 @@ fn build_libcanvas_so(userspace_root: &Path, profile: &str) -> PathBuf {
     );
     let so_path = out_dir.join("libcanvas.so");
     run_checked_cmd(
-        Command::new("ld.lld")
+        lld_gnu_command()
             .args([
                 "-shared",
                 "--gc-sections",
@@ -675,7 +675,7 @@ fn build_libcanvas_so(userspace_root: &Path, profile: &str) -> PathBuf {
             .arg("--no-whole-archive")
             .arg("-o")
             .arg(&so_path),
-        "linking libcanvas.so with ld.lld",
+        "linking libcanvas.so with rust-lld",
     );
 
     // Stage a `libcanvas.so` copy at the `-L` directory referenced by
@@ -703,6 +703,31 @@ fn build_libcanvas_so(userspace_root: &Path, profile: &str) -> PathBuf {
         }
     }
     staged_so
+}
+
+fn lld_gnu_command() -> Command {
+    let rustc = env::var_os("RUSTC").unwrap_or_else(|| OsStr::new("rustc").to_os_string());
+    if let Ok(output) = Command::new(rustc)
+        .args(["--print", "target-libdir"])
+        .output()
+    {
+        if output.status.success() {
+            let libdir = String::from_utf8_lossy(&output.stdout);
+            if let Some(target_dir) = Path::new(libdir.trim()).parent() {
+                let rust_lld = target_dir.join("bin").join("rust-lld");
+                if rust_lld.is_file() {
+                    let mut cmd = Command::new(rust_lld);
+                    cmd.args(["-flavor", "gnu"]);
+                    return cmd;
+                }
+                let gcc_ld = target_dir.join("bin").join("gcc-ld").join("ld.lld");
+                if gcc_ld.is_file() {
+                    return Command::new(gcc_ld);
+                }
+            }
+        }
+    }
+    Command::new("ld.lld")
 }
 
 fn run_checked_cmd(cmd: &mut Command, label: &str) {
@@ -757,7 +782,7 @@ fn build_c_shared_lib(
     );
     let lib_dir = libcanvas_so.parent().unwrap_or_else(|| Path::new("."));
     run_checked_cmd(
-        Command::new("ld.lld")
+        lld_gnu_command()
             .args([
                 "-shared",
                 "--gc-sections",
@@ -817,7 +842,7 @@ fn build_c_dynamic_program(
     );
     let lib_dir = libcanvas_so.parent().unwrap_or_else(|| Path::new("."));
     run_checked_cmd(
-        Command::new("ld.lld")
+        lld_gnu_command()
             .args([
                 "-pie",
                 "--gc-sections",
