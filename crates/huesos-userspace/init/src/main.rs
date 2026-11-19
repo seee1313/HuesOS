@@ -334,6 +334,17 @@ pub extern "C" fn _start() -> ! {
 
     if let Some((_, channel)) = &terminal {
         send_terminal_registry_channel(&mut logger, channel, registry_pair);
+        if let Ok(bootfs_dup) = bootfs.duplicate(
+            libcanvas::rights::READ | libcanvas::rights::TRANSFER | libcanvas::rights::DUPLICATE,
+        ) {
+            if let Err((error, _)) = channel.write_handle(b"bootfs-ro", bootfs_dup.into_handle()) {
+                init_logln!(
+                    logger,
+                    "[init] bootfs-ro transfer to terminal failed: {}",
+                    error.as_str()
+                );
+            }
+        }
         // The screen handoff above stops init's own drawing; from this
         // point the terminal must be able to blit on its own. Deliver
         // the FrameDraw duplicate after the final frame is on screen so

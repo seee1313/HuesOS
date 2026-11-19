@@ -116,3 +116,32 @@ pub struct RtldOps {
     /// Free dynamic TLS blocks and unmap the TLS VMO of an exiting thread.
     pub free_thread_tls: unsafe extern "C" fn(tp: u64),
 }
+
+/// Process bootstrap metadata passed by `/lib/ld-huesos.so` to `libcanvas.so`
+/// before any `.init_array` or `_start` executes.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct ProcessBootstrapInfo {
+    /// Struct ABI version (`RTLD_OPS_VERSION`).
+    pub version: u32,
+    /// Number of arguments in `argv`.
+    pub argc: usize,
+    /// Pointer to `argc` NUL-terminated argument pointers on the initial stack.
+    pub argv: *const *const c_char,
+    /// Attenuated `@caps(...)` capability bitmask (`huesos_abi::auxv::caps_mask`).
+    pub caps_mask: u64,
+    /// Capability handle for `stdin` channel (`INVALID_HANDLE` if absent).
+    pub stdin_ch: u32,
+    /// Capability handle for `stdout` channel (`INVALID_HANDLE` if absent).
+    pub stdout_ch: u32,
+    /// Capability handle for `stderr` channel (`INVALID_HANDLE` if absent).
+    pub stderr_ch: u32,
+    /// Capability handle for attenuated HxFS directory (`INVALID_HANDLE` if absent).
+    pub hxfs_dir_ch: u32,
+    /// Capability handle for HxFS service (`INVALID_HANDLE` if absent).
+    pub hxfs_service_ch: u32,
+    /// Capability handle for block device (`INVALID_HANDLE` if absent).
+    pub block_dev_ch: u32,
+    /// Capability handle for framebuffer draw resource (`INVALID_HANDLE` if absent).
+    pub frame_draw_ch: u32,
+}

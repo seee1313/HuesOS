@@ -9,7 +9,8 @@ use crate::protocol::MANIFEST_GRANTS_COMPLETE_PREFIX;
 use crate::registry::{ServiceRegistry, ServiceState};
 use crate::volume_service::VolumeManagerService;
 use huesos_abi::{
-    acpi_archive, acpi_manager, hmcf, key_broker, pci_config, pci_manager, pci_mediation,
+    acpi_archive, acpi_manager, hmcf, key_broker, pci as abi_pci, pci_config, pci_lease,
+    pci_manager, pci_mediation,
 };
 use libcanvas::{hbi_boot, println, storage_boot, Channel, ErrorCode, Handle, Process, Vmo};
 
@@ -1659,6 +1660,9 @@ impl DriverManager {
                 Ok(n) if &buf[..n] == protocol::OPEN_VOLUME_SYSTEM.as_bytes() => {
                     self.open_system_volume()
                 }
+                Ok(n) if &buf[..n] == protocol::QUERY_PCI.as_bytes() => self.reply_query_pci(),
+                Ok(n) if &buf[..n] == protocol::QUERY_ACPI.as_bytes() => self.reply_query_acpi(),
+                Ok(n) if &buf[..n] == protocol::QUERY_PS.as_bytes() => self.reply_query_ps(),
                 Ok(_) => println!("[driver-manager] unknown registry request"),
                 Err(ErrorCode::ShouldWait) => return,
                 Err(e) => {
@@ -2163,6 +2167,217 @@ impl DriverManager {
         let nvme_bootstrap = self.nvme_host.as_ref().map(|host| &host.bootstrap);
         self.volume
             .open_system_volume(registry, nvme_bootstrap, nvme_online);
+    }
+
+    fn reply_query_pci(&self) {
+        use core::fmt::Write;
+        let Some(registry) = self.registry_channel.as_ref() else {
+            return;
+        };
+        let mut out = QueryBuf::<2048>::new();
+        let _ = writeln!(out, "kind\tseg\tbus\tbackend\tbase_or_bdf\tstatus");
+
+        if let Some(hpci_vmo) = self.hpci.as_ref() {
+            let mut raw = [0u8; 4096];
+            if let Ok(n) = hpci_vmo.read(0, &mut raw) {
+                if let Ok(table) = abi_pci::decode(&raw[..n]) {
+                    for root in &table.roots {
+                        let backend = match root.backend {
+                            abi_pci::ConfigBackend::Ecam => "ecam",
+                            abi_pci::ConfigBackend::LegacyIo => "legacy-io",
+                        };
+                        let status = if self.pci_config_authority_ready {
+                            "ready"
+                        } else {
+                            "pending"
+                        };
+                        let _ = writeln!(
+                            out,
+                            "root\t{}\t{}-{}\t{}\t0x{:x}\t{}",
+                            root.segment,
+                            root.start_bus,
+                            root.end_bus,
+                            backend,
+                            root.ecam_base,
+                            status
+                        );
+                    }
+                }
+            }
+        }
+        if let Some(hmcf_vmo) = self.hmcf.as_ref() {
+            let mut raw = [0u8; 1024];
+            if let Ok(n) = hmcf_vmo.read(0, &mut raw) {
+                if let Ok(view) = hmcf::decode(&raw[..n]) {
+                    for rec in view.records() {
+                        let _ = writeln!(
+                            out,
+                            "ecam\t{}\t{}-{}\tecam\t0x{:x}\tspan={:#x}",
+                            rec.segment, rec.start_bus, rec.end_bus, rec.ecam_base, rec.span_bytes
+                        );
+                    }
+                }
+            }
+        }
+        for slot in self.pci_bound_leases[..self.pci_bound_leases_len]
+            .iter()
+            .flatten()
+        {
+            if let Ok(info) = libcanvas::device_lease::query(slot) {
+                let (seg, bus, dev, func) =
+                    pci_lease::unpack_pci_address(info.pci_address_packed).unwrap_or((0, 0, 0, 0));
+                let status = if info.revoked != 0 {
+                    "revoked"
+                } else {
+                    "leased"
+                };
+                let _ = writeln!(
+                    out,
+                    "lease\t{}\t{:02x}\tdevice-id:{:#x}\t{:02x}:{:02x}.{}\t{}",
+                    seg, bus, info.device_id, bus, dev, func, status
+                );
+            }
+        }
+        if let Some(nvme_lease) = self.nvme_lease_ro.as_ref() {
+            if let Ok(info) = libcanvas::device_lease::query(nvme_lease) {
+                let (seg, bus, dev, func) =
+                    pci_lease::unpack_pci_address(info.pci_address_packed).unwrap_or((0, 0, 0, 0));
+                let _ = writeln!(
+                    out,
+                    "nvme\t{}\t{:02x}\tpci-lease\t{:02x}:{:02x}.{}\tonline={}",
+                    seg,
+                    bus,
+                    bus,
+                    dev,
+                    func,
+                    self.registry.state("block:nvme") == Some(ServiceState::Online)
+                );
+            }
+        }
+        let _ = registry.write(out.as_bytes());
+    }
+
+    fn reply_query_acpi(&self) {
+        use core::fmt::Write;
+        let Some(registry) = self.registry_channel.as_ref() else {
+            return;
+        };
+        let mut out = QueryBuf::<2048>::new();
+        let _ = writeln!(out, "sig\trev\tphys_addr\tlength\tgen\tstatus");
+        if let Some(vmo) = self.acpi_tables.as_ref() {
+            let mut hdr_bytes = [0u8; acpi_archive::HEADER_BYTES];
+            if vmo.read(0, &mut hdr_bytes) == Ok(acpi_archive::HEADER_BYTES) {
+                if let Ok(hdr) = acpi_archive::decode_v2_header(&hdr_bytes) {
+                    let count = (hdr.table_count as usize).min(24);
+                    let entry_size = acpi_archive::TABLE_ENTRY_BYTES;
+                    let mut entry_buf = [0u8; acpi_archive::TABLE_ENTRY_BYTES];
+                    for idx in 0..count {
+                        let off = hdr.table_entries_offset as usize + idx * entry_size;
+                        if vmo.read(off as u64, &mut entry_buf) == Ok(entry_size) {
+                            if let Ok(ent) = acpi_archive::decode_v2_table_entry(&entry_buf) {
+                                let sig = core::str::from_utf8(&ent.signature).unwrap_or("????");
+                                let status = if self.acpi_namespace_initialized {
+                                    "aml-ready"
+                                } else if self.acpi_manager_ready {
+                                    "ready"
+                                } else {
+                                    "archived"
+                                };
+                                let _ = writeln!(
+                                    out,
+                                    "{}\t{}\t0x{:x}\t{}\t{}\t{}",
+                                    sig,
+                                    ent.revision,
+                                    ent.physical_address,
+                                    ent.length,
+                                    self.acpi_manager_generation,
+                                    status
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let _ = registry.write(out.as_bytes());
+    }
+
+    fn reply_query_ps(&self) {
+        use core::fmt::Write;
+        let Some(registry) = self.registry_channel.as_ref() else {
+            return;
+        };
+        let mut out = QueryBuf::<2048>::new();
+        let _ = writeln!(out, "handle\tname\tstate\tgen\trestarts");
+        let _ = writeln!(out, "self\tdriver-manager\tonline\t1\t0");
+        if let Some(h) = self.input_host.as_ref() {
+            let _ = writeln!(
+                out,
+                "{}\tdriver-host-input\t{}\t1\t0",
+                h.process.handle().raw(),
+                if self.keyboard_ready() {
+                    "online"
+                } else {
+                    "starting"
+                }
+            );
+        }
+        if let Some(h) = self.nvme_host.as_ref() {
+            let _ = writeln!(
+                out,
+                "{}\tdriver-host-nvme\t{}\t1\t0",
+                h.process.handle().raw(),
+                if self.registry.state("block:nvme") == Some(ServiceState::Online) {
+                    "online"
+                } else {
+                    "starting"
+                }
+            );
+        }
+        if let Some(h) = self.hxfs_service.as_ref() {
+            let _ = writeln!(
+                out,
+                "{}\thxfs-service\t{}\t{}\t0",
+                h.process.handle().raw(),
+                if self.hxfs_ready {
+                    "online"
+                } else if self.hxfs_failed {
+                    "failed"
+                } else {
+                    "starting"
+                },
+                self.hxfs_generation
+            );
+        }
+        if let Some(h) = self.acpi_manager.as_ref() {
+            let _ = writeln!(
+                out,
+                "{}\tacpi-manager\t{}\t{}\t{}",
+                h.process.handle().raw(),
+                if self.acpi_manager_ready {
+                    "online"
+                } else {
+                    "starting"
+                },
+                self.acpi_manager_generation,
+                self.acpi_manager_restart.failures()
+            );
+        }
+        if let Some(h) = self.pci_manager.as_ref() {
+            let _ = writeln!(
+                out,
+                "{}\tpci-manager\t{}\t{}\t{}",
+                h.process.handle().raw(),
+                if self.pci_manager_ready {
+                    "online"
+                } else {
+                    "starting"
+                },
+                self.pci_manager_generation,
+                self.pci_manager_restart.failures()
+            );
+        }
+        let _ = registry.write(out.as_bytes());
     }
 
     fn open_keyboard_service(&mut self) {
@@ -3454,5 +3669,34 @@ const fn hmcf_error_name(error: hmcf::HmcfError) -> &'static str {
         hmcf::HmcfError::Overlap => "overlapping windows",
         hmcf::HmcfError::StaleGeneration => "stale producer generation",
         hmcf::HmcfError::SnapshotMismatch => "snapshot mismatch",
+    }
+}
+
+struct QueryBuf<const N: usize> {
+    buf: [u8; N],
+    len: usize,
+}
+
+impl<const N: usize> QueryBuf<N> {
+    const fn new() -> Self {
+        Self {
+            buf: [0u8; N],
+            len: 0,
+        }
+    }
+
+    fn as_bytes(&self) -> &[u8] {
+        &self.buf[..self.len]
+    }
+}
+
+impl<const N: usize> core::fmt::Write for QueryBuf<N> {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        let avail = N.saturating_sub(self.len);
+        let bytes = s.as_bytes();
+        let copy = bytes.len().min(avail);
+        self.buf[self.len..self.len + copy].copy_from_slice(&bytes[..copy]);
+        self.len += copy;
+        Ok(())
     }
 }

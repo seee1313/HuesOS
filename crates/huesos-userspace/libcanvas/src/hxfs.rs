@@ -76,11 +76,44 @@ impl Hxfs {
         self.channel_to_dir(b"ROOT")
     }
 
+    /// Open the root directory with explicit attenuated HxFS rights
+    /// (e.g. `huesos_abi::hxfs::rights::READ` for `@caps(hxfs=ro)`).
+    pub fn root_with_rights(&self, rights: u64) -> Result<HxfsDirectory> {
+        write_native_request_with_rights(
+            &self.channel,
+            abi::HxfsOp::OpenRoot,
+            abi::HxfsHandleKind::Directory,
+            rights,
+            0,
+            0,
+            &[],
+        )?;
+        Ok(HxfsDirectory {
+            channel: read_native_handle(&self.channel, abi::HxfsHandleKind::Directory)?,
+        })
+    }
+
     /// Open an absolute directory path.
     pub fn open_dir(&self, path: &str) -> Result<HxfsDirectory> {
         let mut request = [0u8; 320];
         let len = write_prefixed_path(&mut request, b"OPEN_DIR ", path)?;
         self.channel_to_dir(&request[..len])
+    }
+
+    /// Open an absolute directory path with explicit attenuated HxFS rights.
+    pub fn open_dir_with_rights(&self, path: &str, rights: u64) -> Result<HxfsDirectory> {
+        write_native_request_with_rights(
+            &self.channel,
+            abi::HxfsOp::OpenPath,
+            abi::HxfsHandleKind::Directory,
+            rights,
+            0,
+            0,
+            path.as_bytes(),
+        )?;
+        Ok(HxfsDirectory {
+            channel: read_native_handle(&self.channel, abi::HxfsHandleKind::Directory)?,
+        })
     }
 
     /// Open an absolute file path.
@@ -914,6 +947,26 @@ fn write_native_request(
     arg1: u64,
     payload: &[u8],
 ) -> Result<u64> {
+    write_native_request_with_rights(
+        channel,
+        op,
+        handle_kind,
+        abi::rights::ALL,
+        arg0,
+        arg1,
+        payload,
+    )
+}
+
+fn write_native_request_with_rights(
+    channel: &Channel,
+    op: abi::HxfsOp,
+    handle_kind: abi::HxfsHandleKind,
+    rights: u64,
+    arg0: u64,
+    arg1: u64,
+    payload: &[u8],
+) -> Result<u64> {
     if payload.len() > abi::HXFS_MAX_INLINE_WRITE_BYTES {
         return Err(ErrorCode::InvalidArgs);
     }
@@ -931,7 +984,7 @@ fn write_native_request(
         request_id,
         handle_id: 0,
         handle_kind,
-        rights: abi::rights::ALL,
+        rights,
         arg0,
         arg1,
         payload_len,

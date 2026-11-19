@@ -33,6 +33,8 @@ members = [
     "crates/huesos-sync",
     "crates/huesos-tpm",
     "crates/huesos-bootux",
+    "crates/huesos-hsh",
+    "crates/huesos-gpt",
 ]
 resolver = "2"
 exclude = ["tools"]

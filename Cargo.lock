@@ -316,6 +316,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "huesos-gpt"
+version = "0.1.0"
+
+[[package]]
 name = "huesos-hal"
 version = "0.1.0"
 dependencies = [
@@ -327,6 +331,13 @@ dependencies = [
 [[package]]
 name = "huesos-handlemove"
 version = "0.1.0"
+
+[[package]]
+name = "huesos-hsh"
+version = "0.1.0"
+dependencies = [
+ "huesos-abi",
+]
 
 [[package]]
 name = "huesos-hxfs"

@@ -2,6 +2,7 @@ CANVAS_ABI_1.0 {
   global:
     canvas_*;
     __huesos_register_rtld;
+    __huesos_set_process_ctx;
     __tls_get_addr;
     __cxa_atexit;
     atexit;

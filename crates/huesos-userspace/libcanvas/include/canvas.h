@@ -297,6 +297,20 @@ int32_t atexit(void (*func)(void));
 int32_t __cxa_atexit(void (*func)(void *), void *arg, void *dso_handle);
 void *__tls_get_addr(void *ti);
 
+/* --------------------------------------------------------------------------
+ * Process arguments, standard streams (Channel stdio) & capability mask
+ * -------------------------------------------------------------------------- */
+
+size_t canvas_args_count(void);
+int64_t canvas_arg_get(size_t index, uint8_t *out_buf, size_t buf_len, size_t *out_len);
+int64_t canvas_stdin_read(uint8_t *out_buf, size_t buf_len, size_t *out_read);
+int64_t canvas_stdout_write(const uint8_t *data, size_t len, size_t *out_written);
+int64_t canvas_stderr_write(const uint8_t *data, size_t len, size_t *out_written);
+_Noreturn void canvas_exit_code(int32_t code);
+uint64_t canvas_caps_mask(void);
+uint32_t canvas_cap_handle(uint32_t kind);
+uint32_t canvas_take_cap_handle(uint32_t kind);
+
 int64_t canvas_thread_spawn(
     const char *name,
     CanvasThreadFn entry,

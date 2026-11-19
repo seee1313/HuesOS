@@ -31,16 +31,70 @@ pub const AT_HUESOS_LIB_VMO: u64 = 0x1002;
 /// capability `HxFS` library directory/service handle
 /// (`LD_BOOTSTRAP_HXFS_DIR_LABEL`) on bootstrap ahead of normal messages.
 pub const AT_HUESOS_HXFS_DIR: u64 = 0x1003;
+/// HuesOS extension: non-zero when a standard input `Channel` handle was
+/// queued on bootstrap (`LD_BOOTSTRAP_STDIN_LABEL`).
+pub const AT_HUESOS_STDIN: u64 = 0x1004;
+/// HuesOS extension: non-zero when a standard output `Channel` handle was
+/// queued on bootstrap (`LD_BOOTSTRAP_STDOUT_LABEL`).
+pub const AT_HUESOS_STDOUT: u64 = 0x1005;
+/// HuesOS extension: non-zero when a standard error `Channel` handle was
+/// queued on bootstrap (`LD_BOOTSTRAP_STDERR_LABEL`).
+pub const AT_HUESOS_STDERR: u64 = 0x1006;
+/// HuesOS extension: capability attenuation bitmask (`caps_mask::*`) granted
+/// by the spawning shell/supervisor.
+pub const AT_HUESOS_CAPS_MASK: u64 = 0x1007;
+/// HuesOS extension: non-zero when an `HxFS` service `Channel` handle was
+/// queued on bootstrap (`LD_BOOTSTRAP_HXFS_SERVICE_LABEL`).
+pub const AT_HUESOS_HXFS_SERVICE: u64 = 0x1008;
+/// HuesOS extension: non-zero when a block/volume `Channel` handle was
+/// queued on bootstrap (`LD_BOOTSTRAP_BLOCK_DEV_LABEL`).
+pub const AT_HUESOS_BLOCK_DEV: u64 = 0x1009;
+/// HuesOS extension: non-zero when a `FrameDraw` handle was queued on
+/// bootstrap (`LD_BOOTSTRAP_FRAME_DRAW_LABEL`).
+pub const AT_HUESOS_FRAME_DRAW: u64 = 0x100a;
 
 /// Bootstrap channel label carrying the child's own root VMAR handle to
 /// `ld-huesos.so` (closed by the dynamic linker before entering the app).
 pub const LD_BOOTSTRAP_SELF_VMAR_LABEL: &[u8] = b"huesos:ld:self-vmar";
 /// Bootstrap channel label carrying the read-only `BOOTFS` VMO handle to
-/// `ld-huesos.so` for resolving `/lib/*.so` (closed before entering the app).
+/// `ld-huesos.so` for resolving `/lib/*.so` (closed before entering the app
+/// when `caps_mask::BOOTFS_RO` is clear).
 pub const LD_BOOTSTRAP_LIB_VMO_LABEL: &[u8] = b"huesos:ld:lib-vmo";
 /// Bootstrap channel label carrying an `HxFS` library directory/service
 /// channel handle to `ld-huesos.so` for capability-first SONAME lookup.
 pub const LD_BOOTSTRAP_HXFS_DIR_LABEL: &[u8] = b"huesos:ld:hxfs-dir";
+/// Bootstrap channel label carrying the child's `stdin` IPC `Channel`.
+pub const LD_BOOTSTRAP_STDIN_LABEL: &[u8] = b"huesos:ld:stdin";
+/// Bootstrap channel label carrying the child's `stdout` IPC `Channel`.
+pub const LD_BOOTSTRAP_STDOUT_LABEL: &[u8] = b"huesos:ld:stdout";
+/// Bootstrap channel label carrying the child's `stderr` IPC `Channel`.
+pub const LD_BOOTSTRAP_STDERR_LABEL: &[u8] = b"huesos:ld:stderr";
+/// Bootstrap channel label carrying the child's `HxFS` service `Channel`.
+pub const LD_BOOTSTRAP_HXFS_SERVICE_LABEL: &[u8] = b"huesos:ld:hxfs-service";
+/// Bootstrap channel label carrying the child's block/volume `Channel`.
+pub const LD_BOOTSTRAP_BLOCK_DEV_LABEL: &[u8] = b"huesos:ld:block-dev";
+/// Bootstrap channel label carrying the child's `FrameDraw` handle.
+pub const LD_BOOTSTRAP_FRAME_DRAW_LABEL: &[u8] = b"huesos:ld:frame-draw";
+
+/// Capability bitmask carried in `AT_HUESOS_CAPS_MASK`.
+pub mod caps_mask {
+    /// Application may retain and read from the `BOOTFS` VMO.
+    pub const BOOTFS_RO: u64 = 1 << 0;
+    /// Application may read from the granted `HxFS` capability.
+    pub const HXFS_RO: u64 = 1 << 1;
+    /// Application may mutate the granted `HxFS` capability.
+    pub const HXFS_RW: u64 = 1 << 2;
+    /// Application may blit to the framebuffer via `FrameDraw`.
+    pub const FB_RO: u64 = 1 << 3;
+    /// Application may read from the granted block device / volume.
+    pub const BLOCK_RO: u64 = 1 << 4;
+    /// Application may write to the granted block device / volume.
+    pub const BLOCK_RW: u64 = 1 << 5;
+    /// `HxFS` access is restricted to a scoped subpath directory handle.
+    pub const HXFS_DIR_SCOPED: u64 = 1 << 6;
+    /// Full default interactive shell capability set.
+    pub const ALL_DEFAULT: u64 = BOOTFS_RO | HXFS_RO | HXFS_RW | FB_RO | BLOCK_RO | BLOCK_RW;
+}
 
 /// Default interpreter path expected in `PT_INTERP`.
 pub const DEFAULT_INTERP_PATH: &str = "/lib/ld-huesos.so";

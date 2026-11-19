@@ -24,11 +24,17 @@ use core::slice;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use huesos_abi::auxv::{
-    AuxEntry, AT_BASE, AT_ENTRY, AT_HUESOS_HXFS_DIR, AT_HUESOS_LD_BOOTSTRAP, AT_HUESOS_LIB_VMO,
-    AT_NULL, AT_PHDR, AT_PHENT, AT_PHNUM, LD_BOOTSTRAP_HXFS_DIR_LABEL, LD_BOOTSTRAP_LIB_VMO_LABEL,
-    LD_BOOTSTRAP_SELF_VMAR_LABEL,
+    caps_mask, AuxEntry, AT_BASE, AT_ENTRY, AT_HUESOS_BLOCK_DEV, AT_HUESOS_CAPS_MASK,
+    AT_HUESOS_FRAME_DRAW, AT_HUESOS_HXFS_DIR, AT_HUESOS_HXFS_SERVICE, AT_HUESOS_LD_BOOTSTRAP,
+    AT_HUESOS_LIB_VMO, AT_HUESOS_STDERR, AT_HUESOS_STDIN, AT_HUESOS_STDOUT, AT_NULL, AT_PHDR,
+    AT_PHENT, AT_PHNUM, LD_BOOTSTRAP_BLOCK_DEV_LABEL, LD_BOOTSTRAP_FRAME_DRAW_LABEL,
+    LD_BOOTSTRAP_HXFS_DIR_LABEL, LD_BOOTSTRAP_HXFS_SERVICE_LABEL, LD_BOOTSTRAP_LIB_VMO_LABEL,
+    LD_BOOTSTRAP_SELF_VMAR_LABEL, LD_BOOTSTRAP_STDERR_LABEL, LD_BOOTSTRAP_STDIN_LABEL,
+    LD_BOOTSTRAP_STDOUT_LABEL,
 };
-use huesos_abi::{vmar_flags, vmo_create_flags, HandleValue, USER_HEAP_BASE, USER_HEAP_SIZE};
+use huesos_abi::{
+    rights, vmar_flags, vmo_create_flags, HandleValue, USER_HEAP_BASE, USER_HEAP_SIZE,
+};
 use huesos_elf::dynamic::{
     cstr_at, dt, find_verneed_by_ndx, gnu_hash_lookup, r_x86_64, read_phdr64,
     symbol_version_matches, sysv_hash_lookup, validate_soname, validate_verneed_table, Dyn64,
@@ -39,10 +45,12 @@ use huesos_elf::dynamic::{
 use libcanvas::hxfs::HxfsBlobView;
 use libcanvas::process::Vmar;
 use libcanvas::rtld_abi::{
-    CanvasDlInfo, CanvasDlPhdrInfo, HostAllocOps, RtldOps, RTLD_GLOBAL, RTLD_NODELETE, RTLD_NOLOAD,
-    RTLD_OPS_VERSION,
+    CanvasDlInfo, CanvasDlPhdrInfo, HostAllocOps, ProcessBootstrapInfo, RtldOps, RTLD_GLOBAL,
+    RTLD_NODELETE, RTLD_NOLOAD, RTLD_OPS_VERSION,
 };
-use libcanvas::{debug, memory, process, Channel, Handle, Hxfs, HxfsDirectory, Vmo};
+use libcanvas::{
+    debug, memory, process, Channel, Handle, Hxfs, HxfsDirectory, Vmo, INVALID_HANDLE,
+};
 
 const PAGE_SIZE: u64 = 4096;
 const MAX_OBJECTS: usize = 64;
@@ -463,6 +471,8 @@ unsafe fn self_relocate(base: u64) {
 
 #[derive(Clone, Copy)]
 struct AuxInfo {
+    argc: usize,
+    argv: *const *const c_char,
     phdr: u64,
     phent: u64,
     phnum: u64,
@@ -471,6 +481,13 @@ struct AuxInfo {
     ld_bootstrap: bool,
     expect_lib_vmo: bool,
     expect_hxfs_dir: bool,
+    expect_stdin: bool,
+    expect_stdout: bool,
+    expect_stderr: bool,
+    expect_hxfs_service: bool,
+    expect_block_dev: bool,
+    expect_frame_draw: bool,
+    caps_mask: u64,
 }
 
 fn parse_auxv(sp: *const u64) -> Option<AuxInfo> {
@@ -478,6 +495,8 @@ fn parse_auxv(sp: *const u64) -> Option<AuxInfo> {
         return None;
     }
     let mut info = AuxInfo {
+        argc: 0,
+        argv: ptr::null(),
         phdr: 0,
         phent: 0,
         phnum: 0,
@@ -486,10 +505,19 @@ fn parse_auxv(sp: *const u64) -> Option<AuxInfo> {
         ld_bootstrap: false,
         expect_lib_vmo: true,
         expect_hxfs_dir: false,
+        expect_stdin: false,
+        expect_stdout: false,
+        expect_stderr: false,
+        expect_hxfs_service: false,
+        expect_block_dev: false,
+        expect_frame_draw: false,
+        caps_mask: caps_mask::ALL_DEFAULT,
     };
     // SAFETY: stack was constructed by the parent process launcher per SysV ABI.
     unsafe {
         let argc = *sp as usize;
+        info.argc = argc;
+        info.argv = sp.add(1) as *const *const c_char;
         let mut cursor = sp.add(1 + argc + 1);
         while *cursor != 0 {
             cursor = cursor.add(1);
@@ -508,12 +536,29 @@ fn parse_auxv(sp: *const u64) -> Option<AuxInfo> {
                 AT_HUESOS_LD_BOOTSTRAP => info.ld_bootstrap = entry.a_val != 0,
                 AT_HUESOS_LIB_VMO => info.expect_lib_vmo = entry.a_val != 0,
                 AT_HUESOS_HXFS_DIR => info.expect_hxfs_dir = entry.a_val != 0,
+                AT_HUESOS_STDIN => info.expect_stdin = entry.a_val != 0,
+                AT_HUESOS_STDOUT => info.expect_stdout = entry.a_val != 0,
+                AT_HUESOS_STDERR => info.expect_stderr = entry.a_val != 0,
+                AT_HUESOS_CAPS_MASK => info.caps_mask = entry.a_val,
+                AT_HUESOS_HXFS_SERVICE => info.expect_hxfs_service = entry.a_val != 0,
+                AT_HUESOS_BLOCK_DEV => info.expect_block_dev = entry.a_val != 0,
+                AT_HUESOS_FRAME_DRAW => info.expect_frame_draw = entry.a_val != 0,
                 _ => {}
             }
             aux = aux.add(1);
         }
     }
     Some(info)
+}
+
+struct BootstrapExtras {
+    stdin_ch: u32,
+    stdout_ch: u32,
+    stderr_ch: u32,
+    hxfs_dir_ch: u32,
+    hxfs_service_ch: u32,
+    block_dev_ch: u32,
+    frame_draw_ch: u32,
 }
 
 fn fail(msg: &str) -> ! {
@@ -532,8 +577,7 @@ fn ld_main(sp: *const u64) -> u64 {
         fail("missing required auxv entries");
     }
 
-    let (self_vmar, lib_vmo, hxfs_dir) =
-        receive_bootstrap_handles(aux.expect_lib_vmo, aux.expect_hxfs_dir);
+    let (self_vmar, lib_vmo, hxfs_dir, extras) = receive_bootstrap_handles(&aux);
 
     let main_obj = build_main_object(&aux);
     let initial_count = RTLD_STATE.with(|state| {
@@ -629,6 +673,17 @@ fn ld_main(sp: *const u64) -> u64 {
     // and `canvas_dl*`.
     register_rtld_into_libcanvas(initial_count);
 
+    // Enforce `@caps(bootfs=none)` by dropping the BOOTFS `lib_vmo` capability
+    // immediately after initial `DT_NEEDED` resolution, before `.init_array` or `_start`.
+    if (aux.caps_mask & caps_mask::BOOTFS_RO) == 0 {
+        RTLD_STATE.with(|state| {
+            state.lib_vmo = None;
+        });
+    }
+
+    // Pass `argc`/`argv`, `@caps(...)` mask, and stdio/capability handles to `libcanvas.so`.
+    register_process_ctx_into_libcanvas(initial_count, &aux, &extras);
+
     // Run `.init` and `.init_array` in dependency-first order (reverse load order).
     let mut ctor_idx = initial_count;
     while ctor_idx > 0 {
@@ -683,6 +738,42 @@ fn register_rtld_into_libcanvas(obj_count: usize) {
     }
 }
 
+fn register_process_ctx_into_libcanvas(obj_count: usize, aux: &AuxInfo, extras: &BootstrapExtras) {
+    let reg_addr = RTLD_STATE.with(|state| {
+        for idx in 1..obj_count {
+            let obj = &state.objects[idx];
+            if obj.active {
+                if let Some((_sidx, sym)) =
+                    lookup_in_object(obj, b"__huesos_set_process_ctx", None, true)
+                {
+                    return Some(obj.bias.wrapping_add(sym.st_value));
+                }
+            }
+        }
+        None
+    });
+    if let Some(addr) = reg_addr {
+        let info = ProcessBootstrapInfo {
+            version: RTLD_OPS_VERSION,
+            argc: aux.argc,
+            argv: aux.argv,
+            caps_mask: aux.caps_mask,
+            stdin_ch: extras.stdin_ch,
+            stdout_ch: extras.stdout_ch,
+            stderr_ch: extras.stderr_ch,
+            hxfs_dir_ch: extras.hxfs_dir_ch,
+            hxfs_service_ch: extras.hxfs_service_ch,
+            block_dev_ch: extras.block_dev_ch,
+            frame_draw_ch: extras.frame_draw_ch,
+        };
+        // SAFETY: `__huesos_set_process_ctx` in `libcanvas.so` matches this exact signature.
+        let set_fn: unsafe extern "C" fn(*const ProcessBootstrapInfo) -> i32 =
+            unsafe { core::mem::transmute(addr) };
+        // SAFETY: `info` is valid stack storage.
+        let _ = unsafe { set_fn(&info as *const ProcessBootstrapInfo) };
+    }
+}
+
 unsafe extern "C" fn dummy_host_alloc(_size: usize, _align: usize) -> *mut u8 {
     ptr::null_mut()
 }
@@ -690,18 +781,29 @@ unsafe extern "C" fn dummy_host_alloc(_size: usize, _align: usize) -> *mut u8 {
 unsafe extern "C" fn dummy_host_free(_ptr: *mut u8) {}
 
 fn receive_bootstrap_handles(
-    expect_lib_vmo: bool,
-    expect_hxfs_dir: bool,
-) -> (Vmar, Option<Vmo>, Option<HxfsDirectory>) {
+    aux: &AuxInfo,
+) -> (Vmar, Option<Vmo>, Option<HxfsDirectory>, BootstrapExtras) {
     let bootstrap = libcanvas::channel::bootstrap();
     let mut self_vmar: Option<Handle> = None;
     let mut lib_vmo: Option<Handle> = None;
     let mut hxfs_dir: Option<Handle> = None;
+    let mut stdin_h: Option<Handle> = None;
+    let mut stdout_h: Option<Handle> = None;
+    let mut stderr_h: Option<Handle> = None;
+    let mut hxfs_svc_h: Option<Handle> = None;
+    let mut block_dev_h: Option<Handle> = None;
+    let mut frame_draw_h: Option<Handle> = None;
     let mut buf = [0u8; 64];
 
     while self_vmar.is_none()
-        || (expect_lib_vmo && lib_vmo.is_none())
-        || (expect_hxfs_dir && hxfs_dir.is_none())
+        || (aux.expect_lib_vmo && lib_vmo.is_none())
+        || (aux.expect_hxfs_dir && hxfs_dir.is_none())
+        || (aux.expect_stdin && stdin_h.is_none())
+        || (aux.expect_stdout && stdout_h.is_none())
+        || (aux.expect_stderr && stderr_h.is_none())
+        || (aux.expect_hxfs_service && hxfs_svc_h.is_none())
+        || (aux.expect_block_dev && block_dev_h.is_none())
+        || (aux.expect_frame_draw && frame_draw_h.is_none())
     {
         match bootstrap.read_optional_handle(&mut buf) {
             Ok((n, Some(handle))) if &buf[..n] == LD_BOOTSTRAP_SELF_VMAR_LABEL => {
@@ -712,6 +814,24 @@ fn receive_bootstrap_handles(
             }
             Ok((n, Some(handle))) if &buf[..n] == LD_BOOTSTRAP_HXFS_DIR_LABEL => {
                 hxfs_dir = Some(handle);
+            }
+            Ok((n, Some(handle))) if &buf[..n] == LD_BOOTSTRAP_STDIN_LABEL => {
+                stdin_h = Some(handle);
+            }
+            Ok((n, Some(handle))) if &buf[..n] == LD_BOOTSTRAP_STDOUT_LABEL => {
+                stdout_h = Some(handle);
+            }
+            Ok((n, Some(handle))) if &buf[..n] == LD_BOOTSTRAP_STDERR_LABEL => {
+                stderr_h = Some(handle);
+            }
+            Ok((n, Some(handle))) if &buf[..n] == LD_BOOTSTRAP_HXFS_SERVICE_LABEL => {
+                hxfs_svc_h = Some(handle);
+            }
+            Ok((n, Some(handle))) if &buf[..n] == LD_BOOTSTRAP_BLOCK_DEV_LABEL => {
+                block_dev_h = Some(handle);
+            }
+            Ok((n, Some(handle))) if &buf[..n] == LD_BOOTSTRAP_FRAME_DRAW_LABEL => {
+                frame_draw_h = Some(handle);
             }
             Ok((_n, _)) => {
                 fail("unexpected bootstrap message before dynamic link");
@@ -730,10 +850,34 @@ fn receive_bootstrap_handles(
     let Some(vmar_h) = self_vmar else {
         fail("missing self_vmar bootstrap handle");
     };
+
+    let (rtld_hxfs_dir, app_hxfs_dir_ch) = match hxfs_dir {
+        Some(h) => {
+            let dup = h.duplicate(rights::SAME_RIGHTS).ok();
+            let app_raw = h.into_raw();
+            (
+                dup.map(|d| HxfsDirectory::from_channel(Channel::from_handle(d))),
+                app_raw,
+            )
+        }
+        None => (None, INVALID_HANDLE),
+    };
+
+    let extras = BootstrapExtras {
+        stdin_ch: stdin_h.map_or(INVALID_HANDLE, Handle::into_raw),
+        stdout_ch: stdout_h.map_or(INVALID_HANDLE, Handle::into_raw),
+        stderr_ch: stderr_h.map_or(INVALID_HANDLE, Handle::into_raw),
+        hxfs_dir_ch: app_hxfs_dir_ch,
+        hxfs_service_ch: hxfs_svc_h.map_or(INVALID_HANDLE, Handle::into_raw),
+        block_dev_ch: block_dev_h.map_or(INVALID_HANDLE, Handle::into_raw),
+        frame_draw_ch: frame_draw_h.map_or(INVALID_HANDLE, Handle::into_raw),
+    };
+
     (
         Vmar::from_handle(vmar_h),
         lib_vmo.map(Vmo::from_handle),
-        hxfs_dir.map(|h| HxfsDirectory::from_channel(Channel::from_handle(h))),
+        rtld_hxfs_dir,
+        extras,
     )
 }
 

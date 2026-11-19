@@ -20,6 +20,11 @@ const KEY_ARROW_UP: u8 = 0x80;
 const KEY_ARROW_DOWN: u8 = 0x81;
 const KEY_ARROW_LEFT: u8 = 0x82;
 const KEY_ARROW_RIGHT: u8 = 0x83;
+const KEY_HOME: u8 = 0x84;
+const KEY_END: u8 = 0x85;
+const KEY_DELETE: u8 = 0x86;
+const KEY_PAGE_UP: u8 = 0x87;
+const KEY_PAGE_DOWN: u8 = 0x88;
 
 // wait_any keys used by the event loop.
 const WAIT_KEY_BOOTSTRAP: u64 = 0;
@@ -337,6 +342,7 @@ struct KeyEvent {
 
 struct KeyboardDecoder {
     shift: bool,
+    ctrl: bool,
     caps_lock: bool,
     extended: bool,
 }
@@ -345,6 +351,7 @@ impl KeyboardDecoder {
     const fn new() -> Self {
         Self {
             shift: false,
+            ctrl: false,
             caps_lock: false,
             extended: false,
         }
@@ -368,6 +375,14 @@ impl KeyboardDecoder {
                 self.shift = false;
                 return None;
             }
+            0x1d => {
+                self.ctrl = true;
+                return None;
+            }
+            0x9d => {
+                self.ctrl = false;
+                return None;
+            }
             0x3a => {
                 self.caps_lock = !self.caps_lock;
                 return None;
@@ -382,6 +397,9 @@ impl KeyboardDecoder {
         if self.caps_lock && byte.is_ascii_alphabetic() {
             byte ^= 0x20;
         }
+        if self.ctrl && byte.is_ascii_alphabetic() {
+            byte = (byte.to_ascii_lowercase() - b'a') + 1;
+        }
         if byte == 0 {
             None
         } else {
@@ -389,13 +407,22 @@ impl KeyboardDecoder {
         }
     }
 
-    fn feed_extended(&self, scancode: u8) -> Option<KeyEvent> {
+    fn feed_extended(&mut self, scancode: u8) -> Option<KeyEvent> {
         let pressed = scancode & 0x80 == 0;
+        if (scancode & 0x7f) == 0x1d {
+            self.ctrl = pressed;
+            return None;
+        }
         let key = match scancode & 0x7f {
             0x48 => KEY_ARROW_UP,
             0x50 => KEY_ARROW_DOWN,
             0x4b => KEY_ARROW_LEFT,
             0x4d => KEY_ARROW_RIGHT,
+            0x47 => KEY_HOME,
+            0x4f => KEY_END,
+            0x53 => KEY_DELETE,
+            0x49 => KEY_PAGE_UP,
+            0x51 => KEY_PAGE_DOWN,
             _ => return None,
         };
         Some(KeyEvent { key, pressed })

@@ -154,11 +154,13 @@ type MountedHxfs = FixedHxfsWriter<
 struct FileEndpoint {
     channel: Channel,
     handle: FileHandle,
+    read_only: bool,
 }
 
 struct DirEndpoint {
     channel: Channel,
     handle: DirectoryHandle,
+    read_only: bool,
 }
 
 /// A live BlobView handle.
@@ -628,6 +630,7 @@ impl HxfsRuntime {
         *slot = Some(FileEndpoint {
             channel: server_end,
             handle: file,
+            read_only: false,
         });
     }
 
@@ -652,6 +655,7 @@ impl HxfsRuntime {
         *slot = Some(DirEndpoint {
             channel: server_end,
             handle: dir,
+            read_only: false,
         });
     }
 
@@ -717,13 +721,22 @@ impl HxfsRuntime {
         let Some(client) = self.clients[index].as_ref() else {
             return;
         };
+        let read_only = request.rights != 0
+            && (request.rights
+                & (hxfs_rights::WRITE | hxfs_rights::CREATE | hxfs_rights::MODIFY_DIRECTORY))
+                == 0;
+        let granted_rights = if read_only {
+            hxfs_rights::READ
+        } else {
+            hxfs_rights::READ | hxfs_rights::WRITE | hxfs_rights::SYNC
+        };
         let response = make_response(
             request,
             ResponseMeta {
                 status: HxfsStatus::Ok,
                 handle_kind: HxfsHandleKind::File,
                 handle_id: file.object_id,
-                rights: hxfs_rights::READ | hxfs_rights::WRITE | hxfs_rights::SYNC,
+                rights: granted_rights,
                 object_id: file.object_id,
                 value: file.size,
                 flags: response_flags::HANDLE_TRANSFERRED,
@@ -739,6 +752,7 @@ impl HxfsRuntime {
         *slot = Some(FileEndpoint {
             channel: server_end,
             handle: file,
+            read_only,
         });
     }
 
@@ -759,16 +773,25 @@ impl HxfsRuntime {
         let Some(client) = self.clients[index].as_ref() else {
             return;
         };
+        let read_only = request.rights != 0
+            && (request.rights
+                & (hxfs_rights::WRITE | hxfs_rights::CREATE | hxfs_rights::MODIFY_DIRECTORY))
+                == 0;
+        let granted_rights = if read_only {
+            hxfs_rights::READ
+        } else {
+            hxfs_rights::READ
+                | hxfs_rights::CREATE
+                | hxfs_rights::MODIFY_DIRECTORY
+                | hxfs_rights::SYNC
+        };
         let response = make_response(
             request,
             ResponseMeta {
                 status: HxfsStatus::Ok,
                 handle_kind: HxfsHandleKind::Directory,
                 handle_id: dir.object_id,
-                rights: hxfs_rights::READ
-                    | hxfs_rights::CREATE
-                    | hxfs_rights::MODIFY_DIRECTORY
-                    | hxfs_rights::SYNC,
+                rights: granted_rights,
                 object_id: dir.object_id,
                 value: 0,
                 flags: response_flags::HANDLE_TRANSFERRED,
@@ -784,6 +807,7 @@ impl HxfsRuntime {
         *slot = Some(DirEndpoint {
             channel: server_end,
             handle: dir,
+            read_only,
         });
     }
 
@@ -1281,9 +1305,16 @@ impl HxfsRuntime {
     }
 
     fn file_write_native(&mut self, index: usize, request: HxfsRequest, payload: &[u8]) {
-        let Some(handle) = self.files[index].as_ref().map(|endpoint| endpoint.handle) else {
+        let Some((handle, read_only)) = self.files[index]
+            .as_ref()
+            .map(|endpoint| (endpoint.handle, endpoint.read_only))
+        else {
             return;
         };
+        if read_only {
+            self.write_file_status(index, request, HxfsStatus::AccessDenied);
+            return;
+        }
         match self.fs.write_file_at(handle, request.arg0, payload) {
             Ok(new_handle) => {
                 if let Some(endpoint) = self.files[index].as_mut() {
@@ -1304,9 +1335,16 @@ impl HxfsRuntime {
     }
 
     fn file_truncate_native(&mut self, index: usize, request: HxfsRequest) {
-        let Some(handle) = self.files[index].as_ref().map(|endpoint| endpoint.handle) else {
+        let Some((handle, read_only)) = self.files[index]
+            .as_ref()
+            .map(|endpoint| (endpoint.handle, endpoint.read_only))
+        else {
             return;
         };
+        if read_only {
+            self.write_file_status(index, request, HxfsStatus::AccessDenied);
+            return;
+        }
         match self.fs.truncate_file(handle, request.arg0) {
             Ok(new_handle) => {
                 if let Some(endpoint) = self.files[index].as_mut() {
@@ -1430,6 +1468,7 @@ impl HxfsRuntime {
         let Some(endpoint) = self.dirs[index].as_ref() else {
             return;
         };
+        let parent_ro = endpoint.read_only;
         if endpoint
             .channel
             .write_handle(b"service:hxfs:file:channel", client_end.into_handle())
@@ -1440,6 +1479,7 @@ impl HxfsRuntime {
         *slot = Some(FileEndpoint {
             channel: server_end,
             handle: file,
+            read_only: parent_ro,
         });
     }
 
@@ -1493,13 +1533,23 @@ impl HxfsRuntime {
         let Some(endpoint) = self.dirs[index].as_ref() else {
             return;
         };
+        let read_only = endpoint.read_only
+            || (request.rights != 0
+                && (request.rights
+                    & (hxfs_rights::WRITE | hxfs_rights::CREATE | hxfs_rights::MODIFY_DIRECTORY))
+                    == 0);
+        let granted_rights = if read_only {
+            hxfs_rights::READ
+        } else {
+            hxfs_rights::READ | hxfs_rights::WRITE | hxfs_rights::SYNC
+        };
         let response = make_response(
             request,
             ResponseMeta {
                 status: HxfsStatus::Ok,
                 handle_kind: HxfsHandleKind::File,
                 handle_id: file.object_id,
-                rights: hxfs_rights::READ | hxfs_rights::WRITE | hxfs_rights::SYNC,
+                rights: granted_rights,
                 object_id: file.object_id,
                 value: file.size,
                 flags: response_flags::HANDLE_TRANSFERRED,
@@ -1516,6 +1566,7 @@ impl HxfsRuntime {
         *slot = Some(FileEndpoint {
             channel: server_end,
             handle: file,
+            read_only,
         });
     }
 
@@ -1531,16 +1582,26 @@ impl HxfsRuntime {
         let Some(endpoint) = self.dirs[index].as_ref() else {
             return;
         };
+        let read_only = endpoint.read_only
+            || (request.rights != 0
+                && (request.rights
+                    & (hxfs_rights::WRITE | hxfs_rights::CREATE | hxfs_rights::MODIFY_DIRECTORY))
+                    == 0);
+        let granted_rights = if read_only {
+            hxfs_rights::READ
+        } else {
+            hxfs_rights::READ
+                | hxfs_rights::CREATE
+                | hxfs_rights::MODIFY_DIRECTORY
+                | hxfs_rights::SYNC
+        };
         let response = make_response(
             request,
             ResponseMeta {
                 status: HxfsStatus::Ok,
                 handle_kind: HxfsHandleKind::Directory,
                 handle_id: dir.object_id,
-                rights: hxfs_rights::READ
-                    | hxfs_rights::CREATE
-                    | hxfs_rights::MODIFY_DIRECTORY
-                    | hxfs_rights::SYNC,
+                rights: granted_rights,
                 object_id: dir.object_id,
                 value: 0,
                 flags: response_flags::HANDLE_TRANSFERRED,
@@ -1557,6 +1618,7 @@ impl HxfsRuntime {
         self.dirs[slot_index] = Some(DirEndpoint {
             channel: server_end,
             handle: dir,
+            read_only,
         });
     }
 
@@ -1630,9 +1692,16 @@ impl HxfsRuntime {
     }
 
     fn dir_create_file_native(&mut self, index: usize, request: HxfsRequest, payload: &[u8]) {
-        let Some(parent) = self.dirs[index].as_ref().map(|endpoint| endpoint.handle) else {
+        let Some((parent, read_only)) = self.dirs[index]
+            .as_ref()
+            .map(|endpoint| (endpoint.handle, endpoint.read_only))
+        else {
             return;
         };
+        if read_only {
+            self.write_dir_status(index, request, HxfsStatus::AccessDenied);
+            return;
+        }
         let Ok(name) = core::str::from_utf8(payload) else {
             self.write_dir_status(index, request, HxfsStatus::Invalid);
             return;
@@ -1644,9 +1713,16 @@ impl HxfsRuntime {
     }
 
     fn dir_mkdir_native(&mut self, index: usize, request: HxfsRequest, payload: &[u8]) {
-        let Some(parent) = self.dirs[index].as_ref().map(|endpoint| endpoint.handle) else {
+        let Some((parent, read_only)) = self.dirs[index]
+            .as_ref()
+            .map(|endpoint| (endpoint.handle, endpoint.read_only))
+        else {
             return;
         };
+        if read_only {
+            self.write_dir_status(index, request, HxfsStatus::AccessDenied);
+            return;
+        }
         let Ok(name) = core::str::from_utf8(payload) else {
             self.write_dir_status(index, request, HxfsStatus::Invalid);
             return;
@@ -1658,9 +1734,16 @@ impl HxfsRuntime {
     }
 
     fn dir_rename_native(&mut self, index: usize, request: HxfsRequest, payload: &[u8]) {
-        let Some(parent) = self.dirs[index].as_ref().map(|endpoint| endpoint.handle) else {
+        let Some((parent, read_only)) = self.dirs[index]
+            .as_ref()
+            .map(|endpoint| (endpoint.handle, endpoint.read_only))
+        else {
             return;
         };
+        if read_only {
+            self.write_dir_status(index, request, HxfsStatus::AccessDenied);
+            return;
+        }
         let Some((from, to)) = split_two_strings(payload) else {
             self.write_dir_status(index, request, HxfsStatus::Invalid);
             return;
@@ -1680,9 +1763,16 @@ impl HxfsRuntime {
     }
 
     fn dir_unlink_native(&mut self, index: usize, request: HxfsRequest, payload: &[u8]) {
-        let Some(parent) = self.dirs[index].as_ref().map(|endpoint| endpoint.handle) else {
+        let Some((parent, read_only)) = self.dirs[index]
+            .as_ref()
+            .map(|endpoint| (endpoint.handle, endpoint.read_only))
+        else {
             return;
         };
+        if read_only {
+            self.write_dir_status(index, request, HxfsStatus::AccessDenied);
+            return;
+        }
         let Ok(name) = core::str::from_utf8(payload) else {
             self.write_dir_status(index, request, HxfsStatus::Invalid);
             return;
