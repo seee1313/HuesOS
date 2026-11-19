@@ -33,6 +33,21 @@ pub struct HxfsBlobView {
 }
 
 impl Hxfs {
+    /// Wrap an existing HxFS service channel.
+    pub fn from_channel(channel: Channel) -> Self {
+        Self { channel }
+    }
+
+    /// Borrow the underlying HxFS service channel.
+    pub fn channel(&self) -> &Channel {
+        &self.channel
+    }
+
+    /// Consume this wrapper and return the underlying channel.
+    pub fn into_channel(self) -> Channel {
+        self.channel
+    }
+
     /// Open Hxfs through DriverManager registry.
     pub fn open(registry: &Channel) -> Result<Self> {
         let mut buf = [0u8; 64];
@@ -246,6 +261,21 @@ impl Hxfs {
 }
 
 impl HxfsDirectory {
+    /// Wrap an existing HxFS directory channel.
+    pub fn from_channel(channel: Channel) -> Self {
+        Self { channel }
+    }
+
+    /// Borrow the underlying directory channel.
+    pub fn channel(&self) -> &Channel {
+        &self.channel
+    }
+
+    /// Consume this wrapper and return the underlying channel.
+    pub fn into_channel(self) -> Channel {
+        self.channel
+    }
+
     /// List directory names into `out`.
     pub fn list<'a>(&self, out: &'a mut [u8]) -> Result<&'a [u8]> {
         self.channel.write(b"LIST")?;
@@ -399,6 +429,44 @@ impl HxfsFile {
         }
     }
 
+    /// Query the byte size of this file via the native `GetInfo` ABI.
+    pub fn size(&self) -> Result<u64> {
+        write_native_request(
+            &self.channel,
+            abi::HxfsOp::GetInfo,
+            abi::HxfsHandleKind::File,
+            0,
+            0,
+            &[],
+        )?;
+        let response = read_native_status(&self.channel)?;
+        Ok(response.value)
+    }
+
+    /// Stream the entire file into a fresh executable-capable VMO using
+    /// `GetInfo` + chunked `ReadAt`. Works for files larger than 4 KiB.
+    pub fn read_into_vmo(&self) -> Result<Vmo> {
+        const MAX_VMO_FILE_BYTES: u64 = 16 * 1024 * 1024;
+        let file_size = self.size()?;
+        if file_size == 0 || file_size > MAX_VMO_FILE_BYTES {
+            return Err(ErrorCode::InvalidArgs);
+        }
+        let aligned = (file_size + 4095) & !4095;
+        let vmo = Vmo::create_with_flags(aligned, huesos_abi::vmo_create_flags::EXECUTABLE)?;
+        let mut buf = [0u8; abi::HXFS_MAX_INLINE_WRITE_BYTES];
+        let mut offset = 0u64;
+        while offset < file_size {
+            let want = ((file_size - offset) as usize).min(buf.len());
+            let chunk = self.read_at(offset, &mut buf[..want])?;
+            if chunk.is_empty() {
+                return Err(ErrorCode::InvalidArgs);
+            }
+            vmo.write(offset, chunk)?;
+            offset += chunk.len() as u64;
+        }
+        Ok(vmo)
+    }
+
     /// Read at most `out.len()` bytes starting at `offset` through the native ABI.
     pub fn read_at<'a>(&self, offset: u64, out: &'a mut [u8]) -> Result<&'a [u8]> {
         let requested = out.len().min(abi::HXFS_MAX_INLINE_WRITE_BYTES);
@@ -474,6 +542,15 @@ fn write_prefixed_path(out: &mut [u8], prefix: &[u8], path: &str) -> Result<usiz
 }
 
 impl HxfsBlobView {
+    /// Wrap an existing `BlobView` channel handle.
+    pub fn from_channel(channel: Channel) -> Self {
+        Self {
+            channel,
+            hash: [0u8; 32],
+            size: 0,
+        }
+    }
+
     /// Size of the blob in bytes.
     pub fn size(&self) -> u64 {
         self.size
@@ -495,11 +572,36 @@ impl HxfsBlobView {
             &[],
         )?;
         let mut response = [0u8; NATIVE_MESSAGE_BYTES];
-        let n = read_native_payload_bounded(&self.channel, &mut response)?;
+        let (size, n) = read_native_payload_with_value(&self.channel, &mut response)?;
+        self.size = size;
         if n == 32 {
             self.hash.copy_from_slice(&response[..32]);
         }
         Ok(self.size)
+    }
+
+    /// Stream the entire blob into a fresh executable-capable VMO via
+    /// `GetInfo` + chunked `ReadAt`.
+    pub fn read_into_vmo(&mut self) -> Result<Vmo> {
+        const MAX_BLOB_VMO_BYTES: u64 = 16 * 1024 * 1024;
+        let blob_size = self.info()?;
+        if blob_size == 0 || blob_size > MAX_BLOB_VMO_BYTES {
+            return Err(ErrorCode::InvalidArgs);
+        }
+        let aligned = (blob_size + 4095) & !4095;
+        let vmo = Vmo::create_with_flags(aligned, huesos_abi::vmo_create_flags::EXECUTABLE)?;
+        let mut buf = [0u8; abi::HXFS_MAX_INLINE_WRITE_BYTES];
+        let mut offset = 0u64;
+        while offset < blob_size {
+            let want = ((blob_size - offset) as usize).min(buf.len());
+            let chunk = self.read_at(offset, &mut buf[..want])?;
+            if chunk.is_empty() {
+                return Err(ErrorCode::InvalidArgs);
+            }
+            vmo.write(offset, chunk)?;
+            offset += chunk.len() as u64;
+        }
+        Ok(vmo)
     }
 
     /// Send a ReadAt request for this view without waiting.
@@ -887,21 +989,8 @@ fn read_native_status(channel: &Channel) -> Result<abi::HxfsResponse> {
     Err(status_to_error(response.status))
 }
 
-/// Bounded variant of [`read_native_payload`].
-///
-/// The blob paths are reachable from DriverManager's boot path, where
-/// a service that stops answering must surface as `TimedOut` rather
-/// than parking the supervisor forever in a blocking read.
-fn read_native_payload_bounded(channel: &Channel, out: &mut [u8]) -> Result<usize> {
+fn read_native_payload_with_value(channel: &Channel, out: &mut [u8]) -> Result<(u64, usize)> {
     let mut message = [0u8; NATIVE_MESSAGE_BYTES];
-    // Scheduler ticks, not wall time: generous enough for a device
-    // read behind the service, short enough that a wedged service is
-    // reported rather than waited on. One expiry is not a verdict --
-    // the service may simply be busy with another client -- so retry
-    // within a bounded budget and only then report TimedOut.
-    // As in `read_blob_view_on`: keep waiting for the answer to the
-    // request we already sent. Abandoning it would desynchronise the
-    // channel, because responses carry no request correlation.
     let mut attempts = 4_000u32;
     let n = loop {
         match channel.read_into_timeout(&mut message, 1024) {
@@ -932,7 +1021,16 @@ fn read_native_payload_bounded(channel: &Channel, out: &mut [u8]) -> Result<usiz
     out[..payload_len].copy_from_slice(
         &message[abi::HXFS_RESPONSE_BYTES..abi::HXFS_RESPONSE_BYTES + payload_len],
     );
-    Ok(payload_len)
+    Ok((response.value, payload_len))
+}
+
+/// Bounded variant of [`read_native_payload`].
+///
+/// The blob paths are reachable from DriverManager's boot path, where
+/// a service that stops answering must surface as `TimedOut` rather
+/// than parking the supervisor forever in a blocking read.
+fn read_native_payload_bounded(channel: &Channel, out: &mut [u8]) -> Result<usize> {
+    read_native_payload_with_value(channel, out).map(|(_val, len)| len)
 }
 
 fn read_native_payload(channel: &Channel, out: &mut [u8]) -> Result<usize> {

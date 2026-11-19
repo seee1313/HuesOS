@@ -15,6 +15,8 @@ use core::alloc::{GlobalAlloc, Layout};
 
 #[cfg(feature = "local-heap")]
 use core::cell::UnsafeCell;
+#[cfg(feature = "local-heap")]
+use core::sync::atomic::{AtomicBool, Ordering};
 
 #[cfg(feature = "local-heap")]
 use huesos_scudo::backend::{Backend, BackendError};
@@ -23,6 +25,50 @@ use huesos_scudo::Allocator;
 
 #[cfg(feature = "local-heap")]
 use crate::memory;
+
+#[cfg(feature = "local-heap")]
+struct HeapLock<T> {
+    locked: AtomicBool,
+    data: UnsafeCell<T>,
+}
+
+#[cfg(feature = "local-heap")]
+impl<T> HeapLock<T> {
+    const fn new(data: T) -> Self {
+        Self {
+            locked: AtomicBool::new(false),
+            data: UnsafeCell::new(data),
+        }
+    }
+
+    #[inline]
+    fn with<R>(&self, f: impl FnOnce(&mut T) -> R) -> R {
+        while self
+            .locked
+            .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            while self.locked.load(Ordering::Relaxed) {
+                core::hint::spin_loop();
+            }
+        }
+        struct Unlock<'a>(&'a AtomicBool);
+        impl Drop for Unlock<'_> {
+            #[inline]
+            fn drop(&mut self) {
+                self.0.store(false, Ordering::Release);
+            }
+        }
+        let _guard = Unlock(&self.locked);
+        // SAFETY: `self.locked` was acquired atomically via Acquire CAS and is
+        // released only when `_guard` drops.
+        f(unsafe { &mut *self.data.get() })
+    }
+}
+
+// SAFETY: `HeapLock` enforces mutual exclusion via `AtomicBool` Acquire/Release.
+#[cfg(feature = "local-heap")]
+unsafe impl<T: Send> Sync for HeapLock<T> {}
 
 /// A [`Backend`] over this process's kernel-reserved heap window.
 #[cfg(feature = "local-heap")]
@@ -89,7 +135,7 @@ unsafe impl Backend for HeapWindow {
 /// library's `.init_array` constructor runs `init` automatically before `_start`).
 #[cfg(feature = "local-heap")]
 pub struct ScudoHeap {
-    inner: UnsafeCell<Option<Allocator<HeapWindow>>>,
+    inner: HeapLock<Option<Allocator<HeapWindow>>>,
 }
 
 #[cfg(feature = "local-heap")]
@@ -97,7 +143,7 @@ impl ScudoHeap {
     /// Create an uninitialised heap.
     pub const fn new() -> Self {
         Self {
-            inner: UnsafeCell::new(None),
+            inner: HeapLock::new(None),
         }
     }
 
@@ -111,8 +157,8 @@ impl ScudoHeap {
     /// anyway.
     ///
     /// # Safety
-    /// Must be called at most once before any concurrent access or
-    /// additional threads exist.
+    /// Must be called before concurrent use if no synchronisation barrier
+    /// exists yet; thread-safe under internal `HeapLock` once constructed.
     pub unsafe fn init(&self) -> bool {
         if self.is_initialised() {
             return true;
@@ -121,21 +167,23 @@ impl ScudoHeap {
             Ok(value) if value != 0 => value,
             _ => return false,
         };
-        let allocator = match Allocator::new(HeapWindow::new(), cookie) {
-            Ok(allocator) => allocator,
-            Err(_) => return false,
-        };
-        // SAFETY: called before any other access, per the function's contract.
-        unsafe {
-            *self.inner.get() = Some(allocator);
-        }
-        true
+        self.inner.with(|slot| {
+            if slot.is_some() {
+                return true;
+            }
+            match Allocator::new(HeapWindow::new(), cookie) {
+                Ok(allocator) => {
+                    *slot = Some(allocator);
+                    true
+                }
+                Err(_) => false,
+            }
+        })
     }
 
     /// Whether [`Self::init`] has run successfully.
     pub fn is_initialised(&self) -> bool {
-        // SAFETY: single-threaded process; no mutable borrow is live.
-        unsafe { (*self.inner.get()).is_some() }
+        self.inner.with(|slot| slot.is_some())
     }
 
     /// Query usable bytes for a live allocation returned by this heap.
@@ -144,16 +192,16 @@ impl ScudoHeap {
     /// `ptr` must be a live non-null pointer previously returned by this heap.
     #[cfg(feature = "c-abi")]
     pub(crate) unsafe fn usable_size(&self, ptr: *mut u8) -> Option<usize> {
-        // SAFETY: single-threaded process; borrow does not escape.
-        let slot = unsafe { &mut *self.inner.get() };
-        slot.as_mut()
-            .and_then(|allocator| unsafe { allocator.usable_size(ptr) }.ok())
+        self.inner.with(|slot| {
+            slot.as_mut()
+                .and_then(|allocator| unsafe { allocator.usable_size(ptr) }.ok())
+        })
     }
 
     /// Runtime counters, or `None` before initialisation.
     pub fn stats(&self) -> Option<huesos_scudo::Stats> {
-        // SAFETY: single-threaded process; read-only access.
-        unsafe { (*self.inner.get()).as_ref().map(|inner| inner.stats()) }
+        self.inner
+            .with(|slot| slot.as_ref().map(|inner| inner.stats()))
     }
 }
 
@@ -164,12 +212,6 @@ impl Default for ScudoHeap {
     }
 }
 
-// SAFETY: HuesOS ring-3 processes are single-threaded (see the
-// module docs). The `UnsafeCell` is never accessed concurrently
-// because no second thread exists to access it.
-#[cfg(feature = "local-heap")]
-unsafe impl Sync for ScudoHeap {}
-
 // SAFETY: `alloc`/`dealloc` uphold the GlobalAlloc contract: they
 // return either null or a pointer to `layout.size()` writable bytes
 // aligned to `layout.align()`, and `dealloc` is only ever called
@@ -177,10 +219,7 @@ unsafe impl Sync for ScudoHeap {}
 #[cfg(feature = "local-heap")]
 unsafe impl GlobalAlloc for ScudoHeap {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        // SAFETY: single-threaded; the mutable borrow does not
-        // escape this call.
-        let slot = unsafe { &mut *self.inner.get() };
-        match slot {
+        self.inner.with(|slot| match slot {
             Some(allocator) => match allocator.allocate(layout.size(), layout.align()) {
                 Ok(ptr) => ptr,
                 // GlobalAlloc signals failure with null; the typed
@@ -189,18 +228,18 @@ unsafe impl GlobalAlloc for ScudoHeap {
                 Err(_) => core::ptr::null_mut(),
             },
             None => core::ptr::null_mut(),
-        }
+        })
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, _layout: Layout) {
-        // SAFETY: single-threaded; borrow does not escape.
-        let slot = unsafe { &mut *self.inner.get() };
-        if let Some(allocator) = slot {
-            // SAFETY: `GlobalAlloc::dealloc` requires the caller to
-            // pass a pointer from this allocator, which is exactly
-            // `deallocate`'s contract.
-            let _ = unsafe { allocator.deallocate(ptr) };
-        }
+        self.inner.with(|slot| {
+            if let Some(allocator) = slot {
+                // SAFETY: `GlobalAlloc::dealloc` requires the caller to
+                // pass a pointer from this allocator, which is exactly
+                // `deallocate`'s contract.
+                let _ = unsafe { allocator.deallocate(ptr) };
+            }
+        });
     }
 }
 
