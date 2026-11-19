@@ -140,6 +140,14 @@ jobs:
           echo "status=$status" >> "$GITHUB_OUTPUT"
           grep -n "^error\|FAILED\|panicked" -A6 ci-artifacts/arena-tests/asan/asan.log | head -120
           exit 0
+      - name: Upload the sanitizer log
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: asan-log
+          path: ci-artifacts/arena-tests/asan
+          if-no-files-found: warn
+
       - name: Publish the log
         run: |
           set -euo pipefail
