@@ -6,6 +6,12 @@ name: arena-tests
 # Delete this file when the session ends.
 
 on:
+  # Pushing a change to this file is how the workflow is triggered: a
+  # workflow_dispatch cannot target a file that is missing from the default
+  # branch.
+  push:
+    branches: ["arena/**"]
+    paths: [".github/workflows/arena-tests.yml"]
   workflow_dispatch:
     inputs:
       packages:
