@@ -332,6 +332,15 @@ pub extern "C" fn _start() -> ! {
     logger.release_framebuffer();
     drop(ui);
 
+    // The kernel installs exactly one `FrameDraw` handle in init and `Handle`
+    // closes its table entry on drop. Take that single owner once, here, and
+    // keep it alive for the rest of init's life: every graphics consumer
+    // (terminal, doom, ...) is onboarded by duplicating it. Taking it inside
+    // the hand-off helper instead closed the slot together with the helper's
+    // local wrapper, so the *second* consumer got `bad handle`, had no
+    // framebuffer authority at all, and Doom rendered nothing.
+    let frame_draw = libcanvas::handle::Handle::take_init_frame_draw();
+
     if let Some((_, channel)) = &terminal {
         send_terminal_registry_channel(&mut logger, channel, registry_pair);
         if let Ok(bootfs_dup) = bootfs.duplicate(
@@ -350,7 +359,7 @@ pub extern "C" fn _start() -> ! {
         // the FrameDraw duplicate after the final frame is on screen so
         // the first pixels the terminal presents do not race init's
         // last present.
-        send_frame_draw_capability(&mut logger, channel, "terminal");
+        send_frame_draw_capability(&mut logger, channel, "terminal", &frame_draw);
     }
 
     if boot_failed {
@@ -405,6 +414,7 @@ pub extern "C" fn _start() -> ! {
                             channel,
                             Channel::from_handle(handle),
                             &bootfs,
+                            &frame_draw,
                         );
                     } else {
                         init_logln!(logger, "[init] Doom is already running");
@@ -437,6 +447,7 @@ fn launch_doom(
     terminal: &Channel,
     keyboard: Channel,
     bootfs: &Vmo,
+    frame_draw: &libcanvas::handle::Handle,
 ) -> Option<Process> {
     init_logln!(logger, "[init] launching DoomGeneric/Freedoom from BOOTFS");
     let result = (|| -> libcanvas::Result<Process> {
@@ -462,7 +473,7 @@ fn launch_doom(
         // init-only FrameDraw slot (AccessDenied on every frame, exactly
         // the frozen-screen failure mode). It receives its own duplicate
         // like the terminal did at handoff.
-        send_frame_draw_capability(logger, &bootstrap, "doom");
+        send_frame_draw_capability(logger, &bootstrap, "doom", frame_draw);
         init_logln!(logger, "[init] Doom keyboard, WAD VMO and FrameDraw passed");
         terminal.write(b"doom:started")?;
         Ok(process)
@@ -1465,8 +1476,16 @@ fn launch_shutdown_broker(logger: &mut InitLogger) -> Option<(Process, Channel)>
 /// Without this handoff every consumer's blit bounces with
 /// `AccessDenied` (their handle tables hold no `FrameDraw` slot), and
 /// the screen freezes on the last frame init itself drew.
-fn send_frame_draw_capability(logger: &mut InitLogger, bootstrap: &Channel, consumer: &str) {
-    let installed = libcanvas::handle::Handle::take_init_frame_draw();
+///
+/// `installed` is the caller's long-lived owner of the installed handle
+/// (see `_start`): duplicating from a temporary wrapper would close the slot on
+/// drop and make every consumer after the first fail with `bad handle`.
+fn send_frame_draw_capability(
+    logger: &mut InitLogger,
+    bootstrap: &Channel,
+    consumer: &str,
+    installed: &libcanvas::handle::Handle,
+) {
     let duplicate_rights = libcanvas::rights::DUPLICATE
         | libcanvas::rights::TRANSFER
         | libcanvas::rights::READ
