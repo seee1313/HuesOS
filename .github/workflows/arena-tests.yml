@@ -53,7 +53,7 @@ jobs:
         id: tests
         run: |
           set +e
-          mkdir -p ci-artifacts/arena-tests
+          mkdir -p ci-artifacts/arena-tests/host ci-artifacts/arena-tests/clippy ci-artifacts/arena-tests/asan
           args=""
           for pkg in ${{ inputs.packages }}; do
             args="$args -p $pkg"
@@ -61,19 +61,19 @@ jobs:
           RUST_MIN_STACK=16777216 CARGO_BUILD_JOBS=2 \
             cargo test $args --no-fail-fast \
             --target x86_64-unknown-linux-gnu -Z build-std= \
-            > ci-artifacts/arena-tests/host-tests.log 2>&1
+            > ci-artifacts/arena-tests/host/host-tests.log 2>&1
           status=$?
           echo "status=$status" >> "$GITHUB_OUTPUT"
-          tail -60 ci-artifacts/arena-tests/host-tests.log
+          tail -60 ci-artifacts/arena-tests/host/host-tests.log
           exit 0
       - name: Publish the log
         run: |
           set -euo pipefail
           git config user.name "arena-test-bot"
           git config user.email "arena-test-bot@users.noreply.github.com"
-          echo "status=${{ steps.tests.outputs.status }}" > ci-artifacts/arena-tests/status.txt
+          echo "status=${{ steps.tests.outputs.status }}" > ci-artifacts/arena-tests/host/status.txt
           publish() {
-            git add -f ci-artifacts/arena-tests
+            git add -f ci-artifacts/arena-tests/host ci-artifacts/arena-tests/clippy ci-artifacts/arena-tests/asan
             if git diff --cached --quiet; then
               echo "nothing to publish"
               return 0
@@ -126,7 +126,7 @@ jobs:
           RUSTFLAGS: "-Zsanitizer=address"
         run: |
           set +e
-          mkdir -p ci-artifacts/arena-tests
+          mkdir -p ci-artifacts/arena-tests/host ci-artifacts/arena-tests/clippy ci-artifacts/arena-tests/asan
           cargo test -p huesos-abi -p huesos-arch -p huesos-elf -p huesos-pmm \
             -p huesos-object -p huesos-fb -p huesos-syscalls -p huesos-fat \
             -p huesos-alloc -p huesos-uacpi -p huesos-scudo -p huesos-kernel -p huesos-decoder-fuzz \
@@ -135,19 +135,19 @@ jobs:
             -p huesos-handlemove -p hues-async -p huesos-nvme -p huesos-pci -p huesos-quota \
             -p huesos-hxfs \
             --target x86_64-unknown-linux-gnu -Z build-std= \
-            > ci-artifacts/arena-tests/asan.log 2>&1
+            > ci-artifacts/arena-tests/asan/asan.log 2>&1
           status=$?
           echo "status=$status" >> "$GITHUB_OUTPUT"
-          grep -n "^error\|FAILED\|panicked" -A6 ci-artifacts/arena-tests/asan.log | head -120
+          grep -n "^error\|FAILED\|panicked" -A6 ci-artifacts/arena-tests/asan/asan.log | head -120
           exit 0
       - name: Publish the log
         run: |
           set -euo pipefail
           git config user.name "arena-test-bot"
           git config user.email "arena-test-bot@users.noreply.github.com"
-          echo "status=${{ steps.asan.outputs.status }}" > ci-artifacts/arena-tests/asan-status.txt
+          echo "status=${{ steps.asan.outputs.status }}" > ci-artifacts/arena-tests/asan/status.txt
           publish() {
-            git add -f ci-artifacts/arena-tests
+            git add -f ci-artifacts/arena-tests/host ci-artifacts/arena-tests/clippy ci-artifacts/arena-tests/asan
             if git diff --cached --quiet; then
               echo "nothing to publish"
               return 0
@@ -197,20 +197,20 @@ jobs:
           CARGO_BUILD_JOBS: "2"
         run: |
           set +e
-          mkdir -p ci-artifacts/arena-tests
-          bash scripts/clippy.sh > ci-artifacts/arena-tests/clippy.log 2>&1
+          mkdir -p ci-artifacts/arena-tests/host ci-artifacts/arena-tests/clippy ci-artifacts/arena-tests/asan
+          bash scripts/clippy.sh > ci-artifacts/arena-tests/clippy/clippy.log 2>&1
           status=$?
           echo "status=$status" >> "$GITHUB_OUTPUT"
-          grep -n "^error" -A12 ci-artifacts/arena-tests/clippy.log | head -200
+          grep -n "^error" -A12 ci-artifacts/arena-tests/clippy/clippy.log | head -200
           exit 0
       - name: Publish the clippy log
         run: |
           set -euo pipefail
           git config user.name "arena-test-bot"
           git config user.email "arena-test-bot@users.noreply.github.com"
-          echo "status=${{ steps.clippy.outputs.status }}" > ci-artifacts/arena-tests/clippy-status.txt
+          echo "status=${{ steps.clippy.outputs.status }}" > ci-artifacts/arena-tests/clippy/status.txt
           publish() {
-            git add -f ci-artifacts/arena-tests
+            git add -f ci-artifacts/arena-tests/host ci-artifacts/arena-tests/clippy ci-artifacts/arena-tests/asan
             if git diff --cached --quiet; then
               echo "nothing to publish"
               return 0
