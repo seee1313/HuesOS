@@ -1,0 +1,22 @@
+[package]
+name = "huesos-dyn-rust-smoke"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "huesos-dyn-rust-smoke"
+path = "src/main.rs"
+
+[dependencies]
+libcanvas = { path = "../libcanvas", default-features = false, features = ["dyn-client"] }
+huesos-abi = { path = "../../huesos-abi" }
+
+[profile.release]
+opt-level = 2
+panic = "abort"
+lto = false
+
+[profile.dev]
+panic = "abort"
+
+[workspace]
