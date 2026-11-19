@@ -285,6 +285,11 @@ impl HxfsRuntime {
     }
 
     fn attach_client(&mut self, channel: Channel) {
+        if !self.clients.iter().any(Option::is_none) {
+            for idx in 0..self.clients.len() {
+                self.poll_client(idx);
+            }
+        }
         let Some(slot) = self.clients.iter_mut().find(|slot| slot.is_none()) else {
             println!("[hxfs] client table full");
             drop(channel);

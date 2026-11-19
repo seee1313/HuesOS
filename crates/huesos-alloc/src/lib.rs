@@ -410,16 +410,28 @@ impl Slab {
     }
 }
 
+pub const SLAB_CACHE_SLABS: usize = 128;
+
+const fn slab_pages_for_slot(slot_size: usize) -> usize {
+    match slot_size {
+        256 => 2,
+        512 => 4,
+        1024 => 8,
+        2048 => 16,
+        _ => 1,
+    }
+}
+
 pub struct SlabCache {
     pub slot_size: usize,
-    pub slabs: [Option<Slab>; 16],
+    pub slabs: [Option<Slab>; SLAB_CACHE_SLABS],
 }
 
 impl SlabCache {
-    pub fn new(slot_size: usize) -> Self {
+    pub const fn new(slot_size: usize) -> Self {
         Self {
             slot_size,
-            slabs: [const { None }; 16],
+            slabs: [const { None }; SLAB_CACHE_SLABS],
         }
     }
 
@@ -436,9 +448,10 @@ impl SlabCache {
             .iter()
             .position(Option::is_none)
             .ok_or(AllocError::OutOfMemory)?;
-        let page = buddy.allocate_page()?;
-        // SAFETY: BuddyProvider returned one exclusive writable page.
-        let mut slab = unsafe { Slab::new(page, self.slot_size, 1) };
+        let pages = slab_pages_for_slot(self.slot_size);
+        let page = buddy.allocate_pages(pages)?;
+        // SAFETY: BuddyProvider returned exclusive writable pages.
+        let mut slab = unsafe { Slab::new(page, self.slot_size, pages) };
         let pointer = slab.pop_slot()?.ok_or(AllocError::CorruptedFreeList)?;
         self.slabs[index] = Some(slab);
         Ok(pointer)
@@ -466,7 +479,7 @@ impl SlabCache {
         if slab.used_slots == 0 {
             let page = slab.page_start;
             self.slabs[index] = None;
-            buddy.deallocate_page(page)?;
+            buddy.deallocate_pages(page, slab_pages_for_slot(self.slot_size))?;
         }
         Ok(())
     }
@@ -475,6 +488,20 @@ impl SlabCache {
 pub trait BuddyProvider {
     fn allocate_page(&mut self) -> Result<usize, AllocError>;
     fn deallocate_page(&mut self, page: usize) -> Result<(), AllocError>;
+    fn allocate_pages(&mut self, pages: usize) -> Result<usize, AllocError> {
+        if pages == 1 {
+            self.allocate_page()
+        } else {
+            Err(AllocError::InvalidSize)
+        }
+    }
+    fn deallocate_pages(&mut self, page: usize, pages: usize) -> Result<(), AllocError> {
+        if pages == 1 {
+            self.deallocate_page(page)
+        } else {
+            Err(AllocError::InvalidSize)
+        }
+    }
 }
 
 pub struct SlabAllocator {
@@ -488,10 +515,18 @@ impl Default for SlabAllocator {
 }
 
 impl SlabAllocator {
-    pub fn new() -> Self {
-        let sizes = [16, 32, 64, 128, 256, 512, 1024, 2048];
+    pub const fn new() -> Self {
         Self {
-            caches: sizes.map(SlabCache::new),
+            caches: [
+                SlabCache::new(16),
+                SlabCache::new(32),
+                SlabCache::new(64),
+                SlabCache::new(128),
+                SlabCache::new(256),
+                SlabCache::new(512),
+                SlabCache::new(1024),
+                SlabCache::new(2048),
+            ],
         }
     }
     fn get_cache_idx(size: usize) -> Option<usize> {
@@ -538,18 +573,49 @@ unsafe impl Sync for SlabAllocator {}
 mod tests {
     use super::*;
 
-    struct TestBuddy<'a> {
-        allocator: &'a mut BuddyAllocator<4>,
+    struct TestBuddy<'a, const ORDER: usize> {
+        allocator: &'a mut BuddyAllocator<ORDER>,
     }
 
-    impl BuddyProvider for TestBuddy<'_> {
+    impl<const ORDER: usize> BuddyProvider for TestBuddy<'_, ORDER> {
         fn allocate_page(&mut self) -> Result<usize, AllocError> {
             self.allocator.allocate(1)
         }
 
         fn deallocate_page(&mut self, page: usize) -> Result<(), AllocError> {
-            unsafe { self.allocator.deallocate(page, 1) }
+            self.deallocate_pages(page, 1)
         }
+
+        fn allocate_pages(&mut self, pages: usize) -> Result<usize, AllocError> {
+            self.allocator.allocate(pages)
+        }
+
+        fn deallocate_pages(&mut self, page: usize, pages: usize) -> Result<(), AllocError> {
+            unsafe { self.allocator.deallocate(page, pages) }
+        }
+    }
+
+    fn with_test_slabs<const ORDER: usize>(
+        pages: usize,
+        f: impl FnOnce(&mut SlabAllocator, &mut TestBuddy<'_, ORDER>),
+    ) {
+        let mut memory = alloc::vec![0u8; (pages + 1) * 4096];
+        let base = (memory.as_mut_ptr() as usize + 4095) & !4095;
+        let mut buddy_allocator = unsafe { BuddyAllocator::<ORDER>::new(base, pages, 4096) };
+        let mut provider = TestBuddy {
+            allocator: &mut buddy_allocator,
+        };
+        let mut slabs = SlabAllocator::new();
+        f(&mut slabs, &mut provider);
+    }
+
+    fn free_test_slot<const ORDER: usize>(
+        slabs: &mut SlabAllocator,
+        provider: &mut TestBuddy<'_, ORDER>,
+        ptr: usize,
+        size: usize,
+    ) -> Result<(), AllocError> {
+        unsafe { slabs.deallocate(ptr, size, provider) }
     }
 
     #[test]
@@ -593,22 +659,20 @@ mod tests {
 
     #[test]
     fn slab_rejects_double_free_and_returns_empty_page() {
-        let mut memory = alloc::vec![0u8; 3 * 4096];
-        let base = (memory.as_mut_ptr() as usize + 4095) & !4095;
-        let mut buddy_allocator = unsafe { BuddyAllocator::<4>::new(base, 2, 4096) };
-        let mut provider = TestBuddy {
-            allocator: &mut buddy_allocator,
-        };
-        let mut slabs = SlabAllocator::new();
-        let pointer = slabs.allocate(32, &mut provider).unwrap();
-        unsafe { slabs.deallocate(pointer, 32, &mut provider).unwrap() };
-        assert_eq!(
-            unsafe { slabs.deallocate(pointer, 32, &mut provider) },
-            Err(AllocError::InvalidPointer)
-        );
-        // The empty slab page was returned, so both pages can coalesce and be
-        // allocated as one order-1 block.
-        assert!(provider.allocator.allocate(2).is_ok());
+        with_test_slabs::<4>(2, |slabs, provider| {
+            let Ok(pointer) = slabs.allocate(32, provider) else {
+                assert!(false, "initial 32-byte allocation failed");
+                return;
+            };
+            assert_eq!(free_test_slot(slabs, provider, pointer, 32), Ok(()));
+            assert_eq!(
+                free_test_slot(slabs, provider, pointer, 32),
+                Err(AllocError::InvalidPointer)
+            );
+            // The empty slab page was returned, so both pages can coalesce and be
+            // allocated as one order-1 block.
+            assert!(provider.allocator.allocate(2).is_ok());
+        });
     }
 
     #[test]
@@ -621,5 +685,24 @@ mod tests {
         let b = allocator.allocate(1).unwrap();
         assert_eq!(b, base + 4 * 4096);
         assert!(allocator.allocate(1).is_err());
+    }
+
+    #[test]
+    fn slab_handles_over_128_live_384_byte_allocations_and_reuses_slots() {
+        with_test_slabs::<10>(512, |slabs, provider| {
+            let mut ptrs = alloc::vec::Vec::new();
+            for _ in 0..512 {
+                let Ok(ptr) = slabs.allocate(384, provider) else {
+                    assert!(false, "384-byte slab allocation failed before 512 slots");
+                    return;
+                };
+                ptrs.push(ptr);
+            }
+            for ptr in ptrs.drain(..) {
+                assert_eq!(free_test_slot(slabs, provider, ptr, 384), Ok(()));
+            }
+            // All slab pages were returned and coalesced back to the buddy allocator.
+            assert!(provider.allocator.allocate(512).is_ok());
+        });
     }
 }

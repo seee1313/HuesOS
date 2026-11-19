@@ -1422,6 +1422,7 @@ impl ProcessRuntime {
 /// # Safety
 /// No task may still run with this process's CR3.
 pub fn teardown_process(process: &Process) {
+    huesos_object::clear_process_from_all_cpus(process.koid());
     if let Some(any) = process.address_space.lock().take() {
         if let Ok(runtime) = any.downcast::<ProcessRuntime>() {
             drop(runtime);

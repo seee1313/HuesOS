@@ -2188,6 +2188,9 @@ impl DriverManager {
     }
 
     fn open_query_channel(&mut self) {
+        if !self.query_channels.iter().any(|c| c.is_none()) {
+            self.poll_query_channels();
+        }
         let Some(registry) = self.registry_channel.as_ref() else {
             return;
         };

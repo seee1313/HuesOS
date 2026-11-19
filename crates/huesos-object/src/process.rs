@@ -307,6 +307,8 @@ impl Process {
             if let Some(info) = self.exit_info() {
                 self.queue_exit_packets(info);
             }
+            let bindings = core::mem::take(&mut *self.exit_ports.lock());
+            drop(bindings);
             self.exit_waiters.wake_all();
         }
         exited

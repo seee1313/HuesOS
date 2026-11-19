@@ -347,15 +347,9 @@ impl HshHost {
         args: &[String],
         stdin: Option<&Value>,
     ) -> ExecOutcome {
-        let Some(lib_vmo) = self.bootfs.as_ref() else {
+        if self.bootfs.is_none() {
             return ExecOutcome::err(1, "no BOOTFS VMO available for dynamic linker");
-        };
-        let lib_vmo_dup = match lib_vmo.duplicate(
-            libcanvas::rights::READ | libcanvas::rights::TRANSFER | libcanvas::rights::DUPLICATE,
-        ) {
-            Ok(v) => v,
-            Err(e) => return ExecOutcome::err(1, format!("bootfs dup: {}", e.as_str())),
-        };
+        }
 
         let Some((elf_vmo, off, len, resolved)) = self.resolve_elf(name) else {
             return ExecOutcome::err(127, format!("unknown command: {name}"));
@@ -436,6 +430,10 @@ impl HshHost {
             argv_strs.push(a.as_str());
         }
 
+        let Some(lib_vmo) = self.bootfs.as_ref() else {
+            return ExecOutcome::err(1, "no BOOTFS VMO available for dynamic linker");
+        };
+
         let mut spawn_caps = SpawnCaps::new();
         spawn_caps.args = &argv_strs;
         spawn_caps.caps_mask = mask;
@@ -449,7 +447,7 @@ impl HshHost {
         spawn_caps.registry = query_holder.as_ref();
 
         let spawned =
-            spawn_elf_from_vmo_with_caps(&resolved, &elf_vmo, off, len, &lib_vmo_dup, &spawn_caps);
+            spawn_elf_from_vmo_with_caps(&resolved, &elf_vmo, off, len, lib_vmo, &spawn_caps);
         drop(stdin_r);
         drop(stdout_w);
         drop(stderr_w);
@@ -458,14 +456,14 @@ impl HshHost {
         drop(blk_holder);
         drop(query_holder);
         drop(elf_vmo);
-        drop(lib_vmo_dup);
 
-        let (process, _child_bootstrap) = match spawned {
+        let (process, child_bootstrap) = match spawned {
             Ok(pair) => pair,
             Err(e) => {
                 return ExecOutcome::err(1, format!("spawn '{resolved}' failed: {}", e.as_str()));
             }
         };
+        drop(child_bootstrap);
         let pid = u64::from(process.handle().raw());
         let short_name = resolved.rsplit('/').next().unwrap_or(&resolved);
         let active_label = format!("{short_name} [{pid}]");

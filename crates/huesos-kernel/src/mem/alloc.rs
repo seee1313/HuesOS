@@ -8,35 +8,40 @@ use huesos_alloc::{AllocError, BuddyAllocator, BuddyProvider, SlabAllocator};
 pub const BUDDY_ORDER: usize = 20;
 
 pub struct KernelAllocator {
-    buddy: BuddyAllocator<BUDDY_ORDER>,
+    buddy: Option<BuddyAllocator<BUDDY_ORDER>>,
     slab: SlabAllocator,
 }
 
 impl KernelAllocator {
-    /// Create the kernel heap allocator over pre-mapped pages.
+    /// Construct an uninitialized kernel allocator whose large slab arrays live
+    /// directly in `.bss` rather than on the boot stack.
+    pub const fn uninit() -> Self {
+        Self {
+            buddy: None,
+            slab: SlabAllocator::new(),
+        }
+    }
+
+    /// Initialize the kernel heap allocator over pre-mapped pages.
     ///
     /// # Safety
     /// The range must be page-aligned, writable, exclusively owned by this
     /// allocator, and remain mapped for the kernel lifetime.
-    pub unsafe fn new(base_addr: usize, total_pages: usize) -> Self {
-        Self {
-            buddy: unsafe { BuddyAllocator::new(base_addr, total_pages, 4096) },
-            slab: SlabAllocator::new(),
-        }
+    pub unsafe fn init(&mut self, base_addr: usize, total_pages: usize) {
+        self.buddy = Some(unsafe { BuddyAllocator::new(base_addr, total_pages, 4096) });
     }
 
     pub fn kmalloc(&mut self, size: usize) -> Result<usize, AllocError> {
         if size == 0 {
             return Err(AllocError::InvalidSize);
         }
+        let buddy = self.buddy.as_mut().ok_or(AllocError::OutOfMemory)?;
         if size <= 2048 {
-            let mut w = BuddyWrapper {
-                buddy: &mut self.buddy,
-            };
+            let mut w = BuddyWrapper { buddy };
             self.slab.allocate(size, &mut w)
         } else {
             let pages = size.div_ceil(4096);
-            self.buddy.allocate(pages)
+            buddy.allocate(pages)
         }
     }
 
@@ -49,14 +54,13 @@ impl KernelAllocator {
         if size == 0 {
             return Err(AllocError::InvalidSize);
         }
+        let buddy = self.buddy.as_mut().ok_or(AllocError::OutOfMemory)?;
         if size <= 2048 {
-            let mut provider = BuddyWrapper {
-                buddy: &mut self.buddy,
-            };
+            let mut provider = BuddyWrapper { buddy };
             unsafe { self.slab.deallocate(ptr, size, &mut provider) }
         } else {
             let pages = size.div_ceil(4096);
-            unsafe { self.buddy.deallocate(ptr, pages) }
+            unsafe { buddy.deallocate(ptr, pages) }
         }
     }
 }
@@ -71,30 +75,22 @@ impl BuddyProvider for BuddyWrapper<'_> {
     }
 
     fn deallocate_page(&mut self, page: usize) -> Result<(), AllocError> {
-        // SAFETY: SlabCache returns only complete pages previously supplied by
-        // this exact buddy allocator.
-        unsafe { self.buddy.deallocate(page, 1) }
-    }
-}
-
-impl BuddyProvider for KernelAllocator {
-    fn allocate_page(&mut self) -> Result<usize, AllocError> {
-        self.buddy.allocate(1)
+        self.deallocate_pages(page, 1)
     }
 
-    fn deallocate_page(&mut self, page: usize) -> Result<(), AllocError> {
-        // SAFETY: BuddyProvider contract pairs this with allocate_page.
-        unsafe { self.buddy.deallocate(page, 1) }
+    fn allocate_pages(&mut self, pages: usize) -> Result<usize, AllocError> {
+        self.buddy.allocate(pages)
+    }
+
+    fn deallocate_pages(&mut self, page: usize, pages: usize) -> Result<(), AllocError> {
+        // SAFETY: SlabCache returns only complete page blocks previously
+        // supplied by this exact buddy allocator.
+        unsafe { self.buddy.deallocate(page, pages) }
     }
 }
 
 pub fn kmalloc(size: usize) -> usize {
-    let mut lock = GLOBAL_ALLOCATOR.lock();
-    if let Some(a) = lock.as_mut() {
-        a.kmalloc(size).unwrap_or(0)
-    } else {
-        0
-    }
+    GLOBAL_ALLOCATOR.lock().kmalloc(size).unwrap_or(0)
 }
 
 /// Free one kernel-heap allocation.
@@ -102,14 +98,11 @@ pub fn kmalloc(size: usize) -> usize {
 /// # Safety
 /// `ptr` and `size` must satisfy [`KernelAllocator::kfree`]'s contract.
 pub unsafe fn kfree(ptr: usize, size: usize) {
-    let mut lock = GLOBAL_ALLOCATOR.lock();
-    if let Some(allocator) = lock.as_mut() {
-        let _ = unsafe { allocator.kfree(ptr, size) };
-    }
+    let _ = unsafe { GLOBAL_ALLOCATOR.lock().kfree(ptr, size) };
 }
 
-pub static GLOBAL_ALLOCATOR: RankedIrqSafeTicketLock<Option<KernelAllocator>> =
-    RankedIrqSafeTicketLock::new(None, LockRank::ALLOCATOR);
+pub static GLOBAL_ALLOCATOR: RankedIrqSafeTicketLock<KernelAllocator> =
+    RankedIrqSafeTicketLock::new(KernelAllocator::uninit(), LockRank::ALLOCATOR);
 
 pub struct KernelGlobalAlloc;
 

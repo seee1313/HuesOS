@@ -1,9 +1,9 @@
 use huesos_pmm::MemoryRegion;
 
-// 64 MiB leaves enough physical memory on the default 256 MiB machine for
-// large userspace programs (notably the Doom/Freedoom image) while retaining
-// ample kernel allocator headroom.
-const HEAP_SIZE: usize = 64 * 1024 * 1024;
+// 96 MiB gives ample headroom for concurrent dynamic-ELF launches, IPC queues,
+// and kernel objects while leaving sufficient physical memory on 512 MiB QEMU
+// (and even 256 MiB machines) for the boot DMA pool and userspace images.
+const HEAP_SIZE: usize = 96 * 1024 * 1024;
 const HEAP_VIRT_START: u64 = 0xffff_ff00_0000_0000;
 
 /// Limine memmap types that base revision 3 does *not* put into the HHDM,
@@ -132,8 +132,9 @@ pub fn heap_init() -> Result<(), huesos_arch::paging::KernelPageError> {
     }
 
     unsafe {
-        let a = crate::mem::alloc::KernelAllocator::new(HEAP_VIRT_START as usize, page_count);
-        *crate::mem::alloc::GLOBAL_ALLOCATOR.lock() = Some(a);
+        crate::mem::alloc::GLOBAL_ALLOCATOR
+            .lock()
+            .init(HEAP_VIRT_START as usize, page_count);
     }
     Ok(())
 }
