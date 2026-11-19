@@ -1,0 +1,4 @@
+smoke_status=0
+smoke_status_nvme=1
+profile=release
+commit=c1395927079d1dde29d6179d06d7e7d4adad89b8

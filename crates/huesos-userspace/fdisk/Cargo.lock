@@ -23,12 +23,20 @@ version = "0.1.0"
 dependencies = [
  "huesos-abi",
  "huesos-gpt",
+ "huesos-hxfs",
  "libcanvas",
 ]
 
 [[package]]
 name = "huesos-gpt"
 version = "0.1.0"
+
+[[package]]
+name = "huesos-hxfs"
+version = "0.1.0"
+dependencies = [
+ "huesos-abi",
+]
 
 [[package]]
 name = "libcanvas"
