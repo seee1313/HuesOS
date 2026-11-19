@@ -1,0 +1,426 @@
+[2J[01;01H[=3h[2J[01;01H[2J[01;01H[=3h[2J[01;01H[2J[01;01H[=3h[2J[01;01HBdsDxe: loading Boot0001 "UEFI QEMU DVD-ROM QM00005 " from PciRoot(0x0)/Pci(0x1F,0x2)/Sata(0x2,0xFFFF,0x0)
+BdsDxe: starting Boot0001 "UEFI QEMU DVD-ROM QM00005 " from PciRoot(0x0)/Pci(0x1F,0x2)/Sata(0x2,0xFFFF,0x0)
+[2J[01;01H[01;01H[2J[01;01H[01;01H[HuesOS] Bootloader handed over control
+[security] BSP degraded: SMEP/SMAP unavailable on this CPU
+[PMM] Reserved HBI image: phys_addr=0x177fd000, length=36342544
+[storage] reserved boot DMA pool: phys=0x3800000, len=0x4000000
+[HBI] Ed25519 signature verified (v2.2)
+[measure] signed kernel/HBI/cmdline digest ready for PCR 12
+[uACPI] starting uACPI, version 6.0.0
+[uACPI] RSDP 0x000000001F77E014 00000024 v02 (BOCHS )
+[uACPI] XSDT 0x000000001F77D0E8 00000054 v01 (BOCHS  BXPC    )
+[uACPI] DSDT 0x000000001F77A000 00002108 v01 (BOCHS  BXPC    )
+[uACPI] FACP 0x000000001F779000 000000F4 v03 (BOCHS  BXPC    )
+[uACPI] APIC 0x000000001F778000 00000080 v03 (BOCHS  BXPC    )
+[uACPI] HPET 0x000000001F777000 00000038 v01 (BOCHS  BXPC    )
+[uACPI] MCFG 0x000000001F776000 0000003C v01 (BOCHS  BXPC    )
+[uACPI] WAET 0x000000001F775000 00000028 v01 (BOCHS  BXPC    )
+[uACPI] BGRT 0x000000001F774000 00000038 v01 (INTEL  EDK2    )
+[uACPI] validated ACPI table graph and MADT
+[uACPI] built immutable Ring-3 table archive v2
+[uACPI] derived bounded FADT SystemIO policy
+[tpm] no TPM 2.0 CRB interface present
+[acpi] config mint authority installed: snapshot 1 window(s) 1
+[SMP] MADT parsed 2 CPUs found
+[IOAPIC] routed keyboard IRQ1
+[SMP] LAPIC timer count=624595
+[SMP] Booting AP 1
+[security] AP 1 degraded: SMEP/SMAP unavailable
+[SMP] AP 1 online (waiting for release)
+[SMP] AP 1 ready
+[SMP] bringup done, APs ready=1
+HBI v2.2 parsed. Entries: 0x4
+[storage] boot info: dma=0x3800000+0x4000000 storage_off=false
+[extable] installed 2 recoverable-copy entries
+[SMP] APs released to run
+[SMP] AP HuesOS v0.1.0 on CPU 0
+1 scheduling
+PMM: 59157/268435456 frames (231 MiB)
+FB: 1280x800@32
+[init] installed immutable ACPI table archive VMO
+[init] installed deny-by-default ACPI broker capability
+[init] installed kernel command line VMO
+[init] installed storage boot-info VMO
+[init] installed FrameDraw capability (handle 6)
+[init] installed PciConfigMint capability (handle 8)
+[init] installed DeviceLeaseAuthority capability (handle 9)
+[kernel] entering userspace: rip=0x401990 rsp=0x7ffffefffff8 cs=0x23 ss=0x1b
+[init] hello from ring3 userspace, via libcanvas
+[init] config: /etc/init.conf (1716 bytes)
+[init] config: kernel cmdline applied
+[init] splash: 1280x800, 5 stages
+[init] stage selftest start: Checking kernel interfaces
+[init] user pointer guard smoke OK
+[init] VMO read/write round-trip OK
+[init] channel IPC round-trip OK
+[init] monotonic clock OK (10-tick wait measured 11 ticks)
+[kernel] entering userspace: rip=0x4b9381b80 rsp=0x7ffffefffe80 cs=0x23 ss=0x1b
+[fault-probe] triggering cpu
+[init] SMP affinity self-test OK (child ran on CPU 1)
+[kernel] entering userspace: rip=0x46c178b80 rsp=0x7ffffefffe80 cs=0x23 ss=0x1b
+[fault-probe] triggering wait
+[kernel] entering userspace: rip=0x46386cb80 rsp=0x7ffffefffe80 cs=0x23 ss=0x1b
+[fault-probe] triggering wait
+[kernel] entering userspace: rip=0x46623eb80 rsp=0x7ffffefffe80 cs=0x23 ss=0x1b
+[fault-probe] triggering wait
+[kernel] entering userspace: rip=0x4f34b0b80 rsp=0x7ffffefffe80 cs=0x23 ss=0x1b
+[fault-probe] triggering wait
+[kernel] entering userspace: rip=0x44f225b80 rsp=0x7ffffefffe80 cs=0x23 ss=0x1b
+[fault-probe] triggering wait
+[kernel] entering userspace: rip=0x48f572b80 rsp=0x7ffffefffe80 cs=0x23 ss=0x1b
+[fault-probe] triggering wait
+[kernel] entering userspace: rip=0x451c97b80 rsp=0x7ffffefffe80 cs=0x23 ss=0x1b
+[fault-probe] triggering wait
+[kernel] entering userspace: rip=0x462642b80 rsp=0x7ffffefffe80 cs=0x23 ss=0x1b
+[fault-probe] triggering wait
+[kernel] entering userspace: rip=0x4d1d61b80 rsp=0x7ffffefffe80 cs=0x23 ss=0x1b
+[fault-probe] triggering wait
+[kernel] entering userspace: rip=0x47d8c3b80 rsp=0x7ffffefffe80 cs=0x23 ss=0x1b
+[fault-probe] triggering wait
+[kernel] entering userspace: rip=0x41562bb80 rsp=0x7ffffefffe80 cs=0x23 ss=0x1b
+[fault-probe] triggering wait
+[kernel] entering userspace: rip=0x490fd0b80 rsp=0x7ffffefffe80 cs=0x23 ss=0x1b
+[fault-probe] triggering wait
+[kernel] entering userspace: rip=0x4d6549b80 rsp=0x7ffffefffe80 cs=0x23 ss=0x1b
+[fault-probe] triggering wait
+[kernel] entering userspace: rip=0x40cddab80 rsp=0x7ffffefffe80 cs=0x23 ss=0x1b
+[fault-probe] triggering wait
+[kernel] entering userspace: rip=0x46a78db80 rsp=0x7ffffefffe80 cs=0x23 ss=0x1b
+[fault-probe] triggering wait
+[kernel] entering userspace: rip=0x4caf77b80 rsp=0x7ffffefffe80 cs=0x23 ss=0x1b
+[fault-probe] triggering wait
+[kernel] entering userspace: rip=0x45f328b80 rsp=0x7ffffefffe80 cs=0x23 ss=0x1b
+[fault-probe] triggering wait
+[kernel] entering userspace: rip=0x48f476b80 rsp=0x7ffffefffe80 cs=0x23 ss=0x1b
+[fault-probe] triggering wait
+[kernel] entering userspace: rip=0x49ae94b80 rsp=0x7ffffefffe80 cs=0x23 ss=0x1b
+[fault-probe] triggering wait
+[kernel] entering userspace: rip=0x4acc00b80 rsp=0x7ffffefffe80 cs=0x23 ss=0x1b
+[fault-probe] triggering wait
+[kernel] entering userspace: rip=0x4bf8edb80 rsp=0x7ffffefffe80 cs=0x23 ss=0x1b
+[fault-probe] triggering wait
+[kernel] entering userspace: rip=0x498006b80 rsp=0x7ffffefffe80 cs=0x23 ss=0x1b
+[fault-probe] triggering wait
+[kernel] entering userspace: rip=0x4ed3d5b80 rsp=0x7ffffefffe80 cs=0x23 ss=0x1b
+[fault-probe] triggering wait
+[kernel] entering userspace: rip=0x418e4bb80 rsp=0x7ffffefffe80 cs=0x23 ss=0x1b
+[fault-probe] triggering wait
+[kernel] entering userspace: rip=0x4cc17ab80 rsp=0x7ffffefffe80 cs=0x23 ss=0x1b
+[fault-probe] triggering wait
+[kernel] entering userspace: rip=0x4edd59b80 rsp=0x7ffffefffe80 cs=0x23 ss=0x1b
+[fault-probe] triggering wait
+[kernel] entering userspace: rip=0x41c3f0b80 rsp=0x7ffffefffe80 cs=0x23 ss=0x1b
+[fault-probe] triggering wait
+[kernel] entering userspace: rip=0x415e22b80 rsp=0x7ffffefffe80 cs=0x23 ss=0x1b
+[fault-probe] triggering wait
+[kernel] entering userspace: rip=0x4c7d7bb80 rsp=0x7ffffefffe80 cs=0x23 ss=0x1b
+[fault-probe] triggering wait
+[kernel] entering userspace: rip=0x4fc93fb80 rsp=0x7ffffefffe80 cs=0x23 ss=0x1b
+[fault-probe] triggering wait
+[kernel] entering userspace: rip=0x4bf4e5b80 rsp=0x7ffffefffe80 cs=0x23 ss=0x1b
+[fault-probe] triggering wait
+[kernel] entering userspace: rip=0x4e86a8b80 rsp=0x7ffffefffe80 cs=0x23 ss=0x1b
+[fault-probe] triggering wait
+[init] ProcessWait repeated observation OK
+[init] ProcessWait lifecycle smoke OK (32 blocked wakes)
+[init] waitset self-test starting
+[init] waitset self-test channel-readable OK
+[init] waitset self-test channel-timeout OK
+[init] waitset self-test port-timeout OK
+[init] waitset self-test peer-closed OK
+[init] waitset self-test OK
+[kernel] entering userspace: rip=0x4f7220b80 rsp=0x7ffffefffe80 cs=0x23 ss=0x1b
+[fault-probe] triggering page
+[user-fault] process=fault-probe koid=617 task=278531 cpu=0 reason=PAGE FAULT rip=0x16d42dcc1 address=0x10000 error=0x4 action=terminate-process code=-4097
+[kernel] entering userspace: rip=0x42a005b80 rsp=0x7ffffefffe80 cs=0x23 ss=0x1b
+[fault-probe] triggering opcode
+[user-fault] process=fault-probe koid=635 task=286723 cpu=0 reason=INVALID OPCODE rip=0x119b0ab53 address=0x0 error=0x0 action=terminate-process code=-4099
+[kernel] entering userspace: rip=0x4ecd5cb80 rsp=0x7ffffefffe80 cs=0x23 ss=0x1b
+[fault-probe] triggering gpf
+[user-fault] process=fault-probe koid=653 task=294915 cpu=0 reason=GENERAL PROTECTION FAULT rip=0x1dbb75b03 address=0x0 error=0x0 action=terminate-process code=-4098
+[kernel] entering userspace: rip=0x4ba05cb80 rsp=0x7ffffefffe80 cs=0x23 ss=0x1b
+[fault-probe] triggering divide
+[user-fault] process=fault-probe koid=671 task=303107 cpu=0 reason=DIVIDE ERROR rip=0x1c947dc3a address=0x0 error=0x0 action=terminate-process code=-4100
+[init] user fault isolation OK (#PF/#UD/#GP/#DE contained)
+[kernel] entering userspace: rip=0x492d3bb80 rsp=0x7ffffefffe80 cs=0x23 ss=0x1b
+[smoke-plugin] ctor
+[smoke-plugin] dtor
+[dyn-c-smoke] PASS
+[dyn-c-smoke] atexit OK
+[kernel] entering userspace: rip=0x404b44b80 rsp=0x7ffffefffe80 cs=0x23 ss=0x1b
+[smoke-plugin] ctor
+[smoke-plugin] dtor
+[dyn-rust-smoke] PASS
+[dyn-rust-smoke] atexit OK
+[init] dynamic linking smoke OK
+[kernel] entering userspace: rip=0x4f9842b80 rsp=0x7ffffefffe80 cs=0x23 ss=0x1b
+[fault-probe] triggering shutdown
+[init] shutdown authorization OK (unprivileged caller denied)
+[init] stage selftest ok
+[kernel] entering userspace: rip=0x400160 rsp=0x7ffffefffff8 cs=0x23 ss=0x1b
+[key-broker] started
+[key-broker] ambient/wrong-type key take denied
+[key-broker] kernel key moved; state=plain-only
+[init] key-broker ready
+[init] stage driver-manager start: Starting driver manager
+[init] launched driver-manager
+[init] delegated unique KeyBroker authority to DriverManager
+[init] delegated unique PciConfigMint authority to DriverManager
+[init] delegated DeviceLeaseAuthority to DriverManager
+[kernel] entering userspace: rip=0x417080 rsp=0x7ffffefffff8 cs=0x23 ss=0x1b
+[driver-manager] started in userspace
+[driver-manager] received unique KeyBroker generation authority
+[driver-manager] received unique PciConfigMint authority
+[driver-manager] received DeviceLeaseAuthority
+[driver-manager] package probe: waiting for a client channel
+[init] stage driver-manager degraded
+[init] stage storage start: Probing storage controller
+[init] passed storage boot-info VMO to DriverManager
+[init] passed HBI BOOTFS VMO to DriverManager
+[init] passed ACPI table archive to DriverManager
+[init] transferred ACPI broker capability
+[init] manifest input-host: minting 2 resource grant(s)
+[init] manifest input-host: transferred 2/2 resource handle(s) to DriverManager
+[init] manifest input-host: signalled grants-complete to DriverManager
+[init] boot DMA pool transferred: dma=0x3800000+0x4000000
+[init] stage shutdown-broker start: Arming power control
+[driver-manager] received storage boot-info VMO
+[driver-manager] storage boot-info: dma=0x3800000+0x4000000 storage_off=false
+[driver-manager] received BOOTFS VMO from init
+[init] shutdown-broker: spawned
+[init] shutdown-broker: marked critical
+[kernel] entering userspace: rip=0x400190 rsp=0x7ffffefffff8 cs=0x23 ss=0x1b
+[shutdown-broker] started
+[shutdown-broker] ready; awaiting shutdown command
+[init] shutdown-broker: ready
+[init] stage shutdown-broker ok
+[init] passed registry channel to DriverManager
+[init] stage terminal start: Starting terminal
+[init] launched terminal
+[kernel] entering userspace: rip=0x4dfb20b80 rsp=0x7ffffefffe80 cs=0x23 ss=0x1b
+[terminal] started in userspace
+[init] stage terminal ok
+[driver-manager] BOOTFS hash manifest verified and mounted
+[driver-manager] boot driver manifest: nvme elf=/drivers/driver-host-nvme.elf manifest=/manifests/nvme.hdriver
+[kernel] entering userspace: rip=0x4034f0 rsp=0x7ffffefffff8 cs=0x23 ss=0x1b
+[pci-manager] userspace service started (configuration disabled)
+[driver-manager] launched restartable PCI manager generation 1
+[driver-manager] received immutable ACPI table archive
+[driver-manager] received unique ACPI broker capability
+[driver-manager] launched restartable ACPI manager generation 1
+[driver-manager] grants-complete for input-host
+[driver-manager] manifest: host=input-host services=1 irqs=1 io_ports=1
+[driver-manager] capability: service=keyboard required=1
+[driver-manager] capability: irq=1
+[driver-manager] capability: io=0x60+1
+[driver-manager] manifest loaded: host=input-host elf=/drivers/input-host.elf
+[driver-manager] launched DriverHost input-host
+[driver-manager] forwarded 2/2 resource handle(s) to input-host
+[kernel] entering userspace: rip=0x4004b0 rsp=0x7ffffefffff8 cs=0x23 ss=0x1b
+[acpi-manager] isolated Ring-3 service started
+[kernel] entering userspace: rip=0x400830 rsp=0x7ffffefffff8 cs=0x23 ss=0x1b
+[driver-host:input] started
+[driver-host:input] received manifest resource #1: resource:input-host:ioport:0x60:0x1:excl
+[driver-host:input] received manifest resource #2: resource:input-host:irq:0x1:0x1:excl
+[driver-host:input] retained 2 manifest resource handle(s)
+[driver-host:input] keyboard IRQ bound to Port
+[pci-manager] ready without root descriptors; fail-closed
+[acpi-manager] validated ACPI archive v2: 9 tables, 10 physical mappings, snapshot 1
+[acpi-manager] published HMCF: 1 window(s), snapshot 1, generation 1
+[acpi-manager] broker deny-by-default self-test OK
+[uacpi] starting uACPI, version 6.0.0
+[uacpi] RSDP 0x000000001F77E014 00000024 v02 (BOCHS )
+[uacpi] XSDT 0x000000001F77D0E8 00000054 v01 (BOCHS  BXPC    )
+[uacpi] DSDT 0x000000001F77A000 00002108 v01 (BOCHS  BXPC    )
+[uacpi] FACP 0x000000001F779000 000000F4 v03 (BOCHS  BXPC    )
+[uacpi] APIC 0x000000001F778000 00000080 v03 (BOCHS  BXPC    )
+[uacpi] HPET 0x000000001F777000 00000038 v01 (BOCHS  BXPC    )
+[uacpi] MCFG 0x000000001F776000 0000003C v01 (BOCHS  BXPC    )
+[uacpi] WAET 0x000000001F775000 00000028 v01 (BOCHS  BXPC    )
+[uacpi] BGRT 0x000000001F774000 00000038 v01 (INTEL  EDK2    )
+[uacpi] FACS 0x000000001F7DD000 00000040
+[uacpi] successfully loaded 1 AML blob, 1709 ops in 10ms (avg 170900/s)
+[acpi-manager] AML namespace loaded (snapshot 1, degraded=false)
+[acpi-manager] generation 1 archive/broker capabilities ready
+[driver-manager] input DriverHost starting
+[driver-manager] registered service keyboard from input-host
+[driver-manager] input DriverHost ready
+[driver-manager] received service registry channel from init
+[driver-manager] retained HMCF: 1 window(s), snapshot 1, generation 1
+[driver-manager] forwarded DeviceLeaseAuthority to PCI manager generation 1
+[driver-manager] minted 1 read-only config capability(ies) for PCI manager generation 1 (snapshot 1)
+[driver-manager] ACPI manager ready generation 1 tables 9
+[driver-manager] PCI manager ready (no roots; fail-closed)
+[pci-manager] read-only config authority ready: 1 window(s), snapshot 1, producer generation 1
+[pci-manager] obs backend=ecam windows=1 snapshot=1
+[driver-manager] PCI manager ready (read-only config authority, windows 1)
+[driver-manager] mediation channel pair established for pci generation 1 acpi generation 1
+[pci-manager] received DeviceLeaseAuthority
+[pci-manager] mediation channel established generation 1
+[pci-manager] obs mediation op=read status=ok seg=0 bus=0 dev=0 fn=0 off=0x0 width=4 correlation=0 absent=0 latency-ticks=0
+[acpi-manager] pci-mediation self-test: read=ok vendor-nonzero=true
+[pci-manager] obs mediation op=write status=denied reason=policy correlation=0
+[acpi-manager] pci-mediation self-test: write=denied
+[uacpi] unable to perform IO (SystemIO) operation region \_SB_.PCI0.PRES.PRST: the requested action has been denied
+[uacpi] aborting method invocation due to previous error: the requested action has been denied
+[uacpi]     #0 in \_SB_.PCI0.PRES._INI()+6/6 at StoreOp
+[pci-manager] obs mediation op=read status=ok seg=0 bus=0 dev=31 fn=0 off=0x60 width=1 correlation=0 absent=0 latency-ticks=0
+[pci-manager] obs mediation op=read status=ok seg=0 bus=0 dev=31 fn=0 off=0x61 width=1 correlation=0 absent=0 latency-ticks=0
+[pci-manager] obs mediation op=read status=ok seg=0 bus=0 dev=31 fn=0 off=0x62 width=1 correlation=0 absent=0 latency-ticks=0
+[pci-manager] obs mediation op=read status=ok seg=0 bus=0 dev=31 fn=0 off=0x63 width=1 correlation=0 absent=0 latency-ticks=0
+[pci-manager] obs mediation op=read status=ok seg=0 bus=0 dev=31 fn=0 off=0x68 width=1 correlation=0 absent=0 latency-ticks=0
+[pci-manager] obs mediation op=read status=ok seg=0 bus=0 dev=31 fn=0 off=0x69 width=1 correlation=0 absent=0 latency-ticks=0
+[pci-manager] obs mediation op=read status=ok seg=0 bus=0 dev=31 fn=0 off=0x6a width=1 correlation=0 absent=0 latency-ticks=0
+[pci-manager] obs mediation op=read status=ok seg=0 bus=0 dev=31 fn=0 off=0x6b width=1 correlation=0 absent=0 latency-ticks=0
+[uacpi] unable to perform IO (SystemMemory) operation region \_SB_.HPET.HPTM: the requested action has been denied
+[uacpi] aborting method invocation due to previous error: the requested action has been denied
+[uacpi]     #0 in \_SB_.HPET._STA()+5/48 at ReadFieldAsInteger
+[uacpi] unable to perform IO (SystemIO) operation region \_SB_.PCI0.PRES.PRST: the requested action has been denied
+[uacpi] aborting method invocation due to previous error: the requested action has been denied
+[uacpi]     #0 in \_SB_.CPUS.CSTA()+44/97 at StoreOp
+[uacpi]     #1 in \_SB_.CPUS.C000._STA()+6/6 at MethodCall1Args
+[uacpi] unable to perform IO (SystemIO) operation region \_SB_.PCI0.PRES.PRST: the requested action has been denied
+[uacpi] aborting method invocation due to previous error: the requested action has been denied
+[uacpi]     #0 in \_SB_.CPUS.CSTA()+44/97 at StoreOp
+[uacpi]     #1 in \_SB_.CPUS.C001._STA()+6/6 at MethodCall1Args
+[uacpi] namespace initialization done in 10ms: 36 devices, 0 thermal zones
+[acpi-manager] AML namespace initialized (snapshot 1, degraded=true, hpci_eligible=true, detail=0xa, pic_status=0)
+[acpi-manager] published HPCI: 1 root(s), 6 aperture(s), 128 prt(s), snapshot 1, generation 1
+[acpi-manager] root[0] seg=0 bus=0..=255 prt=128 osc=Masked req=0x1d granted=0x1c err=0x10
+[driver-manager] retained HPCI: 1 root(s), 6 aperture(s), generation 1
+[driver-manager] ACPI namespace initialized generation 1 hpci_eligible=true status=3 detail=0xa (HMCF retained)
+[driver-manager] forwarded HPCI root table to PCI manager generation 1
+[pci-manager] accepted HPCI root table: 1 root(s), 6 aperture(s), 128 prt(s)
+[pci-manager] root[0] seg=0 bus=0..=255 prt(direct=0, link=128, unresolved=0) osc=Masked granted=0x1c err=0x10
+[driver-manager] PCI manager accepted HPCI root table: 1 root(s)
+[pci-manager] obs inv-dev gen=1 seg=0 bdf=00:00.0 vendor=0x8086 dev=0x29c0 class=06:00:00 depth=0 resources=FirmwareResourcesAvailable
+[pci-manager] obs inv-dev gen=1 seg=0 bdf=00:01.0 vendor=0x1234 dev=0x1111 class=03:00:00 depth=0 resources=FirmwareResourcesAvailable
+[pci-manager] obs inv-dev gen=1 seg=0 bdf=00:1f.0 vendor=0x8086 dev=0x2918 class=06:01:00 depth=0 resources=FirmwareResourcesAvailable
+[pci-manager] obs inv-dev gen=1 seg=0 bdf=00:1f.2 vendor=0x8086 dev=0x2922 class=01:06:01 depth=0 resources=FirmwareResourcesAvailable
+[pci-manager] obs inv-dev gen=1 seg=0 bdf=00:1f.3 vendor=0x8086 dev=0x2930 class=0c:05:00 depth=0 resources=FirmwareResourcesAvailable
+[pci-manager] published diagnostic PCI inventory: gen=1 roots=1 functions=5 resources=FirmwareResourcesAvailable valid-res=4 unrouteable-res=1 conflict-res=0 config-writes=0
+[driver-manager] PCI diagnostic inventory published: 5 function(s) (FirmwareResourcesAvailable)
+[driver-manager] minted 1 write-capable config capability(ies) for PCI manager generation 1 (snapshot 1)
+[pci-manager] obs b4-write class=CommandControl bdf=00:00.0 offset=0x04 width=2 before=0x0007 written=0x0007 readback=0x0007 mask=0x0547 status=ok
+[pci-manager] write-capable config authority ready: 1 window(s), b4-policy=verified
+[pci-manager] obs e1-bar bdf=00:01.0 reg=bar0 class=mmio32 pci=0x80000000 len=0x1000000 assigned=true status=Valid
+[pci-manager] obs e1-bar bdf=00:01.0 reg=bar2 class=mmio32 pci=0x81011000 len=0x1000 assigned=true status=Valid
+[pci-manager] obs e1-bar bdf=00:1f.2 reg=bar4 class=io pci=0x6040 len=0x20 assigned=true status=Valid
+[pci-manager] obs e1-bar bdf=00:1f.2 reg=bar5 class=mmio32 pci=0x81010000 len=0x1000 assigned=true status=Valid
+[pci-manager] obs e1-bar bdf=00:1f.3 reg=bar4 class=io pci=0x6000 len=0x40 assigned=true status=Valid
+[pci-manager] obs f2-plan status=ok planned=5 writes=0 roms=5
+[pci-manager] obs g3-gone probe=ok pkt_type=5 dev_id=0xffffffffffffffff post_revoke_denied=true
+[pci-manager] obs g2-lease bdf=00:00.0 device_id=0x100000000 gen=1 snapshot=0x0000000000000001 status=ok
+[pci-manager] obs g2-lease bdf=00:01.0 device_id=0x100000008 gen=1 snapshot=0x0000000000000001 status=ok
+[pci-manager] obs g2-lease bdf=00:1f.0 device_id=0x1000000f8 gen=1 snapshot=0x0000000000000001 status=ok
+[pci-manager] obs g2-lease bdf=00:1f.2 device_id=0x1000000fa gen=1 snapshot=0x0000000000000001 status=ok
+[pci-manager] obs g2-lease bdf=00:1f.3 device_id=0x1000000fb gen=1 snapshot=0x0000000000000001 status=ok
+[pci-manager] obs h3-bind bdf=00:00.0 vendor=0x8086 device=0x29c0 class=06:00:00 decision=unbound
+[pci-manager] obs h3-bind bdf=00:01.0 vendor=0x1234 device=0x1111 class=03:00:00 decision=unbound
+[pci-manager] obs h3-bind bdf=00:1f.0 vendor=0x8086 device=0x2918 class=06:01:00 decision=unbound
+[pci-manager] obs h3-bind bdf=00:1f.2 vendor=0x8086 device=0x2922 class=01:06:01 decision=matched driver=ahci-host score=30
+[pci-manager] obs i1-irq bdf=00:1f.2 mode=msi irq=208 writes=5 valid_b4=true minted=3 ro_lease_mint_denied=true
+[pci-manager] obs i2-dma bdf=00:1f.2 isolation=Trusted
+[pci-manager] obs h3-bind bdf=00:1f.3 vendor=0x8086 device=0x2930 class=0c:05:00 decision=unbound
+[driver-manager] obs h3-handoff bound=1 ro_leases=1 minted_resources=3
+[driver-manager] PCI manager ready (write-capable config authority, windows 1)
+[init] stage storage skipped
+[init] stage summary ok selftest
+[init] stage summary ~~ driver-manager
+[init] stage summary -- storage
+[init] stage summary ok shutdown-broker
+[init] stage summary ok terminal
+[init] boot stages complete: degraded
+[init] framebuffer handoff: terminal owns the display
+[init] passed DriverManager registry to terminal
+[init] FrameDraw capability transferred to terminal
+[init] FrameDraw duplicate self-check OK
+[observe] 0100000000000000000000000000000001000000010000000200000000000000
+[init] observation records dumped: 1
+[init] service launch complete; parking as init supervisor
+[terminal] FrameDraw capability received
+[driver-manager] opened keyboard service channel for client
+[driver-host:input] attached keyboard client
+[terminal] spawned /bin/hsh.elf pid=16
+[terminal] keyboard service online, starting /bin/hsh.elf session
+[kernel] entering userspace: rip=0x4fee71b80 rsp=0x7ffffefffe60 cs=0x23 ss=0x1b
+[hsh] core language/cls/fn smoke OK
+[kernel] entering userspace: rip=0x4d275bb80 rsp=0x7ffffefffe60 cs=0x23 ss=0x1b
+[hsh] ls.elf pipe OK
+[kernel] entering userspace: rip=0x489212b80 rsp=0x7ffffefffe80 cs=0x23 ss=0x1b
+[hsh] pci.elf pipe OK
+[kernel] entering userspace: rip=0x424774b80 rsp=0x7ffffefffe60 cs=0x23 ss=0x1b
+[hsh] hxfs.elf status OK
+[kernel] entering userspace: rip=0x44635eb80 rsp=0x7ffffefffe60 cs=0x23 ss=0x1b
+[hsh] fdisk.elf pipe OK
+[kernel] entering userspace: rip=0x4e04d1b80 rsp=0x7ffffefffe30 cs=0x23 ss=0x1b
+[kernel] entering userspace: rip=0x46277db80 rsp=0x7ffffefffe60 cs=0x23 ss=0x1b
+[hsh] @caps(hxfs=ro) enforcement OK
+[kernel] entering userspace: rip=0x4f9352b80 rsp=0x7ffffefffe60 cs=0x23 ss=0x1b
+[kernel] entering userspace: rip=0x4e9cbdb80 rsp=0x7ffffefffe70 cs=0x23 ss=0x1b
+[hsh] @caps(hxfs=none,bootfs=none) enforcement OK
+[kernel] entering userspace: rip=0x488719b80 rsp=0x7ffffefffe80 cs=0x23 ss=0x1b
+[kernel] entering userspace: rip=0x440aedb80 rsp=0x7ffffefffe60 cs=0x23 ss=0x1b
+[kernel] entering userspace: rip=0x4f7537b80 rsp=0x7ffffefffe60 cs=0x23 ss=0x1b
+[driver-manager] NVMe BlockDevice requested before online
+[driver-manager] NVMe BlockDevice requested before online
+[driver-manager] NVMe BlockDevice requested before online
+[driver-manager] NVMe BlockDevice requested before online
+[driver-manager] NVMe BlockDevice requested before online
+[driver-manager] NVMe BlockDevice requested before online
+[driver-manager] NVMe BlockDevice requested before online
+[kernel] entering userspace: rip=0x491b72b80 rsp=0x7ffffefffe80 cs=0x23 ss=0x1b
+[driver-manager] NVMe BlockDevice requested before online
+[kernel] entering userspace: rip=0x46b16fb80 rsp=0x7ffffefffe60 cs=0x23 ss=0x1b
+[driver-manager] NVMe BlockDevice requested before online
+[kernel] entering userspace: rip=0x4c90a6b80 rsp=0x7ffffefffe60 cs=0x23 ss=0x1b
+[driver-manager] NVMe BlockDevice requested before online
+[kernel] entering userspace: rip=0x49a040b80 rsp=0x7ffffefffe80 cs=0x23 ss=0x1b
+[driver-manager] NVMe BlockDevice requested before online
+[kernel] entering userspace: rip=0x446723b80 rsp=0x7ffffefffe60 cs=0x23 ss=0x1b
+[driver-manager] NVMe BlockDevice requested before online
+[kernel] entering userspace: rip=0x4b6b29b80 rsp=0x7ffffefffe60 cs=0x23 ss=0x1b
+[driver-manager] NVMe BlockDevice requested before online
+[kernel] entering userspace: rip=0x43d92fb80 rsp=0x7ffffefffe80 cs=0x23 ss=0x1b
+[driver-manager] NVMe BlockDevice requested before online
+[kernel] entering userspace: rip=0x4dd6e7b80 rsp=0x7ffffefffe60 cs=0x23 ss=0x1b
+[driver-manager] NVMe BlockDevice requested before online
+[kernel] entering userspace: rip=0x4ece2ab80 rsp=0x7ffffefffe60 cs=0x23 ss=0x1b
+[driver-manager] NVMe BlockDevice requested before online
+[kernel] entering userspace: rip=0x420411b80 rsp=0x7ffffefffe80 cs=0x23 ss=0x1b
+[driver-manager] NVMe BlockDevice requested before online
+[kernel] entering userspace: rip=0x4522b4b80 rsp=0x7ffffefffe60 cs=0x23 ss=0x1b
+[driver-manager] NVMe BlockDevice requested before online
+[driver-manager] NVMe BlockDevice requested before online
+[kernel] entering userspace: rip=0x4afd6db80 rsp=0x7ffffefffe60 cs=0x23 ss=0x1b
+[kernel] entering userspace: rip=0x40b8fab80 rsp=0x7ffffefffe80 cs=0x23 ss=0x1b
+[driver-manager] NVMe BlockDevice requested before online
+[driver-manager] NVMe BlockDevice requested before online
+[kernel] entering userspace: rip=0x48e112b80 rsp=0x7ffffefffe60 cs=0x23 ss=0x1b
+[driver-manager] NVMe BlockDevice requested before online
+[kernel] entering userspace: rip=0x4bb4bfb80 rsp=0x7ffffefffe60 cs=0x23 ss=0x1b
+[kernel] entering userspace: rip=0x430943b80 rsp=0x7ffffefffe80 cs=0x23 ss=0x1b
+[driver-manager] NVMe BlockDevice requested before online
+[kernel] entering userspace: rip=0x4abbc6b80 rsp=0x7ffffefffe60 cs=0x23 ss=0x1b
+[driver-manager] NVMe BlockDevice requested before online
+[kernel] entering userspace: rip=0x4b0cadb80 rsp=0x7ffffefffe60 cs=0x23 ss=0x1b
+[driver-manager] NVMe BlockDevice requested before online
+[kernel] entering userspace: rip=0x41ad2db80 rsp=0x7ffffefffe80 cs=0x23 ss=0x1b
+[driver-manager] NVMe BlockDevice requested before online
+[driver-manager] NVMe BlockDevice requested before online
+[kernel] entering userspace: rip=0x4ecd92b80 rsp=0x7ffffefffe60 cs=0x23 ss=0x1b
+[driver-manager] NVMe BlockDevice requested before online
+[kernel] entering userspace: rip=0x402c43b80 rsp=0x7ffffefffe60 cs=0x23 ss=0x1b
+[kernel] entering userspace: rip=0x46f4cfb80 rsp=0x7ffffefffe80 cs=0x23 ss=0x1b
+[driver-manager] NVMe BlockDevice requested before online
+[kernel] entering userspace: rip=0x43d9c9b80 rsp=0x7ffffefffe60 cs=0x23 ss=0x1b
+[driver-manager] NVMe BlockDevice requested before online
+[kernel] entering userspace: rip=0x402047b80 rsp=0x7ffffefffe60 cs=0x23 ss=0x1b
+[driver-manager] NVMe BlockDevice requested before online
+[kernel] entering userspace: rip=0x45f3d2b80 rsp=0x7ffffefffe80 cs=0x23 ss=0x1b
+[driver-manager] NVMe BlockDevice requested before online
+[kernel] entering userspace: rip=0x4c7efdb80 rsp=0x7ffffefffe60 cs=0x23 ss=0x1b
+[driver-manager] NVMe BlockDevice requested before online
+[kernel] entering userspace: rip=0x4e23bbb80 rsp=0x7ffffefffe60 cs=0x23 ss=0x1b
+[driver-manager] NVMe BlockDevice requested before online
+[hsh] consecutive spawn stress OK (30 spawns)
