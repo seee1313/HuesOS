@@ -442,19 +442,6 @@ impl HshHost {
             .any(|(path, _, _)| path == abs || path.starts_with(&dir_prefix))
     }
 
-    /// Whether `abs` names an existing file in HxFS or in BOOTFS.
-    fn is_file(&mut self, abs: &str) -> bool {
-        self.try_connect_hxfs();
-        if let Some(hxfs) = self.hxfs.as_ref() {
-            if hxfs.open_file(abs).is_ok() {
-                return true;
-            }
-        }
-        self.iter_bootfs_entries()
-            .iter()
-            .any(|(path, _, _)| path == abs)
-    }
-
     /// Turn one argument into the absolute path an external utility expects.
     ///
     /// External `/bin/*.elf` tools have no notion of a working directory, so
