@@ -2,7 +2,7 @@
 
 use crate::handle::Handle;
 use crate::raw;
-use huesos_abi::{ChannelReadEtcArgs, HandleValue, Syscall, INVALID_HANDLE};
+use huesos_abi::{ChannelPeekArgs, ChannelReadEtcArgs, HandleValue, Syscall, INVALID_HANDLE};
 
 /// A maximum message size accepted by [`Channel::read`]'s default buffer
 /// helper. Callers with larger messages should size their own buffer and
@@ -187,6 +187,40 @@ impl Channel {
         let ret = raw::syscall1(Syscall::ChannelReadEtc, &args as *const _ as u64);
         raw::decode(ret)?;
         Ok((actual_bytes as usize, actual_handles as usize))
+    }
+
+    /// Park the thread until the next message is readable or `ticks`
+    /// scheduler ticks elapse.
+    ///
+    /// `ticks == 0` only probes; `1` blocks indefinitely; anything else is a
+    /// tick budget that ends in [`crate::ErrorCode::TimedOut`]. Uses
+    /// `ChannelPeek`, whose wait queue honours the budget (`ChannelReadEtc`
+    /// only distinguishes "do not block" from "block forever").
+    pub fn wait_readable(&self, ticks: u64) -> crate::Result<()> {
+        let mut byte_size: u32 = 0;
+        let mut handle_count: u32 = 0;
+        let mut cookie: u64 = 0;
+        let args = ChannelPeekArgs {
+            channel: self.0.raw(),
+            out_byte_size: &mut byte_size as *mut u32,
+            out_handle_count: &mut handle_count as *mut u32,
+            out_cookie: &mut cookie as *mut u64,
+            wait_mode: ticks,
+        };
+        let ret = raw::syscall1(Syscall::ChannelPeek, &args as *const _ as u64);
+        raw::decode(ret)?;
+        Ok(())
+    }
+
+    /// [`Self::read_optional_handle`] that first waits up to `ticks` for a
+    /// message instead of requiring one to be queued already.
+    pub fn read_optional_handle_timeout(
+        &self,
+        buf: &mut [u8],
+        ticks: u64,
+    ) -> crate::Result<(usize, Option<Handle>)> {
+        self.wait_readable(ticks)?;
+        self.read_optional_handle(buf)
     }
 
     /// Read bytes plus zero or one transferred handle.

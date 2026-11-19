@@ -164,6 +164,7 @@ required+=(
     '[hsh] @caps(hxfs=ro) enforcement OK'
     '[hsh] @caps(hxfs=none,bootfs=none) enforcement OK'
     '[hsh] consecutive spawn stress OK (30 spawns)'
+    '[hsh] post-stress query channel OK'
     '[terminal] keyboard service online, starting /bin/hsh.elf session'
     '[init] FrameDraw duplicate self-check OK'
     '[init] stage selftest ok'
