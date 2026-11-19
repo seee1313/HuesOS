@@ -1,41 +1,41 @@
 bash scripts/ensure-hbi-signing-key.sh
 [trust] generating ephemeral development Ed25519 HBI key
 [trust] development HBI key active (not for release distribution)
-HUESOS_HBI_VERIFY_KEY_HEX="$(cat build/hbi-verify-key.hex)" cargo build -p huesos-boot --release -Z build-std=core,compiler_builtins,alloc -Z build-std-features=compiler-builtins-mem
+HUESOS_HBI_VERIFY_KEY_HEX="$(cat build/hbi-verify-key.hex)" cargo build -p huesos-boot  -Z build-std=core,compiler_builtins,alloc -Z build-std-features=compiler-builtins-mem
     Updating crates.io index
  Downloading crates ...
   Downloaded bit_field v0.10.3
-  Downloaded bitflags v1.3.2
   Downloaded curve25519-dalek-derive v0.1.1
+  Downloaded limine v0.6.5
   Downloaded ed25519 v2.2.3
-  Downloaded bitflags v2.13.0
   Downloaded const_fn v0.4.12
+  Downloaded linked_list_allocator v0.10.6
+  Downloaded rustc_version v0.4.1
+  Downloaded scopeguard v1.2.0
   Downloaded pic8259 v0.11.0
   Downloaded signature v2.2.0
-  Downloaded volatile v0.4.6
-  Downloaded rustc_version v0.4.1
   Downloaded uart_16550 v0.3.2
-  Downloaded limine v0.6.5
-  Downloaded scopeguard v1.2.0
   Downloaded lock_api v0.4.14
-  Downloaded static_assertions v1.1.0
-  Downloaded find-msvc-tools v0.1.9
-  Downloaded shlex v2.0.1
-  Downloaded semver v1.0.28
-  Downloaded quote v1.0.47
+  Downloaded volatile v0.4.6
   Downloaded spinning_top v0.2.5
+  Downloaded spin v0.9.9
   Downloaded unicode-ident v1.0.24
   Downloaded proc-macro2 v1.0.107
-  Downloaded cc v1.2.67
+  Downloaded log v0.4.33
   Downloaded x86_64 v0.15.4
   Downloaded raw-cpuid v10.7.0
   Downloaded ed25519-dalek v2.2.0
-  Downloaded spin v0.9.9
-  Downloaded log v0.4.33
-  Downloaded rustversion v1.0.22
-  Downloaded linked_list_allocator v0.10.6
+  Downloaded cc v1.2.67
+  Downloaded semver v1.0.28
+  Downloaded quote v1.0.47
+  Downloaded bitflags v2.13.0
+  Downloaded static_assertions v1.1.0
+  Downloaded shlex v2.0.1
   Downloaded curve25519-dalek v4.1.3
+  Downloaded rustversion v1.0.22
+  Downloaded bitflags v1.3.2
   Downloaded syn v2.0.119
+  Downloaded find-msvc-tools v0.1.9
   Downloaded x86 v0.52.0
    Compiling compiler_builtins v0.1.160 (/home/runner/.rustup/toolchains/nightly-2026-03-01-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/compiler-builtins/compiler-builtins)
    Compiling core v0.0.0 (/home/runner/.rustup/toolchains/nightly-2026-03-01-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core)
@@ -43,14 +43,14 @@ HUESOS_HBI_VERIFY_KEY_HEX="$(cat build/hbi-verify-key.hex)" cargo build -p hueso
    Compiling generic-array v0.14.7
    Compiling rustversion v1.0.22
    Compiling const_fn v0.4.12
-   Compiling x86 v0.52.0
    Compiling typenum v1.20.1
+   Compiling x86 v0.52.0
    Compiling semver v1.0.28
    Compiling rustc_version v0.4.1
    Compiling block-buffer v0.10.4
    Compiling crypto-common v0.1.7
-   Compiling shlex v2.0.1
    Compiling find-msvc-tools v0.1.9
+   Compiling shlex v2.0.1
    Compiling cc v1.2.67
    Compiling digest v0.10.7
    Compiling curve25519-dalek v4.1.3
@@ -65,8 +65,8 @@ HUESOS_HBI_VERIFY_KEY_HEX="$(cat build/hbi-verify-key.hex)" cargo build -p hueso
    Compiling bit_field v0.10.3
    Compiling bitflags v2.13.0
    Compiling spin v0.9.9
-   Compiling bitflags v1.3.2
    Compiling huesos-abi v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-abi)
+   Compiling bitflags v1.3.2
    Compiling log v0.4.33
    Compiling raw-cpuid v10.7.0
    Compiling volatile v0.4.6
@@ -74,70 +74,70 @@ HUESOS_HBI_VERIFY_KEY_HEX="$(cat build/hbi-verify-key.hex)" cargo build -p hueso
    Compiling huesos-pmm v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-pmm)
    Compiling uart_16550 v0.3.2
    Compiling pic8259 v0.11.0
-   Compiling huesos-sched v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-sched)
-   Compiling huesos-ioapic v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-ioapic)
    Compiling static_assertions v1.1.0
    Compiling huesos-sync v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-sync)
+   Compiling huesos-ioapic v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-ioapic)
+   Compiling huesos-sched v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-sched)
    Compiling huesos-arch v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-arch)
-   Compiling subtle v2.6.1
-   Compiling huesos-lifecycle v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-lifecycle)
-   Compiling huesos-quota v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-quota)
-   Compiling signature v2.2.0
    Compiling huesos-proclife v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-proclife)
+   Compiling signature v2.2.0
+   Compiling huesos-lifecycle v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-lifecycle)
+   Compiling subtle v2.6.1
+   Compiling huesos-quota v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-quota)
    Compiling huesos-object v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-object)
    Compiling ed25519 v2.2.3
    Compiling huesos-fb v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-fb)
    Compiling spinning_top v0.2.5
+   Compiling huesos-waitset v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-waitset)
    Compiling hues-async v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/hues-async)
    Compiling huesos-handlemove v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-handlemove)
-   Compiling huesos-waitset v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-waitset)
    Compiling huesos-syscalls v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-syscalls)
    Compiling linked_list_allocator v0.10.6
    Compiling ed25519-dalek v2.2.0
    Compiling huesos-hal v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-hal)
    Compiling huesos-elf v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-elf)
    Compiling huesos-tpm v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-tpm)
-   Compiling huesos-pci v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-pci)
-   Compiling huesos-alloc v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-alloc)
    Compiling huesos-extable v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-extable)
+   Compiling huesos-alloc v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-alloc)
+   Compiling huesos-pci v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-pci)
    Compiling limine v0.6.5
    Compiling huesos-boot v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-boot)
-    Finished `release` profile [optimized] target(s) in 4m 44s
-STORAGE_OFF= bash scripts/mkiso.sh release
+    Finished `dev` profile [optimized + debuginfo] target(s) in 5m 04s
+STORAGE_OFF= bash scripts/mkiso.sh debug
 [HBI] Building hbi-gen...
     Updating crates.io index
  Downloading crates ...
-  Downloaded anstyle-query v1.1.5
-  Downloaded anstream v1.0.0
-  Downloaded const-oid v0.9.6
-  Downloaded colorchoice v1.0.5
+  Downloaded heck v0.5.0
   Downloaded clap_lex v1.1.0
+  Downloaded getrandom v0.2.17
+  Downloaded colorchoice v1.0.5
   Downloaded is_terminal_polyfill v1.70.2
   Downloaded utf8parse v0.2.2
-  Downloaded heck v0.5.0
   Downloaded strsim v0.11.1
-  Downloaded base64ct v1.8.3
-  Downloaded anstyle-parse v1.0.0
-  Downloaded anstyle v1.0.14
-  Downloaded zeroize v1.9.0
+  Downloaded anstyle-query v1.1.5
+  Downloaded anstream v1.0.0
   Downloaded spki v0.7.3
   Downloaded pkcs8 v0.10.2
-  Downloaded quote v1.0.46
-  Downloaded getrandom v0.2.17
+  Downloaded zeroize v1.9.0
+  Downloaded crc32fast v1.5.0
+  Downloaded proc-macro2 v1.0.106
   Downloaded serde_core v1.0.229
   Downloaded serde v1.0.229
-  Downloaded crc32fast v1.5.0
-  Downloaded clap_builder v4.6.0
-  Downloaded proc-macro2 v1.0.106
   Downloaded der v0.7.10
   Downloaded clap v4.6.1
+  Downloaded clap_builder v4.6.0
+  Downloaded const-oid v0.9.6
   Downloaded clap_derive v4.6.1
+  Downloaded base64ct v1.8.3
+  Downloaded anstyle-parse v1.0.0
   Downloaded rand_core v0.6.4
+  Downloaded quote v1.0.46
   Downloaded pem-rfc7468 v0.7.0
   Downloaded syn v2.0.118
+  Downloaded anstyle v1.0.14
   Downloaded libc v0.2.189
-   Compiling proc-macro2 v1.0.106
    Compiling version_check v0.9.5
+   Compiling proc-macro2 v1.0.106
    Compiling quote v1.0.46
    Compiling generic-array v0.14.7
    Compiling unicode-ident v1.0.24
@@ -146,57 +146,57 @@ STORAGE_OFF= bash scripts/mkiso.sh release
    Compiling base64ct v1.8.3
    Compiling pem-rfc7468 v0.7.0
    Compiling syn v2.0.118
-   Compiling semver v1.0.28
    Compiling const-oid v0.9.6
-   Compiling der v0.7.10
+   Compiling semver v1.0.28
    Compiling rustc_version v0.4.1
+   Compiling der v0.7.10
    Compiling block-buffer v0.10.4
    Compiling crypto-common v0.1.7
    Compiling cfg-if v1.0.4
    Compiling utf8parse v0.2.2
    Compiling anstyle-parse v1.0.0
    Compiling digest v0.10.7
-   Compiling curve25519-dalek v4.1.3
    Compiling spki v0.7.3
+   Compiling curve25519-dalek v4.1.3
+   Compiling cpufeatures v0.2.17
+   Compiling is_terminal_polyfill v1.70.2
    Compiling anstyle-query v1.1.5
    Compiling anstyle v1.0.14
-   Compiling cpufeatures v0.2.17
    Compiling colorchoice v1.0.5
-   Compiling is_terminal_polyfill v1.70.2
    Compiling pkcs8 v0.10.2
    Compiling anstream v1.0.0
    Compiling curve25519-dalek-derive v0.1.1
-   Compiling crc32fast v1.5.0
-   Compiling heck v0.5.0
    Compiling subtle v2.6.1
-   Compiling signature v2.2.0
-   Compiling clap_lex v1.1.0
    Compiling strsim v0.11.1
-   Compiling clap_builder v4.6.0
-   Compiling ed25519 v2.2.3
+   Compiling clap_lex v1.1.0
+   Compiling crc32fast v1.5.0
+   Compiling signature v2.2.0
+   Compiling heck v0.5.0
    Compiling clap_derive v4.6.1
+   Compiling ed25519 v2.2.3
+   Compiling clap_builder v4.6.0
    Compiling sha2 v0.10.9
    Compiling ed25519-dalek v2.2.0
    Compiling clap v4.6.1
    Compiling hbi-gen v0.2.0 (/home/runner/work/HuesOS/HuesOS/tools/hbi-gen)
-    Finished `release` profile [optimized] target(s) in 11.45s
+    Finished `release` profile [optimized] target(s) in 11.95s
 [HBI] Locating bootfs...
 [trust] development HBI key active (not for release distribution)
 [HBI] Generating signed HBI image at build/huesos.hbi...
 Signed HBI v2.2 image created at "build/huesos.hbi"
-Signed bytes: 36402024; total bytes: 36402096
+Signed bytes: 57503672; total bytes: 57503744
 [HBI] Done!
 xorriso 1.5.6 : RockRidge filesystem manipulator, libburnia project.
 
 Drive current: -outdev 'stdio:build/huesos.iso'
 Media current: stdio file, overwriteable
 Media status : is blank
-Media summary: 0 sessions, 0 data blocks, 0 data, 80.5g free
+Media summary: 0 sessions, 0 data blocks, 0 data, 80.2g free
 Added to ISO image: directory '/'='/home/runner/work/HuesOS/HuesOS/build/iso'
 xorriso : UPDATE :      12 files added in 1 seconds
 xorriso : UPDATE :      12 files added in 1 seconds
-ISO image produced: 21658 sectors
-Written to medium : 21658 sectors at LBA 0
+ISO image produced: 42266 sectors
+Written to medium : 42266 sectors at LBA 0
 Writing to 'stdio:build/huesos.iso' completed successfully.
 
 [ISO] Created build/huesos.iso
