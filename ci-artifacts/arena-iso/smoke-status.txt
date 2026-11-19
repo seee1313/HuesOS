@@ -1,4 +1,4 @@
-smoke_status=
-smoke_status_nvme=
-profile=debug
-commit=a1cdeb5f94cd29750ed4cb4c32b899ca1c722f89
+smoke_status=0
+smoke_status_nvme=0
+profile=release
+commit=47e3602e6c0425740c9197ca8e29f88a3a3ced62
