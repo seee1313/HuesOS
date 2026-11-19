@@ -938,6 +938,27 @@ impl InteractiveShell {
                 ),
                 Err(e) => println!("[hsh] fdisk raw-hxfs list ERROR: {}", e),
             }
+            // A dry run writes nothing, so it must be allowed even where the
+            // real run is refused, and it must say why the real run needs
+            // `--force`. A live check found the dry run being refused here.
+            match smoke_env.eval_script(
+                "fdisk gpt-init --size 64M --dry-run",
+                &mut self.host,
+            ) {
+                Ok(res)
+                    if res.status == 0
+                        && res.render_text().contains("raw-hxfs")
+                        && res.render_text().contains("dry-run") =>
+                {
+                    println!("[hsh] fdisk raw-hxfs dry-run OK");
+                }
+                Ok(res) => println!(
+                    "[hsh] fdisk raw-hxfs dry-run FAILED status={} out={}",
+                    res.status,
+                    res.render_text()
+                ),
+                Err(e) => println!("[hsh] fdisk raw-hxfs dry-run ERROR: {}", e),
+            }
             match smoke_env.eval_script("fdisk gpt-init --size 64M", &mut self.host) {
                 Ok(res)
                     if res.status != 0
@@ -955,6 +976,7 @@ impl InteractiveShell {
             }
         } else {
             println!("[hsh] fdisk raw-hxfs list SKIP (no block device)");
+            println!("[hsh] fdisk raw-hxfs dry-run SKIP (no block device)");
             println!("[hsh] fdisk raw-hxfs gpt-init guard SKIP (no block device)");
         }
 

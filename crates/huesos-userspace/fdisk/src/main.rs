@@ -610,8 +610,12 @@ fn run() -> i32 {
             // the already-open backend rather than on a second open. Opening
             // for write only ever *grows* a short file target, so probing here
             // cannot destroy data before the refusal.
-            if !force {
-                if let Some(volume) = probe_raw_hxfs(&io) {
+            // A dry run writes nothing, so it stays available on a volume that
+            // would otherwise be protected: it reports the layout it *would*
+            // write together with the warning that the real run needs --force.
+            let mut note = String::new();
+            if let Some(volume) = probe_raw_hxfs(&io) {
+                if !force && !dry_run {
                     return fail_msg(&format!(
                         "refusing to overwrite {} ({}) at {}: no GPT, the whole device is the filesystem; pass --force to erase it",
                         volume.layout_tag(),
@@ -619,11 +623,18 @@ fn run() -> i32 {
                         target.unwrap_or("the block device")
                     ));
                 }
+                if dry_run {
+                    note = format!(
+                        "warning=raw-hxfs volume ({}) detected, the real run needs --force\n",
+                        volume.layout_label()
+                    );
+                }
             }
             match GptDisk::init_empty(io.total_lbas(), 0x4855_4553_0001) {
                 Ok(mut disk) => match disk.write_to(&mut io, dry_run) {
                     Ok(()) => Ok(format!(
-                        "gpt-init {} total_lbas={} guid={}\n",
+                        "{}gpt-init {} total_lbas={} guid={}\n",
+                        note,
                         if dry_run { "dry-run" } else { "ok" },
                         disk.disk_lbas,
                         disk.primary.disk_guid.format_uuid()
