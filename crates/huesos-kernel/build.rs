@@ -1135,6 +1135,10 @@ fn build_bootfs_image(manifest_dir: &Path, inputs: BootfsInputs<'_>) -> PathBuf 
             data: read_build_input(&inputs.coreutils_dir.join("ps"), "ps ELF"),
         },
         BootFsFile {
+            path: "/bin/sleep.elf",
+            data: read_build_input(&inputs.coreutils_dir.join("sleep"), "sleep ELF"),
+        },
+        BootFsFile {
             path: "/lib/ld-huesos.so",
             data: read_build_input(inputs.ld_huesos, "ld-huesos.so"),
         },

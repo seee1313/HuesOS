@@ -55,6 +55,15 @@ see [Known Limitations](#known-limitations) and
   address space
 - ✅ Real ring3 userspace process (`huesos-init`) launched via `iretq`,
   built as a separate target and embedded at build time
+- ✅ **Foreign process termination**: `ProcessTerminate(handle, code)` (syscall
+  83) ends a child the caller holds a `WRITE` handle to, with the same atomic
+  teardown `ProcessExit` uses; `hsh` turns `Ctrl-C` into that call and gets the
+  prompt back from a child that would not finish on its own
+- ✅ **Bare `HxFS v7` volume detection**: `fdisk list|inspect|verify` probe the
+  superblock with the mount path's own validator and report
+  `disk0 raw-hxfs HxFS v7 superfloppy <size> OK` instead of `bad GPT signature`;
+  `gpt-init` refuses to erase such a volume without `--force`, while
+  `gpt-init --dry-run` stays available and prints the warning
 - ✅ Dynamic userspace launch: init embeds child ELF images, creates
   processes/root VMARs, maps VMOs, creates threads, starts them, and
   receives bootstrap channels
@@ -136,6 +145,10 @@ Default `scripts/run.sh` uses `-smp 2`.
   CPU ticks and bounded IPC queues have active accounting. Per-handle hard caps
   and page-table metadata accounting remain incomplete; see
   [docs/QUOTAS.md](docs/QUOTAS.md)
+- HxFS file writes accept a whole-file rewrite (`offset == 0`) or sequential
+  4 KiB appends only, so a tool that patches an existing file sector by sector
+  gets `Unsupported`; `fdisk` therefore runs its GPT cycle on the in-memory
+  scratch disk (`/dev/mem`) instead of an image file on HxFS
 - Framebuffer text is ASCII-only (no Unicode shaping, by design)
 
 > Note: the I/O APIC policy core is integrated into the kernel's route manager

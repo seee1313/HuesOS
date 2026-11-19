@@ -8,7 +8,7 @@ use huesos_object::{Handle, KernelObject, KernelObjectExt, Rights};
 
 use crate::{
     callbacks::{
-        EXIT_FN, PROCESS_CREATE_FN, PROCESS_CREATE_IN_JOB_FN, THREAD_EXIT_FN,
+        EXIT_FN, PROCESS_CREATE_FN, PROCESS_CREATE_IN_JOB_FN, PROCESS_TERMINATE_FN, THREAD_EXIT_FN,
         THREAD_SET_FS_BASE_FN, THREAD_START_EX_FN, THREAD_START_FN, VMAR_MAP_FN, VMAR_PROTECT_FN,
         VMAR_UNMAP_FN, YIELD_FN,
     },
@@ -580,6 +580,39 @@ pub(crate) fn sys_process_wait(handle: HandleValue, out_code: *mut i64) -> Sysca
         }
         prepared.park();
     }
+}
+
+/// `ProcessTerminate(process_handle, exit_code)`.
+///
+/// The capability half of an interactive `Ctrl-C`: a parent that owns the
+/// child's `Process` handle can end it without the child's cooperation. The
+/// handle must carry `WRITE`, which `ProcessCreate` grants by default while a
+/// `READ`-only duplicate (enough for `ProcessWait`) cannot kill anything.
+pub(crate) fn sys_process_terminate(handle: HandleValue, code: i64) -> SyscallResult {
+    let caller = current_proc()?;
+    let h = caller.handles.get(handle).ok_or(ErrorCode::BadHandle)?;
+    if !h.has_rights(Rights::WRITE) {
+        return Err(ErrorCode::AccessDenied);
+    }
+    let target = huesos_object::lookup_process(h.koid).ok_or(ErrorCode::WrongType)?;
+    // Self-termination has to go through `ProcessExit` so the calling thread
+    // stops running instead of returning into freed address space.
+    if target.koid() == caller.koid() {
+        return Err(ErrorCode::InvalidArgs);
+    }
+    // Critical processes (the root supervisor chain) may only exit themselves.
+    if target.is_critical() {
+        return Err(ErrorCode::AccessDenied);
+    }
+    // Idempotent: a second terminate cannot rewrite an observed exit status.
+    if target.exit_code().is_some() {
+        return Ok(0);
+    }
+    // Copy the fn pointer out: never hold a callback mutex across the
+    // scheduler work below, which takes every per-CPU scheduler lock.
+    let terminate = (*PROCESS_TERMINATE_FN.lock()).ok_or(ErrorCode::NotSupported)?;
+    terminate(target.koid(), code)?;
+    Ok(0)
 }
 
 pub(crate) fn sys_process_get_exit_code(handle: HandleValue, out_code: *mut i64) -> SyscallResult {

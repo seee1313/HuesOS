@@ -58,6 +58,10 @@ pub type ThreadStartExFn = fn(&huesos_object::Thread, u64, u64, u64, u64) -> Res
 /// Kernel callback type used by `ThreadSetFsBase` to update the calling
 /// thread's `MSR_FS_BASE`.
 pub type ThreadSetFsBaseFn = fn(u64) -> Result<(), ErrorCode>;
+/// Kernel callback type used by `ProcessTerminate` to end a *foreign*
+/// process. The koid names the victim; the code is the exit status every
+/// `ProcessWait` observer must wake with.
+pub type ProcessTerminateFn = fn(huesos_object::Koid, i64) -> Result<(), ErrorCode>;
 
 /// Global process-create callback (set by the kernel process layer).
 pub(crate) static PROCESS_CREATE_FN: Mutex<Option<ProcessCreateFn>> = Mutex::new(None);
@@ -83,6 +87,8 @@ pub(crate) static THREAD_START_EX_FN: Mutex<Option<ThreadStartExFn>> = Mutex::ne
 pub(crate) static THREAD_EXIT_FN: Mutex<Option<fn(i64) -> !>> = Mutex::new(None);
 /// Global thread `FS_BASE` callback (set by the kernel scheduler).
 pub(crate) static THREAD_SET_FS_BASE_FN: Mutex<Option<ThreadSetFsBaseFn>> = Mutex::new(None);
+/// Global foreign-process terminate callback (set by the kernel scheduler).
+pub(crate) static PROCESS_TERMINATE_FN: Mutex<Option<ProcessTerminateFn>> = Mutex::new(None);
 
 /// Set the yield function. Called once by kernel init.
 pub fn set_yield_fn(f: fn()) {
@@ -172,6 +178,11 @@ pub fn set_thread_start_ex_fn(f: ThreadStartExFn) {
 /// Set the single-thread exit function. Called once by kernel init.
 pub fn set_thread_exit_fn(f: fn(i64) -> !) {
     *THREAD_EXIT_FN.lock() = Some(f);
+}
+
+/// Set the foreign-process terminate function. Called once by kernel init.
+pub fn set_process_terminate_fn(f: ProcessTerminateFn) {
+    *PROCESS_TERMINATE_FN.lock() = Some(f);
 }
 
 /// Set the thread `FS_BASE` update function. Called once by kernel init.

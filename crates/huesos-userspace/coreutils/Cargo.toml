@@ -55,6 +55,10 @@ path = "src/bin/acpi.rs"
 name = "ps"
 path = "src/bin/ps.rs"
 
+[[bin]]
+name = "sleep"
+path = "src/bin/sleep.rs"
+
 [dependencies]
 libcanvas = { path = "../libcanvas", default-features = false, features = ["dyn-client"] }
 huesos-abi = { path = "../../huesos-abi" }

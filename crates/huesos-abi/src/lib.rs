@@ -530,6 +530,29 @@ pub enum Syscall {
     /// Block until thread handle `a1` exits via [`Self::ThreadExit`] or
     /// process termination, writing its `i64` exit code to `*a2`.
     ThreadWait = 82,
+    /// Terminate the process named by handle `a1` with exit code `a2`.
+    ///
+    /// This is the capability that makes an interactive shell's `Ctrl-C`
+    /// real: the parent holds the child's `Process` handle and can end it
+    /// without the child's cooperation.
+    ///
+    /// Rights: `a1` must be a `Process` handle with `WRITE` (the code is
+    /// `DEFAULT`, so a handle minted by `ProcessCreate` qualifies).
+    /// Refused with:
+    /// - `BadHandle`/`WrongType` if `a1` is not a `Process` handle,
+    /// - `AccessDenied` if the handle lacks `WRITE`, or if the target is
+    ///   marked critical to the root job (only the process itself may exit),
+    /// - `InvalidArgs` if the caller targets itself: self-exit has to keep
+    ///   flowing through [`Self::ProcessExit`] so the calling thread also
+    ///   stops running,
+    /// - `NotSupported` before the kernel installs its terminate hook.
+    ///
+    /// Idempotent: terminating a process that already exited returns `Ok(0)`
+    /// and does not overwrite the observed exit code. Every thread of the
+    /// target is stopped, `ProcessWait` observers wake with `a2`, and the
+    /// target's resources are released through the ordinary process-teardown
+    /// path, exactly as for a self-exit.
+    ProcessTerminate = 83,
 }
 
 /// Maximum number of bytes one [`Syscall::SystemGetEntropy`] call
@@ -609,7 +632,7 @@ impl Syscall {
     /// Total number of defined syscalls (i.e. one past the highest
     /// currently-assigned number). The dispatcher uses this to reject
     /// obviously-out-of-range numbers before a `match`.
-    pub const COUNT: u64 = 83;
+    pub const COUNT: u64 = 84;
 
     /// Convert a raw syscall number back into a [`Syscall`], if valid.
     pub const fn from_raw(n: u64) -> Option<Self> {
@@ -697,6 +720,7 @@ impl Syscall {
             80 => Self::ThreadStartEx,
             81 => Self::ThreadExit,
             82 => Self::ThreadWait,
+            83 => Self::ProcessTerminate,
             _ => return None,
         })
     }
@@ -1612,7 +1636,9 @@ mod tests {
         assert_eq!(Syscall::ResourceUnmap as u64, 65);
         assert_eq!(Syscall::InterruptCreateGsiForResource as u64, 66);
         assert_eq!(Syscall::InterruptAcknowledge as u64, 67);
-        assert_eq!(Syscall::COUNT, 83);
+        assert_eq!(Syscall::COUNT, 84);
+        assert_eq!(Syscall::ProcessTerminate as u64, 83);
+        assert_eq!(Syscall::from_raw(83), Some(Syscall::ProcessTerminate));
         assert_eq!(Syscall::from_raw(28), Some(Syscall::VmoCreateEx));
         assert_eq!(Syscall::from_raw(30), Some(Syscall::VmarProtect));
         assert_eq!(Syscall::from_raw(31), Some(Syscall::ChannelPeek));
@@ -1682,7 +1708,9 @@ mod tests {
         assert_eq!(Syscall::from_raw(80), Some(Syscall::ThreadStartEx));
         assert_eq!(Syscall::from_raw(81), Some(Syscall::ThreadExit));
         assert_eq!(Syscall::from_raw(82), Some(Syscall::ThreadWait));
-        assert_eq!(Syscall::from_raw(83), None);
+        assert_eq!(Syscall::from_raw(83), Some(Syscall::ProcessTerminate));
+        // Append-only: the next number past the newest syscall stays unmapped.
+        assert_eq!(Syscall::from_raw(84), None);
     }
 
     #[test]
