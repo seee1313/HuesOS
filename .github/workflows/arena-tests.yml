@@ -72,19 +72,23 @@ jobs:
           git config user.name "arena-test-bot"
           git config user.email "arena-test-bot@users.noreply.github.com"
           echo "status=${{ steps.tests.outputs.status }}" > ci-artifacts/arena-tests/status.txt
-          git add -f ci-artifacts/arena-tests
-          if git diff --cached --quiet; then
-            echo "nothing to publish"
-            exit 0
-          fi
-          git pull --rebase --autostash -q origin "${GITHUB_REF_NAME}" || true
-          git commit -m "chore(arena): publish host-test log [skip ci]"
-          for attempt in 1 2 3 4; do
+          publish() {
+            git add -f ci-artifacts/arena-tests
+            if git diff --cached --quiet; then
+              echo "nothing to publish"
+              return 0
+            fi
+            git commit -m "chore(arena): publish host-test log [skip ci]"
+          }
+          publish
+          for attempt in 1 2 3 4 5 6; do
             if git push origin "HEAD:${GITHUB_REF_NAME}"; then
               exit 0
             fi
-            sleep $((attempt * 10))
-            git pull --rebase -q origin "${GITHUB_REF_NAME}" || true
+            sleep $((attempt * 5))
+            git fetch -q origin "${GITHUB_REF_NAME}"
+            git reset --mixed -q FETCH_HEAD
+            publish
           done
           exit 1
       - name: Fail when tests failed
@@ -131,19 +135,23 @@ jobs:
           git config user.name "arena-test-bot"
           git config user.email "arena-test-bot@users.noreply.github.com"
           echo "status=${{ steps.clippy.outputs.status }}" > ci-artifacts/arena-tests/clippy-status.txt
-          git add -f ci-artifacts/arena-tests
-          if git diff --cached --quiet; then
-            echo "nothing to publish"
-            exit 0
-          fi
-          git pull --rebase --autostash -q origin "${GITHUB_REF_NAME}" || true
-          git commit -m "chore(arena): publish clippy log [skip ci]"
-          for attempt in 1 2 3 4; do
+          publish() {
+            git add -f ci-artifacts/arena-tests
+            if git diff --cached --quiet; then
+              echo "nothing to publish"
+              return 0
+            fi
+            git commit -m "chore(arena): publish clippy log [skip ci]"
+          }
+          publish
+          for attempt in 1 2 3 4 5 6; do
             if git push origin "HEAD:${GITHUB_REF_NAME}"; then
               exit 0
             fi
-            sleep $((attempt * 10))
-            git pull --rebase -q origin "${GITHUB_REF_NAME}" || true
+            sleep $((attempt * 5))
+            git fetch -q origin "${GITHUB_REF_NAME}"
+            git reset --mixed -q FETCH_HEAD
+            publish
           done
           exit 1
       - name: Fail when clippy failed

@@ -185,29 +185,42 @@ jobs:
       - name: Publish images to the branch
         # Runs even when the build or a smoke gate failed: the compiler and
         # serial logs are the only channel this sandbox has for diagnostics.
+        #
+        # Publishing rebases onto the current tip *by resetting the index and
+        # HEAD* and re-adding the artifacts, so a commit that carries new
+        # binary artifacts can never conflict with an earlier one, and a
+        # concurrent push from the session cannot make the run lose its only
+        # delivery channel.
         if: ${{ !cancelled() && inputs.publish != 'false' }}
         run: |
           set -euo pipefail
           git config user.name "arena-iso-bot"
           git config user.email "arena-iso-bot@users.noreply.github.com"
-          git add -f ci-artifacts/arena-iso
-          # Standalone userspace crates carry their own lockfiles; a new path
-          # dependency regenerates them during the build, and the lock-policy
-          # gate wants the regenerated file committed.
-          git add -A -- crates/huesos-userspace/*/Cargo.lock
-          if git diff --cached --quiet; then
-            echo "nothing to publish"
-            exit 0
-          fi
-          git commit -m "chore(arena): publish built HuesOS images and logs [skip ci]"
-          # A concurrent push to the branch must not cost the run its only
-          # delivery channel: retry the publish on top of the new tip.
-          for attempt in 1 2 3 4; do
+
+          publish() {
+            git add -f ci-artifacts/arena-iso
+            if [ -d ci-artifacts/nvme ]; then git add -f ci-artifacts/nvme; fi
+            # Standalone userspace crates carry their own lockfiles; a new path
+            # dependency regenerates them during the build, and the lock-policy
+            # gate wants the regenerated file committed.
+            git add -A -- crates/huesos-userspace/*/Cargo.lock || true
+            if git diff --cached --quiet; then
+              echo "nothing to publish"
+              return 0
+            fi
+            git commit -m "chore(arena): publish built HuesOS images and logs [skip ci]"
+          }
+
+          publish
+          for attempt in 1 2 3 4 5 6; do
             if git push origin "HEAD:${GITHUB_REF_NAME}"; then
               exit 0
             fi
-            sleep $((attempt * 10))
-            git pull --rebase -q origin "${GITHUB_REF_NAME}" || true
+            sleep $((attempt * 5))
+            git fetch -q origin "${GITHUB_REF_NAME}"
+            # Keep the freshly built artifacts, move to the new tip.
+            git reset --mixed -q FETCH_HEAD
+            publish
           done
           exit 1
 
