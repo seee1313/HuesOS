@@ -85,10 +85,14 @@ impl RegistryState {
         self.interrupts.retain(|_, list| !list.is_empty());
 
         // A running process remains typed-owned by the scheduler/process
-        // registry even if userspace closes its last handle. Once exited, no
-        // handle and no kernel reference means it can leave the typed index.
+        // registry even if userspace closes its last handle. Once exited (or
+        // if never started before all handles closed), no handle and no kernel
+        // reference means it can leave the typed index.
         if let Some(process) = self.processes.get(&koid) {
-            if process.exit_code().is_some() {
+            if process.exit_code().is_some()
+                || (process.lifecycle_state() == huesos_proclife::ProcState::Created
+                    && process.active_threads() == 0)
+            {
                 self.processes.remove(&koid);
             }
         }
@@ -410,6 +414,23 @@ pub(crate) fn current_cpu() -> usize {
 pub fn set_current_process(p: Arc<Process>) {
     let cpu = current_cpu().min(63);
     PER_CPU_PROCESSES.lock()[cpu] = Some(p);
+}
+
+/// Clear the current process on the calling CPU (when switching to a kernel
+/// or reaped task so exited `Process` objects are not retained by idle CPUs).
+pub fn clear_current_process() {
+    let cpu = current_cpu().min(63);
+    PER_CPU_PROCESSES.lock()[cpu] = None;
+}
+
+/// Clear any CPU slot still referencing `koid` during process teardown.
+pub fn clear_process_from_all_cpus(koid: Koid) {
+    let mut per_cpu = PER_CPU_PROCESSES.lock();
+    for slot in per_cpu.iter_mut() {
+        if slot.as_ref().is_some_and(|proc| proc.koid() == koid) {
+            *slot = None;
+        }
+    }
 }
 
 /// Get the current process.

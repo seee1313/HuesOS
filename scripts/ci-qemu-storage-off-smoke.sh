@@ -62,7 +62,8 @@ for marker in \
     '[init] launched terminal' \
     '[terminal] spawned /bin/hsh.elf' \
     '[hsh] ls.elf pipe OK' \
-    '[hsh] @caps(hxfs=ro) enforcement OK'; do
+    '[hsh] @caps(hxfs=ro) enforcement OK' \
+    '[hsh] consecutive spawn stress OK (30 spawns)'; do
     if ! grep -Fq "$marker" "$log"; then
         echo "missing storage-off marker: $marker" >&2
         tail -200 "$log" >&2

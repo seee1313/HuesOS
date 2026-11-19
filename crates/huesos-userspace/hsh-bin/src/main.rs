@@ -738,6 +738,45 @@ impl InteractiveShell {
             _ => println!("[hsh] @caps(hxfs=none,bootfs=none) enforcement FAILED"),
         }
 
+        // 8. Consecutive dynamic ELF spawn stress test (30 spawns: 10 rounds of
+        // `/bin/pci.elf`, `/bin/ls.elf`, `/bin/fdisk.elf`) verifying no kernel
+        // slab/heap exhaustion or handle/VMAR/channel/process leaks.
+        let mut stress_ok = true;
+        for round in 0..10 {
+            for cmd in ["pci | count", "ls /bin | count", "fdisk list | count"] {
+                match smoke_env.eval_script(cmd, &mut self.host) {
+                    Ok(res)
+                        if res.status == 0
+                            && res.render_text().trim().parse::<usize>().unwrap_or(0) > 0 => {}
+                    Ok(res) => {
+                        println!(
+                            "[hsh] consecutive spawn stress FAILED round={} cmd='{}' status={} out={}",
+                            round,
+                            cmd,
+                            res.status,
+                            res.render_text()
+                        );
+                        stress_ok = false;
+                        break;
+                    }
+                    Err(e) => {
+                        println!(
+                            "[hsh] consecutive spawn stress ERROR round={} cmd='{}': {}",
+                            round, cmd, e
+                        );
+                        stress_ok = false;
+                        break;
+                    }
+                }
+            }
+            if !stress_ok {
+                break;
+            }
+        }
+        if stress_ok {
+            println!("[hsh] consecutive spawn stress OK (30 spawns)");
+        }
+
         self.send_clear();
         self.send_write(
             Some((95, 225, 185)),

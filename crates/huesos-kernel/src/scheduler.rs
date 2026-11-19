@@ -460,8 +460,13 @@ impl Scheduler {
             huesos_arch::gdt::set_kernel_stack(VirtAddr::new(stack_top));
             huesos_arch::syscall::set_kernel_stack(stack_top);
         }
-        if let TaskKind::User { process, .. } = &task.kind {
-            huesos_object::set_current_process(Arc::clone(process));
+        match &task.kind {
+            TaskKind::User { process, .. } => {
+                huesos_object::set_current_process(Arc::clone(process));
+            }
+            TaskKind::Kernel | TaskKind::Reaped => {
+                huesos_object::clear_current_process();
+            }
         }
     }
 

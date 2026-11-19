@@ -163,6 +163,7 @@ required+=(
     '[hsh] fdisk.elf pipe OK'
     '[hsh] @caps(hxfs=ro) enforcement OK'
     '[hsh] @caps(hxfs=none,bootfs=none) enforcement OK'
+    '[hsh] consecutive spawn stress OK (30 spawns)'
     '[terminal] keyboard service online, starting /bin/hsh.elf session'
     '[init] stage selftest ok'
     '[init] stage summary ok selftest'

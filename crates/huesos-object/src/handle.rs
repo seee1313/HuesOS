@@ -408,12 +408,13 @@ impl HandleTable {
 
     /// Drop every handle slot (process teardown).
     pub fn clear(&self) {
-        let mut t = self.table.lock();
-        for slot in t.iter_mut() {
-            if let Some(h) = slot.take() {
-                crate::registry::wake_object_waiters(h.koid);
-                note_handle_close(h.koid);
-            }
+        let slots = {
+            let mut t = self.table.lock();
+            core::mem::take(&mut *t)
+        };
+        for h in slots.into_iter().flatten() {
+            crate::registry::wake_object_waiters(h.koid);
+            note_handle_close(h.koid);
         }
     }
 }

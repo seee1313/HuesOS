@@ -60,11 +60,11 @@ pub use port::{Port, PortCreateError, PortPacket, PortQueueError};
 pub use process::{steal_opt_in_process_count, Process, ProcessExitPortError};
 pub(crate) use registry::phys_to_virt;
 pub use registry::{
-    acquire_kernel_ref, collect_exited_process, current_process, has_resource_conflict,
-    lookup_interrupts_by_irq, lookup_object, lookup_process, note_handle_close, note_handle_open,
-    note_kernel_ref_close, note_kernel_ref_open, object_ref_counts, register_interrupt,
-    register_object, register_process, root_job, set_cpu_id_callback, set_current_process,
-    set_phys_to_virt, unregister_object,
+    acquire_kernel_ref, clear_current_process, clear_process_from_all_cpus, collect_exited_process,
+    current_process, has_resource_conflict, lookup_interrupts_by_irq, lookup_object,
+    lookup_process, note_handle_close, note_handle_open, note_kernel_ref_close,
+    note_kernel_ref_open, object_ref_counts, register_interrupt, register_object, register_process,
+    root_job, set_cpu_id_callback, set_current_process, set_phys_to_virt, unregister_object,
 };
 pub use resource::{Resource, ResourceError, ResourceKind};
 pub use signal::Signal;
@@ -767,6 +767,52 @@ mod tests {
             drop(vmo);
             assert_eq!(job.usage().map(|usage| usage.memory), Ok(0));
             assert!(Vmo::new_in_job(8192, Some(job)).is_err());
+        });
+    }
+
+    #[test]
+    fn channel_drop_drains_unread_handles_even_while_peer_remains_open() {
+        with_fresh_env(huesos_pmm::FRAME_SIZE * 16, || {
+            let Ok((tx, rx)) = Channel::pair() else {
+                return;
+            };
+            let Ok(vmo) = Vmo::new(4096) else {
+                return;
+            };
+            let vmo_koid = vmo.koid();
+            register_object(vmo);
+            note_handle_open(vmo_koid);
+            let msg = ChannelMessage::new(
+                alloc::vec![1u8, 2, 3],
+                alloc::vec![Handle::new(vmo_koid, Rights::DEFAULT_VMO)],
+            );
+            assert!(tx.send(msg).is_ok());
+            assert_eq!(object_ref_counts(vmo_koid), (1, 0));
+
+            // Dropping the receiver before reading must immediately drain its
+            // inbox and close transferred handles even though `tx` is still alive.
+            drop(rx);
+            assert_eq!(object_ref_counts(vmo_koid), (0, 0));
+            assert!(lookup_object(vmo_koid).is_none());
+        });
+    }
+
+    #[test]
+    fn clear_current_process_releases_exited_process_arc() {
+        with_fresh_env(huesos_pmm::FRAME_SIZE * 8, || {
+            let proc = Process::new("ephemeral");
+            let koid = proc.koid();
+            register_process(proc.clone());
+            set_current_process(proc.clone());
+            assert!(proc.start());
+            assert!(proc.set_exit_code(0));
+            collect_exited_process(koid);
+            let weak = alloc::sync::Arc::downgrade(&proc);
+            drop(proc);
+            // Still retained by PER_CPU_PROCESSES until cleared.
+            assert!(weak.upgrade().is_some());
+            clear_current_process();
+            assert!(weak.upgrade().is_none());
         });
     }
 }

@@ -47,6 +47,8 @@ struct MessageQueue {
     /// cookie (its sequence number) that [`Self::consume`] uses to dequeue
     /// the exact message a prior peek identified.
     next_seq: u64,
+    /// True once the owning reader endpoint has been dropped and drained.
+    closed: bool,
 }
 
 impl MessageQueue {
@@ -63,6 +65,7 @@ impl MessageQueue {
                 max_cpu_ticks: UNLIMITED,
             }),
             next_seq: 0,
+            closed: false,
         })
     }
 
@@ -71,6 +74,9 @@ impl MessageQueue {
         reason = "failed sends must return the owned message without allocating on the error path"
     )]
     fn enqueue(&mut self, msg: ChannelMessage) -> Result<(), ChannelSendError> {
+        if self.closed {
+            return Err(ChannelSendError::new(msg, ChannelSendFailure::PeerClosed));
+        }
         let bytes = msg.data_len() as u64;
         let handles = msg.handle_count() as u64;
         if self.messages.len() >= MAX_CHANNEL_QUEUE_MESSAGES
@@ -681,6 +687,34 @@ impl Drop for Channel {
         // Wake readers so a blocking syscall can observe PeerClosed instead of
         // sleeping forever after the last endpoint disappears.
         self.peer_readers.wake_all();
+        // Nobody can ever read from `self.inbox` again. Mark it closed and
+        // take its preallocated VecDeque + unread messages now so memory and
+        // transferred handles are released immediately even if the peer stays
+        // alive. Drop outside the lock to prevent re-entrant lock ordering.
+        let unread = {
+            let mut q = self.inbox.lock();
+            q.closed = true;
+            q.quota = Quota::new(Limits {
+                max_memory: MAX_CHANNEL_QUEUE_BYTES,
+                max_handles: MAX_CHANNEL_QUEUE_HANDLES,
+                max_cpu_ticks: UNLIMITED,
+            });
+            core::mem::take(&mut q.messages)
+        };
+        drop(unread);
+        if !self.peer_alive.load(Ordering::Acquire) {
+            let unsent = {
+                let mut q = self.outbox.lock();
+                q.closed = true;
+                q.quota = Quota::new(Limits {
+                    max_memory: MAX_CHANNEL_QUEUE_BYTES,
+                    max_handles: MAX_CHANNEL_QUEUE_HANDLES,
+                    max_cpu_ticks: UNLIMITED,
+                });
+                core::mem::take(&mut q.messages)
+            };
+            drop(unsent);
+        }
     }
 }
 
