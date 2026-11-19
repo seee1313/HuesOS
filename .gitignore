@@ -4,3 +4,6 @@ target-cdylib/
 /build
 Cargo.lock.bak
 __pycache__/
+
+# Local CI hand-off artifacts (ISO images, boot logs)
+ci-artifacts/arena-iso/
