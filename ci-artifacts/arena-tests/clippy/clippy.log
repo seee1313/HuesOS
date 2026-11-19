@@ -12,12 +12,12 @@ info: downloading 2 components
    Compiling huesos-uacpi v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-uacpi)
    Compiling alloc v0.0.0 (/home/runner/.rustup/toolchains/nightly-2026-03-01-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/alloc)
    Compiling huesos-kernel v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-kernel)
-    Checking huesos-abi v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-abi)
     Checking scopeguard v1.2.0
+    Checking huesos-abi v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-abi)
     Checking lock_api v0.4.14
     Checking spin v0.9.9
-    Checking bit_field v0.10.3
     Checking bitflags v2.13.0
+    Checking bit_field v0.10.3
     Checking bitflags v1.3.2
     Checking typenum v1.20.1
     Checking log v0.4.33
@@ -27,38 +27,38 @@ info: downloading 2 components
     Checking huesos-pmm v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-pmm)
     Checking uart_16550 v0.3.2
     Checking pic8259 v0.11.0
-    Checking crypto-common v0.1.7
     Checking block-buffer v0.10.4
+    Checking crypto-common v0.1.7
     Checking huesos-ioapic v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-ioapic)
     Checking static_assertions v1.1.0
-    Checking huesos-sync v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-sync)
     Checking huesos-sched v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-sched)
+    Checking huesos-sync v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-sync)
     Checking huesos-arch v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-arch)
     Checking digest v0.10.7
     Checking cpufeatures v0.2.17
     Checking cfg-if v1.0.4
-    Checking subtle v2.6.1
-    Checking huesos-lifecycle v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-lifecycle)
-    Checking hues-async v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/hues-async)
     Checking huesos-quota v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-quota)
-    Checking signature v2.2.0
+    Checking huesos-lifecycle v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-lifecycle)
     Checking huesos-proclife v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-proclife)
-    Checking huesos-object v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-object)
+    Checking signature v2.2.0
+    Checking subtle v2.6.1
+    Checking hues-async v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/hues-async)
     Checking ed25519 v2.2.3
+    Checking huesos-object v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-object)
     Checking sha2 v0.10.9
     Checking huesos-fb v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-fb)
     Checking spinning_top v0.2.5
-    Checking huesos-handlemove v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-handlemove)
     Checking huesos-waitset v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-waitset)
+    Checking huesos-handlemove v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-handlemove)
     Checking huesos-syscalls v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-syscalls)
     Checking linked_list_allocator v0.10.6
     Checking ed25519-dalek v2.2.0
     Checking huesos-hal v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-hal)
     Checking huesos-elf v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-elf)
     Checking huesos-tpm v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-tpm)
+    Checking huesos-alloc v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-alloc)
     Checking huesos-extable v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-extable)
     Checking huesos-pci v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-pci)
-    Checking huesos-alloc v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-alloc)
     Checking huesos-hxfs v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-hxfs)
     Checking limine v0.6.5
     Checking huesos-scudo v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-scudo)
@@ -66,13 +66,13 @@ info: downloading 2 components
     Checking huesos-hxfs-proto v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-hxfs-proto)
     Checking huesos-nvme v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-nvme)
     Checking huesos-fat v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-fat)
-    Checking huesos-hsh v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-hsh)
     Checking huesos-decoder-fuzz v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-decoder-fuzz)
+    Checking huesos-hsh v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-hsh)
     Checking huesos-blobfs v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-blobfs)
     Checking huesos-bootux v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-bootux)
     Checking huesos-gpt v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-gpt)
     Checking huesos-boot v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-boot)
-    Finished `dev` profile [optimized + debuginfo] target(s) in 4m 23s
+    Finished `dev` profile [optimized + debuginfo] target(s) in 4m 16s
    Compiling compiler_builtins v0.1.160 (/home/runner/.rustup/toolchains/nightly-2026-03-01-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/compiler-builtins/compiler-builtins)
    Compiling core v0.0.0 (/home/runner/.rustup/toolchains/nightly-2026-03-01-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core)
    Compiling std v0.0.0 (/home/runner/.rustup/toolchains/nightly-2026-03-01-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/std)
@@ -88,17 +88,17 @@ info: downloading 2 components
    Compiling libc v0.2.178
    Compiling unwind v0.0.0 (/home/runner/.rustup/toolchains/nightly-2026-03-01-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/unwind)
    Compiling gimli v0.32.3
-   Compiling adler2 v2.0.1
    Compiling memchr v2.7.6
-   Compiling object v0.37.3
+   Compiling adler2 v2.0.1
    Compiling miniz_oxide v0.8.9
+   Compiling object v0.37.3
    Compiling addr2line v0.25.1
    Compiling panic_unwind v0.0.0 (/home/runner/.rustup/toolchains/nightly-2026-03-01-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/panic_unwind)
    Compiling std_detect v0.1.5 (/home/runner/.rustup/toolchains/nightly-2026-03-01-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/std_detect)
    Compiling hashbrown v0.16.1
-   Compiling cfg-if v1.0.4
-   Compiling rustc-demangle v0.1.27
    Compiling panic_abort v0.0.0 (/home/runner/.rustup/toolchains/nightly-2026-03-01-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/panic_abort)
+   Compiling rustc-demangle v0.1.27
+   Compiling cfg-if v1.0.4
    Compiling rustc-literal-escaper v0.0.7
    Compiling rustc-std-workspace-std v1.99.0 (/home/runner/.rustup/toolchains/nightly-2026-03-01-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/rustc-std-workspace-std)
    Compiling getopts v0.2.24
@@ -116,18 +116,18 @@ info: downloading 2 components
     Checking volatile v0.4.6
     Checking x86_64 v0.15.4
     Checking pic8259 v0.11.0
-    Checking huesos-ioapic v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-ioapic)
-    Checking huesos-sched v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-sched)
-    Checking static_assertions v1.1.0
     Checking huesos-sync v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-sync)
+    Checking huesos-sched v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-sched)
+    Checking huesos-ioapic v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-ioapic)
+    Checking static_assertions v1.1.0
     Checking typenum v1.20.1
     Checking uart_16550 v0.3.2
     Checking huesos-arch v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-arch)
+    Checking huesos-lifecycle v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-lifecycle)
     Checking huesos-proclife v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-proclife)
     Checking huesos-quota v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-quota)
-    Checking huesos-lifecycle v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-lifecycle)
-    Checking cpufeatures v0.2.17
     Checking hues-async v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/hues-async)
+    Checking cpufeatures v0.2.17
     Checking huesos-object v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-object)
     Checking huesos-fb v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-fb)
     Checking subtle v2.6.1
@@ -147,10 +147,10 @@ info: downloading 2 components
     Checking huesos-elf v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-elf)
     Checking huesos-hxfs v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-hxfs)
     Checking ed25519-dalek v2.2.0
-    Checking huesos-alloc v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-alloc)
     Checking huesos-scudo v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-scudo)
     Checking huesos-extable v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-extable)
     Checking huesos-pci v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-pci)
+    Checking huesos-alloc v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-alloc)
     Checking huesos-scudo-fuzz v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-scudo-fuzz)
     Checking huesos-hxfs-proto v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-hxfs-proto)
     Checking huesos-nvme v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-nvme)
@@ -160,17 +160,7 @@ info: downloading 2 components
     Checking huesos-blobfs v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-blobfs)
     Checking huesos-bootux v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-bootux)
     Checking huesos-gpt v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-gpt)
-    Finished `dev` profile [optimized + debuginfo] target(s) in 38.66s
-   Compiling compiler_builtins v0.1.160 (/home/runner/.rustup/toolchains/nightly-2026-03-01-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/compiler-builtins/compiler-builtins)
-   Compiling core v0.0.0 (/home/runner/.rustup/toolchains/nightly-2026-03-01-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core)
-   Compiling alloc v0.0.0 (/home/runner/.rustup/toolchains/nightly-2026-03-01-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/alloc)
-    Checking log v0.4.35
-    Checking huesos-blobfs v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-blobfs)
-    Checking huesos-abi v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-abi)
-    Checking huesos-elf v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-elf)
-    Checking huesos-scudo v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-scudo)
-    Checking libcanvas v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-userspace/libcanvas)
-    Finished `release` profile [optimized] target(s) in 12.91s
+    Finished `dev` profile [optimized + debuginfo] target(s) in 37.90s
    Compiling compiler_builtins v0.1.160 (/home/runner/.rustup/toolchains/nightly-2026-03-01-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/compiler-builtins/compiler-builtins)
    Compiling core v0.0.0 (/home/runner/.rustup/toolchains/nightly-2026-03-01-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core)
    Compiling alloc v0.0.0 (/home/runner/.rustup/toolchains/nightly-2026-03-01-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/alloc)
@@ -178,34 +168,44 @@ info: downloading 2 components
     Checking huesos-abi v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-abi)
     Checking huesos-elf v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-elf)
     Checking huesos-blobfs v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-blobfs)
-    Checking libcanvas v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-userspace/libcanvas)
-    Finished `release` profile [optimized] target(s) in 12.68s
     Checking huesos-scudo v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-scudo)
     Checking libcanvas v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-userspace/libcanvas)
-    Finished `release` profile [optimized] target(s) in 0.53s
+    Finished `release` profile [optimized] target(s) in 12.59s
+   Compiling compiler_builtins v0.1.160 (/home/runner/.rustup/toolchains/nightly-2026-03-01-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/compiler-builtins/compiler-builtins)
+   Compiling core v0.0.0 (/home/runner/.rustup/toolchains/nightly-2026-03-01-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core)
+   Compiling alloc v0.0.0 (/home/runner/.rustup/toolchains/nightly-2026-03-01-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/alloc)
     Checking log v0.4.35
+    Checking huesos-blobfs v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-blobfs)
     Checking huesos-abi v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-abi)
     Checking huesos-elf v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-elf)
-    Checking huesos-blobfs v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-blobfs)
+    Checking libcanvas v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-userspace/libcanvas)
+    Finished `release` profile [optimized] target(s) in 12.54s
     Checking huesos-scudo v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-scudo)
+    Checking libcanvas v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-userspace/libcanvas)
+    Finished `release` profile [optimized] target(s) in 0.52s
+    Checking log v0.4.35
+    Checking huesos-scudo v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-scudo)
+    Checking huesos-elf v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-elf)
+    Checking huesos-blobfs v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-blobfs)
+    Checking huesos-abi v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-abi)
     Checking huesos-bootux v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-bootux)
     Checking libcanvas v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-userspace/libcanvas)
     Checking huesos-init v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-userspace/init)
-    Finished `release` profile [optimized] target(s) in 0.83s
+    Finished `release` profile [optimized] target(s) in 0.90s
     Checking log v0.4.35
+    Checking huesos-blobfs v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-blobfs)
     Checking huesos-abi v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-abi)
     Checking huesos-elf v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-elf)
-    Checking huesos-blobfs v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-blobfs)
     Checking huesos-scudo v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-scudo)
     Checking libcanvas v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-userspace/libcanvas)
     Checking huesos-driver-manager v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-userspace/driver-manager)
     Finished `release` profile [optimized] target(s) in 1.05s
     Checking huesos-driver-manager v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-userspace/driver-manager)
-    Finished `release` profile [optimized] target(s) in 0.42s
+    Finished `release` profile [optimized] target(s) in 0.40s
     Checking huesos-driver-manager v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-userspace/driver-manager)
-    Finished `release` profile [optimized] target(s) in 0.42s
+    Finished `release` profile [optimized] target(s) in 0.40s
     Checking huesos-driver-manager v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-userspace/driver-manager)
-    Finished `release` profile [optimized] target(s) in 0.42s
+    Finished `release` profile [optimized] target(s) in 0.40s
     Checking log v0.4.35
     Checking huesos-scudo v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-scudo)
     Checking huesos-elf v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-elf)
@@ -213,117 +213,117 @@ info: downloading 2 components
     Checking huesos-blobfs v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-blobfs)
     Checking libcanvas v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-userspace/libcanvas)
     Checking huesos-driver-host-input v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-userspace/driver-host-input)
-    Finished `release` profile [optimized] target(s) in 0.77s
+    Finished `release` profile [optimized] target(s) in 0.74s
     Checking huesos-abi v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-abi)
     Checking log v0.4.35
     Checking huesos-elf v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-elf)
-    Checking huesos-blobfs v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-blobfs)
-    Checking huesos-scudo v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-scudo)
     Checking hues-async v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/hues-async)
-    Checking libcanvas v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-userspace/libcanvas)
+    Checking huesos-scudo v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-scudo)
+    Checking huesos-blobfs v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-blobfs)
     Checking huesos-nvme v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-nvme)
+    Checking libcanvas v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-userspace/libcanvas)
     Checking huesos-driver-host-nvme v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-userspace/driver-host-nvme)
-    Finished `release` profile [optimized] target(s) in 0.89s
+    Finished `release` profile [optimized] target(s) in 0.86s
    Compiling compiler_builtins v0.1.160 (/home/runner/.rustup/toolchains/nightly-2026-03-01-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/compiler-builtins/compiler-builtins)
    Compiling core v0.0.0 (/home/runner/.rustup/toolchains/nightly-2026-03-01-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core)
    Compiling generic-array v0.14.7
    Compiling alloc v0.0.0 (/home/runner/.rustup/toolchains/nightly-2026-03-01-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/alloc)
     Checking typenum v1.20.1
     Checking subtle v2.6.1
-    Checking cpufeatures v0.2.17
     Checking cfg-if v1.0.4
+    Checking cpufeatures v0.2.17
     Checking opaque-debug v0.3.1
     Checking huesos-abi v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-abi)
     Checking lz4_flex v0.11.6
     Checking log v0.4.35
     Checking crypto-common v0.1.7
-    Checking inout v0.1.4
     Checking block-buffer v0.10.4
-    Checking cipher v0.4.4
+    Checking inout v0.1.4
     Checking digest v0.10.7
+    Checking cipher v0.4.4
     Checking universal-hash v0.5.1
-    Checking hmac v0.12.1
     Checking polyval v0.6.2
     Checking aes v0.8.4
     Checking ghash v0.5.1
     Checking ctr v0.9.2
+    Checking hmac v0.12.1
     Checking aead v0.5.2
     Checking hkdf v0.12.4
-    Checking sha2 v0.10.9
     Checking aes-gcm v0.10.3
+    Checking sha2 v0.10.9
     Checking huesos-elf v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-elf)
     Checking huesos-hxfs v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-hxfs)
-    Checking huesos-blobfs v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-blobfs)
     Checking huesos-scudo v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-scudo)
+    Checking huesos-blobfs v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-blobfs)
     Checking libcanvas v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-userspace/libcanvas)
     Checking huesos-hxfs-proto v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-hxfs-proto)
     Checking huesos-hxfs-service v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-userspace/hxfs-service)
-    Finished `release` profile [optimized] target(s) in 13.82s
+    Finished `release` profile [optimized] target(s) in 13.44s
     Checking log v0.4.35
+    Checking huesos-blobfs v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-blobfs)
     Checking huesos-abi v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-abi)
     Checking huesos-elf v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-elf)
-    Checking huesos-blobfs v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-blobfs)
     Checking libcanvas v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-userspace/libcanvas)
     Checking huesos-terminal v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-userspace/terminal)
-    Finished `release` profile [optimized] target(s) in 0.91s
+    Finished `release` profile [optimized] target(s) in 0.93s
     Checking log v0.4.35
     Checking huesos-abi v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-abi)
     Checking huesos-elf v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-elf)
     Checking huesos-blobfs v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-blobfs)
     Checking libcanvas v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-userspace/libcanvas)
     Checking huesos-doom v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-userspace/doom)
-    Finished `release` profile [optimized] target(s) in 0.83s
-    Checking log v0.4.35
+    Finished `release` profile [optimized] target(s) in 0.81s
     Checking huesos-abi v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-abi)
+    Checking log v0.4.35
     Checking huesos-elf v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-elf)
     Checking huesos-blobfs v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-blobfs)
     Checking huesos-gpt v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-gpt)
     Checking huesos-hxfs v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-hxfs)
     Checking libcanvas v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-userspace/libcanvas)
     Checking huesos-fdisk v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-userspace/fdisk)
-    Finished `release` profile [optimized] target(s) in 1.02s
-    Checking log v0.4.35
+    Finished `release` profile [optimized] target(s) in 1.01s
     Checking huesos-abi v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-abi)
+    Checking log v0.4.35
     Checking huesos-elf v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-elf)
     Checking huesos-blobfs v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-blobfs)
     Checking huesos-hsh v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-hsh)
     Checking libcanvas v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-userspace/libcanvas)
     Checking huesos-hsh-bin v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-userspace/hsh-bin)
-    Finished `release` profile [optimized] target(s) in 0.95s
+    Finished `release` profile [optimized] target(s) in 0.93s
     Checking log v0.4.35
-    Checking huesos-blobfs v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-blobfs)
     Checking huesos-abi v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-abi)
     Checking huesos-elf v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-elf)
+    Checking huesos-blobfs v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-blobfs)
     Checking libcanvas v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-userspace/libcanvas)
     Checking huesos-coreutils v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-userspace/coreutils)
-    Finished `release` profile [optimized] target(s) in 1.01s
+    Finished `release` profile [optimized] target(s) in 0.93s
     Checking log v0.4.35
-    Checking huesos-blobfs v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-blobfs)
     Checking huesos-abi v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-abi)
     Checking huesos-elf v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-elf)
+    Checking huesos-blobfs v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-blobfs)
     Checking libcanvas v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-userspace/libcanvas)
     Checking huesos-fault-probe v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-userspace/fault-probe)
-    Finished `release` profile [optimized] target(s) in 0.72s
+    Finished `release` profile [optimized] target(s) in 0.65s
     Checking log v0.4.35
+    Checking huesos-blobfs v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-blobfs)
     Checking huesos-abi v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-abi)
     Checking huesos-elf v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-elf)
-    Checking huesos-blobfs v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-blobfs)
     Checking libcanvas v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-userspace/libcanvas)
     Checking huesos-dyn-rust-smoke v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-userspace/dyn-rust-smoke)
-    Finished `release` profile [optimized] target(s) in 0.81s
+    Finished `release` profile [optimized] target(s) in 0.84s
     Checking scopeguard v1.2.0
     Checking log v0.4.35
     Checking lock_api v0.4.14
     Checking huesos-elf v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-elf)
     Checking huesos-blobfs v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-blobfs)
-    Checking huesos-scudo v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-scudo)
     Checking huesos-abi v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-abi)
+    Checking huesos-scudo v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-scudo)
     Checking spin v0.9.9
     Checking huesos-pci v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-pci)
     Checking libcanvas v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-userspace/libcanvas)
     Checking huesos-uacpi-runtime v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-userspace/uacpi-runtime)
     Checking huesos-acpi-manager v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-userspace/acpi-manager)
-    Finished `release` profile [optimized] target(s) in 1.11s
+    Finished `release` profile [optimized] target(s) in 1.09s
    Compiling compiler_builtins v0.1.160 (/home/runner/.rustup/toolchains/nightly-2026-03-01-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/compiler-builtins/compiler-builtins)
    Compiling core v0.0.0 (/home/runner/.rustup/toolchains/nightly-2026-03-01-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core)
    Compiling find-msvc-tools v0.1.11
@@ -335,21 +335,21 @@ info: downloading 2 components
     Checking scopeguard v1.2.0
     Checking lock_api v0.4.14
     Checking huesos-elf v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-elf)
-    Checking huesos-scudo v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-scudo)
-    Checking huesos-blobfs v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-blobfs)
     Checking huesos-abi v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-abi)
+    Checking huesos-blobfs v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-blobfs)
+    Checking huesos-scudo v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-scudo)
     Checking spin v0.9.9
     Checking libcanvas v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-userspace/libcanvas)
-    Finished `release` profile [optimized] target(s) in 13.11s
+    Finished `release` profile [optimized] target(s) in 12.81s
     Checking log v0.4.35
+    Checking huesos-abi v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-abi)
+    Checking huesos-elf v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-elf)
     Checking huesos-blobfs v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-blobfs)
     Checking huesos-scudo v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-scudo)
-    Checking huesos-elf v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-elf)
-    Checking huesos-abi v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-abi)
     Checking huesos-pci v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-pci)
     Checking libcanvas v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-userspace/libcanvas)
     Checking huesos-pci-manager v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-userspace/pci-manager)
-    Finished `release` profile [optimized] target(s) in 0.92s
+    Finished `release` profile [optimized] target(s) in 0.80s
     Checking log v0.4.35
     Checking huesos-scudo v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-scudo)
     Checking huesos-elf v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-elf)
@@ -357,15 +357,15 @@ info: downloading 2 components
     Checking huesos-blobfs v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-blobfs)
     Checking libcanvas v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-userspace/libcanvas)
     Checking huesos-shutdown-broker v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-userspace/shutdown-broker)
-    Finished `release` profile [optimized] target(s) in 0.89s
+    Finished `release` profile [optimized] target(s) in 0.87s
     Checking log v0.4.35
-    Checking huesos-blobfs v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-blobfs)
     Checking huesos-scudo v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-scudo)
     Checking huesos-elf v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-elf)
+    Checking huesos-blobfs v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-blobfs)
     Checking huesos-abi v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-abi)
     Checking libcanvas v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-userspace/libcanvas)
     Checking huesos-key-broker v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-userspace/key-broker)
-    Finished `release` profile [optimized] target(s) in 0.93s
+    Finished `release` profile [optimized] target(s) in 0.90s
     Checking log v0.4.35
     Checking huesos-blobfs v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-blobfs)
     Checking huesos-elf v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-elf)
@@ -373,8 +373,8 @@ info: downloading 2 components
     Checking huesos-abi v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-abi)
     Checking libcanvas v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-userspace/libcanvas)
     Checking huesos-ld v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-userspace/ld-huesos)
-    Finished `release` profile [optimized] target(s) in 1.09s
+    Finished `release` profile [optimized] target(s) in 1.05s
     Checking huesos-pci-manager v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-userspace/pci-manager)
-    Finished `release` profile [optimized] target(s) in 0.18s
+    Finished `release` profile [optimized] target(s) in 0.17s
     Checking huesos-acpi-manager v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-userspace/acpi-manager)
     Finished `release` profile [optimized] target(s) in 0.10s
