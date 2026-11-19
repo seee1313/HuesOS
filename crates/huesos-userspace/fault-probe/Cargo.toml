@@ -8,7 +8,7 @@ name = "huesos-fault-probe"
 path = "src/main.rs"
 
 [dependencies]
-libcanvas = { path = "../libcanvas" }
+libcanvas = { path = "../libcanvas", default-features = false, features = ["dyn-client"] }
 huesos-abi = { path = "../../huesos-abi" }
 
 [profile.release]

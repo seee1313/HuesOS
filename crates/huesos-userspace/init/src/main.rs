@@ -145,15 +145,15 @@ pub extern "C" fn _start() -> ! {
     ui.step(b"selftest", 25);
     run_monotonic_clock_check(&mut logger);
     ui.step(b"selftest", 37);
-    run_smp_affinity_check(&mut logger);
+    run_smp_affinity_check(&mut logger, &bootfs);
     ui.step(b"selftest", 50);
-    run_process_wait_stress(&mut logger);
+    run_process_wait_stress(&mut logger, &bootfs);
     ui.step(b"selftest", 62);
     run_waitset_check(&mut logger);
     ui.step(b"selftest", 75);
-    run_fault_isolation_check(&mut logger);
+    run_fault_isolation_check(&mut logger, &bootfs);
     ui.step(b"selftest", 87);
-    run_shutdown_authorization_check(&mut logger);
+    run_shutdown_authorization_check(&mut logger, &bootfs);
     ui.end(b"selftest", StageState::Done, &mut logger);
 
     ui.begin(b"key-broker", &mut logger);
@@ -301,7 +301,7 @@ pub extern "C" fn _start() -> ! {
     let registry_pair = create_driver_manager_registry_channel(&mut logger, &driver_manager);
 
     ui.begin(b"terminal", &mut logger);
-    let terminal = launch_service(&mut logger, "terminal", TERMINAL_ELF);
+    let terminal = launch_dynamic_service(&mut logger, "terminal", TERMINAL_ELF, &bootfs);
     if terminal.is_none() {
         ui.end(b"terminal", StageState::Failed, &mut logger);
     }
@@ -1156,6 +1156,24 @@ fn launch_service(logger: &mut InitLogger, name: &str, elf: &[u8]) -> Option<(Pr
     }
 }
 
+fn launch_dynamic_service(
+    logger: &mut InitLogger,
+    name: &str,
+    elf: &[u8],
+    lib_vmo: &Vmo,
+) -> Option<(Process, Channel)> {
+    match libcanvas::process::spawn_elf_with_lib(name, elf, lib_vmo) {
+        Ok((process, bootstrap)) => {
+            init_logln!(logger, "[init] launched {}", name);
+            Some((process, bootstrap))
+        }
+        Err(e) => {
+            init_logln!(logger, "[init] failed to launch {}: {}", name, e.as_str());
+            None
+        }
+    }
+}
+
 /// Launch the isolated KeyBroker and delegate a unique manager channel.
 ///
 /// The `VolumeKey` Resource is transferred, never duplicated. KeyBroker uses
@@ -1503,7 +1521,7 @@ fn run_monotonic_clock_check(logger: &mut InitLogger) {
     }
 }
 
-fn run_smp_affinity_check(logger: &mut InitLogger) {
+fn run_smp_affinity_check(logger: &mut InitLogger, lib_vmo: &Vmo) {
     let cpu_count = match libcanvas::system::cpu_count() {
         Ok(count) => count,
         Err(error) => {
@@ -1520,8 +1538,12 @@ fn run_smp_affinity_check(logger: &mut InitLogger) {
         return;
     }
     let result = (|| -> libcanvas::Result<i64> {
-        let (process, bootstrap) =
-            libcanvas::process::spawn_elf_on_cpu("affinity-probe", FAULT_PROBE_ELF, 1)?;
+        let (process, bootstrap) = libcanvas::process::spawn_elf_on_cpu_with_lib(
+            "affinity-probe",
+            FAULT_PROBE_ELF,
+            1,
+            lib_vmo,
+        )?;
         match process.set_affinity(0) {
             Err(ErrorCode::Busy) => {}
             Ok(()) => return Err(ErrorCode::Busy),
@@ -1580,10 +1602,11 @@ fn lifecycle_wait_iterations() -> usize {
 /// publication and exit-code delivery every single time. A single blocked
 /// wait proves the path works; this proves it keeps working under repetition,
 /// which is where stale-generation and reaper-timing bugs surface.
-fn run_process_wait_stress(logger: &mut InitLogger) {
+fn run_process_wait_stress(logger: &mut InitLogger, lib_vmo: &Vmo) {
     let iterations = lifecycle_wait_iterations();
     for index in 0..iterations {
-        let Ok((process, bootstrap)) = libcanvas::process::spawn_elf("wait-probe", FAULT_PROBE_ELF)
+        let Ok((process, bootstrap)) =
+            libcanvas::process::spawn_elf_with_lib("wait-probe", FAULT_PROBE_ELF, lib_vmo)
         else {
             init_logln!(
                 logger,
@@ -1655,8 +1678,9 @@ fn run_process_wait_stress(logger: &mut InitLogger) {
     );
 }
 
-fn run_shutdown_authorization_check(logger: &mut InitLogger) {
-    let Ok((process, bootstrap)) = libcanvas::process::spawn_elf("shutdown-probe", FAULT_PROBE_ELF)
+fn run_shutdown_authorization_check(logger: &mut InitLogger, lib_vmo: &Vmo) {
+    let Ok((process, bootstrap)) =
+        libcanvas::process::spawn_elf_with_lib("shutdown-probe", FAULT_PROBE_ELF, lib_vmo)
     else {
         init_logln!(logger, "[init] shutdown authorization FAILED (launch)");
         return;
@@ -1684,7 +1708,7 @@ fn run_shutdown_authorization_check(logger: &mut InitLogger) {
     }
 }
 
-fn run_fault_isolation_check(logger: &mut InitLogger) {
+fn run_fault_isolation_check(logger: &mut InitLogger, lib_vmo: &Vmo) {
     let cases: [(&[u8], i64); 4] = [
         (b"page", libcanvas::fault_exit::PAGE_FAULT),
         (b"opcode", libcanvas::fault_exit::INVALID_OPCODE),
@@ -1694,7 +1718,7 @@ fn run_fault_isolation_check(logger: &mut InitLogger) {
 
     for (command, expected) in cases {
         let Ok((process, bootstrap)) =
-            libcanvas::process::spawn_elf("fault-probe", FAULT_PROBE_ELF)
+            libcanvas::process::spawn_elf_with_lib("fault-probe", FAULT_PROBE_ELF, lib_vmo)
         else {
             init_logln!(logger, "[init] user fault isolation FAILED (launch)");
             return;

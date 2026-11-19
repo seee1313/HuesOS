@@ -169,7 +169,10 @@ fn main() {
         &[],
         &key_broker_args_refs,
     );
-    let doom = build_userspace_program(&userspace_root, "doom", "huesos-doom", profile, &[], &[]);
+    let ld_huesos = build_ld_huesos(&userspace_root, profile);
+    let libcanvas_so = build_libcanvas_so(&userspace_root, profile);
+    let doom =
+        build_userspace_dynamic_program(&userspace_root, "doom", "huesos-doom", profile, &[], &[]);
     // Soak shutdown-cycle wiring (qemu-nvme-soak inject=3): the
     // harness exports HUESOS_TERMINAL_FEATURES=soak-shutdown so the
     // terminal auto-triggers an orderly userspace shutdown after a
@@ -182,7 +185,7 @@ fn main() {
         terminal_args.push(terminal_features);
     }
     let terminal_args_refs: Vec<&str> = terminal_args.iter().map(String::as_str).collect();
-    let terminal = build_userspace_program(
+    let terminal = build_userspace_dynamic_program(
         &userspace_root,
         "terminal",
         "huesos-terminal",
@@ -190,7 +193,7 @@ fn main() {
         &[],
         &terminal_args_refs,
     );
-    let fault_probe = build_userspace_program(
+    let fault_probe = build_userspace_dynamic_program(
         &userspace_root,
         "fault-probe",
         "huesos-fault-probe",
@@ -198,8 +201,6 @@ fn main() {
         &[],
         &[],
     );
-    let ld_huesos = build_ld_huesos(&userspace_root, profile);
-    let libcanvas_so = build_libcanvas_so(&userspace_root, profile);
     let _bootfs = build_bootfs_image(
         &manifest_dir,
         BootfsInputs {
@@ -442,6 +443,45 @@ fn build_userspace_program(
     extra_env: &[(&str, &OsStr)],
     extra_args: &[&str],
 ) -> PathBuf {
+    build_userspace_program_for_target(
+        userspace_root,
+        dir_name,
+        bin_name,
+        "x86_64-huesos-userspace",
+        profile,
+        extra_env,
+        extra_args,
+    )
+}
+
+fn build_userspace_dynamic_program(
+    userspace_root: &Path,
+    dir_name: &str,
+    bin_name: &str,
+    profile: &str,
+    extra_env: &[(&str, &OsStr)],
+    extra_args: &[&str],
+) -> PathBuf {
+    build_userspace_program_for_target(
+        userspace_root,
+        dir_name,
+        bin_name,
+        "x86_64-huesos-userspace-dyn",
+        profile,
+        extra_env,
+        extra_args,
+    )
+}
+
+fn build_userspace_program_for_target(
+    userspace_root: &Path,
+    dir_name: &str,
+    bin_name: &str,
+    target_dir_name: &str,
+    profile: &str,
+    extra_env: &[(&str, &OsStr)],
+    extra_args: &[&str],
+) -> PathBuf {
     let program_dir = userspace_root.join(dir_name);
     let target_dir = userspace_target_dir(&program_dir, extra_args);
     let mut command = Command::new(env::var("CARGO").unwrap_or_else(|_| "cargo".into()));
@@ -466,7 +506,7 @@ fn build_userspace_program(
     }
 
     let bin_path = target_dir
-        .join("x86_64-huesos-userspace")
+        .join(target_dir_name)
         .join(profile)
         .join(bin_name);
 
@@ -511,7 +551,17 @@ fn build_ld_huesos(userspace_root: &Path, profile: &str) -> PathBuf {
 
 fn build_libcanvas_so(userspace_root: &Path, profile: &str) -> PathBuf {
     let lib_dir = userspace_root.join("libcanvas");
-    let target_dir = userspace_target_dir(&lib_dir, &["cdylib", "c-abi"]);
+    let target_dir = match env::var_os("CARGO_TARGET_DIR").filter(|value| !value.is_empty()) {
+        Some(configured) => {
+            let p = PathBuf::from(configured);
+            if p.is_absolute() {
+                p
+            } else {
+                lib_dir.join(p)
+            }
+        }
+        None => lib_dir.join("target-cdylib"),
+    };
     let mut command = Command::new(env::var("CARGO").unwrap_or_else(|_| "cargo".into()));
     command
         .current_dir(&lib_dir)
@@ -554,7 +604,30 @@ fn build_libcanvas_so(userspace_root: &Path, profile: &str) -> PathBuf {
         "expected libcanvas.so at {}",
         so_path.display()
     );
-    so_path
+
+    // Stage a `libcanvas.so` copy at the `-L` directory referenced by
+    // dynamic applications' `.cargo/config.toml` (`#[link(name = "canvas")]`).
+    let link_dir = lib_dir
+        .join("target-cdylib")
+        .join("x86_64-huesos-userspace-dyn")
+        .join(profile);
+    if let Err(error) = fs::create_dir_all(&link_dir) {
+        eprintln!(
+            "failed to create libcanvas link directory {}: {error}",
+            link_dir.display()
+        );
+        std::process::exit(1);
+    }
+    let staged_so = link_dir.join("libcanvas.so");
+    if let Err(error) = fs::copy(&so_path, &staged_so) {
+        eprintln!(
+            "failed to stage {} -> {}: {error}",
+            so_path.display(),
+            staged_so.display()
+        );
+        std::process::exit(1);
+    }
+    staged_so
 }
 
 struct BootFsFile {
