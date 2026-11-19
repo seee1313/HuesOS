@@ -2110,7 +2110,16 @@ mod tests {
     fn bare_volume_probe_recognises_v7_superfloppy() {
         let image = build_image(false);
         let mut reader = SliceBlockReader::new(&image);
-        let volume = probe_bare_volume(&mut reader).expect("bare HxFS image must probe");
+        let probe = probe_bare_volume(&mut reader);
+        assert!(probe.is_ok(), "bare HxFS image must probe: {probe:?}");
+        let volume = probe.unwrap_or(BareVolume {
+            format_version: 0,
+            type_system_version: 0,
+            block_size: 0,
+            instance_uuid: [0; 16],
+            sequence_number: 0,
+            root_state: 0,
+        });
         assert_eq!(volume.format_version, FORMAT_VERSION);
         assert_eq!(volume.type_system_version, TYPE_SYSTEM_VERSION);
         assert_eq!(volume.block_size, BLOCK_SIZE as u32);

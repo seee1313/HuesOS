@@ -27,6 +27,11 @@ on:
         type: choice
         options: ["true", "false"]
         default: "true"
+      fmt:
+        description: "Run rustfmt over every crate and commit the result"
+        type: choice
+        options: ["false", "true"]
+        default: "false"
 
 permissions:
   contents: write
@@ -36,6 +41,37 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # The sandbox cannot run rustfmt (no Rust toolchain, no crates.io), so the
+  # formatting gate that `make audit-check` enforces is applied here and the
+  # result is committed back to the branch.
+  format:
+    if: ${{ inputs.fmt == 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install nightly-2026-03-01 --profile minimal \
+            --component rust-src,rustfmt
+          rustup default nightly-2026-03-01
+      - name: Format all crates
+        run: python3 tools/fmt-all.py
+      - name: Commit formatting back to the branch
+        run: |
+          set -euo pipefail
+          git config user.name "arena-fmt-bot"
+          git config user.email "arena-fmt-bot@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "already formatted"
+            exit 0
+          fi
+          git commit -m "style: rustfmt [skip ci]"
+          git push origin "HEAD:${GITHUB_REF_NAME}"
+
   build-iso:
     runs-on: ubuntu-24.04
     timeout-minutes: 150
