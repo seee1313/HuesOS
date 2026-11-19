@@ -357,17 +357,84 @@ impl HshHost {
         Err(format!("script '{path}' not found"))
     }
 
+    /// Resolve `raw` against the working directory, lexically.
+    ///
+    /// `.` and empty elements are dropped and `..` pops a component (never
+    /// above `/`), so `cd /bin/..` is `/` rather than `/bin/..`, and
+    /// `ls ../bin` from `/bin` names the same directory as `ls /bin`.
     fn normalize_path(&self, raw: &str) -> String {
-        if raw.is_empty() {
-            return self.pwd.clone();
-        }
-        if raw.starts_with('/') {
+        let joined = if raw.starts_with('/') {
             String::from(raw)
         } else if self.pwd == "/" {
             format!("/{raw}")
         } else {
             format!("{}/{raw}", self.pwd)
+        };
+        let mut parts: Vec<&str> = Vec::new();
+        for seg in joined.split('/') {
+            match seg {
+                "" | "." => {}
+                ".." => {
+                    parts.pop();
+                }
+                other => parts.push(other),
+            }
         }
+        let mut out = String::from("/");
+        for (idx, part) in parts.iter().enumerate() {
+            if idx > 0 {
+                out.push('/');
+            }
+            out.push_str(part);
+        }
+        out
+    }
+
+    /// Whether `abs` names a directory that exists in HxFS or in BOOTFS.
+    fn is_directory(&mut self, abs: &str) -> bool {
+        if abs == "/" {
+            return true;
+        }
+        self.try_connect_hxfs();
+        if let Some(hxfs) = self.hxfs.as_ref() {
+            if hxfs.open_dir(abs).is_ok() {
+                return true;
+            }
+        }
+        let dir_prefix = format!("{abs}/");
+        self.iter_bootfs_entries()
+            .iter()
+            .any(|(path, _, _)| path == abs || path.starts_with(&dir_prefix))
+    }
+
+    /// Whether `abs` names an existing file in HxFS or in BOOTFS.
+    fn is_file(&mut self, abs: &str) -> bool {
+        self.try_connect_hxfs();
+        if let Some(hxfs) = self.hxfs.as_ref() {
+            if hxfs.open_file(abs).is_ok() {
+                return true;
+            }
+        }
+        self.iter_bootfs_entries()
+            .iter()
+            .any(|(path, _, _)| path == abs)
+    }
+
+    /// Turn one argument into the absolute path an external utility expects.
+    ///
+    /// External `/bin/*.elf` tools have no notion of a working directory, so
+    /// the shell resolves relative names before the spawn: explicit paths
+    /// (`./x`, `../x`, `a/b`), home-relative `.`/`..`, and bare names that only
+    /// exist relative to the current directory ("`cat welcome.txt`" in `/etc`).
+    fn absolutize_argument(&self, arg: &str) -> Option<String> {
+        // Flags stay untouched; every other argument in a path position is a
+        // path, including names that do not exist yet (`mkdir sub`,
+        // `mv a b`, `touch note.md`) -- resolving only existing names would
+        // silently create those in `/` instead of the working directory.
+        if arg.is_empty() || arg.starts_with('-') {
+            return None;
+        }
+        Some(self.normalize_path(arg))
     }
 
     fn resolve_elf(&mut self, name: &str) -> Option<(Vmo, u64, u64, String)> {
@@ -489,6 +556,30 @@ impl HshHost {
             query_holder = self.open_query_fresh();
         }
 
+        // Default relative path expansion when pwd != '/' for single path-free `ls`?
+        // Only pass explicit args directly as typed by user.
+        // Utilities take paths, not a working directory: resolve them here.
+        // `write` has (path, data) so only its first argument is a path; the
+        // service tools (hxfs/fdisk/pci/acpi/ps) take none at all.
+        let path_args = match name {
+            "hxfs" | "fdisk" | "pci" | "acpi" | "ps" => 0,
+            "write" => 1,
+            _ => args.len(),
+        };
+        let mut owned_args: Vec<String> = Vec::with_capacity(args.len() + 1);
+        for (idx, a) in args.iter().enumerate() {
+            if idx < path_args {
+                if let Some(abs) = self.absolutize_argument(a) {
+                    owned_args.push(abs);
+                    continue;
+                }
+            }
+            owned_args.push(a.clone());
+        }
+        if name == "ls" && owned_args.is_empty() {
+            owned_args.push(self.pwd.clone());
+        }
+
         let fb_allowed = caps.is_none_or(|c| c.fb == FbAccess::ReadOnly);
         let frame_draw = if fb_allowed {
             self.frame_draw.as_ref()
@@ -496,11 +587,9 @@ impl HshHost {
             None
         };
 
-        // Default relative path expansion when pwd != '/' for single path-free `ls`?
-        // Only pass explicit args directly as typed by user.
-        let mut argv_strs: Vec<&str> = Vec::with_capacity(1 + args.len());
+        let mut argv_strs: Vec<&str> = Vec::with_capacity(1 + owned_args.len());
         argv_strs.push(&resolved);
-        for a in args {
+        for a in &owned_args {
             argv_strs.push(a.as_str());
         }
 
@@ -708,8 +797,14 @@ impl ShellHost for HshHost {
             )),
             "pwd" => ExecOutcome::ok_text(self.pwd.clone()),
             "cd" => {
-                self.pwd = self.normalize_path(args.first().map(String::as_str).unwrap_or("/"));
-                ExecOutcome::ok(Value::Empty)
+                let target = args.first().map(String::as_str).unwrap_or("/");
+                let abs = self.normalize_path(target);
+                if self.is_directory(&abs) {
+                    self.pwd = abs;
+                    ExecOutcome::ok(Value::Empty)
+                } else {
+                    ExecOutcome::err(1, format!("cd: {target}: no such directory"))
+                }
             }
             "history" => {
                 let mut out = String::new();
