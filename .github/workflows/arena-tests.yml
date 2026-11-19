@@ -1,0 +1,76 @@
+name: arena-tests
+
+# Temporary: the Arena sandbox has no Rust toolchain, so host-unit-test output
+# (including compile errors in the touched crates) is produced here and
+# committed back to the branch as a log file.
+# Delete this file when the session ends.
+
+on:
+  workflow_dispatch:
+    inputs:
+      packages:
+        description: "Space-separated -p packages (default: the touched set)"
+        type: string
+        default: "huesos-abi huesos-hxfs huesos-syscalls huesos-object huesos-kernel huesos-gpt"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: arena-tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  host-tests:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install nightly-2026-03-01 --profile minimal \
+            --component rust-src,llvm-tools-preview
+          rustup default nightly-2026-03-01
+      - name: Cache cargo target directory
+        uses: actions/cache@v4
+        with:
+          path: |
+            target
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: arena-tests-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            arena-tests-
+      - name: Run host tests and capture the log
+        id: tests
+        run: |
+          set +e
+          mkdir -p ci-artifacts/arena-tests
+          args=""
+          for pkg in ${{ inputs.packages }}; do
+            args="$args -p $pkg"
+          done
+          RUST_MIN_STACK=16777216 CARGO_BUILD_JOBS=2 \
+            cargo test $args --no-fail-fast > ci-artifacts/arena-tests/host-tests.log 2>&1
+          status=$?
+          echo "status=$status" >> "$GITHUB_OUTPUT"
+          tail -60 ci-artifacts/arena-tests/host-tests.log
+          exit 0
+      - name: Publish the log
+        run: |
+          set -euo pipefail
+          git config user.name "arena-test-bot"
+          git config user.email "arena-test-bot@users.noreply.github.com"
+          echo "status=${{ steps.tests.outputs.status }}" > ci-artifacts/arena-tests/status.txt
+          git add -f ci-artifacts/arena-tests
+          if git diff --cached --quiet; then
+            echo "nothing to publish"
+            exit 0
+          fi
+          git commit -m "chore(arena): publish host-test log [skip ci]"
+          git push origin "HEAD:${GITHUB_REF_NAME}"
+      - name: Fail when tests failed
+        if: ${{ steps.tests.outputs.status != '0' }}
+        run: exit 1
