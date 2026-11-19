@@ -53,6 +53,8 @@ pub mod storage_boot;
 pub mod pci;
 /// PCI Manager bootstrap and lifecycle control protocol.
 pub mod pci_config;
+/// Kernel-enforced PCI `DeviceLease` ABI (AP-20).
+pub mod pci_lease;
 pub mod pci_manager;
 /// Dedicated ACPI ↔ PCI configuration read mediation protocol (AP-10).
 pub mod pci_mediation;
@@ -486,6 +488,28 @@ pub enum Syscall {
     /// Write one 32-bit value to an x86 I/O port. Same contract as
     /// [`Self::IoPortRead32`]; `a3` is the value.
     IoPortWrite32 = 72,
+    /// Create a kernel-enforced [`DeviceLease`](../../huesos_object/struct.DeviceLease.html)
+    /// bound to `(device_id, generation, firmware_snapshot_id)` (AP-20).
+    /// `a1` points to [`pci_lease::DeviceLeaseCreateArgs`] (must present
+    /// `DeviceLeaseAuthority`), `a2` is `*mut HandleValue`.
+    DeviceLeaseCreate = 73,
+    /// Mint a lease-bound child `Resource` (`IoPort`, `Mmio`, `Irq`, or
+    /// `DmaPool`) for the active lease generation (AP-20). `a1` points to
+    /// [`pci_lease::DeviceLeaseMintResourceArgs`], `a2` is `*mut HandleValue`.
+    DeviceLeaseMintResource = 74,
+    /// Revoke an active `DeviceLease` generation, invalidating all child
+    /// `Resource` handles and delivering `PORT_PACKET_DEVICE_GONE` to bound
+    /// ports (AP-20). `a1` is the `DeviceLease` handle (`WRITE`), `a2` is
+    /// `expected_generation`, `a3` is [`pci_lease::revoke_flags`].
+    DeviceLeaseRevoke = 75,
+    /// Bind a `Port` to receive `PORT_PACKET_DEVICE_GONE` on lease
+    /// revocation (or immediately if already revoked) (AP-20). `a1` points to
+    /// [`pci_lease::DeviceLeaseBindPortArgs`].
+    DeviceLeaseBindGonePort = 76,
+    /// Query current metadata and revocation status of a `DeviceLease`
+    /// (AP-20). `a1` is the `DeviceLease` handle (`READ`), `a2` is
+    /// `*mut pci_lease::DeviceLeaseInfo`.
+    DeviceLeaseQuery = 77,
 }
 
 /// Maximum number of bytes one [`Syscall::SystemGetEntropy`] call
@@ -643,6 +667,11 @@ impl Syscall {
             70 => Self::IoPortWrite16,
             71 => Self::IoPortRead32,
             72 => Self::IoPortWrite32,
+            73 => Self::DeviceLeaseCreate,
+            74 => Self::DeviceLeaseMintResource,
+            75 => Self::DeviceLeaseRevoke,
+            76 => Self::DeviceLeaseBindGonePort,
+            77 => Self::DeviceLeaseQuery,
             _ => return None,
         })
     }
@@ -884,6 +913,12 @@ pub const INIT_CMDLINE_HANDLE: HandleValue = 7;
 /// handle to the supervised driver stack over a channel; the kernel never
 /// mints a second one.
 pub const INIT_CONFIG_MINT_HANDLE: HandleValue = 8;
+/// Unique `DeviceLeaseAuthority` [`Resource`](../../huesos_object/struct.Resource.html)
+/// capability installed in the initial process (AP-20). Minted once by the
+/// kernel at boot for the root supervisor only; required by
+/// [`Syscall::DeviceLeaseCreate`]. `init` delegates it to the supervised
+/// driver stack (`DriverManager` / `PCI Manager`).
+pub const INIT_DEVICE_LEASE_AUTH_HANDLE: HandleValue = 9;
 
 /// Stable process exit codes used when the kernel terminates a process after
 /// an unhandled ring-3 CPU exception.
@@ -1219,6 +1254,8 @@ pub const PORT_PACKET_PROCESS_EXIT: u32 = 2;
 pub const PORT_PACKET_QUOTA_EXHAUSTED: u32 = 3;
 /// Port packet type for async BlockDevice completions.
 pub const PORT_PACKET_BLOCK_COMPLETION: u32 = 4;
+/// Port packet type for `DeviceLease` revocation (`DeviceGone`) notifications.
+pub const PORT_PACKET_DEVICE_GONE: u32 = 5;
 
 /// Fixed-size event packet returned by [`Syscall::PortRead`].
 #[repr(C)]
@@ -1586,7 +1623,18 @@ mod tests {
         assert_eq!(Syscall::from_raw(70), Some(Syscall::IoPortWrite16));
         assert_eq!(Syscall::from_raw(71), Some(Syscall::IoPortRead32));
         assert_eq!(Syscall::from_raw(72), Some(Syscall::IoPortWrite32));
-        assert_eq!(Syscall::from_raw(73), None);
+        assert_eq!(Syscall::from_raw(73), Some(Syscall::DeviceLeaseCreate));
+        assert_eq!(
+            Syscall::from_raw(74),
+            Some(Syscall::DeviceLeaseMintResource)
+        );
+        assert_eq!(Syscall::from_raw(75), Some(Syscall::DeviceLeaseRevoke));
+        assert_eq!(
+            Syscall::from_raw(76),
+            Some(Syscall::DeviceLeaseBindGonePort)
+        );
+        assert_eq!(Syscall::from_raw(77), Some(Syscall::DeviceLeaseQuery));
+        assert_eq!(Syscall::from_raw(78), None);
     }
 
     #[test]

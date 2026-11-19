@@ -89,6 +89,8 @@ pub enum ObjectType {
     Resource = 10,
     /// Level-triggered waitable signal object.
     Signal = 11,
+    /// Kernel-enforced PCI device presence lease (`DeviceLease`).
+    DeviceLease = 12,
     /// Generic / unknown.
     Unknown = 0xFF,
 }

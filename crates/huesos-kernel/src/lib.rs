@@ -528,6 +528,11 @@ fn spawn_init_process(
     } else {
         dbg("[init] failed to install PciConfigMint capability\n");
     }
+    if install_device_lease_authority_capability(&spawned.process) {
+        dbg("[init] installed DeviceLeaseAuthority capability (handle 9)\n");
+    } else {
+        dbg("[init] failed to install DeviceLeaseAuthority capability\n");
+    }
 
     let name = *b"init\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0";
     let _ = scheduler::spawn_user_thread(
@@ -798,6 +803,29 @@ fn install_pci_config_mint_capability(process: &huesos_object::Process) -> bool 
         .handles
         .insert_at(
             huesos_abi::INIT_CONFIG_MINT_HANDLE,
+            Handle::new(koid, rights),
+        )
+        .is_err()
+    {
+        huesos_object::unregister_object(koid);
+        return false;
+    }
+    true
+}
+
+fn install_device_lease_authority_capability(process: &huesos_object::Process) -> bool {
+    use huesos_object::{Handle, KernelObject, Resource, ResourceKind, Rights};
+
+    let Ok(resource) = Resource::try_create_exclusive(ResourceKind::DeviceLeaseAuthority, 0, 1)
+    else {
+        return false;
+    };
+    let koid = resource.koid();
+    let rights = Rights::READ | Rights::TRANSFER | Rights::DUPLICATE;
+    if process
+        .handles
+        .insert_at(
+            huesos_abi::INIT_DEVICE_LEASE_AUTH_HANDLE,
             Handle::new(koid, rights),
         )
         .is_err()

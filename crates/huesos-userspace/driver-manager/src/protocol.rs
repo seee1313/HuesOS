@@ -55,6 +55,10 @@ pub const KEY_BROKER_MANAGER: &str = "key-broker:manager-channel";
 /// generation-bound read-only ECAM capabilities for PCI Manager and never
 /// duplicates or re-transfers the authority itself.
 pub const CONFIG_MINT_AUTHORITY: &str = "pci-config-mint:manager-authority";
+/// Init delegates the unique `DeviceLeaseAuthority` capability (AP-20) to
+/// DriverManager, which forwards a copy to PCI Manager so it can mint
+/// kernel-enforced `DeviceLease` handles.
+pub const DEVICE_LEASE_AUTHORITY: &str = "pci-lease-auth";
 /// DriverManager passes the archive to the isolated ACPI manager.
 pub const ACPI_MANAGER_TABLES: &str = "acpi-tables-vmo";
 /// DriverManager passes the unique broker capability to the ACPI manager.

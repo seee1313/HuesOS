@@ -219,9 +219,13 @@ pub struct DriverManager {
     /// Never duplicated, never re-transferred; used only to mint
     /// generation-bound read-only ECAM capabilities for the PCI Manager.
     config_mint: Option<Handle>,
+    /// Unique `DeviceLeaseAuthority` capability delegated by `init` (AP-20).
+    device_lease_authority: Option<Handle>,
     /// Whether the current PCI Manager generation received its config
     /// authority burst (or the explicit authority-settled sentinel).
     config_authority_handed_off: bool,
+    /// Whether the current PCI Manager generation received `DeviceLeaseAuthority`.
+    pci_device_lease_handed_off: bool,
     /// Whether the current PCI Manager generation reported
     /// [`pci_manager::Status::ConfigAuthorityReady`].
     pci_config_authority_ready: bool,
@@ -401,7 +405,9 @@ impl DriverManager {
             hmcf: None,
             hpci: None,
             config_mint: None,
+            device_lease_authority: None,
             config_authority_handed_off: false,
+            pci_device_lease_handed_off: false,
             pci_config_authority_ready: false,
             pci_roots_handed_off: false,
             pci_write_upgrade_requested: false,
@@ -1109,6 +1115,7 @@ impl DriverManager {
         self.pci_manager_ready = false;
         self.pci_config_authority_ready = false;
         self.config_authority_handed_off = false;
+        self.pci_device_lease_handed_off = false;
         self.pci_write_upgrade_requested = false;
         self.pci_write_authority_ready = false;
         self.pci_manager = Some(ManagedHost { process, bootstrap });
@@ -1126,6 +1133,8 @@ impl DriverManager {
         self.pci_manager = None;
         self.pci_manager_ready = false;
         self.pci_config_authority_ready = false;
+        self.config_authority_handed_off = false;
+        self.pci_device_lease_handed_off = false;
         self.pci_roots_handed_off = false;
         self.pci_write_upgrade_requested = false;
         self.pci_write_authority_ready = false;
@@ -1539,6 +1548,18 @@ impl DriverManager {
                         println!("[driver-manager] received unique PciConfigMint authority");
                         self.config_mint = Some(handle);
                         self.handoff_config_authority();
+                    }
+                }
+                Ok((n, Some(handle)))
+                    if &buf[..n] == protocol::DEVICE_LEASE_AUTHORITY.as_bytes() =>
+                {
+                    if self.device_lease_authority.is_some() {
+                        println!("[driver-manager] duplicate DeviceLeaseAuthority rejected");
+                        drop(handle);
+                    } else {
+                        println!("[driver-manager] received DeviceLeaseAuthority");
+                        self.device_lease_authority = Some(handle);
+                        self.maybe_handoff_device_lease_authority();
                     }
                 }
                 Ok((n, Some(handle))) if buf[..n].starts_with(RESOURCE_LABEL_PREFIX) => {
@@ -2620,6 +2641,7 @@ impl DriverManager {
                         }
                         self.config_authority_handed_off = true;
                         self.pci_manager = Some(host);
+                        self.maybe_handoff_device_lease_authority();
                         if force_legacy {
                             println!(
                                 "[driver-manager] minted legacy CF8/CFC capability for PCI manager generation {} (snapshot {})",
@@ -2657,6 +2679,40 @@ impl DriverManager {
                     // ACPI not settled yet; keep the child waiting.
                     self.pci_manager = Some(host);
                 }
+            }
+        }
+    }
+
+    fn maybe_handoff_device_lease_authority(&mut self) {
+        if !self.config_authority_handed_off || self.pci_device_lease_handed_off {
+            return;
+        }
+        let Some(auth) = self.device_lease_authority.as_ref() else {
+            return;
+        };
+        let Some(host) = self.pci_manager.as_ref() else {
+            return;
+        };
+        let Ok(dup) = auth.duplicate(libcanvas::rights::SAME_RIGHTS) else {
+            println!("[driver-manager] DeviceLeaseAuthority duplicate failed");
+            return;
+        };
+        match host
+            .bootstrap
+            .write_handle(pci_manager::DEVICE_LEASE_AUTHORITY_LABEL, dup)
+        {
+            Ok(()) => {
+                self.pci_device_lease_handed_off = true;
+                println!(
+                    "[driver-manager] forwarded DeviceLeaseAuthority to PCI manager generation {}",
+                    self.pci_manager_generation
+                );
+            }
+            Err((error, _handle)) => {
+                println!(
+                    "[driver-manager] DeviceLeaseAuthority transfer failed: {}",
+                    error.as_str()
+                );
             }
         }
     }

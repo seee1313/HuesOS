@@ -19,6 +19,11 @@ impl Port {
         self.0
     }
 
+    /// Borrow the underlying raw handle value.
+    pub fn raw_handle(&self) -> HandleValue {
+        self.0.raw()
+    }
+
     /// Create a new Port event queue.
     pub fn create() -> crate::Result<Self> {
         let mut out: HandleValue = INVALID_HANDLE;

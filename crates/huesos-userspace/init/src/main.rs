@@ -213,6 +213,18 @@ pub extern "C" fn _start() -> ! {
                 error.as_str()
             ),
         }
+        let lease_auth = libcanvas::handle::Handle::take_init_device_lease_authority();
+        match dm_channel.write_handle(b"pci-lease-auth", lease_auth) {
+            Ok(()) => init_logln!(
+                logger,
+                "[init] delegated DeviceLeaseAuthority to DriverManager"
+            ),
+            Err((error, _handle)) => init_logln!(
+                logger,
+                "[init] device lease authority transfer failed: {}",
+                error.as_str()
+            ),
+        }
     }
 
     if let Some((_, channel)) = &driver_manager {

@@ -31,8 +31,8 @@ use huesos_lifecycle::RefAccount;
 
 use crate::irq_guard::IrqSafeMutex;
 use crate::{
-    Channel, Interrupt, InterruptRouteKind, Job, KernelObject, KernelObjectExt, Koid, Port,
-    Process, Resource, ResourceError, Signal,
+    Channel, DeviceLease, Interrupt, InterruptRouteKind, Job, KernelObject, KernelObjectExt, Koid,
+    Port, Process, Resource, ResourceError, Signal,
 };
 
 struct RegistryState {
@@ -243,6 +243,21 @@ pub fn lookup_process(koid: Koid) -> Option<Arc<Process>> {
 ///
 /// See `docs/ARCHITECTURE_ROADMAP.md` §2 and the Zircon reference in
 /// `resource.rs`.
+fn resource_active_in_map(
+    objects: &BTreeMap<Koid, Arc<dyn KernelObject>>,
+    resource: &Resource,
+) -> bool {
+    let Some((lease_koid, lease_gen)) = resource.lease_binding() else {
+        return true;
+    };
+    let Some(lease_obj) = objects.get(&lease_koid) else {
+        return false;
+    };
+    lease_obj
+        .downcast_ref::<DeviceLease>()
+        .is_some_and(|lease| lease.is_generation_active(lease_gen))
+}
+
 pub(crate) fn try_register_resource_locked(candidate: Arc<Resource>) -> Result<(), ResourceError> {
     let koid = candidate.koid();
     let mut state = REGISTRY.lock();
@@ -254,6 +269,9 @@ pub(crate) fn try_register_resource_locked(candidate: Arc<Resource>) -> Result<(
             continue;
         };
         if other.kind() != candidate.kind() {
+            continue;
+        }
+        if !resource_active_in_map(&state.objects, other) {
             continue;
         }
         if !other.intersects(candidate.base(), candidate.len()) {
@@ -287,6 +305,9 @@ pub fn has_resource_conflict(kind: crate::ResourceKind, base: u64, len: u64) -> 
         let Some(other) = existing.downcast_ref::<Resource>() else {
             continue;
         };
+        if !resource_active_in_map(&state.objects, other) {
+            continue;
+        }
         let relevant = other.kind() == kind
             || (kind == crate::ResourceKind::Mmio && other.kind() == crate::ResourceKind::DmaPool);
         if relevant && other.intersects(base, len) {
@@ -338,6 +359,8 @@ pub(crate) fn wake_object_waiters(koid: Koid) {
         process.exit_waiters.wake_all();
     } else if let Some(signal) = object.downcast_ref::<Signal>() {
         signal.wait_queue().wake_all();
+    } else if let Some(lease) = object.downcast_ref::<DeviceLease>() {
+        lease.wait_queue().wake_all();
     }
 }
 

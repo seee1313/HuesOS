@@ -145,6 +145,9 @@ pub(crate) fn sys_resource_map(args_ptr: *const ResourceMapArgs) -> SyscallResul
     let resource = object
         .downcast_ref::<Resource>()
         .ok_or(ErrorCode::WrongType)?;
+    if !resource.is_lease_active() {
+        return Err(ErrorCode::AccessDenied);
+    }
     let map = (*RESOURCE_MAP_FN.lock()).ok_or(ErrorCode::NotSupported)?;
     map(resource, args).map(|addr| addr as i64)
 }
@@ -251,6 +254,9 @@ fn ioport_check(resource_handle: HandleValue, port: u32, width: u64) -> Result<u
     let resource = guard
         .downcast_ref::<Resource>()
         .ok_or(ErrorCode::WrongType)?;
+    if !resource.is_lease_active() {
+        return Err(ErrorCode::AccessDenied);
+    }
     let port_u16 = u16::try_from(port).map_err(|_| ErrorCode::InvalidArgs)?;
     if width != 0 && u64::from(port_u16) & (width - 1) != 0 {
         return Err(ErrorCode::InvalidArgs);

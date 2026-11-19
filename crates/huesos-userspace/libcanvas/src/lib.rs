@@ -64,6 +64,7 @@ pub mod block;
 pub mod channel;
 pub mod debug;
 pub mod devfs;
+pub mod device_lease;
 #[cfg(feature = "kernel-smoke-tests")]
 pub mod diagnostics;
 mod font6x13;
@@ -107,8 +108,8 @@ pub use huesos_abi::{
     fault_exit, hbi_boot, rights, scheduler_flags, signals, storage_boot, vmar_flags, wait_mode,
     ErrorCode, HandleValue, PortPacket, BOOTSTRAP_HANDLE, INIT_BOOTFS_HANDLE,
     INIT_FRAME_DRAW_HANDLE, INIT_STORAGE_BOOT_INFO_HANDLE, PORT_PACKET_BLOCK_COMPLETION,
-    PORT_PACKET_INTERRUPT, PORT_PACKET_PROCESS_EXIT, PORT_PACKET_QUOTA_EXHAUSTED, USER_STACK_SIZE,
-    USER_STACK_TOP,
+    PORT_PACKET_DEVICE_GONE, PORT_PACKET_INTERRUPT, PORT_PACKET_PROCESS_EXIT,
+    PORT_PACKET_QUOTA_EXHAUSTED, USER_STACK_SIZE, USER_STACK_TOP,
 };
 
 /// Result type used throughout `libcanvas`: every fallible syscall wrapper

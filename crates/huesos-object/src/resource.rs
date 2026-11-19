@@ -36,7 +36,7 @@
 use alloc::sync::Arc;
 use core::any::Any;
 
-use crate::{alloc_koid, KernelObject, Koid, ObjectType};
+use crate::{alloc_koid, KernelObject, KernelObjectExt, Koid, ObjectType};
 
 /// Kind of physical-address-space grant a `Resource` represents.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -87,6 +87,11 @@ pub enum ResourceKind {
     /// mint of PCI configuration capabilities described by
     /// `docs/ACPI_PCI_IMPLEMENTATION_PLAN.md` (AP-8).
     PciConfigMint = 9,
+    /// Authority to invoke [`crate::abi::Syscall::DeviceLeaseCreate`] (AP-20).
+    /// Binary capability minted once by the kernel at boot for `init` and
+    /// delegated to the supervised PCI/driver stack; `sys_resource_create`
+    /// cannot mint it.
+    DeviceLeaseAuthority = 10,
 }
 
 /// Reason a `Resource::try_create*` call was rejected.
@@ -109,6 +114,7 @@ pub struct Resource {
     base: u64,
     len: u64,
     exclusive: bool,
+    lease_binding: Option<(Koid, u64)>,
 }
 
 impl Resource {
@@ -126,7 +132,7 @@ impl Resource {
         base: u64,
         len: u64,
     ) -> Result<Arc<Self>, ResourceError> {
-        Self::try_create(kind, base, len, true)
+        Self::try_create(kind, base, len, true, None)
     }
 
     /// Attempt to mint a shared resource. Fails only on intersection
@@ -136,7 +142,29 @@ impl Resource {
         base: u64,
         len: u64,
     ) -> Result<Arc<Self>, ResourceError> {
-        Self::try_create(kind, base, len, false)
+        Self::try_create(kind, base, len, false, None)
+    }
+
+    /// Attempt to mint a resource bound to an active [`crate::DeviceLease`]
+    /// `(lease_koid, lease_generation)` pair.
+    pub fn try_create_leased(
+        kind: ResourceKind,
+        base: u64,
+        len: u64,
+        exclusive: bool,
+        lease_koid: Koid,
+        lease_generation: u64,
+    ) -> Result<Arc<Self>, ResourceError> {
+        if !lease_koid.is_valid() || lease_generation == 0 {
+            return Err(ResourceError::InvalidRange);
+        }
+        Self::try_create(
+            kind,
+            base,
+            len,
+            exclusive,
+            Some((lease_koid, lease_generation)),
+        )
     }
 
     fn try_create(
@@ -144,6 +172,7 @@ impl Resource {
         base: u64,
         len: u64,
         exclusive: bool,
+        lease_binding: Option<(Koid, u64)>,
     ) -> Result<Arc<Self>, ResourceError> {
         // Half-open range validation. `len == 0` describes an empty
         // range and is meaningless as a capability; wrap-past-u64::MAX
@@ -167,9 +196,30 @@ impl Resource {
             base,
             len,
             exclusive,
+            lease_binding,
         });
         crate::registry::try_register_resource_locked(resource.clone())?;
         Ok(resource)
+    }
+
+    /// Optional `(lease_koid, lease_generation)` binding when minted via
+    /// [`crate::DeviceLease`].
+    pub const fn lease_binding(&self) -> Option<(Koid, u64)> {
+        self.lease_binding
+    }
+
+    /// Return `true` if this resource is unbound or its bound `DeviceLease`
+    /// generation is still active.
+    pub fn is_lease_active(&self) -> bool {
+        let Some((lease_koid, lease_gen)) = self.lease_binding else {
+            return true;
+        };
+        let Some(object) = crate::lookup_object(lease_koid) else {
+            return false;
+        };
+        object
+            .downcast_ref::<crate::DeviceLease>()
+            .is_some_and(|lease| lease.is_generation_active(lease_gen))
     }
 
     /// Resource kind (IoPort, Mmio, or Irq).

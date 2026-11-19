@@ -31,6 +31,9 @@ pub const CONFIG_ECAM_RW_LABEL: &[u8] = b"pci-config-ecam-rw";
 /// requests the legacy backend with [`HELLO_FLAG_FORCE_LEGACY`]; never
 /// sent otherwise.
 pub const LEGACY_IOPORT_LABEL: &[u8] = b"pci-legacy-ioport";
+/// Label carrying the `DeviceLeaseAuthority` capability from DriverManager to
+/// PCI Manager (AP-20). Must stay `<= MESSAGE_BYTES` (24 bytes).
+pub const DEVICE_LEASE_AUTHORITY_LABEL: &[u8] = b"pci-lease-auth";
 
 /// Configuration override: serve configuration reads through the
 /// legacy CF8/CFC mechanism (#1) even though ECAM authority is mapped.
