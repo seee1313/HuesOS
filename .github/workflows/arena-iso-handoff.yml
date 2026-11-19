@@ -37,7 +37,9 @@ permissions:
   contents: write
 
 concurrency:
-  group: arena-iso-${{ github.ref }}
+  # The formatter run must not cancel a build in flight (and vice versa), so
+  # the group is keyed by the requested mode.
+  group: arena-iso-${{ github.ref }}-${{ inputs.fmt == 'true' && 'fmt' || 'build' }}
   cancel-in-progress: true
 
 jobs:
