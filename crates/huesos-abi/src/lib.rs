@@ -19,6 +19,8 @@
 pub mod auxv;
 /// Versioned userspace KeyBroker grant protocol.
 pub mod key_broker;
+/// Bidirectional IPC wire protocol between `terminal` and `/bin/hsh.elf`.
+pub mod term_ipc;
 
 /// Ring-3 ACPI manager broker and immutable table-archive protocol.
 pub mod acpi_broker;

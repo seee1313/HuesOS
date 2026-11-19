@@ -144,4 +144,8 @@ pub struct ProcessBootstrapInfo {
     pub block_dev_ch: u32,
     /// Capability handle for framebuffer draw resource (`INVALID_HANDLE` if absent).
     pub frame_draw_ch: u32,
+    /// Capability handle for read-only `BOOTFS` VMO (`INVALID_HANDLE` if absent/`bootfs=none`).
+    pub bootfs_vmo: u32,
+    /// Capability handle for `DriverManager` query/registry channel (`INVALID_HANDLE` if absent).
+    pub registry_ch: u32,
 }

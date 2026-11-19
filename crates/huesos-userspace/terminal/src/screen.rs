@@ -1,11 +1,10 @@
-//! Framebuffer-backed text screen.
-//!
-//! The terminal keeps a fixed-capacity character buffer and renders through a
-//! process-wide software framebuffer. Full-screen applications may reuse the
-//! same framebuffer through `with_render_shadow`; a generation counter lets
-//! the terminal detect those external renders and restore its complete state
-//! on the next presentation.
+//! Framebuffer-backed text screen with dirty-cell tracking, industrial chrome,
+//! fast scroll-shift blitting, and a 512-line scrollback ring buffer.
 
+use alloc::format;
+use alloc::string::String;
+use alloc::vec;
+use alloc::vec::Vec;
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
@@ -15,40 +14,51 @@ use libcanvas::HandleValue;
 const ROWS: usize = 54;
 const COLS: usize = 168;
 const TAB_WIDTH: usize = 4;
+const SCROLLBACK_CAP: usize = 512;
 
 const ALL_ROWS_DIRTY: u64 = (1u64 << ROWS) - 1;
 const CLEAN_COLUMN: u16 = COLS as u16;
 
 const LEFT_MARGIN: u32 = 12;
-const TOP_MARGIN: u32 = 12;
+const HEADER_HEIGHT: u32 = 22;
+const TOP_MARGIN: u32 = HEADER_HEIGHT + 5;
+const FOOTER_HEIGHT: u32 = 20;
 
-/// Covers framebuffers up to 2560×1600 at 32 bits per pixel without heap
+/// Covers framebuffers up to 2560x1600 at 32 bits per pixel without heap
 /// allocation.
 const SHADOW_CAPACITY: usize = 16 * 1024 * 1024;
 
-type Color = (u8, u8, u8);
+pub type Color = (u8, u8, u8);
 
-const COLOR_BACKGROUND: Color = (5, 8, 16);
-const COLOR_TEXT: Color = (180, 220, 255);
-const COLOR_CURSOR: Color = (100, 255, 170);
+const COLOR_BACKGROUND: Color = (11, 14, 20); // #0B0E14 obsidian workspace
+const COLOR_CHROME_BG: Color = (16, 21, 31); // #10151F header / footer
+const COLOR_DIVIDER: Color = (30, 38, 54); // #1E2636 1px hairline divider
+const COLOR_TEXT: Color = (205, 220, 240);
+const COLOR_MUTED: Color = (120, 140, 168);
+const COLOR_ACCENT: Color = (95, 225, 185);
+const COLOR_AMBER: Color = (255, 195, 90);
+const COLOR_CURSOR: Color = (95, 225, 185);
 
-/// Monotonically identifies the most recent owner of the shared render
-/// buffer. A terminal instance records the generation of its last successful
-/// render and performs a full redraw when another component has rendered
-/// since then.
+/// Single character cell stored in the screen & shadow grids.
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub struct Cell {
+    pub ch: u8,
+    pub fg: Color,
+    pub bg: Color,
+    pub flags: u8,
+}
+
+const DEFAULT_CELL: Cell = Cell {
+    ch: b' ',
+    fg: COLOR_TEXT,
+    bg: COLOR_BACKGROUND,
+    flags: 0,
+};
+
 static SHADOW_GENERATION: AtomicUsize = AtomicUsize::new(0);
 
-/// Failure modes for the [`TerminalShadow::with`] exclusive borrow.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ShadowError {
-    /// A previous closure passed to [`with_render_shadow`] /
-    /// [`with_render_shadow_tracked`] is still running. The render
-    /// pipeline must never recurse into the shadow from inside its
-    /// own callback, so this error indicates a programming bug at
-    /// the call site rather than a runtime condition the caller
-    /// can recover from. Callers should log it and skip the frame
-    /// rather than retry; the recursive borrower will release the
-    /// guard on return and subsequent frames will succeed.
     AlreadyBorrowed,
 }
 
@@ -86,8 +96,6 @@ impl TerminalShadow {
             borrowed: &self.borrowed,
         };
 
-        // The generation is assigned while exclusive ownership is held. This
-        // preserves a total order between terminal and full-screen renders.
         let generation = SHADOW_GENERATION
             .fetch_add(1, Ordering::AcqRel)
             .wrapping_add(1);
@@ -112,16 +120,6 @@ impl Drop for ShadowBorrowGuard<'_> {
 
 static TERMINAL_SHADOW: TerminalShadow = TerminalShadow::new();
 
-/// Borrow the process-wide software framebuffer.
-///
-/// Full-screen applications should use this function when possible. Doing so
-/// allows the terminal to detect that its previous framebuffer contents were
-/// replaced and restore the complete terminal on the next `Screen::render`.
-///
-/// Returns [`ShadowError::AlreadyBorrowed`] if a previous closure is still
-/// running. Callers should treat this as a skip-this-frame signal: the
-/// recursive borrower will release the guard on return and the next call
-/// will succeed.
 pub(crate) fn with_render_shadow<R>(
     operation: impl FnOnce(&mut [u8; SHADOW_CAPACITY]) -> R,
 ) -> Result<R, ShadowError> {
@@ -202,42 +200,41 @@ impl PixelRect {
 /// Fixed-capacity text screen backed by a framebuffer `Canvas`.
 pub struct Screen {
     canvas: Option<Canvas>,
-    cells: [[u8; COLS]; ROWS],
-    colors: [[Color; COLS]; ROWS],
-    active_fg: Color,
+    cells: Vec<[Cell; COLS]>,
+    presented_cells: Vec<[Cell; COLS]>,
+    scrollback: Vec<[Cell; COLS]>,
+    scrollback_head: usize,
+    scrollback_len: usize,
+    scroll_offset: usize,
 
+    active_fg: Color,
     row: usize,
     col: usize,
     font: TextFont,
     cursor_visible: bool,
+    presented_cursor: Option<(usize, usize)>,
 
     dirty_rows: u64,
     dirty_from: [u16; ROWS],
     dirty_to: [u16; ROWS],
+    pending_scroll_lines: usize,
     force_full_render: bool,
+    chrome_dirty: bool,
+
+    status_proc: String,
+    status_pwd: String,
+    status_caps: String,
 
     rendered_view_top: usize,
     observed_shadow_generation: usize,
 }
 
-// `Screen` is the public rendering API of the terminal; some of its
-// methods (framebuffer introspection, cursor position query, manual
-// invalidation) are part of the contract for future drivers and tests
-// even when no current in-tree caller exercises them. The `dead_code`
-// lint is therefore disabled at the impl block.
 #[allow(dead_code)]
 impl Screen {
-    /// Create a terminal screen. Serial-only boots remain operational when a
-    /// framebuffer canvas is unavailable.
     pub fn new() -> Self {
         Self::new_with_cap(None)
     }
 
-    /// Create a terminal screen that blits using the `FrameDraw` capability
-    /// delivered by init. `None` falls back to the default init-process
-    /// slot, which only works for init itself — every other process must be
-    /// handed a real capability or its blits bounce `AccessDenied` and the
-    /// screen freezes on init's last frame.
     pub fn new_with_cap(frame_draw: Option<HandleValue>) -> Self {
         let canvas = match frame_draw {
             Some(cap) => Canvas::new_fullscreen_with_cap(cap).ok(),
@@ -245,83 +242,107 @@ impl Screen {
         };
         Self {
             canvas,
-            cells: [[b' '; COLS]; ROWS],
-            colors: [[COLOR_TEXT; COLS]; ROWS],
+            cells: vec![[DEFAULT_CELL; COLS]; ROWS],
+            presented_cells: vec![[DEFAULT_CELL; COLS]; ROWS],
+            scrollback: vec![[DEFAULT_CELL; COLS]; SCROLLBACK_CAP],
+            scrollback_head: 0,
+            scrollback_len: 0,
+            scroll_offset: 0,
             active_fg: COLOR_TEXT,
-
             row: 0,
             col: 0,
             font: TextFont::Cozette6x13,
             cursor_visible: true,
-
+            presented_cursor: None,
             dirty_rows: ALL_ROWS_DIRTY,
             dirty_from: [0; ROWS],
             dirty_to: [COLS as u16; ROWS],
+            pending_scroll_lines: 0,
             force_full_render: true,
-
+            chrome_dirty: true,
+            status_proc: String::from("hsh.elf"),
+            status_pwd: String::from("/"),
+            status_caps: String::from("HXFS:RW | BOOTFS:RO"),
             rendered_view_top: 0,
             observed_shadow_generation: render_shadow_generation(),
         }
     }
 
-    /// Return whether this screen has access to a framebuffer canvas.
     pub fn has_framebuffer(&self) -> bool {
         self.canvas.is_some()
     }
 
-    /// Return the current logical cursor position as `(row, column)`.
-    pub fn cursor_position(&self) -> (usize, usize) {
-        (self.row, self.col)
-    }
-
-    /// Return the number of text columns and rows currently visible with the
-    /// selected font.
     pub fn visible_size(&self) -> (usize, usize) {
         (self.active_columns(), self.active_rows())
     }
 
-    /// Invalidate all previously rendered framebuffer contents.
-    ///
-    /// Full-screen applications using `with_render_shadow` are detected
-    /// automatically. This method is intended for applications that write to
-    /// the framebuffer through another path.
     pub fn invalidate(&mut self) {
         self.mark_all_dirty();
     }
 
-    /// Clear all cells and reset the cursor.
+    pub fn set_status_info(&mut self, proc_label: &str, pwd: &str, caps: &str) {
+        if self.status_proc != proc_label || self.status_pwd != pwd || self.status_caps != caps {
+            self.status_proc.clear();
+            self.status_proc.push_str(proc_label);
+            self.status_pwd.clear();
+            self.status_pwd.push_str(pwd);
+            self.status_caps.clear();
+            self.status_caps.push_str(caps);
+            self.chrome_dirty = true;
+        }
+    }
+
+    pub fn scroll_up(&mut self, lines: usize) {
+        let max_off = self.scrollback_len;
+        let next = self.scroll_offset.saturating_add(lines).min(max_off);
+        if next != self.scroll_offset {
+            self.scroll_offset = next;
+            self.chrome_dirty = true;
+            self.mark_all_rows_dirty_no_clear();
+        }
+    }
+
+    pub fn scroll_down(&mut self, lines: usize) {
+        let next = self.scroll_offset.saturating_sub(lines);
+        if next != self.scroll_offset {
+            self.scroll_offset = next;
+            self.chrome_dirty = true;
+            self.mark_all_rows_dirty_no_clear();
+        }
+    }
+
+    pub fn reset_scrollback(&mut self) {
+        if self.scroll_offset != 0 {
+            self.scroll_offset = 0;
+            self.chrome_dirty = true;
+            self.mark_all_rows_dirty_no_clear();
+        }
+    }
+
     pub fn clear(&mut self) {
-        self.cells = [[b' '; COLS]; ROWS];
-        self.colors = [[COLOR_TEXT; COLS]; ROWS];
+        for r in self.cells.iter_mut() {
+            *r = [DEFAULT_CELL; COLS];
+        }
+        self.scroll_offset = 0;
         self.active_fg = COLOR_TEXT;
         self.row = 0;
         self.col = 0;
+        self.pending_scroll_lines = 0;
+        self.chrome_dirty = true;
         self.mark_all_dirty();
     }
 
-    /// Write a string followed by a newline.
     pub fn write_line(&mut self, text: &str) {
         self.write_str(text);
         self.newline();
     }
 
-    /// Write a byte string, including supported ASCII control characters.
     pub fn write_str(&mut self, text: &str) {
         for byte in text.bytes() {
             self.write_byte(byte);
         }
     }
 
-    /// Write one byte.
-    ///
-    /// Supported control characters:
-    ///
-    /// - `\n`: newline
-    /// - `\r`: carriage return
-    /// - `\t`: tab
-    /// - `0x08`: backspace
-    ///
-    /// Bytes outside printable ASCII are rendered as `?`.
     pub fn write_byte(&mut self, byte: u8) {
         match byte {
             b'\n' => self.newline(),
@@ -333,91 +354,41 @@ impl Screen {
         }
     }
 
-    /// Delete one character immediately before the cursor.
     pub fn backspace(&mut self) {
         if self.col == 0 {
             return;
         }
-
         let old_col = self.col;
         self.col -= 1;
-        self.cells[self.row][self.col] = b' ';
-
-        // The erased cell and both cursor positions are covered by the same
-        // compact range.
+        self.cells[self.row][self.col] = DEFAULT_CELL;
+        self.chrome_dirty = true;
         self.mark_dirty_span(self.row, self.col, old_col.saturating_add(1).min(COLS));
     }
 
-    /// Move the cursor to the beginning of the current line.
     pub fn carriage_return(&mut self) {
         if self.col == 0 {
             return;
         }
-
         let old_col = self.col;
         self.col = 0;
-
-        if self.cursor_visible {
-            self.mark_dirty_span(self.row, 0, old_col.saturating_add(1).min(COLS));
-        }
+        self.chrome_dirty = true;
+        self.mark_dirty_span(self.row, 0, old_col.saturating_add(1).min(COLS));
     }
 
-    /// Advance to a new line, scrolling the logical buffer when necessary.
     pub fn newline(&mut self) {
         let old_row = self.row;
         let old_col = self.col;
         self.col = 0;
+        self.chrome_dirty = true;
 
-        if self.row + 1 >= ROWS {
+        if self.row + 1 >= self.active_rows() {
             self.scroll();
             return;
         }
 
         self.row += 1;
-
-        // Moving the active row changes its text color. Both the previous and
-        // new active rows must therefore redraw their complete visible text,
-        // plus any cursor cell.
-        let old_end = line_len(&self.cells[old_row])
-            .max(if self.cursor_visible {
-                old_col.saturating_add(1)
-            } else {
-                old_col
-            })
-            .min(COLS);
-
-        let new_end = line_len(&self.cells[self.row])
-            .max(if self.cursor_visible {
-                self.col.saturating_add(1)
-            } else {
-                self.col
-            })
-            .min(COLS);
-
-        self.mark_dirty_span(old_row, 0, old_end);
-        self.mark_dirty_span(self.row, 0, new_end);
-    }
-
-    /// Write an unsigned decimal integer without allocating.
-    pub fn write_usize(&mut self, mut value: usize) {
-        let mut buf = [0u8; 20];
-        let mut len = 0;
-
-        if value == 0 {
-            self.write_byte(b'0');
-            return;
-        }
-
-        while value > 0 && len < buf.len() {
-            buf[len] = b'0' + (value % 10) as u8;
-            value /= 10;
-            len += 1;
-        }
-
-        while len > 0 {
-            len -= 1;
-            self.write_byte(buf[len]);
-        }
+        self.mark_dirty_span(old_row, old_col, old_col.saturating_add(1).min(COLS));
+        self.mark_dirty_span(self.row, 0, 1);
     }
 
     pub fn set_fg(&mut self, color: Color) {
@@ -439,66 +410,66 @@ impl Screen {
         self.row
     }
 
-    pub fn current_col(&self) -> usize {
-        self.col
-    }
-
     pub fn set_cursor(&mut self, row: usize, col: usize) {
         let old_row = self.row;
         let old_col = self.col;
-        self.row = row.min(ROWS - 1);
-        self.col = col.min(COLS - 1);
+        let next_row = row.min(self.active_rows().saturating_sub(1));
+        let next_col = col.min(COLS - 1);
+        if next_row != old_row || next_col != old_col {
+            self.chrome_dirty = true;
+        }
+        self.row = next_row;
+        self.col = next_col;
         self.mark_dirty_span(old_row, old_col, old_col.saturating_add(1).min(COLS));
         self.mark_dirty_span(self.row, self.col, self.col.saturating_add(1).min(COLS));
     }
 
     pub fn clear_from(&mut self, start_row: usize, start_col: usize) {
-        let r0 = start_row.min(ROWS - 1);
+        let vis_rows = self.active_rows();
+        let r0 = start_row.min(vis_rows.saturating_sub(1));
         let c0 = start_col.min(COLS);
-        for r in r0..ROWS {
+        for r in r0..vis_rows {
             let from_c = if r == r0 { c0 } else { 0 };
             for c in from_c..COLS {
-                self.cells[r][c] = b' ';
-                self.colors[r][c] = COLOR_TEXT;
+                self.cells[r][c] = DEFAULT_CELL;
             }
             self.mark_dirty_span(r, from_c, COLS);
         }
         self.row = r0;
         self.col = c0.min(COLS - 1);
+        self.chrome_dirty = true;
     }
 
-    /// Show or hide the terminal cursor.
+    /// Show or hide the cursor. Marks ONLY the single cursor cell dirty so idle
+    /// cursor blinking never triggers full-row or chrome redraws.
     pub fn set_cursor_visible(&mut self, visible: bool) {
         if self.cursor_visible == visible {
             return;
         }
-
-        let row = self.row;
-        let col = self.col;
-
         self.cursor_visible = visible;
-        self.mark_dirty_span(row, col, col.saturating_add(1).min(COLS));
+        if self.scroll_offset == 0 {
+            self.mark_dirty_span(self.row, self.col, self.col.saturating_add(1).min(COLS));
+        }
     }
 
-    /// Select the default Cozette 6×13 bitmap font.
     pub fn use_cozette_font(&mut self) {
         self.font = TextFont::Cozette6x13;
+        self.chrome_dirty = true;
         self.mark_all_dirty();
     }
 
-    /// Select the legacy TTY-style 8×16 font.
     pub fn use_tty_font(&mut self) {
         self.font = TextFont::Tty8x16;
+        self.chrome_dirty = true;
         self.mark_all_dirty();
     }
 
-    /// Select the compact HuesOS 8×8 font.
     pub fn use_compact_font(&mut self) {
         self.font = TextFont::Compact8x8;
+        self.chrome_dirty = true;
         self.mark_all_dirty();
     }
 
-    /// Return the human-readable name of the active font.
     pub fn font_name(&self) -> &'static str {
         match self.font {
             TextFont::Cozette6x13 => "cozette 6x13",
@@ -507,71 +478,76 @@ impl Screen {
         }
     }
 
-    /// Present all modified terminal regions to the framebuffer.
     pub fn render(&mut self) {
         let shared_generation = render_shadow_generation();
-
         if shared_generation != self.observed_shadow_generation {
-            // Another component, such as Snake, has replaced framebuffer
-            // contents since the terminal last presented.
             self.mark_all_dirty();
         }
 
         let view_top = self.viewport_top();
-
         if view_top != self.rendered_view_top {
-            // A viewport shift changes the model row represented by every
-            // screen row, so partial dirty information is no longer valid.
             self.mark_all_dirty();
         }
 
-        if self.dirty_rows == 0 && !self.force_full_render {
+        if self.dirty_rows == 0
+            && !self.force_full_render
+            && !self.chrome_dirty
+            && self.pending_scroll_lines == 0
+        {
             return;
         }
 
         let mut committed_generation = None;
-
-        let rendered = if let Some(canvas) = self.canvas.as_ref() {
-            if canvas.supports_buffered_raster() && canvas.byte_len() <= SHADOW_CAPACITY {
+        let rendered = if let Some(canvas) = self.canvas.take() {
+            let ok = if canvas.supports_buffered_raster() && canvas.byte_len() <= SHADOW_CAPACITY {
                 let dirty_rows = self.dirty_rows;
                 let force_full = self.force_full_render;
+                let chrome_dirty = self.chrome_dirty;
+                let scroll_shift = self.pending_scroll_lines;
 
-                // The shadow is borrowed exclusively for the duration of
-                // the render closure. A recursive borrow would indicate a
-                // programming bug at the call site; the kernel-side
-                // surface turns it into a Result instead of a panic so the
-                // terminal can keep running. We treat the error as
-                // "frame skipped": dirty tracking is left intact so the
-                // next call will retry once the recursive borrower has
-                // released the guard.
                 match with_render_shadow_tracked(|shadow| {
-                    if force_full || dirty_rows == ALL_ROWS_DIRTY {
-                        self.render_full_buffered(canvas, shadow, view_top)
+                    if force_full {
+                        self.render_full_buffered(&canvas, shadow, view_top)
                     } else {
-                        self.render_dirty_buffered(canvas, shadow, dirty_rows, view_top)
+                        let mut ok = true;
+                        if scroll_shift > 0 && self.scroll_offset == 0 {
+                            ok = self.render_scroll_shifted_buffered(
+                                &canvas,
+                                shadow,
+                                scroll_shift,
+                                view_top,
+                            );
+                        } else if dirty_rows != 0 {
+                            ok = self.render_dirty_buffered(&canvas, shadow, dirty_rows, view_top);
+                        }
+                        if ok && chrome_dirty {
+                            ok = self.render_chrome_buffered(&canvas, shadow);
+                        }
+                        ok
                     }
                 }) {
                     Ok((result, generation)) => {
                         committed_generation = Some(generation);
                         result
                     }
-                    Err(_shadow_error) => false,
+                    Err(_) => false,
                 }
             } else {
-                // Unusual pixel formats fall back to direct canvas drawing.
-                // Partial updates are intentionally disabled here because the
-                // direct path cannot guarantee shadow-buffer consistency.
-                self.render_full_fallback(canvas, view_top)
-            }
+                self.render_full_fallback(&canvas, view_top)
+            };
+            self.canvas = Some(canvas);
+            ok
         } else {
             true
         };
 
         if rendered {
+            self.sync_presented_grid(view_top);
             self.clear_dirty_tracking();
             self.force_full_render = false;
+            self.chrome_dirty = false;
+            self.pending_scroll_lines = 0;
             self.rendered_view_top = view_top;
-
             self.observed_shadow_generation =
                 committed_generation.unwrap_or_else(render_shadow_generation);
         }
@@ -579,95 +555,103 @@ impl Screen {
 
     fn write_printable(&mut self, byte: u8) {
         let wrap_columns = self.active_columns();
-
         if self.col >= wrap_columns || self.col >= COLS {
             self.newline();
         }
-
         let row = self.row;
         let column = self.col;
-
-        self.cells[row][column] = byte;
-        self.colors[row][column] = self.active_fg;
+        self.cells[row][column] = Cell {
+            ch: byte,
+            fg: self.active_fg,
+            bg: COLOR_BACKGROUND,
+            flags: 0,
+        };
         self.col += 1;
-
-        // Redraw the written cell and the cursor's new location.
-        let end = if self.cursor_visible {
-            self.col.saturating_add(1)
-        } else {
-            self.col
-        }
-        .min(COLS);
-
+        self.chrome_dirty = true;
+        let end = self.col.saturating_add(1).min(COLS);
         self.mark_dirty_span(row, column, end);
     }
 
     fn tab(&mut self) {
         let columns = self.active_columns();
-
         if self.col >= columns {
             self.newline();
         }
-
         let tab_end = ((self.col / TAB_WIDTH) + 1)
             .saturating_mul(TAB_WIDTH)
             .min(columns);
-
         while self.col < tab_end {
             self.write_printable(b' ');
         }
     }
 
-    fn scroll(&mut self) {
-        let mut source = 1;
-
-        while source < ROWS {
-            self.cells[source - 1] = self.cells[source];
-            self.colors[source - 1] = self.colors[source];
-            source += 1;
+    fn push_scrollback_row(&mut self, row: [Cell; COLS]) {
+        self.scrollback[self.scrollback_head] = row;
+        self.scrollback_head = (self.scrollback_head + 1) % SCROLLBACK_CAP;
+        if self.scrollback_len < SCROLLBACK_CAP {
+            self.scrollback_len += 1;
         }
+    }
 
-        self.cells[ROWS - 1] = [b' '; COLS];
-        self.colors[ROWS - 1] = [COLOR_TEXT; COLS];
-        self.row = ROWS - 1;
+    fn scroll(&mut self) {
+        let vis_rows = self.active_rows().min(ROWS);
+        self.push_scrollback_row(self.cells[0]);
+        for dst in 0..vis_rows.saturating_sub(1) {
+            self.cells[dst] = self.cells[dst + 1];
+        }
+        self.cells[vis_rows.saturating_sub(1)] = [DEFAULT_CELL; COLS];
+        self.row = vis_rows.saturating_sub(1);
         self.col = 0;
+        self.chrome_dirty = true;
 
-        // Logical rows have all changed their screen positions. A complete
-        // redraw is required even when only the final row is empty.
-        self.mark_all_dirty();
+        if self.scroll_offset == 0 {
+            self.pending_scroll_lines = self.pending_scroll_lines.saturating_add(1);
+            if self.pending_scroll_lines >= vis_rows {
+                self.mark_all_dirty();
+            } else {
+                // Shift dirty flags upward and mark the new bottom row dirty.
+                self.dirty_rows >>= 1;
+                for r in 0..vis_rows.saturating_sub(1) {
+                    self.dirty_from[r] = self.dirty_from[r + 1];
+                    self.dirty_to[r] = self.dirty_to[r + 1];
+                }
+                let last = vis_rows.saturating_sub(1);
+                self.dirty_from[last] = CLEAN_COLUMN;
+                self.dirty_to[last] = 0;
+                self.mark_dirty_span(last, 0, COLS);
+            }
+        }
     }
 
     fn active_columns(&self) -> usize {
         self.canvas
             .as_ref()
-            .map(|canvas| self.visible_columns_for(canvas))
+            .map(|c| self.visible_columns_for(c))
             .unwrap_or(COLS)
     }
 
     fn active_rows(&self) -> usize {
         self.canvas
             .as_ref()
-            .map(|canvas| self.visible_rows_for(canvas))
+            .map(|c| self.visible_rows_for(c))
             .unwrap_or(ROWS)
     }
 
     fn visible_columns_for(&self, canvas: &Canvas) -> usize {
         let metrics = font_metrics(self.font);
-        let available = canvas.width().saturating_sub(LEFT_MARGIN);
-
+        let available = canvas.width().saturating_sub(LEFT_MARGIN * 2);
         (available / metrics.advance).max(1).min(COLS as u32) as usize
     }
 
     fn visible_rows_for(&self, canvas: &Canvas) -> usize {
         let metrics = font_metrics(self.font);
-        let available = canvas.height().saturating_sub(TOP_MARGIN);
-
+        let reserved = TOP_MARGIN.saturating_add(FOOTER_HEIGHT + 4);
+        let available = canvas.height().saturating_sub(reserved);
         (available / metrics.line_height).max(1).min(ROWS as u32) as usize
     }
 
     fn viewport_top(&self) -> usize {
         let visible_rows = self.active_rows();
-
         if self.row < visible_rows {
             0
         } else {
@@ -675,35 +659,252 @@ impl Screen {
         }
     }
 
+    fn row_for_display(&self, view_top: usize, display_row: usize) -> &[Cell; COLS] {
+        let visible_rows = self.active_rows();
+        if self.scroll_offset == 0 {
+            let mr = (view_top + display_row).min(ROWS - 1);
+            return &self.cells[mr];
+        }
+        // Chronological order: [oldest scrollback .. newest scrollback, live[0..visible_rows]]
+        // Total lines = scrollback_len + visible_rows.
+        // Visible window ends at `total - scroll_offset`.
+        let total = self.scrollback_len + visible_rows;
+        let end = total.saturating_sub(self.scroll_offset);
+        let start = end.saturating_sub(visible_rows);
+        let idx = start + display_row;
+        if idx < self.scrollback_len {
+            let oldest = if self.scrollback_len == SCROLLBACK_CAP {
+                self.scrollback_head
+            } else {
+                0
+            };
+            let ring_idx = (oldest + idx) % SCROLLBACK_CAP;
+            &self.scrollback[ring_idx]
+        } else {
+            let live_idx = (idx - self.scrollback_len).min(ROWS - 1);
+            &self.cells[live_idx]
+        }
+    }
+
     fn mark_dirty_span(&mut self, row: usize, start_column: usize, end_column: usize) {
         if row >= ROWS {
             return;
         }
-
         let start = start_column.min(COLS);
         let end = end_column.min(COLS);
-
         if start >= end {
             return;
         }
-
         self.dirty_rows |= 1u64 << row;
-
         self.dirty_from[row] = self.dirty_from[row].min(start as u16);
         self.dirty_to[row] = self.dirty_to[row].max(end as u16);
+    }
+
+    fn mark_all_rows_dirty_no_clear(&mut self) {
+        let vis = self.active_rows().min(ROWS);
+        for r in 0..vis {
+            self.dirty_rows |= 1u64 << r;
+            self.dirty_from[r] = 0;
+            self.dirty_to[r] = COLS as u16;
+        }
+        self.pending_scroll_lines = 0;
     }
 
     fn mark_all_dirty(&mut self) {
         self.dirty_rows = ALL_ROWS_DIRTY;
         self.dirty_from = [0; ROWS];
         self.dirty_to = [COLS as u16; ROWS];
+        self.pending_scroll_lines = 0;
         self.force_full_render = true;
+        self.chrome_dirty = true;
     }
 
     fn clear_dirty_tracking(&mut self) {
         self.dirty_rows = 0;
         self.dirty_from = [CLEAN_COLUMN; ROWS];
         self.dirty_to = [0; ROWS];
+    }
+
+    fn sync_presented_grid(&mut self, view_top: usize) {
+        let visible_rows = self.active_rows().min(ROWS);
+        for display_row in 0..visible_rows {
+            let row_data = *self.row_for_display(view_top, display_row);
+            self.presented_cells[display_row] = row_data;
+        }
+        self.presented_cursor = if self.cursor_visible && self.scroll_offset == 0 {
+            Some((self.row.saturating_sub(view_top), self.col))
+        } else {
+            None
+        };
+    }
+
+    fn render_chrome_to_shadow(&self, canvas: &Canvas, shadow: &mut [u8; SHADOW_CAPACITY]) -> bool {
+        let w = canvas.width();
+        let h = canvas.height();
+        let footer_y = h.saturating_sub(FOOTER_HEIGHT);
+
+        // Top header bar + 1px divider
+        if canvas
+            .fill_rect_to_shadow(
+                shadow,
+                0,
+                0,
+                w,
+                HEADER_HEIGHT,
+                COLOR_CHROME_BG.0,
+                COLOR_CHROME_BG.1,
+                COLOR_CHROME_BG.2,
+            )
+            .is_err()
+        {
+            return false;
+        }
+        if canvas
+            .fill_rect_to_shadow(
+                shadow,
+                0,
+                HEADER_HEIGHT,
+                w,
+                1,
+                COLOR_DIVIDER.0,
+                COLOR_DIVIDER.1,
+                COLOR_DIVIDER.2,
+            )
+            .is_err()
+        {
+            return false;
+        }
+
+        let left_hdr = format!("HuesOS  |  {}", self.status_proc);
+        let right_hdr = format!("cwd: {}  |  CAPS: {}", self.status_pwd, self.status_caps);
+        let _ = canvas.draw_text_to_shadow(
+            shadow,
+            LEFT_MARGIN,
+            5,
+            &left_hdr,
+            COLOR_ACCENT.0,
+            COLOR_ACCENT.1,
+            COLOR_ACCENT.2,
+            TextFont::Cozette6x13,
+        );
+        let right_w = right_hdr.len() as u32 * 6;
+        let rx = w.saturating_sub(right_w + LEFT_MARGIN);
+        if rx > LEFT_MARGIN + left_hdr.len() as u32 * 6 + 12 {
+            let _ = canvas.draw_text_to_shadow(
+                shadow,
+                rx,
+                5,
+                &right_hdr,
+                COLOR_TEXT.0,
+                COLOR_TEXT.1,
+                COLOR_TEXT.2,
+                TextFont::Cozette6x13,
+            );
+        }
+
+        // Bottom status bar + 1px divider
+        if footer_y > HEADER_HEIGHT + 2 {
+            if canvas
+                .fill_rect_to_shadow(
+                    shadow,
+                    0,
+                    footer_y - 1,
+                    w,
+                    1,
+                    COLOR_DIVIDER.0,
+                    COLOR_DIVIDER.1,
+                    COLOR_DIVIDER.2,
+                )
+                .is_err()
+            {
+                return false;
+            }
+            if canvas
+                .fill_rect_to_shadow(
+                    shadow,
+                    0,
+                    footer_y,
+                    w,
+                    FOOTER_HEIGHT,
+                    COLOR_CHROME_BG.0,
+                    COLOR_CHROME_BG.1,
+                    COLOR_CHROME_BG.2,
+                )
+                .is_err()
+            {
+                return false;
+            }
+            let left_ftr = format!(
+                "Ln {}, Col {}  |  {}",
+                self.row + 1,
+                self.col + 1,
+                self.font_name()
+            );
+            let _ = canvas.draw_text_to_shadow(
+                shadow,
+                LEFT_MARGIN,
+                footer_y + 4,
+                &left_ftr,
+                COLOR_MUTED.0,
+                COLOR_MUTED.1,
+                COLOR_MUTED.2,
+                TextFont::Cozette6x13,
+            );
+
+            let (scroll_txt, scroll_col) = if self.scroll_offset > 0 {
+                (
+                    format!("SCROLLBACK -{}/{}", self.scroll_offset, self.scrollback_len),
+                    COLOR_AMBER,
+                )
+            } else {
+                (String::from("LIVE  |  PgUp/PgDn scroll"), COLOR_ACCENT)
+            };
+            let sw = scroll_txt.len() as u32 * 6;
+            let sx = w.saturating_sub(sw + LEFT_MARGIN);
+            if sx > LEFT_MARGIN + left_ftr.len() as u32 * 6 + 12 {
+                let _ = canvas.draw_text_to_shadow(
+                    shadow,
+                    sx,
+                    footer_y + 4,
+                    &scroll_txt,
+                    scroll_col.0,
+                    scroll_col.1,
+                    scroll_col.2,
+                    TextFont::Cozette6x13,
+                );
+            }
+        }
+        true
+    }
+
+    fn render_chrome_buffered(&self, canvas: &Canvas, shadow: &mut [u8; SHADOW_CAPACITY]) -> bool {
+        if !self.render_chrome_to_shadow(canvas, shadow) {
+            return false;
+        }
+        let w = canvas.width();
+        let h = canvas.height();
+        let top_rect = PixelRect {
+            x: 0,
+            y: 0,
+            width: w,
+            height: HEADER_HEIGHT + 1,
+        };
+        if !flush_shadow_rect(canvas, shadow, top_rect) {
+            return false;
+        }
+        let footer_y = h.saturating_sub(FOOTER_HEIGHT);
+        if footer_y > HEADER_HEIGHT + 2 {
+            let bot_rect = PixelRect {
+                x: 0,
+                y: footer_y - 1,
+                width: w,
+                height: FOOTER_HEIGHT + 1,
+            };
+            if !flush_shadow_rect(canvas, shadow, bot_rect) {
+                return false;
+            }
+        }
+        true
     }
 
     fn render_full_buffered(
@@ -723,23 +924,110 @@ impl Screen {
         {
             return false;
         }
-
+        if !self.render_chrome_to_shadow(canvas, shadow) {
+            return false;
+        }
         let visible_rows = self.visible_rows_for(canvas);
-        let view_end = view_top.saturating_add(visible_rows).min(ROWS);
-
-        let mut model_row = view_top;
-
-        while model_row < view_end {
-            let display_row = model_row - view_top;
-
-            if !self.draw_complete_row_to_shadow(canvas, shadow, model_row, display_row) {
+        for display_row in 0..visible_rows {
+            if !self.draw_complete_row_to_shadow(canvas, shadow, view_top, display_row) {
                 return false;
             }
+        }
+        canvas.upload_shadow(shadow).is_ok() && canvas.present().is_ok()
+    }
 
-            model_row += 1;
+    fn render_scroll_shifted_buffered(
+        &self,
+        canvas: &Canvas,
+        shadow: &mut [u8; SHADOW_CAPACITY],
+        shift_rows: usize,
+        view_top: usize,
+    ) -> bool {
+        let visible_rows = self.visible_rows_for(canvas);
+        let metrics = font_metrics(self.font);
+        let pitch = canvas.byte_len() / (canvas.height().max(1) as usize);
+        let shift_px = shift_rows as u32 * metrics.line_height;
+        let viewport_h = visible_rows as u32 * metrics.line_height;
+
+        if shift_px >= viewport_h {
+            return self.render_full_buffered(canvas, shadow, view_top);
         }
 
-        canvas.upload_shadow(shadow).is_ok() && canvas.present().is_ok()
+        // Erase the previous cursor glyph/bar before shifting pixels if it was visible.
+        if let Some((old_dr, old_c)) = self.presented_cursor {
+            if old_dr < visible_rows {
+                let _ = self.redraw_single_cell_in_shadow(
+                    canvas,
+                    shadow,
+                    &self.presented_cells[old_dr][old_c],
+                    old_dr,
+                    old_c,
+                );
+            }
+        }
+
+        // Fast block shift upward inside `shadow`.
+        let copy_h = viewport_h - shift_px;
+        let src_start = (TOP_MARGIN + shift_px) as usize * pitch;
+        let dst_start = TOP_MARGIN as usize * pitch;
+        let byte_count = copy_h as usize * pitch;
+        if dst_start + byte_count <= shadow.len() && src_start + byte_count <= shadow.len() {
+            shadow.copy_within(src_start..src_start + byte_count, dst_start);
+        }
+
+        // Clear newly revealed bottom lines and draw them + any dirty rows in the shifted band.
+        let new_start_row = visible_rows.saturating_sub(shift_rows);
+        let clear_y = TOP_MARGIN + new_start_row as u32 * metrics.line_height;
+        if canvas
+            .fill_rect_to_shadow(
+                shadow,
+                0,
+                clear_y,
+                canvas.width(),
+                shift_px,
+                COLOR_BACKGROUND.0,
+                COLOR_BACKGROUND.1,
+                COLOR_BACKGROUND.2,
+            )
+            .is_err()
+        {
+            return false;
+        }
+
+        for dr in 0..visible_rows {
+            if dr >= new_start_row {
+                if !self.draw_complete_row_to_shadow(canvas, shadow, view_top, dr) {
+                    return false;
+                }
+            } else {
+                let mr = view_top + dr;
+                if mr < ROWS
+                    && (self.dirty_rows & (1u64 << mr)) != 0
+                    && self
+                        .render_row_region_to_shadow(canvas, shadow, view_top, mr, dr)
+                        .is_err()
+                {
+                    return false;
+                }
+            }
+        }
+
+        // Ensure current cursor is drawn cleanly.
+        let visible_cols = self.visible_columns_for(canvas);
+        if self.cursor_visible && self.row >= view_top {
+            let cur_dr = self.row - view_top;
+            if cur_dr < visible_rows && self.col < visible_cols {
+                let _ = self.draw_cursor_at_to_shadow(canvas, shadow, cur_dr, self.col);
+            }
+        }
+
+        let rect = PixelRect {
+            x: 0,
+            y: TOP_MARGIN,
+            width: canvas.width(),
+            height: viewport_h.min(canvas.height().saturating_sub(TOP_MARGIN)),
+        };
+        flush_shadow_rect(canvas, shadow, rect)
     }
 
     fn render_dirty_buffered(
@@ -751,44 +1039,38 @@ impl Screen {
     ) -> bool {
         let visible_rows = self.visible_rows_for(canvas);
         let view_end = view_top.saturating_add(visible_rows).min(ROWS);
-
         let mut pending_rect: Option<PixelRect> = None;
-        let mut model_row = view_top;
 
-        while model_row < view_end {
-            if dirty_rows & (1u64 << model_row) != 0 {
-                let display_row = model_row - view_top;
-
-                let rect = match self.render_row_region_to_shadow(
-                    canvas,
-                    shadow,
-                    model_row,
-                    display_row,
-                ) {
-                    Ok(rect) => rect,
-                    Err(()) => return false,
-                };
-
-                if let Some(rect) = rect {
-                    match pending_rect {
-                        Some(pending) if pending.is_vertically_adjacent_to(rect) => {
-                            pending_rect = Some(pending.merge_vertical(rect));
-                        }
-                        Some(pending) => {
-                            if !flush_shadow_rect(canvas, shadow, pending) {
-                                return false;
-                            }
-
-                            pending_rect = Some(rect);
-                        }
-                        None => pending_rect = Some(rect),
+        for model_row in view_top..view_end {
+            if dirty_rows & (1u64 << model_row) == 0 {
+                continue;
+            }
+            let display_row = model_row - view_top;
+            let rect = match self.render_row_region_to_shadow(
+                canvas,
+                shadow,
+                view_top,
+                model_row,
+                display_row,
+            ) {
+                Ok(r) => r,
+                Err(()) => return false,
+            };
+            if let Some(rect) = rect {
+                match pending_rect {
+                    Some(pending) if pending.is_vertically_adjacent_to(rect) => {
+                        pending_rect = Some(pending.merge_vertical(rect));
                     }
+                    Some(pending) => {
+                        if !flush_shadow_rect(canvas, shadow, pending) {
+                            return false;
+                        }
+                        pending_rect = Some(rect);
+                    }
+                    None => pending_rect = Some(rect),
                 }
             }
-
-            model_row += 1;
         }
-
         if let Some(rect) = pending_rect {
             flush_shadow_rect(canvas, shadow, rect)
         } else {
@@ -800,22 +1082,27 @@ impl Screen {
         &self,
         canvas: &Canvas,
         shadow: &mut [u8; SHADOW_CAPACITY],
-        model_row: usize,
+        view_top: usize,
         display_row: usize,
     ) -> bool {
         let visible_columns = self.visible_columns_for(canvas);
-        let len = line_len(&self.cells[model_row]).min(visible_columns);
+        let row_cells = self.row_for_display(view_top, display_row);
+        let len = cell_line_len(row_cells).min(visible_columns);
         let metrics = font_metrics(self.font);
         let y = self.display_row_y(display_row);
 
         let mut col = 0usize;
         while col < len {
-            let color = self.colors[model_row][col];
+            let color = row_cells[col].fg;
             let mut end = col + 1;
-            while end < len && self.colors[model_row][end] == color {
+            while end < len && row_cells[end].fg == color {
                 end += 1;
             }
-            let Ok(text) = core::str::from_utf8(&self.cells[model_row][col..end]) else {
+            let mut buf = [0u8; COLS];
+            for (dst, cell) in buf[..end - col].iter_mut().zip(&row_cells[col..end]) {
+                *dst = cell.ch;
+            }
+            let Ok(text) = core::str::from_utf8(&buf[..end - col]) else {
                 return false;
             };
             let rx = LEFT_MARGIN.saturating_add(col as u32 * metrics.advance);
@@ -828,21 +1115,61 @@ impl Screen {
             col = end;
         }
 
-        self.draw_cursor_to_shadow(canvas, shadow, model_row, display_row, visible_columns)
+        if self.scroll_offset == 0
+            && self.cursor_visible
+            && (view_top + display_row) == self.row
+            && self.col < visible_columns
+        {
+            self.draw_cursor_at_to_shadow(canvas, shadow, display_row, self.col)
+        } else {
+            true
+        }
     }
 
     fn render_row_region_to_shadow(
         &self,
         canvas: &Canvas,
         shadow: &mut [u8; SHADOW_CAPACITY],
+        view_top: usize,
         model_row: usize,
         display_row: usize,
     ) -> Result<Option<PixelRect>, ()> {
         let metrics = font_metrics(self.font);
         let visible_columns = self.visible_columns_for(canvas);
+        let row_cells = self.row_for_display(view_top, display_row);
 
-        let start_column = (self.dirty_from[model_row] as usize).min(visible_columns);
-        let end_column = (self.dirty_to[model_row] as usize).min(visible_columns);
+        let mut start_column = (self.dirty_from[model_row] as usize).min(visible_columns);
+        let mut end_column = (self.dirty_to[model_row] as usize).min(visible_columns);
+
+        // Trim unchanged cells against `presented_cells` (except cursor cell).
+        let is_cur_row = self.scroll_offset == 0 && model_row == self.row;
+        let old_cur_here = self
+            .presented_cursor
+            .is_some_and(|(dr, _)| dr == display_row);
+        while start_column < end_column {
+            let cur_touch = (is_cur_row && start_column == self.col)
+                || (old_cur_here
+                    && self
+                        .presented_cursor
+                        .is_some_and(|(_, c)| c == start_column));
+            if !cur_touch
+                && row_cells[start_column] == self.presented_cells[display_row][start_column]
+            {
+                start_column += 1;
+            } else {
+                break;
+            }
+        }
+        while end_column > start_column {
+            let c = end_column - 1;
+            let cur_touch = (is_cur_row && c == self.col)
+                || (old_cur_here && self.presented_cursor.is_some_and(|(_, oc)| oc == c));
+            if !cur_touch && row_cells[c] == self.presented_cells[display_row][c] {
+                end_column -= 1;
+            } else {
+                break;
+            }
+        }
 
         if start_column >= end_column {
             return Ok(None);
@@ -850,16 +1177,13 @@ impl Screen {
 
         let x = LEFT_MARGIN.saturating_add(start_column as u32 * metrics.advance);
         let y = self.display_row_y(display_row);
-
         if x >= canvas.width() || y >= canvas.height() {
             return Ok(None);
         }
 
         let requested_width = (end_column - start_column) as u32 * metrics.advance;
-
         let width = requested_width.min(canvas.width().saturating_sub(x));
         let height = metrics.line_height.min(canvas.height().saturating_sub(y));
-
         if width == 0 || height == 0 {
             return Ok(None);
         }
@@ -877,15 +1201,22 @@ impl Screen {
             )
             .map_err(|_| ())?;
 
-        let text_end = line_len(&self.cells[model_row]).min(end_column);
+        let text_end = cell_line_len(row_cells).min(end_column);
         let mut col = start_column;
         while col < text_end {
-            let color = self.colors[model_row][col];
+            let color = row_cells[col].fg;
             let mut run_end = col + 1;
-            while run_end < text_end && self.colors[model_row][run_end] == color {
+            while run_end < text_end && row_cells[run_end].fg == color {
                 run_end += 1;
             }
-            let Ok(text) = core::str::from_utf8(&self.cells[model_row][col..run_end]) else {
+            let mut buf = [0u8; COLS];
+            for (dst, cell) in buf[..run_end - col]
+                .iter_mut()
+                .zip(&row_cells[col..run_end])
+            {
+                *dst = cell.ch;
+            }
+            let Ok(text) = core::str::from_utf8(&buf[..run_end - col]) else {
                 return Err(());
             };
             let rx = LEFT_MARGIN.saturating_add(col as u32 * metrics.advance);
@@ -895,7 +1226,8 @@ impl Screen {
             col = run_end;
         }
 
-        if self.cursor_visible
+        if self.scroll_offset == 0
+            && self.cursor_visible
             && model_row == self.row
             && self.col >= start_column
             && self.col < end_column
@@ -914,19 +1246,46 @@ impl Screen {
         }))
     }
 
-    fn draw_cursor_to_shadow(
+    fn redraw_single_cell_in_shadow(
         &self,
         canvas: &Canvas,
         shadow: &mut [u8; SHADOW_CAPACITY],
-        model_row: usize,
+        cell: &Cell,
         display_row: usize,
-        visible_columns: usize,
+        col: usize,
     ) -> bool {
-        if !self.cursor_visible || model_row != self.row || self.col >= visible_columns {
+        let metrics = font_metrics(self.font);
+        let x = LEFT_MARGIN.saturating_add(col as u32 * metrics.advance);
+        let y = self.display_row_y(display_row);
+        if x >= canvas.width() || y >= canvas.height() {
             return true;
         }
-
-        self.draw_cursor_at_to_shadow(canvas, shadow, display_row, self.col)
+        let w = metrics.advance.min(canvas.width().saturating_sub(x));
+        let h = metrics.line_height.min(canvas.height().saturating_sub(y));
+        if canvas
+            .fill_rect_to_shadow(
+                shadow,
+                x,
+                y,
+                w,
+                h,
+                COLOR_BACKGROUND.0,
+                COLOR_BACKGROUND.1,
+                COLOR_BACKGROUND.2,
+            )
+            .is_err()
+        {
+            return false;
+        }
+        if cell.ch != b' ' {
+            let b = [cell.ch];
+            if let Ok(s) = core::str::from_utf8(&b) {
+                let _ = canvas.draw_text_to_shadow(
+                    shadow, x, y, s, cell.fg.0, cell.fg.1, cell.fg.2, self.font,
+                );
+            }
+        }
+        true
     }
 
     fn draw_cursor_at_to_shadow(
@@ -939,7 +1298,6 @@ impl Screen {
         let Some(rect) = self.cursor_rect(canvas, display_row, column) else {
             return true;
         };
-
         canvas
             .fill_rect_to_shadow(
                 shadow,
@@ -969,27 +1327,28 @@ impl Screen {
         {
             return false;
         }
-
         let visible_rows = self.visible_rows_for(canvas);
         let visible_columns = self.visible_columns_for(canvas);
-        let view_end = view_top.saturating_add(visible_rows).min(ROWS);
-
-        let mut model_row = view_top;
-
-        while model_row < view_end {
-            let display_row = model_row - view_top;
-            let len = line_len(&self.cells[model_row]).min(visible_columns);
+        for display_row in 0..visible_rows {
+            let row_cells = self.row_for_display(view_top, display_row);
+            let len = cell_line_len(row_cells).min(visible_columns);
             let metrics = font_metrics(self.font);
             let y = self.display_row_y(display_row);
-
             let mut col = 0usize;
             while col < len {
-                let color = self.colors[model_row][col];
+                let color = row_cells[col].fg;
                 let mut run_end = col + 1;
-                while run_end < len && self.colors[model_row][run_end] == color {
+                while run_end < len && row_cells[run_end].fg == color {
                     run_end += 1;
                 }
-                let Ok(text) = core::str::from_utf8(&self.cells[model_row][col..run_end]) else {
+                let mut buf = [0u8; COLS];
+                for (dst, cell) in buf[..run_end - col]
+                    .iter_mut()
+                    .zip(&row_cells[col..run_end])
+                {
+                    *dst = cell.ch;
+                }
+                let Ok(text) = core::str::from_utf8(&buf[..run_end - col]) else {
                     return false;
                 };
                 let rx = LEFT_MARGIN.saturating_add(col as u32 * metrics.advance);
@@ -1001,68 +1360,35 @@ impl Screen {
                 }
                 col = run_end;
             }
-
-            if self.cursor_visible && model_row == self.row && self.col < visible_columns {
-                if let Some(rect) = self.cursor_rect(canvas, display_row, self.col) {
-                    if canvas
-                        .fill_rect(
-                            rect.x,
-                            rect.y,
-                            rect.width,
-                            rect.height,
-                            COLOR_CURSOR.0,
-                            COLOR_CURSOR.1,
-                            COLOR_CURSOR.2,
-                        )
-                        .is_err()
-                    {
-                        return false;
-                    }
-                }
-            }
-
-            model_row += 1;
         }
-
         canvas.present().is_ok()
     }
 
     fn display_row_y(&self, display_row: usize) -> u32 {
         let metrics = font_metrics(self.font);
-
         TOP_MARGIN.saturating_add(display_row as u32 * metrics.line_height)
     }
 
     fn cursor_rect(&self, canvas: &Canvas, display_row: usize, column: usize) -> Option<PixelRect> {
         let metrics = font_metrics(self.font);
-
         let x = LEFT_MARGIN.saturating_add(column as u32 * metrics.advance);
         let row_y = self.display_row_y(display_row);
-
         let cursor_height = if metrics.line_height >= 4 { 2 } else { 1 };
-
         let maximum_offset = metrics.line_height.saturating_sub(cursor_height);
-
         let cursor_offset = metrics.glyph_height.min(maximum_offset);
-
         let y = row_y.saturating_add(cursor_offset);
-
         if x >= canvas.width() || y >= canvas.height() {
             return None;
         }
-
         let width = metrics
             .advance
             .saturating_sub(1)
             .max(1)
             .min(canvas.width().saturating_sub(x));
-
         let height = cursor_height.min(canvas.height().saturating_sub(y));
-
         if width == 0 || height == 0 {
             return None;
         }
-
         Some(PixelRect {
             x,
             y,
@@ -1079,34 +1405,25 @@ impl Default for Screen {
 }
 
 fn flush_shadow_rect(canvas: &Canvas, shadow: &[u8; SHADOW_CAPACITY], rect: PixelRect) -> bool {
-    if rect.width == 0 || rect.height == 0 {
+    if rect.width == 0 || rect.height == 0 || rect.x >= canvas.width() || rect.y >= canvas.height()
+    {
         return true;
     }
-
-    if rect.x >= canvas.width() || rect.y >= canvas.height() {
-        return true;
-    }
-
     let width = rect.width.min(canvas.width().saturating_sub(rect.x));
-
     let height = rect.height.min(canvas.height().saturating_sub(rect.y));
-
     if width == 0 || height == 0 {
         return true;
     }
-
     canvas
         .upload_shadow_region(shadow, rect.x, rect.y, width, height)
         .is_ok()
         && canvas.present_region(rect.x, rect.y, width, height).is_ok()
 }
 
-fn line_len(line: &[u8; COLS]) -> usize {
+fn cell_line_len(line: &[Cell; COLS]) -> usize {
     let mut len = COLS;
-
-    while len > 0 && line[len - 1] == b' ' {
+    while len > 0 && line[len - 1].ch == b' ' {
         len -= 1;
     }
-
     len
 }

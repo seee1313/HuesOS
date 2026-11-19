@@ -7,11 +7,11 @@ use crate::vmo::Vmo;
 use huesos_abi::auxv::{
     caps_mask, AT_BASE, AT_ENTRY, AT_FLAGS, AT_HUESOS_BLOCK_DEV, AT_HUESOS_CAPS_MASK,
     AT_HUESOS_FRAME_DRAW, AT_HUESOS_HXFS_DIR, AT_HUESOS_HXFS_SERVICE, AT_HUESOS_LD_BOOTSTRAP,
-    AT_HUESOS_LIB_VMO, AT_HUESOS_STDERR, AT_HUESOS_STDIN, AT_HUESOS_STDOUT, AT_NULL, AT_PAGESZ,
-    AT_PHDR, AT_PHENT, AT_PHNUM, AT_RANDOM, LD_BOOTSTRAP_BLOCK_DEV_LABEL,
+    AT_HUESOS_LIB_VMO, AT_HUESOS_REGISTRY, AT_HUESOS_STDERR, AT_HUESOS_STDIN, AT_HUESOS_STDOUT,
+    AT_NULL, AT_PAGESZ, AT_PHDR, AT_PHENT, AT_PHNUM, AT_RANDOM, LD_BOOTSTRAP_BLOCK_DEV_LABEL,
     LD_BOOTSTRAP_FRAME_DRAW_LABEL, LD_BOOTSTRAP_HXFS_DIR_LABEL, LD_BOOTSTRAP_HXFS_SERVICE_LABEL,
-    LD_BOOTSTRAP_LIB_VMO_LABEL, LD_BOOTSTRAP_SELF_VMAR_LABEL, LD_BOOTSTRAP_STDERR_LABEL,
-    LD_BOOTSTRAP_STDIN_LABEL, LD_BOOTSTRAP_STDOUT_LABEL,
+    LD_BOOTSTRAP_LIB_VMO_LABEL, LD_BOOTSTRAP_REGISTRY_LABEL, LD_BOOTSTRAP_SELF_VMAR_LABEL,
+    LD_BOOTSTRAP_STDERR_LABEL, LD_BOOTSTRAP_STDIN_LABEL, LD_BOOTSTRAP_STDOUT_LABEL,
 };
 use huesos_abi::{rights, vmar_flags, vmo_create_flags, USER_STACK_TOP};
 use huesos_elf::dynamic::{
@@ -52,6 +52,8 @@ pub struct SpawnCaps<'a> {
     pub block_dev: Option<&'a Channel>,
     /// Optional framebuffer draw resource handle (`AT_HUESOS_FRAME_DRAW`).
     pub frame_draw: Option<&'a Handle>,
+    /// Optional `DriverManager` query/registry channel (`AT_HUESOS_REGISTRY`).
+    pub registry: Option<&'a Channel>,
     /// Optional CPU pinning affinity.
     pub home_cpu: Option<usize>,
     /// Initial user stack size in bytes.
@@ -71,6 +73,7 @@ impl<'a> SpawnCaps<'a> {
             hxfs_service: None,
             block_dev: None,
             frame_draw: None,
+            registry: None,
             home_cpu: None,
             stack_size: huesos_abi::USER_STACK_DEFAULT_SIZE,
         }
@@ -579,7 +582,7 @@ fn finish_dynamic_launch(
     // ready to enqueue on the parent bootstrap channel immediately.
     let vmar_dup = root_vmar.handle().duplicate(rights::SAME_RIGHTS)?;
     let lib_vmo_dup = lib_vmo
-        .duplicate(rights::READ | rights::TRANSFER)?
+        .duplicate(rights::READ | rights::TRANSFER | rights::DUPLICATE)?
         .into_handle();
     let hxfs_dir_dup = match caps.hxfs_dir {
         Some(ch) => Some(ch.handle().duplicate(rights::SAME_RIGHTS)?),
@@ -621,12 +624,20 @@ fn finish_dynamic_launch(
         Some(h) => Some(h.duplicate(rights::SAME_RIGHTS)?),
         None => None,
     };
+    let registry_dup = match caps.registry {
+        Some(ch) => Some(
+            ch.handle()
+                .duplicate(rights::READ | rights::WRITE | rights::TRANSFER)?,
+        ),
+        None => None,
+    };
 
     let thread = Thread::create(process, "main")?;
     let interp_entry = interp_bias.wrapping_add(interp_image.e_entry);
     let bootstrap = match thread.start(interp_entry, initial_rsp) {
         Ok(ch) => ch,
         Err(err) => {
+            drop(registry_dup);
             drop(frame_draw_dup);
             drop(block_dev_dup);
             drop(hxfs_svc_dup);
@@ -640,7 +651,7 @@ fn finish_dynamic_launch(
         }
     };
 
-    let sends: [(&[u8], Option<Handle>); 9] = [
+    let sends: [(&[u8], Option<Handle>); 10] = [
         (LD_BOOTSTRAP_SELF_VMAR_LABEL, Some(vmar_dup)),
         (LD_BOOTSTRAP_LIB_VMO_LABEL, Some(lib_vmo_dup)),
         (LD_BOOTSTRAP_HXFS_DIR_LABEL, hxfs_dir_dup),
@@ -650,6 +661,7 @@ fn finish_dynamic_launch(
         (LD_BOOTSTRAP_HXFS_SERVICE_LABEL, hxfs_svc_dup),
         (LD_BOOTSTRAP_BLOCK_DEV_LABEL, block_dev_dup),
         (LD_BOOTSTRAP_FRAME_DRAW_LABEL, frame_draw_dup),
+        (LD_BOOTSTRAP_REGISTRY_LABEL, registry_dup),
     ];
     for (idx, (label, maybe_h)) in sends.into_iter().enumerate() {
         if let Some(handle) = maybe_h {
@@ -809,7 +821,7 @@ fn map_dynamic_initial_stack(
     top_page[rand_off + 8..rand_off + 16].copy_from_slice(&r1.to_le_bytes());
     let rand_va = top_page_va + rand_off as u64;
 
-    let aux_entries: [(u64, u64); 19] = [
+    let aux_entries: [(u64, u64); 20] = [
         (AT_PHDR, at_phdr),
         (AT_PHENT, u64::from(at_phent)),
         (AT_PHNUM, u64::from(at_phnum)),
@@ -831,6 +843,7 @@ fn map_dynamic_initial_stack(
         ),
         (AT_HUESOS_BLOCK_DEV, u64::from(caps.block_dev.is_some())),
         (AT_HUESOS_FRAME_DRAW, u64::from(caps.frame_draw.is_some())),
+        (AT_HUESOS_REGISTRY, u64::from(caps.registry.is_some())),
         (AT_NULL, 0),
     ];
 

@@ -52,6 +52,9 @@ pub const AT_HUESOS_BLOCK_DEV: u64 = 0x1009;
 /// HuesOS extension: non-zero when a `FrameDraw` handle was queued on
 /// bootstrap (`LD_BOOTSTRAP_FRAME_DRAW_LABEL`).
 pub const AT_HUESOS_FRAME_DRAW: u64 = 0x100a;
+/// HuesOS extension: non-zero when a read-only `DriverManager` query/registry
+/// `Channel` handle was queued on bootstrap (`LD_BOOTSTRAP_REGISTRY_LABEL`).
+pub const AT_HUESOS_REGISTRY: u64 = 0x100b;
 
 /// Bootstrap channel label carrying the child's own root VMAR handle to
 /// `ld-huesos.so` (closed by the dynamic linker before entering the app).
@@ -75,6 +78,8 @@ pub const LD_BOOTSTRAP_HXFS_SERVICE_LABEL: &[u8] = b"huesos:ld:hxfs-service";
 pub const LD_BOOTSTRAP_BLOCK_DEV_LABEL: &[u8] = b"huesos:ld:block-dev";
 /// Bootstrap channel label carrying the child's `FrameDraw` handle.
 pub const LD_BOOTSTRAP_FRAME_DRAW_LABEL: &[u8] = b"huesos:ld:frame-draw";
+/// Bootstrap channel label carrying the child's `DriverManager` query `Channel`.
+pub const LD_BOOTSTRAP_REGISTRY_LABEL: &[u8] = b"huesos:ld:registry";
 
 /// Capability bitmask carried in `AT_HUESOS_CAPS_MASK`.
 pub mod caps_mask {
@@ -92,8 +97,11 @@ pub mod caps_mask {
     pub const BLOCK_RW: u64 = 1 << 5;
     /// `HxFS` access is restricted to a scoped subpath directory handle.
     pub const HXFS_DIR_SCOPED: u64 = 1 << 6;
+    /// Application may query `DriverManager` read-only (`query:pci`, `query:acpi`, `query:ps`).
+    pub const QUERY_RO: u64 = 1 << 7;
     /// Full default interactive shell capability set.
-    pub const ALL_DEFAULT: u64 = BOOTFS_RO | HXFS_RO | HXFS_RW | FB_RO | BLOCK_RO | BLOCK_RW;
+    pub const ALL_DEFAULT: u64 =
+        BOOTFS_RO | HXFS_RO | HXFS_RW | FB_RO | BLOCK_RO | BLOCK_RW | QUERY_RO;
 }
 
 /// Default interpreter path expected in `PT_INTERP`.

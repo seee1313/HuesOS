@@ -18,18 +18,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "huesos-hsh"
-version = "0.1.0"
-dependencies = [
- "huesos-abi",
-]
-
-[[package]]
 name = "huesos-terminal"
 version = "0.1.0"
 dependencies = [
  "huesos-abi",
- "huesos-hsh",
  "libcanvas",
 ]
 

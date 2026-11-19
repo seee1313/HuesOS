@@ -181,6 +181,9 @@ fn main() {
         &[],
         &[],
     );
+    let hsh_bin =
+        build_userspace_dynamic_program(&userspace_root, "hsh-bin", "hsh", profile, &[], &[]);
+    let coreutils_dir = build_userspace_dynamic_bins(&userspace_root, "coreutils", profile);
     // Soak shutdown-cycle wiring (qemu-nvme-soak inject=3): the
     // harness exports HUESOS_TERMINAL_FEATURES=soak-shutdown so the
     // terminal auto-triggers an orderly userspace shutdown after a
@@ -243,6 +246,8 @@ fn main() {
             terminal: &terminal,
             doom: &doom,
             fdisk: &fdisk,
+            hsh_bin: &hsh_bin,
+            coreutils_dir: &coreutils_dir,
             ld_huesos: &ld_huesos,
             libcanvas_so: &libcanvas_so,
             smoke_plugin_so: &smoke_plugin_so,
@@ -375,6 +380,9 @@ fn track_userspace_inputs(userspace_root: &Path) {
         "key-broker",
         "terminal",
         "doom",
+        "fdisk",
+        "hsh-bin",
+        "coreutils",
         "fault-probe",
         "dyn-rust-smoke",
         "ld-huesos",
@@ -388,6 +396,14 @@ fn track_userspace_inputs(userspace_root: &Path) {
             userspace_root.join(program).join("Cargo.toml").display()
         );
     }
+    println!(
+        "cargo:rerun-if-changed={}",
+        userspace_root
+            .join("coreutils")
+            .join("src")
+            .join("bin")
+            .display()
+    );
     println!(
         "cargo:rerun-if-changed={}",
         userspace_root
@@ -414,6 +430,8 @@ fn track_userspace_inputs(userspace_root: &Path) {
         "crates/huesos-abi",
         "crates/huesos-elf",
         "crates/huesos-scudo",
+        "crates/huesos-hsh",
+        "crates/huesos-gpt",
     ] {
         println!("cargo:rerun-if-changed={crate_dir}");
         println!("cargo:rerun-if-changed={crate_dir}/src");
@@ -528,6 +546,30 @@ fn build_userspace_dynamic_program(
         extra_env,
         extra_args,
     )
+}
+
+fn build_userspace_dynamic_bins(userspace_root: &Path, dir_name: &str, profile: &str) -> PathBuf {
+    let program_dir = userspace_root.join(dir_name);
+    let target_dir = userspace_target_dir(&program_dir, &[]);
+    let mut command = Command::new(env::var("CARGO").unwrap_or_else(|_| "cargo".into()));
+    command
+        .current_dir(&program_dir)
+        .env_remove("RUSTFLAGS")
+        .env_remove("CARGO_ENCODED_RUSTFLAGS")
+        .args(["build", "--release", "--bins", "--target-dir"])
+        .arg(&target_dir);
+    let status = match command.status() {
+        Ok(s) => s,
+        Err(error) => {
+            eprintln!("failed to invoke cargo for {dir_name} userspace bins: {error}");
+            std::process::exit(1);
+        }
+    };
+    if !status.success() {
+        eprintln!("building {dir_name} userspace binaries failed");
+        std::process::exit(1);
+    }
+    target_dir.join("x86_64-huesos-userspace-dyn").join(profile)
 }
 
 fn build_userspace_program_for_target(
@@ -890,6 +932,8 @@ struct BootfsInputs<'a> {
     terminal: &'a Path,
     doom: &'a Path,
     fdisk: &'a Path,
+    hsh_bin: &'a Path,
+    coreutils_dir: &'a Path,
     ld_huesos: &'a Path,
     libcanvas_so: &'a Path,
     smoke_plugin_so: &'a Path,
@@ -1037,6 +1081,58 @@ fn build_bootfs_image(manifest_dir: &Path, inputs: BootfsInputs<'_>) -> PathBuf 
         BootFsFile {
             path: "/bin/fdisk.elf",
             data: read_build_input(inputs.fdisk, "fdisk ELF"),
+        },
+        BootFsFile {
+            path: "/bin/hsh.elf",
+            data: read_build_input(inputs.hsh_bin, "hsh ELF"),
+        },
+        BootFsFile {
+            path: "/bin/ls.elf",
+            data: read_build_input(&inputs.coreutils_dir.join("ls"), "ls ELF"),
+        },
+        BootFsFile {
+            path: "/bin/cat.elf",
+            data: read_build_input(&inputs.coreutils_dir.join("cat"), "cat ELF"),
+        },
+        BootFsFile {
+            path: "/bin/stat.elf",
+            data: read_build_input(&inputs.coreutils_dir.join("stat"), "stat ELF"),
+        },
+        BootFsFile {
+            path: "/bin/touch.elf",
+            data: read_build_input(&inputs.coreutils_dir.join("touch"), "touch ELF"),
+        },
+        BootFsFile {
+            path: "/bin/mkdir.elf",
+            data: read_build_input(&inputs.coreutils_dir.join("mkdir"), "mkdir ELF"),
+        },
+        BootFsFile {
+            path: "/bin/rm.elf",
+            data: read_build_input(&inputs.coreutils_dir.join("rm"), "rm ELF"),
+        },
+        BootFsFile {
+            path: "/bin/mv.elf",
+            data: read_build_input(&inputs.coreutils_dir.join("mv"), "mv ELF"),
+        },
+        BootFsFile {
+            path: "/bin/write.elf",
+            data: read_build_input(&inputs.coreutils_dir.join("write"), "write ELF"),
+        },
+        BootFsFile {
+            path: "/bin/hxfs.elf",
+            data: read_build_input(&inputs.coreutils_dir.join("hxfs"), "hxfs ELF"),
+        },
+        BootFsFile {
+            path: "/bin/pci.elf",
+            data: read_build_input(&inputs.coreutils_dir.join("pci"), "pci ELF"),
+        },
+        BootFsFile {
+            path: "/bin/acpi.elf",
+            data: read_build_input(&inputs.coreutils_dir.join("acpi"), "acpi ELF"),
+        },
+        BootFsFile {
+            path: "/bin/ps.elf",
+            data: read_build_input(&inputs.coreutils_dir.join("ps"), "ps ELF"),
         },
         BootFsFile {
             path: "/lib/ld-huesos.so",

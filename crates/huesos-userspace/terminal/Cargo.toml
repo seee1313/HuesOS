@@ -16,7 +16,6 @@ soak-shutdown = []
 [dependencies]
 libcanvas = { path = "../libcanvas", default-features = false, features = ["dyn-client"] }
 huesos-abi = { path = "../../huesos-abi" }
-huesos-hsh = { path = "../../huesos-hsh" }
 
 [profile.release]
 opt-level = 1

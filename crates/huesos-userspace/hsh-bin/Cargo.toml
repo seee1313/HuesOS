@@ -1,0 +1,23 @@
+[package]
+name = "huesos-hsh-bin"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "hsh"
+path = "src/main.rs"
+
+[dependencies]
+libcanvas = { path = "../libcanvas", default-features = false, features = ["dyn-client"] }
+huesos-abi = { path = "../../huesos-abi" }
+huesos-hsh = { path = "../../huesos-hsh" }
+
+[profile.release]
+opt-level = 2
+panic = "abort"
+lto = false
+
+[profile.dev]
+panic = "abort"
+
+[workspace]

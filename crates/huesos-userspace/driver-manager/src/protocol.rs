@@ -141,3 +141,7 @@ pub const QUERY_PCI: &str = "query:pci";
 pub const QUERY_ACPI: &str = "query:acpi";
 /// Client queries DriverManager-supervised processes and services as TSV text.
 pub const QUERY_PS: &str = "query:ps";
+/// Client requests a dedicated read-only query channel (`query:pci`/`acpi`/`ps`).
+pub const OPEN_QUERY: &str = "open:query";
+/// DriverManager returns a read-only query channel handle.
+pub const QUERY_CHANNEL: &str = "service:query:channel";

@@ -1,15 +1,15 @@
-//! HuesOS production framebuffer terminal (`hsh`).
+//! HuesOS production framebuffer terminal (`terminal`).
 //!
 //! Receives `driver-manager-registry`, `bootfs-ro`, and `framedraw` from `init`,
-//! opens the keyboard service + HxFS/registry query paths, runs Cycle 3 startup
-//! smokes (`hsh`, `/bin/fdisk.elf`, `@caps(...)`), and launches the Fish-UX REPL.
+//! opens the keyboard service, spawns `/bin/hsh.elf` over bidirectional `Channel`
+//! IPC, renders the `#0B0E14` obsidian workspace with dirty-rect blits and a
+//! 500 ms hardware-timer blinking cursor, and maintains a 512-line scrollback.
 
 #![no_std]
 #![no_main]
 
 extern crate alloc;
 
-mod host;
 mod screen;
 mod shell;
 mod snake;
@@ -17,7 +17,7 @@ mod snake;
 use core::panic::PanicInfo;
 use libcanvas::heap::ScudoHeap;
 use libcanvas::{println, Channel, ErrorCode, Handle, Vmo};
-use shell::Shell;
+use shell::TerminalSession;
 
 #[global_allocator]
 static ALLOCATOR: ScudoHeap = ScudoHeap;
@@ -50,15 +50,11 @@ extern "C" fn terminal_main() -> ! {
             }
         }
     };
-    let filesystem =
-        open_service(&registry, b"open:filesystem", b"service:filesystem:channel").ok();
 
-    let mut shell = Shell::new(
-        keyboard, filesystem, registry, bootfs, bootstrap, frame_draw,
-    );
-    shell.run_startup_smokes();
-    println!("[terminal] keyboard service online, starting shell");
-    shell.run();
+    let mut session = TerminalSession::new(keyboard, registry, bootfs, bootstrap, frame_draw);
+    session.trigger_startup_smokes();
+    println!("[terminal] keyboard service online, starting /bin/hsh.elf session");
+    session.run();
 }
 
 const FRAME_DRAW_MAX_POLLS: u32 = 100;

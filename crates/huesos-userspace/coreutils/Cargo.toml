@@ -1,0 +1,70 @@
+[package]
+name = "huesos-coreutils"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "huesos_coreutils"
+path = "src/lib.rs"
+
+[[bin]]
+name = "ls"
+path = "src/bin/ls.rs"
+
+[[bin]]
+name = "cat"
+path = "src/bin/cat.rs"
+
+[[bin]]
+name = "stat"
+path = "src/bin/stat.rs"
+
+[[bin]]
+name = "touch"
+path = "src/bin/touch.rs"
+
+[[bin]]
+name = "mkdir"
+path = "src/bin/mkdir.rs"
+
+[[bin]]
+name = "rm"
+path = "src/bin/rm.rs"
+
+[[bin]]
+name = "mv"
+path = "src/bin/mv.rs"
+
+[[bin]]
+name = "write"
+path = "src/bin/write.rs"
+
+[[bin]]
+name = "hxfs"
+path = "src/bin/hxfs.rs"
+
+[[bin]]
+name = "pci"
+path = "src/bin/pci.rs"
+
+[[bin]]
+name = "acpi"
+path = "src/bin/acpi.rs"
+
+[[bin]]
+name = "ps"
+path = "src/bin/ps.rs"
+
+[dependencies]
+libcanvas = { path = "../libcanvas", default-features = false, features = ["dyn-client"] }
+huesos-abi = { path = "../../huesos-abi" }
+
+[profile.release]
+opt-level = 2
+panic = "abort"
+lto = false
+
+[profile.dev]
+panic = "abort"
+
+[workspace]
