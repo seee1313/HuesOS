@@ -59,8 +59,8 @@ pub use callbacks::{
     set_process_terminate_fn, set_resource_map_fn, set_resource_unmap_fn, set_shutdown_fn,
     set_thread_exit_fn, set_thread_set_fs_base_fn, set_thread_start_ex_fn, set_thread_start_fn,
     set_vmar_map_fn, set_vmar_protect_fn, set_vmar_unmap_fn, set_yield_fn, HeapExtendFn,
-    ProcessCreateFn, ProcessCreateInJobFn, ProcessTerminateFn,
-    ResourceMapFn, ResourceUnmapFn, ThreadStartExFn, ThreadStartFn, VmarMapFn, VmarOpFn,
+    ProcessCreateFn, ProcessCreateInJobFn, ProcessTerminateFn, ResourceMapFn, ResourceUnmapFn,
+    ThreadStartExFn, ThreadStartFn, VmarMapFn, VmarOpFn,
 };
 
 /// Result type for syscalls: `Ok(value)` or a negative error code.

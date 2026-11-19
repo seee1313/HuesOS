@@ -2213,9 +2213,7 @@ impl DriverManager {
             let _ = registry.write(b"err:query:pair");
             return;
         };
-        match registry
-            .write_handle(protocol::QUERY_CHANNEL.as_bytes(), client_ch.into_handle())
-        {
+        match registry.write_handle(protocol::QUERY_CHANNEL.as_bytes(), client_ch.into_handle()) {
             Ok(()) => {
                 self.query_channels[slot] = Some(server_ch);
                 self.query_idle[slot] = 0;
@@ -2261,8 +2259,7 @@ impl DriverManager {
                     }
                 }
             }
-            if close {
-            }
+            if close {}
             if close || self.query_channels[idx].is_none() {
                 self.query_channels[idx] = None;
                 self.query_idle[idx] = 0;
@@ -2364,7 +2361,10 @@ impl DriverManager {
             }
         }
         if let Err(error) = registry.write(out.as_bytes()) {
-            println!("[driver-manager] pci reply write failed: {}", error.as_str());
+            println!(
+                "[driver-manager] pci reply write failed: {}",
+                error.as_str()
+            );
         }
     }
 

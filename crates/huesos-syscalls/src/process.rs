@@ -8,9 +8,9 @@ use huesos_object::{Handle, KernelObject, KernelObjectExt, Rights};
 
 use crate::{
     callbacks::{
-        EXIT_FN, PROCESS_CREATE_FN, PROCESS_CREATE_IN_JOB_FN, PROCESS_TERMINATE_FN,
-        THREAD_EXIT_FN, THREAD_SET_FS_BASE_FN, THREAD_START_EX_FN, THREAD_START_FN, VMAR_MAP_FN,
-        VMAR_PROTECT_FN, VMAR_UNMAP_FN, YIELD_FN,
+        EXIT_FN, PROCESS_CREATE_FN, PROCESS_CREATE_IN_JOB_FN, PROCESS_TERMINATE_FN, THREAD_EXIT_FN,
+        THREAD_SET_FS_BASE_FN, THREAD_START_EX_FN, THREAD_START_FN, VMAR_MAP_FN, VMAR_PROTECT_FN,
+        VMAR_UNMAP_FN, YIELD_FN,
     },
     user_memory,
     util::{current_proc, DeferGuard},

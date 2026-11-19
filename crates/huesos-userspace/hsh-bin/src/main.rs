@@ -901,7 +901,10 @@ impl InteractiveShell {
                     break;
                 }
                 Err(e) => {
-                    println!("[hsh] fdisk gpt init/add/del/verify ERROR cmd='{}': {}", cmd, e);
+                    println!(
+                        "[hsh] fdisk gpt init/add/del/verify ERROR cmd='{}': {}",
+                        cmd, e
+                    );
                     gpt_ok = false;
                     break;
                 }
