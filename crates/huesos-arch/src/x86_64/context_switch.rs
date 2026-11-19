@@ -194,7 +194,7 @@ pub unsafe fn context_switch(old: *mut Context, new: *const Context) {
 global_asm!(
     ".global enter_userspace",
     "enter_userspace:",
-    // Args (SysV): rdi = user_rip, rsi = user_rsp, rdx = user_cs, rcx = user_ss, r8 = user_rflags
+    // Args (SysV): rdi = user_rip, rsi = user_rsp, rdx = user_cs, rcx = user_ss, r8 = user_rflags, r9 = user_rdi
     "push rcx", // SS
     "push rsi", // RSP
     "push r8",  // RFLAGS
@@ -205,7 +205,7 @@ global_asm!(
     "xor rcx, rcx",
     "xor rdx, rdx",
     "xor rsi, rsi",
-    "xor rdi, rdi",
+    "mov rdi, r9",
     "xor rbp, rbp",
     "xor r8, r8",
     "xor r9, r9",
@@ -226,6 +226,7 @@ unsafe extern "C" {
         user_cs: u64,
         user_ss: u64,
         user_rflags: u64,
+        user_rdi: u64,
     ) -> !;
 }
 
@@ -242,8 +243,27 @@ pub unsafe fn enter_userspace(
     user_ss: u64,
     user_rflags: u64,
 ) -> ! {
+    // SAFETY: delegates to `enter_userspace_with_arg` with `user_rdi = 0`.
+    unsafe { enter_userspace_with_arg(user_rip, user_rsp, user_cs, user_ss, user_rflags, 0) }
+}
+
+/// Perform the initial ring0 → ring3 transition via `iretq` with an explicit
+/// initial `rdi` argument (`arg0`) after verifying that the kernel retains no
+/// ranked lock guard.
+///
+/// # Safety
+/// `user_rip`/`user_rsp` must point into valid, mapped user memory in the
+/// current address space, and `user_cs`/`user_ss` must be ring3 selectors.
+pub unsafe fn enter_userspace_with_arg(
+    user_rip: u64,
+    user_rsp: u64,
+    user_cs: u64,
+    user_ss: u64,
+    user_rflags: u64,
+    user_rdi: u64,
+) -> ! {
     crate::assert_no_ranked_locks_held();
     // SAFETY: caller owns the architectural transition contract; this wrapper
     // checks the additional synchronization invariant before entering ring3.
-    unsafe { enter_userspace_asm(user_rip, user_rsp, user_cs, user_ss, user_rflags) }
+    unsafe { enter_userspace_asm(user_rip, user_rsp, user_cs, user_ss, user_rflags, user_rdi) }
 }

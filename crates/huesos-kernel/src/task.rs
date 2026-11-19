@@ -22,6 +22,8 @@ pub enum TaskKind {
     User {
         /// Owning process (address space + handle table).
         process: Arc<Process>,
+        /// Optional userspace `Thread` object for intra-process thread lifecycle.
+        thread: Option<Arc<huesos_object::Thread>>,
     },
     /// Finished task after stack and process ownership have been reclaimed.
     /// The scheduler may reuse this slot, but only after incrementing the
@@ -161,11 +163,26 @@ impl Task {
         entry_trampoline: extern "C" fn() -> !,
         cr3: u64,
     ) -> Self {
+        Self::new_user_with_thread(id, name, process, None, entry_trampoline, cr3, 0)
+    }
+
+    /// Create a userspace task optionally bound to a [`huesos_object::Thread`]
+    /// and an initial `MSR_FS_BASE`.
+    pub fn new_user_with_thread(
+        id: u64,
+        name: [u8; 32],
+        process: Arc<Process>,
+        thread: Option<Arc<huesos_object::Thread>>,
+        entry_trampoline: extern "C" fn() -> !,
+        cr3: u64,
+        fs_base: u64,
+    ) -> Self {
         let mut stack = alloc::vec![0u8; USER_KERNEL_STACK_SIZE];
         let stack_top = unsafe { stack.as_mut_ptr().add(stack.len()) };
         // SAFETY: the Task retains this writable stack for its full lifetime;
         // the top word is reserved for the return sentinel.
-        let context = unsafe { Context::new(entry_trampoline, stack_top.sub(8), cr3) };
+        let mut context = unsafe { Context::new(entry_trampoline, stack_top.sub(8), cr3) };
+        context.fs_base = fs_base;
         unsafe {
             let ret_slot = (stack_top as *mut u64).sub(1);
             *ret_slot = thread_exit as *const () as u64;
@@ -175,7 +192,7 @@ impl Task {
             name,
             context,
             kernel_stack: stack,
-            kind: TaskKind::User { process },
+            kind: TaskKind::User { process, thread },
             finished: core::sync::atomic::AtomicBool::new(false),
             blocked: core::sync::atomic::AtomicBool::new(false),
             wake_pending: core::sync::atomic::AtomicBool::new(false),

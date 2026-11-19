@@ -1,15 +1,16 @@
 //! Process/thread/VMAR launch syscalls plus yield/exit.
 
 use huesos_abi::{
-    ErrorCode, HandleValue, ProcessBindExitPortArgs, ProcessCreateInJobArgs, VmarCreateChildArgs,
-    VmarMapArgs, VmarOpArgs, BOOTSTRAP_HANDLE,
+    ErrorCode, HandleValue, ProcessBindExitPortArgs, ProcessCreateInJobArgs, ThreadStartArgs,
+    VmarCreateChildArgs, VmarMapArgs, VmarOpArgs, BOOTSTRAP_HANDLE,
 };
 use huesos_object::{Handle, KernelObject, KernelObjectExt, Rights};
 
 use crate::{
     callbacks::{
-        EXIT_FN, PROCESS_CREATE_FN, PROCESS_CREATE_IN_JOB_FN, THREAD_SET_FS_BASE_FN,
-        THREAD_START_FN, VMAR_MAP_FN, VMAR_PROTECT_FN, VMAR_UNMAP_FN, YIELD_FN,
+        EXIT_FN, PROCESS_CREATE_FN, PROCESS_CREATE_IN_JOB_FN, THREAD_EXIT_FN,
+        THREAD_SET_FS_BASE_FN, THREAD_START_EX_FN, THREAD_START_FN, VMAR_MAP_FN, VMAR_PROTECT_FN,
+        VMAR_UNMAP_FN, YIELD_FN,
     },
     user_memory,
     util::{current_proc, DeferGuard},
@@ -609,6 +610,114 @@ pub(crate) fn sys_thread_set_fs_base(fs_base: u64) -> SyscallResult {
     Ok(0)
 }
 
+pub(crate) fn sys_process_self(out_process: *mut HandleValue) -> SyscallResult {
+    user_memory::validate_write(out_process)?;
+    let proc = current_proc()?;
+    proc.handles
+        .add_with_commit(Handle::new(proc.koid(), Rights::DEFAULT), |handle| {
+            user_memory::write_value(out_process, &handle)
+        })
+        .map(|_| 0)
+}
+
+pub(crate) fn validate_thread_start_args(args: &ThreadStartArgs) -> Result<(), ErrorCode> {
+    let userspace = huesos_abi::USER_ASPACE_BASE..huesos_abi::USER_ASPACE_END;
+    if args.flags != 0
+        || !userspace.contains(&args.entry)
+        || !userspace.contains(&args.stack)
+        || args.fs_base >= huesos_abi::USER_ASPACE_END
+    {
+        return Err(ErrorCode::InvalidArgs);
+    }
+    Ok(())
+}
+
+pub(crate) fn sys_thread_start_ex(args_ptr: *const ThreadStartArgs) -> SyscallResult {
+    let args = user_memory::read_value(args_ptr)?;
+    validate_thread_start_args(&args)?;
+
+    let caller = current_proc()?;
+    let thread_h = caller
+        .handles
+        .get(args.thread)
+        .ok_or(ErrorCode::BadHandle)?;
+    if !thread_h.has_rights(Rights::WRITE) {
+        return Err(ErrorCode::AccessDenied);
+    }
+
+    let thread_obj = huesos_object::lookup_object(thread_h.koid).ok_or(ErrorCode::BadHandle)?;
+    let thread = thread_obj
+        .downcast_ref::<huesos_object::Thread>()
+        .ok_or(ErrorCode::WrongType)?;
+
+    let target_process =
+        huesos_object::lookup_process(thread.process()).ok_or(ErrorCode::BadHandle)?;
+    if !target_process.is_running() {
+        return Err(ErrorCode::Busy);
+    }
+
+    if !thread.begin_start() {
+        return Err(ErrorCode::Busy);
+    }
+    let start_guard = DeferGuard::new(|| thread.cancel_start());
+
+    let start_ex = (*THREAD_START_EX_FN.lock()).ok_or(ErrorCode::NotSupported)?;
+    let task_id = start_ex(thread, args.entry, args.stack, args.arg0, args.fs_base)?;
+    thread.finish_start(task_id);
+    start_guard.commit();
+    Ok(task_id as i64)
+}
+
+pub(crate) fn sys_thread_exit(code: i64) -> SyscallResult {
+    let thread_exit = *THREAD_EXIT_FN.lock();
+    if let Some(f) = thread_exit {
+        f(code);
+    }
+    sys_process_exit(code)
+}
+
+pub(crate) fn sys_thread_wait(handle: HandleValue, out_code: *mut i64) -> SyscallResult {
+    user_memory::validate_write(out_code)?;
+    let proc = current_proc()?;
+    let h = proc.handles.get(handle).ok_or(ErrorCode::BadHandle)?;
+    if !h.has_rights(Rights::READ) {
+        return Err(ErrorCode::AccessDenied);
+    }
+    let obj = huesos_object::lookup_object(h.koid).ok_or(ErrorCode::BadHandle)?;
+    let target = obj
+        .downcast_arc::<huesos_object::Thread>()
+        .map_err(|_| ErrorCode::WrongType)?;
+
+    loop {
+        let prepared = match huesos_object::wait::WaitQueue::prepare(&target.exit_waiters) {
+            Some(p) => p,
+            None => {
+                let code = hues_async::block_on(
+                    async {
+                        loop {
+                            hues_async::yield_now().await;
+                            if let Some(code) = target.exit_code() {
+                                return code;
+                            }
+                        }
+                    },
+                    || {
+                        huesos_arch::hlt();
+                    },
+                );
+                user_memory::write_value(out_code, &code)?;
+                return Ok(0);
+            }
+        };
+        if let Some(code) = target.exit_code() {
+            prepared.cancel();
+            user_memory::write_value(out_code, &code)?;
+            return Ok(0);
+        }
+        prepared.park();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::vmar_map_authorize;
@@ -650,6 +759,40 @@ mod tests {
         );
         assert_eq!(
             super::sys_thread_set_fs_base(u64::MAX),
+            Err(ErrorCode::InvalidArgs)
+        );
+    }
+
+    #[test]
+    fn thread_start_args_validation_enforces_user_ranges_and_flags() {
+        let valid = huesos_abi::ThreadStartArgs {
+            thread: 1,
+            flags: 0,
+            entry: huesos_abi::USER_ASPACE_BASE,
+            stack: huesos_abi::USER_ASPACE_BASE + 0x2000,
+            arg0: 0x1234,
+            fs_base: 0x2000_0000,
+        };
+        assert_eq!(super::validate_thread_start_args(&valid), Ok(()));
+
+        let mut bad_flags = valid;
+        bad_flags.flags = 1;
+        assert_eq!(
+            super::validate_thread_start_args(&bad_flags),
+            Err(ErrorCode::InvalidArgs)
+        );
+
+        let mut bad_entry = valid;
+        bad_entry.entry = 0;
+        assert_eq!(
+            super::validate_thread_start_args(&bad_entry),
+            Err(ErrorCode::InvalidArgs)
+        );
+
+        let mut bad_fs = valid;
+        bad_fs.fs_base = huesos_abi::USER_ASPACE_END;
+        assert_eq!(
+            super::validate_thread_start_args(&bad_fs),
             Err(ErrorCode::InvalidArgs)
         );
     }

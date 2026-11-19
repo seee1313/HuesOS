@@ -1,6 +1,7 @@
 //! Thread objects.
 
 use crate::irq_guard::IrqSafeMutex;
+use crate::wait::WaitQueue;
 use alloc::string::String;
 use alloc::sync::Arc;
 use core::any::Any;
@@ -17,6 +18,10 @@ pub struct Thread {
     process: Koid,
     /// Scheduler task id this Thread object corresponds to.
     pub task_id: IrqSafeMutex<Option<u64>>,
+    /// First recorded thread exit code (`Some` once exited or terminated).
+    exit_code: IrqSafeMutex<Option<i64>>,
+    /// Waiters blocked in `ThreadWait` until this thread exits.
+    pub exit_waiters: WaitQueue,
 }
 
 impl Thread {
@@ -32,6 +37,8 @@ impl Thread {
             name: IrqSafeMutex::new(String::from(name)),
             process,
             task_id: IrqSafeMutex::new(None),
+            exit_code: IrqSafeMutex::new(None),
+            exit_waiters: WaitQueue::new(),
         })
     }
 
@@ -67,6 +74,24 @@ impl Thread {
     /// Whether this thread has already been started or reserved for start.
     pub fn start_in_progress_or_done(&self) -> bool {
         self.task_id.lock().is_some()
+    }
+
+    /// Record the thread's exit code and wake any `ThreadWait` waiters.
+    /// Idempotent: the first recorded exit code wins.
+    pub fn set_exit_code(&self, code: i64) -> bool {
+        let mut slot = self.exit_code.lock();
+        if slot.is_some() {
+            return false;
+        }
+        *slot = Some(code);
+        drop(slot);
+        self.exit_waiters.wake_all();
+        true
+    }
+
+    /// Return the exit code if this thread has already exited.
+    pub fn exit_code(&self) -> Option<i64> {
+        *self.exit_code.lock()
     }
 }
 

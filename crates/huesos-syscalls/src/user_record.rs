@@ -84,6 +84,7 @@ record!(huesos_abi::JobSetNameArgs, 24, 8, job => 0, name => 8, name_len => 16);
 record!(huesos_abi::JobBindQuotaPortArgs, 24, 8, job => 0, port => 4, key => 8, flags => 16);
 record!(huesos_abi::ProcessCreateInJobArgs, 40, 8, job => 0, name => 8, name_len => 16, out_process => 24, out_root_vmar => 32);
 record!(huesos_abi::ProcessBindExitPortArgs, 24, 8, process => 0, port => 4, key => 8, flags => 16);
+record!(huesos_abi::ThreadStartArgs, 40, 8, thread => 0, flags => 4, entry => 8, stack => 16, arg0 => 24, fs_base => 32);
 record!(huesos_abi::VmarCreateChildArgs, 40, 8, parent => 0, addr => 8, len => 16, flags => 24, out_child => 32);
 record!(huesos_abi::VmarMapArgs, 40, 8, vmar => 0, vmo => 4, vmo_offset => 8, addr => 16, len => 24, flags => 32);
 record!(huesos_abi::VmarOpArgs, 32, 8, vmar => 0, addr => 8, len => 16, flags => 24);

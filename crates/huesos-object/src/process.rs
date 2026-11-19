@@ -69,6 +69,8 @@ pub struct Process {
     /// Initial-thread start reservation. Prevents two different Thread objects
     /// from racing to become the first runnable thread of the same process.
     start_reserved: AtomicBool,
+    /// Number of currently runnable/active scheduler threads in this process.
+    active_threads: AtomicUsize,
     /// Criticality flag: if `true`, an abnormal exit of this process
     /// triggers a kernel-driven hard halt of the whole system. Set once
     /// via [`Self::mark_critical`]; never cleared. Inspired by
@@ -110,6 +112,7 @@ impl Process {
             affinity_mask: AtomicU64::new(1u64 << crate::registry::current_cpu()),
             scheduler_flags: core::sync::atomic::AtomicU32::new(0),
             start_reserved: AtomicBool::new(false),
+            active_threads: AtomicUsize::new(0),
             critical: AtomicBool::new(false),
         })
     }
@@ -255,6 +258,32 @@ impl Process {
     /// Clear the start reservation after the scheduler task was published.
     pub fn finish_initial_thread_start(&self) {
         self.start_reserved.store(false, Ordering::Release);
+    }
+
+    /// Whether the process is currently running and has not exited yet (so a
+    /// secondary thread can be started inside it).
+    pub fn is_running(&self) -> bool {
+        self.lifecycle.lock().state() == ProcState::Running
+    }
+
+    /// Increment the number of active threads in this process.
+    pub fn increment_active_threads(&self) -> usize {
+        self.active_threads.fetch_add(1, Ordering::AcqRel) + 1
+    }
+
+    /// Decrement the number of active threads in this process, returning the
+    /// previous count (so `prev <= 1` means the last thread exited).
+    pub fn decrement_active_threads(&self) -> usize {
+        self.active_threads
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+                Some(n.saturating_sub(1))
+            })
+            .unwrap_or(0)
+    }
+
+    /// Current active thread count in this process.
+    pub fn active_threads(&self) -> usize {
+        self.active_threads.load(Ordering::Acquire)
     }
 
     /// Mark the process as running. The policy accepts this only once, when
