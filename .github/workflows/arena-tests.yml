@@ -79,7 +79,14 @@ jobs:
           fi
           git pull --rebase --autostash -q origin "${GITHUB_REF_NAME}" || true
           git commit -m "chore(arena): publish host-test log [skip ci]"
-          git push origin "HEAD:${GITHUB_REF_NAME}"
+          for attempt in 1 2 3 4; do
+            if git push origin "HEAD:${GITHUB_REF_NAME}"; then
+              exit 0
+            fi
+            sleep $((attempt * 10))
+            git pull --rebase -q origin "${GITHUB_REF_NAME}" || true
+          done
+          exit 1
       - name: Fail when tests failed
         if: ${{ steps.tests.outputs.status != '0' }}
         run: exit 1
@@ -131,7 +138,14 @@ jobs:
           fi
           git pull --rebase --autostash -q origin "${GITHUB_REF_NAME}" || true
           git commit -m "chore(arena): publish clippy log [skip ci]"
-          git push origin "HEAD:${GITHUB_REF_NAME}"
+          for attempt in 1 2 3 4; do
+            if git push origin "HEAD:${GITHUB_REF_NAME}"; then
+              exit 0
+            fi
+            sleep $((attempt * 10))
+            git pull --rebase -q origin "${GITHUB_REF_NAME}" || true
+          done
+          exit 1
       - name: Fail when clippy failed
         if: ${{ steps.clippy.outputs.status != '0' }}
         run: exit 1

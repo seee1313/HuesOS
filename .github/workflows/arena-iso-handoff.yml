@@ -200,7 +200,16 @@ jobs:
             exit 0
           fi
           git commit -m "chore(arena): publish built HuesOS images and logs [skip ci]"
-          git push origin "HEAD:${GITHUB_REF_NAME}"
+          # A concurrent push to the branch must not cost the run its only
+          # delivery channel: retry the publish on top of the new tip.
+          for attempt in 1 2 3 4; do
+            if git push origin "HEAD:${GITHUB_REF_NAME}"; then
+              exit 0
+            fi
+            sleep $((attempt * 10))
+            git pull --rebase -q origin "${GITHUB_REF_NAME}" || true
+          done
+          exit 1
 
       - name: Fail when the boot gate failed
         if: ${{ inputs.smoke != 'false' && ((steps.smoke.outputs.status != '0' && steps.smoke.outputs.status != '124') || (steps.smoke_nvme.outputs.status != '0' && steps.smoke_nvme.outputs.status != '124')) }}
