@@ -426,24 +426,15 @@ impl HshHost {
     /// the shell resolves relative names before the spawn: explicit paths
     /// (`./x`, `../x`, `a/b`), home-relative `.`/`..`, and bare names that only
     /// exist relative to the current directory ("`cat welcome.txt`" in `/etc`).
-    fn absolutize_argument(&mut self, arg: &str) -> Option<String> {
+    fn absolutize_argument(&self, arg: &str) -> Option<String> {
+        // Flags stay untouched; every other argument in a path position is a
+        // path, including names that do not exist yet (`mkdir sub`,
+        // `mv a b`, `touch note.md`) -- resolving only existing names would
+        // silently create those in `/` instead of the working directory.
         if arg.is_empty() || arg.starts_with('-') {
             return None;
         }
-        let looks_like_path = arg.starts_with('/')
-            || arg.starts_with('.')
-            || arg.contains('/');
-        if looks_like_path {
-            return Some(self.normalize_path(arg));
-        }
-        if self.pwd == "/" {
-            return None;
-        }
-        let candidate = self.normalize_path(arg);
-        if self.is_file(&candidate) || self.is_directory(&candidate) {
-            return Some(candidate);
-        }
-        None
+        Some(self.normalize_path(arg))
     }
 
     fn resolve_elf(&mut self, name: &str) -> Option<(Vmo, u64, u64, String)> {
