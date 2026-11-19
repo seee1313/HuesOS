@@ -82,3 +82,55 @@ jobs:
       - name: Fail when tests failed
         if: ${{ steps.tests.outputs.status != '0' }}
         run: exit 1
+
+  clippy:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install nightly-2026-03-01 --profile minimal \
+            --component rust-src,clippy,llvm-tools-preview
+          rustup default nightly-2026-03-01
+      - name: Cache cargo target directory
+        uses: actions/cache@v4
+        with:
+          path: |
+            target
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: arena-clippy-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            arena-clippy-
+      - name: Run clippy and capture the log
+        id: clippy
+        env:
+          CARGO_BUILD_JOBS: "2"
+        run: |
+          set +e
+          mkdir -p ci-artifacts/arena-tests
+          bash scripts/clippy.sh > ci-artifacts/arena-tests/clippy.log 2>&1
+          status=$?
+          echo "status=$status" >> "$GITHUB_OUTPUT"
+          grep -n "^error" -A12 ci-artifacts/arena-tests/clippy.log | head -200
+          exit 0
+      - name: Publish the clippy log
+        run: |
+          set -euo pipefail
+          git config user.name "arena-test-bot"
+          git config user.email "arena-test-bot@users.noreply.github.com"
+          echo "status=${{ steps.clippy.outputs.status }}" > ci-artifacts/arena-tests/clippy-status.txt
+          git add -f ci-artifacts/arena-tests
+          if git diff --cached --quiet; then
+            echo "nothing to publish"
+            exit 0
+          fi
+          git pull --rebase --autostash -q origin "${GITHUB_REF_NAME}" || true
+          git commit -m "chore(arena): publish clippy log [skip ci]"
+          git push origin "HEAD:${GITHUB_REF_NAME}"
+      - name: Fail when clippy failed
+        if: ${{ steps.clippy.outputs.status != '0' }}
+        run: exit 1
