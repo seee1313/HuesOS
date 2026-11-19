@@ -28,6 +28,10 @@ pub enum CapKind {
     BlockDev = 5,
     /// Framebuffer draw resource handle (`AT_HUESOS_FRAME_DRAW`).
     FrameDraw = 6,
+    /// Read-only `BOOTFS` VMO (`AT_HUESOS_LIB_VMO` when `caps_mask::BOOTFS_RO` is set).
+    BootfsRo = 7,
+    /// `DriverManager` query/registry channel (`AT_HUESOS_REGISTRY`).
+    Registry = 8,
 }
 
 #[cfg(not(feature = "dyn-client"))]
@@ -55,6 +59,8 @@ mod imp {
     static HXFS_SERVICE_CH: AtomicU32 = AtomicU32::new(INVALID_HANDLE);
     static BLOCK_DEV_CH: AtomicU32 = AtomicU32::new(INVALID_HANDLE);
     static FRAME_DRAW_CH: AtomicU32 = AtomicU32::new(INVALID_HANDLE);
+    static BOOTFS_VMO_H: AtomicU32 = AtomicU32::new(INVALID_HANDLE);
+    static REGISTRY_CH: AtomicU32 = AtomicU32::new(INVALID_HANDLE);
 
     static STDIN_LOCK: AtomicBool = AtomicBool::new(false);
     static STDIN_POS: AtomicUsize = AtomicUsize::new(0);
@@ -72,6 +78,8 @@ mod imp {
             CapKind::HxfsService => &HXFS_SERVICE_CH,
             CapKind::BlockDev => &BLOCK_DEV_CH,
             CapKind::FrameDraw => &FRAME_DRAW_CH,
+            CapKind::BootfsRo => &BOOTFS_VMO_H,
+            CapKind::Registry => &REGISTRY_CH,
         }
     }
 
@@ -86,6 +94,8 @@ mod imp {
         HXFS_SERVICE_CH.store(info.hxfs_service_ch, Ordering::Release);
         BLOCK_DEV_CH.store(info.block_dev_ch, Ordering::Release);
         FRAME_DRAW_CH.store(info.frame_draw_ch, Ordering::Release);
+        BOOTFS_VMO_H.store(info.bootfs_vmo, Ordering::Release);
+        REGISTRY_CH.store(info.registry_ch, Ordering::Release);
     }
 
     pub fn args_count() -> usize {
@@ -448,6 +458,8 @@ pub const fn cap_kind_from_u32(kind: u32) -> Option<CapKind> {
         4 => Some(CapKind::HxfsService),
         5 => Some(CapKind::BlockDev),
         6 => Some(CapKind::FrameDraw),
+        7 => Some(CapKind::BootfsRo),
+        8 => Some(CapKind::Registry),
         _ => None,
     }
 }

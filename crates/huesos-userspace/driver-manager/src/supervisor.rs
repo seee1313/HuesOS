@@ -254,6 +254,7 @@ pub struct DriverManager {
     /// started before ACPI settles is not told "no snapshot" prematurely.
     acpi_authority_settled: bool,
     registry_channel: Option<Channel>,
+    query_channels: [Option<Channel>; 8],
     fs: FileSystemService,
     volume: VolumeManagerService,
     devfs: DevFsService,
@@ -430,6 +431,7 @@ impl DriverManager {
             config_mediation_established: false,
             acpi_authority_settled: false,
             registry_channel: None,
+            query_channels: [const { None }; 8],
             fs: FileSystemService::new(),
             volume: VolumeManagerService::new(),
             devfs: DevFsService::new(),
@@ -830,6 +832,7 @@ impl DriverManager {
         loop {
             self.poll_init_bootstrap(&init_bootstrap);
             self.poll_registry_requests();
+            self.poll_query_channels();
             self.fs.poll();
             let nvme_online = self.registry.state("block:nvme") == Some(ServiceState::Online);
             self.volume.poll(
@@ -1660,9 +1663,24 @@ impl DriverManager {
                 Ok(n) if &buf[..n] == protocol::OPEN_VOLUME_SYSTEM.as_bytes() => {
                     self.open_system_volume()
                 }
-                Ok(n) if &buf[..n] == protocol::QUERY_PCI.as_bytes() => self.reply_query_pci(),
-                Ok(n) if &buf[..n] == protocol::QUERY_ACPI.as_bytes() => self.reply_query_acpi(),
-                Ok(n) if &buf[..n] == protocol::QUERY_PS.as_bytes() => self.reply_query_ps(),
+                Ok(n) if &buf[..n] == protocol::QUERY_PCI.as_bytes() => {
+                    if let Some(reg) = self.registry_channel.as_ref() {
+                        self.reply_query_pci_on(reg);
+                    }
+                }
+                Ok(n) if &buf[..n] == protocol::QUERY_ACPI.as_bytes() => {
+                    if let Some(reg) = self.registry_channel.as_ref() {
+                        self.reply_query_acpi_on(reg);
+                    }
+                }
+                Ok(n) if &buf[..n] == protocol::QUERY_PS.as_bytes() => {
+                    if let Some(reg) = self.registry_channel.as_ref() {
+                        self.reply_query_ps_on(reg);
+                    }
+                }
+                Ok(n) if &buf[..n] == protocol::OPEN_QUERY.as_bytes() => {
+                    self.open_query_channel();
+                }
                 Ok(_) => println!("[driver-manager] unknown registry request"),
                 Err(ErrorCode::ShouldWait) => return,
                 Err(e) => {
@@ -2169,11 +2187,63 @@ impl DriverManager {
             .open_system_volume(registry, nvme_bootstrap, nvme_online);
     }
 
-    fn reply_query_pci(&self) {
-        use core::fmt::Write;
+    fn open_query_channel(&mut self) {
         let Some(registry) = self.registry_channel.as_ref() else {
             return;
         };
+        let Some(slot) = self.query_channels.iter().position(|c| c.is_none()) else {
+            let _ = registry.write(b"err:query:full");
+            return;
+        };
+        let Ok((server_ch, client_ch)) = Channel::pair() else {
+            let _ = registry.write(b"err:query:pair");
+            return;
+        };
+        if registry
+            .write_handle(protocol::QUERY_CHANNEL.as_bytes(), client_ch.into_handle())
+            .is_ok()
+        {
+            self.query_channels[slot] = Some(server_ch);
+        }
+    }
+
+    fn poll_query_channels(&mut self) {
+        let mut buf = [0u8; 64];
+        for idx in 0..self.query_channels.len() {
+            let mut close = false;
+            if let Some(ch) = self.query_channels[idx].as_ref() {
+                let mut budget = POLL_BUDGET_PER_TICK;
+                while budget > 0 {
+                    budget -= 1;
+                    match ch.read_into(&mut buf) {
+                        Ok(n) if &buf[..n] == protocol::QUERY_PCI.as_bytes() => {
+                            self.reply_query_pci_on(ch);
+                        }
+                        Ok(n) if &buf[..n] == protocol::QUERY_ACPI.as_bytes() => {
+                            self.reply_query_acpi_on(ch);
+                        }
+                        Ok(n) if &buf[..n] == protocol::QUERY_PS.as_bytes() => {
+                            self.reply_query_ps_on(ch);
+                        }
+                        Ok(_) => {
+                            let _ = ch.write(b"err:query:unsupported");
+                        }
+                        Err(ErrorCode::ShouldWait) => break,
+                        Err(ErrorCode::PeerClosed) | Err(_) => {
+                            close = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            if close {
+                self.query_channels[idx] = None;
+            }
+        }
+    }
+
+    fn reply_query_pci_on(&self, registry: &Channel) {
+        use core::fmt::Write;
         let mut out = QueryBuf::<2048>::new();
         let _ = writeln!(out, "kind\tseg\tbus\tbackend\tbase_or_bdf\tstatus");
 
@@ -2257,11 +2327,8 @@ impl DriverManager {
         let _ = registry.write(out.as_bytes());
     }
 
-    fn reply_query_acpi(&self) {
+    fn reply_query_acpi_on(&self, registry: &Channel) {
         use core::fmt::Write;
-        let Some(registry) = self.registry_channel.as_ref() else {
-            return;
-        };
         let mut out = QueryBuf::<2048>::new();
         let _ = writeln!(out, "sig\trev\tphys_addr\tlength\tgen\tstatus");
         if let Some(vmo) = self.acpi_tables.as_ref() {
@@ -2302,11 +2369,8 @@ impl DriverManager {
         let _ = registry.write(out.as_bytes());
     }
 
-    fn reply_query_ps(&self) {
+    fn reply_query_ps_on(&self, registry: &Channel) {
         use core::fmt::Write;
-        let Some(registry) = self.registry_channel.as_ref() else {
-            return;
-        };
         let mut out = QueryBuf::<2048>::new();
         let _ = writeln!(out, "handle\tname\tstate\tgen\trestarts");
         let _ = writeln!(out, "self\tdriver-manager\tonline\t1\t0");

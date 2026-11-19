@@ -218,6 +218,19 @@ impl Hxfs {
         read_native_status(&self.channel).map(|_| ())
     }
 
+    /// Query mounted volume `(root_object_id, checkpoint_sequence)` via native `GetInfo`.
+    pub fn volume_info(&self) -> Result<(u64, u64)> {
+        write_native_request(
+            &self.channel,
+            abi::HxfsOp::GetInfo,
+            abi::HxfsHandleKind::Volume,
+            0,
+            0,
+            &[],
+        )?;
+        read_native_status(&self.channel).map(|r| (r.object_id, r.value))
+    }
+
     /// Publish a dirty Hxfs checkpoint explicitly.
     pub fn checkpoint(&self) -> Result<()> {
         write_native_request(

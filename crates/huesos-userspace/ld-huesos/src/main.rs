@@ -26,11 +26,11 @@ use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use huesos_abi::auxv::{
     caps_mask, AuxEntry, AT_BASE, AT_ENTRY, AT_HUESOS_BLOCK_DEV, AT_HUESOS_CAPS_MASK,
     AT_HUESOS_FRAME_DRAW, AT_HUESOS_HXFS_DIR, AT_HUESOS_HXFS_SERVICE, AT_HUESOS_LD_BOOTSTRAP,
-    AT_HUESOS_LIB_VMO, AT_HUESOS_STDERR, AT_HUESOS_STDIN, AT_HUESOS_STDOUT, AT_NULL, AT_PHDR,
-    AT_PHENT, AT_PHNUM, LD_BOOTSTRAP_BLOCK_DEV_LABEL, LD_BOOTSTRAP_FRAME_DRAW_LABEL,
-    LD_BOOTSTRAP_HXFS_DIR_LABEL, LD_BOOTSTRAP_HXFS_SERVICE_LABEL, LD_BOOTSTRAP_LIB_VMO_LABEL,
-    LD_BOOTSTRAP_SELF_VMAR_LABEL, LD_BOOTSTRAP_STDERR_LABEL, LD_BOOTSTRAP_STDIN_LABEL,
-    LD_BOOTSTRAP_STDOUT_LABEL,
+    AT_HUESOS_LIB_VMO, AT_HUESOS_REGISTRY, AT_HUESOS_STDERR, AT_HUESOS_STDIN, AT_HUESOS_STDOUT,
+    AT_NULL, AT_PHDR, AT_PHENT, AT_PHNUM, LD_BOOTSTRAP_BLOCK_DEV_LABEL,
+    LD_BOOTSTRAP_FRAME_DRAW_LABEL, LD_BOOTSTRAP_HXFS_DIR_LABEL, LD_BOOTSTRAP_HXFS_SERVICE_LABEL,
+    LD_BOOTSTRAP_LIB_VMO_LABEL, LD_BOOTSTRAP_REGISTRY_LABEL, LD_BOOTSTRAP_SELF_VMAR_LABEL,
+    LD_BOOTSTRAP_STDERR_LABEL, LD_BOOTSTRAP_STDIN_LABEL, LD_BOOTSTRAP_STDOUT_LABEL,
 };
 use huesos_abi::{
     rights, vmar_flags, vmo_create_flags, HandleValue, USER_HEAP_BASE, USER_HEAP_SIZE,
@@ -487,6 +487,7 @@ struct AuxInfo {
     expect_hxfs_service: bool,
     expect_block_dev: bool,
     expect_frame_draw: bool,
+    expect_registry: bool,
     caps_mask: u64,
 }
 
@@ -511,6 +512,7 @@ fn parse_auxv(sp: *const u64) -> Option<AuxInfo> {
         expect_hxfs_service: false,
         expect_block_dev: false,
         expect_frame_draw: false,
+        expect_registry: false,
         caps_mask: caps_mask::ALL_DEFAULT,
     };
     // SAFETY: stack was constructed by the parent process launcher per SysV ABI.
@@ -543,6 +545,7 @@ fn parse_auxv(sp: *const u64) -> Option<AuxInfo> {
                 AT_HUESOS_HXFS_SERVICE => info.expect_hxfs_service = entry.a_val != 0,
                 AT_HUESOS_BLOCK_DEV => info.expect_block_dev = entry.a_val != 0,
                 AT_HUESOS_FRAME_DRAW => info.expect_frame_draw = entry.a_val != 0,
+                AT_HUESOS_REGISTRY => info.expect_registry = entry.a_val != 0,
                 _ => {}
             }
             aux = aux.add(1);
@@ -559,6 +562,7 @@ struct BootstrapExtras {
     hxfs_service_ch: u32,
     block_dev_ch: u32,
     frame_draw_ch: u32,
+    registry_ch: u32,
 }
 
 fn fail(msg: &str) -> ! {
@@ -675,14 +679,27 @@ fn ld_main(sp: *const u64) -> u64 {
 
     // Enforce `@caps(bootfs=none)` by dropping the BOOTFS `lib_vmo` capability
     // immediately after initial `DT_NEEDED` resolution, before `.init_array` or `_start`.
-    if (aux.caps_mask & caps_mask::BOOTFS_RO) == 0 {
+    // When `caps_mask::BOOTFS_RO` is set, duplicate a read-only handle for the application.
+    let app_bootfs_vmo = if (aux.caps_mask & caps_mask::BOOTFS_RO) == 0 {
         RTLD_STATE.with(|state| {
             state.lib_vmo = None;
         });
-    }
+        INVALID_HANDLE
+    } else {
+        RTLD_STATE.with(|state| {
+            state
+                .lib_vmo
+                .as_ref()
+                .and_then(|v| {
+                    v.duplicate(rights::READ | rights::TRANSFER | rights::DUPLICATE)
+                        .ok()
+                })
+                .map_or(INVALID_HANDLE, |v| v.into_handle().into_raw())
+        })
+    };
 
     // Pass `argc`/`argv`, `@caps(...)` mask, and stdio/capability handles to `libcanvas.so`.
-    register_process_ctx_into_libcanvas(initial_count, &aux, &extras);
+    register_process_ctx_into_libcanvas(initial_count, &aux, &extras, app_bootfs_vmo);
 
     // Run `.init` and `.init_array` in dependency-first order (reverse load order).
     let mut ctor_idx = initial_count;
@@ -738,7 +755,12 @@ fn register_rtld_into_libcanvas(obj_count: usize) {
     }
 }
 
-fn register_process_ctx_into_libcanvas(obj_count: usize, aux: &AuxInfo, extras: &BootstrapExtras) {
+fn register_process_ctx_into_libcanvas(
+    obj_count: usize,
+    aux: &AuxInfo,
+    extras: &BootstrapExtras,
+    app_bootfs_vmo: u32,
+) {
     let reg_addr = RTLD_STATE.with(|state| {
         for idx in 1..obj_count {
             let obj = &state.objects[idx];
@@ -765,6 +787,8 @@ fn register_process_ctx_into_libcanvas(obj_count: usize, aux: &AuxInfo, extras: 
             hxfs_service_ch: extras.hxfs_service_ch,
             block_dev_ch: extras.block_dev_ch,
             frame_draw_ch: extras.frame_draw_ch,
+            bootfs_vmo: app_bootfs_vmo,
+            registry_ch: extras.registry_ch,
         };
         // SAFETY: `__huesos_set_process_ctx` in `libcanvas.so` matches this exact signature.
         let set_fn: unsafe extern "C" fn(*const ProcessBootstrapInfo) -> i32 =
@@ -793,6 +817,7 @@ fn receive_bootstrap_handles(
     let mut hxfs_svc_h: Option<Handle> = None;
     let mut block_dev_h: Option<Handle> = None;
     let mut frame_draw_h: Option<Handle> = None;
+    let mut registry_h: Option<Handle> = None;
     let mut buf = [0u8; 64];
 
     while self_vmar.is_none()
@@ -804,6 +829,7 @@ fn receive_bootstrap_handles(
         || (aux.expect_hxfs_service && hxfs_svc_h.is_none())
         || (aux.expect_block_dev && block_dev_h.is_none())
         || (aux.expect_frame_draw && frame_draw_h.is_none())
+        || (aux.expect_registry && registry_h.is_none())
     {
         match bootstrap.read_optional_handle(&mut buf) {
             Ok((n, Some(handle))) if &buf[..n] == LD_BOOTSTRAP_SELF_VMAR_LABEL => {
@@ -832,6 +858,9 @@ fn receive_bootstrap_handles(
             }
             Ok((n, Some(handle))) if &buf[..n] == LD_BOOTSTRAP_FRAME_DRAW_LABEL => {
                 frame_draw_h = Some(handle);
+            }
+            Ok((n, Some(handle))) if &buf[..n] == LD_BOOTSTRAP_REGISTRY_LABEL => {
+                registry_h = Some(handle);
             }
             Ok((_n, _)) => {
                 fail("unexpected bootstrap message before dynamic link");
@@ -871,6 +900,7 @@ fn receive_bootstrap_handles(
         hxfs_service_ch: hxfs_svc_h.map_or(INVALID_HANDLE, Handle::into_raw),
         block_dev_ch: block_dev_h.map_or(INVALID_HANDLE, Handle::into_raw),
         frame_draw_ch: frame_draw_h.map_or(INVALID_HANDLE, Handle::into_raw),
+        registry_ch: registry_h.map_or(INVALID_HANDLE, Handle::into_raw),
     };
 
     (

@@ -59,7 +59,10 @@ for marker in \
     '[storage] disabled by init.storage=off' \
     '[init] storage disabled by init.storage=off' \
     '[init] hello from ring3 userspace, via libcanvas' \
-    '[init] launched terminal'; do
+    '[init] launched terminal' \
+    '[terminal] spawned /bin/hsh.elf' \
+    '[hsh] ls.elf pipe OK' \
+    '[hsh] @caps(hxfs=ro) enforcement OK'; do
     if ! grep -Fq "$marker" "$log"; then
         echo "missing storage-off marker: $marker" >&2
         tail -200 "$log" >&2
