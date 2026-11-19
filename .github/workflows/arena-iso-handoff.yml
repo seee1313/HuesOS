@@ -183,7 +183,9 @@ jobs:
           ls -l ci-artifacts/arena-iso
 
       - name: Publish images to the branch
-        if: ${{ inputs.publish != 'false' }}
+        # Runs even when the build or a smoke gate failed: the compiler and
+        # serial logs are the only channel this sandbox has for diagnostics.
+        if: ${{ !cancelled() && inputs.publish != 'false' }}
         run: |
           set -euo pipefail
           git config user.name "arena-iso-bot"
