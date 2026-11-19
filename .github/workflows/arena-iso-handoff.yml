@@ -43,7 +43,23 @@ jobs:
       - name: Build release kernel + ISO
         env:
           CARGO_BUILD_JOBS: "2"
-        run: make iso PROFILE=release
+        run: |
+          set -o pipefail
+          make iso PROFILE=release 2>&1 | tee /tmp/huesos-build.log
+
+      # The sandbox cannot download job logs, so a failed compile has to bring
+      # its own diagnostics: publish the compiler output into the branch.
+      - name: Publish build log when the build failed
+        if: failure()
+        run: |
+          set -euo pipefail
+          mkdir -p ci-artifacts/arena-iso
+          cp /tmp/huesos-build.log ci-artifacts/arena-iso/build.log || true
+          git config user.name "arena-iso-bot"
+          git config user.email "arena-iso-bot@users.noreply.github.com"
+          git add -f ci-artifacts/arena-iso/build.log
+          git commit -m "chore(arena): publish failed build log [skip ci]" || true
+          git push origin "HEAD:${GITHUB_REF_NAME}" || true
 
       - name: Boot smoke gate (release, SMP2, ecam)
         id: smoke
