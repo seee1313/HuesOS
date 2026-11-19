@@ -20,6 +20,17 @@ const BOOTFS_ENTRY_SIZE: u64 = 216;
 const BOOTFS_PATH_SIZE: usize = 192;
 const BOOTFS_MAGIC: &[u8; 8] = b"HBOOTFS1";
 
+/// Tick budget for a single registry handshake read.
+///
+/// `driver-manager` services the registry once per supervision tick, and a tick
+/// can be long (it polls NVMe, the volume manager and the file system first).
+/// Counting `yield_now()` iterations instead of waiting on the channel made the
+/// shell give up while the reply was already on its way.
+const HANDSHAKE_WAIT_TICKS: u64 = 150;
+/// Reads spent on one handshake before giving up; each read waits up to
+/// `HANDSHAKE_WAIT_TICKS`, and stale replies to earlier requests are skipped.
+const HANDSHAKE_READS: usize = 6;
+
 /// UI/supervisor action delegated by `hsh.elf` back to `terminal`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DelegatedAction {
@@ -91,8 +102,8 @@ impl HshHost {
             return;
         }
         let mut buf = [0u8; 64];
-        for _ in 0..40 {
-            match reg.read_optional_handle(&mut buf) {
+        for _ in 0..HANDSHAKE_READS {
+            match reg.read_optional_handle_timeout(&mut buf, HANDSHAKE_WAIT_TICKS) {
                 Ok((n, Some(handle))) if &buf[..n] == b"service:hxfs:channel" => {
                     self.hxfs = Some(Hxfs::from_channel(Channel::from_handle(handle)));
                     return;
@@ -102,9 +113,8 @@ impl HshHost {
                 // A late reply to a different handshake: skip it rather than
                 // failing this one.
                 Ok((_n, None)) => {}
-                Err(ErrorCode::ShouldWait) | Err(ErrorCode::TimedOut) => {
-                    libcanvas::process::yield_now();
-                }
+                // The channel read already waited for a full budget.
+                Err(ErrorCode::ShouldWait) | Err(ErrorCode::TimedOut) => {}
                 Err(_) => return,
             }
         }
@@ -125,7 +135,7 @@ impl HshHost {
         };
         let mut buf = [0u8; 64];
         for _ in 0..32 {
-            match reg.read_optional_handle(&mut buf) {
+            match reg.read_optional_handle_timeout(&mut buf, HANDSHAKE_WAIT_TICKS) {
                 Ok((_n, handle)) => drop(handle),
                 Err(ErrorCode::ShouldWait) | Err(ErrorCode::TimedOut) => break,
                 Err(_) => break,
@@ -138,8 +148,8 @@ impl HshHost {
         self.drain_registry();
         reg.write(b"open:hxfs").ok()?;
         let mut buf = [0u8; 64];
-        for _ in 0..50 {
-            match reg.read_optional_handle(&mut buf) {
+        for _ in 0..HANDSHAKE_READS {
+            match reg.read_optional_handle_timeout(&mut buf, HANDSHAKE_WAIT_TICKS) {
                 Ok((n, Some(handle))) if &buf[..n] == b"service:hxfs:channel" => {
                     return Some(Channel::from_handle(handle));
                 }
@@ -167,8 +177,8 @@ impl HshHost {
         self.drain_registry();
         reg.write(b"open:block:nvme").ok()?;
         let mut buf = [0u8; 64];
-        for _ in 0..50 {
-            match reg.read_optional_handle(&mut buf) {
+        for _ in 0..HANDSHAKE_READS {
+            match reg.read_optional_handle_timeout(&mut buf, HANDSHAKE_WAIT_TICKS) {
                 Ok((n, Some(handle))) if &buf[..n] == b"service:block:nvme:channel" => {
                     return Some(Channel::from_handle(handle));
                 }
@@ -177,9 +187,8 @@ impl HshHost {
                 // A late reply to a different handshake: skip it rather than
                 // giving up on this one.
                 Ok((_n, None)) => {}
-                Err(ErrorCode::ShouldWait) | Err(ErrorCode::TimedOut) => {
-                    libcanvas::process::yield_now();
-                }
+                // The channel read already waited for a full budget.
+                Err(ErrorCode::ShouldWait) | Err(ErrorCode::TimedOut) => {}
                 Err(_) => return None,
             }
         }
@@ -209,10 +218,9 @@ impl HshHost {
         let reg = self.registry.as_ref()?;
         self.drain_registry();
         reg.write(b"open:query").ok()?;
-        let mut polls: u32 = 0;
         let mut buf = [0u8; 64];
-        for _ in 0..50 {
-            match reg.read_optional_handle(&mut buf) {
+        for _ in 0..HANDSHAKE_READS {
+            match reg.read_optional_handle_timeout(&mut buf, HANDSHAKE_WAIT_TICKS) {
                 Ok((n, Some(handle))) if &buf[..n] == b"service:query:channel" => {
                     println!("[hsh] query channel granted");
                     return Some(Channel::from_handle(handle));
@@ -225,12 +233,15 @@ impl HshHost {
                 // A late reply to a different handshake: skip it rather than
                 // giving up on this one.
                 Ok((_n, None)) => {}
-                Err(ErrorCode::ShouldWait) | Err(ErrorCode::TimedOut) => {
-                    libcanvas::process::yield_now();
+                // The channel read already waited for a full budget.
+                Err(ErrorCode::ShouldWait) | Err(ErrorCode::TimedOut) => {}
+                Err(e) => {
+                    println!("[hsh] query handshake read error: {}", e.as_str());
+                    return None;
                 }
-                Err(_) => return None,
             }
         }
+        println!("[hsh] query handshake: no reply after {HANDSHAKE_READS} reads");
         None
     }
 

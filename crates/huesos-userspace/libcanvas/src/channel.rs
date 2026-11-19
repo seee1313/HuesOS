@@ -189,6 +189,60 @@ impl Channel {
         Ok((actual_bytes as usize, actual_handles as usize))
     }
 
+    /// Read bytes and receive transferred handles, parking the thread until a
+    /// message arrives or `ticks` scheduler ticks elapse.
+    ///
+    /// The non-blocking [`Self::read_etc`] is the wrong tool for a client that
+    /// is waiting for a reply: a fixed number of `yield_now` polls only spans
+    /// a couple of supplier ticks, so a busy supplier makes the client give up
+    /// while the reply is already in flight, and the stale reply then desyncs
+    /// whatever handshake comes next.
+    pub fn read_etc_timeout(
+        &self,
+        buf: &mut [u8],
+        handles: &mut [HandleValue],
+        ticks: u64,
+    ) -> crate::Result<(usize, usize)> {
+        let mut actual_bytes: u32 = 0;
+        let mut actual_handles: u32 = 0;
+        let args = ChannelReadEtcArgs {
+            channel: self.0.raw(),
+            bytes: buf.as_mut_ptr(),
+            bytes_capacity: buf.len() as u32,
+            out_bytes: &mut actual_bytes as *mut u32,
+            handles: handles.as_mut_ptr(),
+            handles_capacity: handles.len() as u32,
+            out_handles: &mut actual_handles as *mut u32,
+        };
+        // wait_mode: 0 never blocks, 1 blocks forever, >1 is a tick budget.
+        let ret = raw::syscall2(
+            Syscall::ChannelReadEtc,
+            &args as *const _ as u64,
+            ticks.max(2),
+        );
+        raw::decode(ret)?;
+        Ok((actual_bytes as usize, actual_handles as usize))
+    }
+
+    /// [`Self::read_optional_handle`] with a bounded wait for the message.
+    pub fn read_optional_handle_timeout(
+        &self,
+        buf: &mut [u8],
+        ticks: u64,
+    ) -> crate::Result<(usize, Option<Handle>)> {
+        let mut handles = [INVALID_HANDLE; 1];
+        let (bytes, num_handles) = self.read_etc_timeout(buf, &mut handles, ticks)?;
+        match num_handles {
+            0 => Ok((bytes, None)),
+            1 => {
+                // SAFETY: the kernel installed this value as a newly owned
+                // handle in the caller's table; RAII takes it over here.
+                Ok((bytes, Some(unsafe { Handle::from_raw(handles[0]) })))
+            }
+            _ => Err(crate::ErrorCode::InvalidArgs),
+        }
+    }
+
     /// Read bytes plus zero or one transferred handle.
     ///
     /// This is the safe replacement for applications calling [`read_etc`]
