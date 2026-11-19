@@ -565,13 +565,6 @@ impl HshHost {
             query_holder = self.open_query_fresh();
         }
 
-        let fb_allowed = caps.is_none_or(|c| c.fb == FbAccess::ReadOnly);
-        let frame_draw = if fb_allowed {
-            self.frame_draw.as_ref()
-        } else {
-            None
-        };
-
         // Default relative path expansion when pwd != '/' for single path-free `ls`?
         // Only pass explicit args directly as typed by user.
         // Utilities take paths, not a working directory: resolve them here.
@@ -595,6 +588,13 @@ impl HshHost {
         if name == "ls" && owned_args.is_empty() {
             owned_args.push(self.pwd.clone());
         }
+
+        let fb_allowed = caps.is_none_or(|c| c.fb == FbAccess::ReadOnly);
+        let frame_draw = if fb_allowed {
+            self.frame_draw.as_ref()
+        } else {
+            None
+        };
 
         let mut argv_strs: Vec<&str> = Vec::with_capacity(1 + owned_args.len());
         argv_strs.push(&resolved);
