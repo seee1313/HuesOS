@@ -718,9 +718,20 @@ impl InteractiveShell {
             Err(e) => println!("[hsh] hxfs.elf status ERROR: {}", e),
         }
 
-        // 5. External `/bin/fdisk.elf` pipe
-        match smoke_env.eval_script("fdisk list | where type == hxfs", &mut self.host) {
-            Ok(res) if res.status == 0 && res.render_text().contains("HxFS-Root") => {
+        // 5. External `/bin/fdisk.elf` pipe.
+        //
+        //    The disk under `fdisk list` depends on the boot: the in-memory
+        //    demo disk carries a GPT with an `HxFS-Root` partition, while the
+        //    CI machine with an NVMe volume gets a bare `HxFS v7` superfloppy
+        //    (no partition table at all). Both shapes have to survive the pipe
+        //    stage; the column names differ, so the filter follows the shape.
+        let (list_filter, list_expect) = if self.host.hxfs.is_some() {
+            ("fdisk list | where status == OK", "raw-hxfs")
+        } else {
+            ("fdisk list | where type == hxfs", "HxFS-Root")
+        };
+        match smoke_env.eval_script(list_filter, &mut self.host) {
+            Ok(res) if res.status == 0 && res.render_text().contains(list_expect) => {
                 println!("[hsh] fdisk.elf pipe OK");
             }
             Ok(res) => println!(
@@ -849,12 +860,16 @@ impl InteractiveShell {
         }
 
         // 10. `fdisk gpt-init --dry-run` must always be safe, and a real
-        //     init/add/del/verify cycle must round-trip on a throw-away image.
-        //     With HxFS mounted the cycle runs on a file image (real writes,
-        //     real CRC checks); without it, on the seeded in-memory demo disk,
-        //     which still covers init and verify code paths.
-        let file_image = self.host.hxfs.is_some();
-        let image = if file_image { " /disk.img" } else { "" };
+        //     init/add/del/verify cycle must round-trip on a writable disk.
+        //     Both run against the in-memory scratch disk (`/dev/mem`) so the
+        //     live volume on the default target is never touched; the real
+        //     GPT writer, its CRC recomputation and `verify` all run for real.
+        //
+        //     Writing the same cycle to an image *file* inside HxFS is not
+        //     possible yet: the service write path accepts only a whole-file
+        //     rewrite or sequential 4 KiB appends, so the GPT writer's
+        //     `write_at(512)` comes back `Unsupported`.
+        let image = " /dev/mem";
         let dry = smoke_env.eval_script(
             &format!("fdisk gpt-init{image} --dry-run --size 64M"),
             &mut self.host,
@@ -871,18 +886,13 @@ impl InteractiveShell {
             Err(e) => println!("[hsh] fdisk gpt-init dry-run ERROR: {}", e),
         }
 
-        let mut gpt_cycle: Vec<String> = Vec::new();
-        if file_image {
-            gpt_cycle.push(format!("fdisk gpt-init{image} --size 64M"));
-            gpt_cycle.push(format!("fdisk add{image} --type hxfs --size 16M"));
-            gpt_cycle.push(format!("fdisk verify{image}"));
-            gpt_cycle.push(format!("fdisk del 1{image}"));
-            gpt_cycle.push(format!("fdisk verify{image}"));
-        } else {
-            // No filesystem to hold an image: the seeded in-memory GPT still
-            // exercises the verification path end to end.
-            gpt_cycle.push(String::from("fdisk verify"));
-        }
+        let gpt_cycle = [
+            format!("fdisk gpt-init{image} --size 64M"),
+            format!("fdisk add{image} --type hxfs --size 16M"),
+            format!("fdisk verify{image}"),
+            format!("fdisk del 1{image}"),
+            format!("fdisk verify{image}"),
+        ];
         let mut gpt_ok = true;
         for cmd in &gpt_cycle {
             let expects_verify = cmd.starts_with("fdisk verify");

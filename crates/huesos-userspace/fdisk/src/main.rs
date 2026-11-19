@@ -423,6 +423,16 @@ fn open_backend(target: Option<&str>, write: bool, min_lbas: u64) -> Result<Back
             return HxfsImageIo::open(path, write, min_lbas).map(Backend::Hxfs);
         }
     }
+    // `/dev/mem` is the scratch in-memory disk: a writable GPT fixture that
+    // never touches the real device, so `gpt-init`/`add`/`del` can be
+    // exercised on a machine whose only block device already holds a bare
+    // HxFS volume.
+    if target == Some("/dev/mem") {
+        if write {
+            require_write_cap(mask, false)?;
+        }
+        return SparseMemDisk::seeded_demo().map(Backend::Demo);
+    }
     if let Some(h) = stdio::take_cap_handle(CapKind::BlockDev) {
         if write && (mask & (caps_mask::BLOCK_RW | caps_mask::HXFS_RW)) == 0 {
             return Err(String::from("AccessDenied (read-only capability)"));
@@ -501,7 +511,7 @@ fn run() -> i32 {
     let mask = stdio::caps_mask();
     let res: Result<String, String> = match sub {
         "help" | "--help" | "-h" => Ok(String::from(
-            "usage: fdisk <list|--list|inspect|verify|gpt-init|add|del|resize> [opts] [target]\n  --type <hxfs|esp|linux|swap|basic|UUID>  --size <64M|1G|LBAs>  --start <LBA>  --name <label>  --dry-run  --force\n  a target without a GPT but with a bare HxFS superblock is reported as `raw-hxfs`;\n  gpt-init refuses to erase such a volume unless --force is given\n",
+            "usage: fdisk <list|--list|inspect|verify|gpt-init|add|del|resize> [opts] [target]\n  --type <hxfs|esp|linux|swap|basic|UUID>  --size <64M|1G|LBAs>  --start <LBA>  --name <label>  --dry-run  --force\n  a target without a GPT but with a bare HxFS superblock is reported as `raw-hxfs`;\n  gpt-init refuses to erase such a volume unless --force is given;\n  /dev/mem selects the writable in-memory scratch disk (never the real device)\n",
         )),
         "list" | "--list" => {
             let io = match open_backend(target, false, 4096) {
