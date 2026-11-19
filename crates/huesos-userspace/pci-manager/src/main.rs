@@ -39,6 +39,7 @@
 
 extern crate alloc;
 
+use alloc::format;
 use alloc::vec::Vec;
 use core::panic::PanicInfo;
 use huesos_abi::hmcf;
@@ -49,9 +50,7 @@ use huesos_abi::pci_mediation::{
     self, Opcode as MediationOpcode, Request, Response, Status as MediationStatus, ValidRequest,
     ValidationError,
 };
-#[cfg(not(feature = "force-legacy"))]
-use huesos_abi::vmar_flags;
-use huesos_abi::{rights, ResourceKindAbi};
+use huesos_abi::{rights, vmar_flags, ResourceKindAbi};
 use huesos_pci::bar_sizing::{self, NoActiveLeases};
 use huesos_pci::capability;
 use huesos_pci::driver_binding::{
@@ -88,6 +87,8 @@ static HEAP: libcanvas::heap::ScudoHeap = libcanvas::heap::ScudoHeap::new();
 /// one; the region is far from the heap and stack reservations.
 #[cfg(not(feature = "force-legacy"))]
 const CONFIG_WINDOW_VA_BASE: u64 = 0x0000_0001_0000_0000;
+/// Temporary VA used solely while pci-manager programs an endpoint's MSI-X table.
+const MSIX_TEMP_VA_BASE: u64 = 0x0000_0002_0000_0000;
 
 #[unsafe(no_mangle)]
 pub extern "C" fn _start() -> ! {
@@ -110,7 +111,10 @@ pub extern "C" fn _start() -> ! {
     }
     println!("[pci-manager] ready without root descriptors; fail-closed");
 
-    let mut authority = ConfigAuthority::default();
+    let mut authority = ConfigAuthority {
+        storage_off: (hello.detail & pci_manager::HELLO_FLAG_STORAGE_OFF) != 0,
+        ..ConfigAuthority::default()
+    };
     let mut yields = 0u32;
     loop {
         let mut bytes = [0u8; 64];
@@ -177,6 +181,8 @@ struct ConfigAuthority {
     gone_probe_done: bool,
     /// Whether Stage H.3 driver binding and Stage I resource handoff ran.
     binding_published: bool,
+    /// Whether `init.storage=off` disabled NVMe binding/programming (AP-22).
+    storage_off: bool,
     #[cfg_attr(feature = "force-legacy", allow(dead_code))]
     rw_ecam: [Option<Handle>; hmcf::MAX_RECORDS as usize],
     #[cfg_attr(feature = "force-legacy", allow(dead_code))]
@@ -236,6 +242,7 @@ impl Default for ConfigAuthority {
             leases: Vec::new(),
             gone_probe_done: false,
             binding_published: false,
+            storage_off: false,
             rw_ecam: [const { None }; hmcf::MAX_RECORDS as usize],
             rw_ecam_count: 0,
             writable: false,
@@ -1459,7 +1466,7 @@ fn run_driver_binding_and_handoff(
             },
             relocation: RelocationClass::Fixed,
             irq_preference: IrqPreference::MsixThenMsiThenIntx,
-            max_vectors: 4,
+            max_vectors: 16,
             allow_polling_fallback: true,
         },
         DriverManifestSpec {
@@ -1578,6 +1585,20 @@ fn run_driver_binding_and_handoff(
                 score,
             } => {
                 let manifest = &manifests[manifest_index];
+                if manifest.driver_name == "nvme-host" && authority.storage_off {
+                    println!(
+                        "[pci-manager] obs h3-bind bdf={:02x}:{:02x}.{} vendor=0x{:04x} device=0x{:04x} class={:02x}:{:02x}:{:02x} decision=unbound reason=storage-off",
+                        lease.address.bus(),
+                        lease.address.device(),
+                        lease.address.function(),
+                        node.function.vendor_id,
+                        node.function.device_id,
+                        fc.class,
+                        fc.subclass,
+                        fc.prog_if
+                    );
+                    continue;
+                }
                 bound_count = bound_count.saturating_add(1);
                 println!(
                     "[pci-manager] obs h3-bind bdf={:02x}:{:02x}.{} vendor=0x{:04x} device=0x{:04x} class={:02x}:{:02x}:{:02x} decision=matched driver={} score={}",
@@ -1663,6 +1684,275 @@ fn run_driver_binding_and_handoff(
                     .writes
                     .iter()
                     .all(|w| write_policy::validate_write_request(w).is_ok());
+
+                if manifest.driver_name == "nvme-host" {
+                    let bar0 = validation.resources().iter().find(|r| {
+                        r.resource.owner == lease.address
+                            && r.resource.register == ResourceRegister::Bar(0)
+                            && r.cpu_base.is_some()
+                            && r.resource.len >= 0x1000
+                    });
+                    let Some(bar0) = bar0 else {
+                        println!(
+                            "[pci-manager] obs j2-nvme bdf={:02x}:{:02x}.{} status=missing-bar0",
+                            lease.address.bus(),
+                            lease.address.device(),
+                            lease.address.function()
+                        );
+                        continue;
+                    };
+                    let bar0_base = bar0.cpu_base.unwrap_or(0);
+                    let bar0_len = bar0.resource.len;
+                    let Ok(mmio_handle) = libcanvas::device_lease::mint_resource(
+                        &lease.handle,
+                        ResourceKindAbi::Mmio,
+                        lease.generation,
+                        bar0_base,
+                        bar0_len,
+                        true,
+                    ) else {
+                        println!(
+                            "[pci-manager] obs j2-nvme bdf={:02x}:{:02x}.{} status=mmio-mint-failed",
+                            lease.address.bus(),
+                            lease.address.device(),
+                            lease.address.function()
+                        );
+                        continue;
+                    };
+
+                    let max_config_bytes = if cfg!(feature = "force-legacy") {
+                        CONVENTIONAL_CONFIG_BYTES
+                    } else {
+                        ENHANCED_CONFIG_BYTES
+                    };
+                    let mut nvme_programmed = true;
+                    let (irq_base, irq_len, irq_excl, mode_str) = match irq_plan.mode {
+                        InterruptMode::Msix {
+                            vector_count,
+                            base_vector,
+                            table_bir: 0,
+                            table_offset,
+                        } => {
+                            let cmd_req = WriteRequest {
+                                address: lease.address,
+                                header_kind: HeaderKind::Type0Endpoint,
+                                class: WriteClass::CommandControl,
+                                offset: OFFSET_COMMAND,
+                                width: ConfigWidth::Word,
+                                max_config_bytes,
+                                value: u32::from(current_command) | 0x0406,
+                                write_mask: 0x0406,
+                                expected_readback_mask: 0x0406,
+                                allowlist_entry: None,
+                            };
+                            let _ = write_policy::execute_checked_write(&mut transport, &cmd_req);
+                            if let Some(msix) = msix_info {
+                                let cap_off = u16::from(msix.cap_offset) + 2;
+                                let mask_req = WriteRequest {
+                                    address: lease.address,
+                                    header_kind: HeaderKind::Type0Endpoint,
+                                    class: WriteClass::CapabilityControl,
+                                    offset: cap_off,
+                                    width: ConfigWidth::Word,
+                                    max_config_bytes,
+                                    value: 0xC000,
+                                    write_mask: 0xC000,
+                                    expected_readback_mask: 0xC000,
+                                    allowlist_entry: None,
+                                };
+                                let _ =
+                                    write_policy::execute_checked_write(&mut transport, &mask_req);
+
+                                let page_off = u64::from(table_offset) & !0xFFF;
+                                let in_page = u64::from(table_offset) - page_off;
+                                let table_end =
+                                    u64::from(table_offset) + u64::from(vector_count) * 16;
+                                let map_len = ((table_end - page_off) + 0xFFF) & !0xFFF;
+                                if libcanvas::resource::map_self(
+                                    &mmio_handle,
+                                    page_off,
+                                    MSIX_TEMP_VA_BASE,
+                                    map_len,
+                                    vmar_flags::READ
+                                        | vmar_flags::WRITE
+                                        | vmar_flags::USER
+                                        | vmar_flags::SPECIFIC,
+                                )
+                                .is_ok()
+                                {
+                                    for idx in 0..u64::from(vector_count) {
+                                        let entry = MSIX_TEMP_VA_BASE + in_page + idx * 16;
+                                        libcanvas::channel::mmio_store::<u32>(entry + 12, 1);
+                                        libcanvas::channel::mmio_store::<u32>(entry, 0xFEE0_0000);
+                                        libcanvas::channel::mmio_store::<u32>(entry + 4, 0);
+                                        libcanvas::channel::mmio_store::<u32>(
+                                            entry + 8,
+                                            base_vector + idx as u32,
+                                        );
+                                        libcanvas::channel::mmio_store::<u32>(entry + 12, 0);
+                                    }
+                                    let _ = libcanvas::resource::unmap_self(
+                                        &mmio_handle,
+                                        MSIX_TEMP_VA_BASE,
+                                        map_len,
+                                    );
+                                    let unmask_req = WriteRequest {
+                                        value: 0x8000,
+                                        ..mask_req
+                                    };
+                                    let _ = write_policy::execute_checked_write(
+                                        &mut transport,
+                                        &unmask_req,
+                                    );
+                                } else {
+                                    nvme_programmed = false;
+                                }
+                            }
+                            (
+                                u64::from(base_vector),
+                                u64::from(vector_count),
+                                true,
+                                "msix",
+                            )
+                        }
+                        InterruptMode::Msi {
+                            vector_count,
+                            base_vector,
+                            ..
+                        } => {
+                            for req in &irq_plan.writes {
+                                let mut w = *req;
+                                w.max_config_bytes = max_config_bytes;
+                                if write_policy::execute_checked_write(&mut transport, &w).is_err()
+                                {
+                                    nvme_programmed = false;
+                                }
+                            }
+                            let cmd_req = WriteRequest {
+                                address: lease.address,
+                                header_kind: HeaderKind::Type0Endpoint,
+                                class: WriteClass::CommandControl,
+                                offset: OFFSET_COMMAND,
+                                width: ConfigWidth::Word,
+                                max_config_bytes,
+                                value: u32::from(current_command) | 0x0406,
+                                write_mask: 0x0406,
+                                expected_readback_mask: 0x0406,
+                                allowlist_entry: None,
+                            };
+                            let _ = write_policy::execute_checked_write(&mut transport, &cmd_req);
+                            (u64::from(base_vector), u64::from(vector_count), true, "msi")
+                        }
+                        InterruptMode::Intx { gsi, .. } => {
+                            let cmd_req = WriteRequest {
+                                address: lease.address,
+                                header_kind: HeaderKind::Type0Endpoint,
+                                class: WriteClass::CommandControl,
+                                offset: OFFSET_COMMAND,
+                                width: ConfigWidth::Word,
+                                max_config_bytes,
+                                value: (u32::from(current_command) | 0x0006) & !0x0400,
+                                write_mask: 0x0406,
+                                expected_readback_mask: 0x0406,
+                                allowlist_entry: None,
+                            };
+                            let _ = write_policy::execute_checked_write(&mut transport, &cmd_req);
+                            (u64::from(gsi), 1, false, "intx")
+                        }
+                        InterruptMode::Polling | InterruptMode::Msix { .. } => {
+                            let cmd_req = WriteRequest {
+                                address: lease.address,
+                                header_kind: HeaderKind::Type0Endpoint,
+                                class: WriteClass::CommandControl,
+                                offset: OFFSET_COMMAND,
+                                width: ConfigWidth::Word,
+                                max_config_bytes,
+                                value: u32::from(current_command) | 0x0406,
+                                write_mask: 0x0406,
+                                expected_readback_mask: 0x0406,
+                                allowlist_entry: None,
+                            };
+                            let _ = write_policy::execute_checked_write(&mut transport, &cmd_req);
+                            (0xFF, 1, false, "polling")
+                        }
+                    };
+
+                    let Ok(irq_handle) = libcanvas::device_lease::mint_resource(
+                        &lease.handle,
+                        ResourceKindAbi::Irq,
+                        lease.generation,
+                        irq_base,
+                        irq_len,
+                        irq_excl,
+                    ) else {
+                        println!(
+                            "[pci-manager] obs j2-nvme bdf={:02x}:{:02x}.{} status=irq-mint-failed",
+                            lease.address.bus(),
+                            lease.address.device(),
+                            lease.address.function()
+                        );
+                        continue;
+                    };
+
+                    let mut ro_lease_mint_denied = false;
+                    if let Ok(ro_lease) = lease.handle.duplicate(rights::READ | rights::TRANSFER) {
+                        ro_lease_mint_denied = matches!(
+                            libcanvas::device_lease::mint_resource(
+                                &ro_lease,
+                                ResourceKindAbi::Mmio,
+                                lease.generation,
+                                0xFEE0_0000,
+                                0x1000,
+                                true,
+                            ),
+                            Err(ErrorCode::AccessDenied)
+                        );
+                        let _ = bootstrap
+                            .write_handle(pci_manager::DEVICE_LEASE_NVME_RO_LABEL, ro_lease);
+                    }
+                    let mmio_label = format!(
+                        "resource:driver-host-nvme:mmio:{:#x}:{:#x}:excl",
+                        bar0_base, bar0_len
+                    );
+                    let irq_label = format!(
+                        "resource:driver-host-nvme:irq:{:#x}:{:#x}:{}",
+                        irq_base,
+                        irq_len,
+                        if irq_excl { "excl" } else { "shared" }
+                    );
+                    let _ = bootstrap.write_handle(mmio_label.as_bytes(), mmio_handle);
+                    let _ = bootstrap.write_handle(irq_label.as_bytes(), irq_handle);
+
+                    println!(
+                        "[pci-manager] obs i1-irq bdf={:02x}:{:02x}.{} mode={} irq={} writes={} valid_b4={} minted=2 ro_lease_mint_denied={}",
+                        lease.address.bus(),
+                        lease.address.device(),
+                        lease.address.function(),
+                        mode_str,
+                        irq_base,
+                        irq_plan.writes.len(),
+                        all_writes_valid && nvme_programmed,
+                        ro_lease_mint_denied
+                    );
+                    println!(
+                        "[pci-manager] obs i2-dma bdf={:02x}:{:02x}.{} isolation=Trusted",
+                        lease.address.bus(),
+                        lease.address.device(),
+                        lease.address.function()
+                    );
+                    println!(
+                        "[pci-manager] obs j2-nvme bdf={:02x}:{:02x}.{} bar0=0x{:x}+0x{:x} irq=0x{:x}+{} mode={} status=handed-off",
+                        lease.address.bus(),
+                        lease.address.device(),
+                        lease.address.function(),
+                        bar0_base,
+                        bar0_len,
+                        irq_base,
+                        irq_len,
+                        mode_str
+                    );
+                    continue;
+                }
 
                 let mut minted_handles: Vec<Handle> = Vec::new();
                 for res in validation.resources() {

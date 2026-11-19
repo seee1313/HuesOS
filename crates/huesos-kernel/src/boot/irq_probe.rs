@@ -24,11 +24,9 @@
 use core::fmt::Write;
 
 use huesos_object::{register_interrupt, Interrupt, KernelObject, Port};
-use huesos_pci::{command, off, PciAddress};
-
-use super::storage::{
-    map_mmio_window, read_config_space, read_config_u16, read_config_u32, size_bar0,
-    write_config_u16,
+use huesos_pci::{
+    command, off, Bar, ConfigOffset, ConfigSpace, ConfigSpaceKind, ConfigWidth, LegacyConfigPlan,
+    PciAddress, LEGACY_CONFIG_ADDRESS_PORT, LEGACY_CONFIG_DATA_PORT,
 };
 
 const EDU_VENDOR_ID: u16 = 0x1234;
@@ -202,4 +200,145 @@ fn mmio_read32(address: u64) -> u32 {
 fn mmio_write32(address: u64, value: u32) {
     // SAFETY: same BAR0 window and alignment contract as `mmio_read32`.
     unsafe { core::ptr::write_volatile(address as *mut u32, value) }
+}
+
+fn map_mmio_window(phys: u64, len: u64) -> Result<(), huesos_arch::paging::KernelPageError> {
+    use x86_64::structures::paging::PageTableFlags;
+    huesos_arch::paging::map_hhdm_range_flags(
+        phys,
+        len,
+        PageTableFlags::PRESENT
+            | PageTableFlags::WRITABLE
+            | PageTableFlags::NO_CACHE
+            | PageTableFlags::NO_EXECUTE,
+    )
+}
+
+fn read_config_space(location: PciAddress) -> ConfigSpace {
+    let mut bytes = [0u8; 256];
+    let mut offset = 0usize;
+    while offset < bytes.len() {
+        let value = read_config_u32(location, offset);
+        bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+        offset += 4;
+    }
+    ConfigSpace(bytes)
+}
+
+struct Bar0Info {
+    base: u64,
+    len: u64,
+}
+
+fn size_bar0(location: PciAddress, config: &ConfigSpace) -> Option<Bar0Info> {
+    let lo = config.bar_raw(0)?;
+    if lo & 1 != 0 {
+        return None;
+    }
+    let is_64 = ((lo >> 1) & 0x3) == 0b10;
+    let hi = if is_64 {
+        config.bar_raw(1).unwrap_or_default()
+    } else {
+        0
+    };
+    let decoded = huesos_pci::decode_memory_bar(lo, hi, 1);
+    let Bar::Memory { base, .. } = decoded else {
+        return None;
+    };
+    if base == 0 {
+        return None;
+    }
+    let command_before = config.command();
+    let command_sized = command_before & !(command::MEMORY_SPACE | command::BUS_MASTER);
+    write_config_u16(location, off::COMMAND, command_sized);
+    write_config_u32(location, off::BAR0, 0xffff_ffff);
+    if is_64 {
+        write_config_u32(location, off::BAR0 + 4, 0xffff_ffff);
+    }
+    let mask_lo = read_config_u32(location, off::BAR0);
+    let mask_hi = if is_64 {
+        read_config_u32(location, off::BAR0 + 4)
+    } else {
+        0
+    };
+    write_config_u32(location, off::BAR0, lo);
+    if is_64 {
+        write_config_u32(location, off::BAR0 + 4, hi);
+    }
+    write_config_u16(location, off::COMMAND, command_before);
+    let size = if is_64 {
+        let mask = ((mask_hi as u64) << 32) | u64::from(mask_lo & 0xffff_fff0);
+        (!mask).wrapping_add(1)
+    } else {
+        huesos_pci::memory_bar_size(mask_lo)
+    };
+    if size == 0 || !size.is_power_of_two() {
+        return None;
+    }
+    Some(Bar0Info { base, len: size })
+}
+
+fn legacy_plan(
+    location: PciAddress,
+    offset: usize,
+    width: ConfigWidth,
+) -> Option<LegacyConfigPlan> {
+    let raw_offset = u16::try_from(offset).ok()?;
+    let offset = ConfigOffset::try_new(raw_offset, width, ConfigSpaceKind::Conventional).ok()?;
+    LegacyConfigPlan::try_new(location, offset).ok()
+}
+
+fn read_config_u16(location: PciAddress, offset: usize) -> u16 {
+    let Some(plan) = legacy_plan(location, offset, ConfigWidth::Word) else {
+        return u16::MAX;
+    };
+    plan.extract(read_legacy_dword(plan.address_register())) as u16
+}
+
+fn write_config_u16(location: PciAddress, offset: usize, value: u16) {
+    let Some(plan) = legacy_plan(location, offset, ConfigWidth::Word) else {
+        return;
+    };
+    let current = read_legacy_dword(plan.address_register());
+    write_legacy_dword(
+        plan.address_register(),
+        plan.merge(current, u32::from(value)),
+    );
+}
+
+fn read_config_u32(location: PciAddress, offset: usize) -> u32 {
+    let Some(plan) = legacy_plan(location, offset, ConfigWidth::Dword) else {
+        return u32::MAX;
+    };
+    read_legacy_dword(plan.address_register())
+}
+
+fn write_config_u32(location: PciAddress, offset: usize, value: u32) {
+    let Some(plan) = legacy_plan(location, offset, ConfigWidth::Dword) else {
+        return;
+    };
+    write_legacy_dword(plan.address_register(), value);
+}
+
+fn read_legacy_dword(address: u32) -> u32 {
+    use x86_64::instructions::port::Port as IoPort;
+    // SAFETY: test-only `irq_test=1` boot probe accesses PCI config mechanism #1
+    // before userspace starts.
+    unsafe {
+        let mut addr = IoPort::<u32>::new(LEGACY_CONFIG_ADDRESS_PORT);
+        let mut data = IoPort::<u32>::new(LEGACY_CONFIG_DATA_PORT);
+        addr.write(address);
+        data.read()
+    }
+}
+
+fn write_legacy_dword(address: u32, value: u32) {
+    use x86_64::instructions::port::Port as IoPort;
+    // SAFETY: same test-only `irq_test=1` probe contract as `read_legacy_dword`.
+    unsafe {
+        let mut addr = IoPort::<u32>::new(LEGACY_CONFIG_ADDRESS_PORT);
+        let mut data = IoPort::<u32>::new(LEGACY_CONFIG_DATA_PORT);
+        addr.write(address);
+        data.write(value);
+    }
 }

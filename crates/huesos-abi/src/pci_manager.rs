@@ -37,6 +37,9 @@ pub const DEVICE_LEASE_AUTHORITY_LABEL: &[u8] = b"pci-lease-auth";
 /// Label carrying a read-only `DeviceLease` handle (`READ | TRANSFER`)
 /// from PCI Manager to DriverManager / DriverHost (AP-21).
 pub const DEVICE_LEASE_RO_LABEL: &[u8] = b"pci-lease-ro";
+/// Label carrying the read-only `DeviceLease` handle bound specifically to
+/// `driver-host-nvme` (Stage J.2 / AP-22).
+pub const DEVICE_LEASE_NVME_RO_LABEL: &[u8] = b"pci-lease-ro:nvme";
 /// Label carrying a narrow lease-bound `Resource` handle (`Mmio`, `IoPort`,
 /// `Irq`, or `DmaPool`) minted via `DeviceLeaseMintResource` (AP-21).
 pub const LEASE_RESOURCE_LABEL: &[u8] = b"pci-lease-res";
@@ -47,8 +50,11 @@ pub const LEASE_RESOURCE_LABEL: &[u8] = b"pci-lease-res";
 /// manager still requires the legacy `IoPort` capability to be granted
 /// with this flag, otherwise reads answer `NotReady`.
 pub const HELLO_FLAG_FORCE_LEGACY: u32 = 1 << 0;
+/// Kill-switch flag: `init.storage=off` was active, so PCI Manager must
+/// leave NVMe controllers unbound and unconfigured (AP-22).
+pub const HELLO_FLAG_STORAGE_OFF: u32 = 1 << 1;
 /// All hello flags known by version 1.
-pub const HELLO_FLAGS_V1: u32 = HELLO_FLAG_FORCE_LEGACY;
+pub const HELLO_FLAGS_V1: u32 = HELLO_FLAG_FORCE_LEGACY | HELLO_FLAG_STORAGE_OFF;
 
 /// Control operation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

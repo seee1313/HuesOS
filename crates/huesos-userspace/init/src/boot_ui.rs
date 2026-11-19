@@ -185,6 +185,10 @@ impl BootUi {
                         self.end(id, StageState::Done, logger);
                         return StageState::Done;
                     }
+                    ServiceReport::Skipped { name } if name == id => {
+                        self.end(id, StageState::Skipped, logger);
+                        return StageState::Skipped;
+                    }
                     ServiceReport::Degraded { name } if name == id => {
                         // A real answer, not a failure: the service is
                         // up with reduced function. Settle the stage so
@@ -194,6 +198,9 @@ impl BootUi {
                     }
                     ServiceReport::Ready { name } => {
                         self.end(name, StageState::Done, logger);
+                    }
+                    ServiceReport::Skipped { name } => {
+                        self.end(name, StageState::Skipped, logger);
                     }
                     ServiceReport::Degraded { name } => {
                         self.end(name, StageState::Degraded, logger);
@@ -263,6 +270,7 @@ impl BootUi {
             match channel.read_into(&mut buf) {
                 Ok(n) => match parse_report(&buf[..n]) {
                     ServiceReport::Ready { name } => self.end(name, StageState::Done, logger),
+                    ServiceReport::Skipped { name } => self.end(name, StageState::Skipped, logger),
                     ServiceReport::Degraded { name } => {
                         self.end(name, StageState::Degraded, logger)
                     }

@@ -72,6 +72,8 @@ impl Stage {
 pub enum ServiceReport<'a> {
     /// `name:ready`
     Ready { name: &'a [u8] },
+    /// `name:skipped`
+    Skipped { name: &'a [u8] },
     /// `name:degraded`
     Degraded { name: &'a [u8] },
     /// `name:progress:NN`
@@ -94,6 +96,9 @@ pub fn parse_report(message: &[u8]) -> ServiceReport<'_> {
     let rest = &message[colon + 1..];
     if rest == b"ready" {
         return ServiceReport::Ready { name };
+    }
+    if rest == b"skipped" {
+        return ServiceReport::Skipped { name };
     }
     if rest == b"degraded" {
         return ServiceReport::Degraded { name };

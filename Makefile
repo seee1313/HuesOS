@@ -102,6 +102,7 @@ audit-check:
 	python3 tools/check-hues-async-noalloc.py
 	python3 tools/check-poll-budgets.py
 	python3 tools/check-huesos-object-lock-policy.py
+	python3 tools/check-kernel-no-pci.py
 	python3 tools/check-doc-links.py
 	python3 tools/fmt-all.py --check
 
