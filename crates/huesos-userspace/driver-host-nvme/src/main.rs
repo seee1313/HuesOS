@@ -17,6 +17,7 @@ use core::ptr::null_mut;
 use huesos_abi::block::{
     completion_data, AsyncBlockInfo, AsyncBlockOp, AsyncBlockRequest, AsyncBlockStatus,
 };
+use huesos_abi::pci_manager::DEVICE_LEASE_RO_LABEL;
 use huesos_nvme::controller::{Controller, ControllerConfig, NvmeError};
 use huesos_nvme::device::{BarRegion, DeviceResources, DmaRegion};
 use huesos_nvme::pci_transport::PciMmioTransport;
@@ -215,6 +216,8 @@ impl ResourceSlot {
 
 struct NvmeBootstrap {
     slots: [ResourceSlot; REQUIRED_RESOURCES],
+    lease: Option<Handle>,
+    gone_port: Option<Port>,
 }
 
 impl NvmeBootstrap {
@@ -225,7 +228,23 @@ impl NvmeBootstrap {
                 ResourceSlot::empty(ResourceSlotKind::Irq),
                 ResourceSlot::empty(ResourceSlotKind::DmaPool),
             ],
+            lease: None,
+            gone_port: None,
         }
+    }
+
+    fn record_lease(&mut self, handle: Handle) {
+        if self.lease.is_some() || libcanvas::device_lease::query(&handle).is_err() {
+            drop(handle);
+            return;
+        }
+        if let Ok(port) = Port::create() {
+            if libcanvas::device_lease::bind_gone_port(&handle, &port, 0x4E56).is_ok() {
+                self.gone_port = Some(port);
+            }
+        }
+        self.lease = Some(handle);
+        println!("[driver-host:nvme] read-only DeviceLease bound");
     }
 
     fn record(&mut self, label: &[u8], handle: Handle) {
@@ -372,6 +391,15 @@ pub extern "C" fn _start() -> ! {
     }
 
     loop {
+        if let Some(port) = state.gone_port.as_ref() {
+            if let Ok(pkt) = port.read() {
+                if pkt.packet_type == libcanvas::PORT_PACKET_DEVICE_GONE {
+                    println!("[driver-host:nvme] DeviceGone received; quiescing controller");
+                    runtime = None;
+                    let _ = bootstrap.write(b"service:block:nvme:device-gone");
+                }
+            }
+        }
         if let Some(runtime) = runtime.as_mut() {
             runtime.poll(&bootstrap);
         }
@@ -955,6 +983,9 @@ fn drain_bootstrap_resources(bootstrap: &Channel, state: &mut NvmeBootstrap) {
         match bootstrap.read_optional_handle(&mut buf) {
             Ok((n, Some(handle))) if buf[..n].starts_with(RESOURCE_LABEL_PREFIX) => {
                 state.record(&buf[..n], handle);
+            }
+            Ok((n, Some(handle))) if &buf[..n] == DEVICE_LEASE_RO_LABEL => {
+                state.record_lease(handle);
             }
             Ok((_n, Some(handle))) => drop(handle),
             Ok((n, None)) if &buf[..n] == RESOURCE_TRANSFER_COMPLETE => return,

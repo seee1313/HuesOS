@@ -34,6 +34,12 @@ pub const LEGACY_IOPORT_LABEL: &[u8] = b"pci-legacy-ioport";
 /// Label carrying the `DeviceLeaseAuthority` capability from DriverManager to
 /// PCI Manager (AP-20). Must stay `<= MESSAGE_BYTES` (24 bytes).
 pub const DEVICE_LEASE_AUTHORITY_LABEL: &[u8] = b"pci-lease-auth";
+/// Label carrying a read-only `DeviceLease` handle (`READ | TRANSFER`)
+/// from PCI Manager to DriverManager / DriverHost (AP-21).
+pub const DEVICE_LEASE_RO_LABEL: &[u8] = b"pci-lease-ro";
+/// Label carrying a narrow lease-bound `Resource` handle (`Mmio`, `IoPort`,
+/// `Irq`, or `DmaPool`) minted via `DeviceLeaseMintResource` (AP-21).
+pub const LEASE_RESOURCE_LABEL: &[u8] = b"pci-lease-res";
 
 /// Configuration override: serve configuration reads through the
 /// legacy CF8/CFC mechanism (#1) even though ECAM authority is mapped.
@@ -82,6 +88,9 @@ pub enum Opcode {
     /// PCI Manager mapped write-capable config authority and verified B.4
     /// write policy (`detail` carries window count) (AP-17).
     WriteAuthorityReady = 12,
+    /// PCI Manager completed H.3 manifest driver binding and Stage I narrow
+    /// lease-bound resource minting (`detail` carries bound device count) (AP-21).
+    DriverBindingPublished = 13,
 }
 
 impl Opcode {
@@ -99,6 +108,7 @@ impl Opcode {
             10 => Some(Self::WriteUpgradePrepared),
             11 => Some(Self::WriteAuthorityComplete),
             12 => Some(Self::WriteAuthorityReady),
+            13 => Some(Self::DriverBindingPublished),
             _ => None,
         }
     }
@@ -271,6 +281,16 @@ impl Message {
             manager_generation,
             status: Status::Ok,
             detail: window_count,
+        }
+    }
+
+    /// Report that H.3 driver binding and Stage I narrow resource minting completed.
+    pub const fn driver_binding_published(manager_generation: u64, bound_count: u32) -> Self {
+        Self {
+            opcode: Opcode::DriverBindingPublished,
+            manager_generation,
+            status: Status::Ok,
+            detail: bound_count,
         }
     }
 
