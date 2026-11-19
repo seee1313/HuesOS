@@ -1417,9 +1417,40 @@ pub fn terminate_current_process(code: i64) -> ! {
     let Some(process) = process else {
         panic!("terminate_current_process called without a userspace process");
     };
-    if process.set_exit_code(code) {
-        record_process_exit(&process, code);
+    let _ = terminate_process(&process, code, current_cpu);
+    switch_away_from_finished(current_cpu)
+}
+
+/// Terminate `process` from any CPU, without switching away from the caller.
+///
+/// This is the shared body behind both self-exit (`ProcessExit`, faults) and
+/// the capability-checked foreign exit of `ProcessTerminate`:
+///
+/// * publish the exit code (first writer wins) and wake `ProcessWait`
+///   observers plus bound exit Ports,
+/// * mark every task of the process on *every* CPU finished, drop it from its
+///   fair queue, and queue it for stack reclamation,
+/// * publish the exit code on each of the process's thread objects so
+///   `ThreadWait` also returns,
+/// * queue the address space / handle table for the ordinary process-teardown
+///   path, which refuses to free page tables while any CPU still has the
+///   process as its current task, and
+/// * reschedule every other CPU so a thread of the victim that is currently
+///   running leaves the CPU instead of continuing in a doomed address space.
+///
+/// Returns `true` when this call published the exit code, `false` when the
+/// process had already exited (the earlier terminator owns the teardown; a
+/// second teardown of the same address space must never happen).
+pub fn terminate_process(
+    process: &Arc<huesos_object::Process>,
+    code: i64,
+    current_cpu: usize,
+) -> bool {
+    huesos_arch::interrupts::disable();
+    if !process.set_exit_code(code) {
+        return false;
     }
+    record_process_exit(process, code);
     let process_koid = process.koid();
     huesos_object::collect_exited_process(process_koid);
 
@@ -1474,7 +1505,7 @@ pub fn terminate_current_process(code: i64) -> ! {
         }
     }
 
-    PROCESS_TEARDOWN.lock().push(Arc::clone(&process));
+    PROCESS_TEARDOWN.lock().push(Arc::clone(process));
     REAP_PENDING.store(true, Ordering::Release);
     for cpu in 0..MAX_CPUS {
         if cpu != current_cpu && is_cpu_online(cpu) {
@@ -1483,8 +1514,21 @@ pub fn terminate_current_process(code: i64) -> ! {
             }
         }
     }
+    true
+}
 
-    switch_away_from_finished(current_cpu)
+/// Kernel-side implementation of `ProcessTerminate`: resolve the koid the
+/// syscall layer validated back into a live process and end it.
+pub fn terminate_process_by_koid(
+    koid: huesos_object::Koid,
+    code: i64,
+) -> Result<(), huesos_abi::ErrorCode> {
+    let process = huesos_object::lookup_process(koid).ok_or(huesos_abi::ErrorCode::BadHandle)?;
+    // A `false` return means another CPU already published an exit status and
+    // owns the teardown. That is the idempotent contract of the syscall: the
+    // first terminator's status stands and the caller still sees success.
+    let _ = terminate_process(&process, code, cpu_id());
+    Ok(())
 }
 
 fn switch_away_from_finished(cpu: usize) -> ! {

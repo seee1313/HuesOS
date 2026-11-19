@@ -55,10 +55,11 @@ use huesos_abi::{
 
 pub use callbacks::{
     set_clock_fn, set_cpu_mask_fn, set_current_cpu_fn, set_debug_write_fn, set_exit_fn,
-    set_heap_extend_fn, set_process_create_fn, set_process_create_in_job_fn, set_resource_map_fn,
-    set_resource_unmap_fn, set_shutdown_fn, set_thread_exit_fn, set_thread_set_fs_base_fn,
-    set_thread_start_ex_fn, set_thread_start_fn, set_vmar_map_fn, set_vmar_protect_fn,
-    set_vmar_unmap_fn, set_yield_fn, HeapExtendFn, ProcessCreateFn, ProcessCreateInJobFn,
+    set_heap_extend_fn, set_process_create_fn, set_process_create_in_job_fn,
+    set_process_terminate_fn, set_resource_map_fn, set_resource_unmap_fn, set_shutdown_fn,
+    set_thread_exit_fn, set_thread_set_fs_base_fn, set_thread_start_ex_fn, set_thread_start_fn,
+    set_vmar_map_fn, set_vmar_protect_fn, set_vmar_unmap_fn, set_yield_fn, HeapExtendFn,
+    ProcessCreateFn, ProcessCreateInJobFn, ProcessTerminateFn,
     ResourceMapFn, ResourceUnmapFn, ThreadStartExFn, ThreadStartFn, VmarMapFn, VmarOpFn,
 };
 
@@ -247,5 +248,6 @@ pub fn dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> Syscal
         S::ThreadStartEx => process::sys_thread_start_ex(a1 as *const huesos_abi::ThreadStartArgs),
         S::ThreadExit => process::sys_thread_exit(a1 as i64),
         S::ThreadWait => process::sys_thread_wait(a1 as HandleValue, a2 as *mut i64),
+        S::ProcessTerminate => process::sys_process_terminate(a1 as HandleValue, a2 as i64),
     }
 }

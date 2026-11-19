@@ -69,6 +69,33 @@ impl Process {
         Ok(code)
     }
 
+    /// Non-blocking exit probe: `Ok(code)` once the process has exited,
+    /// `Err(ShouldWait)` while it is still running.
+    pub fn exit_code(&self) -> crate::Result<i64> {
+        let mut code: i64 = 0;
+        let ret = raw::syscall2(
+            Syscall::ProcessGetExitCode,
+            self.0.raw() as u64,
+            &mut code as *mut i64 as u64,
+        );
+        raw::decode(ret)?;
+        Ok(code)
+    }
+
+    /// Terminate this process with `code` (`ProcessTerminate`).
+    ///
+    /// Requires a `Process` handle with `WRITE` rights, which is what
+    /// `ProcessCreate`/`spawn_*` hand to the parent. Every thread of the
+    /// target is stopped, `ProcessWait` observers wake with `code`, and the
+    /// target's resources are released through the normal teardown path — the
+    /// same observable outcome as the process exiting on its own. Idempotent:
+    /// terminating an already-exited process succeeds and keeps the first
+    /// exit status.
+    pub fn terminate(&self, code: i64) -> crate::Result<()> {
+        let ret = raw::syscall2(Syscall::ProcessTerminate, self.0.raw() as u64, code as u64);
+        raw::decode(ret).map(|_| ())
+    }
+
     /// Queue a process-exit packet to `port` when this process exits.
     pub fn bind_exit_port(&self, port: &Port, key: u64) -> crate::Result<()> {
         let args = ProcessBindExitPortArgs {

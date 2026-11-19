@@ -1,0 +1,19 @@
+GLIBC_2.38 {
+    global:
+        __isoc23_strtol;
+        __isoc23_strtoll;
+        __isoc23_strtoul;
+        __isoc23_strtoull;
+        __isoc23_strtoimax;
+        __isoc23_strtoumax;
+        __isoc23_strtoll_l;
+        __isoc23_strtoull_l;
+        __isoc23_sscanf;
+        __isoc23_fscanf;
+        __isoc23_vsscanf;
+        __isoc23_vfscanf;
+        strlcpy;
+        strlcat;
+    local:
+        *;
+};

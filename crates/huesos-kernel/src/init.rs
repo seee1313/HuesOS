@@ -241,6 +241,7 @@ pub fn syscall_init() {
     huesos_syscalls::set_thread_start_ex_fn(crate::process::start_thread_ex);
     huesos_syscalls::set_thread_exit_fn(crate::scheduler::exit_current_thread);
     huesos_syscalls::set_thread_set_fs_base_fn(crate::scheduler::set_current_fs_base);
+    huesos_syscalls::set_process_terminate_fn(crate::scheduler::terminate_process_by_koid);
     seed_kernel_entropy();
     huesos_arch::irq_callback::set_irq_callback(handle_irq);
     huesos_arch::ioapic::set_affinity_validator(ioapic_target_online);

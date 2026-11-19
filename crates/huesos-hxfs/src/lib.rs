@@ -1104,6 +1104,58 @@ pub(crate) fn read_superblock<R: BlockReader>(
     })
 }
 
+/// Compact description of a volume whose LBA 0 carries a bare HxFS
+/// superblock — a "superfloppy": the whole device is the filesystem, with no
+/// GPT or other partition table in front of it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BareVolume {
+    /// Linear on-disk format version (6 or 7).
+    pub format_version: u32,
+    /// Type-system version paired with [`Self::format_version`].
+    pub type_system_version: u32,
+    /// Filesystem block size in bytes.
+    pub block_size: u32,
+    /// Instance UUID, stable for the life of the volume.
+    pub instance_uuid: Uuid,
+    /// Published superblock sequence number.
+    pub sequence_number: u64,
+    /// Root state (`ROOT_STATE_CLEAN` or `ROOT_STATE_RECOVERING`).
+    pub root_state: u32,
+}
+
+impl BareVolume {
+    /// Stable layout label, e.g. `HxFS v7 superfloppy`.
+    pub fn layout_label(&self) -> alloc::string::String {
+        alloc::format!("HxFS v{} superfloppy", self.format_version)
+    }
+
+    /// Short layout tag used as a machine-readable column value.
+    pub const fn layout_tag(&self) -> &'static str {
+        "raw-hxfs"
+    }
+}
+
+/// Detect a bare (superfloppy) HxFS volume by validating the superblock at
+/// LBA 0.
+///
+/// This runs the exact validator the mount path uses ([`read_superblock`]:
+/// block type, self-LBA, header size, metadata CRC32C, format GUID, version
+/// pair, feature gates, root state and journal framing), so a volume that
+/// probes clean here is a volume `hxfs-service` would mount. Deliberately no
+/// separate, weaker magic check: a partition tool that accepts an image the
+/// real mount rejects is worse than one that reports `not HxFS`.
+pub fn probe_bare_volume<R: BlockReader>(reader: &mut R) -> Result<BareVolume, HxfsError> {
+    let superblock = read_superblock(reader, 0)?;
+    Ok(BareVolume {
+        format_version: superblock.format_version,
+        type_system_version: superblock.type_system_version,
+        block_size: superblock.block_size,
+        instance_uuid: superblock.instance_uuid,
+        sequence_number: superblock.sequence_number,
+        root_state: superblock.root_state,
+    })
+}
+
 pub(crate) fn read_checkpoint<R: BlockReader>(
     reader: &mut R,
     lba: u64,
@@ -2052,6 +2104,41 @@ mod tests {
         let crc = metadata_crc32c(&block);
         block[32..36].copy_from_slice(&crc.to_le_bytes());
         block
+    }
+
+    #[test]
+    fn bare_volume_probe_recognises_v7_superfloppy() {
+        let image = build_image(false);
+        let mut reader = SliceBlockReader::new(&image);
+        let volume = probe_bare_volume(&mut reader).expect("bare HxFS image must probe");
+        assert_eq!(volume.format_version, FORMAT_VERSION);
+        assert_eq!(volume.type_system_version, TYPE_SYSTEM_VERSION);
+        assert_eq!(volume.block_size, BLOCK_SIZE as u32);
+        assert_eq!(volume.instance_uuid, INSTANCE);
+        assert_eq!(volume.root_state, ROOT_STATE_CLEAN);
+        assert_eq!(volume.layout_tag(), "raw-hxfs");
+        assert_eq!(volume.layout_label(), "HxFS v7 superfloppy");
+    }
+
+    #[test]
+    fn bare_volume_probe_rejects_gpt_and_blank_media() {
+        // A protective-MBR/GPT disk: LBA 1 starts with `EFI PART`.
+        let mut gpt = vec![0u8; BLOCK_SIZE * 8];
+        gpt[BLOCK_SIZE..BLOCK_SIZE + 8].copy_from_slice(b"EFI PART");
+        let mut reader = SliceBlockReader::new(&gpt);
+        assert!(probe_bare_volume(&mut reader).is_err());
+
+        let blank = vec![0u8; BLOCK_SIZE * 8];
+        let mut reader = SliceBlockReader::new(&blank);
+        assert!(probe_bare_volume(&mut reader).is_err());
+    }
+
+    #[test]
+    fn bare_volume_probe_rejects_corrupted_superblock_crc() {
+        let mut image = build_image(false);
+        image[BLOCK_SIZE / 2] ^= 0x01;
+        let mut reader = SliceBlockReader::new(&image);
+        assert_eq!(probe_bare_volume(&mut reader), Err(HxfsError::BadChecksum));
     }
 
     fn build_image(encrypted: bool) -> Vec<u8> {

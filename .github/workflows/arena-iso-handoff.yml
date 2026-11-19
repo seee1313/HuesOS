@@ -71,7 +71,7 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p build
-          python3 tools/mkhxfs.py --output build/nvme.img --blocks 24576 --plain
+          python3 tools/mkhxfs.py --output build/nvme.img --blocks 24576
           ls -l build/nvme.img
 
       - name: Build kernel + userspace + ISO
@@ -101,13 +101,33 @@ jobs:
           echo "status=$status" >> "$GITHUB_OUTPUT"
           exit 0
 
+      - name: Boot smoke gate with NVMe volume
+        id: smoke_nvme
+        if: ${{ inputs.smoke != 'false' }}
+        continue-on-error: true
+        env:
+          CARGO_BUILD_JOBS: "2"
+          ARTIFACT_DIR: ci-artifacts/nvme
+          HUESOS_SMOKE_NVME: build/nvme.img
+          HUESOS_SMOKE_SKIP_BUILD: "1"
+        run: |
+          set +e
+          mkdir -p ci-artifacts/nvme
+          bash scripts/ci-qemu-smoke.sh "${{ inputs.profile || 'release' }}" 2 300 ecam
+          status=$?
+          echo "status=$status" >> "$GITHUB_OUTPUT"
+          exit 0
+
       - name: Collect images and logs
         run: |
           set -euo pipefail
           mkdir -p ci-artifacts/arena-iso
           cp ci-artifacts/qemu-release-smp2.log ci-artifacts/arena-iso/qemu-smoke.log || true
+          cp ci-artifacts/nvme/qemu-release-smp2.log ci-artifacts/arena-iso/qemu-smoke-nvme.log || true
           echo "smoke_status=${{ steps.smoke.outputs.status }}" \
             > ci-artifacts/arena-iso/smoke-status.txt
+          echo "smoke_status_nvme=${{ steps.smoke_nvme.outputs.status }}" \
+            >> ci-artifacts/arena-iso/smoke-status.txt
           echo "profile=${{ inputs.profile || 'release' }}" >> ci-artifacts/arena-iso/smoke-status.txt
           echo "commit=$(git rev-parse HEAD)" >> ci-artifacts/arena-iso/smoke-status.txt
           ls -l build/huesos.iso build/nvme.img
@@ -139,8 +159,9 @@ jobs:
           git push origin "HEAD:${GITHUB_REF_NAME}"
 
       - name: Fail when the boot gate failed
-        if: ${{ inputs.smoke != 'false' && steps.smoke.outputs.status != '0' && steps.smoke.outputs.status != '124' }}
+        if: ${{ inputs.smoke != 'false' && ((steps.smoke.outputs.status != '0' && steps.smoke.outputs.status != '124') || (steps.smoke_nvme.outputs.status != '0' && steps.smoke_nvme.outputs.status != '124')) }}
         run: |
-          echo "boot smoke gate failed with status ${{ steps.smoke.outputs.status }}" >&2
+          echo "boot smoke gate failed: no-disk=${{ steps.smoke.outputs.status }} nvme=${{ steps.smoke_nvme.outputs.status }}" >&2
           tail -200 ci-artifacts/arena-iso/qemu-smoke.log >&2 || true
+          tail -200 ci-artifacts/arena-iso/qemu-smoke-nvme.log >&2 || true
           exit 1

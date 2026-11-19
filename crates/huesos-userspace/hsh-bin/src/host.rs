@@ -11,8 +11,9 @@ use alloc::vec::Vec;
 
 use huesos_abi::auxv::caps_mask;
 use huesos_abi::hxfs::rights as hxfs_rights;
+use huesos_abi::term_ipc::term_to_hsh;
 use huesos_hsh::{CapsSpec, ExecOutcome, FbAccess, HxfsAccess, ShellHost, Table, Value};
-use libcanvas::process::{spawn_elf_from_vmo_with_caps, SpawnCaps};
+use libcanvas::process::{spawn_elf_from_vmo_with_caps, Process, SpawnCaps};
 use libcanvas::{Channel, ErrorCode, Handle, Hxfs, Vmo};
 
 const BOOTFS_HEADER_SIZE: u64 = 16;
@@ -51,6 +52,36 @@ pub struct HshHost {
     pub delegated: Option<DelegatedAction>,
     pub status_hook: Option<fn(&Channel, &str, &str, &str)>,
     pub ipc_out: Option<Channel>,
+    /// Duplicate of the interactive `stdin` channel. A child run polls it for
+    /// `Ctrl-C` so the shell can kill a child that will not finish on its own.
+    pub key_source: Option<Channel>,
+    /// Terminal packets received while a child was running. They are replayed
+    /// to the prompt once the shell is idle again, so typing during a child
+    /// run is never silently dropped.
+    pub pending_packets: Vec<Vec<u8>>,
+    /// Remaining child runs to interrupt without a keystroke. Only the smoke
+    /// gate uses this; it drives the exact production kill path.
+    pub auto_interrupts: usize,
+    /// Whether the most recent child run ended through the `Ctrl-C` path.
+    pub last_child_interrupted: bool,
+}
+
+/// Exit status reported for a child killed by `Ctrl-C` (128 + SIGINT).
+pub const CTRL_C_EXIT_CODE: i64 = 130;
+
+/// True when a terminal packet carries the `Ctrl-C` key.
+///
+/// `terminal` sends `[TAG_KEY_EVENT, len, b'k', 1, 0x03]`; the other two
+/// shapes are accepted because the ASCII ETX byte and the textual form are
+/// both plausible producers (a test harness injecting keys directly, or the
+/// shell's own key decoder spelling out the name).
+fn packet_is_ctrl_c(packet: &[u8]) -> bool {
+    if packet.first() != Some(&term_to_hsh::TAG_KEY_EVENT) || packet.len() < 2 {
+        return false;
+    }
+    let klen = (packet[1] as usize).min(packet.len() - 2);
+    let key = &packet[2..2 + klen];
+    key == &[b'k', 1, 3][..] || key == &[0x03u8][..] || key == &b"ctrl-c"[..]
 }
 
 impl HshHost {
@@ -70,6 +101,10 @@ impl HshHost {
             delegated: None,
             status_hook: None,
             ipc_out,
+            key_source: None,
+            pending_packets: Vec::new(),
+            auto_interrupts: 0,
+            last_child_interrupted: false,
         };
         host.try_connect_hxfs();
         host
@@ -562,7 +597,9 @@ impl HshHost {
         // `write` has (path, data) so only its first argument is a path; the
         // service tools (hxfs/fdisk/pci/acpi/ps) take none at all.
         let path_args = match name {
-            "hxfs" | "fdisk" | "pci" | "acpi" | "ps" => 0,
+            // Service tools and `sleep` take flags/intervals, not paths; a
+            // numeric interval must not be rewritten into `/30`.
+            "hxfs" | "fdisk" | "pci" | "acpi" | "ps" | "sleep" => 0,
             "write" => 1,
             _ => args.len(),
         };
@@ -656,6 +693,11 @@ impl HshHost {
         let mut out_open = true;
         let mut err_open = true;
         let mut chunk = [0u8; 4096];
+        self.last_child_interrupted = false;
+        let mut interrupted = false;
+        // After a kill the child's pipes must close; if the teardown is slow we
+        // still hand the prompt back rather than spin forever on a dead child.
+        let mut interrupt_deadline: Option<u64> = None;
         while out_open || err_open {
             let mut progressed = false;
             if out_open {
@@ -680,6 +722,21 @@ impl HshHost {
                     Err(_) => err_open = false,
                 }
             }
+            // `Ctrl-C` (or the smoke gate's synthetic interrupt) kills the
+            // child through the `ProcessTerminate` capability while the shell
+            // stays alive to reap it.
+            if !interrupted && self.poll_child_interrupt(&process) {
+                interrupted = true;
+                self.last_child_interrupted = true;
+                let now = libcanvas::system::monotonic_ticks().unwrap_or(0);
+                interrupt_deadline = Some(now.saturating_add(300));
+            }
+            if let Some(deadline) = interrupt_deadline {
+                let now = libcanvas::system::monotonic_ticks().unwrap_or(0);
+                if now >= deadline {
+                    break;
+                }
+            }
             if !progressed {
                 libcanvas::process::yield_now();
             }
@@ -693,8 +750,18 @@ impl HshHost {
             }
         }
 
-        let out_str = String::from_utf8_lossy(&stdout_bytes).into_owned();
+        let mut out_str = String::from_utf8_lossy(&stdout_bytes).into_owned();
         let err_str = String::from_utf8_lossy(&stderr_bytes).into_owned();
+        if interrupted {
+            // Conventional echo: the terminal does not render `^C` itself
+            // because the key goes to the shell, not to a foreground process
+            // group, so the shell prints it.
+            if out_str.is_empty() {
+                out_str = String::from("^C\n");
+            } else {
+                out_str = format!("^C\n{out_str}");
+            }
+        }
 
         let output = if exit_code == 0 {
             if let Some(tbl) = Table::from_tsv(&out_str) {
@@ -717,6 +784,54 @@ impl HshHost {
             exit_requested: false,
             child_pid: Some(pid),
         }
+    }
+
+    /// Service terminal input while a child is running.
+    ///
+    /// Returns `true` when the child must be terminated: either a real
+    /// `Ctrl-C` key event arrived, or the smoke gate asked for a synthetic
+    /// interrupt. Every other packet is buffered and replayed to the prompt
+    /// once the shell is idle, so keystrokes typed during a child run are not
+    /// lost.
+    fn poll_child_interrupt(&mut self, child: &Process) -> bool {
+        let auto = if self.auto_interrupts > 0 {
+            self.auto_interrupts -= 1;
+            true
+        } else {
+            false
+        };
+        let mut ctrl_c = false;
+        let mut buf = [0u8; 256];
+        if let Some(ch) = self.key_source.as_ref() {
+            loop {
+                match ch.read_into(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        let packet = &buf[..n];
+                        if packet_is_ctrl_c(packet) {
+                            ctrl_c = true;
+                        } else {
+                            self.pending_packets.push(packet.to_vec());
+                        }
+                    }
+                    Err(ErrorCode::ShouldWait) | Err(ErrorCode::TimedOut) => break,
+                    Err(_) => break,
+                }
+            }
+        }
+        if auto || ctrl_c {
+            // Best effort by design: if the child exited on its own between
+            // the key press and this call, its own status stands (the syscall
+            // is idempotent) and there is nothing left to kill.
+            let _ = child.terminate(CTRL_C_EXIT_CODE);
+            return true;
+        }
+        false
+    }
+
+    /// Take the packets buffered while a child was running.
+    pub fn take_pending_packets(&mut self) -> Vec<Vec<u8>> {
+        core::mem::take(&mut self.pending_packets)
     }
 
     fn cmd_caps(&mut self) -> ExecOutcome {

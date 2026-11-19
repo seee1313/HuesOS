@@ -11,6 +11,7 @@ path = "src/main.rs"
 libcanvas = { path = "../libcanvas", default-features = false, features = ["dyn-client"] }
 huesos-abi = { path = "../../huesos-abi" }
 huesos-gpt = { path = "../../huesos-gpt" }
+huesos-hxfs = { path = "../../huesos-hxfs" }
 
 [profile.release]
 opt-level = 2

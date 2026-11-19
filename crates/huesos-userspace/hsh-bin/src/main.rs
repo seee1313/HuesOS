@@ -12,6 +12,7 @@ extern crate alloc;
 
 mod host;
 
+use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::panic::PanicInfo;
@@ -36,7 +37,7 @@ const HISTORY_MAX: usize = 128;
 const KNOWN_COMMANDS: &[&str] = &[
     "help", "clear", "cls", "echo", "pwd", "cd", "history", "caps", "exit", "font", "doom",
     "snake", "shutdown", "where", "select", "sort", "head", "tail", "count", "grep", "ls", "cat",
-    "stat", "touch", "mkdir", "rm", "mv", "write", "hxfs", "pci", "acpi", "ps", "fdisk",
+    "stat", "touch", "mkdir", "rm", "mv", "write", "hxfs", "pci", "acpi", "ps", "fdisk", "sleep",
 ];
 
 const FDISK_SUBCMDS: &[&str] = &[
@@ -48,6 +49,7 @@ const FDISK_SUBCMDS: &[&str] = &[
     "add",
     "del",
     "resize",
+    "--force",
     "--type",
     "--size",
     "--start",
@@ -339,6 +341,31 @@ impl InteractiveShell {
             }
         }
         None
+    }
+
+    /// Dispatch one terminal packet. Returns `false` when the shell must exit.
+    fn handle_packet(&mut self, packet: &[u8]) -> bool {
+        let Some(tag) = packet.first().copied() else {
+            return true;
+        };
+        match tag {
+            term_to_hsh::TAG_KEY_EVENT if packet.len() >= 2 => {
+                let klen = (packet[1] as usize).min(packet.len() - 2);
+                self.handle_key(&packet[2..2 + klen]);
+            }
+            term_to_hsh::TAG_RUN_SMOKE => {
+                self.run_smokes();
+            }
+            term_to_hsh::TAG_UI_DONE => {
+                self.send_status("hsh.elf");
+                self.send_prompt();
+            }
+            term_to_hsh::TAG_SHUTDOWN => {
+                self.send_packet(&[hsh_to_term::TAG_REQUEST_SHUTDOWN]);
+            }
+            _ => {}
+        }
+        true
     }
 
     fn handle_key(&mut self, raw: &[u8]) {
@@ -796,6 +823,128 @@ impl InteractiveShell {
             Err(e) => println!("[hsh] post-stress query channel ERROR: {}", e),
         }
 
+        // 9. `ProcessTerminate` + `Ctrl-C` child kill.
+        //
+        //    `sleep` long enough that only the kill can end it; the smoke gate
+        //    asks the host for a synthetic interrupt, which drives exactly the
+        //    production path (poll for Ctrl-C -> ProcessTerminate -> reap the
+        //    child with status 130) minus the keystroke itself. The interactive
+        //    behaviour is exercised by typing Ctrl-C at a real `sleep`.
+        self.host.auto_interrupts = 1;
+        let kill = smoke_env.eval_script("sleep 30", &mut self.host);
+        self.host.auto_interrupts = 0;
+        let interrupted = self.host.last_child_interrupted;
+        match kill {
+            Ok(res) if res.status == 130 && interrupted => {
+                println!("[hsh] ProcessTerminate smoke OK (ProcessWait woke with 130)");
+                println!("[hsh] Ctrl-C child kill smoke OK (child killed, shell alive)");
+            }
+            Ok(res) => println!(
+                "[hsh] ProcessTerminate smoke FAILED status={} interrupted={} out={}",
+                res.status,
+                interrupted,
+                res.render_text()
+            ),
+            Err(e) => println!("[hsh] ProcessTerminate smoke ERROR: {}", e),
+        }
+
+        // 10. `fdisk gpt-init --dry-run` must always be safe, and a real
+        //     init/add/del/verify cycle must round-trip on a throw-away image.
+        //     With HxFS mounted the cycle runs on a file image (real writes,
+        //     real CRC checks); without it, on the seeded in-memory demo disk,
+        //     which still covers init and verify code paths.
+        let file_image = self.host.hxfs.is_some();
+        let image = if file_image { " /disk.img" } else { "" };
+        let dry = smoke_env.eval_script(
+            &format!("fdisk gpt-init{image} --dry-run --size 64M"),
+            &mut self.host,
+        );
+        match dry {
+            Ok(res) if res.status == 0 && res.render_text().contains("gpt-init dry-run") => {
+                println!("[hsh] fdisk gpt-init dry-run OK");
+            }
+            Ok(res) => println!(
+                "[hsh] fdisk gpt-init dry-run FAILED status={} out={}",
+                res.status,
+                res.render_text()
+            ),
+            Err(e) => println!("[hsh] fdisk gpt-init dry-run ERROR: {}", e),
+        }
+
+        let mut gpt_cycle: Vec<String> = Vec::new();
+        if file_image {
+            gpt_cycle.push(format!("fdisk gpt-init{image} --size 64M"));
+            gpt_cycle.push(format!("fdisk add{image} --type hxfs --size 16M"));
+            gpt_cycle.push(format!("fdisk verify{image}"));
+            gpt_cycle.push(format!("fdisk del 1{image}"));
+            gpt_cycle.push(format!("fdisk verify{image}"));
+        } else {
+            // No filesystem to hold an image: the seeded in-memory GPT still
+            // exercises the verification path end to end.
+            gpt_cycle.push(String::from("fdisk verify"));
+        }
+        let mut gpt_ok = true;
+        for cmd in &gpt_cycle {
+            let expects_verify = cmd.starts_with("fdisk verify");
+            match smoke_env.eval_script(cmd, &mut self.host) {
+                Ok(res)
+                    if res.status == 0
+                        && (!expects_verify || res.render_text().contains("ok=true")) => {}
+                Ok(res) => {
+                    println!(
+                        "[hsh] fdisk gpt init/add/del/verify FAILED cmd='{}' status={} out={}",
+                        cmd,
+                        res.status,
+                        res.render_text()
+                    );
+                    gpt_ok = false;
+                    break;
+                }
+                Err(e) => {
+                    println!("[hsh] fdisk gpt init/add/del/verify ERROR cmd='{}': {}", cmd, e);
+                    gpt_ok = false;
+                    break;
+                }
+            }
+        }
+        if gpt_ok {
+            println!("[hsh] fdisk gpt init/add/del/verify OK");
+        }
+
+        // 11. Bare `HxFS v7` volume (superfloppy) detection. Only meaningful on
+        //     a boot with a block device; the NVMe smoke attaches one.
+        if self.host.hxfs.is_some() {
+            match smoke_env.eval_script("fdisk list", &mut self.host) {
+                Ok(res) if res.status == 0 && res.render_text().contains("raw-hxfs") => {
+                    println!("[hsh] fdisk raw-hxfs list OK");
+                }
+                Ok(res) => println!(
+                    "[hsh] fdisk raw-hxfs list FAILED status={} out={}",
+                    res.status,
+                    res.render_text()
+                ),
+                Err(e) => println!("[hsh] fdisk raw-hxfs list ERROR: {}", e),
+            }
+            match smoke_env.eval_script("fdisk gpt-init --size 64M", &mut self.host) {
+                Ok(res)
+                    if res.status != 0
+                        && res.render_text().contains("raw-hxfs")
+                        && res.render_text().contains("--force") =>
+                {
+                    println!("[hsh] fdisk raw-hxfs gpt-init guard OK");
+                }
+                Ok(res) => println!(
+                    "[hsh] fdisk raw-hxfs gpt-init guard FAILED status={} out={}",
+                    res.status,
+                    res.render_text()
+                ),
+                Err(e) => println!("[hsh] fdisk raw-hxfs gpt-init guard ERROR: {}", e),
+            }
+        } else {
+            println!("[hsh] fdisk raw-hxfs list SKIP (no block device)");
+            println!("[hsh] fdisk raw-hxfs gpt-init guard SKIP (no block device)");
+        }
+
         self.send_clear();
         self.send_write(
             Some((95, 225, 185)),
@@ -838,7 +987,11 @@ fn send_status_bar(ch: &Channel, pwd: &str, active_proc: &str, caps_summary: &st
     }
 }
 
-fn run_interactive(in_ch: Channel, host: HshHost) -> ! {
+fn run_interactive(in_ch: Channel, mut host: HshHost) -> ! {
+    // The child-wait loop polls a duplicate of the same endpoint so a Ctrl-C
+    // typed while a child runs reaches the shell instead of sitting unread
+    // until the child finishes (or never does).
+    host.key_source = in_ch.duplicate().ok();
     let mut shell = InteractiveShell {
         in_ch,
         host,
@@ -855,25 +1008,20 @@ fn run_interactive(in_ch: Channel, host: HshHost) -> ! {
 
     let mut buf = [0u8; 256];
     loop {
+        // Packets typed while a child was running were buffered by the host;
+        // replay them before blocking again so no keystroke is lost.
+        for packet in shell.host.take_pending_packets() {
+            if !shell.handle_packet(&packet) {
+                exit(0);
+            }
+        }
         match shell.in_ch.read_into_blocking(&mut buf) {
             Ok(0) => {}
-            Ok(n) => match buf[0] {
-                term_to_hsh::TAG_KEY_EVENT if n >= 2 => {
-                    let klen = (buf[1] as usize).min(n - 2);
-                    shell.handle_key(&buf[2..2 + klen]);
+            Ok(n) => {
+                if !shell.handle_packet(&buf[..n]) {
+                    exit(0);
                 }
-                term_to_hsh::TAG_RUN_SMOKE => {
-                    shell.run_smokes();
-                }
-                term_to_hsh::TAG_UI_DONE => {
-                    shell.send_status("hsh.elf");
-                    shell.send_prompt();
-                }
-                term_to_hsh::TAG_SHUTDOWN => {
-                    shell.send_packet(&[hsh_to_term::TAG_REQUEST_SHUTDOWN]);
-                }
-                _ => {}
-            },
+            }
             Err(ErrorCode::ShouldWait) | Err(ErrorCode::TimedOut) => {
                 libcanvas::process::yield_now();
             }

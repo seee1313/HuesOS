@@ -43,16 +43,41 @@ mkdir -p "$artifact_dir"
 log="$artifact_dir/qemu-${profile}-smp${cpus}.log"
 rm -f "$log"
 
-case "$profile" in
-    debug) CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-1}" make iso PROFILE=debug ;;
-    release) CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-1}" make iso-release ;;
-    *) echo "unsupported profile: $profile" >&2; exit 2 ;;
-esac
+if [[ "${HUESOS_SMOKE_SKIP_BUILD:-0}" == "1" ]]; then
+    # A second scenario (e.g. the NVMe boot) reuses the ISO the first run built.
+    if [[ ! -f build/huesos.iso ]]; then
+        echo "HUESOS_SMOKE_SKIP_BUILD=1 but build/huesos.iso is missing" >&2
+        exit 2
+    fi
+    echo "[smoke] reusing existing build/huesos.iso"
+else
+    case "$profile" in
+        debug) CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-1}" make iso PROFILE=debug ;;
+        release) CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-1}" make iso-release ;;
+        *) echo "unsupported profile: $profile" >&2; exit 2 ;;
+    esac
+fi
+
+# Optional NVMe volume. The disk boot exercises the storage path (HxFS service,
+# raw superfloppy detection in fdisk, block-service capability grants), so it
+# carries its own extra markers below.
+nvme_args=()
+if [[ -n "${HUESOS_SMOKE_NVME:-}" ]]; then
+    if [[ ! -f "${HUESOS_SMOKE_NVME}" ]]; then
+        echo "HUESOS_SMOKE_NVME=${HUESOS_SMOKE_NVME} does not exist" >&2
+        exit 2
+    fi
+    nvme_args=(
+        -drive "id=nvme0,if=none,format=raw,file=${HUESOS_SMOKE_NVME}"
+        -device "nvme,serial=huesosnvme,drive=nvme0"
+    )
+fi
 
 set +e
 timeout "${timeout_seconds}s" qemu-system-x86_64 \
     -machine q35 -cpu qemu64 -smp "$cpus" -m 512M \
     -bios third_party/ovmf/OVMF.fd -cdrom build/huesos.iso \
+    "${nvme_args[@]}" \
     -net none -display none -serial "file:$log" \
     -no-reboot -no-shutdown
 status=$?
@@ -165,6 +190,10 @@ required+=(
     '[hsh] @caps(hxfs=none,bootfs=none) enforcement OK'
     '[hsh] consecutive spawn stress OK (30 spawns)'
     '[hsh] post-stress query channel OK'
+    '[hsh] ProcessTerminate smoke OK'
+    '[hsh] Ctrl-C child kill smoke OK'
+    '[hsh] fdisk gpt-init dry-run OK'
+    '[hsh] fdisk gpt init/add/del/verify OK'
     '[terminal] keyboard service online, starting /bin/hsh.elf session'
     '[init] FrameDraw duplicate self-check OK'
     '[init] stage selftest ok'
@@ -172,6 +201,14 @@ required+=(
     '[init] stage summary ok terminal'
     '[init] boot stages complete:'
 )
+
+if [[ -n "${HUESOS_SMOKE_NVME:-}" ]]; then
+    required+=(
+        '[hxfs] service started'
+        '[hsh] fdisk raw-hxfs list OK'
+        '[hsh] fdisk raw-hxfs gpt-init guard OK'
+    )
+fi
 
 for marker in "${required[@]}"; do
     if ! grep -Fq "$marker" "$log"; then
