@@ -201,6 +201,28 @@ fn main() {
         &[],
         &[],
     );
+    let smoke_plugin_so = build_c_shared_lib(
+        &userspace_root,
+        "smoke-plugin",
+        "plugin.c",
+        "libsmoke_plugin.so",
+        &libcanvas_so,
+    );
+    let dyn_c_smoke = build_c_dynamic_program(
+        &userspace_root,
+        "dyn-c-smoke",
+        "main.c",
+        "dyn-c-smoke.elf",
+        &libcanvas_so,
+    );
+    let dyn_rust_smoke = build_userspace_dynamic_program(
+        &userspace_root,
+        "dyn-rust-smoke",
+        "huesos-dyn-rust-smoke",
+        profile,
+        &[],
+        &[],
+    );
     let _bootfs = build_bootfs_image(
         &manifest_dir,
         BootfsInputs {
@@ -214,6 +236,7 @@ fn main() {
             doom: &doom,
             ld_huesos: &ld_huesos,
             libcanvas_so: &libcanvas_so,
+            smoke_plugin_so: &smoke_plugin_so,
         },
     );
     let init = build_userspace_program(
@@ -225,6 +248,8 @@ fn main() {
             ("HUESOS_DRIVER_MANAGER_PATH", driver_manager.as_os_str()),
             ("HUESOS_TERMINAL_PATH", terminal.as_os_str()),
             ("HUESOS_FAULT_PROBE_PATH", fault_probe.as_os_str()),
+            ("HUESOS_DYN_C_SMOKE_PATH", dyn_c_smoke.as_os_str()),
+            ("HUESOS_DYN_RUST_SMOKE_PATH", dyn_rust_smoke.as_os_str()),
             (
                 "HUESOS_LIFECYCLE_WAIT_STRESS",
                 OsStr::new(&lifecycle_wait_stress),
@@ -342,6 +367,7 @@ fn track_userspace_inputs(userspace_root: &Path) {
         "terminal",
         "doom",
         "fault-probe",
+        "dyn-rust-smoke",
         "ld-huesos",
     ] {
         println!(
@@ -353,6 +379,21 @@ fn track_userspace_inputs(userspace_root: &Path) {
             userspace_root.join(program).join("Cargo.toml").display()
         );
     }
+    println!(
+        "cargo:rerun-if-changed={}",
+        userspace_root
+            .join("smoke-plugin")
+            .join("plugin.c")
+            .display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        userspace_root.join("dyn-c-smoke").join("main.c").display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        userspace_root.join("libcanvas").join("include").display()
+    );
     // The userspace binaries embed workspace crates (huesos-hxfs,
     // huesos-abi, huesos-scudo); a change there must re-run
     // this build script so the recompiled binaries are re-embedded.
@@ -371,6 +412,13 @@ fn track_userspace_inputs(userspace_root: &Path) {
     println!(
         "cargo:rerun-if-changed={}",
         userspace_root.join("libcanvas").join("src").display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        userspace_root
+            .join("libcanvas")
+            .join("libcanvas.ver")
+            .display()
     );
     println!(
         "cargo:rerun-if-changed={}",
@@ -562,17 +610,18 @@ fn build_libcanvas_so(userspace_root: &Path, profile: &str) -> PathBuf {
         }
         None => lib_dir.join("target-cdylib"),
     };
+    let ver_script = lib_dir.join("libcanvas.ver");
     let mut command = Command::new(env::var("CARGO").unwrap_or_else(|_| "cargo".into()));
     command
         .current_dir(&lib_dir)
+        .env_remove("RUSTFLAGS")
         .env_remove("CARGO_ENCODED_RUSTFLAGS")
-        .env("RUSTFLAGS", "-C link-arg=-soname=libcanvas.so")
         .args([
             "rustc",
             "--release",
             "--lib",
             "--crate-type",
-            "cdylib",
+            "staticlib",
             "--no-default-features",
             "--features",
             "c-abi",
@@ -588,21 +637,45 @@ fn build_libcanvas_so(userspace_root: &Path, profile: &str) -> PathBuf {
         .arg("--target-dir")
         .arg(&target_dir);
 
-    let status = command
-        .status()
-        .expect("failed to invoke cargo for libcanvas.so build");
+    let status = match command.status() {
+        Ok(s) => s,
+        Err(err) => {
+            eprintln!("failed to invoke cargo for libcanvas staticlib build: {err}");
+            std::process::exit(1);
+        }
+    };
     if !status.success() {
-        panic!("building libcanvas.so failed");
+        eprintln!("building libcanvas staticlib failed");
+        std::process::exit(1);
     }
 
-    let so_path = target_dir
-        .join("x86_64-huesos-userspace-dyn")
-        .join(profile)
-        .join("liblibcanvas.so");
+    let out_dir = target_dir.join("x86_64-huesos-userspace-dyn").join(profile);
+    let archive_path = out_dir.join("liblibcanvas.a");
     assert!(
-        so_path.exists(),
-        "expected libcanvas.so at {}",
-        so_path.display()
+        archive_path.exists(),
+        "expected libcanvas staticlib at {}",
+        archive_path.display()
+    );
+    let so_path = out_dir.join("libcanvas.so");
+    run_checked_cmd(
+        lld_gnu_command()
+            .args([
+                "-shared",
+                "--gc-sections",
+                "--eh-frame-hdr",
+                "-z",
+                "now",
+                "-z",
+                "relro",
+                "-soname=libcanvas.so",
+            ])
+            .arg(format!("--version-script={}", ver_script.display()))
+            .arg("--whole-archive")
+            .arg(&archive_path)
+            .arg("--no-whole-archive")
+            .arg("-o")
+            .arg(&so_path),
+        "linking libcanvas.so with rust-lld",
     );
 
     // Stage a `libcanvas.so` copy at the `-L` directory referenced by
@@ -619,15 +692,178 @@ fn build_libcanvas_so(userspace_root: &Path, profile: &str) -> PathBuf {
         std::process::exit(1);
     }
     let staged_so = link_dir.join("libcanvas.so");
-    if let Err(error) = fs::copy(&so_path, &staged_so) {
-        eprintln!(
-            "failed to stage {} -> {}: {error}",
-            so_path.display(),
-            staged_so.display()
-        );
-        std::process::exit(1);
+    if staged_so != so_path {
+        if let Err(error) = fs::copy(&so_path, &staged_so) {
+            eprintln!(
+                "failed to stage {} -> {}: {error}",
+                so_path.display(),
+                staged_so.display()
+            );
+            std::process::exit(1);
+        }
     }
     staged_so
+}
+
+fn lld_gnu_command() -> Command {
+    let rustc = env::var_os("RUSTC").unwrap_or_else(|| OsStr::new("rustc").to_os_string());
+    if let Ok(output) = Command::new(rustc)
+        .args(["--print", "target-libdir"])
+        .output()
+    {
+        if output.status.success() {
+            let libdir = String::from_utf8_lossy(&output.stdout);
+            if let Some(target_dir) = Path::new(libdir.trim()).parent() {
+                let rust_lld = target_dir.join("bin").join("rust-lld");
+                if rust_lld.is_file() {
+                    let mut cmd = Command::new(rust_lld);
+                    cmd.args(["-flavor", "gnu"]);
+                    return cmd;
+                }
+                let gcc_ld = target_dir.join("bin").join("gcc-ld").join("ld.lld");
+                if gcc_ld.is_file() {
+                    return Command::new(gcc_ld);
+                }
+            }
+        }
+    }
+    Command::new("ld.lld")
+}
+
+fn run_checked_cmd(cmd: &mut Command, label: &str) {
+    match cmd.status() {
+        Ok(status) if status.success() => {}
+        Ok(status) => {
+            eprintln!("{label} failed with status {status}");
+            std::process::exit(1);
+        }
+        Err(err) => {
+            eprintln!("failed to invoke {label}: {err}");
+            std::process::exit(1);
+        }
+    }
+}
+
+fn build_c_shared_lib(
+    userspace_root: &Path,
+    dir_name: &str,
+    src_file: &str,
+    so_name: &str,
+    libcanvas_so: &Path,
+) -> PathBuf {
+    let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap_or_default()).join(dir_name);
+    if let Err(error) = fs::create_dir_all(&out_dir) {
+        eprintln!("failed to create {}: {error}", out_dir.display());
+        std::process::exit(1);
+    }
+    let obj_path = out_dir.join("lib.o");
+    let so_path = out_dir.join(so_name);
+    let include_dir = userspace_root.join("libcanvas").join("include");
+    let src_path = userspace_root.join(dir_name).join(src_file);
+    run_checked_cmd(
+        Command::new("gcc")
+            .args([
+                "-ffreestanding",
+                "-fno-stack-protector",
+                "-mno-red-zone",
+                "-fPIC",
+                "-O2",
+                "-Wall",
+                "-Wextra",
+                "-Werror",
+            ])
+            .arg("-I")
+            .arg(&include_dir)
+            .arg("-c")
+            .arg(&src_path)
+            .arg("-o")
+            .arg(&obj_path),
+        "compiling C shared library",
+    );
+    let lib_dir = libcanvas_so.parent().unwrap_or_else(|| Path::new("."));
+    run_checked_cmd(
+        lld_gnu_command()
+            .args([
+                "-shared",
+                "--gc-sections",
+                "--eh-frame-hdr",
+                "-z",
+                "now",
+                "-z",
+                "relro",
+            ])
+            .arg(format!("-soname={so_name}"))
+            .arg(&obj_path)
+            .arg("-L")
+            .arg(lib_dir)
+            .arg("-lcanvas")
+            .arg("-o")
+            .arg(&so_path),
+        "linking C shared library",
+    );
+    so_path
+}
+
+fn build_c_dynamic_program(
+    userspace_root: &Path,
+    dir_name: &str,
+    src_file: &str,
+    bin_name: &str,
+    libcanvas_so: &Path,
+) -> PathBuf {
+    let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap_or_default()).join(dir_name);
+    if let Err(error) = fs::create_dir_all(&out_dir) {
+        eprintln!("failed to create {}: {error}", out_dir.display());
+        std::process::exit(1);
+    }
+    let obj_path = out_dir.join("main.o");
+    let bin_path = out_dir.join(bin_name);
+    let include_dir = userspace_root.join("libcanvas").join("include");
+    let src_path = userspace_root.join(dir_name).join(src_file);
+    run_checked_cmd(
+        Command::new("gcc")
+            .args([
+                "-ffreestanding",
+                "-fno-stack-protector",
+                "-mno-red-zone",
+                "-fPIE",
+                "-O2",
+                "-Wall",
+                "-Wextra",
+                "-Werror",
+            ])
+            .arg("-I")
+            .arg(&include_dir)
+            .arg("-c")
+            .arg(&src_path)
+            .arg("-o")
+            .arg(&obj_path),
+        "compiling C dynamic binary",
+    );
+    let lib_dir = libcanvas_so.parent().unwrap_or_else(|| Path::new("."));
+    run_checked_cmd(
+        lld_gnu_command()
+            .args([
+                "-pie",
+                "--gc-sections",
+                "--eh-frame-hdr",
+                "-z",
+                "now",
+                "-z",
+                "relro",
+                "--dynamic-linker=/lib/ld-huesos.so",
+                "-e",
+                "_start",
+            ])
+            .arg(&obj_path)
+            .arg("-L")
+            .arg(lib_dir)
+            .arg("-lcanvas")
+            .arg("-o")
+            .arg(&bin_path),
+        "linking C dynamic binary",
+    );
+    bin_path
 }
 
 struct BootFsFile {
@@ -646,6 +882,7 @@ struct BootfsInputs<'a> {
     doom: &'a Path,
     ld_huesos: &'a Path,
     libcanvas_so: &'a Path,
+    smoke_plugin_so: &'a Path,
 }
 
 fn build_bootfs_image(manifest_dir: &Path, inputs: BootfsInputs<'_>) -> PathBuf {
@@ -794,6 +1031,10 @@ fn build_bootfs_image(manifest_dir: &Path, inputs: BootfsInputs<'_>) -> PathBuf 
         BootFsFile {
             path: "/lib/libcanvas.so",
             data: read_build_input(inputs.libcanvas_so, "libcanvas.so"),
+        },
+        BootFsFile {
+            path: "/lib/libsmoke_plugin.so",
+            data: read_build_input(inputs.smoke_plugin_so, "libsmoke_plugin.so"),
         },
         BootFsFile {
             path: "/data/freedoom1.wad",

@@ -52,6 +52,9 @@ pub type ResourceUnmapFn =
 pub type HeapExtendFn = fn(HeapExtendArgs) -> Result<u64, ErrorCode>;
 /// Kernel callback type used by the syscall layer to start a suspended thread.
 pub type ThreadStartFn = fn(&huesos_object::Thread, u64, u64) -> Result<u64, ErrorCode>;
+/// Kernel callback type used to start a suspended intra-process thread with
+/// explicit `arg0` (`rdi`) and `fs_base`.
+pub type ThreadStartExFn = fn(&huesos_object::Thread, u64, u64, u64, u64) -> Result<u64, ErrorCode>;
 /// Kernel callback type used by `ThreadSetFsBase` to update the calling
 /// thread's `MSR_FS_BASE`.
 pub type ThreadSetFsBaseFn = fn(u64) -> Result<(), ErrorCode>;
@@ -74,6 +77,10 @@ pub(crate) static RESOURCE_UNMAP_FN: Mutex<Option<ResourceUnmapFn>> = Mutex::new
 pub(crate) static HEAP_EXTEND_FN: Mutex<Option<HeapExtendFn>> = Mutex::new(None);
 /// Global thread-start callback (set by the kernel scheduler/process layer).
 pub(crate) static THREAD_START_FN: Mutex<Option<ThreadStartFn>> = Mutex::new(None);
+/// Global extended thread-start callback (set by the kernel scheduler/process layer).
+pub(crate) static THREAD_START_EX_FN: Mutex<Option<ThreadStartExFn>> = Mutex::new(None);
+/// Global single-thread exit callback (set by the kernel scheduler).
+pub(crate) static THREAD_EXIT_FN: Mutex<Option<fn(i64) -> !>> = Mutex::new(None);
 /// Global thread `FS_BASE` callback (set by the kernel scheduler).
 pub(crate) static THREAD_SET_FS_BASE_FN: Mutex<Option<ThreadSetFsBaseFn>> = Mutex::new(None);
 
@@ -155,6 +162,16 @@ pub fn set_heap_extend_fn(f: HeapExtendFn) {
 /// Set the thread-start function. Called once by kernel init.
 pub fn set_thread_start_fn(f: ThreadStartFn) {
     *THREAD_START_FN.lock() = Some(f);
+}
+
+/// Set the extended thread-start function. Called once by kernel init.
+pub fn set_thread_start_ex_fn(f: ThreadStartExFn) {
+    *THREAD_START_EX_FN.lock() = Some(f);
+}
+
+/// Set the single-thread exit function. Called once by kernel init.
+pub fn set_thread_exit_fn(f: fn(i64) -> !) {
+    *THREAD_EXIT_FN.lock() = Some(f);
 }
 
 /// Set the thread `FS_BASE` update function. Called once by kernel init.

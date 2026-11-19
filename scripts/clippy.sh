@@ -21,7 +21,7 @@ RUSTFLAGS="-D warnings" cargo check --workspace --tests --exclude huesos-boot \
 # dependency ELFs merely to lint source.
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
-for name in driver-manager terminal doom fault-probe bootfs input-host nvme-host hxfs-service acpi-manager shutdown-broker key-broker; do
+for name in driver-manager terminal doom fault-probe dyn-c-smoke dyn-rust-smoke bootfs input-host nvme-host hxfs-service acpi-manager shutdown-broker key-broker; do
     : > "$TMP/$name"
 done
 
@@ -42,6 +42,8 @@ done
     HUESOS_DRIVER_MANAGER_PATH="$TMP/driver-manager" \
     HUESOS_TERMINAL_PATH="$TMP/terminal" \
     HUESOS_FAULT_PROBE_PATH="$TMP/fault-probe" \
+    HUESOS_DYN_C_SMOKE_PATH="$TMP/dyn-c-smoke" \
+    HUESOS_DYN_RUST_SMOKE_PATH="$TMP/dyn-rust-smoke" \
     HUESOS_ACPI_MANAGER_PATH="$TMP/acpi-manager" \
     HUESOS_SHUTDOWN_BROKER_PATH="$TMP/shutdown-broker" \
     HUESOS_KEY_BROKER_PATH="$TMP/key-broker" \
@@ -60,7 +62,7 @@ done
         cargo clippy --release --features pci-force-legacy -- -D warnings
 )
 
-for program in driver-host-input driver-host-nvme hxfs-service terminal doom fault-probe acpi-manager uacpi-runtime pci-manager shutdown-broker key-broker ld-huesos; do
+for program in driver-host-input driver-host-nvme hxfs-service terminal doom fault-probe dyn-rust-smoke acpi-manager uacpi-runtime pci-manager shutdown-broker key-broker ld-huesos; do
     (
         cd "crates/huesos-userspace/$program"
         cargo clippy --release -- -D warnings

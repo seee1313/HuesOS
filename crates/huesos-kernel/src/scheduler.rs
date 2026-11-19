@@ -460,7 +460,7 @@ impl Scheduler {
             huesos_arch::gdt::set_kernel_stack(VirtAddr::new(stack_top));
             huesos_arch::syscall::set_kernel_stack(stack_top);
         }
-        if let TaskKind::User { process } = &task.kind {
+        if let TaskKind::User { process, .. } = &task.kind {
             huesos_object::set_current_process(Arc::clone(process));
         }
     }
@@ -490,7 +490,7 @@ impl Scheduler {
 
         // 2. Update stats for currently running task
         if self.current > 0 {
-            if let TaskKind::User { process } = &self.tasks[self.current].kind {
+            if let TaskKind::User { process, .. } = &self.tasks[self.current].kind {
                 let _ = process.charge_cpu_tick();
             }
             // Charge the running task's Job with one tick of service. This
@@ -1251,6 +1251,23 @@ pub fn spawn_user_thread_on_cpu(
     cr3: u64,
     cpu: usize,
 ) -> Option<u64> {
+    spawn_user_thread_on_cpu_ex(name, process, None, entry_point, user_rsp, 0, 0, cr3, cpu)
+}
+
+/// Spawn a userspace task with an optional [`huesos_object::Thread`] binding,
+/// initial `rdi` argument (`arg0`), and initial `MSR_FS_BASE`.
+#[allow(clippy::too_many_arguments)]
+pub fn spawn_user_thread_on_cpu_ex(
+    name: &[u8; 32],
+    process: Arc<Process>,
+    thread: Option<Arc<huesos_object::Thread>>,
+    entry_point: u64,
+    user_rsp: u64,
+    arg0: u64,
+    fs_base: u64,
+    cr3: u64,
+    cpu: usize,
+) -> Option<u64> {
     if cpu >= MAX_CPUS || !is_cpu_online(cpu) {
         return None;
     }
@@ -1261,17 +1278,22 @@ pub fn spawn_user_thread_on_cpu(
     };
     // Drive the policy transition before publishing the first runnable task.
     let _ = process.start();
+    process.increment_active_threads();
+    let proc_for_rollback = Arc::clone(&process);
     let mut guard = PER_CPU_SCHEDULERS[cpu].lock();
     let Some(id) = guard.add_task(cpu, |id| {
-        Task::new_user(
+        Task::new_user_with_thread(
             id,
             *name,
             process,
+            thread,
             crate::process::user_entry_trampoline,
             cr3,
+            fs_base,
         )
     }) else {
         drop(guard);
+        let _ = proc_for_rollback.decrement_active_threads();
         huesos_arch::interrupts::enable();
         return None;
     };
@@ -1279,7 +1301,7 @@ pub fn spawn_user_thread_on_cpu(
     // Publish startup metadata only after releasing the rank-60 scheduler.
     // Interrupts remain disabled, so this CPU cannot run the new task before
     // its rank-40 process record is visible.
-    crate::process::queue_user_entry(id, entry_point, user_rsp);
+    crate::process::queue_user_entry_ex(id, entry_point, user_rsp, arg0, fs_base);
     huesos_arch::interrupts::enable();
 
     if cpu != cpu_id() {
@@ -1290,12 +1312,13 @@ pub fn spawn_user_thread_on_cpu(
     Some(id)
 }
 
-/// Mark the currently running task as finished (won't be scheduled again)
-/// and switch away from it. Never returns.
-pub fn exit_current_task(code: i64) -> ! {
+/// Exit only the currently running userspace thread with `code`. If it is the
+/// last active thread of its process, tears down the entire process as well.
+pub fn exit_current_thread(code: i64) -> ! {
     huesos_arch::interrupts::disable();
     let cpu = cpu_id();
-    let mut process_to_signal: Option<alloc::sync::Arc<huesos_object::Process>> = None;
+    let mut process_to_check: Option<Arc<Process>> = None;
+    let mut thread_to_exit: Option<Arc<huesos_object::Thread>> = None;
     let mut reap_id: Option<u64> = None;
     {
         let mut guard = PER_CPU_SCHEDULERS[cpu].lock();
@@ -1304,8 +1327,9 @@ pub fn exit_current_task(code: i64) -> ! {
             task.finished.store(true, Ordering::Relaxed);
             task.blocked.store(false, Ordering::Relaxed);
             reap_id = Some(task.id);
-            if let crate::task::TaskKind::User { process } = &task.kind {
-                process_to_signal = Some(alloc::sync::Arc::clone(process));
+            if let crate::task::TaskKind::User { process, thread } = &task.kind {
+                process_to_check = Some(Arc::clone(process));
+                thread_to_exit = thread.as_ref().map(Arc::clone);
             }
             if let SchedPolicy::Fair { vruntime, .. } = task.sched_policy {
                 let id = task.id;
@@ -1313,30 +1337,61 @@ pub fn exit_current_task(code: i64) -> ! {
             }
         }
     }
-    if let Some(proc) = process_to_signal {
-        if proc.set_exit_code(code) {
-            record_process_exit(&proc, code);
+    if let Some(thread) = thread_to_exit {
+        let _ = thread.set_exit_code(code);
+    }
+    if let Some(proc) = process_to_check {
+        let prev = proc.decrement_active_threads();
+        if prev <= 1 {
+            if proc.set_exit_code(code) {
+                record_process_exit(&proc, code);
+            }
+            huesos_object::collect_exited_process(proc.koid());
+            PROCESS_TEARDOWN.lock().push(proc);
+            REAP_PENDING.store(true, Ordering::Release);
         }
-        huesos_object::collect_exited_process(proc.koid());
-        PROCESS_TEARDOWN.lock().push(proc);
-        REAP_PENDING.store(true, Ordering::Release);
     }
     if let Some(id) = reap_id {
         REAP_QUEUE.lock().push(id);
         REAP_PENDING.store(true, Ordering::Release);
     }
-    loop {
-        let mut guard = PER_CPU_SCHEDULERS[cpu].lock();
-        let switch_context = guard.tick();
-        drop(guard);
+    switch_away_from_finished(cpu)
+}
 
-        if let Some(target) = switch_context {
-            perform_context_switch(target);
-        }
-        huesos_arch::interrupts::enable();
-        huesos_arch::hlt();
-        huesos_arch::interrupts::disable();
+/// Mark the current process (and all of its sibling threads) as finished and
+/// switch away. Never returns.
+pub fn exit_current_task(code: i64) -> ! {
+    huesos_arch::interrupts::disable();
+    let cpu = cpu_id();
+    let is_user = {
+        let guard = PER_CPU_SCHEDULERS[cpu].lock();
+        matches!(
+            guard.current_task().map(|t| &t.kind),
+            Some(TaskKind::User { .. })
+        )
+    };
+    if is_user {
+        terminate_current_process(code);
     }
+    let mut reap_id: Option<u64> = None;
+    {
+        let mut guard = PER_CPU_SCHEDULERS[cpu].lock();
+        let current_idx = guard.current;
+        if let Some(task) = guard.tasks.get_mut(current_idx) {
+            task.finished.store(true, Ordering::Relaxed);
+            task.blocked.store(false, Ordering::Relaxed);
+            reap_id = Some(task.id);
+            if let SchedPolicy::Fair { vruntime, .. } = task.sched_policy {
+                let id = task.id;
+                let _ = guard.fair_queue.remove(fair_key_of(vruntime, id));
+            }
+        }
+    }
+    if let Some(id) = reap_id {
+        REAP_QUEUE.lock().push(id);
+        REAP_PENDING.store(true, Ordering::Release);
+    }
+    switch_away_from_finished(cpu)
 }
 
 /// Terminate every thread belonging to the current userspace process and
@@ -1349,7 +1404,7 @@ pub fn terminate_current_process(code: i64) -> ! {
     let process = {
         let guard = PER_CPU_SCHEDULERS[current_cpu].lock();
         guard.current_task().and_then(|task| match &task.kind {
-            TaskKind::User { process } => Some(Arc::clone(process)),
+            TaskKind::User { process, .. } => Some(Arc::clone(process)),
             TaskKind::Kernel | TaskKind::Reaped => None,
         })
     };
@@ -1363,11 +1418,28 @@ pub fn terminate_current_process(code: i64) -> ! {
     let process_koid = process.koid();
     huesos_object::collect_exited_process(process_koid);
 
+    const MAX_WOKEN_THREADS: usize = 64;
+    let mut exited_threads: [Option<Arc<huesos_object::Thread>>; MAX_WOKEN_THREADS] =
+        [const { None }; MAX_WOKEN_THREADS];
+    let mut exited_count = 0usize;
+
     for scheduler in &PER_CPU_SCHEDULERS {
         let mut guard = scheduler.lock();
         for idx in 0..guard.tasks.len() {
             let matched = match &guard.tasks[idx].kind {
-                TaskKind::User { process } => process.koid() == process_koid,
+                TaskKind::User { process, thread } => {
+                    if process.koid() == process_koid {
+                        if let Some(t) = thread {
+                            if exited_count < MAX_WOKEN_THREADS {
+                                exited_threads[exited_count] = Some(Arc::clone(t));
+                                exited_count += 1;
+                            }
+                        }
+                        true
+                    } else {
+                        false
+                    }
+                }
                 TaskKind::Kernel | TaskKind::Reaped => false,
             };
             if !matched {
@@ -1388,6 +1460,12 @@ pub fn terminate_current_process(code: i64) -> ! {
             }
             REAP_QUEUE.lock().push(id);
             REAP_PENDING.store(true, Ordering::Release);
+        }
+    }
+
+    for slot in exited_threads.iter_mut().take(exited_count) {
+        if let Some(thread) = slot.take() {
+            let _ = thread.set_exit_code(code);
         }
     }
 
@@ -1572,7 +1650,7 @@ pub fn reap_finished_tasks() {
         let still_current = (0..MAX_CPUS).any(|cpu| {
             let guard = PER_CPU_SCHEDULERS[cpu].lock();
             guard.current_task().is_some_and(|task| match &task.kind {
-                TaskKind::User { process } => process.koid() == koid,
+                TaskKind::User { process, .. } => process.koid() == koid,
                 TaskKind::Kernel | TaskKind::Reaped => false,
             })
         });

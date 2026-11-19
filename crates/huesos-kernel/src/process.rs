@@ -1155,8 +1155,34 @@ pub fn start_thread(
     entry: u64,
     stack: u64,
 ) -> Result<u64, ErrorCode> {
+    start_thread_with_args(thread, entry, stack, 0, 0)
+}
+
+/// Start a suspended userspace thread with an initial `rdi` argument and
+/// `MSR_FS_BASE` (used for both initial bootstrap threads and secondary
+/// intra-process threads).
+pub fn start_thread_ex(
+    thread: &huesos_object::Thread,
+    entry: u64,
+    stack: u64,
+    arg0: u64,
+    fs_base: u64,
+) -> Result<u64, ErrorCode> {
+    start_thread_with_args(thread, entry, stack, arg0, fs_base)
+}
+
+fn start_thread_with_args(
+    thread: &huesos_object::Thread,
+    entry: u64,
+    stack: u64,
+    arg0: u64,
+    fs_base: u64,
+) -> Result<u64, ErrorCode> {
     let userspace = huesos_abi::USER_ASPACE_BASE..huesos_abi::USER_ASPACE_END;
-    if !userspace.contains(&entry) || !userspace.contains(&stack) {
+    if !userspace.contains(&entry)
+        || !userspace.contains(&stack)
+        || fs_base >= huesos_abi::USER_ASPACE_END
+    {
         return Err(ErrorCode::InvalidArgs);
     }
 
@@ -1164,6 +1190,8 @@ pub fn start_thread(
     if process.exit_code().is_some() {
         return Err(ErrorCode::Busy);
     }
+    let thread_arc = huesos_object::lookup_object(thread.koid())
+        .and_then(|obj| obj.downcast_arc::<huesos_object::Thread>().ok());
     let cr3 = {
         let mut runtime_guard = process.address_space.lock();
         let runtime = runtime_guard
@@ -1183,8 +1211,10 @@ pub fn start_thread(
     task_name[..label.len()].copy_from_slice(label);
 
     let target_cpu = process.home_cpu();
-    crate::scheduler::spawn_user_thread_on_cpu(&task_name, process, entry, stack, cr3, target_cpu)
-        .ok_or(ErrorCode::Busy)
+    crate::scheduler::spawn_user_thread_on_cpu_ex(
+        &task_name, process, thread_arc, entry, stack, arg0, fs_base, cr3, target_cpu,
+    )
+    .ok_or(ErrorCode::Busy)
 }
 
 /// Load `elf_bytes` into a brand new address space and prepare a process
@@ -1298,6 +1328,8 @@ struct PendingUserEntry {
     task_id: u64,
     entry: u64,
     rsp: u64,
+    rdi: u64,
+    fs_base: u64,
 }
 
 static PENDING_USER_ENTRIES: RankedIrqSafeTicketLock<Vec<PendingUserEntry>> =
@@ -1308,20 +1340,27 @@ static VMAR_MUTATION_LOCK: RankedIrqSafeTicketLock<()> =
 
 /// Queue the first userspace RIP/RSP pair for a just-created scheduler task.
 pub fn queue_user_entry(task_id: u64, entry: u64, rsp: u64) {
+    queue_user_entry_ex(task_id, entry, rsp, 0, 0);
+}
+
+/// Queue the initial userspace RIP/RSP/RDI/FS_BASE tuple for a scheduler task.
+pub fn queue_user_entry_ex(task_id: u64, entry: u64, rsp: u64, rdi: u64, fs_base: u64) {
     PENDING_USER_ENTRIES.lock().push(PendingUserEntry {
         task_id,
         entry,
         rsp,
+        rdi,
+        fs_base,
     });
 }
 
-fn take_user_entry(task_id: u64) -> Option<(u64, u64)> {
+fn take_user_entry(task_id: u64) -> Option<(u64, u64, u64, u64)> {
     let mut entries = PENDING_USER_ENTRIES.lock();
     let pos = entries
         .iter()
         .position(|pending| pending.task_id == task_id)?;
     let pending = entries.swap_remove(pos);
-    Some((pending.entry, pending.rsp))
+    Some((pending.entry, pending.rsp, pending.rdi, pending.fs_base))
 }
 
 /// Remove a startup record for a task killed before its first schedule.
@@ -1338,7 +1377,7 @@ pub extern "C" fn user_entry_trampoline() -> ! {
     let Some(task_id) = crate::scheduler::current_task_id() else {
         crate::scheduler::terminate_current_process(huesos_abi::fault_exit::STARTUP_FAILED);
     };
-    let Some((entry, rsp)) = take_user_entry(task_id) else {
+    let Some((entry, rsp, rdi, fs_base)) = take_user_entry(task_id) else {
         crate::scheduler::terminate_current_process(huesos_abi::fault_exit::STARTUP_FAILED);
     };
     crate::scheduler::mark_user_entry_consumed(task_id);
@@ -1347,7 +1386,7 @@ pub extern "C" fn user_entry_trampoline() -> ! {
     let user_cs = (sel.user_code.0 as u64) | 3; // RPL=3
     let user_ss = (sel.user_data.0 as u64) | 3;
 
-    {
+    if rdi == 0 && fs_base == 0 {
         use core::fmt::Write;
         let mut w = huesos_arch::serial::SerialWriter;
         let _ = writeln!(
@@ -1357,9 +1396,11 @@ pub extern "C" fn user_entry_trampoline() -> ! {
         );
     }
 
-    huesos_arch::context_switch::write_fs_base(0);
+    huesos_arch::context_switch::write_fs_base(fs_base);
     unsafe {
-        huesos_arch::context_switch::enter_userspace(entry, rsp, user_cs, user_ss, 0x202);
+        huesos_arch::context_switch::enter_userspace_with_arg(
+            entry, rsp, user_cs, user_ss, 0x202, rdi,
+        );
     }
 }
 

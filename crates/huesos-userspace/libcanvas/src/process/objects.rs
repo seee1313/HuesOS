@@ -6,8 +6,8 @@ use crate::port::Port;
 use crate::raw;
 use crate::vmo::Vmo;
 use huesos_abi::{
-    HandleValue, ProcessBindExitPortArgs, Syscall, VmarCreateChildArgs, VmarMapArgs, VmarOpArgs,
-    BOOTSTRAP_HANDLE, INVALID_HANDLE,
+    HandleValue, ProcessBindExitPortArgs, Syscall, ThreadStartArgs, VmarCreateChildArgs,
+    VmarMapArgs, VmarOpArgs, BOOTSTRAP_HANDLE, INVALID_HANDLE,
 };
 
 /// Initial bootstrap channel handle number installed in a newly-started
@@ -142,6 +142,15 @@ impl Process {
         Ok((mask, home as usize))
     }
 
+    /// Return an owned handle to the calling process (`Syscall::ProcessSelf`).
+    pub fn current() -> crate::Result<Self> {
+        let mut handle: HandleValue = INVALID_HANDLE;
+        let ret = raw::syscall1(Syscall::ProcessSelf, &mut handle as *mut HandleValue as u64);
+        raw::decode(ret)?;
+        // SAFETY: the kernel just installed an owned process handle in `handle`.
+        Ok(Self(unsafe { Handle::from_raw(handle) }))
+    }
+
     /// Borrow the underlying process handle.
     pub fn handle(&self) -> &Handle {
         &self.0
@@ -187,6 +196,37 @@ impl Thread {
         );
         raw::decode(ret)?;
         Ok(unsafe { Channel::from_raw(parent_bootstrap) })
+    }
+
+    /// Start a secondary intra-process thread with initial `entry`, `stack`,
+    /// `arg0` (`rdi`), and `fs_base` (`MSR_FS_BASE`), without creating a new
+    /// bootstrap channel.
+    pub fn start_ex(&self, entry: u64, stack: u64, arg0: u64, fs_base: u64) -> crate::Result<u64> {
+        let args = ThreadStartArgs {
+            thread: self.0.raw(),
+            flags: 0,
+            entry,
+            stack,
+            arg0,
+            fs_base,
+        };
+        let ret = raw::syscall1(
+            Syscall::ThreadStartEx,
+            &args as *const ThreadStartArgs as u64,
+        );
+        raw::decode(ret).map(|tid| tid as u64)
+    }
+
+    /// Block until this thread exits and return its exit code.
+    pub fn wait(&self) -> crate::Result<i64> {
+        let mut code: i64 = 0;
+        let ret = raw::syscall2(
+            Syscall::ThreadWait,
+            self.0.raw() as u64,
+            &mut code as *mut i64 as u64,
+        );
+        raw::decode(ret)?;
+        Ok(code)
     }
 
     /// Borrow the underlying thread handle.

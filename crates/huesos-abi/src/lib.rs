@@ -515,6 +515,19 @@ pub enum Syscall {
     /// Set the calling thread's x86-64 `MSR_FS_BASE` for userspace TLS.
     /// `a1` must be a canonical userspace virtual address (`< USER_ASPACE_END`).
     ThreadSetFsBase = 78,
+    /// Return a handle to the calling process in `*a1` (`*mut HandleValue`).
+    ProcessSelf = 79,
+    /// Start a thread created by [`Self::ThreadCreate`] inside a process,
+    /// setting initial `entry`, `stack`, `rdi` argument, and `MSR_FS_BASE`
+    /// without replacing the bootstrap channel. `a1` points to
+    /// [`ThreadStartArgs`].
+    ThreadStartEx = 80,
+    /// Exit only the calling thread with status code `a1` (`i64`), tearing
+    /// down the entire process only when the last active thread exits.
+    ThreadExit = 81,
+    /// Block until thread handle `a1` exits via [`Self::ThreadExit`] or
+    /// process termination, writing its `i64` exit code to `*a2`.
+    ThreadWait = 82,
 }
 
 /// Maximum number of bytes one [`Syscall::SystemGetEntropy`] call
@@ -594,7 +607,7 @@ impl Syscall {
     /// Total number of defined syscalls (i.e. one past the highest
     /// currently-assigned number). The dispatcher uses this to reject
     /// obviously-out-of-range numbers before a `match`.
-    pub const COUNT: u64 = 73;
+    pub const COUNT: u64 = 83;
 
     /// Convert a raw syscall number back into a [`Syscall`], if valid.
     pub const fn from_raw(n: u64) -> Option<Self> {
@@ -678,6 +691,10 @@ impl Syscall {
             76 => Self::DeviceLeaseBindGonePort,
             77 => Self::DeviceLeaseQuery,
             78 => Self::ThreadSetFsBase,
+            79 => Self::ProcessSelf,
+            80 => Self::ThreadStartEx,
+            81 => Self::ThreadExit,
+            82 => Self::ThreadWait,
             _ => return None,
         })
     }
@@ -1138,6 +1155,24 @@ pub struct ChannelReadEtcArgs {
     pub out_handles: *mut u32,
 }
 
+/// Arguments for [`Syscall::ThreadStartEx`].
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ThreadStartArgs {
+    /// Thread handle created via [`Syscall::ThreadCreate`].
+    pub thread: HandleValue,
+    /// Reserved flags (must be `0`).
+    pub flags: u32,
+    /// Initial user RIP inside the target process.
+    pub entry: u64,
+    /// Initial user RSP (must be `< USER_ASPACE_END`).
+    pub stack: u64,
+    /// Initial `rdi` argument passed to the thread entry function.
+    pub arg0: u64,
+    /// Initial `MSR_FS_BASE` (`0` or canonical userspace address `< USER_ASPACE_END`).
+    pub fs_base: u64,
+}
+
 /// Arguments for [`Syscall::ChannelPeek`]: inspect the next queued message
 /// without dequeueing it. The returned cookie identifies the message for a
 /// subsequent [`Syscall::ChannelConsume`] call.
@@ -1575,7 +1610,7 @@ mod tests {
         assert_eq!(Syscall::ResourceUnmap as u64, 65);
         assert_eq!(Syscall::InterruptCreateGsiForResource as u64, 66);
         assert_eq!(Syscall::InterruptAcknowledge as u64, 67);
-        assert_eq!(Syscall::COUNT, 73);
+        assert_eq!(Syscall::COUNT, 83);
         assert_eq!(Syscall::from_raw(28), Some(Syscall::VmoCreateEx));
         assert_eq!(Syscall::from_raw(30), Some(Syscall::VmarProtect));
         assert_eq!(Syscall::from_raw(31), Some(Syscall::ChannelPeek));
@@ -1641,7 +1676,11 @@ mod tests {
         );
         assert_eq!(Syscall::from_raw(77), Some(Syscall::DeviceLeaseQuery));
         assert_eq!(Syscall::from_raw(78), Some(Syscall::ThreadSetFsBase));
-        assert_eq!(Syscall::from_raw(79), None);
+        assert_eq!(Syscall::from_raw(79), Some(Syscall::ProcessSelf));
+        assert_eq!(Syscall::from_raw(80), Some(Syscall::ThreadStartEx));
+        assert_eq!(Syscall::from_raw(81), Some(Syscall::ThreadExit));
+        assert_eq!(Syscall::from_raw(82), Some(Syscall::ThreadWait));
+        assert_eq!(Syscall::from_raw(83), None);
     }
 
     #[test]

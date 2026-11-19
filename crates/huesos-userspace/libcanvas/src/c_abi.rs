@@ -10,8 +10,10 @@ extern crate alloc;
 use alloc::boxed::Box;
 use core::alloc::GlobalAlloc;
 use core::alloc::Layout;
+use core::ffi::{c_char, c_void};
 use core::ptr;
 use core::slice;
+use core::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 
 use huesos_abi::{
     wait_mode, ChannelReadEtcArgs, ErrorCode, FramebufferBlitArgs, FramebufferInfo, HandleValue,
@@ -22,11 +24,42 @@ use huesos_abi::{
 use crate::framebuffer::{Canvas, TextFont};
 use crate::heap::ScudoHeap;
 use crate::hxfs::{Hxfs, HxfsFile};
+use crate::rtld_abi::{CanvasDlInfo, CanvasDlPhdrInfo, HostAllocOps, RtldOps, RTLD_OPS_VERSION};
 use crate::{debug, memory, process, raw, system};
 
 /// Single process-wide Scudo heap living inside `libcanvas.so`.
 #[global_allocator]
 static GLOBAL_HEAP: ScudoHeap = ScudoHeap::new();
+
+static RTLD_OPS_PTR: AtomicPtr<RtldOps> = AtomicPtr::new(ptr::null_mut());
+static FINI_EXECUTED: AtomicBool = AtomicBool::new(false);
+
+#[inline]
+fn rtld_ops() -> Option<&'static RtldOps> {
+    let ptr = RTLD_OPS_PTR.load(Ordering::Acquire);
+    if ptr.is_null() {
+        None
+    } else {
+        // SAFETY: `ld-huesos.so` registers a static `'static` `RtldOps` table
+        // via `__huesos_register_rtld` before any application code runs.
+        Some(unsafe { &*ptr })
+    }
+}
+
+/// Run registered `__cxa_atexit` / `DT_FINI_ARRAY` / `DT_FINI` finalisers once
+/// before terminating the process.
+pub(crate) fn run_process_fini_once() {
+    if FINI_EXECUTED
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+    {
+        if let Some(ops) = rtld_ops() {
+            // SAFETY: registered `RtldOps::run_process_fini` handles locking
+            // and reverse-topological execution once.
+            unsafe { (ops.run_process_fini)() };
+        }
+    }
+}
 
 #[cfg(not(test))]
 #[panic_handler]
@@ -1464,4 +1497,556 @@ pub unsafe extern "C" fn canvas_fs_file_read_at(
 pub unsafe extern "C" fn canvas_fs_file_close(file: *mut CanvasFsFile) {
     // SAFETY: validated by `drop_boxed`.
     unsafe { drop_boxed(file) };
+}
+
+/* --------------------------------------------------------------------------
+ * Dynamic linker bridge, TLS, capability dlopen & intra-process threading
+ * -------------------------------------------------------------------------- */
+
+unsafe extern "C" fn host_scudo_alloc(size: usize, align: usize) -> *mut u8 {
+    canvas_alloc(size, align)
+}
+
+unsafe extern "C" fn host_scudo_free(ptr: *mut u8) {
+    // SAFETY: delegates to `canvas_free` on the global Scudo heap.
+    unsafe { canvas_free(ptr) }
+}
+
+/// Handshake called once by `/lib/ld-huesos.so` right after relocating
+/// `libcanvas.so` to exchange [`RtldOps`] and [`HostAllocOps`].
+///
+/// # Safety
+/// `ops` must point to a `'static` [`RtldOps`] table; if non-null, `out_host`
+/// must be writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn __huesos_register_rtld(
+    ops: *const RtldOps,
+    out_host: *mut HostAllocOps,
+) -> i32 {
+    if ops.is_null() {
+        return -1;
+    }
+    // SAFETY: caller guarantees `ops` points to a readable `RtldOps` struct.
+    if unsafe { (*ops).version } != RTLD_OPS_VERSION {
+        return -1;
+    }
+    RTLD_OPS_PTR.store(ops.cast_mut(), Ordering::Release);
+    if !out_host.is_null() {
+        // SAFETY: `out_host` is non-null and valid writable storage per contract.
+        unsafe {
+            ptr::write(
+                out_host,
+                HostAllocOps {
+                    version: RTLD_OPS_VERSION,
+                    alloc: host_scudo_alloc,
+                    free: host_scudo_free,
+                },
+            );
+        }
+    }
+    0
+}
+
+/// General-Dynamic / Local-Dynamic TLS resolver (`__tls_get_addr`).
+///
+/// # Safety
+/// `ti` must point to an ELF64 `TlsIndex { ti_module: usize, ti_offset: usize }`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn __tls_get_addr(ti: *const u8) -> *mut u8 {
+    match rtld_ops() {
+        Some(ops) => {
+            // SAFETY: delegated to `ld-huesos.so` DTV resolver.
+            unsafe { (ops.tls_get_addr)(ti) }
+        }
+        None => ptr::null_mut(),
+    }
+}
+
+/// Register a DSO destructor callback (`__cxa_atexit`).
+///
+/// # Safety
+/// `func`, `arg`, and `dso_handle` follow the Itanium C++ ABI contract.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn __cxa_atexit(
+    func: Option<unsafe extern "C" fn(*mut c_void)>,
+    arg: *mut c_void,
+    dso_handle: *mut c_void,
+) -> i32 {
+    match rtld_ops() {
+        Some(ops) => {
+            // SAFETY: forwarded to `ld-huesos.so`'s `__cxa_atexit` registry.
+            unsafe { (ops.cxa_atexit)(func, arg, dso_handle) }
+        }
+        None => -1,
+    }
+}
+
+unsafe extern "C" fn plain_atexit_trampoline(fn_ptr: *mut c_void) {
+    if !fn_ptr.is_null() {
+        // SAFETY: `fn_ptr` was converted from `extern "C" fn()` in `atexit` / `canvas_atexit`.
+        let f: extern "C" fn() = unsafe { core::mem::transmute(fn_ptr) };
+        f();
+    }
+}
+
+/// Register a process-exit callback (`canvas_atexit`).
+///
+/// # Safety
+/// `func` must be a valid `extern "C" fn()` pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn canvas_atexit(func: Option<extern "C" fn()>) -> i64 {
+    let Some(f) = func else {
+        return err_code(ErrorCode::InvalidArgs);
+    };
+    let Some(ops) = rtld_ops() else {
+        return err_code(ErrorCode::NotSupported);
+    };
+    // SAFETY: `f` is passed as `arg` to `plain_atexit_trampoline` with null DSO handle.
+    let rc = unsafe {
+        (ops.cxa_atexit)(
+            Some(plain_atexit_trampoline),
+            f as *mut c_void,
+            ptr::null_mut(),
+        )
+    };
+    if rc == 0 {
+        0
+    } else {
+        err_code(ErrorCode::NoMemory)
+    }
+}
+
+/// Standard C `atexit` alias.
+///
+/// # Safety
+/// `func` must be a valid `extern "C" fn()` pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn atexit(func: Option<extern "C" fn()>) -> i32 {
+    // SAFETY: forwarded to `canvas_atexit`.
+    if unsafe { canvas_atexit(func) } == 0 {
+        0
+    } else {
+        -1
+    }
+}
+
+/// Standard C `malloc` alias backed by `GLOBAL_HEAP`.
+///
+/// # Safety
+/// Returned pointer must be freed via `free` / `canvas_free`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn malloc(size: usize) -> *mut c_void {
+    canvas_malloc(size).cast::<c_void>()
+}
+
+/// Standard C `calloc` alias backed by `GLOBAL_HEAP`.
+///
+/// # Safety
+/// Returned pointer must be freed via `free` / `canvas_free`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn calloc(count: usize, size: usize) -> *mut c_void {
+    canvas_calloc(count, size).cast::<c_void>()
+}
+
+/// Standard C `realloc` alias backed by `GLOBAL_HEAP`.
+///
+/// # Safety
+/// `ptr` must be null or previously returned by `malloc`/`calloc`/`realloc`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn realloc(ptr: *mut c_void, new_size: usize) -> *mut c_void {
+    // SAFETY: forwarded to `canvas_realloc`.
+    unsafe { canvas_realloc(ptr.cast::<u8>(), new_size) }.cast::<c_void>()
+}
+
+/// Standard C `free` alias backed by `GLOBAL_HEAP`.
+///
+/// # Safety
+/// `ptr` must be null or previously returned by `malloc`/`calloc`/`realloc`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn free(ptr: *mut c_void) {
+    // SAFETY: forwarded to `canvas_free`.
+    unsafe { canvas_free(ptr.cast::<u8>()) }
+}
+
+/// Load a shared object directly from a `Vmo` capability handle.
+///
+/// # Safety
+/// `vmo_handle` must be a valid readable/executable VMO handle in this process.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn canvas_dlopen_vmo(vmo_handle: u32, flags: i32) -> *mut c_void {
+    match rtld_ops() {
+        Some(ops) => {
+            // SAFETY: delegated to `ld-huesos.so`.
+            unsafe { (ops.dlopen_vmo)(vmo_handle, flags) }
+        }
+        None => ptr::null_mut(),
+    }
+}
+
+/// Load a shared object by validated `SONAME` (no `/` or `..`).
+///
+/// # Safety
+/// `soname` must be a valid NUL-terminated C string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn canvas_dlopen_soname(soname: *const c_char, flags: i32) -> *mut c_void {
+    match rtld_ops() {
+        Some(ops) => {
+            // SAFETY: delegated to `ld-huesos.so`.
+            unsafe { (ops.dlopen_soname)(soname, flags) }
+        }
+        None => ptr::null_mut(),
+    }
+}
+
+/// Load a shared object from an `HxfsBlobView` channel handle.
+///
+/// # Safety
+/// `blob_ch` must be a valid `BlobView` channel handle in this process.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn canvas_dlopen_blob(blob_ch: u32, flags: i32) -> *mut c_void {
+    match rtld_ops() {
+        Some(ops) => {
+            // SAFETY: delegated to `ld-huesos.so`.
+            unsafe { (ops.dlopen_blob)(blob_ch, flags) }
+        }
+        None => ptr::null_mut(),
+    }
+}
+
+/// Resolve an exported symbol from `handle` (or global scope when `handle == NULL`).
+///
+/// # Safety
+/// `handle` must be null or returned by `canvas_dlopen_*`; `symbol` must be a NUL-terminated string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn canvas_dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void {
+    match rtld_ops() {
+        Some(ops) => {
+            // SAFETY: delegated to `ld-huesos.so`.
+            unsafe { (ops.dlsym)(handle, symbol) }
+        }
+        None => ptr::null_mut(),
+    }
+}
+
+/// Decrement module refcount and unload (running destructors) when zero.
+///
+/// # Safety
+/// `handle` must have been returned by `canvas_dlopen_*`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn canvas_dlclose(handle: *mut c_void) -> i32 {
+    match rtld_ops() {
+        Some(ops) => {
+            // SAFETY: delegated to `ld-huesos.so`.
+            unsafe { (ops.dlclose)(handle) }
+        }
+        None => -1,
+    }
+}
+
+/// Return and clear the per-thread error message from the last `canvas_dl*` failure.
+///
+/// # Safety
+/// Returns either `NULL` or a NUL-terminated diagnostic string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn canvas_dlerror() -> *const c_char {
+    match rtld_ops() {
+        Some(ops) => {
+            // SAFETY: delegated to `ld-huesos.so`.
+            unsafe { (ops.dlerror)() }
+        }
+        None => c"dynamic linker unavailable".as_ptr(),
+    }
+}
+
+/// Resolve the loaded object and nearest symbol containing `addr`.
+///
+/// # Safety
+/// `out_info` must point to writable [`CanvasDlInfo`] storage.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn canvas_dladdr(addr: *const c_void, out_info: *mut CanvasDlInfo) -> i32 {
+    match rtld_ops() {
+        Some(ops) => {
+            // SAFETY: delegated to `ld-huesos.so`.
+            unsafe { (ops.dladdr)(addr, out_info) }
+        }
+        None => 0,
+    }
+}
+
+/// Iterate over loaded shared objects (`dl_iterate_phdr`).
+///
+/// # Safety
+/// `callback` must follow the `CanvasDlPhdrInfo` iteration contract.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn canvas_dl_iterate_phdr(
+    callback: Option<unsafe extern "C" fn(*mut CanvasDlPhdrInfo, usize, *mut c_void) -> i32>,
+    data: *mut c_void,
+) -> i32 {
+    match rtld_ops() {
+        Some(ops) => {
+            // SAFETY: delegated to `ld-huesos.so`.
+            unsafe { (ops.dl_iterate_phdr)(callback, data) }
+        }
+        None => 0,
+    }
+}
+
+/// Register an `HxfsDirectory` capability channel for `SONAME` loading.
+///
+/// # Safety
+/// `hxfs_dir_ch` must be a valid `HxfsDirectory` channel handle.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn canvas_dl_set_lib_dir(hxfs_dir_ch: u32) -> i32 {
+    match rtld_ops() {
+        Some(ops) => {
+            // SAFETY: delegated to `ld-huesos.so`.
+            unsafe { (ops.dl_set_lib_dir)(hxfs_dir_ch) }
+        }
+        None => -1,
+    }
+}
+
+/// Register an `Hxfs` service capability channel for `SONAME` loading.
+///
+/// # Safety
+/// `hxfs_ch` must be a valid `Hxfs` channel handle.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn canvas_dl_set_hxfs_service(hxfs_ch: u32) -> i32 {
+    match rtld_ops() {
+        Some(ops) => {
+            // SAFETY: delegated to `ld-huesos.so`.
+            unsafe { (ops.dl_set_hxfs_service)(hxfs_ch) }
+        }
+        None => -1,
+    }
+}
+
+/// Opaque intra-process thread handle (`CanvasThread` in `include/canvas.h`).
+pub struct CanvasThread {
+    handle: crate::Handle,
+    stack_ptr: *mut u8,
+    stack_layout: Layout,
+}
+
+struct ThreadStartContext {
+    entry: unsafe extern "C" fn(*mut c_void) -> i64,
+    arg: *mut c_void,
+    tp: u64,
+}
+
+extern "C" fn thread_entry_trampoline(ctx_ptr: *mut ThreadStartContext) -> ! {
+    // SAFETY: `ctx_ptr` was allocated on `GLOBAL_HEAP` by `canvas_thread_spawn`
+    // and transferred uniquely to this new thread.
+    let ctx = unsafe { *Box::from_raw(ctx_ptr) };
+    // SAFETY: caller supplied a valid `extern "C" fn(*mut c_void) -> i64` and `arg`.
+    let code = unsafe { (ctx.entry)(ctx.arg) };
+    if let Some(ops) = rtld_ops() {
+        // SAFETY: releases any dynamic TLS blocks + per-thread TLS VMO for `ctx.tp`.
+        unsafe { (ops.free_thread_tls)(ctx.tp) };
+    }
+    process::exit_thread(code)
+}
+
+/// Spawn a new intra-process thread with independent per-thread TLS/TCB/DTV.
+///
+/// # Safety
+/// `entry` must be a valid function pointer; `out_thread` must be writable; if
+/// non-null, `name` must be NUL-terminated.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn canvas_thread_spawn(
+    name: *const c_char,
+    entry: Option<unsafe extern "C" fn(*mut c_void) -> i64>,
+    arg: *mut c_void,
+    stack_size: usize,
+    out_thread: *mut *mut CanvasThread,
+) -> i64 {
+    let Some(entry_fn) = entry else {
+        return err_code(ErrorCode::InvalidArgs);
+    };
+    if out_thread.is_null()
+        || !(out_thread as usize).is_multiple_of(core::mem::align_of::<*mut CanvasThread>())
+    {
+        return err_code(ErrorCode::InvalidArgs);
+    }
+
+    let name_str = if name.is_null() {
+        "thread"
+    } else {
+        let mut len = 0usize;
+        while len < 63 {
+            // SAFETY: caller guarantees NUL-terminated `name`.
+            if unsafe { *name.add(len) } == 0 {
+                break;
+            }
+            len += 1;
+        }
+        // SAFETY: `name..name+len` is non-NUL readable bytes.
+        let bytes = unsafe { slice::from_raw_parts(name.cast::<u8>(), len) };
+        core::str::from_utf8(bytes).unwrap_or("thread")
+    };
+
+    let stack_bytes = if stack_size == 0 {
+        huesos_abi::USER_STACK_DEFAULT_SIZE as usize
+    } else {
+        stack_size.max(16 * 1024)
+    };
+    let stack_aligned = (stack_bytes + 15) & !15;
+    let Ok(stack_layout) = Layout::from_size_align(stack_aligned, 16) else {
+        return err_code(ErrorCode::InvalidArgs);
+    };
+    // SAFETY: `stack_layout` has non-zero size and 16-byte alignment.
+    let stack_ptr = unsafe { GLOBAL_HEAP.alloc(stack_layout) };
+    if stack_ptr.is_null() {
+        return err_code(ErrorCode::NoMemory);
+    }
+
+    let tp = match rtld_ops() {
+        Some(ops) => {
+            // SAFETY: allocates and initializes per-thread Variant-II TLS + TCB + DTV.
+            let tp = unsafe { (ops.alloc_thread_tls)() };
+            if tp == 0 {
+                // SAFETY: `stack_ptr` was allocated with `stack_layout` above.
+                unsafe { GLOBAL_HEAP.dealloc(stack_ptr, stack_layout) };
+                return err_code(ErrorCode::NoMemory);
+            }
+            tp
+        }
+        None => 0,
+    };
+
+    let self_proc = match process::Process::current() {
+        Ok(p) => p,
+        Err(err) => {
+            if tp != 0 {
+                if let Some(ops) = rtld_ops() {
+                    // SAFETY: roll back allocated TLS VMO on error.
+                    unsafe { (ops.free_thread_tls)(tp) };
+                }
+            }
+            // SAFETY: `stack_ptr` was allocated with `stack_layout` above.
+            unsafe { GLOBAL_HEAP.dealloc(stack_ptr, stack_layout) };
+            return err_code(err);
+        }
+    };
+
+    let thread = match process::Thread::create(&self_proc, name_str) {
+        Ok(t) => t,
+        Err(err) => {
+            if tp != 0 {
+                if let Some(ops) = rtld_ops() {
+                    // SAFETY: roll back allocated TLS VMO on error.
+                    unsafe { (ops.free_thread_tls)(tp) };
+                }
+            }
+            // SAFETY: `stack_ptr` was allocated with `stack_layout` above.
+            unsafe { GLOBAL_HEAP.dealloc(stack_ptr, stack_layout) };
+            return err_code(err);
+        }
+    };
+
+    let ctx_raw = Box::into_raw(Box::new(ThreadStartContext {
+        entry: entry_fn,
+        arg,
+        tp,
+    }));
+    let initial_rsp = (((stack_ptr as u64) + (stack_aligned as u64)) & !0xf) - 8;
+
+    let mut dup_raw: HandleValue = INVALID_HANDLE;
+    // SAFETY: `dup_raw` is stack-allocated and writable.
+    let dup_rc = unsafe {
+        canvas_handle_duplicate(
+            thread.handle().raw(),
+            huesos_abi::rights::SAME_RIGHTS,
+            &mut dup_raw,
+        )
+    };
+    if dup_rc != 0 {
+        // SAFETY: thread has not started yet, reclaim `ctx_raw` and `stack_ptr`.
+        let _ = unsafe { Box::from_raw(ctx_raw) };
+        if tp != 0 {
+            if let Some(ops) = rtld_ops() {
+                unsafe { (ops.free_thread_tls)(tp) };
+            }
+        }
+        unsafe { GLOBAL_HEAP.dealloc(stack_ptr, stack_layout) };
+        return dup_rc;
+    }
+
+    // SAFETY: `dup_raw` is an owned duplicated thread handle.
+    let owned_handle = unsafe { crate::Handle::from_raw(dup_raw) };
+    let thread_box = Box::into_raw(Box::new(CanvasThread {
+        handle: owned_handle,
+        stack_ptr,
+        stack_layout,
+    }));
+
+    if let Err(err) = thread.start_ex(
+        thread_entry_trampoline as *const () as u64,
+        initial_rsp,
+        ctx_raw as u64,
+        tp,
+    ) {
+        // SAFETY: start_ex failed before scheduling, so reclaim all allocations.
+        let _ = unsafe { Box::from_raw(thread_box) };
+        let _ = unsafe { Box::from_raw(ctx_raw) };
+        if tp != 0 {
+            if let Some(ops) = rtld_ops() {
+                unsafe { (ops.free_thread_tls)(tp) };
+            }
+        }
+        unsafe { GLOBAL_HEAP.dealloc(stack_ptr, stack_layout) };
+        return err_code(err);
+    }
+
+    // SAFETY: `out_thread` was validated non-null and aligned above.
+    unsafe { ptr::write(out_thread, thread_box) };
+    0
+}
+
+/// Wait for `thread` to exit, reclaim its stack, and optionally return its exit code.
+///
+/// # Safety
+/// `thread` must be an owned pointer returned by `canvas_thread_spawn`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn canvas_thread_join(
+    thread: *mut CanvasThread,
+    out_exit_code: *mut i64,
+) -> i64 {
+    if thread.is_null() || !(thread as usize).is_multiple_of(core::mem::align_of::<CanvasThread>())
+    {
+        return err_code(ErrorCode::InvalidArgs);
+    }
+    // SAFETY: caller transfers ownership of `thread` to `canvas_thread_join`.
+    let t = unsafe { Box::from_raw(thread) };
+    let mut code: i64 = 0;
+    let ret = raw::syscall2(
+        Syscall::ThreadWait,
+        t.handle.raw() as u64,
+        &mut code as *mut i64 as u64,
+    );
+    if let Err(err) = raw::decode(ret) {
+        // Re-leak box? No — wait only fails on invalid handle; reclaim stack safely.
+        // SAFETY: `t.stack_ptr` was allocated with `t.stack_layout`.
+        unsafe { GLOBAL_HEAP.dealloc(t.stack_ptr, t.stack_layout) };
+        return err_code(err);
+    }
+    // SAFETY: thread has exited ring3 and been marked finished in kernel before Wait returned.
+    unsafe { GLOBAL_HEAP.dealloc(t.stack_ptr, t.stack_layout) };
+    if !out_exit_code.is_null() {
+        // SAFETY: `write_out` checks alignment.
+        if let Err(err) = unsafe { write_out(out_exit_code, code) } {
+            return err_code(err);
+        }
+    }
+    0
+}
+
+/// Exit only the calling thread (cleaning up its per-thread TLS/TCB/DTV).
+#[unsafe(no_mangle)]
+pub extern "C" fn canvas_thread_exit(code: i64) -> ! {
+    if let Some(ops) = rtld_ops() {
+        // SAFETY: `0` instructs `free_thread_tls` to read and clean current `%fs:0`.
+        unsafe { (ops.free_thread_tls)(0) };
+    }
+    process::exit_thread(code)
 }

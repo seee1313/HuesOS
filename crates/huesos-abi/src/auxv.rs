@@ -24,6 +24,13 @@ pub const AT_RANDOM: u64 = 25;
 /// HuesOS extension: non-zero when the parent launcher queued `self_vmar`
 /// and `lib_vmo` ahead of normal messages on bootstrap handle `1`.
 pub const AT_HUESOS_LD_BOOTSTRAP: u64 = 0x1001;
+/// HuesOS extension: non-zero when the parent launcher transferred a read-only
+/// `BOOTFS` library VMO handle (`LD_BOOTSTRAP_LIB_VMO_LABEL`) on bootstrap.
+pub const AT_HUESOS_LIB_VMO: u64 = 0x1002;
+/// HuesOS extension: non-zero when the parent launcher transferred a
+/// capability `HxFS` library directory/service handle
+/// (`LD_BOOTSTRAP_HXFS_DIR_LABEL`) on bootstrap ahead of normal messages.
+pub const AT_HUESOS_HXFS_DIR: u64 = 0x1003;
 
 /// Bootstrap channel label carrying the child's own root VMAR handle to
 /// `ld-huesos.so` (closed by the dynamic linker before entering the app).
@@ -31,6 +38,9 @@ pub const LD_BOOTSTRAP_SELF_VMAR_LABEL: &[u8] = b"huesos:ld:self-vmar";
 /// Bootstrap channel label carrying the read-only `BOOTFS` VMO handle to
 /// `ld-huesos.so` for resolving `/lib/*.so` (closed before entering the app).
 pub const LD_BOOTSTRAP_LIB_VMO_LABEL: &[u8] = b"huesos:ld:lib-vmo";
+/// Bootstrap channel label carrying an `HxFS` library directory/service
+/// channel handle to `ld-huesos.so` for capability-first SONAME lookup.
+pub const LD_BOOTSTRAP_HXFS_DIR_LABEL: &[u8] = b"huesos:ld:hxfs-dir";
 
 /// Default interpreter path expected in `PT_INTERP`.
 pub const DEFAULT_INTERP_PATH: &str = "/lib/ld-huesos.so";

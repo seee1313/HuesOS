@@ -4,8 +4,9 @@ use crate::channel::Channel;
 use crate::memory;
 use crate::vmo::Vmo;
 use huesos_abi::auxv::{
-    AT_BASE, AT_ENTRY, AT_FLAGS, AT_HUESOS_LD_BOOTSTRAP, AT_NULL, AT_PAGESZ, AT_PHDR, AT_PHENT,
-    AT_PHNUM, AT_RANDOM, LD_BOOTSTRAP_LIB_VMO_LABEL, LD_BOOTSTRAP_SELF_VMAR_LABEL,
+    AT_BASE, AT_ENTRY, AT_FLAGS, AT_HUESOS_HXFS_DIR, AT_HUESOS_LD_BOOTSTRAP, AT_HUESOS_LIB_VMO,
+    AT_NULL, AT_PAGESZ, AT_PHDR, AT_PHENT, AT_PHNUM, AT_RANDOM, LD_BOOTSTRAP_HXFS_DIR_LABEL,
+    LD_BOOTSTRAP_LIB_VMO_LABEL, LD_BOOTSTRAP_SELF_VMAR_LABEL,
 };
 use huesos_abi::{rights, vmar_flags, vmo_create_flags, USER_STACK_TOP};
 use huesos_elf::dynamic::{
@@ -44,6 +45,25 @@ pub fn spawn_elf_with_lib(
         elf,
         Some(lib_vmo),
         None,
+        None,
+        huesos_abi::USER_STACK_DEFAULT_SIZE,
+    )
+}
+
+/// Load a `PT_INTERP` ELF image with an optional capability `HxFS` library
+/// directory/service channel (`AT_HUESOS_HXFS_DIR`) plus `BOOTFS` fallback VMO.
+pub fn spawn_elf_with_lib_and_hxfs(
+    name: &str,
+    elf: &[u8],
+    lib_vmo: &Vmo,
+    hxfs_dir: Option<&Channel>,
+) -> crate::Result<(Process, Channel)> {
+    spawn_elf_with_affinity(
+        name,
+        elf,
+        Some(lib_vmo),
+        hxfs_dir,
+        None,
         huesos_abi::USER_STACK_DEFAULT_SIZE,
     )
 }
@@ -54,7 +74,7 @@ pub fn spawn_elf_with_stack(
     elf: &[u8],
     stack_size: u64,
 ) -> crate::Result<(Process, Channel)> {
-    spawn_elf_with_affinity(name, elf, None, None, stack_size)
+    spawn_elf_with_affinity(name, elf, None, None, None, stack_size)
 }
 
 /// Load a static ELF image into a new process with an explicit home CPU.
@@ -62,6 +82,7 @@ pub fn spawn_elf_on_cpu(name: &str, elf: &[u8], cpu: usize) -> crate::Result<(Pr
     spawn_elf_with_affinity(
         name,
         elf,
+        None,
         None,
         Some(cpu),
         huesos_abi::USER_STACK_DEFAULT_SIZE,
@@ -79,6 +100,7 @@ pub fn spawn_elf_on_cpu_with_lib(
         name,
         elf,
         Some(lib_vmo),
+        None,
         Some(cpu),
         huesos_abi::USER_STACK_DEFAULT_SIZE,
     )
@@ -188,6 +210,7 @@ fn spawn_elf_with_affinity(
     name: &str,
     elf: &[u8],
     lib_vmo: Option<&Vmo>,
+    hxfs_dir: Option<&Channel>,
     home_cpu: Option<usize>,
     stack_size: u64,
 ) -> crate::Result<(Process, Channel)> {
@@ -249,6 +272,7 @@ fn spawn_elf_with_affinity(
             &process,
             &root_vmar,
             lib_vmo,
+            hxfs_dir,
             interp_bytes,
             &image,
             main_bias,
@@ -295,6 +319,29 @@ pub fn spawn_elf_from_vmo_with_lib(
         offset,
         len,
         Some(lib_vmo),
+        None,
+        huesos_abi::USER_STACK_DEFAULT_SIZE,
+    )?;
+    Ok((process, bootstrap))
+}
+
+/// Load a VMO-backed ELF image with an explicit library `BOOTFS` VMO and an
+/// optional capability `HxFS` library directory/service channel.
+pub fn spawn_elf_from_vmo_with_lib_and_hxfs(
+    name: &str,
+    vmo: &Vmo,
+    offset: u64,
+    len: u64,
+    lib_vmo: &Vmo,
+    hxfs_dir: Option<&Channel>,
+) -> crate::Result<(Process, Channel)> {
+    let (process, _root_vmar, bootstrap) = spawn_elf_from_vmo_inner(
+        name,
+        vmo,
+        offset,
+        len,
+        Some(lib_vmo),
+        hxfs_dir,
         huesos_abi::USER_STACK_DEFAULT_SIZE,
     )?;
     Ok((process, bootstrap))
@@ -340,7 +387,7 @@ pub fn spawn_elf_from_vmo_with_vmar_and_stack(
 ) -> crate::Result<(Process, Vmar, Channel)> {
     // When `vmo` is BOOTFS itself (as in `init` launching `doom`), passing `Some(vmo)`
     // allows `PT_INTERP` images stored inside BOOTFS to resolve `/lib/*.so` seamlessly.
-    spawn_elf_from_vmo_inner(name, vmo, offset, len, Some(vmo), stack_size)
+    spawn_elf_from_vmo_inner(name, vmo, offset, len, Some(vmo), None, stack_size)
 }
 
 fn spawn_elf_from_vmo_inner(
@@ -349,6 +396,7 @@ fn spawn_elf_from_vmo_inner(
     offset: u64,
     len: u64,
     lib_vmo: Option<&Vmo>,
+    hxfs_dir: Option<&Channel>,
     stack_size: u64,
 ) -> crate::Result<(Process, Vmar, Channel)> {
     if len == 0
@@ -408,6 +456,7 @@ fn spawn_elf_from_vmo_inner(
             &process,
             &root_vmar,
             lib_vmo,
+            hxfs_dir,
             &interp_buf[..path_len],
             &image,
             main_bias,
@@ -429,6 +478,7 @@ fn finish_dynamic_launch(
     process: &Process,
     root_vmar: &Vmar,
     lib_vmo: &Vmo,
+    hxfs_dir: Option<&Channel>,
     raw_interp_bytes: &[u8],
     main_image: &ParsedElfHeader,
     main_bias: u64,
@@ -468,20 +518,30 @@ fn finish_dynamic_launch(
         main_image.e_phnum,
         interp_load_base,
         main_bias.wrapping_add(main_image.e_entry),
+        true,
+        hxfs_dir.is_some(),
     )?;
 
-    // Duplicate bootstrap capabilities before Thread::start so both handles are
+    // Duplicate bootstrap capabilities before Thread::start so all handles are
     // ready to enqueue on the parent bootstrap channel immediately.
     let vmar_dup = root_vmar.handle().duplicate(rights::SAME_RIGHTS)?;
     let lib_vmo_dup = lib_vmo
         .duplicate(rights::READ | rights::TRANSFER)?
         .into_handle();
+    let hxfs_dir_dup = match hxfs_dir {
+        Some(ch) => Some(
+            ch.handle()
+                .duplicate(rights::READ | rights::WRITE | rights::TRANSFER)?,
+        ),
+        None => None,
+    };
 
     let thread = Thread::create(process, "main")?;
     let interp_entry = interp_bias.wrapping_add(interp_image.e_entry);
     let bootstrap = match thread.start(interp_entry, initial_rsp) {
         Ok(ch) => ch,
         Err(err) => {
+            drop(hxfs_dir_dup);
             drop(lib_vmo_dup);
             drop(vmar_dup);
             return Err(err);
@@ -489,11 +549,18 @@ fn finish_dynamic_launch(
     };
 
     if let Err((err, _h)) = bootstrap.write_handle(LD_BOOTSTRAP_SELF_VMAR_LABEL, vmar_dup) {
+        drop(hxfs_dir_dup);
         drop(lib_vmo_dup);
         return Err(err);
     }
     if let Err((err, _h)) = bootstrap.write_handle(LD_BOOTSTRAP_LIB_VMO_LABEL, lib_vmo_dup) {
+        drop(hxfs_dir_dup);
         return Err(err);
+    }
+    if let Some(dir_dup) = hxfs_dir_dup {
+        if let Err((err, _h)) = bootstrap.write_handle(LD_BOOTSTRAP_HXFS_DIR_LABEL, dir_dup) {
+            return Err(err);
+        }
     }
 
     Ok(bootstrap)
@@ -591,6 +658,8 @@ fn map_dynamic_initial_stack(
     at_phnum: u16,
     at_base: u64,
     at_entry: u64,
+    has_lib_vmo: bool,
+    has_hxfs_dir: bool,
 ) -> crate::Result<u64> {
     if !huesos_abi::valid_user_stack_size(stack_size) {
         return Err(crate::ErrorCode::InvalidArgs);
@@ -615,7 +684,7 @@ fn map_dynamic_initial_stack(
     let argv0_va = top_page_va + name_off as u64;
     let rand_va = top_page_va + rand_off as u64;
 
-    let aux_entries: [(u64, u64); 10] = [
+    let aux_entries: [(u64, u64); 12] = [
         (AT_PHDR, at_phdr),
         (AT_PHENT, u64::from(at_phent)),
         (AT_PHNUM, u64::from(at_phnum)),
@@ -625,10 +694,12 @@ fn map_dynamic_initial_stack(
         (AT_ENTRY, at_entry),
         (AT_RANDOM, rand_va),
         (AT_HUESOS_LD_BOOTSTRAP, 1),
+        (AT_HUESOS_LIB_VMO, u64::from(has_lib_vmo)),
+        (AT_HUESOS_HXFS_DIR, u64::from(has_hxfs_dir)),
         (AT_NULL, 0),
     ];
 
-    // Words: argc (1) + argv[0] + NULL + envp NULL + 10 auxv pairs (20 words) = 24 words.
+    // Words: argc (1) + argv[0] + NULL + envp NULL + 12 auxv pairs (24 words) = 28 words.
     let total_words = 4 + aux_entries.len() * 2;
     let sp_off = (rand_off - total_words * 8) & !0xf;
 

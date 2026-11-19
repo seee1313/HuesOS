@@ -98,6 +98,8 @@ fn load_config(logger: &mut InitLogger, bootfs: &Vmo) -> (InitConfig, bool) {
 static DRIVER_MANAGER_ELF: &[u8] = include_bytes!(env!("HUESOS_DRIVER_MANAGER_PATH"));
 static TERMINAL_ELF: &[u8] = include_bytes!(env!("HUESOS_TERMINAL_PATH"));
 static FAULT_PROBE_ELF: &[u8] = include_bytes!(env!("HUESOS_FAULT_PROBE_PATH"));
+static DYN_C_SMOKE_ELF: &[u8] = include_bytes!(env!("HUESOS_DYN_C_SMOKE_PATH"));
+static DYN_RUST_SMOKE_ELF: &[u8] = include_bytes!(env!("HUESOS_DYN_RUST_SMOKE_PATH"));
 static SHUTDOWN_BROKER_ELF: &[u8] = include_bytes!(env!("HUESOS_SHUTDOWN_BROKER_PATH"));
 static KEY_BROKER_ELF: &[u8] = include_bytes!(env!("HUESOS_KEY_BROKER_PATH"));
 
@@ -152,7 +154,9 @@ pub extern "C" fn _start() -> ! {
     run_waitset_check(&mut logger);
     ui.step(b"selftest", 75);
     run_fault_isolation_check(&mut logger, &bootfs);
-    ui.step(b"selftest", 87);
+    ui.step(b"selftest", 80);
+    run_dynamic_linking_smoke(&mut logger, &bootfs);
+    ui.step(b"selftest", 90);
     run_shutdown_authorization_check(&mut logger, &bootfs);
     ui.end(b"selftest", StageState::Done, &mut logger);
 
@@ -1757,6 +1761,98 @@ fn run_fault_isolation_check(logger: &mut InitLogger, lib_vmo: &Vmo) {
         logger,
         "[init] user fault isolation OK (#PF/#UD/#GP/#DE contained)"
     );
+}
+
+fn copy_bootfs_file_to_exec_vmo(bootfs: &Vmo, path: &[u8]) -> libcanvas::Result<Vmo> {
+    let entry = find_bootfs_entry(bootfs, path)?;
+    let aligned = (entry.len + 4095) & !4095;
+    let vmo = Vmo::create_with_flags(aligned, libcanvas::vmo_create_flags::EXECUTABLE)?;
+    let mut buf = [0u8; 4096];
+    let mut copied = 0u64;
+    while copied < entry.len {
+        let chunk = (entry.len - copied).min(buf.len() as u64) as usize;
+        let read_n = bootfs.read(entry.offset + copied, &mut buf[..chunk])?;
+        if read_n != chunk {
+            return Err(ErrorCode::Internal);
+        }
+        let wrote_n = vmo.write(copied, &buf[..chunk])?;
+        if wrote_n != chunk {
+            return Err(ErrorCode::Internal);
+        }
+        copied += chunk as u64;
+    }
+    Ok(vmo)
+}
+
+fn run_dynamic_linking_smoke(logger: &mut InitLogger, lib_vmo: &Vmo) {
+    let Ok((c_proc, c_boot)) =
+        libcanvas::process::spawn_elf_with_lib("dyn-c-smoke", DYN_C_SMOKE_ELF, lib_vmo)
+    else {
+        init_logln!(logger, "[init] dynamic linking smoke FAILED (c launch)");
+        return;
+    };
+    drop(c_boot);
+    match wait_process_exit(&c_proc) {
+        Ok(0) => {}
+        Ok(code) => {
+            init_logln!(
+                logger,
+                "[init] dynamic linking smoke FAILED (c exit {})",
+                code
+            );
+            return;
+        }
+        Err(error) => {
+            init_logln!(
+                logger,
+                "[init] dynamic linking smoke FAILED (c wait: {})",
+                error.as_str()
+            );
+            return;
+        }
+    }
+
+    let Ok(plugin_vmo) = copy_bootfs_file_to_exec_vmo(lib_vmo, b"/lib/libsmoke_plugin.so") else {
+        init_logln!(
+            logger,
+            "[init] dynamic linking smoke FAILED (plugin vmo extract)"
+        );
+        return;
+    };
+    let Ok((r_proc, r_boot)) =
+        libcanvas::process::spawn_elf_with_lib("dyn-rust-smoke", DYN_RUST_SMOKE_ELF, lib_vmo)
+    else {
+        init_logln!(logger, "[init] dynamic linking smoke FAILED (rust launch)");
+        return;
+    };
+    if let Err((error, _handle)) = r_boot.write_handle(b"plugin-vmo", plugin_vmo.into_handle()) {
+        init_logln!(
+            logger,
+            "[init] dynamic linking smoke FAILED (plugin handle send: {})",
+            error.as_str()
+        );
+        return;
+    }
+    drop(r_boot);
+    match wait_process_exit(&r_proc) {
+        Ok(0) => {
+            init_logln!(logger, "[init] dynamic linking smoke OK");
+        }
+        Ok(code) => {
+            init_logln!(
+                logger,
+                "[init] dynamic linking smoke FAILED (rust exit {})",
+                code
+            );
+        }
+        Err(error) => {
+            init_logln!(
+                logger,
+                "[init] dynamic linking smoke FAILED (rust wait: {})",
+                error.as_str()
+            );
+        }
+    }
 }
 
 fn run_vmo_check(logger: &mut InitLogger) {

@@ -85,6 +85,40 @@ typedef struct CanvasFs CanvasFs;
 /** Opaque HxFS open file handle. */
 typedef struct CanvasFsFile CanvasFsFile;
 
+/** Opaque intra-process thread handle. */
+typedef struct CanvasThread CanvasThread;
+
+/** Thread entry function signature for `canvas_thread_spawn`. */
+typedef int64_t (*CanvasThreadFn)(void *arg);
+
+/** `canvas_dlopen_*` flags. */
+#define CANVAS_RTLD_LAZY     0x0001
+#define CANVAS_RTLD_NOW      0x0002
+#define CANVAS_RTLD_LOCAL    0x0000
+#define CANVAS_RTLD_NOLOAD   0x0004
+#define CANVAS_RTLD_GLOBAL   0x0100
+#define CANVAS_RTLD_NODELETE 0x1000
+
+/** Symbol/object info filled by `canvas_dladdr`. */
+typedef struct CanvasDlInfo {
+    const char *dli_fname;
+    void *dli_fbase;
+    const char *dli_sname;
+    void *dli_saddr;
+} CanvasDlInfo;
+
+/** Loaded module info passed to `canvas_dl_iterate_phdr`. */
+typedef struct CanvasDlPhdrInfo {
+    uint64_t dlpi_addr;
+    const char *dlpi_name;
+    const void *dlpi_phdr;
+    uint16_t dlpi_phnum;
+    uint64_t dlpi_adds;
+    uint64_t dlpi_subs;
+    size_t dlpi_tls_modid;
+    void *dlpi_tls_data;
+} CanvasDlPhdrInfo;
+
 /* --------------------------------------------------------------------------
  * ABI metadata & raw syscall gateway
  * -------------------------------------------------------------------------- */
@@ -239,6 +273,44 @@ int64_t canvas_fs_open_file(CanvasFs *fs, const char *path, size_t path_len, Can
 int64_t canvas_fs_file_read(CanvasFsFile *file, uint8_t *buf, size_t buf_len, size_t *out_len);
 int64_t canvas_fs_file_read_at(CanvasFsFile *file, uint64_t offset, uint8_t *buf, size_t len, size_t *out_len);
 void canvas_fs_file_close(CanvasFsFile *file);
+
+/* --------------------------------------------------------------------------
+ * Capability-first dynamic loading, finalisation & intra-process threading
+ * -------------------------------------------------------------------------- */
+
+void *canvas_dlopen_vmo(uint32_t vmo_handle, int32_t flags);
+void *canvas_dlopen_soname(const char *soname, int32_t flags);
+void *canvas_dlopen_blob(uint32_t blob_ch, int32_t flags);
+void *canvas_dlsym(void *handle, const char *symbol);
+int32_t canvas_dlclose(void *handle);
+const char *canvas_dlerror(void);
+int32_t canvas_dladdr(const void *addr, CanvasDlInfo *out_info);
+int32_t canvas_dl_iterate_phdr(
+    int32_t (*callback)(CanvasDlPhdrInfo *info, size_t size, void *data),
+    void *data
+);
+int32_t canvas_dl_set_lib_dir(uint32_t hxfs_dir_ch);
+int32_t canvas_dl_set_hxfs_service(uint32_t hxfs_ch);
+
+int64_t canvas_atexit(void (*func)(void));
+int32_t atexit(void (*func)(void));
+int32_t __cxa_atexit(void (*func)(void *), void *arg, void *dso_handle);
+void *__tls_get_addr(void *ti);
+
+int64_t canvas_thread_spawn(
+    const char *name,
+    CanvasThreadFn entry,
+    void *arg,
+    size_t stack_size,
+    CanvasThread **out_thread
+);
+int64_t canvas_thread_join(CanvasThread *thread, int64_t *out_exit_code);
+_Noreturn void canvas_thread_exit(int64_t code);
+
+void *malloc(size_t size);
+void *calloc(size_t count, size_t size);
+void *realloc(void *ptr, size_t new_size);
+void free(void *ptr);
 
 #ifdef __cplusplus
 }
