@@ -135,7 +135,7 @@ impl HshHost {
         };
         let mut buf = [0u8; 64];
         for _ in 0..32 {
-            match reg.read_optional_handle_timeout(&mut buf, HANDSHAKE_WAIT_TICKS) {
+            match reg.read_optional_handle(&mut buf) {
                 Ok((_n, handle)) => drop(handle),
                 Err(ErrorCode::ShouldWait) | Err(ErrorCode::TimedOut) => break,
                 Err(_) => break,
@@ -158,17 +158,14 @@ impl HshHost {
                 // A late reply to a different handshake: skip it rather than
                 // giving up on this one.
                 Ok((_n, None)) => {}
-                Err(ErrorCode::ShouldWait) | Err(ErrorCode::TimedOut) => {
-                    polls += 1;
-                    libcanvas::process::yield_now();
-                }
+                // The channel read already waited for a full budget.
+                Err(ErrorCode::ShouldWait) | Err(ErrorCode::TimedOut) => {}
                 Err(e) => {
-                    println!("[hsh] query handshake read error: {}", e.as_str());
+                    libcanvas::println!("[hsh] hxfs handshake read error: {}", e.as_str());
                     return None;
                 }
             }
         }
-        println!("[hsh] query handshake timed out after {} polls", polls);
         None
     }
 
@@ -222,11 +219,14 @@ impl HshHost {
         for _ in 0..HANDSHAKE_READS {
             match reg.read_optional_handle_timeout(&mut buf, HANDSHAKE_WAIT_TICKS) {
                 Ok((n, Some(handle))) if &buf[..n] == b"service:query:channel" => {
-                    println!("[hsh] query channel granted");
+                    libcanvas::println!("[hsh] query channel granted");
                     return Some(Channel::from_handle(handle));
                 }
                 Ok((n, None)) if buf[..n].starts_with(b"err:query") => {
-                    println!("[hsh] query handshake refused: {}", String::from_utf8_lossy(&buf[..n]));
+                    libcanvas::println!(
+                        "[hsh] query handshake refused: {}",
+                        String::from_utf8_lossy(&buf[..n])
+                    );
                     return None;
                 }
                 Ok((_n, Some(handle))) => drop(handle),
@@ -236,12 +236,12 @@ impl HshHost {
                 // The channel read already waited for a full budget.
                 Err(ErrorCode::ShouldWait) | Err(ErrorCode::TimedOut) => {}
                 Err(e) => {
-                    println!("[hsh] query handshake read error: {}", e.as_str());
+                    libcanvas::println!("[hsh] query handshake read error: {}", e.as_str());
                     return None;
                 }
             }
         }
-        println!("[hsh] query handshake: no reply after {HANDSHAKE_READS} reads");
+        libcanvas::println!("[hsh] query handshake: no reply after {HANDSHAKE_READS} reads");
         None
     }
 
