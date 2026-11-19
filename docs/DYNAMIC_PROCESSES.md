@@ -109,6 +109,41 @@ The remaining integration work is future-facing:
 2. complete handle/page-table hard accounting and validate resource release
    against lifecycle transitions; CPU tick charging already exists.
 
+## Foreign termination: `ProcessTerminate`
+
+`ProcessExit` is a process ending *itself*; `ProcessTerminate(process_handle,
+exit_code)` (syscall 83) is a supervisor ending a child it holds a handle to.
+It is the capability behind an interactive `Ctrl-C`: `hsh` owns the child's
+`Process` handle and needs no cooperation from the child.
+
+Rights and refusals:
+
+- the handle must be a `Process` handle with `WRITE` (the default rights minted
+  by `ProcessCreate`); a `READ`-only duplicate is enough for `ProcessWait` but
+  cannot kill;
+- `BadHandle` / `WrongType` when the handle is not a process;
+- `InvalidArgs` when the caller targets itself — self-exit must still go through
+  `ProcessExit` so the calling thread stops instead of returning into an address
+  space that is being freed;
+- `AccessDenied` for a process marked critical to the root job (the supervisor
+  chain may only exit itself);
+- `NotSupported` before the kernel installs its terminate hook.
+
+The kernel implements it with the same body `ProcessExit` uses
+(`scheduler::terminate_process`): the first terminator publishes the exit code
+and owns the teardown, later calls return `Ok(0)` and never rewrite an observed
+status. The teardown marks every task of the victim finished on every CPU,
+evicts it from the fair queues, publishes the exit code on each thread object so
+`ThreadWait` also returns, wakes `ProcessWait` observers and exit Ports with the
+given code, and hands the address space and handle table to the ordinary
+process-teardown path — the same one `ProcessExit` uses, which refuses to free
+page tables while a CPU still has the process as its current task.
+
+`hsh` uses it while a child ELF runs: it polls a duplicate of its terminal
+channel, and on `Ctrl-C` (`0x03`) terminates the child with 130 (128 + SIGINT),
+prints `^C` and returns to the prompt. Keystrokes typed during the child run are
+buffered and replayed instead of being dropped.
+
 ## What still requires on-target verification
 
 - Extend evidence beyond the default ProcessWait boot probe: concurrent waits,
