@@ -2,7 +2,7 @@
 BdsDxe: starting Boot0001 "UEFI QEMU DVD-ROM QM00005 " from PciRoot(0x0)/Pci(0x1F,0x2)/Sata(0x2,0xFFFF,0x0)
 [2J[01;01H[01;01H[2J[01;01H[01;01H[HuesOS] Bootloader handed over control
 [security] BSP degraded: SMEP/SMAP unavailable on this CPU
-[PMM] Reserved HBI image: phys_addr=0x177fc000, length=36344368
+[PMM] Reserved HBI image: phys_addr=0x177f9000, length=36348120
 [storage] reserved boot DMA pool: phys=0x3800000, len=0x4000000
 [HBI] Ed25519 signature verified (v2.2)
 [measure] signed kernel/HBI/cmdline digest ready for PCR 12
@@ -23,7 +23,7 @@ BdsDxe: starting Boot0001 "UEFI QEMU DVD-ROM QM00005 " from PciRoot(0x0)/Pci(0x1
 [acpi] config mint authority installed: snapshot 1 window(s) 1
 [SMP] MADT parsed 2 CPUs found
 [IOAPIC] routed keyboard IRQ1
-[SMP] LAPIC timer count=624599
+[SMP] LAPIC timer count=624299
 [SMP] Booting AP 1
 [security] AP 1 degraded: SMEP/SMAP unavailable
 [SMP] AP 1 online (waiting for release)
@@ -34,8 +34,8 @@ HBI v2.2 parsed. Entries: 0x4
 [extable] installed 2 recoverable-copy entries
 [SMP] APs released to run
 [SMP] AP HuesOS v0.1.0 on CPU 0
-1PMM: 59156/268435456 frames (231 MiB)
- scheduling
+1 scheduling
+PMM: 59153/268435456 frames (231 MiB)
 FB: 1280x800@32
 [init] installed immutable ACPI table archive VMO
 [init] installed deny-by-default ACPI broker capability
@@ -54,72 +54,72 @@ FB: 1280x800@32
 [init] VMO read/write round-trip OK
 [init] channel IPC round-trip OK
 [init] monotonic clock OK (10-tick wait measured 11 ticks)
-[kernel] entering userspace: rip=0x4c46c3b80 rsp=0x7ffffefffe80 cs=0x23 ss=0x1b
+[kernel] entering userspace: rip=0x4a55cbb80 rsp=0x7ffffefffe80 cs=0x23 ss=0x1b
 [fault-probe] triggering cpu
 [init] SMP affinity self-test OK (child ran on CPU 1)
-[kernel] entering userspace: rip=0x45e253b80 rsp=0x7ffffefffe80 cs=0x23 ss=0x1b
+[kernel] entering userspace: rip=0x4b6332b80 rsp=0x7ffffefffe80 cs=0x23 ss=0x1b
 [fault-probe] triggering wait
-[kernel] entering userspace: rip=0x417c19b80 rsp=0x7ffffefffe80 cs=0x23 ss=0x1b
+[kernel] entering userspace: rip=0x458777b80 rsp=0x7ffffefffe80 cs=0x23 ss=0x1b
 [fault-probe] triggering wait
-[kernel] entering userspace: rip=0x4db83eb80 rsp=0x7ffffefffe80 cs=0x23 ss=0x1b
+[kernel] entering userspace: rip=0x446829b80 rsp=0x7ffffefffe80 cs=0x23 ss=0x1b
 [fault-probe] triggering wait
-[kernel] entering userspace: rip=0x4804c3b80 rsp=0x7ffffefffe80 cs=0x23 ss=0x1b
+[kernel] entering userspace: rip=0x45271cb80 rsp=0x7ffffefffe80 cs=0x23 ss=0x1b
 [fault-probe] triggering wait
-[kernel] entering userspace: rip=0x4fd172b80 rsp=0x7ffffefffe80 cs=0x23 ss=0x1b
+[kernel] entering userspace: rip=0x452135b80 rsp=0x7ffffefffe80 cs=0x23 ss=0x1b
 [fault-probe] triggering wait
-[kernel] entering userspace: rip=0x4928f6b80 rsp=0x7ffffefffe80 cs=0x23 ss=0x1b
+[kernel] entering userspace: rip=0x419332b80 rsp=0x7ffffefffe80 cs=0x23 ss=0x1b
 [fault-probe] triggering wait
-[kernel] entering userspace: rip=0x4936ddb80 rsp=0x7ffffefffe80 cs=0x23 ss=0x1b
+[kernel] entering userspace: rip=0x45e7eab80 rsp=0x7ffffefffe80 cs=0x23 ss=0x1b
 [fault-probe] triggering wait
-[kernel] entering userspace: rip=0x4f9170b80 rsp=0x7ffffefffe80 cs=0x23 ss=0x1b
+[kernel] entering userspace: rip=0x42539bb80 rsp=0x7ffffefffe80 cs=0x23 ss=0x1b
 [fault-probe] triggering wait
-[kernel] entering userspace: rip=0x44fc7bb80 rsp=0x7ffffefffe80 cs=0x23 ss=0x1b
+[kernel] entering userspace: rip=0x4ede8cb80 rsp=0x7ffffefffe80 cs=0x23 ss=0x1b
 [fault-probe] triggering wait
-[kernel] entering userspace: rip=0x4da258b80 rsp=0x7ffffefffe80 cs=0x23 ss=0x1b
+[kernel] entering userspace: rip=0x4d2346b80 rsp=0x7ffffefffe80 cs=0x23 ss=0x1b
 [fault-probe] triggering wait
-[kernel] entering userspace: rip=0x490adeb80 rsp=0x7ffffefffe80 cs=0x23 ss=0x1b
+[kernel] entering userspace: rip=0x4fde45b80 rsp=0x7ffffefffe80 cs=0x23 ss=0x1b
 [fault-probe] triggering wait
-[kernel] entering userspace: rip=0x43cd41b80 rsp=0x7ffffefffe80 cs=0x23 ss=0x1b
+[kernel] entering userspace: rip=0x4ec626b80 rsp=0x7ffffefffe80 cs=0x23 ss=0x1b
 [fault-probe] triggering wait
-[kernel] entering userspace: rip=0x478a5ab80 rsp=0x7ffffefffe80 cs=0x23 ss=0x1b
+[kernel] entering userspace: rip=0x4b3257b80 rsp=0x7ffffefffe80 cs=0x23 ss=0x1b
 [fault-probe] triggering wait
-[kernel] entering userspace: rip=0x4ba601b80 rsp=0x7ffffefffe80 cs=0x23 ss=0x1b
+[kernel] entering userspace: rip=0x4df4a5b80 rsp=0x7ffffefffe80 cs=0x23 ss=0x1b
 [fault-probe] triggering wait
-[kernel] entering userspace: rip=0x45b799b80 rsp=0x7ffffefffe80 cs=0x23 ss=0x1b
+[kernel] entering userspace: rip=0x4c2ebab80 rsp=0x7ffffefffe80 cs=0x23 ss=0x1b
 [fault-probe] triggering wait
-[kernel] entering userspace: rip=0x43dfbfb80 rsp=0x7ffffefffe80 cs=0x23 ss=0x1b
+[kernel] entering userspace: rip=0x43a9f4b80 rsp=0x7ffffefffe80 cs=0x23 ss=0x1b
 [fault-probe] triggering wait
-[kernel] entering userspace: rip=0x4ef756b80 rsp=0x7ffffefffe80 cs=0x23 ss=0x1b
+[kernel] entering userspace: rip=0x4441acb80 rsp=0x7ffffefffe80 cs=0x23 ss=0x1b
 [fault-probe] triggering wait
-[kernel] entering userspace: rip=0x466857b80 rsp=0x7ffffefffe80 cs=0x23 ss=0x1b
+[kernel] entering userspace: rip=0x422c58b80 rsp=0x7ffffefffe80 cs=0x23 ss=0x1b
 [fault-probe] triggering wait
-[kernel] entering userspace: rip=0x455b96b80 rsp=0x7ffffefffe80 cs=0x23 ss=0x1b
+[kernel] entering userspace: rip=0x42855cb80 rsp=0x7ffffefffe80 cs=0x23 ss=0x1b
 [fault-probe] triggering wait
-[kernel] entering userspace: rip=0x42d9efb80 rsp=0x7ffffefffe80 cs=0x23 ss=0x1b
+[kernel] entering userspace: rip=0x47648fb80 rsp=0x7ffffefffe80 cs=0x23 ss=0x1b
 [fault-probe] triggering wait
-[kernel] entering userspace: rip=0x4c32e0b80 rsp=0x7ffffefffe80 cs=0x23 ss=0x1b
+[kernel] entering userspace: rip=0x494678b80 rsp=0x7ffffefffe80 cs=0x23 ss=0x1b
 [fault-probe] triggering wait
-[kernel] entering userspace: rip=0x40d266b80 rsp=0x7ffffefffe80 cs=0x23 ss=0x1b
+[kernel] entering userspace: rip=0x46efe0b80 rsp=0x7ffffefffe80 cs=0x23 ss=0x1b
 [fault-probe] triggering wait
-[kernel] entering userspace: rip=0x432111b80 rsp=0x7ffffefffe80 cs=0x23 ss=0x1b
+[kernel] entering userspace: rip=0x421aa2b80 rsp=0x7ffffefffe80 cs=0x23 ss=0x1b
 [fault-probe] triggering wait
-[kernel] entering userspace: rip=0x45537db80 rsp=0x7ffffefffe80 cs=0x23 ss=0x1b
+[kernel] entering userspace: rip=0x431298b80 rsp=0x7ffffefffe80 cs=0x23 ss=0x1b
 [fault-probe] triggering wait
-[kernel] entering userspace: rip=0x439560b80 rsp=0x7ffffefffe80 cs=0x23 ss=0x1b
+[kernel] entering userspace: rip=0x4184e3b80 rsp=0x7ffffefffe80 cs=0x23 ss=0x1b
 [fault-probe] triggering wait
-[kernel] entering userspace: rip=0x4e5f39b80 rsp=0x7ffffefffe80 cs=0x23 ss=0x1b
+[kernel] entering userspace: rip=0x4b4d61b80 rsp=0x7ffffefffe80 cs=0x23 ss=0x1b
 [fault-probe] triggering wait
-[kernel] entering userspace: rip=0x442631b80 rsp=0x7ffffefffe80 cs=0x23 ss=0x1b
+[kernel] entering userspace: rip=0x47367cb80 rsp=0x7ffffefffe80 cs=0x23 ss=0x1b
 [fault-probe] triggering wait
-[kernel] entering userspace: rip=0x4217bdb80 rsp=0x7ffffefffe80 cs=0x23 ss=0x1b
+[kernel] entering userspace: rip=0x400c6eb80 rsp=0x7ffffefffe80 cs=0x23 ss=0x1b
 [fault-probe] triggering wait
-[kernel] entering userspace: rip=0x4802b3b80 rsp=0x7ffffefffe80 cs=0x23 ss=0x1b
+[kernel] entering userspace: rip=0x4b20c4b80 rsp=0x7ffffefffe80 cs=0x23 ss=0x1b
 [fault-probe] triggering wait
-[kernel] entering userspace: rip=0x4b1c73b80 rsp=0x7ffffefffe80 cs=0x23 ss=0x1b
+[kernel] entering userspace: rip=0x4eeb63b80 rsp=0x7ffffefffe80 cs=0x23 ss=0x1b
 [fault-probe] triggering wait
-[kernel] entering userspace: rip=0x499ba0b80 rsp=0x7ffffefffe80 cs=0x23 ss=0x1b
+[kernel] entering userspace: rip=0x4209c6b80 rsp=0x7ffffefffe80 cs=0x23 ss=0x1b
 [fault-probe] triggering wait
-[kernel] entering userspace: rip=0x4ce63fb80 rsp=0x7ffffefffe80 cs=0x23 ss=0x1b
+[kernel] entering userspace: rip=0x436e22b80 rsp=0x7ffffefffe80 cs=0x23 ss=0x1b
 [fault-probe] triggering wait
 [init] ProcessWait repeated observation OK
 [init] ProcessWait lifecycle smoke OK (32 blocked wakes)
@@ -129,31 +129,31 @@ FB: 1280x800@32
 [init] waitset self-test port-timeout OK
 [init] waitset self-test peer-closed OK
 [init] waitset self-test OK
-[kernel] entering userspace: rip=0x403620b80 rsp=0x7ffffefffe80 cs=0x23 ss=0x1b
+[kernel] entering userspace: rip=0x4197abb80 rsp=0x7ffffefffe80 cs=0x23 ss=0x1b
 [fault-probe] triggering page
-[user-fault] process=fault-probe koid=617 task=278531 cpu=0 reason=PAGE FAULT rip=0x13f97bcc1 address=0x10000 error=0x4 action=terminate-process code=-4097
-[kernel] entering userspace: rip=0x4aaf53b80 rsp=0x7ffffefffe80 cs=0x23 ss=0x1b
+[user-fault] process=fault-probe koid=617 task=278531 cpu=0 reason=PAGE FAULT rip=0x120356cc1 address=0x10000 error=0x4 action=terminate-process code=-4097
+[kernel] entering userspace: rip=0x43756ab80 rsp=0x7ffffefffe80 cs=0x23 ss=0x1b
 [fault-probe] triggering opcode
-[user-fault] process=fault-probe koid=635 task=286723 cpu=0 reason=INVALID OPCODE rip=0x18379fb53 address=0x0 error=0x0 action=terminate-process code=-4099
-[kernel] entering userspace: rip=0x4eb6ccb80 rsp=0x7ffffefffe80 cs=0x23 ss=0x1b
+[user-fault] process=fault-probe koid=635 task=286723 cpu=0 reason=INVALID OPCODE rip=0x14a4d4b53 address=0x0 error=0x0 action=terminate-process code=-4099
+[kernel] entering userspace: rip=0x49da31b80 rsp=0x7ffffefffe80 cs=0x23 ss=0x1b
 [fault-probe] triggering gpf
-[user-fault] process=fault-probe koid=653 task=294915 cpu=0 reason=GENERAL PROTECTION FAULT rip=0x189bc4b03 address=0x0 error=0x0 action=terminate-process code=-4098
-[kernel] entering userspace: rip=0x40e10fb80 rsp=0x7ffffefffe80 cs=0x23 ss=0x1b
+[user-fault] process=fault-probe koid=653 task=294915 cpu=0 reason=GENERAL PROTECTION FAULT rip=0x19a568b03 address=0x0 error=0x0 action=terminate-process code=-4098
+[kernel] entering userspace: rip=0x4d0ab3b80 rsp=0x7ffffefffe80 cs=0x23 ss=0x1b
 [fault-probe] triggering divide
-[user-fault] process=fault-probe koid=671 task=303107 cpu=0 reason=DIVIDE ERROR rip=0x1ad1d8c3a address=0x0 error=0x0 action=terminate-process code=-4100
+[user-fault] process=fault-probe koid=671 task=303107 cpu=0 reason=DIVIDE ERROR rip=0x19c279c3a address=0x0 error=0x0 action=terminate-process code=-4100
 [init] user fault isolation OK (#PF/#UD/#GP/#DE contained)
-[kernel] entering userspace: rip=0x481993b80 rsp=0x7ffffefffe80 cs=0x23 ss=0x1b
+[kernel] entering userspace: rip=0x459458b80 rsp=0x7ffffefffe80 cs=0x23 ss=0x1b
 [smoke-plugin] ctor
 [smoke-plugin] dtor
 [dyn-c-smoke] PASS
 [dyn-c-smoke] atexit OK
-[kernel] entering userspace: rip=0x44e8cdb80 rsp=0x7ffffefffe80 cs=0x23 ss=0x1b
+[kernel] entering userspace: rip=0x477cd5b80 rsp=0x7ffffefffe80 cs=0x23 ss=0x1b
 [smoke-plugin] ctor
 [smoke-plugin] dtor
 [dyn-rust-smoke] PASS
 [dyn-rust-smoke] atexit OK
 [init] dynamic linking smoke OK
-[kernel] entering userspace: rip=0x42bd19b80 rsp=0x7ffffefffe80 cs=0x23 ss=0x1b
+[kernel] entering userspace: rip=0x4fd9c9b80 rsp=0x7ffffefffe80 cs=0x23 ss=0x1b
 [fault-probe] triggering shutdown
 [init] shutdown authorization OK (unprivileged caller denied)
 [init] stage selftest ok
@@ -167,7 +167,7 @@ FB: 1280x800@32
 [init] delegated unique KeyBroker authority to DriverManager
 [init] delegated unique PciConfigMint authority to DriverManager
 [init] delegated DeviceLeaseAuthority to DriverManager
-[kernel] entering userspace: rip=0x4172a0 rsp=0x7ffffefffff8 cs=0x23 ss=0x1b
+[kernel] entering userspace: rip=0x417370 rsp=0x7ffffefffff8 cs=0x23 ss=0x1b
 [driver-manager] started in userspace
 [driver-manager] received unique KeyBroker generation authority
 [driver-manager] received unique PciConfigMint authority
@@ -178,26 +178,26 @@ FB: 1280x800@32
 [init] passed storage boot-info VMO to DriverManager
 [init] passed HBI BOOTFS VMO to DriverManager
 [init] passed ACPI table archive to DriverManager
-[init] transferred ACPI broker capability
-[init] manifest input-host: minting 2 resource grant(s)
 [driver-manager] received storage boot-info VMO
 [driver-manager] storage boot-info: dma=0x3800000+0x4000000 storage_off=false
 [driver-manager] received BOOTFS VMO from init
+[init] transferred ACPI broker capability
+[init] manifest input-host: minting 2 resource grant(s)
 [init] manifest input-host: transferred 2/2 resource handle(s) to DriverManager
 [init] manifest input-host: signalled grants-complete to DriverManager
 [init] boot DMA pool transferred: dma=0x3800000+0x4000000
 [init] stage shutdown-broker start: Arming power control
 [init] shutdown-broker: spawned
+[init] shutdown-broker: marked critical
 [kernel] entering userspace: rip=0x400190 rsp=0x7ffffefffff8 cs=0x23 ss=0x1b
 [shutdown-broker] started
-[init] shutdown-broker: marked critical
 [shutdown-broker] ready; awaiting shutdown command
 [init] shutdown-broker: ready
 [init] stage shutdown-broker ok
 [init] passed registry channel to DriverManager
 [init] stage terminal start: Starting terminal
 [init] launched terminal
-[kernel] entering userspace: rip=0x4749b6b80 rsp=0x7ffffefffe80 cs=0x23 ss=0x1b
+[kernel] entering userspace: rip=0x4cb409b80 rsp=0x7ffffefffe80 cs=0x23 ss=0x1b
 [terminal] started in userspace
 [init] stage terminal ok
 [driver-manager] BOOTFS hash manifest verified and mounted
@@ -205,6 +205,11 @@ FB: 1280x800@32
 [driver-manager] launched restartable PCI manager generation 1
 [driver-manager] received immutable ACPI table archive
 [driver-manager] received unique ACPI broker capability
+[kernel] entering userspace: rip=0x4034f0 rsp=0x7ffffefffff8 cs=0x23 ss=0x1b
+[pci-manager] userspace service started (configuration disabled)
+[pci-manager] ready without root descriptors; fail-closed
+[kernel] entering userspace: rip=0x4004b0 rsp=0x7ffffefffff8 cs=0x23 ss=0x1b
+[acpi-manager] isolated Ring-3 service started
 [driver-manager] launched restartable ACPI manager generation 1
 [driver-manager] grants-complete for input-host
 [driver-manager] manifest: host=input-host services=1 irqs=1 io_ports=1
@@ -214,11 +219,6 @@ FB: 1280x800@32
 [driver-manager] manifest loaded: host=input-host elf=/drivers/input-host.elf
 [driver-manager] launched DriverHost input-host
 [driver-manager] forwarded 2/2 resource handle(s) to input-host
-[kernel] entering userspace: rip=0x4034f0 rsp=0x7ffffefffff8 cs=0x23 ss=0x1b
-[pci-manager] userspace service started (configuration disabled)
-[pci-manager] ready without root descriptors; fail-closed
-[kernel] entering userspace: rip=0x4004b0 rsp=0x7ffffefffff8 cs=0x23 ss=0x1b
-[acpi-manager] isolated Ring-3 service started
 [kernel] entering userspace: rip=0x400830 rsp=0x7ffffefffff8 cs=0x23 ss=0x1b
 [driver-host:input] started
 [driver-host:input] received manifest resource #1: resource:input-host:ioport:0x60:0x1:excl
@@ -239,7 +239,7 @@ FB: 1280x800@32
 [uacpi] WAET 0x000000001F775000 00000028 v01 (BOCHS  BXPC    )
 [uacpi] BGRT 0x000000001F774000 00000038 v01 (INTEL  EDK2    )
 [uacpi] FACS 0x000000001F7DD000 00000040
-[uacpi] successfully loaded 1 AML blob, 1709 ops in 10ms (avg 170900/s)
+[uacpi] successfully loaded 1 AML blob, 1709 ops in 20ms (avg 85450/s)
 [acpi-manager] AML namespace loaded (snapshot 1, degraded=false)
 [acpi-manager] generation 1 archive/broker capabilities ready
 [driver-manager] input DriverHost starting
@@ -254,8 +254,8 @@ FB: 1280x800@32
 [pci-manager] read-only config authority ready: 1 window(s), snapshot 1, producer generation 1
 [pci-manager] obs backend=ecam windows=1 snapshot=1
 [driver-manager] PCI manager ready (read-only config authority, windows 1)
-[driver-manager] mediation channel pair established for pci generation 1 acpi generation 1
 [pci-manager] received DeviceLeaseAuthority
+[driver-manager] mediation channel pair established for pci generation 1 acpi generation 1
 [pci-manager] mediation channel established generation 1
 [pci-manager] obs mediation op=read status=ok seg=0 bus=0 dev=0 fn=0 off=0x0 width=4 correlation=0 absent=0 latency-ticks=0
 [acpi-manager] pci-mediation self-test: read=ok vendor-nonzero=true
@@ -343,94 +343,192 @@ FB: 1280x800@32
 [driver-host:input] attached keyboard client
 [terminal] spawned /bin/hsh.elf pid=16
 [terminal] keyboard service online, starting /bin/hsh.elf session
-[kernel] entering userspace: rip=0x443d0eb80 rsp=0x7ffffefffe60 cs=0x23 ss=0x1b
+[kernel] entering userspace: rip=0x4cb611b80 rsp=0x7ffffefffe60 cs=0x23 ss=0x1b
 [hsh] core language/cls/fn smoke OK
-[kernel] entering userspace: rip=0x474918b80 rsp=0x7ffffefffe60 cs=0x23 ss=0x1b
+[driver-manager] NVMe BlockDevice requested before online
+[driver-manager] query slot 0 granted
+[hsh] query channel granted
+[kernel] entering userspace: rip=0x4613cdb80 rsp=0x7ffffefffe60 cs=0x23 ss=0x1b
+[driver-manager] query slot 0 closed by client
 [hsh] ls.elf pipe OK
-[kernel] entering userspace: rip=0x4ca88cb80 rsp=0x7ffffefffe80 cs=0x23 ss=0x1b
+[driver-manager] NVMe BlockDevice requested before online
+[driver-manager] query slot 0 granted
+[hsh] query channel granted
+[kernel] entering userspace: rip=0x4cef17b80 rsp=0x7ffffefffe80 cs=0x23 ss=0x1b
+[driver-manager] query slot 0 closed by client
 [hsh] pci.elf pipe OK
-[kernel] entering userspace: rip=0x4552c5b80 rsp=0x7ffffefffe60 cs=0x23 ss=0x1b
+[driver-manager] NVMe BlockDevice requested before online
+[driver-manager] query slot 0 granted
+[hsh] query channel granted
+[kernel] entering userspace: rip=0x447458b80 rsp=0x7ffffefffe60 cs=0x23 ss=0x1b
+[driver-manager] query slot 0 closed by client
 [hsh] hxfs.elf status OK
-[kernel] entering userspace: rip=0x494312b80 rsp=0x7ffffefffe60 cs=0x23 ss=0x1b
+[driver-manager] NVMe BlockDevice requested before online
+[driver-manager] query slot 0 granted
+[hsh] query channel granted
+[kernel] entering userspace: rip=0x4f1815b80 rsp=0x7ffffefffe60 cs=0x23 ss=0x1b
+[driver-manager] query slot 0 closed by client
 [hsh] fdisk.elf pipe OK
-[kernel] entering userspace: rip=0x498f9cb80 rsp=0x7ffffefffe30 cs=0x23 ss=0x1b
-[kernel] entering userspace: rip=0x4fe385b80 rsp=0x7ffffefffe60 cs=0x23 ss=0x1b
+[kernel] entering userspace: rip=0x43072db80 rsp=0x7ffffefffe30 cs=0x23 ss=0x1b
+[kernel] entering userspace: rip=0x4fa41fb80 rsp=0x7ffffefffe60 cs=0x23 ss=0x1b
 [hsh] @caps(hxfs=ro) enforcement OK
-[kernel] entering userspace: rip=0x4d0524b80 rsp=0x7ffffefffe60 cs=0x23 ss=0x1b
-[kernel] entering userspace: rip=0x46e92fb80 rsp=0x7ffffefffe70 cs=0x23 ss=0x1b
+[kernel] entering userspace: rip=0x4ade24b80 rsp=0x7ffffefffe60 cs=0x23 ss=0x1b
+[kernel] entering userspace: rip=0x46e86ab80 rsp=0x7ffffefffe70 cs=0x23 ss=0x1b
 [hsh] @caps(hxfs=none,bootfs=none) enforcement OK
-[kernel] entering userspace: rip=0x4edd7db80 rsp=0x7ffffefffe80 cs=0x23 ss=0x1b
-[kernel] entering userspace: rip=0x40c167b80 rsp=0x7ffffefffe60 cs=0x23 ss=0x1b
-[kernel] entering userspace: rip=0x4c48aab80 rsp=0x7ffffefffe60 cs=0x23 ss=0x1b
 [driver-manager] NVMe BlockDevice requested before online
+[driver-manager] query slot 0 granted
+[hsh] query channel granted
+[kernel] entering userspace: rip=0x4d9494b80 rsp=0x7ffffefffe80 cs=0x23 ss=0x1b
+[driver-manager] query slot 0 closed by client
 [driver-manager] NVMe BlockDevice requested before online
+[driver-manager] query slot 0 granted
+[hsh] query channel granted
+[kernel] entering userspace: rip=0x4f833fb80 rsp=0x7ffffefffe60 cs=0x23 ss=0x1b
+[driver-manager] query slot 0 closed by client
 [driver-manager] NVMe BlockDevice requested before online
-[driver-manager] query channel pool exhausted; refusing request
+[driver-manager] query slot 0 granted
+[hsh] query channel granted
+[kernel] entering userspace: rip=0x43e267b80 rsp=0x7ffffefffe60 cs=0x23 ss=0x1b
+[driver-manager] query slot 0 closed by client
 [driver-manager] NVMe BlockDevice requested before online
-[driver-manager] query channel pool exhausted; refusing request
-[driver-manager] query channel pool exhausted; refusing request
-[driver-manager] query channel pool exhausted; refusing request
+[driver-manager] query slot 0 granted
+[hsh] query channel granted
+[kernel] entering userspace: rip=0x40d652b80 rsp=0x7ffffefffe80 cs=0x23 ss=0x1b
+[driver-manager] query slot 0 closed by client
 [driver-manager] NVMe BlockDevice requested before online
-[driver-manager] query channel pool exhausted; refusing request
-[driver-manager] query channel pool exhausted; refusing request
-[driver-manager] query channel pool exhausted; refusing request
+[driver-manager] query slot 0 granted
+[hsh] query channel granted
+[kernel] entering userspace: rip=0x4f9549b80 rsp=0x7ffffefffe60 cs=0x23 ss=0x1b
+[driver-manager] query slot 0 closed by client
 [driver-manager] NVMe BlockDevice requested before online
+[driver-manager] query slot 0 granted
+[hsh] query channel granted
+[kernel] entering userspace: rip=0x4fd977b80 rsp=0x7ffffefffe60 cs=0x23 ss=0x1b
+[driver-manager] query slot 0 closed by client
 [driver-manager] NVMe BlockDevice requested before online
+[driver-manager] query slot 0 granted
+[hsh] query channel granted
+[kernel] entering userspace: rip=0x4c56cab80 rsp=0x7ffffefffe80 cs=0x23 ss=0x1b
+[driver-manager] query slot 0 closed by client
 [driver-manager] NVMe BlockDevice requested before online
-[kernel] entering userspace: rip=0x4cff39b80 rsp=0x7ffffefffe80 cs=0x23 ss=0x1b
+[driver-manager] query slot 0 granted
+[hsh] query channel granted
+[kernel] entering userspace: rip=0x4ba053b80 rsp=0x7ffffefffe60 cs=0x23 ss=0x1b
+[driver-manager] query slot 0 closed by client
 [driver-manager] NVMe BlockDevice requested before online
-[kernel] entering userspace: rip=0x439e00b80 rsp=0x7ffffefffe60 cs=0x23 ss=0x1b
+[driver-manager] query slot 0 granted
+[hsh] query channel granted
+[kernel] entering userspace: rip=0x4c5783b80 rsp=0x7ffffefffe60 cs=0x23 ss=0x1b
+[driver-manager] query slot 0 closed by client
 [driver-manager] NVMe BlockDevice requested before online
-[kernel] entering userspace: rip=0x422d65b80 rsp=0x7ffffefffe60 cs=0x23 ss=0x1b
+[driver-manager] query slot 0 granted
+[hsh] query channel granted
+[kernel] entering userspace: rip=0x420c5cb80 rsp=0x7ffffefffe80 cs=0x23 ss=0x1b
+[driver-manager] query slot 0 closed by client
 [driver-manager] NVMe BlockDevice requested before online
-[kernel] entering userspace: rip=0x45ada1b80 rsp=0x7ffffefffe80 cs=0x23 ss=0x1b
+[driver-manager] query slot 0 granted
+[hsh] query channel granted
+[kernel] entering userspace: rip=0x4fb58fb80 rsp=0x7ffffefffe60 cs=0x23 ss=0x1b
+[driver-manager] query slot 0 closed by client
 [driver-manager] NVMe BlockDevice requested before online
-[kernel] entering userspace: rip=0x4b16d3b80 rsp=0x7ffffefffe60 cs=0x23 ss=0x1b
+[driver-manager] query slot 0 granted
+[hsh] query channel granted
+[kernel] entering userspace: rip=0x4b8a86b80 rsp=0x7ffffefffe60 cs=0x23 ss=0x1b
+[driver-manager] query slot 0 closed by client
 [driver-manager] NVMe BlockDevice requested before online
-[kernel] entering userspace: rip=0x4d0849b80 rsp=0x7ffffefffe60 cs=0x23 ss=0x1b
+[driver-manager] query slot 0 granted
+[hsh] query channel granted
+[kernel] entering userspace: rip=0x4d4a57b80 rsp=0x7ffffefffe80 cs=0x23 ss=0x1b
+[driver-manager] query slot 0 closed by client
 [driver-manager] NVMe BlockDevice requested before online
-[kernel] entering userspace: rip=0x4ecaf0b80 rsp=0x7ffffefffe80 cs=0x23 ss=0x1b
+[driver-manager] query slot 0 granted
+[hsh] query channel granted
+[kernel] entering userspace: rip=0x465702b80 rsp=0x7ffffefffe60 cs=0x23 ss=0x1b
+[driver-manager] query slot 0 closed by client
 [driver-manager] NVMe BlockDevice requested before online
-[kernel] entering userspace: rip=0x45c282b80 rsp=0x7ffffefffe60 cs=0x23 ss=0x1b
+[driver-manager] query slot 0 granted
+[hsh] query channel granted
+[kernel] entering userspace: rip=0x479bafb80 rsp=0x7ffffefffe60 cs=0x23 ss=0x1b
+[driver-manager] query slot 0 closed by client
 [driver-manager] NVMe BlockDevice requested before online
-[kernel] entering userspace: rip=0x4cc5e4b80 rsp=0x7ffffefffe60 cs=0x23 ss=0x1b
+[driver-manager] query slot 0 granted
+[hsh] query channel granted
+[kernel] entering userspace: rip=0x433f74b80 rsp=0x7ffffefffe80 cs=0x23 ss=0x1b
+[driver-manager] query slot 0 closed by client
 [driver-manager] NVMe BlockDevice requested before online
-[kernel] entering userspace: rip=0x4feb4cb80 rsp=0x7ffffefffe80 cs=0x23 ss=0x1b
+[driver-manager] query slot 0 granted
+[hsh] query channel granted
+[kernel] entering userspace: rip=0x45504db80 rsp=0x7ffffefffe60 cs=0x23 ss=0x1b
+[driver-manager] query slot 0 closed by client
 [driver-manager] NVMe BlockDevice requested before online
-[kernel] entering userspace: rip=0x4129b3b80 rsp=0x7ffffefffe60 cs=0x23 ss=0x1b
+[driver-manager] query slot 0 granted
+[hsh] query channel granted
+[kernel] entering userspace: rip=0x4a21c7b80 rsp=0x7ffffefffe60 cs=0x23 ss=0x1b
+[driver-manager] query slot 0 closed by client
 [driver-manager] NVMe BlockDevice requested before online
-[kernel] entering userspace: rip=0x4dd092b80 rsp=0x7ffffefffe60 cs=0x23 ss=0x1b
+[driver-manager] query slot 0 granted
+[hsh] query channel granted
+[kernel] entering userspace: rip=0x4ca7c9b80 rsp=0x7ffffefffe80 cs=0x23 ss=0x1b
+[driver-manager] query slot 0 closed by client
 [driver-manager] NVMe BlockDevice requested before online
-[kernel] entering userspace: rip=0x4a8058b80 rsp=0x7ffffefffe80 cs=0x23 ss=0x1b
+[driver-manager] query slot 0 granted
+[hsh] query channel granted
+[kernel] entering userspace: rip=0x4fe831b80 rsp=0x7ffffefffe60 cs=0x23 ss=0x1b
+[driver-manager] query slot 0 closed by client
 [driver-manager] NVMe BlockDevice requested before online
-[kernel] entering userspace: rip=0x435952b80 rsp=0x7ffffefffe60 cs=0x23 ss=0x1b
+[driver-manager] query slot 0 granted
+[hsh] query channel granted
+[kernel] entering userspace: rip=0x42d23cb80 rsp=0x7ffffefffe60 cs=0x23 ss=0x1b
+[driver-manager] query slot 0 closed by client
 [driver-manager] NVMe BlockDevice requested before online
-[kernel] entering userspace: rip=0x41af51b80 rsp=0x7ffffefffe60 cs=0x23 ss=0x1b
+[driver-manager] query slot 0 granted
+[hsh] query channel granted
+[kernel] entering userspace: rip=0x4be642b80 rsp=0x7ffffefffe80 cs=0x23 ss=0x1b
+[driver-manager] query slot 0 closed by client
 [driver-manager] NVMe BlockDevice requested before online
-[kernel] entering userspace: rip=0x466809b80 rsp=0x7ffffefffe80 cs=0x23 ss=0x1b
+[driver-manager] query slot 0 granted
+[hsh] query channel granted
+[kernel] entering userspace: rip=0x4f538db80 rsp=0x7ffffefffe60 cs=0x23 ss=0x1b
+[driver-manager] query slot 0 closed by client
 [driver-manager] NVMe BlockDevice requested before online
-[kernel] entering userspace: rip=0x46d3ffb80 rsp=0x7ffffefffe60 cs=0x23 ss=0x1b
+[driver-manager] query slot 0 granted
+[hsh] query channel granted
+[kernel] entering userspace: rip=0x48b43bb80 rsp=0x7ffffefffe60 cs=0x23 ss=0x1b
+[driver-manager] query slot 0 closed by client
 [driver-manager] NVMe BlockDevice requested before online
-[kernel] entering userspace: rip=0x415c6cb80 rsp=0x7ffffefffe60 cs=0x23 ss=0x1b
+[driver-manager] query slot 0 granted
+[hsh] query channel granted
+[kernel] entering userspace: rip=0x467cf0b80 rsp=0x7ffffefffe80 cs=0x23 ss=0x1b
+[driver-manager] query slot 0 closed by client
 [driver-manager] NVMe BlockDevice requested before online
-[kernel] entering userspace: rip=0x4d0084b80 rsp=0x7ffffefffe80 cs=0x23 ss=0x1b
+[driver-manager] query slot 0 granted
+[hsh] query channel granted
+[kernel] entering userspace: rip=0x4ea725b80 rsp=0x7ffffefffe60 cs=0x23 ss=0x1b
+[driver-manager] query slot 0 closed by client
 [driver-manager] NVMe BlockDevice requested before online
-[kernel] entering userspace: rip=0x491f31b80 rsp=0x7ffffefffe60 cs=0x23 ss=0x1b
+[driver-manager] query slot 0 granted
+[hsh] query channel granted
+[kernel] entering userspace: rip=0x46eec4b80 rsp=0x7ffffefffe60 cs=0x23 ss=0x1b
+[driver-manager] query slot 0 closed by client
 [driver-manager] NVMe BlockDevice requested before online
-[kernel] entering userspace: rip=0x48746eb80 rsp=0x7ffffefffe60 cs=0x23 ss=0x1b
+[driver-manager] query slot 0 granted
+[hsh] query channel granted
+[kernel] entering userspace: rip=0x421ab9b80 rsp=0x7ffffefffe80 cs=0x23 ss=0x1b
+[driver-manager] query slot 0 closed by client
 [driver-manager] NVMe BlockDevice requested before online
-[kernel] entering userspace: rip=0x4b2440b80 rsp=0x7ffffefffe80 cs=0x23 ss=0x1b
+[driver-manager] query slot 0 granted
+[hsh] query channel granted
+[kernel] entering userspace: rip=0x48f42cb80 rsp=0x7ffffefffe60 cs=0x23 ss=0x1b
+[driver-manager] query slot 0 closed by client
 [driver-manager] NVMe BlockDevice requested before online
-[kernel] entering userspace: rip=0x424da6b80 rsp=0x7ffffefffe60 cs=0x23 ss=0x1b
-[driver-manager] NVMe BlockDevice requested before online
-[kernel] entering userspace: rip=0x45955bb80 rsp=0x7ffffefffe60 cs=0x23 ss=0x1b
-[driver-manager] NVMe BlockDevice requested before online
-[kernel] entering userspace: rip=0x468da6b80 rsp=0x7ffffefffe80 cs=0x23 ss=0x1b
-[driver-manager] NVMe BlockDevice requested before online
-[kernel] entering userspace: rip=0x46972db80 rsp=0x7ffffefffe60 cs=0x23 ss=0x1b
-[driver-manager] NVMe BlockDevice requested before online
-[kernel] entering userspace: rip=0x419e72b80 rsp=0x7ffffefffe60 cs=0x23 ss=0x1b
+[driver-manager] query slot 0 granted
+[hsh] query channel granted
+[kernel] entering userspace: rip=0x42b90ab80 rsp=0x7ffffefffe60 cs=0x23 ss=0x1b
+[driver-manager] query slot 0 closed by client
 [hsh] consecutive spawn stress OK (30 spawns)
 [driver-manager] NVMe BlockDevice requested before online
-[kernel] entering userspace: rip=0x45b1a1b80 rsp=0x7ffffefffe80 cs=0x23 ss=0x1b
+[driver-manager] query slot 0 granted
+[hsh] query channel granted
+[kernel] entering userspace: rip=0x4c362db80 rsp=0x7ffffefffe80 cs=0x23 ss=0x1b
+[driver-manager] query slot 0 closed by client
 [hsh] post-stress query channel OK
