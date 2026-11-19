@@ -11,7 +11,9 @@ on:
   # branch.
   push:
     branches: ["arena/**"]
-    paths: [".github/workflows/arena-tests.yml"]
+    paths:
+      - ".github/workflows/arena-tests.yml"
+      - "crates/**"
   workflow_dispatch:
     inputs:
       packages:
