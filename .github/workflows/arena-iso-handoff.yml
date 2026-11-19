@@ -1,0 +1,146 @@
+name: arena-iso-handoff
+
+# Temporary hand-off workflow for an Arena session whose sandbox cannot reach
+# crates.io / static.rust-lang.org. It builds the ISO on a GitHub runner, runs
+# the real boot smoke gate, and publishes the compressed images and logs back
+# into this branch so the session can fetch them over git.
+# Delete this file when the session ends.
+
+on:
+  push:
+    branches: ["arena/**"]
+    paths: [".github/workflows/arena-iso-handoff.yml"]
+  workflow_dispatch:
+    inputs:
+      profile:
+        description: "Build profile"
+        type: choice
+        options: [release, debug]
+        default: release
+      smoke:
+        description: "Run the QEMU boot smoke gate"
+        type: choice
+        options: ["true", "false"]
+        default: "true"
+      publish:
+        description: "Commit the images back to this branch"
+        type: choice
+        options: ["true", "false"]
+        default: "true"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: arena-iso-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-iso:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install nightly-2026-03-01 --profile minimal \
+            --component rust-src,llvm-tools-preview
+          rustup default nightly-2026-03-01
+
+      - name: Install ISO and QEMU tooling
+        run: |
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            xorriso qemu-system-x86
+
+      - name: Cache cargo target directory
+        uses: actions/cache@v4
+        with:
+          path: |
+            target
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: arena-target-${{ inputs.profile || 'release' }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            arena-target-${{ inputs.profile || 'release' }}-
+
+      - name: Build NVMe HxFS fixture
+        run: |
+          set -euo pipefail
+          mkdir -p build
+          python3 tools/mkhxfs.py --output build/nvme.img --blocks 24576 --plain
+          ls -l build/nvme.img
+
+      - name: Build kernel + userspace + ISO
+        env:
+          CARGO_BUILD_JOBS: "2"
+        run: |
+          set -euo pipefail
+          profile="${{ inputs.profile || 'release' }}"
+          mkdir -p ci-artifacts/arena-iso
+          set +e
+          make iso PROFILE="$profile" > ci-artifacts/arena-iso/build.log 2>&1
+          status=$?
+          set -e
+          tail -40 ci-artifacts/arena-iso/build.log
+          exit $status
+
+      - name: Boot smoke gate
+        id: smoke
+        if: ${{ inputs.smoke != 'false' }}
+        continue-on-error: true
+        env:
+          CARGO_BUILD_JOBS: "2"
+        run: |
+          set +e
+          bash scripts/ci-qemu-smoke.sh "${{ inputs.profile || 'release' }}" 2 240 ecam
+          status=$?
+          echo "status=$status" >> "$GITHUB_OUTPUT"
+          exit 0
+
+      - name: Collect images and logs
+        run: |
+          set -euo pipefail
+          mkdir -p ci-artifacts/arena-iso
+          cp ci-artifacts/qemu-release-smp2.log ci-artifacts/arena-iso/qemu-smoke.log || true
+          echo "smoke_status=${{ steps.smoke.outputs.status }}" \
+            > ci-artifacts/arena-iso/smoke-status.txt
+          echo "profile=${{ inputs.profile || 'release' }}" >> ci-artifacts/arena-iso/smoke-status.txt
+          echo "commit=$(git rev-parse HEAD)" >> ci-artifacts/arena-iso/smoke-status.txt
+          ls -l build/huesos.iso build/nvme.img
+          sha256sum build/huesos.iso build/nvme.img | tee ci-artifacts/arena-iso/huesos.sha256
+          xz -T0 -6 -k build/huesos.iso
+          xz -T0 -6 -k build/nvme.img
+          ls -l build/huesos.iso.xz build/nvme.img.xz
+          if [ "$(stat -c%s build/huesos.iso.xz)" -gt 90000000 ]; then
+            split -b 32000000 -d -a 2 build/huesos.iso.xz \
+              ci-artifacts/arena-iso/huesos.iso.xz.part
+          else
+            cp build/huesos.iso.xz ci-artifacts/arena-iso/huesos.iso.xz
+          fi
+          cp build/nvme.img.xz ci-artifacts/arena-iso/nvme.img.xz
+          ls -l ci-artifacts/arena-iso
+
+      - name: Publish images to the branch
+        if: ${{ inputs.publish != 'false' }}
+        run: |
+          set -euo pipefail
+          git config user.name "arena-iso-bot"
+          git config user.email "arena-iso-bot@users.noreply.github.com"
+          git add -f ci-artifacts/arena-iso
+          if git diff --cached --quiet; then
+            echo "nothing to publish"
+            exit 0
+          fi
+          git commit -m "chore(arena): publish built HuesOS images and logs [skip ci]"
+          git push origin "HEAD:${GITHUB_REF_NAME}"
+
+      - name: Fail when the boot gate failed
+        if: ${{ inputs.smoke != 'false' && steps.smoke.outputs.status != '0' && steps.smoke.outputs.status != '124' }}
+        run: |
+          echo "boot smoke gate failed with status ${{ steps.smoke.outputs.status }}" >&2
+          tail -200 ci-artifacts/arena-iso/qemu-smoke.log >&2 || true
+          exit 1

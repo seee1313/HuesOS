@@ -7,3 +7,7 @@ __pycache__/
 
 # Local CI hand-off artifacts (ISO images, boot logs)
 ci-artifacts/arena-iso/
+
+# Arena lab scratch (vendored qemu, downloads)
+.lab/qemu/
+.lab/dl/
