@@ -2,7 +2,7 @@
 
 use crate::handle::Handle;
 use crate::raw;
-use huesos_abi::{ChannelReadEtcArgs, HandleValue, Syscall, INVALID_HANDLE};
+use huesos_abi::{ChannelPeekArgs, ChannelReadEtcArgs, HandleValue, Syscall, INVALID_HANDLE};
 
 /// A maximum message size accepted by [`Channel::read`]'s default buffer
 /// helper. Callers with larger messages should size their own buffer and
@@ -189,58 +189,38 @@ impl Channel {
         Ok((actual_bytes as usize, actual_handles as usize))
     }
 
-    /// Read bytes and receive transferred handles, parking the thread until a
-    /// message arrives or `ticks` scheduler ticks elapse.
+    /// Park the thread until the next message is readable or `ticks`
+    /// scheduler ticks elapse.
     ///
-    /// The non-blocking [`Self::read_etc`] is the wrong tool for a client that
-    /// is waiting for a reply: a fixed number of `yield_now` polls only spans
-    /// a couple of supplier ticks, so a busy supplier makes the client give up
-    /// while the reply is already in flight, and the stale reply then desyncs
-    /// whatever handshake comes next.
-    pub fn read_etc_timeout(
-        &self,
-        buf: &mut [u8],
-        handles: &mut [HandleValue],
-        ticks: u64,
-    ) -> crate::Result<(usize, usize)> {
-        let mut actual_bytes: u32 = 0;
-        let mut actual_handles: u32 = 0;
-        let args = ChannelReadEtcArgs {
+    /// `ticks == 0` only probes; `1` blocks indefinitely; anything else is a
+    /// tick budget that ends in [`crate::ErrorCode::TimedOut`]. Uses
+    /// `ChannelPeek`, whose wait queue honours the budget (`ChannelReadEtc`
+    /// only distinguishes "do not block" from "block forever").
+    pub fn wait_readable(&self, ticks: u64) -> crate::Result<()> {
+        let mut byte_size: u32 = 0;
+        let mut handle_count: u32 = 0;
+        let mut cookie: u64 = 0;
+        let args = ChannelPeekArgs {
             channel: self.0.raw(),
-            bytes: buf.as_mut_ptr(),
-            bytes_capacity: buf.len() as u32,
-            out_bytes: &mut actual_bytes as *mut u32,
-            handles: handles.as_mut_ptr(),
-            handles_capacity: handles.len() as u32,
-            out_handles: &mut actual_handles as *mut u32,
+            out_byte_size: &mut byte_size as *mut u32,
+            out_handle_count: &mut handle_count as *mut u32,
+            out_cookie: &mut cookie as *mut u64,
+            wait_mode: ticks,
         };
-        // wait_mode: 0 never blocks, 1 blocks forever, >1 is a tick budget.
-        let ret = raw::syscall2(
-            Syscall::ChannelReadEtc,
-            &args as *const _ as u64,
-            ticks.max(2),
-        );
+        let ret = raw::syscall1(Syscall::ChannelPeek, &args as *const _ as u64);
         raw::decode(ret)?;
-        Ok((actual_bytes as usize, actual_handles as usize))
+        Ok(())
     }
 
-    /// [`Self::read_optional_handle`] with a bounded wait for the message.
+    /// [`Self::read_optional_handle`] that first waits up to `ticks` for a
+    /// message instead of requiring one to be queued already.
     pub fn read_optional_handle_timeout(
         &self,
         buf: &mut [u8],
         ticks: u64,
     ) -> crate::Result<(usize, Option<Handle>)> {
-        let mut handles = [INVALID_HANDLE; 1];
-        let (bytes, num_handles) = self.read_etc_timeout(buf, &mut handles, ticks)?;
-        match num_handles {
-            0 => Ok((bytes, None)),
-            1 => {
-                // SAFETY: the kernel installed this value as a newly owned
-                // handle in the caller's table; RAII takes it over here.
-                Ok((bytes, Some(unsafe { Handle::from_raw(handles[0]) })))
-            }
-            _ => Err(crate::ErrorCode::InvalidArgs),
-        }
+        self.wait_readable(ticks)?;
+        self.read_optional_handle(buf)
     }
 
     /// Read bytes plus zero or one transferred handle.
