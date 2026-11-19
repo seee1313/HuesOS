@@ -610,6 +610,10 @@ impl Scheduler {
     fn current_task(&self) -> Option<&Task> {
         self.tasks.get(self.current).map(|slot| &**slot)
     }
+
+    fn current_task_mut(&mut self) -> Option<&mut Task> {
+        self.tasks.get_mut(self.current).map(|slot| &mut **slot)
+    }
 }
 
 /// Build a runqueue key from the legacy (vruntime, task_id) pair.
@@ -1022,6 +1026,21 @@ pub fn wake_task(task_id: u64) {
 pub fn current_task_id() -> Option<u64> {
     let guard = PER_CPU_SCHEDULERS[cpu_id()].lock();
     guard.current_task().map(|t| t.id)
+}
+
+/// Update `MSR_FS_BASE` for the calling user thread after validating that the
+/// address lies strictly inside the canonical lower half (`< USER_ASPACE_END`).
+pub fn set_current_fs_base(fs_base: u64) -> Result<(), huesos_abi::ErrorCode> {
+    if fs_base >= huesos_abi::USER_ASPACE_END {
+        return Err(huesos_abi::ErrorCode::InvalidArgs);
+    }
+    let mut guard = PER_CPU_SCHEDULERS[cpu_id()].lock();
+    let Some(task) = guard.current_task_mut() else {
+        return Err(huesos_abi::ErrorCode::NotFound);
+    };
+    task.context.fs_base = fs_base;
+    huesos_arch::context_switch::write_fs_base(fs_base);
+    Ok(())
 }
 
 /// Mark a user task's first-entry metadata as consumed. After this point the

@@ -4,13 +4,28 @@ version = "0.1.0"
 edition = "2021"
 
 [features]
-default = []
+default = ["local-heap"]
+# Embed `huesos-scudo` directly in this crate (used by static services and libcanvas.so).
+local-heap = ["dep:huesos-scudo"]
+# Export stable C ABI symbols + global allocator + `.init_array` constructor for `libcanvas.so`.
+c-abi = ["local-heap"]
+# Thin Rust client wrapper forwarding syscalls and heap allocations to `libcanvas.so`.
+dyn-client = []
 # Boot-time negative syscall probes used by huesos-init/QEMU smoke tests.
 kernel-smoke-tests = []
 
 [dependencies]
 huesos-abi = { path = "../../huesos-abi" }
-huesos-scudo = { path = "../../huesos-scudo" }
+huesos-elf = { path = "../../huesos-elf" }
+huesos-scudo = { path = "../../huesos-scudo", optional = true }
 huesos-blobfs = { path = "../../huesos-blobfs" }
+
+[profile.release]
+opt-level = 2
+panic = "abort"
+lto = false
+
+[profile.dev]
+panic = "abort"
 
 [workspace]

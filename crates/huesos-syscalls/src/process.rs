@@ -8,8 +8,8 @@ use huesos_object::{Handle, KernelObject, KernelObjectExt, Rights};
 
 use crate::{
     callbacks::{
-        EXIT_FN, PROCESS_CREATE_FN, PROCESS_CREATE_IN_JOB_FN, THREAD_START_FN, VMAR_MAP_FN,
-        VMAR_PROTECT_FN, VMAR_UNMAP_FN, YIELD_FN,
+        EXIT_FN, PROCESS_CREATE_FN, PROCESS_CREATE_IN_JOB_FN, THREAD_SET_FS_BASE_FN,
+        THREAD_START_FN, VMAR_MAP_FN, VMAR_PROTECT_FN, VMAR_UNMAP_FN, YIELD_FN,
     },
     user_memory,
     util::{current_proc, DeferGuard},
@@ -600,6 +600,15 @@ fn process_for_wait(
     huesos_object::lookup_process(h.koid).ok_or(ErrorCode::WrongType)
 }
 
+pub(crate) fn sys_thread_set_fs_base(fs_base: u64) -> SyscallResult {
+    if fs_base >= huesos_abi::USER_ASPACE_END {
+        return Err(ErrorCode::InvalidArgs);
+    }
+    let set_fs = (*THREAD_SET_FS_BASE_FN.lock()).ok_or(ErrorCode::NotSupported)?;
+    set_fs(fs_base)?;
+    Ok(0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::vmar_map_authorize;
@@ -627,5 +636,21 @@ mod tests {
         );
         assert_eq!(vmar_map_authorize(&vmar, &child), Ok(()));
         let _ = huesos_object::unregister_object(child.koid());
+    }
+
+    #[test]
+    fn thread_set_fs_base_rejects_noncanonical_and_kernel_addresses() {
+        assert_eq!(
+            super::sys_thread_set_fs_base(huesos_abi::USER_ASPACE_END),
+            Err(ErrorCode::InvalidArgs)
+        );
+        assert_eq!(
+            super::sys_thread_set_fs_base(0xffff_8000_0000_0000),
+            Err(ErrorCode::InvalidArgs)
+        );
+        assert_eq!(
+            super::sys_thread_set_fs_base(u64::MAX),
+            Err(ErrorCode::InvalidArgs)
+        );
     }
 }

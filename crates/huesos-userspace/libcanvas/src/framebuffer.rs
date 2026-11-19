@@ -165,6 +165,11 @@ impl Canvas {
         self.info.height
     }
 
+    /// Raw handle value of the backing VMO.
+    pub fn vmo_handle(&self) -> HandleValue {
+        self.vmo.handle().raw()
+    }
+
     /// Number of tightly-packed bytes backing this Canvas.
     pub fn byte_len(&self) -> usize {
         self.info.pitch as usize * self.info.height as usize

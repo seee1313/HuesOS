@@ -34,7 +34,7 @@ fn main() {
         .flag("-ffreestanding")
         .flag("-fno-builtin")
         .flag("-fno-stack-protector")
-        .flag("-fno-pic")
+        .flag("-fPIC")
         .flag("-mno-red-zone")
         .define("NORMALUNIX", None)
         .define("DOOMGENERIC_RESX", "640")

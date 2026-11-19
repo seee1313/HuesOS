@@ -9,6 +9,8 @@
 #![no_std]
 #![warn(missing_docs)]
 
+pub mod dynamic;
+
 /// ELF64 header size; `e_ehsize` must match.
 const ELF64_HEADER_BYTES: usize = 64;
 /// ELF64 program header size; `e_phentsize` must match when `e_phnum != 0`.

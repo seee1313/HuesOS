@@ -1,19 +1,51 @@
-//! Static ELF process launcher.
+//! Static and dynamically-linked (`PT_INTERP`) ELF64 process launcher.
 
 use crate::channel::Channel;
+use crate::memory;
 use crate::vmo::Vmo;
+use huesos_abi::auxv::{
+    AT_BASE, AT_ENTRY, AT_FLAGS, AT_HUESOS_LD_BOOTSTRAP, AT_NULL, AT_PAGESZ, AT_PHDR, AT_PHENT,
+    AT_PHNUM, AT_RANDOM, LD_BOOTSTRAP_LIB_VMO_LABEL, LD_BOOTSTRAP_SELF_VMAR_LABEL,
+};
+use huesos_abi::{rights, vmar_flags, vmo_create_flags, USER_STACK_TOP};
+use huesos_elf::dynamic::{
+    is_valid_elf64_header, read_phdr64, Phdr64, EM_X86_64, ET_DYN, ET_EXEC, PF_R, PF_W, PF_X,
+    PT_INTERP, PT_LOAD, PT_PHDR,
+};
 
-use super::elf::{self, ProgramHeader, PAGE_SIZE, PF_R, PF_W, PF_X, PT_LOAD};
+use super::elf::{self, PAGE_SIZE};
 use super::{Process, Thread, Vmar};
 
-/// Load a static ELF image into a new process and start its initial thread.
+const HEADER_MAX: usize = 16 * 1024;
+const MAIN_ASLR_BASE: u64 = 0x0000_0001_0000_0000;
+const INTERP_ASLR_BASE: u64 = 0x0000_0004_0000_0000;
+const ASLR_PAGE_MASK: u64 = 0x000f_ffff;
+const BOOTFS_HEADER_SIZE: u64 = 16;
+const BOOTFS_ENTRY_SIZE: u64 = 216;
+const BOOTFS_PATH_SIZE: usize = 192;
+const BOOTFS_MAGIC: &[u8; 8] = b"HBOOTFS1";
+
+/// Load an ELF image into a new process and start its initial thread.
 ///
-/// This is the userspace half of the approved Zircon-like launch model:
-/// create a process/root VMAR, map each `PT_LOAD` segment through VMOs,
-/// map an initial stack, create a suspended main thread, and start it with
-/// a bootstrap channel installed as handle 1 in the child.
+/// Static `ET_EXEC` binaries run directly; `PT_INTERP` binaries require a
+/// library VMO (see [`spawn_elf_with_lib`]).
 pub fn spawn_elf(name: &str, elf: &[u8]) -> crate::Result<(Process, Channel)> {
     spawn_elf_with_stack(name, elf, huesos_abi::USER_STACK_DEFAULT_SIZE)
+}
+
+/// Load a `PT_INTERP` (or static) ELF image with a library `BOOTFS` VMO.
+pub fn spawn_elf_with_lib(
+    name: &str,
+    elf: &[u8],
+    lib_vmo: &Vmo,
+) -> crate::Result<(Process, Channel)> {
+    spawn_elf_with_affinity(
+        name,
+        elf,
+        Some(lib_vmo),
+        None,
+        huesos_abi::USER_STACK_DEFAULT_SIZE,
+    )
 }
 
 /// Load a static ELF with an explicit per-process stack profile.
@@ -22,24 +54,157 @@ pub fn spawn_elf_with_stack(
     elf: &[u8],
     stack_size: u64,
 ) -> crate::Result<(Process, Channel)> {
-    spawn_elf_with_affinity(name, elf, None, stack_size)
+    spawn_elf_with_affinity(name, elf, None, None, stack_size)
 }
 
 /// Load a static ELF image into a new process with an explicit home CPU.
 pub fn spawn_elf_on_cpu(name: &str, elf: &[u8], cpu: usize) -> crate::Result<(Process, Channel)> {
-    spawn_elf_with_affinity(name, elf, Some(cpu), huesos_abi::USER_STACK_DEFAULT_SIZE)
+    spawn_elf_with_affinity(
+        name,
+        elf,
+        None,
+        Some(cpu),
+        huesos_abi::USER_STACK_DEFAULT_SIZE,
+    )
+}
+
+/// Load an ELF image with an explicit home CPU and library `BOOTFS` VMO.
+pub fn spawn_elf_on_cpu_with_lib(
+    name: &str,
+    elf: &[u8],
+    cpu: usize,
+    lib_vmo: &Vmo,
+) -> crate::Result<(Process, Channel)> {
+    spawn_elf_with_affinity(
+        name,
+        elf,
+        Some(lib_vmo),
+        Some(cpu),
+        huesos_abi::USER_STACK_DEFAULT_SIZE,
+    )
+}
+
+#[derive(Clone, Copy)]
+struct ParsedElfHeader {
+    e_type: u16,
+    e_entry: u64,
+    e_phoff: u64,
+    e_phentsize: u16,
+    e_phnum: u16,
+    min_vaddr: u64,
+    pt_phdr_vaddr: Option<u64>,
+    interp: Option<(u64, u64)>,
+}
+
+fn parse_elf_headers(header_slice: &[u8], total_len: u64) -> crate::Result<ParsedElfHeader> {
+    if header_slice.len() < 64 || !is_valid_elf64_header(header_slice) {
+        return Err(crate::ErrorCode::InvalidArgs);
+    }
+    let e_type = u16::from_le_bytes([header_slice[16], header_slice[17]]);
+    let e_machine = u16::from_le_bytes([header_slice[18], header_slice[19]]);
+    if (e_type != ET_EXEC && e_type != ET_DYN) || e_machine != EM_X86_64 {
+        return Err(crate::ErrorCode::InvalidArgs);
+    }
+    let e_entry = u64::from_le_bytes([
+        header_slice[24],
+        header_slice[25],
+        header_slice[26],
+        header_slice[27],
+        header_slice[28],
+        header_slice[29],
+        header_slice[30],
+        header_slice[31],
+    ]);
+    let e_phoff = u64::from_le_bytes([
+        header_slice[32],
+        header_slice[33],
+        header_slice[34],
+        header_slice[35],
+        header_slice[36],
+        header_slice[37],
+        header_slice[38],
+        header_slice[39],
+    ]);
+    let e_phentsize = u16::from_le_bytes([header_slice[54], header_slice[55]]);
+    let e_phnum = u16::from_le_bytes([header_slice[56], header_slice[57]]);
+    if e_phentsize < 56 || e_phnum == 0 {
+        return Err(crate::ErrorCode::InvalidArgs);
+    }
+    let phdr_end = e_phoff
+        .checked_add(u64::from(e_phnum).saturating_mul(u64::from(e_phentsize)))
+        .ok_or(crate::ErrorCode::InvalidArgs)?;
+    if phdr_end > total_len || phdr_end > header_slice.len() as u64 {
+        return Err(crate::ErrorCode::InvalidArgs);
+    }
+
+    let mut min_vaddr = u64::MAX;
+    let mut pt_phdr_vaddr = None;
+    let mut interp = None;
+    let mut load_count = 0usize;
+
+    for idx in 0..usize::from(e_phnum) {
+        let ph =
+            read_phdr64(header_slice, e_phoff, idx).map_err(|_| crate::ErrorCode::InvalidArgs)?;
+        match ph.p_type {
+            PT_LOAD => {
+                let start = elf::align_down(ph.p_vaddr, PAGE_SIZE);
+                if start < min_vaddr {
+                    min_vaddr = start;
+                }
+                load_count += 1;
+            }
+            PT_PHDR => pt_phdr_vaddr = Some(ph.p_vaddr),
+            PT_INTERP => {
+                let end = ph
+                    .p_offset
+                    .checked_add(ph.p_filesz)
+                    .ok_or(crate::ErrorCode::InvalidArgs)?;
+                if ph.p_filesz == 0 || end > total_len {
+                    return Err(crate::ErrorCode::InvalidArgs);
+                }
+                interp = Some((ph.p_offset, ph.p_filesz));
+            }
+            _ => {}
+        }
+    }
+
+    if load_count == 0 {
+        return Err(crate::ErrorCode::InvalidArgs);
+    }
+
+    Ok(ParsedElfHeader {
+        e_type,
+        e_entry,
+        e_phoff,
+        e_phentsize,
+        e_phnum,
+        min_vaddr,
+        pt_phdr_vaddr,
+        interp,
+    })
 }
 
 fn spawn_elf_with_affinity(
     name: &str,
     elf: &[u8],
+    lib_vmo: Option<&Vmo>,
     home_cpu: Option<usize>,
     stack_size: u64,
 ) -> crate::Result<(Process, Channel)> {
     if !huesos_abi::valid_user_stack_size(stack_size) {
         return Err(crate::ErrorCode::InvalidArgs);
     }
-    let image = elf::parse_elf(elf).ok_or(crate::ErrorCode::InvalidArgs)?;
+    let image = parse_elf_headers(elf, elf.len() as u64)?;
+    if image.interp.is_none() && image.e_type == ET_DYN {
+        return Err(crate::ErrorCode::NotSupported);
+    }
+
+    let main_bias = if image.e_type == ET_DYN {
+        choose_aslr_base(MAIN_ASLR_BASE).wrapping_sub(image.min_vaddr)
+    } else {
+        0
+    };
+
     if name == "doom" {
         crate::println!("[doom-launch] ELF parsed, creating process");
     }
@@ -48,19 +213,49 @@ fn spawn_elf_with_affinity(
         process.set_affinity(cpu)?;
     }
 
-    let mut i = 0;
-    while i < image.phnum {
-        let ph = elf::read_program_header(elf, image, i).ok_or(crate::ErrorCode::InvalidArgs)?;
-        if ph.ty == PT_LOAD {
-            if name == "doom" {
-                crate::println!("[doom-launch] mapping PT_LOAD {}", i);
+    let mut at_phdr = main_bias.wrapping_add(image.pt_phdr_vaddr.unwrap_or(0));
+    for idx in 0..usize::from(image.e_phnum) {
+        let ph = read_phdr64(elf, image.e_phoff, idx).map_err(|_| crate::ErrorCode::InvalidArgs)?;
+        if ph.p_type == PT_LOAD {
+            if image.pt_phdr_vaddr.is_none()
+                && image.e_phoff >= ph.p_offset
+                && image.e_phoff < ph.p_offset.saturating_add(ph.p_filesz)
+            {
+                at_phdr = main_bias
+                    .wrapping_add(ph.p_vaddr)
+                    .wrapping_add(image.e_phoff - ph.p_offset);
             }
-            map_load_segment(&root_vmar, elf, ph)?;
             if name == "doom" {
-                crate::println!("[doom-launch] mapped PT_LOAD {}", i);
+                crate::println!("[doom-launch] mapping PT_LOAD {}", idx);
+            }
+            map_load_segment(&root_vmar, elf, main_bias, ph)?;
+            if name == "doom" {
+                crate::println!("[doom-launch] mapped PT_LOAD {}", idx);
             }
         }
-        i += 1;
+    }
+
+    if let Some((interp_off, interp_len)) = image.interp {
+        let Some(lib_vmo) = lib_vmo else {
+            return Err(crate::ErrorCode::InvalidArgs);
+        };
+        let start = usize::try_from(interp_off).map_err(|_| crate::ErrorCode::InvalidArgs)?;
+        let len = usize::try_from(interp_len).map_err(|_| crate::ErrorCode::InvalidArgs)?;
+        let interp_bytes = elf
+            .get(start..start + len)
+            .ok_or(crate::ErrorCode::InvalidArgs)?;
+        let bootstrap = finish_dynamic_launch(
+            name,
+            &process,
+            &root_vmar,
+            lib_vmo,
+            interp_bytes,
+            &image,
+            main_bias,
+            at_phdr,
+            stack_size,
+        )?;
+        return Ok((process, bootstrap));
     }
 
     if name == "doom" {
@@ -69,7 +264,7 @@ fn spawn_elf_with_affinity(
     map_initial_stack(&root_vmar, stack_size)?;
     let thread = Thread::create(&process, "main")?;
     // iretq enters directly, so synthesize SysV's post-call alignment.
-    let bootstrap = thread.start(image.entry, initial_user_rsp(huesos_abi::USER_STACK_TOP))?;
+    let bootstrap = thread.start(image.e_entry, initial_user_rsp(USER_STACK_TOP))?;
     if name == "doom" {
         crate::println!("[doom-launch] thread started");
     }
@@ -84,6 +279,25 @@ pub fn spawn_elf_from_vmo(
     len: u64,
 ) -> crate::Result<(Process, Channel)> {
     spawn_elf_from_vmo_with_stack(name, vmo, offset, len, huesos_abi::USER_STACK_DEFAULT_SIZE)
+}
+
+/// Load a VMO-backed ELF image with an explicit library `BOOTFS` VMO.
+pub fn spawn_elf_from_vmo_with_lib(
+    name: &str,
+    vmo: &Vmo,
+    offset: u64,
+    len: u64,
+    lib_vmo: &Vmo,
+) -> crate::Result<(Process, Channel)> {
+    let (process, _root_vmar, bootstrap) = spawn_elf_from_vmo_inner(
+        name,
+        vmo,
+        offset,
+        len,
+        Some(lib_vmo),
+        huesos_abi::USER_STACK_DEFAULT_SIZE,
+    )?;
+    Ok((process, bootstrap))
 }
 
 /// Load a VMO-backed ELF with an explicit per-process stack profile.
@@ -124,76 +338,343 @@ pub fn spawn_elf_from_vmo_with_vmar_and_stack(
     len: u64,
     stack_size: u64,
 ) -> crate::Result<(Process, Vmar, Channel)> {
+    // When `vmo` is BOOTFS itself (as in `init` launching `doom`), passing `Some(vmo)`
+    // allows `PT_INTERP` images stored inside BOOTFS to resolve `/lib/*.so` seamlessly.
+    spawn_elf_from_vmo_inner(name, vmo, offset, len, Some(vmo), stack_size)
+}
+
+fn spawn_elf_from_vmo_inner(
+    name: &str,
+    vmo: &Vmo,
+    offset: u64,
+    len: u64,
+    lib_vmo: Option<&Vmo>,
+    stack_size: u64,
+) -> crate::Result<(Process, Vmar, Channel)> {
     if len == 0
         || offset.checked_add(len).is_none()
         || !huesos_abi::valid_user_stack_size(stack_size)
     {
         return Err(crate::ErrorCode::InvalidArgs);
     }
-    // Read the ELF header and program-header table into a bounded temporary
-    // buffer. Program headers are not required to live in the first page.
-    const HEADER_MAX: usize = 16 * 1024;
-    let mut header_buf = [0u8; HEADER_MAX];
-    let first_read_len = (len as usize).min(4096).min(header_buf.len());
-    let first_read = vmo.read(offset, &mut header_buf[..first_read_len])?;
-    if first_read != first_read_len {
-        return Err(crate::ErrorCode::InvalidArgs);
-    }
-    let image = elf::parse_elf(&header_buf[..first_read]).ok_or(crate::ErrorCode::InvalidArgs)?;
-    let phdr_end = image
-        .phoff
-        .checked_add((image.phnum as u64).saturating_mul(image.phentsize as u64))
-        .ok_or(crate::ErrorCode::InvalidArgs)?;
-    if phdr_end > len || phdr_end as usize > HEADER_MAX {
-        return Err(crate::ErrorCode::InvalidArgs);
-    }
-    let header_len = (phdr_end as usize).max(first_read);
-    if header_len > first_read {
-        let read = vmo.read(offset, &mut header_buf[..header_len])?;
-        if read != header_len {
-            return Err(crate::ErrorCode::InvalidArgs);
-        }
+
+    let (header_buf, header_len, image) = read_vmo_elf_headers(vmo, offset, len)?;
+    if image.interp.is_none() && image.e_type == ET_DYN {
+        return Err(crate::ErrorCode::NotSupported);
     }
     let header_slice = &header_buf[..header_len];
-    let (process, root_vmar) = Process::create(name)?;
 
-    let mut i = 0;
-    while i < image.phnum {
-        let ph = elf::read_program_header(header_slice, image, i)
-            .ok_or(crate::ErrorCode::InvalidArgs)?;
-        if ph.ty == PT_LOAD {
-            map_load_segment_from_vmo(&root_vmar, vmo, offset, len, ph)?;
+    let main_bias = if image.e_type == ET_DYN {
+        choose_aslr_base(MAIN_ASLR_BASE).wrapping_sub(image.min_vaddr)
+    } else {
+        0
+    };
+
+    let (process, root_vmar) = Process::create(name)?;
+    let mut at_phdr = main_bias.wrapping_add(image.pt_phdr_vaddr.unwrap_or(0));
+
+    for idx in 0..usize::from(image.e_phnum) {
+        let ph = read_phdr64(header_slice, image.e_phoff, idx)
+            .map_err(|_| crate::ErrorCode::InvalidArgs)?;
+        if ph.p_type == PT_LOAD {
+            if image.pt_phdr_vaddr.is_none()
+                && image.e_phoff >= ph.p_offset
+                && image.e_phoff < ph.p_offset.saturating_add(ph.p_filesz)
+            {
+                at_phdr = main_bias
+                    .wrapping_add(ph.p_vaddr)
+                    .wrapping_add(image.e_phoff - ph.p_offset);
+            }
+            map_load_segment_from_vmo(&root_vmar, vmo, offset, len, main_bias, ph)?;
         }
-        i += 1;
+    }
+
+    if let Some((interp_off, interp_len)) = image.interp {
+        let Some(lib_vmo) = lib_vmo else {
+            return Err(crate::ErrorCode::InvalidArgs);
+        };
+        let path_len = usize::try_from(interp_len)
+            .map_err(|_| crate::ErrorCode::InvalidArgs)?
+            .min(192);
+        let mut interp_buf = [0u8; 192];
+        let src_off = offset
+            .checked_add(interp_off)
+            .ok_or(crate::ErrorCode::InvalidArgs)?;
+        if vmo.read(src_off, &mut interp_buf[..path_len])? != path_len {
+            return Err(crate::ErrorCode::InvalidArgs);
+        }
+        let bootstrap = finish_dynamic_launch(
+            name,
+            &process,
+            &root_vmar,
+            lib_vmo,
+            &interp_buf[..path_len],
+            &image,
+            main_bias,
+            at_phdr,
+            stack_size,
+        )?;
+        return Ok((process, root_vmar, bootstrap));
     }
 
     map_initial_stack(&root_vmar, stack_size)?;
     let thread = Thread::create(&process, "main")?;
-    let bootstrap = thread.start(image.entry, initial_user_rsp(huesos_abi::USER_STACK_TOP))?;
+    let bootstrap = thread.start(image.e_entry, initial_user_rsp(USER_STACK_TOP))?;
     Ok((process, root_vmar, bootstrap))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn finish_dynamic_launch(
+    name: &str,
+    process: &Process,
+    root_vmar: &Vmar,
+    lib_vmo: &Vmo,
+    raw_interp_bytes: &[u8],
+    main_image: &ParsedElfHeader,
+    main_bias: u64,
+    at_phdr: u64,
+    stack_size: u64,
+) -> crate::Result<Channel> {
+    let interp_trimmed = match raw_interp_bytes.iter().position(|&b| b == 0) {
+        Some(nul) => &raw_interp_bytes[..nul],
+        None => raw_interp_bytes,
+    };
+    let (interp_off, interp_len) =
+        find_bootfs_entry(lib_vmo, interp_trimmed).ok_or(crate::ErrorCode::NotFound)?;
+
+    let (interp_hdr_buf, interp_hdr_len, interp_image) =
+        read_vmo_elf_headers(lib_vmo, interp_off, interp_len)?;
+    if interp_image.e_type != ET_DYN || interp_image.interp.is_some() {
+        return Err(crate::ErrorCode::InvalidArgs);
+    }
+    let interp_hdr_slice = &interp_hdr_buf[..interp_hdr_len];
+
+    let interp_load_base = choose_aslr_base(INTERP_ASLR_BASE);
+    let interp_bias = interp_load_base.wrapping_sub(interp_image.min_vaddr);
+    for idx in 0..usize::from(interp_image.e_phnum) {
+        let ph = read_phdr64(interp_hdr_slice, interp_image.e_phoff, idx)
+            .map_err(|_| crate::ErrorCode::InvalidArgs)?;
+        if ph.p_type == PT_LOAD {
+            map_load_segment_from_vmo(root_vmar, lib_vmo, interp_off, interp_len, interp_bias, ph)?;
+        }
+    }
+
+    let initial_rsp = map_dynamic_initial_stack(
+        root_vmar,
+        stack_size,
+        name,
+        at_phdr,
+        main_image.e_phentsize,
+        main_image.e_phnum,
+        interp_load_base,
+        main_bias.wrapping_add(main_image.e_entry),
+    )?;
+
+    // Duplicate bootstrap capabilities before Thread::start so both handles are
+    // ready to enqueue on the parent bootstrap channel immediately.
+    let vmar_dup = root_vmar.handle().duplicate(rights::SAME_RIGHTS)?;
+    let lib_vmo_dup = lib_vmo
+        .duplicate(rights::READ | rights::TRANSFER)?
+        .into_handle();
+
+    let thread = Thread::create(process, "main")?;
+    let interp_entry = interp_bias.wrapping_add(interp_image.e_entry);
+    let bootstrap = match thread.start(interp_entry, initial_rsp) {
+        Ok(ch) => ch,
+        Err(err) => {
+            drop(lib_vmo_dup);
+            drop(vmar_dup);
+            return Err(err);
+        }
+    };
+
+    if let Err((err, _h)) = bootstrap.write_handle(LD_BOOTSTRAP_SELF_VMAR_LABEL, vmar_dup) {
+        drop(lib_vmo_dup);
+        return Err(err);
+    }
+    if let Err((err, _h)) = bootstrap.write_handle(LD_BOOTSTRAP_LIB_VMO_LABEL, lib_vmo_dup) {
+        return Err(err);
+    }
+
+    Ok(bootstrap)
+}
+
+fn read_vmo_elf_headers(
+    vmo: &Vmo,
+    offset: u64,
+    len: u64,
+) -> crate::Result<([u8; HEADER_MAX], usize, ParsedElfHeader)> {
+    let mut header_buf = [0u8; HEADER_MAX];
+    let first_read_len = (len as usize).min(4096).min(header_buf.len());
+    if first_read_len < 64 {
+        return Err(crate::ErrorCode::InvalidArgs);
+    }
+    if vmo.read(offset, &mut header_buf[..first_read_len])? != first_read_len {
+        return Err(crate::ErrorCode::InvalidArgs);
+    }
+    if !is_valid_elf64_header(&header_buf[..first_read_len]) {
+        return Err(crate::ErrorCode::InvalidArgs);
+    }
+    let e_phoff = u64::from_le_bytes([
+        header_buf[32],
+        header_buf[33],
+        header_buf[34],
+        header_buf[35],
+        header_buf[36],
+        header_buf[37],
+        header_buf[38],
+        header_buf[39],
+    ]);
+    let e_phentsize = u16::from_le_bytes([header_buf[54], header_buf[55]]);
+    let e_phnum = u16::from_le_bytes([header_buf[56], header_buf[57]]);
+    let phdr_end = e_phoff
+        .checked_add(u64::from(e_phnum).saturating_mul(u64::from(e_phentsize)))
+        .ok_or(crate::ErrorCode::InvalidArgs)?;
+    if phdr_end > len || phdr_end as usize > HEADER_MAX {
+        return Err(crate::ErrorCode::InvalidArgs);
+    }
+    let header_len = (phdr_end as usize).max(first_read_len);
+    if header_len > first_read_len && vmo.read(offset, &mut header_buf[..header_len])? != header_len
+    {
+        return Err(crate::ErrorCode::InvalidArgs);
+    }
+    let image = parse_elf_headers(&header_buf[..header_len], len)?;
+    Ok((header_buf, header_len, image))
+}
+
+fn find_bootfs_entry(vmo: &Vmo, wanted: &[u8]) -> Option<(u64, u64)> {
+    let mut header = [0u8; BOOTFS_HEADER_SIZE as usize];
+    if vmo.read(0, &mut header).ok()? != header.len() || &header[..8] != BOOTFS_MAGIC {
+        return None;
+    }
+    let count = u32::from_le_bytes([header[8], header[9], header[10], header[11]]);
+    let mut raw = [0u8; BOOTFS_ENTRY_SIZE as usize];
+    for index in 0..count {
+        let entry_off = BOOTFS_HEADER_SIZE + u64::from(index) * BOOTFS_ENTRY_SIZE;
+        if vmo.read(entry_off, &mut raw).ok()? != raw.len() {
+            return None;
+        }
+        let path_len = raw[..BOOTFS_PATH_SIZE]
+            .iter()
+            .position(|&b| b == 0)
+            .unwrap_or(BOOTFS_PATH_SIZE);
+        if &raw[..path_len] == wanted {
+            let meta = &raw[BOOTFS_PATH_SIZE..];
+            let offset = u64::from_le_bytes([
+                meta[0], meta[1], meta[2], meta[3], meta[4], meta[5], meta[6], meta[7],
+            ]);
+            let len = u64::from_le_bytes([
+                meta[8], meta[9], meta[10], meta[11], meta[12], meta[13], meta[14], meta[15],
+            ]);
+            return Some((offset, len));
+        }
+    }
+    None
+}
+
+fn choose_aslr_base(window_base: u64) -> u64 {
+    let rand = memory::random_u64().unwrap_or(0x1_2345);
+    window_base + ((rand & ASLR_PAGE_MASK) << 12)
 }
 
 fn initial_user_rsp(stack_top: u64) -> u64 {
     (stack_top & !0xf) - 8
 }
 
-fn map_load_segment(root_vmar: &Vmar, elf: &[u8], ph: ProgramHeader) -> crate::Result<()> {
-    if ph.filesz > ph.memsz {
+#[allow(clippy::too_many_arguments)]
+fn map_dynamic_initial_stack(
+    root_vmar: &Vmar,
+    stack_size: u64,
+    name: &str,
+    at_phdr: u64,
+    at_phent: u16,
+    at_phnum: u16,
+    at_base: u64,
+    at_entry: u64,
+) -> crate::Result<u64> {
+    if !huesos_abi::valid_user_stack_size(stack_size) {
+        return Err(crate::ErrorCode::InvalidArgs);
+    }
+    let stack_bottom = USER_STACK_TOP - stack_size;
+    let stack = Vmo::create(stack_size)?;
+
+    let mut top_page = [0u8; PAGE_SIZE as usize];
+    let name_bytes = name.as_bytes();
+    let clamped_len = name_bytes.len().min(127);
+    let name_off = PAGE_SIZE as usize - (clamped_len + 1);
+    top_page[name_off..name_off + clamped_len].copy_from_slice(&name_bytes[..clamped_len]);
+    top_page[name_off + clamped_len] = 0;
+
+    let rand_off = (name_off - 16) & !0xf;
+    let r0 = memory::random_u64().unwrap_or(0x9e37_79b9_7f4a_7c15);
+    let r1 = memory::random_u64().unwrap_or(0xbf58_476d_1ce4_e5b9);
+    top_page[rand_off..rand_off + 8].copy_from_slice(&r0.to_le_bytes());
+    top_page[rand_off + 8..rand_off + 16].copy_from_slice(&r1.to_le_bytes());
+
+    let top_page_va = USER_STACK_TOP - PAGE_SIZE;
+    let argv0_va = top_page_va + name_off as u64;
+    let rand_va = top_page_va + rand_off as u64;
+
+    let aux_entries: [(u64, u64); 10] = [
+        (AT_PHDR, at_phdr),
+        (AT_PHENT, u64::from(at_phent)),
+        (AT_PHNUM, u64::from(at_phnum)),
+        (AT_PAGESZ, PAGE_SIZE),
+        (AT_BASE, at_base),
+        (AT_FLAGS, 0),
+        (AT_ENTRY, at_entry),
+        (AT_RANDOM, rand_va),
+        (AT_HUESOS_LD_BOOTSTRAP, 1),
+        (AT_NULL, 0),
+    ];
+
+    // Words: argc (1) + argv[0] + NULL + envp NULL + 10 auxv pairs (20 words) = 24 words.
+    let total_words = 4 + aux_entries.len() * 2;
+    let sp_off = (rand_off - total_words * 8) & !0xf;
+
+    let mut cur = sp_off;
+    let write_word = |buf: &mut [u8], pos: &mut usize, val: u64| {
+        buf[*pos..*pos + 8].copy_from_slice(&val.to_le_bytes());
+        *pos += 8;
+    };
+    write_word(&mut top_page, &mut cur, 1); // argc
+    write_word(&mut top_page, &mut cur, argv0_va); // argv[0]
+    write_word(&mut top_page, &mut cur, 0); // argv[1] = NULL
+    write_word(&mut top_page, &mut cur, 0); // envp[0] = NULL
+    for (a_type, a_val) in aux_entries {
+        write_word(&mut top_page, &mut cur, a_type);
+        write_word(&mut top_page, &mut cur, a_val);
+    }
+
+    stack.write(stack_size - PAGE_SIZE, &top_page)?;
+    root_vmar.map(
+        &stack,
+        0,
+        stack_bottom,
+        stack_size,
+        vmar_flags::READ | vmar_flags::WRITE | vmar_flags::USER | vmar_flags::SPECIFIC,
+    )?;
+
+    Ok(top_page_va + sp_off as u64)
+}
+
+fn map_load_segment(root_vmar: &Vmar, elf: &[u8], bias: u64, ph: Phdr64) -> crate::Result<()> {
+    if ph.p_filesz > ph.p_memsz {
         return Err(crate::ErrorCode::InvalidArgs);
     }
 
     let file_end = ph
-        .offset
-        .checked_add(ph.filesz)
+        .p_offset
+        .checked_add(ph.p_filesz)
         .ok_or(crate::ErrorCode::InvalidArgs)?;
     if file_end > elf.len() as u64 {
         return Err(crate::ErrorCode::InvalidArgs);
     }
 
-    let page_start = elf::align_down(ph.vaddr, PAGE_SIZE);
-    let seg_end = ph
-        .vaddr
-        .checked_add(ph.memsz)
+    let seg_vaddr = bias.wrapping_add(ph.p_vaddr);
+    let page_start = elf::align_down(seg_vaddr, PAGE_SIZE);
+    let seg_end = seg_vaddr
+        .checked_add(ph.p_memsz)
         .ok_or(crate::ErrorCode::InvalidArgs)?;
     let page_end = elf::align_up(seg_end, PAGE_SIZE).ok_or(crate::ErrorCode::InvalidArgs)?;
     if page_end <= page_start {
@@ -201,17 +682,17 @@ fn map_load_segment(root_vmar: &Vmar, elf: &[u8], ph: ProgramHeader) -> crate::R
     }
 
     let map_len = page_end - page_start;
-    let vmo_flags = if ph.flags & PF_X != 0 {
-        huesos_abi::vmo_create_flags::EXECUTABLE
+    let vmo_flags = if ph.p_flags & PF_X != 0 {
+        vmo_create_flags::EXECUTABLE
     } else {
         0
     };
     let vmo = Vmo::create_with_flags(map_len, vmo_flags)?;
 
-    if ph.filesz > 0 {
-        let file_start = ph.offset as usize;
+    if ph.p_filesz > 0 {
+        let file_start = ph.p_offset as usize;
         let file_end = file_end as usize;
-        let vmo_file_offset = ph.vaddr - page_start;
+        let vmo_file_offset = seg_vaddr - page_start;
         // The kernel intentionally caps one VMO transfer at 1 MiB. Large
         // static assets (for example Freedoom's IWAD in the Doom ELF) must be
         // copied in bounded chunks rather than weakening that syscall limit.
@@ -228,7 +709,7 @@ fn map_load_segment(root_vmar: &Vmar, elf: &[u8], ph: ProgramHeader) -> crate::R
         }
     }
 
-    let flags = segment_vmar_flags(ph.flags)?;
+    let flags = segment_vmar_flags(ph.p_flags)?;
     root_vmar.map(&vmo, 0, page_start, map_len, flags)?;
     Ok(())
 }
@@ -238,21 +719,22 @@ fn map_load_segment_from_vmo(
     vmo: &Vmo,
     elf_offset: u64,
     elf_len: u64,
-    ph: ProgramHeader,
+    bias: u64,
+    ph: Phdr64,
 ) -> crate::Result<()> {
-    if ph.filesz > ph.memsz
+    if ph.p_filesz > ph.p_memsz
         || ph
-            .offset
-            .checked_add(ph.filesz)
+            .p_offset
+            .checked_add(ph.p_filesz)
             .is_none_or(|end| end > elf_len)
     {
         return Err(crate::ErrorCode::InvalidArgs);
     }
 
-    let page_start = elf::align_down(ph.vaddr, PAGE_SIZE);
-    let seg_end = ph
-        .vaddr
-        .checked_add(ph.memsz)
+    let seg_vaddr = bias.wrapping_add(ph.p_vaddr);
+    let page_start = elf::align_down(seg_vaddr, PAGE_SIZE);
+    let seg_end = seg_vaddr
+        .checked_add(ph.p_memsz)
         .ok_or(crate::ErrorCode::InvalidArgs)?;
     let page_end = elf::align_up(seg_end, PAGE_SIZE).ok_or(crate::ErrorCode::InvalidArgs)?;
     if page_end <= page_start {
@@ -260,22 +742,22 @@ fn map_load_segment_from_vmo(
     }
 
     let map_len = page_end - page_start;
-    let vmo_flags = if ph.flags & PF_X != 0 {
-        huesos_abi::vmo_create_flags::EXECUTABLE
+    let vmo_flags = if ph.p_flags & PF_X != 0 {
+        vmo_create_flags::EXECUTABLE
     } else {
         0
     };
     let seg_vmo = Vmo::create_with_flags(map_len, vmo_flags)?;
 
-    if ph.filesz > 0 {
+    if ph.p_filesz > 0 {
         let mut buf = [0u8; 4096];
         let mut read_total = 0;
-        let vmo_file_offset = ph.vaddr - page_start;
+        let vmo_file_offset = seg_vaddr - page_start;
 
-        while read_total < ph.filesz {
-            let to_read = (ph.filesz - read_total).min(buf.len() as u64);
+        while read_total < ph.p_filesz {
+            let to_read = (ph.p_filesz - read_total).min(buf.len() as u64);
             let source_offset = elf_offset
-                .checked_add(ph.offset)
+                .checked_add(ph.p_offset)
                 .and_then(|base| base.checked_add(read_total))
                 .ok_or(crate::ErrorCode::InvalidArgs)?;
             let count = to_read as usize;
@@ -288,7 +770,7 @@ fn map_load_segment_from_vmo(
         }
     }
 
-    let flags = segment_vmar_flags(ph.flags)?;
+    let flags = segment_vmar_flags(ph.p_flags)?;
     root_vmar.map(&seg_vmo, 0, page_start, map_len, flags)?;
     Ok(())
 }
@@ -297,38 +779,30 @@ fn map_initial_stack(root_vmar: &Vmar, stack_size: u64) -> crate::Result<()> {
     if !huesos_abi::valid_user_stack_size(stack_size) {
         return Err(crate::ErrorCode::InvalidArgs);
     }
-    let stack_bottom = huesos_abi::USER_STACK_TOP - stack_size;
+    let stack_bottom = USER_STACK_TOP - stack_size;
     let stack = Vmo::create(stack_size)?;
     root_vmar.map(
         &stack,
         0,
         stack_bottom,
         stack_size,
-        huesos_abi::vmar_flags::READ
-            | huesos_abi::vmar_flags::WRITE
-            | huesos_abi::vmar_flags::USER
-            | huesos_abi::vmar_flags::SPECIFIC,
+        vmar_flags::READ | vmar_flags::WRITE | vmar_flags::USER | vmar_flags::SPECIFIC,
     )?;
     Ok(())
 }
 
 fn segment_vmar_flags(ph_flags: u32) -> crate::Result<u32> {
-    let mut flags = huesos_abi::vmar_flags::USER | huesos_abi::vmar_flags::SPECIFIC;
+    let mut flags = vmar_flags::USER | vmar_flags::SPECIFIC;
     if ph_flags & PF_R != 0 {
-        flags |= huesos_abi::vmar_flags::READ;
+        flags |= vmar_flags::READ;
     }
     if ph_flags & PF_W != 0 {
-        flags |= huesos_abi::vmar_flags::WRITE;
+        flags |= vmar_flags::WRITE;
     }
     if ph_flags & PF_X != 0 {
-        flags |= huesos_abi::vmar_flags::EXECUTE;
+        flags |= vmar_flags::EXECUTE;
     }
-    if flags
-        & (huesos_abi::vmar_flags::READ
-            | huesos_abi::vmar_flags::WRITE
-            | huesos_abi::vmar_flags::EXECUTE)
-        == 0
-    {
+    if flags & (vmar_flags::READ | vmar_flags::WRITE | vmar_flags::EXECUTE) == 0 {
         return Err(crate::ErrorCode::InvalidArgs);
     }
     Ok(flags)

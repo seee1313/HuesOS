@@ -1,14 +1,20 @@
 //! Audited x86_64 syscall trampoline.
 //!
-//! This is the only userspace module that executes the `syscall` instruction.
-//! The trampoline accepts integer register values, all of which are valid at
-//! the CPU ABI level. Pointer/range semantics are validated by the kernel's
-//! user-copy boundary, so issuing a syscall with a bad address returns an error
-//! rather than causing Rust undefined behavior. Consequently these private
-//! helpers are safe functions; only the inline assembly implementation needs
-//! an unsafe block.
+//! This is the only userspace module that executes the `syscall` instruction
+//! (when compiled statically or into `libcanvas.so`), or delegates to
+//! `canvas_syscall` in `libcanvas.so` (when compiled with `dyn-client`).
+//! Application code should never execute `syscall` directly.
 
 use huesos_abi::Syscall;
+
+#[cfg(all(feature = "c-abi", feature = "dyn-client"))]
+compile_error!("libcanvas features `c-abi` and `dyn-client` are mutually exclusive");
+
+#[cfg(feature = "dyn-client")]
+#[link(name = "canvas", kind = "dylib")]
+unsafe extern "C" {
+    fn canvas_syscall(num: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> i64;
+}
 
 /// Issue a syscall with up to five register arguments.
 ///
@@ -16,6 +22,7 @@ use huesos_abi::Syscall;
 /// responsible for ownership and semantic validation, but callers cannot
 /// violate Rust memory safety merely by placing an integer in a syscall
 /// register.
+#[cfg(not(feature = "dyn-client"))]
 #[inline(always)]
 pub(crate) fn syscall5(syscall: Syscall, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> i64 {
     let number = syscall as u64;
@@ -38,6 +45,16 @@ pub(crate) fn syscall5(syscall: Syscall, a1: u64, a2: u64, a3: u64, a4: u64, a5:
         );
     }
     result
+}
+
+/// Issue a syscall through `libcanvas.so` (`canvas_syscall`).
+#[cfg(feature = "dyn-client")]
+#[inline]
+pub(crate) fn syscall5(syscall: Syscall, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> i64 {
+    // SAFETY: `canvas_syscall` is exported by `libcanvas.so` with the stable
+    // SysV AMD64 ABI and executes the audited kernel syscall trampoline inside
+    // `libcanvas.so`.
+    unsafe { canvas_syscall(syscall as u64, a1, a2, a3, a4, a5) }
 }
 
 /// Issue a zero-argument syscall.

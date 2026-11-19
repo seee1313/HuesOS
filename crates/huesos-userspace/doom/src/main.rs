@@ -81,8 +81,18 @@ unsafe extern "C" {
     static mut DG_ScreenBuffer: *mut u32;
 }
 
+#[unsafe(naked)]
 #[unsafe(no_mangle)]
 pub extern "C" fn _start() -> ! {
+    core::arch::naked_asm!(
+        "and rsp, -16",
+        "call {entry}",
+        "ud2",
+        entry = sym doom_main,
+    );
+}
+
+extern "C" fn doom_main() -> ! {
     libcanvas::println!("[doom] HuesOS DoomGeneric starting (Freedoom Phase 1)");
     let arg0 = c"doom".as_ptr() as *mut u8;
     let arg1 = c"-iwad".as_ptr() as *mut u8;

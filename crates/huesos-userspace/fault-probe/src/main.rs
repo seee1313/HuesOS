@@ -5,8 +5,18 @@
 
 use core::panic::PanicInfo;
 
+#[unsafe(naked)]
 #[unsafe(no_mangle)]
 pub extern "C" fn _start() -> ! {
+    core::arch::naked_asm!(
+        "and rsp, -16",
+        "call {entry}",
+        "ud2",
+        entry = sym fault_probe_main,
+    );
+}
+
+extern "C" fn fault_probe_main() -> ! {
     let bootstrap = libcanvas::channel::bootstrap();
     let mut command = [0u8; 16];
     let Ok(length) = bootstrap.read_into_blocking(&mut command) else {

@@ -1,11 +1,10 @@
 [build]
-target = "../x86_64-huesos-userspace.json"
+target = "../x86_64-huesos-userspace-dyn.json"
 
-[target.x86_64-huesos-userspace]
+[target.x86_64-huesos-userspace-dyn]
 rustflags = [
-    "-C", "link-arg=-T../user_linker.ld",
-    "-C", "link-arg=-no-pie",
-    "-C", "relocation-model=static",
+    "-C", "link-arg=--dynamic-linker=/lib/ld-huesos.so",
+    "-C", "link-arg=-L../libcanvas/target-cdylib/x86_64-huesos-userspace-dyn/release",
 ]
 
 [unstable]
