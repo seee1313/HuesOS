@@ -59,7 +59,9 @@ jobs:
             args="$args -p $pkg"
           done
           RUST_MIN_STACK=16777216 CARGO_BUILD_JOBS=2 \
-            cargo test $args --no-fail-fast > ci-artifacts/arena-tests/host-tests.log 2>&1
+            cargo test $args --no-fail-fast \
+            --target x86_64-unknown-linux-gnu -Z build-std= \
+            > ci-artifacts/arena-tests/host-tests.log 2>&1
           status=$?
           echo "status=$status" >> "$GITHUB_OUTPUT"
           tail -60 ci-artifacts/arena-tests/host-tests.log
