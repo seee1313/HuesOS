@@ -57,7 +57,10 @@ pub mod writer;
 
 use crate::crc32c::metadata_crc32c;
 use crate::format::*;
-use crate::reader::BlockReader;
+// Re-exported so callers that adapt their own storage (for example
+// `fdisk` probing a raw device for a superfloppy) can implement the same
+// reader the mount path uses instead of writing a second, weaker probe.
+pub use crate::reader::BlockReader;
 
 /// Hxfs parser/read failure.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

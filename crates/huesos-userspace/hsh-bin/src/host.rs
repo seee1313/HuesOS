@@ -801,22 +801,25 @@ impl HshHost {
             false
         };
         let mut ctrl_c = false;
+        let mut received: Vec<Vec<u8>> = Vec::new();
         let mut buf = [0u8; 256];
         if let Some(ch) = self.key_source.as_ref() {
             loop {
                 match ch.read_into(&mut buf) {
                     Ok(0) => break,
-                    Ok(n) => {
-                        let packet = &buf[..n];
-                        if packet_is_ctrl_c(packet) {
-                            ctrl_c = true;
-                        } else {
-                            self.pending_packets.push(packet.to_vec());
-                        }
-                    }
+                    Ok(n) => received.push(buf[..n].to_vec()),
                     Err(ErrorCode::ShouldWait) | Err(ErrorCode::TimedOut) => break,
                     Err(_) => break,
                 }
+            }
+        }
+        // Drain into the replay buffer only after the channel borrow above is
+        // released: pushing while `ch` is alive is a double borrow of `self`.
+        for packet in received {
+            if packet_is_ctrl_c(&packet) {
+                ctrl_c = true;
+            } else {
+                self.pending_packets.push(packet);
             }
         }
         if auto || ctrl_c {

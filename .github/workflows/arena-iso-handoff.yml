@@ -191,6 +191,10 @@ jobs:
           git config user.name "arena-iso-bot"
           git config user.email "arena-iso-bot@users.noreply.github.com"
           git add -f ci-artifacts/arena-iso
+          # Standalone userspace crates carry their own lockfiles; a new path
+          # dependency regenerates them during the build, and the lock-policy
+          # gate wants the regenerated file committed.
+          git add -A -- crates/huesos-userspace/*/Cargo.lock
           if git diff --cached --quiet; then
             echo "nothing to publish"
             exit 0
