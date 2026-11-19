@@ -73,7 +73,9 @@ jobs:
           git config user.email "arena-test-bot@users.noreply.github.com"
           echo "status=${{ steps.tests.outputs.status }}" > ci-artifacts/arena-tests/host/status.txt
           publish() {
-            git add -f ci-artifacts/arena-tests/host ci-artifacts/arena-tests/clippy ci-artifacts/arena-tests/asan
+            # Only this job's own directory: a sibling directory that is
+            # absent from this checkout would otherwise be staged as a deletion.
+            git add -f ci-artifacts/arena-tests/host
             if git diff --cached --quiet; then
               echo "nothing to publish"
               return 0
@@ -155,7 +157,9 @@ jobs:
           git config user.email "arena-test-bot@users.noreply.github.com"
           echo "status=${{ steps.asan.outputs.status }}" > ci-artifacts/arena-tests/asan/status.txt
           publish() {
-            git add -f ci-artifacts/arena-tests/host ci-artifacts/arena-tests/clippy ci-artifacts/arena-tests/asan
+            # Only this job's own directory: a sibling directory that is
+            # absent from this checkout would otherwise be staged as a deletion.
+            git add -f ci-artifacts/arena-tests/asan
             if git diff --cached --quiet; then
               echo "nothing to publish"
               return 0
@@ -218,7 +222,9 @@ jobs:
           git config user.email "arena-test-bot@users.noreply.github.com"
           echo "status=${{ steps.clippy.outputs.status }}" > ci-artifacts/arena-tests/clippy/status.txt
           publish() {
-            git add -f ci-artifacts/arena-tests/host ci-artifacts/arena-tests/clippy ci-artifacts/arena-tests/asan
+            # Only this job's own directory: a sibling directory that is
+            # absent from this checkout would otherwise be staged as a deletion.
+            git add -f ci-artifacts/arena-tests/clippy
             if git diff --cached --quiet; then
               echo "nothing to publish"
               return 0
