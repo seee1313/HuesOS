@@ -837,15 +837,16 @@ fn remap_mapping_pages(
 pub fn unmap_vmar_mapping(vmar: &Vmar, args: VmarOpArgs) -> Result<u64, ErrorCode> {
     let process = process_runtime_for_vmar(vmar)?;
     let _memory_guard = process.user_memory_lock.lock();
-    let _mutation_guard = VMAR_MUTATION_LOCK.lock();
+    // Do not hold VMAR_MUTATION_LOCK (LockRank::PROCESS) across
+    // `unmap_user_page`, `replace_mapping`, or `note_kernel_ref_close`, which
+    // acquire lower-ranked locks (ARCHITECTURE, OBJECT, REGISTRY).
     let mapping = validate_vmar_op_args(vmar, args, false)?;
     let object = huesos_object::lookup_object(mapping.vmo).ok_or(ErrorCode::BadHandle)?;
     let vmo = object
         .downcast_ref::<huesos_object::Vmo>()
         .ok_or(ErrorCode::WrongType)?;
-    let runtime_any = process.address_space.lock();
-    let mut runtime = runtime_any;
-    let runtime = runtime
+    let mut runtime_guard = process.address_space.lock();
+    let runtime = runtime_guard
         .as_mut()
         .and_then(|value| value.downcast_mut::<ProcessRuntime>())
         .ok_or(ErrorCode::BadHandle)?;
@@ -885,9 +886,12 @@ pub fn unmap_vmar_mapping(vmar: &Vmar, args: VmarOpArgs) -> Result<u64, ErrorCod
         release_extra_mapping_refs(mapping.vmo, extra_refs);
         return Err(ErrorCode::Internal);
     }
+    drop(runtime_guard);
+    drop(_memory_guard);
     if replacement_count == 0 {
         huesos_object::note_kernel_ref_close(mapping.vmo);
     }
+    let _mutation_guard = VMAR_MUTATION_LOCK.lock();
     huesos_arch::paging::shootdown_range(
         args.addr,
         args.addr + args.len,
@@ -901,13 +905,14 @@ pub fn unmap_vmar_mapping(vmar: &Vmar, args: VmarOpArgs) -> Result<u64, ErrorCod
 pub fn protect_vmar_mapping(vmar: &Vmar, args: VmarOpArgs) -> Result<u64, ErrorCode> {
     let process = process_runtime_for_vmar(vmar)?;
     let _memory_guard = process.user_memory_lock.lock();
-    let _mutation_guard = VMAR_MUTATION_LOCK.lock();
+    // Do not hold VMAR_MUTATION_LOCK (LockRank::PROCESS) across
+    // `protect_user_page`, `replace_mapping`, or `adjust_mapping_refcount`,
+    // which acquire lower-ranked locks (ARCHITECTURE, OBJECT, REGISTRY).
     let mapping = validate_vmar_op_args(vmar, args, true)?;
     let old_flags = page_flags_from_vmar_flags(mapping.flags)?;
     let new_flags = page_flags_from_vmar_flags(args.flags)?;
-    let runtime_any = process.address_space.lock();
-    let mut runtime = runtime_any;
-    let runtime = runtime
+    let mut runtime_guard = process.address_space.lock();
+    let runtime = runtime_guard
         .as_mut()
         .and_then(|value| value.downcast_mut::<ProcessRuntime>())
         .ok_or(ErrorCode::BadHandle)?;
@@ -954,6 +959,9 @@ pub fn protect_vmar_mapping(vmar: &Vmar, args: VmarOpArgs) -> Result<u64, ErrorC
         release_extra_mapping_refs(mapping.vmo, extra_refs);
         return Err(ErrorCode::Internal);
     }
+    drop(runtime_guard);
+    drop(_memory_guard);
+    let _mutation_guard = VMAR_MUTATION_LOCK.lock();
     huesos_arch::paging::shootdown_range(
         args.addr,
         args.addr + args.len,

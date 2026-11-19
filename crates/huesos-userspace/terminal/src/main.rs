@@ -19,8 +19,18 @@ use core::panic::PanicInfo;
 use libcanvas::{println, Channel, ErrorCode, Handle};
 use shell::Shell;
 
+#[unsafe(naked)]
 #[unsafe(no_mangle)]
 pub extern "C" fn _start() -> ! {
+    core::arch::naked_asm!(
+        "and rsp, -16",
+        "call {entry}",
+        "ud2",
+        entry = sym terminal_main,
+    );
+}
+
+extern "C" fn terminal_main() -> ! {
     println!("[terminal] started in userspace");
 
     let bootstrap = libcanvas::channel::bootstrap();
