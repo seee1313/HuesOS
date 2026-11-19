@@ -2217,7 +2217,6 @@ impl DriverManager {
             .write_handle(protocol::QUERY_CHANNEL.as_bytes(), client_ch.into_handle())
         {
             Ok(()) => {
-                println!("[driver-manager] query slot {slot} granted");
                 self.query_channels[slot] = Some(server_ch);
                 self.query_idle[slot] = 0;
             }
@@ -2240,17 +2239,14 @@ impl DriverManager {
                     match ch.read_into(&mut buf) {
                         Ok(n) if &buf[..n] == protocol::QUERY_PCI.as_bytes() => {
                             self.reply_query_pci_on(ch);
-                            println!("[driver-manager] query slot {idx} served pci");
                             served = true;
                         }
                         Ok(n) if &buf[..n] == protocol::QUERY_ACPI.as_bytes() => {
                             self.reply_query_acpi_on(ch);
-                            println!("[driver-manager] query slot {idx} served acpi");
                             served = true;
                         }
                         Ok(n) if &buf[..n] == protocol::QUERY_PS.as_bytes() => {
                             self.reply_query_ps_on(ch);
-                            println!("[driver-manager] query slot {idx} served ps");
                             served = true;
                         }
                         Ok(_) => {
@@ -2266,7 +2262,6 @@ impl DriverManager {
                 }
             }
             if close {
-                println!("[driver-manager] query slot {idx} closed by client");
             }
             if close || self.query_channels[idx].is_none() {
                 self.query_channels[idx] = None;
@@ -2368,9 +2363,8 @@ impl DriverManager {
                 );
             }
         }
-        match registry.write(out.as_bytes()) {
-            Ok(()) => println!("[driver-manager] pci reply {} bytes", out.as_bytes().len()),
-            Err(error) => println!("[driver-manager] pci reply write failed: {}", error.as_str()),
+        if let Err(error) = registry.write(out.as_bytes()) {
+            println!("[driver-manager] pci reply write failed: {}", error.as_str());
         }
     }
 

@@ -219,7 +219,6 @@ impl HshHost {
         for _ in 0..HANDSHAKE_READS {
             match reg.read_optional_handle_timeout(&mut buf, HANDSHAKE_WAIT_TICKS) {
                 Ok((n, Some(handle))) if &buf[..n] == b"service:query:channel" => {
-                    libcanvas::println!("[hsh] query channel granted");
                     return Some(Channel::from_handle(handle));
                 }
                 Ok((n, None)) if buf[..n].starts_with(b"err:query") => {
