@@ -777,6 +777,25 @@ impl InteractiveShell {
             println!("[hsh] consecutive spawn stress OK (30 spawns)");
         }
 
+        // 7. Registry capability must survive the spawn storm above: the
+        //    DriverManager query pool is only reclaimed once the queued
+        //    capabilities are released, so a leaky handshake shows up here and
+        //    nowhere else (`pci` works fine before the stress, never after).
+        match smoke_env.eval_script("pci | count", &mut self.host) {
+            Ok(res)
+                if res.status == 0
+                    && res.render_text().trim().parse::<usize>().unwrap_or(0) > 0 =>
+            {
+                println!("[hsh] post-stress query channel OK");
+            }
+            Ok(res) => println!(
+                "[hsh] post-stress query channel FAILED status={} out={}",
+                res.status,
+                res.render_text()
+            ),
+            Err(e) => println!("[hsh] post-stress query channel ERROR: {}", e),
+        }
+
         self.send_clear();
         self.send_write(
             Some((95, 225, 185)),

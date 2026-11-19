@@ -86,6 +86,7 @@ impl HshHost {
         let Some(reg) = self.registry.as_ref() else {
             return;
         };
+        self.drain_registry();
         if reg.write(b"open:hxfs").is_err() {
             return;
         }
@@ -98,7 +99,9 @@ impl HshHost {
                 }
                 Ok((n, None)) if buf[..n].starts_with(b"err:hxfs") => return,
                 Ok((_n, Some(handle))) => drop(handle),
-                Ok((_n, None)) => return,
+                // A late reply to a different handshake: skip it rather than
+                // failing this one.
+                Ok((_n, None)) => {}
                 Err(ErrorCode::ShouldWait) | Err(ErrorCode::TimedOut) => {
                     libcanvas::process::yield_now();
                 }
@@ -107,8 +110,32 @@ impl HshHost {
         }
     }
 
+    /// Drop any pending message on the shared registry channel.
+    ///
+    /// The registry is a single request/response stream shared by every
+    /// `open:*` handshake. A reply that arrives after a client gave up stays
+    /// queued, and the next handshake would read it as its own answer -- one
+    /// late reply permanently shifts the stream by one message. Draining first
+    /// keeps every handshake aligned; dropping a queued capability handle also
+    /// releases the supplier's side (it sees `PeerClosed`), so leaked query
+    /// slots are reclaimed instead of accumulating.
+    fn drain_registry(&self) {
+        let Some(reg) = self.registry.as_ref() else {
+            return;
+        };
+        let mut buf = [0u8; 64];
+        for _ in 0..32 {
+            match reg.read_optional_handle(&mut buf) {
+                Ok((_n, handle)) => drop(handle),
+                Err(ErrorCode::ShouldWait) | Err(ErrorCode::TimedOut) => break,
+                Err(_) => break,
+            }
+        }
+    }
+
     fn open_hxfs_channel_fresh(&self) -> Option<Channel> {
         let reg = self.registry.as_ref()?;
+        self.drain_registry();
         reg.write(b"open:hxfs").ok()?;
         let mut buf = [0u8; 64];
         for _ in 0..50 {
@@ -118,7 +145,9 @@ impl HshHost {
                 }
                 Ok((n, None)) if buf[..n].starts_with(b"err:hxfs") => return None,
                 Ok((_n, Some(handle))) => drop(handle),
-                Ok((_n, None)) => return None,
+                // A late reply to a different handshake: skip it rather than
+                // giving up on this one.
+                Ok((_n, None)) => {}
                 Err(ErrorCode::ShouldWait) | Err(ErrorCode::TimedOut) => {
                     libcanvas::process::yield_now();
                 }
@@ -130,6 +159,7 @@ impl HshHost {
 
     fn open_block_nvme_fresh(&self) -> Option<Channel> {
         let reg = self.registry.as_ref()?;
+        self.drain_registry();
         reg.write(b"open:block:nvme").ok()?;
         let mut buf = [0u8; 64];
         for _ in 0..50 {
@@ -139,7 +169,9 @@ impl HshHost {
                 }
                 Ok((n, None)) if buf[..n].starts_with(b"err:block") => return None,
                 Ok((_n, Some(handle))) => drop(handle),
-                Ok((_n, None)) => return None,
+                // A late reply to a different handshake: skip it rather than
+                // giving up on this one.
+                Ok((_n, None)) => {}
                 Err(ErrorCode::ShouldWait) | Err(ErrorCode::TimedOut) => {
                     libcanvas::process::yield_now();
                 }
@@ -149,8 +181,28 @@ impl HshHost {
         None
     }
 
+    /// Hand the child a fresh DriverManager query channel.
+    ///
+    /// Transient congestion is normal: a burst of spawns can find every slot
+    /// taken until `driver-manager` reaps the clients of the processes that
+    /// already exited. Retry a few times instead of silently spawning a child
+    /// without a registry capability, which would make `pci`/`ps`/`acpi` fail
+    /// with "query channel unavailable".
     fn open_query_fresh(&self) -> Option<Channel> {
+        for _ in 0..3 {
+            if let Some(channel) = self.open_query_once() {
+                return Some(channel);
+            }
+            for _ in 0..8 {
+                libcanvas::process::yield_now();
+            }
+        }
+        None
+    }
+
+    fn open_query_once(&self) -> Option<Channel> {
         let reg = self.registry.as_ref()?;
+        self.drain_registry();
         reg.write(b"open:query").ok()?;
         let mut buf = [0u8; 64];
         for _ in 0..50 {
@@ -160,7 +212,9 @@ impl HshHost {
                 }
                 Ok((n, None)) if buf[..n].starts_with(b"err:query") => return None,
                 Ok((_n, Some(handle))) => drop(handle),
-                Ok((_n, None)) => return None,
+                // A late reply to a different handshake: skip it rather than
+                // giving up on this one.
+                Ok((_n, None)) => {}
                 Err(ErrorCode::ShouldWait) | Err(ErrorCode::TimedOut) => {
                     libcanvas::process::yield_now();
                 }

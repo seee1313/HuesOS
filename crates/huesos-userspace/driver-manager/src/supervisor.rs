@@ -255,6 +255,8 @@ pub struct DriverManager {
     acpi_authority_settled: bool,
     registry_channel: Option<Channel>,
     query_channels: [Option<Channel>; 8],
+    /// Ticks each pool slot has been held without a single request on it.
+    query_idle: [u32; 8],
     fs: FileSystemService,
     volume: VolumeManagerService,
     devfs: DevFsService,
@@ -299,6 +301,13 @@ const MAX_TRACKED_HOSTS: usize = 8;
 /// peer that eventually goes quiet, which the NVMe host under the
 /// high queue-depth soak is not.
 const POLL_BUDGET_PER_TICK: u32 = 64;
+
+/// How many supervision ticks an unused query channel may sit in the pool
+/// before it is reclaimed. A client that never sends a request on the channel
+/// it was handed is either gone or failed its handshake and left the queued
+/// capability unread; without eviction those slots leak and every later
+/// `open:query` is refused with `err:query:full`.
+const QUERY_IDLE_EVICT_TICKS: u32 = 3000;
 const ACPI_MANAGER_MAX_RESTARTS: u8 = 3;
 const ACPI_MANAGER_RESTART_BASE_TICKS: u64 = 10;
 const ACPI_MANAGER_INIT_WATCHDOG_TICKS: u64 = 1000;
@@ -432,6 +441,7 @@ impl DriverManager {
             acpi_authority_settled: false,
             registry_channel: None,
             query_channels: [const { None }; 8],
+            query_idle: [0; 8],
             fs: FileSystemService::new(),
             volume: VolumeManagerService::new(),
             devfs: DevFsService::new(),
@@ -2195,6 +2205,7 @@ impl DriverManager {
             return;
         };
         let Some(slot) = self.query_channels.iter().position(|c| c.is_none()) else {
+            println!("[driver-manager] query channel pool exhausted; refusing request");
             let _ = registry.write(b"err:query:full");
             return;
         };
@@ -2207,6 +2218,7 @@ impl DriverManager {
             .is_ok()
         {
             self.query_channels[slot] = Some(server_ch);
+            self.query_idle[slot] = 0;
         }
     }
 
@@ -2214,6 +2226,7 @@ impl DriverManager {
         let mut buf = [0u8; 64];
         for idx in 0..self.query_channels.len() {
             let mut close = false;
+            let mut served = false;
             if let Some(ch) = self.query_channels[idx].as_ref() {
                 let mut budget = POLL_BUDGET_PER_TICK;
                 while budget > 0 {
@@ -2221,15 +2234,19 @@ impl DriverManager {
                     match ch.read_into(&mut buf) {
                         Ok(n) if &buf[..n] == protocol::QUERY_PCI.as_bytes() => {
                             self.reply_query_pci_on(ch);
+                            served = true;
                         }
                         Ok(n) if &buf[..n] == protocol::QUERY_ACPI.as_bytes() => {
                             self.reply_query_acpi_on(ch);
+                            served = true;
                         }
                         Ok(n) if &buf[..n] == protocol::QUERY_PS.as_bytes() => {
                             self.reply_query_ps_on(ch);
+                            served = true;
                         }
                         Ok(_) => {
                             let _ = ch.write(b"err:query:unsupported");
+                            served = true;
                         }
                         Err(ErrorCode::ShouldWait) => break,
                         Err(ErrorCode::PeerClosed) | Err(_) => {
@@ -2239,8 +2256,20 @@ impl DriverManager {
                     }
                 }
             }
-            if close {
+            if close || self.query_channels[idx].is_none() {
                 self.query_channels[idx] = None;
+                self.query_idle[idx] = 0;
+                continue;
+            }
+            if served {
+                self.query_idle[idx] = 0;
+                continue;
+            }
+            self.query_idle[idx] = self.query_idle[idx].saturating_add(1);
+            if self.query_idle[idx] >= QUERY_IDLE_EVICT_TICKS {
+                println!("[driver-manager] reclaiming unused query channel slot {idx}");
+                self.query_channels[idx] = None;
+                self.query_idle[idx] = 0;
             }
         }
     }
