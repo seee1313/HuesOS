@@ -2213,12 +2213,18 @@ impl DriverManager {
             let _ = registry.write(b"err:query:pair");
             return;
         };
-        if registry
+        match registry
             .write_handle(protocol::QUERY_CHANNEL.as_bytes(), client_ch.into_handle())
-            .is_ok()
         {
-            self.query_channels[slot] = Some(server_ch);
-            self.query_idle[slot] = 0;
+            Ok(()) => {
+                println!("[driver-manager] query slot {slot} granted");
+                self.query_channels[slot] = Some(server_ch);
+                self.query_idle[slot] = 0;
+            }
+            Err((error, _handle)) => println!(
+                "[driver-manager] query grant write failed: {}",
+                error.as_str()
+            ),
         }
     }
 
@@ -2255,6 +2261,9 @@ impl DriverManager {
                         }
                     }
                 }
+            }
+            if close {
+                println!("[driver-manager] query slot {idx} closed by client");
             }
             if close || self.query_channels[idx].is_none() {
                 self.query_channels[idx] = None;

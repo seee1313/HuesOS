@@ -149,11 +149,16 @@ impl HshHost {
                 // giving up on this one.
                 Ok((_n, None)) => {}
                 Err(ErrorCode::ShouldWait) | Err(ErrorCode::TimedOut) => {
+                    polls += 1;
                     libcanvas::process::yield_now();
                 }
-                Err(_) => return None,
+                Err(e) => {
+                    println!("[hsh] query handshake read error: {}", e.as_str());
+                    return None;
+                }
             }
         }
+        println!("[hsh] query handshake timed out after {} polls", polls);
         None
     }
 
@@ -204,13 +209,18 @@ impl HshHost {
         let reg = self.registry.as_ref()?;
         self.drain_registry();
         reg.write(b"open:query").ok()?;
+        let mut polls: u32 = 0;
         let mut buf = [0u8; 64];
         for _ in 0..50 {
             match reg.read_optional_handle(&mut buf) {
                 Ok((n, Some(handle))) if &buf[..n] == b"service:query:channel" => {
+                    println!("[hsh] query channel granted");
                     return Some(Channel::from_handle(handle));
                 }
-                Ok((n, None)) if buf[..n].starts_with(b"err:query") => return None,
+                Ok((n, None)) if buf[..n].starts_with(b"err:query") => {
+                    println!("[hsh] query handshake refused: {}", String::from_utf8_lossy(&buf[..n]));
+                    return None;
+                }
                 Ok((_n, Some(handle))) => drop(handle),
                 // A late reply to a different handshake: skip it rather than
                 // giving up on this one.
