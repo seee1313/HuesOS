@@ -95,6 +95,80 @@ jobs:
         if: ${{ steps.tests.outputs.status != '0' }}
         run: exit 1
 
+  # Mirrors the sanitizers workflow's failing job so the failure text (which is
+  # otherwise unreachable from this sandbox) lands in the branch.
+  host-tests-asan:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install nightly-2026-03-01 --profile minimal \
+            --component rust-src,llvm-tools-preview
+          rustup default nightly-2026-03-01
+      - name: Cache cargo target directory
+        uses: actions/cache@v4
+        with:
+          path: |
+            target
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: arena-asan-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            arena-asan-
+      - name: Run the sanitizer host tests and capture the log
+        id: asan
+        env:
+          CARGO_BUILD_JOBS: "2"
+          RUSTFLAGS: "-Zsanitizer=address"
+        run: |
+          set +e
+          mkdir -p ci-artifacts/arena-tests
+          cargo test -p huesos-abi -p huesos-arch -p huesos-elf -p huesos-pmm \
+            -p huesos-object -p huesos-fb -p huesos-syscalls -p huesos-fat \
+            -p huesos-alloc -p huesos-uacpi -p huesos-scudo -p huesos-kernel -p huesos-decoder-fuzz \
+            -p huesos-scudo-fuzz -p huesos-hxfs-proto -p huesos-blobfs -p huesos-lifecycle \
+            -p huesos-ioapic -p huesos-extable -p huesos-waitset -p huesos-proclife \
+            -p huesos-handlemove -p hues-async -p huesos-nvme -p huesos-pci -p huesos-quota \
+            -p huesos-hxfs \
+            --target x86_64-unknown-linux-gnu -Z build-std= \
+            > ci-artifacts/arena-tests/asan.log 2>&1
+          status=$?
+          echo "status=$status" >> "$GITHUB_OUTPUT"
+          grep -n "^error\|FAILED\|panicked" -A6 ci-artifacts/arena-tests/asan.log | head -120
+          exit 0
+      - name: Publish the log
+        run: |
+          set -euo pipefail
+          git config user.name "arena-test-bot"
+          git config user.email "arena-test-bot@users.noreply.github.com"
+          echo "status=${{ steps.asan.outputs.status }}" > ci-artifacts/arena-tests/asan-status.txt
+          publish() {
+            git add -f ci-artifacts/arena-tests
+            if git diff --cached --quiet; then
+              echo "nothing to publish"
+              return 0
+            fi
+            git commit -m "chore(arena): publish asan log [skip ci]"
+          }
+          publish
+          for attempt in 1 2 3 4 5 6; do
+            if git push origin "HEAD:${GITHUB_REF_NAME}"; then
+              exit 0
+            fi
+            sleep $((attempt * 5))
+            git fetch -q origin "${GITHUB_REF_NAME}"
+            git reset --mixed -q FETCH_HEAD
+            publish
+          done
+          exit 1
+      - name: Fail when the sanitizer tests failed
+        if: ${{ steps.asan.outputs.status != '0' }}
+        run: exit 1
+
   clippy:
     runs-on: ubuntu-24.04
     timeout-minutes: 60
