@@ -7,53 +7,53 @@ info: downloading 3 components
  Downloading crates ...
   Downloaded block-buffer v0.10.4
   Downloaded bit_field v0.10.3
-  Downloaded const_fn v0.4.12
   Downloaded cpufeatures v0.2.17
+  Downloaded rustc_version v0.4.1
   Downloaded crypto-common v0.1.7
   Downloaded cfg-if v1.0.4
   Downloaded bitflags v1.3.2
-  Downloaded curve25519-dalek-derive v0.1.1
-  Downloaded bitflags v2.13.0
-  Downloaded unicode-ident v1.0.24
-  Downloaded cc v1.2.67
-  Downloaded version_check v0.9.5
-  Downloaded subtle v2.6.1
-  Downloaded signature v2.2.0
-  Downloaded rustc_version v0.4.1
   Downloaded volatile v0.4.6
-  Downloaded semver v1.0.28
-  Downloaded find-msvc-tools v0.1.9
   Downloaded uart_16550 v0.3.2
-  Downloaded generic-array v0.14.7
-  Downloaded scopeguard v1.2.0
-  Downloaded sha2 v0.10.9
-  Downloaded static_assertions v1.1.0
-  Downloaded shlex v2.0.1
-  Downloaded ed25519 v2.2.3
-  Downloaded spinning_top v0.2.5
-  Downloaded rustversion v1.0.22
-  Downloaded linked_list_allocator v0.10.6
-  Downloaded typenum v1.20.1
-  Downloaded proc-macro2 v1.0.107
-  Downloaded spin v0.9.9
-  Downloaded log v0.4.33
-  Downloaded digest v0.10.7
-  Downloaded quote v1.0.47
+  Downloaded subtle v2.6.1
   Downloaded pic8259 v0.11.0
+  Downloaded signature v2.2.0
+  Downloaded generic-array v0.14.7
+  Downloaded curve25519-dalek-derive v0.1.1
   Downloaded lock_api v0.4.14
-  Downloaded syn v2.0.119
-  Downloaded raw-cpuid v10.7.0
+  Downloaded version_check v0.9.5
+  Downloaded static_assertions v1.1.0
+  Downloaded spinning_top v0.2.5
+  Downloaded find-msvc-tools v0.1.9
+  Downloaded unicode-ident v1.0.24
+  Downloaded proc-macro2 v1.0.107
   Downloaded ed25519-dalek v2.2.0
-  Downloaded curve25519-dalek v4.1.3
   Downloaded x86_64 v0.15.4
+  Downloaded typenum v1.20.1
+  Downloaded raw-cpuid v10.7.0
+  Downloaded log v0.4.33
+  Downloaded spin v0.9.9
+  Downloaded shlex v2.0.1
+  Downloaded semver v1.0.28
+  Downloaded sha2 v0.10.9
+  Downloaded rustversion v1.0.22
+  Downloaded quote v1.0.47
+  Downloaded linked_list_allocator v0.10.6
+  Downloaded syn v2.0.119
+  Downloaded curve25519-dalek v4.1.3
+  Downloaded ed25519 v2.2.3
+  Downloaded digest v0.10.7
+  Downloaded cc v1.2.67
+  Downloaded bitflags v2.13.0
+  Downloaded const_fn v0.4.12
+  Downloaded scopeguard v1.2.0
   Downloaded x86 v0.52.0
     Updating crates.io index
  Downloading crates ...
-  Downloaded adler2 v2.0.1
-  Downloaded foldhash v0.2.0
   Downloaded addr2line v0.25.1
-  Downloaded getopts v0.2.24
+  Downloaded adler2 v2.0.1
   Downloaded rustc-literal-escaper v0.0.7
+  Downloaded foldhash v0.2.0
+  Downloaded getopts v0.2.24
   Downloaded rustc-demangle v0.1.27
   Downloaded memchr v2.7.6
   Downloaded miniz_oxide v0.8.9
@@ -72,35 +72,35 @@ info: downloading 3 components
    Compiling rustversion v1.0.22
    Compiling const_fn v0.4.12
    Compiling x86 v0.52.0
-   Compiling typenum v1.20.1
    Compiling proc-macro2 v1.0.107
-   Compiling find-msvc-tools v0.1.9
-   Compiling shlex v2.0.1
+   Compiling typenum v1.20.1
    Compiling quote v1.0.47
    Compiling unicode-ident v1.0.24
+   Compiling find-msvc-tools v0.1.9
+   Compiling shlex v2.0.1
    Compiling cc v1.2.67
    Compiling semver v1.0.28
    Compiling rustc_version v0.4.1
    Compiling huesos-uacpi v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-uacpi)
-   Compiling crypto-common v0.1.7
    Compiling block-buffer v0.10.4
+   Compiling crypto-common v0.1.7
    Compiling digest v0.10.7
    Compiling syn v2.0.119
    Compiling rustc-std-workspace-core v1.99.0 (/home/runner/.rustup/toolchains/nightly-2026-03-01-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/rustc-std-workspace-core)
    Compiling alloc v0.0.0 (/home/runner/.rustup/toolchains/nightly-2026-03-01-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/alloc)
-   Compiling unwind v0.0.0 (/home/runner/.rustup/toolchains/nightly-2026-03-01-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/unwind)
-   Compiling memchr v2.7.6
    Compiling rustc-std-workspace-alloc v1.99.0 (/home/runner/.rustup/toolchains/nightly-2026-03-01-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/rustc-std-workspace-alloc)
    Compiling gimli v0.32.3
+   Compiling unwind v0.0.0 (/home/runner/.rustup/toolchains/nightly-2026-03-01-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/unwind)
+   Compiling memchr v2.7.6
    Compiling adler2 v2.0.1
    Compiling miniz_oxide v0.8.9
    Compiling addr2line v0.25.1
+   Compiling panic_unwind v0.0.0 (/home/runner/.rustup/toolchains/nightly-2026-03-01-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/panic_unwind)
    Compiling std_detect v0.1.5 (/home/runner/.rustup/toolchains/nightly-2026-03-01-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/std_detect)
    Compiling hashbrown v0.16.1
-   Compiling panic_unwind v0.0.0 (/home/runner/.rustup/toolchains/nightly-2026-03-01-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/panic_unwind)
-   Compiling rustc-demangle v0.1.27
    Compiling panic_abort v0.0.0 (/home/runner/.rustup/toolchains/nightly-2026-03-01-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/panic_abort)
    Compiling cfg-if v1.0.4
+   Compiling rustc-demangle v0.1.27
    Compiling rustc-literal-escaper v0.0.7
    Compiling curve25519-dalek v4.1.3
    Compiling cpufeatures v0.2.17
@@ -126,28 +126,28 @@ info: downloading 3 components
    Compiling uart_16550 v0.3.2
    Compiling pic8259 v0.11.0
    Compiling static_assertions v1.1.0
-   Compiling huesos-sched v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-sched)
    Compiling huesos-sync v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-sync)
+   Compiling huesos-sched v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-sched)
    Compiling huesos-arch v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-arch)
-   Compiling huesos-proclife v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-proclife)
-   Compiling huesos-quota v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-quota)
-   Compiling huesos-lifecycle v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-lifecycle)
    Compiling hues-async v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/hues-async)
+   Compiling huesos-proclife v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-proclife)
+   Compiling huesos-lifecycle v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-lifecycle)
+   Compiling huesos-quota v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-quota)
    Compiling huesos-object v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-object)
    Compiling huesos-fb v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-fb)
    Compiling huesos-handlemove v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-handlemove)
    Compiling huesos-waitset v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-waitset)
-   Compiling signature v2.2.0
    Compiling subtle v2.6.1
+   Compiling signature v2.2.0
    Compiling ed25519 v2.2.3
    Compiling huesos-syscalls v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-syscalls)
    Compiling huesos-elf v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-elf)
    Compiling spinning_top v0.2.5
    Compiling huesos-hxfs v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-hxfs)
    Compiling huesos-extable v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-extable)
-   Compiling huesos-alloc v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-alloc)
    Compiling huesos-pci v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-pci)
    Compiling huesos-scudo v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-scudo)
+   Compiling huesos-alloc v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-alloc)
    Compiling linked_list_allocator v0.10.6
    Compiling ed25519-dalek v2.2.0
    Compiling huesos-hal v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-hal)
@@ -158,96 +158,96 @@ info: downloading 3 components
    Compiling huesos-fat v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-fat)
    Compiling huesos-decoder-fuzz v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-decoder-fuzz)
    Compiling huesos-blobfs v0.1.0 (/home/runner/work/HuesOS/HuesOS/crates/huesos-blobfs)
-    Finished `test` profile [optimized + debuginfo] target(s) in 5m 05s
+    Finished `test` profile [optimized + debuginfo] target(s) in 6m 45s
      Running unittests src/lib.rs (target/x86_64-unknown-linux-gnu/debug/deps/hues_async-96396d8916362ef7)
 
 running 16 tests
 test backend::tests::backend_trait_is_object_safe_enough_for_generic_use ... ok
-test backend::tests::user_backend_delegates_to_hooks ... ok
-test tests::block_on_drives_a_yielding_future ... ok
 test backend::tests::kernel_backend_delegates_to_hooks ... ok
+test backend::tests::user_backend_delegates_to_hooks ... ok
 test tests::dropping_executor_drops_live_futures ... ok
+test tests::block_on_drives_a_yielding_future ... ok
 test tests::executor_with_backend_polls_tasks ... ok
 test tests::external_wake_repolls_a_pending_task ... ok
 test tests::run_with_drives_to_completion_with_park ... ok
-test tests::runs_multiple_tasks_to_completion ... ok
-test tests::scope_on_drives_a_future_with_backend ... ok
-test tests::spawn_too_large_returns_error ... ok
-test tests::spawn_full_returns_error ... ok
 test tests::scope_on_allows_borrowing_futures ... ok
+test tests::runs_multiple_tasks_to_completion ... ok
+test tests::spawn_full_returns_error ... ok
+test tests::scope_on_drives_a_future_with_backend ... ok
 test tests::spawns_and_completes_a_ready_future ... ok
+test tests::spawn_too_large_returns_error ... ok
 test tests::stale_task_id_wake_is_ignored ... ok
 test tests::yield_now_reschedules_via_waker ... ok
 
-test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
 
      Running unittests src/lib.rs (target/x86_64-unknown-linux-gnu/debug/deps/huesos_abi-eadc95bf8c2b89c0)
 
 running 125 tests
 test acpi_archive::tests::legacy_decode_builds_complete_small_index ... ok
-test acpi_archive::tests::legacy_virtual_tables_do_not_enter_index ... ok
-test acpi_archive::tests::streaming_read_failures_are_explicit ... ok
 test acpi_archive::tests::legacy_decode_rejects_mapping_truncation ... ok
 test acpi_archive::tests::legacy_rejects_bad_metadata_and_overlap ... ok
+test acpi_archive::tests::legacy_virtual_tables_do_not_enter_index ... ok
+test acpi_archive::tests::streaming_read_failures_are_explicit ... ok
 test acpi_archive::tests::version_two_rejects_bad_rsdp_and_table_checksums ... ok
-test acpi_archive::tests::version_two_rejects_missing_duplicate_and_widened_mappings ... ok
 test acpi_archive::tests::version_two_rejects_physical_overlap_and_unknown_version ... ok
 test acpi_archive::tests::version_two_round_trips_and_validates_bodies ... ok
 test acpi_broker::tests::accepts_exact_width_aligned_io ... ok
-test acpi_broker::tests::non_io_operations_forbid_width_and_value ... ok
-test acpi_broker::tests::rejects_unknown_unaligned_and_wide_requests ... ok
 test acpi_broker::tests::rejects_archive_metadata_overlap ... ok
+test acpi_broker::tests::non_io_operations_forbid_width_and_value ... ok
+test acpi_archive::tests::version_two_rejects_missing_duplicate_and_widened_mappings ... ok
+test acpi_broker::tests::rejects_unknown_unaligned_and_wide_requests ... ok
 test acpi_broker::tests::validates_sorted_non_overlapping_archive ... ok
-test acpi_manager::tests::lifecycle_messages_round_trip_and_reject_stale_shapes ... ok
 test acpi_manager::tests::failure_freezes_new_work_but_preserves_last_good_devices ... ok
+test acpi_manager::tests::lifecycle_messages_round_trip_and_reject_stale_shapes ... ok
 test acpi_manager::tests::restart_backoff_is_bounded_and_saturating ... ok
 test acpi_manager::tests::watchdog_deadline_arms_checks_generation_and_disarms ... ok
-test acpi_region_policy::tests::allowed_widths_and_directions_are_exact ... ok
-test acpi_region_policy::tests::sacred_deny_wins_over_whole_candidate ... ok
-test acpi_region_policy::tests::crossing_adjacent_grants_never_combines_authority ... ok
 test acpi_region_policy::tests::snapshot_mismatch_and_overflow_are_denied ... ok
+test acpi_region_policy::tests::allowed_widths_and_directions_are_exact ... ok
+test acpi_region_policy::tests::crossing_adjacent_grants_never_combines_authority ... ok
+test acpi_region_policy::tests::sacred_deny_wins_over_whole_candidate ... ok
 test block::tests::completion_payload_round_trips ... ok
 test block::tests::flush_has_no_lba_or_count ... ok
 test block::tests::info_response_round_trips ... ok
-test block::tests::rejects_malformed_requests ... ok
 test block::tests::rejects_unknown_completion_status_or_wide_nvme_status ... ok
 test block::tests::request_round_trips ... ok
+test block::tests::rejects_malformed_requests ... ok
 test broker_policy::tests::audit_log_records_in_chronological_order ... ok
 test broker_policy::tests::audit_log_sequence_is_monotonic ... ok
-test broker_policy::tests::rate_limiter_allows_up_to_max_then_denies ... ok
 test broker_policy::tests::rate_limiter_reset_clears_window ... ok
-test broker_policy::tests::rate_limiter_rolls_to_new_window ... ok
-test gas::tests::decodes_packed_gas_layout ... ok
 test gas::tests::decodes_system_memory_address_space ... ok
+test broker_policy::tests::rate_limiter_allows_up_to_max_then_denies ... ok
+test gas::tests::decodes_packed_gas_layout ... ok
 test gas::tests::maps_unknown_address_space ... ok
-test gas::tests::rejects_short_input ... ok
-test hmcf::tests::binding_check_rejects_stale_generation_and_snapshot ... ok
 test hmcf::tests::adjacent_windows_are_accepted ... ok
+test gas::tests::rejects_short_input ... ok
+test broker_policy::tests::rate_limiter_rolls_to_new_window ... ok
+test hmcf::tests::binding_check_rejects_stale_generation_and_snapshot ... ok
 test hmcf::tests::bus_range_alignment_and_span_are_checked ... ok
-test hmcf::tests::canonical_order_is_required_on_the_wire ... ok
 test hmcf::tests::checksum_is_enforced_across_the_whole_image ... ok
+test hmcf::tests::canonical_order_is_required_on_the_wire ... ok
 test hmcf::tests::count_must_match_declared_size ... ok
 test hmcf::tests::declared_size_is_checked_by_consumers ... ok
 test hmcf::tests::deterministic_canonical_encoding ... ok
 test hmcf::tests::duplicate_keys_are_rejected ... ok
-test hmcf::tests::multiple_segments_and_nonzero_start_bus_round_trip ... ok
-test hmcf::tests::physical_span_overflow_is_rejected ... ok
-test hmcf::tests::overlapping_windows_are_rejected_at_encode_time ... ok
-test hmcf::tests::rejects_bad_magic_version_and_header_shape ... ok
 test hmcf::tests::maximum_record_set_round_trips ... ok
+test hmcf::tests::multiple_segments_and_nonzero_start_bus_round_trip ... ok
+test hmcf::tests::overlapping_windows_are_rejected_at_encode_time ... ok
+test hmcf::tests::physical_span_overflow_is_rejected ... ok
 test hmcf::tests::rejects_reserved_fields_and_flags ... ok
+test hmcf::tests::rejects_bad_magic_version_and_header_shape ... ok
 test hmcf::tests::rejects_zero_snapshot_or_generation_identities ... ok
+test hmcf::tests::rejects_empty_and_oversized_record_sets ... ok
 test hxfs::tests::rejects_bad_version_and_reserved_fields ... ok
 test hxfs::tests::rejects_unknown_tags_and_wide_rights ... ok
 test hxfs::tests::request_round_trips ... ok
-test hxfs::tests::response_round_trips ... ok
-test key_broker::tests::malformed_records_are_rejected ... ok
 test key_broker::tests::granted_reply_round_trip_keeps_generation_and_key ... ok
-test key_broker::tests::non_granted_reply_must_not_carry_secret_bytes ... ok
-test key_broker::tests::tracker_rejects_zero_replay_and_backwards_generations ... ok
+test hxfs::tests::response_round_trips ... ok
 test key_broker::tests::request_round_trip_and_rejects_generation_zero ... ok
-test hmcf::tests::rejects_empty_and_oversized_record_sets ... ok
+test key_broker::tests::non_granted_reply_must_not_carry_secret_bytes ... ok
+test key_broker::tests::malformed_records_are_rejected ... ok
 test pci::tests::decode_rejects_header_size_count_and_reserved_errors ... ok
+test key_broker::tests::tracker_rejects_zero_replay_and_backwards_generations ... ok
 test pci::tests::decode_rejects_unknown_kinds_and_flags ... ok
 test pci::tests::encode_rejects_small_output ... ok
 test pci::tests::root_table_round_trips_translation_and_backend ... ok
@@ -255,24 +255,24 @@ test pci::tests::v1_backward_decode_and_v2_prt_osc_validation ... ok
 test pci::tests::validate_rejects_aperture_wrap_and_mmio32_above_four_gib ... ok
 test pci::tests::validate_rejects_invalid_root_backend_geometry ... ok
 test pci::tests::validate_rejects_noncanonical_aperture_ownership ... ok
-test pci_config::tests::adjacent_ram_is_not_an_alias ... ok
 test pci::tests::validate_roots_and_hmcf_checks_coverage_overlaps_and_ecam ... ok
+test pci_config::tests::adjacent_ram_is_not_an_alias ... ok
 test pci_config::tests::foreign_replayed_window_is_rejected ... ok
 test pci_config::tests::empty_usable_ram_map_accepts ... ok
+test pci_config::tests::identical_windows_pass ... ok
 test pci_config::tests::request_layout_is_locked ... ok
 test pci_config::tests::request_validation ... ok
-test pci_config::tests::identical_windows_pass ... ok
 test pci_config::tests::span_mismatch_is_rejected ... ok
 test pci_config::tests::usable_ram_alias_is_rejected ... ok
-test pci_config::tests::subset_of_bound_windows_passes ... ok
 test pci_lease::tests::lease_args_layouts_match_kernel_user_record_expectations ... ok
+test pci_config::tests::subset_of_bound_windows_passes ... ok
 test pci_config::tests::widened_record_is_rejected ... ok
-test pci_lease::tests::pci_address_pack_unpack_roundtrip ... ok
 test pci_lease::tests::lease_args_validation_rejects_zero_ids_and_non_device_kinds ... ok
-test pci_manager::tests::ap16_inventory_and_freeze_messages_round_trip ... ok
-test pci_manager::tests::hello_and_fail_closed_ready_round_trip ... ok
+test pci_lease::tests::pci_address_pack_unpack_roundtrip ... ok
 test pci_manager::tests::hello_rejects_unknown_flags ... ok
 test pci_manager::tests::rejects_small_output_without_partial_success ... ok
+test pci_manager::tests::ap16_inventory_and_freeze_messages_round_trip ... ok
+test pci_manager::tests::hello_and_fail_closed_ready_round_trip ... ok
 test pci_manager::tests::rejects_zero_generation_unknown_values_and_wrong_length ... ok
 test pci_manager::tests::restart_backoff_is_bounded_linear_and_resettable ... ok
 test pci_manager::tests::restart_backoff_saturates_and_can_fail_closed_permanently ... ok
@@ -280,50 +280,294 @@ test pci_mediation::tests::read_request_round_trips_and_validates ... ok
 test pci_mediation::tests::regions_exhaustion_is_total ... ok
 test pci_mediation::tests::regions_open_read_close_cycle ... ok
 test pci_mediation::tests::regions_reject_invalid_bindings ... ok
-test pci_mediation::tests::rejects_bad_device_function_generations_snapshot ... ok
 test pci_mediation::tests::regions_stale_handles_die_on_detach_and_reattach ... ok
+test pci_mediation::tests::rejects_bad_device_function_generations_snapshot ... ok
 test pci_mediation::tests::rejects_bad_version_reserved_width_alignment_bounds ... ok
 test pci_mediation::tests::response_round_trips_and_echoes ... ok
-test pci_mediation::tests::write_request_decodes_but_is_denied_marker_only ... ok
-test storage_boot::tests::rejects_nonzero_nvme_count ... ok
 test storage_boot::tests::rejects_bad_magic_and_truncated_entry ... ok
-test storage_boot::tests::round_trip_storage_boot_info ... ok
+test storage_boot::tests::rejects_nonzero_nvme_count ... ok
+test pci_mediation::tests::write_request_decodes_but_is_denied_marker_only ... ok
 test storage_boot::tests::storage_off_token_is_exact_and_delimited ... ok
+test storage_boot::tests::round_trip_storage_boot_info ... ok
 test tests::boot_driver_manifest_header_validates ... ok
 test tests::encode_syscall_result_err_sign_extends_correctly ... ok
-test tests::encode_syscall_result_ok_preserves_bit_pattern ... ok
 test tests::encode_syscall_result_specific_wire_values_are_locked ... ok
+test tests::encode_syscall_result_ok_preserves_bit_pattern ... ok
 test tests::framebuffer_blit_is_capability_gated ... ok
-test tests::knob_id_abi_round_trip ... ok
-test tests::interrupt_event_keys_preserve_namespace_and_full_u32_number ... ok
 test tests::mapping_rights_always_include_map_but_not_unrequested_permissions ... ok
+test tests::interrupt_event_keys_preserve_namespace_and_full_u32_number ... ok
+test tests::knob_id_abi_round_trip ... ok
 test tests::mapping_rights_include_each_requested_permission ... ok
 test tests::observation_limits_are_record_aligned ... ok
-test tests::resource_kind_abi_round_trip ... ok
 test tests::peer_closed_error_round_trips ... ok
 test tests::per_process_stack_profiles_are_bounded_and_aligned ... ok
+test tests::resource_kind_abi_round_trip ... ok
 test tests::resource_map_args_layout_smoke ... ok
 test tests::resource_unmap_args_layout_smoke ... ok
 test tests::waitset_signal_bits_are_stable_abi ... ok
-test volume::tests::volume_info_round_trips ... ok
+test tests::syscall_numbers_remain_append_only ... ok
 test volume::tests::rejects_bad_volume_requests ... ok
+test volume::tests::volume_info_round_trips ... ok
 test volume::tests::volume_request_round_trips ... ok
-test tests::syscall_numbers_remain_append_only ... FAILED
 
-failures:
+test result: ok. 125 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
 
----- tests::syscall_numbers_remain_append_only stdout ----
+     Running unittests src/lib.rs (target/x86_64-unknown-linux-gnu/debug/deps/huesos_alloc-90111d967d9089b1)
 
-thread 'tests::syscall_numbers_remain_append_only' (12782) panicked at crates/huesos-abi/src/lib.rs:1711:9:
-assertion `left == right` failed
-  left: Some(ProcessTerminate)
- right: None
-note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+running 5 tests
+test tests::buddy_rejects_double_free_and_invalid_pointer ... ok
+test tests::slab_rejects_double_free_and_returns_empty_page ... ok
+test tests::test_buddy_allocate_deallocate ... ok
+test tests::test_buddy_non_power_of_two_pages ... ok
+test tests::slab_handles_over_128_live_384_byte_allocations_and_reuses_slots ... ok
 
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
 
-failures:
-    tests::syscall_numbers_remain_append_only
+     Running unittests src/lib.rs (target/x86_64-unknown-linux-gnu/debug/deps/huesos_arch-24acdfc6d839d42b)
 
-test result: FAILED. 124 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+running 12 tests
+test sync::tests::rank_tracker_accepts_nested_non_decreasing_ranks ... ok
+test sync::tests::rank_tracker_rejects_inversion_and_recursion ... ok
+test sync::tests::rank_tracker_requires_lifo_release ... ok
+test sync::tests::ticket_lock_try_lock_is_non_blocking_under_contention ... ok
+test sync::tests::ticket_lock_try_lock_does_not_leak_tickets ... ok
+test x86_64::acpi::byte_tests::duplicate_apic_or_acpi_identity_is_rejected ... ok
+test x86_64::acpi::byte_tests::parses_enabled_x2apic_and_wide_acpi_uid ... ok
+test x86_64::acpi::byte_tests::local_apic_address_override_is_64_bit_and_authoritative ... ok
+test x86_64::acpi::byte_tests::parses_uacpi_madt_slice ... ok
+test x86_64::acpi::byte_tests::rejects_truncated_or_zero_length_entry ... ok
+test x86_64::idt::tests::nvme_msi_vectors_do_not_overlap_ipis ... ok
+test x86_64::idt::tests::reschedule_ipi_has_dedicated_non_timer_vector ... ok
 
-error: test failed, to rerun pass `-p huesos-abi --lib`
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/x86_64-unknown-linux-gnu/debug/deps/huesos_blobfs-86c5ab526b1e6370)
+
+running 10 tests
+test tests::accumulated_previous_end_rejects_overlap ... ok
+test tests::oversized_blob_length_is_inadmissible ... ok
+test tests::rejects_bad_magic_and_hash_mismatch ... ok
+test tests::parses_hash_hex ... ok
+test tests::mounts_and_opens_blob_by_hash ... ok
+test tests::rejects_overlapping_payloads ... ok
+test tests::repeated_zero_length_entries_are_rejected ... ok
+test tests::sha256_known_answer ... ok
+test tests::zero_length_blob_does_not_disable_overlap_checking ... ok
+test tests::zero_length_blob_still_advances_previous_end ... ok
+
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/x86_64-unknown-linux-gnu/debug/deps/huesos_decoder_fuzz-d8a15b614066a1df)
+
+running 6 tests
+test tests::fuzz_request_validate_never_panics ... ok
+test tests::fuzz_opcode_from_raw_never_panics ... ok
+test tests::fuzz_v2_mapping_decode_never_panics ... ok
+test tests::fuzz_v2_header_decode_never_panics ... ok
+test tests::fuzz_archive_decode_never_panics ... ok
+test tests::fuzz_archive_validate_never_panics ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running unittests src/lib.rs (target/x86_64-unknown-linux-gnu/debug/deps/huesos_elf-e74ef32d50559096)
+
+running 18 tests
+test dynamic::tests::dynamic_summary_parses_versym_verdef_verneed_and_dtpmod ... ok
+test dynamic::tests::dynamic_summary_parses_needed_flags_and_tables ... ok
+test dynamic::tests::soname_validator_is_fail_closed ... ok
+test dynamic::tests::gnu_hash_lookup_resolves_defined_symbol_and_skips_undef ... ok
+test dynamic::tests::symbol_versioning_verdef_verneed_and_matching ... ok
+test dynamic::tests::hashes_match_standard_vectors ... ok
+test tests::accepts_well_formed_minimal_elf ... ok
+test tests::align_helpers ... ok
+test tests::preserves_target_mapping_failure ... ok
+test tests::loads_program_header_table_at_unaligned_offset ... ok
+test tests::rejects_executable_without_pt_load ... ok
+test tests::rejects_filesz_greater_than_memsz ... ok
+test tests::rejects_fuzzed_elf32_shape_without_panicking ... ok
+test tests::rejects_fuzzed_unaligned_phoff_without_panicking ... ok
+test tests::rejects_garbage_input ... ok
+test tests::rejects_offset_overflow_without_panicking ... ok
+test tests::rejects_segment_extending_past_end_of_file ... ok
+test tests::loads_real_userspace_init_binary ... ok
+
+test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running unittests src/lib.rs (target/x86_64-unknown-linux-gnu/debug/deps/huesos_extable-002ed1855d42f269)
+
+running 19 tests
+test tests::is_recoverable_matches_find ... ok
+test tests::adjacent_non_overlapping_ranges_are_ok ... ok
+test tests::empty_table_is_allowed ... ok
+test tests::lookup_multiple_and_gaps ... ok
+test tests::lookup_point_entry ... ok
+test tests::point_covers_single_instruction ... ok
+test tests::range_contains_is_half_open ... ok
+test tests::point_at_u64_max_is_invalid ... ok
+test tests::rejects_duplicate_start ... ok
+test tests::lookup_range_boundaries ... ok
+test tests::rejects_overlapping_ranges ... ok
+test tests::rejects_inverted_range ... ok
+test tests::rejects_empty_range ... ok
+test tests::rejects_unsorted_entries ... ok
+test tests::resolve_is_fatal_when_uncovered ... ok
+test tests::resolve_recovers_when_covered ... ok
+test tests::sort_does_not_fix_overlaps ... ok
+test tests::sort_then_build_table ... ok
+test tests::resolve_on_empty_table_is_fatal ... ok
+
+test result: ok. 19 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running unittests src/lib.rs (target/x86_64-unknown-linux-gnu/debug/deps/huesos_fat-bcb88e57609a94a9)
+
+running 5 tests
+test tests::file_size_reports_on_disk_size_without_reading_data ... ok
+test tests::read_file_refuses_to_truncate_when_buffer_too_small ... ok
+test tests::read_file_succeeds_when_buffer_is_exactly_file_size ... ok
+test tests::test_read_file_multi_sector_cluster ... ok
+test tests::test_mount_invalid_sector_size ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/x86_64-unknown-linux-gnu/debug/deps/huesos_fb-c8f968868090d2d6)
+
+running 8 tests
+test tests::blit_copies_pixels_honoring_dst_pitch_not_src_pitch ... ok
+test tests::blit_with_undersized_src_buffer_stops_cleanly_without_oob_read ... ok
+test tests::fill_rect_clips_to_framebuffer_bounds ... ok
+test tests::glyph_lookup_covers_ascii_and_rejects_out_of_range ... ok
+test tests::set_pixel_out_of_bounds_is_a_silent_noop_not_a_panic ... ok
+test tests::set_pixel_writes_expected_color_and_position ... ok
+test tests::panic_renderer_uses_red_background_and_white_text ... ok
+test tests::shutdown_renderer_uses_dark_background_and_visible_text ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running unittests src/lib.rs (target/x86_64-unknown-linux-gnu/debug/deps/huesos_handlemove-e1e4cac663f2b713)
+
+running 13 tests
+test tests::duplicate_requires_duplicate_right ... ok
+test tests::destination_full_is_rejected_atomically ... ok
+test tests::duplicate_keeps_source ... ok
+test tests::missing_right_leaves_both_unchanged ... ok
+test tests::empty_dispositions_is_ok_zero ... ok
+test tests::move_transfers_and_removes_source ... ok
+test tests::no_such_handle_leaves_both_unchanged ... ok
+test tests::repeated_handle_is_rejected ... ok
+test tests::table_full_and_out_of_range ... ok
+test tests::table_insert_get_remove ... ok
+test tests::rights_ops ... ok
+test tests::transfer_rights_can_reduce ... ok
+test tests::transfer_rights_never_adds ... ok
+
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/x86_64-unknown-linux-gnu/debug/deps/huesos_hxfs-6ed748f1f6b7d211)
+
+running 205 tests
+test alloc_tree::tests::first_fit_splits_and_reuses_free_extents ... ok
+test alloc_tree::tests::rejects_overlaps_and_zero_ranges ... ok
+test a4_page_cache_lookup_and_insert_round_trip ... ok
+test allocator::tests::allocates_across_zones ... ok
+test allocator::tests::enospc_after_zone_is_exhausted ... ok
+test allocator::tests::free_outside_any_zone_is_invalid ... ok
+test allocator::tests::free_and_reallocate_round_trip ... ok
+test allocator::tests::multi_zone_free_is_kept_within_its_zone ... ok
+test allocator::tests::enospc_does_not_panic_on_extreme_request ... ok
+test allocator::tests::reuses_freed_extents_and_records_trim ... ok
+test allocator::tests::zero_block_allocate_is_invalid ... ok
+test allocator::tests::trim_table_overflow_surfaces_table_full ... ok
+test allocator::tests::zero_block_free_is_invalid ... ok
+test allocator::tests::trim_queue_drains_in_insertion_order ... ok
+test cache_policy::tests::cache_evicts_clean_lru_and_preserves_dirty ... ok
+test cache_policy::tests::direct_io_policy_flushes_dirty_overlap ... ok
+test cache_policy::tests::mmap_policy_denies_writable_and_transformed ... ok
+test cache_policy::tests::read_only_mmap_of_a_plain_file_is_allowed ... ok
+test cache_policy::tests::transformed_extents_cannot_be_mapped_at_all ... ok
+test cache_policy::tests::writable_mmap_is_refused_by_policy ... ok
+test cache_policy::tests::writeback_queue_pops_oldest_generation ... ok
+test compression::tests::compress_block_rejects_oversize_input ... ok
+test compression::tests::compress_block_rejects_undersize_scratch ... ok
+test compression::tests::compress_block_returns_plain_for_below_threshold ... ok
+test compression::tests::compress_block_returns_plain_for_empty_input ... ok
+test compression::tests::compress_block_returns_plain_for_none_policy ... ok
+test compression::tests::decoding_a_zstd_extent_is_refused ... ok
+test compression::tests::decompress_block_rejects_bad_crc_for_plain_payload ... ok
+test compression::tests::decompress_block_rejects_payload_length_mismatch ... ok
+test compression::tests::decompress_block_accepts_matching_crc_for_plain_payload ... ok
+test compression::tests::decompress_block_rejects_undersize_output ... ok
+test compression::tests::decompress_block_rejects_unavailable_engine ... ok
+test compression::tests::plans_lz4_and_zstd_by_policy_threshold ... ok
+test compression::tests::decompress_block_rejects_unknown_algorithm ... ok
+test compression::tests::resolve_compression_policy_finds_known_and_rejects_unknown ... ok
+test compression::tests::validates_compression_policies ... ok
+test compression::tests::validates_compressed_extent_shape ... ok
+test compression::tests::zstd_is_never_reported_as_an_available_engine ... ok
+test crc32c::tests::crc32c_known_answer ... ok
+test crypto::tests::crypto_key_handle_borrows_and_revokes ... ok
+test crypto::tests::crypto_key_handle_from_raw_rejects_bad_size ... ok
+test crypto::tests::plain_policy_is_canonical_zero_sentinel ... ok
+test crypto::tests::explicit_zeroize_and_drop_fallback_yield_all_zeros ... ok
+test crypto::tests::resolve_encryption_policy_zero_returns_plain ... ok
+test crypto::tests::resolve_encryption_policy_finds_known_and_rejects_unknown ... ok
+test crypto::tests::selects_hardware_then_software_fallback ... ok
+test crypto::tests::validate_for_mount_rejects_known_failure_modes ... ok
+test crypto::tests::wrapped_key_bounds_are_enforced ... ok
+test crypto::tests::validates_policy_and_requires_key_provider ... ok
+test crypto::tests::zeroize_clears_both_key_halves ... ok
+test extent_record_v2_tests::v2_multi_slot_record_rejects_compression_combination ... ok
+test extent_record_v2_tests::v2_multi_slot_record_rejects_wrong_block_count ... ok
+test extent_record_v2_tests::v2_plain_record_round_trip_without_descriptor ... ok
+test extent_record_v2_tests::v2_multi_slot_record_round_trip ... ok
+test extent_record_v2_tests::v2_record_rejects_descriptor_without_flag ... ok
+test extent_record_v2_tests::v2_record_rejects_flag_without_descriptor ... ok
+test extent_record_v2_tests::v2_record_rejects_hole_claiming_compression ... ok
+test extent_record_v2_tests::v2_record_rejects_oversized_compressed_bytes ... ok
+test extent_record_v2_tests::v2_record_rejects_truncated_record ... ok
+test extent_record_v2_tests::v2_record_rejects_unknown_algorithm ... ok
+test extent_record_v2_tests::v2_record_rejects_zero_block_count ... ok
+test extent_record_v2_tests::v2_record_round_trip_with_compression_descriptor ... ok
+AddressSanitizer:DEADLYSIGNAL
+=================================================================
+==13162==ERROR: AddressSanitizer: stack-overflow on address 0x7b16b49ca000 (pc 0x7f16b9b88f40 bp 0x7b16b49bda10 sp 0x7b16b49bd1c8 T65)
+    #0 0x7f16b9b88f40  (/lib/x86_64-linux-gnu/libc.so.6+0x188f40) (BuildId: a4a7992a8e66555c8141ab2a08a8465ff6e0ea65)
+    #1 0x558ebac1954b  (/home/runner/work/HuesOS/HuesOS/target/x86_64-unknown-linux-gnu/debug/deps/huesos_hxfs-6ed748f1f6b7d211+0x2dd54b) (BuildId: 9c73e59f8edfa26dbb8fcb8766d2e4c12238c214)
+    #2 0x558ebad22212  (/home/runner/work/HuesOS/HuesOS/target/x86_64-unknown-linux-gnu/debug/deps/huesos_hxfs-6ed748f1f6b7d211+0x3e6212) (BuildId: 9c73e59f8edfa26dbb8fcb8766d2e4c12238c214)
+    #3 0x558ebacd6653  (/home/runner/work/HuesOS/HuesOS/target/x86_64-unknown-linux-gnu/debug/deps/huesos_hxfs-6ed748f1f6b7d211+0x39a653) (BuildId: 9c73e59f8edfa26dbb8fcb8766d2e4c12238c214)
+    #4 0x558ebacaa828  (/home/runner/work/HuesOS/HuesOS/target/x86_64-unknown-linux-gnu/debug/deps/huesos_hxfs-6ed748f1f6b7d211+0x36e828) (BuildId: 9c73e59f8edfa26dbb8fcb8766d2e4c12238c214)
+    #5 0x558ebad92265  (/home/runner/work/HuesOS/HuesOS/target/x86_64-unknown-linux-gnu/debug/deps/huesos_hxfs-6ed748f1f6b7d211+0x456265) (BuildId: 9c73e59f8edfa26dbb8fcb8766d2e4c12238c214)
+    #6 0x558ebadd7292  (/home/runner/work/HuesOS/HuesOS/target/x86_64-unknown-linux-gnu/debug/deps/huesos_hxfs-6ed748f1f6b7d211+0x49b292) (BuildId: 9c73e59f8edfa26dbb8fcb8766d2e4c12238c214)
+    #7 0x558ebae3aacb  (/home/runner/work/HuesOS/HuesOS/target/x86_64-unknown-linux-gnu/debug/deps/huesos_hxfs-6ed748f1f6b7d211+0x4feacb) (BuildId: 9c73e59f8edfa26dbb8fcb8766d2e4c12238c214)
+    #8 0x558ebae47363  (/home/runner/work/HuesOS/HuesOS/target/x86_64-unknown-linux-gnu/debug/deps/huesos_hxfs-6ed748f1f6b7d211+0x50b363) (BuildId: 9c73e59f8edfa26dbb8fcb8766d2e4c12238c214)
+    #9 0x558ebae3854d  (/home/runner/work/HuesOS/HuesOS/target/x86_64-unknown-linux-gnu/debug/deps/huesos_hxfs-6ed748f1f6b7d211+0x4fc54d) (BuildId: 9c73e59f8edfa26dbb8fcb8766d2e4c12238c214)
+    #10 0x558ebad9ac66  (/home/runner/work/HuesOS/HuesOS/target/x86_64-unknown-linux-gnu/debug/deps/huesos_hxfs-6ed748f1f6b7d211+0x45ec66) (BuildId: 9c73e59f8edfa26dbb8fcb8766d2e4c12238c214)
+    #11 0x558ebae39e87  (/home/runner/work/HuesOS/HuesOS/target/x86_64-unknown-linux-gnu/debug/deps/huesos_hxfs-6ed748f1f6b7d211+0x4fde87) (BuildId: 9c73e59f8edfa26dbb8fcb8766d2e4c12238c214)
+    #12 0x558ebae3a8a0  (/home/runner/work/HuesOS/HuesOS/target/x86_64-unknown-linux-gnu/debug/deps/huesos_hxfs-6ed748f1f6b7d211+0x4fe8a0) (BuildId: 9c73e59f8edfa26dbb8fcb8766d2e4c12238c214)
+    #13 0x558ebae47363  (/home/runner/work/HuesOS/HuesOS/target/x86_64-unknown-linux-gnu/debug/deps/huesos_hxfs-6ed748f1f6b7d211+0x50b363) (BuildId: 9c73e59f8edfa26dbb8fcb8766d2e4c12238c214)
+    #14 0x558ebae38724  (/home/runner/work/HuesOS/HuesOS/target/x86_64-unknown-linux-gnu/debug/deps/huesos_hxfs-6ed748f1f6b7d211+0x4fc724) (BuildId: 9c73e59f8edfa26dbb8fcb8766d2e4c12238c214)
+    #15 0x558ebade0fd5  (/home/runner/work/HuesOS/HuesOS/target/x86_64-unknown-linux-gnu/debug/deps/huesos_hxfs-6ed748f1f6b7d211+0x4a4fd5) (BuildId: 9c73e59f8edfa26dbb8fcb8766d2e4c12238c214)
+    #16 0x558ebaf10451  (/home/runner/work/HuesOS/HuesOS/target/x86_64-unknown-linux-gnu/debug/deps/huesos_hxfs-6ed748f1f6b7d211+0x5d4451) (BuildId: 9c73e59f8edfa26dbb8fcb8766d2e4c12238c214)
+    #17 0x558ebaee56ba  (/home/runner/work/HuesOS/HuesOS/target/x86_64-unknown-linux-gnu/debug/deps/huesos_hxfs-6ed748f1f6b7d211+0x5a96ba) (BuildId: 9c73e59f8edfa26dbb8fcb8766d2e4c12238c214)
+    #18 0x558ebac19406  (/home/runner/work/HuesOS/HuesOS/target/x86_64-unknown-linux-gnu/debug/deps/huesos_hxfs-6ed748f1f6b7d211+0x2dd406) (BuildId: 9c73e59f8edfa26dbb8fcb8766d2e4c12238c214)
+    #19 0x7f16b9a9cb83  (/lib/x86_64-linux-gnu/libc.so.6+0x9cb83) (BuildId: a4a7992a8e66555c8141ab2a08a8465ff6e0ea65)
+    #20 0x7f16b9b29ecb  (/lib/x86_64-linux-gnu/libc.so.6+0x129ecb) (BuildId: a4a7992a8e66555c8141ab2a08a8465ff6e0ea65)
+
+SUMMARY: AddressSanitizer: stack-overflow (/lib/x86_64-linux-gnu/libc.so.6+0x188f40) (BuildId: a4a7992a8e66555c8141ab2a08a8465ff6e0ea65) 
+Thread T65 created by T0 here:
+    #0 0x558ebabff301  (/home/runner/work/HuesOS/HuesOS/target/x86_64-unknown-linux-gnu/debug/deps/huesos_hxfs-6ed748f1f6b7d211+0x2c3301) (BuildId: 9c73e59f8edfa26dbb8fcb8766d2e4c12238c214)
+    #1 0x558ebaeddc6c  (/home/runner/work/HuesOS/HuesOS/target/x86_64-unknown-linux-gnu/debug/deps/huesos_hxfs-6ed748f1f6b7d211+0x5a1c6c) (BuildId: 9c73e59f8edfa26dbb8fcb8766d2e4c12238c214)
+    #2 0x558ebade00f0  (/home/runner/work/HuesOS/HuesOS/target/x86_64-unknown-linux-gnu/debug/deps/huesos_hxfs-6ed748f1f6b7d211+0x4a40f0) (BuildId: 9c73e59f8edfa26dbb8fcb8766d2e4c12238c214)
+    #3 0x558ebae11522  (/home/runner/work/HuesOS/HuesOS/target/x86_64-unknown-linux-gnu/debug/deps/huesos_hxfs-6ed748f1f6b7d211+0x4d5522) (BuildId: 9c73e59f8edfa26dbb8fcb8766d2e4c12238c214)
+    #4 0x558ebad9cfa3  (/home/runner/work/HuesOS/HuesOS/target/x86_64-unknown-linux-gnu/debug/deps/huesos_hxfs-6ed748f1f6b7d211+0x460fa3) (BuildId: 9c73e59f8edfa26dbb8fcb8766d2e4c12238c214)
+    #5 0x558ebad94d74  (/home/runner/work/HuesOS/HuesOS/target/x86_64-unknown-linux-gnu/debug/deps/huesos_hxfs-6ed748f1f6b7d211+0x458d74) (BuildId: 9c73e59f8edfa26dbb8fcb8766d2e4c12238c214)
+    #6 0x558ebade6bd7  (/home/runner/work/HuesOS/HuesOS/target/x86_64-unknown-linux-gnu/debug/deps/huesos_hxfs-6ed748f1f6b7d211+0x4aabd7) (BuildId: 9c73e59f8edfa26dbb8fcb8766d2e4c12238c214)
+    #7 0x558ebad9272f  (/home/runner/work/HuesOS/HuesOS/target/x86_64-unknown-linux-gnu/debug/deps/huesos_hxfs-6ed748f1f6b7d211+0x45672f) (BuildId: 9c73e59f8edfa26dbb8fcb8766d2e4c12238c214)
+    #8 0x558ebad9a727  (/home/runner/work/HuesOS/HuesOS/target/x86_64-unknown-linux-gnu/debug/deps/huesos_hxfs-6ed748f1f6b7d211+0x45e727) (BuildId: 9c73e59f8edfa26dbb8fcb8766d2e4c12238c214)
+    #9 0x558ebad90c72  (/home/runner/work/HuesOS/HuesOS/target/x86_64-unknown-linux-gnu/debug/deps/huesos_hxfs-6ed748f1f6b7d211+0x454c72) (BuildId: 9c73e59f8edfa26dbb8fcb8766d2e4c12238c214)
+
+==13162==ABORTING
+error: test failed, to rerun pass `-p huesos-hxfs --lib`
+
+Caused by:
+  process didn't exit successfully: `/home/runner/work/HuesOS/HuesOS/target/x86_64-unknown-linux-gnu/debug/deps/huesos_hxfs-6ed748f1f6b7d211` (exit status: 1)
+note: test exited abnormally; to see the full output pass --no-capture to the harness.
