@@ -6,7 +6,7 @@
     "panic_macros": 15,
     "static_mut": 1,
     "todo_markers": 1,
-    "unsafe_blocks": 383,
+    "unsafe_blocks": 384,
     "unsafe_functions": 76,
     "unsafe_impls": 33,
     "unwrap_calls": 22
@@ -18,7 +18,7 @@
     "crates/huesos-arch/src/lib.rs": 3,
     "crates/huesos-arch/src/sync.rs": 17,
     "crates/huesos-arch/src/x86_64/ap_boot.rs": 3,
-    "crates/huesos-arch/src/x86_64/context_switch.rs": 6,
+    "crates/huesos-arch/src/x86_64/context_switch.rs": 7,
     "crates/huesos-arch/src/x86_64/cpu.rs": 6,
     "crates/huesos-arch/src/x86_64/cpu_local.rs": 19,
     "crates/huesos-arch/src/x86_64/fault.rs": 3,

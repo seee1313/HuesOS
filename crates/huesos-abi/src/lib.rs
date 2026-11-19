@@ -15,6 +15,8 @@
 #![no_std]
 #![warn(missing_docs)]
 
+/// SysV AMD64 auxiliary vector (`auxv`) ABI for dynamic ELF loading.
+pub mod auxv;
 /// Versioned userspace KeyBroker grant protocol.
 pub mod key_broker;
 
@@ -510,6 +512,9 @@ pub enum Syscall {
     /// (AP-20). `a1` is the `DeviceLease` handle (`READ`), `a2` is
     /// `*mut pci_lease::DeviceLeaseInfo`.
     DeviceLeaseQuery = 77,
+    /// Set the calling thread's x86-64 `MSR_FS_BASE` for userspace TLS.
+    /// `a1` must be a canonical userspace virtual address (`< USER_ASPACE_END`).
+    ThreadSetFsBase = 78,
 }
 
 /// Maximum number of bytes one [`Syscall::SystemGetEntropy`] call
@@ -672,6 +677,7 @@ impl Syscall {
             75 => Self::DeviceLeaseRevoke,
             76 => Self::DeviceLeaseBindGonePort,
             77 => Self::DeviceLeaseQuery,
+            78 => Self::ThreadSetFsBase,
             _ => return None,
         })
     }
@@ -1634,7 +1640,8 @@ mod tests {
             Some(Syscall::DeviceLeaseBindGonePort)
         );
         assert_eq!(Syscall::from_raw(77), Some(Syscall::DeviceLeaseQuery));
-        assert_eq!(Syscall::from_raw(78), None);
+        assert_eq!(Syscall::from_raw(78), Some(Syscall::ThreadSetFsBase));
+        assert_eq!(Syscall::from_raw(79), None);
     }
 
     #[test]

@@ -52,6 +52,9 @@ pub type ResourceUnmapFn =
 pub type HeapExtendFn = fn(HeapExtendArgs) -> Result<u64, ErrorCode>;
 /// Kernel callback type used by the syscall layer to start a suspended thread.
 pub type ThreadStartFn = fn(&huesos_object::Thread, u64, u64) -> Result<u64, ErrorCode>;
+/// Kernel callback type used by `ThreadSetFsBase` to update the calling
+/// thread's `MSR_FS_BASE`.
+pub type ThreadSetFsBaseFn = fn(u64) -> Result<(), ErrorCode>;
 
 /// Global process-create callback (set by the kernel process layer).
 pub(crate) static PROCESS_CREATE_FN: Mutex<Option<ProcessCreateFn>> = Mutex::new(None);
@@ -71,6 +74,8 @@ pub(crate) static RESOURCE_UNMAP_FN: Mutex<Option<ResourceUnmapFn>> = Mutex::new
 pub(crate) static HEAP_EXTEND_FN: Mutex<Option<HeapExtendFn>> = Mutex::new(None);
 /// Global thread-start callback (set by the kernel scheduler/process layer).
 pub(crate) static THREAD_START_FN: Mutex<Option<ThreadStartFn>> = Mutex::new(None);
+/// Global thread `FS_BASE` callback (set by the kernel scheduler).
+pub(crate) static THREAD_SET_FS_BASE_FN: Mutex<Option<ThreadSetFsBaseFn>> = Mutex::new(None);
 
 /// Set the yield function. Called once by kernel init.
 pub fn set_yield_fn(f: fn()) {
@@ -150,4 +155,9 @@ pub fn set_heap_extend_fn(f: HeapExtendFn) {
 /// Set the thread-start function. Called once by kernel init.
 pub fn set_thread_start_fn(f: ThreadStartFn) {
     *THREAD_START_FN.lock() = Some(f);
+}
+
+/// Set the thread `FS_BASE` update function. Called once by kernel init.
+pub fn set_thread_set_fs_base_fn(f: ThreadSetFsBaseFn) {
+    *THREAD_SET_FS_BASE_FN.lock() = Some(f);
 }

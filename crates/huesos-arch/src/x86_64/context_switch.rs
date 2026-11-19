@@ -41,6 +41,8 @@ pub struct Context {
     pub rsp: u64,
     /// CR3 (page table root) for this task's address space.
     pub cr3: u64,
+    /// Per-thread x86-64 `MSR_FS_BASE` (userspace TLS base).
+    pub fs_base: u64,
 }
 
 impl Context {
@@ -48,13 +50,21 @@ impl Context {
     /// only useful as a placeholder `old` destination when you don't care
     /// about the previously-running context (there isn't one).
     pub const fn zero() -> Self {
-        Self { rsp: 0, cr3: 0 }
+        Self {
+            rsp: 0,
+            cr3: 0,
+            fs_base: 0,
+        }
     }
 
     /// Create a zeroed context with a specific `cr3`. Still not safe to
     /// switch into as `new` (rsp is 0) — see [`Context::zero`].
     pub const fn zero_with_cr3(cr3: u64) -> Self {
-        Self { rsp: 0, cr3 }
+        Self {
+            rsp: 0,
+            cr3,
+            fs_base: 0,
+        }
     }
 
     /// Create a new context that will start executing `entry` with
@@ -96,6 +106,7 @@ impl Context {
         Self {
             rsp: stack_top as u64 - FRAME_SIZE as u64,
             cr3,
+            fs_base: 0,
         }
     }
 }
@@ -146,6 +157,20 @@ unsafe extern "C" {
     fn context_switch_asm(old: *mut Context, new: *const Context);
 }
 
+/// Write `MSR_FS_BASE` on the current CPU after verifying that `fs_base` is a
+/// canonical userspace virtual address (`< 0x0000_8000_0000_0000`).
+pub fn write_fs_base(fs_base: u64) {
+    if fs_base >= 0x0000_8000_0000_0000 {
+        return;
+    }
+    // SAFETY: `fs_base` was just checked to be a canonical lower-half virtual
+    // address, so `wrmsr(IA32_FS_BASE)` cannot raise `#GP(0)` and only affects
+    // ring3 `%fs` base addressing.
+    unsafe {
+        x86_64::registers::model_specific::FsBase::write(x86_64::VirtAddr::new_unsafe(fs_base));
+    }
+}
+
 /// Switch CPU context from `old` to `new` after enforcing that no ranked lock
 /// guard can leak across the switch.
 ///
@@ -156,7 +181,14 @@ pub unsafe fn context_switch(old: *mut Context, new: *const Context) {
     crate::assert_no_ranked_locks_held();
     // SAFETY: the caller provides the context pointer and interrupt contracts;
     // the wrapper has additionally verified the lock-rank invariant.
-    unsafe { context_switch_asm(old, new) };
+    unsafe {
+        let old_fs = (*old).fs_base;
+        let new_fs = (*new).fs_base;
+        if new_fs != old_fs {
+            write_fs_base(new_fs);
+        }
+        context_switch_asm(old, new);
+    }
 }
 
 global_asm!(

@@ -18,3 +18,11 @@ pub fn exit(code: i64) -> ! {
 pub fn yield_now() {
     let _ = raw::syscall0(Syscall::Yield);
 }
+
+/// Set the calling thread's x86-64 `MSR_FS_BASE` (userspace TLS base).
+///
+/// The kernel rejects non-canonical or kernel-half addresses (`>= USER_ASPACE_END`)
+/// with `ErrorCode::InvalidArgs`.
+pub fn set_fs_base(fs_base: u64) -> crate::Result<()> {
+    raw::decode(raw::syscall1(Syscall::ThreadSetFsBase, fs_base)).map(|_| ())
+}
