@@ -127,6 +127,10 @@ jobs:
         id: asan
         env:
           CARGO_BUILD_JOBS: "2"
+          # Same 16 MiB test thread stack `make test` uses: the HxFS writer
+          # mounts an 8192-extent fixed array on the stack and overflows the
+          # default under ASan.
+          RUST_MIN_STACK: "16777216"
           RUSTFLAGS: "-Zsanitizer=address"
         run: |
           set +e
