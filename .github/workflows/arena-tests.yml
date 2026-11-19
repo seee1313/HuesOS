@@ -77,6 +77,7 @@ jobs:
             echo "nothing to publish"
             exit 0
           fi
+          git pull --rebase --autostash -q origin "${GITHUB_REF_NAME}" || true
           git commit -m "chore(arena): publish host-test log [skip ci]"
           git push origin "HEAD:${GITHUB_REF_NAME}"
       - name: Fail when tests failed

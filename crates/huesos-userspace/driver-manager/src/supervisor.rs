@@ -2259,7 +2259,6 @@ impl DriverManager {
                     }
                 }
             }
-            if close {}
             if close || self.query_channels[idx].is_none() {
                 self.query_channels[idx] = None;
                 self.query_idle[idx] = 0;
