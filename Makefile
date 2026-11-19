@@ -61,6 +61,8 @@ test:
 		-p huesos-pci \
 		-p huesos-quota \
 		-p huesos-tpm \
+		-p huesos-hsh \
+		-p huesos-gpt \
 		--target x86_64-unknown-linux-gnu -Z build-std=
 
 # The ordinary host suite builds huesos-hxfs without optional engines. This

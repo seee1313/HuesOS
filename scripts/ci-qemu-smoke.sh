@@ -155,6 +155,10 @@ esac
 required+=(
     '[pci-manager] ready without root descriptors; fail-closed'
     '[driver-manager] PCI manager ready (no roots; fail-closed)'
+    '[terminal] hsh core language/cls/fn smoke OK'
+    '[terminal] hsh fdisk pipe OK'
+    '[terminal] hsh @caps(hxfs=ro) enforcement OK'
+    '[terminal] hsh @caps(hxfs=none,bootfs=none) enforcement OK'
     '[terminal] keyboard service online, starting shell'
     '[init] stage selftest ok'
     '[init] stage summary ok selftest'

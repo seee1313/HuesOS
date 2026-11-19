@@ -173,6 +173,14 @@ fn main() {
     let libcanvas_so = build_libcanvas_so(&userspace_root, profile);
     let doom =
         build_userspace_dynamic_program(&userspace_root, "doom", "huesos-doom", profile, &[], &[]);
+    let fdisk = build_userspace_dynamic_program(
+        &userspace_root,
+        "fdisk",
+        "huesos-fdisk",
+        profile,
+        &[],
+        &[],
+    );
     // Soak shutdown-cycle wiring (qemu-nvme-soak inject=3): the
     // harness exports HUESOS_TERMINAL_FEATURES=soak-shutdown so the
     // terminal auto-triggers an orderly userspace shutdown after a
@@ -234,6 +242,7 @@ fn main() {
             shutdown_broker: &shutdown_broker,
             terminal: &terminal,
             doom: &doom,
+            fdisk: &fdisk,
             ld_huesos: &ld_huesos,
             libcanvas_so: &libcanvas_so,
             smoke_plugin_so: &smoke_plugin_so,
@@ -880,6 +889,7 @@ struct BootfsInputs<'a> {
     shutdown_broker: &'a Path,
     terminal: &'a Path,
     doom: &'a Path,
+    fdisk: &'a Path,
     ld_huesos: &'a Path,
     libcanvas_so: &'a Path,
     smoke_plugin_so: &'a Path,
@@ -1023,6 +1033,10 @@ fn build_bootfs_image(manifest_dir: &Path, inputs: BootfsInputs<'_>) -> PathBuf 
         BootFsFile {
             path: "/bin/doom.elf",
             data: read_build_input(inputs.doom, "Doom ELF"),
+        },
+        BootFsFile {
+            path: "/bin/fdisk.elf",
+            data: read_build_input(inputs.fdisk, "fdisk ELF"),
         },
         BootFsFile {
             path: "/lib/ld-huesos.so",

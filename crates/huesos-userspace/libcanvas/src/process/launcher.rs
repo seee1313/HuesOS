@@ -1,12 +1,17 @@
 //! Static and dynamically-linked (`PT_INTERP`) ELF64 process launcher.
 
 use crate::channel::Channel;
+use crate::handle::Handle;
 use crate::memory;
 use crate::vmo::Vmo;
 use huesos_abi::auxv::{
-    AT_BASE, AT_ENTRY, AT_FLAGS, AT_HUESOS_HXFS_DIR, AT_HUESOS_LD_BOOTSTRAP, AT_HUESOS_LIB_VMO,
-    AT_NULL, AT_PAGESZ, AT_PHDR, AT_PHENT, AT_PHNUM, AT_RANDOM, LD_BOOTSTRAP_HXFS_DIR_LABEL,
-    LD_BOOTSTRAP_LIB_VMO_LABEL, LD_BOOTSTRAP_SELF_VMAR_LABEL,
+    caps_mask, AT_BASE, AT_ENTRY, AT_FLAGS, AT_HUESOS_BLOCK_DEV, AT_HUESOS_CAPS_MASK,
+    AT_HUESOS_FRAME_DRAW, AT_HUESOS_HXFS_DIR, AT_HUESOS_HXFS_SERVICE, AT_HUESOS_LD_BOOTSTRAP,
+    AT_HUESOS_LIB_VMO, AT_HUESOS_STDERR, AT_HUESOS_STDIN, AT_HUESOS_STDOUT, AT_NULL, AT_PAGESZ,
+    AT_PHDR, AT_PHENT, AT_PHNUM, AT_RANDOM, LD_BOOTSTRAP_BLOCK_DEV_LABEL,
+    LD_BOOTSTRAP_FRAME_DRAW_LABEL, LD_BOOTSTRAP_HXFS_DIR_LABEL, LD_BOOTSTRAP_HXFS_SERVICE_LABEL,
+    LD_BOOTSTRAP_LIB_VMO_LABEL, LD_BOOTSTRAP_SELF_VMAR_LABEL, LD_BOOTSTRAP_STDERR_LABEL,
+    LD_BOOTSTRAP_STDIN_LABEL, LD_BOOTSTRAP_STDOUT_LABEL,
 };
 use huesos_abi::{rights, vmar_flags, vmo_create_flags, USER_STACK_TOP};
 use huesos_elf::dynamic::{
@@ -26,6 +31,84 @@ const BOOTFS_ENTRY_SIZE: u64 = 216;
 const BOOTFS_PATH_SIZE: usize = 192;
 const BOOTFS_MAGIC: &[u8; 8] = b"HBOOTFS1";
 
+/// Capability and stdio descriptor passed when spawning a dynamic ELF via
+/// [`spawn_elf_with_caps`] or [`spawn_elf_from_vmo_with_caps`].
+pub struct SpawnCaps<'a> {
+    /// Argument vector (`argv[0..]`); defaults to `[name]` if empty.
+    pub args: &'a [&'a str],
+    /// Capability bitmask (`huesos_abi::auxv::caps_mask`).
+    pub caps_mask: u64,
+    /// Optional `stdin` channel endpoint (child reads).
+    pub stdin: Option<&'a Channel>,
+    /// Optional `stdout` channel endpoint (child writes).
+    pub stdout: Option<&'a Channel>,
+    /// Optional `stderr` channel endpoint (child writes).
+    pub stderr: Option<&'a Channel>,
+    /// Optional attenuated HxFS directory channel (`AT_HUESOS_HXFS_DIR`).
+    pub hxfs_dir: Option<&'a Channel>,
+    /// Optional HxFS service channel (`AT_HUESOS_HXFS_SERVICE`).
+    pub hxfs_service: Option<&'a Channel>,
+    /// Optional block-device service channel (`AT_HUESOS_BLOCK_DEV`).
+    pub block_dev: Option<&'a Channel>,
+    /// Optional framebuffer draw resource handle (`AT_HUESOS_FRAME_DRAW`).
+    pub frame_draw: Option<&'a Handle>,
+    /// Optional CPU pinning affinity.
+    pub home_cpu: Option<usize>,
+    /// Initial user stack size in bytes.
+    pub stack_size: u64,
+}
+
+impl<'a> SpawnCaps<'a> {
+    /// Construct a default full-capability descriptor with no attached stdio.
+    pub const fn new() -> Self {
+        Self {
+            args: &[],
+            caps_mask: caps_mask::ALL_DEFAULT,
+            stdin: None,
+            stdout: None,
+            stderr: None,
+            hxfs_dir: None,
+            hxfs_service: None,
+            block_dev: None,
+            frame_draw: None,
+            home_cpu: None,
+            stack_size: huesos_abi::USER_STACK_DEFAULT_SIZE,
+        }
+    }
+}
+
+impl<'a> Default for SpawnCaps<'a> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Load a `PT_INTERP` ELF image from a slice with explicit `argv`, `@caps(...)`,
+/// and standard-stream channels.
+pub fn spawn_elf_with_caps(
+    name: &str,
+    elf: &[u8],
+    lib_vmo: &Vmo,
+    caps: &SpawnCaps<'_>,
+) -> crate::Result<(Process, Channel)> {
+    spawn_elf_with_affinity(name, elf, Some(lib_vmo), caps)
+}
+
+/// Load a VMO-backed ELF image with explicit `argv`, `@caps(...)`, and
+/// standard-stream channels.
+pub fn spawn_elf_from_vmo_with_caps(
+    name: &str,
+    vmo: &Vmo,
+    offset: u64,
+    len: u64,
+    lib_vmo: &Vmo,
+    caps: &SpawnCaps<'_>,
+) -> crate::Result<(Process, Channel)> {
+    let (process, _root_vmar, bootstrap) =
+        spawn_elf_from_vmo_inner(name, vmo, offset, len, Some(lib_vmo), caps)?;
+    Ok((process, bootstrap))
+}
+
 /// Load an ELF image into a new process and start its initial thread.
 ///
 /// Static `ET_EXEC` binaries run directly; `PT_INTERP` binaries require a
@@ -40,14 +123,8 @@ pub fn spawn_elf_with_lib(
     elf: &[u8],
     lib_vmo: &Vmo,
 ) -> crate::Result<(Process, Channel)> {
-    spawn_elf_with_affinity(
-        name,
-        elf,
-        Some(lib_vmo),
-        None,
-        None,
-        huesos_abi::USER_STACK_DEFAULT_SIZE,
-    )
+    let caps = SpawnCaps::new();
+    spawn_elf_with_affinity(name, elf, Some(lib_vmo), &caps)
 }
 
 /// Load a `PT_INTERP` ELF image with an optional capability `HxFS` library
@@ -58,14 +135,9 @@ pub fn spawn_elf_with_lib_and_hxfs(
     lib_vmo: &Vmo,
     hxfs_dir: Option<&Channel>,
 ) -> crate::Result<(Process, Channel)> {
-    spawn_elf_with_affinity(
-        name,
-        elf,
-        Some(lib_vmo),
-        hxfs_dir,
-        None,
-        huesos_abi::USER_STACK_DEFAULT_SIZE,
-    )
+    let mut caps = SpawnCaps::new();
+    caps.hxfs_dir = hxfs_dir;
+    spawn_elf_with_affinity(name, elf, Some(lib_vmo), &caps)
 }
 
 /// Load a static ELF with an explicit per-process stack profile.
@@ -74,19 +146,16 @@ pub fn spawn_elf_with_stack(
     elf: &[u8],
     stack_size: u64,
 ) -> crate::Result<(Process, Channel)> {
-    spawn_elf_with_affinity(name, elf, None, None, None, stack_size)
+    let mut caps = SpawnCaps::new();
+    caps.stack_size = stack_size;
+    spawn_elf_with_affinity(name, elf, None, &caps)
 }
 
 /// Load a static ELF image into a new process with an explicit home CPU.
 pub fn spawn_elf_on_cpu(name: &str, elf: &[u8], cpu: usize) -> crate::Result<(Process, Channel)> {
-    spawn_elf_with_affinity(
-        name,
-        elf,
-        None,
-        None,
-        Some(cpu),
-        huesos_abi::USER_STACK_DEFAULT_SIZE,
-    )
+    let mut caps = SpawnCaps::new();
+    caps.home_cpu = Some(cpu);
+    spawn_elf_with_affinity(name, elf, None, &caps)
 }
 
 /// Load an ELF image with an explicit home CPU and library `BOOTFS` VMO.
@@ -96,14 +165,9 @@ pub fn spawn_elf_on_cpu_with_lib(
     cpu: usize,
     lib_vmo: &Vmo,
 ) -> crate::Result<(Process, Channel)> {
-    spawn_elf_with_affinity(
-        name,
-        elf,
-        Some(lib_vmo),
-        None,
-        Some(cpu),
-        huesos_abi::USER_STACK_DEFAULT_SIZE,
-    )
+    let mut caps = SpawnCaps::new();
+    caps.home_cpu = Some(cpu);
+    spawn_elf_with_affinity(name, elf, Some(lib_vmo), &caps)
 }
 
 #[derive(Clone, Copy)]
@@ -210,11 +274,9 @@ fn spawn_elf_with_affinity(
     name: &str,
     elf: &[u8],
     lib_vmo: Option<&Vmo>,
-    hxfs_dir: Option<&Channel>,
-    home_cpu: Option<usize>,
-    stack_size: u64,
+    caps: &SpawnCaps<'_>,
 ) -> crate::Result<(Process, Channel)> {
-    if !huesos_abi::valid_user_stack_size(stack_size) {
+    if !huesos_abi::valid_user_stack_size(caps.stack_size) {
         return Err(crate::ErrorCode::InvalidArgs);
     }
     let image = parse_elf_headers(elf, elf.len() as u64)?;
@@ -232,7 +294,7 @@ fn spawn_elf_with_affinity(
         crate::println!("[doom-launch] ELF parsed, creating process");
     }
     let (process, root_vmar) = Process::create(name)?;
-    if let Some(cpu) = home_cpu {
+    if let Some(cpu) = caps.home_cpu {
         process.set_affinity(cpu)?;
     }
 
@@ -272,12 +334,11 @@ fn spawn_elf_with_affinity(
             &process,
             &root_vmar,
             lib_vmo,
-            hxfs_dir,
+            caps,
             interp_bytes,
             &image,
             main_bias,
             at_phdr,
-            stack_size,
         )?;
         return Ok((process, bootstrap));
     }
@@ -285,7 +346,7 @@ fn spawn_elf_with_affinity(
     if name == "doom" {
         crate::println!("[doom-launch] mapping stack and starting thread");
     }
-    map_initial_stack(&root_vmar, stack_size)?;
+    map_initial_stack(&root_vmar, caps.stack_size)?;
     let thread = Thread::create(&process, "main")?;
     // iretq enters directly, so synthesize SysV's post-call alignment.
     let bootstrap = thread.start(image.e_entry, initial_user_rsp(USER_STACK_TOP))?;
@@ -313,15 +374,9 @@ pub fn spawn_elf_from_vmo_with_lib(
     len: u64,
     lib_vmo: &Vmo,
 ) -> crate::Result<(Process, Channel)> {
-    let (process, _root_vmar, bootstrap) = spawn_elf_from_vmo_inner(
-        name,
-        vmo,
-        offset,
-        len,
-        Some(lib_vmo),
-        None,
-        huesos_abi::USER_STACK_DEFAULT_SIZE,
-    )?;
+    let caps = SpawnCaps::new();
+    let (process, _root_vmar, bootstrap) =
+        spawn_elf_from_vmo_inner(name, vmo, offset, len, Some(lib_vmo), &caps)?;
     Ok((process, bootstrap))
 }
 
@@ -335,15 +390,10 @@ pub fn spawn_elf_from_vmo_with_lib_and_hxfs(
     lib_vmo: &Vmo,
     hxfs_dir: Option<&Channel>,
 ) -> crate::Result<(Process, Channel)> {
-    let (process, _root_vmar, bootstrap) = spawn_elf_from_vmo_inner(
-        name,
-        vmo,
-        offset,
-        len,
-        Some(lib_vmo),
-        hxfs_dir,
-        huesos_abi::USER_STACK_DEFAULT_SIZE,
-    )?;
+    let mut caps = SpawnCaps::new();
+    caps.hxfs_dir = hxfs_dir;
+    let (process, _root_vmar, bootstrap) =
+        spawn_elf_from_vmo_inner(name, vmo, offset, len, Some(lib_vmo), &caps)?;
     Ok((process, bootstrap))
 }
 
@@ -385,9 +435,11 @@ pub fn spawn_elf_from_vmo_with_vmar_and_stack(
     len: u64,
     stack_size: u64,
 ) -> crate::Result<(Process, Vmar, Channel)> {
+    let mut caps = SpawnCaps::new();
+    caps.stack_size = stack_size;
     // When `vmo` is BOOTFS itself (as in `init` launching `doom`), passing `Some(vmo)`
     // allows `PT_INTERP` images stored inside BOOTFS to resolve `/lib/*.so` seamlessly.
-    spawn_elf_from_vmo_inner(name, vmo, offset, len, Some(vmo), None, stack_size)
+    spawn_elf_from_vmo_inner(name, vmo, offset, len, Some(vmo), &caps)
 }
 
 fn spawn_elf_from_vmo_inner(
@@ -396,12 +448,11 @@ fn spawn_elf_from_vmo_inner(
     offset: u64,
     len: u64,
     lib_vmo: Option<&Vmo>,
-    hxfs_dir: Option<&Channel>,
-    stack_size: u64,
+    caps: &SpawnCaps<'_>,
 ) -> crate::Result<(Process, Vmar, Channel)> {
     if len == 0
         || offset.checked_add(len).is_none()
-        || !huesos_abi::valid_user_stack_size(stack_size)
+        || !huesos_abi::valid_user_stack_size(caps.stack_size)
     {
         return Err(crate::ErrorCode::InvalidArgs);
     }
@@ -419,6 +470,9 @@ fn spawn_elf_from_vmo_inner(
     };
 
     let (process, root_vmar) = Process::create(name)?;
+    if let Some(cpu) = caps.home_cpu {
+        process.set_affinity(cpu)?;
+    }
     let mut at_phdr = main_bias.wrapping_add(image.pt_phdr_vaddr.unwrap_or(0));
 
     for idx in 0..usize::from(image.e_phnum) {
@@ -456,17 +510,16 @@ fn spawn_elf_from_vmo_inner(
             &process,
             &root_vmar,
             lib_vmo,
-            hxfs_dir,
+            caps,
             &interp_buf[..path_len],
             &image,
             main_bias,
             at_phdr,
-            stack_size,
         )?;
         return Ok((process, root_vmar, bootstrap));
     }
 
-    map_initial_stack(&root_vmar, stack_size)?;
+    map_initial_stack(&root_vmar, caps.stack_size)?;
     let thread = Thread::create(&process, "main")?;
     let bootstrap = thread.start(image.e_entry, initial_user_rsp(USER_STACK_TOP))?;
     Ok((process, root_vmar, bootstrap))
@@ -478,12 +531,11 @@ fn finish_dynamic_launch(
     process: &Process,
     root_vmar: &Vmar,
     lib_vmo: &Vmo,
-    hxfs_dir: Option<&Channel>,
+    caps: &SpawnCaps<'_>,
     raw_interp_bytes: &[u8],
     main_image: &ParsedElfHeader,
     main_bias: u64,
     at_phdr: u64,
-    stack_size: u64,
 ) -> crate::Result<Channel> {
     let interp_trimmed = match raw_interp_bytes.iter().position(|&b| b == 0) {
         Some(nul) => &raw_interp_bytes[..nul],
@@ -511,15 +563,16 @@ fn finish_dynamic_launch(
 
     let initial_rsp = map_dynamic_initial_stack(
         root_vmar,
-        stack_size,
+        caps.stack_size,
         name,
+        caps.args,
         at_phdr,
         main_image.e_phentsize,
         main_image.e_phnum,
         interp_load_base,
         main_bias.wrapping_add(main_image.e_entry),
         true,
-        hxfs_dir.is_some(),
+        caps,
     )?;
 
     // Duplicate bootstrap capabilities before Thread::start so all handles are
@@ -528,11 +581,44 @@ fn finish_dynamic_launch(
     let lib_vmo_dup = lib_vmo
         .duplicate(rights::READ | rights::TRANSFER)?
         .into_handle();
-    let hxfs_dir_dup = match hxfs_dir {
+    let hxfs_dir_dup = match caps.hxfs_dir {
+        Some(ch) => Some(ch.handle().duplicate(rights::SAME_RIGHTS)?),
+        None => None,
+    };
+    let stdin_dup = match caps.stdin {
+        Some(ch) => Some(ch.handle().duplicate(rights::READ | rights::TRANSFER)?),
+        None => None,
+    };
+    let stdout_dup = match caps.stdout {
         Some(ch) => Some(
             ch.handle()
                 .duplicate(rights::READ | rights::WRITE | rights::TRANSFER)?,
         ),
+        None => None,
+    };
+    let stderr_dup = match caps.stderr {
+        Some(ch) => Some(
+            ch.handle()
+                .duplicate(rights::READ | rights::WRITE | rights::TRANSFER)?,
+        ),
+        None => None,
+    };
+    let hxfs_svc_dup = match caps.hxfs_service {
+        Some(ch) => Some(
+            ch.handle()
+                .duplicate(rights::READ | rights::WRITE | rights::TRANSFER)?,
+        ),
+        None => None,
+    };
+    let block_dev_dup = match caps.block_dev {
+        Some(ch) => Some(
+            ch.handle()
+                .duplicate(rights::READ | rights::WRITE | rights::TRANSFER)?,
+        ),
+        None => None,
+    };
+    let frame_draw_dup = match caps.frame_draw {
+        Some(h) => Some(h.duplicate(rights::SAME_RIGHTS)?),
         None => None,
     };
 
@@ -541,6 +627,12 @@ fn finish_dynamic_launch(
     let bootstrap = match thread.start(interp_entry, initial_rsp) {
         Ok(ch) => ch,
         Err(err) => {
+            drop(frame_draw_dup);
+            drop(block_dev_dup);
+            drop(hxfs_svc_dup);
+            drop(stderr_dup);
+            drop(stdout_dup);
+            drop(stdin_dup);
             drop(hxfs_dir_dup);
             drop(lib_vmo_dup);
             drop(vmar_dup);
@@ -548,18 +640,23 @@ fn finish_dynamic_launch(
         }
     };
 
-    if let Err((err, _h)) = bootstrap.write_handle(LD_BOOTSTRAP_SELF_VMAR_LABEL, vmar_dup) {
-        drop(hxfs_dir_dup);
-        drop(lib_vmo_dup);
-        return Err(err);
-    }
-    if let Err((err, _h)) = bootstrap.write_handle(LD_BOOTSTRAP_LIB_VMO_LABEL, lib_vmo_dup) {
-        drop(hxfs_dir_dup);
-        return Err(err);
-    }
-    if let Some(dir_dup) = hxfs_dir_dup {
-        if let Err((err, _h)) = bootstrap.write_handle(LD_BOOTSTRAP_HXFS_DIR_LABEL, dir_dup) {
-            return Err(err);
+    let sends: [(&[u8], Option<Handle>); 9] = [
+        (LD_BOOTSTRAP_SELF_VMAR_LABEL, Some(vmar_dup)),
+        (LD_BOOTSTRAP_LIB_VMO_LABEL, Some(lib_vmo_dup)),
+        (LD_BOOTSTRAP_HXFS_DIR_LABEL, hxfs_dir_dup),
+        (LD_BOOTSTRAP_STDIN_LABEL, stdin_dup),
+        (LD_BOOTSTRAP_STDOUT_LABEL, stdout_dup),
+        (LD_BOOTSTRAP_STDERR_LABEL, stderr_dup),
+        (LD_BOOTSTRAP_HXFS_SERVICE_LABEL, hxfs_svc_dup),
+        (LD_BOOTSTRAP_BLOCK_DEV_LABEL, block_dev_dup),
+        (LD_BOOTSTRAP_FRAME_DRAW_LABEL, frame_draw_dup),
+    ];
+    for (idx, (label, maybe_h)) in sends.into_iter().enumerate() {
+        if let Some(handle) = maybe_h {
+            if let Err((err, _h)) = bootstrap.write_handle(label, handle) {
+                let _ = idx;
+                return Err(err);
+            }
         }
     }
 
@@ -653,13 +750,14 @@ fn map_dynamic_initial_stack(
     root_vmar: &Vmar,
     stack_size: u64,
     name: &str,
+    args: &[&str],
     at_phdr: u64,
     at_phent: u16,
     at_phnum: u16,
     at_base: u64,
     at_entry: u64,
     has_lib_vmo: bool,
-    has_hxfs_dir: bool,
+    caps: &SpawnCaps<'_>,
 ) -> crate::Result<u64> {
     if !huesos_abi::valid_user_stack_size(stack_size) {
         return Err(crate::ErrorCode::InvalidArgs);
@@ -668,23 +766,50 @@ fn map_dynamic_initial_stack(
     let stack = Vmo::create(stack_size)?;
 
     let mut top_page = [0u8; PAGE_SIZE as usize];
-    let name_bytes = name.as_bytes();
-    let clamped_len = name_bytes.len().min(127);
-    let name_off = PAGE_SIZE as usize - (clamped_len + 1);
-    top_page[name_off..name_off + clamped_len].copy_from_slice(&name_bytes[..clamped_len]);
-    top_page[name_off + clamped_len] = 0;
+    let top_page_va = USER_STACK_TOP - PAGE_SIZE;
 
-    let rand_off = (name_off - 16) & !0xf;
+    const MAX_ARGV: usize = 32;
+    let mut arg_vas = [0u64; MAX_ARGV];
+    let mut str_cursor = PAGE_SIZE as usize;
+    let effective_count = if args.is_empty() {
+        1
+    } else {
+        args.len().min(MAX_ARGV)
+    };
+
+    // Pack argument strings downwards from the top of the page.
+    let mut argc = 0usize;
+    for i in (0..effective_count).rev() {
+        let arg_bytes = if args.is_empty() {
+            name.as_bytes()
+        } else {
+            args[i].as_bytes()
+        };
+        let clamped_len = arg_bytes.len().min(255);
+        let needed = clamped_len + 1;
+        if str_cursor < 2048 + needed {
+            break;
+        }
+        str_cursor -= needed;
+        top_page[str_cursor..str_cursor + clamped_len].copy_from_slice(&arg_bytes[..clamped_len]);
+        top_page[str_cursor + clamped_len] = 0;
+        arg_vas[i] = top_page_va + str_cursor as u64;
+        argc += 1;
+    }
+    if argc == 0 {
+        return Err(crate::ErrorCode::InvalidArgs);
+    }
+    // If truncated at the bottom, shift valid entries to start at index 0.
+    let first_valid = effective_count - argc;
+
+    let rand_off = (str_cursor - 16) & !0xf;
     let r0 = memory::random_u64().unwrap_or(0x9e37_79b9_7f4a_7c15);
     let r1 = memory::random_u64().unwrap_or(0xbf58_476d_1ce4_e5b9);
     top_page[rand_off..rand_off + 8].copy_from_slice(&r0.to_le_bytes());
     top_page[rand_off + 8..rand_off + 16].copy_from_slice(&r1.to_le_bytes());
-
-    let top_page_va = USER_STACK_TOP - PAGE_SIZE;
-    let argv0_va = top_page_va + name_off as u64;
     let rand_va = top_page_va + rand_off as u64;
 
-    let aux_entries: [(u64, u64); 12] = [
+    let aux_entries: [(u64, u64); 19] = [
         (AT_PHDR, at_phdr),
         (AT_PHENT, u64::from(at_phent)),
         (AT_PHNUM, u64::from(at_phnum)),
@@ -695,12 +820,22 @@ fn map_dynamic_initial_stack(
         (AT_RANDOM, rand_va),
         (AT_HUESOS_LD_BOOTSTRAP, 1),
         (AT_HUESOS_LIB_VMO, u64::from(has_lib_vmo)),
-        (AT_HUESOS_HXFS_DIR, u64::from(has_hxfs_dir)),
+        (AT_HUESOS_HXFS_DIR, u64::from(caps.hxfs_dir.is_some())),
+        (AT_HUESOS_STDIN, u64::from(caps.stdin.is_some())),
+        (AT_HUESOS_STDOUT, u64::from(caps.stdout.is_some())),
+        (AT_HUESOS_STDERR, u64::from(caps.stderr.is_some())),
+        (AT_HUESOS_CAPS_MASK, caps.caps_mask),
+        (
+            AT_HUESOS_HXFS_SERVICE,
+            u64::from(caps.hxfs_service.is_some()),
+        ),
+        (AT_HUESOS_BLOCK_DEV, u64::from(caps.block_dev.is_some())),
+        (AT_HUESOS_FRAME_DRAW, u64::from(caps.frame_draw.is_some())),
         (AT_NULL, 0),
     ];
 
-    // Words: argc (1) + argv[0] + NULL + envp NULL + 12 auxv pairs (24 words) = 28 words.
-    let total_words = 4 + aux_entries.len() * 2;
+    // Words: argc + argv[0..argc] + NULL + envp NULL + auxv pairs.
+    let total_words = 1 + argc + 1 + 1 + aux_entries.len() * 2;
     let sp_off = (rand_off - total_words * 8) & !0xf;
 
     let mut cur = sp_off;
@@ -708,9 +843,11 @@ fn map_dynamic_initial_stack(
         buf[*pos..*pos + 8].copy_from_slice(&val.to_le_bytes());
         *pos += 8;
     };
-    write_word(&mut top_page, &mut cur, 1); // argc
-    write_word(&mut top_page, &mut cur, argv0_va); // argv[0]
-    write_word(&mut top_page, &mut cur, 0); // argv[1] = NULL
+    write_word(&mut top_page, &mut cur, argc as u64);
+    for &va in &arg_vas[first_valid..effective_count] {
+        write_word(&mut top_page, &mut cur, va);
+    }
+    write_word(&mut top_page, &mut cur, 0); // argv[argc] = NULL
     write_word(&mut top_page, &mut cur, 0); // envp[0] = NULL
     for (a_type, a_val) in aux_entries {
         write_word(&mut top_page, &mut cur, a_type);

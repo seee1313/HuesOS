@@ -2050,3 +2050,172 @@ pub extern "C" fn canvas_thread_exit(code: i64) -> ! {
     }
     process::exit_thread(code)
 }
+
+/* --------------------------------------------------------------------------
+ * Process arguments, standard streams & @caps(...) handles
+ * -------------------------------------------------------------------------- */
+
+/// Internal entrypoint invoked by `/lib/ld-huesos.so` before `.init_array`
+/// to populate `argc`/`argv`, `@caps(...)` mask, and stdio/capability handles.
+///
+/// # Safety
+/// `info` must point to a valid `ProcessBootstrapInfo`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn __huesos_set_process_ctx(
+    info: *const crate::rtld_abi::ProcessBootstrapInfo,
+) -> i32 {
+    if info.is_null() {
+        return -1;
+    }
+    // SAFETY: `ld-huesos.so` passes a valid stack-allocated `ProcessBootstrapInfo`.
+    let ctx = unsafe { &*info };
+    if ctx.version != crate::rtld_abi::RTLD_OPS_VERSION {
+        return -1;
+    }
+    crate::stdio::set_process_ctx(ctx);
+    0
+}
+
+/// Return the number of command-line arguments (`argc`).
+#[unsafe(no_mangle)]
+pub extern "C" fn canvas_args_count() -> usize {
+    crate::stdio::args_count()
+}
+
+/// Copy argument `index` into `out_buf` (up to `buf_len`) and write its full
+/// byte length to `*out_len`.
+///
+/// # Safety
+/// If `buf_len > 0`, `out_buf` must be writable; `out_len` must be writable if non-null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn canvas_arg_get(
+    index: usize,
+    out_buf: *mut u8,
+    buf_len: usize,
+    out_len: *mut usize,
+) -> i64 {
+    // SAFETY: caller guarantees `out_buf` is valid for `buf_len` bytes.
+    let Ok(dst) = (unsafe { write_slice(out_buf, buf_len) }) else {
+        return err_code(ErrorCode::InvalidArgs);
+    };
+    let Some(full_len) = crate::stdio::arg_get(index, dst) else {
+        return err_code(ErrorCode::NotFound);
+    };
+    if !out_len.is_null() {
+        // SAFETY: `write_out` checks pointer validity/alignment.
+        return to_abi_result(unsafe { write_out(out_len, full_len) });
+    }
+    0
+}
+
+/// Read up to `buf_len` bytes from `stdin` into `out_buf` (`*out_read == 0` on EOF).
+///
+/// # Safety
+/// `out_buf` must be writable for `buf_len` bytes and `out_read` must be valid if non-null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn canvas_stdin_read(
+    out_buf: *mut u8,
+    buf_len: usize,
+    out_read: *mut usize,
+) -> i64 {
+    // SAFETY: caller guarantees `out_buf` is valid for `buf_len` bytes.
+    let Ok(dst) = (unsafe { write_slice(out_buf, buf_len) }) else {
+        return err_code(ErrorCode::InvalidArgs);
+    };
+    match crate::stdio::stdin_read(dst) {
+        Ok(n) => {
+            if !out_read.is_null() {
+                // SAFETY: `write_out` checks pointer validity/alignment.
+                return to_abi_result(unsafe { write_out(out_read, n) });
+            }
+            0
+        }
+        Err(err) => err_code(err),
+    }
+}
+
+/// Write `len` bytes from `data` to `stdout` in `4096`-byte chunks.
+///
+/// # Safety
+/// `data` must be readable for `len` bytes and `out_written` must be valid if non-null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn canvas_stdout_write(
+    data: *const u8,
+    len: usize,
+    out_written: *mut usize,
+) -> i64 {
+    // SAFETY: caller guarantees `data` is readable for `len` bytes.
+    let Ok(src) = (unsafe { read_bytes(data, len) }) else {
+        return err_code(ErrorCode::InvalidArgs);
+    };
+    match crate::stdio::stdout_write(src) {
+        Ok(n) => {
+            if !out_written.is_null() {
+                // SAFETY: `write_out` checks pointer validity/alignment.
+                return to_abi_result(unsafe { write_out(out_written, n) });
+            }
+            0
+        }
+        Err(err) => err_code(err),
+    }
+}
+
+/// Write `len` bytes from `data` to `stderr` in `4096`-byte chunks.
+///
+/// # Safety
+/// `data` must be readable for `len` bytes and `out_written` must be valid if non-null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn canvas_stderr_write(
+    data: *const u8,
+    len: usize,
+    out_written: *mut usize,
+) -> i64 {
+    // SAFETY: caller guarantees `data` is readable for `len` bytes.
+    let Ok(src) = (unsafe { read_bytes(data, len) }) else {
+        return err_code(ErrorCode::InvalidArgs);
+    };
+    match crate::stdio::stderr_write(src) {
+        Ok(n) => {
+            if !out_written.is_null() {
+                // SAFETY: `write_out` checks pointer validity/alignment.
+                return to_abi_result(unsafe { write_out(out_written, n) });
+            }
+            0
+        }
+        Err(err) => err_code(err),
+    }
+}
+
+/// Run destructors, close stdio channels (`PeerClosed` EOF), and exit with `code`.
+#[unsafe(no_mangle)]
+pub extern "C" fn canvas_exit_code(code: i32) -> ! {
+    run_process_fini_once();
+    crate::stdio::exit(code)
+}
+
+/// Return the attenuated `@caps(...)` capability bitmask (`huesos_abi::auxv::caps_mask`).
+#[unsafe(no_mangle)]
+pub extern "C" fn canvas_caps_mask() -> u64 {
+    crate::stdio::caps_mask()
+}
+
+/// Return a raw handle value for `kind` (`INVALID_HANDLE` if not granted).
+#[unsafe(no_mangle)]
+pub extern "C" fn canvas_cap_handle(kind: u32) -> u32 {
+    let Some(cap) = crate::stdio::cap_kind_from_u32(kind) else {
+        return crate::INVALID_HANDLE;
+    };
+    crate::stdio::cap_raw_or_invalid(cap)
+}
+
+/// Take ownership of a granted capability handle once (`INVALID_HANDLE` if absent/taken).
+#[unsafe(no_mangle)]
+pub extern "C" fn canvas_take_cap_handle(kind: u32) -> u32 {
+    let Some(cap) = crate::stdio::cap_kind_from_u32(kind) else {
+        return crate::INVALID_HANDLE;
+    };
+    match crate::stdio::take_cap_handle(cap) {
+        Some(handle) => handle.into_raw(),
+        None => crate::INVALID_HANDLE,
+    }
+}

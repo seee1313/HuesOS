@@ -135,3 +135,9 @@ pub const NVME_BLOCK_IDENTIFIED: &str = "service:block:nvme:identified";
 pub const NVME_BLOCK_BRINGUP_FAILED: &str = "service:block:nvme:bringup-failed";
 /// NVMe skeleton compatibility message for resource-only readiness.
 pub const NVME_BLOCK_READY: &str = "service:block:nvme:ready";
+/// Client queries PCI topology/root-bridge/lease summary as TSV text.
+pub const QUERY_PCI: &str = "query:pci";
+/// Client queries ACPI archive/manager summary as TSV text.
+pub const QUERY_ACPI: &str = "query:acpi";
+/// Client queries DriverManager-supervised processes and services as TSV text.
+pub const QUERY_PS: &str = "query:ps";

@@ -30,7 +30,6 @@ type Color = (u8, u8, u8);
 
 const COLOR_BACKGROUND: Color = (5, 8, 16);
 const COLOR_TEXT: Color = (180, 220, 255);
-const COLOR_ACTIVE_TEXT: Color = (180, 240, 180);
 const COLOR_CURSOR: Color = (100, 255, 170);
 
 /// Monotonically identifies the most recent owner of the shared render
@@ -204,6 +203,8 @@ impl PixelRect {
 pub struct Screen {
     canvas: Option<Canvas>,
     cells: [[u8; COLS]; ROWS],
+    colors: [[Color; COLS]; ROWS],
+    active_fg: Color,
 
     row: usize,
     col: usize,
@@ -245,6 +246,8 @@ impl Screen {
         Self {
             canvas,
             cells: [[b' '; COLS]; ROWS],
+            colors: [[COLOR_TEXT; COLS]; ROWS],
+            active_fg: COLOR_TEXT,
 
             row: 0,
             col: 0,
@@ -289,6 +292,8 @@ impl Screen {
     /// Clear all cells and reset the cursor.
     pub fn clear(&mut self) {
         self.cells = [[b' '; COLS]; ROWS];
+        self.colors = [[COLOR_TEXT; COLS]; ROWS];
+        self.active_fg = COLOR_TEXT;
         self.row = 0;
         self.col = 0;
         self.mark_all_dirty();
@@ -415,6 +420,53 @@ impl Screen {
         }
     }
 
+    pub fn set_fg(&mut self, color: Color) {
+        self.active_fg = color;
+    }
+
+    pub fn reset_fg(&mut self) {
+        self.active_fg = COLOR_TEXT;
+    }
+
+    pub fn write_colored(&mut self, text: &str, color: Color) {
+        let prev = self.active_fg;
+        self.active_fg = color;
+        self.write_str(text);
+        self.active_fg = prev;
+    }
+
+    pub fn current_row(&self) -> usize {
+        self.row
+    }
+
+    pub fn current_col(&self) -> usize {
+        self.col
+    }
+
+    pub fn set_cursor(&mut self, row: usize, col: usize) {
+        let old_row = self.row;
+        let old_col = self.col;
+        self.row = row.min(ROWS - 1);
+        self.col = col.min(COLS - 1);
+        self.mark_dirty_span(old_row, old_col, old_col.saturating_add(1).min(COLS));
+        self.mark_dirty_span(self.row, self.col, self.col.saturating_add(1).min(COLS));
+    }
+
+    pub fn clear_from(&mut self, start_row: usize, start_col: usize) {
+        let r0 = start_row.min(ROWS - 1);
+        let c0 = start_col.min(COLS);
+        for r in r0..ROWS {
+            let from_c = if r == r0 { c0 } else { 0 };
+            for c in from_c..COLS {
+                self.cells[r][c] = b' ';
+                self.colors[r][c] = COLOR_TEXT;
+            }
+            self.mark_dirty_span(r, from_c, COLS);
+        }
+        self.row = r0;
+        self.col = c0.min(COLS - 1);
+    }
+
     /// Show or hide the terminal cursor.
     pub fn set_cursor_visible(&mut self, visible: bool) {
         if self.cursor_visible == visible {
@@ -536,6 +588,7 @@ impl Screen {
         let column = self.col;
 
         self.cells[row][column] = byte;
+        self.colors[row][column] = self.active_fg;
         self.col += 1;
 
         // Redraw the written cell and the cursor's new location.
@@ -570,10 +623,12 @@ impl Screen {
 
         while source < ROWS {
             self.cells[source - 1] = self.cells[source];
+            self.colors[source - 1] = self.colors[source];
             source += 1;
         }
 
         self.cells[ROWS - 1] = [b' '; COLS];
+        self.colors[ROWS - 1] = [COLOR_TEXT; COLS];
         self.row = ROWS - 1;
         self.col = 0;
 
@@ -750,29 +805,27 @@ impl Screen {
     ) -> bool {
         let visible_columns = self.visible_columns_for(canvas);
         let len = line_len(&self.cells[model_row]).min(visible_columns);
+        let metrics = font_metrics(self.font);
+        let y = self.display_row_y(display_row);
 
-        if len > 0 {
-            let Ok(text) = core::str::from_utf8(&self.cells[model_row][..len]) else {
+        let mut col = 0usize;
+        while col < len {
+            let color = self.colors[model_row][col];
+            let mut end = col + 1;
+            while end < len && self.colors[model_row][end] == color {
+                end += 1;
+            }
+            let Ok(text) = core::str::from_utf8(&self.cells[model_row][col..end]) else {
                 return false;
             };
-
-            let color = self.row_color(model_row);
-
+            let rx = LEFT_MARGIN.saturating_add(col as u32 * metrics.advance);
             if canvas
-                .draw_text_to_shadow(
-                    shadow,
-                    LEFT_MARGIN,
-                    self.display_row_y(display_row),
-                    text,
-                    color.0,
-                    color.1,
-                    color.2,
-                    self.font,
-                )
+                .draw_text_to_shadow(shadow, rx, y, text, color.0, color.1, color.2, self.font)
                 .is_err()
             {
                 return false;
             }
+            col = end;
         }
 
         self.draw_cursor_to_shadow(canvas, shadow, model_row, display_row, visible_columns)
@@ -825,18 +878,21 @@ impl Screen {
             .map_err(|_| ())?;
 
         let text_end = line_len(&self.cells[model_row]).min(end_column);
-
-        if text_end > start_column {
-            let Ok(text) = core::str::from_utf8(&self.cells[model_row][start_column..text_end])
-            else {
+        let mut col = start_column;
+        while col < text_end {
+            let color = self.colors[model_row][col];
+            let mut run_end = col + 1;
+            while run_end < text_end && self.colors[model_row][run_end] == color {
+                run_end += 1;
+            }
+            let Ok(text) = core::str::from_utf8(&self.cells[model_row][col..run_end]) else {
                 return Err(());
             };
-
-            let color = self.row_color(model_row);
-
+            let rx = LEFT_MARGIN.saturating_add(col as u32 * metrics.advance);
             canvas
-                .draw_text_to_shadow(shadow, x, y, text, color.0, color.1, color.2, self.font)
+                .draw_text_to_shadow(shadow, rx, y, text, color.0, color.1, color.2, self.font)
                 .map_err(|_| ())?;
+            col = run_end;
         }
 
         if self.cursor_visible
@@ -923,28 +979,27 @@ impl Screen {
         while model_row < view_end {
             let display_row = model_row - view_top;
             let len = line_len(&self.cells[model_row]).min(visible_columns);
+            let metrics = font_metrics(self.font);
+            let y = self.display_row_y(display_row);
 
-            if len > 0 {
-                let Ok(text) = core::str::from_utf8(&self.cells[model_row][..len]) else {
+            let mut col = 0usize;
+            while col < len {
+                let color = self.colors[model_row][col];
+                let mut run_end = col + 1;
+                while run_end < len && self.colors[model_row][run_end] == color {
+                    run_end += 1;
+                }
+                let Ok(text) = core::str::from_utf8(&self.cells[model_row][col..run_end]) else {
                     return false;
                 };
-
-                let color = self.row_color(model_row);
-
+                let rx = LEFT_MARGIN.saturating_add(col as u32 * metrics.advance);
                 if canvas
-                    .draw_text_with_font(
-                        LEFT_MARGIN,
-                        self.display_row_y(display_row),
-                        text,
-                        color.0,
-                        color.1,
-                        color.2,
-                        self.font,
-                    )
+                    .draw_text_with_font(rx, y, text, color.0, color.1, color.2, self.font)
                     .is_err()
                 {
                     return false;
                 }
+                col = run_end;
             }
 
             if self.cursor_visible && model_row == self.row && self.col < visible_columns {
@@ -970,14 +1025,6 @@ impl Screen {
         }
 
         canvas.present().is_ok()
-    }
-
-    fn row_color(&self, model_row: usize) -> Color {
-        if model_row == self.row {
-            COLOR_ACTIVE_TEXT
-        } else {
-            COLOR_TEXT
-        }
     }
 
     fn display_row_y(&self, display_row: usize) -> u32 {
