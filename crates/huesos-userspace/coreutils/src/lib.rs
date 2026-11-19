@@ -173,6 +173,9 @@ pub fn iter_bootfs_entries(vmo: &Vmo) -> Vec<(String, u64, u64)> {
 }
 
 /// Issue a `query:*` request to `DriverManager` over `CapKind::Registry` and write TSV to `stdout`.
+/// Ticks to wait for one `query:*` reply from `driver-manager`.
+const QUERY_WAIT_TICKS: u64 = 250;
+
 pub fn run_registry_query(cmd_name: &str, req: &[u8]) -> i32 {
     if let Err(code) = check_query_ro() {
         return code;
@@ -187,9 +190,13 @@ pub fn run_registry_query(cmd_name: &str, req: &[u8]) -> i32 {
         errln(&format!("{cmd_name}: query write failed: {}", e.as_str()));
         return 1;
     }
+    // `driver-manager` answers once per supervision tick, and a tick can be
+    // long (NVMe, volume and file-system polling come first). Spinning on
+    // `yield_now` therefore timed out on a healthy system; wait on the channel
+    // instead, with a bounded budget so a dead manager cannot hang the shell.
     let mut buf = [0u8; 4096];
-    for _ in 0..200 {
-        match reg.read_into(&mut buf) {
+    for _ in 0..6 {
+        match reg.read_into_timeout(&mut buf, QUERY_WAIT_TICKS) {
             Ok(n) => {
                 let text = String::from_utf8_lossy(&buf[..n]);
                 out(text.as_ref());
@@ -198,9 +205,7 @@ pub fn run_registry_query(cmd_name: &str, req: &[u8]) -> i32 {
                 }
                 return 0;
             }
-            Err(ErrorCode::ShouldWait) | Err(ErrorCode::TimedOut) => {
-                libcanvas::process::yield_now();
-            }
+            Err(ErrorCode::ShouldWait) | Err(ErrorCode::TimedOut) => {}
             Err(e) => {
                 errln(&format!("{cmd_name}: query read failed: {}", e.as_str()));
                 return 1;

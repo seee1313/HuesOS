@@ -2240,14 +2240,17 @@ impl DriverManager {
                     match ch.read_into(&mut buf) {
                         Ok(n) if &buf[..n] == protocol::QUERY_PCI.as_bytes() => {
                             self.reply_query_pci_on(ch);
+                            println!("[driver-manager] query slot {idx} served pci");
                             served = true;
                         }
                         Ok(n) if &buf[..n] == protocol::QUERY_ACPI.as_bytes() => {
                             self.reply_query_acpi_on(ch);
+                            println!("[driver-manager] query slot {idx} served acpi");
                             served = true;
                         }
                         Ok(n) if &buf[..n] == protocol::QUERY_PS.as_bytes() => {
                             self.reply_query_ps_on(ch);
+                            println!("[driver-manager] query slot {idx} served ps");
                             served = true;
                         }
                         Ok(_) => {
@@ -2365,7 +2368,10 @@ impl DriverManager {
                 );
             }
         }
-        let _ = registry.write(out.as_bytes());
+        match registry.write(out.as_bytes()) {
+            Ok(()) => println!("[driver-manager] pci reply {} bytes", out.as_bytes().len()),
+            Err(error) => println!("[driver-manager] pci reply write failed: {}", error.as_str()),
+        }
     }
 
     fn reply_query_acpi_on(&self, registry: &Channel) {
