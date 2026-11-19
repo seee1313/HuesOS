@@ -198,6 +198,8 @@ fn main() {
         &[],
         &[],
     );
+    let ld_huesos = build_ld_huesos(&userspace_root, profile);
+    let libcanvas_so = build_libcanvas_so(&userspace_root, profile);
     let _bootfs = build_bootfs_image(
         &manifest_dir,
         BootfsInputs {
@@ -209,6 +211,8 @@ fn main() {
             shutdown_broker: &shutdown_broker,
             terminal: &terminal,
             doom: &doom,
+            ld_huesos: &ld_huesos,
+            libcanvas_so: &libcanvas_so,
         },
     );
     let init = build_userspace_program(
@@ -337,6 +341,7 @@ fn track_userspace_inputs(userspace_root: &Path) {
         "terminal",
         "doom",
         "fault-probe",
+        "ld-huesos",
     ] {
         println!(
             "cargo:rerun-if-changed={}",
@@ -356,6 +361,7 @@ fn track_userspace_inputs(userspace_root: &Path) {
     for crate_dir in [
         "crates/huesos-hxfs",
         "crates/huesos-abi",
+        "crates/huesos-elf",
         "crates/huesos-scudo",
     ] {
         println!("cargo:rerun-if-changed={crate_dir}");
@@ -364,6 +370,19 @@ fn track_userspace_inputs(userspace_root: &Path) {
     println!(
         "cargo:rerun-if-changed={}",
         userspace_root.join("libcanvas").join("src").display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        userspace_root
+            .join("libcanvas")
+            .join("Cargo.toml")
+            .display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        userspace_root
+            .join("x86_64-huesos-userspace-dyn.json")
+            .display()
     );
     println!(
         "cargo:rerun-if-changed={}",
@@ -459,6 +478,85 @@ fn build_userspace_program(
     bin_path
 }
 
+fn build_ld_huesos(userspace_root: &Path, profile: &str) -> PathBuf {
+    let program_dir = userspace_root.join("ld-huesos");
+    let target_dir = userspace_target_dir(&program_dir, &[]);
+    let mut command = Command::new(env::var("CARGO").unwrap_or_else(|_| "cargo".into()));
+    command
+        .current_dir(&program_dir)
+        .env_remove("RUSTFLAGS")
+        .env_remove("CARGO_ENCODED_RUSTFLAGS")
+        .args(["build", "--release"])
+        .arg("--target-dir")
+        .arg(&target_dir);
+
+    let status = command
+        .status()
+        .expect("failed to invoke cargo for ld-huesos dynamic linker build");
+    if !status.success() {
+        panic!("building ld-huesos failed");
+    }
+
+    let bin_path = target_dir
+        .join("x86_64-huesos-userspace-dyn")
+        .join(profile)
+        .join("ld-huesos");
+    assert!(
+        bin_path.exists(),
+        "expected ld-huesos binary at {}",
+        bin_path.display()
+    );
+    bin_path
+}
+
+fn build_libcanvas_so(userspace_root: &Path, profile: &str) -> PathBuf {
+    let lib_dir = userspace_root.join("libcanvas");
+    let target_dir = userspace_target_dir(&lib_dir, &["cdylib", "c-abi"]);
+    let mut command = Command::new(env::var("CARGO").unwrap_or_else(|_| "cargo".into()));
+    command
+        .current_dir(&lib_dir)
+        .env_remove("CARGO_ENCODED_RUSTFLAGS")
+        .env("RUSTFLAGS", "-C link-arg=-soname=libcanvas.so")
+        .args([
+            "rustc",
+            "--release",
+            "--lib",
+            "--crate-type",
+            "cdylib",
+            "--no-default-features",
+            "--features",
+            "c-abi",
+            "--target",
+            "../x86_64-huesos-userspace-dyn.json",
+            "-Z",
+            "build-std=core,compiler_builtins,alloc",
+            "-Z",
+            "build-std-features=compiler-builtins-mem",
+            "-Z",
+            "json-target-spec",
+        ])
+        .arg("--target-dir")
+        .arg(&target_dir);
+
+    let status = command
+        .status()
+        .expect("failed to invoke cargo for libcanvas.so build");
+    if !status.success() {
+        panic!("building libcanvas.so failed");
+    }
+
+    let so_path = target_dir
+        .join("x86_64-huesos-userspace-dyn")
+        .join(profile)
+        .join("liblibcanvas.so");
+    assert!(
+        so_path.exists(),
+        "expected libcanvas.so at {}",
+        so_path.display()
+    );
+    so_path
+}
+
 struct BootFsFile {
     path: &'static str,
     data: Vec<u8>,
@@ -473,6 +571,8 @@ struct BootfsInputs<'a> {
     shutdown_broker: &'a Path,
     terminal: &'a Path,
     doom: &'a Path,
+    ld_huesos: &'a Path,
+    libcanvas_so: &'a Path,
 }
 
 fn build_bootfs_image(manifest_dir: &Path, inputs: BootfsInputs<'_>) -> PathBuf {
@@ -615,6 +715,14 @@ fn build_bootfs_image(manifest_dir: &Path, inputs: BootfsInputs<'_>) -> PathBuf 
             data: read_build_input(inputs.doom, "Doom ELF"),
         },
         BootFsFile {
+            path: "/lib/ld-huesos.so",
+            data: read_build_input(inputs.ld_huesos, "ld-huesos.so"),
+        },
+        BootFsFile {
+            path: "/lib/libcanvas.so",
+            data: read_build_input(inputs.libcanvas_so, "libcanvas.so"),
+        },
+        BootFsFile {
             path: "/data/freedoom1.wad",
             data: read_build_input(
                 &manifest_dir.join("../../third_party/freedoom/freedoom1.wad"),
@@ -641,6 +749,7 @@ fn build_bootfs_hash_manifest(files: &[BootFsFile]) -> Vec<u8> {
     let mut manifest = Vec::new();
     for file in files {
         let trusted = file.path.ends_with(".elf")
+            || file.path.ends_with(".so")
             || file.path.ends_with(".hdriver")
             || file.path == "/storage/boot-drivers.manifest";
         if !trusted {

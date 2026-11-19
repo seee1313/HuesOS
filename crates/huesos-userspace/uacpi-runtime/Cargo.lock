@@ -27,6 +27,13 @@ name = "huesos-blobfs"
 version = "0.1.0"
 
 [[package]]
+name = "huesos-elf"
+version = "0.1.0"
+dependencies = [
+ "log",
+]
+
+[[package]]
 name = "huesos-scudo"
 version = "0.1.0"
 
@@ -46,6 +53,7 @@ version = "0.1.0"
 dependencies = [
  "huesos-abi",
  "huesos-blobfs",
+ "huesos-elf",
  "huesos-scudo",
 ]
 
@@ -57,6 +65,12 @@ checksum = "224399e74b87b5f3557511d98dff8b14089b3dadafcab6bb93eab67d3aace965"
 dependencies = [
  "scopeguard",
 ]
+
+[[package]]
+name = "log"
+version = "0.4.35"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5d15f86d12da44cd8d4ec3c73984537eb7f4cadcb9776a575a0a8a05ca11005c"
 
 [[package]]
 name = "scopeguard"

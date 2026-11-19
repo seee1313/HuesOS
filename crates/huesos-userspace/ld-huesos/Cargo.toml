@@ -1,0 +1,23 @@
+[package]
+name = "huesos-ld"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "ld-huesos"
+path = "src/main.rs"
+
+[dependencies]
+huesos-abi = { path = "../../huesos-abi" }
+huesos-elf = { path = "../../huesos-elf" }
+libcanvas = { path = "../libcanvas" }
+
+[profile.release]
+opt-level = 2
+panic = "abort"
+lto = false
+
+[profile.dev]
+panic = "abort"
+
+[workspace]
