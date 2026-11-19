@@ -17,6 +17,9 @@ extern crate alloc;
 #[cfg(feature = "alloc")]
 use alloc::vec::Vec;
 
+/// Live PCI BAR sizing and firmware resource inventory (Stage E.1).
+#[cfg(feature = "alloc")]
+pub mod bar_sizing;
 /// Bounded conventional and PCIe extended capability-list decoding.
 #[cfg(feature = "alloc")]
 pub mod capability;

@@ -50,10 +50,14 @@ use huesos_abi::pci_mediation::{
 };
 #[cfg(not(feature = "force-legacy"))]
 use huesos_abi::vmar_flags;
+use huesos_pci::bar_sizing::{self, NoActiveLeases};
 use huesos_pci::inventory::{
     ConfigReader, DiagnosticInventory, FirmwareResourceAvailability, InventoryManager,
 };
-use huesos_pci::resource_validation::{ResourceClass, RootAperture};
+use huesos_pci::resource_planner::{self, ResourcePlan};
+use huesos_pci::resource_validation::{
+    ResourceClass, ResourceRegister, ResourceStatus, RootAperture, ValidationReport,
+};
 use huesos_pci::topology::RootBus;
 use huesos_pci::write_policy::{
     self, ConfigReadWriteTransport, HeaderKind, WriteClass, WritePolicyError, WriteRequest,
@@ -150,6 +154,10 @@ struct ConfigAuthority {
     roots: Option<RootBridgeTable>,
     /// Diagnostic read-only inventory state (AP-16).
     inventory: InventoryManager,
+    /// Live BAR sizing validation report (Stage E.1 / AP-19).
+    live_validation: Option<ValidationReport>,
+    /// Firmware-preserving resource plan (Stage F.2 / AP-19).
+    resource_plan: Option<ResourcePlan>,
     #[cfg_attr(feature = "force-legacy", allow(dead_code))]
     rw_ecam: [Option<Handle>; hmcf::MAX_RECORDS as usize],
     #[cfg_attr(feature = "force-legacy", allow(dead_code))]
@@ -194,6 +202,8 @@ impl Default for ConfigAuthority {
             producer_generation: 0,
             roots: None,
             inventory: InventoryManager::new(),
+            live_validation: None,
+            resource_plan: None,
             rw_ecam: [const { None }; hmcf::MAX_RECORDS as usize],
             rw_ecam_count: 0,
             writable: false,
@@ -929,6 +939,7 @@ fn finish_write_authority(
         authority.writable = true;
         authority.write_upgrading = false;
         if verify_b4_write_policy(authority, 1) {
+            run_live_bar_inventory_and_planner(authority);
             let _ = send(
                 bootstrap,
                 Message::write_authority_ready(manager_generation, 1),
@@ -985,6 +996,7 @@ fn finish_write_authority(
         authority.writable = true;
         authority.write_upgrading = false;
         if verify_b4_write_policy(authority, mapped) {
+            run_live_bar_inventory_and_planner(authority);
             let _ = send(
                 bootstrap,
                 Message::write_authority_ready(manager_generation, mapped as u32),
@@ -1148,6 +1160,146 @@ fn verify_b4_write_policy(authority: &ConfigAuthority, window_count: usize) -> b
             false
         }
     }
+}
+
+fn resource_class_label(class: ResourceClass) -> &'static str {
+    match class {
+        ResourceClass::Io => "io",
+        ResourceClass::Mmio32 => "mmio32",
+        ResourceClass::Mmio64 => "mmio64",
+        ResourceClass::PrefetchableMemory => "prefetch",
+    }
+}
+
+fn resource_status_label(status: ResourceStatus) -> &'static str {
+    match status {
+        ResourceStatus::Valid => "Valid",
+        ResourceStatus::Fixed => "Fixed",
+        ResourceStatus::Unassigned => "Unassigned",
+        ResourceStatus::Conflicting => "Conflicting",
+        ResourceStatus::Unrouteable => "Unrouteable",
+        ResourceStatus::Unsupported => "Unsupported",
+    }
+}
+
+fn run_live_bar_inventory_and_planner(authority: &mut ConfigAuthority) {
+    let Some(table) = authority.roots.as_ref() else {
+        return;
+    };
+    let Some(inv) = authority.inventory.last_good() else {
+        return;
+    };
+    let snapshot = inv.snapshot.clone();
+    let mut apertures = Vec::new();
+    for ap in &table.apertures[..table.aperture_count] {
+        let Some(owner) = table.roots.get(usize::from(ap.root_index)) else {
+            continue;
+        };
+        apertures.push(RootAperture {
+            root_id: owner.root_id,
+            class: aperture_class(ap.kind),
+            pci_base: ap.pci_base,
+            cpu_base: ap.cpu_base,
+            len: ap.len,
+        });
+    }
+
+    let mut transport = ReadWriteTransport {
+        windows: &authority.windows,
+        windows_len: authority.windows_len,
+        writable: authority.writable,
+        #[cfg(feature = "force-legacy")]
+        legacy_ioport: authority.legacy_ioport.as_ref(),
+    };
+
+    let live = match bar_sizing::collect_live_bar_inventory(
+        &mut transport,
+        &snapshot,
+        &apertures,
+        &NoActiveLeases,
+    ) {
+        Ok(live) => live,
+        Err(err) => {
+            println!("[pci-manager] obs e1-bar status=error detail={:?}", err);
+            return;
+        }
+    };
+
+    for entry in live.validation.resources() {
+        let r = entry.resource;
+        let reg_kind = match r.register {
+            ResourceRegister::Bar(i) => ("bar", i),
+            ResourceRegister::BridgeWindow(i) => ("win", i),
+        };
+        println!(
+            "[pci-manager] obs e1-bar bdf={:02x}:{:02x}.{} reg={}{} class={} pci=0x{:x} len=0x{:x} assigned={} status={}",
+            r.owner.bus(),
+            r.owner.device(),
+            r.owner.function(),
+            reg_kind.0,
+            reg_kind.1,
+            resource_class_label(r.class),
+            r.pci_base,
+            r.len,
+            r.assigned,
+            resource_status_label(entry.status)
+        );
+    }
+
+    if !live.validation.is_conflict_free() {
+        println!(
+            "[pci-manager] obs f2-plan status=skipped reason=validation-not-conflict-free roms={}",
+            live.rom_bars.len()
+        );
+        authority.live_validation = Some(live.validation);
+        return;
+    }
+
+    let plan =
+        match resource_planner::plan_firmware_preserving(&snapshot, &apertures, &live.validation) {
+            Ok(plan) => plan,
+            Err(err) => {
+                println!(
+                    "[pci-manager] obs f2-plan status=plan-error detail={:?}",
+                    err
+                );
+                authority.live_validation = Some(live.validation);
+                return;
+            }
+        };
+
+    let commit_plan = match resource_planner::build_commit_plan(&snapshot, &plan, &mut transport) {
+        Ok(cp) => cp,
+        Err(err) => {
+            println!(
+                "[pci-manager] obs f2-plan status=commit-build-error detail={:?}",
+                err
+            );
+            authority.live_validation = Some(live.validation);
+            authority.resource_plan = Some(plan);
+            return;
+        }
+    };
+
+    let writes_len = commit_plan.writes().len();
+    if writes_len > 0 {
+        if let Err(err) = resource_planner::execute_commit_plan(&commit_plan, &mut transport) {
+            println!(
+                "[pci-manager] obs f2-plan status=commit-error detail={:?} writes={}",
+                err, writes_len
+            );
+            return;
+        }
+    }
+
+    println!(
+        "[pci-manager] obs f2-plan status=ok planned={} writes={} roms={}",
+        plan.resources().len(),
+        writes_len,
+        live.rom_bars.len()
+    );
+    authority.live_validation = Some(live.validation);
+    authority.resource_plan = Some(plan);
 }
 
 fn read_vmo_exact(vmo: &Vmo, offset: u64, buf: &mut [u8]) -> bool {
