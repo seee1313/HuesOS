@@ -61,6 +61,8 @@
 pub mod acpi_broker;
 pub mod blobfs;
 pub mod block;
+#[cfg(feature = "c-abi")]
+pub mod c_abi;
 pub mod channel;
 pub mod debug;
 pub mod devfs;

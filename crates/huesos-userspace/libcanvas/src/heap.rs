@@ -3,35 +3,35 @@
 //! This is the piece that turns the platform-independent allocator
 //! core into the process's `#[global_allocator]`:
 //!
-//! - [`HeapWindow`] implements `huesos_scudo::backend::Backend` over
-//!   the kernel's `VmarHeapExtend` syscall, so the allocator commits
-//!   and decommits real pages inside the process's reserved window;
-//! - [`ScudoHeap`] wraps the allocator in the interior mutability
-//!   `GlobalAlloc` requires and enforces the "initialise before
-//!   first allocation" contract.
-//!
-//! ## Threading
-//!
-//! HuesOS ring-3 programs are single-threaded: `ThreadCreate` is
-//! issued only by the process launcher and there is no TLS. The
-//! `Sync` impl below rests on that. When userspace threads arrive,
-//! this type — not the allocator core — is where a lock or a
-//! per-thread cache registry belongs.
+//! - In `local-heap` mode (static services and `libcanvas.so`),
+//!   [`HeapWindow`] implements `huesos_scudo::backend::Backend` over
+//!   `VmarHeapExtend` and [`ScudoHeap`] embeds the `Allocator`.
+//! - In `dyn-client` mode, [`ScudoHeap`] is a thin zero-sized proxy
+//!   forwarding allocations to `libcanvas.so` (`canvas_alloc` / `canvas_free`),
+//!   where `libcanvas.so`'s `.init_array` constructor initialises the single
+//!   process-wide Scudo instance once before `_start`.
 
 use core::alloc::{GlobalAlloc, Layout};
+
+#[cfg(feature = "local-heap")]
 use core::cell::UnsafeCell;
 
+#[cfg(feature = "local-heap")]
 use huesos_scudo::backend::{Backend, BackendError};
+#[cfg(feature = "local-heap")]
 use huesos_scudo::Allocator;
 
+#[cfg(feature = "local-heap")]
 use crate::memory;
 
 /// A [`Backend`] over this process's kernel-reserved heap window.
+#[cfg(feature = "local-heap")]
 pub struct HeapWindow {
     base: usize,
     size: usize,
 }
 
+#[cfg(feature = "local-heap")]
 impl HeapWindow {
     /// Describe the process's full heap window.
     pub const fn new() -> Self {
@@ -42,6 +42,7 @@ impl HeapWindow {
     }
 }
 
+#[cfg(feature = "local-heap")]
 impl Default for HeapWindow {
     fn default() -> Self {
         Self::new()
@@ -53,6 +54,7 @@ impl Default for HeapWindow {
 // `heap_commit` returns only after the range is mapped RW and zeroed,
 // and `heap_decommit` unmaps exactly the range it is given inside
 // that same window.
+#[cfg(feature = "local-heap")]
 unsafe impl Backend for HeapWindow {
     fn base(&self) -> usize {
         self.base
@@ -83,11 +85,14 @@ unsafe impl Backend for HeapWindow {
 ///
 /// Declare one as the `#[global_allocator]` and call
 /// [`ScudoHeap::init`] once, early in `main`, before the first
-/// allocation.
+/// allocation (for dynamic binaries linked against `libcanvas.so`, the shared
+/// library's `.init_array` constructor runs `init` automatically before `_start`).
+#[cfg(feature = "local-heap")]
 pub struct ScudoHeap {
     inner: UnsafeCell<Option<Allocator<HeapWindow>>>,
 }
 
+#[cfg(feature = "local-heap")]
 impl ScudoHeap {
     /// Create an uninitialised heap.
     pub const fn new() -> Self {
@@ -97,7 +102,7 @@ impl ScudoHeap {
     }
 
     /// Initialise the allocator, seeding its header cookie from
-    /// kernel entropy.
+    /// kernel entropy. Idempotent if already initialised.
     ///
     /// Returns `false` if entropy was unavailable or the allocator
     /// refused the cookie. The caller must treat that as fatal: an
@@ -106,9 +111,12 @@ impl ScudoHeap {
     /// anyway.
     ///
     /// # Safety
-    /// Must be called at most once, before any allocation, and
-    /// before any additional thread exists.
+    /// Must be called at most once before any concurrent access or
+    /// additional threads exist.
     pub unsafe fn init(&self) -> bool {
+        if self.is_initialised() {
+            return true;
+        }
         let cookie = match memory::random_u64() {
             Ok(value) if value != 0 => value,
             _ => return false,
@@ -117,8 +125,7 @@ impl ScudoHeap {
             Ok(allocator) => allocator,
             Err(_) => return false,
         };
-        // SAFETY: called once before any other access, per the
-        // function's contract.
+        // SAFETY: called before any other access, per the function's contract.
         unsafe {
             *self.inner.get() = Some(allocator);
         }
@@ -131,6 +138,18 @@ impl ScudoHeap {
         unsafe { (*self.inner.get()).is_some() }
     }
 
+    /// Query usable bytes for a live allocation returned by this heap.
+    ///
+    /// # Safety
+    /// `ptr` must be a live non-null pointer previously returned by this heap.
+    #[cfg(feature = "c-abi")]
+    pub(crate) unsafe fn usable_size(&self, ptr: *mut u8) -> Option<usize> {
+        // SAFETY: single-threaded process; borrow does not escape.
+        let slot = unsafe { &mut *self.inner.get() };
+        slot.as_mut()
+            .and_then(|allocator| unsafe { allocator.usable_size(ptr) }.ok())
+    }
+
     /// Runtime counters, or `None` before initialisation.
     pub fn stats(&self) -> Option<huesos_scudo::Stats> {
         // SAFETY: single-threaded process; read-only access.
@@ -138,6 +157,7 @@ impl ScudoHeap {
     }
 }
 
+#[cfg(feature = "local-heap")]
 impl Default for ScudoHeap {
     fn default() -> Self {
         Self::new()
@@ -147,12 +167,14 @@ impl Default for ScudoHeap {
 // SAFETY: HuesOS ring-3 processes are single-threaded (see the
 // module docs). The `UnsafeCell` is never accessed concurrently
 // because no second thread exists to access it.
+#[cfg(feature = "local-heap")]
 unsafe impl Sync for ScudoHeap {}
 
 // SAFETY: `alloc`/`dealloc` uphold the GlobalAlloc contract: they
 // return either null or a pointer to `layout.size()` writable bytes
 // aligned to `layout.align()`, and `dealloc` is only ever called
 // with a pointer this allocator returned.
+#[cfg(feature = "local-heap")]
 unsafe impl GlobalAlloc for ScudoHeap {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         // SAFETY: single-threaded; the mutable borrow does not
@@ -174,16 +196,66 @@ unsafe impl GlobalAlloc for ScudoHeap {
         // SAFETY: single-threaded; borrow does not escape.
         let slot = unsafe { &mut *self.inner.get() };
         if let Some(allocator) = slot {
-            // The Rust language contract makes an invalid pointer
-            // here caller UB, and `dealloc` cannot report an error.
-            // The allocator still validates the header and refuses
-            // to act on a corrupt one, so a bad free is contained
-            // (counted in `stats()`) rather than corrupting the
-            // heap — which is the whole point of the port.
             // SAFETY: `GlobalAlloc::dealloc` requires the caller to
             // pass a pointer from this allocator, which is exactly
             // `deallocate`'s contract.
             let _ = unsafe { allocator.deallocate(ptr) };
         }
+    }
+}
+
+#[cfg(not(feature = "local-heap"))]
+#[link(name = "canvas", kind = "dylib")]
+unsafe extern "C" {
+    fn canvas_heap_init() -> i64;
+    fn canvas_heap_is_initialised() -> u8;
+    fn canvas_alloc(size: usize, align: usize) -> *mut u8;
+    fn canvas_free(ptr: *mut u8);
+}
+
+/// Thin proxy to `libcanvas.so`'s single process-wide Scudo heap.
+#[cfg(not(feature = "local-heap"))]
+pub struct ScudoHeap;
+
+#[cfg(not(feature = "local-heap"))]
+impl ScudoHeap {
+    /// Create a proxy handle to `libcanvas.so`'s global heap.
+    pub const fn new() -> Self {
+        Self
+    }
+
+    /// Ensure `libcanvas.so`'s Scudo heap is initialised (idempotent).
+    ///
+    /// # Safety
+    /// Same single-threaded initialisation contract as the embedded heap.
+    pub unsafe fn init(&self) -> bool {
+        // SAFETY: C ABI call into `libcanvas.so`.
+        unsafe { canvas_heap_init() == 0 }
+    }
+
+    /// Whether `libcanvas.so`'s Scudo heap is initialised.
+    pub fn is_initialised(&self) -> bool {
+        // SAFETY: C ABI call into `libcanvas.so`.
+        unsafe { canvas_heap_is_initialised() != 0 }
+    }
+}
+
+#[cfg(not(feature = "local-heap"))]
+impl Default for ScudoHeap {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(not(feature = "local-heap"))]
+unsafe impl GlobalAlloc for ScudoHeap {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        // SAFETY: delegates to `libcanvas.so`'s GlobalAlloc-compatible allocator.
+        unsafe { canvas_alloc(layout.size(), layout.align()) }
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, _layout: Layout) {
+        // SAFETY: `ptr` came from `canvas_alloc` in `libcanvas.so`.
+        unsafe { canvas_free(ptr) }
     }
 }

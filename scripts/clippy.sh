@@ -26,6 +26,18 @@ for name in driver-manager terminal doom fault-probe bootfs input-host nvme-host
 done
 
 (
+    cd crates/huesos-userspace/libcanvas
+    cargo clippy --release --target ../x86_64-huesos-userspace.json \
+        -Z build-std=core,compiler_builtins,alloc -Z build-std-features=compiler-builtins-mem -Z json-target-spec -- -D warnings
+    cargo clippy --release --no-default-features --features dyn-client \
+        --target ../x86_64-huesos-userspace-dyn.json \
+        -Z build-std=core,compiler_builtins,alloc -Z build-std-features=compiler-builtins-mem -Z json-target-spec -- -D warnings
+    cargo clippy --release --features c-abi \
+        --target ../x86_64-huesos-userspace-dyn.json \
+        -Z build-std=core,compiler_builtins,alloc -Z build-std-features=compiler-builtins-mem -Z json-target-spec -- -D warnings
+)
+
+(
     cd crates/huesos-userspace/init
     HUESOS_DRIVER_MANAGER_PATH="$TMP/driver-manager" \
     HUESOS_TERMINAL_PATH="$TMP/terminal" \
