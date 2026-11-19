@@ -360,6 +360,27 @@ pub extern "C" fn _start() -> ! {
         // the first pixels the terminal presents do not race init's
         // last present.
         send_frame_draw_capability(&mut logger, channel, "terminal", &frame_draw);
+
+        // Boot gate: a *second* graphics consumer (doom) must still be able to
+        // duplicate the same installed handle. A one-shot handoff used to close
+        // the slot right after the terminal and nothing in the boot path
+        // noticed until someone actually launched Doom by hand.
+        match frame_draw.duplicate(
+            libcanvas::rights::DUPLICATE
+                | libcanvas::rights::TRANSFER
+                | libcanvas::rights::READ
+                | libcanvas::rights::WRITE,
+        ) {
+            Ok(probe) => {
+                drop(probe);
+                init_logln!(logger, "[init] FrameDraw duplicate self-check OK");
+            }
+            Err(error) => init_logln!(
+                logger,
+                "[init] FrameDraw duplicate self-check FAILED: {}",
+                error.as_str()
+            ),
+        }
     }
 
     if boot_failed {

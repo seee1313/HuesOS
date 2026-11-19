@@ -165,6 +165,7 @@ required+=(
     '[hsh] @caps(hxfs=none,bootfs=none) enforcement OK'
     '[hsh] consecutive spawn stress OK (30 spawns)'
     '[terminal] keyboard service online, starting /bin/hsh.elf session'
+    '[init] FrameDraw duplicate self-check OK'
     '[init] stage selftest ok'
     '[init] stage summary ok selftest'
     '[init] stage summary ok terminal'
@@ -190,6 +191,8 @@ done
 # — the historical bug shape where CI stayed green because we only
 # checked positive early-boot markers.
 regressions=(
+    '[init] FrameDraw duplicate self-check FAILED:'
+    '[init] FrameDraw duplicate for '
     '[driver-manager] input DriverHost did not become ready in time'
     '[driver-manager] keyboard service requested before ready'
     '[driver-manager] ACPI manager restart budget exhausted'

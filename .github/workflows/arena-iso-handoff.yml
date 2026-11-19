@@ -2,8 +2,9 @@ name: arena-iso-handoff
 
 # Temporary hand-off workflow for an Arena session whose sandbox cannot reach
 # crates.io / static.rust-lang.org. It builds the release ISO on a GitHub
-# runner and publishes the compressed image back into this branch so the
-# session can fetch it over git. Delete this file when the session ends.
+# runner, runs the real boot smoke gate, and publishes the compressed image and
+# the serial log back into this branch so the session can fetch them over git.
+# Delete this file when the session ends.
 
 on:
   push:
@@ -21,7 +22,7 @@ concurrency:
 jobs:
   build-iso:
     runs-on: ubuntu-24.04
-    timeout-minutes: 90
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -33,20 +34,36 @@ jobs:
             --component rust-src,llvm-tools-preview
           rustup default nightly-2026-03-01
 
-      - name: Install ISO tooling
+      - name: Install ISO and QEMU tooling
         run: |
           sudo apt-get update -qq
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y xorriso
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            xorriso qemu-system-x86
 
       - name: Build release kernel + ISO
         env:
           CARGO_BUILD_JOBS: "2"
         run: make iso PROFILE=release
 
+      - name: Boot smoke gate (release, SMP2, ecam)
+        id: smoke
+        continue-on-error: true
+        env:
+          CARGO_BUILD_JOBS: "2"
+        run: |
+          set +e
+          bash scripts/ci-qemu-smoke.sh release 2 240 ecam
+          status=$?
+          echo "status=$status" >> "$GITHUB_OUTPUT"
+          exit 0
+
       - name: Collect image and boot log
         run: |
           set -euo pipefail
           mkdir -p ci-artifacts/arena-iso
+          cp ci-artifacts/qemu-release-smp2.log ci-artifacts/arena-iso/qemu-smoke.log || true
+          echo "smoke_status=${{ steps.smoke.outputs.status }}" \
+            > ci-artifacts/arena-iso/smoke-status.txt
           ls -l build/huesos.iso
           sha256sum build/huesos.iso | tee ci-artifacts/arena-iso/huesos.iso.sha256
           xz -T0 -6 -k build/huesos.iso
@@ -69,5 +86,12 @@ jobs:
             echo "nothing to publish"
             exit 0
           fi
-          git commit -m "chore(arena): publish built HuesOS release ISO [skip ci]"
+          git commit -m "chore(arena): publish built HuesOS release ISO and smoke log [skip ci]"
           git push origin "HEAD:${GITHUB_REF_NAME}"
+
+      - name: Fail when the boot gate failed
+        if: steps.smoke.outputs.status != '0' && steps.smoke.outputs.status != '124'
+        run: |
+          echo "boot smoke gate failed with status ${{ steps.smoke.outputs.status }}" >&2
+          tail -200 ci-artifacts/arena-iso/qemu-smoke.log >&2 || true
+          exit 1
