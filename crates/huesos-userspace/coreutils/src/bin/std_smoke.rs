@@ -57,7 +57,10 @@ fn run() -> i32 {
     // TEMPORARY tracing: stderr is the stream the shell smoke definitely
     // captures, so every step reports there while this is being brought up.
     let mut out = io::stdout();
-    let _ = io::write_all(&mut out, b"[std] direct stdout write OK\n");
+    match io::write_all(&mut out, b"[std] direct stdout write OK\n") {
+        Ok(()) => eprintln!("[std] trace: stdout write ok"),
+        Err(error) => eprintln!("[std] trace: stdout write err {error:?}"),
+    }
     eprintln!("[std] trace: begin");
     eprintln!("[std] entry OK (naked _start, ScudoHeap, panic handler)");
     eprintln!("[std] trace: println done");
@@ -431,7 +434,7 @@ fn check_fs() -> u32 {
 fn check_buffered() -> u32 {
     let mut failures = 0u32;
     let mut sink = Sink { bytes: Vec::new() };
-    let mut writer = io::BufWriter::with_capacity(64, &mut sink);
+    let mut writer = io::BufWriter::with_capacity(128, &mut sink);
     for _ in 0..10 {
         let _ = io::write_all(&mut writer, b"line 7\n");
     }
@@ -692,7 +695,10 @@ fn check_process() -> u32 {
             );
         }
         Err(error) => {
+            // A shell-spawned script inherits no `PROCESS_SPAWN`-style authority,
+            // so this is a skip, not a pass: report it and stop here.
             eprintln!("[std] process SKIP (cannot spawn: {error})");
+            return failures;
         }
     }
     if failures == 0 {

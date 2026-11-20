@@ -271,7 +271,7 @@ impl Instant {
     /// Time since this instant, saturating at zero if the clock went backwards
     /// (it cannot, but a wrapping counter would look like it).
     pub fn elapsed(&self) -> Duration {
-        self.duration_since(*self)
+        Instant::now().duration_since(*self)
     }
 
     /// `now - self`.

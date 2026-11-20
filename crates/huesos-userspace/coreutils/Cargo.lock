@@ -15,15 +15,9 @@ name = "huesos-coreutils"
 version = "0.1.0"
 dependencies = [
  "huesos-abi",
+ "huesos-gpt",
+ "huesos-hxfs",
  "huesos-std",
- "libcanvas",
-]
-
-[[package]]
-name = "huesos-std"
-version = "0.1.0"
-dependencies = [
- "huesos-abi",
  "libcanvas",
 ]
 
@@ -35,16 +29,39 @@ dependencies = [
 ]
 
 [[package]]
+name = "huesos-gpt"
+version = "0.1.0"
+
+[[package]]
+name = "huesos-hxfs"
+version = "0.1.0"
+dependencies = [
+ "huesos-abi",
+]
+
+[[package]]
+name = "huesos-std"
+version = "0.1.0"
+dependencies = [
+ "huesos-abi",
+ "libcanvas",
+ "spin",
+]
+
+[[package]]
 name = "libcanvas"
 version = "0.1.0"
 dependencies = [
  "huesos-abi",
  "huesos-blobfs",
  "huesos-elf",
+ "spin",
 ]
 
 [[package]]
 name = "log"
 version = "0.4.35"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5d15f86d12da44cd8d4ec3c73984537eb7f4cadcb9776a575a0a8a05ca11005c"
+
+[[package]]
+name = "spin"
+version = "0.9.9"
