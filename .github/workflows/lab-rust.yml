@@ -35,6 +35,10 @@ jobs:
       - name: Install the pinned nightly
         run: |
           set +e
+          # The container runs as root but the runner exports HOME=/github/home;
+          # rustup refuses the mismatch, so pin HOME for every step that touches
+          # the toolchain.
+          export HOME=/root
           (
             curl -sSf https://sh.rustup.rs -o /tmp/rustup.sh &&
             sh /tmp/rustup.sh -y --profile minimal --default-toolchain none &&
@@ -50,6 +54,7 @@ jobs:
       - name: Pack it
         run: |
           set -euo pipefail
+          export HOME=/root
           TC="$HOME/.rustup/toolchains/nightly-2026-03-01-x86_64-unknown-linux-gnu"
           rm -rf "$TC/share/doc" "$TC/share/man" "$TC/lib/rustlib/etc" \
             "$TC/lib/rustlib/components"
