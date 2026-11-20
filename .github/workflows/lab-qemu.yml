@@ -1,0 +1,60 @@
+name: lab-qemu
+
+# TEMPORARY (this branch only): pack qemu-system-x86_64 with the shared
+# libraries it needs and publish it to a throwaway branch, because this sandbox
+# cannot reach the distro mirrors to install it.
+on:
+  workflow_dispatch:
+  push:
+    branches: ["arena/97bee4dc-huesos"]
+
+permissions:
+  contents: write
+
+jobs:
+  pack:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          persist-credentials: true
+
+      - name: Install qemu
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qemu-system-x86 ovmf 2>&1 | tail -5
+          qemu-system-x86_64 --version
+
+      - name: Bundle binary and libraries
+        run: |
+          set -eux
+          mkdir -p bundle/bin bundle/lib bundle/share
+          cp "$(command -v qemu-system-x86_64)" bundle/bin/
+          cp "$(command -v qemu-img)" bundle/bin/ 2>/dev/null || true
+          # Every shared object the binary loads, flattened into bundle/lib.
+          for exe in bundle/bin/*; do
+            ldd "$exe" | awk '{print $3}' | grep -E '^/' || true
+          done | sort -u | while read -r lib; do
+            cp -L "$lib" bundle/lib/ || true
+          done
+          cp -rL /usr/share/qemu bundle/share/ 2>/dev/null || true
+          cp -rL /usr/share/seabios bundle/share/ 2>/dev/null || true
+          du -sh bundle
+
+      - name: Split and publish
+        run: |
+          set -eux
+          tar --zstd -cf qemu.tar.zst -C bundle .
+          split -b 20M -a 2 qemu.tar.zst part-
+          sha256sum part-* > SHA256SUMS
+          mkdir publish && mv part-* SHA256SUMS publish/
+          cd publish
+          git init -q
+          git checkout -q -b lab/qemu
+          git config user.name huesos-lab
+          git config user.email lab@huesos.invalid
+          git add -A
+          git commit -q -m "lab: qemu-system-x86_64 bundle for the dev sandbox"
+          URL="https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git"
+          git push -q --force "$URL" HEAD:refs/heads/lab/qemu
