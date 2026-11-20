@@ -1,0 +1,62 @@
+name: lab-diag
+
+# TEMPORARY (this branch only): the job logs of this repository live on a blob
+# host the sandbox cannot reach, so a failing step is invisible from here. This
+# workflow re-runs the interesting commands and turns their output into an
+# annotation, which the sandbox *can* read. Removed once the round is green.
+on:
+  workflow_dispatch:
+  push:
+    branches: ["arena/14dbccbc-huesos"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: lab-diag
+  cancel-in-progress: true
+
+jobs:
+  diag:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            gcc xorriso qemu-system-x86
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install nightly-2026-03-01 --profile minimal \
+            --component rust-src,llvm-tools-preview,rustfmt,clippy
+          rustup default nightly-2026-03-01
+      - name: Clippy
+        run: |
+          set +e
+          make clippy > /tmp/clippy.log 2>&1
+          status=$?
+          if [ "$status" -ne 0 ]; then
+            message=$(tail -c 6000 /tmp/clippy.log | tr '\n' '|' | sed 's/%/%25/g')
+            echo "::error title=clippy-status::exit ${status}"
+            echo "::error title=clippy-log::${message}"
+            exit "$status"
+          fi
+      - name: QEMU nvme smoke (debug, 2)
+        env:
+          CARGO_BUILD_JOBS: "1"
+          ARTIFACT_DIR: ci-artifacts
+        run: |
+          set +e
+          bash scripts/ci-qemu-smoke.sh debug 2 120 > /tmp/qemu.log 2>&1
+          status=$?
+          if [ "$status" -ne 0 ]; then
+            message=$(tail -c 6000 /tmp/qemu.log | tr '\n' '|' | sed 's/%/%25/g')
+            echo "::error title=qemu-status::exit ${status}"
+            echo "::error title=qemu-log::${message}"
+            serial=$(ls ci-artifacts/* 2>/dev/null | head -5)
+            echo "::error title=qemu-artifacts::${serial}"
+            tail -c 4000 ci-artifacts/*serial* 2>/dev/null | tr '\n' '|' | sed 's/^/::error title=serial::/' || true
+            exit "$status"
+          fi
