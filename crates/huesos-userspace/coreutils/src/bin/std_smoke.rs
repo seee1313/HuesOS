@@ -402,7 +402,9 @@ fn check_fs() -> u32 {
     // Usage is a walk of the tree plus, when the volume service is reachable,
     // the capacity it owns; either half may be missing in a sandbox.
     let used = fs::used_bytes("/").map(|bytes| alloc::format!("{bytes}"));
-    let capacity = fs::capacity_bytes().map(|bytes| alloc::format!("{bytes}"));
+    let capacity = huesos_coreutils::disk::DiskIo::open(None, false)
+        .ok()
+        .map(|io| alloc::format!("{}", io.capacity_bytes()));
     println!(
         "[std] fs OK (create/write/seek/read/overwrite/truncate/list/remove/gpt) \
          used={} capacity={}",

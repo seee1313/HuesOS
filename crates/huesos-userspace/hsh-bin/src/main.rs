@@ -960,7 +960,7 @@ impl InteractiveShell {
             self.host.bootfs.is_some()
         );
         match smoke_env.eval_script("df", &mut self.host) {
-            Ok(res) if res.status == 0 && res.render_text().contains("Filesystem") => {
+            Ok(res) if res.status == 0 && res.render_text().contains("hxfs") => {
                 println!("[hsh] df table OK");
             }
             Ok(res) => println!(
@@ -969,6 +969,20 @@ impl InteractiveShell {
                 res.render_text()
             ),
             Err(e) => println!("[hsh] df ERROR: {}", e),
+        }
+
+        // 10e. `/bin/lsblk.elf` reads the block device the shell was granted and
+        //      names what it finds. It is the read-only counterpart of
+        //      `mkfs.elf`/`fsck.elf`, so a clean listing here means the device
+        //      capability, the HxFS superblock probe and the table formatting
+        //      all work from a spawned binary.
+        match smoke_env.eval_script("lsblk -f", &mut self.host) {
+            Ok(res) if res.status == 0 && res.render_text().contains("NAME") => {
+                println!("[hsh] lsblk OK");
+            }
+            Ok(res) if res.status != 0 => println!("[hsh] lsblk SKIP (no block device)"),
+            Ok(res) => println!("[hsh] lsblk FAILED out={}", res.render_text()),
+            Err(e) => println!("[hsh] lsblk ERROR: {}", e),
         }
 
         // 11. Bare `HxFS v7` volume (superfloppy) detection. Only meaningful on

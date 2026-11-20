@@ -20,7 +20,7 @@ extern crate alloc;
 use alloc::format;
 
 use huesos_coreutils as cu;
-use huesos_coreutils::disk::human_size;
+use huesos_coreutils::disk::{self, human_size};
 
 cu::coreutil_entry!(run);
 
@@ -67,13 +67,12 @@ fn run() -> i32 {
             return 1;
         }
     };
-    let capacity = match huesos_std::fs::capacity_bytes() {
-        Ok(bytes) => Some(bytes),
-        Err(_) => {
-            cu::errln("df: volume service unavailable, reporting usage only");
-            None
-        }
-    };
+    // Capacity comes from the granted block device: it is the same store the
+    // filesystem lives in and it needs no broker, so `df` reports a size on a
+    // host whose HxFS service is not reachable either.
+    let capacity = disk::DiskIo::open(None, false)
+        .ok()
+        .map(|io| io.capacity_bytes());
 
     if human {
         cu::outln(&format!(

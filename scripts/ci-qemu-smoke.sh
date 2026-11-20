@@ -208,6 +208,7 @@ required+=(
 if [[ -n "${HUESOS_SMOKE_NVME:-}" ]]; then
     required+=(
         '[hxfs] service started'
+        '[hsh] lsblk OK'
         '[hsh] fdisk raw-hxfs list OK'
         '[hsh] fdisk raw-hxfs dry-run OK'
         '[hsh] fdisk raw-hxfs gpt-init guard OK'

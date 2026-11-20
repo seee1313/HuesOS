@@ -582,17 +582,3 @@ pub fn used_bytes(root: &str) -> Result<u64> {
     }
     Ok(total)
 }
-
-/// Capacity of the system volume in bytes.
-///
-/// The HxFS protocol has no `statfs`: `GetInfo` reports object identity, not a
-/// free-block map, so the filesystem cannot answer this. The `Volume` service
-/// that owns the block range can, and reaching it takes the registry channel
-/// (`CapKind::Registry`). The handle is consumed, so ask once per process.
-pub fn capacity_bytes() -> Result<u64> {
-    let handle = take_cap_handle(CapKind::Registry).ok_or_else(Error::capability)?;
-    let registry = Channel::from_handle(handle);
-    let mut volume = libcanvas::Volume::open_system(&registry).map_err(Error::from)?;
-    let info = volume.info().map_err(Error::from)?;
-    Ok(u64::from(info.block_size).saturating_mul(info.block_count))
-}
