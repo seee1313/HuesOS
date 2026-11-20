@@ -2134,6 +2134,53 @@ pub unsafe extern "C" fn canvas_stdin_read(
     }
 }
 
+/// Park the calling thread on the futex word at `uaddr` while it holds
+/// `expected`.
+///
+/// Returns `0` when woken or when the word already differed, `-HuesOS`
+/// [`ErrorCode::TimedOut`] when `timeout_ticks` elapsed first (`0` means
+/// "wait forever"), and `-HuesOS InvalidArgs` for a word that is not a
+/// readable, 4-byte-aligned address inside the calling process.
+///
+/// # Safety
+/// `uaddr` must point at a live, 4-byte-aligned `uint32_t` owned by the
+/// calling process. The kernel only reads it, and reads it recoverably, but
+/// the caller must make the surrounding compare protocol atomic (use
+/// `_Atomic` or an atomic builtin) for the futex to be sound.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn canvas_futex_wait(
+    uaddr: *const u32,
+    expected: u32,
+    timeout_ticks: u64,
+) -> i64 {
+    if uaddr.is_null() {
+        return err_code(ErrorCode::InvalidArgs);
+    }
+    let ret = raw::syscall3(Syscall::FutexWait, uaddr as u64, expected as u64, timeout_ticks);
+    match raw::decode(ret) {
+        Ok(_) => 0,
+        Err(err) => err_code(err),
+    }
+}
+
+/// Wake up to `max_wake` threads parked on the futex word at `uaddr`,
+/// returning the number woken (never negative) or a negative
+/// [`ErrorCode`] for a misaligned pointer.
+///
+/// Waking does not dereference `uaddr`, so it stays valid for a word whose
+/// page was unmapped after the waiters parked.
+///
+/// # Safety
+/// `uaddr` must be a 4-byte-aligned address; it need not be readable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn canvas_futex_wake(uaddr: *const u32, max_wake: u32) -> i64 {
+    let ret = raw::syscall2(Syscall::FutexWake, uaddr as u64, max_wake as u64);
+    match raw::decode(ret) {
+        Ok(woken) => woken,
+        Err(err) => err_code(err),
+    }
+}
+
 /// Write `len` bytes from `data` to `stdout` in `4096`-byte chunks.
 ///
 /// # Safety

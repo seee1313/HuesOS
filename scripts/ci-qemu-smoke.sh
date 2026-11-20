@@ -123,6 +123,7 @@ required=(
     '[dyn-c-smoke] PASS'
     '[dyn-c-smoke] atexit OK'
     '[dyn-rust-smoke] PASS'
+    '[dyn-rust-smoke] futex OK (compare, park+timeout, cross-thread wake)'
     '[dyn-rust-smoke] atexit OK'
     '[init] dynamic linking smoke OK'
     '[key-broker] kernel key moved; state=plain-only'

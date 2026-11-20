@@ -11,6 +11,8 @@
 
 extern crate alloc;
 
+mod futex_smoke;
+
 use alloc::vec::Vec;
 use core::cell::Cell;
 use core::ffi::c_void;
@@ -183,6 +185,13 @@ extern "C" fn rust_smoke_main() -> ! {
     if WORKER_TLS.get() != 0x1000 {
         libcanvas::println!("[dyn-rust-smoke] FAIL: main TLS clobbered");
         process::exit(12);
+    }
+
+    // Futex primitives: compare, park with a deadline, and a cross-thread
+    // wake. Runs before `drop(plugin)` so the process is still fully loaded.
+    if let Some(code) = futex_smoke::run() {
+        libcanvas::println!("[dyn-rust-smoke] FAIL: futex smoke (code {})", code);
+        process::exit(20 + code as i32);
     }
 
     drop(plugin);

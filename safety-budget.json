@@ -65,6 +65,7 @@
     "crates/huesos-userspace/acpi-manager/src/main.rs": 1,
     "crates/huesos-userspace/doom/src/main.rs": 9,
     "crates/huesos-userspace/driver-host-nvme/src/main.rs": 3,
+    "crates/huesos-userspace/dyn-rust-smoke/src/futex_smoke.rs": 1,
     "crates/huesos-userspace/dyn-rust-smoke/src/main.rs": 6,
     "crates/huesos-userspace/fault-probe/src/main.rs": 4,
     "crates/huesos-userspace/hxfs-service/src/main.rs": 1,

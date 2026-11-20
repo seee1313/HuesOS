@@ -73,6 +73,7 @@ pub mod dl;
 mod font6x13;
 mod font8x8;
 pub mod framebuffer;
+pub mod futex;
 pub mod handle;
 pub mod heap;
 pub mod hxfs;

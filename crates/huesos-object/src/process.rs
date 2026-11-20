@@ -8,6 +8,7 @@ use alloc::vec::Vec;
 use core::any::Any;
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
+use crate::futex::{FutexNode, FutexTable};
 use crate::wait::WaitQueue;
 use crate::{
     alloc_koid, root_job, HandleTable, Job, KernelObject, Koid, ObjectType, Port, PortPacket,
@@ -51,6 +52,10 @@ pub struct Process {
     lifecycle: IrqSafeMutex<ProcessLifecycle>,
     /// Waiters blocked in `ProcessWait` until this process exits.
     pub exit_waiters: WaitQueue,
+    /// Futex wait queues, keyed by user virtual address. Scoped to this
+    /// process because only this process has that address space; dropping
+    /// the process drops every queue with it.
+    futex: FutexTable,
     /// Ports that receive one packet when this process exits.
     exit_ports: IrqSafeMutex<Vec<ExitPortBinding>>,
     /// Serializes validated kernel copies with VMAR mutation operations.
@@ -105,6 +110,7 @@ impl Process {
             job,
             lifecycle: IrqSafeMutex::new(ProcessLifecycle::new(koid.0, koid.0)),
             exit_waiters: WaitQueue::new(),
+            futex: FutexTable::new(),
             exit_ports: IrqSafeMutex::new(Vec::new()),
             user_memory_lock: IrqSafeMutex::new(()),
             address_space: IrqSafeMutex::new(None),
@@ -115,6 +121,23 @@ impl Process {
             active_threads: AtomicUsize::new(0),
             critical: AtomicBool::new(false),
         })
+    }
+
+    /// Register a futex waiter on `uaddr` and return its node.
+    ///
+    /// Pair every call with [`Self::futex_release`].
+    pub fn futex_acquire(&self, uaddr: u64) -> Arc<FutexNode> {
+        self.futex.acquire(uaddr)
+    }
+
+    /// Drop a futex waiter registered by [`Self::futex_acquire`].
+    pub fn futex_release(&self, uaddr: u64, node: &Arc<FutexNode>) {
+        self.futex.release(uaddr, node);
+    }
+
+    /// Wake up to `max_wake` futex waiters on `uaddr`.
+    pub fn futex_wake(&self, uaddr: u64, max_wake: u32) -> usize {
+        self.futex.wake(uaddr, max_wake)
     }
 
     /// Mark this process as critical (see the `critical` field docs).

@@ -27,6 +27,7 @@ mod supervision;
 mod thread;
 mod vmar;
 mod vmo;
+pub mod futex;
 pub mod wait;
 
 pub mod boot_key;
@@ -53,6 +54,7 @@ pub use interrupt::{
     InterruptRouteAcknowledgeFn, InterruptRouteAcquireFn, InterruptRouteKind,
     InterruptRouteReleaseFn,
 };
+pub use futex::{FutexNode, FutexTable};
 pub use job::{flush_pending_quota_notifications, Job};
 pub use koid::{alloc_koid, Koid};
 pub use object::{KernelObject, KernelObjectExt, ObjectType};

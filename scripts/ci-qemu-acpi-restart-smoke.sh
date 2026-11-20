@@ -96,7 +96,11 @@ case "$scenario" in
             '[driver-manager] ACPI manager unavailable; frozen restart 2/2 scheduled'
             '[driver-manager] ACPI manager restart budget exhausted; runtime ACPI degraded'
             '[driver-host:input] retained'
-            '[terminal] keyboard service online, starting shell'
+            # Prefix only: the suffix names the shell binary and has
+            # already drifted once (`starting shell` -> `starting
+            # /bin/hsh.elf session`), which turned this gate red on `main`
+            # after a message-only refactor.
+            '[terminal] keyboard service online'
             '[init] boot stages complete:'
         )
         forbidden=(

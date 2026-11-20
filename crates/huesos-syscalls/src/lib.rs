@@ -20,6 +20,7 @@ mod debug;
 mod device_lease;
 mod entropy;
 mod framebuffer;
+mod futex;
 mod handle;
 mod job;
 mod key;
@@ -249,5 +250,7 @@ pub fn dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> Syscal
         S::ThreadExit => process::sys_thread_exit(a1 as i64),
         S::ThreadWait => process::sys_thread_wait(a1 as HandleValue, a2 as *mut i64),
         S::ProcessTerminate => process::sys_process_terminate(a1 as HandleValue, a2 as i64),
+        S::FutexWait => futex::sys_futex_wait(a1, a2 as u32, a3),
+        S::FutexWake => futex::sys_futex_wake(a1, a2 as u32),
     }
 }
