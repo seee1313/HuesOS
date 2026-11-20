@@ -58,6 +58,7 @@ pub mod process;
 pub mod sync;
 pub mod thread;
 pub mod time;
+pub mod tui;
 
 pub use error::{Error, ErrorKind, Result};
 pub use libcanvas::heap::ScudoHeap;
