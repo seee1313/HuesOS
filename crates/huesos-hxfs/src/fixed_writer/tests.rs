@@ -1980,7 +1980,10 @@ fn random_offset_write_preserves_untouched_bytes() {
     // A protective-MBR-shaped write: sector 0 is 512 bytes.
     let sector = vec![0x5Au8; 512];
     assert!(fs.write_file_at(file, 512, &sector).is_ok());
-    assert_eq!(fs.file_handle(file.object_id).unwrap().size, (2 * BLOCK_SIZE) as u64);
+    assert_eq!(
+        fs.file_handle(file.object_id).unwrap().size,
+        (2 * BLOCK_SIZE) as u64
+    );
 
     let mut out = vec![0u8; 2 * BLOCK_SIZE];
     let Ok(read) = fs.read_file(file, &mut out) else {
@@ -1989,7 +1992,10 @@ fn random_offset_write_preserves_untouched_bytes() {
     };
     assert_eq!(read, 2 * BLOCK_SIZE);
     assert!(out[..512].iter().all(|&b| b == 0x11), "sector 0 untouched");
-    assert!(out[512..1024].iter().all(|&b| b == 0x5A), "sector 1 written");
+    assert!(
+        out[512..1024].iter().all(|&b| b == 0x5A),
+        "sector 1 written"
+    );
     assert!(
         out[1024..BLOCK_SIZE].iter().all(|&b| b == 0x11),
         "rest of block 0 preserved"
@@ -2095,7 +2101,9 @@ fn truncate_shrink_frees_blocks_and_grow_reads_as_zeros() {
 
     // And a random write into the grown (hole) region must not resurrect
     // old bytes around it.
-    assert!(fs.write_file_at(grown, (BLOCK_SIZE + 10) as u64, b"hello").is_ok());
+    assert!(fs
+        .write_file_at(grown, (BLOCK_SIZE + 10) as u64, b"hello")
+        .is_ok());
     let mut out2 = vec![0u8; 3 * BLOCK_SIZE];
     assert!(fs.read_file(grown, &mut out2).is_ok());
     assert_eq!(&out2[BLOCK_SIZE + 10..BLOCK_SIZE + 15], b"hello");

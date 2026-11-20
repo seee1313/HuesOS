@@ -41,7 +41,7 @@ const FUTEX_WORD_BYTES: usize = 4;
 /// checked again by the actual copy, so a race that unmaps the page between
 /// this check and the read is still handled recoverably.
 fn validate_word(uaddr: u64) -> Result<*const u32, ErrorCode> {
-    if uaddr % FUTEX_ALIGN != 0 {
+    if !uaddr.is_multiple_of(FUTEX_ALIGN) {
         return Err(ErrorCode::InvalidArgs);
     }
     user_memory::validate_range(uaddr, FUTEX_WORD_BYTES, false)?;
@@ -110,7 +110,7 @@ pub(crate) fn sys_futex_wait(uaddr: u64, expected: u32, timeout_ticks: u64) -> S
 /// dereferenced here, so waking must not fail because the page was unmapped
 /// after the waiters parked.
 pub(crate) fn sys_futex_wake(uaddr: u64, max_wake: u32) -> SyscallResult {
-    if uaddr % FUTEX_ALIGN != 0 {
+    if !uaddr.is_multiple_of(FUTEX_ALIGN) {
         return Err(ErrorCode::InvalidArgs);
     }
     let proc = current_proc()?;

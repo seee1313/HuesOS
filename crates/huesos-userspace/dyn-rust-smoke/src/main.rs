@@ -191,7 +191,7 @@ extern "C" fn rust_smoke_main() -> ! {
     // wake. Runs before `drop(plugin)` so the process is still fully loaded.
     if let Some(code) = futex_smoke::run() {
         libcanvas::println!("[dyn-rust-smoke] FAIL: futex smoke (code {})", code);
-        process::exit(20 + code as i32);
+        process::exit(20 + i64::from(code));
     }
 
     drop(plugin);

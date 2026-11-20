@@ -2029,8 +2029,8 @@ impl<
         let mut consumed = 0usize;
         while consumed < data.len() {
             let logical_block = cursor / BLOCK_SIZE_U64;
-            let within = usize::try_from(cursor % BLOCK_SIZE_U64)
-                .map_err(|_| HxfsError::OutOfRange)?;
+            let within =
+                usize::try_from(cursor % BLOCK_SIZE_U64).map_err(|_| HxfsError::OutOfRange)?;
             let chunk = core::cmp::min(BLOCK_SIZE - within, data.len() - consumed);
             let mut block_bytes = [0u8; BLOCK_SIZE];
             let whole_block = within == 0 && chunk == BLOCK_SIZE;
@@ -2040,7 +2040,8 @@ impl<
                 // the content a partially written block must keep; the
                 // explicit fill covers the bytes it does not report at all.
                 let mut existing = [0u8; BLOCK_SIZE];
-                let read = self.read_file_at(file, logical_block * BLOCK_SIZE_U64, &mut existing)?;
+                let read =
+                    self.read_file_at(file, logical_block * BLOCK_SIZE_U64, &mut existing)?;
                 block_bytes[..read].copy_from_slice(&existing[..read]);
             }
             block_bytes[within..within + chunk].copy_from_slice(&data[consumed..consumed + chunk]);
