@@ -138,6 +138,13 @@ pub const GUID_HXFS_V7: Guid = Guid::from_fields(
     0x4855,
     [0x45, 0x53, 0x4f, 0x53, 0x56, 0x37, 0x47, 0x50],
 );
+/// Raw on-disk bytes of [`GUID_HXFS_V7`].
+///
+/// Probe paths that only have to *recognise* the type — `hxfs-service`'s GPT
+/// mount probe compares 16 bytes and never builds a [`Guid`] — use this so
+/// there is exactly one definition of the HxFS partition type in the tree.
+pub const GUID_HXFS_V7_BYTES: [u8; 16] = GUID_HXFS_V7.0;
+
 /// EFI System Partition GUID (`C12A7328-F81F-11D2-BA4B-00A0C93EC93B`).
 pub const GUID_ESP: Guid = Guid::from_fields(
     0xC12A_7328,

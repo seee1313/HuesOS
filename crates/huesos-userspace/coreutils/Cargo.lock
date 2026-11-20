@@ -15,6 +15,15 @@ name = "huesos-coreutils"
 version = "0.1.0"
 dependencies = [
  "huesos-abi",
+ "huesos-std",
+ "libcanvas",
+]
+
+[[package]]
+name = "huesos-std"
+version = "0.1.0"
+dependencies = [
+ "huesos-abi",
  "libcanvas",
 ]
 

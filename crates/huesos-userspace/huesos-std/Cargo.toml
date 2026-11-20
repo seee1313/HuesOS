@@ -1,0 +1,22 @@
+[package]
+name = "huesos-std"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "huesos_std"
+path = "src/lib.rs"
+
+[dependencies]
+libcanvas = { path = "../libcanvas", default-features = false, features = ["dyn-client"] }
+huesos-abi = { path = "../../huesos-abi" }
+
+[profile.release]
+opt-level = 2
+panic = "abort"
+lto = false
+
+[profile.dev]
+panic = "abort"
+
+[workspace]

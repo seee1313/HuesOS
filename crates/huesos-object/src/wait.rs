@@ -165,6 +165,37 @@ impl WaitQueue {
         self.waiters.lock().retain(|&t| t != task);
     }
 
+    /// Wake up to `max` waiters, oldest first, returning how many were
+    /// woken. Also wakes all registered async wakers when at least one
+    /// task was woken (futures re-poll and re-check their own condition).
+    ///
+    /// This is the primitive behind `Syscall::FutexWake`, which wakes
+    /// `max_wake` threads rather than exactly one or all of them.
+    pub fn wake_up_to(&self, max: usize) -> usize {
+        if max == 0 {
+            return 0;
+        }
+        let woken: Vec<TaskId> = {
+            let mut w = self.waiters.lock();
+            let take = max.min(w.len());
+            w.drain(..take).collect()
+        };
+        let count = woken.len();
+        for id in woken {
+            wake_task(id);
+        }
+        if count > 0 {
+            let wakers: Vec<Waker> = {
+                let mut w = self.async_wakers.lock();
+                core::mem::take(&mut *w)
+            };
+            for waker in wakers {
+                waker.wake();
+            }
+        }
+        count
+    }
+
     /// Wake the oldest waiter, if any. Also wakes all registered
     /// async wakers so futures re-poll.
     pub fn wake_one(&self) {

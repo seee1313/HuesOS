@@ -10,11 +10,15 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use huesos_abi::auxv::caps_mask;
-use libcanvas::stdio::{
-    arg_str, args_count, caps_mask as proc_caps_mask, exit, stderr_str, stdin_read, stdout_str,
-    take_cap_handle, CapKind,
-};
+use libcanvas::stdio::{caps_mask as proc_caps_mask, take_cap_handle, CapKind};
 use libcanvas::{Channel, ErrorCode, Hxfs, HxfsDirectory, Vmo};
+
+// The runtime below is a thin, compatibility-preserving shell over
+// `huesos-std`: the signatures are what the `/bin` programs already call, and
+// the behaviour now lives in one place instead of being re-derived per crate.
+use huesos_std::{
+    env as std_env, fs as std_fs, io as std_io, path as std_path, process as std_proc,
+};
 
 const BOOTFS_HEADER_SIZE: u64 = 16;
 const BOOTFS_ENTRY_SIZE: u64 = 216;
@@ -23,45 +27,30 @@ const BOOTFS_MAGIC: &[u8; 8] = b"HBOOTFS1";
 
 /// Collect `argv[1..]` as owned UTF-8 strings.
 pub fn collect_args() -> Vec<String> {
-    let count = args_count();
-    let mut out = Vec::with_capacity(count.saturating_sub(1));
-    let mut buf = [0u8; 256];
-    for i in 1..count {
-        if let Some(s) = arg_str(i, &mut buf) {
-            out.push(String::from(s));
-        }
-    }
-    out
+    std_env::args()
 }
 
 /// Write UTF-8 text to `stdout`.
 pub fn out(s: &str) {
-    let _ = stdout_str(s);
+    let _ = std_io::write_all(&mut std_io::stdout(), s.as_bytes());
 }
 
 /// Write UTF-8 line to `stdout`.
 pub fn outln(s: &str) {
-    let _ = stdout_str(s);
-    let _ = stdout_str("\n");
+    out(s);
+    out("\n");
 }
 
 /// Write UTF-8 error line to `stderr`.
 pub fn errln(s: &str) {
-    let _ = stderr_str(s);
-    let _ = stderr_str("\n");
+    let _ = std_io::write_all(&mut std_io::stderr(), s.as_bytes());
+    let _ = std_io::write_all(&mut std_io::stderr(), b"\n");
 }
 
 /// Read all bytes from `stdin` until `PeerClosed` EOF.
 pub fn read_all_stdin() -> Vec<u8> {
     let mut all = Vec::new();
-    let mut buf = [0u8; 4096];
-    loop {
-        match stdin_read(&mut buf) {
-            Ok(0) => break,
-            Ok(n) => all.extend_from_slice(&buf[..n]),
-            Err(_) => break,
-        }
-    }
+    let _ = std_io::read_to_end(&mut std_io::stdin(), &mut all);
     all
 }
 
@@ -104,12 +93,12 @@ pub fn check_query_ro() -> Result<(), i32> {
 
 /// Take granted `Hxfs` service handle if present.
 pub fn take_hxfs() -> Option<Hxfs> {
-    take_cap_handle(CapKind::HxfsService).map(|h| Hxfs::from_channel(Channel::from_handle(h)))
+    std_fs::service()
 }
 
 /// Take granted `HxfsDirectory` handle if present.
 pub fn take_hxfs_dir() -> Option<HxfsDirectory> {
-    take_cap_handle(CapKind::HxfsDir).map(|h| HxfsDirectory::from_channel(Channel::from_handle(h)))
+    std_fs::directory()
 }
 
 /// Take granted `BOOTFS` VMO if present and permitted by `caps_mask`.
@@ -130,13 +119,13 @@ pub fn take_registry() -> Option<Channel> {
 
 /// Normalize a path relative to `/` (or `cwd` if supplied).
 pub fn normalize_path(raw: &str) -> String {
-    if raw.is_empty() {
-        return String::from("/");
-    }
-    if raw.starts_with('/') {
-        String::from(raw)
+    // `huesos_std::path::normalize` also collapses `.`/`..` and repeated
+    // separators, which the shell hands through verbatim.
+    let normalized = std_path::normalize(raw);
+    if std_path::is_absolute(&normalized) {
+        normalized
     } else {
-        format!("/{raw}")
+        std_path::join("/", &normalized)
     }
 }
 
@@ -218,7 +207,7 @@ pub fn run_registry_query(cmd_name: &str, req: &[u8]) -> i32 {
 
 /// Exit process cleanly, flushing stdio `PeerClosed` EOF.
 pub fn finish(code: i32) -> ! {
-    exit(code)
+    std_proc::exit(code)
 }
 
 /// Define SysV `_start`, `ScudoHeap` allocator, and panic handler for one coreutil binary.

@@ -59,9 +59,14 @@ path = "src/bin/ps.rs"
 name = "sleep"
 path = "src/bin/sleep.rs"
 
+[[bin]]
+name = "std-smoke"
+path = "src/bin/std_smoke.rs"
+
 [dependencies]
 libcanvas = { path = "../libcanvas", default-features = false, features = ["dyn-client"] }
 huesos-abi = { path = "../../huesos-abi" }
+huesos-std = { path = "../huesos-std" }
 
 [profile.release]
 opt-level = 2

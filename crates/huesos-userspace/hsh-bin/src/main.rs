@@ -865,10 +865,10 @@ impl InteractiveShell {
         //     live volume on the default target is never touched; the real
         //     GPT writer, its CRC recomputation and `verify` all run for real.
         //
-        //     Writing the same cycle to an image *file* inside HxFS is not
-        //     possible yet: the service write path accepts only a whole-file
-        //     rewrite or sequential 4 KiB appends, so the GPT writer's
-        //     `write_at(512)` comes back `Unsupported`.
+        //     The same cycle also has to work on a disk image stored as an
+        //     ordinary HxFS *file*: that is what needs random-offset writes
+        //     (GPT header at byte 512, entry array at 1024, backup header at
+        //     the end of the file) and it used to come back `Unsupported`.
         let image = " /dev/mem";
         let dry = smoke_env.eval_script(
             &format!("fdisk gpt-init{image} --dry-run --size 64M"),
@@ -889,6 +889,9 @@ impl InteractiveShell {
         let gpt_cycle = [
             format!("fdisk gpt-init{image} --size 64M"),
             format!("fdisk add{image} --type hxfs --size 16M"),
+            format!("fdisk verify{image}"),
+            format!("fdisk resize 1{image} --size 20M"),
+            format!("fdisk list{image}"),
             format!("fdisk verify{image}"),
             format!("fdisk del 1{image}"),
             format!("fdisk verify{image}"),
@@ -922,6 +925,25 @@ impl InteractiveShell {
         }
         if gpt_ok {
             println!("[hsh] fdisk gpt init/add/del/verify OK");
+        }
+
+        // 10c. `/bin/std-smoke.elf` runs the user-space standard library inside
+        //      the OS: `huesos_std::entry!`, streaming formatting, the path and
+        //      error helpers (pure, always run) and a real
+        //      create/write/seek/read/truncate/list/remove cycle on the mounted
+        //      volume. The binary prints its own `[std] FAIL` lines and only
+        //      reports PASS when every check held, so the status plus the
+        //      marker is the whole contract.
+        match smoke_env.eval_script("std-smoke", &mut self.host) {
+            Ok(res) if res.status == 0 && res.render_text().contains("[std] PASS") => {
+                println!("[hsh] huesos-std smoke OK");
+            }
+            Ok(res) => println!(
+                "[hsh] huesos-std smoke FAILED status={} out={}",
+                res.status,
+                res.render_text()
+            ),
+            Err(e) => println!("[hsh] huesos-std smoke ERROR: {}", e),
         }
 
         // 11. Bare `HxFS v7` volume (superfloppy) detection. Only meaningful on

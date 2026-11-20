@@ -1949,3 +1949,163 @@ fn hxblob_gc_crash_recovers_to_clean_gc_state() {
     };
     assert_eq!(bytes_b.as_slice(), payload_b as &[u8]);
 }
+
+/// Random-offset writes: a 512-byte sector write in the middle of a cached
+/// block must preserve every byte the caller did not touch. This is what
+/// lets `fdisk` operate on a disk image that is an ordinary HxFS file.
+#[test]
+fn random_offset_write_preserves_untouched_bytes() {
+    let Ok(mut seed) = HxfsWriter::new(INSTANCE, VOLUME) else {
+        assert!(false, "seed writer should initialize");
+        return;
+    };
+    // One full block of 0x11, so the middle-write has neighbours on both
+    // sides of the block and a second block of 0x22 to prove it survives.
+    let mut payload = vec![0x11u8; 2 * BLOCK_SIZE];
+    for byte in payload.iter_mut().skip(BLOCK_SIZE) {
+        *byte = 0x22;
+    }
+    assert!(seed.create_file("/disk.img", &payload).is_ok());
+    assert!(seed.commit().is_ok());
+    let store = MemStore::from_image_with_blocks(seed.image(), 4096);
+    let Ok(mut fs) = FixedHxfsWriter::<MemStore, 16, 32, 256>::mount(store) else {
+        assert!(false, "mount should succeed");
+        return;
+    };
+    let Ok(file) = fs.open_path("/disk.img") else {
+        assert!(false, "the image must exist");
+        return;
+    };
+
+    // A protective-MBR-shaped write: sector 0 is 512 bytes.
+    let sector = vec![0x5Au8; 512];
+    assert!(fs.write_file_at(file, 512, &sector).is_ok());
+    assert_eq!(
+        fs.file_handle(file.object_id).unwrap().size,
+        (2 * BLOCK_SIZE) as u64
+    );
+
+    let mut out = vec![0u8; 2 * BLOCK_SIZE];
+    let Ok(read) = fs.read_file(file, &mut out) else {
+        assert!(false, "read back should succeed");
+        return;
+    };
+    assert_eq!(read, 2 * BLOCK_SIZE);
+    assert!(out[..512].iter().all(|&b| b == 0x11), "sector 0 untouched");
+    assert!(
+        out[512..1024].iter().all(|&b| b == 0x5A),
+        "sector 1 written"
+    );
+    assert!(
+        out[1024..BLOCK_SIZE].iter().all(|&b| b == 0x11),
+        "rest of block 0 preserved"
+    );
+    assert!(
+        out[BLOCK_SIZE..].iter().all(|&b| b == 0x22),
+        "block 1 must not be disturbed by a write in block 0"
+    );
+
+    // The rewrite must survive a checkpoint + remount, i.e. the split and
+    // replacement extents, not just the in-memory table.
+    assert!(fs.publish_checkpoint().is_ok());
+    let store = fs.into_store();
+    let Ok(mut fs) = FixedHxfsWriter::<MemStore, 16, 32, 256>::mount(store) else {
+        assert!(false, "remount should succeed");
+        return;
+    };
+    let Ok(file) = fs.open_path("/disk.img") else {
+        assert!(false, "the image must survive the remount");
+        return;
+    };
+    let mut after = vec![0u8; 2 * BLOCK_SIZE];
+    assert!(fs.read_file(file, &mut after).is_ok());
+    assert_eq!(after, out, "random-offset write must be durable");
+}
+
+/// A write that spans several blocks and is not block-aligned at either end
+/// (a GPT header + partition array write looks like this) must land exactly.
+#[test]
+fn unaligned_multi_block_write_matches_a_plain_read_back() {
+    let Ok(mut seed) = HxfsWriter::new(INSTANCE, VOLUME) else {
+        assert!(false, "seed writer should initialize");
+        return;
+    };
+    let payload = vec![0x33u8; 4 * BLOCK_SIZE];
+    assert!(seed.create_file("/disk.img", &payload).is_ok());
+    assert!(seed.commit().is_ok());
+    let store = MemStore::from_image_with_blocks(seed.image(), 4096);
+    let Ok(mut fs) = FixedHxfsWriter::<MemStore, 16, 32, 256>::mount(store) else {
+        assert!(false, "mount should succeed");
+        return;
+    };
+    let Ok(file) = fs.open_path("/disk.img") else {
+        assert!(false, "the image must exist");
+        return;
+    };
+    // 1000 bytes at offset 100: starts mid-block, crosses one boundary,
+    // ends mid-block.
+    let write = vec![0x77u8; 1000];
+    assert!(fs.write_file_at(file, 100, &write).is_ok());
+    let mut out = vec![0u8; 4 * BLOCK_SIZE];
+    assert!(fs.read_file(file, &mut out).is_ok());
+    assert!(out[..100].iter().all(|&b| b == 0x33));
+    assert_eq!(&out[100..1100], write.as_slice());
+    assert!(out[1100..].iter().all(|&b| b == 0x33));
+}
+
+/// `truncate_file` shrink frees the tail blocks and grow reads back as zeros.
+#[test]
+fn truncate_shrink_frees_blocks_and_grow_reads_as_zeros() {
+    let Ok(mut seed) = HxfsWriter::new(INSTANCE, VOLUME) else {
+        assert!(false, "seed writer should initialize");
+        return;
+    };
+    let payload = vec![0x44u8; 8 * BLOCK_SIZE];
+    assert!(seed.create_file("/big.bin", &payload).is_ok());
+    assert!(seed.commit().is_ok());
+    let store = MemStore::from_image_with_blocks(seed.image(), 4096);
+    let Ok(mut fs) = FixedHxfsWriter::<MemStore, 16, 32, 256>::mount(store) else {
+        assert!(false, "mount should succeed");
+        return;
+    };
+    let Ok(file) = fs.open_path("/big.bin") else {
+        assert!(false, "file must exist");
+        return;
+    };
+    let before = fs.committed_physical_bytes();
+    // Shrink to one block: seven blocks must stop being charged.
+    let Ok(smaller) = fs.truncate_file(file, BLOCK_SIZE as u64) else {
+        assert!(false, "shrink should succeed");
+        return;
+    };
+    assert_eq!(smaller.size, BLOCK_SIZE as u64);
+    assert_eq!(
+        fs.committed_physical_bytes(),
+        before - 7 * BLOCK_SIZE as u64,
+        "tail blocks must be released"
+    );
+
+    // Grow again: the new region must read as zeros, not as stale 0x44.
+    let Ok(grown) = fs.truncate_file(smaller, (3 * BLOCK_SIZE) as u64) else {
+        assert!(false, "grow should succeed");
+        return;
+    };
+    assert_eq!(grown.size, (3 * BLOCK_SIZE) as u64);
+    let mut out = vec![0u8; 3 * BLOCK_SIZE];
+    assert!(fs.read_file(grown, &mut out).is_ok());
+    assert!(out[..BLOCK_SIZE].iter().all(|&b| b == 0x44));
+    assert!(
+        out[BLOCK_SIZE..].iter().all(|&b| b == 0),
+        "grown tail must read as zeros"
+    );
+
+    // And a random write into the grown (hole) region must not resurrect
+    // old bytes around it.
+    assert!(fs
+        .write_file_at(grown, (BLOCK_SIZE + 10) as u64, b"hello")
+        .is_ok());
+    let mut out2 = vec![0u8; 3 * BLOCK_SIZE];
+    assert!(fs.read_file(grown, &mut out2).is_ok());
+    assert_eq!(&out2[BLOCK_SIZE + 10..BLOCK_SIZE + 15], b"hello");
+    assert!(out2[BLOCK_SIZE..BLOCK_SIZE + 10].iter().all(|&b| b == 0));
+}

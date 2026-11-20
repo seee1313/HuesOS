@@ -32,6 +32,8 @@ pub mod wait;
 pub mod boot_key;
 /// Kernel entropy pool (ChaCha20 DRBG) backing `SystemGetEntropy`.
 pub mod entropy;
+/// Futex wait queues backing `Syscall::FutexWait` / `FutexWake`.
+pub mod futex;
 /// Operator-tunable runtime knobs (Stage E.1) backing `SystemKnobGet` /
 /// `SystemKnobSet`.
 pub mod knobs;
@@ -47,6 +49,7 @@ pub use channel::{
 pub use device_lease::{
     DeviceLease, DeviceLeaseError, DeviceLeaseSnapshot, DeviceLeaseState, PORT_PACKET_DEVICE_GONE,
 };
+pub use futex::{FutexNode, FutexTable};
 pub use handle::{Handle, HandleTable, HandleTableError, HandleValue, Rights, INVALID_HANDLE};
 pub use interrupt::{
     set_interrupt_route_hooks, Interrupt, InterruptBindError, InterruptBinding,

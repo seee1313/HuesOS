@@ -553,6 +553,46 @@ pub enum Syscall {
     /// target's resources are released through the ordinary process-teardown
     /// path, exactly as for a self-exit.
     ProcessTerminate = 83,
+    /// Park the calling thread on the futex word at user virtual address
+    /// `a1` (`*const u32`, 4-byte aligned) while it still holds `a2`.
+    ///
+    /// The word is read through the recoverable user-copy path, so a
+    /// non-canonical, unmapped, or read-protected address fails with
+    /// `InvalidArgs` instead of faulting the kernel. A word that does not
+    /// match `a2` is *not* an error: the call returns `Ok(0)` without
+    /// parking, because the caller races other threads by design and has
+    /// to re-check the word after every return anyway.
+    ///
+    /// Parking is per *process*: the wait queue is keyed by
+    /// `(process koid, a1)`, which is exactly the pair that can observe a
+    /// given word — two processes have disjoint address spaces, so the
+    /// same virtual address in two processes is two different words.
+    ///
+    /// `a3` is a timeout in scheduler ticks; `0` waits forever. On timeout
+    /// the call returns [`ErrorCode::TimedOut`] — a caller that only cares
+    /// about "sleep then re-check" may treat it as success.
+    ///
+    /// Returns:
+    /// - `Ok(0)` — woken, or the word already differed from `a2`,
+    /// - `Err(`[`ErrorCode::TimedOut`]`)` — the timeout expired first,
+    /// - `Err(InvalidArgs)` — `a1` is not a readable, aligned user word,
+    /// - `Err(InvalidArgs)` — the scheduler is not running yet, so there is
+    ///   nothing that could ever wake the caller (early-boot callers must
+    ///   poll instead).
+    FutexWait = 84,
+    /// Wake up to `a2` threads parked in [`Self::FutexWait`] on the futex
+    /// word at user virtual address `a1`, returning how many were woken in
+    /// the syscall result.
+    ///
+    /// Waking is not "sticky": a wake that finds no waiters returns `Ok(0)`
+    /// and wakes nobody. That is sound because every caller re-checks the
+    /// word after parking (standard futex contract); it is not a
+    /// lost-wakeup bug, it is the reason a `FutexWait` caller must
+    /// re-read the word before and after parking.
+    ///
+    /// `a1` is validated for alignment only (the kernel never dereferences
+    /// it here), and wakes never fail because the address became unmapped.
+    FutexWake = 85,
 }
 
 /// Maximum number of bytes one [`Syscall::SystemGetEntropy`] call
@@ -632,7 +672,7 @@ impl Syscall {
     /// Total number of defined syscalls (i.e. one past the highest
     /// currently-assigned number). The dispatcher uses this to reject
     /// obviously-out-of-range numbers before a `match`.
-    pub const COUNT: u64 = 84;
+    pub const COUNT: u64 = 86;
 
     /// Convert a raw syscall number back into a [`Syscall`], if valid.
     pub const fn from_raw(n: u64) -> Option<Self> {
@@ -721,6 +761,8 @@ impl Syscall {
             81 => Self::ThreadExit,
             82 => Self::ThreadWait,
             83 => Self::ProcessTerminate,
+            84 => Self::FutexWait,
+            85 => Self::FutexWake,
             _ => return None,
         })
     }
@@ -1636,9 +1678,14 @@ mod tests {
         assert_eq!(Syscall::ResourceUnmap as u64, 65);
         assert_eq!(Syscall::InterruptCreateGsiForResource as u64, 66);
         assert_eq!(Syscall::InterruptAcknowledge as u64, 67);
-        assert_eq!(Syscall::COUNT, 84);
+        assert_eq!(Syscall::COUNT, 86);
         assert_eq!(Syscall::ProcessTerminate as u64, 83);
+        assert_eq!(Syscall::FutexWait as u64, 84);
+        assert_eq!(Syscall::FutexWake as u64, 85);
         assert_eq!(Syscall::from_raw(83), Some(Syscall::ProcessTerminate));
+        assert_eq!(Syscall::from_raw(84), Some(Syscall::FutexWait));
+        assert_eq!(Syscall::from_raw(85), Some(Syscall::FutexWake));
+        assert_eq!(Syscall::from_raw(86), None);
         assert_eq!(Syscall::from_raw(28), Some(Syscall::VmoCreateEx));
         assert_eq!(Syscall::from_raw(30), Some(Syscall::VmarProtect));
         assert_eq!(Syscall::from_raw(31), Some(Syscall::ChannelPeek));
@@ -1710,7 +1757,7 @@ mod tests {
         assert_eq!(Syscall::from_raw(82), Some(Syscall::ThreadWait));
         assert_eq!(Syscall::from_raw(83), Some(Syscall::ProcessTerminate));
         // Append-only: the next number past the newest syscall stays unmapped.
-        assert_eq!(Syscall::from_raw(84), None);
+        assert_eq!(Syscall::from_raw(86), None);
     }
 
     #[test]

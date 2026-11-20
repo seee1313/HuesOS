@@ -298,6 +298,31 @@ int32_t __cxa_atexit(void (*func)(void *), void *arg, void *dso_handle);
 void *__tls_get_addr(void *ti);
 
 /* --------------------------------------------------------------------------
+ * Futex primitives (park/wake on a userspace word)
+ *
+ * A futex is an ordinary `uint32_t` in the calling process's memory. The
+ * kernel keeps a wait queue per (process, address) and nothing else, so the
+ * caller owns the protocol:
+ *
+ *     if (atomic_load(word) == expected)
+ *         canvas_futex_wait(word, expected, timeout_ticks);
+ *     // always re-read: wakeups are advisory
+ *
+ * canvas_futex_wait returns 0 when woken and also when the word already
+ * differed (nothing was slept for), so callers must re-check the word on
+ * every return. A timeout of 0 waits forever; a nonzero timeout that expires
+ * first returns the HuesOS error code for `TimedOut` (-20), exactly like
+ * every other canvas_* entry point reports failures.
+ *
+ * canvas_futex_wake returns the number of threads actually woken (0 is
+ * normal: the wake lost the race, and the waker's own store is what the
+ * waiter will observe on re-check).
+ * -------------------------------------------------------------------------- */
+
+int64_t canvas_futex_wait(const uint32_t *uaddr, uint32_t expected, uint64_t timeout_ticks);
+int64_t canvas_futex_wake(const uint32_t *uaddr, uint32_t max_wake);
+
+/* --------------------------------------------------------------------------
  * Process arguments, standard streams (Channel stdio) & capability mask
  * -------------------------------------------------------------------------- */
 
