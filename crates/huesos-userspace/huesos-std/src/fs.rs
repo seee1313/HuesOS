@@ -62,12 +62,14 @@ pub struct Entry {
 
 /// Take the granted `Hxfs` service channel, if this process has one.
 pub fn service() -> Option<Hxfs> {
-    take_cap_handle(CapKind::HxfsService).map(|h| Hxfs::from_channel(Channel::from_handle(h)))
+    take_cap_handle(CapKind::HxfsService)
+        .map(|h| Hxfs::from_channel(Channel::from_handle(h)))
 }
 
 /// Take the granted scoped directory handle, if this process has one.
 pub fn directory() -> Option<HxfsDirectory> {
-    take_cap_handle(CapKind::HxfsDir).map(|h| HxfsDirectory::from_channel(Channel::from_handle(h)))
+    take_cap_handle(CapKind::HxfsDir)
+        .map(|h| HxfsDirectory::from_channel(Channel::from_handle(h)))
 }
 
 /// True when the process can reach the filesystem at all.
@@ -131,10 +133,7 @@ pub struct File {
 
 impl File {
     fn wrap(inner: HxfsFile) -> Self {
-        Self {
-            inner,
-            position: 0,
-        }
+        Self { inner, position: 0 }
     }
 
     /// Open an existing file for reading and writing.
@@ -164,7 +163,10 @@ impl File {
     /// Read at the cursor and advance it.
     pub fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
         let read = {
-            let data = self.inner.read_at(self.position, buf).map_err(Error::from)?;
+            let data = self
+                .inner
+                .read_at(self.position, buf)
+                .map_err(Error::from)?;
             data.len()
         };
         self.position += read as u64;
@@ -173,7 +175,10 @@ impl File {
 
     /// Write at the cursor and advance it.
     pub fn write(&mut self, buf: &[u8]) -> Result<usize> {
-        let written = self.inner.write_at(self.position, buf).map_err(Error::from)?;
+        let written = self
+            .inner
+            .write_at(self.position, buf)
+            .map_err(Error::from)?;
         self.position += written as u64;
         Ok(written)
     }

@@ -125,7 +125,10 @@ impl Error {
 
     /// True when the caller may usefully retry the same call.
     pub const fn is_retryable(&self) -> bool {
-        matches!(self.kind, ErrorKind::Busy | ErrorKind::ShouldWait | ErrorKind::TimedOut)
+        matches!(
+            self.kind,
+            ErrorKind::Busy | ErrorKind::ShouldWait | ErrorKind::TimedOut
+        )
     }
 }
 

@@ -67,13 +67,15 @@ fn run() -> i32 {
     }
 }
 
+// The five checks below are assertion tables: one `expect!` per property, with
+// the property text next to it. `#[rustfmt::skip]` keeps that table readable
+// instead of exploding every macro call that happens to cross the call width.
+#[rustfmt::skip]
 fn check_io() -> u32 {
     let mut failures = 0u32;
     // The free `write_all` must loop over short writes rather than assume the
     // first call took everything.
-    let mut sink = Sink {
-        bytes: Vec::new(),
-    };
+    let mut sink = Sink { bytes: Vec::new() };
     let first = io::write_all(&mut sink, b"hello, ");
     let second = io::write_all(&mut sink, b"world");
     if first.is_err() || second.is_err() {
@@ -84,9 +86,7 @@ fn check_io() -> u32 {
     // `Fmt` buffers into a 160-byte stack buffer and flushes when it fills, so
     // a line longer than the buffer must still come out complete and in order.
     let long = "abcdefghij".repeat(40);
-    let mut sink = Sink {
-        bytes: Vec::new(),
-    };
+    let mut sink = Sink { bytes: Vec::new() };
     let formatted = {
         use core::fmt::Write as _;
         let mut fmt = io::Fmt::new(&mut sink);
@@ -115,6 +115,7 @@ fn check_io() -> u32 {
     failures
 }
 
+#[rustfmt::skip]
 fn check_path() -> u32 {
     let mut failures = 0u32;
     let normalizations: [(&str, &str); 7] = [
@@ -167,6 +168,7 @@ fn check_path() -> u32 {
     failures
 }
 
+#[rustfmt::skip]
 fn check_error() -> u32 {
     let mut failures = 0u32;
     let not_found = Error::from_code(ErrorCode::NotFound);
@@ -207,6 +209,7 @@ fn check_error() -> u32 {
     failures
 }
 
+#[rustfmt::skip]
 fn check_env() -> u32 {
     let mut failures = 0u32;
     expect!(failures, env::args_count() >= 1, "env argc");
@@ -225,6 +228,7 @@ fn check_env() -> u32 {
     failures
 }
 
+#[rustfmt::skip]
 fn check_fs() -> u32 {
     const NAME: &str = "/std-smoke.txt";
     let payload: Vec<u8> = (0..3000u32).map(|v| (v % 251) as u8).collect();
