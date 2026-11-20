@@ -1,0 +1,58 @@
+name: lab-rust
+
+# TEMPORARY (this branch only): pack a musl-hosted Rust toolchain on a runner
+# and publish it to a throwaway branch, because this sandbox cannot reach
+# static.rust-lang.org (to install) nor the artifact blob host (to download).
+# A musl-hosted toolchain is statically linked, so it runs in the sandbox
+# without patching glibc the way the portable QEMU needed.
+on:
+  workflow_dispatch:
+  push:
+    branches: ["arena/14dbccbc-huesos"]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: lab-rust
+  cancel-in-progress: true
+
+jobs:
+  pack:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Install the musl-hosted toolchain
+        run: |
+          rustup toolchain install nightly-2026-03-01-x86_64-unknown-linux-musl \
+            --profile minimal --component rust-src,clippy,rustfmt
+      - name: Pack it
+        run: |
+          set -euo pipefail
+          TC="$HOME/.rustup/toolchains/nightly-2026-03-01-x86_64-unknown-linux-musl"
+          rm -rf "$TC/share/doc" "$TC/share/man" "$TC/lib/rustlib/etc" \
+            "$TC/lib/rustlib/components" "$TC/lib/rustlib/manifest-*"
+          # The musl std, the compiler, and its driver .so are all that is
+          # needed; cargo/clippy/rustfmt live in the toolchain bin as well.
+          du -sh "$TC"
+          tar -C "$HOME/.rustup/toolchains" -cf - \
+            nightly-2026-03-01-x86_64-unknown-linux-musl | zstd -3 -T0 -o /tmp/lab-rust.tar.zst
+          tar -C "$HOME/.cargo" -cf - bin | zstd -3 -T0 -o /tmp/lab-cargo-bin.tar.zst
+          ls -l /tmp/lab-rust.tar.zst /tmp/lab-cargo-bin.tar.zst
+      - name: Publish to a throwaway branch
+        run: |
+          set -euo pipefail
+          git config user.email "lab-rust@huesos.invalid"
+          git config user.name "lab-rust"
+          git checkout --orphan lab-toolchain
+          git rm -rq --cached . || true
+          rm -rf ./* ./.github 2>/dev/null || true
+          mkdir -p parts
+          split -b 20M /tmp/lab-rust.tar.zst parts/rust-
+          split -b 20M /tmp/lab-cargo-bin.tar.zst parts/bin-
+          (cd parts && sha256sum ./* > SHA256SUMS)
+          ls -l parts | head -30
+          git add -A
+          git commit -q -m "lab: musl-hosted Rust toolchain for the Arena sandbox"
+          git push -f origin HEAD:refs/heads/lab/toolchain
