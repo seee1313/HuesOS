@@ -18,6 +18,7 @@
 extern crate alloc;
 
 use alloc::format;
+use alloc::string::String;
 
 use huesos_coreutils as cu;
 use huesos_coreutils::disk::{self, human_size};
@@ -54,25 +55,33 @@ fn run() -> i32 {
     }
 
     let mount = path.unwrap_or("/");
+
+    // Usage: the sizes the filesystem reports with its listings, added up.
+    // A sandbox without the handle cannot answer -- which is a fact about this
+    // process, not a failure of the volume, so it becomes a `-` column.
     let used = match huesos_std::fs::used_bytes(mount) {
-        Ok(bytes) => bytes,
+        Ok(bytes) => Some(bytes),
         Err(error) => {
-            // Say which capabilities were missing: a sandbox without a
-            // filesystem handle and a broken volume look identical otherwise.
             cu::errln(&format!(
                 "df: {mount}: {error} (service={} directory={})",
                 huesos_std::fs::service().is_some(),
                 huesos_std::fs::directory().is_some()
             ));
-            return 1;
+            None
         }
     };
-    // Capacity comes from the granted block device: it is the same store the
-    // filesystem lives in and it needs no broker, so `df` reports a size on a
-    // host whose HxFS service is not reachable either.
+
+    // Capacity: the granted block device is the store the filesystem lives in,
+    // it needs no broker, and it is what `fdisk`/`lsblk` already read.
     let capacity = disk::DiskIo::open(None, false)
         .ok()
-        .map(|io| io.capacity_bytes());
+        .map(|io| io.capacity_bytes())
+        .filter(|bytes| *bytes > 0);
+
+    if used.is_none() && capacity.is_none() {
+        cu::errln("df: no filesystem and no block device to report on");
+        return 1;
+    }
 
     if human {
         cu::outln(&format!(
@@ -85,58 +94,52 @@ fn run() -> i32 {
             "Filesystem", "4K-blocks", "Used", "Available", "Use%"
         ));
     }
-    match capacity {
-        Some(capacity) if capacity > 0 => {
-            let available = capacity.saturating_sub(used);
-            let percent = ((used.saturating_mul(100)) / capacity).min(100);
-            if human {
-                cu::outln(&format!(
-                    "{:<12} {:>8} {:>8} {:>8} {:>3}%  {mount}",
-                    "hxfs",
-                    human_size(capacity),
-                    human_size(used),
-                    human_size(available),
-                    percent
-                ));
-            } else {
-                cu::outln(&format!(
-                    "{:<12} {:>10} {:>10} {:>10} {:>3}%  {mount}",
-                    "hxfs",
-                    capacity / BLOCK,
-                    used / BLOCK,
-                    available / BLOCK,
-                    percent
-                ));
-            }
-            cu::outln(&format!(
-                "[{}] {percent}% of {}",
-                fill_bar(percent),
-                human_size(capacity)
-            ));
+
+    let percent = match (used, capacity) {
+        (Some(used), Some(capacity)) => Some(((used.saturating_mul(100)) / capacity).min(100)),
+        _ => None,
+    };
+    let number = |bytes: Option<u64>| -> String {
+        match bytes {
+            Some(bytes) if human => human_size(bytes),
+            Some(bytes) => format!("{}", bytes / BLOCK),
+            None => String::from("-"),
         }
-        _ => {
-            // Usage without a denominator: still a useful number, and better
-            // than a made-up capacity.
-            if human {
-                cu::outln(&format!(
-                    "{:<12} {:>8} {:>8} {:>8} {:>4}  {mount}",
-                    "hxfs",
-                    "-",
-                    human_size(used),
-                    "-",
-                    "-"
-                ));
-            } else {
-                cu::outln(&format!(
-                    "{:<12} {:>10} {:>10} {:>10} {:>4}  {mount}",
-                    "hxfs",
-                    "-",
-                    used / BLOCK,
-                    "-",
-                    "-"
-                ));
-            }
-        }
+    };
+    let available = match (used, capacity) {
+        (Some(used), Some(capacity)) => Some(capacity.saturating_sub(used)),
+        _ => None,
+    };
+    let percent_text = match percent {
+        Some(percent) => format!("{percent}%"),
+        None => String::from("-"),
+    };
+
+    if human {
+        cu::outln(&format!(
+            "{:<12} {:>8} {:>8} {:>8} {:>4}  {mount}",
+            "hxfs",
+            number(capacity),
+            number(used),
+            number(available),
+            percent_text
+        ));
+    } else {
+        cu::outln(&format!(
+            "{:<12} {:>10} {:>10} {:>10} {:>4}  {mount}",
+            "hxfs",
+            number(capacity),
+            number(used),
+            number(available),
+            percent_text
+        ));
+    }
+    if let (Some(percent), Some(capacity)) = (percent, capacity) {
+        cu::outln(&format!(
+            "[{}] {percent}% of {}",
+            fill_bar(percent),
+            human_size(capacity)
+        ));
     }
 
     if wide {
@@ -145,11 +148,8 @@ fn run() -> i32 {
         // so instead of inventing a number.
         cu::outln(&format!(
             "block_size={BLOCK} blocks_used={} blocks_total={}",
-            used / BLOCK,
-            capacity.map_or(alloc::string::String::from("-"), |bytes| format!(
-                "{}",
-                bytes / BLOCK
-            ))
+            number(used),
+            number(capacity)
         ));
         match huesos_std::fs::service() {
             Some(service) => match service.volume_info() {
