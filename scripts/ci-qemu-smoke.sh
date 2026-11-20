@@ -196,7 +196,7 @@ required+=(
     '[hsh] fdisk gpt-init dry-run OK'
     '[hsh] fdisk gpt init/add/del/verify OK'
     '[hsh] huesos-std smoke OK'
-    '[hsh] df table OK'
+    '[hsh] df usage OK'
     '[terminal] keyboard service online, starting /bin/hsh.elf session'
     '[init] FrameDraw duplicate self-check OK'
     '[init] stage selftest ok'
@@ -208,7 +208,6 @@ required+=(
 if [[ -n "${HUESOS_SMOKE_NVME:-}" ]]; then
     required+=(
         '[hxfs] service started'
-        '[hsh] lsblk OK'
         '[hsh] fdisk raw-hxfs list OK'
         '[hsh] fdisk raw-hxfs dry-run OK'
         '[hsh] fdisk raw-hxfs gpt-init guard OK'

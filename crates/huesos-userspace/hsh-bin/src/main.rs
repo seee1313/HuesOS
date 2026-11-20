@@ -959,9 +959,30 @@ impl InteractiveShell {
             self.host.frame_draw.is_some(),
             self.host.bootfs.is_some()
         );
+        //     A boot image with no storage at all still has to be able to run
+        //     the binary, so the usage path is always required and the report
+        //     only when there is something to report on.
+        match smoke_env.eval_script("df --help", &mut self.host) {
+            Ok(res) if res.status == 0 && res.render_text().contains("usage: df") => {
+                println!("[hsh] df usage OK");
+            }
+            Ok(res) => println!(
+                "[hsh] df usage FAILED status={} out={}",
+                res.status,
+                res.render_text()
+            ),
+            Err(e) => println!("[hsh] df usage ERROR: {}", e),
+        }
         match smoke_env.eval_script("df", &mut self.host) {
             Ok(res) if res.status == 0 && res.render_text().contains("hxfs") => {
                 println!("[hsh] df table OK");
+            }
+            Ok(res)
+                if res
+                    .render_text()
+                    .contains("no filesystem and no block device") =>
+            {
+                println!("[hsh] df SKIP (no storage)");
             }
             Ok(res) => println!(
                 "[hsh] df FAILED status={} out={}",
