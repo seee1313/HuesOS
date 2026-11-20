@@ -9,11 +9,23 @@ nvme_img="${NVME_IMG:-build/nvme-soak.img}"
 nvme_size="${NVME_IMG_SIZE:-4G}"
 ovmf="${OVMF_PATH:-third_party/ovmf/OVMF.fd}"
 nvme_layout="${QEMU_NVME_LAYOUT:-split}"
+# Image layout is independent of the QEMU device model: `bare` is a
+# superfloppy (HxFS superblock at block 0), `gpt` puts the same volume in a
+# protective-MBR + GPT disk with an HxFS v7 partition 1 MiB in. Both must mount.
+hxfs_image_layout="${HXFS_IMAGE_LAYOUT:-bare}"
+case "$hxfs_image_layout" in
+    bare) gpt_args=() ;;
+    gpt) gpt_args=(--gpt) ;;
+    *)
+        echo "[soak] unsupported HXFS_IMAGE_LAYOUT=$hxfs_image_layout (use bare or gpt)" >&2
+        exit 2
+        ;;
+esac
 
 mkdir -p build "$(dirname "$log")" "$(dirname "$nvme_img")"
 rm -f "$log"
 
-echo "[soak] profile=${profile} seconds=${seconds} log=${log} nvme_img=${nvme_img} layout=${nvme_layout} inject=${inject}"
+echo "[soak] profile=${profile} seconds=${seconds} log=${log} nvme_img=${nvme_img} layout=${nvme_layout} image=${hxfs_image_layout} inject=${inject}"
 echo "[soak] building ISO before NVMe soak"
 # Injection modes build the ISO with the synthetic-key feature so
 # the embedded hxfs-service mounts the seeded volume and runs its
@@ -109,7 +121,10 @@ fi
 # canonical Rust format version: an old mode-0 v6 fixture is not a writable
 # current image. This invalidates harness fixtures, never migrates user disks.
 current_format="$(bash tools/hxfs-seed.sh --print-format-version)"
-mode_tag="${inject}:format-${current_format}"
+# The image layout is part of the marker: a bare volume must not be reused by a
+# GPT run (the mount probe would report the other layout and the gate would
+# fail on a stale image instead of on a real defect).
+mode_tag="${inject}:format-${current_format}:${hxfs_image_layout}"
 mode_file="$nvme_img.mode"
 need_create=0
 if [[ ! -f "$nvme_img" ]]; then
@@ -154,9 +169,11 @@ if [[ "$need_create" == "1" ]]; then
         # source next to the image so mkhxfs.py can seed it.
         head -c 3072 third_party/freedoom/freedoom1.wad > build/wad-header.bin
         python3 tools/mkhxfs.py --output "$nvme_img" --blocks "$hxfs_blocks" \
-            --seed-file seed.bin --seed-size 3584 "${seed_args[@]}" >/dev/null
+            --seed-file seed.bin --seed-size 3584 "${seed_args[@]}" \
+            "${gpt_args[@]}" >/dev/null
     else
-        python3 tools/mkhxfs.py --output "$nvme_img" --blocks "$hxfs_blocks" >/dev/null
+        python3 tools/mkhxfs.py --output "$nvme_img" --blocks "$hxfs_blocks" \
+            "${gpt_args[@]}" >/dev/null
     fi
     echo "$mode_tag" > "$mode_file"
 fi
@@ -347,8 +364,17 @@ if grep -Fq 'KERNEL PANIC' "$log" || grep -Fq '[hxfs] PANIC' "$log"; then
     exit 1
 fi
 
+# Which layout the mount probe must have found. Asserting the negative case
+# too keeps a "GPT support" change from silently turning every bare image into
+# an unpartitioned-by-accident one.
+if [[ "$hxfs_image_layout" == "gpt" ]]; then
+    layout_marker="[hxfs] layout=gpt-partition"
+else
+    layout_marker="[hxfs] layout=superfloppy"
+fi
 required=(
     "[driver-host:nvme] identified"
+    "$layout_marker"
     "[driver-manager] registered identified block:nvme namespace"
     "[driver-manager] received unique KeyBroker generation authority"
     "[driver-manager] issued one-shot Hxfs key grant generation 1"

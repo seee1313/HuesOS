@@ -234,10 +234,15 @@ jobs:
           rustup toolchain install nightly-2026-03-01 --profile minimal \
             --component rust-src,llvm-tools-preview
           rustup default nightly-2026-03-01
-      - name: NVMe + Hxfs QEMU smoke
+      - name: NVMe + Hxfs QEMU smoke (protective MBR + GPT layout)
+        # The default image is a superfloppy; this leg proves the partitioned
+        # path too: the generator writes a protective MBR + GPT with an HxFS v7
+        # partition 1 MiB in, and hxfs-service must report
+        # `[hxfs] layout=gpt-partition` and mount from the partition window.
         env:
           CARGO_BUILD_JOBS: "1"
           ARTIFACT_DIR: ci-artifacts
+          HXFS_IMAGE_LAYOUT: gpt
         run: bash scripts/ci-qemu-nvme-soak.sh ${{ matrix.profile }} 120
       - name: Upload serial log
         if: always()

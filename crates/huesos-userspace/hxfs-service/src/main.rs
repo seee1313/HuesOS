@@ -104,19 +104,71 @@ const SERVICE_MAX_EXTENTS: usize = 4200;
 // `BadBlock` immediately after `[hxfs] service started`.
 const HXFS_LBA_FACTOR: u32 = 8;
 
-struct BlockDeviceReader {
-    device: libcanvas::block::BlockDevice,
+/// The 512-byte-LBA window of the device that holds the HxFS volume.
+///
+/// A partitioned disk hands the filesystem a *slice* of the device: every
+/// HxFS block I/O is offset by `first_lba` and bounds-checked against `blocks`.
+/// Without the window, a volume in a GPT partition would be mounted from the
+/// disk's block 0 — the protective MBR — and fail its superblock CRC.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct BlockWindow {
+    /// First device LBA (512-byte units) of the partition.
+    first_lba: u64,
+    /// Partition length in 4 KiB HxFS blocks.
+    blocks: u64,
 }
 
-impl BlockReader for BlockDeviceReader {
-    fn read_blocks(&mut self, lba: u64, blocks: u32, out: &mut [u8]) -> Result<(), HxfsError> {
-        let lbas = lba
-            .checked_mul(u64::from(HXFS_LBA_FACTOR))
-            .ok_or(HxfsError::OutOfRange)?;
+/// Where the volume was found on the device.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DiskLayout {
+    /// A protective MBR + GPT with an HxFS v7 partition in it.
+    GptPartition(BlockWindow),
+    /// A bare filesystem with no partition table ("superfloppy").
+    SuperFloppy,
+}
+
+struct BlockDeviceReader {
+    device: libcanvas::block::BlockDevice,
+    window: Option<BlockWindow>,
+}
+
+impl BlockDeviceReader {
+    fn new(device: libcanvas::block::BlockDevice, window: Option<BlockWindow>) -> Self {
+        Self { device, window }
+    }
+
+    /// Translate an HxFS `(lba, blocks)` request into device `(lba, blocks)`,
+    /// both in 512-byte units, rejecting anything outside the partition.
+    fn device_range(&self, lba: u64, blocks: u32) -> Result<(u64, u32), HxfsError> {
         let total = u64::from(blocks)
             .checked_mul(u64::from(HXFS_LBA_FACTOR))
             .ok_or(HxfsError::OutOfRange)?;
         let total = u32::try_from(total).map_err(|_| HxfsError::OutOfRange)?;
+        let base = lba
+            .checked_mul(u64::from(HXFS_LBA_FACTOR))
+            .ok_or(HxfsError::OutOfRange)?;
+        match self.window {
+            Some(window) => {
+                let end = lba
+                    .checked_add(u64::from(blocks))
+                    .ok_or(HxfsError::OutOfRange)?;
+                if end > window.blocks {
+                    return Err(HxfsError::OutOfRange);
+                }
+                let base = window
+                    .first_lba
+                    .checked_add(base)
+                    .ok_or(HxfsError::OutOfRange)?;
+                Ok((base, total))
+            }
+            None => Ok((base, total)),
+        }
+    }
+}
+
+impl BlockReader for BlockDeviceReader {
+    fn read_blocks(&mut self, lba: u64, blocks: u32, out: &mut [u8]) -> Result<(), HxfsError> {
+        let (lbas, total) = self.device_range(lba, blocks)?;
         self.device
             .read_blocks(lbas, total, out)
             .map_err(|_| HxfsError::Io)
@@ -125,13 +177,7 @@ impl BlockReader for BlockDeviceReader {
 
 impl BlockStore for BlockDeviceReader {
     fn write_blocks(&mut self, lba: u64, blocks: u32, input: &[u8]) -> Result<(), HxfsError> {
-        let lbas = lba
-            .checked_mul(u64::from(HXFS_LBA_FACTOR))
-            .ok_or(HxfsError::OutOfRange)?;
-        let total = u64::from(blocks)
-            .checked_mul(u64::from(HXFS_LBA_FACTOR))
-            .ok_or(HxfsError::OutOfRange)?;
-        let total = u32::try_from(total).map_err(|_| HxfsError::OutOfRange)?;
+        let (lbas, total) = self.device_range(lba, blocks)?;
         self.device
             .write_blocks(lbas, total, input)
             .map_err(|_| HxfsError::Io)
@@ -140,6 +186,81 @@ impl BlockStore for BlockDeviceReader {
     fn flush(&mut self) -> Result<(), HxfsError> {
         self.device.flush().map_err(|_| HxfsError::Io)
     }
+}
+
+/// Decide whether the device carries a GPT with an HxFS partition.
+///
+/// The probe is deliberately read-only and cheap: one 4 KiB block for the
+/// protective MBR plus the primary header, and one 4 KiB block per entry array
+/// block it has to walk. A bare volume fails the MBR signature test on its
+/// superblock bytes and is mounted as a superfloppy exactly as before, so a
+/// disk without a partition table keeps working.
+fn probe_disk_layout(device: &mut libcanvas::block::BlockDevice) -> DiskLayout {
+    match gpt_hxfs_partition(device) {
+        Some(window) => DiskLayout::GptPartition(window),
+        None => DiskLayout::SuperFloppy,
+    }
+}
+
+/// Find the HxFS v7 partition of a protective-MBR + GPT disk.
+///
+/// Returns the partition's window in 4 KiB HxFS blocks, or `None` if this is
+/// not a GPT disk, has no HxFS partition, or the partition is not 4 KiB
+/// aligned in 512-byte LBAs (an HxFS volume cannot be mounted from a
+/// misaligned start).
+fn gpt_hxfs_partition(device: &mut libcanvas::block::BlockDevice) -> Option<BlockWindow> {
+    let mut block = [0u8; 4096];
+    device.read_blocks(0, HXFS_LBA_FACTOR, &mut block).ok()?;
+    // Protective MBR: boot signature plus a single type-0xEE entry at the
+    // first partition slot.
+    if block[510] != 0x55 || block[511] != 0xAA || block[446 + 4] != 0xEE {
+        return None;
+    }
+    let header = huesos_hxfs::gpt::parse_gpt_header(&block[512..1024]).ok()?;
+    let entry_size = usize::try_from(header.partition_entry_size).ok()?;
+    if !(huesos_gpt::GPT_ENTRY_SIZE..=4096).contains(&entry_size) {
+        return None;
+    }
+    let entry_size_u64 = u64::try_from(entry_size).ok()?;
+    let array_byte = header.partition_entries_lba.checked_mul(512)?;
+    let mut cached_block = u64::MAX;
+    for index in 0..header.partition_entry_count {
+        let byte = u64::from(index)
+            .checked_mul(entry_size_u64)
+            .and_then(|off| array_byte.checked_add(off))?;
+        let block_index = byte / 4096;
+        let offset = usize::try_from(byte % 4096).ok()?;
+        // An entry that straddles a 4 KiB block boundary would need a
+        // two-block read; the UEFI baseline (128-byte entries) never does, and
+        // refusing is safer than stitching.
+        let end = offset.checked_add(entry_size)?;
+        if end > block.len() {
+            return None;
+        }
+        if block_index != cached_block {
+            let lba = block_index.checked_mul(u64::from(HXFS_LBA_FACTOR))?;
+            device.read_blocks(lba, HXFS_LBA_FACTOR, &mut block).ok()?;
+            cached_block = block_index;
+        }
+        let entry = huesos_hxfs::gpt::parse_partition_entry(&block[offset..end]).ok()?;
+        if entry.is_empty() || entry.type_guid != huesos_gpt::GUID_HXFS_V7_BYTES {
+            continue;
+        }
+        // An HxFS volume is addressed in 4 KiB blocks, so a partition that
+        // does not start on a 4 KiB boundary cannot be mounted as one.
+        if !entry.first_lba.is_multiple_of(u64::from(HXFS_LBA_FACTOR)) {
+            return None;
+        }
+        let blocks = entry.block_count().ok()? / u64::from(HXFS_LBA_FACTOR);
+        if blocks == 0 {
+            return None;
+        }
+        return Some(BlockWindow {
+            first_lba: entry.first_lba,
+            blocks,
+        });
+    }
+    None
 }
 
 type MountedHxfs = FixedHxfsWriter<
@@ -1904,10 +2025,28 @@ fn mount_from_bootstrap(bootstrap: &Channel) -> Option<Box<MountedHxfs>> {
             }
             Ok((n, Some(handle))) if &buf[..n] == b"hxfs:block-device" => {
                 let channel = Channel::from_handle(handle);
-                let Ok(device) = libcanvas::block::BlockDevice::from_channel(channel) else {
+                let Ok(mut device) = libcanvas::block::BlockDevice::from_channel(channel) else {
                     return None;
                 };
-                let mut reader = BlockDeviceReader { device };
+                // Partitioned disks carry a protective MBR + GPT; a bare
+                // volume is a superfloppy. Probe before the first filesystem
+                // read so the journal replay below already works on the
+                // partition's block range.
+                let layout = probe_disk_layout(&mut device);
+                let window = match layout {
+                    DiskLayout::GptPartition(window) => {
+                        println!(
+                            "[hxfs] layout=gpt-partition first_lba={} blocks={}",
+                            window.first_lba, window.blocks
+                        );
+                        Some(window)
+                    }
+                    DiskLayout::SuperFloppy => {
+                        println!("[hxfs] layout=superfloppy");
+                        None
+                    }
+                };
+                let mut reader = BlockDeviceReader::new(device, window);
                 match replay_journal(&mut reader) {
                     Ok(ReplayOutcome::Clean) => {}
                     Ok(ReplayOutcome::Replayed {

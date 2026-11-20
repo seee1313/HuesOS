@@ -195,6 +195,7 @@ required+=(
     '[hsh] Ctrl-C child kill smoke OK'
     '[hsh] fdisk gpt-init dry-run OK'
     '[hsh] fdisk gpt init/add/del/verify OK'
+    '[hsh] fdisk image-file gpt-init/add/list/resize/verify OK'
     '[terminal] keyboard service online, starting /bin/hsh.elf session'
     '[init] FrameDraw duplicate self-check OK'
     '[init] stage selftest ok'

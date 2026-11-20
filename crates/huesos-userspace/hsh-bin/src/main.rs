@@ -865,10 +865,10 @@ impl InteractiveShell {
         //     live volume on the default target is never touched; the real
         //     GPT writer, its CRC recomputation and `verify` all run for real.
         //
-        //     Writing the same cycle to an image *file* inside HxFS is not
-        //     possible yet: the service write path accepts only a whole-file
-        //     rewrite or sequential 4 KiB appends, so the GPT writer's
-        //     `write_at(512)` comes back `Unsupported`.
+        //     The same cycle also has to work on a disk image stored as an
+        //     ordinary HxFS *file*: that is what needs random-offset writes
+        //     (GPT header at byte 512, entry array at 1024, backup header at
+        //     the end of the file) and it used to come back `Unsupported`.
         let image = " /dev/mem";
         let dry = smoke_env.eval_script(
             &format!("fdisk gpt-init{image} --dry-run --size 64M"),
@@ -889,6 +889,9 @@ impl InteractiveShell {
         let gpt_cycle = [
             format!("fdisk gpt-init{image} --size 64M"),
             format!("fdisk add{image} --type hxfs --size 16M"),
+            format!("fdisk verify{image}"),
+            format!("fdisk resize 1{image} --size 20M"),
+            format!("fdisk list{image}"),
             format!("fdisk verify{image}"),
             format!("fdisk del 1{image}"),
             format!("fdisk verify{image}"),
@@ -922,6 +925,46 @@ impl InteractiveShell {
         }
         if gpt_ok {
             println!("[hsh] fdisk gpt init/add/del/verify OK");
+        }
+
+        // 10c. The same GPT cycle against a disk image that lives as a plain
+        //      HxFS file. This is the end-to-end proof of the service's
+        //      random-offset write path: `fdisk` writes LBA 1 and the entry
+        //      array through `write_at(offset)`, which the filesystem used to
+        //      refuse for anything but a whole-file rewrite.
+        if self.host.hxfs.is_some() {
+            let image_file = " /disk.img";
+            let file_cycle = [
+                format!("fdisk gpt-init{image_file} --size 32M"),
+                format!("fdisk add{image_file} --type hxfs --size 8M"),
+                format!("fdisk list{image_file}"),
+                format!("fdisk resize 1{image_file} --size 12M"),
+                format!("fdisk verify{image_file}"),
+            ];
+            let mut file_ok = true;
+            for cmd in &file_cycle {
+                match smoke_env.eval_script(cmd, &mut self.host) {
+                    Ok(res) if res.status == 0 => {}
+                    Ok(res) => {
+                        println!(
+                            "[hsh] fdisk image-file FAILED cmd='{}' status={} out={}",
+                            cmd,
+                            res.status,
+                            res.render_text()
+                        );
+                        file_ok = false;
+                        break;
+                    }
+                    Err(e) => {
+                        println!("[hsh] fdisk image-file ERROR cmd='{}': {}", cmd, e);
+                        file_ok = false;
+                        break;
+                    }
+                }
+            }
+            if file_ok {
+                println!("[hsh] fdisk image-file gpt-init/add/list/resize/verify OK");
+            }
         }
 
         // 11. Bare `HxFS v7` volume (superfloppy) detection. Only meaningful on

@@ -14,6 +14,7 @@ import sys
 import tempfile
 from pathlib import Path
 
+import gpt_image
 from hxfs_image import build_legacy_v6_image, build_legacy_v6_image_stream
 
 
@@ -128,6 +129,16 @@ def main() -> int:
         help="Seed mode: store this file (ELF/WAD) as an Hxblob object",
     )
     parser.add_argument(
+        "--gpt",
+        action="store_true",
+        help=(
+            "Wrap the formatted volume in a protective MBR + GPT with one "
+            "HxFS v7 partition (1 MiB aligned). This is the NVMe image "
+            "generator layout; the mount path probes it before falling back "
+            "to a bare-superblock superfloppy."
+        ),
+    )
+    parser.add_argument(
         "--legacy-v6", action="store_true",
         help="Create a read-only legacy v6 fixture for explicit migration tests",
     )
@@ -142,6 +153,20 @@ def main() -> int:
         parser.error("seed options require --seed-file")
     if args.legacy_v6 and args.seed_file is not None:
         parser.error("--legacy-v6 cannot be combined with seeded generation")
+    if args.legacy_v6 and args.gpt:
+        parser.error("--gpt cannot be combined with --legacy-v6")
+    total_blocks = args.blocks
+    if args.gpt:
+        volume_blocks = total_blocks - gpt_image.GPT_HEAD_4K - gpt_image.GPT_TAIL_4K
+        if volume_blocks < 64:
+            parser.error(
+                "--gpt needs a disk of at least "
+                f"{gpt_image.GPT_HEAD_4K + gpt_image.GPT_TAIL_4K + 64} 4 KiB blocks; "
+                "the first 1 MiB and the last 136 KiB are GPT metadata"
+            )
+        # The HxFS builder is asked for the *volume* size; the partition is
+        # what the mount path sees, so the volume never contains GPT blocks.
+        args.blocks = volume_blocks
     # Build next to the destination and publish only after successful formatting.
     # A small/invalid image must not truncate an existing disk image.
     destination = args.output
@@ -163,6 +188,20 @@ def main() -> int:
             status = run_seed_tool(args)
             if status:
                 return status
+        # The volume is formatted; place it in the partition and publish the
+        # partitioned image. The volume itself never sees GPT blocks.
+        if args.gpt:
+            layout = gpt_image.wrap_volume(
+                volume_path=args.output,
+                out_path=destination,
+                total_blocks_4k=total_blocks,
+            )
+            print(
+                f"wrote {destination} ({total_blocks * 4096} bytes): "
+                f"protective MBR + GPT, HxFS v7 volume {layout['volume_blocks_4k']} "
+                f"blocks at LBA {layout['first_lba']}..{layout['last_lba']}"
+            )
+            return 0
         os.replace(args.output, destination)
         print(f"wrote {destination} ({args.blocks * 4096} bytes)")
     finally:

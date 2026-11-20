@@ -78,6 +78,7 @@ test-hxfs-features:
 image-check:
 	cargo fmt --manifest-path tools/hxfs-seed/Cargo.toml --all -- --check
 	python3 tools/test-hxfs-images.py
+	python3 tools/test-gpt-image.py
 	RUST_MIN_STACK=16777216 cargo test --manifest-path tools/hxfs-seed/Cargo.toml \
 		--target x86_64-unknown-linux-gnu -Z build-std=
 	cargo clippy --manifest-path tools/hxfs-seed/Cargo.toml --bins \
