@@ -12,6 +12,35 @@ permissions:
   contents: write
 
 jobs:
+  vendor:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+      - name: Vendor the registry
+        run: |
+          set -eux
+          rustup toolchain install nightly-2026-03-01 --profile minimal
+          cargo +nightly-2026-03-01 vendor vendor > vendor-config.toml
+          du -sh vendor
+      - name: Publish
+        run: |
+          set -eux
+          tar --zstd -cf vendor.tar.zst vendor vendor-config.toml
+          split -b 20M -a 2 vendor.tar.zst vpart-
+          sha256sum vpart-* > VSHA256SUMS
+          mkdir publish && mv vpart-* VSHA256SUMS publish/
+          cd publish
+          git init -q
+          git checkout -q -b lab/vendor
+          git config user.name huesos-lab
+          git config user.email lab@huesos.invalid
+          git add -A
+          git commit -q -m "lab: vendored registry for the dev sandbox"
+          URL="https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git"
+          git push -q --force "$URL" HEAD:refs/heads/lab/vendor
+
   pack:
     runs-on: ubuntu-22.04
     steps:
