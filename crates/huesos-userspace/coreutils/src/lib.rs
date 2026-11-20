@@ -26,6 +26,8 @@ const BOOTFS_PATH_SIZE: usize = 192;
 const BOOTFS_MAGIC: &[u8; 8] = b"HBOOTFS1";
 
 /// Collect `argv[1..]` as owned UTF-8 strings.
+pub mod disk;
+
 pub fn collect_args() -> Vec<String> {
     std_env::args()
 }

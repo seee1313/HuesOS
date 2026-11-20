@@ -63,10 +63,40 @@ path = "src/bin/sleep.rs"
 name = "std-smoke"
 path = "src/bin/std_smoke.rs"
 
+[[bin]]
+name = "hexdump"
+path = "src/bin/hexdump.rs"
+
+[[bin]]
+name = "dd"
+path = "src/bin/dd.rs"
+
+[[bin]]
+name = "df"
+path = "src/bin/df.rs"
+
+[[bin]]
+name = "du"
+path = "src/bin/du.rs"
+
+[[bin]]
+name = "lsblk"
+path = "src/bin/lsblk.rs"
+
+[[bin]]
+name = "fsck"
+path = "src/bin/fsck.rs"
+
+[[bin]]
+name = "mkfs"
+path = "src/bin/mkfs.rs"
+
 [dependencies]
 libcanvas = { path = "../libcanvas", default-features = false, features = ["dyn-client"] }
 huesos-abi = { path = "../../huesos-abi" }
 huesos-std = { path = "../huesos-std" }
+huesos-gpt = { path = "../../huesos-gpt" }
+huesos-hxfs = { path = "../../huesos-hxfs", features = ["writer"] }
 
 [profile.release]
 opt-level = 2
