@@ -946,6 +946,23 @@ impl InteractiveShell {
             Err(e) => println!("[hsh] huesos-std smoke ERROR: {}", e),
         }
 
+        // 10d. `/bin/df.elf` is the smallest of the new disk utilities: it
+        //      needs the filesystem service for its numbers and `huesos-std`
+        //      for the table, so one successful run proves both the service
+        //      path and the formatting/streaming path of the standard library
+        //      from a real `_start`-to-exit program.
+        match smoke_env.eval_script("df", &mut self.host) {
+            Ok(res) if res.status == 0 && res.render_text().contains("Filesystem") => {
+                println!("[hsh] df table OK");
+            }
+            Ok(res) => println!(
+                "[hsh] df FAILED status={} out={}",
+                res.status,
+                res.render_text()
+            ),
+            Err(e) => println!("[hsh] df ERROR: {}", e),
+        }
+
         // 11. Bare `HxFS v7` volume (superfloppy) detection. Only meaningful on
         //     a boot with a block device; the NVMe smoke attaches one.
         if self.host.hxfs.is_some() {
