@@ -34,13 +34,19 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Install the pinned nightly
         run: |
-          set -euo pipefail
-          curl -sSf https://sh.rustup.rs -o /tmp/rustup.sh
-          sh /tmp/rustup.sh -y --profile minimal --default-toolchain none
-          . "$HOME/.cargo/env"
-          rustup toolchain install nightly-2026-03-01 --profile minimal \
-            --component rust-src,clippy,rustfmt
-          rustc -vV
+          set +e
+          (
+            curl -sSf https://sh.rustup.rs -o /tmp/rustup.sh &&
+            sh /tmp/rustup.sh -y --profile minimal --default-toolchain none &&
+            . "$HOME/.cargo/env" &&
+            rustup toolchain install nightly-2026-03-01 --profile minimal               --component rust-src,clippy,rustfmt &&
+            rustc -vV
+          ) > /tmp/install.log 2>&1
+          status=$?
+          message=$(tail -c 3000 /tmp/install.log | tr '\n' '|' | sed 's/%/%25/g')
+          echo "::error title=install-status::exit ${status}"
+          echo "::error title=install-log::${message}"
+          exit "$status"
       - name: Pack it
         run: |
           set -euo pipefail
