@@ -4,7 +4,7 @@
 # from this environment (the log blob storage returns EOF) while the check-run
 # annotations API does work.
 #
-# Usage: bash scripts/arena-diag.sh <fmt|clippy|test|audit>
+# Usage: bash scripts/arena-diag.sh <fmt|clippy|test|audit|boot>
 #
 # Each invocation reports on exactly one gate and always exits 0: the workflow
 # job is a messenger, not a gate.
@@ -64,6 +64,19 @@ case "$gate" in
         make audit-check >>"$log" 2>&1
         status=$?
         [ "$status" -ne 0 ] && emit "audit-errors" "$log" 3000
+        ;;
+    boot)
+        # One real boot: the serial log is the only place the missing marker is
+        # named, and the hardening job's log cannot be downloaded from here.
+        ARTIFACT_DIR=/tmp/diag-boot bash scripts/ci-qemu-smoke.sh debug 2 120 >>"$log" 2>&1
+        status=$?
+        boot_log=/tmp/diag-boot/qemu-debug-smp2.log
+        {
+            grep -nE "missing [a-z]+ marker|\[std\]|\[hsh\].*(FAILED|OK)|PANIC|panic|boot stages complete|service started" "$boot_log" 2>/dev/null | tail -n 60 || true
+            echo "----- missing/failed from the harness -----"
+            grep -nE "missing|FAILED|forbidden|panic" "$log" | tail -n 40 || true
+        } >"$log.boot"
+        emit "boot-markers" "$log.boot" 6000
         ;;
     *)
         echo "unknown gate: $gate" >&2

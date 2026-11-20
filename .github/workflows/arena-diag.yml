@@ -17,6 +17,26 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  boot:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            gcc xorriso qemu-system-x86 swtpm swtpm-tools
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install nightly-2026-03-01 --profile minimal \
+            --component rust-src,llvm-tools-preview
+          rustup default nightly-2026-03-01
+      - name: gate boot
+        env:
+          CARGO_BUILD_JOBS: "1"
+        run: bash scripts/arena-diag.sh boot
+
   static:
     runs-on: ubuntu-24.04
     timeout-minutes: 60
