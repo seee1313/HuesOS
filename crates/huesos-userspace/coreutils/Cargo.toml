@@ -123,6 +123,10 @@ path = "src/bin/tar.rs"
 name = "sha256sum"
 path = "src/bin/sha256sum.rs"
 
+[[bin]]
+name = "nano"
+path = "src/bin/nano.rs"
+
 [dependencies]
 libcanvas = { path = "../libcanvas", default-features = false, features = ["dyn-client"] }
 huesos-abi = { path = "../../huesos-abi" }

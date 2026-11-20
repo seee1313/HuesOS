@@ -1204,6 +1204,10 @@ fn build_bootfs_image(manifest_dir: &Path, inputs: BootfsInputs<'_>) -> PathBuf 
             data: read_build_input(&inputs.coreutils_dir.join("sha256sum"), "sha256sum ELF"),
         },
         BootFsFile {
+            path: "/bin/nano.elf",
+            data: read_build_input(&inputs.coreutils_dir.join("nano"), "nano ELF"),
+        },
+        BootFsFile {
             path: "/lib/ld-huesos.so",
             data: read_build_input(inputs.ld_huesos, "ld-huesos.so"),
         },

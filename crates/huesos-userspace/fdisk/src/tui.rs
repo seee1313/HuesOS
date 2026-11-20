@@ -17,6 +17,7 @@ use alloc::vec::Vec;
 
 use huesos_gpt::{parse_size_lbas, Guid, GptDisk, LBA_SIZE};
 use huesos_std::io::{self, Read, Write};
+use huesos_std::tui;
 
 use crate::{Backend, BlockIo512, HXFS_BLOCK_SIZE};
 
@@ -182,11 +183,7 @@ fn draw(
 ) {
     let mut text = String::new();
     text.push_str("\x1b[2J\x1b[H");
-    text.push_str("\x1b[7m HuesOS fdisk ");
-    for _ in 0..50 {
-        text.push(' ');
-    }
-    text.push_str("\x1b[0m\r\n");
+    text.push_str(&format!("\x1b[7m{}\x1b[0m\r\n", tui::fit(" HuesOS fdisk ", 62)));
     text.push_str(&format!(
         " Disk   : {label}\r\n Sectors: {total_lbas} x {} bytes ({})\r\n GPT    : {}\r\n",
         LBA_SIZE,
@@ -194,7 +191,10 @@ fn draw(
         if disk.is_some() { "present" } else { "absent" }
     ));
     if dirty {
-        text.push_str(" State  : \x1b[33mMODIFIED\x1b[0m (w writes, q discards)\r\n");
+        text.push_str(&format!(
+            " State  : {} (w writes, q discards)\r\n",
+            tui::colored("MODIFIED", tui::Color::Yellow)
+        ));
     } else {
         text.push_str(" State  : CLEAN\r\n");
     }
@@ -440,30 +440,8 @@ fn number(text: &str) -> Result<usize, String> {
 
 /// Ask a question on the prompt line and read one line back.
 fn ask(out: &mut impl Write, prompt: &str) -> Result<String, String> {
-    put!(out, "\r\n {prompt}: ");
-    let mut line = String::new();
     let mut stdin = io::stdin();
-    let mut byte = [0u8; 1];
-    loop {
-        match stdin.read(&mut byte) {
-            Ok(0) => return Err(String::from("end of input")),
-            Ok(_) => match byte[0] {
-                b'\r' | b'\n' => break,
-                0x08 | 0x7f => {
-                    line.pop();
-                    put!(out, "\x08 \x08");
-                }
-                0x03 => return Err(String::from("cancelled")),
-                other if other.is_ascii_graphic() || other == b' ' => {
-                    line.push(other as char);
-                    put!(out, "{}", other as char);
-                }
-                _ => {}
-            },
-            Err(_) => return Err(String::from("stdin read failed")),
-        }
-    }
-    Ok(line)
+    tui::prompt(out, &mut stdin, prompt).ok_or_else(|| String::from("cancelled"))
 }
 
 fn quit_without_saving(out: &mut impl Write, dirty: &mut bool) {
@@ -510,25 +488,7 @@ fn read_key() -> Key {
     }
 }
 
-/// `1.5M`, `96M`, `200G`, `1T` -- the same units `fdisk` prints elsewhere.
+/// `1.5M`, `96M`, `200G`, `1T` -- the shared size formatter every tool uses.
 fn human_size(bytes: u64) -> String {
-    const UNITS: [(&str, u64); 5] = [
-        ("T", 1024 * 1024 * 1024 * 1024),
-        ("G", 1024 * 1024 * 1024),
-        ("M", 1024 * 1024),
-        ("K", 1024),
-        ("B", 1),
-    ];
-    for (suffix, scale) in UNITS {
-        if bytes >= scale {
-            let whole = bytes / scale;
-            let frac = (bytes % scale) * 10 / scale;
-            return if scale == 1 || frac == 0 {
-                format!("{whole}{suffix}")
-            } else {
-                format!("{whole}.{frac}{suffix}")
-            };
-        }
-    }
-    String::from("0B")
+    tui::human_bytes(bytes)
 }
