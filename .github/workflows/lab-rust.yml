@@ -1,10 +1,13 @@
 name: lab-rust
 
-# TEMPORARY (this branch only): pack a musl-hosted Rust toolchain on a runner
-# and publish it to a throwaway branch, because this sandbox cannot reach
-# static.rust-lang.org (to install) nor the artifact blob host (to download).
-# A musl-hosted toolchain is statically linked, so it runs in the sandbox
-# without patching glibc the way the portable QEMU needed.
+# TEMPORARY (this branch only): pack a Rust toolchain on a runner and publish it
+# to a throwaway branch, because this sandbox cannot reach static.rust-lang.org
+# (to install) nor the artifact blob host (to download).
+#
+# The job runs inside an Ubuntu 22.04 container so the toolchain binaries link
+# against glibc 2.35: the sandbox has 2.36, a 24.04 runner would produce
+# binaries that need 2.38/2.39 and a hand-patched symbol shim (the QEMU detour
+# of the previous round).
 on:
   workflow_dispatch:
   push:
@@ -20,39 +23,50 @@ concurrency:
 jobs:
   pack:
     runs-on: ubuntu-24.04
+    container: ubuntu:22.04
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - name: Install the musl-hosted toolchain
+      - name: Base tooling
         run: |
-          rustup toolchain install nightly-2026-03-01-x86_64-unknown-linux-musl \
-            --profile minimal --component rust-src,clippy,rustfmt
+          apt-get update -qq
+          DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+            curl ca-certificates git zstd xz-utils build-essential gcc
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Install the pinned nightly
+        run: |
+          set -euo pipefail
+          curl -sSf https://sh.rustup.rs -o /tmp/rustup.sh
+          sh /tmp/rustup.sh -y --profile minimal --default-toolchain none
+          . "$HOME/.cargo/env"
+          rustup toolchain install nightly-2026-03-01 --profile minimal \
+            --component rust-src,clippy,rustfmt
+          rustc -vV
       - name: Pack it
         run: |
           set -euo pipefail
-          TC="$HOME/.rustup/toolchains/nightly-2026-03-01-x86_64-unknown-linux-musl"
+          TC="$HOME/.rustup/toolchains/nightly-2026-03-01-x86_64-unknown-linux-gnu"
           rm -rf "$TC/share/doc" "$TC/share/man" "$TC/lib/rustlib/etc" \
-            "$TC/lib/rustlib/components" "$TC/lib/rustlib/manifest-*"
-          # The musl std, the compiler, and its driver .so are all that is
-          # needed; cargo/clippy/rustfmt live in the toolchain bin as well.
+            "$TC/lib/rustlib/components"
           du -sh "$TC"
           tar -C "$HOME/.rustup/toolchains" -cf - \
-            nightly-2026-03-01-x86_64-unknown-linux-musl | zstd -3 -T0 -o /tmp/lab-rust.tar.zst
+            nightly-2026-03-01-x86_64-unknown-linux-gnu | zstd -3 -T0 -o /tmp/lab-rust.tar.zst
           tar -C "$HOME/.cargo" -cf - bin | zstd -3 -T0 -o /tmp/lab-cargo-bin.tar.zst
           ls -l /tmp/lab-rust.tar.zst /tmp/lab-cargo-bin.tar.zst
       - name: Publish to a throwaway branch
         run: |
           set -euo pipefail
+          git config --global --add safe.directory "$PWD"
           git config user.email "lab-rust@huesos.invalid"
           git config user.name "lab-rust"
+          mkdir -p /tmp/parts
+          split -b 20M /tmp/lab-rust.tar.zst /tmp/parts/rust-
+          split -b 20M /tmp/lab-cargo-bin.tar.zst /tmp/parts/bin-
+          (cd /tmp/parts && sha256sum ./* > SHA256SUMS)
           git checkout --orphan lab-toolchain
           git rm -rq --cached . || true
-          rm -rf ./* ./.github 2>/dev/null || true
+          find . -mindepth 1 -maxdepth 1 ! -name .git -exec rm -rf {} +
           mkdir -p parts
-          split -b 20M /tmp/lab-rust.tar.zst parts/rust-
-          split -b 20M /tmp/lab-cargo-bin.tar.zst parts/bin-
-          (cd parts && sha256sum ./* > SHA256SUMS)
-          ls -l parts | head -30
+          cp /tmp/parts/* parts/
           git add -A
-          git commit -q -m "lab: musl-hosted Rust toolchain for the Arena sandbox"
+          git commit -q -m "lab: Rust nightly-2026-03-01 toolchain for the Arena sandbox"
           git push -f origin HEAD:refs/heads/lab/toolchain
