@@ -27,12 +27,13 @@ mod supervision;
 mod thread;
 mod vmar;
 mod vmo;
-pub mod futex;
 pub mod wait;
 
 pub mod boot_key;
 /// Kernel entropy pool (ChaCha20 DRBG) backing `SystemGetEntropy`.
 pub mod entropy;
+/// Futex wait queues backing `Syscall::FutexWait` / `FutexWake`.
+pub mod futex;
 /// Operator-tunable runtime knobs (Stage E.1) backing `SystemKnobGet` /
 /// `SystemKnobSet`.
 pub mod knobs;
