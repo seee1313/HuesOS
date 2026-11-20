@@ -52,7 +52,7 @@ jobs:
       - name: Install qemu
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq qemu-system-x86 ovmf 2>&1 | tail -5
+          sudo apt-get install -y -qq qemu-system-x86 ovmf xorriso mtools 2>&1 | tail -5
           qemu-system-x86_64 --version
 
       - name: Bundle binary and libraries
@@ -61,6 +61,9 @@ jobs:
           mkdir -p bundle/bin bundle/lib bundle/share
           cp "$(command -v qemu-system-x86_64)" bundle/bin/
           cp "$(command -v qemu-img)" bundle/bin/ 2>/dev/null || true
+          cp "$(command -v xorriso)" bundle/bin/ 2>/dev/null || true
+          cp "$(command -v mcopy)" bundle/bin/ 2>/dev/null || true
+          cp "$(command -v mformat)" bundle/bin/ 2>/dev/null || true
           # Every shared object the binary loads, flattened into bundle/lib.
           for exe in bundle/bin/*; do
             ldd "$exe" | awk '{print $3}' | grep -E '^/' || true
