@@ -2156,7 +2156,12 @@ pub unsafe extern "C" fn canvas_futex_wait(
     if uaddr.is_null() {
         return err_code(ErrorCode::InvalidArgs);
     }
-    let ret = raw::syscall3(Syscall::FutexWait, uaddr as u64, expected as u64, timeout_ticks);
+    let ret = raw::syscall3(
+        Syscall::FutexWait,
+        uaddr as u64,
+        expected as u64,
+        timeout_ticks,
+    );
     match raw::decode(ret) {
         Ok(_) => 0,
         Err(err) => err_code(err),

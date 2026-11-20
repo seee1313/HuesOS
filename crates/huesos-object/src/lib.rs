@@ -49,13 +49,13 @@ pub use channel::{
 pub use device_lease::{
     DeviceLease, DeviceLeaseError, DeviceLeaseSnapshot, DeviceLeaseState, PORT_PACKET_DEVICE_GONE,
 };
+pub use futex::{FutexNode, FutexTable};
 pub use handle::{Handle, HandleTable, HandleTableError, HandleValue, Rights, INVALID_HANDLE};
 pub use interrupt::{
     set_interrupt_route_hooks, Interrupt, InterruptBindError, InterruptBinding,
     InterruptRouteAcknowledgeFn, InterruptRouteAcquireFn, InterruptRouteKind,
     InterruptRouteReleaseFn,
 };
-pub use futex::{FutexNode, FutexTable};
 pub use job::{flush_pending_quota_notifications, Job};
 pub use koid::{alloc_koid, Koid};
 pub use object::{KernelObject, KernelObjectExt, ObjectType};

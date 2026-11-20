@@ -96,15 +96,19 @@ impl FutexTable {
         // `saturating_sub` rather than `fetch_sub`: an unmatched release is a
         // kernel bug, but it must not wrap the counter to `usize::MAX` and
         // strand the entry forever.
-        let previous = node.waiters.fetch_update(
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-            |count| Some(count.saturating_sub(1)),
-        );
+        let previous = node
+            .waiters
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
+                Some(count.saturating_sub(1))
+            });
         let now_empty = matches!(previous, Ok(0) | Ok(1));
         // Only remove the entry if it is still *this* node: a released and
         // re-acquired address may already have a younger queue.
-        if now_empty && nodes.get(&uaddr).is_some_and(|current| Arc::ptr_eq(current, node)) {
+        if now_empty
+            && nodes
+                .get(&uaddr)
+                .is_some_and(|current| Arc::ptr_eq(current, node))
+        {
             nodes.remove(&uaddr);
         }
     }

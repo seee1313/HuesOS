@@ -62,7 +62,11 @@ pub fn wait(word: &AtomicU32, expected: u32, timeout_ticks: u64) -> crate::Resul
 /// `max_wake == 0` wakes nobody and returns `Ok(0)`; `u32::MAX` is the
 /// "wake everybody" idiom. A wake with no waiters is `Ok(0)`, not an error.
 pub fn wake(word: &AtomicU32, max_wake: u32) -> crate::Result<usize> {
-    let ret = raw::syscall2(Syscall::FutexWake, word as *const AtomicU32 as u64, max_wake as u64);
+    let ret = raw::syscall2(
+        Syscall::FutexWake,
+        word as *const AtomicU32 as u64,
+        max_wake as u64,
+    );
     Ok(raw::decode(ret)? as usize)
 }
 
