@@ -38,9 +38,10 @@ jobs:
           make clippy > /tmp/clippy.log 2>&1
           status=$?
           if [ "$status" -ne 0 ]; then
-            message=$(tail -c 6000 /tmp/clippy.log | tr '\n' '|' | sed 's/%/%25/g')
             echo "::error title=clippy-status::exit ${status}"
-            echo "::error title=clippy-log::${message}"
+            errors=$(grep -n -E "^error(\[|:)|^  --> |^  = help|^note: " /tmp/clippy.log \
+              | head -40 | tr '\n' '|' | sed 's/%/%25/g')
+            echo "::error title=clippy-errors::${errors}"
             exit "$status"
           fi
       - name: QEMU nvme smoke (debug, 2)
@@ -52,9 +53,10 @@ jobs:
           bash scripts/ci-qemu-smoke.sh debug 2 120 > /tmp/qemu.log 2>&1
           status=$?
           if [ "$status" -ne 0 ]; then
-            message=$(tail -c 6000 /tmp/qemu.log | tr '\n' '|' | sed 's/%/%25/g')
             echo "::error title=qemu-status::exit ${status}"
-            echo "::error title=qemu-log::${message}"
+            errors=$(grep -n -E "error|ERROR|panic|FAIL|failed" /tmp/qemu.log \
+              | tail -30 | tr '\n' '|' | sed 's/%/%25/g')
+            echo "::error title=qemu-log::${errors}"
             serial=$(ls ci-artifacts/* 2>/dev/null | head -5)
             echo "::error title=qemu-artifacts::${serial}"
             tail -c 4000 ci-artifacts/*serial* 2>/dev/null | tr '\n' '|' | sed 's/^/::error title=serial::/' || true
