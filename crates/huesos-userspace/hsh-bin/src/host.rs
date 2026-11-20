@@ -448,15 +448,74 @@ impl HshHost {
     /// the shell resolves relative names before the spawn: explicit paths
     /// (`./x`, `../x`, `a/b`), home-relative `.`/`..`, and bare names that only
     /// exist relative to the current directory ("`cat welcome.txt`" in `/etc`).
+    /// Names that do not exist yet are resolved too (`mkdir sub`, `touch x`):
+    /// resolving only existing names would create them in `/` instead of the
+    /// working directory.
     fn absolutize_argument(&self, arg: &str) -> Option<String> {
-        // Flags stay untouched; every other argument in a path position is a
-        // path, including names that do not exist yet (`mkdir sub`,
-        // `mv a b`, `touch note.md`) -- resolving only existing names would
-        // silently create those in `/` instead of the working directory.
-        if arg.is_empty() || arg.starts_with('-') {
+        if arg.is_empty() {
             return None;
         }
         Some(self.normalize_path(arg))
+    }
+
+    /// Resolve the path arguments of one external command, leaving data alone.
+    ///
+    /// The rule is about *meaning*, not position: a bare word is a path only
+    /// when it is not a number, a size, a hex literal, a `key=value` pair or a
+    /// subcommand of the tool being started. That is what `sleep 30`,
+    /// `hexdump -n 128`, `du -d 1`, `mkfs -s 16M` and
+    /// `dd if=/dev/zero bs=512` need, and what `cat welcome.txt` also gets.
+    fn resolve_arguments(&self, name: &str, args: &[String]) -> Vec<String> {
+        /// Tools that take no path arguments at all.
+        const NO_PATH_ARGS: &[&str] = &["hxfs", "pci", "acpi", "ps", "sleep", "schedctl"];
+        let mut owned: Vec<String> = Vec::with_capacity(args.len() + 1);
+        if NO_PATH_ARGS.contains(&name) {
+            owned.extend(args.iter().cloned());
+            return owned;
+        }
+        // `write <path> <data>`: the payload is text, not a path.
+        let path_budget = if name == "write" { 1 } else { usize::MAX };
+        let mut paths_taken = 0usize;
+        let mut skip_value = false;
+        for arg in args {
+            if skip_value {
+                skip_value = false;
+                owned.push(arg.clone());
+                continue;
+            }
+            if flag_takes_value(name, arg) {
+                skip_value = true;
+                owned.push(arg.clone());
+                continue;
+            }
+            if arg.starts_with('-') {
+                owned.push(arg.clone());
+                continue;
+            }
+            // `if=/dev/zero`, `bs=512`, `of=firmware.bin`: the key is data, the
+            // value is a path only for the two keys that name one.
+            if let Some((key, value)) = arg.split_once('=') {
+                let path_key = matches!(key, "if" | "of");
+                if path_key && !value.starts_with('/') && !value.is_empty() {
+                    owned.push(format!("{key}={}", self.normalize_path(value)));
+                } else {
+                    owned.push(arg.clone());
+                }
+                continue;
+            }
+            if paths_taken >= path_budget || is_data_word(name, arg) {
+                owned.push(arg.clone());
+                continue;
+            }
+            match self.absolutize_argument(arg) {
+                Some(abs) => {
+                    paths_taken += 1;
+                    owned.push(abs);
+                }
+                None => owned.push(arg.clone()),
+            }
+        }
+        owned
     }
 
     fn resolve_elf(&mut self, name: &str) -> Option<(Vmo, u64, u64, String)> {
@@ -578,28 +637,11 @@ impl HshHost {
             query_holder = self.open_query_fresh();
         }
 
-        // Default relative path expansion when pwd != '/' for single path-free `ls`?
-        // Only pass explicit args directly as typed by user.
-        // Utilities take paths, not a working directory: resolve them here.
-        // `write` has (path, data) so only its first argument is a path; the
-        // service tools (hxfs/fdisk/pci/acpi/ps) take none at all.
-        let path_args = match name {
-            // Service tools and `sleep` take flags/intervals, not paths; a
-            // numeric interval must not be rewritten into `/30`.
-            "hxfs" | "fdisk" | "pci" | "acpi" | "ps" | "sleep" => 0,
-            "write" => 1,
-            _ => args.len(),
-        };
-        let mut owned_args: Vec<String> = Vec::with_capacity(args.len() + 1);
-        for (idx, a) in args.iter().enumerate() {
-            if idx < path_args {
-                if let Some(abs) = self.absolutize_argument(a) {
-                    owned_args.push(abs);
-                    continue;
-                }
-            }
-            owned_args.push(a.clone());
-        }
+        // Utilities take paths, not a working directory, so path arguments are
+        // resolved here. Everything that is *data* -- numbers, sizes, values
+        // after a flag that takes one, `key=value` pairs, subcommand words --
+        // has to arrive at the tool exactly as it was typed.
+        let owned_args = self.resolve_arguments(name, args);
         if name == "ls" && owned_args.is_empty() {
             owned_args.push(self.pwd.clone());
         }
@@ -981,4 +1023,66 @@ impl ShellHost for HshHost {
             .map_err(|e| format!("fsync '{abs}': {}", e.as_str()))?;
         Ok(())
     }
+}
+
+/// Flags whose following argument is a value, never a path.
+///
+/// Per command, because the same letter means different things: `head -n 5`
+/// takes a count while `sort -n` is a switch, and `grep -c` counts while
+/// `head -c 16` takes bytes. Values are data by definition, so the shell must
+/// not resolve them as paths (`hexdump -n 128` used to become `-n /128`).
+fn flag_takes_value(command: &str, flag: &str) -> bool {
+    match command {
+        "hexdump" => matches!(flag, "-n" | "--length" | "-s" | "--skip"),
+        "du" => matches!(flag, "-d" | "--max-depth"),
+        "mkfs" => matches!(flag, "-s" | "--size" | "-p" | "--part" | "-t" | "--type"),
+        "head" | "tail" => matches!(flag, "-n" | "--lines" | "-c" | "--bytes"),
+        "sort" => matches!(flag, "-k" | "--key" | "-t" | "--field-separator"),
+        "grep" => matches!(flag, "-e" | "--regexp" | "-m" | "--max-count"),
+        "find" => matches!(flag, "-name" | "-type" | "-maxdepth" | "-iname"),
+        "fdisk" => matches!(
+            flag,
+            "--type" | "--size" | "--start" | "--end" | "--name"
+        ),
+        // `-cf`, `-tf`, `-xf`, `-f`: every archive flag that names the archive.
+        "tar" => flag.starts_with('-') && flag.ends_with('f') || matches!(flag, "-C" | "--directory"),
+        _ => false,
+    }
+}
+
+/// True when `word` is data for `command`, not a path.
+fn is_data_word(command: &str, word: &str) -> bool {
+    if is_number_or_size(word) {
+        return true;
+    }
+    // Subcommands of the multi-command tools.
+    let subcommands: &[&str] = match command {
+        "fdisk" => &["list", "inspect", "verify", "gpt-init", "add", "del", "resize"],
+        "hxfs" => &["status", "stats", "scrub", "snapshot", "sync", "gc"],
+        "schedctl" => &["cpus", "tasks", "bench"],
+        _ => &[],
+    };
+    subcommands.contains(&word)
+}
+
+/// `128`, `0x1f`, `16M`, `512B`, `4K`, `200G`, `1T`, `+32M`.
+fn is_number_or_size(word: &str) -> bool {
+    let body = word.strip_prefix('+').unwrap_or(word);
+    if body.is_empty() {
+        return false;
+    }
+    if let Some(hex) = body.strip_prefix("0x").or_else(|| body.strip_prefix("0X")) {
+        return !hex.is_empty() && hex.chars().all(|c| c.is_ascii_hexdigit());
+    }
+    let (digits, suffix) = match body.char_indices().last() {
+        Some((idx, last)) if last.is_ascii_alphabetic() => (&body[..idx], &body[idx..]),
+        _ => (body, ""),
+    };
+    if digits.is_empty() || !digits.chars().all(|c| c.is_ascii_digit()) {
+        return false;
+    }
+    matches!(
+        suffix,
+        "" | "B" | "b" | "K" | "k" | "M" | "m" | "G" | "g" | "T" | "t"
+    )
 }

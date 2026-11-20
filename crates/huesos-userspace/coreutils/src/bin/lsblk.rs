@@ -56,7 +56,18 @@ fn run() -> i32 {
     let io = match DiskIo::open(target, false) {
         Ok(io) => io,
         Err(error) => {
-            cu::errln(&format!("lsblk: cannot open device: {error}"));
+            // Distinguish "this process was not given the disk" from "the disk
+            // itself is unusable": collapsing them into one message is what
+            // made `lsblk` look broken on a machine that simply had no storage
+            // channel to hand out.
+            if target.is_none() && !disk::has_block_device() {
+                cu::errln(
+                    "lsblk: no block device in this process (the shell grants one only when \
+                     the NVMe service is online); pass an image path instead",
+                );
+                return 1;
+            }
+            cu::errln(&format!("lsblk: cannot open {error}"));
             return 1;
         }
     };

@@ -653,6 +653,47 @@ impl GptDisk {
         Ok(slot_idx + 1)
     }
 
+    /// Change the type GUID of 1-based partition `part_num`.
+    ///
+    /// The entry keeps its start, end, name and unique GUID: retyping a
+    /// partition is exactly that and nothing else.
+    pub fn set_partition_type(&mut self, part_num: usize, type_guid: Guid) -> Result<(), String> {
+        let entry = self.entry_mut(part_num)?;
+        entry.type_guid = type_guid;
+        self.recompute_crcs();
+        Ok(())
+    }
+
+    /// Rename 1-based partition `part_num`.
+    ///
+    /// GPT names are UTF-16 in 36 code units, which is why every name the
+    /// tools write here is short and ASCII; anything longer is refused rather
+    /// than silently truncated.
+    pub fn set_partition_name(&mut self, part_num: usize, name: &str) -> Result<(), String> {
+        if name.chars().count() > 35 {
+            return Err(format!("name too long: {name}"));
+        }
+        let entry = self.entry_mut(part_num)?;
+        entry.name = String::from(name);
+        self.recompute_crcs();
+        Ok(())
+    }
+
+    /// Mutable view of 1-based partition `part_num`, refusing empty slots.
+    fn entry_mut(&mut self, part_num: usize) -> Result<&mut GptEntry, String> {
+        let idx = part_num
+            .checked_sub(1)
+            .ok_or_else(|| String::from("partition numbers are 1-based"))?;
+        let entry = self
+            .entries
+            .get_mut(idx)
+            .ok_or_else(|| format!("invalid partition number {part_num}"))?;
+        if entry.is_unused() {
+            return Err(format!("partition {part_num} is empty"));
+        }
+        Ok(entry)
+    }
+
     /// Delete 1-based partition index.
     pub fn delete_partition(&mut self, part_num: usize) -> Result<(), String> {
         let idx = part_num

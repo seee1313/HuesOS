@@ -61,6 +61,16 @@ impl BlockDevice {
         })
     }
 
+    /// Borrow the underlying device channel.
+    pub fn channel(&self) -> &Channel {
+        &self.channel
+    }
+
+    /// Consume this handle and return the device channel.
+    pub fn into_channel(self) -> Channel {
+        self.channel
+    }
+
     /// Query namespace/device information.
     pub fn info(&mut self) -> Result<AsyncBlockInfo> {
         let request_id = self.alloc_request_id();

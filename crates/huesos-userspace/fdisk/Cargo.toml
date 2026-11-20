@@ -12,6 +12,7 @@ libcanvas = { path = "../libcanvas", default-features = false, features = ["dyn-
 huesos-abi = { path = "../../huesos-abi" }
 huesos-gpt = { path = "../../huesos-gpt" }
 huesos-hxfs = { path = "../../huesos-hxfs" }
+huesos-std = { path = "../huesos-std" }
 
 [profile.release]
 opt-level = 2
