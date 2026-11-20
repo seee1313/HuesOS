@@ -55,8 +55,11 @@ jobs:
           if [ "$status" -ne 0 ]; then
             echo "::error title=qemu-status::exit ${status}"
             errors=$(grep -n -E "error|ERROR|panic|FAIL|failed" /tmp/qemu.log \
-              | tail -30 | tr '\n' '|' | sed 's/%/%25/g')
+              | tail -20 | tr '\n' '|' | sed 's/%/%25/g')
             echo "::error title=qemu-log::${errors}"
+            ctx=$(grep -n -B25 -A10 -E "stage storage FAILED|MISSING|expected" /tmp/qemu.log \
+              | tail -60 | tr '\n' '|' | sed 's/%/%25/g')
+            echo "::error title=qemu-context::${ctx}"
             serial=$(ls ci-artifacts/* 2>/dev/null | head -5)
             echo "::error title=qemu-artifacts::${serial}"
             tail -c 4000 ci-artifacts/*serial* 2>/dev/null | tr '\n' '|' | sed 's/^/::error title=serial::/' || true
