@@ -111,7 +111,10 @@ fn cmd_scrub() -> i32 {
     }
     let hxfs = cu::take_hxfs();
     let hxfs_dir = cu::take_hxfs_dir();
-    let dir_opt = hxfs.as_ref().and_then(|s| s.root().ok()).or(hxfs_dir);
+    // `root()` hands back an owned handle the caller owns; a scoped handle is
+    // the subtree root itself and is only borrowed for the listing below.
+    let owned_root = hxfs.and_then(|svc| svc.root().ok());
+    let dir_opt = owned_root.as_ref().or(hxfs_dir);
 
     cu::outln("entry\tkind\tverify");
     let Some(dir) = dir_opt else {

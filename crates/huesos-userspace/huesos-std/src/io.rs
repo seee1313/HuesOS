@@ -237,3 +237,10 @@ macro_rules! eprintln {
         $crate::eprint!("{}\n", core::format_args!($($arg)*))
     };
 }
+
+/// Buffered and in-memory I/O, re-exported so `io::BufReader` resolves the way
+/// it does in `std`.
+pub use crate::buffered::{
+    copy, empty, read_exact, read_to_string, repeat, sink, BufRead, BufReader, BufWriter, Cursor,
+    Empty, LineWriter, Lines, Repeat, Sink, DEFAULT_BUF_SIZE,
+};

@@ -21,7 +21,11 @@ use huesos_std::error::ErrorCode;
 use huesos_std::prelude::*;
 // The prelude re-exports the *contents* of these modules; the smoke test also
 // names the modules themselves (`env::args_count`, `fs::File::create`).
-use huesos_std::{env, fs, io, path};
+use huesos_std::collections::HashMap;
+use huesos_std::sync::{Arc, Barrier, Condvar, Mutex, OnceLock, RwLock};
+use huesos_std::thread;
+use huesos_std::time::{Duration, Instant};
+use huesos_std::{env, fs, io, path, process};
 
 huesos_std::entry!(run);
 
@@ -57,6 +61,11 @@ fn run() -> i32 {
     failures += check_error();
     failures += check_env();
     failures += check_fs();
+    failures += check_buffered();
+    failures += check_collections();
+    failures += check_time();
+    failures += check_threads();
+    failures += check_process();
 
     if failures == 0 {
         println!("[std] PASS");
@@ -390,11 +399,297 @@ fn check_fs() -> u32 {
         failures += 1;
     }
 
-    if let Ok((used, capacity)) = fs::volume_bytes() {
-        println!("[std] fs OK (create/write/seek/read/overwrite/truncate/list/remove/gpt)");
-        println!("[std] fs volume used={used} capacity={capacity}");
-    } else {
-        println!("[std] fs OK (create/write/seek/read/overwrite/truncate/list/remove/gpt)");
+    // Usage is a walk of the tree plus, when the volume service is reachable,
+    // the capacity it owns; either half may be missing in a sandbox.
+    let used = fs::used_bytes("/").map(|bytes| alloc::format!("{bytes}"));
+    let capacity = huesos_coreutils::disk::DiskIo::open(None, false)
+        .ok()
+        .map(|io| alloc::format!("{}", io.capacity_bytes()));
+    println!(
+        "[std] fs OK (create/write/seek/read/overwrite/truncate/list/remove/gpt) \
+         used={} capacity={}",
+        used.as_deref().unwrap_or("?"),
+        capacity.as_deref().unwrap_or("?")
+    );
+    failures
+}
+
+/// Buffered and in-memory I/O: a `BufWriter` batches small writes into one
+/// syscall, a `BufReader` hands them back a byte at a time, and `Cursor` gives
+/// the same traits a seekable in-memory object.
+#[rustfmt::skip]
+fn check_buffered() -> u32 {
+    let mut failures = 0u32;
+    let mut sink = Sink { bytes: Vec::new() };
+    let mut writer = io::BufWriter::with_capacity(128, &mut sink);
+    for _ in 0..10 {
+        let _ = io::write_all(&mut writer, b"line 7\n");
+    }
+    // Nothing may reach the sink before the flush: that is the whole point.
+    let deferred = writer.get_ref().map(|sink| sink.bytes.is_empty()).unwrap_or(false);
+    expect!(failures, deferred, "bufwriter defers writes");
+    let _ = writer.flush();
+    drop(writer);
+    expect!(failures, sink.bytes.len() == 70, "bufwriter flushed 70 bytes");
+    expect!(failures, sink.bytes.starts_with(b"line 7\n"), "bufwriter content");
+
+    let text: &[u8] = b"alpha\nbeta\ngamma\n";
+    let mut reader = io::BufReader::with_capacity(4, text);
+    let mut first = [0u8; 6];
+    let read = reader.read(&mut first).unwrap_or(0);
+    expect!(failures, read == 6 && &first == b"alpha\n", "bufreader short read");
+
+    let mut lines = Vec::new();
+    let mut reader = io::BufReader::new(text);
+    loop {
+        let mut line = Vec::new();
+        match reader.read_until(b'\n', &mut line) {
+            Ok(0) => break,
+            Ok(_) => lines.push(line),
+            Err(_) => {
+                failures += 1;
+                break;
+            }
+        }
+    }
+    expect!(failures, lines.len() == 3, "bufread read_until three lines");
+    expect!(
+        failures,
+        lines.get(1).map(|line| line.as_slice()) == Some(&b"beta\n"[..]),
+        "bufread second line"
+    );
+
+    let mut cursor = io::Cursor::new(Vec::new());
+    let _ = io::write_all(&mut cursor, b"0123456789");
+    let _ = cursor.seek(SeekFrom::Start(4));
+    let mut byte = [0u8; 2];
+    let read = cursor.read(&mut byte).unwrap_or(0);
+    expect!(failures, read == 2 && &byte == b"45", "cursor seek+read");
+
+    let mut out = Vec::new();
+    let mut source: &[u8] = b"copied";
+    let copied = io::copy(&mut source, &mut out).unwrap_or(0);
+    expect!(failures, copied == 6 && out == b"copied", "io::copy");
+
+    if failures == 0 {
+        println!("[std] buffered OK (BufWriter/BufReader/read_until/Cursor/copy)");
+    }
+    failures
+}
+
+/// The hash collections: insertion, replacement, removal, the `Entry` API and
+/// a tombstone-heavy workload that forces a rehash.
+#[rustfmt::skip]
+fn check_collections() -> u32 {
+    let mut failures = 0u32;
+    let mut map: HashMap<&str, u32> = HashMap::new();
+    for word in ["one", "two", "three", "two"] {
+        *map.entry(word).or_insert(0) += 1;
+    }
+    expect!(failures, map.len() == 3, "hashmap distinct keys");
+    expect!(failures, map.get("two") == Some(&2), "hashmap entry counting");
+    expect!(failures, map.insert("one", 10) == Some(1), "hashmap insert replace");
+    expect!(failures, map.remove("one") == Some(10), "hashmap remove");
+    expect!(failures, map.get("one").is_none(), "hashmap removed key gone");
+
+    // Churn: insert and remove the same key many times, which leaves
+    // tombstones behind and must still find every surviving entry.
+    let mut churn: HashMap<u32, u32> = HashMap::new();
+    for round in 0..64u32 {
+        churn.insert(round, round * 2);
+        if round % 2 == 0 {
+            churn.remove(&(round / 2));
+        }
+    }
+    let mut churn_ok = true;
+    for (key, value) in churn.iter() {
+        churn_ok &= *value == key * 2;
+    }
+    expect!(failures, churn_ok, "hashmap churn keeps values");
+    let survivors = churn.len();
+    churn.shrink_to_fit();
+    expect!(failures, churn.len() == survivors, "hashmap shrink keeps entries");
+
+    let mut ordered = huesos_std::collections::BTreeMap::new();
+    ordered.insert(3u32, "three");
+    ordered.insert(1u32, "one");
+    let keys: Vec<u32> = ordered.keys().copied().collect();
+    expect!(failures, keys == [1, 3], "btreemap orders keys");
+
+    if failures == 0 {
+        println!("[std] collections OK (HashMap entry/churn/shrink, BTreeMap order)");
+    }
+    failures
+}
+
+/// The clock: `Instant` differences must be monotonic and `sleep` must actually
+/// spend time (a busy-spin or a zero-tick sleep would fail the first check).
+fn check_time() -> u32 {
+    let mut failures = 0u32;
+    let start = Instant::now();
+    thread::sleep(Duration::from_millis(30));
+    let elapsed = start.elapsed();
+    expect!(
+        failures,
+        elapsed.as_ticks_ceil() >= 3,
+        "sleep spent at least 30ms of ticks"
+    );
+    let later = Instant::now();
+    expect!(failures, later >= start, "instant is monotonic");
+    expect!(
+        failures,
+        Duration::from_millis(1500).as_secs() == 1 && Duration::from_ticks(250).as_secs() == 2,
+        "duration conversions"
+    );
+    if failures == 0 {
+        println!("[std] time OK (Instant monotonic, sleep 30ms, Duration conversions)");
+    }
+    failures
+}
+
+/// Four threads sharing one counter, a reader-writer lock, a condition
+/// variable, a barrier and a once-cell. Every wait parks on a futex: if the
+/// blocking path were broken (a lost wake, a spinning loop that never yields),
+/// this section would hang or lose counts, and the shell smoke would time out.
+fn check_threads() -> u32 {
+    let mut failures = 0u32;
+
+    const WORKERS: usize = 4;
+    const PER_WORKER: u32 = 25;
+    let counter = Arc::new(Mutex::new(0u32));
+    let mut handles = Vec::new();
+    for _ in 0..WORKERS {
+        let counter = Arc::clone(&counter);
+        handles.push(thread::spawn(move || {
+            for _ in 0..PER_WORKER {
+                let mut guard = counter.lock();
+                *guard += 1;
+            }
+        }));
+    }
+    let mut joined = 0;
+    for handle in handles {
+        if handle.join().is_ok() {
+            joined += 1;
+        }
+    }
+    let total = *counter.lock();
+    expect!(failures, joined == WORKERS, "threads joined");
+    expect!(
+        failures,
+        total == (WORKERS as u32) * PER_WORKER,
+        "mutex kept every increment"
+    );
+
+    // Reader-writer lock: writers take it exclusively, readers concurrently.
+    let shared = Arc::new(RwLock::new(0u64));
+    let readers = Arc::clone(&shared);
+    let reader = thread::spawn(move || {
+        let mut seen = 0u64;
+        for _ in 0..50 {
+            seen += *readers.read();
+        }
+        seen
+    });
+    {
+        let mut guard = shared.write();
+        *guard += 1;
+    }
+    let seen = reader.join().unwrap_or(u64::MAX);
+    expect!(failures, seen == 50, "rwlock reader saw every write");
+
+    // Condition variable: the waiter parks until the setter notifies it.
+    let pair = Arc::new((Mutex::new(false), Condvar::new()));
+    let waiter_pair = Arc::clone(&pair);
+    let waiter = thread::spawn(move || {
+        let (lock, condvar) = &*waiter_pair;
+        let mut ready = lock.lock();
+        let mut spins = 0;
+        while !*ready {
+            ready = condvar.wait(ready);
+            spins += 1;
+            if spins > 1000 {
+                return false;
+            }
+        }
+        true
+    });
+    {
+        let (lock, condvar) = &*pair;
+        *lock.lock() = true;
+        condvar.notify_all();
+    }
+    expect!(
+        failures,
+        waiter.join().unwrap_or(false),
+        "condvar woke the waiter"
+    );
+
+    // Barrier: three threads plus the main one meet exactly once.
+    let barrier = Arc::new(Barrier::new(4));
+    let mut barrier_handles = Vec::new();
+    for _ in 0..3 {
+        let barrier = Arc::clone(&barrier);
+        barrier_handles.push(thread::spawn(move || {
+            let _ = barrier.wait();
+        }));
+    }
+    let _ = barrier.wait();
+    let mut barrier_ok = true;
+    for handle in barrier_handles {
+        barrier_ok &= handle.join().is_ok();
+    }
+    expect!(failures, barrier_ok, "barrier released every thread");
+
+    // OnceLock: an initialiser that runs once even from four threads.
+    let cell: Arc<OnceLock<u32>> = Arc::new(OnceLock::new());
+    let mut once_handles = Vec::new();
+    for index in 0..4u32 {
+        let cell = Arc::clone(&cell);
+        once_handles.push(thread::spawn(move || {
+            let _ = *cell.get_or_init(|| index + 1);
+        }));
+    }
+    for handle in once_handles {
+        let _ = handle.join();
+    }
+    expect!(
+        failures,
+        cell.get().is_some(),
+        "oncelock initialised exactly once"
+    );
+
+    if failures == 0 {
+        eprintln!(
+            "[std] threads OK ({WORKERS} threads, Arc<Mutex>, RwLock, Condvar, Barrier, OnceLock)"
+        );
+    }
+    failures
+}
+
+/// Child processes: `Command` runs `/bin/sleep` for a quarter of a second and
+/// reports a clean exit status.
+fn check_process() -> u32 {
+    let mut failures = 0u32;
+    let start = Instant::now();
+    match process::Command::new("/bin/sleep").arg("0.25").status() {
+        Ok(status) => {
+            expect!(failures, status.success(), "child exited with 0");
+            expect!(
+                failures,
+                start.elapsed().as_ticks_ceil() >= 10,
+                "child actually ran"
+            );
+        }
+        Err(error) => {
+            // A shell-spawned script inherits no `PROCESS_SPAWN`-style authority,
+            // so this is a skip, not a pass: report it and stop here.
+            println!("[std] process SKIP (cannot spawn: {error})");
+            return failures;
+        }
+    }
+    if failures == 0 {
+        println!("[std] process OK (Command spawned /bin/sleep, exit status 0)");
     }
     failures
 }

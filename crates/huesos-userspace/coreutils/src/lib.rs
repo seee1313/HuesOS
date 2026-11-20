@@ -26,6 +26,8 @@ const BOOTFS_PATH_SIZE: usize = 192;
 const BOOTFS_MAGIC: &[u8; 8] = b"HBOOTFS1";
 
 /// Collect `argv[1..]` as owned UTF-8 strings.
+pub mod disk;
+
 pub fn collect_args() -> Vec<String> {
     std_env::args()
 }
@@ -92,12 +94,12 @@ pub fn check_query_ro() -> Result<(), i32> {
 }
 
 /// Take granted `Hxfs` service handle if present.
-pub fn take_hxfs() -> Option<Hxfs> {
+pub fn take_hxfs() -> Option<&'static Hxfs> {
     std_fs::service()
 }
 
 /// Take granted `HxfsDirectory` handle if present.
-pub fn take_hxfs_dir() -> Option<HxfsDirectory> {
+pub fn take_hxfs_dir() -> Option<&'static HxfsDirectory> {
     std_fs::directory()
 }
 

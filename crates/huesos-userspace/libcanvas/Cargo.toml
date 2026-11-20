@@ -11,6 +11,11 @@ local-heap = ["dep:huesos-scudo"]
 c-abi = ["local-heap"]
 # Thin Rust client wrapper forwarding syscalls and heap allocations to `libcanvas.so`.
 dyn-client = []
+# Closure-based thread spawning (`thread::spawn_task`). Separate from
+# `dyn-client` because it is the crate's only allocation: enabling it makes the
+# final binary link `alloc`, so only crates that provide a global allocator (for
+# example `huesos-std`, whose `entry!` macro declares one) may turn it on.
+thread-tasks = ["dyn-client"]
 # Boot-time negative syscall probes used by huesos-init/QEMU smoke tests.
 kernel-smoke-tests = []
 
@@ -19,6 +24,12 @@ huesos-abi = { path = "../../huesos-abi" }
 huesos-elf = { path = "../../huesos-elf" }
 huesos-scudo = { path = "../../huesos-scudo", optional = true }
 huesos-blobfs = { path = "../../huesos-blobfs" }
+# Pinned directly, not inherited: `huesos-std` builds this crate inside its own
+# workspace, where the root workspace's dependency table does not exist. The
+# feature list is minimal on purpose: `lock_api` (a default feature) is a
+# separate crate we do not need, and every feature here is one `huesos-std`
+# layers policy on top of.
+spin = { version = "0.9.8", default-features = false, features = ["spin_mutex", "rwlock", "once", "lazy", "barrier"] }
 
 [profile.release]
 opt-level = 2

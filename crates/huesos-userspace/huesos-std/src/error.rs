@@ -21,6 +21,8 @@ pub enum ErrorKind {
     BadHandle,
     /// The resource is busy; the caller may retry.
     Busy,
+    /// `create_new` found the name already taken.
+    AlreadyExists,
     /// The caller passed a malformed argument.
     InvalidInput,
     /// The service or device reported an I/O failure.
@@ -48,6 +50,7 @@ impl ErrorKind {
             Self::AccessDenied => "access denied",
             Self::BadHandle => "bad handle",
             Self::Busy => "resource busy",
+            Self::AlreadyExists => "already exists",
             Self::InvalidInput => "invalid input",
             Self::Io => "I/O error",
             Self::NoMemory => "out of memory",

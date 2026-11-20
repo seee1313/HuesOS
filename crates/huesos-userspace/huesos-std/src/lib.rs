@@ -44,13 +44,20 @@
 
 extern crate alloc;
 
+pub mod bootfs;
+pub mod buffered;
+pub mod collections;
 pub mod env;
 pub mod error;
 pub mod fs;
 pub mod io;
+pub mod os;
 pub mod path;
 pub mod prelude;
 pub mod process;
+pub mod sync;
+pub mod thread;
+pub mod time;
 
 pub use error::{Error, ErrorKind, Result};
 pub use libcanvas::heap::ScudoHeap;

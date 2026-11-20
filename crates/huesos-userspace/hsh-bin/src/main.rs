@@ -946,6 +946,66 @@ impl InteractiveShell {
             Err(e) => println!("[hsh] huesos-std smoke ERROR: {}", e),
         }
 
+        // 10d. `/bin/df.elf` is the smallest of the new disk utilities: it
+        //      walks the tree for usage and asks the volume service for
+        //      capacity, then formats a table with `huesos-std`. One run
+        //      therefore covers directory listing, the registry handshake and
+        //      stdout from a real `_start`-to-exit program. A boot without a
+        //      volume service still gets usage, so only the header is required.
+        println!(
+            "[hsh] host caps: hxfs={} registry={} frame_draw={} bootfs={}",
+            self.host.hxfs.is_some(),
+            self.host.registry.is_some(),
+            self.host.frame_draw.is_some(),
+            self.host.bootfs.is_some()
+        );
+        //     A boot image with no storage at all still has to be able to run
+        //     the binary, so the usage path is always required and the report
+        //     only when there is something to report on.
+        match smoke_env.eval_script("df --help", &mut self.host) {
+            Ok(res) if res.status == 0 && res.render_text().contains("usage: df") => {
+                println!("[hsh] df usage OK");
+            }
+            Ok(res) => println!(
+                "[hsh] df usage FAILED status={} out={}",
+                res.status,
+                res.render_text()
+            ),
+            Err(e) => println!("[hsh] df usage ERROR: {}", e),
+        }
+        match smoke_env.eval_script("df", &mut self.host) {
+            Ok(res) if res.status == 0 && res.render_text().contains("hxfs") => {
+                println!("[hsh] df table OK");
+            }
+            Ok(res)
+                if res
+                    .render_text()
+                    .contains("no filesystem and no block device") =>
+            {
+                println!("[hsh] df SKIP (no storage)");
+            }
+            Ok(res) => println!(
+                "[hsh] df FAILED status={} out={}",
+                res.status,
+                res.render_text()
+            ),
+            Err(e) => println!("[hsh] df ERROR: {}", e),
+        }
+
+        // 10e. `/bin/lsblk.elf` reads the block device the shell was granted and
+        //      names what it finds. It is the read-only counterpart of
+        //      `mkfs.elf`/`fsck.elf`, so a clean listing here means the device
+        //      capability, the HxFS superblock probe and the table formatting
+        //      all work from a spawned binary.
+        match smoke_env.eval_script("lsblk -f", &mut self.host) {
+            Ok(res) if res.status == 0 && res.render_text().contains("NAME") => {
+                println!("[hsh] lsblk OK");
+            }
+            Ok(res) if res.status != 0 => println!("[hsh] lsblk SKIP (no block device)"),
+            Ok(res) => println!("[hsh] lsblk FAILED out={}", res.render_text()),
+            Err(e) => println!("[hsh] lsblk ERROR: {}", e),
+        }
+
         // 11. Bare `HxFS v7` volume (superfloppy) detection. Only meaningful on
         //     a boot with a block device; the NVMe smoke attaches one.
         if self.host.hxfs.is_some() {

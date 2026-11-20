@@ -1144,6 +1144,34 @@ fn build_bootfs_image(manifest_dir: &Path, inputs: BootfsInputs<'_>) -> PathBuf 
             data: read_build_input(&inputs.coreutils_dir.join("std-smoke"), "std-smoke ELF"),
         },
         BootFsFile {
+            path: "/bin/hexdump.elf",
+            data: read_build_input(&inputs.coreutils_dir.join("hexdump"), "hexdump ELF"),
+        },
+        BootFsFile {
+            path: "/bin/dd.elf",
+            data: read_build_input(&inputs.coreutils_dir.join("dd"), "dd ELF"),
+        },
+        BootFsFile {
+            path: "/bin/df.elf",
+            data: read_build_input(&inputs.coreutils_dir.join("df"), "df ELF"),
+        },
+        BootFsFile {
+            path: "/bin/du.elf",
+            data: read_build_input(&inputs.coreutils_dir.join("du"), "du ELF"),
+        },
+        BootFsFile {
+            path: "/bin/lsblk.elf",
+            data: read_build_input(&inputs.coreutils_dir.join("lsblk"), "lsblk ELF"),
+        },
+        BootFsFile {
+            path: "/bin/fsck.elf",
+            data: read_build_input(&inputs.coreutils_dir.join("fsck"), "fsck ELF"),
+        },
+        BootFsFile {
+            path: "/bin/mkfs.elf",
+            data: read_build_input(&inputs.coreutils_dir.join("mkfs"), "mkfs ELF"),
+        },
+        BootFsFile {
             path: "/lib/ld-huesos.so",
             data: read_build_input(inputs.ld_huesos, "ld-huesos.so"),
         },
