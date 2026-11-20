@@ -1204,6 +1204,14 @@ fn build_bootfs_image(manifest_dir: &Path, inputs: BootfsInputs<'_>) -> PathBuf 
             data: read_build_input(&inputs.coreutils_dir.join("sha256sum"), "sha256sum ELF"),
         },
         BootFsFile {
+            path: "/bin/btop.elf",
+            data: read_build_input(&inputs.coreutils_dir.join("btop"), "btop ELF"),
+        },
+        BootFsFile {
+            path: "/bin/schedctl.elf",
+            data: read_build_input(&inputs.coreutils_dir.join("schedctl"), "schedctl ELF"),
+        },
+        BootFsFile {
             path: "/bin/nano.elf",
             data: read_build_input(&inputs.coreutils_dir.join("nano"), "nano ELF"),
         },

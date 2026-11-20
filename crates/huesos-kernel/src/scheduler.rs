@@ -1176,6 +1176,154 @@ pub fn sched_stats() -> SchedStats {
     }
 }
 
+/// Fill `out` with the aggregate scheduler counters.
+///
+/// The snapshot is racy by construction -- a counter can advance between two
+/// loads -- which is exactly what a monitor expects: the numbers are read to be
+/// compared with a previous sample, not to be consistent with each other.
+pub fn sched_summary(out: &mut huesos_abi::SchedSummary) {
+    let stats = sched_stats();
+    let online = online_cpu_mask();
+    let mut admitted_ppm = 0u64;
+    for cpu in 0..MAX_CPUS {
+        if online & (1 << cpu) != 0 {
+            admitted_ppm += u64::from(cbs_admitted_ppm(cpu));
+        }
+    }
+    *out = huesos_abi::SchedSummary {
+        cpu_count: online.count_ones(),
+        record_size: core::mem::size_of::<huesos_abi::SchedCpuRecord>() as u32,
+        context_switches: stats.context_switches,
+        remote_wakes: stats.remote_wakes,
+        resched_ipis: stats.resched_ipis,
+        inbox_drains: stats.inbox_drains,
+        irq_storm_masks: stats.irq_storm_masks,
+        admitted_ppm,
+    };
+}
+
+/// Fill `out` with the counters for one dense CPU index.
+pub fn sched_cpu_record(cpu: usize, out: &mut huesos_abi::SchedCpuRecord) {
+    let online = cpu < MAX_CPUS && online_cpu_mask() & (1 << cpu) != 0;
+    if !online {
+        *out = huesos_abi::SchedCpuRecord {
+            cpu: cpu as u32,
+            ..Default::default()
+        };
+        return;
+    }
+    // The scheduler lock is IRQ-safe and short: taking it here reports a
+    // consistent (runnable, current) pair instead of two unrelated reads.
+    let (runnable, tasks, current, ticks) = {
+        let scheduler = PER_CPU_SCHEDULERS[cpu].lock();
+        (
+            scheduler.fair_queue.len(),
+            scheduler
+                .tasks
+                .iter()
+                .filter(|slot| !matches!(&slot.kind, TaskKind::Reaped))
+                .count(),
+            scheduler
+                .tasks
+                .get(scheduler.current)
+                .map(|slot| slot.id)
+                .unwrap_or(0),
+            scheduler.ticks,
+        )
+    };
+    *out = huesos_abi::SchedCpuRecord {
+        cpu: cpu as u32,
+        online: 1,
+        runnable: runnable as u32,
+        tasks: tasks as u32,
+        current_task: current,
+        ticks,
+        admitted_ppm: cbs_admitted_ppm(cpu),
+        reserved: 0,
+    };
+}
+
+/// Write the record for the `index`th live task into `out`.
+///
+/// Returns `true` when that task exists. The enumeration order is CPU order and
+/// then slot order, skipping reaped slots, which makes a paged read
+/// reproducible within one sampling pass.
+pub fn task_record(index: usize, out: &mut huesos_abi::TaskRecord) -> bool {
+    let mut seen = 0usize;
+    let online = online_cpu_mask();
+    for (cpu, per_cpu) in PER_CPU_SCHEDULERS.iter().enumerate().take(MAX_CPUS) {
+        if online & (1 << cpu) == 0 {
+            continue;
+        }
+        let scheduler = per_cpu.lock();
+        for (slot_index, slot) in scheduler.tasks.iter().enumerate() {
+            if matches!(&slot.kind, TaskKind::Reaped) {
+                continue;
+            }
+            if seen == index {
+                let (kind, state, weight, policy) = (
+                    match &slot.kind {
+                        TaskKind::Kernel => 0u8,
+                        TaskKind::User { .. } => 1u8,
+                        TaskKind::Reaped => 0u8,
+                    },
+                    if slot_index == scheduler.current {
+                        0u8
+                    } else if slot.finished.load(Ordering::Relaxed) {
+                        3u8
+                    } else if slot.blocked.load(Ordering::Relaxed) {
+                        2u8
+                    } else {
+                        1u8
+                    },
+                    match slot.sched_policy {
+                        SchedPolicy::Fair { weight, .. } => weight.min(u64::from(u16::MAX)) as u16,
+                        SchedPolicy::Deadline { .. } => 0,
+                    },
+                    match slot.sched_policy {
+                        SchedPolicy::Fair { .. } => 0u8,
+                        SchedPolicy::Deadline { .. } => 1u8,
+                    },
+                );
+                let mut record = huesos_abi::TaskRecord {
+                    task_id: slot.id,
+                    cpu: cpu as u16,
+                    weight,
+                    kind,
+                    state,
+                    policy,
+                    ..Default::default()
+                };
+                let name_len = slot.name.iter().position(|byte| *byte == 0).unwrap_or(16);
+                let copy = name_len.min(record.name.len());
+                record.name[..copy].copy_from_slice(&slot.name[..copy]);
+                *out = record;
+                return true;
+            }
+            seen += 1;
+        }
+    }
+    false
+}
+
+/// Number of live tasks (the whole table, for paging).
+pub fn task_count() -> usize {
+    let mut total = 0usize;
+    let online = online_cpu_mask();
+    for (cpu, per_cpu) in PER_CPU_SCHEDULERS.iter().enumerate().take(MAX_CPUS) {
+        if online & (1 << cpu) == 0 {
+            continue;
+        }
+        let scheduler = per_cpu.lock();
+        total += scheduler
+            .tasks
+            .iter()
+            .filter(|slot| !matches!(&slot.kind, TaskKind::Reaped))
+            .count();
+    }
+    total
+}
+
 /// Record that an IRQ source was masked due to a storm/budget violation.
 /// Called by the IRQ layer when it quarantines a misbehaving source.
 pub fn irq_storm_masked() {

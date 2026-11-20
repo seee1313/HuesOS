@@ -2134,6 +2134,34 @@ pub unsafe extern "C" fn canvas_stdin_read(
     }
 }
 
+/// Read up to `buf_len` bytes from `stdin`, waiting at most `ticks` scheduler
+/// ticks. Returns `-TimedOut` when nothing arrived; `*out_read == 0` on EOF.
+///
+/// # Safety
+/// `out_buf` must be writable for `buf_len` bytes and `out_read` must be valid if non-null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn canvas_stdin_read_timeout(
+    out_buf: *mut u8,
+    buf_len: usize,
+    ticks: u64,
+    out_read: *mut usize,
+) -> i64 {
+    // SAFETY: caller guarantees `out_buf` is valid for `buf_len` bytes.
+    let Ok(dst) = (unsafe { write_slice(out_buf, buf_len) }) else {
+        return err_code(ErrorCode::InvalidArgs);
+    };
+    match crate::stdio::stdin_read_timeout(dst, ticks) {
+        Ok(n) => {
+            if !out_read.is_null() {
+                // SAFETY: `write_out` checks pointer validity/alignment.
+                return to_abi_result(unsafe { write_out(out_read, n) });
+            }
+            0
+        }
+        Err(err) => err_code(err),
+    }
+}
+
 /// Park the calling thread on the futex word at `uaddr` while it holds
 /// `expected`.
 ///

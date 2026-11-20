@@ -1562,7 +1562,7 @@ impl HxfsRuntime {
         };
         let handle = endpoint.handle;
         let mut out = [0u8; MAX_READ_BYTES];
-        match self.fs.list_directory(handle, &mut out) {
+        match self.fs.list_directory_entries(handle, &mut out) {
             Ok(n) => self.write_dir(index, &out[..n]),
             Err(_) => self.write_dir(index, b"err:hxfs-list"),
         }
@@ -1782,7 +1782,7 @@ impl HxfsRuntime {
             return;
         };
         let mut out = [0u8; MAX_READ_BYTES];
-        match self.fs.list_directory(endpoint.handle, &mut out) {
+        match self.fs.list_directory_entries(endpoint.handle, &mut out) {
             Ok(n) => self.write_dir_response(
                 index,
                 request,

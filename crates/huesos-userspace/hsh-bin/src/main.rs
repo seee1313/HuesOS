@@ -69,8 +69,19 @@ pub extern "C" fn _start() -> ! {
 }
 
 #[panic_handler]
-fn panic(_info: &PanicInfo<'_>) -> ! {
-    println!("[hsh] PANIC");
+fn panic(info: &PanicInfo<'_>) -> ! {
+    // The location is the whole value of this handler: the shell runs the boot
+    // gates, so a bare "PANIC" costs a full rebuild-and-boot cycle to localise.
+    if let Some(location) = info.location() {
+        println!(
+            "[hsh] PANIC at {}:{}:{}",
+            location.file(),
+            location.line(),
+            location.column()
+        );
+    } else {
+        println!("[hsh] PANIC");
+    }
     exit(1)
 }
 
@@ -761,6 +772,46 @@ impl InteractiveShell {
             _ => println!("[hsh] @caps(hxfs=ro) enforcement FAILED"),
         }
 
+        // 6b. The positive half of the write path: a default-capability child
+        //     must be able to create, write, read back, list and remove a file
+        //     on the mounted volume. The read-only cases above only prove
+        //     refusal, and a boot with storage that cannot round-trip a byte is
+        //     broken in a way the refusal checks cannot see.
+        if self.host.hxfs.is_some() {
+            let created = smoke_env.eval_script("touch /hsh-smoke.txt", &mut self.host);
+            let written = smoke_env.eval_script("write /hsh-smoke.txt hello", &mut self.host);
+            let readback = smoke_env.eval_script("cat /hsh-smoke.txt", &mut self.host);
+            let hashed = smoke_env.eval_script("sha256sum /hsh-smoke.txt", &mut self.host);
+            let listed = smoke_env.eval_script("ls /hsh-smoke.txt | count", &mut self.host);
+            let removed = smoke_env.eval_script("rm /hsh-smoke.txt", &mut self.host);
+            let step = |result: Option<&huesos_hsh::eval::EvalResult>| match result {
+                Some(outcome) => (outcome.status, outcome.render_text()),
+                None => (-1, String::from("<error>")),
+            };
+            let (touch_status, touch_out) = step(created.as_ref().ok());
+            let (write_status, write_out) = step(written.as_ref().ok());
+            let (cat_status, cat_out) = step(readback.as_ref().ok());
+            let (ls_status, ls_out) = step(listed.as_ref().ok());
+            let (rm_status, rm_out) = step(removed.as_ref().ok());
+            let (hash_status, hash_out) = step(hashed.as_ref().ok());
+            if touch_status == 0
+                && write_status == 0
+                && cat_status == 0
+                && cat_out.trim() == "hello"
+                && ls_status == 0
+                && ls_out.trim() == "1"
+                && rm_status == 0
+            {
+                println!("[hsh] volume write path OK (touch/write/cat/ls/rm)");
+            } else {
+                println!(
+                    "[hsh] volume write path FAILED touch={touch_status}:{touch_out:?} write={write_status}:{write_out:?} cat={cat_status}:{cat_out:?} sha={hash_status}:{hash_out:?} ls={ls_status}:{ls_out:?} rm={rm_status}:{rm_out:?}"
+                );
+            }
+        } else {
+            println!("[hsh] volume write path SKIP (no block device)");
+        }
+
         // 7. `@caps(hxfs=none, bootfs=none)` enforcement across `fdisk.elf` and `ls.elf`
         let fdisk_none =
             smoke_env.eval_script("@caps(hxfs=none, bootfs=none) fdisk list", &mut self.host);
@@ -926,6 +977,76 @@ impl InteractiveShell {
         }
         if gpt_ok {
             println!("[hsh] fdisk gpt init/add/del/verify OK");
+        }
+
+        // 10b2. Scheduler observability: `schedctl` reads the aggregate and
+        //       per-CPU records through `SystemSchedStats`, pages the task
+        //       table through `SystemTaskQuery`, and `btop` renders the same
+        //       data as a frame. The frame run is ended by the synthetic
+        //       interrupt, so a full-screen program that never returns cannot
+        //       hang the smoke gate.
+        match smoke_env.eval_script("schedctl cpus", &mut self.host) {
+            Ok(res)
+                if res.status == 0
+                    && res.render_text().contains("scheduler:")
+                    && res.render_text().contains("RUNQ") =>
+            {
+                println!("[hsh] schedctl cpus OK");
+            }
+            Ok(res) => println!(
+                "[hsh] schedctl cpus FAILED status={} out={}",
+                res.status,
+                res.render_text()
+            ),
+            Err(e) => println!("[hsh] schedctl cpus ERROR: {e}"),
+        }
+        match smoke_env.eval_script("schedctl tasks", &mut self.host) {
+            Ok(res)
+                if res.status == 0
+                    && res.render_text().contains("STATE")
+                    && res.render_text().contains("task(s)") =>
+            {
+                println!("[hsh] schedctl tasks OK");
+            }
+            Ok(res) => println!(
+                "[hsh] schedctl tasks FAILED status={} out={}",
+                res.status,
+                res.render_text()
+            ),
+            Err(e) => println!("[hsh] schedctl tasks ERROR: {e}"),
+        }
+        match smoke_env.eval_script("schedctl bench", &mut self.host) {
+            Ok(res)
+                if res.status == 0
+                    && res.render_text().contains("context switches")
+                    && res.render_text().contains("window:") =>
+            {
+                println!("[hsh] schedctl bench OK");
+            }
+            Ok(res) => println!(
+                "[hsh] schedctl bench FAILED status={} out={}",
+                res.status,
+                res.render_text()
+            ),
+            Err(e) => println!("[hsh] schedctl bench ERROR: {e}"),
+        }
+        self.host.auto_interrupts = 1;
+        // Long enough for a frame to reach the wire, short enough that the gate
+        // does not spend the whole boot budget on the monitor.
+        self.host.auto_interrupt_after_ticks = 50;
+        let frame = smoke_env.eval_script("btop -i 250", &mut self.host);
+        self.host.auto_interrupts = 0;
+        self.host.auto_interrupt_after_ticks = 0;
+        match frame {
+            Ok(res) if res.render_text().contains("HuesOS monitor") => {
+                println!("[hsh] btop frame OK");
+            }
+            Ok(res) => println!(
+                "[hsh] btop frame FAILED status={} out={}",
+                res.status,
+                res.render_text()
+            ),
+            Err(e) => println!("[hsh] btop frame ERROR: {e}"),
         }
 
         // 10c. `/bin/std-smoke.elf` runs the user-space standard library inside

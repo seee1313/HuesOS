@@ -62,8 +62,33 @@ pub struct HshHost {
     /// Remaining child runs to interrupt without a keystroke. Only the smoke
     /// gate uses this; it drives the exact production kill path.
     pub auto_interrupts: usize,
+    /// How long a synthetic interrupt waits after the child starts, in
+    /// scheduler ticks. A full-screen program needs a frame on the wire before
+    /// the kill, or the gate would only ever observe the `^C` echo.
+    pub auto_interrupt_after_ticks: u64,
+    /// Deadline for the pending synthetic interrupt, latched on the first poll.
+    interrupt_deadline: Option<u64>,
+    /// Polls spent waiting for that deadline, used when the process has no
+    /// clock capability and the tick count cannot advance.
+    interrupt_polls: u64,
     /// Whether the most recent child run ended through the `Ctrl-C` path.
     pub last_child_interrupted: bool,
+}
+
+/// Most output the shell keeps from one child.
+///
+/// A full-screen program redraws continuously, and a misbehaving child can
+/// print without end. Capturing everything would grow the shell's heap until
+/// an allocation failed and took the whole session down with it, so the buffer
+/// keeps the most recent half once it passes this bound: the end of a run is
+/// what a caller can act on anyway.
+const MAX_CAPTURE_BYTES: usize = 256 * 1024;
+
+fn trim_capture(buf: &mut Vec<u8>) {
+    if buf.len() > MAX_CAPTURE_BYTES {
+        let keep_from = buf.len() - MAX_CAPTURE_BYTES / 2;
+        buf.drain(..keep_from);
+    }
 }
 
 /// Exit status reported for a child killed by `Ctrl-C` (128 + SIGINT).
@@ -104,6 +129,9 @@ impl HshHost {
             key_source: None,
             pending_packets: Vec::new(),
             auto_interrupts: 0,
+            auto_interrupt_after_ticks: 0,
+            interrupt_deadline: None,
+            interrupt_polls: 0,
             last_child_interrupted: false,
         };
         host.try_connect_hxfs();
@@ -641,7 +669,7 @@ impl HshHost {
         // resolved here. Everything that is *data* -- numbers, sizes, values
         // after a flag that takes one, `key=value` pairs, subcommand words --
         // has to arrive at the tool exactly as it was typed.
-        let owned_args = self.resolve_arguments(name, args);
+        let mut owned_args = self.resolve_arguments(name, args);
         if name == "ls" && owned_args.is_empty() {
             owned_args.push(self.pwd.clone());
         }
@@ -733,6 +761,7 @@ impl HshHost {
                 match stdout_r.read_into(&mut chunk) {
                     Ok(n) => {
                         stdout_bytes.extend_from_slice(&chunk[..n]);
+                        trim_capture(&mut stdout_bytes);
                         progressed = true;
                     }
                     Err(ErrorCode::PeerClosed) => out_open = false,
@@ -744,6 +773,7 @@ impl HshHost {
                 match stderr_r.read_into(&mut chunk) {
                     Ok(n) => {
                         stderr_bytes.extend_from_slice(&chunk[..n]);
+                        trim_capture(&mut stderr_bytes);
                         progressed = true;
                     }
                     Err(ErrorCode::PeerClosed) => err_open = false,
@@ -792,18 +822,19 @@ impl HshHost {
             }
         }
 
+        // A failing child's stdout is usually its report -- `std-smoke` prints
+        // one `[std] FAIL` line per broken invariant to stdout and only a
+        // marker to stderr -- so a non-zero exit keeps both streams. Dropping
+        // stdout here once hid the reason a smoke failed behind a single
+        // stderr line.
+        let combined = format!("{out_str}{err_str}");
         let output = if exit_code == 0 {
-            if let Some(tbl) = Table::from_tsv(&out_str) {
-                Value::Table(tbl)
-            } else if err_str.is_empty() {
-                Value::Text(out_str.trim_end_matches('\n').into())
-            } else {
-                Value::Text(format!("{out_str}{err_str}").trim_end_matches('\n').into())
+            match Table::from_tsv(&out_str) {
+                Some(tbl) => Value::Table(tbl),
+                None => Value::Text(combined.trim_end_matches('\n').into()),
             }
-        } else if !err_str.is_empty() {
-            Value::Text(err_str.trim_end_matches('\n').into())
         } else {
-            Value::Text(out_str.trim_end_matches('\n').into())
+            Value::Text(combined.trim_end_matches('\n').into())
         };
 
         ExecOutcome {
@@ -824,8 +855,29 @@ impl HshHost {
     /// lost.
     fn poll_child_interrupt(&mut self, child: &Process) -> bool {
         let auto = if self.auto_interrupts > 0 {
-            self.auto_interrupts -= 1;
-            true
+            // Latch the deadline on the first poll so the wait is measured from
+            // the child actually running, not from the request. A process
+            // without a clock capability cannot advance the tick count, so the
+            // wait also has a poll budget: the loop yields on every iteration,
+            // which makes the budget a slower but unconditional backstop.
+            let now = libcanvas::system::monotonic_ticks();
+            let deadline = *self.interrupt_deadline.get_or_insert_with(|| {
+                self.interrupt_polls = 0;
+                now.unwrap_or(0)
+                    .saturating_add(self.auto_interrupt_after_ticks)
+            });
+            self.interrupt_polls = self.interrupt_polls.saturating_add(1);
+            let expired = match now {
+                Ok(ticks) => ticks >= deadline,
+                Err(_) => self.interrupt_polls >= self.auto_interrupt_after_ticks.max(1) * 500,
+            };
+            if expired {
+                self.auto_interrupts -= 1;
+                self.interrupt_deadline = None;
+                true
+            } else {
+                false
+            }
         } else {
             false
         };

@@ -1133,6 +1133,9 @@ fn status_to_error(status: abi::HxfsStatus) -> ErrorCode {
         abi::HxfsStatus::Ok => ErrorCode::Internal,
         abi::HxfsStatus::Invalid => ErrorCode::InvalidArgs,
         abi::HxfsStatus::NotFound => ErrorCode::NotFound,
+        // The syscall error surface has no "already exists" code, so this
+        // collapses onto `InvalidArgs`. Callers that must distinguish the two
+        // check for the existing entry first (see `huesos_std::fs::File::create`).
         abi::HxfsStatus::AlreadyExists => ErrorCode::InvalidArgs,
         abi::HxfsStatus::WrongType => ErrorCode::WrongType,
         abi::HxfsStatus::AccessDenied => ErrorCode::AccessDenied,

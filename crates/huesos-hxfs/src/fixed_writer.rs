@@ -1690,6 +1690,63 @@ impl<
         Ok(written)
     }
 
+    /// List a directory as one `name kind size` line per child.
+    ///
+    /// `kind` is `file` or `dir`; `size` is the file's byte length, and `0` for
+    /// a directory. [`Self::list_directory`] predates this column format and
+    /// stays for callers that only need names; this variant answers what `ls`
+    /// and `huesos_std::fs::list` display without a second lookup per entry.
+    pub fn list_directory_entries(
+        &self,
+        directory: DirectoryHandle,
+        out: &mut [u8],
+    ) -> FixedResult<usize> {
+        let object = self.object(directory.object_id)?;
+        if object.descriptor.object_type != OBJECT_TYPE_DIRECTORY {
+            return Err(HxfsError::WrongType);
+        }
+        let mut written = 0usize;
+        let mut index = 0usize;
+        while index < self.dir_entries.len() {
+            if let Some(entry) = self.dir_entries[index] {
+                if entry.parent_object_id == directory.object_id {
+                    let kind = match self.object(entry.object_id)?.descriptor.object_type {
+                        OBJECT_TYPE_DIRECTORY => "dir",
+                        _ => "file",
+                    };
+                    let size = self.object(entry.object_id)?.descriptor.size;
+                    let mut push = |bytes: &[u8]| {
+                        for &byte in bytes {
+                            if written < out.len() {
+                                out[written] = byte;
+                                written += 1;
+                            }
+                        }
+                    };
+                    push(entry.name_bytes());
+                    push(b" ");
+                    push(kind.as_bytes());
+                    push(b" ");
+                    let mut digits = [0u8; 20];
+                    let mut value = size;
+                    let mut at = digits.len();
+                    loop {
+                        at -= 1;
+                        digits[at] = b'0' + (value % 10) as u8;
+                        value /= 10;
+                        if value == 0 {
+                            break;
+                        }
+                    }
+                    push(&digits[at..]);
+                    push(b"\n");
+                }
+            }
+            index += 1;
+        }
+        Ok(written)
+    }
+
     /// Read a complete file into `out`.
     pub fn read_file(&mut self, file: FileHandle, out: &mut [u8]) -> FixedResult<usize> {
         let object = self.object(file.object_id)?.descriptor;

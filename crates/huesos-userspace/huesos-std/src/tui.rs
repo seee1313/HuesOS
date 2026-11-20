@@ -163,11 +163,7 @@ pub fn bar(used: u64, total: u64, width: usize) -> String {
 
 /// A bar with the percentage appended: `[██████░░░░]  63%`.
 pub fn percent_bar(used: u64, total: u64, width: usize) -> String {
-    let percent = if total == 0 {
-        0
-    } else {
-        used.min(total) * 100 / total
-    };
+    let percent = (used.min(total) * 100).checked_div(total).unwrap_or(0);
     format!("{} {percent:>3}%", bar(used, total, width))
 }
 
@@ -268,7 +264,7 @@ fn braille_level(value: u64, max: u64) -> usize {
     if max == 0 || value == 0 {
         return 0;
     }
-    let scaled = (value.min(max) as u128 * 4 + max as u128 - 1) / max as u128;
+    let scaled = (value.min(max) as u128 * 4).div_ceil(max as u128);
     (scaled as usize).clamp(1, 4)
 }
 
@@ -443,6 +439,21 @@ pub fn read_key<R: Read>(input: &mut R) -> Option<Key> {
     Some(decode_key(input, byte[0]))
 }
 
+/// Read one keystroke, waiting at most `timeout`.
+///
+/// `None` means either end of input or nothing arrived in time: a monitor
+/// cannot tell the two apart, and both mean "redraw and ask again". Programs
+/// that must notice a closed console use [`read_key`] instead.
+pub fn read_key_timeout(timeout: crate::time::Duration) -> Option<Key> {
+    let mut stdin = io::stdin();
+    let mut byte = [0u8; 1];
+    match stdin.read_timeout(&mut byte, timeout) {
+        Ok(0) => None,
+        Ok(_) => Some(decode_key(&mut stdin, byte[0])),
+        Err(_) => None,
+    }
+}
+
 fn decode_key<R: Read>(input: &mut R, first: u8) -> Key {
     match first {
         0x1b => {
@@ -511,10 +522,9 @@ pub fn prompt<W: Write, R: Read>(out: &mut W, input: &mut R, label: &str) -> Opt
                 return Some(line);
             }
             Key::Backspace => {
-                if line.pop().is_some() {
-                    let _ = io::write_all(out, b"\x08 \x08");
-                    let _ = out.flush();
-                }
+                line.pop();
+                let _ = io::write_all(out, b"\x08 \x08");
+                let _ = out.flush();
             }
             Key::Ctrl(3) | Key::Ctrl(7) => return None,
             Key::Char(byte) => {

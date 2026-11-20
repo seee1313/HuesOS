@@ -297,7 +297,7 @@ const fn build_extended() -> [[u8; CELL_H]; EXTENDED_LEN] {
                     y += 1;
                 }
             }
-            0x2588 | 0x2589 | 0x258A | 0x258B | 0x258C | 0x258D | 0x258E | 0x258F => {
+            0x2588..=0x258F => {
                 // Left-aligned block, 8/8 down to 1/8 of the cell width.
                 let eighths = 8 - (code - 0x2588) as usize;
                 let width = (CELL_W * eighths).div_ceil(8);
@@ -323,9 +323,9 @@ const fn build_extended() -> [[u8; CELL_H]; EXTENDED_LEN] {
                     let mut x = 0;
                     while x < CELL_W {
                         let on = match code {
-                            0x2591 => (x + y) % 2 == 0 && y % 2 == 0,
-                            0x2592 => (x + y) % 2 == 0,
-                            _ => !((x + y) % 4 == 3),
+                            0x2591 => (x + y).is_multiple_of(2) && y.is_multiple_of(2),
+                            0x2592 => (x + y).is_multiple_of(2),
+                            _ => (x + y) % 4 != 3,
                         };
                         if on {
                             set_pixel(&mut cell, x, y);

@@ -56,6 +56,14 @@ name = "ps"
 path = "src/bin/ps.rs"
 
 [[bin]]
+name = "schedctl"
+path = "src/bin/schedctl.rs"
+
+[[bin]]
+name = "btop"
+path = "src/bin/btop.rs"
+
+[[bin]]
 name = "sleep"
 path = "src/bin/sleep.rs"
 

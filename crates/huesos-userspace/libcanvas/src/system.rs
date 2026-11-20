@@ -154,3 +154,102 @@ pub fn observation_read(after_sequence: u64, out: &mut [u8]) -> crate::Result<us
     );
     raw::decode(ret).map(|written| written as usize)
 }
+
+
+/// Largest snapshot the kernel can produce: the summary plus one record per
+/// possible CPU. Sized from the ABI so a bigger machine needs no edit here.
+const MAX_SNAPSHOT_BYTES: usize =
+    core::mem::size_of::<huesos_abi::SchedSummary>()
+        + 64 * core::mem::size_of::<huesos_abi::SchedCpuRecord>();
+
+/// Read the aggregate scheduler counters.
+pub fn sched_summary() -> crate::Result<huesos_abi::SchedSummary> {
+    let mut buffer = [0u8; MAX_SNAPSHOT_BYTES];
+    let written = sched_stats_into(&mut buffer)?;
+    let summary_size = core::mem::size_of::<huesos_abi::SchedSummary>();
+    if written < summary_size {
+        return Err(crate::ErrorCode::InvalidArgs);
+    }
+    // Safety: the kernel wrote a whole summary record at the start of the
+    // buffer, and `written` proves it is there.
+    Ok(unsafe { core::ptr::read_unaligned(buffer.as_ptr() as *const huesos_abi::SchedSummary) })
+}
+
+/// Visit the per-CPU scheduler records.
+///
+/// `visit` sees the CPUs the kernel reported in this sample, in dense CPU
+/// order; the count is returned so a caller can detect a CPU that came online
+/// between the summary and the records.
+pub fn sched_cpus(
+    mut visit: impl FnMut(&huesos_abi::SchedCpuRecord),
+) -> crate::Result<usize> {
+    let mut buffer = [0u8; MAX_SNAPSHOT_BYTES];
+    let written = sched_stats_into(&mut buffer)?;
+    let summary_size = core::mem::size_of::<huesos_abi::SchedSummary>();
+    let record_size = core::mem::size_of::<huesos_abi::SchedCpuRecord>();
+    if written < summary_size || record_size == 0 {
+        return Err(crate::ErrorCode::InvalidArgs);
+    }
+    let mut seen = 0;
+    let mut offset = summary_size;
+    while offset + record_size <= written {
+        // Safety: the kernel wrote whole records into this buffer.
+        let record = unsafe {
+            core::ptr::read_unaligned(
+                buffer.as_ptr().add(offset) as *const huesos_abi::SchedCpuRecord
+            )
+        };
+        visit(&record);
+        seen += 1;
+        offset += record_size;
+    }
+    Ok(seen)
+}
+
+/// Read the whole task table into `visit`, in the kernel's enumeration order.
+///
+/// Pages through the table in chunks of `PAGE` records; the table can grow
+/// while it is read, and the count that comes back is the size the kernel
+/// reported on the last page.
+pub fn for_each_task(mut visit: impl FnMut(&huesos_abi::TaskRecord)) -> crate::Result<usize> {
+    const PAGE: usize = 16;
+    let record_size = core::mem::size_of::<huesos_abi::TaskRecord>();
+    let mut buffer = [0u8; PAGE * core::mem::size_of::<huesos_abi::TaskRecord>()];
+    let mut index = 0usize;
+    let mut total;
+    loop {
+        let packed = raw::syscall3(
+            Syscall::SystemTaskQuery,
+            index as u64,
+            buffer.as_mut_ptr() as u64,
+            buffer.len() as u64,
+        );
+        let packed = raw::decode(packed)? as u64;
+        let written = (packed >> 32) as usize;
+        total = (packed & 0xFFFF_FFFF) as usize;
+        if written == 0 {
+            break;
+        }
+        for slot in 0..written {
+            // Safety: the kernel wrote `written` whole records into the buffer.
+            let record = unsafe {
+                core::ptr::read_unaligned(buffer.as_ptr().add(slot * record_size) as *const huesos_abi::TaskRecord)
+            };
+            visit(&record);
+        }
+        index += written;
+        if index >= total {
+            break;
+        }
+    }
+    Ok(total)
+}
+
+fn sched_stats_into(buffer: &mut [u8]) -> crate::Result<usize> {
+    let written = raw::syscall2(
+        Syscall::SystemSchedStats,
+        buffer.as_mut_ptr() as u64,
+        buffer.len() as u64,
+    );
+    raw::decode(written).map(|bytes| bytes as usize)
+}
