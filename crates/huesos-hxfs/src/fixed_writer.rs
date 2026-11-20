@@ -1879,11 +1879,31 @@ impl<
         Ok(FileHandle { object_id, size: 0 })
     }
 
-    /// Write an inline payload to a file.
+    /// Write `data` at `offset` in a file.
     ///
-    /// The no-heap Stage-K service supports whole-file replacement at offset 0
-    /// and block-aligned appends. More general overwrite/splitting is deferred
-    /// until the persistent allocator/refcount stages own extent surgery.
+    /// Three shapes are supported, all of them copy-on-write — a block is
+    /// never modified in place, it is reallocated and the extent record is
+    /// repointed after the new block is on the media:
+    ///
+    /// * `offset == 0` — whole-file replacement. Every existing extent is
+    ///   dropped and the payload becomes the entire file (this is what
+    ///   `cat > file` and every "rewrite this file" caller means).
+    /// * `offset == size`, block-aligned — plain appends, as before.
+    /// * anything else — random-offset read-modify-write. Each touched
+    ///   logical block is read (missing extents and bytes past end-of-file
+    ///   read as zeros), the caller's bytes are overlaid, and the block is
+    ///   stored at a fresh LBA. A write that does not start or end on a
+    ///   4 KiB boundary costs a full block per touched edge, which is the
+    ///   normal price of block storage.
+    ///
+    /// This is what makes a disk image an ordinary file: `fdisk` writes 512
+    /// byte sectors at arbitrary offsets, and each of those writes lands in
+    /// the middle of a block that already holds data.
+    ///
+    /// The call is atomic from the caller's point of view only in the sense
+    /// that nothing is published until [`Self::publish_checkpoint`]; a
+    /// failure halfway through leaves the in-memory mount dirty but the last
+    /// checkpoint intact.
     pub fn write_file_at(
         &mut self,
         file: FileHandle,
@@ -1891,12 +1911,28 @@ impl<
         data: &[u8],
     ) -> FixedResult<FileHandle> {
         self.ensure_mutable_v6()?;
-        if data.len() > BLOCK_SIZE {
+        if offset != 0 && data.len() > BLOCK_SIZE * 1024 {
+            // One syscall must not be able to pin the service for
+            // milliseconds; callers stream larger writes in chunks.
             return Err(HxfsError::Unsupported);
         }
         let object = self.object(file.object_id)?.descriptor;
         if object.object_type != OBJECT_TYPE_FILE {
             return Err(HxfsError::WrongType);
+        }
+        if offset != 0 {
+            return self.write_file_range(file, object, offset, data);
+        }
+        // A whole-file replacement larger than one block cannot go through
+        // the single-block inline path below, so drop the old extents first
+        // (this is the documented meaning of `offset == 0`) and stream the
+        // payload through the block writer.
+        if data.len() > BLOCK_SIZE {
+            let released = self.clear_extents(file.object_id);
+            self.release_job_bytes(released);
+            self.object_mut(file.object_id)?.descriptor.size = 0;
+            let cleared = self.object(file.object_id)?.descriptor;
+            return self.write_file_range(file, cleared, 0, data);
         }
         // A.5 wire: per-Job quota enforcement on the write path.
         // The volume-level quota is the system volume descriptor
@@ -1921,8 +1957,6 @@ impl<
         if offset == 0 {
             let released = self.clear_extents(file.object_id);
             self.release_job_bytes(released);
-        } else if offset != object.size || !offset.is_multiple_of(BLOCK_SIZE_U64) {
-            return Err(HxfsError::Unsupported);
         }
 
         self.check_volume_quota(delta_bytes, 0)?;
@@ -1969,6 +2003,234 @@ impl<
         self.update_file_record_count(file.object_id)?;
         self.dirty = true;
         self.file_handle(file.object_id)
+    }
+
+    /// Random-offset write: copy-on-write read-modify-write, one logical
+    /// block at a time.
+    ///
+    /// Called by [`Self::write_file_at`] for every non-zero offset. The
+    /// loop is deliberately block-granular and allocation-light: each
+    /// iteration touches one logical block, and the per-block work is
+    /// "read what is there, splat the new bytes, store a fresh block".
+    fn write_file_range(
+        &mut self,
+        file: FileHandle,
+        object: ObjectDescriptor,
+        offset: u64,
+        data: &[u8],
+    ) -> FixedResult<FileHandle> {
+        if data.is_empty() {
+            return self.file_handle(file.object_id);
+        }
+        let end = offset
+            .checked_add(u64::try_from(data.len()).map_err(|_| HxfsError::OutOfRange)?)
+            .ok_or(HxfsError::OutOfRange)?;
+        let mut cursor = offset;
+        let mut consumed = 0usize;
+        while consumed < data.len() {
+            let logical_block = cursor / BLOCK_SIZE_U64;
+            let within = usize::try_from(cursor % BLOCK_SIZE_U64)
+                .map_err(|_| HxfsError::OutOfRange)?;
+            let chunk = core::cmp::min(BLOCK_SIZE - within, data.len() - consumed);
+            let mut block_bytes = [0u8; BLOCK_SIZE];
+            let whole_block = within == 0 && chunk == BLOCK_SIZE;
+            if !whole_block {
+                // Read-modify-write. `read_file_at` already reports zeros for
+                // holes and for anything past end-of-file, which is exactly
+                // the content a partially written block must keep; the
+                // explicit fill covers the bytes it does not report at all.
+                let mut existing = [0u8; BLOCK_SIZE];
+                let read = self.read_file_at(file, logical_block * BLOCK_SIZE_U64, &mut existing)?;
+                block_bytes[..read].copy_from_slice(&existing[..read]);
+            }
+            block_bytes[within..within + chunk].copy_from_slice(&data[consumed..consumed + chunk]);
+            self.store_logical_block(object, logical_block, &block_bytes)?;
+            cursor += chunk as u64;
+            consumed += chunk;
+        }
+        let new_size = object.size.max(end);
+        self.object_mut(file.object_id)?.descriptor.size = new_size;
+        self.update_file_record_count(file.object_id)?;
+        self.dirty = true;
+        self.file_handle(file.object_id)
+    }
+
+    /// Replace the content of one logical block of `object` with `bytes`
+    /// (always a full 4 KiB block).
+    ///
+    /// Order matters: the new block is allocated and written *before* the
+    /// old extent is detached, so a `NoSpace` or I/O failure leaves the
+    /// previous block reachable instead of punching a hole in the file.
+    /// The one thing checked up front is extent-table capacity, because
+    /// running out of slots after the detach would lose the block.
+    fn store_logical_block(
+        &mut self,
+        object: ObjectDescriptor,
+        logical_block: u64,
+        bytes: &[u8],
+    ) -> FixedResult<()> {
+        // A split costs one extra slot (head + tail), a plain replacement
+        // reuses the slot it is about to free.
+        let covering = self.covering_extent_index(object.object_id, logical_block);
+        let split = covering.is_some_and(|slot| self.extent_span_at(slot) > 1);
+        let needed = if split { 2 } else { 1 };
+        if self.free_extent_slots() < needed {
+            return Err(HxfsError::NoSpace);
+        }
+        // Charge the job for the block we are about to allocate. The old
+        // block is credited back by `detach_logical_block` once the
+        // replacement is on the media, so a rewrite nets to zero.
+        self.check_job_quota(BLOCK_SIZE_U64, 0)?;
+        let (physical_block, generation, kind) = self.write_data_blocks(bytes, object)?;
+        let (flags, block_count, compression) = match kind {
+            ExtentWriteKind::Plain => (0, 1, None),
+            ExtentWriteKind::Compressed(meta) => (EXTENT_FLAG_COMPRESSED, 1, Some(meta)),
+            ExtentWriteKind::MultiSlot => (EXTENT_FLAG_MULTI_SLOT, 2, None),
+        };
+        let released = self.detach_logical_block(object.object_id, logical_block)?;
+        if released > 0 {
+            self.release_job_bytes(released.saturating_mul(BLOCK_SIZE_U64));
+        }
+        self.insert_extent(FixedExtent {
+            object_id: object.object_id,
+            extent: ExtentRecord {
+                logical_block,
+                physical_block,
+                block_count,
+                flags,
+                generation,
+            },
+            compression,
+        })
+    }
+
+    /// Detach the slice of `object_id`'s extent table that covers exactly
+    /// one logical block, splitting a multi-block extent into head and tail.
+    ///
+    /// Returns the number of physical blocks handed back to the allocator
+    /// so the caller can credit the job quota.
+    ///
+    /// Multi-block extents are the reason this cannot be a simple "drop the
+    /// record": `tools/hxfs-seed` and `mkhxfs.py` write a whole file as one
+    /// extent with `block_count = N`, and rewriting block 3 of it must not
+    /// discard blocks 0-2 and 4-N.
+    fn detach_logical_block(&mut self, object_id: u64, logical_block: u64) -> FixedResult<u64> {
+        let Some(index) = self.covering_extent_index(object_id, logical_block) else {
+            return Ok(0);
+        };
+        let entry = self.extents[index].ok_or(HxfsError::NotFound)?;
+        let span = self.extent_span(entry);
+        let start = entry.extent.logical_block;
+        let hole = entry.extent.flags & EXTENT_FLAG_HOLE != 0;
+        if span == 1 {
+            self.extents[index] = None;
+            if hole {
+                return Ok(0);
+            }
+            self.free_extent_range(entry.extent.physical_block, 1);
+            return Ok(1);
+        }
+        // A compressed record describes one block and a two-slot record
+        // describes two physical slots of one block; neither has a
+        // block-granular physical mapping to split, so refuse rather than
+        // invent one. (`block_count` for MULTI_SLOT is the slot count, not a
+        // logical run, so `span == 1` catches it above.)
+        if entry.extent.flags & EXTENT_FLAG_COMPRESSED != 0 {
+            return Err(HxfsError::Unsupported);
+        }
+        let head_blocks = logical_block - start;
+        let tail_blocks = span - head_blocks - 1;
+        if !hole {
+            // Free only the physical block that holds this logical block.
+            self.free_extent_range(entry.extent.physical_block + head_blocks, 1);
+        }
+        self.extents[index] = None;
+        let mut head = None;
+        if head_blocks > 0 {
+            head = Some(FixedExtent {
+                object_id,
+                extent: ExtentRecord {
+                    logical_block: start,
+                    physical_block: entry.extent.physical_block,
+                    block_count: u32::try_from(head_blocks).map_err(|_| HxfsError::OutOfRange)?,
+                    flags: entry.extent.flags,
+                    generation: entry.extent.generation,
+                },
+                compression: entry.compression,
+            });
+        }
+        let mut tail = None;
+        if tail_blocks > 0 {
+            tail = Some(FixedExtent {
+                object_id,
+                extent: ExtentRecord {
+                    logical_block: logical_block + 1,
+                    physical_block: entry.extent.physical_block + head_blocks + 1,
+                    block_count: u32::try_from(tail_blocks).map_err(|_| HxfsError::OutOfRange)?,
+                    flags: entry.extent.flags,
+                    generation: entry.extent.generation,
+                },
+                compression: entry.compression,
+            });
+        }
+        self.extents[index] = head;
+        if let Some(tail) = tail {
+            self.insert_extent(tail)?;
+        }
+        if hole {
+            Ok(0)
+        } else {
+            Ok(1)
+        }
+    }
+
+    /// Whether an extent record is a plain run of logical blocks, i.e. it
+    /// maps block-for-block onto the media (no compression envelope, no
+    /// two-slot encrypted split). Only those can be split or trimmed by
+    /// block arithmetic.
+    fn extent_is_plain(&self, entry: &FixedExtent) -> bool {
+        entry.extent.flags & (EXTENT_FLAG_COMPRESSED | EXTENT_FLAG_MULTI_SLOT) == 0
+    }
+
+    /// How many logical blocks an extent record covers.
+    fn extent_span(&self, entry: FixedExtent) -> u64 {
+        if entry.extent.flags & EXTENT_FLAG_MULTI_SLOT != 0 {
+            1
+        } else {
+            u64::from(entry.extent.block_count)
+        }
+    }
+
+    /// Number of logical blocks covered by the record in `slot`, or 0 for an
+    /// empty slot (and for an out-of-range one).
+    fn extent_span_at(&self, slot: usize) -> u64 {
+        match self.extents.get(slot).copied().flatten() {
+            Some(entry) => self.extent_span(entry),
+            None => 0,
+        }
+    }
+
+    /// Index of the extent record of `object_id` covering `logical_block`.
+    fn covering_extent_index(&self, object_id: u64, logical_block: u64) -> Option<usize> {
+        let mut index = 0usize;
+        while index < self.extents.len() {
+            if let Some(entry) = self.extents[index] {
+                if entry.object_id == object_id {
+                    let span = self.extent_span(entry);
+                    let start = entry.extent.logical_block;
+                    if logical_block >= start && logical_block < start.saturating_add(span) {
+                        return Some(index);
+                    }
+                }
+            }
+            index += 1;
+        }
+        None
+    }
+
+    /// Number of free slots in the extent table.
+    fn free_extent_slots(&self) -> usize {
+        self.extents.iter().filter(|slot| slot.is_none()).count()
     }
 
     /// A.5 wire: per-Job volume-quota check on the write
@@ -2085,17 +2347,43 @@ impl<
                         u64::from(entry.extent.block_count)
                     };
                     let extent_start = entry.extent.logical_block * BLOCK_SIZE_U64;
-                    // Keep any extent that still holds a live byte.
-                    // A partially truncated extent is retained whole:
-                    // the tail bytes are unreachable through
-                    // `descriptor.size`, and splitting an extent here
-                    // would need a fresh allocation on a path that
-                    // must not fail.
+                    let hole = entry.extent.flags & EXTENT_FLAG_HOLE != 0;
+                    // Fully past the new end: drop the record and hand every
+                    // physical block back.
                     if extent_start >= new_size && logical > 0 {
-                        if entry.extent.flags & EXTENT_FLAG_HOLE == 0 {
+                        if !hole {
                             released_blocks = released_blocks.saturating_add(logical);
+                            self.free_extent_range(entry.extent.physical_block, logical);
                         }
                         self.extents[index] = None;
+                    } else if logical > 1
+                        && extent_start.saturating_add(logical * BLOCK_SIZE_U64) > new_size
+                    {
+                        // Partially covered: keep only the blocks that still
+                        // hold a live byte and release the rest. A
+                        // compressed record covers one block (and a
+                        // two-slot record one logical block in two slots),
+                        // so this arithmetic only applies to plain runs.
+                        if self.extent_is_plain(&entry) {
+                            let live = new_size
+                                .saturating_sub(extent_start)
+                                .div_ceil(BLOCK_SIZE_U64)
+                                .min(logical);
+                            let keep = u32::try_from(live).map_err(|_| HxfsError::OutOfRange)?;
+                            let drop = logical - live;
+                            if drop > 0 {
+                                if !hole {
+                                    released_blocks = released_blocks.saturating_add(drop);
+                                    self.free_extent_range(
+                                        entry.extent.physical_block + live,
+                                        drop,
+                                    );
+                                }
+                                let mut trimmed = entry;
+                                trimmed.extent.block_count = keep;
+                                self.extents[index] = Some(trimmed);
+                            }
+                        }
                     }
                 }
             }
