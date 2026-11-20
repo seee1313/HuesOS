@@ -94,12 +94,12 @@ pub fn check_query_ro() -> Result<(), i32> {
 }
 
 /// Take granted `Hxfs` service handle if present.
-pub fn take_hxfs() -> Option<Hxfs> {
+pub fn take_hxfs() -> Option<&'static Hxfs> {
     std_fs::service()
 }
 
 /// Take granted `HxfsDirectory` handle if present.
-pub fn take_hxfs_dir() -> Option<HxfsDirectory> {
+pub fn take_hxfs_dir() -> Option<&'static HxfsDirectory> {
     std_fs::directory()
 }
 

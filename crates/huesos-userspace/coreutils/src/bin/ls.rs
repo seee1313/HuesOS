@@ -41,17 +41,39 @@ fn run() -> i32 {
     let mut found_any = false;
 
     if allow_hxfs {
-        let dir_opt = if let Some(svc) = hxfs.as_ref() {
+        let dir_opt = if let Some(svc) = hxfs {
             svc.open_dir(&path).ok()
         } else if let Some(scoped) = hxfs_dir {
             if path == "/" {
-                Some(scoped)
+                None
             } else {
                 scoped.open_dir(path.trim_start_matches('/')).ok()
             }
         } else {
             None
         };
+
+        // The scoped handle is the subtree root itself, so `/` lists through
+        // the handle as granted instead of asking it to open a path above it.
+        if path == "/" && hxfs.is_none() {
+            if let Some(scoped) = hxfs_dir {
+                found_any = true;
+                let mut raw = [0u8; 4096];
+                if let Ok(bytes) = scoped.list(&mut raw) {
+                    if let Ok(text) = core::str::from_utf8(bytes) {
+                        for line in text.lines() {
+                            let mut parts = line.split_whitespace();
+                            let Some(name) = parts.next() else {
+                                continue;
+                            };
+                            let kind = parts.next().unwrap_or("entry");
+                            let size = parts.next().unwrap_or("-");
+                            rows.push(format!("{name}\t{kind}\t{size}\thxfs"));
+                        }
+                    }
+                }
+            }
+        }
 
         if let Some(dir) = dir_opt {
             found_any = true;

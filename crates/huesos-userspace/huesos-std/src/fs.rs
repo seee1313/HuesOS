@@ -60,22 +60,44 @@ pub struct Entry {
     pub size: Option<u64>,
 }
 
-/// Take the granted `Hxfs` service channel, if this process has one.
-pub fn service() -> Option<Hxfs> {
-    take_cap_handle(CapKind::HxfsService).map(|h| Hxfs::from_channel(Channel::from_handle(h)))
+/// The granted `Hxfs` service channel, if this process has one.
+///
+/// A capability slot can be *taken* exactly once (`take_cap_handle` swaps the
+/// slot for `INVALID_HANDLE`), so the handle is taken here on first use and
+/// then lent out. Every call reaching for the slot itself would hand the first
+/// caller the capability and every later caller `capability denied` -- which is
+/// what a directory walk or a two-step `create` + `write` does on its second
+/// call. The handle lives for the rest of the process, as a capability should.
+pub fn service() -> Option<&'static Hxfs> {
+    static SERVICE: spin::Once<Option<Hxfs>> = spin::Once::new();
+    SERVICE
+        .call_once(|| {
+            take_cap_handle(CapKind::HxfsService)
+                .map(|handle| Hxfs::from_channel(Channel::from_handle(handle)))
+        })
+        .as_ref()
 }
 
-/// Take the granted scoped directory handle, if this process has one.
-pub fn directory() -> Option<HxfsDirectory> {
-    take_cap_handle(CapKind::HxfsDir).map(|h| HxfsDirectory::from_channel(Channel::from_handle(h)))
+/// The granted scoped directory handle, if this process has one.
+///
+/// Borrowed from the same one-shot slot as [`service`]. Calls are not
+/// serialised: the channel speaks one request at a time, so a process that
+/// shares it across threads must not issue filesystem requests concurrently.
+pub fn directory() -> Option<&'static HxfsDirectory> {
+    static DIRECTORY: spin::Once<Option<HxfsDirectory>> = spin::Once::new();
+    DIRECTORY
+        .call_once(|| {
+            take_cap_handle(CapKind::HxfsDir)
+                .map(|handle| HxfsDirectory::from_channel(Channel::from_handle(handle)))
+        })
+        .as_ref()
 }
 
 /// True when the process can reach the filesystem at all.
+///
+/// Answered from the cached handles, so asking does not spend the capability.
 pub fn is_available() -> bool {
-    // Taking a handle consumes it, so probe without consuming: the bootstrap
-    // keeps the raw value around even after the handle is taken.
-    libcanvas::stdio::cap_handle(CapKind::HxfsService).is_some()
-        || libcanvas::stdio::cap_handle(CapKind::HxfsDir).is_some()
+    service().is_some() || directory().is_some()
 }
 
 fn open_file(path: &str, create: bool) -> Result<HxfsFile> {
@@ -112,7 +134,14 @@ fn open_dir(path: &str) -> Result<HxfsDirectory> {
     if let Some(root) = directory() {
         let relative = path::relative(&normalized);
         if relative.is_empty() {
-            return Ok(root);
+            // The scoped handle *is* the root: hand the caller its own handle
+            // for the same capability rather than pretending `/` is
+            // unreachable. Duplicating cannot widen the rights, so an
+            // attenuation of the original mask still yields the same subtree.
+            let rights =
+                huesos_abi::rights::READ | huesos_abi::rights::WRITE | huesos_abi::rights::TRANSFER;
+            let handle = root.channel().handle().duplicate(rights)?;
+            return Ok(HxfsDirectory::from_channel(Channel::from_handle(handle)));
         }
         return root.open_dir(relative).map_err(Error::from);
     }
@@ -529,13 +558,22 @@ pub fn remove(path: &str) -> Result<()> {
 pub fn used_bytes(root: &str) -> Result<u64> {
     /// Deepest tree this walk will descend.
     const MAX_DEPTH: usize = 64;
+    let normalized = path::normalize(root);
     let mut total = 0u64;
-    let mut pending = alloc::vec![(path::normalize(root), 0usize)];
+    let mut pending = alloc::vec![(normalized.clone(), 0usize)];
     while let Some((dir, depth)) = pending.pop() {
         if depth > MAX_DEPTH {
             return Err(Error::new(ErrorKind::InvalidInput));
         }
-        for entry in list(&dir)? {
+        // A subtree the caller cannot read contributes nothing to the total;
+        // only the root itself has to be readable for the answer to mean
+        // anything.
+        let entries = match list(&dir) {
+            Ok(entries) => entries,
+            Err(error) if dir == normalized => return Err(error),
+            Err(_) => continue,
+        };
+        for entry in entries {
             match entry.kind {
                 EntryKind::Dir => pending.push((path::join(&dir, &entry.name), depth + 1)),
                 _ => total = total.saturating_add(entry.size.unwrap_or(0)),

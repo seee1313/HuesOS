@@ -57,7 +57,13 @@ fn run() -> i32 {
     let used = match huesos_std::fs::used_bytes(mount) {
         Ok(bytes) => bytes,
         Err(error) => {
-            cu::errln(&format!("df: {mount}: {error}"));
+            // Say which capabilities were missing: a sandbox without a
+            // filesystem handle and a broken volume look identical otherwise.
+            cu::errln(&format!(
+                "df: {mount}: {error} (service={} directory={})",
+                huesos_std::fs::service().is_some(),
+                huesos_std::fs::directory().is_some()
+            ));
             return 1;
         }
     };

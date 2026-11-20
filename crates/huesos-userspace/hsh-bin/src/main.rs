@@ -952,6 +952,13 @@ impl InteractiveShell {
         //      therefore covers directory listing, the registry handshake and
         //      stdout from a real `_start`-to-exit program. A boot without a
         //      volume service still gets usage, so only the header is required.
+        println!(
+            "[hsh] host caps: hxfs={} registry={} frame_draw={} bootfs={}",
+            self.host.hxfs.is_some(),
+            self.host.registry.is_some(),
+            self.host.frame_draw.is_some(),
+            self.host.bootfs.is_some()
+        );
         match smoke_env.eval_script("df", &mut self.host) {
             Ok(res) if res.status == 0 && res.render_text().contains("Filesystem") => {
                 println!("[hsh] df table OK");
