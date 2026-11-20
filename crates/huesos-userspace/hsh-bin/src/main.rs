@@ -932,6 +932,10 @@ impl InteractiveShell {
         //      random-offset write path: `fdisk` writes LBA 1 and the entry
         //      array through `write_at(offset)`, which the filesystem used to
         //      refuse for anything but a whole-file rewrite.
+        // The smoke run happens before the first prompt, i.e. before the
+        // shell has connected to the filesystem: connect here, exactly like
+        // `spawn_external` does, or the guard below skips the whole step.
+        self.host.try_connect_hxfs();
         if self.host.hxfs.is_some() {
             let image_file = " /disk.img";
             let file_cycle = [
