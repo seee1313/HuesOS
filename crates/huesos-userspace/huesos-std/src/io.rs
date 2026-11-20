@@ -51,7 +51,11 @@ impl Stdin {
     /// outcome for a monitor that redraws on a timer, so callers should test
     /// [`crate::error::Error::is_retryable`] rather than treating it as a
     /// failure.
-    pub fn read_timeout(&mut self, buf: &mut [u8], timeout: crate::time::Duration) -> Result<usize> {
+    pub fn read_timeout(
+        &mut self,
+        buf: &mut [u8],
+        timeout: crate::time::Duration,
+    ) -> Result<usize> {
         match stdio::stdin_read_timeout(buf, timeout.as_ticks_ceil().max(1)) {
             Ok(n) => Ok(n),
             Err(ErrorCode::PeerClosed) => Ok(0),

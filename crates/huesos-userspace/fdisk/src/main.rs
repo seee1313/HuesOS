@@ -474,8 +474,20 @@ fn run() -> i32 {
     // Batch subcommands are for scripts; no subcommand (or `-i`) is the
     // interactive editor, and `fdisk /dev/nvme0n1` names a target for it.
     const SUBCOMMANDS: &[&str] = &[
-        "list", "--list", "inspect", "verify", "gpt-init", "add", "del", "resize", "help",
-        "--help", "-h", "interactive", "-i", "--interactive",
+        "list",
+        "--list",
+        "inspect",
+        "verify",
+        "gpt-init",
+        "add",
+        "del",
+        "resize",
+        "help",
+        "--help",
+        "-h",
+        "interactive",
+        "-i",
+        "--interactive",
     ];
     let first = args.get(1).map(String::as_str);
     let (sub, mut target): (&str, Option<&str>) = match first {

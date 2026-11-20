@@ -35,15 +35,16 @@ pub(crate) fn sys_system_sched_stats(out: *mut u8, len: usize) -> SyscallResult 
     let summary_fn = (*SCHED_SUMMARY_FN.lock()).ok_or(ErrorCode::NotSupported)?;
     let cpu_fn = (*SCHED_CPU_FN.lock()).ok_or(ErrorCode::NotSupported)?;
 
-    let mut summary = SchedSummary::default();
-    summary_fn(&mut summary);
     let summary_bytes = core::mem::size_of::<SchedSummary>();
+    // A short buffer is not an error the caller can act on by retrying: it
+    // cannot read the summary that would tell it the size, so report the
+    // shortfall and let it size the buffer from `SystemCpuCount`.
     if len < summary_bytes {
-        // A short buffer is not an error: the caller learns the record size
-        // from the summary it cannot yet read, so report the shortfall.
         return Err(ErrorCode::InvalidArgs);
     }
-    user_memory::copy_to_user(out, as_bytes(&summary))?;
+    let mut summary = SchedSummary::default();
+    summary_fn(&mut summary);
+    user_memory::write_value(out.cast::<SchedSummary>(), &summary)?;
     let mut written = summary_bytes;
 
     let record_size = core::mem::size_of::<SchedCpuRecord>();
@@ -53,11 +54,10 @@ pub(crate) fn sys_system_sched_stats(out: *mut u8, len: usize) -> SyscallResult 
         }
         let mut record = SchedCpuRecord::default();
         cpu_fn(cpu, &mut record);
-        // Safety of the cast: `copy_to_user` validates the caller's range and
-        // `written` is bounded by `len`, so the destination stays inside the
-        // buffer the caller declared.
-        let target = unsafe { out.add(written) };
-        user_memory::copy_to_user(target, as_bytes(&record))?;
+        // `out` is the caller's buffer and `written` never passes `len`, which
+        // the kernel validated; offsetting a raw pointer is safe, and
+        // `write_value` re-validates the range it is handed.
+        user_memory::write_value(out.wrapping_add(written).cast::<SchedCpuRecord>(), &record)?;
         written += record_size;
     }
     Ok(written as i64)
@@ -78,23 +78,16 @@ pub(crate) fn sys_system_task_query(start: usize, out: *mut u8, len: usize) -> S
         if !record_fn(index, &mut record) {
             break;
         }
-        let target = unsafe { out.add(written * record_size) };
-        user_memory::copy_to_user(target, as_bytes(&record))?;
+        user_memory::write_value(
+            out.wrapping_add(written * record_size).cast::<TaskRecord>(),
+            &record,
+        )?;
         written += 1;
         index += 1;
     }
     // (records << 32) | total, so a caller can page without guessing the size.
     let total = crate::callbacks::task_total() as u32 as i64;
     Ok(((written as i64) << 32) | total)
-}
-
-/// View a plain-old-data record as bytes for `copy_to_user`.
-fn as_bytes<T: Copy>(record: &T) -> &[u8] {
-    // Safety: `T` is a `repr(C)` record of plain integers with no padding
-    // invariants, and the borrow lives only for the copy.
-    unsafe {
-        core::slice::from_raw_parts((record as *const T) as *const u8, core::mem::size_of::<T>())
-    }
 }
 
 pub(crate) fn sys_system_shutdown() -> SyscallResult {

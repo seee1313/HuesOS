@@ -659,6 +659,55 @@ pub struct SchedSummary {
     pub admitted_ppm: u64,
 }
 
+/// Read a little-endian-agnostic integer field out of an encoded record.
+///
+/// The kernel encodes records into caller buffers with their native field
+/// layout, so a reader takes the offset from `offset_of!` and decodes in place.
+/// Doing it byte by byte keeps the reader free of `unsafe`: a record written by
+/// an older kernel that lacks a field leaves the tail of the buffer zeroed by
+/// the sender's padding rule, so `None` here means "truncated", never "garbage".
+fn field<const N: usize>(bytes: &[u8], offset: usize) -> Option<[u8; N]> {
+    let slice = bytes.get(offset..offset.checked_add(N)?)?;
+    let mut out = [0u8; N];
+    out.copy_from_slice(slice);
+    Some(out)
+}
+
+fn read_u8(bytes: &[u8], offset: usize) -> Option<u8> {
+    field::<1>(bytes, offset).map(u8::from_ne_bytes)
+}
+
+fn read_u16(bytes: &[u8], offset: usize) -> Option<u16> {
+    field::<2>(bytes, offset).map(u16::from_ne_bytes)
+}
+
+fn read_u32(bytes: &[u8], offset: usize) -> Option<u32> {
+    field::<4>(bytes, offset).map(u32::from_ne_bytes)
+}
+
+fn read_u64(bytes: &[u8], offset: usize) -> Option<u64> {
+    field::<8>(bytes, offset).map(u64::from_ne_bytes)
+}
+
+impl SchedSummary {
+    /// Decode the summary the kernel wrote at the start of a snapshot buffer.
+    ///
+    /// Returns `None` when `bytes` is shorter than the summary, which is what a
+    /// caller sees when it sized its buffer from a stale [`SchedSummary::record_size`].
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        Some(Self {
+            cpu_count: read_u32(bytes, core::mem::offset_of!(Self, cpu_count))?,
+            record_size: read_u32(bytes, core::mem::offset_of!(Self, record_size))?,
+            context_switches: read_u64(bytes, core::mem::offset_of!(Self, context_switches))?,
+            remote_wakes: read_u64(bytes, core::mem::offset_of!(Self, remote_wakes))?,
+            resched_ipis: read_u64(bytes, core::mem::offset_of!(Self, resched_ipis))?,
+            inbox_drains: read_u64(bytes, core::mem::offset_of!(Self, inbox_drains))?,
+            irq_storm_masks: read_u64(bytes, core::mem::offset_of!(Self, irq_storm_masks))?,
+            admitted_ppm: read_u64(bytes, core::mem::offset_of!(Self, admitted_ppm))?,
+        })
+    }
+}
+
 /// Per-CPU half of a [`Syscall::SystemSchedStats`] reply.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -679,6 +728,22 @@ pub struct SchedCpuRecord {
     pub admitted_ppm: u32,
     /// Reserved for future counters; always zero.
     pub reserved: u32,
+}
+
+impl SchedCpuRecord {
+    /// Decode one per-CPU record from a snapshot buffer.
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        Some(Self {
+            cpu: read_u32(bytes, core::mem::offset_of!(Self, cpu))?,
+            online: read_u32(bytes, core::mem::offset_of!(Self, online))?,
+            runnable: read_u32(bytes, core::mem::offset_of!(Self, runnable))?,
+            tasks: read_u32(bytes, core::mem::offset_of!(Self, tasks))?,
+            current_task: read_u64(bytes, core::mem::offset_of!(Self, current_task))?,
+            ticks: read_u64(bytes, core::mem::offset_of!(Self, ticks))?,
+            admitted_ppm: read_u32(bytes, core::mem::offset_of!(Self, admitted_ppm))?,
+            reserved: read_u32(bytes, core::mem::offset_of!(Self, reserved))?,
+        })
+    }
 }
 
 /// One task, as reported by [`Syscall::SystemTaskQuery`].
@@ -722,6 +787,21 @@ impl Default for TaskRecord {
 }
 
 impl TaskRecord {
+    /// Decode one task record from a [`Syscall::SystemTaskQuery`] page.
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        Some(Self {
+            task_id: read_u64(bytes, core::mem::offset_of!(Self, task_id))?,
+            name: field::<16>(bytes, core::mem::offset_of!(Self, name))?,
+            cpu: read_u16(bytes, core::mem::offset_of!(Self, cpu))?,
+            weight: read_u16(bytes, core::mem::offset_of!(Self, weight))?,
+            kind: read_u8(bytes, core::mem::offset_of!(Self, kind))?,
+            state: read_u8(bytes, core::mem::offset_of!(Self, state))?,
+            policy: read_u8(bytes, core::mem::offset_of!(Self, policy))?,
+            flags: read_u8(bytes, core::mem::offset_of!(Self, flags))?,
+            reserved: read_u64(bytes, core::mem::offset_of!(Self, reserved))?,
+        })
+    }
+
     /// The task name as a string slice, stopping at the first NUL.
     pub fn name_str(&self) -> &str {
         let end = self

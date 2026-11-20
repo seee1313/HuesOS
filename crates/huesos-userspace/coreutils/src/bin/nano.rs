@@ -133,12 +133,18 @@ fn run() -> i32 {
 
 fn load(path: &str) -> Result<Editor> {
     let normalized = path::normalize(path);
-    let mut lines = if fs::metadata(&normalized).map(|m| m.is_file()).unwrap_or(false) {
+    let mut lines = if fs::metadata(&normalized)
+        .map(|m| m.is_file())
+        .unwrap_or(false)
+    {
         let mut file = fs::File::open(&normalized)?;
         let mut bytes = Vec::new();
         io::read_to_end(&mut file, &mut bytes)?;
         let text = String::from_utf8_lossy(&bytes).into_owned();
-        let mut lines: Vec<Vec<char>> = text.split('\n').map(|line| line.chars().collect()).collect();
+        let mut lines: Vec<Vec<char>> = text
+            .split('\n')
+            .map(|line| line.chars().collect())
+            .collect();
         // A file ending in a newline has a phantom empty last line; drop it so
         // the cursor can never sit below the real end of the text.
         if text.ends_with('\n') {
@@ -462,7 +468,9 @@ fn highlight(syntax: Syntax, line: &[char]) -> String {
         let rest: String = line[index..].iter().collect();
         if syntax != Syntax::Plain {
             let (class, length) = classify(syntax, &rest);
-            let chunk: String = line[index..(index + length).min(line.len())].iter().collect();
+            let chunk: String = line[index..(index + length).min(line.len())]
+                .iter()
+                .collect();
             if class == Class::Plain {
                 out.push_str(&chunk);
             } else {
@@ -528,14 +536,49 @@ fn classify(syntax: Syntax, text: &str) -> (Class, usize) {
     let is_keyword = match syntax {
         Syntax::Shell => matches!(
             word.as_str(),
-            "if" | "then" | "else" | "fi" | "for" | "while" | "do" | "done" | "case" | "esac"
-                | "in" | "fn" | "let" | "return" | "export" | "local" | "echo" | "cd" | "exit"
+            "if" | "then"
+                | "else"
+                | "fi"
+                | "for"
+                | "while"
+                | "do"
+                | "done"
+                | "case"
+                | "esac"
+                | "in"
+                | "fn"
+                | "let"
+                | "return"
+                | "export"
+                | "local"
+                | "echo"
+                | "cd"
+                | "exit"
         ),
         Syntax::Rust => matches!(
             word.as_str(),
-            "fn" | "let" | "mut" | "pub" | "use" | "mod" | "struct" | "enum" | "impl" | "match"
-                | "if" | "else" | "for" | "while" | "loop" | "return" | "self" | "crate" | "unsafe"
-                | "const" | "static" | "trait" | "where"
+            "fn" | "let"
+                | "mut"
+                | "pub"
+                | "use"
+                | "mod"
+                | "struct"
+                | "enum"
+                | "impl"
+                | "match"
+                | "if"
+                | "else"
+                | "for"
+                | "while"
+                | "loop"
+                | "return"
+                | "self"
+                | "crate"
+                | "unsafe"
+                | "const"
+                | "static"
+                | "trait"
+                | "where"
         ),
         Syntax::Config => false,
         Syntax::Plain => false,

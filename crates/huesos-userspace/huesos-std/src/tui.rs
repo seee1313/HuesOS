@@ -363,7 +363,10 @@ impl Table {
                 if index > 0 {
                     text.push(' ');
                 }
-                text.push_str(&fit(row.get(index).map(String::as_str).unwrap_or(""), *width));
+                text.push_str(&fit(
+                    row.get(index).map(String::as_str).unwrap_or(""),
+                    *width,
+                ));
             }
             lines.push(text);
         }

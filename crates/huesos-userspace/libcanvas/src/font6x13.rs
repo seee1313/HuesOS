@@ -256,8 +256,7 @@ const fn build_extended() -> [[u8; CELL_H]; EXTENDED_LEN] {
             }
             // Corners and tees: one horizontal arm and one vertical arm, each
             // drawn only toward the edges the glyph actually connects.
-            0x250C | 0x2510 | 0x2514 | 0x2518 | 0x251C | 0x2524 | 0x252C | 0x2534
-            | 0x253C => {
+            0x250C | 0x2510 | 0x2514 | 0x2518 | 0x251C | 0x2524 | 0x252C | 0x2534 | 0x253C => {
                 let centre_x = CELL_W / 2;
                 let (left, right, up) = match code {
                     0x250C => (false, true, false),
@@ -341,4 +340,3 @@ const fn build_extended() -> [[u8; CELL_H]; EXTENDED_LEN] {
     }
     table
 }
-

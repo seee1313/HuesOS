@@ -98,7 +98,14 @@ fn run() -> i32 {
         };
 
         let _ = screen.clear();
-        let _ = draw(&mut screen, &current, &rates, &task_records, interval_ms, paused);
+        let _ = draw(
+            &mut screen,
+            &current,
+            &rates,
+            &task_records,
+            interval_ms,
+            paused,
+        );
         let _ = screen.out().flush();
 
         if !paused {

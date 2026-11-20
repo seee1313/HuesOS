@@ -15,7 +15,7 @@ use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use huesos_gpt::{parse_size_lbas, Guid, GptDisk, LBA_SIZE};
+use huesos_gpt::{parse_size_lbas, GptDisk, Guid, LBA_SIZE};
 use huesos_std::io::{self, Read, Write};
 use huesos_std::tui;
 
@@ -183,7 +183,10 @@ fn draw(
 ) {
     let mut text = String::new();
     text.push_str("\x1b[2J\x1b[H");
-    text.push_str(&format!("\x1b[7m{}\x1b[0m\r\n", tui::fit(" HuesOS fdisk ", 62)));
+    text.push_str(&format!(
+        "\x1b[7m{}\x1b[0m\r\n",
+        tui::fit(" HuesOS fdisk ", 62)
+    ));
     text.push_str(&format!(
         " Disk   : {label}\r\n Sectors: {total_lbas} x {} bytes ({})\r\n GPT    : {}\r\n",
         LBA_SIZE,
@@ -239,7 +242,11 @@ fn sector_map(disk: Option<&GptDisk>, total_lbas: u64) -> String {
         if start > cursor {
             let gap = start - cursor;
             let cells = cells_for(gap, total_lbas);
-            bar.push_str(&format!("[{}FREE {}]", ".".repeat(cells.min(8)), human_size(gap * LBA_SIZE as u64)));
+            bar.push_str(&format!(
+                "[{}FREE {}]",
+                ".".repeat(cells.min(8)),
+                human_size(gap * LBA_SIZE as u64)
+            ));
         }
         bar.push_str(&label);
         cursor = start.saturating_add(len);
@@ -301,7 +308,11 @@ fn partition_table(disk: Option<&GptDisk>) -> String {
             entry.ending_lba,
             human_size(entry.size_lbas() * LBA_SIZE as u64),
             short_type(&entry.type_guid),
-            if entry.name.is_empty() { "-" } else { entry.name.as_str() }
+            if entry.name.is_empty() {
+                "-"
+            } else {
+                entry.name.as_str()
+            }
         ));
     }
     text
@@ -352,14 +363,21 @@ fn new_partition(
     };
     let free = free_lbas(table, total_lbas);
     let default_size = free.max(2048);
-    let answer = ask(out, &format!("size [{}]", human_size(default_size * LBA_SIZE as u64)))?;
+    let answer = ask(
+        out,
+        &format!("size [{}]", human_size(default_size * LBA_SIZE as u64)),
+    )?;
     let size_lbas = if answer.trim().is_empty() {
         default_size
     } else {
         parse_size_lbas(answer.trim()).map_err(|error| format!("bad size: {error}"))?
     };
     let name = ask(out, "name [HuesOS]")?;
-    let name = if name.trim().is_empty() { "HuesOS" } else { name.trim() };
+    let name = if name.trim().is_empty() {
+        "HuesOS"
+    } else {
+        name.trim()
+    };
     let num = table.add_partition(
         Guid::parse_type("hxfs").ok_or_else(|| String::from("hxfs is not a known type"))?,
         None,
@@ -404,7 +422,8 @@ fn retype_partition(disk: &mut Option<GptDisk>, out: &mut impl Write) -> Result<
     };
     let num = number(&ask(out, "partition number")?)?;
     let kind = ask(out, "type (hxfs, efi, data, swap)")?;
-    let guid = Guid::parse_type(kind.trim()).ok_or_else(|| format!("unknown type '{}'", kind.trim()))?;
+    let guid =
+        Guid::parse_type(kind.trim()).ok_or_else(|| format!("unknown type '{}'", kind.trim()))?;
     table.set_partition_type(num, guid)?;
     Ok(format!("partition {num} is now {}", kind.trim()))
 }
@@ -421,7 +440,10 @@ fn rename_partition(disk: &mut Option<GptDisk>, out: &mut impl Write) -> Result<
 
 /// Free LBAs between the first usable sector and the end of the disk.
 fn free_lbas(table: &GptDisk, total_lbas: u64) -> u64 {
-    let last_usable = table.primary.last_usable_lba.min(total_lbas.saturating_sub(34));
+    let last_usable = table
+        .primary
+        .last_usable_lba
+        .min(total_lbas.saturating_sub(34));
     let mut cursor = table.primary.first_usable_lba.max(34);
     for (_, entry) in table.active_partitions() {
         if entry.starting_lba > cursor {

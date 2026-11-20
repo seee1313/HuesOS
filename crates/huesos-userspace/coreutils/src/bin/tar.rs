@@ -48,9 +48,18 @@ const TYPE_FILE: u8 = b'0';
 const TYPE_DIR: u8 = b'5';
 
 enum Mode {
-    Create { archive: String, base: String, paths: Vec<String> },
-    List { archive: String },
-    Extract { archive: String, base: String },
+    Create {
+        archive: String,
+        base: String,
+        paths: Vec<String>,
+    },
+    List {
+        archive: String,
+    },
+    Extract {
+        archive: String,
+        base: String,
+    },
 }
 
 fn run() -> i32 {
@@ -66,7 +75,10 @@ fn run() -> i32 {
         return 2;
     }
     let letters: Vec<char> = flags.chars().collect();
-    let operation = match letters.iter().find(|letter| matches!(letter, 'c' | 't' | 'x')) {
+    let operation = match letters
+        .iter()
+        .find(|letter| matches!(letter, 'c' | 't' | 'x'))
+    {
         Some('c') => 'c',
         Some('t') => 't',
         Some('x') => 'x',
@@ -216,13 +228,7 @@ fn append(out: &mut fs::File, source: &str, name: &str) -> Result<()> {
     Ok(())
 }
 
-fn write_header(
-    out: &mut fs::File,
-    name: &str,
-    size: u64,
-    typeflag: u8,
-    mode: u32,
-) -> Result<()> {
+fn write_header(out: &mut fs::File, name: &str, size: u64, typeflag: u8, mode: u32) -> Result<()> {
     if name.len() > 100 {
         return Err(invalid("member name longer than 100 bytes"));
     }
@@ -312,7 +318,10 @@ fn extract(archive: &str, base: &str) -> Result<()> {
                     remaining -= want as u64;
                 }
                 created.fsync()?;
-                skip(&mut file, (BLOCK as u64 - size % BLOCK as u64) % BLOCK as u64)?;
+                skip(
+                    &mut file,
+                    (BLOCK as u64 - size % BLOCK as u64) % BLOCK as u64,
+                )?;
                 println!("{name}");
                 continue;
             }
@@ -324,7 +333,10 @@ fn extract(archive: &str, base: &str) -> Result<()> {
             }
         }
         skip(&mut file, size)?;
-        skip(&mut file, (BLOCK as u64 - size % BLOCK as u64) % BLOCK as u64)?;
+        skip(
+            &mut file,
+            (BLOCK as u64 - size % BLOCK as u64) % BLOCK as u64,
+        )?;
         println!("{name}");
     }
 }
@@ -335,7 +347,10 @@ fn ensure_directory(directory: &str) -> Result<()> {
     if normalized.is_empty() || normalized == "." || normalized == "/" {
         return Ok(());
     }
-    if fs::metadata(&normalized).map(|meta| meta.is_dir()).unwrap_or(false) {
+    if fs::metadata(&normalized)
+        .map(|meta| meta.is_dir())
+        .unwrap_or(false)
+    {
         return Ok(());
     }
     if let Some(parent) = path::parent(&normalized) {

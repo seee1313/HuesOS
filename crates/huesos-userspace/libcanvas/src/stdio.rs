@@ -347,9 +347,8 @@ mod imp {
     pub fn stdin_read_timeout(out: &mut [u8], ticks: u64) -> Result<usize> {
         let mut actual = 0usize;
         // SAFETY: `out` and `actual` are valid writable buffers.
-        let rc = unsafe {
-            canvas_stdin_read_timeout(out.as_mut_ptr(), out.len(), ticks, &mut actual)
-        };
+        let rc =
+            unsafe { canvas_stdin_read_timeout(out.as_mut_ptr(), out.len(), ticks, &mut actual) };
         if rc == 0 {
             Ok(actual)
         } else {

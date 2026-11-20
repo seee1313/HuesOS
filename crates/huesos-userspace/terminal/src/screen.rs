@@ -1295,9 +1295,8 @@ impl Screen {
         if cell.ch != ' ' {
             let mut b = [0u8; 4];
             let s = cell.ch.encode_utf8(&mut b);
-            let _ = canvas.draw_text_to_shadow(
-                shadow, x, y, s, cell.fg.0, cell.fg.1, cell.fg.2, self.font,
-            );
+            let _ = canvas
+                .draw_text_to_shadow(shadow, x, y, s, cell.fg.0, cell.fg.1, cell.fg.2, self.font);
         }
         true
     }

@@ -58,7 +58,9 @@ fn cpus() -> i32 {
     let snapshot = match sys::snapshot() {
         Ok(snapshot) => snapshot,
         Err(error) => {
-            cu::errln(&format!("schedctl: scheduler counters unavailable: {error}"));
+            cu::errln(&format!(
+                "schedctl: scheduler counters unavailable: {error}"
+            ));
             return 1;
         }
     };
@@ -93,7 +95,11 @@ fn cpus() -> i32 {
                 format!("{:#x}", record.current_task & 0xffff)
             },
             tui::human_count(record.ticks),
-            format!("{}.{:02}%", record.admitted_ppm / 10_000, (record.admitted_ppm % 10_000) / 100),
+            format!(
+                "{}.{:02}%",
+                record.admitted_ppm / 10_000,
+                (record.admitted_ppm % 10_000) / 100
+            ),
         ]);
     }
     cu::outln(&table.header_line());
@@ -149,7 +155,9 @@ fn bench() -> i32 {
     let before = match sys::snapshot() {
         Ok(snapshot) => snapshot,
         Err(error) => {
-            cu::errln(&format!("schedctl: scheduler counters unavailable: {error}"));
+            cu::errln(&format!(
+                "schedctl: scheduler counters unavailable: {error}"
+            ));
             return 1;
         }
     };
@@ -161,7 +169,9 @@ fn bench() -> i32 {
     let after = match sys::snapshot() {
         Ok(snapshot) => snapshot,
         Err(error) => {
-            cu::errln(&format!("schedctl: scheduler counters unavailable: {error}"));
+            cu::errln(&format!(
+                "schedctl: scheduler counters unavailable: {error}"
+            ));
             return 1;
         }
     };
@@ -191,13 +201,23 @@ fn bench() -> i32 {
         ),
     ];
     for (label, delta) in lines {
-        cu::outln(&format!("{label:<17}: {delta:>8}  ({} /s)", per_second(delta)));
+        cu::outln(&format!(
+            "{label:<17}: {delta:>8}  ({} /s)",
+            per_second(delta)
+        ));
     }
     cu::outln(&format!(
         "scheduler ticks  : {:>8}",
         after.ticks().saturating_sub(before.ticks())
     ));
-    let idle = after.cpus.iter().filter(|cpu| cpu.current_task == 0).count();
-    cu::outln(&format!("idle cpus at end : {idle}/{}", after.summary.cpu_count));
+    let idle = after
+        .cpus
+        .iter()
+        .filter(|cpu| cpu.current_task == 0)
+        .count();
+    cu::outln(&format!(
+        "idle cpus at end : {idle}/{}",
+        after.summary.cpu_count
+    ));
     0
 }

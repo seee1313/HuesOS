@@ -264,7 +264,9 @@ fn parse_check_line(line: &str) -> Option<(String, &str)> {
         return None;
     }
     let mut rest = &line[64..];
-    rest = rest.strip_prefix("  ").or_else(|| rest.strip_prefix(" *"))?;
+    rest = rest
+        .strip_prefix("  ")
+        .or_else(|| rest.strip_prefix(" *"))?;
     if rest.is_empty() {
         return None;
     }

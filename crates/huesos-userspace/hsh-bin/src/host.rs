@@ -1092,12 +1092,11 @@ fn flag_takes_value(command: &str, flag: &str) -> bool {
         "sort" => matches!(flag, "-k" | "--key" | "-t" | "--field-separator"),
         "grep" => matches!(flag, "-e" | "--regexp" | "-m" | "--max-count"),
         "find" => matches!(flag, "-name" | "-type" | "-maxdepth" | "-iname"),
-        "fdisk" => matches!(
-            flag,
-            "--type" | "--size" | "--start" | "--end" | "--name"
-        ),
+        "fdisk" => matches!(flag, "--type" | "--size" | "--start" | "--end" | "--name"),
         // `-cf`, `-tf`, `-xf`, `-f`: every archive flag that names the archive.
-        "tar" => flag.starts_with('-') && flag.ends_with('f') || matches!(flag, "-C" | "--directory"),
+        "tar" => {
+            flag.starts_with('-') && flag.ends_with('f') || matches!(flag, "-C" | "--directory")
+        }
         _ => false,
     }
 }
@@ -1109,7 +1108,9 @@ fn is_data_word(command: &str, word: &str) -> bool {
     }
     // Subcommands of the multi-command tools.
     let subcommands: &[&str] = match command {
-        "fdisk" => &["list", "inspect", "verify", "gpt-init", "add", "del", "resize"],
+        "fdisk" => &[
+            "list", "inspect", "verify", "gpt-init", "add", "del", "resize",
+        ],
         "hxfs" => &["status", "stats", "scrub", "snapshot", "sync", "gc"],
         "schedctl" => &["cpus", "tasks", "bench"],
         _ => &[],

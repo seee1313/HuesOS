@@ -50,7 +50,10 @@ fn run() -> i32 {
         match arg {
             "-maxdepth" => {
                 index += 1;
-                match args.get(index).and_then(|value| value.parse::<usize>().ok()) {
+                match args
+                    .get(index)
+                    .and_then(|value| value.parse::<usize>().ok())
+                {
                     Some(depth) => options.max_depth = Some(depth),
                     None => {
                         eprintln!("find: -maxdepth needs a non-negative number");
@@ -124,7 +127,12 @@ fn visit(options: &Options, current: &str, depth: usize, failures: &mut u32) {
         .kind
         .is_none_or(|kind| (kind == Kind::Dir) == is_dir);
     let name = path::file_name(&normalized).unwrap_or(&normalized);
-    if selected && options.name.as_deref().is_none_or(|glob| glob_match(glob, name)) {
+    if selected
+        && options
+            .name
+            .as_deref()
+            .is_none_or(|glob| glob_match(glob, name))
+    {
         println!("{normalized}");
     }
     if !is_dir {

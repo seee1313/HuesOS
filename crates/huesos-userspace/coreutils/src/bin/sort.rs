@@ -131,7 +131,9 @@ fn numeric_prefix(text: &str) -> i64 {
             scale_seen = true;
             continue;
         }
-        value = value.saturating_mul(10).saturating_add(i64::from(byte - b'0'));
+        value = value
+            .saturating_mul(10)
+            .saturating_add(i64::from(byte - b'0'));
         if scale_seen {
             // Numeric comparison only needs the integer part; stopping here
             // keeps the parse overflow-free on absurd input.
