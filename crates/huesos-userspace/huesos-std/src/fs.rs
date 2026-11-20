@@ -62,14 +62,12 @@ pub struct Entry {
 
 /// Take the granted `Hxfs` service channel, if this process has one.
 pub fn service() -> Option<Hxfs> {
-    take_cap_handle(CapKind::HxfsService)
-        .map(|h| Hxfs::from_channel(Channel::from_handle(h)))
+    take_cap_handle(CapKind::HxfsService).map(|h| Hxfs::from_channel(Channel::from_handle(h)))
 }
 
 /// Take the granted scoped directory handle, if this process has one.
 pub fn directory() -> Option<HxfsDirectory> {
-    take_cap_handle(CapKind::HxfsDir)
-        .map(|h| HxfsDirectory::from_channel(Channel::from_handle(h)))
+    take_cap_handle(CapKind::HxfsDir).map(|h| HxfsDirectory::from_channel(Channel::from_handle(h)))
 }
 
 /// True when the process can reach the filesystem at all.
