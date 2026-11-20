@@ -4,8 +4,8 @@
 //! boot smoke can drive the tool without a terminal. This module is the
 //! interactive counterpart: it draws the disk geometry, a proportional map of
 //! the sectors and the partition table, then reads keystrokes until the user
-//! quits. Everything happens on an in-memory `GptDisk`; `w` is the only
-//! command that touches the store.
+//! quits. Edits land in the working `GptDisk`, which is a copy of what was read
+//! from the store; `w` is the only command that writes it back.
 //!
 //! The screen is plain ANSI: the terminal in HuesOS is a serial console, so no
 //! cursor-addressing library is involved -- a full redraw (`clear` + text) is

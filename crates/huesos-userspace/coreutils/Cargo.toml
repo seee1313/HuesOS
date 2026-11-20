@@ -91,6 +91,38 @@ path = "src/bin/fsck.rs"
 name = "mkfs"
 path = "src/bin/mkfs.rs"
 
+[[bin]]
+name = "grep"
+path = "src/bin/grep.rs"
+
+[[bin]]
+name = "find"
+path = "src/bin/find.rs"
+
+[[bin]]
+name = "wc"
+path = "src/bin/wc.rs"
+
+[[bin]]
+name = "head"
+path = "src/bin/head.rs"
+
+[[bin]]
+name = "tail"
+path = "src/bin/tail.rs"
+
+[[bin]]
+name = "sort"
+path = "src/bin/sort.rs"
+
+[[bin]]
+name = "tar"
+path = "src/bin/tar.rs"
+
+[[bin]]
+name = "sha256sum"
+path = "src/bin/sha256sum.rs"
+
 [dependencies]
 libcanvas = { path = "../libcanvas", default-features = false, features = ["dyn-client"] }
 huesos-abi = { path = "../../huesos-abi" }

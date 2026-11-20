@@ -720,11 +720,12 @@ impl InteractiveShell {
 
         // 5. External `/bin/fdisk.elf` pipe.
         //
-        //    The disk under `fdisk list` depends on the boot: the in-memory
-        //    demo disk carries a GPT with an `HxFS-Root` partition, while the
-        //    CI machine with an NVMe volume gets a bare `HxFS v7` superfloppy
-        //    (no partition table at all). Both shapes have to survive the pipe
-        //    stage; the column names differ, so the filter follows the shape.
+        //    The disk under `fdisk list` depends on the boot: a machine with no
+        //    block capability falls back to the `/dev/mem` fixture volume,
+        //    which carries a GPT with an `HxFS-Root` partition, while a boot
+        //    with an NVMe volume gets whatever that volume holds. Both shapes
+        //    have to survive the pipe stage; the column names differ, so the
+        //    filter follows the shape.
         let (list_filter, list_expect) = if self.host.hxfs.is_some() {
             ("fdisk list | where status == OK", "raw-hxfs")
         } else {
@@ -861,9 +862,9 @@ impl InteractiveShell {
 
         // 10. `fdisk gpt-init --dry-run` must always be safe, and a real
         //     init/add/del/verify cycle must round-trip on a writable disk.
-        //     Both run against the in-memory scratch disk (`/dev/mem`) so the
-        //     live volume on the default target is never touched; the real
-        //     GPT writer, its CRC recomputation and `verify` all run for real.
+        //     Both run against the `/dev/mem` volume so the boot volume is
+        //     never touched; the GPT writer, its CRC recomputation and
+        //     `verify` all run for real.
         //
         //     The same cycle also has to work on a disk image stored as an
         //     ordinary HxFS *file*: that is what needs random-offset writes
