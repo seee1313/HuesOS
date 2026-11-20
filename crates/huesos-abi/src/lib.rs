@@ -1757,7 +1757,7 @@ mod tests {
         assert_eq!(Syscall::from_raw(82), Some(Syscall::ThreadWait));
         assert_eq!(Syscall::from_raw(83), Some(Syscall::ProcessTerminate));
         // Append-only: the next number past the newest syscall stays unmapped.
-        assert_eq!(Syscall::from_raw(84), None);
+        assert_eq!(Syscall::from_raw(86), None);
     }
 
     #[test]
