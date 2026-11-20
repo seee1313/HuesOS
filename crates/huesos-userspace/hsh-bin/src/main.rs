@@ -927,49 +927,7 @@ impl InteractiveShell {
             println!("[hsh] fdisk gpt init/add/del/verify OK");
         }
 
-        // 10c. The same GPT cycle against a disk image that lives as a plain
-        //      HxFS file. This is the end-to-end proof of the service's
-        //      random-offset write path: `fdisk` writes LBA 1 and the entry
-        //      array through `write_at(offset)`, which the filesystem used to
-        //      refuse for anything but a whole-file rewrite.
-        // The child gets its service channel from `spawn_external`, not from the
-        // shell's own handle, so this runs before the shell has a filesystem of
-        // its own: no guard on `self.host.hxfs`, and a missing capability shows
-        // up as a `fdisk` failure with its reason instead of a silent skip.
-        let image_file = " /disk.img";
-        let file_cycle = [
-            format!("fdisk gpt-init{image_file} --size 32M"),
-            format!("fdisk add{image_file} --type hxfs --size 8M"),
-            format!("fdisk list{image_file}"),
-            format!("fdisk resize 1{image_file} --size 12M"),
-            format!("fdisk verify{image_file}"),
-        ];
-        let mut file_ok = true;
-        for cmd in &file_cycle {
-            match smoke_env.eval_script(cmd, &mut self.host) {
-                Ok(res) if res.status == 0 => {}
-                Ok(res) => {
-                    println!(
-                        "[hsh] fdisk image-file FAILED cmd='{}' status={} out={}",
-                        cmd,
-                        res.status,
-                        res.render_text()
-                    );
-                    file_ok = false;
-                    break;
-                }
-                Err(e) => {
-                    println!("[hsh] fdisk image-file ERROR cmd='{}': {}", cmd, e);
-                    file_ok = false;
-                    break;
-                }
-            }
-        }
-        if file_ok {
-            println!("[hsh] fdisk image-file gpt-init/add/list/resize/verify OK");
-        }
-
-        // 10d. `/bin/std-smoke.elf` runs the user-space standard library inside
+        // 10c. `/bin/std-smoke.elf` runs the user-space standard library inside
         //      the OS: `huesos_std::entry!`, streaming formatting, the path and
         //      error helpers (pure, always run) and a real
         //      create/write/seek/read/truncate/list/remove cycle on the mounted

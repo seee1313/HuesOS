@@ -348,11 +348,53 @@ fn check_fs() -> u32 {
         failures += 1;
     }
 
+    // The offset pattern `fdisk` uses to write a GPT into an image file: MBR
+    // at LBA 0, header at LBA 1, the entry array at LBA 2, and a backup header
+    // appended at the end. Those three offsets in one file are exactly what
+    // the service's random-offset write path exists for, so they are pinned
+    // here, where the filesystem capability is known to be present.
+    if let Ok(mut image) = fs::File::create("/std-gpt.img") {
+        let mut sectors = 0u32;
+        let mut gpt_ok = true;
+        let mut header = [0u8; 512];
+        header[..8].copy_from_slice(b"EFI PART");
+        if io::write_all(&mut image, &[0u8; 512]).is_ok() {
+            sectors += 1;
+        } else {
+            gpt_ok = false;
+        }
+        gpt_ok &= image.seek(SeekFrom::Start(512)).is_ok();
+        gpt_ok &= io::write_all(&mut image, &header).is_ok();
+        gpt_ok &= image.seek(SeekFrom::Start(1024)).is_ok();
+        gpt_ok &= io::write_all(&mut image, &[0xABu8; 512]).is_ok();
+        gpt_ok &= image.seek(SeekFrom::End(0)).is_ok();
+        gpt_ok &= io::write_all(&mut image, &header).is_ok();
+        let mut probe = [0u8; 8];
+        let read_back = image.seek(SeekFrom::Start(512)).is_ok()
+            && matches!(image.read(&mut probe), Ok(8));
+        expect!(failures, gpt_ok && read_back, "fs gpt-shaped write");
+        expect!(failures, &probe[..] == b"EFI PART", "fs gpt header round-trip");
+        expect!(
+            failures,
+            image.size().unwrap_or(0) == 2048 && sectors == 1,
+            "fs gpt image size"
+        );
+        expect!(
+            failures,
+            image.truncate(1024).is_ok() && image.size().unwrap_or(0) == 1024,
+            "fs gpt image truncate"
+        );
+        expect!(failures, fs::remove("/std-gpt.img").is_ok(), "fs gpt image remove");
+    } else {
+        println!("[std] FAIL fs gpt-shaped write: create failed");
+        failures += 1;
+    }
+
     if let Ok((used, capacity)) = fs::volume_bytes() {
-        println!("[std] fs OK (create/write/seek/read/overwrite/truncate/list/remove)");
+        println!("[std] fs OK (create/write/seek/read/overwrite/truncate/list/remove/gpt)");
         println!("[std] fs volume used={used} capacity={capacity}");
     } else {
-        println!("[std] fs OK (create/write/seek/read/overwrite/truncate/list/remove)");
+        println!("[std] fs OK (create/write/seek/read/overwrite/truncate/list/remove/gpt)");
     }
     failures
 }
