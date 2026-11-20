@@ -54,18 +54,34 @@ impl Write for Sink {
 
 fn run() -> i32 {
     let mut failures = 0u32;
+    // TEMPORARY tracing: stderr is the stream the shell smoke definitely
+    // captures, so every step reports there while this is being brought up.
+    let mut out = io::stdout();
+    let _ = io::write_all(&mut out, b"[std] direct stdout write OK\n");
+    eprintln!("[std] trace: begin");
     println!("[std] entry OK (naked _start, ScudoHeap, panic handler)");
+    eprintln!("[std] trace: println done");
 
     failures += check_io();
+    eprintln!("[std] trace: io {failures}");
     failures += check_path();
+    eprintln!("[std] trace: path {failures}");
     failures += check_error();
+    eprintln!("[std] trace: error {failures}");
     failures += check_env();
+    eprintln!("[std] trace: env {failures}");
     failures += check_fs();
+    eprintln!("[std] trace: fs {failures}");
     failures += check_buffered();
+    eprintln!("[std] trace: buffered {failures}");
     failures += check_collections();
+    eprintln!("[std] trace: collections {failures}");
     failures += check_time();
+    eprintln!("[std] trace: time {failures}");
     failures += check_threads();
+    eprintln!("[std] trace: threads {failures}");
     failures += check_process();
+    eprintln!("[std] trace: process {failures}");
 
     if failures == 0 {
         println!("[std] PASS");
