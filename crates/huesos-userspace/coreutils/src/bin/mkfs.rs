@@ -47,7 +47,7 @@ fn run() -> i32 {
     let mut part: Option<usize> = None;
     let mut target: Option<&str> = None;
 
-    let mut index = 1;
+    let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
             "-t" | "--type" => {

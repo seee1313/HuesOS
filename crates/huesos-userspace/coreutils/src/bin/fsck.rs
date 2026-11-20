@@ -46,7 +46,7 @@ fn run() -> i32 {
     let mut verbose = false;
     let mut target: Option<&str> = None;
 
-    for arg in args.iter().skip(1) {
+    for arg in args.iter() {
         match arg.as_str() {
             "-n" | "--no" => read_only = true,
             "-y" | "--yes" | "-f" | "--force" => {}

@@ -31,7 +31,7 @@ fn run() -> i32 {
     let mut path: Option<&str> = None;
     let mut limit: Option<u64> = None;
     let mut offset: u64 = 0;
-    let mut index = 1;
+    let mut index = 0;
     while index < args.len() {
         let arg = args[index].as_str();
         match arg {

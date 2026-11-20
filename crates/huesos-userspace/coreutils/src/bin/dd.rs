@@ -46,7 +46,7 @@ fn run() -> i32 {
     let mut seek = 0u64;
     let mut quiet = false;
 
-    for arg in args.iter().skip(1) {
+    for arg in args.iter() {
         let Some((key, value)) = arg.split_once('=') else {
             cu::errln(&format!("dd: expected key=value, got '{arg}'"));
             return 2;

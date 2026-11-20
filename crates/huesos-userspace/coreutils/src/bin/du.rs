@@ -40,7 +40,7 @@ fn run() -> i32 {
     let mut max_depth: u32 = u32::MAX;
     let mut root: Option<&str> = None;
 
-    let mut index = 1;
+    let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
             "-s" | "--summarize" => summary_only = true,
