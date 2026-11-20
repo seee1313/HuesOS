@@ -40,7 +40,7 @@ fn run() -> i32 {
             "-h" | "--human-readable" => human = true,
             "-a" | "--all" => wide = true,
             "-H" | "--si" => human = true,
-            "-h" | "--help" => {
+            "--help" => {
                 cu::outln("usage: df [-h] [-a] [<path>]");
                 cu::outln("  -h  powers of 1024 instead of 4 KiB blocks");
                 cu::outln("  -a  also print the checkpoint and quota lines");
