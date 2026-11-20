@@ -58,6 +58,11 @@
 #![no_std]
 #![warn(missing_docs)]
 
+// The only allocation in this crate is the dynamic client's task table
+// (`thread::spawn_task`). Keeping the dependency behind that feature matters:
+// a static binary that links this crate against its own allocator must not
+// inherit an `alloc` requirement it never asked for.
+#[cfg(feature = "dyn-client")]
 extern crate alloc;
 
 pub mod acpi_broker;
