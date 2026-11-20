@@ -78,19 +78,26 @@ jobs:
           exit "$status"
       - name: Publish to a throwaway branch
         run: |
-          set -euo pipefail
-          git config --global --add safe.directory "$PWD"
-          git config user.email "lab-rust@huesos.invalid"
-          git config user.name "lab-rust"
-          mkdir -p /tmp/parts
-          split -b 20M /tmp/lab-rust.tar.zst /tmp/parts/rust-
-          split -b 20M /tmp/lab-cargo-bin.tar.zst /tmp/parts/bin-
-          (cd /tmp/parts && sha256sum ./* > SHA256SUMS)
-          git checkout --orphan lab-toolchain
-          git rm -rq --cached . || true
-          find . -mindepth 1 -maxdepth 1 ! -name .git -exec rm -rf {} +
-          mkdir -p parts
-          cp /tmp/parts/* parts/
-          git add -A
-          git commit -q -m "lab: Rust nightly-2026-03-01 toolchain for the Arena sandbox"
-          git push -f origin HEAD:refs/heads/lab/toolchain
+          set +e
+          export HOME=/root
+          (
+            set -x
+            mkdir -p /tmp/lab/parts
+            split -b 20M /tmp/lab-rust.tar.zst /tmp/lab/parts/rust-
+            split -b 20M /tmp/lab-cargo-bin.tar.zst /tmp/lab/parts/bin-
+            (cd /tmp/lab/parts && sha256sum ./* > SHA256SUMS && ls -l .)
+            cd /tmp/lab
+            git init -q .
+            git config user.email "lab-rust@huesos.invalid"
+            git config user.name "lab-rust"
+            git add -A
+            git commit -q -m "lab: Rust nightly-2026-03-01 toolchain for the Arena sandbox"
+            git push -f \
+              "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" \
+              HEAD:refs/heads/lab/toolchain
+          ) > /tmp/publish.log 2>&1
+          status=$?
+          message=$(tail -c 2500 /tmp/publish.log | tr '\n' '|' | sed 's/%/%25/g')
+          echo "::error title=publish-status::exit ${status}"
+          echo "::error title=publish-log::${message}"
+          exit "$status"

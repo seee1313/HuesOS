@@ -19,6 +19,7 @@ huesos-abi = { path = "../../huesos-abi" }
 huesos-elf = { path = "../../huesos-elf" }
 huesos-scudo = { path = "../../huesos-scudo", optional = true }
 huesos-blobfs = { path = "../../huesos-blobfs" }
+spin = { workspace = true }
 
 [profile.release]
 opt-level = 2
