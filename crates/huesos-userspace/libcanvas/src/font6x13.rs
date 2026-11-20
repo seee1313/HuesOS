@@ -129,8 +129,216 @@ pub const FONT_6X13: [[u8; 13]; 95] = [
 pub fn glyph(ch: char) -> Option<&'static [u8; CELL_H]> {
     let code = ch as u32;
     if (0x20..=0x7E).contains(&code) {
-        Some(&FONT_6X13[(code - 0x20) as usize])
-    } else {
-        None
+        return Some(&FONT_6X13[(code - 0x20) as usize]);
+    }
+    extended_index(code).map(|index| &EXTENDED[index])
+}
+
+// ---------------------------------------------------------------------------
+// Generated non-ASCII glyphs: box drawing, block elements and Braille.
+//
+// The terminal cell holds a `char`, so a program can draw a real frame with
+// `─│┌┐└┘`, a solid bar with `█`/`░`, and a sub-cell history with Braille
+// (`⠁`..`⣿`, two columns by four rows per cell). Authoring 256 Braille bitmaps
+// by hand would be silly, so they are *computed* by `const fn` at compile
+// time: one entry per pattern, exact and auditable.
+// ---------------------------------------------------------------------------
+
+/// Codepoints with generated glyphs, in table order after the Braille block.
+const EXTENDED_CODEPOINTS: [u32; 22] = [
+    0x2500, // ─
+    0x2502, // │
+    0x250C, // ┌
+    0x2510, // ┐
+    0x2514, // └
+    0x2518, // ┘
+    0x251C, // ├
+    0x2524, // ┤
+    0x252C, // ┬
+    0x2534, // ┴
+    0x253C, // ┼
+    0x2588, // █
+    0x2589, // ▉
+    0x258A, // ▊
+    0x258B, // ▋
+    0x258C, // ▌
+    0x258D, // ▍
+    0x258E, // ▎
+    0x258F, // ▏
+    0x2591, // ░
+    0x2592, // ▒
+    0x2593, // ▓
+];
+
+/// Braille patterns occupy `[0, 256)`, the codepoints above follow them.
+const EXTENDED_LEN: usize = 256 + EXTENDED_CODEPOINTS.len();
+
+/// Solid rows of a glyph: the x-height band, so adjacent lines of bars keep the
+/// same one-pixel line gap as adjacent lines of text.
+const BAND_TOP: usize = 2;
+const BAND_BOTTOM: usize = 12;
+
+static EXTENDED: [[u8; CELL_H]; EXTENDED_LEN] = build_extended();
+
+/// Index into [`EXTENDED`] for `code`, if the renderer can draw it.
+const fn extended_index(code: u32) -> Option<usize> {
+    if code >= 0x2800 && code <= 0x28FF {
+        return Some((code - 0x2800) as usize);
+    }
+    let mut index = 0;
+    while index < EXTENDED_CODEPOINTS.len() {
+        if EXTENDED_CODEPOINTS[index] == code {
+            return Some(256 + index);
+        }
+        index += 1;
+    }
+    None
+}
+
+const fn set_pixel(cell: &mut [u8; CELL_H], x: usize, y: usize) {
+    if x < CELL_W && y < CELL_H {
+        cell[y] |= 1 << x;
     }
 }
+
+const fn build_extended() -> [[u8; CELL_H]; EXTENDED_LEN] {
+    let mut table = [[0u8; CELL_H]; EXTENDED_LEN];
+    let mut pattern = 0;
+    while pattern < 256 {
+        // Braille dot numbering: dots 1-3 and 7 down the left column, 4-6 and 8
+        // down the right; bit 0 is dot 1.
+        let mut bit = 0;
+        while bit < 8 {
+            if pattern & (1 << bit) != 0 {
+                let column = if bit < 3 || bit == 6 { 0 } else { 1 };
+                let row = match bit {
+                    0 | 3 => 0,
+                    1 | 4 => 1,
+                    2 | 5 => 2,
+                    _ => 3,
+                };
+                let base_x = if column == 0 { 0 } else { 3 };
+                let base_y = 1 + row * 3;
+                let mut dy = 0;
+                while dy < 2 {
+                    let mut dx = 0;
+                    while dx < 2 {
+                        set_pixel(&mut table[pattern], base_x + dx, base_y + dy);
+                        dx += 1;
+                    }
+                    dy += 1;
+                }
+            }
+            bit += 1;
+        }
+        pattern += 1;
+    }
+
+    let mut entry = 0;
+    while entry < EXTENDED_CODEPOINTS.len() {
+        let code = EXTENDED_CODEPOINTS[entry];
+        let mut cell = [0u8; CELL_H];
+        let middle = CELL_H / 2;
+        match code {
+            0x2500 => {
+                let mut x = 0;
+                while x < CELL_W {
+                    set_pixel(&mut cell, x, middle);
+                    x += 1;
+                }
+            }
+            0x2502 => {
+                let mut y = 0;
+                while y < CELL_H {
+                    set_pixel(&mut cell, CELL_W / 2, y);
+                    y += 1;
+                }
+            }
+            // Corners and tees: one horizontal arm and one vertical arm, each
+            // drawn only toward the edges the glyph actually connects.
+            0x250C | 0x2510 | 0x2514 | 0x2518 | 0x251C | 0x2524 | 0x252C | 0x2534
+            | 0x253C => {
+                let centre_x = CELL_W / 2;
+                let (left, right, up) = match code {
+                    0x250C => (false, true, false),
+                    0x2510 => (true, false, false),
+                    0x2514 => (false, true, true),
+                    0x2518 => (true, false, true),
+                    0x251C => (false, true, true),
+                    0x2524 => (true, false, true),
+                    0x252C => (true, true, false),
+                    0x2534 => (true, true, true),
+                    _ => (true, true, true),
+                };
+                if left {
+                    let mut x = 0;
+                    while x <= centre_x {
+                        set_pixel(&mut cell, x, middle);
+                        x += 1;
+                    }
+                }
+                if right {
+                    let mut x = centre_x;
+                    while x < CELL_W {
+                        set_pixel(&mut cell, x, middle);
+                        x += 1;
+                    }
+                }
+                if up {
+                    let mut y = 0;
+                    while y <= middle {
+                        set_pixel(&mut cell, centre_x, y);
+                        y += 1;
+                    }
+                }
+                let mut y = middle;
+                while y < CELL_H {
+                    set_pixel(&mut cell, centre_x, y);
+                    y += 1;
+                }
+            }
+            0x2588 | 0x2589 | 0x258A | 0x258B | 0x258C | 0x258D | 0x258E | 0x258F => {
+                // Left-aligned block, 8/8 down to 1/8 of the cell width.
+                let eighths = 8 - (code - 0x2588) as usize;
+                let width = (CELL_W * eighths).div_ceil(8);
+                let mut y = BAND_TOP;
+                while y < BAND_BOTTOM {
+                    let mut x = 0;
+                    while x < width {
+                        set_pixel(&mut cell, x, y);
+                        x += 1;
+                    }
+                    y += 1;
+                }
+            }
+            // Shade dithers: 1-in-4, 1-in-2 and 3-in-4 pixels of the band.
+            _ => {
+                let step = match code {
+                    0x2591 => 2,
+                    0x2592 => 1,
+                    _ => 1,
+                };
+                let mut y = BAND_TOP;
+                while y < BAND_BOTTOM {
+                    let mut x = 0;
+                    while x < CELL_W {
+                        let on = match code {
+                            0x2591 => (x + y) % 2 == 0 && y % 2 == 0,
+                            0x2592 => (x + y) % 2 == 0,
+                            _ => !((x + y) % 4 == 3),
+                        };
+                        if on {
+                            set_pixel(&mut cell, x, y);
+                        }
+                        x += step;
+                    }
+                    y += 1;
+                }
+            }
+        }
+        table[256 + entry] = cell;
+        entry += 1;
+    }
+    table
+}
+

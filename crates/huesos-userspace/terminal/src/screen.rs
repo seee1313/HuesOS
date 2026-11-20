@@ -42,14 +42,14 @@ const COLOR_CURSOR: Color = (95, 225, 185);
 /// Single character cell stored in the screen & shadow grids.
 #[derive(Clone, Copy, Eq, PartialEq)]
 pub struct Cell {
-    pub ch: u8,
+    pub ch: char,
     pub fg: Color,
     pub bg: Color,
     pub flags: u8,
 }
 
 const DEFAULT_CELL: Cell = Cell {
-    ch: b' ',
+    ch: ' ',
     fg: COLOR_TEXT,
     bg: COLOR_BACKGROUND,
     flags: 0,
@@ -338,8 +338,8 @@ impl Screen {
     }
 
     pub fn write_str(&mut self, text: &str) {
-        for byte in text.bytes() {
-            self.write_byte(byte);
+        for ch in text.chars() {
+            self.write_char(ch);
         }
     }
 
@@ -349,9 +349,25 @@ impl Screen {
             b'\r' => self.carriage_return(),
             b'\t' => self.tab(),
             0x08 => self.backspace(),
-            0x20..=0x7e => self.write_printable(byte),
-            _ => self.write_printable(b'?'),
+            0x20..=0x7e => self.write_char(char::from(byte)),
+            // A lone high byte is not a character: UTF-8 text reaches the
+            // cell grid through `write_str`, which decodes it first.
+            _ => self.write_char('?'),
         }
+    }
+
+    /// Place one character in the grid.
+    ///
+    /// The font covers ASCII plus the generated box/block/Braille glyphs; a
+    /// character outside that set is drawn as `?`, so a program can never
+    /// scribble an unrenderable codepoint into the framebuffer.
+    pub fn write_char(&mut self, ch: char) {
+        let code = ch as u32;
+        let supported = (0x20..=0x7e).contains(&code)
+            || (0x2500..=0x2593).contains(&code)
+            || (0x2800..=0x28ff).contains(&code);
+        let glyph = if supported { ch } else { '?' };
+        self.write_printable(glyph);
     }
 
     pub fn backspace(&mut self) {
@@ -553,7 +569,7 @@ impl Screen {
         }
     }
 
-    fn write_printable(&mut self, byte: u8) {
+    fn write_printable(&mut self, ch: char) {
         let wrap_columns = self.active_columns();
         if self.col >= wrap_columns || self.col >= COLS {
             self.newline();
@@ -561,7 +577,7 @@ impl Screen {
         let row = self.row;
         let column = self.col;
         self.cells[row][column] = Cell {
-            ch: byte,
+            ch,
             fg: self.active_fg,
             bg: COLOR_BACKGROUND,
             flags: 0,
@@ -581,7 +597,7 @@ impl Screen {
             .saturating_mul(TAB_WIDTH)
             .min(columns);
         while self.col < tab_end {
-            self.write_printable(b' ');
+            self.write_printable(' ');
         }
     }
 
@@ -1098,11 +1114,12 @@ impl Screen {
             while end < len && row_cells[end].fg == color {
                 end += 1;
             }
-            let mut buf = [0u8; COLS];
-            for (dst, cell) in buf[..end - col].iter_mut().zip(&row_cells[col..end]) {
-                *dst = cell.ch;
+            let mut buf = [0u8; COLS * 4];
+            let mut used = 0;
+            for cell in &row_cells[col..end] {
+                used += cell.ch.encode_utf8(&mut buf[used..]).len();
             }
-            let Ok(text) = core::str::from_utf8(&buf[..end - col]) else {
+            let Ok(text) = core::str::from_utf8(&buf[..used]) else {
                 return false;
             };
             let rx = LEFT_MARGIN.saturating_add(col as u32 * metrics.advance);
@@ -1209,14 +1226,12 @@ impl Screen {
             while run_end < text_end && row_cells[run_end].fg == color {
                 run_end += 1;
             }
-            let mut buf = [0u8; COLS];
-            for (dst, cell) in buf[..run_end - col]
-                .iter_mut()
-                .zip(&row_cells[col..run_end])
-            {
-                *dst = cell.ch;
+            let mut buf = [0u8; COLS * 4];
+            let mut used = 0;
+            for cell in &row_cells[col..run_end] {
+                used += cell.ch.encode_utf8(&mut buf[used..]).len();
             }
-            let Ok(text) = core::str::from_utf8(&buf[..run_end - col]) else {
+            let Ok(text) = core::str::from_utf8(&buf[..used]) else {
                 return Err(());
             };
             let rx = LEFT_MARGIN.saturating_add(col as u32 * metrics.advance);
@@ -1277,13 +1292,12 @@ impl Screen {
         {
             return false;
         }
-        if cell.ch != b' ' {
-            let b = [cell.ch];
-            if let Ok(s) = core::str::from_utf8(&b) {
-                let _ = canvas.draw_text_to_shadow(
-                    shadow, x, y, s, cell.fg.0, cell.fg.1, cell.fg.2, self.font,
-                );
-            }
+        if cell.ch != ' ' {
+            let mut b = [0u8; 4];
+            let s = cell.ch.encode_utf8(&mut b);
+            let _ = canvas.draw_text_to_shadow(
+                shadow, x, y, s, cell.fg.0, cell.fg.1, cell.fg.2, self.font,
+            );
         }
         true
     }
@@ -1341,14 +1355,12 @@ impl Screen {
                 while run_end < len && row_cells[run_end].fg == color {
                     run_end += 1;
                 }
-                let mut buf = [0u8; COLS];
-                for (dst, cell) in buf[..run_end - col]
-                    .iter_mut()
-                    .zip(&row_cells[col..run_end])
-                {
-                    *dst = cell.ch;
+                let mut buf = [0u8; COLS * 4];
+                let mut used = 0;
+                for cell in &row_cells[col..run_end] {
+                    used += cell.ch.encode_utf8(&mut buf[used..]).len();
                 }
-                let Ok(text) = core::str::from_utf8(&buf[..run_end - col]) else {
+                let Ok(text) = core::str::from_utf8(&buf[..used]) else {
                     return false;
                 };
                 let rx = LEFT_MARGIN.saturating_add(col as u32 * metrics.advance);
@@ -1422,7 +1434,7 @@ fn flush_shadow_rect(canvas: &Canvas, shadow: &[u8; SHADOW_CAPACITY], rect: Pixe
 
 fn cell_line_len(line: &[Cell; COLS]) -> usize {
     let mut len = COLS;
-    while len > 0 && line[len - 1].ch == b' ' {
+    while len > 0 && line[len - 1].ch == ' ' {
         len -= 1;
     }
     len
