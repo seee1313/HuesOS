@@ -208,6 +208,25 @@ impl File {
     }
 }
 
+/// `File` is a byte stream, so the `io` traits apply to it as well as the
+/// inherent methods; `write_all` and `read_to_end` then work on files and
+/// streams with the same code.
+impl crate::io::Read for File {
+    fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
+        File::read(self, buf)
+    }
+}
+
+impl crate::io::Write for File {
+    fn write(&mut self, buf: &[u8]) -> Result<usize> {
+        File::write(self, buf)
+    }
+
+    fn flush(&mut self) -> Result<()> {
+        self.fsync()
+    }
+}
+
 impl Seek for File {
     fn seek(&mut self, from: SeekFrom) -> Result<u64> {
         let target = match from {

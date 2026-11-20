@@ -17,7 +17,11 @@ extern crate alloc;
 
 use alloc::vec::Vec;
 
+use huesos_std::error::ErrorCode;
 use huesos_std::prelude::*;
+// The prelude re-exports the *contents* of these modules; the smoke test also
+// names the modules themselves (`env::args_count`, `fs::File::create`).
+use huesos_std::{env, fs, io, path};
 
 huesos_std::entry!(run);
 
