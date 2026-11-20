@@ -8,7 +8,6 @@ const ENTRY_SIZE: u64 = 216;
 const PATH_SIZE: usize = 192;
 const HASH_MANIFEST_PATH: &str = "/manifests/bootfs.sha256";
 const MAX_HASH_MANIFEST_BYTES: usize = 8192;
-const MAX_HASH_RECORDS: usize = 32;
 
 /// BOOTFS archive backed by a transferred VMO.
 pub struct BootFs {
@@ -20,23 +19,6 @@ pub struct BootFs {
 pub struct Entry {
     pub offset: u64,
     pub len: u64,
-}
-
-#[derive(Clone, Copy)]
-struct HashRecord {
-    path: [u8; PATH_SIZE],
-    path_len: usize,
-    hash: [u8; 32],
-}
-
-impl HashRecord {
-    const fn empty() -> Self {
-        Self {
-            path: [0; PATH_SIZE],
-            path_len: 0,
-            hash: [0; 32],
-        }
-    }
 }
 
 impl BootFs {
@@ -67,57 +49,36 @@ impl BootFs {
         if length != manifest.len as usize {
             return Err(libcanvas::ErrorCode::InvalidArgs);
         }
+        let manifest = &bytes[..length];
 
-        let mut records = [HashRecord::empty(); MAX_HASH_RECORDS];
-        let mut record_count = 0usize;
-        for line in bytes[..length].split(|byte| *byte == b'\n') {
+        // Pass 1: every record must name a real entry and match its content.
+        //
+        // This used to collect the records into a fixed-capacity array, which
+        // capped the boot image at 32 executables — a limit the image reached
+        // as soon as the coreutils grew. Verifying as the lines are read costs
+        // the same single pass over the manifest and no stack.
+        for line in manifest.split(|byte| *byte == b'\n') {
             if line.is_empty() {
                 continue;
             }
-            if line.len() < 67 || &line[64..66] != b"  " || record_count >= records.len() {
-                return Err(libcanvas::ErrorCode::InvalidArgs);
-            }
-            let path = &line[66..];
-            if path.is_empty() || path.len() >= PATH_SIZE || path[0] != b'/' {
-                return Err(libcanvas::ErrorCode::InvalidArgs);
-            }
-            let hash = huesos_blobfs::parse_hash_hex(&line[..64])
-                .ok_or(libcanvas::ErrorCode::InvalidArgs)?;
-            if records[..record_count]
-                .iter()
-                .any(|record| &record.path[..record.path_len] == path)
-            {
-                return Err(libcanvas::ErrorCode::InvalidArgs);
-            }
-            records[record_count].path[..path.len()].copy_from_slice(path);
-            records[record_count].path_len = path.len();
-            records[record_count].hash = hash;
-            record_count += 1;
-        }
-
-        for record in &records[..record_count] {
-            let path = core::str::from_utf8(&record.path[..record.path_len])
-                .map_err(|_| libcanvas::ErrorCode::InvalidArgs)?;
+            let (path, hash) = parse_manifest_line(line)?;
+            let path = core::str::from_utf8(path).map_err(|_| libcanvas::ErrorCode::InvalidArgs)?;
             let Some(entry) = self.get_entry(path)? else {
                 return Err(libcanvas::ErrorCode::NotFound);
             };
-            let actual = self.hash_entry(entry)?;
-            if actual != record.hash {
+            if self.hash_entry(entry)? != hash {
                 return Err(libcanvas::ErrorCode::AccessDenied);
             }
         }
 
-        // Completeness: every executable/authority manifest must be hash-locked.
+        // Pass 2: completeness — every executable/authority manifest must be
+        // hash-locked, so scan the table and look each trusted path up.
         let mut index = 0u32;
         while index < self.file_count {
             let raw = self.read_raw_entry(index)?;
             let path_len = entry_path_len(&raw);
             let path = &raw[..path_len];
-            if trusted_boot_path(path)
-                && !records[..record_count]
-                    .iter()
-                    .any(|record| &record.path[..record.path_len] == path)
-            {
+            if trusted_boot_path(path) && !manifest_lists(manifest, path)? {
                 return Err(libcanvas::ErrorCode::AccessDenied);
             }
             index += 1;
@@ -288,4 +249,32 @@ impl<'a> ByteWriter<'a> {
             self.write_byte(digits[len]);
         }
     }
+}
+
+/// Parse one `<sha256 hex><two spaces><path>` manifest line.
+fn parse_manifest_line(line: &[u8]) -> libcanvas::Result<(&[u8], [u8; 32])> {
+    if line.len() < 67 || &line[64..66] != b"  " {
+        return Err(libcanvas::ErrorCode::InvalidArgs);
+    }
+    let path = &line[66..];
+    if path.is_empty() || path.len() >= PATH_SIZE || path[0] != b'/' {
+        return Err(libcanvas::ErrorCode::InvalidArgs);
+    }
+    let hash =
+        huesos_blobfs::parse_hash_hex(&line[..64]).ok_or(libcanvas::ErrorCode::InvalidArgs)?;
+    Ok((path, hash))
+}
+
+/// Whether `path` has a record in `manifest`.
+fn manifest_lists(manifest: &[u8], path: &[u8]) -> libcanvas::Result<bool> {
+    for line in manifest.split(|byte| *byte == b'\n') {
+        if line.is_empty() {
+            continue;
+        }
+        let (listed, _) = parse_manifest_line(line)?;
+        if listed == path {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
