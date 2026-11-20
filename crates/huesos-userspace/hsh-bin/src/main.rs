@@ -951,7 +951,7 @@ impl InteractiveShell {
         //      for the table, so one successful run proves both the service
         //      path and the formatting/streaming path of the standard library
         //      from a real `_start`-to-exit program.
-        match smoke_env.eval_script("df", &mut self.host) {
+        match smoke_env.eval_script("@caps(hxfs=rw) df", &mut self.host) {
             Ok(res) if res.status == 0 && res.render_text().contains("Filesystem") => {
                 println!("[hsh] df table OK");
             }
