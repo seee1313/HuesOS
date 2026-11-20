@@ -39,8 +39,9 @@ jobs:
           status=$?
           if [ "$status" -ne 0 ]; then
             echo "::error title=clippy-status::exit ${status}"
-            errors=$(grep -n -E "^error(\[|:)|^  --> |^  = help|^note: " /tmp/clippy.log \
-              | head -40 | tr '\n' '|' | sed 's/%/%25/g')
+            start=$(grep -n "failed to run custom build command" /tmp/clippy.log | head -1 | cut -d: -f1)
+            errors=$(sed -n "$((start)),$((start + 40))p" /tmp/clippy.log \
+              | tr '\n' '|' | sed 's/%/%25/g')
             echo "::error title=clippy-errors::${errors}"
             exit "$status"
           fi
