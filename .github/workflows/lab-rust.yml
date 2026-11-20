@@ -53,16 +53,29 @@ jobs:
           exit "$status"
       - name: Pack it
         run: |
-          set -euo pipefail
+          set +e
           export HOME=/root
-          TC="$HOME/.rustup/toolchains/nightly-2026-03-01-x86_64-unknown-linux-gnu"
-          rm -rf "$TC/share/doc" "$TC/share/man" "$TC/lib/rustlib/etc" \
-            "$TC/lib/rustlib/components"
-          du -sh "$TC"
-          tar -C "$HOME/.rustup/toolchains" -cf - \
-            nightly-2026-03-01-x86_64-unknown-linux-gnu | zstd -3 -T0 -o /tmp/lab-rust.tar.zst
-          tar -C "$HOME/.cargo" -cf - bin | zstd -3 -T0 -o /tmp/lab-cargo-bin.tar.zst
-          ls -l /tmp/lab-rust.tar.zst /tmp/lab-cargo-bin.tar.zst
+          (
+            set -x
+            df -h /root /tmp
+            TC="$HOME/.rustup/toolchains/nightly-2026-03-01-x86_64-unknown-linux-gnu"
+            rm -rf "$TC/share/doc" "$TC/share/man" "$TC/lib/rustlib/etc" \
+              "$TC/lib/rustlib/components"
+            du -sh "$TC"
+            tar -C "$HOME/.rustup/toolchains" -cf /tmp/lab-rust.tar \
+              nightly-2026-03-01-x86_64-unknown-linux-gnu
+            zstd -3 -T0 -f /tmp/lab-rust.tar -o /tmp/lab-rust.tar.zst
+            rm -f /tmp/lab-rust.tar
+            tar -C "$HOME/.cargo" -cf /tmp/lab-cargo-bin.tar bin
+            zstd -3 -T0 -f /tmp/lab-cargo-bin.tar -o /tmp/lab-cargo-bin.tar.zst
+            rm -f /tmp/lab-cargo-bin.tar
+            ls -l /tmp/lab-rust.tar.zst /tmp/lab-cargo-bin.tar.zst
+          ) > /tmp/pack.log 2>&1
+          status=$?
+          message=$(tail -c 3000 /tmp/pack.log | tr '\n' '|' | sed 's/%/%25/g')
+          echo "::error title=pack-status::exit ${status}"
+          echo "::error title=pack-log::${message}"
+          exit "$status"
       - name: Publish to a throwaway branch
         run: |
           set -euo pipefail
