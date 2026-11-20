@@ -383,6 +383,7 @@ fn track_userspace_inputs(userspace_root: &Path) {
         "fdisk",
         "hsh-bin",
         "coreutils",
+        "huesos-std",
         "fault-probe",
         "dyn-rust-smoke",
         "ld-huesos",

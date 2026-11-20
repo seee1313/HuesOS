@@ -196,6 +196,8 @@ required+=(
     '[hsh] fdisk gpt-init dry-run OK'
     '[hsh] fdisk gpt init/add/del/verify OK'
     '[hsh] fdisk image-file gpt-init/add/list/resize/verify OK'
+    '[hsh] huesos-std smoke OK'
+    '[std] PASS'
     '[terminal] keyboard service online, starting /bin/hsh.elf session'
     '[init] FrameDraw duplicate self-check OK'
     '[init] stage selftest ok'

@@ -967,6 +967,25 @@ impl InteractiveShell {
             }
         }
 
+        // 10d. `/bin/std-smoke.elf` runs the user-space standard library inside
+        //      the OS: `huesos_std::entry!`, streaming formatting, the path and
+        //      error helpers (pure, always run) and a real
+        //      create/write/seek/read/truncate/list/remove cycle on the mounted
+        //      volume. The binary prints its own `[std] FAIL` lines and only
+        //      reports PASS when every check held, so the status plus the
+        //      marker is the whole contract.
+        match smoke_env.eval_script("std-smoke", &mut self.host) {
+            Ok(res) if res.status == 0 && res.render_text().contains("[std] PASS") => {
+                println!("[hsh] huesos-std smoke OK");
+            }
+            Ok(res) => println!(
+                "[hsh] huesos-std smoke FAILED status={} out={}",
+                res.status,
+                res.render_text()
+            ),
+            Err(e) => println!("[hsh] huesos-std smoke ERROR: {}", e),
+        }
+
         // 11. Bare `HxFS v7` volume (superfloppy) detection. Only meaningful on
         //     a boot with a block device; the NVMe smoke attaches one.
         if self.host.hxfs.is_some() {

@@ -1,0 +1,13 @@
+[build]
+target = "../x86_64-huesos-userspace-dyn.json"
+
+[target.x86_64-huesos-userspace-dyn]
+rustflags = [
+    "-C", "link-arg=--dynamic-linker=/lib/ld-huesos.so",
+    "-C", "link-arg=-L../libcanvas/target-cdylib/x86_64-huesos-userspace-dyn/release",
+]
+
+[unstable]
+build-std = ["core", "compiler_builtins", "alloc"]
+build-std-features = ["compiler-builtins-mem"]
+json-target-spec = true
