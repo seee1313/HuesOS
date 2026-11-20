@@ -520,10 +520,41 @@ pub fn remove(path: &str) -> Result<()> {
     Err(Error::capability())
 }
 
-/// `(used_bytes, capacity_bytes)` of the volume, when a service reports it.
-pub fn volume_bytes() -> Result<(u64, u64)> {
-    service()
-        .ok_or_else(Error::capability)?
-        .volume_info()
-        .map_err(Error::from)
+/// Bytes every regular file reachable from `root` holds, added up.
+///
+/// HxFS reports a size with every directory entry, so this costs one round
+/// trip per directory and no per-file lookup. Nothing is cached: the walk sees
+/// the volume as it is now, which is what a usage report is supposed to mean.
+/// Depth is capped so a malformed tree cannot spin here forever.
+pub fn used_bytes(root: &str) -> Result<u64> {
+    /// Deepest tree this walk will descend.
+    const MAX_DEPTH: usize = 64;
+    let mut total = 0u64;
+    let mut pending = alloc::vec![(path::normalize(root), 0usize)];
+    while let Some((dir, depth)) = pending.pop() {
+        if depth > MAX_DEPTH {
+            return Err(Error::new(ErrorKind::InvalidInput));
+        }
+        for entry in list(&dir)? {
+            match entry.kind {
+                EntryKind::Dir => pending.push((path::join(&dir, &entry.name), depth + 1)),
+                _ => total = total.saturating_add(entry.size.unwrap_or(0)),
+            }
+        }
+    }
+    Ok(total)
+}
+
+/// Capacity of the system volume in bytes.
+///
+/// The HxFS protocol has no `statfs`: `GetInfo` reports object identity, not a
+/// free-block map, so the filesystem cannot answer this. The `Volume` service
+/// that owns the block range can, and reaching it takes the registry channel
+/// (`CapKind::Registry`). The handle is consumed, so ask once per process.
+pub fn capacity_bytes() -> Result<u64> {
+    let handle = take_cap_handle(CapKind::Registry).ok_or_else(Error::capability)?;
+    let registry = Channel::from_handle(handle);
+    let mut volume = libcanvas::Volume::open_system(&registry).map_err(Error::from)?;
+    let info = volume.info().map_err(Error::from)?;
+    Ok(u64::from(info.block_size).saturating_mul(info.block_count))
 }

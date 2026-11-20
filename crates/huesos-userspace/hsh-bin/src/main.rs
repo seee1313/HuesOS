@@ -947,11 +947,12 @@ impl InteractiveShell {
         }
 
         // 10d. `/bin/df.elf` is the smallest of the new disk utilities: it
-        //      needs the filesystem service for its numbers and `huesos-std`
-        //      for the table, so one successful run proves both the service
-        //      path and the formatting/streaming path of the standard library
-        //      from a real `_start`-to-exit program.
-        match smoke_env.eval_script("@caps(hxfs=rw) df", &mut self.host) {
+        //      walks the tree for usage and asks the volume service for
+        //      capacity, then formats a table with `huesos-std`. One run
+        //      therefore covers directory listing, the registry handshake and
+        //      stdout from a real `_start`-to-exit program. A boot without a
+        //      volume service still gets usage, so only the header is required.
+        match smoke_env.eval_script("df", &mut self.host) {
             Ok(res) if res.status == 0 && res.render_text().contains("Filesystem") => {
                 println!("[hsh] df table OK");
             }
