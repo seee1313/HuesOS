@@ -10,6 +10,7 @@ path = "src/lib.rs"
 [dependencies]
 libcanvas = { path = "../libcanvas", default-features = false, features = ["dyn-client"] }
 huesos-abi = { path = "../../huesos-abi" }
+spin = { version = "0.9.9", default-features = false, features = ["spin_mutex", "rwlock", "once", "lazy", "barrier"] }
 
 [profile.release]
 opt-level = 2

@@ -82,6 +82,15 @@ impl Parker {
     }
 }
 
+impl core::fmt::Debug for Parker {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Parker")
+            .field("permit", &self.permit.load(Ordering::Relaxed))
+            .field("sequence", &self.sequence.load(Ordering::Relaxed))
+            .finish()
+    }
+}
+
 /// The process' default parking token, used by the free `park` functions.
 static DEFAULT_PARKER: Parker = Parker::new();
 
@@ -164,16 +173,13 @@ impl<T> JoinHandle<T> {
         }
         let handle = match self.inner.take() {
             Some(handle) => handle,
-            None => return Err(Error::new(crate::error::ErrorKind::Internal)),
+            None => return Err(Error::new(crate::error::ErrorKind::Other)),
         };
         handle.join()?;
-        let value = match self.slot.lock() {
-            Ok(mut slot) => slot.take(),
-            Err(_) => None,
-        };
+        let value = self.slot.lock().take();
         match value {
             Some(value) => Ok(value),
-            None => Err(Error::new(crate::error::ErrorKind::Internal)),
+            None => Err(Error::new(crate::error::ErrorKind::Other)),
         }
     }
 }
@@ -218,7 +224,8 @@ impl Builder {
     {
         let slot = Arc::new(Mutex::new(None));
         let sink = Arc::clone(&slot);
-        let parker: &'static Parker = alloc::boxed::Box::leak(alloc::boxed::Box::new(Parker::new()));
+        let parker: &'static Parker =
+            alloc::boxed::Box::leak(alloc::boxed::Box::new(Parker::new()));
         let name = self.name.unwrap_or_else(|| String::from("worker"));
         let stack_size = match self.stack_size {
             Some(size) => size,
@@ -228,9 +235,7 @@ impl Builder {
             &name,
             move || {
                 let value = task();
-                if let Ok(mut slot) = sink.lock() {
-                    *slot = Some(value);
-                }
+                *sink.lock() = Some(value);
                 0
             },
             stack_size,

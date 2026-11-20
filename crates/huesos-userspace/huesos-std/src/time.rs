@@ -207,7 +207,10 @@ impl Mul<u32> for Duration {
         let nanos = u128::from(self.nanos) * u128::from(rhs);
         let extra_secs = u64::try_from(nanos / 1_000_000_000).unwrap_or(u64::MAX);
         Duration {
-            secs: self.secs.saturating_mul(u64::from(rhs)).saturating_add(extra_secs),
+            secs: self
+                .secs
+                .saturating_mul(u64::from(rhs))
+                .saturating_add(extra_secs),
             nanos: (nanos % 1_000_000_000) as u32,
         }
     }
@@ -349,7 +352,9 @@ impl SystemTime {
         earlier: SystemTime,
     ) -> core::result::Result<Duration, SystemTimeError> {
         if self.ticks < earlier.ticks {
-            return Err(SystemTimeError(Duration::from_ticks(earlier.ticks - self.ticks)));
+            return Err(SystemTimeError(Duration::from_ticks(
+                earlier.ticks - self.ticks,
+            )));
         }
         Ok(Duration::from_ticks(self.ticks - earlier.ticks))
     }

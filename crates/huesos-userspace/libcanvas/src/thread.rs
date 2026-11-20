@@ -17,28 +17,19 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 #[cfg(feature = "dyn-client")]
 #[link(name = "canvas", kind = "dylib")]
 unsafe extern "C" {
+    /// `entry` is an `extern "C" fn(*mut c_void) -> i64`. It is declared as an
+    /// opaque pointer so that a *safe* trampoline can be passed as well as the
+    /// `unsafe extern "C" fn` callers supply: the two are the same machine code
+    /// and the callee only ever jumps to it.
     fn canvas_thread_spawn(
-        name: *const c_char,
-        entry: unsafe extern "C" fn(*mut c_void) -> i64,
-        arg: *mut c_void,
-        stack_size: usize,
-        out_thread: *mut *mut c_void,
-    ) -> i64;
-    fn canvas_thread_join(thread: *mut c_void, out_exit_code: *mut i64) -> i64;
-    fn canvas_thread_exit(code: i64) -> !;
-
-    /// Same symbol as [`canvas_thread_spawn`], declared with an opaque entry
-    /// argument so a safe trampoline (not a `unsafe extern "C" fn`) can be
-    /// passed without adding an `unsafe fn` to the crate: the entry is only
-    /// ever a `extern "C" fn(*mut c_void) -> i64` produced by this module.
-    #[link_name = "canvas_thread_spawn"]
-    fn canvas_thread_spawn_opaque(
         name: *const c_char,
         entry: *const c_void,
         arg: *mut c_void,
         stack_size: usize,
         out_thread: *mut *mut c_void,
     ) -> i64;
+    fn canvas_thread_join(thread: *mut c_void, out_exit_code: *mut i64) -> i64;
+    fn canvas_thread_exit(code: i64) -> !;
 }
 
 /// An opaque handle to a spawned intra-process thread.
@@ -58,10 +49,22 @@ impl JoinHandle {
 
     /// Block until the thread exits and return its exit code.
     pub fn join(mut self) -> crate::Result<i64> {
-        let mut code: i64 = 0;
+        self.release()
+    }
+
+    /// Join the underlying thread exactly once, if it is still live.
+    ///
+    /// A handle that was already joined returns `Ok(0)` instead of joining a
+    /// second time: the pointer is cleared before the call, so the FFI is only
+    /// ever reached with a handle the runtime still knows about.
+    fn release(&mut self) -> crate::Result<i64> {
         let ptr = core::mem::replace(&mut self.raw, core::ptr::null_mut());
-        // SAFETY: `ptr` was returned by `canvas_thread_spawn` and has not yet
-        // been joined.
+        if ptr.is_null() {
+            return Ok(0);
+        }
+        let mut code: i64 = 0;
+        // SAFETY: `ptr` was returned by `canvas_thread_spawn`, and clearing the
+        // field first means exactly one call to `canvas_thread_join` per handle.
         let rc = unsafe { canvas_thread_join(ptr, &mut code) };
         if rc < 0 {
             Err(huesos_abi::ErrorCode::from_raw(rc).unwrap_or(huesos_abi::ErrorCode::InvalidArgs))
@@ -74,12 +77,8 @@ impl JoinHandle {
 #[cfg(feature = "dyn-client")]
 impl Drop for JoinHandle {
     fn drop(&mut self) {
-        if !self.raw.is_null() {
-            let mut ignored = 0i64;
-            // SAFETY: ensure spawned thread resources are reclaimed on drop.
-            let _ = unsafe { canvas_thread_join(self.raw, &mut ignored) };
-            self.raw = core::ptr::null_mut();
-        }
+        // Reclaim the runtime's per-thread resources even if nobody joined.
+        let _ = self.release();
     }
 }
 
@@ -105,7 +104,7 @@ pub unsafe fn spawn(
     let rc = unsafe {
         canvas_thread_spawn(
             name_buf.as_ptr().cast::<c_char>(),
-            entry,
+            entry as *const c_void,
             arg,
             stack_size,
             &mut out_thread,
@@ -129,6 +128,7 @@ pub fn exit(code: i64) -> ! {
 }
 
 /// The exit code reported for a task whose slot had already been claimed.
+#[cfg(feature = "dyn-client")]
 const TASK_LOST: i64 = -1;
 
 /// Boxed worker body. `Send` only: the task runs on another thread, so the
@@ -192,7 +192,7 @@ where
     // live slot in TASKS (not a pointer), `name_buf` is NUL-terminated and
     // `out_thread` is a valid stack slot.
     let rc = unsafe {
-        canvas_thread_spawn_opaque(
+        canvas_thread_spawn(
             name_buf.as_ptr().cast::<c_char>(),
             task_trampoline as *const c_void,
             index as *mut c_void,
@@ -203,8 +203,9 @@ where
     if rc < 0 {
         // The trampoline never ran, so the slot is still ours: clear it.
         TASKS.lock()[index] = None;
-        return Err(huesos_abi::ErrorCode::from_raw(rc)
-            .unwrap_or(huesos_abi::ErrorCode::InvalidArgs));
+        return Err(
+            huesos_abi::ErrorCode::from_raw(rc).unwrap_or(huesos_abi::ErrorCode::InvalidArgs)
+        );
     }
     Ok(JoinHandle {
         raw: out_thread,

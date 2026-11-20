@@ -19,7 +19,12 @@ huesos-abi = { path = "../../huesos-abi" }
 huesos-elf = { path = "../../huesos-elf" }
 huesos-scudo = { path = "../../huesos-scudo", optional = true }
 huesos-blobfs = { path = "../../huesos-blobfs" }
-spin = { workspace = true }
+# Pinned directly, not inherited: `huesos-std` builds this crate inside its own
+# workspace, where the root workspace's dependency table does not exist. The
+# feature list is minimal on purpose: `lock_api` (a default feature) is a
+# separate crate we do not need, and every feature here is one `huesos-std`
+# layers policy on top of.
+spin = { version = "0.9.9", default-features = false, features = ["spin_mutex", "rwlock", "once", "lazy", "barrier"] }
 
 [profile.release]
 opt-level = 2

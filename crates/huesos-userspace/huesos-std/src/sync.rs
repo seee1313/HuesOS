@@ -24,7 +24,6 @@
 //! a real wake are all handled by the same loop.
 
 use core::cell::Cell;
-use core::fmt;
 use core::ops::{Deref, DerefMut};
 use core::sync::atomic::{AtomicU32, Ordering};
 
@@ -38,30 +37,10 @@ pub use alloc::sync::{Arc, Weak};
 /// Re-exported atomic types, so `use huesos_std::sync::atomic::*` works.
 pub use core::sync::atomic;
 
-/// Result of a lock attempt.
-pub type LockResult<T> = core::result::Result<T, PoisonError<T>>;
-
-/// A lock was acquired but its previous owner panicked.
-///
-/// HuesOS user space has no unwinding (`panic = "abort"`), so a poisoned lock
-/// cannot actually be observed; the type exists so code written for `std`
-/// compiles and so the policy is explicit rather than silently different.
-pub struct PoisonError<T> {
-    guard: T,
-}
-
-impl<T> PoisonError<T> {
-    /// The value that was guarded.
-    pub fn into_inner(self) -> T {
-        self.guard
-    }
-}
-
-impl<T> fmt::Debug for PoisonError<T> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("PoisonError")
-    }
-}
+// Lock poisoning is deliberately absent: a HuesOS process is built with
+// `panic = "abort"`, so there is no unwinding that could leave a lock held by a
+// dead thread. Every acquire therefore returns its guard directly instead of a
+// `Result` that could never be `Err`.
 
 /// Failure to acquire a lock without blocking.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -103,7 +82,7 @@ impl<T> Mutex<T> {
 
 impl<T: ?Sized> Mutex<T> {
     /// Block until the lock is ours.
-    pub fn lock(&self) -> LockResult<MutexGuard<'_, T>> {
+    pub fn lock(&self) -> MutexGuard<'_, T> {
         loop {
             if self
                 .word
@@ -113,10 +92,10 @@ impl<T: ?Sized> Mutex<T> {
                 let guard = self.inner.try_lock();
                 match guard {
                     Some(guard) => {
-                        return Ok(MutexGuard {
+                        return MutexGuard {
                             owner: self,
                             guard: Some(guard),
-                        })
+                        }
                     }
                     None => {
                         // Cannot happen: `word == 1` means the previous owner
@@ -204,14 +183,14 @@ impl<T: ?Sized> DerefMut for MutexGuard<'_, T> {
 }
 
 /// Park forever: the caller reached a branch that cannot happen.
-fn unreachable_reference<T: ?Sized>() -> &'static T {
+fn unreachable_reference<'a, T: ?Sized>() -> &'a T {
     loop {
         core::hint::spin_loop();
     }
 }
 
 /// Park forever, mutable form.
-fn unreachable_mut_reference<T: ?Sized>() -> &'static mut T {
+fn unreachable_mut_reference<'a, T: ?Sized>() -> &'a mut T {
     loop {
         core::hint::spin_loop();
     }
@@ -262,10 +241,10 @@ impl<T> RwLock<T> {
 
 impl<T: ?Sized> RwLock<T> {
     /// Block until a read guard is available.
-    pub fn read(&self) -> LockResult<RwLockReadGuard<'_, T>> {
+    pub fn read(&self) -> RwLockReadGuard<'_, T> {
         loop {
             if let Some(guard) = self.inner.try_read() {
-                return Ok(RwLockReadGuard { owner: self, guard });
+                return RwLockReadGuard { owner: self, guard };
             }
             let sequence = self.word.load(Ordering::Acquire);
             let _ = futex::wait(&self.word, sequence, 0);
@@ -273,10 +252,10 @@ impl<T: ?Sized> RwLock<T> {
     }
 
     /// Block until the write guard is available.
-    pub fn write(&self) -> LockResult<RwLockWriteGuard<'_, T>> {
+    pub fn write(&self) -> RwLockWriteGuard<'_, T> {
         loop {
             if let Some(guard) = self.inner.try_write() {
-                return Ok(RwLockWriteGuard { owner: self, guard });
+                return RwLockWriteGuard { owner: self, guard };
             }
             let sequence = self.word.load(Ordering::Acquire);
             let _ = futex::wait(&self.word, sequence, 0);
@@ -371,7 +350,7 @@ impl Condvar {
     }
 
     /// Release `guard`, park until notified, then re-acquire the mutex.
-    pub fn wait<'a, T>(&self, guard: MutexGuard<'a, T>) -> LockResult<MutexGuard<'a, T>> {
+    pub fn wait<'a, T>(&self, guard: MutexGuard<'a, T>) -> MutexGuard<'a, T> {
         let mutex = guard.mutex();
         let sequence = self.sequence.load(Ordering::Acquire);
         // Dropping the guard publishes the wake for anyone else, so the order
@@ -388,15 +367,15 @@ impl Condvar {
         &self,
         guard: MutexGuard<'a, T>,
         timeout: Duration,
-    ) -> LockResult<(MutexGuard<'a, T>, WaitTimeoutResult)> {
+    ) -> (MutexGuard<'a, T>, WaitTimeoutResult) {
         let mutex = guard.mutex();
         let sequence = self.sequence.load(Ordering::Acquire);
         drop(guard);
         let result = futex::wait(&self.sequence, sequence, timeout.as_ticks_ceil());
         let timed_out = matches!(result, Err(libcanvas::ErrorCode::TimedOut))
             && self.sequence.load(Ordering::Acquire) == sequence;
-        let guard = mutex.lock()?;
-        Ok((guard, WaitTimeoutResult(timed_out)))
+        let guard = mutex.lock();
+        (guard, WaitTimeoutResult(timed_out))
     }
 
     /// Wait until `condition` holds for the guarded value.
@@ -404,14 +383,14 @@ impl Condvar {
         &self,
         mut guard: MutexGuard<'a, T>,
         mut condition: F,
-    ) -> LockResult<MutexGuard<'a, T>>
+    ) -> MutexGuard<'a, T>
     where
         F: FnMut(&mut T) -> bool,
     {
         while condition(&mut guard) {
-            guard = self.wait(guard)?;
+            guard = self.wait(guard);
         }
-        Ok(guard)
+        guard
     }
 
     /// Wait until `condition` holds or `timeout` expires.
@@ -420,7 +399,7 @@ impl Condvar {
         mut guard: MutexGuard<'a, T>,
         timeout: Duration,
         mut condition: F,
-    ) -> LockResult<(MutexGuard<'a, T>, WaitTimeoutResult)>
+    ) -> (MutexGuard<'a, T>, WaitTimeoutResult)
     where
         F: FnMut(&mut T) -> bool,
     {
@@ -428,15 +407,16 @@ impl Condvar {
         while condition(&mut guard) {
             let spent = start.elapsed();
             let Some(remaining) = timeout.checked_sub(spent) else {
-                return Ok((guard, WaitTimeoutResult(true)));
+                return (guard, WaitTimeoutResult(true));
             };
-            let (next, result) = self.wait_timeout(guard, remaining)?;
+            let (next, result) = self.wait_timeout(guard, remaining);
             guard = next;
             if result.timed_out() {
-                return Ok((guard, WaitTimeoutResult(condition(&mut guard))));
+                let still_waiting = condition(&mut guard);
+                return (guard, WaitTimeoutResult(still_waiting));
             }
         }
-        Ok((guard, WaitTimeoutResult(false)))
+        (guard, WaitTimeoutResult(false))
     }
 
     /// Wake one waiter.
@@ -495,8 +475,8 @@ impl Barrier {
     }
 
     /// Wait for the rest of the participants.
-    pub fn wait(&self) -> LockResult<BarrierWaitResult> {
-        let mut state = self.mutex.lock()?;
+    pub fn wait(&self) -> BarrierWaitResult {
+        let mut state = self.mutex.lock();
         let generation = state.generation;
         state.waiting += 1;
         let leader = state.waiting == self.count;
@@ -505,13 +485,13 @@ impl Barrier {
             state.generation = generation.wrapping_add(1);
             drop(state);
             self.condvar.notify_all();
-            return Ok(BarrierWaitResult(true));
+            return BarrierWaitResult(true);
         }
-        let state = self.condvar.wait_while(state, |state| {
-            state.generation == generation
-        })?;
+        let state = self
+            .condvar
+            .wait_while(state, |state| state.generation == generation);
         drop(state);
-        Ok(BarrierWaitResult(false))
+        BarrierWaitResult(false)
     }
 }
 
@@ -543,10 +523,7 @@ impl Once {
 
     /// Run `init` unless it already ran; block while another thread runs it.
     pub fn call_once<F: FnOnce()>(&self, init: F) {
-        self.inner.call_once(|| {
-            init();
-            ()
-        });
+        self.inner.call_once(init);
     }
 
     /// True when the initialiser finished.
@@ -590,25 +567,32 @@ impl<T> OnceLock<T> {
 
     /// Store `value`, returning it back if the cell was already set.
     ///
-    /// The value is handed to the winning initialiser through a `Cell`, so the
-    /// loser can tell whether it was the one that stored: if the cell is still
-    /// full afterwards, somebody else won the race and gets its value back.
+    /// The value is handed to the winning initialiser through a `Cell`, so a
+    /// loser can tell whether it was the one that stored: if its cell is still
+    /// full afterwards, somebody else won the race and gets the value back.
     pub fn set(&self, value: T) -> core::result::Result<(), T> {
         let slot = Cell::new(Some(value));
+        let stored = Cell::new(false);
         self.cell.call_once(|| {
             // Exactly one caller runs this closure; the rest keep their value.
-            let taken = slot.take();
-            let _ = taken;
+            stored.set(true);
+            match slot.take() {
+                Some(value) => value,
+                None => crate::sync::wait_forever(),
+            }
         });
+        if stored.get() {
+            return Ok(());
+        }
         match slot.take() {
             Some(unused) => Err(unused),
-            None => Ok(()),
+            None => crate::sync::wait_forever(),
         }
     }
 
     /// Get the value, initialising it with `init` if needed.
     pub fn get_or_init<F: FnOnce() -> T>(&self, init: F) -> &T {
-        self.cell.get_or_init(init)
+        self.cell.call_once(init)
     }
 
     /// Get the value, trying to initialise it.
@@ -620,7 +604,7 @@ impl<T> OnceLock<T> {
             return Ok(value);
         }
         let value = init()?;
-        Ok(self.cell.get_or_init(|| value))
+        Ok(self.cell.call_once(|| value))
     }
 
     /// True when the cell holds a value.
@@ -656,6 +640,16 @@ impl<T, F: FnOnce() -> T> Deref for LazyLock<T, F> {
         &self.cell
     }
 }
+
+/// Park the calling thread forever; used for branches that cannot be reached.
+pub(crate) fn wait_forever<T>() -> T {
+    loop {
+        let _ = futex::wait(&FOREVER_WORD, 0, 0);
+    }
+}
+
+/// Futex word with no waker: a wait on it always sleeps.
+static FOREVER_WORD: AtomicU32 = AtomicU32::new(0);
 
 /// Retry a fallible operation while it reports "would block", yielding to the
 /// scheduler between attempts, up to `attempts` times.

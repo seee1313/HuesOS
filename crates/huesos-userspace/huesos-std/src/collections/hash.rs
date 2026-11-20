@@ -12,7 +12,8 @@
 //! unchanged, and [`DefaultHasher`] is the same algorithm `std` uses for
 //! `std::collections::hash_map::DefaultHasher`.
 
-use core::hash::{BuildHasher, Hash, Hasher};
+use core::hash::Hash;
+pub use core::hash::{BuildHasher, Hasher};
 use core::sync::atomic::{AtomicU64, Ordering};
 
 /// A SipHash-1-3 hasher, byte-compatible with `std`'s default hasher.
@@ -72,6 +73,20 @@ impl SipHasher13 {
     /// Pack the remaining tail bytes little-endian, low byte first.
     fn tail_word(&self) -> u64 {
         self.tail
+    }
+
+    /// Accumulate bytes that do not yet form a full word.
+    fn write_tail(&mut self, bytes: &[u8]) {
+        for byte in bytes {
+            self.tail |= u64::from(*byte) << (8 * self.tail_len);
+            self.tail_len += 1;
+            if self.tail_len == 8 {
+                let word = self.tail;
+                self.absorb(word);
+                self.tail = 0;
+                self.tail_len = 0;
+            }
+        }
     }
 }
 
@@ -330,7 +345,5 @@ impl Hasher for IdentityHasherState {
 
 /// Hash a single value with the process' default hasher.
 pub fn hash_one<T: Hash + ?Sized>(value: &T) -> u64 {
-    let mut hasher = RandomState::new().build_hasher();
-    value.hash(&mut hasher);
-    hasher.finish()
+    RandomState::new().hash_one(value)
 }
