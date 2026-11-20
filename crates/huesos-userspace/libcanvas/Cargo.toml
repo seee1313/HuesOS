@@ -11,6 +11,11 @@ local-heap = ["dep:huesos-scudo"]
 c-abi = ["local-heap"]
 # Thin Rust client wrapper forwarding syscalls and heap allocations to `libcanvas.so`.
 dyn-client = []
+# Closure-based thread spawning (`thread::spawn_task`). Separate from
+# `dyn-client` because it is the crate's only allocation: enabling it makes the
+# final binary link `alloc`, so only crates that provide a global allocator (for
+# example `huesos-std`, whose `entry!` macro declares one) may turn it on.
+thread-tasks = ["dyn-client"]
 # Boot-time negative syscall probes used by huesos-init/QEMU smoke tests.
 kernel-smoke-tests = []
 

@@ -5,13 +5,13 @@
 //! Variant-II TLS block, TCB (`%fs:0`), and DTV (`%fs:8`) from `ld-huesos.so`
 //! and clean them up on exit.
 
-#[cfg(feature = "dyn-client")]
+#[cfg(feature = "thread-tasks")]
 use alloc::boxed::Box;
-#[cfg(feature = "dyn-client")]
+#[cfg(feature = "thread-tasks")]
 use alloc::vec::Vec;
 #[cfg(feature = "dyn-client")]
 use core::ffi::{c_char, c_void};
-#[cfg(feature = "dyn-client")]
+#[cfg(feature = "thread-tasks")]
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 #[cfg(feature = "dyn-client")]
@@ -127,13 +127,17 @@ pub fn exit(code: i64) -> ! {
     unsafe { canvas_thread_exit(code) }
 }
 
+// Everything below needs `alloc` for the task table. It is a separate feature
+// from `dyn-client` on purpose: a dynamic binary that never spawns a closure
+// must not be forced to bring a global allocator into its own crate graph.
+
 /// The exit code reported for a task whose slot had already been claimed.
-#[cfg(feature = "dyn-client")]
+#[cfg(feature = "thread-tasks")]
 const TASK_LOST: i64 = -1;
 
 /// Boxed worker body. `Send` only: the task runs on another thread, so the
 /// captured state must be able to move there, but nothing else is required.
-#[cfg(feature = "dyn-client")]
+#[cfg(feature = "thread-tasks")]
 type Task = Box<dyn FnOnce() -> i64 + Send>;
 
 /// Pending worker bodies, indexed by the integer handed to the trampoline.
@@ -142,15 +146,15 @@ type Task = Box<dyn FnOnce() -> i64 + Send>;
 /// `Box` from that pointer would need `unsafe`. The task therefore travels by
 /// *index* instead: the spawner stores the box here and passes a number, and
 /// the trampoline takes it out through ordinary safe `Vec`/`Mutex` access.
-#[cfg(feature = "dyn-client")]
+#[cfg(feature = "thread-tasks")]
 static TASKS: spin::Mutex<Vec<Option<Task>>> = spin::Mutex::new(Vec::new());
 
 /// Next thread id handed out to [`spawn_task`] callers.
-#[cfg(feature = "dyn-client")]
+#[cfg(feature = "thread-tasks")]
 static NEXT_THREAD_ID: AtomicUsize = AtomicUsize::new(1);
 
 /// Trampoline: take the worker body for `arg` (an index) and run it.
-#[cfg(feature = "dyn-client")]
+#[cfg(feature = "thread-tasks")]
 extern "C" fn task_trampoline(arg: *mut c_void) -> i64 {
     let index = arg as usize;
     let task = {
@@ -167,7 +171,7 @@ extern "C" fn task_trampoline(arg: *mut c_void) -> i64 {
 ///
 /// Unlike [`spawn`] this is safe: the closure owns its captures, and the
 /// thread entry is a trampoline that reads them out of the task table.
-#[cfg(feature = "dyn-client")]
+#[cfg(feature = "thread-tasks")]
 pub fn spawn_task<F>(name: &str, task: F, stack_size: usize) -> crate::Result<JoinHandle>
 where
     F: FnOnce() -> i64 + Send + 'static,
