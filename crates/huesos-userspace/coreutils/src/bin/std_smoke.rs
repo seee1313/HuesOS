@@ -33,7 +33,7 @@ huesos_std::entry!(run);
 macro_rules! expect {
     ($failures:ident, $cond:expr, $what:literal) => {
         if !$cond {
-            println!("[std] FAIL {}: condition did not hold", $what);
+            eprintln!("[std] FAIL {}: condition did not hold", $what);
             $failures += 1;
         }
     };
@@ -59,7 +59,7 @@ fn run() -> i32 {
     let mut out = io::stdout();
     let _ = io::write_all(&mut out, b"[std] direct stdout write OK\n");
     eprintln!("[std] trace: begin");
-    println!("[std] entry OK (naked _start, ScudoHeap, panic handler)");
+    eprintln!("[std] entry OK (naked _start, ScudoHeap, panic handler)");
     eprintln!("[std] trace: println done");
 
     failures += check_io();
@@ -84,10 +84,10 @@ fn run() -> i32 {
     eprintln!("[std] trace: process {failures}");
 
     if failures == 0 {
-        println!("[std] PASS");
+        eprintln!("[std] PASS");
         0
     } else {
-        println!("[std] FAIL count={failures}");
+        eprintln!("[std] FAIL count={failures}");
         1
     }
 }
@@ -155,7 +155,7 @@ fn check_path() -> u32 {
     for (input, want) in normalizations {
         let got = path::normalize(input);
         if got.as_str() != want {
-            println!("[std] FAIL path normalize({input}) = {got}, want {want}");
+            eprintln!("[std] FAIL path normalize({input}) = {got}, want {want}");
             failures += 1;
         }
     }
@@ -189,7 +189,7 @@ fn check_path() -> u32 {
     expect!(failures, path::components("//a//b/").len() == 2, "path components");
     expect!(failures, path::relative("/a/b") == "a/b", "path relative");
 
-    println!("[std] path OK (normalize, join, parent, file_name, components)");
+    eprintln!("[std] path OK (normalize, join, parent, file_name, components)");
     failures
 }
 
@@ -230,7 +230,7 @@ fn check_error() -> u32 {
         Error::capability().kind() == ErrorKind::AccessDenied,
         "error capability"
     );
-    println!("[std] error OK (kind mapping, code, display, retryable)");
+    eprintln!("[std] error OK (kind mapping, code, display, retryable)");
     failures
 }
 
@@ -249,7 +249,7 @@ fn check_env() -> u32 {
     // The shell grants a non-empty mask to every child it launches.
     expect!(failures, caps != 0, "env caps granted");
     expect!(failures, env::has_caps(caps), "env has_caps");
-    println!("[std] env OK (argc={} caps={:#x})", env::args_count(), caps);
+    eprintln!("[std] env OK (argc={} caps={:#x})", env::args_count(), caps);
     failures
 }
 
@@ -261,21 +261,21 @@ fn check_fs() -> u32 {
     let mut file = match fs::File::create(NAME) {
         Ok(file) => file,
         Err(error) if error.kind() == ErrorKind::AccessDenied => {
-            println!("[std] fs SKIP (no HxFS capability: {error})");
+            eprintln!("[std] fs SKIP (no HxFS capability: {error})");
             return 0;
         }
         Err(error) => {
-            println!("[std] FAIL fs create: {error}");
+            eprintln!("[std] FAIL fs create: {error}");
             return 1;
         }
     };
     let mut failures = 0u32;
     if let Err(error) = io::write_all(&mut file, &payload) {
-        println!("[std] FAIL fs write: {error}");
+        eprintln!("[std] FAIL fs write: {error}");
         return 1;
     }
     if let Err(error) = file.fsync() {
-        println!("[std] FAIL fs fsync: {error}");
+        eprintln!("[std] FAIL fs fsync: {error}");
         return 1;
     }
     let size = file.size().unwrap_or(0);
@@ -284,7 +284,7 @@ fn check_fs() -> u32 {
     // Read back from the end: `seek(End(-100))` proves both the negative
     // delta and that the cursor, not the file, moved.
     if let Err(error) = file.seek(SeekFrom::End(-100)) {
-        println!("[std] FAIL fs seek: {error}");
+        eprintln!("[std] FAIL fs seek: {error}");
         return 1;
     }
     expect!(failures, file.position() == payload.len() as u64 - 100, "fs seek end");
@@ -299,7 +299,7 @@ fn check_fs() -> u32 {
             );
         }
         Err(error) => {
-            println!("[std] FAIL fs read: {error}");
+            eprintln!("[std] FAIL fs read: {error}");
             failures += 1;
         }
     }
@@ -321,25 +321,25 @@ fn check_fs() -> u32 {
                             expect!(failures, bytes[19..] == payload[19..], "fs rest intact");
                         }
                         Err(error) => {
-                            println!("[std] FAIL fs read_to_end: {error}");
+                            eprintln!("[std] FAIL fs read_to_end: {error}");
                             failures += 1;
                         }
                     },
                     Err(error) => {
-                        println!("[std] FAIL fs reseek: {error}");
+                        eprintln!("[std] FAIL fs reseek: {error}");
                         failures += 1;
                     }
                 }
             }
             Err(error) => {
-                println!("[std] FAIL fs overwrite: {error}");
+                eprintln!("[std] FAIL fs overwrite: {error}");
                 failures += 1;
             }
         }
     }
 
     if let Err(error) = file.truncate(1000) {
-        println!("[std] FAIL fs truncate: {error}");
+        eprintln!("[std] FAIL fs truncate: {error}");
         failures += 1;
     } else {
         expect!(failures, file.size().unwrap_or(0) == 1000, "fs size after truncate");
@@ -353,7 +353,7 @@ fn check_fs() -> u32 {
             expect!(failures, found, "fs list finds the file");
         }
         Err(error) => {
-            println!("[std] FAIL fs list: {error}");
+            eprintln!("[std] FAIL fs list: {error}");
             failures += 1;
         }
     }
@@ -363,13 +363,13 @@ fn check_fs() -> u32 {
             expect!(failures, fs::File::open(NAME).is_err(), "fs remove");
         }
         Err(error) => {
-            println!("[std] FAIL fs remove: {error}");
+            eprintln!("[std] FAIL fs remove: {error}");
             failures += 1;
         }
     }
 
     if fs::read(NAME).is_ok() {
-        println!("[std] FAIL fs read of a removed file succeeded");
+        eprintln!("[std] FAIL fs read of a removed file succeeded");
         failures += 1;
     }
 
@@ -411,15 +411,15 @@ fn check_fs() -> u32 {
         );
         expect!(failures, fs::remove("/std-gpt.img").is_ok(), "fs gpt image remove");
     } else {
-        println!("[std] FAIL fs gpt-shaped write: create failed");
+        eprintln!("[std] FAIL fs gpt-shaped write: create failed");
         failures += 1;
     }
 
     if let Ok((used, capacity)) = fs::volume_bytes() {
-        println!("[std] fs OK (create/write/seek/read/overwrite/truncate/list/remove/gpt)");
-        println!("[std] fs volume used={used} capacity={capacity}");
+        eprintln!("[std] fs OK (create/write/seek/read/overwrite/truncate/list/remove/gpt)");
+        eprintln!("[std] fs volume used={used} capacity={capacity}");
     } else {
-        println!("[std] fs OK (create/write/seek/read/overwrite/truncate/list/remove/gpt)");
+        eprintln!("[std] fs OK (create/write/seek/read/overwrite/truncate/list/remove/gpt)");
     }
     failures
 }
@@ -482,7 +482,7 @@ fn check_buffered() -> u32 {
     expect!(failures, copied == 6 && out == b"copied", "io::copy");
 
     if failures == 0 {
-        println!("[std] buffered OK (BufWriter/BufReader/read_until/Cursor/copy)");
+        eprintln!("[std] buffered OK (BufWriter/BufReader/read_until/Cursor/copy)");
     }
     failures
 }
@@ -527,7 +527,7 @@ fn check_collections() -> u32 {
     expect!(failures, keys == [1, 3], "btreemap orders keys");
 
     if failures == 0 {
-        println!("[std] collections OK (HashMap entry/churn/shrink, BTreeMap order)");
+        eprintln!("[std] collections OK (HashMap entry/churn/shrink, BTreeMap order)");
     }
     failures
 }
@@ -552,7 +552,7 @@ fn check_time() -> u32 {
         "duration conversions"
     );
     if failures == 0 {
-        println!("[std] time OK (Instant monotonic, sleep 30ms, Duration conversions)");
+        eprintln!("[std] time OK (Instant monotonic, sleep 30ms, Duration conversions)");
     }
     failures
 }
@@ -670,7 +670,7 @@ fn check_threads() -> u32 {
     );
 
     if failures == 0 {
-        println!(
+        eprintln!(
             "[std] threads OK ({WORKERS} threads, Arc<Mutex>, RwLock, Condvar, Barrier, OnceLock)"
         );
     }
@@ -692,11 +692,11 @@ fn check_process() -> u32 {
             );
         }
         Err(error) => {
-            println!("[std] process SKIP (cannot spawn: {error})");
+            eprintln!("[std] process SKIP (cannot spawn: {error})");
         }
     }
     if failures == 0 {
-        println!("[std] process OK (Command spawned /bin/sleep, exit status 0)");
+        eprintln!("[std] process OK (Command spawned /bin/sleep, exit status 0)");
     }
     failures
 }
