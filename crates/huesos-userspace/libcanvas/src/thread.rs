@@ -51,6 +51,11 @@ pub struct JoinHandle {
 
 #[cfg(feature = "dyn-client")]
 impl JoinHandle {
+    /// Identifier handed out by [`spawn_task`] (`0` for [`spawn`]).
+    pub fn thread_id(&self) -> u64 {
+        self.id as u64
+    }
+
     /// Block until the thread exits and return its exit code.
     pub fn join(mut self) -> crate::Result<i64> {
         let mut code: i64 = 0;

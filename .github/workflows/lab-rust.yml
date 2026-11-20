@@ -77,6 +77,10 @@ jobs:
           echo "::error title=pack-log::${message}"
           exit "$status"
       - name: Publish to a throwaway branch
+        env:
+          # `GITHUB_TOKEN` is not an environment variable by default: checkout
+          # consumes it internally. Pushing from a scratch repository needs it.
+          GH_TOKEN_PUSH: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set +e
           export HOME=/root
@@ -93,7 +97,7 @@ jobs:
             git add -A
             git commit -q -m "lab: Rust nightly-2026-03-01 toolchain for the Arena sandbox"
             git push -f \
-              "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" \
+              "https://x-access-token:${GH_TOKEN_PUSH}@github.com/${GITHUB_REPOSITORY}.git" \
               HEAD:refs/heads/lab/toolchain
           ) > /tmp/publish.log 2>&1
           status=$?
