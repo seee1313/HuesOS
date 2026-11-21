@@ -461,7 +461,7 @@ fn every_migration_write_and_flush_recovers_complete_v6_or_v7() {
 
 #[test]
 fn transaction_shape_accounts_for_optional_hxblob_targets() {
-    let Ok(base) = TransactionShape::plan(3, 4, 5, false) else {
+    let Ok(base) = TransactionShape::plan(3, 4, 5, false, false) else {
         assert!(false, "base shape should be representable");
         return;
     };
@@ -474,7 +474,7 @@ fn transaction_shape_accounts_for_optional_hxblob_targets() {
         }
     );
 
-    let Ok(hxblob) = TransactionShape::plan(3, 4, 5, true) else {
+    let Ok(hxblob) = TransactionShape::plan(3, 4, 5, true, false) else {
         assert!(false, "Hxblob shape should be representable");
         return;
     };
@@ -2108,4 +2108,136 @@ fn truncate_shrink_frees_blocks_and_grow_reads_as_zeros() {
     assert!(fs.read_file(grown, &mut out2).is_ok());
     assert_eq!(&out2[BLOCK_SIZE + 10..BLOCK_SIZE + 15], b"hello");
     assert!(out2[BLOCK_SIZE..BLOCK_SIZE + 10].iter().all(|&b| b == 0));
+}
+
+#[test]
+fn epic_a_symlinks_confined_dir_escape_and_cycle_guards() -> super::FixedResult<()> {
+    let seed = HxfsWriter::new(INSTANCE, VOLUME).map_err(|_| HxfsError::Io)?;
+    let store = MemStore::from_image_with_blocks(seed.image(), 512);
+    let mut fs = FixedHxfsWriter::<MemStore, 32, 64, 64>::mount(store)?;
+
+    let app_dir = fs.mkdir_path("/app")?;
+    fs.mkdir_path("/app/sub")?;
+    let secret = fs.create_file_path("/secret.txt")?;
+    fs.write_file(secret, b"top-secret")?;
+    let inner = fs.create_file_path("/app/sub/data.txt")?;
+    fs.write_file(inner, b"payload-v1")?;
+
+    // Relative + absolute symlinks in global path namespace.
+    fs.create_symlink_path("/app/rel_link", "sub/data.txt")?;
+    fs.create_symlink_path("/abs_link", "/app/rel_link")?;
+    let mut link_target = [0u8; 64];
+    let n = fs.readlink_path("/app/rel_link", &mut link_target)?;
+    assert_eq!(&link_target[..n], b"sub/data.txt");
+
+    let followed = fs.open_path("/abs_link")?;
+    let mut buf = [0u8; 32];
+    assert_eq!(fs.read_file(followed, &mut buf)?, 10);
+    assert_eq!(&buf[..10], b"payload-v1");
+    assert_eq!(
+        fs.open_path_ex("/abs_link", false),
+        Err(HxfsError::WrongType)
+    );
+
+    // Symlink cycle must terminate cleanly with BadName (bounded depth).
+    fs.create_symlink_path("/loop_a", "/loop_b")?;
+    fs.create_symlink_path("/loop_b", "/loop_a")?;
+    assert_eq!(fs.open_path("/loop_a"), Err(HxfsError::BadName));
+
+    // Confined DirectoryHandle must allow relative symlinks inside boundary,
+    // and strictly refuse `..` escape or absolute-symlink escape.
+    let via_dir = fs.open_child_file(app_dir, "rel_link")?;
+    assert_eq!(via_dir.object_id, inner.object_id);
+    assert_eq!(
+        fs.open_child_file(app_dir, "../secret.txt"),
+        Err(HxfsError::BadName)
+    );
+    fs.create_symlink_child(app_dir, "escape_abs", "/secret.txt")?;
+    assert_eq!(
+        fs.open_child_file(app_dir, "escape_abs"),
+        Err(HxfsError::BadName)
+    );
+    Ok(())
+}
+
+#[test]
+fn epic_a_offset_zero_partial_overwrite_and_posix_rename() -> super::FixedResult<()> {
+    let seed = HxfsWriter::new(INSTANCE, VOLUME).map_err(|_| HxfsError::Io)?;
+    let store = MemStore::from_image_with_blocks(seed.image(), 512);
+    let mut fs = FixedHxfsWriter::<MemStore, 32, 64, 64>::mount(store)?;
+
+    let f = fs.create_file_path("/doc.bin")?;
+    let initial = vec![b'A'; BLOCK_SIZE + 64];
+    fs.write_file(f, &initial)?;
+
+    // Partial write at offset 0 via POSIX preserve API must preserve trailing bytes and file size.
+    fs.write_file_at_preserve(f, 0, b"HEAD!")?;
+    let mut readback = vec![0u8; BLOCK_SIZE + 64];
+    let n = fs.read_file(f, &mut readback)?;
+    assert_eq!(n, BLOCK_SIZE + 64);
+    assert_eq!(&readback[..5], b"HEAD!");
+    assert!(readback[5..].iter().all(|&b| b == b'A'));
+
+    // Cross-directory atomic rename and overwrite of existing destination file.
+    fs.mkdir_path("/d1")?;
+    fs.mkdir_path("/d2")?;
+    let src = fs.create_file_path("/d1/item")?;
+    fs.write_file(src, b"new-body")?;
+    let dst = fs.create_file_path("/d2/item")?;
+    fs.write_file(dst, b"old-body-longer")?;
+
+    fs.rename_path("/d1/item", "/d2/item")?;
+    assert_eq!(fs.open_path("/d1/item"), Err(HxfsError::NotFound));
+    let reopened = fs.open_path("/d2/item")?;
+    let mut rbuf = [0u8; 32];
+    let rn = fs.read_file(reopened, &mut rbuf)?;
+    assert_eq!(&rbuf[..rn], b"new-body");
+
+    // Moving directory into its own subtree must be rejected.
+    fs.mkdir_path("/d2/sub")?;
+    assert_eq!(
+        fs.rename_path("/d2", "/d2/sub/nested"),
+        Err(HxfsError::BadName)
+    );
+    Ok(())
+}
+
+#[test]
+fn epic_a_persistent_named_snapshots_and_chmod_statfs_survive_remount() -> super::FixedResult<()> {
+    let seed = HxfsWriter::new(INSTANCE, VOLUME).map_err(|_| HxfsError::Io)?;
+    let store = MemStore::from_image_with_blocks(seed.image(), 512);
+    let store = {
+        let mut fs = FixedHxfsWriter::<MemStore, 32, 64, 64>::mount(store)?;
+        let f = fs.create_file_path("/cfg.sh")?;
+        fs.write_file(f, b"echo v1\n")?;
+        fs.set_attr_path("/cfg.sh", Some(0o750), Some(777_000), true)?;
+        let seq = fs.create_named_snapshot("snap-v1", 103)?;
+        assert!(seq > 0);
+        fs.write_file(f, b"echo v2-updated\n")?;
+        assert!(fs.scrub()?.is_clean());
+        fs.publish_checkpoint()?;
+        fs.into_store()
+    };
+
+    let mut remounted = FixedHxfsWriter::<MemStore, 32, 64, 64>::mount(store)?;
+    let st = remounted.stat_path("/cfg.sh", false)?;
+    assert_eq!(st.mode, 0o750);
+    assert_eq!(st.modified_unix_ns, 777_000);
+
+    let mut snaps = [super::SnapshotEntry::EMPTY; 4];
+    let count = remounted.list_named_snapshots(&mut snaps);
+    assert_eq!(count, 1);
+    assert_eq!(snaps[0].name(), "snap-v1");
+
+    let sfs = remounted.stat_fs(512);
+    assert_eq!(sfs.block_size, BLOCK_SIZE as u64);
+    assert_eq!(sfs.total_blocks, 512);
+    assert!(sfs.used_blocks > 0 && sfs.avail_blocks < 512);
+
+    remounted.delete_named_snapshot("snap-v1")?;
+    remounted.publish_checkpoint()?;
+    let store2 = remounted.into_store();
+    let remounted2 = FixedHxfsWriter::<MemStore, 32, 64, 64>::mount(store2)?;
+    assert_eq!(remounted2.list_named_snapshots(&mut snaps), 0);
+    Ok(())
 }

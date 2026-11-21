@@ -18,17 +18,20 @@ fn run() -> i32 {
         return 1;
     };
     let path = cu::normalize_path(arg);
-    let Some(svc) = cu::take_hxfs() else {
-        cu::errln("touch: HxFS service unavailable");
-        return 1;
-    };
-    match svc.create_file(&path) {
+    if huesos_std::fs::exists(&path) {
+        return 0;
+    }
+    match huesos_std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .open(&path)
+    {
         Ok(f) => {
             let _ = f.fsync();
             0
         }
         Err(e) => {
-            cu::errln(&format!("touch '{path}': {}", e.as_str()));
+            cu::errln(&format!("touch '{path}': {e}"));
             1
         }
     }

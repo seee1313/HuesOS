@@ -52,8 +52,13 @@ pub enum TryLockError {
 }
 
 /// A mutual-exclusion lock: the loser parks on a futex.
+///
+/// Uses Drepper's 3-state futex protocol (`0` = unlocked, `1` = locked with no
+/// parked waiters, `2` = locked with possible parked waiters) so a handoff when
+/// a third thread steals `0 -> 1` before a woken waiter runs cannot strand the
+/// remaining sleepers.
 pub struct Mutex<T: ?Sized> {
-    /// `0` = free, `1` = owned. This is the futex word.
+    /// `0` = free, `1` = owned (uncontended), `2` = owned (contended).
     word: AtomicU32,
     /// The data plus the hand-off guard. Only an owner of `word` touches it.
     inner: spin::Mutex<T>,
@@ -83,31 +88,34 @@ impl<T> Mutex<T> {
 impl<T: ?Sized> Mutex<T> {
     /// Block until the lock is ours.
     pub fn lock(&self) -> MutexGuard<'_, T> {
+        // Uncontended fast path: `0 -> 1`.
+        if self
+            .word
+            .compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
+            .is_ok()
+        {
+            if let Some(guard) = self.inner.try_lock() {
+                return MutexGuard {
+                    owner: self,
+                    guard: Some(guard),
+                };
+            }
+            self.release_word();
+        }
+        // Contended path: mark `2` before parking AND keep `2` when we acquire
+        // after waking, so our own future unlock is guaranteed to call
+        // `futex::wake` for any peer still parked behind us.
         loop {
-            if self
-                .word
-                .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok()
-            {
-                let guard = self.inner.try_lock();
-                match guard {
-                    Some(guard) => {
-                        return MutexGuard {
-                            owner: self,
-                            guard: Some(guard),
-                        }
-                    }
-                    None => {
-                        // Cannot happen: `word == 1` means the previous owner
-                        // has already released the inner guard before clearing
-                        // the word. Release and retry rather than loop hot.
-                        self.release_word();
-                    }
+            if self.word.swap(2, Ordering::Acquire) == 0 {
+                if let Some(guard) = self.inner.try_lock() {
+                    return MutexGuard {
+                        owner: self,
+                        guard: Some(guard),
+                    };
                 }
+                self.release_word();
             } else {
-                // Park until the owner clears the word. A wake that races with
-                // our compare-exchange simply makes this return immediately.
-                let _ = futex::wait(&self.word, 1, 0);
+                let _ = futex::wait(&self.word, 2, 0);
             }
         }
     }
@@ -116,7 +124,7 @@ impl<T: ?Sized> Mutex<T> {
     pub fn try_lock(&self) -> core::result::Result<MutexGuard<'_, T>, TryLockError> {
         if self
             .word
-            .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+            .compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
             .is_err()
         {
             return Err(TryLockError::WouldBlock);
@@ -147,8 +155,9 @@ impl<T: ?Sized> Mutex<T> {
     }
 
     fn release_word(&self) {
-        self.word.store(0, Ordering::Release);
-        let _ = futex::wake(&self.word, 1);
+        if self.word.swap(0, Ordering::Release) == 2 {
+            let _ = futex::wake(&self.word, 1);
+        }
     }
 }
 
@@ -215,13 +224,13 @@ pub struct RwLock<T: ?Sized> {
 /// A shared read guard.
 pub struct RwLockReadGuard<'a, T: ?Sized> {
     owner: &'a RwLock<T>,
-    guard: spin::RwLockReadGuard<'a, T>,
+    guard: Option<spin::RwLockReadGuard<'a, T>>,
 }
 
 /// An exclusive write guard.
 pub struct RwLockWriteGuard<'a, T: ?Sized> {
     owner: &'a RwLock<T>,
-    guard: spin::RwLockWriteGuard<'a, T>,
+    guard: Option<spin::RwLockWriteGuard<'a, T>>,
 }
 
 impl<T> RwLock<T> {
@@ -243,10 +252,13 @@ impl<T: ?Sized> RwLock<T> {
     /// Block until a read guard is available.
     pub fn read(&self) -> RwLockReadGuard<'_, T> {
         loop {
-            if let Some(guard) = self.inner.try_read() {
-                return RwLockReadGuard { owner: self, guard };
-            }
             let sequence = self.word.load(Ordering::Acquire);
+            if let Some(guard) = self.inner.try_read() {
+                return RwLockReadGuard {
+                    owner: self,
+                    guard: Some(guard),
+                };
+            }
             let _ = futex::wait(&self.word, sequence, 0);
         }
     }
@@ -254,10 +266,13 @@ impl<T: ?Sized> RwLock<T> {
     /// Block until the write guard is available.
     pub fn write(&self) -> RwLockWriteGuard<'_, T> {
         loop {
-            if let Some(guard) = self.inner.try_write() {
-                return RwLockWriteGuard { owner: self, guard };
-            }
             let sequence = self.word.load(Ordering::Acquire);
+            if let Some(guard) = self.inner.try_write() {
+                return RwLockWriteGuard {
+                    owner: self,
+                    guard: Some(guard),
+                };
+            }
             let _ = futex::wait(&self.word, sequence, 0);
         }
     }
@@ -266,7 +281,10 @@ impl<T: ?Sized> RwLock<T> {
     pub fn try_read(&self) -> core::result::Result<RwLockReadGuard<'_, T>, TryLockError> {
         self.inner
             .try_read()
-            .map(|guard| RwLockReadGuard { owner: self, guard })
+            .map(|guard| RwLockReadGuard {
+                owner: self,
+                guard: Some(guard),
+            })
             .ok_or(TryLockError::WouldBlock)
     }
 
@@ -274,7 +292,10 @@ impl<T: ?Sized> RwLock<T> {
     pub fn try_write(&self) -> core::result::Result<RwLockWriteGuard<'_, T>, TryLockError> {
         self.inner
             .try_write()
-            .map(|guard| RwLockWriteGuard { owner: self, guard })
+            .map(|guard| RwLockWriteGuard {
+                owner: self,
+                guard: Some(guard),
+            })
             .ok_or(TryLockError::WouldBlock)
     }
 
@@ -293,13 +314,19 @@ impl<T: ?Sized> Deref for RwLockReadGuard<'_, T> {
     type Target = T;
 
     fn deref(&self) -> &T {
-        &self.guard
+        match &self.guard {
+            Some(guard) => guard,
+            None => unreachable_reference(),
+        }
     }
 }
 
 impl<T: ?Sized> Drop for RwLockReadGuard<'_, T> {
     fn drop(&mut self) {
-        // The guard's own drop releases the reader; the wake must come after.
+        // Release the inner spin::RwLock guard BEFORE publishing the sequence
+        // increment and waking futex waiters; otherwise a woken writer/reader
+        // observes the still-held lock and sleeps on the already-bumped word.
+        self.guard = None;
         self.owner.publish_unlock();
     }
 }
@@ -308,18 +335,25 @@ impl<T: ?Sized> Deref for RwLockWriteGuard<'_, T> {
     type Target = T;
 
     fn deref(&self) -> &T {
-        &self.guard
+        match &self.guard {
+            Some(guard) => guard,
+            None => unreachable_reference(),
+        }
     }
 }
 
 impl<T: ?Sized> DerefMut for RwLockWriteGuard<'_, T> {
     fn deref_mut(&mut self) -> &mut T {
-        &mut self.guard
+        match &mut self.guard {
+            Some(guard) => guard,
+            None => unreachable_mut_reference(),
+        }
     }
 }
 
 impl<T: ?Sized> Drop for RwLockWriteGuard<'_, T> {
     fn drop(&mut self) {
+        self.guard = None;
         self.owner.publish_unlock();
     }
 }
@@ -508,8 +542,11 @@ pub enum OnceState {
     Poisoned,
 }
 
-/// Run an initialiser at most once, with every caller waiting for the result.
+/// Run an initialiser at most once, with every caller parking on a futex while
+/// the winner runs it.
 pub struct Once {
+    /// `0` = New, `1` = InProgress, `2` = Done.
+    state: AtomicU32,
     inner: spin::Once<()>,
 }
 
@@ -517,26 +554,42 @@ impl Once {
     /// A new, un-run `Once`.
     pub const fn new() -> Self {
         Self {
+            state: AtomicU32::new(0),
             inner: spin::Once::new(),
         }
     }
 
-    /// Run `init` unless it already ran; block while another thread runs it.
+    /// Run `init` unless it already ran; park while another thread runs it.
     pub fn call_once<F: FnOnce()>(&self, init: F) {
-        self.inner.call_once(init);
+        if self.state.load(Ordering::Acquire) == 2 {
+            return;
+        }
+        if self
+            .state
+            .compare_exchange(0, 1, Ordering::Acquire, Ordering::Acquire)
+            .is_ok()
+        {
+            self.inner.call_once(init);
+            self.state.store(2, Ordering::Release);
+            let _ = futex::wake_all(&self.state);
+            return;
+        }
+        while self.state.load(Ordering::Acquire) != 2 {
+            let _ = futex::wait(&self.state, 1, 0);
+        }
     }
 
     /// True when the initialiser finished.
     pub fn is_completed(&self) -> bool {
-        self.inner.is_completed()
+        self.state.load(Ordering::Acquire) == 2
     }
 
     /// Current state.
     pub fn state(&self) -> OnceState {
-        if self.inner.is_completed() {
-            OnceState::Done
-        } else {
-            OnceState::New
+        match self.state.load(Ordering::Acquire) {
+            2 => OnceState::Done,
+            1 => OnceState::InProgress,
+            _ => OnceState::New,
         }
     }
 }
@@ -549,6 +602,7 @@ impl Default for Once {
 
 /// A cell that is written once and then only read.
 pub struct OnceLock<T> {
+    state: AtomicU32,
     cell: spin::Once<T>,
 }
 
@@ -556,43 +610,66 @@ impl<T> OnceLock<T> {
     /// An empty cell.
     pub const fn new() -> Self {
         Self {
+            state: AtomicU32::new(0),
             cell: spin::Once::new(),
         }
     }
 
     /// The value, if it has been set.
     pub fn get(&self) -> Option<&T> {
-        self.cell.get()
+        if self.state.load(Ordering::Acquire) == 2 {
+            self.cell.get()
+        } else {
+            None
+        }
     }
 
     /// Store `value`, returning it back if the cell was already set.
-    ///
-    /// The value is handed to the winning initialiser through a `Cell`, so a
-    /// loser can tell whether it was the one that stored: if its cell is still
-    /// full afterwards, somebody else won the race and gets the value back.
     pub fn set(&self, value: T) -> core::result::Result<(), T> {
-        let slot = Cell::new(Some(value));
-        let stored = Cell::new(false);
-        self.cell.call_once(|| {
-            // Exactly one caller runs this closure; the rest keep their value.
-            stored.set(true);
-            match slot.take() {
-                Some(value) => value,
-                None => crate::sync::wait_forever(),
+        loop {
+            match self
+                .state
+                .compare_exchange(0, 1, Ordering::Acquire, Ordering::Acquire)
+            {
+                Ok(_) => {
+                    let slot = Cell::new(Some(value));
+                    self.cell.call_once(|| match slot.take() {
+                        Some(v) => v,
+                        None => crate::sync::wait_forever(),
+                    });
+                    self.state.store(2, Ordering::Release);
+                    let _ = futex::wake_all(&self.state);
+                    return Ok(());
+                }
+                Err(2) => return Err(value),
+                Err(_) => {
+                    let _ = futex::wait(&self.state, 1, 0);
+                }
             }
-        });
-        if stored.get() {
-            return Ok(());
-        }
-        match slot.take() {
-            Some(unused) => Err(unused),
-            None => crate::sync::wait_forever(),
         }
     }
 
     /// Get the value, initialising it with `init` if needed.
     pub fn get_or_init<F: FnOnce() -> T>(&self, init: F) -> &T {
-        self.cell.call_once(init)
+        if self.state.load(Ordering::Acquire) != 2 {
+            if self
+                .state
+                .compare_exchange(0, 1, Ordering::Acquire, Ordering::Acquire)
+                .is_ok()
+            {
+                let _ = self.cell.call_once(init);
+                self.state.store(2, Ordering::Release);
+                let _ = futex::wake_all(&self.state);
+            } else {
+                while self.state.load(Ordering::Acquire) != 2 {
+                    let _ = futex::wait(&self.state, 1, 0);
+                }
+            }
+        }
+        match self.cell.get() {
+            Some(v) => v,
+            None => crate::sync::wait_forever(),
+        }
     }
 
     /// Get the value, trying to initialise it.
@@ -600,16 +677,39 @@ impl<T> OnceLock<T> {
         &self,
         init: F,
     ) -> core::result::Result<&T, E> {
-        if let Some(value) = self.cell.get() {
-            return Ok(value);
+        loop {
+            if self.state.load(Ordering::Acquire) == 2 {
+                return match self.cell.get() {
+                    Some(v) => Ok(v),
+                    None => crate::sync::wait_forever(),
+                };
+            }
+            if self
+                .state
+                .compare_exchange(0, 1, Ordering::Acquire, Ordering::Acquire)
+                .is_ok()
+            {
+                match init() {
+                    Ok(value) => {
+                        let r = self.cell.call_once(|| value);
+                        self.state.store(2, Ordering::Release);
+                        let _ = futex::wake_all(&self.state);
+                        return Ok(r);
+                    }
+                    Err(err) => {
+                        self.state.store(0, Ordering::Release);
+                        let _ = futex::wake_all(&self.state);
+                        return Err(err);
+                    }
+                }
+            }
+            let _ = futex::wait(&self.state, 1, 0);
         }
-        let value = init()?;
-        Ok(self.cell.call_once(|| value))
     }
 
     /// True when the cell holds a value.
     pub fn is_initialized(&self) -> bool {
-        self.cell.is_completed()
+        self.state.load(Ordering::Acquire) == 2
     }
 }
 

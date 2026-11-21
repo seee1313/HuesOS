@@ -95,13 +95,27 @@ impl Hxfs {
 
     /// Open an absolute directory path.
     pub fn open_dir(&self, path: &str) -> Result<HxfsDirectory> {
-        let mut request = [0u8; 320];
-        let len = write_prefixed_path(&mut request, b"OPEN_DIR ", path)?;
-        self.channel_to_dir(&request[..len])
+        if path == "/" {
+            return self.root();
+        }
+        write_native_request(
+            &self.channel,
+            abi::HxfsOp::OpenPath,
+            abi::HxfsHandleKind::Directory,
+            0,
+            0,
+            path.as_bytes(),
+        )?;
+        Ok(HxfsDirectory {
+            channel: read_native_handle(&self.channel, abi::HxfsHandleKind::Directory)?,
+        })
     }
 
     /// Open an absolute directory path with explicit attenuated HxFS rights.
     pub fn open_dir_with_rights(&self, path: &str, rights: u64) -> Result<HxfsDirectory> {
+        if path == "/" {
+            return self.root_with_rights(rights);
+        }
         write_native_request_with_rights(
             &self.channel,
             abi::HxfsOp::OpenPath,
@@ -116,11 +130,31 @@ impl Hxfs {
         })
     }
 
-    /// Open an absolute file path.
+    /// Open an absolute file path through the native Hxfs ABI.
     pub fn open_file(&self, path: &str) -> Result<HxfsFile> {
-        let mut request = [0u8; 320];
-        let len = write_prefixed_path(&mut request, b"OPEN_FILE ", path)?;
-        self.channel_to_file(&request[..len])
+        self.open_file_ex(path, true)
+    }
+
+    /// Open an absolute file path, optionally refusing to follow a final symlink (`O_NOFOLLOW`).
+    pub fn open_file_ex(&self, path: &str, follow_final: bool) -> Result<HxfsFile> {
+        let extra_flags = if follow_final {
+            0
+        } else {
+            abi::request_flags::O_NOFOLLOW
+        };
+        write_native_request_ex(
+            &self.channel,
+            abi::HxfsOp::OpenPath,
+            abi::HxfsHandleKind::File,
+            abi::rights::ALL,
+            extra_flags,
+            0,
+            0,
+            path.as_bytes(),
+        )?;
+        Ok(HxfsFile {
+            channel: read_native_handle(&self.channel, abi::HxfsHandleKind::File)?,
+        })
     }
 
     /// Open an existing blob by its 32-byte content hash.
@@ -218,6 +252,147 @@ impl Hxfs {
         read_native_status(&self.channel).map(|_| ())
     }
 
+    /// Create a symbolic link at `link_path` pointing to `target`.
+    pub fn symlink(&self, link_path: &str, target: &str) -> Result<()> {
+        let mut payload = [0u8; abi::HXFS_MAX_INLINE_WRITE_BYTES];
+        let len = write_two_strings(&mut payload, link_path, target)?;
+        write_native_request(
+            &self.channel,
+            abi::HxfsOp::Symlink,
+            abi::HxfsHandleKind::None,
+            0,
+            0,
+            &payload[..len],
+        )?;
+        read_native_status(&self.channel).map(|_| ())
+    }
+
+    /// Stat an absolute path (`follow_final = true` for `stat`, `false` for `lstat`).
+    pub fn stat_path(&self, path: &str, follow_final: bool) -> Result<abi::HxfsStatInfo> {
+        let extra_flags = if follow_final {
+            0
+        } else {
+            abi::request_flags::O_NOFOLLOW
+        };
+        write_native_request_ex(
+            &self.channel,
+            abi::HxfsOp::StatPath,
+            abi::HxfsHandleKind::None,
+            abi::rights::READ,
+            extra_flags,
+            0,
+            0,
+            path.as_bytes(),
+        )?;
+        let mut buf = [0u8; abi::HXFS_STAT_INFO_BYTES];
+        let n = read_native_payload(&self.channel, &mut buf)?;
+        abi::HxfsStatInfo::decode(&buf[..n]).ok_or(ErrorCode::InvalidArgs)
+    }
+
+    /// Read the symbolic link target at `path` into `out`.
+    pub fn readlink<'a>(&self, path: &str, out: &'a mut [u8]) -> Result<&'a str> {
+        write_native_request(
+            &self.channel,
+            abi::HxfsOp::ReadLink,
+            abi::HxfsHandleKind::None,
+            0,
+            0,
+            path.as_bytes(),
+        )?;
+        let n = read_native_payload(&self.channel, out)?;
+        core::str::from_utf8(&out[..n]).map_err(|_| ErrorCode::InvalidArgs)
+    }
+
+    /// Update POSIX mode (`mode_opt`) and/or `modified_unix_ns` (`mtime_opt`) on `path`.
+    pub fn set_attr(
+        &self,
+        path: &str,
+        mode_opt: Option<u32>,
+        mtime_opt: Option<i64>,
+        follow_final: bool,
+    ) -> Result<()> {
+        let extra_flags = if follow_final {
+            0
+        } else {
+            abi::request_flags::O_NOFOLLOW
+        };
+        let arg0 = mode_opt.map_or(u64::MAX, u64::from);
+        let arg1 = mtime_opt.map_or(u64::MAX, |v| v as u64);
+        write_native_request_ex(
+            &self.channel,
+            abi::HxfsOp::SetAttr,
+            abi::HxfsHandleKind::None,
+            abi::rights::MODIFY_DIRECTORY,
+            extra_flags,
+            arg0,
+            arg1,
+            path.as_bytes(),
+        )?;
+        read_native_status(&self.channel).map(|_| ())
+    }
+
+    /// Query mounted filesystem capacity and object statistics (`StatFs`).
+    pub fn stat_fs(&self) -> Result<abi::HxfsStatFsInfo> {
+        write_native_request(
+            &self.channel,
+            abi::HxfsOp::StatFs,
+            abi::HxfsHandleKind::Volume,
+            0,
+            0,
+            &[],
+        )?;
+        let mut buf = [0u8; abi::HXFS_STAT_FS_BYTES];
+        let n = read_native_payload(&self.channel, &mut buf)?;
+        abi::HxfsStatFsInfo::decode(&buf[..n]).ok_or(ErrorCode::InvalidArgs)
+    }
+
+    /// Create a persistent named snapshot and return its checkpoint sequence.
+    pub fn create_snapshot(&self, name: &str) -> Result<u64> {
+        write_native_request(
+            &self.channel,
+            abi::HxfsOp::CreateSnapshot,
+            abi::HxfsHandleKind::Volume,
+            0,
+            0,
+            name.as_bytes(),
+        )?;
+        read_native_status(&self.channel).map(|r| r.value)
+    }
+
+    /// Delete a persistent named snapshot.
+    pub fn delete_snapshot(&self, name: &str) -> Result<()> {
+        write_native_request(
+            &self.channel,
+            abi::HxfsOp::DeleteSnapshot,
+            abi::HxfsHandleKind::Volume,
+            0,
+            0,
+            name.as_bytes(),
+        )?;
+        read_native_status(&self.channel).map(|_| ())
+    }
+
+    /// List persistent named snapshots as tab-delimited lines into `out`.
+    pub fn list_snapshots<'a>(&self, out: &'a mut [u8]) -> Result<&'a str> {
+        self.channel.write(b"LIST_SNAPSHOTS")?;
+        let n = self.channel.read_into_blocking(out)?;
+        core::str::from_utf8(&out[..n]).map_err(|_| ErrorCode::InvalidArgs)
+    }
+
+    /// Run a full service-side metadata + extent scrub and return its summary line.
+    pub fn scrub_summary<'a>(&self, out: &'a mut [u8]) -> Result<&'a str> {
+        self.channel.write(b"SCRUB")?;
+        let n = self.channel.read_into_blocking(out)?;
+        core::str::from_utf8(&out[..n]).map_err(|_| ErrorCode::InvalidArgs)
+    }
+
+    /// Run a service-side structural `fsck` + tree walk and return its summary line.
+    pub fn fsck_summary<'a>(&self, out: &'a mut [u8]) -> Result<&'a str> {
+        self.channel.write(b"FSCK")?;
+        let n = self.channel.read_into_blocking(out)?;
+        core::str::from_utf8(&out[..n]).map_err(|_| ErrorCode::InvalidArgs)
+    }
+
     /// Query mounted volume `(root_object_id, checkpoint_sequence)` via native `GetInfo`.
     pub fn volume_info(&self) -> Result<(u64, u64)> {
         write_native_request(
@@ -281,29 +456,6 @@ impl Hxfs {
             }
         }
     }
-
-    fn channel_to_file(&self, request: &[u8]) -> Result<HxfsFile> {
-        self.channel.write(request)?;
-        let mut buf = [0u8; 64];
-        loop {
-            match self.channel.read_optional_handle(&mut buf) {
-                Ok((n, Some(handle))) if &buf[..n] == b"service:hxfs:file:channel" => {
-                    return Ok(HxfsFile {
-                        channel: Channel::from_handle(handle),
-                    });
-                }
-                Ok((_n, Some(handle))) => drop(handle),
-                Ok((n, None)) if buf[..n].starts_with(b"err:hxfs") => {
-                    return Err(ErrorCode::NotFound);
-                }
-                Ok((_n, None)) => return Err(ErrorCode::InvalidArgs),
-                Err(ErrorCode::ShouldWait) | Err(ErrorCode::TimedOut) => {
-                    crate::process::yield_now();
-                }
-                Err(error) => return Err(error),
-            }
-        }
-    }
 }
 
 impl HxfsDirectory {
@@ -322,37 +474,45 @@ impl HxfsDirectory {
         self.channel
     }
 
-    /// List directory names into `out`.
+    /// List directory entries into `out` via the native Hxfs ABI.
     pub fn list<'a>(&self, out: &'a mut [u8]) -> Result<&'a [u8]> {
-        self.channel.write(b"LIST")?;
-        let n = self.channel.read_into_blocking(out)?;
+        write_native_request(
+            &self.channel,
+            abi::HxfsOp::ListDirectory,
+            abi::HxfsHandleKind::Directory,
+            0,
+            0,
+            &[],
+        )?;
+        let n = read_native_payload(&self.channel, out)?;
         Ok(&out[..n])
     }
 
-    /// Open a child file by UTF-8 name.
+    /// Open a child or relative subpath file by UTF-8 name through the native Hxfs ABI.
     pub fn open_file(&self, name: &str) -> Result<HxfsFile> {
-        let mut request = [0u8; 320];
-        let len = write_prefixed_path(&mut request, b"OPEN_FILE ", name)?;
-        self.channel.write(&request[..len])?;
-        let mut buf = [0u8; 64];
-        loop {
-            match self.channel.read_optional_handle(&mut buf) {
-                Ok((n, Some(handle))) if &buf[..n] == b"service:hxfs:file:channel" => {
-                    return Ok(HxfsFile {
-                        channel: Channel::from_handle(handle),
-                    });
-                }
-                Ok((_n, Some(handle))) => drop(handle),
-                Ok((n, None)) if buf[..n].starts_with(b"err:hxfs") => {
-                    return Err(ErrorCode::NotFound);
-                }
-                Ok((_n, None)) => return Err(ErrorCode::InvalidArgs),
-                Err(ErrorCode::ShouldWait) | Err(ErrorCode::TimedOut) => {
-                    crate::process::yield_now();
-                }
-                Err(error) => return Err(error),
-            }
-        }
+        self.open_file_ex(name, true)
+    }
+
+    /// Open a child or relative subpath file, optionally refusing to follow a final symlink.
+    pub fn open_file_ex(&self, name: &str, follow_final: bool) -> Result<HxfsFile> {
+        let extra_flags = if follow_final {
+            0
+        } else {
+            abi::request_flags::O_NOFOLLOW
+        };
+        write_native_request_ex(
+            &self.channel,
+            abi::HxfsOp::OpenPath,
+            abi::HxfsHandleKind::File,
+            abi::rights::ALL,
+            extra_flags,
+            0,
+            0,
+            name.as_bytes(),
+        )?;
+        Ok(HxfsFile {
+            channel: read_native_handle(&self.channel, abi::HxfsHandleKind::File)?,
+        })
     }
 
     /// Open a child directory by UTF-8 name through the native Hxfs ABI.
@@ -415,7 +575,7 @@ impl HxfsDirectory {
         read_native_status(&self.channel).map(|_| ())
     }
 
-    /// Unlink one child from this directory.
+    /// Unlink one child or relative subpath from this directory.
     pub fn unlink(&self, name: &str) -> Result<()> {
         write_native_request(
             &self.channel,
@@ -426,6 +586,100 @@ impl HxfsDirectory {
             name.as_bytes(),
         )?;
         read_native_status(&self.channel).map(|_| ())
+    }
+
+    /// Create a symbolic link at relative `link_rel` pointing to `target`.
+    pub fn symlink(&self, link_rel: &str, target: &str) -> Result<()> {
+        let mut payload = [0u8; abi::HXFS_MAX_INLINE_WRITE_BYTES];
+        let len = write_two_strings(&mut payload, link_rel, target)?;
+        write_native_request(
+            &self.channel,
+            abi::HxfsOp::Symlink,
+            abi::HxfsHandleKind::None,
+            0,
+            0,
+            &payload[..len],
+        )?;
+        read_native_status(&self.channel).map(|_| ())
+    }
+
+    /// Stat a relative subpath under this directory (`follow_final = true` for `stat`, `false` for `lstat`).
+    pub fn stat_path(&self, rel_path: &str, follow_final: bool) -> Result<abi::HxfsStatInfo> {
+        let extra_flags = if follow_final {
+            0
+        } else {
+            abi::request_flags::O_NOFOLLOW
+        };
+        write_native_request_ex(
+            &self.channel,
+            abi::HxfsOp::StatPath,
+            abi::HxfsHandleKind::None,
+            abi::rights::READ,
+            extra_flags,
+            0,
+            0,
+            rel_path.as_bytes(),
+        )?;
+        let mut buf = [0u8; abi::HXFS_STAT_INFO_BYTES];
+        let n = read_native_payload(&self.channel, &mut buf)?;
+        abi::HxfsStatInfo::decode(&buf[..n]).ok_or(ErrorCode::InvalidArgs)
+    }
+
+    /// Read the symbolic link target at relative `rel_path` into `out`.
+    pub fn readlink<'a>(&self, rel_path: &str, out: &'a mut [u8]) -> Result<&'a str> {
+        write_native_request(
+            &self.channel,
+            abi::HxfsOp::ReadLink,
+            abi::HxfsHandleKind::None,
+            0,
+            0,
+            rel_path.as_bytes(),
+        )?;
+        let n = read_native_payload(&self.channel, out)?;
+        core::str::from_utf8(&out[..n]).map_err(|_| ErrorCode::InvalidArgs)
+    }
+
+    /// Update POSIX mode (`mode_opt`) and/or `modified_unix_ns` (`mtime_opt`) on relative `rel_path`.
+    pub fn set_attr(
+        &self,
+        rel_path: &str,
+        mode_opt: Option<u32>,
+        mtime_opt: Option<i64>,
+        follow_final: bool,
+    ) -> Result<()> {
+        let extra_flags = if follow_final {
+            0
+        } else {
+            abi::request_flags::O_NOFOLLOW
+        };
+        let arg0 = mode_opt.map_or(u64::MAX, u64::from);
+        let arg1 = mtime_opt.map_or(u64::MAX, |v| v as u64);
+        write_native_request_ex(
+            &self.channel,
+            abi::HxfsOp::SetAttr,
+            abi::HxfsHandleKind::None,
+            abi::rights::MODIFY_DIRECTORY,
+            extra_flags,
+            arg0,
+            arg1,
+            rel_path.as_bytes(),
+        )?;
+        read_native_status(&self.channel).map(|_| ())
+    }
+
+    /// Query mounted filesystem capacity and object statistics (`StatFs`).
+    pub fn stat_fs(&self) -> Result<abi::HxfsStatFsInfo> {
+        write_native_request(
+            &self.channel,
+            abi::HxfsOp::StatFs,
+            abi::HxfsHandleKind::Directory,
+            0,
+            0,
+            &[],
+        )?;
+        let mut buf = [0u8; abi::HXFS_STAT_FS_BYTES];
+        let n = read_native_payload(&self.channel, &mut buf)?;
+        abi::HxfsStatFsInfo::decode(&buf[..n]).ok_or(ErrorCode::InvalidArgs)
     }
 
     /// Publish pending directory mutations.
@@ -572,19 +826,21 @@ impl HxfsFile {
         )?;
         read_native_status(&self.channel).map(|_| ())
     }
-}
 
-fn write_prefixed_path(out: &mut [u8], prefix: &[u8], path: &str) -> Result<usize> {
-    let bytes = path.as_bytes();
-    let Some(total) = prefix.len().checked_add(bytes.len()) else {
-        return Err(ErrorCode::InvalidArgs);
-    };
-    if total > out.len() {
-        return Err(ErrorCode::InvalidArgs);
+    /// Update POSIX mode (`mode_opt`) and/or `modified_unix_ns` (`mtime_opt`) on this open file.
+    pub fn set_attr(&self, mode_opt: Option<u32>, mtime_opt: Option<i64>) -> Result<()> {
+        let arg0 = mode_opt.map_or(u64::MAX, u64::from);
+        let arg1 = mtime_opt.map_or(u64::MAX, |v| v as u64);
+        write_native_request(
+            &self.channel,
+            abi::HxfsOp::SetAttr,
+            abi::HxfsHandleKind::File,
+            arg0,
+            arg1,
+            &[],
+        )?;
+        read_native_status(&self.channel).map(|_| ())
     }
-    out[..prefix.len()].copy_from_slice(prefix);
-    out[prefix.len()..total].copy_from_slice(bytes);
-    Ok(total)
 }
 
 impl HxfsBlobView {
@@ -980,20 +1236,35 @@ fn write_native_request_with_rights(
     arg1: u64,
     payload: &[u8],
 ) -> Result<u64> {
+    write_native_request_ex(channel, op, handle_kind, rights, 0, arg0, arg1, payload)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_native_request_ex(
+    channel: &Channel,
+    op: abi::HxfsOp,
+    handle_kind: abi::HxfsHandleKind,
+    rights: u64,
+    extra_flags: u32,
+    arg0: u64,
+    arg1: u64,
+    payload: &[u8],
+) -> Result<u64> {
     if payload.len() > abi::HXFS_MAX_INLINE_WRITE_BYTES {
         return Err(ErrorCode::InvalidArgs);
     }
     let request_id = next_request_id();
     let payload_len = payload.len() as u32;
+    let base_flags = if payload.is_empty() {
+        0
+    } else {
+        abi::request_flags::INLINE_PAYLOAD
+    };
     let request = abi::HxfsRequest {
         version: abi::HXFS_PROTOCOL_VERSION,
         reserved0: 0,
         op,
-        flags: if payload.is_empty() {
-            0
-        } else {
-            abi::request_flags::INLINE_PAYLOAD
-        },
+        flags: base_flags | extra_flags,
         request_id,
         handle_id: 0,
         handle_kind,

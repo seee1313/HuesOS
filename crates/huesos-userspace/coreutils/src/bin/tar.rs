@@ -40,11 +40,15 @@ const OFF_SIZE: usize = 124;
 const OFF_MTIME: usize = 136;
 const OFF_CHECKSUM: usize = 148;
 const OFF_TYPEFLAG: usize = 156;
+const OFF_LINKNAME: usize = 157;
 const OFF_MAGIC: usize = 257;
 const OFF_UNAME: usize = 265;
 const OFF_GNAME: usize = 297;
+const OFF_PREFIX: usize = 345;
+const LEN_PREFIX: usize = 155;
 
 const TYPE_FILE: u8 = b'0';
+const TYPE_SYMLINK: u8 = b'2';
 const TYPE_DIR: u8 = b'5';
 
 enum Mode {
@@ -185,7 +189,9 @@ fn create(archive: &str, base: &str, paths: &[String]) -> Result<()> {
     let zeros = [0u8; BLOCK];
     io::write_all(&mut out, &zeros)?;
     io::write_all(&mut out, &zeros)?;
-    out.fsync()
+    out.fsync()?;
+    let _ = fs::sync_all();
+    Ok(())
 }
 
 /// The name stored in the archive: no leading `/`, no `./`.
@@ -197,13 +203,24 @@ fn member_name(requested: &str) -> String {
 
 /// Append `source` (and its children) to `out` as `name`.
 fn append(out: &mut fs::File, source: &str, name: &str) -> Result<()> {
-    let metadata = fs::metadata(source)?;
+    let metadata = fs::symlink_metadata(source)?;
+    if metadata.is_symlink() {
+        let link_target = fs::read_link(source)?;
+        return write_header(out, name, 0, TYPE_SYMLINK, 0o777, &link_target);
+    }
     if metadata.is_dir() {
         let mut directory_name = String::from(name);
         if !directory_name.ends_with('/') {
             directory_name.push('/');
         }
-        write_header(out, &directory_name, metadata.len(), TYPE_DIR, 0o755)?;
+        write_header(
+            out,
+            &directory_name,
+            metadata.len(),
+            TYPE_DIR,
+            metadata.mode(),
+            "",
+        )?;
         let entries = fs::list(source)?;
         let mut names: Vec<&Entry> = entries.iter().collect();
         names.sort_by(|left, right| left.name.as_bytes().cmp(right.name.as_bytes()));
@@ -218,7 +235,7 @@ fn append(out: &mut fs::File, source: &str, name: &str) -> Result<()> {
     let mut file = fs::File::open(source)?;
     let mut data = Vec::new();
     io::read_to_end(&mut file, &mut data)?;
-    write_header(out, name, data.len() as u64, TYPE_FILE, 0o644)?;
+    write_header(out, name, data.len() as u64, TYPE_FILE, metadata.mode(), "")?;
     io::write_all(out, &data)?;
     let padding = (BLOCK - data.len() % BLOCK) % BLOCK;
     if padding > 0 {
@@ -228,18 +245,31 @@ fn append(out: &mut fs::File, source: &str, name: &str) -> Result<()> {
     Ok(())
 }
 
-fn write_header(out: &mut fs::File, name: &str, size: u64, typeflag: u8, mode: u32) -> Result<()> {
+fn write_header(
+    out: &mut fs::File,
+    name: &str,
+    size: u64,
+    typeflag: u8,
+    mode: u32,
+    linkname: &str,
+) -> Result<()> {
     if name.len() > 100 {
         return Err(invalid("member name longer than 100 bytes"));
     }
+    if linkname.len() > 100 {
+        return Err(invalid("symlink target longer than 100 bytes"));
+    }
     let mut header = [0u8; BLOCK];
     header[OFF_NAME..OFF_NAME + name.len()].copy_from_slice(name.as_bytes());
-    write_octal(&mut header, OFF_MODE, 8, u64::from(mode));
+    write_octal(&mut header, OFF_MODE, 8, u64::from(mode & 0o7777));
     write_octal(&mut header, OFF_UID, 8, 0);
     write_octal(&mut header, OFF_GID, 8, 0);
     write_octal(&mut header, OFF_SIZE, 12, size);
     write_octal(&mut header, OFF_MTIME, 12, 0);
     header[OFF_TYPEFLAG] = typeflag;
+    if !linkname.is_empty() {
+        header[OFF_LINKNAME..OFF_LINKNAME + linkname.len()].copy_from_slice(linkname.as_bytes());
+    }
     header[OFF_MAGIC..OFF_MAGIC + 6].copy_from_slice(b"ustar\0");
     header[OFF_MAGIC + 6..OFF_MAGIC + 8].copy_from_slice(b"00");
     for slot in &mut header[OFF_UNAME..OFF_UNAME + 32] {
@@ -291,6 +321,7 @@ fn extract(archive: &str, base: &str) -> Result<()> {
     let mut file = fs::File::open(&path::normalize(archive))?;
     loop {
         let Some(header) = read_header(&mut file)? else {
+            let _ = fs::sync_all();
             return Ok(());
         };
         let name = header_name(&header);
@@ -303,6 +334,25 @@ fn extract(archive: &str, base: &str) -> Result<()> {
         match typeflag {
             TYPE_DIR => {
                 ensure_directory(&target)?;
+                if let Ok(mode) = parse_octal(&header[OFF_MODE..OFF_MODE + 8]) {
+                    let _ = fs::set_permissions(&target, (mode as u32) & 0o7777);
+                }
+            }
+            TYPE_SYMLINK => {
+                if let Some(parent) = path::parent(&target) {
+                    ensure_directory(&parent)?;
+                }
+                let link_end = header[OFF_LINKNAME..OFF_LINKNAME + 100]
+                    .iter()
+                    .position(|&b| b == 0)
+                    .unwrap_or(100);
+                let link_target =
+                    String::from_utf8_lossy(&header[OFF_LINKNAME..OFF_LINKNAME + link_end])
+                        .into_owned();
+                if fs::symlink_metadata(&target).is_ok() {
+                    let _ = fs::remove(&target);
+                }
+                fs::symlink(&link_target, &target)?;
             }
             TYPE_FILE | 0 => {
                 if let Some(parent) = path::parent(&target) {
@@ -318,6 +368,9 @@ fn extract(archive: &str, base: &str) -> Result<()> {
                     remaining -= want as u64;
                 }
                 created.fsync()?;
+                if let Ok(mode) = parse_octal(&header[OFF_MODE..OFF_MODE + 8]) {
+                    let _ = fs::set_permissions(&target, (mode as u32) & 0o7777);
+                }
                 skip(
                     &mut file,
                     (BLOCK as u64 - size % BLOCK as u64) % BLOCK as u64,
@@ -326,7 +379,7 @@ fn extract(archive: &str, base: &str) -> Result<()> {
                 continue;
             }
             other => {
-                // An archive with links or devices in it is not something
+                // An archive with devices/FIFOs in it is not something
                 // HuesOS can represent; refuse rather than silently skip.
                 let _ = other;
                 return Err(invalid("unsupported member type in archive"));
@@ -391,20 +444,18 @@ fn header_name(header: &[u8; BLOCK]) -> String {
         .position(|byte| *byte == 0)
         .unwrap_or(100);
     let mut name = String::from_utf8_lossy(&header[OFF_NAME..OFF_NAME + name_end]).into_owned();
-    let prefix_end = header[OFF_MAGIC + 8 + 33..OFF_MAGIC + 8 + 155]
+    let prefix_end = header[OFF_PREFIX..OFF_PREFIX + LEN_PREFIX]
         .iter()
         .position(|byte| *byte == 0)
         .unwrap_or(0);
-    let prefix_end = prefix_end.min(155 - 33);
+    let prefix_end = prefix_end.min(LEN_PREFIX);
     if prefix_end > 0 {
         // A `prefix` field is only present when the magic actually says
         // `ustar`; a plain v7 header leaves that area zeroed.
         let magic_ok = &header[OFF_MAGIC..OFF_MAGIC + 5] == b"ustar";
         if magic_ok {
-            let prefix = String::from_utf8_lossy(
-                &header[OFF_MAGIC + 8 + 33..OFF_MAGIC + 8 + 33 + prefix_end],
-            )
-            .into_owned();
+            let prefix =
+                String::from_utf8_lossy(&header[OFF_PREFIX..OFF_PREFIX + prefix_end]).into_owned();
             if !prefix.is_empty() {
                 name = format!("{prefix}/{name}");
             }

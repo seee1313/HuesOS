@@ -44,23 +44,23 @@ pub const LBAS_PER_HXFS_BLOCK: u64 = (HXFS_BLOCK_SIZE / LBA_SIZE) as u64;
 enum Backing {
     /// An image file on the mounted volume.
     File(RefCell<fs::File>),
-    /// A raw block device, plus its hardware block size.
-    Device(RefCell<BlockDevice>, u32),
+    /// The process-wide raw block device singleton, plus its hardware block size.
+    Device(&'static spin::Mutex<BlockDevice>, u32),
 }
 
 /// The block device this process was granted, held for its whole lifetime.
 ///
-/// `take_cap_handle` empties the slot, so taking it once here and lending the
-/// channel out is what allows a second and third open in the same process --
-/// `lsblk` reads the geometry, `df` asks for the size, `fsck` probes a volume,
-/// and each of them used to be the last one that could reach the disk.
-pub fn block_device() -> Result<&'static BlockDevice> {
-    static DEVICE: spin::Once<Option<BlockDevice>> = spin::Once::new();
+/// `take_cap_handle` empties the slot, so taking it once here and lending a
+/// locked reference out is what allows a second and third open in the same
+/// process (`lsblk`, `df`, `fsck`, `mkfs`) without duplicating the kernel
+/// `Channel` endpoint and corrupting the 1:1 `BlockDevice` IPC state.
+pub fn block_device() -> Result<&'static spin::Mutex<BlockDevice>> {
+    static DEVICE: spin::Once<Option<spin::Mutex<BlockDevice>>> = spin::Once::new();
     DEVICE
         .call_once(|| {
             take_cap_handle(CapKind::BlockDev)
-                .map(|handle| BlockDevice::from_channel(Channel::from_handle(handle)))
-                .and_then(|device| device.ok())
+                .and_then(|handle| BlockDevice::from_channel(Channel::from_handle(handle)).ok())
+                .map(spin::Mutex::new)
         })
         .as_ref()
         .ok_or_else(Error::capability)
@@ -110,20 +110,17 @@ impl DiskIo {
 
     /// Open the block device the process was granted, if any.
     ///
-    /// The capability slot can be *taken* once, so the handle is taken here on
-    /// first use and then duplicated for every later open: a tool that reports
-    /// the geometry, probes a volume and then writes the table keeps working,
-    /// instead of losing the device after the first `open`.
+    /// Reuses the process-wide `BlockDevice` singleton under a mutex instead
+    /// of duplicating its underlying `Channel` handle (a kernel `Channel` has
+    /// exactly two endpoints, so re-running `BlockDevice::from_channel` on a
+    /// duplicated endpoint handle would collide on IPC replies).
     pub fn open_device() -> Result<Self> {
-        let source = block_device()?.channel().handle().duplicate(
-            huesos_abi::rights::READ | huesos_abi::rights::WRITE | huesos_abi::rights::TRANSFER,
-        )?;
-        let mut device = BlockDevice::from_channel(Channel::from_handle(source))?;
-        let info = device.info()?;
+        let shared = block_device()?;
+        let info = shared.lock().info()?;
         let block_size = info.block_size.max(LBA_SIZE as u32);
         let total_lbas = info.block_count * u64::from(block_size / LBA_SIZE as u32);
         Ok(Self {
-            backing: Backing::Device(RefCell::new(device), block_size),
+            backing: Backing::Device(shared, block_size),
             total_lbas,
             writable: true,
             label: String::from("/dev/nvme0"),
@@ -201,11 +198,12 @@ impl DiskIo {
             Backing::Device(device, block_size) => {
                 let ratio = u64::from((*block_size / LBA_SIZE as u32).max(1));
                 let hw_lba = lba / ratio;
-                let hw_count = u32::try_from((ratio * u64::from(count)).max(1)).unwrap_or(u32::MAX);
+                let end_lba = lba.saturating_add(u64::from(count));
+                let end_hw = end_lba.div_ceil(ratio);
+                let hw_count =
+                    u32::try_from(end_hw.saturating_sub(hw_lba).max(1)).unwrap_or(u32::MAX);
                 let mut scratch = vec![0u8; hw_count as usize * *block_size as usize];
-                let mut device = device
-                    .try_borrow_mut()
-                    .map_err(|_| Error::new(huesos_std::ErrorKind::Busy))?;
+                let mut device = device.lock();
                 device.read_blocks(hw_lba, hw_count, &mut scratch)?;
                 let skip = ((lba % ratio) as usize) * LBA_SIZE;
                 out[..bytes].copy_from_slice(&scratch[skip..skip + bytes]);
@@ -241,12 +239,13 @@ impl DiskIo {
             Backing::Device(device, block_size) => {
                 let ratio = u64::from((*block_size / LBA_SIZE as u32).max(1));
                 let hw_lba = lba / ratio;
-                let hw_count = u32::try_from((ratio * u64::from(count)).max(1)).unwrap_or(u32::MAX);
+                let end_lba = lba.saturating_add(u64::from(count));
+                let end_hw = end_lba.div_ceil(ratio);
+                let hw_count =
+                    u32::try_from(end_hw.saturating_sub(hw_lba).max(1)).unwrap_or(u32::MAX);
                 let mut scratch = vec![0u8; hw_count as usize * *block_size as usize];
-                let mut device = device
-                    .try_borrow_mut()
-                    .map_err(|_| Error::new(huesos_std::ErrorKind::Busy))?;
-                if ratio > 1 || *block_size as usize > bytes {
+                let mut device = device.lock();
+                if !lba.is_multiple_of(ratio) || !end_lba.is_multiple_of(ratio) {
                     // Partial hardware blocks must be read-modify-written so the
                     // neighbouring sectors survive.
                     device.read_blocks(hw_lba, hw_count, &mut scratch)?;
@@ -273,9 +272,7 @@ impl DiskIo {
                 file.fsync()
             }
             Backing::Device(device, _) => {
-                let mut device = device
-                    .try_borrow_mut()
-                    .map_err(|_| Error::new(huesos_std::ErrorKind::Busy))?;
+                let mut device = device.lock();
                 Ok(device.flush()?)
             }
         }

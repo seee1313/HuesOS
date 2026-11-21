@@ -85,7 +85,7 @@ pub extern "C" fn _start() -> ! {
     // the atomic halt syscall. hard_halt never returns.
     loop {
         let mut buf = [0u8; 32];
-        match bootstrap.read_into(&mut buf) {
+        match bootstrap.read_into_blocking(&mut buf) {
             Ok(n) if &buf[..n] == SHUTDOWN_COMMAND => {
                 println!("[shutdown-broker] shutdown command received");
                 quiesce_8042(&ioport);
@@ -98,8 +98,15 @@ pub extern "C" fn _start() -> ! {
                 // critical-fallback halt.
                 println!("[shutdown-broker] ignoring {} unexpected byte(s)", n);
             }
-            Err(ErrorCode::ShouldWait) | Err(ErrorCode::TimedOut) => {
-                libcanvas::process::yield_now();
+            Err(ErrorCode::ShouldWait) | Err(ErrorCode::TimedOut) => {}
+            Err(ErrorCode::PeerClosed) => {
+                // Supervisor closed bootstrap without requesting shutdown; park forever.
+                let items = [WaitItem::new(
+                    bootstrap.handle().raw(),
+                    Signals::READABLE,
+                    0,
+                )];
+                let _ = wait_any(&items, 100);
             }
             Err(e) => {
                 println!("[shutdown-broker] bootstrap read failed: {}", e.as_str());

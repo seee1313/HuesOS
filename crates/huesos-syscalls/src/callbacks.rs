@@ -28,7 +28,7 @@ pub(crate) static SHUTDOWN_FN: Mutex<Option<ShutdownFn>> = Mutex::new(None);
 /// Scheduler snapshot callbacks: aggregate counters, then per-CPU.
 pub type SchedSummaryFn = fn(&mut huesos_abi::SchedSummary);
 pub type SchedCpuFn = fn(usize, &mut huesos_abi::SchedCpuRecord);
-pub type TaskRecordFn = fn(usize, &mut huesos_abi::TaskRecord) -> bool;
+pub type TaskRecordFn = fn(usize, &mut [huesos_abi::TaskRecord]) -> (usize, usize);
 pub(crate) static SCHED_SUMMARY_FN: Mutex<Option<SchedSummaryFn>> = Mutex::new(None);
 pub(crate) static SCHED_CPU_FN: Mutex<Option<SchedCpuFn>> = Mutex::new(None);
 pub(crate) static TASK_RECORD_FN: Mutex<Option<TaskRecordFn>> = Mutex::new(None);
@@ -139,14 +139,6 @@ pub fn set_task_record_fn(f: TaskRecordFn) {
 /// Set the live-task count callback. Called once by kernel init.
 pub fn set_task_count_fn(f: TaskCountFn) {
     *TASK_COUNT_FN.lock() = Some(f);
-}
-
-/// Live tasks, or `0` when the scheduler has not registered the callback yet.
-pub(crate) fn task_total() -> usize {
-    match *TASK_COUNT_FN.lock() {
-        Some(count) => count(),
-        None => 0,
-    }
 }
 
 /// Set the current dense CPU index callback. Called once by kernel init.

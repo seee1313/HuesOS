@@ -687,7 +687,24 @@ fn run() -> i32 {
             // would otherwise be protected: it reports the layout it *would*
             // write together with the warning that the real run needs --force.
             let mut note = String::new();
-            if let Some(volume) = probe_raw_hxfs(&io) {
+            if let Ok(existing) = GptDisk::read_from(&io) {
+                let active_count = existing.active_partitions().len();
+                if active_count > 0 {
+                    if !force && !dry_run {
+                        return fail_msg(&format!(
+                            "refusing to overwrite existing GPT ({} partition(s)) at {}; pass --force to erase it",
+                            active_count,
+                            target.unwrap_or("the block device")
+                        ));
+                    }
+                    if dry_run {
+                        note = format!(
+                            "warning=existing GPT ({} partition(s)) detected, the real run needs --force\n",
+                            active_count
+                        );
+                    }
+                }
+            } else if let Some(volume) = probe_raw_hxfs(&io) {
                 if !force && !dry_run {
                     return fail_msg(&format!(
                         "refusing to overwrite {} ({}) at {}: no GPT, the whole device is the filesystem; pass --force to erase it",

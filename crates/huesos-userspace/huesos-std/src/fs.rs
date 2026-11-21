@@ -34,6 +34,8 @@ pub enum EntryKind {
     File,
     /// A directory.
     Dir,
+    /// A symbolic link.
+    Symlink,
     /// Neither, or a kind this build does not know.
     Other,
 }
@@ -44,6 +46,17 @@ impl EntryKind {
         match text {
             "file" => Self::File,
             "dir" => Self::Dir,
+            "symlink" => Self::Symlink,
+            _ => Self::Other,
+        }
+    }
+
+    /// Parse the HxFS `OBJECT_TYPE_*` discriminant returned by `stat_path`.
+    pub fn from_object_type(object_type: u32) -> Self {
+        match object_type {
+            1 => Self::File,
+            2 => Self::Dir,
+            3 => Self::Symlink,
             _ => Self::Other,
         }
     }
@@ -100,6 +113,26 @@ pub fn is_available() -> bool {
     service().is_some() || directory().is_some()
 }
 
+fn walk_scoped_parent<'a>(
+    root: &HxfsDirectory,
+    relative: &'a str,
+) -> Result<(Option<HxfsDirectory>, &'a str)> {
+    let mut parts = relative.split('/').filter(|seg| !seg.is_empty());
+    let Some(mut cur_seg) = parts.next() else {
+        return Err(Error::new(ErrorKind::InvalidInput));
+    };
+    let mut current_dir: Option<HxfsDirectory> = None;
+    for next_seg in parts {
+        let next_dir = match &current_dir {
+            Some(dir) => dir.open_dir(cur_seg).map_err(Error::from)?,
+            None => root.open_dir(cur_seg).map_err(Error::from)?,
+        };
+        current_dir = Some(next_dir);
+        cur_seg = next_seg;
+    }
+    Ok((current_dir, cur_seg))
+}
+
 fn open_file(path: &str, create: bool) -> Result<HxfsFile> {
     let normalized = path::normalize(path);
     if let Some(service) = service() {
@@ -116,10 +149,12 @@ fn open_file(path: &str, create: bool) -> Result<HxfsFile> {
         if relative.is_empty() {
             return Err(Error::new(ErrorKind::InvalidInput));
         }
+        let (parent_opt, leaf) = walk_scoped_parent(root, relative)?;
+        let parent = parent_opt.as_ref().unwrap_or(root);
         return if create {
-            root.create_file(relative)
+            parent.create_file(leaf)
         } else {
-            root.open_file(relative)
+            parent.open_file(leaf)
         }
         .map_err(Error::from);
     }
@@ -143,7 +178,9 @@ fn open_dir(path: &str) -> Result<HxfsDirectory> {
             let handle = root.channel().handle().duplicate(rights)?;
             return Ok(HxfsDirectory::from_channel(Channel::from_handle(handle)));
         }
-        return root.open_dir(relative).map_err(Error::from);
+        let (parent_opt, leaf) = walk_scoped_parent(root, relative)?;
+        let parent = parent_opt.as_ref().unwrap_or(root);
+        return parent.open_dir(leaf).map_err(Error::from);
     }
     Err(Error::capability())
 }
@@ -209,9 +246,10 @@ impl File {
 
     /// Write at the cursor and advance it.
     pub fn write(&mut self, buf: &[u8]) -> Result<usize> {
+        let cap = buf.len().min(huesos_abi::hxfs::HXFS_MAX_INLINE_WRITE_BYTES);
         let written = self
             .inner
-            .write_at(self.position, buf)
+            .write_at(self.position, &buf[..cap])
             .map_err(Error::from)?;
         self.position += written as u64;
         Ok(written)
@@ -331,33 +369,32 @@ impl OpenOptions {
         if self.truncate && !self.write {
             return Err(Error::new(ErrorKind::InvalidInput));
         }
-        let exists = self.create_new
-            && match File::open(path) {
-                Ok(file) => {
-                    drop(file);
-                    true
-                }
+        if self.create_new {
+            let mut file = match open_file(path, true) {
+                Ok(file) => File::wrap(file),
                 Err(error) => {
-                    if error.kind() != ErrorKind::NotFound {
-                        return Err(error);
+                    if error.kind() == ErrorKind::InvalidInput && exists(path) {
+                        return Err(Error::new(ErrorKind::AlreadyExists));
                     }
-                    false
+                    return Err(error);
                 }
             };
-        if exists {
-            return Err(Error::new(ErrorKind::AlreadyExists));
-        }
-        let create = self.create || self.create_new;
-        let mut file = match open_file(path, create) {
-            Ok(file) => File::wrap(file),
-            Err(error) => {
-                // A `create_new` whose target appeared between the probe and
-                // the create reports the race as "already exists".
-                if self.create_new && error.kind() != ErrorKind::NotFound {
-                    return Err(Error::new(ErrorKind::AlreadyExists));
-                }
-                return Err(error);
+            if self.append {
+                let end = file.size()?;
+                let _ = file.seek(SeekFrom::Start(end))?;
             }
+            return Ok(file);
+        }
+        let mut file = if self.create {
+            match open_file(path, false) {
+                Ok(file) => File::wrap(file),
+                Err(error) if error.kind() == ErrorKind::NotFound => {
+                    File::wrap(open_file(path, true)?)
+                }
+                Err(error) => return Err(error),
+            }
+        } else {
+            File::wrap(open_file(path, false)?)
         };
         if self.truncate {
             file.set_len(0)?;
@@ -383,12 +420,18 @@ impl File {
 }
 
 /// What a path names, without opening it for I/O.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Metadata {
+    /// Persistent object identifier (`0` if unknown).
+    pub object_id: u64,
     /// File size in bytes; `0` for a directory.
     pub len: u64,
-    /// File or directory.
+    /// File, directory, or symbolic link.
     pub kind: EntryKind,
+    /// POSIX mode bits (12-bit `0o7777`).
+    pub mode: u32,
+    /// Last modification timestamp in nanoseconds.
+    pub modified_unix_ns: i64,
 }
 
 impl Metadata {
@@ -402,9 +445,19 @@ impl Metadata {
         matches!(self.kind, EntryKind::File)
     }
 
+    /// True for a symbolic link.
+    pub fn is_symlink(&self) -> bool {
+        matches!(self.kind, EntryKind::Symlink)
+    }
+
     /// Size in bytes.
     pub fn len(&self) -> u64 {
         self.len
+    }
+
+    /// POSIX mode bits (`0o7777`).
+    pub fn mode(&self) -> u32 {
+        self.mode
     }
 
     /// True when the object is empty.
@@ -413,29 +466,40 @@ impl Metadata {
     }
 }
 
-/// Look up `path` without opening it for reading, and report its kind and size.
+/// Look up `path` following symlinks (`stat`), and report its metadata.
 pub fn metadata(path: &str) -> Result<Metadata> {
-    let normalized = path::normalize(path);
-    // A directory lists itself; a file reports its own length. The service has
-    // no `stat`, so this is "try the cheap operations in order".
-    if let Ok(file) = open_file(&normalized, false) {
-        let len = file.size().map_err(Error::from)?;
-        return Ok(Metadata {
-            len,
-            kind: EntryKind::File,
-        });
-    }
-    if let Ok(dir) = open_dir(&normalized) {
-        drop(dir);
-        return Ok(Metadata {
-            len: 0,
-            kind: EntryKind::Dir,
-        });
-    }
-    Err(Error::new(ErrorKind::NotFound))
+    metadata_inner(path, true)
 }
 
-/// True when `path` exists.
+/// Look up `path` without following a final symlink (`lstat`), and report its metadata.
+pub fn symlink_metadata(path: &str) -> Result<Metadata> {
+    metadata_inner(path, false)
+}
+
+fn metadata_inner(path: &str, follow_final: bool) -> Result<Metadata> {
+    let raw = if let Some(service) = service() {
+        let normalized = path::normalize(path);
+        service
+            .stat_path(&normalized, follow_final)
+            .map_err(Error::from)?
+    } else if let Some(root) = directory() {
+        let normalized = path::normalize(path);
+        let rel = path::relative(&normalized);
+        let target = if rel.is_empty() { "." } else { rel };
+        root.stat_path(target, follow_final).map_err(Error::from)?
+    } else {
+        return Err(Error::capability());
+    };
+    Ok(Metadata {
+        object_id: raw.object_id,
+        len: raw.size,
+        kind: EntryKind::from_object_type(raw.object_type),
+        mode: raw.mode,
+        modified_unix_ns: raw.modified_unix_ns,
+    })
+}
+
+/// True when `path` exists (following symlinks).
 pub fn exists(path: &str) -> bool {
     metadata(path).is_ok()
 }
@@ -535,12 +599,14 @@ pub fn create_dir(path: &str) -> Result<HxfsDirectory> {
         if relative.is_empty() {
             return Err(Error::new(ErrorKind::InvalidInput));
         }
-        return root.mkdir(relative).map_err(Error::from);
+        let (parent_opt, leaf) = walk_scoped_parent(root, relative)?;
+        let parent = parent_opt.as_ref().unwrap_or(root);
+        return parent.mkdir(leaf).map_err(Error::from);
     }
     Err(Error::capability())
 }
 
-/// Remove a file.
+/// Remove a file or empty directory.
 pub fn remove(path: &str) -> Result<()> {
     let normalized = path::normalize(path);
     if let Some(service) = service() {
@@ -551,7 +617,106 @@ pub fn remove(path: &str) -> Result<()> {
         if relative.is_empty() {
             return Err(Error::new(ErrorKind::InvalidInput));
         }
-        return root.unlink(relative).map_err(Error::from);
+        let (parent_opt, leaf) = walk_scoped_parent(root, relative)?;
+        let parent = parent_opt.as_ref().unwrap_or(root);
+        return parent.unlink(leaf).map_err(Error::from);
+    }
+    Err(Error::capability())
+}
+
+/// Rename a file, directory, or symlink within the granted namespace.
+pub fn rename(from: &str, to: &str) -> Result<()> {
+    let from_norm = path::normalize(from);
+    let to_norm = path::normalize(to);
+    if let Some(service) = service() {
+        return service.rename(&from_norm, &to_norm).map_err(Error::from);
+    }
+    if let Some(root) = directory() {
+        let from_rel = path::relative(&from_norm);
+        let to_rel = path::relative(&to_norm);
+        if from_rel.is_empty() || to_rel.is_empty() {
+            return Err(Error::new(ErrorKind::InvalidInput));
+        }
+        return root.rename(from_rel, to_rel).map_err(Error::from);
+    }
+    Err(Error::capability())
+}
+
+/// Create a symbolic link at `link_path` pointing to `target`.
+pub fn symlink(target: &str, link_path: &str) -> Result<()> {
+    let norm_link = path::normalize(link_path);
+    if let Some(service) = service() {
+        return service.symlink(&norm_link, target).map_err(Error::from);
+    }
+    if let Some(root) = directory() {
+        let rel_link = path::relative(&norm_link);
+        if rel_link.is_empty() {
+            return Err(Error::new(ErrorKind::InvalidInput));
+        }
+        return root.symlink(rel_link, target).map_err(Error::from);
+    }
+    Err(Error::capability())
+}
+
+/// Read the target of a symbolic link.
+pub fn read_link(path: &str) -> Result<String> {
+    let mut buf = [0u8; huesos_abi::hxfs::HXFS_MAX_PATH_BYTES];
+    if let Some(service) = service() {
+        let normalized = path::normalize(path);
+        let s = service
+            .readlink(&normalized, &mut buf)
+            .map_err(Error::from)?;
+        return Ok(String::from(s));
+    }
+    if let Some(root) = directory() {
+        let normalized = path::normalize(path);
+        let rel = path::relative(&normalized);
+        if rel.is_empty() {
+            return Err(Error::new(ErrorKind::InvalidInput));
+        }
+        let s = root.readlink(rel, &mut buf).map_err(Error::from)?;
+        return Ok(String::from(s));
+    }
+    Err(Error::capability())
+}
+
+/// Update POSIX mode bits (`0o7777`) on `path`.
+pub fn set_permissions(path: &str, mode: u32) -> Result<()> {
+    if let Some(service) = service() {
+        let normalized = path::normalize(path);
+        return service
+            .set_attr(&normalized, Some(mode), None, true)
+            .map_err(Error::from);
+    }
+    if let Some(root) = directory() {
+        let normalized = path::normalize(path);
+        let rel = path::relative(&normalized);
+        let target = if rel.is_empty() { "." } else { rel };
+        return root
+            .set_attr(target, Some(mode), None, true)
+            .map_err(Error::from);
+    }
+    Err(Error::capability())
+}
+
+/// Query filesystem capacity and object statistics (`StatFs`).
+pub fn stat_fs() -> Result<huesos_abi::hxfs::HxfsStatFsInfo> {
+    if let Some(service) = service() {
+        return service.stat_fs().map_err(Error::from);
+    }
+    if let Some(root) = directory() {
+        return root.stat_fs().map_err(Error::from);
+    }
+    Err(Error::capability())
+}
+
+/// Publish any dirty mutations on the volume checkpoint.
+pub fn sync_all() -> Result<()> {
+    if let Some(service) = service() {
+        return service.checkpoint().map_err(Error::from);
+    }
+    if let Some(root) = directory() {
+        return root.fsync().map_err(Error::from);
     }
     Err(Error::capability())
 }

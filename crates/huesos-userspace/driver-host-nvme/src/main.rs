@@ -22,7 +22,9 @@ use huesos_nvme::controller::{Controller, ControllerConfig, NvmeError};
 use huesos_nvme::device::{BarRegion, DeviceResources, DmaRegion};
 use huesos_nvme::pci_transport::PciMmioTransport;
 use huesos_nvme::reliability::{NvmeTelemetry, ResetController, ResetState};
-use libcanvas::{println, Channel, ErrorCode, Handle, Interrupt, Port, Vmo};
+use libcanvas::{
+    println, wait_any, Channel, ErrorCode, Handle, Interrupt, Port, Signals, Vmo, WaitItem,
+};
 
 const REQUIRED_RESOURCES: usize = 3;
 const RESOURCE_LABEL_PREFIX: &[u8] = b"resource:";
@@ -39,7 +41,7 @@ const MMIO_MAP_ADDR: u64 = 0x0000_7000_0000_0000;
 const DMA_MAP_ADDR: u64 = 0x0000_7100_0000_0000;
 const MSI_VECTOR_BASE: u64 = 0xD0;
 const MAX_BOUND_INTERRUPTS: usize = 16;
-const MAX_BLOCK_CLIENTS: usize = 4;
+const MAX_BLOCK_CLIENTS: usize = 16;
 const MAX_CLIENT_BUFFERS: usize = 8;
 const TRANSFER_CHUNK_BYTES: usize = 4096;
 
@@ -402,8 +404,15 @@ pub extern "C" fn _start() -> ! {
         }
         if let Some(runtime) = runtime.as_mut() {
             runtime.poll(&bootstrap);
+            runtime.wait_until_active(&bootstrap, state.gone_port.as_ref(), 2);
+        } else {
+            let items = [WaitItem::new(
+                bootstrap.handle().raw(),
+                Signals::READABLE | Signals::PEER_CLOSED,
+                0,
+            )];
+            let _ = wait_any(&items, 10);
         }
-        libcanvas::process::yield_now();
     }
 }
 
@@ -661,6 +670,30 @@ impl DriverRuntime {
             self.poll_client(index);
             index += 1;
         }
+    }
+
+    fn wait_until_active(&self, bootstrap: &Channel, gone_port: Option<&Port>, timeout_ticks: u64) {
+        let mut items = [WaitItem::new(0, Signals::NONE, 0); 16];
+        let signals = Signals::READABLE | Signals::PEER_CLOSED;
+        items[0] = WaitItem::new(bootstrap.handle().raw(), signals, 0);
+        items[1] = WaitItem::new(
+            self.interrupt_state.port.handle().raw(),
+            Signals::READABLE,
+            1,
+        );
+        let mut count = 2usize;
+        if let Some(port) = gone_port {
+            items[count] = WaitItem::new(port.handle().raw(), Signals::READABLE, 2);
+            count += 1;
+        }
+        for client in self.clients.iter().flatten() {
+            if count >= items.len() {
+                break;
+            }
+            items[count] = WaitItem::new(client.channel.handle().raw(), signals, count as u64);
+            count += 1;
+        }
+        let _ = wait_any(&items[..count], timeout_ticks);
     }
 
     fn poll_bootstrap(&mut self, bootstrap: &Channel) {

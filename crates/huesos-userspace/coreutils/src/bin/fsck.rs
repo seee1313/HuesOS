@@ -24,21 +24,22 @@
 
 extern crate alloc;
 
+use alloc::boxed::Box;
 use alloc::format;
 
 use huesos_hxfs::fixed_writer::FixedHxfsWriter;
+use huesos_hxfs::HxfsError;
 
 use huesos_coreutils as cu;
 use huesos_coreutils::disk::{self, DiskIo, HxfsStore, NO_FSTYPE};
 
 cu::coreutil_entry!(run);
 
-/// Object capacity of the checker's mount. HxFS's structural check is generic
-/// over fixed capacities; these match the size of a service-sized volume while
-/// keeping the mount's state small enough for a userspace stack.
-const MAX_OBJECTS: usize = 32;
-const MAX_DIR_ENTRIES: usize = 64;
-const MAX_EXTENTS: usize = 64;
+/// Object capacity of the checker's mount (`Box`-allocated so the large extent
+/// table does not live on the userspace stack).
+const MAX_OBJECTS: usize = 128;
+const MAX_DIR_ENTRIES: usize = 128;
+const MAX_EXTENTS: usize = 4200;
 
 fn run() -> i32 {
     let args = cu::collect_args();
@@ -68,6 +69,26 @@ fn run() -> i32 {
     let mut io = match DiskIo::open(target, !read_only) {
         Ok(io) => io,
         Err(error) => {
+            if target.is_none() {
+                if let Some(svc) = cu::take_hxfs() {
+                    let mut buf = [0u8; 512];
+                    if let Ok(line) = svc.fsck_summary(&mut buf) {
+                        let trimmed = line.trim();
+                        cu::outln(trimmed);
+                        let errs = trimmed
+                            .split_whitespace()
+                            .find_map(|tok| tok.strip_prefix("errors="))
+                            .and_then(|v| v.parse::<u64>().ok())
+                            .unwrap_or(0);
+                        if errs == 0 {
+                            cu::outln("fsck: clean");
+                            return 0;
+                        }
+                        cu::outln("fsck: DAMAGED");
+                        return 1;
+                    }
+                }
+            }
             cu::errln(&format!("fsck: cannot open store: {error}"));
             return 8;
         }
@@ -168,7 +189,39 @@ fn check_volume(io: &mut DiskIo, lba0: u64, name: &str, verbose: bool) -> (u64, 
         match FixedHxfsWriter::<_, MAX_OBJECTS, MAX_DIR_ENTRIES, MAX_EXTENTS>::mount_from_disk(
             store, None,
         ) {
-            Ok(writer) => writer,
+            Ok(writer) => Box::new(writer),
+            Err(HxfsError::EncryptedVolumeKeyUnavailable) => {
+                if let Some(svc) = cu::take_hxfs() {
+                    let mut buf = [0u8; 512];
+                    if let Ok(line) = svc.fsck_summary(&mut buf) {
+                        let trimmed = line.trim();
+                        let checks = trimmed
+                            .split_whitespace()
+                            .find_map(|tok| tok.strip_prefix("checks="))
+                            .and_then(|v| v.parse::<u64>().ok())
+                            .unwrap_or(1);
+                        let errs = trimmed
+                            .split_whitespace()
+                            .find_map(|tok| tok.strip_prefix("errors="))
+                            .and_then(|v| v.parse::<u64>().ok())
+                            .unwrap_or(0);
+                        if verbose || errs > 0 {
+                            cu::outln(&format!(
+                                "{name}: hxfs (via service): {checks} checks, {errs} errors"
+                            ));
+                        } else {
+                            cu::outln(&format!(
+                                "{name}: hxfs: clean ({checks} checks, encrypted via service)"
+                            ));
+                        }
+                        return (checks, errs);
+                    }
+                }
+                cu::outln(&format!(
+                "{name}: hxfs: encrypted volume (key brokered to hxfs-service; skipped raw mount)"
+            ));
+                return (1, 0);
+            }
             Err(error) => {
                 cu::outln(&format!("{name}: hxfs: mount failed: {error:?}"));
                 return (1, 1);

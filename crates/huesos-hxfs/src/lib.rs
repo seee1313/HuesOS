@@ -583,46 +583,124 @@ impl<R: BlockReader> Hxfs<R> {
         })
     }
 
-    /// Open an absolute path inside the system volume.
+    /// Open an absolute path inside the system volume (following symlinks up to `MAX_SYMLINK_DEPTH`).
     pub fn open_path(&mut self, path: &str) -> Result<FileHandle, HxfsError> {
+        let object = self.resolve_path_with_symlinks(path, true)?;
+        if object.object_type != OBJECT_TYPE_FILE {
+            return Err(HxfsError::WrongType);
+        }
+        Ok(FileHandle {
+            object_id: object.object_id,
+            size: object.size,
+        })
+    }
+
+    /// Read the UTF-8 target of a symlink at `path` (does not follow the final symlink).
+    pub fn readlink_path(&mut self, path: &str, out: &mut [u8]) -> Result<usize, HxfsError> {
+        let object = self.resolve_path_with_symlinks(path, false)?;
+        if object.object_type != OBJECT_TYPE_SYMLINK {
+            return Err(HxfsError::WrongType);
+        }
+        let target_len = usize::try_from(object.size).map_err(|_| HxfsError::OutOfRange)?;
+        if out.len() < target_len {
+            return Err(HxfsError::BufferTooSmall);
+        }
+        out[..target_len].fill(0);
+        self.copy_extents(object, &mut out[..target_len])?;
+        Ok(target_len)
+    }
+
+    fn resolve_path_with_symlinks(
+        &mut self,
+        path: &str,
+        follow_final: bool,
+    ) -> Result<ObjectDescriptor, HxfsError> {
         if path.is_empty() || !path.as_bytes().starts_with(b"/") {
             return Err(HxfsError::BadName);
         }
-        if path == "/" {
-            return Err(HxfsError::WrongType);
+        let trimmed = path.trim_end_matches('/');
+        if trimmed.is_empty() {
+            return self.find_object(self.system_volume.root_object_id);
         }
-        let mut current = self.system_volume.root_object_id;
-        let mut rest = &path.as_bytes()[1..];
-        loop {
-            let slash = rest.iter().position(|&byte| byte == b'/');
-            let (component, tail) = match slash {
-                Some(pos) => (&rest[..pos], &rest[pos + 1..]),
-                None => (rest, &[][..]),
-            };
-            if component.is_empty() || component.len() > MAX_NAME_BYTES {
-                return Err(HxfsError::BadName);
-            }
+        let mut stack = [self.system_volume.root_object_id; 32];
+        let mut stack_len = 1usize;
+        let id =
+            self.walk_ro_components(&mut stack, &mut stack_len, &trimmed[1..], follow_final, 0)?;
+        self.find_object(id)
+    }
+
+    fn walk_ro_components(
+        &mut self,
+        stack: &mut [u64; 32],
+        stack_len: &mut usize,
+        rel: &str,
+        follow_final: bool,
+        depth: u8,
+    ) -> Result<u64, HxfsError> {
+        security_policy::validate_symlink_depth(depth).map_err(|_| HxfsError::BadName)?;
+        let mut parts = rel.split('/').filter(|s| !s.is_empty()).peekable();
+        while let Some(seg) = parts.next() {
+            let is_last = parts.peek().is_none();
+            let current = stack[*stack_len - 1];
             let dir = self.find_object(current)?;
             if dir.object_type != OBJECT_TYPE_DIRECTORY {
                 return Err(HxfsError::WrongType);
             }
-            let next = self.lookup_in_directory(dir, component)?;
-            if tail.is_empty() {
-                let object = self.find_object(next)?;
-                return match object.object_type {
-                    OBJECT_TYPE_FILE => Ok(FileHandle {
-                        object_id: object.object_id,
-                        size: object.size,
-                    }),
-                    OBJECT_TYPE_SYMLINK | OBJECT_TYPE_DIRECTORY | OBJECT_TYPE_BLOB_VIEW => {
-                        Err(HxfsError::WrongType)
-                    }
-                    _ => Err(HxfsError::WrongType),
-                };
+            if seg == "." {
+                continue;
             }
-            current = next;
-            rest = tail;
+            if seg == ".." {
+                if *stack_len > 1 {
+                    *stack_len -= 1;
+                }
+                continue;
+            }
+            if seg.len() > MAX_NAME_BYTES {
+                return Err(HxfsError::BadName);
+            }
+            let next_id = self.lookup_in_directory(dir, seg.as_bytes())?;
+            let next_obj = self.find_object(next_id)?;
+            if next_obj.object_type == OBJECT_TYPE_SYMLINK && (!is_last || follow_final) {
+                security_policy::validate_symlink_depth(depth.saturating_add(1))
+                    .map_err(|_| HxfsError::BadName)?;
+                let target_len =
+                    usize::try_from(next_obj.size).map_err(|_| HxfsError::OutOfRange)?;
+                if target_len == 0 || target_len > huesos_abi::hxfs::HXFS_MAX_PATH_BYTES {
+                    return Err(HxfsError::BadName);
+                }
+                let mut target_buf = [0u8; huesos_abi::hxfs::HXFS_MAX_PATH_BYTES];
+                self.copy_extents(next_obj, &mut target_buf[..target_len])?;
+                let target_str = core::str::from_utf8(&target_buf[..target_len])
+                    .map_err(|_| HxfsError::BadName)?;
+                if target_str.starts_with('/') {
+                    stack[0] = self.system_volume.root_object_id;
+                    *stack_len = 1;
+                }
+                let sym_rel = target_str.trim_matches('/');
+                if !sym_rel.is_empty() {
+                    let resolved = self.walk_ro_components(
+                        stack,
+                        stack_len,
+                        sym_rel,
+                        true,
+                        depth.saturating_add(1),
+                    )?;
+                    stack[*stack_len - 1] = resolved;
+                }
+            } else if !is_last {
+                if next_obj.object_type != OBJECT_TYPE_DIRECTORY {
+                    return Err(HxfsError::WrongType);
+                }
+                if *stack_len >= stack.len() {
+                    return Err(HxfsError::BadName);
+                }
+                stack[*stack_len] = next_id;
+                *stack_len += 1;
+            } else {
+                return Ok(next_id);
+            }
         }
+        Ok(stack[*stack_len - 1])
     }
 
     /// Read a file object into `out`. Returns the number of bytes copied.

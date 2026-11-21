@@ -12,8 +12,17 @@ cu::coreutil_entry!(run);
 
 fn run() -> i32 {
     let args = cu::collect_args();
-    let Some(arg) = args.first() else {
-        cu::errln("usage: stat <path>");
+    let mut follow = true;
+    let mut raw_path: Option<&str> = None;
+    for arg in args.iter() {
+        match arg.as_str() {
+            "-P" | "--no-dereference" => follow = false,
+            "-L" | "--dereference" => follow = true,
+            other => raw_path = Some(other),
+        }
+    }
+    let Some(arg) = raw_path else {
+        cu::errln("usage: stat [-L|-P] <path>");
         return 1;
     };
     let path = cu::normalize_path(arg);
@@ -26,39 +35,33 @@ fn run() -> i32 {
     }
 
     if allow_hxfs {
-        if let Some(svc) = cu::take_hxfs() {
-            if let Ok(file) = svc.open_file(&path) {
-                let sz = file.size().unwrap_or(0);
-                cu::outln("path\tsource\ttype\tsize");
-                cu::outln(&format!("{path}\thxfs\tfile\t{sz}"));
-                return 0;
+        let meta_res = if follow {
+            huesos_std::fs::metadata(&path).or_else(|_| huesos_std::fs::symlink_metadata(&path))
+        } else {
+            huesos_std::fs::symlink_metadata(&path)
+        };
+        if let Ok(meta) = meta_res {
+            cu::outln("path\tsource\ttype\tsize\tmode");
+            let mode_str = format!("0{:03o}", meta.mode() & 0o7777);
+            if meta.is_dir() {
+                cu::outln(&format!("{path}\thxfs\tdir\t-\t{mode_str}"));
+            } else if meta.is_symlink() {
+                cu::outln(&format!(
+                    "{path}\thxfs\tsymlink\t{}\t{mode_str}",
+                    meta.len()
+                ));
+            } else {
+                cu::outln(&format!("{path}\thxfs\tfile\t{}\t{mode_str}", meta.len()));
             }
-            if svc.open_dir(&path).is_ok() {
-                cu::outln("path\tsource\ttype\tsize");
-                cu::outln(&format!("{path}\thxfs\tdir\t-"));
-                return 0;
-            }
-        } else if let Some(dir) = cu::take_hxfs_dir() {
-            let rel = path.trim_start_matches('/');
-            if let Ok(file) = dir.open_file(rel) {
-                let sz = file.size().unwrap_or(0);
-                cu::outln("path\tsource\ttype\tsize");
-                cu::outln(&format!("{path}\thxfs\tfile\t{sz}"));
-                return 0;
-            }
-            if path == "/" || dir.open_dir(rel).is_ok() {
-                cu::outln("path\tsource\ttype\tsize");
-                cu::outln(&format!("{path}\thxfs\tdir\t-"));
-                return 0;
-            }
+            return 0;
         }
     }
 
     if let Some(vmo) = cu::take_bootfs() {
         for (bpath, _off, len) in cu::iter_bootfs_entries(&vmo) {
             if bpath == path {
-                cu::outln("path\tsource\ttype\tsize");
-                cu::outln(&format!("{path}\tbootfs\tfile\t{len}"));
+                cu::outln("path\tsource\ttype\tsize\tmode");
+                cu::outln(&format!("{path}\tbootfs\tfile\t{len}\t0644"));
                 return 0;
             }
         }

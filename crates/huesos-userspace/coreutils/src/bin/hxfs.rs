@@ -19,10 +19,14 @@ fn run() -> i32 {
         "status" => cmd_status(),
         "stats" => cmd_stats(),
         "scrub" => cmd_scrub(),
-        "snapshot" | "sync" | "checkpoint" => cmd_sync(),
+        "fsck" => cmd_fsck(),
+        "snapshot" | "snap" => cmd_snapshot(&args[1..]),
+        "sync" | "checkpoint" => cmd_sync(),
         "gc" => cmd_gc(),
         _ => {
-            cu::errln("usage: hxfs <status|stats|scrub|snapshot|sync|gc>");
+            cu::errln(
+                "usage: hxfs <status|stats|scrub|fsck|snapshot [list|create <name>|delete <name>]|sync|gc>",
+            );
             1
         }
     }
@@ -75,7 +79,16 @@ fn cmd_stats() -> i32 {
     let hxfs_dir = cu::take_hxfs_dir();
     cu::outln("metric\tvalue");
     if let Some(svc) = hxfs.as_ref() {
-        if let Ok((root_id, seq)) = svc.volume_info() {
+        if let Ok(sf) = svc.stat_fs() {
+            cu::outln(&format!("block_size\t{}", sf.block_size));
+            cu::outln(&format!("total_blocks\t{}", sf.total_blocks));
+            cu::outln(&format!("used_blocks\t{}", sf.used_blocks));
+            cu::outln(&format!("avail_blocks\t{}", sf.avail_blocks));
+            cu::outln(&format!("used_objects\t{}", sf.used_objects));
+            cu::outln(&format!("total_objects\t{}", sf.total_objects));
+            cu::outln(&format!("checkpoint_seq\t{}", sf.checkpoint_seq));
+            cu::outln(&format!("format_version\t{}", sf.format_version));
+        } else if let Ok((root_id, seq)) = svc.volume_info() {
             cu::outln(&format!("root_object_id\t{root_id}"));
             cu::outln(&format!("checkpoint_seq\t{seq}"));
         }
@@ -109,15 +122,18 @@ fn cmd_scrub() -> i32 {
     if let Err(code) = cu::check_hxfs_ro() {
         return code;
     }
-    let hxfs = cu::take_hxfs();
+    if let Some(svc) = cu::take_hxfs() {
+        let mut buf = [0u8; 512];
+        if let Ok(line) = svc.scrub_summary(&mut buf) {
+            let trimmed = line.trim();
+            cu::outln(trimmed);
+            let errors = parse_kv_u64(trimmed, "errors=").unwrap_or(0);
+            return if errors == 0 { 0 } else { 1 };
+        }
+    }
     let hxfs_dir = cu::take_hxfs_dir();
-    // `root()` hands back an owned handle the caller owns; a scoped handle is
-    // the subtree root itself and is only borrowed for the listing below.
-    let owned_root = hxfs.and_then(|svc| svc.root().ok());
-    let dir_opt = owned_root.as_ref().or(hxfs_dir);
-
     cu::outln("entry\tkind\tverify");
-    let Some(dir) = dir_opt else {
+    let Some(dir) = hxfs_dir else {
         cu::outln("volume\tstatus\toffline");
         return 0;
     };
@@ -149,6 +165,138 @@ fn cmd_scrub() -> i32 {
         }
     }
     0
+}
+
+fn cmd_fsck() -> i32 {
+    if let Err(code) = cu::check_hxfs_ro() {
+        return code;
+    }
+    let Some(svc) = cu::take_hxfs() else {
+        cu::errln("hxfs fsck: service capability required");
+        return 1;
+    };
+    let mut buf = [0u8; 512];
+    match svc.fsck_summary(&mut buf) {
+        Ok(line) => {
+            let trimmed = line.trim();
+            cu::outln(trimmed);
+            let errors = parse_kv_u64(trimmed, "errors=").unwrap_or(0);
+            if errors == 0 {
+                0
+            } else {
+                1
+            }
+        }
+        Err(e) => {
+            cu::errln(&format!("hxfs fsck failed: {}", e.as_str()));
+            1
+        }
+    }
+}
+
+fn cmd_snapshot(args: &[String]) -> i32 {
+    let action = args.first().map(String::as_str).unwrap_or("list");
+    match action {
+        "list" | "ls" => {
+            if let Err(code) = cu::check_hxfs_ro() {
+                return code;
+            }
+            let Some(svc) = cu::take_hxfs() else {
+                cu::errln("hxfs snapshot: service capability required");
+                return 1;
+            };
+            let mut buf = [0u8; 2048];
+            match svc.list_snapshots(&mut buf) {
+                Ok(text) => {
+                    cu::outln("name\tseq\tlba");
+                    for line in text.lines() {
+                        let line = line.trim();
+                        if line.is_empty() {
+                            continue;
+                        }
+                        let mut parts = line.split('\t');
+                        let name = parts.next().unwrap_or("-");
+                        let seq = parts
+                            .next()
+                            .and_then(|p| p.strip_prefix("seq="))
+                            .unwrap_or("-");
+                        let lba = parts
+                            .next()
+                            .and_then(|p| p.strip_prefix("lba="))
+                            .unwrap_or("-");
+                        cu::outln(&format!("{name}\t{seq}\t{lba}"));
+                    }
+                    0
+                }
+                Err(e) => {
+                    cu::errln(&format!("hxfs snapshot list failed: {}", e.as_str()));
+                    1
+                }
+            }
+        }
+        "create" | "add" => {
+            if let Err(code) = cu::check_hxfs_rw() {
+                return code;
+            }
+            let Some(name) = args.get(1) else {
+                cu::errln("usage: hxfs snapshot create <name>");
+                return 1;
+            };
+            let Some(svc) = cu::take_hxfs() else {
+                cu::errln("hxfs snapshot: service offline");
+                return 1;
+            };
+            match svc.create_snapshot(name) {
+                Ok(seq) => {
+                    cu::outln("property\tvalue");
+                    cu::outln(&format!("snapshot\t{name}"));
+                    cu::outln(&format!("checkpoint_seq\t{seq}"));
+                    0
+                }
+                Err(e) => {
+                    cu::errln(&format!(
+                        "hxfs snapshot create '{name}' failed: {}",
+                        e.as_str()
+                    ));
+                    1
+                }
+            }
+        }
+        "delete" | "rm" | "remove" => {
+            if let Err(code) = cu::check_hxfs_rw() {
+                return code;
+            }
+            let Some(name) = args.get(1) else {
+                cu::errln("usage: hxfs snapshot delete <name>");
+                return 1;
+            };
+            let Some(svc) = cu::take_hxfs() else {
+                cu::errln("hxfs snapshot: service offline");
+                return 1;
+            };
+            match svc.delete_snapshot(name) {
+                Ok(()) => {
+                    cu::outln("property\tvalue");
+                    cu::outln(&format!("deleted_snapshot\t{name}"));
+                    0
+                }
+                Err(e) => {
+                    cu::errln(&format!(
+                        "hxfs snapshot delete '{name}' failed: {}",
+                        e.as_str()
+                    ));
+                    1
+                }
+            }
+        }
+        _ => cmd_sync(),
+    }
+}
+
+fn parse_kv_u64(line: &str, key: &str) -> Option<u64> {
+    line.split_whitespace()
+        .find_map(|tok| tok.strip_prefix(key))
+        .and_then(|v| v.parse::<u64>().ok())
 }
 
 fn cmd_sync() -> i32 {

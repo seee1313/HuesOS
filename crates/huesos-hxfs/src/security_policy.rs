@@ -48,12 +48,16 @@ pub enum PathMode {
 /// Required rights for an operation on a handle kind.
 pub fn required_rights(op: HxfsOp, kind: HxfsHandleKind) -> Result<u64, SecurityError> {
     match op {
-        HxfsOp::GetInfo => Ok(0),
+        HxfsOp::GetInfo | HxfsOp::StatFs => Ok(0),
         HxfsOp::OpenRoot => match kind {
             HxfsHandleKind::None | HxfsHandleKind::Volume => Ok(rights::READ),
             _ => Err(SecurityError::WrongKind),
         },
-        HxfsOp::OpenPath | HxfsOp::ReadAt | HxfsOp::ListDirectory => Ok(rights::READ),
+        HxfsOp::OpenPath
+        | HxfsOp::ReadAt
+        | HxfsOp::ListDirectory
+        | HxfsOp::StatPath
+        | HxfsOp::ReadLink => Ok(rights::READ),
         HxfsOp::CreateFile | HxfsOp::Mkdir | HxfsOp::Symlink => match kind {
             HxfsHandleKind::Directory | HxfsHandleKind::Volume | HxfsHandleKind::None => {
                 Ok(rights::CREATE)
@@ -64,6 +68,13 @@ pub fn required_rights(op: HxfsOp, kind: HxfsHandleKind) -> Result<u64, Security
             HxfsHandleKind::Directory | HxfsHandleKind::Volume | HxfsHandleKind::None => {
                 Ok(rights::MODIFY_DIRECTORY)
             }
+            _ => Err(SecurityError::WrongKind),
+        },
+        HxfsOp::SetAttr => match kind {
+            HxfsHandleKind::Directory
+            | HxfsHandleKind::Volume
+            | HxfsHandleKind::None
+            | HxfsHandleKind::File => Ok(rights::MODIFY_DIRECTORY),
             _ => Err(SecurityError::WrongKind),
         },
         HxfsOp::Truncate | HxfsOp::WriteAt => match kind {

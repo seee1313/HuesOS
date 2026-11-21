@@ -72,7 +72,11 @@ impl Parker {
             return;
         }
         let sequence = self.sequence.load(Ordering::Acquire);
+        if self.permit.swap(false, Ordering::Acquire) {
+            return;
+        }
         let _ = libcanvas::futex::wait(&self.sequence, sequence, timeout.as_ticks_ceil());
+        let _ = self.permit.swap(false, Ordering::Acquire);
     }
 
     fn unpark(&self) {
@@ -277,11 +281,11 @@ where
 
 /// Block the calling thread for `duration` (at least one scheduler tick).
 pub fn sleep(duration: Duration) {
-    static SLEEP_WORD: AtomicU32 = AtomicU32::new(0);
-    // A private futex word with no waker: the wait always runs to its timeout,
-    // which is exactly what "sleep" means, and the thread is parked in the
-    // scheduler rather than spinning.
-    let _ = libcanvas::futex::wait(&SLEEP_WORD, 0, duration.as_ticks_ceil().max(1));
+    let sleep_word = AtomicU32::new(0);
+    // A stack-local futex word with no waker: each sleeping thread owns a
+    // distinct address so concurrent sleepers never contend on one waitqueue,
+    // and the thread parks cleanly in the scheduler until the timer fires.
+    let _ = libcanvas::futex::wait(&sleep_word, 0, duration.as_ticks_ceil().max(1));
 }
 
 /// Give the scheduler a chance to run another thread.

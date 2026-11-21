@@ -607,17 +607,11 @@ fn finish_dynamic_launch(
         None => None,
     };
     let hxfs_svc_dup = match caps.hxfs_service {
-        Some(ch) => Some(
-            ch.handle()
-                .duplicate(rights::READ | rights::WRITE | rights::TRANSFER)?,
-        ),
+        Some(ch) => Some(ch.handle().duplicate(rights::SAME_RIGHTS)?),
         None => None,
     };
     let block_dev_dup = match caps.block_dev {
-        Some(ch) => Some(
-            ch.handle()
-                .duplicate(rights::READ | rights::WRITE | rights::TRANSFER)?,
-        ),
+        Some(ch) => Some(ch.handle().duplicate(rights::SAME_RIGHTS)?),
         None => None,
     };
     let frame_draw_dup = match caps.frame_draw {
@@ -625,10 +619,7 @@ fn finish_dynamic_launch(
         None => None,
     };
     let registry_dup = match caps.registry {
-        Some(ch) => Some(
-            ch.handle()
-                .duplicate(rights::READ | rights::WRITE | rights::TRANSFER)?,
-        ),
+        Some(ch) => Some(ch.handle().duplicate(rights::SAME_RIGHTS)?),
         None => None,
     };
 

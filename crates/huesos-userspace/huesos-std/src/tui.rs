@@ -457,18 +457,20 @@ pub fn read_key_timeout(timeout: crate::time::Duration) -> Option<Key> {
     }
 }
 
-fn decode_key<R: Read>(input: &mut R, first: u8) -> Key {
+fn decode_key<R: Read>(_input: &mut R, first: u8) -> Key {
     match first {
         0x1b => {
-            // A bare Escape has nothing after it; an arrow key is `ESC [ X`
-            // (or `ESC O X` on some consoles).
-            let Some(second) = read_byte(input) else {
+            // A bare Escape has nothing immediately following it; an arrow or
+            // navigation key arrives as `ESC [ X` (either in one channel packet
+            // buffered inside `Stdio` or within 1–2 ticks). Using a short
+            // timeout avoids blocking forever when the user presses Esc alone.
+            let Some(second) = read_escape_byte() else {
                 return Key::Escape;
             };
             if second != b'[' && second != b'O' {
                 return Key::Escape;
             }
-            let Some(third) = read_byte(input) else {
+            let Some(third) = read_escape_byte() else {
                 return Key::Escape;
             };
             match third {
@@ -481,7 +483,7 @@ fn decode_key<R: Read>(input: &mut R, first: u8) -> Key {
                 b'1' | b'2' | b'3' | b'4' | b'5' | b'6' | b'7' | b'8' => {
                     // `ESC [ <n> ~` ends with a tilde; anything else after the
                     // digit means the sequence is not one we know.
-                    let _ = read_byte(input);
+                    let _ = read_escape_byte();
                     match third {
                         b'1' => Key::Home,
                         b'3' => Key::Delete,
@@ -504,9 +506,10 @@ fn decode_key<R: Read>(input: &mut R, first: u8) -> Key {
     }
 }
 
-fn read_byte<R: Read>(input: &mut R) -> Option<u8> {
+fn read_escape_byte() -> Option<u8> {
+    let mut stdin = io::stdin();
     let mut byte = [0u8; 1];
-    match input.read(&mut byte) {
+    match stdin.read_timeout(&mut byte, crate::time::Duration::from_ticks(2)) {
         Ok(1) => Some(byte[0]),
         _ => None,
     }

@@ -17,7 +17,7 @@ pub mod parser;
 pub mod value;
 
 pub use ast::{BootfsAccess, CapsSpec, ChainOp, CmpOp, DirGrant, FbAccess, HxfsAccess, Stmt};
-pub use eval::{EvalAction, EvalResult, ExecOutcome, ShellEnv, ShellHost};
+pub use eval::{EvalAction, EvalResult, ExecOutcome, HostPathKind, ShellEnv, ShellHost};
 pub use lexer::{highlight_line, HighlightKind, HighlightSpan};
 pub use parser::{parse_script, ParseError};
 pub use value::{Table, Value};
@@ -61,6 +61,7 @@ mod tests {
                 "cls" => ExecOutcome {
                     status: 0,
                     output: Value::Empty,
+                    stderr: String::new(),
                     clear_screen: true,
                     exit_requested: false,
                     child_pid: None,
@@ -83,15 +84,27 @@ mod tests {
                     ExecOutcome {
                         status: 0,
                         output: tbl,
+                        stderr: String::new(),
                         clear_screen: false,
                         exit_requested: false,
                         child_pid: Some(42),
                     }
                 }
                 "argcheck" => ExecOutcome::ok_text(format!("argc={}", args.len())),
-                "cat_stdin" => {
-                    ExecOutcome::ok_text(stdin.map(Value::into_text).unwrap_or_default())
-                }
+                "cat_stdin" => ExecOutcome::ok_text(
+                    stdin
+                        .map(Value::into_text)
+                        .unwrap_or_default()
+                        .trim_end_matches('\n'),
+                ),
+                "warn_cmd" => ExecOutcome {
+                    status: 0,
+                    output: Value::Text(String::from("out-line")),
+                    stderr: String::from("err-line"),
+                    clear_screen: false,
+                    exit_requested: false,
+                    child_pid: None,
+                },
                 _ => ExecOutcome::err(127, format!("unknown command: {name}")),
             }
         }
@@ -103,6 +116,46 @@ mod tests {
             }
             entry.extend_from_slice(data);
             Ok(())
+        }
+
+        fn read_file(&mut self, path: &str) -> Result<Vec<u8>, String> {
+            self.files
+                .get(path)
+                .cloned()
+                .ok_or_else(|| format!("not found: {path}"))
+        }
+
+        fn stat_path(&mut self, path: &str, _follow: bool) -> Option<(HostPathKind, u64)> {
+            if let Some(bytes) = self.files.get(path) {
+                return Some((HostPathKind::File, bytes.len() as u64));
+            }
+            let prefix = if path == "/" {
+                String::from("/")
+            } else {
+                format!("{path}/")
+            };
+            if self.files.keys().any(|k| k.starts_with(&prefix)) {
+                return Some((HostPathKind::Dir, 0));
+            }
+            None
+        }
+
+        fn list_dir(&mut self, dir: &str) -> Vec<String> {
+            let prefix = if dir == "/" || dir == "." {
+                String::from("/")
+            } else {
+                format!("{}/", dir.trim_end_matches('/'))
+            };
+            let mut out = Vec::new();
+            for k in self.files.keys() {
+                if let Some(rest) = k.strip_prefix(&prefix) {
+                    let leaf = rest.split('/').next().unwrap_or("");
+                    if !leaf.is_empty() && !out.iter().any(|x| x == leaf) {
+                        out.push(String::from(leaf));
+                    }
+                }
+            }
+            out
         }
     }
 
@@ -237,5 +290,105 @@ mod tests {
             })
         );
         assert_eq!(caps.to_caps_mask(), huesos_abi::auxv::caps_mask::HXFS_RO);
+    }
+
+    #[test]
+    fn test_while_break_continue_arith_and_elif() {
+        let mut env = ShellEnv::new();
+        let mut host = MockHost::new();
+        let script = r#"
+            let i = 0
+            let sum = 0
+            while $i < 10 {
+                i = $((i + 1))
+                if $((i % 2)) == 0 {
+                    continue
+                } elif $i > 7 {
+                    break
+                } else {
+                    sum = $((sum + i))
+                }
+            }
+            echo "sum=$sum i=$i"
+        "#;
+        let Ok(res) = env.eval_script(script, &mut host) else {
+            assert!(false, "eval while/arith/elif");
+            return;
+        };
+        assert_eq!(res.render_text(), "sum=16 i=9");
+    }
+
+    #[test]
+    fn test_fn_local_scoping_and_positional_args() {
+        let mut env = ShellEnv::new();
+        let mut host = MockHost::new();
+        let script = r#"
+            let x = "outer"
+            fn demo(a) {
+                let x = "inner"
+                echo "argc=$# arg1=$1 arg2=$2 x=$x"
+            }
+            demo alpha beta
+            echo "after=$x"
+        "#;
+        let Ok(res) = env.eval_script(script, &mut host) else {
+            assert!(false, "eval fn scope");
+            return;
+        };
+        assert_eq!(
+            res.render_text(),
+            "argc=2 arg1=alpha arg2=beta x=inner\nafter=outer"
+        );
+    }
+
+    #[test]
+    fn test_test_builtin_negation_globs_and_io_redirects() {
+        let mut env = ShellEnv::new();
+        let mut host = MockHost::new();
+        let script = r#"
+            echo "alpha" > /sub/a.txt
+            echo "beta" > /sub/b.txt
+            echo "skip" > /sub/c.log
+            if [ -f /sub/a.txt ] && [ ! -d /sub/a.txt ] {
+                echo "stat-ok"
+            }
+            echo /sub/*.txt
+            cat_stdin < /sub/b.txt
+            ! false
+            echo "neg_status=$?"
+            warn_cmd 2> /sub/err.log > /sub/out.log
+            cat_stdin < /sub/err.log
+        "#;
+        let Ok(res) = env.eval_script(script, &mut host) else {
+            assert!(false, "eval test/globs/redirects");
+            return;
+        };
+        assert_eq!(
+            res.render_text(),
+            "stat-ok\n/sub/a.txt /sub/b.txt\nbeta\nneg_status=0\nerr-line"
+        );
+    }
+
+    #[test]
+    fn test_top_level_script_positional_args_and_zero() {
+        let mut env = ShellEnv::new();
+        env.set_var("0", Value::Text(String::from("/e2e/run.hsh")));
+        env.set_positional_args(alloc::vec![String::from("first"), String::from("second")]);
+        let mut host = MockHost::new();
+        let script = r#"
+            echo "0=$0 argc=$# 1=$1 2=$2"
+            echo $0:$#:$1:$2:$(echo ok)
+            for item in $@ {
+                echo "arg=$item"
+            }
+        "#;
+        let Ok(res) = env.eval_script(script, &mut host) else {
+            assert!(false, "eval script args");
+            return;
+        };
+        assert_eq!(
+            res.render_text(),
+            "0=/e2e/run.hsh argc=2 1=first 2=second\n/e2e/run.hsh:2:first:second:ok\narg=first\narg=second"
+        );
     }
 }

@@ -11,10 +11,12 @@ use alloc::vec::Vec;
 
 use huesos_abi::auxv::caps_mask;
 use huesos_abi::hxfs::rights as hxfs_rights;
-use huesos_abi::term_ipc::term_to_hsh;
-use huesos_hsh::{CapsSpec, ExecOutcome, FbAccess, HxfsAccess, ShellHost, Table, Value};
+use huesos_abi::term_ipc::{hsh_to_term, put_u16, term_to_hsh, MAX_WRITE_CHUNK};
+use huesos_hsh::{
+    CapsSpec, ExecOutcome, FbAccess, HostPathKind, HxfsAccess, ShellHost, Table, Value,
+};
 use libcanvas::process::{spawn_elf_from_vmo_with_caps, Process, SpawnCaps};
-use libcanvas::{Channel, ErrorCode, Handle, Hxfs, Vmo};
+use libcanvas::{wait_any, Channel, ErrorCode, Handle, Hxfs, Signals, Vmo, WaitItem};
 
 const BOOTFS_HEADER_SIZE: u64 = 16;
 const BOOTFS_ENTRY_SIZE: u64 = 216;
@@ -45,6 +47,9 @@ pub enum DelegatedAction {
 pub struct HshHost {
     pub registry: Option<Channel>,
     pub hxfs: Option<Hxfs>,
+    pub block_dev: Option<Channel>,
+    block_unavailable: bool,
+    hxfs_unavailable: bool,
     pub bootfs: Option<Vmo>,
     pub frame_draw: Option<Handle>,
     pub pwd: String,
@@ -71,6 +76,9 @@ pub struct HshHost {
     /// Polls spent waiting for that deadline, used when the process has no
     /// clock capability and the tick count cannot advance.
     interrupt_polls: u64,
+    /// True when evaluated scripts should stream unpiped foreground commands
+    /// directly to `ipc_out` instead of capturing `EvalAction::Output` in RAM.
+    pub interactive_stream: bool,
     /// Whether the most recent child run ended through the `Ctrl-C` path.
     pub last_child_interrupted: bool,
 }
@@ -109,16 +117,85 @@ fn packet_is_ctrl_c(packet: &[u8]) -> bool {
     key == &[b'k', 1, 3][..] || key == &[0x03u8][..] || key == &b"ctrl-c"[..]
 }
 
+/// Translate a terminal key packet into VT100 stdin bytes for a foreground child.
+fn packet_to_vt100(packet: &[u8]) -> Option<&'static [u8]> {
+    if packet.first() != Some(&term_to_hsh::TAG_KEY_EVENT) || packet.len() < 2 {
+        return None;
+    }
+    let klen = (packet[1] as usize).min(packet.len() - 2);
+    let key = &packet[2..2 + klen];
+    match key {
+        [b'k', 0, _] => None,
+        [b'k', 1, 0x80] => Some(b"\x1b[A"),
+        [b'k', 1, 0x81] => Some(b"\x1b[B"),
+        [b'k', 1, 0x82] => Some(b"\x1b[D"),
+        [b'k', 1, 0x83] => Some(b"\x1b[C"),
+        [b'k', 1, 0x84] => Some(b"\x1b[H"),
+        [b'k', 1, 0x85] => Some(b"\x1b[F"),
+        [b'k', 1, 0x86] => Some(b"\x1b[3~"),
+        [b'k', 1, 0x87] => Some(b"\x1b[5~"),
+        [b'k', 1, 0x88] => Some(b"\x1b[6~"),
+        b"enter" => Some(b"\r"),
+        b"backspace" => Some(b"\x08"),
+        _ => None,
+    }
+}
+
+fn packet_single_byte(packet: &[u8]) -> Option<u8> {
+    if packet.first() != Some(&term_to_hsh::TAG_KEY_EVENT) || packet.len() < 2 {
+        return None;
+    }
+    let klen = (packet[1] as usize).min(packet.len() - 2);
+    let key = &packet[2..2 + klen];
+    match key {
+        [b'k', 1, b'\n'] => Some(b'\r'),
+        [b'k', 1, byte] if *byte <= 0x7f => Some(*byte),
+        [b'c', byte] => Some(*byte),
+        [byte] if *byte <= 0x7f => Some(*byte),
+        _ => None,
+    }
+}
+
+fn command_uses_block_device(resolved: &str) -> bool {
+    let base = resolved.rsplit('/').next().unwrap_or(resolved);
+    let stem = base.strip_suffix(".elf").unwrap_or(base);
+    matches!(
+        stem,
+        "fdisk" | "lsblk" | "df" | "fsck" | "mkfs" | "dd" | "hsh"
+    )
+}
+
+fn command_uses_query_channel(resolved: &str) -> bool {
+    let base = resolved.rsplit('/').next().unwrap_or(resolved);
+    let stem = base.strip_suffix(".elf").unwrap_or(base);
+    matches!(stem, "pci" | "acpi" | "ps" | "btop" | "std_smoke")
+}
+
 impl HshHost {
+    #[allow(dead_code)]
     pub fn new(
         registry: Option<Channel>,
         bootfs: Option<Vmo>,
         frame_draw: Option<Handle>,
         ipc_out: Option<Channel>,
     ) -> Self {
+        Self::new_with_caps(registry, None, None, bootfs, frame_draw, ipc_out)
+    }
+
+    pub fn new_with_caps(
+        registry: Option<Channel>,
+        hxfs_svc: Option<Channel>,
+        block_dev: Option<Channel>,
+        bootfs: Option<Vmo>,
+        frame_draw: Option<Handle>,
+        ipc_out: Option<Channel>,
+    ) -> Self {
         let mut host = Self {
             registry,
-            hxfs: None,
+            hxfs: hxfs_svc.map(Hxfs::from_channel),
+            block_dev,
+            block_unavailable: false,
+            hxfs_unavailable: false,
             bootfs,
             frame_draw,
             pwd: String::from("/"),
@@ -132,6 +209,7 @@ impl HshHost {
             auto_interrupt_after_ticks: 0,
             interrupt_deadline: None,
             interrupt_polls: 0,
+            interactive_stream: false,
             last_child_interrupted: false,
         };
         host.try_connect_hxfs();
@@ -154,7 +232,7 @@ impl HshHost {
     }
 
     pub fn try_connect_hxfs(&mut self) {
-        if self.hxfs.is_some() {
+        if self.hxfs.is_some() || self.hxfs_unavailable || self.ipc_out.is_none() {
             return;
         }
         let Some(reg) = self.registry.as_ref() else {
@@ -171,7 +249,10 @@ impl HshHost {
                     self.hxfs = Some(Hxfs::from_channel(Channel::from_handle(handle)));
                     return;
                 }
-                Ok((n, None)) if buf[..n].starts_with(b"err:hxfs") => return,
+                Ok((n, None)) if buf[..n].starts_with(b"err:hxfs") => {
+                    self.hxfs_unavailable = true;
+                    return;
+                }
                 Ok((_n, Some(handle))) => drop(handle),
                 // A late reply to a different handshake: skip it rather than
                 // failing this one.
@@ -207,6 +288,30 @@ impl HshHost {
     }
 
     fn open_hxfs_channel_fresh(&self) -> Option<Channel> {
+        self.hxfs.as_ref()?;
+        if self.ipc_out.is_none() {
+            if let Some(dup) = self
+                .hxfs
+                .as_ref()
+                .and_then(|hxfs| hxfs.channel().duplicate().ok())
+            {
+                return Some(dup);
+            }
+        }
+        for _ in 0..3 {
+            if let Some(ch) = self.open_hxfs_channel_once() {
+                return Some(ch);
+            }
+            for _ in 0..8 {
+                libcanvas::process::yield_now();
+            }
+        }
+        self.hxfs
+            .as_ref()
+            .and_then(|hxfs| hxfs.channel().duplicate().ok())
+    }
+
+    fn open_hxfs_channel_once(&self) -> Option<Channel> {
         let reg = self.registry.as_ref()?;
         self.drain_registry();
         reg.write(b"open:hxfs").ok()?;
@@ -232,27 +337,37 @@ impl HshHost {
         None
     }
 
-    fn open_block_nvme_fresh(&self) -> Option<Channel> {
-        let reg = self.registry.as_ref()?;
-        self.drain_registry();
-        reg.write(b"open:block:nvme").ok()?;
-        let mut buf = [0u8; 64];
-        for _ in 0..HANDSHAKE_READS {
-            match reg.read_optional_handle_timeout(&mut buf, HANDSHAKE_WAIT_TICKS) {
-                Ok((n, Some(handle))) if &buf[..n] == b"service:block:nvme:channel" => {
-                    return Some(Channel::from_handle(handle));
-                }
-                Ok((n, None)) if buf[..n].starts_with(b"err:block") => return None,
-                Ok((_n, Some(handle))) => drop(handle),
-                // A late reply to a different handshake: skip it rather than
-                // giving up on this one.
-                Ok((_n, None)) => {}
-                // The channel read already waited for a full budget.
-                Err(ErrorCode::ShouldWait) | Err(ErrorCode::TimedOut) => {}
-                Err(_) => return None,
+    fn open_block_nvme_fresh(&mut self) -> Option<Channel> {
+        if self.block_unavailable {
+            return None;
+        }
+        if self.ipc_out.is_none() {
+            if let Some(dup) = self.block_dev.as_ref().and_then(|ch| ch.duplicate().ok()) {
+                return Some(dup);
             }
         }
-        None
+        if let Some(reg) = self.registry.as_ref() {
+            self.drain_registry();
+            if reg.write(b"open:block:nvme").is_ok() {
+                let mut buf = [0u8; 64];
+                for _ in 0..HANDSHAKE_READS {
+                    match reg.read_optional_handle_timeout(&mut buf, HANDSHAKE_WAIT_TICKS) {
+                        Ok((n, Some(handle))) if &buf[..n] == b"service:block:nvme:channel" => {
+                            return Some(Channel::from_handle(handle));
+                        }
+                        Ok((n, None)) if buf[..n].starts_with(b"err:block") => {
+                            self.block_unavailable = true;
+                            break;
+                        }
+                        Ok((_n, Some(handle))) => drop(handle),
+                        Ok((_n, None)) => {}
+                        Err(ErrorCode::ShouldWait) | Err(ErrorCode::TimedOut) => {}
+                        Err(_) => break,
+                    }
+                }
+            }
+        }
+        self.block_dev.as_ref().and_then(|ch| ch.duplicate().ok())
     }
 
     /// Hand the child a fresh DriverManager query channel.
@@ -263,6 +378,9 @@ impl HshHost {
     /// without a registry capability, which would make `pci`/`ps`/`acpi` fail
     /// with "query channel unavailable".
     fn open_query_fresh(&self) -> Option<Channel> {
+        if self.ipc_out.is_none() {
+            return self.registry.as_ref().and_then(|ch| ch.duplicate().ok());
+        }
         for _ in 0..3 {
             if let Some(channel) = self.open_query_once() {
                 return Some(channel);
@@ -494,25 +612,94 @@ impl HshHost {
     /// `hexdump -n 128`, `du -d 1`, `mkfs -s 16M` and
     /// `dd if=/dev/zero bs=512` need, and what `cat welcome.txt` also gets.
     fn resolve_arguments(&self, name: &str, args: &[String]) -> Vec<String> {
+        let base = name.rsplit('/').next().unwrap_or(name);
+        let cmd = base.strip_suffix(".elf").unwrap_or(base);
         /// Tools that take no path arguments at all.
-        const NO_PATH_ARGS: &[&str] = &["hxfs", "pci", "acpi", "ps", "sleep", "schedctl"];
+        const NO_PATH_ARGS: &[&str] = &[
+            "hxfs", "pci", "acpi", "ps", "sleep", "schedctl", "seq", "basename", "dirname",
+        ];
         let mut owned: Vec<String> = Vec::with_capacity(args.len() + 1);
-        if NO_PATH_ARGS.contains(&name) {
+        if NO_PATH_ARGS.contains(&cmd) {
             owned.extend(args.iter().cloned());
             return owned;
         }
-        // `write <path> <data>`: the payload is text, not a path.
-        let path_budget = if name == "write" { 1 } else { usize::MAX };
-        let mut paths_taken = 0usize;
-        let mut skip_value = false;
-        for arg in args {
-            if skip_value {
-                skip_value = false;
-                owned.push(arg.clone());
-                continue;
+        // `ln -s <target> <link>`: the symlink target string is stored verbatim
+        // (relative or absolute), while `<link>` is resolved against `pwd`.
+        if cmd == "ln" {
+            let mut operand_idx = 0usize;
+            for arg in args {
+                if arg.starts_with('-') {
+                    owned.push(arg.clone());
+                } else {
+                    operand_idx += 1;
+                    if operand_idx == 1 {
+                        owned.push(arg.clone());
+                    } else {
+                        owned.push(self.normalize_path(arg));
+                    }
+                }
             }
-            if flag_takes_value(name, arg) {
-                skip_value = true;
+            return owned;
+        }
+        // `chmod [-R] <mode> <path>...`: first non-flag operand is the mode spec.
+        if cmd == "chmod" {
+            let mut mode_seen = false;
+            for arg in args {
+                if arg.starts_with('-') {
+                    owned.push(arg.clone());
+                } else if !mode_seen {
+                    mode_seen = true;
+                    owned.push(arg.clone());
+                } else {
+                    owned.push(self.normalize_path(arg));
+                }
+            }
+            return owned;
+        }
+        // `hsh`: `-c <script> [arg0 arg1 ...]` passes everything verbatim;
+        // `hsh <script_path> [arg1 arg2 ...]` resolves only `<script_path>`.
+        if cmd == "hsh" {
+            if args.first().map(String::as_str) == Some("-c") {
+                owned.extend(args.iter().cloned());
+            } else if let Some((script_path, rest)) = args.split_first() {
+                owned.push(self.normalize_path(script_path));
+                owned.extend(rest.iter().cloned());
+            }
+            return owned;
+        }
+        // `write <path> <data>`: the payload is text, not a path.
+        let path_budget = if cmd == "write" { 1 } else { usize::MAX };
+        let mut paths_taken = 0usize;
+        let mut grep_pattern_seen = false;
+        let mut tar_base: Option<String> = None;
+        let mut skip_kind = FlagValueKind::None;
+        for arg in args {
+            match skip_kind {
+                FlagValueKind::Data => {
+                    skip_kind = FlagValueKind::None;
+                    if cmd == "grep" {
+                        grep_pattern_seen = true;
+                    }
+                    owned.push(arg.clone());
+                    continue;
+                }
+                FlagValueKind::Path => {
+                    skip_kind = FlagValueKind::None;
+                    owned.push(self.normalize_path(arg));
+                    continue;
+                }
+                FlagValueKind::TarDir => {
+                    skip_kind = FlagValueKind::None;
+                    let abs_dir = self.normalize_path(arg);
+                    tar_base = Some(abs_dir.clone());
+                    owned.push(abs_dir);
+                    continue;
+                }
+                FlagValueKind::None => {}
+            }
+            let fk = flag_value_kind(cmd, arg);
+            if fk != FlagValueKind::None {
+                skip_kind = fk;
                 owned.push(arg.clone());
                 continue;
             }
@@ -531,7 +718,16 @@ impl HshHost {
                 }
                 continue;
             }
-            if paths_taken >= path_budget || is_data_word(name, arg) {
+            if cmd == "grep" && !grep_pattern_seen {
+                grep_pattern_seen = true;
+                owned.push(arg.clone());
+                continue;
+            }
+            if cmd == "tar" && !arg.starts_with('/') && (tar_base.is_some() || self.pwd != "/") {
+                owned.push(arg.clone());
+                continue;
+            }
+            if paths_taken >= path_budget || is_data_word(cmd, arg) {
                 owned.push(arg.clone());
                 continue;
             }
@@ -596,6 +792,8 @@ impl HshHost {
         name: &str,
         args: &[String],
         stdin: Option<&Value>,
+        capture_output: bool,
+        separate_stderr: bool,
     ) -> ExecOutcome {
         if self.bootfs.is_none() {
             return ExecOutcome::err(1, "no BOOTFS VMO available for dynamic linker");
@@ -648,10 +846,10 @@ impl HshHost {
                 }
                 svc_holder = self.open_hxfs_channel_fresh();
             }
-            if spec.block_rw {
+            if spec.block_rw && command_uses_block_device(&resolved) {
                 blk_holder = self.open_block_nvme_fresh();
             }
-            if (mask & caps_mask::QUERY_RO) != 0 {
+            if (mask & caps_mask::QUERY_RO) != 0 && command_uses_query_channel(&resolved) {
                 query_holder = self.open_query_fresh();
             }
         } else {
@@ -661,17 +859,32 @@ impl HshHost {
                 }
             }
             svc_holder = self.open_hxfs_channel_fresh();
-            blk_holder = self.open_block_nvme_fresh();
-            query_holder = self.open_query_fresh();
+            if command_uses_block_device(&resolved) {
+                blk_holder = self.open_block_nvme_fresh();
+            }
+            if command_uses_query_channel(&resolved) {
+                query_holder = self.open_query_fresh();
+            }
         }
 
         // Utilities take paths, not a working directory, so path arguments are
         // resolved here. Everything that is *data* -- numbers, sizes, values
         // after a flag that takes one, `key=value` pairs, subcommand words --
         // has to arrive at the tool exactly as it was typed.
-        let mut owned_args = self.resolve_arguments(name, args);
+        // Exception: when `@caps(dir=/sub)` confines the child to a subtree,
+        // non-leading-slash paths stay relative to that granted directory.
+        let dir_confined = caps.is_some_and(|c| c.dir.is_some());
+        let mut owned_args = if dir_confined {
+            args.to_vec()
+        } else {
+            self.resolve_arguments(name, args)
+        };
         if name == "ls" && owned_args.is_empty() {
-            owned_args.push(self.pwd.clone());
+            owned_args.push(if dir_confined {
+                String::from(".")
+            } else {
+                self.pwd.clone()
+            });
         }
 
         let fb_allowed = caps.is_none_or(|c| c.fb == FbAccess::ReadOnly);
@@ -731,7 +944,9 @@ impl HshHost {
             }
         }
 
-        if let Some(in_val) = stdin {
+        let stream_direct = self.interactive_stream && !capture_output && self.ipc_out.is_some();
+
+        let mut live_stdin_w = if let Some(in_val) = stdin {
             let bytes = in_val.to_pipe_bytes();
             let mut cursor = 0usize;
             while cursor < bytes.len() {
@@ -742,11 +957,19 @@ impl HshHost {
                     Err(_) => break,
                 }
             }
-        }
-        drop(stdin_w);
+            drop(stdin_w);
+            None
+        } else if stream_direct {
+            Some(stdin_w)
+        } else {
+            drop(stdin_w);
+            None
+        };
 
         let mut stdout_bytes = Vec::new();
         let mut stderr_bytes = Vec::new();
+        let mut streamed_any = false;
+        let mut last_stream_byte = b'\n';
         let mut out_open = true;
         let mut err_open = true;
         let mut chunk = [0u8; 4096];
@@ -758,35 +981,67 @@ impl HshHost {
         while out_open || err_open {
             let mut progressed = false;
             if out_open {
-                match stdout_r.read_into(&mut chunk) {
-                    Ok(n) => {
-                        stdout_bytes.extend_from_slice(&chunk[..n]);
-                        trim_capture(&mut stdout_bytes);
-                        progressed = true;
+                loop {
+                    match stdout_r.read_into(&mut chunk) {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            progressed = true;
+                            if stream_direct {
+                                self.forward_stream_bytes(None, &chunk[..n]);
+                                streamed_any = true;
+                                last_stream_byte = chunk[n - 1];
+                            } else {
+                                stdout_bytes.extend_from_slice(&chunk[..n]);
+                                trim_capture(&mut stdout_bytes);
+                            }
+                        }
+                        Err(ErrorCode::PeerClosed) => {
+                            out_open = false;
+                            break;
+                        }
+                        Err(ErrorCode::ShouldWait) | Err(ErrorCode::TimedOut) => break,
+                        Err(_) => {
+                            out_open = false;
+                            break;
+                        }
                     }
-                    Err(ErrorCode::PeerClosed) => out_open = false,
-                    Err(ErrorCode::ShouldWait) | Err(ErrorCode::TimedOut) => {}
-                    Err(_) => out_open = false,
                 }
             }
             if err_open {
-                match stderr_r.read_into(&mut chunk) {
-                    Ok(n) => {
-                        stderr_bytes.extend_from_slice(&chunk[..n]);
-                        trim_capture(&mut stderr_bytes);
-                        progressed = true;
+                loop {
+                    match stderr_r.read_into(&mut chunk) {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            progressed = true;
+                            if stream_direct {
+                                self.forward_stream_bytes(Some((255, 110, 110)), &chunk[..n]);
+                                streamed_any = true;
+                                last_stream_byte = chunk[n - 1];
+                            } else {
+                                stderr_bytes.extend_from_slice(&chunk[..n]);
+                                trim_capture(&mut stderr_bytes);
+                            }
+                        }
+                        Err(ErrorCode::PeerClosed) => {
+                            err_open = false;
+                            break;
+                        }
+                        Err(ErrorCode::ShouldWait) | Err(ErrorCode::TimedOut) => break,
+                        Err(_) => {
+                            err_open = false;
+                            break;
+                        }
                     }
-                    Err(ErrorCode::PeerClosed) => err_open = false,
-                    Err(ErrorCode::ShouldWait) | Err(ErrorCode::TimedOut) => {}
-                    Err(_) => err_open = false,
                 }
             }
             // `Ctrl-C` (or the smoke gate's synthetic interrupt) kills the
             // child through the `ProcessTerminate` capability while the shell
-            // stays alive to reap it.
-            if !interrupted && self.poll_child_interrupt(&process) {
+            // stays alive to reap it. In `stream_direct` mode, non-Ctrl-C keys
+            // are forwarded live to the child's `stdin_w` as VT100 sequences.
+            if !interrupted && self.poll_child_input(&process, live_stdin_w.as_ref()) {
                 interrupted = true;
                 self.last_child_interrupted = true;
+                live_stdin_w = None;
                 let now = libcanvas::system::monotonic_ticks().unwrap_or(0);
                 interrupt_deadline = Some(now.saturating_add(300));
             }
@@ -796,10 +1051,43 @@ impl HshHost {
                     break;
                 }
             }
-            if !progressed {
-                libcanvas::process::yield_now();
+            if !progressed
+                && (out_open || err_open)
+                && self.wait_for_child_activity(&stdout_r, out_open, &stderr_r, err_open, &process)
+            {
+                // Child already exited; do one final non-blocking drain of
+                // any already-enqueued bytes and do not wait on pipes that
+                // deferred process teardown has not dropped yet.
+                while let Ok(n) = stdout_r.read_into(&mut chunk) {
+                    if n == 0 {
+                        break;
+                    }
+                    if stream_direct {
+                        self.forward_stream_bytes(None, &chunk[..n]);
+                        streamed_any = true;
+                        last_stream_byte = chunk[n - 1];
+                    } else {
+                        stdout_bytes.extend_from_slice(&chunk[..n]);
+                        trim_capture(&mut stdout_bytes);
+                    }
+                }
+                while let Ok(n) = stderr_r.read_into(&mut chunk) {
+                    if n == 0 {
+                        break;
+                    }
+                    if stream_direct {
+                        self.forward_stream_bytes(Some((255, 110, 110)), &chunk[..n]);
+                        streamed_any = true;
+                        last_stream_byte = chunk[n - 1];
+                    } else {
+                        stderr_bytes.extend_from_slice(&chunk[..n]);
+                        trim_capture(&mut stderr_bytes);
+                    }
+                }
+                break;
             }
         }
+        drop(live_stdin_w);
 
         let exit_code = process.wait_exit().unwrap_or(-1) as i32;
         if self.status_hook.is_some() && self.ipc_out.is_some() {
@@ -807,6 +1095,22 @@ impl HshHost {
             if let (Some(hook), Some(ch)) = (self.status_hook, self.ipc_out.as_ref()) {
                 hook(ch, &self.pwd, "hsh.elf", &caps_txt);
             }
+        }
+
+        if stream_direct {
+            if interrupted {
+                self.forward_stream_bytes(Some((255, 110, 110)), b"\x1b[?25h\x1b[0m\n^C\n");
+            } else if streamed_any && last_stream_byte != b'\n' {
+                self.forward_stream_bytes(None, b"\n");
+            }
+            return ExecOutcome {
+                status: exit_code,
+                output: Value::Empty,
+                stderr: String::new(),
+                clear_screen: false,
+                exit_requested: false,
+                child_pid: Some(pid),
+            };
         }
 
         let mut out_str = String::from_utf8_lossy(&stdout_bytes).into_owned();
@@ -822,44 +1126,125 @@ impl HshHost {
             }
         }
 
-        // A failing child's stdout is usually its report -- `std-smoke` prints
-        // one `[std] FAIL` line per broken invariant to stdout and only a
-        // marker to stderr -- so a non-zero exit keeps both streams. Dropping
-        // stdout here once hid the reason a smoke failed behind a single
-        // stderr line.
-        let combined = format!("{out_str}{err_str}");
+        // When stderr is redirected (`2>` / `2>>`), keep stdout pure and return
+        // `stderr` separately for `ShellEnv` to write into the target file.
+        let text_body = if separate_stderr {
+            out_str.clone()
+        } else {
+            format!("{out_str}{err_str}")
+        };
         let output = if exit_code == 0 {
             match Table::from_tsv(&out_str) {
                 Some(tbl) => Value::Table(tbl),
-                None => Value::Text(combined.trim_end_matches('\n').into()),
+                None => Value::Text(text_body.trim_end_matches('\n').into()),
             }
         } else {
-            Value::Text(combined.trim_end_matches('\n').into())
+            Value::Text(text_body.trim_end_matches('\n').into())
         };
 
         ExecOutcome {
             status: exit_code,
             output,
+            stderr: err_str.trim_end_matches('\n').into(),
             clear_screen: false,
             exit_requested: false,
             child_pid: Some(pid),
         }
     }
 
+    fn forward_stream_bytes(&self, fg: Option<(u8, u8, u8)>, bytes: &[u8]) {
+        let Some(ch) = self.ipc_out.as_ref() else {
+            return;
+        };
+        let (use_fg, r, g, b) = match fg {
+            Some((r, g, b)) => (1u8, r, g, b),
+            None => (0u8, 0, 0, 0),
+        };
+        let mut pos = 0usize;
+        while pos < bytes.len() {
+            let take = (bytes.len() - pos).min(MAX_WRITE_CHUNK);
+            let mut pkt = [0u8; 7 + MAX_WRITE_CHUNK];
+            pkt[0] = hsh_to_term::TAG_WRITE;
+            pkt[1] = use_fg;
+            pkt[2] = r;
+            pkt[3] = g;
+            pkt[4] = b;
+            put_u16(&mut pkt, 5, take as u16);
+            pkt[7..7 + take].copy_from_slice(&bytes[pos..pos + take]);
+            for _ in 0..200 {
+                match ch.write(&pkt[..7 + take]) {
+                    Ok(()) => break,
+                    Err(ErrorCode::ShouldWait) => libcanvas::process::yield_now(),
+                    Err(_) => return,
+                }
+            }
+            pos += take;
+        }
+    }
+
+    fn wait_for_child_activity(
+        &self,
+        stdout_r: &Channel,
+        out_open: bool,
+        stderr_r: &Channel,
+        err_open: bool,
+        child: &Process,
+    ) -> bool {
+        let mut items = [WaitItem::new(0, Signals::NONE, 0); 4];
+        let mut count = 0usize;
+        if out_open {
+            items[count] = WaitItem::new(
+                stdout_r.handle().raw(),
+                Signals::READABLE | Signals::PEER_CLOSED,
+                1,
+            );
+            count += 1;
+        }
+        if err_open {
+            items[count] = WaitItem::new(
+                stderr_r.handle().raw(),
+                Signals::READABLE | Signals::PEER_CLOSED,
+                2,
+            );
+            count += 1;
+        }
+        if let Some(key_ch) = self.key_source.as_ref() {
+            items[count] = WaitItem::new(
+                key_ch.handle().raw(),
+                Signals::READABLE | Signals::PEER_CLOSED,
+                3,
+            );
+            count += 1;
+        }
+        items[count] = WaitItem::new(child.handle().raw(), Signals::SIGNALED, 4);
+        count += 1;
+
+        let wait_ticks = if let Some(deadline) = self.interrupt_deadline {
+            let now = libcanvas::system::monotonic_ticks().unwrap_or(0);
+            deadline.saturating_sub(now).clamp(1, 20)
+        } else if self.auto_interrupts > 0 {
+            self.auto_interrupt_after_ticks.clamp(1, 20)
+        } else {
+            20
+        };
+        if let Ok(outcome) = wait_any(&items[..count], wait_ticks) {
+            return outcome
+                .satisfied()
+                .iter()
+                .any(|r| r.key == 4 && (r.active_signals & Signals::SIGNALED.bits()) != 0);
+        }
+        false
+    }
+
     /// Service terminal input while a child is running.
     ///
     /// Returns `true` when the child must be terminated: either a real
     /// `Ctrl-C` key event arrived, or the smoke gate asked for a synthetic
-    /// interrupt. Every other packet is buffered and replayed to the prompt
-    /// once the shell is idle, so keystrokes typed during a child run are not
-    /// lost.
-    fn poll_child_interrupt(&mut self, child: &Process) -> bool {
+    /// interrupt. In foreground streaming mode (`live_stdin.is_some()`), every
+    /// other keystroke is translated into VT100 sequences and written to the
+    /// child's `stdin`; otherwise packets are buffered for prompt replay.
+    fn poll_child_input(&mut self, child: &Process, live_stdin: Option<&Channel>) -> bool {
         let auto = if self.auto_interrupts > 0 {
-            // Latch the deadline on the first poll so the wait is measured from
-            // the child actually running, not from the request. A process
-            // without a clock capability cannot advance the tick count, so the
-            // wait also has a poll budget: the loop yields on every iteration,
-            // which makes the budget a slower but unconditional backstop.
             let now = libcanvas::system::monotonic_ticks();
             let deadline = *self.interrupt_deadline.get_or_insert_with(|| {
                 self.interrupt_polls = 0;
@@ -869,7 +1254,7 @@ impl HshHost {
             self.interrupt_polls = self.interrupt_polls.saturating_add(1);
             let expired = match now {
                 Ok(ticks) => ticks >= deadline,
-                Err(_) => self.interrupt_polls >= self.auto_interrupt_after_ticks.max(1) * 500,
+                Err(_) => self.interrupt_polls >= self.auto_interrupt_after_ticks.max(1) * 50,
             };
             if expired {
                 self.auto_interrupts -= 1;
@@ -894,19 +1279,20 @@ impl HshHost {
                 }
             }
         }
-        // Drain into the replay buffer only after the channel borrow above is
-        // released: pushing while `ch` is alive is a double borrow of `self`.
         for packet in received {
             if packet_is_ctrl_c(&packet) {
                 ctrl_c = true;
+            } else if let Some(stdin_w) = live_stdin {
+                if let Some(seq) = packet_to_vt100(&packet) {
+                    let _ = stdin_w.write(seq);
+                } else if let Some(byte) = packet_single_byte(&packet) {
+                    let _ = stdin_w.write(&[byte]);
+                }
             } else {
                 self.pending_packets.push(packet);
             }
         }
         if auto || ctrl_c {
-            // Best effort by design: if the child exited on its own between
-            // the key press and this call, its own status stands (the syscall
-            // is idempotent) and there is nothing left to kill.
             let _ = child.terminate(CTRL_C_EXIT_CODE);
             return true;
         }
@@ -969,10 +1355,34 @@ impl ShellHost for HshHost {
         args: &[String],
         stdin: Option<&Value>,
     ) -> ExecOutcome {
+        self.exec_command_mode(caps, name, args, stdin, true)
+    }
+
+    fn exec_command_mode(
+        &mut self,
+        caps: Option<&CapsSpec>,
+        name: &str,
+        args: &[String],
+        stdin: Option<&Value>,
+        capture_output: bool,
+    ) -> ExecOutcome {
+        self.exec_command_ex(caps, name, args, stdin, capture_output, false)
+    }
+
+    fn exec_command_ex(
+        &mut self,
+        caps: Option<&CapsSpec>,
+        name: &str,
+        args: &[String],
+        stdin: Option<&Value>,
+        capture_output: bool,
+        separate_stderr: bool,
+    ) -> ExecOutcome {
         match name {
             "cls" | "clear" => ExecOutcome {
                 status: 0,
                 output: Value::Empty,
+                stderr: String::new(),
                 clear_screen: true,
                 exit_requested: false,
                 child_pid: None,
@@ -980,19 +1390,21 @@ impl ShellHost for HshHost {
             "exit" => ExecOutcome {
                 status: args.first().and_then(|s| s.parse::<i32>().ok()).unwrap_or(0),
                 output: Value::Empty,
+                stderr: String::new(),
                 clear_screen: false,
                 exit_requested: true,
                 child_pid: None,
             },
             "help" => ExecOutcome::ok_text(concat!(
                 "hsh intrinsics:\n",
-                "  help | cls | clear | echo | pwd | cd <dir> | caps | history | exit\n",
+                "  help | cls | clear | echo | printf | test | [ | true | false | export | env | pwd | cd <dir> | caps | history | exit\n",
                 "  pipes: | where <col> <op> <val> | select <cols> | sort [--desc] [col] | head [n] | tail [n] | count | grep <pat>\n",
-                "  lang:  let x = ...; if ... { ... } else { ... }; for x in [...] { ... }; fn f(a) { ... }; alias a = \"...\"\n",
+                "  lang:  let x = ...; x = $((x + 1)); if/elif/else; while ... { break; continue }; for x in [...]; fn f(a) { ... }\n",
                 "  caps:  @caps(hxfs=none|ro|rw, bootfs=ro|none, fb=none|ro, dir=/sub:ro) <cmd>\n",
-                "  apps:  doom | snake [hard] | font <cozette|tty|compact> | shutdown\n",
+                "  apps:  doom | snake [hard] | btop | nano <file> | font <cozette|tty|compact> | shutdown\n",
                 "external /bin/*.elf utilities:\n",
-                "  ls | cat | stat | touch | mkdir | rm | mv | write | hxfs | pci | acpi | ps | fdisk"
+                "  ls | cat | stat | touch | mkdir | rm | mv | cp | ln | chmod | readlink | write | find | grep | head | tail | wc | sort | uniq\n",
+                "  seq | tee | basename | dirname | sha256sum | tar | hexdump | dd | df | du | lsblk | fdisk | mkfs | fsck | hxfs | ps | schedctl | pci | acpi | sleep"
             )),
             "pwd" => ExecOutcome::ok_text(self.pwd.clone()),
             "cd" => {
@@ -1041,7 +1453,7 @@ impl ShellHost for HshHost {
                 self.delegated = Some(DelegatedAction::Shutdown);
                 ExecOutcome::ok(Value::Empty)
             }
-            _ => self.spawn_external(caps, name, args, stdin),
+            _ => self.spawn_external(caps, name, args, stdin, capture_output, separate_stderr),
         }
     }
 
@@ -1073,31 +1485,158 @@ impl ShellHost for HshHost {
         }
         file.fsync()
             .map_err(|e| format!("fsync '{abs}': {}", e.as_str()))?;
+        let _ = hxfs.checkpoint();
         Ok(())
+    }
+
+    fn read_file(&mut self, path: &str) -> Result<Vec<u8>, String> {
+        let abs = self.normalize_path(path);
+        self.try_connect_hxfs();
+        if let Some(hxfs) = self.hxfs.as_ref() {
+            if let Ok(file) = hxfs.open_file(&abs) {
+                let sz = file.size().unwrap_or(0).min(256 * 1024) as usize;
+                let mut out = alloc::vec![0u8; sz];
+                let mut pos = 0usize;
+                while pos < sz {
+                    let take = (sz - pos).min(2048);
+                    match file.read_at(pos as u64, &mut out[pos..pos + take]) {
+                        Ok([]) => break,
+                        Ok(slice) => pos += slice.len(),
+                        Err(e) => return Err(format!("read '{abs}': {}", e.as_str())),
+                    }
+                }
+                out.truncate(pos);
+                return Ok(out);
+            }
+        }
+        if let Some(vmo) = self.bootfs.as_ref() {
+            for (bpath, off, len) in self.iter_bootfs_entries() {
+                if bpath == abs {
+                    let take = len.min(256 * 1024) as usize;
+                    let mut buf = alloc::vec![0u8; take];
+                    if vmo.read(off, &mut buf) == Ok(take) {
+                        return Ok(buf);
+                    }
+                }
+            }
+        }
+        Err(format!("'{abs}': not found"))
+    }
+
+    fn stat_path(&mut self, path: &str, follow: bool) -> Option<(HostPathKind, u64)> {
+        let abs = self.normalize_path(path);
+        self.try_connect_hxfs();
+        if let Some(hxfs) = self.hxfs.as_ref() {
+            if let Ok(info) = hxfs.stat_path(&abs, follow) {
+                let kind = match info.object_type {
+                    1 => HostPathKind::File,
+                    2 => HostPathKind::Dir,
+                    3 => HostPathKind::Symlink,
+                    _ => return None,
+                };
+                return Some((kind, info.size));
+            }
+        }
+        if abs == "/" {
+            return Some((HostPathKind::Dir, 0));
+        }
+        let dir_prefix = format!("{abs}/");
+        for (bpath, _off, len) in self.iter_bootfs_entries() {
+            if bpath == abs {
+                return Some((HostPathKind::File, len));
+            }
+            if bpath.starts_with(&dir_prefix) {
+                return Some((HostPathKind::Dir, 0));
+            }
+        }
+        None
+    }
+
+    fn list_dir(&mut self, dir: &str) -> Vec<String> {
+        let abs = if dir == "." {
+            self.pwd.clone()
+        } else {
+            self.normalize_path(dir)
+        };
+        let mut names = Vec::new();
+        self.try_connect_hxfs();
+        if let Some(hxfs) = self.hxfs.as_ref() {
+            if let Ok(d) = hxfs.open_dir(&abs) {
+                let mut raw = [0u8; 4096];
+                if let Ok(bytes) = d.list(&mut raw) {
+                    if let Ok(text) = core::str::from_utf8(bytes) {
+                        for line in text.lines() {
+                            if let Some(name) = line.split_whitespace().next() {
+                                if !name.is_empty() && !names.iter().any(|x| x == name) {
+                                    names.push(String::from(name));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let prefix = if abs == "/" {
+            String::from("/")
+        } else {
+            format!("{abs}/")
+        };
+        for (bpath, _, _) in self.iter_bootfs_entries() {
+            if let Some(rest) = bpath.strip_prefix(&prefix) {
+                let leaf = rest.split('/').next().unwrap_or("");
+                if !leaf.is_empty() && !names.iter().any(|x| x == leaf) {
+                    names.push(String::from(leaf));
+                }
+            }
+        }
+        names
     }
 }
 
-/// Flags whose following argument is a value, never a path.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FlagValueKind {
+    None,
+    Data,
+    Path,
+    TarDir,
+}
+
+/// Classify flags whose following argument is a value, a path, or `-C <dir>`.
 ///
 /// Per command, because the same letter means different things: `head -n 5`
 /// takes a count while `sort -n` is a switch, and `grep -c` counts while
-/// `head -c 16` takes bytes. Values are data by definition, so the shell must
-/// not resolve them as paths (`hexdump -n 128` used to become `-n /128`).
-fn flag_takes_value(command: &str, flag: &str) -> bool {
+/// `head -c 16` takes bytes. Data values must not be resolved as paths
+/// (`hexdump -n 128` used to become `-n /128`), while archive/directory flags
+/// (`tar -cf out.tar`, `tar -C sub`) *are* paths that must resolve against `pwd`.
+fn flag_value_kind(command: &str, flag: &str) -> FlagValueKind {
     match command {
-        "hexdump" => matches!(flag, "-n" | "--length" | "-s" | "--skip"),
-        "du" => matches!(flag, "-d" | "--max-depth"),
-        "mkfs" => matches!(flag, "-s" | "--size" | "-p" | "--part" | "-t" | "--type"),
-        "head" | "tail" => matches!(flag, "-n" | "--lines" | "-c" | "--bytes"),
-        "sort" => matches!(flag, "-k" | "--key" | "-t" | "--field-separator"),
-        "grep" => matches!(flag, "-e" | "--regexp" | "-m" | "--max-count"),
-        "find" => matches!(flag, "-name" | "-type" | "-maxdepth" | "-iname"),
-        "fdisk" => matches!(flag, "--type" | "--size" | "--start" | "--end" | "--name"),
-        // `-cf`, `-tf`, `-xf`, `-f`: every archive flag that names the archive.
-        "tar" => {
-            flag.starts_with('-') && flag.ends_with('f') || matches!(flag, "-C" | "--directory")
+        "hexdump" if matches!(flag, "-n" | "--length" | "-s" | "--skip") => FlagValueKind::Data,
+        "du" if matches!(flag, "-d" | "--max-depth") => FlagValueKind::Data,
+        "mkfs" if matches!(flag, "-s" | "--size" | "-p" | "--part" | "-t" | "--type") => {
+            FlagValueKind::Data
         }
-        _ => false,
+        "head" | "tail" if matches!(flag, "-n" | "--lines" | "-c" | "--bytes") => {
+            FlagValueKind::Data
+        }
+        "sort" if matches!(flag, "-k" | "--key" | "-t" | "--field-separator") => {
+            FlagValueKind::Data
+        }
+        "grep" if matches!(flag, "-e" | "--regexp" | "-m" | "--max-count") => FlagValueKind::Data,
+        "hsh" if flag == "-c" => FlagValueKind::Data,
+        "find" if matches!(flag, "-name" | "-type" | "-maxdepth" | "-iname") => FlagValueKind::Data,
+        "fdisk" if matches!(flag, "--type" | "--size" | "--start" | "--end" | "--name") => {
+            FlagValueKind::Data
+        }
+        "tar" => {
+            if matches!(flag, "-C" | "--directory") {
+                FlagValueKind::TarDir
+            } else if flag.starts_with('-') && flag.ends_with('f') {
+                FlagValueKind::Path
+            } else {
+                FlagValueKind::None
+            }
+        }
+        _ => FlagValueKind::None,
     }
 }
 
@@ -1111,7 +1650,10 @@ fn is_data_word(command: &str, word: &str) -> bool {
         "fdisk" => &[
             "list", "inspect", "verify", "gpt-init", "add", "del", "resize",
         ],
-        "hxfs" => &["status", "stats", "scrub", "snapshot", "sync", "gc"],
+        "hxfs" => &[
+            "status", "stats", "scrub", "fsck", "snapshot", "snap", "sync", "gc", "list", "create",
+            "delete",
+        ],
         "schedctl" => &["cpus", "tasks", "bench"],
         _ => &[],
     };

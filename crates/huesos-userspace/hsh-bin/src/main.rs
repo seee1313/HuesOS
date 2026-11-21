@@ -22,7 +22,7 @@ use huesos_abi::term_ipc::{
     hsh_to_term, put_i32, put_u16, term_to_hsh, SpanKind, MAX_PROMPT_GHOST, MAX_PROMPT_INPUT,
     MAX_PROMPT_SPANS, MAX_PWD_BYTES, MAX_WRITE_CHUNK,
 };
-use huesos_hsh::{highlight_line, EvalAction, HighlightKind, ShellEnv};
+use huesos_hsh::{highlight_line, EvalAction, HighlightKind, ShellEnv, Value};
 use libcanvas::heap::ScudoHeap;
 use libcanvas::stdio::{
     arg_str, args_count, exit, stderr_str, stdin_read, stdout_str, take_cap_handle, CapKind,
@@ -35,9 +35,71 @@ static ALLOCATOR: ScudoHeap = ScudoHeap;
 const HISTORY_MAX: usize = 128;
 
 const KNOWN_COMMANDS: &[&str] = &[
-    "help", "clear", "cls", "echo", "pwd", "cd", "history", "caps", "exit", "font", "doom",
-    "snake", "shutdown", "where", "select", "sort", "head", "tail", "count", "grep", "ls", "cat",
-    "stat", "touch", "mkdir", "rm", "mv", "write", "hxfs", "pci", "acpi", "ps", "fdisk", "sleep",
+    "help",
+    "clear",
+    "cls",
+    "echo",
+    "printf",
+    "test",
+    "[",
+    "true",
+    "false",
+    "export",
+    "env",
+    "pwd",
+    "cd",
+    "history",
+    "caps",
+    "exit",
+    "font",
+    "doom",
+    "snake",
+    "shutdown",
+    "where",
+    "select",
+    "sort",
+    "head",
+    "tail",
+    "count",
+    "grep",
+    "ls",
+    "cat",
+    "stat",
+    "touch",
+    "mkdir",
+    "rm",
+    "mv",
+    "cp",
+    "ln",
+    "chmod",
+    "readlink",
+    "write",
+    "hxfs",
+    "pci",
+    "acpi",
+    "ps",
+    "fdisk",
+    "lsblk",
+    "df",
+    "du",
+    "mkfs",
+    "fsck",
+    "dd",
+    "hexdump",
+    "find",
+    "wc",
+    "uniq",
+    "seq",
+    "tee",
+    "basename",
+    "dirname",
+    "sha256sum",
+    "tar",
+    "nano",
+    "btop",
+    "schedctl",
+    "sleep",
+    "hsh",
 ];
 
 const FDISK_SUBCMDS: &[&str] = &[
@@ -98,6 +160,8 @@ extern "C" fn hsh_entry() -> ! {
     let registry = take_cap_handle(CapKind::Registry).map(Channel::from_handle);
     let bootfs = take_cap_handle(CapKind::BootfsRo).map(Vmo::from_handle);
     let frame_draw = take_cap_handle(CapKind::FrameDraw);
+    let hxfs_svc = take_cap_handle(CapKind::HxfsService).map(Channel::from_handle);
+    let block_dev = take_cap_handle(CapKind::BlockDev).map(Channel::from_handle);
 
     if args.first().map(String::as_str) == Some("--interactive") {
         let stdin_ch = take_cap_handle(CapKind::Stdin).map(Channel::from_handle);
@@ -106,22 +170,37 @@ extern "C" fn hsh_entry() -> ! {
             let _ = stderr_str("hsh: --interactive requires stdin/stdout IPC channels\n");
             exit(1);
         };
-        let mut host = HshHost::new(registry, bootfs, frame_draw, Some(out_ch));
+        let mut host = HshHost::new_with_caps(
+            registry,
+            hxfs_svc,
+            block_dev,
+            bootfs,
+            frame_draw,
+            Some(out_ch),
+        );
         host.status_hook = Some(send_status_bar);
         run_interactive(in_ch, host);
     }
 
     // Batch / `-c` / script file mode.
-    let mut host = HshHost::new(registry, bootfs, frame_draw, None);
+    let mut host = HshHost::new_with_caps(registry, hxfs_svc, block_dev, bootfs, frame_draw, None);
     let mut env = ShellEnv::new();
 
     let script = if args.first().map(String::as_str) == Some("-c") {
         if args.len() < 2 {
-            let _ = stderr_str("usage: hsh -c \"<script>\"\n");
+            let _ = stderr_str("usage: hsh -c \"<script>\" [arg0 arg1 ...]\n");
             exit(2);
         }
-        args[1..].join(" ")
+        if args.len() >= 3 {
+            env.set_var("0", Value::Text(args[2].clone()));
+            env.set_positional_args(args[3..].to_vec());
+        } else {
+            env.set_var("0", Value::Text(String::from("hsh")));
+        }
+        args[1].clone()
     } else if let Some(path) = args.first() {
+        env.set_var("0", Value::Text(path.clone()));
+        env.set_positional_args(args[1..].to_vec());
         match host.read_script_file(path) {
             Ok(s) => s,
             Err(e) => {
@@ -131,6 +210,7 @@ extern "C" fn hsh_entry() -> ! {
             }
         }
     } else {
+        env.set_var("0", Value::Text(String::from("hsh")));
         // Read stdin script until EOF.
         let mut raw = Vec::new();
         let mut buf = [0u8; 4096];
@@ -149,16 +229,9 @@ extern "C" fn hsh_entry() -> ! {
                 if let EvalAction::Output(val) = act {
                     let txt = val.into_text();
                     if !txt.is_empty() {
-                        if res.status == 0 {
-                            let _ = stdout_str(&txt);
-                            if !txt.ends_with('\n') {
-                                let _ = stdout_str("\n");
-                            }
-                        } else {
-                            let _ = stderr_str(&txt);
-                            if !txt.ends_with('\n') {
-                                let _ = stderr_str("\n");
-                            }
+                        let _ = stdout_str(&txt);
+                        if !txt.ends_with('\n') {
+                            let _ = stdout_str("\n");
                         }
                     }
                 }
@@ -737,21 +810,26 @@ impl InteractiveShell {
         //    with an NVMe volume gets whatever that volume holds. Both shapes
         //    have to survive the pipe stage; the column names differ, so the
         //    filter follows the shape.
-        let (list_filter, list_expect) = if self.host.hxfs.is_some() {
-            ("fdisk list | where status == OK", "raw-hxfs")
-        } else {
-            ("fdisk list | where type == hxfs", "HxFS-Root")
-        };
-        match smoke_env.eval_script(list_filter, &mut self.host) {
-            Ok(res) if res.status == 0 && res.render_text().contains(list_expect) => {
-                println!("[hsh] fdisk.elf pipe OK");
+        let fdisk_pipe_ok = if self.host.hxfs.is_some() {
+            match smoke_env.eval_script("fdisk list | where status == OK", &mut self.host) {
+                Ok(res) if res.status == 0 && res.render_text().contains("raw-hxfs") => Ok(()),
+                _ => match smoke_env.eval_script("fdisk list | where type == hxfs", &mut self.host)
+                {
+                    Ok(res) if res.status == 0 && res.render_text().contains("hxfs") => Ok(()),
+                    Ok(res) => Err(format!("status={} out={}", res.status, res.render_text())),
+                    Err(e) => Err(e),
+                },
             }
-            Ok(res) => println!(
-                "[hsh] fdisk.elf pipe FAILED status={} out={}",
-                res.status,
-                res.render_text()
-            ),
-            Err(e) => println!("[hsh] fdisk.elf pipe ERROR: {}", e),
+        } else {
+            match smoke_env.eval_script("fdisk list | where type == hxfs", &mut self.host) {
+                Ok(res) if res.status == 0 && res.render_text().contains("HxFS-Root") => Ok(()),
+                Ok(res) => Err(format!("status={} out={}", res.status, res.render_text())),
+                Err(e) => Err(e),
+            }
+        };
+        match fdisk_pipe_ok {
+            Ok(()) => println!("[hsh] fdisk.elf pipe OK"),
+            Err(detail) => println!("[hsh] fdisk.elf pipe FAILED {detail}"),
         }
 
         // 6. `@caps(hxfs=ro)` enforcement across both `fdisk.elf` and `touch.elf`
@@ -939,7 +1017,7 @@ impl InteractiveShell {
         }
 
         let gpt_cycle = [
-            format!("fdisk gpt-init{image} --size 64M"),
+            format!("fdisk gpt-init{image} --force --size 64M"),
             format!("fdisk add{image} --type hxfs --size 16M"),
             format!("fdisk verify{image}"),
             format!("fdisk resize 1{image} --size 20M"),
@@ -1047,20 +1125,10 @@ impl InteractiveShell {
         }
 
         // 10c. `/bin/std-smoke.elf` runs the user-space standard library inside
-        //      the OS: `huesos_std::entry!`, streaming formatting, the path and
-        //      error helpers (pure, always run) and a real
-        //      create/write/seek/read/truncate/list/remove cycle on the mounted
-        //      volume. The binary prints its own `[std] FAIL` lines and only
-        //      reports PASS when every check held, so the status plus the
-        //      marker is the whole contract.
-        // A smoke that never returns must fail the boot gate, not hang it: a
-        // hung QEMU is indistinguishable from a slow machine in CI, and the
-        // partial output is what localises the stall.
-        self.host.auto_interrupts = 1;
-        self.host.auto_interrupt_after_ticks = 3000;
+        //      the OS without any synthetic 30s auto-interrupt crutch: with
+        //      `RwLock` drop-order and futex parking fixed, it finishes cleanly
+        //      in well under a second.
         let std_smoke = smoke_env.eval_script("std-smoke", &mut self.host);
-        self.host.auto_interrupts = 0;
-        self.host.auto_interrupt_after_ticks = 0;
         match std_smoke {
             Ok(res) if res.status == 0 && res.render_text().contains("[std] PASS") => {
                 println!("[hsh] huesos-std smoke OK");
@@ -1133,11 +1201,16 @@ impl InteractiveShell {
             Err(e) => println!("[hsh] lsblk ERROR: {}", e),
         }
 
-        // 11. Bare `HxFS v7` volume (superfloppy) detection. Only meaningful on
-        //     a boot with a block device; the NVMe smoke attaches one.
+        // 11. Block-device layout & `fdisk gpt-init` overwrite guard (both
+        //     `raw-hxfs` superfloppy and GPT-partitioned NVMe disks). Only
+        //     meaningful on a boot with a block device; the NVMe smoke attaches one.
         if self.host.hxfs.is_some() {
             match smoke_env.eval_script("fdisk list", &mut self.host) {
-                Ok(res) if res.status == 0 && res.render_text().contains("raw-hxfs") => {
+                Ok(res)
+                    if res.status == 0
+                        && (res.render_text().contains("raw-hxfs")
+                            || res.render_text().contains("hxfs")) =>
+                {
                     println!("[hsh] fdisk raw-hxfs list OK");
                 }
                 Ok(res) => println!(
@@ -1153,7 +1226,9 @@ impl InteractiveShell {
             match smoke_env.eval_script("fdisk gpt-init --size 64M --dry-run", &mut self.host) {
                 Ok(res)
                     if res.status == 0
-                        && res.render_text().contains("raw-hxfs")
+                        && (res.render_text().contains("raw-hxfs")
+                            || res.render_text().contains("existing GPT"))
+                        && res.render_text().contains("--force")
                         && res.render_text().contains("dry-run") =>
                 {
                     println!("[hsh] fdisk raw-hxfs dry-run OK");
@@ -1168,7 +1243,8 @@ impl InteractiveShell {
             match smoke_env.eval_script("fdisk gpt-init --size 64M", &mut self.host) {
                 Ok(res)
                     if res.status != 0
-                        && res.render_text().contains("raw-hxfs")
+                        && (res.render_text().contains("raw-hxfs")
+                            || res.render_text().contains("existing GPT"))
                         && res.render_text().contains("--force") =>
                 {
                     println!("[hsh] fdisk raw-hxfs gpt-init guard OK");

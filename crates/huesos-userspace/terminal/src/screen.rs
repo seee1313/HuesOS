@@ -197,6 +197,17 @@ impl PixelRect {
     }
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum AnsiState {
+    Ground,
+    Escape,
+    Csi,
+    Osc,
+    OscEscape,
+}
+
+const MAX_CSI_PARAMS: usize = 8;
+
 /// Fixed-capacity text screen backed by a framebuffer `Canvas`.
 pub struct Screen {
     canvas: Option<Canvas>,
@@ -208,10 +219,27 @@ pub struct Screen {
     scroll_offset: usize,
 
     active_fg: Color,
+    active_bg: Color,
+    sgr_bold: bool,
+    sgr_dim: bool,
+    sgr_reverse: bool,
+    saved_cursor: (usize, usize),
+
+    ansi_state: AnsiState,
+    csi_params: [u16; MAX_CSI_PARAMS],
+    csi_len: usize,
+    csi_has_digit: bool,
+    csi_private: bool,
+
+    utf8_buf: [u8; 4],
+    utf8_len: u8,
+    utf8_need: u8,
+
     row: usize,
     col: usize,
     font: TextFont,
     cursor_visible: bool,
+    app_cursor_hidden: bool,
     presented_cursor: Option<(usize, usize)>,
 
     dirty_rows: u64,
@@ -249,10 +277,24 @@ impl Screen {
             scrollback_len: 0,
             scroll_offset: 0,
             active_fg: COLOR_TEXT,
+            active_bg: COLOR_BACKGROUND,
+            sgr_bold: false,
+            sgr_dim: false,
+            sgr_reverse: false,
+            saved_cursor: (0, 0),
+            ansi_state: AnsiState::Ground,
+            csi_params: [0; MAX_CSI_PARAMS],
+            csi_len: 0,
+            csi_has_digit: false,
+            csi_private: false,
+            utf8_buf: [0; 4],
+            utf8_len: 0,
+            utf8_need: 0,
             row: 0,
             col: 0,
             font: TextFont::Cozette6x13,
             cursor_visible: true,
+            app_cursor_hidden: false,
             presented_cursor: None,
             dirty_rows: ALL_ROWS_DIRTY,
             dirty_from: [0; ROWS],
@@ -324,7 +366,7 @@ impl Screen {
             *r = [DEFAULT_CELL; COLS];
         }
         self.scroll_offset = 0;
-        self.active_fg = COLOR_TEXT;
+        self.reset_sgr();
         self.row = 0;
         self.col = 0;
         self.pending_scroll_lines = 0;
@@ -338,21 +380,413 @@ impl Screen {
     }
 
     pub fn write_str(&mut self, text: &str) {
-        for ch in text.chars() {
-            self.write_char(ch);
+        self.write_bytes(text.as_bytes());
+    }
+
+    pub fn write_colored_bytes(&mut self, bytes: &[u8], color: Color) {
+        let prev_fg = self.active_fg;
+        let prev_bg = self.active_bg;
+        let prev_rev = self.sgr_reverse;
+        self.active_fg = color;
+        self.active_bg = COLOR_BACKGROUND;
+        self.sgr_reverse = false;
+        self.write_bytes(bytes);
+        self.active_fg = prev_fg;
+        self.active_bg = prev_bg;
+        self.sgr_reverse = prev_rev;
+    }
+
+    pub fn write_bytes(&mut self, bytes: &[u8]) {
+        for &byte in bytes {
+            self.write_byte(byte);
         }
     }
 
     pub fn write_byte(&mut self, byte: u8) {
-        match byte {
-            b'\n' => self.newline(),
-            b'\r' => self.carriage_return(),
-            b'\t' => self.tab(),
-            0x08 => self.backspace(),
-            0x20..=0x7e => self.write_char(char::from(byte)),
-            // A lone high byte is not a character: UTF-8 text reaches the
-            // cell grid through `write_str`, which decodes it first.
-            _ => self.write_char('?'),
+        match self.ansi_state {
+            AnsiState::Ground => {
+                if self.utf8_need > 0 {
+                    if (byte & 0xC0) == 0x80 {
+                        let idx = self.utf8_len as usize;
+                        if idx < 4 {
+                            self.utf8_buf[idx] = byte;
+                            self.utf8_len += 1;
+                        }
+                        if self.utf8_len == self.utf8_need {
+                            let len = self.utf8_len as usize;
+                            self.utf8_len = 0;
+                            self.utf8_need = 0;
+                            let ch = core::str::from_utf8(&self.utf8_buf[..len])
+                                .ok()
+                                .and_then(|s| s.chars().next())
+                                .unwrap_or('?');
+                            self.write_char(ch);
+                        }
+                        return;
+                    }
+                    // Broken UTF-8 sequence: emit replacement and fall through to process `byte`.
+                    self.utf8_len = 0;
+                    self.utf8_need = 0;
+                    self.write_char('?');
+                }
+
+                match byte {
+                    0x1b => {
+                        self.ansi_state = AnsiState::Escape;
+                    }
+                    b'\n' => self.newline(),
+                    b'\r' => self.carriage_return(),
+                    b'\t' => self.tab(),
+                    0x08 => self.backspace(),
+                    0x20..=0x7e => self.write_char(char::from(byte)),
+                    0xC2..=0xDF => {
+                        self.utf8_buf[0] = byte;
+                        self.utf8_len = 1;
+                        self.utf8_need = 2;
+                    }
+                    0xE0..=0xEF => {
+                        self.utf8_buf[0] = byte;
+                        self.utf8_len = 1;
+                        self.utf8_need = 3;
+                    }
+                    0xF0..=0xF4 => {
+                        self.utf8_buf[0] = byte;
+                        self.utf8_len = 1;
+                        self.utf8_need = 4;
+                    }
+                    // Ignore NUL, BEL, and other non-printable C0 controls; render invalid high bytes as `?`.
+                    0x00..=0x1f | 0x7f => {}
+                    _ => self.write_char('?'),
+                }
+            }
+            AnsiState::Escape => match byte {
+                b'[' => {
+                    self.ansi_state = AnsiState::Csi;
+                    self.csi_params = [0; MAX_CSI_PARAMS];
+                    self.csi_len = 0;
+                    self.csi_has_digit = false;
+                    self.csi_private = false;
+                }
+                b']' => {
+                    self.ansi_state = AnsiState::Osc;
+                }
+                b'7' => {
+                    self.saved_cursor = (self.row, self.col);
+                    self.ansi_state = AnsiState::Ground;
+                }
+                b'8' => {
+                    let (r, c) = self.saved_cursor;
+                    self.set_cursor(r, c);
+                    self.ansi_state = AnsiState::Ground;
+                }
+                b'c' => {
+                    self.ansi_state = AnsiState::Ground;
+                    self.app_cursor_hidden = false;
+                    self.clear();
+                }
+                _ => {
+                    self.ansi_state = AnsiState::Ground;
+                }
+            },
+            AnsiState::Osc => match byte {
+                0x07 => self.ansi_state = AnsiState::Ground,
+                0x1b => self.ansi_state = AnsiState::OscEscape,
+                _ => {}
+            },
+            AnsiState::OscEscape => {
+                self.ansi_state = AnsiState::Ground;
+            }
+            AnsiState::Csi => match byte {
+                b'?' if self.csi_len == 0 && !self.csi_has_digit => {
+                    self.csi_private = true;
+                }
+                b'0'..=b'9' => {
+                    if !self.csi_has_digit {
+                        self.csi_has_digit = true;
+                        if self.csi_len == 0 {
+                            self.csi_len = 1;
+                        }
+                    }
+                    let slot = self.csi_len.saturating_sub(1);
+                    if slot < MAX_CSI_PARAMS {
+                        self.csi_params[slot] = self.csi_params[slot]
+                            .saturating_mul(10)
+                            .saturating_add(u16::from(byte - b'0'));
+                    }
+                }
+                b';' | b':' => {
+                    if !self.csi_has_digit && self.csi_len == 0 {
+                        self.csi_len = 1;
+                    }
+                    if self.csi_len < MAX_CSI_PARAMS {
+                        self.csi_len += 1;
+                    }
+                    self.csi_has_digit = false;
+                }
+                0x20..=0x2f => {
+                    // Intermediate bytes; keep waiting for the final byte.
+                }
+                0x40..=0x7e => {
+                    self.ansi_state = AnsiState::Ground;
+                    self.dispatch_csi(byte);
+                }
+                _ => {
+                    self.ansi_state = AnsiState::Ground;
+                }
+            },
+        }
+    }
+
+    fn reset_sgr(&mut self) {
+        self.active_fg = COLOR_TEXT;
+        self.active_bg = COLOR_BACKGROUND;
+        self.sgr_bold = false;
+        self.sgr_dim = false;
+        self.sgr_reverse = false;
+    }
+
+    fn effective_colors(&self) -> (Color, Color) {
+        let mut fg = self.active_fg;
+        let bg = self.active_bg;
+        if self.sgr_bold {
+            fg = (
+                fg.0.saturating_add(36),
+                fg.1.saturating_add(36),
+                fg.2.saturating_add(36),
+            );
+        } else if self.sgr_dim {
+            fg = (
+                ((u16::from(fg.0) * 2) / 3) as u8,
+                ((u16::from(fg.1) * 2) / 3) as u8,
+                ((u16::from(fg.2) * 2) / 3) as u8,
+            );
+        }
+        if self.sgr_reverse {
+            (bg, fg)
+        } else {
+            (fg, bg)
+        }
+    }
+
+    fn dispatch_csi(&mut self, final_byte: u8) {
+        let p0 = if self.csi_len >= 1 {
+            self.csi_params[0]
+        } else {
+            0
+        };
+        let p1 = if self.csi_len >= 2 {
+            self.csi_params[1]
+        } else {
+            0
+        };
+
+        if self.csi_private {
+            match (p0, final_byte) {
+                (25, b'l') => {
+                    self.app_cursor_hidden = true;
+                    if self.scroll_offset == 0 {
+                        self.mark_dirty_span(
+                            self.row,
+                            self.col,
+                            self.col.saturating_add(1).min(COLS),
+                        );
+                    }
+                }
+                (25, b'h') => {
+                    self.app_cursor_hidden = false;
+                    if self.scroll_offset == 0 {
+                        self.mark_dirty_span(
+                            self.row,
+                            self.col,
+                            self.col.saturating_add(1).min(COLS),
+                        );
+                    }
+                }
+                (1049, b'h') | (1049, b'l') | (47, b'h') | (47, b'l') => {
+                    self.erase_display(2);
+                    self.set_cursor(0, 0);
+                }
+                _ => {}
+            }
+            return;
+        }
+
+        match final_byte {
+            b'H' | b'f' => {
+                let row = usize::from(p0.max(1)) - 1;
+                let col = usize::from(p1.max(1)) - 1;
+                self.set_cursor(row, col);
+            }
+            b'A' => {
+                let n = usize::from(p0.max(1));
+                self.set_cursor(self.row.saturating_sub(n), self.col);
+            }
+            b'B' => {
+                let n = usize::from(p0.max(1));
+                self.set_cursor(self.row.saturating_add(n), self.col);
+            }
+            b'C' => {
+                let n = usize::from(p0.max(1));
+                self.set_cursor(self.row, self.col.saturating_add(n));
+            }
+            b'D' => {
+                let n = usize::from(p0.max(1));
+                self.set_cursor(self.row, self.col.saturating_sub(n));
+            }
+            b'G' => {
+                let col = usize::from(p0.max(1)) - 1;
+                self.set_cursor(self.row, col);
+            }
+            b'J' => {
+                self.erase_display(p0);
+            }
+            b'K' => {
+                self.erase_line(p0);
+            }
+            b's' => {
+                self.saved_cursor = (self.row, self.col);
+            }
+            b'u' => {
+                let (r, c) = self.saved_cursor;
+                self.set_cursor(r, c);
+            }
+            b'm' => {
+                self.apply_sgr();
+            }
+            _ => {}
+        }
+    }
+
+    fn erase_display(&mut self, mode: u16) {
+        let vis_rows = self.active_rows();
+        match mode {
+            0 => {
+                let r0 = self.row.min(vis_rows.saturating_sub(1));
+                let c0 = self.col.min(COLS);
+                for r in r0..vis_rows {
+                    let from_c = if r == r0 { c0 } else { 0 };
+                    for c in from_c..COLS {
+                        self.cells[r][c] = DEFAULT_CELL;
+                    }
+                    self.mark_dirty_span(r, from_c, COLS);
+                }
+            }
+            1 => {
+                let r_end = self.row.min(vis_rows.saturating_sub(1));
+                for r in 0..=r_end {
+                    let to_c = if r == r_end {
+                        self.col.saturating_add(1).min(COLS)
+                    } else {
+                        COLS
+                    };
+                    for c in 0..to_c {
+                        self.cells[r][c] = DEFAULT_CELL;
+                    }
+                    self.mark_dirty_span(r, 0, to_c);
+                }
+            }
+            2 | 3 => {
+                // Erase all visible rows via `mark_dirty_span` (not `force_full_render`)
+                // so `presented_cells` diffing only redraws cells that actually changed!
+                for r in 0..vis_rows {
+                    self.cells[r] = [DEFAULT_CELL; COLS];
+                    self.mark_dirty_span(r, 0, COLS);
+                }
+                self.scroll_offset = 0;
+            }
+            _ => {}
+        }
+    }
+
+    fn erase_line(&mut self, mode: u16) {
+        let r = self.row.min(ROWS - 1);
+        match mode {
+            0 => {
+                let from_c = self.col.min(COLS);
+                for c in from_c..COLS {
+                    self.cells[r][c] = DEFAULT_CELL;
+                }
+                self.mark_dirty_span(r, from_c, COLS);
+            }
+            1 => {
+                let to_c = self.col.saturating_add(1).min(COLS);
+                for c in 0..to_c {
+                    self.cells[r][c] = DEFAULT_CELL;
+                }
+                self.mark_dirty_span(r, 0, to_c);
+            }
+            2 => {
+                self.cells[r] = [DEFAULT_CELL; COLS];
+                self.mark_dirty_span(r, 0, COLS);
+            }
+            _ => {}
+        }
+    }
+
+    fn apply_sgr(&mut self) {
+        if self.csi_len == 0 {
+            self.reset_sgr();
+            return;
+        }
+        let mut idx = 0usize;
+        while idx < self.csi_len {
+            let code = self.csi_params[idx];
+            match code {
+                0 => self.reset_sgr(),
+                1 => {
+                    self.sgr_bold = true;
+                    self.sgr_dim = false;
+                }
+                2 => {
+                    self.sgr_dim = true;
+                    self.sgr_bold = false;
+                }
+                7 => self.sgr_reverse = true,
+                22 => {
+                    self.sgr_bold = false;
+                    self.sgr_dim = false;
+                }
+                27 => self.sgr_reverse = false,
+                30..=37 => self.active_fg = ansi_16_palette((code - 30) as u8),
+                39 => self.active_fg = COLOR_TEXT,
+                40..=47 => self.active_bg = ansi_16_palette((code - 40) as u8),
+                49 => self.active_bg = COLOR_BACKGROUND,
+                90..=97 => self.active_fg = ansi_16_palette((code - 90 + 8) as u8),
+                100..=107 => self.active_bg = ansi_16_palette((code - 100 + 8) as u8),
+                38 | 48 => {
+                    let is_fg = code == 38;
+                    let mode = if idx + 1 < self.csi_len {
+                        self.csi_params[idx + 1]
+                    } else {
+                        0
+                    };
+                    if mode == 5 && idx + 2 < self.csi_len {
+                        let color = ansi_256_palette(self.csi_params[idx + 2] as u8);
+                        if is_fg {
+                            self.active_fg = color;
+                        } else {
+                            self.active_bg = color;
+                        }
+                        idx += 3;
+                        continue;
+                    } else if mode == 2 && idx + 4 < self.csi_len {
+                        let color = (
+                            self.csi_params[idx + 2].min(255) as u8,
+                            self.csi_params[idx + 3].min(255) as u8,
+                            self.csi_params[idx + 4].min(255) as u8,
+                        );
+                        if is_fg {
+                            self.active_fg = color;
+                        } else {
+                            self.active_bg = color;
+                        }
+                        idx += 5;
+                        continue;
+                    }
+                }
+                _ => {}
+            }
+            idx += 1;
         }
     }
 
@@ -576,10 +1010,11 @@ impl Screen {
         }
         let row = self.row;
         let column = self.col;
+        let (fg, bg) = self.effective_colors();
         self.cells[row][column] = Cell {
             ch,
-            fg: self.active_fg,
-            bg: COLOR_BACKGROUND,
+            fg,
+            bg,
             flags: 0,
         };
         self.col += 1;
@@ -747,11 +1182,12 @@ impl Screen {
             let row_data = *self.row_for_display(view_top, display_row);
             self.presented_cells[display_row] = row_data;
         }
-        self.presented_cursor = if self.cursor_visible && self.scroll_offset == 0 {
-            Some((self.row.saturating_sub(view_top), self.col))
-        } else {
-            None
-        };
+        self.presented_cursor =
+            if self.cursor_visible && !self.app_cursor_hidden && self.scroll_offset == 0 {
+                Some((self.row.saturating_sub(view_top), self.col))
+            } else {
+                None
+            };
     }
 
     fn render_chrome_to_shadow(&self, canvas: &Canvas, shadow: &mut [u8; SHADOW_CAPACITY]) -> bool {
@@ -1110,9 +1546,22 @@ impl Screen {
         let mut col = 0usize;
         while col < len {
             let color = row_cells[col].fg;
+            let bg = row_cells[col].bg;
             let mut end = col + 1;
-            while end < len && row_cells[end].fg == color {
+            while end < len && row_cells[end].fg == color && row_cells[end].bg == bg {
                 end += 1;
+            }
+            let rx = LEFT_MARGIN.saturating_add(col as u32 * metrics.advance);
+            if bg != COLOR_BACKGROUND {
+                let bg_w =
+                    ((end - col) as u32 * metrics.advance).min(canvas.width().saturating_sub(rx));
+                let bg_h = metrics.line_height.min(canvas.height().saturating_sub(y));
+                if canvas
+                    .fill_rect_to_shadow(shadow, rx, y, bg_w, bg_h, bg.0, bg.1, bg.2)
+                    .is_err()
+                {
+                    return false;
+                }
             }
             let mut buf = [0u8; COLS * 4];
             let mut used = 0;
@@ -1122,7 +1571,6 @@ impl Screen {
             let Ok(text) = core::str::from_utf8(&buf[..used]) else {
                 return false;
             };
-            let rx = LEFT_MARGIN.saturating_add(col as u32 * metrics.advance);
             if canvas
                 .draw_text_to_shadow(shadow, rx, y, text, color.0, color.1, color.2, self.font)
                 .is_err()
@@ -1134,6 +1582,7 @@ impl Screen {
 
         if self.scroll_offset == 0
             && self.cursor_visible
+            && !self.app_cursor_hidden
             && (view_top + display_row) == self.row
             && self.col < visible_columns
         {
@@ -1222,9 +1671,21 @@ impl Screen {
         let mut col = start_column;
         while col < text_end {
             let color = row_cells[col].fg;
+            let bg = row_cells[col].bg;
             let mut run_end = col + 1;
-            while run_end < text_end && row_cells[run_end].fg == color {
+            while run_end < text_end
+                && row_cells[run_end].fg == color
+                && row_cells[run_end].bg == bg
+            {
                 run_end += 1;
+            }
+            let rx = LEFT_MARGIN.saturating_add(col as u32 * metrics.advance);
+            if bg != COLOR_BACKGROUND {
+                let bg_w = ((run_end - col) as u32 * metrics.advance)
+                    .min(canvas.width().saturating_sub(rx));
+                canvas
+                    .fill_rect_to_shadow(shadow, rx, y, bg_w, height, bg.0, bg.1, bg.2)
+                    .map_err(|_| ())?;
             }
             let mut buf = [0u8; COLS * 4];
             let mut used = 0;
@@ -1234,7 +1695,6 @@ impl Screen {
             let Ok(text) = core::str::from_utf8(&buf[..used]) else {
                 return Err(());
             };
-            let rx = LEFT_MARGIN.saturating_add(col as u32 * metrics.advance);
             canvas
                 .draw_text_to_shadow(shadow, rx, y, text, color.0, color.1, color.2, self.font)
                 .map_err(|_| ())?;
@@ -1243,6 +1703,7 @@ impl Screen {
 
         if self.scroll_offset == 0
             && self.cursor_visible
+            && !self.app_cursor_hidden
             && model_row == self.row
             && self.col >= start_column
             && self.col < end_column
@@ -1278,16 +1739,7 @@ impl Screen {
         let w = metrics.advance.min(canvas.width().saturating_sub(x));
         let h = metrics.line_height.min(canvas.height().saturating_sub(y));
         if canvas
-            .fill_rect_to_shadow(
-                shadow,
-                x,
-                y,
-                w,
-                h,
-                COLOR_BACKGROUND.0,
-                COLOR_BACKGROUND.1,
-                COLOR_BACKGROUND.2,
-            )
+            .fill_rect_to_shadow(shadow, x, y, w, h, cell.bg.0, cell.bg.1, cell.bg.2)
             .is_err()
         {
             return false;
@@ -1350,9 +1802,23 @@ impl Screen {
             let mut col = 0usize;
             while col < len {
                 let color = row_cells[col].fg;
+                let bg = row_cells[col].bg;
                 let mut run_end = col + 1;
-                while run_end < len && row_cells[run_end].fg == color {
+                while run_end < len && row_cells[run_end].fg == color && row_cells[run_end].bg == bg
+                {
                     run_end += 1;
+                }
+                let rx = LEFT_MARGIN.saturating_add(col as u32 * metrics.advance);
+                if bg != COLOR_BACKGROUND {
+                    let bg_w = ((run_end - col) as u32 * metrics.advance)
+                        .min(canvas.width().saturating_sub(rx));
+                    let bg_h = metrics.line_height.min(canvas.height().saturating_sub(y));
+                    if canvas
+                        .fill_rect(rx, y, bg_w, bg_h, bg.0, bg.1, bg.2)
+                        .is_err()
+                    {
+                        return false;
+                    }
                 }
                 let mut buf = [0u8; COLS * 4];
                 let mut used = 0;
@@ -1362,7 +1828,6 @@ impl Screen {
                 let Ok(text) = core::str::from_utf8(&buf[..used]) else {
                     return false;
                 };
-                let rx = LEFT_MARGIN.saturating_add(col as u32 * metrics.advance);
                 if canvas
                     .draw_text_with_font(rx, y, text, color.0, color.1, color.2, self.font)
                     .is_err()
@@ -1433,8 +1898,45 @@ fn flush_shadow_rect(canvas: &Canvas, shadow: &[u8; SHADOW_CAPACITY], rect: Pixe
 
 fn cell_line_len(line: &[Cell; COLS]) -> usize {
     let mut len = COLS;
-    while len > 0 && line[len - 1].ch == ' ' {
+    while len > 0 && line[len - 1].ch == ' ' && line[len - 1].bg == COLOR_BACKGROUND {
         len -= 1;
     }
     len
+}
+
+fn ansi_16_palette(idx: u8) -> Color {
+    match idx {
+        0 => (24, 30, 42),     // Black
+        1 => (235, 95, 105),   // Red
+        2 => (95, 225, 165),   // Green
+        3 => (245, 200, 95),   // Yellow
+        4 => (110, 165, 250),  // Blue
+        5 => (205, 135, 245),  // Magenta
+        6 => (95, 220, 240),   // Cyan
+        7 => (210, 222, 238),  // White
+        8 => (105, 120, 145),  // Bright Black / Gray
+        9 => (255, 125, 135),  // Bright Red
+        10 => (125, 245, 185), // Bright Green
+        11 => (255, 220, 125), // Bright Yellow
+        12 => (140, 190, 255), // Bright Blue
+        13 => (225, 165, 255), // Bright Magenta
+        14 => (135, 240, 255), // Bright Cyan
+        _ => (245, 250, 255),  // Bright White
+    }
+}
+
+fn ansi_256_palette(idx: u8) -> Color {
+    if idx < 16 {
+        return ansi_16_palette(idx);
+    }
+    if idx < 232 {
+        let cube = idx - 16;
+        let r = cube / 36;
+        let g = (cube / 6) % 6;
+        let b = cube % 6;
+        let step = |v: u8| if v == 0 { 0 } else { 55 + v * 40 };
+        return (step(r), step(g), step(b));
+    }
+    let gray = 8 + (idx - 232) * 10;
+    (gray, gray, gray)
 }

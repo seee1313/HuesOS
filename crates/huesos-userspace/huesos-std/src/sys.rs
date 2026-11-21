@@ -50,9 +50,13 @@ impl Snapshot {
 
 /// Read the scheduler counters.
 pub fn snapshot() -> Result<Snapshot> {
-    let summary = libcanvas::system::sched_summary().map_err(map_error)?;
-    let mut cpus = Vec::new();
-    libcanvas::system::sched_cpus(|record| cpus.push(*record)).map_err(map_error)?;
+    let cpu_cap = libcanvas::system::cpu_count().unwrap_or(64).clamp(1, 64);
+    let bytes =
+        core::mem::size_of::<SchedSummary>() + cpu_cap * core::mem::size_of::<SchedCpuRecord>();
+    let mut buffer = alloc::vec![0u8; bytes];
+    let mut cpus = Vec::with_capacity(cpu_cap);
+    let summary = libcanvas::system::sched_snapshot_into(&mut buffer, |record| cpus.push(*record))
+        .map_err(map_error)?;
     Ok(Snapshot { summary, cpus })
 }
 

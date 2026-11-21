@@ -78,12 +78,17 @@ pub extern "C" fn _start() -> ! {
     let _ = bootstrap.write(READY);
 
     let mut generations = GrantTracker::new();
+    let items = [WaitItem::new(
+        manager.handle().raw(),
+        Signals::READABLE | Signals::PEER_CLOSED,
+        0,
+    )];
     loop {
         if !poll_manager(&manager, key.as_ref(), &mut generations) {
             println!("[key-broker] manager channel closed; exiting");
             libcanvas::process::exit(-3);
         }
-        libcanvas::process::yield_now();
+        let _ = wait_any(&items, 100);
     }
 }
 

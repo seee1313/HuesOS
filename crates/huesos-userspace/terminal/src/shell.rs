@@ -347,15 +347,13 @@ impl TerminalSession {
                 let color = (msg[2], msg[3], msg[4]);
                 let len = get_u16(msg, 5).unwrap_or(0) as usize;
                 let end = (7 + len).min(msg.len());
-                if let Ok(text) = core::str::from_utf8(&msg[7..end]) {
-                    self.screen.reset_scrollback();
-                    if use_fg {
-                        self.screen.write_colored(text, color);
-                    } else {
-                        self.screen.write_str(text);
-                    }
-                    self.prompt_row = self.screen.current_row();
+                self.screen.reset_scrollback();
+                if use_fg {
+                    self.screen.write_colored_bytes(&msg[7..end], color);
+                } else {
+                    self.screen.write_bytes(&msg[7..end]);
                 }
+                self.prompt_row = self.screen.current_row();
             }
             hsh_to_term::TAG_STATUS_BAR if msg.len() >= 4 => {
                 let plen = msg[1] as usize;

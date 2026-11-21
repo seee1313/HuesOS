@@ -21,7 +21,7 @@ use core::ffi::{c_char, c_void};
 use core::panic::PanicInfo;
 use core::ptr;
 use core::slice;
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use huesos_abi::auxv::{
     caps_mask, AuxEntry, AT_BASE, AT_ENTRY, AT_HUESOS_BLOCK_DEV, AT_HUESOS_CAPS_MASK,
@@ -97,38 +97,40 @@ fn ld_panic(_info: &PanicInfo<'_>) -> ! {
 }
 
 struct RtldLock<T> {
-    locked: AtomicBool,
+    state: core::sync::atomic::AtomicU32,
     data: UnsafeCell<T>,
 }
 
 impl<T> RtldLock<T> {
     const fn new(data: T) -> Self {
         Self {
-            locked: AtomicBool::new(false),
+            state: core::sync::atomic::AtomicU32::new(0),
             data: UnsafeCell::new(data),
         }
     }
 
     #[inline]
     fn with<R>(&self, f: impl FnOnce(&mut T) -> R) -> R {
-        while self
-            .locked
-            .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+        if self
+            .state
+            .compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
             .is_err()
         {
-            while self.locked.load(Ordering::Relaxed) {
-                core::hint::spin_loop();
+            while self.state.swap(2, Ordering::Acquire) != 0 {
+                let _ = libcanvas::futex::wait(&self.state, 2, 0);
             }
         }
-        struct Unlock<'a>(&'a AtomicBool);
+        struct Unlock<'a>(&'a core::sync::atomic::AtomicU32);
         impl Drop for Unlock<'_> {
             #[inline]
             fn drop(&mut self) {
-                self.0.store(false, Ordering::Release);
+                if self.0.swap(0, Ordering::Release) == 2 {
+                    let _ = libcanvas::futex::wake(self.0, 1);
+                }
             }
         }
-        let _guard = Unlock(&self.locked);
-        // SAFETY: `self.locked` was acquired atomically via Acquire CAS and is
+        let _guard = Unlock(&self.state);
+        // SAFETY: `self.state` was acquired via 3-state futex protocol and is
         // released only when `_guard` drops.
         f(unsafe { &mut *self.data.get() })
     }
@@ -1766,12 +1768,13 @@ unsafe extern "C" fn rtld_alloc_thread_tls() -> u64 {
 }
 
 unsafe extern "C" fn rtld_free_thread_tls(tp_arg: u64) {
-    let tp = if tp_arg == 0 { current_tp() } else { tp_arg };
+    let cur_tp = current_tp();
+    let tp = if tp_arg == 0 { cur_tp } else { tp_arg };
     if tp == 0 {
         return;
     }
     let tcb = tp as *mut ThreadControlBlock;
-    // SAFETY: `tp` is the exiting thread's `ThreadControlBlock`.
+    // SAFETY: `tp` is the target thread's `ThreadControlBlock`.
     let (map_base, map_len, valid) = unsafe {
         if (*tcb).magic != TCB_MAGIC {
             (0, 0, false)
@@ -1786,7 +1789,7 @@ unsafe extern "C" fn rtld_free_thread_tls(tp_arg: u64) {
     RTLD_STATE.with(|state| {
         if let Some(free_fn) = state.host_free {
             for m in 1..=MAX_OBJECTS {
-                // SAFETY: `tcb` belongs exclusively to this exiting thread.
+                // SAFETY: `tcb` belongs exclusively to the exiting/unstarted thread.
                 let ptr_u64 = unsafe { (*tcb).dyn_allocs[m] };
                 if ptr_u64 != 0 {
                     // SAFETY: `ptr_u64` was returned by `host_alloc`.
@@ -1794,7 +1797,7 @@ unsafe extern "C" fn rtld_free_thread_tls(tp_arg: u64) {
                 }
             }
         }
-        if tp_arg == 0 {
+        if tp == cur_tp {
             let _ = process::set_fs_base(0);
         }
         if let Some(ref vmar) = state.self_vmar {

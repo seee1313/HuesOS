@@ -1216,6 +1216,42 @@ fn build_bootfs_image(manifest_dir: &Path, inputs: BootfsInputs<'_>) -> PathBuf 
             data: read_build_input(&inputs.coreutils_dir.join("nano"), "nano ELF"),
         },
         BootFsFile {
+            path: "/bin/ln.elf",
+            data: read_build_input(&inputs.coreutils_dir.join("ln"), "ln ELF"),
+        },
+        BootFsFile {
+            path: "/bin/cp.elf",
+            data: read_build_input(&inputs.coreutils_dir.join("cp"), "cp ELF"),
+        },
+        BootFsFile {
+            path: "/bin/chmod.elf",
+            data: read_build_input(&inputs.coreutils_dir.join("chmod"), "chmod ELF"),
+        },
+        BootFsFile {
+            path: "/bin/readlink.elf",
+            data: read_build_input(&inputs.coreutils_dir.join("readlink"), "readlink ELF"),
+        },
+        BootFsFile {
+            path: "/bin/seq.elf",
+            data: read_build_input(&inputs.coreutils_dir.join("seq"), "seq ELF"),
+        },
+        BootFsFile {
+            path: "/bin/uniq.elf",
+            data: read_build_input(&inputs.coreutils_dir.join("uniq"), "uniq ELF"),
+        },
+        BootFsFile {
+            path: "/bin/tee.elf",
+            data: read_build_input(&inputs.coreutils_dir.join("tee"), "tee ELF"),
+        },
+        BootFsFile {
+            path: "/bin/basename.elf",
+            data: read_build_input(&inputs.coreutils_dir.join("basename"), "basename ELF"),
+        },
+        BootFsFile {
+            path: "/bin/dirname.elf",
+            data: read_build_input(&inputs.coreutils_dir.join("dirname"), "dirname ELF"),
+        },
+        BootFsFile {
             path: "/lib/ld-huesos.so",
             data: read_build_input(inputs.ld_huesos, "ld-huesos.so"),
         },

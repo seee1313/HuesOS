@@ -2118,19 +2118,20 @@ pub unsafe extern "C" fn canvas_stdin_read(
     buf_len: usize,
     out_read: *mut usize,
 ) -> i64 {
-    // SAFETY: caller guarantees `out_buf` is valid for `buf_len` bytes.
-    let Ok(dst) = (unsafe { write_slice(out_buf, buf_len) }) else {
-        return err_code(ErrorCode::InvalidArgs);
-    };
-    match crate::stdio::stdin_read(dst) {
-        Ok(n) => {
-            if !out_read.is_null() {
-                // SAFETY: `write_out` checks pointer validity/alignment.
-                return to_abi_result(unsafe { write_out(out_read, n) });
+    // SAFETY: caller guarantees `out_buf` and `out_read` satisfy the C ABI contract.
+    unsafe {
+        let Ok(dst) = write_slice(out_buf, buf_len) else {
+            return err_code(ErrorCode::InvalidArgs);
+        };
+        match crate::stdio::stdin_read(dst) {
+            Ok(n) => {
+                if !out_read.is_null() {
+                    return to_abi_result(write_out(out_read, n));
+                }
+                0
             }
-            0
+            Err(err) => err_code(err),
         }
-        Err(err) => err_code(err),
     }
 }
 
@@ -2224,19 +2225,20 @@ pub unsafe extern "C" fn canvas_stdout_write(
     len: usize,
     out_written: *mut usize,
 ) -> i64 {
-    // SAFETY: caller guarantees `data` is readable for `len` bytes.
-    let Ok(src) = (unsafe { read_bytes(data, len) }) else {
-        return err_code(ErrorCode::InvalidArgs);
-    };
-    match crate::stdio::stdout_write(src) {
-        Ok(n) => {
-            if !out_written.is_null() {
-                // SAFETY: `write_out` checks pointer validity/alignment.
-                return to_abi_result(unsafe { write_out(out_written, n) });
+    // SAFETY: caller guarantees `data` and `out_written` satisfy the C ABI contract.
+    unsafe {
+        let Ok(src) = read_bytes(data, len) else {
+            return err_code(ErrorCode::InvalidArgs);
+        };
+        match crate::stdio::stdout_write(src) {
+            Ok(n) => {
+                if !out_written.is_null() {
+                    return to_abi_result(write_out(out_written, n));
+                }
+                0
             }
-            0
+            Err(err) => err_code(err),
         }
-        Err(err) => err_code(err),
     }
 }
 
@@ -2250,19 +2252,20 @@ pub unsafe extern "C" fn canvas_stderr_write(
     len: usize,
     out_written: *mut usize,
 ) -> i64 {
-    // SAFETY: caller guarantees `data` is readable for `len` bytes.
-    let Ok(src) = (unsafe { read_bytes(data, len) }) else {
-        return err_code(ErrorCode::InvalidArgs);
-    };
-    match crate::stdio::stderr_write(src) {
-        Ok(n) => {
-            if !out_written.is_null() {
-                // SAFETY: `write_out` checks pointer validity/alignment.
-                return to_abi_result(unsafe { write_out(out_written, n) });
+    // SAFETY: caller guarantees `data` and `out_written` satisfy the C ABI contract.
+    unsafe {
+        let Ok(src) = read_bytes(data, len) else {
+            return err_code(ErrorCode::InvalidArgs);
+        };
+        match crate::stdio::stderr_write(src) {
+            Ok(n) => {
+                if !out_written.is_null() {
+                    return to_abi_result(write_out(out_written, n));
+                }
+                0
             }
-            0
+            Err(err) => err_code(err),
         }
-        Err(err) => err_code(err),
     }
 }
 

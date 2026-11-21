@@ -69,6 +69,7 @@ dependencies = [
  "huesos-blobfs",
  "huesos-elf",
  "huesos-scudo",
+ "spin",
 ]
 
 [[package]]
