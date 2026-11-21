@@ -593,6 +593,26 @@ pub enum Syscall {
     /// `a1` is validated for alignment only (the kernel never dereferences
     /// it here), and wakes never fail because the address became unmapped.
     FutexWake = 85,
+    /// Read a scheduler snapshot: one [`SchedSummary`] followed by one
+    /// [`SchedCpuRecord`] per online CPU.
+    ///
+    /// `a1` is a `*mut u8` output buffer and `a2` its length. Returns the
+    /// number of bytes written, which is `0` when the buffer is too small for
+    /// even the summary -- a caller sizes the buffer after
+    /// [`Self::SystemCpuCount`] and never has to guess.
+    ///
+    /// Unprivileged: these are counters a monitor needs, and a monitor that
+    /// needs an authority to read a counter is a monitor that is not running
+    /// when the counters matter.
+    SystemSchedStats = 86,
+    /// Read one task record: `a1` is the index to start at, `a2` a `*mut u8`
+    /// output buffer of whole [`TaskRecord`]s, `a3` its length.
+    ///
+    /// Returns `(records_written << 32) | total_tasks`, so a caller can tell
+    /// "this is the last page" from "the table grew" without a second call.
+    /// The index space is the kernel's enumeration order, which is stable
+    /// within a snapshot but may shift when a task is reaped.
+    SystemTaskQuery = 87,
 }
 
 /// Maximum number of bytes one [`Syscall::SystemGetEntropy`] call
@@ -610,6 +630,206 @@ pub const OBSERVATION_RECORD_SIZE: usize = 32;
 /// produce. Bounds the time spent copying with the ring lock held; a
 /// caller wanting more loops on the returned sequence number.
 pub const MAX_OBSERVATION_BYTES: usize = 4096;
+
+/// Aggregate scheduler counters, the first record of a
+/// [`Syscall::SystemSchedStats`] reply.
+///
+/// Every field is a monotonic count since boot. Names say exactly what is
+/// counted: this scheduler pushes work to remote CPUs (there is no work
+/// stealer), so the migration machinery shows up as `remote_wakes` and
+/// `resched_ipis` rather than a "steals" number that would always be zero.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct SchedSummary {
+    /// Online CPUs, which is also how many [`SchedCpuRecord`]s follow.
+    pub cpu_count: u32,
+    /// Bytes in each [`SchedCpuRecord`], so a reader can skip unknown fields.
+    pub record_size: u32,
+    /// Context switches since boot.
+    pub context_switches: u64,
+    /// Wakeups delivered to a task running on another CPU.
+    pub remote_wakes: u64,
+    /// Reschedule IPIs sent to a remote CPU.
+    pub resched_ipis: u64,
+    /// Remote-operation inbox drains.
+    pub inbox_drains: u64,
+    /// IRQ sources quarantined after a storm.
+    pub irq_storm_masks: u64,
+    /// Total admitted CBS utilization, summed over CPUs, in parts per million.
+    pub admitted_ppm: u64,
+}
+
+/// Read a little-endian-agnostic integer field out of an encoded record.
+///
+/// The kernel encodes records into caller buffers with their native field
+/// layout, so a reader takes the offset from `offset_of!` and decodes in place.
+/// Doing it byte by byte keeps the reader free of `unsafe`: a record written by
+/// an older kernel that lacks a field leaves the tail of the buffer zeroed by
+/// the sender's padding rule, so `None` here means "truncated", never "garbage".
+fn field<const N: usize>(bytes: &[u8], offset: usize) -> Option<[u8; N]> {
+    let slice = bytes.get(offset..offset.checked_add(N)?)?;
+    let mut out = [0u8; N];
+    out.copy_from_slice(slice);
+    Some(out)
+}
+
+fn read_u8(bytes: &[u8], offset: usize) -> Option<u8> {
+    field::<1>(bytes, offset).map(u8::from_ne_bytes)
+}
+
+fn read_u16(bytes: &[u8], offset: usize) -> Option<u16> {
+    field::<2>(bytes, offset).map(u16::from_ne_bytes)
+}
+
+fn read_u32(bytes: &[u8], offset: usize) -> Option<u32> {
+    field::<4>(bytes, offset).map(u32::from_ne_bytes)
+}
+
+fn read_u64(bytes: &[u8], offset: usize) -> Option<u64> {
+    field::<8>(bytes, offset).map(u64::from_ne_bytes)
+}
+
+impl SchedSummary {
+    /// Decode the summary the kernel wrote at the start of a snapshot buffer.
+    ///
+    /// Returns `None` when `bytes` is shorter than the summary, which is what a
+    /// caller sees when it sized its buffer from a stale [`SchedSummary::record_size`].
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        Some(Self {
+            cpu_count: read_u32(bytes, core::mem::offset_of!(Self, cpu_count))?,
+            record_size: read_u32(bytes, core::mem::offset_of!(Self, record_size))?,
+            context_switches: read_u64(bytes, core::mem::offset_of!(Self, context_switches))?,
+            remote_wakes: read_u64(bytes, core::mem::offset_of!(Self, remote_wakes))?,
+            resched_ipis: read_u64(bytes, core::mem::offset_of!(Self, resched_ipis))?,
+            inbox_drains: read_u64(bytes, core::mem::offset_of!(Self, inbox_drains))?,
+            irq_storm_masks: read_u64(bytes, core::mem::offset_of!(Self, irq_storm_masks))?,
+            admitted_ppm: read_u64(bytes, core::mem::offset_of!(Self, admitted_ppm))?,
+        })
+    }
+}
+
+/// Per-CPU half of a [`Syscall::SystemSchedStats`] reply.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct SchedCpuRecord {
+    /// Dense CPU index.
+    pub cpu: u32,
+    /// `1` when the CPU is online.
+    pub online: u32,
+    /// Tasks on this CPU's fair runqueue, ready to run.
+    pub runnable: u32,
+    /// Tasks owned by this CPU (running, ready or blocked).
+    pub tasks: u32,
+    /// ID of the task currently running, `0` when the CPU is idle.
+    pub current_task: u64,
+    /// Scheduler ticks spent on this CPU since boot.
+    pub ticks: u64,
+    /// Admitted CBS utilization on this CPU, parts per million.
+    pub admitted_ppm: u32,
+    /// Reserved for future counters; always zero.
+    pub reserved: u32,
+}
+
+impl SchedCpuRecord {
+    /// Decode one per-CPU record from a snapshot buffer.
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        Some(Self {
+            cpu: read_u32(bytes, core::mem::offset_of!(Self, cpu))?,
+            online: read_u32(bytes, core::mem::offset_of!(Self, online))?,
+            runnable: read_u32(bytes, core::mem::offset_of!(Self, runnable))?,
+            tasks: read_u32(bytes, core::mem::offset_of!(Self, tasks))?,
+            current_task: read_u64(bytes, core::mem::offset_of!(Self, current_task))?,
+            ticks: read_u64(bytes, core::mem::offset_of!(Self, ticks))?,
+            admitted_ppm: read_u32(bytes, core::mem::offset_of!(Self, admitted_ppm))?,
+            reserved: read_u32(bytes, core::mem::offset_of!(Self, reserved))?,
+        })
+    }
+}
+
+/// One task, as reported by [`Syscall::SystemTaskQuery`].
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TaskRecord {
+    /// Stable task ID (slot + generation).
+    pub task_id: u64,
+    /// Task name, NUL-padded.
+    pub name: [u8; 16],
+    /// Owning CPU (dense index).
+    pub cpu: u16,
+    /// Fairness weight; `0` for a deadline task.
+    pub weight: u16,
+    /// `0` kernel, `1` user.
+    pub kind: u8,
+    /// `0` running, `1` ready, `2` blocked, `3` finished.
+    pub state: u8,
+    /// `0` fair, `1` deadline.
+    pub policy: u8,
+    /// Bits 0-3: scheduler flags; reserved, always zero today.
+    pub flags: u8,
+    /// Reserved for future accounting; always zero.
+    pub reserved: u64,
+}
+
+impl Default for TaskRecord {
+    fn default() -> Self {
+        Self {
+            task_id: 0,
+            name: [0u8; 16],
+            cpu: 0,
+            weight: 0,
+            kind: 0,
+            state: 1,
+            policy: 0,
+            flags: 0,
+            reserved: 0,
+        }
+    }
+}
+
+impl TaskRecord {
+    /// Decode one task record from a [`Syscall::SystemTaskQuery`] page.
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        Some(Self {
+            task_id: read_u64(bytes, core::mem::offset_of!(Self, task_id))?,
+            name: field::<16>(bytes, core::mem::offset_of!(Self, name))?,
+            cpu: read_u16(bytes, core::mem::offset_of!(Self, cpu))?,
+            weight: read_u16(bytes, core::mem::offset_of!(Self, weight))?,
+            kind: read_u8(bytes, core::mem::offset_of!(Self, kind))?,
+            state: read_u8(bytes, core::mem::offset_of!(Self, state))?,
+            policy: read_u8(bytes, core::mem::offset_of!(Self, policy))?,
+            flags: read_u8(bytes, core::mem::offset_of!(Self, flags))?,
+            reserved: read_u64(bytes, core::mem::offset_of!(Self, reserved))?,
+        })
+    }
+
+    /// The task name as a string slice, stopping at the first NUL.
+    pub fn name_str(&self) -> &str {
+        let end = self
+            .name
+            .iter()
+            .position(|byte| *byte == 0)
+            .unwrap_or(self.name.len());
+        core::str::from_utf8(&self.name[..end]).unwrap_or("<invalid>")
+    }
+
+    /// Human-readable state.
+    pub fn state_str(&self) -> &'static str {
+        match self.state {
+            0 => "running",
+            1 => "ready",
+            2 => "blocked",
+            _ => "finished",
+        }
+    }
+
+    /// Human-readable class.
+    pub fn class_str(&self) -> &'static str {
+        match self.policy {
+            0 => "fair",
+            _ => "deadline",
+        }
+    }
+}
 
 /// Wire-format knob selector for [`Syscall::SystemKnobGet`] and
 /// [`Syscall::SystemKnobSet`].
@@ -672,7 +892,7 @@ impl Syscall {
     /// Total number of defined syscalls (i.e. one past the highest
     /// currently-assigned number). The dispatcher uses this to reject
     /// obviously-out-of-range numbers before a `match`.
-    pub const COUNT: u64 = 86;
+    pub const COUNT: u64 = 88;
 
     /// Convert a raw syscall number back into a [`Syscall`], if valid.
     pub const fn from_raw(n: u64) -> Option<Self> {
@@ -763,6 +983,8 @@ impl Syscall {
             83 => Self::ProcessTerminate,
             84 => Self::FutexWait,
             85 => Self::FutexWake,
+            86 => Self::SystemSchedStats,
+            87 => Self::SystemTaskQuery,
             _ => return None,
         })
     }
@@ -1678,14 +1900,24 @@ mod tests {
         assert_eq!(Syscall::ResourceUnmap as u64, 65);
         assert_eq!(Syscall::InterruptCreateGsiForResource as u64, 66);
         assert_eq!(Syscall::InterruptAcknowledge as u64, 67);
-        assert_eq!(Syscall::COUNT, 86);
+        assert_eq!(Syscall::COUNT, 88);
         assert_eq!(Syscall::ProcessTerminate as u64, 83);
         assert_eq!(Syscall::FutexWait as u64, 84);
         assert_eq!(Syscall::FutexWake as u64, 85);
         assert_eq!(Syscall::from_raw(83), Some(Syscall::ProcessTerminate));
         assert_eq!(Syscall::from_raw(84), Some(Syscall::FutexWait));
         assert_eq!(Syscall::from_raw(85), Some(Syscall::FutexWake));
-        assert_eq!(Syscall::from_raw(86), None);
+        assert_eq!(
+            Syscall::from_raw(86),
+            Some(Syscall::SystemSchedStats),
+            "the scheduler snapshot sits right after FutexWake"
+        );
+        assert_eq!(
+            Syscall::from_raw(87),
+            Some(Syscall::SystemTaskQuery),
+            "the task table sits right after the snapshot"
+        );
+        assert_eq!(Syscall::from_raw(88), None);
         assert_eq!(Syscall::from_raw(28), Some(Syscall::VmoCreateEx));
         assert_eq!(Syscall::from_raw(30), Some(Syscall::VmarProtect));
         assert_eq!(Syscall::from_raw(31), Some(Syscall::ChannelPeek));
@@ -1756,8 +1988,12 @@ mod tests {
         assert_eq!(Syscall::from_raw(81), Some(Syscall::ThreadExit));
         assert_eq!(Syscall::from_raw(82), Some(Syscall::ThreadWait));
         assert_eq!(Syscall::from_raw(83), Some(Syscall::ProcessTerminate));
+        assert_eq!(Syscall::from_raw(84), Some(Syscall::FutexWait));
+        assert_eq!(Syscall::from_raw(85), Some(Syscall::FutexWake));
+        assert_eq!(Syscall::from_raw(86), Some(Syscall::SystemSchedStats));
+        assert_eq!(Syscall::from_raw(87), Some(Syscall::SystemTaskQuery));
         // Append-only: the next number past the newest syscall stays unmapped.
-        assert_eq!(Syscall::from_raw(86), None);
+        assert_eq!(Syscall::from_raw(88), None);
     }
 
     #[test]

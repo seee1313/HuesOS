@@ -1,13 +1,17 @@
 //! `/bin/fdisk.elf` — Protective MBR + GPT partitioning utility for HuesOS.
 //!
 //! Dynamic `ET_DYN` ELF (`PT_INTERP=/lib/ld-huesos.so`, `DT_NEEDED=libcanvas.so`).
-//! Reads `argc`/`argv` and `@caps(...)` mask from `libcanvas::stdio`, writes
-//! TSV/text to `stdout`/`stderr`, and enforces `@caps(hxfs=none|ro)` fail-closed.
+//! Without a subcommand it opens the interactive screen (`tui.rs`); with one it
+//! runs the batch operation a script asked for. Reads `argc`/`argv` and the
+//! `@caps(...)` mask from `libcanvas::stdio`, writes to `stdout`/`stderr`, and
+//! enforces `@caps(hxfs=none|ro)` fail-closed.
 
 #![no_std]
 #![no_main]
 
 extern crate alloc;
+
+mod tui;
 
 use alloc::format;
 use alloc::string::String;
@@ -57,6 +61,8 @@ struct NvmeBlockIo {
     dev: RefCell<BlockDevice>,
     total_lbas: u64,
     block_size: u32,
+    /// Whether the capability allows writes.
+    writable: bool,
 }
 
 impl NvmeBlockIo {
@@ -72,6 +78,7 @@ impl NvmeBlockIo {
             dev: RefCell::new(dev),
             total_lbas,
             block_size,
+            writable: true,
         })
     }
 }
@@ -123,6 +130,8 @@ impl BlockIo512 for NvmeBlockIo {
 struct HxfsImageIo {
     file: HxfsFile,
     total_lbas: u64,
+    /// Whether the image was opened for writing.
+    writable: bool,
 }
 
 impl HxfsImageIo {
@@ -156,6 +165,7 @@ impl HxfsImageIo {
         Ok(Self {
             file,
             total_lbas: (size / LBA_SIZE as u64).max(min_lbas),
+            writable: write,
         })
     }
 }
@@ -193,14 +203,19 @@ impl BlockIo512 for HxfsImageIo {
     }
 }
 
-struct SparseMemDisk {
+struct MemoryDisk {
     total_lbas: u64,
     sectors: alloc::collections::BTreeMap<u64, [u8; LBA_SIZE]>,
 }
 
-impl SparseMemDisk {
-    fn seeded_demo() -> Result<Self, String> {
-        let total_lbas = 2_097_152u64; // 1 GiB virtual disk
+impl MemoryDisk {
+    /// A 1 GiB volume held in memory with a small GPT fixture on it.
+    ///
+    /// `/dev/mem` names this volume: it makes the partition editor scriptable
+    /// (and lets the boot smoke drive the real GPT writer, CRC recomputation
+    /// and `verify` path) without needing a disk to be present.
+    fn with_fixture() -> Result<Self, String> {
+        let total_lbas = 2_097_152u64;
         let mut io = Self {
             total_lbas,
             sectors: alloc::collections::BTreeMap::new(),
@@ -214,7 +229,7 @@ impl SparseMemDisk {
     }
 }
 
-impl BlockIo512 for SparseMemDisk {
+impl BlockIo512 for MemoryDisk {
     fn total_lbas(&self) -> u64 {
         self.total_lbas
     }
@@ -246,7 +261,18 @@ impl BlockIo512 for SparseMemDisk {
 enum Backend {
     Nvme(NvmeBlockIo),
     Hxfs(HxfsImageIo),
-    Demo(SparseMemDisk),
+    Memory(MemoryDisk),
+}
+
+impl Backend {
+    /// True when writes reach the store.
+    fn is_writable(&self) -> bool {
+        match self {
+            Backend::Nvme(io) => io.writable,
+            Backend::Hxfs(io) => io.writable,
+            Backend::Memory(_) => true,
+        }
+    }
 }
 
 impl BlockIo512 for Backend {
@@ -254,7 +280,7 @@ impl BlockIo512 for Backend {
         match self {
             Backend::Nvme(b) => b.total_lbas(),
             Backend::Hxfs(b) => b.total_lbas(),
-            Backend::Demo(b) => b.total_lbas(),
+            Backend::Memory(b) => b.total_lbas(),
         }
     }
 
@@ -262,7 +288,7 @@ impl BlockIo512 for Backend {
         match self {
             Backend::Nvme(b) => b.read_lba(lba, out),
             Backend::Hxfs(b) => b.read_lba(lba, out),
-            Backend::Demo(b) => b.read_lba(lba, out),
+            Backend::Memory(b) => b.read_lba(lba, out),
         }
     }
 
@@ -270,7 +296,7 @@ impl BlockIo512 for Backend {
         match self {
             Backend::Nvme(b) => b.write_lba(lba, data),
             Backend::Hxfs(b) => b.write_lba(lba, data),
-            Backend::Demo(b) => b.write_lba(lba, data),
+            Backend::Memory(b) => b.write_lba(lba, data),
         }
     }
 
@@ -278,7 +304,7 @@ impl BlockIo512 for Backend {
         match self {
             Backend::Nvme(b) => b.flush(),
             Backend::Hxfs(b) => b.flush(),
-            Backend::Demo(b) => b.flush(),
+            Backend::Memory(b) => b.flush(),
         }
     }
 }
@@ -423,15 +449,13 @@ fn open_backend(target: Option<&str>, write: bool, min_lbas: u64) -> Result<Back
             return HxfsImageIo::open(path, write, min_lbas).map(Backend::Hxfs);
         }
     }
-    // `/dev/mem` is the scratch in-memory disk: a writable GPT fixture that
-    // never touches the real device, so `gpt-init`/`add`/`del` can be
-    // exercised on a machine whose only block device already holds a bare
-    // HxFS volume.
+    // `/dev/mem` is an in-memory volume with a GPT fixture: it makes the
+    // editor scriptable and keeps `gpt-init`/`add`/`del` exercisable in tests.
     if target == Some("/dev/mem") {
         if write {
             require_write_cap(mask, false)?;
         }
-        return SparseMemDisk::seeded_demo().map(Backend::Demo);
+        return MemoryDisk::with_fixture().map(Backend::Memory);
     }
     if let Some(h) = stdio::take_cap_handle(CapKind::BlockDev) {
         if write && (mask & (caps_mask::BLOCK_RW | caps_mask::HXFS_RW)) == 0 {
@@ -442,12 +466,43 @@ fn open_backend(target: Option<&str>, write: bool, min_lbas: u64) -> Result<Back
     if write {
         require_write_cap(mask, false)?;
     }
-    SparseMemDisk::seeded_demo().map(Backend::Demo)
+    MemoryDisk::with_fixture().map(Backend::Memory)
 }
 
 fn run() -> i32 {
     let args = collect_args();
-    let sub = args.get(1).map(String::as_str).unwrap_or("list");
+    // Batch subcommands are for scripts; no subcommand (or `-i`) is the
+    // interactive editor, and `fdisk /dev/nvme0n1` names a target for it.
+    const SUBCOMMANDS: &[&str] = &[
+        "list",
+        "--list",
+        "inspect",
+        "verify",
+        "gpt-init",
+        "add",
+        "del",
+        "resize",
+        "help",
+        "--help",
+        "-h",
+        "interactive",
+        "-i",
+        "--interactive",
+    ];
+    let first = args.get(1).map(String::as_str);
+    let (sub, mut target): (&str, Option<&str>) = match first {
+        None => ("interactive", None),
+        Some(word) if SUBCOMMANDS.contains(&word) => {
+            let sub = match word {
+                "interactive" | "-i" | "--interactive" => "interactive",
+                other => other,
+            };
+            (sub, None)
+        }
+        // A bare path is a target for the interactive editor.
+        Some(word) if !word.starts_with('-') => ("interactive", Some(word)),
+        Some(other) => (other, None),
+    };
 
     let mut dry_run = false;
     let mut force = false;
@@ -456,7 +511,6 @@ fn run() -> i32 {
     let mut size_str = "64M";
     let mut name_str = "HuesOS-Part";
     let mut part_num_arg: Option<usize> = None;
-    let mut target: Option<&str> = None;
 
     let mut i = 2usize;
     while i < args.len() {
@@ -511,8 +565,27 @@ fn run() -> i32 {
     let mask = stdio::caps_mask();
     let res: Result<String, String> = match sub {
         "help" | "--help" | "-h" => Ok(String::from(
-            "usage: fdisk <list|--list|inspect|verify|gpt-init|add|del|resize> [opts] [target]\n  --type <hxfs|esp|linux|swap|basic|UUID>  --size <64M|1G|LBAs>  --start <LBA>  --name <label>  --dry-run  --force\n  a target without a GPT but with a bare HxFS superblock is reported as `raw-hxfs`;\n  gpt-init refuses to erase such a volume unless --force is given;\n  /dev/mem selects the writable in-memory scratch disk (never the real device)\n",
+            "usage: fdisk [<device|image>]                    interactive editor\n       fdisk <list|inspect|verify|gpt-init|add|del|resize> [opts] [target]\n  --type <hxfs|esp|linux|swap|basic|UUID>  --size <64M|1G|LBAs>  --start <LBA>  --name <label>  --dry-run  --force\n  a target without a GPT but with a bare HxFS superblock is reported as `raw-hxfs`;\n  gpt-init refuses to erase such a volume unless --force is given;\n  /dev/mem names an in-memory volume with a GPT fixture, for scripting\n",
         )),
+        "interactive" => {
+            let label = target.unwrap_or("/dev/mem");
+            let mut io = match open_backend(target, true, 4096) {
+                Ok(io) => io,
+                Err(error) => {
+                    // A read-only store still gets an editor: everything except
+                    // `w` works, and `w` says why it cannot.
+                    match open_backend(target, false, 4096) {
+                        Ok(io) => {
+                            let _ = stdio::stderr_str(&format!("fdisk: {error}\n"));
+                            io
+                        }
+                        Err(fatal) => return fail_msg(&fatal),
+                    }
+                }
+            };
+            let writable = io.is_writable();
+            return tui::interactive(&mut io, label, writable);
+        }
         "list" | "--list" => {
             let io = match open_backend(target, false, 4096) {
                 Ok(b) => b,

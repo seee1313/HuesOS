@@ -69,8 +69,19 @@ pub extern "C" fn _start() -> ! {
 }
 
 #[panic_handler]
-fn panic(_info: &PanicInfo<'_>) -> ! {
-    println!("[hsh] PANIC");
+fn panic(info: &PanicInfo<'_>) -> ! {
+    // The location is the whole value of this handler: the shell runs the boot
+    // gates, so a bare "PANIC" costs a full rebuild-and-boot cycle to localise.
+    if let Some(location) = info.location() {
+        println!(
+            "[hsh] PANIC at {}:{}:{}",
+            location.file(),
+            location.line(),
+            location.column()
+        );
+    } else {
+        println!("[hsh] PANIC");
+    }
     exit(1)
 }
 
@@ -720,11 +731,12 @@ impl InteractiveShell {
 
         // 5. External `/bin/fdisk.elf` pipe.
         //
-        //    The disk under `fdisk list` depends on the boot: the in-memory
-        //    demo disk carries a GPT with an `HxFS-Root` partition, while the
-        //    CI machine with an NVMe volume gets a bare `HxFS v7` superfloppy
-        //    (no partition table at all). Both shapes have to survive the pipe
-        //    stage; the column names differ, so the filter follows the shape.
+        //    The disk under `fdisk list` depends on the boot: a machine with no
+        //    block capability falls back to the `/dev/mem` fixture volume,
+        //    which carries a GPT with an `HxFS-Root` partition, while a boot
+        //    with an NVMe volume gets whatever that volume holds. Both shapes
+        //    have to survive the pipe stage; the column names differ, so the
+        //    filter follows the shape.
         let (list_filter, list_expect) = if self.host.hxfs.is_some() {
             ("fdisk list | where status == OK", "raw-hxfs")
         } else {
@@ -758,6 +770,46 @@ impl InteractiveShell {
                 println!("[hsh] @caps(hxfs=ro) enforcement OK");
             }
             _ => println!("[hsh] @caps(hxfs=ro) enforcement FAILED"),
+        }
+
+        // 6b. The positive half of the write path: a default-capability child
+        //     must be able to create, write, read back, list and remove a file
+        //     on the mounted volume. The read-only cases above only prove
+        //     refusal, and a boot with storage that cannot round-trip a byte is
+        //     broken in a way the refusal checks cannot see.
+        if self.host.hxfs.is_some() {
+            let created = smoke_env.eval_script("touch /hsh-smoke.txt", &mut self.host);
+            let written = smoke_env.eval_script("write /hsh-smoke.txt hello", &mut self.host);
+            let readback = smoke_env.eval_script("cat /hsh-smoke.txt", &mut self.host);
+            let hashed = smoke_env.eval_script("sha256sum /hsh-smoke.txt", &mut self.host);
+            let listed = smoke_env.eval_script("ls /hsh-smoke.txt | count", &mut self.host);
+            let removed = smoke_env.eval_script("rm /hsh-smoke.txt", &mut self.host);
+            let step = |result: Option<&huesos_hsh::eval::EvalResult>| match result {
+                Some(outcome) => (outcome.status, outcome.render_text()),
+                None => (-1, String::from("<error>")),
+            };
+            let (touch_status, touch_out) = step(created.as_ref().ok());
+            let (write_status, write_out) = step(written.as_ref().ok());
+            let (cat_status, cat_out) = step(readback.as_ref().ok());
+            let (ls_status, ls_out) = step(listed.as_ref().ok());
+            let (rm_status, rm_out) = step(removed.as_ref().ok());
+            let (hash_status, hash_out) = step(hashed.as_ref().ok());
+            if touch_status == 0
+                && write_status == 0
+                && cat_status == 0
+                && cat_out.trim() == "hello"
+                && ls_status == 0
+                && ls_out.trim() == "1"
+                && rm_status == 0
+            {
+                println!("[hsh] volume write path OK (touch/write/cat/ls/rm)");
+            } else {
+                println!(
+                    "[hsh] volume write path FAILED touch={touch_status}:{touch_out:?} write={write_status}:{write_out:?} cat={cat_status}:{cat_out:?} sha={hash_status}:{hash_out:?} ls={ls_status}:{ls_out:?} rm={rm_status}:{rm_out:?}"
+                );
+            }
+        } else {
+            println!("[hsh] volume write path SKIP (no block device)");
         }
 
         // 7. `@caps(hxfs=none, bootfs=none)` enforcement across `fdisk.elf` and `ls.elf`
@@ -861,9 +913,9 @@ impl InteractiveShell {
 
         // 10. `fdisk gpt-init --dry-run` must always be safe, and a real
         //     init/add/del/verify cycle must round-trip on a writable disk.
-        //     Both run against the in-memory scratch disk (`/dev/mem`) so the
-        //     live volume on the default target is never touched; the real
-        //     GPT writer, its CRC recomputation and `verify` all run for real.
+        //     Both run against the `/dev/mem` volume so the boot volume is
+        //     never touched; the GPT writer, its CRC recomputation and
+        //     `verify` all run for real.
         //
         //     The same cycle also has to work on a disk image stored as an
         //     ordinary HxFS *file*: that is what needs random-offset writes
@@ -927,6 +979,73 @@ impl InteractiveShell {
             println!("[hsh] fdisk gpt init/add/del/verify OK");
         }
 
+        // 10b2. Scheduler observability: `schedctl` reads the aggregate and
+        //       per-CPU records through `SystemSchedStats`, pages the task
+        //       table through `SystemTaskQuery`, and `btop` renders the same
+        //       data as a frame. The frame run is ended by the synthetic
+        //       interrupt, so a full-screen program that never returns cannot
+        //       hang the smoke gate.
+        match smoke_env.eval_script("schedctl cpus", &mut self.host) {
+            Ok(res)
+                if res.status == 0
+                    && res.render_text().contains("scheduler:")
+                    && res.render_text().contains("RUNQ") =>
+            {
+                println!("[hsh] schedctl cpus OK");
+            }
+            Ok(res) => println!(
+                "[hsh] schedctl cpus FAILED status={} out={}",
+                res.status,
+                res.render_text()
+            ),
+            Err(e) => println!("[hsh] schedctl cpus ERROR: {e}"),
+        }
+        match smoke_env.eval_script("schedctl tasks", &mut self.host) {
+            Ok(res)
+                if res.status == 0
+                    && res.render_text().contains("STATE")
+                    && res.render_text().contains("task(s)") =>
+            {
+                println!("[hsh] schedctl tasks OK");
+            }
+            Ok(res) => println!(
+                "[hsh] schedctl tasks FAILED status={} out={}",
+                res.status,
+                res.render_text()
+            ),
+            Err(e) => println!("[hsh] schedctl tasks ERROR: {e}"),
+        }
+        match smoke_env.eval_script("schedctl bench", &mut self.host) {
+            Ok(res)
+                if res.status == 0
+                    && res.render_text().contains("context switches")
+                    && res.render_text().contains("window:") =>
+            {
+                println!("[hsh] schedctl bench OK");
+            }
+            Ok(res) => println!(
+                "[hsh] schedctl bench FAILED status={} out={}",
+                res.status,
+                res.render_text()
+            ),
+            Err(e) => println!("[hsh] schedctl bench ERROR: {e}"),
+        }
+        // `-n 1` draws exactly one frame and exits, so this needs no kill and
+        // the exit status alone says whether the frame was drawn. A kill-based
+        // gate could not fail: the frame and the `^C` echo look the same.
+        let frame = smoke_env.eval_script("btop -i 250 -n 1", &mut self.host);
+        match frame {
+            Ok(res) if res.render_text().contains("HuesOS monitor") => {
+                println!("[hsh] btop frame OK");
+            }
+            Ok(res) => println!(
+                "[hsh] btop frame FAILED status={} out={}",
+                res.status,
+                res.render_text()
+            ),
+            Err(e) => println!("[hsh] btop frame ERROR: {e}"),
+        }
+
         // 10c. `/bin/std-smoke.elf` runs the user-space standard library inside
         //      the OS: `huesos_std::entry!`, streaming formatting, the path and
         //      error helpers (pure, always run) and a real
@@ -934,7 +1053,15 @@ impl InteractiveShell {
         //      volume. The binary prints its own `[std] FAIL` lines and only
         //      reports PASS when every check held, so the status plus the
         //      marker is the whole contract.
-        match smoke_env.eval_script("std-smoke", &mut self.host) {
+        // A smoke that never returns must fail the boot gate, not hang it: a
+        // hung QEMU is indistinguishable from a slow machine in CI, and the
+        // partial output is what localises the stall.
+        self.host.auto_interrupts = 1;
+        self.host.auto_interrupt_after_ticks = 3000;
+        let std_smoke = smoke_env.eval_script("std-smoke", &mut self.host);
+        self.host.auto_interrupts = 0;
+        self.host.auto_interrupt_after_ticks = 0;
+        match std_smoke {
             Ok(res) if res.status == 0 && res.render_text().contains("[std] PASS") => {
                 println!("[hsh] huesos-std smoke OK");
             }

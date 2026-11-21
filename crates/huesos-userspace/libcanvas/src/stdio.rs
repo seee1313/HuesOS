@@ -166,6 +166,18 @@ mod imp {
     }
 
     pub fn stdin_read(out: &mut [u8]) -> Result<usize> {
+        stdin_read_mode(out, None)
+    }
+
+    /// Read from `stdin`, waiting at most `ticks` scheduler ticks.
+    ///
+    /// `Err(ErrorCode::TimedOut)` means nothing arrived; a monitor uses it to
+    /// redraw on its own schedule instead of parking until the next keystroke.
+    pub fn stdin_read_timeout(out: &mut [u8], ticks: u64) -> Result<usize> {
+        stdin_read_mode(out, Some(ticks.max(1)))
+    }
+
+    fn stdin_read_mode(out: &mut [u8], timeout_ticks: Option<u64>) -> Result<usize> {
         if out.is_empty() {
             return Ok(0);
         }
@@ -203,9 +215,16 @@ mod imp {
             let mut tmp = [0u8; STDIO_CHUNK_BYTES];
             let ch = Channel::from_handle(Handle::from_syscall_out(raw_h));
             let read_res = loop {
-                match ch.read_into_blocking(&mut tmp) {
+                let attempt = match timeout_ticks {
+                    Some(ticks) => ch.read_into_timeout(&mut tmp, ticks),
+                    None => ch.read_into_blocking(&mut tmp),
+                };
+                match attempt {
                     Ok(n) => break Ok(n),
                     Err(ErrorCode::ShouldWait) | Err(ErrorCode::TimedOut) => {
+                        if timeout_ticks.is_some() {
+                            break Err(ErrorCode::TimedOut);
+                        }
                         process::yield_now();
                     }
                     Err(ErrorCode::PeerClosed) => {
@@ -284,6 +303,12 @@ mod imp {
             out_len: *mut usize,
         ) -> i64;
         fn canvas_stdin_read(out_buf: *mut u8, buf_len: usize, out_read: *mut usize) -> i64;
+        fn canvas_stdin_read_timeout(
+            out_buf: *mut u8,
+            buf_len: usize,
+            ticks: u64,
+            out_read: *mut usize,
+        ) -> i64;
         fn canvas_stdout_write(data: *const u8, len: usize, out_written: *mut usize) -> i64;
         fn canvas_stderr_write(data: *const u8, len: usize, out_written: *mut usize) -> i64;
         fn canvas_exit_code(code: i32) -> !;
@@ -312,6 +337,18 @@ mod imp {
         let mut actual = 0usize;
         // SAFETY: `out` and `actual` are valid writable buffers.
         let rc = unsafe { canvas_stdin_read(out.as_mut_ptr(), out.len(), &mut actual) };
+        if rc == 0 {
+            Ok(actual)
+        } else {
+            Err(ErrorCode::from_raw(rc).unwrap_or(ErrorCode::Internal))
+        }
+    }
+
+    pub fn stdin_read_timeout(out: &mut [u8], ticks: u64) -> Result<usize> {
+        let mut actual = 0usize;
+        // SAFETY: `out` and `actual` are valid writable buffers.
+        let rc =
+            unsafe { canvas_stdin_read_timeout(out.as_mut_ptr(), out.len(), ticks, &mut actual) };
         if rc == 0 {
             Ok(actual)
         } else {
@@ -400,6 +437,12 @@ pub fn arg_str(index: usize, buf: &mut [u8]) -> Option<&str> {
 /// Read up to `out.len()` bytes from `stdin` (`Ok(0)` on EOF / `PeerClosed`).
 pub fn stdin_read(out: &mut [u8]) -> Result<usize> {
     imp::stdin_read(out)
+}
+
+/// Read up to `out.len()` bytes from `stdin`, waiting at most `ticks`
+/// scheduler ticks (`Err(ErrorCode::TimedOut)` when nothing arrived).
+pub fn stdin_read_timeout(out: &mut [u8], ticks: u64) -> Result<usize> {
+    imp::stdin_read_timeout(out, ticks)
 }
 
 /// Write all of `data` to `stdout` in `4096`-byte chunks.

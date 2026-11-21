@@ -115,8 +115,178 @@ pub const FONT_8X8: [[u8; 8]; 95] = [
 pub fn glyph(ch: char) -> Option<&'static [u8; 8]> {
     let code = ch as u32;
     if (0x20..=0x7E).contains(&code) {
-        Some(&FONT_8X8[(code - 0x20) as usize])
-    } else {
-        None
+        return Some(&FONT_8X8[(code - 0x20) as usize]);
     }
+    extended_index(code).map(|index| &EXTENDED[index])
+}
+
+// ---------------------------------------------------------------------------
+// Generated non-ASCII glyphs: box drawing, block elements and Braille.
+//
+// Same table as the 6x13 font, generated for an 8-pixel cell by the same
+// `const fn`s: frames (`─│┌┐└┘`), bars (`█` and the `░▒▓` shades) and Braille
+// sub-cell history (`⣿`-style patterns, two columns by four rows).
+// ---------------------------------------------------------------------------
+
+/// Codepoints with generated glyphs, in table order after the Braille block.
+const EXTENDED_CODEPOINTS: [u32; 22] = [
+    0x2500, 0x2502, 0x250C, 0x2510, 0x2514, 0x2518, 0x251C, 0x2524, 0x252C, 0x2534, 0x253C, 0x2588,
+    0x2589, 0x258A, 0x258B, 0x258C, 0x258D, 0x258E, 0x258F, 0x2591, 0x2592, 0x2593,
+];
+
+const CELL_W: usize = 8;
+const CELL_H: usize = 8;
+
+/// Braille patterns occupy `[0, 256)`, the codepoints above follow them.
+const EXTENDED_LEN: usize = 256 + EXTENDED_CODEPOINTS.len();
+
+static EXTENDED: [[u8; CELL_H]; EXTENDED_LEN] = build_extended();
+
+const fn extended_index(code: u32) -> Option<usize> {
+    if code >= 0x2800 && code <= 0x28FF {
+        return Some((code - 0x2800) as usize);
+    }
+    let mut index = 0;
+    while index < EXTENDED_CODEPOINTS.len() {
+        if EXTENDED_CODEPOINTS[index] == code {
+            return Some(256 + index);
+        }
+        index += 1;
+    }
+    None
+}
+
+const fn set_pixel(cell: &mut [u8; CELL_H], x: usize, y: usize) {
+    if x < CELL_W && y < CELL_H {
+        cell[y] |= 1 << x;
+    }
+}
+
+const fn build_extended() -> [[u8; CELL_H]; EXTENDED_LEN] {
+    let mut table = [[0u8; CELL_H]; EXTENDED_LEN];
+    let mut pattern = 0;
+    while pattern < 256 {
+        let mut bit = 0;
+        while bit < 8 {
+            if pattern & (1 << bit) != 0 {
+                let column = if bit < 3 || bit == 6 { 0 } else { 1 };
+                let row = match bit {
+                    0 | 3 => 0,
+                    1 | 4 => 1,
+                    2 | 5 => 2,
+                    _ => 3,
+                };
+                let base_x = if column == 0 { 1 } else { 5 };
+                let base_y = row * 2;
+                let mut dy = 0;
+                while dy < 2 {
+                    let mut dx = 0;
+                    while dx < 2 {
+                        set_pixel(&mut table[pattern], base_x + dx, base_y + dy);
+                        dx += 1;
+                    }
+                    dy += 1;
+                }
+            }
+            bit += 1;
+        }
+        pattern += 1;
+    }
+
+    let mut entry = 0;
+    while entry < EXTENDED_CODEPOINTS.len() {
+        let code = EXTENDED_CODEPOINTS[entry];
+        let mut cell = [0u8; CELL_H];
+        let middle = CELL_H / 2;
+        match code {
+            0x2500 => {
+                let mut x = 0;
+                while x < CELL_W {
+                    set_pixel(&mut cell, x, middle);
+                    x += 1;
+                }
+            }
+            0x2502 => {
+                let mut y = 0;
+                while y < CELL_H {
+                    set_pixel(&mut cell, CELL_W / 2, y);
+                    y += 1;
+                }
+            }
+            0x250C | 0x2510 | 0x2514 | 0x2518 | 0x251C | 0x2524 | 0x252C | 0x2534 | 0x253C => {
+                let centre_x = CELL_W / 2;
+                let (left, right, up) = match code {
+                    0x250C => (false, true, false),
+                    0x2510 => (true, false, false),
+                    0x2514 => (false, true, true),
+                    0x2518 => (true, false, true),
+                    0x251C => (false, true, true),
+                    0x2524 => (true, false, true),
+                    0x252C => (true, true, false),
+                    0x2534 => (true, true, true),
+                    _ => (true, true, true),
+                };
+                if left {
+                    let mut x = 0;
+                    while x <= centre_x {
+                        set_pixel(&mut cell, x, middle);
+                        x += 1;
+                    }
+                }
+                if right {
+                    let mut x = centre_x;
+                    while x < CELL_W {
+                        set_pixel(&mut cell, x, middle);
+                        x += 1;
+                    }
+                }
+                if up {
+                    let mut y = 0;
+                    while y <= middle {
+                        set_pixel(&mut cell, centre_x, y);
+                        y += 1;
+                    }
+                }
+                let mut y = middle;
+                while y < CELL_H {
+                    set_pixel(&mut cell, centre_x, y);
+                    y += 1;
+                }
+            }
+            0x2588..=0x258F => {
+                let eighths = 8 - (code - 0x2588) as usize;
+                let width = (CELL_W * eighths).div_ceil(8);
+                let mut y = 0;
+                while y < CELL_H {
+                    let mut x = 0;
+                    while x < width {
+                        set_pixel(&mut cell, x, y);
+                        x += 1;
+                    }
+                    y += 1;
+                }
+            }
+            _ => {
+                let mut y = 0;
+                while y < CELL_H {
+                    let mut x = 0;
+                    while x < CELL_W {
+                        let on = match code {
+                            0x2591 => (x + y).is_multiple_of(2) && y.is_multiple_of(2),
+                            0x2592 => (x + y).is_multiple_of(2),
+                            _ => (x + y) % 4 != 3,
+                        };
+                        if on {
+                            set_pixel(&mut cell, x, y);
+                        }
+                        x += 1;
+                    }
+                    y += 1;
+                }
+            }
+        }
+        table[256 + entry] = cell;
+        entry += 1;
+    }
+    table
 }

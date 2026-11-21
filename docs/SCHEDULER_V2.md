@@ -478,6 +478,52 @@ Rules:
 - outermost enable/drop checks deferred reschedule;
 - Task-local counters survive migration; CPU IRQ counters do not migrate.
 
+### 12.1 Ring-3 observability
+
+Two syscalls export what the counters above record, so a monitor needs no
+kernel privilege:
+
+| syscall | number | arguments | returns |
+| --- | --- | --- | --- |
+| `SystemSchedStats` | 86 | `out: *mut u8`, `len: usize` | bytes written, `InvalidArgs` if `len` cannot hold the summary |
+| `SystemTaskQuery` | 87 | `start: usize`, `out: *mut u8`, `len: usize` | `(records << 32) | total` |
+
+`SystemSchedStats` writes one `SchedSummary` (`cpu_count`, `record_size`,
+`context_switches`, `remote_wakes`, `resched_ipis`, `inbox_drains`,
+`irq_storm_masks`, `admitted_ppm`) followed by one `SchedCpuRecord` per online
+CPU: `cpu`, `online`, `runnable`, `tasks`, `current_task`, `ticks`,
+`admitted_ppm`. Records are fixed-size, so a short buffer yields *whole*
+records rather than a truncated one; the caller sizes it from
+`SystemCpuCount`.
+
+`SystemTaskQuery` pages the task table in CPU-then-slot order, skipping reaped
+slots. A `TaskRecord` carries `task_id`, `name` (16 bytes), `cpu`, `weight`,
+`kind` (kernel/user), `state` (running/ready/blocked/finished) and `policy`
+(fair/deadline). The total in the low 32 bits lets a caller tell "the table
+grew while I read it" from "this is all of it".
+
+Both are read-only snapshots taken under each CPU's scheduler lock, so
+`(runnable, current_task)` is a consistent pair rather than two unrelated
+reads. Ring-3 consumers:
+
+- `schedctl cpus|tasks|bench` prints the records, the table and a
+  two-sample rate measurement;
+- `btop` draws the same data as a frame, refreshed on a timer, parking in
+  `read_key_timeout` between frames instead of spinning. `btop -n <frames>`
+  draws a fixed number of frames and exits, which is what makes it scriptable:
+  a gate that has to kill the monitor cannot tell a drawn frame from an empty
+  one.
+
+The boot smoke drives all three (`[hsh] schedctl cpus OK`,
+`[hsh] schedctl tasks OK`, `[hsh] schedctl bench OK`, `[hsh] btop frame OK`),
+which is what keeps the ABI honest: the records are only useful if a real
+program can read them through the syscall ABI and render them.
+
+**Reserved bandwidth is the honest CPU number.** The scheduler does not bill
+idle cycles per task, so `btop` draws the CPU share *reserved* by admitted
+CBS bandwidth (`admitted_ppm`) and the runqueue depth next to it, rather than
+inventing a utilization percentage.
+
 ## 13. CPU-local API
 
 Ordinary safe code must not receive a `'static` mutable CPU-local reference.

@@ -170,9 +170,16 @@ impl File {
 
     /// Create (or truncate to empty) a file for writing.
     pub fn create(path: &str) -> Result<Self> {
-        let file = open_file(path, true)?;
-        // `create_file` on an existing name keeps the old bytes; truncating
-        // here is what makes `create` mean "start empty" for a caller.
+        // `create` means "start empty", not "fail on an existing name": the
+        // service answers `AlreadyExists` for a name that is already there and
+        // the ABI has no code to carry that answer, so an existing file is
+        // opened and truncated instead. Without this, creating a file that a
+        // previous run left behind looked like a bad request.
+        let file = match open_file(path, false) {
+            Ok(file) => file,
+            Err(error) if error.kind() == ErrorKind::NotFound => open_file(path, true)?,
+            Err(error) => return Err(error),
+        };
         file.truncate(0).map_err(Error::from)?;
         Ok(Self::wrap(file))
     }

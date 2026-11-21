@@ -581,22 +581,50 @@ fn check_threads() -> u32 {
         "mutex kept every increment"
     );
 
-    // Reader-writer lock: writers take it exclusively, readers concurrently.
+    // Reader-writer lock. Two properties are actually guaranteed, so those are
+    // the two that get asserted: a value published under the write lock is
+    // visible to every later reader, and concurrent readers all see a value the
+    // writer really wrote. (The old check required the write to land before the
+    // reader's first read, which is a race, not a property: on SMP the reader
+    // can legitimately observe the pre-write value.)
     let shared = Arc::new(RwLock::new(0u64));
-    let readers = Arc::clone(&shared);
-    let reader = thread::spawn(move || {
-        let mut seen = 0u64;
-        for _ in 0..50 {
-            seen += *readers.read();
+    let before = {
+        let mut reads = 0u64;
+        for _ in 0..10 {
+            reads += *shared.read();
         }
-        seen
-    });
+        reads
+    };
+    expect!(failures, before == 0, "rwlock reads before the write");
     {
         let mut guard = shared.write();
-        *guard += 1;
+        *guard = 7;
     }
-    let seen = reader.join().unwrap_or(u64::MAX);
-    expect!(failures, seen == 50, "rwlock reader saw every write");
+    let mut reader_handles = Vec::new();
+    for _ in 0..4 {
+        let readers = Arc::clone(&shared);
+        reader_handles.push(thread::spawn(move || {
+            let mut seen = Vec::new();
+            for _ in 0..50 {
+                seen.push(*readers.read());
+            }
+            seen
+        }));
+    }
+    let mut reads = 0u64;
+    for handle in reader_handles {
+        match handle.join() {
+            Ok(seen) => {
+                for value in seen {
+                    if value != 7 {
+                        reads = u64::MAX;
+                    }
+                }
+            }
+            Err(_) => reads = u64::MAX,
+        }
+    }
+    expect!(failures, reads != u64::MAX, "rwlock readers saw the write");
 
     // Condition variable: the waiter parks until the setter notifies it.
     let pair = Arc::new((Mutex::new(false), Condvar::new()));

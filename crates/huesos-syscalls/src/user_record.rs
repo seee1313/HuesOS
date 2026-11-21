@@ -77,6 +77,12 @@ record!(huesos_abi::WaitSetItem, 16, 8, handle => 0, awaited_signals => 4, key =
 record!(huesos_abi::WaitSetResult, 16, 8, key => 0, active_signals => 8);
 record!(huesos_abi::WaitSetWaitArgs, 40, 8, items => 0, item_count => 8, mode => 12, timeout_ticks => 16, out_results => 24, out_count => 32);
 record!(huesos_abi::PortPacket, 48, 8, key => 0, packet_type => 8, status => 12, data => 16);
+// Scheduler observability records. The offsets are pinned because these are
+// written straight into an unprivileged caller's buffer: a field that moves
+// silently would turn a monitor's counter into a neighbouring field's value.
+record!(huesos_abi::SchedSummary, 56, 8, cpu_count => 0, record_size => 4, context_switches => 8, remote_wakes => 16, resched_ipis => 24, inbox_drains => 32, irq_storm_masks => 40, admitted_ppm => 48);
+record!(huesos_abi::SchedCpuRecord, 40, 8, cpu => 0, online => 4, runnable => 8, tasks => 12, current_task => 16, ticks => 24, admitted_ppm => 32, reserved => 36);
+record!(huesos_abi::TaskRecord, 40, 8, task_id => 0, name => 8, cpu => 24, weight => 26, kind => 28, state => 29, policy => 30, flags => 31, reserved => 32);
 record!(huesos_abi::JobLimitsAbi, 24, 8, max_memory => 0, max_handles => 8, max_cpu_ticks => 16);
 record!(huesos_abi::JobCreateArgs, 40, 8, parent => 0, limits => 8, out_job => 32);
 record!(huesos_abi::JobSetLimitsArgs, 32, 8, job => 0, limits => 8);

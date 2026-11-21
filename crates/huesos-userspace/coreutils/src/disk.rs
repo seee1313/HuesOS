@@ -48,6 +48,29 @@ enum Backing {
     Device(RefCell<BlockDevice>, u32),
 }
 
+/// The block device this process was granted, held for its whole lifetime.
+///
+/// `take_cap_handle` empties the slot, so taking it once here and lending the
+/// channel out is what allows a second and third open in the same process --
+/// `lsblk` reads the geometry, `df` asks for the size, `fsck` probes a volume,
+/// and each of them used to be the last one that could reach the disk.
+pub fn block_device() -> Result<&'static BlockDevice> {
+    static DEVICE: spin::Once<Option<BlockDevice>> = spin::Once::new();
+    DEVICE
+        .call_once(|| {
+            take_cap_handle(CapKind::BlockDev)
+                .map(|handle| BlockDevice::from_channel(Channel::from_handle(handle)))
+                .and_then(|device| device.ok())
+        })
+        .as_ref()
+        .ok_or_else(Error::capability)
+}
+
+/// True when this process has a block device at all.
+pub fn has_block_device() -> bool {
+    libcanvas::stdio::cap_handle(CapKind::BlockDev).is_some() || block_device().is_ok()
+}
+
 /// A 512-byte-sector view of a file or a block device.
 pub struct DiskIo {
     backing: Backing,
@@ -86,9 +109,16 @@ impl DiskIo {
     }
 
     /// Open the block device the process was granted, if any.
+    ///
+    /// The capability slot can be *taken* once, so the handle is taken here on
+    /// first use and then duplicated for every later open: a tool that reports
+    /// the geometry, probes a volume and then writes the table keeps working,
+    /// instead of losing the device after the first `open`.
     pub fn open_device() -> Result<Self> {
-        let handle = take_cap_handle(CapKind::BlockDev).ok_or(Error::capability())?;
-        let mut device = BlockDevice::from_channel(Channel::from_handle(handle))?;
+        let source = block_device()?.channel().handle().duplicate(
+            huesos_abi::rights::READ | huesos_abi::rights::WRITE | huesos_abi::rights::TRANSFER,
+        )?;
+        let mut device = BlockDevice::from_channel(Channel::from_handle(source))?;
         let info = device.info()?;
         let block_size = info.block_size.max(LBA_SIZE as u32);
         let total_lbas = info.block_count * u64::from(block_size / LBA_SIZE as u32);

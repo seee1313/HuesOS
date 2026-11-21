@@ -1172,6 +1172,50 @@ fn build_bootfs_image(manifest_dir: &Path, inputs: BootfsInputs<'_>) -> PathBuf 
             data: read_build_input(&inputs.coreutils_dir.join("mkfs"), "mkfs ELF"),
         },
         BootFsFile {
+            path: "/bin/grep.elf",
+            data: read_build_input(&inputs.coreutils_dir.join("grep"), "grep ELF"),
+        },
+        BootFsFile {
+            path: "/bin/find.elf",
+            data: read_build_input(&inputs.coreutils_dir.join("find"), "find ELF"),
+        },
+        BootFsFile {
+            path: "/bin/wc.elf",
+            data: read_build_input(&inputs.coreutils_dir.join("wc"), "wc ELF"),
+        },
+        BootFsFile {
+            path: "/bin/head.elf",
+            data: read_build_input(&inputs.coreutils_dir.join("head"), "head ELF"),
+        },
+        BootFsFile {
+            path: "/bin/tail.elf",
+            data: read_build_input(&inputs.coreutils_dir.join("tail"), "tail ELF"),
+        },
+        BootFsFile {
+            path: "/bin/sort.elf",
+            data: read_build_input(&inputs.coreutils_dir.join("sort"), "sort ELF"),
+        },
+        BootFsFile {
+            path: "/bin/tar.elf",
+            data: read_build_input(&inputs.coreutils_dir.join("tar"), "tar ELF"),
+        },
+        BootFsFile {
+            path: "/bin/sha256sum.elf",
+            data: read_build_input(&inputs.coreutils_dir.join("sha256sum"), "sha256sum ELF"),
+        },
+        BootFsFile {
+            path: "/bin/btop.elf",
+            data: read_build_input(&inputs.coreutils_dir.join("btop"), "btop ELF"),
+        },
+        BootFsFile {
+            path: "/bin/schedctl.elf",
+            data: read_build_input(&inputs.coreutils_dir.join("schedctl"), "schedctl ELF"),
+        },
+        BootFsFile {
+            path: "/bin/nano.elf",
+            data: read_build_input(&inputs.coreutils_dir.join("nano"), "nano ELF"),
+        },
+        BootFsFile {
             path: "/lib/ld-huesos.so",
             data: read_build_input(inputs.ld_huesos, "ld-huesos.so"),
         },

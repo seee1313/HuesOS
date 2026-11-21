@@ -25,6 +25,16 @@ pub(crate) static CPU_MASK_FN: Mutex<Option<fn() -> u64>> = Mutex::new(None);
 pub(crate) static CURRENT_CPU_FN: Mutex<Option<fn() -> usize>> = Mutex::new(None);
 /// Global privileged shutdown callback.
 pub(crate) static SHUTDOWN_FN: Mutex<Option<ShutdownFn>> = Mutex::new(None);
+/// Scheduler snapshot callbacks: aggregate counters, then per-CPU.
+pub type SchedSummaryFn = fn(&mut huesos_abi::SchedSummary);
+pub type SchedCpuFn = fn(usize, &mut huesos_abi::SchedCpuRecord);
+pub type TaskRecordFn = fn(usize, &mut huesos_abi::TaskRecord) -> bool;
+pub(crate) static SCHED_SUMMARY_FN: Mutex<Option<SchedSummaryFn>> = Mutex::new(None);
+pub(crate) static SCHED_CPU_FN: Mutex<Option<SchedCpuFn>> = Mutex::new(None);
+pub(crate) static TASK_RECORD_FN: Mutex<Option<TaskRecordFn>> = Mutex::new(None);
+/// Live-task count callback, used to page the task table.
+pub type TaskCountFn = fn() -> usize;
+pub(crate) static TASK_COUNT_FN: Mutex<Option<TaskCountFn>> = Mutex::new(None);
 
 /// Kernel callback type used by the syscall layer to create a suspended process.
 pub type ProcessCreateFn =
@@ -113,6 +123,30 @@ pub fn set_clock_fn(f: fn() -> u64) {
 /// Set the online CPU mask callback. Called once by kernel init.
 pub fn set_cpu_mask_fn(f: fn() -> u64) {
     *CPU_MASK_FN.lock() = Some(f);
+}
+
+/// Set the scheduler snapshot callbacks. Called once by kernel init.
+pub fn set_sched_stats_fns(summary: SchedSummaryFn, cpu: SchedCpuFn) {
+    *SCHED_SUMMARY_FN.lock() = Some(summary);
+    *SCHED_CPU_FN.lock() = Some(cpu);
+}
+
+/// Set the task-table callbacks. Called once by kernel init.
+pub fn set_task_record_fn(f: TaskRecordFn) {
+    *TASK_RECORD_FN.lock() = Some(f);
+}
+
+/// Set the live-task count callback. Called once by kernel init.
+pub fn set_task_count_fn(f: TaskCountFn) {
+    *TASK_COUNT_FN.lock() = Some(f);
+}
+
+/// Live tasks, or `0` when the scheduler has not registered the callback yet.
+pub(crate) fn task_total() -> usize {
+    match *TASK_COUNT_FN.lock() {
+        Some(count) => count(),
+        None => 0,
+    }
 }
 
 /// Set the current dense CPU index callback. Called once by kernel init.

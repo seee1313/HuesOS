@@ -62,8 +62,33 @@ pub struct HshHost {
     /// Remaining child runs to interrupt without a keystroke. Only the smoke
     /// gate uses this; it drives the exact production kill path.
     pub auto_interrupts: usize,
+    /// How long a synthetic interrupt waits after the child starts, in
+    /// scheduler ticks. A full-screen program needs a frame on the wire before
+    /// the kill, or the gate would only ever observe the `^C` echo.
+    pub auto_interrupt_after_ticks: u64,
+    /// Deadline for the pending synthetic interrupt, latched on the first poll.
+    interrupt_deadline: Option<u64>,
+    /// Polls spent waiting for that deadline, used when the process has no
+    /// clock capability and the tick count cannot advance.
+    interrupt_polls: u64,
     /// Whether the most recent child run ended through the `Ctrl-C` path.
     pub last_child_interrupted: bool,
+}
+
+/// Most output the shell keeps from one child.
+///
+/// A full-screen program redraws continuously, and a misbehaving child can
+/// print without end. Capturing everything would grow the shell's heap until
+/// an allocation failed and took the whole session down with it, so the buffer
+/// keeps the most recent half once it passes this bound: the end of a run is
+/// what a caller can act on anyway.
+const MAX_CAPTURE_BYTES: usize = 256 * 1024;
+
+fn trim_capture(buf: &mut Vec<u8>) {
+    if buf.len() > MAX_CAPTURE_BYTES {
+        let keep_from = buf.len() - MAX_CAPTURE_BYTES / 2;
+        buf.drain(..keep_from);
+    }
 }
 
 /// Exit status reported for a child killed by `Ctrl-C` (128 + SIGINT).
@@ -104,6 +129,9 @@ impl HshHost {
             key_source: None,
             pending_packets: Vec::new(),
             auto_interrupts: 0,
+            auto_interrupt_after_ticks: 0,
+            interrupt_deadline: None,
+            interrupt_polls: 0,
             last_child_interrupted: false,
         };
         host.try_connect_hxfs();
@@ -448,15 +476,74 @@ impl HshHost {
     /// the shell resolves relative names before the spawn: explicit paths
     /// (`./x`, `../x`, `a/b`), home-relative `.`/`..`, and bare names that only
     /// exist relative to the current directory ("`cat welcome.txt`" in `/etc`).
+    /// Names that do not exist yet are resolved too (`mkdir sub`, `touch x`):
+    /// resolving only existing names would create them in `/` instead of the
+    /// working directory.
     fn absolutize_argument(&self, arg: &str) -> Option<String> {
-        // Flags stay untouched; every other argument in a path position is a
-        // path, including names that do not exist yet (`mkdir sub`,
-        // `mv a b`, `touch note.md`) -- resolving only existing names would
-        // silently create those in `/` instead of the working directory.
-        if arg.is_empty() || arg.starts_with('-') {
+        if arg.is_empty() {
             return None;
         }
         Some(self.normalize_path(arg))
+    }
+
+    /// Resolve the path arguments of one external command, leaving data alone.
+    ///
+    /// The rule is about *meaning*, not position: a bare word is a path only
+    /// when it is not a number, a size, a hex literal, a `key=value` pair or a
+    /// subcommand of the tool being started. That is what `sleep 30`,
+    /// `hexdump -n 128`, `du -d 1`, `mkfs -s 16M` and
+    /// `dd if=/dev/zero bs=512` need, and what `cat welcome.txt` also gets.
+    fn resolve_arguments(&self, name: &str, args: &[String]) -> Vec<String> {
+        /// Tools that take no path arguments at all.
+        const NO_PATH_ARGS: &[&str] = &["hxfs", "pci", "acpi", "ps", "sleep", "schedctl"];
+        let mut owned: Vec<String> = Vec::with_capacity(args.len() + 1);
+        if NO_PATH_ARGS.contains(&name) {
+            owned.extend(args.iter().cloned());
+            return owned;
+        }
+        // `write <path> <data>`: the payload is text, not a path.
+        let path_budget = if name == "write" { 1 } else { usize::MAX };
+        let mut paths_taken = 0usize;
+        let mut skip_value = false;
+        for arg in args {
+            if skip_value {
+                skip_value = false;
+                owned.push(arg.clone());
+                continue;
+            }
+            if flag_takes_value(name, arg) {
+                skip_value = true;
+                owned.push(arg.clone());
+                continue;
+            }
+            if arg.starts_with('-') {
+                owned.push(arg.clone());
+                continue;
+            }
+            // `if=/dev/zero`, `bs=512`, `of=firmware.bin`: the key is data, the
+            // value is a path only for the two keys that name one.
+            if let Some((key, value)) = arg.split_once('=') {
+                let path_key = matches!(key, "if" | "of");
+                if path_key && !value.starts_with('/') && !value.is_empty() {
+                    owned.push(format!("{key}={}", self.normalize_path(value)));
+                } else {
+                    owned.push(arg.clone());
+                }
+                continue;
+            }
+            if paths_taken >= path_budget || is_data_word(name, arg) {
+                owned.push(arg.clone());
+                continue;
+            }
+            match self.absolutize_argument(arg) {
+                Some(abs) => {
+                    paths_taken += 1;
+                    owned.push(abs);
+                }
+                None => owned.push(arg.clone()),
+            }
+        }
+        owned
     }
 
     fn resolve_elf(&mut self, name: &str) -> Option<(Vmo, u64, u64, String)> {
@@ -578,28 +665,11 @@ impl HshHost {
             query_holder = self.open_query_fresh();
         }
 
-        // Default relative path expansion when pwd != '/' for single path-free `ls`?
-        // Only pass explicit args directly as typed by user.
-        // Utilities take paths, not a working directory: resolve them here.
-        // `write` has (path, data) so only its first argument is a path; the
-        // service tools (hxfs/fdisk/pci/acpi/ps) take none at all.
-        let path_args = match name {
-            // Service tools and `sleep` take flags/intervals, not paths; a
-            // numeric interval must not be rewritten into `/30`.
-            "hxfs" | "fdisk" | "pci" | "acpi" | "ps" | "sleep" => 0,
-            "write" => 1,
-            _ => args.len(),
-        };
-        let mut owned_args: Vec<String> = Vec::with_capacity(args.len() + 1);
-        for (idx, a) in args.iter().enumerate() {
-            if idx < path_args {
-                if let Some(abs) = self.absolutize_argument(a) {
-                    owned_args.push(abs);
-                    continue;
-                }
-            }
-            owned_args.push(a.clone());
-        }
+        // Utilities take paths, not a working directory, so path arguments are
+        // resolved here. Everything that is *data* -- numbers, sizes, values
+        // after a flag that takes one, `key=value` pairs, subcommand words --
+        // has to arrive at the tool exactly as it was typed.
+        let mut owned_args = self.resolve_arguments(name, args);
         if name == "ls" && owned_args.is_empty() {
             owned_args.push(self.pwd.clone());
         }
@@ -691,6 +761,7 @@ impl HshHost {
                 match stdout_r.read_into(&mut chunk) {
                     Ok(n) => {
                         stdout_bytes.extend_from_slice(&chunk[..n]);
+                        trim_capture(&mut stdout_bytes);
                         progressed = true;
                     }
                     Err(ErrorCode::PeerClosed) => out_open = false,
@@ -702,6 +773,7 @@ impl HshHost {
                 match stderr_r.read_into(&mut chunk) {
                     Ok(n) => {
                         stderr_bytes.extend_from_slice(&chunk[..n]);
+                        trim_capture(&mut stderr_bytes);
                         progressed = true;
                     }
                     Err(ErrorCode::PeerClosed) => err_open = false,
@@ -750,18 +822,19 @@ impl HshHost {
             }
         }
 
+        // A failing child's stdout is usually its report -- `std-smoke` prints
+        // one `[std] FAIL` line per broken invariant to stdout and only a
+        // marker to stderr -- so a non-zero exit keeps both streams. Dropping
+        // stdout here once hid the reason a smoke failed behind a single
+        // stderr line.
+        let combined = format!("{out_str}{err_str}");
         let output = if exit_code == 0 {
-            if let Some(tbl) = Table::from_tsv(&out_str) {
-                Value::Table(tbl)
-            } else if err_str.is_empty() {
-                Value::Text(out_str.trim_end_matches('\n').into())
-            } else {
-                Value::Text(format!("{out_str}{err_str}").trim_end_matches('\n').into())
+            match Table::from_tsv(&out_str) {
+                Some(tbl) => Value::Table(tbl),
+                None => Value::Text(combined.trim_end_matches('\n').into()),
             }
-        } else if !err_str.is_empty() {
-            Value::Text(err_str.trim_end_matches('\n').into())
         } else {
-            Value::Text(out_str.trim_end_matches('\n').into())
+            Value::Text(combined.trim_end_matches('\n').into())
         };
 
         ExecOutcome {
@@ -782,8 +855,29 @@ impl HshHost {
     /// lost.
     fn poll_child_interrupt(&mut self, child: &Process) -> bool {
         let auto = if self.auto_interrupts > 0 {
-            self.auto_interrupts -= 1;
-            true
+            // Latch the deadline on the first poll so the wait is measured from
+            // the child actually running, not from the request. A process
+            // without a clock capability cannot advance the tick count, so the
+            // wait also has a poll budget: the loop yields on every iteration,
+            // which makes the budget a slower but unconditional backstop.
+            let now = libcanvas::system::monotonic_ticks();
+            let deadline = *self.interrupt_deadline.get_or_insert_with(|| {
+                self.interrupt_polls = 0;
+                now.unwrap_or(0)
+                    .saturating_add(self.auto_interrupt_after_ticks)
+            });
+            self.interrupt_polls = self.interrupt_polls.saturating_add(1);
+            let expired = match now {
+                Ok(ticks) => ticks >= deadline,
+                Err(_) => self.interrupt_polls >= self.auto_interrupt_after_ticks.max(1) * 500,
+            };
+            if expired {
+                self.auto_interrupts -= 1;
+                self.interrupt_deadline = None;
+                true
+            } else {
+                false
+            }
         } else {
             false
         };
@@ -981,4 +1075,67 @@ impl ShellHost for HshHost {
             .map_err(|e| format!("fsync '{abs}': {}", e.as_str()))?;
         Ok(())
     }
+}
+
+/// Flags whose following argument is a value, never a path.
+///
+/// Per command, because the same letter means different things: `head -n 5`
+/// takes a count while `sort -n` is a switch, and `grep -c` counts while
+/// `head -c 16` takes bytes. Values are data by definition, so the shell must
+/// not resolve them as paths (`hexdump -n 128` used to become `-n /128`).
+fn flag_takes_value(command: &str, flag: &str) -> bool {
+    match command {
+        "hexdump" => matches!(flag, "-n" | "--length" | "-s" | "--skip"),
+        "du" => matches!(flag, "-d" | "--max-depth"),
+        "mkfs" => matches!(flag, "-s" | "--size" | "-p" | "--part" | "-t" | "--type"),
+        "head" | "tail" => matches!(flag, "-n" | "--lines" | "-c" | "--bytes"),
+        "sort" => matches!(flag, "-k" | "--key" | "-t" | "--field-separator"),
+        "grep" => matches!(flag, "-e" | "--regexp" | "-m" | "--max-count"),
+        "find" => matches!(flag, "-name" | "-type" | "-maxdepth" | "-iname"),
+        "fdisk" => matches!(flag, "--type" | "--size" | "--start" | "--end" | "--name"),
+        // `-cf`, `-tf`, `-xf`, `-f`: every archive flag that names the archive.
+        "tar" => {
+            flag.starts_with('-') && flag.ends_with('f') || matches!(flag, "-C" | "--directory")
+        }
+        _ => false,
+    }
+}
+
+/// True when `word` is data for `command`, not a path.
+fn is_data_word(command: &str, word: &str) -> bool {
+    if is_number_or_size(word) {
+        return true;
+    }
+    // Subcommands of the multi-command tools.
+    let subcommands: &[&str] = match command {
+        "fdisk" => &[
+            "list", "inspect", "verify", "gpt-init", "add", "del", "resize",
+        ],
+        "hxfs" => &["status", "stats", "scrub", "snapshot", "sync", "gc"],
+        "schedctl" => &["cpus", "tasks", "bench"],
+        _ => &[],
+    };
+    subcommands.contains(&word)
+}
+
+/// `128`, `0x1f`, `16M`, `512B`, `4K`, `200G`, `1T`, `+32M`.
+fn is_number_or_size(word: &str) -> bool {
+    let body = word.strip_prefix('+').unwrap_or(word);
+    if body.is_empty() {
+        return false;
+    }
+    if let Some(hex) = body.strip_prefix("0x").or_else(|| body.strip_prefix("0X")) {
+        return !hex.is_empty() && hex.chars().all(|c| c.is_ascii_hexdigit());
+    }
+    let (digits, suffix) = match body.char_indices().last() {
+        Some((idx, last)) if last.is_ascii_alphabetic() => (&body[..idx], &body[idx..]),
+        _ => (body, ""),
+    };
+    if digits.is_empty() || !digits.chars().all(|c| c.is_ascii_digit()) {
+        return false;
+    }
+    matches!(
+        suffix,
+        "" | "B" | "b" | "K" | "k" | "M" | "m" | "G" | "g" | "T" | "t"
+    )
 }
