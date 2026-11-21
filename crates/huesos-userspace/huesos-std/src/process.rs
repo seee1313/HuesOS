@@ -336,7 +336,7 @@ impl Child {
         })
     }
 
-    /// Read both pipes until they close, yielding while they are empty.
+    /// Read both pipes until they close, parking on `wait_any` while empty.
     fn drain(
         &mut self,
         mut stdout: Option<&mut Vec<u8>>,
@@ -346,6 +346,7 @@ impl Child {
         let mut out_open = self.stdout.is_some();
         let mut err_open = self.stderr.is_some();
         while out_open || err_open {
+            let mut progressed = false;
             if out_open {
                 let channel = match self.stdout.as_ref() {
                     Some(channel) => channel,
@@ -356,6 +357,7 @@ impl Child {
                 };
                 match channel.read_into(&mut chunk) {
                     Ok(n) => {
+                        progressed = true;
                         if let Some(sink) = stdout.as_deref_mut() {
                             sink.extend_from_slice(&chunk[..n]);
                         }
@@ -375,6 +377,7 @@ impl Child {
                 };
                 match channel.read_into(&mut chunk) {
                     Ok(n) => {
+                        progressed = true;
                         if let Some(sink) = stderr.as_deref_mut() {
                             sink.extend_from_slice(&chunk[..n]);
                         }
@@ -384,7 +387,61 @@ impl Child {
                     Err(error) => return Err(Error::from(error)),
                 }
             }
-            yield_now();
+            if !progressed && (out_open || err_open) {
+                let mut items = [libcanvas::WaitItem::new(
+                    self.process.handle().raw(),
+                    libcanvas::Signals::SIGNALED,
+                    0,
+                ); 3];
+                let mut count = 1usize;
+                if out_open {
+                    if let Some(ch) = self.stdout.as_ref() {
+                        items[count] = libcanvas::WaitItem::new(
+                            ch.handle().raw(),
+                            libcanvas::Signals::READABLE | libcanvas::Signals::PEER_CLOSED,
+                            1,
+                        );
+                        count += 1;
+                    }
+                }
+                if err_open {
+                    if let Some(ch) = self.stderr.as_ref() {
+                        items[count] = libcanvas::WaitItem::new(
+                            ch.handle().raw(),
+                            libcanvas::Signals::READABLE | libcanvas::Signals::PEER_CLOSED,
+                            2,
+                        );
+                        count += 1;
+                    }
+                }
+                if let Ok(outcome) = libcanvas::wait_any(&items[..count], 5) {
+                    if outcome.satisfied().iter().any(|r| {
+                        r.key == 0 && (r.active_signals & libcanvas::Signals::SIGNALED.bits()) != 0
+                    }) {
+                        if let Some(ch) = self.stdout.as_ref() {
+                            while let Ok(n) = ch.read_into(&mut chunk) {
+                                if n == 0 {
+                                    break;
+                                }
+                                if let Some(sink) = stdout.as_deref_mut() {
+                                    sink.extend_from_slice(&chunk[..n]);
+                                }
+                            }
+                        }
+                        if let Some(ch) = self.stderr.as_ref() {
+                            while let Ok(n) = ch.read_into(&mut chunk) {
+                                if n == 0 {
+                                    break;
+                                }
+                                if let Some(sink) = stderr.as_deref_mut() {
+                                    sink.extend_from_slice(&chunk[..n]);
+                                }
+                            }
+                        }
+                        break;
+                    }
+                }
+            }
         }
         Ok(())
     }

@@ -50,10 +50,15 @@ impl Value {
 
     /// Convert to TSV/wire text when piping into an external ELF `stdin`.
     pub fn to_pipe_bytes(&self) -> Vec<u8> {
-        match self {
+        let mut bytes = match self {
+            Value::Empty => return Vec::new(),
             Value::Table(tbl) => tbl.to_tsv().into_bytes(),
             other => other.into_text().into_bytes(),
+        };
+        if !bytes.is_empty() && !bytes.ends_with(b"\n") {
+            bytes.push(b'\n');
         }
+        bytes
     }
 
     /// Evaluate truthiness (`false`, `0`, empty text/list/table -> false).

@@ -16,7 +16,7 @@ use core::alloc::{GlobalAlloc, Layout};
 #[cfg(feature = "local-heap")]
 use core::cell::UnsafeCell;
 #[cfg(feature = "local-heap")]
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicU32, Ordering};
 
 #[cfg(feature = "local-heap")]
 use huesos_scudo::backend::{Backend, BackendError};
@@ -28,7 +28,7 @@ use crate::memory;
 
 #[cfg(feature = "local-heap")]
 struct HeapLock<T> {
-    locked: AtomicBool,
+    state: AtomicU32,
     data: UnsafeCell<T>,
 }
 
@@ -36,31 +36,33 @@ struct HeapLock<T> {
 impl<T> HeapLock<T> {
     const fn new(data: T) -> Self {
         Self {
-            locked: AtomicBool::new(false),
+            state: AtomicU32::new(0),
             data: UnsafeCell::new(data),
         }
     }
 
     #[inline]
     fn with<R>(&self, f: impl FnOnce(&mut T) -> R) -> R {
-        while self
-            .locked
-            .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+        if self
+            .state
+            .compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
             .is_err()
         {
-            while self.locked.load(Ordering::Relaxed) {
-                core::hint::spin_loop();
+            while self.state.swap(2, Ordering::Acquire) != 0 {
+                let _ = crate::futex::wait(&self.state, 2, 0);
             }
         }
-        struct Unlock<'a>(&'a AtomicBool);
+        struct Unlock<'a>(&'a AtomicU32);
         impl Drop for Unlock<'_> {
             #[inline]
             fn drop(&mut self) {
-                self.0.store(false, Ordering::Release);
+                if self.0.swap(0, Ordering::Release) == 2 {
+                    let _ = crate::futex::wake(self.0, 1);
+                }
             }
         }
-        let _guard = Unlock(&self.locked);
-        // SAFETY: `self.locked` was acquired atomically via Acquire CAS and is
+        let _guard = Unlock(&self.state);
+        // SAFETY: `self.state` was acquired via 3-state futex protocol and is
         // released only when `_guard` drops.
         f(unsafe { &mut *self.data.get() })
     }

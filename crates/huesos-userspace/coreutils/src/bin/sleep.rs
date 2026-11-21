@@ -31,6 +31,7 @@ fn run() -> i32 {
     if ticks == 0 {
         return 0;
     }
+    let sleep_word = core::sync::atomic::AtomicU32::new(0);
     let start = match libcanvas::system::monotonic_ticks() {
         Ok(t) => t,
         Err(e) => {
@@ -39,18 +40,19 @@ fn run() -> i32 {
         }
     };
     loop {
-        match libcanvas::system::monotonic_ticks() {
-            Ok(now) => {
-                if now.wrapping_sub(start) >= ticks {
-                    return 0;
-                }
-            }
+        let now = match libcanvas::system::monotonic_ticks() {
+            Ok(now) => now,
             Err(e) => {
                 cu::errln(&format!("sleep: clock unavailable: {}", e.as_str()));
                 return 1;
             }
+        };
+        let elapsed = now.wrapping_sub(start);
+        if elapsed >= ticks {
+            return 0;
         }
-        libcanvas::process::yield_now();
+        let remaining = ticks - elapsed;
+        let _ = libcanvas::futex::wait(&sleep_word, 0, remaining);
     }
 }
 

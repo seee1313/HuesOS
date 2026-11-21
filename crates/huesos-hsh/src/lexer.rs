@@ -18,14 +18,19 @@ pub enum TokenKind {
     DoubleQuoted(Vec<QuotePart>),
     Var(String),
     CmdSubst(String),
+    ArithSubst(String),
     CapsAnnot(String),
     Keyword(Keyword),
+    Bang,
     Semi,
     AndAnd,
     OrOr,
     Pipe,
     Gt,
     GtGt,
+    ErrGt,
+    ErrGtGt,
+    ErrToOut,
     Eq,
     EqEq,
     NotEq,
@@ -48,6 +53,7 @@ pub enum QuotePart {
     Literal(String),
     Var(String),
     CmdSubst(String),
+    ArithSubst(String),
 }
 
 /// Reserved `hsh` keywords.
@@ -55,11 +61,15 @@ pub enum QuotePart {
 pub enum Keyword {
     Let,
     If,
+    Elif,
     Else,
+    While,
     For,
     In,
     Fn,
     Alias,
+    Break,
+    Continue,
     Return,
     Contains,
 }
@@ -129,19 +139,62 @@ fn is_ident_char(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_'
 }
 
+fn is_special_var_char(b: u8) -> bool {
+    matches!(b, b'?' | b'#' | b'@')
+}
+
 fn keyword_from_str(s: &str) -> Option<Keyword> {
     match s {
         "let" => Some(Keyword::Let),
         "if" => Some(Keyword::If),
+        "elif" => Some(Keyword::Elif),
         "else" => Some(Keyword::Else),
+        "while" => Some(Keyword::While),
         "for" => Some(Keyword::For),
         "in" => Some(Keyword::In),
         "fn" => Some(Keyword::Fn),
         "alias" => Some(Keyword::Alias),
+        "break" => Some(Keyword::Break),
+        "continue" => Some(Keyword::Continue),
         "return" => Some(Keyword::Return),
         "contains" => Some(Keyword::Contains),
         _ => None,
     }
+}
+
+fn parse_arith_subst(
+    bytes: &[u8],
+    start_after_dollar_lparen2: usize,
+) -> Result<(String, usize), LexError> {
+    let mut i = start_after_dollar_lparen2;
+    let mut depth = 1usize;
+    while i < bytes.len() {
+        if bytes[i] == b'(' && i + 1 < bytes.len() && bytes[i + 1] == b'(' {
+            depth += 1;
+            i += 2;
+            continue;
+        }
+        if bytes[i] == b')' && i + 1 < bytes.len() && bytes[i + 1] == b')' {
+            depth -= 1;
+            if depth == 0 {
+                let inner =
+                    core::str::from_utf8(&bytes[start_after_dollar_lparen2..i]).map_err(|_| {
+                        LexError {
+                            message: String::from("invalid UTF-8 in $((...))"),
+                            offset: start_after_dollar_lparen2,
+                        }
+                    })?;
+                return Ok((String::from(inner), i + 2));
+            }
+            i += 2;
+            continue;
+        }
+        i += 1;
+    }
+    Err(LexError {
+        message: String::from("unterminated $((...))"),
+        offset: start_after_dollar_lparen2.saturating_sub(3),
+    })
 }
 
 fn parse_cmd_subst(
@@ -254,6 +307,42 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, LexError> {
             continue;
         }
 
+        // Multi-char stderr redirection operators (`2>&1`, `2>>`, `2>`) when at token start
+        if bytes[i..].starts_with(b"2>&1") && (i + 4 == bytes.len() || is_word_break(bytes[i + 4]))
+        {
+            tokens.push(Token {
+                kind: TokenKind::ErrToOut,
+                span: Span {
+                    start: i,
+                    end: i + 4,
+                },
+            });
+            i += 4;
+            continue;
+        }
+        if bytes[i..].starts_with(b"2>>") {
+            tokens.push(Token {
+                kind: TokenKind::ErrGtGt,
+                span: Span {
+                    start: i,
+                    end: i + 3,
+                },
+            });
+            i += 3;
+            continue;
+        }
+        if bytes[i..].starts_with(b"2>") {
+            tokens.push(Token {
+                kind: TokenKind::ErrGt,
+                span: Span {
+                    start: i,
+                    end: i + 2,
+                },
+            });
+            i += 2;
+            continue;
+        }
+
         // Two-char operators
         if i + 1 < bytes.len() {
             let two = &bytes[i..i + 2];
@@ -278,6 +367,19 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, LexError> {
                 i += 2;
                 continue;
             }
+        }
+
+        // Standalone `!` negation operator (followed by whitespace or paren)
+        if b == b'!' && (i + 1 == bytes.len() || matches!(bytes[i + 1], b' ' | b'\t' | b'(')) {
+            tokens.push(Token {
+                kind: TokenKind::Bang,
+                span: Span {
+                    start: i,
+                    end: i + 1,
+                },
+            });
+            i += 1;
+            continue;
         }
 
         // Single-char punctuation
@@ -364,6 +466,14 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, LexError> {
                         lit.push(esc);
                         i += 2;
                     }
+                    b'$' if i + 2 < bytes.len() && bytes[i + 1] == b'(' && bytes[i + 2] == b'(' => {
+                        if !lit.is_empty() {
+                            parts.push(QuotePart::Literal(core::mem::take(&mut lit)));
+                        }
+                        let (expr, next_i) = parse_arith_subst(bytes, i + 3)?;
+                        parts.push(QuotePart::ArithSubst(expr));
+                        i = next_i;
+                    }
                     b'$' if i + 1 < bytes.len() && bytes[i + 1] == b'(' => {
                         if !lit.is_empty() {
                             parts.push(QuotePart::Literal(core::mem::take(&mut lit)));
@@ -371,6 +481,33 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, LexError> {
                         let (cmd, next_i) = parse_cmd_subst(bytes, i + 2)?;
                         parts.push(QuotePart::CmdSubst(cmd));
                         i = next_i;
+                    }
+                    b'$' if i + 1 < bytes.len() && bytes[i + 1] == b'{' => {
+                        if !lit.is_empty() {
+                            parts.push(QuotePart::Literal(core::mem::take(&mut lit)));
+                        }
+                        let vstart = i + 2;
+                        let mut vend = vstart;
+                        while vend < bytes.len() && bytes[vend] != b'}' {
+                            vend += 1;
+                        }
+                        if vend >= bytes.len() {
+                            return Err(LexError {
+                                message: String::from("unterminated ${...}"),
+                                offset: i,
+                            });
+                        }
+                        let name = &input[vstart..vend];
+                        parts.push(QuotePart::Var(String::from(name)));
+                        i = vend + 1;
+                    }
+                    b'$' if i + 1 < bytes.len() && is_special_var_char(bytes[i + 1]) => {
+                        if !lit.is_empty() {
+                            parts.push(QuotePart::Literal(core::mem::take(&mut lit)));
+                        }
+                        let name = &input[i + 1..i + 2];
+                        parts.push(QuotePart::Var(String::from(name)));
+                        i += 2;
                     }
                     b'$' if i + 1 < bytes.len() && is_ident_char(bytes[i + 1]) => {
                         if !lit.is_empty() {
@@ -411,47 +548,192 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, LexError> {
             continue;
         }
 
-        // `$(cmd)` or `$var`
+        // Standalone `$((arith))`, `$(cmd)`, `${var}`, `$?`, `$#`, `$@`, or `$var`
+        // (only when followed by a word break; otherwise composite word handling
+        // below keeps `$0:$1:$(cmd)` together as a single argument).
         if b == b'$' {
             let start = i;
-            if i + 1 < bytes.len() && bytes[i + 1] == b'(' {
+            if i + 2 < bytes.len() && bytes[i + 1] == b'(' && bytes[i + 2] == b'(' {
+                let (expr, next_i) = parse_arith_subst(bytes, i + 3)?;
+                if next_i == bytes.len() || is_word_break(bytes[next_i]) {
+                    tokens.push(Token {
+                        kind: TokenKind::ArithSubst(expr),
+                        span: Span { start, end: next_i },
+                    });
+                    i = next_i;
+                    continue;
+                }
+            } else if i + 1 < bytes.len() && bytes[i + 1] == b'(' {
                 let (cmd, next_i) = parse_cmd_subst(bytes, i + 2)?;
-                tokens.push(Token {
-                    kind: TokenKind::CmdSubst(cmd),
-                    span: Span { start, end: next_i },
-                });
-                i = next_i;
-                continue;
-            }
-            if i + 1 < bytes.len() && is_ident_char(bytes[i + 1]) {
+                if next_i == bytes.len() || is_word_break(bytes[next_i]) {
+                    tokens.push(Token {
+                        kind: TokenKind::CmdSubst(cmd),
+                        span: Span { start, end: next_i },
+                    });
+                    i = next_i;
+                    continue;
+                }
+            } else if i + 1 < bytes.len() && bytes[i + 1] == b'{' {
+                let vstart = i + 2;
+                let mut vend = vstart;
+                while vend < bytes.len() && bytes[vend] != b'}' {
+                    vend += 1;
+                }
+                if vend >= bytes.len() {
+                    return Err(LexError {
+                        message: String::from("unterminated ${...}"),
+                        offset: start,
+                    });
+                }
+                if vend + 1 == bytes.len() || is_word_break(bytes[vend + 1]) {
+                    let name = &input[vstart..vend];
+                    tokens.push(Token {
+                        kind: TokenKind::Var(String::from(name)),
+                        span: Span {
+                            start,
+                            end: vend + 1,
+                        },
+                    });
+                    i = vend + 1;
+                    continue;
+                }
+            } else if i + 1 < bytes.len() && is_special_var_char(bytes[i + 1]) {
+                if i + 2 == bytes.len() || is_word_break(bytes[i + 2]) {
+                    let name = &input[i + 1..i + 2];
+                    tokens.push(Token {
+                        kind: TokenKind::Var(String::from(name)),
+                        span: Span { start, end: i + 2 },
+                    });
+                    i += 2;
+                    continue;
+                }
+            } else if i + 1 < bytes.len() && is_ident_char(bytes[i + 1]) {
                 let vstart = i + 1;
                 let mut vend = vstart;
                 while vend < bytes.len() && is_ident_char(bytes[vend]) {
                     vend += 1;
                 }
-                let name = &input[vstart..vend];
-                tokens.push(Token {
-                    kind: TokenKind::Var(String::from(name)),
-                    span: Span { start, end: vend },
-                });
-                i = vend;
-                continue;
+                if vend == bytes.len() || is_word_break(bytes[vend]) {
+                    let name = &input[vstart..vend];
+                    tokens.push(Token {
+                        kind: TokenKind::Var(String::from(name)),
+                        span: Span { start, end: vend },
+                    });
+                    i = vend;
+                    continue;
+                }
             }
         }
 
-        // Bare word / keyword
+        // Bare word / keyword (supports composite words like `$0:$1:$(cmd)` or `foo"bar"`)
         let start = i;
+        let mut parts: Vec<QuotePart> = Vec::new();
+        let mut lit = String::new();
+        let mut saw_dynamic_or_quote = false;
         while i < bytes.len() && !is_word_break(bytes[i]) {
-            i += 1;
+            if bytes[i] == b'\'' {
+                saw_dynamic_or_quote = true;
+                let sq_start = i;
+                i += 1;
+                let body_start = i;
+                while i < bytes.len() && bytes[i] != b'\'' {
+                    i += 1;
+                }
+                if i >= bytes.len() {
+                    return Err(LexError {
+                        message: String::from("unterminated single-quoted string"),
+                        offset: sq_start,
+                    });
+                }
+                let inner = core::str::from_utf8(&bytes[body_start..i]).map_err(|_| LexError {
+                    message: String::from("invalid UTF-8 in string"),
+                    offset: sq_start,
+                })?;
+                lit.push_str(inner);
+                i += 1;
+                continue;
+            }
+            if bytes[i] == b'$' {
+                if i + 2 < bytes.len() && bytes[i + 1] == b'(' && bytes[i + 2] == b'(' {
+                    saw_dynamic_or_quote = true;
+                    if !lit.is_empty() {
+                        parts.push(QuotePart::Literal(core::mem::take(&mut lit)));
+                    }
+                    let (expr, next_i) = parse_arith_subst(bytes, i + 3)?;
+                    parts.push(QuotePart::ArithSubst(expr));
+                    i = next_i;
+                    continue;
+                }
+                if i + 1 < bytes.len() && bytes[i + 1] == b'(' {
+                    saw_dynamic_or_quote = true;
+                    if !lit.is_empty() {
+                        parts.push(QuotePart::Literal(core::mem::take(&mut lit)));
+                    }
+                    let (cmd, next_i) = parse_cmd_subst(bytes, i + 2)?;
+                    parts.push(QuotePart::CmdSubst(cmd));
+                    i = next_i;
+                    continue;
+                }
+                if i + 1 < bytes.len() && bytes[i + 1] == b'{' {
+                    saw_dynamic_or_quote = true;
+                    if !lit.is_empty() {
+                        parts.push(QuotePart::Literal(core::mem::take(&mut lit)));
+                    }
+                    let vstart = i + 2;
+                    let mut vend = vstart;
+                    while vend < bytes.len() && bytes[vend] != b'}' {
+                        vend += 1;
+                    }
+                    if vend >= bytes.len() {
+                        return Err(LexError {
+                            message: String::from("unterminated ${...}"),
+                            offset: i,
+                        });
+                    }
+                    parts.push(QuotePart::Var(String::from(&input[vstart..vend])));
+                    i = vend + 1;
+                    continue;
+                }
+                if i + 1 < bytes.len() && is_special_var_char(bytes[i + 1]) {
+                    saw_dynamic_or_quote = true;
+                    if !lit.is_empty() {
+                        parts.push(QuotePart::Literal(core::mem::take(&mut lit)));
+                    }
+                    parts.push(QuotePart::Var(String::from(&input[i + 1..i + 2])));
+                    i += 2;
+                    continue;
+                }
+                if i + 1 < bytes.len() && is_ident_char(bytes[i + 1]) {
+                    saw_dynamic_or_quote = true;
+                    if !lit.is_empty() {
+                        parts.push(QuotePart::Literal(core::mem::take(&mut lit)));
+                    }
+                    let vstart = i + 1;
+                    let mut vend = vstart;
+                    while vend < bytes.len() && is_ident_char(bytes[vend]) {
+                        vend += 1;
+                    }
+                    parts.push(QuotePart::Var(String::from(&input[vstart..vend])));
+                    i = vend;
+                    continue;
+                }
+            }
+            let ch = input[i..].chars().next().ok_or(LexError {
+                message: String::from("invalid UTF-8 in word"),
+                offset: i,
+            })?;
+            lit.push(ch);
+            i += ch.len_utf8();
         }
-        let word = core::str::from_utf8(&bytes[start..i]).map_err(|_| LexError {
-            message: String::from("invalid UTF-8 in word"),
-            offset: start,
-        })?;
-        let kind = if let Some(kw) = keyword_from_str(word) {
+        let kind = if saw_dynamic_or_quote {
+            if !lit.is_empty() || parts.is_empty() {
+                parts.push(QuotePart::Literal(lit));
+            }
+            TokenKind::DoubleQuoted(parts)
+        } else if let Some(kw) = keyword_from_str(&lit) {
             TokenKind::Keyword(kw)
         } else {
-            TokenKind::Word(String::from(word))
+            TokenKind::Word(lit)
         };
         tokens.push(Token {
             kind,

@@ -333,10 +333,17 @@ mod imp {
         }
     }
 
-    pub fn stdin_read(out: &mut [u8]) -> Result<usize> {
+    fn stdin_read_dyn(out: &mut [u8], timeout_ticks: Option<u64>) -> Result<usize> {
         let mut actual = 0usize;
         // SAFETY: `out` and `actual` are valid writable buffers.
-        let rc = unsafe { canvas_stdin_read(out.as_mut_ptr(), out.len(), &mut actual) };
+        let rc = unsafe {
+            match timeout_ticks {
+                Some(ticks) => {
+                    canvas_stdin_read_timeout(out.as_mut_ptr(), out.len(), ticks, &mut actual)
+                }
+                None => canvas_stdin_read(out.as_mut_ptr(), out.len(), &mut actual),
+            }
+        };
         if rc == 0 {
             Ok(actual)
         } else {
@@ -344,16 +351,12 @@ mod imp {
         }
     }
 
+    pub fn stdin_read(out: &mut [u8]) -> Result<usize> {
+        stdin_read_dyn(out, None)
+    }
+
     pub fn stdin_read_timeout(out: &mut [u8], ticks: u64) -> Result<usize> {
-        let mut actual = 0usize;
-        // SAFETY: `out` and `actual` are valid writable buffers.
-        let rc =
-            unsafe { canvas_stdin_read_timeout(out.as_mut_ptr(), out.len(), ticks, &mut actual) };
-        if rc == 0 {
-            Ok(actual)
-        } else {
-            Err(ErrorCode::from_raw(rc).unwrap_or(ErrorCode::Internal))
-        }
+        stdin_read_dyn(out, Some(ticks))
     }
 
     pub fn stdout_write(data: &[u8]) -> Result<usize> {

@@ -143,7 +143,7 @@ impl CapsSpec {
                             _ => return Err(alloc::format!("invalid dir mode '{mode}'")),
                         }
                     } else {
-                        (val, true)
+                        (val, false)
                     };
                     if !path.starts_with('/') {
                         return Err(alloc::format!("dir path must be absolute: '{path}'"));
@@ -170,6 +170,7 @@ pub enum WordPart {
     Literal(String),
     Var(String),
     CmdSubst(Vec<Stmt>),
+    ArithSubst(String),
 }
 
 /// Argument expression (preserves exact boundaries; no POSIX word splitting).
@@ -177,6 +178,8 @@ pub enum WordPart {
 pub struct ArgExpr {
     pub parts: Vec<WordPart>,
     pub raw_var_only: Option<String>,
+    /// True if any part was quoted (`'...'` or `"..."`), suppressing `*`/`?` globbing.
+    pub quoted: bool,
 }
 
 /// Expression evaluated in `let`, `for`, or `return`.
@@ -198,7 +201,7 @@ pub enum CmpOp {
     Contains,
 }
 
-/// Conditional expression in `if ... { ... }`.
+/// Conditional expression in `if ... { ... }` or `while ... { ... }`.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Cond {
     Compare {
@@ -207,6 +210,10 @@ pub enum Cond {
         right: ArgExpr,
     },
     Truthy(ArgExpr),
+    Test(Vec<ArgExpr>),
+    Not(alloc::boxed::Box<Cond>),
+    And(alloc::boxed::Box<Cond>, alloc::boxed::Box<Cond>),
+    Or(alloc::boxed::Box<Cond>, alloc::boxed::Box<Cond>),
 }
 
 /// Output redirection to an HxFS file.
@@ -216,13 +223,24 @@ pub enum Redirect {
     Append(ArgExpr),
 }
 
+/// Stderr redirection on a command.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ErrRedirect {
+    ToStdout,
+    Truncate(ArgExpr),
+    Append(ArgExpr),
+}
+
 /// Single command invocation in a pipeline.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CommandCall {
     pub caps: Option<CapsSpec>,
+    pub negated: bool,
     pub name: ArgExpr,
     pub args: Vec<ArgExpr>,
+    pub stdin_redirect: Option<ArgExpr>,
     pub redirect: Option<Redirect>,
+    pub err_redirect: Option<ErrRedirect>,
 }
 
 /// Pipeline `cmd1 | cmd2 | ...`.
@@ -253,6 +271,10 @@ pub enum Stmt {
         name: String,
         value: Expr,
     },
+    Assign {
+        name: String,
+        value: Expr,
+    },
     Alias {
         name: String,
         value: String,
@@ -267,11 +289,17 @@ pub enum Stmt {
         then_body: Vec<Stmt>,
         else_body: Option<Vec<Stmt>>,
     },
+    While {
+        cond: Cond,
+        body: Vec<Stmt>,
+    },
     For {
         var: String,
         iter: Expr,
         body: Vec<Stmt>,
     },
+    Break,
+    Continue,
     Return(Option<Expr>),
     Chain(Chain),
 }

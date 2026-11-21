@@ -26,6 +26,7 @@ huesos_std::entry!(run);
 enum Kind {
     File,
     Dir,
+    Symlink,
 }
 
 struct Options {
@@ -76,8 +77,9 @@ fn run() -> i32 {
                 match args.get(index).map(String::as_str) {
                     Some("f") => options.kind = Some(Kind::File),
                     Some("d") => options.kind = Some(Kind::Dir),
+                    Some("l") => options.kind = Some(Kind::Symlink),
                     _ => {
-                        eprintln!("find: -type takes f or d");
+                        eprintln!("find: -type takes f, d, or l");
                         return 2;
                     }
                 }
@@ -114,7 +116,7 @@ fn run() -> i32 {
 /// Depth-first walk of `current`, one level of `depth` down from the root.
 fn visit(options: &Options, current: &str, depth: usize, failures: &mut u32) {
     let normalized = path::normalize(current);
-    let metadata = match fs::metadata(&normalized) {
+    let metadata = match fs::symlink_metadata(&normalized) {
         Ok(metadata) => metadata,
         Err(error) => {
             eprintln!("find: {current}: {error}");
@@ -123,9 +125,13 @@ fn visit(options: &Options, current: &str, depth: usize, failures: &mut u32) {
         }
     };
     let is_dir = metadata.is_dir();
-    let selected = options
-        .kind
-        .is_none_or(|kind| (kind == Kind::Dir) == is_dir);
+    let is_symlink = metadata.is_symlink();
+    let is_file = metadata.is_file();
+    let selected = options.kind.is_none_or(|kind| match kind {
+        Kind::Dir => is_dir,
+        Kind::File => is_file,
+        Kind::Symlink => is_symlink,
+    });
     let name = path::file_name(&normalized).unwrap_or(&normalized);
     if selected
         && options

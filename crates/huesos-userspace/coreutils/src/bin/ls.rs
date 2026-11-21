@@ -25,12 +25,6 @@ fn run() -> i32 {
         return 1;
     }
 
-    let hxfs = if allow_hxfs { cu::take_hxfs() } else { None };
-    let hxfs_dir = if allow_hxfs {
-        cu::take_hxfs_dir()
-    } else {
-        None
-    };
     let bootfs = if allow_bootfs {
         cu::take_bootfs()
     } else {
@@ -41,56 +35,31 @@ fn run() -> i32 {
     let mut found_any = false;
 
     if allow_hxfs {
-        let dir_opt = if let Some(svc) = hxfs {
-            svc.open_dir(&path).ok()
-        } else if let Some(scoped) = hxfs_dir {
-            if path == "/" {
-                None
-            } else {
-                scoped.open_dir(path.trim_start_matches('/')).ok()
-            }
-        } else {
-            None
-        };
-
-        // The scoped handle is the subtree root itself, so `/` lists through
-        // the handle as granted instead of asking it to open a path above it.
-        if path == "/" && hxfs.is_none() {
-            if let Some(scoped) = hxfs_dir {
-                found_any = true;
-                let mut raw = [0u8; 4096];
-                if let Ok(bytes) = scoped.list(&mut raw) {
-                    if let Ok(text) = core::str::from_utf8(bytes) {
-                        for line in text.lines() {
-                            let mut parts = line.split_whitespace();
-                            let Some(name) = parts.next() else {
-                                continue;
-                            };
-                            let kind = parts.next().unwrap_or("entry");
-                            let size = parts.next().unwrap_or("-");
-                            rows.push(format!("{name}\t{kind}\t{size}\thxfs"));
-                        }
-                    }
-                }
-            }
-        }
-
-        if let Some(dir) = dir_opt {
+        if let Ok(entries) = huesos_std::fs::list(&path) {
             found_any = true;
-            let mut raw = [0u8; 4096];
-            if let Ok(bytes) = dir.list(&mut raw) {
-                if let Ok(text) = core::str::from_utf8(bytes) {
-                    for line in text.lines() {
-                        let mut parts = line.split_whitespace();
-                        let Some(name) = parts.next() else {
-                            continue;
-                        };
-                        let kind = parts.next().unwrap_or("entry");
-                        let size = parts.next().unwrap_or("-");
-                        rows.push(format!("{name}\t{kind}\t{size}\thxfs"));
-                    }
-                }
+            for entry in entries {
+                let kind = match entry.kind {
+                    huesos_std::fs::EntryKind::Dir => "dir",
+                    huesos_std::fs::EntryKind::File => "file",
+                    huesos_std::fs::EntryKind::Symlink => "symlink",
+                    huesos_std::fs::EntryKind::Other => "entry",
+                };
+                let size = match entry.size {
+                    Some(sz) => format!("{sz}"),
+                    None => String::from("-"),
+                };
+                rows.push(format!("{}\t{kind}\t{size}\thxfs", entry.name));
             }
+        } else if let Ok(meta) = huesos_std::fs::symlink_metadata(&path) {
+            found_any = true;
+            let leaf = path.rsplit('/').next().unwrap_or(&path);
+            let kind = match meta.kind {
+                huesos_std::fs::EntryKind::Dir => "dir",
+                huesos_std::fs::EntryKind::File => "file",
+                huesos_std::fs::EntryKind::Symlink => "symlink",
+                huesos_std::fs::EntryKind::Other => "entry",
+            };
+            rows.push(format!("{leaf}\t{kind}\t{}\thxfs", meta.len()));
         }
     }
 
@@ -102,6 +71,12 @@ fn run() -> i32 {
         };
         let mut seen_dirs: Vec<String> = Vec::new();
         for (bpath, _off, blen) in cu::iter_bootfs_entries(vmo) {
+            if bpath == path && !found_any {
+                found_any = true;
+                let leaf = bpath.rsplit('/').next().unwrap_or(&bpath);
+                rows.push(format!("{leaf}\tfile\t{blen}\tbootfs"));
+                break;
+            }
             if let Some(rest) = bpath.strip_prefix(&prefix) {
                 found_any = true;
                 if let Some((dir_name, _)) = rest.split_once('/') {

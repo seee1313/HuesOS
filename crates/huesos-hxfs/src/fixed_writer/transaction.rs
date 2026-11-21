@@ -22,6 +22,7 @@ impl TransactionShape {
         extra_tree_blocks: u64,
         hxblob_leaf_blocks: u64,
         hxblob_enabled: bool,
+        has_snapshots: bool,
     ) -> FixedResult<Self> {
         // Object table, volume table, allocation/refcount/backref/quota roots,
         // two v6 policy roots, and checkpoint.
@@ -32,19 +33,24 @@ impl TransactionShape {
         const HXBLOB_RECORDS: u64 = 2;
 
         let object_blocks = u64::try_from(live_objects).map_err(|_| HxfsError::NoSpace)?;
+        let snapshot_blocks = u64::from(has_snapshots);
         let feature_target_blocks = if hxblob_enabled {
             HXBLOB_TARGET_BLOCKS
                 .checked_add(hxblob_leaf_blocks)
                 .ok_or(HxfsError::NoSpace)?
         } else {
             0
-        };
+        }
+        .checked_add(snapshot_blocks)
+        .ok_or(HxfsError::NoSpace)?;
         let target_blocks = object_blocks
             .checked_add(extra_tree_blocks)
             .and_then(|value| value.checked_add(BASE_TARGET_BLOCKS))
             .and_then(|value| value.checked_add(feature_target_blocks))
             .ok_or(HxfsError::NoSpace)?;
-        let feature_records = if hxblob_enabled { HXBLOB_RECORDS } else { 0 };
+        let feature_records = (if hxblob_enabled { HXBLOB_RECORDS } else { 0 })
+            .checked_add(snapshot_blocks)
+            .ok_or(HxfsError::NoSpace)?;
         let record_count_u64 = object_blocks
             .checked_add(BASE_RECORDS)
             .and_then(|value| value.checked_add(feature_records))

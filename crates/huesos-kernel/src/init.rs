@@ -220,7 +220,7 @@ pub fn syscall_init() {
         crate::scheduler::sched_summary,
         crate::scheduler::sched_cpu_record,
     );
-    huesos_syscalls::set_task_record_fn(crate::scheduler::task_record);
+    huesos_syscalls::set_task_record_fn(crate::scheduler::task_records_page);
     huesos_syscalls::set_task_count_fn(crate::scheduler::task_count);
     huesos_syscalls::set_current_cpu_fn(crate::scheduler::current_cpu_index);
     huesos_syscalls::set_shutdown_fn(crate::shutdown::request);

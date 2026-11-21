@@ -49,6 +49,47 @@ pub const MAX_QUOTA_RECORDS: usize = 16;
 /// mount; persisting the marker on disk is a Stage C+ item.
 pub const MAX_BAD_EXTENTS: usize = 16;
 
+/// Maximum named snapshots persisted in the virtual-volume snapshot registry.
+pub const MAX_NAMED_SNAPSHOTS: usize = 16;
+
+/// Persisted named snapshot registry entry.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SnapshotEntry {
+    /// Snapshot identifier.
+    pub snapshot_id: u64,
+    /// Checkpoint sequence captured by the snapshot.
+    pub checkpoint_seq: u64,
+    /// Checkpoint LBA captured by the snapshot.
+    pub checkpoint_lba: u64,
+    /// Creation timestamp (nanoseconds since UNIX epoch, or monotonic stamp).
+    pub created_unix_ns: i64,
+    /// UTF-8 byte length of `name`.
+    pub name_len: u16,
+    /// UTF-8 snapshot name bytes.
+    pub name: [u8; MAX_NAME_BYTES],
+}
+
+impl SnapshotEntry {
+    /// Empty slot sentinel.
+    pub const EMPTY: Self = Self {
+        snapshot_id: 0,
+        checkpoint_seq: 0,
+        checkpoint_lba: 0,
+        created_unix_ns: 0,
+        name_len: 0,
+        name: [0; MAX_NAME_BYTES],
+    };
+
+    /// Borrow the snapshot name as `&str`.
+    pub fn name(&self) -> &str {
+        core::str::from_utf8(&self.name[..usize::from(self.name_len)]).unwrap_or("")
+    }
+}
+
+const SNAPSHOT_TABLE_MAGIC: u32 = 0x5041_4E53; // "SNAP"
+const SNAPSHOT_TABLE_VERSION: u32 = 1;
+const SNAPSHOT_RECORD_BYTES: usize = 192;
+
 /// Decoded pages the mounted writer caches.
 ///
 /// 256 * 4 KiB = 1 MiB, held inline in the mount. The service's user
@@ -76,6 +117,13 @@ pub struct ScrubSummary {
     pub data_bytes: u64,
     /// Failures encountered (metadata or data).
     pub errors: u64,
+}
+
+impl ScrubSummary {
+    /// True when the scrub encountered zero metadata or data errors.
+    pub const fn is_clean(&self) -> bool {
+        self.errors == 0
+    }
 }
 
 /// Stage C: report-only structural fsck summary.
@@ -303,6 +351,9 @@ pub struct FixedHxfsWriter<
     /// Boxed for the same reason as the page cache: this is sized by
     /// MAX_EXTENTS and must not sit on the construction stack.
     snapshot_refs: alloc::boxed::Box<RefcountBtree<MAX_EXTENTS>>,
+    /// Persisted named snapshots (serialized into `checkpoint.virtual_volume_tree_lba`).
+    snapshots: [Option<SnapshotEntry>; MAX_NAMED_SNAPSHOTS],
+    next_snapshot_id: u64,
     /// v5 compatibility mounts are read-only until an explicit migration.
     legacy_read_only: bool,
     dirty: bool,
@@ -477,6 +528,8 @@ impl<
             page_cache: alloc::boxed::Box::new(crate::page_cache::FixedPageCache::new()),
             pending_free: [None; MAX_EXTENTS],
             snapshot_refs: alloc::boxed::Box::new(RefcountBtree::new()),
+            snapshots: [None; MAX_NAMED_SNAPSHOTS],
+            next_snapshot_id: 1,
             free_space: [None; MAX_EXTENTS],
             legacy_read_only: superblock.format_version == LEGACY_FORMAT_VERSION,
             dirty: false,
@@ -485,6 +538,7 @@ impl<
         #[cfg(feature = "hxblob")]
         mounted.load_hxblob_index()?;
         mounted.load_quota_tree()?;
+        mounted.load_snapshot_table()?;
         mounted.next_object_id = mounted.compute_next_object_id();
         mounted.next_lba = mounted.compute_next_lba()?;
         mounted.rebuild_free_space();
@@ -588,32 +642,74 @@ impl<
         while index < self.objects.len() {
             if let Some(object) = self.objects[index] {
                 let descriptor = object.descriptor;
-                // Metadata tree block.
-                let mut block = [0u8; BLOCK_SIZE];
-                let metadata_ok = match descriptor.object_type {
-                    OBJECT_TYPE_DIRECTORY => self
-                        .read_mounted_metadata_block(
-                            descriptor.tree_lba,
-                            BLOCK_TYPE_DIRECTORY,
-                            descriptor.object_id,
-                            &mut block,
-                        )
-                        .is_ok(),
-                    OBJECT_TYPE_FILE | OBJECT_TYPE_SYMLINK => self
-                        .read_mounted_metadata_block_any_type(
-                            descriptor.tree_lba,
-                            BLOCK_TYPE_EXTENT_TABLE,
-                            BLOCK_TYPE_EXTENT_TABLE_V2,
-                            descriptor.object_id,
-                            &mut block,
-                        )
-                        .is_ok(),
-                    _ => true,
-                };
-                if metadata_ok {
-                    summary.metadata_blocks += 1;
-                } else {
-                    summary.errors += 1;
+                // Metadata tree block (only validate persisted trees when tree_lba != 0).
+                if descriptor.tree_lba != 0 {
+                    let mut block = [0u8; BLOCK_SIZE];
+                    match descriptor.object_type {
+                        OBJECT_TYPE_DIRECTORY => {
+                            if self
+                                .read_mounted_metadata_block(
+                                    descriptor.tree_lba,
+                                    BLOCK_TYPE_DIRECTORY,
+                                    descriptor.object_id,
+                                    &mut block,
+                                )
+                                .is_ok()
+                            {
+                                summary.metadata_blocks += 1;
+                            } else {
+                                summary.errors += 1;
+                            }
+                        }
+                        OBJECT_TYPE_FILE | OBJECT_TYPE_SYMLINK => {
+                            if self
+                                .read_mounted_metadata_block_any_type(
+                                    descriptor.tree_lba,
+                                    BLOCK_TYPE_EXTENT_TABLE,
+                                    BLOCK_TYPE_EXTENT_TABLE_V2,
+                                    descriptor.object_id,
+                                    &mut block,
+                                )
+                                .is_ok()
+                            {
+                                summary.metadata_blocks += 1;
+                            } else if let Ok(root_hdr) = self.read_mounted_metadata_block(
+                                descriptor.tree_lba,
+                                BLOCK_TYPE_EXTENT_TREE_ROOT,
+                                descriptor.object_id,
+                                &mut block,
+                            ) {
+                                summary.metadata_blocks += 1;
+                                match parse_extent_tree_root(
+                                    &block[root_hdr.header_bytes as usize..],
+                                ) {
+                                    Ok(leaves) => {
+                                        let mut leaf_block = [0u8; BLOCK_SIZE];
+                                        for leaf_lba in leaves {
+                                            if self
+                                                .read_mounted_metadata_block(
+                                                    leaf_lba,
+                                                    BLOCK_TYPE_EXTENT_TREE_LEAF,
+                                                    descriptor.object_id,
+                                                    &mut leaf_block,
+                                                )
+                                                .is_ok()
+                                            {
+                                                summary.metadata_blocks += 1;
+                                            } else {
+                                                summary.errors += 1;
+                                            }
+                                        }
+                                    }
+                                    Err(_) => summary.errors += 1,
+                                }
+                            } else {
+                                summary.errors += 1;
+                            }
+                        }
+                        OBJECT_TYPE_BLOB_VIEW => {}
+                        _ => summary.errors += 1,
+                    }
                 }
                 // Data extents.
                 if matches!(
@@ -1606,12 +1702,12 @@ impl<
         }
     }
 
-    /// Open an absolute directory path.
-    pub fn open_directory_path(&self, path: &str) -> FixedResult<DirectoryHandle> {
+    /// Open an absolute directory path (following symlinks up to [`crate::security_policy::MAX_SYMLINK_DEPTH`]).
+    pub fn open_directory_path(&mut self, path: &str) -> FixedResult<DirectoryHandle> {
         if path == "/" {
             return Ok(self.root_directory());
         }
-        let object_id = self.resolve_path(path)?;
+        let object_id = self.resolve_path_with_symlinks(path, true)?;
         let object = self.object(object_id)?;
         if object.descriptor.object_type != OBJECT_TYPE_DIRECTORY {
             return Err(HxfsError::WrongType);
@@ -1619,34 +1715,275 @@ impl<
         Ok(DirectoryHandle { object_id })
     }
 
-    /// Open an absolute file path.
-    pub fn open_path(&self, path: &str) -> FixedResult<FileHandle> {
-        let object_id = self.resolve_path(path)?;
+    /// Open an absolute file path (following symlinks up to [`crate::security_policy::MAX_SYMLINK_DEPTH`]).
+    pub fn open_path(&mut self, path: &str) -> FixedResult<FileHandle> {
+        let object_id = self.resolve_path_with_symlinks(path, true)?;
         self.file_handle(object_id)
     }
 
-    /// Open one child file by name from a directory handle.
+    /// Open an absolute file path, optionally refusing to follow a final symlink (`O_NOFOLLOW`).
+    pub fn open_path_ex(&mut self, path: &str, follow_final: bool) -> FixedResult<FileHandle> {
+        let object_id = self.resolve_path_with_symlinks(path, follow_final)?;
+        self.file_handle(object_id)
+    }
+
+    /// Open a child or relative subpath file from a directory handle (following symlinks).
     pub fn open_child_file(
-        &self,
+        &mut self,
         directory: DirectoryHandle,
         name: &str,
     ) -> FixedResult<FileHandle> {
-        let object_id = self.lookup_child(directory.object_id, name.as_bytes())?;
+        let object_id = self.resolve_relative_from_dir(directory.object_id, name, true)?;
         self.file_handle(object_id)
     }
 
-    /// Open one child directory by name from a directory handle.
+    /// Open a child or relative subpath directory from a directory handle (following symlinks).
     pub fn open_child_dir(
-        &self,
+        &mut self,
         directory: DirectoryHandle,
         name: &str,
     ) -> FixedResult<DirectoryHandle> {
-        let object_id = self.lookup_child(directory.object_id, name.as_bytes())?;
+        if name.is_empty() || name == "." {
+            self.ensure_directory(directory.object_id)?;
+            return Ok(directory);
+        }
+        let object_id = self.resolve_relative_from_dir(directory.object_id, name, true)?;
         let object = self.object(object_id)?;
         if object.descriptor.object_type != OBJECT_TYPE_DIRECTORY {
             return Err(HxfsError::WrongType);
         }
         Ok(DirectoryHandle { object_id })
+    }
+
+    /// Stat an absolute path, following or not following a final symlink (`stat` vs `lstat`).
+    pub fn stat_path(
+        &mut self,
+        path: &str,
+        follow_final: bool,
+    ) -> FixedResult<huesos_abi::hxfs::HxfsStatInfo> {
+        let object_id = self.resolve_path_with_symlinks(path, follow_final)?;
+        self.stat_object(object_id)
+    }
+
+    /// Stat a relative subpath under a directory handle (`stat` vs `lstat` confined to subtree).
+    pub fn stat_child(
+        &mut self,
+        directory: DirectoryHandle,
+        rel_path: &str,
+        follow_final: bool,
+    ) -> FixedResult<huesos_abi::hxfs::HxfsStatInfo> {
+        if rel_path.is_empty() || rel_path == "." {
+            return self.stat_object(directory.object_id);
+        }
+        let object_id =
+            self.resolve_relative_from_dir(directory.object_id, rel_path, follow_final)?;
+        self.stat_object(object_id)
+    }
+
+    fn stat_object(&self, object_id: u64) -> FixedResult<huesos_abi::hxfs::HxfsStatInfo> {
+        let desc = self.object(object_id)?.descriptor;
+        let mode = effective_posix_mode(desc.object_type, desc.flags);
+        Ok(huesos_abi::hxfs::HxfsStatInfo {
+            object_id: desc.object_id,
+            size: desc.size,
+            modified_unix_ns: desc.modified_unix_ns,
+            object_type: desc.object_type,
+            mode,
+        })
+    }
+
+    /// Read the target path of a symbolic link at an absolute path (`readlink`).
+    pub fn readlink_path(&mut self, path: &str, out: &mut [u8]) -> FixedResult<usize> {
+        let object_id = self.resolve_path_with_symlinks(path, false)?;
+        self.read_symlink_object(object_id, out)
+    }
+
+    /// Read the target path of a symbolic link at a relative subpath under a directory handle.
+    pub fn readlink_child(
+        &mut self,
+        directory: DirectoryHandle,
+        rel_path: &str,
+        out: &mut [u8],
+    ) -> FixedResult<usize> {
+        let object_id = self.resolve_relative_from_dir(directory.object_id, rel_path, false)?;
+        self.read_symlink_object(object_id, out)
+    }
+
+    fn read_symlink_object(&mut self, object_id: u64, out: &mut [u8]) -> FixedResult<usize> {
+        let desc = self.object(object_id)?.descriptor;
+        if desc.object_type != OBJECT_TYPE_SYMLINK {
+            return Err(HxfsError::WrongType);
+        }
+        let size = usize::try_from(desc.size).map_err(|_| HxfsError::OutOfRange)?;
+        if out.len() < size {
+            return Err(HxfsError::BufferTooSmall);
+        }
+        out[..size].fill(0);
+        self.copy_extents(object_id, &mut out[..size])?;
+        Ok(size)
+    }
+
+    /// Create a symbolic link at `link_path` pointing to `target`.
+    pub fn create_symlink_path(&mut self, link_path: &str, target: &str) -> FixedResult<u64> {
+        self.ensure_mutable_v6()?;
+        let (parent, name) = self.parent_and_name_with_symlinks(link_path)?;
+        self.create_symlink_child(DirectoryHandle { object_id: parent }, name, target)
+    }
+
+    /// Create a symbolic link under `parent` at `rel_path` pointing to `target`.
+    pub fn create_symlink_child(
+        &mut self,
+        parent: DirectoryHandle,
+        rel_path: &str,
+        target: &str,
+    ) -> FixedResult<u64> {
+        self.ensure_mutable_v6()?;
+        if target.is_empty() || target.len() > huesos_abi::hxfs::HXFS_MAX_PATH_BYTES {
+            return Err(HxfsError::BadName);
+        }
+        let (dir_id, leaf) = self.parent_and_leaf_from_dir(parent.object_id, rel_path)?;
+        self.ensure_directory(dir_id)?;
+        if self.lookup_child(dir_id, leaf.as_bytes()).is_ok() {
+            return Err(HxfsError::AlreadyExists);
+        }
+        let target_bytes = target.as_bytes();
+        let delta_bytes = u64::try_from(target_bytes.len()).map_err(|_| HxfsError::OutOfRange)?;
+        self.quota_admits(delta_bytes, 1)?;
+        self.check_volume_quota(delta_bytes, 1)?;
+        self.check_job_quota(delta_bytes, 1)?;
+
+        let object_id = self.alloc_object_id()?;
+        let descriptor = ObjectDescriptor {
+            object_id,
+            object_type: OBJECT_TYPE_SYMLINK,
+            type_version: 1,
+            size: delta_bytes,
+            modified_unix_ns: 0,
+            encryption_policy_id: 0,
+            compression_policy_id: 0,
+            tree_lba: 0,
+            record_count: 0,
+            flags: huesos_abi::hxfs::HXFS_MODE_EXPLICIT_BIT | 0o777,
+        };
+        let (physical_block, generation, kind) =
+            self.write_data_blocks(target_bytes, descriptor, 0)?;
+        let (flags, block_count, compression) = match kind {
+            ExtentWriteKind::Plain => (0, 1, None),
+            ExtentWriteKind::Compressed(meta) => (EXTENT_FLAG_COMPRESSED, 1, Some(meta)),
+            ExtentWriteKind::MultiSlot => (EXTENT_FLAG_MULTI_SLOT, 2, None),
+        };
+        self.insert_object(descriptor)?;
+        self.insert_extent(FixedExtent {
+            object_id,
+            extent: ExtentRecord {
+                logical_block: 0,
+                physical_block,
+                block_count,
+                flags,
+                generation,
+            },
+            compression,
+        })?;
+        self.insert_dir_entry(dir_id, object_id, leaf.as_bytes())?;
+        self.dirty = true;
+        Ok(object_id)
+    }
+
+    /// Update POSIX mode (`mode_opt`) and/or `modified_unix_ns` (`mtime_opt`) on an absolute path.
+    pub fn set_attr_path(
+        &mut self,
+        path: &str,
+        mode_opt: Option<u32>,
+        mtime_opt: Option<i64>,
+        follow_final: bool,
+    ) -> FixedResult<huesos_abi::hxfs::HxfsStatInfo> {
+        self.ensure_mutable_v6()?;
+        let object_id = self.resolve_path_with_symlinks(path, follow_final)?;
+        self.apply_set_attr(object_id, mode_opt, mtime_opt)
+    }
+
+    /// Update POSIX mode and/or `modified_unix_ns` on a relative subpath under `directory`.
+    pub fn set_attr_child(
+        &mut self,
+        directory: DirectoryHandle,
+        rel_path: &str,
+        mode_opt: Option<u32>,
+        mtime_opt: Option<i64>,
+        follow_final: bool,
+    ) -> FixedResult<huesos_abi::hxfs::HxfsStatInfo> {
+        self.ensure_mutable_v6()?;
+        let object_id = if rel_path.is_empty() || rel_path == "." {
+            directory.object_id
+        } else {
+            self.resolve_relative_from_dir(directory.object_id, rel_path, follow_final)?
+        };
+        self.apply_set_attr(object_id, mode_opt, mtime_opt)
+    }
+
+    /// Update POSIX mode and/or `modified_unix_ns` directly on an open file handle.
+    pub fn set_attr_file(
+        &mut self,
+        file: FileHandle,
+        mode_opt: Option<u32>,
+        mtime_opt: Option<i64>,
+    ) -> FixedResult<huesos_abi::hxfs::HxfsStatInfo> {
+        self.ensure_mutable_v6()?;
+        self.apply_set_attr(file.object_id, mode_opt, mtime_opt)
+    }
+
+    fn apply_set_attr(
+        &mut self,
+        object_id: u64,
+        mode_opt: Option<u32>,
+        mtime_opt: Option<i64>,
+    ) -> FixedResult<huesos_abi::hxfs::HxfsStatInfo> {
+        let obj = self.object_mut(object_id)?;
+        if let Some(mode) = mode_opt {
+            let clean = mode & huesos_abi::hxfs::HXFS_MODE_MASK;
+            obj.descriptor.flags = (obj.descriptor.flags
+                & !(huesos_abi::hxfs::HXFS_MODE_EXPLICIT_BIT | huesos_abi::hxfs::HXFS_MODE_MASK))
+                | huesos_abi::hxfs::HXFS_MODE_EXPLICIT_BIT
+                | clean;
+        }
+        if let Some(mtime) = mtime_opt {
+            obj.descriptor.modified_unix_ns = mtime;
+        }
+        self.dirty = true;
+        self.stat_object(object_id)
+    }
+
+    /// Compute filesystem space and object statistics (`statvfs`) given total device/partition blocks.
+    pub fn stat_fs(&self, total_blocks: u64) -> huesos_abi::hxfs::HxfsStatFsInfo {
+        let mut live_data_blocks = 0u64;
+        let mut idx = 0usize;
+        while idx < self.extents.len() {
+            if let Some(entry) = self.extents[idx] {
+                if entry.extent.flags & EXTENT_FLAG_HOLE == 0 {
+                    live_data_blocks =
+                        live_data_blocks.saturating_add(u64::from(entry.extent.block_count));
+                }
+            }
+            idx += 1;
+        }
+        let meta_blocks = 1u64
+            .saturating_add(self.live_object_count() as u64)
+            .saturating_add(10);
+        let min_used = live_data_blocks.saturating_add(meta_blocks);
+        let high_water = self.next_lba.max(min_used);
+        let reclaimable_blocks = self.reclaimable_physical_bytes() / BLOCK_SIZE_U64;
+        let used_blocks = high_water.saturating_sub(reclaimable_blocks).max(min_used);
+        let eff_total = total_blocks.max(used_blocks);
+        let avail_blocks = eff_total.saturating_sub(used_blocks);
+        huesos_abi::hxfs::HxfsStatFsInfo {
+            block_size: BLOCK_SIZE_U64,
+            total_blocks: eff_total,
+            used_blocks,
+            avail_blocks,
+            total_objects: MAX_OBJECTS as u64,
+            used_objects: self.live_object_count() as u64,
+            checkpoint_seq: self.superblock.sequence_number,
+            format_version: u64::from(self.superblock.format_version),
+        }
     }
 
     /// Refresh a file handle's size after mutation.
@@ -1712,6 +2049,7 @@ impl<
                 if entry.parent_object_id == directory.object_id {
                     let kind = match self.object(entry.object_id)?.descriptor.object_type {
                         OBJECT_TYPE_DIRECTORY => "dir",
+                        OBJECT_TYPE_SYMLINK => "symlink",
                         _ => "file",
                     };
                     let size = self.object(entry.object_id)?.descriptor.size;
@@ -1863,20 +2201,21 @@ impl<
     /// Create a directory at an absolute path.
     pub fn mkdir_path(&mut self, path: &str) -> FixedResult<DirectoryHandle> {
         self.ensure_mutable_v6()?;
-        let (parent, name) = self.parent_and_name(path)?;
+        let (parent, name) = self.parent_and_name_with_symlinks(path)?;
         self.mkdir_child(DirectoryHandle { object_id: parent }, name)
     }
 
-    /// Create a directory below an existing directory handle.
+    /// Create a directory below an existing directory handle (supports relative subpaths).
     pub fn mkdir_child(
         &mut self,
         parent: DirectoryHandle,
         name: &str,
     ) -> FixedResult<DirectoryHandle> {
         self.ensure_mutable_v6()?;
-        self.ensure_directory(parent.object_id)?;
+        let (dir_id, leaf) = self.parent_and_leaf_from_dir(parent.object_id, name)?;
+        self.ensure_directory(dir_id)?;
         self.quota_admits(0, 1)?;
-        if self.lookup_child(parent.object_id, name.as_bytes()).is_ok() {
+        if self.lookup_child(dir_id, leaf.as_bytes()).is_ok() {
             return Err(HxfsError::AlreadyExists);
         }
         let object_id = self.alloc_object_id()?;
@@ -1893,7 +2232,7 @@ impl<
             flags: 0,
         };
         self.insert_object(descriptor)?;
-        self.insert_dir_entry(parent.object_id, object_id, name.as_bytes())?;
+        self.insert_dir_entry(dir_id, object_id, leaf.as_bytes())?;
         self.dirty = true;
         Ok(DirectoryHandle { object_id })
     }
@@ -1901,20 +2240,21 @@ impl<
     /// Create an empty file at an absolute path.
     pub fn create_file_path(&mut self, path: &str) -> FixedResult<FileHandle> {
         self.ensure_mutable_v6()?;
-        let (parent, name) = self.parent_and_name(path)?;
+        let (parent, name) = self.parent_and_name_with_symlinks(path)?;
         self.create_file_child(DirectoryHandle { object_id: parent }, name)
     }
 
-    /// Create an empty file below an existing directory handle.
+    /// Create an empty file below an existing directory handle (supports relative subpaths).
     pub fn create_file_child(
         &mut self,
         parent: DirectoryHandle,
         name: &str,
     ) -> FixedResult<FileHandle> {
         self.ensure_mutable_v6()?;
-        self.ensure_directory(parent.object_id)?;
+        let (dir_id, leaf) = self.parent_and_leaf_from_dir(parent.object_id, name)?;
+        self.ensure_directory(dir_id)?;
         self.quota_admits(0, 1)?;
-        if self.lookup_child(parent.object_id, name.as_bytes()).is_ok() {
+        if self.lookup_child(dir_id, leaf.as_bytes()).is_ok() {
             return Err(HxfsError::AlreadyExists);
         }
         let object_id = self.alloc_object_id()?;
@@ -1931,7 +2271,7 @@ impl<
             flags: 0,
         };
         self.insert_object(descriptor)?;
-        self.insert_dir_entry(parent.object_id, object_id, name.as_bytes())?;
+        self.insert_dir_entry(dir_id, object_id, leaf.as_bytes())?;
         self.dirty = true;
         Ok(FileHandle { object_id, size: 0 })
     }
@@ -1956,6 +2296,11 @@ impl<
     /// This is what makes a disk image an ordinary file: `fdisk` writes 512
     /// byte sectors at arbitrary offsets, and each of those writes lands in
     /// the middle of a block that already holds data.
+    ///
+    /// Write inline data to `file` at `offset` (`offset == 0` replaces the
+    /// existing file contents, matching HxFS's documented whole-file rewrite
+    /// contract; use [`Self::write_file_at_preserve`] for POSIX random-offset
+    /// partial overwrites that must preserve bytes past `offset + data.len()`).
     ///
     /// The call is atomic from the caller's point of view only in the sense
     /// that nothing is published until [`Self::publish_checkpoint`]; a
@@ -1991,46 +2336,16 @@ impl<
             let cleared = self.object(file.object_id)?.descriptor;
             return self.write_file_range(file, cleared, 0, data);
         }
-        // A.5 wire: per-Job quota enforcement on the write path.
-        // The volume-level quota is the system volume descriptor
-        // (VolumeDescriptor.quota_physical_bytes /
-        // quota_objects) and the current usage is the volume's
-        // computed usage; the delta is the bytes + one object
-        // this write will commit. A breach returns
-        // HxfsError::QuotaExceeded, which the kernel
-        // translates to the user-facing NoSpace error at the
-        // mount boundary.
         let delta_bytes = u64::try_from(data.len()).map_err(|_| HxfsError::OutOfRange)?;
-
-        // Release the extents this write replaces BEFORE charging the
-        // quota. A full rewrite (`offset == 0`) drops every existing
-        // extent of the file, so those blocks must not be counted as
-        // still-in-use when deciding whether the new write fits;
-        // charging first made an in-place rewrite of a file that
-        // exactly filled its quota fail even though usage would not
-        // change. Validation that can reject the write already
-        // happened above, so dropping the extents here does not
-        // discard data for a call that then fails.
-        if offset == 0 {
-            let released = self.clear_extents(file.object_id);
-            self.release_job_bytes(released);
-        }
+        let released = self.clear_extents(file.object_id);
+        self.release_job_bytes(released);
+        self.object_mut(file.object_id)?.descriptor.size = 0;
 
         self.check_volume_quota(delta_bytes, 0)?;
-        // Stage E (Phase-2): per-Job quota enforcement.
         self.check_job_quota(delta_bytes, 0)?;
 
         if !data.is_empty() {
-            let logical_block = offset / BLOCK_SIZE_U64;
-            // Stage B.3 completion: the write path resolves the
-            // object's compression policy and stores the resulting
-            // descriptor (or `None` for a plain extent) with the
-            // extent record; the v2 serialization at publish time
-            // carries it and sets `EXTENT_FLAG_COMPRESSED`. An
-            // incompressible full block on an encrypted volume is
-            // stored as a two-slot extent
-            // (`EXTENT_FLAG_MULTI_SLOT`, `block_count = 2`).
-            let (physical_block, generation, kind) = self.write_data_blocks(data, object)?;
+            let (physical_block, generation, kind) = self.write_data_blocks(data, object, 0)?;
             let (flags, block_count, compression) = match kind {
                 ExtentWriteKind::Plain => (0, 1, None),
                 ExtentWriteKind::Compressed(meta) => (EXTENT_FLAG_COMPRESSED, 1, Some(meta)),
@@ -2039,7 +2354,7 @@ impl<
             self.insert_extent(FixedExtent {
                 object_id: file.object_id,
                 extent: ExtentRecord {
-                    logical_block,
+                    logical_block: 0,
                     physical_block,
                     block_count,
                     flags,
@@ -2048,18 +2363,38 @@ impl<
                 compression,
             })?;
         }
-        let end = offset
-            .checked_add(u64::try_from(data.len()).map_err(|_| HxfsError::OutOfRange)?)
-            .ok_or(HxfsError::OutOfRange)?;
-        let new_size = if offset == 0 {
-            end
-        } else {
-            object.size.max(end)
-        };
-        self.object_mut(file.object_id)?.descriptor.size = new_size;
+        self.object_mut(file.object_id)?.descriptor.size = delta_bytes;
         self.update_file_record_count(file.object_id)?;
         self.dirty = true;
         self.file_handle(file.object_id)
+    }
+
+    /// POSIX random-offset write at `offset` that preserves existing bytes
+    /// outside `[offset, offset + data.len())` even when `offset == 0`.
+    pub fn write_file_at_preserve(
+        &mut self,
+        file: FileHandle,
+        offset: u64,
+        data: &[u8],
+    ) -> FixedResult<FileHandle> {
+        self.ensure_mutable_v6()?;
+        if data.len() > BLOCK_SIZE * 1024 {
+            return Err(HxfsError::Unsupported);
+        }
+        let object = self.object(file.object_id)?.descriptor;
+        if object.object_type != OBJECT_TYPE_FILE {
+            return Err(HxfsError::WrongType);
+        }
+        if offset == 0 && object.size == 0 && data.len() <= BLOCK_SIZE {
+            return self.write_file_at(file, 0, data);
+        }
+        self.write_file_range(file, object, offset, data)
+    }
+
+    /// Replace the entire payload of `file` (truncate to 0, then write at 0).
+    pub fn write_file(&mut self, file: FileHandle, data: &[u8]) -> FixedResult<FileHandle> {
+        let truncated = self.truncate_file(file, 0)?;
+        self.write_file_at(truncated, 0, data)
     }
 
     /// Random-offset write: copy-on-write read-modify-write, one logical
@@ -2135,19 +2470,50 @@ impl<
         if self.free_extent_slots() < needed {
             return Err(HxfsError::NoSpace);
         }
-        // Charge the job for the block we are about to allocate. The old
-        // block is credited back by `detach_logical_block` once the
-        // replacement is on the media, so a rewrite nets to zero.
-        self.check_job_quota(BLOCK_SIZE_U64, 0)?;
-        let (physical_block, generation, kind) = self.write_data_blocks(bytes, object)?;
+        // Only charge volume/job quota for net-new logical blocks (holes or past
+        // allocated extents). Overwriting an already-allocated physical block
+        // replaces it 1-for-1 (retired immediately below by `detach_logical_block`),
+        // so an in-place rewrite at exact volume/job quota must succeed.
+        let replaced_slots = covering
+            .and_then(|slot| self.extents[slot])
+            .map_or(0u64, |entry| {
+                if entry.extent.flags & EXTENT_FLAG_HOLE != 0 {
+                    0
+                } else if self.extent_span(entry) == 1 {
+                    u64::from(entry.extent.block_count).max(1)
+                } else {
+                    1
+                }
+            });
+        let net_new_block = replaced_slots == 0;
+        if net_new_block {
+            self.check_volume_quota(BLOCK_SIZE_U64, 0)?;
+            self.check_job_quota(BLOCK_SIZE_U64, 0)?;
+        }
+        let (physical_block, generation, kind) =
+            self.write_data_blocks(bytes, object, replaced_slots)?;
         let (flags, block_count, compression) = match kind {
             ExtentWriteKind::Plain => (0, 1, None),
             ExtentWriteKind::Compressed(meta) => (EXTENT_FLAG_COMPRESSED, 1, Some(meta)),
             ExtentWriteKind::MultiSlot => (EXTENT_FLAG_MULTI_SLOT, 2, None),
         };
         let released = self.detach_logical_block(object.object_id, logical_block)?;
-        if released > 0 {
-            self.release_job_bytes(released.saturating_mul(BLOCK_SIZE_U64));
+        if block_count > 1 {
+            let extra_slots = u64::from(block_count) - 1;
+            let extra_bytes = extra_slots.saturating_mul(BLOCK_SIZE_U64);
+            if extra_slots > released.saturating_sub(u64::from(!net_new_block)) {
+                let net_extra = (u64::from(block_count))
+                    .saturating_sub(if net_new_block { 1 } else { 0 })
+                    .saturating_sub(released);
+                if net_extra > 0 {
+                    let charge = net_extra.saturating_mul(BLOCK_SIZE_U64);
+                    self.check_job_quota(charge, 0)?;
+                }
+            } else {
+                let _ = extra_bytes;
+            }
+        } else if !net_new_block && released > 1 {
+            self.release_job_bytes((released - 1).saturating_mul(BLOCK_SIZE_U64));
         }
         self.insert_extent(FixedExtent {
             object_id: object.object_id,
@@ -2185,8 +2551,9 @@ impl<
             if hole {
                 return Ok(0);
             }
-            self.free_extent_range(entry.extent.physical_block, 1);
-            return Ok(1);
+            let phys_slots = u64::from(entry.extent.block_count).max(1);
+            self.free_extent_range(entry.extent.physical_block, phys_slots);
+            return Ok(phys_slots);
         }
         // A compressed record describes one block and a two-slot record
         // describes two physical slots of one block; neither has a
@@ -2361,14 +2728,10 @@ impl<
         while index < self.extents.len() {
             if let Some(entry) = self.extents[index] {
                 // Hole extents describe unwritten logical range and
-                // occupy no media.
+                // occupy no media; `block_count` is always the physical slot
+                // count (including `EXTENT_FLAG_MULTI_SLOT` -> 2 slots).
                 if entry.extent.flags & EXTENT_FLAG_HOLE == 0 {
-                    let count = if entry.extent.flags & EXTENT_FLAG_MULTI_SLOT != 0 {
-                        1
-                    } else {
-                        u64::from(entry.extent.block_count)
-                    };
-                    blocks = blocks.saturating_add(count);
+                    blocks = blocks.saturating_add(u64::from(entry.extent.block_count));
                 }
             }
             index += 1;
@@ -2404,14 +2767,15 @@ impl<
                     } else {
                         u64::from(entry.extent.block_count)
                     };
+                    let phys_blocks = u64::from(entry.extent.block_count);
                     let extent_start = entry.extent.logical_block * BLOCK_SIZE_U64;
                     let hole = entry.extent.flags & EXTENT_FLAG_HOLE != 0;
                     // Fully past the new end: drop the record and hand every
                     // physical block back.
                     if extent_start >= new_size && logical > 0 {
-                        if !hole {
-                            released_blocks = released_blocks.saturating_add(logical);
-                            self.free_extent_range(entry.extent.physical_block, logical);
+                        if !hole && phys_blocks > 0 {
+                            released_blocks = released_blocks.saturating_add(phys_blocks);
+                            self.free_extent_range(entry.extent.physical_block, phys_blocks);
                         }
                         self.extents[index] = None;
                     } else if logical > 1
@@ -2457,11 +2821,11 @@ impl<
         self.file_handle(file.object_id)
     }
 
-    /// Rename an absolute path.
+    /// Rename an absolute path (POSIX atomic replacement when target exists).
     pub fn rename_path(&mut self, from: &str, to: &str) -> FixedResult<()> {
         self.ensure_mutable_v6()?;
-        let (old_parent, old_name) = self.parent_and_name(from)?;
-        let (new_parent, new_name) = self.parent_and_name(to)?;
+        let (old_parent, old_name) = self.parent_and_name_with_symlinks(from)?;
+        let (new_parent, new_name) = self.parent_and_name_with_symlinks(to)?;
         self.rename_child(
             DirectoryHandle {
                 object_id: old_parent,
@@ -2474,7 +2838,7 @@ impl<
         )
     }
 
-    /// Rename a child entry between directories.
+    /// Rename a child entry between directories (supports relative subpaths and POSIX atomic replacement).
     pub fn rename_child(
         &mut self,
         old_parent: DirectoryHandle,
@@ -2483,36 +2847,74 @@ impl<
         new_name: &str,
     ) -> FixedResult<()> {
         self.ensure_mutable_v6()?;
-        self.ensure_directory(old_parent.object_id)?;
-        self.ensure_directory(new_parent.object_id)?;
-        if self
-            .lookup_child(new_parent.object_id, new_name.as_bytes())
-            .is_ok()
-        {
-            return Err(HxfsError::AlreadyExists);
+        let (old_dir, old_leaf) = self.parent_and_leaf_from_dir(old_parent.object_id, old_name)?;
+        let (new_dir, new_leaf) = self.parent_and_leaf_from_dir(new_parent.object_id, new_name)?;
+        self.ensure_directory(old_dir)?;
+        self.ensure_directory(new_dir)?;
+        if old_dir == new_dir && old_leaf == new_leaf {
+            let _ = self.dir_entry_index(old_dir, old_leaf.as_bytes())?;
+            return Ok(());
         }
-        let index = self.dir_entry_index(old_parent.object_id, old_name.as_bytes())?;
-        let object_id = self.dir_entries[index]
+        let src_index = self.dir_entry_index(old_dir, old_leaf.as_bytes())?;
+        let src_id = self.dir_entries[src_index]
             .ok_or(HxfsError::NotFound)?
             .object_id;
-        self.dir_entries[index] = None;
-        self.insert_dir_entry(new_parent.object_id, object_id, new_name.as_bytes())?;
+        let src_obj = self.object(src_id)?.descriptor;
+
+        // Prevent moving a directory onto itself or into any of its own descendants.
+        if src_obj.object_type == OBJECT_TYPE_DIRECTORY
+            && self.is_same_or_descendant_dir(src_id, new_dir)
+        {
+            return Err(HxfsError::BadName);
+        }
+
+        if let Ok(dst_index) = self.dir_entry_index(new_dir, new_leaf.as_bytes()) {
+            let dst_id = self.dir_entries[dst_index]
+                .ok_or(HxfsError::NotFound)?
+                .object_id;
+            if dst_id == src_id {
+                return Ok(());
+            }
+            let dst_obj = self.object(dst_id)?.descriptor;
+            if src_obj.object_type == OBJECT_TYPE_DIRECTORY {
+                if dst_obj.object_type != OBJECT_TYPE_DIRECTORY {
+                    return Err(HxfsError::WrongType);
+                }
+                if self.directory_has_children(dst_id) {
+                    return Err(HxfsError::DirectoryNotEmpty);
+                }
+            } else if dst_obj.object_type == OBJECT_TYPE_DIRECTORY {
+                return Err(HxfsError::WrongType);
+            }
+            // Atomically drop the overwritten target entry and reclaim its object/extents.
+            self.dir_entries[dst_index] = None;
+            self.update_directory_record_count(new_dir)?;
+            self.remove_object(dst_id);
+            let released = self.clear_extents(dst_id);
+            self.release_job_bytes(released);
+        }
+
+        let src_index_now = self.dir_entry_index(old_dir, old_leaf.as_bytes())?;
+        self.dir_entries[src_index_now] = None;
+        self.update_directory_record_count(old_dir)?;
+        self.insert_dir_entry(new_dir, src_id, new_leaf.as_bytes())?;
         self.dirty = true;
         Ok(())
     }
 
-    /// Unlink an absolute path.
+    /// Unlink an absolute path (never follows a final symlink).
     pub fn unlink_path(&mut self, path: &str) -> FixedResult<()> {
         self.ensure_mutable_v6()?;
-        let (parent, name) = self.parent_and_name(path)?;
+        let (parent, name) = self.parent_and_name_with_symlinks(path)?;
         self.unlink_child(DirectoryHandle { object_id: parent }, name)
     }
 
-    /// Unlink a child entry below a directory handle.
+    /// Unlink a child entry or relative subpath below a directory handle.
     pub fn unlink_child(&mut self, parent: DirectoryHandle, name: &str) -> FixedResult<()> {
         self.ensure_mutable_v6()?;
-        self.ensure_directory(parent.object_id)?;
-        let index = self.dir_entry_index(parent.object_id, name.as_bytes())?;
+        let (dir_id, leaf) = self.parent_and_leaf_from_dir(parent.object_id, name)?;
+        self.ensure_directory(dir_id)?;
+        let index = self.dir_entry_index(dir_id, leaf.as_bytes())?;
         let object_id = self.dir_entries[index]
             .ok_or(HxfsError::NotFound)?
             .object_id;
@@ -2521,6 +2923,7 @@ impl<
             return Err(HxfsError::DirectoryNotEmpty);
         }
         self.dir_entries[index] = None;
+        self.update_directory_record_count(dir_id)?;
         self.remove_object(object_id);
         let released = self.clear_extents(object_id);
         self.release_job_bytes(released);
@@ -2568,9 +2971,9 @@ impl<
             }
             object_slot += 1;
         }
-        // The allocation tree may also span multiple blocks; its
-        // leaf blocks are part of the target area and must not
-        // overlap the journal area.
+        // The allocation & backref trees list live extents, while the refcount
+        // tree merges live extents with any snapshot-pinned extents so freed
+        // snapshot-owned blocks remain accounted for across remounts.
         let mut alloc_count = 0usize;
         let mut alloc_slot = 0usize;
         while alloc_slot < self.extents.len() {
@@ -2581,13 +2984,14 @@ impl<
             }
             alloc_slot += 1;
         }
+        let refcount_count = self.merged_refcount_record_count()?;
         let alloc_leaf_blocks = if alloc_count > ALLOC_LEAF_RECORDS {
             alloc_count.div_ceil(ALLOC_LEAF_RECORDS)
         } else {
             0
         };
-        let refcount_leaf_blocks = if alloc_count > REFCOUNT_LEAF_RECORDS {
-            alloc_count.div_ceil(REFCOUNT_LEAF_RECORDS)
+        let refcount_leaf_blocks = if refcount_count > REFCOUNT_LEAF_RECORDS {
+            refcount_count.div_ceil(REFCOUNT_LEAF_RECORDS)
         } else {
             0
         };
@@ -2632,11 +3036,13 @@ impl<
         // journal records entirely. A reclaimed run could therefore be
         // four blocks shorter than the writes placed into it, while a
         // crash in RECOVERING state produced an unreplayable journal.
+        let has_snapshots = self.snapshot_count() > 0;
         let shape = TransactionShape::plan(
             live_objects,
             extra_total,
             hxblob_leaf_blocks as u64,
             cfg!(feature = "hxblob"),
+            has_snapshots,
         )?;
         let record_count = shape.record_count;
         let metadata_span = shape.total_blocks;
@@ -2675,7 +3081,7 @@ impl<
         // reserve two phantom target blocks: the shape and actual LBA layout
         // must describe the same range.
         #[cfg(feature = "hxblob")]
-        let (hxblob_index_tree_lba, hxblob_merkle_tree_lba, checkpoint_lba) = {
+        let (hxblob_index_tree_lba, hxblob_merkle_tree_lba, after_hxblob_lba) = {
             let index = compression_policy_tree_lba
                 .checked_add(1)
                 .ok_or(HxfsError::NoSpace)?;
@@ -2683,17 +3089,24 @@ impl<
                 .checked_add(1)
                 .and_then(|value| value.checked_add(hxblob_leaf_blocks as u64))
                 .ok_or(HxfsError::NoSpace)?;
-            let checkpoint = leaves_end.checked_add(1).ok_or(HxfsError::NoSpace)?;
-            (index, leaves_end, checkpoint)
+            let after = leaves_end.checked_add(1).ok_or(HxfsError::NoSpace)?;
+            (index, leaves_end, after)
         };
         #[cfg(not(feature = "hxblob"))]
-        let (hxblob_index_tree_lba, hxblob_merkle_tree_lba, checkpoint_lba) = (
+        let (hxblob_index_tree_lba, hxblob_merkle_tree_lba, after_hxblob_lba) = (
             0u64,
             0u64,
             compression_policy_tree_lba
                 .checked_add(1)
                 .ok_or(HxfsError::NoSpace)?,
         );
+        let (virtual_volume_tree_lba, checkpoint_lba) = if has_snapshots {
+            let snap_lba = after_hxblob_lba;
+            let cp_lba = snap_lba.checked_add(1).ok_or(HxfsError::NoSpace)?;
+            (snap_lba, cp_lba)
+        } else {
+            (0u64, after_hxblob_lba)
+        };
         let journal_start_lba = checkpoint_lba.checked_add(1).ok_or(HxfsError::NoSpace)?;
         let journal_end_lba = journal_start_lba
             .checked_add(
@@ -2894,6 +3307,19 @@ impl<
                 0,
             )?;
         }
+        if virtual_volume_tree_lba != 0 {
+            let snapshot_table_block = self.build_snapshot_table_block(virtual_volume_tree_lba)?;
+            self.write_journaled_target(
+                virtual_volume_tree_lba,
+                &snapshot_table_block,
+                sequence,
+                journal.regular()?,
+                record_count,
+                journal_start_lba,
+                checkpoint_lba,
+                0,
+            )?;
+        }
         let checkpoint_block = build_checkpoint_block(
             sequence,
             volume_table_lba,
@@ -2906,7 +3332,7 @@ impl<
             compression_policy_tree_lba,
             hxblob_index_tree_lba,
             hxblob_merkle_tree_lba,
-            0,
+            virtual_volume_tree_lba,
             0,
             0,
             checkpoint_lba,
@@ -3390,6 +3816,284 @@ impl<
         Ok(())
     }
 
+    /// Number of persisted named snapshots currently registered.
+    pub fn snapshot_count(&self) -> usize {
+        self.snapshots.iter().filter(|s| s.is_some()).count()
+    }
+
+    /// Copy up to `out.len()` registered named snapshots in ID order and return the count copied.
+    pub fn list_named_snapshots(&self, out: &mut [SnapshotEntry]) -> usize {
+        let mut copied = 0usize;
+        for slot in self.snapshots.iter().flatten() {
+            if copied >= out.len() {
+                break;
+            }
+            out[copied] = *slot;
+            copied += 1;
+        }
+        copied
+    }
+
+    /// Create and persist a named snapshot, pinning all live extents and returning its checkpoint sequence.
+    pub fn create_named_snapshot(&mut self, name: &str, created_unix_ns: i64) -> FixedResult<u64> {
+        self.ensure_mutable_v6()?;
+        if !valid_name(name.as_bytes()) {
+            return Err(HxfsError::BadName);
+        }
+        for existing in self.snapshots.iter().flatten() {
+            if existing.name() == name {
+                return Err(HxfsError::AlreadyExists);
+            }
+        }
+        let free_slot = self
+            .snapshots
+            .iter()
+            .position(|s| s.is_none())
+            .ok_or(HxfsError::NoSpace)?;
+
+        // Ensure current dirty mutations are checkpointed so the snapshot captures a clean checkpoint LBA.
+        if self.dirty {
+            self.publish_checkpoint()?;
+        }
+        let snap_seq = self.superblock.sequence_number;
+        let snap_lba = self.superblock.checkpoint_lba;
+        self.retain_extents_for_snapshot()?;
+
+        let mut entry = SnapshotEntry {
+            snapshot_id: self.next_snapshot_id,
+            checkpoint_seq: snap_seq,
+            checkpoint_lba: snap_lba,
+            created_unix_ns,
+            name_len: name.len() as u16,
+            name: [0; MAX_NAME_BYTES],
+        };
+        entry.name[..name.len()].copy_from_slice(name.as_bytes());
+        self.next_snapshot_id = self.next_snapshot_id.saturating_add(1);
+        self.snapshots[free_slot] = Some(entry);
+        self.dirty = true;
+        self.publish_checkpoint()
+    }
+
+    /// Delete a persisted named snapshot and release any extents it uniquely pinned.
+    pub fn delete_named_snapshot(&mut self, name: &str) -> FixedResult<()> {
+        self.ensure_mutable_v6()?;
+        if !valid_name(name.as_bytes()) {
+            return Err(HxfsError::BadName);
+        }
+        let slot = self
+            .snapshots
+            .iter()
+            .position(|s| s.as_ref().is_some_and(|e| e.name() == name))
+            .ok_or(HxfsError::NotFound)?;
+        let removed = self.snapshots[slot].take().ok_or(HxfsError::NotFound)?;
+        let pinned =
+            self.collect_checkpoint_extents(removed.checkpoint_lba, removed.checkpoint_seq);
+        if !pinned.is_empty() {
+            let _ = self.release_extents_for_snapshot(&pinned);
+        }
+        self.dirty = true;
+        self.publish_checkpoint()?;
+        Ok(())
+    }
+
+    fn load_snapshot_table(&mut self) -> FixedResult<()> {
+        let lba = self.checkpoint.virtual_volume_tree_lba;
+        if lba == 0 {
+            return Ok(());
+        }
+        let mut block = [0u8; BLOCK_SIZE];
+        let header = match self.read_mounted_metadata_block(
+            lba,
+            BLOCK_TYPE_VIRTUAL_VOLUME_TREE,
+            self.system_volume.root_object_id,
+            &mut block,
+        ) {
+            Ok(h) => h,
+            Err(_) => return Ok(()),
+        };
+        let base = header.header_bytes as usize;
+        let magic = read_u32(&block, base)?;
+        let version = read_u32(&block, base + 4)?;
+        if magic != SNAPSHOT_TABLE_MAGIC || version != SNAPSHOT_TABLE_VERSION {
+            return Ok(());
+        }
+        let count = read_u32(&block, base + 8)? as usize;
+        if count > MAX_NAMED_SNAPSHOTS {
+            return Err(HxfsError::BadTree);
+        }
+        let mut max_id = 0u64;
+        let mut index = 0usize;
+        while index < count {
+            let offset = base + 16 + index * SNAPSHOT_RECORD_BYTES;
+            if offset + SNAPSHOT_RECORD_BYTES > BLOCK_SIZE {
+                return Err(HxfsError::BadTree);
+            }
+            let snapshot_id = read_u64(&block, offset)?;
+            let checkpoint_seq = read_u64(&block, offset + 8)?;
+            let checkpoint_lba = read_u64(&block, offset + 16)?;
+            let created_unix_ns = i64::from_le_bytes(
+                block[offset + 24..offset + 32]
+                    .try_into()
+                    .map_err(|_| HxfsError::BadTree)?,
+            );
+            let name_len = u16::from_le_bytes(
+                block[offset + 32..offset + 34]
+                    .try_into()
+                    .map_err(|_| HxfsError::BadTree)?,
+            );
+            if usize::from(name_len) == 0 || usize::from(name_len) > MAX_NAME_BYTES {
+                return Err(HxfsError::BadName);
+            }
+            let mut name = [0u8; MAX_NAME_BYTES];
+            name[..usize::from(name_len)]
+                .copy_from_slice(&block[offset + 36..offset + 36 + usize::from(name_len)]);
+            if !valid_name(&name[..usize::from(name_len)]) {
+                return Err(HxfsError::BadName);
+            }
+            max_id = max_id.max(snapshot_id);
+            self.snapshots[index] = Some(SnapshotEntry {
+                snapshot_id,
+                checkpoint_seq,
+                checkpoint_lba,
+                created_unix_ns,
+                name_len,
+                name,
+            });
+            index += 1;
+        }
+        self.next_snapshot_id = max_id.saturating_add(1).max(1);
+
+        for snap_idx in 0..MAX_NAMED_SNAPSHOTS {
+            if let Some(entry) = self.snapshots[snap_idx] {
+                let pinned =
+                    self.collect_checkpoint_extents(entry.checkpoint_lba, entry.checkpoint_seq);
+                for (start, blocks) in pinned {
+                    if blocks == 0 {
+                        continue;
+                    }
+                    match self.snapshot_refs.increment(start, blocks) {
+                        Ok(_) => {}
+                        Err(crate::ref_tree::RefTreeError::NotFound) => {
+                            let _ = self.snapshot_refs.insert(RefcountRecord {
+                                start_block: start,
+                                block_count: blocks,
+                                refcount: 1,
+                            });
+                        }
+                        Err(_) => {}
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn collect_checkpoint_extents(
+        &mut self,
+        checkpoint_lba: u64,
+        checkpoint_seq: u64,
+    ) -> alloc::vec::Vec<(u64, u64)> {
+        let mut out = alloc::vec::Vec::new();
+        let Ok(cp) = read_checkpoint(&mut self.store, checkpoint_lba, checkpoint_seq) else {
+            return out;
+        };
+        if cp.allocation_tree_lba == 0 {
+            return out;
+        }
+        let mut block = [0u8; BLOCK_SIZE];
+        if let Ok(hdr) = self.read_mounted_metadata_block(
+            cp.allocation_tree_lba,
+            BLOCK_TYPE_ALLOCATION_TREE,
+            self.system_volume.root_object_id,
+            &mut block,
+        ) {
+            let base = hdr.header_bytes as usize;
+            let count = read_u32(&block, base).unwrap_or(0) as usize;
+            let mut idx = 0usize;
+            while idx < count && base + 16 + (idx + 1) * 32 <= BLOCK_SIZE {
+                let off = base + 16 + idx * 32;
+                if let (Ok(start), Ok(cnt)) = (read_u64(&block, off), read_u64(&block, off + 8)) {
+                    if cnt > 0 {
+                        out.push((start, cnt));
+                    }
+                }
+                idx += 1;
+            }
+        } else if let Ok(hdr) = self.read_mounted_metadata_block(
+            cp.allocation_tree_lba,
+            BLOCK_TYPE_ALLOCATION_TREE_ROOT,
+            self.system_volume.root_object_id,
+            &mut block,
+        ) {
+            let base = hdr.header_bytes as usize;
+            let leaf_count = read_u32(&block, base + 8).unwrap_or(0) as usize;
+            let mut lidx = 0usize;
+            while lidx < leaf_count && base + 16 + (lidx + 1) * 8 <= BLOCK_SIZE {
+                if let Ok(leaf_lba) = read_u64(&block, base + 16 + lidx * 8) {
+                    let mut leaf = [0u8; BLOCK_SIZE];
+                    if let Ok(lhdr) = self.read_mounted_metadata_block(
+                        leaf_lba,
+                        BLOCK_TYPE_ALLOCATION_TREE_LEAF,
+                        self.system_volume.root_object_id,
+                        &mut leaf,
+                    ) {
+                        let lbase = lhdr.header_bytes as usize;
+                        let mut r = 0usize;
+                        while r < ALLOC_LEAF_RECORDS && lbase + (r + 1) * 32 <= BLOCK_SIZE {
+                            let off = lbase + r * 32;
+                            if let (Ok(start), Ok(cnt)) =
+                                (read_u64(&leaf, off), read_u64(&leaf, off + 8))
+                            {
+                                if cnt > 0 {
+                                    out.push((start, cnt));
+                                }
+                            }
+                            r += 1;
+                        }
+                    }
+                }
+                lidx += 1;
+            }
+        }
+        out
+    }
+
+    fn build_snapshot_table_block(&self, lba: u64) -> FixedResult<[u8; BLOCK_SIZE]> {
+        let mut payload = [0u8; BLOCK_SIZE - HEADER_BYTES];
+        let count = self.snapshot_count();
+        payload[0..4].copy_from_slice(&SNAPSHOT_TABLE_MAGIC.to_le_bytes());
+        payload[4..8].copy_from_slice(&SNAPSHOT_TABLE_VERSION.to_le_bytes());
+        payload[8..12].copy_from_slice(&(count as u32).to_le_bytes());
+        let mut written = 0usize;
+        for entry in self.snapshots.iter().flatten() {
+            let offset = 16 + written * SNAPSHOT_RECORD_BYTES;
+            if offset + SNAPSHOT_RECORD_BYTES > payload.len() {
+                return Err(HxfsError::NoSpace);
+            }
+            payload[offset..offset + 8].copy_from_slice(&entry.snapshot_id.to_le_bytes());
+            payload[offset + 8..offset + 16].copy_from_slice(&entry.checkpoint_seq.to_le_bytes());
+            payload[offset + 16..offset + 24].copy_from_slice(&entry.checkpoint_lba.to_le_bytes());
+            payload[offset + 24..offset + 32].copy_from_slice(&entry.created_unix_ns.to_le_bytes());
+            payload[offset + 32..offset + 34].copy_from_slice(&entry.name_len.to_le_bytes());
+            let nlen = usize::from(entry.name_len);
+            payload[offset + 36..offset + 36 + nlen].copy_from_slice(&entry.name[..nlen]);
+            written += 1;
+        }
+        let args = self.encryption_args();
+        make_metadata_block_for_volume(
+            BLOCK_TYPE_VIRTUAL_VOLUME_TREE,
+            self.system_volume.root_object_id,
+            MetadataBlockSite {
+                lba,
+                generation: self.metadata_generation(),
+            },
+            &payload[..16 + written * SNAPSHOT_RECORD_BYTES],
+            args.0,
+            args.1,
+            args.2,
+        )
+    }
+
     /// Read a metadata block at mount time, validating the header
     /// and decrypting the v6 payload in place when the volume is
     /// encrypted. Mirrors the reader's `read_metadata_block`; the
@@ -3461,49 +4165,195 @@ impl<
         Ok((header, header.block_type))
     }
 
-    fn resolve_path(&self, path: &str) -> FixedResult<u64> {
+    fn parent_directory_of(&self, object_id: u64) -> Option<u64> {
+        let mut index = 0usize;
+        while index < self.dir_entries.len() {
+            if let Some(entry) = self.dir_entries[index] {
+                if entry.object_id == object_id {
+                    return Some(entry.parent_object_id);
+                }
+            }
+            index += 1;
+        }
+        None
+    }
+
+    fn is_same_or_descendant_dir(&self, candidate_ancestor: u64, dir_id: u64) -> bool {
+        let mut cur = dir_id;
+        let mut guard = 0usize;
+        while guard <= MAX_OBJECTS {
+            if cur == candidate_ancestor {
+                return true;
+            }
+            if cur == self.system_volume.root_object_id {
+                return false;
+            }
+            match self.parent_directory_of(cur) {
+                Some(parent) => cur = parent,
+                None => return false,
+            }
+            guard += 1;
+        }
+        true
+    }
+
+    fn resolve_path_with_symlinks(&mut self, path: &str, follow_final: bool) -> FixedResult<u64> {
         if path.is_empty() || !path.as_bytes().starts_with(b"/") {
             return Err(HxfsError::BadName);
         }
-        if path == "/" {
+        let trimmed = path.trim_end_matches('/');
+        if trimmed.is_empty() {
             return Ok(self.system_volume.root_object_id);
         }
-        let mut current = self.system_volume.root_object_id;
-        let mut rest = &path.as_bytes()[1..];
-        loop {
-            let slash = rest.iter().position(|&byte| byte == b'/');
-            let (component, tail) = match slash {
-                Some(pos) => (&rest[..pos], &rest[pos + 1..]),
-                None => (rest, &[][..]),
-            };
-            if !valid_name(component) {
-                return Err(HxfsError::BadName);
-            }
-            current = self.lookup_child(current, component)?;
-            if tail.is_empty() {
-                return Ok(current);
-            }
-            self.ensure_directory(current)?;
-            rest = tail;
-        }
+        self.walk_components_confined(
+            self.system_volume.root_object_id,
+            self.system_volume.root_object_id,
+            &trimmed[1..],
+            follow_final,
+            0,
+        )
     }
 
-    fn parent_and_name<'a>(&self, path: &'a str) -> FixedResult<(u64, &'a str)> {
-        if path == "/" || !path.as_bytes().starts_with(b"/") {
+    fn resolve_relative_from_dir(
+        &mut self,
+        boundary_root: u64,
+        rel_path: &str,
+        follow_final: bool,
+    ) -> FixedResult<u64> {
+        let trimmed = rel_path.trim_matches('/');
+        if trimmed.is_empty() || rel_path.starts_with('/') {
             return Err(HxfsError::BadName);
         }
-        let Some(pos) = path.as_bytes().iter().rposition(|&byte| byte == b'/') else {
+        self.walk_components_confined(boundary_root, boundary_root, trimmed, follow_final, 0)
+    }
+
+    fn walk_components_confined(
+        &mut self,
+        boundary_root: u64,
+        start_dir: u64,
+        rel_components: &str,
+        follow_final: bool,
+        depth: u8,
+    ) -> FixedResult<u64> {
+        crate::security_policy::validate_symlink_depth(depth).map_err(|_| HxfsError::BadName)?;
+        let mut current = start_dir;
+        let mut parts = rel_components
+            .split('/')
+            .filter(|seg| !seg.is_empty())
+            .peekable();
+
+        while let Some(seg) = parts.next() {
+            let is_last = parts.peek().is_none();
+            if seg == "." {
+                self.ensure_directory(current)?;
+                continue;
+            }
+            if seg == ".." {
+                self.ensure_directory(current)?;
+                if current == boundary_root {
+                    if boundary_root == self.system_volume.root_object_id {
+                        continue;
+                    }
+                    // Confined capability handle may never traverse above its boundary root.
+                    return Err(HxfsError::BadName);
+                }
+                current = self
+                    .parent_directory_of(current)
+                    .unwrap_or(self.system_volume.root_object_id);
+                continue;
+            }
+            if !valid_name(seg.as_bytes()) {
+                return Err(HxfsError::BadName);
+            }
+            let next_id = self.lookup_child(current, seg.as_bytes())?;
+            let next_desc = self.object(next_id)?.descriptor;
+            if next_desc.object_type == OBJECT_TYPE_SYMLINK && (!is_last || follow_final) {
+                crate::security_policy::validate_symlink_depth(depth.saturating_add(1))
+                    .map_err(|_| HxfsError::BadName)?;
+                let mut target_buf = [0u8; huesos_abi::hxfs::HXFS_MAX_PATH_BYTES];
+                let n = self.read_symlink_object(next_id, &mut target_buf)?;
+                let target_str =
+                    core::str::from_utf8(&target_buf[..n]).map_err(|_| HxfsError::BadName)?;
+                let sym_start = if target_str.starts_with('/') {
+                    if boundary_root != self.system_volume.root_object_id {
+                        // Absolute symlink inside a confined directory capability is refused.
+                        return Err(HxfsError::BadName);
+                    }
+                    self.system_volume.root_object_id
+                } else {
+                    current
+                };
+                let sym_rel = target_str.trim_matches('/');
+                current = if sym_rel.is_empty() {
+                    sym_start
+                } else {
+                    self.walk_components_confined(
+                        boundary_root,
+                        sym_start,
+                        sym_rel,
+                        true,
+                        depth.saturating_add(1),
+                    )?
+                };
+            } else {
+                current = next_id;
+            }
+            if !is_last {
+                self.ensure_directory(current)?;
+            }
+        }
+        Ok(current)
+    }
+
+    fn parent_and_name_with_symlinks<'a>(&mut self, path: &'a str) -> FixedResult<(u64, &'a str)> {
+        let trimmed = path.trim_end_matches('/');
+        if trimmed.is_empty() || !trimmed.as_bytes().starts_with(b"/") {
+            return Err(HxfsError::BadName);
+        }
+        let Some(pos) = trimmed.as_bytes().iter().rposition(|&byte| byte == b'/') else {
             return Err(HxfsError::BadName);
         };
         let name =
-            core::str::from_utf8(&path.as_bytes()[pos + 1..]).map_err(|_| HxfsError::BadName)?;
+            core::str::from_utf8(&trimmed.as_bytes()[pos + 1..]).map_err(|_| HxfsError::BadName)?;
         if !valid_name(name.as_bytes()) {
             return Err(HxfsError::BadName);
         }
-        let parent_path = if pos == 0 { "/" } else { &path[..pos] };
-        let parent = self.resolve_path(parent_path)?;
+        let parent_path = if pos == 0 { "/" } else { &trimmed[..pos] };
+        let parent = self.resolve_path_with_symlinks(parent_path, true)?;
         self.ensure_directory(parent)?;
         Ok((parent, name))
+    }
+
+    fn parent_and_leaf_from_dir<'a>(
+        &mut self,
+        boundary_root: u64,
+        rel_path: &'a str,
+    ) -> FixedResult<(u64, &'a str)> {
+        if rel_path.starts_with('/') {
+            return Err(HxfsError::BadName);
+        }
+        let trimmed = rel_path.trim_end_matches('/');
+        if trimmed.is_empty() {
+            return Err(HxfsError::BadName);
+        }
+        if let Some((parent_rel, leaf)) = trimmed.rsplit_once('/') {
+            if !valid_name(leaf.as_bytes()) {
+                return Err(HxfsError::BadName);
+            }
+            let dir_id = if parent_rel.is_empty() || parent_rel == "." {
+                boundary_root
+            } else {
+                self.resolve_relative_from_dir(boundary_root, parent_rel, true)?
+            };
+            self.ensure_directory(dir_id)?;
+            Ok((dir_id, leaf))
+        } else {
+            if !valid_name(trimmed.as_bytes()) {
+                return Err(HxfsError::BadName);
+            }
+            self.ensure_directory(boundary_root)?;
+            Ok((boundary_root, trimmed))
+        }
     }
 
     fn lookup_child(&self, parent: u64, name: &[u8]) -> FixedResult<u64> {
@@ -3712,11 +4562,7 @@ impl<
             if let Some(entry) = self.extents[index] {
                 if entry.object_id == object_id {
                     if entry.extent.flags & EXTENT_FLAG_HOLE == 0 {
-                        let count = if entry.extent.flags & EXTENT_FLAG_MULTI_SLOT != 0 {
-                            1
-                        } else {
-                            u64::from(entry.extent.block_count)
-                        };
+                        let count = u64::from(entry.extent.block_count);
                         blocks = blocks.saturating_add(count);
                         // Hand the physical blocks back. Dropping the
                         // slot alone is what made deletes never return
@@ -3877,11 +4723,7 @@ impl<
         while index < self.extents.len() {
             if let Some(entry) = self.extents[index] {
                 if entry.extent.flags & EXTENT_FLAG_HOLE == 0 {
-                    let blocks = if entry.extent.flags & EXTENT_FLAG_MULTI_SLOT != 0 {
-                        1
-                    } else {
-                        u64::from(entry.extent.block_count)
-                    };
+                    let blocks = u64::from(entry.extent.block_count);
                     if blocks != 0 && count < live.len() {
                         live[count] = Some(FreeRange {
                             start_block: entry.extent.physical_block,
@@ -3892,6 +4734,16 @@ impl<
                 }
             }
             index += 1;
+        }
+        // Snapshot-pinned blocks must also be excluded from the reusable gap pool!
+        for pinned in self.snapshot_refs.records().iter().flatten() {
+            if pinned.refcount > 0 && pinned.block_count > 0 && count < live.len() {
+                live[count] = Some(FreeRange {
+                    start_block: pinned.start_block,
+                    block_count: pinned.block_count,
+                });
+                count += 1;
+            }
         }
         let mut i = 1usize;
         while i < count {
@@ -4181,11 +5033,7 @@ impl<
             while index < self.extents.len() {
                 if let Some(entry) = self.extents[index] {
                     if entry.extent.flags & EXTENT_FLAG_HOLE == 0 {
-                        let blocks = if entry.extent.flags & EXTENT_FLAG_MULTI_SLOT != 0 {
-                            1
-                        } else {
-                            u64::from(entry.extent.block_count)
-                        };
+                        let blocks = u64::from(entry.extent.block_count);
                         let live_start = entry.extent.physical_block;
                         let live_end = live_start.saturating_add(blocks);
                         if live_end > cursor && live_start < next_live_start && live_start < end {
@@ -4492,6 +5340,7 @@ impl<
         &mut self,
         data: &[u8],
         object: ObjectDescriptor,
+        replaced_slots: u64,
     ) -> FixedResult<(u64, u64, ExtentWriteKind)> {
         // The LZ4 worst-case output bound is
         // `16 + 4 + input_len * 110 / 100` (lz4_flex
@@ -4550,12 +5399,12 @@ impl<
             encrypted && block_bytes.len() > crate::extent_crypto::EXTENT_PLAINTEXT_BYTES;
         #[cfg(not(feature = "crypto-aes-gcm"))]
         let multi_slot = false;
-        if multi_slot {
-            self.quota_admits(2 * BLOCK_SIZE_U64, 0)?;
-        } else {
-            self.quota_admits(BLOCK_SIZE_U64, 0)?;
+        let needed_slots = if multi_slot { 2u64 } else { 1u64 };
+        let net_slots = needed_slots.saturating_sub(replaced_slots);
+        if net_slots > 0 {
+            self.quota_admits(net_slots * BLOCK_SIZE_U64, 0)?;
         }
-        let (start, generation) = self.reserve_data_blocks(if multi_slot { 2 } else { 1 })?;
+        let (start, generation) = self.reserve_data_blocks(needed_slots)?;
         // Two-slot path: split the incompressible plaintext at the
         // envelope capacity and encrypt each half in its own slot.
         // (Only reachable with `crypto-aes-gcm`; `multi_slot` is
@@ -5483,10 +6332,7 @@ impl<
         Ok((root, leaves))
     }
 
-    fn build_refcount_tree_block(
-        &self,
-        lba: u64,
-    ) -> FixedResult<([u8; BLOCK_SIZE], alloc::vec::Vec<[u8; BLOCK_SIZE]>)> {
+    fn build_merged_refcount_tree(&self) -> FixedResult<RefcountBtree<MAX_EXTENTS>> {
         let mut tree = RefcountBtree::<MAX_EXTENTS>::new();
         let mut index = 0usize;
         while index < self.extents.len() {
@@ -5502,7 +6348,36 @@ impl<
             }
             index += 1;
         }
+        for pinned in self.snapshot_refs.records().iter().flatten() {
+            if pinned.refcount == 0 || pinned.block_count == 0 {
+                continue;
+            }
+            let mut added = 0u32;
+            while added < pinned.refcount {
+                match tree.increment(pinned.start_block, pinned.block_count) {
+                    Ok(_) => {}
+                    Err(crate::ref_tree::RefTreeError::NotFound) => {
+                        tree.insert(*pinned).map_err(|_| HxfsError::BadTree)?;
+                        break;
+                    }
+                    Err(_) => return Err(HxfsError::BadTree),
+                }
+                added += 1;
+            }
+        }
         tree.validate().map_err(|_| HxfsError::BadTree)?;
+        Ok(tree)
+    }
+
+    fn merged_refcount_record_count(&self) -> FixedResult<usize> {
+        Ok(self.build_merged_refcount_tree()?.record_count())
+    }
+
+    fn build_refcount_tree_block(
+        &self,
+        lba: u64,
+    ) -> FixedResult<([u8; BLOCK_SIZE], alloc::vec::Vec<[u8; BLOCK_SIZE]>)> {
+        let tree = self.build_merged_refcount_tree()?;
         let records: alloc::vec::Vec<RefcountRecord> =
             tree.records().iter().filter_map(|record| *record).collect();
         let count = records.len();
@@ -5512,7 +6387,7 @@ impl<
         let mut payload = [0u8; BLOCK_SIZE - HEADER_BYTES];
         payload[0..4].copy_from_slice(&(count as u32).to_le_bytes());
         let mut written = 0usize;
-        index = 0;
+        let mut index = 0usize;
         while index < records.len() {
             let record = records[index];
             let offset = 16 + written * 24;
@@ -5976,7 +6851,25 @@ impl FixedDirEntry {
 }
 
 fn valid_name(name: &[u8]) -> bool {
-    !name.is_empty() && name.len() <= MAX_NAME_BYTES && core::str::from_utf8(name).is_ok()
+    !name.is_empty()
+        && name.len() <= MAX_NAME_BYTES
+        && name != b"."
+        && name != b".."
+        && !name.contains(&0)
+        && !name.contains(&b'/')
+        && core::str::from_utf8(name).is_ok()
+}
+
+fn effective_posix_mode(object_type: u32, flags: u32) -> u32 {
+    if flags & huesos_abi::hxfs::HXFS_MODE_EXPLICIT_BIT != 0 {
+        flags & huesos_abi::hxfs::HXFS_MODE_MASK
+    } else {
+        match object_type {
+            OBJECT_TYPE_DIRECTORY => 0o755,
+            OBJECT_TYPE_SYMLINK => 0o777,
+            _ => 0o644,
+        }
+    }
 }
 
 fn should_swap_dir(a: Option<FixedDirEntry>, b: Option<FixedDirEntry>, parent: u64) -> bool {

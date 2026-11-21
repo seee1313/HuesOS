@@ -75,25 +75,7 @@ fn run() -> i32 {
     let mut failures = 0;
     let mut data = Vec::new();
     match path {
-        Some(path) => match fs::File::open(path) {
-            Ok(mut file) => {
-                if offset > 0 {
-                    if let Err(error) = file.seek(SeekFrom::Start(offset)) {
-                        cu::errln(&format!("hexdump: seek {path}: {error}"));
-                        return 1;
-                    }
-                }
-                if let Err(error) = io::read_to_end(&mut file, &mut data) {
-                    cu::errln(&format!("hexdump: read {path}: {error}"));
-                    return 1;
-                }
-            }
-            Err(error) => {
-                cu::errln(&format!("hexdump: {path}: {error}"));
-                return 1;
-            }
-        },
-        None => {
+        Some("-") | None => {
             let mut stdin = io::stdin();
             if let Err(error) = io::read_to_end(&mut stdin, &mut data) {
                 cu::errln(&format!("hexdump: stdin: {error}"));
@@ -105,11 +87,66 @@ fn run() -> i32 {
             } else {
                 data.drain(..offset as usize);
             }
+            if let Some(limit) = limit {
+                data.truncate(limit as usize);
+            }
         }
-    }
-
-    if let Some(limit) = limit {
-        data.truncate(limit as usize);
+        Some(path) => match fs::File::open(path) {
+            Ok(mut file) => {
+                if offset > 0 {
+                    if let Err(error) = file.seek(SeekFrom::Start(offset)) {
+                        cu::errln(&format!("hexdump: seek {path}: {error}"));
+                        return 1;
+                    }
+                }
+                if let Some(max_bytes) = limit {
+                    let cap = usize::try_from(max_bytes).unwrap_or(usize::MAX);
+                    let mut chunk = [0u8; 4096];
+                    while data.len() < cap {
+                        let want = chunk.len().min(cap - data.len());
+                        match io::Read::read(&mut file, &mut chunk[..want]) {
+                            Ok(0) => break,
+                            Ok(n) => data.extend_from_slice(&chunk[..n]),
+                            Err(error) => {
+                                cu::errln(&format!("hexdump: read {path}: {error}"));
+                                return 1;
+                            }
+                        }
+                    }
+                } else if let Err(error) = io::read_to_end(&mut file, &mut data) {
+                    cu::errln(&format!("hexdump: read {path}: {error}"));
+                    return 1;
+                }
+            }
+            Err(error) => {
+                if let Some(vmo) = cu::take_bootfs() {
+                    let norm = cu::normalize_path(path);
+                    let mut found = false;
+                    for (bpath, boff, blen) in cu::iter_bootfs_entries(&vmo) {
+                        if bpath == norm {
+                            found = true;
+                            if offset < blen {
+                                let avail = blen - offset;
+                                let take = limit.map_or(avail, |l| l.min(avail)) as usize;
+                                data.resize(take, 0);
+                                if vmo.read(boff + offset, &mut data) != Ok(take) {
+                                    cu::errln(&format!("hexdump: read {path}: bootfs read error"));
+                                    return 1;
+                                }
+                            }
+                            break;
+                        }
+                    }
+                    if !found {
+                        cu::errln(&format!("hexdump: {path}: {error}"));
+                        return 1;
+                    }
+                } else {
+                    cu::errln(&format!("hexdump: {path}: {error}"));
+                    return 1;
+                }
+            }
+        },
     }
 
     let mut line = format!(

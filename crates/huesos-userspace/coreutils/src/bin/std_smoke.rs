@@ -581,77 +581,108 @@ fn check_threads() -> u32 {
         "mutex kept every increment"
     );
 
-    // Reader-writer lock. Two properties are actually guaranteed, so those are
-    // the two that get asserted: a value published under the write lock is
-    // visible to every later reader, and concurrent readers all see a value the
-    // writer really wrote. (The old check required the write to land before the
-    // reader's first read, which is a race, not a property: on SMP the reader
-    // can legitimately observe the pre-write value.)
-    let shared = Arc::new(RwLock::new(0u64));
-    let before = {
-        let mut reads = 0u64;
-        for _ in 0..10 {
-            reads += *shared.read();
-        }
-        reads
-    };
-    expect!(failures, before == 0, "rwlock reads before the write");
-    {
-        let mut guard = shared.write();
-        *guard = 7;
-    }
-    let mut reader_handles = Vec::new();
-    for _ in 0..4 {
-        let readers = Arc::clone(&shared);
-        reader_handles.push(thread::spawn(move || {
-            let mut seen = Vec::new();
-            for _ in 0..50 {
-                seen.push(*readers.read());
-            }
-            seen
-        }));
-    }
-    let mut reads = 0u64;
-    for handle in reader_handles {
-        match handle.join() {
-            Ok(seen) => {
-                for value in seen {
-                    if value != 7 {
-                        reads = u64::MAX;
-                    }
-                }
-            }
-            Err(_) => reads = u64::MAX,
-        }
-    }
-    expect!(failures, reads != u64::MAX, "rwlock readers saw the write");
-
-    // Condition variable: the waiter parks until the setter notifies it.
-    let pair = Arc::new((Mutex::new(false), Condvar::new()));
-    let waiter_pair = Arc::clone(&pair);
-    let waiter = thread::spawn(move || {
-        let (lock, condvar) = &*waiter_pair;
-        let mut ready = lock.lock();
-        let mut spins = 0;
-        while !*ready {
-            ready = condvar.wait(ready);
-            spins += 1;
-            if spins > 1000 {
-                return false;
-            }
-        }
-        true
-    });
-    {
-        let (lock, condvar) = &*pair;
-        *lock.lock() = true;
-        condvar.notify_all();
-    }
+    // Reader-writer lock: test both uncontended sequential handoff and genuine
+    // concurrent reader/writer contention (4 readers + 2 writers racing on an
+    // invariant-preserving pair `(seq, seq * 7)`). Any inverted guard-drop
+    // order or pre-read sequence race deadlocks or exposes torn state here.
+    let shared = Arc::new(RwLock::new((0u64, 0u64)));
     expect!(
         failures,
-        waiter.join().unwrap_or(false),
-        "condvar woke the waiter"
+        *shared.read() == (0, 0),
+        "rwlock reads initial state"
     );
+    {
+        let mut guard = shared.write();
+        *guard = (1, 7);
+    }
+    let mut rw_handles = Vec::new();
+    for writer_id in 0..2u64 {
+        let rw = Arc::clone(&shared);
+        rw_handles.push(thread::spawn(move || {
+            for step in 0..32u64 {
+                let _ = writer_id;
+                let mut guard = rw.write();
+                let next = guard.0 + 1;
+                *guard = (next, next * 7);
+                if step & 7 == 0 {
+                    thread::yield_now();
+                }
+            }
+            true
+        }));
+    }
+    for _ in 0..4 {
+        let rw = Arc::clone(&shared);
+        rw_handles.push(thread::spawn(move || {
+            let mut prev = 0u64;
+            for step in 0..64u64 {
+                let (seq, scaled) = *rw.read();
+                if scaled != seq * 7 || seq < prev {
+                    return false;
+                }
+                prev = seq;
+                if step & 15 == 0 {
+                    thread::yield_now();
+                }
+            }
+            true
+        }));
+    }
+    let mut rw_ok = true;
+    for handle in rw_handles {
+        rw_ok &= handle.join().unwrap_or(false);
+    }
+    let final_pair = *shared.read();
+    expect!(
+        failures,
+        rw_ok,
+        "rwlock concurrent readers/writers invariant"
+    );
+    expect!(
+        failures,
+        final_pair == (65, 65 * 7),
+        "rwlock preserved every contended write"
+    );
+
+    // Condition variable: verify both pre-wait and post-wait notifications.
+    // First round: wait until the waiter actually holds the lock and enters
+    // `condvar.wait` before notifying (`waiting` flag). Second round: notify
+    // immediately so the already-satisfied fast path is covered too.
+    for wait_first in [true, false] {
+        let pair = Arc::new((Mutex::new((false, false)), Condvar::new()));
+        let waiter_pair = Arc::clone(&pair);
+        let waiter = thread::spawn(move || {
+            let (lock, condvar) = &*waiter_pair;
+            let mut state = lock.lock();
+            state.0 = true;
+            condvar.notify_all();
+            let mut spins = 0;
+            while !state.1 {
+                state = condvar.wait(state);
+                spins += 1;
+                if spins > 1000 {
+                    return false;
+                }
+            }
+            true
+        });
+        {
+            let (lock, condvar) = &*pair;
+            let mut state = lock.lock();
+            if wait_first {
+                while !state.0 {
+                    state = condvar.wait(state);
+                }
+            }
+            state.1 = true;
+            condvar.notify_all();
+        }
+        expect!(
+            failures,
+            waiter.join().unwrap_or(false),
+            "condvar woke the waiter"
+        );
+    }
 
     // Barrier: three threads plus the main one meet exactly once.
     let barrier = Arc::new(Barrier::new(4));
@@ -688,7 +719,7 @@ fn check_threads() -> u32 {
     );
 
     if failures == 0 {
-        eprintln!(
+        println!(
             "[std] threads OK ({WORKERS} threads, Arc<Mutex>, RwLock, Condvar, Barrier, OnceLock)"
         );
     }

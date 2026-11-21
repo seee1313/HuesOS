@@ -138,7 +138,10 @@ fn run() -> i32 {
         }
         let key = tui::read_key_timeout(Duration::from_millis(interval_ms));
         match key {
-            Some(Key::Char(b'q')) | Some(Key::Char(b'Q')) => break,
+            Some(Key::Char(b'q'))
+            | Some(Key::Char(b'Q'))
+            | Some(Key::Ctrl(3))
+            | Some(Key::Escape) => break,
             Some(Key::Char(b' ')) => paused = !paused,
             Some(Key::Char(b'r')) => previous = None,
             Some(Key::Char(b'+')) | Some(Key::Char(b'=')) => {

@@ -162,14 +162,45 @@ const MAX_SNAPSHOT_BYTES: usize = core::mem::size_of::<huesos_abi::SchedSummary>
 
 /// Read the aggregate scheduler counters.
 pub fn sched_summary() -> crate::Result<huesos_abi::SchedSummary> {
-    let mut buffer = [0u8; MAX_SNAPSHOT_BYTES];
-    let written = sched_stats_into(&mut buffer)?;
     let summary_size = core::mem::size_of::<huesos_abi::SchedSummary>();
+    let mut buffer = [0u8; core::mem::size_of::<huesos_abi::SchedSummary>()];
+    let written = sched_stats_into(&mut buffer)?;
     if written < summary_size {
         return Err(crate::ErrorCode::InvalidArgs);
     }
     huesos_abi::SchedSummary::from_bytes(&buffer[..summary_size])
         .ok_or(crate::ErrorCode::InvalidArgs)
+}
+
+/// Read the aggregate scheduler summary and per-CPU records into caller storage.
+pub fn sched_snapshot_into(
+    buffer: &mut [u8],
+    mut visit: impl FnMut(&huesos_abi::SchedCpuRecord),
+) -> crate::Result<huesos_abi::SchedSummary> {
+    let written = sched_stats_into(buffer)?;
+    let summary_size = core::mem::size_of::<huesos_abi::SchedSummary>();
+    let record_size = core::mem::size_of::<huesos_abi::SchedCpuRecord>();
+    if written < summary_size || record_size == 0 {
+        return Err(crate::ErrorCode::InvalidArgs);
+    }
+    let summary = huesos_abi::SchedSummary::from_bytes(&buffer[..summary_size])
+        .ok_or(crate::ErrorCode::InvalidArgs)?;
+    let mut offset = summary_size;
+    while offset + record_size <= written {
+        let record = huesos_abi::SchedCpuRecord::from_bytes(&buffer[offset..offset + record_size])
+            .ok_or(crate::ErrorCode::InvalidArgs)?;
+        visit(&record);
+        offset += record_size;
+    }
+    Ok(summary)
+}
+
+/// Read the aggregate scheduler summary and per-CPU records in a single syscall.
+pub fn sched_snapshot(
+    visit: impl FnMut(&huesos_abi::SchedCpuRecord),
+) -> crate::Result<huesos_abi::SchedSummary> {
+    let mut buffer = [0u8; MAX_SNAPSHOT_BYTES];
+    sched_snapshot_into(&mut buffer, visit)
 }
 
 /// Visit the per-CPU scheduler records.
@@ -178,22 +209,11 @@ pub fn sched_summary() -> crate::Result<huesos_abi::SchedSummary> {
 /// order; the count is returned so a caller can detect a CPU that came online
 /// between the summary and the records.
 pub fn sched_cpus(mut visit: impl FnMut(&huesos_abi::SchedCpuRecord)) -> crate::Result<usize> {
-    let mut buffer = [0u8; MAX_SNAPSHOT_BYTES];
-    let written = sched_stats_into(&mut buffer)?;
-    let summary_size = core::mem::size_of::<huesos_abi::SchedSummary>();
-    let record_size = core::mem::size_of::<huesos_abi::SchedCpuRecord>();
-    if written < summary_size || record_size == 0 {
-        return Err(crate::ErrorCode::InvalidArgs);
-    }
     let mut seen = 0;
-    let mut offset = summary_size;
-    while offset + record_size <= written {
-        let record = huesos_abi::SchedCpuRecord::from_bytes(&buffer[offset..offset + record_size])
-            .ok_or(crate::ErrorCode::InvalidArgs)?;
-        visit(&record);
+    let _ = sched_snapshot(|record| {
+        visit(record);
         seen += 1;
-        offset += record_size;
-    }
+    })?;
     Ok(seen)
 }
 

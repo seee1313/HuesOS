@@ -37,25 +37,14 @@ fn run() -> i32 {
     }
 
     if allow_hxfs {
-        let file_opt = if let Some(svc) = cu::take_hxfs() {
-            svc.open_file(&path).ok()
-        } else if let Some(dir) = cu::take_hxfs_dir() {
-            dir.open_file(path.trim_start_matches('/')).ok()
-        } else {
-            None
-        };
-        if let Some(file) = file_opt {
-            if let Ok(vmo) = file.read_into_vmo() {
-                let sz = file.size().unwrap_or(0).min(64 * 1024) as usize;
-                let mut buf = vec![0u8; sz];
-                if vmo.read(0, &mut buf).is_ok() {
-                    let s = String::from_utf8_lossy(&buf);
-                    cu::out(s.as_ref());
-                    if !s.ends_with('\n') {
-                        cu::out("\n");
-                    }
-                    return 0;
+        if let Ok(mut file) = huesos_std::fs::File::open(&path) {
+            if let Ok(buf) = file.read_to_end() {
+                let s = String::from_utf8_lossy(&buf);
+                cu::out(s.as_ref());
+                if !s.is_empty() && !s.ends_with('\n') {
+                    cu::out("\n");
                 }
+                return 0;
             }
         }
     }

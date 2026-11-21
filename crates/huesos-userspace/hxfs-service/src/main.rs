@@ -22,7 +22,7 @@ use huesos_hxfs_proto::{
 };
 #[cfg(feature = "hxblob")]
 use libcanvas::Handle;
-use libcanvas::{println, Channel, ErrorCode, Vmo};
+use libcanvas::{println, wait_any, Channel, ErrorCode, Signals, Vmo, WaitItem};
 
 /// A.6 live mount: the hxfs-service is the production
 /// mount process. It needs a global allocator so the
@@ -51,16 +51,16 @@ fn init_heap() -> bool {
     unsafe { HEAP.init() }
 }
 
-const MAX_CLIENTS: usize = 4;
-const MAX_FILE_HANDLES: usize = 8;
-const MAX_DIR_HANDLES: usize = 8;
+const MAX_CLIENTS: usize = 32;
+const MAX_FILE_HANDLES: usize = 32;
+const MAX_DIR_HANDLES: usize = 32;
 /// Concurrently open BlobView handles.
 #[cfg(feature = "hxblob")]
 ///
 /// Blob views are read-only and short-lived (resolve a package, read
 /// it, close), so the ceiling is deliberately lower than the file
 /// table; each slot costs a channel plus a 32-byte hash.
-const MAX_BLOB_HANDLES: usize = 8;
+const MAX_BLOB_HANDLES: usize = 16;
 
 /// Messages one endpoint may be served per service-loop tick.
 ///
@@ -90,8 +90,8 @@ const MAX_READ_BYTES: usize = 4096;
 // soak file (256 extents -> 3 leaves) exercises the tree; larger
 // files need the writer to move off the stack (a Box/heap-based
 // service runtime), tracked separately.
-const SERVICE_MAX_OBJECTS: usize = 32;
-const SERVICE_MAX_DIR_ENTRIES: usize = 32;
+const SERVICE_MAX_OBJECTS: usize = 62;
+const SERVICE_MAX_DIR_ENTRIES: usize = 128;
 const SERVICE_MAX_EXTENTS: usize = 4200;
 // The qemu-nvme-boot namespace is exposed with a 512-byte LBA while
 // Hxfs internally works in 4 KiB blocks. The
@@ -130,11 +130,33 @@ enum DiskLayout {
 struct BlockDeviceReader {
     device: libcanvas::block::BlockDevice,
     window: Option<BlockWindow>,
+    total_hxfs_blocks: u64,
 }
 
 impl BlockDeviceReader {
-    fn new(device: libcanvas::block::BlockDevice, window: Option<BlockWindow>) -> Self {
-        Self { device, window }
+    fn new(mut device: libcanvas::block::BlockDevice, window: Option<BlockWindow>) -> Self {
+        let total_hxfs_blocks = match window {
+            Some(win) => win.blocks,
+            None => device
+                .info()
+                .map(|info| {
+                    if info.block_size == 0 {
+                        0
+                    } else {
+                        info.block_count.saturating_mul(u64::from(info.block_size)) / 4096
+                    }
+                })
+                .unwrap_or(0),
+        };
+        Self {
+            device,
+            window,
+            total_hxfs_blocks,
+        }
+    }
+
+    const fn total_blocks(&self) -> u64 {
+        self.total_hxfs_blocks
     }
 
     /// Translate an HxFS `(lba, blocks)` request into device `(lba, blocks)`,
@@ -356,6 +378,58 @@ impl HxfsRuntime {
         }
     }
 
+    fn wait_until_active(&self, bootstrap: &Channel, timeout_ticks: u64) {
+        let mut items = [WaitItem::new(0, Signals::NONE, 0); 16];
+        items[0] = WaitItem::new(
+            bootstrap.handle().raw(),
+            Signals::READABLE | Signals::PEER_CLOSED,
+            0,
+        );
+        let mut count = 1usize;
+        let signals = Signals::READABLE | Signals::PEER_CLOSED;
+        for ch in self.clients.iter().flatten() {
+            if count >= items.len() {
+                break;
+            }
+            items[count] = WaitItem::new(ch.handle().raw(), signals, count as u64);
+            count += 1;
+        }
+        for ep in self.files.iter().flatten() {
+            if count >= items.len() {
+                break;
+            }
+            items[count] = WaitItem::new(ep.channel.handle().raw(), signals, count as u64);
+            count += 1;
+        }
+        for ep in self.dirs.iter().flatten() {
+            if count >= items.len() {
+                break;
+            }
+            items[count] = WaitItem::new(ep.channel.handle().raw(), signals, count as u64);
+            count += 1;
+        }
+        #[cfg(feature = "hxblob")]
+        for ep in self.blobs.iter().flatten() {
+            if count >= items.len() {
+                break;
+            }
+            items[count] = WaitItem::new(ep.channel.handle().raw(), signals, count as u64);
+            count += 1;
+        }
+        let total_active = 1
+            + self.clients.iter().flatten().count()
+            + self.files.iter().flatten().count()
+            + self.dirs.iter().flatten().count();
+        #[cfg(feature = "hxblob")]
+        let total_active = total_active + self.blobs.iter().flatten().count();
+        let wait_ticks = if total_active > items.len() {
+            1
+        } else {
+            timeout_ticks
+        };
+        let _ = wait_any(&items[..count], wait_ticks);
+    }
+
     fn poll_bootstrap(&mut self, bootstrap: &Channel) {
         let mut buf = [0u8; 64];
         // Bounded per tick. An endpoint whose peer keeps talking must
@@ -489,6 +563,60 @@ impl HxfsRuntime {
             self.write_client(index, b"stats-ok");
             return;
         }
+        if request == b"SCRUB" {
+            match self.fs.scrub() {
+                Ok(s) => {
+                    let (tree_blocks, tree_errors) = self.fs.scrub_all().unwrap_or((0, 1));
+                    let fsck = self.fs.fsck();
+                    let text = alloc::format!(
+                        "scrub: metadata_blocks={} data_blocks={} data_bytes={} tree_blocks={} errors={}\n",
+                        s.metadata_blocks,
+                        s.data_blocks,
+                        s.data_bytes,
+                        tree_blocks,
+                        s.errors
+                            .saturating_add(tree_errors)
+                            .saturating_add(fsck.errors)
+                    );
+                    self.write_client(index, text.as_bytes());
+                }
+                Err(err) => {
+                    let text = alloc::format!("err:scrub:{err:?}");
+                    self.write_client(index, text.as_bytes());
+                }
+            }
+            return;
+        }
+        if request == b"FSCK" {
+            let fsck = self.fs.fsck();
+            let (tree_blocks, tree_errors) = self.fs.scrub_all().unwrap_or((0, 1));
+            let text = alloc::format!(
+                "fsck: checks={} tree_blocks={} errors={}\n",
+                fsck.checks,
+                tree_blocks,
+                fsck.errors.saturating_add(tree_errors)
+            );
+            self.write_client(index, text.as_bytes());
+            return;
+        }
+        if request == b"LIST_SNAPSHOTS" {
+            let mut entries = [huesos_hxfs::fixed_writer::SnapshotEntry::EMPTY;
+                huesos_hxfs::fixed_writer::MAX_NAMED_SNAPSHOTS];
+            let count = self.fs.list_named_snapshots(&mut entries);
+            let mut text = alloc::string::String::new();
+            for entry in entries.iter().take(count) {
+                use core::fmt::Write;
+                let _ = writeln!(
+                    &mut text,
+                    "{}\tseq={}\tlba={}",
+                    entry.name(),
+                    entry.checkpoint_seq,
+                    entry.checkpoint_lba
+                );
+            }
+            self.write_client(index, text.as_bytes());
+            return;
+        }
         if let Some(rest) = strip_prefix(request, b"SET_KNOB ") {
             if let Some(eq) = rest.iter().position(|&b| b == b'=') {
                 let name = &rest[..eq];
@@ -562,6 +690,13 @@ impl HxfsRuntime {
             HxfsOp::CreateFile => self.client_create_file_native(index, request, payload),
             HxfsOp::Rename => self.client_rename_native(index, request, payload),
             HxfsOp::Unlink => self.client_unlink_native(index, request, payload),
+            HxfsOp::Symlink => self.client_symlink_native(index, request, payload),
+            HxfsOp::StatPath => self.client_stat_native(index, request, payload),
+            HxfsOp::ReadLink => self.client_readlink_native(index, request, payload),
+            HxfsOp::SetAttr => self.client_setattr_native(index, request, payload),
+            HxfsOp::StatFs => self.client_statfs_native(index, request),
+            HxfsOp::CreateSnapshot => self.client_create_snapshot_native(index, request, payload),
+            HxfsOp::DeleteSnapshot => self.client_delete_snapshot_native(index, request, payload),
             HxfsOp::Fsync | HxfsOp::Checkpoint => self.client_checkpoint_native(index, request),
             #[cfg(feature = "hxblob")]
             HxfsOp::GcBlobs => {
@@ -613,15 +748,26 @@ impl HxfsRuntime {
             self.write_client_status(index, request, HxfsStatus::Invalid);
             return;
         };
+        let follow_final = request.flags & request_flags::O_NOFOLLOW == 0;
         match request.handle_kind {
-            HxfsHandleKind::File => match self.fs.open_path(path) {
+            HxfsHandleKind::File => match self.fs.open_path_ex(path, follow_final) {
                 Ok(file) => self.return_file_abi_to_client(index, request, file),
                 Err(error) => self.write_client_status(index, request, status_for_error(error)),
             },
-            HxfsHandleKind::Directory => match self.fs.open_directory_path(path) {
-                Ok(dir) => self.return_dir_abi_to_client(index, request, dir),
-                Err(error) => self.write_client_status(index, request, status_for_error(error)),
-            },
+            HxfsHandleKind::Directory => {
+                if !follow_final {
+                    if let Ok(st) = self.fs.stat_path(path, false) {
+                        if st.object_type == huesos_hxfs::format::OBJECT_TYPE_SYMLINK {
+                            self.write_client_status(index, request, HxfsStatus::WrongType);
+                            return;
+                        }
+                    }
+                }
+                match self.fs.open_directory_path(path) {
+                    Ok(dir) => self.return_dir_abi_to_client(index, request, dir),
+                    Err(error) => self.write_client_status(index, request, status_for_error(error)),
+                }
+            }
             _ => self.write_client_status(index, request, HxfsStatus::Invalid),
         }
     }
@@ -691,6 +837,186 @@ impl HxfsRuntime {
                 0,
                 0,
                 0,
+                0,
+            ),
+            Err(error) => self.write_client_status(index, request, status_for_error(error)),
+        }
+    }
+
+    fn client_symlink_native(&mut self, index: usize, request: HxfsRequest, payload: &[u8]) {
+        let Some((link_path, target)) = split_two_strings(payload) else {
+            self.write_client_status(index, request, HxfsStatus::Invalid);
+            return;
+        };
+        match self.fs.create_symlink_path(link_path, target) {
+            Ok(obj_id) => self.write_client_response(
+                index,
+                request,
+                HxfsStatus::Ok,
+                HxfsHandleKind::None,
+                0,
+                0,
+                obj_id,
+                0,
+            ),
+            Err(error) => self.write_client_status(index, request, status_for_error(error)),
+        }
+    }
+
+    fn client_stat_native(&mut self, index: usize, request: HxfsRequest, payload: &[u8]) {
+        let Ok(path) = core::str::from_utf8(payload) else {
+            self.write_client_status(index, request, HxfsStatus::Invalid);
+            return;
+        };
+        let follow_final = request.flags & request_flags::O_NOFOLLOW == 0;
+        match self.fs.stat_path(path, follow_final) {
+            Ok(stat) => {
+                let encoded = stat.encode();
+                self.write_client_response_meta(
+                    index,
+                    request,
+                    ResponseMeta {
+                        status: HxfsStatus::Ok,
+                        handle_kind: HxfsHandleKind::None,
+                        handle_id: 0,
+                        rights: 0,
+                        object_id: stat.object_id,
+                        value: stat.size,
+                        flags: response_flags::INLINE_PAYLOAD,
+                    },
+                    &encoded,
+                );
+            }
+            Err(error) => self.write_client_status(index, request, status_for_error(error)),
+        }
+    }
+
+    fn client_readlink_native(&mut self, index: usize, request: HxfsRequest, payload: &[u8]) {
+        let Ok(path) = core::str::from_utf8(payload) else {
+            self.write_client_status(index, request, HxfsStatus::Invalid);
+            return;
+        };
+        let mut target_buf = [0u8; huesos_abi::hxfs::HXFS_MAX_PATH_BYTES];
+        match self.fs.readlink_path(path, &mut target_buf) {
+            Ok(n) => self.write_client_response_meta(
+                index,
+                request,
+                ResponseMeta {
+                    status: HxfsStatus::Ok,
+                    handle_kind: HxfsHandleKind::None,
+                    handle_id: 0,
+                    rights: 0,
+                    object_id: 0,
+                    value: n as u64,
+                    flags: response_flags::INLINE_PAYLOAD,
+                },
+                &target_buf[..n],
+            ),
+            Err(error) => self.write_client_status(index, request, status_for_error(error)),
+        }
+    }
+
+    fn client_setattr_native(&mut self, index: usize, request: HxfsRequest, payload: &[u8]) {
+        let Ok(path) = core::str::from_utf8(payload) else {
+            self.write_client_status(index, request, HxfsStatus::Invalid);
+            return;
+        };
+        let mode_opt = if request.arg0 != u64::MAX {
+            Some(request.arg0 as u32)
+        } else {
+            None
+        };
+        let mtime_opt = if request.arg1 != u64::MAX {
+            Some(request.arg1 as i64)
+        } else {
+            None
+        };
+        let follow_final = request.flags & request_flags::O_NOFOLLOW == 0;
+        match self
+            .fs
+            .set_attr_path(path, mode_opt, mtime_opt, follow_final)
+        {
+            Ok(stat) => self.write_client_response(
+                index,
+                request,
+                HxfsStatus::Ok,
+                HxfsHandleKind::None,
+                0,
+                0,
+                stat.object_id,
+                u64::from(stat.mode),
+            ),
+            Err(error) => self.write_client_status(index, request, status_for_error(error)),
+        }
+    }
+
+    fn client_statfs_native(&self, index: usize, request: HxfsRequest) {
+        let total_blocks = self.fs.store().total_blocks();
+        let info = self.fs.stat_fs(total_blocks);
+        let encoded = info.encode();
+        self.write_client_response_meta(
+            index,
+            request,
+            ResponseMeta {
+                status: HxfsStatus::Ok,
+                handle_kind: HxfsHandleKind::Volume,
+                handle_id: 0,
+                rights: hxfs_rights::ALL,
+                object_id: self.fs.volume_info().root_object_id,
+                value: info.avail_blocks,
+                flags: response_flags::INLINE_PAYLOAD,
+            },
+            &encoded,
+        );
+    }
+
+    fn client_create_snapshot_native(
+        &mut self,
+        index: usize,
+        request: HxfsRequest,
+        payload: &[u8],
+    ) {
+        let Ok(name) = core::str::from_utf8(payload) else {
+            self.write_client_status(index, request, HxfsStatus::Invalid);
+            return;
+        };
+        let now_ns = libcanvas::system::monotonic_ticks()
+            .unwrap_or(0)
+            .saturating_mul(10_000_000) as i64;
+        match self.fs.create_named_snapshot(name, now_ns) {
+            Ok(seq) => self.write_client_response(
+                index,
+                request,
+                HxfsStatus::Ok,
+                HxfsHandleKind::Volume,
+                0,
+                hxfs_rights::SNAPSHOT,
+                self.fs.volume_info().root_object_id,
+                seq,
+            ),
+            Err(error) => self.write_client_status(index, request, status_for_error(error)),
+        }
+    }
+
+    fn client_delete_snapshot_native(
+        &mut self,
+        index: usize,
+        request: HxfsRequest,
+        payload: &[u8],
+    ) {
+        let Ok(name) = core::str::from_utf8(payload) else {
+            self.write_client_status(index, request, HxfsStatus::Invalid);
+            return;
+        };
+        match self.fs.delete_named_snapshot(name) {
+            Ok(()) => self.write_client_response(
+                index,
+                request,
+                HxfsStatus::Ok,
+                HxfsHandleKind::Volume,
+                0,
+                hxfs_rights::SNAPSHOT,
+                self.fs.volume_info().root_object_id,
                 0,
             ),
             Err(error) => self.write_client_status(index, request, status_for_error(error)),
@@ -1377,8 +1703,44 @@ impl HxfsRuntime {
             HxfsOp::ReadAt => self.file_read_native(index, request),
             HxfsOp::WriteAt => self.file_write_native(index, request, payload),
             HxfsOp::Truncate => self.file_truncate_native(index, request),
+            HxfsOp::SetAttr => self.file_setattr_native(index, request),
             HxfsOp::Fsync | HxfsOp::Checkpoint => self.file_checkpoint_native(index, request),
             _ => self.write_file_status(index, request, HxfsStatus::Unsupported),
+        }
+    }
+
+    fn file_setattr_native(&mut self, index: usize, request: HxfsRequest) {
+        let Some((handle, read_only)) = self.files[index]
+            .as_ref()
+            .map(|endpoint| (endpoint.handle, endpoint.read_only))
+        else {
+            return;
+        };
+        if read_only {
+            self.write_file_status(index, request, HxfsStatus::AccessDenied);
+            return;
+        }
+        let mode_opt = if request.arg0 != u64::MAX {
+            Some(request.arg0 as u32)
+        } else {
+            None
+        };
+        let mtime_opt = if request.arg1 != u64::MAX {
+            Some(request.arg1 as i64)
+        } else {
+            None
+        };
+        match self.fs.set_attr_file(handle, mode_opt, mtime_opt) {
+            Ok(stat) => self.write_file_response(
+                index,
+                request,
+                HxfsStatus::Ok,
+                handle,
+                u64::from(stat.mode),
+                response_flags::DIRTY,
+                &[],
+            ),
+            Err(error) => self.write_file_status(index, request, status_for_error(error)),
         }
     }
 
@@ -1441,7 +1803,10 @@ impl HxfsRuntime {
             self.write_file_status(index, request, HxfsStatus::AccessDenied);
             return;
         }
-        match self.fs.write_file_at(handle, request.arg0, payload) {
+        match self
+            .fs
+            .write_file_at_preserve(handle, request.arg0, payload)
+        {
             Ok(new_handle) => {
                 if let Some(endpoint) = self.files[index].as_mut() {
                     endpoint.handle = new_handle;
@@ -1757,6 +2122,11 @@ impl HxfsRuntime {
             HxfsOp::Mkdir => self.dir_mkdir_native(index, request, payload),
             HxfsOp::Rename => self.dir_rename_native(index, request, payload),
             HxfsOp::Unlink => self.dir_unlink_native(index, request, payload),
+            HxfsOp::Symlink => self.dir_symlink_native(index, request, payload),
+            HxfsOp::StatPath => self.dir_stat_native(index, request, payload),
+            HxfsOp::ReadLink => self.dir_readlink_native(index, request, payload),
+            HxfsOp::SetAttr => self.dir_setattr_native(index, request, payload),
+            HxfsOp::StatFs => self.dir_statfs_native(index, request),
             HxfsOp::Fsync | HxfsOp::Checkpoint => self.dir_checkpoint_native(index, request),
             _ => self.write_dir_status(index, request, HxfsStatus::Unsupported),
         }
@@ -1804,12 +2174,22 @@ impl HxfsRuntime {
             self.write_dir_status(index, request, HxfsStatus::Invalid);
             return;
         };
+        let follow_final = request.flags & request_flags::O_NOFOLLOW == 0;
+        let dir_handle = endpoint.handle;
+        if !follow_final {
+            if let Ok(st) = self.fs.stat_child(dir_handle, name, false) {
+                if st.object_type == huesos_hxfs::format::OBJECT_TYPE_SYMLINK {
+                    self.write_dir_status(index, request, HxfsStatus::WrongType);
+                    return;
+                }
+            }
+        }
         match request.handle_kind {
-            HxfsHandleKind::File => match self.fs.open_child_file(endpoint.handle, name) {
+            HxfsHandleKind::File => match self.fs.open_child_file(dir_handle, name) {
                 Ok(file) => self.return_file_abi_to_dir(index, request, file),
                 Err(error) => self.write_dir_status(index, request, status_for_error(error)),
             },
-            HxfsHandleKind::Directory => match self.fs.open_child_dir(endpoint.handle, name) {
+            HxfsHandleKind::Directory => match self.fs.open_child_dir(dir_handle, name) {
                 Ok(dir) => self.return_dir_abi_to_dir(index, request, dir),
                 Err(error) => self.write_dir_status(index, request, status_for_error(error)),
             },
@@ -1915,6 +2295,145 @@ impl HxfsRuntime {
             ),
             Err(error) => self.write_dir_status(index, request, status_for_error(error)),
         }
+    }
+
+    fn dir_symlink_native(&mut self, index: usize, request: HxfsRequest, payload: &[u8]) {
+        let Some((parent, read_only)) = self.dirs[index]
+            .as_ref()
+            .map(|endpoint| (endpoint.handle, endpoint.read_only))
+        else {
+            return;
+        };
+        if read_only {
+            self.write_dir_status(index, request, HxfsStatus::AccessDenied);
+            return;
+        }
+        let Some((link_rel, target)) = split_two_strings(payload) else {
+            self.write_dir_status(index, request, HxfsStatus::Invalid);
+            return;
+        };
+        match self.fs.create_symlink_child(parent, link_rel, target) {
+            Ok(obj_id) => self.write_dir_response(
+                index,
+                request,
+                HxfsStatus::Ok,
+                parent,
+                obj_id,
+                response_flags::DIRTY,
+                &[],
+            ),
+            Err(error) => self.write_dir_status(index, request, status_for_error(error)),
+        }
+    }
+
+    fn dir_stat_native(&mut self, index: usize, request: HxfsRequest, payload: &[u8]) {
+        let Some(parent) = self.dirs[index].as_ref().map(|endpoint| endpoint.handle) else {
+            return;
+        };
+        let Ok(rel_path) = core::str::from_utf8(payload) else {
+            self.write_dir_status(index, request, HxfsStatus::Invalid);
+            return;
+        };
+        let follow_final = request.flags & request_flags::O_NOFOLLOW == 0;
+        match self.fs.stat_child(parent, rel_path, follow_final) {
+            Ok(stat) => {
+                let encoded = stat.encode();
+                self.write_dir_response(
+                    index,
+                    request,
+                    HxfsStatus::Ok,
+                    parent,
+                    stat.size,
+                    response_flags::INLINE_PAYLOAD,
+                    &encoded,
+                );
+            }
+            Err(error) => self.write_dir_status(index, request, status_for_error(error)),
+        }
+    }
+
+    fn dir_readlink_native(&mut self, index: usize, request: HxfsRequest, payload: &[u8]) {
+        let Some(parent) = self.dirs[index].as_ref().map(|endpoint| endpoint.handle) else {
+            return;
+        };
+        let Ok(rel_path) = core::str::from_utf8(payload) else {
+            self.write_dir_status(index, request, HxfsStatus::Invalid);
+            return;
+        };
+        let mut target_buf = [0u8; huesos_abi::hxfs::HXFS_MAX_PATH_BYTES];
+        match self.fs.readlink_child(parent, rel_path, &mut target_buf) {
+            Ok(n) => self.write_dir_response(
+                index,
+                request,
+                HxfsStatus::Ok,
+                parent,
+                n as u64,
+                response_flags::INLINE_PAYLOAD,
+                &target_buf[..n],
+            ),
+            Err(error) => self.write_dir_status(index, request, status_for_error(error)),
+        }
+    }
+
+    fn dir_setattr_native(&mut self, index: usize, request: HxfsRequest, payload: &[u8]) {
+        let Some((parent, read_only)) = self.dirs[index]
+            .as_ref()
+            .map(|endpoint| (endpoint.handle, endpoint.read_only))
+        else {
+            return;
+        };
+        if read_only {
+            self.write_dir_status(index, request, HxfsStatus::AccessDenied);
+            return;
+        }
+        let Ok(rel_path) = core::str::from_utf8(payload) else {
+            self.write_dir_status(index, request, HxfsStatus::Invalid);
+            return;
+        };
+        let mode_opt = if request.arg0 != u64::MAX {
+            Some(request.arg0 as u32)
+        } else {
+            None
+        };
+        let mtime_opt = if request.arg1 != u64::MAX {
+            Some(request.arg1 as i64)
+        } else {
+            None
+        };
+        let follow_final = request.flags & request_flags::O_NOFOLLOW == 0;
+        match self
+            .fs
+            .set_attr_child(parent, rel_path, mode_opt, mtime_opt, follow_final)
+        {
+            Ok(stat) => self.write_dir_response(
+                index,
+                request,
+                HxfsStatus::Ok,
+                parent,
+                u64::from(stat.mode),
+                response_flags::DIRTY,
+                &[],
+            ),
+            Err(error) => self.write_dir_status(index, request, status_for_error(error)),
+        }
+    }
+
+    fn dir_statfs_native(&self, index: usize, request: HxfsRequest) {
+        let Some(parent) = self.dirs[index].as_ref().map(|endpoint| endpoint.handle) else {
+            return;
+        };
+        let total_blocks = self.fs.store().total_blocks();
+        let info = self.fs.stat_fs(total_blocks);
+        let encoded = info.encode();
+        self.write_dir_response(
+            index,
+            request,
+            HxfsStatus::Ok,
+            parent,
+            info.avail_blocks,
+            response_flags::INLINE_PAYLOAD,
+            &encoded,
+        );
     }
 
     fn dir_checkpoint_native(&mut self, index: usize, request: HxfsRequest) {
@@ -2240,7 +2759,7 @@ pub extern "C" fn _start() -> ! {
                 scrub
             );
         }
-        libcanvas::process::yield_now();
+        runtime.wait_until_active(&bootstrap, 5);
     }
 }
 

@@ -224,6 +224,7 @@ fn acquire_runqueue_token(cpu: usize) -> Option<RunqueueTokenGuard> {
                 request_id,
             });
         }
+        process_runqueue_token_mailbox(current);
         core::hint::spin_loop();
     }
     cancel_runqueue_token_request(cpu, current, request_id);
@@ -493,23 +494,23 @@ impl Scheduler {
             }
         }
 
-        // 2. Update stats for currently running task
+        // 2. Update stats for currently running task.
+        // Note: while a Fair task is `self.current`, it is NOT in `self.fair_queue`.
+        // Reinsert it only if it remains runnable AND is actually runnable as a
+        // candidate alongside queued peers; if `next_idx == old_index`, we avoid
+        // leaving stale `(old_vruntime, task_id)` duplicates in `EevdfTree`.
+        let mut current_fair_candidate: Option<(u64, u64)> = None;
         if self.current > 0 {
             if let TaskKind::User { process, .. } = &self.tasks[self.current].kind {
                 let _ = process.charge_cpu_tick();
             }
             // Charge the running task's Job with one tick of service. This
             // feeds the Job hard-cap oracle and the per-CPU demand snapshots
-            // used by the (future) cross-CPU deficit balancer.
+            // used by the cross-CPU deficit balancer.
             let job_id = self.tasks[self.current].job_id;
             let now = monotonic_ns();
             if let Some(table) = JOB_TABLE.get() {
                 let mut jobs = table.lock();
-                // The kernel currently maintains one accounting entry for the
-                // root Job; all tasks default to it. When a privileged policy
-                // assigns tasks to distinct resource domains, the entry set
-                // must be indexed by JobId — the charge below already names
-                // the task's Job so the plumbing does not need rework.
                 let _ = jobs.charge(self.cpu, TICK_SERVICE_NS);
                 let _ = jobs.maybe_replenish(now);
                 let _ = job_id;
@@ -523,7 +524,7 @@ impl Scheduler {
                     let delta = (1024 * 1000) / (*weight).max(1);
                     *vruntime += delta;
                     if !finished && !blocked {
-                        fair_queue_insert(&mut self.fair_queue, *vruntime, task_id);
+                        current_fair_candidate = Some((*vruntime, task_id));
                     }
                 }
                 SchedPolicy::Deadline {
@@ -532,6 +533,10 @@ impl Scheduler {
                     *remaining_budget = remaining_budget.saturating_sub(1);
                 }
             }
+        }
+
+        if let Some((vr, task_id)) = current_fair_candidate {
+            fair_queue_insert(&mut self.fair_queue, vr, task_id);
         }
 
         // 3. Pick the next task to run
@@ -590,6 +595,12 @@ impl Scheduler {
                 next_idx = idx;
                 break;
             }
+        } else if let Some((vr, task_id)) = current_fair_candidate {
+            // A Deadline task preempted (or remained ahead of) the fair queue:
+            // if `next_idx == self.current` (impossible for Fair, since Fair
+            // cannot win the Deadline scan), `current_fair_candidate` stays
+            // queued for when the Deadline task yields/blocks.
+            let _ = (vr, task_id);
         }
 
         let old_index = self.current;
@@ -814,6 +825,7 @@ pub fn yield_now() {
 pub fn park_current() {
     huesos_arch::interrupts::disable();
     let cpu = cpu_id();
+    CPU_INBOX[cpu].drain(|slot| process_inbox_task(cpu, slot));
     process_runqueue_token_mailbox(cpu);
     {
         let mut guard = PER_CPU_SCHEDULERS[cpu].lock();
@@ -821,14 +833,28 @@ pub fn park_current() {
         let mut should_park = true;
         let fair_key = if let Some(task) = guard.tasks.get_mut(idx) {
             // The scheduler lock makes the blocked flag and the pending wake
-            // handshake atomic with respect to remote wake_task calls.
+            // handshake atomic with respect to local wake_task calls, while
+            // checking TASK_DIRECTORY catches any remote WAKE operation that
+            // was published after the inbox drain above.
             task.blocked.store(true, Ordering::SeqCst);
             let fair_key = match task.sched_policy {
                 SchedPolicy::Fair { vruntime, .. } => Some((vruntime, task.id)),
                 SchedPolicy::Deadline { .. } => None,
             };
+            let remote_wake = V2TaskId::from_raw(task.id)
+                .and_then(|id| TASK_DIRECTORY.take_operations(id).ok())
+                .is_some_and(|ops| {
+                    // Preserve non-WAKE bits if any raced simultaneously.
+                    let rest = ops & !task_operations::WAKE;
+                    if rest != 0 {
+                        if let Some(id) = V2TaskId::from_raw(task.id) {
+                            let _ = TASK_DIRECTORY.publish_operations(id, rest);
+                        }
+                    }
+                    ops & task_operations::WAKE != 0
+                });
             let pending = task.wake_pending.swap(false, Ordering::SeqCst);
-            if pending || !task.blocked.load(Ordering::SeqCst) {
+            if pending || remote_wake || !task.blocked.load(Ordering::SeqCst) {
                 task.blocked.store(false, Ordering::SeqCst);
                 should_park = false;
             }
@@ -836,8 +862,10 @@ pub fn park_current() {
         } else {
             None
         };
-        if let Some((vruntime, task_id)) = fair_key {
-            let _ = guard.fair_queue.remove(fair_key_of(vruntime, task_id));
+        if should_park {
+            if let Some((vruntime, task_id)) = fair_key {
+                let _ = guard.fair_queue.remove(fair_key_of(vruntime, task_id));
+            }
         }
         // Prefer tick(); if it declines to switch (edge case), force idle.
         let switch_context = if should_park {
@@ -976,7 +1004,12 @@ fn process_inbox_task(cpu: usize, slot: usize) {
         if let SchedPolicy::Fair { vruntime, .. } = guard.tasks[idx].sched_policy {
             let key = fair_key_of(vruntime, raw_id);
             let _ = guard.fair_queue.remove(key);
-            fair_queue_insert(&mut guard.fair_queue, vruntime, raw_id);
+            if idx != guard.current
+                && !guard.tasks[idx].blocked.load(Ordering::Relaxed)
+                && !guard.tasks[idx].finished.load(Ordering::Relaxed)
+            {
+                fair_queue_insert(&mut guard.fair_queue, vruntime, raw_id);
+            }
         }
     }
 }
@@ -1248,8 +1281,11 @@ pub fn sched_cpu_record(cpu: usize, out: &mut huesos_abi::SchedCpuRecord) {
 /// Returns `true` when that task exists. The enumeration order is CPU order and
 /// then slot order, skipping reaped slots, which makes a paged read
 /// reproducible within one sampling pass.
-pub fn task_record(index: usize, out: &mut huesos_abi::TaskRecord) -> bool {
+/// Fill `out` with a page of live task records starting at `start`, returning
+/// `(written, total_live_tasks)` in a single O(CPUs + tasks) pass.
+pub fn task_records_page(start: usize, out: &mut [huesos_abi::TaskRecord]) -> (usize, usize) {
     let mut seen = 0usize;
+    let mut written = 0usize;
     let online = online_cpu_mask();
     for (cpu, per_cpu) in PER_CPU_SCHEDULERS.iter().enumerate().take(MAX_CPUS) {
         if online & (1 << cpu) == 0 {
@@ -1260,7 +1296,7 @@ pub fn task_record(index: usize, out: &mut huesos_abi::TaskRecord) -> bool {
             if matches!(&slot.kind, TaskKind::Reaped) {
                 continue;
             }
-            if seen == index {
+            if seen >= start && written < out.len() {
                 let (kind, state, weight, policy) = (
                     match &slot.kind {
                         TaskKind::Kernel => 0u8,
@@ -1297,13 +1333,13 @@ pub fn task_record(index: usize, out: &mut huesos_abi::TaskRecord) -> bool {
                 let name_len = slot.name.iter().position(|byte| *byte == 0).unwrap_or(16);
                 let copy = name_len.min(record.name.len());
                 record.name[..copy].copy_from_slice(&slot.name[..copy]);
-                *out = record;
-                return true;
+                out[written] = record;
+                written += 1;
             }
             seen += 1;
         }
     }
-    false
+    (written, seen)
 }
 
 /// Number of live tasks (the whole table, for paging).
@@ -1332,40 +1368,59 @@ pub fn irq_storm_masked() {
 
 /// Set the scheduling policy for a task by its ID.
 pub fn set_sched_policy(task_id: u64, policy: SchedPolicy) {
-    huesos_arch::interrupts::disable();
     let Some(location) = task_location(task_id) else {
-        huesos_arch::interrupts::enable();
         return;
     };
     let cpu = location.owner.as_usize();
     let idx = location.local_index as usize;
     if cpu >= MAX_CPUS {
-        huesos_arch::interrupts::enable();
         return;
+    }
+    let was_enabled = x86_64::instructions::interrupts::are_enabled();
+    if cpu == cpu_id() {
+        huesos_arch::interrupts::disable();
     }
     // Policy changes are control-plane operations: rare and allowed to
     // briefly take the owner scheduler lock so the mutation is applied
-    // synchronously with correct payload semantics. The hot scheduling
-    // path (wake/tick) never takes this path.
+    // synchronously with correct payload semantics. Acquire remote tokens
+    // before disabling local interrupts so incoming TLB shootdown IPIs on
+    // this CPU are serviced promptly instead of spinning against a remote CPU.
     let Some(_token) = acquire_runqueue_token(cpu) else {
-        huesos_arch::interrupts::enable();
+        if was_enabled {
+            huesos_arch::interrupts::enable();
+        }
         return;
     };
+    huesos_arch::interrupts::disable();
     let mut guard = PER_CPU_SCHEDULERS[cpu].lock();
     if !guard.task_matches(task_id) {
         drop(guard);
-        huesos_arch::interrupts::enable();
+        if was_enabled {
+            huesos_arch::interrupts::enable();
+        }
         return;
     }
+    let mut is_running_or_blocked = false;
     if let Some(SchedPolicy::Fair { vruntime, .. }) = Some(guard.tasks[idx].sched_policy) {
         let _ = guard.fair_queue.remove(fair_key_of(vruntime, task_id));
     }
+    if idx == guard.current
+        || guard.tasks[idx].blocked.load(Ordering::Relaxed)
+        || guard.tasks[idx].finished.load(Ordering::Relaxed)
+    {
+        is_running_or_blocked = true;
+    }
     guard.tasks[idx].sched_policy = policy;
-    if let SchedPolicy::Fair { vruntime, .. } = policy {
-        fair_queue_insert(&mut guard.fair_queue, vruntime, task_id);
+    if !is_running_or_blocked {
+        if let SchedPolicy::Fair { vruntime, .. } = policy {
+            fair_queue_insert(&mut guard.fair_queue, vruntime, task_id);
+        }
     }
     drop(guard);
-    huesos_arch::interrupts::enable();
+    drop(_token);
+    if was_enabled {
+        huesos_arch::interrupts::enable();
+    }
 }
 
 /// Spawn a new kernel thread. Returns `None` when the global Task capacity
@@ -1424,11 +1479,17 @@ pub fn spawn_user_thread_on_cpu_ex(
     if cpu >= MAX_CPUS || !is_cpu_online(cpu) {
         return None;
     }
-    huesos_arch::interrupts::disable();
+    let was_enabled = x86_64::instructions::interrupts::are_enabled();
+    if cpu == cpu_id() {
+        huesos_arch::interrupts::disable();
+    }
     let Some(_token) = acquire_runqueue_token(cpu) else {
-        huesos_arch::interrupts::enable();
+        if was_enabled {
+            huesos_arch::interrupts::enable();
+        }
         return None;
     };
+    huesos_arch::interrupts::disable();
     // Drive the policy transition before publishing the first runnable task.
     let _ = process.start();
     process.increment_active_threads();
@@ -1447,15 +1508,21 @@ pub fn spawn_user_thread_on_cpu_ex(
     }) else {
         drop(guard);
         let _ = proc_for_rollback.decrement_active_threads();
-        huesos_arch::interrupts::enable();
+        drop(_token);
+        if was_enabled {
+            huesos_arch::interrupts::enable();
+        }
         return None;
     };
     drop(guard);
+    drop(_token);
     // Publish startup metadata only after releasing the rank-60 scheduler.
     // Interrupts remain disabled, so this CPU cannot run the new task before
     // its rank-40 process record is visible.
     crate::process::queue_user_entry_ex(id, entry_point, user_rsp, arg0, fs_base);
-    huesos_arch::interrupts::enable();
+    if was_enabled {
+        huesos_arch::interrupts::enable();
+    }
 
     if cpu != cpu_id() {
         if let Some(apic_id) = lapic_id_for_cpu_index(cpu) {

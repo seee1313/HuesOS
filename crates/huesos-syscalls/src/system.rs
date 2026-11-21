@@ -70,24 +70,18 @@ pub(crate) fn sys_system_task_query(start: usize, out: *mut u8, len: usize) -> S
     if record_size == 0 || len < record_size {
         return Err(ErrorCode::InvalidArgs);
     }
-    let capacity = len / record_size;
-    let mut written = 0usize;
-    let mut index = start;
-    while written < capacity {
-        let mut record = TaskRecord::default();
-        if !record_fn(index, &mut record) {
-            break;
-        }
+    const BATCH_MAX: usize = 32;
+    let capacity = (len / record_size).min(BATCH_MAX);
+    let mut batch = [TaskRecord::default(); BATCH_MAX];
+    let (written, total) = record_fn(start, &mut batch[..capacity]);
+    for (slot, record) in batch.iter().enumerate().take(written) {
         user_memory::write_value(
-            out.wrapping_add(written * record_size).cast::<TaskRecord>(),
-            &record,
+            out.wrapping_add(slot * record_size).cast::<TaskRecord>(),
+            record,
         )?;
-        written += 1;
-        index += 1;
     }
     // (records << 32) | total, so a caller can page without guessing the size.
-    let total = crate::callbacks::task_total() as u32 as i64;
-    Ok(((written as i64) << 32) | total)
+    Ok(((written as i64) << 32) | (total as u32 as i64))
 }
 
 pub(crate) fn sys_system_shutdown() -> SyscallResult {

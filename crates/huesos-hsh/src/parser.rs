@@ -6,8 +6,8 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use crate::ast::{
-    ArgExpr, CapsSpec, Chain, ChainOp, CmpOp, CommandCall, Cond, Expr, Pipeline, Redirect, Stmt,
-    WordPart,
+    ArgExpr, CapsSpec, Chain, ChainOp, CmpOp, CommandCall, Cond, ErrRedirect, Expr, Pipeline,
+    Redirect, Stmt, WordPart,
 };
 use crate::lexer::{tokenize, Keyword, QuotePart, Span, Token, TokenKind};
 
@@ -94,6 +94,10 @@ impl Parser {
         Ok(stmts)
     }
 
+    fn peek_next(&self) -> Option<&Token> {
+        self.tokens.get(self.pos + 1)
+    }
+
     fn parse_stmt(&mut self) -> Result<Stmt, ParseError> {
         let Some(tok) = self.peek() else {
             return Err(ParseError {
@@ -106,8 +110,23 @@ impl Parser {
             TokenKind::Keyword(Keyword::Alias) => self.parse_alias(),
             TokenKind::Keyword(Keyword::Fn) => self.parse_fn(),
             TokenKind::Keyword(Keyword::If) => self.parse_if(),
+            TokenKind::Keyword(Keyword::While) => self.parse_while(),
             TokenKind::Keyword(Keyword::For) => self.parse_for(),
+            TokenKind::Keyword(Keyword::Break) => {
+                self.bump();
+                Ok(Stmt::Break)
+            }
+            TokenKind::Keyword(Keyword::Continue) => {
+                self.bump();
+                Ok(Stmt::Continue)
+            }
             TokenKind::Keyword(Keyword::Return) => self.parse_return(),
+            TokenKind::Word(w)
+                if is_valid_var_ident(w)
+                    && matches!(self.peek_next().map(|t| &t.kind), Some(TokenKind::Eq)) =>
+            {
+                self.parse_assign()
+            }
             _ => Ok(Stmt::Chain(self.parse_chain()?)),
         }
     }
@@ -147,6 +166,25 @@ impl Parser {
         }
         let value = self.parse_expr()?;
         Ok(Stmt::Let { name, value })
+    }
+
+    fn parse_assign(&mut self) -> Result<Stmt, ParseError> {
+        let name = self.expect_ident_word("variable name")?;
+        let off = self.peek_offset();
+        match self.bump() {
+            Some(Token {
+                kind: TokenKind::Eq,
+                ..
+            }) => {}
+            _ => {
+                return Err(ParseError {
+                    message: String::from("expected '=' in assignment"),
+                    offset: off,
+                })
+            }
+        }
+        let value = self.parse_expr()?;
+        Ok(Stmt::Assign { name, value })
     }
 
     fn parse_alias(&mut self) -> Result<Stmt, ParseError> {
@@ -261,8 +299,78 @@ impl Parser {
         Ok(Stmt::FnDef { name, params, body })
     }
 
-    fn parse_if(&mut self) -> Result<Stmt, ParseError> {
-        self.bump(); // `if`
+    fn parse_cond(&mut self) -> Result<Cond, ParseError> {
+        let mut left = self.parse_cond_and()?;
+        while matches!(self.peek().map(|t| &t.kind), Some(TokenKind::OrOr)) {
+            self.bump();
+            self.skip_newlines();
+            let right = self.parse_cond_and()?;
+            left = Cond::Or(alloc::boxed::Box::new(left), alloc::boxed::Box::new(right));
+        }
+        Ok(left)
+    }
+
+    fn parse_cond_and(&mut self) -> Result<Cond, ParseError> {
+        let mut left = self.parse_cond_unary()?;
+        while matches!(self.peek().map(|t| &t.kind), Some(TokenKind::AndAnd)) {
+            self.bump();
+            self.skip_newlines();
+            let right = self.parse_cond_unary()?;
+            left = Cond::And(alloc::boxed::Box::new(left), alloc::boxed::Box::new(right));
+        }
+        Ok(left)
+    }
+
+    fn parse_cond_unary(&mut self) -> Result<Cond, ParseError> {
+        if matches!(self.peek().map(|t| &t.kind), Some(TokenKind::LBracket)) {
+            self.bump();
+            let mut bracket_args = Vec::new();
+            loop {
+                let off = self.peek_offset();
+                match self.peek().map(|t| &t.kind) {
+                    Some(TokenKind::RBracket) => {
+                        self.bump();
+                        break;
+                    }
+                    None | Some(TokenKind::Newline | TokenKind::LBrace) => {
+                        return Err(ParseError {
+                            message: String::from("expected ']' in condition"),
+                            offset: off,
+                        });
+                    }
+                    _ => {
+                        let tok = self.bump().ok_or(ParseError {
+                            message: String::from("unexpected EOF"),
+                            offset: off,
+                        })?;
+                        bracket_args.push(token_to_arg_expr(tok)?);
+                    }
+                }
+            }
+            return Ok(Cond::Test(bracket_args));
+        }
+        if matches!(self.peek().map(|t| &t.kind), Some(TokenKind::Bang)) {
+            self.bump();
+            let inner = self.parse_cond_unary()?;
+            return Ok(Cond::Not(alloc::boxed::Box::new(inner)));
+        }
+        if matches!(self.peek().map(|t| &t.kind), Some(TokenKind::LParen)) {
+            self.bump();
+            let inner = self.parse_cond()?;
+            let off = self.peek_offset();
+            match self.bump() {
+                Some(Token {
+                    kind: TokenKind::RParen,
+                    ..
+                }) => return Ok(inner),
+                _ => {
+                    return Err(ParseError {
+                        message: String::from("expected ')' in condition"),
+                        offset: off,
+                    })
+                }
+            }
+        }
         let left = self.parse_arg_expr()?;
         let op = match self.peek().map(|t| &t.kind) {
             Some(TokenKind::EqEq) => Some(CmpOp::Eq),
@@ -274,17 +382,22 @@ impl Parser {
             Some(TokenKind::Keyword(Keyword::Contains)) => Some(CmpOp::Contains),
             _ => None,
         };
-        let cond = if let Some(cmp) = op {
+        if let Some(cmp) = op {
             self.bump();
             let right = self.parse_arg_expr()?;
-            Cond::Compare {
+            Ok(Cond::Compare {
                 left,
                 op: cmp,
                 right,
-            }
+            })
         } else {
-            Cond::Truthy(left)
-        };
+            Ok(Cond::Truthy(left))
+        }
+    }
+
+    fn parse_if(&mut self) -> Result<Stmt, ParseError> {
+        self.bump(); // `if` or `elif`
+        let cond = self.parse_cond()?;
         let brace_off = self.peek_offset();
         match self.bump() {
             Some(Token {
@@ -301,6 +414,11 @@ impl Parser {
         let then_body = self.parse_block(true)?;
         self.skip_newlines();
         let else_body = if matches!(
+            self.peek().map(|t| &t.kind),
+            Some(TokenKind::Keyword(Keyword::Elif))
+        ) {
+            Some(vec![self.parse_if()?])
+        } else if matches!(
             self.peek().map(|t| &t.kind),
             Some(TokenKind::Keyword(Keyword::Else))
         ) {
@@ -335,6 +453,26 @@ impl Parser {
             then_body,
             else_body,
         })
+    }
+
+    fn parse_while(&mut self) -> Result<Stmt, ParseError> {
+        self.bump(); // `while`
+        let cond = self.parse_cond()?;
+        let brace_off = self.peek_offset();
+        match self.bump() {
+            Some(Token {
+                kind: TokenKind::LBrace,
+                ..
+            }) => {}
+            _ => {
+                return Err(ParseError {
+                    message: String::from("expected '{' before while body"),
+                    offset: brace_off,
+                })
+            }
+        }
+        let body = self.parse_block(true)?;
+        Ok(Stmt::While { cond, body })
     }
 
     fn parse_for(&mut self) -> Result<Stmt, ParseError> {
@@ -439,22 +577,32 @@ impl Parser {
                     if matches!(self.peek().map(|t| &t.kind), None | Some(TokenKind::RBrace)) {
                         break;
                     }
-                    // Continue parsing next statement in chain if another command follows
                     if matches!(
                         self.peek().map(|t| &t.kind),
                         Some(
                             TokenKind::Keyword(Keyword::Let)
                                 | TokenKind::Keyword(Keyword::If)
+                                | TokenKind::Keyword(Keyword::While)
                                 | TokenKind::Keyword(Keyword::For)
                                 | TokenKind::Keyword(Keyword::Fn)
                                 | TokenKind::Keyword(Keyword::Alias)
+                                | TokenKind::Keyword(Keyword::Break)
+                                | TokenKind::Keyword(Keyword::Continue)
                                 | TokenKind::Keyword(Keyword::Return)
                         )
                     ) {
-                        // Let outer `parse_block` parse the next keyword statement.
-                        // Push back? No — we already consumed `;`, so returning `Chain`
-                        // leaves the keyword token ready for `parse_block`!
                         break;
+                    }
+                    if let Some(Token {
+                        kind: TokenKind::Word(w),
+                        ..
+                    }) = self.peek()
+                    {
+                        if is_valid_var_ident(w)
+                            && matches!(self.peek_next().map(|t| &t.kind), Some(TokenKind::Eq))
+                        {
+                            break;
+                        }
                     }
                     rest.push((ChainOp::Seq, self.parse_pipeline()?));
                     continue;
@@ -479,6 +627,12 @@ impl Parser {
     }
 
     fn parse_command(&mut self) -> Result<CommandCall, ParseError> {
+        let mut negated = false;
+        while matches!(self.peek().map(|t| &t.kind), Some(TokenKind::Bang)) {
+            self.bump();
+            negated = !negated;
+        }
+
         let caps = if let Some(Token {
             kind: TokenKind::CapsAnnot(spec),
             span,
@@ -493,12 +647,31 @@ impl Parser {
             None
         };
 
-        let name = self.parse_arg_expr()?;
+        while matches!(self.peek().map(|t| &t.kind), Some(TokenKind::Bang)) {
+            self.bump();
+            negated = !negated;
+        }
+
+        let name = if matches!(self.peek().map(|t| &t.kind), Some(TokenKind::LBracket)) {
+            self.bump();
+            ArgExpr {
+                parts: vec![WordPart::Literal(String::from("["))],
+                raw_var_only: None,
+                quoted: false,
+            }
+        } else {
+            self.parse_arg_expr()?
+        };
+
         let mut args = Vec::new();
+        let mut stdin_redirect = None;
         let mut redirect = None;
+        let mut err_redirect = None;
 
         let is_where_cmd =
             name.parts.len() == 1 && matches!(&name.parts[0], WordPart::Literal(s) if s == "where");
+        let is_test_cmd = name.parts.len() == 1
+            && matches!(&name.parts[0], WordPart::Literal(s) if s == "test" || s == "[");
 
         while let Some(tok) = self.peek() {
             match &tok.kind {
@@ -515,6 +688,17 @@ impl Parser {
                     })?;
                     args.push(token_to_arg_expr(arg_tok)?);
                 }
+                TokenKind::Lt if is_where_cmd && args.len() == 1 => {
+                    let arg_tok = self.bump().ok_or(ParseError {
+                        message: String::from("unexpected EOF"),
+                        offset: 0,
+                    })?;
+                    args.push(token_to_arg_expr(arg_tok)?);
+                }
+                TokenKind::Lt if !is_test_cmd => {
+                    self.bump();
+                    stdin_redirect = Some(self.parse_arg_expr()?);
+                }
                 TokenKind::Gt | TokenKind::GtGt => {
                     let is_append = matches!(tok.kind, TokenKind::GtGt);
                     self.bump();
@@ -523,6 +707,28 @@ impl Parser {
                         Redirect::Append(target)
                     } else {
                         Redirect::Truncate(target)
+                    });
+                }
+                TokenKind::ErrToOut => {
+                    self.bump();
+                    err_redirect = Some(ErrRedirect::ToStdout);
+                }
+                TokenKind::ErrGt | TokenKind::ErrGtGt => {
+                    let is_append = matches!(tok.kind, TokenKind::ErrGtGt);
+                    self.bump();
+                    let target = self.parse_arg_expr()?;
+                    err_redirect = Some(if is_append {
+                        ErrRedirect::Append(target)
+                    } else {
+                        ErrRedirect::Truncate(target)
+                    });
+                }
+                TokenKind::RBracket if is_test_cmd => {
+                    self.bump();
+                    args.push(ArgExpr {
+                        parts: vec![WordPart::Literal(String::from("]"))],
+                        raw_var_only: None,
+                        quoted: false,
                     });
                 }
                 _ => {
@@ -537,22 +743,40 @@ impl Parser {
 
         Ok(CommandCall {
             caps,
+            negated,
             name,
             args,
+            stdin_redirect,
             redirect,
+            err_redirect,
         })
     }
+}
+
+fn is_valid_var_ident(w: &str) -> bool {
+    let mut chars = w.bytes();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !(first.is_ascii_alphabetic() || first == b'_') {
+        return false;
+    }
+    chars.all(|b| b.is_ascii_alphanumeric() || b == b'_')
 }
 
 fn keyword_str(k: Keyword) -> &'static str {
     match k {
         Keyword::Let => "let",
         Keyword::If => "if",
+        Keyword::Elif => "elif",
         Keyword::Else => "else",
+        Keyword::While => "while",
         Keyword::For => "for",
         Keyword::In => "in",
         Keyword::Fn => "fn",
         Keyword::Alias => "alias",
+        Keyword::Break => "break",
+        Keyword::Continue => "continue",
         Keyword::Return => "return",
         Keyword::Contains => "contains",
     }
@@ -564,14 +788,22 @@ fn token_to_arg_expr(tok: Token) -> Result<ArgExpr, ParseError> {
         TokenKind::Word(w) => Ok(ArgExpr {
             parts: vec![WordPart::Literal(w)],
             raw_var_only: None,
+            quoted: false,
         }),
         TokenKind::SingleQuoted(s) => Ok(ArgExpr {
             parts: vec![WordPart::Literal(s)],
             raw_var_only: None,
+            quoted: true,
         }),
         TokenKind::Var(v) => Ok(ArgExpr {
             parts: vec![WordPart::Var(v.clone())],
             raw_var_only: Some(v),
+            quoted: false,
+        }),
+        TokenKind::ArithSubst(expr) => Ok(ArgExpr {
+            parts: vec![WordPart::ArithSubst(expr)],
+            raw_var_only: None,
+            quoted: false,
         }),
         TokenKind::CmdSubst(script) => {
             let stmts = parse_script(&script).map_err(|e| ParseError {
@@ -581,6 +813,7 @@ fn token_to_arg_expr(tok: Token) -> Result<ArgExpr, ParseError> {
             Ok(ArgExpr {
                 parts: vec![WordPart::CmdSubst(stmts)],
                 raw_var_only: None,
+                quoted: false,
             })
         }
         TokenKind::DoubleQuoted(qparts) => {
@@ -589,6 +822,7 @@ fn token_to_arg_expr(tok: Token) -> Result<ArgExpr, ParseError> {
                 match qp {
                     QuotePart::Literal(s) => parts.push(WordPart::Literal(s)),
                     QuotePart::Var(v) => parts.push(WordPart::Var(v)),
+                    QuotePart::ArithSubst(expr) => parts.push(WordPart::ArithSubst(expr)),
                     QuotePart::CmdSubst(script) => {
                         let stmts = parse_script(&script).map_err(|e| ParseError {
                             message: e.message,
@@ -601,43 +835,58 @@ fn token_to_arg_expr(tok: Token) -> Result<ArgExpr, ParseError> {
             Ok(ArgExpr {
                 parts,
                 raw_var_only: None,
+                quoted: true,
             })
         }
         TokenKind::Keyword(kw) => Ok(ArgExpr {
             parts: vec![WordPart::Literal(String::from(keyword_str(kw)))],
             raw_var_only: None,
+            quoted: false,
+        }),
+        TokenKind::Bang => Ok(ArgExpr {
+            parts: vec![WordPart::Literal(String::from("!"))],
+            raw_var_only: None,
+            quoted: false,
         }),
         TokenKind::Lt => Ok(ArgExpr {
             parts: vec![WordPart::Literal(String::from("<"))],
             raw_var_only: None,
+            quoted: false,
         }),
         TokenKind::Gt => Ok(ArgExpr {
             parts: vec![WordPart::Literal(String::from(">"))],
             raw_var_only: None,
+            quoted: false,
         }),
         TokenKind::Le => Ok(ArgExpr {
             parts: vec![WordPart::Literal(String::from("<="))],
             raw_var_only: None,
+            quoted: false,
         }),
         TokenKind::Ge => Ok(ArgExpr {
             parts: vec![WordPart::Literal(String::from(">="))],
             raw_var_only: None,
+            quoted: false,
         }),
         TokenKind::EqEq => Ok(ArgExpr {
             parts: vec![WordPart::Literal(String::from("=="))],
             raw_var_only: None,
+            quoted: false,
         }),
         TokenKind::NotEq => Ok(ArgExpr {
             parts: vec![WordPart::Literal(String::from("!="))],
             raw_var_only: None,
+            quoted: false,
         }),
         TokenKind::Eq => Ok(ArgExpr {
             parts: vec![WordPart::Literal(String::from("="))],
             raw_var_only: None,
+            quoted: false,
         }),
         TokenKind::Comma => Ok(ArgExpr {
             parts: vec![WordPart::Literal(String::from(","))],
             raw_var_only: None,
+            quoted: false,
         }),
         _ => Err(ParseError {
             message: String::from("unexpected token in expression"),

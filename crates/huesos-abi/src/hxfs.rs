@@ -106,6 +106,15 @@ pub enum HxfsOp {
     /// No payload; the response `value` field carries the number of
     /// reclaimed objects.
     GcBlobs = 18,
+    /// Query metadata for an object by absolute or handle-relative path
+    /// (honoring `request_flags::NOFOLLOW_FINAL_SYMLINK` for `lstat`).
+    StatPath = 19,
+    /// Read the UTF-8 target string of a symbolic link by path.
+    ReadLink = 20,
+    /// Update POSIX mode/flags or modification timestamp on an object by path.
+    SetAttr = 21,
+    /// Query mounted filesystem space, block, and object statistics (`statvfs`).
+    StatFs = 22,
 }
 
 impl HxfsOp {
@@ -131,6 +140,10 @@ impl HxfsOp {
             16 => Some(Self::OpenBlob),
             17 => Some(Self::CreateBlob),
             18 => Some(Self::GcBlobs),
+            19 => Some(Self::StatPath),
+            20 => Some(Self::ReadLink),
+            21 => Some(Self::SetAttr),
+            22 => Some(Self::StatFs),
             _ => None,
         }
     }
@@ -245,6 +258,8 @@ pub mod request_flags {
     pub const INLINE_PAYLOAD: u32 = 1 << 2;
     /// Do not follow the final path component if it is a symlink.
     pub const NOFOLLOW_FINAL_SYMLINK: u32 = 1 << 3;
+    /// POSIX-style alias for [`NOFOLLOW_FINAL_SYMLINK`].
+    pub const O_NOFOLLOW: u32 = NOFOLLOW_FINAL_SYMLINK;
     /// Stage B.4: caller requests the O_DIRECT bypass of the
     /// page cache. The MVP denies the flag: the page cache
     /// is not yet production-grade and the kernel-side
@@ -449,6 +464,112 @@ impl HxfsResponse {
             value,
             payload_len,
             reserved1,
+        })
+    }
+}
+
+/// Encoded [`HxfsStatInfo`] payload byte size.
+pub const HXFS_STAT_INFO_BYTES: usize = 32;
+/// Encoded [`HxfsStatFsInfo`] payload byte size.
+pub const HXFS_STAT_FS_BYTES: usize = 64;
+
+/// Bit in `ObjectDescriptor::flags` indicating an explicit POSIX mode in bits `0..=11`.
+pub const HXFS_MODE_EXPLICIT_BIT: u32 = 1 << 16;
+/// Mask for POSIX permission + special mode bits (`0o7777`).
+pub const HXFS_MODE_MASK: u32 = 0o7777;
+
+/// Inline response payload for [`HxfsOp::StatPath`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HxfsStatInfo {
+    /// Stable object id.
+    pub object_id: u64,
+    /// Logical byte size (`target.len()` for symlinks, `0` for directories).
+    pub size: u64,
+    /// Modified timestamp in Unix nanoseconds.
+    pub modified_unix_ns: i64,
+    /// On-disk object type (`1` = file, `2` = dir, `3` = symlink, `4` = blob).
+    pub object_type: u32,
+    /// Effective POSIX permission mode (`0o7777` mask).
+    pub mode: u32,
+}
+
+impl HxfsStatInfo {
+    /// Encode to 32 little-endian bytes.
+    pub fn encode(self) -> [u8; HXFS_STAT_INFO_BYTES] {
+        let mut out = [0u8; HXFS_STAT_INFO_BYTES];
+        write_u64(&mut out, 0, self.object_id);
+        write_u64(&mut out, 8, self.size);
+        out[16..24].copy_from_slice(&self.modified_unix_ns.to_le_bytes());
+        write_u32(&mut out, 24, self.object_type);
+        write_u32(&mut out, 28, self.mode);
+        out
+    }
+
+    /// Decode from 32 little-endian bytes.
+    pub fn decode(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() < HXFS_STAT_INFO_BYTES {
+            return None;
+        }
+        Some(Self {
+            object_id: read_u64(bytes, 0)?,
+            size: read_u64(bytes, 8)?,
+            modified_unix_ns: i64::from_le_bytes(bytes.get(16..24)?.try_into().ok()?),
+            object_type: read_u32(bytes, 24)?,
+            mode: read_u32(bytes, 28)?,
+        })
+    }
+}
+
+/// Inline response payload for [`HxfsOp::StatFs`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HxfsStatFsInfo {
+    /// Filesystem allocation block size in bytes (`4096`).
+    pub block_size: u64,
+    /// Total 4 KiB blocks in the mounted volume or partition window.
+    pub total_blocks: u64,
+    /// Live data + metadata blocks currently committed/in-use.
+    pub used_blocks: u64,
+    /// Free + reclaimable blocks available to the volume.
+    pub avail_blocks: u64,
+    /// Maximum live objects supported by the mounted runtime (`MAX_OBJECTS`).
+    pub total_objects: u64,
+    /// Currently live objects in the mounted volume.
+    pub used_objects: u64,
+    /// Published checkpoint sequence number.
+    pub checkpoint_seq: u64,
+    /// On-disk HxFS format version (`7`).
+    pub format_version: u64,
+}
+
+impl HxfsStatFsInfo {
+    /// Encode to 64 little-endian bytes.
+    pub fn encode(self) -> [u8; HXFS_STAT_FS_BYTES] {
+        let mut out = [0u8; HXFS_STAT_FS_BYTES];
+        write_u64(&mut out, 0, self.block_size);
+        write_u64(&mut out, 8, self.total_blocks);
+        write_u64(&mut out, 16, self.used_blocks);
+        write_u64(&mut out, 24, self.avail_blocks);
+        write_u64(&mut out, 32, self.total_objects);
+        write_u64(&mut out, 40, self.used_objects);
+        write_u64(&mut out, 48, self.checkpoint_seq);
+        write_u64(&mut out, 56, self.format_version);
+        out
+    }
+
+    /// Decode from 64 little-endian bytes.
+    pub fn decode(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() < HXFS_STAT_FS_BYTES {
+            return None;
+        }
+        Some(Self {
+            block_size: read_u64(bytes, 0)?,
+            total_blocks: read_u64(bytes, 8)?,
+            used_blocks: read_u64(bytes, 16)?,
+            avail_blocks: read_u64(bytes, 24)?,
+            total_objects: read_u64(bytes, 32)?,
+            used_objects: read_u64(bytes, 40)?,
+            checkpoint_seq: read_u64(bytes, 48)?,
+            format_version: read_u64(bytes, 56)?,
         })
     }
 }
