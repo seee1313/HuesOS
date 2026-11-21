@@ -509,7 +509,10 @@ reads. Ring-3 consumers:
 - `schedctl cpus|tasks|bench` prints the records, the table and a
   two-sample rate measurement;
 - `btop` draws the same data as a frame, refreshed on a timer, parking in
-  `read_key_timeout` between frames instead of spinning.
+  `read_key_timeout` between frames instead of spinning. `btop -n <frames>`
+  draws a fixed number of frames and exits, which is what makes it scriptable:
+  a gate that has to kill the monitor cannot tell a drawn frame from an empty
+  one.
 
 The boot smoke drives all three (`[hsh] schedctl cpus OK`,
 `[hsh] schedctl tasks OK`, `[hsh] schedctl bench OK`, `[hsh] btop frame OK`),

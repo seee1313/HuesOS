@@ -1030,13 +1030,10 @@ impl InteractiveShell {
             ),
             Err(e) => println!("[hsh] schedctl bench ERROR: {e}"),
         }
-        self.host.auto_interrupts = 1;
-        // Long enough for a frame to reach the wire, short enough that the gate
-        // does not spend the whole boot budget on the monitor.
-        self.host.auto_interrupt_after_ticks = 50;
-        let frame = smoke_env.eval_script("btop -i 250", &mut self.host);
-        self.host.auto_interrupts = 0;
-        self.host.auto_interrupt_after_ticks = 0;
+        // `-n 1` draws exactly one frame and exits, so this needs no kill and
+        // the exit status alone says whether the frame was drawn. A kill-based
+        // gate could not fail: the frame and the `^C` echo look the same.
+        let frame = smoke_env.eval_script("btop -i 250 -n 1", &mut self.host);
         match frame {
             Ok(res) if res.render_text().contains("HuesOS monitor") => {
                 println!("[hsh] btop frame OK");

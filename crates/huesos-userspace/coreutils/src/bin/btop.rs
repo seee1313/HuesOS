@@ -48,6 +48,10 @@ const MAX_INTERVAL: u64 = 5_000;
 fn run() -> i32 {
     let args = cu::collect_args();
     let mut interval_ms = 1_000u64;
+    // `--frames N` draws N frames and exits. A monitor that can only be stopped
+    // by a keypress cannot be driven from a script, and a scripted run that
+    // has to kill it cannot tell "drew one frame" from "drew none".
+    let mut frames_left: Option<u32> = None;
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
@@ -61,8 +65,18 @@ fn run() -> i32 {
                     }
                 }
             }
+            "-n" | "--frames" => {
+                index += 1;
+                match args.get(index).and_then(|value| value.parse::<u32>().ok()) {
+                    Some(0) | None => {
+                        cu::errln("btop: -n needs a frame count of at least 1");
+                        return 2;
+                    }
+                    Some(value) => frames_left = Some(value),
+                }
+            }
             "-h" | "--help" => {
-                cu::outln("usage: btop [-i <milliseconds>]");
+                cu::outln("usage: btop [-i <milliseconds>] [-n <frames>]");
                 cu::outln("  q quit   space pause   r refresh   + / - interval");
                 return 0;
             }
@@ -112,8 +126,16 @@ fn run() -> i32 {
             previous = Some(current);
         }
 
-        // Park for the sampling window; a key arrives long before that only
-        // when the operator presses one.
+        // A frame budget is how a scripted run stops; otherwise park for the
+        // sampling window, where a key arrives long before it only when the
+        // operator presses one.
+        if let Some(remaining) = frames_left {
+            if remaining <= 1 {
+                break;
+            }
+            frames_left = Some(remaining - 1);
+            continue;
+        }
         let key = tui::read_key_timeout(Duration::from_millis(interval_ms));
         match key {
             Some(Key::Char(b'q')) | Some(Key::Char(b'Q')) => break,
