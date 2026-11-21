@@ -1988,8 +1988,12 @@ mod tests {
         assert_eq!(Syscall::from_raw(81), Some(Syscall::ThreadExit));
         assert_eq!(Syscall::from_raw(82), Some(Syscall::ThreadWait));
         assert_eq!(Syscall::from_raw(83), Some(Syscall::ProcessTerminate));
+        assert_eq!(Syscall::from_raw(84), Some(Syscall::FutexWait));
+        assert_eq!(Syscall::from_raw(85), Some(Syscall::FutexWake));
+        assert_eq!(Syscall::from_raw(86), Some(Syscall::SystemSchedStats));
+        assert_eq!(Syscall::from_raw(87), Some(Syscall::SystemTaskQuery));
         // Append-only: the next number past the newest syscall stays unmapped.
-        assert_eq!(Syscall::from_raw(86), None);
+        assert_eq!(Syscall::from_raw(88), None);
     }
 
     #[test]

@@ -1056,7 +1056,15 @@ impl InteractiveShell {
         //      volume. The binary prints its own `[std] FAIL` lines and only
         //      reports PASS when every check held, so the status plus the
         //      marker is the whole contract.
-        match smoke_env.eval_script("std-smoke", &mut self.host) {
+        // A smoke that never returns must fail the boot gate, not hang it: a
+        // hung QEMU is indistinguishable from a slow machine in CI, and the
+        // partial output is what localises the stall.
+        self.host.auto_interrupts = 1;
+        self.host.auto_interrupt_after_ticks = 3000;
+        let std_smoke = smoke_env.eval_script("std-smoke", &mut self.host);
+        self.host.auto_interrupts = 0;
+        self.host.auto_interrupt_after_ticks = 0;
+        match std_smoke {
             Ok(res) if res.status == 0 && res.render_text().contains("[std] PASS") => {
                 println!("[hsh] huesos-std smoke OK");
             }
