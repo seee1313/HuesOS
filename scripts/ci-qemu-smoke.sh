@@ -39,6 +39,28 @@ if [[ "$scenario" == "ecam" && "${HUESOS_PCI_FORCE_LEGACY:-}" == "1" ]]; then
     exit 2
 fi
 
+# Annotations for the PR page.
+#
+# The serial log is uploaded as an artifact, which is the right place for the
+# full transcript but a poor place to look when a job goes red: a reviewer (or
+# an agent driving the branch) sees "missing boot marker" and nothing else. The
+# GitHub workflow-command form below turns the verdict into a check annotation
+# while keeping the same text on stdout for a local run.
+annotate() {
+    printf '::%s::%s\n' "$1" "$2"
+}
+
+annotate_verdict() {
+    local verdict="$1"
+    annotate error "ci-qemu-smoke: $verdict (profile=$profile smp=$cpus scenario=$scenario)"
+    # The last lines of the serial log are what localises a stall: the smokes
+    # print one line per check, so the missing marker is almost always the line
+    # after the last one shown here.
+    while IFS= read -r line; do
+        annotate error "serial| ${line}"
+    done < <(tail -n 8 "$log" 2>/dev/null || true)
+}
+
 mkdir -p "$artifact_dir"
 log="$artifact_dir/qemu-${profile}-smp${cpus}.log"
 rm -f "$log"
@@ -86,11 +108,13 @@ set -e
 # A healthy OS intentionally keeps running, so timeout(1)'s 124 is expected.
 if [[ "$status" != 0 && "$status" != 124 ]]; then
     echo "QEMU exited unexpectedly with status $status" >&2
+    annotate_verdict "QEMU exited unexpectedly with status $status"
     tail -200 "$log" >&2 || true
     exit 1
 fi
 if grep -q 'KERNEL PANIC' "$log"; then
     echo "kernel panic detected" >&2
+    annotate_verdict "kernel panic detected"
     tail -200 "$log" >&2
     exit 1
 fi
@@ -217,6 +241,7 @@ fi
 for marker in "${required[@]}"; do
     if ! grep -Fq "$marker" "$log"; then
         echo "missing boot marker: $marker" >&2
+        annotate_verdict "missing boot marker: $marker"
         tail -200 "$log" >&2
         exit 1
     fi
@@ -299,6 +324,7 @@ esac
 for regression in "${regressions[@]}"; do
     if grep -Fq "$regression" "$log"; then
         echo "regression marker present: $regression" >&2
+        annotate_verdict "regression marker present: $regression"
         tail -200 "$log" >&2
         exit 1
     fi
