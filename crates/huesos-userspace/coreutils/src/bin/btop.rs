@@ -38,7 +38,7 @@ use huesos_std::tui::{self, Color, Key};
 cu::coreutil_entry!(run);
 
 /// Width of every pane, in columns.
-const WIDTH: usize = 78;
+const WIDTH: usize = 84;
 /// Width of a CPU bar.
 const BAR: usize = 36;
 /// Fastest and slowest sampling windows, in milliseconds.
@@ -93,9 +93,9 @@ fn run() -> i32 {
     let _ = screen.hide_cursor();
 
     let mut paused = false;
-    let mut previous: Option<Snapshot> = None;
+    let mut previous: Option<(Snapshot, Instant)> = None;
     loop {
-        let started = Instant::now();
+        let now = Instant::now();
         let current = match sys::snapshot() {
             Ok(snapshot) => snapshot,
             Err(error) => {
@@ -105,9 +105,11 @@ fn run() -> i32 {
             }
         };
         let task_records = sys::tasks().unwrap_or_default();
-        let elapsed = started.elapsed().as_micros().max(1) as u64;
         let rates = match &previous {
-            Some(previous) => Rates::between(previous, &current, elapsed),
+            Some((prev_snap, prev_at)) => {
+                let elapsed = prev_at.elapsed().as_micros().max(1) as u64;
+                Rates::between(prev_snap, &current, elapsed)
+            }
             None => Rates::default(),
         };
 
@@ -123,7 +125,7 @@ fn run() -> i32 {
         let _ = screen.out().flush();
 
         if !paused {
-            previous = Some(current);
+            previous = Some((current, now));
         }
 
         // A frame budget is how a scripted run stops; otherwise park for the

@@ -167,20 +167,66 @@ pub fn percent_bar(used: u64, total: u64, width: usize) -> String {
     format!("{} {percent:>3}%", bar(used, total, width))
 }
 
-/// Truncate `text` to `width` characters, or pad it with spaces.
+/// Visible column width of `text`, ignoring ANSI CSI escape sequences (`\x1b[...X`).
+pub fn visible_width(text: &str) -> usize {
+    let mut width = 0usize;
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\x1b' {
+            if chars.peek() == Some(&'[') {
+                let _ = chars.next();
+                for c in chars.by_ref() {
+                    if ('@'..='~').contains(&c) {
+                        break;
+                    }
+                }
+            }
+            continue;
+        }
+        width += 1;
+    }
+    width
+}
+
+/// Truncate `text` to `width` visible columns, or pad it with spaces.
 ///
-/// Column layout in a terminal needs both directions, and doing it in one
-/// function keeps every table in the programs here aligned by construction.
+/// Preserves embedded SGR escape sequences (`\x1b[...m`) without counting their
+/// control bytes against `width`, so colored cells inside [`frame_line`] keep
+/// the right border aligned.
 pub fn fit(text: &str, width: usize) -> String {
     let mut out = String::new();
-    for (index, ch) in text.chars().enumerate() {
-        if index >= width {
+    let mut seen = 0usize;
+    let mut had_escape = false;
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\x1b' {
+            had_escape = true;
+            out.push(ch);
+            if chars.peek() == Some(&'[') {
+                if let Some(bracket) = chars.next() {
+                    out.push(bracket);
+                }
+                for c in chars.by_ref() {
+                    out.push(c);
+                    if ('@'..='~').contains(&c) {
+                        break;
+                    }
+                }
+            }
+            continue;
+        }
+        if seen >= width {
             break;
         }
         out.push(ch);
+        seen += 1;
     }
-    while out.chars().count() < width {
+    if had_escape && !out.ends_with("\x1b[0m") {
+        out.push_str("\x1b[0m");
+    }
+    while seen < width {
         out.push(' ');
+        seen += 1;
     }
     out
 }
@@ -444,14 +490,17 @@ pub fn read_key<R: Read>(input: &mut R) -> Option<Key> {
 
 /// Read one keystroke, waiting at most `timeout`.
 ///
-/// `None` means either end of input or nothing arrived in time: a monitor
-/// cannot tell the two apart, and both mean "redraw and ask again". Programs
-/// that must notice a closed console use [`read_key`] instead.
+/// `None` means nothing arrived before `timeout`. When `stdin` is already at
+/// end of input (`Ok(0)` / closed pipe), park for `timeout` via [`crate::thread::sleep`]
+/// so a full-screen monitor run non-interactively never busy-spins at 100% CPU.
 pub fn read_key_timeout(timeout: crate::time::Duration) -> Option<Key> {
     let mut stdin = io::stdin();
     let mut byte = [0u8; 1];
     match stdin.read_timeout(&mut byte, timeout) {
-        Ok(0) => None,
+        Ok(0) => {
+            crate::thread::sleep(timeout);
+            None
+        }
         Ok(_) => Some(decode_key(&mut stdin, byte[0])),
         Err(_) => None,
     }
@@ -527,12 +576,11 @@ pub fn prompt<W: Write, R: Read>(out: &mut W, input: &mut R, label: &str) -> Opt
                 let _ = out.flush();
                 return Some(line);
             }
-            Key::Backspace => {
-                line.pop();
+            Key::Backspace if line.pop().is_some() => {
                 let _ = io::write_all(out, b"\x08 \x08");
                 let _ = out.flush();
             }
-            Key::Ctrl(3) | Key::Ctrl(7) => return None,
+            Key::Escape | Key::Ctrl(3) | Key::Ctrl(7) => return None,
             Key::Char(byte) => {
                 line.push(char::from(byte));
                 let _ = io::write_all(out, &[byte]);

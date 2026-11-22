@@ -589,7 +589,10 @@ fn finish_dynamic_launch(
         None => None,
     };
     let stdin_dup = match caps.stdin {
-        Some(ch) => Some(ch.handle().duplicate(rights::READ | rights::TRANSFER)?),
+        Some(ch) => Some(
+            ch.handle()
+                .duplicate(rights::READ | rights::TRANSFER | rights::DUPLICATE)?,
+        ),
         None => None,
     };
     let stdout_dup = match caps.stdout {
