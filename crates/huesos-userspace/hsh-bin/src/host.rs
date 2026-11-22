@@ -949,7 +949,15 @@ impl HshHost {
             }
         };
         drop(child_bootstrap);
-        let pid = u64::from(process.handle().raw());
+        let pid = match process.koid() {
+            Ok(koid) => koid,
+            Err(error) => {
+                return ExecOutcome::err(
+                    1,
+                    format!("could not read child process KOID: {}", error.as_str()),
+                );
+            }
+        };
         let short_name = resolved.rsplit('/').next().unwrap_or(&resolved);
         let active_label = format!("{short_name} [{pid}]");
         if self.status_hook.is_some() && self.ipc_out.is_some() {

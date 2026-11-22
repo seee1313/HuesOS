@@ -613,7 +613,33 @@ pub enum Syscall {
     /// The index space is the kernel's enumeration order, which is stable
     /// within a snapshot but may shift when a task is reaped.
     SystemTaskQuery = 87,
+    /// Read the kernel object id ([`Koid`]-backed identity) of a handle:
+    /// `a1` is the handle, `a2` points to an output `u64`. Returns zero,
+    /// [`ErrorCode::BadHandle`] for an invalid handle, or
+    /// [`ErrorCode::InvalidArgs`] for an invalid output pointer.
+    ///
+    /// Unprivileged and side-effect free: a koid is the same opaque,
+    /// generation-tagged number the kernel uses in the task table, the
+    /// graveyard, and process objects, which makes it the only honest
+    /// cross-subsystem identity an unprivileged monitor can print. It
+    /// carries no authority by itself — acting on a koid still requires a
+    /// capability handle with the matching rights.
+    HandleGetKoid = 88,
+    /// Set a process affinity mask across the complete 256-CPU namespace.
+    /// `a1` points to [`ProcessSetAffinityMask256Args`].
+    ProcessSetAffinityMask256 = 89,
+    /// Read a process's complete 256-CPU affinity mask.
+    /// `a1` points to [`ProcessGetAffinityMask256Args`].
+    ProcessGetAffinityMask256 = 90,
 }
+
+/// Number of scheduler Task slots encoded in the low bits of a Task ID.
+pub const MAX_TASK_SLOTS: usize = 8192;
+/// Low Task ID bits contain the generation-safe slot index; the remaining
+/// high bits contain its non-zero generation.
+pub const TASK_ID_SLOT_BITS: u32 = MAX_TASK_SLOTS.trailing_zeros();
+/// Mask selecting the slot portion of a stable scheduler Task ID.
+pub const TASK_ID_SLOT_MASK: u64 = (1u64 << TASK_ID_SLOT_BITS) - 1;
 
 /// Maximum number of bytes one [`Syscall::SystemGetEntropy`] call
 /// will produce. Callers needing more must loop; the cap bounds the
@@ -766,7 +792,7 @@ pub struct TaskRecord {
     pub policy: u8,
     /// Bits 0-3: scheduler flags; reserved, always zero today.
     pub flags: u8,
-    /// Reserved for future accounting; always zero.
+    /// Owning `Process` KOID for userspace tasks; `0` for kernel tasks.
     pub reserved: u64,
 }
 
@@ -787,6 +813,16 @@ impl Default for TaskRecord {
 }
 
 impl TaskRecord {
+    /// Decode the stable scheduler slot from this Task ID.
+    pub const fn task_slot(&self) -> usize {
+        (self.task_id & TASK_ID_SLOT_MASK) as usize
+    }
+
+    /// Decode the full non-zero generation from this Task ID.
+    pub const fn task_generation(&self) -> u64 {
+        self.task_id >> TASK_ID_SLOT_BITS
+    }
+
     /// Decode one task record from a [`Syscall::SystemTaskQuery`] page.
     pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
         Some(Self {
@@ -828,6 +864,11 @@ impl TaskRecord {
             0 => "fair",
             _ => "deadline",
         }
+    }
+
+    /// Owning `Process` KOID for userspace tasks (`0` for kernel tasks).
+    pub const fn process_koid(&self) -> u64 {
+        self.reserved
     }
 }
 
@@ -892,7 +933,7 @@ impl Syscall {
     /// Total number of defined syscalls (i.e. one past the highest
     /// currently-assigned number). The dispatcher uses this to reject
     /// obviously-out-of-range numbers before a `match`.
-    pub const COUNT: u64 = 88;
+    pub const COUNT: u64 = 91;
 
     /// Convert a raw syscall number back into a [`Syscall`], if valid.
     pub const fn from_raw(n: u64) -> Option<Self> {
@@ -985,6 +1026,9 @@ impl Syscall {
             85 => Self::FutexWake,
             86 => Self::SystemSchedStats,
             87 => Self::SystemTaskQuery,
+            88 => Self::HandleGetKoid,
+            89 => Self::ProcessSetAffinityMask256,
+            90 => Self::ProcessGetAffinityMask256,
             _ => return None,
         })
     }
@@ -1663,6 +1707,84 @@ pub struct JobBindQuotaPortArgs {
     pub flags: u32,
 }
 
+/// Number of dense logical CPU indexes represented by the v2 affinity ABI.
+pub const MAX_LOGICAL_CPUS: usize = 256;
+/// Number of 64-bit words in [`CpuMask256`].
+pub const CPU_MASK256_WORDS: usize = MAX_LOGICAL_CPUS / u64::BITS as usize;
+
+/// A dense 256-bit CPU mask. Bit `n` names scheduler CPU index `n`, never an
+/// APIC ID. The words are little-indexed: word zero contains CPUs 0 through 63.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct CpuMask256 {
+    /// Four 64-bit words covering dense CPU indexes `0..256`.
+    pub words: [u64; CPU_MASK256_WORDS],
+}
+
+impl CpuMask256 {
+    /// Empty mask.
+    pub const fn empty() -> Self {
+        Self {
+            words: [0; CPU_MASK256_WORDS],
+        }
+    }
+
+    /// Whether `cpu` is selected.
+    pub const fn contains(&self, cpu: usize) -> bool {
+        cpu < MAX_LOGICAL_CPUS && self.words[cpu / 64] & (1u64 << (cpu % 64)) != 0
+    }
+
+    /// Whether no CPU is selected.
+    pub const fn is_empty(&self) -> bool {
+        let mut index = 0;
+        while index < CPU_MASK256_WORDS {
+            if self.words[index] != 0 {
+                return false;
+            }
+            index += 1;
+        }
+        true
+    }
+
+    /// Build a one-CPU mask, or `None` for an out-of-range index.
+    pub const fn one(cpu: usize) -> Option<Self> {
+        if cpu >= MAX_LOGICAL_CPUS {
+            return None;
+        }
+        let mut mask = Self::empty();
+        mask.words[cpu / 64] = 1u64 << (cpu % 64);
+        Some(mask)
+    }
+}
+
+/// Set a process affinity mask before its first thread starts.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ProcessSetAffinityMask256Args {
+    /// Process handle with WRITE rights.
+    pub process: HandleValue,
+    /// Dense CPU index that receives the initial thread.
+    pub home_cpu: u32,
+    /// Reserved for future policy flags; must be zero.
+    pub flags: u32,
+    /// CPUs that may run the process.
+    pub mask: CpuMask256,
+}
+
+/// Read a process's complete affinity mask and home CPU.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ProcessGetAffinityMask256Args {
+    /// Process handle with READ rights.
+    pub process: HandleValue,
+    /// Reserved; must be zero.
+    pub reserved: u32,
+    /// Output pointer to a [`CpuMask256`].
+    pub out_mask: *mut CpuMask256,
+    /// Output pointer to a dense CPU index.
+    pub out_home_cpu: *mut u32,
+}
+
 /// Arguments for [`Syscall::ProcessCreateInJob`].
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -1794,9 +1916,9 @@ pub struct ResourceUnmapArgs {
 #[cfg(test)]
 mod tests {
     use super::{
-        hbi_boot, rights, vmar_flags, ErrorCode, InterruptEventKey, InterruptEventKind, KnobIdAbi,
-        ResourceKindAbi, ResourceMapArgs, ResourceUnmapArgs, Syscall, MAX_OBSERVATION_BYTES,
-        OBSERVATION_RECORD_SIZE,
+        hbi_boot, rights, vmar_flags, CpuMask256, ErrorCode, InterruptEventKey, InterruptEventKind,
+        KnobIdAbi, ResourceKindAbi, ResourceMapArgs, ResourceUnmapArgs, Syscall, TaskRecord,
+        MAX_OBSERVATION_BYTES, MAX_TASK_SLOTS, OBSERVATION_RECORD_SIZE, TASK_ID_SLOT_BITS,
     };
 
     #[test]
@@ -1900,7 +2022,11 @@ mod tests {
         assert_eq!(Syscall::ResourceUnmap as u64, 65);
         assert_eq!(Syscall::InterruptCreateGsiForResource as u64, 66);
         assert_eq!(Syscall::InterruptAcknowledge as u64, 67);
-        assert_eq!(Syscall::COUNT, 88);
+        assert_eq!(Syscall::COUNT, 91);
+        assert_eq!(Syscall::SystemTaskQuery as u64, 87);
+        assert_eq!(Syscall::HandleGetKoid as u64, 88);
+        assert_eq!(Syscall::ProcessSetAffinityMask256 as u64, 89);
+        assert_eq!(Syscall::ProcessGetAffinityMask256 as u64, 90);
         assert_eq!(Syscall::ProcessTerminate as u64, 83);
         assert_eq!(Syscall::FutexWait as u64, 84);
         assert_eq!(Syscall::FutexWake as u64, 85);
@@ -1917,7 +2043,20 @@ mod tests {
             Some(Syscall::SystemTaskQuery),
             "the task table sits right after the snapshot"
         );
-        assert_eq!(Syscall::from_raw(88), None);
+        assert_eq!(
+            Syscall::from_raw(88),
+            Some(Syscall::HandleGetKoid),
+            "the handle koid reader follows task query"
+        );
+        assert_eq!(
+            Syscall::from_raw(89),
+            Some(Syscall::ProcessSetAffinityMask256)
+        );
+        assert_eq!(
+            Syscall::from_raw(90),
+            Some(Syscall::ProcessGetAffinityMask256)
+        );
+        assert_eq!(Syscall::from_raw(91), None);
         assert_eq!(Syscall::from_raw(28), Some(Syscall::VmoCreateEx));
         assert_eq!(Syscall::from_raw(30), Some(Syscall::VmarProtect));
         assert_eq!(Syscall::from_raw(31), Some(Syscall::ChannelPeek));
@@ -1992,8 +2131,47 @@ mod tests {
         assert_eq!(Syscall::from_raw(85), Some(Syscall::FutexWake));
         assert_eq!(Syscall::from_raw(86), Some(Syscall::SystemSchedStats));
         assert_eq!(Syscall::from_raw(87), Some(Syscall::SystemTaskQuery));
+        assert_eq!(Syscall::from_raw(88), Some(Syscall::HandleGetKoid));
+        assert_eq!(
+            Syscall::from_raw(89),
+            Some(Syscall::ProcessSetAffinityMask256)
+        );
+        assert_eq!(
+            Syscall::from_raw(90),
+            Some(Syscall::ProcessGetAffinityMask256)
+        );
         // Append-only: the next number past the newest syscall stays unmapped.
-        assert_eq!(Syscall::from_raw(88), None);
+        assert_eq!(Syscall::from_raw(91), None);
+    }
+
+    #[test]
+    fn cpu_mask_256_covers_four_words_and_boundary_indexes() {
+        let mut mask = CpuMask256::empty();
+        for cpu in [0, 63, 64, 127, 128, 191, 192, 255] {
+            let one = CpuMask256::one(cpu).expect("valid CPU index");
+            assert!(one.contains(cpu));
+            mask.words[cpu / 64] |= one.words[cpu / 64];
+        }
+        assert_eq!(
+            mask.words,
+            [1 | (1 << 63), 1 | (1 << 63), 1 | (1 << 63), 1 | (1 << 63)]
+        );
+        assert!(!mask.contains(256));
+        assert!(CpuMask256::one(256).is_none());
+        assert!(!mask.is_empty());
+        assert!(CpuMask256::empty().is_empty());
+    }
+
+    #[test]
+    fn task_record_decodes_full_generation_safe_identity() {
+        let task_id = (7u64 << TASK_ID_SLOT_BITS) | 4095;
+        let record = TaskRecord {
+            task_id,
+            ..TaskRecord::default()
+        };
+        assert_eq!(record.task_slot(), 4095);
+        assert_eq!(record.task_generation(), 7);
+        assert_eq!(MAX_TASK_SLOTS, 8192);
     }
 
     #[test]

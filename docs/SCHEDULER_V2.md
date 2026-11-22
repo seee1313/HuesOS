@@ -498,9 +498,18 @@ records rather than a truncated one; the caller sizes it from
 
 `SystemTaskQuery` pages the task table in CPU-then-slot order, skipping reaped
 slots. A `TaskRecord` carries `task_id`, `name` (16 bytes), `cpu`, `weight`,
-`kind` (kernel/user), `state` (running/ready/blocked/finished) and `policy`
-(fair/deadline). The total in the low 32 bits lets a caller tell "the table
-grew while I read it" from "this is all of it".
+`kind` (kernel/user), `state` (running/ready/blocked/finished), `policy`
+(fair/deadline), and the owning Process KOID in the legacy `reserved` field
+(zero for kernel Tasks). Task IDs keep the 8192-slot index in the low 13 bits
+and the complete generation in the remaining high bits; KOIDs are opaque
+identity only and never substitute for a capability handle. The total in the
+low 32 bits lets a caller tell "the table grew while I read it" from "this is
+all of it".
+
+The syscall ABI appends `HandleGetKoid` at 88 and 256-CPU process-affinity
+set/get calls at 89/90. Affinity masks are four little-indexed `u64` words
+indexed by dense logical CPU number, independent of sparse APIC IDs. The legacy
+single-word affinity calls remain limited to CPUs 0–63.
 
 Both are read-only snapshots taken under each CPU's scheduler lock, so
 `(runnable, current_task)` is a consistent pair rather than two unrelated

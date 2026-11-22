@@ -66,9 +66,9 @@ pub struct Process {
     pub address_space: IrqSafeMutex<Option<Box<dyn Any + Send + Sync>>>,
     /// Dense CPU index new threads are pinned to by default.
     home_cpu: AtomicUsize,
-    /// CPU affinity mask. New threads must start on `home_cpu`, and future
-    /// explicit migration requests must stay within this mask.
-    affinity_mask: AtomicU64,
+    /// 256-bit dense CPU affinity mask. New threads start on `home_cpu`, and
+    /// future explicit migration requests must stay within this mask.
+    affinity_mask: [AtomicU64; huesos_abi::CPU_MASK256_WORDS],
     /// Scheduler feature flags (see `huesos_abi::scheduler_flags`).
     scheduler_flags: core::sync::atomic::AtomicU32,
     /// Initial-thread start reservation. Prevents two different Thread objects
@@ -103,6 +103,11 @@ impl Process {
     /// Create a process attached to an explicit Job.
     pub fn new_in_job(name: &str, job: Arc<Job>) -> Arc<Self> {
         let koid = alloc_koid();
+        let home_cpu = crate::registry::current_cpu();
+        let mut affinity_mask = [const { AtomicU64::new(0) }; huesos_abi::CPU_MASK256_WORDS];
+        if home_cpu < huesos_abi::MAX_LOGICAL_CPUS {
+            affinity_mask[home_cpu / 64] = AtomicU64::new(1u64 << (home_cpu % 64));
+        }
         Arc::new(Self {
             koid,
             name: IrqSafeMutex::new(String::from(name)),
@@ -114,8 +119,8 @@ impl Process {
             exit_ports: IrqSafeMutex::new(Vec::new()),
             user_memory_lock: IrqSafeMutex::new(()),
             address_space: IrqSafeMutex::new(None),
-            home_cpu: AtomicUsize::new(crate::registry::current_cpu()),
-            affinity_mask: AtomicU64::new(1u64 << crate::registry::current_cpu()),
+            home_cpu: AtomicUsize::new(home_cpu),
+            affinity_mask,
             scheduler_flags: core::sync::atomic::AtomicU32::new(0),
             start_reserved: AtomicBool::new(false),
             active_threads: AtomicUsize::new(0),
@@ -175,37 +180,68 @@ impl Process {
 
     /// Dense CPU index this process's initial thread is pinned to by default.
     pub fn home_cpu(&self) -> usize {
-        self.home_cpu.load(Ordering::Acquire)
+        self.affinity_snapshot().1
     }
 
-    /// CPU affinity mask for this process.
+    /// Low 64 bits of the process affinity mask for legacy callers.
     pub fn affinity_mask(&self) -> u64 {
-        self.affinity_mask.load(Ordering::Acquire)
+        self.affinity_snapshot().0[0]
     }
 
-    /// Set the default CPU affinity mask for this process before its first
-    /// thread starts. Returns false once a thread is running/reserved, when the
-    /// mask is empty, or when `home_cpu` is outside the mask.
+    /// Complete dense 256-bit process affinity mask.
+    pub fn affinity_mask_words(&self) -> [u64; huesos_abi::CPU_MASK256_WORDS] {
+        self.affinity_snapshot().0
+    }
+
+    /// Take a coherent affinity-mask/home-CPU snapshot.
+    pub fn affinity_snapshot(&self) -> ([u64; huesos_abi::CPU_MASK256_WORDS], usize) {
+        let _lifecycle = self.lifecycle.lock();
+        let mut words = [0; huesos_abi::CPU_MASK256_WORDS];
+        for (word, atomic) in words.iter_mut().zip(self.affinity_mask.iter()) {
+            *word = atomic.load(Ordering::Acquire);
+        }
+        (words, self.home_cpu.load(Ordering::Acquire))
+    }
+
+    /// Set the default low-64 affinity mask for legacy ABI callers before its
+    /// first thread starts. CPUs outside the mask are cleared.
     pub fn set_affinity_mask(&self, mask: u64, home_cpu: usize) -> bool {
-        if mask == 0 || home_cpu >= 64 || (mask & (1u64 << home_cpu)) == 0 {
+        let mut words = [0; huesos_abi::CPU_MASK256_WORDS];
+        words[0] = mask;
+        self.set_affinity_mask_words(words, home_cpu)
+    }
+
+    /// Set the complete 256-bit CPU affinity mask before the first thread
+    /// starts. Returns false once a thread is running/reserved, when the mask
+    /// is empty, or when `home_cpu` is outside the mask.
+    pub fn set_affinity_mask_words(
+        &self,
+        words: [u64; huesos_abi::CPU_MASK256_WORDS],
+        home_cpu: usize,
+    ) -> bool {
+        if home_cpu >= huesos_abi::MAX_LOGICAL_CPUS
+            || words.iter().all(|word| *word == 0)
+            || words[home_cpu / 64] & (1u64 << (home_cpu % 64)) == 0
+        {
             return false;
         }
         let lifecycle = self.lifecycle.lock();
         if lifecycle.state() != ProcState::Created || self.start_reserved.load(Ordering::Acquire) {
             return false;
         }
-        drop(lifecycle);
-        self.affinity_mask.store(mask, Ordering::Release);
+        for (atomic, word) in self.affinity_mask.iter().zip(words) {
+            atomic.store(word, Ordering::Release);
+        }
         self.home_cpu.store(home_cpu, Ordering::Release);
         true
     }
 
-    /// Set single-CPU affinity for this process before its first thread starts.
+    /// Set single-CPU affinity before this process's first thread starts.
     pub fn set_home_cpu(&self, cpu: usize) -> bool {
-        if cpu >= 64 {
+        let Some(mask) = huesos_abi::CpuMask256::one(cpu) else {
             return false;
-        }
-        self.set_affinity_mask(1u64 << cpu, cpu)
+        };
+        self.set_affinity_mask_words(mask.words, cpu)
     }
 
     /// Set scheduler flags before the initial thread starts.

@@ -6,8 +6,9 @@ use crate::port::Port;
 use crate::raw;
 use crate::vmo::Vmo;
 use huesos_abi::{
-    HandleValue, ProcessBindExitPortArgs, Syscall, ThreadStartArgs, VmarCreateChildArgs,
-    VmarMapArgs, VmarOpArgs, BOOTSTRAP_HANDLE, INVALID_HANDLE,
+    CpuMask256, HandleValue, ProcessBindExitPortArgs, ProcessGetAffinityMask256Args,
+    ProcessSetAffinityMask256Args, Syscall, ThreadStartArgs, VmarCreateChildArgs, VmarMapArgs,
+    VmarOpArgs, BOOTSTRAP_HANDLE, INVALID_HANDLE,
 };
 
 /// Initial bootstrap channel handle number installed in a newly-started
@@ -126,9 +127,46 @@ impl Process {
 
     /// Set the process's single-CPU affinity before its initial thread starts.
     pub fn set_affinity(&self, cpu: usize) -> crate::Result<()> {
-        let ret = raw::syscall2(Syscall::ProcessSetAffinity, self.0.raw() as u64, cpu as u64);
+        let mask = CpuMask256::one(cpu).ok_or(crate::ErrorCode::InvalidArgs)?;
+        self.set_affinity_mask_256(mask, cpu)
+    }
+
+    /// Set the complete 256-CPU affinity mask before the initial thread starts.
+    /// The selected home CPU must be present in `mask` and online.
+    pub fn set_affinity_mask_256(
+        &self,
+        mask: CpuMask256,
+        home_cpu: usize,
+    ) -> crate::Result<()> {
+        let args = ProcessSetAffinityMask256Args {
+            process: self.0.raw(),
+            home_cpu: u32::try_from(home_cpu).map_err(|_| crate::ErrorCode::InvalidArgs)?,
+            flags: 0,
+            mask,
+        };
+        let ret = raw::syscall1(
+            Syscall::ProcessSetAffinityMask256,
+            &args as *const ProcessSetAffinityMask256Args as u64,
+        );
+        raw::decode(ret).map(|_| ())
+    }
+
+    /// Read the complete 256-CPU affinity mask and home CPU.
+    pub fn affinity_mask_256(&self) -> crate::Result<(CpuMask256, usize)> {
+        let mut mask = CpuMask256::empty();
+        let mut home_cpu = 0u32;
+        let args = ProcessGetAffinityMask256Args {
+            process: self.0.raw(),
+            reserved: 0,
+            out_mask: &mut mask,
+            out_home_cpu: &mut home_cpu,
+        };
+        let ret = raw::syscall1(
+            Syscall::ProcessGetAffinityMask256,
+            &args as *const ProcessGetAffinityMask256Args as u64,
+        );
         raw::decode(ret)?;
-        Ok(())
+        Ok((mask, home_cpu as usize))
     }
 
     /// Set the process's CPU affinity mask and home CPU before its initial
@@ -176,6 +214,12 @@ impl Process {
         raw::decode(ret)?;
         // SAFETY: the kernel just installed an owned process handle in `handle`.
         Ok(Self(unsafe { Handle::from_raw(handle) }))
+    }
+
+    /// The process's stable kernel object ID. This is printable identity, not
+    /// authority; operations still require this capability handle and rights.
+    pub fn koid(&self) -> crate::Result<u64> {
+        self.0.koid()
     }
 
     /// Borrow the underlying process handle.

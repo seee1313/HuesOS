@@ -580,8 +580,12 @@ pub mod task_operations {
     pub const POLICY: u64 = 1 << 3;
     pub const THROTTLE: u64 = 1 << 4;
     pub const MIGRATION: u64 = 1 << 5;
+    /// Deferred remote task insertion (`Embryo -> DeferredReady -> Ready` on target CPU).
+    pub const SPAWN: u64 = 1 << 6;
+    /// Owner-local slot and stack reclamation after `Dying -> Dead`.
+    pub const REAP: u64 = 1 << 7;
     /// Public flags must fit below the complete 51-bit generation tag.
-    pub const ALL: u64 = WAKE | KILL | AFFINITY | POLICY | THROTTLE | MIGRATION;
+    pub const ALL: u64 = WAKE | KILL | AFFINITY | POLICY | THROTTLE | MIGRATION | SPAWN | REAP;
     const _: () = assert!(ALL <= super::TASK_INDEX_MASK);
 }
 
@@ -1254,7 +1258,8 @@ impl<const N: usize> Default for EevdfModel<N> {
     }
 }
 
-fn virtual_delta(runtime_ns: u64, weight: u64) -> Result<u128, EevdfError> {
+/// Scale `runtime_ns` into virtual time against `weight` (`NICE_0_WEIGHT = 1024`).
+pub fn virtual_delta(runtime_ns: u64, weight: u64) -> Result<u128, EevdfError> {
     if weight == 0 {
         return Err(EevdfError::InvalidWeight);
     }

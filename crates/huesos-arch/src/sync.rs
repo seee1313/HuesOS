@@ -19,7 +19,7 @@ use huesos_sync::RankTracker;
 pub use huesos_sync::{LockRank, LockRankError};
 
 /// Number of hardware-thread rank trackers. This matches `cpu_local::MAX_CPUS`.
-const MAX_RANK_TRACKERS: usize = 64;
+const MAX_RANK_TRACKERS: usize = crate::cpu_local::MAX_CPUS;
 
 struct RankTrackerSlot(UnsafeCell<RankTracker>);
 

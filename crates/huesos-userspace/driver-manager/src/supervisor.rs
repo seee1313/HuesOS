@@ -2412,13 +2412,16 @@ impl DriverManager {
     fn reply_query_ps_on(&self, registry: &Channel) {
         use core::fmt::Write;
         let mut out = QueryBuf::<2048>::new();
-        let _ = writeln!(out, "handle\tname\tstate\tgen\trestarts");
-        let _ = writeln!(out, "self\tdriver-manager\tonline\t1\t0");
+        let _ = writeln!(out, "koid\tname\tstate\tgen\trestarts");
+        let self_koid = Process::current()
+            .and_then(|process| process.koid())
+            .map_or(0, |koid| koid);
+        let _ = writeln!(out, "{:#x}\tdriver-manager\tonline\t1\t0", self_koid);
         if let Some(h) = self.input_host.as_ref() {
             let _ = writeln!(
                 out,
-                "{}\tdriver-host-input\t{}\t1\t0",
-                h.process.handle().raw(),
+                "{:#x}\tdriver-host-input\t{}\t1\t0",
+                h.process.koid().map_or(0, |koid| koid),
                 if self.keyboard_ready() {
                     "online"
                 } else {
@@ -2429,8 +2432,8 @@ impl DriverManager {
         if let Some(h) = self.nvme_host.as_ref() {
             let _ = writeln!(
                 out,
-                "{}\tdriver-host-nvme\t{}\t1\t0",
-                h.process.handle().raw(),
+                "{:#x}\tdriver-host-nvme\t{}\t1\t0",
+                h.process.koid().map_or(0, |koid| koid),
                 if self.registry.state("block:nvme") == Some(ServiceState::Online) {
                     "online"
                 } else {
@@ -2441,8 +2444,8 @@ impl DriverManager {
         if let Some(h) = self.hxfs_service.as_ref() {
             let _ = writeln!(
                 out,
-                "{}\thxfs-service\t{}\t{}\t0",
-                h.process.handle().raw(),
+                "{:#x}\thxfs-service\t{}\t{}\t0",
+                h.process.koid().map_or(0, |koid| koid),
                 if self.hxfs_ready {
                     "online"
                 } else if self.hxfs_failed {
@@ -2456,8 +2459,8 @@ impl DriverManager {
         if let Some(h) = self.acpi_manager.as_ref() {
             let _ = writeln!(
                 out,
-                "{}\tacpi-manager\t{}\t{}\t{}",
-                h.process.handle().raw(),
+                "{:#x}\tacpi-manager\t{}\t{}\t{}",
+                h.process.koid().map_or(0, |koid| koid),
                 if self.acpi_manager_ready {
                     "online"
                 } else {
@@ -2470,8 +2473,8 @@ impl DriverManager {
         if let Some(h) = self.pci_manager.as_ref() {
             let _ = writeln!(
                 out,
-                "{}\tpci-manager\t{}\t{}\t{}",
-                h.process.handle().raw(),
+                "{:#x}\tpci-manager\t{}\t{}\t{}",
+                h.process.koid().map_or(0, |koid| koid),
                 if self.pci_manager_ready {
                     "online"
                 } else {

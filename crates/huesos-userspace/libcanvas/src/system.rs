@@ -156,9 +156,9 @@ pub fn observation_read(after_sequence: u64, out: &mut [u8]) -> crate::Result<us
 }
 
 /// Largest snapshot the kernel can produce: the summary plus one record per
-/// possible CPU. Sized from the ABI so a bigger machine needs no edit here.
+/// possible dense CPU index.
 const MAX_SNAPSHOT_BYTES: usize = core::mem::size_of::<huesos_abi::SchedSummary>()
-    + 64 * core::mem::size_of::<huesos_abi::SchedCpuRecord>();
+    + huesos_abi::MAX_LOGICAL_CPUS * core::mem::size_of::<huesos_abi::SchedCpuRecord>();
 
 /// Read the aggregate scheduler counters.
 pub fn sched_summary() -> crate::Result<huesos_abi::SchedSummary> {

@@ -32,6 +32,22 @@ impl Handle {
         self.0
     }
 
+    /// Return the stable kernel object ID named by this capability.
+    ///
+    /// A KOID is opaque identity only: it grants no rights and cannot be used
+    /// in place of a handle. The kernel validates that this owned handle is
+    /// live before returning the ID.
+    pub fn koid(&self) -> crate::Result<u64> {
+        let mut koid = 0u64;
+        let raw = raw::syscall2(
+            Syscall::HandleGetKoid,
+            self.0 as u64,
+            &mut koid as *mut u64 as u64,
+        );
+        raw::decode(raw)?;
+        Ok(koid)
+    }
+
     /// Take ownership of a kernel-reserved fixed init slot.
     ///
     /// `raw` must name a slot the kernel reserves for exactly one

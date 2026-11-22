@@ -223,7 +223,8 @@ impl<const N: usize> EevdfTree<N> {
         Ok(Some(key))
     }
 
-    /// Select the eligible entry with the earliest virtual finish.
+    /// Select the eligible entry with the earliest virtual finish in `O(log n)`
+    /// via `min_finish` subtree pruning.
     ///
     /// Eligibility is `virtual_start <= now`. If no entry is eligible but
     /// entries exist, the caller should advance `now` to the smallest
@@ -234,18 +235,36 @@ impl<const N: usize> EevdfTree<N> {
     /// because a partial read cannot strand a task.
     pub fn pick_eligible(&self, now: u128) -> Option<EevdfKey> {
         let mut best: Option<(u128, EevdfKey)> = None;
-        self.walk_eligible(self.root, now, &mut |key, finish| {
-            let candidate = (finish, key);
-            match best {
-                None => best = Some(candidate),
-                Some(current) => {
-                    if candidate.0 < current.0 || (candidate.0 == current.0 && key < current.1) {
-                        best = Some(candidate);
-                    }
-                }
-            }
-        });
+        self.search_eligible(self.root, now, &mut best);
         best.map(|(_, key)| key)
+    }
+
+    /// Pop (select and remove) the eligible entry with the earliest virtual
+    /// finish, snapping `now` upward to [`Self::min_start`] if runnable entries
+    /// exist with `virtual_start > now`.
+    pub fn pop_eligible(
+        &mut self,
+        now: &mut u128,
+    ) -> Result<Option<(EevdfKey, u128)>, EevdfTreeError> {
+        if self.is_empty() {
+            return Ok(None);
+        }
+        let mut best: Option<(u128, EevdfKey)> = None;
+        self.search_eligible(self.root, *now, &mut best);
+        if best.is_none() {
+            if let Some(snap) = self.min_start() {
+                if snap > *now {
+                    *now = snap;
+                }
+                self.search_eligible(self.root, *now, &mut best);
+            }
+        }
+        let Some((finish, key)) = best else {
+            return Ok(None);
+        };
+        let slot = self.find_key(key).ok_or(EevdfTreeError::InvariantBroken)?;
+        self.erase_node(slot)?;
+        Ok(Some((key, finish)))
     }
 
     /// Smallest `virtual_start` among all live entries (EEVDF snap target).
@@ -593,18 +612,51 @@ impl<const N: usize> EevdfTree<N> {
         Ok(())
     }
 
-    /// Walk all eligible nodes and invoke `f(key, finish)`.
-    ///
-    /// Read-only: a corrupted subtree is skipped rather than reported.
-    fn walk_eligible(&self, node: Option<usize>, now: u128, f: &mut impl FnMut(EevdfKey, u128)) {
+    /// Search eligible nodes (`virtual_start <= now`) in `O(log n)` by pruning
+    /// ineligible right subtrees and subtrees whose `min_finish` cannot beat
+    /// the incumbent `best`.
+    fn search_eligible(&self, node: Option<usize>, now: u128, best: &mut Option<(u128, EevdfKey)>) {
         let Some(idx) = node else { return };
         let Ok(n) = self.node_ref(idx) else { return };
         let n = *n;
-        self.walk_eligible(n.left, now, f);
-        if n.key.virtual_start <= now {
-            f(n.key, n.finish);
+        if let Some((best_finish, _)) = *best {
+            if n.min_finish > best_finish {
+                return;
+            }
         }
-        self.walk_eligible(n.right, now, f);
+        if n.key.virtual_start > now {
+            // Every node in `n.right` has `virtual_start >= n.key.virtual_start > now`.
+            self.search_eligible(n.left, now, best);
+            return;
+        }
+        let candidate = (n.finish, n.key);
+        match *best {
+            None => *best = Some(candidate),
+            Some(current) => {
+                if candidate.0 < current.0 || (candidate.0 == current.0 && candidate.1 < current.1)
+                {
+                    *best = Some(candidate);
+                }
+            }
+        }
+        // Visit the child subtree with the smaller `min_finish` first to tighten
+        // `best` immediately so the sibling subtree can be pruned in O(1).
+        let left_min = n
+            .left
+            .and_then(|l| self.node_ref(l).ok().map(|ln| ln.min_finish));
+        let right_min = n
+            .right
+            .and_then(|r| self.node_ref(r).ok().map(|rn| rn.min_finish));
+        match (left_min, right_min) {
+            (Some(lm), Some(rm)) if rm < lm => {
+                self.search_eligible(n.right, now, best);
+                self.search_eligible(n.left, now, best);
+            }
+            _ => {
+                self.search_eligible(n.left, now, best);
+                self.search_eligible(n.right, now, best);
+            }
+        }
     }
 }
 
@@ -713,6 +765,40 @@ mod tests {
         assert_eq!(tree.min_start(), Some(300));
         assert_eq!(tree.pick_eligible(0), None);
         assert_eq!(tree.pick_eligible(300), Some(key(300, 2)));
+        let mut now = 0u128;
+        assert_eq!(tree.pop_eligible(&mut now), Ok(Some((key(300, 2), 700))));
+        assert_eq!(now, 300);
+        assert_eq!(tree.pop_eligible(&mut now), Ok(Some((key(500, 1), 600))));
+        assert_eq!(now, 500);
+        assert_eq!(tree.pop_eligible(&mut now), Ok(None));
+    }
+
+    #[test]
+    fn pruned_pick_eligible_matches_linear_scan() {
+        let mut state = 0xfeed_face_cafe_babeu64;
+        let mut rng = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let mut tree = EevdfTree::<64>::new();
+        let mut live: alloc::vec::Vec<(EevdfKey, u128)> = alloc::vec::Vec::new();
+        for i in 0..48u64 {
+            let start = (rng() % 500) as u128;
+            let finish = start + (rng() % 300) as u128 + 1;
+            let k = key(start, i + 1);
+            expect_ok!(tree.insert(k, finish), "insert");
+            live.push((k, finish));
+        }
+        for probe in (0u128..=550).step_by(7) {
+            let expected = live
+                .iter()
+                .filter(|(k, _)| k.virtual_start <= probe)
+                .min_by_key(|(k, f)| (*f, *k))
+                .map(|(k, _)| *k);
+            assert_eq!(tree.pick_eligible(probe), expected, "probe={probe}");
+        }
     }
 
     #[test]

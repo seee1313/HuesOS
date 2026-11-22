@@ -18,7 +18,7 @@ use core::arch::asm;
 use core::cell::UnsafeCell;
 
 /// Maximum CPUs supported by the cpu-local array.
-pub const MAX_CPUS: usize = 64;
+pub const MAX_CPUS: usize = huesos_sched::MAX_CPUS;
 
 /// Per-CPU data. Must be `#[repr(C)]` so offsets are stable for inline asm.
 #[repr(C)]

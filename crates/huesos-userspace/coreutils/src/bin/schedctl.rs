@@ -3,9 +3,10 @@
 //! `schedctl cpus|tasks|bench`
 //!
 //! - `cpus` prints the aggregate counters and one line per CPU: runqueue depth,
-//!   owned tasks, the running task, scheduler ticks and admitted CBS
+//!   owned tasks, the full running Task ID, scheduler ticks and admitted CBS
 //!   utilization.
-//! - `tasks` prints the whole task table: id, name, class, state, CPU, weight.
+//! - `tasks` prints the whole task table with full Task IDs and owning Process
+//!   KOIDs, followed by name, class, state, CPU, and weight.
 //! - `bench` samples the counters twice, a tenth of a second apart, and reports
 //!   what moved: context switches, remote wakes, reschedule IPIs and the
 //!   scheduler ticks consumed in the window.
@@ -50,7 +51,7 @@ fn run() -> i32 {
 fn usage() {
     cu::outln("usage: schedctl cpus|tasks|bench");
     cu::outln("  cpus  per-CPU runqueue depth, current task, ticks, admitted CBS");
-    cu::outln("  tasks the whole task table (id, name, class, state, cpu, weight)");
+    cu::outln("  tasks full Task IDs and owning Process KOIDs with scheduler details");
     cu::outln("  bench counters sampled over a short window");
 }
 
@@ -80,8 +81,16 @@ fn cpus() -> i32 {
     ));
 
     let mut table = tui::Table::new(
-        &["CPU", "ONLINE", "RUNQ", "TASKS", "CURRENT", "TICKS", "CBS"],
-        &[3, 6, 4, 5, 8, 9, 6],
+        &[
+            "CPU",
+            "ONLINE",
+            "RUNQ",
+            "TASKS",
+            "CURRENT TASK ID",
+            "TICKS",
+            "CBS",
+        ],
+        &[3, 6, 4, 5, 16, 9, 6],
     );
     for record in &snapshot.cpus {
         table.row(&[
@@ -92,7 +101,7 @@ fn cpus() -> i32 {
             if record.current_task == 0 {
                 String::from("-")
             } else {
-                format!("{:#x}", record.current_task & 0xffff)
+                format!("{:#x}", record.current_task)
             },
             tui::human_count(record.ticks),
             format!(
@@ -125,12 +134,17 @@ fn tasks() -> i32 {
         }
     };
     let mut table = tui::Table::new(
-        &["PID", "NAME", "CLASS", "STATE", "CPU", "WEIGHT"],
-        &[7, 16, 8, 8, 3, 6],
+        &["TASK-ID", "PROCESS-KOID", "NAME", "CLASS", "STATE", "CPU", "WEIGHT"],
+        &[16, 16, 16, 8, 8, 3, 6],
     );
     for record in &records {
         table.row(&[
-            format!("{}", record.task_id & 0xffff),
+            format!("{:#x}", record.task_id),
+            if record.process_koid() == 0 {
+                String::from("-")
+            } else {
+                format!("{:#x}", record.process_koid())
+            },
             String::from(record.name_str()),
             String::from(record.class_str()),
             String::from(record.state_str()),

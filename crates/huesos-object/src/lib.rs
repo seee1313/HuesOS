@@ -323,6 +323,18 @@ mod tests {
     }
 
     #[test]
+    fn process_affinity_stores_all_256_dense_cpu_bits() {
+        let process = Process::new("affinity-256");
+        let mask = huesos_abi::CpuMask256::one(255).expect("CPU 255 is representable");
+        assert!(process.set_affinity_mask_words(mask.words, 255));
+        let (words, home_cpu) = process.affinity_snapshot();
+        assert_eq!(home_cpu, 255);
+        assert_eq!(words, [0, 0, 0, 1u64 << 63]);
+        assert_eq!(process.affinity_mask(), 0);
+        assert!(!process.set_home_cpu(256));
+    }
+
+    #[test]
     fn process_exit_queues_bound_port_packet() {
         let process = Process::new("watched");
         let port = match Port::new() {
