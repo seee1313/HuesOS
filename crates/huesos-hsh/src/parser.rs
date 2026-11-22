@@ -98,6 +98,30 @@ impl Parser {
         self.tokens.get(self.pos + 1)
     }
 
+    fn starts_standalone_stmt(&self) -> bool {
+        match self.peek().map(|token| &token.kind) {
+            Some(TokenKind::Keyword(
+                Keyword::Let
+                | Keyword::If
+                | Keyword::While
+                | Keyword::For
+                | Keyword::Fn
+                | Keyword::Alias
+                | Keyword::Break
+                | Keyword::Continue
+                | Keyword::Return,
+            )) => true,
+            Some(TokenKind::Word(name)) => {
+                is_valid_var_ident(name)
+                    && matches!(
+                        self.peek_next().map(|token| &token.kind),
+                        Some(TokenKind::Eq)
+                    )
+            }
+            _ => false,
+        }
+    }
+
     fn parse_stmt(&mut self) -> Result<Stmt, ParseError> {
         let Some(tok) = self.peek() else {
             return Err(ParseError {
@@ -564,54 +588,69 @@ impl Parser {
     }
 
     fn parse_chain(&mut self) -> Result<Chain, ParseError> {
-        let first = self.parse_pipeline()?;
+        let mut first = self.parse_pipeline()?;
         let mut rest = Vec::new();
         loop {
-            let op = match self.peek().map(|t| &t.kind) {
-                Some(TokenKind::AndAnd) => ChainOp::And,
-                Some(TokenKind::OrOr) => ChainOp::Or,
-                Some(TokenKind::Semi) => {
-                    // Check if `;` is followed by end of block/input/newline — if so, trailing `;`
+            match self.peek().map(|token| &token.kind) {
+                Some(TokenKind::AndAnd) | Some(TokenKind::OrOr) => {
+                    let op = if matches!(
+                        self.peek().map(|token| &token.kind),
+                        Some(TokenKind::AndAnd)
+                    ) {
+                        ChainOp::And
+                    } else {
+                        ChainOp::Or
+                    };
                     self.bump();
                     self.skip_newlines();
-                    if matches!(self.peek().map(|t| &t.kind), None | Some(TokenKind::RBrace)) {
-                        break;
+                    rest.push((op, self.parse_pipeline()?));
+                }
+                Some(TokenKind::Amp) => {
+                    self.bump();
+                    if let Some((_, pipeline)) = rest.last_mut() {
+                        pipeline.background = true;
+                    } else {
+                        first.background = true;
                     }
+                    self.skip_newlines();
                     if matches!(
-                        self.peek().map(|t| &t.kind),
-                        Some(
-                            TokenKind::Keyword(Keyword::Let)
-                                | TokenKind::Keyword(Keyword::If)
-                                | TokenKind::Keyword(Keyword::While)
-                                | TokenKind::Keyword(Keyword::For)
-                                | TokenKind::Keyword(Keyword::Fn)
-                                | TokenKind::Keyword(Keyword::Alias)
-                                | TokenKind::Keyword(Keyword::Break)
-                                | TokenKind::Keyword(Keyword::Continue)
-                                | TokenKind::Keyword(Keyword::Return)
-                        )
-                    ) {
+                        self.peek().map(|token| &token.kind),
+                        None | Some(TokenKind::RBrace)
+                    ) || self.starts_standalone_stmt()
+                    {
                         break;
                     }
-                    if let Some(Token {
-                        kind: TokenKind::Word(w),
-                        ..
-                    }) = self.peek()
-                    {
-                        if is_valid_var_ident(w)
-                            && matches!(self.peek_next().map(|t| &t.kind), Some(TokenKind::Eq))
+                    if matches!(self.peek().map(|token| &token.kind), Some(TokenKind::Semi)) {
+                        self.bump();
+                        self.skip_newlines();
+                        if matches!(
+                            self.peek().map(|token| &token.kind),
+                            None | Some(TokenKind::RBrace)
+                        ) || self.starts_standalone_stmt()
                         {
                             break;
                         }
                     }
                     rest.push((ChainOp::Seq, self.parse_pipeline()?));
-                    continue;
+                }
+                Some(TokenKind::Semi) => {
+                    // A semicolon may trail the chain or separate a simple
+                    // command from a following control-flow statement.
+                    self.bump();
+                    self.skip_newlines();
+                    if matches!(
+                        self.peek().map(|token| &token.kind),
+                        None | Some(TokenKind::RBrace)
+                    ) {
+                        break;
+                    }
+                    if self.starts_standalone_stmt() {
+                        break;
+                    }
+                    rest.push((ChainOp::Seq, self.parse_pipeline()?));
                 }
                 _ => break,
-            };
-            self.bump();
-            self.skip_newlines();
-            rest.push((op, self.parse_pipeline()?));
+            }
         }
         Ok(Chain { first, rest })
     }
@@ -623,7 +662,10 @@ impl Parser {
             self.skip_newlines();
             stages.push(self.parse_command()?);
         }
-        Ok(Pipeline { stages })
+        Ok(Pipeline {
+            stages,
+            background: false,
+        })
     }
 
     fn parse_command(&mut self) -> Result<CommandCall, ParseError> {
@@ -677,6 +719,7 @@ impl Parser {
             match &tok.kind {
                 TokenKind::Newline
                 | TokenKind::Semi
+                | TokenKind::Amp
                 | TokenKind::AndAnd
                 | TokenKind::OrOr
                 | TokenKind::Pipe

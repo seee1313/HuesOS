@@ -539,7 +539,7 @@ fn filter_and_sort_tasks(tasks: &[TaskRecord], app: &MonitorApp) -> Vec<TaskReco
             }
             let name_lc = t.name_str().to_ascii_lowercase();
             let state_lc = state_label(t.state).to_ascii_lowercase();
-            let tid_s = format!("{}", t.task_id & 0xFFFF);
+            let tid_s = format!("{} {:016x}", t.task_id, t.task_id);
             name_lc.contains(&needle) || state_lc.contains(&needle) || tid_s.contains(&needle)
         })
         .collect();
@@ -1162,10 +1162,9 @@ fn render_tasks_box(
 
     // Column header row (matches exact data row column widths below)
     let hdr = format!(
-        "   {}{:<6} {:>6} {:>10}  {:<5} {:<8} {:<9} {:>7}  {:<22}  {}CORE AFFINITY / ACTIVITY{}",
+        "   {}{:<16} {:>10}  {:<5} {:<8} {:<9} {:>7}  {:<22}  {}CORE AFFINITY / ACTIVITY{}",
         ansi::BOLD,
-        col_hdr("TID", 6, false, SortCol::TaskId, app.sort_col),
-        col_hdr("GEN", 6, true, SortCol::TaskId, SortCol::Name),
+        col_hdr("TID (HEX)", 16, false, SortCol::TaskId, app.sort_col),
         col_hdr("STATE", 10, true, SortCol::State, app.sort_col),
         col_hdr("CPU", 5, false, SortCol::Cpu, app.sort_col),
         col_hdr("DOMAIN", 8, false, SortCol::Domain, app.sort_col),
@@ -1194,8 +1193,6 @@ fn render_tasks_box(
         let r = list_start_row + idx;
         if let Some(task) = tasks.get(scroll_top + idx) {
             let is_sel = scroll_top + idx == app.selected;
-            let slot = task.task_id & 0xFFFF_FFFF;
-            let gen = task.task_id >> 32;
             let (st_lbl, st_col) = state_badge(task.state);
             let dom_lbl = if task.kind == 1 { "user" } else { "kernel" };
             let dom_col = if task.kind == 1 { FG_CYAN } else { FG_VIOLET };
@@ -1217,9 +1214,8 @@ fn render_tasks_box(
 
             if is_sel {
                 let plain = format!(
-                    " > {:<6} {:>6} {:>10}  CPU{:<2} {:<8} {:<9} {:>7}  {:<22}  {}",
-                    slot,
-                    gen,
+                    " > {:016x} {:>10}  CPU{:<2} {:<8} {:<9} {:>7}  {:<22}  {}",
+                    task.task_id,
                     st_lbl,
                     task.cpu,
                     dom_lbl,
@@ -1244,12 +1240,9 @@ fn render_tasks_box(
                 );
             } else {
                 let row_str = format!(
-                    "   {}{:<6}{} {}{:>6}{} {}{:>10}{}  {}CPU{:<2}{} {}{:<8}{} {}{:<9}{} {}{:>7}{}  {}{:<22}{}  {}{}{}",
+                    "   {}{:016x}{} {}{:>10}{}  {}CPU{:<2}{} {}{:<8}{} {}{:<9}{} {}{:>7}{}  {}{:<22}{}  {}{}{}",
                     fg_rgb(FG_TEXT.0, FG_TEXT.1, FG_TEXT.2),
-                    slot,
-                    ansi::RESET,
-                    fg_rgb(FG_MUTED.0, FG_MUTED.1, FG_MUTED.2),
-                    gen,
+                    task.task_id,
                     ansi::RESET,
                     fg_rgb(st_col.0, st_col.1, st_col.2),
                     st_lbl,
@@ -1282,8 +1275,8 @@ fn render_tasks_box(
 
     fb.put_row(inspector_rule_row, &box_rule(cols, FG_BORDER));
     let inspector_txt = if let Some(sel) = tasks.get(app.selected) {
-        let slot = sel.task_id & 0xFFFF_FFFF;
-        let gen = sel.task_id >> 32;
+        let slot = sel.task_slot();
+        let gen = sel.task_generation();
         format!(
             " {}Selected:{} {}{}{}   {}raw_id:{} 0x{:016x} (slot {}, gen {})   {}ring:{} {}   {}sched:{} {} (weight {})   {}state:{} {}",
             fg_rgb(FG_MUTED.0, FG_MUTED.1, FG_MUTED.2),
@@ -1441,7 +1434,7 @@ fn find_task_name(tasks: &[TaskRecord], task_id: u64) -> String {
         .iter()
         .find(|t| t.task_id == task_id)
         .map(|t| String::from(t.name_str()))
-        .unwrap_or_else(|| format!("task#{:x}", task_id & 0xFFFF))
+        .unwrap_or_else(|| format!("task#{task_id:016x}"))
 }
 
 fn pad_history_left(samples: &[u64], wanted: usize) -> Vec<u64> {

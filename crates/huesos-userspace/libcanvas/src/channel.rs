@@ -88,7 +88,9 @@ impl Channel {
 
     /// Send a message (raw bytes; no handle transfer support in this safe
     /// wrapper yet — see `huesos-abi::Syscall::ChannelWrite`'s lower-level
-    /// handle-array parameters if you need that).
+    /// handle-array parameters if you need that). Returns
+    /// [`ErrorCode::ShouldWait`](crate::ErrorCode::ShouldWait) when the peer's
+    /// bounded inbox is full; retry after the receiver drains messages.
     pub fn write(&self, data: &[u8]) -> crate::Result<()> {
         let ret = raw::syscall5(
             Syscall::ChannelWrite,

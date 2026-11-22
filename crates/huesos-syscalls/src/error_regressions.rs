@@ -179,7 +179,7 @@ fn full_queue_send_restores_handle_then_recovers_after_drain() {
             &[slot],
             ChannelMessage::new(alloc::vec![], moved)
         ),
-        Err(ErrorCode::NoMemory)
+        Err(ErrorCode::ShouldWait)
     );
     assert_eq!(process.handles.get(slot), Some(handle));
     assert_eq!(object_ref_counts(handle.koid), (1, 0));

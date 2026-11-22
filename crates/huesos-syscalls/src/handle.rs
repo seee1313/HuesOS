@@ -14,6 +14,21 @@ pub(crate) fn sys_handle_close(handle: HandleValue) -> SyscallResult {
     Ok(0)
 }
 
+pub(crate) fn sys_handle_get_koid(handle: HandleValue, out_koid: *mut u64) -> SyscallResult {
+    if handle == INVALID_HANDLE {
+        return Err(ErrorCode::BadHandle);
+    }
+    user_memory::validate_write(out_koid)?;
+    let proc = current_proc()?;
+    let h = proc.handles.get(handle).ok_or(ErrorCode::BadHandle)?;
+    // A koid is opaque identity, not authority: any valid handle may report
+    // the object it names. Acting on the object still requires rights. Write
+    // through the pointer rather than returning it in the signed syscall
+    // result register so all 64 identity bits remain representable.
+    user_memory::write_value(out_koid, &h.koid.0)?;
+    Ok(0)
+}
+
 pub(crate) fn sys_handle_duplicate(
     handle: HandleValue,
     rights: u32,

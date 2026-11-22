@@ -386,9 +386,9 @@ pub fn unregister_object(koid: Koid) {
     drop(removed);
 }
 
-/// Current process per CPU core (set by the scheduler on every context switch).
-static PER_CPU_PROCESSES: IrqSafeMutex<[Option<Arc<Process>>; 64]> =
-    IrqSafeMutex::new([const { None }; 64]);
+/// Current process per dense scheduler CPU (set on every context switch).
+static PER_CPU_PROCESSES: IrqSafeMutex<[Option<Arc<Process>>; huesos_abi::MAX_LOGICAL_CPUS]> =
+    IrqSafeMutex::new([const { None }; huesos_abi::MAX_LOGICAL_CPUS]);
 
 static CPU_ID_CALLBACK: IrqSafeMutex<Option<fn() -> usize>> = IrqSafeMutex::new(None);
 
@@ -412,14 +412,14 @@ pub(crate) fn current_cpu() -> usize {
 
 /// Set the current process.
 pub fn set_current_process(p: Arc<Process>) {
-    let cpu = current_cpu().min(63);
+    let cpu = current_cpu().min(huesos_abi::MAX_LOGICAL_CPUS - 1);
     PER_CPU_PROCESSES.lock()[cpu] = Some(p);
 }
 
 /// Clear the current process on the calling CPU (when switching to a kernel
 /// or reaped task so exited `Process` objects are not retained by idle CPUs).
 pub fn clear_current_process() {
-    let cpu = current_cpu().min(63);
+    let cpu = current_cpu().min(huesos_abi::MAX_LOGICAL_CPUS - 1);
     PER_CPU_PROCESSES.lock()[cpu] = None;
 }
 
@@ -435,7 +435,7 @@ pub fn clear_process_from_all_cpus(koid: Koid) {
 
 /// Get the current process.
 pub fn current_process() -> Option<Arc<Process>> {
-    let cpu = current_cpu().min(63);
+    let cpu = current_cpu().min(huesos_abi::MAX_LOGICAL_CPUS - 1);
     PER_CPU_PROCESSES.lock()[cpu].clone()
 }
 

@@ -247,6 +247,8 @@ pub struct CommandCall {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Pipeline {
     pub stages: Vec<CommandCall>,
+    /// Run the external pipeline in the background (`command &`).
+    pub background: bool,
 }
 
 /// Logical/sequential chain operator.

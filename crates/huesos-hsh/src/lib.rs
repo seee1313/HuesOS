@@ -17,7 +17,9 @@ pub mod parser;
 pub mod value;
 
 pub use ast::{BootfsAccess, CapsSpec, ChainOp, CmpOp, DirGrant, FbAccess, HxfsAccess, Stmt};
-pub use eval::{EvalAction, EvalResult, ExecOutcome, HostPathKind, ShellEnv, ShellHost};
+pub use eval::{
+    EvalAction, EvalResult, ExecOutcome, HostPathKind, PipelineCommand, ShellEnv, ShellHost,
+};
 pub use lexer::{highlight_line, HighlightKind, HighlightSpan};
 pub use parser::{parse_script, ParseError};
 pub use value::{Table, Value};
@@ -35,6 +37,8 @@ mod tests {
         files: BTreeMap<String, Vec<u8>>,
         last_caps: Option<CapsSpec>,
         exec_log: Vec<(String, Vec<String>)>,
+        pipeline_log: Vec<(Vec<eval::PipelineCommand>, bool, bool)>,
+        handle_pipelines: bool,
     }
 
     impl MockHost {
@@ -43,6 +47,8 @@ mod tests {
                 files: BTreeMap::new(),
                 last_caps: None,
                 exec_log: Vec::new(),
+                pipeline_log: Vec::new(),
+                handle_pipelines: false,
             }
         }
     }
@@ -107,6 +113,24 @@ mod tests {
                 },
                 _ => ExecOutcome::err(127, format!("unknown command: {name}")),
             }
+        }
+
+        fn exec_pipeline(
+            &mut self,
+            stages: &[eval::PipelineCommand],
+            background: bool,
+            capture_output: bool,
+        ) -> Option<ExecOutcome> {
+            self.pipeline_log
+                .push((stages.to_vec(), background, capture_output));
+            self.handle_pipelines.then(|| ExecOutcome {
+                status: 0,
+                output: Value::Text(String::from("pipeline-started")),
+                stderr: String::new(),
+                clear_screen: false,
+                exit_requested: false,
+                child_pid: Some(77),
+            })
         }
 
         fn write_file(&mut self, path: &str, data: &[u8], append: bool) -> Result<(), String> {
@@ -367,6 +391,42 @@ mod tests {
             res.render_text(),
             "stat-ok\n/sub/a.txt /sub/b.txt\nbeta\nneg_status=0\nerr-line"
         );
+    }
+
+    #[test]
+    fn test_background_external_pipeline_is_delegated_as_one_job() {
+        let mut env = ShellEnv::new();
+        let mut host = MockHost::new();
+        host.handle_pipelines = true;
+
+        let Ok(foreground) = env.eval_script("seq 1 4 | grep 2", &mut host) else {
+            assert!(false, "eval foreground external pipeline");
+            return;
+        };
+        assert_eq!(foreground.render_text(), "pipeline-started");
+        assert_eq!(host.pipeline_log.len(), 1);
+        assert!(!host.pipeline_log[0].1);
+
+        let Ok(result) = env.eval_script(
+            "alias list = \"seq 1 4\"\nlist | grep 2 &\nlet foreground = \"foreground\"\necho $foreground",
+            &mut host,
+        ) else {
+            assert!(false, "eval background pipeline");
+            return;
+        };
+
+        assert_eq!(result.status, 0);
+        assert_eq!(result.render_text(), "pipeline-started\nforeground");
+        assert_eq!(env.last_pid, 77);
+        assert_eq!(host.pipeline_log.len(), 2);
+        let (stages, background, capture_output) = &host.pipeline_log[1];
+        assert!(*background);
+        assert!(!capture_output);
+        assert_eq!(stages.len(), 2);
+        assert_eq!(stages[0].name, "seq");
+        assert_eq!(stages[0].args, alloc::vec!["1", "4"]);
+        assert_eq!(stages[1].name, "grep");
+        assert_eq!(stages[1].args, alloc::vec!["2"]);
     }
 
     #[test]

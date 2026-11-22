@@ -5,10 +5,11 @@
 //! "earliest virtual finish among eligible requests", matching the EEVDF
 //! policy used by the `EevdfModel` oracle.
 //!
-//! All operations are O(log n) and allocation-free: nodes live in fixed
-//! arrays keyed by `usize` indices provided by the caller. The caller is
-//! responsible for keeping node slots stable while they are present in the
-//! tree; the tree never owns or allocates node data.
+//! Tree operations are O(log n) and use stable `usize` indices into fixed-
+//! capacity backing storage. The slot and free-list vectors are allocated
+//! lazily on the first insert; subsequent mutations do not allocate. The
+//! tree owns its backing storage, and callers never hold node references
+//! across an operation.
 //!
 //! This module never panics. Internal operations are `?`-threaded: a
 //! violation of the tree's bookkeeping invariants surfaces to the caller as
@@ -26,11 +27,13 @@
 use alloc::vec::Vec;
 use core::cmp::Ordering;
 
-/// Capacity-exhaustion, missing-entry, or internal-invariant error.
+/// Capacity-exhaustion, allocation, missing-entry, or internal-invariant error.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum EevdfTreeError {
     /// The tree has reached its fixed capacity.
     Full,
+    /// The tree could not allocate its fixed-capacity backing storage.
+    AllocationFailed,
     /// A requested key is not present.
     NotFound,
     /// An internal bookkeeping invariant was violated: an index that was
@@ -87,32 +90,45 @@ impl Node {
     }
 }
 
-/// Fixed-capacity augmented WAVL tree using `Option<Node>` slots so every
-/// operation stays allocation-free and unsafe-free.
+/// Fixed-capacity augmented WAVL tree with lazily allocated slot storage.
+///
+/// The tree value itself stays small, including for large capacities; the
+/// backing vectors are reserved on its first insert and are reused thereafter.
 pub struct EevdfTree<const N: usize> {
-    nodes: [Option<Node>; N],
-    free: [usize; N],
-    free_len: usize,
+    nodes: Vec<Option<Node>>,
+    free: Vec<usize>,
     root: Option<usize>,
     len: usize,
 }
 
 impl<const N: usize> EevdfTree<N> {
-    /// Create an empty tree.
+    /// Create an empty tree without allocating its backing storage.
     pub const fn new() -> Self {
-        let mut free = [0usize; N];
-        let mut i = 0;
-        while i < N {
-            free[i] = i;
-            i += 1;
-        }
         Self {
-            nodes: [None; N],
-            free,
-            free_len: N,
+            nodes: Vec::new(),
+            free: Vec::new(),
             root: None,
             len: 0,
         }
+    }
+
+    /// Reserve and initialize the fixed-capacity storage on first mutation.
+    fn ensure_storage(&mut self) -> Result<(), EevdfTreeError> {
+        if self.nodes.len() == N && self.free.capacity() >= N {
+            return Ok(());
+        }
+        if !self.nodes.is_empty() || !self.free.is_empty() {
+            return Err(EevdfTreeError::InvariantBroken);
+        }
+        self.nodes
+            .try_reserve_exact(N)
+            .map_err(|_| EevdfTreeError::AllocationFailed)?;
+        self.free
+            .try_reserve_exact(N)
+            .map_err(|_| EevdfTreeError::AllocationFailed)?;
+        self.nodes.resize_with(N, || None);
+        self.free.extend(0..N);
+        Ok(())
     }
 
     /// Number of live entries.
@@ -127,16 +143,13 @@ impl<const N: usize> EevdfTree<N> {
 
     /// Whether the tree has no free capacity.
     pub fn is_full(&self) -> bool {
-        self.free_len == 0
+        self.len == N
     }
 
     /// Insert a key with its virtual finish. Duplicate keys are rejected.
     pub fn insert(&mut self, key: EevdfKey, finish: u128) -> Result<(), EevdfTreeError> {
-        if self.free_len == 0 {
-            return Err(EevdfTreeError::Full);
-        }
-        let slot = self.free[self.free_len - 1];
-        self.free_len -= 1;
+        self.ensure_storage()?;
+        let slot = self.free.pop().ok_or(EevdfTreeError::Full)?;
         self.nodes[slot] = Some(Node::new(key, finish));
         self.len += 1;
 
@@ -147,8 +160,7 @@ impl<const N: usize> EevdfTree<N> {
             match key.cmp(&node.key) {
                 Ordering::Equal => {
                     // Roll back the slot reservation.
-                    self.free[self.free_len] = slot;
-                    self.free_len += 1;
+                    self.free.push(slot);
                     self.len -= 1;
                     self.nodes[slot] = None;
                     return Err(EevdfTreeError::NotFound);
@@ -223,7 +235,8 @@ impl<const N: usize> EevdfTree<N> {
         Ok(Some(key))
     }
 
-    /// Select the eligible entry with the earliest virtual finish.
+    /// Select the eligible entry with the earliest virtual finish in `O(log n)`
+    /// via `min_finish` subtree pruning.
     ///
     /// Eligibility is `virtual_start <= now`. If no entry is eligible but
     /// entries exist, the caller should advance `now` to the smallest
@@ -234,18 +247,36 @@ impl<const N: usize> EevdfTree<N> {
     /// because a partial read cannot strand a task.
     pub fn pick_eligible(&self, now: u128) -> Option<EevdfKey> {
         let mut best: Option<(u128, EevdfKey)> = None;
-        self.walk_eligible(self.root, now, &mut |key, finish| {
-            let candidate = (finish, key);
-            match best {
-                None => best = Some(candidate),
-                Some(current) => {
-                    if candidate.0 < current.0 || (candidate.0 == current.0 && key < current.1) {
-                        best = Some(candidate);
-                    }
-                }
-            }
-        });
+        self.search_eligible(self.root, now, &mut best);
         best.map(|(_, key)| key)
+    }
+
+    /// Pop (select and remove) the eligible entry with the earliest virtual
+    /// finish, snapping `now` upward to [`Self::min_start`] if runnable entries
+    /// exist with `virtual_start > now`.
+    pub fn pop_eligible(
+        &mut self,
+        now: &mut u128,
+    ) -> Result<Option<(EevdfKey, u128)>, EevdfTreeError> {
+        if self.is_empty() {
+            return Ok(None);
+        }
+        let mut best: Option<(u128, EevdfKey)> = None;
+        self.search_eligible(self.root, *now, &mut best);
+        if best.is_none() {
+            if let Some(snap) = self.min_start() {
+                if snap > *now {
+                    *now = snap;
+                }
+                self.search_eligible(self.root, *now, &mut best);
+            }
+        }
+        let Some((finish, key)) = best else {
+            return Ok(None);
+        };
+        let slot = self.find_key(key).ok_or(EevdfTreeError::InvariantBroken)?;
+        self.erase_node(slot)?;
+        Ok(Some((key, finish)))
     }
 
     /// Smallest `virtual_start` among all live entries (EEVDF snap target).
@@ -367,8 +398,7 @@ impl<const N: usize> EevdfTree<N> {
         if let Some(c) = child {
             self.node_mut_ref(c)?.parent = parent;
         }
-        self.free[self.free_len] = slot;
-        self.free_len += 1;
+        self.free.push(slot);
         self.len -= 1;
         self.nodes[slot] = None;
         Ok(())
@@ -593,18 +623,51 @@ impl<const N: usize> EevdfTree<N> {
         Ok(())
     }
 
-    /// Walk all eligible nodes and invoke `f(key, finish)`.
-    ///
-    /// Read-only: a corrupted subtree is skipped rather than reported.
-    fn walk_eligible(&self, node: Option<usize>, now: u128, f: &mut impl FnMut(EevdfKey, u128)) {
+    /// Search eligible nodes (`virtual_start <= now`) in `O(log n)` by pruning
+    /// ineligible right subtrees and subtrees whose `min_finish` cannot beat
+    /// the incumbent `best`.
+    fn search_eligible(&self, node: Option<usize>, now: u128, best: &mut Option<(u128, EevdfKey)>) {
         let Some(idx) = node else { return };
         let Ok(n) = self.node_ref(idx) else { return };
         let n = *n;
-        self.walk_eligible(n.left, now, f);
-        if n.key.virtual_start <= now {
-            f(n.key, n.finish);
+        if let Some((best_finish, _)) = *best {
+            if n.min_finish > best_finish {
+                return;
+            }
         }
-        self.walk_eligible(n.right, now, f);
+        if n.key.virtual_start > now {
+            // Every node in `n.right` has `virtual_start >= n.key.virtual_start > now`.
+            self.search_eligible(n.left, now, best);
+            return;
+        }
+        let candidate = (n.finish, n.key);
+        match *best {
+            None => *best = Some(candidate),
+            Some(current) => {
+                if candidate.0 < current.0 || (candidate.0 == current.0 && candidate.1 < current.1)
+                {
+                    *best = Some(candidate);
+                }
+            }
+        }
+        // Visit the child subtree with the smaller `min_finish` first to tighten
+        // `best` immediately so the sibling subtree can be pruned in O(1).
+        let left_min = n
+            .left
+            .and_then(|l| self.node_ref(l).ok().map(|ln| ln.min_finish));
+        let right_min = n
+            .right
+            .and_then(|r| self.node_ref(r).ok().map(|rn| rn.min_finish));
+        match (left_min, right_min) {
+            (Some(lm), Some(rm)) if rm < lm => {
+                self.search_eligible(n.right, now, best);
+                self.search_eligible(n.left, now, best);
+            }
+            _ => {
+                self.search_eligible(n.left, now, best);
+                self.search_eligible(n.right, now, best);
+            }
+        }
     }
 }
 
@@ -683,10 +746,25 @@ mod tests {
     }
 
     #[test]
+    fn backing_storage_is_lazy_and_tree_value_stays_small() {
+        let mut tree = EevdfTree::<256>::new();
+        assert!(tree.nodes.is_empty());
+        assert!(tree.free.is_empty());
+        assert!(!tree.is_full());
+        assert!(core::mem::size_of::<EevdfTree<256>>() <= 80);
+
+        expect_ok!(tree.insert(key(1, 1), 2), "first insert allocates backing");
+        assert_eq!(tree.nodes.len(), 256);
+        assert_eq!(tree.free.len(), 255);
+    }
+
+    #[test]
     fn capacity_is_hard() {
         let mut tree = EevdfTree::<2>::new();
+        assert!(!tree.is_full());
         expect_ok!(tree.insert(key(1, 1), 2), "insert (1, 1)");
         expect_ok!(tree.insert(key(2, 2), 3), "insert (2, 2)");
+        assert!(tree.is_full());
         assert_eq!(tree.insert(key(3, 3), 4), Err(EevdfTreeError::Full));
     }
 
@@ -713,6 +791,40 @@ mod tests {
         assert_eq!(tree.min_start(), Some(300));
         assert_eq!(tree.pick_eligible(0), None);
         assert_eq!(tree.pick_eligible(300), Some(key(300, 2)));
+        let mut now = 0u128;
+        assert_eq!(tree.pop_eligible(&mut now), Ok(Some((key(300, 2), 700))));
+        assert_eq!(now, 300);
+        assert_eq!(tree.pop_eligible(&mut now), Ok(Some((key(500, 1), 600))));
+        assert_eq!(now, 500);
+        assert_eq!(tree.pop_eligible(&mut now), Ok(None));
+    }
+
+    #[test]
+    fn pruned_pick_eligible_matches_linear_scan() {
+        let mut state = 0xfeed_face_cafe_babeu64;
+        let mut rng = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let mut tree = EevdfTree::<64>::new();
+        let mut live: alloc::vec::Vec<(EevdfKey, u128)> = alloc::vec::Vec::new();
+        for i in 0..48u64 {
+            let start = (rng() % 500) as u128;
+            let finish = start + (rng() % 300) as u128 + 1;
+            let k = key(start, i + 1);
+            expect_ok!(tree.insert(k, finish), "insert");
+            live.push((k, finish));
+        }
+        for probe in (0u128..=550).step_by(7) {
+            let expected = live
+                .iter()
+                .filter(|(k, _)| k.virtual_start <= probe)
+                .min_by_key(|(k, f)| (*f, *k))
+                .map(|(k, _)| *k);
+            assert_eq!(tree.pick_eligible(probe), expected, "probe={probe}");
+        }
     }
 
     #[test]

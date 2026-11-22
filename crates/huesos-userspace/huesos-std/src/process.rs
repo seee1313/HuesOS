@@ -40,7 +40,7 @@ pub fn yield_now() {
 /// The process' own identifier, as the kernel names it.
 pub fn id() -> Result<u64> {
     let process = Process::current().map_err(Error::from)?;
-    Ok(u64::from(process.handle().raw()))
+    process.koid().map_err(Error::from)
 }
 
 /// How a child process finished.
@@ -245,8 +245,10 @@ impl Command {
         drop(stderr_write);
         let (process, bootstrap) = spawned.map_err(Error::from)?;
         drop(bootstrap);
+        let koid = process.koid().map_err(Error::from)?;
         Ok(Child {
             process,
+            koid,
             stdin: Some(stdin_write),
             stdout: self.capture_stdout.then_some(stdout_read),
             stderr: self.capture_stderr.then_some(stderr_read),
@@ -270,6 +272,7 @@ impl Command {
 /// A running child process.
 pub struct Child {
     process: Process,
+    koid: u64,
     stdin: Option<Channel>,
     stdout: Option<Channel>,
     stderr: Option<Channel>,
@@ -277,9 +280,9 @@ pub struct Child {
 }
 
 impl Child {
-    /// The kernel's handle for the child.
+    /// The child's stable kernel object ID (KOID), not its handle value.
     pub fn id(&self) -> u64 {
-        u64::from(self.process.handle().raw())
+        self.koid
     }
 
     /// Write `data` to the child's standard input.

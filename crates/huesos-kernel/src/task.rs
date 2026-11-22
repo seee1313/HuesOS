@@ -57,6 +57,10 @@ pub struct Task {
     pub startup_pending: core::sync::atomic::AtomicBool,
     /// Scheduling policy.
     pub sched_policy: crate::scheduler::SchedPolicy,
+    /// Explicit Scheduler v2 lifecycle state (`Embryo` -> `Ready` -> `Running` / `Blocked` -> `Dying` -> `Dead` -> `Reaped`).
+    pub lifecycle: huesos_sched::TaskLifecycle,
+    /// Monotonic wait-epoch incremented on every block attempt so stale wakes are rejected.
+    pub wait_epoch: core::sync::atomic::AtomicU32,
     /// Resource/Job domain this task is charged to. Defaults to the root job.
     pub job_id: huesos_sched::job::JobId,
     /// Nested preemption/migration guards carried with this Task across CPU
@@ -86,10 +90,9 @@ impl Task {
             blocked: core::sync::atomic::AtomicBool::new(false),
             wake_pending: core::sync::atomic::AtomicBool::new(false),
             startup_pending: core::sync::atomic::AtomicBool::new(false),
-            sched_policy: crate::scheduler::SchedPolicy::Fair {
-                weight: 1024,
-                vruntime: 0,
-            },
+            sched_policy: crate::scheduler::SchedPolicy::default_fair(),
+            lifecycle: huesos_sched::TaskLifecycle::new(),
+            wait_epoch: core::sync::atomic::AtomicU32::new(0),
             execution_guards: huesos_sched::ExecutionGuards::new(),
             job_id: huesos_sched::job::JobId::ROOT,
         }
@@ -107,10 +110,9 @@ impl Task {
             blocked: core::sync::atomic::AtomicBool::new(false),
             wake_pending: core::sync::atomic::AtomicBool::new(false),
             startup_pending: core::sync::atomic::AtomicBool::new(false),
-            sched_policy: crate::scheduler::SchedPolicy::Fair {
-                weight: 1024,
-                vruntime: 0,
-            },
+            sched_policy: crate::scheduler::SchedPolicy::default_fair(),
+            lifecycle: huesos_sched::TaskLifecycle::new(),
+            wait_epoch: core::sync::atomic::AtomicU32::new(0),
             execution_guards: huesos_sched::ExecutionGuards::new(),
             job_id: huesos_sched::job::JobId::ROOT,
         }
@@ -141,10 +143,9 @@ impl Task {
             blocked: core::sync::atomic::AtomicBool::new(false),
             wake_pending: core::sync::atomic::AtomicBool::new(false),
             startup_pending: core::sync::atomic::AtomicBool::new(false),
-            sched_policy: crate::scheduler::SchedPolicy::Fair {
-                weight: 1024,
-                vruntime: 0,
-            },
+            sched_policy: crate::scheduler::SchedPolicy::default_fair(),
+            lifecycle: huesos_sched::TaskLifecycle::new(),
+            wait_epoch: core::sync::atomic::AtomicU32::new(0),
             execution_guards: huesos_sched::ExecutionGuards::new(),
             job_id: huesos_sched::job::JobId::ROOT,
         }
@@ -187,6 +188,7 @@ impl Task {
             let ret_slot = (stack_top as *mut u64).sub(1);
             *ret_slot = thread_exit as *const () as u64;
         }
+        let job_id = crate::scheduler::resolve_sched_job_id(process.job().koid());
         Self {
             id,
             name,
@@ -197,12 +199,11 @@ impl Task {
             blocked: core::sync::atomic::AtomicBool::new(false),
             wake_pending: core::sync::atomic::AtomicBool::new(false),
             startup_pending: core::sync::atomic::AtomicBool::new(true),
-            sched_policy: crate::scheduler::SchedPolicy::Fair {
-                weight: 1024,
-                vruntime: 0,
-            },
+            sched_policy: crate::scheduler::SchedPolicy::default_fair(),
+            lifecycle: huesos_sched::TaskLifecycle::new(),
+            wait_epoch: core::sync::atomic::AtomicU32::new(0),
             execution_guards: huesos_sched::ExecutionGuards::new(),
-            job_id: huesos_sched::job::JobId::ROOT,
+            job_id,
         }
     }
 

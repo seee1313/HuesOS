@@ -50,7 +50,9 @@ impl Snapshot {
 
 /// Read the scheduler counters.
 pub fn snapshot() -> Result<Snapshot> {
-    let cpu_cap = libcanvas::system::cpu_count().unwrap_or(64).clamp(1, 64);
+    let cpu_cap = libcanvas::system::cpu_count()
+        .unwrap_or(huesos_abi::MAX_LOGICAL_CPUS)
+        .clamp(1, huesos_abi::MAX_LOGICAL_CPUS);
     let bytes =
         core::mem::size_of::<SchedSummary>() + cpu_cap * core::mem::size_of::<SchedCpuRecord>();
     let mut buffer = alloc::vec![0u8; bytes];

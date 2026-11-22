@@ -2,7 +2,9 @@
 
 use huesos_abi::{ChannelConsumeArgs, ChannelPeekArgs, ChannelReadEtcArgs, ErrorCode, HandleValue};
 use huesos_handlemove as handlemove;
-use huesos_object::{ChannelRecvError, Handle, KernelObject, KernelObjectExt, Rights};
+use huesos_object::{
+    ChannelRecvError, ChannelSendFailure, Handle, KernelObject, KernelObjectExt, Rights,
+};
 
 use crate::{user_memory, util::current_proc, SyscallResult};
 
@@ -12,6 +14,14 @@ fn map_recv_error(error: ChannelRecvError) -> huesos_abi::ErrorCode {
             ErrorCode::InvalidArgs
         }
         ChannelRecvError::PeerClosed => ErrorCode::PeerClosed,
+    }
+}
+
+fn map_send_failure(failure: ChannelSendFailure) -> ErrorCode {
+    match failure {
+        ChannelSendFailure::PeerClosed => ErrorCode::PeerClosed,
+        ChannelSendFailure::QuotaExceeded => ErrorCode::ShouldWait,
+        ChannelSendFailure::OutOfMemory => ErrorCode::NoMemory,
     }
 }
 
@@ -203,12 +213,7 @@ fn send_or_restore(
                     Err(lost) => huesos_object::note_handle_close(lost.koid),
                 }
             }
-            let status = match reason {
-                huesos_object::ChannelSendFailure::PeerClosed => ErrorCode::PeerClosed,
-                huesos_object::ChannelSendFailure::QuotaExceeded
-                | huesos_object::ChannelSendFailure::OutOfMemory => ErrorCode::NoMemory,
-            };
-            Err(status)
+            Err(map_send_failure(reason))
         }
     }
 }
@@ -453,9 +458,25 @@ pub(crate) fn sys_channel_consume(args_ptr: *const ChannelConsumeArgs) -> Syscal
 
 #[cfg(test)]
 mod tests {
-    use super::validate_move_dispositions;
+    use super::{map_send_failure, validate_move_dispositions};
     use huesos_abi::ErrorCode;
-    use huesos_object::{Handle, KernelObject, Process, Rights, Vmar};
+    use huesos_object::{ChannelSendFailure, Handle, KernelObject, Process, Rights, Vmar};
+
+    #[test]
+    fn bounded_channel_queue_exhaustion_reports_retryable_backpressure() {
+        assert_eq!(
+            map_send_failure(ChannelSendFailure::QuotaExceeded),
+            ErrorCode::ShouldWait
+        );
+        assert_eq!(
+            map_send_failure(ChannelSendFailure::OutOfMemory),
+            ErrorCode::NoMemory
+        );
+        assert_eq!(
+            map_send_failure(ChannelSendFailure::PeerClosed),
+            ErrorCode::PeerClosed
+        );
+    }
 
     /// Regression pin for the isolated-service bootstrap flow: the launcher
     /// (driver-manager) holds a copy of the child's root VMAR and forwards it

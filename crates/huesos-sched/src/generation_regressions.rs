@@ -159,7 +159,7 @@ fn invalid_operation_bits_cannot_modify_the_generation_tag() {
         return;
     };
     assert_eq!(DIRECTORY.publish(id, owner, 0), Ok(()));
-    for bits in [1 << 6, 1 << super::TASK_INDEX_BITS, u64::MAX] {
+    for bits in [1 << 8, 1 << super::TASK_INDEX_BITS, u64::MAX] {
         assert_eq!(
             DIRECTORY.publish_operations(id, bits),
             Err(DirectoryError::InvalidOperations)
@@ -247,7 +247,7 @@ fn concurrent_publishers_coalesce_without_losing_distinct_flags() {
     };
     assert_eq!(DIRECTORY.publish(id, owner, 0), Ok(()));
     std::thread::scope(|scope| {
-        for bit in 0..6 {
+        for bit in 0..8 {
             scope.spawn(move || {
                 for _ in 0..1024 {
                     assert!(DIRECTORY.publish_operations(id, 1 << bit).is_ok());

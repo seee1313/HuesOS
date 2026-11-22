@@ -216,6 +216,8 @@ pub fn syscall_init() {
     // record when diagnosing an incident.
     huesos_object::observation::set_clock(crate::scheduler::global_ticks);
     huesos_syscalls::set_cpu_mask_fn(crate::scheduler::online_cpu_mask);
+    huesos_syscalls::set_cpu_count_fn(crate::scheduler::online_cpu_count);
+    huesos_syscalls::set_cpu_online_fn(crate::scheduler::is_cpu_online);
     huesos_syscalls::set_sched_stats_fns(
         crate::scheduler::sched_summary,
         crate::scheduler::sched_cpu_record,

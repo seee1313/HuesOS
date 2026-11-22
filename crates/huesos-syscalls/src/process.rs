@@ -1,16 +1,17 @@
 //! Process/thread/VMAR launch syscalls plus yield/exit.
 
 use huesos_abi::{
-    ErrorCode, HandleValue, ProcessBindExitPortArgs, ProcessCreateInJobArgs, ThreadStartArgs,
-    VmarCreateChildArgs, VmarMapArgs, VmarOpArgs, BOOTSTRAP_HANDLE,
+    CpuMask256, ErrorCode, HandleValue, ProcessBindExitPortArgs, ProcessCreateInJobArgs,
+    ProcessGetAffinityMask256Args, ProcessSetAffinityMask256Args, ThreadStartArgs,
+    VmarCreateChildArgs, VmarMapArgs, VmarOpArgs, BOOTSTRAP_HANDLE, MAX_LOGICAL_CPUS,
 };
 use huesos_object::{Handle, KernelObject, KernelObjectExt, Rights};
 
 use crate::{
     callbacks::{
-        EXIT_FN, PROCESS_CREATE_FN, PROCESS_CREATE_IN_JOB_FN, PROCESS_TERMINATE_FN, THREAD_EXIT_FN,
-        THREAD_SET_FS_BASE_FN, THREAD_START_EX_FN, THREAD_START_FN, VMAR_MAP_FN, VMAR_PROTECT_FN,
-        VMAR_UNMAP_FN, YIELD_FN,
+        CPU_ONLINE_FN, EXIT_FN, PROCESS_CREATE_FN, PROCESS_CREATE_IN_JOB_FN, PROCESS_TERMINATE_FN,
+        THREAD_EXIT_FN, THREAD_SET_FS_BASE_FN, THREAD_START_EX_FN, THREAD_START_FN, VMAR_MAP_FN,
+        VMAR_PROTECT_FN, VMAR_UNMAP_FN, YIELD_FN,
     },
     user_memory,
     util::{current_proc, DeferGuard},
@@ -98,6 +99,19 @@ fn validate_affinity(mask: u64, home_cpu: usize) -> Result<(), ErrorCode> {
     Ok(())
 }
 
+fn validate_affinity_256(mask: &CpuMask256, home_cpu: usize) -> Result<(), ErrorCode> {
+    if mask.is_empty() || home_cpu >= MAX_LOGICAL_CPUS || !mask.contains(home_cpu) {
+        return Err(ErrorCode::InvalidArgs);
+    }
+    let online = (*CPU_ONLINE_FN.lock()).ok_or(ErrorCode::NotSupported)?;
+    for cpu in 0..MAX_LOGICAL_CPUS {
+        if mask.contains(cpu) && !online(cpu) {
+            return Err(ErrorCode::InvalidArgs);
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn sys_process_create_in_job(args_ptr: *const ProcessCreateInJobArgs) -> SyscallResult {
     let args = user_memory::read_value(args_ptr)?;
     if args.name_len as usize > MAX_PROCESS_NAME_LEN || args.out_process == args.out_root_vmar {
@@ -166,6 +180,61 @@ pub(crate) fn sys_process_set_affinity_mask(
     }
 }
 
+pub(crate) fn sys_process_set_affinity_mask_256(
+    args_ptr: *const ProcessSetAffinityMask256Args,
+) -> SyscallResult {
+    let args = user_memory::read_value(args_ptr)?;
+    if args.flags != 0 {
+        return Err(ErrorCode::InvalidArgs);
+    }
+    let home_cpu = args.home_cpu as usize;
+    validate_affinity_256(&args.mask, home_cpu)?;
+    let process_obj = process_from_handle(args.process, Rights::WRITE)?;
+    let process = process_obj
+        .downcast_ref::<huesos_object::Process>()
+        .ok_or(ErrorCode::WrongType)?;
+    if process.set_affinity_mask_words(args.mask.words, home_cpu) {
+        Ok(0)
+    } else {
+        Err(ErrorCode::Busy)
+    }
+}
+
+pub(crate) fn sys_process_get_affinity_mask_256(
+    args_ptr: *const ProcessGetAffinityMask256Args,
+) -> SyscallResult {
+    let args = user_memory::read_value(args_ptr)?;
+    if args.reserved != 0 {
+        return Err(ErrorCode::InvalidArgs);
+    }
+    if args.out_mask.is_null() || args.out_home_cpu.is_null() {
+        return Err(ErrorCode::InvalidArgs);
+    }
+    let mask_start = args.out_mask as usize;
+    let mask_end = mask_start
+        .checked_add(core::mem::size_of::<CpuMask256>())
+        .ok_or(ErrorCode::InvalidArgs)?;
+    let home_start = args.out_home_cpu as usize;
+    let home_end = home_start
+        .checked_add(core::mem::size_of::<u32>())
+        .ok_or(ErrorCode::InvalidArgs)?;
+    if mask_start < home_end && home_start < mask_end {
+        return Err(ErrorCode::InvalidArgs);
+    }
+    user_memory::validate_write(args.out_mask)?;
+    user_memory::validate_write(args.out_home_cpu)?;
+    let process_obj = process_from_handle(args.process, Rights::READ)?;
+    let process = process_obj
+        .downcast_ref::<huesos_object::Process>()
+        .ok_or(ErrorCode::WrongType)?;
+    let (words, home) = process.affinity_snapshot();
+    let mask = CpuMask256 { words };
+    let home_cpu = u32::try_from(home).map_err(|_| ErrorCode::InvalidArgs)?;
+    user_memory::write_value(args.out_mask, &mask)?;
+    user_memory::write_value(args.out_home_cpu, &home_cpu)?;
+    Ok(0)
+}
+
 pub(crate) fn sys_process_set_scheduler_flags(
     process_handle: HandleValue,
     flags: u32,
@@ -193,8 +262,9 @@ pub(crate) fn sys_process_get_affinity(
     let process = process_obj
         .downcast_ref::<huesos_object::Process>()
         .ok_or(ErrorCode::WrongType)?;
-    let mask = process.affinity_mask();
-    let home = process.home_cpu() as u64;
+    let (words, home_cpu) = process.affinity_snapshot();
+    let mask = words[0];
+    let home = home_cpu as u64;
     user_memory::write_value(out_mask, &mask)?;
     user_memory::write_value(out_home_cpu, &home)?;
     Ok(0)

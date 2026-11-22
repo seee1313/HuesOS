@@ -55,14 +55,14 @@ use huesos_abi::{
 };
 
 pub use callbacks::{
-    set_clock_fn, set_cpu_mask_fn, set_current_cpu_fn, set_debug_write_fn, set_exit_fn,
-    set_heap_extend_fn, set_process_create_fn, set_process_create_in_job_fn,
-    set_process_terminate_fn, set_resource_map_fn, set_resource_unmap_fn, set_sched_stats_fns,
-    set_shutdown_fn, set_task_count_fn, set_task_record_fn, set_thread_exit_fn,
-    set_thread_set_fs_base_fn, set_thread_start_ex_fn, set_thread_start_fn, set_vmar_map_fn,
-    set_vmar_protect_fn, set_vmar_unmap_fn, set_yield_fn, HeapExtendFn, ProcessCreateFn,
-    ProcessCreateInJobFn, ProcessTerminateFn, ResourceMapFn, ResourceUnmapFn, ThreadStartExFn,
-    ThreadStartFn, VmarMapFn, VmarOpFn,
+    set_clock_fn, set_cpu_count_fn, set_cpu_mask_fn, set_cpu_online_fn, set_current_cpu_fn,
+    set_debug_write_fn, set_exit_fn, set_heap_extend_fn, set_process_create_fn,
+    set_process_create_in_job_fn, set_process_terminate_fn, set_resource_map_fn,
+    set_resource_unmap_fn, set_sched_stats_fns, set_shutdown_fn, set_task_count_fn,
+    set_task_record_fn, set_thread_exit_fn, set_thread_set_fs_base_fn, set_thread_start_ex_fn,
+    set_thread_start_fn, set_vmar_map_fn, set_vmar_protect_fn, set_vmar_unmap_fn, set_yield_fn,
+    HeapExtendFn, ProcessCreateFn, ProcessCreateInJobFn, ProcessTerminateFn, ResourceMapFn,
+    ResourceUnmapFn, ThreadStartExFn, ThreadStartFn, VmarMapFn, VmarOpFn,
 };
 
 /// Result type for syscalls: `Ok(value)` or a negative error code.
@@ -206,6 +206,7 @@ pub fn dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> Syscal
         S::SystemTaskQuery => {
             system::sys_system_task_query(a1 as usize, a2 as *mut u8, a3 as usize)
         }
+        S::HandleGetKoid => handle::sys_handle_get_koid(a1 as HandleValue, a2 as *mut u64),
         S::SystemCurrentCpu => system::sys_system_current_cpu(),
         S::ProcessSetAffinityMask => {
             process::sys_process_set_affinity_mask(a1 as HandleValue, a2, a3 as usize)
@@ -213,6 +214,12 @@ pub fn dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> Syscal
         S::ProcessGetAffinity => {
             process::sys_process_get_affinity(a1 as HandleValue, a2 as *mut u64, a3 as *mut u64)
         }
+        S::ProcessSetAffinityMask256 => process::sys_process_set_affinity_mask_256(
+            a1 as *const huesos_abi::ProcessSetAffinityMask256Args,
+        ),
+        S::ProcessGetAffinityMask256 => process::sys_process_get_affinity_mask_256(
+            a1 as *const huesos_abi::ProcessGetAffinityMask256Args,
+        ),
         S::VmarCreateChild => process::sys_vmar_create_child(a1 as *const VmarCreateChildArgs),
         S::SignalCreate => signal::sys_signal_create(a1 as *mut HandleValue),
         S::SignalSet => signal::sys_signal_set(a1 as HandleValue),

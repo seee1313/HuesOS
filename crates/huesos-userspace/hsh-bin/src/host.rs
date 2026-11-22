@@ -5,6 +5,7 @@
 //! `pci`, `acpi`, `ps`, `fdisk`) is spawned as an external dynamic ELF from
 //! `HxFS` or `BOOTFS` with full `@caps(...)` attenuation.
 
+use alloc::collections::VecDeque;
 use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -13,7 +14,8 @@ use huesos_abi::auxv::caps_mask;
 use huesos_abi::hxfs::rights as hxfs_rights;
 use huesos_abi::term_ipc::{hsh_to_term, put_u16, term_to_hsh, MAX_WRITE_CHUNK};
 use huesos_hsh::{
-    CapsSpec, ExecOutcome, FbAccess, HostPathKind, HxfsAccess, ShellHost, Table, Value,
+    CapsSpec, ExecOutcome, FbAccess, HostPathKind, HxfsAccess, PipelineCommand, ShellHost, Table,
+    Value,
 };
 use libcanvas::process::{spawn_elf_from_vmo_with_caps, Process, SpawnCaps};
 use libcanvas::{wait_any, Channel, ErrorCode, Handle, Hxfs, Signals, Vmo, WaitItem};
@@ -41,6 +43,62 @@ pub enum DelegatedAction {
     Snake { hard: bool },
     Shutdown,
     Font(u8),
+}
+
+const MAX_PIPELINE_STAGES: usize = 4;
+const MAX_PIPELINE_JOBS: usize = 16;
+const MAX_PIPE_PENDING_BYTES: usize = 64 * 1024;
+const MAX_PENDING_BACKGROUND_OUTPUT_BYTES: usize = 512 * 1024;
+const PIPELINE_DRAIN_MESSAGES: usize = 32;
+
+struct SpawnedExternal {
+    process: Process,
+    pid: u64,
+    resolved: String,
+    owned_args: Vec<String>,
+}
+
+struct PipelineStage {
+    process: Process,
+    pid: u64,
+    stdin_w: Option<Channel>,
+    stdout_r: Option<Channel>,
+    stderr_r: Option<Channel>,
+    exit_code: Option<i32>,
+}
+
+struct PipelinePipe {
+    pending: VecDeque<Vec<u8>>,
+    pending_bytes: usize,
+    source_closed: bool,
+}
+
+struct PipelineRun {
+    stages: Vec<PipelineStage>,
+    pipes: Vec<PipelinePipe>,
+    output: Vec<u8>,
+    stderr: Vec<u8>,
+    direct_stream: bool,
+    background_stream: bool,
+    streamed_any: bool,
+    last_stream_byte: u8,
+}
+
+struct BackgroundJob {
+    id: u64,
+    pid: u64,
+    label: String,
+    run: Option<PipelineRun>,
+    status: Option<i32>,
+    output: Vec<u8>,
+    stderr: Vec<u8>,
+    notification_queued: bool,
+}
+
+struct PendingTerminalOutput {
+    fg: Option<(u8, u8, u8)>,
+    bytes: Vec<u8>,
+    cursor: usize,
 }
 
 /// Runtime environment owned by `/bin/hsh.elf`.
@@ -81,6 +139,10 @@ pub struct HshHost {
     pub interactive_stream: bool,
     /// Whether the most recent child run ended through the `Ctrl-C` path.
     pub last_child_interrupted: bool,
+    next_job_id: u64,
+    background_jobs: Vec<BackgroundJob>,
+    pending_background_output: VecDeque<PendingTerminalOutput>,
+    pending_background_output_bytes: usize,
 }
 
 /// Most output the shell keeps from one child.
@@ -226,6 +288,10 @@ impl HshHost {
             interrupt_polls: 0,
             interactive_stream: false,
             last_child_interrupted: false,
+            next_job_id: 1,
+            background_jobs: Vec::new(),
+            pending_background_output: VecDeque::new(),
+            pending_background_output_bytes: 0,
         };
         host.try_connect_hxfs();
         host
@@ -801,34 +867,27 @@ impl HshHost {
         None
     }
 
-    fn spawn_external(
+    fn spawn_prepared_child(
         &mut self,
         caps: Option<&CapsSpec>,
         name: &str,
         args: &[String],
-        stdin: Option<&Value>,
-        capture_output: bool,
-        separate_stderr: bool,
-    ) -> ExecOutcome {
+        stdin_r: &Channel,
+        stdout_w: &Channel,
+        stderr_w: &Channel,
+    ) -> Result<SpawnedExternal, ExecOutcome> {
         if self.bootfs.is_none() {
-            return ExecOutcome::err(1, "no BOOTFS VMO available for dynamic linker");
+            return Err(ExecOutcome::err(
+                1,
+                "no BOOTFS VMO available for dynamic linker",
+            ));
         }
 
         let Some((elf_vmo, off, len, resolved)) = self.resolve_elf(name) else {
-            return ExecOutcome::err(127, format!("unknown command: {name}"));
+            return Err(ExecOutcome::err(127, format!("unknown command: {name}")));
         };
 
         let mask = caps.map_or(caps_mask::ALL_DEFAULT, CapsSpec::to_caps_mask);
-        let Ok((stdin_r, stdin_w)) = Channel::pair() else {
-            return ExecOutcome::err(1, "failed creating stdin channel");
-        };
-        let Ok((stdout_r, stdout_w)) = Channel::pair() else {
-            return ExecOutcome::err(1, "failed creating stdout channel");
-        };
-        let Ok((stderr_r, stderr_w)) = Channel::pair() else {
-            return ExecOutcome::err(1, "failed creating stderr channel");
-        };
-
         self.try_connect_hxfs();
         let mut dir_holder: Option<libcanvas::HxfsDirectory> = None;
         let mut svc_holder: Option<Channel> = None;
@@ -883,11 +942,8 @@ impl HshHost {
         }
 
         // Utilities take paths, not a working directory, so path arguments are
-        // resolved here. Everything that is *data* -- numbers, sizes, values
-        // after a flag that takes one, `key=value` pairs, subcommand words --
-        // has to arrive at the tool exactly as it was typed.
-        // Exception: when `@caps(dir=/sub)` confines the child to a subtree,
-        // non-leading-slash paths stay relative to that granted directory.
+        // resolved here. Data operands stay exactly as typed. A directory grant
+        // makes relative paths meaningful inside the granted subtree.
         let dir_confined = caps.is_some_and(|c| c.dir.is_some());
         let mut owned_args = if dir_confined {
             args.to_vec()
@@ -911,21 +967,23 @@ impl HshHost {
 
         let mut argv_strs: Vec<&str> = Vec::with_capacity(1 + owned_args.len());
         argv_strs.push(&resolved);
-        for a in &owned_args {
-            argv_strs.push(a.as_str());
+        for arg in &owned_args {
+            argv_strs.push(arg.as_str());
         }
 
         let Some(lib_vmo) = self.bootfs.as_ref() else {
-            return ExecOutcome::err(1, "no BOOTFS VMO available for dynamic linker");
+            return Err(ExecOutcome::err(
+                1,
+                "no BOOTFS VMO available for dynamic linker",
+            ));
         };
-
         let mut spawn_caps = SpawnCaps::new();
         spawn_caps.args = &argv_strs;
         spawn_caps.caps_mask = mask;
-        spawn_caps.stdin = Some(&stdin_r);
-        spawn_caps.stdout = Some(&stdout_w);
-        spawn_caps.stderr = Some(&stderr_w);
-        spawn_caps.hxfs_dir = dir_holder.as_ref().map(|d| d.channel());
+        spawn_caps.stdin = Some(stdin_r);
+        spawn_caps.stdout = Some(stdout_w);
+        spawn_caps.stderr = Some(stderr_w);
+        spawn_caps.hxfs_dir = dir_holder.as_ref().map(|dir| dir.channel());
         spawn_caps.hxfs_service = svc_holder.as_ref();
         spawn_caps.block_dev = blk_holder.as_ref();
         spawn_caps.frame_draw = frame_draw;
@@ -933,23 +991,68 @@ impl HshHost {
 
         let spawned =
             spawn_elf_from_vmo_with_caps(&resolved, &elf_vmo, off, len, lib_vmo, &spawn_caps);
-        drop(stdin_r);
-        drop(stdout_w);
-        drop(stderr_w);
         drop(dir_holder);
         drop(svc_holder);
         drop(blk_holder);
         drop(query_holder);
         drop(elf_vmo);
 
-        let (process, child_bootstrap) = match spawned {
-            Ok(pair) => pair,
-            Err(e) => {
-                return ExecOutcome::err(1, format!("spawn '{resolved}' failed: {}", e.as_str()));
+        let (process, child_bootstrap) = spawned.map_err(|error| {
+            ExecOutcome::err(1, format!("spawn '{resolved}' failed: {}", error.as_str()))
+        })?;
+        drop(child_bootstrap);
+        let pid = match process.koid() {
+            Ok(koid) => koid,
+            Err(error) => {
+                let _ = process.terminate(1);
+                return Err(ExecOutcome::err(
+                    1,
+                    format!("could not read child process KOID: {}", error.as_str()),
+                ));
             }
         };
-        drop(child_bootstrap);
-        let pid = u64::from(process.handle().raw());
+
+        Ok(SpawnedExternal {
+            process,
+            pid,
+            resolved,
+            owned_args,
+        })
+    }
+
+    fn spawn_external(
+        &mut self,
+        caps: Option<&CapsSpec>,
+        name: &str,
+        args: &[String],
+        stdin: Option<&Value>,
+        capture_output: bool,
+        separate_stderr: bool,
+    ) -> ExecOutcome {
+        let Ok((stdin_r, stdin_w)) = Channel::pair() else {
+            return ExecOutcome::err(1, "failed creating stdin channel");
+        };
+        let Ok((stdout_r, stdout_w)) = Channel::pair() else {
+            return ExecOutcome::err(1, "failed creating stdout channel");
+        };
+        let Ok((stderr_r, stderr_w)) = Channel::pair() else {
+            return ExecOutcome::err(1, "failed creating stderr channel");
+        };
+
+        let spawned = self.spawn_prepared_child(caps, name, args, &stdin_r, &stdout_w, &stderr_w);
+        drop(stdin_r);
+        drop(stdout_w);
+        drop(stderr_w);
+        let SpawnedExternal {
+            process,
+            pid,
+            resolved,
+            owned_args,
+        } = match spawned {
+            Ok(child) => child,
+            Err(error) => return error,
+        };
+
         let short_name = resolved.rsplit('/').next().unwrap_or(&resolved);
         let active_label = format!("{short_name} [{pid}]");
         if self.status_hook.is_some() && self.ipc_out.is_some() {
@@ -997,6 +1100,7 @@ impl HshHost {
         // still hand the prompt back rather than spin forever on a dead child.
         let mut interrupt_deadline: Option<u64> = None;
         while out_open || err_open {
+            self.poll_background_jobs_impl();
             let mut progressed = false;
             if out_open {
                 loop {
@@ -1171,6 +1275,782 @@ impl HshHost {
             clear_screen: false,
             exit_requested: false,
             child_pid: Some(pid),
+        }
+    }
+
+    fn start_pipeline_run(
+        &mut self,
+        commands: &[PipelineCommand],
+        capture_output: bool,
+        background: bool,
+    ) -> Result<PipelineRun, ExecOutcome> {
+        if commands.is_empty() {
+            return Err(ExecOutcome::err(2, "empty pipeline"));
+        }
+        if commands.len() > MAX_PIPELINE_STAGES {
+            return Err(ExecOutcome::err(
+                2,
+                format!("pipeline exceeds the {MAX_PIPELINE_STAGES}-stage limit"),
+            ));
+        }
+        if background {
+            self.prune_background_job_history();
+            if self.background_jobs.len() >= MAX_PIPELINE_JOBS {
+                return Err(ExecOutcome::err(
+                    1,
+                    format!("background job table is full ({MAX_PIPELINE_JOBS} jobs)"),
+                ));
+            }
+        }
+
+        let live_stdin = !background
+            && self.interactive_stream
+            && !capture_output
+            && self.ipc_out.is_some()
+            && self.key_source.is_some();
+        let mut run = PipelineRun {
+            stages: Vec::with_capacity(commands.len()),
+            pipes: Vec::with_capacity(commands.len().saturating_sub(1)),
+            output: Vec::new(),
+            stderr: Vec::new(),
+            direct_stream: false,
+            background_stream: false,
+            streamed_any: false,
+            last_stream_byte: b'\n',
+        };
+        let mut last_is_tsv = false;
+
+        for (index, command) in commands.iter().enumerate() {
+            let Ok((stdin_r, stdin_w)) = Channel::pair() else {
+                for stage in &run.stages {
+                    let _ = stage.process.terminate(1);
+                }
+                return Err(ExecOutcome::err(
+                    1,
+                    "failed creating pipeline stdin channel",
+                ));
+            };
+            let Ok((stdout_r, stdout_w)) = Channel::pair() else {
+                for stage in &run.stages {
+                    let _ = stage.process.terminate(1);
+                }
+                return Err(ExecOutcome::err(
+                    1,
+                    "failed creating pipeline stdout channel",
+                ));
+            };
+            let Ok((stderr_r, stderr_w)) = Channel::pair() else {
+                for stage in &run.stages {
+                    let _ = stage.process.terminate(1);
+                }
+                return Err(ExecOutcome::err(
+                    1,
+                    "failed creating pipeline stderr channel",
+                ));
+            };
+
+            let spawned = self.spawn_prepared_child(
+                command.caps.as_ref(),
+                &command.name,
+                &command.args,
+                &stdin_r,
+                &stdout_w,
+                &stderr_w,
+            );
+            drop(stdin_r);
+            drop(stdout_w);
+            drop(stderr_w);
+            let SpawnedExternal {
+                process,
+                pid,
+                resolved,
+                owned_args,
+            } = match spawned {
+                Ok(child) => child,
+                Err(error) => {
+                    for stage in &run.stages {
+                        let _ = stage.process.terminate(1);
+                    }
+                    return Err(error);
+                }
+            };
+
+            let stdin_w = if index == 0 && !live_stdin {
+                drop(stdin_w);
+                None
+            } else {
+                Some(stdin_w)
+            };
+            if index > 0 {
+                run.pipes.push(PipelinePipe {
+                    pending: VecDeque::new(),
+                    pending_bytes: 0,
+                    source_closed: false,
+                });
+            }
+            run.stages.push(PipelineStage {
+                process,
+                pid,
+                stdin_w,
+                stdout_r: Some(stdout_r),
+                stderr_r: Some(stderr_r),
+                exit_code: None,
+            });
+            if index + 1 == commands.len() {
+                last_is_tsv = command_emits_tsv_table(&resolved, &owned_args);
+            }
+        }
+
+        run.direct_stream = !background
+            && self.interactive_stream
+            && !capture_output
+            && self.ipc_out.is_some()
+            && !last_is_tsv;
+        run.background_stream =
+            background && self.interactive_stream && !capture_output && self.ipc_out.is_some();
+
+        let leader_pid = run.stages[0].pid;
+        let active_label = format!("pipeline [{leader_pid}]");
+        if !background && self.status_hook.is_some() && self.ipc_out.is_some() {
+            let caps_txt = self.caps_summary();
+            if let (Some(hook), Some(channel)) = (self.status_hook, self.ipc_out.as_ref()) {
+                hook(channel, &self.pwd, &active_label, &caps_txt);
+            }
+        }
+        Ok(run)
+    }
+
+    fn exec_external_pipeline(
+        &mut self,
+        commands: &[PipelineCommand],
+        background: bool,
+        capture_output: bool,
+    ) -> ExecOutcome {
+        let mut run = match self.start_pipeline_run(commands, capture_output, background) {
+            Ok(run) => run,
+            Err(error) => return error,
+        };
+        let leader_pid = run.stages[0].pid;
+
+        if background {
+            self.prune_background_job_history();
+            if self.background_jobs.len() >= MAX_PIPELINE_JOBS {
+                for stage in &run.stages {
+                    let _ = stage.process.terminate(1);
+                }
+                return ExecOutcome::err(
+                    1,
+                    format!("background job table is full ({MAX_PIPELINE_JOBS} jobs)"),
+                );
+            }
+            let id = self.next_job_id;
+            self.next_job_id = self.next_job_id.wrapping_add(1).max(1);
+            let label = pipeline_label(commands);
+            self.background_jobs.push(BackgroundJob {
+                id,
+                pid: leader_pid,
+                label: label.clone(),
+                run: Some(run),
+                status: None,
+                output: Vec::new(),
+                stderr: Vec::new(),
+                notification_queued: false,
+            });
+            return ExecOutcome {
+                status: 0,
+                output: Value::Text(format!("[{id}] started {label}")),
+                stderr: String::new(),
+                clear_screen: false,
+                exit_requested: false,
+                child_pid: Some(leader_pid),
+            };
+        }
+
+        self.last_child_interrupted = false;
+        let mut interrupted = false;
+        loop {
+            let (finished, progressed) = self.pump_pipeline_run(&mut run);
+            if finished {
+                break;
+            }
+            self.poll_background_jobs_impl();
+            if !interrupted {
+                let interrupt = {
+                    let first = &run.stages[0];
+                    self.poll_child_input(&first.process, first.stdin_w.as_ref())
+                };
+                if interrupt {
+                    interrupted = true;
+                    self.last_child_interrupted = true;
+                    for stage in &run.stages {
+                        let _ = stage.process.terminate(CTRL_C_EXIT_CODE);
+                    }
+                    run.stages[0].stdin_w.take();
+                }
+            }
+            if !progressed {
+                self.wait_for_pipeline_activity(&run);
+            }
+        }
+        let outcome = self.finish_pipeline_run(run, interrupted);
+        if self.status_hook.is_some() && self.ipc_out.is_some() {
+            let caps_txt = self.caps_summary();
+            if let (Some(hook), Some(channel)) = (self.status_hook, self.ipc_out.as_ref()) {
+                hook(channel, &self.pwd, "hsh.elf", &caps_txt);
+            }
+        }
+        outcome
+    }
+
+    /// Drain all connected channels without blocking, applying bounded
+    /// backpressure to each intermediate pipeline edge.
+    fn pump_pipeline_run(&mut self, run: &mut PipelineRun) -> (bool, bool) {
+        let mut progressed = false;
+        let mut chunk = [0u8; 4096];
+
+        for edge in 0..run.pipes.len() {
+            if run.stages[edge + 1].stdin_w.is_none() {
+                run.pipes[edge].pending.clear();
+                run.pipes[edge].pending_bytes = 0;
+            } else {
+                while let Some(message) = run.pipes[edge].pending.front().cloned() {
+                    let Some(writer) = run.stages[edge + 1].stdin_w.as_ref() else {
+                        break;
+                    };
+                    let result = writer.write(&message);
+                    match result {
+                        Ok(()) => {
+                            run.pipes[edge].pending.pop_front();
+                            run.pipes[edge].pending_bytes =
+                                run.pipes[edge].pending_bytes.saturating_sub(message.len());
+                            progressed = true;
+                        }
+                        Err(ErrorCode::ShouldWait) => break,
+                        Err(_) => {
+                            run.stages[edge + 1].stdin_w.take();
+                            run.pipes[edge].pending.clear();
+                            run.pipes[edge].pending_bytes = 0;
+                            break;
+                        }
+                    }
+                }
+            }
+
+            for _ in 0..PIPELINE_DRAIN_MESSAGES {
+                if run.pipes[edge].pending_bytes >= MAX_PIPE_PENDING_BYTES {
+                    break;
+                }
+                let Some(reader) = run.stages[edge].stdout_r.as_ref() else {
+                    break;
+                };
+                match reader.read_into(&mut chunk) {
+                    Ok(0) => {
+                        progressed = true;
+                        continue;
+                    }
+                    Ok(n) => {
+                        progressed = true;
+                        if run.stages[edge + 1].stdin_w.is_some() {
+                            run.pipes[edge].pending.push_back(chunk[..n].to_vec());
+                            run.pipes[edge].pending_bytes =
+                                run.pipes[edge].pending_bytes.saturating_add(n);
+                        }
+                    }
+                    Err(ErrorCode::ShouldWait) | Err(ErrorCode::TimedOut) => {
+                        if run.stages[edge].exit_code.is_some() {
+                            run.pipes[edge].source_closed = true;
+                            run.stages[edge].stdout_r.take();
+                        }
+                        break;
+                    }
+                    Err(_) => {
+                        run.pipes[edge].source_closed = true;
+                        run.stages[edge].stdout_r.take();
+                        break;
+                    }
+                }
+            }
+            if run.pipes[edge].source_closed
+                && run.pipes[edge].pending.is_empty()
+                && run.stages[edge + 1].stdin_w.is_some()
+            {
+                run.stages[edge + 1].stdin_w.take();
+                progressed = true;
+            }
+        }
+
+        let mut all_output_drained = true;
+        let last = run.stages.len().saturating_sub(1);
+        if let Some(reader) = run.stages[last].stdout_r.as_ref() {
+            let mut hit_drain_limit = false;
+            for drained in 0..PIPELINE_DRAIN_MESSAGES {
+                match reader.read_into(&mut chunk) {
+                    Ok(0) => {
+                        progressed = true;
+                        hit_drain_limit = drained + 1 == PIPELINE_DRAIN_MESSAGES;
+                    }
+                    Ok(n) => {
+                        progressed = true;
+                        if run.direct_stream {
+                            self.forward_stream_bytes(None, &chunk[..n]);
+                            run.streamed_any = true;
+                            run.last_stream_byte = chunk[n - 1];
+                        } else if run.background_stream {
+                            self.enqueue_background_output(None, chunk[..n].to_vec());
+                        } else {
+                            run.output.extend_from_slice(&chunk[..n]);
+                            trim_capture(&mut run.output);
+                        }
+                        hit_drain_limit = drained + 1 == PIPELINE_DRAIN_MESSAGES;
+                    }
+                    Err(ErrorCode::ShouldWait) | Err(ErrorCode::TimedOut) => break,
+                    Err(_) => {
+                        run.stages[last].stdout_r.take();
+                        break;
+                    }
+                }
+            }
+            if hit_drain_limit {
+                all_output_drained = false;
+            }
+        }
+
+        for index in 0..run.stages.len() {
+            if let Some(reader) = run.stages[index].stderr_r.as_ref() {
+                let mut hit_drain_limit = false;
+                for drained in 0..PIPELINE_DRAIN_MESSAGES {
+                    match reader.read_into(&mut chunk) {
+                        Ok(0) => {
+                            progressed = true;
+                            hit_drain_limit = drained + 1 == PIPELINE_DRAIN_MESSAGES;
+                        }
+                        Ok(n) => {
+                            progressed = true;
+                            if run.direct_stream {
+                                self.forward_stream_bytes(Some((255, 110, 110)), &chunk[..n]);
+                                run.streamed_any = true;
+                                run.last_stream_byte = chunk[n - 1];
+                            } else if run.background_stream {
+                                self.enqueue_background_output(
+                                    Some((255, 110, 110)),
+                                    chunk[..n].to_vec(),
+                                );
+                            } else {
+                                run.stderr.extend_from_slice(&chunk[..n]);
+                                trim_capture(&mut run.stderr);
+                            }
+                            hit_drain_limit = drained + 1 == PIPELINE_DRAIN_MESSAGES;
+                        }
+                        Err(ErrorCode::ShouldWait) | Err(ErrorCode::TimedOut) => break,
+                        Err(_) => {
+                            run.stages[index].stderr_r.take();
+                            break;
+                        }
+                    }
+                }
+                if hit_drain_limit {
+                    all_output_drained = false;
+                }
+            }
+            if run.stages[index].exit_code.is_none() {
+                run.stages[index].exit_code = match run.stages[index].process.poll_exit() {
+                    Ok(Some(code)) => Some(code as i32),
+                    Ok(None) => None,
+                    Err(_) => Some(-1),
+                };
+            }
+        }
+
+        let all_exited = run.stages.iter().all(|stage| stage.exit_code.is_some());
+        if all_exited && all_output_drained {
+            // No child can consume any remaining queued input. Output channels
+            // were drained above; discard leftovers from stages whose consumer
+            // exited early, then release all endpoints with the run.
+            for pipe in &mut run.pipes {
+                pipe.pending.clear();
+                pipe.pending_bytes = 0;
+            }
+            for stage in &mut run.stages {
+                stage.stdin_w.take();
+            }
+            return (true, progressed);
+        }
+        (false, progressed)
+    }
+
+    fn wait_for_pipeline_activity(&self, run: &PipelineRun) {
+        let mut items = [WaitItem::new(0, Signals::NONE, 0); libcanvas::waitset::MAX_ITEMS];
+        let mut count = 0usize;
+
+        for stage in &run.stages {
+            if let Some(reader) = stage.stdout_r.as_ref() {
+                add_wait_item(
+                    &mut items,
+                    &mut count,
+                    reader.handle(),
+                    Signals::READABLE | Signals::PEER_CLOSED,
+                );
+            }
+            if let Some(reader) = stage.stderr_r.as_ref() {
+                add_wait_item(
+                    &mut items,
+                    &mut count,
+                    reader.handle(),
+                    Signals::READABLE | Signals::PEER_CLOSED,
+                );
+            }
+        }
+        for (edge, pipe) in run.pipes.iter().enumerate() {
+            if !pipe.pending.is_empty() {
+                if let Some(writer) = run.stages[edge + 1].stdin_w.as_ref() {
+                    add_wait_item(
+                        &mut items,
+                        &mut count,
+                        writer.handle(),
+                        Signals::WRITABLE | Signals::PEER_CLOSED,
+                    );
+                }
+            }
+        }
+        for stage in &run.stages {
+            if stage.exit_code.is_none() {
+                add_wait_item(
+                    &mut items,
+                    &mut count,
+                    stage.process.handle(),
+                    Signals::SIGNALED,
+                );
+            }
+        }
+        if let Some(keys) = self.key_source.as_ref() {
+            add_wait_item(
+                &mut items,
+                &mut count,
+                keys.handle(),
+                Signals::READABLE | Signals::PEER_CLOSED,
+            );
+        }
+
+        if count == 0 {
+            libcanvas::process::yield_now();
+        } else {
+            let _ = wait_any(&items[..count], 20);
+        }
+    }
+
+    fn finish_pipeline_run(&self, run: PipelineRun, interrupted: bool) -> ExecOutcome {
+        let status = run
+            .stages
+            .last()
+            .and_then(|stage| stage.exit_code)
+            .unwrap_or(-1);
+        let pid = run.stages.first().map(|stage| stage.pid);
+        if run.direct_stream {
+            if interrupted {
+                self.forward_stream_bytes(None, b"\x1b[?25h\x1b[0m");
+                self.forward_stream_bytes(Some((255, 110, 110)), b"\n^C\n");
+            } else {
+                self.forward_stream_bytes(None, b"\x1b[?25h\x1b[0m");
+                if run.streamed_any && run.last_stream_byte != b'\n' {
+                    self.forward_stream_bytes(None, b"\n");
+                }
+            }
+            return ExecOutcome {
+                status,
+                output: Value::Empty,
+                stderr: String::new(),
+                clear_screen: false,
+                exit_requested: false,
+                child_pid: pid,
+            };
+        }
+
+        let mut stdout = String::from_utf8_lossy(&run.output).into_owned();
+        let stderr = String::from_utf8_lossy(&run.stderr).into_owned();
+        if interrupted {
+            stdout = format!("^C\n{stdout}");
+        }
+        let combined = format!("{stdout}{stderr}");
+        let output = if status == 0 && stderr.is_empty() {
+            Table::from_tsv(&stdout)
+                .map(Value::Table)
+                .unwrap_or_else(|| Value::Text(combined.trim_end_matches('\n').into()))
+        } else {
+            Value::Text(combined.trim_end_matches('\n').into())
+        };
+        ExecOutcome {
+            status,
+            output,
+            stderr,
+            clear_screen: false,
+            exit_requested: false,
+            child_pid: pid,
+        }
+    }
+
+    fn prune_background_job_history(&mut self) {
+        while self.background_jobs.len() >= MAX_PIPELINE_JOBS {
+            let Some(index) = self
+                .background_jobs
+                .iter()
+                .position(|job| job.status.is_some() && job.notification_queued)
+            else {
+                break;
+            };
+            self.background_jobs.remove(index);
+        }
+    }
+
+    fn poll_background_jobs_impl(&mut self) {
+        let mut jobs = core::mem::take(&mut self.background_jobs);
+        for job in &mut jobs {
+            let finished = job
+                .run
+                .as_mut()
+                .is_some_and(|run| self.pump_pipeline_run(run).0);
+            if finished {
+                if let Some(run) = job.run.take() {
+                    job.status = Some(
+                        run.stages
+                            .last()
+                            .and_then(|stage| stage.exit_code)
+                            .unwrap_or(-1),
+                    );
+                    job.output = run.output;
+                    job.stderr = run.stderr;
+                }
+            }
+        }
+        self.background_jobs = jobs;
+        self.queue_completed_job_notifications();
+        self.flush_pending_background_output();
+    }
+
+    fn queue_completed_job_notifications(&mut self) {
+        if self.ipc_out.is_none() {
+            return;
+        }
+        let mut completed = Vec::new();
+        for job in &mut self.background_jobs {
+            let Some(status) = job.status else {
+                continue;
+            };
+            if job.notification_queued {
+                continue;
+            }
+            job.notification_queued = true;
+            completed.push((
+                job.id,
+                job.pid,
+                status,
+                job.label.clone(),
+                core::mem::take(&mut job.output),
+                core::mem::take(&mut job.stderr),
+            ));
+        }
+
+        for (id, pid, status, label, output, stderr) in completed {
+            self.enqueue_background_output(
+                None,
+                format!("\n[{id}] Done ({status}) {label} [{pid}]\n").into_bytes(),
+            );
+            self.enqueue_background_output(None, output);
+            self.enqueue_background_output(Some((255, 110, 110)), stderr);
+        }
+    }
+
+    fn enqueue_background_output(&mut self, fg: Option<(u8, u8, u8)>, mut bytes: Vec<u8>) {
+        let available = MAX_PENDING_BACKGROUND_OUTPUT_BYTES
+            .saturating_sub(self.pending_background_output_bytes);
+        if available == 0 || bytes.is_empty() {
+            return;
+        }
+        bytes.truncate(available);
+        self.pending_background_output_bytes += bytes.len();
+        self.pending_background_output
+            .push_back(PendingTerminalOutput {
+                fg,
+                bytes,
+                cursor: 0,
+            });
+    }
+
+    /// Try a bounded amount of queued job output so idle job polling never
+    /// blocks the shell on a slow terminal consumer.
+    fn flush_pending_background_output(&mut self) {
+        let Some(channel) = self.ipc_out.as_ref() else {
+            return;
+        };
+        for _ in 0..8 {
+            let Some(front) = self.pending_background_output.front_mut() else {
+                break;
+            };
+            if front.cursor >= front.bytes.len() {
+                self.pending_background_output.pop_front();
+                continue;
+            }
+            let take = (front.bytes.len() - front.cursor).min(MAX_WRITE_CHUNK);
+            let (use_fg, r, g, b) = match front.fg {
+                Some((r, g, b)) => (1u8, r, g, b),
+                None => (0u8, 0, 0, 0),
+            };
+            let mut packet = [0u8; 7 + MAX_WRITE_CHUNK];
+            packet[0] = hsh_to_term::TAG_WRITE;
+            packet[1] = use_fg;
+            packet[2] = r;
+            packet[3] = g;
+            packet[4] = b;
+            put_u16(&mut packet, 5, take as u16);
+            packet[7..7 + take].copy_from_slice(&front.bytes[front.cursor..front.cursor + take]);
+            match channel.write(&packet[..7 + take]) {
+                Ok(()) => {
+                    front.cursor += take;
+                    self.pending_background_output_bytes =
+                        self.pending_background_output_bytes.saturating_sub(take);
+                    if front.cursor == front.bytes.len() {
+                        self.pending_background_output.pop_front();
+                    }
+                }
+                Err(ErrorCode::ShouldWait) => break,
+                Err(_) => {
+                    self.pending_background_output.clear();
+                    self.pending_background_output_bytes = 0;
+                    break;
+                }
+            }
+        }
+    }
+
+    fn shutdown_background_jobs(&mut self) {
+        for job in &self.background_jobs {
+            if let Some(run) = job.run.as_ref() {
+                for stage in &run.stages {
+                    let _ = stage.process.terminate(CTRL_C_EXIT_CODE);
+                }
+            }
+        }
+        self.background_jobs.clear();
+        self.pending_background_output.clear();
+        self.pending_background_output_bytes = 0;
+    }
+
+    fn cmd_jobs(&self) -> ExecOutcome {
+        if self.background_jobs.is_empty() {
+            return ExecOutcome::ok_text("no background jobs");
+        }
+        let mut output = String::new();
+        for job in &self.background_jobs {
+            match job.status {
+                Some(status) => output.push_str(&format!(
+                    "[{}] Done ({status}) {} [{}]\n",
+                    job.id, job.label, job.pid
+                )),
+                None => output.push_str(&format!(
+                    "[{}] Running {} [{}]\n",
+                    job.id, job.label, job.pid
+                )),
+            }
+        }
+        ExecOutcome::ok_text(output.trim_end_matches('\n'))
+    }
+
+    fn cmd_kill(&mut self, args: &[String]) -> ExecOutcome {
+        if args.len() != 1 {
+            return ExecOutcome::err(2, "usage: kill <job-id>");
+        }
+        let Ok(id) = args[0].parse::<u64>() else {
+            return ExecOutcome::err(2, "kill: expected a background job id from `jobs`");
+        };
+        let Some(job) = self.background_jobs.iter().find(|job| job.id == id) else {
+            return ExecOutcome::err(1, format!("kill: no such background job: {id}"));
+        };
+        let Some(run) = job.run.as_ref() else {
+            return ExecOutcome::err(1, format!("kill: job {id} has already completed"));
+        };
+        for stage in &run.stages {
+            let _ = stage.process.terminate(CTRL_C_EXIT_CODE);
+        }
+        ExecOutcome::ok_text(format!("[{id}] termination requested"))
+    }
+
+    fn wait_background_job(&mut self, id: u64) -> Option<ExecOutcome> {
+        if !self.background_jobs.iter().any(|job| job.id == id) {
+            return None;
+        }
+        loop {
+            self.poll_background_jobs_impl();
+            let finished = self
+                .background_jobs
+                .iter()
+                .find(|job| job.id == id)
+                .is_some_and(|job| job.status.is_some());
+            if finished {
+                break;
+            }
+            libcanvas::process::yield_now();
+        }
+
+        let index = self.background_jobs.iter().position(|job| job.id == id)?;
+        let job = self.background_jobs.remove(index);
+        let status = job.status.unwrap_or(-1);
+        let output = if self.ipc_out.is_none() {
+            let stdout = String::from_utf8_lossy(&job.output);
+            let stderr = String::from_utf8_lossy(&job.stderr);
+            Value::Text(format!("{stdout}{stderr}").trim_end_matches('\n').into())
+        } else {
+            Value::Text(format!("[{id}] completed with status {status}"))
+        };
+        Some(ExecOutcome {
+            status,
+            output,
+            stderr: String::new(),
+            clear_screen: false,
+            exit_requested: false,
+            child_pid: Some(job.pid),
+        })
+    }
+
+    fn cmd_wait(&mut self, args: &[String]) -> ExecOutcome {
+        if args.len() > 1 {
+            return ExecOutcome::err(2, "usage: wait [job-id]");
+        }
+        if let Some(raw_id) = args.first() {
+            let Ok(id) = raw_id.parse::<u64>() else {
+                return ExecOutcome::err(2, "wait: expected a background job id from `jobs`");
+            };
+            return self
+                .wait_background_job(id)
+                .unwrap_or_else(|| ExecOutcome::err(1, format!("wait: no such job: {id}")));
+        }
+
+        let ids: Vec<u64> = self.background_jobs.iter().map(|job| job.id).collect();
+        let mut status = 0;
+        let mut output = String::new();
+        let mut pid = None;
+        for id in ids {
+            if let Some(result) = self.wait_background_job(id) {
+                status = result.status;
+                pid = result.child_pid;
+                let text = result.output.into_text();
+                if !text.is_empty() {
+                    if !output.is_empty() {
+                        output.push('\n');
+                    }
+                    output.push_str(&text);
+                }
+            }
+        }
+        ExecOutcome {
+            status,
+            output: if output.is_empty() {
+                Value::Empty
+            } else {
+                Value::Text(output)
+            },
+            stderr: String::new(),
+            clear_screen: false,
+            exit_requested: false,
+            child_pid: pid,
         }
     }
 
@@ -1372,6 +2252,28 @@ fn vec_str(items: &[&str]) -> Vec<String> {
     items.iter().map(|s| String::from(*s)).collect()
 }
 
+fn pipeline_label(commands: &[PipelineCommand]) -> String {
+    let mut label = String::new();
+    for (index, command) in commands.iter().enumerate() {
+        if index != 0 {
+            label.push_str(" | ");
+        }
+        label.push_str(&command.name);
+        for arg in &command.args {
+            label.push(' ');
+            label.push_str(arg);
+        }
+    }
+    label
+}
+
+fn add_wait_item(items: &mut [WaitItem], count: &mut usize, handle: &Handle, signals: Signals) {
+    if *count < items.len() {
+        items[*count] = WaitItem::new(handle.raw(), signals, *count as u64);
+        *count += 1;
+    }
+}
+
 impl ShellHost for HshHost {
     fn exec_command(
         &mut self,
@@ -1422,8 +2324,9 @@ impl ShellHost for HshHost {
             },
             "help" => ExecOutcome::ok_text(concat!(
                 "hsh intrinsics:\n",
-                "  help | cls | clear | echo | printf | test | [ | true | false | export | env | pwd | cd <dir> | caps | history | exit\n",
+                "  help | cls | clear | echo | printf | test | [ | true | false | export | env | pwd | cd <dir> | caps | history | jobs | wait | kill | exit\n",
                 "  pipes: | where <col> <op> <val> | select <cols> | sort [--desc] [col] | head [n] | tail [n] | count | grep <pat>\n",
+                "  jobs:  command & | jobs | wait [job-id] | kill <job-id>\n",
                 "  lang:  let x = ...; x = $((x + 1)); if/elif/else; while ... { break; continue }; for x in [...]; fn f(a) { ... }\n",
                 "  caps:  @caps(hxfs=none|ro|rw, bootfs=ro|none, fb=none|ro, dir=/sub:ro) <cmd>\n",
                 "  apps:  doom | snake [hard] | btop | nano <file> | font <cozette|tty|compact> | shutdown\n",
@@ -1449,6 +2352,9 @@ impl ShellHost for HshHost {
                 }
                 ExecOutcome::ok_text(out.trim_end_matches('\n'))
             }
+            "jobs" => self.cmd_jobs(),
+            "wait" => self.cmd_wait(args),
+            "kill" => self.cmd_kill(args),
             "caps" => self.cmd_caps(),
             "font" => match args.first().map(String::as_str) {
                 Some("cozette") => {
@@ -1480,6 +2386,23 @@ impl ShellHost for HshHost {
             }
             _ => self.spawn_external(caps, name, args, stdin, capture_output, separate_stderr),
         }
+    }
+
+    fn exec_pipeline(
+        &mut self,
+        stages: &[PipelineCommand],
+        background: bool,
+        capture_output: bool,
+    ) -> Option<ExecOutcome> {
+        Some(self.exec_external_pipeline(stages, background, capture_output))
+    }
+
+    fn poll_background_jobs(&mut self) {
+        self.poll_background_jobs_impl();
+    }
+
+    fn shutdown_background_jobs(&mut self) {
+        HshHost::shutdown_background_jobs(self);
     }
 
     fn write_file(&mut self, path: &str, data: &[u8], append: bool) -> Result<(), String> {

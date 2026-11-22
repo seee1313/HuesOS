@@ -1,3 +1,6 @@
+//! Print DriverManager's supervised-process list. The first column is the
+//! stable kernel Process KOID, never a process-local handle-table slot.
+
 #![no_std]
 #![no_main]
 

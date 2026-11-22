@@ -1,10 +1,12 @@
 //! Host-testable policy core for HuesOS Scheduler/SMP v2.
 //!
-//! This crate contains no context switching, APIC access, allocation, or
-//! privileged synchronization. It defines identities, masks, lifecycle
-//! transitions, remote-inbox geometry, EEVDF policy, and CBS admission as pure
-//! or bounded mechanisms. The kernel integration must preserve these
-//! invariants; passing these tests alone is not a production-grade claim.
+//! This crate contains no context switching, APIC access, or privileged
+//! synchronization. It defines identities, masks, lifecycle transitions,
+//! remote-inbox geometry, EEVDF policy, and CBS admission as pure or bounded
+//! mechanisms. EEVDF trees reserve their fixed-capacity backing lazily with a
+//! fallible allocation, keeping large tree values off caller stacks. The kernel
+//! integration must preserve these invariants; passing these tests alone is
+//! not a production-grade claim.
 
 #![no_std]
 #![forbid(unsafe_code)]
@@ -580,8 +582,12 @@ pub mod task_operations {
     pub const POLICY: u64 = 1 << 3;
     pub const THROTTLE: u64 = 1 << 4;
     pub const MIGRATION: u64 = 1 << 5;
+    /// Deferred remote task insertion (`Embryo -> DeferredReady -> Ready` on target CPU).
+    pub const SPAWN: u64 = 1 << 6;
+    /// Owner-local slot and stack reclamation after `Dying -> Dead`.
+    pub const REAP: u64 = 1 << 7;
     /// Public flags must fit below the complete 51-bit generation tag.
-    pub const ALL: u64 = WAKE | KILL | AFFINITY | POLICY | THROTTLE | MIGRATION;
+    pub const ALL: u64 = WAKE | KILL | AFFINITY | POLICY | THROTTLE | MIGRATION | SPAWN | REAP;
     const _: () = assert!(ALL <= super::TASK_INDEX_MASK);
 }
 
@@ -1254,7 +1260,8 @@ impl<const N: usize> Default for EevdfModel<N> {
     }
 }
 
-fn virtual_delta(runtime_ns: u64, weight: u64) -> Result<u128, EevdfError> {
+/// Scale `runtime_ns` into virtual time against `weight` (`NICE_0_WEIGHT = 1024`).
+pub fn virtual_delta(runtime_ns: u64, weight: u64) -> Result<u128, EevdfError> {
     if weight == 0 {
         return Err(EevdfError::InvalidWeight);
     }

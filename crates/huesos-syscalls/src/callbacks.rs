@@ -20,7 +20,12 @@ pub(crate) static DEBUG_WRITE_FN: Mutex<Option<DebugWriteFn>> = Mutex::new(None)
 /// Global monotonic-clock callback.
 pub(crate) static CLOCK_FN: Mutex<Option<fn() -> u64>> = Mutex::new(None);
 /// Global online-CPU mask callback.
+type CpuCountFn = fn() -> usize;
+type CpuOnlineFn = fn(usize) -> bool;
+
 pub(crate) static CPU_MASK_FN: Mutex<Option<fn() -> u64>> = Mutex::new(None);
+pub(crate) static CPU_COUNT_FN: Mutex<Option<CpuCountFn>> = Mutex::new(None);
+pub(crate) static CPU_ONLINE_FN: Mutex<Option<CpuOnlineFn>> = Mutex::new(None);
 /// Global current-CPU callback.
 pub(crate) static CURRENT_CPU_FN: Mutex<Option<fn() -> usize>> = Mutex::new(None);
 /// Global privileged shutdown callback.
@@ -123,6 +128,16 @@ pub fn set_clock_fn(f: fn() -> u64) {
 /// Set the online CPU mask callback. Called once by kernel init.
 pub fn set_cpu_mask_fn(f: fn() -> u64) {
     *CPU_MASK_FN.lock() = Some(f);
+}
+
+/// Install the online CPU count for the complete 256-CPU namespace.
+pub fn set_cpu_count_fn(f: fn() -> usize) {
+    *CPU_COUNT_FN.lock() = Some(f);
+}
+
+/// Install the full-namespace online-CPU predicate for 256-bit affinity.
+pub fn set_cpu_online_fn(f: fn(usize) -> bool) {
+    *CPU_ONLINE_FN.lock() = Some(f);
 }
 
 /// Set the scheduler snapshot callbacks. Called once by kernel init.
