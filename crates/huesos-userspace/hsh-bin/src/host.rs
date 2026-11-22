@@ -168,7 +168,22 @@ fn command_uses_block_device(resolved: &str) -> bool {
 fn command_uses_query_channel(resolved: &str) -> bool {
     let base = resolved.rsplit('/').next().unwrap_or(resolved);
     let stem = base.strip_suffix(".elf").unwrap_or(base);
-    matches!(stem, "pci" | "acpi" | "ps" | "btop" | "std_smoke")
+    matches!(
+        stem,
+        "pci" | "acpi" | "ps" | "btop" | "std_smoke" | "std-smoke"
+    )
+}
+
+/// True when an unpiped interactive run should still capture TSV stdout so
+/// `ShellEnv` pretty-prints aligned table headers/dividers instead of raw tabs.
+fn command_emits_tsv_table(resolved: &str, args: &[String]) -> bool {
+    let base = resolved.rsplit('/').next().unwrap_or(resolved);
+    let stem = base.strip_suffix(".elf").unwrap_or(base);
+    match stem {
+        "ls" | "stat" | "hxfs" | "pci" | "acpi" | "ps" => true,
+        "fdisk" => matches!(args.first().map(String::as_str), Some("list" | "--list")),
+        _ => false,
+    }
 }
 
 impl HshHost {
@@ -944,7 +959,10 @@ impl HshHost {
             }
         }
 
-        let stream_direct = self.interactive_stream && !capture_output && self.ipc_out.is_some();
+        let stream_direct = self.interactive_stream
+            && !capture_output
+            && self.ipc_out.is_some()
+            && !command_emits_tsv_table(&resolved, &owned_args);
 
         let mut live_stdin_w = if let Some(in_val) = stdin {
             let bytes = in_val.to_pipe_bytes();
@@ -1099,9 +1117,13 @@ impl HshHost {
 
         if stream_direct {
             if interrupted {
-                self.forward_stream_bytes(Some((255, 110, 110)), b"\x1b[?25h\x1b[0m\n^C\n");
-            } else if streamed_any && last_stream_byte != b'\n' {
-                self.forward_stream_bytes(None, b"\n");
+                self.forward_stream_bytes(None, b"\x1b[?25h\x1b[0m");
+                self.forward_stream_bytes(Some((255, 110, 110)), b"\n^C\n");
+            } else {
+                self.forward_stream_bytes(None, b"\x1b[?25h\x1b[0m");
+                if streamed_any && last_stream_byte != b'\n' {
+                    self.forward_stream_bytes(None, b"\n");
+                }
             }
             return ExecOutcome {
                 status: exit_code,
@@ -1171,10 +1193,13 @@ impl HshHost {
             pkt[4] = b;
             put_u16(&mut pkt, 5, take as u16);
             pkt[7..7 + take].copy_from_slice(&bytes[pos..pos + take]);
-            for _ in 0..200 {
+            loop {
                 match ch.write(&pkt[..7 + take]) {
                     Ok(()) => break,
-                    Err(ErrorCode::ShouldWait) => libcanvas::process::yield_now(),
+                    Err(ErrorCode::ShouldWait) => {
+                        let item = [WaitItem::new(ch.handle().raw(), Signals::PEER_CLOSED, 1)];
+                        let _ = wait_any(&item, 1);
+                    }
                     Err(_) => return,
                 }
             }

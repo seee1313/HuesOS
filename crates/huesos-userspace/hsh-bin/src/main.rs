@@ -317,10 +317,17 @@ impl InteractiveShell {
         let Some(ch) = self.out_ch() else {
             return;
         };
-        for _ in 0..200 {
+        loop {
             match ch.write(pkt) {
                 Ok(()) => return,
-                Err(ErrorCode::ShouldWait) => libcanvas::process::yield_now(),
+                Err(ErrorCode::ShouldWait) => {
+                    let item = [libcanvas::WaitItem::new(
+                        ch.handle().raw(),
+                        libcanvas::Signals::PEER_CLOSED,
+                        1,
+                    )];
+                    let _ = libcanvas::wait_any(&item, 1);
+                }
                 Err(_) => return,
             }
         }
@@ -666,7 +673,10 @@ impl InteractiveShell {
                 }
                 self.host.history_lines.push(String::from(trimmed));
             }
-            match self.env.eval_script(trimmed, &mut self.host) {
+            self.host.interactive_stream = true;
+            let eval_res = self.env.eval_script(trimmed, &mut self.host);
+            self.host.interactive_stream = false;
+            match eval_res {
                 Ok(res) => {
                     let mut should_exit = false;
                     for act in res.actions {
@@ -1261,6 +1271,7 @@ impl InteractiveShell {
             println!("[hsh] fdisk raw-hxfs dry-run SKIP (no block device)");
             println!("[hsh] fdisk raw-hxfs gpt-init guard SKIP (no block device)");
         }
+        println!("[hsh] startup smokes complete");
 
         self.send_clear();
         self.send_write(

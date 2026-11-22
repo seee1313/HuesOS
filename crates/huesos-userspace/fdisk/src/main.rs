@@ -66,7 +66,7 @@ struct NvmeBlockIo {
 }
 
 impl NvmeBlockIo {
-    fn open(dev_handle: libcanvas::Handle) -> Result<Self, String> {
+    fn open(dev_handle: libcanvas::Handle, writable: bool) -> Result<Self, String> {
         let mut dev = BlockDevice::from_channel(Channel::from_handle(dev_handle))
             .map_err(|e| format!("block open failed: {}", e.as_str()))?;
         let info = dev
@@ -78,7 +78,7 @@ impl NvmeBlockIo {
             dev: RefCell::new(dev),
             total_lbas,
             block_size,
-            writable: true,
+            writable,
         })
     }
 }
@@ -273,6 +273,14 @@ impl Backend {
             Backend::Memory(_) => true,
         }
     }
+
+    fn default_label(&self) -> &'static str {
+        match self {
+            Backend::Nvme(_) => "/dev/nvme0n1",
+            Backend::Hxfs(_) => "<image>",
+            Backend::Memory(_) => "/dev/mem",
+        }
+    }
 }
 
 impl BlockIo512 for Backend {
@@ -457,11 +465,14 @@ fn open_backend(target: Option<&str>, write: bool, min_lbas: u64) -> Result<Back
         }
         return MemoryDisk::with_fixture().map(Backend::Memory);
     }
-    if let Some(h) = stdio::take_cap_handle(CapKind::BlockDev) {
-        if write && (mask & (caps_mask::BLOCK_RW | caps_mask::HXFS_RW)) == 0 {
+    if stdio::cap_handle(CapKind::BlockDev).is_some() {
+        let can_write = (mask & (caps_mask::BLOCK_RW | caps_mask::HXFS_RW)) != 0;
+        if write && !can_write {
             return Err(String::from("AccessDenied (read-only capability)"));
         }
-        return NvmeBlockIo::open(h).map(Backend::Nvme);
+        if let Some(h) = stdio::take_cap_handle(CapKind::BlockDev) {
+            return NvmeBlockIo::open(h, write && can_write).map(Backend::Nvme);
+        }
     }
     if write {
         require_write_cap(mask, false)?;
@@ -568,7 +579,6 @@ fn run() -> i32 {
             "usage: fdisk [<device|image>]                    interactive editor\n       fdisk <list|inspect|verify|gpt-init|add|del|resize> [opts] [target]\n  --type <hxfs|esp|linux|swap|basic|UUID>  --size <64M|1G|LBAs>  --start <LBA>  --name <label>  --dry-run  --force\n  a target without a GPT but with a bare HxFS superblock is reported as `raw-hxfs`;\n  gpt-init refuses to erase such a volume unless --force is given;\n  /dev/mem names an in-memory volume with a GPT fixture, for scripting\n",
         )),
         "interactive" => {
-            let label = target.unwrap_or("/dev/mem");
             let mut io = match open_backend(target, true, 4096) {
                 Ok(io) => io,
                 Err(error) => {
@@ -583,6 +593,7 @@ fn run() -> i32 {
                     }
                 }
             };
+            let label = target.unwrap_or_else(|| io.default_label());
             let writable = io.is_writable();
             return tui::interactive(&mut io, label, writable);
         }
