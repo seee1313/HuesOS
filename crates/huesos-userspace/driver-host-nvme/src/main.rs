@@ -815,9 +815,11 @@ impl DriverRuntime {
 
     fn send_info(&mut self, index: usize) -> AsyncBlockStatus {
         // The Hxfs service asks for geometry once at mount; piggyback
-        // the reliability snapshot on it so every boot logs a
-        // baseline even when nothing goes wrong.
-        self.report_telemetry();
+        // the reliability snapshot on that initial probe (`submitted == 0`)
+        // so every boot logs a baseline without spamming on every `df`/`fdisk`.
+        if self.telemetry.submitted == 0 {
+            self.report_telemetry();
+        }
         let info = AsyncBlockInfo {
             namespace_id: 1,
             block_size: self.controller.lba_size(),

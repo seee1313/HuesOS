@@ -9,6 +9,10 @@ cargo clippy --workspace --lib --bins \
     -Z build-std=core,compiler_builtins,alloc \
     -Z build-std-features=compiler-builtins-mem -- -D warnings
 
+cargo clippy -p huesos-boot --features boot-selftest \
+    -Z build-std=core,compiler_builtins,alloc \
+    -Z build-std-features=compiler-builtins-mem -- -D warnings
+
 # Production-only Clippy does not compile integration/unit test targets. Keep a
 # separate rustc warning gate for host-testable targets so unused imports and
 # other ordinary warnings in tests cannot hide behind a green Clippy run.
@@ -41,13 +45,19 @@ done
     cd crates/huesos-userspace/init
     HUESOS_DRIVER_MANAGER_PATH="$TMP/driver-manager" \
     HUESOS_TERMINAL_PATH="$TMP/terminal" \
+    HUESOS_ACPI_MANAGER_PATH="$TMP/acpi-manager" \
+    HUESOS_SHUTDOWN_BROKER_PATH="$TMP/shutdown-broker" \
+    HUESOS_KEY_BROKER_PATH="$TMP/key-broker" \
+        cargo clippy --release -- -D warnings
+    HUESOS_DRIVER_MANAGER_PATH="$TMP/driver-manager" \
+    HUESOS_TERMINAL_PATH="$TMP/terminal" \
     HUESOS_FAULT_PROBE_PATH="$TMP/fault-probe" \
     HUESOS_DYN_C_SMOKE_PATH="$TMP/dyn-c-smoke" \
     HUESOS_DYN_RUST_SMOKE_PATH="$TMP/dyn-rust-smoke" \
     HUESOS_ACPI_MANAGER_PATH="$TMP/acpi-manager" \
     HUESOS_SHUTDOWN_BROKER_PATH="$TMP/shutdown-broker" \
     HUESOS_KEY_BROKER_PATH="$TMP/key-broker" \
-        cargo clippy --release -- -D warnings
+        cargo clippy --release --features boot-selftest -- -D warnings
 )
 
 (

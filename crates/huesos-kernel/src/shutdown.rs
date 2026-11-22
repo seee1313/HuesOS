@@ -77,7 +77,7 @@ pub fn hard_halt() -> ! {
 /// `docs/ARCHITECTURE_ROADMAP.md` §3 for the "critical to root job"
 /// analogue borrowed from Fuchsia.
 pub fn note_critical_exit(process_name: &str, exit_code: i64) -> ! {
-    let mut serial = huesos_arch::serial::SerialWriter;
+    let mut serial = huesos_arch::serial::ErrorSerialWriter;
     let _ = writeln!(
         serial,
         "[shutdown] critical process {} exited with code {}; forcing hard_halt",

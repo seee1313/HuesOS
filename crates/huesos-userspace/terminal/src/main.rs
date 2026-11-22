@@ -52,6 +52,7 @@ extern "C" fn terminal_main() -> ! {
     };
 
     let mut session = TerminalSession::new(keyboard, registry, bootfs, bootstrap, frame_draw);
+    #[cfg(feature = "boot-selftest")]
     session.trigger_startup_smokes();
     println!("[terminal] keyboard service online, starting /bin/hsh.elf session");
     session.run();

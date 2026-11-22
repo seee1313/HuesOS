@@ -172,11 +172,16 @@ impl InitConfig {
         }
     }
 
-    /// Install the built-in stage table. Called before parsing so a
-    /// config file can override weights and labels by id without
-    /// having to redeclare the whole sequence.
+    /// Install the built-in stage table (including the `selftest` stage).
+    /// Called before parsing so a config file can override weights and labels
+    /// by id without having to redeclare the whole sequence.
     pub fn with_default_stages(mut self) -> Self {
         self.push_stage(b"selftest", b"Checking kernel interfaces", 5);
+        self.with_production_stages()
+    }
+
+    /// Install the production boot stage table (without `selftest`).
+    pub fn with_production_stages(mut self) -> Self {
         self.push_stage(b"driver-manager", b"Starting driver manager", 10);
         self.push_stage(b"storage", b"Probing storage controller", 30);
         self.push_stage(b"shutdown-broker", b"Arming power control", 8);

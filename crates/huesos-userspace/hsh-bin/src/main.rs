@@ -12,6 +12,7 @@ extern crate alloc;
 
 mod host;
 
+#[cfg(feature = "boot-selftest")]
 use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -445,6 +446,7 @@ impl InteractiveShell {
                 self.handle_key(&packet[2..2 + klen]);
             }
             term_to_hsh::TAG_RUN_SMOKE => {
+                #[cfg(feature = "boot-selftest")]
                 self.run_smokes();
             }
             term_to_hsh::TAG_UI_DONE => {
@@ -741,6 +743,7 @@ impl InteractiveShell {
         self.send_prompt();
     }
 
+    #[cfg(feature = "boot-selftest")]
     fn run_smokes(&mut self) {
         let mut smoke_env = ShellEnv::new();
 
@@ -1331,6 +1334,15 @@ fn run_interactive(in_ch: Channel, mut host: HshHost) -> ! {
         draft_before_history: String::new(),
     };
 
+    shell.send_clear();
+    shell.send_write(
+        Some((95, 225, 185)),
+        "HuesOS Production Terminal // /bin/hsh.elf\n",
+    );
+    shell.send_write(
+        None,
+        "All system utilities run as isolated dynamic ELFs under @caps(...). Type 'help'.\n\n",
+    );
     shell.send_status("hsh.elf");
     shell.send_prompt();
 

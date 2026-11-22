@@ -121,6 +121,7 @@ head -c 3072 third_party/freedoom/freedoom1.wad > build/wad-header.bin
 python3 tools/mkhxfs.py --output "$work/nvme.img" --blocks 131072 \
     --seed-file seed.bin --seed-size 3584 \
     --seed-blob-file build/wad-header.bin >/dev/null
+HUESOS_BOOT_SELFTEST=1 \
 HUESOS_SEALED_KEY_MODULE="$work/sealed-key.bin" \
 HUESOS_HXFS_SERVICE_FEATURES=synthetic-key \
 CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-1}" make iso PROFILE="$profile"
@@ -138,6 +139,7 @@ done
 # Change only the signed command line. Signature remains valid, PCR12 changes,
 # and the same sealed object must refuse unseal.
 printf 'init_args=foo measurement_mismatch=1\n' > build/cmdline.txt
+HUESOS_BOOT_SELFTEST=1 \
 HUESOS_SEALED_KEY_MODULE="$work/sealed-key.bin" \
 HUESOS_HXFS_SERVICE_FEATURES=synthetic-key \
 CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-1}" make iso PROFILE="$profile"

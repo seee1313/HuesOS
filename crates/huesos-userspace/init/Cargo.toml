@@ -7,8 +7,11 @@ edition = "2021"
 name = "huesos-init"
 path = "src/main.rs"
 
+[features]
+boot-selftest = ["libcanvas/kernel-smoke-tests"]
+
 [dependencies]
-libcanvas = { path = "../libcanvas", features = ["kernel-smoke-tests"] }
+libcanvas = { path = "../libcanvas" }
 huesos-bootux = { path = "../../huesos-bootux" }
 
 [profile.release]

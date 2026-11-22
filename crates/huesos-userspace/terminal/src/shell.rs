@@ -177,6 +177,7 @@ impl TerminalSession {
         }
     }
 
+    #[cfg(feature = "boot-selftest")]
     pub fn trigger_startup_smokes(&mut self) {
         self.send_to_hsh(&[term_to_hsh::TAG_RUN_SMOKE]);
     }

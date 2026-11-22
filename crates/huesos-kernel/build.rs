@@ -20,7 +20,10 @@ fn main() {
 
     track_userspace_inputs(&userspace_root);
     println!("cargo:rerun-if-env-changed=CARGO_TARGET_DIR");
+    println!("cargo:rerun-if-env-changed=HUESOS_BOOT_SELFTEST");
     println!("cargo:rerun-if-env-changed=HUESOS_LIFECYCLE_WAIT_STRESS");
+    let boot_selftest = env::var_os("CARGO_FEATURE_BOOT_SELFTEST").is_some()
+        || matches!(env::var("HUESOS_BOOT_SELFTEST").as_deref(), Ok("1"));
     let lifecycle_wait_stress = env::var("HUESOS_LIFECYCLE_WAIT_STRESS")
         .ok()
         .filter(|value| matches!(value.as_str(), "32" | "256"))
@@ -181,8 +184,13 @@ fn main() {
         &[],
         &[],
     );
+    let hsh_args: &[&str] = if boot_selftest {
+        &["--features", "boot-selftest"]
+    } else {
+        &[]
+    };
     let hsh_bin =
-        build_userspace_dynamic_program(&userspace_root, "hsh-bin", "hsh", profile, &[], &[]);
+        build_userspace_dynamic_program(&userspace_root, "hsh-bin", "hsh", profile, &[], hsh_args);
     let coreutils_dir = build_userspace_dynamic_bins(&userspace_root, "coreutils", profile);
     // Soak shutdown-cycle wiring (qemu-nvme-soak inject=3): the
     // harness exports HUESOS_TERMINAL_FEATURES=soak-shutdown so the
@@ -190,10 +198,22 @@ fn main() {
     // few idle seconds. Production builds leave it unset.
     let terminal_features = env::var("HUESOS_TERMINAL_FEATURES").unwrap_or_default();
     println!("cargo:rerun-if-env-changed=HUESOS_TERMINAL_FEATURES");
+    let mut term_feats: Vec<&str> = Vec::new();
+    for feat in terminal_features
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        term_feats.push(feat);
+    }
+    if boot_selftest && !term_feats.contains(&"boot-selftest") {
+        term_feats.push("boot-selftest");
+    }
+    let joined_term_feats = term_feats.join(",");
     let mut terminal_args: Vec<String> = Vec::new();
-    if !terminal_features.is_empty() {
+    if !joined_term_feats.is_empty() {
         terminal_args.push("--features".to_string());
-        terminal_args.push(terminal_features);
+        terminal_args.push(joined_term_feats);
     }
     let terminal_args_refs: Vec<&str> = terminal_args.iter().map(String::as_str).collect();
     let terminal = build_userspace_dynamic_program(
@@ -204,36 +224,44 @@ fn main() {
         &[],
         &terminal_args_refs,
     );
-    let fault_probe = build_userspace_dynamic_program(
-        &userspace_root,
-        "fault-probe",
-        "huesos-fault-probe",
-        profile,
-        &[],
-        &[],
-    );
-    let smoke_plugin_so = build_c_shared_lib(
-        &userspace_root,
-        "smoke-plugin",
-        "plugin.c",
-        "libsmoke_plugin.so",
-        &libcanvas_so,
-    );
-    let dyn_c_smoke = build_c_dynamic_program(
-        &userspace_root,
-        "dyn-c-smoke",
-        "main.c",
-        "dyn-c-smoke.elf",
-        &libcanvas_so,
-    );
-    let dyn_rust_smoke = build_userspace_dynamic_program(
-        &userspace_root,
-        "dyn-rust-smoke",
-        "huesos-dyn-rust-smoke",
-        profile,
-        &[],
-        &[],
-    );
+
+    let (fault_probe, smoke_plugin_so, dyn_c_smoke, dyn_rust_smoke) = if boot_selftest {
+        (
+            Some(build_userspace_dynamic_program(
+                &userspace_root,
+                "fault-probe",
+                "huesos-fault-probe",
+                profile,
+                &[],
+                &[],
+            )),
+            Some(build_c_shared_lib(
+                &userspace_root,
+                "smoke-plugin",
+                "plugin.c",
+                "libsmoke_plugin.so",
+                &libcanvas_so,
+            )),
+            Some(build_c_dynamic_program(
+                &userspace_root,
+                "dyn-c-smoke",
+                "main.c",
+                "dyn-c-smoke.elf",
+                &libcanvas_so,
+            )),
+            Some(build_userspace_dynamic_program(
+                &userspace_root,
+                "dyn-rust-smoke",
+                "huesos-dyn-rust-smoke",
+                profile,
+                &[],
+                &[],
+            )),
+        )
+    } else {
+        (None, None, None, None)
+    };
+
     let _bootfs = build_bootfs_image(
         &manifest_dir,
         BootfsInputs {
@@ -250,29 +278,43 @@ fn main() {
             coreutils_dir: &coreutils_dir,
             ld_huesos: &ld_huesos,
             libcanvas_so: &libcanvas_so,
-            smoke_plugin_so: &smoke_plugin_so,
+            smoke_plugin_so: smoke_plugin_so.as_deref(),
+            boot_selftest,
         },
     );
+
+    let mut init_env: Vec<(&str, &OsStr)> = vec![
+        ("HUESOS_DRIVER_MANAGER_PATH", driver_manager.as_os_str()),
+        ("HUESOS_TERMINAL_PATH", terminal.as_os_str()),
+        (
+            "HUESOS_LIFECYCLE_WAIT_STRESS",
+            OsStr::new(&lifecycle_wait_stress),
+        ),
+        ("HUESOS_ACPI_MANAGER_PATH", acpi_manager.as_os_str()),
+        ("HUESOS_SHUTDOWN_BROKER_PATH", shutdown_broker.as_os_str()),
+        ("HUESOS_KEY_BROKER_PATH", key_broker.as_os_str()),
+    ];
+    if let Some(ref fp) = fault_probe {
+        init_env.push(("HUESOS_FAULT_PROBE_PATH", fp.as_os_str()));
+    }
+    if let Some(ref dc) = dyn_c_smoke {
+        init_env.push(("HUESOS_DYN_C_SMOKE_PATH", dc.as_os_str()));
+    }
+    if let Some(ref dr) = dyn_rust_smoke {
+        init_env.push(("HUESOS_DYN_RUST_SMOKE_PATH", dr.as_os_str()));
+    }
+    let init_args: &[&str] = if boot_selftest {
+        &["--features", "boot-selftest"]
+    } else {
+        &[]
+    };
     let init = build_userspace_program(
         &userspace_root,
         "init",
         "huesos-init",
         profile,
-        &[
-            ("HUESOS_DRIVER_MANAGER_PATH", driver_manager.as_os_str()),
-            ("HUESOS_TERMINAL_PATH", terminal.as_os_str()),
-            ("HUESOS_FAULT_PROBE_PATH", fault_probe.as_os_str()),
-            ("HUESOS_DYN_C_SMOKE_PATH", dyn_c_smoke.as_os_str()),
-            ("HUESOS_DYN_RUST_SMOKE_PATH", dyn_rust_smoke.as_os_str()),
-            (
-                "HUESOS_LIFECYCLE_WAIT_STRESS",
-                OsStr::new(&lifecycle_wait_stress),
-            ),
-            ("HUESOS_ACPI_MANAGER_PATH", acpi_manager.as_os_str()),
-            ("HUESOS_SHUTDOWN_BROKER_PATH", shutdown_broker.as_os_str()),
-            ("HUESOS_KEY_BROKER_PATH", key_broker.as_os_str()),
-        ],
-        &[],
+        &init_env,
+        init_args,
     );
 
     println!("cargo:rustc-env=HUESOS_INIT_PATH={}", init.display());
@@ -937,7 +979,8 @@ struct BootfsInputs<'a> {
     coreutils_dir: &'a Path,
     ld_huesos: &'a Path,
     libcanvas_so: &'a Path,
-    smoke_plugin_so: &'a Path,
+    smoke_plugin_so: Option<&'a Path>,
+    boot_selftest: bool,
 }
 
 fn build_bootfs_image(manifest_dir: &Path, inputs: BootfsInputs<'_>) -> PathBuf {
@@ -1140,10 +1183,6 @@ fn build_bootfs_image(manifest_dir: &Path, inputs: BootfsInputs<'_>) -> PathBuf 
             data: read_build_input(&inputs.coreutils_dir.join("sleep"), "sleep ELF"),
         },
         BootFsFile {
-            path: "/bin/std-smoke.elf",
-            data: read_build_input(&inputs.coreutils_dir.join("std-smoke"), "std-smoke ELF"),
-        },
-        BootFsFile {
             path: "/bin/hexdump.elf",
             data: read_build_input(&inputs.coreutils_dir.join("hexdump"), "hexdump ELF"),
         },
@@ -1260,10 +1299,6 @@ fn build_bootfs_image(manifest_dir: &Path, inputs: BootfsInputs<'_>) -> PathBuf 
             data: read_build_input(inputs.libcanvas_so, "libcanvas.so"),
         },
         BootFsFile {
-            path: "/lib/libsmoke_plugin.so",
-            data: read_build_input(inputs.smoke_plugin_so, "libsmoke_plugin.so"),
-        },
-        BootFsFile {
             path: "/data/freedoom1.wad",
             data: read_build_input(
                 &manifest_dir.join("../../third_party/freedoom/freedoom1.wad"),
@@ -1271,6 +1306,18 @@ fn build_bootfs_image(manifest_dir: &Path, inputs: BootfsInputs<'_>) -> PathBuf 
             ),
         },
     ];
+    if inputs.boot_selftest {
+        files.push(BootFsFile {
+            path: "/bin/std-smoke.elf",
+            data: read_build_input(&inputs.coreutils_dir.join("std-smoke"), "std-smoke ELF"),
+        });
+    }
+    if let Some(smoke_plugin_so) = inputs.smoke_plugin_so {
+        files.push(BootFsFile {
+            path: "/lib/libsmoke_plugin.so",
+            data: read_build_input(smoke_plugin_so, "libsmoke_plugin.so"),
+        });
+    }
     let hash_manifest = build_bootfs_hash_manifest(&files);
     files.push(BootFsFile {
         path: "/manifests/bootfs.sha256",

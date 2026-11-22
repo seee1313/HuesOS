@@ -6,6 +6,9 @@ authors.workspace = true
 license.workspace = true
 build = "build.rs"
 
+[features]
+boot-selftest = []
+
 [dependencies]
 huesos-tpm = { path = "../huesos-tpm" }
 huesos-arch = { path = "../huesos-arch" }

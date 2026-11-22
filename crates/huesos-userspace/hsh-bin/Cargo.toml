@@ -7,6 +7,9 @@ edition = "2021"
 name = "hsh"
 path = "src/main.rs"
 
+[features]
+boot-selftest = []
+
 [dependencies]
 libcanvas = { path = "../libcanvas", default-features = false, features = ["dyn-client"] }
 huesos-abi = { path = "../../huesos-abi" }

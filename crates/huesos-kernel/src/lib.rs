@@ -109,7 +109,7 @@ pub unsafe fn kmain(boot_info: BootInfo) -> ! {
         // ready, so surface the diagnostic on early serial and halt the
         // BSP. Matches the pattern used by init::heap_init below.
         use core::fmt::Write;
-        let mut writer = huesos_arch::serial::SerialWriter;
+        let mut writer = huesos_arch::serial::ErrorSerialWriter;
         let _ = writeln!(writer, "[boot] PMM init failed: {error:?}");
         loop {
             huesos_arch::hlt();
@@ -165,7 +165,7 @@ pub unsafe fn kmain(boot_info: BootInfo) -> ! {
 
     if let Err(error) = init::heap_init() {
         use core::fmt::Write;
-        let mut writer = huesos_arch::serial::SerialWriter;
+        let mut writer = huesos_arch::serial::ErrorSerialWriter;
         let _ = writeln!(writer, "[boot] kernel heap mapping failed: {error:?}");
         loop {
             huesos_arch::hlt();
@@ -177,12 +177,15 @@ pub unsafe fn kmain(boot_info: BootInfo) -> ! {
     let verified_hbi = match boot_info.hbi_image {
         Some(bytes) => match boot::hbi::HbiImage::parse(bytes) {
             Ok(image) => {
+                if cmdline_requests_verbose_log(&image) {
+                    huesos_arch::serial::set_verbose(true);
+                }
                 dbg("[HBI] Ed25519 signature verified (v2.2)\n");
                 image
             }
             Err(error) => {
                 use core::fmt::Write;
-                let mut writer = huesos_arch::serial::SerialWriter;
+                let mut writer = huesos_arch::serial::ErrorSerialWriter;
                 let _ = writeln!(writer, "[HBI] signature verification failed: {error:?}");
                 loop {
                     huesos_arch::hlt();
@@ -190,7 +193,7 @@ pub unsafe fn kmain(boot_info: BootInfo) -> ! {
             }
         },
         None => {
-            dbg("[HBI] signed boot image missing; fail-closed halt\n");
+            err_dbg("[HBI] signed boot image missing; fail-closed halt\n");
             loop {
                 huesos_arch::hlt();
             }
@@ -201,7 +204,7 @@ pub unsafe fn kmain(boot_info: BootInfo) -> ! {
         Ok(digest) => digest,
         Err(error) => {
             use core::fmt::Write;
-            let mut writer = huesos_arch::serial::SerialWriter;
+            let mut writer = huesos_arch::serial::ErrorSerialWriter;
             let _ = writeln!(writer, "[measure] boot measurement failed: {error:?}");
             loop {
                 huesos_arch::hlt();
@@ -284,8 +287,11 @@ pub unsafe fn kmain(boot_info: BootInfo) -> ! {
         alloc::vec::Vec::new()
     };
 
+    #[cfg(feature = "boot-selftest")]
     let panic_test_requested = cmdline_requests_panic_test(&verified_hbi);
+    #[cfg(feature = "boot-selftest")]
     let extable_test_requested = cmdline_requests_extable_test(&verified_hbi);
+    #[cfg(feature = "boot-selftest")]
     let irq_test_requested = cmdline_requests_irq_test(&verified_hbi);
     let storage_off_requested = cmdline_requests_storage_off(&verified_hbi);
     let sealed_key_module = verified_hbi
@@ -323,7 +329,7 @@ pub unsafe fn kmain(boot_info: BootInfo) -> ! {
         }
         Err(error) => {
             use core::fmt::Write;
-            let mut writer = huesos_arch::serial::SerialWriter;
+            let mut writer = huesos_arch::serial::ErrorSerialWriter;
             let _ = writeln!(writer, "[HBI] required BOOTFS missing: {error:?}");
             loop {
                 huesos_arch::hlt();
@@ -354,6 +360,7 @@ pub unsafe fn kmain(boot_info: BootInfo) -> ! {
             "[extable] installed {extable_entries} recoverable-copy entries"
         );
     }
+    #[cfg(feature = "boot-selftest")]
     if extable_test_requested {
         run_extable_synthetic_probe();
     }
@@ -366,10 +373,12 @@ pub unsafe fn kmain(boot_info: BootInfo) -> ! {
     // run-gate; release them now that the timer callback + PIC are live.
     smp::release_aps();
 
+    #[cfg(feature = "boot-selftest")]
     if irq_test_requested {
         boot::irq_probe::run();
     }
 
+    #[cfg(feature = "boot-selftest")]
     if panic_test_requested {
         panic!("intentional panic requested by HBI cmdline panic_test=1");
     }
@@ -869,20 +878,27 @@ fn install_frame_draw_capability(process: &huesos_object::Process) -> bool {
     true
 }
 
+#[cfg(feature = "boot-selftest")]
 fn cmdline_requests_panic_test(image: &boot::hbi::HbiImage<'_>) -> bool {
     cmdline_flag_present(image, b"panic_test=1")
 }
 
+#[cfg(feature = "boot-selftest")]
 fn cmdline_requests_irq_test(image: &boot::hbi::HbiImage<'_>) -> bool {
     cmdline_flag_present(image, b"irq_test=1")
 }
 
+#[cfg(feature = "boot-selftest")]
 fn cmdline_requests_extable_test(image: &boot::hbi::HbiImage<'_>) -> bool {
     cmdline_flag_present(image, b"extable_test=1")
 }
 
 fn cmdline_requests_storage_off(image: &boot::hbi::HbiImage<'_>) -> bool {
     cmdline_flag_present(image, huesos_abi::storage_boot::STORAGE_OFF_TOKEN)
+}
+
+fn cmdline_requests_verbose_log(image: &boot::hbi::HbiImage<'_>) -> bool {
+    cmdline_flag_present(image, b"log=verbose") || cmdline_flag_present(image, b"kernel.verbose=1")
 }
 
 fn cmdline_flag_present(image: &boot::hbi::HbiImage<'_>, needle: &[u8]) -> bool {
@@ -905,6 +921,7 @@ fn cmdline_flag_present(image: &boot::hbi::HbiImage<'_>, needle: &[u8]) -> bool 
 /// running. If the probe returns any other outcome the fault path is
 /// broken and the CI QEMU smoke gate will fail on the missing / wrong
 /// marker.
+#[cfg(feature = "boot-selftest")]
 fn run_extable_synthetic_probe() {
     use core::fmt::Write;
     let mut writer = huesos_arch::serial::SerialWriter;
@@ -968,7 +985,7 @@ fn handle_user_fault(info: huesos_arch::fault::FaultInfo) -> ! {
         huesos_arch::fault::FaultKind::DoubleFault => crate::panic::from_cpu_fault(info),
     };
 
-    let mut writer = huesos_arch::serial::SerialWriter;
+    let mut writer = huesos_arch::serial::ErrorSerialWriter;
     let _ = writeln!(
         writer,
         "[user-fault] process={} koid={} task={} cpu={} reason={} rip={:#x} address={:#x} error={:#x} action=terminate-process code={}",
@@ -983,6 +1000,12 @@ fn handle_user_fault(info: huesos_arch::fault::FaultInfo) -> ! {
         code,
     );
     scheduler::terminate_current_process(code)
+}
+
+fn err_dbg(msg: &str) {
+    use core::fmt::Write;
+    let mut w = huesos_arch::serial::ErrorSerialWriter;
+    let _ = w.write_str(msg);
 }
 
 fn dbg(msg: &str) {

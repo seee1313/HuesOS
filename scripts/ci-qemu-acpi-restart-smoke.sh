@@ -35,8 +35,8 @@ case "$scenario" in
         log="$artifact_dir/qemu-${profile}-smp${cpus}.log"
         rm -f "$log"
         case "$profile" in
-            debug) CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-1}" HUESOS_ACPI_BUDGET_SMOKE=1 make iso PROFILE=debug ;;
-            release) CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-1}" HUESOS_ACPI_BUDGET_SMOKE=1 make iso-release ;;
+            debug) HUESOS_BOOT_SELFTEST=1 CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-1}" HUESOS_ACPI_BUDGET_SMOKE=1 make iso PROFILE=debug ;;
+            release) HUESOS_BOOT_SELFTEST=1 CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-1}" HUESOS_ACPI_BUDGET_SMOKE=1 make iso-release ;;
             *) echo "unsupported profile: $profile" >&2; exit 2 ;;
         esac
         set +e

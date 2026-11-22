@@ -60,6 +60,8 @@ pub unsafe extern "C" fn kmain_entry() -> ! {
     );
 
     huesos_arch::serial::init();
+    #[cfg(feature = "boot-selftest")]
+    huesos_arch::serial::set_verbose(true);
     log_line("[HuesOS] Bootloader handed over control");
 
     let hhdm_offset = HHDM_REQUEST.response().map(|r| r.offset).unwrap_or(0);

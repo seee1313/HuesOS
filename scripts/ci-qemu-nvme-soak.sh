@@ -94,8 +94,8 @@ elif [[ "$inject" == "1" || "$inject" == "2" || "$inject" == "3" || "$inject" ==
     seed_args+=(--seed-blob-file build/wad-header.bin)
 fi
 case "$profile" in
-    release) CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-1}" make iso-release >/tmp/huesos-nvme-soak-build.log ;;
-    debug) CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-1}" make iso PROFILE=debug >/tmp/huesos-nvme-soak-build.log ;;
+    release) HUESOS_BOOT_SELFTEST=1 CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-1}" make iso-release >/tmp/huesos-nvme-soak-build.log ;;
+    debug) HUESOS_BOOT_SELFTEST=1 CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-1}" make iso PROFILE=debug >/tmp/huesos-nvme-soak-build.log ;;
     *) echo "[soak] unsupported profile: $profile" >&2; exit 2 ;;
 esac
 

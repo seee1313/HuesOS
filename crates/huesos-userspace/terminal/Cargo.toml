@@ -12,6 +12,8 @@ path = "src/main.rs"
 # shutdown after ~N empty keyboard polls (used by the
 # qemu-nvme-soak inject=3 shutdown-cycle gate).
 soak-shutdown = []
+# Test-build wiring: triggers interactive shell boot smokes on startup.
+boot-selftest = []
 
 [dependencies]
 libcanvas = { path = "../libcanvas", default-features = false, features = ["dyn-client"] }

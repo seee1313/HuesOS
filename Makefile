@@ -3,7 +3,8 @@ PROFILE ?= debug
 # line. The kernel then skips PCI/NVMe discovery so a USB boot cannot
 # program MSI or bus-master a live NVMe. Default remains storage on.
 STORAGE_OFF ?=
-CARGO_FLAGS := $(if $(filter release,$(PROFILE)),--release,)
+HUESOS_BOOT_SELFTEST ?=
+CARGO_FLAGS := $(if $(filter release,$(PROFILE)),--release,) $(if $(filter 1,$(HUESOS_BOOT_SELFTEST)),--features boot-selftest,)
 
 # Build the boot crate (which produces the final kernel ELF "huesos-boot").
 # We build explicitly with -p to avoid pulling in dev tools (clap etc.)
@@ -14,7 +15,7 @@ CARGO_BUILD := cargo build -p huesos-boot $(CARGO_FLAGS) \
 
 ISO := build/huesos.iso
 
-.PHONY: all build build-release run run-release iso iso-release clean fmt fmt-check test test-hxfs-features migration-check image-check policy-check storage-gate audit audit-check bench-check clippy
+.PHONY: all build build-release build-test build-test-release run run-release run-test run-test-release iso iso-release iso-test iso-test-release clean fmt fmt-check test test-hxfs-features migration-check image-check policy-check storage-gate audit audit-check bench-check clippy
 
 all: build
 
@@ -25,16 +26,34 @@ build:
 build-release:
 	$(MAKE) build PROFILE=release
 
+build-test:
+	$(MAKE) build PROFILE=$(PROFILE) HUESOS_BOOT_SELFTEST=1
+
+build-test-release:
+	$(MAKE) build PROFILE=release HUESOS_BOOT_SELFTEST=1
+
 iso: build
 	STORAGE_OFF=$(STORAGE_OFF) bash scripts/mkiso.sh $(PROFILE)
 
 iso-release: build-release
 	STORAGE_OFF=$(STORAGE_OFF) bash scripts/mkiso.sh release
 
+iso-test: build-test
+	STORAGE_OFF=$(STORAGE_OFF) bash scripts/mkiso.sh $(PROFILE)
+
+iso-test-release: build-test-release
+	STORAGE_OFF=$(STORAGE_OFF) bash scripts/mkiso.sh release
+
 run: iso
 	bash scripts/run.sh $(PROFILE)
 
 run-release: iso-release
+	bash scripts/run.sh release
+
+run-test: iso-test
+	bash scripts/run.sh $(PROFILE)
+
+run-test-release: iso-test-release
 	bash scripts/run.sh release
 
 test:
