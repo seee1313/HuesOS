@@ -258,16 +258,16 @@ const fn build_extended() -> [[u8; CELL_H]; EXTENDED_LEN] {
             // drawn only toward the edges the glyph actually connects.
             0x250C | 0x2510 | 0x2514 | 0x2518 | 0x251C | 0x2524 | 0x252C | 0x2534 | 0x253C => {
                 let centre_x = CELL_W / 2;
-                let (left, right, up) = match code {
-                    0x250C => (false, true, false),
-                    0x2510 => (true, false, false),
-                    0x2514 => (false, true, true),
-                    0x2518 => (true, false, true),
-                    0x251C => (false, true, true),
-                    0x2524 => (true, false, true),
-                    0x252C => (true, true, false),
-                    0x2534 => (true, true, true),
-                    _ => (true, true, true),
+                let (left, right, up, down) = match code {
+                    0x250C => (false, true, false, true),
+                    0x2510 => (true, false, false, true),
+                    0x2514 => (false, true, true, false),
+                    0x2518 => (true, false, true, false),
+                    0x251C => (false, true, true, true),
+                    0x2524 => (true, false, true, true),
+                    0x252C => (true, true, false, true),
+                    0x2534 => (true, true, true, false),
+                    _ => (true, true, true, true),
                 };
                 if left {
                     let mut x = 0;
@@ -290,10 +290,12 @@ const fn build_extended() -> [[u8; CELL_H]; EXTENDED_LEN] {
                         y += 1;
                     }
                 }
-                let mut y = middle;
-                while y < CELL_H {
-                    set_pixel(&mut cell, centre_x, y);
-                    y += 1;
+                if down {
+                    let mut y = middle;
+                    while y < CELL_H {
+                        set_pixel(&mut cell, centre_x, y);
+                        y += 1;
+                    }
                 }
             }
             0x2588..=0x258F => {
