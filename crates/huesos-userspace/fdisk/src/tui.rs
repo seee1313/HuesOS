@@ -1,31 +1,91 @@
-//! Interactive screen mode (`cfdisk` / `fdisk` hybrid) for `/bin/fdisk.elf`.
+//! Full-screen interactive disk & GPT partition studio (`cfdisk` / `fdisk` hybrid)
+//! for `/bin/fdisk.elf`.
 //!
-//! Draws disk geometry, detected layout (`GPT` vs bare `raw-hxfs` superfloppy vs
-//! blank), a proportional block-element sector map, and an interactive cursor
-//! list of partitions and free-space regions inside a box-drawn `huesos_std::tui`
-//! frame. Both arrow-key cursor navigation (`↑`/`↓`, `←`/`→` action bar, `Enter`)
-//! and classic `fdisk` single-key commands (`m`/`?`, `p`, `n`, `d`, `r`, `t`,
-//! `c`, `i`, `g`, `v`, `l`, `w`, `q`) work side-by-side.
+//! Renders a dual-pane truecolor partition studio across the entire HuesOS
+//! framebuffer terminal (`166 × 50` on `1024×768` Cozette6x13, scaling cleanly
+//! down to `80 × 24` serial consoles):
 //!
-//! Edits mutate an in-memory `GptDisk` copy; nothing touches the underlying
-//! block device or image file until the operator confirms `w` (`Write`).
+//! - **Top header chrome**: device path, `RW`/`RO` capability pill, total
+//!   capacity, sector geometry, partition-table type, and `CLEAN` / `MODIFIED`
+//!   staging indicator.
+//! - **Proportional Disk Layout Map**: 2-row truecolor block ribbon showing
+//!   partition proportions, active cursor caret (`^^^`), and partition type
+//!   color legend.
+//! - **Dual-pane main workspace**:
+//!   - **Left pane (~62%)**: interactive scrollable Partition & Free-Space
+//!     table (`↑`/`↓`/`k`/`j`, `PgUp`/`PgDn`, `Home`/`End`).
+//!   - **Right pane (~38%)**: live Region & GPT/HxFS Telemetry Inspector
+//!     (Type GUID, Unique UUID, LBA start/end/span, byte offsets, 1 MiB / 4 KiB
+//!     alignment check, Disk GUID, Primary/Backup header LBAs, CRC health).
+//! - **Centered modal dialogs**: styled floating input dialogs (`ask_modal`),
+//!   interactive Type Catalog (`l`), Region Inspector (`i`), and Command
+//!   Reference (`m`/`?`).
+//! - **Docked bottom status toast + `cfdisk` action button bar**: arrow/tab
+//!   button navigation (`Left`/`Right`/`Tab` + `Enter`) plus classic single-key
+//!   `fdisk` hotkeys (`g`, `n`, `d`, `r`, `t`, `c`, `i`, `v`, `l`, `p`, `w`, `q`).
 
 use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
 
 use huesos_gpt::{
-    parse_size_lbas, GptDisk, Guid, ALIGN_1MIB_LBAS, GUID_ESP, GUID_HXFS_V7, GUID_LINUX_FS,
-    GUID_LINUX_SWAP, GUID_MS_BASIC_DATA, LBA_SIZE,
+    parse_size_lbas, GptDisk, Guid, VerifyReport, ALIGN_1MIB_LBAS, ALIGN_4KIB_LBAS, GUID_ESP,
+    GUID_HXFS_V7, GUID_LINUX_FS, GUID_LINUX_SWAP, GUID_MS_BASIC_DATA, LBA_SIZE,
 };
 use huesos_hxfs::BareVolume;
-use huesos_std::io::{self, Write};
-use huesos_std::tui::{self, Color, Key};
+use huesos_std::io::{self, Read, Write};
+use huesos_std::tui::{self, ansi, bg_rgb, fg_rgb, FrameBuffer, Key};
 
-use crate::{probe_raw_hxfs, Backend, BlockIo512, HXFS_BLOCK_SIZE};
+use crate::{format_uuid, probe_raw_hxfs, Backend, BlockIo512, HXFS_BLOCK_SIZE};
 
-const FRAME_WIDTH: usize = 96;
-const MAP_INNER_WIDTH: usize = 74;
+// Obsidian studio truecolor palette.
+const BG_HEADER: (u8, u8, u8) = (19, 26, 40);
+const BG_ACTION_BAR: (u8, u8, u8) = (16, 22, 34);
+const BG_STATUS: (u8, u8, u8) = (13, 18, 28);
+const BG_SELECT: (u8, u8, u8) = (32, 56, 86);
+const BG_MODAL: (u8, u8, u8) = (15, 22, 35);
+const BG_INPUT: (u8, u8, u8) = (10, 14, 22);
+
+const FG_BORDER: (u8, u8, u8) = (56, 78, 112);
+const FG_BORDER_HI: (u8, u8, u8) = (88, 196, 220);
+const FG_TITLE: (u8, u8, u8) = (120, 238, 200);
+const FG_TEXT: (u8, u8, u8) = (214, 226, 244);
+const FG_MUTED: (u8, u8, u8) = (118, 138, 168);
+const FG_CYAN: (u8, u8, u8) = (95, 222, 245);
+const FG_MINT: (u8, u8, u8) = (95, 230, 172);
+const FG_AMBER: (u8, u8, u8) = (250, 202, 96);
+const FG_CORAL: (u8, u8, u8) = (250, 108, 118);
+const FG_VIOLET: (u8, u8, u8) = (198, 146, 252);
+const FG_BLUE: (u8, u8, u8) = (122, 176, 255);
+const FG_TRACK: (u8, u8, u8) = (44, 56, 76);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StatusTone {
+    Ok,
+    Info,
+    Warn,
+    Err,
+}
+
+impl StatusTone {
+    fn color(self) -> (u8, u8, u8) {
+        match self {
+            StatusTone::Ok => FG_MINT,
+            StatusTone::Info => FG_CYAN,
+            StatusTone::Warn => FG_AMBER,
+            StatusTone::Err => FG_CORAL,
+        }
+    }
+
+    fn tag(self) -> &'static str {
+        match self {
+            StatusTone::Ok => "OK",
+            StatusTone::Info => "INFO",
+            StatusTone::Warn => "WARN",
+            StatusTone::Err => "ERR",
+        }
+    }
+}
 
 #[derive(Clone, Debug)]
 enum SlotKind {
@@ -98,19 +158,35 @@ const ACTIONS_FREE: &[Action] = &[
 const ACTIONS_NO_TABLE: &[Action] = &[Action::InitGpt, Action::Verify, Action::Help, Action::Quit];
 
 impl Action {
-    fn label(self) -> &'static str {
+    fn key_hint(self) -> &'static str {
         match self {
-            Action::New => "n:New",
-            Action::Delete => "d:Delete",
-            Action::Resize => "r:Resize",
-            Action::Type => "t:Type",
-            Action::Name => "c:Name",
-            Action::Info => "i:Info",
-            Action::InitGpt => "g:NewGPT",
-            Action::Verify => "v:Verify",
-            Action::Write => "w:Write",
-            Action::Help => "m:Help",
-            Action::Quit => "q:Quit",
+            Action::New => "n",
+            Action::Delete => "d",
+            Action::Resize => "r",
+            Action::Type => "t",
+            Action::Name => "c",
+            Action::Info => "i",
+            Action::InitGpt => "g",
+            Action::Verify => "v",
+            Action::Write => "w",
+            Action::Help => "m",
+            Action::Quit => "q",
+        }
+    }
+
+    fn title(self) -> &'static str {
+        match self {
+            Action::New => "New",
+            Action::Delete => "Delete",
+            Action::Resize => "Resize",
+            Action::Type => "Type",
+            Action::Name => "Name",
+            Action::Info => "Info",
+            Action::InitGpt => "NewGPT",
+            Action::Verify => "Verify",
+            Action::Write => "Write",
+            Action::Help => "Help",
+            Action::Quit => "Quit",
         }
     }
 }
@@ -121,12 +197,13 @@ struct EditorState {
     total_lbas: u64,
     disk: Option<GptDisk>,
     raw_hxfs: Option<BareVolume>,
+    last_verify: Option<VerifyReport>,
     dirty: bool,
     selected_row: usize,
     selected_action: usize,
     quit_armed: bool,
     status: String,
-    status_color: Color,
+    status_tone: StatusTone,
 }
 
 impl EditorState {
@@ -142,24 +219,24 @@ impl EditorState {
 
     fn set_ok(&mut self, msg: impl Into<String>) {
         self.status = msg.into();
-        self.status_color = Color::Green;
+        self.status_tone = StatusTone::Ok;
         self.quit_armed = false;
     }
 
     fn set_info(&mut self, msg: impl Into<String>) {
         self.status = msg.into();
-        self.status_color = Color::Cyan;
+        self.status_tone = StatusTone::Info;
         self.quit_armed = false;
     }
 
     fn set_warn(&mut self, msg: impl Into<String>) {
         self.status = msg.into();
-        self.status_color = Color::Yellow;
+        self.status_tone = StatusTone::Warn;
     }
 
     fn set_err(&mut self, msg: impl Into<String>) {
         self.status = msg.into();
-        self.status_color = Color::Red;
+        self.status_tone = StatusTone::Err;
         self.quit_armed = false;
     }
 }
@@ -174,28 +251,33 @@ pub fn interactive(io: &mut Backend, label: &str, writable: bool) -> i32 {
     } else {
         None
     };
+    let last_verify = if disk.is_some() {
+        Some(huesos_gpt::verify_disk_io(io))
+    } else {
+        None
+    };
 
-    let (init_status, init_color) = if let Some(ref d) = disk {
+    let (init_status, init_tone) = if let Some(ref d) = disk {
         let count = d.active_partitions().len();
         (
             format!(
-                "GPT loaded ({count} partition(s)) -- Up/Down select, Left/Right/Enter or hotkeys"
+                "GPT loaded ({count} partition(s)) -- Up/Down select region, Left/Right/Enter or hotkeys"
             ),
-            Color::Green,
+            StatusTone::Ok,
         )
     } else if let Some(ref bare) = raw_hxfs {
         (
             format!(
-                "Whole-disk {} ({}) mounted without GPT -- press g to initialize GPT",
+                "Whole-disk {} ({}) mounted without GPT -- press g to stage a GPT in memory",
                 bare.layout_tag(),
                 bare.layout_label()
             ),
-            Color::Yellow,
+            StatusTone::Warn,
         )
     } else {
         (
-            String::from("No GPT partition table found -- press g to create a fresh GPT"),
-            Color::Yellow,
+            String::from("No GPT partition table found -- press g to initialize a fresh GPT"),
+            StatusTone::Warn,
         )
     };
 
@@ -208,17 +290,18 @@ pub fn interactive(io: &mut Backend, label: &str, writable: bool) -> i32 {
         total_lbas,
         disk,
         raw_hxfs,
+        last_verify,
         dirty: false,
         selected_row: initial_selected_row,
         selected_action: 0,
         quit_armed: false,
         status: init_status,
-        status_color: init_color,
+        status_tone: init_tone,
     };
 
     let mut screen = tui::Screen::new(io::stdout());
     let mut input = io::stdin();
-    let _ = screen.hide_cursor();
+    let _ = screen.enter_fullscreen();
 
     let exit_code = loop {
         let slots = build_slots(state.disk.as_ref(), state.total_lbas);
@@ -230,7 +313,7 @@ pub fn interactive(io: &mut Backend, label: &str, writable: bool) -> i32 {
             state.selected_action = 0;
         }
 
-        let _ = draw_main(&mut screen, &state, &slots, actions);
+        let _ = draw_studio(&mut screen, &state, &slots, actions, None);
 
         let Some(key) = tui::read_key(&mut input) else {
             break 0;
@@ -249,6 +332,18 @@ pub fn interactive(io: &mut Backend, label: &str, writable: bool) -> i32 {
                 state.quit_armed = false;
                 if state.selected_row + 1 < slots.len() {
                     state.selected_row += 1;
+                    state.selected_action = 0;
+                }
+            }
+            Key::PageUp => {
+                state.quit_armed = false;
+                state.selected_row = state.selected_row.saturating_sub(10);
+                state.selected_action = 0;
+            }
+            Key::PageDown => {
+                state.quit_armed = false;
+                if !slots.is_empty() {
+                    state.selected_row = (state.selected_row + 10).min(slots.len() - 1);
                     state.selected_action = 0;
                 }
             }
@@ -386,14 +481,25 @@ pub fn interactive(io: &mut Backend, label: &str, writable: bool) -> i32 {
                 );
             }
             Key::Char(b'l') | Key::Char(b'L') => {
-                draw_types_modal(&mut screen);
+                let _ = draw_studio(
+                    &mut screen,
+                    &state,
+                    &slots,
+                    actions,
+                    Some(ModalOverlay::Types),
+                );
                 let _ = tui::read_key(&mut input);
-                state.set_info("returned from partition type list");
+                state.set_info("returned from GPT partition type catalog");
             }
             Key::Char(b'p') | Key::Char(b'P') => {
                 state.disk = GptDisk::read_from(io).ok();
                 state.raw_hxfs = if state.disk.is_none() {
                     probe_raw_hxfs(io)
+                } else {
+                    None
+                };
+                state.last_verify = if state.disk.is_some() {
+                    Some(huesos_gpt::verify_disk_io(io))
                 } else {
                     None
                 };
@@ -425,10 +531,21 @@ pub fn interactive(io: &mut Backend, label: &str, writable: bool) -> i32 {
         }
     };
 
+    let _ = screen.leave_fullscreen();
     let _ = screen.clear();
-    let _ = screen.show_cursor();
-    let _ = screen.out().flush();
     exit_code
+}
+
+#[derive(Clone, Copy)]
+enum ModalOverlay<'a> {
+    Help,
+    Types,
+    Info(&'a DiskSlot),
+    Prompt {
+        title: &'a str,
+        prompt: &'a str,
+        typed: &'a str,
+    },
 }
 
 fn dispatch_action<W: Write>(
@@ -439,9 +556,10 @@ fn dispatch_action<W: Write>(
     screen: &mut tui::Screen<W>,
     input: &mut io::Stdin,
 ) -> Option<i32> {
+    let actions = state.active_actions(slots);
     match act {
         Action::Help => {
-            draw_help_modal(screen);
+            let _ = draw_studio(screen, state, slots, actions, Some(ModalOverlay::Help));
             let _ = tui::read_key(input);
             state.set_info("ready");
             None
@@ -460,11 +578,19 @@ fn dispatch_action<W: Write>(
         Action::InitGpt => {
             if state.raw_hxfs.is_some() || state.disk.is_some() {
                 let prompt = if state.raw_hxfs.is_some() {
-                    "replace raw-hxfs layout in memory with empty GPT? (yes/no) [no]"
+                    "Replace raw-hxfs layout in memory with empty GPT? (yes/no) [no]"
                 } else {
-                    "create empty GPT in memory, clearing all partitions? (yes/no) [no]"
+                    "Create empty GPT in memory, clearing all partitions? (yes/no) [no]"
                 };
-                let Some(ans) = ask_modal(screen, input, prompt) else {
+                let Some(ans) = ask_modal(
+                    screen,
+                    input,
+                    state,
+                    slots,
+                    actions,
+                    "Initialize Fresh GPT",
+                    prompt,
+                ) else {
                     state.set_info("cancelled");
                     return None;
                 };
@@ -513,6 +639,10 @@ fn dispatch_action<W: Write>(
             let Some(size_ans) = ask_modal(
                 screen,
                 input,
+                state,
+                slots,
+                actions,
+                "Create New GPT Partition (1/3: Size)",
                 &format!("Partition size (e.g. 16M, 64M, 1G, LBAs) [{default_human}]"),
             ) else {
                 state.set_info("new partition cancelled");
@@ -538,7 +668,11 @@ fn dispatch_action<W: Write>(
             let Some(type_ans) = ask_modal(
                 screen,
                 input,
-                "Partition type (1/hxfs, 2/efi, 3/linux, 4/swap, 5/basic, UUID) [hxfs]",
+                state,
+                slots,
+                actions,
+                "Create New GPT Partition (2/3: Type GUID)",
+                "Type: 1/hxfs, 2/efi, 3/linux, 4/swap, 5/basic, or RFC4122 UUID [hxfs]",
             ) else {
                 state.set_info("new partition cancelled");
                 return None;
@@ -552,9 +686,15 @@ fn dispatch_action<W: Write>(
             };
 
             let default_name = default_name_for_type(&type_guid);
-            let Some(name_ans) =
-                ask_modal(screen, input, &format!("Partition label [{default_name}]"))
-            else {
+            let Some(name_ans) = ask_modal(
+                screen,
+                input,
+                state,
+                slots,
+                actions,
+                "Create New GPT Partition (3/3: UTF-16 Label)",
+                &format!("Partition label [{default_name}]"),
+            ) else {
                 state.set_info("new partition cancelled");
                 return None;
             };
@@ -594,7 +734,7 @@ fn dispatch_action<W: Write>(
             None
         }
         Action::Delete => {
-            let part_num = resolve_target_partition(state, slots, screen, input)?;
+            let part_num = resolve_target_partition(state, slots, actions, screen, input)?;
             if let Some(table) = state.disk.as_mut() {
                 match table.delete_partition(part_num) {
                     Ok(()) => {
@@ -608,7 +748,7 @@ fn dispatch_action<W: Write>(
             None
         }
         Action::Resize => {
-            let part_num = resolve_target_partition(state, slots, screen, input)?;
+            let part_num = resolve_target_partition(state, slots, actions, screen, input)?;
             let current_h = state
                 .disk
                 .as_ref()
@@ -622,6 +762,10 @@ fn dispatch_action<W: Write>(
             let Some(ans) = ask_modal(
                 screen,
                 input,
+                state,
+                slots,
+                actions,
+                "Resize Partition In Place",
                 &format!("New size for partition #{part_num} (current {current_h}, e.g. 32M, 1G)"),
             ) else {
                 state.set_info("resize cancelled");
@@ -650,10 +794,14 @@ fn dispatch_action<W: Write>(
             None
         }
         Action::Type => {
-            let part_num = resolve_target_partition(state, slots, screen, input)?;
+            let part_num = resolve_target_partition(state, slots, actions, screen, input)?;
             let Some(ans) = ask_modal(
                 screen,
                 input,
+                state,
+                slots,
+                actions,
+                "Change Partition Type GUID",
                 &format!(
                     "New type for #{part_num} (1/hxfs, 2/efi, 3/linux, 4/swap, 5/basic, UUID)"
                 ),
@@ -683,11 +831,15 @@ fn dispatch_action<W: Write>(
             None
         }
         Action::Name => {
-            let part_num = resolve_target_partition(state, slots, screen, input)?;
+            let part_num = resolve_target_partition(state, slots, actions, screen, input)?;
             let Some(ans) = ask_modal(
                 screen,
                 input,
-                &format!("New GPT label for partition #{part_num}"),
+                state,
+                slots,
+                actions,
+                "Rename GPT Partition",
+                &format!("New UTF-16 GPT label for partition #{part_num}"),
             ) else {
                 state.set_info("rename cancelled");
                 return None;
@@ -705,7 +857,13 @@ fn dispatch_action<W: Write>(
         }
         Action::Info => {
             if let Some(slot) = slots.get(state.selected_row) {
-                draw_info_modal(screen, state, slot);
+                let _ = draw_studio(
+                    screen,
+                    state,
+                    slots,
+                    actions,
+                    Some(ModalOverlay::Info(slot)),
+                );
                 let _ = tui::read_key(input);
                 state.set_info("ready");
             } else {
@@ -727,24 +885,31 @@ fn dispatch_action<W: Write>(
                 }
             }
             let report = huesos_gpt::verify_disk_io(io);
-            if report.ok {
-                state.set_ok(
+            let ok = report.ok;
+            let msg = if ok {
+                String::from(
                     "on-disk GPT verify OK: MBR=protective primary_crc=ok backup_crc=ok entries_crc=ok",
-                );
+                )
             } else {
-                state.set_warn(format!(
+                format!(
                     "on-disk verify: mbr={} primary={} backup={} entries={} errs={}",
                     report.protective_mbr,
                     report.primary_crc_ok,
                     report.backup_crc_ok,
                     report.entries_crc_ok,
                     report.errors.len()
-                ));
+                )
+            };
+            state.last_verify = Some(report);
+            if ok {
+                state.set_ok(msg);
+            } else {
+                state.set_warn(msg);
             }
             None
         }
         Action::Write => {
-            let Some(ref table) = state.disk else {
+            let Some(table_clone) = state.disk.clone() else {
                 state.set_warn("nothing to write: press g to initialize a GPT first");
                 return None;
             };
@@ -756,7 +921,11 @@ fn dispatch_action<W: Write>(
                 let Some(ans) = ask_modal(
                     screen,
                     input,
-                    "WARNING: disk currently holds a raw-hxfs volume! Type 'yes' to overwrite",
+                    state,
+                    slots,
+                    actions,
+                    "CONFIRM DESTRUCTIVE OVERWRITE",
+                    "WARNING: disk holds a live raw-hxfs volume! Type exact 'yes' to overwrite",
                 ) else {
                     state.set_info("write cancelled");
                     return None;
@@ -769,22 +938,27 @@ fn dispatch_action<W: Write>(
                 let Some(ans) = ask_modal(
                     screen,
                     input,
-                    "Write partition table to disk? Type 'yes' to commit [no]",
+                    state,
+                    slots,
+                    actions,
+                    "Commit Partition Table to Disk",
+                    "Write Protective MBR + Primary & Backup GPT to disk? Type 'yes' [no]",
                 ) else {
                     state.set_info("write cancelled");
                     return None;
                 };
                 if ans.trim() != "yes" {
-                    state.set_info("write aborted (changes remain in memory)");
+                    state.set_info("write aborted (changes remain staged in memory)");
                     return None;
                 }
             }
-            let mut copy = table.clone();
+            let mut copy = table_clone;
             match copy.write_to(io, false).and_then(|()| io.flush()) {
                 Ok(()) => {
                     state.disk = Some(copy);
                     state.raw_hxfs = None;
                     state.dirty = false;
+                    state.last_verify = Some(huesos_gpt::verify_disk_io(io));
                     state.set_ok("partition table written and flushed to disk");
                     None
                 }
@@ -800,6 +974,7 @@ fn dispatch_action<W: Write>(
 fn resolve_target_partition<W: Write>(
     state: &mut EditorState,
     slots: &[DiskSlot],
+    actions: &[Action],
     screen: &mut tui::Screen<W>,
     input: &mut io::Stdin,
 ) -> Option<usize> {
@@ -829,7 +1004,15 @@ fn resolve_target_partition<W: Write>(
         return Some(active[0]);
     }
     let default_num = active[0];
-    let ans = ask_modal(screen, input, &format!("Partition number [{default_num}]"))?;
+    let ans = ask_modal(
+        screen,
+        input,
+        state,
+        slots,
+        actions,
+        "Select Target Partition",
+        &format!("Partition number [{default_num}]"),
+    )?;
     if ans.trim().is_empty() {
         return Some(default_num);
     }
@@ -842,16 +1025,47 @@ fn resolve_target_partition<W: Write>(
     }
 }
 
-fn ask_modal<W: Write>(
+/// Interactive floating modal prompt rendered cleanly over the full-screen studio.
+fn ask_modal<W: Write, R: Read>(
     screen: &mut tui::Screen<W>,
-    input: &mut io::Stdin,
+    input: &mut R,
+    state: &EditorState,
+    slots: &[DiskSlot],
+    actions: &[Action],
+    title: &str,
     prompt_label: &str,
 ) -> Option<String> {
-    let _ = screen.write_raw("\r\x1b[2K");
-    let _ = screen.show_cursor();
-    let res = tui::prompt(screen.out(), input, prompt_label);
-    let _ = screen.hide_cursor();
-    res
+    let mut line = String::new();
+    loop {
+        let _ = draw_studio(
+            screen,
+            state,
+            slots,
+            actions,
+            Some(ModalOverlay::Prompt {
+                title,
+                prompt: prompt_label,
+                typed: &line,
+            }),
+        );
+        match tui::read_key(input)? {
+            Key::Enter => return Some(line),
+            Key::Backspace => {
+                line.pop();
+            }
+            Key::Ctrl(21) => {
+                line.clear();
+            }
+            Key::Escape | Key::Ctrl(3) | Key::Ctrl(7) => return None,
+            Key::Char(byte) if (0x20..=0x7e).contains(&byte) && line.len() < 64 => {
+                line.push(char::from(byte));
+            }
+            Key::Tab if line.len() < 64 => {
+                line.push(' ');
+            }
+            _ => {}
+        }
+    }
 }
 
 fn parse_type_choice(raw: &str) -> Option<Guid> {
@@ -946,163 +1160,610 @@ fn build_slots(disk: Option<&GptDisk>, total_lbas: u64) -> Vec<DiskSlot> {
     slots
 }
 
-fn draw_main<W: Write>(
+fn draw_studio<W: Write>(
     screen: &mut tui::Screen<W>,
     state: &EditorState,
     slots: &[DiskSlot],
     actions: &[Action],
+    overlay: Option<ModalOverlay<'_>>,
 ) -> huesos_std::Result<()> {
-    screen.clear()?;
+    let (cols, rows) = tui::viewport_size();
+    let mut fb = FrameBuffer::new(cols, rows);
 
-    let mode_tag = if state.writable { "RW" } else { "RO" };
-    let title = format!(
-        " HuesOS fdisk/cfdisk -- {} [{}] -- {} ",
-        state.label,
-        mode_tag,
-        human_size(state.total_lbas.saturating_mul(LBA_SIZE as u64))
-    );
-    screen.line(&tui::frame_top(&title, FRAME_WIDTH))?;
+    let total_bytes = state.total_lbas.saturating_mul(LBA_SIZE as u64);
 
-    // Header metadata pane
-    let label_desc = if let Some(ref d) = state.disk {
-        format!("gpt   Disk GUID: {}", d.primary.disk_guid.format_uuid())
-    } else if let Some(ref bare) = state.raw_hxfs {
+    // 1. Row 1: Top Header Bar
+    let rw_pill = if state.writable {
         format!(
-            "none (whole-device {} {}, v{}, seq {})",
-            bare.layout_tag(),
-            bare.layout_label(),
-            bare.format_version,
-            bare.sequence_number
+            "{}{}{}[ RW ]{}",
+            bg_rgb(18, 66, 52),
+            fg_rgb(110, 245, 190),
+            ansi::BOLD,
+            ansi::RESET
         )
     } else {
-        String::from("none (unpartitioned disk)")
+        format!(
+            "{}{}{}[ RO ]{}",
+            bg_rgb(76, 32, 38),
+            fg_rgb(255, 145, 155),
+            ansi::BOLD,
+            ansi::RESET
+        )
     };
-    let dirty_badge = if state.dirty {
-        tui::colored("MODIFIED (in memory)", Color::Yellow)
+    let dirty_pill = if state.dirty {
+        format!(
+            "{}{}{}[ MODIFIED IN MEMORY ]{}",
+            bg_rgb(88, 62, 18),
+            fg_rgb(255, 215, 105),
+            ansi::BOLD,
+            ansi::RESET
+        )
     } else {
-        tui::colored("CLEAN", Color::Green)
+        format!(
+            "{}{}{}[ SYNCED / CLEAN ]{}",
+            bg_rgb(24, 52, 76),
+            fg_rgb(125, 220, 255),
+            ansi::BOLD,
+            ansi::RESET
+        )
     };
-    screen.line(&tui::frame_line(
-        &format!(" Label: {}   State: {}", label_desc, dirty_badge),
-        FRAME_WIDTH,
-    ))?;
-    screen.line(&tui::frame_line(
-        &format!(
-            " Geometry: {} sectors x {}B = {}   Align: 1 MiB (2048 LBAs)",
-            state.total_lbas,
-            LBA_SIZE,
-            human_size(state.total_lbas.saturating_mul(LBA_SIZE as u64))
-        ),
-        FRAME_WIDTH,
-    ))?;
-    screen.line(&tui::frame_rule(FRAME_WIDTH))?;
 
-    // Visual proportional usage bar
-    let map_bar = render_visual_bar(state, slots);
-    screen.line(&tui::frame_line(&format!(" Map: {map_bar}"), FRAME_WIDTH))?;
-    screen.line(&tui::frame_rule(FRAME_WIDTH))?;
-
-    // Partition & free-space table
-    screen.line(&tui::frame_line(
-        "\x1b[1m   DEVICE           START         END     SECTORS    SIZE  TYPE         NAME\x1b[0m",
-        FRAME_WIDTH,
-    ))?;
-
-    if state.disk.is_none() {
-        screen.line(&tui::frame_line("", FRAME_WIDTH))?;
-        if let Some(ref bare) = state.raw_hxfs {
-            screen.line(&tui::frame_line(
-                &format!(
-                    "   Whole device contains a live {} filesystem ({}).",
-                    bare.layout_tag(),
-                    bare.layout_label()
-                ),
-                FRAME_WIDTH,
-            ))?;
-            screen.line(&tui::frame_line(
-                "   Press 'g' (or Enter on [g:NewGPT]) to stage a new GPT in memory.",
-                FRAME_WIDTH,
-            ))?;
-        } else {
-            screen.line(&tui::frame_line(
-                "   Disk does not contain a recognized GPT partition table.",
-                FRAME_WIDTH,
-            ))?;
-            screen.line(&tui::frame_line(
-                "   Press 'g' (or Enter on [g:NewGPT]) to initialize a new GPT.",
-                FRAME_WIDTH,
-            ))?;
-        }
-        screen.line(&tui::frame_line("", FRAME_WIDTH))?;
-    } else if slots.is_empty() {
-        screen.line(&tui::frame_line(
-            "   (no usable sectors on disk)",
-            FRAME_WIDTH,
-        ))?;
+    let layout_kind = if state.disk.is_some() {
+        "GPT + Protective MBR"
+    } else if state.raw_hxfs.is_some() {
+        "Bare HxFS v7 (superfloppy)"
     } else {
-        let max_rows = 10usize;
-        let start_idx = if state.selected_row >= max_rows {
-            state.selected_row + 1 - max_rows
+        "Unpartitioned"
+    };
+
+    let left_hdr = format!(
+        " {}{}HuesOS fdisk{} {}// cfdisk studio{}   {}{}{} {}   {}capacity:{} {}{}{} ({} LBAs x {}B)",
+        fg_rgb(110, 245, 195),
+        ansi::BOLD,
+        ansi::RESET,
+        fg_rgb(120, 145, 180),
+        ansi::RESET,
+        fg_rgb(255, 255, 255),
+        state.label,
+        ansi::RESET,
+        rw_pill,
+        fg_rgb(140, 165, 198),
+        ansi::RESET,
+        fg_rgb(95, 222, 245),
+        human_size(total_bytes),
+        ansi::RESET,
+        state.total_lbas,
+        LBA_SIZE,
+    );
+    let right_hdr = format!(
+        "{}{}{}  {} ",
+        fg_rgb(198, 146, 252),
+        layout_kind,
+        ansi::RESET,
+        dirty_pill
+    );
+    fb.put_bar_row(1, BG_HEADER, &join_lr(&left_hdr, &right_hdr, cols));
+
+    // 2. Rows 2..=6: Full-width Proportional Disk Layout Map Box
+    let mut cur_row = 2usize;
+    let used_lbas: u64 = slots
+        .iter()
+        .filter(|s| matches!(s.kind, SlotKind::Partition { .. }))
+        .map(DiskSlot::size_lbas)
+        .sum();
+    let free_lbas: u64 = slots
+        .iter()
+        .filter(|s| matches!(s.kind, SlotKind::FreeSpace))
+        .map(DiskSlot::size_lbas)
+        .sum();
+    let used_pct = (used_lbas.saturating_mul(100))
+        .checked_div(state.total_lbas.max(1))
+        .unwrap_or(0);
+
+    let map_title = format!(
+        "Disk Sector Topology  [allocated {} ({:>2}%) | free {} | align 1 MiB (2048 LBAs)]",
+        human_size(used_lbas * LBA_SIZE as u64),
+        used_pct,
+        human_size(free_lbas * LBA_SIZE as u64),
+    );
+    fb.put_row(cur_row, &box_top(&map_title, cols, FG_BORDER_HI, FG_TITLE));
+    cur_row += 1;
+
+    let ribbon_w = cols.saturating_sub(6).max(20);
+    let (bar_line, caret_line) = render_topology_ribbon(state, slots, ribbon_w);
+    fb.put_row(
+        cur_row,
+        &box_line(&format!(" [{bar_line}]"), cols, FG_BORDER_HI),
+    );
+    cur_row += 1;
+    fb.put_row(
+        cur_row,
+        &box_line(&format!("  {caret_line} "), cols, FG_BORDER_HI),
+    );
+    cur_row += 1;
+
+    let legend_line = format!(
+        " {}Legend:{}  {}██{} HxFS v7   {}██{} EFI System   {}██{} Linux FS   {}██{} Swap   {}██{} Basic Data   {}░░{} Free Space   {}^^{} Selected Region",
+        fg_rgb(FG_MUTED.0, FG_MUTED.1, FG_MUTED.2),
+        ansi::RESET,
+        fg_rgb(FG_CYAN.0, FG_CYAN.1, FG_CYAN.2),
+        ansi::RESET,
+        fg_rgb(FG_AMBER.0, FG_AMBER.1, FG_AMBER.2),
+        ansi::RESET,
+        fg_rgb(FG_MINT.0, FG_MINT.1, FG_MINT.2),
+        ansi::RESET,
+        fg_rgb(FG_VIOLET.0, FG_VIOLET.1, FG_VIOLET.2),
+        ansi::RESET,
+        fg_rgb(FG_BLUE.0, FG_BLUE.1, FG_BLUE.2),
+        ansi::RESET,
+        fg_rgb(FG_TRACK.0, FG_TRACK.1, FG_TRACK.2),
+        ansi::RESET,
+        fg_rgb(255, 255, 255),
+        ansi::RESET,
+    );
+    fb.put_row(cur_row, &box_line(&legend_line, cols, FG_BORDER_HI));
+    cur_row += 1;
+    fb.put_row(cur_row, &box_bottom(cols, FG_BORDER_HI));
+    cur_row += 1;
+
+    // 3. Main Workspace Rows (`cur_row ..= rows - 2`):
+    //    Dual-pane when cols >= 112 (Partition Table left + Live Inspector right),
+    //    single-pane with bottom detail strip on narrow serial terminals.
+    let status_row = rows.saturating_sub(1);
+    let action_row = rows;
+    let main_bottom = status_row.saturating_sub(1);
+
+    if main_bottom >= cur_row + 6 {
+        if cols >= 112 {
+            let left_w = (cols * 62) / 100;
+            let right_w = cols - left_w;
+            let h = main_bottom - cur_row + 1;
+            let left_lines = build_partition_table_pane(state, slots, left_w, h);
+            let right_lines = build_inspector_pane(state, slots, right_w, h);
+            for i in 0..h {
+                let l = left_lines.get(i).map(String::as_str).unwrap_or("");
+                let r = right_lines.get(i).map(String::as_str).unwrap_or("");
+                fb.put_row(cur_row + i, &format!("{l}{r}"));
+            }
         } else {
-            0
-        };
-        let end_idx = (start_idx + max_rows).min(slots.len());
-        for (idx, slot) in slots[start_idx..end_idx].iter().enumerate() {
-            let abs_idx = start_idx + idx;
-            let selected = abs_idx == state.selected_row;
-            let marker = if selected { ">" } else { " " };
-            let row_plain = match &slot.kind {
-                SlotKind::Partition {
-                    part_num,
-                    type_guid,
-                    name,
-                    ..
-                } => {
-                    let dev_name = partition_dev_name(&state.label, *part_num);
-                    let disp_name = if name.is_empty() { "-" } else { name.as_str() };
-                    format!(
-                        " {marker} {:<14} {:>9} {:>11} {:>11} {:>7}  {:<12} {}",
-                        tui::fit(&dev_name, 14),
-                        slot.start_lba,
-                        slot.end_lba,
-                        slot.size_lbas(),
-                        human_size(slot.size_bytes()),
-                        tui::fit(short_type(type_guid), 12),
-                        tui::fit(disp_name, 20)
-                    )
-                }
-                SlotKind::FreeSpace => {
-                    format!(
-                        " {marker} {:<14} {:>9} {:>11} {:>11} {:>7}  {:<12} -",
-                        "Free space",
-                        slot.start_lba,
-                        slot.end_lba,
-                        slot.size_lbas(),
-                        human_size(slot.size_bytes()),
-                        "unallocated"
-                    )
-                }
-            };
-            let fitted = tui::fit(&row_plain, FRAME_WIDTH - 2);
-            let styled = if selected {
-                format!("\x1b[7m{fitted}\x1b[0m")
-            } else if matches!(slot.kind, SlotKind::FreeSpace) {
-                tui::colored(&fitted, Color::Green)
-            } else {
-                fitted
-            };
-            screen.line(&format!("│{styled}│"))?;
-        }
-        // Pad remaining table height slightly so the bottom bar doesn't jump around
-        let rendered = end_idx - start_idx;
-        for _ in rendered..5 {
-            screen.line(&tui::frame_line("", FRAME_WIDTH))?;
+            let h = main_bottom - cur_row + 1;
+            let single_lines = build_partition_table_pane(state, slots, cols, h);
+            for (i, line) in single_lines.iter().enumerate() {
+                fb.put_row(cur_row + i, line);
+            }
         }
     }
 
-    // Selected item detail strip
-    screen.line(&tui::frame_rule(FRAME_WIDTH))?;
+    // 4. Status / Toast Bar on `status_row`
+    let tone_col = state.status_tone.color();
+    let status_str = format!(
+        " {}{}[{}]{} {}{}{}",
+        fg_rgb(tone_col.0, tone_col.1, tone_col.2),
+        ansi::BOLD,
+        state.status_tone.tag(),
+        ansi::RESET,
+        fg_rgb(FG_TEXT.0, FG_TEXT.1, FG_TEXT.2),
+        state.status,
+        ansi::RESET
+    );
+    let quick_hint = format!(
+        "{}l:types  p:reload  m/?:help{} ",
+        fg_rgb(FG_MUTED.0, FG_MUTED.1, FG_MUTED.2),
+        ansi::RESET
+    );
+    fb.put_bar_row(
+        status_row,
+        BG_STATUS,
+        &join_lr(&status_str, &quick_hint, cols),
+    );
+
+    // 5. Bottom `cfdisk` Action Button Bar on `action_row`
+    let mut act_bar = String::from(" ");
+    for (idx, act) in actions.iter().enumerate() {
+        if idx > 0 {
+            act_bar.push_str("  ");
+        }
+        if idx == state.selected_action {
+            act_bar.push_str(&format!(
+                "{}{}{}[ {}:{} ]{}",
+                bg_rgb(95, 222, 200),
+                fg_rgb(10, 16, 24),
+                ansi::BOLD,
+                act.key_hint(),
+                act.title(),
+                ansi::RESET
+            ));
+        } else {
+            act_bar.push_str(&format!(
+                "{}[{}{}:{}{}]{}",
+                fg_rgb(FG_BORDER_HI.0, FG_BORDER_HI.1, FG_BORDER_HI.2),
+                fg_rgb(FG_AMBER.0, FG_AMBER.1, FG_AMBER.2),
+                act.key_hint(),
+                fg_rgb(FG_TEXT.0, FG_TEXT.1, FG_TEXT.2),
+                act.title(),
+                ansi::RESET
+            ));
+        }
+    }
+    let nav_hint = format!(
+        "{}Up/Dn:region  Left/Right/Enter:action{} ",
+        fg_rgb(FG_MUTED.0, FG_MUTED.1, FG_MUTED.2),
+        ansi::RESET
+    );
+    fb.put_bar_row(
+        action_row,
+        BG_ACTION_BAR,
+        &join_lr(&act_bar, &nav_hint, fb.safe_cols(action_row)),
+    );
+
+    // 6. Optional Modal Overlay (Help / Types / Info / Input Prompt)
+    if let Some(modal) = overlay {
+        render_modal(&mut fb, state, modal);
+    }
+
+    fb.flush_to(screen.out())
+}
+
+fn render_topology_ribbon(
+    state: &EditorState,
+    slots: &[DiskSlot],
+    width: usize,
+) -> (String, String) {
+    if state.total_lbas == 0 || width == 0 {
+        return (" ".repeat(width), " ".repeat(width));
+    }
+    if state.disk.is_none() {
+        if let Some(ref bare) = state.raw_hxfs {
+            let fill = format!(
+                "{}{}{}",
+                fg_rgb(FG_CYAN.0, FG_CYAN.1, FG_CYAN.2),
+                "█".repeat(width),
+                ansi::RESET
+            );
+            let msg = format!(
+                "{}Whole-disk {} ({}) -- no GPT partition table{}",
+                fg_rgb(FG_CYAN.0, FG_CYAN.1, FG_CYAN.2),
+                bare.layout_tag(),
+                bare.layout_label(),
+                ansi::RESET
+            );
+            return (fill, tui::fit(&msg, width));
+        }
+        let empty = format!(
+            "{}{}{}",
+            fg_rgb(FG_TRACK.0, FG_TRACK.1, FG_TRACK.2),
+            "░".repeat(width),
+            ansi::RESET
+        );
+        let msg = format!(
+            "{}Unpartitioned blank medium -- press [g] to initialize GPT{}",
+            fg_rgb(FG_AMBER.0, FG_AMBER.1, FG_AMBER.2),
+            ansi::RESET
+        );
+        return (empty, tui::fit(&msg, width));
+    }
+
+    if slots.is_empty() {
+        return ("░".repeat(width), " ".repeat(width));
+    }
+
+    // Compute segment widths summing to `width`.
+    let mut seg_widths = alloc::vec![1usize; slots.len()];
+    if width >= slots.len() {
+        let mut assigned = 0usize;
+        for (i, slot) in slots.iter().enumerate() {
+            let w = ((slot.size_lbas() as u128 * width as u128) / state.total_lbas.max(1) as u128)
+                as usize;
+            let clamped = w.max(1);
+            seg_widths[i] = clamped;
+            assigned += clamped;
+        }
+        while assigned > width {
+            if let Some((idx, _)) = seg_widths
+                .iter()
+                .enumerate()
+                .filter(|(_, &w)| w > 1)
+                .max_by_key(|(_, &w)| w)
+            {
+                seg_widths[idx] -= 1;
+                assigned -= 1;
+            } else {
+                break;
+            }
+        }
+        if assigned < width {
+            if let Some((idx, _)) = slots.iter().enumerate().max_by_key(|(_, s)| s.size_lbas()) {
+                seg_widths[idx] += width - assigned;
+            }
+        }
+    }
+
+    let mut bar = String::new();
+    let mut caret = String::new();
+    for (idx, (slot, &seg_w)) in slots.iter().zip(seg_widths.iter()).enumerate() {
+        let selected = idx == state.selected_row;
+        match &slot.kind {
+            SlotKind::Partition {
+                part_num,
+                type_guid,
+                ..
+            } => {
+                let col = type_color(type_guid);
+                bar.push_str(&fg_rgb(col.0, col.1, col.2));
+                for c in 0..seg_w {
+                    if c + 1 == seg_w && seg_w >= 3 && idx + 1 < slots.len() {
+                        bar.push('▉');
+                    } else {
+                        bar.push('█');
+                    }
+                }
+                bar.push_str(ansi::RESET);
+
+                if selected {
+                    let tag = format!("^p{part_num}^");
+                    caret.push_str(&fg_rgb(255, 255, 255));
+                    caret.push_str(ansi::BOLD);
+                    caret.push_str(&center_ascii(&tag, seg_w, '^'));
+                    caret.push_str(ansi::RESET);
+                } else {
+                    let tag = format!("p{part_num}");
+                    caret.push_str(&fg_rgb(col.0, col.1, col.2));
+                    if seg_w > tag.len() {
+                        caret.push_str(&center_ascii(&tag, seg_w, ' '));
+                    } else {
+                        for _ in 0..seg_w {
+                            caret.push(' ');
+                        }
+                    }
+                    caret.push_str(ansi::RESET);
+                }
+            }
+            SlotKind::FreeSpace => {
+                let col = if selected { FG_MINT } else { FG_TRACK };
+                bar.push_str(&fg_rgb(col.0, col.1, col.2));
+                for _ in 0..seg_w {
+                    bar.push(if selected { '▒' } else { '░' });
+                }
+                bar.push_str(ansi::RESET);
+
+                if selected {
+                    caret.push_str(&fg_rgb(FG_MINT.0, FG_MINT.1, FG_MINT.2));
+                    caret.push_str(ansi::BOLD);
+                    caret.push_str(&center_ascii("^FREE^", seg_w, '^'));
+                    caret.push_str(ansi::RESET);
+                } else {
+                    for _ in 0..seg_w {
+                        caret.push(' ');
+                    }
+                }
+            }
+        }
+    }
+    (bar, caret)
+}
+
+fn build_partition_table_pane(
+    state: &EditorState,
+    slots: &[DiskSlot],
+    width: usize,
+    height: usize,
+) -> Vec<String> {
+    let mut lines = Vec::with_capacity(height);
+    let part_count = slots
+        .iter()
+        .filter(|s| matches!(s.kind, SlotKind::Partition { .. }))
+        .count();
+    let free_count = slots.len().saturating_sub(part_count);
+    let title = format!("Partitions & Free Regions  [{part_count} part | {free_count} free]");
+    lines.push(box_top(&title, width, FG_BORDER_HI, FG_TITLE));
+
+    let name_w = width.saturating_sub(78).clamp(8, 28);
+    let hdr = format!(
+        "   {}{:<15} {:>10} {:>10} {:>10} {:>8}  {:<14} {:<name_w$}{}",
+        ansi::BOLD,
+        "DEVICE",
+        "START LBA",
+        "END LBA",
+        "SECTORS",
+        "SIZE",
+        "TYPE",
+        "GPT LABEL",
+        ansi::RESET,
+    );
+    lines.push(box_line(&hdr, width, FG_BORDER_HI));
+    lines.push(box_rule(width, FG_BORDER));
+
+    let body_rows = height.saturating_sub(4);
+    if state.disk.is_none() {
+        let mut msg_lines = Vec::new();
+        msg_lines.push(String::new());
+        if let Some(ref bare) = state.raw_hxfs {
+            msg_lines.push(format!(
+                "   {}Whole device holds a mounted {} filesystem ({}){}",
+                fg_rgb(FG_AMBER.0, FG_AMBER.1, FG_AMBER.2),
+                bare.layout_tag(),
+                bare.layout_label(),
+                ansi::RESET
+            ));
+            msg_lines.push(format!(
+                "   {}Format v{}, checkpoint sequence #{}, block size {}B{}",
+                fg_rgb(FG_TEXT.0, FG_TEXT.1, FG_TEXT.2),
+                bare.format_version,
+                bare.sequence_number,
+                bare.block_size,
+                ansi::RESET
+            ));
+            msg_lines.push(String::new());
+            msg_lines.push(format!(
+                "   {}Press [g] (or Enter on g:NewGPT) to stage a fresh GPT in memory.{}",
+                fg_rgb(FG_CYAN.0, FG_CYAN.1, FG_CYAN.2),
+                ansi::RESET
+            ));
+            msg_lines.push(format!(
+                "   {}Nothing touches disk unless you explicitly confirm [w:Write].{}",
+                fg_rgb(FG_MUTED.0, FG_MUTED.1, FG_MUTED.2),
+                ansi::RESET
+            ));
+        } else {
+            msg_lines.push(format!(
+                "   {}Disk does not contain a recognized GPT partition table.{}",
+                fg_rgb(FG_AMBER.0, FG_AMBER.1, FG_AMBER.2),
+                ansi::RESET
+            ));
+            msg_lines.push(format!(
+                "   {}Press [g] (or Enter on g:NewGPT) to initialize Protective MBR + GPT.{}",
+                fg_rgb(FG_CYAN.0, FG_CYAN.1, FG_CYAN.2),
+                ansi::RESET
+            ));
+        }
+        for i in 0..body_rows {
+            let txt = msg_lines.get(i).map(String::as_str).unwrap_or("");
+            lines.push(box_line(txt, width, FG_BORDER_HI));
+        }
+    } else {
+        let scroll_top = if body_rows == 0 || state.selected_row < body_rows {
+            0
+        } else {
+            state.selected_row + 1 - body_rows
+        };
+        for i in 0..body_rows {
+            if let Some(slot) = slots.get(scroll_top + i) {
+                let selected = scroll_top + i == state.selected_row;
+                match &slot.kind {
+                    SlotKind::Partition {
+                        part_num,
+                        type_guid,
+                        name,
+                        ..
+                    } => {
+                        let dev = partition_dev_name(&state.label, *part_num);
+                        let disp_name = if name.is_empty() { "-" } else { name.as_str() };
+                        let tcol = type_color(type_guid);
+                        if selected {
+                            let plain = format!(
+                                " > {:<15} {:>10} {:>10} {:>10} {:>8}  █ {:<12} {}",
+                                tui::fit(&dev, 15),
+                                slot.start_lba,
+                                slot.end_lba,
+                                slot.size_lbas(),
+                                human_size(slot.size_bytes()),
+                                tui::fit(short_type(type_guid), 12),
+                                tui::fit(disp_name, name_w),
+                            );
+                            let hi = tui::fit_with_bg(
+                                &format!("{}{}{}", fg_rgb(255, 255, 255), ansi::BOLD, plain),
+                                width.saturating_sub(2),
+                                BG_SELECT,
+                            );
+                            let b = fg_rgb(FG_BORDER_HI.0, FG_BORDER_HI.1, FG_BORDER_HI.2);
+                            lines.push(format!("{b}│{}{hi}{b}│{}", ansi::RESET, ansi::RESET));
+                        } else {
+                            let row = format!(
+                                "   {}{:<15}{} {}{:>10} {:>10} {:>10}{} {}{:>8}{}  {}█ {:<12}{} {}{}{}",
+                                fg_rgb(235, 243, 255),
+                                tui::fit(&dev, 15),
+                                ansi::RESET,
+                                fg_rgb(FG_MUTED.0, FG_MUTED.1, FG_MUTED.2),
+                                slot.start_lba,
+                                slot.end_lba,
+                                slot.size_lbas(),
+                                ansi::RESET,
+                                fg_rgb(FG_TEXT.0, FG_TEXT.1, FG_TEXT.2),
+                                human_size(slot.size_bytes()),
+                                ansi::RESET,
+                                fg_rgb(tcol.0, tcol.1, tcol.2),
+                                tui::fit(short_type(type_guid), 12),
+                                ansi::RESET,
+                                fg_rgb(FG_TEXT.0, FG_TEXT.1, FG_TEXT.2),
+                                tui::fit(disp_name, name_w),
+                                ansi::RESET,
+                            );
+                            lines.push(box_line(&row, width, FG_BORDER_HI));
+                        }
+                    }
+                    SlotKind::FreeSpace => {
+                        if selected {
+                            let plain = format!(
+                                " > {:<15} {:>10} {:>10} {:>10} {:>8}  {:<14} {}",
+                                "Free space",
+                                slot.start_lba,
+                                slot.end_lba,
+                                slot.size_lbas(),
+                                human_size(slot.size_bytes()),
+                                "unallocated",
+                                "[press n]",
+                            );
+                            let hi = tui::fit_with_bg(
+                                &format!("{}{}{}", fg_rgb(130, 255, 195), ansi::BOLD, plain),
+                                width.saturating_sub(2),
+                                BG_SELECT,
+                            );
+                            let b = fg_rgb(FG_BORDER_HI.0, FG_BORDER_HI.1, FG_BORDER_HI.2);
+                            lines.push(format!("{b}│{}{hi}{b}│{}", ansi::RESET, ansi::RESET));
+                        } else {
+                            let row = format!(
+                                "   {}{:<15}{} {}{:>10} {:>10} {:>10}{} {}{:>8}{}  {}{:<14} -{}",
+                                fg_rgb(FG_MINT.0, FG_MINT.1, FG_MINT.2),
+                                "Free space",
+                                ansi::RESET,
+                                fg_rgb(FG_MUTED.0, FG_MUTED.1, FG_MUTED.2),
+                                slot.start_lba,
+                                slot.end_lba,
+                                slot.size_lbas(),
+                                ansi::RESET,
+                                fg_rgb(FG_MINT.0, FG_MINT.1, FG_MINT.2),
+                                human_size(slot.size_bytes()),
+                                ansi::RESET,
+                                fg_rgb(FG_MUTED.0, FG_MUTED.1, FG_MUTED.2),
+                                "unallocated",
+                                ansi::RESET,
+                            );
+                            lines.push(box_line(&row, width, FG_BORDER_HI));
+                        }
+                    }
+                }
+            } else {
+                lines.push(box_line("", width, FG_BORDER_HI));
+            }
+        }
+    }
+
+    lines.push(box_bottom(width, FG_BORDER_HI));
+    lines
+}
+
+fn build_inspector_pane(
+    state: &EditorState,
+    slots: &[DiskSlot],
+    width: usize,
+    height: usize,
+) -> Vec<String> {
+    let mut content: Vec<String> = Vec::new();
+
     if let Some(slot) = slots.get(state.selected_row) {
+        let share_pct = (slot.size_lbas().saturating_mul(100))
+            .checked_div(state.total_lbas.max(1))
+            .unwrap_or(0);
+        let align_str = if slot.start_lba % ALIGN_1MIB_LBAS == 0 {
+            format!(
+                "{}1 MiB optimal{}",
+                fg_rgb(FG_MINT.0, FG_MINT.1, FG_MINT.2),
+                ansi::RESET
+            )
+        } else if slot.start_lba % ALIGN_4KIB_LBAS == 0 {
+            format!(
+                "{}4 KiB aligned{}",
+                fg_rgb(FG_CYAN.0, FG_CYAN.1, FG_CYAN.2),
+                ansi::RESET
+            )
+        } else {
+            format!(
+                "{}unaligned sector{}",
+                fg_rgb(FG_AMBER.0, FG_AMBER.1, FG_AMBER.2),
+                ansi::RESET
+            )
+        };
+
         match &slot.kind {
             SlotKind::Partition {
                 part_num,
@@ -1110,275 +1771,512 @@ fn draw_main<W: Write>(
                 unique_guid,
                 name,
             } => {
-                screen.line(&tui::frame_line(
-                    &format!(
-                        " Part #{part_num}: {}   Label: '{}'",
-                        type_guid.type_label(),
-                        if name.is_empty() { "-" } else { name.as_str() }
-                    ),
-                    FRAME_WIDTH,
-                ))?;
-                screen.line(&tui::frame_line(
-                    &format!(" UUID: {}", unique_guid.format_uuid()),
-                    FRAME_WIDTH,
-                ))?;
-            }
-            SlotKind::FreeSpace => {
-                screen.line(&tui::frame_line(
-                    &format!(
-                        " Unallocated: LBAs {}..={} ({}) -- press n or Enter to create partition",
-                        slot.start_lba,
-                        slot.end_lba,
-                        human_size(slot.size_bytes())
-                    ),
-                    FRAME_WIDTH,
-                ))?;
-                screen.line(&tui::frame_line(
-                    " Keys: Up/Down select row, Left/Right select action, l list types",
-                    FRAME_WIDTH,
-                ))?;
-            }
-        }
-    } else {
-        screen.line(&tui::frame_line(
-            " Keys: g create GPT, v verify disk, m/? help, l list types, q quit",
-            FRAME_WIDTH,
-        ))?;
-    }
-
-    // Action button bar (`cfdisk`-style)
-    screen.line(&tui::frame_rule(FRAME_WIDTH))?;
-    let mut bar = String::from(" ");
-    for (idx, act) in actions.iter().enumerate() {
-        if idx > 0 {
-            bar.push(' ');
-        }
-        let chip = format!("[{}]", act.label());
-        if idx == state.selected_action {
-            bar.push_str(&format!("\x1b[7m{chip}\x1b[0m"));
-        } else {
-            bar.push_str(&chip);
-        }
-    }
-    screen.line(&tui::frame_line(&bar, FRAME_WIDTH))?;
-    screen.line(&tui::frame_bottom(FRAME_WIDTH))?;
-
-    // Status line below frame
-    if !state.status.is_empty() {
-        let msg = tui::fit(&format!(" {}", state.status), FRAME_WIDTH);
-        screen.write_raw(&tui::colored(&msg, state.status_color))?;
-    }
-    screen.out().flush()
-}
-
-fn render_visual_bar(state: &EditorState, slots: &[DiskSlot]) -> String {
-    if state.total_lbas == 0 {
-        return String::from("[empty]");
-    }
-    if state.disk.is_none() {
-        if state.raw_hxfs.is_some() {
-            let inner = "█".repeat(MAP_INNER_WIDTH);
-            return format!("[{}] 100% raw-hxfs", tui::colored(&inner, Color::Cyan));
-        }
-        let inner = "░".repeat(MAP_INNER_WIDTH);
-        return format!("[{inner}] unpartitioned");
-    }
-
-    let used_lbas: u64 = slots
-        .iter()
-        .filter(|s| matches!(s.kind, SlotKind::Partition { .. }))
-        .map(DiskSlot::size_lbas)
-        .sum();
-    let pct = (used_lbas.saturating_mul(100))
-        .checked_div(state.total_lbas)
-        .unwrap_or(0);
-
-    let mut out = String::from("[");
-    let mut used_cols = 0usize;
-    for (i, slot) in slots.iter().enumerate() {
-        let remaining_cols = MAP_INNER_WIDTH.saturating_sub(used_cols);
-        if remaining_cols == 0 {
-            break;
-        }
-        let cols = if i + 1 == slots.len() {
-            remaining_cols
-        } else {
-            let raw = (slot.size_lbas() as u128 * MAP_INNER_WIDTH as u128
-                / state.total_lbas as u128) as usize;
-            raw.clamp(1, remaining_cols)
-        };
-        used_cols += cols;
-        match &slot.kind {
-            SlotKind::Partition { type_guid, .. } => {
-                let seg = "█".repeat(cols);
-                let color = if *type_guid == GUID_HXFS_V7 {
-                    Color::Cyan
-                } else if *type_guid == GUID_ESP {
-                    Color::Yellow
-                } else if *type_guid == GUID_LINUX_SWAP {
-                    Color::Magenta
-                } else {
-                    Color::Blue
-                };
-                out.push_str(&tui::colored(&seg, color));
-            }
-            SlotKind::FreeSpace => {
-                for _ in 0..cols {
-                    out.push('░');
-                }
-            }
-        }
-    }
-    while used_cols < MAP_INNER_WIDTH {
-        out.push('░');
-        used_cols += 1;
-    }
-    out.push_str(&format!("] {pct:>3}% used"));
-    out
-}
-
-fn draw_help_modal<W: Write>(screen: &mut tui::Screen<W>) {
-    let _ = screen.clear();
-    let _ = screen.line(&tui::frame_top(
-        " fdisk / cfdisk Command Reference ",
-        FRAME_WIDTH,
-    ));
-    let rows = [
-        " Navigation:",
-        "   Up / Down (or k / j)    Select partition or free-space region",
-        "   Left / Right / Tab      Select bottom action button",
-        "   Enter                   Execute highlighted action button",
-        "",
-        " Classic fdisk Keybindings:",
-        "   n   Create new GPT partition in free space (aligned to 1 MiB)",
-        "   d   Delete selected (or numbered) GPT partition",
-        "   r   Resize partition in place",
-        "   t   Change partition type GUID (hxfs, efi, linux, swap, basic, UUID)",
-        "   c   Change GPT partition UTF-16 name / label",
-        "   i   Inspect detailed partition LBA / GUID attributes",
-        "   l   List known GPT partition type GUIDs",
-        "   g   Create a fresh empty Protective MBR + GPT in memory",
-        "   p   Reload partition table from disk (discarding unsaved edits)",
-        "   v   Verify Protective MBR + Primary/Backup GPT header & entry CRCs",
-        "   w   Write modified GPT to disk and flush",
-        "   q   Quit without saving (prompts twice if modified; Esc / ^C)",
-        "",
-        " Press any key to return to the partition table...",
-    ];
-    for r in rows {
-        let _ = screen.line(&tui::frame_line(r, FRAME_WIDTH));
-    }
-    let _ = screen.line(&tui::frame_bottom(FRAME_WIDTH));
-    let _ = screen.out().flush();
-}
-
-fn draw_types_modal<W: Write>(screen: &mut tui::Screen<W>) {
-    let _ = screen.clear();
-    let _ = screen.line(&tui::frame_top(
-        " Known GPT Partition Types (t / n) ",
-        FRAME_WIDTH,
-    ));
-    let types = [
-        ("1", "hxfs", "HuesOS HxFS v7", GUID_HXFS_V7),
-        ("2", "efi", "EFI System Partition (ESP)", GUID_ESP),
-        ("3", "linux", "Linux filesystem data", GUID_LINUX_FS),
-        ("4", "swap", "Linux swap partition", GUID_LINUX_SWAP),
-        ("5", "basic", "Microsoft Basic Data", GUID_MS_BASIC_DATA),
-    ];
-    let _ = screen.line(&tui::frame_line(
-        " #  ALIAS   DESCRIPTION                  TYPE GUID",
-        FRAME_WIDTH,
-    ));
-    let _ = screen.line(&tui::frame_rule(FRAME_WIDTH));
-    for (num, alias, desc, guid) in types {
-        let _ = screen.line(&tui::frame_line(
-            &format!(
-                " {}  {:<6}  {:<27}  {}",
-                num,
-                alias,
-                desc,
-                guid.format_uuid()
-            ),
-            FRAME_WIDTH,
-        ));
-    }
-    let _ = screen.line(&tui::frame_line("", FRAME_WIDTH));
-    let _ = screen.line(&tui::frame_line(
-        " Custom 36-char RFC 4122 UUIDs are also accepted at the type prompt.",
-        FRAME_WIDTH,
-    ));
-    let _ = screen.line(&tui::frame_line(" Press any key to return...", FRAME_WIDTH));
-    let _ = screen.line(&tui::frame_bottom(FRAME_WIDTH));
-    let _ = screen.out().flush();
-}
-
-fn draw_info_modal<W: Write>(screen: &mut tui::Screen<W>, state: &EditorState, slot: &DiskSlot) {
-    let _ = screen.clear();
-    let _ = screen.line(&tui::frame_top(
-        " Partition / Region Inspector ",
-        FRAME_WIDTH,
-    ));
-    match &slot.kind {
-        SlotKind::Partition {
-            part_num,
-            type_guid,
-            unique_guid,
-            name,
-        } => {
-            let dev = partition_dev_name(&state.label, *part_num);
-            let lines = [
-                format!(" Device        : {dev} (GPT slot #{part_num})"),
-                format!(
-                    " Partition Name: {}",
+                let dev = partition_dev_name(&state.label, *part_num);
+                let tcol = type_color(type_guid);
+                content.push(section_hdr("SELECTED PARTITION", FG_CYAN));
+                content.push(kv_line("Device Node", &dev, FG_TITLE));
+                content.push(kv_line("GPT Slot", &format!("#{part_num} of 128"), FG_TEXT));
+                content.push(kv_line(
+                    "UTF-16 Label",
                     if name.is_empty() {
                         "<empty>"
                     } else {
                         name.as_str()
-                    }
-                ),
-                format!(" Type          : {}", type_guid.type_label()),
-                format!(" Type GUID     : {}", type_guid.format_uuid()),
-                format!(" Unique UUID   : {}", unique_guid.format_uuid()),
-                format!(" Start LBA     : {}", slot.start_lba),
-                format!(" End LBA       : {}", slot.end_lba),
-                format!(
-                    " Span          : {} sectors ({} bytes / {})",
-                    slot.size_lbas(),
-                    slot.size_bytes(),
-                    human_size(slot.size_bytes())
-                ),
-            ];
-            for line in &lines {
-                let _ = screen.line(&tui::frame_line(line, FRAME_WIDTH));
+                    },
+                    FG_TEXT,
+                ));
+                content.push(kv_line("Partition Type", &type_guid.type_label(), tcol));
+                content.push(kv_line("Type GUID", &type_guid.format_uuid(), FG_MUTED));
+                content.push(kv_line("Unique UUID", &unique_guid.format_uuid(), FG_MUTED));
+                content.push(String::new());
+                content.push(section_hdr("SECTOR & BYTE GEOMETRY", FG_CYAN));
+                content.push(kv_line(
+                    "Start LBA",
+                    &format!("{}", slot.start_lba),
+                    FG_TEXT,
+                ));
+                content.push(kv_line("End LBA", &format!("{}", slot.end_lba), FG_TEXT));
+                content.push(kv_line(
+                    "Span",
+                    &format!(
+                        "{} LBAs ({}, {}%)",
+                        slot.size_lbas(),
+                        human_size(slot.size_bytes()),
+                        share_pct
+                    ),
+                    FG_TEXT,
+                ));
+                content.push(kv_line(
+                    "Byte Offset",
+                    &format!("0x{:010x}", slot.start_lba * LBA_SIZE as u64),
+                    FG_MUTED,
+                ));
+                content.push(format!(
+                    " {}Alignment   :{} {}",
+                    fg_rgb(FG_MUTED.0, FG_MUTED.1, FG_MUTED.2),
+                    ansi::RESET,
+                    align_str
+                ));
+            }
+            SlotKind::FreeSpace => {
+                let usable = usable_free_in_slot(slot);
+                let next_aligned = align_up(slot.start_lba, ALIGN_1MIB_LBAS);
+                content.push(section_hdr("SELECTED FREE REGION", FG_MINT));
+                content.push(kv_line("Region Kind", "Unallocated space", FG_MINT));
+                content.push(kv_line(
+                    "Raw Start LBA",
+                    &format!("{}", slot.start_lba),
+                    FG_TEXT,
+                ));
+                content.push(kv_line(
+                    "Raw End LBA",
+                    &format!("{}", slot.end_lba),
+                    FG_TEXT,
+                ));
+                content.push(kv_line(
+                    "Raw Capacity",
+                    &format!(
+                        "{} ({} LBAs)",
+                        human_size(slot.size_bytes()),
+                        slot.size_lbas()
+                    ),
+                    FG_TEXT,
+                ));
+                content.push(kv_line(
+                    "1MiB Start",
+                    &format!("LBA {next_aligned}"),
+                    FG_CYAN,
+                ));
+                content.push(kv_line(
+                    "1MiB Usable",
+                    &format!("{} ({} LBAs)", human_size(usable * LBA_SIZE as u64), usable),
+                    FG_MINT,
+                ));
+                content.push(String::new());
+                content.push(format!(
+                    " {}Tip: press [n] or Enter to allocate{}",
+                    fg_rgb(FG_CYAN.0, FG_CYAN.1, FG_CYAN.2),
+                    ansi::RESET
+                ));
+                content.push(format!(
+                    " {}a new 1 MiB-aligned GPT partition.{}",
+                    fg_rgb(FG_MUTED.0, FG_MUTED.1, FG_MUTED.2),
+                    ansi::RESET
+                ));
             }
         }
-        SlotKind::FreeSpace => {
-            let _ = screen.line(&tui::frame_line(
-                " Region        : Unallocated free space",
-                FRAME_WIDTH,
+    } else if let Some(ref bare) = state.raw_hxfs {
+        content.push(section_hdr("BARE HXFS SUPERFLOPPY", FG_AMBER));
+        content.push(kv_line("Layout Tag", bare.layout_tag(), FG_CYAN));
+        content.push(kv_line("Volume Label", &bare.layout_label(), FG_TEXT));
+        content.push(kv_line(
+            "HxFS Version",
+            &format!("v{}", bare.format_version),
+            FG_MINT,
+        ));
+        content.push(kv_line(
+            "Block Size",
+            &format!("{} B", bare.block_size),
+            FG_TEXT,
+        ));
+        content.push(kv_line(
+            "Instance UUID",
+            &format_uuid(&bare.instance_uuid),
+            FG_MUTED,
+        ));
+        content.push(kv_line(
+            "Checkpoint Seq",
+            &format!("#{}", bare.sequence_number),
+            FG_TEXT,
+        ));
+        content.push(kv_line(
+            "Root State",
+            &format!("{}", bare.root_state),
+            FG_TEXT,
+        ));
+    }
+
+    content.push(String::new());
+    content.push(section_hdr("DISK & GPT HEADER TELEMETRY", FG_VIOLET));
+    if let Some(ref d) = state.disk {
+        content.push(kv_line(
+            "Disk GUID",
+            &d.primary.disk_guid.format_uuid(),
+            FG_MUTED,
+        ));
+        content.push(kv_line(
+            "Usable LBAs",
+            &format!(
+                "{} ..= {}",
+                d.primary.first_usable_lba, d.primary.last_usable_lba
+            ),
+            FG_TEXT,
+        ));
+        content.push(kv_line(
+            "Headers",
+            &format!(
+                "Pri LBA {} | Bak LBA {}",
+                d.primary.my_lba, d.primary.alternate_lba
+            ),
+            FG_TEXT,
+        ));
+        content.push(kv_line(
+            "Entry Array",
+            &format!(
+                "LBA {} ({} slots)",
+                d.primary.partition_entry_lba, d.primary.num_partition_entries
+            ),
+            FG_TEXT,
+        ));
+        if state.dirty {
+            content.push(kv_line(
+                "On-Disk Sync",
+                "Staged edits pending [w]",
+                FG_AMBER,
             ));
-            let _ = screen.line(&tui::frame_line(
-                &format!(" Start LBA     : {}", slot.start_lba),
-                FRAME_WIDTH,
-            ));
-            let _ = screen.line(&tui::frame_line(
-                &format!(" End LBA       : {}", slot.end_lba),
-                FRAME_WIDTH,
-            ));
-            let _ = screen.line(&tui::frame_line(
-                &format!(
-                    " Capacity      : {} sectors ({})",
-                    slot.size_lbas(),
-                    human_size(slot.size_bytes())
-                ),
-                FRAME_WIDTH,
+        } else if let Some(ref rep) = state.last_verify {
+            let health = if rep.ok {
+                "VALID (PMBR + Pri + Bak CRC)"
+            } else {
+                "DEGRADED (press v for details)"
+            };
+            content.push(kv_line(
+                "CRC Integrity",
+                health,
+                if rep.ok { FG_MINT } else { FG_AMBER },
             ));
         }
+    } else {
+        content.push(kv_line("GPT Table", "Absent", FG_AMBER));
+        content.push(kv_line(
+            "Total Sectors",
+            &format!("{} x {}B", state.total_lbas, LBA_SIZE),
+            FG_TEXT,
+        ));
     }
-    let _ = screen.line(&tui::frame_line("", FRAME_WIDTH));
-    let _ = screen.line(&tui::frame_line(" Press any key to return...", FRAME_WIDTH));
-    let _ = screen.line(&tui::frame_bottom(FRAME_WIDTH));
-    let _ = screen.out().flush();
+
+    let mut lines = Vec::with_capacity(height);
+    lines.push(box_top(
+        "Region & GPT Inspector",
+        width,
+        FG_BORDER,
+        FG_VIOLET,
+    ));
+    let body_rows = height.saturating_sub(2);
+    for i in 0..body_rows {
+        let txt = content.get(i).map(String::as_str).unwrap_or("");
+        lines.push(box_line(txt, width, FG_BORDER));
+    }
+    lines.push(box_bottom(width, FG_BORDER));
+    lines
+}
+
+fn render_modal(fb: &mut FrameBuffer, state: &EditorState, modal: ModalOverlay<'_>) {
+    match modal {
+        ModalOverlay::Prompt {
+            title,
+            prompt,
+            typed,
+        } => {
+            let w = 86usize.min(fb.cols().saturating_sub(4));
+            let inner_box = w.saturating_sub(6);
+            let cursor_field = format!("{typed}_");
+            let field_rendered = tui::fit_with_bg(
+                &format!(" {}{}{}", fg_rgb(110, 245, 195), ansi::BOLD, cursor_field),
+                inner_box,
+                BG_INPUT,
+            );
+            let rows_txt = [
+                String::new(),
+                format!(
+                    "  {}{}{}",
+                    fg_rgb(FG_TEXT.0, FG_TEXT.1, FG_TEXT.2),
+                    tui::fit(prompt, w.saturating_sub(4)),
+                    ansi::RESET
+                ),
+                String::new(),
+                format!("  {field_rendered}"),
+                String::new(),
+                format!(
+                    "  {}Enter{} confirm   {}Esc / ^C{} cancel   {}Backspace{} edit   {}^U{} clear",
+                    fg_rgb(FG_MINT.0, FG_MINT.1, FG_MINT.2),
+                    fg_rgb(FG_MUTED.0, FG_MUTED.1, FG_MUTED.2),
+                    fg_rgb(FG_AMBER.0, FG_AMBER.1, FG_AMBER.2),
+                    fg_rgb(FG_MUTED.0, FG_MUTED.1, FG_MUTED.2),
+                    fg_rgb(FG_CYAN.0, FG_CYAN.1, FG_CYAN.2),
+                    fg_rgb(FG_MUTED.0, FG_MUTED.1, FG_MUTED.2),
+                    fg_rgb(FG_CYAN.0, FG_CYAN.1, FG_CYAN.2),
+                    fg_rgb(FG_MUTED.0, FG_MUTED.1, FG_MUTED.2),
+                ),
+            ];
+            draw_floating_box(fb, title, &rows_txt, w, FG_CYAN);
+        }
+        ModalOverlay::Help => {
+            let w = 88usize.min(fb.cols().saturating_sub(4));
+            let rows_txt = [
+                String::from("  Navigation"),
+                String::from(
+                    "    Up / Down (k / j), PgUp/Dn   Select partition or free-space slot",
+                ),
+                String::from("    Left / Right / Tab           Select bottom cfdisk action button"),
+                String::from("    Enter                        Execute highlighted action button"),
+                String::new(),
+                String::from("  Partition & GPT Operations"),
+                String::from("    n   Create new 1 MiB-aligned GPT partition in free space"),
+                String::from("    d   Delete selected (or numbered) GPT partition"),
+                String::from("    r   Resize partition in place"),
+                String::from(
+                    "    t   Change partition type GUID (hxfs, efi, linux, swap, basic, UUID)",
+                ),
+                String::from("    c   Change GPT partition UTF-16 name / label"),
+                String::from("    i   Open detailed Partition / Region Inspector modal"),
+                String::from("    l   Open known GPT Partition Type GUID catalog"),
+                String::from("    g   Stage a fresh empty Protective MBR + GPT in memory"),
+                String::from("    p   Reload partition table from disk (discarding unsaved edits)"),
+                String::from(
+                    "    v   Verify Protective MBR + Primary & Backup GPT header/entry CRCs",
+                ),
+                String::from("    w   Commit staged GPT to disk and flush"),
+                String::from(
+                    "    q   Quit cleanly (prompts twice if unsaved edits exist; Esc / ^C)",
+                ),
+                String::new(),
+                format!(
+                    "                  {}Press any key to close command reference{}",
+                    fg_rgb(FG_CYAN.0, FG_CYAN.1, FG_CYAN.2),
+                    ansi::RESET
+                ),
+            ];
+            draw_floating_box(
+                fb,
+                "fdisk / cfdisk Command Reference",
+                &rows_txt,
+                w,
+                FG_CYAN,
+            );
+        }
+        ModalOverlay::Types => {
+            let w = 92usize.min(fb.cols().saturating_sub(4));
+            let types = [
+                ("1", "hxfs", "HuesOS HxFS v7", GUID_HXFS_V7),
+                ("2", "efi", "EFI System Partition (ESP)", GUID_ESP),
+                ("3", "linux", "Linux filesystem data", GUID_LINUX_FS),
+                ("4", "swap", "Linux swap partition", GUID_LINUX_SWAP),
+                ("5", "basic", "Microsoft Basic Data", GUID_MS_BASIC_DATA),
+            ];
+            let mut rows_txt = Vec::new();
+            rows_txt.push(format!(
+                "  {}{:<3} {:<8} {:<28} TYPE GUID{}",
+                ansi::BOLD,
+                "#",
+                "ALIAS",
+                "DESCRIPTION",
+                ansi::RESET
+            ));
+            rows_txt.push(format!(
+                "  {}{}{}",
+                fg_rgb(FG_BORDER.0, FG_BORDER.1, FG_BORDER.2),
+                "─".repeat(w.saturating_sub(6)),
+                ansi::RESET
+            ));
+            for (num, alias, desc, guid) in types {
+                let col = type_color(&guid);
+                rows_txt.push(format!(
+                    "  {}{:<3}{} {}{:<8}{} {:<28} {}{}{}",
+                    fg_rgb(FG_AMBER.0, FG_AMBER.1, FG_AMBER.2),
+                    num,
+                    ansi::RESET,
+                    fg_rgb(col.0, col.1, col.2),
+                    alias,
+                    ansi::RESET,
+                    desc,
+                    fg_rgb(FG_MUTED.0, FG_MUTED.1, FG_MUTED.2),
+                    guid.format_uuid(),
+                    ansi::RESET
+                ));
+            }
+            rows_txt.push(String::new());
+            rows_txt.push(String::from(
+                "  Custom 36-char RFC 4122 UUIDs are also accepted at any type prompt.",
+            ));
+            rows_txt.push(format!(
+                "                      {}Press any key to return...{}",
+                fg_rgb(FG_CYAN.0, FG_CYAN.1, FG_CYAN.2),
+                ansi::RESET
+            ));
+            draw_floating_box(
+                fb,
+                "Known GPT Partition Types (t / n)",
+                &rows_txt,
+                w,
+                FG_VIOLET,
+            );
+        }
+        ModalOverlay::Info(slot) => {
+            let w = 84usize.min(fb.cols().saturating_sub(4));
+            let mut rows_txt = Vec::new();
+            match &slot.kind {
+                SlotKind::Partition {
+                    part_num,
+                    type_guid,
+                    unique_guid,
+                    name,
+                } => {
+                    let dev = partition_dev_name(&state.label, *part_num);
+                    rows_txt.push(kv_line(
+                        "Device Node",
+                        &format!("{dev} (slot #{part_num})"),
+                        FG_TITLE,
+                    ));
+                    rows_txt.push(kv_line(
+                        "Partition Name",
+                        if name.is_empty() {
+                            "<empty>"
+                        } else {
+                            name.as_str()
+                        },
+                        FG_TEXT,
+                    ));
+                    rows_txt.push(kv_line(
+                        "Partition Type",
+                        &type_guid.type_label(),
+                        type_color(type_guid),
+                    ));
+                    rows_txt.push(kv_line("Type GUID", &type_guid.format_uuid(), FG_CYAN));
+                    rows_txt.push(kv_line("Unique UUID", &unique_guid.format_uuid(), FG_CYAN));
+                    rows_txt.push(kv_line(
+                        "Start LBA",
+                        &format!("{}", slot.start_lba),
+                        FG_TEXT,
+                    ));
+                    rows_txt.push(kv_line("End LBA", &format!("{}", slot.end_lba), FG_TEXT));
+                    rows_txt.push(kv_line(
+                        "Capacity",
+                        &format!(
+                            "{} sectors ({} bytes / {})",
+                            slot.size_lbas(),
+                            slot.size_bytes(),
+                            human_size(slot.size_bytes())
+                        ),
+                        FG_MINT,
+                    ));
+                }
+                SlotKind::FreeSpace => {
+                    rows_txt.push(kv_line("Region", "Unallocated free space", FG_MINT));
+                    rows_txt.push(kv_line(
+                        "Start LBA",
+                        &format!("{}", slot.start_lba),
+                        FG_TEXT,
+                    ));
+                    rows_txt.push(kv_line("End LBA", &format!("{}", slot.end_lba), FG_TEXT));
+                    rows_txt.push(kv_line(
+                        "Capacity",
+                        &format!(
+                            "{} sectors ({})",
+                            slot.size_lbas(),
+                            human_size(slot.size_bytes())
+                        ),
+                        FG_MINT,
+                    ));
+                }
+            }
+            rows_txt.push(String::new());
+            rows_txt.push(format!(
+                "                    {}Press any key to return...{}",
+                fg_rgb(FG_CYAN.0, FG_CYAN.1, FG_CYAN.2),
+                ansi::RESET
+            ));
+            draw_floating_box(fb, "Partition / Region Inspector", &rows_txt, w, FG_CYAN);
+        }
+    }
+}
+
+fn draw_floating_box(
+    fb: &mut FrameBuffer,
+    title: &str,
+    rows_txt: &[String],
+    w: usize,
+    border: (u8, u8, u8),
+) {
+    let h = rows_txt.len() + 2;
+    let start_r = (fb.rows().saturating_sub(h)) / 2 + 1;
+    let start_c = (fb.cols().saturating_sub(w)) / 2 + 1;
+
+    fb.put_at(
+        start_r,
+        start_c,
+        &tui::fit_with_bg(&box_top(title, w, border, FG_TITLE), w, BG_MODAL),
+    );
+    for (i, rline) in rows_txt.iter().enumerate() {
+        let body = box_line(rline, w, border);
+        fb.put_at(
+            start_r + 1 + i,
+            start_c,
+            &tui::fit_with_bg(&body, w, BG_MODAL),
+        );
+    }
+    fb.put_at(
+        start_r + 1 + rows_txt.len(),
+        start_c,
+        &tui::fit_with_bg(&box_bottom(w, border), w, BG_MODAL),
+    );
+}
+
+fn section_hdr(title: &str, col: (u8, u8, u8)) -> String {
+    format!(
+        " {}{}{}{}",
+        fg_rgb(col.0, col.1, col.2),
+        ansi::BOLD,
+        title,
+        ansi::RESET
+    )
+}
+
+fn kv_line(key: &str, val: &str, val_col: (u8, u8, u8)) -> String {
+    format!(
+        " {}{:<14}:{} {}{}{}",
+        fg_rgb(FG_MUTED.0, FG_MUTED.1, FG_MUTED.2),
+        key,
+        ansi::RESET,
+        fg_rgb(val_col.0, val_col.1, val_col.2),
+        val,
+        ansi::RESET
+    )
+}
+
+fn type_color(guid: &Guid) -> (u8, u8, u8) {
+    if *guid == GUID_HXFS_V7 {
+        FG_CYAN
+    } else if *guid == GUID_ESP {
+        FG_AMBER
+    } else if *guid == GUID_LINUX_FS {
+        FG_MINT
+    } else if *guid == GUID_LINUX_SWAP {
+        FG_VIOLET
+    } else {
+        FG_BLUE
+    }
+}
+
+fn center_ascii(text: &str, width: usize, pad: char) -> String {
+    let tlen = text.chars().count();
+    if width == 0 {
+        return String::new();
+    }
+    if tlen >= width {
+        return text.chars().take(width).collect();
+    }
+    let left = (width - tlen) / 2;
+    let right = width - tlen - left;
+    let mut out = String::with_capacity(width);
+    for _ in 0..left {
+        out.push(pad);
+    }
+    out.push_str(text);
+    for _ in 0..right {
+        out.push(pad);
+    }
+    out
 }
 
 fn partition_dev_name(disk_label: &str, part_num: usize) -> String {
@@ -1445,4 +2343,71 @@ fn default_selected_row(slots: &[DiskSlot]) -> usize {
 
 fn human_size(bytes: u64) -> String {
     tui::human_bytes(bytes)
+}
+
+fn join_lr(left: &str, right: &str, width: usize) -> String {
+    let lw = tui::visible_width(left);
+    let rw = tui::visible_width(right);
+    if lw + rw + 1 >= width {
+        return tui::fit(left, width);
+    }
+    let mut out = String::from(left);
+    for _ in 0..(width - lw - rw) {
+        out.push(' ');
+    }
+    out.push_str(right);
+    out
+}
+
+fn box_top(title: &str, width: usize, border: (u8, u8, u8), title_col: (u8, u8, u8)) -> String {
+    let inner = width.saturating_sub(2);
+    let b_seq = fg_rgb(border.0, border.1, border.2);
+    let t_seq = fg_rgb(title_col.0, title_col.1, title_col.2);
+    if title.trim().is_empty() || inner < 6 {
+        let mut s = format!("{b_seq}┌");
+        for _ in 0..inner {
+            s.push('─');
+        }
+        s.push('┐');
+        s.push_str(ansi::RESET);
+        return s;
+    }
+    let clean = title.trim();
+    let max_title = inner.saturating_sub(4);
+    let shown: String = clean.chars().take(max_title).collect();
+    let shown_len = shown.chars().count();
+    let dashes = inner.saturating_sub(shown_len + 3);
+    let mut s = format!("{b_seq}┌─ {t_seq}{}{shown}{b_seq} ", ansi::BOLD);
+    for _ in 0..dashes {
+        s.push('─');
+    }
+    s.push('┐');
+    s.push_str(ansi::RESET);
+    s
+}
+
+fn box_rule(width: usize, border: (u8, u8, u8)) -> String {
+    let mut s = format!("{}├", fg_rgb(border.0, border.1, border.2));
+    for _ in 0..width.saturating_sub(2) {
+        s.push('─');
+    }
+    s.push('┤');
+    s.push_str(ansi::RESET);
+    s
+}
+
+fn box_bottom(width: usize, border: (u8, u8, u8)) -> String {
+    let mut s = format!("{}└", fg_rgb(border.0, border.1, border.2));
+    for _ in 0..width.saturating_sub(2) {
+        s.push('─');
+    }
+    s.push('┘');
+    s.push_str(ansi::RESET);
+    s
+}
+
+fn box_line(body: &str, width: usize, border: (u8, u8, u8)) -> String {
+    let b_seq = fg_rgb(border.0, border.1, border.2);
+    let fitted = tui::fit(body, width.saturating_sub(2));
+    format!("{b_seq}│{}{fitted}{b_seq}│{}", ansi::RESET, ansi::RESET)
 }

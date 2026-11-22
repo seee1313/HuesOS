@@ -652,4 +652,210 @@ impl<W: Write> Screen<W> {
         io::write_all(&mut self.out, text.as_bytes())?;
         self.out.flush()
     }
+
+    /// Enter full-screen alternate buffer mode and hide the hardware cursor.
+    pub fn enter_fullscreen(&mut self) -> Result<()> {
+        io::write_all(&mut self.out, b"\x1b[?1049h\x1b[?25l\x1b[2J\x1b[H")?;
+        self.out.flush()
+    }
+
+    /// Leave full-screen alternate buffer mode, reset SGR, and show the cursor.
+    pub fn leave_fullscreen(&mut self) -> Result<()> {
+        io::write_all(&mut self.out, b"\x1b[0m\x1b[?1049l\x1b[?25h")?;
+        self.out.flush()
+    }
+}
+
+/// Active terminal viewport `(cols, rows)` in character cells.
+///
+/// Queries the UEFI GOP framebuffer geometry via `libcanvas::framebuffer::info()`
+/// and applies the exact cell metrics of `terminal/src/screen.rs` (`Cozette6x13`:
+/// `advance = 6`, `line_height = 14`, `LEFT_MARGIN = 12`, `TOP_MARGIN = 27`,
+/// `FOOTER_HEIGHT = 20`, yielding `166 × 50` on `1024×768`). Falls back to
+/// `100 × 30` on serial-only consoles without a framebuffer.
+pub fn viewport_size() -> (usize, usize) {
+    if let Ok(info) = libcanvas::framebuffer::info() {
+        let avail_w = info.width.saturating_sub(24);
+        let avail_h = info.height.saturating_sub(51);
+        let cols = ((avail_w / 6) as usize).clamp(80, 168);
+        let rows = ((avail_h / 14) as usize).clamp(24, 54);
+        (cols, rows)
+    } else {
+        (100, 30)
+    }
+}
+
+/// Format a 24-bit RGB foreground SGR escape (`\x1b[38;2;r;g;bm`).
+pub fn fg_rgb(r: u8, g: u8, b: u8) -> String {
+    format!("\x1b[38;2;{r};{g};{b}m")
+}
+
+/// Format a 24-bit RGB background SGR escape (`\x1b[48;2;r;g;bm`).
+pub fn bg_rgb(r: u8, g: u8, b: u8) -> String {
+    format!("\x1b[48;2;{r};{g};{b}m")
+}
+
+/// Smooth horizontal meter of `width` cells using 1/8th fractional block glyphs
+/// (`█▉▊▋▌▍▎▏`) and `░` track cells.
+pub fn smooth_bar(
+    used: u64,
+    total: u64,
+    width: usize,
+    fill_fg: (u8, u8, u8),
+    track_fg: (u8, u8, u8),
+) -> String {
+    const EIGHTHS: [char; 8] = [' ', '▏', '▎', '▍', '▌', '▋', '▊', '▉'];
+    if width == 0 {
+        return String::new();
+    }
+    let total_eighths = width as u128 * 8;
+    let filled_eighths = if total == 0 {
+        0usize
+    } else {
+        ((used.min(total) as u128 * total_eighths) / total as u128) as usize
+    };
+    let full_cells = (filled_eighths / 8).min(width);
+    let rem_eighth = filled_eighths % 8;
+
+    let mut out = String::new();
+    if full_cells > 0 || rem_eighth > 0 {
+        out.push_str(&fg_rgb(fill_fg.0, fill_fg.1, fill_fg.2));
+        for _ in 0..full_cells {
+            out.push('█');
+        }
+        if full_cells < width && rem_eighth > 0 {
+            out.push(EIGHTHS[rem_eighth]);
+        }
+    }
+    let used_cells = full_cells + usize::from(full_cells < width && rem_eighth > 0);
+    if used_cells < width {
+        out.push_str(&fg_rgb(track_fg.0, track_fg.1, track_fg.2));
+        for _ in used_cells..width {
+            out.push('░');
+        }
+    }
+    out.push_str(ansi::RESET);
+    out
+}
+
+/// Full-screen single-frame string buffer that addresses every row explicitly via
+/// `\x1b[{row};1H` so a redraw is emitted in a single `stdout` write without
+/// flicker, tearing, or accidental bottom-row auto-wrap scrolling.
+pub struct FrameBuffer {
+    cols: usize,
+    rows: usize,
+    buf: String,
+}
+
+impl FrameBuffer {
+    /// Allocate a frame buffer for `(cols, rows)` cells.
+    pub fn new(cols: usize, rows: usize) -> Self {
+        Self {
+            cols: cols.max(40),
+            rows: rows.max(16),
+            buf: String::with_capacity(cols.saturating_mul(rows).saturating_mul(3)),
+        }
+    }
+
+    /// Viewport width in columns.
+    pub fn cols(&self) -> usize {
+        self.cols
+    }
+
+    /// Viewport height in rows.
+    pub fn rows(&self) -> usize {
+        self.rows
+    }
+
+    /// Safe printable width on `row` (1-based).
+    ///
+    /// `terminal/src/screen.rs` uses deferred auto-wrap (`if self.col >= wrap_columns`),
+    /// so writing all `cols` cells on any explicitly addressed row (`\x1b[r;1H`)
+    /// never triggers `newline()`/`scroll()` unless an extra `(cols + 1)`-th
+    /// printable character is emitted on the same row.
+    pub fn safe_cols(&self, _row: usize) -> usize {
+        self.cols
+    }
+
+    /// Place `content` at 1-based `(row, col)` without padding.
+    pub fn put_at(&mut self, row: usize, col: usize, content: &str) {
+        if row < 1 || row > self.rows || col < 1 || col > self.cols {
+            return;
+        }
+        use core::fmt::Write as _;
+        let _ = write!(self.buf, "\x1b[{row};{col}H{content}\x1b[0m");
+    }
+
+    /// Place a full-width row at 1-based `row`, fitted/padded to `safe_cols(row)`.
+    pub fn put_row(&mut self, row: usize, content: &str) {
+        if row < 1 || row > self.rows {
+            return;
+        }
+        let max_w = self.safe_cols(row);
+        let fitted = fit(content, max_w);
+        use core::fmt::Write as _;
+        if row < self.rows {
+            let _ = write!(self.buf, "\x1b[{row};1H{fitted}\x1b[0m\x1b[K");
+        } else {
+            let _ = write!(self.buf, "\x1b[{row};1H{fitted}\x1b[0m");
+        }
+    }
+
+    /// Place a full-width row painted with a uniform background colour `bg`.
+    pub fn put_bar_row(&mut self, row: usize, bg: (u8, u8, u8), content: &str) {
+        if row < 1 || row > self.rows {
+            return;
+        }
+        let max_w = self.safe_cols(row);
+        let fitted = fit_with_bg(content, max_w, bg);
+        use core::fmt::Write as _;
+        let _ = write!(self.buf, "\x1b[{row};1H{fitted}\x1b[0m");
+    }
+
+    /// Flush the entire assembled frame to `out` in one contiguous write.
+    pub fn flush_to<W: Write>(&self, out: &mut W) -> Result<()> {
+        io::write_all(out, self.buf.as_bytes())?;
+        out.flush()
+    }
+}
+
+/// Fit `text` to `width` visible columns while keeping `bg` active across resets.
+pub fn fit_with_bg(text: &str, width: usize, bg: (u8, u8, u8)) -> String {
+    let bg_seq = bg_rgb(bg.0, bg.1, bg.2);
+    let mut out = String::new();
+    out.push_str(&bg_seq);
+    let mut seen = 0usize;
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\x1b' {
+            let mut esc = String::from("\x1b");
+            if chars.peek() == Some(&'[') {
+                if let Some(b) = chars.next() {
+                    esc.push(b);
+                }
+                for c in chars.by_ref() {
+                    esc.push(c);
+                    if ('@'..='~').contains(&c) {
+                        break;
+                    }
+                }
+            }
+            out.push_str(&esc);
+            if esc == "\x1b[0m" || esc == "\x1b[m" {
+                out.push_str(&bg_seq);
+            }
+            continue;
+        }
+        if seen >= width {
+            break;
+        }
+        out.push(ch);
+        seen += 1;
+    }
+    while seen < width {
+        out.push(' ');
+        seen += 1;
+    }
+    out.push_str(ansi::RESET);
+    out
 }
