@@ -67,6 +67,29 @@ pub fn from_cpu_fault(info: FaultInfo) -> ! {
     let mut serial = EmergencySerial;
     let _ = serial.write_str("\n\n================ HuesOS KERNEL PANIC ================\n");
     let _ = serial.write_fmt(report);
+    // Preserve a small window of the interrupted kernel stack in fatal
+    // exception logs. In particular, a #PF at RIP=0 often means a bad
+    // indirect call or a zero return address; these words let us distinguish
+    // the two and symbolize the surrounding return addresses after reboot.
+    // Kernel task stacks live in the mapped high-half heap window below.
+    let stack = info.stack_pointer as usize;
+    if (0xffff_ff00_0000_0000..0xffff_ff80_0000_0000).contains(&stack) {
+        let start = stack.saturating_sub(core::mem::size_of::<u64>());
+        for index in 0..64usize {
+            let address = start.saturating_add(index * core::mem::size_of::<u64>());
+            // SAFETY: the fault interrupted kernel execution on this live
+            // stack; the bounded window stays within its mapped stack region.
+            let value = unsafe { core::ptr::read_volatile(address as *const u64) };
+            if index < 12 {
+                let _ = writeln!(serial, "Stack[{address:#018x}] = {value:#018x}");
+            } else if (0xffff_ffff_8000_0000..0xffff_ffff_8010_0000).contains(&value) {
+                let _ = writeln!(
+                    serial,
+                    "Kernel return candidate {value:#018x} at {address:#018x}"
+                );
+            }
+        }
+    }
     let _ = serial.write_str("======================================================\n");
 
     // Recreate Arguments because the first value was consumed by serial.

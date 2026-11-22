@@ -23,6 +23,7 @@ pub enum TokenKind {
     Keyword(Keyword),
     Bang,
     Semi,
+    Amp,
     AndAnd,
     OrOr,
     Pipe,
@@ -385,6 +386,7 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, LexError> {
         // Single-char punctuation
         let single = match b {
             b';' => Some(TokenKind::Semi),
+            b'&' => Some(TokenKind::Amp),
             b'|' => Some(TokenKind::Pipe),
             b'>' => Some(TokenKind::Gt),
             b'<' => Some(TokenKind::Lt),

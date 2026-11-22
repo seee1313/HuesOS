@@ -277,6 +277,8 @@ struct Scheduler {
     current: Option<usize>,
     /// Root Job EEVDF; each entity is one runnable Job, never one Task.
     root_jobs: EevdfTree<MAX_JOB_QUEUES>,
+    // EEVDF backing storage is lazily allocated on the heap, keeping each
+    // queue descriptor small when ensure_job runs on a task kernel stack.
     job_queues: Vec<JobRunqueue>,
     root_virtual_time: u128,
     root_weight_sum: u64,

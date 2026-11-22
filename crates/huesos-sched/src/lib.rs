@@ -1,10 +1,12 @@
 //! Host-testable policy core for HuesOS Scheduler/SMP v2.
 //!
-//! This crate contains no context switching, APIC access, allocation, or
-//! privileged synchronization. It defines identities, masks, lifecycle
-//! transitions, remote-inbox geometry, EEVDF policy, and CBS admission as pure
-//! or bounded mechanisms. The kernel integration must preserve these
-//! invariants; passing these tests alone is not a production-grade claim.
+//! This crate contains no context switching, APIC access, or privileged
+//! synchronization. It defines identities, masks, lifecycle transitions,
+//! remote-inbox geometry, EEVDF policy, and CBS admission as pure or bounded
+//! mechanisms. EEVDF trees reserve their fixed-capacity backing lazily with a
+//! fallible allocation, keeping large tree values off caller stacks. The kernel
+//! integration must preserve these invariants; passing these tests alone is
+//! not a production-grade claim.
 
 #![no_std]
 #![forbid(unsafe_code)]

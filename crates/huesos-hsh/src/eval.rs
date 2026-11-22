@@ -64,6 +64,15 @@ impl ExecOutcome {
     }
 }
 
+/// One fully expanded command in a pipeline that the host can run as a
+/// concurrently connected stream of external processes.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PipelineCommand {
+    pub caps: Option<CapsSpec>,
+    pub name: String,
+    pub args: Vec<String>,
+}
+
 /// Host environment callbacks implemented by `terminal` (or a mock in tests).
 pub trait ShellHost {
     fn exec_command(
@@ -98,6 +107,25 @@ pub trait ShellHost {
     ) -> ExecOutcome {
         self.exec_command_mode(caps, name, args, stdin, capture_output)
     }
+
+    /// Start or execute a pipeline using directly connected stream channels.
+    /// `None` asks the evaluator to use its in-memory/builtin path instead.
+    /// Hosts must retain process capabilities for background jobs and must not
+    /// treat a displayed PID/KOID as authority.
+    fn exec_pipeline(
+        &mut self,
+        _stages: &[PipelineCommand],
+        _background: bool,
+        _capture_output: bool,
+    ) -> Option<ExecOutcome> {
+        None
+    }
+
+    /// Poll and reap completed background jobs without blocking.
+    fn poll_background_jobs(&mut self) {}
+
+    /// Terminate jobs still owned by the shell before it exits.
+    fn shutdown_background_jobs(&mut self) {}
 
     fn write_file(&mut self, path: &str, data: &[u8], append: bool) -> Result<(), String>;
 
@@ -266,6 +294,7 @@ impl ShellEnv {
         input: &str,
         host: &mut dyn ShellHost,
     ) -> Result<EvalResult, String> {
+        host.poll_background_jobs();
         let stmts =
             parse_script(input).map_err(|e| format!("parse error @{}: {}", e.offset, e.message))?;
         let mut actions = Vec::new();
@@ -283,6 +312,7 @@ impl ShellEnv {
         actions: &mut Vec<EvalAction>,
     ) -> Result<Option<BlockSignal>, String> {
         for stmt in stmts {
+            host.poll_background_jobs();
             match stmt {
                 Stmt::Let { name, value } => {
                     let val = self.eval_expr(value, host)?;
@@ -578,12 +608,138 @@ impl ShellEnv {
         Ok(())
     }
 
+    fn prepare_external_pipeline(
+        &mut self,
+        pipe: &Pipeline,
+        host: &mut dyn ShellHost,
+    ) -> Result<Option<Vec<PipelineCommand>>, String> {
+        let mut prepared = Vec::with_capacity(pipe.stages.len());
+        for stage in &pipe.stages {
+            if stage.stdin_redirect.is_some()
+                || stage.redirect.is_some()
+                || stage.err_redirect.is_some()
+            {
+                if pipe.background {
+                    return Err(String::from(
+                        "background pipelines do not support redirection yet",
+                    ));
+                }
+                return Ok(None);
+            }
+            let raw_name = self.eval_arg_text(&stage.name, host)?;
+            let no_glob_cmd = raw_name == "where" || raw_name == "find";
+            let mut args = Vec::with_capacity(stage.args.len());
+            let mut skip_glob_next = false;
+            for arg in &stage.args {
+                if no_glob_cmd || skip_glob_next {
+                    skip_glob_next = false;
+                    args.push(self.eval_arg_text(arg, host)?);
+                } else {
+                    let expanded = self.expand_arg_with_globs(arg, host)?;
+                    if expanded.len() == 1
+                        && raw_name == "grep"
+                        && matches!(expanded[0].as_str(), "-e" | "--regexp")
+                    {
+                        skip_glob_next = true;
+                    }
+                    args.extend(expanded);
+                }
+            }
+            let (name, args) = if let Some(alias) = self.aliases.get(&raw_name) {
+                let mut parts = alias.split_whitespace();
+                if let Some(target) = parts.next() {
+                    let mut expanded: Vec<String> = parts.map(String::from).collect();
+                    expanded.extend(args);
+                    (String::from(target), expanded)
+                } else {
+                    (raw_name, args)
+                }
+            } else {
+                (raw_name, args)
+            };
+
+            let is_shell_command = self.functions.contains_key(&name)
+                || (stage.caps.is_none()
+                    && matches!(
+                        name.as_str(),
+                        "cls"
+                            | "clear"
+                            | "true"
+                            | ":"
+                            | "false"
+                            | "echo"
+                            | "printf"
+                            | "test"
+                            | "["
+                            | "export"
+                            | "env"
+                            | "exit"
+                            | "help"
+                            | "pwd"
+                            | "cd"
+                            | "history"
+                            | "jobs"
+                            | "wait"
+                            | "kill"
+                            | "caps"
+                            | "font"
+                            | "doom"
+                            | "snake"
+                            | "shutdown"
+                            | "where"
+                            | "select"
+                            | "count"
+                    ));
+            if is_shell_command {
+                if pipe.background {
+                    return Err(String::from(
+                        "background mode supports external commands only",
+                    ));
+                }
+                return Ok(None);
+            }
+            prepared.push(PipelineCommand {
+                caps: stage.caps.clone(),
+                name,
+                args,
+            });
+        }
+        Ok(Some(prepared))
+    }
+
     fn exec_pipeline(
         &mut self,
         pipe: &Pipeline,
         host: &mut dyn ShellHost,
         actions: &mut Vec<EvalAction>,
     ) -> Result<(), String> {
+        if pipe.stages.len() > 1 || pipe.background {
+            if let Some(stages) = self.prepare_external_pipeline(pipe, host)? {
+                let capture_output = self.capture_depth > 0 || self.depth > 0;
+                if let Some(mut outcome) =
+                    host.exec_pipeline(&stages, pipe.background, capture_output)
+                {
+                    if pipe.stages.last().is_some_and(|stage| stage.negated) {
+                        outcome.status = if outcome.status == 0 { 1 } else { 0 };
+                    }
+                    self.last_status = outcome.status;
+                    if let Some(pid) = outcome.child_pid {
+                        self.last_pid = pid;
+                    }
+                    if outcome.clear_screen {
+                        actions.push(EvalAction::ClearScreen);
+                    }
+                    if outcome.exit_requested {
+                        actions.push(EvalAction::Exit);
+                    }
+                    if !matches!(outcome.output, Value::Empty) {
+                        actions.push(EvalAction::Output(outcome.output));
+                    }
+                    return Ok(());
+                }
+            }
+        }
+
         let mut current_val: Option<Value> = None;
         let mut final_redirect: Option<&Redirect> = None;
 

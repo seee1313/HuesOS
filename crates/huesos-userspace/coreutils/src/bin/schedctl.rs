@@ -134,7 +134,15 @@ fn tasks() -> i32 {
         }
     };
     let mut table = tui::Table::new(
-        &["TASK-ID", "PROCESS-KOID", "NAME", "CLASS", "STATE", "CPU", "WEIGHT"],
+        &[
+            "TASK-ID",
+            "PROCESS-KOID",
+            "NAME",
+            "CLASS",
+            "STATE",
+            "CPU",
+            "WEIGHT",
+        ],
         &[16, 16, 16, 8, 8, 3, 6],
     );
     for record in &records {

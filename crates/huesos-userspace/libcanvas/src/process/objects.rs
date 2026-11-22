@@ -133,11 +133,7 @@ impl Process {
 
     /// Set the complete 256-CPU affinity mask before the initial thread starts.
     /// The selected home CPU must be present in `mask` and online.
-    pub fn set_affinity_mask_256(
-        &self,
-        mask: CpuMask256,
-        home_cpu: usize,
-    ) -> crate::Result<()> {
+    pub fn set_affinity_mask_256(&self, mask: CpuMask256, home_cpu: usize) -> crate::Result<()> {
         let args = ProcessSetAffinityMask256Args {
             process: self.0.raw(),
             home_cpu: u32::try_from(home_cpu).map_err(|_| crate::ErrorCode::InvalidArgs)?,

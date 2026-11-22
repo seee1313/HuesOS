@@ -1132,7 +1132,8 @@ pub enum ErrorCode {
     /// The resource is busy; try again.
     Busy = -15,
     /// A non-blocking call would have to block to complete (e.g. reading
-    /// an empty channel) — not a real error, just "nothing to do yet".
+    /// an empty channel or writing to a full channel) — not a real error,
+    /// just "nothing to do yet".
     ShouldWait = -16,
     /// A timed wait expired without the condition becoming true.
     TimedOut = -20,

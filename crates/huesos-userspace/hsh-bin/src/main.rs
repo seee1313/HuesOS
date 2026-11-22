@@ -23,7 +23,7 @@ use huesos_abi::term_ipc::{
     hsh_to_term, put_i32, put_u16, term_to_hsh, SpanKind, MAX_PROMPT_GHOST, MAX_PROMPT_INPUT,
     MAX_PROMPT_SPANS, MAX_PWD_BYTES, MAX_WRITE_CHUNK,
 };
-use huesos_hsh::{highlight_line, EvalAction, HighlightKind, ShellEnv, Value};
+use huesos_hsh::{highlight_line, EvalAction, HighlightKind, ShellEnv, ShellHost, Value};
 use libcanvas::heap::ScudoHeap;
 use libcanvas::stdio::{
     arg_str, args_count, exit, stderr_str, stdin_read, stdout_str, take_cap_handle, CapKind,
@@ -50,6 +50,9 @@ const KNOWN_COMMANDS: &[&str] = &[
     "pwd",
     "cd",
     "history",
+    "jobs",
+    "wait",
+    "kill",
     "caps",
     "exit",
     "font",
@@ -237,11 +240,13 @@ extern "C" fn hsh_entry() -> ! {
                     }
                 }
             }
+            host.shutdown_background_jobs();
             exit(res.status)
         }
         Err(err) => {
             let _ = stderr_str(&err);
             let _ = stderr_str("\n");
+            host.shutdown_background_jobs();
             exit(2)
         }
     }
@@ -708,6 +713,7 @@ impl InteractiveShell {
                         pkt[0] = hsh_to_term::TAG_EXIT;
                         put_i32(&mut pkt, 1, res.status);
                         self.send_packet(&pkt);
+                        self.host.shutdown_background_jobs();
                         exit(res.status);
                     }
                 }
@@ -768,6 +774,20 @@ impl InteractiveShell {
                 res.render_text()
             ),
             Err(e) => println!("[hsh] core language smoke ERROR: {}", e),
+        }
+
+        // More than 256 tiny stdout messages force the reader to drain the
+        // producer's bounded channel while both external stages are running.
+        match smoke_env.eval_script("seq 1 300 | wc -l", &mut self.host) {
+            Ok(res) if res.status == 0 && res.render_text().trim() == "300 -" => {
+                println!("[hsh] concurrent external pipeline OK");
+            }
+            Ok(res) => println!(
+                "[hsh] concurrent external pipeline FAILED status={} out={}",
+                res.status,
+                res.render_text()
+            ),
+            Err(e) => println!("[hsh] concurrent external pipeline ERROR: {e}"),
         }
 
         // 2. External `/bin/ls.elf` pipe
@@ -1000,6 +1020,34 @@ impl InteractiveShell {
                 res.render_text()
             ),
             Err(e) => println!("[hsh] ProcessTerminate smoke ERROR: {}", e),
+        }
+
+        // Background job IDs are shell-table selectors, while the host retains
+        // and exercises the actual Process capabilities for terminate/wait.
+        let background_lifecycle = match smoke_env.eval_script("sleep 30 &", &mut self.host) {
+            Ok(launched) if launched.status == 0 => {
+                let output = launched.render_text();
+                let job_id = output
+                    .strip_prefix('[')
+                    .and_then(|tail| tail.split_once(']'))
+                    .and_then(|(id, _)| id.parse::<u64>().ok());
+                if let Some(job_id) = job_id {
+                    let killed = smoke_env.eval_script(&format!("kill {job_id}"), &mut self.host);
+                    let waited = smoke_env.eval_script(&format!("wait {job_id}"), &mut self.host);
+                    let jobs = smoke_env.eval_script("jobs", &mut self.host);
+                    matches!(killed, Ok(result) if result.status == 0)
+                        && matches!(waited, Ok(result) if result.status == 130)
+                        && matches!(jobs, Ok(result) if result.status == 0 && result.render_text() == "no background jobs")
+                } else {
+                    false
+                }
+            }
+            _ => false,
+        };
+        if background_lifecycle {
+            println!("[hsh] capability-owned background job lifecycle OK");
+        } else {
+            println!("[hsh] capability-owned background job lifecycle FAILED");
         }
 
         // 10. `fdisk gpt-init --dry-run` must always be safe, and a real
@@ -1348,24 +1396,30 @@ fn run_interactive(in_ch: Channel, mut host: HshHost) -> ! {
 
     let mut buf = [0u8; 256];
     loop {
+        shell.host.poll_background_jobs();
         // Packets typed while a child was running were buffered by the host;
         // replay them before blocking again so no keystroke is lost.
         for packet in shell.host.take_pending_packets() {
             if !shell.handle_packet(&packet) {
+                shell.host.shutdown_background_jobs();
                 exit(0);
             }
         }
-        match shell.in_ch.read_into_blocking(&mut buf) {
+        match shell.in_ch.read_into_timeout(&mut buf, 20) {
             Ok(0) => {}
             Ok(n) => {
                 if !shell.handle_packet(&buf[..n]) {
+                    shell.host.shutdown_background_jobs();
                     exit(0);
                 }
             }
             Err(ErrorCode::ShouldWait) | Err(ErrorCode::TimedOut) => {
                 libcanvas::process::yield_now();
             }
-            Err(ErrorCode::PeerClosed) => exit(0),
+            Err(ErrorCode::PeerClosed) => {
+                shell.host.shutdown_background_jobs();
+                exit(0);
+            }
             Err(_) => libcanvas::process::yield_now(),
         }
     }

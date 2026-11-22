@@ -5,6 +5,8 @@
 //! switches CR3, runs XSAVE/XRSTOR, or programs the x2APIC is validated
 //! separately on hardware; this module proves the bookkeeping around them.
 
+use crate::{CpuIndex, CpuMask};
+
 /// Layout information for an eager xstate save area.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct XsaveLayout {
@@ -93,7 +95,7 @@ impl XsaveModel {
 /// CPUs a PCID is active on, so the kernel can prove safe reuse.
 pub struct PcidTable<const MAX_PCIDS: usize> {
     generations: [u64; MAX_PCIDS],
-    active: [u64; MAX_PCIDS],
+    active: [CpuMask; MAX_PCIDS],
     next: usize,
 }
 
@@ -103,13 +105,14 @@ pub enum PcidError {
     Exhausted,
     NotActive,
     InUse,
+    InvalidCpu,
 }
 
 impl<const MAX_PCIDS: usize> PcidTable<MAX_PCIDS> {
     pub const fn new() -> Self {
         Self {
             generations: [0; MAX_PCIDS],
-            active: [0; MAX_PCIDS],
+            active: [CpuMask::empty(); MAX_PCIDS],
             next: 1, // 0 is reserved (no PCID semantics on some CPUs).
         }
     }
@@ -122,8 +125,8 @@ impl<const MAX_PCIDS: usize> PcidTable<MAX_PCIDS> {
             if pcid == 0 {
                 continue;
             }
-            if self.generations[pcid] == u64::MAX {
-                // Generation exhausted: never reuse.
+            if self.generations[pcid] == u64::MAX || !self.active[pcid].is_empty() {
+                // Generation exhausted or still active: never reuse.
                 continue;
             }
             self.generations[pcid] += 1;
@@ -137,7 +140,8 @@ impl<const MAX_PCIDS: usize> PcidTable<MAX_PCIDS> {
         if pcid >= MAX_PCIDS || self.generations[pcid] != generation {
             return Err(PcidError::InUse);
         }
-        self.active[pcid] |= 1u64 << cpu;
+        let cpu = CpuIndex::new(cpu).ok_or(PcidError::InvalidCpu)?;
+        self.active[pcid].insert(cpu);
         Ok(())
     }
 
@@ -151,19 +155,23 @@ impl<const MAX_PCIDS: usize> PcidTable<MAX_PCIDS> {
         if pcid >= MAX_PCIDS || self.generations[pcid] != generation {
             return Err(PcidError::InUse);
         }
-        self.active[pcid] &= !(1u64 << cpu);
+        let cpu = CpuIndex::new(cpu).ok_or(PcidError::InvalidCpu)?;
+        if !self.active[pcid].contains(cpu) {
+            return Err(PcidError::NotActive);
+        }
+        self.active[pcid].remove(cpu);
         Ok(())
     }
 
     /// Whether the PCID+generation is still active on any CPU.
     pub fn is_active(&self, pcid: usize, generation: u64) -> bool {
-        pcid < MAX_PCIDS && self.generations[pcid] == generation && self.active[pcid] != 0
+        pcid < MAX_PCIDS && self.generations[pcid] == generation && !self.active[pcid].is_empty()
     }
 
     /// CPUs this PCID+generation is active on.
-    pub fn active_mask(&self, pcid: usize, generation: u64) -> u64 {
+    pub fn active_mask(&self, pcid: usize, generation: u64) -> CpuMask {
         if pcid >= MAX_PCIDS || self.generations[pcid] != generation {
-            return 0;
+            return CpuMask::empty();
         }
         self.active[pcid]
     }
@@ -298,13 +306,48 @@ mod tests {
         let (pcid_a, gen_a) = expect_ok!(table.allocate(), "first allocate");
         assert!(pcid_a != 0);
         expect_ok!(table.activate(pcid_a, gen_a, 1), "activate cpu 1");
+        expect_ok!(table.activate(pcid_a, gen_a, 130), "activate cpu 130");
+        expect_ok!(table.activate(pcid_a, gen_a, 255), "activate cpu 255");
         assert!(table.is_active(pcid_a, gen_a));
-        // Deactivate on one CPU, still active on none -> reusable.
+        let active = table.active_mask(pcid_a, gen_a);
+        assert_eq!(active.count(), 3);
+        assert_eq!(active.words(), [1u64 << 1, 0, 1u64 << 2, 1u64 << 63]);
+        // Deactivate every CPU; PCID is no longer active and eligible for invalidation.
         expect_ok!(table.deactivate(pcid_a, gen_a, 1), "deactivate cpu 1");
+        expect_ok!(table.deactivate(pcid_a, gen_a, 130), "deactivate cpu 130");
+        expect_ok!(table.deactivate(pcid_a, gen_a, 255), "deactivate cpu 255");
         assert!(!table.is_active(pcid_a, gen_a));
+        assert_eq!(
+            table.deactivate(pcid_a, gen_a, 130),
+            Err(PcidError::NotActive)
+        );
         // But the same generation can be re-activated.
         expect_ok!(table.activate(pcid_a, gen_a, 2), "activate cpu 2");
         assert!(table.is_active(pcid_a, gen_a));
+    }
+
+    #[test]
+    fn pcid_cannot_be_reused_while_active_on_any_of_256_cpus() {
+        let mut table = PcidTable::<2>::new();
+        let (pcid, generation) = expect_ok!(table.allocate(), "allocate PCID");
+        assert_eq!(
+            table.activate(pcid, generation, 256),
+            Err(PcidError::InvalidCpu)
+        );
+        expect_ok!(table.activate(pcid, generation, 130), "activate cpu 130");
+        assert_eq!(table.allocate(), Err(PcidError::Exhausted));
+        expect_ok!(
+            table.deactivate(pcid, generation, 130),
+            "deactivate cpu 130"
+        );
+
+        let (reused_pcid, next_generation) = expect_ok!(table.allocate(), "reuse deactivated PCID");
+        assert_eq!(reused_pcid, pcid);
+        assert_eq!(next_generation, generation + 1);
+        assert_eq!(
+            table.active_mask(reused_pcid, next_generation),
+            CpuMask::empty()
+        );
     }
 
     #[test]
