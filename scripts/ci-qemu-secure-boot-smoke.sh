@@ -55,6 +55,7 @@ run_qemu() {
 }
 
 HUESOS_SECURE_BOOT=1 \
+HUESOS_BOOT_SELFTEST=1 \
 HUESOS_UEFI_DB_KEY="$work/db.key" \
 HUESOS_UEFI_DB_CERT="$work/db.crt" \
 CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-1}" make iso PROFILE="$profile"
@@ -66,7 +67,7 @@ grep -Fq '[HBI] Ed25519 signature verified (v2.2)' "$positive_log"
 
 # Rebuild with the same kernel/HBI but an unsigned Limine. The enrolled db and
 # SecureBootEnable stay identical; OVMF must reject before HuesOS gains control.
-HUESOS_SECURE_BOOT=0 CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-1}" make iso PROFILE="$profile"
+HUESOS_SECURE_BOOT=0 HUESOS_BOOT_SELFTEST=1 CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-1}" make iso PROFILE="$profile"
 if sbverify --list build/iso/EFI/BOOT/BOOTX64.EFI 2>&1 | grep -vq 'No signature table present'; then
     echo "negative Secure Boot image unexpectedly has a signature" >&2
     exit 1

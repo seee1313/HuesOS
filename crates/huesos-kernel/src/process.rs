@@ -1386,6 +1386,7 @@ pub extern "C" fn user_entry_trampoline() -> ! {
     let user_cs = (sel.user_code.0 as u64) | 3; // RPL=3
     let user_ss = (sel.user_data.0 as u64) | 3;
 
+    #[cfg(feature = "boot-selftest")]
     if rdi == 0 && fs_base == 0 {
         use core::fmt::Write;
         let mut w = huesos_arch::serial::SerialWriter;

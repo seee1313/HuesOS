@@ -6,7 +6,7 @@ artifact_dir="${ARTIFACT_DIR:-ci-artifacts}"
 log="$artifact_dir/qemu-smep-smap-${profile}.log"
 mkdir -p "$artifact_dir"
 rm -f "$log"
-CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-1}" make iso PROFILE="$profile"
+HUESOS_BOOT_SELFTEST=1 CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-1}" make iso PROFILE="$profile"
 set +e
 timeout "${seconds}s" qemu-system-x86_64 \
     -machine q35 -cpu max -smp 4 -m 512M \

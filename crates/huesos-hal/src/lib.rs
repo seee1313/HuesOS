@@ -14,16 +14,8 @@ pub fn init() {
 
 /// Early panic output.
 pub fn early_panic(msg: &str) -> ! {
-    serial::write_byte(b'P');
-    serial::write_byte(b'A');
-    serial::write_byte(b'N');
-    serial::write_byte(b'I');
-    serial::write_byte(b'C');
-    serial::write_byte(b':');
-    serial::write_byte(b' ');
-    for b in msg.bytes() {
-        serial::write_byte(b);
-    }
+    serial::write_error_bytes(b"PANIC: ");
+    serial::write_error_bytes(msg.as_bytes());
     loop {
         huesos_arch::hlt();
     }

@@ -365,8 +365,23 @@ extern "C" fn handle_syscall(f: &mut huesos_arch::syscall::SyscallFrame) {
 
 fn debug_write(b: &[u8]) {
     // One lock for the whole userspace chunk: keeps a DebugWrite line intact
-    // against kernel log lines emitted on other CPUs.
-    huesos_arch::serial::write_bytes(b);
+    // against kernel log lines emitted on other CPUs. In quiet release mode,
+    // only ring-3 PANIC / ERROR / FAILED diagnostics pass through to COM1.
+    if huesos_arch::serial::is_verbose() || is_userspace_error_line(b) {
+        huesos_arch::serial::write_error_bytes(b);
+    }
+}
+
+fn is_userspace_error_line(b: &[u8]) -> bool {
+    contains_subslice(b, b"PANIC")
+        || contains_subslice(b, b"FAILED")
+        || contains_subslice(b, b"ERROR")
+}
+
+fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
+    !needle.is_empty()
+        && haystack.len() >= needle.len()
+        && haystack.windows(needle.len()).any(|w| w == needle)
 }
 
 /// Serial log line for the TPM bring-up path.

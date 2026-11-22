@@ -9,6 +9,9 @@ license.workspace = true
 name = "huesos-boot"
 path = "src/main.rs"
 
+[features]
+boot-selftest = ["huesos-kernel/boot-selftest"]
+
 [dependencies]
 huesos-kernel = { path = "../huesos-kernel" }
 huesos-arch = { path = "../huesos-arch" }

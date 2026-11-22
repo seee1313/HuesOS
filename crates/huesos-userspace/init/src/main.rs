@@ -39,7 +39,10 @@ const MAX_CONFIG_BYTES: usize = 4096;
 /// machine will not boot far enough to rebuild an image, so it must win
 /// over the file.
 fn load_config(logger: &mut InitLogger, bootfs: &Vmo) -> (InitConfig, bool) {
+    #[cfg(feature = "boot-selftest")]
     let mut config = InitConfig::new().with_default_stages();
+    #[cfg(not(feature = "boot-selftest"))]
+    let mut config = InitConfig::new().with_production_stages();
     let mut buf = [0u8; MAX_CONFIG_BYTES];
 
     match find_bootfs_entry(bootfs, b"/etc/init.conf") {
@@ -97,8 +100,11 @@ fn load_config(logger: &mut InitLogger, bootfs: &Vmo) -> (InitConfig, bool) {
 
 static DRIVER_MANAGER_ELF: &[u8] = include_bytes!(env!("HUESOS_DRIVER_MANAGER_PATH"));
 static TERMINAL_ELF: &[u8] = include_bytes!(env!("HUESOS_TERMINAL_PATH"));
+#[cfg(feature = "boot-selftest")]
 static FAULT_PROBE_ELF: &[u8] = include_bytes!(env!("HUESOS_FAULT_PROBE_PATH"));
+#[cfg(feature = "boot-selftest")]
 static DYN_C_SMOKE_ELF: &[u8] = include_bytes!(env!("HUESOS_DYN_C_SMOKE_PATH"));
+#[cfg(feature = "boot-selftest")]
 static DYN_RUST_SMOKE_ELF: &[u8] = include_bytes!(env!("HUESOS_DYN_RUST_SMOKE_PATH"));
 static SHUTDOWN_BROKER_ELF: &[u8] = include_bytes!(env!("HUESOS_SHUTDOWN_BROKER_PATH"));
 static KEY_BROKER_ELF: &[u8] = include_bytes!(env!("HUESOS_KEY_BROKER_PATH"));
@@ -129,36 +135,8 @@ pub extern "C" fn _start() -> ! {
         init_logln!(logger, "[init] framebuffer log requested but unavailable");
     }
 
-    ui.begin(b"selftest", &mut logger);
-    if libcanvas::diagnostics::user_pointer_guard_smoke_test() {
-        init_logln!(logger, "[init] user pointer guard smoke OK");
-    } else {
-        init_logln!(logger, "[init] user pointer guard smoke FAILED");
-    }
-
-    // The self-checks are the longest stretch of the boot in which
-    // nothing else reports, so init reports its own progress through
-    // them. The percentages are step counts, not timings: they are
-    // honest about position in the sequence rather than pretending to
-    // predict duration.
-    run_vmo_check(&mut logger);
-    ui.step(b"selftest", 12);
-    run_channel_check(&mut logger);
-    ui.step(b"selftest", 25);
-    run_monotonic_clock_check(&mut logger);
-    ui.step(b"selftest", 37);
-    run_smp_affinity_check(&mut logger, &bootfs);
-    ui.step(b"selftest", 50);
-    run_process_wait_stress(&mut logger, &bootfs);
-    ui.step(b"selftest", 62);
-    run_waitset_check(&mut logger);
-    ui.step(b"selftest", 75);
-    run_fault_isolation_check(&mut logger, &bootfs);
-    ui.step(b"selftest", 80);
-    run_dynamic_linking_smoke(&mut logger, &bootfs);
-    ui.step(b"selftest", 90);
-    run_shutdown_authorization_check(&mut logger, &bootfs);
-    ui.end(b"selftest", StageState::Done, &mut logger);
+    #[cfg(feature = "boot-selftest")]
+    selftests::run_boot_selftests(&mut ui, &mut logger, &bootfs);
 
     ui.begin(b"key-broker", &mut logger);
     let mut key_broker = launch_key_broker(&mut logger);
@@ -365,6 +343,7 @@ pub extern "C" fn _start() -> ! {
         // duplicate the same installed handle. A one-shot handoff used to close
         // the slot right after the terminal and nothing in the boot path
         // noticed until someone actually launched Doom by hand.
+        #[cfg(feature = "boot-selftest")]
         match frame_draw.duplicate(
             libcanvas::rights::DUPLICATE
                 | libcanvas::rights::TRANSFER
@@ -388,9 +367,10 @@ pub extern "C" fn _start() -> ! {
     }
 
     // Stage E.2: emit the kernel's structured observation records on the
-    // serial console as hex, so an off-target collector gets the machine
-    // readable channel alongside the text trace from the same capture.
+    // serial console as hex in test builds, so an off-target collector gets the
+    // machine readable channel alongside the text trace from the same capture.
     // `tools/observation-decode.py` turns these lines back into records.
+    #[cfg(feature = "boot-selftest")]
     dump_observation_records(&mut logger);
     init_logln!(
         logger,
@@ -1119,6 +1099,7 @@ fn parse_u64_ascii(bytes: &[u8]) -> Option<u64> {
 /// serial capture, and means a truncated line costs one record rather
 /// than the whole batch. Failures are logged and ignored: observability
 /// must never be able to fail the boot it is observing.
+#[cfg(feature = "boot-selftest")]
 fn dump_observation_records(logger: &mut InitLogger) {
     use libcanvas::system::OBSERVATION_RECORD_SIZE;
 
@@ -1548,592 +1529,627 @@ fn fallback_legacy_shutdown(logger: &mut InitLogger) {
     }
 }
 
-fn run_monotonic_clock_check(logger: &mut InitLogger) {
-    let result = (|| -> libcanvas::Result<u64> {
-        let (_tx, rx) = Channel::pair()?;
-        let start = libcanvas::system::monotonic_ticks()?;
-        let mut byte = [0u8; 1];
-        match rx.read_into_timeout(&mut byte, 10) {
-            Err(ErrorCode::TimedOut) => {}
-            Ok(_) => return Err(ErrorCode::Busy),
-            Err(error) => return Err(error),
+#[cfg(feature = "boot-selftest")]
+mod selftests {
+    use super::*;
+
+    pub(super) fn run_boot_selftests(ui: &mut BootUi, logger: &mut InitLogger, bootfs: &Vmo) {
+        ui.begin(b"selftest", logger);
+        if libcanvas::diagnostics::user_pointer_guard_smoke_test() {
+            init_logln!(logger, "[init] user pointer guard smoke OK");
+        } else {
+            init_logln!(logger, "[init] user pointer guard smoke FAILED");
         }
-        Ok(libcanvas::system::monotonic_ticks()?.saturating_sub(start))
-    })();
 
-    match result {
-        Ok(elapsed) if (9..=12).contains(&elapsed) => init_logln!(
-            logger,
-            "[init] monotonic clock OK (10-tick wait measured {} ticks)",
-            elapsed
-        ),
-        Ok(elapsed) => init_logln!(
-            logger,
-            "[init] monotonic clock FAILED (measured {} ticks)",
-            elapsed
-        ),
-        Err(error) => init_logln!(logger, "[init] monotonic clock FAILED ({})", error.as_str()),
+        run_vmo_check(logger);
+        ui.step(b"selftest", 12);
+        run_channel_check(logger);
+        ui.step(b"selftest", 25);
+        run_monotonic_clock_check(logger);
+        ui.step(b"selftest", 37);
+        run_smp_affinity_check(logger, bootfs);
+        ui.step(b"selftest", 50);
+        run_process_wait_stress(logger, bootfs);
+        ui.step(b"selftest", 62);
+        run_waitset_check(logger);
+        ui.step(b"selftest", 75);
+        run_fault_isolation_check(logger, bootfs);
+        ui.step(b"selftest", 80);
+        run_dynamic_linking_smoke(logger, bootfs);
+        ui.step(b"selftest", 90);
+        run_shutdown_authorization_check(logger, bootfs);
+        ui.end(b"selftest", StageState::Done, logger);
     }
-}
 
-fn run_smp_affinity_check(logger: &mut InitLogger, lib_vmo: &Vmo) {
-    let cpu_count = match libcanvas::system::cpu_count() {
-        Ok(count) => count,
-        Err(error) => {
-            init_logln!(
+    fn run_monotonic_clock_check(logger: &mut InitLogger) {
+        let result = (|| -> libcanvas::Result<u64> {
+            let (_tx, rx) = Channel::pair()?;
+            let start = libcanvas::system::monotonic_ticks()?;
+            let mut byte = [0u8; 1];
+            match rx.read_into_timeout(&mut byte, 10) {
+                Err(ErrorCode::TimedOut) => {}
+                Ok(_) => return Err(ErrorCode::Busy),
+                Err(error) => return Err(error),
+            }
+            Ok(libcanvas::system::monotonic_ticks()?.saturating_sub(start))
+        })();
+
+        match result {
+            Ok(elapsed) if (9..=12).contains(&elapsed) => init_logln!(
                 logger,
-                "[init] SMP affinity self-test skipped ({})",
-                error.as_str()
-            );
-            return;
-        }
-    };
-    if cpu_count < 2 {
-        init_logln!(logger, "[init] SMP affinity self-test skipped (single CPU)");
-        return;
-    }
-    let result = (|| -> libcanvas::Result<i64> {
-        let (process, bootstrap) = libcanvas::process::spawn_elf_on_cpu_with_lib(
-            "affinity-probe",
-            FAULT_PROBE_ELF,
-            1,
-            lib_vmo,
-        )?;
-        match process.set_affinity(0) {
-            Err(ErrorCode::Busy) => {}
-            Ok(()) => return Err(ErrorCode::Busy),
-            Err(error) => return Err(error),
-        }
-        bootstrap.write(b"cpu")?;
-        wait_process_exit(&process)
-    })();
-    match result {
-        Ok(1) => init_logln!(
-            logger,
-            "[init] SMP affinity self-test OK (child ran on CPU 1)"
-        ),
-        Ok(cpu) => init_logln!(
-            logger,
-            "[init] SMP affinity self-test FAILED (child ran on CPU {})",
-            cpu
-        ),
-        Err(error) => init_logln!(
-            logger,
-            "[init] SMP affinity self-test FAILED ({})",
-            error.as_str()
-        ),
-    }
-}
-
-fn wait_process_exit(process: &Process) -> libcanvas::Result<i64> {
-    // Early boot must not park init on a still-maturing cross-process wait
-    // queue: a missed wake would prevent every later service from launching.
-    // Cooperative polling keeps scheduler progress explicit and is bounded so
-    // a broken probe degrades diagnostics instead of hanging the boot forever.
-    for _ in 0..100_000 {
-        if let Some(code) = process.poll_exit()? {
-            return Ok(code);
-        }
-        libcanvas::process::yield_now();
-    }
-    Err(ErrorCode::TimedOut)
-}
-
-/// Number of blocking `ProcessWait` wakes the self-test drives.
-///
-/// 32 is the ordinary smoke; CI sets `HUESOS_LIFECYCLE_WAIT_STRESS=256` for
-/// the soak matrix. The value is baked in at build time by the kernel crate.
-fn lifecycle_wait_iterations() -> usize {
-    match option_env!("HUESOS_LIFECYCLE_WAIT_STRESS") {
-        Some("256") => 256,
-        _ => 32,
-    }
-}
-
-/// Drive the blocking `ProcessWait` path repeatedly.
-///
-/// Each iteration spawns a probe child that yields before exiting, so the
-/// kernel must exercise wait registration, scheduler park/wake, lifecycle
-/// publication and exit-code delivery every single time. A single blocked
-/// wait proves the path works; this proves it keeps working under repetition,
-/// which is where stale-generation and reaper-timing bugs surface.
-fn run_process_wait_stress(logger: &mut InitLogger, lib_vmo: &Vmo) {
-    let iterations = lifecycle_wait_iterations();
-    for index in 0..iterations {
-        let Ok((process, bootstrap)) =
-            libcanvas::process::spawn_elf_with_lib("wait-probe", FAULT_PROBE_ELF, lib_vmo)
-        else {
-            init_logln!(
+                "[init] monotonic clock OK (10-tick wait measured {} ticks)",
+                elapsed
+            ),
+            Ok(elapsed) => init_logln!(
                 logger,
-                "[init] ProcessWait lifecycle FAILED (launch at {})",
-                index
-            );
-            return;
+                "[init] monotonic clock FAILED (measured {} ticks)",
+                elapsed
+            ),
+            Err(error) => init_logln!(logger, "[init] monotonic clock FAILED ({})", error.as_str()),
+        }
+    }
+
+    fn run_smp_affinity_check(logger: &mut InitLogger, lib_vmo: &Vmo) {
+        let cpu_count = match libcanvas::system::cpu_count() {
+            Ok(count) => count,
+            Err(error) => {
+                init_logln!(
+                    logger,
+                    "[init] SMP affinity self-test skipped ({})",
+                    error.as_str()
+                );
+                return;
+            }
         };
-        if bootstrap.write(b"wait").is_err() {
-            init_logln!(
-                logger,
-                "[init] ProcessWait lifecycle FAILED (command at {})",
-                index
-            );
+        if cpu_count < 2 {
+            init_logln!(logger, "[init] SMP affinity self-test skipped (single CPU)");
             return;
         }
-        drop(bootstrap);
-        // The child yields before exit, so this must exercise wait registration,
-        // scheduler park/wake, lifecycle publication, and exit-code delivery.
-        match process.wait_exit() {
-            Ok(0) => {
-                // The handle remains live after observation/reaping. A late
-                // ProcessWait must return the stored status without parking,
-                // and ProcessGetExitCode must report the identical result.
-                if process.wait_exit() != Ok(0) || process.poll_exit() != Ok(Some(0)) {
+        let result = (|| -> libcanvas::Result<i64> {
+            let (process, bootstrap) = libcanvas::process::spawn_elf_on_cpu_with_lib(
+                "affinity-probe",
+                FAULT_PROBE_ELF,
+                1,
+                lib_vmo,
+            )?;
+            match process.set_affinity(0) {
+                Err(ErrorCode::Busy) => {}
+                Ok(()) => return Err(ErrorCode::Busy),
+                Err(error) => return Err(error),
+            }
+            bootstrap.write(b"cpu")?;
+            wait_process_exit(&process)
+        })();
+        match result {
+            Ok(1) => init_logln!(
+                logger,
+                "[init] SMP affinity self-test OK (child ran on CPU 1)"
+            ),
+            Ok(cpu) => init_logln!(
+                logger,
+                "[init] SMP affinity self-test FAILED (child ran on CPU {})",
+                cpu
+            ),
+            Err(error) => init_logln!(
+                logger,
+                "[init] SMP affinity self-test FAILED ({})",
+                error.as_str()
+            ),
+        }
+    }
+
+    fn wait_process_exit(process: &Process) -> libcanvas::Result<i64> {
+        // Early boot must not park init on a still-maturing cross-process wait
+        // queue: a missed wake would prevent every later service from launching.
+        // Cooperative polling keeps scheduler progress explicit and is bounded so
+        // a broken probe degrades diagnostics instead of hanging the boot forever.
+        for _ in 0..100_000 {
+            if let Some(code) = process.poll_exit()? {
+                return Ok(code);
+            }
+            libcanvas::process::yield_now();
+        }
+        Err(ErrorCode::TimedOut)
+    }
+
+    /// Number of blocking `ProcessWait` wakes the self-test drives.
+    ///
+    /// 32 is the ordinary smoke; CI sets `HUESOS_LIFECYCLE_WAIT_STRESS=256` for
+    /// the soak matrix. The value is baked in at build time by the kernel crate.
+    fn lifecycle_wait_iterations() -> usize {
+        match option_env!("HUESOS_LIFECYCLE_WAIT_STRESS") {
+            Some("256") => 256,
+            _ => 32,
+        }
+    }
+
+    /// Drive the blocking `ProcessWait` path repeatedly.
+    ///
+    /// Each iteration spawns a probe child that yields before exiting, so the
+    /// kernel must exercise wait registration, scheduler park/wake, lifecycle
+    /// publication and exit-code delivery every single time. A single blocked
+    /// wait proves the path works; this proves it keeps working under repetition,
+    /// which is where stale-generation and reaper-timing bugs surface.
+    fn run_process_wait_stress(logger: &mut InitLogger, lib_vmo: &Vmo) {
+        let iterations = lifecycle_wait_iterations();
+        for index in 0..iterations {
+            let Ok((process, bootstrap)) =
+                libcanvas::process::spawn_elf_with_lib("wait-probe", FAULT_PROBE_ELF, lib_vmo)
+            else {
+                init_logln!(
+                    logger,
+                    "[init] ProcessWait lifecycle FAILED (launch at {})",
+                    index
+                );
+                return;
+            };
+            if bootstrap.write(b"wait").is_err() {
+                init_logln!(
+                    logger,
+                    "[init] ProcessWait lifecycle FAILED (command at {})",
+                    index
+                );
+                return;
+            }
+            drop(bootstrap);
+            // The child yields before exit, so this must exercise wait registration,
+            // scheduler park/wake, lifecycle publication, and exit-code delivery.
+            match process.wait_exit() {
+                Ok(0) => {
+                    // The handle remains live after observation/reaping. A late
+                    // ProcessWait must return the stored status without parking,
+                    // and ProcessGetExitCode must report the identical result.
+                    if process.wait_exit() != Ok(0) || process.poll_exit() != Ok(Some(0)) {
+                        init_logln!(
+                            logger,
+                            "[init] ProcessWait lifecycle FAILED (repeat observation at {})",
+                            index
+                        );
+                        return;
+                    }
+                    if (index + 1) % 32 == 0 && index + 1 != iterations {
+                        init_logln!(
+                            logger,
+                            "[init] ProcessWait lifecycle progress {}/{}",
+                            index + 1,
+                            iterations
+                        );
+                    }
+                }
+                Ok(code) => {
                     init_logln!(
                         logger,
-                        "[init] ProcessWait lifecycle FAILED (repeat observation at {})",
+                        "[init] ProcessWait lifecycle FAILED (exit {} at {})",
+                        code,
                         index
                     );
                     return;
                 }
-                if (index + 1) % 32 == 0 && index + 1 != iterations {
+                Err(error) => {
                     init_logln!(
                         logger,
-                        "[init] ProcessWait lifecycle progress {}/{}",
-                        index + 1,
-                        iterations
+                        "[init] ProcessWait lifecycle FAILED ({} at {})",
+                        error.as_str(),
+                        index
                     );
+                    return;
                 }
             }
-            Ok(code) => {
-                init_logln!(
-                    logger,
-                    "[init] ProcessWait lifecycle FAILED (exit {} at {})",
-                    code,
-                    index
-                );
-                return;
-            }
-            Err(error) => {
-                init_logln!(
-                    logger,
-                    "[init] ProcessWait lifecycle FAILED ({} at {})",
-                    error.as_str(),
-                    index
-                );
-                return;
-            }
         }
-    }
-    init_logln!(logger, "[init] ProcessWait repeated observation OK");
-    let mode = if iterations == 256 { "soak" } else { "smoke" };
-    init_logln!(
-        logger,
-        "[init] ProcessWait lifecycle {} OK ({} blocked wakes)",
-        mode,
-        iterations
-    );
-}
-
-fn run_shutdown_authorization_check(logger: &mut InitLogger, lib_vmo: &Vmo) {
-    let Ok((process, bootstrap)) =
-        libcanvas::process::spawn_elf_with_lib("shutdown-probe", FAULT_PROBE_ELF, lib_vmo)
-    else {
-        init_logln!(logger, "[init] shutdown authorization FAILED (launch)");
-        return;
-    };
-    if bootstrap.write(b"shutdown").is_err() {
-        init_logln!(logger, "[init] shutdown authorization FAILED (command)");
-        return;
-    }
-    drop(bootstrap);
-    match wait_process_exit(&process) {
-        Ok(0) => init_logln!(
+        init_logln!(logger, "[init] ProcessWait repeated observation OK");
+        let mode = if iterations == 256 { "soak" } else { "smoke" };
+        init_logln!(
             logger,
-            "[init] shutdown authorization OK (unprivileged caller denied)"
-        ),
-        Ok(code) => init_logln!(
-            logger,
-            "[init] shutdown authorization FAILED (exit code {})",
-            code
-        ),
-        Err(error) => init_logln!(
-            logger,
-            "[init] shutdown authorization FAILED ({})",
-            error.as_str()
-        ),
+            "[init] ProcessWait lifecycle {} OK ({} blocked wakes)",
+            mode,
+            iterations
+        );
     }
-}
 
-fn run_fault_isolation_check(logger: &mut InitLogger, lib_vmo: &Vmo) {
-    let cases: [(&[u8], i64); 4] = [
-        (b"page", libcanvas::fault_exit::PAGE_FAULT),
-        (b"opcode", libcanvas::fault_exit::INVALID_OPCODE),
-        (b"gpf", libcanvas::fault_exit::GENERAL_PROTECTION),
-        (b"divide", libcanvas::fault_exit::DIVIDE_ERROR),
-    ];
-
-    for (command, expected) in cases {
+    fn run_shutdown_authorization_check(logger: &mut InitLogger, lib_vmo: &Vmo) {
         let Ok((process, bootstrap)) =
-            libcanvas::process::spawn_elf_with_lib("fault-probe", FAULT_PROBE_ELF, lib_vmo)
+            libcanvas::process::spawn_elf_with_lib("shutdown-probe", FAULT_PROBE_ELF, lib_vmo)
         else {
-            init_logln!(logger, "[init] user fault isolation FAILED (launch)");
+            init_logln!(logger, "[init] shutdown authorization FAILED (launch)");
             return;
         };
-        if let Err(error) = bootstrap.write(command) {
-            init_logln!(
-                logger,
-                "[init] user fault isolation FAILED (command: {})",
-                error.as_str()
-            );
+        if bootstrap.write(b"shutdown").is_err() {
+            init_logln!(logger, "[init] shutdown authorization FAILED (command)");
             return;
         }
         drop(bootstrap);
         match wait_process_exit(&process) {
-            Ok(code) if code == expected => {}
+            Ok(0) => init_logln!(
+                logger,
+                "[init] shutdown authorization OK (unprivileged caller denied)"
+            ),
+            Ok(code) => init_logln!(
+                logger,
+                "[init] shutdown authorization FAILED (exit code {})",
+                code
+            ),
+            Err(error) => init_logln!(
+                logger,
+                "[init] shutdown authorization FAILED ({})",
+                error.as_str()
+            ),
+        }
+    }
+
+    fn run_fault_isolation_check(logger: &mut InitLogger, lib_vmo: &Vmo) {
+        let cases: [(&[u8], i64); 4] = [
+            (b"page", libcanvas::fault_exit::PAGE_FAULT),
+            (b"opcode", libcanvas::fault_exit::INVALID_OPCODE),
+            (b"gpf", libcanvas::fault_exit::GENERAL_PROTECTION),
+            (b"divide", libcanvas::fault_exit::DIVIDE_ERROR),
+        ];
+
+        for (command, expected) in cases {
+            let Ok((process, bootstrap)) =
+                libcanvas::process::spawn_elf_with_lib("fault-probe", FAULT_PROBE_ELF, lib_vmo)
+            else {
+                init_logln!(logger, "[init] user fault isolation FAILED (launch)");
+                return;
+            };
+            if let Err(error) = bootstrap.write(command) {
+                init_logln!(
+                    logger,
+                    "[init] user fault isolation FAILED (command: {})",
+                    error.as_str()
+                );
+                return;
+            }
+            drop(bootstrap);
+            match wait_process_exit(&process) {
+                Ok(code) if code == expected => {}
+                Ok(code) => {
+                    init_logln!(
+                        logger,
+                        "[init] user fault isolation FAILED (exit code {}, expected {})",
+                        code,
+                        expected
+                    );
+                    return;
+                }
+                Err(error) => {
+                    init_logln!(
+                        logger,
+                        "[init] user fault isolation FAILED ({})",
+                        error.as_str()
+                    );
+                    return;
+                }
+            }
+        }
+        init_logln!(
+            logger,
+            "[init] user fault isolation OK (#PF/#UD/#GP/#DE contained)"
+        );
+    }
+
+    fn copy_bootfs_file_to_exec_vmo(bootfs: &Vmo, path: &[u8]) -> libcanvas::Result<Vmo> {
+        let entry = find_bootfs_entry(bootfs, path)?;
+        let aligned = (entry.len + 4095) & !4095;
+        let vmo = Vmo::create_with_flags(aligned, libcanvas::vmo_create_flags::EXECUTABLE)?;
+        let mut buf = [0u8; 4096];
+        let mut copied = 0u64;
+        while copied < entry.len {
+            let chunk = (entry.len - copied).min(buf.len() as u64) as usize;
+            let read_n = bootfs.read(entry.offset + copied, &mut buf[..chunk])?;
+            if read_n != chunk {
+                return Err(ErrorCode::Internal);
+            }
+            let wrote_n = vmo.write(copied, &buf[..chunk])?;
+            if wrote_n != chunk {
+                return Err(ErrorCode::Internal);
+            }
+            copied += chunk as u64;
+        }
+        Ok(vmo)
+    }
+
+    fn run_dynamic_linking_smoke(logger: &mut InitLogger, lib_vmo: &Vmo) {
+        let Ok((c_proc, c_boot)) =
+            libcanvas::process::spawn_elf_with_lib("dyn-c-smoke", DYN_C_SMOKE_ELF, lib_vmo)
+        else {
+            init_logln!(logger, "[init] dynamic linking smoke FAILED (c launch)");
+            return;
+        };
+        drop(c_boot);
+        match wait_process_exit(&c_proc) {
+            Ok(0) => {}
             Ok(code) => {
                 init_logln!(
                     logger,
-                    "[init] user fault isolation FAILED (exit code {}, expected {})",
-                    code,
-                    expected
+                    "[init] dynamic linking smoke FAILED (c exit {})",
+                    code
                 );
                 return;
             }
             Err(error) => {
                 init_logln!(
                     logger,
-                    "[init] user fault isolation FAILED ({})",
+                    "[init] dynamic linking smoke FAILED (c wait: {})",
                     error.as_str()
                 );
                 return;
             }
         }
-    }
-    init_logln!(
-        logger,
-        "[init] user fault isolation OK (#PF/#UD/#GP/#DE contained)"
-    );
-}
 
-fn copy_bootfs_file_to_exec_vmo(bootfs: &Vmo, path: &[u8]) -> libcanvas::Result<Vmo> {
-    let entry = find_bootfs_entry(bootfs, path)?;
-    let aligned = (entry.len + 4095) & !4095;
-    let vmo = Vmo::create_with_flags(aligned, libcanvas::vmo_create_flags::EXECUTABLE)?;
-    let mut buf = [0u8; 4096];
-    let mut copied = 0u64;
-    while copied < entry.len {
-        let chunk = (entry.len - copied).min(buf.len() as u64) as usize;
-        let read_n = bootfs.read(entry.offset + copied, &mut buf[..chunk])?;
-        if read_n != chunk {
-            return Err(ErrorCode::Internal);
-        }
-        let wrote_n = vmo.write(copied, &buf[..chunk])?;
-        if wrote_n != chunk {
-            return Err(ErrorCode::Internal);
-        }
-        copied += chunk as u64;
-    }
-    Ok(vmo)
-}
-
-fn run_dynamic_linking_smoke(logger: &mut InitLogger, lib_vmo: &Vmo) {
-    let Ok((c_proc, c_boot)) =
-        libcanvas::process::spawn_elf_with_lib("dyn-c-smoke", DYN_C_SMOKE_ELF, lib_vmo)
-    else {
-        init_logln!(logger, "[init] dynamic linking smoke FAILED (c launch)");
-        return;
-    };
-    drop(c_boot);
-    match wait_process_exit(&c_proc) {
-        Ok(0) => {}
-        Ok(code) => {
+        let Ok(plugin_vmo) = copy_bootfs_file_to_exec_vmo(lib_vmo, b"/lib/libsmoke_plugin.so")
+        else {
             init_logln!(
                 logger,
-                "[init] dynamic linking smoke FAILED (c exit {})",
-                code
+                "[init] dynamic linking smoke FAILED (plugin vmo extract)"
             );
             return;
-        }
-        Err(error) => {
+        };
+        let Ok((r_proc, r_boot)) =
+            libcanvas::process::spawn_elf_with_lib("dyn-rust-smoke", DYN_RUST_SMOKE_ELF, lib_vmo)
+        else {
+            init_logln!(logger, "[init] dynamic linking smoke FAILED (rust launch)");
+            return;
+        };
+        if let Err((error, _handle)) = r_boot.write_handle(b"plugin-vmo", plugin_vmo.into_handle())
+        {
             init_logln!(
                 logger,
-                "[init] dynamic linking smoke FAILED (c wait: {})",
+                "[init] dynamic linking smoke FAILED (plugin handle send: {})",
                 error.as_str()
             );
             return;
         }
-    }
-
-    let Ok(plugin_vmo) = copy_bootfs_file_to_exec_vmo(lib_vmo, b"/lib/libsmoke_plugin.so") else {
-        init_logln!(
-            logger,
-            "[init] dynamic linking smoke FAILED (plugin vmo extract)"
-        );
-        return;
-    };
-    let Ok((r_proc, r_boot)) =
-        libcanvas::process::spawn_elf_with_lib("dyn-rust-smoke", DYN_RUST_SMOKE_ELF, lib_vmo)
-    else {
-        init_logln!(logger, "[init] dynamic linking smoke FAILED (rust launch)");
-        return;
-    };
-    if let Err((error, _handle)) = r_boot.write_handle(b"plugin-vmo", plugin_vmo.into_handle()) {
-        init_logln!(
-            logger,
-            "[init] dynamic linking smoke FAILED (plugin handle send: {})",
-            error.as_str()
-        );
-        return;
-    }
-    drop(r_boot);
-    match wait_process_exit(&r_proc) {
-        Ok(0) => {
-            init_logln!(logger, "[init] dynamic linking smoke OK");
-        }
-        Ok(code) => {
-            init_logln!(
-                logger,
-                "[init] dynamic linking smoke FAILED (rust exit {})",
-                code
-            );
-        }
-        Err(error) => {
-            init_logln!(
-                logger,
-                "[init] dynamic linking smoke FAILED (rust wait: {})",
-                error.as_str()
-            );
-        }
-    }
-}
-
-fn run_vmo_check(logger: &mut InitLogger) {
-    let payload = b"HuesOS VMO round-trip OK\n";
-    let ok = (|| -> libcanvas::Result<bool> {
-        let vmo = Vmo::create(4096)?;
-        vmo.write(0, payload)?;
-        let mut readback = [0u8; 32];
-        let n = vmo.read(0, &mut readback)?;
-        Ok(n >= payload.len() && &readback[..payload.len()] == payload)
-    })();
-
-    match ok {
-        Ok(true) => init_logln!(logger, "[init] VMO read/write round-trip OK"),
-        Ok(false) => init_logln!(
-            logger,
-            "[init] VMO read/write round-trip FAILED (data mismatch)"
-        ),
-        Err(e) => init_logln!(
-            logger,
-            "[init] VMO read/write round-trip FAILED ({})",
-            e.as_str()
-        ),
-    }
-}
-
-fn run_channel_check(logger: &mut InitLogger) {
-    let msg = b"ping over huesos channel\n";
-    let ok = (|| -> libcanvas::Result<bool> {
-        let (tx, rx) = libcanvas::Channel::pair()?;
-        tx.write(msg)?;
-        let (buf, n) = rx.read()?;
-        Ok(n == msg.len() && &buf[..n] == msg)
-    })();
-
-    match ok {
-        Ok(true) => init_logln!(logger, "[init] channel IPC round-trip OK"),
-        Ok(false) => init_logln!(
-            logger,
-            "[init] channel IPC round-trip FAILED (data mismatch)"
-        ),
-        Err(e) => init_logln!(
-            logger,
-            "[init] channel IPC round-trip FAILED ({})",
-            e.as_str()
-        ),
-    }
-}
-
-/// Regression suite for `Syscall::WaitSetWait`.
-///
-/// Three properties, each a live end-to-end syscall probe:
-///
-/// 1. **READABLE fires on channel wake.** A `wait_any` on the empty
-///    receiver returns pending; after the peer writes a message the
-///    same wait wakes and reports `Signals::READABLE` for the item.
-///    The read then returns the payload — proving the wake was not
-///    a spurious poll.
-///
-/// 2. **`timeout_ticks` is honoured.** A `wait_any` on a channel
-///    that never becomes readable returns `Err(TimedOut)` within
-///    the requested budget. Between PR #126 and this PR the kernel
-///    silently ignored `timeout_ticks` and looped forever, and the
-///    only reason it did not lock up any real boot was that every
-///    caller either passed `0` (wait forever) or had a peer that
-///    eventually wrote something. driver-host-input was the first
-///    caller that actually depended on timeout firing, and it
-///    stalled.
-///
-/// 3. **Ports report `READABLE`, not `SIGNALED`.** Bound-key IRQ
-///    packets on a Port were previously reported under
-///    `Signals::SIGNALED` while every driver awaited `READABLE`, so
-///    the two never intersected and Port-based `wait_any` never
-///    fired. Rectified in the same PR as this test.
-fn run_waitset_check(logger: &mut InitLogger) {
-    use libcanvas::{wait_any, Signals, WaitItem};
-
-    init_logln!(logger, "[init] waitset self-test starting");
-
-    // Property 1 — READABLE fires on channel wake.
-    let Ok((tx, rx)) = libcanvas::Channel::pair() else {
-        init_logln!(logger, "[init] waitset self-test FAILED (channel pair)");
-        return;
-    };
-    if let Err(e) = tx.write(b"waitset-probe") {
-        init_logln!(
-            logger,
-            "[init] waitset self-test FAILED (write: {})",
-            e.as_str()
-        );
-        return;
-    }
-    let items = [WaitItem::new(rx.handle().raw(), Signals::READABLE, 7)];
-    match wait_any(&items, 0) {
-        Ok(outcome) => {
-            let found = outcome
-                .satisfied()
-                .iter()
-                .any(|r| r.key == 7 && (r.active_signals & Signals::READABLE.bits()) != 0);
-            if !found {
+        drop(r_boot);
+        match wait_process_exit(&r_proc) {
+            Ok(0) => {
+                init_logln!(logger, "[init] dynamic linking smoke OK");
+            }
+            Ok(code) => {
                 init_logln!(
                     logger,
-                    "[init] waitset self-test FAILED (READABLE not reported for channel)"
+                    "[init] dynamic linking smoke FAILED (rust exit {})",
+                    code
+                );
+            }
+            Err(error) => {
+                init_logln!(
+                    logger,
+                    "[init] dynamic linking smoke FAILED (rust wait: {})",
+                    error.as_str()
+                );
+            }
+        }
+    }
+
+    fn run_vmo_check(logger: &mut InitLogger) {
+        let payload = b"HuesOS VMO round-trip OK\n";
+        let ok = (|| -> libcanvas::Result<bool> {
+            let vmo = Vmo::create(4096)?;
+            vmo.write(0, payload)?;
+            let mut readback = [0u8; 32];
+            let n = vmo.read(0, &mut readback)?;
+            Ok(n >= payload.len() && &readback[..payload.len()] == payload)
+        })();
+
+        match ok {
+            Ok(true) => init_logln!(logger, "[init] VMO read/write round-trip OK"),
+            Ok(false) => init_logln!(
+                logger,
+                "[init] VMO read/write round-trip FAILED (data mismatch)"
+            ),
+            Err(e) => init_logln!(
+                logger,
+                "[init] VMO read/write round-trip FAILED ({})",
+                e.as_str()
+            ),
+        }
+    }
+
+    fn run_channel_check(logger: &mut InitLogger) {
+        let msg = b"ping over huesos channel\n";
+        let ok = (|| -> libcanvas::Result<bool> {
+            let (tx, rx) = libcanvas::Channel::pair()?;
+            tx.write(msg)?;
+            let (buf, n) = rx.read()?;
+            Ok(n == msg.len() && &buf[..n] == msg)
+        })();
+
+        match ok {
+            Ok(true) => init_logln!(logger, "[init] channel IPC round-trip OK"),
+            Ok(false) => init_logln!(
+                logger,
+                "[init] channel IPC round-trip FAILED (data mismatch)"
+            ),
+            Err(e) => init_logln!(
+                logger,
+                "[init] channel IPC round-trip FAILED ({})",
+                e.as_str()
+            ),
+        }
+    }
+
+    /// Regression suite for `Syscall::WaitSetWait`.
+    ///
+    /// Three properties, each a live end-to-end syscall probe:
+    ///
+    /// 1. **READABLE fires on channel wake.** A `wait_any` on the empty
+    ///    receiver returns pending; after the peer writes a message the
+    ///    same wait wakes and reports `Signals::READABLE` for the item.
+    ///    The read then returns the payload — proving the wake was not
+    ///    a spurious poll.
+    ///
+    /// 2. **`timeout_ticks` is honoured.** A `wait_any` on a channel
+    ///    that never becomes readable returns `Err(TimedOut)` within
+    ///    the requested budget. Between PR #126 and this PR the kernel
+    ///    silently ignored `timeout_ticks` and looped forever, and the
+    ///    only reason it did not lock up any real boot was that every
+    ///    caller either passed `0` (wait forever) or had a peer that
+    ///    eventually wrote something. driver-host-input was the first
+    ///    caller that actually depended on timeout firing, and it
+    ///    stalled.
+    ///
+    /// 3. **Ports report `READABLE`, not `SIGNALED`.** Bound-key IRQ
+    ///    packets on a Port were previously reported under
+    ///    `Signals::SIGNALED` while every driver awaited `READABLE`, so
+    ///    the two never intersected and Port-based `wait_any` never
+    ///    fired. Rectified in the same PR as this test.
+    fn run_waitset_check(logger: &mut InitLogger) {
+        use libcanvas::{wait_any, Signals, WaitItem};
+
+        init_logln!(logger, "[init] waitset self-test starting");
+
+        // Property 1 — READABLE fires on channel wake.
+        let Ok((tx, rx)) = libcanvas::Channel::pair() else {
+            init_logln!(logger, "[init] waitset self-test FAILED (channel pair)");
+            return;
+        };
+        if let Err(e) = tx.write(b"waitset-probe") {
+            init_logln!(
+                logger,
+                "[init] waitset self-test FAILED (write: {})",
+                e.as_str()
+            );
+            return;
+        }
+        let items = [WaitItem::new(rx.handle().raw(), Signals::READABLE, 7)];
+        match wait_any(&items, 0) {
+            Ok(outcome) => {
+                let found = outcome
+                    .satisfied()
+                    .iter()
+                    .any(|r| r.key == 7 && (r.active_signals & Signals::READABLE.bits()) != 0);
+                if !found {
+                    init_logln!(
+                        logger,
+                        "[init] waitset self-test FAILED (READABLE not reported for channel)"
+                    );
+                    return;
+                }
+            }
+            Err(e) => {
+                init_logln!(
+                    logger,
+                    "[init] waitset self-test FAILED (channel wait_any: {})",
+                    e.as_str()
                 );
                 return;
             }
         }
-        Err(e) => {
-            init_logln!(
-                logger,
-                "[init] waitset self-test FAILED (channel wait_any: {})",
-                e.as_str()
-            );
-            return;
-        }
-    }
-    init_logln!(logger, "[init] waitset self-test channel-readable OK");
-    // Drain the probe message so the next iteration starts empty.
-    let mut buf = [0u8; 32];
-    let _ = rx.read_into(&mut buf);
+        init_logln!(logger, "[init] waitset self-test channel-readable OK");
+        // Drain the probe message so the next iteration starts empty.
+        let mut buf = [0u8; 32];
+        let _ = rx.read_into(&mut buf);
 
-    // Property 2 — timeout_ticks is honoured.
-    let empty_items = [WaitItem::new(rx.handle().raw(), Signals::READABLE, 8)];
-    match wait_any(&empty_items, 4) {
-        Err(libcanvas::ErrorCode::TimedOut) => {}
-        Ok(_) => {
-            init_logln!(
-                logger,
-                "[init] waitset self-test FAILED (timeout returned Ok on empty channel)"
-            );
-            return;
-        }
-        Err(e) => {
-            init_logln!(
-                logger,
-                "[init] waitset self-test FAILED (timeout wait_any: {})",
-                e.as_str()
-            );
-            return;
-        }
-    }
-    init_logln!(logger, "[init] waitset self-test channel-timeout OK");
-
-    // Property 3 — Port with no packet queued parks past the
-    // deadline (times out) instead of spinning. This closes the
-    // second half of the WaitSetWait timeout regression: even for
-    // a Port item (which has different signal semantics than a
-    // Channel) the timeout budget must be honoured.
-    //
-    // The complementary "packet arrives → wait wakes with
-    // READABLE" property for Ports is validated end-to-end at
-    // runtime by the input-host driver loop and asserted by the
-    // CI serial-marker chain; init cannot re-run that check
-    // without stealing the keyboard IRQ capability from input-host
-    // (Interrupt::keyboard is exclusive).
-    let Ok(idle_port) = libcanvas::Port::create() else {
-        init_logln!(logger, "[init] waitset self-test FAILED (port create)");
-        return;
-    };
-    let idle_items = [WaitItem::new(
-        idle_port.handle().raw(),
-        Signals::READABLE,
-        9,
-    )];
-    match wait_any(&idle_items, 4) {
-        Err(libcanvas::ErrorCode::TimedOut) => {}
-        Ok(_) => {
-            init_logln!(
-                logger,
-                "[init] waitset self-test FAILED (port timeout returned Ok on empty port)"
-            );
-            return;
-        }
-        Err(e) => {
-            init_logln!(
-                logger,
-                "[init] waitset self-test FAILED (idle port wait_any: {})",
-                e.as_str()
-            );
-            return;
-        }
-    }
-    init_logln!(logger, "[init] waitset self-test port-timeout OK");
-
-    // Property 4 — PEER_CLOSED wakes wait_any. This is the invariant
-    // the shutdown-broker bootstrap loop depends on for its "peer
-    // died before completing the handshake" fast-fail path: without
-    // it, closing one end of a channel with no queued messages would
-    // leave the other end permanently parked in wait_any(READABLE |
-    // PEER_CLOSED). Regression coverage for the broker rewrite from
-    // bounded-yield-loop to blocking wait_any in PR-H.
-    let Ok((peer_tx, peer_rx)) = libcanvas::Channel::pair() else {
-        init_logln!(
-            logger,
-            "[init] waitset self-test FAILED (peer channel pair)"
-        );
-        return;
-    };
-    drop(peer_tx);
-    let peer_items = [WaitItem::new(
-        peer_rx.handle().raw(),
-        Signals::READABLE | Signals::PEER_CLOSED,
-        10,
-    )];
-    match wait_any(&peer_items, 0) {
-        Ok(outcome) => {
-            let found = outcome
-                .satisfied()
-                .iter()
-                .any(|r| r.key == 10 && (r.active_signals & Signals::PEER_CLOSED.bits()) != 0);
-            if !found {
+        // Property 2 — timeout_ticks is honoured.
+        let empty_items = [WaitItem::new(rx.handle().raw(), Signals::READABLE, 8)];
+        match wait_any(&empty_items, 4) {
+            Err(libcanvas::ErrorCode::TimedOut) => {}
+            Ok(_) => {
                 init_logln!(
                     logger,
-                    "[init] waitset self-test FAILED (PEER_CLOSED not reported on dropped tx)"
+                    "[init] waitset self-test FAILED (timeout returned Ok on empty channel)"
+                );
+                return;
+            }
+            Err(e) => {
+                init_logln!(
+                    logger,
+                    "[init] waitset self-test FAILED (timeout wait_any: {})",
+                    e.as_str()
                 );
                 return;
             }
         }
-        Err(e) => {
+        init_logln!(logger, "[init] waitset self-test channel-timeout OK");
+
+        // Property 3 — Port with no packet queued parks past the
+        // deadline (times out) instead of spinning. This closes the
+        // second half of the WaitSetWait timeout regression: even for
+        // a Port item (which has different signal semantics than a
+        // Channel) the timeout budget must be honoured.
+        //
+        // The complementary "packet arrives → wait wakes with
+        // READABLE" property for Ports is validated end-to-end at
+        // runtime by the input-host driver loop and asserted by the
+        // CI serial-marker chain; init cannot re-run that check
+        // without stealing the keyboard IRQ capability from input-host
+        // (Interrupt::keyboard is exclusive).
+        let Ok(idle_port) = libcanvas::Port::create() else {
+            init_logln!(logger, "[init] waitset self-test FAILED (port create)");
+            return;
+        };
+        let idle_items = [WaitItem::new(
+            idle_port.handle().raw(),
+            Signals::READABLE,
+            9,
+        )];
+        match wait_any(&idle_items, 4) {
+            Err(libcanvas::ErrorCode::TimedOut) => {}
+            Ok(_) => {
+                init_logln!(
+                    logger,
+                    "[init] waitset self-test FAILED (port timeout returned Ok on empty port)"
+                );
+                return;
+            }
+            Err(e) => {
+                init_logln!(
+                    logger,
+                    "[init] waitset self-test FAILED (idle port wait_any: {})",
+                    e.as_str()
+                );
+                return;
+            }
+        }
+        init_logln!(logger, "[init] waitset self-test port-timeout OK");
+
+        // Property 4 — PEER_CLOSED wakes wait_any. This is the invariant
+        // the shutdown-broker bootstrap loop depends on for its "peer
+        // died before completing the handshake" fast-fail path: without
+        // it, closing one end of a channel with no queued messages would
+        // leave the other end permanently parked in wait_any(READABLE |
+        // PEER_CLOSED). Regression coverage for the broker rewrite from
+        // bounded-yield-loop to blocking wait_any in PR-H.
+        let Ok((peer_tx, peer_rx)) = libcanvas::Channel::pair() else {
             init_logln!(
                 logger,
-                "[init] waitset self-test FAILED (peer wait_any: {})",
-                e.as_str()
+                "[init] waitset self-test FAILED (peer channel pair)"
             );
             return;
+        };
+        drop(peer_tx);
+        let peer_items = [WaitItem::new(
+            peer_rx.handle().raw(),
+            Signals::READABLE | Signals::PEER_CLOSED,
+            10,
+        )];
+        match wait_any(&peer_items, 0) {
+            Ok(outcome) => {
+                let found = outcome
+                    .satisfied()
+                    .iter()
+                    .any(|r| r.key == 10 && (r.active_signals & Signals::PEER_CLOSED.bits()) != 0);
+                if !found {
+                    init_logln!(
+                        logger,
+                        "[init] waitset self-test FAILED (PEER_CLOSED not reported on dropped tx)"
+                    );
+                    return;
+                }
+            }
+            Err(e) => {
+                init_logln!(
+                    logger,
+                    "[init] waitset self-test FAILED (peer wait_any: {})",
+                    e.as_str()
+                );
+                return;
+            }
         }
-    }
-    init_logln!(logger, "[init] waitset self-test peer-closed OK");
+        init_logln!(logger, "[init] waitset self-test peer-closed OK");
 
-    init_logln!(logger, "[init] waitset self-test OK");
+        init_logln!(logger, "[init] waitset self-test OK");
+    }
 }
 
 #[panic_handler]

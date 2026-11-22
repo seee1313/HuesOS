@@ -36,8 +36,8 @@ trap 'echo "init_args=foo" > build/cmdline.txt' EXIT
 # but the cmdline.txt input was just rewritten — mkiso.sh will
 # regenerate the image).
 case "$profile" in
-    debug)   CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-1}" make iso PROFILE=debug ;;
-    release) CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-1}" make iso-release ;;
+    debug)   HUESOS_BOOT_SELFTEST=1 CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-1}" make iso PROFILE=debug ;;
+    release) HUESOS_BOOT_SELFTEST=1 CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-1}" make iso-release ;;
     *) echo "unsupported profile: $profile" >&2; exit 2 ;;
 esac
 

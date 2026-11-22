@@ -106,7 +106,7 @@ pub fn shootdown_range(start: u64, end: u64, expected_remote: usize) {
     }
     if superseded {
         use core::fmt::Write;
-        let mut w = crate::x86_64::serial::SerialWriter;
+        let mut w = crate::x86_64::serial::ErrorSerialWriter;
         let _ = writeln!(
             &mut w,
             "[tlb-shootdown] ERROR: concurrent shootdown detected; request {seq} completed without verified remote invalidation"
