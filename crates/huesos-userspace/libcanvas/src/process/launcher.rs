@@ -7,11 +7,14 @@ use crate::vmo::Vmo;
 use huesos_abi::auxv::{
     caps_mask, AT_BASE, AT_ENTRY, AT_FLAGS, AT_HUESOS_BLOCK_DEV, AT_HUESOS_CAPS_MASK,
     AT_HUESOS_FRAME_DRAW, AT_HUESOS_HXFS_DIR, AT_HUESOS_HXFS_SERVICE, AT_HUESOS_LD_BOOTSTRAP,
-    AT_HUESOS_LIB_VMO, AT_HUESOS_REGISTRY, AT_HUESOS_STDERR, AT_HUESOS_STDIN, AT_HUESOS_STDOUT,
-    AT_NULL, AT_PAGESZ, AT_PHDR, AT_PHENT, AT_PHNUM, AT_RANDOM, LD_BOOTSTRAP_BLOCK_DEV_LABEL,
-    LD_BOOTSTRAP_FRAME_DRAW_LABEL, LD_BOOTSTRAP_HXFS_DIR_LABEL, LD_BOOTSTRAP_HXFS_SERVICE_LABEL,
-    LD_BOOTSTRAP_LIB_VMO_LABEL, LD_BOOTSTRAP_REGISTRY_LABEL, LD_BOOTSTRAP_SELF_VMAR_LABEL,
+    AT_HUESOS_LIB_VMO, AT_HUESOS_NET_SERVICE, AT_HUESOS_PE_LEN, AT_HUESOS_PE_OFFSET,
+    AT_HUESOS_PE_VMO, AT_HUESOS_REGISTRY, AT_HUESOS_STDERR, AT_HUESOS_STDIN, AT_HUESOS_STDOUT,
+    AT_HUESOS_WLAN_SERVICE, AT_NULL, AT_PAGESZ, AT_PHDR, AT_PHENT, AT_PHNUM, AT_RANDOM,
+    LD_BOOTSTRAP_BLOCK_DEV_LABEL, LD_BOOTSTRAP_FRAME_DRAW_LABEL, LD_BOOTSTRAP_HXFS_DIR_LABEL,
+    LD_BOOTSTRAP_HXFS_SERVICE_LABEL, LD_BOOTSTRAP_LIB_VMO_LABEL, LD_BOOTSTRAP_NET_SERVICE_LABEL,
+    LD_BOOTSTRAP_PE_VMO_LABEL, LD_BOOTSTRAP_REGISTRY_LABEL, LD_BOOTSTRAP_SELF_VMAR_LABEL,
     LD_BOOTSTRAP_STDERR_LABEL, LD_BOOTSTRAP_STDIN_LABEL, LD_BOOTSTRAP_STDOUT_LABEL,
+    LD_BOOTSTRAP_WLAN_SERVICE_LABEL,
 };
 use huesos_abi::{rights, vmar_flags, vmo_create_flags, USER_STACK_TOP};
 use huesos_elf::dynamic::{
@@ -25,6 +28,8 @@ use super::{Process, Thread, Vmar};
 const HEADER_MAX: usize = 16 * 1024;
 const MAIN_ASLR_BASE: u64 = 0x0000_0001_0000_0000;
 const INTERP_ASLR_BASE: u64 = 0x0000_0004_0000_0000;
+const PE_LOADER_ASLR_BASE: u64 = 0x0000_0004_8000_0000;
+const PE_LOADER_BOOTFS_PATH: &[u8] = b"/lib/ld-pe.so";
 const ASLR_PAGE_MASK: u64 = 0x000f_ffff;
 const BOOTFS_HEADER_SIZE: u64 = 16;
 const BOOTFS_ENTRY_SIZE: u64 = 216;
@@ -54,6 +59,10 @@ pub struct SpawnCaps<'a> {
     pub frame_draw: Option<&'a Handle>,
     /// Optional `DriverManager` query/registry channel (`AT_HUESOS_REGISTRY`).
     pub registry: Option<&'a Channel>,
+    /// Optional `net-service` (`Plan 9 /net`) channel (`AT_HUESOS_NET_SERVICE`).
+    pub net_service: Option<&'a Channel>,
+    /// Optional `wlan-service` channel (`AT_HUESOS_WLAN_SERVICE`).
+    pub wlan_service: Option<&'a Channel>,
     /// Optional CPU pinning affinity.
     pub home_cpu: Option<usize>,
     /// Initial user stack size in bytes.
@@ -74,6 +83,8 @@ impl<'a> SpawnCaps<'a> {
             block_dev: None,
             frame_draw: None,
             registry: None,
+            net_service: None,
+            wlan_service: None,
             home_cpu: None,
             stack_size: huesos_abi::USER_STACK_DEFAULT_SIZE,
         }
@@ -282,6 +293,16 @@ fn spawn_elf_with_affinity(
     if !huesos_abi::valid_user_stack_size(caps.stack_size) {
         return Err(crate::ErrorCode::InvalidArgs);
     }
+    if huesos_pe::has_pe64_magic(elf) {
+        let Some(lib_vmo) = lib_vmo else {
+            return Err(crate::ErrorCode::InvalidArgs);
+        };
+        let pe_vmo = Vmo::create(elf.len() as u64)?;
+        pe_vmo.write(0, elf)?;
+        let (process, _vmar, bootstrap) =
+            spawn_pe64_from_vmo(name, &pe_vmo, 0, elf.len() as u64, lib_vmo, caps)?;
+        return Ok((process, bootstrap));
+    }
     let image = parse_elf_headers(elf, elf.len() as u64)?;
     if image.interp.is_none() && image.e_type == ET_DYN {
         return Err(crate::ErrorCode::NotSupported);
@@ -342,6 +363,7 @@ fn spawn_elf_with_affinity(
             &image,
             main_bias,
             at_phdr,
+            None,
         )?;
         return Ok((process, bootstrap));
     }
@@ -460,6 +482,17 @@ fn spawn_elf_from_vmo_inner(
         return Err(crate::ErrorCode::InvalidArgs);
     }
 
+    if let Some(lib_vmo_ref) = lib_vmo {
+        let mut magic_probe = [0u8; 512];
+        let probe_len = (len as usize).min(magic_probe.len());
+        if probe_len >= 64
+            && vmo.read(offset, &mut magic_probe[..probe_len])? == probe_len
+            && huesos_pe::has_pe64_magic(&magic_probe[..probe_len])
+        {
+            return spawn_pe64_from_vmo(name, vmo, offset, len, lib_vmo_ref, caps);
+        }
+    }
+
     let (header_buf, header_len, image) = read_vmo_elf_headers(vmo, offset, len)?;
     if image.interp.is_none() && image.e_type == ET_DYN {
         return Err(crate::ErrorCode::NotSupported);
@@ -518,6 +551,7 @@ fn spawn_elf_from_vmo_inner(
             &image,
             main_bias,
             at_phdr,
+            None,
         )?;
         return Ok((process, root_vmar, bootstrap));
     }
@@ -525,6 +559,131 @@ fn spawn_elf_from_vmo_inner(
     map_initial_stack(&root_vmar, caps.stack_size)?;
     let thread = Thread::create(&process, "main")?;
     let bootstrap = thread.start(image.e_entry, initial_user_rsp(USER_STACK_TOP))?;
+    Ok((process, root_vmar, bootstrap))
+}
+
+struct PeTargetBootstrap<'a> {
+    vmo: &'a Vmo,
+    offset: u64,
+    len: u64,
+}
+
+fn spawn_pe64_from_vmo(
+    name: &str,
+    pe_vmo: &Vmo,
+    pe_offset: u64,
+    pe_len: u64,
+    lib_vmo: &Vmo,
+    caps: &SpawnCaps<'_>,
+) -> crate::Result<(Process, Vmar, Channel)> {
+    let mut hdr_buf = [0u8; 4096];
+    let hdr_len = (pe_len as usize).min(hdr_buf.len());
+    if pe_vmo.read(pe_offset, &mut hdr_buf[..hdr_len])? != hdr_len {
+        return Err(crate::ErrorCode::InvalidArgs);
+    }
+    let _ = huesos_pe::PeImage::parse_headers(&hdr_buf[..hdr_len])
+        .map_err(|_| crate::ErrorCode::InvalidArgs)?;
+
+    // Ensure the PE VMO handle can be duplicated for transfer into `ld-pe.so`
+    // even when a caller hands us a non-duplicable `READ`-only slice handle.
+    let owned_pe_vmo: Option<Vmo> = if pe_vmo
+        .duplicate(rights::READ | rights::TRANSFER | rights::DUPLICATE)
+        .is_ok()
+    {
+        None
+    } else {
+        let copy = Vmo::create(pe_len)?;
+        let mut chunk = [0u8; 4096];
+        let mut copied = 0u64;
+        while copied < pe_len {
+            let step = ((pe_len - copied) as usize).min(chunk.len());
+            let got = pe_vmo.read(pe_offset + copied, &mut chunk[..step])?;
+            if got == 0 {
+                return Err(crate::ErrorCode::InvalidArgs);
+            }
+            copy.write(copied, &chunk[..got])?;
+            copied += got as u64;
+        }
+        Some(copy)
+    };
+    let (pe_vmo_eff, pe_offset_eff) = match owned_pe_vmo.as_ref() {
+        Some(v) => (v, 0u64),
+        None => (pe_vmo, pe_offset),
+    };
+
+    let (loader_off, loader_len) =
+        find_bootfs_entry(lib_vmo, PE_LOADER_BOOTFS_PATH).ok_or(crate::ErrorCode::NotFound)?;
+    let (loader_hdr_buf, loader_hdr_len, loader_image) =
+        read_vmo_elf_headers(lib_vmo, loader_off, loader_len)?;
+    let Some((interp_off, interp_len)) = loader_image.interp else {
+        return Err(crate::ErrorCode::InvalidArgs);
+    };
+    let loader_hdr_slice = &loader_hdr_buf[..loader_hdr_len];
+
+    let loader_bias = if loader_image.e_type == ET_DYN {
+        choose_aslr_base(PE_LOADER_ASLR_BASE).wrapping_sub(loader_image.min_vaddr)
+    } else {
+        0
+    };
+
+    let (process, root_vmar) = Process::create(name)?;
+    process.set_abi(huesos_abi::ProcessAbi::Pe64)?;
+    if let Some(cpu) = caps.home_cpu {
+        process.set_affinity(cpu)?;
+    }
+
+    let mut at_phdr = loader_bias.wrapping_add(loader_image.pt_phdr_vaddr.unwrap_or(0));
+    for idx in 0..usize::from(loader_image.e_phnum) {
+        let ph = read_phdr64(loader_hdr_slice, loader_image.e_phoff, idx)
+            .map_err(|_| crate::ErrorCode::InvalidArgs)?;
+        if ph.p_type == PT_LOAD {
+            if loader_image.pt_phdr_vaddr.is_none()
+                && loader_image.e_phoff >= ph.p_offset
+                && loader_image.e_phoff < ph.p_offset.saturating_add(ph.p_filesz)
+            {
+                at_phdr = loader_bias
+                    .wrapping_add(ph.p_vaddr)
+                    .wrapping_add(loader_image.e_phoff - ph.p_offset);
+            }
+            map_load_segment_from_vmo(
+                &root_vmar,
+                lib_vmo,
+                loader_off,
+                loader_len,
+                loader_bias,
+                ph,
+            )?;
+        }
+    }
+
+    let path_len = usize::try_from(interp_len)
+        .map_err(|_| crate::ErrorCode::InvalidArgs)?
+        .min(192);
+    let mut interp_buf = [0u8; 192];
+    let src_off = loader_off
+        .checked_add(interp_off)
+        .ok_or(crate::ErrorCode::InvalidArgs)?;
+    if lib_vmo.read(src_off, &mut interp_buf[..path_len])? != path_len {
+        return Err(crate::ErrorCode::InvalidArgs);
+    }
+
+    let pe_target = PeTargetBootstrap {
+        vmo: pe_vmo_eff,
+        offset: pe_offset_eff,
+        len: pe_len,
+    };
+    let bootstrap = finish_dynamic_launch(
+        name,
+        &process,
+        &root_vmar,
+        lib_vmo,
+        caps,
+        &interp_buf[..path_len],
+        &loader_image,
+        loader_bias,
+        at_phdr,
+        Some(&pe_target),
+    )?;
     Ok((process, root_vmar, bootstrap))
 }
 
@@ -539,6 +698,7 @@ fn finish_dynamic_launch(
     main_image: &ParsedElfHeader,
     main_bias: u64,
     at_phdr: u64,
+    pe_target: Option<&PeTargetBootstrap<'_>>,
 ) -> crate::Result<Channel> {
     let interp_trimmed = match raw_interp_bytes.iter().position(|&b| b == 0) {
         Some(nul) => &raw_interp_bytes[..nul],
@@ -576,6 +736,7 @@ fn finish_dynamic_launch(
         main_bias.wrapping_add(main_image.e_entry),
         true,
         caps,
+        pe_target,
     )?;
 
     // Duplicate bootstrap capabilities before Thread::start so all handles are
@@ -625,12 +786,31 @@ fn finish_dynamic_launch(
         Some(ch) => Some(ch.handle().duplicate(rights::SAME_RIGHTS)?),
         None => None,
     };
+    let net_svc_dup = match caps.net_service {
+        Some(ch) => Some(ch.handle().duplicate(rights::SAME_RIGHTS)?),
+        None => None,
+    };
+    let wlan_svc_dup = match caps.wlan_service {
+        Some(ch) => Some(ch.handle().duplicate(rights::SAME_RIGHTS)?),
+        None => None,
+    };
+    let pe_vmo_dup = match pe_target {
+        Some(pe) => Some(
+            pe.vmo
+                .duplicate(rights::READ | rights::TRANSFER | rights::DUPLICATE)?
+                .into_handle(),
+        ),
+        None => None,
+    };
 
     let thread = Thread::create(process, "main")?;
     let interp_entry = interp_bias.wrapping_add(interp_image.e_entry);
     let bootstrap = match thread.start(interp_entry, initial_rsp) {
         Ok(ch) => ch,
         Err(err) => {
+            drop(pe_vmo_dup);
+            drop(wlan_svc_dup);
+            drop(net_svc_dup);
             drop(registry_dup);
             drop(frame_draw_dup);
             drop(block_dev_dup);
@@ -645,7 +825,7 @@ fn finish_dynamic_launch(
         }
     };
 
-    let sends: [(&[u8], Option<Handle>); 10] = [
+    let sends: [(&[u8], Option<Handle>); 13] = [
         (LD_BOOTSTRAP_SELF_VMAR_LABEL, Some(vmar_dup)),
         (LD_BOOTSTRAP_LIB_VMO_LABEL, Some(lib_vmo_dup)),
         (LD_BOOTSTRAP_HXFS_DIR_LABEL, hxfs_dir_dup),
@@ -656,6 +836,9 @@ fn finish_dynamic_launch(
         (LD_BOOTSTRAP_BLOCK_DEV_LABEL, block_dev_dup),
         (LD_BOOTSTRAP_FRAME_DRAW_LABEL, frame_draw_dup),
         (LD_BOOTSTRAP_REGISTRY_LABEL, registry_dup),
+        (LD_BOOTSTRAP_NET_SERVICE_LABEL, net_svc_dup),
+        (LD_BOOTSTRAP_WLAN_SERVICE_LABEL, wlan_svc_dup),
+        (LD_BOOTSTRAP_PE_VMO_LABEL, pe_vmo_dup),
     ];
     for (idx, (label, maybe_h)) in sends.into_iter().enumerate() {
         if let Some(handle) = maybe_h {
@@ -764,6 +947,7 @@ fn map_dynamic_initial_stack(
     at_entry: u64,
     has_lib_vmo: bool,
     caps: &SpawnCaps<'_>,
+    pe_target: Option<&PeTargetBootstrap<'_>>,
 ) -> crate::Result<u64> {
     if !huesos_abi::valid_user_stack_size(stack_size) {
         return Err(crate::ErrorCode::InvalidArgs);
@@ -815,7 +999,7 @@ fn map_dynamic_initial_stack(
     top_page[rand_off + 8..rand_off + 16].copy_from_slice(&r1.to_le_bytes());
     let rand_va = top_page_va + rand_off as u64;
 
-    let aux_entries: [(u64, u64); 20] = [
+    let aux_entries: [(u64, u64); 25] = [
         (AT_PHDR, at_phdr),
         (AT_PHENT, u64::from(at_phent)),
         (AT_PHNUM, u64::from(at_phnum)),
@@ -838,6 +1022,14 @@ fn map_dynamic_initial_stack(
         (AT_HUESOS_BLOCK_DEV, u64::from(caps.block_dev.is_some())),
         (AT_HUESOS_FRAME_DRAW, u64::from(caps.frame_draw.is_some())),
         (AT_HUESOS_REGISTRY, u64::from(caps.registry.is_some())),
+        (AT_HUESOS_NET_SERVICE, u64::from(caps.net_service.is_some())),
+        (
+            AT_HUESOS_WLAN_SERVICE,
+            u64::from(caps.wlan_service.is_some()),
+        ),
+        (AT_HUESOS_PE_VMO, u64::from(pe_target.is_some())),
+        (AT_HUESOS_PE_OFFSET, pe_target.map_or(0, |pe| pe.offset)),
+        (AT_HUESOS_PE_LEN, pe_target.map_or(0, |pe| pe.len)),
         (AT_NULL, 0),
     ];
 

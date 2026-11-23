@@ -16,7 +16,10 @@ pub mod lexer;
 pub mod parser;
 pub mod value;
 
-pub use ast::{BootfsAccess, CapsSpec, ChainOp, CmpOp, DirGrant, FbAccess, HxfsAccess, Stmt};
+pub use ast::{
+    BootfsAccess, CapsSpec, ChainOp, CmpOp, DirGrant, FbAccess, HxfsAccess, NetAccess, Stmt,
+    WlanAccess,
+};
 pub use eval::{
     EvalAction, EvalResult, ExecOutcome, HostPathKind, PipelineCommand, ShellEnv, ShellHost,
 };
@@ -313,7 +316,37 @@ mod tests {
                 read_only: true
             })
         );
-        assert_eq!(caps.to_caps_mask(), huesos_abi::auxv::caps_mask::HXFS_RO);
+        assert_eq!(
+            caps.to_caps_mask(),
+            huesos_abi::auxv::caps_mask::HXFS_RO
+                | huesos_abi::auxv::caps_mask::NET_RO
+                | huesos_abi::auxv::caps_mask::NET_RW
+                | huesos_abi::auxv::caps_mask::WLAN_RO
+                | huesos_abi::auxv::caps_mask::WLAN_ADMIN
+        );
+    }
+
+    #[test]
+    fn test_caps_net_and_wlan_attenuation() {
+        let Ok(ro) = CapsSpec::parse("hxfs=none, bootfs=none, fb=none, net=ro, wlan=ro") else {
+            assert!(false, "parse net=ro, wlan=ro");
+            return;
+        };
+        assert_eq!(ro.net, NetAccess::ReadOnly);
+        assert_eq!(ro.wlan, WlanAccess::ReadOnly);
+        assert_eq!(
+            ro.to_caps_mask(),
+            huesos_abi::auxv::caps_mask::NET_RO | huesos_abi::auxv::caps_mask::WLAN_RO
+        );
+
+        let Ok(none) = CapsSpec::parse("hxfs=none, bootfs=none, fb=none, net=none, wlan=none")
+        else {
+            assert!(false, "parse net=none, wlan=none");
+            return;
+        };
+        assert_eq!(none.net, NetAccess::None);
+        assert_eq!(none.wlan, WlanAccess::None);
+        assert_eq!(none.to_caps_mask(), 0);
     }
 
     #[test]

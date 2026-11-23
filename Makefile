@@ -82,7 +82,12 @@ test:
 		-p huesos-tpm \
 		-p huesos-hsh \
 		-p huesos-gpt \
-		--target x86_64-unknown-linux-gnu -Z build-std=
+		-p huesos-pe \
+		-p huesos-net \
+		-p huesos-ieee80211 \
+		-p huesos-wpa \
+		-p huesos-rtw88 \
+		--target x86_64-unknown-linux-gnu
 
 # The ordinary host suite builds huesos-hxfs without optional engines. This
 # second gate is the production storage composition used by the encrypted
@@ -90,7 +95,7 @@ test:
 # three independently green feature sets.
 test-hxfs-features:
 	RUST_MIN_STACK=16777216 cargo test -p huesos-hxfs \
-		--target x86_64-unknown-linux-gnu -Z build-std= \
+		--target x86_64-unknown-linux-gnu \
 		--no-default-features --features crypto-aes-gcm,compression-engines,hxblob
 
 # Current-format image generation + real writer round-trip; legacy stays read-only.
@@ -99,9 +104,9 @@ image-check:
 	python3 tools/test-hxfs-images.py
 	python3 tools/test-gpt-image.py
 	RUST_MIN_STACK=16777216 cargo test --manifest-path tools/hxfs-seed/Cargo.toml \
-		--target x86_64-unknown-linux-gnu -Z build-std=
+		--target x86_64-unknown-linux-gnu
 	cargo clippy --manifest-path tools/hxfs-seed/Cargo.toml --bins \
-		--target x86_64-unknown-linux-gnu -Z build-std= -- -D warnings
+		--target x86_64-unknown-linux-gnu -- -D warnings
 
 # Explicit HxFS v6 -> v7 migration: legacy mounts stay read-only until this
 # journaled host tool publishes v7 Hxblob refcounts and format stamps.

@@ -13,11 +13,15 @@ cargo clippy -p huesos-boot --features boot-selftest \
     -Z build-std=core,compiler_builtins,alloc \
     -Z build-std-features=compiler-builtins-mem -- -D warnings
 
+cargo clippy -p huesos-rtw88 --features boot-selftest \
+    -Z build-std=core,compiler_builtins,alloc \
+    -Z build-std-features=compiler-builtins-mem -- -D warnings
+
 # Production-only Clippy does not compile integration/unit test targets. Keep a
 # separate rustc warning gate for host-testable targets so unused imports and
 # other ordinary warnings in tests cannot hide behind a green Clippy run.
 RUSTFLAGS="-D warnings" cargo check --workspace --tests --exclude huesos-boot \
-    --target x86_64-unknown-linux-gnu -Z build-std=
+    --target x86_64-unknown-linux-gnu
 
 # Standalone userspace crates use include_bytes!(env!(...)) paths normally
 # supplied by huesos-kernel/build.rs. Clippy only type-checks these binaries, so
@@ -72,12 +76,17 @@ done
         cargo clippy --release --features pci-force-legacy -- -D warnings
 )
 
-for program in driver-host-input driver-host-nvme hxfs-service terminal doom fdisk hsh-bin huesos-std coreutils fault-probe dyn-rust-smoke acpi-manager uacpi-runtime pci-manager shutdown-broker key-broker ld-huesos; do
+for program in driver-host-input driver-host-nvme hxfs-service net-service wlan-service terminal doom fdisk hsh-bin huesos-std coreutils fault-probe dyn-rust-smoke acpi-manager uacpi-runtime pci-manager shutdown-broker key-broker ld-huesos ld-pe; do
     (
         cd "crates/huesos-userspace/$program"
         cargo clippy --release -- -D warnings
     )
 done
+
+(
+    cd crates/huesos-userspace/win64-runtime
+    cargo clippy --release --workspace -- -D warnings
+)
 
 (
     cd crates/huesos-userspace/pci-manager
@@ -87,4 +96,14 @@ done
 (
     cd crates/huesos-userspace/acpi-manager
     cargo clippy --release --features restart-smoke -- -D warnings
+)
+
+(
+    cd crates/huesos-userspace/wlan-service
+    cargo clippy --release --features boot-selftest -- -D warnings
+)
+
+(
+    cd crates/huesos-userspace/hsh-bin
+    cargo clippy --release --features boot-selftest -- -D warnings
 )

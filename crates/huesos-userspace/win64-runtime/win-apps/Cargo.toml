@@ -1,0 +1,23 @@
+[package]
+name = "win-apps"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "win_sdk"
+path = "src/lib.rs"
+
+[[bin]]
+name = "win-hello"
+path = "src/bin/win_hello.rs"
+
+[[bin]]
+name = "win-threads"
+path = "src/bin/win_threads.rs"
+
+[[bin]]
+name = "win-bench"
+path = "src/bin/win_bench.rs"
+
+[dependencies]
+huesos-pe = { path = "../../../huesos-pe" }

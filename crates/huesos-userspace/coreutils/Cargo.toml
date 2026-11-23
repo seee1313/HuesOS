@@ -171,6 +171,22 @@ path = "src/bin/basename.rs"
 name = "dirname"
 path = "src/bin/dirname.rs"
 
+[[bin]]
+name = "ping"
+path = "src/bin/ping.rs"
+
+[[bin]]
+name = "curl"
+path = "src/bin/curl.rs"
+
+[[bin]]
+name = "netctl"
+path = "src/bin/netctl.rs"
+
+[[bin]]
+name = "wlanctl"
+path = "src/bin/wlanctl.rs"
+
 [dependencies]
 libcanvas = { path = "../libcanvas", default-features = false, features = ["dyn-client"] }
 huesos-abi = { path = "../../huesos-abi" }

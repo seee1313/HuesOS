@@ -14,8 +14,9 @@ const MEMMAP_ACPI_RECLAIMABLE: u64 = 2;
 const MEMMAP_ACPI_NVS: u64 = 3;
 /// Some Limine builds also expose this as type 8 (ACPI tables / mapped reserved).
 const MEMMAP_ACPI_TABLES_OR_MAPPED_RESERVED: u64 = 8;
-/// Stage-A storage target: a single 64 MiB physically contiguous DMA pool.
-const BOOT_DMA_POOL_LEN: u64 = 64 * 1024 * 1024;
+/// Stage-A storage + network/WLAN target: 72 MiB physically contiguous `< 4 GiB`
+/// DMA pool (`[0..64 MiB)` NVMe, `[64..68 MiB)` virtio-net, `[68..72 MiB)` rtw88).
+const BOOT_DMA_POOL_LEN: u64 = 72 * 1024 * 1024;
 /// Prefer a 2 MiB-aligned base so later huge-page/IOMMU mappings can reuse the
 /// same aperture without moving the pool.
 const BOOT_DMA_POOL_ALIGN: u64 = 2 * 1024 * 1024;
@@ -249,6 +250,8 @@ pub fn syscall_init() {
     huesos_syscalls::set_thread_start_ex_fn(crate::process::start_thread_ex);
     huesos_syscalls::set_thread_exit_fn(crate::scheduler::exit_current_thread);
     huesos_syscalls::set_thread_set_fs_base_fn(crate::scheduler::set_current_fs_base);
+    huesos_syscalls::set_thread_set_gs_base_fn(crate::scheduler::set_current_gs_base);
+    huesos_syscalls::set_thread_get_gs_base_fn(crate::scheduler::get_current_gs_base);
     huesos_syscalls::set_process_terminate_fn(crate::scheduler::terminate_process_by_koid);
     seed_kernel_entropy();
     huesos_arch::irq_callback::set_irq_callback(handle_irq);

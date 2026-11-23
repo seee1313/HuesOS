@@ -2302,3 +2302,20 @@ pub extern "C" fn canvas_take_cap_handle(kind: u32) -> u32 {
         None => crate::INVALID_HANDLE,
     }
 }
+
+/// Read the `(offset, len)` span of the target PE32+ `.exe` in `PeVmo`.
+///
+/// # Safety
+/// `out_offset` and `out_len` must be valid writable pointers if non-null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn canvas_pe_image_span(out_offset: *mut u64, out_len: *mut u64) {
+    let (off, len) = crate::stdio::pe_image_span();
+    unsafe {
+        if !out_offset.is_null() {
+            *out_offset = off;
+        }
+        if !out_len.is_null() {
+            *out_len = len;
+        }
+    }
+}

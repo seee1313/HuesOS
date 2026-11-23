@@ -73,6 +73,12 @@ pub type ThreadStartExFn = fn(&huesos_object::Thread, u64, u64, u64, u64) -> Res
 /// Kernel callback type used by `ThreadSetFsBase` to update the calling
 /// thread's `MSR_FS_BASE`.
 pub type ThreadSetFsBaseFn = fn(u64) -> Result<(), ErrorCode>;
+/// Kernel callback type used by `ThreadSetGsBase` to update the calling
+/// thread's Ring-3 `GS_BASE` (`IA32_KERNEL_GS_BASE`).
+pub type ThreadSetGsBaseFn = fn(u64) -> Result<(), ErrorCode>;
+/// Kernel callback type used by `ThreadGetGsBase` to read the calling
+/// thread's Ring-3 `GS_BASE`.
+pub type ThreadGetGsBaseFn = fn() -> Result<u64, ErrorCode>;
 /// Kernel callback type used by `ProcessTerminate` to end a *foreign*
 /// process. The koid names the victim; the code is the exit status every
 /// `ProcessWait` observer must wake with.
@@ -102,6 +108,10 @@ pub(crate) static THREAD_START_EX_FN: Mutex<Option<ThreadStartExFn>> = Mutex::ne
 pub(crate) static THREAD_EXIT_FN: Mutex<Option<fn(i64) -> !>> = Mutex::new(None);
 /// Global thread `FS_BASE` callback (set by the kernel scheduler).
 pub(crate) static THREAD_SET_FS_BASE_FN: Mutex<Option<ThreadSetFsBaseFn>> = Mutex::new(None);
+/// Global thread `GS_BASE` update callback (set by the kernel scheduler).
+pub(crate) static THREAD_SET_GS_BASE_FN: Mutex<Option<ThreadSetGsBaseFn>> = Mutex::new(None);
+/// Global thread `GS_BASE` query callback (set by the kernel scheduler).
+pub(crate) static THREAD_GET_GS_BASE_FN: Mutex<Option<ThreadGetGsBaseFn>> = Mutex::new(None);
 /// Global foreign-process terminate callback (set by the kernel scheduler).
 pub(crate) static PROCESS_TERMINATE_FN: Mutex<Option<ProcessTerminateFn>> = Mutex::new(None);
 
@@ -229,4 +239,14 @@ pub fn set_process_terminate_fn(f: ProcessTerminateFn) {
 /// Set the thread `FS_BASE` update function. Called once by kernel init.
 pub fn set_thread_set_fs_base_fn(f: ThreadSetFsBaseFn) {
     *THREAD_SET_FS_BASE_FN.lock() = Some(f);
+}
+
+/// Set the thread `GS_BASE` update function. Called once by kernel init.
+pub fn set_thread_set_gs_base_fn(f: ThreadSetGsBaseFn) {
+    *THREAD_SET_GS_BASE_FN.lock() = Some(f);
+}
+
+/// Set the thread `GS_BASE` query function. Called once by kernel init.
+pub fn set_thread_get_gs_base_fn(f: ThreadGetGsBaseFn) {
+    *THREAD_GET_GS_BASE_FN.lock() = Some(f);
 }

@@ -118,22 +118,30 @@ impl BootFs {
     }
 
     /// Resolve `name` the way the shell does: an absolute path first, then
-    /// `/bin/<name>` and `/bin/<name>.elf`.
+    /// `/bin/<name>`, `/bin/<name>.elf`, and `/bin/<name>.exe`.
     pub fn resolve(&self, name: &str) -> Option<&Entry> {
         if name.starts_with('/') {
             if let Some(entry) = self.find(name) {
                 return Some(entry);
             }
-            // `/bin/ls` and `/bin/ls.elf` name the same file.
-            let with_suffix = alloc::format!("{name}.elf");
-            return self.find(&with_suffix);
+            // `/bin/ls` and `/bin/ls.elf` (or `/bin/win-hello.exe`) name the same file.
+            let with_elf = alloc::format!("{name}.elf");
+            if let Some(entry) = self.find(&with_elf) {
+                return Some(entry);
+            }
+            let with_exe = alloc::format!("{name}.exe");
+            return self.find(&with_exe);
         }
         let direct = alloc::format!("/bin/{name}");
         if let Some(entry) = self.find(&direct) {
             return Some(entry);
         }
-        let with_suffix = alloc::format!("{direct}.elf");
-        self.find(&with_suffix)
+        let with_elf = alloc::format!("{direct}.elf");
+        if let Some(entry) = self.find(&with_elf) {
+            return Some(entry);
+        }
+        let with_exe = alloc::format!("{direct}.exe");
+        self.find(&with_exe)
     }
 
     /// Every `/bin` program in the image, sorted.

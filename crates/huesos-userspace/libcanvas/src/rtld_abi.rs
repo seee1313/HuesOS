@@ -148,4 +148,16 @@ pub struct ProcessBootstrapInfo {
     pub bootfs_vmo: u32,
     /// Capability handle for `DriverManager` query/registry channel (`INVALID_HANDLE` if absent).
     pub registry_ch: u32,
+    /// Capability handle for `net-service` (`Plan 9 /net`) channel (`INVALID_HANDLE` if absent).
+    pub net_service_ch: u32,
+    /// Capability handle for `wlan-service` channel (`INVALID_HANDLE` if absent).
+    pub wlan_service_ch: u32,
+    /// Target PE32+ `.exe` VMO handle when launching `/lib/ld-pe.so` (`INVALID_HANDLE` otherwise).
+    pub pe_vmo: u32,
+    /// Self root VMAR handle retained exclusively for `/lib/ld-pe.so` (`INVALID_HANDLE` otherwise).
+    pub pe_self_vmar: u32,
+    /// Byte offset of the target PE32+ `.exe` inside `pe_vmo`.
+    pub pe_offset: u64,
+    /// Byte length of the target PE32+ `.exe` inside `pe_vmo`.
+    pub pe_len: u64,
 }

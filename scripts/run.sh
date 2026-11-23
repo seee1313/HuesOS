@@ -52,6 +52,7 @@ exec qemu-system-x86_64 \
     -bios "$OVMF" \
     -cdrom "$ISO" \
     "${disk_args[@]}" \
-    -net none \
+    -netdev user,id=n0 \
+    -device virtio-net-pci,netdev=n0,disable-legacy=off,disable-modern=on \
     -serial stdio \
     -no-reboot -no-shutdown

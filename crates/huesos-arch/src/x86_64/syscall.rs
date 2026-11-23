@@ -112,7 +112,8 @@ unsafe extern "C" {
 global_asm!(
     ".global syscall_entry",
     "syscall_entry:",
-    // Swap to kernel stack, remembering the user one.
+    // Swap Ring-3 GS_BASE with IA32_KERNEL_GS_BASE (&CpuLocal), then switch to kernel stack.
+    "swapgs",
     "mov gs:[40], rsp",
     "mov rsp, gs:[48]",
     "push qword ptr gs:[40]", // user_rsp
@@ -139,5 +140,6 @@ global_asm!(
     "pop rcx", // user_rip
     "pop r11", // user_rflags
     "pop rsp", // restore user rsp last
+    "swapgs",
     "sysretq",
 );

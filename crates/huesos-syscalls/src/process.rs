@@ -10,8 +10,8 @@ use huesos_object::{Handle, KernelObject, KernelObjectExt, Rights};
 use crate::{
     callbacks::{
         CPU_ONLINE_FN, EXIT_FN, PROCESS_CREATE_FN, PROCESS_CREATE_IN_JOB_FN, PROCESS_TERMINATE_FN,
-        THREAD_EXIT_FN, THREAD_SET_FS_BASE_FN, THREAD_START_EX_FN, THREAD_START_FN, VMAR_MAP_FN,
-        VMAR_PROTECT_FN, VMAR_UNMAP_FN, YIELD_FN,
+        THREAD_EXIT_FN, THREAD_GET_GS_BASE_FN, THREAD_SET_FS_BASE_FN, THREAD_SET_GS_BASE_FN,
+        THREAD_START_EX_FN, THREAD_START_FN, VMAR_MAP_FN, VMAR_PROTECT_FN, VMAR_UNMAP_FN, YIELD_FN,
     },
     user_memory,
     util::{current_proc, DeferGuard},
@@ -711,6 +711,39 @@ pub(crate) fn sys_thread_set_fs_base(fs_base: u64) -> SyscallResult {
     Ok(0)
 }
 
+pub(crate) fn sys_thread_set_gs_base(gs_base: u64) -> SyscallResult {
+    if gs_base >= huesos_abi::USER_ASPACE_END {
+        return Err(ErrorCode::InvalidArgs);
+    }
+    let set_gs = (*THREAD_SET_GS_BASE_FN.lock()).ok_or(ErrorCode::NotSupported)?;
+    set_gs(gs_base)?;
+    Ok(0)
+}
+
+pub(crate) fn sys_thread_get_gs_base(out_gs: *mut u64) -> SyscallResult {
+    user_memory::validate_write(out_gs)?;
+    let get_gs = (*THREAD_GET_GS_BASE_FN.lock()).ok_or(ErrorCode::NotSupported)?;
+    let val = get_gs()?;
+    user_memory::write_value(out_gs, &val)?;
+    Ok(0)
+}
+
+pub(crate) fn sys_process_set_abi(handle: HandleValue, raw_abi: u64) -> SyscallResult {
+    let abi = huesos_abi::ProcessAbi::from_raw(raw_abi).ok_or(ErrorCode::InvalidArgs)?;
+    let caller = current_proc()?;
+    if handle == 0 {
+        caller.set_abi(abi);
+        return Ok(0);
+    }
+    let h = caller.handles.get(handle).ok_or(ErrorCode::BadHandle)?;
+    if !h.has_rights(Rights::WRITE) {
+        return Err(ErrorCode::AccessDenied);
+    }
+    let target = huesos_object::lookup_process(h.koid).ok_or(ErrorCode::WrongType)?;
+    target.set_abi(abi);
+    Ok(0)
+}
+
 pub(crate) fn sys_process_self(out_process: *mut HandleValue) -> SyscallResult {
     user_memory::validate_write(out_process)?;
     let proc = current_proc()?;
@@ -860,6 +893,22 @@ mod tests {
         );
         assert_eq!(
             super::sys_thread_set_fs_base(u64::MAX),
+            Err(ErrorCode::InvalidArgs)
+        );
+    }
+
+    #[test]
+    fn thread_set_gs_base_rejects_noncanonical_and_kernel_addresses() {
+        assert_eq!(
+            super::sys_thread_set_gs_base(huesos_abi::USER_ASPACE_END),
+            Err(ErrorCode::InvalidArgs)
+        );
+        assert_eq!(
+            super::sys_thread_set_gs_base(0xffff_8000_0000_0000),
+            Err(ErrorCode::InvalidArgs)
+        );
+        assert_eq!(
+            super::sys_thread_set_gs_base(u64::MAX),
             Err(ErrorCode::InvalidArgs)
         );
     }

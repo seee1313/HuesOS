@@ -48,6 +48,10 @@ name = "huesos-pci"
 version = "0.1.0"
 
 [[package]]
+name = "huesos-pe"
+version = "0.1.0"
+
+[[package]]
 name = "huesos-scudo"
 version = "0.1.0"
 
@@ -68,6 +72,7 @@ dependencies = [
  "huesos-abi",
  "huesos-blobfs",
  "huesos-elf",
+ "huesos-pe",
  "huesos-scudo",
  "spin",
 ]

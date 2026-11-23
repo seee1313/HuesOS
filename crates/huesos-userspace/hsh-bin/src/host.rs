@@ -14,8 +14,8 @@ use huesos_abi::auxv::caps_mask;
 use huesos_abi::hxfs::rights as hxfs_rights;
 use huesos_abi::term_ipc::{hsh_to_term, put_u16, term_to_hsh, MAX_WRITE_CHUNK};
 use huesos_hsh::{
-    CapsSpec, ExecOutcome, FbAccess, HostPathKind, HxfsAccess, PipelineCommand, ShellHost, Table,
-    Value,
+    CapsSpec, ExecOutcome, FbAccess, HostPathKind, HxfsAccess, NetAccess, PipelineCommand,
+    ShellHost, Table, Value, WlanAccess,
 };
 use libcanvas::process::{spawn_elf_from_vmo_with_caps, Process, SpawnCaps};
 use libcanvas::{wait_any, Channel, ErrorCode, Handle, Hxfs, Signals, Vmo, WaitItem};
@@ -106,8 +106,12 @@ pub struct HshHost {
     pub registry: Option<Channel>,
     pub hxfs: Option<Hxfs>,
     pub block_dev: Option<Channel>,
+    pub net_svc: Option<Channel>,
+    pub wlan_svc: Option<Channel>,
     block_unavailable: bool,
     hxfs_unavailable: bool,
+    net_unavailable: bool,
+    wlan_unavailable: bool,
     pub bootfs: Option<Vmo>,
     pub frame_draw: Option<Handle>,
     pub pwd: String,
@@ -247,12 +251,36 @@ fn command_uses_block_device(resolved: &str) -> bool {
     )
 }
 
+fn strip_exec_ext(base: &str) -> &str {
+    base.strip_suffix(".elf")
+        .or_else(|| base.strip_suffix(".exe"))
+        .unwrap_or(base)
+}
+
 fn command_uses_query_channel(resolved: &str) -> bool {
     let base = resolved.rsplit('/').next().unwrap_or(resolved);
-    let stem = base.strip_suffix(".elf").unwrap_or(base);
+    let stem = strip_exec_ext(base);
     matches!(
         stem,
-        "pci" | "acpi" | "ps" | "btop" | "std_smoke" | "std-smoke"
+        "pci" | "acpi" | "ps" | "btop" | "netctl" | "wlanctl" | "std_smoke" | "std-smoke"
+    )
+}
+
+fn command_uses_net_service(resolved: &str) -> bool {
+    let base = resolved.rsplit('/').next().unwrap_or(resolved);
+    let stem = strip_exec_ext(base);
+    matches!(
+        stem,
+        "ping" | "curl" | "netctl" | "wlanctl" | "btop" | "hsh" | "std_smoke" | "std-smoke"
+    )
+}
+
+fn command_uses_wlan_service(resolved: &str) -> bool {
+    let base = resolved.rsplit('/').next().unwrap_or(resolved);
+    let stem = strip_exec_ext(base);
+    matches!(
+        stem,
+        "wlanctl" | "netctl" | "btop" | "hsh" | "std_smoke" | "std-smoke"
     )
 }
 
@@ -291,8 +319,12 @@ impl HshHost {
             registry,
             hxfs: hxfs_svc.map(Hxfs::from_channel),
             block_dev,
+            net_svc: None,
+            wlan_svc: None,
             block_unavailable: false,
             hxfs_unavailable: false,
+            net_unavailable: false,
+            wlan_unavailable: false,
             bootfs,
             frame_draw,
             pwd: String::from("/"),
@@ -315,6 +347,11 @@ impl HshHost {
         };
         host.try_connect_hxfs();
         host
+    }
+
+    pub fn set_net_wlan_caps(&mut self, net_svc: Option<Channel>, wlan_svc: Option<Channel>) {
+        self.net_svc = net_svc;
+        self.wlan_svc = wlan_svc;
     }
 
     pub fn caps_summary(&mut self) -> String {
@@ -526,6 +563,78 @@ impl HshHost {
         None
     }
 
+    fn open_net_fresh(&mut self, read_only: bool) -> Option<Channel> {
+        let req: &[u8] = if read_only {
+            b"open:net:ro"
+        } else {
+            b"open:net"
+        };
+        if !self.net_unavailable {
+            if let Some(reg) = self.registry.as_ref() {
+                self.drain_registry();
+                if reg.write(req).is_ok() {
+                    let mut buf = [0u8; 64];
+                    for _ in 0..HANDSHAKE_READS {
+                        match reg.read_optional_handle_timeout(&mut buf, HANDSHAKE_WAIT_TICKS) {
+                            Ok((n, Some(handle))) if &buf[..n] == b"service:net:channel" => {
+                                return Some(Channel::from_handle(handle));
+                            }
+                            Ok((n, None)) if buf[..n].starts_with(b"err:net") => {
+                                self.net_unavailable = true;
+                                break;
+                            }
+                            Ok((_n, Some(handle))) => drop(handle),
+                            Ok((_n, None)) => {}
+                            Err(ErrorCode::ShouldWait) | Err(ErrorCode::TimedOut) => {}
+                            Err(_) => break,
+                        }
+                    }
+                }
+            }
+        }
+        if read_only {
+            None
+        } else {
+            self.net_svc.as_ref().and_then(|ch| ch.duplicate().ok())
+        }
+    }
+
+    fn open_wlan_fresh(&mut self, read_only: bool) -> Option<Channel> {
+        let req: &[u8] = if read_only {
+            b"open:wlan:ro"
+        } else {
+            b"open:wlan"
+        };
+        if !self.wlan_unavailable {
+            if let Some(reg) = self.registry.as_ref() {
+                self.drain_registry();
+                if reg.write(req).is_ok() {
+                    let mut buf = [0u8; 64];
+                    for _ in 0..HANDSHAKE_READS {
+                        match reg.read_optional_handle_timeout(&mut buf, HANDSHAKE_WAIT_TICKS) {
+                            Ok((n, Some(handle))) if &buf[..n] == b"service:wlan:channel" => {
+                                return Some(Channel::from_handle(handle));
+                            }
+                            Ok((n, None)) if buf[..n].starts_with(b"err:wlan") => {
+                                self.wlan_unavailable = true;
+                                break;
+                            }
+                            Ok((_n, Some(handle))) => drop(handle),
+                            Ok((_n, None)) => {}
+                            Err(ErrorCode::ShouldWait) | Err(ErrorCode::TimedOut) => {}
+                            Err(_) => break,
+                        }
+                    }
+                }
+            }
+        }
+        if read_only {
+            None
+        } else {
+            self.wlan_svc.as_ref().and_then(|ch| ch.duplicate().ok())
+        }
+    }
+
     pub fn iter_bootfs_entries(&self) -> Vec<(String, u64, u64)> {
         let mut entries = Vec::new();
         let Some(vmo) = self.bootfs.as_ref() else {
@@ -565,7 +674,10 @@ impl HshHost {
         for (path, _, _) in self.iter_bootfs_entries() {
             if let Some(rest) = path.strip_prefix("/bin/") {
                 out.push(String::from(rest));
-                if let Some(short) = rest.strip_suffix(".elf") {
+                if let Some(short) = rest
+                    .strip_suffix(".elf")
+                    .or_else(|| rest.strip_suffix(".exe"))
+                {
                     out.push(String::from(short));
                 }
             }
@@ -714,10 +826,25 @@ impl HshHost {
     /// `dd if=/dev/zero bs=512` need, and what `cat welcome.txt` also gets.
     fn resolve_arguments(&self, name: &str, args: &[String]) -> Vec<String> {
         let base = name.rsplit('/').next().unwrap_or(name);
-        let cmd = base.strip_suffix(".elf").unwrap_or(base);
+        let cmd = strip_exec_ext(base);
         /// Tools that take no path arguments at all.
         const NO_PATH_ARGS: &[&str] = &[
-            "hxfs", "pci", "acpi", "ps", "sleep", "schedctl", "seq", "basename", "dirname",
+            "hxfs",
+            "pci",
+            "acpi",
+            "ps",
+            "sleep",
+            "schedctl",
+            "seq",
+            "basename",
+            "dirname",
+            "ping",
+            "curl",
+            "netctl",
+            "wlanctl",
+            "win-hello",
+            "win-threads",
+            "win-bench",
         ];
         let mut owned: Vec<String> = Vec::with_capacity(args.len() + 1);
         if NO_PATH_ARGS.contains(&cmd) {
@@ -847,13 +974,15 @@ impl HshHost {
         let mut candidates = Vec::new();
         if name.starts_with('/') {
             candidates.push(String::from(name));
-            if !name.ends_with(".elf") {
+            if !name.ends_with(".elf") && !name.ends_with(".exe") {
                 candidates.push(format!("{name}.elf"));
+                candidates.push(format!("{name}.exe"));
             }
         } else {
             candidates.push(format!("/bin/{name}"));
-            if !name.ends_with(".elf") {
+            if !name.ends_with(".elf") && !name.ends_with(".exe") {
                 candidates.push(format!("/bin/{name}.elf"));
+                candidates.push(format!("/bin/{name}.exe"));
             }
         }
 
@@ -875,9 +1004,11 @@ impl HshHost {
             for cand in &candidates {
                 for (path, off, len) in &bootfs_entries {
                     if path == cand {
-                        if let Ok(dup) =
-                            bootfs.duplicate(libcanvas::rights::READ | libcanvas::rights::TRANSFER)
-                        {
+                        if let Ok(dup) = bootfs.duplicate(
+                            libcanvas::rights::READ
+                                | libcanvas::rights::TRANSFER
+                                | libcanvas::rights::DUPLICATE,
+                        ) {
                             return Some((dup, *off, *len, cand.clone()));
                         }
                     }
@@ -913,6 +1044,8 @@ impl HshHost {
         let mut svc_holder: Option<Channel> = None;
         let mut blk_holder: Option<Channel> = None;
         let mut query_holder: Option<Channel> = None;
+        let mut net_holder: Option<Channel> = None;
+        let mut wlan_holder: Option<Channel> = None;
 
         if let Some(spec) = caps {
             if let Some(dir_grant) = &spec.dir {
@@ -946,6 +1079,12 @@ impl HshHost {
             if (mask & caps_mask::QUERY_RO) != 0 && command_uses_query_channel(&resolved) {
                 query_holder = self.open_query_fresh();
             }
+            if spec.net != NetAccess::None && command_uses_net_service(&resolved) {
+                net_holder = self.open_net_fresh(spec.net == NetAccess::ReadOnly);
+            }
+            if spec.wlan != WlanAccess::None && command_uses_wlan_service(&resolved) {
+                wlan_holder = self.open_wlan_fresh(spec.wlan == WlanAccess::ReadOnly);
+            }
         } else {
             if let Some(hxfs) = self.hxfs.as_ref() {
                 if let Ok(d) = hxfs.root_with_rights(hxfs_rights::ALL) {
@@ -958,6 +1097,12 @@ impl HshHost {
             }
             if command_uses_query_channel(&resolved) {
                 query_holder = self.open_query_fresh();
+            }
+            if command_uses_net_service(&resolved) {
+                net_holder = self.open_net_fresh(false);
+            }
+            if command_uses_wlan_service(&resolved) {
+                wlan_holder = self.open_wlan_fresh(false);
             }
         }
 
@@ -1008,6 +1153,8 @@ impl HshHost {
         spawn_caps.block_dev = blk_holder.as_ref();
         spawn_caps.frame_draw = frame_draw;
         spawn_caps.registry = query_holder.as_ref();
+        spawn_caps.net_service = net_holder.as_ref();
+        spawn_caps.wlan_service = wlan_holder.as_ref();
 
         let spawned =
             spawn_elf_from_vmo_with_caps(&resolved, &elf_vmo, off, len, lib_vmo, &spawn_caps);
@@ -1015,6 +1162,8 @@ impl HshHost {
         drop(svc_holder);
         drop(blk_holder);
         drop(query_holder);
+        drop(net_holder);
+        drop(wlan_holder);
         drop(elf_vmo);
 
         let (process, child_bootstrap) = spawned.map_err(|error| {
@@ -2518,11 +2667,12 @@ impl ShellHost for HshHost {
                 "  pipes: | where <col> <op> <val> | select <cols> | sort [--desc] [col] | head [n] | tail [n] | count | grep <pat>\n",
                 "  jobs:  command & | jobs | fg [%job] | wait [%job|koid] | kill <%job|koid>\n",
                 "  lang:  let x = ...; x = $((x + 1)); if/elif/else; while ... { break; continue }; for x in [...]; fn f(a) { ... }\n",
-                "  caps:  @caps(hxfs=none|ro|rw, bootfs=ro|none, fb=none|ro, dir=/sub:ro) <cmd>\n",
-                "  apps:  doom | snake [hard] | btop | nano <file> | font <cozette|tty|compact> | shutdown\n",
-                "external /bin/*.elf utilities:\n",
+                "  caps:  @caps(hxfs=none|ro|rw, bootfs=ro|none, fb=none|ro, net=none|ro|rw, wlan=none|ro|admin, dir=/sub:ro) <cmd>\n",
+                "  apps:  doom | snake [hard] | btop | wlanctl | nano <file> | font <cozette|tty|compact> | shutdown\n",
+                "external /bin/*.{elf,exe} utilities:\n",
                 "  ls | cat | stat | touch | mkdir | rm | mv | cp | ln | chmod | readlink | write | find | grep | head | tail | wc | sort | uniq\n",
-                "  seq | tee | basename | dirname | sha256sum | tar | hexdump | dd | df | du | lsblk | fdisk | mkfs | fsck | hxfs | ps | schedctl | pci | acpi | sleep"
+                "  seq | tee | basename | dirname | sha256sum | tar | hexdump | dd | df | du | lsblk | fdisk | mkfs | fsck | hxfs | ps | schedctl | pci | acpi | sleep\n",
+                "  ping | curl | netctl | wlanctl"
             )),
             "pwd" => ExecOutcome::ok_text(self.pwd.clone()),
             "cd" => {

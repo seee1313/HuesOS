@@ -26,12 +26,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "huesos-pe"
+version = "0.1.0"
+
+[[package]]
 name = "libcanvas"
 version = "0.1.0"
 dependencies = [
  "huesos-abi",
  "huesos-blobfs",
  "huesos-elf",
+ "huesos-pe",
  "spin",
 ]
 

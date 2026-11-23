@@ -1771,10 +1771,17 @@ fn record_task(slot: usize, task: Option<&Task>, cpu: usize, state: u8) {
     if slot >= huesos_sched::MAX_TASKS {
         return;
     }
-    let (kind, process_koid) = match &task.kind {
-        TaskKind::Kernel => (0u8, 0u64),
-        TaskKind::User { process, .. } => (1u8, process.koid().0),
-        TaskKind::Reaped => (0u8, 0u64),
+    let (kind, process_koid, flags) = match &task.kind {
+        TaskKind::Kernel => (0u8, 0u64, 0u8),
+        TaskKind::User { process, .. } => {
+            let abi_flag = if process.abi() == huesos_abi::ProcessAbi::Pe64 {
+                huesos_abi::TASK_FLAG_ABI_PE64
+            } else {
+                0
+            };
+            (1u8, process.koid().0, abi_flag)
+        }
+        TaskKind::Reaped => (0u8, 0u64, 0u8),
     };
     let (policy, weight) = match task.sched_policy {
         SchedPolicy::Fair { weight } => (0u8, weight.min(u64::from(u16::MAX)) as u16),
@@ -1790,7 +1797,7 @@ fn record_task(slot: usize, task: Option<&Task>, cpu: usize, state: u8) {
         kind,
         state,
         policy,
-        flags: 0,
+        flags,
         reserved: process_koid,
     });
 }
@@ -2263,6 +2270,41 @@ pub fn set_current_fs_base(fs_base: u64) -> Result<(), huesos_abi::ErrorCode> {
     task.task.context.fs_base = fs_base;
     huesos_arch::context_switch::write_fs_base(fs_base);
     Ok(())
+}
+
+/// Update the calling user thread's Ring-3 `GS_BASE` (`IA32_KERNEL_GS_BASE`)
+/// after canonical lower-half validation, and refresh its published `TaskRecord`
+/// so `PE64` ABI changes take effect immediately in `ps`/`btop`/`schedctl`.
+pub fn set_current_gs_base(gs_base: u64) -> Result<(), huesos_abi::ErrorCode> {
+    if gs_base >= huesos_abi::USER_ASPACE_END {
+        return Err(huesos_abi::ErrorCode::InvalidArgs);
+    }
+    let cpu = cpu_id();
+    let mut scheduler = PER_CPU_SCHEDULERS[cpu].lock();
+    scheduler.assert_owner();
+    let Some(slot_index) = scheduler.current else {
+        return Err(huesos_abi::ErrorCode::NotFound);
+    };
+    let Some(task) = scheduler.task_mut(slot_index) else {
+        return Err(huesos_abi::ErrorCode::NotFound);
+    };
+    task.task.context.gs_base = gs_base;
+    huesos_arch::context_switch::write_user_gs_base(gs_base);
+    record_task(slot_index, Some(&task.task), cpu, 0);
+    Ok(())
+}
+
+/// Read the calling user thread's Ring-3 `GS_BASE`.
+pub fn get_current_gs_base() -> Result<u64, huesos_abi::ErrorCode> {
+    let scheduler = PER_CPU_SCHEDULERS[cpu_id()].lock();
+    scheduler.assert_owner();
+    let Some(slot_index) = scheduler.current else {
+        return Err(huesos_abi::ErrorCode::NotFound);
+    };
+    let Some(task) = scheduler.task(slot_index) else {
+        return Err(huesos_abi::ErrorCode::NotFound);
+    };
+    Ok(task.task.context.gs_base)
 }
 
 /// Mark a user task's initial entry record consumed after its trampoline runs.

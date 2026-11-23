@@ -100,12 +100,57 @@ pub fn init() {
     IDT.load();
 }
 
+/// RAII guard maintaining the Ring-0 `GS_BASE == &CpuLocal` invariant across
+/// every IDT exception and interrupt entry/exit.
+///
+/// When `(frame.code_segment.0 & 3) == 3`, the CPU interrupted Ring-3 code
+/// whose `IA32_GS_BASE` holds the thread's user `GS_BASE` (e.g. a Win64 `TEB`)
+/// while `&CpuLocal` sits in `IA32_KERNEL_GS_BASE`. Executing `swapgs` on entry
+/// and again on `Drop` before `iretq` matches `syscall_entry` across preemptive
+/// context switches as well as normal returns.
+pub(super) struct SwapGsGuard {
+    swapped: bool,
+}
+
+impl SwapGsGuard {
+    #[inline(always)]
+    pub(super) fn new(frame: &InterruptStackFrame) -> Self {
+        let from_ring3 = (frame.code_segment.0 & 3) == 3;
+        if from_ring3 {
+            // SAFETY: interrupt gates enter with IF=0; when interrupted CPL==3,
+            // `IA32_KERNEL_GS_BASE` holds `&CpuLocal` and `IA32_GS_BASE` holds
+            // the interrupted thread's user `GS_BASE`.
+            unsafe {
+                core::arch::asm!("swapgs", options(nomem, nostack, preserves_flags));
+            }
+        }
+        Self {
+            swapped: from_ring3,
+        }
+    }
+}
+
+impl Drop for SwapGsGuard {
+    #[inline(always)]
+    fn drop(&mut self) {
+        if self.swapped {
+            // SAFETY: pairs symmetrically with the Ring-3 entry `swapgs` just
+            // before the enclosing `x86-interrupt` handler executes `iretq`.
+            unsafe {
+                core::arch::asm!("swapgs", options(nomem, nostack, preserves_flags));
+            }
+        }
+    }
+}
+
 extern "x86-interrupt" fn divide_error_handler(frame: InterruptStackFrame) {
+    let _gs = SwapGsGuard::new(&frame);
     super::cpu::clear_user_access();
     dispatch(fault_info(FaultKind::DivideError, &frame, 0, 0));
 }
 
-extern "x86-interrupt" fn breakpoint_handler(_frame: InterruptStackFrame) {
+extern "x86-interrupt" fn breakpoint_handler(frame: InterruptStackFrame) {
+    let _gs = SwapGsGuard::new(&frame);
     super::cpu::clear_user_access();
     // INT3 is deliberately non-fatal for now. A debugger hook can replace
     // this behavior later; returning resumes immediately after the trap.
@@ -113,6 +158,7 @@ extern "x86-interrupt" fn breakpoint_handler(_frame: InterruptStackFrame) {
 }
 
 extern "x86-interrupt" fn invalid_opcode_handler(frame: InterruptStackFrame) {
+    let _gs = SwapGsGuard::new(&frame);
     super::cpu::clear_user_access();
     dispatch(fault_info(FaultKind::InvalidOpcode, &frame, 0, 0));
 }
@@ -121,6 +167,7 @@ extern "x86-interrupt" fn general_protection_fault_handler(
     frame: InterruptStackFrame,
     error_code: u64,
 ) {
+    let _gs = SwapGsGuard::new(&frame);
     super::cpu::clear_user_access();
     dispatch(fault_info(
         FaultKind::GeneralProtection,
@@ -134,6 +181,7 @@ extern "x86-interrupt" fn page_fault_handler(
     mut frame: InterruptStackFrame,
     error_code: PageFaultErrorCode,
 ) {
+    let _gs = SwapGsGuard::new(&frame);
     super::cpu::clear_user_access();
     let address = Cr2::read().map(|a| a.as_u64()).unwrap_or(0);
     let info = fault_info(FaultKind::PageFault, &frame, error_code.bits(), address);
@@ -168,16 +216,25 @@ extern "x86-interrupt" fn page_fault_handler(
 }
 
 extern "x86-interrupt" fn alignment_check_handler(frame: InterruptStackFrame, error_code: u64) {
+    let _gs = SwapGsGuard::new(&frame);
     super::cpu::clear_user_access();
     dispatch(fault_info(FaultKind::AlignmentCheck, &frame, error_code, 0));
 }
 
 extern "x86-interrupt" fn double_fault_handler(frame: InterruptStackFrame, error_code: u64) -> ! {
+    if (x86_64::registers::model_specific::GsBase::read().as_u64() >> 47) == 0 {
+        // SAFETY: `#DF` never returns; ensure `IA32_GS_BASE` points to kernel
+        // high-half `&CpuLocal` before entering the fatal diagnostic path.
+        unsafe {
+            core::arch::asm!("swapgs", options(nomem, nostack, preserves_flags));
+        }
+    }
     super::cpu::clear_user_access();
     super::fault::kernel_fault(fault_info(FaultKind::DoubleFault, &frame, error_code, 0));
 }
 
-extern "x86-interrupt" fn panic_stop_handler(_frame: InterruptStackFrame) {
+extern "x86-interrupt" fn panic_stop_handler(frame: InterruptStackFrame) {
+    let _gs = SwapGsGuard::new(&frame);
     super::cpu::clear_user_access();
     super::interrupts::disable();
     PANIC_STOPPED_CPUS.fetch_add(1, Ordering::Release);
@@ -187,7 +244,8 @@ extern "x86-interrupt" fn panic_stop_handler(_frame: InterruptStackFrame) {
     }
 }
 
-extern "x86-interrupt" fn shutdown_stop_handler(_frame: InterruptStackFrame) {
+extern "x86-interrupt" fn shutdown_stop_handler(frame: InterruptStackFrame) {
+    let _gs = SwapGsGuard::new(&frame);
     super::cpu::clear_user_access();
     super::interrupts::disable();
     super::lapic::timer_stop();
@@ -197,19 +255,22 @@ extern "x86-interrupt" fn shutdown_stop_handler(_frame: InterruptStackFrame) {
     }
 }
 
-extern "x86-interrupt" fn tlb_shootdown_handler(_frame: InterruptStackFrame) {
+extern "x86-interrupt" fn tlb_shootdown_handler(frame: InterruptStackFrame) {
+    let _gs = SwapGsGuard::new(&frame);
     super::cpu::clear_user_access();
     super::paging::handle_tlb_shootdown();
     super::lapic::eoi();
 }
 
-extern "x86-interrupt" fn reschedule_handler(_frame: InterruptStackFrame) {
+extern "x86-interrupt" fn reschedule_handler(frame: InterruptStackFrame) {
+    let _gs = SwapGsGuard::new(&frame);
     super::cpu::clear_user_access();
     super::lapic::eoi();
     crate::x86_64::timer_callback::reschedule();
 }
 
-extern "x86-interrupt" fn timer_handler(_stack_frame: InterruptStackFrame) {
+extern "x86-interrupt" fn timer_handler(stack_frame: InterruptStackFrame) {
+    let _gs = SwapGsGuard::new(&stack_frame);
     super::cpu::clear_user_access();
     super::lapic::eoi();
     unsafe {
@@ -220,7 +281,8 @@ extern "x86-interrupt" fn timer_handler(_stack_frame: InterruptStackFrame) {
 
 macro_rules! nvme_msi_handler {
     ($name:ident, $offset:expr) => {
-        extern "x86-interrupt" fn $name(_stack_frame: InterruptStackFrame) {
+        extern "x86-interrupt" fn $name(stack_frame: InterruptStackFrame) {
+            let _gs = SwapGsGuard::new(&stack_frame);
             pci_msi_ack(NVME_MSI_VECTOR_BASE + $offset);
         }
     };
@@ -256,11 +318,13 @@ fn pci_msi_ack(vector: u8) {
     );
 }
 
-extern "x86-interrupt" fn keyboard_handler(_stack_frame: InterruptStackFrame) {
+extern "x86-interrupt" fn keyboard_handler(stack_frame: InterruptStackFrame) {
+    let _gs = SwapGsGuard::new(&stack_frame);
     keyboard_irq_ack(true);
 }
 
-extern "x86-interrupt" fn ioapic_keyboard_handler(_stack_frame: InterruptStackFrame) {
+extern "x86-interrupt" fn ioapic_keyboard_handler(stack_frame: InterruptStackFrame) {
+    let _gs = SwapGsGuard::new(&stack_frame);
     keyboard_irq_ack(false);
 }
 
