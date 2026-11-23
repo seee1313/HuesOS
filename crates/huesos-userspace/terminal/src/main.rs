@@ -58,6 +58,7 @@ extern "C" fn terminal_main() -> ! {
     session.run();
 }
 
+const FRAME_DRAW_WAIT_TICKS: u64 = 100;
 const FRAME_DRAW_MAX_POLLS: u32 = 100;
 
 fn wait_for_bootstrap(bootstrap: &Channel) -> (Channel, Option<Vmo>, Option<Handle>) {
@@ -65,12 +66,18 @@ fn wait_for_bootstrap(bootstrap: &Channel) -> (Channel, Option<Vmo>, Option<Hand
     let mut registry: Option<Channel> = None;
     let mut bootfs: Option<Vmo> = None;
     let mut frame_draw: Option<Handle> = None;
+    let mut frame_draw_deadline: Option<u64> = None;
     let mut polls = 0u32;
 
     loop {
-        match bootstrap.read_optional_handle(&mut buf) {
+        match bootstrap.read_optional_handle_timeout(&mut buf, 5) {
             Ok((n, Some(handle))) if &buf[..n] == b"driver-manager-registry" => {
                 registry = Some(Channel::from_handle(handle));
+                if frame_draw_deadline.is_none() {
+                    frame_draw_deadline = libcanvas::system::monotonic_ticks()
+                        .ok()
+                        .map(|now| now.saturating_add(FRAME_DRAW_WAIT_TICKS));
+                }
             }
             Ok((n, Some(handle))) if &buf[..n] == b"bootfs-ro" => {
                 bootfs = Some(Vmo::from_handle(handle));
@@ -105,7 +112,11 @@ fn wait_for_bootstrap(bootstrap: &Channel) -> (Channel, Option<Vmo>, Option<Hand
                 continue;
             }
             polls = polls.saturating_add(1);
-            if polls >= FRAME_DRAW_MAX_POLLS {
+            let expired = match (frame_draw_deadline, libcanvas::system::monotonic_ticks()) {
+                (Some(deadline), Ok(now)) => now >= deadline,
+                _ => polls >= FRAME_DRAW_MAX_POLLS,
+            };
+            if expired {
                 println!("[terminal] FrameDraw not received; continuing without a framebuffer");
                 if let Some(registry) = registry.take() {
                     return (registry, bootfs, None);
@@ -116,30 +127,36 @@ fn wait_for_bootstrap(bootstrap: &Channel) -> (Channel, Option<Vmo>, Option<Hand
     }
 }
 
+const OPEN_SERVICE_TIMEOUT_TICKS: u64 = 500;
+const OPEN_SERVICE_READ_TICKS: u64 = 10;
 const OPEN_SERVICE_MAX_POLLS: u32 = 100;
 
 fn open_service(registry: &Channel, request: &[u8], response: &[u8]) -> libcanvas::Result<Channel> {
     let mut buf = [0u8; 64];
     registry.write(request)?;
+    let deadline = libcanvas::system::monotonic_ticks()
+        .ok()
+        .map(|now| now.saturating_add(OPEN_SERVICE_TIMEOUT_TICKS));
     let mut polls: u32 = 0;
     loop {
-        match registry.read_channel_handle(&mut buf) {
-            Ok((n, channel)) if &buf[..n] == response => return Ok(channel),
-            Ok((_n, _channel)) => {
+        match registry.read_optional_handle_timeout(&mut buf, OPEN_SERVICE_READ_TICKS) {
+            Ok((n, Some(handle))) if &buf[..n] == response => {
+                return Ok(Channel::from_handle(handle));
+            }
+            Ok((_n, _handle)) => {
                 polls = polls.saturating_add(1);
-                if polls >= OPEN_SERVICE_MAX_POLLS {
-                    return Err(ErrorCode::TimedOut);
-                }
-                libcanvas::process::yield_now();
             }
             Err(ErrorCode::ShouldWait) | Err(ErrorCode::TimedOut) => {
                 polls = polls.saturating_add(1);
-                if polls >= OPEN_SERVICE_MAX_POLLS {
-                    return Err(ErrorCode::TimedOut);
-                }
-                libcanvas::process::yield_now();
             }
             Err(e) => return Err(e),
+        }
+        let expired = match (deadline, libcanvas::system::monotonic_ticks()) {
+            (Some(limit), Ok(now)) => now >= limit,
+            _ => polls >= OPEN_SERVICE_MAX_POLLS,
+        };
+        if expired {
+            return Err(ErrorCode::TimedOut);
         }
     }
 }

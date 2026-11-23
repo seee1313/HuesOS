@@ -825,6 +825,8 @@ impl DriverRuntime {
             block_size: self.controller.lba_size(),
             block_count: self.controller.namespace_size(),
             max_request_bytes: self.controller.mdts(),
+            serial: self.controller.serial(),
+            model: self.controller.model(),
         };
         let Some(client) = self.clients[index].as_ref() else {
             return AsyncBlockStatus::NoResources;

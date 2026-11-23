@@ -85,13 +85,13 @@ fn run() -> i32 {
     let raw_volume = disk::probe_hxfs(&io);
     let header = if show_filesystems {
         format!(
-            "{:<16} {:>4} {:>10} {:>3} {:<6} {:<8} {:<6} {}",
-            "NAME", "RM", "SIZE", "RO", "TYPE", "FSTYPE", "FSVER", "MOUNTPOINT"
+            "{:<16} {:>4} {:>10} {:>3} {:<6} {:<8} {:<6} {:<20} {:<16} {}",
+            "NAME", "RM", "SIZE", "RO", "TYPE", "FSTYPE", "FSVER", "MODEL", "SERIAL", "MOUNTPOINT"
         )
     } else {
         format!(
-            "{:<16} {:>4} {:>10} {:>3} {:<6} {}",
-            "NAME", "RM", "SIZE", "RO", "TYPE", "MOUNTPOINT"
+            "{:<16} {:>4} {:>10} {:>3} {:<6} {:<20} {:<16} {}",
+            "NAME", "RM", "SIZE", "RO", "TYPE", "MODEL", "SERIAL", "MOUNTPOINT"
         )
     };
     if !no_headings {
@@ -111,9 +111,19 @@ fn run() -> i32 {
     } else {
         NOT_MOUNTED
     };
+    let disk_model = if io.model().is_empty() {
+        NO_FSTYPE
+    } else {
+        io.model()
+    };
+    let disk_serial = if io.serial().is_empty() {
+        NO_FSTYPE
+    } else {
+        io.serial()
+    };
     if show_filesystems {
         cu::outln(&format!(
-            "{:<16} {:>4} {:>10} {:>3} {:<6} {:<8} {:<6} {}",
+            "{:<16} {:>4} {:>10} {:>3} {:<6} {:<8} {:<6} {:<20} {:<16} {}",
             name,
             0,
             size(io.capacity_bytes()),
@@ -121,16 +131,20 @@ fn run() -> i32 {
             "disk",
             disk_fstype,
             disk_version,
+            disk_model,
+            disk_serial,
             disk_mount
         ));
     } else {
         cu::outln(&format!(
-            "{:<16} {:>4} {:>10} {:>3} {:<6} {}",
+            "{:<16} {:>4} {:>10} {:>3} {:<6} {:<20} {:<16} {}",
             name,
             0,
             size(io.capacity_bytes()),
             0,
             "disk",
+            disk_model,
+            disk_serial,
             disk_mount
         ));
     }
@@ -180,7 +194,7 @@ fn run() -> i32 {
         };
         if show_filesystems {
             cu::outln(&format!(
-                "{:<2}{:<14} {:>4} {:>10} {:>3} {:<6} {:<8} {:<6} {}",
+                "{:<2}{:<14} {:>4} {:>10} {:>3} {:<6} {:<8} {:<6} {:<20} {:<16} {}",
                 branch,
                 part_name,
                 0,
@@ -189,17 +203,21 @@ fn run() -> i32 {
                 "part",
                 fstype,
                 version,
+                "-",
+                "-",
                 mount
             ));
         } else {
             cu::outln(&format!(
-                "{:<2}{:<14} {:>4} {:>10} {:>3} {:<6} {}  {label}",
+                "{:<2}{:<14} {:>4} {:>10} {:>3} {:<6} {:<20} {:<16} {}  {label}",
                 branch,
                 part_name,
                 0,
                 size(part_bytes),
                 0,
                 "part",
+                "-",
+                "-",
                 mount
             ));
         }

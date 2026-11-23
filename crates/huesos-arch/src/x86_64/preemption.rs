@@ -50,6 +50,20 @@ pub fn can_sleep() -> bool {
     super::cpu_local::current_execution_guards().can_sleep()
 }
 
+/// Latch a deferred reschedule request on the current Task's execution guards.
+pub fn request_reschedule() {
+    let _ = super::cpu_local::update_current_execution_guards(|guards| {
+        guards.request_reschedule();
+        Ok(())
+    });
+}
+
+/// Atomically consume any latched deferred reschedule request on the current Task.
+pub fn take_reschedule_request() -> bool {
+    super::cpu_local::update_current_execution_guards(|guards| Ok(guards.take_reschedule_pending()))
+        .unwrap_or(false)
+}
+
 /// Guard forbidding context switch of the current Task.
 #[must_use = "dropping the guard re-enables preemption"]
 pub struct PreemptionGuard {
@@ -62,10 +76,16 @@ impl Drop for PreemptionGuard {
             return;
         }
         self.active = false;
-        let outermost =
-            super::cpu_local::update_current_execution_guards(|guards| guards.enable_preemption())
-                .unwrap_or_else(|error| fatal_guard_error(error));
-        if outermost && x86_64::instructions::interrupts::are_enabled() {
+        let should_reschedule = super::cpu_local::update_current_execution_guards(|guards| {
+            let outermost = guards.enable_preemption()?;
+            if outermost && x86_64::instructions::interrupts::are_enabled() {
+                Ok(guards.take_reschedule_pending())
+            } else {
+                Ok(false)
+            }
+        })
+        .unwrap_or_else(|error| fatal_guard_error(error));
+        if should_reschedule {
             if let Some(hook) = RESCHEDULE_HOOK.get().copied() {
                 hook();
             }

@@ -47,6 +47,14 @@ impl Thread {
         self.process
     }
 
+    /// Copy the thread name into caller-owned storage without allocating.
+    pub fn copy_name(&self, output: &mut [u8]) -> usize {
+        let name = self.name.lock();
+        let count = name.len().min(output.len());
+        output[..count].copy_from_slice(&name.as_bytes()[..count]);
+        count
+    }
+
     /// Atomically reserve this thread for start. Returns `false` if another
     /// caller already started it or is in the middle of starting it.
     pub fn begin_start(&self) -> bool {

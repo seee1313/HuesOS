@@ -69,6 +69,8 @@ pub struct Process {
     /// 256-bit dense CPU affinity mask. New threads start on `home_cpu`, and
     /// future explicit migration requests must stay within this mask.
     affinity_mask: [AtomicU64; huesos_abi::CPU_MASK256_WORDS],
+    /// Whether userspace explicitly configured CPU affinity before thread start.
+    affinity_explicit: AtomicBool,
     /// Scheduler feature flags (see `huesos_abi::scheduler_flags`).
     scheduler_flags: core::sync::atomic::AtomicU32,
     /// Initial-thread start reservation. Prevents two different Thread objects
@@ -104,10 +106,7 @@ impl Process {
     pub fn new_in_job(name: &str, job: Arc<Job>) -> Arc<Self> {
         let koid = alloc_koid();
         let home_cpu = crate::registry::current_cpu();
-        let mut affinity_mask = [const { AtomicU64::new(0) }; huesos_abi::CPU_MASK256_WORDS];
-        if home_cpu < huesos_abi::MAX_LOGICAL_CPUS {
-            affinity_mask[home_cpu / 64] = AtomicU64::new(1u64 << (home_cpu % 64));
-        }
+        let affinity_mask = [const { AtomicU64::new(u64::MAX) }; huesos_abi::CPU_MASK256_WORDS];
         Arc::new(Self {
             koid,
             name: IrqSafeMutex::new(String::from(name)),
@@ -121,6 +120,7 @@ impl Process {
             address_space: IrqSafeMutex::new(None),
             home_cpu: AtomicUsize::new(home_cpu),
             affinity_mask,
+            affinity_explicit: AtomicBool::new(false),
             scheduler_flags: core::sync::atomic::AtomicU32::new(0),
             start_reserved: AtomicBool::new(false),
             active_threads: AtomicUsize::new(0),
@@ -233,7 +233,20 @@ impl Process {
             atomic.store(word, Ordering::Release);
         }
         self.home_cpu.store(home_cpu, Ordering::Release);
+        self.affinity_explicit.store(true, Ordering::Release);
         true
+    }
+
+    /// Whether userspace explicitly pinned or restricted this process's CPU mask.
+    pub fn has_explicit_affinity(&self) -> bool {
+        self.affinity_explicit.load(Ordering::Acquire)
+    }
+
+    /// Record the scheduler-selected default home CPU for an unpinned process.
+    pub fn record_default_cpu(&self, cpu: usize) {
+        if !self.has_explicit_affinity() && cpu < huesos_abi::MAX_LOGICAL_CPUS {
+            self.home_cpu.store(cpu, Ordering::Release);
+        }
     }
 
     /// Set single-CPU affinity before this process's first thread starts.

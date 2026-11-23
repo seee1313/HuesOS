@@ -19,9 +19,7 @@ use crate::{
 };
 
 pub(crate) fn sys_yield() -> SyscallResult {
-    // Never hold a callback mutex across a context switch.
-    let yield_fn = *YIELD_FN.lock();
-    if let Some(f) = yield_fn {
+    if let Some(f) = YIELD_FN.get() {
         f();
     }
     Ok(0)

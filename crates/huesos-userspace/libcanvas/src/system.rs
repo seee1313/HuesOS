@@ -21,6 +21,80 @@ pub fn current_cpu() -> crate::Result<usize> {
     raw::decode(value).map(|cpu| cpu as usize)
 }
 
+/// Stack-allocated sanitized x86_64 processor brand / vendor string.
+#[derive(Clone, Copy)]
+pub struct CpuBrand {
+    bytes: [u8; 48],
+    len: usize,
+}
+
+impl CpuBrand {
+    /// Trimmed printable ASCII processor brand string.
+    pub fn as_str(&self) -> &str {
+        core::str::from_utf8(&self.bytes[..self.len]).unwrap_or("x86_64")
+    }
+}
+
+/// Query the hardware x86_64 processor brand string via unprivileged `CPUID`
+/// leaves `0x8000_0002..=0x8000_0004`, falling back to the leaf-0 vendor string.
+pub fn cpu_brand_string() -> CpuBrand {
+    let mut raw_brand = [0u8; 48];
+    let mut raw_len = 0usize;
+    let max_ext = core::arch::x86_64::__cpuid(0x8000_0000).eax;
+    if max_ext >= 0x8000_0004 {
+        for (chunk_idx, leaf_num) in (0x8000_0002..=0x8000_0004).enumerate() {
+            let leaf = core::arch::x86_64::__cpuid(leaf_num);
+            let base = chunk_idx * 16;
+            raw_brand[base..base + 4].copy_from_slice(&leaf.eax.to_le_bytes());
+            raw_brand[base + 4..base + 8].copy_from_slice(&leaf.ebx.to_le_bytes());
+            raw_brand[base + 8..base + 12].copy_from_slice(&leaf.ecx.to_le_bytes());
+            raw_brand[base + 12..base + 16].copy_from_slice(&leaf.edx.to_le_bytes());
+        }
+        raw_len = raw_brand
+            .iter()
+            .position(|&b| b == 0)
+            .unwrap_or(raw_brand.len());
+    }
+    if raw_len == 0 {
+        let leaf0 = core::arch::x86_64::__cpuid(0);
+        raw_brand[0..4].copy_from_slice(&leaf0.ebx.to_le_bytes());
+        raw_brand[4..8].copy_from_slice(&leaf0.edx.to_le_bytes());
+        raw_brand[8..12].copy_from_slice(&leaf0.ecx.to_le_bytes());
+        raw_len = raw_brand[..12].iter().position(|&b| b == 0).unwrap_or(12);
+    }
+
+    let mut out = [0u8; 48];
+    let mut out_len = 0usize;
+    let mut prev_space = true;
+    for &b in &raw_brand[..raw_len] {
+        let ch = if (0x21..=0x7e).contains(&b) {
+            prev_space = false;
+            b
+        } else if b == b' ' && !prev_space {
+            prev_space = true;
+            b' '
+        } else {
+            continue;
+        };
+        if out_len < out.len() {
+            out[out_len] = ch;
+            out_len += 1;
+        }
+    }
+    while out_len > 0 && out[out_len - 1] == b' ' {
+        out_len -= 1;
+    }
+    if out_len == 0 {
+        let fallback = b"x86_64";
+        out[..fallback.len()].copy_from_slice(fallback);
+        out_len = fallback.len();
+    }
+    CpuBrand {
+        bytes: out,
+        len: out_len,
+    }
+}
+
 /// In-memory boot volume key owned by KeyBroker.
 ///
 /// This type deliberately has no `Debug`, `Clone`, or `Copy` implementation.

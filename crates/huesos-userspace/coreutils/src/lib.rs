@@ -32,9 +32,14 @@ pub fn collect_args() -> Vec<String> {
     std_env::args()
 }
 
-/// Write UTF-8 text to `stdout`.
+/// Write UTF-8 text to `stdout`. If the downstream pipeline consumer closed its
+/// read endpoint (`PeerClosed`), exit cleanly with status 0 (`EPIPE` semantics).
 pub fn out(s: &str) {
-    let _ = std_io::write_all(&mut std_io::stdout(), s.as_bytes());
+    if let Err(err) = std_io::write_all(&mut std_io::stdout(), s.as_bytes()) {
+        if err.kind() == huesos_std::ErrorKind::PeerClosed {
+            std_proc::exit(0);
+        }
+    }
 }
 
 /// Write UTF-8 line to `stdout`.

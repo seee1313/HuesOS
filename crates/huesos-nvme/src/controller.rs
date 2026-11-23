@@ -8,7 +8,8 @@
 
 use crate::cmd::{build, identify, Cqe, Sqe};
 use crate::identify::{
-    parse_controller, parse_namespace, ControllerInfo, IdentifyError, NamespaceInfo, IDENTIFY_BYTES,
+    parse_controller, parse_namespace, ControllerInfo, IdentifyError, NamespaceInfo,
+    IDENTIFY_BYTES, IDENTIFY_MODEL_BYTES, IDENTIFY_SERIAL_BYTES,
 };
 use crate::queue_plan::{plan_queues, InterruptMode, QueuePlan, QueuePlanInput};
 // Synchronous completion-poll budget. Iterations are cheap (one
@@ -159,6 +160,8 @@ pub struct Controller<T: NvmeTransport> {
     io_prp_list_count: usize,
     // Capabilities (validated during init).
     mdts: u32,
+    serial: [u8; IDENTIFY_SERIAL_BYTES],
+    model: [u8; IDENTIFY_MODEL_BYTES],
     max_queue_size: u16,
     /// Config of the last successful init, replayed by `reset()`.
     last_config: Option<ControllerConfig>,
@@ -205,6 +208,8 @@ impl<T: NvmeTransport> Controller<T> {
             io_prp_list_extra: [0; MAX_EXTRA_PRP_LIST_PAGES],
             io_prp_list_count: 0,
             mdts: 0,
+            serial: [0; IDENTIFY_SERIAL_BYTES],
+            model: [0; IDENTIFY_MODEL_BYTES],
             max_queue_size: 0,
             last_config: None,
         }
@@ -222,6 +227,16 @@ impl<T: NvmeTransport> Controller<T> {
     /// Maximum data transfer size in bytes (MDTS).
     pub fn mdts(&self) -> u32 {
         self.mdts
+    }
+
+    /// Trimmed ASCII serial number (`SN`) from Identify Controller.
+    pub fn serial(&self) -> [u8; IDENTIFY_SERIAL_BYTES] {
+        self.serial
+    }
+
+    /// Trimmed ASCII model number (`MN`) from Identify Controller.
+    pub fn model(&self) -> [u8; IDENTIFY_MODEL_BYTES] {
+        self.model
     }
 
     /// Maximum queue size (entries) supported by the controller.
@@ -472,6 +487,8 @@ impl<T: NvmeTransport> Controller<T> {
             NvmeError::InvalidIdentifyController
         })?;
         self.mdts = controller_info.max_request_bytes;
+        self.serial = controller_info.serial;
+        self.model = controller_info.model;
         self.io_data_buf_size = self.mdts as u64;
         self.io_data_buf = self.dma_alloc_zeroed(self.io_data_buf_size, ps)?;
         self.io_prp_list = self.dma_alloc_zeroed(ps, ps)?;

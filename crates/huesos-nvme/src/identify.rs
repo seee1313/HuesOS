@@ -4,6 +4,10 @@
 pub const HUESOS_MAX_IO_BYTES: u32 = 1024 * 1024;
 /// Identify Controller / Namespace data structure size.
 pub const IDENTIFY_BYTES: usize = 4096;
+/// NVMe Identify Controller Serial Number (`SN`, bytes 4..24) length.
+pub const IDENTIFY_SERIAL_BYTES: usize = 20;
+/// NVMe Identify Controller Model Number (`MN`, bytes 24..64) length.
+pub const IDENTIFY_MODEL_BYTES: usize = 40;
 
 /// Identify parsing failure.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -20,7 +24,7 @@ pub enum IdentifyError {
     UnsupportedLbaSize,
 }
 
-/// Parsed Identify Controller subset needed before queue setup.
+/// Parsed Identify Controller subset needed before queue setup and hardware reporting.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ControllerInfo {
     /// Raw MDTS value from Identify Controller byte 77.
@@ -30,6 +34,53 @@ pub struct ControllerInfo {
     /// Effective HuesOS max request size: `min(MDTS, 1 MiB)`, with MDTS=0
     /// treated as no controller-imposed limit.
     pub max_request_bytes: u32,
+    /// Sanitized ASCII Serial Number (`SN`, bytes 4..24), NUL-padded after trim.
+    pub serial: [u8; IDENTIFY_SERIAL_BYTES],
+    /// Sanitized ASCII Model Number (`MN`, bytes 24..64), NUL-padded after trim.
+    pub model: [u8; IDENTIFY_MODEL_BYTES],
+}
+
+impl ControllerInfo {
+    /// Trimmed ASCII Serial Number reported by Identify Controller.
+    pub fn serial_str(&self) -> &str {
+        ascii_field_str(&self.serial)
+    }
+
+    /// Trimmed ASCII Model Number reported by Identify Controller.
+    pub fn model_str(&self) -> &str {
+        ascii_field_str(&self.model)
+    }
+}
+
+fn sanitize_ascii_field<const N: usize>(raw: &[u8]) -> [u8; N] {
+    let len = raw.len().min(N);
+    let slice = &raw[..len];
+    let first_nul = slice.iter().position(|&b| b == 0).unwrap_or(len);
+    let mut trimmed = &slice[..first_nul];
+    while let Some((&last, rest)) = trimmed.split_last() {
+        if last == b' ' || !last.is_ascii_graphic() {
+            trimmed = rest;
+        } else {
+            break;
+        }
+    }
+    while let Some((&first, rest)) = trimmed.split_first() {
+        if first == b' ' {
+            trimmed = rest;
+        } else {
+            break;
+        }
+    }
+    let mut out = [0u8; N];
+    for (dst, &b) in out.iter_mut().zip(trimmed.iter()) {
+        *dst = if (0x20..=0x7e).contains(&b) { b } else { b'?' };
+    }
+    out
+}
+
+fn ascii_field_str(bytes: &[u8]) -> &str {
+    let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+    core::str::from_utf8(&bytes[..end]).unwrap_or("").trim()
 }
 
 /// Parsed Identify Namespace subset exposed by the block layer.
@@ -67,10 +118,14 @@ pub fn parse_controller(
             .checked_mul(multiplier)
             .ok_or(IdentifyError::InvalidMdts)?
     };
+    let serial = sanitize_ascii_field::<IDENTIFY_SERIAL_BYTES>(&data[4..24]);
+    let model = sanitize_ascii_field::<IDENTIFY_MODEL_BYTES>(&data[24..64]);
     Ok(ControllerInfo {
         mdts_raw,
         mdts_bytes,
         max_request_bytes: mdts_bytes.min(HUESOS_MAX_IO_BYTES),
+        serial,
+        model,
     })
 }
 
@@ -147,8 +202,23 @@ mod tests {
                 mdts_raw: 0,
                 mdts_bytes: HUESOS_MAX_IO_BYTES,
                 max_request_bytes: HUESOS_MAX_IO_BYTES,
+                serial: [0u8; IDENTIFY_SERIAL_BYTES],
+                model: [0u8; IDENTIFY_MODEL_BYTES],
             })
         );
+    }
+
+    #[test]
+    fn controller_parses_identify_serial_and_model() {
+        let mut data = [0u8; IDENTIFY_BYTES];
+        data[4..24].copy_from_slice(b"SN-HUES-9901        ");
+        data[24..64].copy_from_slice(b"QEMU NVMe Ctrl                          ");
+        let Ok(info) = parse_controller(&data, 4096) else {
+            assert!(false, "controller identify must succeed");
+            return;
+        };
+        assert_eq!(info.serial_str(), "SN-HUES-9901");
+        assert_eq!(info.model_str(), "QEMU NVMe Ctrl");
     }
 
     #[test]

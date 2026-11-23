@@ -65,9 +65,11 @@ fn cpus() -> i32 {
             return 1;
         }
     };
+    let brand = libcanvas::system::cpu_brand_string();
     cu::outln(&format!(
-        "scheduler: {} cpu(s)  context_switches={}  remote_wakes={}  resched_ipis={}",
+        "scheduler: {} cpu(s) [{}]  context_switches={}  remote_wakes={}  resched_ipis={}",
         snapshot.summary.cpu_count,
+        brand.as_str(),
         snapshot.summary.context_switches,
         snapshot.summary.remote_wakes,
         snapshot.summary.resched_ipis
@@ -151,7 +153,7 @@ fn tasks() -> i32 {
             if record.process_koid() == 0 {
                 String::from("-")
             } else {
-                format!("{:#x}", record.process_koid())
+                format!("{}", record.process_koid())
             },
             String::from(record.name_str()),
             String::from(record.class_str()),

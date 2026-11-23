@@ -86,44 +86,71 @@ fn run() -> i32 {
 }
 
 fn emit(operand: &str, limit: &Limit) -> Result<()> {
+    if operand == "-" {
+        emit_reader(&mut io::stdin(), limit)
+    } else {
+        let mut file = fs::File::open(&path::normalize(operand))?;
+        emit_reader(&mut file, limit)
+    }
+}
+
+fn write_out(out: &mut io::Stdout, bytes: &[u8]) -> Result<bool> {
+    match io::write_all(out, bytes) {
+        Ok(()) => Ok(true),
+        Err(err) if err.kind() == huesos_std::ErrorKind::PeerClosed => Ok(false),
+        Err(err) => Err(err),
+    }
+}
+
+fn emit_reader<R: io::Read>(reader: &mut R, limit: &Limit) -> Result<()> {
     let mut out = io::stdout();
+    let mut buf = [0u8; 4096];
     match limit {
         Limit::Bytes(count) => {
-            let data = read_operand(operand)?;
-            let end = (*count as usize).min(data.len());
-            io::write_all(&mut out, &data[..end])?;
-            out.flush()
+            let mut remaining = *count;
+            while remaining > 0 {
+                let want = (remaining as usize).min(buf.len());
+                let n = reader.read(&mut buf[..want])?;
+                if n == 0 {
+                    break;
+                }
+                if !write_out(&mut out, &buf[..n])? {
+                    return Ok(());
+                }
+                remaining = remaining.saturating_sub(n as u64);
+            }
+            let _ = out.flush();
+            Ok(())
         }
         Limit::Lines(count) => {
-            let data = read_operand(operand)?;
-            let mut seen = 0u64;
-            let mut end = data.len();
             if *count == 0 {
-                end = 0;
-            } else {
-                for (index, byte) in data.iter().enumerate() {
-                    if *byte == b'\n' {
+                return Ok(());
+            }
+            let mut seen = 0u64;
+            loop {
+                let n = reader.read(&mut buf)?;
+                if n == 0 {
+                    break;
+                }
+                let mut emit_len = n;
+                for (index, &byte) in buf[..n].iter().enumerate() {
+                    if byte == b'\n' {
                         seen += 1;
                         if seen == *count {
-                            end = index + 1;
+                            emit_len = index + 1;
                             break;
                         }
                     }
                 }
+                if !write_out(&mut out, &buf[..emit_len])? {
+                    return Ok(());
+                }
+                if seen == *count {
+                    break;
+                }
             }
-            io::write_all(&mut out, &data[..end])?;
-            out.flush()
+            let _ = out.flush();
+            Ok(())
         }
     }
-}
-
-fn read_operand(operand: &str) -> Result<Vec<u8>> {
-    let mut data = Vec::new();
-    if operand == "-" {
-        io::read_to_end(&mut io::stdin(), &mut data)?;
-    } else {
-        let mut file = fs::File::open(&path::normalize(operand))?;
-        io::read_to_end(&mut file, &mut data)?;
-    }
-    Ok(data)
 }

@@ -265,6 +265,7 @@ pub unsafe extern "C" fn ap_entry() -> ! {
     // The timer handler runs the per-CPU scheduler tick and may context-switch
     // this idle task onto a real workload that was load-balanced here.
     loop {
+        crate::scheduler::reap_if_pending();
         huesos_arch::hlt();
     }
 }

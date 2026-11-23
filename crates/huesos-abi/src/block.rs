@@ -8,8 +8,14 @@
 /// Size of an encoded async block request.
 pub const ASYNC_REQUEST_BYTES: usize = 32;
 
-/// Size of an encoded async block info response.
-pub const ASYNC_INFO_RESPONSE_BYTES: usize = 24;
+/// Legacy v1 encoded async block info response size (without controller identity).
+pub const ASYNC_INFO_LEGACY_BYTES: usize = 24;
+/// NVMe Identify Controller Serial Number (`SN`) wire field size.
+pub const ASYNC_INFO_SERIAL_BYTES: usize = 20;
+/// NVMe Identify Controller Model Number (`MN`) wire field size.
+pub const ASYNC_INFO_MODEL_BYTES: usize = 40;
+/// Size of an encoded async block info response (geometry + serial + model).
+pub const ASYNC_INFO_RESPONSE_BYTES: usize = 88;
 
 /// Async block operation code.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -139,9 +145,23 @@ pub struct AsyncBlockInfo {
     pub block_count: u64,
     /// Maximum request size accepted by this service.
     pub max_request_bytes: u32,
+    /// Sanitized ASCII controller serial number (`SN`), NUL-padded.
+    pub serial: [u8; ASYNC_INFO_SERIAL_BYTES],
+    /// Sanitized ASCII controller model number (`MN`), NUL-padded.
+    pub model: [u8; ASYNC_INFO_MODEL_BYTES],
 }
 
 impl AsyncBlockInfo {
+    /// Trimmed printable ASCII controller serial number.
+    pub fn serial_str(&self) -> &str {
+        ascii_cstr(&self.serial)
+    }
+
+    /// Trimmed printable ASCII controller model number.
+    pub fn model_str(&self) -> &str {
+        ascii_cstr(&self.model)
+    }
+
     /// Encode to the fixed wire format.
     pub fn encode(&self) -> [u8; ASYNC_INFO_RESPONSE_BYTES] {
         let mut out = [0u8; ASYNC_INFO_RESPONSE_BYTES];
@@ -149,21 +169,39 @@ impl AsyncBlockInfo {
         out[4..8].copy_from_slice(&self.block_size.to_le_bytes());
         out[8..16].copy_from_slice(&self.block_count.to_le_bytes());
         out[16..20].copy_from_slice(&self.max_request_bytes.to_le_bytes());
+        out[24..44].copy_from_slice(&self.serial);
+        out[44..84].copy_from_slice(&self.model);
         out
     }
 
-    /// Decode from the fixed wire format.
+    /// Decode from the fixed wire format (accepts v2 88-byte or legacy 24-byte frames).
     pub fn decode(bytes: &[u8]) -> Option<Self> {
-        if bytes.len() != ASYNC_INFO_RESPONSE_BYTES {
+        if bytes.len() != ASYNC_INFO_RESPONSE_BYTES && bytes.len() != ASYNC_INFO_LEGACY_BYTES {
             return None;
+        }
+        let mut serial = [0u8; ASYNC_INFO_SERIAL_BYTES];
+        let mut model = [0u8; ASYNC_INFO_MODEL_BYTES];
+        if bytes.len() == ASYNC_INFO_RESPONSE_BYTES {
+            serial.copy_from_slice(&bytes[24..44]);
+            model.copy_from_slice(&bytes[44..84]);
         }
         Some(Self {
             namespace_id: read_u32(bytes, 0)?,
             block_size: read_u32(bytes, 4)?,
             block_count: read_u64(bytes, 8)?,
             max_request_bytes: read_u32(bytes, 16)?,
+            serial,
+            model,
         })
     }
+}
+
+fn ascii_cstr(bytes: &[u8]) -> &str {
+    let end = bytes
+        .iter()
+        .position(|&b| b == 0 || !(0x20..=0x7e).contains(&b))
+        .unwrap_or(bytes.len());
+    core::str::from_utf8(&bytes[..end]).unwrap_or("").trim()
 }
 
 /// Build the PortPacket data payload for a completion.
@@ -269,12 +307,25 @@ mod tests {
 
     #[test]
     fn info_response_round_trips() {
+        let mut serial = [0u8; ASYNC_INFO_SERIAL_BYTES];
+        serial[..8].copy_from_slice(b"deadbeef");
+        let mut model = [0u8; ASYNC_INFO_MODEL_BYTES];
+        model[..14].copy_from_slice(b"QEMU NVMe Ctrl");
         let info = AsyncBlockInfo {
             namespace_id: 1,
             block_size: 4096,
             block_count: 1024,
             max_request_bytes: 1024 * 1024,
+            serial,
+            model,
         };
-        assert_eq!(AsyncBlockInfo::decode(&info.encode()), Some(info));
+        let encoded = info.encode();
+        assert_eq!(AsyncBlockInfo::decode(&encoded), Some(info));
+        assert_eq!(info.serial_str(), "deadbeef");
+        assert_eq!(info.model_str(), "QEMU NVMe Ctrl");
+        assert_eq!(
+            AsyncBlockInfo::decode(&encoded[..ASYNC_INFO_LEGACY_BYTES]).map(|v| v.block_count),
+            Some(1024)
+        );
     }
 }

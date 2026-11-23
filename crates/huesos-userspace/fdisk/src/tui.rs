@@ -193,6 +193,8 @@ impl Action {
 
 struct EditorState {
     label: String,
+    hw_model: String,
+    hw_serial: String,
     writable: bool,
     total_lbas: u64,
     disk: Option<GptDisk>,
@@ -286,6 +288,8 @@ pub fn interactive(io: &mut Backend, label: &str, writable: bool) -> i32 {
 
     let mut state = EditorState {
         label: String::from(label),
+        hw_model: String::from(io.hw_model()),
+        hw_serial: String::from(io.hw_serial()),
         writable,
         total_lbas,
         disk,
@@ -1216,8 +1220,13 @@ fn draw_studio<W: Write>(
         "Unpartitioned"
     };
 
+    let hw_tag = if state.hw_serial == "-" || state.hw_serial.is_empty() {
+        format!(" [{}]", state.hw_model)
+    } else {
+        format!(" [{} S/N {}]", state.hw_model, state.hw_serial)
+    };
     let left_hdr = format!(
-        " {}{}HuesOS fdisk{} {}// cfdisk studio{}   {}{}{} {}   {}capacity:{} {}{}{} ({} LBAs x {}B)",
+        " {}{}HuesOS fdisk{} {}// cfdisk studio{}   {}{}{}{} {}   {}capacity:{} {}{}{} ({} LBAs x {}B)",
         fg_rgb(110, 245, 195),
         ansi::BOLD,
         ansi::RESET,
@@ -1225,6 +1234,7 @@ fn draw_studio<W: Write>(
         ansi::RESET,
         fg_rgb(255, 255, 255),
         state.label,
+        hw_tag,
         ansi::RESET,
         rw_pill,
         fg_rgb(140, 165, 198),

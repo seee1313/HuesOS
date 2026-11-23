@@ -9,7 +9,7 @@ use libcanvas::{println, Channel, ErrorCode, Port};
 
 use huesos_abi::block::{
     completion_data, decode_completion_data, AsyncBlockInfo, AsyncBlockOp, AsyncBlockRequest,
-    AsyncBlockStatus, ASYNC_INFO_RESPONSE_BYTES,
+    AsyncBlockStatus, ASYNC_INFO_MODEL_BYTES, ASYNC_INFO_RESPONSE_BYTES, ASYNC_INFO_SERIAL_BYTES,
 };
 use huesos_abi::volume::{
     VolumeInfo, VolumeOp, VolumeRequest, SYSTEM_VOLUME_ID, VOLUME_FLAG_NVME,
@@ -25,6 +25,8 @@ const BACKEND_INFO_REQUEST_ID: u64 = u64::MAX - 1;
 /// DriverManager-owned VolumeManager.
 pub struct VolumeManagerService {
     system: Option<VolumeInfo>,
+    backend_serial: [u8; ASYNC_INFO_SERIAL_BYTES],
+    backend_model: [u8; ASYNC_INFO_MODEL_BYTES],
     clients: [Option<VolumeClient>; MAX_VOLUME_CLIENTS],
     proxies: [Option<BlockRangeProxy>; MAX_BLOCK_RANGE_PROXIES],
 }
@@ -54,6 +56,8 @@ impl VolumeManagerService {
     pub const fn new() -> Self {
         Self {
             system: None,
+            backend_serial: [0u8; ASYNC_INFO_SERIAL_BYTES],
+            backend_model: [0u8; ASYNC_INFO_MODEL_BYTES],
             clients: [const { None }; MAX_VOLUME_CLIENTS],
             proxies: [const { None }; MAX_BLOCK_RANGE_PROXIES],
         }
@@ -190,6 +194,8 @@ impl VolumeManagerService {
         let Some(info) = AsyncBlockInfo::decode(&bytes) else {
             return Err(ErrorCode::InvalidArgs);
         };
+        self.backend_serial = info.serial;
+        self.backend_model = info.model;
         self.system = Some(VolumeInfo {
             volume_id: SYSTEM_VOLUME_ID,
             kind: VOLUME_KIND_RAW_NVME_NAMESPACE,
@@ -455,6 +461,8 @@ impl VolumeManagerService {
                     block_size: proxy.block_size,
                     block_count: proxy.block_count,
                     max_request_bytes: proxy.max_request_bytes,
+                    serial: self.backend_serial,
+                    model: self.backend_model,
                 };
                 let _ = proxy.client.write(&info.encode());
                 self.complete_proxy(

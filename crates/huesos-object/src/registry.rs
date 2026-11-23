@@ -386,24 +386,20 @@ pub fn unregister_object(koid: Koid) {
     drop(removed);
 }
 
-/// Current process per dense scheduler CPU (set on every context switch).
-static PER_CPU_PROCESSES: IrqSafeMutex<[Option<Arc<Process>>; huesos_abi::MAX_LOGICAL_CPUS]> =
-    IrqSafeMutex::new([const { None }; huesos_abi::MAX_LOGICAL_CPUS]);
+/// Current process per dense scheduler CPU (sharded per CPU to avoid
+/// cross-core lock contention on every syscall and context switch).
+static PER_CPU_PROCESSES: [IrqSafeMutex<Option<Arc<Process>>>; huesos_abi::MAX_LOGICAL_CPUS] =
+    [const { IrqSafeMutex::new(None) }; huesos_abi::MAX_LOGICAL_CPUS];
 
-static CPU_ID_CALLBACK: IrqSafeMutex<Option<fn() -> usize>> = IrqSafeMutex::new(None);
+static CPU_ID_CALLBACK: spin::Once<fn() -> usize> = spin::Once::new();
 
 /// Register a callback to retrieve the current CPU ID.
 pub fn set_cpu_id_callback(f: fn() -> usize) {
-    *CPU_ID_CALLBACK.lock() = Some(f);
+    CPU_ID_CALLBACK.call_once(|| f);
 }
 
 pub(crate) fn current_cpu() -> usize {
-    // Drop the lock before calling the callback (see
-    // `huesos_object::wait::park_current` for why holding a callback
-    // mutex guard across the call is unsafe in general, even though this
-    // particular callback is short and non-blocking).
-    let cpu_id_fn = *CPU_ID_CALLBACK.lock();
-    if let Some(f) = cpu_id_fn {
+    if let Some(f) = CPU_ID_CALLBACK.get() {
         f()
     } else {
         0
@@ -413,20 +409,20 @@ pub(crate) fn current_cpu() -> usize {
 /// Set the current process.
 pub fn set_current_process(p: Arc<Process>) {
     let cpu = current_cpu().min(huesos_abi::MAX_LOGICAL_CPUS - 1);
-    PER_CPU_PROCESSES.lock()[cpu] = Some(p);
+    *PER_CPU_PROCESSES[cpu].lock() = Some(p);
 }
 
 /// Clear the current process on the calling CPU (when switching to a kernel
 /// or reaped task so exited `Process` objects are not retained by idle CPUs).
 pub fn clear_current_process() {
     let cpu = current_cpu().min(huesos_abi::MAX_LOGICAL_CPUS - 1);
-    PER_CPU_PROCESSES.lock()[cpu] = None;
+    *PER_CPU_PROCESSES[cpu].lock() = None;
 }
 
 /// Clear any CPU slot still referencing `koid` during process teardown.
 pub fn clear_process_from_all_cpus(koid: Koid) {
-    let mut per_cpu = PER_CPU_PROCESSES.lock();
-    for slot in per_cpu.iter_mut() {
+    for slot_mutex in &PER_CPU_PROCESSES {
+        let mut slot = slot_mutex.lock();
         if slot.as_ref().is_some_and(|proc| proc.koid() == koid) {
             *slot = None;
         }
@@ -436,7 +432,7 @@ pub fn clear_process_from_all_cpus(koid: Koid) {
 /// Get the current process.
 pub fn current_process() -> Option<Arc<Process>> {
     let cpu = current_cpu().min(huesos_abi::MAX_LOGICAL_CPUS - 1);
-    PER_CPU_PROCESSES.lock()[cpu].clone()
+    PER_CPU_PROCESSES[cpu].lock().clone()
 }
 
 /// Root job (set during object init).
@@ -456,14 +452,14 @@ pub(crate) fn set_root_job(root: Arc<Job>) {
 /// virtual address (the HHDM). Injected by the kernel at init time so that
 /// `huesos-object` doesn't need to depend on `huesos-arch` directly.
 type PhysToVirtFn = fn(u64) -> u64;
-static PHYS_TO_VIRT: IrqSafeMutex<Option<PhysToVirtFn>> = IrqSafeMutex::new(None);
+static PHYS_TO_VIRT: spin::Once<PhysToVirtFn> = spin::Once::new();
 
 /// Register the physical-to-virtual translator. Must be called once during
 /// kernel init, after paging is set up.
 pub fn set_phys_to_virt(f: fn(u64) -> u64) {
-    *PHYS_TO_VIRT.lock() = Some(f);
+    PHYS_TO_VIRT.call_once(|| f);
 }
 
 pub(crate) fn phys_to_virt(phys: u64) -> u64 {
-    (PHYS_TO_VIRT.lock().expect("phys_to_virt not registered"))(phys)
+    (PHYS_TO_VIRT.get().expect("phys_to_virt not registered"))(phys)
 }

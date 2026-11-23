@@ -219,6 +219,8 @@ required+=(
     '[hsh] ProcessTerminate smoke OK'
     '[hsh] Ctrl-C child kill smoke OK'
     '[hsh] capability-owned background job lifecycle OK'
+    '[hsh] KOID job-control + 8-stage PeerClosed pipeline OK'
+    '[hsh] ps live KOID table OK'
     '[hsh] fdisk gpt-init dry-run OK'
     '[hsh] fdisk gpt init/add/del/verify OK'
     '[hsh] huesos-std smoke OK'
@@ -234,6 +236,7 @@ required+=(
 if [[ -n "${HUESOS_SMOKE_NVME:-}" ]]; then
     required+=(
         '[hxfs] service started'
+        '[hsh] NVMe Identify model/serial plumbing OK'
         '[hsh] fdisk raw-hxfs list OK'
         '[hsh] fdisk raw-hxfs dry-run OK'
         '[hsh] fdisk raw-hxfs gpt-init guard OK'

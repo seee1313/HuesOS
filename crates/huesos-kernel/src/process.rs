@@ -521,9 +521,9 @@ pub fn unmap_resource_from_current(
     huesos_object::note_kernel_ref_close(resource.koid());
     // The map path guaranteed the PTEs were absent (no shootdown needed);
     // unmap does not — other CPUs may still hold the translations this
-    // call just invalidated. Hold VMAR_MUTATION_LOCK across the global
-    // shootdown mailbox.
-    let _mutation_guard = VMAR_MUTATION_LOCK.lock();
+    // call just invalidated. `shootdown_range` serializes its global
+    // mailbox internally with interrupts enabled while waiting so peer
+    // CPUs never deadlock with `IF = 0`.
     huesos_arch::paging::shootdown_range(
         args.addr,
         args.addr + args.len,
@@ -891,7 +891,6 @@ pub fn unmap_vmar_mapping(vmar: &Vmar, args: VmarOpArgs) -> Result<u64, ErrorCod
     if replacement_count == 0 {
         huesos_object::note_kernel_ref_close(mapping.vmo);
     }
-    let _mutation_guard = VMAR_MUTATION_LOCK.lock();
     huesos_arch::paging::shootdown_range(
         args.addr,
         args.addr + args.len,
@@ -905,9 +904,8 @@ pub fn unmap_vmar_mapping(vmar: &Vmar, args: VmarOpArgs) -> Result<u64, ErrorCod
 pub fn protect_vmar_mapping(vmar: &Vmar, args: VmarOpArgs) -> Result<u64, ErrorCode> {
     let process = process_runtime_for_vmar(vmar)?;
     let _memory_guard = process.user_memory_lock.lock();
-    // Do not hold VMAR_MUTATION_LOCK (LockRank::PROCESS) across
-    // `protect_user_page`, `replace_mapping`, or `adjust_mapping_refcount`,
-    // which acquire lower-ranked locks (ARCHITECTURE, OBJECT, REGISTRY).
+    // Serialize page-table and VMAR metadata updates under the per-process
+    // locks, then drop all locks before entering `shootdown_range`.
     let mapping = validate_vmar_op_args(vmar, args, true)?;
     let old_flags = page_flags_from_vmar_flags(mapping.flags)?;
     let new_flags = page_flags_from_vmar_flags(args.flags)?;
@@ -961,7 +959,6 @@ pub fn protect_vmar_mapping(vmar: &Vmar, args: VmarOpArgs) -> Result<u64, ErrorC
     }
     drop(runtime_guard);
     drop(_memory_guard);
-    let _mutation_guard = VMAR_MUTATION_LOCK.lock();
     huesos_arch::paging::shootdown_range(
         args.addr,
         args.addr + args.len,
@@ -1130,12 +1127,9 @@ pub fn heap_extend_current(args: huesos_abi::HeapExtendArgs) -> Result<u64, Erro
         let _ = address_space.unmap_and_release_user_page(page);
     }
     drop(runtime_guard);
+    drop(_memory_guard);
     // Removing mappings *does* require invalidating other CPUs, or a
     // stale TLB entry would keep a freed frame reachable from ring 3.
-    // The shootdown's global mailbox is only safe with one request in
-    // flight system-wide, so hold the VMAR mutation lock across the IPI
-    // handshake, matching the unmap/protect transaction paths.
-    let _mutation_guard = VMAR_MUTATION_LOCK.lock();
     huesos_arch::paging::shootdown_range(
         base,
         base + args.len,
@@ -1207,10 +1201,37 @@ fn start_thread_with_args(
     };
 
     let mut task_name = [0u8; 32];
-    let label = b"user-thread";
-    task_name[..label.len()].copy_from_slice(label);
+    let copied = if process.active_threads() > 0 {
+        let mut tname = [0u8; 32];
+        let tlen = thread.copy_name(&mut tname);
+        if tlen > 0 && &tname[..tlen] != b"main" && &tname[..tlen] != b"thread" {
+            task_name[..tlen].copy_from_slice(&tname[..tlen]);
+            tlen
+        } else {
+            process.copy_name(&mut task_name)
+        }
+    } else {
+        process.copy_name(&mut task_name)
+    };
+    if copied == 0 {
+        let label = b"user-thread";
+        task_name[..label.len()].copy_from_slice(label);
+    }
 
-    let target_cpu = process.home_cpu();
+    let target_cpu = if process.has_explicit_affinity() {
+        let (mask_words, home_cpu) = process.affinity_snapshot();
+        if process.active_threads() == 0 && crate::scheduler::is_cpu_online(home_cpu) {
+            home_cpu
+        } else {
+            crate::scheduler::select_least_loaded_cpu(Some(&mask_words))
+        }
+    } else {
+        let chosen = crate::scheduler::select_least_loaded_cpu(None);
+        if process.active_threads() == 0 {
+            process.record_default_cpu(chosen);
+        }
+        chosen
+    };
     crate::scheduler::spawn_user_thread_on_cpu_ex(
         &task_name, process, thread_arc, entry, stack, arg0, fs_base, cr3, target_cpu,
     )
@@ -1334,9 +1355,6 @@ struct PendingUserEntry {
 
 static PENDING_USER_ENTRIES: RankedIrqSafeTicketLock<Vec<PendingUserEntry>> =
     RankedIrqSafeTicketLock::new(Vec::new(), LockRank::PROCESS);
-
-static VMAR_MUTATION_LOCK: RankedIrqSafeTicketLock<()> =
-    RankedIrqSafeTicketLock::new((), LockRank::PROCESS);
 
 /// Queue the first userspace RIP/RSP pair for a just-created scheduler task.
 pub fn queue_user_entry(task_id: u64, entry: u64, rsp: u64) {

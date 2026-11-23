@@ -63,6 +63,8 @@ struct NvmeBlockIo {
     block_size: u32,
     /// Whether the capability allows writes.
     writable: bool,
+    model: String,
+    serial: String,
 }
 
 impl NvmeBlockIo {
@@ -74,11 +76,23 @@ impl NvmeBlockIo {
             .map_err(|e| format!("block info failed: {}", e.as_str()))?;
         let block_size = info.block_size.max(LBA_SIZE as u32);
         let total_lbas = info.block_count * u64::from(block_size / LBA_SIZE as u32);
+        let model = if info.model_str().is_empty() {
+            String::from("NVMe SSD")
+        } else {
+            String::from(info.model_str())
+        };
+        let serial = if info.serial_str().is_empty() {
+            String::from("-")
+        } else {
+            String::from(info.serial_str())
+        };
         Ok(Self {
             dev: RefCell::new(dev),
             total_lbas,
             block_size,
             writable,
+            model,
+            serial,
         })
     }
 }
@@ -281,6 +295,21 @@ impl Backend {
             Backend::Memory(_) => "/dev/mem",
         }
     }
+
+    fn hw_model(&self) -> &str {
+        match self {
+            Backend::Nvme(io) => &io.model,
+            Backend::Hxfs(_) => "HxFS-Image",
+            Backend::Memory(_) => "RAM-Disk",
+        }
+    }
+
+    fn hw_serial(&self) -> &str {
+        match self {
+            Backend::Nvme(io) => &io.serial,
+            Backend::Hxfs(_) | Backend::Memory(_) => "-",
+        }
+    }
 }
 
 impl BlockIo512 for Backend {
@@ -372,10 +401,12 @@ fn format_raw_list(volume: &BareVolume, total_lbas: u64) -> String {
     )
 }
 
-fn format_raw_inspect(volume: &BareVolume, total_lbas: u64) -> String {
+fn format_raw_inspect(volume: &BareVolume, total_lbas: u64, model: &str, serial: &str) -> String {
     let size_mib = total_lbas.saturating_mul(LBA_SIZE as u64) / (1024 * 1024);
     format!(
-        "layout={}\nlabel={}\ntotal_lbas={}\nsize_mib={}\nformat_version={}\ntype_system_version={}\nblock_size={}\ninstance_uuid={}\nsequence_number={}\nroot_state={}\ngpt=absent\nstatus=OK\n",
+        "model={}\nserial={}\nlayout={}\nlabel={}\ntotal_lbas={}\nsize_mib={}\nformat_version={}\ntype_system_version={}\nblock_size={}\ninstance_uuid={}\nsequence_number={}\nroot_state={}\ngpt=absent\nstatus=OK\n",
+        model,
+        serial,
         volume.layout_tag(),
         volume.layout_label(),
         total_lbas,
@@ -623,7 +654,12 @@ fn run() -> i32 {
                 Err(gpt_err) => {
                     return match probe_raw_hxfs(&io) {
                         Some(volume) => {
-                            let text = format_raw_inspect(&volume, io.total_lbas());
+                            let text = format_raw_inspect(
+                                &volume,
+                                io.total_lbas(),
+                                io.hw_model(),
+                                io.hw_serial(),
+                            );
                             let _ = stdio::stdout_str(&text);
                             0
                         }
@@ -632,7 +668,9 @@ fn run() -> i32 {
                 }
             };
             let mut out = format!(
-                "disk_lbas={}\nmbr_protective={}\ndisk_guid={}\nfirst_usable={}\nlast_usable={}\nheader_crc32={:#010x}\nentries_crc32={:#010x}\n",
+                "model={}\nserial={}\ndisk_lbas={}\nmbr_protective={}\ndisk_guid={}\nfirst_usable={}\nlast_usable={}\nheader_crc32={:#010x}\nentries_crc32={:#010x}\n",
+                io.hw_model(),
+                io.hw_serial(),
                 disk.disk_lbas,
                 disk.mbr.is_protective_gpt(),
                 disk.primary.disk_guid.format_uuid(),

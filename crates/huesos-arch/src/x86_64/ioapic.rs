@@ -407,6 +407,9 @@ pub fn route_legacy_irq(irq: u8) -> Result<IoApicRoute, IoApicError> {
         .config_for_legacy_irq(irq)
         .ok_or(IoApicError::InvalidOverrideFlags)?;
     let alias = (gsi != u32::from(irq)).then_some(gsi_event_key(gsi));
+    let destination_apic_id = find_route_index(&state, gsi)
+        .map(|idx| u32::from(state.routes[idx].entry.destination))
+        .unwrap_or_else(super::lapic::id);
     route_locked(
         &mut state,
         RouteRequest {
@@ -414,7 +417,7 @@ pub fn route_legacy_irq(irq: u8) -> Result<IoApicRoute, IoApicError> {
             primary_event: legacy_event_key(u32::from(irq)),
             alias_event: alias,
             config,
-            destination_apic_id: super::lapic::id(),
+            destination_apic_id,
             forced_vector: None,
             permanent: false,
         },
@@ -485,18 +488,22 @@ pub fn acquire_interrupt_route(irq_or_vector: u32) -> Option<bool> {
 /// source-override flags are used when the GSI is an ISA alias; otherwise PCI
 /// INTx electrical defaults are used until ACPI `_PRT`/link routing is wired.
 pub fn acquire_gsi_interrupt_route(gsi: u32) -> Option<bool> {
-    let config = {
+    let (config, destination_apic_id) = {
         let state = IOAPIC_STATE.lock();
         if !state.initialized {
             return None;
         }
-        match state.overrides.find_gsi(gsi).filter(|entry| entry.bus == 0) {
+        let config = match state.overrides.find_gsi(gsi).filter(|entry| entry.bus == 0) {
             Some(entry) => entry.config()?,
             None if gsi < 16 => RouteConfig::isa_default(),
             None => RouteConfig::pci_intx_default(),
-        }
+        };
+        let dest = find_route_index(&state, gsi)
+            .map(|idx| u32::from(state.routes[idx].entry.destination))
+            .unwrap_or_else(super::lapic::id);
+        (config, dest)
     };
-    route_gsi(gsi, config, super::lapic::id())
+    route_gsi(gsi, config, destination_apic_id)
         .ok()
         .map(|route| route.trigger == TriggerMode::Level && route.vector != KEYBOARD_VECTOR)
 }

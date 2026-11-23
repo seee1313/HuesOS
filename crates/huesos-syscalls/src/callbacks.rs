@@ -4,10 +4,10 @@ use alloc::sync::Arc;
 use huesos_abi::{
     ErrorCode, HeapExtendArgs, ResourceMapArgs, ResourceUnmapArgs, VmarMapArgs, VmarOpArgs,
 };
-use spin::Mutex;
+use spin::{Mutex, Once};
 
 /// Global yield callback (set by kernel scheduler to avoid circular deps).
-pub(crate) static YIELD_FN: Mutex<Option<fn()>> = Mutex::new(None);
+pub(crate) static YIELD_FN: Once<fn()> = Once::new();
 /// Global process-exit callback (set by kernel scheduler).
 pub(crate) static EXIT_FN: Mutex<Option<fn(i64) -> !>> = Mutex::new(None);
 /// Kernel debug sink callback.
@@ -18,7 +18,7 @@ pub type ShutdownFn = fn() -> Result<(), ErrorCode>;
 /// Global debug-write callback (set by kernel to point at the serial writer).
 pub(crate) static DEBUG_WRITE_FN: Mutex<Option<DebugWriteFn>> = Mutex::new(None);
 /// Global monotonic-clock callback.
-pub(crate) static CLOCK_FN: Mutex<Option<fn() -> u64>> = Mutex::new(None);
+pub(crate) static CLOCK_FN: Once<fn() -> u64> = Once::new();
 /// Global online-CPU mask callback.
 type CpuCountFn = fn() -> usize;
 type CpuOnlineFn = fn(usize) -> bool;
@@ -27,7 +27,7 @@ pub(crate) static CPU_MASK_FN: Mutex<Option<fn() -> u64>> = Mutex::new(None);
 pub(crate) static CPU_COUNT_FN: Mutex<Option<CpuCountFn>> = Mutex::new(None);
 pub(crate) static CPU_ONLINE_FN: Mutex<Option<CpuOnlineFn>> = Mutex::new(None);
 /// Global current-CPU callback.
-pub(crate) static CURRENT_CPU_FN: Mutex<Option<fn() -> usize>> = Mutex::new(None);
+pub(crate) static CURRENT_CPU_FN: Once<fn() -> usize> = Once::new();
 /// Global privileged shutdown callback.
 pub(crate) static SHUTDOWN_FN: Mutex<Option<ShutdownFn>> = Mutex::new(None);
 /// Scheduler snapshot callbacks: aggregate counters, then per-CPU.
@@ -107,7 +107,7 @@ pub(crate) static PROCESS_TERMINATE_FN: Mutex<Option<ProcessTerminateFn>> = Mute
 
 /// Set the yield function. Called once by kernel init.
 pub fn set_yield_fn(f: fn()) {
-    *YIELD_FN.lock() = Some(f);
+    YIELD_FN.call_once(|| f);
 }
 
 /// Set the process-exit function. Called once by kernel init.
@@ -122,7 +122,7 @@ pub fn set_debug_write_fn(f: DebugWriteFn) {
 
 /// Set the monotonic clock source. Called once by kernel init.
 pub fn set_clock_fn(f: fn() -> u64) {
-    *CLOCK_FN.lock() = Some(f);
+    CLOCK_FN.call_once(|| f);
 }
 
 /// Set the online CPU mask callback. Called once by kernel init.
@@ -158,7 +158,7 @@ pub fn set_task_count_fn(f: TaskCountFn) {
 
 /// Set the current dense CPU index callback. Called once by kernel init.
 pub fn set_current_cpu_fn(f: fn() -> usize) {
-    *CURRENT_CPU_FN.lock() = Some(f);
+    CURRENT_CPU_FN.call_once(|| f);
 }
 
 /// Set the privileged orderly-shutdown callback. Called once by kernel init.

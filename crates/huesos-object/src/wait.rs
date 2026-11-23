@@ -30,37 +30,27 @@ type CurrentTaskFn = fn() -> Option<TaskId>;
 type ParkFn = fn();
 type WakeFn = fn(TaskId);
 
-static CURRENT_TASK_FN: IrqSafeMutex<Option<CurrentTaskFn>> = IrqSafeMutex::new(None);
-static PARK_FN: IrqSafeMutex<Option<ParkFn>> = IrqSafeMutex::new(None);
-static WAKE_FN: IrqSafeMutex<Option<WakeFn>> = IrqSafeMutex::new(None);
+static CURRENT_TASK_FN: spin::Once<CurrentTaskFn> = spin::Once::new();
+static PARK_FN: spin::Once<ParkFn> = spin::Once::new();
+static WAKE_FN: spin::Once<WakeFn> = spin::Once::new();
 /// Monotonic tick counter (scheduler ticks), for wait timeouts.
-static TICKS_FN: IrqSafeMutex<Option<fn() -> u64>> = IrqSafeMutex::new(None);
+static TICKS_FN: spin::Once<fn() -> u64> = spin::Once::new();
 
 /// Register scheduler hooks. Called once from kernel init after the
 /// scheduler exists.
 pub fn set_scheduler_hooks(current_task: fn() -> Option<TaskId>, park: fn(), wake: fn(TaskId)) {
-    *CURRENT_TASK_FN.lock() = Some(current_task);
-    *PARK_FN.lock() = Some(park);
-    *WAKE_FN.lock() = Some(wake);
+    CURRENT_TASK_FN.call_once(|| current_task);
+    PARK_FN.call_once(|| park);
+    WAKE_FN.call_once(|| wake);
 }
 
 /// Register a monotonic tick source used by timed waits.
 pub fn set_ticks_fn(ticks: fn() -> u64) {
-    *TICKS_FN.lock() = Some(ticks);
+    TICKS_FN.call_once(|| ticks);
 }
 
 fn current_task_id() -> Option<TaskId> {
-    // Copy the `Option<fn>` out and drop the guard *before* calling it.
-    // `if let Some(f) = *MUTEX.lock() { f() }` (and the equivalent
-    // `.and_then`/`.map` chains on a `.lock()` temporary) extend the
-    // guard's lifetime across the whole arm/closure body, because the
-    // temporary in a `match`/`if let` scrutinee lives until the end of
-    // the enclosing expression. That is harmless for a short call, but
-    // `park_current` below calls into the scheduler's blocking park,
-    // which performs a real context switch and may not return for an
-    // arbitrary amount of time — see the `park_current` doc comment.
-    let current_task_fn = *CURRENT_TASK_FN.lock();
-    current_task_fn.and_then(|f| f())
+    CURRENT_TASK_FN.get().and_then(|f| f())
 }
 
 /// Current scheduler task id, if scheduler hooks are installed.
@@ -72,39 +62,20 @@ pub fn current_task() -> Option<TaskId> {
 }
 
 /// Park the current task via the scheduler-installed hook.
-///
-/// # Why the guard must be dropped before calling `f()`
-///
-/// This resolves to `huesos_kernel::scheduler::park_current`, which
-/// performs a real context switch and only returns once a matching
-/// `wake_task` call has made this task runnable again — that can be an
-/// arbitrarily long time later. Calling `f()` while still holding the
-/// `PARK_FN` lock guard (as `if let Some(f) = *PARK_FN.lock() { f() }`
-/// does, due to temporary lifetime extension in `if let` scrutinees)
-/// would mean interrupts stay disabled (an `IrqSafeMutex` guard, unlike a
-/// plain `spin::Mutex` guard, also holds interrupts off until dropped) for
-/// the entire time this task is parked — freezing the CPU's timer tick for
-/// as long as the park lasts, which can be forever. Copying the `Option<fn>`
-/// out and dropping the guard first, as below, restores interrupts before
-/// the context switch and matches the pattern already used by
-/// `huesos_syscalls::process::sys_yield`.
 fn park_current() {
-    let park_fn = *PARK_FN.lock();
-    if let Some(f) = park_fn {
+    if let Some(f) = PARK_FN.get() {
         f();
     }
 }
 
 fn wake_task(id: TaskId) {
-    let wake_fn = *WAKE_FN.lock();
-    if let Some(f) = wake_fn {
+    if let Some(f) = WAKE_FN.get() {
         f(id);
     }
 }
 
 fn now_ticks() -> u64 {
-    let ticks_fn = *TICKS_FN.lock();
-    ticks_fn.map(|f| f()).unwrap_or(0)
+    TICKS_FN.get().map_or(0, |f| f())
 }
 
 /// Yield to the scheduler without parking on a wait queue.
