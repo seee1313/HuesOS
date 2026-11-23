@@ -1,0 +1,11 @@
+[package]
+name = "msvcrt"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "msvcrt"
+crate-type = ["cdylib"]
+
+[dependencies]
+huesos-pe = { path = "../../../huesos-pe" }

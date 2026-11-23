@@ -11,6 +11,13 @@
 #[cfg(any(test, feature = "boot-selftest"))]
 extern crate alloc;
 
+pub mod hw;
+pub mod tables;
+
+pub use hw::{
+    fill_txdesc_checksum_16words, Rtl8821ceHw, Rtw8821cEfuseInfo, Rtw88Dma, RtwC2hEvent, RtwTxQueue,
+};
+
 pub const PCI_VENDOR_REALTEK: u16 = 0x10EC;
 pub const PCI_DEVICE_RTL8821CE: u16 = 0xC821;
 pub const RTW8821C_FW_SIGNATURE: u16 = 0x8821;
@@ -129,6 +136,7 @@ pub trait Rtw88Mmio {
     fn write8(&mut self, offset: u32, val: u8);
     fn write16(&mut self, offset: u32, val: u16);
     fn write32(&mut self, offset: u32, val: u32);
+    fn delay_us(&mut self, _us: u32) {}
 }
 
 /// Encode a 48-byte Realtek `rtw88` TX packet descriptor (`rtw_tx_pkt_info`)
@@ -144,14 +152,15 @@ pub fn encode_tx_pkt_desc(
     let qsel: u32 = if is_mgmt { 0x12 } else { 0x00 }; // QSEL_MGMT vs QSEL_BE
     let dw0 = u32::from(mpdu_len) | (48u32 << 16) | (1u32 << 26) | (1u32 << 27);
     let dw1 = qsel << 8;
-    // DW3: [15]=use_rate
-    let dw3 = 1u32 << 15;
+    // DW3: [8]=use_rate (RTW_TX_DESC_W3_USE_RATE = BIT(8))
+    let dw3 = 1u32 << 8;
     // DW4: [6:0]=datarate (e.g. DESC_RATE6M = 0x04 or MCS7 = 0x13)
     let dw4 = u32::from(rate_id & 0x7F);
     out[0..4].copy_from_slice(&dw0.to_le_bytes());
     out[4..8].copy_from_slice(&dw1.to_le_bytes());
     out[12..16].copy_from_slice(&dw3.to_le_bytes());
     out[16..20].copy_from_slice(&dw4.to_le_bytes());
+    hw::fill_txdesc_checksum_16words(out);
 }
 
 /// Decode a 24-byte Realtek `rtw88` RX packet descriptor (`rtw_rx_pkt_stat`),
@@ -713,5 +722,157 @@ mod tests {
         .unwrap_or(0);
         med.transmit_sta_mpdu(10, &req[..len]);
         assert!(med.poll_rx_mpdu().is_some());
+    }
+
+    struct MockBar2 {
+        regs: alloc::vec::Vec<u8>,
+        efuse_rom: [u8; 512],
+    }
+
+    impl MockBar2 {
+        fn new() -> Self {
+            let mut regs = alloc::vec![0u8; 0x4000];
+            regs[0x0100] = 0xEA; // initial powered-off REG_CR
+            regs[0x00F1] = 0x10; // cut B in REG_SYS_CFG1
+                                 // Encode a valid Realtek 2-byte EFUSE packet for logical block 0x1A (`0xD0..0xD6` MAC)
+                                 // blk_idx = 26 (0x1A): hdr1 = ((26 & 7) << 5) | 0x0F = 0x4F, hdr2 = ((26 >> 3) << 4) | 0x08 = 0x38 (words 0,1,2 enabled)
+            let mut efuse_rom = [0xFFu8; 512];
+            efuse_rom[0] = 0x4F;
+            efuse_rom[1] = 0x38;
+            efuse_rom[2..8].copy_from_slice(&[0x74, 0xD8, 0x3E, 0x88, 0x21, 0xCE]);
+            Self { regs, efuse_rom }
+        }
+    }
+
+    impl Rtw88Mmio for MockBar2 {
+        fn read8(&self, off: u32) -> u8 {
+            let o = off as usize;
+            match off {
+                0x0006 => self.regs[o] | 0x02,
+                0x0005 => self.regs[o] & !0x03,
+                0x0208 => self.regs[o] & !0x01,
+                _ => *self.regs.get(o).unwrap_or(&0),
+            }
+        }
+        fn read16(&self, off: u32) -> u16 {
+            u16::from_le_bytes([self.read8(off), self.read8(off + 1)])
+        }
+        fn read32(&self, off: u32) -> u32 {
+            u32::from_le_bytes([
+                self.read8(off),
+                self.read8(off + 1),
+                self.read8(off + 2),
+                self.read8(off + 3),
+            ])
+        }
+        fn write8(&mut self, off: u32, mut val: u8) {
+            let o = off as usize;
+            if off == 0x03F2 || off == 0x01CC {
+                val = 0; // DBI / HMETFR immediately ready
+            }
+            if off == 0x0383 && (val & (1 << 4)) != 0 {
+                // BCNQ transfer complete -> set BIT_BCN_VALID_V1 in 0x0205
+                self.regs[0x0205] |= 0x80;
+            }
+            if o < self.regs.len() {
+                self.regs[o] = val;
+            }
+        }
+        fn write16(&mut self, off: u32, mut val: u16) {
+            if off == 0x0080 && (val & (1 << 14)) != 0 {
+                val |= 1 << 15; // WCPU sets BIT_FW_INIT_RDY once BIT_FW_DW_RDY is set
+            }
+            let b = val.to_le_bytes();
+            self.write8(off, b[0]);
+            self.write8(off + 1, b[1]);
+        }
+        fn write32(&mut self, off: u32, mut val: u32) {
+            if off == 0x0030 && (val & (1 << 31)) == 0 {
+                let addr = ((val >> 8) & 0x1FF) as usize;
+                val = (val & !0xFF) | u32::from(self.efuse_rom[addr]) | (1 << 31);
+            }
+            if off == 0x1208 {
+                val &= !((1 << 31) | (1 << 27)); // DDMA completes with valid checksum
+            }
+            if off == 0x03F8 {
+                val &= !(1 << 5); // MDIO write completes
+            }
+            if off == 0x0C90 {
+                // Mirror SIPI RF write into direct RF read window 0x2800
+                let rf_addr = (val >> 20) & 0xFF;
+                let rf_data = if rf_addr == 0x08 { 0 } else { val & 0xFFFFF };
+                let direct = (0x2800 + (rf_addr << 2)) as usize;
+                if direct + 4 <= self.regs.len() {
+                    self.regs[direct..direct + 4].copy_from_slice(&rf_data.to_le_bytes());
+                }
+            }
+            let b = val.to_le_bytes();
+            for i in 0..4 {
+                if (off as usize) + i < self.regs.len() {
+                    self.regs[(off as usize) + i] = b[i];
+                }
+            }
+            // Simulate IQK completion in RF 0x08 when H2C IQK runs
+            if off == 0x1320 || off == 0x0308 {
+                let iqk_done = 0x000A_BCDEu32.to_le_bytes();
+                self.regs[0x2820..0x2824].copy_from_slice(&iqk_done);
+            }
+        }
+    }
+
+    struct MockDma(alloc::vec::Vec<u8>);
+    impl Rtw88Dma for MockDma {
+        fn phys_base(&self) -> u32 {
+            0x0440_0000
+        }
+        fn len(&self) -> usize {
+            self.0.len()
+        }
+        fn read_bytes(&self, offset: usize, dst: &mut [u8]) {
+            dst.copy_from_slice(&self.0[offset..offset + dst.len()]);
+        }
+        fn write_bytes(&mut self, offset: usize, src: &[u8]) {
+            self.0[offset..offset + src.len()].copy_from_slice(src);
+        }
+    }
+
+    #[test]
+    fn full_rtl8821ce_silicon_init_efuse_fw_tables_and_softap_beacon() {
+        let fw = include_bytes!("../../../third_party/firmware/rtw88/rtw8821c_fw.bin");
+        let mut bar2 = MockBar2::new();
+        let mut dma = MockDma(alloc::vec![0u8; 0x30_0000]);
+        let mut hw = Rtl8821ceHw::new();
+
+        assert_eq!(hw.init_hardware(&mut bar2, &mut dma, fw), Ok(()));
+        assert!(hw.initialized);
+        assert_eq!(hw.efuse.mac_addr, [0x74, 0xD8, 0x3E, 0x88, 0x21, 0xCE]);
+
+        // Tune to 5 GHz channel 36 (80 MHz) and check RF 0x18
+        hw.set_channel(&mut bar2, 36, 80);
+        let rf18 = hw.read_rf(&bar2, 0x18, 0xFFFFF);
+        assert_eq!(rf18 & 0xFF, 36);
+        assert_ne!(rf18 & (1 << 16), 0); // 5 GHz band bit
+
+        // Configure real SoftAP beacon
+        let mut bcn = [0u8; 160];
+        let bcn_len = huesos_ieee80211::build_beacon_or_probe_resp(
+            false,
+            [0xFF; 6],
+            hw.efuse.mac_addr,
+            b"HuesOS-AP",
+            6,
+            huesos_ieee80211::SecurityMode::Wpa2PskCcmp,
+            1,
+            &mut bcn,
+        )
+        .unwrap_or(0);
+        assert!(bcn_len > 36);
+        let ap_mac = hw.efuse.mac_addr;
+        assert_eq!(
+            hw.configure_ap_mode(&mut bar2, &mut dma, &ap_mac, &bcn[..bcn_len], 100),
+            Ok(())
+        );
+        // Verify RTW_NET_AP_MODE (3) in REG_CR [17:16]
+        assert_eq!((bar2.read32(0x0100) >> 16) & 0x3, 3);
     }
 }

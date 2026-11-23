@@ -2,7 +2,7 @@
 //! bridge contract between `/lib/ld-pe.so` and `/lib/ntdll.dll`.
 
 /// Version tag of [`PeHostApi`].
-pub const PE_HOST_API_VERSION: u32 = 1;
+pub const PE_HOST_API_VERSION: u32 = 2;
 
 /// Exported binder symbol in `ntdll.dll` invoked by `/lib/ld-pe.so` immediately
 /// after relocating `ntdll.dll` and before `DllMain(DLL_PROCESS_ATTACH)`.
@@ -240,13 +240,83 @@ pub struct SystemInfo64 {
     pub processor_revision: u16,
 }
 
+/// Win64 `CONTEXT` (1232 bytes, 16-byte aligned on x64).
+///
+/// Matches the exact Microsoft x64 ABI byte offsets for `ContextFlags` (`0x30`),
+/// `Rax..R15` (`0x78..0xF8`), `Rip` (`0xF8`), and `EFlags` (`0x44`).
+#[repr(C, align(16))]
+#[derive(Clone, Copy)]
+pub struct Win64Context {
+    pub p1_home: u64,
+    pub p2_home: u64,
+    pub p3_home: u64,
+    pub p4_home: u64,
+    pub p5_home: u64,
+    pub p6_home: u64,
+    pub context_flags: u32,
+    pub mx_csr: u32,
+    pub seg_cs: u16,
+    pub seg_ds: u16,
+    pub seg_es: u16,
+    pub seg_fs: u16,
+    pub seg_gs: u16,
+    pub seg_ss: u16,
+    pub eflags: u32,
+    pub dr0: u64,
+    pub dr1: u64,
+    pub dr2: u64,
+    pub dr3: u64,
+    pub dr6: u64,
+    pub dr7: u64,
+    /// General-purpose registers `[rax, rcx, rdx, rbx, rsp, rbp, rsi, rdi, r8..r15]` at `0x78`.
+    pub gpr: [u64; 16],
+    /// Instruction pointer at `0xF8`.
+    pub rip: u64,
+    /// FXSAVE / XMM area + vector registers (`0x100..0x4D0`).
+    pub flt_and_vector_area: [u8; 0x3D0],
+}
+
+impl Win64Context {
+    pub const fn zeroed() -> Self {
+        Self {
+            p1_home: 0,
+            p2_home: 0,
+            p3_home: 0,
+            p4_home: 0,
+            p5_home: 0,
+            p6_home: 0,
+            context_flags: 0x0010_000B,
+            mx_csr: 0x1F80,
+            seg_cs: 0x33,
+            seg_ds: 0x2B,
+            seg_es: 0x2B,
+            seg_fs: 0x53,
+            seg_gs: 0x2B,
+            seg_ss: 0x2B,
+            eflags: 0x202,
+            dr0: 0,
+            dr1: 0,
+            dr2: 0,
+            dr3: 0,
+            dr6: 0,
+            dr7: 0,
+            gpr: [0; 16],
+            rip: 0,
+            flt_and_vector_area: [0; 0x3D0],
+        }
+    }
+}
+
 /// Win64 thread start routine (`LPTHREAD_START_ROUTINE`).
 pub type Win64ThreadStart = extern "win64" fn(usize) -> u32;
+
+/// Win64 FLS destructor callback (`PFLS_CALLBACK_FUNCTION`).
+pub type Win64FlsCallback = unsafe extern "win64" fn(usize);
 
 /// Host capability bridge table exported by `/lib/ld-pe.so` to `/lib/ntdll.dll`.
 ///
 /// Every callback uses the Microsoft x64 (`extern "win64"`) calling convention
-/// so `ntdll.dll` invokes them directly without ABI thunks.
+/// so `ntdll.dll` and companion Win64 system DLLs invoke them directly.
 #[repr(C)]
 pub struct PeHostApi {
     /// Struct version (`PE_HOST_API_VERSION`).
@@ -339,4 +409,29 @@ pub struct PeHostApi {
     pub sleep_ms: extern "win64" fn(u32),
     /// Online logical processor count (`GetSystemInfo`).
     pub get_num_cpus: extern "win64" fn() -> u32,
+    /// `.pdata` `RtlLookupFunctionEntry` across loaded PE32+ modules and dynamic function tables.
+    pub lookup_function_entry: extern "win64" fn(u64, *mut u64) -> usize,
+    /// `.xdata` `RtlVirtualUnwind` single frame step.
+    pub virtual_unwind_step:
+        extern "win64" fn(u32, u64, u64, usize, *mut Win64Context, *mut usize, *mut u64) -> usize,
+    /// `RtlAddFunctionTable` dynamic `.pdata` registration (`JIT` / dynamic frames).
+    pub add_function_table: extern "win64" fn(usize, u32, u64) -> u8,
+    /// `RtlDeleteFunctionTable` unregistration.
+    pub delete_function_table: extern "win64" fn(usize) -> u8,
+    /// Kernel CSPRNG buffer fill (`BCryptGenRandom` / `ProcessPrng` / `RtlGenRandom`).
+    pub gen_random: extern "win64" fn(*mut u8, usize) -> i32,
+    /// Winsock2 DNS IPv4 resolver (`0` = ok, non-zero = WSA error).
+    pub net_resolve_ipv4: extern "win64" fn(*const u8, usize, *mut u32) -> i32,
+    /// Winsock2 TCP socket create (`INVALID_SOCKET = usize::MAX` on failure).
+    pub net_tcp_socket: extern "win64" fn() -> usize,
+    /// Winsock2 TCP connect (`ip_be`, `port_host`, returns `0` or WSA error).
+    pub net_tcp_connect: extern "win64" fn(usize, u32, u16) -> i32,
+    /// Winsock2 TCP send (`>= 0` bytes sent or `-wsa_err`).
+    pub net_tcp_send: extern "win64" fn(usize, *const u8, usize) -> isize,
+    /// Winsock2 TCP recv (`>= 0` bytes read or `-wsa_err`).
+    pub net_tcp_recv: extern "win64" fn(usize, *mut u8, usize) -> isize,
+    /// Winsock2 TCP nonblocking toggle (`0` = ok).
+    pub net_tcp_set_nonblocking: extern "win64" fn(usize, u32) -> i32,
+    /// Winsock2 TCP closesocket (`0` = ok).
+    pub net_tcp_close: extern "win64" fn(usize) -> i32,
 }

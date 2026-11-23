@@ -19,5 +19,9 @@ path = "src/bin/win_threads.rs"
 name = "win-bench"
 path = "src/bin/win_bench.rs"
 
+[[bin]]
+name = "win-crt-smoke"
+path = "src/bin/win_crt_smoke.rs"
+
 [dependencies]
 huesos-pe = { path = "../../../huesos-pe" }

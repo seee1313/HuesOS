@@ -1,0 +1,7 @@
+Mozilla Included CA Certificate List (`ca-certificates.pem`)
+
+The root CA certificates in `third_party/certs/ca-certificates.pem` (packaged into
+HuesOS BOOTFS at `/etc/ssl/certs.pem`) originate from the Mozilla NSS `certdata.txt`
+root store distributed under the Mozilla Public License Version 2.0 (MPL-2.0).
+
+Full license text: https://mozilla.org/MPL/2.0/

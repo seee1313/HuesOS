@@ -229,6 +229,7 @@ required+=(
     '[hsh] huesos-std smoke OK'
     '[hsh] PE64 win-hello.exe OK'
     '[hsh] PE64 win-threads.exe OK'
+    '[hsh] PE64 win-crt-smoke.exe OK'
     '[hsh] wlanctl scan + WPA2 connect OK'
     '[hsh] @caps(net=ro,wlan=ro) enforcement OK'
     '[hsh] df usage OK'

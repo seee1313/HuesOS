@@ -1,0 +1,15 @@
+[package]
+name = "huesos-tls"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+aead = { version = "0.5.2", default-features = false, features = ["alloc"] }
+aes-gcm = { version = "0.10.3", default-features = false, features = ["aes", "alloc"] }
+curve25519-dalek = { version = "4.1.3", default-features = false }
+ed25519-dalek = { version = "2.2.0", default-features = false }
+hkdf = { version = "0.12.4", default-features = false }
+hmac = { version = "0.12.1", default-features = false }
+sha2 = { version = "0.10.9", default-features = false }
+subtle = { version = "2.6.1", default-features = false }

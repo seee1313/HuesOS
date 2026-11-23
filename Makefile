@@ -87,6 +87,7 @@ test:
 		-p huesos-ieee80211 \
 		-p huesos-wpa \
 		-p huesos-rtw88 \
+		-p huesos-tls \
 		--target x86_64-unknown-linux-gnu
 
 # The ordinary host suite builds huesos-hxfs without optional engines. This

@@ -511,11 +511,24 @@ fn track_userspace_inputs(userspace_root: &Path) {
         "crates/huesos-scudo",
         "crates/huesos-hsh",
         "crates/huesos-gpt",
+        "crates/huesos-rtw88",
+        "crates/huesos-tls",
     ] {
         println!("cargo:rerun-if-changed={crate_dir}");
         println!("cargo:rerun-if-changed={crate_dir}/src");
     }
-    for sub in ["", "ntdll/src", "kernel32/src", "win-apps/src"] {
+    for sub in [
+        "",
+        "ntdll/src",
+        "kernel32/src",
+        "ucrtbase/src",
+        "msvcrt/src",
+        "ws2_32/src",
+        "bcrypt/src",
+        "bcryptprimitives/src",
+        "advapi32/src",
+        "win-apps/src",
+    ] {
         println!(
             "cargo:rerun-if-changed={}",
             userspace_root.join("win64-runtime").join(sub).display()
@@ -750,7 +763,24 @@ fn build_win64_runtime(userspace_root: &Path, _profile: &str, boot_selftest: boo
     if boot_selftest {
         command.arg("--workspace");
     } else {
-        command.args(["-p", "ntdll", "-p", "kernel32"]);
+        command.args([
+            "-p",
+            "ntdll",
+            "-p",
+            "kernel32",
+            "-p",
+            "ucrtbase",
+            "-p",
+            "msvcrt",
+            "-p",
+            "ws2_32",
+            "-p",
+            "bcrypt",
+            "-p",
+            "bcryptprimitives",
+            "-p",
+            "advapi32",
+        ]);
     }
     command.arg("--target-dir").arg(&target_dir);
     let status = match command.status() {
@@ -1415,10 +1445,44 @@ fn build_bootfs_image(manifest_dir: &Path, inputs: BootfsInputs<'_>) -> PathBuf 
             data: read_build_input(&inputs.win64_dir.join("kernel32.dll"), "kernel32.dll"),
         },
         BootFsFile {
+            path: "/lib/ucrtbase.dll",
+            data: read_build_input(&inputs.win64_dir.join("ucrtbase.dll"), "ucrtbase.dll"),
+        },
+        BootFsFile {
+            path: "/lib/msvcrt.dll",
+            data: read_build_input(&inputs.win64_dir.join("msvcrt.dll"), "msvcrt.dll"),
+        },
+        BootFsFile {
+            path: "/lib/ws2_32.dll",
+            data: read_build_input(&inputs.win64_dir.join("ws2_32.dll"), "ws2_32.dll"),
+        },
+        BootFsFile {
+            path: "/lib/bcrypt.dll",
+            data: read_build_input(&inputs.win64_dir.join("bcrypt.dll"), "bcrypt.dll"),
+        },
+        BootFsFile {
+            path: "/lib/bcryptprimitives.dll",
+            data: read_build_input(
+                &inputs.win64_dir.join("bcryptprimitives.dll"),
+                "bcryptprimitives.dll",
+            ),
+        },
+        BootFsFile {
+            path: "/lib/advapi32.dll",
+            data: read_build_input(&inputs.win64_dir.join("advapi32.dll"), "advapi32.dll"),
+        },
+        BootFsFile {
             path: "/lib/firmware/rtw88/rtw8821c_fw.bin",
             data: read_build_input(
                 &manifest_dir.join("../../third_party/firmware/rtw88/rtw8821c_fw.bin"),
                 "Realtek RTL8821CE firmware",
+            ),
+        },
+        BootFsFile {
+            path: "/etc/ssl/certs.pem",
+            data: read_build_input(
+                &manifest_dir.join("../../third_party/certs/ca-certificates.pem"),
+                "WebPKI Root CA Bundle",
             ),
         },
         BootFsFile {
@@ -1445,6 +1509,13 @@ fn build_bootfs_image(manifest_dir: &Path, inputs: BootfsInputs<'_>) -> PathBuf 
         files.push(BootFsFile {
             path: "/bin/win-bench.exe",
             data: read_build_input(&inputs.win64_dir.join("win-bench.exe"), "win-bench.exe"),
+        });
+        files.push(BootFsFile {
+            path: "/bin/win-crt-smoke.exe",
+            data: read_build_input(
+                &inputs.win64_dir.join("win-crt-smoke.exe"),
+                "win-crt-smoke.exe",
+            ),
         });
     }
     if let Some(smoke_plugin_so) = inputs.smoke_plugin_so {
@@ -1477,6 +1548,7 @@ fn build_bootfs_hash_manifest(files: &[BootFsFile]) -> Vec<u8> {
             || file.path.ends_with(".exe")
             || file.path.ends_with(".hdriver")
             || file.path == "/lib/firmware/rtw88/rtw8821c_fw.bin"
+            || file.path == "/etc/ssl/certs.pem"
             || file.path == "/storage/boot-drivers.manifest";
         if !trusted {
             continue;

@@ -1,12 +1,12 @@
 {
-  "rust_files": 411,
-  "rust_lines": 199767,
+  "rust_files": 426,
+  "rust_lines": 215357,
   "totals": {
     "expect_calls": 62,
     "panic_macros": 13,
     "static_mut": 1,
     "todo_markers": 1,
-    "unsafe_blocks": 867,
+    "unsafe_blocks": 1029,
     "unsafe_functions": 95,
     "unsafe_impls": 38,
     "unwrap_calls": 21
@@ -70,7 +70,7 @@
     "crates/huesos-userspace/fault-probe/src/main.rs": 4,
     "crates/huesos-userspace/hxfs-service/src/main.rs": 1,
     "crates/huesos-userspace/ld-huesos/src/main.rs": 83,
-    "crates/huesos-userspace/ld-pe/src/main.rs": 51,
+    "crates/huesos-userspace/ld-pe/src/main.rs": 62,
     "crates/huesos-userspace/libcanvas/src/c_abi.rs": 144,
     "crates/huesos-userspace/libcanvas/src/channel.rs": 8,
     "crates/huesos-userspace/libcanvas/src/dl.rs": 11,
@@ -94,12 +94,19 @@
     "crates/huesos-userspace/uacpi-runtime/src/namespace.rs": 1,
     "crates/huesos-userspace/uacpi-runtime/src/primitives.rs": 3,
     "crates/huesos-userspace/uacpi-runtime/src/roots.rs": 1,
-    "crates/huesos-userspace/win64-runtime/kernel32/src/lib.rs": 59,
-    "crates/huesos-userspace/win64-runtime/ntdll/src/lib.rs": 40,
+    "crates/huesos-userspace/win64-runtime/advapi32/src/lib.rs": 11,
+    "crates/huesos-userspace/win64-runtime/bcrypt/src/lib.rs": 4,
+    "crates/huesos-userspace/win64-runtime/bcryptprimitives/src/lib.rs": 3,
+    "crates/huesos-userspace/win64-runtime/kernel32/src/lib.rs": 86,
+    "crates/huesos-userspace/win64-runtime/msvcrt/src/lib.rs": 5,
+    "crates/huesos-userspace/win64-runtime/ntdll/src/lib.rs": 47,
+    "crates/huesos-userspace/win64-runtime/ucrtbase/src/lib.rs": 62,
     "crates/huesos-userspace/win64-runtime/win-apps/src/bin/win_bench.rs": 13,
+    "crates/huesos-userspace/win64-runtime/win-apps/src/bin/win_crt_smoke.rs": 12,
     "crates/huesos-userspace/win64-runtime/win-apps/src/bin/win_hello.rs": 23,
     "crates/huesos-userspace/win64-runtime/win-apps/src/bin/win_threads.rs": 21,
     "crates/huesos-userspace/win64-runtime/win-apps/src/lib.rs": 4,
-    "crates/huesos-userspace/wlan-service/src/main.rs": 13
+    "crates/huesos-userspace/win64-runtime/ws2_32/src/lib.rs": 21,
+    "crates/huesos-userspace/wlan-service/src/main.rs": 12
   }
 }

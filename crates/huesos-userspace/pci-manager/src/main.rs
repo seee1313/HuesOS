@@ -39,8 +39,8 @@
 
 extern crate alloc;
 
-use alloc::format;
 use alloc::vec::Vec;
+use core::fmt::Write as _;
 use core::panic::PanicInfo;
 use huesos_abi::hmcf;
 use huesos_abi::pci::{self as abi_pci, ApertureKind, RootBridgeTable};
@@ -1274,6 +1274,7 @@ fn run_live_bar_inventory_and_planner(
         Ok(live) => live,
         Err(err) => {
             println!("[pci-manager] obs e1-bar status=error detail={:?}", err);
+            publish_zero_bindings_if_needed(bootstrap, authority, manager_generation);
             return;
         }
     };
@@ -1299,27 +1300,65 @@ fn run_live_bar_inventory_and_planner(
         );
     }
 
-    if !live.validation.is_conflict_free() {
-        println!(
-            "[pci-manager] obs f2-plan status=skipped reason=validation-not-conflict-free roms={}",
-            live.rom_bars.len()
-        );
-        authority.live_validation = Some(live.validation);
-        return;
-    }
-
-    let plan =
-        match resource_planner::plan_firmware_preserving(&snapshot, &apertures, &live.validation) {
-            Ok(plan) => plan,
-            Err(err) => {
+    let effective_validation = if live.validation.is_conflict_free() {
+        live.validation
+    } else {
+        // Real x86/AMD firmware occasionally leaves chipset-internal BARs (e.g.
+        // SMBus/PSP/IOMMU) in motherboard-reserved space outside PCI _CRS.
+        // Isolate only the offending resources so conflict-free endpoints
+        // (NVMe, VirtIO, Wi-Fi) still plan, bind, and settle boot cleanly.
+        let mut clean_resources = Vec::new();
+        for entry in live.validation.resources() {
+            if matches!(
+                entry.status,
+                ResourceStatus::Valid | ResourceStatus::Fixed | ResourceStatus::Unassigned
+            ) {
+                clean_resources.push(entry.resource);
+            } else {
                 println!(
-                    "[pci-manager] obs f2-plan status=plan-error detail={:?}",
-                    err
+                    "[pci-manager] obs f2-isolate bdf={:02x}:{:02x}.{} reg={:?} status={}",
+                    entry.resource.owner.bus(),
+                    entry.resource.owner.device(),
+                    entry.resource.owner.function(),
+                    entry.resource.register,
+                    resource_status_label(entry.status)
+                );
+            }
+        }
+        match huesos_pci::resource_validation::validate_firmware_resources(
+            &snapshot,
+            &apertures,
+            &clean_resources,
+        ) {
+            Ok(revalidated) if revalidated.is_conflict_free() => revalidated,
+            _ => {
+                println!(
+                    "[pci-manager] obs f2-plan status=skipped reason=validation-not-conflict-free roms={}",
+                    live.rom_bars.len()
                 );
                 authority.live_validation = Some(live.validation);
+                publish_zero_bindings_if_needed(bootstrap, authority, manager_generation);
                 return;
             }
-        };
+        }
+    };
+
+    let plan = match resource_planner::plan_firmware_preserving(
+        &snapshot,
+        &apertures,
+        &effective_validation,
+    ) {
+        Ok(plan) => plan,
+        Err(err) => {
+            println!(
+                "[pci-manager] obs f2-plan status=plan-error detail={:?}",
+                err
+            );
+            authority.live_validation = Some(effective_validation);
+            publish_zero_bindings_if_needed(bootstrap, authority, manager_generation);
+            return;
+        }
+    };
 
     let commit_plan = match resource_planner::build_commit_plan(&snapshot, &plan, &mut transport) {
         Ok(cp) => cp,
@@ -1328,8 +1367,9 @@ fn run_live_bar_inventory_and_planner(
                 "[pci-manager] obs f2-plan status=commit-build-error detail={:?}",
                 err
             );
-            authority.live_validation = Some(live.validation);
+            authority.live_validation = Some(effective_validation);
             authority.resource_plan = Some(plan);
+            publish_zero_bindings_if_needed(bootstrap, authority, manager_generation);
             return;
         }
     };
@@ -1341,6 +1381,7 @@ fn run_live_bar_inventory_and_planner(
                 "[pci-manager] obs f2-plan status=commit-error detail={:?} writes={}",
                 err, writes_len
             );
+            publish_zero_bindings_if_needed(bootstrap, authority, manager_generation);
             return;
         }
     }
@@ -1351,9 +1392,59 @@ fn run_live_bar_inventory_and_planner(
         writes_len,
         live.rom_bars.len()
     );
-    authority.live_validation = Some(live.validation);
+    authority.live_validation = Some(effective_validation);
     authority.resource_plan = Some(plan);
     establish_device_leases(bootstrap, authority, manager_generation);
+}
+
+fn publish_zero_bindings_if_needed(
+    bootstrap: &Channel,
+    authority: &mut ConfigAuthority,
+    manager_generation: u64,
+) {
+    if !authority.binding_published {
+        authority.binding_published = true;
+        let _ = send(
+            bootstrap,
+            Message::driver_binding_published(manager_generation, 0),
+        );
+    }
+}
+
+fn enable_ancestor_bridges(
+    topology: &huesos_pci::topology::TopologySnapshot,
+    endpoint: PciAddress,
+    transport: &mut ReadWriteTransport<'_>,
+    max_config_bytes: u16,
+) {
+    let mut parent = topology.find(endpoint).map(|n| n.parent);
+    let mut hops = 0usize;
+    while let Some(huesos_pci::topology::Parent::Bridge(bridge_addr)) = parent {
+        if hops >= 16 {
+            break;
+        }
+        hops += 1;
+        if let Some(cur_cmd) = transport.read_width(bridge_addr, OFFSET_COMMAND, ConfigWidth::Word)
+        {
+            let want_bits = 0x0007u32;
+            if (cur_cmd & want_bits) != want_bits {
+                let req = WriteRequest {
+                    address: bridge_addr,
+                    header_kind: HeaderKind::Type1Bridge,
+                    class: WriteClass::CommandControl,
+                    offset: OFFSET_COMMAND,
+                    width: ConfigWidth::Word,
+                    max_config_bytes,
+                    value: cur_cmd | want_bits,
+                    write_mask: want_bits,
+                    expected_readback_mask: 0x0006,
+                    allowlist_entry: None,
+                };
+                let _ = write_policy::execute_checked_write(transport, &req);
+            }
+        }
+        parent = topology.find(bridge_addr).map(|n| n.parent);
+    }
 }
 
 fn establish_device_leases(
@@ -1424,9 +1515,159 @@ fn establish_device_leases(
         }
     }
 
-    if !authority.binding_published && !authority.leases.is_empty() {
-        authority.binding_published = true;
-        run_driver_binding_and_handoff(bootstrap, authority, manager_generation);
+    if !authority.binding_published {
+        if !authority.leases.is_empty() {
+            authority.binding_published = true;
+            run_driver_binding_and_handoff(bootstrap, authority, manager_generation);
+        } else {
+            publish_zero_bindings_if_needed(bootstrap, authority, manager_generation);
+        }
+    }
+}
+
+struct StackLabel {
+    buf: [u8; 96],
+    len: usize,
+}
+
+impl StackLabel {
+    const fn new() -> Self {
+        Self {
+            buf: [0u8; 96],
+            len: 0,
+        }
+    }
+
+    fn as_bytes(&self) -> &[u8] {
+        &self.buf[..self.len]
+    }
+}
+
+impl core::fmt::Write for StackLabel {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        let bytes = s.as_bytes();
+        let avail = self.buf.len().saturating_sub(self.len);
+        if bytes.len() > avail {
+            return Err(core::fmt::Error);
+        }
+        self.buf[self.len..self.len + bytes.len()].copy_from_slice(bytes);
+        self.len += bytes.len();
+        Ok(())
+    }
+}
+
+fn mint_ro_metadata_vmo(payload: &[u8]) -> Option<Handle> {
+    let vmo = Vmo::create(payload.len() as u64).ok()?;
+    if vmo.write(0, payload) != Ok(payload.len()) {
+        return None;
+    }
+    let ro = vmo
+        .duplicate(rights::READ | rights::DUPLICATE | rights::TRANSFER)
+        .ok()?;
+    Some(ro.into_handle())
+}
+
+#[derive(Clone, Copy, Default)]
+struct VirtioPciCapRegion {
+    present: bool,
+    bar: u8,
+    offset: u32,
+    length: u32,
+    notify_multiplier: u32,
+}
+
+fn parse_virtio_modern_caps(
+    cfg: &[u8; 256],
+    caps: &[huesos_pci::capability::ConventionalCapability],
+) -> Option<(
+    VirtioPciCapRegion,
+    VirtioPciCapRegion,
+    VirtioPciCapRegion,
+    VirtioPciCapRegion,
+)> {
+    let mut common = VirtioPciCapRegion::default();
+    let mut notify = VirtioPciCapRegion::default();
+    let mut isr = VirtioPciCapRegion::default();
+    let mut device = VirtioPciCapRegion::default();
+
+    for cap in caps {
+        if cap.id != 0x09 {
+            continue;
+        }
+        let off = usize::from(cap.offset);
+        if off + 16 > cfg.len() {
+            continue;
+        }
+        let cap_len = usize::from(cfg[off + 2]);
+        if cap_len < 16 || off + cap_len > cfg.len() {
+            continue;
+        }
+        let cfg_type = cfg[off + 3];
+        let bar = cfg[off + 4];
+        if bar >= 6 {
+            continue;
+        }
+        let region_off =
+            u32::from_le_bytes([cfg[off + 8], cfg[off + 9], cfg[off + 10], cfg[off + 11]]);
+        let region_len =
+            u32::from_le_bytes([cfg[off + 12], cfg[off + 13], cfg[off + 14], cfg[off + 15]]);
+        if region_len == 0 {
+            continue;
+        }
+        match cfg_type {
+            1 if !common.present => {
+                common = VirtioPciCapRegion {
+                    present: true,
+                    bar,
+                    offset: region_off,
+                    length: region_len,
+                    notify_multiplier: 0,
+                };
+            }
+            2 if !notify.present && cap_len >= 20 => {
+                let Some(mult_bytes) = cfg.get(off + 16..off + 20) else {
+                    continue;
+                };
+                let mult = u32::from_le_bytes([
+                    mult_bytes[0],
+                    mult_bytes[1],
+                    mult_bytes[2],
+                    mult_bytes[3],
+                ]);
+                notify = VirtioPciCapRegion {
+                    present: true,
+                    bar,
+                    offset: region_off,
+                    length: region_len,
+                    notify_multiplier: mult,
+                };
+            }
+            3 if !isr.present => {
+                isr = VirtioPciCapRegion {
+                    present: true,
+                    bar,
+                    offset: region_off,
+                    length: region_len,
+                    notify_multiplier: 0,
+                };
+            }
+            4 if !device.present => {
+                device = VirtioPciCapRegion {
+                    present: true,
+                    bar,
+                    offset: region_off,
+                    length: region_len,
+                    notify_multiplier: 0,
+                };
+            }
+            _ => {}
+        }
+    }
+
+    if common.present && notify.present && isr.present && device.present {
+        Some((common, notify, isr, device))
+    } else {
+        None
     }
 }
 
@@ -1506,6 +1747,22 @@ fn run_driver_binding_and_handoff(
             allow_polling_fallback: true,
         },
         DriverManifestSpec {
+            driver_name: "net-service",
+            match_rule: DeviceMatchRule {
+                vendor_id: Some(0x1AF4),
+                device_id: Some(0x1041),
+                subsystem_vendor_id: None,
+                subsystem_id: None,
+                revision_id: None,
+                class: None,
+                required_capability_id: None,
+            },
+            relocation: RelocationClass::Fixed,
+            irq_preference: IrqPreference::IntxOnly,
+            max_vectors: 1,
+            allow_polling_fallback: true,
+        },
+        DriverManifestSpec {
             driver_name: "wlan-service",
             match_rule: DeviceMatchRule {
                 vendor_id: Some(0x10EC),
@@ -1514,6 +1771,26 @@ fn run_driver_binding_and_handoff(
                 subsystem_id: None,
                 revision_id: None,
                 class: None,
+                required_capability_id: None,
+            },
+            relocation: RelocationClass::Fixed,
+            irq_preference: IrqPreference::MsiThenIntx,
+            max_vectors: 1,
+            allow_polling_fallback: true,
+        },
+        DriverManifestSpec {
+            driver_name: "wlan-service",
+            match_rule: DeviceMatchRule {
+                vendor_id: None,
+                device_id: None,
+                subsystem_vendor_id: None,
+                subsystem_id: None,
+                revision_id: None,
+                class: Some(ClassMatch {
+                    base: 0x02,
+                    sub: 0x80,
+                    prog_if: None,
+                }),
                 required_capability_id: None,
             },
             relocation: RelocationClass::Fixed,
@@ -1718,12 +1995,9 @@ fn run_driver_binding_and_handoff(
                     .all(|w| write_policy::validate_write_request(w).is_ok());
 
                 if manifest.driver_name == "nvme-host" {
-                    let bar0 = validation.resources().iter().find(|r| {
-                        r.resource.owner == lease.address
-                            && r.resource.register == ResourceRegister::Bar(0)
-                            && r.cpu_base.is_some()
-                            && r.resource.len >= 0x1000
-                    });
+                    let bar0 = plan
+                        .find(lease.address, ResourceRegister::Bar(0))
+                        .filter(|r| r.len >= 0x1000);
                     let Some(bar0) = bar0 else {
                         println!(
                             "[pci-manager] obs j2-nvme bdf={:02x}:{:02x}.{} status=missing-bar0",
@@ -1733,8 +2007,8 @@ fn run_driver_binding_and_handoff(
                         );
                         continue;
                     };
-                    let bar0_base = bar0.cpu_base.unwrap_or(0);
-                    let bar0_len = bar0.resource.len;
+                    let bar0_base = bar0.cpu_base;
+                    let bar0_len = bar0.len;
                     let Ok(mmio_handle) = libcanvas::device_lease::mint_resource(
                         &lease.handle,
                         ResourceKindAbi::Mmio,
@@ -1757,6 +2031,12 @@ fn run_driver_binding_and_handoff(
                     } else {
                         ENHANCED_CONFIG_BYTES
                     };
+                    enable_ancestor_bridges(
+                        &inv.snapshot,
+                        lease.address,
+                        &mut transport,
+                        max_config_bytes,
+                    );
                     let mut nvme_programmed = true;
                     let (irq_base, irq_len, irq_excl, mode_str) = match irq_plan.mode {
                         InterruptMode::Msix {
@@ -1942,11 +2222,15 @@ fn run_driver_binding_and_handoff(
                         let _ = bootstrap
                             .write_handle(pci_manager::DEVICE_LEASE_NVME_RO_LABEL, ro_lease);
                     }
-                    let mmio_label = format!(
+                    let mut mmio_label = StackLabel::new();
+                    let _ = write!(
+                        mmio_label,
                         "resource:driver-host-nvme:mmio:{:#x}:{:#x}:excl",
                         bar0_base, bar0_len
                     );
-                    let irq_label = format!(
+                    let mut irq_label = StackLabel::new();
+                    let _ = write!(
+                        irq_label,
                         "resource:driver-host-nvme:irq:{:#x}:{:#x}:{}",
                         irq_base,
                         irq_len,
@@ -1987,21 +2271,25 @@ fn run_driver_binding_and_handoff(
                 }
 
                 if manifest.driver_name == "net-service" {
-                    let bar0 = validation.resources().iter().find(|r| {
-                        r.resource.owner == lease.address
-                            && r.resource.register == ResourceRegister::Bar(0)
-                            && r.resource.class == ResourceClass::Io
-                            && r.cpu_base.is_some()
-                            && r.resource.len >= 0x20
-                    });
-                    if let Some(bar0) = bar0 {
-                        let max_config_bytes = if cfg!(feature = "force-legacy") {
-                            CONVENTIONAL_CONFIG_BYTES
-                        } else {
-                            ENHANCED_CONFIG_BYTES
-                        };
-                        // Enable IO_SPACE | MEMORY_SPACE | BUS_MASTER | INTERRUPT_DISABLE (0x0407)
-                        // while leaving MSI-X disabled so VirtIO legacy BAR0 offsets stay unshifted.
+                    let max_config_bytes = if cfg!(feature = "force-legacy") {
+                        CONVENTIONAL_CONFIG_BYTES
+                    } else {
+                        ENHANCED_CONFIG_BYTES
+                    };
+                    enable_ancestor_bridges(
+                        &inv.snapshot,
+                        lease.address,
+                        &mut transport,
+                        max_config_bytes,
+                    );
+                    let modern_caps = parse_virtio_modern_caps(&cfg, &caps);
+                    let bar0_io = plan
+                        .find(lease.address, ResourceRegister::Bar(0))
+                        .filter(|r| r.class == ResourceClass::Io && r.len >= 0x20);
+
+                    if modern_caps.is_some() || bar0_io.is_some() {
+                        let cmd_bits: u32 = if bar0_io.is_some() { 0x0407 } else { 0x0406 };
+                        let expect_bits: u32 = if bar0_io.is_some() { 0x0407 } else { 0x0406 };
                         let cmd_req = WriteRequest {
                             address: lease.address,
                             header_kind: HeaderKind::Type0Endpoint,
@@ -2009,28 +2297,119 @@ fn run_driver_binding_and_handoff(
                             offset: OFFSET_COMMAND,
                             width: ConfigWidth::Word,
                             max_config_bytes,
-                            value: u32::from(current_command) | 0x0407,
-                            write_mask: 0x0407,
-                            expected_readback_mask: 0x0407,
+                            value: u32::from(current_command) | cmd_bits,
+                            write_mask: cmd_bits,
+                            expected_readback_mask: expect_bits,
                             allowlist_entry: None,
                         };
                         let cmd_ok =
                             write_policy::execute_checked_write(&mut transport, &cmd_req).is_ok();
-                        let bar0_base = bar0.cpu_base.unwrap_or(0);
-                        let bar0_len = bar0.resource.len;
-                        if let Ok(io_handle) = libcanvas::device_lease::mint_resource(
-                            &lease.handle,
-                            ResourceKindAbi::IoPort,
-                            lease.generation,
-                            bar0_base,
-                            bar0_len,
-                            true,
-                        ) {
-                            let io_label = format!(
-                                "resource:net-service:ioport:{:#x}:{:#x}:excl",
-                                bar0_base, bar0_len
-                            );
-                            let _ = bootstrap.write_handle(io_label.as_bytes(), io_handle);
+                        let mut minted_any = false;
+
+                        if let Some((common, notify, isr, dev_cfg)) = modern_caps {
+                            let needed_bars = [common.bar, notify.bar, isr.bar, dev_cfg.bar];
+                            let mut minted_bar_mask = 0u8;
+                            let mut all_modern_bars_ok = true;
+                            for &b_idx in &needed_bars {
+                                if (minted_bar_mask & (1 << b_idx)) != 0 {
+                                    continue;
+                                }
+                                let Some(bar_res) =
+                                    plan.find(lease.address, ResourceRegister::Bar(b_idx))
+                                else {
+                                    all_modern_bars_ok = false;
+                                    break;
+                                };
+                                if bar_res.class == ResourceClass::Io || bar_res.len == 0 {
+                                    all_modern_bars_ok = false;
+                                    break;
+                                }
+                                match libcanvas::device_lease::mint_resource(
+                                    &lease.handle,
+                                    ResourceKindAbi::Mmio,
+                                    lease.generation,
+                                    bar_res.cpu_base,
+                                    bar_res.len,
+                                    true,
+                                ) {
+                                    Ok(mmio_h) => {
+                                        let mut label = StackLabel::new();
+                                        let _ = write!(
+                                            label,
+                                            "resource:net-service:mmio:{:#x}:{:#x}:bar{}",
+                                            bar_res.cpu_base, bar_res.len, b_idx
+                                        );
+                                        let _ = bootstrap.write_handle(label.as_bytes(), mmio_h);
+                                        minted_bar_mask |= 1 << b_idx;
+                                        minted_any = true;
+                                    }
+                                    Err(_) => {
+                                        all_modern_bars_ok = false;
+                                        break;
+                                    }
+                                }
+                            }
+                            if all_modern_bars_ok {
+                                let mut meta = [0u8; 48];
+                                meta[0..4].copy_from_slice(b"VT10");
+                                meta[4] = common.bar;
+                                meta[5] = notify.bar;
+                                meta[6] = isr.bar;
+                                meta[7] = dev_cfg.bar;
+                                meta[8..12].copy_from_slice(&common.offset.to_le_bytes());
+                                meta[12..16].copy_from_slice(&common.length.to_le_bytes());
+                                meta[16..20].copy_from_slice(&notify.offset.to_le_bytes());
+                                meta[20..24].copy_from_slice(&notify.length.to_le_bytes());
+                                meta[24..28]
+                                    .copy_from_slice(&notify.notify_multiplier.to_le_bytes());
+                                meta[28..32].copy_from_slice(&isr.offset.to_le_bytes());
+                                meta[32..36].copy_from_slice(&isr.length.to_le_bytes());
+                                meta[36..40].copy_from_slice(&dev_cfg.offset.to_le_bytes());
+                                meta[40..44].copy_from_slice(&dev_cfg.length.to_le_bytes());
+                                let bdf_packed = pack_pci_address(
+                                    lease.address.segment(),
+                                    lease.address.bus(),
+                                    lease.address.device(),
+                                    lease.address.function(),
+                                )
+                                .unwrap_or(0)
+                                    as u32;
+                                meta[44..48].copy_from_slice(&bdf_packed.to_le_bytes());
+                                if let Some(vmo_h) = mint_ro_metadata_vmo(&meta) {
+                                    let mut label = StackLabel::new();
+                                    let _ = write!(
+                                        label,
+                                        "resource:net-service:virtio1:{:#x}:48:ro",
+                                        bdf_packed
+                                    );
+                                    let _ = bootstrap.write_handle(label.as_bytes(), vmo_h);
+                                }
+                            }
+                        }
+
+                        if let Some(bar0) = bar0_io {
+                            let bar0_base = bar0.cpu_base;
+                            let bar0_len = bar0.len;
+                            if let Ok(io_handle) = libcanvas::device_lease::mint_resource(
+                                &lease.handle,
+                                ResourceKindAbi::IoPort,
+                                lease.generation,
+                                bar0_base,
+                                bar0_len,
+                                true,
+                            ) {
+                                let mut io_label = StackLabel::new();
+                                let _ = write!(
+                                    io_label,
+                                    "resource:net-service:ioport:{:#x}:{:#x}:excl",
+                                    bar0_base, bar0_len
+                                );
+                                let _ = bootstrap.write_handle(io_label.as_bytes(), io_handle);
+                                minted_any = true;
+                            }
+                        }
+
+                        if minted_any {
                             let mut ro_lease_mint_denied = false;
                             if let Ok(ro_lease) =
                                 lease.handle.duplicate(rights::READ | rights::TRANSFER)
@@ -2038,10 +2417,10 @@ fn run_driver_binding_and_handoff(
                                 ro_lease_mint_denied = matches!(
                                     libcanvas::device_lease::mint_resource(
                                         &ro_lease,
-                                        ResourceKindAbi::IoPort,
+                                        ResourceKindAbi::Mmio,
                                         lease.generation,
-                                        bar0_base,
-                                        bar0_len,
+                                        0xFEE0_0000,
+                                        0x1000,
                                         true,
                                     ),
                                     Err(ErrorCode::AccessDenied)
@@ -2064,12 +2443,12 @@ fn run_driver_binding_and_handoff(
                                 lease.address.function()
                             );
                             println!(
-                                "[pci-manager] obs virtio-net bdf={:02x}:{:02x}.{} ioport=0x{:x}+0x{:x} status=handed-off",
+                                "[pci-manager] obs virtio-net bdf={:02x}:{:02x}.{} modern={} legacy_io={} status=handed-off",
                                 lease.address.bus(),
                                 lease.address.device(),
                                 lease.address.function(),
-                                bar0_base,
-                                bar0_len
+                                modern_caps.is_some(),
+                                bar0_io.is_some()
                             );
                         }
                     }
@@ -2077,23 +2456,32 @@ fn run_driver_binding_and_handoff(
                 }
 
                 if manifest.driver_name == "wlan-service" {
-                    let mmio_bar = validation.resources().iter().find(|r| {
-                        r.resource.owner == lease.address
-                            && matches!(
-                                r.resource.class,
-                                ResourceClass::Mmio32
-                                    | ResourceClass::Mmio64
-                                    | ResourceClass::PrefetchableMemory
-                            )
-                            && r.cpu_base.is_some()
-                            && r.resource.len >= 0x1000
-                    });
+                    let max_config_bytes = if cfg!(feature = "force-legacy") {
+                        CONVENTIONAL_CONFIG_BYTES
+                    } else {
+                        ENHANCED_CONFIG_BYTES
+                    };
+                    enable_ancestor_bridges(
+                        &inv.snapshot,
+                        lease.address,
+                        &mut transport,
+                        max_config_bytes,
+                    );
+                    let mmio_bar = plan
+                        .find(lease.address, ResourceRegister::Bar(2))
+                        .filter(|r| r.class != ResourceClass::Io && r.len >= 0x1000)
+                        .or_else(|| {
+                            plan.resources()
+                                .iter()
+                                .filter(|r| {
+                                    r.owner == lease.address
+                                        && matches!(r.register, ResourceRegister::Bar(_))
+                                        && r.class != ResourceClass::Io
+                                        && r.len >= 0x1000
+                                })
+                                .max_by_key(|r| r.len)
+                        });
                     if let Some(mmio) = mmio_bar {
-                        let max_config_bytes = if cfg!(feature = "force-legacy") {
-                            CONVENTIONAL_CONFIG_BYTES
-                        } else {
-                            ENHANCED_CONFIG_BYTES
-                        };
                         let cmd_req = WriteRequest {
                             address: lease.address,
                             header_kind: HeaderKind::Type0Endpoint,
@@ -2108,8 +2496,8 @@ fn run_driver_binding_and_handoff(
                         };
                         let cmd_ok =
                             write_policy::execute_checked_write(&mut transport, &cmd_req).is_ok();
-                        let mmio_base = mmio.cpu_base.unwrap_or(0);
-                        let mmio_len = mmio.resource.len;
+                        let mmio_base = mmio.cpu_base;
+                        let mmio_len = mmio.len;
                         if let Ok(mmio_handle) = libcanvas::device_lease::mint_resource(
                             &lease.handle,
                             ResourceKindAbi::Mmio,
@@ -2118,11 +2506,36 @@ fn run_driver_binding_and_handoff(
                             mmio_len,
                             true,
                         ) {
-                            let mmio_label = format!(
+                            let mut mmio_label = StackLabel::new();
+                            let _ = write!(
+                                mmio_label,
                                 "resource:wlan-service:mmio:{:#x}:{:#x}:excl",
                                 mmio_base, mmio_len
                             );
                             let _ = bootstrap.write_handle(mmio_label.as_bytes(), mmio_handle);
+                            let vd = (u64::from(node.function.vendor_id) << 16)
+                                | u64::from(node.function.device_id);
+                            let bdf_packed = u64::from(
+                                pack_pci_address(
+                                    lease.address.segment(),
+                                    lease.address.bus(),
+                                    lease.address.device(),
+                                    lease.address.function(),
+                                )
+                                .unwrap_or(0),
+                            );
+                            let mut id_bytes = [0u8; 16];
+                            id_bytes[0..8].copy_from_slice(&vd.to_le_bytes());
+                            id_bytes[8..16].copy_from_slice(&bdf_packed.to_le_bytes());
+                            if let Some(id_vmo) = mint_ro_metadata_vmo(&id_bytes) {
+                                let mut id_label = StackLabel::new();
+                                let _ = write!(
+                                    id_label,
+                                    "resource:wlan-service:pciid:{:#x}:{:#x}:ro",
+                                    vd, bdf_packed
+                                );
+                                let _ = bootstrap.write_handle(id_label.as_bytes(), id_vmo);
+                            }
                             if let Ok(ro_lease) =
                                 lease.handle.duplicate(rights::READ | rights::TRANSFER)
                             {
@@ -2130,10 +2543,12 @@ fn run_driver_binding_and_handoff(
                                     .write_handle(pci_manager::DEVICE_LEASE_RO_LABEL, ro_lease);
                             }
                             println!(
-                                "[pci-manager] obs rtw88 bdf={:02x}:{:02x}.{} mmio=0x{:x}+0x{:x} cmd_ok={} status=handed-off",
+                                "[pci-manager] obs wlan bdf={:02x}:{:02x}.{} vendor=0x{:04x} device=0x{:04x} mmio=0x{:x}+0x{:x} cmd_ok={} status=handed-off",
                                 lease.address.bus(),
                                 lease.address.device(),
                                 lease.address.function(),
+                                node.function.vendor_id,
+                                node.function.device_id,
                                 mmio_base,
                                 mmio_len,
                                 cmd_ok
@@ -2365,8 +2780,8 @@ fn send(bootstrap: &Channel, message: Message) -> bool {
 }
 
 #[panic_handler]
-fn panic(_info: &PanicInfo) -> ! {
-    libcanvas::debug::write_str("[pci-manager] PANIC\n");
+fn panic(info: &PanicInfo) -> ! {
+    println!("[pci-manager] PANIC: {info}");
     libcanvas::process::exit(-127);
 }
 

@@ -56,7 +56,7 @@ impl BootDriverSpec {
 /// Mirrors the manifest parser's `MAX_RESOURCE_GRANTS` bound; kept as
 /// a private constant so the accumulator array size is a compile-time
 /// literal.
-const MAX_PENDING_RESOURCES_PER_DRIVER: usize = 8;
+const MAX_PENDING_RESOURCES_PER_DRIVER: usize = 12;
 
 /// Buffered resource handles + labels for one driver, waiting to be
 /// forwarded to that driver's bootstrap channel once its host process
@@ -89,48 +89,13 @@ impl PendingResources {
         Self {
             driver: [0; 32],
             driver_len: 0,
-            entries: [
+            entries: [const {
                 PendingResource {
                     handle: None,
                     label: [0; 96],
                     label_len: 0,
-                },
-                PendingResource {
-                    handle: None,
-                    label: [0; 96],
-                    label_len: 0,
-                },
-                PendingResource {
-                    handle: None,
-                    label: [0; 96],
-                    label_len: 0,
-                },
-                PendingResource {
-                    handle: None,
-                    label: [0; 96],
-                    label_len: 0,
-                },
-                PendingResource {
-                    handle: None,
-                    label: [0; 96],
-                    label_len: 0,
-                },
-                PendingResource {
-                    handle: None,
-                    label: [0; 96],
-                    label_len: 0,
-                },
-                PendingResource {
-                    handle: None,
-                    label: [0; 96],
-                    label_len: 0,
-                },
-                PendingResource {
-                    handle: None,
-                    label: [0; 96],
-                    label_len: 0,
-                },
-            ],
+                }
+            }; MAX_PENDING_RESOURCES_PER_DRIVER],
             count: 0,
             critical_requested: false,
         }
@@ -155,6 +120,8 @@ pub struct DriverManager {
     wlan_generation: u64,
     wlan_failed: bool,
     wlan_ready: bool,
+    net_wlan_bridged: bool,
+    wlan_hxfs_attached: bool,
     pci_bindings_settled: bool,
     /// Unique generation-grant authority delegated by init.
     key_broker: Option<Channel>,
@@ -410,6 +377,8 @@ impl DriverManager {
             wlan_generation: 0,
             wlan_failed: false,
             wlan_ready: false,
+            net_wlan_bridged: false,
+            wlan_hxfs_attached: false,
             pci_bindings_settled: false,
             key_broker: None,
             hxfs_generation: 0,
@@ -1095,6 +1064,7 @@ impl DriverManager {
             self.net_generation
         );
         self.net_service = Some(ManagedHost { process, bootstrap });
+        self.maybe_bridge_net_and_wlan();
     }
 
     fn try_start_wlan_service(&mut self) {
@@ -1141,6 +1111,61 @@ impl DriverManager {
             self.wlan_generation
         );
         self.wlan_service = Some(ManagedHost { process, bootstrap });
+        self.maybe_bridge_net_and_wlan();
+        self.maybe_attach_wlan_hxfs();
+    }
+
+    fn maybe_bridge_net_and_wlan(&mut self) {
+        if self.net_wlan_bridged {
+            return;
+        }
+        let (Some(net), Some(wlan)) = (self.net_service.as_ref(), self.wlan_service.as_ref())
+        else {
+            return;
+        };
+        let Ok((net_end, wlan_end)) = Channel::pair() else {
+            return;
+        };
+        if net
+            .bootstrap
+            .write_handle(b"uplink:wlan0", net_end.into_handle())
+            .is_ok()
+            && wlan
+                .bootstrap
+                .write_handle(b"uplink:net", wlan_end.into_handle())
+                .is_ok()
+        {
+            self.net_wlan_bridged = true;
+            println!("[driver-manager] bridged net-service <-> wlan-service L2 uplink");
+        }
+    }
+
+    fn maybe_attach_wlan_hxfs(&mut self) {
+        if self.wlan_hxfs_attached || !self.hxfs_ready {
+            return;
+        }
+        let (Some(hxfs), Some(wlan)) = (self.hxfs_service.as_ref(), self.wlan_service.as_ref())
+        else {
+            return;
+        };
+        let Ok((client_end, server_end)) = Channel::pair() else {
+            return;
+        };
+        if hxfs
+            .bootstrap
+            .write_handle(
+                protocol::ATTACH_HXFS_CLIENT.as_bytes(),
+                server_end.into_handle(),
+            )
+            .is_ok()
+            && wlan
+                .bootstrap
+                .write_handle(b"hxfs:client", client_end.into_handle())
+                .is_ok()
+        {
+            self.wlan_hxfs_attached = true;
+            println!("[driver-manager] attached HxFS persistence channel to wlan-service");
+        }
     }
 
     /// Adversarial lifecycle probe used only by the KeyBroker crash smoke.
@@ -1292,6 +1317,9 @@ impl DriverManager {
             println!(
                 "[driver-manager] PCI manager restart budget exhausted; new PCI operations disabled"
             );
+            self.pci_bindings_settled = true;
+            self.try_start_net_service();
+            self.try_start_wlan_service();
             return;
         }
         println!(
@@ -2904,6 +2932,7 @@ impl DriverManager {
                     println!("[driver-manager] Hxfs service ready");
                     self.storage_milestone(100);
                     self.attach_own_hxfs_client();
+                    self.maybe_attach_wlan_hxfs();
                     #[cfg(feature = "key-broker-fail-smoke")]
                     self.probe_key_broker_fail_closed();
                     return;
@@ -3127,6 +3156,11 @@ impl DriverManager {
                             pci_manager::Status::InvalidRootTable,
                         ) => {
                             println!("[driver-manager] PCI manager rejected HPCI root table");
+                            self.pci_bindings_settled = true;
+                            if !self.storage_off && self.nvme_lease_ro.is_none() {
+                                self.storage_skipped_pending = true;
+                            }
+                            self.try_start_pending_hosts();
                         }
                         (pci_manager::Opcode::InventoryPublished, pci_manager::Status::Ok) => {
                             println!(
@@ -3143,6 +3177,9 @@ impl DriverManager {
                                 message.detail
                             );
                             self.pci_bindings_settled = true;
+                            if !self.storage_off && self.nvme_lease_ro.is_none() {
+                                self.storage_skipped_pending = true;
+                            }
                             self.try_start_pending_hosts();
                         }
                         (pci_manager::Opcode::DriverBindingPublished, pci_manager::Status::Ok) => {
@@ -3483,6 +3520,11 @@ impl DriverManager {
         }
         self.config_authority_handed_off = true;
         self.pci_manager = Some(host);
+        self.pci_bindings_settled = true;
+        if !self.storage_off && self.nvme_lease_ro.is_none() {
+            self.storage_skipped_pending = true;
+        }
+        self.try_start_pending_hosts();
     }
 
     /// Validate and retain one `HMCF` config-window snapshot received
@@ -3658,6 +3700,11 @@ impl DriverManager {
         if self.acpi_namespace_initialized && !self.acpi_hpci_eligible {
             self.pci_roots_handed_off = true;
             self.notify_pci_acpi_frozen(true);
+            self.pci_bindings_settled = true;
+            if !self.storage_off && self.nvme_lease_ro.is_none() {
+                self.storage_skipped_pending = true;
+            }
+            self.try_start_pending_hosts();
             return;
         }
         if !self.acpi_hpci_eligible {

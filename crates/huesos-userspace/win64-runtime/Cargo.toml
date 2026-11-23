@@ -3,6 +3,12 @@ resolver = "2"
 members = [
     "ntdll",
     "kernel32",
+    "ucrtbase",
+    "msvcrt",
+    "ws2_32",
+    "bcrypt",
+    "bcryptprimitives",
+    "advapi32",
     "win-apps",
 ]
 

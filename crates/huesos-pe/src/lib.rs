@@ -11,7 +11,14 @@
 #[cfg(test)]
 extern crate alloc;
 
+pub mod unwind;
 pub mod win64_abi;
+
+pub use unwind::{
+    lookup_runtime_function, resolve_apiset_dll, virtual_unwind, RuntimeFunction,
+    UnwindStepOutcome, Win64UnwindRegs, UNW_FLAG_CHAININFO, UNW_FLAG_EHANDLER, UNW_FLAG_NHANDLER,
+    UNW_FLAG_UHANDLER,
+};
 
 /// `MZ` magic at offset `0` of the MS-DOS header.
 pub const IMAGE_DOS_SIGNATURE: u16 = 0x5A4D;
@@ -1240,5 +1247,107 @@ mod tests {
             PeImage::parse(elf_stub).err(),
             Some(PeError::BufferTooShort)
         );
+    }
+
+    #[test]
+    fn resolves_apiset_and_unwinds_x64_pdata_xdata() {
+        assert_eq!(
+            resolve_apiset_dll("api-ms-win-crt-stdio-l1-1-0.dll"),
+            Some("ucrtbase.dll")
+        );
+        assert_eq!(
+            resolve_apiset_dll("VCRUNTIME140_1.DLL"),
+            Some("ucrtbase.dll")
+        );
+        assert_eq!(
+            resolve_apiset_dll("api-ms-win-core-synch-l1-2-0.dll"),
+            Some("kernel32.dll")
+        );
+        assert_eq!(
+            resolve_apiset_dll("api-ms-win-security-base-l1-1-0.dll"),
+            Some("advapi32.dll")
+        );
+        assert_eq!(resolve_apiset_dll("ws2_32.dll"), None);
+
+        // Synthetic mapped image with:
+        // - `.text` at 0x1000..0x1020 (`push rbx; sub rsp, 0x20; ...; add rsp, 0x20; pop rbx; ret`)
+        // - `.xdata` at 0x2000 (version 1 | UNW_FLAG_EHANDLER, prolog=5, codes=2:
+        //    [offset=5, UWOP_ALLOC_SMALL (info=3 => 32B)], [offset=1, UWOP_PUSH_NONVOL (info=3 => rbx)],
+        //    handler_rva = 0x1500)
+        // - `.pdata` at 0x3000: [begin=0x1000, end=0x1020, unwind=0x2000]
+        let mut img = alloc::vec![0u8; 0x4000];
+        img[0x1000..0x1005].copy_from_slice(&[0x53, 0x48, 0x83, 0xEC, 0x20]);
+        img[0x101A..0x1020].copy_from_slice(&[0x48, 0x83, 0xC4, 0x20, 0x5B, 0xC3]);
+
+        // UNWIND_INFO at 0x2000
+        img[0x2000] = 0x01 | (UNW_FLAG_EHANDLER << 3);
+        img[0x2001] = 5; // size_of_prolog
+        img[0x2002] = 2; // count_of_codes
+        img[0x2003] = 0; // no frame reg
+                         // Code 0: offset 5, UWOP_ALLOC_SMALL (2), op_info = 3 (3*8 + 8 = 32 bytes)
+        img[0x2004] = 5;
+        img[0x2005] = (3 << 4) | 2;
+        // Code 1: offset 1, UWOP_PUSH_NONVOL (0), op_info = 3 (rbx)
+        img[0x2006] = 1;
+        img[0x2007] = (3 << 4) | 0;
+        // ExceptionHandler RVA at 0x2008 = 0x1500
+        img[0x2008..0x200C].copy_from_slice(&0x1500u32.to_le_bytes());
+
+        // RUNTIME_FUNCTION at 0x3000
+        img[0x3000..0x3004].copy_from_slice(&0x1000u32.to_le_bytes());
+        img[0x3004..0x3008].copy_from_slice(&0x1020u32.to_le_bytes());
+        img[0x3008..0x300C].copy_from_slice(&0x2000u32.to_le_bytes());
+
+        let pdata = DataDirectory {
+            virtual_address: 0x3000,
+            size: 12,
+        };
+        let rf = lookup_runtime_function(&img, pdata, 0x100A);
+        assert_eq!(
+            rf,
+            Some(RuntimeFunction {
+                begin_address: 0x1000,
+                end_address: 0x1020,
+                unwind_info_rva: 0x2000,
+            })
+        );
+        let rf_val = match rf {
+            Some(v) => v,
+            None => return,
+        };
+
+        // Stack frame at RSP = 0x7000:
+        // [0x7000..0x7020] = 32B local alloc
+        // [0x7020] = saved rbx (0xCAFE_BABE_1122_3344)
+        // [0x7028] = caller return RIP (0x0000_0001_4000_0999)
+        let mut regs = Win64UnwindRegs {
+            gpr: [0; 16],
+            rip: 0x0000_0001_4000_100A,
+        };
+        regs.set_rsp(0x7000);
+
+        let step = virtual_unwind(
+            &img,
+            0x0000_0001_4000_0000,
+            rf_val,
+            &mut regs,
+            UNW_FLAG_EHANDLER,
+            |addr| match addr {
+                0x7020 => Some(0xCAFE_BABE_1122_3344),
+                0x7028 => Some(0x0000_0001_4000_0999),
+                _ => Some(0),
+            },
+        );
+        assert_eq!(
+            step,
+            Some(UnwindStepOutcome {
+                establisher_frame: 0x7000,
+                handler_rva: Some(0x1500),
+                handler_data_rva: 0x200C,
+            })
+        );
+        assert_eq!(regs.gpr[3], 0xCAFE_BABE_1122_3344);
+        assert_eq!(regs.rsp(), 0x7030);
+        assert_eq!(regs.rip, 0x0000_0001_4000_0999);
     }
 }

@@ -307,8 +307,13 @@ fn resource_shape_valid(topology: &TopologySnapshot, resource: FirmwareResource)
             let class_matches = matches!(
                 (index, resource.class),
                 (0, ResourceClass::Io)
-                    | (1, ResourceClass::Mmio32)
-                    | (2, ResourceClass::PrefetchableMemory)
+                    | (1, ResourceClass::Mmio32 | ResourceClass::Mmio64)
+                    | (
+                        2,
+                        ResourceClass::PrefetchableMemory
+                            | ResourceClass::Mmio64
+                            | ResourceClass::Mmio32
+                    )
             );
             if !class_matches
                 || !matches!(

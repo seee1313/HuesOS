@@ -3,11 +3,39 @@
 version = 4
 
 [[package]]
+name = "advapi32"
+version = "0.1.0"
+dependencies = [
+ "huesos-pe",
+]
+
+[[package]]
+name = "bcrypt"
+version = "0.1.0"
+dependencies = [
+ "huesos-pe",
+]
+
+[[package]]
+name = "bcryptprimitives"
+version = "0.1.0"
+dependencies = [
+ "huesos-pe",
+]
+
+[[package]]
 name = "huesos-pe"
 version = "0.1.0"
 
 [[package]]
 name = "kernel32"
+version = "0.1.0"
+dependencies = [
+ "huesos-pe",
+]
+
+[[package]]
+name = "msvcrt"
 version = "0.1.0"
 dependencies = [
  "huesos-pe",
@@ -21,7 +49,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "ucrtbase"
+version = "0.1.0"
+dependencies = [
+ "huesos-pe",
+]
+
+[[package]]
 name = "win-apps"
+version = "0.1.0"
+dependencies = [
+ "huesos-pe",
+]
+
+[[package]]
+name = "ws2_32"
 version = "0.1.0"
 dependencies = [
  "huesos-pe",
