@@ -13,11 +13,14 @@
 
 use core::panic::PanicInfo;
 use core::ptr;
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 use huesos_pe::win64_abi::{
-    DEFAULT_PROCESS_HEAP, ERROR_INVALID_PARAMETER, ERROR_NOT_ENOUGH_MEMORY, ERROR_SUCCESS, FALSE,
+    DEFAULT_PROCESS_HEAP, ERROR_INSUFFICIENT_BUFFER, ERROR_INVALID_PARAMETER,
+    ERROR_NOT_ENOUGH_MEMORY, ERROR_SUCCESS, FALSE, HANDLE_STDERR, HANDLE_STDIN, HANDLE_STDOUT,
     INVALID_HANDLE_VALUE, PeHostApi, RtlConditionVariable, RtlCriticalSection, RtlSrwLock,
-    SystemInfo64, TLS_MINIMUM_AVAILABLE, TRUE, WAIT_FAILED, Win64ThreadStart, teb_offsets,
+    SystemInfo64, TLS_MINIMUM_AVAILABLE, TLS_OUT_OF_INDEXES, TRUE, WAIT_FAILED, Win64FlsCallback,
+    Win64ThreadStart, teb_offsets,
 };
 
 #[used]
@@ -79,6 +82,10 @@ unsafe extern "win64" {
     fn RtlReAllocateHeap(heap: usize, flags: u32, ptr_val: usize, size: usize) -> usize;
     fn RtlFreeHeap(heap: usize, flags: u32, ptr_val: usize) -> u8;
     fn RtlSizeHeap(heap: usize, flags: u32, ptr_val: usize) -> usize;
+
+    fn RtlEncodePointer(ptr_val: usize) -> usize;
+    fn RtlDecodePointer(ptr_val: usize) -> usize;
+    fn RtlInitializeSListHead(list_head: *mut [u64; 2]);
 
     fn NtTerminateProcess(process_handle: usize, exit_status: u32) -> !;
 }
@@ -845,5 +852,452 @@ pub unsafe extern "win64" fn GetSystemInfo(info: *mut SystemInfo64) {
                 processor_revision: 0,
             },
         );
+    }
+}
+
+// ============================================================================
+// Fiber-Local Storage (`Fls*`), Wide/UTF-8 Conversion, Console, & SEH Forwarders
+// ============================================================================
+
+static FLS_CALLBACKS: [AtomicUsize; TLS_MINIMUM_AVAILABLE] =
+    [const { AtomicUsize::new(0) }; TLS_MINIMUM_AVAILABLE];
+static UNHANDLED_FILTER: AtomicUsize = AtomicUsize::new(0);
+static CONSOLE_IN_MODE: AtomicUsize = AtomicUsize::new(0x0007);
+static CONSOLE_OUT_MODE: AtomicUsize = AtomicUsize::new(0x0007); // ENABLE_VIRTUAL_TERMINAL_PROCESSING | PROCESSED_OUTPUT
+
+#[unsafe(no_mangle)]
+pub extern "win64" fn FlsAlloc(callback: Option<Win64FlsCallback>) -> u32 {
+    let idx = TlsAlloc();
+    if idx != TLS_OUT_OF_INDEXES && (idx as usize) < TLS_MINIMUM_AVAILABLE {
+        let cb_addr = callback.map_or(0, |f| f as usize);
+        FLS_CALLBACKS[idx as usize].store(cb_addr, Ordering::Release);
+    }
+    idx
+}
+
+#[unsafe(no_mangle)]
+pub extern "win64" fn FlsGetValue(index: u32) -> usize {
+    TlsGetValue(index)
+}
+
+#[unsafe(no_mangle)]
+pub extern "win64" fn FlsSetValue(index: u32, value: usize) -> i32 {
+    TlsSetValue(index, value)
+}
+
+#[unsafe(no_mangle)]
+pub extern "win64" fn FlsFree(index: u32) -> i32 {
+    if (index as usize) < TLS_MINIMUM_AVAILABLE {
+        let val = TlsGetValue(index);
+        let cb = FLS_CALLBACKS[index as usize].swap(0, Ordering::AcqRel);
+        if cb != 0 && val != 0 {
+            // SAFETY: `cb` was registered via `FlsAlloc` as `Win64FlsCallback`.
+            unsafe {
+                let func: Win64FlsCallback = core::mem::transmute(cb);
+                func(val);
+            }
+        }
+    }
+    TlsFree(index)
+}
+
+#[unsafe(no_mangle)]
+pub extern "win64" fn MultiByteToWideChar(
+    _code_page: u32,
+    _flags: u32,
+    mb_str: *const u8,
+    mb_len: i32,
+    wide_buf: *mut u16,
+    wide_cap: i32,
+) -> i32 {
+    if mb_str.is_null() || mb_len == 0 || wide_cap < 0 {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    let (in_len, include_nul) = if mb_len < 0 {
+        // SAFETY: `mb_str` is NUL-terminated when `mb_len == -1`.
+        (unsafe { cstr_len(mb_str, 65_536) }, true)
+    } else {
+        (mb_len as usize, false)
+    };
+    // SAFETY: `mb_str` valid for `in_len` bytes.
+    let bytes = unsafe { core::slice::from_raw_parts(mb_str, in_len) };
+    let text = core::str::from_utf8(bytes);
+
+    let mut needed = 0usize;
+    match text {
+        Ok(s) => {
+            for ch in s.chars() {
+                let mut u16s = [0u16; 2];
+                let enc = ch.encode_utf16(&mut u16s);
+                if wide_cap > 0 && !wide_buf.is_null() {
+                    if needed + enc.len() > wide_cap as usize {
+                        SetLastError(ERROR_INSUFFICIENT_BUFFER);
+                        return 0;
+                    }
+                    for &w in enc.iter() {
+                        // SAFETY: `needed < wide_cap`.
+                        unsafe { ptr::write_unaligned(wide_buf.add(needed), w) };
+                        needed += 1;
+                    }
+                } else {
+                    needed += enc.len();
+                }
+            }
+        }
+        Err(_) => {
+            for &b in bytes {
+                if wide_cap > 0 && !wide_buf.is_null() {
+                    if needed >= wide_cap as usize {
+                        SetLastError(ERROR_INSUFFICIENT_BUFFER);
+                        return 0;
+                    }
+                    // SAFETY: `needed < wide_cap`.
+                    unsafe { ptr::write_unaligned(wide_buf.add(needed), u16::from(b)) };
+                }
+                needed += 1;
+            }
+        }
+    }
+    if include_nul {
+        if wide_cap > 0 && !wide_buf.is_null() {
+            if needed >= wide_cap as usize {
+                SetLastError(ERROR_INSUFFICIENT_BUFFER);
+                return 0;
+            }
+            // SAFETY: `needed < wide_cap`.
+            unsafe { ptr::write_unaligned(wide_buf.add(needed), 0) };
+        }
+        needed += 1;
+    }
+    needed as i32
+}
+
+#[unsafe(no_mangle)]
+pub extern "win64" fn WideCharToMultiByte(
+    _code_page: u32,
+    _flags: u32,
+    wide_str: *const u16,
+    wide_len: i32,
+    mb_buf: *mut u8,
+    mb_cap: i32,
+    _default_char: *const u8,
+    _used_default: *mut i32,
+) -> i32 {
+    if wide_str.is_null() || wide_len == 0 || mb_cap < 0 {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    let (units, include_nul) = if wide_len < 0 {
+        let mut n = 0usize;
+        while n < 65_536 {
+            // SAFETY: `wide_str` NUL-terminated when `wide_len < 0`.
+            if unsafe { ptr::read_unaligned(wide_str.add(n)) } == 0 {
+                break;
+            }
+            n += 1;
+        }
+        (n, true)
+    } else {
+        (wide_len as usize, false)
+    };
+
+    let mut iter_units = (0..units).map(|i| {
+        // SAFETY: `i < units` within `wide_str`.
+        unsafe { ptr::read_unaligned(wide_str.add(i)) }
+    });
+    let mut needed = 0usize;
+    for decoded in core::char::decode_utf16(&mut iter_units) {
+        let ch = decoded.unwrap_or('\u{FFFD}');
+        let mut enc = [0u8; 4];
+        let utf8 = ch.encode_utf8(&mut enc).as_bytes();
+        if mb_cap > 0 && !mb_buf.is_null() {
+            if needed + utf8.len() > mb_cap as usize {
+                SetLastError(ERROR_INSUFFICIENT_BUFFER);
+                return 0;
+            }
+            // SAFETY: `needed + utf8.len() <= mb_cap`.
+            unsafe {
+                ptr::copy_nonoverlapping(utf8.as_ptr(), mb_buf.add(needed), utf8.len());
+            }
+        }
+        needed += utf8.len();
+    }
+    if include_nul {
+        if mb_cap > 0 && !mb_buf.is_null() {
+            if needed >= mb_cap as usize {
+                SetLastError(ERROR_INSUFFICIENT_BUFFER);
+                return 0;
+            }
+            // SAFETY: `needed < mb_cap`.
+            unsafe { ptr::write(mb_buf.add(needed), 0) };
+        }
+        needed += 1;
+    }
+    needed as i32
+}
+
+#[unsafe(no_mangle)]
+pub extern "win64" fn WriteConsoleW(
+    console_output: usize,
+    buffer: *const u16,
+    chars_to_write: u32,
+    chars_written: *mut u32,
+    _reserved: usize,
+) -> i32 {
+    if buffer.is_null() && chars_to_write > 0 {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+    let mut utf8_chunk = [0u8; 1024];
+    let mut i = 0usize;
+    let total = chars_to_write as usize;
+    while i < total {
+        let mut used = 0usize;
+        while i < total && used + 4 <= utf8_chunk.len() {
+            // SAFETY: `i < total` inside `buffer`.
+            let u = unsafe { ptr::read_unaligned(buffer.add(i)) };
+            i += 1;
+            let ch = char::from_u32(u32::from(u)).unwrap_or('?');
+            let mut enc = [0u8; 4];
+            let s = ch.encode_utf8(&mut enc).as_bytes();
+            utf8_chunk[used..used + s.len()].copy_from_slice(s);
+            used += s.len();
+        }
+        let mut dummy = 0u32;
+        if WriteFile(
+            console_output,
+            utf8_chunk.as_ptr(),
+            used as u32,
+            &raw mut dummy,
+            0,
+        ) == FALSE
+        {
+            return FALSE;
+        }
+    }
+    if !chars_written.is_null() {
+        // SAFETY: `chars_written` checked non-null.
+        unsafe { ptr::write_unaligned(chars_written, chars_to_write) };
+    }
+    TRUE
+}
+
+#[unsafe(no_mangle)]
+pub extern "win64" fn GetConsoleMode(handle: usize, out_mode: *mut u32) -> i32 {
+    if out_mode.is_null() {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+    let mode = if handle == HANDLE_STDIN {
+        CONSOLE_IN_MODE.load(Ordering::Relaxed) as u32
+    } else if handle == HANDLE_STDOUT || handle == HANDLE_STDERR {
+        CONSOLE_OUT_MODE.load(Ordering::Relaxed) as u32
+    } else {
+        SetLastError(6); // ERROR_INVALID_HANDLE
+        return FALSE;
+    };
+    // SAFETY: `out_mode` checked non-null.
+    unsafe { ptr::write_unaligned(out_mode, mode) };
+    TRUE
+}
+
+#[unsafe(no_mangle)]
+pub extern "win64" fn SetConsoleMode(handle: usize, mode: u32) -> i32 {
+    if handle == HANDLE_STDIN {
+        CONSOLE_IN_MODE.store(mode as usize, Ordering::Relaxed);
+        TRUE
+    } else if handle == HANDLE_STDOUT || handle == HANDLE_STDERR {
+        CONSOLE_OUT_MODE.store(mode as usize, Ordering::Relaxed);
+        TRUE
+    } else {
+        SetLastError(6);
+        FALSE
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "win64" fn GetFileType(handle: usize) -> u32 {
+    if handle == HANDLE_STDIN || handle == HANDLE_STDOUT || handle == HANDLE_STDERR {
+        2 // FILE_TYPE_CHAR (console TTY)
+    } else if handle == 0 || handle == INVALID_HANDLE_VALUE {
+        0 // FILE_TYPE_UNKNOWN
+    } else {
+        1 // FILE_TYPE_DISK
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "win64" fn FlushFileBuffers(_handle: usize) -> i32 {
+    TRUE
+}
+
+#[unsafe(no_mangle)]
+pub extern "win64" fn InitializeCriticalSectionEx(
+    cs: *mut RtlCriticalSection,
+    spin_count: u32,
+    _flags: u32,
+) -> i32 {
+    // SAFETY: delegates to `ntdll` critical section init.
+    unsafe {
+        if RtlInitializeCriticalSectionAndSpinCount(cs, spin_count) == 0 {
+            TRUE
+        } else {
+            FALSE
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "win64" fn LoadLibraryExA(lib_file_name: *const u8, _file: usize, _flags: u32) -> usize {
+    // SAFETY: delegates to `LoadLibraryA`.
+    unsafe { LoadLibraryA(lib_file_name) }
+}
+
+#[unsafe(no_mangle)]
+pub extern "win64" fn LoadLibraryExW(
+    lib_file_name: *const u16,
+    _file: usize,
+    _flags: u32,
+) -> usize {
+    // SAFETY: delegates to `LoadLibraryW`.
+    unsafe { LoadLibraryW(lib_file_name) }
+}
+
+#[unsafe(no_mangle)]
+pub extern "win64" fn GetModuleHandleExA(
+    _flags: u32,
+    module_name: *const u8,
+    out_module: *mut usize,
+) -> i32 {
+    if out_module.is_null() {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+    // SAFETY: delegates to `GetModuleHandleA` and writes non-null `out_module`.
+    let h = unsafe { GetModuleHandleA(module_name) };
+    // SAFETY: `out_module` checked non-null.
+    unsafe { ptr::write_unaligned(out_module, h) };
+    if h != 0 { TRUE } else { FALSE }
+}
+
+#[unsafe(no_mangle)]
+pub extern "win64" fn GetModuleHandleExW(
+    _flags: u32,
+    module_name: *const u16,
+    out_module: *mut usize,
+) -> i32 {
+    if out_module.is_null() {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+    // SAFETY: delegates to `GetModuleHandleW`.
+    let h = unsafe { GetModuleHandleW(module_name) };
+    // SAFETY: `out_module` checked non-null.
+    unsafe { ptr::write_unaligned(out_module, h) };
+    if h != 0 { TRUE } else { FALSE }
+}
+
+#[unsafe(no_mangle)]
+pub extern "win64" fn GetModuleFileNameA(_module: usize, filename: *mut u8, size: u32) -> u32 {
+    const DEFAULT_NAME: &[u8] = b"C:\\bin\\app.exe";
+    if filename.is_null() || size == 0 {
+        return 0;
+    }
+    let copy_len = DEFAULT_NAME.len().min((size as usize).saturating_sub(1));
+    // SAFETY: `filename` valid for `size` bytes.
+    unsafe {
+        ptr::copy_nonoverlapping(DEFAULT_NAME.as_ptr(), filename, copy_len);
+        ptr::write(filename.add(copy_len), 0);
+    }
+    copy_len as u32
+}
+
+#[unsafe(no_mangle)]
+pub extern "win64" fn GetModuleFileNameW(_module: usize, filename: *mut u16, size: u32) -> u32 {
+    const DEFAULT_NAME: &[u8] = b"C:\\bin\\app.exe";
+    if filename.is_null() || size == 0 {
+        return 0;
+    }
+    let copy_len = DEFAULT_NAME.len().min((size as usize).saturating_sub(1));
+    for i in 0..copy_len {
+        // SAFETY: `i < size` within `filename`.
+        unsafe { ptr::write_unaligned(filename.add(i), u16::from(DEFAULT_NAME[i])) };
+    }
+    // SAFETY: `copy_len < size` within `filename`.
+    unsafe { ptr::write_unaligned(filename.add(copy_len), 0) };
+    copy_len as u32
+}
+
+#[unsafe(no_mangle)]
+pub extern "win64" fn GetSystemTimePreciseAsFileTime(out_ft: *mut u64) {
+    // SAFETY: delegates to `GetSystemTimeAsFileTime`.
+    unsafe { GetSystemTimeAsFileTime(out_ft) };
+}
+
+#[unsafe(no_mangle)]
+pub extern "win64" fn IsDebuggerPresent() -> i32 {
+    FALSE
+}
+
+#[unsafe(no_mangle)]
+pub extern "win64" fn IsProcessorFeaturePresent(feature: u32) -> i32 {
+    // PF_FASTFAIL_AVAILABLE (23), PF_COMPARE_EXCHANGE_DOUBLE (2), PF_RDTSC_INSTRUCTION_AVAILABLE (8)
+    if matches!(feature, 2 | 8 | 23) {
+        TRUE
+    } else {
+        FALSE
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "win64" fn SetUnhandledExceptionFilter(filter: usize) -> usize {
+    UNHANDLED_FILTER.swap(filter, Ordering::AcqRel)
+}
+
+#[unsafe(no_mangle)]
+pub extern "win64" fn UnhandledExceptionFilter(_exception_info: usize) -> i32 {
+    1 // EXCEPTION_EXECUTE_HANDLER
+}
+
+#[unsafe(no_mangle)]
+pub extern "win64" fn RaiseException(code: u32, _flags: u32, _num_args: u32, _args: usize) -> ! {
+    ExitProcess(code)
+}
+
+#[unsafe(no_mangle)]
+pub extern "win64" fn EncodePointer(ptr_val: usize) -> usize {
+    // SAFETY: forwards to `ntdll::RtlEncodePointer`.
+    unsafe { RtlEncodePointer(ptr_val) }
+}
+
+#[unsafe(no_mangle)]
+pub extern "win64" fn DecodePointer(ptr_val: usize) -> usize {
+    // SAFETY: forwards to `ntdll::RtlDecodePointer`.
+    unsafe { RtlDecodePointer(ptr_val) }
+}
+
+#[unsafe(no_mangle)]
+pub extern "win64" fn InitializeSListHead(list_head: *mut [u64; 2]) {
+    // SAFETY: forwards to `ntdll::RtlInitializeSListHead`.
+    unsafe { RtlInitializeSListHead(list_head) }
+}
+
+#[unsafe(no_mangle)]
+pub extern "win64" fn GetACP() -> u32 {
+    65001 // CP_UTF8
+}
+
+#[unsafe(no_mangle)]
+pub extern "win64" fn GetOEMCP() -> u32 {
+    65001
+}
+
+#[unsafe(no_mangle)]
+pub extern "win64" fn IsValidCodePage(cp: u32) -> i32 {
+    if matches!(cp, 0 | 437 | 1252 | 65000 | 65001) {
+        TRUE
+    } else {
+        FALSE
     }
 }

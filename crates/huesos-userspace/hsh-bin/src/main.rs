@@ -1308,6 +1308,17 @@ impl InteractiveShell {
             ),
             Err(e) => println!("[hsh] PE64 win-threads.exe ERROR: {e}"),
         }
+        match smoke_env.eval_script("win-crt-smoke", &mut self.host) {
+            Ok(res) if res.status == 0 && res.render_text().contains("[win-crt-smoke] PASS") => {
+                println!("[hsh] PE64 win-crt-smoke.exe OK");
+            }
+            Ok(res) => println!(
+                "[hsh] PE64 win-crt-smoke.exe FAILED status={} out={}",
+                res.status,
+                res.render_text()
+            ),
+            Err(e) => println!("[hsh] PE64 win-crt-smoke.exe ERROR: {e}"),
+        }
 
         // 10c3. Networking (`net-service` + `virtio-net` + DHCP/ICMP) and
         //       IEEE 802.11 Wi-Fi (`wlan-service` + `rtw88` + WPA2-CCMP) + `@caps`.

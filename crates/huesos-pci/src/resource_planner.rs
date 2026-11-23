@@ -153,13 +153,23 @@ pub fn plan_firmware_preserving(
         .map_err(|_| PlanError::NoMemory)?;
 
     // Preserve every firmware assignment before allocating anything new.
+    // Sort by topological depth (parent BridgeWindow before child BAR/window)
+    // so downstream buses work regardless of BDF ordering.
+    let mut preserved = Vec::new();
+    preserved
+        .try_reserve_exact(validation.resources().len())
+        .map_err(|_| PlanError::NoMemory)?;
     for validated in validation.resources() {
-        if !matches!(
+        if matches!(
             validated.status,
             ResourceStatus::Valid | ResourceStatus::Fixed
         ) {
-            continue;
+            preserved.push(*validated);
         }
+    }
+    preserved.sort_by_key(|v| allocation_order(topology, v.resource));
+
+    for validated in preserved {
         let resource = validated.resource;
         let container = direct_container(topology, apertures, &planned, resource)?;
         let cpu_base = validated

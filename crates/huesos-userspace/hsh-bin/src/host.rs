@@ -845,6 +845,7 @@ impl HshHost {
             "win-hello",
             "win-threads",
             "win-bench",
+            "win-crt-smoke",
         ];
         let mut owned: Vec<String> = Vec::with_capacity(args.len() + 1);
         if NO_PATH_ARGS.contains(&cmd) {

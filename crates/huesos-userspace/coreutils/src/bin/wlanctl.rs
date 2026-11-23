@@ -1,17 +1,9 @@
-//! `/bin/wlanctl.elf` — IEEE 802.11 / WPA2-CCMP / Realtek `rtw88` (`10ec:c821`)
-//! CLI and full-screen 168×50 interactive TUI (`HWLN` wire protocol).
+//! `/bin/wlanctl.elf` — Unified Multi-Adapter Network & IEEE 802.11ac Wi-Fi
+//! Studio CLI + 168×50 Interactive TUI (`HWLN` + `HNET` wire protocols).
 //!
-//! Modes:
-//! - `wlanctl` / `wlanctl tui` / `wlanctl -n 1` — full-screen obsidian TUI
-//! - `wlanctl status`
-//! - `wlanctl scan`
-//! - `wlanctl connect <ssid> [passphrase]`
-//! - `wlanctl disconnect`
-//! - `wlanctl profiles`
-//! - `wlanctl regdomain <WORLD|RU|US|EU|JP|UNLOCKED>`
-//! - `wlanctl mac <factory|random>`
-//! - `wlanctl ap start <ssid> <passphrase> [channel]`
-//! - `wlanctl ap stop`
+//! Manages both wireless (`wlan0` — Realtek RTL8821CE `10ec:c821` 802.11ac
+//! WPA2-CCMP Station & SoftAP) and wired (`virtio0`/`eth0` — VirtIO-Net 1.0
+//! MMIO / Legacy PCI) interfaces, DHCPv4, and metric routing.
 
 #![no_std]
 #![no_main]
@@ -22,6 +14,7 @@ use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
 
+use huesos_abi::net::{iface_id, NetStatusSnapshot};
 use huesos_abi::wlan::{
     MacPolicyMode, RegDomainCode, WlanBssInfo, WlanProfileSummary, WlanSecurity, WlanStateCode,
     WlanStatusSnapshot,
@@ -52,6 +45,17 @@ fn fmt_mac(m: [u8; 6]) -> String {
         "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
         m[0], m[1], m[2], m[3], m[4], m[5]
     )
+}
+
+fn fmt_ip(ip: [u8; 4]) -> String {
+    format!("{}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3])
+}
+
+fn fmt_bdf(bdf: u16) -> String {
+    let bus = (bdf >> 8) & 0xFF;
+    let dev = (bdf >> 3) & 0x1F;
+    let func = bdf & 0x07;
+    format!("{bus:02x}:{dev:02x}.{func}")
 }
 
 fn parse_reg_domain(s: &str) -> Option<RegDomainCode> {
@@ -99,12 +103,93 @@ fn describe_wlan_err(err: Error) -> &'static str {
             Ok(st) if st.state == WlanStateCode::HardwareAbsent => {
                 "no Wi-Fi adapter detected (PCIe 10ec:c821 RTL8821CE absent)"
             }
-            Ok(st) if !st.firmware_loaded => "rtw8821c_fw.bin firmware unavailable",
+            Ok(st) if !st.firmware_loaded => {
+                "Wi-Fi firmware unavailable or unsupported PCIe 802.11 chipset"
+            }
             _ => "no Wi-Fi adapter detected (PCIe 10ec:c821 RTL8821CE absent)",
         }
     } else {
         err.kind().as_str()
     }
+}
+
+fn cmd_adapters() -> i32 {
+    let net_snap = net::status().ok();
+    let wlan_snap = net::wlan_status().ok();
+
+    let mut tbl = tui::Table::new(
+        &[
+            "IFACE",
+            "TYPE / DRIVER",
+            "METRIC",
+            "STATE",
+            "IPV4/CIDR",
+            "GATEWAY",
+            "MAC",
+            "RX / TX",
+        ],
+        &[8, 24, 6, 14, 18, 15, 17, 20],
+    );
+
+    if let Some(ns) = net_snap.as_ref() {
+        let eth = &ns.ifaces[usize::from(iface_id::VIRTIO0)];
+        let eth_state = if !eth.present {
+            "absent"
+        } else if ns.active_uplink == iface_id::VIRTIO0 && eth.link_up {
+            "up (default)"
+        } else if eth.link_up {
+            "up"
+        } else {
+            "down"
+        };
+        tbl.row(&[
+            String::from("virtio0"),
+            String::from("Ethernet (virtio-net)"),
+            String::from("100"),
+            String::from(eth_state),
+            format!("{}/{}", fmt_ip(eth.ipv4), eth.prefix_len),
+            fmt_ip(eth.gateway),
+            fmt_mac(eth.mac),
+            format!("{}p / {}p", eth.rx_packets, eth.tx_packets),
+        ]);
+
+        let wl = &ns.ifaces[usize::from(iface_id::WLAN0)];
+        let drv = match wlan_snap.as_ref() {
+            Some(ws) if ws.adapter_present => format!("Wi-Fi rtw88 ({})", fmt_bdf(ws.pci_bdf)),
+            Some(ws) if ws.state != WlanStateCode::HardwareAbsent => {
+                String::from("Wi-Fi rtw88 (selftest)")
+            }
+            _ => String::from("Wi-Fi 802.11 (absent)"),
+        };
+        let wl_state = match wlan_snap.as_ref() {
+            Some(ws) => {
+                if ns.active_uplink == iface_id::WLAN0 && wl.link_up {
+                    "up (default)"
+                } else {
+                    ws.state.as_str()
+                }
+            }
+            None => "unavailable",
+        };
+        let mac = wlan_snap.as_ref().map(|w| w.active_mac).unwrap_or(wl.mac);
+        tbl.row(&[
+            String::from("wlan0"),
+            drv,
+            String::from("600"),
+            String::from(wl_state),
+            format!("{}/{}", fmt_ip(wl.ipv4), wl.prefix_len),
+            fmt_ip(wl.gateway),
+            fmt_mac(mac),
+            format!("{}p / {}p", wl.rx_packets, wl.tx_packets),
+        ]);
+    }
+
+    cu::outln(&tbl.header_line());
+    cu::outln(&tbl.separator());
+    for line in tbl.lines() {
+        cu::outln(&line);
+    }
+    0
 }
 
 fn cmd_status() -> i32 {
@@ -115,12 +200,13 @@ fn cmd_status() -> i32 {
             return 1;
         }
     };
+    let net_snap = net::status().ok();
     let hw_mode = if st.adapter_present {
-        "RTL8821CE PCIe (10ec:c821)"
+        format!("RTL8821CE PCIe 10ec:c821 @ {}", fmt_bdf(st.pci_bdf))
     } else if st.state == WlanStateCode::HardwareAbsent {
-        "none (PCIe 10ec:c821 absent)"
+        String::from("none (PCIe 10ec:c821 absent)")
     } else {
-        "rtw88 boot-selftest medium"
+        String::from("rtw88 boot-selftest medium")
     };
     cu::outln(&format!(
         "wlan0: state={}  hw=\"{}\"  fw=v{}.{} (loaded={})",
@@ -130,6 +216,28 @@ fn cmd_status() -> i32 {
         st.fw_version[1],
         st.firmware_loaded
     ));
+    if let Some(ns) = net_snap.as_ref() {
+        let eth = &ns.ifaces[usize::from(iface_id::VIRTIO0)];
+        let wl = &ns.ifaces[usize::from(iface_id::WLAN0)];
+        let def_if = ns
+            .ifaces
+            .get(usize::from(ns.active_uplink))
+            .map(|i| i.name_str())
+            .unwrap_or("lo");
+        cu::outln(&format!(
+            "       ip={}/{}  gw={}  dns={}  default_route={} (eth0/virtio0={})",
+            fmt_ip(wl.ipv4),
+            wl.prefix_len,
+            fmt_ip(wl.gateway),
+            fmt_ip(ns.dns_server),
+            def_if,
+            if eth.present && eth.link_up {
+                format!("{}/{} metric 100", fmt_ip(eth.ipv4), eth.prefix_len)
+            } else {
+                String::from("down")
+            }
+        ));
+    }
     if st.state == WlanStateCode::HardwareAbsent {
         cu::outln(
             "       no physical Realtek RTL8821CE (10ec:c821) Wi-Fi adapter detected on PCIe bus",
@@ -137,11 +245,12 @@ fn cmd_status() -> i32 {
         return 0;
     }
     cu::outln(&format!(
-        "       mac={} (factory={}, policy={})  regdomain={}  thermal={}C",
+        "       mac={} (factory={}, policy={})  regdomain={}  xtal={:#04x}  thermal={}C",
         fmt_mac(st.active_mac),
         fmt_mac(st.factory_mac),
         st.mac_policy.as_str(),
         st.reg_domain.as_str(),
+        st.xtal_cap,
         st.thermal_celsius
     ));
     if st.state == WlanStateCode::Connected || st.state == WlanStateCode::SoftAp {
@@ -155,9 +264,14 @@ fn cmd_status() -> i32 {
             rssi_quality_pct(st.rssi_dbm)
         ));
     }
+    let prof_label = if st.state == WlanStateCode::SoftAp {
+        "ap_clients"
+    } else {
+        "saved_profiles"
+    };
     cu::outln(&format!(
-        "       tx_mpdu={}  rx_mpdu={}  ccmp_replay_drops={}  saved_profiles={}",
-        st.tx_frames, st.rx_frames, st.ccmp_replay_drops, st.saved_profiles
+        "       tx_mpdu={}  rx_mpdu={}  ccmp_replay_drops={}  {}={}",
+        st.tx_frames, st.rx_frames, st.ccmp_replay_drops, prof_label, st.saved_profiles
     ));
     0
 }
@@ -225,13 +339,21 @@ fn cmd_profiles() -> i32 {
 }
 
 // ============================================================================
-// Interactive 168×50 Obsidian Wi-Fi Studio TUI (`wlanctl` / `wlanctl -n 1`)
+// Interactive 168×50 Unified Network & Wi-Fi Studio TUI (`wlanctl`)
 // ============================================================================
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum FocusedAdapter {
+    Wlan0,
+    Virtio0,
+}
+
 struct WlanTui {
+    net_status: Option<NetStatusSnapshot>,
     status: Option<WlanStatusSnapshot>,
     scan: Vec<WlanBssInfo>,
     profiles: Vec<WlanProfileSummary>,
+    focused_adapter: FocusedAdapter,
     selected: usize,
     typing_psk: bool,
     psk_buf: String,
@@ -241,19 +363,24 @@ struct WlanTui {
 impl WlanTui {
     fn new() -> Self {
         let mut s = Self {
+            net_status: None,
             status: None,
             scan: Vec::new(),
             profiles: Vec::new(),
+            focused_adapter: FocusedAdapter::Wlan0,
             selected: 0,
             typing_psk: false,
             psk_buf: String::new(),
-            banner_msg: String::from("Ready — press 's' to rescan, Enter/'c' to connect"),
+            banner_msg: String::from(
+                "Ready — [Tab] switch adapter, 's' scan, Enter connect, 'a' SoftAP",
+            ),
         };
         s.refresh(true);
         s
     }
 
     fn refresh(&mut self, do_scan: bool) {
+        self.net_status = net::status().ok();
         self.status = net::wlan_status().ok();
         let hw_absent = self
             .status
@@ -261,8 +388,18 @@ impl WlanTui {
             .is_some_and(|st| st.state == WlanStateCode::HardwareAbsent);
         if hw_absent {
             self.scan.clear();
-            self.banner_msg =
-                String::from("No Wi-Fi adapter detected (PCIe 10ec:c821 RTL8821CE absent)");
+            if self
+                .net_status
+                .as_ref()
+                .is_some_and(|ns| ns.ifaces[usize::from(iface_id::VIRTIO0)].present)
+            {
+                self.banner_msg = String::from(
+                    "virtio0 Ethernet active (metric 100) — PCIe 802.11 adapter absent",
+                );
+            } else {
+                self.banner_msg =
+                    String::from("No Wi-Fi adapter detected (PCIe 10ec:c821 RTL8821CE absent)");
+            }
         } else if do_scan {
             if let Ok(list) = net::wlan_scan() {
                 self.scan = list;
@@ -274,6 +411,10 @@ impl WlanTui {
         if self.selected >= self.scan.len() && !self.scan.is_empty() {
             self.selected = self.scan.len() - 1;
         }
+    }
+
+    fn has_saved_profile(&self, ssid: &str) -> bool {
+        self.profiles.iter().any(|p| p.ssid_str() == ssid)
     }
 }
 
@@ -314,7 +455,7 @@ fn render_tui_frame(fb: &mut FrameBuffer, app: &WlanTui) {
         .is_some_and(|st| st.state == WlanStateCode::HardwareAbsent);
 
     let hdr = format!(
-        " {}{}HuesOS Wi-Fi Studio{}  │  Realtek RTL8821CE (rtw88 / 802.11ac WPA2-CCMP)  │  {}{}",
+        " {}{}HuesOS Wi-Fi Studio · Unified Adapters{}  │  virtio-net + Realtek RTL8821CE (802.11ac WPA2-CCMP)  │  {}{}",
         fg_rgb(FG_MINT.0, FG_MINT.1, FG_MINT.2),
         ansi::BOLD,
         ansi::RESET,
@@ -324,7 +465,98 @@ fn render_tui_frame(fb: &mut FrameBuffer, app: &WlanTui) {
     fb.put_bar_row(1, BG_HEADER, &hdr);
 
     let mut row = 2usize;
-    fb.put_row(row, &box_top("Radio Telemetry & WPA2-CCMP State", cols));
+
+    // 1. Unified Multi-Adapter Overview (`virtio0` + `wlan0`)
+    fb.put_row(
+        row,
+        &box_top("Unified Network Adapters & Default Route Metric", cols),
+    );
+    row += 1;
+    if let Some(ns) = app.net_status.as_ref() {
+        let eth = &ns.ifaces[usize::from(iface_id::VIRTIO0)];
+        let wl = &ns.ifaces[usize::from(iface_id::WLAN0)];
+        let eth_sel = if app.focused_adapter == FocusedAdapter::Virtio0 {
+            "▸"
+        } else {
+            " "
+        };
+        let wl_sel = if app.focused_adapter == FocusedAdapter::Wlan0 {
+            "▸"
+        } else {
+            " "
+        };
+        let eth_def = if ns.active_uplink == iface_id::VIRTIO0 && eth.link_up {
+            "*DEFAULT*"
+        } else {
+            ""
+        };
+        let wl_def = if ns.active_uplink == iface_id::WLAN0 && wl.link_up {
+            "*DEFAULT*"
+        } else {
+            ""
+        };
+        fb.put_row(
+            row,
+            &box_line(
+                &format!(
+                    " {} virtio0 [Ethernet metric 100]  state={:<6} ip={:<18} gw={:<15} rx={}p tx={}p {}{}{}",
+                    eth_sel,
+                    if !eth.present {
+                        "absent"
+                    } else if eth.link_up {
+                        "up"
+                    } else {
+                        "down"
+                    },
+                    format!("{}/{}", fmt_ip(eth.ipv4), eth.prefix_len),
+                    fmt_ip(eth.gateway),
+                    eth.rx_packets,
+                    eth.tx_packets,
+                    fg_rgb(FG_MINT.0, FG_MINT.1, FG_MINT.2),
+                    eth_def,
+                    ansi::RESET,
+                ),
+                cols,
+            ),
+        );
+        row += 1;
+        fb.put_row(
+            row,
+            &box_line(
+                &format!(
+                    " {} wlan0   [802.11ac metric 600]  state={:<6} ip={:<18} gw={:<15} rx={}p tx={}p {}{}{}",
+                    wl_sel,
+                    if !wl.present && hw_absent {
+                        "absent"
+                    } else if wl.link_up {
+                        "up"
+                    } else {
+                        "down"
+                    },
+                    format!("{}/{}", fmt_ip(wl.ipv4), wl.prefix_len),
+                    fmt_ip(wl.gateway),
+                    wl.rx_packets,
+                    wl.tx_packets,
+                    fg_rgb(FG_MINT.0, FG_MINT.1, FG_MINT.2),
+                    wl_def,
+                    ansi::RESET,
+                ),
+                cols,
+            ),
+        );
+        row += 1;
+    } else {
+        fb.put_row(row, &box_line(" net-service status unavailable", cols));
+        row += 1;
+    }
+    fb.put_row(row, &box_bottom(cols));
+    row += 1;
+
+    // 2. Radio Telemetry & WPA2-CCMP State
+    fb.put_row(
+        row,
+        &box_top("Radio Telemetry & WPA2-CCMP / SoftAP State", cols),
+    );
     row += 1;
     if let Some(st) = app.status.as_ref() {
         if st.state == WlanStateCode::HardwareAbsent {
@@ -332,30 +564,13 @@ fn render_tui_frame(fb: &mut FrameBuffer, app: &WlanTui) {
                 row,
                 &box_line(
                     &format!(
-                        " State: {}{:<15}{}  Adapter: {}none (PCIe 10ec:c821 RTL8821CE not detected){}  FW: v{}.{} (staged={})",
+                        " State: {}{:<15}{}  Adapter: {}none (PCIe 10ec:c821 RTL8821CE not detected){}  Saved Profiles: {}",
                         fg_rgb(FG_AMBER.0, FG_AMBER.1, FG_AMBER.2),
                         st.state.as_str(),
                         ansi::RESET,
                         fg_rgb(FG_AMBER.0, FG_AMBER.1, FG_AMBER.2),
                         ansi::RESET,
-                        st.fw_version[0],
-                        st.fw_version[1],
-                        st.firmware_loaded,
-                    ),
-                    cols,
-                ),
-            );
-            row += 1;
-            fb.put_row(
-                row,
-                &box_line(
-                    &format!(
-                        " RegDomain: {}{:<8}{}  MAC Policy: {}  Saved Profiles: {}",
-                        fg_rgb(FG_CYAN.0, FG_CYAN.1, FG_CYAN.2),
-                        st.reg_domain.as_str(),
-                        ansi::RESET,
-                        st.mac_policy.as_str(),
-                        st.saved_profiles,
+                        app.profiles.len(),
                     ),
                     cols,
                 ),
@@ -363,15 +578,16 @@ fn render_tui_frame(fb: &mut FrameBuffer, app: &WlanTui) {
             row += 1;
         } else {
             let qual = rssi_quality_pct(st.rssi_dbm);
-            let sig_bar = tui::smooth_bar(qual, 100, 28, FG_MINT, FG_TRACK);
+            let sig_bar = tui::smooth_bar(qual, 100, 24, FG_MINT, FG_TRACK);
             fb.put_row(
                 row,
                 &box_line(
                     &format!(
-                        " State: {}{:<15}{}  FW: v{}.{}  RegDomain: {}{:<8}{}  MAC: {} ({})  Temp: {}C",
+                        " State: {}{:<15}{}  PCIe: {}  FW: v{}.{}  RegDomain: {}{:<8}{}  MAC: {} ({})  Temp: {}C",
                         fg_rgb(FG_MINT.0, FG_MINT.1, FG_MINT.2),
                         st.state.as_str(),
                         ansi::RESET,
+                        fmt_bdf(st.pci_bdf),
                         st.fw_version[0],
                         st.fw_version[1],
                         fg_rgb(FG_AMBER.0, FG_AMBER.1, FG_AMBER.2),
@@ -389,7 +605,7 @@ fn render_tui_frame(fb: &mut FrameBuffer, app: &WlanTui) {
                 row,
                 &box_line(
                     &format!(
-                        " Link:  SSID=\"{}\"  BSSID={}  Ch={} ({}MHz)  Signal=[{}] {} dBm ({}%)  TX/RX={}/{}",
+                        " Link:  SSID=\"{}\"  BSSID={}  Ch={} ({}MHz)  Signal=[{}] {} dBm ({}%)  MPDU TX/RX={}/{}",
                         if st.ssid_len > 0 { st.ssid_str() } else { "-" },
                         fmt_mac(st.bssid),
                         st.channel,
@@ -417,7 +633,11 @@ fn render_tui_frame(fb: &mut FrameBuffer, app: &WlanTui) {
     fb.put_row(
         row,
         &box_top(
-            &format!("Discovered 802.11 Networks ({} BSS)", app.scan.len()),
+            &format!(
+                "Discovered 802.11 Networks ({} BSS) & Saved Profiles ({})",
+                app.scan.len(),
+                app.profiles.len()
+            ),
             cols,
         ),
     );
@@ -426,8 +646,8 @@ fn render_tui_frame(fb: &mut FrameBuffer, app: &WlanTui) {
         row,
         &box_line(
             &format!(
-                "   {:<24} {:<19} {:<6} {:<4} {:<7} {:<10} {:<12}",
-                "SSID", "BSSID", "BAND", "CH", "WIDTH", "RSSI", "SECURITY"
+                "   {:<24} {:<19} {:<6} {:<4} {:<7} {:<10} {:<12} {:<8}",
+                "SSID", "BSSID", "BAND", "CH", "WIDTH", "RSSI", "SECURITY", "PROFILE"
             ),
             cols,
         ),
@@ -450,8 +670,13 @@ fn render_tui_frame(fb: &mut FrameBuffer, app: &WlanTui) {
                 ),
             );
         } else if let Some(bss) = app.scan.get(idx) {
+            let saved_tag = if app.has_saved_profile(bss.ssid_str()) {
+                "SAVED"
+            } else {
+                "-"
+            };
             let line = format!(
-                " {} {:<24} {:<19} {:<6} {:<4} {:<5}M  {:>4} dBm   {:<12}",
+                " {} {:<24} {:<19} {:<6} {:<4} {:<5}M  {:>4} dBm   {:<12} {:<8}",
                 if idx == app.selected { ">" } else { " " },
                 tui::fit(bss.ssid_str(), 24),
                 fmt_mac(bss.bssid),
@@ -460,6 +685,7 @@ fn render_tui_frame(fb: &mut FrameBuffer, app: &WlanTui) {
                 bss.width_mhz,
                 bss.rssi_dbm,
                 bss.security.as_str(),
+                saved_tag,
             );
             if idx == app.selected {
                 let hi = tui::fit_with_bg(
@@ -489,7 +715,7 @@ fn render_tui_frame(fb: &mut FrameBuffer, app: &WlanTui) {
         )
     } else {
         String::from(
-            " [q] quit   [j/k/Up/Down] select   [Enter/c] connect   [d] disconnect   [s] scan   [r] regdomain   [m] MAC privacy",
+            " [q] quit  [Tab] adapter  [j/k] select  [Enter/c] connect  [C] new PSK  [d] disconnect  [a] SoftAP  [h] DHCP  [s] scan  [r] reg  [m] MAC",
         )
     };
     fb.put_bar_row(footer_row, BG_FOOTER, &footer);
@@ -550,6 +776,20 @@ fn run_tui(max_frames: Option<u64>) -> i32 {
                 } else {
                     match key {
                         Key::Char(b'q') | Key::Char(b'Q') | Key::Escape | Key::Ctrl(3) => break,
+                        Key::Tab => {
+                            app.focused_adapter = match app.focused_adapter {
+                                FocusedAdapter::Wlan0 => FocusedAdapter::Virtio0,
+                                FocusedAdapter::Virtio0 => FocusedAdapter::Wlan0,
+                            };
+                            app.banner_msg = match app.focused_adapter {
+                                FocusedAdapter::Wlan0 => {
+                                    String::from("Focused adapter: wlan0 (802.11ac)")
+                                }
+                                FocusedAdapter::Virtio0 => {
+                                    String::from("Focused adapter: virtio0 (Ethernet)")
+                                }
+                            };
+                        }
                         Key::Up | Key::Char(b'k') => {
                             app.selected = app.selected.saturating_sub(1);
                         }
@@ -567,6 +807,54 @@ fn run_tui(max_frames: Option<u64>) -> i32 {
                             {
                                 app.banner_msg =
                                     format!("Scan complete: {} BSS found", app.scan.len());
+                            }
+                        }
+                        Key::Char(b'h') => {
+                            let (id, name) = match app.focused_adapter {
+                                FocusedAdapter::Virtio0 => (iface_id::VIRTIO0, "virtio0"),
+                                FocusedAdapter::Wlan0 => (iface_id::WLAN0, "wlan0"),
+                            };
+                            match net::set_dhcp(id, true) {
+                                Ok(()) => {
+                                    app.refresh(false);
+                                    app.banner_msg = format!("DHCPv4 renew triggered on {name}");
+                                }
+                                Err(e) => {
+                                    app.banner_msg = format!("DHCP renew on {name} failed: {e}");
+                                }
+                            }
+                        }
+                        Key::Char(b'a') => {
+                            let in_ap = app
+                                .status
+                                .as_ref()
+                                .is_some_and(|s| s.state == WlanStateCode::SoftAp);
+                            if in_ap {
+                                match net::wlan_ap_stop() {
+                                    Ok(()) => {
+                                        app.refresh(false);
+                                        app.banner_msg = String::from("SoftAP stopped");
+                                    }
+                                    Err(e) => {
+                                        app.banner_msg =
+                                            format!("SoftAP stop failed: {}", describe_wlan_err(e));
+                                    }
+                                }
+                            } else {
+                                match net::wlan_ap_start("HuesOS-Hotspot", "huesos-ap-2026", 6) {
+                                    Ok(()) => {
+                                        app.refresh(false);
+                                        app.banner_msg = String::from(
+                                            "SoftAP 'HuesOS-Hotspot' active on ch 6 (PSK: huesos-ap-2026, GW 192.168.50.1)",
+                                        );
+                                    }
+                                    Err(e) => {
+                                        app.banner_msg = format!(
+                                            "SoftAP start failed: {}",
+                                            describe_wlan_err(e)
+                                        );
+                                    }
+                                }
                             }
                         }
                         Key::Char(b'd') => match net::wlan_disconnect() {
@@ -599,9 +887,19 @@ fn run_tui(max_frames: Option<u64>) -> i32 {
                                 app.banner_msg = format!("MAC policy -> {}", nxt.as_str());
                             }
                         }
+                        Key::Char(b'C') => {
+                            if let Some(bss) = app.scan.get(app.selected).copied() {
+                                if bss.security != WlanSecurity::Open {
+                                    app.typing_psk = true;
+                                    app.psk_buf.clear();
+                                }
+                            }
+                        }
                         Key::Enter | Key::Char(b'c') => {
                             if let Some(bss) = app.scan.get(app.selected).copied() {
-                                if bss.security == WlanSecurity::Open {
+                                if bss.security == WlanSecurity::Open
+                                    || app.has_saved_profile(bss.ssid_str())
+                                {
                                     match net::wlan_connect(bss.ssid_str(), "") {
                                         Ok(()) => {
                                             app.banner_msg =
@@ -632,18 +930,28 @@ fn run_tui(max_frames: Option<u64>) -> i32 {
 }
 
 fn usage() {
-    cu::outln("usage: wlanctl [tui|status|scan|connect|disconnect|profiles|regdomain|mac|ap]");
-    cu::outln("  (no args) | tui [-n N]                launch 168x50 interactive Wi-Fi Studio TUI");
-    cu::outln("  status                                show rtw88 firmware, radio, and WPA2 state");
+    cu::outln(
+        "usage: wlanctl [tui|adapters|status|scan|connect|disconnect|profiles|dhcp|regdomain|mac|ap]",
+    );
+    cu::outln("  (no args) | tui [-n N]                launch 168x50 Network & Wi-Fi Studio TUI");
+    cu::outln(
+        "  adapters                              list all wired & wireless adapters + metrics",
+    );
+    cu::outln(
+        "  status                                show rtw88 radio, WPA2, and IPv4 route state",
+    );
     cu::outln("  scan                                  perform active 2.4/5 GHz 802.11 scan");
     cu::outln(
         "  connect <ssid> [passphrase]           authenticate, associate, and run 4-way EAPOL",
     );
     cu::outln("  disconnect                            deauthenticate and wipe PTK/GTK keys");
     cu::outln("  profiles                              list non-secret saved PMK fingerprints");
+    cu::outln("  dhcp [wlan0|virtio0] [on|off]         renew or toggle DHCPv4 on an adapter");
     cu::outln("  regdomain <WORLD|RU|US|EU|JP|UNLOCKED> set regulatory channel policy");
     cu::outln("  mac <factory|random>                  set MAC privacy policy");
-    cu::outln("  ap start <ssid> <passphrase> [ch]     start WPA2-CCMP SoftAP");
+    cu::outln(
+        "  ap start <ssid> [passphrase] [ch]     start WPA2-CCMP or Open SoftAP (192.168.50.1)",
+    );
     cu::outln("  ap stop                               stop SoftAP");
 }
 
@@ -665,6 +973,7 @@ fn run() -> i32 {
             let max_f = args.get(1).and_then(|s| s.parse::<u64>().ok()).or(Some(1));
             run_tui(max_f)
         }
+        "adapters" | "ifaces" => cmd_adapters(),
         "status" => cmd_status(),
         "scan" => cmd_scan(),
         "connect" => {
@@ -701,6 +1010,28 @@ fn run() -> i32 {
             }
         },
         "profiles" => cmd_profiles(),
+        "dhcp" => {
+            let (if_id, if_name, mode_arg) = match args.get(1).map(String::as_str) {
+                Some("virtio0" | "eth0") => (iface_id::VIRTIO0, "virtio0", args.get(2)),
+                Some("wlan0") => (iface_id::WLAN0, "wlan0", args.get(2)),
+                _ => (iface_id::WLAN0, "wlan0", args.get(1)),
+            };
+            let enable = mode_arg.map(String::as_str).unwrap_or("on") != "off";
+            match net::set_dhcp(if_id, enable) {
+                Ok(()) => {
+                    cu::outln(&format!(
+                        "wlanctl: DHCPv4 {} on {}",
+                        if enable { "started" } else { "disabled" },
+                        if_name
+                    ));
+                    0
+                }
+                Err(e) => {
+                    cu::errln(&format!("wlanctl: dhcp on {if_name} failed: {e}"));
+                    1
+                }
+            }
+        }
         "regdomain" => {
             let Some(d_str) = args.get(1) else {
                 usage();
@@ -746,16 +1077,19 @@ fn run() -> i32 {
         }
         "ap" => match args.get(1).map(String::as_str) {
             Some("start") => {
-                let (Some(ssid), Some(psk)) = (args.get(2), args.get(3)) else {
+                let Some(ssid) = args.get(2) else {
                     usage();
                     return 2;
                 };
+                let psk = args.get(3).map(String::as_str).unwrap_or("");
                 let ch = args.get(4).and_then(|s| s.parse::<u8>().ok()).unwrap_or(6);
                 match net::wlan_ap_start(ssid, psk, ch) {
                     Ok(()) => {
                         cu::outln(&format!(
-                            "wlanctl: SoftAP '{}' active on channel {} (WPA2-CCMP)",
-                            ssid, ch
+                            "wlanctl: SoftAP '{}' active on channel {} ({})",
+                            ssid,
+                            ch,
+                            if psk.is_empty() { "OPEN" } else { "WPA2-CCMP" }
                         ));
                         0
                     }

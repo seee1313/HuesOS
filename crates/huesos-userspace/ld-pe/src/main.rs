@@ -27,7 +27,7 @@ use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use huesos_abi::{vmar_flags, vmo_create_flags, ProcessAbi};
 use huesos_pe::win64_abi::{
-    teb_offsets, PeHostApi, Peb64, Win64ThreadStart, CREATE_ALWAYS, CREATE_NEW,
+    teb_offsets, PeHostApi, Peb64, Win64Context, Win64ThreadStart, CREATE_ALWAYS, CREATE_NEW,
     DEFAULT_PROCESS_HEAP, DLL_PROCESS_ATTACH, DLL_PROCESS_DETACH, DLL_THREAD_ATTACH,
     DLL_THREAD_DETACH, ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS, ERROR_FILE_NOT_FOUND,
     ERROR_INVALID_HANDLE, ERROR_INVALID_PARAMETER, ERROR_MOD_NOT_FOUND, ERROR_NOT_ENOUGH_MEMORY,
@@ -41,14 +41,16 @@ use huesos_pe::win64_abi::{
     WAIT_TIMEOUT,
 };
 use huesos_pe::{
-    apply_base_relocations, eq_dll_name_ignore_ascii_case, parse_import_binding,
-    parse_import_descriptor, parse_tls_directory, resolve_export_by_name,
-    resolve_export_by_ordinal, write_iat_slot, DataDirectory, ExportTarget, ImportSymbol, PeImage,
-    TlsDirectory64, IMAGE_DIRECTORY_ENTRY_BASERELOC, IMAGE_DIRECTORY_ENTRY_EXPORT,
-    IMAGE_DIRECTORY_ENTRY_IMPORT, IMAGE_DIRECTORY_ENTRY_TLS,
+    apply_base_relocations, eq_dll_name_ignore_ascii_case, lookup_runtime_function,
+    parse_import_binding, parse_import_descriptor, parse_tls_directory, resolve_apiset_dll,
+    resolve_export_by_name, resolve_export_by_ordinal, virtual_unwind, write_iat_slot,
+    DataDirectory, ExportTarget, ImportSymbol, PeImage, RuntimeFunction, TlsDirectory64,
+    Win64UnwindRegs, IMAGE_DIRECTORY_ENTRY_BASERELOC, IMAGE_DIRECTORY_ENTRY_EXCEPTION,
+    IMAGE_DIRECTORY_ENTRY_EXPORT, IMAGE_DIRECTORY_ENTRY_IMPORT, IMAGE_DIRECTORY_ENTRY_TLS,
 };
 use huesos_std::bootfs::BootFs;
 use huesos_std::io::{Read, Seek, SeekFrom, Write};
+use huesos_std::net::{self, TcpStream};
 use huesos_std::{bootfs, env, eprintln, fs, io, time};
 use libcanvas::process::{Process, Thread, Vmar};
 use libcanvas::stdio::{pe_image_span, take_cap_handle, CapKind};
@@ -89,15 +91,29 @@ static PEB_STORAGE: SyncPebCell = SyncPebCell(UnsafeCell::new(Peb64 {
 struct LoadedPeModule {
     name: String,
     base: u64,
+    size_of_image: u64,
     entry_rva: u32,
     is_dll: bool,
     export_dir: DataDirectory,
+    exception_dir: DataDirectory,
     tls: Option<TlsDirectory64>,
     tls_slot_index: Option<usize>,
     ref_count: usize,
     dll_main_called: bool,
     image_copy: Vec<u8>,
     _backing_vmo: Vmo,
+}
+
+struct DynFunctionTable {
+    table_va: usize,
+    entry_count: u32,
+    base_address: u64,
+}
+
+struct WinSocketSlot {
+    id: usize,
+    nonblocking: bool,
+    stream: Option<TcpStream>,
 }
 
 struct VirtualRegion {
@@ -151,6 +167,9 @@ struct RuntimeState {
     cmd_line_w: Once<Vec<u16>>,
     env_block_w: Once<Vec<u16>>,
     tsc_freq_hz: Once<u64>,
+    dyn_fn_tables: Mutex<Vec<DynFunctionTable>>,
+    sockets: Mutex<Vec<WinSocketSlot>>,
+    next_socket_id: AtomicU64,
 }
 
 static STATE: RuntimeState = RuntimeState {
@@ -170,6 +189,9 @@ static STATE: RuntimeState = RuntimeState {
     cmd_line_w: Once::new(),
     env_block_w: Once::new(),
     tsc_freq_hz: Once::new(),
+    dyn_fn_tables: Mutex::new(Vec::new()),
+    sockets: Mutex::new(Vec::new()),
+    next_socket_id: AtomicU64::new(0x1000),
 };
 
 static PE_HOST_API: PeHostApi = PeHostApi {
@@ -218,6 +240,18 @@ static PE_HOST_API: PeHostApi = PeHostApi {
     get_tick_count64: host_get_tick_count64,
     sleep_ms: host_sleep_ms,
     get_num_cpus: host_get_num_cpus,
+    lookup_function_entry: host_lookup_function_entry,
+    virtual_unwind_step: host_virtual_unwind_step,
+    add_function_table: host_add_function_table,
+    delete_function_table: host_delete_function_table,
+    gen_random: host_gen_random,
+    net_resolve_ipv4: host_net_resolve_ipv4,
+    net_tcp_socket: host_net_tcp_socket,
+    net_tcp_connect: host_net_tcp_connect,
+    net_tcp_send: host_net_tcp_send,
+    net_tcp_recv: host_net_tcp_recv,
+    net_tcp_set_nonblocking: host_net_tcp_set_nonblocking,
+    net_tcp_close: host_net_tcp_close,
 };
 
 const fn align_up(val: u64, align: u64) -> u64 {
@@ -439,7 +473,11 @@ fn win_protect_to_vmar_flags(protect: u32) -> Result<u32, u32> {
 }
 
 fn find_loaded_module_index(modules: &[LoadedPeModule], name: &str) -> Option<usize> {
-    let leaf = name.rsplit(['/', '\\']).next().unwrap_or(name);
+    let mapped_name = resolve_apiset_dll(name).unwrap_or(name);
+    let leaf = mapped_name
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(mapped_name);
     let mut normalized = String::with_capacity(leaf.len() + 4);
     for ch in leaf.chars() {
         normalized.push(ch.to_ascii_lowercase());
@@ -459,15 +497,16 @@ fn ensure_dll_loaded(dll_name: &str, depth: usize) -> Result<u64, &'static str> 
     if depth > 16 {
         return Err("DLL import recursion depth exceeded");
     }
+    let effective_name = resolve_apiset_dll(dll_name).unwrap_or(dll_name);
     {
         let mut modules = STATE.modules.lock();
-        if let Some(idx) = find_loaded_module_index(&modules, dll_name) {
+        if let Some(idx) = find_loaded_module_index(&modules, effective_name) {
             modules[idx].ref_count = modules[idx].ref_count.saturating_add(1);
             return Ok(modules[idx].base);
         }
     }
 
-    let Some((canonical_name, raw_bytes)) = read_dll_bytes(dll_name) else {
+    let Some((canonical_name, raw_bytes)) = read_dll_bytes(effective_name) else {
         return Err("imported DLL not found in HxFS or BOOTFS");
     };
     load_pe_image(&canonical_name, &raw_bytes, true, depth + 1)
@@ -649,6 +688,7 @@ fn load_pe_image(
     }
 
     let export_dir = pe.data_directory(IMAGE_DIRECTORY_ENTRY_EXPORT);
+    let exception_dir = pe.data_directory(IMAGE_DIRECTORY_ENTRY_EXCEPTION);
     let bind_rva = if pe.is_dll() && eq_dll_name_ignore_ascii_case(name, "ntdll.dll") {
         let sym_str = core::str::from_utf8(NTDLL_BIND_HOST_SYMBOL).unwrap_or("");
         match resolve_export_by_name(&staging, export_dir, sym_str) {
@@ -664,9 +704,11 @@ fn load_pe_image(
         modules.push(LoadedPeModule {
             name: String::from(name),
             base: actual_base,
+            size_of_image: aligned_img_len,
             entry_rva: pe.optional().address_of_entry_point,
             is_dll: pe.is_dll(),
             export_dir,
+            exception_dir,
             tls,
             tls_slot_index,
             ref_count: 1,
@@ -2103,4 +2145,340 @@ extern "win64" fn host_sleep_ms(ms: u32) {
 
 extern "win64" fn host_get_num_cpus() -> u32 {
     system::cpu_count().unwrap_or(1).max(1) as u32
+}
+
+extern "win64" fn host_lookup_function_entry(control_pc: u64, image_base_out: *mut u64) -> usize {
+    {
+        let modules = STATE.modules.lock();
+        for m in modules.iter() {
+            if control_pc >= m.base && control_pc < m.base.saturating_add(m.size_of_image) {
+                let rip_rva = (control_pc - m.base) as u32;
+                if !m.exception_dir.is_present() {
+                    return 0;
+                }
+                let base_off = m.exception_dir.virtual_address as usize;
+                let total_bytes = (m.exception_dir.size as usize)
+                    .min(m.image_copy.len().saturating_sub(base_off));
+                let count = total_bytes / 12;
+                for idx in 0..count {
+                    let off = base_off + idx * 12;
+                    let begin = u32::from_le_bytes([
+                        m.image_copy[off],
+                        m.image_copy[off + 1],
+                        m.image_copy[off + 2],
+                        m.image_copy[off + 3],
+                    ]);
+                    let end = u32::from_le_bytes([
+                        m.image_copy[off + 4],
+                        m.image_copy[off + 5],
+                        m.image_copy[off + 6],
+                        m.image_copy[off + 7],
+                    ]);
+                    if rip_rva >= begin && rip_rva < end {
+                        if !image_base_out.is_null() {
+                            // SAFETY: caller supplied non-null `ImageBase` output pointer.
+                            unsafe { ptr::write_unaligned(image_base_out, m.base) };
+                        }
+                        return (m.base as usize).wrapping_add(off);
+                    }
+                }
+                return 0;
+            }
+        }
+    }
+
+    let dyn_tables = STATE.dyn_fn_tables.lock();
+    for dt in dyn_tables.iter() {
+        if control_pc >= dt.base_address {
+            let rip_rva_u64 = control_pc - dt.base_address;
+            if rip_rva_u64 <= u64::from(u32::MAX) {
+                let rip_rva = rip_rva_u64 as u32;
+                for i in 0..(dt.entry_count as usize) {
+                    let entry_va = dt.table_va.wrapping_add(i * 12);
+                    // SAFETY: `table_va` registered by `RtlAddFunctionTable`.
+                    let rf = unsafe { ptr::read_unaligned(entry_va as *const RuntimeFunction) };
+                    if rip_rva >= rf.begin_address && rip_rva < rf.end_address {
+                        if !image_base_out.is_null() {
+                            // SAFETY: caller supplied non-null `ImageBase` output pointer.
+                            unsafe { ptr::write_unaligned(image_base_out, dt.base_address) };
+                        }
+                        return entry_va;
+                    }
+                }
+            }
+        }
+    }
+    0
+}
+
+extern "win64" fn host_virtual_unwind_step(
+    handler_type: u32,
+    image_base: u64,
+    control_pc: u64,
+    function_entry_va: usize,
+    ctx_ptr: *mut Win64Context,
+    handler_data_out: *mut usize,
+    establisher_frame_out: *mut u64,
+) -> usize {
+    if function_entry_va == 0 || ctx_ptr.is_null() {
+        return 0;
+    }
+    // SAFETY: `function_entry_va` and `ctx_ptr` are valid Win64 SEH pointers.
+    let (rf, mut regs) = unsafe {
+        let entry = ptr::read_unaligned(function_entry_va as *const RuntimeFunction);
+        let ctx_ref = &*ctx_ptr;
+        (
+            entry,
+            Win64UnwindRegs {
+                gpr: ctx_ref.gpr,
+                rip: control_pc,
+            },
+        )
+    };
+
+    let outcome = {
+        let modules = STATE.modules.lock();
+        let Some(m) = modules.iter().find(|m| m.base == image_base) else {
+            return 0;
+        };
+        let _ = lookup_runtime_function(&m.image_copy, m.exception_dir, rf.begin_address);
+        virtual_unwind(
+            &m.image_copy,
+            image_base,
+            rf,
+            &mut regs,
+            (handler_type & 0xFF) as u8,
+            |stack_addr| {
+                if stack_addr < 0x1000 || (stack_addr & 0x7) != 0 {
+                    None
+                } else {
+                    // SAFETY: aligned stack address inside current thread's Win64 stack.
+                    Some(unsafe { ptr::read(stack_addr as *const u64) })
+                }
+            },
+        )
+    };
+
+    let Some(step) = outcome else {
+        return 0;
+    };
+
+    // SAFETY: `ctx_ptr`, `handler_data_out`, and `establisher_frame_out` checked before writing.
+    unsafe {
+        (*ctx_ptr).gpr = regs.gpr;
+        (*ctx_ptr).rip = regs.rip;
+        if !establisher_frame_out.is_null() {
+            ptr::write_unaligned(establisher_frame_out, step.establisher_frame);
+        }
+        if !handler_data_out.is_null() {
+            let hd = if step.handler_data_rva != 0 {
+                (image_base as usize).wrapping_add(step.handler_data_rva as usize)
+            } else {
+                0
+            };
+            ptr::write_unaligned(handler_data_out, hd);
+        }
+    }
+
+    match step.handler_rva {
+        Some(rva) => (image_base as usize).wrapping_add(rva as usize),
+        None => 0,
+    }
+}
+
+extern "win64" fn host_add_function_table(
+    function_table_va: usize,
+    entry_count: u32,
+    base_address: u64,
+) -> u8 {
+    if function_table_va == 0 || entry_count == 0 {
+        return 0;
+    }
+    STATE.dyn_fn_tables.lock().push(DynFunctionTable {
+        table_va: function_table_va,
+        entry_count,
+        base_address,
+    });
+    1
+}
+
+extern "win64" fn host_delete_function_table(function_table_va: usize) -> u8 {
+    let mut tables = STATE.dyn_fn_tables.lock();
+    if let Some(pos) = tables.iter().position(|t| t.table_va == function_table_va) {
+        tables.remove(pos);
+        1
+    } else {
+        0
+    }
+}
+
+extern "win64" fn host_gen_random(buf: *mut u8, len: usize) -> i32 {
+    if len == 0 {
+        return 0;
+    }
+    if buf.is_null() {
+        return -1;
+    }
+    // SAFETY: caller supplied `buf` valid for `len` writable bytes.
+    let dst = unsafe { slice::from_raw_parts_mut(buf, len) };
+    let mut off = 0usize;
+    let mut fallback = system::monotonic_ticks()
+        .unwrap_or(0x9E37_79B9_7F4A_7C15)
+        .wrapping_add(buf as usize as u64);
+    while off < dst.len() {
+        let word = libcanvas::memory::random_u64().unwrap_or_else(|_| {
+            fallback = fallback
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            fallback
+        });
+        let bytes = word.to_le_bytes();
+        let take = (dst.len() - off).min(8);
+        dst[off..off + take].copy_from_slice(&bytes[..take]);
+        off += take;
+    }
+    0
+}
+
+const WSAEINVAL: i32 = 10022;
+const WSAEWOULDBLOCK: i32 = 10035;
+const WSAENOTSOCK: i32 = 10038;
+const WSAENOTCONN: i32 = 10057;
+const WSAECONNREFUSED: i32 = 10061;
+const WSAHOST_NOT_FOUND: i32 = 11001;
+
+extern "win64" fn host_net_resolve_ipv4(
+    host_ptr: *const u8,
+    host_len: usize,
+    ipv4_be_out: *mut u32,
+) -> i32 {
+    if host_ptr.is_null() || host_len == 0 || host_len > 255 || ipv4_be_out.is_null() {
+        return WSAEINVAL;
+    }
+    // SAFETY: `host_ptr` is valid for `host_len` bytes.
+    let Ok(host_str) = core::str::from_utf8(unsafe { slice::from_raw_parts(host_ptr, host_len) })
+    else {
+        return WSAEINVAL;
+    };
+    let ip = if host_str.eq_ignore_ascii_case("localhost") {
+        [127, 0, 0, 1]
+    } else if let Some(parsed) = net::parse_ipv4(host_str) {
+        parsed
+    } else {
+        match net::resolve_host(host_str) {
+            Ok(resolved) => resolved,
+            Err(_) => return WSAHOST_NOT_FOUND,
+        }
+    };
+    let net_order_u32 = u32::from_ne_bytes(ip);
+    // SAFETY: `ipv4_be_out` checked non-null above.
+    unsafe { ptr::write_unaligned(ipv4_be_out, net_order_u32) };
+    0
+}
+
+extern "win64" fn host_net_tcp_socket() -> usize {
+    let id = STATE.next_socket_id.fetch_add(1, Ordering::Relaxed) as usize;
+    STATE.sockets.lock().push(WinSocketSlot {
+        id,
+        nonblocking: false,
+        stream: None,
+    });
+    id
+}
+
+extern "win64" fn host_net_tcp_connect(sock_id: usize, ipv4_net_order: u32, port: u16) -> i32 {
+    let ip = ipv4_net_order.to_ne_bytes();
+    let mut stream = match TcpStream::connect_timeout(ip, port, 8_000) {
+        Ok(s) => s,
+        Err(_) => return WSAECONNREFUSED,
+    };
+    let mut socks = STATE.sockets.lock();
+    let Some(slot) = socks.iter_mut().find(|s| s.id == sock_id) else {
+        return WSAENOTSOCK;
+    };
+    stream.set_read_timeout_ms(if slot.nonblocking { 10 } else { 5_000 });
+    slot.stream = Some(stream);
+    0
+}
+
+extern "win64" fn host_net_tcp_send(sock_id: usize, buf: *const u8, len: usize) -> isize {
+    if len == 0 {
+        return 0;
+    }
+    if buf.is_null() {
+        return -(WSAEINVAL as isize);
+    }
+    // SAFETY: `buf` valid for `len` bytes.
+    let slice = unsafe { slice::from_raw_parts(buf, len) };
+    let mut socks = STATE.sockets.lock();
+    let Some(slot) = socks.iter_mut().find(|s| s.id == sock_id) else {
+        return -(WSAENOTSOCK as isize);
+    };
+    let Some(stream) = slot.stream.as_mut() else {
+        return -(WSAENOTCONN as isize);
+    };
+    match Write::write(stream, slice) {
+        Ok(n) => n as isize,
+        Err(e)
+            if matches!(
+                e.kind(),
+                huesos_std::error::ErrorKind::Busy | huesos_std::error::ErrorKind::TimedOut
+            ) =>
+        {
+            -(WSAEWOULDBLOCK as isize)
+        }
+        Err(_) => -(WSAENOTCONN as isize),
+    }
+}
+
+extern "win64" fn host_net_tcp_recv(sock_id: usize, buf: *mut u8, len: usize) -> isize {
+    if len == 0 {
+        return 0;
+    }
+    if buf.is_null() {
+        return -(WSAEINVAL as isize);
+    }
+    // SAFETY: `buf` valid for `len` writable bytes.
+    let slice = unsafe { slice::from_raw_parts_mut(buf, len) };
+    let mut socks = STATE.sockets.lock();
+    let Some(slot) = socks.iter_mut().find(|s| s.id == sock_id) else {
+        return -(WSAENOTSOCK as isize);
+    };
+    let Some(stream) = slot.stream.as_mut() else {
+        return -(WSAENOTCONN as isize);
+    };
+    match Read::read(stream, slice) {
+        Ok(n) => n as isize,
+        Err(e)
+            if matches!(
+                e.kind(),
+                huesos_std::error::ErrorKind::Busy | huesos_std::error::ErrorKind::TimedOut
+            ) =>
+        {
+            -(WSAEWOULDBLOCK as isize)
+        }
+        Err(_) => -(WSAENOTCONN as isize),
+    }
+}
+
+extern "win64" fn host_net_tcp_set_nonblocking(sock_id: usize, nonblocking: u32) -> i32 {
+    let mut socks = STATE.sockets.lock();
+    let Some(slot) = socks.iter_mut().find(|s| s.id == sock_id) else {
+        return WSAENOTSOCK;
+    };
+    slot.nonblocking = nonblocking != 0;
+    if let Some(stream) = slot.stream.as_mut() {
+        stream.set_read_timeout_ms(if slot.nonblocking { 10 } else { 5_000 });
+    }
+    0
+}
+
+extern "win64" fn host_net_tcp_close(sock_id: usize) -> i32 {
+    let mut socks = STATE.sockets.lock();
+    if let Some(pos) = socks.iter().position(|s| s.id == sock_id) {
+        socks.remove(pos);
+        0
+    } else {
+        WSAENOTSOCK
+    }
 }

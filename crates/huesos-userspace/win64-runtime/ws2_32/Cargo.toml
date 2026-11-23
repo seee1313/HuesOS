@@ -1,0 +1,11 @@
+[package]
+name = "ws2_32"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "ws2_32"
+crate-type = ["cdylib"]
+
+[dependencies]
+huesos-pe = { path = "../../../huesos-pe" }

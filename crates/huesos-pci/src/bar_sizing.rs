@@ -172,6 +172,7 @@ pub fn size_function_bars(
         transport,
         address,
         header_kind,
+        orig_cmd,
         root_id,
         apertures,
         out_resources,
@@ -202,6 +203,7 @@ fn probe_bars_inner(
     transport: &mut impl ConfigReadWriteTransport,
     address: PciAddress,
     header_kind: HeaderKind,
+    orig_cmd: u32,
     root_id: u64,
     apertures: &[RootAperture],
     out_resources: &mut Vec<FirmwareResource>,
@@ -355,7 +357,14 @@ fn probe_bars_inner(
     }
 
     if header_kind == HeaderKind::Type1Bridge {
-        decode_bridge_windows(transport, address, out_resources)?;
+        decode_bridge_windows(
+            transport,
+            address,
+            orig_cmd,
+            root_id,
+            apertures,
+            out_resources,
+        )?;
     }
 
     let rom_offset = match header_kind {
@@ -448,31 +457,69 @@ fn classify_mem_bar(
     len: u64,
     is_64bit: bool,
 ) -> ResourceClass {
-    if prefetch {
-        let has_prefetch_fit = apertures.iter().any(|ap| {
+    let fits_aperture = |class: ResourceClass| {
+        apertures.iter().any(|ap| {
             ap.root_id == root_id
-                && ap.class == ResourceClass::PrefetchableMemory
+                && ap.class == class
                 && (!assigned
                     || (pci_base >= ap.pci_base
                         && pci_base.saturating_add(len) <= ap.pci_base.saturating_add(ap.len)))
-        });
-        if has_prefetch_fit {
+        })
+    };
+
+    if assigned {
+        if prefetch {
+            if fits_aperture(ResourceClass::PrefetchableMemory) {
+                return ResourceClass::PrefetchableMemory;
+            }
+            // Firmware (OVMF / UEFI / AMD _CRS) frequently declares >4 GiB or <4 GiB
+            // QWordMemory/DWordMemory root apertures as non-cacheable Mmio64/Mmio32
+            // even when PCIe prefetchable BARs or bridge windows live inside them.
+            if fits_aperture(ResourceClass::Mmio64) {
+                return ResourceClass::Mmio64;
+            }
+            if pci_base.saturating_add(len) <= 0x1_0000_0000 && fits_aperture(ResourceClass::Mmio32)
+            {
+                return ResourceClass::Mmio32;
+            }
             return ResourceClass::PrefetchableMemory;
         }
-        // Per PCI-to-PCI bridge architecture, a 32-bit prefetchable BAR (or one
-        // placed by firmware inside a 32-bit MMIO aperture) may fall back to Mmio32
-        // when no matching prefetchable root aperture covers it.
-        if (!is_64bit || (assigned && pci_base.saturating_add(len) <= 0x1_0000_0000))
-            && apertures
-                .iter()
-                .any(|ap| ap.root_id == root_id && ap.class == ResourceClass::Mmio32)
-        {
+        if pci_base.saturating_add(len) <= 0x1_0000_0000 && fits_aperture(ResourceClass::Mmio32) {
+            return ResourceClass::Mmio32;
+        }
+        if fits_aperture(ResourceClass::Mmio64) {
+            return ResourceClass::Mmio64;
+        }
+        if fits_aperture(ResourceClass::PrefetchableMemory) {
+            return ResourceClass::PrefetchableMemory;
+        }
+        return if is_64bit && pci_base.saturating_add(len) > 0x1_0000_0000 {
+            ResourceClass::Mmio64
+        } else {
+            ResourceClass::Mmio32
+        };
+    }
+
+    if prefetch {
+        if fits_aperture(ResourceClass::PrefetchableMemory) {
+            return ResourceClass::PrefetchableMemory;
+        }
+        if is_64bit && fits_aperture(ResourceClass::Mmio64) {
+            return ResourceClass::Mmio64;
+        }
+        if !is_64bit && fits_aperture(ResourceClass::Mmio32) {
             return ResourceClass::Mmio32;
         }
         return ResourceClass::PrefetchableMemory;
     }
-    if is_64bit && (!assigned || pci_base.saturating_add(len) > 0x1_0000_0000) {
-        ResourceClass::Mmio64
+    if is_64bit {
+        if fits_aperture(ResourceClass::Mmio64) {
+            ResourceClass::Mmio64
+        } else if fits_aperture(ResourceClass::Mmio32) {
+            ResourceClass::Mmio32
+        } else {
+            ResourceClass::Mmio64
+        }
     } else {
         ResourceClass::Mmio32
     }
@@ -481,6 +528,9 @@ fn classify_mem_bar(
 fn decode_bridge_windows(
     transport: &mut impl ConfigReadWriteTransport,
     owner: PciAddress,
+    orig_cmd: u32,
+    root_id: u64,
+    apertures: &[RootAperture],
     out: &mut Vec<FirmwareResource>,
 ) -> Result<(), BarSizingError> {
     if let Some(io_reg) = transport.read_width(owner, 0x1C, ConfigWidth::Dword) {
@@ -497,7 +547,14 @@ fn decode_bridge_windows(
         };
         let base = (base_hi << 16) | (u64::from(io_base_lo & 0xF0) << 8);
         let limit = (limit_hi << 16) | (u64::from(io_limit_lo & 0xF0) << 8) | 0x0FFF;
-        if limit >= base && (io_base_lo != 0 || io_limit_lo != 0) {
+        // On PCIe Root Ports with 32-bit I/O capability, bits [3:0] of IO_BASE and
+        // IO_LIMIT hardwire to 0x1 at reset (`0x0001_0001`), yielding `base == 0,
+        // limit == 0xFFF` even when I/O forwarding is completely unconfigured.
+        // Never treat `base == 0` as an active bridge window unless I/O decode is
+        // explicitly enabled (`COMMAND.IO == 1`) AND `io_limit_lo & 0xF0 != 0`.
+        let io_active =
+            limit >= base && (base != 0 || ((orig_cmd & 0x1) != 0 && (io_limit_lo & 0xF0) != 0));
+        if io_active {
             push_resource(
                 out,
                 FirmwareResource {
@@ -516,16 +573,20 @@ fn decode_bridge_windows(
     if let Some(mem_reg) = transport.read_width(owner, 0x20, ConfigWidth::Dword) {
         let mem_base = u64::from(mem_reg & 0xFFF0) << 16;
         let mem_limit = (u64::from((mem_reg >> 16) & 0xFFF0) << 16) | 0xF_FFFF;
-        if mem_limit >= mem_base && mem_reg != 0 {
+        // Physical 0x0000_0000..0x000F_FFFF is x86 low RAM/BIOS; `mem_base == 0`
+        // represents an unprogrammed bridge memory window.
+        if mem_limit >= mem_base && mem_base != 0 {
+            let len = (mem_limit - mem_base) + 1;
+            let class = classify_mem_bar(root_id, apertures, false, true, mem_base, len, false);
             push_resource(
                 out,
                 FirmwareResource {
                     owner,
                     register: ResourceRegister::BridgeWindow(1),
-                    class: ResourceClass::Mmio32,
+                    class,
                     assigned: true,
                     pci_base: mem_base,
-                    len: (mem_limit - mem_base) + 1,
+                    len,
                     fixed: false,
                 },
             )?;
@@ -535,7 +596,8 @@ fn decode_bridge_windows(
     if let Some(pref_reg) = transport.read_width(owner, 0x24, ConfigWidth::Dword) {
         let pref_base_lo = (pref_reg & 0xFFFF) as u16;
         let pref_limit_lo = ((pref_reg >> 16) & 0xFFFF) as u16;
-        let (base_hi, limit_hi) = if (pref_base_lo & 0x0F) == 1 {
+        let is_64 = (pref_base_lo & 0x0F) == 1;
+        let (base_hi, limit_hi) = if is_64 {
             let b = transport
                 .read_width(owner, 0x28, ConfigWidth::Dword)
                 .unwrap_or(0);
@@ -548,16 +610,20 @@ fn decode_bridge_windows(
         };
         let base = (base_hi << 32) | (u64::from(pref_base_lo & 0xFFF0) << 16);
         let limit = (limit_hi << 32) | (u64::from(pref_limit_lo & 0xFFF0) << 16) | 0xF_FFFF;
-        if limit >= base && pref_reg != 0 {
+        // On 64-bit PCIe Root Ports, `pref_reg` resets to `0x0001_0001` (capability
+        // bit 0 = 64-bit decode) with `base == 0`. Ignore unconfigured `base == 0`.
+        if limit >= base && base != 0 {
+            let len = (limit - base) + 1;
+            let class = classify_mem_bar(root_id, apertures, true, true, base, len, is_64);
             push_resource(
                 out,
                 FirmwareResource {
                     owner,
                     register: ResourceRegister::BridgeWindow(2),
-                    class: ResourceClass::PrefetchableMemory,
+                    class,
                     assigned: true,
                     pci_base: base,
-                    len: (limit - base) + 1,
+                    len,
                     fixed: false,
                 },
             )?;
@@ -845,5 +911,188 @@ mod tests {
             res,
             Err(BarSizingError::MalformedBarMask { bar_index: 0, .. })
         ));
+    }
+
+    #[test]
+    fn routes_64bit_prefetchable_bar_in_mmio64_crs_and_ignores_reset_pcie_bridge_windows() {
+        let Ok(bridge_addr) = PciAddress::try_new(0, 0, 1, 3) else {
+            return;
+        };
+        let Ok(wlan_addr) = PciAddress::try_new(0, 1, 0, 0) else {
+            return;
+        };
+        let Ok(vnet_addr) = PciAddress::try_new(0, 0, 4, 0) else {
+            return;
+        };
+        let roots = [RootBus {
+            root_id: 1,
+            segment: 0,
+            start_bus: 0,
+            end_bus: 2,
+        }];
+        let functions = [
+            DiscoveredFunction {
+                address: bridge_addr,
+                vendor_id: 0x1022,
+                device_id: 0x1634,
+                class_code: ClassCode {
+                    class: 0x06,
+                    subclass: 0x04,
+                    prog_if: 0x00,
+                },
+                kind: FunctionKind::PciBridge {
+                    secondary_bus: 1,
+                    subordinate_bus: 1,
+                },
+            },
+            DiscoveredFunction {
+                address: wlan_addr,
+                vendor_id: 0x10EC,
+                device_id: 0xC821,
+                class_code: ClassCode {
+                    class: 0x02,
+                    subclass: 0x80,
+                    prog_if: 0x00,
+                },
+                kind: FunctionKind::Endpoint,
+            },
+            DiscoveredFunction {
+                address: vnet_addr,
+                vendor_id: 0x1AF4,
+                device_id: 0x1000,
+                class_code: ClassCode {
+                    class: 0x02,
+                    subclass: 0x00,
+                    prog_if: 0x00,
+                },
+                kind: FunctionKind::Endpoint,
+            },
+        ];
+        let Ok(topo) = build_snapshot(1, &roots, &functions) else {
+            return;
+        };
+        let apertures = [
+            RootAperture {
+                root_id: 1,
+                class: ResourceClass::Mmio32,
+                pci_base: 0xFC00_0000,
+                cpu_base: 0xFC00_0000,
+                len: 0x0200_0000,
+            },
+            RootAperture {
+                root_id: 1,
+                class: ResourceClass::Mmio64,
+                pci_base: 0xC0_0000_0000,
+                cpu_base: 0xC0_0000_0000,
+                len: 0x01_0000_0000,
+            },
+        ];
+
+        struct MultiDevTransport {
+            bridge_cmd: u16,
+            wlan_cmd: u16,
+            wlan_bar2_lo: u32,
+            wlan_bar2_hi: u32,
+            vnet_cmd: u16,
+            vnet_bar4_lo: u32,
+            vnet_bar4_hi: u32,
+        }
+        impl ConfigReadWriteTransport for MultiDevTransport {
+            fn read_width(&mut self, addr: PciAddress, off: u16, _w: ConfigWidth) -> Option<u32> {
+                if addr.bus() == 0 && addr.device() == 1 && addr.function() == 3 {
+                    return match off {
+                        0x04 => Some(u32::from(self.bridge_cmd)),
+                        0x1C => Some(0x0001_0001), // unconfigured 32-bit I/O cap reset value
+                        0x20 => Some(0xFC80_FC80), // 0xFC80_0000..0xFC8F_FFFF
+                        0x24 => Some(0x0001_0001), // unconfigured 64-bit pref cap reset value
+                        _ => Some(0),
+                    };
+                }
+                if addr.bus() == 1 {
+                    return match off {
+                        0x04 => Some(u32::from(self.wlan_cmd)),
+                        0x18 => Some(self.wlan_bar2_lo),
+                        0x1C => Some(self.wlan_bar2_hi),
+                        _ => Some(0),
+                    };
+                }
+                match off {
+                    0x04 => Some(u32::from(self.vnet_cmd)),
+                    0x20 => Some(self.vnet_bar4_lo),
+                    0x24 => Some(self.vnet_bar4_hi),
+                    _ => Some(0),
+                }
+            }
+            fn write_width(
+                &mut self,
+                addr: PciAddress,
+                off: u16,
+                _w: ConfigWidth,
+                val: u32,
+            ) -> bool {
+                if addr.bus() == 0 && addr.device() == 1 && addr.function() == 3 {
+                    if off == 0x04 {
+                        self.bridge_cmd = val as u16;
+                    }
+                    return true;
+                }
+                if addr.bus() == 1 {
+                    match off {
+                        0x04 => self.wlan_cmd = val as u16,
+                        0x18 => {
+                            self.wlan_bar2_lo = if val == u32::MAX {
+                                0xFFFF_0004
+                            } else {
+                                (val & 0xFFFF_0000) | 0x4
+                            };
+                        }
+                        0x1C => {
+                            self.wlan_bar2_hi = if val == u32::MAX { u32::MAX } else { val };
+                        }
+                        _ => {}
+                    }
+                    return true;
+                }
+                match off {
+                    0x04 => self.vnet_cmd = val as u16,
+                    0x20 => {
+                        self.vnet_bar4_lo = if val == u32::MAX {
+                            0xFFFF_C00C
+                        } else {
+                            (val & 0xFFFF_C000) | 0xC
+                        };
+                    }
+                    0x24 => {
+                        self.vnet_bar4_hi = if val == u32::MAX { u32::MAX } else { val };
+                    }
+                    _ => {}
+                }
+                true
+            }
+        }
+
+        let mut t = MultiDevTransport {
+            bridge_cmd: 0x0006,
+            wlan_cmd: 0x0006,
+            wlan_bar2_lo: 0xFC80_0004,
+            wlan_bar2_hi: 0x0000_0000,
+            vnet_cmd: 0x0006,
+            vnet_bar4_lo: 0x0000_000C,
+            vnet_bar4_hi: 0x0000_00C0,
+        };
+        let live_res = collect_live_bar_inventory(&mut t, &topo, &apertures, &NoActiveLeases);
+        assert!(live_res.is_ok(), "live BAR inventory must succeed");
+        let Ok(live) = live_res else {
+            return;
+        };
+        assert!(
+            live.validation.is_conflict_free(),
+            "validation must be conflict-free: {:?}",
+            live.validation.resources()
+        );
+        let wlan_bar = live.validation.find(wlan_addr, ResourceRegister::Bar(2));
+        assert_eq!(wlan_bar.and_then(|r| r.cpu_base), Some(0xFC80_0000));
+        let vnet_bar = live.validation.find(vnet_addr, ResourceRegister::Bar(4));
+        assert_eq!(vnet_bar.and_then(|r| r.cpu_base), Some(0xC0_0000_0000));
     }
 }

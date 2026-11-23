@@ -6,10 +6,14 @@ license.workspace = true
 
 [features]
 default = []
-boot-selftest = []
+boot-selftest = ["dep:huesos-ieee80211", "dep:huesos-wpa", "dep:huesos-net"]
 
 [dependencies]
-huesos-abi = { path = "../huesos-abi" }
+huesos-ieee80211 = { path = "../huesos-ieee80211", optional = true }
+huesos-wpa = { path = "../huesos-wpa", optional = true }
+huesos-net = { path = "../huesos-net", optional = true }
+
+[dev-dependencies]
 huesos-ieee80211 = { path = "../huesos-ieee80211" }
 huesos-wpa = { path = "../huesos-wpa" }
 huesos-net = { path = "../huesos-net" }

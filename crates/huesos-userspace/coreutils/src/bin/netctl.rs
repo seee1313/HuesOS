@@ -24,11 +24,17 @@ cu::coreutil_entry!(run);
 
 fn usage() {
     cu::outln("usage: netctl [status|dhcp|static|dns|resolve]");
-    cu::outln("  status                       show interfaces, addresses, routes, and counters");
-    cu::outln("  dhcp [on|off]                renew or toggle DHCPv4 on virtio0");
-    cu::outln("  static <ip/prefix> <gateway> configure static IPv4 CIDR on virtio0");
-    cu::outln("  dns <ipv4>                   override upstream DNS resolver");
-    cu::outln("  resolve <hostname>           resolve an IPv4 A record via net-service");
+    cu::outln(
+        "  status                                       show interfaces, routes, and counters",
+    );
+    cu::outln(
+        "  dhcp [virtio0|wlan0] [on|off]                renew or toggle DHCPv4 on an interface",
+    );
+    cu::outln("  static [virtio0|wlan0] <ip/prefix> <gateway> configure static IPv4 CIDR");
+    cu::outln("  dns <ipv4>                                   override upstream DNS resolver");
+    cu::outln(
+        "  resolve <hostname>                           resolve an IPv4 A record via net-service",
+    );
 }
 
 fn fmt_ip(ip: [u8; 4]) -> String {
@@ -120,14 +126,23 @@ fn run() -> i32 {
     match args.first().map(String::as_str).unwrap_or("status") {
         "status" => cmd_status(),
         "dhcp" => {
-            let enable = args.get(1).map(String::as_str).unwrap_or("on") != "off";
-            match net::set_dhcp(iface_id::VIRTIO0, enable) {
+            let (if_id, if_name, mode_arg) = match args.get(1).map(String::as_str) {
+                Some("wlan0") => (iface_id::WLAN0, "wlan0", args.get(2)),
+                Some("virtio0" | "eth0") => (iface_id::VIRTIO0, "virtio0", args.get(2)),
+                _ => (iface_id::VIRTIO0, "virtio0", args.get(1)),
+            };
+            let enable = mode_arg.map(String::as_str).unwrap_or("on") != "off";
+            match net::set_dhcp(if_id, enable) {
                 Ok(()) => {
-                    cu::outln(if enable {
-                        "netctl: DHCPv4 discovery started on virtio0"
-                    } else {
-                        "netctl: DHCPv4 disabled on virtio0"
-                    });
+                    cu::outln(&format!(
+                        "netctl: DHCPv4 {} on {}",
+                        if enable {
+                            "discovery started"
+                        } else {
+                            "disabled"
+                        },
+                        if_name
+                    ));
                     0
                 }
                 Err(e) => {
@@ -137,7 +152,14 @@ fn run() -> i32 {
             }
         }
         "static" => {
-            let (Some(cidr), Some(gw_str)) = (args.get(1), args.get(2)) else {
+            let (if_id, if_name, cidr_opt, gw_opt) = match args.get(1).map(String::as_str) {
+                Some("wlan0") => (iface_id::WLAN0, "wlan0", args.get(2), args.get(3)),
+                Some("virtio0" | "eth0") => {
+                    (iface_id::VIRTIO0, "virtio0", args.get(2), args.get(3))
+                }
+                _ => (iface_id::VIRTIO0, "virtio0", args.get(1), args.get(2)),
+            };
+            let (Some(cidr), Some(gw_str)) = (cidr_opt, gw_opt) else {
                 usage();
                 return 2;
             };
@@ -147,13 +169,14 @@ fn run() -> i32 {
                 pfx_s.parse::<u8>(),
                 net::parse_ipv4(gw_str),
             ) else {
-                cu::errln("netctl: invalid static <ip/prefix> <gateway>");
+                cu::errln("netctl: invalid static [iface] <ip/prefix> <gateway>");
                 return 2;
             };
-            match net::set_static_ip(iface_id::VIRTIO0, ip, pfx.min(32), gw) {
+            match net::set_static_ip(if_id, ip, pfx.min(32), gw) {
                 Ok(()) => {
                     cu::outln(&format!(
-                        "netctl: configured virtio0 {}/{} gw {}",
+                        "netctl: configured {} {}/{} gw {}",
+                        if_name,
                         fmt_ip(ip),
                         pfx.min(32),
                         fmt_ip(gw)

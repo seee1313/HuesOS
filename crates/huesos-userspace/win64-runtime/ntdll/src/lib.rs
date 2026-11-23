@@ -18,7 +18,7 @@ use core::sync::atomic::{AtomicPtr, AtomicU32, AtomicUsize, Ordering};
 
 use huesos_pe::win64_abi::{
     ERROR_INVALID_PARAMETER, ERROR_SUCCESS, ERROR_TIMEOUT, FALSE, INFINITE, PE_HOST_API_VERSION,
-    PeHostApi, RtlConditionVariable, RtlCriticalSection, RtlSrwLock, TRUE,
+    PeHostApi, RtlConditionVariable, RtlCriticalSection, RtlSrwLock, TRUE, Win64Context,
 };
 
 #[used]
@@ -654,4 +654,245 @@ pub unsafe extern "win64" fn NtQueryPerformanceCounter(
         }
     }
     0
+}
+
+// ============================================================================
+// Win64 `.pdata` / `.xdata` SEH & Stack Unwinding (`Rtl*`)
+// ============================================================================
+
+#[unsafe(no_mangle)]
+pub extern "win64" fn RtlLookupFunctionEntry(
+    control_pc: u64,
+    image_base_out: *mut u64,
+    _history_table: usize,
+) -> usize {
+    host().map_or(0, |h| (h.lookup_function_entry)(control_pc, image_base_out))
+}
+
+#[unsafe(no_mangle)]
+pub extern "win64" fn RtlVirtualUnwind(
+    handler_type: u32,
+    image_base: u64,
+    control_pc: u64,
+    function_entry: usize,
+    ctx: *mut Win64Context,
+    handler_data: *mut usize,
+    establisher_frame: *mut u64,
+    _context_pointers: usize,
+) -> usize {
+    host().map_or(0, |h| {
+        (h.virtual_unwind_step)(
+            handler_type,
+            image_base,
+            control_pc,
+            function_entry,
+            ctx,
+            handler_data,
+            establisher_frame,
+        )
+    })
+}
+
+#[inline(always)]
+fn capture_context_inline() -> Win64Context {
+    let mut ctx = Win64Context::zeroed();
+    let rbx_v: u64;
+    let rsp_v: u64;
+    let rbp_v: u64;
+    let rsi_v: u64;
+    let rdi_v: u64;
+    let r12_v: u64;
+    let r13_v: u64;
+    let r14_v: u64;
+    let r15_v: u64;
+    let rip_v: u64;
+    // SAFETY: reads current non-volatile registers inline within caller's stack frame.
+    unsafe {
+        asm!(
+            "mov {rbx_o}, rbx",
+            "mov {rsp_o}, rsp",
+            "mov {rbp_o}, rbp",
+            "mov {rsi_o}, rsi",
+            "mov {rdi_o}, rdi",
+            "mov {r12_o}, r12",
+            "mov {r13_o}, r13",
+            "mov {r14_o}, r14",
+            "mov {r15_o}, r15",
+            "lea {rip_o}, [rip + 0]",
+            rbx_o = out(reg) rbx_v,
+            rsp_o = out(reg) rsp_v,
+            rbp_o = out(reg) rbp_v,
+            rsi_o = out(reg) rsi_v,
+            rdi_o = out(reg) rdi_v,
+            r12_o = out(reg) r12_v,
+            r13_o = out(reg) r13_v,
+            r14_o = out(reg) r14_v,
+            r15_o = out(reg) r15_v,
+            rip_o = out(reg) rip_v,
+            options(nostack, preserves_flags),
+        );
+    }
+    ctx.gpr[3] = rbx_v;
+    ctx.gpr[4] = rsp_v;
+    ctx.gpr[5] = rbp_v;
+    ctx.gpr[6] = rsi_v;
+    ctx.gpr[7] = rdi_v;
+    ctx.gpr[12] = r12_v;
+    ctx.gpr[13] = r13_v;
+    ctx.gpr[14] = r14_v;
+    ctx.gpr[15] = r15_v;
+    ctx.rip = rip_v;
+    ctx
+}
+
+#[unsafe(no_mangle)]
+pub extern "win64" fn RtlCaptureContext(ctx_ptr: *mut Win64Context) {
+    if ctx_ptr.is_null() {
+        return;
+    }
+    let ctx = capture_context_inline();
+    // SAFETY: `ctx_ptr` checked non-null above.
+    unsafe {
+        ptr::write_unaligned(ctx_ptr, ctx);
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "win64" fn RtlAddFunctionTable(
+    function_table: usize,
+    entry_count: u32,
+    base_address: u64,
+) -> u8 {
+    host().map_or(0, |h| {
+        (h.add_function_table)(function_table, entry_count, base_address)
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "win64" fn RtlDeleteFunctionTable(function_table: usize) -> u8 {
+    host().map_or(0, |h| (h.delete_function_table)(function_table))
+}
+
+#[unsafe(no_mangle)]
+pub extern "win64" fn RtlPcToFileHeader(pc_value: u64, base_of_image_out: *mut u64) -> u64 {
+    let mut base = 0u64;
+    let _ = RtlLookupFunctionEntry(pc_value, &raw mut base, 0);
+    if !base_of_image_out.is_null() {
+        // SAFETY: `base_of_image_out` checked non-null.
+        unsafe { ptr::write_unaligned(base_of_image_out, base) };
+    }
+    base
+}
+
+#[unsafe(no_mangle)]
+pub extern "win64" fn RtlCaptureStackBackTrace(
+    frames_to_skip: u32,
+    frames_to_capture: u32,
+    back_trace: *mut usize,
+    back_trace_hash: *mut u32,
+) -> u16 {
+    if back_trace.is_null() || frames_to_capture == 0 {
+        return 0;
+    }
+    let mut ctx = capture_context_inline();
+
+    let max_total = frames_to_skip.saturating_add(frames_to_capture).min(64);
+    let mut captured = 0u16;
+    let mut hash = 0u32;
+
+    for step_idx in 0..max_total {
+        if ctx.rip < 0x1000 {
+            break;
+        }
+        let mut img_base = 0u64;
+        let fn_entry = RtlLookupFunctionEntry(ctx.rip, &raw mut img_base, 0);
+        if fn_entry == 0 {
+            if step_idx > 0 {
+                // Reached non-PE host loader boundary (`ld-pe.so` ELF frame).
+                break;
+            }
+            // Innermost leaf function: pop return address directly from `[rsp]`.
+            let sp = ctx.gpr[4];
+            if sp < 0x1000 || (sp & 7) != 0 {
+                break;
+            }
+            // SAFETY: 8-byte aligned stack pointer inside current thread stack.
+            ctx.rip = unsafe { ptr::read(sp as *const u64) };
+            ctx.gpr[4] = sp.wrapping_add(8);
+        } else {
+            let mut hdata = 0usize;
+            let mut est = 0u64;
+            let _ = RtlVirtualUnwind(
+                0,
+                img_base,
+                ctx.rip,
+                fn_entry,
+                &raw mut ctx,
+                &raw mut hdata,
+                &raw mut est,
+                0,
+            );
+        }
+        if ctx.rip == 0 {
+            break;
+        }
+        if step_idx >= frames_to_skip {
+            // SAFETY: `captured < frames_to_capture` within caller's `back_trace` array.
+            unsafe {
+                ptr::write(back_trace.add(usize::from(captured)), ctx.rip as usize);
+            }
+            hash = hash.rotate_left(5).wrapping_add(ctx.rip as u32);
+            captured += 1;
+        }
+    }
+
+    if !back_trace_hash.is_null() {
+        // SAFETY: `back_trace_hash` checked non-null.
+        unsafe { ptr::write_unaligned(back_trace_hash, hash) };
+    }
+    captured
+}
+
+#[unsafe(no_mangle)]
+pub extern "win64" fn RtlUnwindEx(
+    _target_frame: usize,
+    _target_ip: usize,
+    _exception_record: usize,
+    _return_value: usize,
+    _context_record: *mut Win64Context,
+    _history_table: usize,
+) {
+}
+
+#[unsafe(no_mangle)]
+pub extern "win64" fn RtlRaiseException(_exception_record: usize) -> ! {
+    NtTerminateProcess(usize::MAX, 0xC000_0025)
+}
+
+#[unsafe(no_mangle)]
+pub extern "win64" fn __C_specific_handler(
+    _exception_record: usize,
+    _establisher_frame: usize,
+    _context_record: usize,
+    _dispatcher_context: usize,
+) -> i32 {
+    1 // ExceptionContinueSearch
+}
+
+#[unsafe(no_mangle)]
+pub extern "win64" fn RtlEncodePointer(ptr_val: usize) -> usize {
+    ptr_val ^ 0x5A5A_5A5A_A5A5_A5A5usize
+}
+
+#[unsafe(no_mangle)]
+pub extern "win64" fn RtlDecodePointer(ptr_val: usize) -> usize {
+    ptr_val ^ 0x5A5A_5A5A_A5A5_A5A5usize
+}
+
+#[unsafe(no_mangle)]
+pub extern "win64" fn RtlInitializeSListHead(list_head: *mut [u64; 2]) {
+    if !list_head.is_null() {
+        // SAFETY: `list_head` checked non-null.
+        unsafe { ptr::write_unaligned(list_head, [0, 0]) };
+    }
 }

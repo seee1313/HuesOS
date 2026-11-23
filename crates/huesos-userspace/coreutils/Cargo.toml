@@ -193,6 +193,7 @@ huesos-abi = { path = "../../huesos-abi" }
 huesos-std = { path = "../huesos-std" }
 huesos-gpt = { path = "../../huesos-gpt" }
 huesos-hxfs = { path = "../../huesos-hxfs", features = ["writer"] }
+huesos-tls = { path = "../../huesos-tls" }
 spin = "0.9.9"
 
 [profile.release]

@@ -460,7 +460,6 @@ version = "0.1.0"
 name = "huesos-rtw88"
 version = "0.1.0"
 dependencies = [
- "huesos-abi",
  "huesos-ieee80211",
  "huesos-net",
  "huesos-wpa",
@@ -502,6 +501,20 @@ dependencies = [
  "spin",
  "static_assertions",
  "x86_64",
+]
+
+[[package]]
+name = "huesos-tls"
+version = "0.1.0"
+dependencies = [
+ "aead",
+ "aes-gcm",
+ "curve25519-dalek",
+ "ed25519-dalek",
+ "hkdf",
+ "hmac",
+ "sha2",
+ "subtle",
 ]
 
 [[package]]

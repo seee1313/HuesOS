@@ -40,6 +40,7 @@ members = [
     "crates/huesos-ieee80211",
     "crates/huesos-wpa",
     "crates/huesos-rtw88",
+    "crates/huesos-tls",
 ]
 resolver = "2"
 exclude = ["tools"]
