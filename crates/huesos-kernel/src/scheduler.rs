@@ -34,14 +34,16 @@ pub const TICK_NS: u64 = 10_000_000;
 /// Compatibility accounting unit; CPU time is now charged from TSC deltas.
 pub const TICK_SERVICE_NS: u64 = TICK_NS;
 
-const FAIR_REQUEST_NS: u64 = 4_000_000;
-const JOB_REQUEST_NS: u64 = 20_000_000;
-const SLEEP_LAG_DECAY_NS: u64 = FAIR_REQUEST_NS * 8;
+const FAIR_REQUEST_NS: u64 = 1_000_000;
+const JOB_REQUEST_NS: u64 = 4_000_000;
+const SLEEP_LAG_DECAY_NS: u64 = 32_000_000;
 const MAX_CBS_REFILLS: usize = 8;
 
 static TSC_DEADLINE_ACTIVE: AtomicBool = AtomicBool::new(false);
 static MONOTONIC_TICKS: AtomicU64 = AtomicU64::new(0);
 static ONLINE_CPUS: [AtomicU64; MAX_CPUS / 64] = [const { AtomicU64::new(0) }; MAX_CPUS / 64];
+static NEXT_SPAWN_CPU: AtomicUsize = AtomicUsize::new(0);
+static CPU_PENDING_SPAWNS: [AtomicUsize; MAX_CPUS] = [const { AtomicUsize::new(0) }; MAX_CPUS];
 static TSC_CLOCK: spin::Once<TscClock> = spin::Once::new();
 
 static TASK_DIRECTORY: TaskDirectory = TaskDirectory::new();
@@ -53,6 +55,7 @@ static CPU_INBOX: [TaskInbox; MAX_CPUS] = [const { TaskInbox::new() }; MAX_CPUS]
 /// takes its local scheduler lock.
 struct PendingTask {
     id: u64,
+    cpu: usize,
     task: Box<Task>,
 }
 static PENDING_TASKS: RankedIrqSafeTicketLock<Vec<Option<PendingTask>>> =
@@ -266,6 +269,9 @@ impl JobRunqueue {
         })
     }
 }
+
+const _: () = assert!(core::mem::size_of::<EevdfTree<MAX_FAIR_TASKS>>() < 256);
+const _: () = assert!(core::mem::size_of::<JobRunqueue>() < 256);
 
 struct Scheduler {
     /// Dense CPU index that is the sole writer of all fields below.
@@ -654,19 +660,20 @@ impl Scheduler {
         {
             scheduler_fail_stop();
         }
-        let (request_finish, request_remaining) = if fair {
-            Self::make_request(
-                self.job_queues[job_index].virtual_time,
-                FAIR_REQUEST_NS,
-                task_weight,
-            )
+        let (request_start, request_finish, request_remaining) = if fair {
+            let vtime = self.job_queues[job_index].virtual_time;
+            let initial_slice = (FAIR_REQUEST_NS / 2).max(1);
+            let credit = virtual_delta(initial_slice, task_weight).unwrap_or(1);
+            let start = vtime.saturating_sub(credit);
+            let (finish, request) = Self::make_request(start, initial_slice, task_weight);
+            (start, finish, request)
         } else {
-            (0, 0)
+            (0, 0, 0)
         };
         let slot_index = id.slot();
         self.tasks[slot_index] = Some(TaskSlot {
             task,
-            request_start: self.job_queues[job_index].virtual_time,
+            request_start,
             request_finish,
             request_remaining_ns: request_remaining,
             blocked_at_ns: now_ns,
@@ -695,6 +702,9 @@ impl Scheduler {
             1,
         );
         publish_cpu_stats(self);
+        if self.should_preempt_current(slot_index) && cpu == self::cpu_id() {
+            huesos_arch::preemption::request_reschedule();
+        }
         Ok(())
     }
 
@@ -744,38 +754,63 @@ impl Scheduler {
                     );
                 }
                 if let Some(slot) = self.task_mut(slot_index) {
+                    let w = weight.max(1);
                     let mut remaining = elapsed_ns;
                     while remaining != 0 {
                         if remaining < slot.request_remaining_ns {
+                            let delta = virtual_delta(remaining, w).unwrap_or(1);
                             slot.request_remaining_ns -= remaining;
+                            slot.request_start = slot
+                                .request_start
+                                .saturating_add(delta)
+                                .min(slot.request_finish);
+                            let (finish, _) = Self::make_request(
+                                slot.request_start,
+                                slot.request_remaining_ns,
+                                w,
+                            );
+                            slot.request_finish = finish;
                             remaining = 0;
                         } else {
                             remaining -= slot.request_remaining_ns;
                             slot.request_start = slot.request_finish;
-                            let (finish, request) = Self::make_request(
-                                slot.request_start,
-                                FAIR_REQUEST_NS,
-                                weight.max(1),
-                            );
+                            let (finish, request) =
+                                Self::make_request(slot.request_start, FAIR_REQUEST_NS, w);
                             slot.request_finish = finish;
                             slot.request_remaining_ns = request;
                         }
                     }
                 }
-                let job = &mut self.job_queues[job_index];
-                let mut remaining = elapsed_ns;
-                while remaining != 0 {
-                    if remaining < job.root_remaining_ns {
-                        job.root_remaining_ns -= remaining;
-                        remaining = 0;
-                    } else {
-                        remaining -= job.root_remaining_ns;
-                        job.root_start = job.root_finish;
-                        job.root_finish = job.root_start.saturating_add(
-                            virtual_delta(JOB_REQUEST_NS, job.weight).map_or(1, |delta| delta),
-                        );
-                        job.root_remaining_ns = JOB_REQUEST_NS;
+                let was_root_queued = self.job_queues[job_index].root_queued;
+                if was_root_queued {
+                    self.remove_root_job(job_index);
+                }
+                {
+                    let job = &mut self.job_queues[job_index];
+                    let jw = job.weight.max(1);
+                    let mut remaining = elapsed_ns;
+                    while remaining != 0 {
+                        if remaining < job.root_remaining_ns {
+                            let delta = virtual_delta(remaining, jw).unwrap_or(1);
+                            job.root_remaining_ns -= remaining;
+                            job.root_start =
+                                job.root_start.saturating_add(delta).min(job.root_finish);
+                            job.root_finish = job.root_start.saturating_add(
+                                virtual_delta(job.root_remaining_ns, jw).unwrap_or(1),
+                            );
+                            remaining = 0;
+                        } else {
+                            remaining -= job.root_remaining_ns;
+                            job.root_start = job.root_finish;
+                            job.root_finish = job
+                                .root_start
+                                .saturating_add(virtual_delta(JOB_REQUEST_NS, jw).unwrap_or(1));
+                            job.root_remaining_ns = JOB_REQUEST_NS;
+                        }
                     }
+                }
+                if was_root_queued && self.job_queues[job_index].fair_runnable != 0 {
+                    self.insert_root_job(job_index);
                 }
             }
             SchedPolicy::Deadline { .. } => {
@@ -903,7 +938,13 @@ impl Scheduler {
                     continue;
                 };
                 self.job_queues[root_index].root_queued = false;
-                if let Some(slot) = self.pop_job_thread(root_index) {
+                let popped = self.pop_job_thread(root_index);
+                if !self.job_queues[root_index].threads.is_empty()
+                    && self.job_queues[root_index].fair_runnable != 0
+                {
+                    self.insert_root_job(root_index);
+                }
+                if let Some(slot) = popped {
                     return Some(slot);
                 }
                 continue;
@@ -912,7 +953,13 @@ impl Scheduler {
                 continue;
             };
             self.job_queues[job_index].root_queued = false;
-            if let Some(slot) = self.pop_job_thread(job_index) {
+            let popped = self.pop_job_thread(job_index);
+            if !self.job_queues[job_index].threads.is_empty()
+                && self.job_queues[job_index].fair_runnable != 0
+            {
+                self.insert_root_job(job_index);
+            }
+            if let Some(slot) = popped {
                 return Some(slot);
             }
         }
@@ -974,6 +1021,15 @@ impl Scheduler {
             self.cpu,
             1,
         );
+    }
+
+    fn tick_without_preempt(&mut self, now_ns: u64) -> Option<Arc<Process>> {
+        self.assert_owner();
+        self.ticks = self.ticks.saturating_add(1);
+        let charge_process = self.account_running(now_ns);
+        self.replenish_due(now_ns);
+        publish_cpu_stats(self);
+        charge_process
     }
 
     fn schedule(&mut self, now_ns: u64, hardware_tick: bool) -> ScheduleResult {
@@ -1257,6 +1313,59 @@ impl Scheduler {
             1,
         );
         publish_cpu_stats(self);
+        if self.should_preempt_current(slot_index) && self.cpu == cpu_id() {
+            huesos_arch::preemption::request_reschedule();
+        }
+    }
+
+    fn should_preempt_current(&self, candidate_slot: usize) -> bool {
+        let Some(current_slot) = self.current else {
+            return true;
+        };
+        if current_slot == candidate_slot {
+            return false;
+        }
+        let Some(candidate) = self.task(candidate_slot) else {
+            return false;
+        };
+        let Some(current) = self.task(current_slot) else {
+            return true;
+        };
+        match (
+            candidate.queue,
+            Self::policy_is_fair(current.task.sched_policy),
+        ) {
+            (QueueKind::Deadline, true) => true,
+            (QueueKind::Deadline, false) => {
+                let cand_dl = candidate
+                    .cbs
+                    .map_or(u64::MAX, CbsRuntime::absolute_deadline_ns);
+                let cur_dl = current
+                    .cbs
+                    .map_or(u64::MAX, CbsRuntime::absolute_deadline_ns);
+                cand_dl < cur_dl
+            }
+            (QueueKind::Fair, true) => {
+                let Some(cand_job_idx) = self.job_index(candidate.task.job_id) else {
+                    return false;
+                };
+                let cand_job = &self.job_queues[cand_job_idx];
+                if candidate.request_start > cand_job.virtual_time {
+                    return false;
+                }
+                if candidate.task.job_id == current.task.job_id {
+                    candidate.request_finish < current.request_finish
+                } else {
+                    let Some(cur_job_idx) = self.job_index(current.task.job_id) else {
+                        return false;
+                    };
+                    let cur_job = &self.job_queues[cur_job_idx];
+                    cand_job.root_start <= self.root_virtual_time
+                        && cand_job.root_finish < cur_job.root_finish
+                }
+            }
+            _ => false,
+        }
     }
 
     fn place_wake_request(&mut self, slot_index: usize, sleep_ns: u64) {
@@ -1747,9 +1856,11 @@ unsafe fn register_scheduler_ptr(scheduler: *mut Scheduler) {
     unsafe { (*local).scheduler = scheduler as *mut () };
 }
 
+#[track_caller]
 fn scheduler_fail_stop() -> ! {
     log::error!("scheduler invariant failed; CPU stopped");
     huesos_arch::interrupts::disable();
+    huesos_arch::serial::emergency_write("[sched] fatal scheduler invariant violation\n");
     loop {
         huesos_arch::hlt();
     }
@@ -1775,7 +1886,7 @@ fn publish_remote_operation(id: V2TaskId, operations: u64, owner: usize) -> bool
     true
 }
 
-fn place_pending_task(id: V2TaskId, task: Box<Task>) -> Result<(), Box<Task>> {
+fn place_pending_task(id: V2TaskId, cpu: usize, task: Box<Task>) -> Result<(), Box<Task>> {
     let mut pending = PENDING_TASKS.lock();
     let slot = id.slot();
     if pending.len() <= slot {
@@ -1788,7 +1899,14 @@ fn place_pending_task(id: V2TaskId, task: Box<Task>) -> Result<(), Box<Task>> {
     if pending[slot].is_some() {
         return Err(task);
     }
-    pending[slot] = Some(PendingTask { id: id.raw(), task });
+    if cpu < MAX_CPUS {
+        CPU_PENDING_SPAWNS[cpu].fetch_add(1, Ordering::AcqRel);
+    }
+    pending[slot] = Some(PendingTask {
+        id: id.raw(),
+        cpu,
+        task,
+    });
     Ok(())
 }
 
@@ -1796,6 +1914,13 @@ fn take_pending_task(id: V2TaskId) -> Option<Box<Task>> {
     let mut pending = PENDING_TASKS.lock();
     let entry = pending.get_mut(id.slot())?.take()?;
     if entry.id == id.raw() {
+        if entry.cpu < MAX_CPUS {
+            let _ = CPU_PENDING_SPAWNS[entry.cpu].try_update(
+                Ordering::AcqRel,
+                Ordering::Acquire,
+                |n| Some(n.saturating_sub(1)),
+            );
+        }
         Some(entry.task)
     } else {
         pending[id.slot()] = Some(entry);
@@ -1926,10 +2051,20 @@ fn deferred_task_drop(task: Box<Task>) {
 }
 
 fn run_current_cpu_scheduler_interrupt(hardware_tick: bool) {
+    let was_enabled = x86_64::instructions::interrupts::are_enabled();
     huesos_arch::interrupts::disable();
-    if !huesos_arch::preemption::can_preempt() && !hardware_tick {
-        huesos_arch::interrupts::enable();
+    let allow_preempt = huesos_arch::preemption::can_preempt();
+    if !allow_preempt && !hardware_tick {
+        huesos_arch::preemption::request_reschedule();
+        if was_enabled {
+            huesos_arch::interrupts::enable();
+        }
         return;
+    }
+    if allow_preempt {
+        let _ = huesos_arch::preemption::take_reschedule_request();
+    } else {
+        huesos_arch::preemption::request_reschedule();
     }
     let cpu = cpu_id();
     let drained = CPU_INBOX[cpu].drain(|slot| process_inbox_task(cpu, slot));
@@ -1940,13 +2075,22 @@ fn run_current_cpu_scheduler_interrupt(hardware_tick: bool) {
     let now_ns = monotonic_ns();
     let result = {
         let mut scheduler = PER_CPU_SCHEDULERS[cpu].lock();
-        scheduler.schedule(now_ns, hardware_tick)
+        if allow_preempt {
+            scheduler.schedule(now_ns, hardware_tick)
+        } else {
+            ScheduleResult {
+                decision: None,
+                charge_process: scheduler.tick_without_preempt(now_ns),
+            }
+        }
     };
     if hardware_tick {
         if let Some(process) = result.charge_process.as_ref() {
             let _ = process.charge_cpu_tick();
         }
-        huesos_object::wait::notify_tick(MONOTONIC_TICKS.load(Ordering::SeqCst));
+        if cpu == 0 {
+            huesos_object::wait::notify_tick(MONOTONIC_TICKS.load(Ordering::SeqCst));
+        }
         if TSC_DEADLINE_ACTIVE.load(Ordering::Relaxed) {
             if let Some(clock) = TSC_CLOCK.get() {
                 let deadline = huesos_arch::rdtsc().saturating_add(clock.ns_to_cycles(TICK_NS));
@@ -1960,7 +2104,9 @@ fn run_current_cpu_scheduler_interrupt(hardware_tick: bool) {
         perform_context_switch(decision.target);
     }
     drop(result.charge_process);
-    huesos_arch::interrupts::enable();
+    if was_enabled {
+        huesos_arch::interrupts::enable();
+    }
 }
 
 /// Initialize the owner CPU scheduler and install its timer callbacks.
@@ -2036,9 +2182,20 @@ pub fn yield_now() {
     run_current_cpu_scheduler_interrupt(false);
 }
 
+/// Service any latched reschedule request on the current CPU when preemption
+/// is permitted (used on syscall exit so local wakes/spawns preempt promptly).
+pub fn reschedule_if_pending() {
+    if huesos_arch::preemption::can_preempt() && huesos_arch::preemption::take_reschedule_request()
+    {
+        run_current_cpu_scheduler_interrupt(false);
+    }
+}
+
 /// Park the current task after the wait-queue enqueue handshake.
 pub fn park_current() {
+    let was_enabled = x86_64::instructions::interrupts::are_enabled();
     huesos_arch::interrupts::disable();
+    let _ = huesos_arch::preemption::take_reschedule_request();
     let cpu = cpu_id();
     let drained = CPU_INBOX[cpu].drain(|slot| process_inbox_task(cpu, slot));
     OBS_INBOX_DRAINS.fetch_add(drained as u64, Ordering::Relaxed);
@@ -2055,7 +2212,9 @@ pub fn park_current() {
         decision.environment.install();
         perform_context_switch(decision.target);
     }
-    huesos_arch::interrupts::enable();
+    if was_enabled {
+        huesos_arch::interrupts::enable();
+    }
 }
 
 /// Wake a parked task. Remote wakes are asynchronous and coalesced by inbox.
@@ -2352,7 +2511,50 @@ pub fn spawn_kernel_thread(name: &[u8; 32], entry: extern "C" fn() -> !) -> Opti
     installed.then_some(id.raw())
 }
 
-/// Spawn a user task on the current CPU.
+/// Select the least-loaded online CPU permitted by `allowed_mask` (`None`
+/// permits all online CPUs), breaking ties round-robin across online cores.
+pub fn select_least_loaded_cpu(
+    allowed_mask: Option<&[u64; huesos_abi::CPU_MASK256_WORDS]>,
+) -> usize {
+    let online = online_cpu_mask_words();
+    let start = NEXT_SPAWN_CPU.fetch_add(1, Ordering::Relaxed) % MAX_CPUS;
+    let mut best_cpu = None;
+    let mut best_score = (usize::MAX, usize::MAX);
+
+    for offset in 0..MAX_CPUS {
+        let cpu = (start + offset) % MAX_CPUS;
+        let word = cpu / 64;
+        let bit = 1u64 << (cpu % 64);
+        if online[word] & bit == 0 {
+            continue;
+        }
+        if let Some(mask) = allowed_mask {
+            if mask[word] & bit == 0 {
+                continue;
+            }
+        }
+        let running = usize::from(CURRENT_TASK_IDS[cpu].load(Ordering::Acquire) != 0);
+        let pending = CPU_PENDING_SPAWNS[cpu].load(Ordering::Acquire);
+        let active = running
+            .saturating_add(CPU_RUNNABLE[cpu].load(Ordering::Acquire))
+            .saturating_add(pending);
+        let total = CPU_TASKS[cpu]
+            .load(Ordering::Acquire)
+            .saturating_add(pending);
+        let score = (active, total);
+        if best_cpu.is_none() || score < best_score {
+            best_cpu = Some(cpu);
+            best_score = score;
+            if score == (0, 0) {
+                break;
+            }
+        }
+    }
+
+    best_cpu.unwrap_or_else(cpu_id)
+}
+
+/// Spawn a user task on the least-loaded online CPU.
 pub fn spawn_user_thread(
     name: &[u8; 32],
     process: Arc<Process>,
@@ -2360,7 +2562,9 @@ pub fn spawn_user_thread(
     user_rsp: u64,
     cr3: u64,
 ) -> u64 {
-    spawn_user_thread_on_cpu(name, process, entry_point, user_rsp, cr3, cpu_id())
+    let target_cpu = select_least_loaded_cpu(None);
+    process.record_default_cpu(target_cpu);
+    spawn_user_thread_on_cpu(name, process, entry_point, user_rsp, cr3, target_cpu)
         .unwrap_or(u64::MAX)
 }
 
@@ -2449,7 +2653,7 @@ pub fn spawn_user_thread_on_cpu_ex(
             huesos_arch::interrupts::enable();
         }
     } else {
-        if let Err(task) = place_pending_task(id, task) {
+        if let Err(task) = place_pending_task(id, cpu, task) {
             clear_task_identity(id.raw());
             crate::process::cancel_user_entry(id.raw());
             let _ = process.decrement_active_threads();
@@ -2555,8 +2759,12 @@ pub fn terminate_current_process(code: i64) -> ! {
 /// Terminate every task belonging to `process` without taking a remote
 /// runqueue lock. KILL operations are consumed by each owner CPU.
 pub fn terminate_process(process: &Arc<Process>, code: i64, current_cpu: usize) -> bool {
+    let was_enabled = x86_64::instructions::interrupts::are_enabled();
     huesos_arch::interrupts::disable();
     if !process.set_exit_code(code) {
+        if was_enabled {
+            huesos_arch::interrupts::enable();
+        }
         return false;
     }
     record_process_exit(process, code);
@@ -2593,6 +2801,9 @@ pub fn terminate_process(process: &Arc<Process>, code: i64, current_cpu: usize) 
             queue_ipi(cpu);
         }
     }
+    if was_enabled {
+        huesos_arch::interrupts::enable();
+    }
     true
 }
 
@@ -2606,6 +2817,8 @@ pub fn terminate_process_by_koid(koid: Koid, code: i64) -> Result<(), huesos_abi
 
 fn switch_away_from_finished(cpu: usize) -> ! {
     loop {
+        let drained = CPU_INBOX[cpu].drain(|slot| process_inbox_task(cpu, slot));
+        OBS_INBOX_DRAINS.fetch_add(drained as u64, Ordering::Relaxed);
         let now_ns = monotonic_ns();
         let result = {
             let mut scheduler = PER_CPU_SCHEDULERS[cpu].lock();
@@ -2783,5 +2996,123 @@ mod task_id_tests {
         assert_eq!(remaining, 40);
         replenish_deadline_on_unblock(u64::MAX, 1, 10, &mut remaining, &mut deadline);
         assert_eq!(deadline, u64::MAX);
+    }
+
+    #[test]
+    fn partial_slice_accounting_advances_virtual_start_without_lag_refund() {
+        let weight = huesos_sched::NICE_0_WEIGHT;
+        let v0 = 1_000_000u128;
+        let (mut finish, mut remaining_ns) = Scheduler::make_request(v0, FAIR_REQUEST_NS, weight);
+        let mut start = v0;
+        let elapsed = FAIR_REQUEST_NS / 2;
+        let delta = virtual_delta(elapsed, weight).map_or(1, |d| d);
+        remaining_ns -= elapsed;
+        start = start.saturating_add(delta).min(finish);
+        let (new_finish, _) = Scheduler::make_request(start, remaining_ns, weight);
+        finish = new_finish;
+
+        let job_vtime = v0.saturating_add(delta);
+        assert_eq!(signed_delta(job_vtime, start), 0);
+        assert!(finish > start);
+    }
+
+    #[test]
+    fn interactive_spawn_credit_makes_new_fair_task_immediately_eligible() {
+        let weight = huesos_sched::NICE_0_WEIGHT;
+        let job_vtime = 50_000_000_000u128;
+        let initial_slice = (FAIR_REQUEST_NS / 2).max(1);
+        let credit = virtual_delta(initial_slice, weight).map_or(1, |d| d);
+        let start = job_vtime.saturating_sub(credit);
+        let (finish, _) = Scheduler::make_request(start, initial_slice, weight);
+        let (hog_finish, _) = Scheduler::make_request(job_vtime, FAIR_REQUEST_NS, weight);
+        assert!(start <= job_vtime);
+        assert!(finish < hog_finish);
+    }
+
+    #[test]
+    fn multi_thread_job_remains_root_queued_after_selecting_one_sibling() {
+        let weight = huesos_sched::NICE_0_WEIGHT;
+        let mut root_jobs: EevdfTree<MAX_JOB_QUEUES> = EevdfTree::new();
+        let mut root_vtime = 0u128;
+        let Some(job_id) = JobId::new(7) else {
+            assert_eq!(0, 1);
+            return;
+        };
+        let Some(mut job) = JobRunqueue::new(job_id, weight, 0) else {
+            assert_eq!(0, 1);
+            return;
+        };
+        let id_a = V2TaskId::new(1, 1).map_or(0, V2TaskId::raw);
+        let id_b = V2TaskId::new(2, 1).map_or(0, V2TaskId::raw);
+        let (finish_a, _) = Scheduler::make_request(0, FAIR_REQUEST_NS, weight);
+        let (finish_b, _) = Scheduler::make_request(100, FAIR_REQUEST_NS, weight);
+        assert!(job
+            .threads
+            .insert(
+                EevdfKey {
+                    virtual_start: 0,
+                    task_id: id_a,
+                },
+                finish_a,
+            )
+            .is_ok());
+        assert!(job
+            .threads
+            .insert(
+                EevdfKey {
+                    virtual_start: 100,
+                    task_id: id_b,
+                },
+                finish_b,
+            )
+            .is_ok());
+        job.fair_runnable = 2;
+
+        let (root_finish, _) = Scheduler::make_request(job.root_start, FAIR_REQUEST_NS, job.weight);
+        assert!(root_jobs
+            .insert(
+                EevdfKey {
+                    virtual_start: job.root_start,
+                    task_id: u64::from(job.id.raw()),
+                },
+                root_finish,
+            )
+            .is_ok());
+        job.root_queued = true;
+
+        assert!(matches!(
+            root_jobs.pop_eligible(&mut root_vtime),
+            Ok(Some(_))
+        ));
+        job.root_queued = false;
+        let first_tid = match job.threads.pop_eligible(&mut job.virtual_time) {
+            Ok(Some((key, _))) => key.task_id,
+            _ => 0,
+        };
+        assert_eq!(first_tid, id_a);
+        assert!(!job.threads.is_empty() && job.fair_runnable != 0);
+
+        // Re-insert the job while the sibling thread remains queued so the
+        // next `pick_next` selects `id_b` without stalling until `id_a` blocks.
+        assert!(root_jobs
+            .insert(
+                EevdfKey {
+                    virtual_start: job.root_start,
+                    task_id: u64::from(job.id.raw()),
+                },
+                root_finish,
+            )
+            .is_ok());
+        job.root_queued = true;
+        assert!(job.root_queued);
+        assert!(matches!(
+            root_jobs.pop_eligible(&mut root_vtime),
+            Ok(Some(_))
+        ));
+        let second_tid = match job.threads.pop_eligible(&mut job.virtual_time) {
+            Ok(Some((key, _))) => key.task_id,
+            _ => 0,
+        };
+        assert_eq!(second_tid, id_b);
     }
 }

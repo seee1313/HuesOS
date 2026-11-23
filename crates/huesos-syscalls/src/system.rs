@@ -12,7 +12,7 @@ use crate::user_memory;
 use crate::SyscallResult;
 
 pub(crate) fn sys_clock_get_monotonic() -> SyscallResult {
-    let clock = (*CLOCK_FN.lock()).ok_or(ErrorCode::NotSupported)?;
+    let clock = CLOCK_FN.get().ok_or(ErrorCode::NotSupported)?;
     let ticks = clock();
     if ticks > i64::MAX as u64 {
         return Err(ErrorCode::Busy);
@@ -30,7 +30,7 @@ pub(crate) fn sys_system_cpu_count() -> SyscallResult {
 }
 
 pub(crate) fn sys_system_current_cpu() -> SyscallResult {
-    let current = (*CURRENT_CPU_FN.lock()).ok_or(ErrorCode::NotSupported)?;
+    let current = CURRENT_CPU_FN.get().ok_or(ErrorCode::NotSupported)?;
     Ok(current() as i64)
 }
 

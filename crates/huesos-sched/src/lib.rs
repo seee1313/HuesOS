@@ -605,6 +605,7 @@ pub enum PreemptionProfile {
 pub struct ExecutionGuards {
     preempt_depth: u16,
     migration_depth: u16,
+    reschedule_pending: bool,
 }
 
 /// Invalid guard transition.
@@ -622,7 +623,26 @@ impl ExecutionGuards {
         Self {
             preempt_depth: 0,
             migration_depth: 0,
+            reschedule_pending: false,
         }
+    }
+
+    /// Record that a scheduler decision was deferred while preemption was
+    /// disabled or while running inside a non-preemptible kernel transition.
+    pub fn request_reschedule(&mut self) {
+        self.reschedule_pending = true;
+    }
+
+    /// Atomically clear and return whether a deferred reschedule was requested.
+    pub fn take_reschedule_pending(&mut self) -> bool {
+        let pending = self.reschedule_pending;
+        self.reschedule_pending = false;
+        pending
+    }
+
+    /// Whether a deferred reschedule request is currently latched.
+    pub const fn reschedule_pending(self) -> bool {
+        self.reschedule_pending
     }
 
     /// Disable preemption in a nested scope.
@@ -2278,6 +2298,22 @@ mod tests {
             state.begin_migration(cpu(1), guards),
             Err(LifecycleError::MigrationUnsafe)
         );
+    }
+
+    #[test]
+    fn execution_guards_latch_and_consume_deferred_reschedule() {
+        let mut guards = ExecutionGuards::new();
+        assert!(!guards.reschedule_pending());
+        assert_eq!(guards.disable_preemption(), Ok(()));
+        assert_eq!(guards.disable_preemption(), Ok(()));
+        guards.request_reschedule();
+        assert!(guards.reschedule_pending());
+        assert_eq!(guards.enable_preemption(), Ok(false));
+        assert!(guards.reschedule_pending());
+        assert_eq!(guards.enable_preemption(), Ok(true));
+        assert!(guards.take_reschedule_pending());
+        assert!(!guards.reschedule_pending());
+        assert!(!guards.take_reschedule_pending());
     }
 
     #[test]

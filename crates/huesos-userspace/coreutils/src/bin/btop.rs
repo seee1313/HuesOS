@@ -72,6 +72,7 @@ const FG_TRACK: (u8, u8, u8) = (38, 49, 68);
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SortCol {
     State,
+    Koid,
     TaskId,
     Cpu,
     Domain,
@@ -81,8 +82,9 @@ enum SortCol {
 }
 
 impl SortCol {
-    const ALL: [SortCol; 7] = [
+    const ALL: [SortCol; 8] = [
         SortCol::State,
+        SortCol::Koid,
         SortCol::TaskId,
         SortCol::Cpu,
         SortCol::Domain,
@@ -108,6 +110,7 @@ impl SortCol {
     fn label(self) -> &'static str {
         match self {
             SortCol::State => "STATE",
+            SortCol::Koid => "KOID",
             SortCol::TaskId => "TID",
             SortCol::Cpu => "CPU",
             SortCol::Domain => "RING",
@@ -143,12 +146,29 @@ struct MonitorApp {
     query_ch: Option<Channel>,
     services: Vec<ServiceRow>,
     fs_stats: Option<HxfsStatFsInfo>,
+    cpu_brand: String,
+    nvme_ident: Option<String>,
     tick_counter: u64,
 }
 
 impl MonitorApp {
     fn new(interval_ms: u64) -> Self {
         let query_ch = take_cap_handle(CapKind::Registry).map(Channel::from_handle);
+        let cpu_brand = String::from(libcanvas::system::cpu_brand_string().as_str());
+        let nvme_ident = cu::disk::block_device()
+            .ok()
+            .and_then(|shared| shared.lock().info().ok())
+            .and_then(|info| {
+                let model = info.model_str();
+                let serial = info.serial_str();
+                if model.is_empty() && serial.is_empty() {
+                    None
+                } else if serial.is_empty() {
+                    Some(String::from(model))
+                } else {
+                    Some(format!("{model} S/N {serial}"))
+                }
+            });
         Self {
             interval_ms,
             paused: false,
@@ -167,6 +187,8 @@ impl MonitorApp {
             query_ch,
             services: Vec::new(),
             fs_stats: None,
+            cpu_brand,
+            nvme_ident,
             tick_counter: 0,
         }
     }
@@ -539,7 +561,7 @@ fn filter_and_sort_tasks(tasks: &[TaskRecord], app: &MonitorApp) -> Vec<TaskReco
             }
             let name_lc = t.name_str().to_ascii_lowercase();
             let state_lc = state_label(t.state).to_ascii_lowercase();
-            let tid_s = format!("{} {:016x}", t.task_id, t.task_id);
+            let tid_s = format!("{} {:016x} {}", t.task_id, t.task_id, t.process_koid());
             name_lc.contains(&needle) || state_lc.contains(&needle) || tid_s.contains(&needle)
         })
         .collect();
@@ -550,6 +572,10 @@ fn filter_and_sort_tasks(tasks: &[TaskRecord], app: &MonitorApp) -> Vec<TaskReco
                 .state
                 .cmp(&b.state)
                 .then_with(|| b.kind.cmp(&a.kind))
+                .then_with(|| a.task_id.cmp(&b.task_id)),
+            SortCol::Koid => a
+                .process_koid()
+                .cmp(&b.process_koid())
                 .then_with(|| a.task_id.cmp(&b.task_id)),
             SortCol::TaskId => a.task_id.cmp(&b.task_id),
             SortCol::Cpu => a.cpu.cmp(&b.cpu).then_with(|| a.state.cmp(&b.state)),
@@ -674,7 +700,8 @@ fn render_dashboard(
     let inbox_s = rates.per_second(rates.inbox_drains);
 
     let cpu_title = format!(
-        "CPU & CBS Scheduler  [admitted {} | runq {} | total tasks {}]",
+        "CPU [{}] & EEVDF/CBS  [admitted {} | runq {} | tasks {}]",
+        tui::fit(&app.cpu_brand, 34),
         format_ppm(snapshot.summary.admitted_ppm),
         snapshot.runnable(),
         snapshot.tasks()
@@ -849,7 +876,8 @@ fn render_dashboard(
     if rows.saturating_sub(cur_row) >= 18 {
         let left_w = cols / 2;
         let right_w = cols - left_w;
-        let storage_lines = build_storage_box(app.fs_stats.as_ref(), left_w);
+        let storage_lines =
+            build_storage_box(app.fs_stats.as_ref(), app.nvme_ident.as_deref(), left_w);
         let summary_lines = build_summary_box(all_tasks, &app.services, right_w);
         for (l, r) in storage_lines.iter().zip(summary_lines.iter()) {
             if cur_row >= rows.saturating_sub(8) {
@@ -919,9 +947,20 @@ fn render_dashboard(
     }
 }
 
-fn build_storage_box(stats: Option<&HxfsStatFsInfo>, width: usize) -> Vec<String> {
+fn build_storage_box(
+    stats: Option<&HxfsStatFsInfo>,
+    nvme_ident: Option<&str>,
+    width: usize,
+) -> Vec<String> {
     let mut out = Vec::with_capacity(6);
-    out.push(box_top("HxFS v7 Storage Volume", width, FG_BORDER, FG_CYAN));
+    let storage_title = match nvme_ident {
+        Some(ident) => format!(
+            "HxFS v7 Storage [{}]",
+            tui::fit(ident, width.saturating_sub(24))
+        ),
+        None => String::from("HxFS v7 Storage Volume"),
+    };
+    out.push(box_top(&storage_title, width, FG_BORDER, FG_CYAN));
     if let Some(st) = stats {
         let total_b = st.total_blocks.saturating_mul(st.block_size);
         let used_b = st.used_blocks.saturating_mul(st.block_size);
@@ -1162,15 +1201,16 @@ fn render_tasks_box(
 
     // Column header row (matches exact data row column widths below)
     let hdr = format!(
-        "   {}{:<16} {:>10}  {:<5} {:<8} {:<9} {:>7}  {:<22}  {}CORE AFFINITY / ACTIVITY{}",
+        "   {}{:>6} {:<16} {:>10}  {:<5} {:<8} {:<9} {:>7}  {:<20}  {}CORE AFFINITY / ACTIVITY{}",
         ansi::BOLD,
+        col_hdr("KOID", 6, true, SortCol::Koid, app.sort_col),
         col_hdr("TID (HEX)", 16, false, SortCol::TaskId, app.sort_col),
         col_hdr("STATE", 10, true, SortCol::State, app.sort_col),
         col_hdr("CPU", 5, false, SortCol::Cpu, app.sort_col),
         col_hdr("DOMAIN", 8, false, SortCol::Domain, app.sort_col),
         col_hdr("POLICY", 9, false, SortCol::Policy, app.sort_col),
         col_hdr("WEIGHT", 7, true, SortCol::Weight, app.sort_col),
-        col_hdr("TASK NAME", 22, false, SortCol::Name, app.sort_col),
+        col_hdr("TASK NAME", 20, false, SortCol::Name, app.sort_col),
         fg_rgb(FG_MUTED.0, FG_MUTED.1, FG_MUTED.2),
         ansi::RESET,
     );
@@ -1278,12 +1318,15 @@ fn render_tasks_box(
         let slot = sel.task_slot();
         let gen = sel.task_generation();
         format!(
-            " {}Selected:{} {}{}{}   {}raw_id:{} 0x{:016x} (slot {}, gen {})   {}ring:{} {}   {}sched:{} {} (weight {})   {}state:{} {}",
+            " {}Selected:{} {}{}{}   {}koid:{} {}   {}raw_id:{} 0x{:016x} (slot {}, gen {})   {}ring:{} {}   {}sched:{} {} (w={})   {}state:{} {}",
             fg_rgb(FG_MUTED.0, FG_MUTED.1, FG_MUTED.2),
             ansi::RESET,
             fg_rgb(FG_TITLE.0, FG_TITLE.1, FG_TITLE.2),
             sel.name_str(),
             ansi::RESET,
+            fg_rgb(FG_MUTED.0, FG_MUTED.1, FG_MUTED.2),
+            ansi::RESET,
+            sel.process_koid(),
             fg_rgb(FG_MUTED.0, FG_MUTED.1, FG_MUTED.2),
             ansi::RESET,
             sel.task_id,

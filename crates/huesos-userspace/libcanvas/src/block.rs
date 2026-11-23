@@ -86,10 +86,7 @@ impl BlockDevice {
         self.wait_ok(request_id)?;
         let mut bytes = [0u8; ASYNC_INFO_RESPONSE_BYTES];
         let n = self.channel.read_into_blocking(&mut bytes)?;
-        if n != bytes.len() {
-            return Err(ErrorCode::InvalidArgs);
-        }
-        AsyncBlockInfo::decode(&bytes).ok_or(ErrorCode::InvalidArgs)
+        AsyncBlockInfo::decode(&bytes[..n]).ok_or(ErrorCode::InvalidArgs)
     }
 
     /// Read blocks into `out`.

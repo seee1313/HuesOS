@@ -51,6 +51,7 @@ const KNOWN_COMMANDS: &[&str] = &[
     "cd",
     "history",
     "jobs",
+    "fg",
     "wait",
     "kill",
     "caps",
@@ -1050,6 +1051,58 @@ impl InteractiveShell {
             println!("[hsh] capability-owned background job lifecycle FAILED");
         }
 
+        // Verify KOID-addressed job control (`[<job_id>] <koid>`, `kill <koid>`,
+        // and fail-closed `PermissionDenied` on unowned process KOIDs) plus
+        // multi-stage pipeline `PeerClosed` early termination (`seq 1 100000 | head -n 5`)
+        // and >= 8-stage pipeline execution.
+        let self_koid = libcanvas::process::Process::current()
+            .and_then(|p| p.koid())
+            .unwrap_or(0);
+        let unowned_kill = smoke_env.eval_script(&format!("kill {self_koid}"), &mut self.host);
+        let koid_job_ok = match smoke_env.eval_script("sleep 30 &", &mut self.host) {
+            Ok(launched) if launched.status == 0 => {
+                let output = launched.render_text();
+                let parsed = output.strip_prefix('[').and_then(|tail| {
+                    let (id_s, rest) = tail.split_once(']')?;
+                    let job_id = id_s.parse::<u64>().ok()?;
+                    let koid = rest.trim().parse::<u64>().ok()?;
+                    Some((job_id, koid))
+                });
+                if let Some((job_id, child_koid)) = parsed {
+                    let killed_by_koid =
+                        smoke_env.eval_script(&format!("kill {child_koid}"), &mut self.host);
+                    let waited_by_pct =
+                        smoke_env.eval_script(&format!("wait %{job_id}"), &mut self.host);
+                    child_koid > 0
+                        && child_koid != job_id
+                        && matches!(killed_by_koid, Ok(r) if r.status == 0)
+                        && matches!(waited_by_pct, Ok(r) if r.status == 130)
+                        && matches!(
+                            unowned_kill,
+                            Ok(ref r) if r.status != 0 && r.render_text().contains("PermissionDenied")
+                        )
+                } else {
+                    false
+                }
+            }
+            _ => false,
+        };
+        let pipe_backpressure = smoke_env.eval_script("seq 1 100000 | head -n 5", &mut self.host);
+        let pipe_eight_stage = smoke_env.eval_script(
+            "seq 1 20 | cat | cat | cat | cat | cat | head -n 4 | wc -l",
+            &mut self.host,
+        );
+        if koid_job_ok
+            && matches!(pipe_backpressure, Ok(ref r) if r.status == 0 && r.render_text().trim() == "1\n2\n3\n4\n5")
+            && matches!(pipe_eight_stage, Ok(ref r) if r.status == 0 && r.render_text().split_whitespace().next() == Some("4"))
+        {
+            println!("[hsh] KOID job-control + 8-stage PeerClosed pipeline OK");
+        } else {
+            println!(
+                "[hsh] KOID job-control + 8-stage PeerClosed pipeline FAILED (koid_job_ok={koid_job_ok}, bp={pipe_backpressure:?}, p8={pipe_eight_stage:?})"
+            );
+        }
+
         // 10. `fdisk gpt-init --dry-run` must always be safe, and a real
         //     init/add/del/verify cycle must round-trip on a writable disk.
         //     Both run against the `/dev/mem` volume so the boot volume is
@@ -1130,7 +1183,9 @@ impl InteractiveShell {
                     && res.render_text().contains("scheduler:")
                     && res.render_text().contains("RUNQ") =>
             {
-                println!("[hsh] schedctl cpus OK");
+                let text = res.render_text();
+                let header = text.lines().next().unwrap_or("");
+                println!("[hsh] schedctl cpus OK ({header})");
             }
             Ok(res) => println!(
                 "[hsh] schedctl cpus FAILED status={} out={}",
@@ -1138,6 +1193,21 @@ impl InteractiveShell {
                 res.render_text()
             ),
             Err(e) => println!("[hsh] schedctl cpus ERROR: {e}"),
+        }
+        match smoke_env.eval_script("ps", &mut self.host) {
+            Ok(res)
+                if res.status == 0
+                    && res.render_text().contains("koid")
+                    && res.render_text().contains("hsh") =>
+            {
+                println!("[hsh] ps live KOID table OK");
+            }
+            Ok(res) => println!(
+                "[hsh] ps live KOID table FAILED status={} out={}",
+                res.status,
+                res.render_text()
+            ),
+            Err(e) => println!("[hsh] ps live KOID table ERROR: {e}"),
         }
         match smoke_env.eval_script("schedctl tasks", &mut self.host) {
             Ok(res)
@@ -1266,6 +1336,32 @@ impl InteractiveShell {
         //     `raw-hxfs` superfloppy and GPT-partitioned NVMe disks). Only
         //     meaningful on a boot with a block device; the NVMe smoke attaches one.
         if self.host.hxfs.is_some() {
+            let lsblk_out = smoke_env
+                .eval_script("lsblk -f", &mut self.host)
+                .ok()
+                .map(|r| r.render_text())
+                .unwrap_or_default();
+            let fdisk_inspect_out = smoke_env
+                .eval_script("fdisk inspect", &mut self.host)
+                .ok()
+                .map(|r| r.render_text())
+                .unwrap_or_default();
+            if lsblk_out.contains("MODEL")
+                && lsblk_out.contains("SERIAL")
+                && fdisk_inspect_out.contains("model=")
+                && fdisk_inspect_out.contains("serial=")
+                && !fdisk_inspect_out.contains("model=-\n")
+            {
+                let summary = fdisk_inspect_out
+                    .lines()
+                    .find(|l| l.contains("model="))
+                    .unwrap_or("");
+                println!("[hsh] NVMe Identify model/serial plumbing OK ({summary})");
+            } else {
+                println!(
+                    "[hsh] NVMe Identify model/serial plumbing FAILED lsblk={lsblk_out} inspect={fdisk_inspect_out}"
+                );
+            }
             match smoke_env.eval_script("fdisk list", &mut self.host) {
                 Ok(res)
                     if res.status == 0

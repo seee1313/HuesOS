@@ -53,19 +53,27 @@ fn run() -> i32 {
 
     let mut cur = first;
     let mut printed = false;
+    let mut buf = String::with_capacity(4096);
     while (step > 0 && cur <= last) || (step < 0 && cur >= last) {
         if printed {
-            cu::out(&sep);
+            buf.push_str(&sep);
         }
-        cu::out(&format!("{cur}"));
+        let _ = core::fmt::Write::write_fmt(&mut buf, format_args!("{cur}"));
         printed = true;
+        if buf.len() >= 4096 {
+            cu::out(&buf);
+            buf.clear();
+        }
         match cur.checked_add(step) {
             Some(next) => cur = next,
             None => break,
         }
     }
     if printed {
-        cu::out("\n");
+        buf.push('\n');
+    }
+    if !buf.is_empty() {
+        cu::out(&buf);
     }
     0
 }

@@ -14,6 +14,11 @@ use x86_64::structures::paging::{
 use x86_64::{PhysAddr, VirtAddr};
 
 const TLB_SHOOTDOWN_VECTOR: u8 = 0xF3;
+/// FIFO ticket dispensers serializing the global shootdown mailbox while
+/// permitting contended waiters to keep interrupts enabled (under a
+/// preemption guard) so they can service incoming `TLB_SHOOTDOWN_VECTOR` IPIs.
+static TLB_MAILBOX_NEXT: AtomicU64 = AtomicU64::new(0);
+static TLB_MAILBOX_SERVING: AtomicU64 = AtomicU64::new(0);
 /// Sequence number of the shootdown request whose acknowledgements are
 /// currently being counted; 0 = no request in flight.
 static TLB_REQ_SEQ: AtomicU64 = AtomicU64::new(0);
@@ -47,23 +52,38 @@ pub fn handle_tlb_shootdown() {
 /// Invalidate a virtual-address range on every online CPU.
 ///
 /// The caller supplies the number of remote online CPUs expected to
-/// acknowledge the IPI.
-///
-/// # Serialization contract
-/// This primitive owns a single global mailbox (start/end/acks/seq), so
-/// **exactly one shootdown may be in flight system-wide**. Every kernel
-/// call site holds the VMAR mutation lock across the call. The sequence
-/// tag makes a contract violation detectable — the sender stops waiting
-/// on a foreign (possibly reset) ack counter and reports the violation on
-/// the console — instead of silently accepting the wrong request's
-/// acknowledgements or spinning on a reset counter with interrupts
-/// disabled.
+/// acknowledge the IPI and must hold **no** ranked IRQ-disabling locks.
+/// Contended callers wait for the FIFO shootdown mailbox with local
+/// preemption disabled and interrupts enabled so they remain responsive to
+/// incoming `TLB_SHOOTDOWN_VECTOR` IPIs from the current mailbox owner.
 pub fn shootdown_range(start: u64, end: u64, expected_remote: usize) {
     let start = start & !0xfff;
     let end = end.saturating_add(0xfff) & !0xfff;
     if start >= end {
         return;
     }
+
+    if expected_remote == 0 {
+        let mut page = start;
+        while page < end {
+            crate::x86_64::cpu::invlpg(page);
+            page = page.saturating_add(4096);
+        }
+        return;
+    }
+
+    crate::sync::assert_no_ranked_locks_held();
+    let _preempt_guard = crate::x86_64::preemption::disable_preemption();
+    let interrupts_were_enabled = x86_64::instructions::interrupts::are_enabled();
+
+    let ticket = TLB_MAILBOX_NEXT.fetch_add(1, Ordering::Relaxed);
+    if TLB_MAILBOX_SERVING.load(Ordering::Acquire) != ticket {
+        x86_64::instructions::interrupts::enable();
+        while TLB_MAILBOX_SERVING.load(Ordering::Acquire) != ticket {
+            core::hint::spin_loop();
+        }
+    }
+    x86_64::instructions::interrupts::disable();
 
     // Tag this request with a fresh sequence number. 0 is reserved for
     // "idle"; the counter is 64-bit, so wraparound is not a practical
@@ -73,8 +93,6 @@ pub fn shootdown_range(start: u64, end: u64, expected_remote: usize) {
         seq = 1;
     }
 
-    let interrupts_were_enabled = x86_64::instructions::interrupts::are_enabled();
-    x86_64::instructions::interrupts::disable();
     TLB_START.store(start, Ordering::Relaxed);
     TLB_END.store(end, Ordering::Relaxed);
     TLB_ACKS.store(0, Ordering::Relaxed);
@@ -101,9 +119,15 @@ pub fn shootdown_range(start: u64, end: u64, expected_remote: usize) {
     let superseded = TLB_REQ_SEQ
         .compare_exchange(seq, 0, Ordering::AcqRel, Ordering::Acquire)
         .is_err();
+    TLB_MAILBOX_SERVING.fetch_add(1, Ordering::Release);
+
     if interrupts_were_enabled {
         x86_64::instructions::interrupts::enable();
+    } else {
+        x86_64::instructions::interrupts::disable();
     }
+    drop(_preempt_guard);
+
     if superseded {
         use core::fmt::Write;
         let mut w = crate::x86_64::serial::ErrorSerialWriter;
@@ -114,9 +138,13 @@ pub fn shootdown_range(start: u64, end: u64, expected_remote: usize) {
     }
 }
 
-/// Higher-half direct map offset, fixed once at boot.
-static HHDM_OFFSET: RankedIrqSafeTicketLock<u64> =
-    RankedIrqSafeTicketLock::new(0, LockRank::ARCHITECTURE);
+/// Higher-half direct map offset, fixed once at boot before AP release.
+static HHDM_OFFSET: AtomicU64 = AtomicU64::new(0);
+
+#[inline]
+fn hhdm_offset() -> u64 {
+    HHDM_OFFSET.load(Ordering::Acquire)
+}
 
 /// Kernel's own mapper over the bootloader-provided top-level table.
 static KERNEL_PAGE_TABLE: RankedIrqSafeTicketLock<Option<OffsetPageTable<'static>>> =
@@ -145,7 +173,7 @@ impl FrameDeallocator<Size4KiB> for PmmFrameAllocator {
 /// `phys_offset` must be a valid higher-half direct map covering all
 /// physical memory, and the PMM must already be initialized.
 pub unsafe fn init(phys_offset: VirtAddr) {
-    *HHDM_OFFSET.lock() = phys_offset.as_u64();
+    HHDM_OFFSET.store(phys_offset.as_u64(), Ordering::Release);
     let level_4_table = unsafe { active_level_4_table(phys_offset) };
     *KERNEL_PAGE_TABLE.lock() = Some(OffsetPageTable::new(level_4_table, phys_offset));
 }
@@ -160,7 +188,7 @@ unsafe fn active_level_4_table(phys_offset: VirtAddr) -> &'static mut PageTable 
 /// Translate a physical address to a kernel-accessible virtual address via
 /// the HHDM.
 pub fn phys_to_virt(phys: u64) -> VirtAddr {
-    VirtAddr::new(*HHDM_OFFSET.lock() + phys)
+    VirtAddr::new(hhdm_offset() + phys)
 }
 
 /// Failure while mutating the shared kernel page table.
@@ -565,7 +593,7 @@ impl AddressSpace {
         // SAFETY: pml4_frame is owned by this AddressSpace and HHDM maps every
         // page-table frame for its full lifetime.
         let table: &mut PageTable = unsafe { &mut *virt.as_mut_ptr() };
-        let phys_offset = VirtAddr::new(*HHDM_OFFSET.lock());
+        let phys_offset = VirtAddr::new(hhdm_offset());
         // SAFETY: table is the unique mutable PML4 owned behind &mut self.
         let mut mapper = unsafe { OffsetPageTable::new(table, phys_offset) };
         let flush = unsafe { mapper.map_to(page, frame, flags, &mut PmmFrameAllocator) }.map_err(
@@ -591,7 +619,7 @@ impl AddressSpace {
         let virt = phys_to_virt(self.pml4_frame.start_address().as_u64());
         // SAFETY: identical unique-PML4 invariant to try_map_user_page.
         let table: &mut PageTable = unsafe { &mut *virt.as_mut_ptr() };
-        let phys_offset = VirtAddr::new(*HHDM_OFFSET.lock());
+        let phys_offset = VirtAddr::new(hhdm_offset());
         // SAFETY: table and physical offset describe this owned address space.
         let mut mapper = unsafe { OffsetPageTable::new(table, phys_offset) };
         let (_, flush) = mapper.unmap(page).map_err(|error| match error {
@@ -626,7 +654,7 @@ impl AddressSpace {
         let virt = phys_to_virt(self.pml4_frame.start_address().as_u64());
         // SAFETY: identical unique-PML4 invariant to try_map_user_page.
         let table: &mut PageTable = unsafe { &mut *virt.as_mut_ptr() };
-        let phys_offset = VirtAddr::new(*HHDM_OFFSET.lock());
+        let phys_offset = VirtAddr::new(hhdm_offset());
         // SAFETY: table and physical offset describe this owned address space.
         let mut mapper = unsafe { OffsetPageTable::new(table, phys_offset) };
         let (frame, flush) = mapper.unmap(page).map_err(|error| match error {
@@ -662,7 +690,7 @@ impl AddressSpace {
         // every page-table frame for its full lifetime. The mapper is
         // used read-only here.
         let table: &mut PageTable = unsafe { &mut *virt.as_mut_ptr() };
-        let phys_offset = VirtAddr::new(*HHDM_OFFSET.lock());
+        let phys_offset = VirtAddr::new(hhdm_offset());
         // SAFETY: table is the PML4 owned by this address space.
         let mapper = unsafe { OffsetPageTable::new(table, phys_offset) };
         !matches!(
@@ -681,7 +709,7 @@ impl AddressSpace {
         // SAFETY: pml4_frame is owned by this AddressSpace and HHDM maps every
         // page-table frame for its full lifetime.
         let table: &mut PageTable = unsafe { &mut *virt.as_mut_ptr() };
-        let phys_offset = VirtAddr::new(*HHDM_OFFSET.lock());
+        let phys_offset = VirtAddr::new(hhdm_offset());
         // SAFETY: table is the unique mutable PML4 owned behind &mut self;
         // update_flags changes only the validated page in that table.
         let flush = unsafe {

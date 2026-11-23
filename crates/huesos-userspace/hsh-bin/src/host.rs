@@ -45,7 +45,7 @@ pub enum DelegatedAction {
     Font(u8),
 }
 
-const MAX_PIPELINE_STAGES: usize = 4;
+const MAX_PIPELINE_STAGES: usize = 16;
 const MAX_PIPELINE_JOBS: usize = 16;
 const MAX_PIPE_PENDING_BYTES: usize = 64 * 1024;
 const MAX_PENDING_BACKGROUND_OUTPUT_BYTES: usize = 512 * 1024;
@@ -218,12 +218,32 @@ fn packet_single_byte(packet: &[u8]) -> Option<u8> {
     }
 }
 
+fn is_live_process_koid(koid: u64) -> bool {
+    if koid == 0 {
+        return false;
+    }
+    if libcanvas::process::Process::current()
+        .and_then(|p| p.koid())
+        .ok()
+        == Some(koid)
+    {
+        return true;
+    }
+    let mut found = false;
+    let _ = libcanvas::system::for_each_task(|record| {
+        if record.process_koid() == koid && record.state < 3 {
+            found = true;
+        }
+    });
+    found
+}
+
 fn command_uses_block_device(resolved: &str) -> bool {
     let base = resolved.rsplit('/').next().unwrap_or(resolved);
     let stem = base.strip_suffix(".elf").unwrap_or(base);
     matches!(
         stem,
-        "fdisk" | "lsblk" | "df" | "fsck" | "mkfs" | "dd" | "hsh"
+        "fdisk" | "lsblk" | "df" | "fsck" | "mkfs" | "dd" | "btop" | "hsh"
     )
 }
 
@@ -1426,7 +1446,7 @@ impl HshHost {
         background: bool,
         capture_output: bool,
     ) -> ExecOutcome {
-        let mut run = match self.start_pipeline_run(commands, capture_output, background) {
+        let run = match self.start_pipeline_run(commands, capture_output, background) {
             Ok(run) => run,
             Err(error) => return error,
         };
@@ -1458,7 +1478,7 @@ impl HshHost {
             });
             return ExecOutcome {
                 status: 0,
-                output: Value::Text(format!("[{id}] started {label}")),
+                output: Value::Text(format!("[{id}] {leader_pid}")),
                 stderr: String::new(),
                 clear_screen: false,
                 exit_requested: false,
@@ -1466,6 +1486,10 @@ impl HshHost {
             };
         }
 
+        self.drive_foreground_pipeline(run)
+    }
+
+    fn drive_foreground_pipeline(&mut self, mut run: PipelineRun) -> ExecOutcome {
         self.last_child_interrupted = false;
         let mut interrupted = false;
         loop {
@@ -1503,37 +1527,68 @@ impl HshHost {
     }
 
     /// Drain all connected channels without blocking, applying bounded
-    /// backpressure to each intermediate pipeline edge.
+    /// backpressure and propagating downstream `PeerClosed` upstream immediately.
     fn pump_pipeline_run(&mut self, run: &mut PipelineRun) -> (bool, bool) {
         let mut progressed = false;
         let mut chunk = [0u8; 4096];
 
-        for edge in 0..run.pipes.len() {
+        // Poll stage exits up front so an early consumer exit (e.g. `head -n 5`)
+        // immediately closes its stdin and propagates `PeerClosed` upstream.
+        for stage in &mut run.stages {
+            if stage.exit_code.is_none() {
+                stage.exit_code = match stage.process.poll_exit() {
+                    Ok(Some(code)) => {
+                        stage.stdin_w.take();
+                        progressed = true;
+                        Some(code as i32)
+                    }
+                    Ok(None) => None,
+                    Err(_) => {
+                        stage.stdin_w.take();
+                        Some(-1)
+                    }
+                };
+            }
+        }
+
+        for edge in (0..run.pipes.len()).rev() {
             if run.stages[edge + 1].stdin_w.is_none() {
                 run.pipes[edge].pending.clear();
                 run.pipes[edge].pending_bytes = 0;
-            } else {
-                while let Some(message) = run.pipes[edge].pending.front().cloned() {
-                    let Some(writer) = run.stages[edge + 1].stdin_w.as_ref() else {
+                run.pipes[edge].source_closed = true;
+                if run.stages[edge].stdout_r.take().is_some() {
+                    progressed = true;
+                }
+                continue;
+            }
+
+            while let Some(message) = run.pipes[edge].pending.front().cloned() {
+                let Some(writer) = run.stages[edge + 1].stdin_w.as_ref() else {
+                    break;
+                };
+                let result = writer.write(&message);
+                match result {
+                    Ok(()) => {
+                        run.pipes[edge].pending.pop_front();
+                        run.pipes[edge].pending_bytes =
+                            run.pipes[edge].pending_bytes.saturating_sub(message.len());
+                        progressed = true;
+                    }
+                    Err(ErrorCode::ShouldWait) => break,
+                    Err(_) => {
+                        run.stages[edge + 1].stdin_w.take();
+                        run.pipes[edge].pending.clear();
+                        run.pipes[edge].pending_bytes = 0;
+                        run.pipes[edge].source_closed = true;
+                        run.stages[edge].stdout_r.take();
+                        progressed = true;
                         break;
-                    };
-                    let result = writer.write(&message);
-                    match result {
-                        Ok(()) => {
-                            run.pipes[edge].pending.pop_front();
-                            run.pipes[edge].pending_bytes =
-                                run.pipes[edge].pending_bytes.saturating_sub(message.len());
-                            progressed = true;
-                        }
-                        Err(ErrorCode::ShouldWait) => break,
-                        Err(_) => {
-                            run.stages[edge + 1].stdin_w.take();
-                            run.pipes[edge].pending.clear();
-                            run.pipes[edge].pending_bytes = 0;
-                            break;
-                        }
                     }
                 }
+            }
+
+            if run.stages[edge + 1].stdin_w.is_none() {
+                continue;
             }
 
             for _ in 0..PIPELINE_DRAIN_MESSAGES {
@@ -1554,6 +1609,9 @@ impl HshHost {
                             run.pipes[edge].pending.push_back(chunk[..n].to_vec());
                             run.pipes[edge].pending_bytes =
                                 run.pipes[edge].pending_bytes.saturating_add(n);
+                        } else {
+                            run.stages[edge].stdout_r.take();
+                            break;
                         }
                     }
                     Err(ErrorCode::ShouldWait) | Err(ErrorCode::TimedOut) => {
@@ -1942,35 +2000,154 @@ impl HshHost {
         for job in &self.background_jobs {
             match job.status {
                 Some(status) => output.push_str(&format!(
-                    "[{}] Done ({status}) {} [{}]\n",
-                    job.id, job.label, job.pid
+                    "[{}] Done({}) {}  {}\n",
+                    job.id, status, job.pid, job.label
                 )),
                 None => output.push_str(&format!(
-                    "[{}] Running {} [{}]\n",
-                    job.id, job.label, job.pid
+                    "[{}] Running {}  {}\n",
+                    job.id, job.pid, job.label
                 )),
             }
         }
         ExecOutcome::ok_text(output.trim_end_matches('\n'))
     }
 
+    fn resolve_job_index(&self, spec: &str) -> Option<usize> {
+        if let Some(rest) = spec.strip_prefix('%') {
+            let id = rest.parse::<u64>().ok()?;
+            return self.background_jobs.iter().position(|job| job.id == id);
+        }
+        let value = spec.parse::<u64>().ok()?;
+        self.background_jobs
+            .iter()
+            .position(|job| {
+                job.pid == value
+                    || job
+                        .run
+                        .as_ref()
+                        .is_some_and(|r| r.stages.iter().any(|s| s.pid == value))
+            })
+            .or_else(|| self.background_jobs.iter().position(|job| job.id == value))
+    }
+
+    fn cmd_fg(&mut self, args: &[String]) -> ExecOutcome {
+        if args.len() > 1 {
+            return ExecOutcome::err(2, "usage: fg [%job-id]");
+        }
+        self.poll_background_jobs_impl();
+        let index = if let Some(spec) = args.first() {
+            let Some(idx) = self.resolve_job_index(spec) else {
+                return ExecOutcome::err(1, format!("fg: {spec}: no such job"));
+            };
+            idx
+        } else {
+            let Some(idx) = self
+                .background_jobs
+                .iter()
+                .rposition(|job| job.run.is_some())
+                .or_else(|| self.background_jobs.len().checked_sub(1))
+            else {
+                return ExecOutcome::err(1, "fg: current: no such job");
+            };
+            idx
+        };
+
+        let mut job = self.background_jobs.remove(index);
+        if let Some(mut run) = job.run.take() {
+            if self.interactive_stream && self.ipc_out.is_some() {
+                self.forward_stream_bytes(None, format!("{}\n", job.label).as_bytes());
+                if !run.output.is_empty() {
+                    self.forward_stream_bytes(None, &run.output);
+                    run.streamed_any = true;
+                    run.last_stream_byte = *run.output.last().unwrap_or(&b'\n');
+                    run.output.clear();
+                }
+                if !run.stderr.is_empty() {
+                    self.forward_stream_bytes(Some((255, 110, 110)), &run.stderr);
+                    run.stderr.clear();
+                }
+                run.background_stream = false;
+                run.direct_stream = true;
+            }
+            return self.drive_foreground_pipeline(run);
+        }
+
+        let status = job.status.unwrap_or(0);
+        let stdout = String::from_utf8_lossy(&job.output);
+        let stderr = String::from_utf8_lossy(&job.stderr);
+        let combined = format!("{stdout}{stderr}");
+        ExecOutcome {
+            status,
+            output: if combined.is_empty() {
+                Value::Empty
+            } else {
+                Value::Text(combined.trim_end_matches('\n').into())
+            },
+            stderr: String::new(),
+            clear_screen: false,
+            exit_requested: false,
+            child_pid: Some(job.pid),
+        }
+    }
+
     fn cmd_kill(&mut self, args: &[String]) -> ExecOutcome {
-        if args.len() != 1 {
-            return ExecOutcome::err(2, "usage: kill <job-id>");
+        if args.is_empty() {
+            return ExecOutcome::err(2, "usage: kill <%job-id | koid>");
         }
-        let Ok(id) = args[0].parse::<u64>() else {
-            return ExecOutcome::err(2, "kill: expected a background job id from `jobs`");
+        // Accept optional signal-like flag (`-9`, `-TERM`, `-INT`) before target.
+        let target = if args.len() == 2 && args[0].starts_with('-') {
+            args[1].as_str()
+        } else if args.len() == 1 {
+            args[0].as_str()
+        } else {
+            return ExecOutcome::err(2, "usage: kill <%job-id | koid>");
         };
-        let Some(job) = self.background_jobs.iter().find(|job| job.id == id) else {
-            return ExecOutcome::err(1, format!("kill: no such background job: {id}"));
-        };
-        let Some(run) = job.run.as_ref() else {
-            return ExecOutcome::err(1, format!("kill: job {id} has already completed"));
-        };
-        for stage in &run.stages {
-            let _ = stage.process.terminate(CTRL_C_EXIT_CODE);
+
+        if let Some(rest) = target.strip_prefix('%') {
+            let Ok(id) = rest.parse::<u64>() else {
+                return ExecOutcome::err(2, format!("kill: invalid job spec '{target}'"));
+            };
+            let Some(job) = self.background_jobs.iter().find(|job| job.id == id) else {
+                return ExecOutcome::err(1, format!("kill: %{id}: no such background job"));
+            };
+            let Some(run) = job.run.as_ref() else {
+                return ExecOutcome::err(1, format!("kill: %{id} has already completed"));
+            };
+            for stage in &run.stages {
+                if let Err(ErrorCode::AccessDenied) = stage.process.terminate(CTRL_C_EXIT_CODE) {
+                    return ExecOutcome::err(1, format!("kill: %{id}: PermissionDenied"));
+                }
+            }
+            return ExecOutcome::ok_text(format!("[{id}] {} terminated", job.pid));
         }
-        ExecOutcome::ok_text(format!("[{id}] termination requested"))
+
+        let Ok(num) = target.parse::<u64>() else {
+            return ExecOutcome::err(2, "kill: expected %<job-id> or process <koid>");
+        };
+
+        if let Some(idx) = self.resolve_job_index(target) {
+            let job = &self.background_jobs[idx];
+            let id = job.id;
+            let koid = job.pid;
+            let Some(run) = job.run.as_ref() else {
+                return ExecOutcome::err(1, format!("kill: job {id} has already completed"));
+            };
+            for stage in &run.stages {
+                if let Err(ErrorCode::AccessDenied) = stage.process.terminate(CTRL_C_EXIT_CODE) {
+                    return ExecOutcome::err(1, format!("kill: koid {koid}: PermissionDenied"));
+                }
+            }
+            return ExecOutcome::ok_text(format!("[{id}] {koid} terminated"));
+        }
+
+        if is_live_process_koid(num) {
+            return ExecOutcome::err(
+                1,
+                format!("kill: koid {num}: PermissionDenied (process capability handle not owned)"),
+            );
+        }
+
+        ExecOutcome::err(1, format!("kill: {num}: no such job or process"))
     }
 
     fn wait_background_job(&mut self, id: u64) -> Option<ExecOutcome> {
@@ -1987,7 +2164,19 @@ impl HshHost {
             if finished {
                 break;
             }
-            libcanvas::process::yield_now();
+            let wait_target = self
+                .background_jobs
+                .iter()
+                .position(|job| job.id == id && job.run.is_some());
+            if let Some(idx) = wait_target {
+                let jobs = core::mem::take(&mut self.background_jobs);
+                if let Some(run) = jobs[idx].run.as_ref() {
+                    self.wait_for_pipeline_activity(run);
+                }
+                self.background_jobs = jobs;
+            } else {
+                libcanvas::process::yield_now();
+            }
         }
 
         let index = self.background_jobs.iter().position(|job| job.id == id)?;
@@ -1998,7 +2187,7 @@ impl HshHost {
             let stderr = String::from_utf8_lossy(&job.stderr);
             Value::Text(format!("{stdout}{stderr}").trim_end_matches('\n').into())
         } else {
-            Value::Text(format!("[{id}] completed with status {status}"))
+            Value::Text(format!("[{id}] {} exited ({status})", job.pid))
         };
         Some(ExecOutcome {
             status,
@@ -2012,15 +2201,16 @@ impl HshHost {
 
     fn cmd_wait(&mut self, args: &[String]) -> ExecOutcome {
         if args.len() > 1 {
-            return ExecOutcome::err(2, "usage: wait [job-id]");
+            return ExecOutcome::err(2, "usage: wait [%job-id | koid]");
         }
-        if let Some(raw_id) = args.first() {
-            let Ok(id) = raw_id.parse::<u64>() else {
-                return ExecOutcome::err(2, "wait: expected a background job id from `jobs`");
+        if let Some(raw_spec) = args.first() {
+            let Some(idx) = self.resolve_job_index(raw_spec) else {
+                return ExecOutcome::err(1, format!("wait: no such job: {raw_spec}"));
             };
+            let id = self.background_jobs[idx].id;
             return self
                 .wait_background_job(id)
-                .unwrap_or_else(|| ExecOutcome::err(1, format!("wait: no such job: {id}")));
+                .unwrap_or_else(|| ExecOutcome::err(1, format!("wait: no such job: {raw_spec}")));
         }
 
         let ids: Vec<u64> = self.background_jobs.iter().map(|job| job.id).collect();
@@ -2324,9 +2514,9 @@ impl ShellHost for HshHost {
             },
             "help" => ExecOutcome::ok_text(concat!(
                 "hsh intrinsics:\n",
-                "  help | cls | clear | echo | printf | test | [ | true | false | export | env | pwd | cd <dir> | caps | history | jobs | wait | kill | exit\n",
+                "  help | cls | clear | echo | printf | test | [ | true | false | export | env | pwd | cd <dir> | caps | history | jobs | fg | wait | kill | exit\n",
                 "  pipes: | where <col> <op> <val> | select <cols> | sort [--desc] [col] | head [n] | tail [n] | count | grep <pat>\n",
-                "  jobs:  command & | jobs | wait [job-id] | kill <job-id>\n",
+                "  jobs:  command & | jobs | fg [%job] | wait [%job|koid] | kill <%job|koid>\n",
                 "  lang:  let x = ...; x = $((x + 1)); if/elif/else; while ... { break; continue }; for x in [...]; fn f(a) { ... }\n",
                 "  caps:  @caps(hxfs=none|ro|rw, bootfs=ro|none, fb=none|ro, dir=/sub:ro) <cmd>\n",
                 "  apps:  doom | snake [hard] | btop | nano <file> | font <cozette|tty|compact> | shutdown\n",
@@ -2353,6 +2543,7 @@ impl ShellHost for HshHost {
                 ExecOutcome::ok_text(out.trim_end_matches('\n'))
             }
             "jobs" => self.cmd_jobs(),
+            "fg" => self.cmd_fg(args),
             "wait" => self.cmd_wait(args),
             "kill" => self.cmd_kill(args),
             "caps" => self.cmd_caps(),

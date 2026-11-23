@@ -77,6 +77,8 @@ pub struct DiskIo {
     total_lbas: u64,
     writable: bool,
     label: String,
+    model: String,
+    serial: String,
 }
 
 impl DiskIo {
@@ -93,6 +95,8 @@ impl DiskIo {
             total_lbas: size / LBA_SIZE as u64,
             writable,
             label: String::from(path),
+            model: String::from("file-image"),
+            serial: String::from("-"),
         })
     }
 
@@ -105,6 +109,8 @@ impl DiskIo {
             total_lbas: bytes / LBA_SIZE as u64,
             writable: true,
             label: String::from(path),
+            model: String::from("file-image"),
+            serial: String::from("-"),
         })
     }
 
@@ -119,11 +125,23 @@ impl DiskIo {
         let info = shared.lock().info()?;
         let block_size = info.block_size.max(LBA_SIZE as u32);
         let total_lbas = info.block_count * u64::from(block_size / LBA_SIZE as u32);
+        let model = if info.model_str().is_empty() {
+            String::from("NVMe SSD")
+        } else {
+            String::from(info.model_str())
+        };
+        let serial = if info.serial_str().is_empty() {
+            String::from("-")
+        } else {
+            String::from(info.serial_str())
+        };
         Ok(Self {
             backing: Backing::Device(shared, block_size),
             total_lbas,
             writable: true,
             label: String::from("/dev/nvme0"),
+            model,
+            serial,
         })
     }
 
@@ -158,6 +176,16 @@ impl DiskIo {
     /// The store's name, for output columns.
     pub fn label(&self) -> &str {
         &self.label
+    }
+
+    /// Controller model string (NVMe Identify `MN` for hardware block devices).
+    pub fn model(&self) -> &str {
+        &self.model
+    }
+
+    /// Controller serial string (NVMe Identify `SN` for hardware block devices).
+    pub fn serial(&self) -> &str {
+        &self.serial
     }
 
     /// Bytes per hardware block (512 for image files).

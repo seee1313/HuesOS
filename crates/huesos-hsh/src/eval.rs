@@ -679,6 +679,7 @@ impl ShellEnv {
                             | "cd"
                             | "history"
                             | "jobs"
+                            | "fg"
                             | "wait"
                             | "kill"
                             | "caps"

@@ -363,6 +363,10 @@ extern "C" fn handle_syscall(f: &mut huesos_arch::syscall::SyscallFrame) {
     // the same audited translation and any drift is caught by
     // `huesos_abi::tests::encode_syscall_result_*`.
     f.num = huesos_abi::encode_syscall_result(r);
+    // If a local wake/spawn during this syscall made an earlier-deadline task
+    // runnable on this CPU, switch now with all syscall locks released and
+    // SyscallFrame.num already materialized on the outgoing stack.
+    crate::scheduler::reschedule_if_pending();
 }
 
 fn debug_write(b: &[u8]) {
