@@ -32,10 +32,13 @@ use alloc::vec::Vec;
 use core::cmp::Ordering;
 
 use huesos_abi::hxfs::HxfsStatFsInfo;
+use huesos_abi::net::NetStatusSnapshot;
+use huesos_abi::wlan::{WlanStateCode, WlanStatusSnapshot};
 use huesos_abi::TaskRecord;
 use huesos_coreutils as cu;
 use huesos_std::fs;
 use huesos_std::io;
+use huesos_std::net;
 use huesos_std::sys::{self, Snapshot};
 use huesos_std::time::{Duration, Instant};
 use huesos_std::tui::{self, ansi, bg_rgb, fg_rgb, FrameBuffer, Key};
@@ -146,6 +149,8 @@ struct MonitorApp {
     query_ch: Option<Channel>,
     services: Vec<ServiceRow>,
     fs_stats: Option<HxfsStatFsInfo>,
+    net_stats: Option<NetStatusSnapshot>,
+    wlan_stats: Option<WlanStatusSnapshot>,
     cpu_brand: String,
     nvme_ident: Option<String>,
     tick_counter: u64,
@@ -187,6 +192,8 @@ impl MonitorApp {
             query_ch,
             services: Vec::new(),
             fs_stats: None,
+            net_stats: None,
+            wlan_stats: None,
             cpu_brand,
             nvme_ident,
             tick_counter: 0,
@@ -217,9 +224,11 @@ impl MonitorApp {
     }
 
     fn refresh_side_telemetry(&mut self) {
-        // Refresh storage & service state every 4th frame (and frame 0) so IPC stays featherweight.
+        // Refresh storage, net/wlan, & service state every 4th frame (and frame 0) so IPC stays featherweight.
         if self.tick_counter.is_multiple_of(4) {
             self.fs_stats = fs::stat_fs().ok();
+            self.net_stats = net::status().ok();
+            self.wlan_stats = net::wlan_status().ok();
             self.poll_services();
         }
         self.tick_counter = self.tick_counter.wrapping_add(1);
@@ -872,19 +881,40 @@ fn render_dashboard(
     cur_row += 1;
     let _ = cpu_box_rows;
 
-    // 3. Optional middle dual boxes (Storage HxFS + System/Services) when rows >= 34
+    // 3. Optional middle boxes (Storage HxFS + Net/802.11 Wi-Fi + System/Services) when rows >= 34
     if rows.saturating_sub(cur_row) >= 18 {
-        let left_w = cols / 2;
-        let right_w = cols - left_w;
-        let storage_lines =
-            build_storage_box(app.fs_stats.as_ref(), app.nvme_ident.as_deref(), left_w);
-        let summary_lines = build_summary_box(all_tasks, &app.services, right_w);
-        for (l, r) in storage_lines.iter().zip(summary_lines.iter()) {
-            if cur_row >= rows.saturating_sub(8) {
-                break;
+        if cols >= 132 {
+            let w1 = cols / 3;
+            let w2 = cols / 3;
+            let w3 = cols - w1 - w2;
+            let storage_lines =
+                build_storage_box(app.fs_stats.as_ref(), app.nvme_ident.as_deref(), w1);
+            let net_lines = build_net_wlan_box(app.net_stats.as_ref(), app.wlan_stats.as_ref(), w2);
+            let summary_lines = build_summary_box(all_tasks, &app.services, w3);
+            for ((l, m), r) in storage_lines
+                .iter()
+                .zip(net_lines.iter())
+                .zip(summary_lines.iter())
+            {
+                if cur_row >= rows.saturating_sub(8) {
+                    break;
+                }
+                fb.put_row(cur_row, &format!("{l}{m}{r}"));
+                cur_row += 1;
             }
-            fb.put_row(cur_row, &format!("{l}{r}"));
-            cur_row += 1;
+        } else {
+            let left_w = cols / 2;
+            let right_w = cols - left_w;
+            let storage_lines =
+                build_storage_box(app.fs_stats.as_ref(), app.nvme_ident.as_deref(), left_w);
+            let summary_lines = build_summary_box(all_tasks, &app.services, right_w);
+            for (l, r) in storage_lines.iter().zip(summary_lines.iter()) {
+                if cur_row >= rows.saturating_sub(8) {
+                    break;
+                }
+                fb.put_row(cur_row, &format!("{l}{r}"));
+                cur_row += 1;
+            }
         }
     }
 
@@ -1068,6 +1098,157 @@ fn build_storage_box(
     out
 }
 
+fn build_net_wlan_box(
+    net_st: Option<&NetStatusSnapshot>,
+    wlan_st: Option<&WlanStatusSnapshot>,
+    width: usize,
+) -> Vec<String> {
+    let mut out = Vec::with_capacity(6);
+    out.push(box_top(
+        "Net & 802.11 Wi-Fi (rtw88)",
+        width,
+        FG_BORDER,
+        FG_MINT,
+    ));
+    if let Some(ns) = net_st {
+        let v = &ns.ifaces[1];
+        out.push(box_line(
+            &format!(
+                " {}virtio0:{} {}{}.{}.{}.{}/{}{}  gw {}.{}.{}.{}",
+                fg_rgb(FG_MUTED.0, FG_MUTED.1, FG_MUTED.2),
+                ansi::RESET,
+                fg_rgb(FG_CYAN.0, FG_CYAN.1, FG_CYAN.2),
+                v.ipv4[0],
+                v.ipv4[1],
+                v.ipv4[2],
+                v.ipv4[3],
+                v.prefix_len,
+                ansi::RESET,
+                v.gateway[0],
+                v.gateway[1],
+                v.gateway[2],
+                v.gateway[3],
+            ),
+            width,
+            FG_BORDER,
+        ));
+        out.push(box_line(
+            &format!(
+                " {}RX/TX:{} {}{}{} ({}p) / {}{}{} ({}p)  tcp:{}",
+                fg_rgb(FG_MUTED.0, FG_MUTED.1, FG_MUTED.2),
+                ansi::RESET,
+                fg_rgb(FG_MINT.0, FG_MINT.1, FG_MINT.2),
+                tui::human_bytes(v.rx_bytes),
+                ansi::RESET,
+                v.rx_packets,
+                fg_rgb(FG_AMBER.0, FG_AMBER.1, FG_AMBER.2),
+                tui::human_bytes(v.tx_bytes),
+                ansi::RESET,
+                v.tx_packets,
+                ns.active_tcp_sockets,
+            ),
+            width,
+            FG_BORDER,
+        ));
+    } else {
+        out.push(box_line(
+            &format!(
+                " {}virtio0:{} net-service offline / cap restricted",
+                fg_rgb(FG_MUTED.0, FG_MUTED.1, FG_MUTED.2),
+                ansi::RESET
+            ),
+            width,
+            FG_BORDER,
+        ));
+        out.push(box_line("", width, FG_BORDER));
+    }
+
+    if let Some(ws) = wlan_st {
+        if ws.state == WlanStateCode::HardwareAbsent {
+            out.push(box_line(
+                &format!(
+                    " {}wlan0:{} {}no Wi-Fi adapter (10ec:c821 absent){}",
+                    fg_rgb(FG_MUTED.0, FG_MUTED.1, FG_MUTED.2),
+                    ansi::RESET,
+                    fg_rgb(FG_AMBER.0, FG_AMBER.1, FG_AMBER.2),
+                    ansi::RESET,
+                ),
+                width,
+                FG_BORDER,
+            ));
+            out.push(box_line(
+                &format!(
+                    " {}fw:{} rtw8821c v{}.{} staged  reg:{}",
+                    fg_rgb(FG_MUTED.0, FG_MUTED.1, FG_MUTED.2),
+                    ansi::RESET,
+                    ws.fw_version[0],
+                    ws.fw_version[1],
+                    ws.reg_domain.as_str(),
+                ),
+                width,
+                FG_BORDER,
+            ));
+        } else {
+            let qual = if ws.rssi_dbm <= -95 {
+                0u64
+            } else if ws.rssi_dbm >= -35 {
+                100u64
+            } else {
+                (((i32::from(ws.rssi_dbm) + 95) * 100) / 60) as u64
+            };
+            let sig = tui::smooth_bar(qual, 100, 10, FG_MINT, FG_TRACK);
+            let ssid_lbl = if ws.state == WlanStateCode::Connected && ws.ssid_len > 0 {
+                ws.ssid_str()
+            } else {
+                ws.state.as_str()
+            };
+            out.push(box_line(
+                &format!(
+                    " {}wlan0:{} {}{}{} ch{} ({}MHz) fw v{}.{}",
+                    fg_rgb(FG_MUTED.0, FG_MUTED.1, FG_MUTED.2),
+                    ansi::RESET,
+                    fg_rgb(FG_MINT.0, FG_MINT.1, FG_MINT.2),
+                    tui::fit(ssid_lbl, 14),
+                    ansi::RESET,
+                    ws.channel,
+                    ws.width_mhz,
+                    ws.fw_version[0],
+                    ws.fw_version[1],
+                ),
+                width,
+                FG_BORDER,
+            ));
+            out.push(box_line(
+                &format!(
+                    " {}RSSI:{} [{}] {} dBm  reg:{}  mpdu:{}/{}",
+                    fg_rgb(FG_MUTED.0, FG_MUTED.1, FG_MUTED.2),
+                    ansi::RESET,
+                    sig,
+                    ws.rssi_dbm,
+                    ws.reg_domain.as_str(),
+                    ws.tx_frames,
+                    ws.rx_frames,
+                ),
+                width,
+                FG_BORDER,
+            ));
+        }
+    } else {
+        out.push(box_line(
+            &format!(
+                " {}wlan0:{} wlan-service offline / cap restricted",
+                fg_rgb(FG_MUTED.0, FG_MUTED.1, FG_MUTED.2),
+                ansi::RESET
+            ),
+            width,
+            FG_BORDER,
+        ));
+        out.push(box_line("", width, FG_BORDER));
+    }
+    out.push(box_bottom(width, FG_BORDER));
+    out
+}
+
 fn build_summary_box(
     all_tasks: &[TaskRecord],
     services: &[ServiceRow],
@@ -1201,13 +1382,13 @@ fn render_tasks_box(
 
     // Column header row (matches exact data row column widths below)
     let hdr = format!(
-        "   {}{:>6} {:<16} {:>10}  {:<5} {:<8} {:<9} {:>7}  {:<20}  {}CORE AFFINITY / ACTIVITY{}",
+        "   {}{:>6} {:<16} {:>10}  {:<5} {:<7} {:<9} {:>7}  {:<20}  {}CORE AFFINITY / ACTIVITY{}",
         ansi::BOLD,
         col_hdr("KOID", 6, true, SortCol::Koid, app.sort_col),
         col_hdr("TID (HEX)", 16, false, SortCol::TaskId, app.sort_col),
         col_hdr("STATE", 10, true, SortCol::State, app.sort_col),
         col_hdr("CPU", 5, false, SortCol::Cpu, app.sort_col),
-        col_hdr("DOMAIN", 8, false, SortCol::Domain, app.sort_col),
+        col_hdr("ABI", 7, false, SortCol::Domain, app.sort_col),
         col_hdr("POLICY", 9, false, SortCol::Policy, app.sort_col),
         col_hdr("WEIGHT", 7, true, SortCol::Weight, app.sort_col),
         col_hdr("TASK NAME", 20, false, SortCol::Name, app.sort_col),
@@ -1234,8 +1415,14 @@ fn render_tasks_box(
         if let Some(task) = tasks.get(scroll_top + idx) {
             let is_sel = scroll_top + idx == app.selected;
             let (st_lbl, st_col) = state_badge(task.state);
-            let dom_lbl = if task.kind == 1 { "user" } else { "kernel" };
-            let dom_col = if task.kind == 1 { FG_CYAN } else { FG_VIOLET };
+            let abi_lbl = task.abi_str();
+            let abi_col = if task.is_pe64() {
+                FG_AMBER
+            } else if task.kind == 1 {
+                FG_CYAN
+            } else {
+                FG_VIOLET
+            };
             let pol_lbl = if task.policy == 1 { "deadline" } else { "fair" };
             let pol_col = if task.policy == 1 { FG_AMBER } else { FG_TEXT };
             let on_cpu_now = snapshot
@@ -1254,14 +1441,15 @@ fn render_tasks_box(
 
             if is_sel {
                 let plain = format!(
-                    " > {:016x} {:>10}  CPU{:<2} {:<8} {:<9} {:>7}  {:<22}  {}",
+                    " > {:>6} {:016x} {:>10}  CPU{:<2} {:<7} {:<9} {:>7}  {:<20}  {}",
+                    task.process_koid(),
                     task.task_id,
                     st_lbl,
                     task.cpu,
-                    dom_lbl,
+                    abi_lbl,
                     pol_lbl,
                     task.weight,
-                    tui::fit(task.name_str(), 22),
+                    tui::fit(task.name_str(), 20),
                     activity
                 );
                 let highlighted = tui::fit_with_bg(
@@ -1280,7 +1468,10 @@ fn render_tasks_box(
                 );
             } else {
                 let row_str = format!(
-                    "   {}{:016x}{} {}{:>10}{}  {}CPU{:<2}{} {}{:<8}{} {}{:<9}{} {}{:>7}{}  {}{:<22}{}  {}{}{}",
+                    "   {}{:>6}{} {}{:016x}{} {}{:>10}{}  {}CPU{:<2}{} {}{:<7}{} {}{:<9}{} {}{:>7}{}  {}{:<20}{}  {}{}{}",
+                    fg_rgb(FG_MUTED.0, FG_MUTED.1, FG_MUTED.2),
+                    task.process_koid(),
+                    ansi::RESET,
                     fg_rgb(FG_TEXT.0, FG_TEXT.1, FG_TEXT.2),
                     task.task_id,
                     ansi::RESET,
@@ -1290,8 +1481,8 @@ fn render_tasks_box(
                     fg_rgb(FG_BLUE.0, FG_BLUE.1, FG_BLUE.2),
                     task.cpu,
                     ansi::RESET,
-                    fg_rgb(dom_col.0, dom_col.1, dom_col.2),
-                    dom_lbl,
+                    fg_rgb(abi_col.0, abi_col.1, abi_col.2),
+                    abi_lbl,
                     ansi::RESET,
                     fg_rgb(pol_col.0, pol_col.1, pol_col.2),
                     pol_lbl,
@@ -1300,7 +1491,7 @@ fn render_tasks_box(
                     task.weight,
                     ansi::RESET,
                     fg_rgb(235, 243, 255),
-                    tui::fit(task.name_str(), 22),
+                    tui::fit(task.name_str(), 20),
                     ansi::RESET,
                     fg_rgb(FG_MUTED.0, FG_MUTED.1, FG_MUTED.2),
                     activity,
@@ -1334,7 +1525,11 @@ fn render_tasks_box(
             gen,
             fg_rgb(FG_MUTED.0, FG_MUTED.1, FG_MUTED.2),
             ansi::RESET,
-            if sel.kind == 1 { "ring3-user" } else { "ring0-kernel" },
+            if sel.kind == 1 {
+                if sel.is_pe64() { "ring3-PE64" } else { "ring3-ELF64" }
+            } else {
+                "ring0-kernel"
+            },
             fg_rgb(FG_MUTED.0, FG_MUTED.1, FG_MUTED.2),
             ansi::RESET,
             if sel.policy == 1 { "CBS-deadline" } else { "EEVDF-fair" },

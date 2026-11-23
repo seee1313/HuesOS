@@ -140,12 +140,13 @@ fn tasks() -> i32 {
             "TASK-ID",
             "PROCESS-KOID",
             "NAME",
+            "ABI",
             "CLASS",
             "STATE",
             "CPU",
             "WEIGHT",
         ],
-        &[16, 16, 16, 8, 8, 3, 6],
+        &[16, 14, 16, 6, 8, 8, 3, 6],
     );
     for record in &records {
         table.row(&[
@@ -156,6 +157,7 @@ fn tasks() -> i32 {
                 format!("{}", record.process_koid())
             },
             String::from(record.name_str()),
+            String::from(record.abi_str()),
             String::from(record.class_str()),
             String::from(record.state_str()),
             format!("{}", record.cpu),

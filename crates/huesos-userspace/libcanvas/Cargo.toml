@@ -22,6 +22,7 @@ kernel-smoke-tests = []
 [dependencies]
 huesos-abi = { path = "../../huesos-abi" }
 huesos-elf = { path = "../../huesos-elf" }
+huesos-pe = { path = "../../huesos-pe" }
 huesos-scudo = { path = "../../huesos-scudo", optional = true }
 huesos-blobfs = { path = "../../huesos-blobfs" }
 # Pinned directly, not inherited: `huesos-std` builds this crate inside its own

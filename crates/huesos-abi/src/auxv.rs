@@ -55,6 +55,19 @@ pub const AT_HUESOS_FRAME_DRAW: u64 = 0x100a;
 /// HuesOS extension: non-zero when a read-only `DriverManager` query/registry
 /// `Channel` handle was queued on bootstrap (`LD_BOOTSTRAP_REGISTRY_LABEL`).
 pub const AT_HUESOS_REGISTRY: u64 = 0x100b;
+/// HuesOS extension: non-zero when a target PE32+ `.exe` VMO handle was queued
+/// on bootstrap (`LD_BOOTSTRAP_PE_VMO_LABEL`) for `/lib/ld-pe.so`.
+pub const AT_HUESOS_PE_VMO: u64 = 0x100c;
+/// HuesOS extension: byte offset of the target PE32+ `.exe` inside `pe_vmo`.
+pub const AT_HUESOS_PE_OFFSET: u64 = 0x100d;
+/// HuesOS extension: byte length of the target PE32+ `.exe` inside `pe_vmo`.
+pub const AT_HUESOS_PE_LEN: u64 = 0x100e;
+/// HuesOS extension: non-zero when a `net-service` (`Plan 9 /net`) `Channel`
+/// handle was queued on bootstrap (`LD_BOOTSTRAP_NET_SERVICE_LABEL`).
+pub const AT_HUESOS_NET_SERVICE: u64 = 0x100f;
+/// HuesOS extension: non-zero when a `wlan-service` `Channel` handle was
+/// queued on bootstrap (`LD_BOOTSTRAP_WLAN_SERVICE_LABEL`).
+pub const AT_HUESOS_WLAN_SERVICE: u64 = 0x1010;
 
 /// Bootstrap channel label carrying the child's own root VMAR handle to
 /// `ld-huesos.so` (closed by the dynamic linker before entering the app).
@@ -80,6 +93,12 @@ pub const LD_BOOTSTRAP_BLOCK_DEV_LABEL: &[u8] = b"huesos:ld:block-dev";
 pub const LD_BOOTSTRAP_FRAME_DRAW_LABEL: &[u8] = b"huesos:ld:frame-draw";
 /// Bootstrap channel label carrying the child's `DriverManager` query `Channel`.
 pub const LD_BOOTSTRAP_REGISTRY_LABEL: &[u8] = b"huesos:ld:registry";
+/// Bootstrap channel label carrying the target PE32+ `.exe` VMO to `/lib/ld-pe.so`.
+pub const LD_BOOTSTRAP_PE_VMO_LABEL: &[u8] = b"huesos:ld:pe-vmo";
+/// Bootstrap channel label carrying the child's `net-service` `Channel`.
+pub const LD_BOOTSTRAP_NET_SERVICE_LABEL: &[u8] = b"huesos:ld:net-service";
+/// Bootstrap channel label carrying the child's `wlan-service` `Channel`.
+pub const LD_BOOTSTRAP_WLAN_SERVICE_LABEL: &[u8] = b"huesos:ld:wlan-service";
 
 /// Capability bitmask carried in `AT_HUESOS_CAPS_MASK`.
 pub mod caps_mask {
@@ -99,13 +118,32 @@ pub mod caps_mask {
     pub const HXFS_DIR_SCOPED: u64 = 1 << 6;
     /// Application may query `DriverManager` read-only (`query:pci`, `query:acpi`, `query:ps`).
     pub const QUERY_RO: u64 = 1 << 7;
+    /// Application may read network telemetry and perform read-only DNS queries.
+    pub const NET_RO: u64 = 1 << 8;
+    /// Application may open TCP/UDP/ICMP sockets and configure `/net`.
+    pub const NET_RW: u64 = 1 << 9;
+    /// Application may read Wi-Fi status and non-secret saved profile summaries.
+    pub const WLAN_RO: u64 = 1 << 10;
+    /// Application may scan, connect, run SoftAP, and update Wi-Fi regulatory/MAC policy.
+    pub const WLAN_ADMIN: u64 = 1 << 11;
     /// Full default interactive shell capability set.
-    pub const ALL_DEFAULT: u64 =
-        BOOTFS_RO | HXFS_RO | HXFS_RW | FB_RO | BLOCK_RO | BLOCK_RW | QUERY_RO;
+    pub const ALL_DEFAULT: u64 = BOOTFS_RO
+        | HXFS_RO
+        | HXFS_RW
+        | FB_RO
+        | BLOCK_RO
+        | BLOCK_RW
+        | QUERY_RO
+        | NET_RO
+        | NET_RW
+        | WLAN_RO
+        | WLAN_ADMIN;
 }
 
 /// Default interpreter path expected in `PT_INTERP`.
 pub const DEFAULT_INTERP_PATH: &str = "/lib/ld-huesos.so";
+/// Native PE32+ (`.exe` / `.dll`) userspace runtime loader path.
+pub const DEFAULT_PE_INTERP_PATH: &str = "/lib/ld-pe.so";
 
 /// One entry in the SysV AMD64 auxiliary vector on the initial user stack.
 #[repr(C)]

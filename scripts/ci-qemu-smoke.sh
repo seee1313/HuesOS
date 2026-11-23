@@ -100,7 +100,9 @@ timeout "${timeout_seconds}s" qemu-system-x86_64 \
     -machine q35 -cpu qemu64 -smp "$cpus" -m 512M \
     -bios third_party/ovmf/OVMF.fd -cdrom build/huesos.iso \
     "${nvme_args[@]}" \
-    -net none -display none -serial "file:$log" \
+    -netdev user,id=n0 \
+    -device virtio-net-pci,netdev=n0,disable-legacy=off,disable-modern=on \
+    -display none -serial "file:$log" \
     -no-reboot -no-shutdown
 status=$?
 set -e
@@ -192,6 +194,7 @@ case "$scenario" in
             '[driver-manager] PCI manager ready (read-only config authority'
             '[pci-manager] read-only config authority ready'
             'write-capable config capability(ies) for PCI manager'
+            '[hsh] netctl + ping 10.0.2.2 OK'
         )
         ;;
     legacy)
@@ -224,6 +227,10 @@ required+=(
     '[hsh] fdisk gpt-init dry-run OK'
     '[hsh] fdisk gpt init/add/del/verify OK'
     '[hsh] huesos-std smoke OK'
+    '[hsh] PE64 win-hello.exe OK'
+    '[hsh] PE64 win-threads.exe OK'
+    '[hsh] wlanctl scan + WPA2 connect OK'
+    '[hsh] @caps(net=ro,wlan=ro) enforcement OK'
     '[hsh] df usage OK'
     '[terminal] keyboard service online, starting /bin/hsh.elf session'
     '[init] FrameDraw duplicate self-check OK'

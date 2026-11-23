@@ -1,0 +1,23 @@
+[package]
+name = "huesos-net-service"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "huesos-net-service"
+path = "src/main.rs"
+
+[dependencies]
+libcanvas = { path = "../libcanvas" }
+huesos-abi = { path = "../../huesos-abi" }
+huesos-net = { path = "../../huesos-net" }
+
+[profile.release]
+opt-level = 2
+panic = "abort"
+lto = false
+
+[profile.dev]
+panic = "abort"
+
+[workspace]

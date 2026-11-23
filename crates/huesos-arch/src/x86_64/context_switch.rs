@@ -41,8 +41,10 @@ pub struct Context {
     pub rsp: u64,
     /// CR3 (page table root) for this task's address space.
     pub cr3: u64,
-    /// Per-thread x86-64 `MSR_FS_BASE` (userspace TLS base).
+    /// Per-thread x86-64 `MSR_FS_BASE` (userspace ELF TLS base).
     pub fs_base: u64,
+    /// Per-thread Ring-3 `GS_BASE` (`IA32_KERNEL_GS_BASE` while in Ring 0; Win64 TEB).
+    pub gs_base: u64,
 }
 
 impl Context {
@@ -54,6 +56,7 @@ impl Context {
             rsp: 0,
             cr3: 0,
             fs_base: 0,
+            gs_base: 0,
         }
     }
 
@@ -64,6 +67,7 @@ impl Context {
             rsp: 0,
             cr3,
             fs_base: 0,
+            gs_base: 0,
         }
     }
 
@@ -107,6 +111,7 @@ impl Context {
             rsp: stack_top as u64 - FRAME_SIZE as u64,
             cr3,
             fs_base: 0,
+            gs_base: 0,
         }
     }
 }
@@ -171,6 +176,26 @@ pub fn write_fs_base(fs_base: u64) {
     }
 }
 
+/// Write `IA32_KERNEL_GS_BASE` (the Ring-3 `GS_BASE` that `swapgs` installs on
+/// return to userspace) on the current CPU after verifying that `gs_base` is a
+/// canonical lower-half virtual address (`< 0x0000_8000_0000_0000`).
+pub fn write_user_gs_base(gs_base: u64) {
+    if gs_base >= 0x0000_8000_0000_0000 {
+        return;
+    }
+    // SAFETY: called in Ring 0 after `init_gs_base`, so `gs:[0]` names this
+    // CPU's `CpuLocal` and `gs_base` is canonical lower-half.
+    unsafe {
+        let local = crate::cpu_local::cpu_local_ptr();
+        if (*local).shadow_user_gs_base != gs_base {
+            (*local).shadow_user_gs_base = gs_base;
+            x86_64::registers::model_specific::KernelGsBase::write(x86_64::VirtAddr::new_unsafe(
+                gs_base,
+            ));
+        }
+    }
+}
+
 /// Switch CPU context from `old` to `new` after enforcing that no ranked lock
 /// guard can leak across the switch.
 ///
@@ -184,9 +209,10 @@ pub unsafe fn context_switch(old: *mut Context, new: *const Context) {
     unsafe {
         let old_fs = (*old).fs_base;
         let new_fs = (*new).fs_base;
-        if new_fs != old_fs {
+        if new_fs != old_fs || (*old).rsp == 0 {
             write_fs_base(new_fs);
         }
+        write_user_gs_base((*new).gs_base);
         context_switch_asm(old, new);
     }
 }
@@ -215,6 +241,7 @@ global_asm!(
     "xor r13, r13",
     "xor r14, r14",
     "xor r15, r15",
+    "swapgs",
     "iretq",
 );
 

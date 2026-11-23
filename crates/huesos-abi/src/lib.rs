@@ -38,6 +38,12 @@ pub mod volume;
 /// Native Hxfs handle-first service wire protocol.
 pub mod hxfs;
 
+/// Plan 9 `/net`-style internet service wire protocol.
+pub mod net;
+
+/// Production Wi-Fi (`10ec:c821` RTL8821CE) service wire protocol.
+pub mod wlan;
+
 /// Immutable ACPI table-archive decoding and physical-address index.
 ///
 /// Used by both the kernel archive builder and the Ring-3 `acpi-manager` to
@@ -631,7 +637,52 @@ pub enum Syscall {
     /// Read a process's complete 256-CPU affinity mask.
     /// `a1` points to [`ProcessGetAffinityMask256Args`].
     ProcessGetAffinityMask256 = 90,
+    /// Set the calling thread's Ring-3 `GS_BASE` (`a1` is a canonical user VA
+    /// `< USER_ASPACE_END`, or `0`). Used by `/lib/ld-pe.so` and `kernel32.dll`
+    /// to point `gs:` at the Win64 Thread Environment Block (`TEB`).
+    ThreadSetGsBase = 91,
+    /// Read the calling thread's Ring-3 `GS_BASE` into `a1` (`*mut u64`).
+    ThreadGetGsBase = 92,
+    /// Record the execution personality (`ProcessAbi`) of a process (`a1 = 0`
+    /// for the calling process, or a `Process` handle with `WRITE` rights;
+    /// `a2` is [`ProcessAbi`] discriminant `0 = Elf64`, `1 = Pe64`).
+    ProcessSetAbi = 93,
 }
+
+/// Userspace execution personality tracked per [`Process`] and published in
+/// [`TaskRecord::flags`] (`TASK_FLAG_ABI_PE64`).
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ProcessAbi {
+    /// Native HuesOS System V AMD64 `ELF64` process (`FS_BASE` TLS).
+    #[default]
+    Elf64 = 0,
+    /// Native Windows x64 `PE32+` (`.exe` / `.dll`) process (`GS_BASE` TEB/PEB).
+    Pe64 = 1,
+}
+
+impl ProcessAbi {
+    /// Decode a wire discriminant into [`ProcessAbi`].
+    pub const fn from_raw(raw: u64) -> Option<Self> {
+        Some(match raw {
+            0 => Self::Elf64,
+            1 => Self::Pe64,
+            _ => return None,
+        })
+    }
+
+    /// Short display tag for `ps`, `schedctl`, and `btop`.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Elf64 => "ELF64",
+            Self::Pe64 => "PE64",
+        }
+    }
+}
+
+/// [`TaskRecord::flags`] bit indicating that the owning userspace process runs
+/// under the native `PE64` (`PE32+` `.exe`/`.dll`) personality.
+pub const TASK_FLAG_ABI_PE64: u8 = 1 << 4;
 
 /// Number of scheduler Task slots encoded in the low bits of a Task ID.
 pub const MAX_TASK_SLOTS: usize = 8192;
@@ -870,6 +921,22 @@ impl TaskRecord {
     pub const fn process_koid(&self) -> u64 {
         self.reserved
     }
+
+    /// True when this task belongs to a native `PE64` (`.exe`) process.
+    pub const fn is_pe64(&self) -> bool {
+        (self.flags & TASK_FLAG_ABI_PE64) != 0
+    }
+
+    /// Human-readable execution personality (`"KRNL"`, `"ELF64"`, or `"PE64"`).
+    pub const fn abi_str(&self) -> &'static str {
+        if self.kind == 0 || self.reserved == 0 {
+            "KRNL"
+        } else if (self.flags & TASK_FLAG_ABI_PE64) != 0 {
+            "PE64"
+        } else {
+            "ELF64"
+        }
+    }
 }
 
 /// Wire-format knob selector for [`Syscall::SystemKnobGet`] and
@@ -933,7 +1000,7 @@ impl Syscall {
     /// Total number of defined syscalls (i.e. one past the highest
     /// currently-assigned number). The dispatcher uses this to reject
     /// obviously-out-of-range numbers before a `match`.
-    pub const COUNT: u64 = 91;
+    pub const COUNT: u64 = 94;
 
     /// Convert a raw syscall number back into a [`Syscall`], if valid.
     pub const fn from_raw(n: u64) -> Option<Self> {
@@ -1029,6 +1096,9 @@ impl Syscall {
             88 => Self::HandleGetKoid,
             89 => Self::ProcessSetAffinityMask256,
             90 => Self::ProcessGetAffinityMask256,
+            91 => Self::ThreadSetGsBase,
+            92 => Self::ThreadGetGsBase,
+            93 => Self::ProcessSetAbi,
             _ => return None,
         })
     }
@@ -2023,11 +2093,14 @@ mod tests {
         assert_eq!(Syscall::ResourceUnmap as u64, 65);
         assert_eq!(Syscall::InterruptCreateGsiForResource as u64, 66);
         assert_eq!(Syscall::InterruptAcknowledge as u64, 67);
-        assert_eq!(Syscall::COUNT, 91);
+        assert_eq!(Syscall::COUNT, 94);
         assert_eq!(Syscall::SystemTaskQuery as u64, 87);
         assert_eq!(Syscall::HandleGetKoid as u64, 88);
         assert_eq!(Syscall::ProcessSetAffinityMask256 as u64, 89);
         assert_eq!(Syscall::ProcessGetAffinityMask256 as u64, 90);
+        assert_eq!(Syscall::ThreadSetGsBase as u64, 91);
+        assert_eq!(Syscall::ThreadGetGsBase as u64, 92);
+        assert_eq!(Syscall::ProcessSetAbi as u64, 93);
         assert_eq!(Syscall::ProcessTerminate as u64, 83);
         assert_eq!(Syscall::FutexWait as u64, 84);
         assert_eq!(Syscall::FutexWake as u64, 85);
@@ -2057,7 +2130,10 @@ mod tests {
             Syscall::from_raw(90),
             Some(Syscall::ProcessGetAffinityMask256)
         );
-        assert_eq!(Syscall::from_raw(91), None);
+        assert_eq!(Syscall::from_raw(91), Some(Syscall::ThreadSetGsBase));
+        assert_eq!(Syscall::from_raw(92), Some(Syscall::ThreadGetGsBase));
+        assert_eq!(Syscall::from_raw(93), Some(Syscall::ProcessSetAbi));
+        assert_eq!(Syscall::from_raw(94), None);
         assert_eq!(Syscall::from_raw(28), Some(Syscall::VmoCreateEx));
         assert_eq!(Syscall::from_raw(30), Some(Syscall::VmarProtect));
         assert_eq!(Syscall::from_raw(31), Some(Syscall::ChannelPeek));
@@ -2141,8 +2217,11 @@ mod tests {
             Syscall::from_raw(90),
             Some(Syscall::ProcessGetAffinityMask256)
         );
+        assert_eq!(Syscall::from_raw(91), Some(Syscall::ThreadSetGsBase));
+        assert_eq!(Syscall::from_raw(92), Some(Syscall::ThreadGetGsBase));
+        assert_eq!(Syscall::from_raw(93), Some(Syscall::ProcessSetAbi));
         // Append-only: the next number past the newest syscall stays unmapped.
-        assert_eq!(Syscall::from_raw(91), None);
+        assert_eq!(Syscall::from_raw(94), None);
     }
 
     #[test]

@@ -1,0 +1,31 @@
+[package]
+name = "huesos-wlan-service"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "huesos-wlan-service"
+path = "src/main.rs"
+
+[features]
+default = []
+boot-selftest = ["huesos-rtw88/boot-selftest"]
+
+[dependencies]
+libcanvas = { path = "../libcanvas" }
+huesos-abi = { path = "../../huesos-abi" }
+huesos-ieee80211 = { path = "../../huesos-ieee80211" }
+huesos-wpa = { path = "../../huesos-wpa" }
+huesos-rtw88 = { path = "../../huesos-rtw88" }
+huesos-net = { path = "../../huesos-net" }
+
+
+[profile.release]
+opt-level = 2
+panic = "abort"
+lto = false
+
+[profile.dev]
+panic = "abort"
+
+[workspace]

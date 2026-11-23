@@ -1416,6 +1416,7 @@ pub extern "C" fn user_entry_trampoline() -> ! {
     }
 
     huesos_arch::context_switch::write_fs_base(fs_base);
+    huesos_arch::context_switch::write_user_gs_base(0);
     unsafe {
         huesos_arch::context_switch::enter_userspace_with_arg(
             entry, rsp, user_cs, user_ss, 0x202, rdi,

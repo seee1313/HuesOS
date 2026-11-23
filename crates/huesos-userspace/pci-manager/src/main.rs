@@ -1489,6 +1489,38 @@ fn run_driver_binding_and_handoff(
             max_vectors: 1,
             allow_polling_fallback: false,
         },
+        DriverManifestSpec {
+            driver_name: "net-service",
+            match_rule: DeviceMatchRule {
+                vendor_id: Some(0x1AF4),
+                device_id: Some(0x1000),
+                subsystem_vendor_id: None,
+                subsystem_id: None,
+                revision_id: None,
+                class: None,
+                required_capability_id: None,
+            },
+            relocation: RelocationClass::Fixed,
+            irq_preference: IrqPreference::IntxOnly,
+            max_vectors: 1,
+            allow_polling_fallback: true,
+        },
+        DriverManifestSpec {
+            driver_name: "wlan-service",
+            match_rule: DeviceMatchRule {
+                vendor_id: Some(0x10EC),
+                device_id: Some(0xC821),
+                subsystem_vendor_id: None,
+                subsystem_id: None,
+                revision_id: None,
+                class: None,
+                required_capability_id: None,
+            },
+            relocation: RelocationClass::Fixed,
+            irq_preference: IrqPreference::MsiThenIntx,
+            max_vectors: 1,
+            allow_polling_fallback: true,
+        },
     ];
 
     let mut transport = ReadWriteTransport {
@@ -1951,6 +1983,163 @@ fn run_driver_binding_and_handoff(
                         irq_len,
                         mode_str
                     );
+                    continue;
+                }
+
+                if manifest.driver_name == "net-service" {
+                    let bar0 = validation.resources().iter().find(|r| {
+                        r.resource.owner == lease.address
+                            && r.resource.register == ResourceRegister::Bar(0)
+                            && r.resource.class == ResourceClass::Io
+                            && r.cpu_base.is_some()
+                            && r.resource.len >= 0x20
+                    });
+                    if let Some(bar0) = bar0 {
+                        let max_config_bytes = if cfg!(feature = "force-legacy") {
+                            CONVENTIONAL_CONFIG_BYTES
+                        } else {
+                            ENHANCED_CONFIG_BYTES
+                        };
+                        // Enable IO_SPACE | MEMORY_SPACE | BUS_MASTER | INTERRUPT_DISABLE (0x0407)
+                        // while leaving MSI-X disabled so VirtIO legacy BAR0 offsets stay unshifted.
+                        let cmd_req = WriteRequest {
+                            address: lease.address,
+                            header_kind: HeaderKind::Type0Endpoint,
+                            class: WriteClass::CommandControl,
+                            offset: OFFSET_COMMAND,
+                            width: ConfigWidth::Word,
+                            max_config_bytes,
+                            value: u32::from(current_command) | 0x0407,
+                            write_mask: 0x0407,
+                            expected_readback_mask: 0x0407,
+                            allowlist_entry: None,
+                        };
+                        let cmd_ok =
+                            write_policy::execute_checked_write(&mut transport, &cmd_req).is_ok();
+                        let bar0_base = bar0.cpu_base.unwrap_or(0);
+                        let bar0_len = bar0.resource.len;
+                        if let Ok(io_handle) = libcanvas::device_lease::mint_resource(
+                            &lease.handle,
+                            ResourceKindAbi::IoPort,
+                            lease.generation,
+                            bar0_base,
+                            bar0_len,
+                            true,
+                        ) {
+                            let io_label = format!(
+                                "resource:net-service:ioport:{:#x}:{:#x}:excl",
+                                bar0_base, bar0_len
+                            );
+                            let _ = bootstrap.write_handle(io_label.as_bytes(), io_handle);
+                            let mut ro_lease_mint_denied = false;
+                            if let Ok(ro_lease) =
+                                lease.handle.duplicate(rights::READ | rights::TRANSFER)
+                            {
+                                ro_lease_mint_denied = matches!(
+                                    libcanvas::device_lease::mint_resource(
+                                        &ro_lease,
+                                        ResourceKindAbi::IoPort,
+                                        lease.generation,
+                                        bar0_base,
+                                        bar0_len,
+                                        true,
+                                    ),
+                                    Err(ErrorCode::AccessDenied)
+                                );
+                                let _ = bootstrap
+                                    .write_handle(pci_manager::DEVICE_LEASE_RO_LABEL, ro_lease);
+                            }
+                            println!(
+                                "[pci-manager] obs i1-irq bdf={:02x}:{:02x}.{} mode=polling irq=0 writes=1 valid_b4={} minted=1 ro_lease_mint_denied={}",
+                                lease.address.bus(),
+                                lease.address.device(),
+                                lease.address.function(),
+                                cmd_ok,
+                                ro_lease_mint_denied
+                            );
+                            println!(
+                                "[pci-manager] obs i2-dma bdf={:02x}:{:02x}.{} isolation=Trusted",
+                                lease.address.bus(),
+                                lease.address.device(),
+                                lease.address.function()
+                            );
+                            println!(
+                                "[pci-manager] obs virtio-net bdf={:02x}:{:02x}.{} ioport=0x{:x}+0x{:x} status=handed-off",
+                                lease.address.bus(),
+                                lease.address.device(),
+                                lease.address.function(),
+                                bar0_base,
+                                bar0_len
+                            );
+                        }
+                    }
+                    continue;
+                }
+
+                if manifest.driver_name == "wlan-service" {
+                    let mmio_bar = validation.resources().iter().find(|r| {
+                        r.resource.owner == lease.address
+                            && matches!(
+                                r.resource.class,
+                                ResourceClass::Mmio32
+                                    | ResourceClass::Mmio64
+                                    | ResourceClass::PrefetchableMemory
+                            )
+                            && r.cpu_base.is_some()
+                            && r.resource.len >= 0x1000
+                    });
+                    if let Some(mmio) = mmio_bar {
+                        let max_config_bytes = if cfg!(feature = "force-legacy") {
+                            CONVENTIONAL_CONFIG_BYTES
+                        } else {
+                            ENHANCED_CONFIG_BYTES
+                        };
+                        let cmd_req = WriteRequest {
+                            address: lease.address,
+                            header_kind: HeaderKind::Type0Endpoint,
+                            class: WriteClass::CommandControl,
+                            offset: OFFSET_COMMAND,
+                            width: ConfigWidth::Word,
+                            max_config_bytes,
+                            value: u32::from(current_command) | 0x0406,
+                            write_mask: 0x0406,
+                            expected_readback_mask: 0x0406,
+                            allowlist_entry: None,
+                        };
+                        let cmd_ok =
+                            write_policy::execute_checked_write(&mut transport, &cmd_req).is_ok();
+                        let mmio_base = mmio.cpu_base.unwrap_or(0);
+                        let mmio_len = mmio.resource.len;
+                        if let Ok(mmio_handle) = libcanvas::device_lease::mint_resource(
+                            &lease.handle,
+                            ResourceKindAbi::Mmio,
+                            lease.generation,
+                            mmio_base,
+                            mmio_len,
+                            true,
+                        ) {
+                            let mmio_label = format!(
+                                "resource:wlan-service:mmio:{:#x}:{:#x}:excl",
+                                mmio_base, mmio_len
+                            );
+                            let _ = bootstrap.write_handle(mmio_label.as_bytes(), mmio_handle);
+                            if let Ok(ro_lease) =
+                                lease.handle.duplicate(rights::READ | rights::TRANSFER)
+                            {
+                                let _ = bootstrap
+                                    .write_handle(pci_manager::DEVICE_LEASE_RO_LABEL, ro_lease);
+                            }
+                            println!(
+                                "[pci-manager] obs rtw88 bdf={:02x}:{:02x}.{} mmio=0x{:x}+0x{:x} cmd_ok={} status=handed-off",
+                                lease.address.bus(),
+                                lease.address.device(),
+                                lease.address.function(),
+                                mmio_base,
+                                mmio_len,
+                                cmd_ok
+                            );
+                        }
+                    }
                     continue;
                 }
 

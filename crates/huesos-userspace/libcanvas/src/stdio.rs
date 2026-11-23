@@ -32,6 +32,14 @@ pub enum CapKind {
     BootfsRo = 7,
     /// `DriverManager` query/registry channel (`AT_HUESOS_REGISTRY`).
     Registry = 8,
+    /// `net-service` (`Plan 9 /net`) capability channel (`AT_HUESOS_NET_SERVICE`).
+    NetService = 9,
+    /// `wlan-service` capability channel (`AT_HUESOS_WLAN_SERVICE`).
+    WlanService = 10,
+    /// Target PE32+ `.exe` VMO passed to `/lib/ld-pe.so` (`AT_HUESOS_PE_VMO`).
+    PeVmo = 11,
+    /// Self root VMAR passed to `/lib/ld-pe.so` for mapping `.exe`/`.dll` sections.
+    PeSelfVmar = 12,
 }
 
 #[cfg(not(feature = "dyn-client"))]
@@ -61,6 +69,12 @@ mod imp {
     static FRAME_DRAW_CH: AtomicU32 = AtomicU32::new(INVALID_HANDLE);
     static BOOTFS_VMO_H: AtomicU32 = AtomicU32::new(INVALID_HANDLE);
     static REGISTRY_CH: AtomicU32 = AtomicU32::new(INVALID_HANDLE);
+    static NET_SERVICE_CH: AtomicU32 = AtomicU32::new(INVALID_HANDLE);
+    static WLAN_SERVICE_CH: AtomicU32 = AtomicU32::new(INVALID_HANDLE);
+    static PE_VMO_H: AtomicU32 = AtomicU32::new(INVALID_HANDLE);
+    static PE_SELF_VMAR_H: AtomicU32 = AtomicU32::new(INVALID_HANDLE);
+    static PE_OFFSET: AtomicU64 = AtomicU64::new(0);
+    static PE_LEN: AtomicU64 = AtomicU64::new(0);
 
     static STDIN_LOCK: AtomicBool = AtomicBool::new(false);
     static STDIN_POS: AtomicUsize = AtomicUsize::new(0);
@@ -80,6 +94,10 @@ mod imp {
             CapKind::FrameDraw => &FRAME_DRAW_CH,
             CapKind::BootfsRo => &BOOTFS_VMO_H,
             CapKind::Registry => &REGISTRY_CH,
+            CapKind::NetService => &NET_SERVICE_CH,
+            CapKind::WlanService => &WLAN_SERVICE_CH,
+            CapKind::PeVmo => &PE_VMO_H,
+            CapKind::PeSelfVmar => &PE_SELF_VMAR_H,
         }
     }
 
@@ -96,6 +114,19 @@ mod imp {
         FRAME_DRAW_CH.store(info.frame_draw_ch, Ordering::Release);
         BOOTFS_VMO_H.store(info.bootfs_vmo, Ordering::Release);
         REGISTRY_CH.store(info.registry_ch, Ordering::Release);
+        NET_SERVICE_CH.store(info.net_service_ch, Ordering::Release);
+        WLAN_SERVICE_CH.store(info.wlan_service_ch, Ordering::Release);
+        PE_VMO_H.store(info.pe_vmo, Ordering::Release);
+        PE_SELF_VMAR_H.store(info.pe_self_vmar, Ordering::Release);
+        PE_OFFSET.store(info.pe_offset, Ordering::Release);
+        PE_LEN.store(info.pe_len, Ordering::Release);
+    }
+
+    pub fn pe_image_span() -> (u64, u64) {
+        (
+            PE_OFFSET.load(Ordering::Acquire),
+            PE_LEN.load(Ordering::Acquire),
+        )
     }
 
     pub fn args_count() -> usize {
@@ -315,6 +346,7 @@ mod imp {
         fn canvas_caps_mask() -> u64;
         fn canvas_cap_handle(kind: u32) -> u32;
         fn canvas_take_cap_handle(kind: u32) -> u32;
+        fn canvas_pe_image_span(out_offset: *mut u64, out_len: *mut u64);
     }
 
     pub fn args_count() -> usize {
@@ -409,6 +441,14 @@ mod imp {
         } else {
             Some(Handle::from_syscall_out(raw_h))
         }
+    }
+
+    pub fn pe_image_span() -> (u64, u64) {
+        let mut off = 0u64;
+        let mut len = 0u64;
+        // SAFETY: `off` and `len` are valid stack pointers.
+        unsafe { canvas_pe_image_span(&mut off, &mut len) };
+        (off, len)
     }
 }
 
@@ -506,8 +546,17 @@ pub const fn cap_kind_from_u32(kind: u32) -> Option<CapKind> {
         6 => Some(CapKind::FrameDraw),
         7 => Some(CapKind::BootfsRo),
         8 => Some(CapKind::Registry),
+        9 => Some(CapKind::NetService),
+        10 => Some(CapKind::WlanService),
+        11 => Some(CapKind::PeVmo),
+        12 => Some(CapKind::PeSelfVmar),
         _ => None,
     }
+}
+
+/// Return `(offset, len)` of the target PE32+ `.exe` inside `PeVmo` (`(0, 0)` for ELF processes).
+pub fn pe_image_span() -> (u64, u64) {
+    imp::pe_image_span()
 }
 
 /// Duplicate or borrow-free check returning `INVALID_HANDLE` on absence.

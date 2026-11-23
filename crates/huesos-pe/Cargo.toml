@@ -1,0 +1,9 @@
+[package]
+name = "huesos-pe"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Safe, zero-unsafe no_std PE32+ (x86_64) image, relocation, export, and import parser for HuesOS."
+
+[dependencies]

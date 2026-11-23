@@ -48,6 +48,8 @@ pub struct CpuLocal {
     pub execution_guards: *mut huesos_sched::ExecutionGuards,
     /// Early-boot execution state used before Scheduler v2 publishes a Task.
     pub bootstrap_guards: huesos_sched::ExecutionGuards,
+    /// Cached `IA32_KERNEL_GS_BASE` (active thread's Ring-3 `GS_BASE`) on this CPU.
+    pub shadow_user_gs_base: u64,
 }
 
 impl CpuLocal {
@@ -65,6 +67,7 @@ impl CpuLocal {
             rank_tracker_index: 0,
             execution_guards: core::ptr::null_mut(),
             bootstrap_guards: huesos_sched::ExecutionGuards::new(),
+            shadow_user_gs_base: 0,
         }
     }
 }
@@ -74,7 +77,8 @@ static_assertions::const_assert_eq!(core::mem::offset_of!(CpuLocal, kernel_rsp),
 static_assertions::const_assert_eq!(core::mem::offset_of!(CpuLocal, rank_tracker_index), 56);
 static_assertions::const_assert_eq!(core::mem::offset_of!(CpuLocal, execution_guards), 64);
 static_assertions::const_assert_eq!(core::mem::offset_of!(CpuLocal, bootstrap_guards), 72);
-static_assertions::const_assert_eq!(core::mem::size_of::<CpuLocal>(), 80);
+static_assertions::const_assert_eq!(core::mem::offset_of!(CpuLocal, shadow_user_gs_base), 80);
+static_assertions::const_assert_eq!(core::mem::size_of::<CpuLocal>(), 88);
 
 struct CpuLocalStorage(UnsafeCell<[CpuLocal; MAX_CPUS]>);
 
@@ -116,11 +120,19 @@ pub unsafe fn alloc_cpu_local(lapic_id: u32) -> &'static mut CpuLocal {
 pub unsafe fn init_gs_base(ptr: *mut CpuLocal) {
     let addr = ptr as u64;
     unsafe {
+        (*ptr).shadow_user_gs_base = 0;
         asm!(
             "wrmsr",
             in("ecx") 0xC000_0101u32,
             in("edx") (addr >> 32) as u32,
             in("eax") addr as u32,
+            options(nomem, nostack),
+        );
+        asm!(
+            "wrmsr",
+            in("ecx") 0xC000_0102u32,
+            in("edx") 0u32,
+            in("eax") 0u32,
             options(nomem, nostack),
         );
     }

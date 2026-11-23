@@ -2,7 +2,7 @@
 
 use crate::manifest::{DriverHostManifest, DRIVER_HOSTS};
 
-const MAX_SERVICES: usize = 8;
+const MAX_SERVICES: usize = 16;
 
 /// Runtime service state.
 #[derive(Clone, Copy, PartialEq, Eq)]

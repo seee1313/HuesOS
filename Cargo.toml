@@ -35,6 +35,11 @@ members = [
     "crates/huesos-bootux",
     "crates/huesos-hsh",
     "crates/huesos-gpt",
+    "crates/huesos-pe",
+    "crates/huesos-net",
+    "crates/huesos-ieee80211",
+    "crates/huesos-wpa",
+    "crates/huesos-rtw88",
 ]
 resolver = "2"
 exclude = ["tools"]

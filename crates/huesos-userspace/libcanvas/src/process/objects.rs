@@ -97,6 +97,18 @@ impl Process {
         raw::decode(ret).map(|_| ())
     }
 
+    /// Record the execution personality (`ELF64` or `PE64`) of this process.
+    pub fn set_abi(&self, abi: huesos_abi::ProcessAbi) -> crate::Result<()> {
+        let ret = raw::syscall2(Syscall::ProcessSetAbi, self.0.raw() as u64, abi as u64);
+        raw::decode(ret).map(|_| ())
+    }
+
+    /// Record the execution personality (`ELF64` or `PE64`) of the calling process.
+    pub fn set_current_abi(abi: huesos_abi::ProcessAbi) -> crate::Result<()> {
+        let ret = raw::syscall2(Syscall::ProcessSetAbi, 0, abi as u64);
+        raw::decode(ret).map(|_| ())
+    }
+
     /// Queue a process-exit packet to `port` when this process exits.
     pub fn bind_exit_port(&self, port: &Port, key: u64) -> crate::Result<()> {
         let args = ProcessBindExitPortArgs {
@@ -299,6 +311,20 @@ impl Thread {
     /// Borrow the underlying thread handle.
     pub fn handle(&self) -> &Handle {
         &self.0
+    }
+
+    /// Set the calling thread's Ring-3 `GS_BASE` (e.g. Win64 `TEB` linear address).
+    pub fn set_current_gs_base(gs_base: u64) -> crate::Result<()> {
+        let ret = raw::syscall1(Syscall::ThreadSetGsBase, gs_base);
+        raw::decode(ret).map(|_| ())
+    }
+
+    /// Read the calling thread's Ring-3 `GS_BASE`.
+    pub fn get_current_gs_base() -> crate::Result<u64> {
+        let mut out = 0u64;
+        let ret = raw::syscall1(Syscall::ThreadGetGsBase, &mut out as *mut u64 as u64);
+        raw::decode(ret)?;
+        Ok(out)
     }
 }
 

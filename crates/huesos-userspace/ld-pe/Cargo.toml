@@ -1,0 +1,25 @@
+[package]
+name = "huesos-ld-pe"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "ld-pe"
+path = "src/main.rs"
+
+[dependencies]
+huesos-abi = { path = "../../huesos-abi" }
+huesos-pe = { path = "../../huesos-pe" }
+huesos-std = { path = "../huesos-std" }
+libcanvas = { path = "../libcanvas", default-features = false, features = ["dyn-client", "thread-tasks"] }
+spin = { version = "0.9", default-features = false, features = ["mutex", "once"] }
+
+[profile.release]
+opt-level = 2
+panic = "abort"
+lto = false
+
+[profile.dev]
+panic = "abort"
+
+[workspace]

@@ -239,11 +239,12 @@ pub extern "C" fn _start() -> ! {
             b"/manifests/input-host.hdriver",
         );
         ui.step(b"storage", 25);
+        let nvme_dma_ok = send_boot_dma_pool_grant(&mut logger, channel, &storage_boot_info);
         if storage_off {
             // Kernel already skipped storage and pci-manager leaves NVMe unbound.
             init_logln!(logger, "[init] storage disabled by init.storage=off");
             ui.end(b"storage", StageState::Skipped, &mut logger);
-        } else if !send_boot_dma_pool_grant(&mut logger, channel, &storage_boot_info) {
+        } else if !nvme_dma_ok {
             // No DMA pool available for NVMe.
             ui.end(b"storage", StageState::Skipped, &mut logger);
         }
@@ -762,14 +763,91 @@ fn send_boot_dma_pool_grant(
         );
         return false;
     };
-    if info.storage_off() || !info.dma_pool.is_present() {
+    if !info.dma_pool.is_present() {
         return false;
     }
 
+    const NVME_DMA_LEN: u64 = 64 * 1024 * 1024;
+    const NET_DMA_OFFSET: u64 = 64 * 1024 * 1024;
+    const NET_DMA_LEN: u64 = 4 * 1024 * 1024;
+    const WLAN_DMA_OFFSET: u64 = 68 * 1024 * 1024;
+    const WLAN_DMA_LEN: u64 = 4 * 1024 * 1024;
+
+    // Carve isolated `[64..68 MiB)` for `net-service` and `[68..72 MiB)` for `wlan-service`
+    // regardless of `init.storage=off` so networking and Wi-Fi work on Live ISO / ramdisk boots too.
+    if info.dma_pool.len >= NET_DMA_OFFSET + NET_DMA_LEN {
+        let net_grant = ResourceGrant {
+            kind: kind::DMA_POOL,
+            base: info.dma_pool.base + NET_DMA_OFFSET,
+            len: NET_DMA_LEN,
+            exclusive: true,
+        };
+        if let Ok(res) = Resource::create(
+            net_grant.kind,
+            net_grant.base,
+            net_grant.len,
+            net_grant.exclusive,
+        ) {
+            let mut label = [0u8; 96];
+            let n = format_grant_label(&mut label, "net-service", &net_grant);
+            if dm_bootstrap
+                .write_handle(&label[..n.min(label.len())], res.into_handle())
+                .is_ok()
+            {
+                let mut done = [0u8; 64];
+                let dn = format_grants_complete_label(&mut done, "net-service");
+                let _ = dm_bootstrap.write(&done[..dn.min(done.len())]);
+                init_logln!(
+                    logger,
+                    "[init] net-service DMA pool transferred: dma={:#x}+{:#x}",
+                    net_grant.base,
+                    net_grant.len
+                );
+            }
+        }
+    }
+
+    if info.dma_pool.len >= WLAN_DMA_OFFSET + WLAN_DMA_LEN {
+        let wlan_grant = ResourceGrant {
+            kind: kind::DMA_POOL,
+            base: info.dma_pool.base + WLAN_DMA_OFFSET,
+            len: WLAN_DMA_LEN,
+            exclusive: true,
+        };
+        if let Ok(res) = Resource::create(
+            wlan_grant.kind,
+            wlan_grant.base,
+            wlan_grant.len,
+            wlan_grant.exclusive,
+        ) {
+            let mut label = [0u8; 96];
+            let n = format_grant_label(&mut label, "wlan-service", &wlan_grant);
+            if dm_bootstrap
+                .write_handle(&label[..n.min(label.len())], res.into_handle())
+                .is_ok()
+            {
+                let mut done = [0u8; 64];
+                let dn = format_grants_complete_label(&mut done, "wlan-service");
+                let _ = dm_bootstrap.write(&done[..dn.min(done.len())]);
+                init_logln!(
+                    logger,
+                    "[init] wlan-service DMA pool transferred: dma={:#x}+{:#x}",
+                    wlan_grant.base,
+                    wlan_grant.len
+                );
+            }
+        }
+    }
+
+    if info.storage_off() {
+        return false;
+    }
+
+    let nvme_len = info.dma_pool.len.min(NVME_DMA_LEN);
     let grant = ResourceGrant {
         kind: kind::DMA_POOL,
         base: info.dma_pool.base,
-        len: info.dma_pool.len,
+        len: nvme_len,
         exclusive: true,
     };
     let resource = match Resource::create(grant.kind, grant.base, grant.len, grant.exclusive) {
@@ -793,8 +871,8 @@ fn send_boot_dma_pool_grant(
             init_logln!(
                 logger,
                 "[init] boot DMA pool transferred: dma={:#x}+{:#x}",
-                info.dma_pool.base,
-                info.dma_pool.len
+                grant.base,
+                grant.len
             );
             true
         }

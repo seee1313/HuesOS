@@ -59,10 +59,11 @@ pub use callbacks::{
     set_debug_write_fn, set_exit_fn, set_heap_extend_fn, set_process_create_fn,
     set_process_create_in_job_fn, set_process_terminate_fn, set_resource_map_fn,
     set_resource_unmap_fn, set_sched_stats_fns, set_shutdown_fn, set_task_count_fn,
-    set_task_record_fn, set_thread_exit_fn, set_thread_set_fs_base_fn, set_thread_start_ex_fn,
-    set_thread_start_fn, set_vmar_map_fn, set_vmar_protect_fn, set_vmar_unmap_fn, set_yield_fn,
-    HeapExtendFn, ProcessCreateFn, ProcessCreateInJobFn, ProcessTerminateFn, ResourceMapFn,
-    ResourceUnmapFn, ThreadStartExFn, ThreadStartFn, VmarMapFn, VmarOpFn,
+    set_task_record_fn, set_thread_exit_fn, set_thread_get_gs_base_fn, set_thread_set_fs_base_fn,
+    set_thread_set_gs_base_fn, set_thread_start_ex_fn, set_thread_start_fn, set_vmar_map_fn,
+    set_vmar_protect_fn, set_vmar_unmap_fn, set_yield_fn, HeapExtendFn, ProcessCreateFn,
+    ProcessCreateInJobFn, ProcessTerminateFn, ResourceMapFn, ResourceUnmapFn, ThreadGetGsBaseFn,
+    ThreadSetGsBaseFn, ThreadStartExFn, ThreadStartFn, VmarMapFn, VmarOpFn,
 };
 
 /// Result type for syscalls: `Ok(value)` or a negative error code.
@@ -257,6 +258,9 @@ pub fn dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> Syscal
             a2 as *mut huesos_abi::pci_lease::DeviceLeaseInfo,
         ),
         S::ThreadSetFsBase => process::sys_thread_set_fs_base(a1),
+        S::ThreadSetGsBase => process::sys_thread_set_gs_base(a1),
+        S::ThreadGetGsBase => process::sys_thread_get_gs_base(a1 as *mut u64),
+        S::ProcessSetAbi => process::sys_process_set_abi(a1 as HandleValue, a2),
         S::ProcessSelf => process::sys_process_self(a1 as *mut HandleValue),
         S::ThreadStartEx => process::sys_thread_start_ex(a1 as *const huesos_abi::ThreadStartArgs),
         S::ThreadExit => process::sys_thread_exit(a1 as i64),

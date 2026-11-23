@@ -40,6 +40,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "huesos-pe"
+version = "0.1.0"
+
+[[package]]
 name = "huesos-std"
 version = "0.1.0"
 dependencies = [
@@ -55,6 +59,7 @@ dependencies = [
  "huesos-abi",
  "huesos-blobfs",
  "huesos-elf",
+ "huesos-pe",
  "spin",
 ]
 

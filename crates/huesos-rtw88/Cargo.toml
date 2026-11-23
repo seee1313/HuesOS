@@ -1,0 +1,16 @@
+[package]
+name = "huesos-rtw88"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+default = []
+boot-selftest = []
+
+[dependencies]
+huesos-abi = { path = "../huesos-abi" }
+huesos-ieee80211 = { path = "../huesos-ieee80211" }
+huesos-wpa = { path = "../huesos-wpa" }
+huesos-net = { path = "../huesos-net" }
+

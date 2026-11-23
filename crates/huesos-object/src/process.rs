@@ -6,7 +6,7 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::any::Any;
-use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 
 use crate::futex::{FutexNode, FutexTable};
 use crate::wait::WaitQueue;
@@ -85,6 +85,8 @@ pub struct Process {
     /// (`src/power/shutdown-shim/main.cc`), captured in
     /// `docs/ARCHITECTURE_ROADMAP.md` §3.
     critical: AtomicBool,
+    /// Userspace execution personality (`ProcessAbi::Elf64` = `0`, `ProcessAbi::Pe64` = `1`).
+    abi: AtomicU8,
 }
 
 /// Number of processes that enabled opt-in scheduler stealing.
@@ -125,7 +127,19 @@ impl Process {
             start_reserved: AtomicBool::new(false),
             active_threads: AtomicUsize::new(0),
             critical: AtomicBool::new(false),
+            abi: AtomicU8::new(huesos_abi::ProcessAbi::Elf64 as u8),
         })
+    }
+
+    /// Return this process's execution personality (`ELF64` or `PE64`).
+    pub fn abi(&self) -> huesos_abi::ProcessAbi {
+        huesos_abi::ProcessAbi::from_raw(self.abi.load(Ordering::Acquire) as u64)
+            .unwrap_or(huesos_abi::ProcessAbi::Elf64)
+    }
+
+    /// Record this process's execution personality (`ELF64` or `PE64`).
+    pub fn set_abi(&self, abi: huesos_abi::ProcessAbi) {
+        self.abi.store(abi as u8, Ordering::Release);
     }
 
     /// Register a futex waiter on `uaddr` and return its node.

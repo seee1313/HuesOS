@@ -147,6 +147,15 @@ pub struct DriverManager {
     input_host: Option<ManagedHost>,
     nvme_host: Option<ManagedHost>,
     hxfs_service: Option<ManagedHost>,
+    net_service: Option<ManagedHost>,
+    net_generation: u64,
+    net_failed: bool,
+    net_ready: bool,
+    wlan_service: Option<ManagedHost>,
+    wlan_generation: u64,
+    wlan_failed: bool,
+    wlan_ready: bool,
+    pci_bindings_settled: bool,
     /// Unique generation-grant authority delegated by init.
     key_broker: Option<Channel>,
     hxfs_generation: u64,
@@ -275,7 +284,7 @@ pub struct DriverManager {
     /// their target drivers. Indexed implicitly by driver name via a
     /// linear scan; the number of drivers is small in the MVP so no
     /// hash-map is warranted.
-    pending_resources: [PendingResources; 8],
+    pending_resources: [PendingResources; 16],
     pending_resource_count: usize,
     /// Driver names for which init has signalled that every
     /// declared resource grant has been transferred. Populated by
@@ -290,7 +299,7 @@ pub struct DriverManager {
     grants_ready_count: usize,
 }
 
-const MAX_TRACKED_HOSTS: usize = 8;
+const MAX_TRACKED_HOSTS: usize = 16;
 
 /// Messages one channel may be served per main-loop tick.
 ///
@@ -393,6 +402,15 @@ impl DriverManager {
             input_host: None,
             nvme_host: None,
             hxfs_service: None,
+            net_service: None,
+            net_generation: 0,
+            net_failed: false,
+            net_ready: false,
+            wlan_service: None,
+            wlan_generation: 0,
+            wlan_failed: false,
+            wlan_ready: false,
+            pci_bindings_settled: false,
             key_broker: None,
             hxfs_generation: 0,
             hxfs_failed: false,
@@ -456,16 +474,7 @@ impl DriverManager {
             storage_skipped_sent: false,
             nvme_lease_ro: None,
             nvme_boot_driver: None,
-            pending_resources: [
-                PendingResources::empty(),
-                PendingResources::empty(),
-                PendingResources::empty(),
-                PendingResources::empty(),
-                PendingResources::empty(),
-                PendingResources::empty(),
-                PendingResources::empty(),
-                PendingResources::empty(),
-            ],
+            pending_resources: [const { PendingResources::empty() }; 16],
             pending_resource_count: 0,
             grants_ready: [[0; 32]; MAX_TRACKED_HOSTS],
             grants_ready_len: [0; MAX_TRACKED_HOSTS],
@@ -526,6 +535,8 @@ impl DriverManager {
         {
             self.start_nvme_host();
         }
+        self.try_start_net_service();
+        self.try_start_wlan_service();
     }
 
     fn record_resource_handle(&mut self, label: &[u8], handle: Handle) {
@@ -850,6 +861,8 @@ impl DriverManager {
                 nvme_online,
             );
             self.try_start_hxfs_service(nvme_online);
+            self.try_start_net_service();
+            self.try_start_wlan_service();
             self.blobfs.poll(
                 &mut self.volume,
                 self.nvme_host.as_ref().map(|host| &host.bootstrap),
@@ -863,6 +876,8 @@ impl DriverManager {
             self.poll_input_host();
             self.poll_nvme_host();
             self.poll_hxfs_service();
+            self.poll_net_service();
+            self.poll_wlan_service();
             self.probe_package_resolving();
             self.poll_acpi_manager();
             self.try_start_acpi_manager();
@@ -1040,6 +1055,92 @@ impl DriverManager {
             huesos_abi::USER_STACK_HXFS_SIZE
         );
         self.hxfs_service = Some(ManagedHost { process, bootstrap });
+    }
+
+    fn try_start_net_service(&mut self) {
+        if self.net_service.is_some()
+            || self.net_failed
+            || !self.bootfs_loaded
+            || !self.pci_bindings_settled
+            || !self.driver_grants_ready(b"net-service")
+        {
+            return;
+        }
+        let Some(bootfs) = self.fs.bootfs() else {
+            return;
+        };
+        let Ok(Some(entry)) = bootfs.get_entry("/services/net.elf") else {
+            println!("[driver-manager] net-service ELF missing from BOOTFS");
+            self.net_failed = true;
+            return;
+        };
+        let Some(bootfs_vmo) = self.fs.vmo() else {
+            return;
+        };
+        let Ok((process, bootstrap)) = libcanvas::process::spawn_elf_from_vmo_with_stack(
+            "net-service",
+            bootfs_vmo,
+            entry.offset,
+            entry.len,
+            huesos_abi::USER_STACK_HXFS_SIZE,
+        ) else {
+            println!("[driver-manager] failed to launch net-service");
+            self.net_failed = true;
+            return;
+        };
+        self.net_generation = self.net_generation.saturating_add(1);
+        self.forward_pending_resources("net-service", &bootstrap, &process);
+        println!(
+            "[driver-manager] launched net-service gen={}",
+            self.net_generation
+        );
+        self.net_service = Some(ManagedHost { process, bootstrap });
+    }
+
+    fn try_start_wlan_service(&mut self) {
+        if self.wlan_service.is_some()
+            || self.wlan_failed
+            || !self.bootfs_loaded
+            || !self.pci_bindings_settled
+            || !self.driver_grants_ready(b"wlan-service")
+        {
+            return;
+        }
+        let Some(bootfs) = self.fs.bootfs() else {
+            return;
+        };
+        let Ok(Some(entry)) = bootfs.get_entry("/services/wlan.elf") else {
+            println!("[driver-manager] wlan-service ELF missing from BOOTFS");
+            self.wlan_failed = true;
+            return;
+        };
+        let Some(bootfs_vmo) = self.fs.vmo() else {
+            return;
+        };
+        let Ok((process, bootstrap)) = libcanvas::process::spawn_elf_from_vmo_with_stack(
+            "wlan-service",
+            bootfs_vmo,
+            entry.offset,
+            entry.len,
+            huesos_abi::USER_STACK_HXFS_SIZE,
+        ) else {
+            println!("[driver-manager] failed to launch wlan-service");
+            self.wlan_failed = true;
+            return;
+        };
+        if let Ok(ro_bootfs) = bootfs_vmo.duplicate(
+            huesos_abi::rights::READ | huesos_abi::rights::DUPLICATE | huesos_abi::rights::TRANSFER,
+        ) {
+            let _ =
+                bootstrap.write_handle(protocol::BOOTFS_VMO.as_bytes(), ro_bootfs.into_handle());
+        }
+        self.wlan_generation = self.wlan_generation.saturating_add(1);
+        self.forward_pending_resources("wlan-service", &bootstrap, &process);
+        println!(
+            "[driver-manager] launched wlan-service gen={}",
+            self.wlan_generation
+        );
+        self.wlan_service = Some(ManagedHost { process, bootstrap });
     }
 
     /// Adversarial lifecycle probe used only by the KeyBroker crash smoke.
@@ -1673,6 +1774,18 @@ impl DriverManager {
                 Ok(n) if &buf[..n] == protocol::OPEN_VOLUME_SYSTEM.as_bytes() => {
                     self.open_system_volume()
                 }
+                Ok(n) if &buf[..n] == protocol::OPEN_NET.as_bytes() => {
+                    self.open_net_service(false);
+                }
+                Ok(n) if &buf[..n] == protocol::OPEN_NET_RO.as_bytes() => {
+                    self.open_net_service(true);
+                }
+                Ok(n) if &buf[..n] == protocol::OPEN_WLAN.as_bytes() => {
+                    self.open_wlan_service(false);
+                }
+                Ok(n) if &buf[..n] == protocol::OPEN_WLAN_RO.as_bytes() => {
+                    self.open_wlan_service(true);
+                }
                 Ok(n) if &buf[..n] == protocol::QUERY_PCI.as_bytes() => {
                     if let Some(reg) = self.registry_channel.as_ref() {
                         self.reply_query_pci_on(reg);
@@ -2197,6 +2310,106 @@ impl DriverManager {
             .open_system_volume(registry, nvme_bootstrap, nvme_online);
     }
 
+    fn open_net_service_on(
+        net_service: Option<&ManagedHost>,
+        net_failed: bool,
+        reply_ch: &Channel,
+        read_only: bool,
+    ) {
+        if net_failed {
+            let _ = reply_ch.write(protocol::NET_UNAVAILABLE.as_bytes());
+            return;
+        }
+        let Some(net) = net_service else {
+            let _ = reply_ch.write(protocol::NET_UNAVAILABLE.as_bytes());
+            return;
+        };
+        let attach_lbl = if read_only {
+            protocol::ATTACH_NET_CLIENT_RO.as_bytes()
+        } else {
+            protocol::ATTACH_NET_CLIENT.as_bytes()
+        };
+        match Channel::pair() {
+            Ok((client_end, server_end)) => {
+                if net
+                    .bootstrap
+                    .write_handle(attach_lbl, server_end.into_handle())
+                    .is_err()
+                {
+                    let _ = reply_ch.write(protocol::NET_UNAVAILABLE.as_bytes());
+                    return;
+                }
+                let _ = reply_ch
+                    .write_handle(protocol::NET_CHANNEL.as_bytes(), client_end.into_handle());
+            }
+            Err(_) => {
+                let _ = reply_ch.write(protocol::NET_UNAVAILABLE.as_bytes());
+            }
+        }
+    }
+
+    fn open_net_service(&mut self, read_only: bool) {
+        let Some(registry) = self.registry_channel.as_ref() else {
+            return;
+        };
+        Self::open_net_service_on(
+            self.net_service.as_ref(),
+            self.net_failed,
+            registry,
+            read_only,
+        );
+    }
+
+    fn open_wlan_service_on(
+        wlan_service: Option<&ManagedHost>,
+        wlan_failed: bool,
+        reply_ch: &Channel,
+        read_only: bool,
+    ) {
+        if wlan_failed {
+            let _ = reply_ch.write(protocol::WLAN_UNAVAILABLE.as_bytes());
+            return;
+        }
+        let Some(wlan) = wlan_service else {
+            let _ = reply_ch.write(protocol::WLAN_UNAVAILABLE.as_bytes());
+            return;
+        };
+        let attach_lbl = if read_only {
+            protocol::ATTACH_WLAN_CLIENT_RO.as_bytes()
+        } else {
+            protocol::ATTACH_WLAN_CLIENT.as_bytes()
+        };
+        match Channel::pair() {
+            Ok((client_end, server_end)) => {
+                if wlan
+                    .bootstrap
+                    .write_handle(attach_lbl, server_end.into_handle())
+                    .is_err()
+                {
+                    let _ = reply_ch.write(protocol::WLAN_UNAVAILABLE.as_bytes());
+                    return;
+                }
+                let _ = reply_ch
+                    .write_handle(protocol::WLAN_CHANNEL.as_bytes(), client_end.into_handle());
+            }
+            Err(_) => {
+                let _ = reply_ch.write(protocol::WLAN_UNAVAILABLE.as_bytes());
+            }
+        }
+    }
+
+    fn open_wlan_service(&mut self, read_only: bool) {
+        let Some(registry) = self.registry_channel.as_ref() else {
+            return;
+        };
+        Self::open_wlan_service_on(
+            self.wlan_service.as_ref(),
+            self.wlan_failed,
+            registry,
+            read_only,
+        );
+    }
+
     fn open_query_channel(&mut self) {
         if !self.query_channels.iter().any(|c| c.is_none()) {
             self.poll_query_channels();
@@ -2245,6 +2458,42 @@ impl DriverManager {
                         }
                         Ok(n) if &buf[..n] == protocol::QUERY_PS.as_bytes() => {
                             self.reply_query_ps_on(ch);
+                            served = true;
+                        }
+                        Ok(n) if &buf[..n] == protocol::OPEN_NET.as_bytes() => {
+                            Self::open_net_service_on(
+                                self.net_service.as_ref(),
+                                self.net_failed,
+                                ch,
+                                false,
+                            );
+                            served = true;
+                        }
+                        Ok(n) if &buf[..n] == protocol::OPEN_NET_RO.as_bytes() => {
+                            Self::open_net_service_on(
+                                self.net_service.as_ref(),
+                                self.net_failed,
+                                ch,
+                                true,
+                            );
+                            served = true;
+                        }
+                        Ok(n) if &buf[..n] == protocol::OPEN_WLAN.as_bytes() => {
+                            Self::open_wlan_service_on(
+                                self.wlan_service.as_ref(),
+                                self.wlan_failed,
+                                ch,
+                                false,
+                            );
+                            served = true;
+                        }
+                        Ok(n) if &buf[..n] == protocol::OPEN_WLAN_RO.as_bytes() => {
+                            Self::open_wlan_service_on(
+                                self.wlan_service.as_ref(),
+                                self.wlan_failed,
+                                ch,
+                                true,
+                            );
                             served = true;
                         }
                         Ok(_) => {
@@ -2484,6 +2733,36 @@ impl DriverManager {
                 self.pci_manager_restart.failures()
             );
         }
+        if let Some(h) = self.net_service.as_ref() {
+            let _ = writeln!(
+                out,
+                "{:#x}\tnet-service\t{}\t{}\t0",
+                h.process.koid().unwrap_or(0),
+                if self.net_ready {
+                    "online"
+                } else if self.net_failed {
+                    "failed"
+                } else {
+                    "starting"
+                },
+                self.net_generation
+            );
+        }
+        if let Some(h) = self.wlan_service.as_ref() {
+            let _ = writeln!(
+                out,
+                "{:#x}\twlan-service\t{}\t{}\t0",
+                h.process.koid().unwrap_or(0),
+                if self.wlan_ready {
+                    "online"
+                } else if self.wlan_failed {
+                    "failed"
+                } else {
+                    "starting"
+                },
+                self.wlan_generation
+            );
+        }
         let _ = registry.write(out.as_bytes());
     }
 
@@ -2659,6 +2938,78 @@ impl DriverManager {
         }
     }
 
+    fn poll_net_service(&mut self) {
+        let Some(host) = self.net_service.take() else {
+            return;
+        };
+        let mut buf = [0u8; 64];
+        let mut budget = POLL_BUDGET_PER_TICK;
+        loop {
+            let Some(rem) = budget.checked_sub(1) else {
+                self.net_service = Some(host);
+                return;
+            };
+            budget = rem;
+            match host.bootstrap.read_into(&mut buf) {
+                Ok(n) if &buf[..n] == protocol::NET_READY.as_bytes() => {
+                    println!("[driver-manager] net-service reported ready");
+                    self.net_ready = true;
+                    self.net_failed = false;
+                }
+                Ok(_) => {}
+                Err(ErrorCode::ShouldWait) => {
+                    self.net_service = Some(host);
+                    return;
+                }
+                Err(err) => {
+                    println!(
+                        "[driver-manager] net-service channel closed: {}",
+                        err.as_str()
+                    );
+                    self.net_failed = true;
+                    self.net_ready = false;
+                    return;
+                }
+            }
+        }
+    }
+
+    fn poll_wlan_service(&mut self) {
+        let Some(host) = self.wlan_service.take() else {
+            return;
+        };
+        let mut buf = [0u8; 64];
+        let mut budget = POLL_BUDGET_PER_TICK;
+        loop {
+            let Some(rem) = budget.checked_sub(1) else {
+                self.wlan_service = Some(host);
+                return;
+            };
+            budget = rem;
+            match host.bootstrap.read_into(&mut buf) {
+                Ok(n) if &buf[..n] == protocol::WLAN_READY.as_bytes() => {
+                    println!("[driver-manager] wlan-service reported ready");
+                    self.wlan_ready = true;
+                    self.wlan_failed = false;
+                }
+                Ok(_) => {}
+                Err(ErrorCode::ShouldWait) => {
+                    self.wlan_service = Some(host);
+                    return;
+                }
+                Err(err) => {
+                    println!(
+                        "[driver-manager] wlan-service channel closed: {}",
+                        err.as_str()
+                    );
+                    self.wlan_failed = true;
+                    self.wlan_ready = false;
+                    return;
+                }
+            }
+        }
+    }
+
     fn poll_pci_manager(&mut self) {
         let Some(host) = self.pci_manager.take() else {
             return;
@@ -2791,6 +3142,8 @@ impl DriverManager {
                                 "[driver-manager] PCI diagnostic inventory published: {} function(s) (FirmwareResourcesUnavailable)",
                                 message.detail
                             );
+                            self.pci_bindings_settled = true;
+                            self.try_start_pending_hosts();
                         }
                         (pci_manager::Opcode::DriverBindingPublished, pci_manager::Status::Ok) => {
                             println!(
@@ -2799,12 +3152,13 @@ impl DriverManager {
                                 self.pci_bound_leases_len,
                                 self.pci_bound_resources_len
                             );
+                            self.pci_bindings_settled = true;
                             if !self.storage_off && self.nvme_lease_ro.is_some() {
                                 self.mark_driver_grants_ready(NVME_DRIVER_NAME);
-                                self.try_start_pending_hosts();
                             } else if !self.storage_off {
                                 self.storage_skipped_pending = true;
                             }
+                            self.try_start_pending_hosts();
                         }
                         (pci_manager::Opcode::Heartbeat, _) => {}
                         _ => println!("[driver-manager] unexpected PCI manager control message"),

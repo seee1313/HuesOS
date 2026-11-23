@@ -26,6 +26,22 @@ pub enum FbAccess {
     ReadOnly,
 }
 
+/// Network service capability access level (`@caps(net=none|ro|rw)`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NetAccess {
+    None,
+    ReadOnly,
+    ReadWrite,
+}
+
+/// WLAN service capability access level (`@caps(wlan=none|ro|admin)`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WlanAccess {
+    None,
+    ReadOnly,
+    Admin,
+}
+
 /// Scoped HxFS directory grant (`@caps(dir=/subpath:ro)`).
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DirGrant {
@@ -41,6 +57,8 @@ pub struct CapsSpec {
     pub fb: FbAccess,
     pub block_rw: bool,
     pub dir: Option<DirGrant>,
+    pub net: NetAccess,
+    pub wlan: WlanAccess,
 }
 
 impl Default for CapsSpec {
@@ -51,6 +69,8 @@ impl Default for CapsSpec {
             fb: FbAccess::ReadOnly,
             block_rw: true,
             dir: None,
+            net: NetAccess::ReadWrite,
+            wlan: WlanAccess::Admin,
         }
     }
 }
@@ -82,6 +102,16 @@ impl CapsSpec {
             if dir.read_only {
                 mask &= !caps_mask::HXFS_RW;
             }
+        }
+        match self.net {
+            NetAccess::None => {}
+            NetAccess::ReadOnly => mask |= caps_mask::NET_RO,
+            NetAccess::ReadWrite => mask |= caps_mask::NET_RO | caps_mask::NET_RW,
+        }
+        match self.wlan {
+            WlanAccess::None => {}
+            WlanAccess::ReadOnly => mask |= caps_mask::WLAN_RO,
+            WlanAccess::Admin => mask |= caps_mask::WLAN_RO | caps_mask::WLAN_ADMIN,
         }
         mask
     }
@@ -133,6 +163,22 @@ impl CapsSpec {
                         "none" => FbAccess::None,
                         "ro" => FbAccess::ReadOnly,
                         _ => return Err(alloc::format!("invalid fb cap '{val}'")),
+                    };
+                }
+                "net" => {
+                    out.net = match val {
+                        "none" => NetAccess::None,
+                        "ro" => NetAccess::ReadOnly,
+                        "rw" => NetAccess::ReadWrite,
+                        _ => return Err(alloc::format!("invalid net cap '{val}'")),
+                    };
+                }
+                "wlan" => {
+                    out.wlan = match val {
+                        "none" => WlanAccess::None,
+                        "ro" => WlanAccess::ReadOnly,
+                        "admin" | "rw" => WlanAccess::Admin,
+                        _ => return Err(alloc::format!("invalid wlan cap '{val}'")),
                     };
                 }
                 "dir" => {

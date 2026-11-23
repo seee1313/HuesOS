@@ -35,6 +35,7 @@ struct SupervisedMeta {
 struct ProcessSummary {
     koid: u64,
     name: String,
+    abi: &'static str,
     best_state: u8,
     cpu: u16,
     threads: usize,
@@ -123,7 +124,7 @@ fn run() -> i32 {
     };
 
     if show_all_threads {
-        cu::outln("koid\ttask_id\tname\tdomain\tstate\tcpu\tpolicy");
+        cu::outln("koid\ttask_id\tname\tdomain\tabi\tstate\tcpu\tpolicy");
         for r in &records {
             let koid_col = if r.process_koid() == 0 {
                 String::from("0")
@@ -133,11 +134,12 @@ fn run() -> i32 {
             let dom = if r.kind == 1 { "user" } else { "kernel" };
             let pol = if r.policy == 1 { "deadline" } else { "fair" };
             cu::outln(&format!(
-                "{}\t{:#x}\t{}\t{}\t{}\t{}\t{}",
+                "{}\t{:#x}\t{}\t{}\t{}\t{}\t{}\t{}",
                 koid_col,
                 r.task_id,
                 r.name_str(),
                 dom,
+                r.abi_str(),
                 r.state_str(),
                 r.cpu,
                 pol
@@ -156,11 +158,15 @@ fn run() -> i32 {
         let entry = procs.entry(koid).or_insert_with(|| ProcessSummary {
             koid,
             name: String::from(r.name_str()),
+            abi: r.abi_str(),
             best_state: r.state,
             cpu: r.cpu,
             threads: 0,
         });
         entry.threads += 1;
+        if r.abi_str() == "PE64" {
+            entry.abi = "PE64";
+        }
         if r.state < entry.best_state {
             entry.best_state = r.state;
             entry.cpu = r.cpu;
@@ -170,13 +176,14 @@ fn run() -> i32 {
         procs.entry(koid).or_insert_with(|| ProcessSummary {
             koid,
             name: sup.name.clone(),
+            abi: "ELF64",
             best_state: 2,
             cpu: 0,
             threads: 1,
         });
     }
 
-    cu::outln("koid\tname\tstate\tcpu\tthreads\tsupervisor");
+    cu::outln("koid\tname\tabi\tstate\tcpu\tthreads\tsupervisor");
     for (_, proc_row) in procs {
         let (name, sup_col) = if let Some(sup) = supervised.get(&proc_row.koid) {
             (
@@ -190,9 +197,10 @@ fn run() -> i32 {
             (proc_row.name.as_str(), String::from("-"))
         };
         cu::outln(&format!(
-            "{}\t{}\t{}\t{}\t{}\t{}",
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}",
             proc_row.koid,
             name,
+            proc_row.abi,
             state_str(proc_row.best_state),
             proc_row.cpu,
             proc_row.threads,

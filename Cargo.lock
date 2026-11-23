@@ -361,6 +361,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "huesos-ieee80211"
+version = "0.1.0"
+dependencies = [
+ "huesos-abi",
+]
+
+[[package]]
 name = "huesos-ioapic"
 version = "0.1.0"
 
@@ -397,6 +404,13 @@ name = "huesos-lifecycle"
 version = "0.1.0"
 
 [[package]]
+name = "huesos-net"
+version = "0.1.0"
+dependencies = [
+ "huesos-abi",
+]
+
+[[package]]
 name = "huesos-nvme"
 version = "0.1.0"
 dependencies = [
@@ -423,6 +437,10 @@ name = "huesos-pci"
 version = "0.1.0"
 
 [[package]]
+name = "huesos-pe"
+version = "0.1.0"
+
+[[package]]
 name = "huesos-pmm"
 version = "0.1.0"
 dependencies = [
@@ -437,6 +455,16 @@ version = "0.1.0"
 [[package]]
 name = "huesos-quota"
 version = "0.1.0"
+
+[[package]]
+name = "huesos-rtw88"
+version = "0.1.0"
+dependencies = [
+ "huesos-abi",
+ "huesos-ieee80211",
+ "huesos-net",
+ "huesos-wpa",
+]
 
 [[package]]
 name = "huesos-sched"
@@ -494,6 +522,15 @@ dependencies = [
 [[package]]
 name = "huesos-waitset"
 version = "0.1.0"
+
+[[package]]
+name = "huesos-wpa"
+version = "0.1.0"
+dependencies = [
+ "aes",
+ "huesos-ieee80211",
+ "subtle",
+]
 
 [[package]]
 name = "inout"

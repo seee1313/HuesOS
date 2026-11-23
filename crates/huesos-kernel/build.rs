@@ -79,6 +79,27 @@ fn main() {
         &hxfs_env,
         &hxfs_args_refs,
     );
+    let net_service = build_userspace_program(
+        &userspace_root,
+        "net-service",
+        "huesos-net-service",
+        profile,
+        &[],
+        &[],
+    );
+    let wlan_service_args: &[&str] = if boot_selftest {
+        &["--features", "boot-selftest"]
+    } else {
+        &[]
+    };
+    let wlan_service = build_userspace_program(
+        &userspace_root,
+        "wlan-service",
+        "huesos-wlan-service",
+        profile,
+        &[],
+        wlan_service_args,
+    );
     println!("cargo:rerun-if-env-changed=HUESOS_ACPI_RESTART_SMOKE");
     println!("cargo:rerun-if-env-changed=HUESOS_ACPI_BUDGET_SMOKE");
     println!("cargo:rerun-if-env-changed=HUESOS_KEY_BROKER_FEATURES");
@@ -174,6 +195,9 @@ fn main() {
     );
     let ld_huesos = build_ld_huesos(&userspace_root, profile);
     let libcanvas_so = build_libcanvas_so(&userspace_root, profile);
+    let ld_pe =
+        build_userspace_dynamic_program(&userspace_root, "ld-pe", "ld-pe", profile, &[], &[]);
+    let win64_dir = build_win64_runtime(&userspace_root, profile, boot_selftest);
     let doom =
         build_userspace_dynamic_program(&userspace_root, "doom", "huesos-doom", profile, &[], &[]);
     let fdisk = build_userspace_dynamic_program(
@@ -268,6 +292,8 @@ fn main() {
             input_driver_host: &input_driver_host,
             nvme_driver_host: &nvme_driver_host,
             hxfs_service: &hxfs_service,
+            net_service: &net_service,
+            wlan_service: &wlan_service,
             acpi_manager: &acpi_manager,
             pci_manager: &pci_manager,
             shutdown_broker: &shutdown_broker,
@@ -277,7 +303,9 @@ fn main() {
             hsh_bin: &hsh_bin,
             coreutils_dir: &coreutils_dir,
             ld_huesos: &ld_huesos,
+            ld_pe: &ld_pe,
             libcanvas_so: &libcanvas_so,
+            win64_dir: &win64_dir,
             smoke_plugin_so: smoke_plugin_so.as_deref(),
             boot_selftest,
         },
@@ -416,6 +444,8 @@ fn track_userspace_inputs(userspace_root: &Path) {
         "driver-host-input",
         "driver-host-nvme",
         "hxfs-service",
+        "net-service",
+        "wlan-service",
         "acpi-manager",
         "pci-manager",
         "shutdown-broker",
@@ -429,6 +459,7 @@ fn track_userspace_inputs(userspace_root: &Path) {
         "fault-probe",
         "dyn-rust-smoke",
         "ld-huesos",
+        "ld-pe",
     ] {
         println!(
             "cargo:rerun-if-changed={}",
@@ -472,6 +503,11 @@ fn track_userspace_inputs(userspace_root: &Path) {
         "crates/huesos-hxfs",
         "crates/huesos-abi",
         "crates/huesos-elf",
+        "crates/huesos-pe",
+        "crates/huesos-net",
+        "crates/huesos-ieee80211",
+        "crates/huesos-wpa",
+        "crates/huesos-rtw88",
         "crates/huesos-scudo",
         "crates/huesos-hsh",
         "crates/huesos-gpt",
@@ -479,6 +515,17 @@ fn track_userspace_inputs(userspace_root: &Path) {
         println!("cargo:rerun-if-changed={crate_dir}");
         println!("cargo:rerun-if-changed={crate_dir}/src");
     }
+    for sub in ["", "ntdll/src", "kernel32/src", "win-apps/src"] {
+        println!(
+            "cargo:rerun-if-changed={}",
+            userspace_root.join("win64-runtime").join(sub).display()
+        );
+    }
+    println!(
+        "cargo:rerun-if-changed={}",
+        userspace_root.join("x86_64-huesos-pe64.json").display()
+    );
+    println!("cargo:rerun-if-changed=../../third_party/firmware/rtw88/rtw8821c_fw.bin");
     println!(
         "cargo:rerun-if-changed={}",
         userspace_root.join("libcanvas").join("src").display()
@@ -689,6 +736,35 @@ fn build_ld_huesos(userspace_root: &Path, profile: &str) -> PathBuf {
         bin_path.display()
     );
     bin_path
+}
+
+fn build_win64_runtime(userspace_root: &Path, _profile: &str, boot_selftest: bool) -> PathBuf {
+    let program_dir = userspace_root.join("win64-runtime");
+    let target_dir = userspace_target_dir(&program_dir, &[]);
+    let mut command = Command::new(env::var("CARGO").unwrap_or_else(|_| "cargo".into()));
+    command
+        .current_dir(&program_dir)
+        .env_remove("RUSTFLAGS")
+        .env_remove("CARGO_ENCODED_RUSTFLAGS")
+        .args(["build", "--release"]);
+    if boot_selftest {
+        command.arg("--workspace");
+    } else {
+        command.args(["-p", "ntdll", "-p", "kernel32"]);
+    }
+    command.arg("--target-dir").arg(&target_dir);
+    let status = match command.status() {
+        Ok(s) => s,
+        Err(error) => {
+            eprintln!("failed to invoke cargo for win64-runtime PE32+ build: {error}");
+            std::process::exit(1);
+        }
+    };
+    if !status.success() {
+        eprintln!("building win64-runtime PE32+ workspace failed");
+        std::process::exit(1);
+    }
+    target_dir.join("x86_64-huesos-pe64").join("release")
 }
 
 fn build_libcanvas_so(userspace_root: &Path, profile: &str) -> PathBuf {
@@ -969,6 +1045,8 @@ struct BootfsInputs<'a> {
     input_driver_host: &'a Path,
     nvme_driver_host: &'a Path,
     hxfs_service: &'a Path,
+    net_service: &'a Path,
+    wlan_service: &'a Path,
     acpi_manager: &'a Path,
     pci_manager: &'a Path,
     shutdown_broker: &'a Path,
@@ -978,7 +1056,9 @@ struct BootfsInputs<'a> {
     hsh_bin: &'a Path,
     coreutils_dir: &'a Path,
     ld_huesos: &'a Path,
+    ld_pe: &'a Path,
     libcanvas_so: &'a Path,
+    win64_dir: &'a Path,
     smoke_plugin_so: Option<&'a Path>,
     boot_selftest: bool,
 }
@@ -1101,6 +1181,14 @@ fn build_bootfs_image(manifest_dir: &Path, inputs: BootfsInputs<'_>) -> PathBuf 
         BootFsFile {
             path: "/services/hxfs.elf",
             data: read_build_input(inputs.hxfs_service, "Hxfs service ELF"),
+        },
+        BootFsFile {
+            path: "/services/net.elf",
+            data: read_build_input(inputs.net_service, "net-service ELF"),
+        },
+        BootFsFile {
+            path: "/services/wlan.elf",
+            data: read_build_input(inputs.wlan_service, "wlan-service ELF"),
         },
         BootFsFile {
             path: "/services/acpi-manager.elf",
@@ -1291,12 +1379,47 @@ fn build_bootfs_image(manifest_dir: &Path, inputs: BootfsInputs<'_>) -> PathBuf 
             data: read_build_input(&inputs.coreutils_dir.join("dirname"), "dirname ELF"),
         },
         BootFsFile {
+            path: "/bin/ping.elf",
+            data: read_build_input(&inputs.coreutils_dir.join("ping"), "ping ELF"),
+        },
+        BootFsFile {
+            path: "/bin/curl.elf",
+            data: read_build_input(&inputs.coreutils_dir.join("curl"), "curl ELF"),
+        },
+        BootFsFile {
+            path: "/bin/netctl.elf",
+            data: read_build_input(&inputs.coreutils_dir.join("netctl"), "netctl ELF"),
+        },
+        BootFsFile {
+            path: "/bin/wlanctl.elf",
+            data: read_build_input(&inputs.coreutils_dir.join("wlanctl"), "wlanctl ELF"),
+        },
+        BootFsFile {
             path: "/lib/ld-huesos.so",
             data: read_build_input(inputs.ld_huesos, "ld-huesos.so"),
         },
         BootFsFile {
+            path: "/lib/ld-pe.so",
+            data: read_build_input(inputs.ld_pe, "ld-pe.so"),
+        },
+        BootFsFile {
             path: "/lib/libcanvas.so",
             data: read_build_input(inputs.libcanvas_so, "libcanvas.so"),
+        },
+        BootFsFile {
+            path: "/lib/ntdll.dll",
+            data: read_build_input(&inputs.win64_dir.join("ntdll.dll"), "ntdll.dll"),
+        },
+        BootFsFile {
+            path: "/lib/kernel32.dll",
+            data: read_build_input(&inputs.win64_dir.join("kernel32.dll"), "kernel32.dll"),
+        },
+        BootFsFile {
+            path: "/lib/firmware/rtw88/rtw8821c_fw.bin",
+            data: read_build_input(
+                &manifest_dir.join("../../third_party/firmware/rtw88/rtw8821c_fw.bin"),
+                "Realtek RTL8821CE firmware",
+            ),
         },
         BootFsFile {
             path: "/data/freedoom1.wad",
@@ -1310,6 +1433,18 @@ fn build_bootfs_image(manifest_dir: &Path, inputs: BootfsInputs<'_>) -> PathBuf 
         files.push(BootFsFile {
             path: "/bin/std-smoke.elf",
             data: read_build_input(&inputs.coreutils_dir.join("std-smoke"), "std-smoke ELF"),
+        });
+        files.push(BootFsFile {
+            path: "/bin/win-hello.exe",
+            data: read_build_input(&inputs.win64_dir.join("win-hello.exe"), "win-hello.exe"),
+        });
+        files.push(BootFsFile {
+            path: "/bin/win-threads.exe",
+            data: read_build_input(&inputs.win64_dir.join("win-threads.exe"), "win-threads.exe"),
+        });
+        files.push(BootFsFile {
+            path: "/bin/win-bench.exe",
+            data: read_build_input(&inputs.win64_dir.join("win-bench.exe"), "win-bench.exe"),
         });
     }
     if let Some(smoke_plugin_so) = inputs.smoke_plugin_so {
@@ -1338,7 +1473,10 @@ fn build_bootfs_hash_manifest(files: &[BootFsFile]) -> Vec<u8> {
     for file in files {
         let trusted = file.path.ends_with(".elf")
             || file.path.ends_with(".so")
+            || file.path.ends_with(".dll")
+            || file.path.ends_with(".exe")
             || file.path.ends_with(".hdriver")
+            || file.path == "/lib/firmware/rtw88/rtw8821c_fw.bin"
             || file.path == "/storage/boot-drivers.manifest";
         if !trusted {
             continue;

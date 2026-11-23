@@ -103,6 +103,10 @@ const KNOWN_COMMANDS: &[&str] = &[
     "nano",
     "btop",
     "schedctl",
+    "ping",
+    "curl",
+    "netctl",
+    "wlanctl",
     "sleep",
     "hsh",
 ];
@@ -167,6 +171,8 @@ extern "C" fn hsh_entry() -> ! {
     let frame_draw = take_cap_handle(CapKind::FrameDraw);
     let hxfs_svc = take_cap_handle(CapKind::HxfsService).map(Channel::from_handle);
     let block_dev = take_cap_handle(CapKind::BlockDev).map(Channel::from_handle);
+    let net_svc = take_cap_handle(CapKind::NetService).map(Channel::from_handle);
+    let wlan_svc = take_cap_handle(CapKind::WlanService).map(Channel::from_handle);
 
     if args.first().map(String::as_str) == Some("--interactive") {
         let stdin_ch = take_cap_handle(CapKind::Stdin).map(Channel::from_handle);
@@ -183,12 +189,14 @@ extern "C" fn hsh_entry() -> ! {
             frame_draw,
             Some(out_ch),
         );
+        host.set_net_wlan_caps(net_svc, wlan_svc);
         host.status_hook = Some(send_status_bar);
         run_interactive(in_ch, host);
     }
 
     // Batch / `-c` / script file mode.
     let mut host = HshHost::new_with_caps(registry, hxfs_svc, block_dev, bootfs, frame_draw, None);
+    host.set_net_wlan_caps(net_svc, wlan_svc);
     let mut env = ShellEnv::new();
 
     let script = if args.first().map(String::as_str) == Some("-c") {
@@ -1270,6 +1278,94 @@ impl InteractiveShell {
                 res.render_text()
             ),
             Err(e) => println!("[hsh] huesos-std smoke ERROR: {}", e),
+        }
+
+        // 10c2. Native Win64 PE32+ subsystem (`/lib/ld-pe.so` + `ntdll.dll` +
+        //       `kernel32.dll`): `win-hello.exe` exercises PEB/TEB via `gs:[...]`,
+        //       heap, VirtualAlloc/VirtualProtect W^X, dynamic `GetProcAddress`,
+        //       and console/file I/O; `win-threads.exe` exercises real Win32
+        //       threads, `CRITICAL_SECTION`, `SRWLOCK`, `CONDITION_VARIABLE`,
+        //       and `WaitOnAddress`.
+        match smoke_env.eval_script("win-hello --smoke", &mut self.host) {
+            Ok(res) if res.status == 0 && res.render_text().contains("[win-hello] PASS") => {
+                println!("[hsh] PE64 win-hello.exe OK");
+            }
+            Ok(res) => println!(
+                "[hsh] PE64 win-hello.exe FAILED status={} out={}",
+                res.status,
+                res.render_text()
+            ),
+            Err(e) => println!("[hsh] PE64 win-hello.exe ERROR: {e}"),
+        }
+        match smoke_env.eval_script("win-threads", &mut self.host) {
+            Ok(res) if res.status == 0 && res.render_text().contains("[win-threads] PASS") => {
+                println!("[hsh] PE64 win-threads.exe OK");
+            }
+            Ok(res) => println!(
+                "[hsh] PE64 win-threads.exe FAILED status={} out={}",
+                res.status,
+                res.render_text()
+            ),
+            Err(e) => println!("[hsh] PE64 win-threads.exe ERROR: {e}"),
+        }
+
+        // 10c3. Networking (`net-service` + `virtio-net` + DHCP/ICMP) and
+        //       IEEE 802.11 Wi-Fi (`wlan-service` + `rtw88` + WPA2-CCMP) + `@caps`.
+        match smoke_env.eval_script("netctl status", &mut self.host) {
+            Ok(res) if res.status == 0 && res.render_text().contains("virtio0") => {
+                if res.render_text().contains("10.0.2.") {
+                    match smoke_env.eval_script("ping -c 1 10.0.2.2", &mut self.host) {
+                        Ok(pr)
+                            if pr.status == 0
+                                && pr.render_text().contains("1 packets received") =>
+                        {
+                            println!("[hsh] netctl + ping 10.0.2.2 OK");
+                        }
+                        Ok(pr) => println!(
+                            "[hsh] ping 10.0.2.2 FAILED status={} out={}",
+                            pr.status,
+                            pr.render_text()
+                        ),
+                        Err(e) => println!("[hsh] ping 10.0.2.2 ERROR: {e}"),
+                    }
+                } else {
+                    println!("[hsh] netctl loopback-only OK");
+                }
+            }
+            Ok(res) => println!(
+                "[hsh] netctl status FAILED status={} out={}",
+                res.status,
+                res.render_text()
+            ),
+            Err(e) => println!("[hsh] netctl status ERROR: {e}"),
+        }
+
+        match smoke_env.eval_script(
+            "wlanctl -n 1 ; wlanctl tui -n 1 ; wlanctl scan ; wlanctl connect HuesOS-Lab-5G huesos-wifi-2026",
+            &mut self.host,
+        ) {
+            Ok(res)
+                if res.status == 0
+                    && res.render_text().contains("HuesOS Wi-Fi Studio")
+                    && res.render_text().contains("HuesOS-Lab-5G")
+                    && res.render_text().contains("state=connected") =>
+            {
+                println!("[hsh] wlanctl scan + WPA2 connect OK");
+            }
+            Ok(res) => println!(
+                "[hsh] wlanctl WPA2 smoke FAILED status={} out={}",
+                res.status,
+                res.render_text()
+            ),
+            Err(e) => println!("[hsh] wlanctl WPA2 smoke ERROR: {e}"),
+        }
+
+        let ro_net = smoke_env.eval_script("@caps(net=ro) ping -c 1 127.0.0.1", &mut self.host);
+        let ro_wlan = smoke_env.eval_script("@caps(wlan=ro) wlanctl disconnect", &mut self.host);
+        if ro_net.is_ok_and(|r| r.status != 0) && ro_wlan.is_ok_and(|r| r.status != 0) {
+            println!("[hsh] @caps(net=ro,wlan=ro) enforcement OK");
+        } else {
+            println!("[hsh] @caps(net=ro,wlan=ro) enforcement FAILED");
         }
 
         // 10d. `/bin/df.elf` is the smallest of the new disk utilities: it

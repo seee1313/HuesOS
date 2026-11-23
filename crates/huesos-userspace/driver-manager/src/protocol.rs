@@ -145,3 +145,31 @@ pub const QUERY_PS: &str = "query:ps";
 pub const OPEN_QUERY: &str = "open:query";
 /// DriverManager returns a read-only query channel handle.
 pub const QUERY_CHANNEL: &str = "service:query:channel";
+/// Client asks DriverManager to open a full-access (`net=rw`) `net-service` channel.
+pub const OPEN_NET: &str = "open:net";
+/// Client asks DriverManager to open a read-only (`net=ro`) `net-service` channel.
+pub const OPEN_NET_RO: &str = "open:net:ro";
+/// DriverManager responds with a `net-service` channel.
+pub const NET_CHANNEL: &str = "service:net:channel";
+/// `net-service` is not currently available.
+pub const NET_UNAVAILABLE: &str = "err:net-unavailable";
+/// DriverManager attaches a RW client channel to `net-service`.
+pub const ATTACH_NET_CLIENT: &str = "net-client";
+/// DriverManager attaches a RO client channel to `net-service`.
+pub const ATTACH_NET_CLIENT_RO: &str = "net-client:ro";
+/// `net-service` reported ready.
+pub const NET_READY: &str = "service:net:ready";
+/// Client asks DriverManager to open an admin (`wlan=admin`) `wlan-service` channel.
+pub const OPEN_WLAN: &str = "open:wlan";
+/// Client asks DriverManager to open a read-only (`wlan=ro`) `wlan-service` channel.
+pub const OPEN_WLAN_RO: &str = "open:wlan:ro";
+/// DriverManager responds with a `wlan-service` channel.
+pub const WLAN_CHANNEL: &str = "service:wlan:channel";
+/// `wlan-service` is not currently available.
+pub const WLAN_UNAVAILABLE: &str = "err:wlan-unavailable";
+/// DriverManager attaches an admin client channel to `wlan-service`.
+pub const ATTACH_WLAN_CLIENT: &str = "wlan-client";
+/// DriverManager attaches a RO client channel to `wlan-service`.
+pub const ATTACH_WLAN_CLIENT_RO: &str = "wlan-client:ro";
+/// `wlan-service` reported ready.
+pub const WLAN_READY: &str = "service:wlan:ready";

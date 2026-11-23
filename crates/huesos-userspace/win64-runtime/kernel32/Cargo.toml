@@ -1,0 +1,11 @@
+[package]
+name = "kernel32"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "kernel32"
+crate-type = ["cdylib"]
+
+[dependencies]
+huesos-pe = { path = "../../../huesos-pe" }

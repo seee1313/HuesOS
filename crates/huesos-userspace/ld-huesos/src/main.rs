@@ -26,11 +26,13 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use huesos_abi::auxv::{
     caps_mask, AuxEntry, AT_BASE, AT_ENTRY, AT_HUESOS_BLOCK_DEV, AT_HUESOS_CAPS_MASK,
     AT_HUESOS_FRAME_DRAW, AT_HUESOS_HXFS_DIR, AT_HUESOS_HXFS_SERVICE, AT_HUESOS_LD_BOOTSTRAP,
-    AT_HUESOS_LIB_VMO, AT_HUESOS_REGISTRY, AT_HUESOS_STDERR, AT_HUESOS_STDIN, AT_HUESOS_STDOUT,
-    AT_NULL, AT_PHDR, AT_PHENT, AT_PHNUM, LD_BOOTSTRAP_BLOCK_DEV_LABEL,
+    AT_HUESOS_LIB_VMO, AT_HUESOS_NET_SERVICE, AT_HUESOS_PE_LEN, AT_HUESOS_PE_OFFSET,
+    AT_HUESOS_PE_VMO, AT_HUESOS_REGISTRY, AT_HUESOS_STDERR, AT_HUESOS_STDIN, AT_HUESOS_STDOUT,
+    AT_HUESOS_WLAN_SERVICE, AT_NULL, AT_PHDR, AT_PHENT, AT_PHNUM, LD_BOOTSTRAP_BLOCK_DEV_LABEL,
     LD_BOOTSTRAP_FRAME_DRAW_LABEL, LD_BOOTSTRAP_HXFS_DIR_LABEL, LD_BOOTSTRAP_HXFS_SERVICE_LABEL,
-    LD_BOOTSTRAP_LIB_VMO_LABEL, LD_BOOTSTRAP_REGISTRY_LABEL, LD_BOOTSTRAP_SELF_VMAR_LABEL,
-    LD_BOOTSTRAP_STDERR_LABEL, LD_BOOTSTRAP_STDIN_LABEL, LD_BOOTSTRAP_STDOUT_LABEL,
+    LD_BOOTSTRAP_LIB_VMO_LABEL, LD_BOOTSTRAP_NET_SERVICE_LABEL, LD_BOOTSTRAP_PE_VMO_LABEL,
+    LD_BOOTSTRAP_REGISTRY_LABEL, LD_BOOTSTRAP_SELF_VMAR_LABEL, LD_BOOTSTRAP_STDERR_LABEL,
+    LD_BOOTSTRAP_STDIN_LABEL, LD_BOOTSTRAP_STDOUT_LABEL, LD_BOOTSTRAP_WLAN_SERVICE_LABEL,
 };
 use huesos_abi::{
     rights, vmar_flags, vmo_create_flags, HandleValue, USER_HEAP_BASE, USER_HEAP_SIZE,
@@ -490,6 +492,11 @@ struct AuxInfo {
     expect_block_dev: bool,
     expect_frame_draw: bool,
     expect_registry: bool,
+    expect_net_service: bool,
+    expect_wlan_service: bool,
+    expect_pe_vmo: bool,
+    pe_offset: u64,
+    pe_len: u64,
     caps_mask: u64,
 }
 
@@ -502,7 +509,7 @@ fn parse_auxv(sp: *const u64) -> Option<AuxInfo> {
         argv: ptr::null(),
         phdr: 0,
         phent: 0,
-        phnum: 0,
+        phnum: u64::default(),
         base: 0,
         entry: 0,
         ld_bootstrap: false,
@@ -515,6 +522,11 @@ fn parse_auxv(sp: *const u64) -> Option<AuxInfo> {
         expect_block_dev: false,
         expect_frame_draw: false,
         expect_registry: false,
+        expect_net_service: false,
+        expect_wlan_service: false,
+        expect_pe_vmo: false,
+        pe_offset: 0,
+        pe_len: 0,
         caps_mask: caps_mask::ALL_DEFAULT,
     };
     // SAFETY: stack was constructed by the parent process launcher per SysV ABI.
@@ -548,6 +560,11 @@ fn parse_auxv(sp: *const u64) -> Option<AuxInfo> {
                 AT_HUESOS_BLOCK_DEV => info.expect_block_dev = entry.a_val != 0,
                 AT_HUESOS_FRAME_DRAW => info.expect_frame_draw = entry.a_val != 0,
                 AT_HUESOS_REGISTRY => info.expect_registry = entry.a_val != 0,
+                AT_HUESOS_NET_SERVICE => info.expect_net_service = entry.a_val != 0,
+                AT_HUESOS_WLAN_SERVICE => info.expect_wlan_service = entry.a_val != 0,
+                AT_HUESOS_PE_VMO => info.expect_pe_vmo = entry.a_val != 0,
+                AT_HUESOS_PE_OFFSET => info.pe_offset = entry.a_val,
+                AT_HUESOS_PE_LEN => info.pe_len = entry.a_val,
                 _ => {}
             }
             aux = aux.add(1);
@@ -565,6 +582,10 @@ struct BootstrapExtras {
     block_dev_ch: u32,
     frame_draw_ch: u32,
     registry_ch: u32,
+    net_service_ch: u32,
+    wlan_service_ch: u32,
+    pe_vmo: u32,
+    pe_self_vmar: u32,
 }
 
 fn fail(msg: &str) -> ! {
@@ -791,6 +812,12 @@ fn register_process_ctx_into_libcanvas(
             frame_draw_ch: extras.frame_draw_ch,
             bootfs_vmo: app_bootfs_vmo,
             registry_ch: extras.registry_ch,
+            net_service_ch: extras.net_service_ch,
+            wlan_service_ch: extras.wlan_service_ch,
+            pe_vmo: extras.pe_vmo,
+            pe_self_vmar: extras.pe_self_vmar,
+            pe_offset: aux.pe_offset,
+            pe_len: aux.pe_len,
         };
         // SAFETY: `__huesos_set_process_ctx` in `libcanvas.so` matches this exact signature.
         let set_fn: unsafe extern "C" fn(*const ProcessBootstrapInfo) -> i32 =
@@ -820,6 +847,9 @@ fn receive_bootstrap_handles(
     let mut block_dev_h: Option<Handle> = None;
     let mut frame_draw_h: Option<Handle> = None;
     let mut registry_h: Option<Handle> = None;
+    let mut net_svc_h: Option<Handle> = None;
+    let mut wlan_svc_h: Option<Handle> = None;
+    let mut pe_vmo_h: Option<Handle> = None;
     let mut buf = [0u8; 64];
 
     while self_vmar.is_none()
@@ -832,6 +862,9 @@ fn receive_bootstrap_handles(
         || (aux.expect_block_dev && block_dev_h.is_none())
         || (aux.expect_frame_draw && frame_draw_h.is_none())
         || (aux.expect_registry && registry_h.is_none())
+        || (aux.expect_net_service && net_svc_h.is_none())
+        || (aux.expect_wlan_service && wlan_svc_h.is_none())
+        || (aux.expect_pe_vmo && pe_vmo_h.is_none())
     {
         match bootstrap.read_optional_handle(&mut buf) {
             Ok((n, Some(handle))) if &buf[..n] == LD_BOOTSTRAP_SELF_VMAR_LABEL => {
@@ -864,6 +897,15 @@ fn receive_bootstrap_handles(
             Ok((n, Some(handle))) if &buf[..n] == LD_BOOTSTRAP_REGISTRY_LABEL => {
                 registry_h = Some(handle);
             }
+            Ok((n, Some(handle))) if &buf[..n] == LD_BOOTSTRAP_NET_SERVICE_LABEL => {
+                net_svc_h = Some(handle);
+            }
+            Ok((n, Some(handle))) if &buf[..n] == LD_BOOTSTRAP_WLAN_SERVICE_LABEL => {
+                wlan_svc_h = Some(handle);
+            }
+            Ok((n, Some(handle))) if &buf[..n] == LD_BOOTSTRAP_PE_VMO_LABEL => {
+                pe_vmo_h = Some(handle);
+            }
             Ok((_n, _)) => {
                 fail("unexpected bootstrap message before dynamic link");
             }
@@ -880,6 +922,13 @@ fn receive_bootstrap_handles(
 
     let Some(vmar_h) = self_vmar else {
         fail("missing self_vmar bootstrap handle");
+    };
+    let pe_self_vmar = if aux.expect_pe_vmo {
+        vmar_h
+            .duplicate(rights::SAME_RIGHTS)
+            .map_or(INVALID_HANDLE, Handle::into_raw)
+    } else {
+        INVALID_HANDLE
     };
 
     let (rtld_hxfs_dir, app_hxfs_dir_ch) = match hxfs_dir {
@@ -903,6 +952,10 @@ fn receive_bootstrap_handles(
         block_dev_ch: block_dev_h.map_or(INVALID_HANDLE, Handle::into_raw),
         frame_draw_ch: frame_draw_h.map_or(INVALID_HANDLE, Handle::into_raw),
         registry_ch: registry_h.map_or(INVALID_HANDLE, Handle::into_raw),
+        net_service_ch: net_svc_h.map_or(INVALID_HANDLE, Handle::into_raw),
+        wlan_service_ch: wlan_svc_h.map_or(INVALID_HANDLE, Handle::into_raw),
+        pe_vmo: pe_vmo_h.map_or(INVALID_HANDLE, Handle::into_raw),
+        pe_self_vmar,
     };
 
     (

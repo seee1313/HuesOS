@@ -7,7 +7,8 @@ use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame};
 macro_rules! define_ioapic_handlers {
     ($(($name:ident, $vector:expr)),* $(,)?) => {
         $(
-            extern "x86-interrupt" fn $name(_frame: InterruptStackFrame) {
+            extern "x86-interrupt" fn $name(frame: InterruptStackFrame) {
+                let _gs = super::idt::SwapGsGuard::new(&frame);
                 dispatch_external_irq($vector);
             }
         )*

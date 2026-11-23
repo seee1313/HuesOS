@@ -1,0 +1,10 @@
+[package]
+name = "huesos-wpa"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+aes = { version = "0.8.4", default-features = false }
+subtle = { version = "2.6.1", default-features = false }
+huesos-ieee80211 = { path = "../huesos-ieee80211" }
