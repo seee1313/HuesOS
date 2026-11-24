@@ -5,6 +5,11 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
+# Standalone userspace crates are linted explicitly below; skip rebuilding and
+# linking all 20+ userspace ELF/PE images inside huesos-kernel/build.rs while
+# type-checking the kernel workspace.
+export HUESOS_CLIPPY_PLACEHOLDER_USERSPACE=1
+
 cargo clippy --workspace --lib --bins \
     -Z build-std=core,compiler_builtins,alloc \
     -Z build-std-features=compiler-builtins-mem -- -D warnings
