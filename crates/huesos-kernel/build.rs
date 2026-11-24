@@ -22,12 +22,6 @@ fn main() {
     println!("cargo:rerun-if-env-changed=CARGO_TARGET_DIR");
     println!("cargo:rerun-if-env-changed=HUESOS_BOOT_SELFTEST");
     println!("cargo:rerun-if-env-changed=HUESOS_LIFECYCLE_WAIT_STRESS");
-    let boot_selftest = env::var_os("CARGO_FEATURE_BOOT_SELFTEST").is_some()
-        || matches!(env::var("HUESOS_BOOT_SELFTEST").as_deref(), Ok("1"));
-    let lifecycle_wait_stress = env::var("HUESOS_LIFECYCLE_WAIT_STRESS")
-        .ok()
-        .filter(|value| matches!(value.as_str(), "32" | "256"))
-        .unwrap_or_else(|| "32".into());
 
     // Stage D bootloader key blob: the soak harness (and a real
     // bootloader chain later) feeds the volume key hex here; the
@@ -50,6 +44,13 @@ fn main() {
         println!("cargo:rustc-env=HUESOS_INIT_PATH={}", placeholder.display());
         return;
     }
+
+    let boot_selftest = env::var_os("CARGO_FEATURE_BOOT_SELFTEST").is_some()
+        || matches!(env::var("HUESOS_BOOT_SELFTEST").as_deref(), Ok("1"));
+    let lifecycle_wait_stress = env::var("HUESOS_LIFECYCLE_WAIT_STRESS")
+        .ok()
+        .filter(|value| matches!(value.as_str(), "32" | "256"))
+        .unwrap_or_else(|| "32".into());
 
     // The production HxFS service always contains AES-GCM, compression and
     // Hxblob engines; versioned on-disk policy roots decide whether they are
