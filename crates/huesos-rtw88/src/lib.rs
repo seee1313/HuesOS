@@ -765,8 +765,8 @@ mod tests {
             regs[0x0100] = 0xEA; // initial powered-off REG_CR
             regs[0x00F1] = 0x10; // cut B in REG_SYS_CFG1
             regs[0x1703] = 0x20; // LTECOEX_READY (1 << 29) in 0x1700
-            // Encode a valid Realtek 2-byte EFUSE packet for block 0x1A (`0xD0..0xD6` MAC):
-            // hdr1 = ((26 & 7) << 5) | 0x0F = 0x4F, hdr2 = ((26 >> 3) << 4) | 0x08 = 0x38
+                                 // Encode a valid Realtek 2-byte EFUSE packet for block 0x1A (`0xD0..0xD6` MAC):
+                                 // hdr1 = ((26 & 7) << 5) | 0x0F = 0x4F, hdr2 = ((26 >> 3) << 4) | 0x08 = 0x38
             let mut efuse_rom = [0xFFu8; 512];
             efuse_rom[0] = 0x4F;
             efuse_rom[1] = 0x38;

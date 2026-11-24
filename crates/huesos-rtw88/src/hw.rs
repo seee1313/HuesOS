@@ -296,6 +296,9 @@ const TX_QUEUE_QSEL: [u8; RTK_MAX_TX_QUEUE_NUM] = [
 pub trait Rtw88Dma {
     fn phys_base(&self) -> u32;
     fn len(&self) -> usize;
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
     fn read_bytes(&self, offset: usize, dst: &mut [u8]);
     fn write_bytes(&mut self, offset: usize, src: &[u8]);
     fn zero_range(&mut self, offset: usize, len: usize) {
@@ -1037,8 +1040,7 @@ impl Rtl8821ceHw {
         let pq_map: u16 = (2u16 << 4)  // VO -> NORMAL(2)
             | (2u16 << 6)  // VI -> NORMAL(2)
             | (1u16 << 8)  // BE -> LOW(1)
-            | (1u16 << 10) // BK -> LOW(1)
-            | (0u16 << 12) // MG -> EXTRA(0)
+            | (1u16 << 10) // BK -> LOW(1), MG -> EXTRA(0)
             | (3u16 << 14); // HI -> HIGH(3)
         mmio.write16(REG_TXDMA_PQ_MAP, pq_map);
         mmio.write8(REG_CR, 0);
@@ -2159,6 +2161,7 @@ impl Rtl8821ceHw {
     // 8-Queue PCIe TX & MPDU RX Ring Operations
     // -----------------------------------------------------------------------
 
+    #[allow(clippy::too_many_arguments)]
     fn tx_raw_ring<M: Rtw88Mmio, D: Rtw88Dma>(
         &mut self,
         mmio: &mut M,
