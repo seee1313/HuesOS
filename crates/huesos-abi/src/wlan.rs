@@ -321,12 +321,63 @@ pub struct WlanStatusSnapshot {
     pub ssid_len: u8,
     /// Connected SSID bytes.
     pub ssid: [u8; MAX_SSID_LEN],
+    /// Hardware bring-up diagnostic code (`0` = OK, non-zero = bring-up stage failure).
+    pub hw_diag: u8,
+    /// Live or last-observed `REG_MCUFW_CTRL` (`0x0080`) register value (`0xC078` when WCPU ready).
+    pub mcufw_ctrl: u16,
     /// Transmitted 802.11 MPDU count across the 8 hardware TX rings.
     pub tx_frames: u64,
     /// Received 802.11 MPDU count on the hardware RX ring.
     pub rx_frames: u64,
     /// Frames dropped due to CCMP MIC failure or replay-counter violation.
     pub ccmp_replay_drops: u64,
+}
+
+/// Hardware bring-up diagnostic stage codes reported in [`WlanStatusSnapshot::hw_diag`].
+pub mod hw_diag_code {
+    /// Hardware initialized cleanly (`REG_MCUFW_CTRL == 0xC078`) or no hardware bring-up attempted.
+    pub const OK: u8 = 0;
+    /// Firmware file `/lib/firmware/rtw88/rtw8821c_fw.bin` missing or header invalid.
+    pub const FW_BLOB_INVALID: u8 = 1;
+    /// `REG_SYS_CFG1` read `0xFFFF_FFFF` (PCIe MMIO BAR unreachable).
+    pub const MMIO_UNREACHABLE: u8 = 2;
+    /// `card_enable_flow_8821c` power-sequence poll timed out.
+    pub const PWR_SEQ_TIMEOUT: u8 = 3;
+    /// Indirect LTECoex register `0x1700` `LTECOEX_READY` poll timed out.
+    pub const LTECOEX_TIMEOUT: u8 = 4;
+    /// `BCNQ` reserved-page upload timed out polling `BIT_BCN_VALID_V1` (`REG_FIFOPAGE_CTRL_2`).
+    pub const RSVD_PAGE_BCN_TIMEOUT: u8 = 5;
+    /// Internal IDDMA transfer (`REG_DDMA_CH0CTRL`) timed out.
+    pub const IDDMA_TIMEOUT: u8 = 6;
+    /// Hardware DDMA firmware section checksum mismatch (`BIT_DDMACH0_CHKSUM_STS`).
+    pub const FW_CHECKSUM_BAD: u8 = 7;
+    /// WCPU3081 boot timed out polling `FW_READY` in `REG_MCUFW_CTRL`.
+    pub const WCPU_BOOT_TIMEOUT: u8 = 8;
+    /// TX FIFO `REG_AUTO_LLT_V1` initialization timed out.
+    pub const AUTO_LLT_TIMEOUT: u8 = 9;
+    /// DMA pool buffer too small or descriptor malformed.
+    pub const DMA_RING_INVALID: u8 = 10;
+    /// Firmware file `/lib/firmware/rtw88/rtw8821c_fw.bin` not found in initrd/HxFS.
+    pub const FW_FILE_MISSING: u8 = 11;
+
+    /// Human-readable short slug for `wlanctl status`.
+    pub const fn as_str(code: u8) -> &'static str {
+        match code {
+            OK => "ok",
+            FW_BLOB_INVALID => "fw-blob-invalid",
+            MMIO_UNREACHABLE => "mmio-unreachable",
+            PWR_SEQ_TIMEOUT => "pwr-seq-timeout",
+            LTECOEX_TIMEOUT => "ltecoex-timeout",
+            RSVD_PAGE_BCN_TIMEOUT => "rsvd-page-bcn-timeout",
+            IDDMA_TIMEOUT => "iddma-timeout",
+            FW_CHECKSUM_BAD => "fw-checksum-bad",
+            WCPU_BOOT_TIMEOUT => "wcpu-boot-timeout",
+            AUTO_LLT_TIMEOUT => "auto-llt-timeout",
+            DMA_RING_INVALID => "dma-ring-invalid",
+            FW_FILE_MISSING => "fw-file-missing",
+            _ => "hw-init-error",
+        }
+    }
 }
 
 impl WlanStatusSnapshot {
@@ -368,6 +419,8 @@ impl WlanStatusSnapshot {
         p[30..36].copy_from_slice(&self.bssid);
         p[36] = self.ssid_len.min(MAX_SSID_LEN as u8);
         p[37..37 + MAX_SSID_LEN].copy_from_slice(&self.ssid);
+        p[69] = self.hw_diag;
+        p[70..72].copy_from_slice(&self.mcufw_ctrl.to_le_bytes());
         p[72..80].copy_from_slice(&self.tx_frames.to_le_bytes());
         p[80..88].copy_from_slice(&self.rx_frames.to_le_bytes());
         p[88..96].copy_from_slice(&self.ccmp_replay_drops.to_le_bytes());
@@ -415,6 +468,8 @@ impl WlanStatusSnapshot {
             bssid,
             ssid_len: p[36].min(MAX_SSID_LEN as u8),
             ssid,
+            hw_diag: p[69],
+            mcufw_ctrl: read_u16(p, 70).ok_or(WlanStatus::InvalidRequest)?,
             tx_frames: read_u64(p, 72).ok_or(WlanStatus::InvalidRequest)?,
             rx_frames: read_u64(p, 80).ok_or(WlanStatus::InvalidRequest)?,
             ccmp_replay_drops: read_u64(p, 88).ok_or(WlanStatus::InvalidRequest)?,
@@ -630,6 +685,8 @@ mod tests {
             bssid: [0; 6],
             ssid_len: 4,
             ssid: [0; MAX_SSID_LEN],
+            hw_diag: hw_diag_code::RSVD_PAGE_BCN_TIMEOUT,
+            mcufw_ctrl: 0xC078,
             tx_frames: 10,
             rx_frames: 20,
             ccmp_replay_drops: 0,

@@ -413,12 +413,10 @@ where
                         let alloc_bytes = u64::from(op_info) * 8 + 8;
                         regs.set_rsp(regs.rsp().wrapping_add(alloc_bytes));
                     }
-                    UWOP_SET_FPREG => {
-                        if frame_reg != 0 && usize::from(frame_reg) < 16 {
-                            let new_rsp =
-                                regs.gpr[usize::from(frame_reg)].wrapping_sub(frame_scaled_off);
-                            regs.set_rsp(new_rsp);
-                        }
+                    UWOP_SET_FPREG if frame_reg != 0 && usize::from(frame_reg) < 16 => {
+                        let new_rsp =
+                            regs.gpr[usize::from(frame_reg)].wrapping_sub(frame_scaled_off);
+                        regs.set_rsp(new_rsp);
                     }
                     UWOP_SAVE_NONVOL => {
                         let scaled = u64::from(read_u16_le(mapped_image, slot_off + 2)?) * 8;

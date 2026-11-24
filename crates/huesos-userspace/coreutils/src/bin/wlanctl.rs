@@ -16,8 +16,8 @@ use alloc::vec::Vec;
 
 use huesos_abi::net::{iface_id, NetStatusSnapshot};
 use huesos_abi::wlan::{
-    MacPolicyMode, RegDomainCode, WlanBssInfo, WlanProfileSummary, WlanSecurity, WlanStateCode,
-    WlanStatusSnapshot,
+    hw_diag_code, MacPolicyMode, RegDomainCode, WlanBssInfo, WlanProfileSummary, WlanSecurity,
+    WlanStateCode, WlanStatusSnapshot,
 };
 use huesos_coreutils as cu;
 use huesos_std::io;
@@ -208,13 +208,23 @@ fn cmd_status() -> i32 {
     } else {
         String::from("rtw88 boot-selftest medium")
     };
+    let hw_diag_suffix = if st.adapter_present {
+        format!(
+            "  mcufw={:#06x}  diag={}",
+            st.mcufw_ctrl,
+            hw_diag_code::as_str(st.hw_diag)
+        )
+    } else {
+        String::new()
+    };
     cu::outln(&format!(
-        "wlan0: state={}  hw=\"{}\"  fw=v{}.{} (loaded={})",
+        "wlan0: state={}  hw=\"{}\"  fw=v{}.{} (loaded={}){}",
         st.state.as_str(),
         hw_mode,
         st.fw_version[0],
         st.fw_version[1],
-        st.firmware_loaded
+        st.firmware_loaded,
+        hw_diag_suffix
     ));
     if let Some(ns) = net_snap.as_ref() {
         let eth = &ns.ifaces[usize::from(iface_id::VIRTIO0)];
@@ -793,10 +803,8 @@ fn run_tui(max_frames: Option<u64>) -> i32 {
                         Key::Up | Key::Char(b'k') => {
                             app.selected = app.selected.saturating_sub(1);
                         }
-                        Key::Down | Key::Char(b'j') => {
-                            if app.selected + 1 < app.scan.len() {
-                                app.selected += 1;
-                            }
+                        Key::Down | Key::Char(b'j') if app.selected + 1 < app.scan.len() => {
+                            app.selected += 1;
                         }
                         Key::Char(b's') => {
                             app.refresh(true);

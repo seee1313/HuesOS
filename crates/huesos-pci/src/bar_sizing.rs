@@ -173,8 +173,7 @@ pub fn size_function_bars(
         address,
         header_kind,
         orig_cmd,
-        root_id,
-        apertures,
+        BarProbeRoot { root_id, apertures },
         out_resources,
         out_roms,
     );
@@ -199,16 +198,22 @@ pub fn size_function_bars(
     probe_res
 }
 
+#[derive(Copy, Clone)]
+struct BarProbeRoot<'a> {
+    root_id: u64,
+    apertures: &'a [RootAperture],
+}
+
 fn probe_bars_inner(
     transport: &mut impl ConfigReadWriteTransport,
     address: PciAddress,
     header_kind: HeaderKind,
     orig_cmd: u32,
-    root_id: u64,
-    apertures: &[RootAperture],
+    root: BarProbeRoot<'_>,
     out_resources: &mut Vec<FirmwareResource>,
     out_roms: &mut Vec<RomBarState>,
 ) -> Result<(), BarSizingError> {
+    let BarProbeRoot { root_id, apertures } = root;
     let bar_count: u8 = match header_kind {
         HeaderKind::Type0Endpoint => 6,
         HeaderKind::Type1Bridge => 2,

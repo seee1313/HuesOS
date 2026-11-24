@@ -517,7 +517,7 @@ fn run() -> i32 {
                 }
                 match resolve_redirect_url(&target, &loc) {
                     Ok(next_url) => {
-                        if matches!(status, 301 | 302 | 303)
+                        if matches!(status, 301..=303)
                             && !current_verb.eq_ignore_ascii_case("GET")
                             && !current_verb.eq_ignore_ascii_case("HEAD")
                         {

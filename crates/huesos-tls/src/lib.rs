@@ -277,7 +277,7 @@ impl<T: TlsTransport> TlsStream<T> {
         if next_type == HS_CERTIFICATE_REQUEST {
             client_cert_requested = true;
             if let Some(&ctx_len) = next_body.first() {
-                if 1 + usize::from(ctx_len) <= next_body.len() {
+                if usize::from(ctx_len) < next_body.len() {
                     client_cert_req_ctx.extend_from_slice(&next_body[1..1 + usize::from(ctx_len)]);
                 }
             }
@@ -770,9 +770,12 @@ fn read_exact_transport<T: TlsTransport>(
     Ok(())
 }
 
+type RawTlsRecord = ([u8; 5], Vec<u8>);
+type ParsedHandshakeMsg = (u8, Vec<u8>, Vec<u8>);
+
 fn read_raw_record_eof_ok<T: TlsTransport>(
     transport: &mut T,
-) -> Result<Option<([u8; 5], Vec<u8>)>, TlsError<T::Error>> {
+) -> Result<Option<RawTlsRecord>, TlsError<T::Error>> {
     let mut hdr = [0u8; 5];
     let mut pos = 0usize;
     while pos < 5 {
@@ -796,9 +799,7 @@ fn read_raw_record_eof_ok<T: TlsTransport>(
     Ok(Some((hdr, payload)))
 }
 
-fn read_raw_record<T: TlsTransport>(
-    transport: &mut T,
-) -> Result<([u8; 5], Vec<u8>), TlsError<T::Error>> {
+fn read_raw_record<T: TlsTransport>(transport: &mut T) -> Result<RawTlsRecord, TlsError<T::Error>> {
     read_raw_record_eof_ok(transport)?.ok_or(TlsError::UnexpectedEof)
 }
 
@@ -993,7 +994,7 @@ fn read_encrypted_handshake_msg<T: TlsTransport>(
     transport: &mut T,
     cipher: &mut TrafficCipher,
     hs_buf: &mut Vec<u8>,
-) -> Result<(u8, Vec<u8>, Vec<u8>), TlsError<T::Error>> {
+) -> Result<ParsedHandshakeMsg, TlsError<T::Error>> {
     while hs_buf.len() < 4 || hs_buf.len() < 4 + read_u24_be(&hs_buf[1..4]) {
         let (hdr, payload) = read_raw_record(transport)?;
         match hdr[0] {

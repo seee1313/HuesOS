@@ -280,7 +280,7 @@ fn base64_val(b: u8) -> Option<u8> {
 }
 
 fn base64_decode(src: &[u8]) -> Option<Vec<u8>> {
-    if src.len() % 4 != 0 {
+    if !src.len().is_multiple_of(4) {
         return None;
     }
     let mut out = Vec::with_capacity((src.len() / 4) * 3);
@@ -497,7 +497,7 @@ fn parse_digits(slice: &[u8]) -> Option<u32> {
 }
 
 fn is_leap_year(y: u32) -> bool {
-    (y % 4 == 0 && y % 100 != 0) || (y % 400 == 0)
+    (y.is_multiple_of(4) && !y.is_multiple_of(100)) || y.is_multiple_of(400)
 }
 
 fn ymd_hms_to_unix(year: u32, month: u32, day: u32, hour: u32, min: u32, sec: u32) -> Option<u64> {
@@ -526,8 +526,8 @@ fn ymd_hms_to_unix(year: u32, month: u32, day: u32, hour: u32, min: u32, sec: u3
     for y in 1970..year {
         days += if is_leap_year(y) { 366 } else { 365 };
     }
-    for m in 0..(month - 1) as usize {
-        days += u64::from(days_in_months[m]);
+    for &dim in days_in_months.iter().take((month - 1) as usize) {
+        days += u64::from(dim);
     }
     days += u64::from(day - 1);
     Some(days * 86_400 + u64::from(hour) * 3_600 + u64::from(min) * 60 + u64::from(sec.min(59)))

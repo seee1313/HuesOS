@@ -12,6 +12,7 @@
 //!   - `rsa_pss_rsae_sha256` (`0x0804`), `rsa_pss_rsae_sha384` (`0x0805`)
 //!   - `rsa_pkcs1_sha256` (`0x0401`), `rsa_pkcs1_sha384` (`0x0501`)
 
+use alloc::boxed::Box;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::cmp::Ordering;
@@ -187,8 +188,8 @@ pub fn ct_eq_slices(a: &[u8], b: &[u8]) -> bool {
 }
 
 enum AeadEngine {
-    Aes128(Aes128Gcm),
-    Aes256(Aes256Gcm),
+    Aes128(Box<Aes128Gcm>),
+    Aes256(Box<Aes256Gcm>),
 }
 
 /// TLS 1.3 per-direction record AEAD state (`key`, `iv`, 64-bit `seq`).
@@ -208,10 +209,10 @@ impl TrafficCipher {
         iv.copy_from_slice(&iv_vec);
         let engine = match suite {
             CipherSuite::Aes128GcmSha256 => {
-                AeadEngine::Aes128(Aes128Gcm::new_from_slice(&key).ok()?)
+                AeadEngine::Aes128(Box::new(Aes128Gcm::new_from_slice(&key).ok()?))
             }
             CipherSuite::Aes256GcmSha384 => {
-                AeadEngine::Aes256(Aes256Gcm::new_from_slice(&key).ok()?)
+                AeadEngine::Aes256(Box::new(Aes256Gcm::new_from_slice(&key).ok()?))
             }
         };
         Some(Self {
@@ -391,7 +392,7 @@ impl BigUint {
             None => return Self::zero(),
         };
         let trimmed = &bytes[first_nz..];
-        let num_limbs = (trimmed.len() + 7) / 8;
+        let num_limbs = trimmed.len().div_ceil(8);
         let mut limbs = Vec::with_capacity(num_limbs);
         let mut end = trimmed.len();
         while end > 0 {
@@ -411,10 +412,10 @@ impl BigUint {
         let mut out = vec![0u8; width];
         for (i, &limb) in self.limbs.iter().enumerate() {
             let be = limb.to_be_bytes();
-            for j in 0..8 {
+            for (j, &byte) in be.iter().enumerate() {
                 let byte_idx_from_right = i * 8 + (7 - j);
                 if byte_idx_from_right < width {
-                    out[width - 1 - byte_idx_from_right] = be[j];
+                    out[width - 1 - byte_idx_from_right] = byte;
                 }
             }
         }
@@ -1078,7 +1079,7 @@ fn rsa_raw_public_op(
     if !(1024..=8192).contains(&mod_bits) || !n.is_odd() || e.bit_len() < 2 || !e.is_odd() {
         return None;
     }
-    let k = (mod_bits + 7) / 8;
+    let k = mod_bits.div_ceil(8);
     if sig.len() != k {
         return None;
     }
@@ -1180,12 +1181,10 @@ pub fn rsa_verify_pss(
         return false;
     };
     let em_bits = mod_bits - 1;
-    let em_len = (em_bits + 7) / 8;
+    let em_len = em_bits.div_ceil(8);
     let k = full_em.len();
-    if em_len < k {
-        if full_em[..k - em_len].iter().any(|&b| b != 0) {
-            return false;
-        }
+    if em_len < k && full_em[..k - em_len].iter().any(|&b| b != 0) {
+        return false;
     }
     let em = &full_em[k - em_len..];
     let h_len = hash_alg.out_len();

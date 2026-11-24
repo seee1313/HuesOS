@@ -831,15 +831,13 @@ impl NetStack {
                 xid,
                 started_ms,
                 retries,
-            } if now_ms.saturating_sub(started_ms) >= 1_500 => {
-                if retries < 4 {
-                    self.dhcp = DhcpState::Discovering {
-                        xid,
-                        started_ms: now_ms,
-                        retries: retries + 1,
-                    };
-                    let _ = self.emit_dhcp_message(DHCP_DISCOVER, xid, None, None, tx_frames);
-                }
+            } if now_ms.saturating_sub(started_ms) >= 1_500 && retries < 4 => {
+                self.dhcp = DhcpState::Discovering {
+                    xid,
+                    started_ms: now_ms,
+                    retries: retries + 1,
+                };
+                let _ = self.emit_dhcp_message(DHCP_DISCOVER, xid, None, None, tx_frames);
             }
             DhcpState::Requesting {
                 xid,

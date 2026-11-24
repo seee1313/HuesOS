@@ -22,12 +22,6 @@ fn main() {
     println!("cargo:rerun-if-env-changed=CARGO_TARGET_DIR");
     println!("cargo:rerun-if-env-changed=HUESOS_BOOT_SELFTEST");
     println!("cargo:rerun-if-env-changed=HUESOS_LIFECYCLE_WAIT_STRESS");
-    let boot_selftest = env::var_os("CARGO_FEATURE_BOOT_SELFTEST").is_some()
-        || matches!(env::var("HUESOS_BOOT_SELFTEST").as_deref(), Ok("1"));
-    let lifecycle_wait_stress = env::var("HUESOS_LIFECYCLE_WAIT_STRESS")
-        .ok()
-        .filter(|value| matches!(value.as_str(), "32" | "256"))
-        .unwrap_or_else(|| "32".into());
 
     // Stage D bootloader key blob: the soak harness (and a real
     // bootloader chain later) feeds the volume key hex here; the
@@ -36,6 +30,27 @@ fn main() {
     // None and encrypted volumes cannot be mounted.
     emit_boot_key_blob();
     emit_hbi_verify_key();
+    println!("cargo:rerun-if-env-changed=HUESOS_CLIPPY_PLACEHOLDER_USERSPACE");
+    if env::var("HUESOS_CLIPPY_PLACEHOLDER_USERSPACE").as_deref() == Ok("1") {
+        let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap_or_default());
+        let placeholder = out_dir.join("clippy-placeholder-init.elf");
+        if let Err(error) = fs::write(&placeholder, [0x7f, b'E', b'L', b'F', 0, 0, 0, 0]) {
+            eprintln!(
+                "failed to write clippy placeholder init ELF {}: {error}",
+                placeholder.display()
+            );
+            std::process::exit(1);
+        }
+        println!("cargo:rustc-env=HUESOS_INIT_PATH={}", placeholder.display());
+        return;
+    }
+
+    let boot_selftest = env::var_os("CARGO_FEATURE_BOOT_SELFTEST").is_some()
+        || matches!(env::var("HUESOS_BOOT_SELFTEST").as_deref(), Ok("1"));
+    let lifecycle_wait_stress = env::var("HUESOS_LIFECYCLE_WAIT_STRESS")
+        .ok()
+        .filter(|value| matches!(value.as_str(), "32" | "256"))
+        .unwrap_or_else(|| "32".into());
 
     // The production HxFS service always contains AES-GCM, compression and
     // Hxblob engines; versioned on-disk policy roots decide whether they are
@@ -651,14 +666,23 @@ fn build_userspace_dynamic_program(
     )
 }
 
+fn cargo_userspace_command(dir: &Path) -> Command {
+    let mut command = Command::new(env::var("CARGO").unwrap_or_else(|_| "cargo".into()));
+    command
+        .current_dir(dir)
+        .env_remove("RUSTFLAGS")
+        .env_remove("CARGO_ENCODED_RUSTFLAGS")
+        .env_remove("RUSTC_WORKSPACE_WRAPPER")
+        .env_remove("RUSTC_WRAPPER")
+        .env_remove("CLIPPY_ARGS");
+    command
+}
+
 fn build_userspace_dynamic_bins(userspace_root: &Path, dir_name: &str, profile: &str) -> PathBuf {
     let program_dir = userspace_root.join(dir_name);
     let target_dir = userspace_target_dir(&program_dir, &[]);
-    let mut command = Command::new(env::var("CARGO").unwrap_or_else(|_| "cargo".into()));
+    let mut command = cargo_userspace_command(&program_dir);
     command
-        .current_dir(&program_dir)
-        .env_remove("RUSTFLAGS")
-        .env_remove("CARGO_ENCODED_RUSTFLAGS")
         .args(["build", "--release", "--bins", "--target-dir"])
         .arg(&target_dir);
     let status = match command.status() {
@@ -686,12 +710,8 @@ fn build_userspace_program_for_target(
 ) -> PathBuf {
     let program_dir = userspace_root.join(dir_name);
     let target_dir = userspace_target_dir(&program_dir, extra_args);
-    let mut command = Command::new(env::var("CARGO").unwrap_or_else(|_| "cargo".into()));
-    command
-        .current_dir(&program_dir)
-        .env_remove("RUSTFLAGS")
-        .env_remove("CARGO_ENCODED_RUSTFLAGS")
-        .args(["build", "--release"]);
+    let mut command = cargo_userspace_command(&program_dir);
+    command.args(["build", "--release"]);
     command.args(extra_args);
     for &(key, value) in extra_env {
         command.env(key, value);
@@ -723,11 +743,8 @@ fn build_userspace_program_for_target(
 fn build_ld_huesos(userspace_root: &Path, profile: &str) -> PathBuf {
     let program_dir = userspace_root.join("ld-huesos");
     let target_dir = userspace_target_dir(&program_dir, &[]);
-    let mut command = Command::new(env::var("CARGO").unwrap_or_else(|_| "cargo".into()));
+    let mut command = cargo_userspace_command(&program_dir);
     command
-        .current_dir(&program_dir)
-        .env_remove("RUSTFLAGS")
-        .env_remove("CARGO_ENCODED_RUSTFLAGS")
         .args(["build", "--release"])
         .arg("--target-dir")
         .arg(&target_dir);
@@ -754,12 +771,8 @@ fn build_ld_huesos(userspace_root: &Path, profile: &str) -> PathBuf {
 fn build_win64_runtime(userspace_root: &Path, _profile: &str, boot_selftest: bool) -> PathBuf {
     let program_dir = userspace_root.join("win64-runtime");
     let target_dir = userspace_target_dir(&program_dir, &[]);
-    let mut command = Command::new(env::var("CARGO").unwrap_or_else(|_| "cargo".into()));
-    command
-        .current_dir(&program_dir)
-        .env_remove("RUSTFLAGS")
-        .env_remove("CARGO_ENCODED_RUSTFLAGS")
-        .args(["build", "--release"]);
+    let mut command = cargo_userspace_command(&program_dir);
+    command.args(["build", "--release"]);
     if boot_selftest {
         command.arg("--workspace");
     } else {
@@ -811,11 +824,8 @@ fn build_libcanvas_so(userspace_root: &Path, profile: &str) -> PathBuf {
         None => lib_dir.join("target-cdylib"),
     };
     let ver_script = lib_dir.join("libcanvas.ver");
-    let mut command = Command::new(env::var("CARGO").unwrap_or_else(|_| "cargo".into()));
+    let mut command = cargo_userspace_command(&lib_dir);
     command
-        .current_dir(&lib_dir)
-        .env_remove("RUSTFLAGS")
-        .env_remove("CARGO_ENCODED_RUSTFLAGS")
         .args([
             "rustc",
             "--release",
