@@ -888,9 +888,8 @@ mod tests {
                     self.regs[direct..direct + 4].copy_from_slice(&rf_data.to_le_bytes());
                 }
             }
-            let b = val.to_le_bytes();
-            for i in 0..4 {
-                self.write8(off + i as u32, b[i]);
+            for (i, &byte) in val.to_le_bytes().iter().enumerate() {
+                self.write8(off + i as u32, byte);
             }
             // Simulate IQK completion in RF 0x08 when H2C IQK runs
             if off == 0x1320 || off == 0x0308 {
@@ -929,23 +928,44 @@ mod tests {
         assert_eq!(hw.last_mcufw_ctrl & 0xCFFF, 0xC078);
         assert_eq!(hw.efuse.mac_addr, [0x74, 0xD8, 0x3E, 0x88, 0x21, 0xCE]);
 
-        // Verify RX filter accepts 802.11 management + data frames (`BIT_AMF | BIT_RCR_ADF`)
+        // Verify RX filter matches Linux `rtw88` (`0xF410_400E`): `BIT_TA_BCN` (`BIT(11)`)
+        // MUST stay cleared so non-associated AP Beacons are not dropped, while `REG_RXFLTMAP0/2`
+        // accept all management and data subtypes.
         let rcr = bar2.read32(hw::REG_RCR);
-        assert_ne!(rcr & (1 << 13), 0);
-        assert_ne!(rcr & (1 << 11), 0);
+        assert_eq!(rcr, 0xF410_400E);
+        assert_eq!(rcr & (1 << 11), 0);
+        assert_eq!(bar2.read16(hw::REG_RXFLTMAP0), 0xFFFF);
+        assert_eq!(bar2.read16(hw::REG_RXFLTMAP2), 0xFFFF);
 
-        // Verify Wi-Fi-only LTECoex PTA ownership (`GNT_WL = 0x3`, `GNT_BT = 0x1`)
-        let lte38 = bar2.ltecoex_regs[(0x38 / 4) as usize];
-        assert_eq!((lte38 >> 14) & 0x3, 0x1);
-        assert_eq!((lte38 >> 10) & 0x3, 0x1);
-        assert_eq!((lte38 >> 12) & 0x3, 0x3);
-        assert_eq!((lte38 >> 8) & 0x3, 0x3);
+        // Verify 2.4 GHz internal RFE switch (`B_WL_SWITCH | B_WLG_SWITCH`), LNA (`0x7532`),
+        // calibrated TXAGC (`0x1D00 != 0`), external DPDT (`BIT_DPDT_WL_SEL`), and PTA Scoreboard
+        let rfectl_2g = bar2.read32(hw::REG_RFECTL);
+        assert_eq!(
+            rfectl_2g & ((1 << 20) | (1 << 21) | (1 << 22)),
+            (1 << 20) | (1 << 21) | (1 << 22)
+        );
+        assert_eq!(bar2.read32(hw::REG_ENTXCCK) & 0xFFFF, 0x7532);
+        assert_ne!(bar2.read32(hw::REG_TXAGC_A_BASE), 0);
+        assert_ne!(bar2.read32(hw::REG_LED_CFG) & (1 << 24), 0);
+        assert_eq!(
+            bar2.read8(hw::REG_CTRL_TYPE) & ((1 << 7) | (1 << 5) | (1 << 4)),
+            (1 << 5) | (1 << 4)
+        );
+        assert_eq!(bar2.read16(hw::REG_WIFI_BT_INFO), 0x8003);
 
-        // Tune to 5 GHz channel 36 (80 MHz) and check RF 0x18
+        // Tune to 5 GHz channel 36 (80 MHz) and check RF 0x18, `B_WLA_SWITCH`, and 5G PTA (`GNT_WL = 0x3`)
         hw.set_channel(&mut bar2, 36, 80);
         let rf18 = hw.read_rf(&bar2, 0x18, 0xFFFFF);
         assert_eq!(rf18 & 0xFF, 36);
         assert_ne!(rf18 & (1 << 16), 0); // 5 GHz band bit
+        let rfectl_5g = bar2.read32(hw::REG_RFECTL);
+        assert_eq!(
+            rfectl_5g & ((1 << 20) | (1 << 22) | (1 << 23)),
+            (1 << 20) | (1 << 22) | (1 << 23)
+        );
+        let lte38 = bar2.ltecoex_regs[(0x38 / 4) as usize];
+        assert_eq!((lte38 >> 14) & 0x3, 0x0); // GNT_BT = HW_PTA
+        assert_eq!((lte38 >> 12) & 0x3, 0x3); // GNT_WL = SW_HIGH on 5 GHz
 
         // Configure real SoftAP beacon
         let mut bcn = [0u8; 160];
