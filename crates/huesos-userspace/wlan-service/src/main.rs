@@ -15,7 +15,8 @@ use alloc::boxed::Box;
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;
 use core::panic::PanicInfo;
-use core::ptr::{copy_nonoverlapping, read_volatile, write_volatile};
+use core::ptr::{read_volatile, write_volatile};
+use core::sync::atomic::{fence, AtomicU64, Ordering};
 
 use huesos_abi::vmar_flags;
 use huesos_abi::wlan::{
@@ -175,10 +176,65 @@ fn rdrand_u64() -> Option<u64> {
     None
 }
 
+static TSC_CYCLES_PER_US: AtomicU64 = AtomicU64::new(0);
+
+fn calibrated_cycles_per_us() -> u64 {
+    let cached = TSC_CYCLES_PER_US.load(Ordering::Relaxed);
+    if cached != 0 {
+        return cached;
+    }
+    let fallback = 5_000u64;
+    let Ok(t0) = libcanvas::system::monotonic_ticks() else {
+        TSC_CYCLES_PER_US.store(fallback, Ordering::Relaxed);
+        return fallback;
+    };
+    // Align to next 100 Hz monotonic tick edge (`10_000 us` per tick)
+    let mut t_edge = t0;
+    let mut aligned = false;
+    for _ in 0..500_000 {
+        if let Ok(cur) = libcanvas::system::monotonic_ticks() {
+            if cur > t0 {
+                t_edge = cur;
+                aligned = true;
+                break;
+            }
+        } else {
+            break;
+        }
+        core::hint::spin_loop();
+    }
+    let measured = if aligned {
+        let tsc_start = rdtsc_u64();
+        let mut measured_ok = false;
+        let mut tsc_end = tsc_start;
+        for _ in 0..500_000 {
+            if let Ok(cur) = libcanvas::system::monotonic_ticks() {
+                if cur > t_edge {
+                    tsc_end = rdtsc_u64();
+                    measured_ok = true;
+                    break;
+                }
+            } else {
+                break;
+            }
+            core::hint::spin_loop();
+        }
+        if measured_ok {
+            (tsc_end.wrapping_sub(tsc_start) / 10_000).clamp(2_000, 6_500)
+        } else {
+            fallback
+        }
+    } else {
+        fallback
+    };
+    TSC_CYCLES_PER_US.store(measured, Ordering::Relaxed);
+    measured
+}
+
 fn delay_us_spin(us: u32) {
-    // ~2.5 GHz nominal TSC => ~2500 cycles/us
+    let cycles_per_us = calibrated_cycles_per_us();
     let start = rdtsc_u64();
-    let cycles = u64::from(us).saturating_mul(2_500);
+    let cycles = u64::from(us).saturating_mul(cycles_per_us);
     while rdtsc_u64().wrapping_sub(start) < cycles {
         core::hint::spin_loop();
     }
@@ -196,6 +252,9 @@ trait WlanHal {
     fn fw_version(&self) -> [u16; 2];
     fn factory_mac(&self) -> [u8; 6];
     fn thermal_and_xtal(&self) -> (u8, u8);
+    fn hw_diag_and_mcufw(&self) -> (u8, u16) {
+        (0, 0)
+    }
     fn set_mac_addr(&mut self, mac: &[u8; 6]);
     fn set_channel(&mut self, channel: u8, bw_mhz: u8);
     fn configure_sta_link(&mut self, bssid: &[u8; 6], linked: bool);
@@ -281,26 +340,41 @@ impl Rtw88Dma for MappedRtwDma {
     }
     fn read_bytes(&self, offset: usize, dst: &mut [u8]) {
         if offset.saturating_add(dst.len()) <= self.len {
-            // SAFETY: Bounds checked within `[self.va .. self.va + self.len)`.
+            fence(Ordering::SeqCst);
+            let src_ptr = (self.va + offset) as *const u8;
+            // SAFETY: Bounds checked within `[self.va .. self.va + self.len)`; volatile
+            // reads prevent elision/caching of PCIe bus-master DMA ring completions.
             unsafe {
-                copy_nonoverlapping((self.va + offset) as *const u8, dst.as_mut_ptr(), dst.len());
+                for (i, slot) in dst.iter_mut().enumerate() {
+                    *slot = read_volatile(src_ptr.add(i));
+                }
             }
+            fence(Ordering::SeqCst);
         }
     }
     fn write_bytes(&mut self, offset: usize, src: &[u8]) {
         if offset.saturating_add(src.len()) <= self.len {
-            // SAFETY: Bounds checked within `[self.va .. self.va + self.len)`.
+            let dst_ptr = (self.va + offset) as *mut u8;
+            // SAFETY: Bounds checked within `[self.va .. self.va + self.len)`; volatile
+            // writes + SeqCst fence publish TX/BCNQ descriptors before MMIO doorbell writes.
             unsafe {
-                copy_nonoverlapping(src.as_ptr(), (self.va + offset) as *mut u8, src.len());
+                for (i, &b) in src.iter().enumerate() {
+                    write_volatile(dst_ptr.add(i), b);
+                }
             }
+            fence(Ordering::SeqCst);
         }
     }
     fn zero_range(&mut self, offset: usize, len: usize) {
         if offset.saturating_add(len) <= self.len {
+            let dst_ptr = (self.va + offset) as *mut u8;
             // SAFETY: Bounds checked within `[self.va .. self.va + self.len)`.
             unsafe {
-                core::ptr::write_bytes((self.va + offset) as *mut u8, 0, len);
+                for i in 0..len {
+                    write_volatile(dst_ptr.add(i), 0);
+                }
             }
+            fence(Ordering::SeqCst);
         }
     }
 }
@@ -325,19 +399,34 @@ impl Rtw88Hal {
                         .map(|f| (f.version, f.subversion))
                         .unwrap_or((0, 0));
                     println!(
-                        "[wlan-service] RTL8821CE (10ec:c821) bdf={:#06x} online: mac={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} rfe={} xtal={:#04x} fw=v{}.{}",
-                        bdf, m[0], m[1], m[2], m[3], m[4], m[5],
-                        hw.efuse.rfe_option, hw.efuse.crystal_cap, fw_maj, fw_min
+                        "[wlan-service] RTL8821CE (10ec:c821) bdf={:#06x} online: mac={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} rfe={} xtal={:#04x} fw=v{}.{} mcufw={:#06x}",
+                        bdf,
+                        m[0],
+                        m[1],
+                        m[2],
+                        m[3],
+                        m[4],
+                        m[5],
+                        hw.efuse.rfe_option,
+                        hw.efuse.crystal_cap,
+                        fw_maj,
+                        fw_min,
+                        hw.last_mcufw_ctrl
                     );
                 }
                 Err(e) => {
                     println!(
-                        "[wlan-service] RTL8821CE (10ec:c821) bdf={:#06x} hardware bring-up error: {:?}",
-                        bdf, e
+                        "[wlan-service] RTL8821CE (10ec:c821) bdf={:#06x} hardware bring-up error: {:?} (diag={} mcufw={:#06x})",
+                        bdf,
+                        e,
+                        wlan::hw_diag_code::as_str(hw.last_diag),
+                        hw.last_mcufw_ctrl
                     );
                 }
             }
         } else {
+            hw.last_diag = wlan::hw_diag_code::FW_FILE_MISSING;
+            hw.last_mcufw_ctrl = mmio.read16(huesos_rtw88::hw::REG_MCUFW_CTRL);
             println!(
                 "[wlan-service] RTL8821CE (10ec:c821) bdf={:#06x} detected, but {} missing",
                 bdf, FW_PATH
@@ -377,6 +466,9 @@ impl WlanHal for Rtw88Hal {
     }
     fn thermal_and_xtal(&self) -> (u8, u8) {
         (42, self.hw.efuse.crystal_cap)
+    }
+    fn hw_diag_and_mcufw(&self) -> (u8, u16) {
+        (self.hw.last_diag, self.hw.last_mcufw_ctrl)
     }
     fn set_mac_addr(&mut self, mac: &[u8; 6]) {
         self.hw.program_mac_addr(&mut self.mmio, mac);
@@ -1586,8 +1678,15 @@ impl WlanRuntime {
                 if let Ok(n) = build_probe_request(self.active_mac, b"", seq, &mut buf) {
                     self.tx_mpdu(now_ms, &buf[..n]);
                 }
-                // Dwell ~25 ms pumping real RX ring for Beacons & ProbeResponses
-                for _ in 0..25 {
+                // Dwell ~45 ms per channel (22 * 45 ms = 990 ms < 4.0 s RPC timeout),
+                // sending a second wildcard ProbeRequest at 15 ms and pumping RX ring.
+                for step in 0..45u32 {
+                    if step == 15 {
+                        let seq2 = self.next_seq();
+                        if let Ok(n) = build_probe_request(self.active_mac, b"", seq2, &mut buf) {
+                            self.tx_mpdu(now_ms, &buf[..n]);
+                        }
+                    }
                     delay_us_spin(1_000);
                     self.pump_air(now_ms);
                 }
@@ -2326,6 +2425,7 @@ pub extern "C" fn _start() -> ! {
             match op {
                 WlanOp::Status => {
                     let (therm, xtal) = rt.hal.thermal_and_xtal();
+                    let (hw_diag, mcufw_ctrl) = rt.hal.hw_diag_and_mcufw();
                     let profiles_or_clients = if let Some(ap) = rt.softap.as_ref() {
                         ap.connected_count()
                     } else {
@@ -2351,6 +2451,8 @@ pub extern "C" fn _start() -> ! {
                         bssid: rt.bssid,
                         ssid_len: rt.ssid_len,
                         ssid: rt.ssid,
+                        hw_diag,
+                        mcufw_ctrl,
                         tx_frames: rt.tx_frames,
                         rx_frames: rt.rx_frames,
                         ccmp_replay_drops: rt.ccmp_replay_drops,

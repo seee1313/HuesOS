@@ -64,9 +64,37 @@ pub enum RtwError {
     TruncatedFirmware,
     InvalidFirmwareMagic(u16),
     FirmwareSectionOutOfBounds,
+    MmioUnreachable,
+    PwrSeqTimeout,
+    LteCoexTimeout,
+    RsvdPageBcnValidTimeout,
+    IddmaTimeout,
+    FirmwareChecksumMismatch,
+    WcpuBootTimeout,
+    AutoLltTimeout,
     HardwareTimeout,
     RingFull,
     MalformedDescriptor,
+}
+
+impl RtwError {
+    /// Map to wire diagnostic stage code (`huesos_abi::wlan::hw_diag_code`).
+    pub const fn diag_code(self) -> u8 {
+        match self {
+            Self::TruncatedFirmware
+            | Self::InvalidFirmwareMagic(_)
+            | Self::FirmwareSectionOutOfBounds => 1,
+            Self::MmioUnreachable => 2,
+            Self::PwrSeqTimeout => 3,
+            Self::LteCoexTimeout => 4,
+            Self::RsvdPageBcnValidTimeout => 5,
+            Self::IddmaTimeout => 6,
+            Self::FirmwareChecksumMismatch => 7,
+            Self::WcpuBootTimeout | Self::HardwareTimeout => 8,
+            Self::AutoLltTimeout => 9,
+            Self::RingFull | Self::MalformedDescriptor => 10,
+        }
+    }
 }
 
 /// Parsed `rtw8821c_fw.bin` 64-byte Realtek firmware header.
@@ -727,6 +755,8 @@ mod tests {
     struct MockBar2 {
         regs: alloc::vec::Vec<u8>,
         efuse_rom: [u8; 512],
+        ltecoex_regs: [u32; 128],
+        rpwm_toggles: u32,
     }
 
     impl MockBar2 {
@@ -734,13 +764,21 @@ mod tests {
             let mut regs = alloc::vec![0u8; 0x4000];
             regs[0x0100] = 0xEA; // initial powered-off REG_CR
             regs[0x00F1] = 0x10; // cut B in REG_SYS_CFG1
-                                 // Encode a valid Realtek 2-byte EFUSE packet for logical block 0x1A (`0xD0..0xD6` MAC)
-                                 // blk_idx = 26 (0x1A): hdr1 = ((26 & 7) << 5) | 0x0F = 0x4F, hdr2 = ((26 >> 3) << 4) | 0x08 = 0x38 (words 0,1,2 enabled)
+            regs[0x1703] = 0x20; // LTECOEX_READY (1 << 29) in 0x1700
+            // Encode a valid Realtek 2-byte EFUSE packet for block 0x1A (`0xD0..0xD6` MAC):
+            // hdr1 = ((26 & 7) << 5) | 0x0F = 0x4F, hdr2 = ((26 >> 3) << 4) | 0x08 = 0x38
             let mut efuse_rom = [0xFFu8; 512];
             efuse_rom[0] = 0x4F;
             efuse_rom[1] = 0x38;
             efuse_rom[2..8].copy_from_slice(&[0x74, 0xD8, 0x3E, 0x88, 0x21, 0xCE]);
-            Self { regs, efuse_rom }
+            let mut ltecoex_regs = [0u32; 128];
+            ltecoex_regs[(0x38 / 4) as usize] = 0x0000_5500;
+            Self {
+                regs,
+                efuse_rom,
+                ltecoex_regs,
+                rpwm_toggles: 0,
+            }
         }
     }
 
@@ -751,6 +789,7 @@ mod tests {
                 0x0006 => self.regs[o] | 0x02,
                 0x0005 => self.regs[o] & !0x03,
                 0x0208 => self.regs[o] & !0x01,
+                0x1703 => self.regs[o] | 0x20, // LTECOEX_READY (bit 29 of 0x1700)
                 _ => *self.regs.get(o).unwrap_or(&0),
             }
         }
@@ -767,20 +806,47 @@ mod tests {
         }
         fn write8(&mut self, off: u32, mut val: u8) {
             let o = off as usize;
+            if off == 0x03D9 && self.regs[o] != val {
+                self.rpwm_toggles += 1;
+            }
             if off == 0x03F2 || off == 0x01CC {
                 val = 0; // DBI / HMETFR immediately ready
             }
+            if off == 0x0205 {
+                // `BIT_BCN_VALID_V1` (bit 7 of 0x0205 / bit 15 of 0x0204) is RW1C on silicon!
+                let cur_valid = self.regs[0x0205] & 0x80;
+                let next_valid = if (val & 0x80) != 0 { 0 } else { cur_valid };
+                self.regs[0x0205] = (val & 0x7F) | next_valid;
+                return;
+            }
             if off == 0x0383 && (val & (1 << 4)) != 0 {
-                // BCNQ transfer complete -> set BIT_BCN_VALID_V1 in 0x0205
-                self.regs[0x0205] |= 0x80;
+                // Real RTL8821CE PCIe BCNQ DMA asserts BIT_BCN_VALID_V1 ONLY when:
+                // 1) TXDMA enabled (`REG_CR & 0x05 == 0x05`)
+                // 2) SW Beacon enabled (`REG_CR + 1 & 0x01 != 0`, `BIT_ENSWBCN`)
+                // 3) `BIT_EN_BCNQ_DL` CLEARED (`REG_FWHW_TXQ_CTRL + 2 & (1 << 6) == 0`)
+                // 4) HW TBTT beacon disabled (`REG_BCN_CTRL & (1 << 3) == 0`)
+                // 5) 64-bit BCNQ_DESA upper 32 bits == 0 (`0x030C..0x0310`)
+                let txdma_ok = (self.regs[0x0100] & 0x05) == 0x05;
+                let enswbcn_ok = (self.regs[0x0101] & 0x01) != 0;
+                let bcnq_dl_cleared = (self.regs[0x0422] & (1 << 6)) == 0;
+                let bcn_fn_disabled = (self.regs[0x0550] & (1 << 3)) == 0;
+                let desa_hi = u32::from_le_bytes([
+                    self.regs[0x030C],
+                    self.regs[0x030D],
+                    self.regs[0x030E],
+                    self.regs[0x030F],
+                ]);
+                if txdma_ok && enswbcn_ok && bcnq_dl_cleared && bcn_fn_disabled && desa_hi == 0 {
+                    self.regs[0x0205] |= 0x80;
+                }
             }
             if o < self.regs.len() {
                 self.regs[o] = val;
             }
         }
         fn write16(&mut self, off: u32, mut val: u16) {
-            if off == 0x0080 && (val & (1 << 14)) != 0 {
-                val |= 1 << 15; // WCPU sets BIT_FW_INIT_RDY once BIT_FW_DW_RDY is set
+            if off == 0x0080 && (val & (1 << 14)) != 0 && (val & 0x0078) == 0x0078 {
+                val |= 1 << 15; // WCPU sets BIT_FW_INIT_RDY once IMEM+DMEM OK & BIT_FW_DW_RDY set
             }
             let b = val.to_le_bytes();
             self.write8(off, b[0]);
@@ -797,6 +863,22 @@ mod tests {
             if off == 0x03F8 {
                 val &= !(1 << 5); // MDIO write completes
             }
+            if off == 0x1700 {
+                let idx = (((val & 0xFFFF) / 4) as usize) & 0x7F;
+                if (val & 0xC000_0000) == 0xC000_0000 {
+                    let wdata = u32::from_le_bytes([
+                        self.regs[0x1704],
+                        self.regs[0x1705],
+                        self.regs[0x1706],
+                        self.regs[0x1707],
+                    ]);
+                    self.ltecoex_regs[idx] = wdata;
+                } else if (val & 0x8000_0000) != 0 {
+                    let rdata = self.ltecoex_regs[idx].to_le_bytes();
+                    self.regs[0x1708..0x170C].copy_from_slice(&rdata);
+                }
+                val |= 1 << 29; // keep LTECOEX_READY asserted
+            }
             if off == 0x0C90 {
                 // Mirror SIPI RF write into direct RF read window 0x2800
                 let rf_addr = (val >> 20) & 0xFF;
@@ -808,9 +890,7 @@ mod tests {
             }
             let b = val.to_le_bytes();
             for i in 0..4 {
-                if (off as usize) + i < self.regs.len() {
-                    self.regs[(off as usize) + i] = b[i];
-                }
+                self.write8(off + i as u32, b[i]);
             }
             // Simulate IQK completion in RF 0x08 when H2C IQK runs
             if off == 0x1320 || off == 0x0308 {
@@ -845,7 +925,21 @@ mod tests {
 
         assert_eq!(hw.init_hardware(&mut bar2, &mut dma, fw), Ok(()));
         assert!(hw.initialized);
+        assert_eq!(hw.last_diag, 0);
+        assert_eq!(hw.last_mcufw_ctrl & 0xCFFF, 0xC078);
         assert_eq!(hw.efuse.mac_addr, [0x74, 0xD8, 0x3E, 0x88, 0x21, 0xCE]);
+
+        // Verify RX filter accepts 802.11 management + data frames (`BIT_AMF | BIT_RCR_ADF`)
+        let rcr = bar2.read32(hw::REG_RCR);
+        assert_ne!(rcr & (1 << 13), 0);
+        assert_ne!(rcr & (1 << 11), 0);
+
+        // Verify Wi-Fi-only LTECoex PTA ownership (`GNT_WL = 0x3`, `GNT_BT = 0x1`)
+        let lte38 = bar2.ltecoex_regs[(0x38 / 4) as usize];
+        assert_eq!((lte38 >> 14) & 0x3, 0x1);
+        assert_eq!((lte38 >> 10) & 0x3, 0x1);
+        assert_eq!((lte38 >> 12) & 0x3, 0x3);
+        assert_eq!((lte38 >> 8) & 0x3, 0x3);
 
         // Tune to 5 GHz channel 36 (80 MHz) and check RF 0x18
         hw.set_channel(&mut bar2, 36, 80);
@@ -874,5 +968,43 @@ mod tests {
         );
         // Verify RTW_NET_AP_MODE (3) in REG_CR [17:16]
         assert_eq!((bar2.read32(0x0100) >> 16) & 0x3, 3);
+    }
+
+    #[test]
+    fn warm_vfio_dirty_state_rtl8821ce_recovery_and_pcie_desc_invariants() {
+        let fw = include_bytes!("../../../third_party/firmware/rtw88/rtw8821c_fw.bin");
+        let mut bar2 = MockBar2::new();
+        // Simulate warm-VFIO handoff from host Linux without PCIe FLR:
+        // WCPU still running (`0xC078`), MAC TRX active (`0xFF`), `BIT_EN_BCNQ_DL` set,
+        // and stale 64-bit upper DMA ring addresses (`DESA + 4 != 0`).
+        bar2.regs[0x0100] = 0xFF;
+        bar2.regs[0x0080] = 0x78;
+        bar2.regs[0x0081] = 0xC0;
+        bar2.regs[0x03D9] = 0x80;
+        bar2.regs[0x0422] = 0xFF;
+        for desa_hi in [
+            0x030Cu32, 0x0314, 0x031C, 0x0324, 0x032C, 0x0334, 0x033C, 0x0344, 0x1324,
+        ] {
+            let o = desa_hi as usize;
+            bar2.regs[o..o + 4].copy_from_slice(&0xDEAD_BEEFu32.to_le_bytes());
+        }
+
+        let mut dma = MockDma(alloc::vec![0u8; 0x30_0000]);
+        let mut hw = Rtl8821ceHw::new();
+        assert_eq!(hw.init_hardware(&mut bar2, &mut dma, fw), Ok(()));
+        assert!(hw.initialized);
+        assert!(bar2.rpwm_toggles >= 1);
+
+        // Verify all 9 64-bit upper DESA registers were cleared to 0
+        for desa_hi in [
+            0x030Cu32, 0x0314, 0x031C, 0x0324, 0x032C, 0x0334, 0x033C, 0x0344, 0x1324,
+        ] {
+            assert_eq!(bar2.read32(desa_hi), 0);
+        }
+
+        // Verify PCIe TX descriptor leaves w7[15:0] == 0 (`fill_txdesc_checksum` is USB/SDIO-only)
+        let mut desc = [0xFFu8; RTW_TX_DESC_SIZE];
+        hw::build_full_tx_desc(64, 16, hw::DESC_RATE1M, true, false, 0, 1, 0, &mut desc);
+        assert_eq!(&desc[28..32], &[0, 0, 0, 0]);
     }
 }

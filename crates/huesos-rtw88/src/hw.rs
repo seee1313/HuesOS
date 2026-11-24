@@ -28,6 +28,8 @@ pub const REG_LDO_EFUSE_CTRL: u32 = 0x0034;
 pub const REG_GPIO_MUXCFG: u32 = 0x0040;
 pub const REG_LED_CFG: u32 = 0x004C;
 pub const REG_PAD_CTRL1: u32 = 0x0064;
+pub const REG_CTRL_TYPE: u32 = 0x0067;
+pub const REG_SYS_SDIO_CTRL: u32 = 0x0070;
 pub const REG_HCI_OPT_CTRL: u32 = 0x0074;
 pub const REG_MCUFW_CTRL: u32 = 0x0080;
 pub const REG_MCU_TST_CFG: u32 = 0x0084;
@@ -93,6 +95,7 @@ pub const RTK_PCI_TXBD_IDX_BKQ: u32 = 0x03AC;
 pub const RTK_PCI_TXBD_IDX_MGMTQ: u32 = 0x03B0;
 pub const RTK_PCI_RXBD_IDX_MPDUQ: u32 = 0x03B4;
 pub const RTK_PCI_TXBD_IDX_HI0Q: u32 = 0x03B8;
+pub const REG_PCIE_HRPWM1: u32 = 0x03D9;
 pub const REG_DBI_WDATA_V1: u32 = 0x03E8;
 pub const REG_DBI_RDATA_V1: u32 = 0x03EC;
 pub const REG_DBI_FLAG_V1: u32 = 0x03F0;
@@ -175,6 +178,7 @@ pub const REG_TXSCALE_A: u32 = 0x0C1C;
 pub const REG_RXIGI_A: u32 = 0x0C50;
 pub const REG_CLKTRK: u32 = 0x0C60;
 pub const REG_LSSI_WRITE_A: u32 = 0x0C90;
+pub const REG_RFE_CTRL8: u32 = 0x0CB4;
 pub const REG_RFECTL: u32 = 0x0CB8;
 pub const REG_ENRXCCA: u32 = 0x0CC0;
 pub const REG_ENTXCCK: u32 = 0x0CC8;
@@ -195,6 +199,11 @@ pub const RTK_PCI_TXBD_H2CQ_CSR: u32 = 0x1330;
 pub const REG_H2CQ_CSR: u32 = 0x1330;
 pub const REG_FAST_EDCA_VOVI_SETTING: u32 = 0x1448;
 pub const REG_FAST_EDCA_BEBK_SETTING: u32 = 0x144C;
+pub const REG_WL2LTECOEX_INDIRECT_ACCESS_CTRL_V1: u32 = 0x1700;
+pub const REG_WL2LTECOEX_INDIRECT_ACCESS_WRITE_DATA_V1: u32 = 0x1704;
+pub const REG_WL2LTECOEX_INDIRECT_ACCESS_READ_DATA_V1: u32 = 0x1708;
+pub const LTECOEX_READY: u32 = 1 << 29;
+pub const LTE_COEX_CTRL: u16 = 0x0038;
 pub const REG_DMEM_CTRL: u32 = 0x1080;
 pub const RF_BASE_ADDR_A: u32 = 0x2800;
 
@@ -436,6 +445,8 @@ pub struct Rtl8821ceHw {
     h2c_seq: u16,
     h2c_mbox: u8,
     tx_seq: u16,
+    pub last_diag: u8,
+    pub last_mcufw_ctrl: u16,
     pub initialized: bool,
 }
 
@@ -495,12 +506,32 @@ impl Rtl8821ceHw {
             h2c_seq: 0,
             h2c_mbox: 0,
             tx_seq: 1,
+            last_diag: 0,
+            last_mcufw_ctrl: 0,
             initialized: false,
         }
     }
 
     /// Execute full Realtek `RTL8821CE` bring-up on real PCIe BAR2 + `< 4 GiB` DMA.
     pub fn init_hardware<M: Rtw88Mmio, D: Rtw88Dma>(
+        &mut self,
+        mmio: &mut M,
+        dma: &mut D,
+        fw_blob: &[u8],
+    ) -> Result<(), RtwError> {
+        self.initialized = false;
+        self.last_diag = 0;
+        self.last_mcufw_ctrl = 0;
+        let res = self.init_hardware_inner(mmio, dma, fw_blob);
+        self.last_mcufw_ctrl = mmio.read16(REG_MCUFW_CTRL);
+        if let Err(err) = res {
+            self.last_diag = err.diag_code();
+            return Err(err);
+        }
+        Ok(())
+    }
+
+    fn init_hardware_inner<M: Rtw88Mmio, D: Rtw88Dma>(
         &mut self,
         mmio: &mut M,
         dma: &mut D,
@@ -515,7 +546,7 @@ impl Rtl8821ceHw {
         // 1. Read silicon cut version from REG_SYS_CFG1
         let sys_cfg1 = mmio.read32(REG_SYS_CFG1);
         if sys_cfg1 == 0xFFFF_FFFF {
-            return Err(RtwError::HardwareTimeout);
+            return Err(RtwError::MmioUnreachable);
         }
         self.cut_version = ((sys_cfg1 >> 12) & 0x0F) as u8;
 
@@ -525,7 +556,7 @@ impl Rtl8821ceHw {
         mmio.write32(RTK_PCI_HIMR3, 0);
         self.pci_phy_and_aspm_cfg(mmio);
 
-        // 3. Initialize & program all 8 TX rings + 1 RX MPDU ring
+        // 3. Initialize & program all 8 TX rings + 1 RX MPDU ring (`rtw_hci_setup`)
         self.setup_pci_rings(mmio, dma);
 
         // 4. Power on MAC (`rtw_mac_power_on`: pre_system_cfg + pwr_seq + init_system_cfg)
@@ -535,22 +566,25 @@ impl Rtl8821ceHw {
         self.read_efuse(mmio);
         self.program_mac_addr(mmio, &self.efuse.mac_addr);
 
-        // 6. Initialize TRXFF / Auto-LLT / H2C ring so `BCNQ` rsvd_page DMA works
-        self.init_trx_cfg(mmio)?;
+        // 6. Re-assert PCIe ring control after `card_enable_flow_8821c` zeroes 0x0300..0x0301
+        self.setup_pci_rings(mmio, dma);
 
         // 7. Download `rtw8821c_fw.bin` (DMEM + IMEM + EMEM) via BCNQ + IDDMA & boot WCPU
+        //    (`rtw_power_on` runs `rtw_download_firmware` BEFORE `rtw_mac_init`)
         self.download_firmware(mmio, dma, fw_blob, &fw_info)?;
 
-        // 8. Reset PCIe rings after firmware boot (`rtw_hci_setup`) & configure MAC
+        // 8. Reset PCIe rings after firmware boot (`rtw_hci_setup` in `__rtw_download_firmware`)
+        //    & configure TRXFF / Auto-LLT / H2C / WMAC (`rtw_mac_init`)
         self.setup_pci_rings(mmio, dma);
         self.init_trx_cfg(mmio)?;
         self.mac_init_8821c(mmio);
         self.drv_info_cfg(mmio);
 
-        // 9. Power up BB/RF, load authentic 8821C MAC/BB/AGC/RF tables, set XTAL
+        // 9. Power up BB/RF, load authentic 8821C MAC/BB/AGC/RF tables, set XTAL & WL antenna
         self.phy_set_param_8821c(mmio);
+        self.coex_wifi_only_init_8821c(mmio);
 
-        // 10. Enable hardware AES-CCMP security engine & RX filter
+        // 10. Enable hardware AES-CCMP security engine & RX filter (including AMF + ADF!)
         self.enable_sec_engine(mmio);
         let rcr = (1u32 << 31) // APP_FCS
             | (1u32 << 30) // APP_MIC
@@ -558,6 +592,8 @@ impl Rtl8821ceHw {
             | (1u32 << 28) // APP_PHYSTS
             | (1u32 << 20) // PKTCTL_DLEN
             | (1u32 << 14) // HTC_LOC_CTRL
+            | (1u32 << 13) // AMF (Accept 802.11 Management Frames: Beacon/ProbeResp/Auth/Assoc)
+            | (1u32 << 11) // RCR_ADF (Accept 802.11 Data Frames)
             | (1u32 << 3)  // AB (Broadcast)
             | (1u32 << 2)  // AM (Multicast)
             | (1u32 << 1); // APM (Unicast match)
@@ -678,6 +714,7 @@ impl Rtl8821ceHw {
             RTK_PCI_TXBD_DESA_BCNQ,
             base_pa.wrapping_add(self.tx_rings[RtwTxQueue::Bcn as usize].bd_off as u32),
         );
+        mmio.write32(RTK_PCI_TXBD_DESA_BCNQ + 4, 0);
 
         let h2c = &self.tx_rings[RtwTxQueue::H2c as usize];
         mmio.write16(RTK_PCI_TXBD_NUM_H2CQ, (h2c.cap as u16) & 0x0FFF);
@@ -685,6 +722,7 @@ impl Rtl8821ceHw {
             RTK_PCI_TXBD_DESA_H2CQ,
             base_pa.wrapping_add(h2c.bd_off as u32),
         );
+        mmio.write32(RTK_PCI_TXBD_DESA_H2CQ + 4, 0);
 
         let ring_regs = [
             (RtwTxQueue::Bk, RTK_PCI_TXBD_NUM_BKQ, RTK_PCI_TXBD_DESA_BKQ),
@@ -706,6 +744,7 @@ impl Rtl8821ceHw {
             let r = &self.tx_rings[q as usize];
             mmio.write16(num_reg, (r.cap as u16) & 0x0FFF);
             mmio.write32(desa_reg, base_pa.wrapping_add(r.bd_off as u32));
+            mmio.write32(desa_reg + 4, 0);
         }
 
         mmio.write16(RTK_PCI_RXBD_NUM_MPDUQ, (self.rx_ring.cap as u16) & 0x0FFF);
@@ -713,6 +752,7 @@ impl Rtl8821ceHw {
             RTK_PCI_RXBD_DESA_MPDUQ,
             base_pa.wrapping_add(self.rx_ring.bd_off as u32),
         );
+        mmio.write32(RTK_PCI_RXBD_DESA_MPDUQ + 4, 0);
 
         mmio.write32(RTK_PCI_TXBD_RWPTR_CLR, 0xFFFF_FFFF);
         let h2c_csr = mmio.read32(RTK_PCI_TXBD_H2CQ_CSR);
@@ -787,7 +827,7 @@ impl Rtl8821ceHw {
         self.pwr_write_mask(mmio, 0x0005, (1 << 4) | (1 << 3) | (1 << 2), 0);
         self.pwr_write_mask(mmio, 0x0075, 1 << 0, 1 << 0);
         if !self.pwr_poll(mmio, 0x0006, 1 << 1, 1 << 1) {
-            return Err(RtwError::HardwareTimeout);
+            return Err(RtwError::PwrSeqTimeout);
         }
         self.pwr_write_mask(mmio, 0x0075, 1 << 0, 0);
         self.pwr_write_mask(mmio, 0x0006, 1 << 0, 1 << 0);
@@ -795,7 +835,7 @@ impl Rtl8821ceHw {
         self.pwr_write_mask(mmio, 0x0005, (1 << 4) | (1 << 3), 0);
         self.pwr_write_mask(mmio, 0x0005, 1 << 0, 1 << 0);
         if !self.pwr_poll(mmio, 0x0005, 1 << 0, 0) {
-            return Err(RtwError::HardwareTimeout);
+            return Err(RtwError::PwrSeqTimeout);
         }
         self.pwr_write_mask(mmio, 0x0020, 1 << 3, 1 << 3);
         self.pwr_write_mask(mmio, 0x0074, 1 << 5, 1 << 5);
@@ -807,7 +847,7 @@ impl Rtl8821ceHw {
     }
 
     fn run_pwr_off_seq_8821c<M: Rtw88Mmio>(&self, mmio: &mut M) {
-        // trans_act_to_cardemu_8821c
+        // trans_act_to_cardemu_8821c (PCI-applicable entries)
         self.pwr_write_mask(mmio, 0x0093, 1 << 3, 0);
         self.pwr_write_mask(mmio, 0x001F, 0xFF, 0);
         self.pwr_write_mask(mmio, 0x0049, 1 << 1, 0);
@@ -816,15 +856,23 @@ impl Rtl8821ceHw {
         self.pwr_write_mask(mmio, 0x0005, 1 << 1, 1 << 1);
         let _ = self.pwr_poll(mmio, 0x0005, 1 << 1, 0);
         self.pwr_write_mask(mmio, 0x0020, 1 << 3, 0);
-        // trans_cardemu_to_carddis_8821c
+        // trans_cardemu_to_carddis_8821c (PCI-applicable entries from rtw8821c.c)
         self.pwr_write_mask(mmio, 0x0067, 1 << 5, 0);
-        self.pwr_write_mask(mmio, 0x0005, (1 << 3) | (1 << 4), 1 << 3);
+        self.pwr_write_mask(mmio, 0x0005, 1 << 2, 1 << 2);
+        self.pwr_write_mask(mmio, 0x0081, (1 << 7) | (1 << 6), 0);
+        self.pwr_write_mask(mmio, 0x0090, 1 << 1, 0);
     }
 
     fn mac_power_on<M: Rtw88Mmio>(&self, mmio: &mut M) -> Result<(), RtwError> {
         self.mac_pre_system_cfg(mmio);
+        // If WCPU3081 firmware is still active after warm VFIO handoff (no PCIe FLR),
+        // toggle RPWM (`rtw_mac_power_switch`, `mac.c:280`) before cycling power.
+        if mmio.read16(REG_MCUFW_CTRL) == 0xC078 {
+            let rpwm = (mmio.read8(REG_PCIE_HRPWM1) ^ (1 << 7)) & (1 << 7);
+            mmio.write8(REG_PCIE_HRPWM1, rpwm);
+        }
         if mmio.read8(REG_CR) != 0xEA {
-            // Card was already powered from BIOS/warm reboot — cleanly cycle it
+            // Card was already powered from host OS/BIOS/warm reboot — cleanly cycle it
             self.run_pwr_off_seq_8821c(mmio);
             self.mac_pre_system_cfg(mmio);
         }
@@ -1019,15 +1067,15 @@ impl Rtl8821ceHw {
         let llt = mmio.read8(REG_AUTO_LLT_V1) | 1;
         mmio.write8(REG_AUTO_LLT_V1, llt);
         let mut llt_ok = false;
-        for _ in 0..5_000 {
+        for _ in 0..20_000 {
             if (mmio.read8(REG_AUTO_LLT_V1) & 1) == 0 {
                 llt_ok = true;
                 break;
             }
-            mmio.delay_us(10);
+            mmio.delay_us(25);
         }
         if !llt_ok {
-            return Err(RtwError::HardwareTimeout);
+            return Err(RtwError::AutoLltTimeout);
         }
         mmio.write8(REG_CR + 3, 0);
 
@@ -1054,6 +1102,51 @@ impl Rtl8821ceHw {
     // Firmware Download via BCNQ `rsvd_page` + IDDMA (`__rtw_download_firmware`)
     // -----------------------------------------------------------------------
 
+    fn ltecoex_wait_ready<M: Rtw88Mmio>(&self, mmio: &mut M) -> Result<(), RtwError> {
+        for _ in 0..5_000 {
+            if (mmio.read32(REG_WL2LTECOEX_INDIRECT_ACCESS_CTRL_V1) & LTECOEX_READY) != 0 {
+                return Ok(());
+            }
+            mmio.delay_us(20);
+        }
+        Err(RtwError::LteCoexTimeout)
+    }
+
+    fn ltecoex_read_reg<M: Rtw88Mmio>(&self, mmio: &mut M, offset: u16) -> Result<u32, RtwError> {
+        self.ltecoex_wait_ready(mmio)?;
+        mmio.write32(
+            REG_WL2LTECOEX_INDIRECT_ACCESS_CTRL_V1,
+            0x800F_0000 | u32::from(offset),
+        );
+        Ok(mmio.read32(REG_WL2LTECOEX_INDIRECT_ACCESS_READ_DATA_V1))
+    }
+
+    fn ltecoex_write_reg<M: Rtw88Mmio>(
+        &self,
+        mmio: &mut M,
+        offset: u16,
+        value: u32,
+    ) -> Result<(), RtwError> {
+        self.ltecoex_wait_ready(mmio)?;
+        mmio.write32(REG_WL2LTECOEX_INDIRECT_ACCESS_WRITE_DATA_V1, value);
+        mmio.write32(
+            REG_WL2LTECOEX_INDIRECT_ACCESS_CTRL_V1,
+            0xC00F_0000 | u32::from(offset),
+        );
+        Ok(())
+    }
+
+    fn ltecoex_write_mask<M: Rtw88Mmio>(&self, mmio: &mut M, offset: u16, mask: u32, val: u32) {
+        if mask == 0 {
+            return;
+        }
+        if let Ok(cur) = self.ltecoex_read_reg(mmio, offset) {
+            let shift = mask.trailing_zeros();
+            let next = (cur & !mask) | ((val << shift) & mask);
+            let _ = self.ltecoex_write_reg(mmio, offset, next);
+        }
+    }
+
     fn wlan_cpu_enable<M: Rtw88Mmio>(&self, mmio: &mut M, enable: bool) {
         if enable {
             let rsv = mmio.read8(REG_RSV_CTRL + 1) | 0x01;
@@ -1068,7 +1161,8 @@ impl Rtl8821ceHw {
         }
     }
 
-    /// Write a payload into TX FIFO reserved page `pg_addr` via `BCNQ` DMA.
+    /// Write a payload into TX FIFO reserved page `pg_addr` via `BCNQ` DMA
+    /// (`rtw_fw_write_data_rsvd_page` + `rtw_pci_write_data_rsvd_page`).
     pub fn write_rsvd_page<M: Rtw88Mmio, D: Rtw88Dma>(
         &mut self,
         mmio: &mut M,
@@ -1077,20 +1171,32 @@ impl Rtl8821ceHw {
         payload: &[u8],
         tim_offset: u8,
     ) -> Result<(), RtwError> {
+        if payload.is_empty() {
+            return Err(RtwError::MalformedDescriptor);
+        }
         let bcn_ring = self.tx_rings[RtwTxQueue::Bcn as usize];
         if RTW_TX_DESC_SIZE + payload.len() > bcn_ring.buf_stride {
             return Err(RtwError::MalformedDescriptor);
         }
 
-        // Clear BIT_BCN_VALID_V1 in REG_FIFOPAGE_CTRL_2 and set target page
-        let mut fp2 = mmio.read16(REG_FIFOPAGE_CTRL_2);
-        fp2 = (fp2 & !0x0FFF) | (pg_addr & 0x0FFF) | (1u16 << 15);
-        mmio.write16(REG_FIFOPAGE_CTRL_2, fp2);
+        // Save `REG_CR + 1`, `REG_FWHW_TXQ_CTRL + 2`, and `REG_BCN_CTRL` (`fw.c:1485..1507`)
+        let bckp_bcn = mmio.read8(REG_BCN_CTRL);
+        let bckp_cr1 = mmio.read8(REG_CR + 1);
+        let bckp_fwhw2 = mmio.read8(REG_FWHW_TXQ_CTRL + 2);
 
-        let fwhw = mmio.read32(REG_FWHW_TXQ_CTRL) | (1u32 << 22); // BIT_EN_BCNQ_DL
-        mmio.write32(REG_FWHW_TXQ_CTRL, fwhw);
+        // Clear BIT_BCN_VALID_V1 (RW1C bit 15) in REG_FIFOPAGE_CTRL_2 and set target page
+        mmio.write16(REG_FIFOPAGE_CTRL_2, (pg_addr & 0x0FFF) | (1u16 << 15));
 
-        // Build 48-byte TX descriptor with QSEL_BEACON (16) + 16-word checksum
+        // Enable SW Beacon (`BIT_ENSWBCN >> 8` = bit 0 of `REG_CR + 1`)
+        mmio.write8(REG_CR + 1, bckp_cr1 | 0x01);
+
+        // Disable hardware TBTT beacon function while uploading reserved page
+        mmio.write8(REG_BCN_CTRL, (bckp_bcn & !(1 << 3)) | (1 << 4));
+
+        // On PCIe, `BIT_EN_BCNQ_DL` (`BIT(22)` => bit 6 of `REG_FWHW_TXQ_CTRL + 2`) MUST be CLEARED
+        mmio.write8(REG_FWHW_TXQ_CTRL + 2, bckp_fwhw2 & !(1 << 6));
+
+        // Build 48-byte PCIe TX descriptor with QSEL_BEACON (16) (`w7 = 0` on PCIe)
         let mut desc = [0u8; RTW_TX_DESC_SIZE];
         build_full_tx_desc(
             payload.len() as u16,
@@ -1120,18 +1226,34 @@ impl Rtl8821ceHw {
         bd[12..16].copy_from_slice(&(pkt_pa.wrapping_add(RTW_TX_DESC_SIZE as u32)).to_le_bytes());
         dma.write_bytes(bcn_ring.bd_off, &bd);
 
-        // Kick BCNQ transfer
+        // Kick BCNQ transfer (`RTK_PCI_TXBD_BCN_WORK |= BIT_PCI_BCNQ_FLAG`)
         let work = mmio.read8(RTK_PCI_TXBD_BCN_WORK) | (1 << 4);
         mmio.write8(RTK_PCI_TXBD_BCN_WORK, work);
 
-        // Poll BIT_BCN_VALID_V1 (bit 15 of REG_FIFOPAGE_CTRL_2)
-        for _ in 0..5_000 {
+        // Poll BIT_BCN_VALID_V1 (bit 15 of REG_FIFOPAGE_CTRL_2) up to ~500 ms
+        let mut bcn_ok = false;
+        for _ in 0..20_000 {
             if (mmio.read16(REG_FIFOPAGE_CTRL_2) & (1u16 << 15)) != 0 {
-                return Ok(());
+                bcn_ok = true;
+                break;
             }
-            mmio.delay_us(10);
+            mmio.delay_us(25);
         }
-        Err(RtwError::HardwareTimeout)
+
+        // Restore reserved-page head & backed-up registers (`fw.c:1529..1535`)
+        mmio.write16(
+            REG_FIFOPAGE_CTRL_2,
+            (self.fifo.rsvd_boundary & 0x0FFF) | (1u16 << 15),
+        );
+        mmio.write8(REG_BCN_CTRL, bckp_bcn);
+        mmio.write8(REG_FWHW_TXQ_CTRL + 2, bckp_fwhw2);
+        mmio.write8(REG_CR + 1, bckp_cr1);
+
+        if bcn_ok {
+            Ok(())
+        } else {
+            Err(RtwError::RsvdPageBcnValidTimeout)
+        }
     }
 
     fn iddma_copy_chunk<M: Rtw88Mmio>(
@@ -1142,11 +1264,16 @@ impl Rtl8821ceHw {
         len: u32,
         first_chunk: bool,
     ) -> Result<(), RtwError> {
-        for _ in 0..2_000 {
+        let mut idle = false;
+        for _ in 0..5_000 {
             if (mmio.read32(REG_DDMA_CH0CTRL) & (1u32 << 31)) == 0 {
+                idle = true;
                 break;
             }
-            mmio.delay_us(5);
+            mmio.delay_us(10);
+        }
+        if !idle {
+            return Err(RtwError::IddmaTimeout);
         }
         let mut ctrl = (1u32 << 31) | (1u32 << 29) | (len & 0x3FFFF);
         if !first_chunk {
@@ -1155,13 +1282,13 @@ impl Rtl8821ceHw {
         mmio.write32(REG_DDMA_CH0SA, src);
         mmio.write32(REG_DDMA_CH0DA, dst);
         mmio.write32(REG_DDMA_CH0CTRL, ctrl);
-        for _ in 0..5_000 {
+        for _ in 0..20_000 {
             if (mmio.read32(REG_DDMA_CH0CTRL) & (1u32 << 31)) == 0 {
                 return Ok(());
             }
-            mmio.delay_us(10);
+            mmio.delay_us(25);
         }
-        Err(RtwError::HardwareTimeout)
+        Err(RtwError::IddmaTimeout)
     }
 
     fn download_fw_section<M: Rtw88Mmio, D: Rtw88Dma>(
@@ -1195,7 +1322,13 @@ impl Rtl8821ceHw {
         let mut fw_ctrl = mmio.read8(REG_MCUFW_CTRL);
         let bad_csum = (mmio.read32(REG_DDMA_CH0CTRL) & (1u32 << 27)) != 0;
         if bad_csum {
-            return Err(RtwError::MalformedDescriptor);
+            if dst_addr < OCPBASE_DMEM_88XX {
+                fw_ctrl = (fw_ctrl | (1 << 3)) & !(1 << 4);
+            } else {
+                fw_ctrl = (fw_ctrl | (1 << 5)) & !(1 << 6);
+            }
+            mmio.write8(REG_MCUFW_CTRL, fw_ctrl);
+            return Err(RtwError::FirmwareChecksumMismatch);
         }
         if dst_addr < OCPBASE_DMEM_88XX {
             fw_ctrl |= (1 << 3) | (1 << 4); // BIT_IMEM_DW_OK | BIT_IMEM_CHKSUM_OK
@@ -1234,6 +1367,9 @@ impl Rtl8821ceHw {
         if RTW88_FW_HDR_LEN + dmem_len + imem_len + emem_len > fw_blob.len() {
             return Err(RtwError::FirmwareSectionOutOfBounds);
         }
+
+        // Backup LTECoex indirect register 0x38 before disabling WCPU (`mac.c:788`)
+        let ltecoex_bckp = self.ltecoex_read_reg(mmio, LTE_COEX_CTRL)?;
 
         self.wlan_cpu_enable(mmio, false);
 
@@ -1294,21 +1430,37 @@ impl Rtl8821ceHw {
         if let Err(e) = dl_res {
             let c = mmio.read8(REG_MCUFW_CTRL) & !0x01;
             mmio.write8(REG_MCUFW_CTRL, c);
+            let fen = mmio.read8(REG_SYS_FUNC_EN + 1) | (1 << 2);
+            mmio.write8(REG_SYS_FUNC_EN + 1, fen);
             return Err(e);
         }
 
-        // `download_firmware_end_flow`
+        // `download_firmware_end_flow` (`mac.c:761..774`)
         mmio.write32(REG_TXDMA_STATUS, 1u32 << 2); // BTI_PAGE_OVF
         let mut ctrl16 = mmio.read16(REG_MCUFW_CTRL);
+        if (ctrl16 & 0x0050) != 0x0050 {
+            let c = mmio.read8(REG_MCUFW_CTRL) & !0x01;
+            mmio.write8(REG_MCUFW_CTRL, c);
+            return Err(RtwError::FirmwareChecksumMismatch);
+        }
         ctrl16 = (ctrl16 | (1u16 << 14)) & !0x0001; // BIT_FW_DW_RDY & ~BIT_MCUFWDL_EN
         mmio.write16(REG_MCUFW_CTRL, ctrl16);
 
         self.wlan_cpu_enable(mmio, true);
 
-        // Poll `FW_READY` (`0xC078` under mask `0xCFFF`)
+        // Restore LTECoex indirect register 0x38 after enabling WCPU (`mac.c:807`)
+        if let Err(e) = self.ltecoex_write_reg(mmio, LTE_COEX_CTRL, ltecoex_bckp) {
+            let c = mmio.read8(REG_MCUFW_CTRL) & !0x01;
+            mmio.write8(REG_MCUFW_CTRL, c);
+            let fen = mmio.read8(REG_SYS_FUNC_EN + 1) | (1 << 2);
+            mmio.write8(REG_SYS_FUNC_EN + 1, fen);
+            return Err(e);
+        }
+
+        // Poll `FW_READY` (`0xC078` under mask `0xFFFF & ~BIT_CPU_CLK_SEL` = `0xCFFF`)
         const FW_READY_MASK: u16 = 0xCFFF;
         const FW_READY_VAL: u16 = (1 << 15) | (1 << 14) | (1 << 6) | (1 << 5) | (1 << 4) | (1 << 3);
-        for _ in 0..10_000 {
+        for _ in 0..20_000 {
             if (mmio.read16(REG_MCUFW_CTRL) & FW_READY_MASK) == FW_READY_VAL {
                 self.h2c_mbox = 0;
                 self.h2c_seq = 0;
@@ -1316,7 +1468,11 @@ impl Rtl8821ceHw {
             }
             mmio.delay_us(25);
         }
-        Err(RtwError::HardwareTimeout)
+        let c = mmio.read8(REG_MCUFW_CTRL) & !0x01;
+        mmio.write8(REG_MCUFW_CTRL, c);
+        let fen = mmio.read8(REG_SYS_FUNC_EN + 1) | (1 << 2);
+        mmio.write8(REG_SYS_FUNC_EN + 1, fen);
+        Err(RtwError::WcpuBootTimeout)
     }
 
     // -----------------------------------------------------------------------
@@ -1567,6 +1723,37 @@ impl Rtl8821ceHw {
 
         // Beamforming grouping bitmap (`rtw8821c_phy_bf_init`)
         mmio.write32(0x1C94, 0xAFFF_AFFF);
+    }
+
+    /// Force Wi-Fi-only antenna & PTA ownership (`rtw_coex_wifi_only_hw_config` +
+    /// `COEX_SET_ANT_WONLY` for M.2 `RTL8821CE` Wi-Fi + Bluetooth combo cards).
+    fn coex_wifi_only_init_8821c<M: Rtw88Mmio>(&self, mmio: &mut M) {
+        // Route LTE/PTA mux control to WL (`BIT_LTE_MUX_CTRL_PATH = BIT(26)` in `REG_SYS_SDIO_CTRL`)
+        let mux = mmio.read8(REG_SYS_SDIO_CTRL + 3) | (1 << 2);
+        mmio.write8(REG_SYS_SDIO_CTRL + 3, mux);
+
+        // Program indirect `LTE_COEX_CTRL` (0x38):
+        //   GNT_BT (0xC000 ctrl + 0x0C00 val) -> COEX_GNT_SET_SW_LOW  (0x1)
+        //   GNT_WL (0x3000 ctrl + 0x0300 val) -> COEX_GNT_SET_SW_HIGH (0x3)
+        self.ltecoex_write_mask(mmio, LTE_COEX_CTRL, 0xC000, 0x1);
+        self.ltecoex_write_mask(mmio, LTE_COEX_CTRL, 0x0C00, 0x1);
+        self.ltecoex_write_mask(mmio, LTE_COEX_CTRL, 0x3000, 0x3);
+        self.ltecoex_write_mask(mmio, LTE_COEX_CTRL, 0x0300, 0x3);
+
+        // Switch external DPDT / RFE control pins to BB/WL (`rtw8821c_switch_ant_set`)
+        let mut pad2 = mmio.read8(REG_PAD_CTRL1 + 2);
+        pad2 &= !(1 << 0); // clear BIT_BT_BTG_SEL so BT does not hijack 2.4G path
+        mmio.write8(REG_PAD_CTRL1 + 2, pad2);
+
+        let led2 = mmio.read8(REG_LED_CFG + 2) & !(1 << 5); // DPDT_SEL_EN = BB
+        mmio.write8(REG_LED_CFG + 2, led2);
+
+        let ctrl_type = mmio.read8(REG_CTRL_TYPE) | (1 << 7); // BIT_CTRL_TYPE1 | BIT_CTRL_TYPE2 -> DPDT
+        mmio.write8(REG_CTRL_TYPE, ctrl_type);
+
+        // RFE_CTRL8: RFE source = WL/BB (`0x77` for switch control, direction to WL main antenna)
+        self.write32_mask(mmio, REG_RFE_CTRL8, 0x0000_00FF, 0x77);
+        self.write32_mask(mmio, REG_RFE_CTRL8, 0x0030_0000, 0x01);
     }
 
     fn enable_sec_engine<M: Rtw88Mmio>(&self, mmio: &mut M) {
@@ -2005,11 +2192,12 @@ impl Rtl8821ceHw {
 
         let mut desc = [0u8; RTW_TX_DESC_SIZE];
         if queue == RtwTxQueue::H2c {
-            let dw0 = (payload.len() as u32) | (48u32 << 16) | (1u32 << 26);
+            // `rtw_tx_write_data_h2c_get` (`tx.c:532..555`):
+            // `tx_pkt_size = size, qsel = TX_DESC_QSEL_H2C (19), offset = 0, ls = 0, w7 = 0`
+            let dw0 = (payload.len() as u32) & 0xFFFF;
             let dw1 = 19u32 << 8; // TX_DESC_QSEL_H2C
             desc[0..4].copy_from_slice(&dw0.to_le_bytes());
             desc[4..8].copy_from_slice(&dw1.to_le_bytes());
-            fill_txdesc_checksum_16words(&mut desc);
         } else {
             build_full_tx_desc(
                 payload.len() as u16,
@@ -2217,7 +2405,8 @@ pub fn build_full_tx_desc(
     out[16..20].copy_from_slice(&w4.to_le_bytes());
     out[32..36].copy_from_slice(&w8.to_le_bytes());
     out[36..40].copy_from_slice(&w9.to_le_bytes());
-    fill_txdesc_checksum_16words(out);
+    // Note: on Realtek PCIe (`pci.c:829`, `main.h:913`), `w7[15:0]` MUST stay 0
+    // (`fill_txdesc_checksum_16words` is strictly USB/SDIO-only).
 }
 
 fn decode_8821c_phy_rssi(phy: &[u8; 16], rx_rate: u8, rfe_option: u8) -> i8 {
