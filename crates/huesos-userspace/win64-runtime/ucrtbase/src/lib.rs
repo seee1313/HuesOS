@@ -5,7 +5,7 @@
 
 #![no_std]
 #![no_main]
-#![allow(clippy::missing_safety_doc)]
+#![allow(clippy::missing_safety_doc, clippy::not_unsafe_ptr_arg_deref)]
 
 use core::panic::PanicInfo;
 use core::ptr;
@@ -522,7 +522,7 @@ pub unsafe extern "C" fn crt_memmove(
     src: *const core::ffi::c_void,
     n: usize,
 ) -> *mut core::ffi::c_void {
-    if n > 0 && !dst.is_null() && !src.is_null() && (dst as usize) != (src as usize) {
+    if n > 0 && !dst.is_null() && !src.is_null() && !ptr::eq(dst.cast_const(), src) {
         let d = dst.cast::<u8>();
         let s = src.cast::<u8>();
         if (d as usize) < (s as usize) {

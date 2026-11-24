@@ -2515,15 +2515,13 @@ fn run_driver_binding_and_handoff(
                             let _ = bootstrap.write_handle(mmio_label.as_bytes(), mmio_handle);
                             let vd = (u64::from(node.function.vendor_id) << 16)
                                 | u64::from(node.function.device_id);
-                            let bdf_packed = u64::from(
-                                pack_pci_address(
-                                    lease.address.segment(),
-                                    lease.address.bus(),
-                                    lease.address.device(),
-                                    lease.address.function(),
-                                )
-                                .unwrap_or(0),
-                            );
+                            let bdf_packed = pack_pci_address(
+                                lease.address.segment(),
+                                lease.address.bus(),
+                                lease.address.device(),
+                                lease.address.function(),
+                            )
+                            .unwrap_or(0);
                             let mut id_bytes = [0u8; 16];
                             id_bytes[0..8].copy_from_slice(&vd.to_le_bytes());
                             id_bytes[8..16].copy_from_slice(&bdf_packed.to_le_bytes());

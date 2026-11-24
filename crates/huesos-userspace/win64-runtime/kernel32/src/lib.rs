@@ -9,7 +9,7 @@
 
 #![no_std]
 #![no_main]
-#![allow(clippy::missing_safety_doc)]
+#![allow(clippy::missing_safety_doc, clippy::not_unsafe_ptr_arg_deref)]
 
 use core::panic::PanicInfo;
 use core::ptr;
@@ -1220,9 +1220,9 @@ pub extern "win64" fn GetModuleFileNameW(_module: usize, filename: *mut u16, siz
         return 0;
     }
     let copy_len = DEFAULT_NAME.len().min((size as usize).saturating_sub(1));
-    for i in 0..copy_len {
+    for (i, &b) in DEFAULT_NAME.iter().enumerate().take(copy_len) {
         // SAFETY: `i < size` within `filename`.
-        unsafe { ptr::write_unaligned(filename.add(i), u16::from(DEFAULT_NAME[i])) };
+        unsafe { ptr::write_unaligned(filename.add(i), u16::from(b)) };
     }
     // SAFETY: `copy_len < size` within `filename`.
     unsafe { ptr::write_unaligned(filename.add(copy_len), 0) };

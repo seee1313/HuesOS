@@ -9,7 +9,7 @@
 
 #![no_std]
 #![no_main]
-#![allow(clippy::missing_safety_doc)]
+#![allow(clippy::missing_safety_doc, clippy::not_unsafe_ptr_arg_deref)]
 
 use core::arch::asm;
 use core::panic::PanicInfo;

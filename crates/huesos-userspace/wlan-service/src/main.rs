@@ -123,8 +123,8 @@ impl Csprng {
             // Ratchet internal key forward
             let next_k = hmac_sha1_parts(&self.key, &[&digest, b"ratchet"]);
             self.key[..20].copy_from_slice(&next_k);
-            for i in 0..12 {
-                self.key[20 + i] ^= digest[i];
+            for (dst, &src) in self.key[20..32].iter_mut().zip(&digest[..12]) {
+                *dst ^= src;
             }
             let take = (out.len() - pos).min(digest.len());
             out[pos..pos + take].copy_from_slice(&digest[..take]);
