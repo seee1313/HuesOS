@@ -499,26 +499,20 @@ fn run() -> i32 {
             Some(Key::Up) | Some(Key::Char(b'k')) => {
                 app.selected = app.selected.saturating_sub(1);
             }
-            Some(Key::Down) | Some(Key::Char(b'j')) => {
-                if app.selected + 1 < visible_tasks.len() {
-                    app.selected += 1;
-                }
+            Some(Key::Down) | Some(Key::Char(b'j')) if app.selected + 1 < visible_tasks.len() => {
+                app.selected += 1;
             }
             Some(Key::PageUp) => {
                 app.selected = app.selected.saturating_sub(12);
             }
-            Some(Key::PageDown) => {
-                if !visible_tasks.is_empty() {
-                    app.selected = (app.selected + 12).min(visible_tasks.len() - 1);
-                }
+            Some(Key::PageDown) if !visible_tasks.is_empty() => {
+                app.selected = (app.selected + 12).min(visible_tasks.len() - 1);
             }
             Some(Key::Home) | Some(Key::Char(b'g')) => {
                 app.selected = 0;
             }
-            Some(Key::End) | Some(Key::Char(b'G')) => {
-                if !visible_tasks.is_empty() {
-                    app.selected = visible_tasks.len() - 1;
-                }
+            Some(Key::End) | Some(Key::Char(b'G')) if !visible_tasks.is_empty() => {
+                app.selected = visible_tasks.len() - 1;
             }
             Some(Key::Char(b's')) | Some(Key::Char(b'S')) | Some(Key::Right) => {
                 app.sort_col = app.sort_col.next();

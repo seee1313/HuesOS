@@ -803,10 +803,8 @@ fn run_tui(max_frames: Option<u64>) -> i32 {
                         Key::Up | Key::Char(b'k') => {
                             app.selected = app.selected.saturating_sub(1);
                         }
-                        Key::Down | Key::Char(b'j') => {
-                            if app.selected + 1 < app.scan.len() {
-                                app.selected += 1;
-                            }
+                        Key::Down | Key::Char(b'j') if app.selected + 1 < app.scan.len() => {
+                            app.selected += 1;
                         }
                         Key::Char(b's') => {
                             app.refresh(true);
