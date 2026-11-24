@@ -799,9 +799,7 @@ fn read_raw_record_eof_ok<T: TlsTransport>(
     Ok(Some((hdr, payload)))
 }
 
-fn read_raw_record<T: TlsTransport>(
-    transport: &mut T,
-) -> Result<RawTlsRecord, TlsError<T::Error>> {
+fn read_raw_record<T: TlsTransport>(transport: &mut T) -> Result<RawTlsRecord, TlsError<T::Error>> {
     read_raw_record_eof_ok(transport)?.ok_or(TlsError::UnexpectedEof)
 }
 
