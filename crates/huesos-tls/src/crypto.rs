@@ -12,6 +12,7 @@
 //!   - `rsa_pss_rsae_sha256` (`0x0804`), `rsa_pss_rsae_sha384` (`0x0805`)
 //!   - `rsa_pkcs1_sha256` (`0x0401`), `rsa_pkcs1_sha384` (`0x0501`)
 
+use alloc::boxed::Box;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::cmp::Ordering;
@@ -187,8 +188,8 @@ pub fn ct_eq_slices(a: &[u8], b: &[u8]) -> bool {
 }
 
 enum AeadEngine {
-    Aes128(Aes128Gcm),
-    Aes256(Aes256Gcm),
+    Aes128(Box<Aes128Gcm>),
+    Aes256(Box<Aes256Gcm>),
 }
 
 /// TLS 1.3 per-direction record AEAD state (`key`, `iv`, 64-bit `seq`).
@@ -208,10 +209,10 @@ impl TrafficCipher {
         iv.copy_from_slice(&iv_vec);
         let engine = match suite {
             CipherSuite::Aes128GcmSha256 => {
-                AeadEngine::Aes128(Aes128Gcm::new_from_slice(&key).ok()?)
+                AeadEngine::Aes128(Box::new(Aes128Gcm::new_from_slice(&key).ok()?))
             }
             CipherSuite::Aes256GcmSha384 => {
-                AeadEngine::Aes256(Aes256Gcm::new_from_slice(&key).ok()?)
+                AeadEngine::Aes256(Box::new(Aes256Gcm::new_from_slice(&key).ok()?))
             }
         };
         Some(Self {
