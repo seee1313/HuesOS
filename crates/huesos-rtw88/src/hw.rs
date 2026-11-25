@@ -37,6 +37,7 @@ pub const RTK_PCI_HIMR0: u32 = 0x00B0;
 pub const RTK_PCI_HISR0: u32 = 0x00B4;
 pub const RTK_PCI_HIMR1: u32 = 0x00B8;
 pub const RTK_PCI_HISR1: u32 = 0x00BC;
+pub const REG_WIFI_BT_INFO: u32 = 0x00AA;
 pub const REG_EFUSE_ACCESS: u32 = 0x00CF;
 pub const REG_WLRF1: u32 = 0x00EC;
 pub const REG_SYS_CFG1: u32 = 0x00F0;
@@ -109,6 +110,7 @@ pub const REG_AMPDU_MAX_TIME_V1: u32 = 0x0455;
 pub const REG_BCNQ1_BDNY_V1: u32 = 0x0456;
 pub const REG_TX_HANG_CTRL: u32 = 0x045E;
 pub const REG_DATA_SC: u32 = 0x0483;
+pub const REG_QUEUE_CTRL: u32 = 0x04C6;
 pub const REG_PROT_MODE_CTRL: u32 = 0x04C8;
 pub const REG_BAR_MODE_CTRL: u32 = 0x04CC;
 pub const REG_PRECNT_CTRL: u32 = 0x04E5;
@@ -149,39 +151,47 @@ pub const RTW_SEC_CONFIG: u32 = 0x0680;
 pub const REG_RXFLTMAP0: u32 = 0x06A0;
 pub const REG_RXFLTMAP1: u32 = 0x06A2;
 pub const REG_RXFLTMAP2: u32 = 0x06A4;
+pub const REG_BT_COEX_TABLE0: u32 = 0x06C0;
+pub const REG_BT_COEX_TABLE1: u32 = 0x06C4;
+pub const REG_BT_COEX_BRK_TABLE: u32 = 0x06C8;
+pub const REG_BT_COEX_TABLE_H: u32 = 0x06CC;
 pub const RTK_PCIE_LINK_CFG: u16 = 0x0719;
+pub const REG_BT_COEX_V2: u32 = 0x0762;
+pub const REG_BT_STAT_CTRL: u32 = 0x0778;
+pub const REG_BT_TDMA_TIME: u32 = 0x0790;
 pub const REG_WMAC_OPTION_FUNCTION: u32 = 0x07D0;
 
-// 8821C BB / RF registers
+// 8821C BB / RF registers (exact `rtw8821c.h` + `reg.h` silicon offsets)
 pub const REG_SYS_CTRL: u32 = 0x0000;
 pub const REG_INIRTS_RATE_SEL: u32 = 0x0480;
 pub const REG_SND_PTCL_CTRL: u32 = 0x0718;
 pub const REG_RXPSEL: u32 = 0x0808;
-pub const REG_TXDFIR: u32 = 0x080C;
-pub const REG_ACBB0: u32 = 0x0958;
-pub const REG_ACBBRXFIR: u32 = 0x095C;
-pub const REG_ADCCLK: u32 = 0x09B4;
-pub const REG_ADC40: u32 = 0x09B8;
-pub const REG_ADC160: u32 = 0x09BC;
+pub const REG_RXCCAMSK: u32 = 0x0814;
+pub const REG_CLKTRK: u32 = 0x0860;
+pub const REG_ADCCLK: u32 = 0x08AC;
+pub const REG_ADC160: u32 = 0x08C4;
+pub const REG_ADC40: u32 = 0x08C8;
+pub const REG_CHFIR: u32 = 0x08F0;
+pub const REG_ACBB0: u32 = 0x0948;
+pub const REG_ACBBRXFIR: u32 = 0x094C;
 pub const REG_RXSB: u32 = 0x0A00;
+pub const REG_PWRTH: u32 = 0x0A08;
 pub const REG_CCA_FLTR: u32 = 0x0A20;
 pub const REG_TXSF2: u32 = 0x0A24;
 pub const REG_TXSF6: u32 = 0x0A28;
-pub const REG_RXCCAMSK: u32 = 0x0A2C;
-pub const REG_PWRTH: u32 = 0x0A30;
-pub const REG_PWRTH2: u32 = 0x0A34;
+pub const REG_CCK0_FAREPORT: u32 = 0x0A2C;
+pub const REG_ENTXCCK: u32 = 0x0A80;
+pub const REG_ENRXCCA: u32 = 0x0A84;
+pub const REG_PWRTH2: u32 = 0x0AA8;
 pub const REG_CSRATIO: u32 = 0x0AAA;
 pub const REG_TXFILTER: u32 = 0x0AAC;
-pub const REG_CCK0_FAREPORT: u32 = 0x0A5C;
-pub const REG_CHFIR: u32 = 0x0A80;
 pub const REG_TXSCALE_A: u32 = 0x0C1C;
+pub const REG_TXDFIR: u32 = 0x0C20;
 pub const REG_RXIGI_A: u32 = 0x0C50;
-pub const REG_CLKTRK: u32 = 0x0C60;
 pub const REG_LSSI_WRITE_A: u32 = 0x0C90;
 pub const REG_RFE_CTRL8: u32 = 0x0CB4;
 pub const REG_RFECTL: u32 = 0x0CB8;
-pub const REG_ENRXCCA: u32 = 0x0CC0;
-pub const REG_ENTXCCK: u32 = 0x0CC8;
+pub const REG_TXAGC_A_BASE: u32 = 0x1D00;
 pub const RTK_PCI_HIMR3: u32 = 0x10B8;
 pub const RTK_PCI_HISR3: u32 = 0x10BC;
 pub const REG_CPU_DMEM_CON: u32 = 0x1080;
@@ -324,6 +334,9 @@ pub struct Rtw8821cEfuseInfo {
     pub thermal_meter: u8,
     pub tx_bb_swing_2g: u8,
     pub tx_bb_swing_5g: u8,
+    pub txpwr_2g_cck: [u8; 6],
+    pub txpwr_2g_bw40: [u8; 5],
+    pub txpwr_5g_bw40: [u8; 14],
     pub country_code: [u8; 2],
     pub efuse_valid: bool,
 }
@@ -339,6 +352,9 @@ impl Default for Rtw8821cEfuseInfo {
             thermal_meter: 0x1A,
             tx_bb_swing_2g: 0,
             tx_bb_swing_5g: 0,
+            txpwr_2g_cck: [0x28; 6],
+            txpwr_2g_bw40: [0x28; 5],
+            txpwr_5g_bw40: [0x28; 14],
             country_code: *b"00",
             efuse_valid: false,
         }
@@ -583,23 +599,27 @@ impl Rtl8821ceHw {
         self.mac_init_8821c(mmio);
         self.drv_info_cfg(mmio);
 
-        // 9. Power up BB/RF, load authentic 8821C MAC/BB/AGC/RF tables, set XTAL & WL antenna
+        // 9. Power up BB/RF, load authentic 8821C MAC/BB/AGC/RF tables, set XTAL & PTA/Coex
         self.phy_set_param_8821c(mmio);
-        self.coex_wifi_only_init_8821c(mmio);
+        self.coex_init_hw_config_8821c(mmio);
 
-        // 10. Enable hardware AES-CCMP security engine & RX filter (including AMF + ADF!)
+        // 10. Enable hardware AES-CCMP security engine & RX filter (`rtwdev->hal.rcr`).
+        //     On 8821C (WCPU_3081), frame-type acceptance is controlled by `REG_RXFLTMAP0/1/2`
+        //     (`0xFFFF / 0x0FFF / 0xFFFF`), while `BIT(11)` of `REG_RCR` is `BIT_TA_BCN`
+        //     (which drops Beacons from non-associated BSSIDs if set!). Match Linux `rtw88`
+        //     `0xF410_400E` with `BIT_CBSSID_BCN | BIT_CBSSID_DATA` cleared so all Beacons,
+        //     Probe Responses, Auth/Assoc, and Data frames pass cleanly.
         self.enable_sec_engine(mmio);
-        let rcr = (1u32 << 31) // APP_FCS
-            | (1u32 << 30) // APP_MIC
-            | (1u32 << 29) // APP_ICV
-            | (1u32 << 28) // APP_PHYSTS
-            | (1u32 << 20) // PKTCTL_DLEN
-            | (1u32 << 14) // HTC_LOC_CTRL
-            | (1u32 << 13) // AMF (Accept 802.11 Management Frames: Beacon/ProbeResp/Auth/Assoc)
-            | (1u32 << 11) // RCR_ADF (Accept 802.11 Data Frames)
-            | (1u32 << 3)  // AB (Broadcast)
-            | (1u32 << 2)  // AM (Multicast)
-            | (1u32 << 1); // APM (Unicast match)
+        let rcr = (1u32 << 31) // BIT_APP_FCS
+            | (1u32 << 30) // BIT_APP_MIC
+            | (1u32 << 29) // BIT_APP_ICV
+            | (1u32 << 28) // BIT_APP_PHYSTS
+            | (1u32 << 26) // BIT_VHT_DACK
+            | (1u32 << 20) // BIT_PKTCTL_DLEN
+            | (1u32 << 14) // BIT_HTC_LOC_CTRL
+            | (1u32 << 3)  // BIT_AB (Broadcast)
+            | (1u32 << 2)  // BIT_AM (Multicast)
+            | (1u32 << 1); // BIT_APM (Unicast match)
         mmio.write32(REG_RCR, rcr);
         mmio.write32(REG_MAR, 0xFFFF_FFFF);
         mmio.write32(REG_MAR + 4, 0xFFFF_FFFF);
@@ -1000,6 +1020,28 @@ impl Rtl8821ceHw {
             *b"00"
         };
 
+        let mut txpwr_2g_cck = [0x28u8; 6];
+        for (i, slot) in txpwr_2g_cck.iter_mut().enumerate() {
+            let v = log[0x10 + i];
+            if v != 0 && v < 0x3F {
+                *slot = v;
+            }
+        }
+        let mut txpwr_2g_bw40 = [0x28u8; 5];
+        for (i, slot) in txpwr_2g_bw40.iter_mut().enumerate() {
+            let v = log[0x16 + i];
+            if v != 0 && v < 0x3F {
+                *slot = v;
+            }
+        }
+        let mut txpwr_5g_bw40 = [0x28u8; 14];
+        for (i, slot) in txpwr_5g_bw40.iter_mut().enumerate() {
+            let v = log[0x22 + i];
+            if v != 0 && v < 0x3F {
+                *slot = v;
+            }
+        }
+
         let mut mac = [0u8; 6];
         mac.copy_from_slice(&log[0xD0..0xD6]);
         if mac == [0; 6] || mac == [0xFF; 6] || (mac[0] & 1) != 0 {
@@ -1016,6 +1058,9 @@ impl Rtl8821ceHw {
             thermal_meter: thermal,
             tx_bb_swing_2g: swing_2g,
             tx_bb_swing_5g: swing_5g,
+            txpwr_2g_cck,
+            txpwr_2g_bw40,
+            txpwr_5g_bw40,
             country_code: cc,
             efuse_valid: rtl_id == 0x8129 || rtl_id == 0x8821 || log[0xD0] != 0xFF,
         };
@@ -1698,7 +1743,8 @@ impl Rtl8821ceHw {
         mmio.write8(REG_WLRF1 + 3, 0x07);
         mmio.delay_us(10);
 
-        let rxpsel = mmio.read32(REG_RXPSEL) & !(1u32 << 28);
+        const BIT_RX_PSEL_RST: u32 = (1u32 << 28) | (1u32 << 29);
+        let rxpsel = mmio.read32(REG_RXPSEL) & !BIT_RX_PSEL_RST;
         mmio.write32(REG_RXPSEL, rxpsel);
 
         // Load all authentic 8821C silicon tables
@@ -1715,7 +1761,7 @@ impl Rtl8821ceHw {
         self.write32_mask(mmio, REG_AFE_PLL_CTRL, 0x0000_007E, xtal);
         self.write32_mask(mmio, REG_CCK0_FAREPORT, (1u32 << 18) | (1u32 << 22), 0);
 
-        let rxpsel_post = mmio.read32(REG_RXPSEL) | (1u32 << 28);
+        let rxpsel_post = mmio.read32(REG_RXPSEL) | BIT_RX_PSEL_RST;
         mmio.write32(REG_RXPSEL, rxpsel_post);
 
         self.ch_param[0] = mmio.read32(REG_TXSF2);
@@ -1723,39 +1769,173 @@ impl Rtl8821ceHw {
         self.ch_param[2] = mmio.read32(REG_TXFILTER);
         self.cck_pd_default = mmio.read8(REG_CSRATIO) & 0x1F;
 
+        // Set DIG Initial Gain (`REG_RXIGI_A[6:0]`) to `chip->dig_min = 0x1C`
+        // (`rtw_phy_dig_init` / `rtw_phy_dig_set_max_coverage`) for full RX sensitivity.
+        self.write32_mask(mmio, REG_RXIGI_A, 0x0000_007F, 0x1C);
+
         // Beamforming grouping bitmap (`rtw8821c_phy_bf_init`)
         mmio.write32(0x1C94, 0xAFFF_AFFF);
     }
 
-    /// Force Wi-Fi-only antenna & PTA ownership (`rtw_coex_wifi_only_hw_config` +
-    /// `COEX_SET_ANT_WONLY` for M.2 `RTL8821CE` Wi-Fi + Bluetooth combo cards).
-    fn coex_wifi_only_init_8821c<M: Rtw88Mmio>(&self, mmio: &mut M) {
-        // Route LTE/PTA mux control to WL (`BIT_LTE_MUX_CTRL_PATH = BIT(26)` in `REG_SYS_SDIO_CTRL`)
+    /// Initialize 8821C Wi-Fi + Bluetooth hardware PTA coexistence (`rtw8821c_coex_cfg_init` +
+    /// `__rtw_coex_init_hw_config` + Scoreboard `REG_WIFI_BT_INFO`) so Wi-Fi works cleanly
+    /// even when the combo card's USB Bluetooth side is simultaneously active on a host OS.
+    fn coex_init_hw_config_8821c<M: Rtw88Mmio>(&self, mmio: &mut M) {
+        // 1. Enable TBTT function & BT statistics / sample rate (`rtw8821c_coex_cfg_init`)
+        let bcn = mmio.read8(REG_BCN_CTRL) | (1 << 3);
+        mmio.write8(REG_BCN_CTRL, bcn);
+        let tdma_time = (mmio.read8(REG_BT_TDMA_TIME) & !0x3F) | 0x05;
+        mmio.write8(REG_BT_TDMA_TIME, tdma_time);
+        mmio.write8(REG_BT_STAT_CTRL, 0x01); // BT_CNT_ENABLE
+
+        // 2. Enable 3-wire PTA between WL and BT (`BIT_BT_PTA_EN | BIT_PO_BT_PTA_PINS`)
+        //    and clear debug overrides (`rtw8821c_coex_cfg_gnt_debug`)
+        let mut gpio_mux = mmio.read32(REG_GPIO_MUXCFG);
+        gpio_mux = (gpio_mux | (1u32 << 5) | (1u32 << 9)) & !(1u32 << 19);
+        mmio.write32(REG_GPIO_MUXCFG, gpio_mux);
+
+        let mut qctrl = mmio.read8(REG_QUEUE_CTRL);
+        qctrl = (qctrl | (1 << 4)) & !(1 << 5); // BIT_PTA_WL_TX_EN=1, BIT_PTA_EDCCA_EN=0
+        mmio.write8(REG_QUEUE_CTRL, qctrl);
+
+        let bt_coex_v2 = mmio.read16(REG_BT_COEX_V2) | (1u16 << 12); // BIT_GNT_BT_POLARITY
+        mmio.write16(REG_BT_COEX_V2, bt_coex_v2);
+
+        // High-priority WL masks (`TX_RSP`, `TX_BEACON`, `RX_SCAN`, `TX_BEACONQ`)
+        let tbl_h0 = mmio.read8(REG_BT_COEX_TABLE_H) | (1 << 3) | (1 << 4);
+        mmio.write8(REG_BT_COEX_TABLE_H, tbl_h0);
+        let tbl_h3 = mmio.read8(REG_BT_COEX_TABLE_H + 3) | (1 << 3); // BIT_BCN_QUEUE
+        mmio.write8(REG_BT_COEX_TABLE_H + 3, tbl_h3);
+
+        // Shared-antenna PTA slot arbitration (`table_sant_8821c[4]` = 0x5A5A_5A5A:
+        // grants WL RX/TX against low-pri BT while preserving BT A2DP/SCO high-pri)
+        mmio.write32(REG_BT_COEX_TABLE0, 0x5A5A_5A5A);
+        mmio.write32(REG_BT_COEX_TABLE1, 0x5A5A_5A5A);
+        mmio.write32(REG_BT_COEX_BRK_TABLE, 0xF0FF_FFFF);
+
+        // Clear GNT debug / SDIO pins (`rtw8821c_coex_cfg_gnt_debug`)
+        let sdio = mmio.read32(REG_SYS_SDIO_CTRL) & !((1u32 << 18) | (1u32 << 27));
+        mmio.write32(REG_SYS_SDIO_CTRL, sdio);
+
+        // Notify Bluetooth MCU via Scoreboard (`COEX_SCBD_ACTIVE | COEX_SCBD_ONOFF | BIT_BT_INT_EN`)
+        mmio.write16(REG_WIFI_BT_INFO, (1u16 << 15) | 0x0003);
+
+        // Configure initial 2.4 GHz PTA & external DPDT/SPDT antenna switch
+        self.coex_set_ant_path_8821c(mmio, false);
+    }
+
+    /// Program external M.2 DPDT/SPDT antenna switch & `LTE_COEX_CTRL` GNT lines
+    /// for 2.4 GHz (`COEX_SET_ANT_2G`) or 5 GHz (`COEX_SET_ANT_5G`), strictly
+    /// following `rtw8821c_coex_cfg_rfe_type` + `rtw8821c_coex_cfg_ant_switch`.
+    fn coex_set_ant_path_8821c<M: Rtw88Mmio>(&self, mmio: &mut M, is_5g: bool) {
+        // 1. Decode board RFE topology (`rtw8821c_coex_cfg_rfe_type`, `rtw8821c.c:947..987`)
+        let rfe_type = self.efuse.rfe_option;
+        let wlg_at_btg = matches!(rfe_type, 2 | 4 | 7 | 10 | 12 | 15);
+        let polarity_inverse = matches!(rfe_type, 3 | 4 | 11 | 12);
+
+        // 2. Give LTE/PTA mux ownership to WL (`BIT_LTE_MUX_CTRL_PATH = BIT(26)` of `0x0070`)
         let mux = mmio.read8(REG_SYS_SDIO_CTRL + 3) | (1 << 2);
         mmio.write8(REG_SYS_SDIO_CTRL + 3, mux);
 
-        // Program indirect `LTE_COEX_CTRL` (0x38):
-        //   GNT_BT (0xC000 ctrl + 0x0C00 val) -> COEX_GNT_SET_SW_LOW  (0x1)
-        //   GNT_WL (0x3000 ctrl + 0x0300 val) -> COEX_GNT_SET_SW_HIGH (0x3)
-        self.ltecoex_write_mask(mmio, LTE_COEX_CTRL, 0xC000, 0x1);
-        self.ltecoex_write_mask(mmio, LTE_COEX_CTRL, 0x0C00, 0x1);
-        self.ltecoex_write_mask(mmio, LTE_COEX_CTRL, 0x3000, 0x3);
-        self.ltecoex_write_mask(mmio, LTE_COEX_CTRL, 0x0300, 0x3);
+        // 3. Program `LTE_COEX_CTRL` (0x0038):
+        //    - 2.4 GHz (`COEX_SET_ANT_2G`): `GNT_BT = HW_PTA (0x0)`, `GNT_WL = HW_PTA (0x0)`
+        //    - 5 GHz   (`COEX_SET_ANT_5G`): `GNT_BT = HW_PTA (0x0)`, `GNT_WL = SW_HIGH (0x3)`
+        let gnt_wl = if is_5g { 0x3 } else { 0x0 };
+        self.ltecoex_write_mask(mmio, LTE_COEX_CTRL, 0xC000, 0x0);
+        self.ltecoex_write_mask(mmio, LTE_COEX_CTRL, 0x0C00, 0x0);
+        self.ltecoex_write_mask(mmio, LTE_COEX_CTRL, 0x3000, gnt_wl);
+        self.ltecoex_write_mask(mmio, LTE_COEX_CTRL, 0x0300, gnt_wl);
 
-        // Switch external DPDT / RFE control pins to BB/WL (`rtw8821c_switch_ant_set`)
-        let mut pad2 = mmio.read8(REG_PAD_CTRL1 + 2);
-        pad2 &= !(1 << 0); // clear BIT_BT_BTG_SEL so BT does not hijack 2.4G path
-        mmio.write8(REG_PAD_CTRL1 + 2, pad2);
+        // 4. Hand DPDT control from BT to WL/BB (`REG_LED_CFG`: clear `BIT_DPDT_SEL_EN = BIT(23)`,
+        //    set `BIT_DPDT_WL_SEL = BIT(24)`)
+        let mut led = mmio.read32(REG_LED_CFG);
+        led = (led & !(1u32 << 23)) | (1u32 << 24);
+        mmio.write32(REG_LED_CFG, led);
 
-        let led2 = mmio.read8(REG_LED_CFG + 2) & !(1 << 5); // DPDT_SEL_EN = BB
-        mmio.write8(REG_LED_CFG + 2, led2);
+        // 5. Clear `BIT_BT_BTG_SEL` (`BIT(31)` of `REG_PAD_CTRL1` = bit 7 of `0x0067`) and
+        //    enable `BIT_CTRL_TYPE1 | BIT_CTRL_TYPE2` (`BIT(5) | BIT(4)` of `REG_CTRL_TYPE = 0x0067`)
+        let mut ctrl = mmio.read8(REG_CTRL_TYPE);
+        ctrl = (ctrl & !(1 << 7)) | (1 << 5) | (1 << 4);
+        mmio.write8(REG_CTRL_TYPE, ctrl);
 
-        let ctrl_type = mmio.read8(REG_CTRL_TYPE) | (1 << 7); // BIT_CTRL_TYPE1 | BIT_CTRL_TYPE2 -> DPDT
-        mmio.write8(REG_CTRL_TYPE, ctrl_type);
+        // 6. Select RFE_CTRL8 pin mux (`[7:0]`) and DPDT switch nibble (`[31:28]`, `0xF000_0000`)
+        //    (`rtw8821c_coex_cfg_ant_switch`, `rtw8821c.c:850..901`)
+        let (pin_mux, regval): (u32, u32) = if wlg_at_btg {
+            // `COEX_SWITCH_CTRL_BY_BBSW` (`DPDT_CTRL_PIN = 0x77`)
+            let rv = if polarity_inverse {
+                // `pos_type = COEX_SWITCH_TO_WLA`, `polarity_inverse = true` => `0x2`
+                0x2
+            } else if rfe_type != 4 && rfe_type != 2 {
+                // `pos_type = COEX_SWITCH_TO_WLG_BT` => `0x3`
+                0x3
+            } else {
+                0x2
+            };
+            (0x77, rv)
+        } else if is_5g {
+            // `COEX_SET_ANT_5G`: `COEX_SWITCH_CTRL_BY_BBSW`, `COEX_SWITCH_TO_WLA`
+            let rv = if !polarity_inverse { 0x1 } else { 0x2 };
+            (0x77, rv)
+        } else {
+            // `COEX_SET_ANT_2G`: `COEX_SWITCH_CTRL_BY_PTA` (`PTA_CTRL_PIN = 0x66`)
+            let rv = if !polarity_inverse { 0x2 } else { 0x1 };
+            (0x66, rv)
+        };
+        self.write32_mask(mmio, REG_RFE_CTRL8, 0x0000_00FF, pin_mux);
+        self.write32_mask(mmio, REG_RFE_CTRL8, 0xF000_0000, regval);
+    }
 
-        // RFE_CTRL8: RFE source = WL/BB (`0x77` for switch control, direction to WL main antenna)
-        self.write32_mask(mmio, REG_RFE_CTRL8, 0x0000_00FF, 0x77);
-        self.write32_mask(mmio, REG_RFE_CTRL8, 0x0030_0000, 0x01);
+    /// Program per-rate Path-A TX power indices (`0x1D00..0x1D54`) from factory EFUSE
+    /// (`rtw8821c_set_tx_power_index`, `rtw8821c.c:685..722`). Without this, `0x1D00..`
+    /// remains `0x00` (~ -16 dBm), making transmitted Probe Requests / Auth frames inaudible.
+    fn set_tx_power_index_8821c<M: Rtw88Mmio>(&self, mmio: &mut M, ch: u8) {
+        let pack4 = |p: u8| -> u32 {
+            let b = u32::from(p.min(0x3F));
+            b | (b << 8) | (b << 16) | (b << 24)
+        };
+        if ch <= 14 {
+            let grp_cck = match ch {
+                1..=2 => 0,
+                3..=5 => 1,
+                6..=8 => 2,
+                9..=11 => 3,
+                12..=13 => 4,
+                _ => 5,
+            };
+            let grp_ofdm = grp_cck.min(4);
+            let cck_w = pack4(self.efuse.txpwr_2g_cck[grp_cck]);
+            let ofdm_w = pack4(self.efuse.txpwr_2g_bw40[grp_ofdm]);
+            // CCK 1M/2M/5.5M/11M (`0x00..0x03`)
+            mmio.write32(REG_TXAGC_A_BASE, cck_w);
+            // OFDM 6M..54M (`0x04..0x0B`), HT MCS0..7 (`0x0C..0x13`), VHT 1SS MCS0..9 (`0x2C..0x35`)
+            for off in [0x04u32, 0x08, 0x0C, 0x10, 0x2C, 0x30] {
+                mmio.write32(REG_TXAGC_A_BASE + off, ofdm_w);
+            }
+            let p = u32::from(self.efuse.txpwr_2g_bw40[grp_ofdm].min(0x3F));
+            mmio.write32(REG_TXAGC_A_BASE + 0x34, p | (p << 8));
+        } else {
+            let grp_5g = match ch {
+                36..=42 => 0,
+                44..=48 => 1,
+                50..=58 => 2,
+                60..=64 => 3,
+                100..=106 => 4,
+                108..=114 => 5,
+                116..=122 => 6,
+                124..=130 => 7,
+                132..=138 => 8,
+                140..=144 => 9,
+                149..=155 => 10,
+                157..=161 => 11,
+                _ => 12,
+            };
+            let w = pack4(self.efuse.txpwr_5g_bw40[grp_5g]);
+            for off in [0x04u32, 0x08, 0x0C, 0x10, 0x2C, 0x30] {
+                mmio.write32(REG_TXAGC_A_BASE + off, w);
+            }
+            let p = u32::from(self.efuse.txpwr_5g_bw40[grp_5g].min(0x3F));
+            mmio.write32(REG_TXAGC_A_BASE + 0x34, p | (p << 8));
+        }
     }
 
     fn enable_sec_engine<M: Rtw88Mmio>(&self, mmio: &mut M) {
@@ -1881,30 +2061,38 @@ impl Rtl8821ceHw {
         mmio.write32(REG_SYS_CTRL, sys);
 
         let mut rfectl = mmio.read32(REG_RFECTL);
-        // Realtek 8821C RFE switch bits:
-        // B_BTG_SWITCH=BIT(16), B_CTRL_SWITCH=BIT(18), B_WL_SWITCH=BIT(17)|BIT(15)?
-        // Exact bits from rtw8821c.h: B_BTG_SWITCH=BIT(16), B_CTRL_SWITCH=BIT(18),
-        // B_WL_SWITCH=BIT(17), B_WLG_SWITCH=BIT(19), B_WLA_SWITCH=BIT(20)
-        const B_BTG: u32 = 1 << 16;
-        const B_WL: u32 = 1 << 17;
-        const B_CTRL: u32 = 1 << 18;
-        const B_WLG: u32 = 1 << 19;
-        const B_WLA: u32 = 1 << 20;
+        // Authentic `rtw8821c.h:251..255` internal RFE switch bitmasks & 2.4G LNA/CCA:
+        //   B_BTG_SWITCH  = BIT(16)
+        //   B_CTRL_SWITCH = BIT(18)
+        //   B_WL_SWITCH   = BIT(20) | BIT(22)
+        //   B_WLG_SWITCH  = BIT(21)
+        //   B_WLA_SWITCH  = BIT(23)
+        //   BTG_LNA = 0xFC84 (BTG_CCA = 0x0E), WLG_LNA = 0x7532 (WLG_CCA = 0x12)
+        const B_BTG_SWITCH: u32 = 1 << 16;
+        const B_CTRL_SWITCH: u32 = 1 << 18;
+        const B_WL_SWITCH: u32 = (1 << 20) | (1 << 22);
+        const B_WLG_SWITCH: u32 = 1 << 21;
+        const B_WLA_SWITCH: u32 = 1 << 23;
+        const BTG_LNA: u32 = 0xFC84;
+        const WLG_LNA: u32 = 0x7532;
         if ch <= 14 {
             if self.efuse.rfe_btg {
-                rfectl = (rfectl | B_BTG) & !(B_CTRL | B_WL | B_WLG | B_WLA);
+                rfectl = (rfectl | B_BTG_SWITCH)
+                    & !(B_CTRL_SWITCH | B_WL_SWITCH | B_WLG_SWITCH | B_WLA_SWITCH);
                 self.write32_mask(mmio, REG_ENRXCCA, 0x00FF_0000, 0x0E);
-                self.write32_mask(mmio, REG_ENTXCCK, 0x0000_FFFF, 0x8000);
+                self.write32_mask(mmio, REG_ENTXCCK, 0x0000_FFFF, BTG_LNA);
             } else {
-                rfectl = (rfectl | B_WL | B_WLG) & !(B_BTG | B_CTRL | B_WLA);
+                rfectl = (rfectl | B_WL_SWITCH | B_WLG_SWITCH)
+                    & !(B_BTG_SWITCH | B_CTRL_SWITCH | B_WLA_SWITCH);
                 self.write32_mask(mmio, REG_ENRXCCA, 0x00FF_0000, 0x12);
-                self.write32_mask(mmio, REG_ENTXCCK, 0x0000_FFFF, 0x0000);
+                self.write32_mask(mmio, REG_ENTXCCK, 0x0000_FFFF, WLG_LNA);
             }
             mmio.write32(REG_RFECTL, rfectl);
             self.write_rf(mmio, RF_LUTDBG, 1 << 6, 1);
             self.write_rf(mmio, 0x64, 0x0F, 0x0F);
         } else {
-            rfectl = (rfectl | B_WL | B_WLA) & !(B_BTG | B_CTRL | B_WLG);
+            rfectl = (rfectl | B_WL_SWITCH | B_WLA_SWITCH)
+                & !(B_BTG_SWITCH | B_CTRL_SWITCH | B_WLG_SWITCH);
             mmio.write32(REG_RFECTL, rfectl);
             self.write_rf(mmio, RF_LUTDBG, 1 << 6, 0);
         }
@@ -1953,6 +2141,12 @@ impl Rtl8821ceHw {
             self.write32_mask(mmio, REG_TXDFIR, 1 << 31, 1);
             self.write32_mask(mmio, REG_CHFIR, 1 << 31, 0);
         }
+
+        // 6. Program external DPDT/PTA antenna path (`COEX_SET_ANT_2G` / `COEX_SET_ANT_5G`),
+        //    per-rate TX power (`rtw_phy_set_tx_power_level`), and DIG RX gain (`0x1C`).
+        self.coex_set_ant_path_8821c(mmio, ch > 14);
+        self.set_tx_power_index_8821c(mmio, ch);
+        self.write32_mask(mmio, REG_RXIGI_A, 0x0000_007F, 0x1C);
     }
 
     // -----------------------------------------------------------------------
@@ -2015,7 +2209,10 @@ impl Rtl8821ceHw {
         dma: &mut D,
     ) -> Result<(), RtwError> {
         let mut body = [0u8; 4];
-        body[2] = self.fifo.rsvd_fw_txbuf_addr as u8;
+        body[2] = self
+            .fifo
+            .rsvd_fw_txbuf_addr
+            .saturating_sub(self.fifo.rsvd_boundary) as u8;
         self.send_h2c_pkt(mmio, dma, 0x0D, &body)
     }
 
@@ -2030,7 +2227,7 @@ impl Rtl8821ceHw {
     }
 
     pub fn trigger_iqk<M: Rtw88Mmio, D: Rtw88Dma>(&mut self, mmio: &mut M, dma: &mut D) {
-        let _ = self.send_h2c_pkt(mmio, dma, 0x0E, &[0x00]);
+        let _ = self.send_h2c_pkt(mmio, dma, 0x0E, &[0x00, 0x00, 0x00, 0x00]);
         for _ in 0..200 {
             if self.read_rf(mmio, RF_DTXLOK, RFREG_MASK) == 0xABCDE {
                 self.write_rf(mmio, RF_DTXLOK, RFREG_MASK, 0);
@@ -2100,8 +2297,9 @@ impl Rtl8821ceHw {
         self.write32_mask(mmio, REG_CR, 0x0003_0000, 3);
 
         // Accept ProbeReq, Auth, AssocReq and all data directed to our BSSID
-        let rcr = mmio.read32(REG_RCR) & !((1u32 << 7) | (1u32 << 6)); // clear CBSSID_BCN/DATA during AP
-        mmio.write32(REG_RCR, rcr | (1u32 << 13)); // BIT_AMF
+        // (keep `BIT_TA_BCN = BIT(11)` cleared!)
+        let rcr = mmio.read32(REG_RCR) & !((1u32 << 11) | (1u32 << 7) | (1u32 << 6));
+        mmio.write32(REG_RCR, rcr);
 
         mmio.write16(REG_BCNTCFG, 0x0200);
         mmio.write16(0x0518, beacon_int_tu); // REG_BCN_INTERVAL
@@ -2250,7 +2448,9 @@ impl Rtl8821ceHw {
         } else {
             RtwTxQueue::Be
         };
-        let rate = if is_mgmt {
+        let is_bmc = mpdu.len() >= 10 && (mpdu[4] & 0x01) != 0;
+        let use_basic_rate = is_mgmt || is_bmc;
+        let rate = if use_basic_rate {
             if self.current_channel > 14 {
                 DESC_RATE6M
             } else {
@@ -2259,7 +2459,7 @@ impl Rtl8821ceHw {
         } else {
             DESC_RATEMCS7
         };
-        self.tx_raw_ring(mmio, dma, queue, mpdu, rate, is_mgmt, false)
+        self.tx_raw_ring(mmio, dma, queue, mpdu, rate, use_basic_rate, false)
     }
 
     /// Poll and acknowledge pending interrupt status, then pop at most one
