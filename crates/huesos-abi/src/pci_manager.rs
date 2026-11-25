@@ -43,6 +43,12 @@ pub const DEVICE_LEASE_NVME_RO_LABEL: &[u8] = b"pci-lease-ro:nvme";
 /// Label carrying a narrow lease-bound `Resource` handle (`Mmio`, `IoPort`,
 /// `Irq`, or `DmaPool`) minted via `DeviceLeaseMintResource` (AP-21).
 pub const LEASE_RESOURCE_LABEL: &[u8] = b"pci-lease-res";
+/// Label carrying the immutable `HIOM` IOMMU discovery VMO from DriverManager
+/// to PCI Manager (Stage N.1).
+pub const IOMMU_VMO_LABEL: &[u8] = b"pci-iommu-vmo";
+/// Label carrying the immutable `HPIN` PCI inventory VMO from PCI Manager to
+/// DriverManager (Stage D.3).
+pub const INVENTORY_VMO_LABEL: &[u8] = b"pci-inventory-vmo";
 
 /// Configuration override: serve configuration reads through the
 /// legacy CF8/CFC mechanism (#1) even though ECAM authority is mapped.

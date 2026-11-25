@@ -63,8 +63,13 @@ pub mod storage_boot;
 pub mod pci;
 /// PCI Manager bootstrap and lifecycle control protocol.
 pub mod pci_config;
+/// Immutable zero-bus-traffic PCI inventory VMO wire format (`HPIN`, Stage D.3).
+pub mod pci_inventory;
+/// Immutable IOMMU firmware discovery VMO wire format (`HIOM`, Stage N.1 / N.3).
+pub mod pci_iommu;
 /// Kernel-enforced PCI `DeviceLease` ABI (AP-20).
 pub mod pci_lease;
+/// PCI Manager supervision and capability handoff protocol.
 pub mod pci_manager;
 /// Dedicated ACPI ↔ PCI configuration read mediation protocol (AP-10).
 pub mod pci_mediation;

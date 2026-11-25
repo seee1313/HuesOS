@@ -26,13 +26,21 @@ pub mod capability;
 /// Manifest-driven PCI driver binding, interrupt transaction planning, and DMA pools (H.3 + I).
 #[cfg(feature = "alloc")]
 pub mod driver_binding;
+/// Reserved-space PCIe hotplug event queue, subtree insertion, and removal (Stage K).
+#[cfg(feature = "alloc")]
+pub mod hotplug;
 /// Diagnostic read-only PCI bus inventory and availability state (AP-16).
 #[cfg(feature = "alloc")]
 pub mod inventory;
+/// Firmware IOMMU (`DMAR` / `IVRS`) discovery and validation policy (Stages N.1 & N.3).
+pub mod iommu;
 /// Generation-safe DeviceLease lifecycle policy.
 pub mod lease;
 /// ACPI MCFG allocation-table decoding and validation.
 pub mod mcfg;
+/// Transactional restart rebalance and `QuiesceRemap` live relocation protocol (Stages L & M.1).
+#[cfg(feature = "alloc")]
+pub mod rebalance;
 /// Deterministic firmware-preserving BAR/window allocation plans.
 #[cfg(feature = "alloc")]
 pub mod resource_planner;

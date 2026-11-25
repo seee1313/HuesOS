@@ -65,14 +65,80 @@ impl PlannedResource {
     }
 }
 
+/// Configurable hotplug capacity reserved below hotplug-capable PCIe ports (Stage F.3).
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct HotplugReservePolicy {
+    /// Additional downstream bus numbers reserved when parent subordinate bus permits.
+    pub extra_buses: u8,
+    /// Additional I/O window bytes reserved (`BRIDGE_IO_GRANULARITY` aligned).
+    pub io_bytes: u64,
+    /// Additional 32-bit MMIO window bytes reserved (`BRIDGE_MEMORY_GRANULARITY` aligned).
+    pub mmio32_bytes: u64,
+    /// Additional 64-bit prefetchable window bytes reserved (`BRIDGE_MEMORY_GRANULARITY` aligned).
+    pub prefetch_mmio64_bytes: u64,
+}
+
+impl HotplugReservePolicy {
+    /// Zero hotplug reservation (stock firmware-preserving behavior).
+    pub const NONE: Self = Self {
+        extra_buses: 0,
+        io_bytes: 0,
+        mmio32_bytes: 0,
+        prefetch_mmio64_bytes: 0,
+    };
+
+    /// Standard PCIe hotplug port reservation (`2` extra buses, `2 MiB` MMIO32, `4 MiB` pref64).
+    pub const STANDARD_PCIE_SLOT: Self = Self {
+        extra_buses: 2,
+        io_bytes: 0,
+        mmio32_bytes: 2 * BRIDGE_MEMORY_GRANULARITY,
+        prefetch_mmio64_bytes: 4 * BRIDGE_MEMORY_GRANULARITY,
+    };
+
+    const fn reserve_for_class(self, class: ResourceClass) -> u64 {
+        match class {
+            ResourceClass::Io => self.io_bytes,
+            ResourceClass::Mmio32 => self.mmio32_bytes,
+            ResourceClass::Mmio64 | ResourceClass::PrefetchableMemory => self.prefetch_mmio64_bytes,
+        }
+    }
+}
+
+/// Bus-number hotplug slack recorded for one hotplug-capable bridge port (Stage F.3).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PlannedBusReserve {
+    /// Bridge routing address.
+    pub bridge: PciAddress,
+    /// Bridge secondary bus.
+    pub secondary_bus: u8,
+    /// Current highest occupied bus below `bridge`.
+    pub used_subordinate_bus: u8,
+    /// Planned subordinate bus ceiling including hotplug reserve.
+    pub reserved_subordinate_bus: u8,
+}
+
 /// Complete deterministic plan.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ResourcePlan {
     topology_generation: u64,
     resources: Vec<PlannedResource>,
+    bus_reserves: Vec<PlannedBusReserve>,
 }
 
 impl ResourcePlan {
+    pub(crate) fn from_parts(
+        topology_generation: u64,
+        mut resources: Vec<PlannedResource>,
+        bus_reserves: Vec<PlannedBusReserve>,
+    ) -> Self {
+        resources.sort_by_key(|r| (r.owner, r.register));
+        Self {
+            topology_generation,
+            resources,
+            bus_reserves,
+        }
+    }
+
     /// Topology generation this plan was calculated against.
     pub const fn topology_generation(&self) -> u64 {
         self.topology_generation
@@ -81,6 +147,11 @@ impl ResourcePlan {
     /// Resources ordered by owner/register.
     pub fn resources(&self) -> &[PlannedResource] {
         &self.resources
+    }
+
+    /// Reserved bus-number ranges for hotplug-capable bridge ports (Stage F.3).
+    pub fn bus_reserves(&self) -> &[PlannedBusReserve] {
+        &self.bus_reserves
     }
 
     /// Find one planned BAR/window.
@@ -130,11 +201,29 @@ struct Occupied {
 }
 
 /// Create a plan that preserves every valid firmware assignment and fills only
-/// unassigned requirements.
+/// unassigned requirements (including bottom-up synthesis of missing bridge windows).
 pub fn plan_firmware_preserving(
     topology: &TopologySnapshot,
     apertures: &[RootAperture],
     validation: &ValidationReport,
+) -> Result<ResourcePlan, PlanError> {
+    plan_with_hotplug_reserves(
+        topology,
+        apertures,
+        validation,
+        &[],
+        HotplugReservePolicy::NONE,
+    )
+}
+
+/// Create a firmware-preserving plan with bottom-up bridge window aggregation
+/// and configurable hotplug capacity below `hotplug_ports` (Stages F.1 & F.3).
+pub fn plan_with_hotplug_reserves(
+    topology: &TopologySnapshot,
+    apertures: &[RootAperture],
+    validation: &ValidationReport,
+    hotplug_ports: &[PciAddress],
+    reserve_policy: HotplugReservePolicy,
 ) -> Result<ResourcePlan, PlanError> {
     if validation.resources().len() > MAX_PLANNED_RESOURCES {
         return Err(PlanError::TooManyResources);
@@ -142,14 +231,15 @@ pub fn plan_firmware_preserving(
     if !validation.is_conflict_free() {
         return Err(PlanError::InvalidValidationReport);
     }
+    validate_hotplug_reserve_policy(reserve_policy)?;
 
     let mut planned = Vec::new();
     planned
-        .try_reserve_exact(validation.resources().len())
+        .try_reserve(validation.resources().len().saturating_add(16))
         .map_err(|_| PlanError::NoMemory)?;
     let mut occupied = Vec::new();
     occupied
-        .try_reserve_exact(validation.resources().len())
+        .try_reserve(validation.resources().len().saturating_add(16))
         .map_err(|_| PlanError::NoMemory)?;
 
     // Preserve every firmware assignment before allocating anything new.
@@ -192,16 +282,28 @@ pub fn plan_firmware_preserving(
         });
     }
 
-    // Parent windows must exist before resources below them are allocated.
+    // Validate all explicit unassigned requirements first so malformed inputs
+    // (such as unrounded bridge windows) are rejected before aggregation.
     let mut pending = Vec::new();
     pending
-        .try_reserve_exact(validation.resources().len())
+        .try_reserve(validation.resources().len().saturating_add(16))
         .map_err(|_| PlanError::NoMemory)?;
     for validated in validation.resources() {
         if validated.status == ResourceStatus::Unassigned {
+            validate_requirement(topology, validated.resource)?;
             pending.push(validated.resource);
         }
     }
+
+    // Stage F.1 + F.3: bottom-up bridge window sizing + hotplug reserve slack.
+    aggregate_bottom_up_bridge_windows(
+        topology,
+        &planned,
+        &mut pending,
+        hotplug_ports,
+        reserve_policy,
+    )?;
+
     pending.sort_by_key(|resource| allocation_order(topology, *resource));
 
     for resource in pending {
@@ -235,11 +337,193 @@ pub fn plan_firmware_preserving(
         });
     }
 
+    let bus_reserves = compute_hotplug_bus_reserves(topology, hotplug_ports, reserve_policy)?;
+
     planned.sort_by_key(|resource| (resource.owner, resource.register));
     Ok(ResourcePlan {
         topology_generation: topology.generation(),
         resources: planned,
+        bus_reserves,
     })
+}
+
+fn validate_hotplug_reserve_policy(policy: HotplugReservePolicy) -> Result<(), PlanError> {
+    if !policy.io_bytes.is_multiple_of(BRIDGE_IO_GRANULARITY)
+        || !policy
+            .mmio32_bytes
+            .is_multiple_of(BRIDGE_MEMORY_GRANULARITY)
+        || !policy
+            .prefetch_mmio64_bytes
+            .is_multiple_of(BRIDGE_MEMORY_GRANULARITY)
+    {
+        return Err(PlanError::InvalidRequirement);
+    }
+    Ok(())
+}
+
+fn window_index_for_class(class: ResourceClass) -> u8 {
+    match class {
+        ResourceClass::Io => 0,
+        ResourceClass::Mmio32 => 1,
+        ResourceClass::Mmio64 | ResourceClass::PrefetchableMemory => 2,
+    }
+}
+
+fn aggregate_bottom_up_bridge_windows(
+    topology: &TopologySnapshot,
+    preserved: &[PlannedResource],
+    pending: &mut Vec<FirmwareResource>,
+    hotplug_ports: &[PciAddress],
+    reserve_policy: HotplugReservePolicy,
+) -> Result<(), PlanError> {
+    let mut bridges = Vec::new();
+    bridges
+        .try_reserve(topology.nodes().len())
+        .map_err(|_| PlanError::NoMemory)?;
+    for node in topology.nodes() {
+        if matches!(node.function.kind, FunctionKind::PciBridge { .. }) {
+            bridges.push((node.depth, node.function.address));
+        }
+    }
+    // Deepest bridges first so parent bridges see aggregated child bridge windows.
+    bridges.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+
+    const CLASSES: [ResourceClass; 4] = [
+        ResourceClass::Io,
+        ResourceClass::Mmio32,
+        ResourceClass::Mmio64,
+        ResourceClass::PrefetchableMemory,
+    ];
+
+    for &(_depth, bridge_addr) in &bridges {
+        let is_hotplug = hotplug_ports.contains(&bridge_addr);
+        for class in CLASSES {
+            let has_preserved_window = preserved.iter().any(|r| {
+                r.owner == bridge_addr
+                    && matches!(r.register, ResourceRegister::BridgeWindow(_))
+                    && r.class == class
+            });
+            if has_preserved_window {
+                continue;
+            }
+
+            let mut child_reqs: Vec<u64> = Vec::new();
+            for item in pending.iter() {
+                if item.class != class {
+                    continue;
+                }
+                let is_direct_child = topology
+                    .find(item.owner)
+                    .is_some_and(|n| n.parent == Parent::Bridge(bridge_addr));
+                if is_direct_child {
+                    child_reqs.try_reserve(1).map_err(|_| PlanError::NoMemory)?;
+                    child_reqs.push(item.len);
+                }
+            }
+            // Sort descending by natural alignment/size so packed sum has zero internal gaps.
+            child_reqs.sort_by(|a, b| b.cmp(a));
+            let mut needed = 0u64;
+            for len in child_reqs {
+                needed = needed
+                    .checked_add(len)
+                    .ok_or(PlanError::ArithmeticOverflow)?;
+            }
+            if is_hotplug {
+                // Avoid double-reserving both Mmio64 and PrefetchableMemory unless child uses Mmio64;
+                // standard PCIe prefetchable 64-bit window is ResourceClass::PrefetchableMemory.
+                let reserve = if class == ResourceClass::Mmio64 && needed == 0 {
+                    0
+                } else {
+                    reserve_policy.reserve_for_class(class)
+                };
+                needed = needed
+                    .checked_add(reserve)
+                    .ok_or(PlanError::ArithmeticOverflow)?;
+            }
+            if needed == 0 {
+                continue;
+            }
+            let gran = bridge_granularity(class);
+            let rounded = align_up(needed, gran)?;
+            if let Some(existing) = pending.iter_mut().find(|r| {
+                r.owner == bridge_addr
+                    && matches!(r.register, ResourceRegister::BridgeWindow(_))
+                    && r.class == class
+            }) {
+                if existing.len < rounded {
+                    existing.len = rounded;
+                }
+            } else {
+                if pending.len() >= MAX_PLANNED_RESOURCES {
+                    return Err(PlanError::TooManyResources);
+                }
+                pending.try_reserve(1).map_err(|_| PlanError::NoMemory)?;
+                pending.push(FirmwareResource {
+                    owner: bridge_addr,
+                    register: ResourceRegister::BridgeWindow(window_index_for_class(class)),
+                    class,
+                    assigned: false,
+                    pci_base: 0,
+                    len: rounded,
+                    fixed: false,
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+fn compute_hotplug_bus_reserves(
+    topology: &TopologySnapshot,
+    hotplug_ports: &[PciAddress],
+    reserve_policy: HotplugReservePolicy,
+) -> Result<Vec<PlannedBusReserve>, PlanError> {
+    let mut out = Vec::new();
+    if hotplug_ports.is_empty() || reserve_policy.extra_buses == 0 {
+        return Ok(out);
+    }
+    out.try_reserve(hotplug_ports.len())
+        .map_err(|_| PlanError::NoMemory)?;
+    for &bridge_addr in hotplug_ports {
+        let Some(node) = topology.find(bridge_addr) else {
+            return Err(PlanError::MissingTopology);
+        };
+        let FunctionKind::PciBridge {
+            secondary_bus,
+            subordinate_bus,
+        } = node.function.kind
+        else {
+            return Err(PlanError::InvalidRequirement);
+        };
+        let mut used_max = secondary_bus;
+        for candidate in topology.nodes() {
+            let bus = candidate.function.address.bus();
+            if bus >= secondary_bus
+                && bus <= subordinate_bus
+                && candidate.function.address.segment() == bridge_addr.segment()
+            {
+                used_max = used_max.max(bus);
+                if let FunctionKind::PciBridge {
+                    subordinate_bus: child_sub,
+                    ..
+                } = candidate.function.kind
+                {
+                    used_max = used_max.max(child_sub);
+                }
+            }
+        }
+        let reserved = used_max
+            .saturating_add(reserve_policy.extra_buses)
+            .min(subordinate_bus);
+        out.push(PlannedBusReserve {
+            bridge: bridge_addr,
+            secondary_bus,
+            used_subordinate_bus: used_max,
+            reserved_subordinate_bus: reserved,
+        });
+    }
+    out.sort_by_key(|r| r.bridge);
+    Ok(out)
 }
 
 fn allocation_order(
@@ -651,9 +935,9 @@ pub enum CommitError {
     NoMemory,
 }
 
-/// Build an ordered [`CommitPlan`] for all newly-assigned entries in `plan` (Stage F.2).
+/// Build an ordered [`CommitPlan`] for all newly-assigned or relocated entries in `plan` (Stages F.2 & L).
 ///
-/// Firmware-preserved (`!newly_assigned()`) resources are never mutated.
+/// Unmoved firmware-preserved (`!newly_assigned() && !moved()`) resources are never mutated.
 pub fn build_commit_plan(
     topology: &TopologySnapshot,
     plan: &ResourcePlan,
@@ -662,7 +946,7 @@ pub fn build_commit_plan(
     let mut staged: Vec<(u8, u8, PlannedWrite)> = Vec::new();
 
     for resource in plan.resources() {
-        if !resource.newly_assigned() {
+        if !resource.newly_assigned() && !resource.moved() {
             continue;
         }
         let node = topology
@@ -1243,5 +1527,93 @@ mod tests {
         assert_eq!(transport.bridge_mem_win, 0x80F0_8000);
         assert_eq!(transport.bar0, 0x8000_0000);
         assert_eq!(transport.bar1, 0x8000_1000);
+    }
+
+    #[test]
+    fn bottom_up_bridge_aggregation_and_hotplug_reserves_size_nested_windows() {
+        let roots = [RootBus {
+            root_id: 1,
+            segment: 0,
+            start_bus: 0,
+            end_bus: 15,
+        }];
+        let functions = [
+            function(
+                address(0, 1),
+                FunctionKind::PciBridge {
+                    secondary_bus: 1,
+                    subordinate_bus: 10,
+                },
+            ),
+            function(
+                address(1, 0),
+                FunctionKind::PciBridge {
+                    secondary_bus: 2,
+                    subordinate_bus: 6,
+                },
+            ),
+            function(address(2, 0), FunctionKind::Endpoint),
+        ];
+        let Ok(nested_topo) = build_snapshot(9, &roots, &functions) else {
+            assert!(false, "nested topology should build");
+            return;
+        };
+        let apertures = [
+            aperture(0x2000_0000),
+            RootAperture {
+                root_id: 1,
+                class: ResourceClass::PrefetchableMemory,
+                pci_base: 0xC000_0000,
+                cpu_base: 0xC000_0000,
+                len: 0x2000_0000,
+            },
+        ];
+        // Endpoint at 02:00.0 has an unassigned 2 MiB BAR0, and NEITHER parent bridge
+        // has a pre-declared BridgeWindow yet — bottom-up aggregation must synthesize
+        // both 01:00.0's window (+ 2 MiB hotplug reserve = 4 MiB) and 00:01.0's outer window!
+        let ep_bar = FirmwareResource {
+            owner: address(2, 0),
+            register: ResourceRegister::Bar(0),
+            class: ResourceClass::Mmio32,
+            assigned: false,
+            pci_base: 0,
+            len: 0x0020_0000,
+            fixed: false,
+        };
+        let Ok(validation) = validated(&nested_topo, &apertures, &[ep_bar]) else {
+            assert!(false, "unassigned child BAR should validate");
+            return;
+        };
+        let hotplug_ports = [address(1, 0)];
+        let Ok(plan) = plan_with_hotplug_reserves(
+            &nested_topo,
+            &apertures,
+            &validation,
+            &hotplug_ports,
+            HotplugReservePolicy::STANDARD_PCIE_SLOT,
+        ) else {
+            assert!(false, "bottom-up + hotplug reserve plan should succeed");
+            return;
+        };
+        let Some(inner_win) = plan.find(address(1, 0), ResourceRegister::BridgeWindow(1)) else {
+            assert!(false, "inner bridge window must be synthesized");
+            return;
+        };
+        let Some(outer_win) = plan.find(address(0, 1), ResourceRegister::BridgeWindow(1)) else {
+            assert!(false, "outer bridge window must be synthesized");
+            return;
+        };
+        let Some(planned_ep) = plan.find(address(2, 0), ResourceRegister::Bar(0)) else {
+            assert!(false, "endpoint BAR must be allocated");
+            return;
+        };
+        // 2 MiB child BAR + 2 MiB hotplug reserve = 4 MiB on inner & outer windows.
+        assert_eq!(inner_win.len, 0x0040_0000);
+        assert_eq!(outer_win.len, 0x0040_0000);
+        assert!(planned_ep.pci_base >= inner_win.pci_base);
+        assert!(planned_ep.pci_base + planned_ep.len <= inner_win.pci_base + inner_win.len);
+        assert_eq!(plan.bus_reserves().len(), 1);
+        assert_eq!(plan.bus_reserves()[0].used_subordinate_bus, 2);
+        assert_eq!(plan.bus_reserves()[0].reserved_subordinate_bus, 4);
     }
 }

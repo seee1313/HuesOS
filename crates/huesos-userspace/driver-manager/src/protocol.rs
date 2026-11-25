@@ -137,6 +137,12 @@ pub const NVME_BLOCK_BRINGUP_FAILED: &str = "service:block:nvme:bringup-failed";
 pub const NVME_BLOCK_READY: &str = "service:block:nvme:ready";
 /// Client queries PCI topology/root-bridge/lease summary as TSV text.
 pub const QUERY_PCI: &str = "query:pci";
+/// Client requests a read-only duplicate of the `HPIN` PCI inventory VMO (Stage D.3).
+pub const QUERY_PCI_VMO: &str = "query:pci:vmo";
+/// DriverManager replies with a read-only `HPIN` PCI inventory VMO handle.
+pub const PCI_INVENTORY_VMO_REPLY: &str = "service:pci:inventory-vmo";
+/// DriverManager replies when the `HPIN` PCI inventory VMO is not yet published.
+pub const PCI_INVENTORY_UNAVAILABLE: &str = "err:pci-inventory-unavailable";
 /// Client queries ACPI archive/manager summary as TSV text.
 pub const QUERY_ACPI: &str = "query:acpi";
 /// Client queries DriverManager-supervised processes and services as TSV text.
