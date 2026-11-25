@@ -440,7 +440,21 @@ pub extern "C" fn _start() -> ! {
                 let _ = channel.write(b"doom:exited");
             }
         }
-        libcanvas::process::yield_now();
+        if let Some((_, channel)) = &terminal {
+            let item = [libcanvas::WaitItem::new(
+                channel.handle().raw(),
+                libcanvas::Signals::READABLE | libcanvas::Signals::PEER_CLOSED,
+                0,
+            )];
+            let timeout_ticks = if doom_process.is_some() { 5 } else { 0 };
+            if let Err(err) = libcanvas::wait_any(&item, timeout_ticks) {
+                if err != ErrorCode::TimedOut {
+                    libcanvas::system::sleep_ms(10);
+                }
+            }
+        } else {
+            libcanvas::system::sleep_ms(if doom_process.is_some() { 50 } else { 250 });
+        }
     }
 }
 
@@ -1537,7 +1551,11 @@ fn launch_shutdown_broker(logger: &mut InitLogger) -> Option<(Process, Channel)>
             init_logln!(logger, "[init] shutdown-broker: ready timeout");
             return None;
         }
-        libcanvas::process::yield_now();
+        if attempts >= 256 && (attempts & 63) == 0 {
+            libcanvas::system::sleep_ms(10);
+        } else {
+            libcanvas::process::yield_now();
+        }
     }
 }
 
@@ -1717,15 +1735,20 @@ mod selftests {
     }
 
     fn wait_process_exit(process: &Process) -> libcanvas::Result<i64> {
-        // Early boot must not park init on a still-maturing cross-process wait
-        // queue: a missed wake would prevent every later service from launching.
-        // Cooperative polling keeps scheduler progress explicit and is bounded so
-        // a broken probe degrades diagnostics instead of hanging the boot forever.
-        for _ in 0..100_000 {
+        // Early boot must not park init indefinitely on a broken probe.
+        // Fast cooperative polls handle immediate local exits; periodic 10 ms
+        // sleeps after 256 polls prevent a solo-CPU spin in `--release` SMP
+        // from exhausting the iteration budget while a child dynamic-links on
+        // another core.
+        for attempt in 0..100_000u32 {
             if let Some(code) = process.poll_exit()? {
                 return Ok(code);
             }
-            libcanvas::process::yield_now();
+            if attempt >= 256 && (attempt & 63) == 0 {
+                libcanvas::system::sleep_ms(10);
+            } else {
+                libcanvas::process::yield_now();
+            }
         }
         Err(ErrorCode::TimedOut)
     }

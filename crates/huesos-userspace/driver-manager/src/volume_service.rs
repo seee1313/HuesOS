@@ -174,6 +174,24 @@ impl VolumeManagerService {
         }
     }
 
+    /// Append active client channels and backend completion ports to a wait set.
+    pub fn push_wait_items(
+        &self,
+        push: &mut impl FnMut(huesos_abi::HandleValue, libcanvas::Signals),
+    ) {
+        let ch_sig = libcanvas::Signals::READABLE | libcanvas::Signals::PEER_CLOSED;
+        for client in self.clients.iter().flatten() {
+            push(client.channel.handle().raw(), ch_sig);
+        }
+        for proxy in self.proxies.iter().flatten() {
+            push(proxy.client.handle().raw(), ch_sig);
+            push(
+                proxy.backend_completion.raw_handle(),
+                libcanvas::Signals::READABLE,
+            );
+        }
+    }
+
     fn ensure_system_volume(&mut self, nvme_bootstrap: &Channel) -> Result<(), ErrorCode> {
         if self.system.is_some() {
             return Ok(());
@@ -560,7 +578,11 @@ fn wait_completion(port: &Port, request_id: u64) -> Result<(), ErrorCode> {
             }
             Ok(_) => {}
             Err(ErrorCode::ShouldWait) | Err(ErrorCode::TimedOut) => {
-                libcanvas::process::yield_now();
+                if attempts >= 256 && (attempts & 63) == 0 {
+                    libcanvas::system::sleep_ms(10);
+                } else {
+                    libcanvas::process::yield_now();
+                }
             }
             Err(error) => return Err(error),
         }
@@ -576,7 +598,11 @@ fn read_exact_channel(channel: &Channel, out: &mut [u8]) -> Result<(), ErrorCode
             Ok(n) if n == out.len() => return Ok(()),
             Ok(_) => return Err(ErrorCode::InvalidArgs),
             Err(ErrorCode::ShouldWait) | Err(ErrorCode::TimedOut) => {
-                libcanvas::process::yield_now();
+                if attempts >= 256 && (attempts & 63) == 0 {
+                    libcanvas::system::sleep_ms(10);
+                } else {
+                    libcanvas::process::yield_now();
+                }
             }
             Err(error) => return Err(error),
         }

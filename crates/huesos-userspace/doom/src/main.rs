@@ -10,6 +10,7 @@ use libcanvas::{Channel, ErrorCode, Handle, Vmo};
 
 const DOOM_WIDTH: usize = 640;
 const DOOM_HEIGHT: usize = 400;
+const MAX_OUTPUT_WIDTH: usize = 960;
 const SCALE_CHUNK_SIZE: usize = 1024 * 1024;
 
 struct DoomState {
@@ -28,6 +29,7 @@ struct DoomState {
     output_x: u32,
     output_y: u32,
     output_bpp: u32,
+    x_map: [u16; MAX_OUTPUT_WIDTH],
     scale_chunk: [u8; SCALE_CHUNK_SIZE],
 }
 
@@ -45,6 +47,7 @@ impl DoomState {
             output_x: 0,
             output_y: 0,
             output_bpp: 4,
+            x_map: [0; MAX_OUTPUT_WIDTH],
             scale_chunk: [0; SCALE_CHUNK_SIZE],
         }
     }
@@ -259,23 +262,53 @@ pub extern "C" fn DG_DrawFrame() {
         let width = state.output_width as usize;
         let height = state.output_height as usize;
         let row_bytes = width.saturating_mul(4);
-        if width == 0 || height == 0 || row_bytes > SCALE_CHUNK_SIZE {
+        if width == 0 || width > MAX_OUTPUT_WIDTH || height == 0 || row_bytes > SCALE_CHUNK_SIZE {
             return;
         }
+        let exact_3_to_2 = width == 960 && height == 600;
+        let exact_1_to_1 = width == DOOM_WIDTH && height == DOOM_HEIGHT;
         let rows_per_chunk = (SCALE_CHUNK_SIZE / row_bytes).max(1);
         let mut first_y = 0usize;
         while first_y < height {
             let rows = rows_per_chunk.min(height - first_y);
             let output = &mut state.scale_chunk[..rows * row_bytes];
+            let mut prev_src_y = usize::MAX;
             for local_y in 0..rows {
                 let dst_y = first_y + local_y;
-                let src_y = dst_y * DOOM_HEIGHT / height;
-                let dst_row = &mut output[local_y * row_bytes..(local_y + 1) * row_bytes];
-                for dst_x in 0..width {
-                    let src_x = dst_x * DOOM_WIDTH / width;
-                    let pixel = source[src_y * DOOM_WIDTH + src_x].to_le_bytes();
-                    let offset = dst_x * 4;
-                    dst_row[offset..offset + 4].copy_from_slice(&pixel);
+                let src_y = if exact_3_to_2 {
+                    (dst_y * 2) / 3
+                } else if exact_1_to_1 {
+                    dst_y
+                } else {
+                    (dst_y * DOOM_HEIGHT) / height
+                };
+                let row_start = local_y * row_bytes;
+                if src_y == prev_src_y && local_y > 0 {
+                    let prev_start = (local_y - 1) * row_bytes;
+                    output.copy_within(prev_start..prev_start + row_bytes, row_start);
+                    continue;
+                }
+                prev_src_y = src_y;
+                let src_row = &source[src_y * DOOM_WIDTH..(src_y + 1) * DOOM_WIDTH];
+                let dst_row = &mut output[row_start..row_start + row_bytes];
+
+                if exact_3_to_2 {
+                    for (dst12, src2) in dst_row.chunks_exact_mut(12).zip(src_row.chunks_exact(2)) {
+                        let b0 = src2[0].to_le_bytes();
+                        let b1 = src2[1].to_le_bytes();
+                        dst12[0..4].copy_from_slice(&b0);
+                        dst12[4..8].copy_from_slice(&b0);
+                        dst12[8..12].copy_from_slice(&b1);
+                    }
+                } else if exact_1_to_1 {
+                    for (dst4, &px) in dst_row.chunks_exact_mut(4).zip(src_row.iter()) {
+                        dst4.copy_from_slice(&px.to_le_bytes());
+                    }
+                } else {
+                    for (dst4, &sx) in dst_row.chunks_exact_mut(4).zip(state.x_map[..width].iter())
+                    {
+                        dst4.copy_from_slice(&src_row[sx as usize].to_le_bytes());
+                    }
                 }
             }
             let _ = canvas.write_bytes((first_y * row_bytes) as u64, output);
@@ -287,18 +320,18 @@ pub extern "C" fn DG_DrawFrame() {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn DG_SleepMs(ms: u32) {
-    let ticks = (ms as u64).div_ceil(10).max(1);
-    let deadline = DG_GetTicksMs().saturating_add((ticks * 10) as u32);
-    while (DG_GetTicksMs().wrapping_sub(deadline) as i32) < 0 {
-        libcanvas::process::yield_now();
-    }
+    libcanvas::system::sleep_ms(ms as u64);
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn DG_GetTicksMs() -> u32 {
-    libcanvas::system::monotonic_ticks()
-        .unwrap_or(0)
-        .wrapping_mul(10) as u32
+    if let Ok(ns) = libcanvas::system::monotonic_ns() {
+        (ns / 1_000_000) as u32
+    } else {
+        libcanvas::system::monotonic_ticks()
+            .unwrap_or(0)
+            .wrapping_mul(10) as u32
+    }
 }
 
 /// Poll one DoomGeneric keyboard event.

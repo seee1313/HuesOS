@@ -2504,9 +2504,14 @@ pub extern "C" fn _start() -> ! {
     let _ = bootstrap.write(b"service:wlan:ready");
 
     let mut clients: Vec<Option<WlanClientConn>> = Vec::with_capacity(16);
+    let mut active_until_ms = 0u64;
 
     loop {
-        let now_ms = rdtsc_u64().saturating_sub(boot_tsc) / 2_000_000;
+        let now_ms = libcanvas::system::monotonic_ns()
+            .map(|ns| ns / 1_000_000)
+            .unwrap_or_else(|_| rdtsc_u64().saturating_sub(boot_tsc) / 2_000_000);
+        let prev_air = rt.tx_frames.wrapping_add(rt.rx_frames);
+        let mut did_ipc = false;
         rt.pump_air(now_ms);
         rt.poll_net_uplink(now_ms);
         rt.maybe_try_autoconnect(now_ms);
@@ -2516,6 +2521,7 @@ pub extern "C" fn _start() -> ! {
             let mut bmsg = [0u8; 64];
             match bootstrap.read_optional_handle(&mut bmsg) {
                 Ok((n, Some(h))) => {
+                    did_ipc = true;
                     let tag = &bmsg[..n];
                     let is_ro = tag == b"wlan-client:ro";
                     if tag == b"wlan-client" || is_ro {
@@ -2569,6 +2575,7 @@ pub extern "C" fn _start() -> ! {
             if got_len == 0 {
                 continue;
             }
+            did_ipc = true;
             let Some((op, payload)) = wlan::parse_request(&req_buf[..got_len]) else {
                 if let Some(c) = clients[idx].as_ref() {
                     let mut rep = [0u8; 8];
@@ -2818,7 +2825,45 @@ pub extern "C" fn _start() -> ! {
             }
         }
 
-        libcanvas::process::yield_now();
+        if rt.tx_frames.wrapping_add(rt.rx_frames) != prev_air || did_ipc {
+            active_until_ms = now_ms.saturating_add(50);
+            continue;
+        }
+        let handshaking = matches!(
+            rt.state,
+            WlanStateCode::Authenticating
+                | WlanStateCode::Associating
+                | WlanStateCode::Handshaking4Way
+        );
+        if now_ms < active_until_ms || handshaking {
+            libcanvas::system::sleep_ms(1);
+            continue;
+        }
+        let awaited = libcanvas::Signals::READABLE | libcanvas::Signals::PEER_CLOSED;
+        let mut items = [libcanvas::WaitItem::new(bootstrap.handle().raw(), awaited, 0); 16];
+        let mut count = 1usize;
+        if let Some(up) = rt.uplink_ch.as_ref() {
+            items[count] = libcanvas::WaitItem::new(up.handle().raw(), awaited, 1);
+            count += 1;
+        }
+        for c in clients.iter().flatten() {
+            if count >= items.len() {
+                break;
+            }
+            items[count] = libcanvas::WaitItem::new(c.ch.handle().raw(), awaited, count as u64);
+            count += 1;
+        }
+        let timeout_ticks = if matches!(rt.state, WlanStateCode::Connected | WlanStateCode::SoftAp)
+        {
+            1
+        } else {
+            20
+        };
+        if let Err(err) = libcanvas::wait_any(&items[..count], timeout_ticks) {
+            if err != libcanvas::ErrorCode::TimedOut {
+                libcanvas::system::sleep_ms(10);
+            }
+        }
     }
 }
 

@@ -80,10 +80,28 @@ pub(crate) fn sys_vmo_read(
     let vmo = obj
         .downcast_ref::<huesos_object::Vmo>()
         .ok_or(ErrorCode::WrongType)?;
-    let mut tmp = user_memory::zeroed_buffer(len)?;
-    let n = vmo.read(offset as usize, &mut tmp);
-    user_memory::copy_to_user(buf, &tmp[..n])?;
-    Ok(n as i64)
+    let start_offset = usize::try_from(offset).map_err(|_| ErrorCode::InvalidArgs)?;
+    let mut chunk = [0u8; 2048];
+    let mut total_read = 0usize;
+    while total_read < len {
+        let step = (len - total_read).min(chunk.len());
+        let off = start_offset
+            .checked_add(total_read)
+            .ok_or(ErrorCode::InvalidArgs)?;
+        let n = vmo.read(off, &mut chunk[..step]);
+        if n == 0 {
+            break;
+        }
+        let dst = (buf as u64)
+            .checked_add(total_read as u64)
+            .ok_or(ErrorCode::InvalidArgs)? as *mut u8;
+        user_memory::copy_to_user(dst, &chunk[..n])?;
+        total_read += n;
+        if n < step {
+            break;
+        }
+    }
+    Ok(total_read as i64)
 }
 
 pub(crate) fn sys_vmo_write(
@@ -95,8 +113,7 @@ pub(crate) fn sys_vmo_write(
     if len == 0 || len > user_memory::MAX_VMO_TRANSFER {
         return Err(ErrorCode::InvalidArgs);
     }
-    // Copy first so no VMO lock is held while touching untrusted memory.
-    let bytes = user_memory::copy_from_user(buf, len)?;
+    user_memory::validate_range(buf as u64, len, false)?;
 
     let proc = current_proc()?;
     let h = proc.handles.get(handle).ok_or(ErrorCode::BadHandle)?;
@@ -107,6 +124,23 @@ pub(crate) fn sys_vmo_write(
     let vmo = obj
         .downcast_ref::<huesos_object::Vmo>()
         .ok_or(ErrorCode::WrongType)?;
-    let n = vmo.write(offset as usize, &bytes);
-    Ok(n as i64)
+    let start_offset = usize::try_from(offset).map_err(|_| ErrorCode::InvalidArgs)?;
+    let mut chunk = [0u8; 2048];
+    let mut total_written = 0usize;
+    while total_written < len {
+        let step = (len - total_written).min(chunk.len());
+        let src = (buf as u64)
+            .checked_add(total_written as u64)
+            .ok_or(ErrorCode::InvalidArgs)? as *const u8;
+        user_memory::copy_from_user_into(src, &mut chunk[..step])?;
+        let off = start_offset
+            .checked_add(total_written)
+            .ok_or(ErrorCode::InvalidArgs)?;
+        let n = vmo.write(off, &chunk[..step]);
+        total_written += n;
+        if n < step {
+            break;
+        }
+    }
+    Ok(total_written as i64)
 }

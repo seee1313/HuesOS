@@ -2,6 +2,9 @@
 //! the Rust entry point called by the trampoline.
 
 use core::arch::global_asm;
+use core::sync::atomic::{AtomicBool, Ordering};
+
+static TRAMPOLINE_INSTALLED: AtomicBool = AtomicBool::new(false);
 
 // Pull in the real-mode -> long mode trampoline.
 global_asm!(include_str!("ap_trampoline.S"));
@@ -59,6 +62,9 @@ fn map_ap_low_pages() {
 /// Must be called on the BSP before any SIPI is sent. Paging/HHDM mapper
 /// must already be initialized.
 pub unsafe fn copy_trampoline() {
+    if TRAMPOLINE_INSTALLED.swap(true, Ordering::AcqRel) {
+        return;
+    }
     map_ap_low_pages();
     let src = ap_trampoline_start as *const u8;
     let dst = crate::x86_64::paging::phys_to_virt(AP_TRAMPOLINE_PHYS).as_mut_ptr::<u8>();
@@ -79,19 +85,20 @@ pub fn ap_status() -> u64 {
 /// # Safety
 /// Must be called on the BSP. The stack must be valid and mapped in the
 /// kernel address space. Does not wait for the AP to come online.
-pub unsafe fn boot_ap(apic_id: u8, stack_top: u64, entry_point: u64) {
+pub unsafe fn boot_ap(apic_id: u32, stack_top: u64, entry_point: u64) {
     copy_trampoline();
 
     // Write ApBootInfo through the HHDM — physical 0x7000 is not identity-mapped
     // for ordinary kernel code under base revision 3.
     let info = crate::x86_64::paging::phys_to_virt(AP_BOOT_INFO_PHYS).as_mut_ptr::<ApBootInfo>();
-    (*info).cr3 = x86_64::registers::control::Cr3::read()
+    let cr3_phys = x86_64::registers::control::Cr3::read_raw()
         .0
         .start_address()
         .as_u64();
-    (*info).stack_top = stack_top;
-    (*info).entry_point = entry_point;
-    (*info).status = 0;
+    core::ptr::write_volatile(core::ptr::addr_of_mut!((*info).cr3), cr3_phys);
+    core::ptr::write_volatile(core::ptr::addr_of_mut!((*info).stack_top), stack_top);
+    core::ptr::write_volatile(core::ptr::addr_of_mut!((*info).entry_point), entry_point);
+    core::ptr::write_volatile(core::ptr::addr_of_mut!((*info).status), 0);
 
     // INIT-SIPI-SIPI (Intel SDM vol 3).
     crate::lapic::send_init_assert(apic_id);

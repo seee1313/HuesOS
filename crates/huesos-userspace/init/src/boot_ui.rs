@@ -214,8 +214,17 @@ impl BootUi {
                     }
                 },
                 Err(ErrorCode::ShouldWait) | Err(ErrorCode::TimedOut) => {
-                    libcanvas::process::yield_now();
-                    self.render();
+                    let item = [libcanvas::WaitItem::new(
+                        channel.handle().raw(),
+                        libcanvas::Signals::READABLE | libcanvas::Signals::PEER_CLOSED,
+                        0,
+                    )];
+                    if libcanvas::wait_any(&item, 1).is_err() && (spins & 63) == 63 {
+                        libcanvas::process::yield_now();
+                    }
+                    if (spins & 3) == 0 {
+                        self.render();
+                    }
                 }
                 Err(error) => {
                     crate::init_logln!(
@@ -281,8 +290,17 @@ impl BootUi {
                     }
                 },
                 Err(ErrorCode::ShouldWait) | Err(ErrorCode::TimedOut) => {
-                    libcanvas::process::yield_now();
-                    self.render();
+                    let item = [libcanvas::WaitItem::new(
+                        channel.handle().raw(),
+                        libcanvas::Signals::READABLE | libcanvas::Signals::PEER_CLOSED,
+                        0,
+                    )];
+                    if libcanvas::wait_any(&item, 1).is_err() && (spins & 63) == 63 {
+                        libcanvas::process::yield_now();
+                    }
+                    if (spins & 3) == 0 {
+                        self.render();
+                    }
                 }
                 Err(error) => {
                     crate::init_logln!(logger, "[init] drain read failed: {}", error.as_str());

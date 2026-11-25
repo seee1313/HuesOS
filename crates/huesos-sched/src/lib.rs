@@ -18,6 +18,8 @@ pub mod eevdf;
 pub mod hw;
 pub mod job;
 
+pub use hw::{CpuLocation, CpuTopology, XsaveLayout, XsaveModel};
+
 use core::sync::atomic::{fence, AtomicBool, AtomicU64, Ordering};
 
 /// Maximum logical CPUs represented by Scheduler v2 masks.
@@ -154,6 +156,11 @@ impl CpuMask {
             }
         }
         None
+    }
+
+    /// Construct a mask from four 64-bit dense CPU words.
+    pub const fn from_words(words: [u64; MAX_CPUS / 64]) -> Self {
+        Self { words }
     }
 
     /// Expose words for ABI/atomic integration tests.
@@ -988,6 +995,143 @@ impl TaskLifecycle {
 impl Default for TaskLifecycle {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Lifecycle state of one logical processor (`SMP_V2.md` §§3, 6).
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[repr(u8)]
+pub enum CpuState {
+    /// Slot unused; processor has not been enumerated by firmware.
+    #[default]
+    Offline = 0,
+    /// Processor enumerated in ACPI MADT (`apic_id` known).
+    Discovered = 1,
+    /// BSP allocated per-CPU stack/state and issued INIT-SIPI-SIPI.
+    Starting = 2,
+    /// Processor initialized GDT/IDT/LAPIC/PAT/SIMD/SYSCALL and entered its
+    /// scheduler idle loop.
+    Online = 3,
+    /// Processor cannot be started safely by the active boot path (e.g. an
+    /// x2APIC ID `>= 255` without x2APIC hardware or firmware handoff).
+    Parked = 4,
+    /// Processor failed to report ready within the AP startup timeout; BSP
+    /// retains ownership of its stack and per-CPU memory.
+    Failed = 5,
+    /// Processor is draining/evacuating tasks prior to shutdown or panic stop.
+    Quiescing = 6,
+    /// Processor halted with interrupts masked (`cli; hlt`).
+    Stopped = 7,
+}
+
+/// Invalid [`CpuLifecycle`] transition.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CpuLifecycleError {
+    /// Requested transition is illegal from the current [`CpuState`].
+    WrongState,
+}
+
+/// Per-CPU lifecycle state machine (`SMP_V2.md` §§3, 6).
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct CpuLifecycle {
+    state: CpuState,
+    apic_id: Option<u32>,
+}
+
+impl CpuLifecycle {
+    /// Construct an [`CpuState::Offline`] slot.
+    pub const fn new() -> Self {
+        Self {
+            state: CpuState::Offline,
+            apic_id: None,
+        }
+    }
+
+    /// Current processor state.
+    pub const fn state(&self) -> CpuState {
+        self.state
+    }
+
+    /// Hardware APIC/x2APIC ID recorded at discovery.
+    pub const fn apic_id(&self) -> Option<u32> {
+        self.apic_id
+    }
+
+    /// True only when the processor may receive runnable tasks, timers, and
+    /// TLB shootdown IPIs.
+    pub const fn is_schedulable(&self) -> bool {
+        matches!(self.state, CpuState::Online)
+    }
+
+    /// Record MADT enumeration (`Offline -> Discovered`).
+    pub fn discover(&mut self, apic_id: u32) -> Result<(), CpuLifecycleError> {
+        if self.state != CpuState::Offline {
+            return Err(CpuLifecycleError::WrongState);
+        }
+        self.apic_id = Some(apic_id);
+        self.state = CpuState::Discovered;
+        Ok(())
+    }
+
+    /// Begin AP bring-up (`Discovered -> Starting`).
+    pub fn begin_start(&mut self) -> Result<(), CpuLifecycleError> {
+        if self.state != CpuState::Discovered {
+            return Err(CpuLifecycleError::WrongState);
+        }
+        self.state = CpuState::Starting;
+        Ok(())
+    }
+
+    /// Publish processor online (`Discovered | Starting -> Online`).
+    pub fn mark_online(&mut self) -> Result<(), CpuLifecycleError> {
+        match self.state {
+            CpuState::Discovered | CpuState::Starting => {
+                self.state = CpuState::Online;
+                Ok(())
+            }
+            _ => Err(CpuLifecycleError::WrongState),
+        }
+    }
+
+    /// Park a discovered processor that cannot be started on this platform
+    /// (`Discovered | Starting -> Parked`).
+    pub fn mark_parked(&mut self) -> Result<(), CpuLifecycleError> {
+        match self.state {
+            CpuState::Discovered | CpuState::Starting => {
+                self.state = CpuState::Parked;
+                Ok(())
+            }
+            _ => Err(CpuLifecycleError::WrongState),
+        }
+    }
+
+    /// Record AP startup timeout (`Starting -> Failed`).
+    pub fn mark_failed(&mut self) -> Result<(), CpuLifecycleError> {
+        if self.state != CpuState::Starting {
+            return Err(CpuLifecycleError::WrongState);
+        }
+        self.state = CpuState::Failed;
+        Ok(())
+    }
+
+    /// Enter quiescing before stop (`Online -> Quiescing`).
+    pub fn begin_quiesce(&mut self) -> Result<(), CpuLifecycleError> {
+        if self.state != CpuState::Online {
+            return Err(CpuLifecycleError::WrongState);
+        }
+        self.state = CpuState::Quiescing;
+        Ok(())
+    }
+
+    /// Record final processor halt (`Online | Quiescing | Parked | Starting -> Stopped`).
+    pub fn mark_stopped(&mut self) -> Result<(), CpuLifecycleError> {
+        match self.state {
+            CpuState::Online | CpuState::Quiescing | CpuState::Parked | CpuState::Starting => {
+                self.state = CpuState::Stopped;
+                Ok(())
+            }
+            _ => Err(CpuLifecycleError::WrongState),
+        }
     }
 }
 
@@ -2592,6 +2736,30 @@ mod tests {
         assert_eq!(rollback.target_reserved(), Ok(()));
         assert_eq!(rollback.rollback(), Ok(()));
         assert_eq!(rollback.state(), CbsMigrationState::RolledBack);
+    }
+
+    #[test]
+    fn cpu_lifecycle_enforces_ap_startup_and_failure_transitions() {
+        let mut ap = CpuLifecycle::new();
+        assert_eq!(ap.state(), CpuState::Offline);
+        assert!(!ap.is_schedulable());
+        assert_eq!(ap.begin_start(), Err(CpuLifecycleError::WrongState));
+        assert_eq!(ap.discover(0x104), Ok(()));
+        assert_eq!(ap.apic_id(), Some(0x104));
+        assert_eq!(ap.begin_start(), Ok(()));
+        assert!(!ap.is_schedulable());
+        assert_eq!(ap.mark_online(), Ok(()));
+        assert!(ap.is_schedulable());
+        assert_eq!(ap.begin_quiesce(), Ok(()));
+        assert!(!ap.is_schedulable());
+        assert_eq!(ap.mark_stopped(), Ok(()));
+
+        let mut failed = CpuLifecycle::new();
+        assert_eq!(failed.discover(7), Ok(()));
+        assert_eq!(failed.begin_start(), Ok(()));
+        assert_eq!(failed.mark_failed(), Ok(()));
+        assert!(!failed.is_schedulable());
+        assert_eq!(failed.mark_online(), Err(CpuLifecycleError::WrongState));
     }
 }
 

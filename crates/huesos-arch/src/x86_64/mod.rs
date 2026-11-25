@@ -59,7 +59,6 @@ pub unsafe fn init_paging(phys_offset: crate::VirtAddr) {
 /// SMP bring-up; otherwise calibrates now. APs never call this — they start
 /// their own timers from the shared count inside `ap_entry`.
 pub fn init_late() {
-    interrupts::init();
     let initial_count = {
         let shared = lapic::timer_initial_count();
         if shared != 0 {
@@ -70,6 +69,13 @@ pub fn init_late() {
             c
         }
     };
+    interrupts::init();
+    if lapic::tsc_deadline_supported() && lapic::tsc_invariant() {
+        return;
+    }
+    if lapic::timer_arm_oneshot_ns(10_000_000, 0x20) {
+        return;
+    }
     unsafe {
         lapic::timer_init(
             lapic::TimerDivide::Div16,

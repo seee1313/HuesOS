@@ -45,6 +45,9 @@ pub struct Context {
     pub fs_base: u64,
     /// Per-thread Ring-3 `GS_BASE` (`IA32_KERNEL_GS_BASE` while in Ring 0; Win64 TEB).
     pub gs_base: u64,
+    /// Optional 64-byte-aligned kernel virtual address of this task's SIMD
+    /// (`XSAVE64` / `FXSAVE64`) save area, or `0` for pure kernel/idle tasks.
+    pub simd_addr: u64,
 }
 
 impl Context {
@@ -57,6 +60,7 @@ impl Context {
             cr3: 0,
             fs_base: 0,
             gs_base: 0,
+            simd_addr: 0,
         }
     }
 
@@ -68,6 +72,7 @@ impl Context {
             cr3,
             fs_base: 0,
             gs_base: 0,
+            simd_addr: 0,
         }
     }
 
@@ -112,7 +117,19 @@ impl Context {
             cr3,
             fs_base: 0,
             gs_base: 0,
+            simd_addr: 0,
         }
+    }
+}
+
+/// Initialize a 64-byte-aligned userspace SIMD save buffer (`>= 512` bytes)
+/// with architectural reset values (`FCW = 0x037F`, `MXCSR = 0x1F80`, and a
+/// zeroed `XSAVE` header when `buf.len() >= 576`).
+pub fn init_simd_save_area(buf: &mut [u8]) {
+    buf.fill(0);
+    if buf.len() >= 32 {
+        buf[0..2].copy_from_slice(&0x037fu16.to_le_bytes());
+        buf[24..28].copy_from_slice(&0x1f80u32.to_le_bytes());
     }
 }
 
@@ -207,6 +224,67 @@ pub unsafe fn context_switch(old: *mut Context, new: *const Context) {
     // SAFETY: the caller provides the context pointer and interrupt contracts;
     // the wrapper has additionally verified the lock-rank invariant.
     unsafe {
+        let old_simd = (*old).simd_addr;
+        if old_simd != 0 && (old_simd & 63) == 0 {
+            if super::cpu::xsave_enabled() {
+                let mask = super::cpu::simd_xcr0();
+                let mask_lo = mask as u32;
+                let mask_hi = (mask >> 32) as u32;
+                if super::cpu::xsaveopt_enabled() {
+                    core::arch::asm!(
+                        "xsaveopt64 [{ptr}]",
+                        ptr = in(reg) old_simd,
+                        in("eax") mask_lo,
+                        in("edx") mask_hi,
+                        options(nostack, preserves_flags)
+                    );
+                } else {
+                    core::arch::asm!(
+                        "xsave64 [{ptr}]",
+                        ptr = in(reg) old_simd,
+                        in("eax") mask_lo,
+                        in("edx") mask_hi,
+                        options(nostack, preserves_flags)
+                    );
+                }
+            } else {
+                core::arch::asm!(
+                    "fxsave64 [{ptr}]",
+                    ptr = in(reg) old_simd,
+                    options(nostack, preserves_flags)
+                );
+            }
+        }
+
+        let new_simd = (*new).simd_addr;
+        if new_simd != 0 && (new_simd & 63) == 0 {
+            if super::cpu::xsave_enabled() {
+                let mask = super::cpu::simd_xcr0();
+                let mask_lo = mask as u32;
+                let mask_hi = (mask >> 32) as u32;
+                core::arch::asm!(
+                    "xrstor64 [{ptr}]",
+                    ptr = in(reg) new_simd,
+                    in("eax") mask_lo,
+                    in("edx") mask_hi,
+                    options(nostack, preserves_flags)
+                );
+            } else {
+                core::arch::asm!(
+                    "fxrstor64 [{ptr}]",
+                    ptr = in(reg) new_simd,
+                    options(nostack, preserves_flags)
+                );
+            }
+        }
+
+        let cpu_idx = if crate::cpu_local::has_cpu_locals() {
+            crate::cpu_local::current_cpu_index()
+        } else {
+            0
+        };
+        super::paging::note_cpu_active_cr3(cpu_idx, (*new).cr3 & !0xfff);
+
         let old_fs = (*old).fs_base;
         let new_fs = (*new).fs_base;
         if new_fs != old_fs || (*old).rsp == 0 {

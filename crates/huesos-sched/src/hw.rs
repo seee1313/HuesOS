@@ -201,6 +201,21 @@ pub struct CpuTopology {
     pub cores_per_package: u32,
     /// Total logical CPUs per package.
     pub logical_per_package: u32,
+    /// APIC ID right-shift width for core identity (`EAX[4:0]` at SMT level).
+    pub smt_shift: u32,
+    /// APIC ID right-shift width for package identity (`EAX[4:0]` at Core level).
+    pub pkg_shift: u32,
+}
+
+/// Decomposed physical location of one hardware APIC / x2APIC ID.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct CpuLocation {
+    /// Socket / package identifier.
+    pub package_id: u32,
+    /// Physical core identifier within the package.
+    pub core_id: u32,
+    /// SMT hardware thread index within the core (`0` when SMT is absent).
+    pub smt_id: u32,
 }
 
 /// Topology parse failure.
@@ -233,20 +248,119 @@ impl CpuTopology {
         }
         let smt_per_core = smt.ok_or(TopologyError::LeafUnavailable)?;
         let cores_per_package = core.ok_or(TopologyError::LeafUnavailable)?;
+        let logical_per_package = max_logical.max(1);
+        let smt_shift = smt_per_core.max(1).next_power_of_two().trailing_zeros();
+        let pkg_shift = logical_per_package
+            .max(smt_per_core)
+            .next_power_of_two()
+            .trailing_zeros()
+            .max(smt_shift);
         Ok(Self {
             smt_per_core,
             cores_per_package,
-            logical_per_package: max_logical.max(1),
+            logical_per_package,
+            smt_shift,
+            pkg_shift,
+        })
+    }
+
+    /// Parse real hardware CPUID `0x1F` or `0x0B` extended-topology subleaves
+    /// where `EAX[4:0]` holds the APIC ID bit shift to the next domain and
+    /// `EBX[15:0]` holds the logical processor count at the level.
+    pub fn from_sdm_leaves(leaves: &[(u32, u32, u32, u32)]) -> Result<Self, TopologyError> {
+        let mut smt_logical: Option<u32> = None;
+        let mut smt_shift: Option<u32> = None;
+        let mut pkg_logical: Option<u32> = None;
+        let mut pkg_shift: Option<u32> = None;
+        for &(eax, ebx, ecx, _) in leaves {
+            let level_type = (ecx >> 8) & 0xff;
+            let logical = ebx & 0xffff;
+            if level_type == 0 || logical == 0 {
+                continue;
+            }
+            let shift = (eax & 0x1f).min(31);
+            match level_type {
+                1 => {
+                    smt_logical = Some(logical);
+                    smt_shift = Some(shift);
+                }
+                2 => {
+                    pkg_logical = Some(logical);
+                    pkg_shift = Some(shift);
+                }
+                _ => {
+                    pkg_logical = Some(pkg_logical.unwrap_or(0).max(logical));
+                    pkg_shift = Some(pkg_shift.unwrap_or(0).max(shift));
+                }
+            }
+        }
+        let smt_per_core = smt_logical.unwrap_or(1).max(1);
+        let logical_per_package = pkg_logical
+            .ok_or(TopologyError::LeafUnavailable)?
+            .max(smt_per_core);
+        let resolved_smt_shift = smt_shift
+            .unwrap_or_else(|| smt_per_core.next_power_of_two().trailing_zeros())
+            .min(31);
+        let resolved_pkg_shift = pkg_shift
+            .unwrap_or_else(|| logical_per_package.next_power_of_two().trailing_zeros())
+            .max(resolved_smt_shift)
+            .min(31);
+        let cores_per_package = (logical_per_package / smt_per_core).max(1);
+        Ok(Self {
+            smt_per_core,
+            cores_per_package,
+            logical_per_package,
+            smt_shift: resolved_smt_shift,
+            pkg_shift: resolved_pkg_shift,
         })
     }
 
     /// Conservative fallback when leaf 0x1F/0x0B are unavailable: one thread
-    /// per core, unknown package geometry.
+    /// per core, each APIC ID treated as an independent core in package 0.
     pub const fn conservative() -> Self {
         Self {
             smt_per_core: 1,
             cores_per_package: 1,
             logical_per_package: 1,
+            smt_shift: 0,
+            pkg_shift: 31,
+        }
+    }
+
+    /// Decompose a 32-bit hardware APIC/x2APIC ID into `(package, core, smt)`.
+    pub const fn locate_apic_id(&self, apic_id: u32) -> CpuLocation {
+        let smt_bits = if self.smt_shift <= 31 {
+            self.smt_shift
+        } else {
+            0
+        };
+        let pkg_bits = if self.pkg_shift <= 31 && self.pkg_shift >= smt_bits {
+            self.pkg_shift
+        } else {
+            smt_bits
+        };
+        let smt_mask = if smt_bits == 0 {
+            0
+        } else {
+            (1u32 << smt_bits) - 1
+        };
+        let core_bits = pkg_bits - smt_bits;
+        let core_mask = if core_bits == 0 {
+            0
+        } else if core_bits >= 32 {
+            u32::MAX
+        } else {
+            (1u32 << core_bits) - 1
+        };
+        let package_id = if pkg_bits >= 32 {
+            0
+        } else {
+            apic_id >> pkg_bits
+        };
+        CpuLocation {
+            package_id,
+            core_id: (apic_id >> smt_bits) & core_mask,
+            smt_id: apic_id & smt_mask,
         }
     }
 }
@@ -376,6 +490,36 @@ mod tests {
 
     #[test]
     fn topology_falls_back_conservatively() {
-        assert_eq!(CpuTopology::conservative().smt_per_core, 1);
+        let topo = CpuTopology::conservative();
+        assert_eq!(topo.smt_per_core, 1);
+        assert_eq!(
+            topo.locate_apic_id(5),
+            CpuLocation {
+                package_id: 0,
+                core_id: 5,
+                smt_id: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn sdm_topology_locates_smt_siblings_and_packages() {
+        // EAX[4:0]=1 (2 SMT/core), ECX[15:8]=1 (SMT), EBX[15:0]=2
+        // EAX[4:0]=4 (16 logical/pkg), ECX[15:8]=2 (Core), EBX[15:0]=16
+        let leaves = [(1, 2, 0x0100, 0), (4, 16, 0x0201, 0)];
+        let topo = expect_ok!(
+            CpuTopology::from_sdm_leaves(&leaves),
+            "CpuTopology::from_sdm_leaves"
+        );
+        assert_eq!(topo.smt_per_core, 2);
+        assert_eq!(topo.cores_per_package, 8);
+        assert_eq!(
+            topo.locate_apic_id(0x13),
+            CpuLocation {
+                package_id: 1,
+                core_id: 1,
+                smt_id: 1,
+            }
+        );
     }
 }

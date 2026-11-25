@@ -404,9 +404,10 @@ pub unsafe fn kmain(boot_info: BootInfo) -> ! {
         cmdline_image,
     );
 
-    // BSP idle: timer IRQ drives the scheduler; opportunistically reap.
+    // BSP idle: timer IRQ drives the scheduler; opportunistically reap & pull.
     loop {
         crate::scheduler::reap_finished_tasks();
+        crate::scheduler::idle_try_pull_work();
         huesos_arch::hlt();
     }
 }

@@ -19,6 +19,11 @@ pub type ShutdownFn = fn() -> Result<(), ErrorCode>;
 pub(crate) static DEBUG_WRITE_FN: Mutex<Option<DebugWriteFn>> = Mutex::new(None);
 /// Global monotonic-clock callback.
 pub(crate) static CLOCK_FN: Once<fn() -> u64> = Once::new();
+/// Global monotonic-nanoseconds callback.
+pub(crate) static CLOCK_NS_FN: Once<fn() -> u64> = Once::new();
+/// Scheduler policy update callback (`kind`, `weight_or_capacity_ns`, `period_ns`).
+pub type SchedSetPolicyFn = fn(u64, u64, u64) -> Result<(), ErrorCode>;
+pub(crate) static SCHED_SET_POLICY_FN: Mutex<Option<SchedSetPolicyFn>> = Mutex::new(None);
 /// Global online-CPU mask callback.
 type CpuCountFn = fn() -> usize;
 type CpuOnlineFn = fn(usize) -> bool;
@@ -133,6 +138,16 @@ pub fn set_debug_write_fn(f: DebugWriteFn) {
 /// Set the monotonic clock source. Called once by kernel init.
 pub fn set_clock_fn(f: fn() -> u64) {
     CLOCK_FN.call_once(|| f);
+}
+
+/// Set the monotonic nanosecond clock source. Called once by kernel init.
+pub fn set_clock_ns_fn(f: fn() -> u64) {
+    CLOCK_NS_FN.call_once(|| f);
+}
+
+/// Set the scheduler policy update callback. Called once by kernel init.
+pub fn set_sched_set_policy_fn(f: SchedSetPolicyFn) {
+    *SCHED_SET_POLICY_FN.lock() = Some(f);
 }
 
 /// Set the online CPU mask callback. Called once by kernel init.

@@ -42,6 +42,17 @@ impl BlobFsService {
         }
     }
 
+    /// Append active BlobFS client channels to a wait set.
+    pub fn push_wait_items(
+        &self,
+        push: &mut impl FnMut(huesos_abi::HandleValue, libcanvas::Signals),
+    ) {
+        let sig = libcanvas::Signals::READABLE | libcanvas::Signals::PEER_CLOSED;
+        for client in self.clients.iter().flatten() {
+            push(client.handle().raw(), sig);
+        }
+    }
+
     /// Open BlobFS through the DriverManager registry.
     pub fn open_for_registry(
         &mut self,

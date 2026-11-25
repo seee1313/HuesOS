@@ -953,10 +953,12 @@ mod tests {
         );
         assert_eq!(bar2.read16(hw::REG_WIFI_BT_INFO), 0x8003);
 
-        // Tune to 5 GHz channel 36 (80 MHz) and check RF 0x18, `B_WLA_SWITCH`, and 5G PTA (`GNT_WL = 0x3`)
+        // Tune to 5 GHz channel 36 (80 MHz) and check RF 0x18 (VHT80 center channel 42),
+        // `B_WLA_SWITCH`, and 5G PTA (`GNT_WL = 0x3`)
         hw.set_channel(&mut bar2, 36, 80);
+        assert_eq!(hw.current_channel, 36);
         let rf18 = hw.read_rf(&bar2, 0x18, 0xFFFFF);
-        assert_eq!(rf18 & 0xFF, 36);
+        assert_eq!(rf18 & 0xFF, 42);
         assert_ne!(rf18 & (1 << 16), 0); // 5 GHz band bit
         let rfectl_5g = bar2.read32(hw::REG_RFECTL);
         assert_eq!(

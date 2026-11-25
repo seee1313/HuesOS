@@ -73,6 +73,7 @@ stop_qemu_tpm() {
 # sealed-key HBI module. The kernel prints the resulting PCR values.
 rm -f build/cmdline.txt
 printf 'init_args=foo\n' > build/cmdline.txt
+HUESOS_BOOT_SELFTEST=1 \
 HUESOS_HXFS_SERVICE_FEATURES=synthetic-key CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-1}" \
     make iso PROFILE="$profile"
 swtpm_setup --tpmstate "$root/$state" --tpm2 >/dev/null

@@ -853,9 +853,46 @@ impl DriverManager {
             self.poll_pci_manager();
             self.try_start_pci_manager();
             self.flush_storage_progress(&init_bootstrap);
-            // Multi-channel poll: cannot block on one fd without starving others.
-            // Yield cooperatively; hot IRQ path is already blocking in the host.
-            libcanvas::process::yield_now();
+            self.wait_until_active(&init_bootstrap);
+        }
+    }
+
+    fn wait_until_active(&self, init_bootstrap: &Channel) {
+        let awaited = libcanvas::Signals::READABLE | libcanvas::Signals::PEER_CLOSED;
+        let mut items = [libcanvas::WaitItem::new(init_bootstrap.handle().raw(), awaited, 0);
+            libcanvas::waitset::MAX_ITEMS];
+        let mut count = 1usize;
+        let mut push_raw = |raw: huesos_abi::HandleValue, sig: libcanvas::Signals| {
+            if count < items.len() {
+                items[count] = libcanvas::WaitItem::new(raw, sig, count as u64);
+                count += 1;
+            }
+        };
+        self.volume.push_wait_items(&mut push_raw);
+        self.fs.push_wait_items(&mut push_raw);
+        self.blobfs.push_wait_items(&mut push_raw);
+        self.devfs.push_wait_items(&mut push_raw);
+        let mut push_ch = |ch: Option<&Channel>| {
+            if let Some(c) = ch {
+                push_raw(c.handle().raw(), awaited);
+            }
+        };
+        push_ch(self.registry_channel.as_ref());
+        push_ch(self.acpi_manager.as_ref().map(|h| &h.bootstrap));
+        push_ch(self.pci_manager.as_ref().map(|h| &h.bootstrap));
+        push_ch(self.nvme_host.as_ref().map(|h| &h.bootstrap));
+        push_ch(self.input_host.as_ref().map(|h| &h.bootstrap));
+        push_ch(self.hxfs_service.as_ref().map(|h| &h.bootstrap));
+        push_ch(self.net_service.as_ref().map(|h| &h.bootstrap));
+        push_ch(self.wlan_service.as_ref().map(|h| &h.bootstrap));
+        push_ch(self.hxfs_client.as_ref());
+        for slot in &self.query_channels {
+            push_ch(slot.as_ref());
+        }
+        if let Err(err) = libcanvas::wait_any(&items[..count], 1) {
+            if err != ErrorCode::TimedOut {
+                libcanvas::system::sleep_ms(10);
+            }
         }
     }
 
@@ -1509,6 +1546,7 @@ impl DriverManager {
             );
             self.acpi_authority_settled = true;
             self.handoff_config_authority();
+            self.notify_pci_acpi_frozen(true);
             return;
         }
         println!(
@@ -1546,23 +1584,31 @@ impl DriverManager {
     fn wait_for_input_host_ready(&mut self) {
         // Cooperative poll only — do not timed-park (can eat ready messages
         // or hang if park/wake races). Host sends ready then stays alive.
-        for _ in 0..20_000 {
+        for attempt in 0..20_000u32 {
             self.poll_input_host();
             if self.keyboard_ready() {
                 return;
             }
-            libcanvas::process::yield_now();
+            if attempt >= 256 && (attempt & 63) == 0 {
+                libcanvas::system::sleep_ms(10);
+            } else {
+                libcanvas::process::yield_now();
+            }
         }
         println!("[driver-manager] input DriverHost did not become ready in time");
     }
 
     fn wait_for_nvme_host_ready(&mut self) {
-        for _ in 0..20_000 {
+        for attempt in 0..20_000u32 {
             self.poll_nvme_host();
             if self.registry.state("block:nvme") == Some(ServiceState::Online) {
                 return;
             }
-            libcanvas::process::yield_now();
+            if attempt >= 256 && (attempt & 63) == 0 {
+                libcanvas::system::sleep_ms(10);
+            } else {
+                libcanvas::process::yield_now();
+            }
         }
         println!("[driver-manager] NVMe DriverHost did not report resources in time");
     }
@@ -3874,6 +3920,8 @@ impl DriverManager {
                 Some(remaining) => remaining,
                 None => {
                     self.acpi_manager = Some(host);
+                    self.maybe_publish_mediation();
+                    self.maybe_handoff_pci_roots();
                     return;
                 }
             };
@@ -3975,6 +4023,8 @@ impl DriverManager {
                 }
                 Err(ErrorCode::ShouldWait) | Err(ErrorCode::TimedOut) => {
                     self.acpi_manager = Some(host);
+                    self.maybe_publish_mediation();
+                    self.maybe_handoff_pci_roots();
                     return;
                 }
                 Err(error) => {
