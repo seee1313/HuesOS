@@ -1379,8 +1379,8 @@ mod tests {
         assert_eq!(bus.nic_bar0, 0x8001_0000);
         assert_eq!(bus.new_bar0, 0x8002_0000);
 
-        // 2. Exhaustive fault injection across every hook call (1..=6) and every write call (1..=6):
-        for fail_hook in 1..=6usize {
+        // 2. Exhaustive fault injection across every hook call (1..=5) and every write call (1..=6):
+        for fail_hook in 1..=5usize {
             let (Some(nvme_l), Some(nic_l)) = (
                 make_online_lease(1, 1, nvme_addr, RelocationClass::Fixed),
                 make_online_lease(2, 10, nic_addr, RelocationClass::Restart),

@@ -16,7 +16,7 @@
 use alloc::vec::Vec;
 
 use crate::lease::{
-    DeviceId, DeviceLeasePolicy, DmaIsolation, LeaseError, LeaseEvent, LeaseGeneration, LeaseState,
+    DeviceId, DeviceLeasePolicy, DmaIsolation, LeaseError, LeaseEvent, LeaseGeneration,
     RelocationClass,
 };
 use crate::resource_planner::{
@@ -749,6 +749,7 @@ pub(crate) fn build_direct_commit_plan(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::lease::LeaseState;
     use crate::resource_planner::{plan_with_hotplug_reserves, HotplugReservePolicy};
     use crate::resource_validation::{validate_firmware_resources, FirmwareResource, RootAperture};
     use crate::topology::{build_snapshot, DiscoveredFunction, FunctionKind, RootBus};
@@ -942,7 +943,6 @@ mod tests {
         };
         let nvme_gen = nvme_lease_before.generation();
 
-        let mut transport = SlotTransport::new_64bit_bar();
         let mut bars = Vec::new();
         bars.push(HotplugBarRequirement {
             bar_index: 0,
@@ -961,6 +961,7 @@ mod tests {
 
         // Mandatory Stage K.3 / O.2 gate: 1,000 synthetic add/remove cycles!
         for cycle in 0..1_000usize {
+            let mut transport = SlotTransport::new_64bit_bar();
             let Ok((inserted_lease, allocated_bars)) =
                 coord.insert_endpoint(&candidate, &mut transport)
             else {

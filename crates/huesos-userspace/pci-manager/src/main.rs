@@ -480,7 +480,7 @@ fn accept_iommu_vmo(
 
 fn run_hotplug_and_rebalance_self_check() {
     let mut queue = hotplug::HotplugEventQueue::new();
-    let Some(bridge) = PciAddress::new(0, 0, 1, 0) else {
+    let Ok(bridge) = PciAddress::try_new(0, 0, 1, 0) else {
         return;
     };
     let target = hotplug::HotplugTarget::BridgePort(bridge);
@@ -912,33 +912,48 @@ fn refresh_runtime_meta_from_readonly(authority: &mut ConfigAuthority) {
     }
 }
 
-fn map_bar_record(
-    res: &huesos_pci::resource_validation::ValidatedResource,
-) -> Option<pci_inventory::PciInventoryBar> {
-    if matches!(res.resource.register, ResourceRegister::ExpansionRom) {
-        return None;
-    }
-    let class = match res.resource.class {
+fn map_resource_class(class: ResourceClass) -> pci_inventory::InventoryBarClass {
+    match class {
         ResourceClass::Io => pci_inventory::InventoryBarClass::Io,
         ResourceClass::Mmio32 => pci_inventory::InventoryBarClass::Mmio32,
         ResourceClass::Mmio64 => pci_inventory::InventoryBarClass::Mmio64,
         ResourceClass::PrefetchableMemory => pci_inventory::InventoryBarClass::Prefetchable,
-    };
+    }
+}
+
+fn map_bar_record(
+    res: &huesos_pci::resource_validation::ValidatedResource,
+) -> pci_inventory::PciInventoryBar {
     let status = match res.status {
         ResourceStatus::Valid => pci_inventory::InventoryBarStatus::Valid,
         ResourceStatus::Fixed => pci_inventory::InventoryBarStatus::Fixed,
         ResourceStatus::Unassigned => pci_inventory::InventoryBarStatus::Unassigned,
-        ResourceStatus::Disabled => pci_inventory::InventoryBarStatus::None,
-        ResourceStatus::Unrouteable => pci_inventory::InventoryBarStatus::Unrouteable,
-        ResourceStatus::InvalidBridgeWindow => pci_inventory::InventoryBarStatus::Unsupported,
         ResourceStatus::Conflicting => pci_inventory::InventoryBarStatus::Conflicting,
+        ResourceStatus::Unrouteable => pci_inventory::InventoryBarStatus::Unrouteable,
+        ResourceStatus::Unsupported => pci_inventory::InventoryBarStatus::Unsupported,
     };
-    Some(pci_inventory::PciInventoryBar {
-        base: res.cpu_base.unwrap_or(res.resource.base),
+    pci_inventory::PciInventoryBar {
+        base: res.cpu_base.unwrap_or(res.resource.pci_base),
         len: res.resource.len,
-        class,
+        class: map_resource_class(res.resource.class),
         status,
-    })
+    }
+}
+
+fn map_planned_bar_record(
+    planned: &resource_planner::PlannedResource,
+) -> pci_inventory::PciInventoryBar {
+    let status = if planned.fixed {
+        pci_inventory::InventoryBarStatus::Fixed
+    } else {
+        pci_inventory::InventoryBarStatus::Valid
+    };
+    pci_inventory::PciInventoryBar {
+        base: planned.cpu_base,
+        len: planned.len,
+        class: map_resource_class(planned.class),
+        status,
+    }
 }
 
 fn publish_hpin_vmo(bootstrap: &Channel, authority: &ConfigAuthority, manager_generation: u64) {
@@ -1023,31 +1038,23 @@ fn publish_hpin_vmo(bootstrap: &Channel, authority: &ConfigAuthority, manager_ge
         let mut bar_count = 0usize;
         if let Some(plan) = authority.resource_plan.as_ref() {
             for planned in plan.resources() {
-                if planned.effective().resource.owner == addr
-                    && bar_count < pci_inventory::BAR_SLOTS_PER_FUNCTION
-                {
-                    if let Some(mapped) = map_bar_record(planned.effective()) {
-                        bars[bar_count] = mapped;
-                        bar_count += 1;
-                    }
+                if planned.owner == addr && bar_count < pci_inventory::BAR_SLOTS_PER_FUNCTION {
+                    bars[bar_count] = map_planned_bar_record(planned);
+                    bar_count += 1;
                 }
             }
         } else if let Some(live) = authority.live_validation.as_ref() {
             for res in live.resources() {
                 if res.resource.owner == addr && bar_count < pci_inventory::BAR_SLOTS_PER_FUNCTION {
-                    if let Some(mapped) = map_bar_record(res) {
-                        bars[bar_count] = mapped;
-                        bar_count += 1;
-                    }
+                    bars[bar_count] = map_bar_record(res);
+                    bar_count += 1;
                 }
             }
         } else if let Some(diag) = inv.validation.as_ref() {
             for res in diag.resources() {
                 if res.resource.owner == addr && bar_count < pci_inventory::BAR_SLOTS_PER_FUNCTION {
-                    if let Some(mapped) = map_bar_record(res) {
-                        bars[bar_count] = mapped;
-                        bar_count += 1;
-                    }
+                    bars[bar_count] = map_bar_record(res);
+                    bar_count += 1;
                 }
             }
         }

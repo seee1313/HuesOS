@@ -4437,7 +4437,7 @@ fn append_hpin_func_rows(inv_vmo: &Vmo, out: &mut QueryBuf<3840>) {
         return;
     };
     for idx in 0..usize::from(hdr.function_count) {
-        if out.len + 112 > 3840 {
+        if out.len + 512 > 3840 {
             break;
         }
         if let Ok(rec) = pci_inventory::decode_record(&buf[..declared], idx) {
