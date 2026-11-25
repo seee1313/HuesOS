@@ -842,13 +842,13 @@ fn encode_hiom_from_archive(
             if dmar_loc.is_some() || (entry.length as usize) > MAX_IOMMU_SDT_BYTES {
                 ambiguous_or_oversized = true;
             } else {
-                dmar_loc = Some((entry.payload_offset, entry.length));
+                dmar_loc = Some((entry.offset, entry.length));
             }
         } else if &entry.signature == b"IVRS" {
             if ivrs_loc.is_some() || (entry.length as usize) > MAX_IOMMU_SDT_BYTES {
                 ambiguous_or_oversized = true;
             } else {
-                ivrs_loc = Some((entry.payload_offset, entry.length));
+                ivrs_loc = Some((entry.offset, entry.length));
             }
         }
     }
@@ -933,9 +933,8 @@ fn report_to_hiom_snapshot(
 
     let unit_count = report.unit_count.min(pci_iommu::MAX_UNITS);
     let mut units = [pci_iommu::IommuUnitDesc::ZERO; pci_iommu::MAX_UNITS];
-    for idx in 0..unit_count {
-        let src = report.units[idx];
-        units[idx] = pci_iommu::IommuUnitDesc {
+    for (dst, src) in units.iter_mut().zip(report.units.iter()).take(unit_count) {
+        *dst = pci_iommu::IommuUnitDesc {
             segment: src.segment,
             flags: if src.include_pci_all {
                 pci_iommu::UNIT_FLAG_INCLUDE_PCI_ALL
@@ -950,9 +949,12 @@ fn report_to_hiom_snapshot(
 
     let region_count = report.region_count.min(pci_iommu::MAX_REGIONS);
     let mut regions = [pci_iommu::IommuReservedRegion::ZERO; pci_iommu::MAX_REGIONS];
-    for idx in 0..region_count {
-        let src = report.regions[idx];
-        regions[idx] = pci_iommu::IommuReservedRegion {
+    for (dst, src) in regions
+        .iter_mut()
+        .zip(report.regions.iter())
+        .take(region_count)
+    {
+        *dst = pci_iommu::IommuReservedRegion {
             segment: src.segment,
             requester_bdf: src.requester_bdf,
             flags: src.flags,

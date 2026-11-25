@@ -7,9 +7,7 @@ use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
 use huesos_abi::pci::ConfigBackend;
-use huesos_abi::pci_inventory::{
-    self, InventoryBarClass, InventoryIrqMode, InventoryParentKind, BAR_SLOTS_PER_FUNCTION,
-};
+use huesos_abi::pci_inventory::{self, InventoryBarClass, InventoryIrqMode, InventoryParentKind};
 use huesos_abi::pci_iommu::{self, IommuMode};
 use huesos_coreutils as cu;
 use libcanvas::{ErrorCode, Vmo};
@@ -57,9 +55,7 @@ fn run() -> i32 {
 }
 
 fn fetch_inventory_vmo() -> Result<Vmo, i32> {
-    if let Err(code) = cu::check_query_ro() {
-        return Err(code);
-    }
+    cu::check_query_ro()?;
     let Some(reg) = cu::take_registry() else {
         cu::errln("pci: DriverManager query channel unavailable");
         return Err(1);
@@ -198,8 +194,7 @@ fn run_hpin_report(show_iommu: bool, show_functions: bool, show_bars: bool) -> i
                 ));
             }
             if show_bars {
-                for b_idx in 0..BAR_SLOTS_PER_FUNCTION {
-                    let bar = rec.bars[b_idx];
+                for (b_idx, bar) in rec.bars.iter().copied().enumerate() {
                     if bar.class == InventoryBarClass::Unused {
                         continue;
                     }

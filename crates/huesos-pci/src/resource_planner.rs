@@ -298,6 +298,7 @@ pub fn plan_with_hotplug_reserves(
     // Stage F.1 + F.3: bottom-up bridge window sizing + hotplug reserve slack.
     aggregate_bottom_up_bridge_windows(
         topology,
+        apertures,
         &planned,
         &mut pending,
         hotplug_ports,
@@ -371,6 +372,7 @@ fn window_index_for_class(class: ResourceClass) -> u8 {
 
 fn aggregate_bottom_up_bridge_windows(
     topology: &TopologySnapshot,
+    apertures: &[RootAperture],
     preserved: &[PlannedResource],
     pending: &mut Vec<FirmwareResource>,
     hotplug_ports: &[PciAddress],
@@ -397,6 +399,7 @@ fn aggregate_bottom_up_bridge_windows(
 
     for &(_depth, bridge_addr) in &bridges {
         let is_hotplug = hotplug_ports.contains(&bridge_addr);
+        let root_id = root_id_of(topology, bridge_addr);
         for class in CLASSES {
             let has_preserved_window = preserved.iter().any(|r| {
                 r.owner == bridge_addr
@@ -429,9 +432,24 @@ fn aggregate_bottom_up_bridge_windows(
                     .ok_or(PlanError::ArithmeticOverflow)?;
             }
             if is_hotplug {
-                // Avoid double-reserving both Mmio64 and PrefetchableMemory unless child uses Mmio64;
-                // standard PCIe prefetchable 64-bit window is ResourceClass::PrefetchableMemory.
-                let reserve = if class == ResourceClass::Mmio64 && needed == 0 {
+                let root_has_class = root_id.is_some_and(|rid| {
+                    apertures.iter().any(|ap| {
+                        ap.root_id == rid
+                            && match class {
+                                ResourceClass::Mmio64 => matches!(
+                                    ap.class,
+                                    ResourceClass::Mmio64 | ResourceClass::PrefetchableMemory
+                                ),
+                                other => ap.class == other,
+                            }
+                    })
+                });
+                // Avoid double-reserving Mmio64 alongside PrefetchableMemory, and do not
+                // synthesize a pure reserve window when the owning root bridge has no
+                // upstream aperture of `class`.
+                let reserve = if (class == ResourceClass::Mmio64 && needed == 0)
+                    || (needed == 0 && !root_has_class)
+                {
                     0
                 } else {
                     reserve_policy.reserve_for_class(class)
