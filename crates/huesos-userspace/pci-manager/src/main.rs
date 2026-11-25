@@ -724,20 +724,25 @@ fn publish_inventory_from_hpci(
         });
     }
 
-    let mut transport = ReadOnlyTransport {
-        windows: &authority.windows,
-        windows_len: authority.windows_len,
-        #[cfg(feature = "force-legacy")]
-        legacy_ioport: authority.legacy_ioport.as_ref(),
+    let publish_res = {
+        let mut transport = ReadOnlyTransport {
+            windows: &authority.windows,
+            windows_len: authority.windows_len,
+            #[cfg(feature = "force-legacy")]
+            legacy_ioport: authority.legacy_ioport.as_ref(),
+        };
+        authority
+            .inventory
+            .publish_from_roots(&mut transport, &roots, &apertures)
+            .map(|inv| {
+                let fn_count = inv.snapshot.nodes().len() as u32;
+                let avail = inv.availability == FirmwareResourceAvailability::Available;
+                log_diagnostic_inventory(inv);
+                (fn_count, avail)
+            })
     };
-    match authority
-        .inventory
-        .publish_from_roots(&mut transport, &roots, &apertures)
-    {
-        Ok(inv) => {
-            let fn_count = inv.snapshot.nodes().len() as u32;
-            let avail = inv.availability == FirmwareResourceAvailability::Available;
-            log_diagnostic_inventory(inv);
+    match publish_res {
+        Ok((fn_count, avail)) => {
             refresh_runtime_meta_from_readonly(authority);
             publish_hpin_vmo(bootstrap, authority, manager_generation);
             let _ = send(
@@ -785,18 +790,24 @@ fn handle_acpi_frozen(
                 end_bus: window.bus_end,
             });
         }
-        let mut transport = ReadOnlyTransport {
-            windows: &authority.windows,
-            windows_len: authority.windows_len,
-            #[cfg(feature = "force-legacy")]
-            legacy_ioport: authority.legacy_ioport.as_ref(),
+        let unavail_fn_count = {
+            let mut transport = ReadOnlyTransport {
+                windows: &authority.windows,
+                windows_len: authority.windows_len,
+                #[cfg(feature = "force-legacy")]
+                legacy_ioport: authority.legacy_ioport.as_ref(),
+            };
+            authority
+                .inventory
+                .publish_unavailable(&mut transport, &fallback_roots)
+                .ok()
+                .map(|inv| {
+                    let fn_count = inv.snapshot.nodes().len() as u32;
+                    log_diagnostic_inventory(inv);
+                    fn_count
+                })
         };
-        if let Ok(inv) = authority
-            .inventory
-            .publish_unavailable(&mut transport, &fallback_roots)
-        {
-            let fn_count = inv.snapshot.nodes().len() as u32;
-            log_diagnostic_inventory(inv);
+        if let Some(fn_count) = unavail_fn_count {
             refresh_runtime_meta_from_readonly(authority);
             publish_hpin_vmo(bootstrap, authority, manager_generation);
             let _ = send(
@@ -2100,7 +2111,7 @@ fn parse_virtio_modern_caps(
 
 fn run_driver_binding_and_handoff(
     bootstrap: &Channel,
-    authority: &ConfigAuthority,
+    authority: &mut ConfigAuthority,
     manager_generation: u64,
 ) {
     let Some(inv) = authority.inventory.last_good() else {
@@ -2235,6 +2246,12 @@ fn run_driver_binding_and_handoff(
         legacy_ioport: authority.legacy_ioport.as_ref(),
     };
     let mut bound_count = 0u32;
+    let mut meta_updates: Vec<(
+        PciAddress,
+        pci_inventory::InventoryIrqMode,
+        u16,
+        pci_inventory::InventoryRelocationClass,
+    )> = Vec::new();
 
     for lease in &authority.leases {
         let Some(node) = inv
@@ -3119,17 +3136,26 @@ fn run_driver_binding_and_handoff(
                         pci_inventory::InventoryRelocationClass::QuiesceRemap
                     }
                 };
-                if let Some(meta) = authority
-                    .runtime_meta
-                    .iter_mut()
-                    .find(|m| m.address == lease.address)
-                {
-                    meta.lease_state = pci_inventory::InventoryLeaseState::BoundOnline;
-                    meta.irq_mode = inv_irq_mode;
-                    meta.irq_vector_or_gsi = u16::try_from(irq_num).unwrap_or(0);
-                    meta.relocation_class = inv_reloc;
-                }
+                meta_updates.push((
+                    lease.address,
+                    inv_irq_mode,
+                    u16::try_from(irq_num).unwrap_or(0),
+                    inv_reloc,
+                ));
             }
+        }
+    }
+
+    for (addr, inv_irq_mode, irq_vec, inv_reloc) in meta_updates {
+        if let Some(meta) = authority
+            .runtime_meta
+            .iter_mut()
+            .find(|m| m.address == addr)
+        {
+            meta.lease_state = pci_inventory::InventoryLeaseState::BoundOnline;
+            meta.irq_mode = inv_irq_mode;
+            meta.irq_vector_or_gsi = irq_vec;
+            meta.relocation_class = inv_reloc;
         }
     }
 

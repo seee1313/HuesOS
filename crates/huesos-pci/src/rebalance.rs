@@ -1050,7 +1050,7 @@ mod tests {
     use super::*;
     use crate::lease::DmaIsolation;
     use crate::resource_validation::validate_firmware_resources;
-    use crate::topology::{build_snapshot, DiscoveredFunction, RootBus};
+    use crate::topology::{build_snapshot, DiscoveredFunction, FunctionKind, RootBus};
 
     fn bdf(dev: u8) -> PciAddress {
         match PciAddress::try_new(0, 0, dev, 0) {
@@ -1463,6 +1463,7 @@ mod tests {
             assert!(false);
             return;
         };
+        let dev_id = lease.device_id();
 
         // 1,000 live QuiesceRemap cycles (Stage M.1 + O.2 repetition gate):
         for epoch in 1..=1_000u64 {
@@ -1479,7 +1480,7 @@ mod tests {
                     sess.on_quiesced(
                         &mut lease,
                         QuiesceRemapMessage::Quiesced {
-                            device_id: lease.device_id(),
+                            device_id: dev_id,
                             lease_generation: stale_gen,
                             epoch,
                         },
@@ -1498,7 +1499,7 @@ mod tests {
             let Ok(new_gen) = sess.on_quiesced(
                 &mut lease,
                 QuiesceRemapMessage::Quiesced {
-                    device_id: lease.device_id(),
+                    device_id: dev_id,
                     lease_generation,
                     epoch,
                 },
@@ -1522,7 +1523,7 @@ mod tests {
                 sess.on_resume(
                     &mut lease,
                     QuiesceRemapMessage::Resume {
-                        device_id: lease.device_id(),
+                        device_id: dev_id,
                         new_generation: new_gen,
                         epoch,
                     },
@@ -1545,7 +1546,7 @@ mod tests {
             late_sess.on_quiesced(
                 &mut lease,
                 QuiesceRemapMessage::Quiesced {
-                    device_id: lease.device_id(),
+                    device_id: dev_id,
                     lease_generation: cur_gen,
                     epoch: 2000,
                 },
