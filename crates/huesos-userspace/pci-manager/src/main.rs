@@ -2303,7 +2303,9 @@ fn run_driver_binding_and_handoff(
             continue;
         };
         let active_dma_isolation = match authority.iommu.as_ref().map(|s| s.active_mode) {
-            Some(pci_iommu::IommuMode::Isolated) => DmaIsolation::Isolated,
+            Some(pci_iommu::IommuMode::Isolated) => {
+                DmaIsolation::IommuDomain(lease.device_id.max(1))
+            }
             _ => DmaIsolation::Trusted,
         };
         let effective_reloc = rebalance::effective_relocation_class(

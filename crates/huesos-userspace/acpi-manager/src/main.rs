@@ -918,7 +918,7 @@ fn report_to_hiom_snapshot(
     };
     let active_mode = match report.active_dma_isolation {
         DmaIsolation::Trusted => pci_iommu::IommuMode::Trusted,
-        DmaIsolation::Isolated => pci_iommu::IommuMode::Isolated,
+        DmaIsolation::IommuDomain(_) => pci_iommu::IommuMode::Isolated,
     };
     let mut flags = 0u8;
     if report.interrupt_remapping_supported {
