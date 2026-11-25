@@ -256,6 +256,12 @@ pub unsafe fn install_execution_guards(guards: *mut huesos_sched::ExecutionGuard
     }
 }
 
+/// True once at least the BSP has allocated and initialized its `CpuLocal` slot.
+#[inline]
+pub fn has_cpu_locals() -> bool {
+    CPU_LOCAL_NEXT.load(core::sync::atomic::Ordering::Acquire) != 0
+}
+
 /// Translate a dense CPU index back to the LAPIC ID used for IPIs.
 ///
 /// Returns `None` for an index that has not been allocated yet. The BSP/AP

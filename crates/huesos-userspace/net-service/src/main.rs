@@ -1748,7 +1748,46 @@ pub extern "C" fn _start() -> ! {
             n.flush_tx(&mut tx_eth_out);
         }
         flush_wlan_tx(wlan_uplink_ch.as_ref(), &mut tx_wlan_out);
-        libcanvas::process::yield_now();
+
+        let awaited = libcanvas::Signals::READABLE | libcanvas::Signals::PEER_CLOSED;
+        let mut items = [libcanvas::WaitItem::new(bootstrap.handle().raw(), awaited, 0); 16];
+        let mut count = 1usize;
+        if let Some(up) = wlan_uplink_ch.as_ref() {
+            items[count] = libcanvas::WaitItem::new(up.handle().raw(), awaited, 1);
+            count += 1;
+        }
+        for c in clients.iter().flatten() {
+            if count >= items.len() {
+                break;
+            }
+            items[count] = libcanvas::WaitItem::new(c.ch.handle().raw(), awaited, count as u64);
+            count += 1;
+        }
+        for t in &active_tcp {
+            if count >= items.len() {
+                break;
+            }
+            items[count] =
+                libcanvas::WaitItem::new(t.data_ch.handle().raw(), awaited, count as u64);
+            count += 1;
+        }
+        for u in &active_udp {
+            if count >= items.len() {
+                break;
+            }
+            items[count] = libcanvas::WaitItem::new(u.ch.handle().raw(), awaited, count as u64);
+            count += 1;
+        }
+        let has_active_net = nic.is_some()
+            || wlan_stack.cfg.link_up
+            || !active_tcp.is_empty()
+            || !active_udp.is_empty();
+        let timeout_ticks = if has_active_net { 1 } else { 20 };
+        if let Err(err) = libcanvas::wait_any(&items[..count], timeout_ticks) {
+            if err != libcanvas::ErrorCode::TimedOut {
+                libcanvas::system::sleep_ms(10);
+            }
+        }
     }
 }
 

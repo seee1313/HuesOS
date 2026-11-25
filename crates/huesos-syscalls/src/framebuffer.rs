@@ -100,11 +100,18 @@ pub(crate) fn sys_framebuffer_blit(
     }
 
     let row_bytes = row_bytes_u64 as usize;
-    let rows_per_chunk = (BLIT_CHUNK_BYTES / row_bytes).max(1);
-    let buffer_bytes = rows_per_chunk
-        .checked_mul(row_bytes)
-        .ok_or(ErrorCode::InvalidArgs)?;
-    let mut buffer = user_memory::zeroed_buffer(buffer_bytes)?;
+    let mut stack_buf = [0u8; 4096];
+    let mut heap_buf;
+    let (buffer, rows_per_chunk): (&mut [u8], usize) = if row_bytes <= stack_buf.len() {
+        let rows = (stack_buf.len() / row_bytes).max(1);
+        let used = rows * row_bytes;
+        (&mut stack_buf[..used], rows)
+    } else {
+        let rows = (BLIT_CHUNK_BYTES / row_bytes).max(1);
+        let buffer_bytes = rows.checked_mul(row_bytes).ok_or(ErrorCode::InvalidArgs)?;
+        heap_buf = user_memory::zeroed_buffer(buffer_bytes)?;
+        (&mut heap_buf[..], rows)
+    };
 
     let mut first_row = 0usize;
     let height = args.src_height as usize;

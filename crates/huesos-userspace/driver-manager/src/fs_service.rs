@@ -39,6 +39,16 @@ impl FileSystemService {
         self.bootfs.as_ref().map(|b| &b.vmo)
     }
 
+    pub fn push_wait_items(
+        &self,
+        push: &mut impl FnMut(huesos_abi::HandleValue, libcanvas::Signals),
+    ) {
+        let sig = libcanvas::Signals::READABLE | libcanvas::Signals::PEER_CLOSED;
+        for client in self.clients.iter().flatten() {
+            push(client.handle().raw(), sig);
+        }
+    }
+
     pub fn open_for_registry(&mut self, registry: &Channel) {
         let Some(slot) = self.clients.iter().position(Option::is_none) else {
             let _ = registry.write(b"err:filesystem-busy\n");

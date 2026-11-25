@@ -125,10 +125,25 @@ impl Framebuffer {
         let packed = self.pack_color(r, g, b);
         let x_end = (x.saturating_add(w)).min(self.config.width);
         let y_end = (y.saturating_add(h)).min(self.config.height);
-        for py in y..y_end {
-            for px in x..x_end {
-                unsafe {
-                    self.put_pixel_raw(px, py, packed);
+        if x_end <= x || y_end <= y {
+            return;
+        }
+        unsafe {
+            if self.bytes_per_pixel() == 4
+                && (self.config.addr as usize & 3) == 0
+                && (self.config.pitch & 3) == 0
+            {
+                let span = (x_end - x) as usize;
+                for py in y..y_end {
+                    let dst_off = self.offset_of(x, py);
+                    let row_ptr = self.config.addr.add(dst_off) as *mut u32;
+                    core::slice::from_raw_parts_mut(row_ptr, span).fill(packed);
+                }
+            } else {
+                for py in y..y_end {
+                    for px in x..x_end {
+                        self.put_pixel_raw(px, py, packed);
+                    }
                 }
             }
         }
@@ -183,21 +198,35 @@ impl Framebuffer {
         let copy_w = src_w.min(self.config.width.saturating_sub(dst_x));
         let copy_h = src_h.min(self.config.height.saturating_sub(dst_y));
         let copy_bytes = copy_w as usize * bpp;
+        if copy_w == 0 || copy_h == 0 || copy_bytes == 0 {
+            return 0;
+        }
 
         let mut rows_copied = 0u32;
-        for row in 0..copy_h {
-            let src_row_start = row as usize * src_pitch;
-            let src_row_end = src_row_start + copy_bytes;
-            if src_row_end > src.len() {
-                break; // src buffer shorter than claimed; stop, don't panic/OOB read
+        unsafe {
+            if dst_x == 0 && copy_bytes == self.config.pitch as usize && copy_bytes == src_pitch {
+                let max_rows = (src.len() / copy_bytes).min(copy_h as usize);
+                if max_rows > 0 {
+                    let total_bytes = max_rows * copy_bytes;
+                    let dst_off = self.offset_of(0, dst_y);
+                    let dst_ptr = self.config.addr.add(dst_off);
+                    core::ptr::copy_nonoverlapping(src.as_ptr(), dst_ptr, total_bytes);
+                }
+                return max_rows as u32;
             }
-            let src_row = &src[src_row_start..src_row_end];
-            let dst_off = self.offset_of(dst_x, dst_y + row);
-            unsafe {
+
+            for row in 0..copy_h {
+                let src_row_start = row as usize * src_pitch;
+                let src_row_end = src_row_start + copy_bytes;
+                if src_row_end > src.len() {
+                    break;
+                }
+                let src_row = &src[src_row_start..src_row_end];
+                let dst_off = self.offset_of(dst_x, dst_y + row);
                 let dst_ptr = self.config.addr.add(dst_off);
                 core::ptr::copy_nonoverlapping(src_row.as_ptr(), dst_ptr, copy_bytes);
+                rows_copied += 1;
             }
-            rows_copied += 1;
         }
         rows_copied
     }

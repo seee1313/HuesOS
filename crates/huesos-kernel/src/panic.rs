@@ -49,7 +49,7 @@ pub fn from_cpu_fault(info: FaultInfo) -> ! {
     let stopped_peers = stop_machine();
 
     let cpu = huesos_arch::cpu::current_id();
-    let cr3 = Cr3::read().0.start_address().as_u64();
+    let cr3 = Cr3::read_raw().0.start_address().as_u64();
     let report = format_args!(
         "CPU: {}\nException: {}\nError code: {:#018x}\nFault address: {:#018x}\nInstruction pointer: {:#018x}\nStack pointer: {:#018x}\nRFLAGS: {:#018x}\nCS: {:#06x}\nCR3: {:#018x}\nStopped peer CPUs: {}\nAction: system halted; no automatic reboot\n",
         cpu,
@@ -94,7 +94,7 @@ pub fn from_rust(info: &core::panic::PanicInfo<'_>) -> ! {
     let stopped_peers = stop_machine();
 
     let cpu = huesos_arch::cpu::current_id();
-    let cr3 = Cr3::read().0.start_address().as_u64();
+    let cr3 = Cr3::read_raw().0.start_address().as_u64();
     let location = info.location();
 
     let mut serial = EmergencySerial;

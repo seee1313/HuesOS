@@ -27,16 +27,54 @@ static TLB_SEQ: AtomicU64 = AtomicU64::new(0);
 static TLB_START: AtomicU64 = AtomicU64::new(0);
 static TLB_END: AtomicU64 = AtomicU64::new(0);
 static TLB_ACKS: AtomicUsize = AtomicUsize::new(0);
+static TLB_TARGET_MASK: [AtomicU64; 4] = [const { AtomicU64::new(u64::MAX) }; 4];
+static ACTIVE_CPU_CR3: [AtomicU64; huesos_sched::MAX_CPUS] =
+    [const { AtomicU64::new(0) }; huesos_sched::MAX_CPUS];
+
+const KERNEL_STACK_ARENA_PML4_INDEX: usize = 509;
+const KERNEL_STACK_ARENA_START: u64 = 0xffff_fe80_0000_0000;
+const KERNEL_STACK_ARENA_END: u64 = 0xffff_ff00_0000_0000;
+const GUARDED_STACK_POOL_CAP: usize = 64;
+const STANDARD_GUARDED_STACK_BYTES: usize = 64 * 1024;
+static KERNEL_STACK_ARENA_NEXT: AtomicU64 = AtomicU64::new(KERNEL_STACK_ARENA_START);
+static GUARDED_STACK_POOL_64K: [AtomicU64; GUARDED_STACK_POOL_CAP] =
+    [const { AtomicU64::new(0) }; GUARDED_STACK_POOL_CAP];
+
+#[inline]
+fn local_cpu_index() -> Option<usize> {
+    if crate::cpu_local::has_cpu_locals() {
+        Some(unsafe { crate::cpu_local::current_cpu_index() })
+    } else {
+        None
+    }
+}
+
+/// Record the active PML4 physical address on `cpu` so user-address-space TLB
+/// shootdowns only IPI CPUs that actually hold active translations for that CR3.
+#[inline]
+pub fn note_cpu_active_cr3(cpu: usize, cr3_phys: u64) {
+    if cpu < huesos_sched::MAX_CPUS {
+        let masked = cr3_phys & !0xfff;
+        if ACTIVE_CPU_CR3[cpu].load(Ordering::Relaxed) != masked {
+            ACTIVE_CPU_CR3[cpu].store(masked, Ordering::SeqCst);
+        }
+    }
+}
 
 /// Invalidate the requested range on the local CPU as part of an active
 /// cross-CPU TLB shootdown request.
 pub fn handle_tlb_shootdown() {
-    // Acknowledge only the request that is in flight when this IPI is
-    // handled. A delayed IPI from a finished (or superseded) request must
-    // not count toward the current request's acknowledgement budget.
     let seq = TLB_REQ_SEQ.load(Ordering::Acquire);
     if seq == 0 {
         return;
+    }
+    if let Some(cpu) = local_cpu_index() {
+        if cpu < huesos_sched::MAX_CPUS {
+            let word = TLB_TARGET_MASK[cpu / 64].load(Ordering::Acquire);
+            if (word & (1u64 << (cpu % 64))) == 0 {
+                return;
+            }
+        }
     }
     let mut page = TLB_START.load(Ordering::Acquire);
     let end = TLB_END.load(Ordering::Acquire);
@@ -93,6 +131,9 @@ pub fn shootdown_range(start: u64, end: u64, expected_remote: usize) {
         seq = 1;
     }
 
+    for mask_word in &TLB_TARGET_MASK {
+        mask_word.store(u64::MAX, Ordering::Relaxed);
+    }
     TLB_START.store(start, Ordering::Relaxed);
     TLB_END.store(end, Ordering::Relaxed);
     TLB_ACKS.store(0, Ordering::Relaxed);
@@ -138,6 +179,103 @@ pub fn shootdown_range(start: u64, end: u64, expected_remote: usize) {
     }
 }
 
+/// Invalidate `[start, end)` only on CPUs whose active CR3 matches `pml4_phys`.
+///
+/// Single-CPU processes pay zero cross-CPU IPIs and zero global shootdown-lock
+/// contention; multi-threaded processes send unicast shootdown IPIs solely to
+/// sibling CPUs actively executing in `pml4_phys`.
+pub fn shootdown_range_for_cr3(pml4_phys: u64, start: u64, end: u64) {
+    let start = start & !0xfff;
+    let end = end.saturating_add(0xfff) & !0xfff;
+    if start >= end {
+        return;
+    }
+    let target_cr3 = pml4_phys & !0xfff;
+    core::sync::atomic::fence(Ordering::SeqCst);
+
+    let self_cpu = local_cpu_index();
+    let mut target_words = [0u64; 4];
+    let mut remote_apics = [0u32; huesos_sched::MAX_CPUS];
+    let mut remote_count = 0usize;
+
+    for (cpu, slot) in ACTIVE_CPU_CR3.iter().enumerate() {
+        if Some(cpu) == self_cpu {
+            continue;
+        }
+        if slot.load(Ordering::Acquire) == target_cr3 {
+            if let Some(apic_id) = crate::cpu_local::lapic_id_for_index(cpu) {
+                target_words[cpu / 64] |= 1u64 << (cpu % 64);
+                remote_apics[remote_count] = apic_id;
+                remote_count += 1;
+            }
+        }
+    }
+
+    if remote_count == 0 {
+        let active_local = Cr3::read_raw().0.start_address().as_u64() & !0xfff;
+        if active_local == target_cr3 {
+            let mut page = start;
+            while page < end {
+                crate::x86_64::cpu::invlpg(page);
+                page = page.saturating_add(4096);
+            }
+        }
+        return;
+    }
+
+    crate::sync::assert_no_ranked_locks_held();
+    let _preempt_guard = crate::x86_64::preemption::disable_preemption();
+    let interrupts_were_enabled = x86_64::instructions::interrupts::are_enabled();
+
+    let ticket = TLB_MAILBOX_NEXT.fetch_add(1, Ordering::Relaxed);
+    if TLB_MAILBOX_SERVING.load(Ordering::Acquire) != ticket {
+        x86_64::instructions::interrupts::enable();
+        while TLB_MAILBOX_SERVING.load(Ordering::Acquire) != ticket {
+            core::hint::spin_loop();
+        }
+    }
+    x86_64::instructions::interrupts::disable();
+
+    let mut seq = TLB_SEQ.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+    if seq == 0 {
+        seq = 1;
+    }
+
+    for (dst, &src) in TLB_TARGET_MASK.iter().zip(target_words.iter()) {
+        dst.store(src, Ordering::Relaxed);
+    }
+    TLB_START.store(start, Ordering::Relaxed);
+    TLB_END.store(end, Ordering::Relaxed);
+    TLB_ACKS.store(0, Ordering::Relaxed);
+    TLB_REQ_SEQ.store(seq, Ordering::Release);
+
+    for &apic_id in &remote_apics[..remote_count] {
+        crate::x86_64::lapic::ipi_vector(apic_id, TLB_SHOOTDOWN_VECTOR);
+    }
+
+    let mut page = start;
+    while page < end {
+        crate::x86_64::cpu::invlpg(page);
+        page = page.saturating_add(4096);
+    }
+
+    while TLB_REQ_SEQ.load(Ordering::Acquire) == seq
+        && TLB_ACKS.load(Ordering::Acquire) < remote_count
+    {
+        core::hint::spin_loop();
+    }
+
+    let _ = TLB_REQ_SEQ.compare_exchange(seq, 0, Ordering::AcqRel, Ordering::Acquire);
+    TLB_MAILBOX_SERVING.fetch_add(1, Ordering::Release);
+
+    if interrupts_were_enabled {
+        x86_64::instructions::interrupts::enable();
+    } else {
+        x86_64::instructions::interrupts::disable();
+    }
+    drop(_preempt_guard);
+}
+
 /// Higher-half direct map offset, fixed once at boot before AP release.
 static HHDM_OFFSET: AtomicU64 = AtomicU64::new(0);
 
@@ -174,15 +312,26 @@ impl FrameDeallocator<Size4KiB> for PmmFrameAllocator {
 /// physical memory, and the PMM must already be initialized.
 pub unsafe fn init(phys_offset: VirtAddr) {
     HHDM_OFFSET.store(phys_offset.as_u64(), Ordering::Release);
-    let level_4_table = unsafe { active_level_4_table(phys_offset) };
+    let (level_4_frame, _) = Cr3::read_raw();
+    note_cpu_active_cr3(0, level_4_frame.start_address().as_u64());
+    let level_4_table = unsafe {
+        let phys = level_4_frame.start_address();
+        let virt = phys_offset + phys.as_u64();
+        let pml4: &mut PageTable = &mut *virt.as_mut_ptr();
+        if pml4[KERNEL_STACK_ARENA_PML4_INDEX].is_unused() {
+            if let Ok(pdpt_phys) = huesos_pmm::alloc_frame() {
+                let pdpt_virt = phys_offset + pdpt_phys;
+                let pdpt: &mut PageTable = &mut *pdpt_virt.as_mut_ptr();
+                pdpt.zero();
+                pml4[KERNEL_STACK_ARENA_PML4_INDEX].set_addr(
+                    PhysAddr::new(pdpt_phys),
+                    PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::NO_EXECUTE,
+                );
+            }
+        }
+        pml4
+    };
     *KERNEL_PAGE_TABLE.lock() = Some(OffsetPageTable::new(level_4_table, phys_offset));
-}
-
-unsafe fn active_level_4_table(phys_offset: VirtAddr) -> &'static mut PageTable {
-    let (level_4_frame, _) = Cr3::read();
-    let phys = level_4_frame.start_address();
-    let virt = phys_offset + phys.as_u64();
-    unsafe { &mut *virt.as_mut_ptr() }
 }
 
 /// Translate a physical address to a kernel-accessible virtual address via
@@ -480,7 +629,7 @@ pub fn active_user_page_accessible(addr: VirtAddr, write: bool) -> bool {
         unsafe { &*phys_to_virt(phys.as_u64()).as_ptr::<PageTable>() }
     }
 
-    let (p4_frame, _) = Cr3::read();
+    let (p4_frame, _) = Cr3::read_raw();
     let p4 = table_at(p4_frame.start_address());
     let p4e = &p4[addr.p4_index()];
     if !permits(p4e.flags(), write) || p4e.flags().contains(PageTableFlags::HUGE_PAGE) {
@@ -519,11 +668,108 @@ pub fn map_new_page(
         .allocate_frame()
         .ok_or(KernelPageError::OutOfMemory)?;
     if let Err(error) = map_page(page, frame, flags) {
-        // SAFETY: map_page failed, so the fresh frame has no published owner.
-        unsafe { PmmFrameAllocator.deallocate_frame(frame) };
+        huesos_pmm::free_frame(frame.start_address().as_u64());
         return Err(error);
     }
     Ok(frame)
+}
+
+/// Allocate a kernel stack of `usable_bytes` (page-rounded) inside the private
+/// kernel stack arena (`0xffff_fe80_0000_0000..`), flanked by unmapped 4 KiB
+/// lower and upper guard pages and mapped `PRESENT | WRITABLE | NO_EXECUTE`.
+pub fn alloc_guarded_kernel_stack(usable_bytes: usize) -> Option<(u64, usize)> {
+    if hhdm_offset() == 0 || usable_bytes == 0 {
+        return None;
+    }
+    let aligned_bytes = usable_bytes.checked_add(0xfff)? & !0xfff;
+    if aligned_bytes == STANDARD_GUARDED_STACK_BYTES {
+        for slot in &GUARDED_STACK_POOL_64K {
+            let cached = slot.swap(0, Ordering::AcqRel);
+            if cached != 0 {
+                return Some((cached, aligned_bytes));
+            }
+        }
+    }
+
+    // Layout: [4 KiB lower guard (unmapped)] [aligned_bytes RW+NX] [4 KiB upper guard (unmapped)]
+    let span = (aligned_bytes as u64).checked_add(8192)?;
+    let slot_start = KERNEL_STACK_ARENA_NEXT.fetch_add(span, Ordering::AcqRel);
+    let slot_end = slot_start.checked_add(span)?;
+    if slot_end > KERNEL_STACK_ARENA_END {
+        return None;
+    }
+    let usable_base = slot_start + 4096;
+    let pages = aligned_bytes / 4096;
+    for idx in 0..pages {
+        let va = VirtAddr::new(usable_base + (idx as u64) * 4096);
+        let page = Page::<Size4KiB>::containing_address(va);
+        if map_new_page(page, flags::KERNEL_RW).is_err() {
+            // Roll back already-mapped pages in this fresh slot; no other CPU
+            // has observed `usable_base` yet.
+            let mut guard = KERNEL_PAGE_TABLE.lock();
+            if let Some(mapper) = guard.as_mut() {
+                for undo in 0..idx {
+                    let undo_va = VirtAddr::new(usable_base + (undo as u64) * 4096);
+                    let undo_page = Page::<Size4KiB>::containing_address(undo_va);
+                    if let Ok((frame, flush)) = mapper.unmap(undo_page) {
+                        flush.flush();
+                        huesos_pmm::free_frame(frame.start_address().as_u64());
+                    }
+                }
+            }
+            return None;
+        }
+    }
+    Some((usable_base, aligned_bytes))
+}
+
+/// Return a guarded kernel stack allocated by [`alloc_guarded_kernel_stack`]
+/// to the bounded reuse pool (or unmap and release its backing frames when the
+/// pool is full). Must only be called after the owning task/CPU has completely
+/// switched off the stack (`TaskState::Reaped`).
+pub fn free_guarded_kernel_stack(usable_base: u64, usable_bytes: usize) {
+    if !(KERNEL_STACK_ARENA_START..KERNEL_STACK_ARENA_END).contains(&usable_base)
+        || usable_bytes == 0
+        || (usable_bytes & 0xfff) != 0
+    {
+        return;
+    }
+    if usable_bytes == STANDARD_GUARDED_STACK_BYTES {
+        for slot in &GUARDED_STACK_POOL_64K {
+            if slot
+                .compare_exchange(0, usable_base, Ordering::AcqRel, Ordering::Relaxed)
+                .is_ok()
+            {
+                return;
+            }
+        }
+    }
+
+    let pages = usable_bytes / 4096;
+    let mut frames_to_free = [0u64; 32];
+    let mut freed_count = 0usize;
+    {
+        let mut guard = KERNEL_PAGE_TABLE.lock();
+        let Some(mapper) = guard.as_mut() else {
+            return;
+        };
+        for idx in 0..pages {
+            let va = VirtAddr::new(usable_base + (idx as u64) * 4096);
+            let page = Page::<Size4KiB>::containing_address(va);
+            if let Ok((frame, flush)) = mapper.unmap(page) {
+                flush.flush();
+                if freed_count < frames_to_free.len() {
+                    frames_to_free[freed_count] = frame.start_address().as_u64();
+                    freed_count += 1;
+                } else {
+                    huesos_pmm::free_frame(frame.start_address().as_u64());
+                }
+            }
+        }
+    }
+    for &phys in &frames_to_free[..freed_count] {
+        huesos_pmm::free_frame(phys);
+    }
 }
 
 /// Failure while mutating a userspace page table.
@@ -562,17 +808,18 @@ impl AddressSpace {
             .allocate_frame()
             .ok_or(UserPageError::OutOfMemory)?;
         let virt = phys_to_virt(pml4_frame.start_address().as_u64());
-        let new_table: &mut PageTable = unsafe { &mut *virt.as_mut_ptr() };
-        new_table.zero();
-
-        // Copy the upper half (kernel space, indices 256..512) from the
-        // currently active table so kernel code/data/heap stay mapped.
-        let (current_frame, _) = Cr3::read();
+        let (current_frame, _) = Cr3::read_raw();
         let current_virt = phys_to_virt(current_frame.start_address().as_u64());
-        let current_table: &PageTable = unsafe { &*current_virt.as_ptr() };
-        for i in 256..512 {
-            new_table[i] = current_table[i].clone();
-        }
+        let new_table: &mut PageTable = unsafe {
+            let dst = &mut *virt.as_mut_ptr::<PageTable>();
+            dst.zero();
+            let src = &*current_virt.as_ptr::<PageTable>();
+            for i in 256..512 {
+                dst[i] = src[i].clone();
+            }
+            dst
+        };
+        let _ = new_table;
 
         Ok(Self {
             pml4_frame,
@@ -755,6 +1002,8 @@ impl AddressSpace {
     /// The address space must contain valid kernel mappings (so interrupts
     /// keep working) and must outlive the switch.
     pub unsafe fn activate(&self) {
+        let cpu_idx = local_cpu_index().unwrap_or(0);
+        note_cpu_active_cr3(cpu_idx, self.pml4_frame.start_address().as_u64());
         unsafe {
             Cr3::write(self.pml4_frame, Cr3Flags::empty());
         }

@@ -512,6 +512,7 @@ pub fn unmap_resource_from_current(
         remap_resource_pages(address_space, args.addr, phys_base, page_flags, page_count)?;
         return Err(ErrorCode::Internal);
     }
+    let target_cr3 = address_space.phys_addr().as_u64();
     drop(runtime_guard);
     drop(_memory_guard);
 
@@ -519,16 +520,7 @@ pub fn unmap_resource_from_current(
     // mapping is what kept the resource alive beyond its last user
     // handle.
     huesos_object::note_kernel_ref_close(resource.koid());
-    // The map path guaranteed the PTEs were absent (no shootdown needed);
-    // unmap does not — other CPUs may still hold the translations this
-    // call just invalidated. `shootdown_range` serializes its global
-    // mailbox internally with interrupts enabled while waiting so peer
-    // CPUs never deadlock with `IF = 0`.
-    huesos_arch::paging::shootdown_range(
-        args.addr,
-        args.addr + args.len,
-        crate::scheduler::online_remote_cpu_count(),
-    );
+    huesos_arch::paging::shootdown_range_for_cr3(target_cr3, args.addr, args.addr + args.len);
     Ok(args.addr)
 }
 
@@ -886,16 +878,21 @@ pub fn unmap_vmar_mapping(vmar: &Vmar, args: VmarOpArgs) -> Result<u64, ErrorCod
         release_extra_mapping_refs(mapping.vmo, extra_refs);
         return Err(ErrorCode::Internal);
     }
+    let target_cr3 = runtime.cr3();
     drop(runtime_guard);
     drop(_memory_guard);
     if replacement_count == 0 {
         huesos_object::note_kernel_ref_close(mapping.vmo);
     }
-    huesos_arch::paging::shootdown_range(
-        args.addr,
-        args.addr + args.len,
-        crate::scheduler::online_remote_cpu_count(),
-    );
+    if let Some(cr3) = target_cr3 {
+        huesos_arch::paging::shootdown_range_for_cr3(cr3, args.addr, args.addr + args.len);
+    } else {
+        huesos_arch::paging::shootdown_range(
+            args.addr,
+            args.addr + args.len,
+            crate::scheduler::online_remote_cpu_count(),
+        );
+    }
     Ok(args.addr)
 }
 
@@ -957,13 +954,18 @@ pub fn protect_vmar_mapping(vmar: &Vmar, args: VmarOpArgs) -> Result<u64, ErrorC
         release_extra_mapping_refs(mapping.vmo, extra_refs);
         return Err(ErrorCode::Internal);
     }
+    let target_cr3 = runtime.cr3();
     drop(runtime_guard);
     drop(_memory_guard);
-    huesos_arch::paging::shootdown_range(
-        args.addr,
-        args.addr + args.len,
-        crate::scheduler::online_remote_cpu_count(),
-    );
+    if let Some(cr3) = target_cr3 {
+        huesos_arch::paging::shootdown_range_for_cr3(cr3, args.addr, args.addr + args.len);
+    } else {
+        huesos_arch::paging::shootdown_range(
+            args.addr,
+            args.addr + args.len,
+            crate::scheduler::online_remote_cpu_count(),
+        );
+    }
     Ok(args.addr)
 }
 
@@ -1126,15 +1128,12 @@ pub fn heap_extend_current(args: huesos_abi::HeapExtendArgs) -> Result<u64, Erro
         // partially committed.
         let _ = address_space.unmap_and_release_user_page(page);
     }
+    let target_cr3 = address_space.phys_addr().as_u64();
     drop(runtime_guard);
     drop(_memory_guard);
-    // Removing mappings *does* require invalidating other CPUs, or a
-    // stale TLB entry would keep a freed frame reachable from ring 3.
-    huesos_arch::paging::shootdown_range(
-        base,
-        base + args.len,
-        crate::scheduler::online_remote_cpu_count(),
-    );
+    // Removing mappings *does* require invalidating other CPUs that actively
+    // hold this CR3, or a stale TLB entry would keep a freed frame reachable.
+    huesos_arch::paging::shootdown_range_for_cr3(target_cr3, base, base + args.len);
     Ok(base)
 }
 

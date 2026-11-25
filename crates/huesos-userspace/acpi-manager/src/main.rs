@@ -251,7 +251,18 @@ pub extern "C" fn _start() -> ! {
             summary.firmware_snapshot_id,
             hmcf_image.as_ref().map(|(buf, len)| &buf[..*len]),
         );
-        libcanvas::process::yield_now();
+        let elapsed = now.saturating_sub(last_heartbeat);
+        let timeout_ticks = 100u64.saturating_sub(elapsed).clamp(1, 100);
+        let item = [libcanvas::WaitItem::new(
+            bootstrap.handle().raw(),
+            libcanvas::Signals::READABLE | libcanvas::Signals::PEER_CLOSED,
+            0,
+        )];
+        if let Err(err) = libcanvas::wait_any(&item, timeout_ticks) {
+            if err != ErrorCode::TimedOut {
+                libcanvas::system::sleep_ms(10);
+            }
+        }
     }
 }
 

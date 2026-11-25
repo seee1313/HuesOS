@@ -223,6 +223,8 @@ pub fn syscall_init() {
         crate::scheduler::sched_summary,
         crate::scheduler::sched_cpu_record,
     );
+    huesos_syscalls::set_clock_ns_fn(crate::scheduler::monotonic_ns);
+    huesos_syscalls::set_sched_set_policy_fn(crate::scheduler::set_current_sched_policy);
     huesos_syscalls::set_task_record_fn(crate::scheduler::task_records_page);
     huesos_syscalls::set_task_count_fn(crate::scheduler::task_count);
     huesos_syscalls::set_current_cpu_fn(crate::scheduler::current_cpu_index);

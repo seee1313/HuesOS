@@ -12,7 +12,7 @@ use huesos_waitset::{Signals, WaitMode, WaitOutcome, WaitSet};
 use crate::{user_memory, util::current_proc, SyscallResult};
 
 /// Maximum number of items in a single WaitSetWait call.
-const MAX_WAIT_ITEMS: usize = 16;
+const MAX_WAIT_ITEMS: usize = 48;
 
 pub(crate) fn sys_waitset_wait(args_ptr: *const WaitSetWaitArgs) -> SyscallResult {
     let args = user_memory::read_value(args_ptr)?;

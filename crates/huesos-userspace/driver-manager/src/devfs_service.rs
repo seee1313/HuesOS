@@ -25,6 +25,17 @@ impl DevFsService {
         }
     }
 
+    /// Append active DevFS client channels to a wait set.
+    pub fn push_wait_items(
+        &self,
+        push: &mut impl FnMut(huesos_abi::HandleValue, libcanvas::Signals),
+    ) {
+        let sig = libcanvas::Signals::READABLE | libcanvas::Signals::PEER_CLOSED;
+        for client in self.clients.iter().flatten() {
+            push(client.handle().raw(), sig);
+        }
+    }
+
     /// Open DevFS through the DriverManager registry.
     pub fn open_for_registry(&mut self, registry: &Channel) {
         let Some(slot) = self.clients.iter_mut().find(|slot| slot.is_none()) else {

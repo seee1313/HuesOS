@@ -1,6 +1,6 @@
 //! Safe wrapper for the [`WaitSetWait`][sw] multiplexed-wait syscall.
 //!
-//! The kernel accepts a small set (currently up to 16) of `(handle, awaited
+//! The kernel accepts a small set (currently up to 48) of `(handle, awaited
 //! signals, user key)` tuples and blocks the caller until either:
 //!
 //! - **Any** item's awaited signals become active (`wait_any`), or
@@ -61,7 +61,7 @@ use crate::{raw, Result};
 /// `MAX_WAIT_ITEMS` in `huesos-syscalls`.
 ///
 /// [sw]: huesos_abi::Syscall::WaitSetWait
-pub const MAX_ITEMS: usize = 16;
+pub const MAX_ITEMS: usize = 48;
 
 /// Signal bits accepted in a [`WaitItem`]. Thin `Copy` newtype over `u32`
 /// so common combinations compose with `|`, matching the kernel-side

@@ -5,8 +5,8 @@ use huesos_abi::ErrorCode;
 use huesos_abi::{SchedCpuRecord, SchedSummary, TaskRecord};
 
 use crate::callbacks::{
-    CLOCK_FN, CPU_COUNT_FN, CPU_MASK_FN, CURRENT_CPU_FN, SCHED_CPU_FN, SCHED_SUMMARY_FN,
-    SHUTDOWN_FN, TASK_RECORD_FN,
+    CLOCK_FN, CLOCK_NS_FN, CPU_COUNT_FN, CPU_MASK_FN, CURRENT_CPU_FN, SCHED_CPU_FN,
+    SCHED_SET_POLICY_FN, SCHED_SUMMARY_FN, SHUTDOWN_FN, TASK_RECORD_FN,
 };
 use crate::user_memory;
 use crate::SyscallResult;
@@ -18,6 +18,29 @@ pub(crate) fn sys_clock_get_monotonic() -> SyscallResult {
         return Err(ErrorCode::Busy);
     }
     Ok(ticks as i64)
+}
+
+pub(crate) fn sys_clock_get_monotonic_ns(out_ns: *mut u64) -> SyscallResult {
+    user_memory::validate_write(out_ns)?;
+    let ns = if let Some(clock_ns) = CLOCK_NS_FN.get() {
+        clock_ns()
+    } else if let Some(clock_ticks) = CLOCK_FN.get() {
+        clock_ticks().saturating_mul(10_000_000)
+    } else {
+        return Err(ErrorCode::NotSupported);
+    };
+    user_memory::write_value(out_ns, &ns)?;
+    Ok(0)
+}
+
+pub(crate) fn sys_sched_set_policy(
+    kind: u64,
+    weight_or_capacity_ns: u64,
+    period_ns: u64,
+) -> SyscallResult {
+    let set_fn = (*SCHED_SET_POLICY_FN.lock()).ok_or(ErrorCode::NotSupported)?;
+    set_fn(kind, weight_or_capacity_ns, period_ns)?;
+    Ok(0)
 }
 
 pub(crate) fn sys_system_cpu_count() -> SyscallResult {

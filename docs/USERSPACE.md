@@ -98,7 +98,7 @@ A driver that listens on both a control Channel and a device Port used to
 `wait_any` / `wait_all` wrappers block once until any (or all) of the given
 handles have their awaited signals active, with an optional
 scheduler-tick timeout. Every handle must carry `rights::READ`; up to
-`libcanvas::waitset::MAX_ITEMS` (16) handles per call.
+`libcanvas::waitset::MAX_ITEMS` (48) handles per call.
 
 ```ignore
 use libcanvas::{wait_any, Signals, WaitItem};

@@ -9,6 +9,51 @@ pub fn monotonic_ticks() -> crate::Result<u64> {
     raw::decode(value).map(|ticks| ticks as u64)
 }
 
+/// Read the calibrated kernel monotonic clock in nanoseconds.
+pub fn monotonic_ns() -> crate::Result<u64> {
+    let mut out = 0u64;
+    let value = raw::syscall1(Syscall::ClockGetMonotonicNs, &mut out as *mut u64 as u64);
+    raw::decode(value).map(|_| out)
+}
+
+/// Set the calling thread's EEVDF Fair scheduling weight (`1..=65535`; default `1024`).
+pub fn set_fair_weight(weight: u64) -> crate::Result<()> {
+    let value = raw::syscall3(Syscall::SchedSetPolicy, 0, weight, 0);
+    raw::decode(value).map(|_| ())
+}
+
+/// Request CBS `Deadline` scheduling (`capacity_ns` per `period_ns`) for the calling thread.
+pub fn set_deadline_policy(capacity_ns: u64, period_ns: u64) -> crate::Result<()> {
+    let value = raw::syscall3(Syscall::SchedSetPolicy, 1, capacity_ns, period_ns);
+    raw::decode(value).map(|_| ())
+}
+
+/// Block the calling thread for `ms` milliseconds using futex tick sleep for
+/// whole `10 ms` ticks and bounded cooperative yields for the sub-tick tail.
+pub fn sleep_ms(ms: u64) {
+    if ms == 0 {
+        return;
+    }
+    let start_ns = monotonic_ns()
+        .unwrap_or_else(|_| monotonic_ticks().unwrap_or(0).saturating_mul(10_000_000));
+    let deadline_ns = start_ns.saturating_add(ms.saturating_mul(1_000_000));
+    let park_word = core::sync::atomic::AtomicU32::new(0);
+
+    let full_ticks = ms / 10;
+    if full_ticks > 0 {
+        let _ = crate::futex::wait(&park_word, 0, full_ticks);
+    }
+
+    for _budget in 0..4_096u32 {
+        let now_ns = monotonic_ns()
+            .unwrap_or_else(|_| monotonic_ticks().unwrap_or(0).saturating_mul(10_000_000));
+        if now_ns >= deadline_ns {
+            break;
+        }
+        crate::process::yield_now();
+    }
+}
+
 /// Number of online CPUs using HuesOS dense CPU indexes.
 pub fn cpu_count() -> crate::Result<usize> {
     let value = raw::syscall0(Syscall::SystemCpuCount);

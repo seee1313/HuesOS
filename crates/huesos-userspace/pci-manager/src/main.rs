@@ -115,11 +115,13 @@ pub extern "C" fn _start() -> ! {
         storage_off: (hello.detail & pci_manager::HELLO_FLAG_STORAGE_OFF) != 0,
         ..ConfigAuthority::default()
     };
-    let mut yields = 0u32;
+    let mut last_heartbeat = libcanvas::system::monotonic_ticks().unwrap_or(0);
     loop {
+        let mut did_work = false;
         let mut bytes = [0u8; 64];
         match bootstrap.read_optional_handle(&mut bytes) {
             Ok((length, handle)) => {
+                did_work = true;
                 if !handle_authority_message(
                     &bootstrap,
                     &bytes[..length],
@@ -137,8 +139,8 @@ pub extern "C" fn _start() -> ! {
             serve_mediation(&mut authority, hello.manager_generation);
         }
 
-        yields = yields.wrapping_add(1);
-        if yields.is_multiple_of(65_536) {
+        let now = libcanvas::system::monotonic_ticks().unwrap_or(last_heartbeat.wrapping_add(1));
+        if now.saturating_sub(last_heartbeat) >= 100 {
             let _ = send(
                 &bootstrap,
                 Message {
@@ -148,8 +150,25 @@ pub extern "C" fn _start() -> ! {
                     detail: 0,
                 },
             );
+            last_heartbeat = now;
         }
-        libcanvas::process::yield_now();
+        if did_work {
+            continue;
+        }
+        let awaited = libcanvas::Signals::READABLE | libcanvas::Signals::PEER_CLOSED;
+        let mut items = [libcanvas::WaitItem::new(bootstrap.handle().raw(), awaited, 0); 2];
+        let mut count = 1usize;
+        if let Some(mediation) = authority.mediation.as_ref() {
+            items[count] = libcanvas::WaitItem::new(mediation.handle().raw(), awaited, 1);
+            count += 1;
+        }
+        let elapsed = now.saturating_sub(last_heartbeat);
+        let timeout_ticks = 100u64.saturating_sub(elapsed).clamp(1, 100);
+        if let Err(err) = libcanvas::wait_any(&items[..count], timeout_ticks) {
+            if err != ErrorCode::TimedOut {
+                libcanvas::system::sleep_ms(10);
+            }
+        }
     }
 }
 
@@ -678,8 +697,8 @@ fn handle_acpi_frozen(
                 ),
             );
         }
+        authority.inventory.freeze();
     }
-    authority.inventory.freeze();
 }
 
 fn log_diagnostic_inventory(inv: &DiagnosticInventory) {
