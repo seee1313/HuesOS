@@ -19,11 +19,15 @@ use subtle::ConstantTimeEq;
 
 use huesos_ieee80211::{Dot11Header, FC_FLAG_PROTECTED, FC_TYPE_DATA, RSN_IE_WPA2_CCMP};
 
+pub const EAPOL_VERSION_1: u8 = 1;
 pub const EAPOL_VERSION_2: u8 = 2;
 pub const EAPOL_TYPE_KEY: u8 = 3;
 pub const EAPOL_KEY_DESC_RSN: u8 = 2;
+pub const EAPOL_KEY_DESC_WPA: u8 = 254;
 
+pub const KEY_INFO_TYPE_MASK: u16 = 0x0007;
 pub const KEY_INFO_TYPE_HMAC_SHA1_AES: u16 = 0x0002;
+pub const KEY_INFO_TYPE_AES_128_CMAC: u16 = 0x0003;
 pub const KEY_INFO_PAIRWISE: u16 = 0x0008;
 pub const KEY_INFO_INSTALL: u16 = 0x0040;
 pub const KEY_INFO_ACK: u16 = 0x0080;
@@ -370,7 +374,65 @@ pub fn aes_key_unwrap(kek: &[u8; 16], wrapped: &[u8]) -> Result<Vec<u8>, WpaErro
 
 const EAPOL_KEY_FIXED_LEN: usize = 4 + 95; // 4-byte EAPOL hdr + 95-byte Key body
 
-fn compute_eapol_mic(kck: &[u8; 16], frame_with_zeroed_mic: &[u8]) -> [u8; 16] {
+fn dbl_gf128(block: &[u8; 16]) -> [u8; 16] {
+    let mut out = [0u8; 16];
+    let mut carry = 0u8;
+    for i in (0..16).rev() {
+        let next = block[i] >> 7;
+        out[i] = (block[i] << 1) | carry;
+        carry = next;
+    }
+    if (block[0] & 0x80) != 0 {
+        out[15] ^= 0x87;
+    }
+    out
+}
+
+/// RFC 4493 AES-128-CMAC (used when an 802.11w/802.11r AP selects EAPOL-Key descriptor version 3).
+fn aes128_cmac(key: &[u8; 16], msg: &[u8]) -> [u8; 16] {
+    let cipher = Aes128::new(key.into());
+    let mut l = [0u8; 16];
+    cipher.encrypt_block((&mut l).into());
+    let k1 = dbl_gf128(&l);
+    let k2 = dbl_gf128(&k1);
+
+    let n = msg.len().div_ceil(16).max(1);
+    let complete = !msg.is_empty() && msg.len().is_multiple_of(16);
+
+    let mut x = [0u8; 16];
+    for blk_idx in 0..(n - 1) {
+        let off = blk_idx * 16;
+        for (xb, &mb) in x.iter_mut().zip(&msg[off..off + 16]) {
+            *xb ^= mb;
+        }
+        cipher.encrypt_block((&mut x).into());
+    }
+
+    let mut m_last = [0u8; 16];
+    let last_off = (n - 1) * 16;
+    let rem = msg.len().saturating_sub(last_off);
+    m_last[..rem].copy_from_slice(&msg[last_off..]);
+    if complete {
+        for (mb, &kb) in m_last.iter_mut().zip(&k1) {
+            *mb ^= kb;
+        }
+    } else {
+        m_last[rem] = 0x80;
+        for (mb, &kb) in m_last.iter_mut().zip(&k2) {
+            *mb ^= kb;
+        }
+    }
+    for (xb, &mb) in x.iter_mut().zip(&m_last) {
+        *xb ^= mb;
+    }
+    cipher.encrypt_block((&mut x).into());
+    x
+}
+
+fn compute_eapol_mic(kck: &[u8; 16], desc_ver: u16, frame_with_zeroed_mic: &[u8]) -> [u8; 16] {
+    if desc_ver == KEY_INFO_TYPE_AES_128_CMAC {
+        return aes128_cmac(kck, frame_with_zeroed_mic);
+    }
     let full = hmac_sha1_parts(kck, &[frame_with_zeroed_mic]);
     let mut mic = [0u8; 16];
     mic.copy_from_slice(&full[..16]);
@@ -381,11 +443,12 @@ fn verify_eapol_mic(kck: &[u8; 16], raw: &[u8]) -> Result<(), WpaError> {
     if raw.len() < EAPOL_KEY_FIXED_LEN {
         return Err(WpaError::Truncated);
     }
+    let desc_ver = u16::from_be_bytes([raw[5], raw[6]]) & KEY_INFO_TYPE_MASK;
     let mut copy = raw.to_vec();
     let mut expected = [0u8; 16];
     expected.copy_from_slice(&raw[81..97]);
     copy[81..97].fill(0);
-    let calc = compute_eapol_mic(kck, &copy);
+    let calc = compute_eapol_mic(kck, desc_ver, &copy);
     if calc.ct_eq(&expected).unwrap_u8() == 1 {
         Ok(())
     } else {
@@ -395,7 +458,9 @@ fn verify_eapol_mic(kck: &[u8; 16], raw: &[u8]) -> Result<(), WpaError> {
 
 #[allow(clippy::too_many_arguments)]
 fn build_eapol_key_frame(
+    eapol_version: u8,
     key_info: u16,
+    key_len: u16,
     replay_counter: u64,
     nonce: &[u8; 32],
     key_data: &[u8],
@@ -404,12 +469,12 @@ fn build_eapol_key_frame(
     let body_len = 95 + key_data.len();
     let total_len = 4 + body_len;
     let mut out = alloc::vec![0u8; total_len];
-    out[0] = EAPOL_VERSION_2;
+    out[0] = eapol_version;
     out[1] = EAPOL_TYPE_KEY;
     out[2..4].copy_from_slice(&(body_len as u16).to_be_bytes());
     out[4] = EAPOL_KEY_DESC_RSN;
     out[5..7].copy_from_slice(&key_info.to_be_bytes());
-    out[7..9].copy_from_slice(&16u16.to_be_bytes()); // CCMP key length = 16
+    out[7..9].copy_from_slice(&key_len.to_be_bytes());
     out[9..17].copy_from_slice(&replay_counter.to_be_bytes());
     out[17..49].copy_from_slice(nonce);
     // Key IV [49..65], Key RSC [65..73], Reserved [73..81], MIC [81..97] = 0
@@ -417,7 +482,7 @@ fn build_eapol_key_frame(
     out[99..total_len].copy_from_slice(key_data);
 
     if let Some(kck) = kck_for_mic {
-        let mic = compute_eapol_mic(kck, &out);
+        let mic = compute_eapol_mic(kck, key_info & KEY_INFO_TYPE_MASK, &out);
         out[81..97].copy_from_slice(&mic);
     }
     out
@@ -437,6 +502,7 @@ pub struct Supplicant4Way {
     bssid: [u8; 6],
     sta_mac: [u8; 6],
     snonce: [u8; 32],
+    rsn_ie: [u8; 22],
     anonce: [u8; 32],
     last_replay: Option<u64>,
     ptk: Option<Ptk>,
@@ -445,11 +511,22 @@ pub struct Supplicant4Way {
 
 impl Supplicant4Way {
     pub fn new(pmk: [u8; 32], bssid: [u8; 6], sta_mac: [u8; 6], snonce: [u8; 32]) -> Self {
+        Self::new_with_rsn_ie(pmk, bssid, sta_mac, snonce, RSN_IE_WPA2_CCMP)
+    }
+
+    pub fn new_with_rsn_ie(
+        pmk: [u8; 32],
+        bssid: [u8; 6],
+        sta_mac: [u8; 6],
+        snonce: [u8; 32],
+        rsn_ie: [u8; 22],
+    ) -> Self {
         Self {
             pmk,
             bssid,
             sta_mac,
             snonce,
+            rsn_ie,
             anonce: [0u8; 32],
             last_replay: None,
             ptk: None,
@@ -467,7 +544,9 @@ impl Supplicant4Way {
         if raw.len() < EAPOL_KEY_FIXED_LEN {
             return Err(WpaError::Truncated);
         }
-        if raw[1] != EAPOL_TYPE_KEY || raw[4] != EAPOL_KEY_DESC_RSN {
+        if raw[1] != EAPOL_TYPE_KEY
+            || (raw[4] != EAPOL_KEY_DESC_RSN && raw[4] != EAPOL_KEY_DESC_WPA)
+        {
             return Err(WpaError::Malformed);
         }
         let body_len = usize::from(u16::from_be_bytes([raw[2], raw[3]]));
@@ -476,6 +555,14 @@ impl Supplicant4Way {
         }
         let frame = &raw[..4 + body_len];
         let key_info = u16::from_be_bytes([frame[5], frame[6]]);
+        let desc_ver = {
+            let v = key_info & KEY_INFO_TYPE_MASK;
+            if v == KEY_INFO_TYPE_AES_128_CMAC {
+                KEY_INFO_TYPE_AES_128_CMAC
+            } else {
+                KEY_INFO_TYPE_HMAC_SHA1_AES
+            }
+        };
         let replay = u64::from_be_bytes([
             frame[9], frame[10], frame[11], frame[12], frame[13], frame[14], frame[15], frame[16],
         ]);
@@ -499,6 +586,7 @@ impl Supplicant4Way {
 
         if !has_mic {
             // Message 1/4: extract ANonce, derive PTK, return signed Message 2/4.
+            // Per IEEE 802.11-2020 Table 12-9 (and wpa_supplicant), Key Length in M2/M4 is 0.
             self.anonce.copy_from_slice(&frame[17..49]);
             let ptk = derive_ptk(
                 &self.pmk,
@@ -509,12 +597,14 @@ impl Supplicant4Way {
             );
             self.ptk = Some(ptk);
             self.last_replay = Some(replay);
-            let m2_info = KEY_INFO_TYPE_HMAC_SHA1_AES | KEY_INFO_PAIRWISE | KEY_INFO_MIC;
+            let m2_info = desc_ver | KEY_INFO_PAIRWISE | KEY_INFO_MIC;
             Ok(build_eapol_key_frame(
+                EAPOL_VERSION_1,
                 m2_info,
+                0,
                 replay,
                 &self.snonce,
-                &RSN_IE_WPA2_CCMP,
+                &self.rsn_ie,
                 Some(&ptk.kck),
             ))
         } else {
@@ -535,10 +625,11 @@ impl Supplicant4Way {
             }
             self.last_replay = Some(replay);
             self.installed = Some(InstalledWpa2Keys { ptk, gtk, gtk_idx });
-            let m4_info =
-                KEY_INFO_TYPE_HMAC_SHA1_AES | KEY_INFO_PAIRWISE | KEY_INFO_MIC | KEY_INFO_SECURE;
+            let m4_info = desc_ver | KEY_INFO_PAIRWISE | KEY_INFO_MIC | KEY_INFO_SECURE;
             Ok(build_eapol_key_frame(
+                EAPOL_VERSION_1,
                 m4_info,
+                0,
                 replay,
                 &[0u8; 32],
                 &[],
@@ -606,7 +697,15 @@ impl Authenticator4Way {
 
     pub fn build_msg1(&mut self) -> Vec<u8> {
         let m1_info = KEY_INFO_TYPE_HMAC_SHA1_AES | KEY_INFO_PAIRWISE | KEY_INFO_ACK;
-        build_eapol_key_frame(m1_info, self.replay_counter, &self.anonce, &[], None)
+        build_eapol_key_frame(
+            EAPOL_VERSION_2,
+            m1_info,
+            16,
+            self.replay_counter,
+            &self.anonce,
+            &[],
+            None,
+        )
     }
 
     pub fn on_supplicant_eapol(&mut self, raw: &[u8]) -> Result<Option<Vec<u8>>, WpaError> {
@@ -649,7 +748,9 @@ impl Authenticator4Way {
                 | KEY_INFO_SECURE
                 | KEY_INFO_ENCRYPTED_DATA;
             Ok(Some(build_eapol_key_frame(
+                EAPOL_VERSION_2,
                 m3_info,
+                16,
                 self.replay_counter,
                 &self.anonce,
                 &wrapped,
@@ -677,13 +778,13 @@ impl Authenticator4Way {
 // IEEE 802.11 CCMP-128 (AES-128-CCM)
 // ============================================================================
 
-/// Stateful CCMP-128 cipher context with monotonic TX PN and RX anti-replay window.
+/// Stateful CCMP-128 cipher context with monotonic TX PN and per-TID RX anti-replay window.
 #[derive(Clone, Debug)]
 pub struct CcmpContext {
     tk: [u8; 16],
     key_id: u8,
     tx_pn: u64,
-    rx_max_pn: Option<u64>,
+    rx_max_pn: [Option<u64>; 17],
 }
 
 impl CcmpContext {
@@ -692,7 +793,7 @@ impl CcmpContext {
             tk,
             key_id: key_id & 0x03,
             tx_pn: 0,
-            rx_max_pn: None,
+            rx_max_pn: [None; 17],
         }
     }
 
@@ -748,7 +849,8 @@ impl CcmpContext {
         }
         let pn = [ch[0], ch[1], ch[4], ch[5], ch[6], ch[7]];
         let pn_u64 = pn_from_6bytes(&pn);
-        if let Some(prev) = self.rx_max_pn {
+        let tid_slot = hdr.qos_tid.map_or(16usize, |t| usize::from(t & 0x0F));
+        if let Some(prev) = self.rx_max_pn[tid_slot] {
             if pn_u64 <= prev {
                 return Err(WpaError::ReplayDetected);
             }
@@ -764,9 +866,172 @@ impl CcmpContext {
         if calc_mic.ct_eq(rx_mic).unwrap_u8() != 1 {
             return Err(WpaError::BadMic);
         }
-        self.rx_max_pn = Some(pn_u64);
+        self.rx_max_pn[tid_slot] = Some(pn_u64);
         Ok(pt)
     }
+}
+
+const TKIP_SBOX: [u16; 256] = [
+    0xC6A5, 0xF884, 0xEE99, 0xF68D, 0xFF0D, 0xD6BD, 0xDEB1, 0x9154, 0x6050, 0x0203, 0xCEA9, 0x567D,
+    0xE719, 0xB562, 0x4DE6, 0xEC9A, 0x8F45, 0x1F9D, 0x8940, 0xFA87, 0xEF15, 0xB2EB, 0x8EC9, 0xFB0B,
+    0x41EC, 0xB367, 0x5FFD, 0x45EA, 0x23BF, 0x53F7, 0xE496, 0x9B5B, 0x75C2, 0xE11C, 0x3DAE, 0x4C6A,
+    0x6C5A, 0x7E41, 0xF502, 0x834F, 0x685C, 0x51F4, 0xD134, 0xF908, 0xE293, 0xAB73, 0x6253, 0x2A3F,
+    0x080C, 0x9552, 0x4665, 0x9D5E, 0x3028, 0x37A1, 0x0A0F, 0x2FB5, 0x0E09, 0x2436, 0x1B9B, 0xDF3D,
+    0xCD26, 0x4E69, 0x7FCD, 0xEA9F, 0x121B, 0x1D9E, 0x5874, 0x342E, 0x362D, 0xDCB2, 0xB4EE, 0x5BFB,
+    0xA4F6, 0x764D, 0xB761, 0x7DCE, 0x527B, 0xDD3E, 0x5E71, 0x1397, 0xA6F5, 0xB968, 0x0000, 0xC12C,
+    0x4060, 0xE31F, 0x79C8, 0xB6ED, 0xD4BE, 0x8D46, 0x67D9, 0x724B, 0x94DE, 0x98D4, 0xB0E8, 0x854A,
+    0xBB6B, 0xC52A, 0x4FE5, 0xED16, 0x86C5, 0x9AD7, 0x6655, 0x1194, 0x8ACF, 0xE910, 0x0406, 0xFE81,
+    0xA0F0, 0x7844, 0x25BA, 0x4BE3, 0xA2F3, 0x5DFE, 0x80C0, 0x058A, 0x3FAD, 0x21BC, 0x7048, 0xF104,
+    0x63DF, 0x77C1, 0xAF75, 0x4263, 0x2030, 0xE51A, 0xFD0E, 0xBF6D, 0x814C, 0x1814, 0x2635, 0xC32F,
+    0xBEE1, 0x35A2, 0x88CC, 0x2E39, 0x9357, 0x55F2, 0xFC82, 0x7A47, 0xC8AC, 0xBAE7, 0x322B, 0xE695,
+    0xC0A0, 0x1998, 0x9ED1, 0xA37F, 0x4466, 0x547E, 0x3BAB, 0x0B83, 0x8CCA, 0xC729, 0x6BD3, 0x283C,
+    0xA779, 0xBCE2, 0x161D, 0xAD76, 0xDB3B, 0x6456, 0x744E, 0x141E, 0x92DB, 0x0C0A, 0x486C, 0xB8E4,
+    0x9F5D, 0xBD6E, 0x43EF, 0xC4A6, 0x39A8, 0x31A4, 0xD337, 0xF28B, 0xD532, 0x8B43, 0x6E59, 0xDAB7,
+    0x018C, 0xB164, 0x9CD2, 0x49E0, 0xD8B4, 0xACFA, 0xF307, 0xCF25, 0xCAAF, 0xF48E, 0x47E9, 0x1018,
+    0x6FD5, 0xF088, 0x4A6F, 0x5C72, 0x3824, 0x57F1, 0x73C7, 0x9751, 0xCB23, 0xA17C, 0xE89C, 0x3E21,
+    0x96DD, 0x61DC, 0x0D86, 0x0F85, 0xE090, 0x7C42, 0x71C4, 0xCCAA, 0x90D8, 0x0605, 0xF701, 0x1C12,
+    0xC2A3, 0x6A5F, 0xAEF9, 0x69D0, 0x1791, 0x9958, 0x3A27, 0x27B9, 0xD938, 0xEB13, 0x2BB3, 0x2233,
+    0xD2BB, 0xA970, 0x0789, 0x33A7, 0x2DB6, 0x3C22, 0x1592, 0xC920, 0x8749, 0xAAFF, 0x5078, 0xA57A,
+    0x038F, 0x59F8, 0x0980, 0x1A17, 0x65DA, 0xD731, 0x84C6, 0xD0B8, 0x82C3, 0x29B0, 0x5A77, 0x1E11,
+    0x7BCB, 0xA8FC, 0x6DD6, 0x2C3A,
+];
+
+fn tkip_s(v: u16) -> u16 {
+    TKIP_SBOX[usize::from(v & 0xFF)] ^ TKIP_SBOX[usize::from((v >> 8) & 0xFF)].swap_bytes()
+}
+
+fn crc32_ieee(data: &[u8]) -> u32 {
+    let mut crc = 0xFFFF_FFFFu32;
+    for &b in data {
+        crc ^= u32::from(b);
+        for _ in 0..8 {
+            let mask = (crc & 1).wrapping_neg();
+            crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
+        }
+    }
+    !crc
+}
+
+/// Decrypt an inbound WPA/WPA2 mixed-mode broadcast/multicast TKIP group MPDU
+/// (IEEE 802.11-2020 Section 12.5.2 Phase 1 + Phase 2 key mixing + RC4 + CRC-32 ICV),
+/// returning the inner LLC/SNAP payload stripped of TKIP IV, Michael MIC, and ICV.
+pub fn decrypt_tkip_group_mpdu(
+    gtk_enc_16: &[u8; 16],
+    raw_mpdu: &[u8],
+) -> Result<Vec<u8>, WpaError> {
+    let hdr = Dot11Header::parse(raw_mpdu).map_err(|_| WpaError::Malformed)?;
+    if hdr.frame_type != FC_TYPE_DATA || (hdr.flags & FC_FLAG_PROTECTED) == 0 {
+        return Err(WpaError::Malformed);
+    }
+    // 8-byte Extended IV + payload + 8-byte Michael MIC + 4-byte WEP ICV = 20 bytes overhead
+    if hdr.body.len() < 20 {
+        return Err(WpaError::Truncated);
+    }
+    let iv = &hdr.body[..8];
+    if (iv[3] & 0x20) == 0 {
+        return Err(WpaError::Malformed);
+    }
+    let tsc1 = iv[0];
+    let tsc0 = iv[2];
+    let tsc2 = iv[4];
+    let tsc3 = iv[5];
+    let tsc4 = iv[6];
+    let tsc5 = iv[7];
+    let iv16 = u16::from(tsc0) | (u16::from(tsc1) << 8);
+    let iv32 = u32::from_le_bytes([tsc2, tsc3, tsc4, tsc5]);
+
+    let mut tk = [0u16; 8];
+    for (i, slot) in tk.iter_mut().enumerate() {
+        *slot = u16::from_le_bytes([gtk_enc_16[i * 2], gtk_enc_16[i * 2 + 1]]);
+    }
+    let ta = hdr.addr2;
+
+    // Phase 1 key mixing (`tkip_mixing_phase1`)
+    let mut ttak = [
+        (iv32 & 0xFFFF) as u16,
+        (iv32 >> 16) as u16,
+        u16::from_le_bytes([ta[0], ta[1]]),
+        u16::from_le_bytes([ta[2], ta[3]]),
+        u16::from_le_bytes([ta[4], ta[5]]),
+    ];
+    for step in 0..8usize {
+        let j = step & 1;
+        ttak[0] = ttak[0].wrapping_add(tkip_s(ttak[4] ^ tk[j]));
+        ttak[1] = ttak[1].wrapping_add(tkip_s(ttak[0] ^ tk[2 + j]));
+        ttak[2] = ttak[2].wrapping_add(tkip_s(ttak[1] ^ tk[4 + j]));
+        ttak[3] = ttak[3].wrapping_add(tkip_s(ttak[2] ^ tk[6 + j]));
+        ttak[4] = ttak[4]
+            .wrapping_add(tkip_s(ttak[3] ^ tk[j]))
+            .wrapping_add(step as u16);
+    }
+
+    // Phase 2 key mixing
+    let mut ppk = [
+        ttak[0],
+        ttak[1],
+        ttak[2],
+        ttak[3],
+        ttak[4],
+        ttak[4].wrapping_add(iv16),
+    ];
+    ppk[0] = ppk[0].wrapping_add(tkip_s(ppk[5] ^ tk[0]));
+    ppk[1] = ppk[1].wrapping_add(tkip_s(ppk[0] ^ tk[1]));
+    ppk[2] = ppk[2].wrapping_add(tkip_s(ppk[1] ^ tk[2]));
+    ppk[3] = ppk[3].wrapping_add(tkip_s(ppk[2] ^ tk[3]));
+    ppk[4] = ppk[4].wrapping_add(tkip_s(ppk[3] ^ tk[4]));
+    ppk[5] = ppk[5].wrapping_add(tkip_s(ppk[4] ^ tk[5]));
+    ppk[0] = ppk[0].wrapping_add((ppk[5] ^ tk[6]).rotate_right(1));
+    ppk[1] = ppk[1].wrapping_add((ppk[0] ^ tk[7]).rotate_right(1));
+    ppk[2] = ppk[2].wrapping_add(ppk[1].rotate_right(1));
+    ppk[3] = ppk[3].wrapping_add(ppk[2].rotate_right(1));
+    ppk[4] = ppk[4].wrapping_add(ppk[3].rotate_right(1));
+    ppk[5] = ppk[5].wrapping_add(ppk[4].rotate_right(1));
+
+    let mut rc4_seed = [0u8; 16];
+    rc4_seed[0] = tsc1;
+    rc4_seed[1] = (tsc1 | 0x20) & 0x7F;
+    rc4_seed[2] = tsc0;
+    rc4_seed[3] = ((ppk[5] ^ tk[0]) >> 1) as u8;
+    for (i, &w) in ppk.iter().enumerate() {
+        let le = w.to_le_bytes();
+        rc4_seed[4 + i * 2] = le[0];
+        rc4_seed[5 + i * 2] = le[1];
+    }
+
+    // RC4 KSA + PRGA over ciphertext || Michael MIC || CRC-32 ICV
+    let mut s = [0u8; 256];
+    for (idx, slot) in s.iter_mut().enumerate() {
+        *slot = idx as u8;
+    }
+    let mut j = 0u8;
+    for i in 0..256usize {
+        j = j.wrapping_add(s[i]).wrapping_add(rc4_seed[i & 15]);
+        s.swap(i, usize::from(j));
+    }
+    let enc_slice = &hdr.body[8..];
+    let mut dec = Vec::with_capacity(enc_slice.len());
+    let mut ri = 0u8;
+    let mut rj = 0u8;
+    for &b in enc_slice {
+        ri = ri.wrapping_add(1);
+        rj = rj.wrapping_add(s[usize::from(ri)]);
+        s.swap(usize::from(ri), usize::from(rj));
+        let k = s[usize::from(s[usize::from(ri)].wrapping_add(s[usize::from(rj)]))];
+        dec.push(b ^ k);
+    }
+
+    let payload_plus_mic_len = dec.len() - 4;
+    let rx_icv = u32::from_le_bytes([
+        dec[payload_plus_mic_len],
+        dec[payload_plus_mic_len + 1],
+        dec[payload_plus_mic_len + 2],
+        dec[payload_plus_mic_len + 3],
+    ]);
+    if crc32_ieee(&dec[..payload_plus_mic_len]) != rx_icv {
+        return Err(WpaError::BadMic);
+    }
+    dec.truncate(payload_plus_mic_len - 8);
+    Ok(dec)
 }
 
 fn pn_to_6bytes(pn: u64) -> [u8; 6] {
@@ -968,5 +1233,28 @@ mod tests {
             mpdu2[35] ^= 0x01;
             assert_eq!(rx_ccmp.decrypt_mpdu(&mpdu2), Err(WpaError::BadMic));
         }
+    }
+
+    #[test]
+    fn rfc4493_aes128_cmac_test_vectors() {
+        let key: [u8; 16] = [
+            0x2b, 0x7e, 0x15, 0x16, 0x28, 0xae, 0xd2, 0xa6, 0xab, 0xf7, 0x15, 0x88, 0x09, 0xcf,
+            0x4f, 0x3c,
+        ];
+        let exp0: [u8; 16] = [
+            0xbb, 0x1d, 0x69, 0x29, 0xe9, 0x59, 0x37, 0x28, 0x7f, 0xa3, 0x7d, 0x12, 0x9b, 0x75,
+            0x67, 0x46,
+        ];
+        assert_eq!(aes128_cmac(&key, &[]), exp0);
+
+        let m16: [u8; 16] = [
+            0x6b, 0xc1, 0xbe, 0xe2, 0x2e, 0x40, 0x9f, 0x96, 0xe9, 0x3d, 0x7e, 0x11, 0x73, 0x93,
+            0x17, 0x2a,
+        ];
+        let exp16: [u8; 16] = [
+            0x07, 0x0a, 0x16, 0xb4, 0x6b, 0x4d, 0x41, 0x44, 0xf7, 0x9b, 0xdd, 0x9d, 0xd0, 0x4a,
+            0x28, 0x7c,
+        ];
+        assert_eq!(aes128_cmac(&key, &m16), exp16);
     }
 }

@@ -151,6 +151,7 @@ pub const RTW_SEC_CONFIG: u32 = 0x0680;
 pub const REG_RXFLTMAP0: u32 = 0x06A0;
 pub const REG_RXFLTMAP1: u32 = 0x06A2;
 pub const REG_RXFLTMAP2: u32 = 0x06A4;
+pub const REG_BCN_PSR_RPT: u32 = 0x06A8;
 pub const REG_BT_COEX_TABLE0: u32 = 0x06C0;
 pub const REG_BT_COEX_TABLE1: u32 = 0x06C4;
 pub const REG_BT_COEX_BRK_TABLE: u32 = 0x06C8;
@@ -1939,16 +1940,13 @@ impl Rtl8821ceHw {
     }
 
     fn enable_sec_engine<M: Rtw88Mmio>(&self, mmio: &mut M) {
+        // Keep `RTW_SEC_ENGINE_EN` active in `REG_CR`, while leaving hardware
+        // `RTW_SEC_TX_DEC_EN` / `RTW_SEC_RX_DEC_EN` off (`RTW_SEC_CONFIG = 0`) so
+        // pure-Rust WPA2-CCMP / TKIP (`huesos-wpa`) never suffers hardware+software
+        // double-decryption on received protected MPDUs.
         let cr = mmio.read16(REG_CR) | (1u16 << 9); // RTW_SEC_ENGINE_EN
         mmio.write16(REG_CR, cr);
-        let sec = mmio.read16(RTW_SEC_CONFIG)
-            | (1 << 0) // TX_UNI_USE_DK
-            | (1 << 1) // RX_UNI_USE_DK
-            | (1 << 2) // TX_DEC_EN
-            | (1 << 3) // RX_DEC_EN
-            | (1 << 6) // TX_BC_USE_DK
-            | (1 << 7); // RX_BC_USE_DK
-        mmio.write16(RTW_SEC_CONFIG, sec);
+        mmio.write16(RTW_SEC_CONFIG, 0);
     }
 
     // -----------------------------------------------------------------------
@@ -1960,15 +1958,66 @@ impl Rtl8821ceHw {
         self.current_channel = ch;
         self.current_bw_mhz = bw_mhz;
 
+        // Compute RF center channel and 20 MHz primary subchannel index (`cch`, `pri_ch_idx`)
+        // per `rtw_set_channel` (`phy.c` / `rtw8821c.c`) so 40/80 MHz channels never tune
+        // `RF 0x18` off-frequency from the AP's primary 20 MHz control channel.
+        let (cch, pri_ch_idx): (u8, u8) = match bw_mhz {
+            80 if ch >= 36 => {
+                let base = match ch {
+                    36..=48 => 36,
+                    52..=64 => 52,
+                    100..=112 => 100,
+                    116..=128 => 116,
+                    132..=144 => 132,
+                    149..=161 => 149,
+                    _ => ch,
+                };
+                if base == ch && ch > 161 {
+                    (ch, 0)
+                } else {
+                    let center = base + 6;
+                    let idx = match ch.saturating_sub(base) {
+                        0 => 2,  // PRIMARY_CH_IDX_2 (lower-lower 20 MHz)
+                        4 => 1,  // PRIMARY_CH_IDX_1 (lower-upper 20 MHz)
+                        8 => 4,  // PRIMARY_CH_IDX_4 (upper-lower 20 MHz)
+                        12 => 3, // PRIMARY_CH_IDX_3 (upper-upper 20 MHz)
+                        _ => 2,
+                    };
+                    (center, idx)
+                }
+            }
+            40 if ch >= 36 => {
+                // 5 GHz 40 MHz pairs: (36,40), (44,48), (52,56), (60,64), (100,104)...(149,153),(157,161)
+                let is_lower = if ch >= 149 {
+                    ((ch - 149) % 8) == 0
+                } else {
+                    ((ch - 36) % 8) == 0
+                };
+                if is_lower {
+                    (ch + 2, 2)
+                } else {
+                    (ch.saturating_sub(2), 1)
+                }
+            }
+            40 if ch <= 13 => {
+                if ch <= 9 {
+                    (ch + 2, 2)
+                } else {
+                    (ch - 2, 1)
+                }
+            }
+            _ => (ch, 0),
+        };
+
         // 1. BB channel config
-        if ch <= 14 {
+        if cch <= 14 {
             self.write32_mask(mmio, REG_RXPSEL, 1 << 28, 1);
             self.write32_mask(mmio, REG_CCK_CHECK, 1 << 7, 0);
             self.write32_mask(mmio, REG_ENTXCCK, 1 << 18, 0);
             self.write32_mask(mmio, REG_RXCCAMSK, 0x0000_FC00, 15);
             self.write32_mask(mmio, REG_TXSCALE_A, 0x0F00, 0x0);
             self.write32_mask(mmio, REG_CLKTRK, 0x1FFE_0000, 0x96A);
-            if ch == 14 {
+            if cch == 14 {
                 mmio.write32(REG_TXSF2, 0x0000_B81C);
                 self.write32_mask(mmio, REG_TXSF6, 0x0000_FFFF, 0x0000);
                 mmio.write32(REG_TXFILTER, 0x0000_3667);
@@ -1982,19 +2031,19 @@ impl Rtl8821ceHw {
             self.write32_mask(mmio, REG_CCK_CHECK, 1 << 7, 1);
             self.write32_mask(mmio, REG_RXPSEL, 1 << 28, 0);
             self.write32_mask(mmio, REG_RXCCAMSK, 0x0000_FC00, 15);
-            let scale = if ch <= 64 {
+            let scale = if cch <= 64 {
                 1
-            } else if ch <= 144 {
+            } else if cch <= 144 {
                 2
             } else {
                 3
             };
             self.write32_mask(mmio, REG_TXSCALE_A, 0x0F00, scale);
-            let clktrk = if ch <= 48 {
+            let clktrk = if cch <= 48 {
                 0x494
-            } else if ch <= 64 {
+            } else if cch <= 64 {
                 0x453
-            } else if ch <= 116 {
+            } else if cch <= 116 {
                 0x452
             } else {
                 0x412
@@ -2002,15 +2051,17 @@ impl Rtl8821ceHw {
             self.write32_mask(mmio, REG_CLKTRK, 0x1FFE_0000, clktrk);
         }
 
-        // BW ADC clock
+        // BW ADC clock + primary 20 MHz subchannel (`rtw8821c_set_channel_bb`)
         let mut adc = mmio.read32(REG_ADCCLK);
         match bw_mhz {
-            40 => {
-                adc = (adc & 0xFF3F_F300) | 0x2002_0001;
+            40 if pri_ch_idx != 0 => {
+                let sc = u32::from(pri_ch_idx & 0x0F);
+                adc = (adc & 0xFF3F_F300) | 0x2002_0001 | ((sc << 2) << 4);
                 mmio.write32(REG_ADCCLK, adc);
             }
-            80 => {
-                adc = (adc & 0xFCFF_CF00) | 0x4004_0002;
+            80 if pri_ch_idx != 0 => {
+                let sc = u32::from(pri_ch_idx & 0x0F);
+                adc = (adc & 0xFCFF_CF00) | 0x4004_0002 | (sc | (sc << 4));
                 mmio.write32(REG_ADCCLK, adc);
             }
             _ => {
@@ -2022,7 +2073,7 @@ impl Rtl8821ceHw {
 
         // 2. BB TX swing
         const SWING_MAP: [u32; 4] = [0x200, 0x16A, 0x101, 0x0B6];
-        let raw_swing = if ch <= 14 {
+        let raw_swing = if cch <= 14 {
             self.efuse.tx_bb_swing_2g
         } else {
             self.efuse.tx_bb_swing_5g
@@ -2035,11 +2086,24 @@ impl Rtl8821ceHw {
         self.write32_mask(mmio, REG_TXSCALE_A, 0xFFE0_0000, SWING_MAP[swing_idx]);
 
         // 3. MAC channel config (`rtw_set_channel_mac`)
-        mmio.write8(REG_DATA_SC, 0);
+        let txsc_20 = pri_ch_idx & 0x0F;
+        let txsc_40 = match pri_ch_idx {
+            1 | 2 => 2,
+            3 | 4 => 1,
+            _ => 0,
+        };
+        let data_sc = if bw_mhz == 80 && pri_ch_idx != 0 {
+            txsc_20 | (txsc_40 << 4)
+        } else if bw_mhz == 40 && pri_ch_idx != 0 {
+            txsc_20
+        } else {
+            0
+        };
+        mmio.write8(REG_DATA_SC, data_sc);
         let mut trxptcl = mmio.read32(REG_WMAC_TRXPTCL_CTL) & !((1 << 7) | (1 << 8));
-        if bw_mhz == 80 {
+        if bw_mhz == 80 && pri_ch_idx != 0 {
             trxptcl |= 1 << 8;
-        } else if bw_mhz == 40 {
+        } else if bw_mhz == 40 && pri_ch_idx != 0 {
             trxptcl |= 1 << 7;
         }
         mmio.write32(REG_WMAC_TRXPTCL_CTL, trxptcl);
@@ -2108,18 +2172,18 @@ impl Rtl8821ceHw {
 
         let mut rf18 = self.read_rf(mmio, RF_CFGCH, RFREG_MASK);
         rf18 &= !(RF18_BAND_MASK | 0xFF | RF18_RFSI_MASK | RF18_BW_MASK);
-        if ch > 14 {
+        if cch > 14 {
             rf18 |= (1 << 16) | (1 << 8);
         }
-        rf18 |= u32::from(ch);
-        if (100..=140).contains(&ch) {
+        rf18 |= u32::from(cch);
+        if (100..=140).contains(&cch) {
             rf18 |= 1 << 17;
-        } else if ch > 140 {
+        } else if cch > 140 {
             rf18 |= 1 << 18;
         }
         rf18 |= match bw_mhz {
-            80 => 1 << 10,
-            40 => 1 << 11,
+            80 if pri_ch_idx != 0 => 1 << 10,
+            40 if pri_ch_idx != 0 => 1 << 11,
             _ => (1 << 11) | (1 << 10),
         };
         self.write_rf(mmio, RF_CFGCH, RFREG_MASK, rf18);
@@ -2245,13 +2309,19 @@ impl Rtl8821ceHw {
         let _ = self.send_h2c_cmd(mmio, &cmd);
 
         if connected {
-            // Also configure Rate Adaptation (`H2C_CMD_RA_INFO` = 0x40) for 1SS B/G/N/AC
+            // Configure MCU Rate Adaptation (`H2C_CMD_RA_INFO` = 0x40) strictly matching
+            // our negotiated non-HT 20 MHz rate set (OFDM 6..54M on 5 GHz, CCK+OFDM 1..54M on 2.4 GHz).
+            let (rate_id, ra_mask): (u8, u32) = if self.current_channel > 14 {
+                (2, 0x0000_0FF0) // RTW_RATEID_G, OFDM 6..54M (no CCK on 5 GHz!)
+            } else {
+                (1, 0x0000_0FFF) // RTW_RATEID_BG, CCK 1..11M + OFDM 6..54M
+            };
             let mut ra = [0u8; 8];
             ra[0] = 0x40;
             ra[1] = mac_id;
-            ra[2] = 3 | (1 << 7); // RTW_RATEID_BGN_20M_1SS | DIS_PT
+            ra[2] = rate_id | (1 << 7); // DIS_PT
             ra[3] = 0; // 20MHz
-            ra[4..8].copy_from_slice(&0x000F_FFFFu32.to_le_bytes()); // CCK + OFDM + MCS0..7
+            ra[4..8].copy_from_slice(&ra_mask.to_le_bytes());
             let _ = self.send_h2c_cmd(mmio, &ra);
         }
     }
@@ -2272,6 +2342,9 @@ impl Rtl8821ceHw {
         let hi = u16::from_le_bytes([bssid[4], bssid[5]]);
         mmio.write32(REG_BSSID, lo);
         mmio.write16(REG_BSSID + 4, hi);
+        // Program port-0 AID (`rtw_vif_port[0].aid = { .addr = 0x06a8, .mask = 0x7ff }`)
+        let aid_val: u32 = if linked { 1 } else { 0 };
+        self.write32_mask(mmio, REG_BCN_PSR_RPT, 0x0000_07FF, aid_val);
         mmio.write8(REG_BCN_CTRL, 1 << 3); // BIT_EN_BCN_FUNCTION
         self.report_media_status(mmio, 0, linked);
     }
@@ -2449,17 +2522,23 @@ impl Rtl8821ceHw {
             RtwTxQueue::Be
         };
         let is_bmc = mpdu.len() >= 10 && (mpdu[4] & 0x01) != 0;
-        let use_basic_rate = is_mgmt || is_bmc;
-        let rate = if use_basic_rate {
+        // Unencrypted EAPOL (LLC/SNAP 0x888E at offset 30..32) and short control/ARP/DHCP
+        // frames use robust 6 Mbps BPSK OFDM (`DESC_RATE6M`); bulk unicast data uses
+        // 24 Mbps OFDM (`DESC_RATE24M` = 0x08) with automatic hardware fallback enabled.
+        let rate = if is_mgmt || is_bmc {
             if self.current_channel > 14 {
                 DESC_RATE6M
             } else {
                 DESC_RATE1M
             }
+        } else if mpdu.len() <= 420 {
+            DESC_RATE6M
         } else {
-            DESC_RATEMCS7
+            DESC_RATE24M
         };
-        self.tx_raw_ring(mmio, dma, queue, mpdu, rate, use_basic_rate, false)
+        // Always set `USE_RATE = 1` so TX never stalls on an uninitialized MCU RA table
+        // during the pre-Connected 4-way EAPOL handshake or sends unnegotiated HT MCS rates.
+        self.tx_raw_ring(mmio, dma, queue, mpdu, rate, true, false)
     }
 
     /// Poll and acknowledge pending interrupt status, then pop at most one
@@ -2590,13 +2669,23 @@ pub fn build_full_tx_desc(
 ) {
     out.fill(0);
     let more_data = qsel == 17;
-    let w0 = u32::from(mpdu_len) | (48u32 << 16) | (u32::from(bmc) << 24) | (1u32 << 26); // LS
+    let rate_id: u32 = if rate < DESC_RATE6M {
+        0 // RTW_RATEID_B_20M (CCK 1..11M)
+    } else if rate <= DESC_RATE54M {
+        2 // RTW_RATEID_G (OFDM 6..54M, valid on both 2.4 GHz & 5 GHz)
+    } else {
+        3 // RTW_RATEID_BGN_20M_1SS
+    };
+    let dis_fb = u32::from(bmc || qsel == 18 || qsel == 16);
+    // `RTW_TX_DESC_W0_DISQSELSEQ = BIT(31)` pairs with `RTW_TX_DESC_W8_EN_HWSEQ = BIT(15)` (`tx.c:1318`)
+    let w0 =
+        u32::from(mpdu_len) | (48u32 << 16) | (u32::from(bmc) << 24) | (1u32 << 26) | (1u32 << 31);
     let w1 = (u32::from(qsel & 0x1F) << 8)
-        | (3u32 << 16) // RATE_ID = BGN_20M_1SS
+        | (rate_id << 16)
         | (u32::from(sec_type & 0x03) << 22)
         | (u32::from(more_data) << 29);
-    let w3 = (u32::from(use_rate) << 8) | (0x0Fu32 << 17);
-    let w4 = u32::from(rate & 0x7F);
+    let w3 = (u32::from(use_rate) << 8) | (dis_fb << 10) | (0x0Fu32 << 17);
+    let w4 = u32::from(rate & 0x7F) | (0x1Fu32 << 8); // DATARATE_FB_LIMIT = 0x1F
     let w8 = 1u32 << 15; // EN_HWSEQ
     let mut w9 = u32::from(seq & 0x0FFF) << 12;
     if tim_offset != 0 {

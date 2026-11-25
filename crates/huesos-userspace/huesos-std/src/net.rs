@@ -29,10 +29,11 @@ fn map_net_status(st: NetStatus) -> Error {
         NetStatus::Ok => ErrorKind::Other,
         NetStatus::InvalidRequest => ErrorKind::InvalidInput,
         NetStatus::AccessDenied => ErrorKind::AccessDenied,
-        NetStatus::Unreachable => ErrorKind::Io,
+        NetStatus::NetworkDown => ErrorKind::NetworkUnreachable,
+        NetStatus::Unreachable => ErrorKind::HostUnreachable,
         NetStatus::TimedOut => ErrorKind::TimedOut,
-        NetStatus::ConnectionRefused => ErrorKind::PeerClosed,
-        NetStatus::NameNotFound => ErrorKind::NotFound,
+        NetStatus::ConnectionRefused => ErrorKind::ConnectionRefused,
+        NetStatus::NameNotFound => ErrorKind::DnsFailure,
         NetStatus::Busy => ErrorKind::Busy,
     };
     Error::new(kind)
@@ -41,10 +42,15 @@ fn map_net_status(st: NetStatus) -> Error {
 fn map_wlan_status(st: WlanStatus) -> Error {
     let kind = match st {
         WlanStatus::Ok => ErrorKind::Other,
-        WlanStatus::InvalidRequest | WlanStatus::InvalidPassphrase => ErrorKind::InvalidInput,
-        WlanStatus::AccessDenied | WlanStatus::RegulatoryBlocked => ErrorKind::AccessDenied,
+        WlanStatus::InvalidRequest => ErrorKind::InvalidInput,
+        WlanStatus::InvalidPassphrase => ErrorKind::InvalidPassphrase,
+        WlanStatus::AccessDenied => ErrorKind::AccessDenied,
+        WlanStatus::RegulatoryBlocked => ErrorKind::RegulatoryBlocked,
         WlanStatus::HardwareAbsent | WlanStatus::FirmwareUnavailable => ErrorKind::Unsupported,
-        WlanStatus::AuthFailed => ErrorKind::Io,
+        WlanStatus::SsidNotFound => ErrorKind::SsidNotFound,
+        WlanStatus::AuthFailed => ErrorKind::AuthFailed,
+        WlanStatus::AssocFailed => ErrorKind::AssocFailed,
+        WlanStatus::HandshakeFailed => ErrorKind::HandshakeFailed,
     };
     Error::new(kind)
 }
@@ -539,7 +545,7 @@ pub fn wlan_connect(ssid: &str, passphrase: &str) -> Result<()> {
         ch.write(&req).map_err(Error::from_code)?;
         let mut rep = [0u8; 32];
         let n = ch
-            .read_into_timeout(&mut rep, 600)
+            .read_into_timeout(&mut rep, 1_200)
             .map_err(Error::from_code)?;
         let st = wlan::check_header(&rep[..n], WlanOp::Connect).map_err(map_wlan_status)?;
         if st == WlanStatus::Ok {

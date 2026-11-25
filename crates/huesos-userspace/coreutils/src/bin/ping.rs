@@ -14,6 +14,7 @@ use huesos_coreutils as cu;
 use huesos_std::net;
 use huesos_std::thread;
 use huesos_std::time::Duration;
+use huesos_std::ErrorKind;
 
 cu::coreutil_entry!(run);
 
@@ -116,9 +117,26 @@ fn run() -> i32 {
                     (rep.rtt_us % 1_000) / 10,
                 ));
             }
-            Err(err) => {
-                cu::outln(&format!("Request timeout for icmp_seq {}: {}", seq, err));
-            }
+            Err(err) => match err.kind() {
+                ErrorKind::NetworkUnreachable => {
+                    cu::errln(
+                        "ping: sendto: network is unreachable (no active link or IPv4 lease)",
+                    );
+                    break;
+                }
+                ErrorKind::HostUnreachable => {
+                    cu::outln(&format!(
+                        "From local icmp_seq={}: Destination Host Unreachable",
+                        seq
+                    ));
+                }
+                ErrorKind::TimedOut => {
+                    cu::outln(&format!("Request timeout for icmp_seq {}", seq));
+                }
+                _ => {
+                    cu::outln(&format!("ping: icmp_seq={}: {}", seq, err));
+                }
+            },
         }
         if seq < count {
             thread::sleep(Duration::from_millis(150));
