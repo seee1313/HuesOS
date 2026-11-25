@@ -896,6 +896,14 @@ pub struct CommitPlan {
 }
 
 impl CommitPlan {
+    /// Construct a commit plan from an already ordered write list.
+    pub(crate) const fn from_writes(topology_generation: u64, writes: Vec<PlannedWrite>) -> Self {
+        Self {
+            topology_generation,
+            writes,
+        }
+    }
+
     /// Topology generation this commit plan targets.
     pub const fn topology_generation(&self) -> u64 {
         self.topology_generation

@@ -28,10 +28,10 @@ use crate::resource_validation::{
     FirmwareResource, ResourceClass, ResourceRegister, ResourceStatus, RootAperture,
     ValidationReport,
 };
-use crate::topology::{FunctionKind, Parent, TopologySnapshot};
+use crate::topology::{Parent, TopologySnapshot};
 use crate::write_policy::{
-    execute_checked_write, ConfigReadWriteTransport, HeaderKind, WriteClass, WritePolicyError,
-    WriteRequest, OFFSET_COMMAND,
+    execute_checked_write, ConfigReadWriteTransport, HeaderKind, WriteClass, WriteRequest,
+    OFFSET_COMMAND,
 };
 use crate::{ClassCode, ConfigWidth, PciAddress, ENHANCED_CONFIG_BYTES};
 

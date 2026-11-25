@@ -2695,74 +2695,24 @@ impl DriverManager {
             let mut raw = [0u8; pci_iommu::MAX_BYTES];
             if let Ok(n) = hiom_vmo.read(0, &mut raw) {
                 if let Ok(snap) = pci_iommu::decode(&raw[..n]) {
-                    let hw = match snap.hardware {
-                        pci_iommu::IommuHardware::None => "none",
-                        pci_iommu::IommuHardware::IntelVtd => "intel-vtd",
-                        pci_iommu::IommuHardware::AmdVi => "amd-vi",
-                    };
-                    let mode = match snap.active_isolation {
-                        pci_iommu::DmaIsolation::Trusted => "trusted",
-                        pci_iommu::DmaIsolation::Isolated => "isolated",
+                    let mode = match snap.active_mode {
+                        pci_iommu::IommuMode::Trusted => "trusted",
+                        pci_iommu::IommuMode::Isolated => "isolated",
                     };
                     let _ = writeln!(
                         out,
                         "iommu\t0\t*\t{}\tunits={}\tmode={},ir_hw={},ir_active={}",
-                        hw,
+                        snap.hardware_kind.label(),
                         snap.unit_count,
                         mode,
-                        snap.interrupt_remapping_supported,
-                        snap.interrupt_remapping_active
+                        snap.interrupt_remapping_supported(),
+                        snap.interrupt_remapping_active()
                     );
                 }
             }
         }
         if let Some(inv_vmo) = self.pci_inventory_vmo.as_ref() {
-            let mut hdr_bytes = [0u8; pci_inventory::HEADER_BYTES];
-            if read_vmo_exact(inv_vmo, 0, &mut hdr_bytes) {
-                if let Ok(hdr) = pci_inventory::decode_header(&hdr_bytes) {
-                    let mut rec_bytes = [0u8; pci_inventory::FUNCTION_RECORD_BYTES];
-                    for idx in 0..(hdr.function_count as usize) {
-                        if out.len + 112 > 3840 {
-                            break;
-                        }
-                        let off = (pci_inventory::HEADER_BYTES
-                            + idx * pci_inventory::FUNCTION_RECORD_BYTES)
-                            as u64;
-                        if read_vmo_exact(inv_vmo, off, &mut rec_bytes) {
-                            if let Ok(rec) = pci_inventory::decode_function(&rec_bytes) {
-                                let class_short =
-                                    inventory_class_short(rec.class_code, rec.subclass);
-                                let lease_str = match rec.lease_state {
-                                    pci_inventory::InventoryLeaseState::Unbound => "unbound",
-                                    pci_inventory::InventoryLeaseState::Leased => "leased",
-                                    pci_inventory::InventoryLeaseState::Revoked => "revoked",
-                                    pci_inventory::InventoryLeaseState::DeviceGone => "gone",
-                                };
-                                let irq_str = match rec.irq_mode {
-                                    pci_inventory::InventoryIrqMode::None => "none",
-                                    pci_inventory::InventoryIrqMode::LegacyIntx => "intx",
-                                    pci_inventory::InventoryIrqMode::Msi => "msi",
-                                    pci_inventory::InventoryIrqMode::Msix => "msix",
-                                };
-                                let _ = writeln!(
-                                    out,
-                                    "func\t{}\t{:02x}\t{}\t{:02x}:{:02x}.{}\t{:04x}:{:04x},{},irq={}",
-                                    rec.segment,
-                                    rec.bus,
-                                    class_short,
-                                    rec.bus,
-                                    rec.device,
-                                    rec.function,
-                                    rec.vendor_id,
-                                    rec.device_id,
-                                    lease_str,
-                                    irq_str
-                                );
-                            }
-                        }
-                    }
-                }
-            }
+            append_hpin_func_rows(inv_vmo, &mut out);
         }
         for slot in self.pci_bound_leases[..self.pci_bound_leases_len]
             .iter()
@@ -3890,11 +3840,11 @@ impl DriverManager {
             return;
         }
         println!(
-            "[driver-manager] retained HIOM: hw={:?}, status={:?}, units={}, regions={}, gen {}",
-            snap.hardware,
-            snap.status,
+            "[driver-manager] retained HIOM: hw={}, status={}, units={}, regions={}, gen {}",
+            snap.hardware_kind.label(),
+            snap.discovery_status.label(),
             snap.unit_count,
-            snap.reserved_region_count,
+            snap.region_count,
             self.acpi_manager_generation
         );
         self.hiom = Some(vmo);
@@ -4469,23 +4419,45 @@ const fn hmcf_error_name(error: hmcf::HmcfError) -> &'static str {
     }
 }
 
-const fn inventory_class_short(class_code: u8, subclass: u8) -> &'static str {
-    match (class_code, subclass) {
-        (0x01, 0x08) => "nvme",
-        (0x01, 0x06) => "sata",
-        (0x01, _) => "storage",
-        (0x02, 0x00) => "eth",
-        (0x02, 0x80) => "wlan",
-        (0x02, _) => "net",
-        (0x03, _) => "display",
-        (0x04, _) => "audio",
-        (0x06, 0x00) => "host-br",
-        (0x06, 0x01) => "isa-br",
-        (0x06, 0x04) => "pci-br",
-        (0x06, _) => "bridge",
-        (0x0c, 0x03) => "usb",
-        (0x0c, 0x05) => "smbus",
-        _ => "pci-dev",
+#[inline(never)]
+fn append_hpin_func_rows(inv_vmo: &Vmo, out: &mut QueryBuf<3840>) {
+    use core::fmt::Write;
+    let mut hdr_bytes = [0u8; pci_inventory::HEADER_BYTES];
+    if !read_vmo_exact(inv_vmo, 0, &mut hdr_bytes) {
+        return;
+    }
+    let Ok(declared) = pci_inventory::declared_size(&hdr_bytes) else {
+        return;
+    };
+    let mut buf = [0u8; pci_inventory::MAX_BYTES];
+    if !read_vmo_exact(inv_vmo, 0, &mut buf[..declared]) {
+        return;
+    }
+    let Ok(hdr) = pci_inventory::validate_and_decode_header(&buf[..declared]) else {
+        return;
+    };
+    for idx in 0..usize::from(hdr.function_count) {
+        if out.len + 112 > 3840 {
+            break;
+        }
+        if let Ok(rec) = pci_inventory::decode_record(&buf[..declared], idx) {
+            let class_short =
+                pci_inventory::class_short_name(rec.class_code, rec.subclass, rec.prog_if);
+            let _ = writeln!(
+                out,
+                "func\t{}\t{:02x}\t{}\t{:02x}:{:02x}.{}\t{:04x}:{:04x},{},irq={}",
+                rec.segment,
+                rec.bus,
+                class_short,
+                rec.bus,
+                rec.device,
+                rec.function,
+                rec.vendor_id,
+                rec.device_id,
+                rec.lease_state.label(),
+                rec.irq_mode.label()
+            );
+        }
     }
 }
 

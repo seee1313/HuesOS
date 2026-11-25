@@ -6,11 +6,11 @@ extern crate alloc;
 use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
+use huesos_abi::pci::ConfigBackend;
 use huesos_abi::pci_inventory::{
-    self, BarRegisterKind, BarResourceClass, BarValidationStatus, InventoryBackend,
-    InventoryIrqMode, InventoryLeaseState, InventoryRelocationClass,
+    self, InventoryBarClass, InventoryIrqMode, InventoryParentKind, BAR_SLOTS_PER_FUNCTION,
 };
-use huesos_abi::pci_iommu::{DmaIsolation, IommuHardware, IommuStatus};
+use huesos_abi::pci_iommu::{self, IommuMode};
 use huesos_coreutils as cu;
 use libcanvas::{ErrorCode, Vmo};
 
@@ -114,85 +114,72 @@ fn run_hpin_report(show_iommu: bool, show_functions: bool, show_bars: bool) -> i
     };
 
     let backend = match hdr.backend {
-        InventoryBackend::Ecam => "ecam",
-        InventoryBackend::LegacyIo => "legacy-io",
+        ConfigBackend::Ecam => "ecam",
+        ConfigBackend::LegacyIo => "legacy-io",
     };
+    let live_sized = (hdr.flags & pci_inventory::INVENTORY_FLAG_LIVE_SIZED) != 0;
+    let bound = (hdr.flags & pci_inventory::INVENTORY_FLAG_BINDING_COMPLETE) != 0;
     cu::outln(&format!(
-        "HPIN v1 snapshot=0x{:016x} pci_gen={} topo_gen={} roots={} functions={} backend={} fw_res={}",
+        "HPIN v1 snapshot=0x{:016x} pci_gen={} topo_gen={} functions={} backend={} live_sized={} bound={}",
         hdr.firmware_snapshot_id,
         hdr.manager_generation,
         hdr.topology_generation,
-        hdr.root_count,
         hdr.function_count,
         backend,
-        hdr.firmware_resources_available
+        live_sized,
+        bound
     ));
 
     if show_iommu {
-        let hw = match hdr.iommu_hardware {
-            IommuHardware::None => "none",
-            IommuHardware::IntelVtd => "intel-vtd",
-            IommuHardware::AmdVi => "amd-vi",
+        let dma = match hdr.active_dma_isolation {
+            IommuMode::Trusted => "trusted",
+            IommuMode::Isolated => "isolated",
         };
-        let status = match hdr.iommu_status {
-            IommuStatus::Absent => "absent",
-            IommuStatus::DiscoveredInactive => "discovered-inactive",
-            IommuStatus::InvalidTable => "invalid-table",
-        };
-        let dma = match hdr.dma_isolation {
-            DmaIsolation::Trusted => "trusted",
-            DmaIsolation::Isolated => "isolated",
-        };
+        let intr_hw = (hdr.iommu_flags & pci_iommu::FLAG_INTR_REMAP_HW_SUPPORTED) != 0;
+        let intr_active = (hdr.iommu_flags & pci_iommu::FLAG_INTR_REMAP_ACTIVE) != 0;
         cu::outln(&format!(
             "IOMMU hw={} status={} units={} dma_isolation={} intr_remap_hw={} intr_remap_active={}",
-            hw,
-            status,
+            hdr.iommu_hw.label(),
+            hdr.iommu_status.label(),
             hdr.iommu_unit_count,
             dma,
-            hdr.interrupt_remapping_supported,
-            hdr.interrupt_remapping_active
+            intr_hw,
+            intr_active
         ));
     }
 
     if show_functions {
-        for idx in 0..(hdr.function_count as usize) {
-            let Ok(rec) = pci_inventory::decode_function_at(&raw, idx) else {
+        for idx in 0..usize::from(hdr.function_count) {
+            let Ok(rec) = pci_inventory::decode_record(&raw, idx) else {
                 break;
             };
-            let lease = match rec.lease_state {
-                InventoryLeaseState::Unbound => "unbound",
-                InventoryLeaseState::Leased => "leased",
-                InventoryLeaseState::Revoked => "revoked",
-                InventoryLeaseState::DeviceGone => "gone",
-            };
             let irq = match rec.irq_mode {
-                InventoryIrqMode::None => String::from("none"),
-                InventoryIrqMode::LegacyIntx => format!("intx({})", rec.irq_vector_or_gsi),
-                InventoryIrqMode::Msi => format!("msi({})", rec.irq_vector_or_gsi),
-                InventoryIrqMode::Msix => format!("msix({})", rec.irq_vector_or_gsi),
+                InventoryIrqMode::None | InventoryIrqMode::Polling => {
+                    String::from(rec.irq_mode.label())
+                }
+                InventoryIrqMode::Intx | InventoryIrqMode::Msi | InventoryIrqMode::Msix => {
+                    format!("{}({})", rec.irq_mode.label(), rec.irq_vector_or_gsi)
+                }
             };
-            let reloc = match rec.relocation_class {
-                InventoryRelocationClass::Fixed => "fixed",
-                InventoryRelocationClass::RestartRelocatable => "restart-reloc",
-                InventoryRelocationClass::QuiesceRemap => "quiesce-remap",
-            };
-            let parent = if rec.parent_bus == 0xFF {
-                String::from("root")
-            } else {
-                format!(
+            let parent = match rec.parent_kind {
+                InventoryParentKind::Root => format!("root({})", rec.root_id),
+                InventoryParentKind::Bridge => format!(
                     "{:02x}:{:02x}.{}",
                     rec.parent_bus, rec.parent_device, rec.parent_function
-                )
+                ),
             };
             let caps = format_caps(rec.cap_flags);
+            let cls_name =
+                pci_inventory::class_short_name(rec.class_code, rec.subclass, rec.prog_if);
             cu::outln(&format!(
-                "{:04x}:{:02x}:{:02x}.{} {:04x}:{:04x} class={:02x}:{:02x}:{:02x} rev={:02x} parent={} depth={} caps=[{}] irq={} reloc={} lease={}",
+                "{:04x}:{:02x}:{:02x}.{} {:04x}:{:04x} {} ({:02x}:{:02x}:{:02x}) rev={:02x} parent={} depth={} caps=[{}] irq={} reloc={} lease={}",
                 rec.segment,
                 rec.bus,
                 rec.device,
                 rec.function,
                 rec.vendor_id,
                 rec.device_id,
+                cls_name,
                 rec.class_code,
                 rec.subclass,
                 rec.prog_if,
@@ -201,8 +188,8 @@ fn run_hpin_report(show_iommu: bool, show_functions: bool, show_bars: bool) -> i
                 rec.depth,
                 caps,
                 irq,
-                reloc,
-                lease
+                rec.relocation_class.label(),
+                rec.lease_state.label()
             ));
             if rec.header_type == 1 {
                 cu::outln(&format!(
@@ -211,36 +198,23 @@ fn run_hpin_report(show_iommu: bool, show_functions: bool, show_bars: bool) -> i
                 ));
             }
             if show_bars {
-                for b_idx in
-                    0..(usize::from(rec.bar_count).min(pci_inventory::MAX_BARS_PER_FUNCTION))
-                {
+                for b_idx in 0..BAR_SLOTS_PER_FUNCTION {
                     let bar = rec.bars[b_idx];
-                    let reg = match bar.register_kind {
-                        BarRegisterKind::None => continue,
-                        BarRegisterKind::Bar => format!("BAR{}", bar.register_index),
-                        BarRegisterKind::ExpansionRom => String::from("ROM"),
-                        BarRegisterKind::BridgeIoWindow => String::from("WIN-IO"),
-                        BarRegisterKind::BridgeMemoryWindow => String::from("WIN-MEM"),
-                        BarRegisterKind::BridgePrefetchWindow => String::from("WIN-PREF"),
-                    };
-                    let cls = match bar.resource_class {
-                        BarResourceClass::Io => "io",
-                        BarResourceClass::Mmio32 => "mmio32",
-                        BarResourceClass::Mmio64 => "mmio64",
-                        BarResourceClass::PrefetchableMemory => "pref",
-                    };
-                    let st = match bar.status {
-                        BarValidationStatus::Valid => "valid",
-                        BarValidationStatus::Fixed => "fixed",
-                        BarValidationStatus::Unassigned => "unassigned",
-                        BarValidationStatus::Disabled => "disabled",
-                        BarValidationStatus::Unrouteable => "unrouteable",
-                        BarValidationStatus::InvalidBridgeWindow => "bad-window",
-                        BarValidationStatus::Conflicting => "conflict",
+                    if bar.class == InventoryBarClass::Unused {
+                        continue;
+                    }
+                    let slot_lbl = if rec.header_type == 1 {
+                        format!("WIN{b_idx}")
+                    } else {
+                        format!("BAR{b_idx}")
                     };
                     cu::outln(&format!(
                         "  {} {} base=0x{:x} size=0x{:x} status={}",
-                        reg, cls, bar.base, bar.size, st
+                        slot_lbl,
+                        bar.class.label(),
+                        bar.base,
+                        bar.len,
+                        bar.status.label()
                     ));
                 }
             }
@@ -264,8 +238,14 @@ fn format_caps(flags: u16) -> String {
     if (flags & pci_inventory::CAP_FLAG_PM) != 0 {
         parts.push("pm");
     }
-    if (flags & pci_inventory::CAP_FLAG_VIRTIO) != 0 {
-        parts.push("virtio");
+    if (flags & pci_inventory::CAP_FLAG_VENDOR) != 0 {
+        parts.push("vendor");
+    }
+    if (flags & pci_inventory::CAP_FLAG_AER) != 0 {
+        parts.push("aer");
+    }
+    if (flags & pci_inventory::CAP_FLAG_HOTPLUG) != 0 {
+        parts.push("hotplug");
     }
     if parts.is_empty() {
         String::from("-")

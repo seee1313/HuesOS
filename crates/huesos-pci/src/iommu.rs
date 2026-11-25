@@ -534,11 +534,7 @@ pub fn parse_ivrs(bytes: &[u8]) -> IommuDiscoveryReport {
     }
 }
 
-fn validate_sdt_header<'a>(
-    bytes: &'a [u8],
-    expected_sig: [u8; 4],
-    min_len: usize,
-) -> Option<&'a [u8]> {
+fn validate_sdt_header(bytes: &[u8], expected_sig: [u8; 4], min_len: usize) -> Option<&[u8]> {
     if bytes.len() < min_len {
         return None;
     }

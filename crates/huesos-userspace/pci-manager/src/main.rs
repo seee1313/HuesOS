@@ -232,9 +232,6 @@ struct FunctionRuntimeMeta {
     address: PciAddress,
     revision_id: u8,
     header_type: u8,
-    is_multi_function: bool,
-    subsystem_vendor_id: u16,
-    subsystem_id: u16,
     cap_flags: u16,
     lease_state: pci_inventory::InventoryLeaseState,
     irq_mode: pci_inventory::InventoryIrqMode,
@@ -466,14 +463,14 @@ fn accept_iommu_vmo(
         return;
     }
     println!(
-        "[pci-manager] obs n1-iommu hw={:?} status={:?} active_isolation={:?} intr_remap_hw={} intr_remap_active={} units={} regions={}",
-        snap.hardware,
-        snap.status,
-        snap.active_isolation,
-        snap.interrupt_remapping_supported,
-        snap.interrupt_remapping_active,
+        "[pci-manager] obs n1-iommu hw={} status={} active_isolation={} intr_remap_hw={} intr_remap_active={} units={} regions={}",
+        snap.hardware_kind.label(),
+        snap.discovery_status.label(),
+        snap.active_mode.label(),
+        snap.interrupt_remapping_supported(),
+        snap.interrupt_remapping_active(),
         snap.unit_count,
-        snap.reserved_region_count
+        snap.region_count
     );
     authority.iommu = Some(snap);
     if authority.inventory.last_good().is_some() {
@@ -486,27 +483,25 @@ fn run_hotplug_and_rebalance_self_check() {
     let Some(bridge) = PciAddress::new(0, 0, 1, 0) else {
         return;
     };
-    let slot = hotplug::HotplugSlotId {
-        bridge,
-        secondary_bus: 1,
-        slot_number: 1,
-    };
-    queue.enqueue(hotplug::HotplugEvent {
-        slot,
-        kind: hotplug::HotplugEventKind::PresenceDetected,
+    let target = hotplug::HotplugTarget::BridgePort(bridge);
+    let _ = queue.push(hotplug::HotplugEvent {
+        target,
+        kind: hotplug::HotplugEventKind::RescanSubtree,
+        manager_generation: 1,
     });
-    queue.enqueue(hotplug::HotplugEvent {
-        slot,
-        kind: hotplug::HotplugEventKind::DataLinkLayerUp,
+    let _ = queue.push(hotplug::HotplugEvent {
+        target,
+        kind: hotplug::HotplugEventKind::RescanSubtree,
+        manager_generation: 1,
     });
-    let queue_ok = queue.pending_slots() == 1 && queue.pop_next().is_some();
+    let queue_ok = queue.len() == 1 && queue.coalesced_count() == 1 && queue.pop().is_some();
     let nvme_class = ClassCode {
         class: 0x01,
         subclass: 0x08,
         prog_if: 0x02,
     };
     let nvme_fixed =
-        rebalance::effective_relocation_class(nvme_class, RelocationClass::QuiesceRemap)
+        rebalance::effective_relocation_class(nvme_class, Some(RelocationClass::QuiesceRemap))
             == RelocationClass::Fixed;
     println!(
         "[pci-manager] obs k1-l1 hotplug_queue={} nvme_reloc_fixed={}",
@@ -890,25 +885,14 @@ fn refresh_runtime_meta_from_readonly(authority: &mut ConfigAuthority) {
         }
         let revision_id = cfg[0x08];
         let raw_hdr = cfg[0x0E];
-        let header_type = raw_hdr & 0x7F;
-        let is_multi_function = (raw_hdr & 0x80) != 0;
-        let (subsystem_vendor_id, subsystem_id) = if header_type == 0 {
-            (
-                u16::from_le_bytes([cfg[0x2C], cfg[0x2D]]),
-                u16::from_le_bytes([cfg[0x2E], cfg[0x2F]]),
-            )
-        } else {
-            (0, 0)
-        };
+        let header_type = (raw_hdr & 0x7F).min(1);
         let mut cap_flags = 0u16;
         if let Ok(caps) = capability::parse_conventional(&cfg) {
             for cap in caps {
                 match cap.id {
                     0x01 => cap_flags |= pci_inventory::CAP_FLAG_PM,
                     0x05 => cap_flags |= pci_inventory::CAP_FLAG_MSI,
-                    0x09 if node.function.vendor_id == 0x1AF4 => {
-                        cap_flags |= pci_inventory::CAP_FLAG_VIRTIO;
-                    }
+                    0x09 => cap_flags |= pci_inventory::CAP_FLAG_VENDOR,
                     0x10 => cap_flags |= pci_inventory::CAP_FLAG_PCIE,
                     0x11 => cap_flags |= pci_inventory::CAP_FLAG_MSIX,
                     _ => {}
@@ -919,9 +903,6 @@ fn refresh_runtime_meta_from_readonly(authority: &mut ConfigAuthority) {
             address: addr,
             revision_id,
             header_type,
-            is_multi_function,
-            subsystem_vendor_id,
-            subsystem_id,
             cap_flags,
             lease_state: pci_inventory::InventoryLeaseState::Unbound,
             irq_mode: pci_inventory::InventoryIrqMode::None,
@@ -933,58 +914,55 @@ fn refresh_runtime_meta_from_readonly(authority: &mut ConfigAuthority) {
 
 fn map_bar_record(
     res: &huesos_pci::resource_validation::ValidatedResource,
-) -> pci_inventory::BarRecord {
-    let (register_kind, register_index) = match res.resource.register {
-        ResourceRegister::Bar(i) => (pci_inventory::BarRegisterKind::Bar, i),
-        ResourceRegister::ExpansionRom => (pci_inventory::BarRegisterKind::ExpansionRom, 0),
-        ResourceRegister::BridgeIoWindow => (pci_inventory::BarRegisterKind::BridgeIoWindow, 0),
-        ResourceRegister::BridgeMemoryWindow => {
-            (pci_inventory::BarRegisterKind::BridgeMemoryWindow, 0)
-        }
-        ResourceRegister::BridgePrefetchWindow => {
-            (pci_inventory::BarRegisterKind::BridgePrefetchWindow, 0)
-        }
-    };
-    let resource_class = match res.resource.class {
-        ResourceClass::Io => pci_inventory::BarResourceClass::Io,
-        ResourceClass::Mmio32 => pci_inventory::BarResourceClass::Mmio32,
-        ResourceClass::Mmio64 => pci_inventory::BarResourceClass::Mmio64,
-        ResourceClass::PrefetchableMemory => pci_inventory::BarResourceClass::PrefetchableMemory,
+) -> Option<pci_inventory::PciInventoryBar> {
+    if matches!(res.resource.register, ResourceRegister::ExpansionRom) {
+        return None;
+    }
+    let class = match res.resource.class {
+        ResourceClass::Io => pci_inventory::InventoryBarClass::Io,
+        ResourceClass::Mmio32 => pci_inventory::InventoryBarClass::Mmio32,
+        ResourceClass::Mmio64 => pci_inventory::InventoryBarClass::Mmio64,
+        ResourceClass::PrefetchableMemory => pci_inventory::InventoryBarClass::Prefetchable,
     };
     let status = match res.status {
-        ResourceStatus::Valid => pci_inventory::BarValidationStatus::Valid,
-        ResourceStatus::Fixed => pci_inventory::BarValidationStatus::Fixed,
-        ResourceStatus::Unassigned => pci_inventory::BarValidationStatus::Unassigned,
-        ResourceStatus::Disabled => pci_inventory::BarValidationStatus::Disabled,
-        ResourceStatus::Unrouteable => pci_inventory::BarValidationStatus::Unrouteable,
-        ResourceStatus::InvalidBridgeWindow => {
-            pci_inventory::BarValidationStatus::InvalidBridgeWindow
-        }
-        ResourceStatus::Conflicting => pci_inventory::BarValidationStatus::Conflicting,
+        ResourceStatus::Valid => pci_inventory::InventoryBarStatus::Valid,
+        ResourceStatus::Fixed => pci_inventory::InventoryBarStatus::Fixed,
+        ResourceStatus::Unassigned => pci_inventory::InventoryBarStatus::Unassigned,
+        ResourceStatus::Disabled => pci_inventory::InventoryBarStatus::None,
+        ResourceStatus::Unrouteable => pci_inventory::InventoryBarStatus::Unrouteable,
+        ResourceStatus::InvalidBridgeWindow => pci_inventory::InventoryBarStatus::Unsupported,
+        ResourceStatus::Conflicting => pci_inventory::InventoryBarStatus::Conflicting,
     };
-    pci_inventory::BarRecord {
-        register_kind,
-        register_index,
-        resource_class,
-        status,
-        is_64bit: matches!(res.resource.class, ResourceClass::Mmio64),
-        is_prefetchable: matches!(res.resource.class, ResourceClass::PrefetchableMemory),
+    Some(pci_inventory::PciInventoryBar {
         base: res.cpu_base.unwrap_or(res.resource.base),
-        size: res.resource.len,
-    }
+        len: res.resource.len,
+        class,
+        status,
+    })
 }
 
 fn publish_hpin_vmo(bootstrap: &Channel, authority: &ConfigAuthority, manager_generation: u64) {
     let Some(inv) = authority.inventory.last_good() else {
         return;
     };
+    if authority.firmware_snapshot_id == 0 || manager_generation == 0 || inv.generation == 0 {
+        return;
+    }
     let nodes = inv.snapshot.nodes();
     let count = nodes.len().min(pci_inventory::MAX_FUNCTIONS);
     let mut records = Vec::with_capacity(count);
+    let firmware_available = inv.availability == FirmwareResourceAvailability::Available;
+    let iommu = authority.iommu;
+    let active_dma = iommu.map_or(pci_iommu::IommuMode::Trusted, |s| s.active_mode);
 
     for node in nodes.iter().take(count) {
         let addr = node.function.address;
-        let meta = authority
+        let default_lease_state = if authority.leases.iter().any(|l| l.address == addr) {
+            pci_inventory::InventoryLeaseState::Leased
+        } else {
+            pci_inventory::InventoryLeaseState::Unbound
+        };
+        let mut meta = authority
             .runtime_meta
             .iter()
             .find(|m| m.address == addr)
@@ -996,19 +974,41 @@ fn publish_hpin_vmo(bootstrap: &Channel, authority: &ConfigAuthority, manager_ge
                     huesos_pci::topology::FunctionKind::Endpoint => 0,
                     huesos_pci::topology::FunctionKind::PciBridge { .. } => 1,
                 },
-                is_multi_function: false,
-                subsystem_vendor_id: 0,
-                subsystem_id: 0,
                 cap_flags: 0,
-                lease_state: pci_inventory::InventoryLeaseState::Unbound,
+                lease_state: default_lease_state,
                 irq_mode: pci_inventory::InventoryIrqMode::None,
                 irq_vector_or_gsi: 0,
                 relocation_class: pci_inventory::InventoryRelocationClass::Fixed,
             });
+        if meta.lease_state == pci_inventory::InventoryLeaseState::Unbound
+            && default_lease_state == pci_inventory::InventoryLeaseState::Leased
+        {
+            meta.lease_state = pci_inventory::InventoryLeaseState::Leased;
+        }
 
-        let (parent_bus, parent_device, parent_function) = match node.parent {
-            huesos_pci::topology::Parent::Root(_) => (0xFF, 0xFF, 0xFF),
-            huesos_pci::topology::Parent::Bridge(b) => (b.bus(), b.device(), b.function()),
+        let (parent_kind, parent_bus, parent_device, parent_function, root_id) = match node.parent {
+            huesos_pci::topology::Parent::Root(rid) => {
+                (pci_inventory::InventoryParentKind::Root, 0, 0, 0, rid)
+            }
+            huesos_pci::topology::Parent::Bridge(b) => {
+                let rid = inv
+                    .snapshot
+                    .roots()
+                    .iter()
+                    .find(|r| {
+                        r.segment == addr.segment()
+                            && addr.bus() >= r.start_bus
+                            && addr.bus() <= r.end_bus
+                    })
+                    .map_or(1, |r| r.root_id);
+                (
+                    pci_inventory::InventoryParentKind::Bridge,
+                    b.bus(),
+                    b.device(),
+                    b.function(),
+                    rid,
+                )
+            }
         };
         let (secondary_bus, subordinate_bus) = match node.function.kind {
             huesos_pci::topology::FunctionKind::Endpoint => (0, 0),
@@ -1018,91 +1018,104 @@ fn publish_hpin_vmo(bootstrap: &Channel, authority: &ConfigAuthority, manager_ge
             } => (secondary_bus, subordinate_bus),
         };
 
-        let mut bars = [pci_inventory::BarRecord::empty(); pci_inventory::MAX_BARS_PER_FUNCTION];
+        let mut bars =
+            [pci_inventory::PciInventoryBar::EMPTY; pci_inventory::BAR_SLOTS_PER_FUNCTION];
         let mut bar_count = 0usize;
         if let Some(plan) = authority.resource_plan.as_ref() {
             for planned in plan.resources() {
                 if planned.effective().resource.owner == addr
-                    && bar_count < pci_inventory::MAX_BARS_PER_FUNCTION
+                    && bar_count < pci_inventory::BAR_SLOTS_PER_FUNCTION
                 {
-                    bars[bar_count] = map_bar_record(planned.effective());
-                    bar_count += 1;
+                    if let Some(mapped) = map_bar_record(planned.effective()) {
+                        bars[bar_count] = mapped;
+                        bar_count += 1;
+                    }
                 }
             }
         } else if let Some(live) = authority.live_validation.as_ref() {
             for res in live.resources() {
-                if res.resource.owner == addr && bar_count < pci_inventory::MAX_BARS_PER_FUNCTION {
-                    bars[bar_count] = map_bar_record(res);
-                    bar_count += 1;
+                if res.resource.owner == addr && bar_count < pci_inventory::BAR_SLOTS_PER_FUNCTION {
+                    if let Some(mapped) = map_bar_record(res) {
+                        bars[bar_count] = mapped;
+                        bar_count += 1;
+                    }
                 }
             }
         } else if let Some(diag) = inv.validation.as_ref() {
             for res in diag.resources() {
-                if res.resource.owner == addr && bar_count < pci_inventory::MAX_BARS_PER_FUNCTION {
-                    bars[bar_count] = map_bar_record(res);
-                    bar_count += 1;
+                if res.resource.owner == addr && bar_count < pci_inventory::BAR_SLOTS_PER_FUNCTION {
+                    if let Some(mapped) = map_bar_record(res) {
+                        bars[bar_count] = mapped;
+                        bar_count += 1;
+                    }
                 }
             }
         }
 
-        records.push(pci_inventory::FunctionRecord {
+        records.push(pci_inventory::PciInventoryRecord {
             segment: addr.segment(),
             bus: addr.bus(),
             device: addr.device(),
             function: addr.function(),
+            depth: node.depth,
+            parent_kind,
+            parent_bus,
+            parent_device,
+            parent_function,
             vendor_id: node.function.vendor_id,
             device_id: node.function.device_id,
-            subsystem_vendor_id: meta.subsystem_vendor_id,
-            subsystem_id: meta.subsystem_id,
             class_code: node.function.class_code.class,
             subclass: node.function.class_code.subclass,
             prog_if: node.function.class_code.prog_if,
             revision_id: meta.revision_id,
             header_type: meta.header_type,
-            is_multi_function: meta.is_multi_function,
-            depth: node.depth,
-            parent_bus,
-            parent_device,
-            parent_function,
             secondary_bus,
             subordinate_bus,
-            cap_flags: meta.cap_flags,
-            bar_count: bar_count as u8,
-            lease_state: meta.lease_state,
+            firmware_available,
             irq_mode: meta.irq_mode,
+            dma_isolation: active_dma,
             irq_vector_or_gsi: meta.irq_vector_or_gsi,
+            lease_state: meta.lease_state,
             relocation_class: meta.relocation_class,
+            cap_flags: meta.cap_flags,
+            root_id,
             bars,
         });
     }
 
     let backend = if cfg!(feature = "force-legacy") {
-        pci_inventory::InventoryBackend::LegacyIo
+        abi_pci::ConfigBackend::LegacyIo
     } else {
-        pci_inventory::InventoryBackend::Ecam
+        abi_pci::ConfigBackend::Ecam
     };
-    let firmware_resources_available = inv.availability == FirmwareResourceAvailability::Available;
-    let iommu = authority.iommu;
+    let mut inv_flags = 0u32;
+    if authority.live_validation.is_some() {
+        inv_flags |= pci_inventory::INVENTORY_FLAG_LIVE_SIZED;
+    }
+    if authority.binding_published {
+        inv_flags |= pci_inventory::INVENTORY_FLAG_BINDING_COMPLETE;
+    }
+    if authority.inventory.is_frozen() {
+        inv_flags |= pci_inventory::INVENTORY_FLAG_FROZEN;
+    }
 
-    let hdr = pci_inventory::InventoryHeader {
-        total_bytes: 0,
-        function_count: records.len() as u16,
-        root_count: inv.snapshot.roots().len().min(u8::MAX as usize) as u8,
-        backend,
-        firmware_resources_available,
-        iommu_hardware: iommu.map_or(pci_iommu::IommuHardware::None, |s| s.hardware),
-        iommu_status: iommu.map_or(pci_iommu::IommuStatus::Absent, |s| s.status),
-        dma_isolation: iommu.map_or(pci_iommu::DmaIsolation::Trusted, |s| s.active_isolation),
-        interrupt_remapping_supported: iommu.is_some_and(|s| s.interrupt_remapping_supported),
-        interrupt_remapping_active: iommu.is_some_and(|s| s.interrupt_remapping_active),
-        iommu_unit_count: iommu.map_or(0, |s| s.unit_count),
+    let hdr = pci_inventory::PciInventoryHeader {
         firmware_snapshot_id: authority.firmware_snapshot_id,
         manager_generation,
         topology_generation: inv.generation,
-        checksum: 0,
+        backend,
+        iommu_hw: iommu.map_or(pci_iommu::IommuHardwareKind::None, |s| s.hardware_kind),
+        iommu_status: iommu.map_or(pci_iommu::IommuDiscoveryStatus::Absent, |s| {
+            s.discovery_status
+        }),
+        active_dma_isolation: active_dma,
+        iommu_unit_count: iommu.map_or(0, |s| s.unit_count.min(u8::MAX as usize) as u8),
+        iommu_flags: iommu.map_or(0, |s| s.flags),
+        function_count: records.len() as u16,
+        flags: inv_flags,
     };
 
-    let needed = pci_inventory::HEADER_BYTES + records.len() * pci_inventory::FUNCTION_RECORD_BYTES;
+    let needed = pci_inventory::HEADER_BYTES + records.len() * pci_inventory::RECORD_BYTES;
     let mut encoded = alloc::vec![0u8; needed];
     let Ok(written) = pci_inventory::encode(&hdr, &records, &mut encoded) else {
         println!("[pci-manager] HPIN encode failed");
@@ -1117,20 +1130,21 @@ fn publish_hpin_vmo(bootstrap: &Channel, authority: &ConfigAuthority, manager_ge
         return;
     }
     let ro_rights = rights::READ | rights::DUPLICATE | rights::TRANSFER;
-    let Ok(ro_handle) = vmo.into_handle().duplicate(ro_rights) else {
+    let Ok(ro_vmo) = vmo.duplicate(ro_rights) else {
         println!("[pci-manager] HPIN VMO duplicate failed");
         return;
     };
+    drop(vmo);
     if bootstrap
-        .write_handle(pci_manager::INVENTORY_VMO_LABEL, ro_handle)
+        .write_handle(pci_manager::INVENTORY_VMO_LABEL, ro_vmo.into_handle())
         .is_ok()
     {
         println!(
-            "[pci-manager] obs d3-inventory functions={} bytes={} topo_gen={} iommu_hw={:?}",
+            "[pci-manager] obs d3-inventory functions={} bytes={} topo_gen={} iommu_hw={}",
             records.len(),
             written,
             inv.generation,
-            hdr.iommu_hardware
+            hdr.iommu_hw.label()
         );
     }
 }
@@ -2264,12 +2278,14 @@ fn run_driver_binding_and_handoff(
         let Ok(gen_id) = LeaseGeneration::try_new(lease.generation) else {
             continue;
         };
-        let active_dma_isolation = match authority.iommu.as_ref().map(|s| s.active_isolation) {
-            Some(pci_iommu::DmaIsolation::Isolated) => DmaIsolation::Isolated,
+        let active_dma_isolation = match authority.iommu.as_ref().map(|s| s.active_mode) {
+            Some(pci_iommu::IommuMode::Isolated) => DmaIsolation::Isolated,
             _ => DmaIsolation::Trusted,
         };
-        let effective_reloc =
-            rebalance::effective_relocation_class(node.function.class_code, RelocationClass::Fixed);
+        let effective_reloc = rebalance::effective_relocation_class(
+            node.function.class_code,
+            Some(RelocationClass::Fixed),
+        );
         let Ok(mut policy) = DeviceLeasePolicy::try_new(
             dev_id,
             gen_id,
@@ -3083,17 +3099,15 @@ fn run_driver_binding_and_handoff(
                 let inv_irq_mode = match irq_plan.mode {
                     InterruptMode::Msix { .. } => pci_inventory::InventoryIrqMode::Msix,
                     InterruptMode::Msi { .. } => pci_inventory::InventoryIrqMode::Msi,
-                    InterruptMode::Intx { .. } => pci_inventory::InventoryIrqMode::LegacyIntx,
-                    InterruptMode::Polling => pci_inventory::InventoryIrqMode::None,
+                    InterruptMode::Intx { .. } => pci_inventory::InventoryIrqMode::Intx,
+                    InterruptMode::Polling => pci_inventory::InventoryIrqMode::Polling,
                 };
                 let inv_reloc = match rebalance::effective_relocation_class(
                     node.function.class_code,
-                    manifest.relocation,
+                    Some(manifest.relocation),
                 ) {
                     RelocationClass::Fixed => pci_inventory::InventoryRelocationClass::Fixed,
-                    RelocationClass::RestartRelocatable => {
-                        pci_inventory::InventoryRelocationClass::RestartRelocatable
-                    }
+                    RelocationClass::Restart => pci_inventory::InventoryRelocationClass::Restart,
                     RelocationClass::QuiesceRemap => {
                         pci_inventory::InventoryRelocationClass::QuiesceRemap
                     }
@@ -3103,7 +3117,7 @@ fn run_driver_binding_and_handoff(
                     .iter_mut()
                     .find(|m| m.address == lease.address)
                 {
-                    meta.lease_state = pci_inventory::InventoryLeaseState::Leased;
+                    meta.lease_state = pci_inventory::InventoryLeaseState::BoundOnline;
                     meta.irq_mode = inv_irq_mode;
                     meta.irq_vector_or_gsi = u16::try_from(irq_num).unwrap_or(0);
                     meta.relocation_class = inv_reloc;

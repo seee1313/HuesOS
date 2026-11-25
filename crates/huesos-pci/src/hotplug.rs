@@ -746,15 +746,6 @@ pub(crate) fn build_direct_commit_plan(
     CommitPlan::from_writes(topology_generation, writes)
 }
 
-impl CommitPlan {
-    pub(crate) fn from_writes(topology_generation: u64, writes: Vec<PlannedWrite>) -> Self {
-        Self {
-            topology_generation,
-            writes,
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
