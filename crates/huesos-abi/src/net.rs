@@ -103,6 +103,8 @@ pub enum NetStatus {
     NameNotFound = 6,
     /// Socket table or packet pool is full.
     Busy = 7,
+    /// No network interface has an active link and configured IPv4 route.
+    NetworkDown = 8,
 }
 
 impl NetStatus {
@@ -117,6 +119,7 @@ impl NetStatus {
             5 => Self::ConnectionRefused,
             6 => Self::NameNotFound,
             7 => Self::Busy,
+            8 => Self::NetworkDown,
             _ => return None,
         })
     }

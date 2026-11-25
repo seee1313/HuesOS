@@ -37,6 +37,11 @@ pub const IE_SSID: u8 = 0;
 pub const IE_SUPPORTED_RATES: u8 = 1;
 pub const IE_DS_PARAM_SET: u8 = 3;
 pub const IE_RSN: u8 = 48;
+pub const IE_EXT_SUPPORTED_RATES: u8 = 50;
+pub const IE_HT_OPERATION: u8 = 61;
+
+pub const CIPHER_SUITE_TKIP: [u8; 4] = [0x00, 0x0F, 0xAC, 0x02];
+pub const CIPHER_SUITE_CCMP: [u8; 4] = [0x00, 0x0F, 0xAC, 0x04];
 
 /// Canonical WPA2-PSK (AES-CCMP group + pairwise, PSK AKM `00-0F-AC:02`) RSN IE
 /// including element ID `48` (`0x30`) and length `20` (`0x14`).
@@ -51,7 +56,21 @@ pub const RSN_IE_WPA2_CCMP: [u8; 22] = [
     0x00, 0x00, // RSN Capabilities
 ];
 
+/// Build a 22-byte WPA2-PSK RSN IE matching the AP's advertised Group Cipher
+/// (`CCMP-128` or `TKIP` on mixed-mode WPA/WPA2 routers) while selecting
+/// `CCMP-128` pairwise cipher and `PSK` AKM (`00:0F:AC:02`).
+pub const fn build_rsn_ie_with_group(group_cipher: [u8; 4]) -> [u8; 22] {
+    let mut ie = RSN_IE_WPA2_CCMP;
+    ie[4] = group_cipher[0];
+    ie[5] = group_cipher[1];
+    ie[6] = group_cipher[2];
+    ie[7] = group_cipher[3];
+    ie
+}
+
 const DEFAULT_RATES: [u8; 8] = [0x82, 0x84, 0x8B, 0x96, 0x0C, 0x12, 0x18, 0x24];
+const EXT_RATES_2G: [u8; 4] = [0x30, 0x48, 0x60, 0x6C];
+const DEFAULT_RATES_5G: [u8; 8] = [0x8C, 0x12, 0x98, 0x24, 0xB0, 0x48, 0x60, 0x6C];
 
 /// Security suite advertised by a BSS.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -78,6 +97,8 @@ pub struct BssRecord {
     pub channel: u8,
     pub rssi_dbm: i8,
     pub security: SecurityMode,
+    pub capab_info: u16,
+    pub group_cipher: [u8; 4],
 }
 
 impl BssRecord {
@@ -189,8 +210,21 @@ pub fn build_probe_request(
     seq_num: u16,
     out: &mut [u8],
 ) -> Result<usize, Dot11Error> {
+    build_probe_request_band(sta_mac, ssid, false, seq_num, out)
+}
+
+/// Build an active scan Probe Request frame with band-appropriate supported rates
+/// (CCK+OFDM `1..54 Mbps` on 2.4 GHz, pure OFDM `6..54 Mbps` on 5 GHz).
+pub fn build_probe_request_band(
+    sta_mac: [u8; 6],
+    ssid: &[u8],
+    is_5g: bool,
+    seq_num: u16,
+    out: &mut [u8],
+) -> Result<usize, Dot11Error> {
     let ssid_len = ssid.len().min(32);
-    let need = IEEE80211_HDR_LEN + 2 + ssid_len + 2 + DEFAULT_RATES.len();
+    let ext_len = if is_5g { 0 } else { 2 + EXT_RATES_2G.len() };
+    let need = IEEE80211_HDR_LEN + 2 + ssid_len + 2 + DEFAULT_RATES.len() + ext_len;
     if out.len() < need {
         return Err(Dot11Error::BufferTooSmall);
     }
@@ -208,10 +242,22 @@ pub fn build_probe_request(
     out[pos + 1] = ssid_len as u8;
     out[pos + 2..pos + 2 + ssid_len].copy_from_slice(&ssid[..ssid_len]);
     pos += 2 + ssid_len;
+    let rates = if is_5g {
+        &DEFAULT_RATES_5G
+    } else {
+        &DEFAULT_RATES
+    };
     out[pos] = IE_SUPPORTED_RATES;
-    out[pos + 1] = DEFAULT_RATES.len() as u8;
-    out[pos + 2..pos + 2 + DEFAULT_RATES.len()].copy_from_slice(&DEFAULT_RATES);
-    Ok(pos + 2 + DEFAULT_RATES.len())
+    out[pos + 1] = rates.len() as u8;
+    out[pos + 2..pos + 2 + rates.len()].copy_from_slice(rates);
+    pos += 2 + rates.len();
+    if !is_5g {
+        out[pos] = IE_EXT_SUPPORTED_RATES;
+        out[pos + 1] = EXT_RATES_2G.len() as u8;
+        out[pos + 2..pos + 2 + EXT_RATES_2G.len()].copy_from_slice(&EXT_RATES_2G);
+        pos += 2 + EXT_RATES_2G.len();
+    }
+    Ok(pos)
 }
 
 /// Build a Beacon or Probe Response frame (for AP / virtual-radio testing).
@@ -303,7 +349,9 @@ pub fn parse_beacon_or_probe_resp(
     let mut ssid = [0u8; 32];
     let mut ssid_len = 0usize;
     let mut channel = default_channel;
+    let mut has_ds_param = false;
     let mut has_wpa2_ccmp = false;
+    let mut group_cipher = CIPHER_SUITE_CCMP;
 
     let ies = &hdr.body[12..];
     let mut idx = 0usize;
@@ -319,14 +367,38 @@ pub fn parse_beacon_or_probe_resp(
                 ssid_len = len.min(32);
                 ssid[..ssid_len].copy_from_slice(&val[..ssid_len]);
             }
-            IE_DS_PARAM_SET if len == 1 => {
+            IE_DS_PARAM_SET if len == 1 && val[0] != 0 => {
+                channel = val[0];
+                has_ds_param = true;
+            }
+            IE_HT_OPERATION if !has_ds_param && !val.is_empty() && val[0] != 0 => {
                 channel = val[0];
             }
-            IE_RSN if len >= 18 => {
-                // Validate RSN version == 1 and presence of PSK AKM 00:0F:AC:02
+            IE_RSN if len >= 8 => {
                 let ver = u16::from_le_bytes([val[0], val[1]]);
-                if ver == 1 && val.windows(4).any(|w| w == [0x00, 0x0F, 0xAC, 0x02]) {
-                    has_wpa2_ccmp = true;
+                if ver == 1 {
+                    group_cipher.copy_from_slice(&val[2..6]);
+                    let pw_cnt = usize::from(u16::from_le_bytes([val[6], val[7]]));
+                    let pw_end = 8usize.saturating_add(pw_cnt.saturating_mul(4));
+                    if pw_end + 2 <= val.len() {
+                        let akm_cnt =
+                            usize::from(u16::from_le_bytes([val[pw_end], val[pw_end + 1]]));
+                        let akm_start = pw_end + 2;
+                        let akm_end = akm_start
+                            .saturating_add(akm_cnt.saturating_mul(4))
+                            .min(val.len());
+                        let pw_has_ccmp = val[8..pw_end]
+                            .chunks_exact(4)
+                            .any(|c| c == CIPHER_SUITE_CCMP);
+                        let akm_has_psk = val[akm_start..akm_end].chunks_exact(4).any(|a| {
+                            a == [0x00, 0x0F, 0xAC, 0x02] || a == [0x00, 0x0F, 0xAC, 0x06]
+                        });
+                        if pw_has_ccmp && akm_has_psk {
+                            has_wpa2_ccmp = true;
+                        }
+                    } else {
+                        has_wpa2_ccmp = true;
+                    }
                 }
             }
             _ => {}
@@ -346,6 +418,8 @@ pub fn parse_beacon_or_probe_resp(
         channel,
         rssi_dbm,
         security,
+        capab_info: cap,
+        group_cipher,
     })
 }
 
@@ -399,13 +473,44 @@ pub fn build_assoc_request(
     seq_num: u16,
     out: &mut [u8],
 ) -> Result<usize, Dot11Error> {
+    build_assoc_request_for_bss(
+        bssid,
+        sta_mac,
+        ssid,
+        1,
+        0x0400,
+        security,
+        CIPHER_SUITE_CCMP,
+        seq_num,
+        out,
+    )
+}
+
+/// Build an IEEE 802.11 Association Request tailored to the target AP's band,
+/// capability bits (`ShortPreamble`, `SpectrumMgmt`, `ShortSlotTime`),
+/// full 2.4 GHz (`1..54 Mbps` + IE 50) or 5 GHz (`6..54 Mbps`, zero CCK) rates,
+/// and exact RSN Group Cipher (`CCMP-128` or mixed-mode `TKIP`).
+#[allow(clippy::too_many_arguments)]
+pub fn build_assoc_request_for_bss(
+    bssid: [u8; 6],
+    sta_mac: [u8; 6],
+    ssid: &[u8],
+    channel: u8,
+    ap_capab_info: u16,
+    security: SecurityMode,
+    group_cipher: [u8; 4],
+    seq_num: u16,
+    out: &mut [u8],
+) -> Result<usize, Dot11Error> {
     let ssid_len = ssid.len().min(32);
+    let is_5g = channel > 14;
+    let ext_len = if is_5g { 0 } else { 2 + EXT_RATES_2G.len() };
     let rsn_len = if security == SecurityMode::Wpa2PskCcmp {
         RSN_IE_WPA2_CCMP.len()
     } else {
         0
     };
-    let need = IEEE80211_HDR_LEN + 4 + 2 + ssid_len + 2 + DEFAULT_RATES.len() + rsn_len;
+    let need = IEEE80211_HDR_LEN + 4 + 2 + ssid_len + 2 + DEFAULT_RATES.len() + ext_len + rsn_len;
     if out.len() < need {
         return Err(Dot11Error::BufferTooSmall);
     }
@@ -419,11 +524,15 @@ pub fn build_assoc_request(
         seq_num,
         out,
     )?;
-    let cap: u16 = if security == SecurityMode::Wpa2PskCcmp {
-        0x0411
-    } else {
-        0x0401
-    };
+    // ESS (0x0001) + Privacy (0x0010) + echo AP ShortPreamble (0x0020),
+    // SpectrumMgmt (0x0100 on 5 GHz), and ShortSlotTime (0x0400 on 2.4 GHz).
+    let mut cap: u16 = 0x0001 | (ap_capab_info & (0x0020 | 0x0100 | 0x0400));
+    if !is_5g && ap_capab_info == 0 {
+        cap |= 0x0400;
+    }
+    if security == SecurityMode::Wpa2PskCcmp {
+        cap |= 0x0010;
+    }
     out[pos..pos + 2].copy_from_slice(&cap.to_le_bytes());
     out[pos + 2..pos + 4].copy_from_slice(&10u16.to_le_bytes()); // Listen interval
     pos += 4;
@@ -433,14 +542,27 @@ pub fn build_assoc_request(
     out[pos + 2..pos + 2 + ssid_len].copy_from_slice(&ssid[..ssid_len]);
     pos += 2 + ssid_len;
 
+    let rates = if is_5g {
+        &DEFAULT_RATES_5G
+    } else {
+        &DEFAULT_RATES
+    };
     out[pos] = IE_SUPPORTED_RATES;
-    out[pos + 1] = DEFAULT_RATES.len() as u8;
-    out[pos + 2..pos + 2 + DEFAULT_RATES.len()].copy_from_slice(&DEFAULT_RATES);
-    pos += 2 + DEFAULT_RATES.len();
+    out[pos + 1] = rates.len() as u8;
+    out[pos + 2..pos + 2 + rates.len()].copy_from_slice(rates);
+    pos += 2 + rates.len();
+
+    if !is_5g {
+        out[pos] = IE_EXT_SUPPORTED_RATES;
+        out[pos + 1] = EXT_RATES_2G.len() as u8;
+        out[pos + 2..pos + 2 + EXT_RATES_2G.len()].copy_from_slice(&EXT_RATES_2G);
+        pos += 2 + EXT_RATES_2G.len();
+    }
 
     if security == SecurityMode::Wpa2PskCcmp {
-        out[pos..pos + RSN_IE_WPA2_CCMP.len()].copy_from_slice(&RSN_IE_WPA2_CCMP);
-        pos += RSN_IE_WPA2_CCMP.len();
+        let rsn_ie = build_rsn_ie_with_group(group_cipher);
+        out[pos..pos + rsn_ie.len()].copy_from_slice(&rsn_ie);
+        pos += rsn_ie.len();
     }
     Ok(pos)
 }
@@ -596,7 +718,7 @@ pub fn build_data_frame(
     Ok(total)
 }
 
-/// Bounded scan table storing up to 16 distinct APs sorted by RSSI.
+/// Bounded scan table storing up to 24 distinct APs sorted by RSSI.
 pub struct ScanTable {
     entries: Vec<BssRecord>,
 }
@@ -610,7 +732,7 @@ impl Default for ScanTable {
 impl ScanTable {
     pub fn new() -> Self {
         Self {
-            entries: Vec::with_capacity(16),
+            entries: Vec::with_capacity(24),
         }
     }
 
@@ -620,9 +742,21 @@ impl ScanTable {
 
     pub fn upsert(&mut self, bss: BssRecord) {
         if let Some(existing) = self.entries.iter_mut().find(|e| e.bssid == bss.bssid) {
+            // Preserve non-empty SSID if a hidden-SSID beacon arrives after a ProbeResp
+            let keep_ssid = bss.ssid_len == 0 && existing.ssid_len > 0;
+            let prev_ssid = existing.ssid;
+            let prev_len = existing.ssid_len;
             *existing = bss;
-        } else if self.entries.len() < 16 {
+            if keep_ssid {
+                existing.ssid = prev_ssid;
+                existing.ssid_len = prev_len;
+            }
+        } else if self.entries.len() < 24 {
             self.entries.push(bss);
+        } else if let Some(last) = self.entries.last_mut() {
+            if bss.rssi_dbm > last.rssi_dbm {
+                *last = bss;
+            }
         }
         self.entries.sort_by_key(|a| core::cmp::Reverse(a.rssi_dbm));
     }
@@ -681,6 +815,26 @@ mod tests {
         assert_eq!(
             parse_llc_snap_payload(&snap[..slen]),
             Ok((0x888E, &[1u8, 3, 0, 4][..]))
+        );
+
+        let assoc_len = build_assoc_request_for_bss(
+            bssid,
+            sta,
+            b"HuesOS-Lab-5G",
+            36,
+            0x0111,
+            SecurityMode::Wpa2PskCcmp,
+            CIPHER_SUITE_TKIP,
+            10,
+            &mut buf,
+        )
+        .unwrap_or(0);
+        assert!(assoc_len > IEEE80211_HDR_LEN + 26);
+        let cap = u16::from_le_bytes([buf[24], buf[25]]);
+        assert_eq!(cap & 0x0111, 0x0111);
+        assert_eq!(
+            &buf[assoc_len - 22..assoc_len - 14],
+            &[0x30, 0x14, 0x01, 0x00, 0x00, 0x0F, 0xAC, 0x02]
         );
     }
 }

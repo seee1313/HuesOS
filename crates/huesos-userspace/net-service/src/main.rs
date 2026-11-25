@@ -1217,8 +1217,18 @@ pub extern "C" fn _start() -> ! {
                             deadline_ms: now_ms + u64::from(timeout_ms.clamp(100, 10_000)),
                         });
                     } else if let Some(c) = clients[idx].as_ref() {
-                        let rep =
-                            encode_ping_reply(NetStatus::Unreachable, &AbiPingResult::default());
+                        let stack_up = (nic.is_some()
+                            && eth_stack.cfg.link_up
+                            && !eth_stack.cfg.ip.is_unspecified())
+                            || (wlan_present
+                                && wlan_stack.cfg.link_up
+                                && !wlan_stack.cfg.ip.is_unspecified());
+                        let st = if stack_up {
+                            NetStatus::Unreachable
+                        } else {
+                            NetStatus::NetworkDown
+                        };
+                        let rep = encode_ping_reply(st, &AbiPingResult::default());
                         let _ = c.ch.write(&rep);
                     }
                 }
@@ -1273,8 +1283,19 @@ pub extern "C" fn _start() -> ! {
                             });
                         }
                         Err(_) => {
+                            let stack_up = (nic.is_some()
+                                && eth_stack.cfg.link_up
+                                && !eth_stack.cfg.ip.is_unspecified())
+                                || (wlan_present
+                                    && wlan_stack.cfg.link_up
+                                    && !wlan_stack.cfg.ip.is_unspecified());
+                            let st = if stack_up {
+                                NetStatus::Unreachable
+                            } else {
+                                NetStatus::NetworkDown
+                            };
                             let mut rep = [0u8; 16];
-                            net::write_header(&mut rep, NetOp::ResolveDns, NetStatus::Unreachable);
+                            net::write_header(&mut rep, NetOp::ResolveDns, st);
                             if let Some(c) = clients[idx].as_ref() {
                                 let _ = c.ch.write(&rep);
                             }
@@ -1331,8 +1352,20 @@ pub extern "C" fn _start() -> ! {
                             });
                         }
                         Err(_) => {
+                            let stack_up = dst.is_loopback()
+                                || (nic.is_some()
+                                    && eth_stack.cfg.link_up
+                                    && !eth_stack.cfg.ip.is_unspecified())
+                                || (wlan_present
+                                    && wlan_stack.cfg.link_up
+                                    && !wlan_stack.cfg.ip.is_unspecified());
+                            let st = if stack_up {
+                                NetStatus::Unreachable
+                            } else {
+                                NetStatus::NetworkDown
+                            };
                             let mut rep = [0u8; 8];
-                            net::write_header(&mut rep, NetOp::OpenTcp, NetStatus::Unreachable);
+                            net::write_header(&mut rep, NetOp::OpenTcp, st);
                             if let Some(c) = clients[idx].as_ref() {
                                 let _ = c.ch.write(&rep);
                             }

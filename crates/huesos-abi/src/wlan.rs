@@ -90,6 +90,12 @@ pub enum WlanStatus {
     AuthFailed = 6,
     /// Passphrase length must be `8..=63` ASCII bytes for WPA2-PSK.
     InvalidPassphrase = 7,
+    /// Target SSID was not discovered on any 2.4 GHz or 5 GHz channel.
+    SsidNotFound = 8,
+    /// Access Point rejected the 802.11 Association Request.
+    AssocFailed = 9,
+    /// WPA2 4-way EAPOL handshake failed or timed out (commonly wrong password).
+    HandshakeFailed = 10,
 }
 
 impl WlanStatus {
@@ -104,6 +110,9 @@ impl WlanStatus {
             5 => Self::RegulatoryBlocked,
             6 => Self::AuthFailed,
             7 => Self::InvalidPassphrase,
+            8 => Self::SsidNotFound,
+            9 => Self::AssocFailed,
+            10 => Self::HandshakeFailed,
             _ => return None,
         })
     }

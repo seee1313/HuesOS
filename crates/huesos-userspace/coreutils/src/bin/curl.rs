@@ -14,7 +14,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use huesos_coreutils as cu;
-use huesos_std::error::Error as StdError;
+use huesos_std::error::{Error as StdError, ErrorKind};
 use huesos_std::fs;
 use huesos_std::io::{self, Read, Write};
 use huesos_std::net::{self, TcpStream};
@@ -269,25 +269,47 @@ fn perform_single_exchange(
     trust_store: Option<&TrustStore>,
     hop: u64,
 ) -> Result<Vec<u8>, (i32, String)> {
-    let ip = net::resolve_host(&target.host).map_err(|err| {
-        (
+    let ip = net::resolve_host(&target.host).map_err(|err| match err.kind() {
+        ErrorKind::NetworkUnreachable => (
+            7,
+            format!(
+                "curl: (7) Network is unreachable resolving '{}' (no active link or IPv4)",
+                target.host
+            ),
+        ),
+        ErrorKind::TimedOut => (
+            28,
+            format!(
+                "curl: (28) Resolving host '{}' timed out (DNS server unreachable)",
+                target.host
+            ),
+        ),
+        _ => (
             6,
             format!(
                 "curl: (6) Could not resolve host '{}': {}",
                 target.host, err
             ),
-        )
+        ),
     })?;
 
-    let mut stream = TcpStream::connect_timeout(ip, target.port, 8_000).map_err(|err| {
-        (
-            7,
-            format!(
-                "curl: (7) Failed to connect to {} ({}.{}.{}.{}) port {}: {}",
-                target.host, ip[0], ip[1], ip[2], ip[3], target.port, err
+    let mut stream =
+        TcpStream::connect_timeout(ip, target.port, 8_000).map_err(|err| match err.kind() {
+            ErrorKind::TimedOut => (
+                28,
+                format!(
+                    "curl: (28) Connection to {} ({}.{}.{}.{}) port {} timed out",
+                    target.host, ip[0], ip[1], ip[2], ip[3], target.port
+                ),
             ),
-        )
-    })?;
+            _ => (
+                7,
+                format!(
+                    "curl: (7) Failed to connect to {} ({}.{}.{}.{}) port {}: {}",
+                    target.host, ip[0], ip[1], ip[2], ip[3], target.port, err
+                ),
+            ),
+        })?;
 
     let default_port = if target.https { 443 } else { 80 };
     let host_hdr = if target.port == default_port {

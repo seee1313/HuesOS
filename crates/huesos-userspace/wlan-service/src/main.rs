@@ -24,13 +24,14 @@ use huesos_abi::wlan::{
     WlanStateCode, WlanStatus, WlanStatusSnapshot, MAX_SSID_LEN,
 };
 use huesos_ieee80211::{
-    build_assoc_request, build_assoc_response, build_auth_frame, build_beacon_or_probe_resp,
-    build_data_frame, build_deauth, build_llc_snap_payload, build_probe_request,
-    parse_assoc_response, parse_auth_frame, parse_beacon_or_probe_resp, parse_llc_snap_payload,
-    Dot11Header, ScanTable, SecurityMode, FC_FLAG_FROM_DS, FC_FLAG_PROTECTED, FC_FLAG_TO_DS,
-    FC_TYPE_DATA, FC_TYPE_MGMT, IE_SSID, MGMT_SUBTYPE_ASSOC_REQ, MGMT_SUBTYPE_ASSOC_RESP,
-    MGMT_SUBTYPE_AUTH, MGMT_SUBTYPE_BEACON, MGMT_SUBTYPE_DEAUTH, MGMT_SUBTYPE_DISASSOC,
-    MGMT_SUBTYPE_PROBE_REQ, MGMT_SUBTYPE_PROBE_RESP,
+    build_assoc_request_for_bss, build_assoc_response, build_auth_frame,
+    build_beacon_or_probe_resp, build_data_frame, build_deauth, build_llc_snap_payload,
+    build_probe_request, build_probe_request_band, build_rsn_ie_with_group, parse_assoc_response,
+    parse_auth_frame, parse_beacon_or_probe_resp, parse_llc_snap_payload, Dot11Header, ScanTable,
+    SecurityMode, CIPHER_SUITE_CCMP, CIPHER_SUITE_TKIP, FC_FLAG_FROM_DS, FC_FLAG_PROTECTED,
+    FC_FLAG_TO_DS, FC_TYPE_DATA, FC_TYPE_MGMT, IE_SSID, MGMT_SUBTYPE_ASSOC_REQ,
+    MGMT_SUBTYPE_ASSOC_RESP, MGMT_SUBTYPE_AUTH, MGMT_SUBTYPE_BEACON, MGMT_SUBTYPE_DEAUTH,
+    MGMT_SUBTYPE_DISASSOC, MGMT_SUBTYPE_PROBE_REQ, MGMT_SUBTYPE_PROBE_RESP,
 };
 use huesos_net::dhcp_dns::{
     parse_dhcp_reply, DHCP_ACK, DHCP_CLIENT_PORT, DHCP_DISCOVER, DHCP_OFFER, DHCP_REQUEST,
@@ -44,7 +45,8 @@ use huesos_net::{Ipv4Addr, MacAddr, NetStack};
 use huesos_rtw88::VirtualRtw88Medium;
 use huesos_rtw88::{Rtl8821ceHw, Rtw88Dma, Rtw88FirmwareInfo, Rtw88Mmio};
 use huesos_wpa::{
-    derive_wpa2_psk, hmac_sha1_parts, Authenticator4Way, CcmpContext, Supplicant4Way,
+    decrypt_tkip_group_mpdu, derive_wpa2_psk, hmac_sha1_parts, Authenticator4Way, CcmpContext,
+    Supplicant4Way,
 };
 use libcanvas::{println, Channel, ErrorCode, Handle, Hxfs, Vmo};
 
@@ -900,9 +902,14 @@ struct WlanRuntime {
     ccmp_replay_drops: u64,
     scan_table: ScanTable,
     profiles: Vec<SavedPmkProfile>,
+    ap_capab_info: u16,
+    group_cipher: [u8; 4],
+    gtk_raw: [u8; 16],
+    last_fail_status: Option<WlanStatus>,
     supp: Option<Supplicant4Way>,
     tx_ccmp: Option<CcmpContext>,
     rx_ccmp: Option<CcmpContext>,
+    rx_gtk_ccmp: Option<CcmpContext>,
     softap: Option<SoftApState>,
     local_net: NetStack,
     last_autoconnect_try_ms: u64,
@@ -1124,51 +1131,85 @@ impl WlanRuntime {
                         }
                     }
                 }
-                MGMT_SUBTYPE_AUTH if self.state == WlanStateCode::Authenticating => {
-                    if let Ok((bssid, 0, 2, 0)) = parse_auth_frame(mpdu) {
+                MGMT_SUBTYPE_AUTH
+                    if self.state == WlanStateCode::Authenticating
+                        && hdr.addr1 == self.active_mac =>
+                {
+                    if let Ok((bssid, 0, 2, status)) = parse_auth_frame(mpdu) {
                         if bssid == self.bssid {
-                            self.state = WlanStateCode::Associating;
-                            self.state_deadline_ms = now_ms + 3_000;
-                            let sec = if self.supp.is_some() {
-                                SecurityMode::Wpa2PskCcmp
+                            if status != 0 {
+                                self.last_fail_status = Some(WlanStatus::AuthFailed);
                             } else {
-                                SecurityMode::Open
-                            };
-                            let mut buf = [0u8; 192];
-                            let seq = self.next_seq();
-                            if let Ok(n) = build_assoc_request(
-                                self.bssid,
-                                self.active_mac,
-                                &self.ssid[..self.ssid_len as usize],
-                                sec,
-                                seq,
-                                &mut buf,
-                            ) {
-                                self.tx_mpdu(now_ms, &buf[..n]);
+                                self.state = WlanStateCode::Associating;
+                                self.state_deadline_ms = now_ms + 4_000;
+                                let sec = if self.supp.is_some() {
+                                    SecurityMode::Wpa2PskCcmp
+                                } else {
+                                    SecurityMode::Open
+                                };
+                                let mut buf = [0u8; 224];
+                                let seq = self.next_seq();
+                                if let Ok(n) = build_assoc_request_for_bss(
+                                    self.bssid,
+                                    self.active_mac,
+                                    &self.ssid[..self.ssid_len as usize],
+                                    self.channel,
+                                    self.ap_capab_info,
+                                    sec,
+                                    self.group_cipher,
+                                    seq,
+                                    &mut buf,
+                                ) {
+                                    self.tx_mpdu(now_ms, &buf[..n]);
+                                }
                             }
                         }
                     }
                 }
-                MGMT_SUBTYPE_ASSOC_RESP if self.state == WlanStateCode::Associating => {
-                    if let Ok((bssid, 0, _aid)) = parse_assoc_response(mpdu) {
+                MGMT_SUBTYPE_ASSOC_RESP
+                    if self.state == WlanStateCode::Associating && hdr.addr1 == self.active_mac =>
+                {
+                    if let Ok((bssid, status, _aid)) = parse_assoc_response(mpdu) {
                         if bssid == self.bssid {
-                            self.rssi_dbm = rssi;
-                            if self.supp.is_some() {
-                                self.state = WlanStateCode::Handshaking4Way;
-                                self.state_deadline_ms = now_ms + 4_000;
+                            if status != 0 {
+                                self.last_fail_status = Some(WlanStatus::AssocFailed);
                             } else {
+                                self.rssi_dbm = rssi;
+                                // Match Linux `rtw88` (`BSS_CHANGED_ASSOC`): activate `RTW_NET_MGD_LINKED`,
+                                // `AID`, and MCU `MEDIA_STATUS_RPT` / `RA_INFO` immediately upon Association
+                                // Response so EAPOL 1/4..4/4 frames are ACKed and transmitted cleanly.
                                 self.hal.configure_sta_link(&self.bssid, true);
-                                self.state = WlanStateCode::Connected;
-                                self.state_deadline_ms = 0;
-                                self.on_sta_link_established(now_ms);
+                                if self.supp.is_some() {
+                                    self.state = WlanStateCode::Handshaking4Way;
+                                    self.state_deadline_ms = now_ms + 4_500;
+                                } else {
+                                    self.state = WlanStateCode::Connected;
+                                    self.state_deadline_ms = 0;
+                                    self.on_sta_link_established(now_ms);
+                                }
                             }
                         }
                     }
                 }
                 MGMT_SUBTYPE_DEAUTH | MGMT_SUBTYPE_DISASSOC
-                    if self.state == WlanStateCode::Connected && hdr.addr2 == self.bssid =>
+                    if hdr.addr2 == self.bssid
+                        && (hdr.addr1 == self.active_mac || (hdr.addr1[0] & 1) != 0) =>
                 {
-                    self.disconnect(now_ms);
+                    match self.state {
+                        WlanStateCode::Handshaking4Way => {
+                            self.last_fail_status = Some(WlanStatus::HandshakeFailed);
+                        }
+                        WlanStateCode::Associating => {
+                            self.last_fail_status = Some(WlanStatus::AssocFailed);
+                        }
+                        WlanStateCode::Authenticating => {
+                            self.last_fail_status = Some(WlanStatus::AuthFailed);
+                        }
+                        WlanStateCode::Connected => {
+                            self.disconnect(now_ms);
+                        }
+                        _ => {}
+                    }
                 }
                 _ => {}
             },
@@ -1176,21 +1217,55 @@ impl WlanRuntime {
                 if (hdr.flags & FC_FLAG_FROM_DS) == 0 || hdr.addr2 != self.bssid {
                     return;
                 }
+                let is_bmc = (hdr.addr1[0] & 1) != 0;
+                if !is_bmc && hdr.addr1 != self.active_mac {
+                    return;
+                }
+                if (hdr.subtype & 0x04) != 0 || hdr.body.is_empty() {
+                    return;
+                }
                 let plain = if (hdr.flags & FC_FLAG_PROTECTED) != 0 {
-                    let Some(rx_c) = self.rx_ccmp.as_mut() else {
-                        return;
-                    };
-                    match rx_c.decrypt_mpdu(mpdu) {
-                        Ok(pt) => pt,
-                        Err(_) => {
-                            self.ccmp_replay_drops += 1;
+                    if is_bmc {
+                        if self.group_cipher == CIPHER_SUITE_TKIP && self.gtk_raw != [0u8; 16] {
+                            match decrypt_tkip_group_mpdu(&self.gtk_raw, mpdu) {
+                                Ok(pt) => pt,
+                                Err(_) => {
+                                    self.ccmp_replay_drops += 1;
+                                    return;
+                                }
+                            }
+                        } else {
+                            let Some(rx_g) = self.rx_gtk_ccmp.as_mut() else {
+                                return;
+                            };
+                            match rx_g.decrypt_mpdu(mpdu) {
+                                Ok(pt) => pt,
+                                Err(_) => {
+                                    self.ccmp_replay_drops += 1;
+                                    return;
+                                }
+                            }
+                        }
+                    } else {
+                        let Some(rx_c) = self.rx_ccmp.as_mut() else {
                             return;
+                        };
+                        match rx_c.decrypt_mpdu(mpdu) {
+                            Ok(pt) => pt,
+                            Err(_) => {
+                                self.ccmp_replay_drops += 1;
+                                return;
+                            }
                         }
                     }
                 } else {
                     if self.tx_ccmp.is_some() {
-                        // Drop unencrypted data once WPA2-CCMP session is active
-                        return;
+                        // Drop unencrypted non-EAPOL data once WPA2-CCMP session is active
+                        let is_eapol = parse_llc_snap_payload(hdr.body)
+                            .is_ok_and(|(et, _)| et == ETHERTYPE_EAPOL);
+                        if !is_eapol {
+                            return;
+                        }
                     }
                     hdr.body.to_vec()
                 };
@@ -1210,16 +1285,20 @@ impl WlanRuntime {
                                 false,
                             );
                             if let Some(keys) = installed {
+                                let was_connected = self.state == WlanStateCode::Connected;
                                 self.tx_ccmp = Some(CcmpContext::new(keys.ptk.tk, 0));
                                 self.rx_ccmp = Some(CcmpContext::new(keys.ptk.tk, 0));
-                                self.hal.configure_sta_link(&bssid, true);
-                                self.hal.install_ccmp_key(4, 0, &bssid, false, &keys.ptk.tk);
-                                if keys.gtk != [0u8; 16] {
-                                    self.hal.install_ccmp_key(1, 1, &bssid, true, &keys.gtk);
-                                }
+                                self.gtk_raw = keys.gtk;
+                                self.rx_gtk_ccmp = if keys.gtk != [0u8; 16] {
+                                    Some(CcmpContext::new(keys.gtk, keys.gtk_idx))
+                                } else {
+                                    None
+                                };
                                 self.state = WlanStateCode::Connected;
                                 self.state_deadline_ms = 0;
-                                self.on_sta_link_established(now_ms);
+                                if !was_connected {
+                                    self.on_sta_link_established(now_ms);
+                                }
                             }
                         }
                     }
@@ -1675,7 +1754,9 @@ impl WlanRuntime {
                 self.hal.set_channel(ch, 20);
                 let mut buf = [0u8; 128];
                 let seq = self.next_seq();
-                if let Ok(n) = build_probe_request(self.active_mac, b"", seq, &mut buf) {
+                if let Ok(n) =
+                    build_probe_request_band(self.active_mac, b"", ch > 14, seq, &mut buf)
+                {
                     self.tx_mpdu(now_ms, &buf[..n]);
                 }
                 // Dwell ~45 ms per channel (22 * 45 ms = 990 ms < 4.0 s RPC timeout),
@@ -1683,7 +1764,9 @@ impl WlanRuntime {
                 for step in 0..45u32 {
                     if step == 15 {
                         let seq2 = self.next_seq();
-                        if let Ok(n) = build_probe_request(self.active_mac, b"", seq2, &mut buf) {
+                        if let Ok(n) =
+                            build_probe_request_band(self.active_mac, b"", ch > 14, seq2, &mut buf)
+                        {
                             self.tx_mpdu(now_ms, &buf[..n]);
                         }
                     }
@@ -1722,7 +1805,7 @@ impl WlanRuntime {
             self.run_scan(now_ms);
         }
         let Some(target) = self.scan_table.find_by_ssid(ssid) else {
-            return WlanStatus::AuthFailed;
+            return WlanStatus::SsidNotFound;
         };
         if !channel_allowed(self.reg_domain, target.channel) {
             return WlanStatus::RegulatoryBlocked;
@@ -1735,6 +1818,21 @@ impl WlanRuntime {
         self.supp = None;
         self.tx_ccmp = None;
         self.rx_ccmp = None;
+        self.rx_gtk_ccmp = None;
+        self.gtk_raw = [0u8; 16];
+        self.last_fail_status = None;
+        self.ap_capab_info = target.capab_info;
+        self.group_cipher = target.group_cipher;
+
+        // Rotate `active_mac` BEFORE constructing `Supplicant4Way` so PTK/MIC use
+        // the exact same STA MAC address transmitted in Auth and AssocReq!
+        if self.mac_policy == MacPolicyMode::Random {
+            let mut rmac = [0u8; 6];
+            self.rng.fill_bytes(&mut rmac);
+            rmac[0] = (rmac[0] | 0x02) & 0xFE;
+            self.active_mac = rmac;
+            self.hal.set_mac_addr(&self.active_mac);
+        }
 
         if target.security == SecurityMode::Wpa2PskCcmp {
             let pmk = if passphrase.is_empty() {
@@ -1755,34 +1853,33 @@ impl WlanRuntime {
                 derived
             };
             let snonce = self.rng.gen_nonce32();
-            self.supp = Some(Supplicant4Way::new(
+            let rsn_ie = build_rsn_ie_with_group(target.group_cipher);
+            self.supp = Some(Supplicant4Way::new_with_rsn_ie(
                 pmk,
                 target.bssid,
                 self.active_mac,
                 snonce,
+                rsn_ie,
             ));
         } else {
             self.upsert_saved_profile(ssid, SecurityMode::Open, [0u8; 32]);
         }
 
-        if self.mac_policy == MacPolicyMode::Random {
-            let mut rmac = [0u8; 6];
-            self.rng.fill_bytes(&mut rmac);
-            rmac[0] = (rmac[0] | 0x02) & 0xFE;
-            self.active_mac = rmac;
-            self.hal.set_mac_addr(&self.active_mac);
-        }
-
         self.bssid = target.bssid;
         self.channel = target.channel;
-        self.width_mhz = if target.channel >= 36 { 80 } else { 20 };
+        // Operate on the AP's primary 20 MHz channel matching our non-HT rate set
+        // (avoids 80 MHz center-channel / VHT negotiation mismatch on 5 GHz).
+        self.width_mhz = 20;
         self.ssid.fill(0);
         self.ssid[..ssid.len()].copy_from_slice(ssid);
         self.ssid_len = ssid.len() as u8;
         self.hal.set_channel(self.channel, self.width_mhz);
         self.hal.configure_sta_link(&self.bssid, false);
+        if self.hal.is_hardware_radio() {
+            delay_us_spin(2_000);
+        }
         self.state = WlanStateCode::Authenticating;
-        self.state_deadline_ms = now_ms + 3_000;
+        self.state_deadline_ms = now_ms + 5_000;
 
         let mut buf = [0u8; 64];
         let seq = self.next_seq();
@@ -1798,9 +1895,10 @@ impl WlanRuntime {
             self.tx_mpdu(now_ms, &buf[..n]);
         }
 
-        // Wait up to ~1.5 s on real RF (or 16 ticks on virtual medium) for Auth+Assoc+4Way
+        // Wait up to ~4.0 s on real RF (or 16 ticks on virtual medium) for Auth+Assoc+4Way,
+        // retransmitting Auth / AssocReq every 250 ms if a single frame collided on air.
         let poll_iters = if self.hal.is_hardware_radio() {
-            750u64
+            2_000u64
         } else {
             16u64
         };
@@ -1808,13 +1906,64 @@ impl WlanRuntime {
             if self.hal.is_hardware_radio() {
                 delay_us_spin(2_000);
             }
-            self.pump_air(now_ms + step * 2);
+            let cur_ms = now_ms + step * 2;
+            self.pump_air(cur_ms);
             if self.state == WlanStateCode::Connected {
                 return WlanStatus::Ok;
             }
+            if self.last_fail_status.is_some() {
+                break;
+            }
+            if self.hal.is_hardware_radio() && step > 0 && (step % 125 == 0) {
+                match self.state {
+                    WlanStateCode::Authenticating => {
+                        let mut abuf = [0u8; 64];
+                        let s = self.next_seq();
+                        if let Ok(n) = build_auth_frame(
+                            self.bssid,
+                            self.active_mac,
+                            self.bssid,
+                            1,
+                            0,
+                            s,
+                            &mut abuf,
+                        ) {
+                            self.tx_mpdu(cur_ms, &abuf[..n]);
+                        }
+                    }
+                    WlanStateCode::Associating => {
+                        let sec = if self.supp.is_some() {
+                            SecurityMode::Wpa2PskCcmp
+                        } else {
+                            SecurityMode::Open
+                        };
+                        let mut rbuf = [0u8; 224];
+                        let s = self.next_seq();
+                        if let Ok(n) = build_assoc_request_for_bss(
+                            self.bssid,
+                            self.active_mac,
+                            &self.ssid[..self.ssid_len as usize],
+                            self.channel,
+                            self.ap_capab_info,
+                            sec,
+                            self.group_cipher,
+                            s,
+                            &mut rbuf,
+                        ) {
+                            self.tx_mpdu(cur_ms, &rbuf[..n]);
+                        }
+                    }
+                    _ => {}
+                }
+            }
         }
-        self.disconnect(now_ms + 1_500);
-        WlanStatus::AuthFailed
+        let fail_st = self.last_fail_status.unwrap_or(match self.state {
+            WlanStateCode::Associating => WlanStatus::AssocFailed,
+            WlanStateCode::Handshaking4Way => WlanStatus::HandshakeFailed,
+            _ => WlanStatus::AuthFailed,
+        });
+        self.disconnect(now_ms + 4_000);
+        fail_st
     }
 
     fn start_softap(&mut self, now_ms: u64, ch: u8, ssid: &[u8], passphrase: &[u8]) -> WlanStatus {
@@ -1907,11 +2056,18 @@ impl WlanRuntime {
     }
 
     fn disconnect(&mut self, now_ms: u64) {
-        if self.state == WlanStateCode::Connected {
-            let mut buf = [0u8; 64];
-            let seq = self.next_seq();
-            if let Ok(n) = build_deauth(self.bssid, self.active_mac, self.bssid, 3, seq, &mut buf) {
-                self.tx_mpdu(now_ms, &buf[..n]);
+        if matches!(
+            self.state,
+            WlanStateCode::Connected | WlanStateCode::Handshaking4Way | WlanStateCode::Associating
+        ) {
+            if self.state == WlanStateCode::Connected {
+                let mut buf = [0u8; 64];
+                let seq = self.next_seq();
+                if let Ok(n) =
+                    build_deauth(self.bssid, self.active_mac, self.bssid, 3, seq, &mut buf)
+                {
+                    self.tx_mpdu(now_ms, &buf[..n]);
+                }
             }
             self.hal.configure_sta_link(&[0; 6], false);
         } else if self.state == WlanStateCode::SoftAp {
@@ -1932,6 +2088,9 @@ impl WlanRuntime {
         self.supp = None;
         self.tx_ccmp = None;
         self.rx_ccmp = None;
+        self.rx_gtk_ccmp = None;
+        self.gtk_raw = [0u8; 16];
+        self.last_fail_status = None;
         self.softap = None;
         self.bssid = [0; 6];
         self.ssid.fill(0);
@@ -2320,9 +2479,14 @@ pub extern "C" fn _start() -> ! {
         ccmp_replay_drops: 0,
         scan_table: ScanTable::new(),
         profiles: Vec::new(),
+        ap_capab_info: 0,
+        group_cipher: CIPHER_SUITE_CCMP,
+        gtk_raw: [0u8; 16],
+        last_fail_status: None,
         supp: None,
         tx_ccmp: None,
         rx_ccmp: None,
+        rx_gtk_ccmp: None,
         softap: None,
         local_net: NetStack::new(MacAddr(factory_mac)),
         last_autoconnect_try_ms: 0,

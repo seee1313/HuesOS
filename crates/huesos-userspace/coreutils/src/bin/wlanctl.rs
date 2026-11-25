@@ -22,6 +22,7 @@ use huesos_abi::wlan::{
 use huesos_coreutils as cu;
 use huesos_std::io;
 use huesos_std::net;
+use huesos_std::thread;
 use huesos_std::time::Duration;
 use huesos_std::tui::{self, ansi, bg_rgb, fg_rgb, FrameBuffer, Key};
 use huesos_std::{Error, ErrorKind};
@@ -992,6 +993,15 @@ fn run() -> i32 {
             let psk = args.get(2).map(String::as_str).unwrap_or("");
             match net::wlan_connect(ssid, psk) {
                 Ok(()) => {
+                    // Allow up to ~1.5 s for DHCPv4 over the newly established WPA2 link
+                    for _ in 0..15 {
+                        if let Ok(ns) = net::status() {
+                            if ns.ifaces[usize::from(iface_id::WLAN0)].ipv4 != [0, 0, 0, 0] {
+                                break;
+                            }
+                        }
+                        thread::sleep(Duration::from_millis(100));
+                    }
                     cu::outln(&format!("wlanctl: connected to '{ssid}'"));
                     cmd_status()
                 }

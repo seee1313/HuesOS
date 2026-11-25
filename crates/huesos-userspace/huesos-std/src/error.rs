@@ -39,6 +39,26 @@ pub enum ErrorKind {
     TimedOut,
     /// The call would block; the caller should wait and try again.
     ShouldWait,
+    /// No active network link, IPv4 lease, or default route is available.
+    NetworkUnreachable,
+    /// Target host or subnet could not be reached via ARP or routing table.
+    HostUnreachable,
+    /// Remote peer refused or reset the TCP connection.
+    ConnectionRefused,
+    /// DNS hostname could not be resolved (`NXDOMAIN` / no `A` record).
+    DnsFailure,
+    /// Target Wi-Fi SSID was not found on any scanned channel.
+    SsidNotFound,
+    /// Access Point rejected or did not answer 802.11 Authentication.
+    AuthFailed,
+    /// Access Point rejected 802.11 Association (rate/cipher/capability mismatch).
+    AssocFailed,
+    /// WPA2 4-way EAPOL handshake failed or timed out (commonly wrong password).
+    HandshakeFailed,
+    /// WPA2 passphrase length or format is invalid (`8..=63` ASCII bytes required).
+    InvalidPassphrase,
+    /// Target Wi-Fi channel is blocked by the active regulatory domain.
+    RegulatoryBlocked,
     /// Anything the code table does not name.
     Other,
 }
@@ -59,6 +79,16 @@ impl ErrorKind {
             Self::PeerClosed => "peer closed",
             Self::TimedOut => "timed out",
             Self::ShouldWait => "would block",
+            Self::NetworkUnreachable => "network is unreachable",
+            Self::HostUnreachable => "no route to host",
+            Self::ConnectionRefused => "connection refused",
+            Self::DnsFailure => "name or service not known",
+            Self::SsidNotFound => "Wi-Fi network (SSID) not found",
+            Self::AuthFailed => "802.11 authentication failed",
+            Self::AssocFailed => "802.11 association rejected by AP",
+            Self::HandshakeFailed => "WPA2 handshake failed (wrong password or timeout)",
+            Self::InvalidPassphrase => "invalid WPA2 passphrase (expected 8..63 chars)",
+            Self::RegulatoryBlocked => "Wi-Fi channel blocked by regulatory domain",
             Self::Other => "error",
         }
     }
