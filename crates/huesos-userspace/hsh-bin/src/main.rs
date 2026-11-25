@@ -828,6 +828,30 @@ impl InteractiveShell {
             Err(e) => println!("[hsh] pci.elf pipe ERROR: {}", e),
         }
 
+        // 3b. External `/bin/pci.elf -v` zero-bus-traffic HPIN + IOMMU report
+        match smoke_env.eval_script("pci -v", &mut self.host) {
+            Ok(res) if res.status == 0 => {
+                let text = res.render_text();
+                if text.contains("HPIN v1")
+                    && text.contains("IOMMU hw=")
+                    && text.contains("dma_isolation=trusted")
+                {
+                    println!("[hsh] pci.elf -v HPIN+IOMMU OK");
+                } else {
+                    println!(
+                        "[hsh] pci.elf -v HPIN+IOMMU FAILED missing markers out={}",
+                        text
+                    );
+                }
+            }
+            Ok(res) => println!(
+                "[hsh] pci.elf -v HPIN+IOMMU FAILED status={} out={}",
+                res.status,
+                res.render_text()
+            ),
+            Err(e) => println!("[hsh] pci.elf -v HPIN+IOMMU ERROR: {}", e),
+        }
+
         // 4. External `/bin/hxfs.elf` status
         match smoke_env.eval_script(
             "hxfs status | where property == capability | select value",

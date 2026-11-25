@@ -16,6 +16,7 @@ use huesos_abi::acpi_archive::{
 use huesos_abi::acpi_broker::{ArchiveError, MAX_ARCHIVE_BYTES};
 use huesos_abi::acpi_manager;
 use huesos_abi::hmcf;
+use huesos_abi::pci_iommu;
 use libcanvas::{println, wait_any, Channel, ErrorCode, Signals, Vmar, Vmo, WaitItem};
 
 #[global_allocator]
@@ -113,6 +114,7 @@ pub extern "C" fn _start() -> ! {
     // the lifecycle continues fail-closed (no HMCF, no config
     // authority downstream).
     let hmcf_image = publish_hmcf(&bootstrap, generation, &archive, &summary);
+    let hiom_image = encode_hiom_from_archive(generation, &archive, &summary);
 
     let Some(self_vmar) = inputs.self_vmar.take() else {
         send_failure(
@@ -250,6 +252,7 @@ pub extern "C" fn _start() -> ! {
             generation,
             summary.firmware_snapshot_id,
             hmcf_image.as_ref().map(|(buf, len)| &buf[..*len]),
+            hiom_image.as_ref().map(|(buf, len)| &buf[..*len]),
         );
         let elapsed = now.saturating_sub(last_heartbeat);
         let timeout_ticks = 100u64.saturating_sub(elapsed).clamp(1, 100);
@@ -275,6 +278,7 @@ pub extern "C" fn _start() -> ! {
 /// (once per `acpi-manager` generation) execute AP-14 namespace
 /// initialization (`_PIC(IOAPIC)`, `_REG`, `_STA`, `_INI`) followed by AP-15
 /// `HPCI` root-bridge publication when eligible.
+#[allow(clippy::too_many_arguments)]
 fn drain_mediation_bootstrap(
     bootstrap: &Channel,
     pending_mediation: &mut Option<Channel>,
@@ -283,6 +287,7 @@ fn drain_mediation_bootstrap(
     generation: u64,
     firmware_snapshot_id: u64,
     hmcf_bytes: Option<&[u8]>,
+    hiom_bytes: Option<&[u8]>,
 ) {
     let mut bytes = [0u8; 64];
     for _ in 0..4 {
@@ -312,6 +317,7 @@ fn drain_mediation_bootstrap(
                                         generation,
                                         firmware_snapshot_id,
                                         hmcf_bytes,
+                                        hiom_bytes,
                                     );
                                 }
                             }
@@ -330,6 +336,7 @@ fn run_namespace_initialize(
     generation: u64,
     firmware_snapshot_id: u64,
     hmcf_bytes: Option<&[u8]>,
+    hiom_bytes: Option<&[u8]>,
 ) {
     match huesos_uacpi_runtime::namespace::initialize_namespace(firmware_snapshot_id) {
         Ok(init) => {
@@ -344,7 +351,11 @@ fn run_namespace_initialize(
             let mut detail_flags = init.detail_flags;
             if init.hpci_eligible {
                 if let Some(hmcf) = hmcf_bytes {
-                    if !publish_hpci(bootstrap, generation, firmware_snapshot_id, hmcf) {
+                    if publish_hpci(bootstrap, generation, firmware_snapshot_id, hmcf) {
+                        if let Some(hiom) = hiom_bytes {
+                            publish_hiom(bootstrap, generation, firmware_snapshot_id, hiom);
+                        }
+                    } else {
                         detail_flags |= acpi_manager::INIT_DETAIL_AML_ERROR;
                     }
                 } else {
@@ -792,6 +803,221 @@ const fn archive_error_name(error: ArchiveError) -> &'static str {
         ArchiveError::Capacity => "capacity",
         ArchiveError::Read => "short VMO read",
     }
+}
+
+#[inline(never)]
+fn encode_hiom_from_archive(
+    generation: u64,
+    archive: &Vmo,
+    summary: &ArchiveSummary,
+) -> Option<([u8; pci_iommu::MAX_BYTES], usize)> {
+    const MAX_IOMMU_SDT_BYTES: usize = 4096;
+
+    let mut header = [0u8; huesos_abi::acpi_archive::HEADER_BYTES];
+    if !vmo_read_exact(archive, 0, &mut header) {
+        return None;
+    }
+    let Ok(header_v2) = huesos_abi::acpi_archive::decode_v2_header(&header) else {
+        return None;
+    };
+    if header_v2.firmware_snapshot_id != summary.firmware_snapshot_id {
+        return None;
+    }
+
+    let mut dmar_loc: Option<(u64, u32)> = None;
+    let mut ivrs_loc: Option<(u64, u32)> = None;
+    let mut ambiguous_or_oversized = false;
+
+    for index in 0..header_v2.table_count {
+        let entry_offset =
+            header_v2.table_entries_offset + u64::from(index) * TABLE_ENTRY_BYTES as u64;
+        let mut entry_bytes = [0u8; TABLE_ENTRY_BYTES];
+        if !vmo_read_exact(archive, entry_offset, &mut entry_bytes) {
+            return None;
+        }
+        let Ok(entry) = huesos_abi::acpi_archive::decode_v2_table_entry(&entry_bytes) else {
+            return None;
+        };
+        if &entry.signature == b"DMAR" {
+            if dmar_loc.is_some() || (entry.length as usize) > MAX_IOMMU_SDT_BYTES {
+                ambiguous_or_oversized = true;
+            } else {
+                dmar_loc = Some((entry.offset, entry.length));
+            }
+        } else if &entry.signature == b"IVRS" {
+            if ivrs_loc.is_some() || (entry.length as usize) > MAX_IOMMU_SDT_BYTES {
+                ambiguous_or_oversized = true;
+            } else {
+                ivrs_loc = Some((entry.offset, entry.length));
+            }
+        }
+    }
+
+    let mut dmar_buf = [0u8; MAX_IOMMU_SDT_BYTES];
+    let mut ivrs_buf = [0u8; MAX_IOMMU_SDT_BYTES];
+
+    let snapshot = if ambiguous_or_oversized {
+        pci_iommu::IommuSnapshot::trusted_fallback(
+            summary.firmware_snapshot_id,
+            generation,
+            pci_iommu::IommuHardwareKind::None,
+            pci_iommu::IommuDiscoveryStatus::ConflictFallbackTrusted,
+        )
+    } else {
+        let dmar_slice = match dmar_loc {
+            Some((offset, len)) => {
+                let len = len as usize;
+                if !vmo_read_exact(archive, offset, &mut dmar_buf[..len]) {
+                    return None;
+                }
+                Some(&dmar_buf[..len])
+            }
+            None => None,
+        };
+        let ivrs_slice = match ivrs_loc {
+            Some((offset, len)) => {
+                let len = len as usize;
+                if !vmo_read_exact(archive, offset, &mut ivrs_buf[..len]) {
+                    return None;
+                }
+                Some(&ivrs_buf[..len])
+            }
+            None => None,
+        };
+        let report = huesos_pci::iommu::discover_from_acpi_tables(dmar_slice, ivrs_slice);
+        report_to_hiom_snapshot(summary.firmware_snapshot_id, generation, &report)
+    };
+
+    let mut encoded = [0u8; pci_iommu::MAX_BYTES];
+    let len = pci_iommu::encode(&snapshot, &mut encoded).ok()?;
+    Some((encoded, len))
+}
+
+fn report_to_hiom_snapshot(
+    firmware_snapshot_id: u64,
+    producer_generation: u64,
+    report: &huesos_pci::iommu::IommuDiscoveryReport,
+) -> pci_iommu::IommuSnapshot {
+    use huesos_pci::iommu::{FirmwareIommuKind, FirmwareIommuStatus};
+    use huesos_pci::lease::DmaIsolation;
+
+    let hardware_kind = match report.kind {
+        FirmwareIommuKind::None => pci_iommu::IommuHardwareKind::None,
+        FirmwareIommuKind::IntelVtd => pci_iommu::IommuHardwareKind::IntelVtd,
+        FirmwareIommuKind::AmdVi => pci_iommu::IommuHardwareKind::AmdVi,
+    };
+    let discovery_status = match report.status {
+        FirmwareIommuStatus::Absent => pci_iommu::IommuDiscoveryStatus::Absent,
+        FirmwareIommuStatus::Valid => pci_iommu::IommuDiscoveryStatus::Valid,
+        FirmwareIommuStatus::MalformedFallbackTrusted => {
+            pci_iommu::IommuDiscoveryStatus::MalformedFallbackTrusted
+        }
+        FirmwareIommuStatus::ConflictFallbackTrusted => {
+            pci_iommu::IommuDiscoveryStatus::ConflictFallbackTrusted
+        }
+    };
+    let active_mode = match report.active_dma_isolation {
+        DmaIsolation::Trusted => pci_iommu::IommuMode::Trusted,
+        DmaIsolation::IommuDomain(_) => pci_iommu::IommuMode::Isolated,
+    };
+    let mut flags = 0u8;
+    if report.interrupt_remapping_supported {
+        flags |= pci_iommu::FLAG_INTR_REMAP_HW_SUPPORTED;
+    }
+    if report.interrupt_remapping_active {
+        flags |= pci_iommu::FLAG_INTR_REMAP_ACTIVE;
+    }
+    if report.x2apic_opt_out {
+        flags |= pci_iommu::FLAG_X2APIC_OPT_OUT;
+    }
+
+    let unit_count = report.unit_count.min(pci_iommu::MAX_UNITS);
+    let mut units = [pci_iommu::IommuUnitDesc::ZERO; pci_iommu::MAX_UNITS];
+    for (dst, src) in units.iter_mut().zip(report.units.iter()).take(unit_count) {
+        *dst = pci_iommu::IommuUnitDesc {
+            segment: src.segment,
+            flags: if src.include_pci_all {
+                pci_iommu::UNIT_FLAG_INCLUDE_PCI_ALL
+            } else {
+                0
+            },
+            scope_bdf_count: src.scope_bdf_count,
+            register_base: src.register_base,
+            scope_bdfs: src.scope_bdfs,
+        };
+    }
+
+    let region_count = report.region_count.min(pci_iommu::MAX_REGIONS);
+    let mut regions = [pci_iommu::IommuReservedRegion::ZERO; pci_iommu::MAX_REGIONS];
+    for (dst, src) in regions
+        .iter_mut()
+        .zip(report.regions.iter())
+        .take(region_count)
+    {
+        *dst = pci_iommu::IommuReservedRegion {
+            segment: src.segment,
+            requester_bdf: src.requester_bdf,
+            flags: src.flags,
+            base_address: src.base_address,
+            limit_address: src.limit_address,
+        };
+    }
+
+    pci_iommu::IommuSnapshot {
+        firmware_snapshot_id,
+        producer_generation,
+        hardware_kind,
+        discovery_status,
+        active_mode,
+        flags,
+        host_address_width: report.host_address_width,
+        unit_count,
+        units,
+        region_count,
+        regions,
+    }
+}
+
+fn publish_hiom(
+    bootstrap: &Channel,
+    generation: u64,
+    firmware_snapshot_id: u64,
+    hiom_bytes: &[u8],
+) {
+    let Ok(snapshot) = pci_iommu::decode(hiom_bytes) else {
+        return;
+    };
+    let Ok(vmo) = Vmo::create(hiom_bytes.len() as u64) else {
+        println!("[acpi-manager] failed to create HIOM VMO");
+        return;
+    };
+    if vmo.write(0, hiom_bytes) != Ok(hiom_bytes.len()) {
+        println!("[acpi-manager] short write to HIOM VMO");
+        return;
+    }
+    let rights =
+        huesos_abi::rights::READ | huesos_abi::rights::DUPLICATE | huesos_abi::rights::TRANSFER;
+    let Ok(duplicate) = vmo.duplicate(rights) else {
+        println!("[acpi-manager] failed to narrow HIOM VMO rights");
+        return;
+    };
+    drop(vmo);
+    if bootstrap
+        .write_handle(acpi_manager::IOMMU_VMO_LABEL, duplicate.into_handle())
+        .is_err()
+    {
+        println!("[acpi-manager] failed to publish HIOM VMO");
+        return;
+    }
+    println!(
+        "[acpi-manager] published HIOM (gen {}, snapshot {}, hw={}, status={}, units={}, regions={})",
+        generation,
+        firmware_snapshot_id,
+        snapshot.hardware_kind.label(),
+        snapshot.discovery_status.label(),
+        snapshot.unit_count,
+        snapshot.region_count
+    );
 }
 
 #[panic_handler]

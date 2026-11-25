@@ -19,6 +19,9 @@ pub const HMCF_VMO_LABEL: &[u8] = b"acpi-hmcf-vmo";
 /// `acpi-manager` transfers the validated `HPCI` PCI root-bridge table with
 /// this label. The VMO carries `READ | DUPLICATE | TRANSFER` rights only.
 pub const HPCI_VMO_LABEL: &[u8] = b"acpi-hpci-vmo";
+/// `acpi-manager` transfers the validated `HIOM` IOMMU firmware discovery
+/// snapshot (`DMAR`/`IVRS`) with this label (`READ | DUPLICATE | TRANSFER`).
+pub const IOMMU_VMO_LABEL: &[u8] = b"acpi-iommu-vmo";
 /// Test-only hello detail: generation one exits before readiness.
 pub const HELLO_FLAG_INJECT_PRE_READY_EXIT: u32 = 1 << 0;
 /// Test-only hello detail: the second generation exits right after readiness

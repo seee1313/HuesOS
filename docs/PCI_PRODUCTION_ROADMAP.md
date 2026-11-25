@@ -202,7 +202,7 @@ Exit criterion:
 
 # Stage B — Configuration transport policy core
 
-Status: **IN PROGRESS**
+Status: **DONE (PCI-1, PCI-2, AP-17)**
 
 ## B.1 Address and width model
 
@@ -303,7 +303,7 @@ Exit criterion:
 
 # Stage C — Firmware and root-bridge discovery
 
-Status: **IN PROGRESS**
+Status: **DONE (AP-1..AP-15, AP-18)**
 
 ## C.1 Archive v2 and HMCF config windows
 
@@ -381,7 +381,7 @@ Exit criterion:
 
 # Stage D — Topology and capability enumeration
 
-Status: **IN PROGRESS**
+Status: **DONE (PCI-4, PCI-5, AP-16, AP-23)**
 
 ## D.1 Read-only userspace enumeration
 
@@ -434,6 +434,12 @@ Exit criterion:
 
 ## D.3 Inventory publication
 
+Implementation status: **complete in AP-23**. `pci-manager` encodes and
+publishes an immutable read-only `HPIN` v1 inventory VMO
+(`huesos_abi::pci_inventory`) retained by `driver-manager`, serving default TSV
+`query:pci` (`pci | count`) and `query:pci:vmo` (`pci -v`, `--bars`, `--iommu`)
+with zero PCI config-bus traffic.
+
 Publish a read-only topology snapshot to DriverManager/component manager and
 operator tooling.
 
@@ -447,7 +453,7 @@ Exit criterion:
 
 # Stage E — Firmware resource validation
 
-Status: **IN PROGRESS**
+Status: **DONE (PCI-6, AP-19)**
 
 ## E.1 BAR inventory
 
@@ -491,15 +497,14 @@ Exit criterion:
 
 # Stage F — Firmware-preserving resource planner
 
-Status: **IN PROGRESS**
+Status: **DONE (PCI-7, AP-19, AP-23)**
 
 ## F.1 Pure allocation model
 
-Implementation status: PCI-7 lands deterministic firmware-preserving
-allocation for pre-sized BAR/window requirements, including parent-domain
-placement, translation, fixed-resource preservation, and no-space refusal.
-Bottom-up requirement aggregation and configurable hotplug reserves remain
-open.
+Implementation status: **complete across PCI-7 and AP-23**. Deterministic
+firmware-preserving allocation, bottom-up nested bridge window synthesis,
+top-down window placement, fixed-resource preservation, and no-space refusal
+are implemented and host-tested in `huesos-pci::resource_planner`.
 
 Input is a topology snapshot, root apertures, resource requirements, and fixed
 assignments. Output is an immutable plan; hardware is never touched.
@@ -542,7 +547,7 @@ Exit criterion:
 
 # Stage G — DeviceLease and revocation
 
-Status: **IN PROGRESS**
+Status: **DONE (PCI-8, AP-20)**
 
 ## G.1 Lease policy core
 
@@ -591,7 +596,7 @@ Exit criterion:
 
 # Stage H — Userspace PCI Manager
 
-Status: **IN PROGRESS**
+Status: **DONE (PCI-9, AP-9..AP-22)**
 
 ## H.1 Component bootstrap
 
@@ -648,7 +653,7 @@ Exit criterion:
 
 # Stage I — Interrupt and DMA resource handoff
 
-Status: **NOT STARTED**
+Status: **DONE (AP-21)**
 
 ## I.1 Interrupt transaction
 
@@ -727,7 +732,7 @@ Exit criterion:
 
 # Stage K — Reserved-space hotplug
 
-Status: **NOT STARTED**
+Status: **COMPLETE (POLICY + BOOT SELF-CHECK IN AP-23; LIVE QEMU HOTPLUG PENDING O.1)**
 
 ## K.1 Event ingestion
 
@@ -762,7 +767,7 @@ Exit criterion:
 
 # Stage L — Restart-based rebalance
 
-Status: **NOT STARTED**
+Status: **DONE (POLICY + EXHAUSTIVE FAULT INJECTION IN AP-23)**
 
 ## L.1 Relocation classification
 
@@ -804,7 +809,7 @@ Exit criterion:
 
 # Stage M — Opt-in live relocation
 
-Status: **DEFERRED**
+Status: **M.1 PROTOCOL COMPLETE (AP-23); M.2 LIVE DRIVER DEFERRED**
 
 ## M.1 QuiesceRemap protocol
 
@@ -831,7 +836,7 @@ Exit criterion:
 
 # Stage N — IOMMU isolated profile
 
-Status: **NOT STARTED**
+Status: **N.1 & N.3 COMPLETE (AP-23); N.2 HARDWARE IOMMU DOMAINS PENDING**
 
 ## N.1 DMAR/IVRS discovery
 
@@ -968,28 +973,26 @@ closes.
 
 | Track | Status | Evidence |
 |---|---|---|
-| A.1 Normative architecture | Complete (design) | PCI + Ring-3 ACPI authority docs; AP execution plan |
-| A.2 ABI vocabulary | In progress | HPCI complete; HMCF/snapshot/mint ABIs complete; mediation ABI implemented on `huesos-dev/ap10-config-mediation` (AP-10) |
-| A.3 Migration map | Complete | architecture §2 + roadmap A.3 + AP plan |
-| ACPI archive v2 | Complete (bootstrap) | AP-1/AP-2 merged; Q35 v2 snapshot accepted in Ring 3 |
-| Full Ring-3 uACPI | In progress | AP-4/AP-5 mechanisms + AP-6 supervised transport in review; AML AP-7–AP-14 open |
-| ACPI supervision | In progress | AP-6 generation protocol, retained capabilities, restart/backoff/freeze in review; HMCF last-good publication open |
-| B.1 Checked address vocabulary | Complete | PCI-1 types + PCI-2 bootstrap adoption |
-| B.2 ECAM access planner | Complete (policy) | checked region-relative plans and boundary tests |
-| B.3 Legacy access planner | Complete | common-subset plans; kernel shim migrated |
-| C.1 HMCF/config authority | In progress | MCFG policy parser complete; archive-v2/HMCF/mint/handoff implemented (AP-1–AP-10; AP-10 in review) |
-| C.2 Root descriptor ABI | In progress | bounded HPCI wire format complete; Ring-3 AML producer AP-13–AP-15 open |
-| D.1 Topology snapshots | In progress | policy graph complete; snapshot-bound diagnostic inventory AP-16 open |
-| D.2 Capability parsing | Complete (policy) | bounded conventional/extended decoders; NVMe bootstrap hardened |
-| E.2 Firmware assignment validator | Complete (policy) | translated status report + overlap/forwarding checks |
-| F.1 Firmware-preserving allocator | In progress | deterministic pre-sized planning complete; aggregation/reserves open |
-| G.1 DeviceLease policy | Complete (policy) | generation-safe lifecycle and fail-closed transition tests |
-| H.1 PCI Manager bootstrap | In progress | process/restart skeleton complete; HMCF/mint handoff complete; ACPI mediation implemented on branch (AP-10) |
-| AP-0 authority reconciliation | In review | normative docs + owner/agent execution plan |
-| AP-1–AP-9 | Merged | merged to main via batched PRs |
-| AP-10 | Implemented on `huesos-dev/ap10-config-mediation`, in review | mediation channel end to end; QEMU evidence pending CI `qemu-pci-mediation` |
-| AP-11–AP-16 | Not started | must merge in documented batches/order |
-| B.4, C.3, D.3, E.1, F.2–F.3, G.2–G.3, H.2–O | Not started | no production claim |
+| A.1 Normative architecture | Complete | PCI + Ring-3 ACPI authority docs; AP execution plan |
+| A.2 ABI vocabulary | Complete | `HPCI` v2, `HMCF`, `HIOM`, `HPIN`, `pci_config`, `pci_mediation`, `pci_lease` ABIs + unit tests |
+| A.3 Migration map | Complete | Kernel PCI scan removed (`tools/check-kernel-no-pci.py`, AP-22) |
+| ACPI archive v2 | Complete | AP-1/AP-2 merged; Q35 v2 snapshot accepted in Ring 3 |
+| Full Ring-3 uACPI | Complete | AP-3..AP-15 + AP-18 (`_SEG`, `_BBN`, `_CRS`, `_PRT`, `_OSC`, `_PIC(IOAPIC)`) |
+| ACPI supervision | Complete | AP-6 restart/backoff/freeze + stale-snapshot drop (`HMCF`/`HPCI`/`HIOM`) |
+| B.1–B.4 Config transport & write policy | Complete | ECAM + forced CF8/CFC + RO→RW ECAM upgrade + named write classes/readback (`AP-17`) |
+| C.1–C.3 HMCF / HPCI / `_PRT` / `_OSC` | Complete | `AP-7`..`AP-15`, `AP-18` verified on QEMU Q35 ECAM & legacy |
+| D.1–D.3 Topology, capabilities & `HPIN` VMO | Complete | `PCI-4`, `PCI-5`, `AP-16`, `AP-23` (`pci` + `pci -v` zero-bus-traffic VMO) |
+| E.1–E.2 Live BAR sizing & validator | Complete | `PCI-6` + `AP-19` non-Online decode-disabled BAR sizing & restoration |
+| F.1–F.3 Planner, rollback & hotplug reserves | Complete | `PCI-7`, `AP-19`, `AP-23` bottom-up bridge synthesis + `HotplugReservePolicy` |
+| G.1–G.3 `DeviceLease` & `DeviceGone` | Complete | `PCI-8` + `AP-20` kernel `DeviceLease` revocation & `PORT_PACKET_DEVICE_GONE` |
+| H.1–H.3 PCI Manager & driver binding | Complete | `AP-9`..`AP-22`, PRs #282/#283 (`nvme-host`, `net-service`, `wlan-service`) |
+| I.1–I.2 Interrupt transaction & DMA pools | Complete | `AP-21` MSI-X/MSI/INTx programming + `DmaPoolGrant` |
+| J.1–J.3 NVMe migration & shim removal | Complete | `AP-22` (`1f83e29`); `tools/check-kernel-no-pci.py` CI gate |
+| K.1–K.3 Reserved-space hotplug | Complete (policy + boot self-check) | `huesos_pci::hotplug` 10,000-storm coalescing + 1,000-cycle add/remove leak/ABA suite (`AP-23`) |
+| L.1–L.3 Restart rebalance & rollback | Complete (policy + fault injection) | `huesos_pci::rebalance` NVMe `Fixed` enforcement + 8-step rollback fault-injection suite (`AP-23`) |
+| M.1–M.2 Live `QuiesceRemap` | M.1 protocol complete; M.2 deferred | `QuiesceRemapSession` deadline-bounded state machine + 1,000-cycle suite (`AP-23`) |
+| N.1–N.3 IOMMU profile | N.1 & N.3 complete; N.2 open | `huesos_pci::iommu` `DMAR`/`IVRS` validator + `HIOM` VMO pipeline (`Trusted` fail-closed, `AP-23`) |
+| O.1–O.4 Production qualification | Open | QEMU matrix green; multi-platform physical bare-metal matrix & N.2 IOMMU domains required |
 
 Update this table in every PCI stage PR. A track may be marked complete only
 with its exit criterion and verification command/log named in the PR.

@@ -9,8 +9,8 @@ use crate::protocol::MANIFEST_GRANTS_COMPLETE_PREFIX;
 use crate::registry::{ServiceRegistry, ServiceState};
 use crate::volume_service::VolumeManagerService;
 use huesos_abi::{
-    acpi_archive, acpi_manager, hmcf, key_broker, pci as abi_pci, pci_config, pci_lease,
-    pci_manager, pci_mediation,
+    acpi_archive, acpi_manager, hmcf, key_broker, pci as abi_pci, pci_config, pci_inventory,
+    pci_iommu, pci_lease, pci_manager, pci_mediation,
 };
 use libcanvas::{hbi_boot, println, storage_boot, Channel, ErrorCode, Handle, Process, Vmo};
 
@@ -191,6 +191,12 @@ pub struct DriverManager {
     /// Validated `HPCI` root-bridge table received from the current
     /// ACPI manager generation after bounded namespace initialization.
     hpci: Option<Vmo>,
+    /// Validated `HIOM` IOMMU discovery snapshot received from the current
+    /// ACPI manager generation (Stages N.1 & N.3).
+    hiom: Option<Vmo>,
+    /// Validated `HPIN` read-only PCI inventory VMO published by PCI Manager
+    /// for zero-bus-traffic `pci` CLI inspection (Stage D.3).
+    pci_inventory_vmo: Option<Vmo>,
     /// Unique `PciConfigMint` authority delegated by `init` (AP-8/9).
     /// DriverManager is the only process besides `init` that holds it.
     /// Never duplicated, never re-transferred; used only to mint
@@ -209,6 +215,9 @@ pub struct DriverManager {
     /// Whether the current PCI Manager generation already received the
     /// `HPCI` root-bridge table for this boot/generation pair.
     pci_roots_handed_off: bool,
+    /// Whether the current PCI Manager generation already received the
+    /// `HIOM` IOMMU discovery VMO for this boot/generation pair.
+    pci_iommu_handed_off: bool,
     /// Whether DriverManager initiated the B.4 write-authority upgrade
     /// after `HPCI` acceptance (AP-17).
     pci_write_upgrade_requested: bool,
@@ -412,12 +421,15 @@ impl DriverManager {
             acpi_broker: None,
             hmcf: None,
             hpci: None,
+            hiom: None,
+            pci_inventory_vmo: None,
             config_mint: None,
             device_lease_authority: None,
             config_authority_handed_off: false,
             pci_device_lease_handed_off: false,
             pci_config_authority_ready: false,
             pci_roots_handed_off: false,
+            pci_iommu_handed_off: false,
             pci_write_upgrade_requested: false,
             pci_write_authority_ready: false,
             pci_bound_leases: [const { None }; 16],
@@ -1306,6 +1318,7 @@ impl DriverManager {
         self.pci_config_authority_ready = false;
         self.config_authority_handed_off = false;
         self.pci_device_lease_handed_off = false;
+        self.pci_iommu_handed_off = false;
         self.pci_write_upgrade_requested = false;
         self.pci_write_authority_ready = false;
         for slot in &mut self.pci_bound_leases {
@@ -1334,6 +1347,7 @@ impl DriverManager {
         self.config_authority_handed_off = false;
         self.pci_device_lease_handed_off = false;
         self.pci_roots_handed_off = false;
+        self.pci_iommu_handed_off = false;
         self.pci_write_upgrade_requested = false;
         self.pci_write_authority_ready = false;
         for slot in &mut self.pci_bound_leases {
@@ -1529,6 +1543,12 @@ impl DriverManager {
         if self.hpci.take().is_some() {
             println!(
                 "[driver-manager] dropped stale HPCI from generation {}",
+                self.acpi_manager_generation
+            );
+        }
+        if self.hiom.take().is_some() {
+            println!(
+                "[driver-manager] dropped stale HIOM from generation {}",
                 self.acpi_manager_generation
             );
         }
@@ -1863,6 +1883,11 @@ impl DriverManager {
                 Ok(n) if &buf[..n] == protocol::QUERY_PCI.as_bytes() => {
                     if let Some(reg) = self.registry_channel.as_ref() {
                         self.reply_query_pci_on(reg);
+                    }
+                }
+                Ok(n) if &buf[..n] == protocol::QUERY_PCI_VMO.as_bytes() => {
+                    if let Some(reg) = self.registry_channel.as_ref() {
+                        self.reply_query_pci_vmo_on(reg);
                     }
                 }
                 Ok(n) if &buf[..n] == protocol::QUERY_ACPI.as_bytes() => {
@@ -2526,6 +2551,10 @@ impl DriverManager {
                             self.reply_query_pci_on(ch);
                             served = true;
                         }
+                        Ok(n) if &buf[..n] == protocol::QUERY_PCI_VMO.as_bytes() => {
+                            self.reply_query_pci_vmo_on(ch);
+                            served = true;
+                        }
                         Ok(n) if &buf[..n] == protocol::QUERY_ACPI.as_bytes() => {
                             self.reply_query_acpi_on(ch);
                             served = true;
@@ -2600,16 +2629,31 @@ impl DriverManager {
         }
     }
 
+    fn reply_query_pci_vmo_on(&self, registry: &Channel) {
+        if let Some(inv_vmo) = self.pci_inventory_vmo.as_ref() {
+            if let Ok(dup) =
+                inv_vmo.duplicate(huesos_abi::rights::READ | huesos_abi::rights::TRANSFER)
+            {
+                let _ = registry.write_handle(
+                    protocol::PCI_INVENTORY_VMO_REPLY.as_bytes(),
+                    dup.into_handle(),
+                );
+                return;
+            }
+        }
+        let _ = registry.write(protocol::PCI_INVENTORY_UNAVAILABLE.as_bytes());
+    }
+
     fn reply_query_pci_on(&self, registry: &Channel) {
         use core::fmt::Write;
-        let mut out = QueryBuf::<2048>::new();
+        let mut out = QueryBuf::<3840>::new();
         let _ = writeln!(out, "kind\tseg\tbus\tbackend\tbase_or_bdf\tstatus");
 
         if let Some(hpci_vmo) = self.hpci.as_ref() {
             let mut raw = [0u8; 4096];
             if let Ok(n) = hpci_vmo.read(0, &mut raw) {
                 if let Ok(table) = abi_pci::decode(&raw[..n]) {
-                    for root in &table.roots {
+                    for root in &table.roots[..table.root_count] {
                         let backend = match root.backend {
                             abi_pci::ConfigBackend::Ecam => "ecam",
                             abi_pci::ConfigBackend::LegacyIo => "legacy-io",
@@ -2646,6 +2690,29 @@ impl DriverManager {
                     }
                 }
             }
+        }
+        if let Some(hiom_vmo) = self.hiom.as_ref() {
+            let mut raw = [0u8; pci_iommu::MAX_BYTES];
+            if let Ok(n) = hiom_vmo.read(0, &mut raw) {
+                if let Ok(snap) = pci_iommu::decode(&raw[..n]) {
+                    let mode = match snap.active_mode {
+                        pci_iommu::IommuMode::Trusted => "trusted",
+                        pci_iommu::IommuMode::Isolated => "isolated",
+                    };
+                    let _ = writeln!(
+                        out,
+                        "iommu\t0\t*\t{}\tunits={}\tmode={},ir_hw={},ir_active={}",
+                        snap.hardware_kind.label(),
+                        snap.unit_count,
+                        mode,
+                        snap.interrupt_remapping_supported(),
+                        snap.interrupt_remapping_active()
+                    );
+                }
+            }
+        }
+        if let Some(inv_vmo) = self.pci_inventory_vmo.as_ref() {
+            append_hpin_func_rows(inv_vmo, &mut out);
         }
         for slot in self.pci_bound_leases[..self.pci_bound_leases_len]
             .iter()
@@ -3119,6 +3186,8 @@ impl DriverManager {
                         } else {
                             drop(handle);
                         }
+                    } else if label == pci_manager::INVENTORY_VMO_LABEL {
+                        self.retain_pci_inventory(handle);
                     } else {
                         drop(handle);
                     }
@@ -3722,6 +3791,102 @@ impl DriverManager {
         self.hpci = Some(vmo);
     }
 
+    /// Validate and retain one `HIOM` IOMMU discovery snapshot received
+    /// from the current ACPI manager generation (Stages N.1 & N.3).
+    fn retain_hiom(&mut self, handle: Handle) {
+        let vmo = Vmo::from_handle(handle);
+        let mut hdr = [0u8; pci_iommu::HEADER_BYTES];
+        if !read_vmo_exact(&vmo, 0, &mut hdr) {
+            println!("[driver-manager] HIOM rejected: short header read");
+            return;
+        }
+        let Ok(declared) = pci_iommu::declared_size(&hdr) else {
+            println!("[driver-manager] HIOM rejected: invalid header");
+            return;
+        };
+        let mut buf = [0u8; pci_iommu::MAX_BYTES];
+        if !read_vmo_exact(&vmo, 0, &mut buf[..declared]) {
+            println!("[driver-manager] HIOM rejected: short body read");
+            return;
+        }
+        let Ok(snap) = pci_iommu::decode(&buf[..declared]) else {
+            println!("[driver-manager] HIOM rejected: decode failed");
+            return;
+        };
+        let mut archive_header = [0u8; acpi_archive::HEADER_BYTES];
+        let expected_snapshot = self
+            .acpi_tables
+            .as_ref()
+            .and_then(|tables| {
+                if read_vmo_exact(tables, 0, &mut archive_header) {
+                    acpi_archive::decode_v2_header(&archive_header).ok()
+                } else {
+                    None
+                }
+            })
+            .map(|h| h.firmware_snapshot_id);
+        let Some(expected_snapshot) = expected_snapshot else {
+            println!("[driver-manager] HIOM rejected: bound archive unavailable");
+            return;
+        };
+        if snap
+            .check_binding(self.acpi_manager_generation, expected_snapshot)
+            .is_err()
+        {
+            println!(
+                "[driver-manager] HIOM rejected: binding mismatch (gen {}, snapshot {})",
+                self.acpi_manager_generation, expected_snapshot
+            );
+            return;
+        }
+        println!(
+            "[driver-manager] retained HIOM: hw={}, status={}, units={}, regions={}, gen {}",
+            snap.hardware_kind.label(),
+            snap.discovery_status.label(),
+            snap.unit_count,
+            snap.region_count,
+            self.acpi_manager_generation
+        );
+        self.hiom = Some(vmo);
+    }
+
+    /// Validate and retain one `HPIN` PCI inventory VMO published by the
+    /// current PCI Manager generation (Stage D.3).
+    #[inline(never)]
+    fn retain_pci_inventory(&mut self, handle: Handle) {
+        let vmo = Vmo::from_handle(handle);
+        let mut hdr_bytes = [0u8; pci_inventory::HEADER_BYTES];
+        if !read_vmo_exact(&vmo, 0, &mut hdr_bytes) {
+            println!("[driver-manager] HPIN rejected: short header read");
+            return;
+        }
+        let Ok(declared) = pci_inventory::declared_size(&hdr_bytes) else {
+            println!("[driver-manager] HPIN rejected: invalid header");
+            return;
+        };
+        let mut buf = [0u8; pci_inventory::MAX_BYTES];
+        if !read_vmo_exact(&vmo, 0, &mut buf[..declared]) {
+            println!("[driver-manager] HPIN rejected: short body read");
+            return;
+        }
+        let Ok(hdr) = pci_inventory::validate_and_decode_header(&buf[..declared]) else {
+            println!("[driver-manager] HPIN rejected: checksum or canonical validation failed");
+            return;
+        };
+        if hdr.manager_generation != self.pci_manager_generation {
+            println!(
+                "[driver-manager] HPIN rejected: stale PCI manager generation {} != {}",
+                hdr.manager_generation, self.pci_manager_generation
+            );
+            return;
+        }
+        println!(
+            "[driver-manager] retained HPIN inventory VMO: {} function(s), topo_gen={}, pci_gen={}",
+            hdr.function_count, hdr.topology_generation, hdr.manager_generation
+        );
+        self.pci_inventory_vmo = Some(vmo);
+    }
+
     /// Notify PCI Manager to freeze new inventory generations when ACPI crashes
     /// or completes without usable `HPCI`.
     fn notify_pci_acpi_frozen(&self, no_hpci: bool) {
@@ -3759,6 +3924,25 @@ impl DriverManager {
         let (Some(host), Some(hpci_vmo)) = (self.pci_manager.as_ref(), self.hpci.as_ref()) else {
             return;
         };
+        if !self.pci_iommu_handed_off {
+            if let Some(hiom_vmo) = self.hiom.as_ref() {
+                if let Ok(hiom_dup) =
+                    hiom_vmo.duplicate(huesos_abi::rights::READ | huesos_abi::rights::TRANSFER)
+                {
+                    if host
+                        .bootstrap
+                        .write_handle(pci_manager::IOMMU_VMO_LABEL, hiom_dup.into_handle())
+                        .is_ok()
+                    {
+                        self.pci_iommu_handed_off = true;
+                        println!(
+                            "[driver-manager] forwarded HIOM IOMMU snapshot to PCI manager generation {}",
+                            self.pci_manager_generation
+                        );
+                    }
+                }
+            }
+        }
         let Ok(duplicate) =
             hpci_vmo.duplicate(huesos_abi::rights::READ | huesos_abi::rights::TRANSFER)
         else {
@@ -3941,6 +4125,10 @@ impl DriverManager {
                     self.retain_hpci(handle);
                     continue;
                 }
+                Ok((length, Some(handle))) if &bytes[..length] == acpi_manager::IOMMU_VMO_LABEL => {
+                    self.retain_hiom(handle);
+                    continue;
+                }
                 Ok((_length, Some(handle))) => {
                     println!("[driver-manager] unexpected ACPI manager handle message");
                     drop(handle);
@@ -3995,6 +4183,7 @@ impl DriverManager {
                                 && self.hpci.is_some();
                             if !eligible {
                                 self.hpci = None;
+                                self.hiom = None;
                             }
                             self.acpi_hpci_eligible = eligible;
                             println!(
@@ -4227,6 +4416,48 @@ const fn hmcf_error_name(error: hmcf::HmcfError) -> &'static str {
         hmcf::HmcfError::Overlap => "overlapping windows",
         hmcf::HmcfError::StaleGeneration => "stale producer generation",
         hmcf::HmcfError::SnapshotMismatch => "snapshot mismatch",
+    }
+}
+
+#[inline(never)]
+fn append_hpin_func_rows(inv_vmo: &Vmo, out: &mut QueryBuf<3840>) {
+    use core::fmt::Write;
+    let mut hdr_bytes = [0u8; pci_inventory::HEADER_BYTES];
+    if !read_vmo_exact(inv_vmo, 0, &mut hdr_bytes) {
+        return;
+    }
+    let Ok(declared) = pci_inventory::declared_size(&hdr_bytes) else {
+        return;
+    };
+    let mut buf = [0u8; pci_inventory::MAX_BYTES];
+    if !read_vmo_exact(inv_vmo, 0, &mut buf[..declared]) {
+        return;
+    }
+    let Ok(hdr) = pci_inventory::validate_and_decode_header(&buf[..declared]) else {
+        return;
+    };
+    for idx in 0..usize::from(hdr.function_count) {
+        if out.len + 512 > 3840 {
+            break;
+        }
+        if let Ok(rec) = pci_inventory::decode_record(&buf[..declared], idx) {
+            let class_short =
+                pci_inventory::class_short_name(rec.class_code, rec.subclass, rec.prog_if);
+            let _ = writeln!(
+                out,
+                "func\t{}\t{:02x}\t{}\t{:02x}:{:02x}.{}\t{:04x}:{:04x},{},irq={}",
+                rec.segment,
+                rec.bus,
+                class_short,
+                rec.bus,
+                rec.device,
+                rec.function,
+                rec.vendor_id,
+                rec.device_id,
+                rec.lease_state.label(),
+                rec.irq_mode.label()
+            );
+        }
     }
 }
 

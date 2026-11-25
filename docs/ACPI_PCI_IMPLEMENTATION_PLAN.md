@@ -1,22 +1,12 @@
 # ACPI → PCI implementation PR plan
 
-- **Status:** approved execution plan; AP-0…AP-6 implemented on main (AP-4/AP-5
-  merged earlier; `huesos-dev/ap4-ap5-ap6-batch2` extends the required host
-  suites/tests and re-verifies the AP-6 gates on Q35/OVMF SMP2: startup success,
-  injected restart cascade and restart-budget exhaustion, release and debug for
-  the cascade); AP-7 implemented on `huesos-dev/ap7-hmcf-wire` (bounded HMCF
-  wire format, producer publication from the archived MCFG, DriverManager
-  retain); AP-8 implemented on `huesos-dev/ap8-config-mint` (snapshot-bound
-  mint authority and kernel cross-check); AP-9 implemented on
-  `huesos-dev/ap9-config-authority-handoff` (generation-bound read-only
-  authority handoff to PCI Manager: two-phase readiness, fresh mint per
-  generation, ECAM mapped read-only; no topology, no AML yet);
-  AP-10 implemented on `huesos-dev/ap10-config-mediation` (dedicated
-  ACPI→PCI read mediation: AML-visible config reads served by PCI Manager
-  over a private channel; every write denied; legacy broker PCI opcodes
-  permanently unauthorizable; QEMU evidence pending CI
-  `qemu-pci-mediation`) — AP-11 onwards not started; see the progress
-  ledger in §7.
+- **Status:** approved execution plan; AP-0…AP-22 merged on `main` (`6ad199e`)
+  and AP-23 completes `D.3` (`HPIN` zero-bus-traffic inventory VMO + `pci -v`),
+  `F.1`/`F.3` (bottom-up bridge synthesis + hotplug reserves), `K.1`–`K.3`
+  (reserved-space hotplug queue/insertion/removal + 1,000-cycle suite),
+  `L.1`–`L.3` (transactional restart rebalance + exhaustive fault injection),
+  `M.1` (`QuiesceRemap` protocol), and `N.1`/`N.3` (`DMAR`/`IVRS` discovery +
+  `HIOM` fail-closed `Trusted` VMO pipeline); see the progress ledger in §7.
 - **Owners:** HuesOS project owner + implementation agent
 - **Architecture:** [ACPI_RING3.md](ACPI_RING3.md) and
   [PCI_MANAGER_ARCHITECTURE.md](PCI_MANAGER_ARCHITECTURE.md)
@@ -761,7 +751,14 @@ Each PR adds one row or updates the corresponding row in the live PCI roadmap:
 | AP-12 | complete | `f007150` (PR #251) | Generation-safe ACPI IRQ grants in `acpi_policy.rs`/`huesos-object`/`huesos-syscalls` and bounded CPU0 deferred-work queue in `uacpi-runtime::work` | Q35/OVMF SMP2 boot gate green | n/a | — |
 | AP-13 / AP-14 | complete | `92e7be9` (PR #252), `9c9c625` (PR #254) | `uacpi-runtime` namespace load/init (`_PIC(IOAPIC)`), writable FACS shadow, ASan/UBSan AML namespace corpus suite (`scripts/test-uacpi-runtime.sh`), audit & Clippy clean | Q35/OVMF SMP2 (`ecam` & forced `legacy`): `[acpi-manager] AML namespace loaded`, `[acpi-manager] AML namespace initialized`, `[driver-manager] ACPI namespace initialized generation` | n/a | — |
 | AP-15 | complete | `a192cfe` (PR #255) | `huesos_abi::pci::RootBridgeTable` (`HPCI`) & `validate_roots_and_hmcf`, `uacpi-runtime::roots`, ASan/UBSan `HPCI` AML buffer/overlap/malformed tests | Q35/OVMF SMP2 (`ecam` & forced `legacy`): `[acpi-manager] published HPCI`, `[driver-manager] retained HPCI`, `[pci-manager] accepted HPCI root table` | n/a | — |
-| AP-16 | complete | `ba1f439` (PR #256) | `huesos_pci::inventory` read-only traversal + resource-availability unit tests (`config-writes=0`), `pci-manager` crash-freeze retention, audit & Clippy clean | Q35/OVMF SMP2 (`ecam` & forced `legacy`): identical 5-function Q35 inventory (`[driver-manager] PCI diagnostic inventory published: ... config-writes=0`) | n/a | Next work: AP-17+ (`B.4`, `C.3`, `E.1`/`F.2`, `G.2`/`G.3`, `I`/`J`) |
+| AP-16 | complete | `ba1f439` (PR #256) | `huesos_pci::inventory` read-only traversal + resource-availability unit tests (`config-writes=0`), `pci-manager` crash-freeze retention, audit & Clippy clean | Q35/OVMF SMP2 (`ecam` & forced `legacy`): identical 5-function Q35 inventory (`[driver-manager] PCI diagnostic inventory published: ... config-writes=0`) | n/a | — |
+| AP-17 | complete | `4cfd0e0` (PR #257) | `huesos_pci::write_policy` named write classes, readback masks & RO→RW ECAM upgrade | Q35/OVMF SMP2 (`ecam` & forced `legacy`): `b4-policy=verified`, `[pci-manager] write-capable config authority ready` | n/a | — |
+| AP-18 | complete | `b863a5d` (PR #258) | `HPCI` v2 `_PRT` & `_OSC` ownership decoding and cross-check | Q35/OVMF SMP2 root `_PRT`/`_OSC` markers verified | n/a | — |
+| AP-19 | complete | `ebe2ae7` (PR #259) | `huesos_pci::bar_sizing` (E.1) & `resource_planner` rollback-verified commit plans (F.2) | Q35/OVMF SMP2 live BAR sizing & `obs f2-plan status=ok` | n/a | — |
+| AP-20 | complete | `be653f3` (PR #260) | Kernel `DeviceLease` & `DeviceLeaseAuthority` objects, stale-generation rejection, `PORT_PACKET_DEVICE_GONE` (G.2/G.3) | Q35/OVMF SMP2 `obs g2-lease ... status=ok` & `DeviceGone` self-check | n/a | — |
+| AP-21 | complete | `ce9779b` (PR #261) | `huesos_pci::driver_binding` (H.3), MSI-X/MSI/INTx transactions (I.1), `DmaPoolGrant` (I.2) | Q35/OVMF SMP2 `obs h3-bind`, `obs i1-irq`, `obs i2-dma`, `ro_lease_mint_denied=true` | n/a | — |
+| AP-22 | complete | `1f83e29` (PR #262) | NVMe migrated to `pci-manager`; kernel PCI scan removed and guarded by `tools/check-kernel-no-pci.py` (J.1–J.3) | Full QEMU Q35 NVMe/HxFS/soak/powerfail/`storage=off` gates green | n/a | — |
+| AP-23 | implemented (this PR) | `arena/83195ede-huesos` | `pci_iommu` (`HIOM`) + `pci_inventory` (`HPIN`), `huesos_pci::{iommu,hotplug,rebalance}` + bottom-up/reserve planner (D.3, F.1, F.3, K.1–K.3, L.1–L.3, M.1, N.1, N.3) | Q35/OVMF SMP2 (`ecam` & `legacy`): `published HIOM`, `obs n1-iommu`, `obs d3-inventory`, `[hsh] pci.elf -v HPIN+IOMMU OK` | n/a | Physical bare-metal matrix & N.2 IOMMU page-table domains remain open |
 
 A row says `Complete` only after its exit criteria and actual verification logs
 are named in the merged PR. Policy-only completion never closes an on-target
