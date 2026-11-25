@@ -447,8 +447,7 @@ fn aggregate_bottom_up_bridge_windows(
                 // Avoid double-reserving Mmio64 alongside PrefetchableMemory, and do not
                 // synthesize a pure reserve window when the owning root bridge has no
                 // upstream aperture of `class`.
-                let reserve = if (class == ResourceClass::Mmio64 && needed == 0)
-                    || (needed == 0 && !root_has_class)
+                let reserve = if needed == 0 && (class == ResourceClass::Mmio64 || !root_has_class)
                 {
                     0
                 } else {
