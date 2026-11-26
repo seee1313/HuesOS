@@ -255,6 +255,9 @@ pub struct DriverManager {
     storage_skipped_pending: bool,
     storage_skipped_sent: bool,
     nvme_lease_ro: Option<Handle>,
+    nvme_lease_rw: Option<Handle>,
+    net_lease_rw: Option<Handle>,
+    wlan_lease_rw: Option<Handle>,
     nvme_boot_driver: Option<BootDriverSpec>,
     /// Resource handles received from init but not yet forwarded to
     /// their target drivers. Indexed implicitly by driver name via a
@@ -454,6 +457,9 @@ impl DriverManager {
             storage_skipped_pending: false,
             storage_skipped_sent: false,
             nvme_lease_ro: None,
+            nvme_lease_rw: None,
+            net_lease_rw: None,
+            wlan_lease_rw: None,
             nvme_boot_driver: None,
             pending_resources: [const { PendingResources::empty() }; 16],
             pending_resource_count: 0,
@@ -1664,6 +1670,9 @@ impl DriverManager {
                 };
                 let entry = &bucket.entries[entry_idx];
                 let label = &entry.label[..entry.label_len];
+                if label.windows(5).any(|w| w == b":dma:") {
+                    self.bind_dma_handle_to_driver_lease(driver, &handle);
+                }
                 match child_bootstrap.write_handle(label, handle) {
                     Ok(()) => sent += 1,
                     Err((e, _handle)) => println!(
@@ -1708,6 +1717,60 @@ impl DriverManager {
             );
         }
         let _ = (sent, total); // keep local totals visible above the sentinel emit.
+    }
+
+    fn bind_dma_handle_to_driver_lease(&self, driver: &str, dma_handle: &Handle) {
+        let lease_slot = match driver {
+            "driver-host-nvme" => self.nvme_lease_rw.as_ref(),
+            "net-service" => self.net_lease_rw.as_ref(),
+            "wlan-service" => self.wlan_lease_rw.as_ref(),
+            _ => None,
+        };
+        let Some(lease_rw) = lease_slot else {
+            return;
+        };
+        let Ok(info) = libcanvas::device_lease::query(lease_rw) else {
+            return;
+        };
+        if info.revoked != 0 {
+            return;
+        }
+        match libcanvas::device_lease::attach_dma(lease_rw, dma_handle, info.generation) {
+            Ok(()) => println!(
+                "[driver-manager] attached DmaPool to DeviceLease for {} (gen={})",
+                driver, info.generation
+            ),
+            Err(err) => println!(
+                "[driver-manager] attach_dma failed for {}: {}",
+                driver,
+                err.as_str()
+            ),
+        }
+    }
+
+    fn revoke_driver_lease(&mut self, driver: &str) {
+        let lease_opt = match driver {
+            "driver-host-nvme" => self.nvme_lease_rw.take(),
+            "net-service" => self.net_lease_rw.take(),
+            "wlan-service" => self.wlan_lease_rw.take(),
+            _ => None,
+        };
+        let Some(lease_rw) = lease_opt else {
+            return;
+        };
+        if let Ok(info) = libcanvas::device_lease::query(&lease_rw) {
+            if info.revoked == 0 {
+                let _ = libcanvas::device_lease::revoke(
+                    &lease_rw,
+                    info.generation,
+                    pci_lease::revoke_flags::FAILED,
+                );
+                println!(
+                    "[driver-manager] revoked DeviceLease + IOMMU domain for {} (gen={})",
+                    driver, info.generation
+                );
+            }
+        }
     }
 
     fn poll_init_bootstrap(&mut self, init_bootstrap: &Channel) {
@@ -2711,6 +2774,19 @@ impl DriverManager {
                 }
             }
         }
+        if let Ok(k_iommu) = libcanvas::device_lease::system_iommu_status() {
+            let _ = writeln!(
+                out,
+                "iommu-kernel\t0\t*\t{}\tunits={}\tmode={},domains={},pages={},teardowns={},faults={}",
+                k_iommu.kind().label(),
+                k_iommu.active_unit_count,
+                k_iommu.mode().label(),
+                k_iommu.active_domains,
+                k_iommu.mapped_pages,
+                k_iommu.teardown_count,
+                k_iommu.fault_count
+            );
+        }
         if let Some(inv_vmo) = self.pci_inventory_vmo.as_ref() {
             append_hpin_func_rows(inv_vmo, &mut out);
         }
@@ -3005,6 +3081,7 @@ impl DriverManager {
                         "[driver-manager] NVMe host channel read failed: {}",
                         error.as_str()
                     );
+                    self.revoke_driver_lease("driver-host-nvme");
                     self.registry.mark_failed("block:nvme");
                     return;
                 }
@@ -3108,6 +3185,7 @@ impl DriverManager {
                         "[driver-manager] net-service channel closed: {}",
                         err.as_str()
                     );
+                    self.revoke_driver_lease("net-service");
                     self.net_failed = true;
                     self.net_ready = false;
                     return;
@@ -3144,6 +3222,7 @@ impl DriverManager {
                         "[driver-manager] wlan-service channel closed: {}",
                         err.as_str()
                     );
+                    self.revoke_driver_lease("wlan-service");
                     self.wlan_failed = true;
                     self.wlan_ready = false;
                     return;
@@ -3174,6 +3253,24 @@ impl DriverManager {
                     } else if label == pci_manager::DEVICE_LEASE_NVME_RO_LABEL {
                         if libcanvas::device_lease::query(&handle).is_ok() {
                             self.nvme_lease_ro = Some(handle);
+                        } else {
+                            drop(handle);
+                        }
+                    } else if label == pci_manager::DEVICE_LEASE_NVME_RW_LABEL {
+                        if libcanvas::device_lease::query(&handle).is_ok() {
+                            self.nvme_lease_rw = Some(handle);
+                        } else {
+                            drop(handle);
+                        }
+                    } else if label == pci_manager::DEVICE_LEASE_NET_RW_LABEL {
+                        if libcanvas::device_lease::query(&handle).is_ok() {
+                            self.net_lease_rw = Some(handle);
+                        } else {
+                            drop(handle);
+                        }
+                    } else if label == pci_manager::DEVICE_LEASE_WLAN_RW_LABEL {
+                        if libcanvas::device_lease::query(&handle).is_ok() {
+                            self.wlan_lease_rw = Some(handle);
                         } else {
                             drop(handle);
                         }

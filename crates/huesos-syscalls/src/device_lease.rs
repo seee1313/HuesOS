@@ -111,6 +111,13 @@ pub(crate) fn sys_device_lease_mint_resource(
         return Err(ErrorCode::AccessDenied);
     }
 
+    if kind == ResourceKind::DmaPool {
+        if let Err(err) = lease.attach_dma_range(args.expected_generation, args.base, args.len) {
+            unregister_object(resource.koid());
+            return Err(map_lease_error(err));
+        }
+    }
+
     let koid = resource.koid();
     let rights = Rights::READ | Rights::WRITE | Rights::TRANSFER;
     match caller
@@ -214,11 +221,53 @@ pub(crate) fn sys_device_lease_query(
     Ok(0)
 }
 
+pub(crate) fn sys_device_lease_attach_dma(
+    lease_handle_val: HandleValue,
+    dma_handle_val: HandleValue,
+    expected_generation: u64,
+) -> SyscallResult {
+    if expected_generation == 0 {
+        return Err(ErrorCode::InvalidArgs);
+    }
+    let caller = current_process().ok_or(ErrorCode::AccessDenied)?;
+    let lease_handle = caller
+        .handles
+        .get(lease_handle_val)
+        .ok_or(ErrorCode::BadHandle)?;
+    if !lease_handle.has_rights(Rights::WRITE) {
+        return Err(ErrorCode::AccessDenied);
+    }
+    let dma_entry = caller
+        .handles
+        .get(dma_handle_val)
+        .ok_or(ErrorCode::BadHandle)?;
+    if !dma_entry.has_rights(Rights::READ | Rights::WRITE) {
+        return Err(ErrorCode::AccessDenied);
+    }
+    let dma_obj = require_resource_of_kind(dma_handle_val, ResourceKind::DmaPool)?;
+    let dma_res = dma_obj
+        .downcast_ref::<Resource>()
+        .ok_or(ErrorCode::WrongType)?;
+    if !dma_res.is_lease_active() {
+        return Err(ErrorCode::AccessDenied);
+    }
+    let lease_obj = huesos_object::lookup_object(lease_handle.koid).ok_or(ErrorCode::BadHandle)?;
+    let lease = lease_obj
+        .downcast_ref::<DeviceLease>()
+        .ok_or(ErrorCode::WrongType)?;
+
+    lease
+        .attach_dma_range(expected_generation, dma_res.base(), dma_res.len())
+        .map_err(map_lease_error)?;
+    Ok(0)
+}
+
 const fn map_lease_error(err: DeviceLeaseError) -> ErrorCode {
     match err {
         DeviceLeaseError::InvalidArgs => ErrorCode::InvalidArgs,
         DeviceLeaseError::StaleOrRevoked => ErrorCode::Busy,
         DeviceLeaseError::TooManyPorts => ErrorCode::NoMemory,
         DeviceLeaseError::GenerationExhausted => ErrorCode::Internal,
+        DeviceLeaseError::IommuBindFailed => ErrorCode::Busy,
     }
 }

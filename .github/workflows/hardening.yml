@@ -644,6 +644,43 @@ jobs:
           path: ci-artifacts/
           if-no-files-found: warn
 
+  qemu-iommu-vtd:
+    # Stage N.2: end-to-end Intel VT-d hardware IOMMU (`PCI Isolated Profile`)
+    # gate. Boots QEMU Q35 with `-device intel-iommu,intremap=off,caching-mode=on`,
+    # `-device edu,dma_mask=0xffffffffffffffff` (`iommu_test=1`), NVMe + HxFS,
+    # and modern VirtIO 1.0 (`iommu_platform=on`), then boots the same artifact
+    # without `intel-iommu` to prove fail-closed fallback to `Trusted` mode.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      matrix:
+        profile: [debug, release]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            gcc xorriso qemu-system-x86
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install nightly-2026-03-01 --profile minimal \
+            --component rust-src,llvm-tools-preview
+          rustup default nightly-2026-03-01
+      - name: Intel VT-d hardware isolation + Trusted fallback QEMU smoke
+        env:
+          CARGO_BUILD_JOBS: "1"
+          ARTIFACT_DIR: ci-artifacts
+        run: bash scripts/ci-qemu-iommu-vtd-smoke.sh ${{ matrix.profile }} 2 150
+      - name: Upload serial logs
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: qemu-iommu-vtd-${{ matrix.profile }}-smp2
+          path: ci-artifacts/
+          if-no-files-found: warn
+
   verified-boot-hardening:
     # Security/release chain gates. QEMU is used for deterministic CI only;
     # physical Intel/AMD/NVMe/TPM evidence is collected separately before merge.

@@ -2447,6 +2447,10 @@ fn run_driver_binding_and_handoff(
                     .writes
                     .iter()
                     .all(|w| write_policy::validate_write_request(w).is_ok());
+                let isolation_str = match policy.dma_isolation() {
+                    DmaIsolation::Trusted => "Trusted",
+                    DmaIsolation::IommuDomain(_) => "IommuDomain",
+                };
 
                 if manifest.driver_name == "nvme-host" {
                     let bar0 = plan
@@ -2676,6 +2680,13 @@ fn run_driver_binding_and_handoff(
                         let _ = bootstrap
                             .write_handle(pci_manager::DEVICE_LEASE_NVME_RO_LABEL, ro_lease);
                     }
+                    if let Ok(rw_lease) = lease
+                        .handle
+                        .duplicate(rights::READ | rights::WRITE | rights::TRANSFER)
+                    {
+                        let _ = bootstrap
+                            .write_handle(pci_manager::DEVICE_LEASE_NVME_RW_LABEL, rw_lease);
+                    }
                     let mut mmio_label = StackLabel::new();
                     let _ = write!(
                         mmio_label,
@@ -2705,10 +2716,11 @@ fn run_driver_binding_and_handoff(
                         ro_lease_mint_denied
                     );
                     println!(
-                        "[pci-manager] obs i2-dma bdf={:02x}:{:02x}.{} isolation=Trusted",
+                        "[pci-manager] obs i2-dma bdf={:02x}:{:02x}.{} isolation={}",
                         lease.address.bus(),
                         lease.address.device(),
-                        lease.address.function()
+                        lease.address.function(),
+                        isolation_str
                     );
                     println!(
                         "[pci-manager] obs j2-nvme bdf={:02x}:{:02x}.{} bar0=0x{:x}+0x{:x} irq=0x{:x}+{} mode={} status=handed-off",
@@ -2882,6 +2894,13 @@ fn run_driver_binding_and_handoff(
                                 let _ = bootstrap
                                     .write_handle(pci_manager::DEVICE_LEASE_RO_LABEL, ro_lease);
                             }
+                            if let Ok(rw_lease) = lease
+                                .handle
+                                .duplicate(rights::READ | rights::WRITE | rights::TRANSFER)
+                            {
+                                let _ = bootstrap
+                                    .write_handle(pci_manager::DEVICE_LEASE_NET_RW_LABEL, rw_lease);
+                            }
                             println!(
                                 "[pci-manager] obs i1-irq bdf={:02x}:{:02x}.{} mode=polling irq=0 writes=1 valid_b4={} minted=1 ro_lease_mint_denied={}",
                                 lease.address.bus(),
@@ -2891,10 +2910,11 @@ fn run_driver_binding_and_handoff(
                                 ro_lease_mint_denied
                             );
                             println!(
-                                "[pci-manager] obs i2-dma bdf={:02x}:{:02x}.{} isolation=Trusted",
+                                "[pci-manager] obs i2-dma bdf={:02x}:{:02x}.{} isolation={}",
                                 lease.address.bus(),
                                 lease.address.device(),
-                                lease.address.function()
+                                lease.address.function(),
+                                isolation_str
                             );
                             println!(
                                 "[pci-manager] obs virtio-net bdf={:02x}:{:02x}.{} modern={} legacy_io={} status=handed-off",
@@ -2994,6 +3014,22 @@ fn run_driver_binding_and_handoff(
                                 let _ = bootstrap
                                     .write_handle(pci_manager::DEVICE_LEASE_RO_LABEL, ro_lease);
                             }
+                            if let Ok(rw_lease) = lease
+                                .handle
+                                .duplicate(rights::READ | rights::WRITE | rights::TRANSFER)
+                            {
+                                let _ = bootstrap.write_handle(
+                                    pci_manager::DEVICE_LEASE_WLAN_RW_LABEL,
+                                    rw_lease,
+                                );
+                            }
+                            println!(
+                                "[pci-manager] obs i2-dma bdf={:02x}:{:02x}.{} isolation={}",
+                                lease.address.bus(),
+                                lease.address.device(),
+                                lease.address.function(),
+                                isolation_str
+                            );
                             println!(
                                 "[pci-manager] obs wlan bdf={:02x}:{:02x}.{} vendor=0x{:04x} device=0x{:04x} mmio=0x{:x}+0x{:x} cmd_ok={} status=handed-off",
                                 lease.address.bus(),

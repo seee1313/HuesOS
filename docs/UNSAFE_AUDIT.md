@@ -3188,3 +3188,29 @@ in `huesos-syscalls/src/config_mint.rs`, and checked write execution in
   write-capable `NO_CACHE` ECAM windows after `huesos_pci::write_policy`
   class, offset, alignment, write-mask, and non-zero `expected_readback_mask`
   validation passes.
+
+## Stage N.2 Intel VT-d hardware IOMMU (`PCI Isolated Profile`)
+
+All VT-d capability validation, Root/Context/SLPT entry codecs, command
+builders, `FRCD` fault decoding, and per-lease domain policy live in the
+`#![forbid(unsafe_code)]` crate `crates/huesos-iommu`. The privileged hardware
+boundary adds eleven audited `unsafe` blocks (zero `unsafe fn`, zero
+`unsafe impl`, zero `unwrap`/`expect`/`panic!`, bringing `unsafe_blocks` to
+`1032`):
+
+- `crates/huesos-arch/src/x86_64/vtd.rs` (`7` unsafe blocks):
+  - `mmio_read32`, `mmio_write32`, `mmio_read64`, `mmio_write64` (`4` blocks):
+    volatile register accesses into uncached (`NO_CACHE`) `DRHD` MMIO windows
+    whose bases were verified against usable RAM in `initialize_hardware_iommu`
+    and whose offsets are bounded by `VtdCapabilities::parse`.
+  - `phys_read64`, `phys_write64`, `zero_frame_4k` (`3` blocks): HHDM reads,
+    writes, and zero-initialization on PMM-owned 4 KiB Root, Context, and
+    Second-Stage Page Table frames serialized under `VTD_STATE`
+    (`RankedIrqSafeTicketLock` at `LockRank::ARCHITECTURE`), paired with inline
+    `clflush` + `mfence` eviction whenever `ECAP.C == 0`.
+- `crates/huesos-kernel/src/boot/iommu_probe.rs` (`4` unsafe blocks,
+  `#[cfg(feature = "boot-selftest")]` only): 64-bit `edu` DMA register MMIO
+  reads/writes (`0x80..=0x98`) and volatile + `clflush` accesses to two
+  PMM-allocated test frames (`auth_phys`, `canary_phys`) used by the
+  `iommu_test=1` hardware isolation smoke.
+

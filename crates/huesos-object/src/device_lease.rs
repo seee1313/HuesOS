@@ -58,21 +58,45 @@ pub struct DeviceLeaseSnapshot {
 /// Failure modes for [`DeviceLease`] operations.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DeviceLeaseError {
-    /// Identity, snapshot, or expected generation was zero/invalid.
+    /// Identity, snapshot, alignment, or expected generation was zero/invalid.
     InvalidArgs,
     /// Expected generation does not match the live generation, or lease is
     /// already revoked.
     StaleOrRevoked,
-    /// Too many `Port` bindings on this lease.
+    /// Too many `Port` bindings or DMA ranges on this lease.
     TooManyPorts,
     /// Generation counter would overflow.
     GenerationExhausted,
+    /// Hardware IOMMU domain binding failed (overlap, isolation-group conflict, or OOM).
+    IommuBindFailed,
+}
+
+/// Ring-0 hook mapping `[base, base + len)` into `(pci_address_packed, lease_koid, generation)`.
+pub type IommuBindDmaFn = fn(u64, u64, u64, u64, u64) -> Result<(), DeviceLeaseError>;
+/// Ring-0 hook synchronously tearing down `(pci_address_packed, lease_koid, generation)`.
+pub type IommuTeardownFn = fn(u64, u64, u64);
+
+/// Kernel-registered hardware IOMMU callbacks invoked by [`DeviceLease`] (Stage N.2).
+#[derive(Clone, Copy)]
+pub struct IommuLeaseHooks {
+    /// Program a validated `DmaPool` range into the lease's hardware IOMMU domain.
+    pub bind_dma: IommuBindDmaFn,
+    /// Synchronously unbind the BDF, flush Context/IOTLB caches, and free page tables.
+    pub teardown: IommuTeardownFn,
+}
+
+static IOMMU_LEASE_HOOKS: IrqSafeMutex<Option<IommuLeaseHooks>> = IrqSafeMutex::new(None);
+
+/// Install the hardware IOMMU lease lifecycle callbacks.
+pub fn set_iommu_lease_hooks(hooks: Option<IommuLeaseHooks>) {
+    *IOMMU_LEASE_HOOKS.lock() = hooks;
 }
 
 struct DeviceLeaseInner {
     generation: u64,
     pci_address_packed: u64,
     state: DeviceLeaseState,
+    iommu_bound: bool,
     gone_ports: Vec<(Arc<Port>, u64)>,
 }
 
@@ -104,6 +128,7 @@ impl DeviceLease {
                 generation: 1,
                 pci_address_packed,
                 state: DeviceLeaseState::Configured,
+                iommu_bound: false,
                 gone_ports: Vec::new(),
             }),
             waiters: WaitQueue::new(),
@@ -194,15 +219,80 @@ impl DeviceLease {
         Ok(())
     }
 
-    /// Revoke the active generation (`expected_generation`), invalidating all
-    /// child `Resource` capabilities bound to it, advancing the monotonic
-    /// generation so the revoked generation can never be replayed, and
-    /// delivering `PORT_PACKET_DEVICE_GONE` to every bound `Port`.
+    /// Bind a 4 KiB-aligned `DmaPool` physical range `[base, base + len)` into
+    /// this lease's hardware IOMMU domain for `expected_generation` (Stage N.2).
+    pub fn attach_dma_range(
+        &self,
+        expected_generation: u64,
+        base: u64,
+        len: u64,
+    ) -> Result<(), DeviceLeaseError> {
+        if expected_generation == 0
+            || len == 0
+            || (base & 0xFFF) != 0
+            || (len & 0xFFF) != 0
+            || base.checked_add(len).is_none()
+        {
+            return Err(DeviceLeaseError::InvalidArgs);
+        }
+        let pci_address_packed = {
+            let inner = self.inner.lock();
+            if inner.generation != expected_generation
+                || !matches!(
+                    inner.state,
+                    DeviceLeaseState::Configured | DeviceLeaseState::Online
+                )
+            {
+                return Err(DeviceLeaseError::StaleOrRevoked);
+            }
+            inner.pci_address_packed
+        };
+
+        let hooks = *IOMMU_LEASE_HOOKS.lock();
+        if let Some(h) = hooks {
+            (h.bind_dma)(
+                pci_address_packed,
+                self.koid.0,
+                expected_generation,
+                base,
+                len,
+            )?;
+        }
+
+        let still_active = {
+            let mut inner = self.inner.lock();
+            if inner.generation == expected_generation
+                && matches!(
+                    inner.state,
+                    DeviceLeaseState::Configured | DeviceLeaseState::Online
+                )
+            {
+                inner.iommu_bound = true;
+                true
+            } else {
+                false
+            }
+        };
+
+        if !still_active {
+            if let Some(h) = hooks {
+                (h.teardown)(pci_address_packed, self.koid.0, expected_generation);
+            }
+            return Err(DeviceLeaseError::StaleOrRevoked);
+        }
+        Ok(())
+    }
+
+    /// Revoke the active generation (`expected_generation`), synchronously
+    /// tearing down any bound hardware IOMMU domain, invalidating all child
+    /// `Resource` capabilities bound to it, advancing the monotonic generation
+    /// so the revoked generation can never be replayed, and delivering
+    /// `PORT_PACKET_DEVICE_GONE` to every bound `Port`.
     pub fn revoke(&self, expected_generation: u64, failed: bool) -> Result<u64, DeviceLeaseError> {
         if expected_generation == 0 {
             return Err(DeviceLeaseError::InvalidArgs);
         }
-        let (revoked_gen, new_state, ports) = {
+        let (revoked_gen, pci_address_packed, new_state, ports) = {
             let mut inner = self.inner.lock();
             if inner.generation != expected_generation
                 || !matches!(
@@ -217,14 +307,25 @@ impl DeviceLease {
                 .checked_add(1)
                 .ok_or(DeviceLeaseError::GenerationExhausted)?;
             inner.generation = next_generation;
+            inner.iommu_bound = false;
             inner.state = if failed {
                 DeviceLeaseState::Failed
             } else {
                 DeviceLeaseState::Removed
             };
             let ports = core::mem::take(&mut inner.gone_ports);
-            (expected_generation, inner.state, ports)
+            (
+                expected_generation,
+                inner.pci_address_packed,
+                inner.state,
+                ports,
+            )
         };
+
+        let hooks = *IOMMU_LEASE_HOOKS.lock();
+        if let Some(h) = hooks {
+            (h.teardown)(pci_address_packed, self.koid.0, revoked_gen);
+        }
 
         for (port, key) in ports {
             let packet = self.make_gone_packet(key, revoked_gen, new_state);
@@ -255,6 +356,26 @@ impl DeviceLease {
                 self.firmware_snapshot_id,
                 state as u64,
             ],
+        }
+    }
+}
+
+impl Drop for DeviceLease {
+    fn drop(&mut self) {
+        let teardown_target = {
+            let mut inner = self.inner.lock();
+            if inner.iommu_bound {
+                inner.iommu_bound = false;
+                Some((inner.pci_address_packed, inner.generation))
+            } else {
+                None
+            }
+        };
+        if let Some((pci_address_packed, active_gen)) = teardown_target {
+            let hooks = *IOMMU_LEASE_HOOKS.lock();
+            if let Some(h) = hooks {
+                (h.teardown)(pci_address_packed, self.koid.0, active_gen);
+            }
         }
     }
 }
@@ -393,5 +514,64 @@ mod tests {
         unregister_object(port.koid());
         unregister_object(lease.koid());
         unregister_object(lease2.koid());
+    }
+
+    #[test]
+    fn device_lease_iommu_hooks_bind_and_synchronously_teardown_on_revoke_and_drop() {
+        use core::sync::atomic::{AtomicU64, Ordering};
+
+        static BOUND_PAGES: AtomicU64 = AtomicU64::new(0);
+        static TEARDOWNS: AtomicU64 = AtomicU64::new(0);
+
+        fn mock_bind(
+            _bdf: u64,
+            _koid: u64,
+            _gen: u64,
+            _base: u64,
+            len: u64,
+        ) -> Result<(), DeviceLeaseError> {
+            BOUND_PAGES.fetch_add(len / 4096, Ordering::SeqCst);
+            Ok(())
+        }
+        fn mock_teardown(_bdf: u64, _koid: u64, _gen: u64) {
+            TEARDOWNS.fetch_add(1, Ordering::SeqCst);
+        }
+
+        BOUND_PAGES.store(0, Ordering::SeqCst);
+        TEARDOWNS.store(0, Ordering::SeqCst);
+        set_iommu_lease_hooks(Some(IommuLeaseHooks {
+            bind_dma: mock_bind,
+            teardown: mock_teardown,
+        }));
+
+        let Ok(lease) = DeviceLease::try_create(99, 0x1111, 0x0020) else {
+            set_iommu_lease_hooks(None);
+            assert!(false, "DeviceLease::try_create failed");
+            return;
+        };
+        assert_eq!(
+            lease.attach_dma_range(1, 0x1001, 4096),
+            Err(DeviceLeaseError::InvalidArgs)
+        );
+        assert_eq!(lease.attach_dma_range(1, 0x0200_0000, 8192), Ok(()));
+        assert_eq!(BOUND_PAGES.load(Ordering::SeqCst), 2);
+        assert_eq!(lease.revoke(1, false), Ok(1));
+        assert_eq!(TEARDOWNS.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            lease.attach_dma_range(1, 0x0200_2000, 4096),
+            Err(DeviceLeaseError::StaleOrRevoked)
+        );
+        unregister_object(lease.koid());
+
+        // Also prove Drop tears down an un-revoked bound lease when its last Arc drops.
+        if let Ok(ephemeral) = DeviceLease::try_create(100, 0x1111, 0x0028) {
+            let eph_koid = ephemeral.koid();
+            assert_eq!(ephemeral.attach_dma_range(1, 0x0300_0000, 4096), Ok(()));
+            unregister_object(eph_koid);
+            drop(ephemeral);
+            assert_eq!(TEARDOWNS.load(Ordering::SeqCst), 2);
+        }
+
+        set_iommu_lease_hooks(None);
     }
 }

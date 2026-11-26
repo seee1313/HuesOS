@@ -1,0 +1,9 @@
+[package]
+name = "huesos-iommu"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Host-testable Intel VT-d DMA remapping codecs, domain table, and isolation policy"
+
+[dependencies]

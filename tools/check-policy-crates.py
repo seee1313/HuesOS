@@ -16,6 +16,7 @@ from pathlib import Path
 
 POLICY_CRATES = {
     "huesos-lifecycle": "OBJECT_LIFECYCLE_POLICY.md",
+    "huesos-iommu": "IOMMU_VTD.md",
     "huesos-ioapic": "IOAPIC_ROUTING.md",
     "huesos-extable": "RECOVERABLE_COPIES.md",
     "huesos-waitset": "MULTI_OBJECT_WAIT.md",

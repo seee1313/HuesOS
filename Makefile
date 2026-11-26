@@ -68,6 +68,7 @@ test:
 		-p huesos-bootux \
 		-p huesos-lifecycle \
 		-p huesos-sched \
+		-p huesos-iommu \
 		-p huesos-ioapic \
 		-p huesos-extable \
 		-p huesos-waitset \

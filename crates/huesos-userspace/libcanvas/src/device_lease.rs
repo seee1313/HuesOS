@@ -107,3 +107,30 @@ pub fn query(lease: &Handle) -> Result<DeviceLeaseInfo> {
     raw::decode(ret)?;
     Ok(info)
 }
+
+/// Bind an existing `DmaPool` `Resource` handle (`READ | WRITE`) into the
+/// hardware IOMMU domain of `lease` (`WRITE`) for `expected_generation` (Stage N.2).
+pub fn attach_dma(
+    lease: &Handle,
+    dma_resource: &Handle,
+    expected_generation: u64,
+) -> Result<()> {
+    let ret = raw::syscall3(
+        Syscall::DeviceLeaseAttachDma,
+        lease.raw() as u64,
+        dma_resource.raw() as u64,
+        expected_generation,
+    );
+    raw::decode(ret).map(|_| ())
+}
+
+/// Query live Ring-0 hardware IOMMU translation telemetry (Stage N.2).
+pub fn system_iommu_status() -> Result<huesos_abi::pci_iommu::KernelIommuStatus> {
+    let mut status = huesos_abi::pci_iommu::KernelIommuStatus::TRUSTED_INACTIVE;
+    let ret = raw::syscall1(
+        Syscall::SystemIommuStatus,
+        &mut status as *mut huesos_abi::pci_iommu::KernelIommuStatus as u64,
+    );
+    raw::decode(ret)?;
+    Ok(status)
+}

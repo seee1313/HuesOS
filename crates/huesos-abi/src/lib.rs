@@ -659,6 +659,14 @@ pub enum Syscall {
     /// `Fair` with `a2 = weight`, or `a1 = 1` for CBS `Deadline` with
     /// `a2 = capacity_ns` and `a3 = period_ns`).
     SchedSetPolicy = 95,
+    /// Bind an existing `DmaPool` `Resource` handle (`a2`, requiring
+    /// `READ | WRITE`) into the hardware IOMMU domain of an active
+    /// `DeviceLease` handle (`a1`, requiring `WRITE`) for `expected_generation`
+    /// (`a3`, Stage N.2).
+    DeviceLeaseAttachDma = 96,
+    /// Read live Ring-0 hardware IOMMU translation telemetry into `a1`
+    /// (`*mut pci_iommu::KernelIommuStatus`, unprivileged, Stage N.2).
+    SystemIommuStatus = 97,
 }
 
 /// Userspace execution personality tracked per [`Process`] and published in
@@ -1113,6 +1121,8 @@ impl Syscall {
             93 => Self::ProcessSetAbi,
             94 => Self::ClockGetMonotonicNs,
             95 => Self::SchedSetPolicy,
+            96 => Self::DeviceLeaseAttachDma,
+            97 => Self::SystemIommuStatus,
             _ => return None,
         })
     }
@@ -2117,6 +2127,8 @@ mod tests {
         assert_eq!(Syscall::ProcessSetAbi as u64, 93);
         assert_eq!(Syscall::ClockGetMonotonicNs as u64, 94);
         assert_eq!(Syscall::SchedSetPolicy as u64, 95);
+        assert_eq!(Syscall::DeviceLeaseAttachDma as u64, 96);
+        assert_eq!(Syscall::SystemIommuStatus as u64, 97);
         assert_eq!(Syscall::ProcessTerminate as u64, 83);
         assert_eq!(Syscall::FutexWait as u64, 84);
         assert_eq!(Syscall::FutexWake as u64, 85);
@@ -2151,7 +2163,9 @@ mod tests {
         assert_eq!(Syscall::from_raw(93), Some(Syscall::ProcessSetAbi));
         assert_eq!(Syscall::from_raw(94), Some(Syscall::ClockGetMonotonicNs));
         assert_eq!(Syscall::from_raw(95), Some(Syscall::SchedSetPolicy));
-        assert_eq!(Syscall::from_raw(96), None);
+        assert_eq!(Syscall::from_raw(96), Some(Syscall::DeviceLeaseAttachDma));
+        assert_eq!(Syscall::from_raw(97), Some(Syscall::SystemIommuStatus));
+        assert_eq!(Syscall::from_raw(98), None);
         assert_eq!(Syscall::from_raw(28), Some(Syscall::VmoCreateEx));
         assert_eq!(Syscall::from_raw(30), Some(Syscall::VmarProtect));
         assert_eq!(Syscall::from_raw(31), Some(Syscall::ChannelPeek));
@@ -2240,8 +2254,10 @@ mod tests {
         assert_eq!(Syscall::from_raw(93), Some(Syscall::ProcessSetAbi));
         assert_eq!(Syscall::from_raw(94), Some(Syscall::ClockGetMonotonicNs));
         assert_eq!(Syscall::from_raw(95), Some(Syscall::SchedSetPolicy));
+        assert_eq!(Syscall::from_raw(96), Some(Syscall::DeviceLeaseAttachDma));
+        assert_eq!(Syscall::from_raw(97), Some(Syscall::SystemIommuStatus));
         // Append-only: the next number past the newest syscall stays unmapped.
-        assert_eq!(Syscall::from_raw(96), None);
+        assert_eq!(Syscall::from_raw(98), None);
     }
 
     #[test]

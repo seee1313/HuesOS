@@ -41,6 +41,71 @@ pub const HEADER_FLAGS_V1: u8 =
 /// Unit flag: unit covers all PCI devices on its segment (`INCLUDE_PCI_ALL`).
 pub const UNIT_FLAG_INCLUDE_PCI_ALL: u8 = 1 << 0;
 
+/// [`KernelIommuStatus::runtime_flags`]: VT-d Caching Mode (`CAP.CM == 1`).
+pub const RUNTIME_FLAG_CACHING_MODE: u8 = 1 << 0;
+/// [`KernelIommuStatus::runtime_flags`]: Hardware supports Interrupt Remapping.
+pub const RUNTIME_FLAG_INTR_REMAP_HW: u8 = 1 << 1;
+/// [`KernelIommuStatus::runtime_flags`]: Interrupt Remapping is actively enabled.
+pub const RUNTIME_FLAG_INTR_REMAP_ACTIVE: u8 = 1 << 2;
+
+/// Live Ring-0 IOMMU translation telemetry returned by
+/// [`crate::Syscall::SystemIommuStatus`] (Stage N.2).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct KernelIommuStatus {
+    /// Active hardware engine kind ([`IommuHardwareKind`] discriminant).
+    pub hardware_kind: u8,
+    /// Effective kernel enforcement mode ([`IommuMode`] discriminant).
+    pub active_mode: u8,
+    /// Number of hardware IOMMU units actively translating DMA (`GSTS.TES == 1`).
+    pub active_unit_count: u8,
+    /// Bitmask of `RUNTIME_FLAG_*` runtime properties.
+    pub runtime_flags: u8,
+    /// Number of currently active per-lease IOMMU domains.
+    pub active_domains: u32,
+    /// Total 4 KiB `DmaPool` pages mapped across active lease domains.
+    pub mapped_pages: u64,
+    /// Monotonic count of completed synchronous lease-domain teardowns.
+    pub teardown_count: u64,
+    /// Monotonic count of hardware DMA faults captured since boot.
+    pub fault_count: u64,
+}
+
+impl KernelIommuStatus {
+    /// Canonical fail-closed status when no hardware IOMMU is active (`Trusted` mode).
+    pub const TRUSTED_INACTIVE: Self = Self {
+        hardware_kind: IommuHardwareKind::None as u8,
+        active_mode: IommuMode::Trusted as u8,
+        active_unit_count: 0,
+        runtime_flags: 0,
+        active_domains: 0,
+        mapped_pages: 0,
+        teardown_count: 0,
+        fault_count: 0,
+    };
+
+    /// Decoded [`IommuMode`] (`Isolated` iff hardware translation is genuinely live).
+    pub const fn mode(&self) -> IommuMode {
+        match IommuMode::from_raw(self.active_mode) {
+            Some(mode) => mode,
+            None => IommuMode::Trusted,
+        }
+    }
+
+    /// Decoded [`IommuHardwareKind`].
+    pub const fn kind(&self) -> IommuHardwareKind {
+        match IommuHardwareKind::from_raw(self.hardware_kind) {
+            Some(kind) => kind,
+            None => IommuHardwareKind::None,
+        }
+    }
+
+    /// True when VT-d Caching Mode (`CM == 1`) is reported by hardware.
+    pub const fn caching_mode(&self) -> bool {
+        (self.runtime_flags & RUNTIME_FLAG_CACHING_MODE) != 0
+    }
+}
+
 const CHECKSUM_OFFSET: usize = 36;
 
 /// Discovered platform IOMMU architecture.
@@ -640,5 +705,15 @@ mod tests {
             encode(&bad_ir, &mut buf),
             Err(IommuWireError::InvalidPolicyState)
         );
+    }
+
+    #[test]
+    fn kernel_iommu_status_layout_and_helpers() {
+        assert_eq!(core::mem::size_of::<KernelIommuStatus>(), 32);
+        assert_eq!(core::mem::align_of::<KernelIommuStatus>(), 8);
+        let inactive = KernelIommuStatus::TRUSTED_INACTIVE;
+        assert_eq!(inactive.mode(), IommuMode::Trusted);
+        assert_eq!(inactive.kind(), IommuHardwareKind::None);
+        assert!(!inactive.caching_mode());
     }
 }

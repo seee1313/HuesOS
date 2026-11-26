@@ -28,7 +28,7 @@ treating roadmaps as current feature claims.
 
 ## Firmware, PCI, storage, networking, and display
 
-- [ACPI_RING3.md](ACPI_RING3.md), [UACPI.md](UACPI.md), [IOAPIC_ROUTING.md](IOAPIC_ROUTING.md).
+- [ACPI_RING3.md](ACPI_RING3.md), [UACPI.md](UACPI.md), [IOAPIC_ROUTING.md](IOAPIC_ROUTING.md), [IOMMU_VTD.md](IOMMU_VTD.md).
 - [PCI_MANAGER_ARCHITECTURE.md](PCI_MANAGER_ARCHITECTURE.md), [PCI_PRODUCTION_ROADMAP.md](PCI_PRODUCTION_ROADMAP.md).
 - [NVME.md](NVME.md), [HXFS_DESIGN.md](HXFS_DESIGN.md), [HXFS_V6.md](HXFS_V6.md),
   [KEY_BROKER.md](KEY_BROKER.md), [VERIFIED_BOOT_TPM.md](VERIFIED_BOOT_TPM.md),

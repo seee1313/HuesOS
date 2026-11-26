@@ -128,6 +128,29 @@ fn probe() -> Result<(), &'static str> {
     Ok(())
 }
 
+/// Prepare the QEMU `edu` PCI test function for kernel boot-selftest probes:
+/// locate `1234:11e8` on bus 0, map BAR0 uncached, verify its identification
+/// register, enable Memory Space + Bus Master, and return `(location, bar0_va)`.
+pub(crate) fn prepare_edu_for_selftest() -> Result<(PciAddress, u64), &'static str> {
+    let (location, bar0_base, bar0_len) = find_edu().ok_or("edu device not found on bus 0")?;
+    match map_mmio_window(bar0_base, bar0_len) {
+        Ok(()) | Err(huesos_arch::paging::KernelPageError::AlreadyMapped) => {}
+        Err(_) => return Err("BAR0 mapping failed"),
+    }
+    let base = huesos_arch::paging::phys_to_virt(bar0_base).as_u64();
+    enable_intx(location);
+    if mmio_read32(base + EDU_ID_OFFSET as u64) != EDU_ID_VALUE {
+        return Err("edu identification register mismatch");
+    }
+    Ok((location, base))
+}
+
+/// Clear PCI `BUS_MASTER` on `location` after a boot-selftest DMA probe completes.
+pub(crate) fn quiesce_edu_bus_master(location: PciAddress) {
+    let current = read_config_u16(location, off::COMMAND);
+    write_config_u16(location, off::COMMAND, current & !command::BUS_MASTER);
+}
+
 /// Locate the first `edu` function on PCI bus 0. Returns its address and
 /// decoded BAR0 window.
 fn find_edu() -> Option<(PciAddress, u64, u64)> {

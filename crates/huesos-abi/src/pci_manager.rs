@@ -40,6 +40,16 @@ pub const DEVICE_LEASE_RO_LABEL: &[u8] = b"pci-lease-ro";
 /// Label carrying the read-only `DeviceLease` handle bound specifically to
 /// `driver-host-nvme` (Stage J.2 / AP-22).
 pub const DEVICE_LEASE_NVME_RO_LABEL: &[u8] = b"pci-lease-ro:nvme";
+/// Label carrying the supervisor-only `DeviceLease` handle (`READ | WRITE |
+/// TRANSFER`) for `driver-host-nvme` so `DriverManager` can attach `DmaPool`
+/// grants into the hardware IOMMU domain and revoke on crash (Stage N.2).
+pub const DEVICE_LEASE_NVME_RW_LABEL: &[u8] = b"pci-lease-rw:nvme";
+/// Label carrying the supervisor-only `DeviceLease` handle (`READ | WRITE |
+/// TRANSFER`) for `net-service` (Stage N.2).
+pub const DEVICE_LEASE_NET_RW_LABEL: &[u8] = b"pci-lease-rw:net";
+/// Label carrying the supervisor-only `DeviceLease` handle (`READ | WRITE |
+/// TRANSFER`) for `wlan-service` (Stage N.2).
+pub const DEVICE_LEASE_WLAN_RW_LABEL: &[u8] = b"pci-lease-rw:wlan";
 /// Label carrying a narrow lease-bound `Resource` handle (`Mmio`, `IoPort`,
 /// `Irq`, or `DmaPool`) minted via `DeviceLeaseMintResource` (AP-21).
 pub const LEASE_RESOURCE_LABEL: &[u8] = b"pci-lease-res";
