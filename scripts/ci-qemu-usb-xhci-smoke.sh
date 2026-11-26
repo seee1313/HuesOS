@@ -352,37 +352,6 @@ def send_line(text: str) -> None:
         time.sleep(0.04)
 
 
-send_line("lsusb -v --bot-smoke --log-serial\n")
-wait_serial('USB_BOT_SMOKE_OK block_size=512 blocks=73728 xfer=512 lba0_tag="HUESOS-USB3-BOT-SMOKE"')
-time.sleep(0.3)
-
-send_line("hsh /mnt/usb0/smoke.hsh\n")
-while time.monotonic() < deadline:
-    with open(usb_img_path, "rb") as uf:
-        blob = uf.read()
-    if b"USB-FAT32-E2E-OK" in blob:
-        break
-    with open(serial_path, "r", encoding="utf-8", errors="replace") as sf:
-        sc = sf.read()
-    if "KERNEL PANIC" in sc or "[driver-host:xhci] PANIC" in sc:
-        fail("panic observed while running /mnt/usb0/smoke.hsh")
-    time.sleep(0.2)
-else:
-    fail("timed out waiting for /mnt/usb0/smoke.hsh to persist USB-FAT32-E2E-OK on usb-storage")
-
-try:
-    qmp_cmd("quit")
-except Exception:
-    pass
-qmp.close()
-time.sleep(0.2)
-
-with open(usb_img_path, "rb") as uf:
-    disk = uf.read()
-
-if disk[:22] != b"HUESOS-USB3-BOT-SMOKE\n":
-    fail("LBA 0 BOT smoke tag was overwritten")
-
 PART_START = 64
 RESERVED = 32
 NUM_FATS = 2
@@ -390,12 +359,12 @@ FAT_SECTORS = 576
 FIRST_DATA = PART_START + RESERVED + NUM_FATS * FAT_SECTORS
 
 
-def fat_next(cl: int) -> int:
+def fat_next(img_bytes: bytes, cl: int) -> int:
     off = (PART_START + RESERVED) * 512 + cl * 4
-    return struct.unpack_from("<I", disk, off)[0] & 0x0FFFFFFF
+    return struct.unpack_from("<I", img_bytes, off)[0] & 0x0FFFFFFF
 
 
-def read_chain(start_cl: int) -> bytes:
+def read_chain(img_bytes: bytes, start_cl: int) -> bytes:
     if start_cl < 2:
         return b""
     out = bytearray()
@@ -404,8 +373,8 @@ def read_chain(start_cl: int) -> bytes:
     while 2 <= cl < 0x0FFFFFF8 and cl not in seen:
         seen.add(cl)
         off = (FIRST_DATA + (cl - 2)) * 512
-        out.extend(disk[off : off + 512])
-        cl = fat_next(cl)
+        out.extend(img_bytes[off : off + 512])
+        cl = fat_next(img_bytes, cl)
     return bytes(out)
 
 
@@ -450,36 +419,78 @@ def parse_dir(raw: bytes) -> dict:
     return entries
 
 
-root = parse_dir(read_chain(2))
+send_line("lsusb -v --bot-smoke --log-serial\n")
+wait_serial('USB_BOT_SMOKE_OK block_size=512 blocks=73728 xfer=512 lba0_tag="HUESOS-USB3-BOT-SMOKE"')
+time.sleep(0.3)
+
+send_line("hsh /mnt/usb0/smoke.hsh\n")
+last_root = {}
+last_sub = {}
+while time.monotonic() < deadline:
+    with open(usb_img_path, "rb") as uf:
+        snap = uf.read()
+    if len(snap) >= 73728 * 512:
+        last_root = parse_dir(read_chain(snap, 2))
+        if "sub" in last_root:
+            last_sub = parse_dir(read_chain(snap, last_root["sub"][1]))
+            if "done.txt" in last_sub and last_sub["done.txt"][2] > 0:
+                done_payload = read_chain(snap, last_sub["done.txt"][1])[: last_sub["done.txt"][2]]
+                if b"USB-FAT32-E2E-OK" in done_payload:
+                    break
+    with open(serial_path, "r", encoding="utf-8", errors="replace") as sf:
+        sc = sf.read()
+    if "KERNEL PANIC" in sc or "[driver-host:xhci] PANIC" in sc or "[hsh] PANIC" in sc:
+        fail("panic observed while running /mnt/usb0/smoke.hsh")
+    time.sleep(0.25)
+else:
+    fail(
+        f"timed out waiting for /mnt/usb0/sub/done.txt (root={sorted(last_root)}, sub={sorted(last_sub)})"
+    )
+
+time.sleep(0.2)
+try:
+    qmp_cmd("quit")
+except Exception:
+    pass
+qmp.close()
+time.sleep(0.3)
+
+with open(usb_img_path, "rb") as uf:
+    disk = uf.read()
+
+if disk[:22] != b"HUESOS-USB3-BOT-SMOKE\n":
+    fail("LBA 0 BOT smoke tag was overwritten")
+
+root = parse_dir(read_chain(disk, 2))
 if "ls_root.txt" not in root or "sub" not in root:
     fail(f"expected ls_root.txt and sub in FAT32 root, got: {sorted(root)}")
 
-ls_root_text = read_chain(root["ls_root.txt"][1])[: root["ls_root.txt"][2]].decode("utf-8", errors="replace")
+ls_root_text = read_chain(disk, root["ls_root.txt"][1])[: root["ls_root.txt"][2]].decode("utf-8", errors="replace")
 if "HelloFromHost.txt" not in ls_root_text or "smoke.hsh" not in ls_root_text:
     fail(f"unexpected /mnt/usb0 ls output: {ls_root_text!r}")
 
-sub = parse_dir(read_chain(root["sub"][1]))
+sub = parse_dir(read_chain(disk, root["sub"][1]))
 if "tmp_rm.txt" in sub:
     fail("rm /mnt/usb0/sub/tmp_rm.txt did not remove FAT32 entry")
 for expected in ("CopiedLongName.txt", "lsblk.txt", "df.txt", "done.txt"):
     if expected not in sub:
         fail(f"missing /mnt/usb0/sub/{expected} in FAT32 subdir: {sorted(sub)}")
 
-copied = read_chain(sub["CopiedLongName.txt"][1])[: sub["CopiedLongName.txt"][2]]
+copied = read_chain(disk, sub["CopiedLongName.txt"][1])[: sub["CopiedLongName.txt"][2]]
 if copied != b"FAT32-LFN-HOST-SEED-OK\n":
     fail(f"CopiedLongName.txt content mismatch: {copied!r}")
 
-lsblk_txt = read_chain(sub["lsblk.txt"][1])[: sub["lsblk.txt"][2]].decode("utf-8", errors="replace")
+lsblk_txt = read_chain(disk, sub["lsblk.txt"][1])[: sub["lsblk.txt"][2]].decode("utf-8", errors="replace")
 for tok in ("/dev/block/usb0", "vfat", "FAT32", "/mnt/usb0"):
     if tok not in lsblk_txt:
         fail(f"lsblk.txt missing {tok!r}: {lsblk_txt!r}")
 
-df_txt = read_chain(sub["df.txt"][1])[: sub["df.txt"][2]].decode("utf-8", errors="replace")
+df_txt = read_chain(disk, sub["df.txt"][1])[: sub["df.txt"][2]].decode("utf-8", errors="replace")
 for tok in ("fat32", "/mnt/usb0"):
     if tok not in df_txt:
         fail(f"df.txt missing {tok!r}: {df_txt!r}")
 
-done_txt = read_chain(sub["done.txt"][1])[: sub["done.txt"][2]].decode("utf-8", errors="replace")
+done_txt = read_chain(disk, sub["done.txt"][1])[: sub["done.txt"][2]].decode("utf-8", errors="replace")
 if "USB-FAT32-E2E-OK" not in done_txt:
     fail(f"done.txt mismatch: {done_txt!r}")
 PY

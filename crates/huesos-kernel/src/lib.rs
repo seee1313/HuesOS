@@ -810,7 +810,10 @@ fn initialize_hardware_iommu(archive: Option<&[u8]>, memory_regions: &[MemoryReg
         }
         discover_from_acpi_tables(None, Some(&table_bytes[..ivrs_length]))
     } else {
-        let _ = writeln!(writer, "[iommu] no DMAR/IVRS table in archive; DMA mode=Trusted");
+        let _ = writeln!(
+            writer,
+            "[iommu] no DMAR/IVRS table in archive; DMA mode=Trusted"
+        );
         return;
     };
 
@@ -821,9 +824,7 @@ fn initialize_hardware_iommu(archive: Option<&[u8]>, memory_regions: &[MemoryReg
         let _ = writeln!(
             writer,
             "[iommu] IOMMU discovery rejected (kind={:?}, status={:?}, units={}); DMA mode=Trusted",
-            report.kind,
-            report.status,
-            report.unit_count
+            report.kind, report.status, report.unit_count
         );
         return;
     }

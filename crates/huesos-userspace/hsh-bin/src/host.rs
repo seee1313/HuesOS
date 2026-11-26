@@ -2941,11 +2941,14 @@ impl ShellHost for HshHost {
 
 fn split_usb0_rel(abs: &str) -> Option<String> {
     if abs == "/mnt/usb0" {
-        Some(String::from("/"))
-    } else {
-        abs.strip_prefix("/mnt/usb0/")
-            .map(|rest| format!("/{rest}"))
+        return Some(String::from("/"));
     }
+    let rest = abs.strip_prefix("/mnt/usb0/")?;
+    Some(format!("/{rest}"))
+}
+
+fn usb_fat_err(op: &str, rel: &str, err: huesos_fat::DriverError) -> String {
+    format!("{op} '/mnt/usb0{rel}': {err:?}")
 }
 
 struct HshUsbSectorIo {
@@ -2961,12 +2964,13 @@ impl huesos_fat::BlockDevice for HshUsbSectorIo {
         if buf.len() != 512 {
             return Err(huesos_fat::DriverError::InvalidSector);
         }
-        let mut dev = self
-            .dev
-            .try_borrow_mut()
-            .map_err(|_| huesos_fat::DriverError::ReadError)?;
-        dev.read_blocks(u64::from(sector), 1, buf)
-            .map_err(|_| huesos_fat::DriverError::ReadError)
+        let Ok(mut dev) = self.dev.try_borrow_mut() else {
+            return Err(huesos_fat::DriverError::ReadError);
+        };
+        if dev.read_blocks(u64::from(sector), 1, buf).is_err() {
+            return Err(huesos_fat::DriverError::ReadError);
+        }
+        Ok(())
     }
 
     fn write_sector(
@@ -2977,12 +2981,13 @@ impl huesos_fat::BlockDevice for HshUsbSectorIo {
         if buf.len() != 512 {
             return Err(huesos_fat::DriverError::InvalidSector);
         }
-        let mut dev = self
-            .dev
-            .try_borrow_mut()
-            .map_err(|_| huesos_fat::DriverError::WriteError)?;
-        dev.write_blocks(u64::from(sector), 1, buf)
-            .map_err(|_| huesos_fat::DriverError::WriteError)
+        let Ok(mut dev) = self.dev.try_borrow_mut() else {
+            return Err(huesos_fat::DriverError::WriteError);
+        };
+        if dev.write_blocks(u64::from(sector), 1, buf).is_err() {
+            return Err(huesos_fat::DriverError::WriteError);
+        }
+        Ok(())
     }
 
     fn sector_size(&self) -> u32 {
@@ -3008,7 +3013,8 @@ impl HshHost {
         } else {
             HostPathKind::File
         };
-        Some((kind, if info.is_dir { 0 } else { u64::from(info.size) }))
+        let size = if info.is_dir { 0 } else { u64::from(info.size) };
+        Some((kind, size))
     }
 
     fn usb_list_dir(&self, rel: &str) -> Vec<String> {
@@ -3018,53 +3024,58 @@ impl HshHost {
         let Ok(fs) = huesos_fat::FatFileSystem::mount_auto(&io) else {
             return Vec::new();
         };
-        fs.list_dir(rel)
-            .map(|items| items.into_iter().map(|e| e.name).collect())
-            .unwrap_or_default()
+        let Ok(items) = fs.list_dir(rel) else {
+            return Vec::new();
+        };
+        items.into_iter().map(|e| e.name).collect()
     }
 
     fn usb_read_file(&self, rel: &str) -> Result<Vec<u8>, String> {
-        let io = self
-            .open_usb_io()
-            .ok_or_else(|| String::from("redirect failed: /mnt/usb0 unavailable"))?;
-        let fs = huesos_fat::FatFileSystem::mount_auto(&io)
-            .map_err(|_| String::from("redirect failed: /mnt/usb0 mount error"))?;
-        let sz = fs
-            .file_size(rel)
-            .map_err(|e| format!("stat '/mnt/usb0{rel}': {e:?}"))?
-            .min(256 * 1024) as usize;
+        let Some(io) = self.open_usb_io() else {
+            return Err(String::from("redirect failed: /mnt/usb0 unavailable"));
+        };
+        let Ok(fs) = huesos_fat::FatFileSystem::mount_auto(&io) else {
+            return Err(String::from("redirect failed: /mnt/usb0 mount error"));
+        };
+        let raw_sz = fs.file_size(rel).map_err(|e| usb_fat_err("stat", rel, e))?;
+        let sz = (raw_sz as usize).min(256 * 1024);
         let mut out = alloc::vec![0u8; sz];
-        let n = fs
-            .read_at(rel, 0, &mut out)
-            .map_err(|e| format!("read '/mnt/usb0{rel}': {e:?}"))?;
+        let n = match fs.read_at(rel, 0, &mut out) {
+            Ok(n) => n,
+            Err(e) => return Err(usb_fat_err("read", rel, e)),
+        };
         out.truncate(n);
         Ok(out)
     }
 
     fn usb_write_file(&self, rel: &str, data: &[u8], append: bool) -> Result<(), String> {
-        let io = self
-            .open_usb_io()
-            .ok_or_else(|| String::from("redirect failed: /mnt/usb0 unavailable"))?;
-        let fs = huesos_fat::FatFileSystem::mount_auto(&io)
-            .map_err(|_| String::from("redirect failed: /mnt/usb0 mount error"))?;
+        let Some(io) = self.open_usb_io() else {
+            return Err(String::from("redirect failed: /mnt/usb0 unavailable"));
+        };
+        let Ok(fs) = huesos_fat::FatFileSystem::mount_auto(&io) else {
+            return Err(String::from("redirect failed: /mnt/usb0 mount error"));
+        };
         match fs.stat(rel) {
             Ok(info) if info.is_dir => return Err(format!("'/mnt/usb0{rel}': is a directory")),
             Ok(_) => {}
             Err(huesos_fat::DriverError::FileNotFound) => {
-                fs.create_file(rel)
-                    .map_err(|e| format!("create '/mnt/usb0{rel}': {e:?}"))?;
+                if let Err(e) = fs.create_file(rel) {
+                    return Err(usb_fat_err("create", rel, e));
+                }
             }
-            Err(e) => return Err(format!("stat '/mnt/usb0{rel}': {e:?}")),
+            Err(e) => return Err(usb_fat_err("stat", rel, e)),
         }
         let offset = if append {
             fs.file_size(rel).unwrap_or(0)
         } else {
-            fs.truncate(rel, 0)
-                .map_err(|e| format!("truncate '/mnt/usb0{rel}': {e:?}"))?;
+            if let Err(e) = fs.truncate(rel, 0) {
+                return Err(usb_fat_err("truncate", rel, e));
+            }
             0
         };
-        fs.write_at(rel, offset, data)
-            .map_err(|e| format!("write '/mnt/usb0{rel}': {e:?}"))?;
+        if let Err(e) = fs.write_at(rel, offset, data) {
+            return Err(usb_fat_err("write", rel, e));
+        }
         if let Ok(mut dev) = io.dev.try_borrow_mut() {
             let _ = dev.flush();
         }

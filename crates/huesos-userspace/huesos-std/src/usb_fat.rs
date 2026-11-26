@@ -84,7 +84,8 @@ pub fn usb_block_device() -> Result<&'static spin::Mutex<AsyncBlockClient>> {
     USB_DEV
         .call_once(|| {
             let guard = reg.lock();
-            AsyncBlockClient::open_usb(&guard).ok().map(spin::Mutex::new)
+            let client = AsyncBlockClient::open_usb(&guard).ok()?;
+            Some(spin::Mutex::new(client))
         })
         .as_ref()
         .ok_or(Error::new(ErrorKind::NotFound))

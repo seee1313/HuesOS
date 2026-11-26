@@ -232,13 +232,12 @@ impl File {
         // the ABI has no code to carry that answer, so an existing file is
         // opened and truncated instead. Without this, creating a file that a
         // previous run left behind looked like a bad request.
-        let mut file = match open_file(path, false) {
-            Ok(inner) => Self::wrap(inner),
-            Err(error) if error.kind() == ErrorKind::NotFound => {
-                Self::wrap(open_file(path, true)?)
-            }
+        let inner = match open_file(path, false) {
+            Ok(inner) => inner,
+            Err(error) if error.kind() == ErrorKind::NotFound => open_file(path, true)?,
             Err(error) => return Err(error),
         };
+        let mut file = Self::wrap(inner);
         file.truncate(0)?;
         Ok(file)
     }
