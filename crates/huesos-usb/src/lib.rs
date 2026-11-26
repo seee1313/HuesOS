@@ -24,7 +24,9 @@ mod tests {
         ParsedDescriptor, SetupPacket, DESC_CONFIGURATION, DESC_DEVICE, DESC_ENDPOINT,
         DESC_INTERFACE, DESC_SS_EP_COMPANION, DESC_STRING, USB_CLASS_HID, USB_CLASS_MASS_STORAGE,
     };
-    use super::hid::{HidBootKeyboard, HidKeyEvent, HidMouseEvent, KEY_ARROW_UP, MAX_HID_KEY_EVENTS};
+    use super::hid::{
+        HidBootKeyboard, HidKeyEvent, HidMouseEvent, KEY_ARROW_UP, MAX_HID_KEY_EVENTS,
+    };
     use super::hub::{append_route_port, HubDescriptor, HubPortStatus};
     use super::xhci::{
         init_input_context, portsc_preserve_rw, set_input_endpoint_context, usb_interval_to_xhci,
@@ -362,7 +364,9 @@ mod tests {
         assert!(completed_ok.get());
 
         let exec: Executor<4, 128> = Executor::new();
-        let tid = exec.spawn(hues_async::yield_now()).unwrap_or(TaskId::INVALID);
+        let tid = exec
+            .spawn(hues_async::yield_now())
+            .unwrap_or(TaskId::INVALID);
         assert_ne!(tid, TaskId::INVALID);
         assert_eq!(exec.poll(), 2);
         assert!(exec.is_empty());

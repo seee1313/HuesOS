@@ -110,7 +110,7 @@ impl SetupPacket {
         Self {
             bm_request_type: 0x21,
             b_request: 0x0B,
-            w_value: u16::from(report_protocol),
+            w_value: if report_protocol { 1 } else { 0 },
             w_index: interface_num as u16,
             w_length: 0,
         }

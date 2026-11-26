@@ -17,9 +17,9 @@ use huesos_usb::bot::{
 };
 use huesos_usb::ch9::{
     decode_usb_string_ascii, ConfigurationDescriptor, DescriptorIter, DeviceDescriptor,
-    EndpointDescriptor, ParsedDescriptor, SetupPacket, DESC_CONFIGURATION, DESC_DEVICE, DESC_STRING,
-    HID_PROTO_KEYBOARD, HID_PROTO_MOUSE, MSC_PROTO_BULK_ONLY, MSC_SUBCLASS_SCSI, USB_CLASS_HID,
-    USB_CLASS_HUB, USB_CLASS_MASS_STORAGE,
+    EndpointDescriptor, ParsedDescriptor, SetupPacket, DESC_CONFIGURATION, DESC_DEVICE,
+    DESC_STRING, HID_PROTO_KEYBOARD, HID_PROTO_MOUSE, MSC_PROTO_BULK_ONLY, MSC_SUBCLASS_SCSI,
+    USB_CLASS_HID, USB_CLASS_HUB, USB_CLASS_MASS_STORAGE,
 };
 use huesos_usb::hid::{HidBootKeyboard, HidKeyEvent, HidMouseEvent, MAX_HID_KEY_EVENTS};
 use huesos_usb::hub::{
@@ -31,8 +31,8 @@ use huesos_usb::xhci::{
     default_ep0_mps, init_input_context, portsc_preserve_rw, portsc_speed,
     set_input_endpoint_context, usb_interval_to_xhci, CompletionCode, ControlTransferType,
     DecodedEvent, EndpointContextParams, EventRingConsumer, PortProtocolRange, ProducerRing,
-    SlotContextParams, Trb, XhciCapabilities, XhciEndpointType, ERDP_EHB, IMAN_IE, IMAN_IP, IR_ERDP,
-    IR_ERSTBA, IR_ERSTSZ, IR_IMAN, IR_IMOD, OP_CONFIG, OP_CRCR, OP_DCBAAP, OP_PAGESIZE,
+    SlotContextParams, Trb, XhciCapabilities, XhciEndpointType, ERDP_EHB, IMAN_IE, IMAN_IP,
+    IR_ERDP, IR_ERSTBA, IR_ERSTSZ, IR_IMAN, IR_IMOD, OP_CONFIG, OP_CRCR, OP_DCBAAP, OP_PAGESIZE,
     OP_PORT_BASE, OP_PORT_STRIDE, OP_USBCMD, OP_USBSTS, PORTSC_CCS, PORTSC_CHANGE_BITS, PORTSC_PED,
     PORTSC_PP, PORTSC_PR, PORTSC_PRC, RT_IR0_BASE, USBCMD_HCRST, USBCMD_HSEE, USBCMD_INTE,
     USBCMD_RS, USBLEGSUP_BIOS_OWNED, USBLEGSUP_OS_OWNED, USBSTS_CNR, USBSTS_EINT, USBSTS_HCH,
@@ -1615,9 +1615,14 @@ impl XhciController {
 
         let mut port = 1u8;
         while port <= dev_snap.hub_ports && port <= 15 {
+            let p_idx = usize::from(port);
             let mut raw = [0u8; 4];
             if self
-                .control_in(hub_slot_id, SetupPacket::hub_get_port_status(port), &mut raw)
+                .control_in(
+                    hub_slot_id,
+                    SetupPacket::hub_get_port_status(port),
+                    &mut raw,
+                )
                 .await
                 .is_err()
             {
@@ -1640,7 +1645,7 @@ impl XhciController {
                     .await;
             }
 
-            let existing_child = self.hw.borrow().devices[d_idx].hub_child_slots[usize::from(port)];
+            let existing_child = self.hw.borrow().devices[d_idx].hub_child_slots[p_idx];
             if !st0.connected {
                 if existing_child != 0 {
                     println!(
@@ -1648,7 +1653,7 @@ impl XhciController {
                         hub_slot_id, port, existing_child
                     );
                     self.teardown_device_tree(existing_child).await;
-                    self.hw.borrow_mut().devices[d_idx].hub_child_slots[usize::from(port)] = 0;
+                    self.hw.borrow_mut().devices[d_idx].hub_child_slots[p_idx] = 0;
                     self.inventory_dirty.set(true);
                 }
                 port += 1;
@@ -1676,7 +1681,11 @@ impl XhciController {
             while tries < 25 {
                 libcanvas::system::sleep_ms(12);
                 if self
-                    .control_in(hub_slot_id, SetupPacket::hub_get_port_status(port), &mut raw)
+                    .control_in(
+                        hub_slot_id,
+                        SetupPacket::hub_get_port_status(port),
+                        &mut raw,
+                    )
                     .await
                     .is_ok()
                 {
@@ -1734,13 +1743,12 @@ impl XhciController {
                 )
                 .await
             {
-                self.hw.borrow_mut().devices[d_idx].hub_child_slots[usize::from(port)] = child_slot;
+                self.hw.borrow_mut().devices[d_idx].hub_child_slots[p_idx] = child_slot;
                 self.inventory_dirty.set(true);
-                let child_is_hub =
-                    self.hw.borrow().devices[usize::from(child_slot - 1)].is_hub;
+                let c_idx = usize::from(child_slot - 1);
+                let child_is_hub = self.hw.borrow().devices[c_idx].is_hub;
                 if child_is_hub {
-                    self.hw.borrow_mut().hub_dirty_mask |=
-                        1u32 << usize::from(child_slot - 1);
+                    self.hw.borrow_mut().hub_dirty_mask |= 1u32 << c_idx;
                 }
             }
             port += 1;
@@ -1940,7 +1948,13 @@ impl XhciController {
         let csw_off = ctrl_scratch_off + 64;
         self.dma.zero_range(csw_off, CSW_BYTES);
         if let Err(err) = self
-            .bulk_xfer_dma(slot_id, bot.bulk_in_dci, bot.bulk_in_ring, csw_off, CSW_BYTES)
+            .bulk_xfer_dma(
+                slot_id,
+                bot.bulk_in_dci,
+                bot.bulk_in_ring,
+                csw_off,
+                CSW_BYTES,
+            )
             .await
         {
             if err == UsbError::TrbFailed(CompletionCode::StallError) {
@@ -2027,7 +2041,9 @@ impl XhciController {
         .await?;
         let mut csw_raw = [0u8; CSW_BYTES];
         self.dma.copy_out(csw_off, &mut csw_raw);
-        let csw = CommandStatusWrapper::decode(&csw_raw, cbw.tag).ok_or(UsbError::BotFailed)?;
+        let Some(csw) = CommandStatusWrapper::decode(&csw_raw, cbw.tag) else {
+            return Err(UsbError::BotFailed);
+        };
         if csw.status == CswStatus::Passed {
             Ok(())
         } else {
@@ -2078,7 +2094,9 @@ impl XhciController {
         .await?;
         let mut csw_raw = [0u8; CSW_BYTES];
         self.dma.copy_out(csw_off, &mut csw_raw);
-        let csw = CommandStatusWrapper::decode(&csw_raw, cbw.tag).ok_or(UsbError::BotFailed)?;
+        let Some(csw) = CommandStatusWrapper::decode(&csw_raw, cbw.tag) else {
+            return Err(UsbError::BotFailed);
+        };
         if csw.status == CswStatus::Passed {
             Ok(())
         } else {

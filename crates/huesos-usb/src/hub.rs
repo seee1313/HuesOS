@@ -105,7 +105,11 @@ pub const fn append_route_port(parent_route: u32, hub_port: u8) -> Option<u32> {
     if hub_port == 0 {
         return None;
     }
-    let nibble = if hub_port > 15 { 15u32 } else { hub_port as u32 };
+    let nibble = if hub_port > 15 {
+        15u32
+    } else {
+        hub_port as u32
+    };
     let mut tier = 0u32;
     while tier < 5 {
         let shift = tier * 4;

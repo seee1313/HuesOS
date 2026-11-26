@@ -80,13 +80,8 @@ pub const PORTSC_CEC: u32 = 1 << 23;
 /// Warm Port Reset (`RW1S`, USB3 only).
 pub const PORTSC_WPR: u32 = 1 << 31;
 /// All `PORTSC` `RW1C` status-change bits (`17..=23`).
-pub const PORTSC_CHANGE_BITS: u32 = PORTSC_CSC
-    | PORTSC_PEC
-    | PORTSC_WRC
-    | PORTSC_OCC
-    | PORTSC_PRC
-    | PORTSC_PLC
-    | PORTSC_CEC;
+pub const PORTSC_CHANGE_BITS: u32 =
+    PORTSC_CSC | PORTSC_PEC | PORTSC_WRC | PORTSC_OCC | PORTSC_PRC | PORTSC_PLC | PORTSC_CEC;
 /// Safe read-modify-write mask preserving `RWS` bits (`PP`, `PIC`, `WCE/WDE/WOE`)
 /// while zeroing `PED` (`RW1C`) and all `17..=23` `RW1C` change bits.
 pub const PORTSC_RW_PRESERVE_MASK: u32 = PORTSC_PP | (0x3 << 14) | (0x7 << 25);
