@@ -5,8 +5,8 @@ use huesos_abi::ErrorCode;
 use huesos_abi::{SchedCpuRecord, SchedSummary, TaskRecord};
 
 use crate::callbacks::{
-    CLOCK_FN, CLOCK_NS_FN, CPU_COUNT_FN, CPU_MASK_FN, CURRENT_CPU_FN, SCHED_CPU_FN,
-    SCHED_SET_POLICY_FN, SCHED_SUMMARY_FN, SHUTDOWN_FN, TASK_RECORD_FN,
+    CLOCK_FN, CLOCK_NS_FN, CPU_COUNT_FN, CPU_MASK_FN, CURRENT_CPU_FN, IOMMU_STATUS_FN,
+    SCHED_CPU_FN, SCHED_SET_POLICY_FN, SCHED_SUMMARY_FN, SHUTDOWN_FN, TASK_RECORD_FN,
 };
 use crate::user_memory;
 use crate::SyscallResult;
@@ -124,5 +124,17 @@ pub(crate) fn sys_system_shutdown() -> SyscallResult {
     shutdown()?;
     // A successful shutdown never returns. Keep the ABI result defined for a
     // test implementation that elects to return instead.
+    Ok(0)
+}
+
+pub(crate) fn sys_system_iommu_status(
+    out_status: *mut huesos_abi::pci_iommu::KernelIommuStatus,
+) -> SyscallResult {
+    user_memory::validate_write(out_status)?;
+    let status = (*IOMMU_STATUS_FN.lock()).map_or(
+        huesos_abi::pci_iommu::KernelIommuStatus::TRUSTED_INACTIVE,
+        |f| f(),
+    );
+    user_memory::write_value(out_status, &status)?;
     Ok(0)
 }

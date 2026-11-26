@@ -293,12 +293,15 @@ pub unsafe fn kmain(boot_info: BootInfo) -> ! {
     let extable_test_requested = cmdline_requests_extable_test(&verified_hbi);
     #[cfg(feature = "boot-selftest")]
     let irq_test_requested = cmdline_requests_irq_test(&verified_hbi);
+    #[cfg(feature = "boot-selftest")]
+    let iommu_test_requested = cmdline_requests_iommu_test(&verified_hbi);
     let storage_off_requested = cmdline_requests_storage_off(&verified_hbi);
     let sealed_key_module = verified_hbi
         .get_module(boot::hbi::ModuleType::SealedKey)
         .ok();
     init::object_init(boot_measurement, sealed_key_module);
     install_config_mint_authority(acpi_archive.as_deref(), boot_info.memory_regions);
+    initialize_hardware_iommu(acpi_archive.as_deref(), boot_info.memory_regions);
 
     if firmware_tables_mapped && uacpi_tables_ready {
         match huesos_uacpi::Table::find(b"APIC").and_then(|table| {
@@ -376,6 +379,11 @@ pub unsafe fn kmain(boot_info: BootInfo) -> ! {
     #[cfg(feature = "boot-selftest")]
     if irq_test_requested {
         boot::irq_probe::run();
+    }
+
+    #[cfg(feature = "boot-selftest")]
+    if iommu_test_requested {
+        boot::iommu_probe::run();
     }
 
     #[cfg(feature = "boot-selftest")]
@@ -683,6 +691,205 @@ fn install_config_mint_authority(archive: Option<&[u8]>, memory_regions: &[Memor
     }
 }
 
+fn kernel_iommu_bind_dma(
+    pci_address_packed: u64,
+    lease_koid: u64,
+    lease_generation: u64,
+    base: u64,
+    len: u64,
+) -> Result<(), huesos_object::DeviceLeaseError> {
+    huesos_arch::vtd::bind_lease_dma(pci_address_packed, lease_koid, lease_generation, base, len)
+        .map_err(|_| huesos_object::DeviceLeaseError::IommuBindFailed)
+}
+
+/// Discover `DMAR` from the validated boot ACPI archive, verify that no `DRHD`
+/// MMIO base aliases usable RAM, initialize hardware Intel VT-d second-stage
+/// DMA translation (`GCMD.TE = 1`), and wire `DeviceLease` lifecycle hooks
+/// (Stage N.2). Platforms without `DMAR` stay cleanly in `Trusted` mode.
+fn initialize_hardware_iommu(archive: Option<&[u8]>, memory_regions: &[MemoryRegion]) {
+    use core::fmt::Write;
+    use huesos_abi::acpi_archive::{self, ArchiveReader};
+    use huesos_pci::iommu::{discover_from_acpi_tables, FirmwareIommuKind, FirmwareIommuStatus};
+
+    huesos_syscalls::set_iommu_status_fn(huesos_arch::vtd::status);
+    huesos_object::set_iommu_lease_hooks(Some(huesos_object::IommuLeaseHooks {
+        bind_dma: kernel_iommu_bind_dma,
+        teardown: huesos_arch::vtd::teardown_lease,
+    }));
+
+    let mut writer = huesos_arch::serial::SerialWriter;
+    let Some(bytes) = archive else {
+        let _ = writeln!(writer, "[iommu] no ACPI archive; DMA mode=Trusted");
+        return;
+    };
+    let mut header = [0u8; acpi_archive::HEADER_BYTES];
+    if bytes.read_exact_at(0, &mut header).is_err() {
+        let _ = writeln!(
+            writer,
+            "[iommu] archive header unreadable; DMA mode=Trusted"
+        );
+        return;
+    }
+    let Ok(header_v2) = acpi_archive::decode_v2_header(&header) else {
+        let _ = writeln!(writer, "[iommu] archive header rejected; DMA mode=Trusted");
+        return;
+    };
+
+    let mut dmar: Option<(u64, usize)> = None;
+    let mut ivrs_present = false;
+    for index in 0..header_v2.table_count {
+        let entry_offset = header_v2.table_entries_offset
+            + u64::from(index) * acpi_archive::TABLE_ENTRY_BYTES as u64;
+        let mut entry_bytes = [0u8; acpi_archive::TABLE_ENTRY_BYTES];
+        if bytes.read_exact_at(entry_offset, &mut entry_bytes).is_err() {
+            let _ = writeln!(
+                writer,
+                "[iommu] table directory truncated; DMA mode=Trusted"
+            );
+            return;
+        }
+        let Ok(entry) = acpi_archive::decode_v2_table_entry(&entry_bytes) else {
+            let _ = writeln!(writer, "[iommu] table entry invalid; DMA mode=Trusted");
+            return;
+        };
+        if entry.signature == *b"DMAR" {
+            if dmar.is_some() {
+                let _ = writeln!(writer, "[iommu] duplicate DMAR tables; DMA mode=Trusted");
+                return;
+            }
+            dmar = Some((entry.offset, entry.length as usize));
+        } else if entry.signature == *b"IVRS" {
+            ivrs_present = true;
+        }
+    }
+
+    if ivrs_present && dmar.is_some() {
+        let _ = writeln!(
+            writer,
+            "[iommu] conflicting DMAR+IVRS tables; DMA mode=Trusted"
+        );
+        return;
+    }
+    let Some((dmar_offset, dmar_length)) = dmar else {
+        let _ = writeln!(writer, "[iommu] no DMAR table in archive; DMA mode=Trusted");
+        return;
+    };
+
+    const DMAR_MAX_BYTES: usize = 4096;
+    if !(48..=DMAR_MAX_BYTES).contains(&dmar_length) {
+        let _ = writeln!(
+            writer,
+            "[iommu] DMAR length out of bounds; DMA mode=Trusted"
+        );
+        return;
+    }
+    let mut dmar_bytes = [0u8; DMAR_MAX_BYTES];
+    if bytes
+        .read_exact_at(dmar_offset, &mut dmar_bytes[..dmar_length])
+        .is_err()
+    {
+        let _ = writeln!(writer, "[iommu] DMAR read failed; DMA mode=Trusted");
+        return;
+    }
+
+    let report = discover_from_acpi_tables(Some(&dmar_bytes[..dmar_length]), None);
+    if report.kind != FirmwareIommuKind::IntelVtd
+        || report.status != FirmwareIommuStatus::Valid
+        || report.unit_count == 0
+        || report.unit_count > huesos_arch::vtd::MAX_DRHD_UNITS
+    {
+        let _ = writeln!(
+            writer,
+            "[iommu] DMAR discovery rejected (status={:?}, units={}); DMA mode=Trusted",
+            report.status, report.unit_count
+        );
+        return;
+    }
+
+    // Reject any DRHD register window that aliases usable physical RAM.
+    const MAX_DRHD_WINDOW: u64 = 65_536;
+    for unit in &report.units[..report.unit_count] {
+        let Some(unit_end) = unit.register_base.checked_add(MAX_DRHD_WINDOW) else {
+            let _ = writeln!(writer, "[iommu] DRHD register overflow; DMA mode=Trusted");
+            return;
+        };
+        for ram in memory_regions {
+            if !ram.usable || ram.length == 0 {
+                continue;
+            }
+            let ram_end = ram.base.saturating_add(ram.length);
+            if unit.register_base < ram_end && ram.base < unit_end {
+                let _ = writeln!(
+                    writer,
+                    "[iommu] DRHD base {:#x} aliases usable RAM; DMA mode=Trusted",
+                    unit.register_base
+                );
+                return;
+            }
+        }
+    }
+
+    let mut units = [huesos_arch::vtd::VtdUnitInit {
+        segment: 0,
+        include_pci_all: false,
+        scope_bdf_count: 0,
+        register_base: 0,
+        scope_bdfs: [0; 4],
+    }; huesos_arch::vtd::MAX_DRHD_UNITS];
+    for (dst, src) in units
+        .iter_mut()
+        .zip(report.units[..report.unit_count].iter())
+    {
+        *dst = huesos_arch::vtd::VtdUnitInit {
+            segment: src.segment,
+            include_pci_all: src.include_pci_all,
+            scope_bdf_count: src.scope_bdf_count,
+            register_base: src.register_base,
+            scope_bdfs: src.scope_bdfs,
+        };
+    }
+
+    let keep_regions = report
+        .region_count
+        .min(huesos_arch::vtd::MAX_RESERVED_REGIONS);
+    let mut regions = [huesos_arch::vtd::VtdReservedRegion {
+        segment: 0,
+        requester_bdf: 0,
+        base_address: 0,
+        limit_address: 0,
+    }; huesos_arch::vtd::MAX_RESERVED_REGIONS];
+    for (dst, src) in regions
+        .iter_mut()
+        .zip(report.regions[..keep_regions].iter())
+    {
+        *dst = huesos_arch::vtd::VtdReservedRegion {
+            segment: src.segment,
+            requester_bdf: src.requester_bdf,
+            base_address: src.base_address,
+            limit_address: src.limit_address,
+        };
+    }
+
+    match huesos_arch::vtd::initialize(&units[..report.unit_count], &regions[..keep_regions]) {
+        Ok(caps) => {
+            let _ = writeln!(
+                writer,
+                "[iommu] Intel VT-d active: units={} aw={}-bit caching_mode={} domains_max={} mode=Isolated",
+                report.unit_count,
+                caps.address_width.bits(),
+                caps.caching_mode,
+                caps.max_domains
+            );
+        }
+        Err(error) => {
+            let _ = writeln!(
+                writer,
+                "[iommu] Intel VT-d hardware init failed ({error:?}); DMA mode=Trusted"
+            );
+        }
+    }
+}
+
 fn install_readonly_vmo(
     process: &huesos_object::Process,
     slot: huesos_abi::HandleValue,
@@ -887,6 +1094,11 @@ fn cmdline_requests_panic_test(image: &boot::hbi::HbiImage<'_>) -> bool {
 #[cfg(feature = "boot-selftest")]
 fn cmdline_requests_irq_test(image: &boot::hbi::HbiImage<'_>) -> bool {
     cmdline_flag_present(image, b"irq_test=1")
+}
+
+#[cfg(feature = "boot-selftest")]
+fn cmdline_requests_iommu_test(image: &boot::hbi::HbiImage<'_>) -> bool {
+    cmdline_flag_present(image, b"iommu_test=1")
 }
 
 #[cfg(feature = "boot-selftest")]

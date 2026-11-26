@@ -47,7 +47,8 @@ pub use channel::{
     ChannelSendFailure, CHANNEL_INLINE_BYTES, CHANNEL_INLINE_HANDLES,
 };
 pub use device_lease::{
-    DeviceLease, DeviceLeaseError, DeviceLeaseSnapshot, DeviceLeaseState, PORT_PACKET_DEVICE_GONE,
+    set_iommu_lease_hooks, DeviceLease, DeviceLeaseError, DeviceLeaseSnapshot, DeviceLeaseState,
+    IommuBindDmaFn, IommuLeaseHooks, IommuTeardownFn, PORT_PACKET_DEVICE_GONE,
 };
 pub use futex::{FutexNode, FutexTable};
 pub use handle::{Handle, HandleTable, HandleTableError, HandleValue, Rights, INVALID_HANDLE};

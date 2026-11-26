@@ -916,9 +916,19 @@ fn report_to_hiom_snapshot(
             pci_iommu::IommuDiscoveryStatus::ConflictFallbackTrusted
         }
     };
-    let active_mode = match report.active_dma_isolation {
-        DmaIsolation::Trusted => pci_iommu::IommuMode::Trusted,
-        DmaIsolation::IommuDomain(_) => pci_iommu::IommuMode::Isolated,
+    let kernel_iommu = libcanvas::device_lease::system_iommu_status()
+        .unwrap_or(pci_iommu::KernelIommuStatus::TRUSTED_INACTIVE);
+    let active_mode = if report.status == FirmwareIommuStatus::Valid
+        && kernel_iommu.mode() == pci_iommu::IommuMode::Isolated
+        && kernel_iommu.kind() == hardware_kind
+        && kernel_iommu.active_unit_count > 0
+    {
+        pci_iommu::IommuMode::Isolated
+    } else {
+        match report.active_dma_isolation {
+            DmaIsolation::Trusted => pci_iommu::IommuMode::Trusted,
+            DmaIsolation::IommuDomain(_) => pci_iommu::IommuMode::Isolated,
+        }
     };
     let mut flags = 0u8;
     if report.interrupt_remapping_supported {

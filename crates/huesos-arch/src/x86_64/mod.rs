@@ -19,6 +19,7 @@ pub mod preemption;
 pub mod serial;
 pub mod syscall;
 pub mod timer_callback;
+pub mod vtd;
 
 /// Early architecture initialization (before paging/heap are set up).
 ///

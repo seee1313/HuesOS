@@ -20,6 +20,7 @@ members = [
     "crates/huesos-uacpi",
     "crates/huesos-decoder-fuzz",
     "crates/huesos-lifecycle",
+    "crates/huesos-iommu",
     "crates/huesos-ioapic",
     "crates/huesos-extable",
     "crates/huesos-waitset",

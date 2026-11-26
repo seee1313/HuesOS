@@ -76,6 +76,7 @@ const VIRTIO_STATUS_FEATURES_OK: u8 = 8;
 const VIRTIO_NET_F_MAC: u32 = 1 << 5;
 const VIRTIO_NET_F_STATUS: u32 = 1 << 16;
 const VIRTIO_F_VERSION_1_HI: u32 = 1 << 0; // bit 32
+const VIRTIO_F_ACCESS_PLATFORM_HI: u32 = 1 << 1; // bit 33 (IOMMU / platform DMA)
 
 const VRING_DESC_F_WRITE: u16 = 2;
 
@@ -317,7 +318,7 @@ impl VirtioNetNic {
             return None;
         }
         let guest_lo = host_lo & (VIRTIO_NET_F_MAC | VIRTIO_NET_F_STATUS);
-        let guest_hi = VIRTIO_F_VERSION_1_HI;
+        let guest_hi = VIRTIO_F_VERSION_1_HI | (host_hi & VIRTIO_F_ACCESS_PLATFORM_HI);
         common_win.write32(common_off + COMMON_GFSELECT, 0);
         common_win.write32(common_off + COMMON_GF, guest_lo);
         common_win.write32(common_off + COMMON_GFSELECT, 1);

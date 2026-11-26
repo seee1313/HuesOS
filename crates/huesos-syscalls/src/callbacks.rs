@@ -24,6 +24,9 @@ pub(crate) static CLOCK_NS_FN: Once<fn() -> u64> = Once::new();
 /// Scheduler policy update callback (`kind`, `weight_or_capacity_ns`, `period_ns`).
 pub type SchedSetPolicyFn = fn(u64, u64, u64) -> Result<(), ErrorCode>;
 pub(crate) static SCHED_SET_POLICY_FN: Mutex<Option<SchedSetPolicyFn>> = Mutex::new(None);
+/// Live kernel IOMMU status snapshot callback (Stage N.2).
+pub type IommuStatusFn = fn() -> huesos_abi::pci_iommu::KernelIommuStatus;
+pub(crate) static IOMMU_STATUS_FN: Mutex<Option<IommuStatusFn>> = Mutex::new(None);
 /// Global online-CPU mask callback.
 type CpuCountFn = fn() -> usize;
 type CpuOnlineFn = fn(usize) -> bool;
@@ -148,6 +151,11 @@ pub fn set_clock_ns_fn(f: fn() -> u64) {
 /// Set the scheduler policy update callback. Called once by kernel init.
 pub fn set_sched_set_policy_fn(f: SchedSetPolicyFn) {
     *SCHED_SET_POLICY_FN.lock() = Some(f);
+}
+
+/// Set the live kernel IOMMU status snapshot callback. Called once by kernel init.
+pub fn set_iommu_status_fn(f: IommuStatusFn) {
+    *IOMMU_STATUS_FN.lock() = Some(f);
 }
 
 /// Set the online CPU mask callback. Called once by kernel init.

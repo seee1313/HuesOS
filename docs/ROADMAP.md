@@ -15,16 +15,15 @@ until bare-metal and hardware-isolation gates close.
 
 ### 1. PCI / PCIe Production Qualification (`PCI_PRODUCTION_ROADMAP.md` Stages M.2, N.2, O)
 
-Stages `A` through `J`, `K` (policy + boot self-check), `L`, `M.1`, and
-`N.1`/`N.3` (`AP-0..AP-23`) are merged on `main`, and the legacy kernel PCI scan
-is permanently removed (`tools/check-kernel-no-pci.py`). Remaining tracks before
+Stages `A` through `J`, `K` (policy + boot self-check), `L`, `M.1`, `N.1`,
+`N.2` (Intel VT-d hardware second-stage DMA domains, [IOMMU_VTD.md](IOMMU_VTD.md)),
+and `N.3` (`AP-0..AP-23`) are implemented, and the legacy kernel PCI scan is
+permanently removed (`tools/check-kernel-no-pci.py`). Remaining tracks before
 `PCI production-ready = true`:
 
-- **Stage N.2 — Hardware IOMMU DMA isolation (`PCI Isolated Profile`):** program
-  Intel VT-d (`DMAR`) and AMD-Vi (`IVRS`) second-stage DMA translation tables in
-  the kernel, bind `DeviceLease` lifetimes to per-device IOMMU domains, and pass
-  negative unauthorized-DMA fault tests (replacing `dma_isolation=trusted` on
-  capable platforms).
+- **Stage N.2 (AMD-Vi backend):** program AMD-Vi (`IVRS`) second-stage DMA
+  translation tables to match Intel VT-d `PCI Isolated Profile` parity on AMD
+  silicon.
 - **Stage K.2 (live runtime) & Stage M.2 (`QuiesceRemap` driver):** wire live
   PCIe Root Port hotplug interrupts to runtime `DriverHost` spawn/teardown in
   QEMU and migrate a first non-storage driver onto live `QuiesceRemap` BAR

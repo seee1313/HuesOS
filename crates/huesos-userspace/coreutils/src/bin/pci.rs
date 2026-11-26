@@ -142,6 +142,19 @@ fn run_hpin_report(show_iommu: bool, show_functions: bool, show_bars: bool) -> i
             intr_hw,
             intr_active
         ));
+        if let Ok(k_status) = libcanvas::device_lease::system_iommu_status() {
+            cu::outln(&format!(
+                "IOMMU-KERNEL mode={} hw={} units={} caching_mode={} active_domains={} mapped_pages={} teardowns={} faults={}",
+                k_status.mode().label(),
+                k_status.kind().label(),
+                k_status.active_unit_count,
+                k_status.caching_mode(),
+                k_status.active_domains,
+                k_status.mapped_pages,
+                k_status.teardown_count,
+                k_status.fault_count
+            ));
+        }
     }
 
     if show_functions {

@@ -29,7 +29,7 @@ an Ed25519-signed **HBI v2.2** boot image module.
    entry point (with `huesos-std` layered safely on top for `/bin` utilities,
    and `PeHostApi` inside `ld-pe` bridging native Win64 DLLs).
 5. **Policy Crates Forbidding `unsafe`** — Complex decision engines (`huesos-sched`,
-   `huesos-pci`, `huesos-lifecycle`, `huesos-proclife`, `huesos-handlemove`,
+   `huesos-pci`, `huesos-iommu`, `huesos-lifecycle`, `huesos-proclife`, `huesos-handlemove`,
    `huesos-waitset`, `huesos-extable`, `huesos-ioapic`, `huesos-quota`,
    `huesos-net`, `huesos-tls`, `huesos-ieee80211`, `huesos-wpa`, `huesos-rtw88`,
    `huesos-pe`, `huesos-hsh`) are standalone `#![no_std]`, `#![forbid(unsafe_code)]`
@@ -43,7 +43,7 @@ boot/kernel:   huesos-boot, huesos-kernel, huesos-arch, huesos-hal,
                huesos-abi, huesos-sync, huesos-fb, huesos-bootux
 sched/policy:  huesos-sched, huesos-lifecycle, huesos-proclife,
                huesos-handlemove, huesos-waitset, huesos-extable,
-               huesos-ioapic, huesos-quota, hues-async
+               huesos-ioapic, huesos-iommu, huesos-quota, hues-async
 acpi/pci/hw:   huesos-uacpi, huesos-pci, huesos-tpm, huesos-nvme
 storage:       huesos-hxfs, huesos-hxfs-proto, huesos-blobfs,
                huesos-gpt, huesos-fat
@@ -81,9 +81,12 @@ userspace:     libcanvas, huesos-std, init, driver-manager,
    parity), initializes per-CPU GDT/TSS/IDT/`STAR`/`LSTAR`/`SFMASK`/SIMD/scheduler,
    and gates AP execution on `APS_MAY_RUN`.
 7. Verifies the HBI v2.2 Ed25519 signature, builds the immutable ACPI archive v2,
-   creates `init`'s bootstrap handles (`BOOTFS` VMO, `FrameDraw`, `SystemControl`,
-   `AcpiBroker`, `PciConfigMint`, `DeviceLeaseAuthority`, `VolumeKey`), releases
-   APs, and enters Ring 3 `huesos-init`.
+   initializes Intel VT-d hardware DMA translation ([IOMMU_VTD.md](IOMMU_VTD.md))
+   when firmware publishes a valid `DMAR` table (falling back fail-closed to
+   `Trusted` mode otherwise), creates `init`'s bootstrap handles (`BOOTFS` VMO,
+   `FrameDraw`, `SystemControl`, `AcpiBroker`, `PciConfigMint`,
+   `DeviceLeaseAuthority`, `VolumeKey`), releases APs, and enters Ring 3
+   `huesos-init`.
 8. **`init` → `driver-manager` cascade**:
    - `driver-manager` supervises `acpi-manager` (`HMCF`, `HPCI` v2, `HIOM` v1),
      `pci-manager` (sole PCI config executor + `HPIN` v1 inventory), `key-broker`,
