@@ -50,15 +50,18 @@ annotate_failure() {
     printf '::error::ci-qemu-usb-xhci-smoke: %s (profile=%s smp=%s)\n' \
         "$reason" "$profile" "$cpus"
     while IFS= read -r line; do
+        printf '::error::usb| %s\n' "$line"
+    done < <(grep -E '(xhci|HUSB|lsusb|USB_BOT|usb)' "$log" 2>/dev/null | tail -n 5 || true)
+    while IFS= read -r line; do
         printf '::error::serial| %s\n' "$line"
-    done < <(tail -n 20 "$log" 2>/dev/null || true)
+    done < <(tail -n 4 "$log" 2>/dev/null || true)
 }
 
 build_log="build/usb-xhci-smoke-build.log"
 set +e
 case "$profile" in
-    debug)   HUESOS_BOOT_SELFTEST=1 CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-1}" make iso PROFILE=debug >"$build_log" 2>&1 ;;
-    release) HUESOS_BOOT_SELFTEST=1 CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-1}" make iso-release >"$build_log" 2>&1 ;;
+    debug)   CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-1}" make iso PROFILE=debug >"$build_log" 2>&1 ;;
+    release) CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-1}" make iso-release >"$build_log" 2>&1 ;;
     *) echo "unsupported profile: $profile" >&2; exit 2 ;;
 esac
 build_status=$?
@@ -197,7 +200,7 @@ for ch in cmd_line:
             ],
         },
     )
-    time.sleep(0.03)
+    time.sleep(0.05)
     qmp_cmd(
         "input-send-event",
         {
@@ -210,7 +213,7 @@ for ch in cmd_line:
             ],
         },
     )
-    time.sleep(0.03)
+    time.sleep(0.05)
 
 wait_serial('USB_BOT_SMOKE_OK block_size=512 blocks=8192 xfer=512 lba0_tag="HUESOS-USB3-BOT-SMOKE"')
 qmp.close()
