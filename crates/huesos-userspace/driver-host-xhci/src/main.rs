@@ -463,9 +463,10 @@ fn bind_interrupts(irq: &ResourceSlot) -> Result<InterruptState, &'static str> {
     let mut idx = 0usize;
     while idx < bind_count {
         let vector = irq.base + idx as u64;
-        let intr = Interrupt::create_from_resource(irq_handle, vector as u32)
-            .map_err(|_| "irq-create")?;
-        intr.bind_port(&state.port, vector).map_err(|_| "irq-bind")?;
+        let intr =
+            Interrupt::create_from_resource(irq_handle, vector as u32).map_err(|_| "irq-create")?;
+        intr.bind_port(&state.port, vector)
+            .map_err(|_| "irq-bind")?;
         state.slots[idx].handle = Some(intr);
         state.count += 1;
         idx += 1;

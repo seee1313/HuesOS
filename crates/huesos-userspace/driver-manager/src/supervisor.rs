@@ -3197,9 +3197,9 @@ impl DriverManager {
         if self.input_host.is_none() && self.xhci_host.is_none() {
             return;
         }
-        let Some(registry) = self.registry_channel.as_ref() else {
+        if self.registry_channel.is_none() {
             return;
-        };
+        }
         let Ok((client_end, app_tx)) = Channel::pair() else {
             return;
         };
@@ -3229,6 +3229,9 @@ impl DriverManager {
             println!("[driver-manager] failed to attach any keyboard source");
             return;
         }
+        let Some(registry) = self.registry_channel.as_ref() else {
+            return;
+        };
         if let Err((e, _handle)) = registry.write_handle(
             protocol::KEYBOARD_CHANNEL.as_bytes(),
             client_end.into_handle(),
