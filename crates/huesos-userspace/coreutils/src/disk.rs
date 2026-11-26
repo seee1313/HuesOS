@@ -145,12 +145,43 @@ impl DiskIo {
         })
     }
 
+    /// Open the USB BOT block device (`/dev/block/usb0`) through `DriverManager`.
+    pub fn open_usb_device() -> Result<Self> {
+        let shared = huesos_std::usb_fat::usb_block_device()?;
+        let info = shared.lock().info()?;
+        let block_size = info.block_size.max(LBA_SIZE as u32);
+        let total_lbas = info.block_count * u64::from(block_size / LBA_SIZE as u32);
+        let model = if info.model_str().is_empty() {
+            String::from("USB Storage")
+        } else {
+            String::from(info.model_str())
+        };
+        let serial = if info.serial_str().is_empty() {
+            String::from("-")
+        } else {
+            String::from(info.serial_str())
+        };
+        Ok(Self {
+            backing: Backing::Device(shared, block_size),
+            total_lbas,
+            writable: true,
+            label: String::from("/dev/block/usb0"),
+            model,
+            serial,
+        })
+    }
+
     /// Open `path` as an image, or the granted device when `path` is
-    /// `/dev/nvme0`, `/dev/disk` or `None`.
+    /// `/dev/nvme0`, `/dev/disk`, `/dev/block/usb0`, or `None`.
     pub fn open(path: Option<&str>, writable: bool) -> Result<Self> {
         match path {
             None | Some("/dev/nvme0") | Some("/dev/disk") => {
                 let mut io = Self::open_device()?;
+                io.writable = writable;
+                Ok(io)
+            }
+            Some("/dev/block/usb0") | Some("/dev/usb0") => {
+                let mut io = Self::open_usb_device()?;
                 io.writable = writable;
                 Ok(io)
             }
@@ -379,6 +410,39 @@ pub fn probe_hxfs_at(io: &DiskIo, lba0: u64) -> Option<BareVolume> {
     }
     let mut reader = HxfsProbeIoAt { io, lba0 };
     probe_bare_volume(&mut reader).ok()
+}
+
+/// Probe a FAT16/FAT32 BPB at `lba0` of `io`, returning `"FAT16"` or `"FAT32"`.
+pub fn probe_fat_at(io: &DiskIo, lba0: u64) -> Option<&'static str> {
+    if lba0 >= io.total_lbas() {
+        return None;
+    }
+    let mut sec = [0u8; LBA_SIZE];
+    io.read(lba0, 1, &mut sec).ok()?;
+    let bpb = huesos_fat::FatBpb::decode(&sec)?;
+    Some(if bpb.is_fat32() { "FAT32" } else { "FAT16" })
+}
+
+/// Read non-empty MBR primary partitions `(part_num, start_lba, sector_count, ptype)` from LBA 0.
+pub fn read_mbr_partitions(io: &DiskIo) -> alloc::vec::Vec<(usize, u64, u64, u8)> {
+    let mut out = alloc::vec::Vec::new();
+    if io.total_lbas() == 0 {
+        return out;
+    }
+    let mut sec0 = [0u8; LBA_SIZE];
+    if io.read(0, 1, &mut sec0).is_err() || sec0[510] != 0x55 || sec0[511] != 0xAA {
+        return out;
+    }
+    for idx in 0..4usize {
+        let e = &sec0[446 + idx * 16..446 + (idx + 1) * 16];
+        let ptype = e[4];
+        let start = u32::from_le_bytes([e[8], e[9], e[10], e[11]]);
+        let count = u32::from_le_bytes([e[12], e[13], e[14], e[15]]);
+        if ptype != 0 && ptype != 0xEE && start > 0 && count > 0 {
+            out.push((idx + 1, u64::from(start), u64::from(count), ptype));
+        }
+    }
+    out
 }
 
 /// Adapter that offsets every read by `lba0`, for a partition inside a disk.

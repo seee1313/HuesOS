@@ -22,6 +22,9 @@
 #![no_std]
 #![forbid(unsafe_code)]
 
+/// AMD-Vi (`IVRS`) Device Table, I/O Page Table, Command Ring, and Event Log codecs.
+pub mod amd_vi;
+
 /// Standard 4 KiB IOMMU page size.
 pub const PAGE_SIZE_4K: u64 = 4096;
 /// Mask for 4 KiB page offset bits.
@@ -766,6 +769,31 @@ impl DomainTable {
         lease_generation: u64,
         slpt_root_phys: u64,
     ) -> Result<(usize, u16), VtdError> {
+        self.allocate_domain_min(
+            unit_index,
+            1,
+            max_domains,
+            pci_address_packed,
+            isolation_group_id,
+            lease_koid,
+            lease_generation,
+            slpt_root_phys,
+        )
+    }
+
+    /// Allocate a fresh domain ID (`min_domain_id.max(1)..max_domains`) on `unit_index`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn allocate_domain_min(
+        &mut self,
+        unit_index: u8,
+        min_domain_id: u16,
+        max_domains: u32,
+        pci_address_packed: u64,
+        isolation_group_id: u32,
+        lease_koid: u64,
+        lease_generation: u64,
+        slpt_root_phys: u64,
+    ) -> Result<(usize, u16), VtdError> {
         if slpt_root_phys == 0 || (slpt_root_phys & !PHYS_ADDR_MASK_52) != 0 {
             return Err(VtdError::InvalidAddress);
         }
@@ -802,7 +830,7 @@ impl DomainTable {
         } else {
             max_domains
         };
-        let mut candidate: u32 = 1;
+        let mut candidate: u32 = u32::from(if min_domain_id == 0 { 1 } else { min_domain_id });
         let mut chosen_did: Option<u16> = None;
         while candidate < cap_limit {
             let did = candidate as u16;

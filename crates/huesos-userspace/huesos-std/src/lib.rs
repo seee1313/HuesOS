@@ -61,6 +61,7 @@ pub mod sys;
 pub mod thread;
 pub mod time;
 pub mod tui;
+pub mod usb_fat;
 
 pub use error::{Error, ErrorKind, Result};
 pub use libcanvas::heap::ScudoHeap;

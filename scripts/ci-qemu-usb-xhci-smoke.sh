@@ -49,7 +49,7 @@ trap cleanup EXIT
 echo "log=verbose" > build/cmdline.txt
 
 annotate_failure() {
-    local reason="$1"
+    local reason="${1//$'\n'/ }"
     printf '::error::ci-qemu-usb-xhci-smoke: %s (profile=%s smp=%s)\n' \
         "$reason" "$profile" "$cpus"
     while IFS= read -r line; do
@@ -79,12 +79,133 @@ fi
 
 python3 tools/mkhxfs.py --output "$nvme_img" --blocks 16384 >/dev/null
 python3 - "$usb_img" <<'PY'
+import struct
 import sys
 
 path = sys.argv[1]
-img = bytearray(4 * 1024 * 1024)  # 8192 x 512B blocks
+TOTAL_SECTORS = 73728  # 36 MiB (73728 x 512B blocks -> >= 65525 FAT32 clusters)
+PART_START = 64
+PART_SECTORS = TOTAL_SECTORS - PART_START
+RESERVED = 32
+NUM_FATS = 2
+FAT_SECTORS = 576  # 576 * 128 = 73728 FAT32 entries
+SPC = 1
+
+img = bytearray(TOTAL_SECTORS * 512)
+
+# LBA 0: preserve BOT smoke marker in boot-code bytes + MBR partition 1 (0x0C FAT32 LBA).
 tag = b"HUESOS-USB3-BOT-SMOKE\n"
 img[: len(tag)] = tag
+part_entry = struct.pack("<BBBBBBBBII", 0x80, 0, 1, 0, 0x0C, 0xFE, 0xFF, 0xFF, PART_START, PART_SECTORS)
+img[446 : 446 + 16] = part_entry
+img[510:512] = b"\x55\xAA"
+
+# FAT32 BPB at PART_START.
+bpb = bytearray(512)
+bpb[0:3] = b"\xEB\x58\x90"
+bpb[3:11] = b"HUESFAT3"
+struct.pack_into("<HBHBHHBHHHII", bpb, 11, 512, SPC, RESERVED, NUM_FATS, 0, 0, 0xF8, 0, 63, 255, PART_START, PART_SECTORS)
+struct.pack_into("<IHHIHH", bpb, 36, FAT_SECTORS, 0, 0, 2, 1, 6)
+bpb[64] = 0x80
+bpb[66] = 0x29
+struct.pack_into("<I", bpb, 67, 0x20261123)
+bpb[71:82] = b"HUESOS USB0"
+bpb[82:90] = b"FAT32   "
+bpb[510:512] = b"\x55\xAA"
+img[PART_START * 512 : (PART_START + 1) * 512] = bpb
+
+# FSInfo at PART_START + 1.
+fsinfo = bytearray(512)
+struct.pack_into("<I", fsinfo, 0, 0x41615252)
+struct.pack_into("<I", fsinfo, 484, 0x61417272)
+struct.pack_into("<II", fsinfo, 488, 0xFFFFFFFF, 5)
+fsinfo[510:512] = b"\x55\xAA"
+img[(PART_START + 1) * 512 : (PART_START + 2) * 512] = fsinfo
+
+
+def set_fat(cl: int, val: int) -> None:
+    for copy in range(NUM_FATS):
+        off = (PART_START + RESERVED + copy * FAT_SECTORS) * 512 + cl * 4
+        struct.pack_into("<I", img, off, val & 0x0FFFFFFF)
+
+
+def cl_off(cl: int) -> int:
+    first_data = PART_START + RESERVED + NUM_FATS * FAT_SECTORS
+    return (first_data + (cl - 2) * SPC) * 512
+
+
+def lfn_checksum(short11: bytes) -> int:
+    s = 0
+    for b in short11:
+        s = (((s & 1) << 7) + (s >> 1) + b) & 0xFF
+    return s
+
+
+def make_lfn_entries(long_name: str, short11: bytes, attr: int, cluster: int, size: int) -> bytes:
+    chk = lfn_checksum(short11)
+    u16 = [ord(c) for c in long_name]
+    chunks = []
+    for i in range(0, len(u16), 13):
+        part = u16[i : i + 13]
+        if len(part) < 13:
+            part = part + [0x0000] + [0xFFFF] * (12 - len(part))
+        chunks.append(part)
+    out = bytearray()
+    total = len(chunks)
+    for seq_rev, part in enumerate(reversed(chunks)):
+        seq = total - seq_rev
+        ord_byte = seq | (0x40 if seq_rev == 0 else 0)
+        ent = bytearray(32)
+        ent[0] = ord_byte
+        for idx, ch in enumerate(part[:5]):
+            struct.pack_into("<H", ent, 1 + idx * 2, ch)
+        ent[11] = 0x0F
+        ent[12] = 0
+        ent[13] = chk
+        for idx, ch in enumerate(part[5:11]):
+            struct.pack_into("<H", ent, 14 + idx * 2, ch)
+        struct.pack_into("<H", ent, 26, 0)
+        for idx, ch in enumerate(part[11:13]):
+            struct.pack_into("<H", ent, 28 + idx * 2, ch)
+        out.extend(ent)
+    sfn = bytearray(32)
+    sfn[0:11] = short11
+    sfn[11] = attr
+    struct.pack_into("<H", sfn, 20, (cluster >> 16) & 0xFFFF)
+    struct.pack_into("<H", sfn, 26, cluster & 0xFFFF)
+    struct.pack_into("<I", sfn, 28, size)
+    out.extend(sfn)
+    return bytes(out)
+
+
+set_fat(0, 0x0FFFFFF8)
+set_fat(1, 0x0FFFFFFF)
+set_fat(2, 0x0FFFFFFF)  # root dir
+set_fat(3, 0x0FFFFFFF)  # HelloFromHost.txt
+set_fat(4, 0x0FFFFFFF)  # smoke.hsh
+
+hello_bytes = b"FAT32-LFN-HOST-SEED-OK\n"
+smoke_script = (
+    b"mkdir /tmp\n"
+    b"ls /mnt/usb0 > /mnt/usb0/ls_root.txt\n"
+    b"cat /mnt/usb0/HelloFromHost.txt > /tmp/from_usb.txt\n"
+    b"mkdir /mnt/usb0/sub\n"
+    b"cp /tmp/from_usb.txt /mnt/usb0/sub/CopiedLongName.txt\n"
+    b"write /mnt/usb0/sub/tmp_rm.txt DELETE-ME\n"
+    b"rm /mnt/usb0/sub/tmp_rm.txt\n"
+    b"lsblk -f /dev/block/usb0 > /mnt/usb0/sub/lsblk.txt\n"
+    b"df -h /mnt/usb0 > /mnt/usb0/sub/df.txt\n"
+    b"write /mnt/usb0/sub/done.txt USB-FAT32-E2E-OK\n"
+)
+
+img[cl_off(3) : cl_off(3) + len(hello_bytes)] = hello_bytes
+img[cl_off(4) : cl_off(4) + len(smoke_script)] = smoke_script
+
+root_entries = bytearray()
+root_entries.extend(make_lfn_entries("HelloFromHost.txt", b"HELLOF~1TXT", 0x20, 3, len(hello_bytes)))
+root_entries.extend(make_lfn_entries("smoke.hsh", b"SMOKE   HSH", 0x20, 4, len(smoke_script)))
+img[cl_off(2) : cl_off(2) + len(root_entries)] = root_entries
+
 with open(path, "wb") as f:
     f.write(img)
 PY
@@ -108,13 +229,14 @@ qemu-system-x86_64 \
 qemu_pid=$!
 
 set +e
-python3 - "$qmp_socket" "$log" "$timeout_seconds" "$qmp_dir/py_err.txt" <<'PY'
+python3 - "$qmp_socket" "$log" "$usb_img" "$timeout_seconds" "$qmp_dir/py_err.txt" <<'PY'
 import json
 import socket
+import struct
 import sys
 import time
 
-qmp_path, serial_path, timeout_text, err_path = sys.argv[1:]
+qmp_path, serial_path, usb_img_path, timeout_text, err_path = sys.argv[1:]
 deadline = time.monotonic() + float(timeout_text)
 
 
@@ -194,39 +316,183 @@ time.sleep(0.25)
 QCODE_MAP = {
     " ": "spc",
     "-": "minus",
+    "/": "slash",
+    ".": "dot",
+    "_": "minus",
     "\n": "ret",
 }
 
-cmd_line = "lsusb -v --bot-smoke --log-serial\n"
-for ch in cmd_line:
-    qcode = QCODE_MAP.get(ch, ch)
-    qmp_cmd(
-        "input-send-event",
-        {
-            "events": [
-                {
-                    "type": "key",
-                    "data": {"down": True, "key": {"type": "qcode", "data": qcode}},
-                }
-            ]
-        },
-    )
-    time.sleep(0.05)
-    qmp_cmd(
-        "input-send-event",
-        {
-            "events": [
-                {
-                    "type": "key",
-                    "data": {"down": False, "key": {"type": "qcode", "data": qcode}},
-                }
-            ]
-        },
-    )
-    time.sleep(0.05)
 
-wait_serial('USB_BOT_SMOKE_OK block_size=512 blocks=8192 xfer=512 lba0_tag="HUESOS-USB3-BOT-SMOKE"')
+def send_line(text: str) -> None:
+    for ch in text:
+        qcode = QCODE_MAP.get(ch, ch)
+        qmp_cmd(
+            "input-send-event",
+            {
+                "events": [
+                    {
+                        "type": "key",
+                        "data": {"down": True, "key": {"type": "qcode", "data": qcode}},
+                    }
+                ]
+            },
+        )
+        time.sleep(0.04)
+        qmp_cmd(
+            "input-send-event",
+            {
+                "events": [
+                    {
+                        "type": "key",
+                        "data": {"down": False, "key": {"type": "qcode", "data": qcode}},
+                    }
+                ]
+            },
+        )
+        time.sleep(0.04)
+
+
+PART_START = 64
+RESERVED = 32
+NUM_FATS = 2
+FAT_SECTORS = 576
+FIRST_DATA = PART_START + RESERVED + NUM_FATS * FAT_SECTORS
+
+
+def fat_next(img_bytes: bytes, cl: int) -> int:
+    off = (PART_START + RESERVED) * 512 + cl * 4
+    return struct.unpack_from("<I", img_bytes, off)[0] & 0x0FFFFFFF
+
+
+def read_chain(img_bytes: bytes, start_cl: int) -> bytes:
+    if start_cl < 2:
+        return b""
+    out = bytearray()
+    cl = start_cl
+    seen = set()
+    while 2 <= cl < 0x0FFFFFF8 and cl not in seen:
+        seen.add(cl)
+        off = (FIRST_DATA + (cl - 2)) * 512
+        out.extend(img_bytes[off : off + 512])
+        cl = fat_next(img_bytes, cl)
+    return bytes(out)
+
+
+def parse_dir(raw: bytes) -> dict:
+    entries = {}
+    lfn_parts = {}
+    for off in range(0, len(raw), 32):
+        ent = raw[off : off + 32]
+        if ent[0] == 0x00:
+            break
+        if ent[0] == 0xE5:
+            lfn_parts.clear()
+            continue
+        if ent[11] == 0x0F:
+            seq = ent[0] & 0x1F
+            chars = []
+            for p in (1, 3, 5, 7, 9, 14, 16, 18, 20, 22, 24, 28, 30):
+                u = struct.unpack_from("<H", ent, p)[0]
+                if u in (0x0000, 0xFFFF):
+                    break
+                chars.append(chr(u))
+            lfn_parts[seq] = "".join(chars)
+            continue
+        if ent[11] & 0x08:
+            lfn_parts.clear()
+            continue
+        if lfn_parts:
+            name = "".join(lfn_parts[k] for k in sorted(lfn_parts))
+        else:
+            stem = ent[0:8].decode("ascii", errors="replace").rstrip(" ")
+            ext = ent[8:11].decode("ascii", errors="replace").rstrip(" ")
+            name = f"{stem}.{ext}" if ext else stem
+        lfn_parts.clear()
+        if name in (".", ".."):
+            continue
+        hi = struct.unpack_from("<H", ent, 20)[0]
+        lo = struct.unpack_from("<H", ent, 26)[0]
+        cl = (hi << 16) | lo
+        sz = struct.unpack_from("<I", ent, 28)[0]
+        is_dir = bool(ent[11] & 0x10)
+        entries[name] = (is_dir, cl, sz)
+    return entries
+
+
+send_line("lsusb -v --bot-smoke --log-serial\n")
+wait_serial('USB_BOT_SMOKE_OK block_size=512 blocks=73728 xfer=512 lba0_tag="HUESOS-USB3-BOT-SMOKE"')
+time.sleep(0.3)
+
+send_line("hsh /mnt/usb0/smoke.hsh\n")
+last_root = {}
+last_sub = {}
+while time.monotonic() < deadline:
+    with open(usb_img_path, "rb") as uf:
+        snap = uf.read()
+    if len(snap) >= 73728 * 512:
+        last_root = parse_dir(read_chain(snap, 2))
+        if "sub" in last_root:
+            last_sub = parse_dir(read_chain(snap, last_root["sub"][1]))
+            if "done.txt" in last_sub and last_sub["done.txt"][2] > 0:
+                done_payload = read_chain(snap, last_sub["done.txt"][1])[: last_sub["done.txt"][2]]
+                if b"USB-FAT32-E2E-OK" in done_payload:
+                    break
+    with open(serial_path, "r", encoding="utf-8", errors="replace") as sf:
+        sc = sf.read()
+    if "KERNEL PANIC" in sc or "[driver-host:xhci] PANIC" in sc or "[hsh] PANIC" in sc:
+        fail("panic observed while running /mnt/usb0/smoke.hsh")
+    time.sleep(0.25)
+else:
+    fail(
+        f"timed out waiting for /mnt/usb0/sub/done.txt (root={sorted(last_root)}, sub={sorted(last_sub)})"
+    )
+
+time.sleep(0.2)
+try:
+    qmp_cmd("quit")
+except Exception:
+    pass
 qmp.close()
+time.sleep(0.3)
+
+with open(usb_img_path, "rb") as uf:
+    disk = uf.read()
+
+if disk[:22] != b"HUESOS-USB3-BOT-SMOKE\n":
+    fail("LBA 0 BOT smoke tag was overwritten")
+
+root = parse_dir(read_chain(disk, 2))
+if "ls_root.txt" not in root or "sub" not in root:
+    fail(f"expected ls_root.txt and sub in FAT32 root, got: {sorted(root)}")
+
+ls_root_text = read_chain(disk, root["ls_root.txt"][1])[: root["ls_root.txt"][2]].decode("utf-8", errors="replace")
+if "HelloFromHost.txt" not in ls_root_text or "smoke.hsh" not in ls_root_text:
+    fail(f"unexpected /mnt/usb0 ls output: {ls_root_text!r}")
+
+sub = parse_dir(read_chain(disk, root["sub"][1]))
+if "tmp_rm.txt" in sub:
+    fail("rm /mnt/usb0/sub/tmp_rm.txt did not remove FAT32 entry")
+for expected in ("CopiedLongName.txt", "lsblk.txt", "df.txt", "done.txt"):
+    if expected not in sub:
+        fail(f"missing /mnt/usb0/sub/{expected} in FAT32 subdir: {sorted(sub)}")
+
+copied = read_chain(disk, sub["CopiedLongName.txt"][1])[: sub["CopiedLongName.txt"][2]]
+if copied != b"FAT32-LFN-HOST-SEED-OK\n":
+    fail(f"CopiedLongName.txt content mismatch: {copied!r}")
+
+lsblk_txt = read_chain(disk, sub["lsblk.txt"][1])[: sub["lsblk.txt"][2]].decode("utf-8", errors="replace")
+for tok in ("/dev/block/usb0", "vfat", "FAT32", "/mnt/usb0"):
+    if tok not in lsblk_txt:
+        fail(f"lsblk.txt missing {tok!r}: {lsblk_txt!r}")
+
+df_txt = read_chain(disk, sub["df.txt"][1])[: sub["df.txt"][2]].decode("utf-8", errors="replace")
+for tok in ("fat32", "/mnt/usb0"):
+    if tok not in df_txt:
+        fail(f"df.txt missing {tok!r}: {df_txt!r}")
+
+done_txt = read_chain(disk, sub["done.txt"][1])[: sub["done.txt"][2]].decode("utf-8", errors="replace")
+if "USB-FAT32-E2E-OK" not in done_txt:
+    fail(f"done.txt mismatch: {done_txt!r}")
 PY
 py_status=$?
 set -e
@@ -258,7 +524,7 @@ required_markers=(
     'drv usb-hid-kbd'
     'drv usb-hid-mouse'
     'drv usb-storage-bot'
-    'USB_BOT_SMOKE_OK block_size=512 blocks=8192 xfer=512 lba0_tag="HUESOS-USB3-BOT-SMOKE"'
+    'USB_BOT_SMOKE_OK block_size=512 blocks=73728 xfer=512 lba0_tag="HUESOS-USB3-BOT-SMOKE"'
 )
 
 for marker in "${required_markers[@]}"; do

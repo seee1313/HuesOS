@@ -1,9 +1,9 @@
-# Intel VT-d Hardware IOMMU Isolation (`huesos-iommu` & Stage N.2)
+# Hardware IOMMU Isolation: Intel VT-d & AMD-Vi (`huesos-iommu` & Stage N.2)
 
 HuesOS enforces hardware DMA isolation (**PCI Isolated Profile**, Stage N.2 of
-[`PCI_PRODUCTION_ROADMAP.md`](PCI_PRODUCTION_ROADMAP.md)) using **Intel VT-d**
-second-stage address translation when firmware publishes a valid ACPI `DMAR`
-table.
+[`PCI_PRODUCTION_ROADMAP.md`](PCI_PRODUCTION_ROADMAP.md)) across both **Intel
+VT-d** (ACPI `DMAR`) and **AMD-Vi** (ACPI `IVRS`) platforms using per-lease
+4 KiB IO page tables.
 
 ## Trust & Privilege Boundary
 
@@ -12,36 +12,43 @@ Following the microkernel policy-crate split enforced by
 
 1. **`crates/huesos-iommu` (`#![no_std]`, `#![forbid(unsafe_code)]`)** owns all
    pure bit-level codecs and policy state machines:
-   - `VtdCapabilities::parse`: validates `VER_REG`, `CAP_REG`, and `ECAP_REG`,
-     selecting 48-bit (4-level) or 39-bit (3-level) second-stage page tables,
-     detecting Caching Mode (`CAP.CM == 1`), Page-Walk Coherency (`ECAP.C`),
-     `DRD`/`DWD` drain flags, and bounded register offsets (`IOTLB_REG`,
-     `FRCD_REG`).
-   - `RootEntry`, `ContextEntry`, and `SlPte`: encode 128-bit Root/Context
-     descriptors and 64-bit 4 KiB Second-Stage PTEs (`R`/`W`, `TT=00`),
-     permanently reserving `DomainId 0` for `CM=1` compliance.
-   - `build_gcmd`, `ccmd_*`, and `iotlb_*`: construct invalidation and global
-     command words while masking one-shot `GSTS_REG` status bits (`0x96FF_FFFF`).
-   - `FaultRecord`: decodes 128-bit Primary Fault Recording entries (`FRCD_REG`)
-     into PCI Source-ID (`BDF`), 4 KiB faulting IOVA, access direction, and
-     classified `FaultKind`.
+   - **Intel VT-d codecs:** `VtdCapabilities::parse` (`VER_REG`/`CAP_REG`/`ECAP_REG`,
+     39-bit / 48-bit SLPTs, `CM=1`, `ECAP.C`, `IOTLB_REG`/`FRCD_REG`),
+     `RootEntry`/`ContextEntry`/`SlPte`, `build_gcmd`/`ccmd_*`/`iotlb_*`, and
+     `FaultRecord::decode_frcd`.
+   - **AMD-Vi codecs (`amd_vi` module):**
+     - `AmdViDte`: 256-bit Device Table Entries (`AmdViDte::blocked` sets
+       `V = 1, TV = 1, Mode = 4, IR = 0, IW = 0` on `DomainId 1` because `V = 0`
+       in AMD-Vi is pass-through; `AmdViDte::translated` binds `DomainId >= 2`).
+     - `AmdViPte`: 64-bit 4-level (`48`-bit IOVA) IO Page Table entries with
+       `NextLevel` (`3`, `2`, `1` on directories; `0` on 4 KiB leaves) and
+       `IR`/`IW` bits.
+     - `AmdViCommand`: 128-bit ring commands (`COMPLETION_WAIT` store-fence,
+       `INVALIDATE_DEVTAB_ENTRY`, `INVALIDATE_IOMMU_PAGES` full-domain `S = 1, PDE = 1`).
+     - `decode_amd_vi_event`: decodes 128-bit Event Log entries (`IO_PAGE_FAULT`
+       and hardware/table faults) into `FaultRecord`.
    - `DomainTable`: fixed-capacity (`MAX_ACTIVE_DOMAINS = 64`) per-lease domain
-     allocator tracking `(lease_koid, lease_generation) -> DomainId`, enforcing
-     isolation-group exclusivity (`derive_isolation_group`), and accounting
-     mapped `DmaPool` pages and completed teardowns.
+     allocator (`allocate_domain` / `allocate_domain_min`) tracking
+     `(lease_koid, lease_generation) -> DomainId`, enforcing isolation-group
+     exclusivity (`derive_isolation_group`), and accounting mapped `DmaPool`
+     pages and completed teardowns.
 
-2. **`crates/huesos-arch/src/x86_64/vtd.rs` (Ring-0 hardware adapter)** owns
-   the minimal privileged integration boundary:
-   - Maps each `DRHD` MMIO window uncached (`PRESENT | WRITABLE | NO_CACHE | NO_EXECUTE`)
-     after `huesos-kernel` verifies that `DRHD` bases in `DMAR` do not alias
-     usable RAM.
-   - Allocates 4 KiB physical frames for the Root Table, per-bus Context Tables,
-     and per-domain Second-Stage Page Tables from `huesos-pmm`, executing
-     `clflush` on modified cache lines whenever `ECAP.C == 0`.
-   - Pre-populates firmware `RMRR` reserved unity regions (`IOVA == HPA`) before
-     setting `GCMD.TE = 1` and polling `GSTS.TES == 1`.
-   - Exposes `bind_lease_dma` and synchronous `teardown_lease` under
-     `RankedIrqSafeTicketLock` (`LockRank::ARCHITECTURE`).
+2. **`crates/huesos-arch/src/x86_64/{vtd.rs, amd_vi.rs, iommu.rs}` (Ring-0 hardware adapters)**
+   own the minimal privileged integration boundary:
+   - Map each `DRHD` (`4 KiB`) or `IVHD` (`16 KiB`) MMIO window uncached
+     (`PRESENT | WRITABLE | NO_CACHE | NO_EXECUTE`) after `huesos-kernel`
+     verifies that firmware register bases do not alias usable RAM.
+   - **VT-d (`vtd.rs`):** allocates 4 KiB Root, per-bus Context, and SLPT frames
+     from `huesos-pmm`, pre-populates `RMRR` unity regions (`IOVA == HPA`), and
+     sets `GCMD.TE = 1` (`GSTS.TES == 1`).
+   - **AMD-Vi (`amd_vi.rs`, 0 `unsafe` blocks):** allocates a contiguous 2 MiB
+     (`65,536`-entry) Device Table pre-filled with `AmdViDte::blocked`, 4 KiB
+     Command Buffer and Event Log rings, pre-populates `IVMD` unity regions,
+     enables `CmdBufEn | EventLogEn | IommuEn`, and synchronizes every DTE/IOTLB
+     invalidation with a hardware `COMPLETION_WAIT` memory store fence.
+   - **`huesos_arch::iommu`:** unified Ring-0 facade dispatching `bind_lease_dma`,
+     `teardown_lease`, `status_snapshot`, and `drain_faults` to the active
+     backend under `RankedIrqSafeTicketLock` (`LockRank::ARCHITECTURE`).
 
 ## Capability Lifecycle (`DeviceLease` ↔ `DmaPool`)
 
@@ -69,13 +76,15 @@ Following the microkernel policy-crate split enforced by
 
 ## Verification
 
-- **Host unit tests:** `cargo test -p huesos-iommu` exercises capability
+- **Host unit tests:** `cargo test -p huesos-iommu` exercises VT-d capability
   parsing (`39-bit` / `48-bit`, `CM=1`, malformed offsets), `GCMD` persistent
-  masking, Root/Context/SLPT codecs, `FRCD` fault decoding, isolation-group
-  conflict rejection, and domain teardown reuse.
-- **Live QEMU hardware smoke (`scripts/ci-qemu-iommu-vtd-smoke.sh`):** Boots
-  QEMU Q35 with `-device intel-iommu,intremap=off,caching-mode=on`, a PCI `edu`
-  DMA engine, an encrypted `HxFS v7` NVMe drive, and `virtio-net-pci,iommu_platform=on`,
-  proving authorized DMA read/write success, hardware blocking + `FRCD` fault
-  capture on out-of-bounds canary DMA, synchronous post-`revoke()` DMA blocking,
-  and full Ring-3 storage/network bring-up under `mode=Isolated`.
+  masking, Root/Context/SLPT codecs, `FRCD` fault decoding, AMD-Vi DTE/PTE/Command
+  and Event Log codecs (`amd_vi`), isolation-group conflict rejection, and
+  domain teardown reuse.
+- **Live QEMU hardware smoke (`scripts/ci-qemu-iommu-vtd-smoke.sh`):** Boots the
+  same HBI ISO across three Q35 legs: (1) `intel-iommu,intremap=off,caching-mode=on`,
+  (2) `amd-iommu,intremap=off`, and (3) no-IOMMU `Trusted` fallback — proving
+  authorized `edu` DMA read/write success, hardware blocking on out-of-bounds
+  canary DMA, synchronous post-`revoke()` DMA blocking + fault capture, and full
+  Ring-3 NVMe + `HxFS v7` + `virtio-net-pci,iommu_platform=on` bring-up under
+  `mode=Isolated` on both Intel VT-d and AMD-Vi.

@@ -33,7 +33,7 @@ pub const MAX_DISCOVERED_UNITS: usize = 8;
 /// Maximum reserved/unity DMA regions (`RMRR`/`IVMD`) retained.
 pub const MAX_DISCOVERED_REGIONS: usize = 16;
 /// Maximum explicit Device Scope BDFs retained per unit.
-pub const MAX_UNIT_SCOPE_BDFS: usize = 4;
+pub const MAX_UNIT_SCOPE_BDFS: usize = 32;
 
 /// `DMAR` header flag bit 0: platform supports VT-d Interrupt Remapping.
 pub const DMAR_FLAG_INTR_REMAP: u8 = 1 << 0;
@@ -425,7 +425,7 @@ pub fn parse_ivrs(bytes: &[u8]) -> IommuDiscoveryReport {
             0x10 | 0x11 | 0x40 => {
                 // IVHD: I/O Virtualization Hardware Definition
                 let hdr_len = if block_type == 0x10 { 24usize } else { 40usize };
-                if block_len < hdr_len || unit_count >= MAX_DISCOVERED_UNITS {
+                if block_len < hdr_len {
                     return IommuDiscoveryReport::malformed(FirmwareIommuKind::AmdVi);
                 }
                 let reg_base = u64::from_le_bytes([
@@ -445,37 +445,108 @@ pub fn parse_ivrs(bytes: &[u8]) -> IommuDiscoveryReport {
                 let mut include_all = false;
                 let mut scope_bdfs = [0u16; MAX_UNIT_SCOPE_BDFS];
                 let mut scope_count = 0usize;
+                let mut range_start: Option<u16> = None;
                 let mut dev_off = hdr_len;
                 while dev_off < block_len {
                     let entry_type = blk[dev_off];
                     let entry_len = match entry_type {
                         0x00..=0x3F => 4usize,
                         0x40..=0x7F => 8usize,
+                        0x80..=0xBF => 16usize,
+                        0xF0 => {
+                            if dev_off + 22 > block_len {
+                                return IommuDiscoveryReport::malformed(FirmwareIommuKind::AmdVi);
+                            }
+                            22usize + usize::from(blk[dev_off + 21])
+                        }
                         _ => return IommuDiscoveryReport::malformed(FirmwareIommuKind::AmdVi),
                     };
                     if dev_off + entry_len > block_len {
                         return IommuDiscoveryReport::malformed(FirmwareIommuKind::AmdVi);
                     }
-                    let bdf = u16::from_le_bytes([blk[dev_off + 1], blk[dev_off + 2]]);
+                    let bdf = if entry_len >= 3 {
+                        u16::from_le_bytes([blk[dev_off + 1], blk[dev_off + 2]])
+                    } else {
+                        0
+                    };
                     match entry_type {
-                        1 => include_all = true,
-                        2 | 3 | 0x42 | 0x43 if scope_count < MAX_UNIT_SCOPE_BDFS => {
-                            scope_bdfs[scope_count] = bdf;
-                            scope_count += 1;
+                        1 => {
+                            include_all = true;
+                            range_start = None;
+                        }
+                        2 | 0x42 | 0x46 => {
+                            range_start = None;
+                            if scope_count < MAX_UNIT_SCOPE_BDFS
+                                && !scope_bdfs[..scope_count].contains(&bdf)
+                            {
+                                scope_bdfs[scope_count] = bdf;
+                                scope_count += 1;
+                            } else if scope_count >= MAX_UNIT_SCOPE_BDFS {
+                                include_all = true;
+                            }
+                        }
+                        3 | 0x43 | 0x47 => {
+                            range_start = Some(bdf);
+                        }
+                        4 => {
+                            if let Some(start_bdf) = range_start.take() {
+                                if start_bdf == 0 && bdf >= 0x00FF {
+                                    include_all = true;
+                                } else if bdf >= start_bdf {
+                                    let mut cur = start_bdf;
+                                    loop {
+                                        if scope_count < MAX_UNIT_SCOPE_BDFS
+                                            && !scope_bdfs[..scope_count].contains(&cur)
+                                        {
+                                            scope_bdfs[scope_count] = cur;
+                                            scope_count += 1;
+                                        } else if scope_count >= MAX_UNIT_SCOPE_BDFS {
+                                            break;
+                                        }
+                                        if cur == bdf {
+                                            break;
+                                        }
+                                        cur += 1;
+                                    }
+                                }
+                            }
                         }
                         _ => {}
                     }
                     dev_off += entry_len;
                 }
 
-                units[unit_count] = DiscoveredIommuUnit {
-                    segment,
-                    include_pci_all: include_all,
-                    register_base: reg_base,
-                    scope_bdf_count: scope_count as u8,
-                    scope_bdfs,
-                };
-                unit_count += 1;
+                // AGESA and QEMU 8.x may publish multiple IVHD blocks (`0x10`, `0x11`, `0x40`)
+                // describing the same physical `(segment, register_base)` hardware unit.
+                let existing = units[..unit_count]
+                    .iter_mut()
+                    .find(|u| u.segment == segment && u.register_base == reg_base);
+                if let Some(unit) = existing {
+                    unit.include_pci_all |= include_all;
+                    let mut s = 0usize;
+                    while s < scope_count {
+                        let cand = scope_bdfs[s];
+                        let cur_n = usize::from(unit.scope_bdf_count);
+                        if cur_n < MAX_UNIT_SCOPE_BDFS && !unit.scope_bdfs[..cur_n].contains(&cand)
+                        {
+                            unit.scope_bdfs[cur_n] = cand;
+                            unit.scope_bdf_count += 1;
+                        }
+                        s += 1;
+                    }
+                } else {
+                    if unit_count >= MAX_DISCOVERED_UNITS {
+                        return IommuDiscoveryReport::malformed(FirmwareIommuKind::AmdVi);
+                    }
+                    units[unit_count] = DiscoveredIommuUnit {
+                        segment,
+                        include_pci_all: include_all,
+                        register_base: reg_base,
+                        scope_bdf_count: scope_count as u8,
+                        scope_bdfs,
+                    };
+                    unit_count += 1;
+                }
             }
             0x20..=0x22 => {
                 // IVMD: I/O Virtualization Memory Definition
@@ -676,5 +747,41 @@ mod tests {
             FirmwareIommuStatus::ConflictFallbackTrusted
         );
         assert_eq!(conflict.active_dma_isolation, DmaIsolation::Trusted);
+    }
+
+    #[test]
+    fn ivrs_qemu_range_and_duplicate_ivhd_blocks_deduplicate_into_single_unit() {
+        // 48B IVRS hdr + 40B IVHD 0x10 (Start 0x0000, End 0xFFFF, Special 8B)
+        // + 44B IVHD 0x11 (same reg_base 0xFED8_0000 + Select 0x0018) = 132B
+        let mut ivrs = [0u8; 132];
+        ivrs[0..4].copy_from_slice(b"IVRS");
+        ivrs[4..8].copy_from_slice(&(132u32).to_le_bytes());
+        ivrs[8] = 2;
+        ivrs[36..40].copy_from_slice(&(40u32 << 8).to_le_bytes());
+
+        // Block 1: IVHD type 0x10 at 48..88 (24B hdr + 4B start + 4B end + 8B special)
+        ivrs[48] = 0x10;
+        ivrs[50..52].copy_from_slice(&40u16.to_le_bytes());
+        ivrs[56..64].copy_from_slice(&0xFED8_0000u64.to_le_bytes());
+        ivrs[72] = 0x03; // Start of Range 0x0000
+        ivrs[76] = 0x04; // End of Range 0xFFFF
+        ivrs[77..79].copy_from_slice(&0xFFFFu16.to_le_bytes());
+        ivrs[80] = 0x48; // Special device (IOAPIC, 8 bytes)
+
+        // Block 2: IVHD type 0x11 at 88..132 (40B hdr + 4B Select 00:03.0)
+        ivrs[88] = 0x11;
+        ivrs[90..92].copy_from_slice(&44u16.to_le_bytes());
+        ivrs[96..104].copy_from_slice(&0xFED8_0000u64.to_le_bytes());
+        ivrs[128] = 0x02;
+        ivrs[129..131].copy_from_slice(&0x0018u16.to_le_bytes());
+
+        seal_acpi_checksum(&mut ivrs);
+        let report = discover_from_acpi_tables(None, Some(&ivrs));
+        assert_eq!(report.status, FirmwareIommuStatus::Valid);
+        assert_eq!(report.unit_count, 1);
+        assert!(report.units[0].include_pci_all);
+        assert_eq!(report.units[0].register_base, 0xFED8_0000);
+        assert_eq!(report.units[0].scope_bdf_count, 1);
+        assert_eq!(report.units[0].scope_bdfs[0], 0x0018);
     }
 }

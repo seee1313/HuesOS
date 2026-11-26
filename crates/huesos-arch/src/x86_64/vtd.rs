@@ -30,6 +30,8 @@ use crate::{LockRank, RankedIrqSafeTicketLock};
 
 /// Maximum `DRHD` hardware remapping units managed concurrently.
 pub const MAX_DRHD_UNITS: usize = 4;
+/// Maximum explicit endpoint/bridge BDF scope entries retained per IOMMU unit.
+pub const MAX_UNIT_SCOPE_BDFS: usize = 32;
 /// Maximum firmware `RMRR` reserved unity regions retained by the kernel.
 pub const MAX_RESERVED_REGIONS: usize = 16;
 /// Bounded MMIO poll iterations before failing closed (`~1M` pauses).
@@ -55,7 +57,7 @@ pub struct VtdUnitInit {
     /// 4 KiB-aligned MMIO register base physical address.
     pub register_base: u64,
     /// Explicit `(bus << 8) | devfn` scope targets.
-    pub scope_bdfs: [u16; 4],
+    pub scope_bdfs: [u16; MAX_UNIT_SCOPE_BDFS],
 }
 
 /// Validated ACPI `RMRR` reserved memory region supplied by kernel `DMAR` discovery.
@@ -115,7 +117,7 @@ struct DrhdEngine {
     segment: u16,
     include_pci_all: bool,
     scope_bdf_count: u8,
-    scope_bdfs: [u16; 4],
+    scope_bdfs: [u16; MAX_UNIT_SCOPE_BDFS],
     register_base: u64,
     caps: VtdCapabilities,
     root_table_phys: u64,
@@ -129,7 +131,7 @@ impl DrhdEngine {
         segment: 0,
         include_pci_all: false,
         scope_bdf_count: 0,
-        scope_bdfs: [0; 4],
+        scope_bdfs: [0; MAX_UNIT_SCOPE_BDFS],
         register_base: 0,
         caps: VtdCapabilities {
             ver_major: 0,
@@ -869,7 +871,7 @@ fn free_slpt_tree(table_phys: u64, level: u8) {
     huesos_pmm::free_frame(table_phys);
 }
 
-fn map_uncached_mmio(phys_base: u64, length: u64) -> Result<(), VtdHwError> {
+pub(super) fn map_uncached_mmio(phys_base: u64, length: u64) -> Result<(), VtdHwError> {
     match super::paging::map_hhdm_range_flags(
         phys_base,
         length,
@@ -883,42 +885,42 @@ fn map_uncached_mmio(phys_base: u64, length: u64) -> Result<(), VtdHwError> {
     }
 }
 
-fn mmio_read32(base: u64, offset: usize) -> u32 {
+pub(super) fn mmio_read32(base: u64, offset: usize) -> u32 {
     let ptr = (super::paging::phys_to_virt(base + offset as u64).as_u64()) as *const u32;
     // SAFETY: `initialize` mapped the DRHD register window uncached (`NO_CACHE`),
     // and `offset` is bounded by `VtdCapabilities::parse` (`< required_mmio_bytes()`).
     unsafe { core::ptr::read_volatile(ptr) }
 }
 
-fn mmio_write32(base: u64, offset: usize, value: u32) {
+pub(super) fn mmio_write32(base: u64, offset: usize, value: u32) {
     let ptr = (super::paging::phys_to_virt(base + offset as u64).as_u64()) as *mut u32;
     // SAFETY: `initialize` mapped the DRHD register window uncached (`NO_CACHE`),
     // `offset` is a valid 32-bit VT-d register, and writes are serialized by `VTD_STATE`.
     unsafe { core::ptr::write_volatile(ptr, value) };
 }
 
-fn mmio_read64(base: u64, offset: usize) -> u64 {
+pub(super) fn mmio_read64(base: u64, offset: usize) -> u64 {
     let ptr = (super::paging::phys_to_virt(base + offset as u64).as_u64()) as *const u64;
     // SAFETY: `initialize` mapped the DRHD register window uncached (`NO_CACHE`),
     // and `offset` is an 8-byte-aligned 64-bit VT-d register within `required_mmio_bytes()`.
     unsafe { core::ptr::read_volatile(ptr) }
 }
 
-fn mmio_write64(base: u64, offset: usize, value: u64) {
+pub(super) fn mmio_write64(base: u64, offset: usize, value: u64) {
     let ptr = (super::paging::phys_to_virt(base + offset as u64).as_u64()) as *mut u64;
     // SAFETY: `initialize` mapped the DRHD register window uncached (`NO_CACHE`),
     // `offset` is an 8-byte-aligned 64-bit VT-d register, and writes are serialized by `VTD_STATE`.
     unsafe { core::ptr::write_volatile(ptr, value) };
 }
 
-fn phys_read64(frame_phys: u64, index: usize) -> u64 {
+pub(super) fn phys_read64(frame_phys: u64, index: usize) -> u64 {
     let va = super::paging::phys_to_virt(frame_phys + (index as u64) * 8).as_u64();
     // SAFETY: `frame_phys` is a PMM-owned 4 KiB Root/Context/SLPT frame mapped in
     // the HHDM, `index < 512`, and accesses are serialized by `VTD_STATE`.
     unsafe { core::ptr::read_volatile(va as *const u64) }
 }
 
-fn phys_write64(frame_phys: u64, index: usize, value: u64, coherent: bool) {
+pub(super) fn phys_write64(frame_phys: u64, index: usize, value: u64, coherent: bool) {
     let va = super::paging::phys_to_virt(frame_phys + (index as u64) * 8).as_u64();
     // SAFETY: `frame_phys` is a PMM-owned 4 KiB Root/Context/SLPT frame mapped in
     // the HHDM, `index < 512`, and accesses are serialized by `VTD_STATE`. When
@@ -933,7 +935,7 @@ fn phys_write64(frame_phys: u64, index: usize, value: u64, coherent: bool) {
     }
 }
 
-fn zero_frame_4k(frame_phys: u64, coherent: bool) {
+pub(super) fn zero_frame_4k(frame_phys: u64, coherent: bool) {
     let va = super::paging::phys_to_virt(frame_phys).as_u64();
     // SAFETY: `frame_phys` was freshly allocated by `huesos_pmm::alloc_frame`
     // (4096 bytes, 4 KiB-aligned) and is uniquely owned under `VTD_STATE`.

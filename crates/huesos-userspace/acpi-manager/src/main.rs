@@ -944,16 +944,20 @@ fn report_to_hiom_snapshot(
     let unit_count = report.unit_count.min(pci_iommu::MAX_UNITS);
     let mut units = [pci_iommu::IommuUnitDesc::ZERO; pci_iommu::MAX_UNITS];
     for (dst, src) in units.iter_mut().zip(report.units.iter()).take(unit_count) {
+        let total_scope = usize::from(src.scope_bdf_count);
+        let keep_scope = total_scope.min(4);
+        let mut scope_bdfs = [0u16; 4];
+        scope_bdfs[..keep_scope].copy_from_slice(&src.scope_bdfs[..keep_scope]);
         *dst = pci_iommu::IommuUnitDesc {
             segment: src.segment,
-            flags: if src.include_pci_all {
+            flags: if src.include_pci_all || total_scope > 4 {
                 pci_iommu::UNIT_FLAG_INCLUDE_PCI_ALL
             } else {
                 0
             },
-            scope_bdf_count: src.scope_bdf_count,
+            scope_bdf_count: keep_scope as u8,
             register_base: src.register_base,
-            scope_bdfs: src.scope_bdfs,
+            scope_bdfs,
         };
     }
 

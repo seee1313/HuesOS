@@ -34,14 +34,14 @@ const AUTHORIZED_SENTINEL_A: u64 = 0x1111_1111_1111_1111;
 const AUTHORIZED_SENTINEL_B: u64 = 0x2222_2222_2222_2222;
 const CANARY_SENTINEL: u64 = 0xCAFE_BABE_DEAD_BEEF;
 
-/// Run the live Intel VT-d DMA isolation probe and log structured markers.
+/// Run the live hardware IOMMU DMA isolation probe (Intel VT-d or AMD-Vi) and log structured markers.
 pub fn run() {
     let mut writer = huesos_arch::serial::SerialWriter;
     match probe() {
-        Ok(()) => {
+        Ok(hw_label) => {
             let _ = writeln!(
                 writer,
-                "[iommu-test] Intel VT-d hardware isolation self-test OK"
+                "[iommu-test] {hw_label} hardware isolation self-test OK"
             );
         }
         Err(reason) => {
@@ -50,10 +50,16 @@ pub fn run() {
     }
 }
 
-fn probe() -> Result<(), &'static str> {
-    if !huesos_arch::vtd::is_active() {
-        return Err("Intel VT-d hardware translation is not active");
-    }
+fn probe() -> Result<&'static str, &'static str> {
+    use huesos_abi::pci_iommu::IommuHardwareKind;
+
+    let hw_label = match huesos_arch::iommu::active_kind() {
+        IommuHardwareKind::IntelVtd => "Intel VT-d",
+        IommuHardwareKind::AmdVi => "AMD-Vi",
+        IommuHardwareKind::None => {
+            return Err("hardware IOMMU translation is not active");
+        }
+    };
     let (location, bar0_va) = super::irq_probe::prepare_edu_for_selftest()?;
     let packed_addr = pack_pci_address(
         location.segment(),
@@ -76,12 +82,19 @@ fn probe() -> Result<(), &'static str> {
         }
     };
 
-    let result = run_with_frames(bar0_va, packed_addr, edu_bdf, auth_phys, canary_phys);
+    let result = run_with_frames(
+        bar0_va,
+        packed_addr,
+        edu_bdf,
+        auth_phys,
+        canary_phys,
+        huesos_arch::iommu::active_kind(),
+    );
 
     super::irq_probe::quiesce_edu_bus_master(location);
     huesos_pmm::free_frame(auth_phys);
     huesos_pmm::free_frame(canary_phys);
-    result
+    result.map(|()| hw_label)
 }
 
 fn run_with_frames(
@@ -90,6 +103,7 @@ fn run_with_frames(
     edu_bdf: u16,
     auth_phys: u64,
     canary_phys: u64,
+    hw_kind: huesos_abi::pci_iommu::IommuHardwareKind,
 ) -> Result<(), &'static str> {
     phys_write64(auth_phys, AUTHORIZED_PATTERN);
     phys_write64(auth_phys + 64, AUTHORIZED_SENTINEL_A);
@@ -97,7 +111,7 @@ fn run_with_frames(
     phys_write64(canary_phys, CANARY_SENTINEL);
 
     let mut faults = [empty_fault(); 4];
-    let _ = huesos_arch::vtd::drain_faults(&mut faults);
+    let _ = huesos_arch::iommu::drain_faults(&mut faults);
 
     let lease = DeviceLease::try_create(0xED00_0001, 1, packed_addr)
         .map_err(|_| "DeviceLease::try_create failed")?;
@@ -128,10 +142,10 @@ fn run_with_frames(
         unregister_object(lease.koid());
         return Err("authorized DMA write did not land in leased frame");
     }
-    if huesos_arch::vtd::drain_faults(&mut faults) != 0 {
+    if huesos_arch::iommu::drain_faults(&mut faults) != 0 {
         let _ = lease.revoke(1, true);
         unregister_object(lease.koid());
-        return Err("unexpected VT-d fault during authorized DMA");
+        return Err("unexpected IOMMU fault during authorized DMA");
     }
     log_line("[iommu-test] authorized DeviceLease DMA read/write OK");
 
@@ -152,18 +166,40 @@ fn run_with_frames(
         unregister_object(lease.koid());
         return Err("SECURITY FAILURE: unmapped canary frame modified by unauthorized DMA");
     }
-    let canary_faults = huesos_arch::vtd::drain_faults(&mut faults);
-    let saw_canary_fault = faults[..canary_faults].iter().any(|f| {
-        f.source_bdf == edu_bdf
-            && f.fault_iova == canary_phys
-            && f.kind == FaultKind::WriteNotPermitted
-    });
-    if !saw_canary_fault {
-        let _ = lease.revoke(1, true);
-        unregister_object(lease.koid());
-        return Err("expected VT-d WriteNotPermitted fault not recorded for canary DMA");
+    let canary_faults = huesos_arch::iommu::drain_faults(&mut faults);
+    match hw_kind {
+        huesos_abi::pci_iommu::IommuHardwareKind::AmdVi => {
+            // Real AMD-Vi silicon logs `IO_PAGE_FAULT` (`PR=0`) on unmapped PTEs, whereas
+            // QEMU 8.2 `amdvi_page_walk` (`if (!pte) return;`) blocks the DMA write with
+            // `IOMMU_NONE` without emitting an event when a PTE is zero. If an event was
+            // emitted, verify it matches `edu_bdf` and `canary_phys`.
+            if canary_faults > 0 {
+                let ok = faults[..canary_faults].iter().any(|f| {
+                    f.source_bdf == edu_bdf
+                        && (f.fault_iova == 0 || (f.fault_iova & !0xFFF) == canary_phys)
+                });
+                if !ok {
+                    let _ = lease.revoke(1, true);
+                    unregister_object(lease.koid());
+                    return Err("unexpected AMD-Vi fault record during canary DMA");
+                }
+            }
+            log_line("[iommu-test] unmapped canary DMA blocked by hardware AMD-Vi OK");
+        }
+        _ => {
+            let saw_canary_fault = faults[..canary_faults].iter().any(|f| {
+                f.source_bdf == edu_bdf
+                    && f.fault_iova == canary_phys
+                    && f.kind == FaultKind::WriteNotPermitted
+            });
+            if !saw_canary_fault {
+                let _ = lease.revoke(1, true);
+                unregister_object(lease.koid());
+                return Err("expected IOMMU WriteNotPermitted fault not recorded for canary DMA");
+            }
+            log_line("[iommu-test] unmapped canary DMA blocked by hardware VT-d OK");
+        }
     }
-    log_line("[iommu-test] unmapped canary DMA blocked by hardware VT-d OK");
 
     // 3. Synchronous revocation + post-revoke DMA write attempt to `auth_phys + 128`.
     if lease.revoke(1, false) != Ok(1) {
@@ -182,12 +218,38 @@ fn run_with_frames(
     if phys_read64(auth_phys + 128) != AUTHORIZED_SENTINEL_B {
         return Err("SECURITY FAILURE: revoked DMA frame modified after DeviceLease::revoke");
     }
-    let revoke_faults = huesos_arch::vtd::drain_faults(&mut faults);
-    let saw_revoke_fault = faults[..revoke_faults]
-        .iter()
-        .any(|f| f.source_bdf == edu_bdf && f.kind == FaultKind::ContextNotPresent);
-    if !saw_revoke_fault {
-        return Err("expected VT-d ContextNotPresent fault not recorded after revoke");
+    let revoke_faults = huesos_arch::iommu::drain_faults(&mut faults);
+    match hw_kind {
+        huesos_abi::pci_iommu::IommuHardwareKind::AmdVi => {
+            // Real AMD-Vi silicon records `IO_PAGE_FAULT` against `AMD_VI_BLOCKED_DOMAIN_ID`;
+            // QEMU 8.2 `amdvi_log_event` (`amdvi_test_mask` `|` bug) suppresses Event Log DMA
+            // writes while still enforcing IOTLB revocation and blocking the memory write above.
+            if revoke_faults > 0 {
+                let mut ok = false;
+                for f in &faults[..revoke_faults] {
+                    let iova_ok = f.fault_iova == 0 || (f.fault_iova & !0xFFF) == auth_phys;
+                    let kind_ok = f.kind == FaultKind::ContextNotPresent
+                        || f.kind == FaultKind::WriteNotPermitted;
+                    if f.source_bdf == edu_bdf && iova_ok && kind_ok {
+                        ok = true;
+                    }
+                }
+                if !ok {
+                    return Err("unexpected AMD-Vi post-revoke fault record");
+                }
+            }
+        }
+        _ => {
+            let mut saw_revoke_fault = false;
+            for f in &faults[..revoke_faults] {
+                if f.source_bdf == edu_bdf && f.kind == FaultKind::ContextNotPresent {
+                    saw_revoke_fault = true;
+                }
+            }
+            if !saw_revoke_fault {
+                return Err("expected IOMMU post-revoke fault not recorded after revoke");
+            }
+        }
     }
     log_line("[iommu-test] post-revoke DMA blocked after synchronous IOTLB flush OK");
     Ok(())

@@ -32,9 +32,10 @@ artifact_dir="${ARTIFACT_DIR:-ci-artifacts}"
 mkdir -p "$artifact_dir" build
 
 vtd_log="$artifact_dir/qemu-iommu-vtd-${profile}-smp${cpus}.log"
+amdvi_log="$artifact_dir/qemu-iommu-amdvi-${profile}-smp${cpus}.log"
 fallback_log="$artifact_dir/qemu-iommu-fallback-${profile}-smp${cpus}.log"
 nvme_img="build/nvme-iommu-vtd.img"
-rm -f "$vtd_log" "$fallback_log" "$nvme_img"
+rm -f "$vtd_log" "$amdvi_log" "$fallback_log" "$nvme_img"
 
 annotate_failure() {
     local leg="$1"
@@ -43,8 +44,11 @@ annotate_failure() {
     printf '::error::ci-qemu-iommu-vtd-smoke (%s): %s (profile=%s smp=%s)\n' \
         "$leg" "$reason" "$profile" "$cpus"
     while IFS= read -r line; do
+        printf '::error::iommu| %s\n' "$line"
+    done < <(grep -E '\[(iommu|vtd|amd-vi)' "$log_path" 2>/dev/null | tail -n 8 || true)
+    while IFS= read -r line; do
         printf '::error::serial| %s\n' "$line"
-    done < <(tail -n 12 "$log_path" 2>/dev/null || true)
+    done < <(tail -n 6 "$log_path" 2>/dev/null || true)
 }
 
 echo "iommu_test=1" > build/cmdline.txt
@@ -123,13 +127,72 @@ for marker in "${vtd_markers[@]}"; do
         exit 1
     fi
 done
-echo "[iommu-smoke] Leg 1/2 PASS ($vtd_log)"
+echo "[iommu-smoke] Leg 1/3 PASS ($vtd_log)"
 
-# Recreate clean HxFS image for Leg 2 so journal/mount state starts fresh.
+# Recreate clean HxFS image for Leg 2 (AMD-Vi hardware isolation).
 rm -f "$nvme_img"
 python3 tools/mkhxfs.py --output "$nvme_img" --blocks 16384 >/dev/null
 
-echo "[iommu-smoke] Leg 2/2: booting Q35 without intel-iommu (Trusted fallback verification)"
+echo "[iommu-smoke] Leg 2/3: booting Q35 with amd-iommu (intremap=off) + edu + NVMe + virtio-net (iommu_platform=on)"
+set +e
+timeout "${timeout_seconds}s" qemu-system-x86_64 \
+    -machine q35 -cpu qemu64 -smp "$cpus" -m 512M \
+    -device amd-iommu,intremap=off \
+    -bios third_party/ovmf/OVMF.fd -cdrom build/huesos.iso \
+    -device edu,dma_mask=0xffffffffffffffff \
+    -drive "id=nvme0,if=none,format=raw,file=${nvme_img}" \
+    -device nvme,serial=huesosnvme,id=nvme-ctrl \
+    -device nvme-ns,drive=nvme0,bus=nvme-ctrl,nsid=1 \
+    -netdev user,id=n0 \
+    -device virtio-net-pci,netdev=n0,disable-legacy=on,disable-modern=off,iommu_platform=on \
+    -display none -serial "file:$amdvi_log" \
+    -no-reboot -no-shutdown
+status=$?
+set -e
+
+if [[ "$status" != 0 && "$status" != 124 ]]; then
+    echo "QEMU (amd-vi-isolated) exited unexpectedly with status $status" >&2
+    annotate_failure "amd-vi-isolated" "QEMU exited with status $status" "$amdvi_log"
+    tail -200 "$amdvi_log" >&2 || true
+    exit 1
+fi
+if grep -Fq 'KERNEL PANIC' "$amdvi_log" || grep -Fq '[iommu-test] FAILED:' "$amdvi_log"; then
+    echo "panic or iommu-test failure detected in amd-vi-isolated leg" >&2
+    annotate_failure "amd-vi-isolated" "panic or [iommu-test] FAILED detected" "$amdvi_log"
+    tail -200 "$amdvi_log" >&2
+    exit 1
+fi
+
+amdvi_markers=(
+    '[iommu] AMD-Vi active:'
+    'mode=Isolated'
+    '[iommu-test] authorized DeviceLease DMA read/write OK'
+    '[iommu-test] unmapped canary DMA blocked by hardware AMD-Vi OK'
+    '[iommu-test] post-revoke DMA blocked after synchronous IOTLB flush OK'
+    '[iommu-test] AMD-Vi hardware isolation self-test OK'
+    '[acpi-manager] published HIOM'
+    'active_isolation=Isolated'
+    'isolation=IommuDomain'
+    '[driver-manager] attached DmaPool to DeviceLease for'
+    '[hxfs] service started'
+    '[net-service] virtio-net 1.0 modern MMIO online'
+)
+
+for marker in "${amdvi_markers[@]}"; do
+    if ! grep -Fq "$marker" "$amdvi_log"; then
+        echo "missing amd-vi-isolated marker: $marker" >&2
+        annotate_failure "amd-vi-isolated" "missing marker: $marker" "$amdvi_log"
+        tail -200 "$amdvi_log" >&2
+        exit 1
+    fi
+done
+echo "[iommu-smoke] Leg 2/3 PASS ($amdvi_log)"
+
+# Recreate clean HxFS image for Leg 3 so journal/mount state starts fresh.
+rm -f "$nvme_img"
+python3 tools/mkhxfs.py --output "$nvme_img" --blocks 16384 >/dev/null
+
+echo "[iommu-smoke] Leg 3/3: booting Q35 without IOMMU (Trusted fallback verification)"
 set +e
 timeout "${timeout_seconds}s" qemu-system-x86_64 \
     -machine q35 -cpu qemu64 -smp "$cpus" -m 512M \
@@ -156,15 +219,15 @@ if grep -Fq 'KERNEL PANIC' "$fallback_log"; then
     tail -200 "$fallback_log" >&2
     exit 1
 fi
-if grep -Fq '[iommu] Intel VT-d active:' "$fallback_log"; then
-    echo "unexpected VT-d activation without DMAR in trusted-fallback leg" >&2
-    annotate_failure "trusted-fallback" "VT-d reported active without DMAR" "$fallback_log"
+if grep -Fq '[iommu] Intel VT-d active:' "$fallback_log" || grep -Fq '[iommu] AMD-Vi active:' "$fallback_log"; then
+    echo "unexpected IOMMU activation without DMAR/IVRS in trusted-fallback leg" >&2
+    annotate_failure "trusted-fallback" "IOMMU reported active without DMAR/IVRS" "$fallback_log"
     tail -200 "$fallback_log" >&2
     exit 1
 fi
 
 fallback_markers=(
-    '[iommu-test] FAILED: Intel VT-d hardware translation is not active'
+    '[iommu-test] FAILED: hardware IOMMU translation is not active'
     'active_isolation=Trusted'
     'isolation=Trusted'
     '[hxfs] service started'
@@ -180,5 +243,5 @@ for marker in "${fallback_markers[@]}"; do
     fi
 done
 
-echo "[iommu-smoke] Leg 2/2 PASS ($fallback_log)"
+echo "[iommu-smoke] Leg 3/3 PASS ($fallback_log)"
 echo "ci-qemu-iommu-vtd-smoke PASS ($profile, smp=$cpus)"
