@@ -271,11 +271,9 @@ pub fn dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> Syscal
         S::FutexWake => futex::sys_futex_wake(a1, a2 as u32),
         S::ClockGetMonotonicNs => system::sys_clock_get_monotonic_ns(a1 as *mut u64),
         S::SchedSetPolicy => system::sys_sched_set_policy(a1, a2, a3),
-        S::DeviceLeaseAttachDma => device_lease::sys_device_lease_attach_dma(
-            a1 as HandleValue,
-            a2 as HandleValue,
-            a3,
-        ),
+        S::DeviceLeaseAttachDma => {
+            device_lease::sys_device_lease_attach_dma(a1 as HandleValue, a2 as HandleValue, a3)
+        }
         S::SystemIommuStatus => {
             system::sys_system_iommu_status(a1 as *mut huesos_abi::pci_iommu::KernelIommuStatus)
         }

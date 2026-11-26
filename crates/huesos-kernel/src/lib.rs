@@ -724,7 +724,10 @@ fn initialize_hardware_iommu(archive: Option<&[u8]>, memory_regions: &[MemoryReg
     };
     let mut header = [0u8; acpi_archive::HEADER_BYTES];
     if bytes.read_exact_at(0, &mut header).is_err() {
-        let _ = writeln!(writer, "[iommu] archive header unreadable; DMA mode=Trusted");
+        let _ = writeln!(
+            writer,
+            "[iommu] archive header unreadable; DMA mode=Trusted"
+        );
         return;
     }
     let Ok(header_v2) = acpi_archive::decode_v2_header(&header) else {
@@ -739,7 +742,10 @@ fn initialize_hardware_iommu(archive: Option<&[u8]>, memory_regions: &[MemoryReg
             + u64::from(index) * acpi_archive::TABLE_ENTRY_BYTES as u64;
         let mut entry_bytes = [0u8; acpi_archive::TABLE_ENTRY_BYTES];
         if bytes.read_exact_at(entry_offset, &mut entry_bytes).is_err() {
-            let _ = writeln!(writer, "[iommu] table directory truncated; DMA mode=Trusted");
+            let _ = writeln!(
+                writer,
+                "[iommu] table directory truncated; DMA mode=Trusted"
+            );
             return;
         }
         let Ok(entry) = acpi_archive::decode_v2_table_entry(&entry_bytes) else {
@@ -758,7 +764,10 @@ fn initialize_hardware_iommu(archive: Option<&[u8]>, memory_regions: &[MemoryReg
     }
 
     if ivrs_present && dmar.is_some() {
-        let _ = writeln!(writer, "[iommu] conflicting DMAR+IVRS tables; DMA mode=Trusted");
+        let _ = writeln!(
+            writer,
+            "[iommu] conflicting DMAR+IVRS tables; DMA mode=Trusted"
+        );
         return;
     }
     let Some((dmar_offset, dmar_length)) = dmar else {
@@ -768,7 +777,10 @@ fn initialize_hardware_iommu(archive: Option<&[u8]>, memory_regions: &[MemoryReg
 
     const DMAR_MAX_BYTES: usize = 4096;
     if !(48..=DMAR_MAX_BYTES).contains(&dmar_length) {
-        let _ = writeln!(writer, "[iommu] DMAR length out of bounds; DMA mode=Trusted");
+        let _ = writeln!(
+            writer,
+            "[iommu] DMAR length out of bounds; DMA mode=Trusted"
+        );
         return;
     }
     let mut dmar_bytes = [0u8; DMAR_MAX_BYTES];

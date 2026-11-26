@@ -882,9 +882,10 @@ impl DomainTable {
     ) -> Option<DomainRecord> {
         let idx = self.find_by_lease(lease_koid, lease_generation)?;
         let removed = self.slots[idx];
+        let pages = removed.mapped_pages();
         self.slots[idx] = DomainRecord::EMPTY;
         self.active_count = self.active_count.saturating_sub(1);
-        self.mapped_pages_total = self.mapped_pages_total.saturating_sub(removed.mapped_pages());
+        self.mapped_pages_total = self.mapped_pages_total.saturating_sub(pages);
         self.teardown_count = self.teardown_count.saturating_add(1);
         Some(removed)
     }
@@ -899,13 +900,7 @@ mod tests {
         // QEMU `-device intel-iommu,intremap=off,caching-mode=on` typical values:
         // ND=2 (256 domains), CM=1 (bit 7), SAGAW=0x02 (39-bit, bit 1), MGAW=38 (39 bits),
         // FRO=0x10 (offset 0x100), NFR=0 (1 fault reg), DRD=1, DWD=1; ECAP IRO=0x08 (0x80).
-        let cap: u64 = 2
-            | (1 << 7)
-            | (0b00010 << 8)
-            | (38 << 16)
-            | (0x10 << 24)
-            | (1 << 54)
-            | (1 << 55);
+        let cap: u64 = 2 | (1 << 7) | (2 << 8) | (38 << 16) | (0x10 << 24) | (3 << 54);
         let ecap: u64 = 0x08 << 8;
         let parsed = VtdCapabilities::parse(0x10, cap, ecap);
         assert_eq!(
@@ -991,7 +986,13 @@ mod tests {
         assert_eq!(RootEntry::present(0), Err(VtdError::InvalidAddress));
         assert_eq!(RootEntry::present(0x1234), Err(VtdError::InvalidAddress));
         let root = RootEntry::present(0x0010_2000);
-        assert_eq!(root, Ok(RootEntry { lo: 0x0010_2001, hi: 0 }));
+        assert_eq!(
+            root,
+            Ok(RootEntry {
+                lo: 0x0010_2001,
+                hi: 0,
+            })
+        );
         if let Ok(r) = root {
             assert_eq!(r.context_table_phys(), Some(0x0010_2000));
         }
@@ -1019,7 +1020,10 @@ mod tests {
         }
 
         // SlPte checks.
-        assert_eq!(SlPte::leaf_4k(0x4000, false, false), Err(VtdError::InvalidAddress));
+        assert_eq!(
+            SlPte::leaf_4k(0x4000, false, false),
+            Err(VtdError::InvalidAddress)
+        );
         let pte = SlPte::leaf_4k(0x0100_0000, true, true);
         assert_eq!(pte, Ok(SlPte(0x0100_0003)));
     }

@@ -39,7 +39,10 @@ pub fn run() {
     let mut writer = huesos_arch::serial::SerialWriter;
     match probe() {
         Ok(()) => {
-            let _ = writeln!(writer, "[iommu-test] Intel VT-d hardware isolation self-test OK");
+            let _ = writeln!(
+                writer,
+                "[iommu-test] Intel VT-d hardware isolation self-test OK"
+            );
         }
         Err(reason) => {
             let _ = writeln!(writer, "[iommu-test] FAILED: {reason}");

@@ -292,7 +292,7 @@ impl DeviceLease {
         if expected_generation == 0 {
             return Err(DeviceLeaseError::InvalidArgs);
         }
-        let (revoked_gen, pci_address_packed, new_state, ports) = {
+        let (revoked_gen, pci_address_packed, was_bound, new_state, ports) = {
             let mut inner = self.inner.lock();
             if inner.generation != expected_generation
                 || !matches!(
@@ -306,6 +306,7 @@ impl DeviceLease {
                 .generation
                 .checked_add(1)
                 .ok_or(DeviceLeaseError::GenerationExhausted)?;
+            let was_bound = inner.iommu_bound;
             inner.generation = next_generation;
             inner.iommu_bound = false;
             inner.state = if failed {
@@ -317,14 +318,17 @@ impl DeviceLease {
             (
                 expected_generation,
                 inner.pci_address_packed,
+                was_bound,
                 inner.state,
                 ports,
             )
         };
 
-        let hooks = *IOMMU_LEASE_HOOKS.lock();
-        if let Some(h) = hooks {
-            (h.teardown)(pci_address_packed, self.koid.0, revoked_gen);
+        if was_bound {
+            let hooks = *IOMMU_LEASE_HOOKS.lock();
+            if let Some(h) = hooks {
+                (h.teardown)(pci_address_packed, self.koid.0, revoked_gen);
+            }
         }
 
         for (port, key) in ports {
@@ -524,17 +528,21 @@ mod tests {
         static TEARDOWNS: AtomicU64 = AtomicU64::new(0);
 
         fn mock_bind(
-            _bdf: u64,
+            bdf: u64,
             _koid: u64,
             _gen: u64,
             _base: u64,
             len: u64,
         ) -> Result<(), DeviceLeaseError> {
-            BOUND_PAGES.fetch_add(len / 4096, Ordering::SeqCst);
+            if bdf == 0x0020 || bdf == 0x0028 {
+                BOUND_PAGES.fetch_add(len / 4096, Ordering::SeqCst);
+            }
             Ok(())
         }
-        fn mock_teardown(_bdf: u64, _koid: u64, _gen: u64) {
-            TEARDOWNS.fetch_add(1, Ordering::SeqCst);
+        fn mock_teardown(bdf: u64, _koid: u64, _gen: u64) {
+            if bdf == 0x0020 || bdf == 0x0028 {
+                TEARDOWNS.fetch_add(1, Ordering::SeqCst);
+            }
         }
 
         BOUND_PAGES.store(0, Ordering::SeqCst);

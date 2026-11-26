@@ -34,13 +34,16 @@ jobs:
           CARGO_BUILD_JOBS: "1"
           RUSTFLAGS: "-Zsanitizer=address"
         run: |
-          cargo test -p huesos-abi -p huesos-arch -p huesos-elf -p huesos-pmm \
+          set -o pipefail
+          LOG="$(mktemp)"
+          if ! cargo test -p huesos-abi -p huesos-arch -p huesos-elf -p huesos-pmm \
             -p huesos-object -p huesos-fb -p huesos-syscalls -p huesos-fat \
             -p huesos-alloc -p huesos-uacpi -p huesos-scudo -p huesos-kernel -p huesos-decoder-fuzz \
             -p huesos-scudo-fuzz \
             -p huesos-hxfs-proto \
             -p huesos-blobfs \
             -p huesos-lifecycle \
+            -p huesos-iommu \
             -p huesos-ioapic \
             -p huesos-extable \
             -p huesos-waitset \
@@ -50,7 +53,12 @@ jobs:
             -p huesos-nvme \
             -p huesos-pci \
             -p huesos-quota \
-            --target x86_64-unknown-linux-gnu -Z build-std=
+            --target x86_64-unknown-linux-gnu -Z build-std= 2>&1 | tee "$LOG"; then
+            grep -E '(^error|FAILED|panicked at|SUMMARY: AddressSanitizer)' "$LOG" | tail -n 10 | while IFS= read -r line; do
+              echo "::error::asan|${line}"
+            done
+            exit 1
+          fi
       - name: Coverage-guided decoder and ELF fuzzing
         run: |
           cargo install cargo-fuzz --locked --version 0.13.2
