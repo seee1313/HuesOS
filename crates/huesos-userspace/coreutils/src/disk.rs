@@ -434,12 +434,10 @@ pub fn read_mbr_partitions(io: &DiskIo) -> alloc::vec::Vec<(usize, u64, u64, u8)
         return out;
     }
     for idx in 0..4usize {
-        let off = 446 + idx * 16;
-        let ptype = sec0[off + 4];
-        let start =
-            u32::from_le_bytes([sec0[off + 8], sec0[off + 9], sec0[off + 10], sec0[off + 11]]);
-        let count =
-            u32::from_le_bytes([sec0[off + 12], sec0[off + 13], sec0[off + 14], sec0[off + 15]]);
+        let e = &sec0[446 + idx * 16..446 + (idx + 1) * 16];
+        let ptype = e[4];
+        let start = u32::from_le_bytes([e[8], e[9], e[10], e[11]]);
+        let count = u32::from_le_bytes([e[12], e[13], e[14], e[15]]);
         if ptype != 0 && ptype != 0xEE && start > 0 && count > 0 {
             out.push((idx + 1, u64::from(start), u64::from(count), ptype));
         }

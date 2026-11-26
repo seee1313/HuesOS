@@ -864,7 +864,7 @@ fn initialize_hardware_iommu(archive: Option<&[u8]>, memory_regions: &[MemoryReg
         include_pci_all: false,
         scope_bdf_count: 0,
         register_base: 0,
-        scope_bdfs: [0; 4],
+        scope_bdfs: [0; huesos_arch::vtd::MAX_UNIT_SCOPE_BDFS],
     }; huesos_arch::vtd::MAX_DRHD_UNITS];
     for (dst, src) in units
         .iter_mut()

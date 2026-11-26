@@ -44,12 +44,7 @@ impl BlockDevice {
         )
     }
 
-    fn open_named(
-        registry: &Channel,
-        req: &[u8],
-        ok_tag: &[u8],
-        err_tag: &[u8],
-    ) -> Result<Self> {
+    fn open_named(registry: &Channel, req: &[u8], ok_tag: &[u8], err_tag: &[u8]) -> Result<Self> {
         let mut buf = [0u8; 64];
         registry.write(req)?;
         let mut spins = 0usize;

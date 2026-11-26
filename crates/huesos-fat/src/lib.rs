@@ -304,12 +304,11 @@ impl<'a, D: BlockDevice> FatFileSystem<'a, D> {
             let entry_lba = u64::from_le_bytes([
                 sec1[72], sec1[73], sec1[74], sec1[75], sec1[76], sec1[77], sec1[78], sec1[79],
             ]);
-            let num_entries =
-                u32::from_le_bytes([sec1[80], sec1[81], sec1[82], sec1[83]]).min(128);
-            let entry_size =
-                u32::from_le_bytes([sec1[84], sec1[85], sec1[86], sec1[87]]) as usize;
-            if entry_lba >= 2 && entry_lba <= u32::MAX as u64 && (128..=512).contains(&entry_size)
-            {
+            let raw_num = u32::from_le_bytes([sec1[80], sec1[81], sec1[82], sec1[83]]);
+            let num_entries = raw_num.min(128);
+            let entry_size = u32::from_le_bytes([sec1[84], sec1[85], sec1[86], sec1[87]]) as usize;
+            let lba_ok = (2..=u32::MAX as u64).contains(&entry_lba);
+            if lba_ok && (128..=512).contains(&entry_size) {
                 let per_sec = 512 / entry_size;
                 if per_sec > 0 {
                     let mut idx = 0usize;
@@ -659,11 +658,8 @@ impl<'a, D: BlockDevice> FatFileSystem<'a, D> {
                         lfn_checksum = Some(csum);
                     }
                     if ord >= 1 && lfn_checksum == Some(csum) {
-                        lfn_parts.push((
-                            ord,
-                            decode_lfn_chars(raw),
-                            EntrySlotLoc { sector, slot },
-                        ));
+                        let loc = EntrySlotLoc { sector, slot };
+                        lfn_parts.push((ord, decode_lfn_chars(raw), loc));
                     } else {
                         lfn_parts.clear();
                         lfn_checksum = None;
@@ -739,7 +735,10 @@ impl<'a, D: BlockDevice> FatFileSystem<'a, D> {
         if path.is_empty() {
             return Err(DriverError::InvalidPath);
         }
-        let parts: Vec<&str> = path.split('/').filter(|c| !c.is_empty() && *c != ".").collect();
+        let parts: Vec<&str> = path
+            .split('/')
+            .filter(|c| !c.is_empty() && *c != ".")
+            .collect();
         for &p in &parts {
             if p.len() > 255 || p == ".." {
                 return Err(DriverError::InvalidPath);
@@ -1198,8 +1197,8 @@ impl<'a, D: BlockDevice> FatFileSystem<'a, D> {
             if off_in_sec != 0 || take < 512 {
                 self.read_vol_sector(target_sec, &mut sec_buf)?;
             }
-            sec_buf[off_in_sec..off_in_sec + take]
-                .copy_from_slice(&data[written..written + take]);
+            let src = &data[written..written + take];
+            sec_buf[off_in_sec..off_in_sec + take].copy_from_slice(src);
             self.write_vol_sector(target_sec, &sec_buf)?;
             written += take;
         }
@@ -1387,12 +1386,7 @@ fn short_name_matches(entry: &DirectoryEntry, query: &str) -> bool {
 }
 
 fn is_valid_short_char(b: u8) -> bool {
-    b.is_ascii_alphanumeric()
-        || matches!(
-            b,
-            b'$' | b'%' | b'\'' | b'-' | b'_' | b'@' | b'~' | b'`' | b'!' | b'(' | b')'
-                | b'{' | b'}' | b'^' | b'#' | b'&'
-        )
+    b.is_ascii_alphanumeric() || b"$%'-_@~`!(){}^#&".contains(&b)
 }
 
 fn try_exact_83_uppercase(name: &str) -> Option<[u8; 11]> {
@@ -1437,10 +1431,7 @@ fn try_exact_83_uppercase(name: &str) -> Option<[u8; 11]> {
     }
 }
 
-fn generate_short_alias(
-    name: &str,
-    existing: &[(String, ResolvedRecord)],
-) -> ([u8; 11], bool) {
+fn generate_short_alias(name: &str, existing: &[(String, ResolvedRecord)]) -> ([u8; 11], bool) {
     let has_lowercase = name.bytes().any(|b| b.is_ascii_lowercase());
     if !has_lowercase {
         if let Some(exact) = try_exact_83_uppercase(name) {
@@ -1595,7 +1586,8 @@ mod tests {
     #[test]
     fn test_mount_invalid_sector_size() {
         let d = RamDisk::new(64);
-        assert_eq!(FatFileSystem::mount(&d).err(), Some(DriverError::InvalidFat));
+        let err = FatFileSystem::mount(&d).err();
+        assert_eq!(err, Some(DriverError::InvalidFat));
     }
 
     #[test]

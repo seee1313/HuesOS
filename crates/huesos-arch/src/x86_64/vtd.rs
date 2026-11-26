@@ -30,6 +30,8 @@ use crate::{LockRank, RankedIrqSafeTicketLock};
 
 /// Maximum `DRHD` hardware remapping units managed concurrently.
 pub const MAX_DRHD_UNITS: usize = 4;
+/// Maximum explicit endpoint/bridge BDF scope entries retained per IOMMU unit.
+pub const MAX_UNIT_SCOPE_BDFS: usize = 32;
 /// Maximum firmware `RMRR` reserved unity regions retained by the kernel.
 pub const MAX_RESERVED_REGIONS: usize = 16;
 /// Bounded MMIO poll iterations before failing closed (`~1M` pauses).
@@ -55,7 +57,7 @@ pub struct VtdUnitInit {
     /// 4 KiB-aligned MMIO register base physical address.
     pub register_base: u64,
     /// Explicit `(bus << 8) | devfn` scope targets.
-    pub scope_bdfs: [u16; 4],
+    pub scope_bdfs: [u16; MAX_UNIT_SCOPE_BDFS],
 }
 
 /// Validated ACPI `RMRR` reserved memory region supplied by kernel `DMAR` discovery.
@@ -115,7 +117,7 @@ struct DrhdEngine {
     segment: u16,
     include_pci_all: bool,
     scope_bdf_count: u8,
-    scope_bdfs: [u16; 4],
+    scope_bdfs: [u16; MAX_UNIT_SCOPE_BDFS],
     register_base: u64,
     caps: VtdCapabilities,
     root_table_phys: u64,
@@ -129,7 +131,7 @@ impl DrhdEngine {
         segment: 0,
         include_pci_all: false,
         scope_bdf_count: 0,
-        scope_bdfs: [0; 4],
+        scope_bdfs: [0; MAX_UNIT_SCOPE_BDFS],
         register_base: 0,
         caps: VtdCapabilities {
             ver_major: 0,

@@ -16,13 +16,12 @@ use huesos_abi::pci_lease::unpack_pci_address;
 use huesos_iommu::amd_vi::{
     advance_ring_offset_4k, decode_amd_vi_event, encode_devtab_base, encode_ring_base_4k,
     AmdViCommand, AmdViDte, AmdViPte, AMD_VI_BLOCKED_DOMAIN_ID, AMD_VI_DEVTAB_BYTES,
-    AMD_VI_FIRST_LEASE_DOMAIN_ID, AMD_VI_IVMD_DOMAIN_ID, AMD_VI_MAX_DOMAINS,
-    AMD_VI_MAX_IOVA_48BIT, AMD_VI_MMIO_BYTES, AMD_VI_RING_CAPACITY, AMD_VI_RING_OFFSET_MASK,
-    CTRL_CMD_BUF_EN, CTRL_COHERENT, CTRL_EVENT_LOG_EN, CTRL_IOMMU_EN, MMIO_CMDBUF_BASE,
-    MMIO_CMD_HEAD, MMIO_CMD_TAIL, MMIO_CONTROL, MMIO_DEVTAB_BASE, MMIO_EVTLOG_BASE,
-    MMIO_EVT_HEAD, MMIO_EVT_TAIL, MMIO_EXCL_BASE, MMIO_EXCL_LIMIT, MMIO_EXT_FEATURES,
-    MMIO_STATUS, STATUS_COM_WAIT_INT, STATUS_EVENT_LOG_INT, STATUS_EVENT_OVERFLOW,
-    STATUS_RW1C_ALL,
+    AMD_VI_FIRST_LEASE_DOMAIN_ID, AMD_VI_IVMD_DOMAIN_ID, AMD_VI_MAX_DOMAINS, AMD_VI_MAX_IOVA_48BIT,
+    AMD_VI_MMIO_BYTES, AMD_VI_RING_CAPACITY, AMD_VI_RING_OFFSET_MASK, CTRL_CMD_BUF_EN,
+    CTRL_COHERENT, CTRL_EVENT_LOG_EN, CTRL_IOMMU_EN, MMIO_CMDBUF_BASE, MMIO_CMD_HEAD, MMIO_CMD_TAIL,
+    MMIO_CONTROL, MMIO_DEVTAB_BASE, MMIO_EVTLOG_BASE, MMIO_EVT_HEAD, MMIO_EVT_TAIL, MMIO_EXCL_BASE,
+    MMIO_EXCL_LIMIT, MMIO_EXT_FEATURES, MMIO_STATUS, STATUS_COM_WAIT_INT, STATUS_EVENT_LOG_INT,
+    STATUS_EVENT_OVERFLOW, STATUS_RW1C_ALL,
 };
 use huesos_iommu::{
     derive_isolation_group, iova_level_index, DomainTable, FaultRecord, MappedDmaRange, VtdError,
@@ -32,6 +31,7 @@ use huesos_iommu::{
 use super::vtd::{
     map_uncached_mmio, mmio_read64, mmio_write64, phys_read64, phys_write64, zero_frame_4k,
     VtdHwError, VtdReservedRegion, VtdUnitInit, MAX_DRHD_UNITS, MAX_RESERVED_REGIONS,
+    MAX_UNIT_SCOPE_BDFS,
 };
 use crate::{LockRank, RankedIrqSafeTicketLock};
 
@@ -60,7 +60,7 @@ struct IvhdEngine {
     segment: u16,
     include_pci_all: bool,
     scope_bdf_count: u8,
-    scope_bdfs: [u16; 4],
+    scope_bdfs: [u16; MAX_UNIT_SCOPE_BDFS],
     register_base: u64,
     intr_remap_hw: bool,
     devtab_phys: u64,
@@ -77,7 +77,7 @@ impl IvhdEngine {
         segment: 0,
         include_pci_all: false,
         scope_bdf_count: 0,
-        scope_bdfs: [0; 4],
+        scope_bdfs: [0; MAX_UNIT_SCOPE_BDFS],
         register_base: 0,
         intr_remap_hw: false,
         devtab_phys: 0,
@@ -216,8 +216,9 @@ pub fn initialize(
     guard.reserved_count = keep_reserved;
 
     for (idx, u) in units.iter().enumerate() {
-        let devtab_phys = huesos_pmm::alloc_contiguous_aligned(AMD_VI_DEVTAB_BYTES, PAGE_SIZE_4K, 0)
-            .map_err(|_| VtdHwError::OutOfMemory)?;
+        let devtab_phys =
+            huesos_pmm::alloc_contiguous_aligned(AMD_VI_DEVTAB_BYTES, PAGE_SIZE_4K, 0)
+                .map_err(|_| VtdHwError::OutOfMemory)?;
         let cmd_buf_phys = huesos_pmm::alloc_frame().map_err(|_| VtdHwError::OutOfMemory)?;
         let evt_log_phys = huesos_pmm::alloc_frame().map_err(|_| VtdHwError::OutOfMemory)?;
         let blocked_pt_phys = huesos_pmm::alloc_frame().map_err(|_| VtdHwError::OutOfMemory)?;
@@ -529,7 +530,9 @@ fn bring_up_ivhd_hardware(engine: &mut IvhdEngine) -> Result<(), VtdHwError> {
     let ctrl = CTRL_IOMMU_EN | CTRL_EVENT_LOG_EN | CTRL_COHERENT | CTRL_CMD_BUF_EN;
     mmio_write64(base, MMIO_CONTROL, ctrl);
 
-    let init_cmds = [AmdViCommand::invalidate_domain_all(AMD_VI_BLOCKED_DOMAIN_ID)];
+    let init_cmds = [AmdViCommand::invalidate_domain_all(
+        AMD_VI_BLOCKED_DOMAIN_ID,
+    )];
     submit_commands_and_wait(engine, &init_cmds)
 }
 
