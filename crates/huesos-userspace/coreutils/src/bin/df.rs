@@ -68,11 +68,8 @@ fn run() -> i32 {
                 format!("{}", bytes / BLOCK)
             }
         };
-        let pct = if cap_b > 0 {
-            ((used_b.saturating_mul(100)) / cap_b).min(100)
-        } else {
-            0
-        };
+        let raw_pct = used_b.saturating_mul(100).checked_div(cap_b).unwrap_or(0);
+        let pct = raw_pct.min(100);
         if human {
             cu::outln(&format!(
                 "{:<12} {:>8} {:>8} {:>8} {:>4}  Mounted on",
@@ -205,32 +202,27 @@ fn run() -> i32 {
             percent_text
         ));
     }
-    if path.is_none() {
-        if let Some((u_cap, u_used, u_avail, u_kind)) = huesos_std::usb_fat::stat_fs() {
-            let u_pct = if u_cap > 0 {
-                format!("{}%", ((u_used.saturating_mul(100)) / u_cap).min(100))
-            } else {
-                String::from("0%")
-            };
-            if human {
-                cu::outln(&format!(
-                    "{:<12} {:>8} {:>8} {:>8} {:>4}  /mnt/usb0",
-                    u_kind,
-                    number(Some(u_cap)),
-                    number(Some(u_used)),
-                    number(Some(u_avail)),
-                    u_pct
-                ));
-            } else {
-                cu::outln(&format!(
-                    "{:<12} {:>10} {:>10} {:>10} {:>4}  /mnt/usb0",
-                    u_kind,
-                    number(Some(u_cap)),
-                    number(Some(u_used)),
-                    number(Some(u_avail)),
-                    u_pct
-                ));
-            }
+    if let (None, Some((u_cap, u_used, u_avail, u_kind))) = (path, huesos_std::usb_fat::stat_fs()) {
+        let u_raw = u_used.saturating_mul(100).checked_div(u_cap).unwrap_or(0);
+        let u_pct = format!("{}%", u_raw.min(100));
+        if human {
+            cu::outln(&format!(
+                "{:<12} {:>8} {:>8} {:>8} {:>4}  /mnt/usb0",
+                u_kind,
+                number(Some(u_cap)),
+                number(Some(u_used)),
+                number(Some(u_avail)),
+                u_pct
+            ));
+        } else {
+            cu::outln(&format!(
+                "{:<12} {:>10} {:>10} {:>10} {:>4}  /mnt/usb0",
+                u_kind,
+                number(Some(u_cap)),
+                number(Some(u_used)),
+                number(Some(u_avail)),
+                u_pct
+            ));
         }
     }
     if let (Some(percent), Some(capacity)) = (percent, capacity) {

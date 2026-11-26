@@ -310,35 +310,33 @@ impl<'a, D: BlockDevice> FatFileSystem<'a, D> {
             let lba_ok = (2..=u32::MAX as u64).contains(&entry_lba);
             if lba_ok && (128..=512).contains(&entry_size) {
                 let per_sec = 512 / entry_size;
-                if per_sec > 0 {
-                    let mut idx = 0usize;
-                    while idx < num_entries as usize {
-                        let lba = (entry_lba as u32).saturating_add((idx / per_sec) as u32);
-                        let off = (idx % per_sec) * entry_size;
-                        let mut ebuf = [0u8; 512];
-                        if device.read_sector(lba, &mut ebuf).is_err() {
-                            break;
-                        }
-                        let type_guid = &ebuf[off..off + 16];
-                        if type_guid.iter().any(|&b| b != 0) {
-                            let first_lba = u64::from_le_bytes([
-                                ebuf[off + 32],
-                                ebuf[off + 33],
-                                ebuf[off + 34],
-                                ebuf[off + 35],
-                                ebuf[off + 36],
-                                ebuf[off + 37],
-                                ebuf[off + 38],
-                                ebuf[off + 39],
-                            ]);
-                            if first_lba > 0 && first_lba <= u32::MAX as u64 {
-                                if let Ok(fs) = Self::mount_at(device, first_lba as u32) {
-                                    return Ok(fs);
-                                }
+                let mut idx = 0usize;
+                while idx < num_entries as usize {
+                    let lba = (entry_lba as u32).saturating_add((idx / per_sec) as u32);
+                    let off = (idx % per_sec) * entry_size;
+                    let mut ebuf = [0u8; 512];
+                    if device.read_sector(lba, &mut ebuf).is_err() {
+                        break;
+                    }
+                    let type_guid = &ebuf[off..off + 16];
+                    if type_guid.iter().any(|&b| b != 0) {
+                        let first_lba = u64::from_le_bytes([
+                            ebuf[off + 32],
+                            ebuf[off + 33],
+                            ebuf[off + 34],
+                            ebuf[off + 35],
+                            ebuf[off + 36],
+                            ebuf[off + 37],
+                            ebuf[off + 38],
+                            ebuf[off + 39],
+                        ]);
+                        if first_lba > 0 && first_lba <= u32::MAX as u64 {
+                            if let Ok(fs) = Self::mount_at(device, first_lba as u32) {
+                                return Ok(fs);
                             }
                         }
-                        idx += 1;
                     }
+                    idx += 1;
                 }
             }
         }
@@ -1337,12 +1335,12 @@ fn build_lfn_entries(name: &str, short_11: &[u8; 11]) -> Result<Vec<[u8; 32]>, D
     for rev_idx in (0..slot_count).rev() {
         let mut chunk = [0xFFFFu16; 13];
         let base = rev_idx * 13;
-        for j in 0..13usize {
+        for (j, slot) in chunk.iter_mut().enumerate() {
             let pos = base + j;
             if pos < utf16.len() {
-                chunk[j] = utf16[pos];
+                *slot = utf16[pos];
             } else if pos == utf16.len() {
-                chunk[j] = 0x0000;
+                *slot = 0x0000;
             }
         }
         let mut ord = (rev_idx + 1) as u8;

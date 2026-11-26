@@ -60,18 +60,16 @@ fn run() -> i32 {
         None
     };
 
-    if primary_io.is_err() && usb_extra.is_none() {
-        if let Err(error) = primary_io {
-            if target.is_none() && !disk::has_block_device() {
-                cu::errln(
-                    "lsblk: no block device in this process (the shell grants one only when \
-                     the NVMe service is online); pass an image path instead",
-                );
-                return 1;
-            }
-            cu::errln(&format!("lsblk: cannot open {error}"));
+    if let (Err(error), None) = (&primary_io, &usb_extra) {
+        if target.is_none() && !disk::has_block_device() {
+            cu::errln(
+                "lsblk: no block device in this process (the shell grants one only when \
+                 the NVMe service is online); pass an image path instead",
+            );
             return 1;
         }
+        cu::errln(&format!("lsblk: cannot open {error}"));
+        return 1;
     }
 
     let header = if show_filesystems {
