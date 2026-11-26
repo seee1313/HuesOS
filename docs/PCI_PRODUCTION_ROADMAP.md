@@ -835,7 +835,7 @@ Exit criterion:
 
 # Stage N — IOMMU isolated profile
 
-Status: **N.1, N.2 (Intel VT-d), & N.3 COMPLETE; AMD-Vi HARDWARE BACKEND OPEN**
+Status: **N.1, N.2 (Intel VT-d & AMD-Vi), & N.3 COMPLETE**
 
 ## N.1 DMAR/IVRS discovery
 
@@ -850,21 +850,20 @@ Exit criterion:
 
 Bind DeviceLease to an IOMMU domain and map only lease-owned buffers.
 
-Implemented for Intel VT-d (`DMAR`, [IOMMU_VTD.md](IOMMU_VTD.md)):
+Implemented for both Intel VT-d (`DMAR`) and AMD-Vi (`IVRS`, [IOMMU_VTD.md](IOMMU_VTD.md)):
 - pure `#![forbid(unsafe_code)]` codec/policy crate `crates/huesos-iommu`
-  (39-bit / 48-bit SLPTs, `RMRR` unity passthrough, `CM=1` invalidation
-  sequencing, `FRCD` fault decode, per-lease `DomainTable`);
-- Ring-0 driver `huesos_arch::x86_64::vtd` wired to `DeviceLease`
-  (`Syscall::DeviceLeaseAttachDma = 96`, `Syscall::SystemIommuStatus = 97`,
-  synchronous `revoke()`/`Drop` teardown before BDF or physical frame reuse);
+  (VT-d 39-bit / 48-bit SLPTs + `RMRR` + `CM=1` + `FRCD`, AMD-Vi DTE + 4-level
+  IO page tables + Command Buffer / Event Log + `IVMD`, per-lease `DomainTable`);
+- Ring-0 backends `huesos_arch::x86_64::{vtd, amd_vi, iommu}` wired to
+  `DeviceLease` (`Syscall::DeviceLeaseAttachDma = 96`,
+  `Syscall::SystemIommuStatus = 97`, synchronous `revoke()`/`Drop` teardown
+  before BDF or physical frame reuse);
 - `acpi-manager` `HIOM` `active_mode=Isolated` gated on `SystemIommuStatus`,
   `pci-manager` `IommuDomain` binding, `driver-manager` `:dma:` grant binding,
   `net-service` `VIRTIO_F_ACCESS_PLATFORM` negotiation, and `pci --iommu`
   `IOMMU-KERNEL` telemetry;
-- verified in CI by `scripts/ci-qemu-iommu-vtd-smoke.sh` (`iommu_test=1` `edu`
-  positive + negative SLPT write fault + post-revoke fault, NVMe + HxFS, and
-  VirtIO 1.0 `iommu_platform=on`, plus no-IOMMU `Trusted` fallback). AMD-Vi
-  (`IVRS`) hardware table programming remains open for AMD platforms.
+- verified in CI by the 3-leg `scripts/ci-qemu-iommu-vtd-smoke.sh` (`intel-iommu`,
+  `amd-iommu`, and no-IOMMU `Trusted` fallback).
 
 Exit criterion:
 
@@ -953,11 +952,11 @@ PCI production-ready remains false while any of these are true:
 ## 5. Completed `AP-0..AP-23` bring-up cascade
 
 `PCI-1` through `PCI-9`, the complete `AP-0..AP-23` Ring-3 ACPI → PCI Manager
-implementation series, and `Stage N.2` Intel VT-d second-stage DMA isolation are
-implemented. The remaining open work before `PCI production-ready = true`
-consists strictly of AMD-Vi (`IVRS`) hardware IOMMU tables, `Stage M.2` (first
-live `QuiesceRemap` DriverHost), live runtime Root Port hotplug wiring (`K.2`),
-and `Stage O` (long-haul and multi-platform bare-metal qualification).
+implementation series, and `Stage N.2` Intel VT-d & AMD-Vi hardware DMA
+isolation are implemented. The remaining open work before
+`PCI production-ready = true` consists strictly of `Stage M.2` (first live
+`QuiesceRemap` DriverHost), live runtime Root Port hotplug wiring (`K.2`), and
+`Stage O` (long-haul and multi-platform bare-metal qualification).
 
 ---
 
@@ -983,8 +982,8 @@ and `Stage O` (long-haul and multi-platform bare-metal qualification).
 | K.1–K.3 Reserved-space hotplug | Complete (policy + boot self-check) | `huesos_pci::hotplug` 10,000-storm coalescing + 1,000-cycle add/remove leak/ABA suite (`AP-23`) |
 | L.1–L.3 Restart rebalance & rollback | Complete (policy + fault injection) | `huesos_pci::rebalance` NVMe `Fixed` enforcement + 8-step rollback fault-injection suite (`AP-23`) |
 | M.1–M.2 Live `QuiesceRemap` | M.1 protocol complete; M.2 deferred | `QuiesceRemapSession` deadline-bounded state machine + 1,000-cycle suite (`AP-23`) |
-| N.1–N.3 IOMMU profile | Complete (Intel VT-d); AMD-Vi open | `huesos-iommu` + `vtd.rs` per-lease SLPT domains + `scripts/ci-qemu-iommu-vtd-smoke.sh` (`iommu_test=1` negative DMA + `Trusted` fallback) |
-| O.1–O.4 Production qualification | Open | QEMU matrix (including VT-d isolated DMA) green; multi-platform physical bare-metal matrix & AMD-Vi required |
+| N.1–N.3 IOMMU profile | Complete (Intel VT-d & AMD-Vi) | `huesos-iommu` + `vtd.rs`/`amd_vi.rs` per-lease IO page-table domains + 3-leg `scripts/ci-qemu-iommu-vtd-smoke.sh` (`intel-iommu` + `amd-iommu` + `Trusted` fallback) |
+| O.1–O.4 Production qualification | Open | QEMU matrix (VT-d & AMD-Vi isolated DMA) green; multi-platform physical bare-metal matrix required |
 
 Update this table in every PCI stage PR. A track may be marked complete only
 with its exit criterion and verification command/log named in the PR.

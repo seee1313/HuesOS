@@ -1,6 +1,7 @@
 //! x86_64-specific implementation.
 
 pub mod acpi;
+pub mod amd_vi;
 pub mod ap_boot;
 pub mod context_switch;
 pub mod cpu;
@@ -11,6 +12,7 @@ pub mod idt;
 pub mod interrupts;
 pub mod ioapic;
 mod ioapic_vectors;
+pub mod iommu;
 pub mod irq_callback;
 pub mod lapic;
 pub mod paging;

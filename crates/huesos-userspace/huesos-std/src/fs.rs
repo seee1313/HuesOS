@@ -133,14 +133,33 @@ fn walk_scoped_parent<'a>(
     Ok((current_dir, cur_seg))
 }
 
-fn open_file(path: &str, create: bool) -> Result<HxfsFile> {
+enum FileInner {
+    Hxfs(HxfsFile),
+    UsbFat { rel_path: String },
+}
+
+fn usb_mount_available() -> bool {
+    (service().is_some() || directory().is_some()) && crate::usb_fat::shared_registry().is_some()
+}
+
+fn open_file(path: &str, create: bool) -> Result<FileInner> {
     let normalized = path::normalize(path);
+    if usb_mount_available() {
+        if normalized == "/mnt" {
+            return Err(Error::new(ErrorKind::InvalidInput));
+        }
+        if let Some(sub) = crate::usb_fat::split_usb_mount_path(&normalized) {
+            let rel_path = crate::usb_fat::open_existing_or_create(sub, create)?;
+            return Ok(FileInner::UsbFat { rel_path });
+        }
+    }
     if let Some(service) = service() {
         return if create {
             service.create_file(&normalized)
         } else {
             service.open_file(&normalized)
         }
+        .map(FileInner::Hxfs)
         .map_err(Error::from);
     }
     if let Some(root) = directory() {
@@ -156,6 +175,7 @@ fn open_file(path: &str, create: bool) -> Result<HxfsFile> {
         } else {
             parent.open_file(leaf)
         }
+        .map(FileInner::Hxfs)
         .map_err(Error::from);
     }
     Err(Error::capability())
@@ -191,12 +211,12 @@ fn open_dir(path: &str) -> Result<HxfsDirectory> {
 /// cursor as it goes and `seek` is what makes an append, an overwrite in the
 /// middle, or a whole-file rewrite the same operation.
 pub struct File {
-    inner: HxfsFile,
+    inner: FileInner,
     position: u64,
 }
 
 impl File {
-    fn wrap(inner: HxfsFile) -> Self {
+    fn wrap(inner: FileInner) -> Self {
         Self { inner, position: 0 }
     }
 
@@ -212,18 +232,23 @@ impl File {
         // the ABI has no code to carry that answer, so an existing file is
         // opened and truncated instead. Without this, creating a file that a
         // previous run left behind looked like a bad request.
-        let file = match open_file(path, false) {
-            Ok(file) => file,
-            Err(error) if error.kind() == ErrorKind::NotFound => open_file(path, true)?,
+        let mut file = match open_file(path, false) {
+            Ok(inner) => Self::wrap(inner),
+            Err(error) if error.kind() == ErrorKind::NotFound => {
+                Self::wrap(open_file(path, true)?)
+            }
             Err(error) => return Err(error),
         };
-        file.truncate(0).map_err(Error::from)?;
-        Ok(Self::wrap(file))
+        file.truncate(0)?;
+        Ok(file)
     }
 
     /// The file's length in bytes, without a cached size.
     pub fn size(&self) -> Result<u64> {
-        self.inner.size().map_err(Error::from)
+        match &self.inner {
+            FileInner::Hxfs(file) => file.size().map_err(Error::from),
+            FileInner::UsbFat { rel_path } => crate::usb_fat::file_size(rel_path),
+        }
     }
 
     /// The current cursor.
@@ -233,12 +258,14 @@ impl File {
 
     /// Read at the cursor and advance it.
     pub fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
-        let read = {
-            let data = self
-                .inner
-                .read_at(self.position, buf)
-                .map_err(Error::from)?;
-            data.len()
+        let read = match &self.inner {
+            FileInner::Hxfs(file) => {
+                let data = file.read_at(self.position, buf).map_err(Error::from)?;
+                data.len()
+            }
+            FileInner::UsbFat { rel_path } => {
+                crate::usb_fat::read_at(rel_path, self.position, buf)?
+            }
         };
         self.position += read as u64;
         Ok(read)
@@ -246,11 +273,16 @@ impl File {
 
     /// Write at the cursor and advance it.
     pub fn write(&mut self, buf: &[u8]) -> Result<usize> {
-        let cap = buf.len().min(huesos_abi::hxfs::HXFS_MAX_INLINE_WRITE_BYTES);
-        let written = self
-            .inner
-            .write_at(self.position, &buf[..cap])
-            .map_err(Error::from)?;
+        let written = match &self.inner {
+            FileInner::Hxfs(file) => {
+                let cap = buf.len().min(huesos_abi::hxfs::HXFS_MAX_INLINE_WRITE_BYTES);
+                file.write_at(self.position, &buf[..cap])
+                    .map_err(Error::from)?
+            }
+            FileInner::UsbFat { rel_path } => {
+                crate::usb_fat::write_at(rel_path, self.position, buf)?
+            }
+        };
         self.position += written as u64;
         Ok(written)
     }
@@ -278,21 +310,25 @@ impl File {
     /// length", so growing a file leaves the new region zero-filled and the
     /// cursor where it was, which is what `dd seek=` and `hexdump -s` need.
     pub fn set_len(&mut self, size: u64) -> Result<()> {
-        self.inner.truncate(size).map_err(Error::from)?;
+        match &self.inner {
+            FileInner::Hxfs(file) => file.truncate(size).map_err(Error::from)?,
+            FileInner::UsbFat { rel_path } => crate::usb_fat::truncate(rel_path, size)?,
+        }
         self.position = self.position.min(size);
         Ok(())
     }
 
     /// Truncate or zero-extend the file.
     pub fn truncate(&mut self, size: u64) -> Result<()> {
-        self.inner.truncate(size).map_err(Error::from)?;
-        self.position = self.position.min(size);
-        Ok(())
+        self.set_len(size)
     }
 
     /// Flush to the volume.
     pub fn fsync(&self) -> Result<()> {
-        self.inner.fsync().map_err(Error::from)
+        match &self.inner {
+            FileInner::Hxfs(file) => file.fsync().map_err(Error::from),
+            FileInner::UsbFat { .. } => crate::usb_fat::flush(),
+        }
     }
 }
 
@@ -477,13 +513,26 @@ pub fn symlink_metadata(path: &str) -> Result<Metadata> {
 }
 
 fn metadata_inner(path: &str, follow_final: bool) -> Result<Metadata> {
+    let normalized = path::normalize(path);
+    if usb_mount_available() {
+        if normalized == "/mnt" {
+            return Ok(Metadata {
+                object_id: 0,
+                len: 0,
+                kind: EntryKind::Dir,
+                mode: 0o755,
+                modified_unix_ns: 0,
+            });
+        }
+        if let Some(sub) = crate::usb_fat::split_usb_mount_path(&normalized) {
+            return crate::usb_fat::metadata(sub);
+        }
+    }
     let raw = if let Some(service) = service() {
-        let normalized = path::normalize(path);
         service
             .stat_path(&normalized, follow_final)
             .map_err(Error::from)?
     } else if let Some(root) = directory() {
-        let normalized = path::normalize(path);
         let rel = path::relative(&normalized);
         let target = if rel.is_empty() { "." } else { rel };
         root.stat_path(target, follow_final).map_err(Error::from)?
@@ -563,8 +612,40 @@ pub fn write(path: &str, data: &[u8]) -> Result<()> {
     file.fsync()
 }
 
+/// Handle returned by [`create_dir`] for optional directory `fsync`.
+pub struct CreatedDir {
+    inner: Option<HxfsDirectory>,
+}
+
+impl CreatedDir {
+    /// Flush newly created directory metadata to backing storage.
+    pub fn fsync(&self) -> Result<()> {
+        match &self.inner {
+            Some(dir) => dir.fsync().map_err(Error::from),
+            None => crate::usb_fat::flush(),
+        }
+    }
+}
+
 /// List a directory.
 pub fn list(path: &str) -> Result<Vec<Entry>> {
+    let normalized = path::normalize(path);
+    if usb_mount_available() {
+        if normalized == "/mnt" {
+            let mut out = Vec::new();
+            if crate::usb_fat::is_mounted() {
+                out.push(Entry {
+                    name: String::from("usb0"),
+                    kind: EntryKind::Dir,
+                    size: None,
+                });
+            }
+            return Ok(out);
+        }
+        if let Some(sub) = crate::usb_fat::split_usb_mount_path(&normalized) {
+            return crate::usb_fat::list(sub);
+        }
+    }
     let dir = open_dir(path)?;
     let mut raw = [0u8; LIST_BYTES];
     let text = {
@@ -589,10 +670,22 @@ pub fn list(path: &str) -> Result<Vec<Entry>> {
 }
 
 /// Create a directory.
-pub fn create_dir(path: &str) -> Result<HxfsDirectory> {
+pub fn create_dir(path: &str) -> Result<CreatedDir> {
     let normalized = path::normalize(path);
+    if usb_mount_available() {
+        if normalized == "/mnt" {
+            return Err(Error::new(ErrorKind::AlreadyExists));
+        }
+        if let Some(sub) = crate::usb_fat::split_usb_mount_path(&normalized) {
+            crate::usb_fat::create_dir(sub)?;
+            return Ok(CreatedDir { inner: None });
+        }
+    }
     if let Some(service) = service() {
-        return service.mkdir(&normalized).map_err(Error::from);
+        return service
+            .mkdir(&normalized)
+            .map(|dir| CreatedDir { inner: Some(dir) })
+            .map_err(Error::from);
     }
     if let Some(root) = directory() {
         let relative = path::relative(&normalized);
@@ -601,7 +694,10 @@ pub fn create_dir(path: &str) -> Result<HxfsDirectory> {
         }
         let (parent_opt, leaf) = walk_scoped_parent(root, relative)?;
         let parent = parent_opt.as_ref().unwrap_or(root);
-        return parent.mkdir(leaf).map_err(Error::from);
+        return parent
+            .mkdir(leaf)
+            .map(|dir| CreatedDir { inner: Some(dir) })
+            .map_err(Error::from);
     }
     Err(Error::capability())
 }
@@ -609,6 +705,14 @@ pub fn create_dir(path: &str) -> Result<HxfsDirectory> {
 /// Remove a file or empty directory.
 pub fn remove(path: &str) -> Result<()> {
     let normalized = path::normalize(path);
+    if usb_mount_available() {
+        if normalized == "/mnt" {
+            return Err(Error::new(ErrorKind::InvalidInput));
+        }
+        if let Some(sub) = crate::usb_fat::split_usb_mount_path(&normalized) {
+            return crate::usb_fat::remove(sub);
+        }
+    }
     if let Some(service) = service() {
         return service.unlink(&normalized).map_err(Error::from);
     }
@@ -628,6 +732,18 @@ pub fn remove(path: &str) -> Result<()> {
 pub fn rename(from: &str, to: &str) -> Result<()> {
     let from_norm = path::normalize(from);
     let to_norm = path::normalize(to);
+    if usb_mount_available() {
+        match (
+            crate::usb_fat::split_usb_mount_path(&from_norm),
+            crate::usb_fat::split_usb_mount_path(&to_norm),
+        ) {
+            (Some(from_sub), Some(to_sub)) => return crate::usb_fat::rename(from_sub, to_sub),
+            (Some(_), None) | (None, Some(_)) => {
+                return Err(Error::new(ErrorKind::InvalidInput));
+            }
+            (None, None) => {}
+        }
+    }
     if let Some(service) = service() {
         return service.rename(&from_norm, &to_norm).map_err(Error::from);
     }
@@ -682,8 +798,13 @@ pub fn read_link(path: &str) -> Result<String> {
 
 /// Update POSIX mode bits (`0o7777`) on `path`.
 pub fn set_permissions(path: &str, mode: u32) -> Result<()> {
+    let normalized = path::normalize(path);
+    if usb_mount_available()
+        && (normalized == "/mnt" || crate::usb_fat::split_usb_mount_path(&normalized).is_some())
+    {
+        return Ok(());
+    }
     if let Some(service) = service() {
-        let normalized = path::normalize(path);
         return service
             .set_attr(&normalized, Some(mode), None, true)
             .map_err(Error::from);

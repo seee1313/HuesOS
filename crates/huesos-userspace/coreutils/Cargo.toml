@@ -195,6 +195,7 @@ path = "src/bin/wlanctl.rs"
 libcanvas = { path = "../libcanvas", default-features = false, features = ["dyn-client"] }
 huesos-abi = { path = "../../huesos-abi" }
 huesos-std = { path = "../huesos-std" }
+huesos-fat = { path = "../../huesos-fat" }
 huesos-gpt = { path = "../../huesos-gpt" }
 huesos-hxfs = { path = "../../huesos-hxfs", features = ["writer"] }
 huesos-tls = { path = "../../huesos-tls" }

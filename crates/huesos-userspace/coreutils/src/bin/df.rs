@@ -55,6 +55,53 @@ fn run() -> i32 {
     }
 
     let mount = path.unwrap_or("/");
+    let normalized_mount = cu::normalize_path(mount);
+    if huesos_std::usb_fat::split_usb_mount_path(&normalized_mount).is_some() {
+        let Some((cap_b, used_b, avail_b, fs_label)) = huesos_std::usb_fat::stat_fs() else {
+            cu::errln("df: /mnt/usb0: no FAT volume mounted");
+            return 1;
+        };
+        let number = |bytes: u64| -> String {
+            if human {
+                human_size(bytes)
+            } else {
+                format!("{}", bytes / BLOCK)
+            }
+        };
+        let pct = if cap_b > 0 {
+            ((used_b.saturating_mul(100)) / cap_b).min(100)
+        } else {
+            0
+        };
+        if human {
+            cu::outln(&format!(
+                "{:<12} {:>8} {:>8} {:>8} {:>4}  Mounted on",
+                "Filesystem", "Size", "Used", "Avail", "Use%"
+            ));
+            cu::outln(&format!(
+                "{:<12} {:>8} {:>8} {:>8} {:>4}  /mnt/usb0",
+                fs_label,
+                number(cap_b),
+                number(used_b),
+                number(avail_b),
+                format!("{pct}%")
+            ));
+        } else {
+            cu::outln(&format!(
+                "{:<12} {:>10} {:>10} {:>10} {:>4}  Mounted on",
+                "Filesystem", "4K-blocks", "Used", "Available", "Use%"
+            ));
+            cu::outln(&format!(
+                "{:<12} {:>10} {:>10} {:>10} {:>4}  /mnt/usb0",
+                fs_label,
+                number(cap_b),
+                number(used_b),
+                number(avail_b),
+                format!("{pct}%")
+            ));
+        }
+        return 0;
+    }
 
     // Prefer native `StatFs` from `hxfs-service` (accurate physical block
     // allocation, free space, quota, object counts, and checkpoint sequence).
@@ -157,6 +204,34 @@ fn run() -> i32 {
             number(available),
             percent_text
         ));
+    }
+    if path.is_none() {
+        if let Some((u_cap, u_used, u_avail, u_kind)) = huesos_std::usb_fat::stat_fs() {
+            let u_pct = if u_cap > 0 {
+                format!("{}%", ((u_used.saturating_mul(100)) / u_cap).min(100))
+            } else {
+                String::from("0%")
+            };
+            if human {
+                cu::outln(&format!(
+                    "{:<12} {:>8} {:>8} {:>8} {:>4}  /mnt/usb0",
+                    u_kind,
+                    number(Some(u_cap)),
+                    number(Some(u_used)),
+                    number(Some(u_avail)),
+                    u_pct
+                ));
+            } else {
+                cu::outln(&format!(
+                    "{:<12} {:>10} {:>10} {:>10} {:>4}  /mnt/usb0",
+                    u_kind,
+                    number(Some(u_cap)),
+                    number(Some(u_used)),
+                    number(Some(u_avail)),
+                    u_pct
+                ));
+            }
+        }
     }
     if let (Some(percent), Some(capacity)) = (percent, capacity) {
         cu::outln(&format!(

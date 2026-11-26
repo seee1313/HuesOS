@@ -262,8 +262,28 @@ fn command_uses_query_channel(resolved: &str) -> bool {
     let stem = strip_exec_ext(base);
     matches!(
         stem,
-        "pci" | "lsusb" | "acpi" | "ps" | "btop" | "netctl" | "wlanctl" | "std_smoke" | "std-smoke"
+        "pci"
+            | "lsusb"
+            | "acpi"
+            | "ps"
+            | "btop"
+            | "netctl"
+            | "wlanctl"
+            | "df"
+            | "lsblk"
+            | "fdisk"
+            | "hsh"
+            | "std_smoke"
+            | "std-smoke"
     )
+}
+
+fn arg_touches_usb_mount(arg: &str) -> bool {
+    arg == "/"
+        || arg == "/mnt"
+        || arg.starts_with("/mnt/")
+        || arg == "/dev/block/usb0"
+        || arg == "/dev/usb0"
 }
 
 fn command_uses_net_service(resolved: &str) -> bool {
@@ -726,6 +746,10 @@ impl HshHost {
 
     pub fn read_script_file(&mut self, path_arg: &str) -> Result<String, String> {
         let path = self.normalize_path(path_arg);
+        if let Some(rel) = split_usb0_rel(&path) {
+            let bytes = self.usb_read_file(&rel)?;
+            return Ok(String::from_utf8_lossy(&bytes).into_owned());
+        }
         self.try_connect_hxfs();
         if let Some(hxfs) = self.hxfs.as_ref() {
             if let Ok(file) = hxfs.open_file(&path) {
@@ -1041,6 +1065,28 @@ impl HshHost {
             return Err(ExecOutcome::err(127, format!("unknown command: {name}")));
         };
 
+        // Utilities take paths, not a working directory, so path arguments are
+        // resolved here. Data operands stay exactly as typed. A directory grant
+        // makes relative paths meaningful inside the granted subtree.
+        let dir_confined = caps.is_some_and(|c| c.dir.is_some());
+        let mut owned_args = if dir_confined {
+            args.to_vec()
+        } else {
+            self.resolve_arguments(name, args)
+        };
+        if name == "ls" && owned_args.is_empty() {
+            owned_args.push(if dir_confined {
+                String::from(".")
+            } else {
+                self.pwd.clone()
+            });
+        }
+        let needs_query = command_uses_query_channel(&resolved)
+            || (!dir_confined
+                && (self.pwd == "/mnt"
+                    || self.pwd.starts_with("/mnt/")
+                    || owned_args.iter().any(|a| arg_touches_usb_mount(a))));
+
         let mask = caps.map_or(caps_mask::ALL_DEFAULT, CapsSpec::to_caps_mask);
         self.try_connect_hxfs();
         let mut dir_holder: Option<libcanvas::HxfsDirectory> = None;
@@ -1079,7 +1125,7 @@ impl HshHost {
             if spec.block_rw && command_uses_block_device(&resolved) {
                 blk_holder = self.open_block_nvme_fresh();
             }
-            if (mask & caps_mask::QUERY_RO) != 0 && command_uses_query_channel(&resolved) {
+            if (mask & caps_mask::QUERY_RO) != 0 && needs_query {
                 query_holder = self.open_query_fresh();
             }
             if spec.net != NetAccess::None && command_uses_net_service(&resolved) {
@@ -1098,7 +1144,7 @@ impl HshHost {
             if command_uses_block_device(&resolved) {
                 blk_holder = self.open_block_nvme_fresh();
             }
-            if command_uses_query_channel(&resolved) {
+            if needs_query {
                 query_holder = self.open_query_fresh();
             }
             if command_uses_net_service(&resolved) {
@@ -1107,23 +1153,6 @@ impl HshHost {
             if command_uses_wlan_service(&resolved) {
                 wlan_holder = self.open_wlan_fresh(false);
             }
-        }
-
-        // Utilities take paths, not a working directory, so path arguments are
-        // resolved here. Data operands stay exactly as typed. A directory grant
-        // makes relative paths meaningful inside the granted subtree.
-        let dir_confined = caps.is_some_and(|c| c.dir.is_some());
-        let mut owned_args = if dir_confined {
-            args.to_vec()
-        } else {
-            self.resolve_arguments(name, args)
-        };
-        if name == "ls" && owned_args.is_empty() {
-            owned_args.push(if dir_confined {
-                String::from(".")
-            } else {
-                self.pwd.clone()
-            });
         }
 
         let fb_allowed = caps.is_none_or(|c| c.fb == FbAccess::ReadOnly);
@@ -2751,6 +2780,9 @@ impl ShellHost for HshHost {
 
     fn write_file(&mut self, path: &str, data: &[u8], append: bool) -> Result<(), String> {
         let abs = self.normalize_path(path);
+        if let Some(rel) = split_usb0_rel(&abs) {
+            return self.usb_write_file(&rel, data, append);
+        }
         self.try_connect_hxfs();
         let Some(hxfs) = self.hxfs.as_ref() else {
             return Err(String::from("redirect failed: hxfs unavailable"));
@@ -2783,6 +2815,9 @@ impl ShellHost for HshHost {
 
     fn read_file(&mut self, path: &str) -> Result<Vec<u8>, String> {
         let abs = self.normalize_path(path);
+        if let Some(rel) = split_usb0_rel(&abs) {
+            return self.usb_read_file(&rel);
+        }
         self.try_connect_hxfs();
         if let Some(hxfs) = self.hxfs.as_ref() {
             if let Ok(file) = hxfs.open_file(&abs) {
@@ -2817,6 +2852,12 @@ impl ShellHost for HshHost {
 
     fn stat_path(&mut self, path: &str, follow: bool) -> Option<(HostPathKind, u64)> {
         let abs = self.normalize_path(path);
+        if abs == "/mnt" {
+            return Some((HostPathKind::Dir, 0));
+        }
+        if let Some(rel) = split_usb0_rel(&abs) {
+            return self.usb_stat_path(&rel);
+        }
         self.try_connect_hxfs();
         if let Some(hxfs) = self.hxfs.as_ref() {
             if let Ok(info) = hxfs.stat_path(&abs, follow) {
@@ -2850,6 +2891,16 @@ impl ShellHost for HshHost {
         } else {
             self.normalize_path(dir)
         };
+        if abs == "/mnt" {
+            let mut out = Vec::new();
+            if self.usb_stat_path("/").is_some() {
+                out.push(String::from("usb0"));
+            }
+            return out;
+        }
+        if let Some(rel) = split_usb0_rel(&abs) {
+            return self.usb_list_dir(&rel);
+        }
         let mut names = Vec::new();
         self.try_connect_hxfs();
         if let Some(hxfs) = self.hxfs.as_ref() {
@@ -2868,6 +2919,9 @@ impl ShellHost for HshHost {
                 }
             }
         }
+        if abs == "/" && !names.iter().any(|x| x == "mnt") && self.usb_stat_path("/").is_some() {
+            names.push(String::from("mnt"));
+        }
         let prefix = if abs == "/" {
             String::from("/")
         } else {
@@ -2882,6 +2936,139 @@ impl ShellHost for HshHost {
             }
         }
         names
+    }
+}
+
+fn split_usb0_rel(abs: &str) -> Option<String> {
+    if abs == "/mnt/usb0" {
+        Some(String::from("/"))
+    } else {
+        abs.strip_prefix("/mnt/usb0/")
+            .map(|rest| format!("/{rest}"))
+    }
+}
+
+struct HshUsbSectorIo {
+    dev: core::cell::RefCell<libcanvas::block::BlockDevice>,
+}
+
+impl huesos_fat::BlockDevice for HshUsbSectorIo {
+    fn read_sector(
+        &self,
+        sector: u32,
+        buf: &mut [u8],
+    ) -> core::result::Result<(), huesos_fat::DriverError> {
+        if buf.len() != 512 {
+            return Err(huesos_fat::DriverError::InvalidSector);
+        }
+        let mut dev = self
+            .dev
+            .try_borrow_mut()
+            .map_err(|_| huesos_fat::DriverError::ReadError)?;
+        dev.read_blocks(u64::from(sector), 1, buf)
+            .map_err(|_| huesos_fat::DriverError::ReadError)
+    }
+
+    fn write_sector(
+        &self,
+        sector: u32,
+        buf: &[u8],
+    ) -> core::result::Result<(), huesos_fat::DriverError> {
+        if buf.len() != 512 {
+            return Err(huesos_fat::DriverError::InvalidSector);
+        }
+        let mut dev = self
+            .dev
+            .try_borrow_mut()
+            .map_err(|_| huesos_fat::DriverError::WriteError)?;
+        dev.write_blocks(u64::from(sector), 1, buf)
+            .map_err(|_| huesos_fat::DriverError::WriteError)
+    }
+
+    fn sector_size(&self) -> u32 {
+        512
+    }
+}
+
+impl HshHost {
+    fn open_usb_io(&self) -> Option<HshUsbSectorIo> {
+        let reg = self.registry.as_ref()?;
+        let dev = libcanvas::block::BlockDevice::open_usb(reg).ok()?;
+        Some(HshUsbSectorIo {
+            dev: core::cell::RefCell::new(dev),
+        })
+    }
+
+    fn usb_stat_path(&self, rel: &str) -> Option<(HostPathKind, u64)> {
+        let io = self.open_usb_io()?;
+        let fs = huesos_fat::FatFileSystem::mount_auto(&io).ok()?;
+        let info = fs.stat(rel).ok()?;
+        let kind = if info.is_dir {
+            HostPathKind::Dir
+        } else {
+            HostPathKind::File
+        };
+        Some((kind, if info.is_dir { 0 } else { u64::from(info.size) }))
+    }
+
+    fn usb_list_dir(&self, rel: &str) -> Vec<String> {
+        let Some(io) = self.open_usb_io() else {
+            return Vec::new();
+        };
+        let Ok(fs) = huesos_fat::FatFileSystem::mount_auto(&io) else {
+            return Vec::new();
+        };
+        fs.list_dir(rel)
+            .map(|items| items.into_iter().map(|e| e.name).collect())
+            .unwrap_or_default()
+    }
+
+    fn usb_read_file(&self, rel: &str) -> Result<Vec<u8>, String> {
+        let io = self
+            .open_usb_io()
+            .ok_or_else(|| String::from("redirect failed: /mnt/usb0 unavailable"))?;
+        let fs = huesos_fat::FatFileSystem::mount_auto(&io)
+            .map_err(|_| String::from("redirect failed: /mnt/usb0 mount error"))?;
+        let sz = fs
+            .file_size(rel)
+            .map_err(|e| format!("stat '/mnt/usb0{rel}': {e:?}"))?
+            .min(256 * 1024) as usize;
+        let mut out = alloc::vec![0u8; sz];
+        let n = fs
+            .read_at(rel, 0, &mut out)
+            .map_err(|e| format!("read '/mnt/usb0{rel}': {e:?}"))?;
+        out.truncate(n);
+        Ok(out)
+    }
+
+    fn usb_write_file(&self, rel: &str, data: &[u8], append: bool) -> Result<(), String> {
+        let io = self
+            .open_usb_io()
+            .ok_or_else(|| String::from("redirect failed: /mnt/usb0 unavailable"))?;
+        let fs = huesos_fat::FatFileSystem::mount_auto(&io)
+            .map_err(|_| String::from("redirect failed: /mnt/usb0 mount error"))?;
+        match fs.stat(rel) {
+            Ok(info) if info.is_dir => return Err(format!("'/mnt/usb0{rel}': is a directory")),
+            Ok(_) => {}
+            Err(huesos_fat::DriverError::FileNotFound) => {
+                fs.create_file(rel)
+                    .map_err(|e| format!("create '/mnt/usb0{rel}': {e:?}"))?;
+            }
+            Err(e) => return Err(format!("stat '/mnt/usb0{rel}': {e:?}")),
+        }
+        let offset = if append {
+            fs.file_size(rel).unwrap_or(0)
+        } else {
+            fs.truncate(rel, 0)
+                .map_err(|e| format!("truncate '/mnt/usb0{rel}': {e:?}"))?;
+            0
+        };
+        fs.write_at(rel, offset, data)
+            .map_err(|e| format!("write '/mnt/usb0{rel}': {e:?}"))?;
+        if let Ok(mut dev) = io.dev.try_borrow_mut() {
+            let _ = dev.flush();
+        }
+        Ok(())
     }
 }
 

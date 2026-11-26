@@ -13,6 +13,7 @@ boot-selftest = []
 [dependencies]
 libcanvas = { path = "../libcanvas", default-features = false, features = ["dyn-client"] }
 huesos-abi = { path = "../../huesos-abi" }
+huesos-fat = { path = "../../huesos-fat" }
 huesos-hsh = { path = "../../huesos-hsh" }
 
 [profile.release]

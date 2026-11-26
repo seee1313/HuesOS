@@ -11,31 +11,63 @@ use huesos_abi::block::{
 use huesos_abi::{rights, PORT_PACKET_BLOCK_COMPLETION};
 
 const BUFFER_ID: u32 = 1;
+const SCRATCH_BUFFER_ID: u32 = 2;
+const SCRATCH_BYTES: usize = 4096;
 const DEFAULT_NAMESPACE_ID: u32 = 1;
 
-/// Opened NVMe BlockDevice service channel.
+/// Opened async BlockDevice service channel (NVMe or USB BOT).
 pub struct BlockDevice {
     channel: Channel,
     completion: Port,
     next_request_id: u64,
+    scratch: Option<Vmo>,
 }
 
 impl BlockDevice {
     /// Open the NVMe BlockDevice through a DriverManager registry channel.
     pub fn open_nvme(registry: &Channel) -> Result<Self> {
+        Self::open_named(
+            registry,
+            b"open:block:nvme",
+            b"service:block:nvme:channel",
+            b"err:block:nvme-unavailable",
+        )
+    }
+
+    /// Open the USB BOT (`/dev/block/usb0`) BlockDevice through a DriverManager registry channel.
+    pub fn open_usb(registry: &Channel) -> Result<Self> {
+        Self::open_named(
+            registry,
+            b"open:block:usb",
+            b"service:block:usb:channel",
+            b"err:block:usb-unavailable",
+        )
+    }
+
+    fn open_named(
+        registry: &Channel,
+        req: &[u8],
+        ok_tag: &[u8],
+        err_tag: &[u8],
+    ) -> Result<Self> {
         let mut buf = [0u8; 64];
-        registry.write(b"open:block:nvme")?;
+        registry.write(req)?;
+        let mut spins = 0usize;
         let channel = loop {
             match registry.read_optional_handle(&mut buf) {
-                Ok((n, Some(handle))) if &buf[..n] == b"service:block:nvme:channel" => {
+                Ok((n, Some(handle))) if &buf[..n] == ok_tag => {
                     break Channel::from_handle(handle);
                 }
-                Ok((n, None)) if &buf[..n] == b"err:block:nvme-unavailable" => {
+                Ok((n, None)) if &buf[..n] == err_tag => {
                     return Err(ErrorCode::ShouldWait);
                 }
                 Ok((_n, Some(handle))) => drop(handle),
                 Ok((_n, None)) => return Err(ErrorCode::InvalidArgs),
                 Err(ErrorCode::ShouldWait) | Err(ErrorCode::TimedOut) => {
+                    spins += 1;
+                    if spins > 4096 {
+                        return Err(ErrorCode::TimedOut);
+                    }
                     crate::process::yield_now();
                 }
                 Err(error) => return Err(error),
@@ -58,6 +90,7 @@ impl BlockDevice {
             channel,
             completion,
             next_request_id: 1,
+            scratch: None,
         })
     }
 
@@ -104,7 +137,36 @@ impl BlockDevice {
         }
     }
 
+    fn ensure_scratch(&mut self) -> Result<&Vmo> {
+        if self.scratch.is_none() {
+            let vmo = Vmo::create(SCRATCH_BYTES as u64)?;
+            self.register_buffer(SCRATCH_BUFFER_ID, &vmo)?;
+            self.scratch = Some(vmo);
+        }
+        self.scratch.as_ref().ok_or(ErrorCode::NoMemory)
+    }
+
     fn read_blocks_once(&mut self, lba: u64, block_count: u32, out: &mut [u8]) -> Result<()> {
+        if out.len() <= SCRATCH_BYTES {
+            let _ = self.ensure_scratch()?;
+            let request_id = self.alloc_request_id();
+            let request = AsyncBlockRequest {
+                op: AsyncBlockOp::Read,
+                request_id,
+                namespace_id: DEFAULT_NAMESPACE_ID,
+                lba,
+                block_count,
+                buffer_id: SCRATCH_BUFFER_ID,
+            };
+            self.channel.write(&request.encode())?;
+            self.wait_ok(request_id)?;
+            let vmo = self.scratch.as_ref().ok_or(ErrorCode::NoMemory)?;
+            let copied = vmo.read(0, out)?;
+            if copied != out.len() {
+                return Err(ErrorCode::InvalidArgs);
+            }
+            return Ok(());
+        }
         let request_id = self.alloc_request_id();
         let vmo = Vmo::create(out.len() as u64)?;
         self.register_buffer(BUFFER_ID, &vmo)?;
@@ -146,6 +208,23 @@ impl BlockDevice {
     }
 
     fn write_blocks_once(&mut self, lba: u64, block_count: u32, input: &[u8]) -> Result<()> {
+        if input.len() <= SCRATCH_BYTES {
+            let vmo = self.ensure_scratch()?;
+            if vmo.write(0, input)? != input.len() {
+                return Err(ErrorCode::InvalidArgs);
+            }
+            let request_id = self.alloc_request_id();
+            let request = AsyncBlockRequest {
+                op: AsyncBlockOp::Write,
+                request_id,
+                namespace_id: DEFAULT_NAMESPACE_ID,
+                lba,
+                block_count,
+                buffer_id: SCRATCH_BUFFER_ID,
+            };
+            self.channel.write(&request.encode())?;
+            return self.wait_ok(request_id);
+        }
         let request_id = self.alloc_request_id();
         let vmo = Vmo::create(input.len() as u64)?;
         if vmo.write(0, input)? != input.len() {

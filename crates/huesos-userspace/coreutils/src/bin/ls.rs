@@ -35,6 +35,13 @@ fn run() -> i32 {
     let mut found_any = false;
 
     if allow_hxfs {
+        let row_source = if path == "/mnt" {
+            "vfs"
+        } else if huesos_std::usb_fat::split_usb_mount_path(&path).is_some() {
+            "vfat"
+        } else {
+            "hxfs"
+        };
         if let Ok(entries) = huesos_std::fs::list(&path) {
             found_any = true;
             for entry in entries {
@@ -48,7 +55,13 @@ fn run() -> i32 {
                     Some(sz) => format!("{sz}"),
                     None => String::from("-"),
                 };
-                rows.push(format!("{}\t{kind}\t{size}\thxfs", entry.name));
+                rows.push(format!("{}\t{kind}\t{size}\t{row_source}", entry.name));
+            }
+            if path == "/"
+                && !rows.iter().any(|r| r.starts_with("mnt\t"))
+                && huesos_std::usb_fat::is_mounted()
+            {
+                rows.push(String::from("mnt\tdir\t-\tvfs"));
             }
         } else if let Ok(meta) = huesos_std::fs::symlink_metadata(&path) {
             found_any = true;
@@ -59,7 +72,7 @@ fn run() -> i32 {
                 huesos_std::fs::EntryKind::Symlink => "symlink",
                 huesos_std::fs::EntryKind::Other => "entry",
             };
-            rows.push(format!("{leaf}\t{kind}\t{}\thxfs", meta.len()));
+            rows.push(format!("{leaf}\t{kind}\t{}\t{row_source}", meta.len()));
         }
     }
 
