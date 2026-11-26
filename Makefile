@@ -76,6 +76,7 @@ test:
 		-p huesos-handlemove \
 		-p hues-async \
 		-p huesos-nvme \
+		-p huesos-usb \
 		-p huesos-hxfs \
 		-p huesos-hxfs-proto \
 		-p huesos-pci \

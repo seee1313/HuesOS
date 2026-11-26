@@ -1,0 +1,24 @@
+[package]
+name = "huesos-driver-host-xhci"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "huesos-driver-host-xhci"
+path = "src/main.rs"
+
+[dependencies]
+libcanvas = { path = "../libcanvas" }
+hues-async = { path = "../../hues-async" }
+huesos-abi = { path = "../../huesos-abi" }
+huesos-usb = { path = "../../huesos-usb" }
+
+[profile.release]
+opt-level = 2
+panic = "abort"
+lto = false
+
+[profile.dev]
+panic = "abort"
+
+[workspace]

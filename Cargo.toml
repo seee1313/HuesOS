@@ -29,6 +29,7 @@ members = [
     "crates/hues-async",
     "crates/huesos-nvme",
     "crates/huesos-pci",
+    "crates/huesos-usb",
     "crates/huesos-quota",
     "crates/huesos-sched",
     "crates/huesos-sync",

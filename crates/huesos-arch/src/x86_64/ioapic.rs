@@ -469,11 +469,11 @@ pub fn route_gsi(
 
 /// Acquire a legacy IRQ or already-routed MSI vector for an interrupt object.
 /// ISA IRQs `0..15` use MADT overrides. The MSI-X/MSI vector range
-/// (`0xD0..=0xDF`) is already wired by the PCI path and needs no I/O APIC route.
+/// (`0xD0..=0xE7`) is already wired by the PCI path and needs no I/O APIC route.
 /// Other numeric values are rejected; raw GSIs must use the explicitly typed
 /// [`acquire_gsi_interrupt_route`] path.
 pub fn acquire_interrupt_route(irq_or_vector: u32) -> Option<bool> {
-    if (0xD0..=0xDF).contains(&irq_or_vector) {
+    if (0xD0..=0xE7).contains(&irq_or_vector) {
         return Some(false);
     }
     if irq_or_vector >= 16 {
@@ -524,7 +524,7 @@ pub fn release_gsi_interrupt_route(gsi: u32) {
 /// Complete one userspace service cycle for a legacy IRQ or MSI vector. Edge
 /// routes and MSI vectors need no I/O-APIC unmask operation.
 pub fn acknowledge_interrupt_route(irq_or_vector: u32) -> Result<(), IoApicError> {
-    if (0xD0..=0xDF).contains(&irq_or_vector) {
+    if (0xD0..=0xE7).contains(&irq_or_vector) {
         return Ok(());
     }
     if irq_or_vector >= 16 {

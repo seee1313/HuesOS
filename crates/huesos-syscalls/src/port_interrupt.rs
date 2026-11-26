@@ -87,7 +87,7 @@ pub(crate) fn sys_interrupt_create_for_resource(
     irq: u32,
     out: *mut HandleValue,
 ) -> SyscallResult {
-    if irq >= 16 && !(0xD0..=0xDF).contains(&irq) {
+    if irq >= 16 && !(0xD0..=0xE7).contains(&irq) {
         return Err(ErrorCode::NotSupported);
     }
     validate_irq_resource(resource_handle, irq)?;

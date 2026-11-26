@@ -73,6 +73,8 @@ pub mod pci_lease;
 pub mod pci_manager;
 /// Dedicated ACPI ↔ PCI configuration read mediation protocol (AP-10).
 pub mod pci_mediation;
+/// Zero-bus-traffic USB 3.x (`xHCI`) inventory VMO wire format (`HUSB` v1).
+pub mod usb;
 
 /// HBI boot-driver manifest ABI.
 pub mod hbi_boot {
@@ -398,7 +400,7 @@ pub enum Syscall {
     ResourceMap = 56,
     /// Create an Interrupt object authorized by an `Irq` Resource. `a1` is the
     /// Resource handle, `a2` is a legacy ISA IRQ (`0..16`) or pre-routed
-    /// MSI/MSI-X vector (`0xD0..=0xDF`), `a3=*mut HandleValue`. Raw GSIs use
+    /// MSI/MSI-X vector (`0xD0..=0xE7`), `a3=*mut HandleValue`. Raw GSIs use
     /// [`Self::InterruptCreateGsiForResource`].
     InterruptCreateForResource = 57,
     /// Queue one packet to a Port. `a1` is a Port handle with WRITE rights,

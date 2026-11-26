@@ -86,6 +86,14 @@ fn main() {
         &[],
         &[],
     );
+    let xhci_driver_host = build_userspace_program(
+        &userspace_root,
+        "driver-host-xhci",
+        "huesos-driver-host-xhci",
+        profile,
+        &[],
+        &[],
+    );
     let hxfs_service = build_userspace_program(
         &userspace_root,
         "hxfs-service",
@@ -306,6 +314,7 @@ fn main() {
         BootfsInputs {
             input_driver_host: &input_driver_host,
             nvme_driver_host: &nvme_driver_host,
+            xhci_driver_host: &xhci_driver_host,
             hxfs_service: &hxfs_service,
             net_service: &net_service,
             wlan_service: &wlan_service,
@@ -458,6 +467,7 @@ fn track_userspace_inputs(userspace_root: &Path) {
         "driver-manager",
         "driver-host-input",
         "driver-host-nvme",
+        "driver-host-xhci",
         "hxfs-service",
         "net-service",
         "wlan-service",
@@ -1084,6 +1094,7 @@ struct BootFsFile {
 struct BootfsInputs<'a> {
     input_driver_host: &'a Path,
     nvme_driver_host: &'a Path,
+    xhci_driver_host: &'a Path,
     hxfs_service: &'a Path,
     net_service: &'a Path,
     wlan_service: &'a Path,
@@ -1207,6 +1218,10 @@ fn build_bootfs_image(manifest_dir: &Path, inputs: BootfsInputs<'_>) -> PathBuf 
             data: b"name=driver-host-nvme\nkind=driver-host\nprovides=block:nvme\ncritical=false\nelf=/drivers/driver-host-nvme.elf\nheartbeat=false\n".to_vec(),
         },
         BootFsFile {
+            path: "/manifests/xhci.hdriver",
+            data: b"name=driver-host-xhci\nkind=driver-host\nprovides=usb:hid\nprovides=block:usb\ncritical=false\nelf=/drivers/driver-host-xhci.elf\nheartbeat=false\n".to_vec(),
+        },
+        BootFsFile {
             path: "/storage/boot-drivers.manifest",
             data: build_boot_driver_manifest(),
         },
@@ -1217,6 +1232,10 @@ fn build_bootfs_image(manifest_dir: &Path, inputs: BootfsInputs<'_>) -> PathBuf 
         BootFsFile {
             path: "/drivers/driver-host-nvme.elf",
             data: read_build_input(inputs.nvme_driver_host, "NVMe DriverHost ELF"),
+        },
+        BootFsFile {
+            path: "/drivers/driver-host-xhci.elf",
+            data: read_build_input(inputs.xhci_driver_host, "xHCI DriverHost ELF"),
         },
         BootFsFile {
             path: "/services/hxfs.elf",
@@ -1297,6 +1316,10 @@ fn build_bootfs_image(manifest_dir: &Path, inputs: BootfsInputs<'_>) -> PathBuf 
         BootFsFile {
             path: "/bin/pci.elf",
             data: read_build_input(&inputs.coreutils_dir.join("pci"), "pci ELF"),
+        },
+        BootFsFile {
+            path: "/bin/lsusb.elf",
+            data: read_build_input(&inputs.coreutils_dir.join("lsusb"), "lsusb ELF"),
         },
         BootFsFile {
             path: "/bin/acpi.elf",

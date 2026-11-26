@@ -10,7 +10,7 @@ use crate::registry::{ServiceRegistry, ServiceState};
 use crate::volume_service::VolumeManagerService;
 use huesos_abi::{
     acpi_archive, acpi_manager, hmcf, key_broker, pci as abi_pci, pci_config, pci_inventory,
-    pci_iommu, pci_lease, pci_manager, pci_mediation,
+    pci_iommu, pci_lease, pci_manager, pci_mediation, usb,
 };
 use libcanvas::{hbi_boot, println, storage_boot, Channel, ErrorCode, Handle, Process, Vmo};
 
@@ -120,6 +120,14 @@ pub struct DriverManager {
     wlan_generation: u64,
     wlan_failed: bool,
     wlan_ready: bool,
+    xhci_host: Option<ManagedHost>,
+    xhci_generation: u64,
+    xhci_failed: bool,
+    xhci_ready: bool,
+    usb_inventory_vmo: Option<Vmo>,
+    active_keyboard_tx: Option<Channel>,
+    ps2_kbd_rx: Option<Channel>,
+    usb_kbd_rx: Option<Channel>,
     net_wlan_bridged: bool,
     wlan_hxfs_attached: bool,
     pci_bindings_settled: bool,
@@ -258,6 +266,8 @@ pub struct DriverManager {
     nvme_lease_rw: Option<Handle>,
     net_lease_rw: Option<Handle>,
     wlan_lease_rw: Option<Handle>,
+    xhci_lease_ro: Option<Handle>,
+    xhci_lease_rw: Option<Handle>,
     nvme_boot_driver: Option<BootDriverSpec>,
     /// Resource handles received from init but not yet forwarded to
     /// their target drivers. Indexed implicitly by driver name via a
@@ -389,6 +399,14 @@ impl DriverManager {
             wlan_generation: 0,
             wlan_failed: false,
             wlan_ready: false,
+            xhci_host: None,
+            xhci_generation: 0,
+            xhci_failed: false,
+            xhci_ready: false,
+            usb_inventory_vmo: None,
+            active_keyboard_tx: None,
+            ps2_kbd_rx: None,
+            usb_kbd_rx: None,
             net_wlan_bridged: false,
             wlan_hxfs_attached: false,
             pci_bindings_settled: false,
@@ -460,6 +478,8 @@ impl DriverManager {
             nvme_lease_rw: None,
             net_lease_rw: None,
             wlan_lease_rw: None,
+            xhci_lease_ro: None,
+            xhci_lease_rw: None,
             nvme_boot_driver: None,
             pending_resources: [const { PendingResources::empty() }; 16],
             pending_resource_count: 0,
@@ -524,6 +544,7 @@ impl DriverManager {
         }
         self.try_start_net_service();
         self.try_start_wlan_service();
+        self.try_start_xhci_host();
     }
 
     fn record_resource_handle(&mut self, label: &[u8], handle: Handle) {
@@ -850,17 +871,23 @@ impl DriverManager {
             self.try_start_hxfs_service(nvme_online);
             self.try_start_net_service();
             self.try_start_wlan_service();
+            self.try_start_xhci_host();
             self.blobfs.poll(
                 &mut self.volume,
                 self.nvme_host.as_ref().map(|host| &host.bootstrap),
                 nvme_online,
             );
+            let usb_block_online = self.registry.state("block:usb") == Some(ServiceState::Online);
             self.devfs.poll(
                 &mut self.volume,
                 self.nvme_host.as_ref().map(|host| &host.bootstrap),
                 nvme_online,
+                self.xhci_host.as_ref().map(|host| &host.bootstrap),
+                usb_block_online,
             );
             self.poll_input_host();
+            self.poll_xhci_host();
+            self.poll_keyboard_mux();
             self.poll_nvme_host();
             self.poll_hxfs_service();
             self.poll_net_service();
@@ -900,6 +927,9 @@ impl DriverManager {
         push_ch(self.pci_manager.as_ref().map(|h| &h.bootstrap));
         push_ch(self.nvme_host.as_ref().map(|h| &h.bootstrap));
         push_ch(self.input_host.as_ref().map(|h| &h.bootstrap));
+        push_ch(self.xhci_host.as_ref().map(|h| &h.bootstrap));
+        push_ch(self.ps2_kbd_rx.as_ref());
+        push_ch(self.usb_kbd_rx.as_ref());
         push_ch(self.hxfs_service.as_ref().map(|h| &h.bootstrap));
         push_ch(self.net_service.as_ref().map(|h| &h.bootstrap));
         push_ch(self.wlan_service.as_ref().map(|h| &h.bootstrap));
@@ -965,9 +995,10 @@ impl DriverManager {
         }
     }
 
-    /// Return whether the keyboard service is online.
+    /// Return whether any keyboard service (PS/2 or USB HID) is online.
     pub fn keyboard_ready(&self) -> bool {
         self.registry.state("keyboard") == Some(ServiceState::Online)
+            || self.registry.state("usb:hid") == Some(ServiceState::Online)
     }
 
     fn try_start_hxfs_service(&mut self, nvme_online: bool) {
@@ -1168,6 +1199,73 @@ impl DriverManager {
         self.wlan_service = Some(ManagedHost { process, bootstrap });
         self.maybe_bridge_net_and_wlan();
         self.maybe_attach_wlan_hxfs();
+    }
+
+    fn try_start_xhci_host(&mut self) {
+        if self.xhci_host.is_some()
+            || self.xhci_failed
+            || !self.bootfs_loaded
+            || !self.pci_bindings_settled
+            || self.xhci_lease_ro.is_none()
+            || !self.driver_grants_ready(b"driver-host-xhci")
+        {
+            return;
+        }
+        let Some(bootfs) = self.fs.bootfs() else {
+            return;
+        };
+        let Ok(Some(entry)) = bootfs.get_entry("/drivers/driver-host-xhci.elf") else {
+            println!("[driver-manager] driver-host-xhci ELF missing from BOOTFS");
+            self.xhci_failed = true;
+            return;
+        };
+        let Some(bootfs_vmo) = self.fs.vmo() else {
+            return;
+        };
+        let Ok((process, bootstrap)) = libcanvas::process::spawn_elf_from_vmo_with_stack(
+            "driver-host-xhci",
+            bootfs_vmo,
+            entry.offset,
+            entry.len,
+            huesos_abi::USER_STACK_HXFS_SIZE,
+        ) else {
+            println!("[driver-manager] failed to launch driver-host-xhci");
+            self.xhci_failed = true;
+            return;
+        };
+        self.xhci_generation = self.xhci_generation.saturating_add(1);
+        if let Some(ro_lease) = self.xhci_lease_ro.take() {
+            let _ = bootstrap.write_handle(pci_manager::DEVICE_LEASE_XHCI_RO_LABEL, ro_lease);
+        }
+        self.forward_pending_resources("driver-host-xhci", &bootstrap, &process);
+        println!(
+            "[driver-manager] launched driver-host-xhci gen={}",
+            self.xhci_generation
+        );
+        self.xhci_host = Some(ManagedHost { process, bootstrap });
+        if self.active_keyboard_tx.is_some() {
+            self.attach_usb_keyboard_stream();
+        }
+    }
+
+    fn attach_usb_keyboard_stream(&mut self) {
+        let Some(xhci) = self.xhci_host.as_ref() else {
+            return;
+        };
+        let Ok((usb_rx, usb_tx)) = Channel::pair() else {
+            return;
+        };
+        if xhci
+            .bootstrap
+            .write_handle(
+                protocol::ATTACH_KEYBOARD_CLIENT.as_bytes(),
+                usb_tx.into_handle(),
+            )
+            .is_ok()
+        {
+            self.usb_kbd_rx = Some(usb_rx);
+            println!("[driver-manager] attached USB HID keyboard stream to mux");
+        }
     }
 
     fn maybe_bridge_net_and_wlan(&mut self) {
@@ -1724,6 +1822,7 @@ impl DriverManager {
             "driver-host-nvme" => self.nvme_lease_rw.as_ref(),
             "net-service" => self.net_lease_rw.as_ref(),
             "wlan-service" => self.wlan_lease_rw.as_ref(),
+            "driver-host-xhci" => self.xhci_lease_rw.as_ref(),
             _ => None,
         };
         let Some(lease_rw) = lease_slot else {
@@ -1753,6 +1852,7 @@ impl DriverManager {
             "driver-host-nvme" => self.nvme_lease_rw.take(),
             "net-service" => self.net_lease_rw.take(),
             "wlan-service" => self.wlan_lease_rw.take(),
+            "driver-host-xhci" => self.xhci_lease_rw.take(),
             _ => None,
         };
         let Some(lease_rw) = lease_opt else {
@@ -1917,6 +2017,7 @@ impl DriverManager {
                 Ok(n) if &buf[..n] == protocol::OPEN_KEYBOARD.as_bytes() => {
                     self.open_keyboard_service()
                 }
+                Ok(n) if &buf[..n] == protocol::OPEN_MOUSE.as_bytes() => self.open_mouse_service(),
                 Ok(n) if &buf[..n] == protocol::OPEN_FILESYSTEM.as_bytes() => {
                     self.open_filesystem_service()
                 }
@@ -1927,6 +2028,9 @@ impl DriverManager {
                 Ok(n) if &buf[..n] == protocol::OPEN_HXFS.as_bytes() => self.open_hxfs_service(),
                 Ok(n) if &buf[..n] == protocol::OPEN_BLOCK_NVME.as_bytes() => {
                     self.open_nvme_block_service()
+                }
+                Ok(n) if &buf[..n] == protocol::OPEN_BLOCK_USB.as_bytes() => {
+                    self.open_usb_block_service()
                 }
                 Ok(n) if &buf[..n] == protocol::OPEN_VOLUME_SYSTEM.as_bytes() => {
                     self.open_system_volume()
@@ -1951,6 +2055,16 @@ impl DriverManager {
                 Ok(n) if &buf[..n] == protocol::QUERY_PCI_VMO.as_bytes() => {
                     if let Some(reg) = self.registry_channel.as_ref() {
                         self.reply_query_pci_vmo_on(reg);
+                    }
+                }
+                Ok(n) if &buf[..n] == protocol::QUERY_USB.as_bytes() => {
+                    if let Some(reg) = self.registry_channel.as_ref() {
+                        self.reply_query_usb_on(reg);
+                    }
+                }
+                Ok(n) if &buf[..n] == protocol::QUERY_USB_VMO.as_bytes() => {
+                    if let Some(reg) = self.registry_channel.as_ref() {
+                        self.reply_query_usb_vmo_on(reg);
                     }
                 }
                 Ok(n) if &buf[..n] == protocol::QUERY_ACPI.as_bytes() => {
@@ -2618,6 +2732,24 @@ impl DriverManager {
                             self.reply_query_pci_vmo_on(ch);
                             served = true;
                         }
+                        Ok(n) if &buf[..n] == protocol::QUERY_USB.as_bytes() => {
+                            self.reply_query_usb_on(ch);
+                            served = true;
+                        }
+                        Ok(n) if &buf[..n] == protocol::QUERY_USB_VMO.as_bytes() => {
+                            self.reply_query_usb_vmo_on(ch);
+                            served = true;
+                        }
+                        Ok(n) if &buf[..n] == protocol::OPEN_BLOCK_USB.as_bytes() => {
+                            let usb_online =
+                                self.registry.state("block:usb") == Some(ServiceState::Online);
+                            Self::open_usb_block_service_on(
+                                self.xhci_host.as_ref(),
+                                usb_online,
+                                ch,
+                            );
+                            served = true;
+                        }
                         Ok(n) if &buf[..n] == protocol::QUERY_ACPI.as_bytes() => {
                             self.reply_query_acpi_on(ch);
                             served = true;
@@ -2705,6 +2837,65 @@ impl DriverManager {
             }
         }
         let _ = registry.write(protocol::PCI_INVENTORY_UNAVAILABLE.as_bytes());
+    }
+
+    fn reply_query_usb_vmo_on(&self, registry: &Channel) {
+        if let Some(usb_vmo) = self.usb_inventory_vmo.as_ref() {
+            if let Ok(dup) =
+                usb_vmo.duplicate(huesos_abi::rights::READ | huesos_abi::rights::TRANSFER)
+            {
+                let _ = registry.write_handle(
+                    protocol::USB_INVENTORY_VMO_REPLY.as_bytes(),
+                    dup.into_handle(),
+                );
+                return;
+            }
+        }
+        let _ = registry.write(protocol::USB_INVENTORY_UNAVAILABLE.as_bytes());
+    }
+
+    fn reply_query_usb_on(&self, registry: &Channel) {
+        use core::fmt::Write;
+        let mut out = QueryBuf::<3840>::new();
+        let _ = writeln!(
+            out,
+            "slot\tport\tparent\tspeed\tvid_pid\tclass\tdriver\tblocks\tiommu"
+        );
+        if let Some(usb_vmo) = self.usb_inventory_vmo.as_ref() {
+            let mut raw = [0u8; usb::MAX_BYTES];
+            if let Ok(n) = usb_vmo.read(0, &mut raw) {
+                if let Ok(hdr) = usb::validate_and_decode_header(&raw[..n]) {
+                    let iommu = if (hdr.flags & usb::USB_FLAG_IOMMU_ISOLATED) != 0 {
+                        "isolated"
+                    } else {
+                        "trusted"
+                    };
+                    for idx in 0..usize::from(hdr.device_count) {
+                        let Ok(rec) = usb::decode_device(&raw[..n], idx) else {
+                            continue;
+                        };
+                        let _ = writeln!(
+                            out,
+                            "{}\t{}\t{}:{}\t{}\t{:04x}:{:04x}\t{:02x}:{:02x}:{:02x}\t{}\t{}\t{}",
+                            rec.slot_id,
+                            rec.root_port,
+                            rec.parent_slot_id,
+                            rec.parent_port,
+                            rec.speed.rate_label(),
+                            rec.vendor_id,
+                            rec.product_id,
+                            rec.interface_class,
+                            rec.interface_subclass,
+                            rec.interface_protocol,
+                            rec.role.label(),
+                            rec.bot_total_blocks,
+                            iommu
+                        );
+                    }
+                }
+            }
+        }
+        let _ = registry.write(out.as_bytes());
     }
 
     fn reply_query_pci_on(&self, registry: &Channel) {
@@ -2980,6 +3171,21 @@ impl DriverManager {
                 self.wlan_generation
             );
         }
+        if let Some(h) = self.xhci_host.as_ref() {
+            let _ = writeln!(
+                out,
+                "{:#x}\tdriver-host-xhci\t{}\t{}\t0",
+                h.process.koid().unwrap_or(0),
+                if self.xhci_ready {
+                    "online"
+                } else if self.xhci_failed {
+                    "failed"
+                } else {
+                    "starting"
+                },
+                self.xhci_generation
+            );
+        }
         let _ = registry.write(out.as_bytes());
     }
 
@@ -2988,40 +3194,252 @@ impl DriverManager {
             println!("[driver-manager] keyboard service requested before ready");
             return;
         }
-        let Some(input_host) = self.input_host.as_ref() else {
+        if self.input_host.is_none() && self.xhci_host.is_none() {
+            return;
+        }
+        if self.registry_channel.is_none() {
+            return;
+        }
+        let Ok((client_end, app_tx)) = Channel::pair() else {
             return;
         };
+        let mut any_attached = false;
+        if let Some(input_host) = self.input_host.as_ref() {
+            if let Ok((ps2_rx, ps2_tx)) = Channel::pair() {
+                if input_host
+                    .bootstrap
+                    .write_handle(
+                        protocol::ATTACH_KEYBOARD_CLIENT.as_bytes(),
+                        ps2_tx.into_handle(),
+                    )
+                    .is_ok()
+                {
+                    self.ps2_kbd_rx = Some(ps2_rx);
+                    any_attached = true;
+                }
+            }
+        }
+        if self.xhci_host.is_some() {
+            self.attach_usb_keyboard_stream();
+            if self.usb_kbd_rx.is_some() {
+                any_attached = true;
+            }
+        }
+        if !any_attached {
+            println!("[driver-manager] failed to attach any keyboard source");
+            return;
+        }
         let Some(registry) = self.registry_channel.as_ref() else {
+            return;
+        };
+        if let Err((e, _handle)) = registry.write_handle(
+            protocol::KEYBOARD_CHANNEL.as_bytes(),
+            client_end.into_handle(),
+        ) {
+            println!(
+                "[driver-manager] failed to return keyboard channel: {}",
+                e.as_str()
+            );
+            return;
+        }
+        self.active_keyboard_tx = Some(app_tx);
+        println!("[driver-manager] opened multiplexed PS/2 + USB HID keyboard channel");
+    }
+
+    fn poll_keyboard_mux(&mut self) {
+        let mut buf = [0u8; 32];
+        let mut budget = POLL_BUDGET_PER_TICK;
+        loop {
+            budget = match budget.checked_sub(1) {
+                Some(rem) => rem,
+                None => break,
+            };
+            let Some(rx) = self.ps2_kbd_rx.as_ref() else {
+                break;
+            };
+            match rx.read_into(&mut buf) {
+                Ok(n) if n >= 3 && buf[0] == b'k' => self.forward_kbd_packet(&buf[..3]),
+                Ok(_) => {}
+                Err(ErrorCode::ShouldWait) => break,
+                Err(_) => {
+                    self.ps2_kbd_rx = None;
+                    break;
+                }
+            }
+        }
+        let mut usb_budget = POLL_BUDGET_PER_TICK;
+        loop {
+            usb_budget = match usb_budget.checked_sub(1) {
+                Some(rem) => rem,
+                None => break,
+            };
+            let Some(rx) = self.usb_kbd_rx.as_ref() else {
+                break;
+            };
+            match rx.read_into(&mut buf) {
+                Ok(n) if n >= 3 && buf[0] == b'k' => self.forward_kbd_packet(&buf[..3]),
+                Ok(_) => {}
+                Err(ErrorCode::ShouldWait) => break,
+                Err(_) => {
+                    self.usb_kbd_rx = None;
+                    break;
+                }
+            }
+        }
+    }
+
+    fn forward_kbd_packet(&mut self, pkt: &[u8]) {
+        if let Some(tx) = self.active_keyboard_tx.as_ref() {
+            if tx.write(pkt) == Err(ErrorCode::PeerClosed) {
+                self.active_keyboard_tx = None;
+            }
+        }
+    }
+
+    fn open_mouse_service(&mut self) {
+        let Some(registry) = self.registry_channel.as_ref() else {
+            return;
+        };
+        let Some(xhci) = self.xhci_host.as_ref() else {
+            let _ = registry.write(protocol::MOUSE_UNAVAILABLE.as_bytes());
             return;
         };
         match Channel::pair() {
             Ok((client_end, driver_end)) => {
-                if let Err((e, _handle)) = input_host.bootstrap.write_handle(
-                    protocol::ATTACH_KEYBOARD_CLIENT.as_bytes(),
-                    driver_end.into_handle(),
-                ) {
-                    println!(
-                        "[driver-manager] failed to attach keyboard client: {}",
-                        e.as_str()
-                    );
+                if xhci
+                    .bootstrap
+                    .write_handle(
+                        protocol::ATTACH_MOUSE_CLIENT.as_bytes(),
+                        driver_end.into_handle(),
+                    )
+                    .is_err()
+                {
+                    let _ = registry.write(protocol::MOUSE_UNAVAILABLE.as_bytes());
                     return;
                 }
-                if let Err((e, _handle)) = registry.write_handle(
-                    protocol::KEYBOARD_CHANNEL.as_bytes(),
-                    client_end.into_handle(),
-                ) {
-                    println!(
-                        "[driver-manager] failed to return keyboard channel: {}",
-                        e.as_str()
-                    );
-                    return;
-                }
-                println!("[driver-manager] opened keyboard service channel for client");
+                let _ = registry
+                    .write_handle(protocol::MOUSE_CHANNEL.as_bytes(), client_end.into_handle());
             }
-            Err(e) => println!(
-                "[driver-manager] failed to create keyboard service channel: {}",
-                e.as_str()
-            ),
+            Err(_) => {
+                let _ = registry.write(protocol::MOUSE_UNAVAILABLE.as_bytes());
+            }
+        }
+    }
+
+    fn open_usb_block_service_on(
+        xhci_host: Option<&ManagedHost>,
+        usb_online: bool,
+        reply_ch: &Channel,
+    ) {
+        if !usb_online {
+            let _ = reply_ch.write(protocol::BLOCK_USB_UNAVAILABLE.as_bytes());
+            return;
+        }
+        let Some(xhci) = xhci_host else {
+            let _ = reply_ch.write(protocol::BLOCK_USB_UNAVAILABLE.as_bytes());
+            return;
+        };
+        match Channel::pair() {
+            Ok((client_end, driver_end)) => {
+                if xhci
+                    .bootstrap
+                    .write_handle(
+                        protocol::ATTACH_BLOCK_USB_CLIENT.as_bytes(),
+                        driver_end.into_handle(),
+                    )
+                    .is_err()
+                {
+                    let _ = reply_ch.write(protocol::BLOCK_USB_UNAVAILABLE.as_bytes());
+                    return;
+                }
+                let _ = reply_ch.write_handle(
+                    protocol::BLOCK_USB_CHANNEL.as_bytes(),
+                    client_end.into_handle(),
+                );
+            }
+            Err(_) => {
+                let _ = reply_ch.write(protocol::BLOCK_USB_UNAVAILABLE.as_bytes());
+            }
+        }
+    }
+
+    fn open_usb_block_service(&mut self) {
+        let Some(registry) = self.registry_channel.as_ref() else {
+            return;
+        };
+        let usb_online = self.registry.state("block:usb") == Some(ServiceState::Online);
+        Self::open_usb_block_service_on(self.xhci_host.as_ref(), usb_online, registry);
+    }
+
+    fn poll_xhci_host(&mut self) {
+        let mut buf = [0u8; 96];
+        let Some(host) = self.xhci_host.take() else {
+            return;
+        };
+        let _keep_process_alive = &host.process;
+        let mut budget = POLL_BUDGET_PER_TICK;
+        loop {
+            budget = match budget.checked_sub(1) {
+                Some(remaining) => remaining,
+                None => {
+                    self.xhci_host = Some(host);
+                    return;
+                }
+            };
+            match host.bootstrap.read_optional_handle(&mut buf) {
+                Ok((n, Some(handle)))
+                    if &buf[..n] == protocol::USB_INVENTORY_VMO_UPDATE.as_bytes() =>
+                {
+                    let vmo = Vmo::from_handle(handle);
+                    let mut check = [0u8; usb::MAX_BYTES];
+                    if let Ok(len) = vmo.read(0, &mut check) {
+                        if usb::validate_and_decode_header(&check[..len]).is_ok() {
+                            self.usb_inventory_vmo = Some(vmo);
+                        }
+                    }
+                }
+                Ok((_n, Some(handle))) => drop(handle),
+                Ok((n, None)) => {
+                    let msg = &buf[..n];
+                    if msg == protocol::XHCI_HOST_READY.as_bytes() {
+                        self.xhci_ready = true;
+                        println!("[driver-manager] xHCI DriverHost ready");
+                    } else if msg == protocol::USB_HID_READY.as_bytes() {
+                        self.registry.mark_online("usb:hid");
+                        println!("[driver-manager] USB HID input service online");
+                    } else if msg == protocol::BLOCK_USB_READY.as_bytes() {
+                        self.registry.mark_online("block:usb");
+                        println!("[driver-manager] USB BOT BlockDevice service online");
+                    } else if msg == protocol::USB_BRINGUP_FAILED.as_bytes()
+                        || msg == protocol::USB_MISSING_RESOURCES.as_bytes()
+                        || msg == protocol::USB_DEVICE_GONE.as_bytes()
+                    {
+                        self.xhci_failed = true;
+                        self.xhci_ready = false;
+                        self.registry.mark_failed("usb:hid");
+                        self.registry.mark_failed("block:usb");
+                        self.revoke_driver_lease("driver-host-xhci");
+                        println!("[driver-manager] xHCI DriverHost halted/offline");
+                        return;
+                    }
+                }
+                Err(ErrorCode::ShouldWait) | Err(ErrorCode::TimedOut) => {
+                    self.xhci_host = Some(host);
+                    return;
+                }
+                Err(error) => {
+                    println!(
+                        "[driver-manager] xHCI host channel read failed: {}",
+                        error.as_str()
+                    );
+                    self.xhci_failed = true;
+                    self.xhci_ready = false;
+                    self.registry.mark_failed("usb:hid");
+                    self.registry.mark_failed("block:usb");
+                    self.revoke_driver_lease("driver-host-xhci");
+                    return;
+                }
+            }
         }
     }
 
@@ -3271,6 +3689,18 @@ impl DriverManager {
                     } else if label == pci_manager::DEVICE_LEASE_WLAN_RW_LABEL {
                         if libcanvas::device_lease::query(&handle).is_ok() {
                             self.wlan_lease_rw = Some(handle);
+                        } else {
+                            drop(handle);
+                        }
+                    } else if label == pci_manager::DEVICE_LEASE_XHCI_RO_LABEL {
+                        if libcanvas::device_lease::query(&handle).is_ok() {
+                            self.xhci_lease_ro = Some(handle);
+                        } else {
+                            drop(handle);
+                        }
+                    } else if label == pci_manager::DEVICE_LEASE_XHCI_RW_LABEL {
+                        if libcanvas::device_lease::query(&handle).is_ok() {
+                            self.xhci_lease_rw = Some(handle);
                         } else {
                             drop(handle);
                         }

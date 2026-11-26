@@ -296,6 +296,18 @@ pub const BLOCK_NVME_SERVICE: ServiceManifest = ServiceManifest {
     required: true,
 };
 
+/// USB HID input service manifest.
+pub const USB_HID_SERVICE: ServiceManifest = ServiceManifest {
+    name: "usb:hid",
+    required: false,
+};
+
+/// USB BOT block storage service manifest.
+pub const BLOCK_USB_SERVICE: ServiceManifest = ServiceManifest {
+    name: "block:usb",
+    required: false,
+};
+
 /// Input DriverHost manifest.
 ///
 /// 8042 port ownership split (kept in sync with the BOOTFS-embedded
@@ -336,5 +348,15 @@ pub const NVME_HOST: DriverHostManifest = DriverHostManifest {
     critical: false,
 };
 
+/// xHCI USB 3.x DriverHost manifest shell.
+pub const XHCI_HOST: DriverHostManifest = DriverHostManifest {
+    name: "driver-host-xhci",
+    services: &[USB_HID_SERVICE, BLOCK_USB_SERVICE],
+    irqs: &[],
+    io_ports: &[],
+    resources: &[],
+    critical: false,
+};
+
 /// Static DriverHost manifest table.
-pub const DRIVER_HOSTS: &[DriverHostManifest] = &[INPUT_HOST, NVME_HOST];
+pub const DRIVER_HOSTS: &[DriverHostManifest] = &[INPUT_HOST, NVME_HOST, XHCI_HOST];

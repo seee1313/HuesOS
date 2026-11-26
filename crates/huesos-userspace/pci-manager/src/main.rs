@@ -2236,6 +2236,26 @@ fn run_driver_binding_and_handoff(
             max_vectors: 1,
             allow_polling_fallback: true,
         },
+        DriverManifestSpec {
+            driver_name: "driver-host-xhci",
+            match_rule: DeviceMatchRule {
+                vendor_id: None,
+                device_id: None,
+                subsystem_vendor_id: None,
+                subsystem_id: None,
+                revision_id: None,
+                class: Some(ClassMatch {
+                    base: 0x0C,
+                    sub: 0x03,
+                    prog_if: Some(0x30),
+                }),
+                required_capability_id: None,
+            },
+            relocation: RelocationClass::Fixed,
+            irq_preference: IrqPreference::MsixThenMsiThenIntx,
+            max_vectors: 1,
+            allow_polling_fallback: true,
+        },
     ];
 
     let mut transport = ReadWriteTransport {
@@ -2246,6 +2266,7 @@ fn run_driver_binding_and_handoff(
         legacy_ioport: authority.legacy_ioport.as_ref(),
     };
     let mut bound_count = 0u32;
+    let mut xhci_handed_off = false;
     let mut meta_updates: Vec<(
         PciAddress,
         pci_inventory::InventoryIrqMode,
@@ -2419,8 +2440,16 @@ fn run_driver_binding_and_handoff(
                 let irq_ctx = InterruptAllocatorContext {
                     destination_apic_id: 0,
                     interrupt_remapping_active: false,
-                    available_vectors: 16,
-                    next_base_vector: 0xD0,
+                    available_vectors: if manifest.driver_name == "driver-host-xhci" {
+                        8
+                    } else {
+                        16
+                    },
+                    next_base_vector: if manifest.driver_name == "driver-host-xhci" {
+                        0xE0
+                    } else {
+                        0xD0
+                    },
                 };
                 let Ok(irq_plan) = driver_binding::plan_interrupt_transaction(
                     lease.address,
@@ -3043,6 +3072,322 @@ fn run_driver_binding_and_handoff(
                             );
                         }
                     }
+                    continue;
+                }
+
+                if manifest.driver_name == "driver-host-xhci" {
+                    if xhci_handed_off {
+                        continue;
+                    }
+                    let bar0 = plan
+                        .find(lease.address, ResourceRegister::Bar(0))
+                        .filter(|r| r.class != ResourceClass::Io && r.len >= 0x1000);
+                    let Some(bar0) = bar0 else {
+                        println!(
+                            "[pci-manager] obs xhci bdf={:02x}:{:02x}.{} status=missing-bar0",
+                            lease.address.bus(),
+                            lease.address.device(),
+                            lease.address.function()
+                        );
+                        continue;
+                    };
+                    let bar0_base = bar0.cpu_base;
+                    let bar0_len = bar0.len;
+                    let Ok(mmio_handle) = libcanvas::device_lease::mint_resource(
+                        &lease.handle,
+                        ResourceKindAbi::Mmio,
+                        lease.generation,
+                        bar0_base,
+                        bar0_len,
+                        true,
+                    ) else {
+                        println!(
+                            "[pci-manager] obs xhci bdf={:02x}:{:02x}.{} status=mmio-mint-failed",
+                            lease.address.bus(),
+                            lease.address.device(),
+                            lease.address.function()
+                        );
+                        continue;
+                    };
+
+                    let max_config_bytes = if cfg!(feature = "force-legacy") {
+                        CONVENTIONAL_CONFIG_BYTES
+                    } else {
+                        ENHANCED_CONFIG_BYTES
+                    };
+                    enable_ancestor_bridges(
+                        &inv.snapshot,
+                        lease.address,
+                        &mut transport,
+                        max_config_bytes,
+                    );
+                    let mut xhci_programmed = true;
+                    let (irq_base, irq_len, irq_excl, mode_str, inv_irq_mode) = match irq_plan.mode
+                    {
+                        InterruptMode::Msix {
+                            vector_count,
+                            base_vector,
+                            table_bir: 0,
+                            table_offset,
+                        } => {
+                            let cmd_req = WriteRequest {
+                                address: lease.address,
+                                header_kind: HeaderKind::Type0Endpoint,
+                                class: WriteClass::CommandControl,
+                                offset: OFFSET_COMMAND,
+                                width: ConfigWidth::Word,
+                                max_config_bytes,
+                                value: u32::from(current_command) | 0x0406,
+                                write_mask: 0x0406,
+                                expected_readback_mask: 0x0406,
+                                allowlist_entry: None,
+                            };
+                            let _ = write_policy::execute_checked_write(&mut transport, &cmd_req);
+                            if let Some(msix) = msix_info {
+                                let cap_off = u16::from(msix.cap_offset) + 2;
+                                let mask_req = WriteRequest {
+                                    address: lease.address,
+                                    header_kind: HeaderKind::Type0Endpoint,
+                                    class: WriteClass::CapabilityControl,
+                                    offset: cap_off,
+                                    width: ConfigWidth::Word,
+                                    max_config_bytes,
+                                    value: 0xC000,
+                                    write_mask: 0xC000,
+                                    expected_readback_mask: 0xC000,
+                                    allowlist_entry: None,
+                                };
+                                let _ =
+                                    write_policy::execute_checked_write(&mut transport, &mask_req);
+
+                                let page_off = u64::from(table_offset) & !0xFFF;
+                                let in_page = u64::from(table_offset) - page_off;
+                                let table_end =
+                                    u64::from(table_offset) + u64::from(vector_count) * 16;
+                                let map_len = ((table_end - page_off) + 0xFFF) & !0xFFF;
+                                if libcanvas::resource::map_self(
+                                    &mmio_handle,
+                                    page_off,
+                                    MSIX_TEMP_VA_BASE,
+                                    map_len,
+                                    vmar_flags::READ
+                                        | vmar_flags::WRITE
+                                        | vmar_flags::USER
+                                        | vmar_flags::SPECIFIC,
+                                )
+                                .is_ok()
+                                {
+                                    for idx in 0..u64::from(vector_count) {
+                                        let entry = MSIX_TEMP_VA_BASE + in_page + idx * 16;
+                                        libcanvas::channel::mmio_store::<u32>(entry + 12, 1);
+                                        libcanvas::channel::mmio_store::<u32>(entry, 0xFEE0_0000);
+                                        libcanvas::channel::mmio_store::<u32>(entry + 4, 0);
+                                        libcanvas::channel::mmio_store::<u32>(
+                                            entry + 8,
+                                            base_vector + idx as u32,
+                                        );
+                                        libcanvas::channel::mmio_store::<u32>(entry + 12, 0);
+                                    }
+                                    let _ = libcanvas::resource::unmap_self(
+                                        &mmio_handle,
+                                        MSIX_TEMP_VA_BASE,
+                                        map_len,
+                                    );
+                                    let unmask_req = WriteRequest {
+                                        value: 0x8000,
+                                        ..mask_req
+                                    };
+                                    let _ = write_policy::execute_checked_write(
+                                        &mut transport,
+                                        &unmask_req,
+                                    );
+                                } else {
+                                    xhci_programmed = false;
+                                }
+                            }
+                            (
+                                u64::from(base_vector),
+                                u64::from(vector_count),
+                                true,
+                                "msix",
+                                pci_inventory::InventoryIrqMode::Msix,
+                            )
+                        }
+                        InterruptMode::Msi {
+                            vector_count,
+                            base_vector,
+                            ..
+                        } => {
+                            for req in &irq_plan.writes {
+                                let mut w = *req;
+                                w.max_config_bytes = max_config_bytes;
+                                if write_policy::execute_checked_write(&mut transport, &w).is_err()
+                                {
+                                    xhci_programmed = false;
+                                }
+                            }
+                            let cmd_req = WriteRequest {
+                                address: lease.address,
+                                header_kind: HeaderKind::Type0Endpoint,
+                                class: WriteClass::CommandControl,
+                                offset: OFFSET_COMMAND,
+                                width: ConfigWidth::Word,
+                                max_config_bytes,
+                                value: u32::from(current_command) | 0x0406,
+                                write_mask: 0x0406,
+                                expected_readback_mask: 0x0406,
+                                allowlist_entry: None,
+                            };
+                            let _ = write_policy::execute_checked_write(&mut transport, &cmd_req);
+                            (
+                                u64::from(base_vector),
+                                u64::from(vector_count),
+                                true,
+                                "msi",
+                                pci_inventory::InventoryIrqMode::Msi,
+                            )
+                        }
+                        InterruptMode::Intx { gsi, .. } => {
+                            let cmd_req = WriteRequest {
+                                address: lease.address,
+                                header_kind: HeaderKind::Type0Endpoint,
+                                class: WriteClass::CommandControl,
+                                offset: OFFSET_COMMAND,
+                                width: ConfigWidth::Word,
+                                max_config_bytes,
+                                value: (u32::from(current_command) | 0x0006) & !0x0400,
+                                write_mask: 0x0406,
+                                expected_readback_mask: 0x0406,
+                                allowlist_entry: None,
+                            };
+                            let _ = write_policy::execute_checked_write(&mut transport, &cmd_req);
+                            (
+                                u64::from(gsi),
+                                1,
+                                false,
+                                "intx",
+                                pci_inventory::InventoryIrqMode::Intx,
+                            )
+                        }
+                        InterruptMode::Polling | InterruptMode::Msix { .. } => {
+                            let cmd_req = WriteRequest {
+                                address: lease.address,
+                                header_kind: HeaderKind::Type0Endpoint,
+                                class: WriteClass::CommandControl,
+                                offset: OFFSET_COMMAND,
+                                width: ConfigWidth::Word,
+                                max_config_bytes,
+                                value: u32::from(current_command) | 0x0406,
+                                write_mask: 0x0406,
+                                expected_readback_mask: 0x0406,
+                                allowlist_entry: None,
+                            };
+                            let _ = write_policy::execute_checked_write(&mut transport, &cmd_req);
+                            (
+                                0xFE,
+                                1,
+                                false,
+                                "polling",
+                                pci_inventory::InventoryIrqMode::Polling,
+                            )
+                        }
+                    };
+
+                    let Ok(irq_handle) = libcanvas::device_lease::mint_resource(
+                        &lease.handle,
+                        ResourceKindAbi::Irq,
+                        lease.generation,
+                        irq_base,
+                        irq_len,
+                        irq_excl,
+                    ) else {
+                        println!(
+                            "[pci-manager] obs xhci bdf={:02x}:{:02x}.{} status=irq-mint-failed",
+                            lease.address.bus(),
+                            lease.address.device(),
+                            lease.address.function()
+                        );
+                        continue;
+                    };
+
+                    let mut ro_lease_mint_denied = false;
+                    if let Ok(ro_lease) = lease.handle.duplicate(rights::READ | rights::TRANSFER) {
+                        ro_lease_mint_denied = matches!(
+                            libcanvas::device_lease::mint_resource(
+                                &ro_lease,
+                                ResourceKindAbi::Mmio,
+                                lease.generation,
+                                0xFEE0_0000,
+                                0x1000,
+                                true,
+                            ),
+                            Err(ErrorCode::AccessDenied)
+                        );
+                        let _ = bootstrap
+                            .write_handle(pci_manager::DEVICE_LEASE_XHCI_RO_LABEL, ro_lease);
+                    }
+                    if let Ok(rw_lease) = lease
+                        .handle
+                        .duplicate(rights::READ | rights::WRITE | rights::TRANSFER)
+                    {
+                        let _ = bootstrap
+                            .write_handle(pci_manager::DEVICE_LEASE_XHCI_RW_LABEL, rw_lease);
+                    }
+                    let mut mmio_label = StackLabel::new();
+                    let _ = write!(
+                        mmio_label,
+                        "resource:driver-host-xhci:mmio:{:#x}:{:#x}:excl",
+                        bar0_base, bar0_len
+                    );
+                    let mut irq_label = StackLabel::new();
+                    let _ = write!(
+                        irq_label,
+                        "resource:driver-host-xhci:irq:{:#x}:{:#x}:{}",
+                        irq_base,
+                        irq_len,
+                        if irq_excl { "excl" } else { "shared" }
+                    );
+                    let _ = bootstrap.write_handle(mmio_label.as_bytes(), mmio_handle);
+                    let _ = bootstrap.write_handle(irq_label.as_bytes(), irq_handle);
+
+                    meta_updates.push((
+                        lease.address,
+                        inv_irq_mode,
+                        irq_base as u16,
+                        pci_inventory::InventoryRelocationClass::Fixed,
+                    ));
+                    bound_count += 1;
+                    xhci_handed_off = true;
+
+                    println!(
+                        "[pci-manager] obs i1-irq bdf={:02x}:{:02x}.{} mode={} irq={} writes={} valid_b4={} minted=2 ro_lease_mint_denied={}",
+                        lease.address.bus(),
+                        lease.address.device(),
+                        lease.address.function(),
+                        mode_str,
+                        irq_base,
+                        irq_plan.writes.len(),
+                        all_writes_valid && xhci_programmed,
+                        ro_lease_mint_denied
+                    );
+                    println!(
+                        "[pci-manager] obs i2-dma bdf={:02x}:{:02x}.{} isolation={}",
+                        lease.address.bus(),
+                        lease.address.device(),
+                        lease.address.function(),
+                        isolation_str
+                    );
+                    println!(
+                        "[pci-manager] obs xhci bdf={:02x}:{:02x}.{} bar0=0x{:x}+0x{:x} irq=0x{:x}+{} mode={} status=handed-off",
+                        lease.address.bus(),
+                        lease.address.device(),
+                        lease.address.function(),
+                        bar0_base,
+                        bar0_len,
+                        irq_base,
+                        irq_len,
+                        mode_str
+                    );
                     continue;
                 }
 

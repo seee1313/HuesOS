@@ -10,7 +10,7 @@ use crate::volume_service::VolumeManagerService;
 use libcanvas::{println, Channel, ErrorCode};
 
 const MAX_DEVFS_CLIENTS: usize = 4;
-const LISTING: &[u8] = b"/dev\n/dev/nvme0\n/dev/nvme0/ns1\n/dev/block\n/dev/block/system\n/dev/input\n/dev/input/keyboard0\n/dev/fb0\n/dev/drivers\n/dev/drivers/nvme-host\n";
+const LISTING: &[u8] = b"/dev\n/dev/nvme0\n/dev/nvme0/ns1\n/dev/block\n/dev/block/system\n/dev/block/usb0\n/dev/input\n/dev/input/keyboard0\n/dev/input/mouse0\n/dev/fb0\n/dev/drivers\n/dev/drivers/nvme-host\n/dev/drivers/xhci-host\n";
 
 /// DriverManager-owned DevFS service.
 pub struct DevFsService {
@@ -73,20 +73,32 @@ impl DevFsService {
         volume: &mut VolumeManagerService,
         nvme_bootstrap: Option<&Channel>,
         nvme_online: bool,
+        xhci_bootstrap: Option<&Channel>,
+        usb_block_online: bool,
     ) {
         let mut index = 0usize;
         while index < self.clients.len() {
-            self.poll_client(index, volume, nvme_bootstrap, nvme_online);
+            self.poll_client(
+                index,
+                volume,
+                nvme_bootstrap,
+                nvme_online,
+                xhci_bootstrap,
+                usb_block_online,
+            );
             index += 1;
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn poll_client(
         &mut self,
         index: usize,
         volume: &mut VolumeManagerService,
         nvme_bootstrap: Option<&Channel>,
         nvme_online: bool,
+        xhci_bootstrap: Option<&Channel>,
+        usb_block_online: bool,
     ) {
         let mut request = [0u8; 128];
         loop {
@@ -94,9 +106,15 @@ impl DevFsService {
                 return;
             };
             match client.read_into(&mut request) {
-                Ok(n) => {
-                    self.handle_request(index, volume, nvme_bootstrap, nvme_online, &request[..n])
-                }
+                Ok(n) => self.handle_request(
+                    index,
+                    volume,
+                    nvme_bootstrap,
+                    nvme_online,
+                    xhci_bootstrap,
+                    usb_block_online,
+                    &request[..n],
+                ),
                 Err(ErrorCode::ShouldWait) | Err(ErrorCode::TimedOut) => return,
                 Err(ErrorCode::PeerClosed) => {
                     self.clients[index] = None;
@@ -110,12 +128,15 @@ impl DevFsService {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn handle_request(
         &mut self,
         index: usize,
         volume: &mut VolumeManagerService,
         nvme_bootstrap: Option<&Channel>,
         nvme_online: bool,
+        xhci_bootstrap: Option<&Channel>,
+        usb_block_online: bool,
         request: &[u8],
     ) {
         if request == b"LIST /dev" || request == b"LIST /" {
@@ -136,9 +157,46 @@ impl DevFsService {
             volume.open_fs_candidate_for_devfs(client, nvme_bootstrap, nvme_online);
             return;
         }
+        if request == b"OPEN /dev/block/usb0" {
+            let Some(client) = self.clients[index].as_ref() else {
+                return;
+            };
+            if !usb_block_online {
+                let _ = client.write(protocol::BLOCK_USB_UNAVAILABLE.as_bytes());
+                return;
+            }
+            let Some(xhci) = xhci_bootstrap else {
+                let _ = client.write(protocol::BLOCK_USB_UNAVAILABLE.as_bytes());
+                return;
+            };
+            match Channel::pair() {
+                Ok((client_end, driver_end)) => {
+                    if xhci
+                        .write_handle(
+                            protocol::ATTACH_BLOCK_USB_CLIENT.as_bytes(),
+                            driver_end.into_handle(),
+                        )
+                        .is_err()
+                    {
+                        let _ = client.write(protocol::BLOCK_USB_UNAVAILABLE.as_bytes());
+                        return;
+                    }
+                    let _ = client.write_handle(
+                        protocol::BLOCK_USB_CHANNEL.as_bytes(),
+                        client_end.into_handle(),
+                    );
+                }
+                Err(_) => {
+                    let _ = client.write(protocol::BLOCK_USB_UNAVAILABLE.as_bytes());
+                }
+            }
+            return;
+        }
         if request == b"OPEN /dev/input/keyboard0"
+            || request == b"OPEN /dev/input/mouse0"
             || request == b"OPEN /dev/fb0"
             || request == b"OPEN /dev/drivers/nvme-host"
+            || request == b"OPEN /dev/drivers/xhci-host"
         {
             self.write(index, b"err:devfs-not-supported\n");
             return;

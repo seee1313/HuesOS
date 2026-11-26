@@ -14,9 +14,10 @@ const MEMMAP_ACPI_RECLAIMABLE: u64 = 2;
 const MEMMAP_ACPI_NVS: u64 = 3;
 /// Some Limine builds also expose this as type 8 (ACPI tables / mapped reserved).
 const MEMMAP_ACPI_TABLES_OR_MAPPED_RESERVED: u64 = 8;
-/// Stage-A storage + network/WLAN target: 72 MiB physically contiguous `< 4 GiB`
-/// DMA pool (`[0..64 MiB)` NVMe, `[64..68 MiB)` virtio-net, `[68..72 MiB)` rtw88).
-const BOOT_DMA_POOL_LEN: u64 = 72 * 1024 * 1024;
+/// Stage-A storage + network/WLAN/USB target: 76 MiB physically contiguous `< 4 GiB`
+/// DMA pool (`[0..64 MiB)` NVMe, `[64..68 MiB)` virtio-net, `[68..72 MiB)` rtw88,
+/// `[72..76 MiB)` xHCI USB 3.x).
+const BOOT_DMA_POOL_LEN: u64 = 76 * 1024 * 1024;
 /// Prefer a 2 MiB-aligned base so later huge-page/IOMMU mappings can reuse the
 /// same aperture without moving the pool.
 const BOOT_DMA_POOL_ALIGN: u64 = 2 * 1024 * 1024;

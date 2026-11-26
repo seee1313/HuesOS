@@ -1,0 +1,13 @@
+[package]
+name = "huesos-usb"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Allocation-free USB 3.x / xHCI 1.x codecs, ring state machines, async completion table, Hub, HID, and BOT Mass Storage policy"
+
+[dependencies]
+huesos-abi = { path = "../huesos-abi" }
+
+[dev-dependencies]
+hues-async = { path = "../hues-async" }

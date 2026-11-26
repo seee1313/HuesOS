@@ -280,8 +280,11 @@ impl TerminalSession {
             match self.keyboard.read_into(&mut buf) {
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
+                    if n < 3 || buf[0] != b'k' {
+                        continue;
+                    }
                     // Ignore key-release packets (`['k', 0, _]`)
-                    if n >= 3 && buf[0] == b'k' && buf[1] == 0 {
+                    if buf[1] == 0 {
                         continue;
                     }
                     // Reset cursor solid on any key press.

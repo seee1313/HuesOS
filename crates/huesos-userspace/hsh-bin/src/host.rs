@@ -262,7 +262,7 @@ fn command_uses_query_channel(resolved: &str) -> bool {
     let stem = strip_exec_ext(base);
     matches!(
         stem,
-        "pci" | "acpi" | "ps" | "btop" | "netctl" | "wlanctl" | "std_smoke" | "std-smoke"
+        "pci" | "lsusb" | "acpi" | "ps" | "btop" | "netctl" | "wlanctl" | "std_smoke" | "std-smoke"
     )
 }
 
@@ -291,6 +291,7 @@ fn command_emits_tsv_table(resolved: &str, args: &[String]) -> bool {
     let stem = base.strip_suffix(".elf").unwrap_or(base);
     match stem {
         "ls" | "stat" | "hxfs" | "pci" | "acpi" | "ps" => true,
+        "lsusb" => args.is_empty(),
         "fdisk" => matches!(args.first().map(String::as_str), Some("list" | "--list")),
         _ => false,
     }
@@ -831,6 +832,7 @@ impl HshHost {
         const NO_PATH_ARGS: &[&str] = &[
             "hxfs",
             "pci",
+            "lsusb",
             "acpi",
             "ps",
             "sleep",
