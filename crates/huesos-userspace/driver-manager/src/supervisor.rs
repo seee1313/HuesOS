@@ -2017,9 +2017,7 @@ impl DriverManager {
                 Ok(n) if &buf[..n] == protocol::OPEN_KEYBOARD.as_bytes() => {
                     self.open_keyboard_service()
                 }
-                Ok(n) if &buf[..n] == protocol::OPEN_MOUSE.as_bytes() => {
-                    self.open_mouse_service()
-                }
+                Ok(n) if &buf[..n] == protocol::OPEN_MOUSE.as_bytes() => self.open_mouse_service(),
                 Ok(n) if &buf[..n] == protocol::OPEN_FILESYSTEM.as_bytes() => {
                     self.open_filesystem_service()
                 }

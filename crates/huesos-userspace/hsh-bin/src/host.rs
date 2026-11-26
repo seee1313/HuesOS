@@ -262,15 +262,7 @@ fn command_uses_query_channel(resolved: &str) -> bool {
     let stem = strip_exec_ext(base);
     matches!(
         stem,
-        "pci"
-            | "lsusb"
-            | "acpi"
-            | "ps"
-            | "btop"
-            | "netctl"
-            | "wlanctl"
-            | "std_smoke"
-            | "std-smoke"
+        "pci" | "lsusb" | "acpi" | "ps" | "btop" | "netctl" | "wlanctl" | "std_smoke" | "std-smoke"
     )
 }
 

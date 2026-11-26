@@ -82,6 +82,11 @@ impl UsbSpeedAbi {
             Self::SuperPlus => "10000M",
         }
     }
+
+    /// Returns `true` when the link negotiated USB 3.x SuperSpeed or SuperSpeedPlus.
+    pub const fn is_superspeed(self) -> bool {
+        matches!(self, Self::Super | Self::SuperPlus)
+    }
 }
 
 /// Bound class driver role assigned to an enumerated USB device.

@@ -31,8 +31,8 @@ use huesos_usb::xhci::{
     default_ep0_mps, init_input_context, portsc_preserve_rw, portsc_speed,
     set_input_endpoint_context, usb_interval_to_xhci, CompletionCode, ControlTransferType,
     DecodedEvent, EndpointContextParams, EventRingConsumer, PortProtocolRange, ProducerRing,
-    SlotContextParams, Trb, XhciCapabilities, XhciEndpointType, ERDP_EHB, IMAN_IE, IMAN_IP,
-    IR_ERDP, IR_ERSTBA, IR_ERSTSZ, IR_IMAN, IR_IMOD, OP_CONFIG, OP_CRCR, OP_DCBAAP, OP_PAGESIZE,
+    SlotContextParams, Trb, XhciCapabilities, XhciEndpointType, IMAN_IE, IMAN_IP, IR_ERDP,
+    IR_ERSTBA, IR_ERSTSZ, IR_IMAN, IR_IMOD, OP_CONFIG, OP_CRCR, OP_DCBAAP, OP_PAGESIZE,
     OP_PORT_BASE, OP_PORT_STRIDE, OP_USBCMD, OP_USBSTS, PORTSC_CCS, PORTSC_CHANGE_BITS, PORTSC_PED,
     PORTSC_PP, PORTSC_PR, PORTSC_PRC, RT_IR0_BASE, USBCMD_HCRST, USBCMD_HSEE, USBCMD_INTE,
     USBCMD_RS, USBLEGSUP_BIOS_OWNED, USBLEGSUP_OS_OWNED, USBSTS_CNR, USBSTS_EINT, USBSTS_HCH,
@@ -306,8 +306,7 @@ impl XhciController {
             return Err(UsbError::MmioInvalid);
         }
 
-        let (bios_handoff_done, usb3_port_mask) =
-            perform_bios_handoff_and_port_scan(&mmio, &caps);
+        let (bios_handoff_done, usb3_port_mask) = perform_bios_handoff_and_port_scan(&mmio, &caps);
 
         if !wait_mmio_mask(&mmio, op_off + OP_USBSTS, USBSTS_CNR, false, 200) {
             return Err(UsbError::ControllerTimeout);
@@ -370,14 +369,8 @@ impl XhciController {
         mmio.write64_split(ir0_off + IR_ERSTBA, erst_phys);
         mmio.write32(ir0_off + IR_IMAN, IMAN_IP | IMAN_IE);
 
-        mmio.write32(
-            op_off + OP_USBSTS,
-            USBSTS_EINT | USBSTS_PCD | USBSTS_HSE,
-        );
-        mmio.write32(
-            op_off + OP_USBCMD,
-            USBCMD_RS | USBCMD_INTE | USBCMD_HSEE,
-        );
+        mmio.write32(op_off + OP_USBSTS, USBSTS_EINT | USBSTS_PCD | USBSTS_HSE);
+        mmio.write32(op_off + OP_USBCMD, USBCMD_RS | USBCMD_INTE | USBCMD_HSEE);
         if !wait_mmio_mask(&mmio, op_off + OP_USBSTS, USBSTS_HCH, false, 100) {
             return Err(UsbError::ControllerTimeout);
         }
@@ -1095,8 +1088,8 @@ impl XhciController {
             parent_port,
             inv_snap.vendor_id,
             inv_snap.product_id,
-            inv_snap.speed.as_str(),
-            inv_snap.role.as_str(),
+            inv_snap.speed.rate_label(),
+            inv_snap.role.label(),
             inv_snap.product_str()
         );
         Ok(slot_id)

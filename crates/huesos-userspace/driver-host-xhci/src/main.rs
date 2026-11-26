@@ -463,8 +463,8 @@ fn bind_interrupts(irq: &ResourceSlot) -> Result<InterruptState, &'static str> {
     let mut idx = 0usize;
     while idx < bind_count {
         let vector = irq.base + idx as u64;
-        let intr =
-            Interrupt::create_from_resource(irq_handle, vector as u32).map_err(|_| "irq-create")?;
+        let intr = Interrupt::create_from_resource(irq_handle, vector as u32)
+            .map_err(|_| "irq-create")?;
         intr.bind_port(&state.port, vector).map_err(|_| "irq-bind")?;
         state.slots[idx].handle = Some(intr);
         state.count += 1;
@@ -504,12 +504,7 @@ impl DriverRuntime {
         publish_husb_if_needed(bootstrap, self);
     }
 
-    fn wait_until_active(
-        &self,
-        bootstrap: &Channel,
-        gone_port: Option<&Port>,
-        timeout_ticks: u64,
-    ) {
+    fn wait_until_active(&self, bootstrap: &Channel, gone_port: Option<&Port>, timeout_ticks: u64) {
         let mut items = [WaitItem::new(0, Signals::NONE, 0); 14];
         let sig = Signals::READABLE | Signals::PEER_CLOSED;
         items[0] = WaitItem::new(bootstrap.handle().raw(), sig, 0);
