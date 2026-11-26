@@ -42,8 +42,11 @@ cleanup() {
         wait "$qemu_pid" 2>/dev/null || true
     fi
     rm -rf "$qmp_dir"
+    echo "init_args=foo" > build/cmdline.txt
 }
 trap cleanup EXIT
+
+echo "log=verbose" > build/cmdline.txt
 
 annotate_failure() {
     local reason="$1"
