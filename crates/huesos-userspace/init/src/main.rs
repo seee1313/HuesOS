@@ -786,9 +786,12 @@ fn send_boot_dma_pool_grant(
     const NET_DMA_LEN: u64 = 4 * 1024 * 1024;
     const WLAN_DMA_OFFSET: u64 = 68 * 1024 * 1024;
     const WLAN_DMA_LEN: u64 = 4 * 1024 * 1024;
+    const XHCI_DMA_OFFSET: u64 = 72 * 1024 * 1024;
+    const XHCI_DMA_LEN: u64 = 4 * 1024 * 1024;
 
-    // Carve isolated `[64..68 MiB)` for `net-service` and `[68..72 MiB)` for `wlan-service`
-    // regardless of `init.storage=off` so networking and Wi-Fi work on Live ISO / ramdisk boots too.
+    // Carve isolated `[64..68 MiB)` (`net-service`), `[68..72 MiB)` (`wlan-service`),
+    // and `[72..76 MiB)` (`driver-host-xhci`) regardless of `init.storage=off` so
+    // networking, Wi-Fi, USB HID, and USB BOT work on Live ISO / ramdisk boots too.
     if info.dma_pool.len >= NET_DMA_OFFSET + NET_DMA_LEN {
         let net_grant = ResourceGrant {
             kind: kind::DMA_POOL,
@@ -848,6 +851,38 @@ fn send_boot_dma_pool_grant(
                     "[init] wlan-service DMA pool transferred: dma={:#x}+{:#x}",
                     wlan_grant.base,
                     wlan_grant.len
+                );
+            }
+        }
+    }
+
+    if info.dma_pool.len >= XHCI_DMA_OFFSET + XHCI_DMA_LEN {
+        let xhci_grant = ResourceGrant {
+            kind: kind::DMA_POOL,
+            base: info.dma_pool.base + XHCI_DMA_OFFSET,
+            len: XHCI_DMA_LEN,
+            exclusive: true,
+        };
+        if let Ok(res) = Resource::create(
+            xhci_grant.kind,
+            xhci_grant.base,
+            xhci_grant.len,
+            xhci_grant.exclusive,
+        ) {
+            let mut label = [0u8; 96];
+            let n = format_grant_label(&mut label, "driver-host-xhci", &xhci_grant);
+            if dm_bootstrap
+                .write_handle(&label[..n.min(label.len())], res.into_handle())
+                .is_ok()
+            {
+                let mut done = [0u8; 64];
+                let dn = format_grants_complete_label(&mut done, "driver-host-xhci");
+                let _ = dm_bootstrap.write(&done[..dn.min(done.len())]);
+                init_logln!(
+                    logger,
+                    "[init] driver-host-xhci DMA pool transferred: dma={:#x}+{:#x}",
+                    xhci_grant.base,
+                    xhci_grant.len
                 );
             }
         }

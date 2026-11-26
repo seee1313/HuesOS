@@ -81,6 +81,7 @@ const KNOWN_COMMANDS: &[&str] = &[
     "write",
     "hxfs",
     "pci",
+    "lsusb",
     "acpi",
     "ps",
     "fdisk",
@@ -1620,6 +1621,7 @@ fn run_interactive(in_ch: Channel, mut host: HshHost) -> ! {
     );
     shell.send_status("hsh.elf");
     shell.send_prompt();
+    println!("[hsh] interactive prompt ready");
 
     let mut buf = [0u8; 256];
     loop {

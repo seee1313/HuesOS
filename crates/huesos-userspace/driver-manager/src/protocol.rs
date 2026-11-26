@@ -179,3 +179,51 @@ pub const ATTACH_WLAN_CLIENT: &str = "wlan-client";
 pub const ATTACH_WLAN_CLIENT_RO: &str = "wlan-client:ro";
 /// `wlan-service` reported ready.
 pub const WLAN_READY: &str = "service:wlan:ready";
+
+/// Client asks DriverManager to open the USB HID mouse service.
+pub const OPEN_MOUSE: &str = "open:mouse";
+/// DriverManager responds with a mouse service channel.
+pub const MOUSE_CHANNEL: &str = "service:mouse:channel";
+/// Mouse service is not currently available.
+pub const MOUSE_UNAVAILABLE: &str = "err:mouse-unavailable";
+/// DriverManager attaches a mouse client channel to `driver-host-xhci`.
+pub const ATTACH_MOUSE_CLIENT: &str = "mouse-client";
+
+/// Client asks DriverManager to open the USB BOT async BlockDevice service.
+pub const OPEN_BLOCK_USB: &str = "open:block:usb";
+/// DriverManager responds with a USB BOT BlockDevice service channel.
+pub const BLOCK_USB_CHANNEL: &str = "service:block:usb:channel";
+/// USB BOT BlockDevice service is not currently online.
+pub const BLOCK_USB_UNAVAILABLE: &str = "err:block:usb-unavailable";
+/// DriverManager attaches a USB BOT block client channel to `driver-host-xhci`.
+pub const ATTACH_BLOCK_USB_CLIENT: &str = "block:usb-client";
+
+/// xHCI DriverHost reported it is starting.
+pub const XHCI_HOST_STARTING: &str = "driver-host:xhci:starting";
+/// xHCI DriverHost has received its MMIO/IRQ/DMA resources.
+pub const XHCI_HOST_RESOURCES_READY: &str = "driver-host:xhci:resources-ready";
+/// xHCI DriverHost reported ready.
+pub const XHCI_HOST_READY: &str = "driver-host:xhci:ready";
+/// xHCI DriverHost USB HID input service is ready.
+pub const USB_HID_READY: &str = "service:usb:hid:ready";
+/// xHCI DriverHost USB BOT block service is ready.
+pub const BLOCK_USB_READY: &str = "service:block:usb:ready";
+/// xHCI DriverHost bring-up failed.
+pub const USB_BRINGUP_FAILED: &str = "service:usb:bringup-failed";
+/// xHCI DriverHost missing required resources.
+pub const USB_MISSING_RESOURCES: &str = "service:usb:missing-resources";
+/// xHCI DriverHost observed `PORT_PACKET_DEVICE_GONE`.
+pub const USB_DEVICE_GONE: &str = "service:usb:device-gone";
+/// xHCI DriverHost published a read-only `HUSB` inventory VMO.
+pub const USB_INVENTORY_VMO_UPDATE: &str = "service:usb:inventory-vmo";
+/// DriverManager asks `driver-host-xhci` to refresh its `HUSB` inventory VMO.
+pub const USB_REFRESH_VMO: &str = "usb:refresh-vmo";
+
+/// Client queries USB controller & attached device inventory as TSV text.
+pub const QUERY_USB: &str = "query:usb";
+/// Client requests a read-only duplicate of the `HUSB` USB inventory VMO.
+pub const QUERY_USB_VMO: &str = "query:usb:vmo";
+/// DriverManager replies with a read-only `HUSB` USB inventory VMO handle.
+pub const USB_INVENTORY_VMO_REPLY: &str = "service:usb:inventory-vmo";
+/// DriverManager replies when no `HUSB` USB inventory VMO is published.
+pub const USB_INVENTORY_UNAVAILABLE: &str = "err:usb-inventory-unavailable";

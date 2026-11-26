@@ -48,6 +48,10 @@ name = "pci"
 path = "src/bin/pci.rs"
 
 [[bin]]
+name = "lsusb"
+path = "src/bin/lsusb.rs"
+
+[[bin]]
 name = "acpi"
 path = "src/bin/acpi.rs"
 

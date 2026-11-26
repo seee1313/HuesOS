@@ -52,6 +52,7 @@ jobs:
             -p hues-async \
             -p huesos-nvme \
             -p huesos-pci \
+            -p huesos-usb \
             -p huesos-quota \
             --target x86_64-unknown-linux-gnu -Z build-std= 2>&1 | tee "$LOG"; then
             grep -E '(^error|FAILED|panicked at|SUMMARY: AddressSanitizer)' "$LOG" | tail -n 10 | while IFS= read -r line; do

@@ -73,6 +73,8 @@ pub mod pci_lease;
 pub mod pci_manager;
 /// Dedicated ACPI ↔ PCI configuration read mediation protocol (AP-10).
 pub mod pci_mediation;
+/// Zero-bus-traffic USB 3.x (`xHCI`) inventory VMO wire format (`HUSB` v1).
+pub mod usb;
 
 /// HBI boot-driver manifest ABI.
 pub mod hbi_boot {
