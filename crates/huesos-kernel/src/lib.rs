@@ -698,14 +698,8 @@ fn kernel_iommu_bind_dma(
     base: u64,
     len: u64,
 ) -> Result<(), huesos_object::DeviceLeaseError> {
-    huesos_arch::iommu::bind_lease_dma(
-        pci_address_packed,
-        lease_koid,
-        lease_generation,
-        base,
-        len,
-    )
-    .map_err(|_| huesos_object::DeviceLeaseError::IommuBindFailed)
+    huesos_arch::iommu::bind_lease_dma(pci_address_packed, lease_koid, lease_generation, base, len)
+        .map_err(|_| huesos_object::DeviceLeaseError::IommuBindFailed)
 }
 
 /// Discover `DMAR` (Intel VT-d) or `IVRS` (AMD-Vi) from the validated boot ACPI
@@ -827,7 +821,9 @@ fn initialize_hardware_iommu(archive: Option<&[u8]>, memory_regions: &[MemoryReg
         let _ = writeln!(
             writer,
             "[iommu] IOMMU discovery rejected (kind={:?}, status={:?}, units={}); DMA mode=Trusted",
-            report.kind, report.status, report.unit_count
+            report.kind,
+            report.status,
+            report.unit_count
         );
         return;
     }

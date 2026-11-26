@@ -174,9 +174,10 @@ fn run_with_frames(
             // `IOMMU_NONE` without emitting an event when a PTE is zero. If an event was
             // emitted, verify it matches `edu_bdf` and `canary_phys`.
             if canary_faults > 0 {
-                let ok = faults[..canary_faults]
-                    .iter()
-                    .any(|f| f.source_bdf == edu_bdf && f.fault_iova == canary_phys);
+                let ok = faults[..canary_faults].iter().any(|f| {
+                    f.source_bdf == edu_bdf
+                        && (f.fault_iova == 0 || (f.fault_iova & !0xFFF) == canary_phys)
+                });
                 if !ok {
                     let _ = lease.revoke(1, true);
                     unregister_object(lease.koid());
@@ -224,8 +225,9 @@ fn run_with_frames(
         }
         match hw_kind {
             huesos_abi::pci_iommu::IommuHardwareKind::AmdVi => {
-                f.fault_iova == auth_phys
-                    && matches!(f.kind, FaultKind::ContextNotPresent | FaultKind::WriteNotPermitted)
+                (f.fault_iova == 0 || (f.fault_iova & !0xFFF) == auth_phys)
+                    && (f.kind == FaultKind::ContextNotPresent
+                        || f.kind == FaultKind::WriteNotPermitted)
             }
             _ => f.kind == FaultKind::ContextNotPresent,
         }

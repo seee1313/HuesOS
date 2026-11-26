@@ -18,10 +18,10 @@ use huesos_iommu::amd_vi::{
     AmdViCommand, AmdViDte, AmdViPte, AMD_VI_BLOCKED_DOMAIN_ID, AMD_VI_DEVTAB_BYTES,
     AMD_VI_FIRST_LEASE_DOMAIN_ID, AMD_VI_IVMD_DOMAIN_ID, AMD_VI_MAX_DOMAINS, AMD_VI_MAX_IOVA_48BIT,
     AMD_VI_MMIO_BYTES, AMD_VI_RING_CAPACITY, AMD_VI_RING_OFFSET_MASK, CTRL_CMD_BUF_EN,
-    CTRL_COHERENT, CTRL_EVENT_LOG_EN, CTRL_IOMMU_EN, MMIO_CMDBUF_BASE, MMIO_CMD_HEAD, MMIO_CMD_TAIL,
-    MMIO_CONTROL, MMIO_DEVTAB_BASE, MMIO_EVTLOG_BASE, MMIO_EVT_HEAD, MMIO_EVT_TAIL, MMIO_EXCL_BASE,
-    MMIO_EXCL_LIMIT, MMIO_EXT_FEATURES, MMIO_STATUS, STATUS_COM_WAIT_INT, STATUS_EVENT_LOG_INT,
-    STATUS_EVENT_OVERFLOW, STATUS_RW1C_ALL,
+    CTRL_COHERENT, CTRL_EVENT_LOG_EN, CTRL_IOMMU_EN, MMIO_CMDBUF_BASE, MMIO_CMD_HEAD,
+    MMIO_CMD_TAIL, MMIO_CONTROL, MMIO_DEVTAB_BASE, MMIO_EVTLOG_BASE, MMIO_EVT_HEAD, MMIO_EVT_TAIL,
+    MMIO_EXCL_BASE, MMIO_EXCL_LIMIT, MMIO_EXT_FEATURES, MMIO_STATUS, STATUS_COM_WAIT_INT,
+    STATUS_EVENT_LOG_INT, STATUS_EVENT_OVERFLOW, STATUS_RW1C_ALL,
 };
 use huesos_iommu::{
     derive_isolation_group, iova_level_index, DomainTable, FaultRecord, MappedDmaRange, VtdError,
@@ -473,10 +473,16 @@ pub fn drain_faults(out: &mut [FaultRecord]) -> usize {
         let tail = mmio_read64(engine.register_base, MMIO_EVT_TAIL) & AMD_VI_RING_OFFSET_MASK;
         let mut head = mmio_read64(engine.register_base, MMIO_EVT_HEAD) & AMD_VI_RING_OFFSET_MASK;
         let mut steps = 0usize;
-        while head != tail && steps < AMD_VI_RING_CAPACITY {
-            steps += 1;
+        while steps < AMD_VI_RING_CAPACITY {
             let word_idx = (head as usize) / 8;
             let w0 = phys_read64(engine.evt_log_phys, word_idx);
+            // Real AMD-Vi silicon advances `MMIO_EVT_TAIL`; QEMU 8.2 `amd-iommu`
+            // updates `s->evtlog_tail` internally without mirroring `MMIO_EVT_TAIL`
+            // while still writing non-zero `EventCode` (`w0[63:60]`) into the zeroed ring.
+            if head == tail && (w0 >> 60) == 0 {
+                break;
+            }
+            steps += 1;
             let w1 = phys_read64(engine.evt_log_phys, word_idx + 1);
             phys_write64(engine.evt_log_phys, word_idx, 0, true);
             phys_write64(engine.evt_log_phys, word_idx + 1, 0, true);

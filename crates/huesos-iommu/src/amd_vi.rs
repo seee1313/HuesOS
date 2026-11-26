@@ -13,9 +13,7 @@
 //!   `INVALIDATE_IOMMU_PAGES`, `COMPLETION_WAIT`);
 //! - `128`-bit Event Log entries (`IO_PAGE_FAULT` -> [`crate::FaultRecord`]).
 
-use crate::{
-    FaultKind, FaultRecord, VtdError, PAGE_OFFSET_MASK, PAGE_SIZE_4K, PHYS_ADDR_MASK_52,
-};
+use crate::{FaultKind, FaultRecord, VtdError, PAGE_OFFSET_MASK, PAGE_SIZE_4K, PHYS_ADDR_MASK_52};
 
 /// Total uncached MMIO window mapped per AMD-Vi hardware unit (`16 KiB`).
 pub const AMD_VI_MMIO_BYTES: u64 = 0x4000;
@@ -85,8 +83,7 @@ pub const STATUS_EVENT_LOG_INT: u64 = 1 << 1;
 /// `MMIO_STATUS` bit 2: Completion-Wait status (`ComWaitInt`, RW1C).
 pub const STATUS_COM_WAIT_INT: u64 = 1 << 2;
 /// Mask of RW1C status bits cleared during bring-up.
-pub const STATUS_RW1C_ALL: u64 =
-    STATUS_EVENT_OVERFLOW | STATUS_EVENT_LOG_INT | STATUS_COM_WAIT_INT;
+pub const STATUS_RW1C_ALL: u64 = STATUS_EVENT_OVERFLOW | STATUS_EVENT_LOG_INT | STATUS_COM_WAIT_INT;
 
 const DTE_VALID: u64 = 1 << 0;
 const DTE_TRANSLATION_VALID: u64 = 1 << 1;
@@ -164,7 +161,11 @@ impl AmdViDte {
         }
         Ok(Self {
             words: [
-                DTE_VALID | DTE_TRANSLATION_VALID | DTE_MODE_4LEVEL | pt_root_phys | DTE_IR
+                DTE_VALID
+                    | DTE_TRANSLATION_VALID
+                    | DTE_MODE_4LEVEL
+                    | pt_root_phys
+                    | DTE_IR
                     | DTE_IW,
                 domain_id as u64,
                 0,
@@ -205,11 +206,7 @@ impl AmdViPte {
     }
 
     /// 4 KiB leaf PTE (`NextLevel = 0`).
-    pub const fn leaf_4k(
-        page_phys: u64,
-        readable: bool,
-        writable: bool,
-    ) -> Result<Self, VtdError> {
+    pub const fn leaf_4k(page_phys: u64, readable: bool, writable: bool) -> Result<Self, VtdError> {
         if !readable && !writable {
             return Err(VtdError::InvalidRange);
         }

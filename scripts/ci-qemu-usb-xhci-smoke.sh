@@ -49,7 +49,7 @@ trap cleanup EXIT
 echo "log=verbose" > build/cmdline.txt
 
 annotate_failure() {
-    local reason="$1"
+    local reason="${1//$'\n'/ }"
     printf '::error::ci-qemu-usb-xhci-smoke: %s (profile=%s smp=%s)\n' \
         "$reason" "$profile" "$cpus"
     while IFS= read -r line; do
@@ -104,7 +104,7 @@ img[510:512] = b"\x55\xAA"
 bpb = bytearray(512)
 bpb[0:3] = b"\xEB\x58\x90"
 bpb[3:11] = b"HUESFAT3"
-struct.pack_into("<HBBHBHHBHHHII", bpb, 11, 512, SPC, RESERVED, NUM_FATS, 0, 0, 0xF8, 0, 63, 255, PART_START, PART_SECTORS)
+struct.pack_into("<HBHBHHBHHHII", bpb, 11, 512, SPC, RESERVED, NUM_FATS, 0, 0, 0xF8, 0, 63, 255, PART_START, PART_SECTORS)
 struct.pack_into("<IHHIHH", bpb, 36, FAT_SECTORS, 0, 0, 2, 1, 6)
 bpb[64] = 0x80
 bpb[66] = 0x29
@@ -455,7 +455,7 @@ if "ls_root.txt" not in root or "sub" not in root:
     fail(f"expected ls_root.txt and sub in FAT32 root, got: {sorted(root)}")
 
 ls_root_text = read_chain(root["ls_root.txt"][1])[: root["ls_root.txt"][2]].decode("utf-8", errors="replace")
-if "HelloFromHost.txt" not in ls_root_text or "vfat" not in ls_root_text:
+if "HelloFromHost.txt" not in ls_root_text or "smoke.hsh" not in ls_root_text:
     fail(f"unexpected /mnt/usb0 ls output: {ls_root_text!r}")
 
 sub = parse_dir(read_chain(root["sub"][1]))

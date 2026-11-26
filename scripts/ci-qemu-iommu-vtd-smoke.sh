@@ -44,8 +44,11 @@ annotate_failure() {
     printf '::error::ci-qemu-iommu-vtd-smoke (%s): %s (profile=%s smp=%s)\n' \
         "$leg" "$reason" "$profile" "$cpus"
     while IFS= read -r line; do
+        printf '::error::iommu| %s\n' "$line"
+    done < <(grep -E '\[(iommu|vtd|amd-vi)' "$log_path" 2>/dev/null | tail -n 8 || true)
+    while IFS= read -r line; do
         printf '::error::serial| %s\n' "$line"
-    done < <(tail -n 12 "$log_path" 2>/dev/null || true)
+    done < <(tail -n 6 "$log_path" 2>/dev/null || true)
 }
 
 echo "iommu_test=1" > build/cmdline.txt
