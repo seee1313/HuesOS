@@ -687,7 +687,11 @@ fn flush_write_buffer_if_needed(engine: &DrhdEngine) -> Result<(), VtdHwError> {
         return Ok(());
     }
     let gsts = mmio_read32(engine.register_base, REG_GSTS);
-    mmio_write32(engine.register_base, REG_GCMD, build_gcmd(gsts, GCMD_WBF, 0));
+    mmio_write32(
+        engine.register_base,
+        REG_GCMD,
+        build_gcmd(gsts, GCMD_WBF, 0),
+    );
     poll_u32_mask(engine.register_base, REG_GSTS, GCMD_WBF, 0)
 }
 
@@ -715,7 +719,11 @@ fn invalidate_iotlb_global(engine: &DrhdEngine) -> Result<(), VtdHwError> {
         engine.caps.iotlb_reg_offset,
         engine.caps.iotlb_global_invalidate_cmd(),
     );
-    poll_u64_clear(engine.register_base, engine.caps.iotlb_reg_offset, IOTLB_IVT)
+    poll_u64_clear(
+        engine.register_base,
+        engine.caps.iotlb_reg_offset,
+        IOTLB_IVT,
+    )
 }
 
 fn invalidate_iotlb_domain(engine: &DrhdEngine, domain_id: u16) -> Result<(), VtdHwError> {
@@ -724,7 +732,11 @@ fn invalidate_iotlb_domain(engine: &DrhdEngine, domain_id: u16) -> Result<(), Vt
         engine.caps.iotlb_reg_offset,
         engine.caps.iotlb_domain_invalidate_cmd(domain_id),
     );
-    poll_u64_clear(engine.register_base, engine.caps.iotlb_reg_offset, IOTLB_IVT)
+    poll_u64_clear(
+        engine.register_base,
+        engine.caps.iotlb_reg_offset,
+        IOTLB_IVT,
+    )
 }
 
 fn poll_u32_mask(base: u64, offset: usize, mask: u32, expected: u32) -> Result<(), VtdHwError> {
@@ -766,7 +778,12 @@ fn program_context_entry(
         let frame = huesos_pmm::alloc_frame().map_err(|_| VtdHwError::OutOfMemory)?;
         zero_frame_4k(frame, coherent);
         let root_entry = RootEntry::present(frame)?;
-        phys_write64(engine.root_table_phys, bus_idx * 2 + 1, root_entry.hi, coherent);
+        phys_write64(
+            engine.root_table_phys,
+            bus_idx * 2 + 1,
+            root_entry.hi,
+            coherent,
+        );
         phys_write64(engine.root_table_phys, bus_idx * 2, root_entry.lo, coherent);
         engine.bus_ctx_phys[bus_idx] = frame;
         frame

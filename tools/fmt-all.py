@@ -82,7 +82,9 @@ def run(command: list[str], cwd: Path) -> int:
         if result.stderr:
             print(result.stderr, end="", file=sys.stderr, flush=True)
         if result.returncode != 0:
-            for line in (result.stdout + "\n" + result.stderr).splitlines()[:40]:
+            lines = (result.stdout + "\n" + result.stderr).splitlines()
+            diff_headers = [l for l in lines if l.startswith("Diff in ")]
+            for line in (diff_headers or lines)[:10]:
                 if line.strip():
                     print(f"::error::fmt({rel})| {line}", flush=True)
         return result.returncode

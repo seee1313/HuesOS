@@ -709,7 +709,7 @@ fn kernel_iommu_bind_dma(
 fn initialize_hardware_iommu(archive: Option<&[u8]>, memory_regions: &[MemoryRegion]) {
     use core::fmt::Write;
     use huesos_abi::acpi_archive::{self, ArchiveReader};
-    use huesos_pci::iommu::{discover_iommu, FirmwareIommuKind, FirmwareIommuStatus};
+    use huesos_pci::iommu::{discover_from_acpi_tables, FirmwareIommuKind, FirmwareIommuStatus};
 
     huesos_syscalls::set_iommu_status_fn(huesos_arch::vtd::status);
     huesos_object::set_iommu_lease_hooks(Some(huesos_object::IommuLeaseHooks {
@@ -780,7 +780,7 @@ fn initialize_hardware_iommu(archive: Option<&[u8]>, memory_regions: &[MemoryReg
         return;
     }
 
-    let report = discover_iommu(Some(&dmar_bytes[..dmar_length]), None);
+    let report = discover_from_acpi_tables(Some(&dmar_bytes[..dmar_length]), None);
     if report.kind != FirmwareIommuKind::IntelVtd
         || report.status != FirmwareIommuStatus::Valid
         || report.unit_count == 0
