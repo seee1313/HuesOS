@@ -108,14 +108,23 @@ qemu-system-x86_64 \
 qemu_pid=$!
 
 set +e
-python3 - "$qmp_socket" "$log" "$timeout_seconds" <<'PY'
+python3 - "$qmp_socket" "$log" "$timeout_seconds" "$qmp_dir/py_err.txt" <<'PY'
 import json
 import socket
 import sys
 import time
 
-qmp_path, serial_path, timeout_text = sys.argv[1:]
+qmp_path, serial_path, timeout_text, err_path = sys.argv[1:]
 deadline = time.monotonic() + float(timeout_text)
+
+
+def fail(msg: str) -> "NoReturn":
+    try:
+        with open(err_path, "w", encoding="utf-8") as ef:
+            ef.write(msg)
+    except OSError:
+        pass
+    raise SystemExit(msg)
 
 
 def wait_serial(marker: str) -> str:
@@ -124,13 +133,13 @@ def wait_serial(marker: str) -> str:
             with open(serial_path, "r", encoding="utf-8", errors="replace") as f:
                 contents = f.read()
             if "KERNEL PANIC" in contents or "[driver-host:xhci] PANIC" in contents:
-                raise SystemExit(f"panic observed while waiting for {marker!r}")
+                fail(f"panic observed while waiting for {marker!r}")
             if marker in contents:
                 return contents
         except FileNotFoundError:
             pass
         time.sleep(0.1)
-    raise SystemExit(f"timed out waiting for serial marker {marker!r}")
+    fail(f"timed out waiting for serial marker {marker!r}")
 
 
 while time.monotonic() < deadline:
@@ -146,12 +155,12 @@ while time.monotonic() < deadline:
             pass
         time.sleep(0.1)
 else:
-    raise SystemExit("timed out waiting for QEMU QMP socket")
+    fail("timed out waiting for QEMU QMP socket")
 
 stream = qmp.makefile("rwb", buffering=0)
 greeting = json.loads(stream.readline())
 if "QMP" not in greeting:
-    raise SystemExit(f"unexpected QMP greeting: {greeting!r}")
+    fail(f"unexpected QMP greeting: {greeting!r}")
 
 req_seq = 0
 
@@ -167,11 +176,11 @@ def qmp_cmd(execute: str, arguments=None):
     while True:
         line = stream.readline()
         if not line:
-            raise SystemExit(f"EOF waiting for QMP {execute}")
+            fail(f"EOF waiting for QMP {execute}")
         msg = json.loads(line)
         if msg.get("id") == req_id:
             if "error" in msg:
-                raise SystemExit(f"QMP {execute} failed: {msg['error']}")
+                fail(f"QMP {execute} failed: {msg['error']}")
             return msg.get("return")
 
 
@@ -194,26 +203,24 @@ for ch in cmd_line:
     qmp_cmd(
         "input-send-event",
         {
-            "device": "usbkbd0",
             "events": [
                 {
                     "type": "key",
                     "data": {"down": True, "key": {"type": "qcode", "data": qcode}},
                 }
-            ],
+            ]
         },
     )
     time.sleep(0.05)
     qmp_cmd(
         "input-send-event",
         {
-            "device": "usbkbd0",
             "events": [
                 {
                     "type": "key",
                     "data": {"down": False, "key": {"type": "qcode", "data": qcode}},
                 }
-            ],
+            ]
         },
     )
     time.sleep(0.05)
@@ -225,7 +232,8 @@ py_status=$?
 set -e
 
 if [[ "$py_status" != 0 ]]; then
-    annotate_failure "QMP USB HID / BOT smoke failed"
+    py_reason="$(cat "$qmp_dir/py_err.txt" 2>/dev/null || echo "QMP USB HID / BOT smoke failed")"
+    annotate_failure "$py_reason"
     tail -200 "$log" >&2 || true
     exit 1
 fi
@@ -242,6 +250,7 @@ required_markers=(
     'status=handed-off'
     '[driver-manager] attached DmaPool to DeviceLease for driver-host-xhci'
     '[driver-host:xhci] controller online'
+    '[driver-host:xhci] first USB HID keyboard report delivered'
     'iommu=true'
     'HUSB v1'
     'iommu=isolated msi=true'

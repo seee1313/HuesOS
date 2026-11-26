@@ -635,14 +635,21 @@ impl XhciController {
                         key: 0,
                         pressed: false,
                     }; MAX_HID_KEY_EVENTS];
-                    let count = {
+                    let (count, first_hid) = {
                         let mut hw = self.hw.borrow_mut();
+                        let prev = hw.hid_events;
                         let n = hw.devices[d_idx]
                             .kbd_state
                             .feed_report(&raw[..8], &mut events);
                         hw.hid_events = hw.hid_events.saturating_add(n as u64);
-                        n
+                        (n, prev == 0 && n > 0)
                     };
+                    if first_hid {
+                        println!(
+                            "[driver-host:xhci] first USB HID keyboard report delivered (slot={})",
+                            slot_id
+                        );
+                    }
                     let mut saw_release = false;
                     let mut k = 0usize;
                     while k < count {
