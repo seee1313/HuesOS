@@ -41,7 +41,7 @@ const RMRR_FALLBACK_DOMAIN_ID: u16 = 1;
 static VTD_ACTIVE: AtomicBool = AtomicBool::new(false);
 static VTD_FAULT_COUNT: AtomicU64 = AtomicU64::new(0);
 static VTD_STATE: RankedIrqSafeTicketLock<VtdManager> =
-    RankedIrqSafeTicketLock::new(LockRank::ARCHITECTURE, VtdManager::new());
+    RankedIrqSafeTicketLock::new(VtdManager::new(), LockRank::ARCHITECTURE);
 
 /// Validated `DRHD` unit descriptor supplied by kernel `DMAR` discovery.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -321,8 +321,9 @@ pub fn initialize(
                 let start_4k = reg.base_address & !PAGE_OFFSET_MASK;
                 let end_4k = (reg.limit_address.saturating_add(PAGE_SIZE_4K)) & !PAGE_OFFSET_MASK;
                 if end_4k > start_4k {
+                    let fallback_slpt = engine.rmrr_fallback_slpt_phys;
                     map_range_in_slpt(
-                        engine.rmrr_fallback_slpt_phys,
+                        fallback_slpt,
                         caps.address_width,
                         start_4k,
                         end_4k - start_4k,
@@ -332,7 +333,7 @@ pub fn initialize(
                         &mut engine,
                         (reg.requester_bdf >> 8) as u8,
                         (reg.requester_bdf & 0xFF) as u8,
-                        engine.rmrr_fallback_slpt_phys,
+                        fallback_slpt,
                         RMRR_FALLBACK_DOMAIN_ID,
                     )?;
                 }
@@ -378,14 +379,16 @@ pub fn bind_lease_dma(
     let caps = guard.units[unit_idx].caps;
     let range = MappedDmaRange::try_new(base, len, caps.effective_iova_limit())?;
 
-    let (slot_idx, domain_id, slpt_root_phys, is_new_domain) =
-        if let Some(existing_idx) = guard.domains.find_by_lease(lease_koid, lease_generation) {
+    let existing = guard.domains.find_by_lease(lease_koid, lease_generation);
+    let (slot_idx, domain_id, slpt_root_phys, is_new_domain) = match existing {
+        Some(existing_idx) => {
             let rec = guard.domains.slots()[existing_idx];
             if rec.pci_address_packed != pci_address_packed {
                 return Err(VtdHwError::Policy(VtdError::IsolationGroupConflict));
             }
             (existing_idx, rec.domain_id, rec.slpt_root_phys, false)
-        } else {
+        }
+        None => {
             let slpt_phys = huesos_pmm::alloc_frame().map_err(|_| VtdHwError::OutOfMemory)?;
             zero_frame_4k(slpt_phys, caps.page_walk_coherent);
 
@@ -450,7 +453,8 @@ pub fn bind_lease_dma(
                 r_idx += 1;
             }
             (idx, did, slpt_phys, true)
-        };
+        }
+    };
 
     let inserted = match guard.domains.record_range(slot_idx, range) {
         Ok(ins) => ins,
