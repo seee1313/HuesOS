@@ -143,15 +143,23 @@ mod tests {
     use super::*;
     use core::sync::atomic::{AtomicU32, Ordering};
 
-    static PARK_COUNT: AtomicU32 = AtomicU32::new(0);
-    static WAKE_COUNT: AtomicU32 = AtomicU32::new(0);
+    static KERNEL_PARK_COUNT: AtomicU32 = AtomicU32::new(0);
+    static KERNEL_WAKE_COUNT: AtomicU32 = AtomicU32::new(0);
+    static USER_PARK_COUNT: AtomicU32 = AtomicU32::new(0);
+    static USER_WAKE_COUNT: AtomicU32 = AtomicU32::new(0);
     static TICK_VAL: AtomicU32 = AtomicU32::new(42);
 
-    fn mock_park() {
-        PARK_COUNT.fetch_add(1, Ordering::SeqCst);
+    fn kernel_park() {
+        KERNEL_PARK_COUNT.fetch_add(1, Ordering::SeqCst);
     }
-    fn mock_wake(_slot: u32) {
-        WAKE_COUNT.fetch_add(1, Ordering::SeqCst);
+    fn kernel_wake(_slot: u32) {
+        KERNEL_WAKE_COUNT.fetch_add(1, Ordering::SeqCst);
+    }
+    fn user_park() {
+        USER_PARK_COUNT.fetch_add(1, Ordering::SeqCst);
+    }
+    fn user_wake(_slot: u32) {
+        USER_WAKE_COUNT.fetch_add(1, Ordering::SeqCst);
     }
     fn mock_ticks() -> u64 {
         TICK_VAL.load(Ordering::SeqCst) as u64
@@ -159,29 +167,29 @@ mod tests {
 
     #[test]
     fn kernel_backend_delegates_to_hooks() {
-        PARK_COUNT.store(0, Ordering::SeqCst);
-        WAKE_COUNT.store(0, Ordering::SeqCst);
+        KERNEL_PARK_COUNT.store(0, Ordering::SeqCst);
+        KERNEL_WAKE_COUNT.store(0, Ordering::SeqCst);
 
-        let b = KernelBackend::new(mock_park, mock_wake, mock_ticks);
+        let b = KernelBackend::new(kernel_park, kernel_wake, mock_ticks);
         b.park();
         b.park();
         b.wake(3);
-        assert_eq!(PARK_COUNT.load(Ordering::SeqCst), 2);
-        assert_eq!(WAKE_COUNT.load(Ordering::SeqCst), 1);
+        assert_eq!(KERNEL_PARK_COUNT.load(Ordering::SeqCst), 2);
+        assert_eq!(KERNEL_WAKE_COUNT.load(Ordering::SeqCst), 1);
         assert_eq!(b.now_ticks(), 42);
     }
 
     #[test]
     fn user_backend_delegates_to_hooks() {
-        PARK_COUNT.store(0, Ordering::SeqCst);
-        WAKE_COUNT.store(0, Ordering::SeqCst);
+        USER_PARK_COUNT.store(0, Ordering::SeqCst);
+        USER_WAKE_COUNT.store(0, Ordering::SeqCst);
 
-        let b = UserBackend::new(mock_park, mock_wake, mock_ticks);
+        let b = UserBackend::new(user_park, user_wake, mock_ticks);
         b.park();
         b.wake(0);
         b.wake(7);
-        assert_eq!(PARK_COUNT.load(Ordering::SeqCst), 1);
-        assert_eq!(WAKE_COUNT.load(Ordering::SeqCst), 2);
+        assert_eq!(USER_PARK_COUNT.load(Ordering::SeqCst), 1);
+        assert_eq!(USER_WAKE_COUNT.load(Ordering::SeqCst), 2);
         assert_eq!(b.now_ticks(), 42);
     }
 
