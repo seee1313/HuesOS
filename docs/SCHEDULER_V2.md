@@ -1,17 +1,17 @@
 # Scheduler v2 production design
 
-Status: approved target architecture; implementation not yet present.
+Status: **core runtime implemented and integrated (`huesos-sched` + `huesos-kernel`, PRs #280, #281, #287)**.
+Two-level `Job`→`Thread` request-based EEVDF (`O(1)` rollover, `yield_now()` slice forfeiture), CBS reservations over `TscClock`, 256-CPU / 8192-task capacities, single-writer per-CPU runqueues + bitmap `TaskInbox`, topology-aware placement/idle pull, and `SystemSchedStats`/`SystemTaskQuery` observability are active in the kernel. Hardware `CR3` PCID/`INVPCID` activation (`PcidTable` is policy-tested in `huesos-sched`), cross-SMT core-scheduling barriers (`SmtCoreGate` is policy-tested in `huesos-sched`), and multi-platform bare-metal latency qualification ([STATUS.md](STATUS.md)) remain open.
 
 This document is normative for the Scheduler/SMP v2 implementation. It
 separates fixed architecture decisions from tunable values that still require
-measurement. Existing code must not claim these properties until the exit
-gates in this document pass.
+bare-metal measurement.
 
 Related documents:
 
-- `docs/SCHEDULER_RESEARCH.md` — comparative rationale;
-- `docs/SMP_V2.md` — APIC, topology, timer, IPI, and IRQ architecture;
-- `docs/SMP.md` — currently implemented SMP path.
+- [SMP_V2.md](SMP_V2.md) — APIC, topology, timer, IPI, and IRQ architecture;
+- [SCHEDULER_BENCHMARK.md](SCHEDULER_BENCHMARK.md) — benchmark and verification methodology;
+- [STATUS.md](STATUS.md) — current implementation vs bare-metal qualification boundaries.
 
 ## 1. Goals
 

@@ -1,10 +1,10 @@
 # SMP v2 production design
 
-Status: approved target architecture; implementation not yet present.
+Status: **implemented and active on `main` (`huesos-arch` + `huesos-kernel` + `huesos-sched`, PRs #280, #281, #287)**.
+256-CPU dense indices, 32-bit `xAPIC`/`x2APIC` APIC IDs, `CPUID 0x1F/0x0B` topology discovery, `CpuLifecycle` state tracking, AP `IA32_PAT` sync (`WC` framebuffer parity), per-task `XSAVE`/`FXSAVE` SIMD state, 16 KiB unmapped-guard-paged `NX` kernel stacks (`PML4[509]`), per-`CR3` active CPU tracking + targeted TLB shootdowns, and `IA32_TSC_DEADLINE`/LAPIC timers are live and verified across QEMU SMP 1..8 gates. Hardware `CR3` PCID/`INVPCID` enablement, cross-SMT core-scheduling barriers, and multi-platform physical qualification remain tracked in [STATUS.md](STATUS.md).
 
-This document specifies x86-64 SMP behavior supporting Scheduler v2. It does
+This document specifies x86-64 SMP behavior supporting [SCHEDULER_V2.md](SCHEDULER_V2.md). It does
 not describe NUMA or runtime CPU hotplug, which are excluded from this phase.
-The currently implemented AP path remains documented in `docs/SMP.md`.
 
 ## 1. Scope and fixed limits
 
@@ -606,8 +606,17 @@ This is one implementation PR, but commits remain independently reviewable:
 
 No commit may bypass the prior layer's invariant tests.
 
-## 26. Documentation requirement
+## 26. Shipped AP trampoline and Limine base-rev-3 invariants
 
-The implementation must update this document with exact constants, memory
-orderings, vector assignments, fallback behavior, measurements, and evidence.
-Architectural deviation requires owner approval before code.
+Consolidated from the original `SMP.md` bring-up contract (`crates/huesos-arch/src/x86_64/ap_boot.rs` and `crates/huesos-kernel/src/smp.rs`):
+
+- **Low-memory identity map (`0x0000..0x10000`):** Limine base revision 3 omits the unconditional low 4 GiB identity map and omits reserved/ACPI/MMIO ranges from the HHDM. Before sending `INIT-SIPI-SIPI`, the BSP copies the real-mode trampoline to physical `0x8000`, writes `ApBootInfo` at `0x7000`, and installs temporary low-64 KiB identity mappings alongside explicit `NO_CACHE | NO_EXECUTE` LAPIC/IOAPIC HHDM mappings.
+- **Trampoline invariants (`0x8000`):** sets `SP/ESP = 0x8ff0` before any stack push, enables `EFER.LME | EFER.NXE` prior to loading the kernel `CR3` (preventing `#PF` on `NX` kernel PTEs), and enters 64-bit mode via a far jump (`0xEA`).
+- **Per-AP Rust initialization (`ap_entry`):** initializes local `xAPIC`/`x2APIC`, `CpuLocal` (`GS_BASE`), `PerCpuGdt`/TSS, `idt::init()`, `IA32_PAT` (`MSR 0x277` cloned from BSP so `WC` framebuffer writes never degrade on APs), SMEP/SMAP/UMIP, `XSAVE`/`FXSAVE` control bits, per-CPU `STAR`/`LSTAR`/`SFMASK` syscall MSRs, and the local `Scheduler`, then spins on `APS_MAY_RUN` until the BSP completes `init_late`.
+- **Permanent guard-paged AP stacks:** each discovered AP receives a 16 KiB `NX` stack flanked by unmapped guard pages in `PML4[509]` (`AP_STACKS`), retained permanently even if an AP times out (`CpuLifecycle::Failed`) so a late-waking core can never corrupt recycled memory.
+
+## 27. Documentation requirement
+
+Updates to SMP behavior must keep exact constants, memory orderings, vector
+assignments, fallback behavior, and [STATUS.md](STATUS.md) evidence boundaries
+in sync with code.

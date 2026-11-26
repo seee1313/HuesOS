@@ -1,212 +1,109 @@
 # HuesOS Roadmap
 
-**Snapshot baseline:** `main` at `ba1f439` (2026-11-18).
+**Snapshot baseline:** `main` at `52be571` (2026-11-23; through PR #288).
 
-The MVP boot-to-userspace pipeline (Limine → PMM → paging → SMP-aware
-scheduler → ring3 → syscalls → VMO/Channel IPC) is working and verified in
-QEMU (`-smp 1` and `-smp 2`). This roadmap organizes active work by subsystem
-and keeps a compact ledger of recently completed milestones.
-
-Authoritative status and evidence boundaries live in [STATUS.md](STATUS.md).
-Storage details live in [PRODUCTION_ROADMAP.md](PRODUCTION_ROADMAP.md) and
-[STORAGE_PRODUCTION_GATE.md](STORAGE_PRODUCTION_GATE.md); mutable HxFS v7
-exists, while `storage production-ready` and format freeze remain `false`.
-
-PCI/PCIe and Ring-3 ACPI modernization are specified in
-[PCI Manager Architecture](PCI_MANAGER_ARCHITECTURE.md),
-[Ring-3 ACPI Architecture](ACPI_RING3.md),
-[PCI Production Roadmap](PCI_PRODUCTION_ROADMAP.md), and
-[ACPI → PCI Implementation PR Plan](ACPI_PCI_IMPLEMENTATION_PLAN.md). The
-kernel CF8/CFC NVMe bootstrap (`crates/huesos-kernel/src/boot/storage.rs`)
-remains a migration shim and `PCI production-ready` remains `false`.
+Authoritative implementation and evidence boundaries live in [STATUS.md](STATUS.md).
+Storage release gates live in [PRODUCTION_ROADMAP.md](PRODUCTION_ROADMAP.md) and
+[STORAGE_PRODUCTION_GATE.md](STORAGE_PRODUCTION_GATE.md); PCI production gates
+live in [PCI_PRODUCTION_ROADMAP.md](PCI_PRODUCTION_ROADMAP.md). Both
+`storage production-ready` and `PCI production-ready` remain deliberately `false`
+until bare-metal and hardware-isolation gates close.
 
 ---
 
 ## Active Subsystems Roadmap
 
-### 1. PCI / PCIe & Ring-3 ACPI (AP-17+ — Stages B.4…O)
+### 1. PCI / PCIe Production Qualification (`PCI_PRODUCTION_ROADMAP.md` Stages M.2, N.2, O)
 
-AP-0 through AP-16 established the isolated Ring-3 `uacpi-runtime`, `acpi-manager`
-supervision, `HMCF` config-window snapshots, `PciConfigMint` capability minting,
-mediated `PCI_Config`/`SystemIO`/`SystemMemory` reads, generation-safe ACPI IRQ
-grants, namespace load/init, `HPCI` root-bridge discovery, and root-bound
-read-only diagnostic PCI inventory. The next ordered stages turn read-only
-discovery into active device ownership:
+Stages `A` through `J`, `K` (policy + boot self-check), `L`, `M.1`, and
+`N.1`/`N.3` (`AP-0..AP-23`) are merged on `main`, and the legacy kernel PCI scan
+is permanently removed (`tools/check-kernel-no-pci.py`). Remaining tracks before
+`PCI production-ready = true`:
 
-- **AP-17 (`B.4` — Audited config write policy & transactions):** bounded
-  config-space write policy and write/readback verification transactions
-  (Command register, BAR sizing/enable, bridge windows) owned solely by
-  `pci-manager`; AML config writes remain denied unless explicitly justified.
-- **AP-18 (`C.3` — `_PRT` and `_OSC` ownership):** evaluate ACPI `_PRT`
-  (PCI interrupt routing tables) and `_OSC` (host/OS control negotiation) in
-  Ring-3 `uacpi-runtime` and carry validated routing/control metadata to
-  `pci-manager`.
-- **AP-19 (`E.1` + `F.2` — Live BAR inventory & rollback-verified planner):**
-  live BAR sizing/validation integrated with `huesos-pci::resource_planner`
-  for deterministic firmware-preserving allocation and explicit rollback plans.
-- **AP-20 (`G.2` + `G.3` — Kernel `DeviceLease` & `DeviceGone`):** kernel-enforced
-  per-device lease object bound to `(DeviceId, LeaseGeneration, FirmwareSnapshotId)`,
-  preventing BDF-reuse / stale-resource ABA and delivering `DeviceGone` revocation
-  signals.
-- **AP-21 (`H.3` + `I` — Driver binding & narrow BAR/IRQ/DMA handoff):**
-  `pci-manager` + `driver-manager` driver binding that mints narrow per-device
-  BAR MMIO, MSI-X/MSI/INTx IRQ, and bounded DMA pool handles strictly through
-  active `DeviceLease` grants.
-- **AP-22 (`J` — NVMe migration & kernel PCI shim removal):** migrate system
-  NVMe boot/binding completely to `pci-manager` + `driver-host-nvme` and delete
-  the legacy kernel CF8/CFC scan in `crates/huesos-kernel/src/boot/storage.rs`.
-- **Later (`Stages K–O`):** reserved-space hotplug and surprise-removal
-  fail-stop (`K`), restart-based and opt-in `QuiesceRemap` rebalance (`L`–`M`),
-  IOMMU isolated DMA domains (VT-d / AMD-Vi, `N`), and multi-machine
-  bare-metal production qualification (`O`).
+- **Stage N.2 — Hardware IOMMU DMA isolation (`PCI Isolated Profile`):** program
+  Intel VT-d (`DMAR`) and AMD-Vi (`IVRS`) second-stage DMA translation tables in
+  the kernel, bind `DeviceLease` lifetimes to per-device IOMMU domains, and pass
+  negative unauthorized-DMA fault tests (replacing `dma_isolation=trusted` on
+  capable platforms).
+- **Stage K.2 (live runtime) & Stage M.2 (`QuiesceRemap` driver):** wire live
+  PCIe Root Port hotplug interrupts to runtime `DriverHost` spawn/teardown in
+  QEMU and migrate a first non-storage driver onto live `QuiesceRemap` BAR
+  relocation.
+- **Stage O — Multi-platform bare-metal qualification:** execute the documented
+  Intel/AMD multi-generation chipset, PCIe switch/bridge, NVMe, and integrated
+  xHCI bare-metal matrix.
 
-### 2. Storage & HxFS (`PRODUCTION_ROADMAP.md` / `STORAGE_PRODUCTION_GATE.md`)
+### 2. Storage & `HxFS v7` Closure (`PRODUCTION_ROADMAP.md` / `STORAGE_PRODUCTION_GATE.md`)
 
-HxFS v7 read/write/checkpoint foundations, encrypted metadata/filenames/extents
-(Stage B), runtime knobs/structured observation/reproducible benchmarks
-(Stages E.1/E.2/E.4), and Hxblob/service foundations (Stage F) have landed,
-while `v7 format freeze` and `storage production-ready` remain deliberately
-`false`. Remaining work to close the storage track:
+Mutable `HxFS v7` (AES-GCM 64-bit extent nonces, LZ4, Hxblob, random-offset RMW,
+`truncate`, symlinks, `chmod`, `StatFs`, persistent named snapshots, journal
+replay, `scrub`/`fsck`, and `v6 → v7` migration) runs end-to-end over
+`pci-manager` + `driver-host-nvme`. Remaining blockers before format freeze:
 
-- **Stage E.3 — 24-hour long-haul soak & run-to-run comparison:** extend the
-  bounded ~2 h `scripts/soak-long.sh` pass to a full 24 h endurance run with
-  automated throughput/error/recovery delta checks against a prior baseline.
-- **Stage C — Full reliability closure:** complete end-to-end fault-injection
-  and recovery verification for media error handling, online `fsck`, and
-  online `scrub` across power-loss and LBA-corruption matrices.
-- **Stage D — Hardware security closure:** execute the owner-gated physical
-  TPM PCR sealing and Secure Boot verification matrix on real hardware (beyond
-  QEMU OVMF + `swtpm` smoke gates).
-- **Multi-vendor NVMe qualification & format freeze:** sustain persistent
-  `hxfs-service` workloads across at least two distinct NVMe controller/SSD
-  vendors before approving an irreversible on-disk HxFS v7 format freeze.
+- **Stage E.3 — Full 24-hour endurance soak:** extend the automated soak gate
+  from bounded CI windows to a 24-hour mixed workload with baseline delta checks.
+- **Stage D — Physical Secure Boot & TPM PCR matrix:** record owner-verified
+  bare-metal Secure Boot + hardware TPM 2.0 PCR sealing/mismatch runs.
+- **Independent review & multi-vendor NVMe matrix:** complete external
+  cryptographic/fsck review of `KeyBroker` + `HxFS v7` and qualify at least two
+  physical NVMe controller families before freezing the v7 on-disk layout.
 
-### 3. Networking (Medium Term #9)
+### 3. Networking & Wireless Expansion (`NETWORKING.md`)
 
-No network driver or TCP/IP stack exists yet. Planned incremental delivery:
+Userspace `net-service` (VirtIO 1.0 Modern + `huesos-net` IPv4/DHCP/DNS/ICMP/UDP/TCP),
+`wlan-service` (`huesos-ieee80211` + `huesos-wpa` WPA2-CCMP + `huesos-rtw88`
+`RTL8821CE`), and `huesos-tls` (TLS 1.3 HTTPS) are operational. Next steps:
 
-- **Userspace `virtio-net` DriverHost:** implement a capability-scoped network
-  device driver host (`driver-host-net`) using bounded DMA descriptor rings,
-  `WaitSet` / `Port` completion notifications, and `DeviceLease`-mediated
-  BAR/IRQ grants once AP-20/AP-21 land (or manifest-scoped MMIO/IRQ in a
-  staging harness).
-- **Userspace TCP/IP stack:** isolated, quota-bounded protocol service
-  (Ethernet, ARP, IPv4, ICMP, UDP, TCP) communicating with clients over
-  Channel/VMO IPC without adding protocol parsing to Ring-0.
-- **QEMU & real-NIC follow-ups:** automated QEMU user-net / tap smoke tests
-  (DHCP/ARP/ICMP/UDP/TCP echo), followed later by real hardware NIC drivers
-  (e.g., Intel `e1000e`/`igc`) under the IOMMU isolated profile.
+- **Bare-metal RF & Ethernet qualification:** multi-AP interoperability soak on
+  physical `RTL8821CE` hardware plus wired PCIe Ethernet DriverHosts (e.g.,
+  Intel `e1000e`/`igc`, Realtek `r8169`).
+- **Protocol surface:** IPv6 dual-stack (`NDP`/`SLAAC`/TCP6/UDP6), passive/active
+  listening socket readiness for userspace daemons, and hardware checksum/TSO
+  offload negotiation.
 
-### 4. Platform, Userspace & Long-Term Hardening
+### 4. Scheduler, CPU Hardening & New Device Classes
 
-- **VFS-backed process execution:** replace build-time `include_bytes!` BOOTFS
-  ELF embedding for non-bootstrap applications with dynamic loading from
-  persistent HxFS / BlobFS volumes.
-- **Userspace environment & toolchain:** expand `libcanvas`, freestanding C/POSIX
-  compatibility surfaces, interactive shell utilities, and work toward a
-  self-hosting toolchain.
-- **Additional device classes (post PCI/Storage/Net):** USB xHCI host controller
-  driver host and audio output (PC Speaker SFX / HD Audio).
-- **Kernel & CPU security hardening:** KASLR, full physical-CPU SMEP/SMAP
-  verification matrices, and IOMMU (VT-d / AMD-Vi) DMA isolation.
+- **Hardware `CR3` PCID/`INVPCID` & SMT core-scheduling:** wire the host-tested
+  `huesos_sched::hw::PcidTable` and `SmtCoreGate` policy engines into `huesos-arch`
+  page-table switching and cross-sibling IPI barriers, and record bare-metal
+  latency thresholds ([SCHEDULER_BENCHMARK.md](SCHEDULER_BENCHMARK.md)).
+- **USB xHCI & Audio DriverHosts:** Ring-3 USB 3.x (`xHCI`) controller/HID/mass-storage
+  driver host over `DeviceLease` and isolated userspace audio output (Intel HDA /
+  VirtIO-Sound).
+- **Lifecycle & quota completion:** per-handle hard caps, page-table frame
+  charging in `Job` quotas ([QUOTAS.md](QUOTAS.md)), and sustained concurrent
+  cancellation stress ([OBJECT_LIFECYCLE.md](OBJECT_LIFECYCLE.md)).
 
 ---
 
-## Done (recent)
+## Completed Milestones Summary
 
-### ACPI→PCI Bring-Up Series (AP-4…AP-16)
-- **AP-4 / AP-5 / AP-6 (uACPI primitives, archive-v2, supervision):** isolated
-  Ring-3 `uacpi-runtime` extended with process-local primitives and archive-v2
-  read-only table maps; `acpi-manager` supervision enforces generation-safe
-  retained archive/broker handles, bounded backoff, and last-good freeze
-  (`scripts/ci-qemu-acpi-restart-smoke.sh restart|budget`).
-- **AP-7 (`huesos-dev/ap7-hmcf-wire`):** validated `HMCF` ECAM config-window
-  snapshot produced by `acpi-manager` and retained by `driver-manager` under the
-  active ACPI generation.
-- **AP-8 (`d100388`, PR #245):** kernel `PciConfigMint` one-shot root
-  capability (`init` only), bounded mint requests bound to HMCF + archive-v2
-  MCFG with canonical-subset and usable-RAM-alias checks, minting read-only,
-  non-executable, `NO_CACHE` ECAM mappings.
-- **AP-9 (`b66895d`, PR #246):** `init` delegates `PciConfigMint` to
-  `driver-manager`, which mints generation-bound read-only ECAM capabilities per
-  `pci-manager` generation and transitions readiness from fail-closed to
-  `read-only config authority ready`.
-- **AP-10 (`6ad1f78`, PR #247; `3050c5c`, PR #248):** dedicated ACPI→PCI
-  `PCI_Config` read mediation channel served by `pci-manager`; all config
-  writes denied; legacy broker PCI opcodes permanently unauthorizable;
-  scenario-aware ECAM/forced-legacy QEMU smoke gates.
-- **AP-11 (`9fc854c`, PR #249; `18242b3`, PR #250):** Gate B range policy and
-  kernel-broker mediation for ACPI `SystemIO` and `SystemMemory`
-  `OperationRegion` accesses (`huesos_abi::acpi_region_policy`,
-  `acpi_policy.rs`), preserving sacred denies and snapshot bindings.
-- **AP-12 (`f007150`, PR #251):** generation-safe ACPI IRQ grants and CPU0
-  deferred-work queue (`uacpi-runtime::work`), keeping AML interrupt/work
-  dispatch bounded and generation-checked.
-- **AP-13 / AP-14 (`92e7be9`, PR #252; `9c9c625`, PR #254):** isolated Ring-3
-  uACPI AML namespace load (`_PIC(IOAPIC)`), bounded `uacpi_namespace_initialize`,
-  writable FACS shadow in `uacpi_shim.c`, and host ASan/UBSan namespace corpus
-  tests (`scripts/test-uacpi-runtime.sh`).
-- **AP-15 (`a192cfe`, PR #255):** Ring-3 uACPI root-bridge discovery (`_HID`
-  `PNP0A03`/`PNP0A08`, `_CRS`, `_BBN`/`_SEG`) producing validated `HPCI`
-  `RootBridgeTable` VMOs (`acpi-manager` → `driver-manager` → `pci-manager`)
-  with HMCF cross-checks and ECAM/forced-legacy QEMU parity.
-- **AP-16 (`ba1f439`, PR #256):** `huesos-pci::inventory` and `pci-manager`
-  read-only diagnostic PCI inventory enumeration bound to validated `HPCI` roots
-  with `FirmwareResourceAvailability` status, zero config writes/BAR sizing
-  mutations, crash-freeze inventory retention, and CI stabilization for
-  `tools/storage-bench.py` (`--self-compare` warmup/median) and
-  `extable::tests` (`SORTED_PTR` host-test serialization).
-
-### Core Kernel, Security, Scheduler & Quotas (Immediate #1–#4, Short-Term #5–#6, Medium-Term #8 & #10 — COMPLETE ✅)
-- **Immediate #1 — Recoverable copies, VMAR splits & SMEP/SMAP:** `huesos-extable`,
-  `.ex_table` asm primitives for bulk & typed user copies, `VmarCreateChild` /
-  split `VmarUnmap` / `VmarProtect`, and `qemu-extable-smoke` (`extable_test=1`).
-- **Immediate #2 — IOAPIC routing:** `huesos-ioapic` policy crate, masked-first
-  multi-controller GSI routing, dynamic IDT bridge, and kernel `edu` level-IRQ
-  probe (`scripts/ci-qemu-irq-level-smoke.sh`); userspace raw-GSI path and
-  `_PRT` integration remain open under AP-18/AP-21.
-- **Immediate #3 & Short-Term #5 — Process/object lifecycle & dynamic processes:**
-  `huesos-lifecycle` `RefAccount` registry, `huesos-proclife` state machine,
-  `ProcessBindExitPort`, `TaskDirectory::retire` drain, bounded graveyard, and
-  32-exit repeated-observation init tests ([PROCESS_LIFECYCLE_REGRESSIONS.md](PROCESS_LIFECYCLE_REGRESSIONS.md)).
-- **Immediate #4 & Short-Term #6 — Wait primitives & handle transfer:**
-  `huesos-waitset` + `Syscall::WaitSetWait`, level-triggered `Signal` objects,
-  and transactional all-or-nothing `huesos-handlemove` handle transfer in
-  `ChannelWrite`.
-- **Medium-Term #8 & #10 — Job quotas & scheduler polish (+ 16-item stabilization):**
-  hierarchical `Job` tree (`JobDefault`/`JobCreate`/`JobSetLimits`/`JobBindQuotaPort`
-  /`ProcessCreateInJob`), panic-free `huesos-sched` EEVDF (`?`-threaded internals),
-  EDF replenish-on-unblock, opt-in token-based Fair task stealing, dedicated
-  non-timer reschedule IPI, and deferred quota-exhaustion packets.
-- **Locking & static safety gates:** type-enforced `IrqSafeMutex<T>` across
-  `huesos-object` + `tools/check-huesos-object-lock-policy.py`, `hues-async`
-  alloc-free CI gate, ranked privileged locks, sealed typed syscall allowlists,
-  and zero runtime `unwrap`/`expect`/`panic` policy (`safety-budget.json`).
-
-### Userspace Platform, Terminal, Input & Storage Foundation (Short-Term #7 foundation)
-- **Userspace drivers, terminal & shutdown (PR-C…PR-G):** manifest-driven
-  `Resource` capability grants (`IoPort`/`Mmio`/`Irq`/`PowerControl`), full
-  migration of PS/2 input to event-driven `driver-host-input`, deletion of
-  `huesos-arch::x86_64::keyboard`, userspace `shutdown-broker` + `Syscall::HardHalt`,
-  Cozette 6×13 TTY font + buffered 16 MiB shadow terminal renderer, monotonic
-  Snake, and Freedoom/DoomGeneric port.
-- **NVMe & HxFS v7 foundation (Stages A–F foundation):** `driver-host-nvme`
-  (64 MiB boot DMA pool, MSI-X→MSI→polling, per-CPU queues, async BlockDevice
-  Channel+Port, VolumeManager), read-only BlobFS & DevFS handle namespace, and
-  `hxfs-service` / `huesos-hxfs` v7 COW + encrypted/compressed pipeline +
-  journaled crash-consistency harness (`scripts/ci-qemu-powerfail.sh`).
-
----
-
-## Explicitly Out of Scope for the Original MVP
-
-Tracked for historical context from the initial MVP boundary:
-
-- ~~SMP / IOAPIC routing~~ → SMP core and generic IOAPIC route manager landed;
-  userspace raw-GSI validation and ACPI `_PRT` integration continue under
-  PCI/ACPI AP-18+.
-- ~~Any filesystem on real block devices~~ → `driver-host-nvme` + HxFS v7
-  foundation landed; storage production gate closure tracked in §2 above.
-- Networking → tracked in §3 above.
-- ~~Full process teardown / wait~~ → closed under Immediate #3/#4 and
-  Short-Term #5.
+- **AP-0…AP-23 — Ring-3 ACPI & Userspace PCI Manager (PRs #240–#262, #283, #288):**
+  immutable ACPI archive v2, isolated Ring-3 `uacpi-runtime` (`HMCF`, `HPCI` v2
+  `_SEG`/`_BBN`/`_CRS`/`_PRT`/`_OSC`, `HIOM` v1 `DMAR`/`IVRS`), `PciConfigMint`
+  RO→RW ECAM + `B.4` write policy, live Type-0/Type-1 BAR & 64-bit bridge window
+  sizing/planning with rollback and hotplug reserves, kernel `DeviceLease` +
+  `PORT_PACKET_DEVICE_GONE`, MSI-X/MSI/INTx + `DmaPoolGrant` binding for NVMe /
+  VirtIO-Net / `rtw88`, deletion of kernel PCI bootstrap scan, zero-bus-traffic
+  `HPIN` v1 inventory (`pci -v`), and `HotplugCoordinator` / `Rebalance` /
+  `QuiesceRemap` engines.
+- **Scheduler v2 & SMP v2 (PRs #280, #281, #287):** `MAX_CPUS = 256`,
+  `MAX_TASKS = 8192`, single-writer per-CPU runqueues + bitmap `TaskInbox`,
+  two-level `Job`→`Thread` EEVDF (`O(1)` rollover, `yield_now()` forfeiture) +
+  CBS reservations over `TscClock`, `x2APIC`/`xAPIC` 32-bit APIC IDs, CPUID
+  `0x1F`/`0x0B` topology, AP `IA32_PAT` sync (`WC`), `XSAVE`/`FXSAVE`, 16 KiB
+  guard-paged `NX` stacks, per-`CR3` targeted TLB shootdowns, `TSC-deadline`
+  timer, and futexes.
+- **Networking, 802.11 WPA2-CCMP & TLS 1.3 (PRs #282–#286):** `huesos-net`,
+  `net-service`, `huesos-ieee80211`, `huesos-wpa`, `huesos-rtw88`, `wlan-service`,
+  `huesos-tls`, and `netctl`/`wlanctl`/`ping`/`curl`.
+- **Dynamic ELF64 & Native Win64 PE32+ (PRs #263, #264, #282, #283):**
+  `/lib/ld-huesos.so` (`BIND_NOW`, `RELRO`, TLS, `canvas_dlopen_*`, `libcanvas.so`)
+  and `huesos-pe` + `/lib/ld-pe.so` + native `ntdll`/`kernel32`/`ucrtbase`/
+  `msvcrt`/`ws2_32`/`bcrypt`/`advapi32` DLLs with `GS_BASE` `SwapGsGuard` and SEH
+  virtual unwind.
+- **`HxFS v7`, `huesos-std`, Scripting `hsh` & Truecolor TUIs (PRs #265–#281):**
+  `HxFS v7` symlinks/snapshots/`StatFs`/random-offset RMW/`truncate`, Scudo-backed
+  `huesos-std`, Fish-UX scripting `hsh` with N-stage streaming pipes, job
+  control/`Ctrl-C` (`ProcessTerminate`), `@caps` attenuation, 45 `coreutils`, and
+  full-screen truecolor `btop` and `fdisk`/`cfdisk` TUI studios.

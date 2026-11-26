@@ -80,9 +80,9 @@ impl Handle {
     /// only in the initial process by the kernel (AP-8).
     ///
     /// init transfers it (never duplicates it) to DriverManager, which
-    /// is the only component allowed to mint generation-bound,
-    /// read-only PCI configuration capabilities; see
-    /// `docs/ACPI_PCI_IMPLEMENTATION_PLAN.md` AP-9.
+    /// is the only component allowed to mint generation-bound PCI
+    /// configuration capabilities; see `docs/PCI_MANAGER_ARCHITECTURE.md`
+    /// and `docs/PCI_PRODUCTION_ROADMAP.md` (Stages C.1/H.1).
     pub fn take_init_config_mint() -> Self {
         Self::take_fixed_init_handle(huesos_abi::INIT_CONFIG_MINT_HANDLE)
     }

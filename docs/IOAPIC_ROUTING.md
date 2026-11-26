@@ -11,10 +11,11 @@ userspace keyboard Port. A separate QEMU edu kernel-Port probe covers raw GSI
 and level ACK/re-enable (see below); the corresponding userspace syscall path
 and physical verification remain pending.
 
-The implementation supports Immediate #2 in [ROADMAP.md](ROADMAP.md), while
-retaining the 8259 as a boot-time fallback. It does not add interrupt
-remapping, x2APIC destinations wider than the I/O APIC's 8-bit destination
-field, or ACPI `_PRT`/link-device enumeration.
+The implementation supports the kernel GSI routing boundary, while retaining
+the 8259 as a boot-time fallback. `huesos-ioapic` itself does not add IOMMU
+interrupt remapping or destinations wider than the hardware I/O APIC's 8-bit
+physical destination field; ACPI `_PRT` evaluation is performed in Ring 3 by
+`acpi-manager` and consumed by `pci-manager` ([ACPI_RING3.md](ACPI_RING3.md)).
 
 ## Policy crate
 

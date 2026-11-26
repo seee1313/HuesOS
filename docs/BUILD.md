@@ -87,12 +87,14 @@ make build
 make build PROFILE=release
 ```
 
-Under the hood, `huesos-kernel`'s `build.rs` invokes a **separate** `cargo
-build` for `crates/huesos-userspace/init` (it targets ring3 userspace with
-a different linker script/load address than the kernel) and embeds the
-resulting ELF binary into the kernel image via `include_bytes!`. This means
-the very first `cargo build` will look like it's compiling two independent
-projects — that's expected.
+Under the hood, `huesos-kernel`'s `build.rs` compiles the Ring-3 supervisor,
+service, driver, dynamic-linker (`ld-huesos`, `ld-pe`), Win64 PE32+ system DLL
+(`win64-runtime`), `hsh`, and `coreutils` crates against their dedicated
+userspace targets (`x86_64-huesos-userspace`, `x86_64-huesos-userspace-dyn`,
+`x86_64-huesos-pe64`) and packages them into the HBI v2.2 `BOOTFS` image
+([BOOTFS.md](BOOTFS.md)). Production `make iso-release` omits `boot-selftest`
+probes and silences verbose UART trace, whereas CI smoke targets build with
+selftest assertions enabled.
 
 To place host and embedded userspace artifacts under one custom root, set an
 absolute `CARGO_TARGET_DIR`; the nested standalone Cargo invocations use the
@@ -152,9 +154,10 @@ qemu-system-x86_64 -machine q35 -cpu qemu64 -smp 1 -m 512M \
    of=/dev/sdX bs=4M status=progress`), or
 2. Copy the ISO's `EFI/BOOT/BOOTX64.EFI` + `boot/` tree onto a FAT32 ESP.
 
-HuesOS itself makes no BIOS/legacy assumptions, but real hardware obviously
-carries more risk than QEMU — expect to debug driver gaps (this MVP only
-has a PS/2 keyboard, serial, and PIT).
+HuesOS makes no BIOS/legacy assumptions (`BOOTX64.EFI` UEFI only). On a new
+physical machine, boot first with `STORAGE_OFF=1` (see [OPERATIONS.md](OPERATIONS.md)
+and [HARDWARE.md](HARDWARE.md)) before exercising NVMe/`HxFS` writes on
+disposable media.
 
 ## Troubleshooting
 

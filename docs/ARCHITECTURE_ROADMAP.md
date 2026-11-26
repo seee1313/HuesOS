@@ -6,29 +6,22 @@ we do not lose the shape of the target while shipping incremental PRs against
 it. Every PR chain listed under "Immediate cascade" below should visibly move
 toward the endpoint described here.
 
-Status: **planning document, not implemented**. Individual sections cross-link
-to concrete work items in `ROADMAP.md` §7 and the Immediate list.
+Status: **long-term direction; Resource/Job/Supervisor/ACPI/PCI foundations (`§2`–`§5`) are implemented, while declarative HML/HIDL compilation (`§1`) remains future target design**. See [STATUS.md](STATUS.md) and [ROADMAP.md](ROADMAP.md) for current implementation boundaries.
 
-The **production-readiness push** that is currently in flight is tracked in
+The **production-readiness push** is tracked in
 [`PRODUCTION_ROADMAP.md`](PRODUCTION_ROADMAP.md), which organises the
-remaining work into Stages A through F (mount path wired, I/O pipeline
-complete, reliability surface, security gate, operations, service
-foundation). That document is the live to-do; this one is the long-term
-direction. The two coexist because they answer different questions:
-*this* document says **what the system is**; *that* document says
-**what still has to ship to make the system deployable**.
+storage/platform gates into Stages A through F and Stage Z
+([STORAGE_PRODUCTION_GATE.md](STORAGE_PRODUCTION_GATE.md)).
 
-The PCI/PCIe subsystem now has its own approved normative architecture and
-production delivery plan:
+The PCI/PCIe and Ring-3 ACPI subsystems have their own normative architecture
+and production roadmaps:
 [PCI_MANAGER_ARCHITECTURE.md](PCI_MANAGER_ARCHITECTURE.md) defines the
-userspace PCI Manager, configuration authority, DeviceLease, DMA, hotplug, and
+userspace PCI Manager, configuration authority, `DeviceLease`, DMA, hotplug, and
 rebalance model; [ACPI_RING3.md](ACPI_RING3.md) defines the isolated firmware
-runtime and ACPI→PCI authority boundary;
+runtime and ACPI→PCI authority boundary; and
 [PCI_PRODUCTION_ROADMAP.md](PCI_PRODUCTION_ROADMAP.md) defines the staged
-release gates; and
-[ACPI_PCI_IMPLEMENTATION_PLAN.md](ACPI_PCI_IMPLEMENTATION_PLAN.md) is the
-ordered owner/agent PR plan. Those documents supersede any older PCI/ACPI
-sketch in this general roadmap.
+release gates (`AP-0..AP-23` merged on `main`). Those documents supersede any
+older PCI/ACPI sketch in this general roadmap.
 
 ---
 

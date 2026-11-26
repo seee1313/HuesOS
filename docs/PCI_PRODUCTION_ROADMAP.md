@@ -6,8 +6,7 @@
 - **Architecture:**
   [PCI_MANAGER_ARCHITECTURE.md](PCI_MANAGER_ARCHITECTURE.md) and
   [ACPI_RING3.md](ACPI_RING3.md)
-- **Execution plan:**
-  [ACPI_PCI_IMPLEMENTATION_PLAN.md](ACPI_PCI_IMPLEMENTATION_PLAN.md)
+- **Status overview:** [STATUS.md](STATUS.md)
 
 This roadmap turns the approved HuesOS userspace PCI Manager architecture into
 small, reviewable delivery stages. It is intentionally stricter than a feature
@@ -128,7 +127,7 @@ outside its granted buffers.
 
 # Stage A — Architecture and contracts
 
-Status: **IN PROGRESS**
+Status: **DONE (AP-0, AP-22, AP-23)**
 
 ## A.1 Normative architecture
 
@@ -136,7 +135,7 @@ Deliver:
 
 - `docs/PCI_MANAGER_ARCHITECTURE.md`;
 - `docs/ACPI_RING3.md`;
-- `docs/ACPI_PCI_IMPLEMENTATION_PLAN.md`;
+- `docs/PCI_PRODUCTION_ROADMAP.md`;
 - authority and trust boundaries;
 - config backend semantics;
 - address vs identity model;
@@ -935,37 +934,14 @@ PCI production-ready remains false while any of these are true:
 
 ---
 
-## 5. Immediate next PR sequence
+## 5. Completed `AP-0..AP-23` bring-up cascade
 
-PCI-1 through PCI-9 are merged policy/bootstrap foundations. The next
-implementation cascade is the AP series defined in full, including branch,
-owner/agent, merge, rollback, and verification rules, in
-[ACPI_PCI_IMPLEMENTATION_PLAN.md](ACPI_PCI_IMPLEMENTATION_PLAN.md).
-
-```text
-AP-0   ACPI/PCI authority documentation reconciliation (this docs batch)
-AP-1   ACPI archive-v2 ABI and complete translation policy
-AP-2   sealed kernel RSDP-complete snapshot producer
-AP-3   isolated full userspace uACPI build with denied callbacks
-AP-4   bounded userspace allocation/time/synchronization primitives
-AP-5   archive-only uACPI table mapping
-AP-6   generation-safe ACPI Manager supervision and last-good freeze state
-AP-7   HMCF ABI and MCFG producer
-AP-8   dynamic snapshot-bound config capability mint
-AP-9   DriverManager → PCI Manager HMCF/authority handoff
-AP-10  dedicated mediated AML PCI reads; writes denied
-AP-11  approved SystemIO/SystemMemory OperationRegion mediation
-AP-12  IRQ/deferred-work lifecycle and teardown
-AP-13  isolated full AML namespace load
-AP-14  bounded namespace initialization and _PIC
-AP-15  _SEG/_BBN/_CRS HPCI producer and consistency validation
-AP-16  diagnostic read-only/unbound PCI inventory
-```
-
-AP-11 is blocked on the explicit SystemMemory/SystemIO grant-derivation
-architecture checkpoint. Config writes remain blocked on B.4 and are not part
-of AP-1 through AP-16. No kernel bootstrap code is removed before Stage J
-closes.
+`PCI-1` through `PCI-9` and the complete `AP-0..AP-23` Ring-3 ACPI → PCI
+Manager implementation series are merged on `main` (through PR #288). The
+remaining open work before `PCI production-ready = true` consists strictly of
+`Stage N.2` (kernel VT-d/AMD-Vi second-stage DMA domains), `Stage M.2` (first
+live `QuiesceRemap` DriverHost), live runtime Root Port hotplug wiring (`K.2`),
+and `Stage O` (long-haul and multi-platform bare-metal qualification).
 
 ---
 

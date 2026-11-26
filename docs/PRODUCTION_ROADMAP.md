@@ -27,7 +27,9 @@ errors must not panic.
 
 - Server / multi-tenant workloads
 - Container orchestration / process migration
-- Networking stack beyond the local kernel control plane
+- Networking stack qualification (userspace TCP/IP, 802.11 WPA2, and TLS 1.3
+  are documented separately in [NETWORKING.md](NETWORKING.md) and are outside
+  this storage production gate)
 - Graphical compositor / desktop environment beyond the existing
   framebuffer text terminal
 - Symmetric multi-core scalability beyond what the existing SMP
