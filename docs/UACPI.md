@@ -1,15 +1,13 @@
 # uACPI integration
 
-- **Status:** kernel barebones/archive-v2 bootstrap implemented; AP-4/AP-5
-  runtime mechanisms on main with the plan's required host tests (timeout trio,
-  recursion, event saturation/teardown, overflow, allocation-failure points,
-  synthetic RSDP→FACS graph, page-boundary, translator fuzz; decoder ASan fuzz
-  for the v2 wire format); AP-6 generation-safe supervision on main with QEMU
-  Q35/OVMF SMP2 restart-cascade and restart-budget gates; Ring-3 AML execution
-  not implemented
+- **Status:** implemented and active on `main` — kernel barebones/archive-v2
+  bootstrap (`huesos-uacpi`) plus isolated Ring-3 full AML runtime
+  (`uacpi-runtime` inside `acpi-manager`, `AP-1..AP-18` & `AP-23`) publishing
+  `HMCF`, `HPCI` v2 (`_SEG`/`_BBN`/`_CRS`/`_PRT`/`_OSC`), and `HIOM` v1
+  (`DMAR`/`IVRS`), verified by host ASan/UBSan suites and QEMU Q35 restart /
+  PCI-mediation gates
 - **Architecture:** [ACPI_RING3.md](ACPI_RING3.md)
-- **Delivery plan:**
-  [ACPI_PCI_IMPLEMENTATION_PLAN.md](ACPI_PCI_IMPLEMENTATION_PLAN.md)
+- **Production roadmap:** [PCI_PRODUCTION_ROADMAP.md](PCI_PRODUCTION_ROADMAP.md)
 
 ## 1. Decision and pinned source
 
@@ -276,10 +274,10 @@ a dedicated review with machine-readable budget updates where applicable.
 
 ---
 
-## 10. Delivery plan
+## 10. Production qualification
 
-The full sequence, PR boundaries, owner/agent responsibilities, merge order,
-and verification commands are maintained in
-[ACPI_PCI_IMPLEMENTATION_PLAN.md](ACPI_PCI_IMPLEMENTATION_PLAN.md). No
-implementation PR may skip its architecture checkpoint by adding a permissive
-stub or temporary raw hardware grant.
+The `AP-0..AP-23` bring-up cascade is merged on `main`. Remaining hardware
+qualification gates (`Stage O`) are tracked in
+[PCI_PRODUCTION_ROADMAP.md](PCI_PRODUCTION_ROADMAP.md). No future change may
+weaken the broker or snapshot-binding boundaries by adding a permissive stub or
+raw hardware grant.

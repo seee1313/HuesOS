@@ -3,8 +3,8 @@
 //! `HMCF` is the bounded, pointer-free, versioned wire contract between the
 //! producer of ECAM configuration windows (`acpi-manager`, which interprets
 //! the archived `MCFG` table) and the holder of the configuration-mint
-//! authority (DriverManager) and, later, the dynamic kernel mint request
-//! (see `docs/ACPI_PCI_IMPLEMENTATION_PLAN.md`, AP-7/AP-8).
+//! authority (DriverManager) and the dynamic kernel mint request
+//! (see `docs/ACPI_RING3.md` and `docs/PCI_PRODUCTION_ROADMAP.md`, Stage C.1).
 //!
 //! ## What this format is
 //!

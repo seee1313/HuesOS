@@ -3,262 +3,170 @@
 ## Overview
 
 For the reviewed implementation/evidence snapshot and document authority, see
-[STATUS.md](STATUS.md). Production Scheduler/SMP v2 documents describe targets;
-only boundaries stated as current below should be attributed to this runtime.
+[STATUS.md](STATUS.md).
 
-HuesOS is a **microkernel** for x86_64, inspired by Google Zircon (Fuchsia).
-It boots exclusively via **UEFI**, loaded directly by the **Limine**
-bootloader as a higher-half ELF64 executable (not a legacy multiboot image,
-and not a standalone UEFI PE application — Limine handles all firmware
-interaction and hands off a fully set up long-mode environment).
+HuesOS is a capability-based **microkernel** for `x86_64`, inspired by Google
+Zircon (Fuchsia). It boots exclusively via **UEFI**, loaded by **Limine** (base
+revision 3) as a higher-half ELF64 executable (`0xffffffff80000000`+) alongside
+an Ed25519-signed **HBI v2.2** boot image module.
 
 ## Design Principles
 
-1. **Minimal Kernel** — Drivers, filesystems, and network stack are meant to
-   live in userspace. Bootstrap keyboard/serial/timer, IRQ mediation and the
-   capability-gated framebuffer/panic drawing path remain in kernel today.
-2. **Capability-Based Security** — Resources are accessed through handles
-   with rights (`huesos-object::Rights`).
-3. **Message-Passing IPC** — Channels are the primary IPC primitive.
-4. **Real ring3 userspace** — Processes genuinely run at CPL=3 with their own
-   page tables and reach the kernel exclusively via the `syscall`
-   instruction.
-5. **One sanctioned syscall entry point in userspace** — application code
-   never issues `syscall` itself; it goes through `libcanvas`. See
-   [docs/USERSPACE.md](USERSPACE.md).
-6. **SMP-aware from the kernel up** — every CPU has its own GDT/TSS,
-   scheduler, and syscall MSRs; work is only placed on online CPUs.
+1. **Minimal Kernel** — Firmware AML execution (`acpi-manager`), PCI/PCIe
+   enumeration and BAR/IRQ allocation (`pci-manager`), storage (`driver-host-nvme`,
+   `hxfs-service`, `key-broker`), networking (`net-service`, `wlan-service`),
+   dynamic linkers (`ld-huesos`, `ld-pe`), and the shell (`hsh`) all run in
+   isolated Ring-3 processes. Only memory management, scheduling, IPC, IRQ/GSI
+   routing, capability enforcement, and the bounds-checked framebuffer/panic
+   blitter live in Ring 0.
+2. **Capability-Based Security** — Kernel objects are named only through
+   per-process handles carrying monotonic `Rights`. There is no global kernel
+   VFS or ambient root UID.
+3. **Message-Passing & Shared-VMO IPC** — Processes communicate via `Channel`,
+   `Port`, `Signal`, `WaitSet`, and page-backed `Vmo` handles.
+4. **One Sanctioned Syscall Boundary** — Userspace code never issues raw
+   `syscall` instructions directly; `libcanvas::raw` is the sole audited Ring-3
+   entry point (with `huesos-std` layered safely on top for `/bin` utilities,
+   and `PeHostApi` inside `ld-pe` bridging native Win64 DLLs).
+5. **Policy Crates Forbidding `unsafe`** — Complex decision engines (`huesos-sched`,
+   `huesos-pci`, `huesos-lifecycle`, `huesos-proclife`, `huesos-handlemove`,
+   `huesos-waitset`, `huesos-extable`, `huesos-ioapic`, `huesos-quota`,
+   `huesos-net`, `huesos-tls`, `huesos-ieee80211`, `huesos-wpa`, `huesos-rtw88`,
+   `huesos-pe`, `huesos-hsh`) are standalone `#![no_std]`, `#![forbid(unsafe_code)]`
+   host-tested crates.
 
 ## Crate Structure
 
-The root workspace contains the kernel plus host-testable `no_std` libraries;
-standalone ring-3 binaries have their own target/linker configuration.
-
 ```text
-boot/kernel: huesos-boot, huesos-kernel, huesos-arch, huesos-pmm,
-             huesos-alloc, huesos-object, huesos-syscalls, huesos-abi
-hardware:    huesos-pci, huesos-ioapic, huesos-nvme, huesos-tpm,
-             huesos-uacpi, huesos-hal, huesos-fb
-storage:     huesos-hxfs, huesos-hxfs-proto, huesos-blobfs, huesos-fat
-policy/test: huesos-lifecycle, huesos-proclife, huesos-handlemove,
-             huesos-waitset, huesos-extable, huesos-quota, hues-async,
-             huesos-decoder-fuzz, huesos-scudo-fuzz
-userspace:   libcanvas, init, driver-manager, driver-host-input,
-             driver-host-nvme, hxfs-service, key-broker, acpi-manager,
-             pci-manager, shutdown-broker, terminal, doom, fault-probe
+boot/kernel:   huesos-boot, huesos-kernel, huesos-arch, huesos-hal,
+               huesos-pmm, huesos-alloc, huesos-object, huesos-syscalls,
+               huesos-abi, huesos-sync, huesos-fb, huesos-bootux
+sched/policy:  huesos-sched, huesos-lifecycle, huesos-proclife,
+               huesos-handlemove, huesos-waitset, huesos-extable,
+               huesos-ioapic, huesos-quota, hues-async
+acpi/pci/hw:   huesos-uacpi, huesos-pci, huesos-tpm, huesos-nvme
+storage:       huesos-hxfs, huesos-hxfs-proto, huesos-blobfs,
+               huesos-gpt, huesos-fat
+net/wlan/tls:  huesos-net, huesos-tls, huesos-ieee80211,
+               huesos-wpa, huesos-rtw88
+loaders/shell: huesos-elf, huesos-pe, huesos-scudo, huesos-hsh
+fuzzing:       huesos-decoder-fuzz, huesos-scudo-fuzz
+userspace:     libcanvas, huesos-std, init, driver-manager,
+               acpi-manager, uacpi-runtime, pci-manager,
+               driver-host-input, driver-host-nvme, hxfs-service,
+               key-broker, shutdown-broker, net-service, wlan-service,
+               ld-huesos, ld-pe, win64-runtime, terminal, hsh-bin,
+               coreutils (45 /bin tools), fdisk, doom, fault-probe
 ```
-
-`tools/hbi-gen` builds HBI v2.2 images; `tools/hxfs-migrate` performs explicit
-journaled HxFS v6→v7 migration. Coverage-guided targets live under `fuzz/`.
-
-Policy crates remain independently host-testable. Their documentation now
-states whether each one is a model only or is integrated into a privileged
-runtime path; the existence of a policy crate alone is never treated as
-on-target evidence.
 
 ## Boot Flow
 
-1. **Limine** maps `huesos-boot` into the higher half (`0xffffffff80000000`+),
-   sets up long mode + a stack (1 MiB requested), and jumps to `kmain_entry`.
-   Optional **HBI** image is loaded as a Limine module.
-2. `kmain_entry` validates base revision **3**, reads HHDM offset, memory
-   map (including raw `kind` types), framebuffer, RSDP, and HBI module.
-3. `huesos_arch::init_early()`: serial, `EFER.NXE`, BSP GDT/TSS, IDT,
-   `CpuLocal` + `GS_BASE`.
-4. PMM init from the memory map; **HBI physical range reserved**.
-5. Paging init over Limine's tables via the HHDM.
-6. **`map_firmware_tables`**: map ACPI reclaimable/NVS/table regions (and a
-   window around the RSDP) into the HHDM — base rev 3 does *not* map these
-   by default. General RESERVED is intentionally **not** bulk-mapped (would
-   WB-map LAPIC/MMIO).
-7. Heap init (64 MiB buddy+slab at `0xffff_ff00_0000_0000`).
-8. Object subsystem init; phys-to-virt + CPU-id callbacks.
-9. **SMP bring-up** (if RSDP/MADT present):
-   - Program LAPIC base (HHDM + **NO_CACHE**); calibrate timer once on BSP.
-   - INIT-SIPI-SIPI; AP trampoline at phys `0x8000` with identity+HHDM maps
-     for low memory; AP sets stack, enables LME|NXE, jumps to `ap_entry`.
-   - APs: per-CPU GDT/TSS, IDT load, **syscall MSR init**, scheduler init,
-     signal ready, wait on `APS_MAY_RUN`.
-10. Parse HBI (if present); framebuffer / HAL / **syscall_init** (BSP MSRs +
-    global handler); **BSP scheduler::init** (marks CPU online).
-11. `init_late`: PIC setup, LAPIC timer start (shared calibrated count), STI.
-12. **`smp::release_aps`**: APs start their LAPIC timers, STI, HLT idle.
-13. Spawn `huesos-init`; BSP and APs idle on `hlt` while timer IRQs drive
-    per-CPU scheduling.
+1. **Limine** maps `huesos-boot` into the higher half, sets up long mode, and
+   enters `kmain_entry` with the memory map, framebuffer, RSDP, and HBI v2.2
+   module.
+2. `huesos_arch::init_early()` initializes serial diagnostics, `EFER.NXE`, BSP
+   GDT/TSS, IDT, `CpuLocal` (`GS_BASE`), SMEP/SMAP/UMIP, and `XSAVE`/`FXSAVE`
+   SIMD state.
+3. `huesos-pmm` initializes the physical frame bitmap and reserves the HBI
+   module, kernel image, and page tables.
+4. Explicit HHDM mappings are installed for ACPI reclaimable/NVS/RSDP tables and
+   uncached/NX LAPIC/IOAPIC MMIO (Limine base revision 3 does not map reserved or
+   ACPI ranges into the HHDM).
+5. `huesos-alloc` initializes the 64 MiB buddy + slab kernel heap;
+   `huesos-object` initializes the KOID/handle/object registries.
+6. **SMP v2 bring-up** ([SMP_V2.md](SMP_V2.md)): parses CPUID `0x1F`/`0x0B`
+   topology and uACPI barebones MADT (`xAPIC` and `x2APIC` 32-bit APIC IDs),
+   allocates permanent 16 KiB unmapped-guard-paged `NX` stacks (`PML4[509]`
+   arena), boots APs via phys `0x8000`, syncs BSP `IA32_PAT` (`WC` framebuffer
+   parity), initializes per-CPU GDT/TSS/IDT/`STAR`/`LSTAR`/`SFMASK`/SIMD/scheduler,
+   and gates AP execution on `APS_MAY_RUN`.
+7. Verifies the HBI v2.2 Ed25519 signature, builds the immutable ACPI archive v2,
+   creates `init`'s bootstrap handles (`BOOTFS` VMO, `FrameDraw`, `SystemControl`,
+   `AcpiBroker`, `PciConfigMint`, `DeviceLeaseAuthority`, `VolumeKey`), releases
+   APs, and enters Ring 3 `huesos-init`.
+8. **`init` → `driver-manager` cascade**:
+   - `driver-manager` supervises `acpi-manager` (`HMCF`, `HPCI` v2, `HIOM` v1),
+     `pci-manager` (sole PCI config executor + `HPIN` v1 inventory), `key-broker`,
+     `driver-host-input`, `driver-host-nvme`, `hxfs-service`, `net-service`, and
+     `wlan-service`.
+   - `init` launches `shutdown-broker` and `/bin/terminal.elf`, which spawns
+     `/bin/hsh.elf` ([SHELL_AND_STD.md](SHELL_AND_STD.md)).
 
-## SMP Model
+## SMP v2 & Scheduler v2
 
-| Piece | Location / notes |
-|-------|------------------|
-| CpuLocal | `huesos-arch::cpu_local`, GS_BASE |
-| Per-CPU GDT/TSS | `PerCpuGdt` (APs); BSP uses static GDT early |
-| Per-CPU scheduler | `PER_CPU_SCHEDULERS[dense_cpu_index]`, spinlock |
-| Online mask | `ONLINE_CPUS` — dense CPU-index bits; LAPIC IDs are resolved only when sending IPIs |
-| Run queues | Strict per-CPU queues; no global load average and no automatic balancing |
-| Affinity | Processes carry a default home CPU; new threads are pinned there unless userspace changes affinity before start |
-| Token passing | Remote runqueue mutation must acquire the target CPU's explicit runqueue token; local enqueue/dequeue needs no token |
-| Timer | LAPIC periodic vector `0x20`; EOI LAPIC (+ PIC for legacy) |
-| IPI | `ipi_reschedule` wakes remote idle CPUs after explicit token-mediated placement/wake |
-| Syscall | STAR/LSTAR/SFMASK **per CPU** |
+Specified and tracked in [SCHEDULER_V2.md](SCHEDULER_V2.md) and
+[SMP_V2.md](SMP_V2.md):
 
-### Limine base revision 3 mapping rules (important)
+- **Capacities & identity:** up to `MAX_CPUS = 256` dense CPU indices (mapped to
+  32-bit hardware APIC IDs) and `MAX_TASKS = 8192` generation-tagged `TaskId`
+  slots (`TaskSlotAllocator` + `TaskDirectory`).
+- **Single-writer runqueues:** only the owner CPU mutates its `Scheduler`;
+  cross-CPU wake, kill, policy, spawn, and reap operations publish into the
+  target CPU's two-level atomic bitmap `TaskInbox` and send a directed
+  reschedule IPI when needed.
+- **Policies:** two-level request-based **EEVDF** (`Job` tree → per-Job `Thread`
+  tree, `O(1)` virtual-time rollover, `yield_now()` slice forfeiture) preempted
+  by admission-controlled **CBS** (`Deadline`) reservations charged in
+  nanoseconds from `TscClock`.
+- **Placement & TLB:** topology-aware spawn placement and idle pull (preferring
+  completely idle physical cores before busy SMT siblings), plus per-`CR3`
+  active-CPU tracking for targeted TLB shootdowns (`shootdown_range_for_cr3`).
 
-For base revision ≥ 3, HHDM covers only certain memmap types (usable,
-bootloader-reclaimable, executable+modules, framebuffer) — **not** general
-reserved/ACPI/MMIO — and there is **no** unconditional low 4 GiB identity
-map. The kernel therefore:
+## Kernel Object System
 
-- Maps ACPI-related ranges + RSDP window via `map_hhdm_range`
-- Maps LAPIC/IOAPIC MMIO with `PRESENT|WRITABLE|NO_CACHE|NO_EXECUTE` and
-  propagates mapping/update failures instead of treating them as best-effort
-- Identity-maps the first 64 KiB for the AP trampoline / `ApBootInfo`
+Every kernel resource implements `KernelObject` with a unique 64-bit `Koid` and
+two-counter `RefAccount` lifecycle ([OBJECT_LIFECYCLE.md](OBJECT_LIFECYCLE.md)):
 
-## Memory Model
+| `ObjectType` | Purpose |
+|---|---|
+| `Vmo` | Page-backed Virtual Memory Object (anonymous, physical MMIO, or DMA pool) |
+| `Vmar` | Hierarchical Virtual Memory Address Region with transactional map/split-unmap/protect |
+| `Process` | Isolated PML4 address space, handle table, `ProcessAbi` (`Elf64` / `Pe64`), exit waiters/ports |
+| `Thread` | Execution context (kernel stack, saved GPRs, `XSAVE`/`FXSAVE` buffer, Ring-3 `FS_BASE`/`GS_BASE`) |
+| `Job` | Hierarchical process container with VMO byte, CPU tick, and IPC queue quotas ([QUOTAS.md](QUOTAS.md)) |
+| `Channel` | Bidirectional message-passing pipe (inline fast path for ≤64 B / ≤2 handles; transactional handle move) |
+| `Port` | Asynchronous packet queue for interrupts, process exits, quota alerts, and `PORT_PACKET_DEVICE_GONE` |
+| `Interrupt` | Capability-bound GSI / MSI / MSI-X bridge waking a `Port` |
+| `Signal` | Level-triggered waitable user synchronization object |
+| `Resource` | Ranged (`IoPort`, `Mmio`, `Irq`, `DmaPool`) or binary (`FrameDraw`, `SystemControl`, `VolumeKey`, `PciConfigMint`, `DeviceLeaseAuthority`) authority |
+| `AcpiBroker` | Snapshot-bound Gate B `SystemIO`/`SystemMemory`/IRQ broker for `acpi-manager` ([ACPI_RING3.md](ACPI_RING3.md)) |
+| `DeviceLease` | Generation-checked per-PCI-function authority (`DeviceId`, `LeaseGeneration`) revocable on removal/rebalance ([PCI_MANAGER_ARCHITECTURE.md](PCI_MANAGER_ARCHITECTURE.md)) |
 
-- **Physical Memory**: `huesos-pmm` bitmap; `reserve_range` protects HBI,
-  bitmap storage, etc.
-- **HHDM**: `hhdm_offset + phys` for kernel access where mapped.
-- **Per-process address spaces**: fresh PML4, kernel upper half cloned
-  (indices 256..512).
-- **Kernel heap**: buddy (`huesos-alloc::BuddyAllocator`, stores `page_size`)
-  + slab; exposed as `GlobalAlloc` after `heap_init`.
-- **VMOs**: real 4 KiB physical frames.
+## Syscall Boundary
 
-## HBI (HuesOS Boot Image) v2.2
+Canonical syscall numbers (`..=95`) live in `huesos_abi::Syscall`. Major groups:
 
-On-disk layout (generator: `tools/hbi-gen`, parser:
-`huesos-kernel::boot::hbi`):
+- **Memory & address spaces:** `VmoCreate`, `VmoRead`, `VmoWrite`, `VmoSetSize`,
+  `VmarMap`, `VmarUnmap`, `VmarProtect`, `VmarCreateChild`, `VmarHeapExtend`.
+- **IPC & synchronization:** `ChannelCreate`, `ChannelWrite`, `ChannelRead`,
+  `PortCreate`, `PortQueue`, `PortWait`, `SignalCreate`, `SignalUpdate`,
+  `WaitSetWait`, `FutexWait`, `FutexWake`.
+- **Processes, threads, jobs & ABIs:** `ProcessCreate`, `ProcessCreateInJob`,
+  `ProcessStart`, `ProcessWait`, `ProcessTerminate`, `ProcessBindExitPort`,
+  `ProcessSetAffinityMask256`, `ProcessGetAffinityMask256`, `ProcessSetAbi`,
+  `ThreadCreate`, `ThreadStart`, `ThreadSetGsBase`, `ThreadGetGsBase`,
+  `SchedSetPolicy`, `JobDefault`, `JobCreate`, `JobSetLimits`, `JobBindQuotaPort`.
+- **Hardware & platform capabilities:** `ResourceCreate`, `PciConfigMint`,
+  `DeviceLeaseCreate`, `DeviceLeaseRevoke`, `AcpiBrokerOp`, `InterruptCreate`,
+  `InterruptBind`, `InterruptAck`, `FramebufferInfo`, `FramebufferBlit`.
+- **Observability & clocks:** `ClockGetMonotonic`, `ClockGetMonotonicNs`,
+  `SystemCpuCount`, `SystemSchedStats`, `SystemTaskQuery`, `HandleGetKoid`,
+  `ObserveRead`, `KnobGet`/`KnobSet`, `HardHalt`.
 
-- Global header (`HUESOS_H`, version `0x0002_0002`) and Ed25519 signature
-  verified before module parsing; see [VERIFIED_BOOT_TPM.md](VERIFIED_BOOT_TPM.md)
-- Directory entries (`type_id`, `offset`, `length`, `flags`)
-- Per-module `EntryHeader` (**24 bytes** = 6×`u32`) + payload + 8-byte pad
+Every pointer-bearing syscall validates lower-half bounds and page-table flags
+under the process memory lock and copies via recoverable `.ex_table` routines
+([USER_MEMORY.md](USER_MEMORY.md), [RECOVERABLE_COPIES.md](RECOVERABLE_COPIES.md)).
 
-`hbi-gen` must advance the payload cursor by `size_of::<EntryHeader>()`, not
-a hardcoded 16 — otherwise every module after the first is mis-sliced.
+## Subsystems in Ring 3
 
-## Object System
-
-Every kernel resource is an **object** with a unique `Koid`:
-
-| Type      | Purpose                          |
-|-----------|----------------------------------|
-| Vmo       | Physical memory pages            |
-| Process   | Address space + handle table     |
-| Thread    | Execution context                |
-| Job       | Group of processes (hierarchy)   |
-| Channel   | IPC endpoint (message passing; inline storage for ≤64 B / ≤2 handles) |
-| Port      | Waitset (multiplex waiting)      |
-| Interrupt | Userspace IRQ bridge             |
-
-Objects implement `KernelObject: Any`, live in a global registry, and are
-referenced by **handles** with **rights**.
-
-## Syscalls
-
-Invoked via real `syscall` (not a software interrupt). Canonical numbers
-live in `huesos-abi::Syscall`. Current surface includes VMO/Channel/handle ops, process/thread/VMAR launch,
-exact VMAR map/unmap/protect operations, Port/Interrupt, framebuffer
-info/blit, yield/exit/debug write, and `ProcessTerminate` for a capability-checked
-foreign exit (see [DYNAMIC_PROCESSES.md](DYNAMIC_PROCESSES.md)).
-
-Raw caller pointers are never dereferenced by individual syscall handlers.
-`huesos-syscalls::user_memory` validates ABI bounds plus every active
-page-table level (`PRESENT`, `USER_ACCESSIBLE`, and `WRITABLE` for outputs),
-then performs the only audited raw copies. Typed records use the sealed UserRecord allowlist and zero-padded output
-encoding. Argument records are snapshotted once, and blocking/dequeueing calls preflight outputs before side effects.
-See [USER_MEMORY.md](USER_MEMORY.md) for the complete contract, limits, review
-checklist and the existing lock/extable contract for VMAR unmap/protect.
-
-`ClockGetMonotonic` exposes a hardware-tick clock independent of yields and SMP
-CPU count. `SystemShutdown` is restricted to the init KOID; terminal requests
-it through init-owned IPC rather than receiving global power authority. See
-[SHUTDOWN.md](SHUTDOWN.md).
-
-## Scheduler
-
-Current implementation:
-
-- **Fair**: CFS-like virtual runtime in an ordered tree;
-- **Deadline**: best-effort capacity/period with EDF priority over Fair;
-- preemption from a periodic LAPIC timer;
-- per-CPU scheduler locks and directed reschedule IPI.
-
-The approved production replacement is specified in
-[SCHEDULER_V2.md](SCHEDULER_V2.md) and [SMP_V2.md](SMP_V2.md). It introduces
-request-based EEVDF, Job→Thread fairness, owner-only runqueues, bitmap remote
-operations, CBS/IRQ reservations, full/lazy kernel preemption, automatic
-migration, x2APIC/TSC-deadline, three SMT policies, eager xstate, and
-PCID/INVPCID. These are target properties and must not be attributed to the
-current implementation before their exit gates pass.
-
-## Framebuffer & Graphics
-
-`huesos-fb` owns Limine's framebuffer. Userspace draws into a VMO-backed
-`Canvas` and presents via bounds-checked `FramebufferBlit`. No raw video
-mapping is given to userspace.
-
-## Monotonic Time
-
-Each per-CPU scheduler still tracks local scheduling ticks, but public
-monotonic time is a separate atomic counter advanced only by CPU 0's calibrated
-LAPIC interrupt. Cooperative scheduling operations never update it. This keeps
-time stable under different workloads and prevents an SMP system from running
-clocks N times faster with N CPUs.
-
-## Large Userspace Programs and Doom
-
-The process launcher copies large ELF segments to VMOs in bounded 1 MiB
-transfers. Child page-table construction does not flush the current process TLB
-for each mapping because the child CR3 has never been active. Initial RSP uses
-SysV post-call alignment, and every CPU enables x87/SSE execution for the
-separate GPL DoomGeneric process. See [DOOM.md](DOOM.md).
-
-## Orderly Shutdown
-
-Shutdown is a root-supervisor operation. Terminal sends an IPC request to init;
-the kernel verifies init's recorded KOID, renders the final screen, disables
-both PS/2 interfaces with 8042 commands, broadcasts vector `0xF2`, and halts
-all CPUs permanently. It intentionally performs neither ACPI poweroff nor
-8042 reset. Physical power remains on.
-
-## Fault Containment
-
-The saved CS privilege level determines exception policy. Page faults, GPF,
-invalid opcodes, divide errors, and alignment checks from Ring 3 terminate the
-entire owning process and report a stable negative status through
-`ProcessWait`. Ring 0 exceptions and double faults enter the SMP panic path:
-one CPU emits emergency serial diagnostics and a white-on-red framebuffer
-report, other CPUs receive a panic-stop IPI, and no CPU reboots. See
-[FAULTS_AND_PANIC.md](FAULTS_AND_PANIC.md).
-
-## Security Model
-
-- No global namespaces — capabilities via handles.
-- Rights checked on handle-touching syscalls; handle duplication can only
-  preserve or reduce rights, never add rights absent from the source.
-- VMAR capabilities are scoped to their owner: every VMAR-mutating
-  syscall authorizes against the VMAR's owning process. `VmarMap`
-  allows the owner at any time and, before the owning process's first
-  thread starts, the launcher installing the initial image; after start,
-  a VMAR handle held by any other process is inert. `VmarUnmap`,
-  `VmarProtect`, and `VmarCreateChild` require the caller to own the
-  VMAR outright. This keeps the parent-forwards-child's-root-VMAR
-  bootstrap flow (e.g. driver-manager to acpi-manager) working while a
-  forwarded handle can never install, overlap-block, or re-flag
-  mappings in another running process's address space.
-- W^X on user pages (`NO_EXECUTE` requires `EFER.NXE` on **every** CPU).
-- Syscall user pointers are range-checked and page-table-checked before an
-  audited copy; kernel-half pointers and supervisor-only mappings are rejected.
-- Per-call transfer limits bound attacker-controlled temporary allocations.
-- Jobs own a hierarchical quota tree; VMO memory and scheduler CPU ticks are
-  charged and public Job control syscalls exist. Per-handle and page-table
-  metadata hard limits remain incomplete; see [QUOTAS.md](QUOTAS.md).
-- SMEP/SMAP are enabled through CPUID-gated CR4 updates on every CPU
-  (the QEMU `qemu64` smoke matrix lacks the feature and reports
-  "degraded: SMEP/SMAP unavailable"; the bits are set on supporting
-  hardware).
-- Fault-recoverable user copies are implemented (extable): the ring-0
-  `#PF` path consults the fixup table, and the user-memory bulk-copy
-  and typed-ABI helpers are extable-covered — see
-  `docs/RECOVERABLE_COPIES.md`.
+- **ACPI & PCI/PCIe:** [ACPI_RING3.md](ACPI_RING3.md),
+  [PCI_MANAGER_ARCHITECTURE.md](PCI_MANAGER_ARCHITECTURE.md),
+  [PCI_PRODUCTION_ROADMAP.md](PCI_PRODUCTION_ROADMAP.md).
+- **NVMe & `HxFS v7`:** [NVME.md](NVME.md), [HXFS_DESIGN.md](HXFS_DESIGN.md),
+  [KEY_BROKER.md](KEY_BROKER.md), [STORAGE_PRODUCTION_GATE.md](STORAGE_PRODUCTION_GATE.md).
+- **Networking, 802.11 Wi-Fi & TLS 1.3:** [NETWORKING.md](NETWORKING.md).
+- **Static/Dynamic ELF & Win64 PE32+ Loaders:** [EXECUTABLE_LOADERS.md](EXECUTABLE_LOADERS.md).
+- **Shell (`hsh`), `huesos-std` & Coreutils:** [SHELL_AND_STD.md](SHELL_AND_STD.md).
+- **Framebuffer, Terminal & Games:** [FRAMEBUFFER_POLICY.md](FRAMEBUFFER_POLICY.md),
+  [TERMINAL_RENDERING.md](TERMINAL_RENDERING.md), [SNAKE.md](SNAKE.md),
+  [DOOM.md](DOOM.md), [SHUTDOWN.md](SHUTDOWN.md).

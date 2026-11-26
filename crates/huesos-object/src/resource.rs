@@ -85,7 +85,7 @@ pub enum ResourceKind {
     /// supervised driver stack; `sys_resource_create` cannot mint it, so no
     /// other process can obtain one. It authorizes the snapshot-bound
     /// mint of PCI configuration capabilities described by
-    /// `docs/ACPI_PCI_IMPLEMENTATION_PLAN.md` (AP-8).
+    /// `docs/ACPI_RING3.md` and `docs/PCI_PRODUCTION_ROADMAP.md` (Stage C.1).
     PciConfigMint = 9,
     /// Authority to invoke [`crate::abi::Syscall::DeviceLeaseCreate`] (AP-20).
     /// Binary capability minted once by the kernel at boot for `init` and

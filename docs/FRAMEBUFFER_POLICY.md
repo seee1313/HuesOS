@@ -161,3 +161,14 @@ unknown value reads as `None` from `ResourceKindAbi::from_raw`.
   before the kernel can boot with the wrong handler.
 - `docs/ARCHITECTURE_ROADMAP.md` — this PR is the entry for
   "framebuffer capability" in the capability-primitive roadmap.
+
+## Strided dirty-region blits (`src_stride`)
+
+`FramebufferBlitArgs` includes `src_stride` so a `Canvas` backed by a full-screen
+VMO can present arbitrary dirty sub-rectangles (`present_region`,
+`present_region_at`) without repacking the entire screen. Before touching video
+memory, `sys_framebuffer_blit` validates non-zero dimensions, checked
+`width * bytes_per_pixel`, `src_stride >= row_bytes`, configured stride/transfer
+caps, checked final-row offset inside the source VMO, and `READ` rights. Packed
+full-width stripes take the fast contiguous bulk path; narrower strided
+rectangles gather row-by-row through a bounded 64 KiB kernel scratch buffer.

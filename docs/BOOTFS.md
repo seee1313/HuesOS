@@ -1,89 +1,58 @@
 # BOOTFS
 
-BOOTFS is the first HuesOS filesystem backend. It is a RAM-resident archive
-built at kernel build time and handed to userspace `init`, which then passes it
-as a VMO capability to DriverManager.
+BOOTFS (`HBOOTFS1`) is HuesOS's immutable RAM-resident bootstrap archive. It is
+assembled at build time (`crates/huesos-kernel/build.rs`), packaged as a module
+inside the Ed25519-signed **HBI v2.2** image (`tools/hbi-gen`), validated by the
+kernel at boot, and handed to `init` as a read-only VMO (`INIT_BOOTFS_HANDLE`
+with `READ | DUPLICATE | TRANSFER` rights).
 
-This is intentionally not FAT32 yet. BOOTFS gives the userspace driver stack a
-filesystem-shaped source of manifests, drivers, programs, and shell-visible
-files before we have real block drivers. FAT32 should become another backend
-behind the same FileSystemService protocol later.
+While mutable persistent files live on `HxFS v7` (`hxfs-service` over
+`driver-host-nvme`), `BOOTFS` remains the trusted, block-device-independent
+source of core supervisors, drivers, shared libraries, shell utilities, firmware
+blobs, and root certificates — allowing HuesOS to boot cleanly even with
+`STORAGE_OFF=1` or before an NVMe volume is formatted.
 
-## Goals
+## Archive format (`HBOOTFS1`)
 
-- Keep the kernel out of filesystem parsing.
-- Let DriverManager own a `filesystem` service.
-- Move driver manifests toward files with a dedicated extension.
-- Provide shell-visible `ls`, `cat`, and `stat` commands.
-- Provide a clean stepping stone toward loading DriverHosts from files instead
-  of `include_bytes!`.
-
-## Manifest extension
-
-Driver manifests use the `.hdriver` extension.
-
-Example path:
+All fields are little-endian:
 
 ```text
-/manifests/input-host.hdriver
-```
-
-The MVP manifest is plain ASCII key/value text so it can be parsed in no_std
-userspace without pulling in a complex parser:
-
-```text
-name=input-host
-kind=driver-host
-provides=keyboard
-irq=1
-ioport=0x60:1
-ioport=0x64:1
-elf=/drivers/input-host.elf
-heartbeat=true
-```
-
-## Archive format version 1
-
-All integers are little-endian.
-
-```text
-BootFsHeader
+BootFsHeader (16 bytes)
   magic[8]    = "HBOOTFS1"
   file_count  = u32
   reserved    = u32
 
 BootFsEntry[file_count] (216 bytes)
-  path[192]   = UTF-8 path, NUL-padded
-  offset      = u64, absolute byte offset from start of image
-  len         = u64
+  path[192]   = UTF-8 absolute path, NUL-padded
+  offset      = u64, byte offset from start of image
+  len         = u64, payload length in bytes
   flags       = u32
   reserved    = u32
 
-data bytes
+payload bytes...
 ```
 
-Paths are absolute, slash-separated, and ASCII/UTF-8. Directories are implicit:
-`/drivers/input-host.elf` implies `/drivers`.
+## Current BOOTFS namespace layout
 
-## Initial BOOTFS layout
+- `/services/*` — `acpi-manager.elf`, `pci-manager.elf`, `hxfs-service.elf`,
+  `key-broker.elf`, `shutdown-broker.elf`, `net.elf`, `wlan.elf`
+- `/drivers/*` & `/manifests/*` — `input-host.elf`, `nvme-host.elf`, `.hdriver`
+  bootstrap manifests
+- `/lib/*` — `/lib/ld-huesos.so`, `/lib/libcanvas.so`, `/lib/ld-pe.so`, and
+  native Win64 PE32+ system DLLs (`ntdll.dll`, `kernel32.dll`, `ucrtbase.dll`,
+  `msvcrt.dll`, `ws2_32.dll`, `bcrypt.dll`, `bcryptprimitives.dll`,
+  `advapi32.dll`; see [EXECUTABLE_LOADERS.md](EXECUTABLE_LOADERS.md))
+- `/bin/*` — `terminal.elf`, `hsh.elf`, `fdisk.elf`, `doom.elf`, and the 45
+  `coreutils` binaries (`ls`, `cat`, `grep`, `tar`, `pci`, `acpi`, `btop`,
+  `nano`, `netctl`, `wlanctl`, `ping`, `curl`, ...; see
+  [SHELL_AND_STD.md](SHELL_AND_STD.md))
+- `/firmware/*` — vendor firmware images such as `rtw8821c_fw.bin`
+- `/etc/ssl/certs/ca-certificates.pem` — Mozilla TLS 1.3 root CA bundle
+- `/data/freedoom1.wad` — Freedoom Phase 1 asset streamed via read-only VMO slice
 
-```text
-/welcome.txt
-/manifests/input-host.hdriver
-/drivers/input-host.elf
-/bin/terminal.elf
-```
+## Access model
 
-## Current service protocol
-
-DriverManager exposes a `filesystem` service over a Channel. The initial MVP
-uses line-oriented ASCII requests:
-
-```text
-LIST <path>
-CAT <path>
-STAT <path>
-```
-
-Responses are text intended for early shell/debug use. This will eventually be
-replaced by a typed binary VFS protocol once the service model is stable.
+- `driver-manager` exposes read-only `BOOTFS` directory/file access and library
+  sub-VMOs without copying payloads into per-client heaps.
+- `huesos-std::fs` and `hsh` expose `BOOTFS` seamlessly alongside `HxFS v7` (and
+  allow `@caps(bootfs=none)` attenuation when spawning untrusted children).

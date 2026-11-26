@@ -1,20 +1,18 @@
 # HuesOS PCI/PCIe Manager Architecture
 
-- **Status:** approved target architecture; implementation is incomplete
+- **Status:** implemented on `main` for the `PCI Compatibility Profile` (`AP-0..AP-23`); hardware VT-d/AMD-Vi second-stage DMA domains (`Stage N.2`), live `QuiesceRemap` driver (`Stage M.2`), and bare-metal qualification (`Stage O`) remain open
 - **Audience:** kernel, platform, DriverManager, and DriverHost maintainers
 - **Scope:** x86_64 PCI/PCIe discovery, configuration, resource ownership,
   DMA, interrupts, hotplug, and relocation
 
-This document defines the target PCI/PCIe architecture for HuesOS. It is a
+This document defines the PCI/PCIe architecture for HuesOS. It is a
 normative design document: implementation PRs may refine details, but they must
 not silently change the trust boundaries, ownership model, or lifecycle
 invariants described here.
 
-The staged delivery plan and production exit criteria are tracked separately in
+The staged delivery ledger and production exit criteria are tracked in
 [PCI_PRODUCTION_ROADMAP.md](PCI_PRODUCTION_ROADMAP.md). The firmware/AML trust
-boundary is normative in [ACPI_RING3.md](ACPI_RING3.md), and the shared
-owner/agent PR sequence is maintained in
-[ACPI_PCI_IMPLEMENTATION_PLAN.md](ACPI_PCI_IMPLEMENTATION_PLAN.md).
+boundary is normative in [ACPI_RING3.md](ACPI_RING3.md).
 
 ---
 

@@ -2,133 +2,76 @@
 
 ## Components and licensing
 
-The Doom port is a separate userspace program:
+The Doom port is a separate Ring-3 userspace program (`/bin/doom.elf`):
 
-- Engine: `doomgeneric`, GPL-2.0-only, vendored under
-  `third_party/doomgeneric` with its license.
+- Engine: `doomgeneric`, GPL-2.0-only, vendored under `third_party/doomgeneric`
+  with its upstream license.
 - Game data: Freedoom Phase 1 v0.13.0, BSD 3-Clause, vendored as
-  `third_party/freedoom/freedoom1.wad`.
-- WAD SHA-256:
-  `7323bcc168c5a45ff10749b339960e98314740a734c30d4b9f3337001f9e703d`.
-- HuesOS kernel, ABI, libcanvas, terminal, and other crates retain their
-  existing MIT licensing. The GPL engine remains a distinct process/binary.
+  `third_party/freedoom/freedoom1.wad` (packaged in HBI BOOTFS at
+  `/data/freedoom1.wad`, SHA-256
+  `7323bcc168c5a45ff10749b339960e98314740a734c30d4b9f3337001f9e703d`).
+- HuesOS kernel, ABI, `libcanvas`, `huesos-std`, `terminal`, `hsh`, and other
+  first-party crates retain MIT licensing; the GPL engine remains an isolated
+  executable in `BOOTFS`.
 
 No commercial Doom IWAD is distributed.
 
-## Launch architecture
+## BOOTFS VMO launch architecture
 
-The terminal command is:
+Neither `init` nor `/bin/doom.elf` embeds the 28 MiB Freedoom WAD in `.rodata`:
 
-```text
-doom
-```
+1. `hbi-gen` packages `/bin/doom.elf` and `/data/freedoom1.wad` once inside the
+   HBI `BOOTFS` module.
+2. At boot the kernel copies `BOOTFS` into one immutable VMO (`READ | DUPLICATE | TRANSFER`)
+   shared by `init` and `driver-manager`.
+3. When the user runs `doom`, `terminal` transfers a duplicate of its keyboard
+   `Channel` to `init` (`system:launch-doom`) and parks until `doom:exited`.
+4. `init` locates `/bin/doom.elf` and `/data/freedoom1.wad` in the bounded
+   `BOOTFS` directory, spawns `/bin/doom.elf` via `spawn_elf_from_vmo` (with
+   strict entry-bounds and W^X segment checks), and transfers a read-only
+   duplicate of the `BOOTFS` VMO plus the validated `(wad_offset, wad_len)`
+   slice.
+5. Doom's narrow C FFI streams WAD ranges out of that read-only VMO without
+   holding write, map, or ambient filesystem authority. If `BOOTFS` lacks Doom or
+   the WAD, `init` returns `doom:error` cleanly without panicking.
 
-Terminal duplicates its keyboard service Channel and transfers it to init with
-`system:launch-doom`. Init owns the embedded Doom ELF, creates the process,
-maps its segments in bounded 1 MiB VMO transfers, starts its initial thread,
-and forwards the keyboard handle through the child bootstrap channel.
+## Freestanding C shim
 
-Terminal then blocks on its supervisor channel so it neither consumes Doom
-keyboard events nor overwrites Doom frames. Init retains the process handle and
-polls `ProcessGetExitCode`; when Doom exits normally (or through the Q safety
-shortcut), init sends `doom:exited` and terminal redraws its prompt.
+DoomGeneric is C, compiled against a minimal non-POSIX compatibility layer:
 
-## Freestanding libc compatibility layer
+- userspace heap (`malloc`, `calloc`, `realloc`, `free`);
+- string/memory/printf/math (`atan`, `fabs`) helpers;
+- read-only VMO-backed `FILE` stream for `/data/freedoom1.wad`;
+- monotonic millisecond timing via `ClockGetMonotonic` / `ClockGetMonotonicNs`.
 
-DoomGeneric is C, but HuesOS does not emulate Linux or claim POSIX compliance.
-The port provides a small purpose-built compatibility layer containing only
-what this engine needs:
+## Adaptive viewport and write-combining (`WC`) video
 
-- fixed userspace heap (`malloc`, `calloc`, `realloc`, `free`);
-- memory and string routines;
-- bounded printf-family formatting;
-- in-memory `FILE` implementation for the embedded WAD;
-- minimal configuration/save sinks;
-- `atan`, `fabs`, integer parsers, assertions, and process exit.
+DoomGeneric renders internally at 640×400 (16:10). Rather than stretching across
+ultra-high-resolution panels and copying millions of pixels per frame, the
+adapter:
 
-The WAD reader calls into Rust and reads the compile-time Freedoom byte slice.
-There are no host file descriptors or Linux syscalls.
+- preserves 16:10 aspect ratio, capping the game viewport at **960×600** centered
+  on the physical display (and scaling down cleanly on smaller modes such as
+  800×600 → 800×500);
+- clears the outer border once and uploads/presents only the bounded game canvas
+  on subsequent frames.
 
-## Video
+During SMP bring-up ([SMP_V2.md](SMP_V2.md)), every AP clones the BSP's
+`IA32_PAT` (`MSR 0x277`) so write-combining (`WC`) framebuffer pages maintain
+full throughput regardless of which CPU core schedules Doom.
 
-DoomGeneric produces a 640×400 packed 32-bit buffer. The HuesOS adapter scales
-it with nearest-neighbor sampling to the complete physical framebuffer, so
-laptop-native modes no longer show a small centered window. A reusable 1 MiB
-staging buffer groups many destination rows into each bounded VMO write; the
-adapter does not issue one syscall per scanline. Timing uses
-`ClockGetMonotonic`; no POSIX clocks are involved.
-
-Large child address spaces are created without flushing the current process TLB
-for every page. A fresh child CR3 cannot have stale entries, and eliminating
-those redundant flushes makes Doom startup practical.
-
-## Input
-
-The first port maps:
+## Input, SIMD, and stack ABI
 
 | HuesOS key | Doom action |
 |---|---|
-| W/A/S/D | Arrow movement/turning |
+| W / A / S / D or Arrows | Movement / turning |
 | F | Fire |
-| E | Use/open |
-| Enter | Confirm |
-| Escape | Menu |
-| Q | Immediate safe return to terminal |
+| E | Use / open |
+| Enter / Escape | Confirm / Menu |
+| Q | Immediate clean exit back to `terminal` |
 
-The keyboard service now publishes unified three-byte events containing the
-logical key plus an explicit pressed/released flag. It handles Shift,
-CapsLock, and the common Set-1 extended arrow scancodes, encoding arrows as
-non-printable logical key bytes so the terminal line editor ignores them while
-games can opt in. Doom forwards those real make/break transitions to
-`DG_GetKey`, so held movement and simultaneous game tics no longer depend on
-guessed release delays. Terminal and Snake ignore release events while retaining
-backward compatibility with the old text event format.
-
-## SIMD and stack ABI
-
-Doom's C compiler uses the x86_64 SysV SSE ABI. HuesOS now enables CR0.MP and
-CR4.OSFXSR/OSXMMEXCPT on every logical CPU. Initial userspace RSP is aligned as
-a SysV function entry (`RSP % 16 == 8`), which is required by aligned XMM stack
-moves.
-
-Kernel Rust remains soft-float and does not touch SIMD registers. The current
-scheduler pins userspace launch work to one CPU, so the single Doom SIMD task
-retains state across switches. Full lazy/eager FXSAVE/FXRSTOR ownership is a
-required follow-up before multiple independent SIMD userspace tasks share one
-CPU.
-
-## Memory requirement
-
-The initial self-contained binary embeds the 28 MiB Freedoom IWAD and has a
-20 MiB BSS heap. The standard QEMU profile is therefore 512 MiB. A 256 MiB
-profile correctly reports OOM during the large process setup.
-
-A future storage iteration should place Doom and the WAD in BOOTFS/VFS and map
-or stream them without embedding/copying the payload through init. That will
-reduce the minimum memory requirement.
-
-## Sound
-
-The first stable port is intentionally silent (`-nosound`). PC Speaker effects
-are the next isolated phase. They require a privileged userspace-facing tone
-service or driver and must not grant Doom arbitrary I/O-port access. Music is
-out of scope for the PC Speaker backend.
-
-## Test expectations
-
-A successful serial boot includes:
-
-```text
-[init] launching DoomGeneric/Freedoom
-[doom-launch] thread started
-[doom] HuesOS DoomGeneric starting (Freedoom Phase 1)
-W_Init: Init WADfiles.
-I_InitGraphics: DOOM screen size: 320 x 200
-```
-
-A QEMU PPM screenshot must contain a centered multicolor game image rather than
-the two-color terminal background, and the serial log must contain no Doom
-user-fault or kernel panic. The release soak test captured title, gameplay, and
-late gameplay frames with 156/164/149 distinct colors and byte differences of
-622,930 and 532,728 respectively, while repeatedly injecting movement/fire
-input.
+Every logical CPU enables `CR0.MP`, `CR4.OSFXSR`/`OSXMMEXCPT`, and per-task
+64-byte-aligned `XSAVEOPT64`/`XSAVE64`/`XRSTOR64` (with `FXSAVE64`/`FXRSTOR64`
+fallback), so multiple preempted Ring-3 SIMD tasks can share CPUs safely. Sound
+remains intentionally disabled (`-nosound`) until a dedicated userspace audio
+DriverHost lands.

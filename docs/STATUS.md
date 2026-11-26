@@ -1,65 +1,57 @@
 # HuesOS status and evidence map
 
-Status reviewed against `main` at `6ad199e` (2026-11-23; through PR #287 plus
-AP-23 PCI Manager completion on `arena/83195ede-huesos`). This is a versioned
-snapshot, not a live dashboard and not a claim that every current CI job passed.
-Docs-only follow-ups do not change implementation status.
+Status reviewed against `main` at `52be571` (2026-11-23; through PR #288). This
+is a versioned snapshot, not a live dashboard and not a claim that every current
+CI job passed. Docs-only follow-ups do not change implementation status.
 
 ## Read this first
 
-Implementation, host tests, QEMU evidence and physical hardware evidence are
+Implementation, host tests, QEMU evidence, and physical hardware evidence are
 separate dimensions. A workflow definition is a configured gate, not its result.
-A checked box in an old roadmap is not a current release approval.
+A checked box in a roadmap is not a release approval.
 
 | Area | Implemented boundary | Host coverage / QEMU gate | Physical evidence / remaining boundary |
 | --- | --- | --- | --- |
-| Boot and ring3 | Limine UEFI, independent address spaces, ELF launch and syscalls | Host ELF/PMM/object suites; `scripts/ci-qemu-smoke.sh` checks ring3, VMO, IPC and terminal markers | One MSI Modern 15 B5M smoke report; not a compatibility certification |
-| Signed boot image | HBI v2.2 signature verification; development keys are not release keys | `scripts/ci-qemu-hbi-signature-smoke.sh`, secure-boot/TPM scripts are configured gates | Physical Secure Boot/TPM security matrix remains required |
-| User-copy | Bounds/page-table validation, process memory lock, extable copies; sealed typed record allowlist and zeroed output padding | Syscall host suite; default user-pointer diagnostics; `scripts/ci-qemu-smep-smap-smoke.sh` on CPU max | Real CPU feature evidence must distinguish enabled controls from degraded mode |
-| Objects and processes | Registry uses RefAccount; ProcessLifecycle, exit status, counted waiters, port notifications, deferred teardown and bounded graveyard wired | Object/policy host suites, actual-object exit/wait regressions, 4096-exit bounded-graveyard tests and 32-exit init probe with repeated observation; inspect run logs, not marker wording alone | Full-system baseline return, cancellations and longer concurrent storms need separate evidence |
-| Task identities and SMP | Global TaskSlotAllocator/TaskDirectory; stable generation-bearing TaskId; owner-local scheduling and token-mediated remote operations; retire-at-reap drains and counts pending remote operations | `huesos-sched` host tests are selected by `make test`; generation-helper regressions cover sequential reuse, stale operations, atomic drain at retire, and replacement-generation isolation. Kernel and QEMU boot tests are complementary | SMP termination/reschedule-IPI race behavior still requires on-target evidence; directory-level carry-over is closed. CPU ownership is not encoded in TaskId. EEVDF/CBS/SMP v2 target design is only partially integrated |
-| IRQ routing | Multi-controller route manager, dynamic vectors, typed IRQ/GSI objects, level ACK | IOAPIC host tests; keyboard QMP userspace test; edu level/raw-GSI kernel probe | Kernel-Port probe is not proof of raw-GSI userspace syscall path or real-device coverage |
-| Job quotas | Hierarchical Job tree, VMO memory/CPU tick charging and bounded IPC queues; public Job controls | Quota/object host suites; integration stress still required | Per-handle hard caps and page-table metadata accounting are not complete |
-| ACPI / PCI | Kernel immutable ACPI archive and broker; isolated userspace `uacpi-runtime` and generation-safe `acpi-manager` supervision (`HMCF`, `HPCI` v2 `_SEG`/`_BBN`/`_CRS`/`_PRT`/`_OSC`, and `HIOM` `DMAR`/`IVRS` snapshots retained by `driver-manager`); `PciConfigMint` RO→RW ECAM authority + named `B.4` write policy (`AP-17`); live BAR sizing, bottom-up bridge window synthesis, hotplug reserves, and rollback-verified commit plans (`E.1`, `F.1`–`F.3`, `AP-19`/`AP-23`); kernel `DeviceLease` revocation and `PORT_PACKET_DEVICE_GONE` (`G.2`/`G.3`, `AP-20`); manifest driver binding, MSI-X/MSI/INTx transactions, and `DmaPoolGrant` (`H.3`, `I.1`/`I.2`, `AP-21`) driving `driver-host-nvme`, `net-service`, and `wlan-service` with kernel PCI scan removed and guarded by `tools/check-kernel-no-pci.py` (`J.1`–`J.3`, `AP-22`); zero-bus-traffic `HPIN` inventory VMO + `pci -v` (`D.3`), reserved-space hotplug policy (`K.1`–`K.3`), restart rebalance + rollback (`L.1`–`L.3`), `QuiesceRemap` protocol (`M.1`), and fail-closed `Trusted` IOMMU discovery (`N.1`/`N.3`, `AP-23`) | Host suites (`huesos-abi`, `huesos-pci` including 10,000-event hotplug storm, 1,000-cycle add/remove leak/ABA, exhaustive rebalance fault injection, and `DMAR`/`IVRS` corpus, `huesos-syscalls`, `huesos-object`, `huesos-kernel`) + ASan/UBSan `scripts/test-uacpi-runtime.sh`; QEMU Q35/OVMF SMP2 (`scripts/ci-qemu-smoke.sh` ECAM and forced-legacy, `scripts/ci-qemu-pci-mediation-smoke.sh`, `scripts/ci-qemu-acpi-restart-smoke.sh`, `scripts/ci-qemu-storage-off-smoke.sh`, `scripts/ci-qemu-nvme-soak.sh`) | Hardware IOMMU per-device DMA page-table domains (`N.2`), live `QuiesceRemap` driver (`M.2`), and multi-platform physical bare-metal qualification matrix (`O.3`) remain open; `PCI production-ready = false` |
-| NVMe / HxFS | Userspace driver and mutable HxFS v7 foundation; read-only v6 compatibility with explicit migration; versioned policies and recovery paths; production status remains false | Host/storage feature gates and QEMU fault/soak scripts; inspect per-commit results | Dedicated two-vendor NVMe, v7 format approval and independent security review remain open; no physical storage verification inferred from the laptop report |
-| Framebuffer / terminal | Capability-gated drawing remains in kernel; userspace Canvas, terminal and games | Host framebuffer tests; terminal boot gate; visual/game tests have separate procedures | No Unicode shaping, GPU acceleration or desktop compositor claimed |
+| Boot and ring3 | Limine UEFI base-rev-3, independent PML4s, W^X ELF/PE launch, capability syscalls, Scudo userspace heap (`huesos-scudo`) | Host ELF/PMM/Scudo/object suites; `scripts/ci-qemu-smoke.sh` checks ring3, VMO, IPC, `std-smoke`, and `hsh` startup smokes | One MSI Modern 15 B5M smoke report; not a broad compatibility certification |
+| Signed boot image | HBI v2.2 Ed25519 verification, KeyBroker one-shot volume key handoff, TPM unseal path | `scripts/ci-qemu-hbi-signature-smoke.sh`, `ci-qemu-secure-boot-smoke.sh`, `ci-qemu-tpm-sealed-key-smoke.sh`, `ci-qemu-key-broker-fail-smoke.sh` | Physical Secure Boot/TPM PCR matrix and production key ceremony remain required |
+| User-copy & CPU hardening | Bounds/page-table validation, process memory lock, `.ex_table` recoverable copies, sealed `UserRecord` allowlist, SMEP/SMAP/UMIP enablement | Syscall/extable host suites; `scripts/ci-qemu-extable-smoke.sh` and `scripts/ci-qemu-smep-smap-smoke.sh` | Real-CPU feature evidence must distinguish enabled hardware controls from degraded mode |
+| Objects, processes & quotas | `RefAccount` registry, `ProcessLifecycle`, exit ports, foreign `ProcessTerminate`, deferred teardown, bounded graveyard, hierarchical `Job` VMO/CPU/IPC quotas | Policy/object host suites (`huesos-lifecycle`, `huesos-proclife`, `huesos-quota`, `huesos-handlemove`, `huesos-waitset`), 4096-exit graveyard tests, 32-exit init probe | Per-handle hard caps, page-table metadata charging, and long-haul cancellation storms remain open |
+| Scheduler v2 & SMP v2 | `MAX_CPUS = 256`, `MAX_TASKS = 8192`, generation-tagged `TaskId`/`TaskDirectory`, single-writer per-CPU runqueues + bitmap `TaskInbox`, two-level `Job`→`Thread` EEVDF + CBS reservations over `TscClock`, `x2APIC`/`xAPIC` 32-bit APIC IDs, `CPUID 0x1F/0x0B` topology, AP `IA32_PAT` sync (`WC`), `XSAVE`/`FXSAVE` SIMD, 16 KiB guard-paged `NX` stacks, per-`CR3` targeted TLB shootdowns, `IA32_TSC_DEADLINE`/LAPIC timer, futexes, and topology-aware idle pull | `huesos-sched` host suite (EEVDF, CBS, `TaskDirectory`, `PcidTable`, `SmtCoreGate`); QEMU debug/release SMP 1/2/4/8 boot and soak gates | Hardware `CR3` PCID/`INVPCID` activation, cross-SMT core-scheduling barriers, and multi-platform bare-metal latency benchmarks remain open |
+| IRQ routing | Multi-controller IOAPIC route manager, dynamic vectors, typed IRQ/GSI objects, level ACK | `huesos-ioapic` host suite; `scripts/ci-qemu-ioapic-delivery.sh`; `scripts/ci-qemu-irq-level-smoke.sh` | Bare-metal multi-IOAPIC and non-QEMU device GSI coverage remain open |
+| ACPI & PCI Manager (`AP-0..AP-23`) | Immutable ACPI archive v2 + broker; isolated Ring-3 `uacpi-runtime` & supervised `acpi-manager` (`HMCF`, `HPCI` v2 `_SEG`/`_BBN`/`_CRS`/`_PRT`/`_OSC`, `HIOM` `DMAR`/`IVRS`); sole config executor `pci-manager` (ECAM + forced-legacy), named `B.4` write policy, live BAR/bridge planner with rollback & hotplug reserves, kernel `DeviceLease` + `PORT_PACKET_DEVICE_GONE`, MSI-X/MSI/INTx + `DmaPoolGrant` driving `driver-host-nvme`/`net-service`/`wlan-service`, zero-bus-traffic `HPIN` v1 inventory (`pci -v`), hotplug/rebalance/`QuiesceRemap` state machines; kernel PCI scan removed (`tools/check-kernel-no-pci.py`) | `huesos-abi` & `huesos-pci` host suites (including 10,000-event hotplug storm, 1,000-cycle add/remove, exhaustive rebalance fault injection, `DMAR`/`IVRS`); ASan `test-uacpi-runtime.sh`; QEMU ECAM/legacy `ci-qemu-pci-mediation-smoke.sh` & `ci-qemu-acpi-restart-smoke.sh` | Hardware VT-d/AMD-Vi second-stage DMA domains (`N.2`, currently `dma_isolation=trusted`), live `QuiesceRemap` driver (`M.2`), and bare-metal qualification (`O.3`) remain open; `PCI production-ready = false` |
+| NVMe & `HxFS v7` | Ring-3 `driver-host-nvme` + mutable `HxFS v7` (`AES-GCM` 64-bit extent nonces, `LZ4`, `Hxblob`, random-offset RMW, `truncate`, symlinks, `chmod`, `StatFs`, persistent named snapshots, journal replay, `scrub`/`fsck`, explicit `v6 → v7` migration) | Host `huesos-nvme`/`huesos-hxfs`/GPT suites, `migration-check`, benchmark gate, and QEMU `gcm-inject`/`crc-inject`/`no-tpm`/`powerfail`/`shutdown-cycle`/`stress`/`long-soak` | Independent security review, `HxFS v7` format freeze, 24h endurance soak, and two-vendor disposable-NVMe bare-metal matrix remain open; `storage production-ready = false` |
+| Loaders & Win64 PE32+ | Static `huesos-elf`, dynamic `/lib/ld-huesos.so` (`BIND_NOW`, `RELRO`, TLS, `canvas_dlopen_*`, `libcanvas.so`), and native Win64 PE32+ (`huesos-pe` + `/lib/ld-pe.so` + `ntdll`/`kernel32`/`ucrtbase`/`msvcrt`/`ws2_32`/`bcrypt`/`advapi32`, `GS_BASE` `SwapGsGuard`, `.pdata`/`.xdata` SEH unwind) | `huesos-elf` & `huesos-pe` host suites; QEMU dynamic ELF (`dyn-rust-smoke`, `dyn-c-smoke`, `smoke-plugin`) and Win64 PE32+ selftest gates | Subset of Win32/NT console, file, sync, CRT, and Winsock APIs; GUI/Win32k/COM subsystems are not claimed |
+| Networking, Wi-Fi & TLS 1.3 | `#![forbid(unsafe_code)]` `huesos-net` (`Eth`/`ARP`/`IPv4`/`ICMP`/`UDP`/`DHCP`/`DNS`/`TCP`), `net-service` (VirtIO 1.0 + dual-uplink), `huesos-ieee80211` + `huesos-wpa` (`WPA2-CCMP`) + `huesos-rtw88` (`RTL8821CE`) in `wlan-service`, pure-Rust `huesos-tls` (TLS 1.3 + X.509v3 CA validation) | Host suites across `huesos-net`, `huesos-ieee80211`, `huesos-wpa`, `huesos-rtw88`, and `huesos-tls`; QEMU boot-selftest exercises VirtIO + simulated 802.11 WPA2 + TLS | IPv4 client focus (no IPv6); `RTL8821CE` targets initial laptop silicon while multi-NIC/RF bare-metal qualification remains open |
+| Display, `hsh` & userland | Kernel capability-gated `huesos-fb` (`src_stride` dirty blits), buffered truecolor `terminal`, `hsh` (`@caps`, N-stage pipes, scripting, job control), `huesos-std`, 45 `coreutils`, `btop`/`fdisk` TUIs, Snake, Freedoom | `huesos-fb` & `huesos-hsh` host suites; QEMU smoke checks `std-smoke`, `hsh` pipes, `pci -v`, and terminal readiness | ASCII/box-drawing bitmap fonts only; no GPU acceleration or window compositor claimed |
 
 ## Which documents are authoritative?
 
-- **Current status overview:** this file. Detailed contracts still govern their
-  subsystem; resolve contradictions against code and evidence before editing.
-- **Current implementation:** [ARCHITECTURE.md](ARCHITECTURE.md),
+- **Current status overview:** this file ([STATUS.md](STATUS.md)).
+- **Core kernel, scheduler & SMP:** [ARCHITECTURE.md](ARCHITECTURE.md),
+  [SCHEDULER_V2.md](SCHEDULER_V2.md), [SMP_V2.md](SMP_V2.md),
   [USER_MEMORY.md](USER_MEMORY.md), [OBJECT_LIFECYCLE.md](OBJECT_LIFECYCLE.md),
   [DYNAMIC_PROCESSES.md](DYNAMIC_PROCESSES.md), [TASK_GENERATIONS.md](TASK_GENERATIONS.md),
-  [IOAPIC_ROUTING.md](IOAPIC_ROUTING.md), [QUOTAS.md](QUOTAS.md), [UACPI.md](UACPI.md).
-- **Verification procedures:** [TESTING.md](TESTING.md); actual evidence requires
-  a commit, exact command/result and retained serial/test logs.
-- **Physical reports:** [HARDWARE.md](HARDWARE.md). The report lists host hardware;
-  listing an NVMe, network or Bluetooth device does not imply HuesOS tested it.
-- **Release blockers:** [STORAGE_PRODUCTION_GATE.md](STORAGE_PRODUCTION_GATE.md),
-  [PCI_PRODUCTION_ROADMAP.md](PCI_PRODUCTION_ROADMAP.md). Bare-metal /
-  physical-hardware evidence for Secure Boot, TPM and storage remains
-  owner-gated; there is no public evidence checklist in the tree.
-- **Target designs:** [SCHEDULER_V2.md](SCHEDULER_V2.md), [SMP_V2.md](SMP_V2.md),
-  [ACPI_RING3.md](ACPI_RING3.md), [PCI_MANAGER_ARCHITECTURE.md](PCI_MANAGER_ARCHITECTURE.md).
-  Design acceptance is not implementation completion.
-- **Current work queues:** [ROADMAP.md](ROADMAP.md),
+  [IOAPIC_ROUTING.md](IOAPIC_ROUTING.md), [QUOTAS.md](QUOTAS.md).
+- **ACPI, PCI, storage & networking:** [ACPI_RING3.md](ACPI_RING3.md),
+  [UACPI.md](UACPI.md), [PCI_MANAGER_ARCHITECTURE.md](PCI_MANAGER_ARCHITECTURE.md),
+  [PCI_PRODUCTION_ROADMAP.md](PCI_PRODUCTION_ROADMAP.md), [NVME.md](NVME.md),
+  [HXFS_DESIGN.md](HXFS_DESIGN.md), [STORAGE_PRODUCTION_GATE.md](STORAGE_PRODUCTION_GATE.md),
+  [NETWORKING.md](NETWORKING.md).
+- **Userspace, loaders & tools:** [USERSPACE.md](USERSPACE.md),
+  [SHELL_AND_STD.md](SHELL_AND_STD.md), [EXECUTABLE_LOADERS.md](EXECUTABLE_LOADERS.md),
+  [OPERATIONS.md](OPERATIONS.md).
+- **Verification & physical hardware:** [TESTING.md](TESTING.md),
+  [HARDWARE.md](HARDWARE.md). Listing host hardware in `HARDWARE.md` never
+  implies HuesOS exercised every device on that board.
+- **Active work queues:** [ROADMAP.md](ROADMAP.md),
   [PRODUCTION_ROADMAP.md](PRODUCTION_ROADMAP.md),
-  [ACPI_PCI_IMPLEMENTATION_PLAN.md](ACPI_PCI_IMPLEMENTATION_PLAN.md).
-- **History:** archived/closed material (the v1 storage roadmap, the
-  microkernel migration plan, the early architectural-weaknesses analysis,
-  closed stage plans) was removed in the 2026-11 docs-hygiene pass. Migration
-  and storage history lives in git; current design intent lives in the
-  target designs listed above — not in the removed files.
+  [ARCHITECTURE_ROADMAP.md](ARCHITECTURE_ROADMAP.md).
 
 See [INDEX.md](INDEX.md) for a newcomer reading order.
 
 ## Maintenance contract
 
-When changing a boundary, update the subsystem contract and this snapshot in the
-same PR. Record implementation and verification separately. State the observed
-CPU/profile/commit and limitations; never turn a configured gate into a pass.
-Do not erase still-open failure modes merely because ordinary boot succeeds.
-Update the reviewed base above when reviewing code, not automatically for a
-spelling change. Full green GitHub CI, independent review and hardware evidence
-must not be inferred from a local docs-only verification.
+When changing a subsystem boundary, update both its contract document and this
+snapshot in the same PR. Record implementation, host tests, QEMU gates, and
+bare-metal evidence separately; never turn a configured gate into a pass or
+claim production readiness while release blockers remain open.

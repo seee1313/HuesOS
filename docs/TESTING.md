@@ -337,7 +337,7 @@ frames, with more than 500,000 changed bytes between gameplay captures. The
 font switch integration produced 9,615 changed framebuffer bytes between TTY
 and compact modes.
 
-See [DOOM.md](DOOM.md) and [TTY_FONT.md](TTY_FONT.md).
+See [DOOM.md](DOOM.md) and [TERMINAL_RENDERING.md](TERMINAL_RENDERING.md).
 
 The post-game repaint regression launches Doom, exits with Q, captures Terminal
 after two seconds, and requires its small text palette with no panic. Buffered

@@ -1,16 +1,7 @@
 # NVMe Driver (ring-3 DriverHost)
 
-Status: **Stage B + real MSI-X/MSI wiring landed.** The repository now has:
-`DmaPool` resource capability, HBI boot-driver packaging, kernel PCI NVMe
-BAR/IRQ metadata discovery, Resource-backed userspace MMIO/DMA mapping,
-kernel-programmed MSI-X with MSI fallback, DriverManager launch of
-`driver-host-nvme` from BOOTFS, real BAR/DMA mapping in the DriverHost,
-controller disable/enable + admin queue setup from the 64 MiB DMA pool, Identify
-Controller/Namespace integration, per-CPU queue creation planning, PRP handling
-up to the 1 MiB request cap, MSI/MSI-X vectors bound to a userspace Port, and a
-real async BlockDevice service channel exposed through DriverManager, and a
-VolumeManager system volume optimized specifically for NVMe/SSD raw namespaces.
-This is ROADMAP Short-Term #7 (real VFS + userspace drivers), first device.
+Status: **userspace PCI Manager handoff (`AP-21`/`AP-22`) + `DeviceLease` + MSI-X/MSI + `HxFS v7` active on `main`; legacy kernel PCI scan removed (`tools/check-kernel-no-pci.py`)**.
+`pci-manager` enumerates NVMe (`01:08:02`), validates/commits BAR0, programs MSI-X/MSI/INTx, and publishes a `Fixed`-relocation binding; `driver-manager` mints a generation-bound `DeviceLease`, BAR0 `Mmio` `Resource`, IRQ handles, and `DmaPoolGrant` VMO, then launches `/drivers/driver-host-nvme.elf` from BOOTFS. `driver-host-nvme` maps BAR0/DMA, initializes admin and per-CPU I/O queues (Identify Controller/Namespace model/serial/firmware metadata, PRPs up to 1 MiB), and serves the async `BlockDevice` and `VolumeManager` (including GPT partition discovery alongside raw superfloppy volumes) channels.
 
 ## Goal
 
@@ -161,13 +152,14 @@ should probe.
 
 Stage A/B/C + MSI-X/MSI completed in code:
 
-- Boot reserves/logs the 64 MiB DMA pool.
-- Kernel storage boot-info logs discovered NVMe PCI function(s), BAR0, IRQ/vector
-  range, and MSI/MSI-X metadata/programming status.
-- Init forwards `Mmio`, `Irq`, and `DmaPool` Resource handles with deterministic
-  labels to DriverManager.
-- DriverManager enumerates `/storage/boot-drivers.manifest` and launches
-  `/drivers/driver-host-nvme.elf` from HBI BOOTFS when hardware is present.
+- Boot reserves/logs the bounded DMA pool (`DmaPoolGrant`).
+- `pci-manager` discovers NVMe PCI function(s) from validated `HPCI` roots,
+  validates BAR0, programs MSI-X/MSI/INTx, and emits `DriverBindingPublished`
+  with `RelocationClass::Fixed` (the old kernel `boot/storage.rs` PCI scan was
+  deleted in `AP-22`).
+- `driver-manager` mints the `DeviceLease`, BAR0 `Mmio`, IRQ, and `DmaPool`
+  capabilities and launches `/drivers/driver-host-nvme.elf` from HBI BOOTFS when
+  hardware is present.
 - `driver-host-nvme` maps BAR0/DMA with `ResourceMap`, binds MSI-X/MSI vectors to
   a Port when vector resources are present, initializes the controller, and logs
   namespace id, block size, block count, max request, queue count, and bound IRQ

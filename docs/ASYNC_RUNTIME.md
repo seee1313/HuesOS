@@ -1,8 +1,7 @@
-# `hues-async` — Async Runtime for Fast Drivers
+# `hues-async` — Allocation-Free Async Runtime
 
-Status: **executor + host tests landed.** Used by the in-progress NVMe driver
-(ROADMAP Short-Term #7). The on-target DriverHost integration (MMIO/DMA) is a
-separate follow-up.
+Status: **implemented and active in Ring 0 (`async_rt`) and Ring 3 (`driver-host-nvme`)**.
+Strict zero-heap policy enforced in CI by `tools/check-hues-async-noalloc.py`.
 
 ## Purpose
 
@@ -110,11 +109,13 @@ waker self-reschedule (`yield_now`), multiple tasks, external `wake(task_id)`,
 capacity (`Full`), the size guard (`TooLarge`), generation-guarded stale-id
 rejection, `run(park)`, and that dropping the executor drops live futures.
 
-## Next: NVMe DriverHost (on-target)
+## `block_on` vs `Executor::spawn` and on-target integration
 
-The NVMe driver is the first consumer. The host-testable protocol/queue layer
-(registers, SQE/CQE, phase bit, admin commands, PRP-based Read/Write) and the
-DriverHost event loop are the next deliverables; the privileged plumbing —
-mapping the controller BAR (MMIO) into the DriverHost and providing coherent DMA
-buffers via VMOs — is a separate kernel-side step that requires QEMU
-(`-device nvme`) / bare-metal verification.
+`hues-async` provides two execution shapes over the scheduler/Port reactor
+(IRQ/timer paths only drain hardware completions and set ready bits — futures
+are never polled in interrupt context):
+
+| Mode | Lifetime | Storage | Typical caller |
+|---|---|---|---|
+| `block_on` / `run_sync` | Non-`'static` borrows allowed | Caller stack frame | One-shot admin / synchronous driver transactions |
+| `Executor<TASKS, F>::spawn` | `'static` | Inline fixed-size slot table (`TASKS <= 64`) | Concurrent queue-depth I/O in `driver-host-nvme` ([NVME.md](NVME.md)) |

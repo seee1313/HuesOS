@@ -1,15 +1,15 @@
 # Ring-3 ACPI architecture
 
-- **Status:** approved target architecture; full AML runtime is not implemented
+- **Status:** implemented and active on `main` (`AP-1..AP-18`, `AP-23`); physical multi-platform bare-metal corpus qualification remains tracked in [PCI_PRODUCTION_ROADMAP.md](PCI_PRODUCTION_ROADMAP.md)
 - **Audience:** kernel, ACPI, PCI, DriverManager, and platform maintainers
 - **Scope:** x86_64 ACPI table ownership, AML execution, OperationRegions,
   PCI-root discovery, supervision, and failure containment
 
 This document is normative. It defines the ACPI trust boundary and its
 interaction with the userspace PCI Manager. The PCI ownership model is defined
-in [PCI_MANAGER_ARCHITECTURE.md](PCI_MANAGER_ARCHITECTURE.md); the ordered
-implementation PRs are defined in
-[ACPI_PCI_IMPLEMENTATION_PLAN.md](ACPI_PCI_IMPLEMENTATION_PLAN.md).
+in [PCI_MANAGER_ARCHITECTURE.md](PCI_MANAGER_ARCHITECTURE.md); staged release
+gates and progress are tracked in
+[PCI_PRODUCTION_ROADMAP.md](PCI_PRODUCTION_ROADMAP.md).
 
 Implementation may refine data structures, but it must not silently change the
 authorities, boot ordering, or failure policy below.
@@ -462,5 +462,5 @@ executor, generation-safe restart, and explicit degradation.
 - ACPI manager failure retains the last-good snapshot for existing devices but
   freezes new PCI lifecycle operations until restart/revalidation.
 
-The implementation sequence and owner/agent review points are maintained in
-[ACPI_PCI_IMPLEMENTATION_PLAN.md](ACPI_PCI_IMPLEMENTATION_PLAN.md).
+The staged production qualification gates are tracked in
+[PCI_PRODUCTION_ROADMAP.md](PCI_PRODUCTION_ROADMAP.md).

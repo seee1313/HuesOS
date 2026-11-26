@@ -45,7 +45,10 @@ Visual changes include:
 - preserved classic and hard-mode color distinctions.
 
 Every size calculation uses saturating arithmetic, so unusually small
-framebuffers degrade without unsigned underflow.
+framebuffers degrade without unsigned underflow. Dirty-cell tracking uploads and
+blits only changed board cells and HUD regions via strided `Canvas::present_region`
+([FRAMEBUFFER_POLICY.md](FRAMEBUFFER_POLICY.md)), keeping frame work independent
+of snake length.
 
 ## QEMU visual/timing test
 

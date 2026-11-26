@@ -109,6 +109,25 @@ CI runs `make migration-check`, which creates a v6 fixture, performs the
 migration and requires a v7 checkpoint with non-zero policy roots. The host
 suite separately verifies that ordinary mutation of a legacy mount is denied.
 
+## HxFS v7 progression on top of v6
+
+`HxFS v7` (`crates/huesos-hxfs`, `crates/huesos-userspace/hxfs-service`) retains
+the v6 48-byte 64-bit-generation extent layout, GCM nonce domain, and on-disk
+policy roots above, and extends the mutable filesystem contract with:
+
+- **Arbitrary-offset RMW & `truncate`:** sub-block and random-offset POSIX writes
+  (`write_file_at_preserve`) and file truncation without whole-file rewrites;
+- **Symlinks & confined traversal:** `Symlink`, `ReadLink`, `StatPath`
+  (`O_NOFOLLOW`), bounded resolution (`MAX_SYMLINK_DEPTH = 8`), and strict
+  `DirectoryHandle` confinement preventing `..` or symlink escapes;
+- **Metadata & atomic rename:** `SetAttr` (POSIX mode & `mtime`), `StatFs`
+  capacity/inode reporting, and cross-directory atomic `rename` with overwrite;
+- **Persistent named snapshots:** journaled `CreateSnapshot` / `DeleteSnapshot`
+  preserving CoW extent reference counts across checkpoints;
+- **GPT & bare-volume mount:** mounts from either a GPT `HxFS` partition or a
+  bare `HxFS v7` superfloppy namespace (`fdisk` detects and protects bare `HxFS v7`
+  volumes against accidental `gpt-init` without `--force`).
+
 ## Verification
 
 - default HxFS host suite;

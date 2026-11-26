@@ -80,3 +80,21 @@ multi-second pause. Production code omits per-frame logging.
 The dirty-row path is the shared fast path for ordinary shell typing; the full
 buffered path remains the safe fallback for large invalidations and unusual
 framebuffer formats.
+
+## Terminal fonts and truecolor TUI studio modes
+
+Terminal starts with the **Cozette 6×13** bitmap font (MIT), giving a 1024×768
+display roughly 54 rows × 168 columns without runtime TTF rasterization. Two
+additional fixed-cell modes remain built in:
+
+| Command / `TextFont` | Glyph cell | Notes |
+|---|---|---|
+| `font cozette` (`TextFont::Cozette6x13`) | 6×13 | Default clean monospace bitmap font |
+| `font tty` (`TextFont::Tty8x16`) | 8×16 | Classic PC-TTY density |
+| `font compact` (`TextFont::Compact8x8`) | 8×8 | High-density compact fallback |
+
+`terminal` spawns `/bin/hsh.elf` ([SHELL_AND_STD.md](SHELL_AND_STD.md)) over
+streaming stdio `Channel` pairs and parses ANSI/VT sequences including 24-bit
+truecolor foreground/background (`ESC[38;2;R;G;Bm` / `ESC[48;2;R;G;Bm`),
+alternate-screen cursor positioning, and raw keyboard forwarding for full-screen
+TUI studios (`btop`, `fdisk`/`cfdisk`, `nano`).
