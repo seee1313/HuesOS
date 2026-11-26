@@ -1020,7 +1020,7 @@ impl Syscall {
     /// Total number of defined syscalls (i.e. one past the highest
     /// currently-assigned number). The dispatcher uses this to reject
     /// obviously-out-of-range numbers before a `match`.
-    pub const COUNT: u64 = 96;
+    pub const COUNT: u64 = 98;
 
     /// Convert a raw syscall number back into a [`Syscall`], if valid.
     pub const fn from_raw(n: u64) -> Option<Self> {
@@ -2117,7 +2117,7 @@ mod tests {
         assert_eq!(Syscall::ResourceUnmap as u64, 65);
         assert_eq!(Syscall::InterruptCreateGsiForResource as u64, 66);
         assert_eq!(Syscall::InterruptAcknowledge as u64, 67);
-        assert_eq!(Syscall::COUNT, 96);
+        assert_eq!(Syscall::COUNT, 98);
         assert_eq!(Syscall::SystemTaskQuery as u64, 87);
         assert_eq!(Syscall::HandleGetKoid as u64, 88);
         assert_eq!(Syscall::ProcessSetAffinityMask256 as u64, 89);

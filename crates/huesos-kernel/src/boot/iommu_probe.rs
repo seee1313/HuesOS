@@ -190,13 +190,7 @@ fn run_with_frames(
     Ok(())
 }
 
-fn run_edu_dma(
-    bar0_va: u64,
-    src: u64,
-    dst: u64,
-    cnt: u64,
-    cmd: u64,
-) -> Result<(), &'static str> {
+fn run_edu_dma(bar0_va: u64, src: u64, dst: u64, cnt: u64, cmd: u64) -> Result<(), &'static str> {
     mmio_write64(bar0_va + EDU_DMA_SRC_OFFSET, src);
     mmio_write64(bar0_va + EDU_DMA_DST_OFFSET, dst);
     mmio_write64(bar0_va + EDU_DMA_CNT_OFFSET, cnt);

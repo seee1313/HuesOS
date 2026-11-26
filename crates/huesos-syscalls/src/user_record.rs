@@ -105,6 +105,7 @@ record!(huesos_abi::pci_lease::DeviceLeaseCreateArgs, 32, 8, authority => 0, fla
 record!(huesos_abi::pci_lease::DeviceLeaseMintResourceArgs, 40, 8, lease => 0, kind => 4, expected_generation => 8, base => 16, len => 24, exclusive => 32, reserved => 36);
 record!(huesos_abi::pci_lease::DeviceLeaseBindPortArgs, 24, 8, lease => 0, port => 4, key => 8, flags => 16, reserved => 20);
 record!(huesos_abi::pci_lease::DeviceLeaseInfo, 40, 8, device_id => 0, generation => 8, firmware_snapshot_id => 16, pci_address_packed => 24, state => 32, revoked => 36);
+record!(huesos_abi::pci_iommu::KernelIommuStatus, 32, 8, hardware_kind => 0, active_mode => 1, active_unit_count => 2, runtime_flags => 3, active_domains => 4, mapped_pages => 8, teardown_count => 16, fault_count => 24);
 
 #[cfg(test)]
 mod tests {

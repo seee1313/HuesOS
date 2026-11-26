@@ -593,11 +593,7 @@ pub struct MappedDmaRange {
 
 impl MappedDmaRange {
     /// Construct and validate a 4 KiB-aligned range within `iova_limit_exclusive`.
-    pub const fn try_new(
-        base: u64,
-        len: u64,
-        iova_limit_exclusive: u64,
-    ) -> Result<Self, VtdError> {
+    pub const fn try_new(base: u64, len: u64, iova_limit_exclusive: u64) -> Result<Self, VtdError> {
         if len == 0
             || (base & PAGE_OFFSET_MASK) != 0
             || (len & PAGE_OFFSET_MASK) != 0

@@ -110,11 +110,7 @@ pub fn query(lease: &Handle) -> Result<DeviceLeaseInfo> {
 
 /// Bind an existing `DmaPool` `Resource` handle (`READ | WRITE`) into the
 /// hardware IOMMU domain of `lease` (`WRITE`) for `expected_generation` (Stage N.2).
-pub fn attach_dma(
-    lease: &Handle,
-    dma_resource: &Handle,
-    expected_generation: u64,
-) -> Result<()> {
+pub fn attach_dma(lease: &Handle, dma_resource: &Handle, expected_generation: u64) -> Result<()> {
     let ret = raw::syscall3(
         Syscall::DeviceLeaseAttachDma,
         lease.raw() as u64,

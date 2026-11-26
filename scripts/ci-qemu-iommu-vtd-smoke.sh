@@ -50,11 +50,22 @@ annotate_failure() {
 echo "iommu_test=1" > build/cmdline.txt
 trap 'echo "init_args=foo" > build/cmdline.txt' EXIT
 
+build_log="build/iommu-smoke-build.log"
+set +e
 case "$profile" in
-    debug)   HUESOS_BOOT_SELFTEST=1 CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-1}" make iso PROFILE=debug ;;
-    release) HUESOS_BOOT_SELFTEST=1 CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-1}" make iso-release ;;
+    debug)   HUESOS_BOOT_SELFTEST=1 CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-1}" make iso PROFILE=debug >"$build_log" 2>&1 ;;
+    release) HUESOS_BOOT_SELFTEST=1 CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-1}" make iso-release >"$build_log" 2>&1 ;;
     *) echo "unsupported profile: $profile" >&2; exit 2 ;;
 esac
+build_status=$?
+set -e
+if [[ "$build_status" != 0 ]]; then
+    cat "$build_log" >&2 || true
+    while IFS= read -r line; do
+        printf '::error::build| %s\n' "$line"
+    done < <(grep -E 'error(\[E[0-9]+\])?:|-->' "$build_log" | head -n 25 || tail -n 20 "$build_log")
+    exit "$build_status"
+fi
 
 # Create a 64 MiB (16384 * 4 KiB blocks) plain HxFS volume for NVMe DMA smoke.
 python3 tools/mkhxfs.py --output "$nvme_img" --blocks 16384 >/dev/null
@@ -82,9 +93,9 @@ if [[ "$status" != 0 && "$status" != 124 ]]; then
     tail -200 "$vtd_log" >&2 || true
     exit 1
 fi
-if grep -Fq 'KERNEL PANIC' "$vtd_log" || grep -Fq '[iommu-probe] FAIL' "$vtd_log"; then
-    echo "panic or iommu-probe failure detected in vtd-isolated leg" >&2
-    annotate_failure "vtd-isolated" "panic or [iommu-probe] FAIL detected" "$vtd_log"
+if grep -Fq 'KERNEL PANIC' "$vtd_log" || grep -Fq '[iommu-test] FAILED:' "$vtd_log"; then
+    echo "panic or iommu-test failure detected in vtd-isolated leg" >&2
+    annotate_failure "vtd-isolated" "panic or [iommu-test] FAILED detected" "$vtd_log"
     tail -200 "$vtd_log" >&2
     exit 1
 fi
@@ -92,15 +103,14 @@ fi
 vtd_markers=(
     '[iommu] Intel VT-d active:'
     'mode=Isolated'
-    '[iommu-probe] authorized DMA OK'
-    '[iommu-probe] unauthorized DMA blocked OK'
-    '[iommu-probe] post-revoke DMA blocked OK'
-    '[iommu-probe] PASS: Intel VT-d hardware DMA isolation, containment, and revocation verified'
-    '[vtd] fault unit='
-    'HIOM snapshot published'
-    'active=Isolated'
+    '[iommu-test] authorized DeviceLease DMA read/write OK'
+    '[iommu-test] unmapped canary DMA blocked by hardware VT-d OK'
+    '[iommu-test] post-revoke DMA blocked after synchronous IOTLB flush OK'
+    '[iommu-test] Intel VT-d hardware isolation self-test OK'
+    '[acpi-manager] published HIOM'
+    'active_isolation=Isolated'
     'isolation=IommuDomain'
-    '[driver-manager] bound DMA grant to IOMMU domain='
+    '[driver-manager] attached DmaPool to DeviceLease for'
     '[hxfs] service started'
     '[net-service] virtio-net 1.0 modern MMIO online'
 )
@@ -154,7 +164,8 @@ if grep -Fq '[iommu] Intel VT-d active:' "$fallback_log"; then
 fi
 
 fallback_markers=(
-    '[iommu-probe] FAIL: Intel VT-d is not active'
+    '[iommu-test] FAILED: Intel VT-d hardware translation is not active'
+    'active_isolation=Trusted'
     'isolation=Trusted'
     '[hxfs] service started'
     '[net-service] virtio-net 1.0 modern MMIO online'
