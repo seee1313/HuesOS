@@ -198,10 +198,6 @@ pub const BLOCK_USB_UNAVAILABLE: &str = "err:block:usb-unavailable";
 /// DriverManager attaches a USB BOT block client channel to `driver-host-xhci`.
 pub const ATTACH_BLOCK_USB_CLIENT: &str = "block:usb-client";
 
-/// xHCI DriverHost reported it is starting.
-pub const XHCI_HOST_STARTING: &str = "driver-host:xhci:starting";
-/// xHCI DriverHost has received its MMIO/IRQ/DMA resources.
-pub const XHCI_HOST_RESOURCES_READY: &str = "driver-host:xhci:resources-ready";
 /// xHCI DriverHost reported ready.
 pub const XHCI_HOST_READY: &str = "driver-host:xhci:ready";
 /// xHCI DriverHost USB HID input service is ready.
@@ -216,8 +212,6 @@ pub const USB_MISSING_RESOURCES: &str = "service:usb:missing-resources";
 pub const USB_DEVICE_GONE: &str = "service:usb:device-gone";
 /// xHCI DriverHost published a read-only `HUSB` inventory VMO.
 pub const USB_INVENTORY_VMO_UPDATE: &str = "service:usb:inventory-vmo";
-/// DriverManager asks `driver-host-xhci` to refresh its `HUSB` inventory VMO.
-pub const USB_REFRESH_VMO: &str = "usb:refresh-vmo";
 
 /// Client queries USB controller & attached device inventory as TSV text.
 pub const QUERY_USB: &str = "query:usb";

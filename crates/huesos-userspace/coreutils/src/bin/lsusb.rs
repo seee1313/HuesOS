@@ -59,12 +59,12 @@ fn run() -> i32 {
     };
 
     if verbose || !bot_smoke {
-        if let Err(code) = report_husb_vmo(reg, verbose, log_serial) {
+        if let Err(code) = report_husb_vmo(&reg, verbose, log_serial) {
             return code;
         }
     }
     if bot_smoke {
-        if let Err(code) = run_bot_smoke(reg, log_serial) {
+        if let Err(code) = run_bot_smoke(&reg, log_serial) {
             return code;
         }
     }
