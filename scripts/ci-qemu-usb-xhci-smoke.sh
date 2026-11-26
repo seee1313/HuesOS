@@ -11,7 +11,7 @@
 # client injects `lsusb -v --bot-smoke --log-serial\n` exclusively through the
 # Hub-attached `usbkbd0` device and verifies:
 #   - VT-d second-stage DMA isolation (`iommu=isolated`, zero DMAR faults)
-#   - MSI-X vector `0xD8` binding & `HUSB v1` zero-bus-traffic VMO snapshot
+#   - MSI-X vector `0xE0` binding & `HUSB v1` zero-bus-traffic VMO snapshot
 #   - Root-port + Hub downstream enumeration (`usb-hub`, `usb-hid-kbd`,
 #     `usb-hid-mouse`, `usb-storage-bot`)
 #   - Live USB HID keystrokes multiplexed through `driver-manager` -> `terminal`

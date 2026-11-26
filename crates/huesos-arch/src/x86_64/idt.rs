@@ -16,10 +16,10 @@ pub const PANIC_STOP_VECTOR: u8 = 0xF1;
 pub const SHUTDOWN_STOP_VECTOR: u8 = 0xF2;
 /// IPI vector used for cross-CPU TLB invalidation.
 pub const TLB_SHOOTDOWN_VECTOR: u8 = 0xF3;
-/// First vector reserved for NVMe MSI-X/MSI delivery.
+/// First vector reserved for PCI MSI-X/MSI delivery (`0xD0..=0xDF` NVMe, `0xE0..=0xE7` xHCI/PCI).
 pub const NVME_MSI_VECTOR_BASE: u8 = 0xD0;
-/// Number of contiguous NVMe MSI vectors installed in the IDT.
-pub const NVME_MSI_VECTOR_COUNT: u8 = 16;
+/// Number of contiguous PCI MSI vectors installed in the IDT (`0xD0..=0xE7`).
+pub const NVME_MSI_VECTOR_COUNT: u8 = 24;
 static PANIC_STOPPED_CPUS: AtomicUsize = AtomicUsize::new(0);
 
 /// Number of peer CPUs that acknowledged the panic-stop IPI.
@@ -92,6 +92,14 @@ static IDT: Lazy<InterruptDescriptorTable> = Lazy::new(|| {
     idt[NVME_MSI_VECTOR_BASE + 13].set_handler_fn(nvme_msi_handler_13);
     idt[NVME_MSI_VECTOR_BASE + 14].set_handler_fn(nvme_msi_handler_14);
     idt[NVME_MSI_VECTOR_BASE + 15].set_handler_fn(nvme_msi_handler_15);
+    idt[NVME_MSI_VECTOR_BASE + 16].set_handler_fn(nvme_msi_handler_16);
+    idt[NVME_MSI_VECTOR_BASE + 17].set_handler_fn(nvme_msi_handler_17);
+    idt[NVME_MSI_VECTOR_BASE + 18].set_handler_fn(nvme_msi_handler_18);
+    idt[NVME_MSI_VECTOR_BASE + 19].set_handler_fn(nvme_msi_handler_19);
+    idt[NVME_MSI_VECTOR_BASE + 20].set_handler_fn(nvme_msi_handler_20);
+    idt[NVME_MSI_VECTOR_BASE + 21].set_handler_fn(nvme_msi_handler_21);
+    idt[NVME_MSI_VECTOR_BASE + 22].set_handler_fn(nvme_msi_handler_22);
+    idt[NVME_MSI_VECTOR_BASE + 23].set_handler_fn(nvme_msi_handler_23);
     idt
 });
 
@@ -304,6 +312,14 @@ nvme_msi_handler!(nvme_msi_handler_12, 12);
 nvme_msi_handler!(nvme_msi_handler_13, 13);
 nvme_msi_handler!(nvme_msi_handler_14, 14);
 nvme_msi_handler!(nvme_msi_handler_15, 15);
+nvme_msi_handler!(nvme_msi_handler_16, 16);
+nvme_msi_handler!(nvme_msi_handler_17, 17);
+nvme_msi_handler!(nvme_msi_handler_18, 18);
+nvme_msi_handler!(nvme_msi_handler_19, 19);
+nvme_msi_handler!(nvme_msi_handler_20, 20);
+nvme_msi_handler!(nvme_msi_handler_21, 21);
+nvme_msi_handler!(nvme_msi_handler_22, 22);
+nvme_msi_handler!(nvme_msi_handler_23, 23);
 
 fn pci_msi_ack(vector: u8) {
     super::cpu::clear_user_access();

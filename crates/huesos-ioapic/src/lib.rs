@@ -569,8 +569,8 @@ pub fn parse_source_overrides(table: &[u8]) -> Option<SourceOverrideTable> {
 /// vectors.
 pub const DEVICE_VECTOR_START: u8 = 0x30;
 
-/// Last dynamically allocated I/O-APIC vector. `0xD0..=0xDF` is reserved for
-/// the statically installed NVMe MSI/MSI-X handlers; `0xF0..=0xF3` is reserved
+/// Last dynamically allocated I/O-APIC vector. `0xD0..=0xE7` is reserved for
+/// the statically installed PCI MSI/MSI-X handlers; `0xF0..=0xF3` is reserved
 /// for scheduler, stop, and TLB-shootdown IPIs.
 pub const DEVICE_VECTOR_END: u8 = 0xCF;
 

@@ -2446,7 +2446,7 @@ fn run_driver_binding_and_handoff(
                         16
                     },
                     next_base_vector: if manifest.driver_name == "driver-host-xhci" {
-                        0xD8
+                        0xE0
                     } else {
                         0xD0
                     },
