@@ -273,8 +273,6 @@ fn command_uses_query_channel(resolved: &str) -> bool {
             | "btop"
             | "netctl"
             | "wlanctl"
-            | "btctl"
-            | "audioctl"
             | "df"
             | "lsblk"
             | "fdisk"
@@ -325,7 +323,7 @@ fn command_uses_wlan_service(resolved: &str) -> bool {
     let stem = strip_exec_ext(base);
     matches!(
         stem,
-        "wlanctl" | "netctl" | "btctl" | "btop" | "hsh" | "std_smoke" | "std-smoke"
+        "wlanctl" | "netctl" | "btop" | "hsh" | "std_smoke" | "std-smoke"
     )
 }
 
@@ -343,7 +341,7 @@ fn command_uses_audio_service(resolved: &str) -> bool {
     let stem = strip_exec_ext(base);
     matches!(
         stem,
-        "audioctl" | "aplay" | "btctl" | "btop" | "hsh" | "std_smoke" | "std-smoke"
+        "audioctl" | "aplay" | "btop" | "hsh" | "std_smoke" | "std-smoke"
     )
 }
 

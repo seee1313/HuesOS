@@ -1479,12 +1479,6 @@ impl DriverManager {
         {
             return;
         }
-        if (self.xhci_lease_ro.is_some() || self.xhci_host.is_some())
-            && !self.xhci_ready
-            && !self.xhci_failed
-        {
-            return;
-        }
         let Some(bootfs) = self.fs.bootfs() else {
             return;
         };
@@ -1533,12 +1527,6 @@ impl DriverManager {
         {
             return;
         }
-        if (self.snd_lease_ro.is_some() || self.snd_host.is_some())
-            && !self.snd_ready
-            && !self.snd_failed
-        {
-            return;
-        }
         if self.btl_service.is_none() && !self.btl_failed {
             return;
         }
@@ -1575,7 +1563,7 @@ impl DriverManager {
     }
 
     fn maybe_bridge_xhci_and_btl(&mut self) {
-        if self.xhci_btl_bridged {
+        if self.xhci_btl_bridged || !self.xhci_ready {
             return;
         }
         let (Some(xhci), Some(btl)) = (self.xhci_host.as_ref(), self.btl_service.as_ref()) else {
@@ -1655,7 +1643,7 @@ impl DriverManager {
     }
 
     fn maybe_bridge_snd_and_audio(&mut self) {
-        if self.snd_audio_bridged {
+        if self.snd_audio_bridged || !self.snd_ready {
             return;
         }
         let (Some(snd), Some(audio)) = (self.snd_host.as_ref(), self.audio_service.as_ref()) else {
@@ -4256,6 +4244,7 @@ impl DriverManager {
                 Some(remaining) => remaining,
                 None => {
                     self.xhci_host = Some(host);
+                    self.maybe_bridge_xhci_and_btl();
                     return;
                 }
             };
@@ -4301,6 +4290,7 @@ impl DriverManager {
                 }
                 Err(ErrorCode::ShouldWait) | Err(ErrorCode::TimedOut) => {
                     self.xhci_host = Some(host);
+                    self.maybe_bridge_xhci_and_btl();
                     return;
                 }
                 Err(error) => {

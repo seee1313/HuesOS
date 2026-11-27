@@ -560,6 +560,8 @@ pub const fn cap_kind_from_u32(kind: u32) -> Option<CapKind> {
         10 => Some(CapKind::WlanService),
         11 => Some(CapKind::PeVmo),
         12 => Some(CapKind::PeSelfVmar),
+        13 => Some(CapKind::BtlService),
+        14 => Some(CapKind::AudioService),
         _ => None,
     }
 }

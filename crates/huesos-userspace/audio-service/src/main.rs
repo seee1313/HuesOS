@@ -897,13 +897,19 @@ impl AudioRuntime {
         let mut rtp_pkt = [0u8; MAX_L2CAP_IPC_PAYLOAD];
         let mut pcm_block = [[0i16; 2]; SBC_MAX_PCM_FRAMES];
 
+        let sources_idle = self.streams.is_empty() && self.tone_samples.is_empty();
         for _budget in 0..4u32 {
-            if sink.pcm_fifo.len() < pcm_per_sbc * max_pack {
+            let avail_sbc_frames = sink.pcm_fifo.len() / pcm_per_sbc;
+            let pack_count = if avail_sbc_frames >= max_pack {
+                max_pack
+            } else if sources_idle && avail_sbc_frames >= 1 {
+                avail_sbc_frames
+            } else {
                 break;
-            }
+            };
             let mut concat_len = 0usize;
             let mut encoded_count = 0u8;
-            for _ in 0..max_pack {
+            for _ in 0..pack_count {
                 for slot in pcm_block.iter_mut().take(pcm_per_sbc) {
                     *slot = sink.pcm_fifo.pop_front().unwrap_or([0, 0]);
                 }
@@ -1072,8 +1078,19 @@ impl AudioRuntime {
                     return (8, None);
                 }
                 let sid = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
-                self.streams
-                    .retain(|s| !(s.stream_id == sid && s.owner_client_id == client_id));
+                self.streams.retain_mut(|s| {
+                    if s.stream_id == sid && s.owner_client_id == client_id {
+                        let has_tail = load_header(&s.ring).is_some_and(|h| {
+                            (h.flags & HARB_FLAG_EOS) != 0 && h.available_read() > 0
+                        });
+                        if has_tail {
+                            s.owner_disconnected = true;
+                            return true;
+                        }
+                        return false;
+                    }
+                    true
+                });
                 self.sync_virtio_running();
                 audio::write_header(rep, op, AudioStatus::Ok);
                 (8, None)

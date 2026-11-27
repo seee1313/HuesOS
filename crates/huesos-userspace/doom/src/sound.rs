@@ -82,9 +82,7 @@ impl DoomSoundState {
         // Guaranteed `Some` by initialization above.
         match self.music_player.as_mut() {
             Some(p) => p,
-            None => loop {
-                libcanvas::process::exit(-98);
-            },
+            None => libcanvas::process::exit(-98),
         }
     }
 

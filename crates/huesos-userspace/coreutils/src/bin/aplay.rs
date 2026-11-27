@@ -162,7 +162,7 @@ fn run() -> i32 {
             cu::errln(&format!("aplay: stream write failed: {e}"));
             return 1;
         }
-        stream.drain(400);
+        stream.drain(2500);
         cu::outln(&format!(
             "aplay: streamed {} stereo frames ({freq}Hz/{ms}ms) on HARB stream #{}",
             samples.len() / 2,
@@ -270,7 +270,7 @@ fn run() -> i32 {
         cu::errln(&format!("aplay: playback failed: {e}"));
         return 1;
     }
-    stream.drain(600);
+    stream.drain(2500);
 
     let frame_bytes = usize::from(hdr.channels) * usize::from(hdr.bits_per_sample / 8);
     let frames = hdr.data_len.checked_div(frame_bytes).unwrap_or(0);

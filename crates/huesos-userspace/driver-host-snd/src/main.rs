@@ -192,6 +192,7 @@ impl MappedWin {
     }
 }
 
+#[allow(dead_code)]
 #[derive(Clone, Copy)]
 struct Vt10CapInfo {
     common_bar: u8,
