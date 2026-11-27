@@ -73,6 +73,8 @@ pub mod pci_lease;
 pub mod pci_manager;
 /// Dedicated ACPI ↔ PCI configuration read mediation protocol (AP-10).
 pub mod pci_mediation;
+/// ACPI Notify/PCI hotplug event wire format and the Stage M.2 trigger ABI.
+pub mod pci_hotplug;
 /// Zero-bus-traffic USB 3.x (`xHCI`) inventory VMO wire format (`HUSB` v1).
 pub mod usb;
 
@@ -661,14 +663,21 @@ pub enum Syscall {
     /// `Fair` with `a2 = weight`, or `a1 = 1` for CBS `Deadline` with
     /// `a2 = capacity_ns` and `a3 = period_ns`).
     SchedSetPolicy = 95,
-    /// Bind an existing `DmaPool` `Resource` handle (`a2`, requiring
-    /// `READ | WRITE`) into the hardware IOMMU domain of an active
-    /// `DeviceLease` handle (`a1`, requiring `WRITE`) for `expected_generation`
-    /// (`a3`, Stage N.2).
+    /// Bind an existing boot-reserved `DmaPool` `Resource` handle (`a2`,
+    /// requiring `READ | WRITE`) into the hardware IOMMU domain of an active
+    /// `DeviceLease` handle (`a1`, requiring `WRITE`) for
+    /// `expected_generation` (`a3`, Stage N.2). Static boot slices are
+    /// unbound; a live-hotplug slice must already be bound to this exact
+    /// lease generation.
     DeviceLeaseAttachDma = 96,
     /// Read live Ring-0 hardware IOMMU translation telemetry into `a1`
     /// (`*mut pci_iommu::KernelIommuStatus`, unprivileged, Stage N.2).
     SystemIommuStatus = 97,
+    /// Submit one bounded ACPI/PCI hotplug trigger from a ring-3 test client.
+    /// `a1` points to [`pci_hotplug::PciHotplugTriggerArgs`]; the channel
+    /// capability inside the argument is the only authority to deliver the
+    /// event to `pci-manager` (Stage M.2).
+    PciHotplugTrigger = 98,
 }
 
 /// Userspace execution personality tracked per [`Process`] and published in
@@ -1022,7 +1031,7 @@ impl Syscall {
     /// Total number of defined syscalls (i.e. one past the highest
     /// currently-assigned number). The dispatcher uses this to reject
     /// obviously-out-of-range numbers before a `match`.
-    pub const COUNT: u64 = 98;
+    pub const COUNT: u64 = 99;
 
     /// Convert a raw syscall number back into a [`Syscall`], if valid.
     pub const fn from_raw(n: u64) -> Option<Self> {
@@ -1125,6 +1134,7 @@ impl Syscall {
             95 => Self::SchedSetPolicy,
             96 => Self::DeviceLeaseAttachDma,
             97 => Self::SystemIommuStatus,
+            98 => Self::PciHotplugTrigger,
             _ => return None,
         })
     }
@@ -1373,6 +1383,10 @@ pub const INIT_CONFIG_MINT_HANDLE: HandleValue = 8;
 /// [`Syscall::DeviceLeaseCreate`]. `init` delegates it to the supervised
 /// driver stack (`DriverManager` / `PCI Manager`).
 pub const INIT_DEVICE_LEASE_AUTH_HANDLE: HandleValue = 9;
+/// Read-only `Irq` resource for the firmware SCI GSI. It is minted by the
+/// kernel from the validated FADT policy and transferred only to the isolated
+/// ACPI manager, which uses it to bind the real SCI to a userspace Port.
+pub const INIT_ACPI_SCI_IRQ_HANDLE: HandleValue = 10;
 
 /// Stable process exit codes used when the kernel terminates a process after
 /// an unhandled ring-3 CPU exception.
@@ -2119,7 +2133,7 @@ mod tests {
         assert_eq!(Syscall::ResourceUnmap as u64, 65);
         assert_eq!(Syscall::InterruptCreateGsiForResource as u64, 66);
         assert_eq!(Syscall::InterruptAcknowledge as u64, 67);
-        assert_eq!(Syscall::COUNT, 98);
+        assert_eq!(Syscall::COUNT, 99);
         assert_eq!(Syscall::SystemTaskQuery as u64, 87);
         assert_eq!(Syscall::HandleGetKoid as u64, 88);
         assert_eq!(Syscall::ProcessSetAffinityMask256 as u64, 89);
@@ -2131,6 +2145,7 @@ mod tests {
         assert_eq!(Syscall::SchedSetPolicy as u64, 95);
         assert_eq!(Syscall::DeviceLeaseAttachDma as u64, 96);
         assert_eq!(Syscall::SystemIommuStatus as u64, 97);
+        assert_eq!(Syscall::PciHotplugTrigger as u64, 98);
         assert_eq!(Syscall::ProcessTerminate as u64, 83);
         assert_eq!(Syscall::FutexWait as u64, 84);
         assert_eq!(Syscall::FutexWake as u64, 85);
@@ -2167,7 +2182,8 @@ mod tests {
         assert_eq!(Syscall::from_raw(95), Some(Syscall::SchedSetPolicy));
         assert_eq!(Syscall::from_raw(96), Some(Syscall::DeviceLeaseAttachDma));
         assert_eq!(Syscall::from_raw(97), Some(Syscall::SystemIommuStatus));
-        assert_eq!(Syscall::from_raw(98), None);
+        assert_eq!(Syscall::from_raw(98), Some(Syscall::PciHotplugTrigger));
+        assert_eq!(Syscall::from_raw(99), None);
         assert_eq!(Syscall::from_raw(28), Some(Syscall::VmoCreateEx));
         assert_eq!(Syscall::from_raw(30), Some(Syscall::VmarProtect));
         assert_eq!(Syscall::from_raw(31), Some(Syscall::ChannelPeek));
@@ -2258,8 +2274,9 @@ mod tests {
         assert_eq!(Syscall::from_raw(95), Some(Syscall::SchedSetPolicy));
         assert_eq!(Syscall::from_raw(96), Some(Syscall::DeviceLeaseAttachDma));
         assert_eq!(Syscall::from_raw(97), Some(Syscall::SystemIommuStatus));
+        assert_eq!(Syscall::from_raw(98), Some(Syscall::PciHotplugTrigger));
         // Append-only: the next number past the newest syscall stays unmapped.
-        assert_eq!(Syscall::from_raw(98), None);
+        assert_eq!(Syscall::from_raw(99), None);
     }
 
     #[test]
@@ -2394,6 +2411,8 @@ mod tests {
         assert_eq!(super::INIT_FRAME_DRAW_HANDLE, 6);
         assert_eq!(super::INIT_CMDLINE_HANDLE, 7);
         assert_eq!(super::INIT_CONFIG_MINT_HANDLE, 8);
+        assert_eq!(super::INIT_DEVICE_LEASE_AUTH_HANDLE, 9);
+        assert_eq!(super::INIT_ACPI_SCI_IRQ_HANDLE, 10);
         assert_eq!(super::INIT_STORAGE_BOOT_INFO_HANDLE, 5);
     }
 

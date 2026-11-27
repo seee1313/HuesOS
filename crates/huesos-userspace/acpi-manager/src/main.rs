@@ -28,6 +28,9 @@ struct BootstrapInputs {
     archive: Option<Vmo>,
     broker: Option<libcanvas::acpi_broker::AcpiBroker>,
     self_vmar: Option<Vmar>,
+    sci_irq: Option<libcanvas::Handle>,
+    sci_settled: bool,
+    hotplug_events: Option<Channel>,
 }
 
 impl BootstrapInputs {
@@ -38,6 +41,9 @@ impl BootstrapInputs {
             archive: None,
             broker: None,
             self_vmar: None,
+            sci_irq: None,
+            sci_settled: false,
+            hotplug_events: None,
         }
     }
 
@@ -46,6 +52,8 @@ impl BootstrapInputs {
             && self.archive.is_some()
             && self.broker.is_some()
             && self.self_vmar.is_some()
+            && self.sci_settled
+            && self.hotplug_events.is_some()
     }
 }
 
@@ -167,6 +175,43 @@ pub extern "C" fn _start() -> ! {
         libcanvas::process::exit(-6);
     }
     huesos_uacpi_runtime::work::reset_generation(generation);
+    if let Some(sci_irq) = inputs.sci_irq.take() {
+        if !huesos_uacpi_runtime::work::install_sci_irq(sci_irq) {
+            println!("[acpi-manager] SCI Port/Interrupt installation failed");
+            send_failure(
+                &bootstrap,
+                generation,
+                acpi_manager::Status::BrokerDenied,
+                0,
+            );
+            libcanvas::process::exit(-7);
+        }
+        println!("[acpi-manager] FADT SCI bound to private Port");
+    } else {
+        println!("[acpi-manager] no validated FADT SCI; hotplug IRQ delivery disabled");
+    }
+    let Some(hotplug_events) = inputs.hotplug_events.take() else {
+        send_failure(
+            &bootstrap,
+            generation,
+            acpi_manager::Status::MissingCapability,
+            3,
+        );
+        libcanvas::process::exit(-7);
+    };
+    if !huesos_uacpi_runtime::work::install_hotplug_channel(
+        hotplug_events,
+        summary.firmware_snapshot_id,
+    ) {
+        println!("[acpi-manager] private PCI hotplug channel installation failed");
+        send_failure(
+            &bootstrap,
+            generation,
+            acpi_manager::Status::MissingCapability,
+            3,
+        );
+        libcanvas::process::exit(-7);
+    }
     match huesos_uacpi_runtime::namespace::load_namespace(summary.firmware_snapshot_id) {
         Ok(ns) => println!(
             "[acpi-manager] AML namespace loaded (snapshot {}, degraded={})",
@@ -183,6 +228,18 @@ pub extern "C" fn _start() -> ! {
             libcanvas::process::exit(-7);
         }
     }
+
+    if let Err(err) = huesos_uacpi_runtime::namespace::install_hotplug_notify() {
+        println!("[acpi-manager] ACPI Notify handler installation failed: {:?}", err);
+        send_failure(
+            &bootstrap,
+            generation,
+            acpi_manager::Status::BrokerDenied,
+            0,
+        );
+        libcanvas::process::exit(-8);
+    }
+    println!("[acpi-manager] SCI -> GPE -> Notify hotplug bridge installed");
 
     if !send_control(
         &bootstrap,
@@ -254,14 +311,22 @@ pub extern "C" fn _start() -> ! {
             hmcf_image.as_ref().map(|(buf, len)| &buf[..*len]),
             hiom_image.as_ref().map(|(buf, len)| &buf[..*len]),
         );
+        if huesos_uacpi_runtime::work::poll_sci_packet() {
+            if let Err(err) = huesos_uacpi_runtime::namespace::dispatch_sci() {
+                println!("[acpi-manager] SCI dispatch failed: {:?}", err);
+            }
+            huesos_uacpi_runtime::work::acknowledge_sci();
+        }
         let elapsed = now.saturating_sub(last_heartbeat);
         let timeout_ticks = 100u64.saturating_sub(elapsed).clamp(1, 100);
-        let item = [libcanvas::WaitItem::new(
-            bootstrap.handle().raw(),
-            libcanvas::Signals::READABLE | libcanvas::Signals::PEER_CLOSED,
-            0,
-        )];
-        if let Err(err) = libcanvas::wait_any(&item, timeout_ticks) {
+        let awaited = libcanvas::Signals::READABLE | libcanvas::Signals::PEER_CLOSED;
+        let mut items = [libcanvas::WaitItem::new(bootstrap.handle().raw(), awaited, 0); 2];
+        let mut item_count = 1usize;
+        if let Some(port) = huesos_uacpi_runtime::work::sci_port_handle() {
+            items[item_count] = libcanvas::WaitItem::new(port, awaited, 1);
+            item_count += 1;
+        }
+        if let Err(err) = libcanvas::wait_any(&items[..item_count], timeout_ticks) {
             if err != ErrorCode::TimedOut {
                 libcanvas::system::sleep_ms(10);
             }
@@ -518,7 +583,30 @@ fn receive_bootstrap(bootstrap: &Channel) -> Option<BootstrapInputs> {
                     }
                     inputs.self_vmar = Some(Vmar::from_handle(handle));
                 }
+                Ok((length, Some(handle))) if &bytes[..length] == acpi_manager::SCI_IRQ_LABEL => {
+                    if inputs.sci_settled || inputs.sci_irq.is_some() {
+                        drop(handle);
+                        return None;
+                    }
+                    inputs.sci_irq = Some(handle);
+                    inputs.sci_settled = true;
+                }
+                Ok((length, Some(handle)))
+                    if &bytes[..length] == acpi_manager::HOTPLUG_EVENTS_LABEL =>
+                {
+                    if inputs.hotplug_events.is_some() {
+                        drop(handle);
+                        return None;
+                    }
+                    inputs.hotplug_events = Some(Channel::from_handle(handle));
+                }
                 Ok((_length, Some(handle))) => drop(handle),
+                Ok((length, None)) if &bytes[..length] == acpi_manager::SCI_UNAVAILABLE_LABEL => {
+                    if inputs.sci_settled {
+                        return None;
+                    }
+                    inputs.sci_settled = true;
+                }
                 Ok((length, None)) => {
                     let message = acpi_manager::decode(&bytes[..length])?;
                     if message.opcode != acpi_manager::Opcode::Hello

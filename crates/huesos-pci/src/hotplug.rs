@@ -16,7 +16,7 @@
 use alloc::vec::Vec;
 
 use crate::lease::{
-    DeviceId, DeviceLeasePolicy, DmaIsolation, LeaseError, LeaseEvent, LeaseGeneration,
+    DeviceId, DeviceLeasePolicy, DmaIsolation, LeaseError, LeaseEvent, LeaseGeneration, LeaseState,
     RelocationClass,
 };
 use crate::resource_planner::{
@@ -123,10 +123,24 @@ impl HotplugEventQueue {
             if let Some(existing) = &mut self.entries[idx] {
                 if existing.target == event.target {
                     let same_or_upgrade = existing.kind == event.kind
-                        || (existing.kind == HotplugEventKind::OrderlyEject
-                            && event.kind == HotplugEventKind::SurpriseLinkDown);
+                        || matches!(
+                            (existing.kind, event.kind),
+                            (
+                                HotplugEventKind::OrderlyEject,
+                                HotplugEventKind::SurpriseLinkDown
+                            ) | (
+                                HotplugEventKind::SurpriseLinkDown,
+                                HotplugEventKind::OrderlyEject
+                            )
+                        );
                     if same_or_upgrade {
-                        existing.kind = event.kind;
+                        // Surprise removal dominates an orderly request no
+                        // matter which notification arrived first. This is
+                        // both safer for vanished hardware and keeps a
+                        // surprise/orderly storm in one bounded queue slot.
+                        if event.kind == HotplugEventKind::SurpriseLinkDown {
+                            existing.kind = HotplugEventKind::SurpriseLinkDown;
+                        }
                         existing.manager_generation = event.manager_generation;
                         self.coalesced_count = self.coalesced_count.saturating_add(1);
                         return true;
@@ -180,8 +194,10 @@ pub struct HotplugInsertionCandidate {
     pub relocation: RelocationClass,
     /// DMA isolation mode for the new lease.
     pub dma_isolation: DmaIsolation,
-    /// DriverHost process KOID to attach upon configuration.
-    pub driver_process_koid: u64,
+    /// DriverHost process KOID to attach upon configuration. `None` keeps the
+    /// lease in `Configured` until DriverManager completes the live binding
+    /// handshake; it must never be replaced with a made-up KOID.
+    pub driver_process_koid: Option<u64>,
     /// Sized BAR requirements (`0..=6`).
     pub bars: Vec<HotplugBarRequirement>,
 }
@@ -253,7 +269,7 @@ impl HotplugCoordinator {
     pub fn from_boot_plan(
         bridge_bus_ranges: &[(PciAddress, u8, u8)],
         plan: &ResourcePlan,
-        initial_leases: &[(PciAddress, RelocationClass, DmaIsolation, u64)],
+        initial_leases: &[(PciAddress, RelocationClass, DmaIsolation, Option<u64>)],
     ) -> Result<Self, HotplugError> {
         let mut bridge_windows = Vec::new();
         let mut active_resources = Vec::new();
@@ -286,7 +302,7 @@ impl HotplugCoordinator {
             .try_reserve_exact(initial_leases.len())
             .map_err(|_| HotplugError::NoMemory)?;
 
-        for &(addr, reloc, dma, koid) in initial_leases {
+        for &(addr, reloc, dma, driver_process_koid) in initial_leases {
             let dev_id = DeviceId::try_new(next_device_id).map_err(HotplugError::Lease)?;
             next_device_id = next_device_id
                 .checked_add(1)
@@ -301,15 +317,20 @@ impl HotplugCoordinator {
             policy
                 .apply(gen_id, LeaseEvent::Configure)
                 .map_err(HotplugError::Lease)?;
-            policy
-                .apply(gen_id, LeaseEvent::StartDriver { process_koid: koid })
-                .map_err(HotplugError::Lease)?;
-            policy
-                .apply(gen_id, LeaseEvent::DriverReady)
-                .map_err(HotplugError::Lease)?;
+            if let Some(process_koid) = driver_process_koid {
+                if process_koid == 0 {
+                    return Err(HotplugError::Lease(LeaseError::InvalidIdentity));
+                }
+                policy
+                    .apply(gen_id, LeaseEvent::StartDriver { process_koid })
+                    .map_err(HotplugError::Lease)?;
+                policy
+                    .apply(gen_id, LeaseEvent::DriverReady)
+                    .map_err(HotplugError::Lease)?;
+            }
             active_slots.push(ManagedSlot {
                 policy,
-                service_published: true,
+                service_published: driver_process_koid.is_some(),
             });
         }
 
@@ -389,7 +410,25 @@ impl HotplugCoordinator {
         staged_bars
             .try_reserve_exact(candidate.bars.len())
             .map_err(|_| HotplugError::NoMemory)?;
+        // Reserve all coordinator state before the first hardware write. A
+        // bounded allocation failure after a BAR commit would otherwise leave
+        // silicon configured without a lease record.
+        self.active_resources
+            .try_reserve(candidate.bars.len())
+            .map_err(|_| HotplugError::NoMemory)?;
+        self.active_slots
+            .try_reserve(1)
+            .map_err(|_| HotplugError::NoMemory)?;
+        let write_capacity = candidate
+            .bars
+            .len()
+            .checked_mul(2)
+            .and_then(|count| count.checked_add(1))
+            .ok_or(HotplugError::NoMemory)?;
         let mut staged_writes: Vec<PlannedWrite> = Vec::new();
+        staged_writes
+            .try_reserve_exact(write_capacity)
+            .map_err(|_| HotplugError::NoMemory)?;
 
         for req in &candidate.bars {
             if req.bar_index >= 6 || req.len == 0 || !req.len.is_power_of_two() {
@@ -425,6 +464,11 @@ impl HotplugCoordinator {
             };
             let write_mask = if req.len <= u64::from(u32::MAX) {
                 !((req.len as u32).wrapping_sub(1)) & lo_mask
+            } else if req.is_64bit {
+                // A BAR larger than 4 GiB still needs its low dword
+                // programmed; only its size alignment, not the address
+                // register, is absent from the 32-bit mask.
+                lo_mask
             } else {
                 0
             };
@@ -496,9 +540,6 @@ impl HotplugCoordinator {
             expected_readback_mask: 0x0406,
         });
 
-        let commit_plan = build_direct_commit_plan(self.next_generation, staged_writes);
-        execute_commit_plan(&commit_plan, transport).map_err(HotplugError::HardwareCommitFailed)?;
-
         let dev_id = DeviceId::try_new(self.next_device_id).map_err(HotplugError::Lease)?;
         self.next_device_id = self
             .next_device_id
@@ -521,33 +562,74 @@ impl HotplugCoordinator {
         policy
             .apply(gen_id, LeaseEvent::Configure)
             .map_err(HotplugError::Lease)?;
-        policy
-            .apply(
-                gen_id,
-                LeaseEvent::StartDriver {
-                    process_koid: candidate.driver_process_koid,
-                },
-            )
-            .map_err(HotplugError::Lease)?;
-        policy
-            .apply(gen_id, LeaseEvent::DriverReady)
-            .map_err(HotplugError::Lease)?;
+        if let Some(process_koid) = candidate.driver_process_koid {
+            if process_koid == 0 {
+                return Err(HotplugError::Lease(LeaseError::InvalidIdentity));
+            }
+            policy
+                .apply(gen_id, LeaseEvent::StartDriver { process_koid })
+                .map_err(HotplugError::Lease)?;
+            policy
+                .apply(gen_id, LeaseEvent::DriverReady)
+                .map_err(HotplugError::Lease)?;
+        }
 
-        self.active_resources
-            .try_reserve(staged_bars.len())
-            .map_err(|_| HotplugError::NoMemory)?;
+        let commit_plan = build_direct_commit_plan(gen_id.get(), staged_writes);
+        execute_commit_plan(&commit_plan, transport).map_err(HotplugError::HardwareCommitFailed)?;
+
         for bar in &staged_bars {
             self.active_resources.push(*bar);
         }
-        self.active_slots
-            .try_reserve(1)
-            .map_err(|_| HotplugError::NoMemory)?;
+        let service_published = candidate.driver_process_koid.is_some();
         self.active_slots.push(ManagedSlot {
             policy,
-            service_published: true,
+            service_published,
         });
 
         Ok((policy, staged_bars))
+    }
+
+    /// Attach a real DriverHost identity to a configured hotplug lease.
+    ///
+    /// The caller must obtain the KOID from DriverManager; a zero or synthetic
+    /// identity is rejected and the lease remains `Configured`.
+    pub fn attach_driver(
+        &mut self,
+        address: PciAddress,
+        process_koid: u64,
+    ) -> Result<(), HotplugError> {
+        if process_koid == 0 {
+            return Err(HotplugError::Lease(LeaseError::InvalidIdentity));
+        }
+        let Some(slot) = self
+            .active_slots
+            .iter_mut()
+            .find(|slot| slot.policy.address() == address)
+        else {
+            return Err(HotplugError::DeviceNotFound);
+        };
+        let generation = slot.policy.generation();
+        slot.policy
+            .apply(generation, LeaseEvent::StartDriver { process_koid })
+            .map_err(HotplugError::Lease)?;
+        Ok(())
+    }
+
+    /// Mark an attached hotplug DriverHost ready and publish its service.
+    pub fn driver_ready(&mut self, address: PciAddress) -> Result<(), HotplugError> {
+        let Some(slot) = self
+            .active_slots
+            .iter_mut()
+            .find(|slot| slot.policy.address() == address)
+        else {
+            return Err(HotplugError::DeviceNotFound);
+        };
+        let generation = slot.policy.generation();
+        slot.policy
+            .apply(generation, LeaseEvent::DriverReady)
+            .map_err(HotplugError::Lease)?;
+        slot.service_published = true;
+        Ok(())
     }
 
     /// Perform orderly hotplug removal: drain, disable decoding/bus-master, revoke
@@ -566,6 +648,7 @@ impl HotplugCoordinator {
         };
 
         let revoked_gen = self.active_slots[pos].policy.generation();
+        let prior_state = self.active_slots[pos].policy.state();
         self.active_slots[pos]
             .policy
             .apply(revoked_gen, LeaseEvent::BeginRemoval)
@@ -573,10 +656,22 @@ impl HotplugCoordinator {
         // Withdraw service immediately so no new opens succeed while quiescing.
         self.active_slots[pos].service_published = false;
 
-        let tr = self.active_slots[pos]
-            .policy
-            .apply(revoked_gen, LeaseEvent::DriverQuiesced)
-            .map_err(HotplugError::Lease)?;
+        // A live DriverHost must acknowledge quiesce. A newly inserted device
+        // may still be `Configured` while the supervisor is waiting for its
+        // binding decision; that state is removed directly after the same
+        // command-disable transaction, without inventing a quiesce ACK.
+        let removal_generation = if matches!(
+            prior_state,
+            LeaseState::DriverStarting | LeaseState::Online
+        ) {
+            self.active_slots[pos]
+                .policy
+                .apply(revoked_gen, LeaseEvent::DriverQuiesced)
+                .map_err(HotplugError::Lease)?
+                .generation
+        } else {
+            self.active_slots[pos].policy.generation()
+        };
 
         // Disable I/O, Memory Space, and Bus Master in PCI Command register.
         let cur_cmd = transport
@@ -599,16 +694,16 @@ impl HotplugCoordinator {
 
         self.active_slots[pos]
             .policy
-            .apply(tr.generation, LeaseEvent::CompleteRemoval)
+            .apply(removal_generation, LeaseEvent::CompleteRemoval)
             .map_err(HotplugError::Lease)?;
 
         let slot = self.active_slots.remove(pos);
         self.active_resources.retain(|r| r.owner != address);
-        // Advance coordinator generation past `tr.generation` so subsequent
-        // insertions at the same BDF never collide with the retired lease's generation.
-        if self.next_generation <= tr.generation.get() {
-            self.next_generation = tr
-                .generation
+        // Advance coordinator generation past the revoked generation so
+        // subsequent insertions at the same BDF never collide with the
+        // retired lease's generation.
+        if self.next_generation <= removal_generation.get() {
+            self.next_generation = removal_generation
                 .get()
                 .checked_add(1)
                 .ok_or(HotplugError::Lease(LeaseError::GenerationExhausted))?;
@@ -619,7 +714,7 @@ impl HotplugCoordinator {
         Ok(DeviceGoneNotification {
             device_id: dev_id,
             revoked_generation: revoked_gen,
-            new_generation: tr.generation,
+            new_generation: removal_generation,
             last_address: address,
             surprise: false,
             service_withdrawn: true,
@@ -853,6 +948,47 @@ mod tests {
     }
 
     #[test]
+    fn surprise_removal_dominates_orderly_storm_in_either_arrival_order() {
+        let target = HotplugTarget::Function(bdf(2, 0));
+        let mut queue = HotplugEventQueue::new();
+        assert!(queue.push(HotplugEvent {
+            target,
+            kind: HotplugEventKind::OrderlyEject,
+            manager_generation: 1,
+        }));
+        assert!(queue.push(HotplugEvent {
+            target,
+            kind: HotplugEventKind::SurpriseLinkDown,
+            manager_generation: 2,
+        }));
+        assert_eq!(queue.len(), 1);
+        assert_eq!(queue.coalesced_count(), 1);
+        let Some(event) = queue.pop() else {
+            assert!(false, "coalesced event must remain queued");
+            return;
+        };
+        assert_eq!(event.kind, HotplugEventKind::SurpriseLinkDown);
+        assert_eq!(event.manager_generation, 2);
+
+        assert!(queue.push(HotplugEvent {
+            target,
+            kind: HotplugEventKind::SurpriseLinkDown,
+            manager_generation: 3,
+        }));
+        assert!(queue.push(HotplugEvent {
+            target,
+            kind: HotplugEventKind::OrderlyEject,
+            manager_generation: 4,
+        }));
+        let Some(event) = queue.pop() else {
+            assert!(false, "reverse-order coalesced event must remain queued");
+            return;
+        };
+        assert_eq!(event.kind, HotplugEventKind::SurpriseLinkDown);
+        assert_eq!(event.manager_generation, 4);
+    }
+
+    #[test]
     fn thousand_add_remove_cycles_preserve_online_nvme_have_zero_leaks_and_reject_stale_handles() {
         let roots = [RootBus {
             root_id: 1,
@@ -932,7 +1068,7 @@ mod tests {
         let Ok(mut coord) = HotplugCoordinator::from_boot_plan(
             &[(bridge, 1, 4)],
             &plan,
-            &[(nvme, RelocationClass::Fixed, DmaIsolation::Trusted, 100)],
+            &[(nvme, RelocationClass::Fixed, DmaIsolation::Trusted, Some(100))],
         ) else {
             assert!(false);
             return;
@@ -955,7 +1091,7 @@ mod tests {
             address: hotplug_ep,
             relocation: RelocationClass::Restart,
             dma_isolation: DmaIsolation::Trusted,
-            driver_process_koid: 200,
+            driver_process_koid: Some(200),
             bars,
         };
 

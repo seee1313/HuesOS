@@ -44,9 +44,10 @@ use core::fmt::Write as _;
 use core::panic::PanicInfo;
 use huesos_abi::hmcf;
 use huesos_abi::pci::{self as abi_pci, ApertureKind, RootBridgeTable};
+use huesos_abi::pci_hotplug;
 use huesos_abi::pci_inventory;
 use huesos_abi::pci_iommu;
-use huesos_abi::pci_lease::pack_pci_address;
+use huesos_abi::pci_lease::{pack_pci_address, unpack_pci_address};
 use huesos_abi::pci_manager::{self, Message, Opcode, Status, MESSAGE_BYTES};
 use huesos_abi::pci_mediation::{
     self, Opcode as MediationOpcode, Request, Response, Status as MediationStatus, ValidRequest,
@@ -68,9 +69,10 @@ use huesos_pci::lease::{
 };
 use huesos_pci::resource_planner::{self, ResourcePlan};
 use huesos_pci::resource_validation::{
-    ResourceClass, ResourceRegister, ResourceStatus, RootAperture, ValidationReport,
+    FirmwareResource, ResourceClass, ResourceRegister, ResourceStatus, RootAperture,
+    ValidationReport,
 };
-use huesos_pci::topology::RootBus;
+use huesos_pci::topology::{FunctionKind, Parent, RootBus, TopologySnapshot};
 use huesos_pci::write_policy::{
     self, ConfigReadWriteTransport, HeaderKind, WriteClass, WritePolicyError, WriteRequest,
     COMMAND_WRITABLE_MASK, OFFSET_COMMAND,
@@ -94,6 +96,12 @@ static HEAP: libcanvas::heap::ScudoHeap = libcanvas::heap::ScudoHeap::new();
 const CONFIG_WINDOW_VA_BASE: u64 = 0x0000_0001_0000_0000;
 /// Temporary VA used solely while pci-manager programs an endpoint's MSI-X table.
 const MSIX_TEMP_VA_BASE: u64 = 0x0000_0002_0000_0000;
+/// The first fixed portion of the boot pool is reserved for NVMe, network,
+/// WLAN, and xHCI grants. The kernel reserves the ABI-defined slices for
+/// bounded live NVMe hotplug; this bitmap is only a scheduling hint.
+const HOTPLUG_DMA_OFFSET: u64 = huesos_abi::storage_boot::HOTPLUG_DMA_OFFSET;
+const HOTPLUG_DMA_SLOT_LEN: u64 = huesos_abi::storage_boot::HOTPLUG_DMA_SLOT_LEN;
+const HOTPLUG_DMA_SLOTS: u8 = huesos_abi::storage_boot::HOTPLUG_DMA_SLOT_COUNT as u8;
 
 #[unsafe(no_mangle)]
 pub extern "C" fn _start() -> ! {
@@ -123,7 +131,7 @@ pub extern "C" fn _start() -> ! {
     let mut last_heartbeat = libcanvas::system::monotonic_ticks().unwrap_or(0);
     loop {
         let mut did_work = false;
-        let mut bytes = [0u8; 64];
+        let mut bytes = [0u8; 96];
         match bootstrap.read_optional_handle(&mut bytes) {
             Ok((length, handle)) => {
                 did_work = true;
@@ -141,6 +149,9 @@ pub extern "C" fn _start() -> ! {
             Err(_) => libcanvas::process::exit(0),
         }
         if authority.authorized {
+            if poll_hotplug_events(&bootstrap, &mut authority, hello.manager_generation) {
+                did_work = true;
+            }
             serve_mediation(&mut authority, hello.manager_generation);
         }
 
@@ -161,10 +172,14 @@ pub extern "C" fn _start() -> ! {
             continue;
         }
         let awaited = libcanvas::Signals::READABLE | libcanvas::Signals::PEER_CLOSED;
-        let mut items = [libcanvas::WaitItem::new(bootstrap.handle().raw(), awaited, 0); 2];
+        let mut items = [libcanvas::WaitItem::new(bootstrap.handle().raw(), awaited, 0); 3];
         let mut count = 1usize;
         if let Some(mediation) = authority.mediation.as_ref() {
             items[count] = libcanvas::WaitItem::new(mediation.handle().raw(), awaited, 1);
+            count += 1;
+        }
+        if let Some(events) = authority.hotplug_events.as_ref() {
+            items[count] = libcanvas::WaitItem::new(events.handle().raw(), awaited, 2);
             count += 1;
         }
         let elapsed = now.saturating_sub(last_heartbeat);
@@ -220,6 +235,24 @@ struct ConfigAuthority {
     #[cfg(feature = "force-legacy")]
     legacy_ioport: Option<IoPort>,
     mediation: Option<Channel>,
+    /// Private ACPI Notify event endpoint. Events are decoded and queued;
+    /// enumeration runs only from the bounded manager loop.
+    hotplug_events: Option<Channel>,
+    /// Storm-coalescing queue for ACPI/native PCIe hotplug notifications.
+    hotplug_queue: hotplug::HotplugEventQueue,
+    /// Optional runtime coordinator seeded from the firmware-preserving plan.
+    hotplug_coordinator: Option<hotplug::HotplugCoordinator>,
+    /// Boot DMA geometry supplied by DriverManager for dynamic endpoint
+    /// allocation. The descriptor is metadata only; every range is still
+    /// minted through the inserted endpoint's DeviceLease.
+    storage_boot: Option<huesos_abi::storage_boot::StorageBootInfo>,
+    /// Userspace scheduling hint for the four dynamic NVMe slices. The kernel
+    /// repeats the exact range check and owns the authoritative claim table.
+    hotplug_dma_slots: u8,
+    /// One bounded event retained until write authority and the live planner
+    /// are ready. A rescan observed during read-only bootstrap must not be
+    /// silently lost.
+    deferred_hotplug: Option<hotplug::HotplugEvent>,
     /// A fail-closed verdict was already reported; further bursts are
     /// ignored rather than double-reported.
     verdict_sent: bool,
@@ -246,6 +279,9 @@ struct ActiveDeviceLease {
     device_id: u64,
     generation: u64,
     handle: Handle,
+    /// Reserved dynamic DMA slice, if this lease owns one. Boot-time static
+    /// leases never consume the live-hotplug pool.
+    hotplug_dma_slot: Option<u8>,
 }
 
 /// One retained, mapped configuration window.
@@ -293,10 +329,1089 @@ impl Default for ConfigAuthority {
             #[cfg(feature = "force-legacy")]
             legacy_ioport: None,
             mediation: None,
+            hotplug_events: None,
+            hotplug_queue: hotplug::HotplugEventQueue::new(),
+            hotplug_coordinator: None,
+            storage_boot: None,
+            hotplug_dma_slots: 0,
+            deferred_hotplug: None,
             verdict_sent: false,
             authorized: false,
         }
     }
+}
+
+/// Drain a bounded number of private ACPI hotplug messages and process one
+/// queued event. Channel bytes are untrusted input; no hardware access occurs
+/// until the event has passed wire, Notify, generation, and target checks.
+fn poll_hotplug_events(
+    bootstrap: &Channel,
+    authority: &mut ConfigAuthority,
+    manager_generation: u64,
+) -> bool {
+    let mut did_work = false;
+    let mut bytes = [0u8; pci_hotplug::MESSAGE_BYTES];
+    let mut budget = 8usize;
+    loop {
+        if budget == 0 {
+            break;
+        }
+        budget -= 1;
+        let Some(events) = authority.hotplug_events.as_ref() else {
+            break;
+        };
+        match events.read_into(&mut bytes) {
+            Ok(length) => {
+                did_work = true;
+                let Some(wire) = pci_hotplug::HotplugWireEvent::decode(&bytes[..length]) else {
+                    println!("[pci-manager] hotplug event rejected: malformed wire");
+                    continue;
+                };
+                if pci_hotplug::acpi_notify_kind(wire.notify_value) != Some(wire.kind) {
+                    println!("[pci-manager] hotplug event rejected: Notify mismatch");
+                    continue;
+                }
+                let target = match wire.target {
+                    pci_hotplug::HotplugTargetKind::Root => {
+                        let root_id = if wire.root_id != 0 {
+                            wire.root_id
+                        } else if authority
+                            .roots
+                            .as_ref()
+                            .is_some_and(|table| table.root_count == 1)
+                        {
+                            authority.roots.as_ref().map_or(0, |table| table.roots[0].root_id)
+                        } else {
+                            0
+                        };
+                        if root_id == 0 {
+                            println!("[pci-manager] hotplug root event rejected: ambiguous root");
+                            continue;
+                        }
+                        hotplug::HotplugTarget::Root(root_id)
+                    }
+                    pci_hotplug::HotplugTargetKind::BridgePort => {
+                        let Ok(address) = PciAddress::try_new(
+                            wire.segment,
+                            wire.bus,
+                            wire.device,
+                            wire.function,
+                        ) else {
+                            println!("[pci-manager] hotplug bridge target rejected: invalid BDF");
+                            continue;
+                        };
+                        hotplug::HotplugTarget::BridgePort(address)
+                    }
+                    pci_hotplug::HotplugTargetKind::Function => {
+                        let Ok(address) = PciAddress::try_new(
+                            wire.segment,
+                            wire.bus,
+                            wire.device,
+                            wire.function,
+                        ) else {
+                            println!("[pci-manager] hotplug function target rejected: invalid BDF");
+                            continue;
+                        };
+                        hotplug::HotplugTarget::Function(address)
+                    }
+                };
+                if !hotplug_target_is_currently_accepted(authority, target) {
+                    println!(
+                        "[pci-manager] hotplug event rejected: target is outside accepted roots"
+                    );
+                    continue;
+                }
+                let event = hotplug::HotplugEvent {
+                    target,
+                    kind: wire.kind.into(),
+                    manager_generation,
+                };
+                if !authority.writable {
+                    if authority.deferred_hotplug.is_some() {
+                        println!("[pci-manager] hotplug event dropped: bootstrap slot occupied");
+                    } else {
+                        authority.deferred_hotplug = Some(event);
+                        println!("[pci-manager] hotplug event deferred until write authority");
+                    }
+                } else if !authority.hotplug_queue.push(event) {
+                    println!("[pci-manager] hotplug event dropped: queue full");
+                }
+            }
+            Err(ErrorCode::ShouldWait) | Err(ErrorCode::TimedOut) => break,
+            Err(error) => {
+                println!(
+                    "[pci-manager] hotplug event channel closed: {}",
+                    error.as_str()
+                );
+                // The endpoint is generation-scoped. Exiting lets
+                // DriverManager rebuild both supervised managers rather than
+                // silently running without firmware hotplug delivery.
+                libcanvas::process::exit(0);
+            }
+        }
+    }
+    if let Some(event) = authority.hotplug_queue.pop() {
+        process_hotplug_event(bootstrap, authority, event);
+        did_work = true;
+    }
+    did_work
+}
+
+impl From<pci_hotplug::HotplugNotifyKind> for hotplug::HotplugEventKind {
+    fn from(kind: pci_hotplug::HotplugNotifyKind) -> Self {
+        match kind {
+            pci_hotplug::HotplugNotifyKind::RescanSubtree => Self::RescanSubtree,
+            pci_hotplug::HotplugNotifyKind::OrderlyEject => Self::OrderlyEject,
+            pci_hotplug::HotplugNotifyKind::SurpriseLinkDown => Self::SurpriseLinkDown,
+        }
+    }
+}
+
+fn hotplug_target_is_currently_accepted(
+    authority: &ConfigAuthority,
+    target: hotplug::HotplugTarget,
+) -> bool {
+    let Some(table) = authority.roots.as_ref() else {
+        return false;
+    };
+    match target {
+        hotplug::HotplugTarget::Root(root_id) => table.roots[..table.root_count]
+            .iter()
+            .any(|root| root.root_id == root_id),
+        hotplug::HotplugTarget::BridgePort(address)
+        | hotplug::HotplugTarget::Function(address) => table.roots[..table.root_count]
+            .iter()
+            .any(|root| {
+                root.segment == address.segment()
+                    && address.bus() >= root.start_bus
+                    && address.bus() <= root.end_bus
+            }),
+    }
+}
+
+fn process_hotplug_event(
+    bootstrap: &Channel,
+    authority: &mut ConfigAuthority,
+    event: hotplug::HotplugEvent,
+) {
+    println!(
+        "[pci-manager] hotplug event queued kind={:?} target={:?} generation={}",
+        event.kind, event.target, event.manager_generation
+    );
+    match (event.kind, event.target) {
+        (hotplug::HotplugEventKind::RescanSubtree, target) => {
+            rescan_hotplug_subtree(
+                bootstrap,
+                authority,
+                target,
+                event.manager_generation,
+            );
+        }
+        (hotplug::HotplugEventKind::OrderlyEject, target) => {
+            let removed = remove_hotplug_scope(
+                bootstrap,
+                authority,
+                target,
+                false,
+                event.manager_generation,
+            );
+            if let Some(table) = authority.roots {
+                publish_inventory_from_hpci(bootstrap, authority, &table, event.manager_generation);
+            }
+            println!(
+                "[pci-manager] hotplug orderly eject target={:?} removed={}",
+                target, removed
+            );
+        }
+        (hotplug::HotplugEventKind::SurpriseLinkDown, target) => {
+            let removed = remove_hotplug_scope(
+                bootstrap,
+                authority,
+                target,
+                true,
+                event.manager_generation,
+            );
+            if let Some(table) = authority.roots {
+                publish_inventory_from_hpci(bootstrap, authority, &table, event.manager_generation);
+            }
+            println!(
+                "[pci-manager] hotplug surprise removal target={:?} removed={}",
+                target, removed
+            );
+        },
+    }
+}
+
+fn node_is_in_hotplug_target(
+    snapshot: &TopologySnapshot,
+    address: PciAddress,
+    target: hotplug::HotplugTarget,
+) -> bool {
+    match target {
+        hotplug::HotplugTarget::Function(expected) => address == expected,
+        hotplug::HotplugTarget::Root(root_id) => {
+            bar_sizing::root_id_of(snapshot, address) == Some(root_id)
+        }
+        hotplug::HotplugTarget::BridgePort(bridge) => {
+            if address == bridge {
+                return true;
+            }
+            let mut parent = snapshot.find(address).map(|node| node.parent);
+            let mut remaining = huesos_pci::topology::MAX_TOPOLOGY_DEPTH + 1;
+            while remaining != 0 {
+                remaining -= 1;
+                match parent {
+                    Some(Parent::Bridge(parent_address)) if parent_address == bridge => return true,
+                    Some(Parent::Bridge(parent_address)) => {
+                        parent = snapshot.find(parent_address).map(|node| node.parent);
+                    }
+                    Some(Parent::Root(_)) | None => return false,
+                }
+            }
+            false
+        }
+    }
+}
+
+fn root_and_apertures_from_hpci(
+    table: &huesos_abi::pci::RootBridgeTable,
+) -> Option<(Vec<RootBus>, Vec<RootAperture>)> {
+    let mut roots = Vec::new();
+    roots.try_reserve_exact(table.root_count).ok()?;
+    for root in &table.roots[..table.root_count] {
+        roots.push(RootBus {
+            root_id: root.root_id,
+            segment: root.segment,
+            start_bus: root.start_bus,
+            end_bus: root.end_bus,
+        });
+    }
+
+    let mut apertures = Vec::new();
+    apertures.try_reserve_exact(table.aperture_count).ok()?;
+    for aperture in &table.apertures[..table.aperture_count] {
+        let owner = table.roots.get(usize::from(aperture.root_index))?;
+        apertures.push(RootAperture {
+            root_id: owner.root_id,
+            class: aperture_class(aperture.kind),
+            pci_base: aperture.pci_base,
+            cpu_base: aperture.cpu_base,
+            len: aperture.len,
+        });
+    }
+    Some((roots, apertures))
+}
+
+/// Rescan one accepted root/bridge/function target and, when write authority
+/// is live, run the complete bounded insertion transaction for newly visible
+/// endpoints. The first scan is always read-only; BAR sizing is attempted only
+/// after the endpoint is proven absent from the previous immutable snapshot.
+fn rescan_hotplug_subtree(
+    bootstrap: &Channel,
+    authority: &mut ConfigAuthority,
+    target: hotplug::HotplugTarget,
+    manager_generation: u64,
+) {
+    let Some(table) = authority.roots else {
+        println!("[pci-manager] hotplug rescan withheld: no accepted HPCI roots");
+        return;
+    };
+    let Some((roots, apertures)) = root_and_apertures_from_hpci(&table) else {
+        println!("[pci-manager] hotplug rescan rejected: HPCI geometry allocation");
+        return;
+    };
+    let previous = authority
+        .inventory
+        .last_good()
+        .map(|inventory| inventory.snapshot.clone());
+    let scanned = {
+        let mut transport = ReadOnlyTransport {
+            windows: &authority.windows,
+            windows_len: authority.windows_len,
+            #[cfg(feature = "force-legacy")]
+            legacy_ioport: authority.legacy_ioport.as_ref(),
+        };
+        authority
+            .inventory
+            .publish_from_roots(&mut transport, &roots, &apertures)
+            .ok()
+            .map(|inventory| inventory.snapshot.clone())
+    };
+    let Some(snapshot) = scanned else {
+        println!("[pci-manager] hotplug rescan failed: read-only topology scan");
+        return;
+    };
+
+    let inserted = if authority.writable {
+        insert_new_hotplug_endpoints(
+            bootstrap,
+            authority,
+            &snapshot,
+            previous.as_ref(),
+            target,
+            &apertures,
+            manager_generation,
+        )
+    } else {
+        println!(
+            "[pci-manager] hotplug rescan observed without write authority; insertion withheld"
+        );
+        0
+    };
+
+    // Publish the post-transaction immutable inventory. A second read-only
+    // scan makes the HPIN generation include BARs and functions committed by
+    // the insertion path, while never making HPIN itself a source of truth.
+    publish_inventory_from_hpci(bootstrap, authority, &table, manager_generation);
+    println!(
+        "[pci-manager] hotplug rescan published diagnostic inventory target={:?} inserted={}",
+        target, inserted
+    );
+}
+
+fn insert_new_hotplug_endpoints(
+    bootstrap: &Channel,
+    authority: &mut ConfigAuthority,
+    snapshot: &TopologySnapshot,
+    previous: Option<&TopologySnapshot>,
+    target: hotplug::HotplugTarget,
+    apertures: &[RootAperture],
+    manager_generation: u64,
+) -> usize {
+    let Some(lease_authority) = authority.device_lease_authority.as_ref() else {
+        println!("[pci-manager] hotplug insertion withheld: DeviceLeaseAuthority absent");
+        return 0;
+    };
+    let Ok(lease_authority) = lease_authority.duplicate(huesos_abi::rights::SAME_RIGHTS) else {
+        println!("[pci-manager] hotplug insertion withheld: lease authority duplicate failed");
+        return 0;
+    };
+    if authority.hotplug_coordinator.is_none() {
+        println!("[pci-manager] hotplug insertion withheld: coordinator absent");
+        return 0;
+    }
+    let mut pending_leases: Vec<ActiveDeviceLease> = Vec::new();
+    if pending_leases
+        .try_reserve(snapshot.nodes().len())
+        .is_err()
+        || authority.leases.try_reserve(snapshot.nodes().len()).is_err()
+    {
+        println!("[pci-manager] hotplug insertion withheld: bounded lease allocation");
+        return 0;
+    }
+    let iommu_isolated = authority
+        .iommu
+        .is_some_and(|snapshot| snapshot.active_mode == pci_iommu::IommuMode::Isolated);
+    let windows = &authority.windows;
+    let windows_len = authority.windows_len;
+    let writable = authority.writable;
+    let storage_boot = authority.storage_boot;
+    let storage_off = authority.storage_off;
+    let mut hotplug_dma_slots = authority.hotplug_dma_slots;
+    #[cfg(feature = "force-legacy")]
+    let legacy_ioport = authority.legacy_ioport.as_ref();
+    let mut transport = ReadWriteTransport {
+        windows,
+        windows_len,
+        writable,
+        #[cfg(feature = "force-legacy")]
+        legacy_ioport,
+    };
+    let Some(coordinator) = authority.hotplug_coordinator.as_mut() else {
+        return 0;
+    };
+
+    let mut inserted = 0usize;
+    for node in snapshot.nodes() {
+        let address = node.function.address;
+        if previous.is_some_and(|old| old.find(address).is_some())
+            || !node_is_in_hotplug_target(snapshot, address, target)
+            || !matches!(node.function.kind, FunctionKind::Endpoint)
+        {
+            continue;
+        }
+        let driver = if storage_off {
+            None
+        } else {
+            hotplug_driver_kind(node.function.class_code)
+        };
+        let Parent::Bridge(parent_bridge) = node.parent else {
+            println!(
+                "[pci-manager] hotplug endpoint {:?} has no reserved parent bridge",
+                address
+            );
+            continue;
+        };
+        let Some(root_id) = bar_sizing::root_id_of(snapshot, address) else {
+            println!("[pci-manager] hotplug endpoint {:?} has no root", address);
+            continue;
+        };
+
+        let mut resources: Vec<FirmwareResource> = Vec::new();
+        let mut rom_bars = Vec::new();
+        if bar_sizing::size_function_bars(
+            &mut transport,
+            address,
+            HeaderKind::Type0Endpoint,
+            root_id,
+            apertures,
+            &mut resources,
+            &mut rom_bars,
+        )
+        .is_err()
+        {
+            println!(
+                "[pci-manager] hotplug endpoint {:?} BAR sizing failed; no writes committed",
+                address
+            );
+            continue;
+        }
+
+        let mut bars = Vec::new();
+        if bars.try_reserve(resources.len()).is_err() {
+            println!("[pci-manager] hotplug endpoint {:?} BAR requirement allocation failed", address);
+            continue;
+        }
+        let mut malformed_bar = false;
+        for resource in resources {
+            let ResourceRegister::Bar(bar_index) = resource.register else {
+                continue;
+            };
+            if resource.len == 0 || !resource.len.is_power_of_two() {
+                println!(
+                    "[pci-manager] hotplug endpoint {:?} rejected malformed BAR length",
+                    address
+                );
+                malformed_bar = true;
+                break;
+            }
+            let raw = transport
+                .read_width(
+                    address,
+                    0x10u16.saturating_add(u16::from(bar_index) * 4),
+                    ConfigWidth::Dword,
+                )
+                .unwrap_or(0);
+            bars.push(hotplug::HotplugBarRequirement {
+                bar_index,
+                class: resource.class,
+                len: resource.len,
+                is_64bit: (raw & 0x6) == 0x4,
+            });
+        }
+        if malformed_bar {
+            continue;
+        }
+
+        let packed = match pack_pci_address(
+            address.segment(),
+            address.bus(),
+            address.device(),
+            address.function(),
+        ) {
+            Some(value) => value,
+            None => continue,
+        };
+        let dma_isolation = if iommu_isolated {
+            DmaIsolation::IommuDomain(packed.saturating_add(1))
+        } else {
+            DmaIsolation::Trusted
+        };
+        let candidate = hotplug::HotplugInsertionCandidate {
+            parent_bridge,
+            address,
+            relocation: rebalance::effective_relocation_class(node.function.class_code, None),
+            dma_isolation,
+            driver_process_koid: None,
+            bars,
+        };
+        let Ok((policy, planned_resources)) = coordinator.insert_endpoint(&candidate, &mut transport) else {
+            println!(
+                "[pci-manager] hotplug endpoint {:?} insertion rejected; firmware preserved",
+                address
+            );
+            continue;
+        };
+
+        let bar0 = planned_resources.iter().find(|resource| {
+            resource.register == ResourceRegister::Bar(0)
+                && resource.len >= 0x1000
+                && matches!(
+                    resource.class,
+                    ResourceClass::Mmio32
+                        | ResourceClass::Mmio64
+                        | ResourceClass::PrefetchableMemory
+                )
+        });
+        let dma_slot = if driver == Some(pci_hotplug::HotplugDriverKind::Nvme) {
+            let Some(slot) = reserve_hotplug_dma_slot(storage_boot, &mut hotplug_dma_slots) else {
+                let _ = coordinator.remove_orderly(address, &mut transport);
+                println!(
+                    "[pci-manager] hotplug NVMe {:?} withheld: no dynamic DMA slice",
+                    address
+                );
+                continue;
+            };
+            Some(slot)
+        } else {
+            None
+        };
+
+        // Bind the kernel lease only after BAR/Command commit succeeded. If
+        // kernel authority creation or any live-driver capability mint fails,
+        // immediately execute the checked Command-disable rollback and return
+        // the reserved DMA slice. No configured silicon is left without a
+        // lease authority or a driver handoff decision.
+        let device_id = (1u64 << 63) | policy.device_id().get();
+        let Ok(handle) = libcanvas::device_lease::create(
+            &lease_authority,
+            device_id,
+            authority.firmware_snapshot_id,
+            packed,
+        ) else {
+            release_hotplug_dma_slot(dma_slot, &mut hotplug_dma_slots);
+            let _ = coordinator.remove_orderly(address, &mut transport);
+            println!("[pci-manager] hotplug endpoint {:?} lease creation failed", address);
+            continue;
+        };
+        let Ok(info) = libcanvas::device_lease::query(&handle) else {
+            release_hotplug_dma_slot(dma_slot, &mut hotplug_dma_slots);
+            let _ = libcanvas::device_lease::revoke(&handle, 1, 0);
+            let _ = coordinator.remove_orderly(address, &mut transport);
+            println!("[pci-manager] hotplug endpoint {:?} lease query failed", address);
+            continue;
+        };
+
+        let mut handoff_pending = false;
+        if let Some(pci_hotplug::HotplugDriverKind::Nvme) = driver {
+            let Some(bar0) = bar0 else {
+                release_hotplug_dma_slot(dma_slot, &mut hotplug_dma_slots);
+                let _ = libcanvas::device_lease::revoke(&handle, info.generation, 0);
+                let _ = coordinator.remove_orderly(address, &mut transport);
+                println!(
+                    "[pci-manager] hotplug NVMe {:?} rejected: BAR0 is not usable MMIO",
+                    address
+                );
+                continue;
+            };
+            let Some((dma_slot_index, dma_base, dma_len)) = dma_slot.and_then(|slot| {
+                hotplug_dma_range(storage_boot, slot).map(|(base, len)| (slot, base, len))
+            }) else {
+                release_hotplug_dma_slot(dma_slot, &mut hotplug_dma_slots);
+                let _ = libcanvas::device_lease::revoke(&handle, info.generation, 0);
+                let _ = coordinator.remove_orderly(address, &mut transport);
+                println!(
+                    "[pci-manager] hotplug NVMe {:?} rejected: DMA geometry disappeared",
+                    address
+                );
+                continue;
+            };
+            let Ok(mmio_handle) = libcanvas::device_lease::mint_resource(
+                &handle,
+                ResourceKindAbi::Mmio,
+                info.generation,
+                bar0.cpu_base,
+                bar0.len,
+                true,
+            ) else {
+                release_hotplug_dma_slot(Some(dma_slot_index), &mut hotplug_dma_slots);
+                let _ = libcanvas::device_lease::revoke(&handle, info.generation, 0);
+                let _ = coordinator.remove_orderly(address, &mut transport);
+                println!("[pci-manager] hotplug NVMe {:?} MMIO mint failed", address);
+                continue;
+            };
+            // No interrupt transaction is attempted until the live host has
+            // accepted the endpoint. A valid lease-bound polling descriptor is
+            // explicit and lets the NVMe host remain interrupt-capable later
+            // without inventing an IRQ identity during rollback.
+            let Ok(irq_handle) = libcanvas::device_lease::mint_resource(
+                &handle,
+                ResourceKindAbi::Irq,
+                info.generation,
+                0xFF,
+                1,
+                false,
+            ) else {
+                release_hotplug_dma_slot(Some(dma_slot_index), &mut hotplug_dma_slots);
+                let _ = libcanvas::device_lease::revoke(&handle, info.generation, 0);
+                let _ = coordinator.remove_orderly(address, &mut transport);
+                println!("[pci-manager] hotplug NVMe {:?} polling IRQ mint failed", address);
+                continue;
+            };
+            let Ok(dma_handle) = libcanvas::device_lease::mint_resource(
+                &handle,
+                ResourceKindAbi::DmaPool,
+                info.generation,
+                dma_base,
+                dma_len,
+                true,
+            ) else {
+                release_hotplug_dma_slot(Some(dma_slot_index), &mut hotplug_dma_slots);
+                let _ = libcanvas::device_lease::revoke(&handle, info.generation, 0);
+                let _ = coordinator.remove_orderly(address, &mut transport);
+                println!("[pci-manager] hotplug NVMe {:?} DMA mint failed", address);
+                continue;
+            };
+            let Ok(lease_for_manager) = handle
+                .duplicate(rights::READ | rights::WRITE | rights::TRANSFER)
+            else {
+                release_hotplug_dma_slot(Some(dma_slot_index), &mut hotplug_dma_slots);
+                let _ = libcanvas::device_lease::revoke(&handle, info.generation, 0);
+                let _ = coordinator.remove_orderly(address, &mut transport);
+                println!("[pci-manager] hotplug NVMe {:?} lease duplicate failed", address);
+                continue;
+            };
+            let request = pci_hotplug::HotplugHandoff::bind_request(
+                manager_generation,
+                info.device_id,
+                info.generation,
+                packed,
+                pci_hotplug::HotplugDriverKind::Nvme,
+            );
+            if !send_hotplug_bind(
+                bootstrap,
+                request,
+                lease_for_manager,
+                mmio_handle,
+                bar0.cpu_base,
+                bar0.len,
+                irq_handle,
+                0xFF,
+                1,
+                false,
+                dma_handle,
+                dma_base,
+                dma_len,
+            ) {
+                // DriverManager may already own the lease and one or more
+                // resources because the handoff is a bounded FIFO sequence.
+                // Send a matching removal control message before revoking the
+                // PCI-side lease so that a partial pending bind cannot retain
+                // stale capabilities indefinitely.
+                let cleanup_sent = send_hotplug_remove_for_request(bootstrap, request, address);
+                release_hotplug_dma_slot(Some(dma_slot_index), &mut hotplug_dma_slots);
+                let _ = libcanvas::device_lease::revoke(&handle, info.generation, 0);
+                let _ = coordinator.remove_orderly(address, &mut transport);
+                if !cleanup_sent {
+                    // The receiver may still own a partial FIFO handoff. A
+                    // closed PCI-manager endpoint makes DriverManager drop
+                    // that generation-scoped pending binding and restart
+                    // rather than launching a host against a revoked lease.
+                    libcanvas::process::exit(0);
+                }
+                println!("[pci-manager] hotplug NVMe {:?} handoff transfer failed", address);
+                continue;
+            }
+            handoff_pending = true;
+        }
+        pending_leases.push(ActiveDeviceLease {
+            address,
+            device_id: info.device_id,
+            generation: info.generation,
+            handle,
+            hotplug_dma_slot: dma_slot,
+        });
+        inserted += 1;
+        println!(
+            "[pci-manager] hotplug endpoint {:?} configured lease=0x{:x} generation={} driver={} handoff={}",
+            address,
+            info.device_id,
+            info.generation,
+            driver.map_or("unbound", |kind| match kind {
+                pci_hotplug::HotplugDriverKind::Nvme => "nvme",
+                pci_hotplug::HotplugDriverKind::Net => "net",
+                pci_hotplug::HotplugDriverKind::Wlan => "wlan",
+                pci_hotplug::HotplugDriverKind::Xhci => "xhci",
+                pci_hotplug::HotplugDriverKind::Unknown => "unbound",
+            }),
+            handoff_pending
+        );
+    }
+
+    for lease in pending_leases {
+        authority.leases.push(lease);
+    }
+    authority.hotplug_dma_slots = hotplug_dma_slots;
+    inserted
+}
+
+fn hotplug_driver_kind(class: ClassCode) -> Option<pci_hotplug::HotplugDriverKind> {
+    if class.class == 0x01 && class.subclass == 0x08 && class.prog_if == 0x02 {
+        Some(pci_hotplug::HotplugDriverKind::Nvme)
+    } else {
+        None
+    }
+}
+
+fn hotplug_dma_range(
+    storage_boot: Option<huesos_abi::storage_boot::StorageBootInfo>,
+    slot: u8,
+) -> Option<(u64, u64)> {
+    if slot >= HOTPLUG_DMA_SLOTS {
+        return None;
+    }
+    let info = storage_boot?;
+    let offset = HOTPLUG_DMA_OFFSET.checked_add(
+        u64::from(slot).checked_mul(HOTPLUG_DMA_SLOT_LEN)?,
+    )?;
+    let base = info.dma_pool.base.checked_add(offset)?;
+    let end = base.checked_add(HOTPLUG_DMA_SLOT_LEN)?;
+    let pool_end = info.dma_pool.base.checked_add(info.dma_pool.len)?;
+    (end <= pool_end).then_some((base, HOTPLUG_DMA_SLOT_LEN))
+}
+
+fn reserve_hotplug_dma_slot(
+    storage_boot: Option<huesos_abi::storage_boot::StorageBootInfo>,
+    used: &mut u8,
+) -> Option<u8> {
+    for slot in 0..HOTPLUG_DMA_SLOTS {
+        if *used & (1u8 << slot) == 0 && hotplug_dma_range(storage_boot, slot).is_some() {
+            *used |= 1u8 << slot;
+            return Some(slot);
+        }
+    }
+    None
+}
+
+fn release_hotplug_dma_slot(slot: Option<u8>, used: &mut u8) {
+    if let Some(slot) = slot.filter(|slot| *slot < HOTPLUG_DMA_SLOTS) {
+        *used &= !(1u8 << slot);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn send_hotplug_bind(
+    bootstrap: &Channel,
+    request: pci_hotplug::HotplugHandoff,
+    lease: Handle,
+    mmio: Handle,
+    mmio_base: u64,
+    mmio_len: u64,
+    irq: Handle,
+    irq_base: u64,
+    irq_len: u64,
+    irq_exclusive: bool,
+    dma: Handle,
+    dma_base: u64,
+    dma_len: u64,
+) -> bool {
+    let write = |message: pci_hotplug::HotplugHandoff, handle: Option<Handle>| {
+        let bytes = message.encode();
+        match handle {
+            Some(handle) => match bootstrap.write_handle(&bytes, handle) {
+                Ok(()) => true,
+                Err((error, _returned)) => {
+                    println!("[pci-manager] hotplug handoff write failed: {}", error.as_str());
+                    false
+                }
+            },
+            None => match bootstrap.write(&bytes) {
+                Ok(()) => true,
+                Err(error) => {
+                    println!("[pci-manager] hotplug handoff control write failed: {}", error.as_str());
+                    false
+                }
+            },
+        }
+    };
+    write(request, Some(lease))
+        && write(
+            pci_hotplug::HotplugHandoff::bind_resource(
+                request,
+                pci_hotplug::HotplugResourceKind::Mmio,
+                mmio_base,
+                mmio_len,
+                true,
+            ),
+            Some(mmio),
+        )
+        && write(
+            pci_hotplug::HotplugHandoff::bind_resource(
+                request,
+                pci_hotplug::HotplugResourceKind::Irq,
+                irq_base,
+                irq_len,
+                irq_exclusive,
+            ),
+            Some(irq),
+        )
+        && write(
+            pci_hotplug::HotplugHandoff::bind_resource(
+                request,
+                pci_hotplug::HotplugResourceKind::DmaPool,
+                dma_base,
+                dma_len,
+                true,
+            ),
+            Some(dma),
+        )
+        && write(pci_hotplug::HotplugHandoff::bind_complete(request), None)
+}
+
+fn send_hotplug_remove_request(
+    bootstrap: &Channel,
+    authority: &ConfigAuthority,
+    address: PciAddress,
+    manager_generation: u64,
+) -> bool {
+    let Some(lease) = authority.leases.iter().find(|lease| lease.address == address) else {
+        // No DriverManager-side binding exists for a lease without the
+        // dynamic NVMe slice, so there is no FIFO cleanup record to send.
+        return true;
+    };
+    if lease.hotplug_dma_slot.is_none() {
+        return true;
+    }
+    let request = pci_hotplug::HotplugHandoff::bind_request(
+        manager_generation,
+        lease.device_id,
+        lease.generation,
+        pack_pci_address(
+            address.segment(),
+            address.bus(),
+            address.device(),
+            address.function(),
+        )
+        .unwrap_or(0),
+        pci_hotplug::HotplugDriverKind::Nvme,
+    );
+    send_hotplug_remove_for_request(bootstrap, request, address)
+}
+
+/// Clean up a DriverManager-side pending bind after a multi-message resource
+/// transfer failed or a live host is being removed. The request is FIFO-ordered
+/// after any handles already delivered, so the receiver can drop its partial
+/// capability set and revoke its duplicate lease before the PCI manager retires
+/// its own lease. A failed write is not silently ignored: callers finish their
+/// local revoke/disable work and then close the PCI-manager endpoint so
+/// DriverManager's peer-closed path drops the orphaned generation.
+fn send_hotplug_remove_for_request(
+    bootstrap: &Channel,
+    request: pci_hotplug::HotplugHandoff,
+    address: PciAddress,
+) -> bool {
+    let bytes = pci_hotplug::HotplugHandoff::remove_request(request).encode();
+    match bootstrap.write(&bytes) {
+        Ok(()) => true,
+        Err(error) => {
+            println!(
+                "[pci-manager] hotplug remove request for {:?} failed: {}",
+                address,
+                error.as_str()
+            );
+            false
+        }
+    }
+}
+
+fn remove_hotplug_scope(
+    bootstrap: &Channel,
+    authority: &mut ConfigAuthority,
+    target: hotplug::HotplugTarget,
+    surprise: bool,
+    manager_generation: u64,
+) -> usize {
+    let Some(snapshot) = authority
+        .inventory
+        .last_good()
+        .map(|inventory| inventory.snapshot.clone())
+    else {
+        return 0;
+    };
+    let mut addresses: Vec<(u8, PciAddress)> = Vec::new();
+    for node in snapshot.nodes() {
+        let address = node.function.address;
+        if node_is_in_hotplug_target(&snapshot, address, target)
+            && (authority.leases.iter().any(|lease| lease.address == address)
+                || authority
+                    .hotplug_coordinator
+                    .as_ref()
+                    .is_some_and(|coordinator| coordinator.lease_at(address).is_some()))
+        {
+            if addresses.try_reserve(1).is_err() {
+                println!("[pci-manager] hotplug removal scope allocation failed");
+                return 0;
+            }
+            addresses.push((node.depth, address));
+        }
+    }
+    // Disable/revoke children before their parent bridge. This is required
+    // for orderly bridge/root removal and also keeps surprise removal's
+    // service withdrawal deterministic.
+    addresses.sort_by(|left, right| right.0.cmp(&left.0));
+    let mut removed = 0usize;
+    for (_, address) in addresses {
+        if remove_hotplug_device(
+            bootstrap,
+            authority,
+            address,
+            surprise,
+            true,
+            manager_generation,
+        ) {
+            removed += 1;
+        }
+    }
+    removed
+}
+
+fn remove_hotplug_device(
+    bootstrap: &Channel,
+    authority: &mut ConfigAuthority,
+    address: PciAddress,
+    surprise: bool,
+    notify_driver: bool,
+    manager_generation: u64,
+) -> bool {
+    let cleanup_sent = if notify_driver {
+        send_hotplug_remove_request(bootstrap, authority, address, manager_generation)
+    } else {
+        true
+    };
+    let mut coordinator_result = false;
+    if let Some(coordinator) = authority.hotplug_coordinator.as_mut() {
+        if surprise {
+            coordinator_result = coordinator.remove_surprise(address).is_ok();
+        } else {
+            let mut transport = ReadWriteTransport {
+                windows: &authority.windows,
+                windows_len: authority.windows_len,
+                writable: authority.writable,
+                #[cfg(feature = "force-legacy")]
+                legacy_ioport: authority.legacy_ioport.as_ref(),
+            };
+            coordinator_result = coordinator.remove_orderly(address, &mut transport).is_ok();
+        }
+    }
+    if !surprise && authority.hotplug_coordinator.is_some() && !coordinator_result {
+        // The coordinator has already withdrawn its service and entered a
+        // fail-closed removal state. Do not leave the kernel lease/DMA domain
+        // alive merely because the checked Command-disable transaction
+        // failed; revoke the capability below and keep the BDF reserved in
+        // the coordinator until a later surprise-removal/restart path.
+        println!(
+            "[pci-manager] orderly removal {:?} command-disable failed; revoking lease fail-closed",
+            address
+        );
+    }
+    let Some(index) = authority.leases.iter().position(|lease| lease.address == address) else {
+        if !cleanup_sent {
+            libcanvas::process::exit(0);
+        }
+        return coordinator_result;
+    };
+    let hotplug_dma_slot = authority.leases[index].hotplug_dma_slot;
+    let revoked = {
+        let lease = &authority.leases[index];
+        libcanvas::device_lease::query(&lease.handle)
+            .ok()
+            .map_or(false, |info| {
+                info.revoked != 0
+                    || libcanvas::device_lease::revoke(
+                        &lease.handle,
+                        info.generation,
+                        if surprise { huesos_abi::pci_lease::revoke_flags::FAILED } else { 0 },
+                    )
+                    .is_ok()
+            })
+    };
+    if revoked {
+        authority.leases.remove(index);
+        release_hotplug_dma_slot(hotplug_dma_slot, &mut authority.hotplug_dma_slots);
+    }
+    if !cleanup_sent {
+        // Complete PCI-side revoke/slot cleanup before using process exit as
+        // the peer-closed recovery signal for an orphaned DriverManager bind.
+        libcanvas::process::exit(0);
+    }
+    coordinator_result || revoked
+}
+
+fn handle_hotplug_handoff_response(
+    bootstrap: &Channel,
+    authority: &mut ConfigAuthority,
+    message: pci_hotplug::HotplugHandoff,
+    manager_generation: u64,
+) {
+    if message.manager_generation != manager_generation {
+        println!("[pci-manager] stale hotplug handoff response ignored");
+        return;
+    }
+    let Some(address) = unpack_hotplug_address(message.bdf) else {
+        println!("[pci-manager] malformed hotplug handoff response BDF");
+        return;
+    };
+    match message.op {
+        pci_hotplug::HotplugHandoffOp::BindResponse => {
+            let Some(index) = authority.leases.iter().position(|lease| {
+                lease.address == address
+                    && lease.device_id == message.device_id
+                    && lease.generation == message.lease_generation
+                    && lease.hotplug_dma_slot.is_some()
+                    && message.driver == pci_hotplug::HotplugDriverKind::Nvme
+            }) else {
+                println!("[pci-manager] stale or mismatched hotplug bind response dropped");
+                return;
+            };
+            if message.status == pci_hotplug::HotplugHandoffStatus::Ok {
+                let attached = authority
+                    .hotplug_coordinator
+                    .as_mut()
+                    .is_some_and(|coordinator| {
+                        coordinator.attach_driver(address, message.process_koid).is_ok()
+                            && coordinator.driver_ready(address).is_ok()
+                    });
+                if attached {
+                    println!(
+                        "[pci-manager] hotplug DriverHost online bdf={:02x}:{:02x}.{} koid={}",
+                        address.bus(),
+                        address.device(),
+                        address.function(),
+                        message.process_koid
+                    );
+                    return;
+                }
+                println!(
+                    "[pci-manager] hotplug bind response could not advance lease bdf={:02x}:{:02x}.{}",
+                    address.bus(),
+                    address.device(),
+                    address.function()
+                );
+            } else {
+                println!(
+                    "[pci-manager] hotplug DriverHost bind failed bdf={:02x}:{:02x}.{} status={:?}",
+                    address.bus(),
+                    address.device(),
+                    address.function(),
+                    message.status
+                );
+            }
+            let _ = remove_hotplug_device(
+                bootstrap,
+                authority,
+                address,
+                false,
+                message.status == pci_hotplug::HotplugHandoffStatus::Ok,
+                manager_generation,
+            );
+            let _ = index;
+        }
+        pci_hotplug::HotplugHandoffOp::RemoveResponse => {
+            println!(
+                "[pci-manager] hotplug DriverHost removal acknowledged bdf={:02x}:{:02x}.{} status={:?}",
+                address.bus(),
+                address.device(),
+                address.function(),
+                message.status
+            );
+        }
+        _ => println!("[pci-manager] unexpected hotplug handoff response ignored"),
+    }
+}
+
+fn unpack_hotplug_address(packed: u64) -> Option<PciAddress> {
+    let (segment, bus, device, function) = unpack_pci_address(packed)?;
+    PciAddress::try_new(segment, bus, device, function).ok()
 }
 
 /// Consume one message of the authority burst (or a stray control
@@ -308,6 +1423,38 @@ fn handle_authority_message(
     authority: &mut ConfigAuthority,
     manager_generation: u64,
 ) -> bool {
+    if handle.is_none()
+        && bytes.len()
+            == pci_manager::STORAGE_BOOT_INFO_LABEL.len() + pci_manager::STORAGE_BOOT_INFO_BYTES
+        && bytes.starts_with(pci_manager::STORAGE_BOOT_INFO_LABEL)
+    {
+        let payload = &bytes[pci_manager::STORAGE_BOOT_INFO_LABEL.len()..];
+        if authority.storage_boot.is_some() {
+            println!("[pci-manager] duplicate storage DMA metadata rejected");
+        } else if let Some(info) = huesos_abi::storage_boot::decode(payload) {
+            if info.dma_pool.base & 0xFFF != 0
+                || info.dma_pool.len == 0
+                || info.dma_pool.len > 512 * 1024 * 1024
+            {
+                println!("[pci-manager] storage DMA metadata rejected: invalid range");
+            } else {
+                authority.storage_boot = Some(info);
+                println!(
+                    "[pci-manager] storage DMA metadata accepted base={:#x} len={:#x}",
+                    info.dma_pool.base, info.dma_pool.len
+                );
+            }
+        } else {
+            println!("[pci-manager] storage DMA metadata rejected: malformed payload");
+        }
+        return true;
+    }
+    if handle.is_none() {
+        if let Some(message) = pci_hotplug::HotplugHandoff::decode(bytes) {
+            handle_hotplug_handoff_response(bootstrap, authority, message, manager_generation);
+            return true;
+        }
+    }
     if authority.authorized {
         // Post-authority messages: the private mediation channel end,
         // the validated `HPCI` root table, or ACPI crash-freeze signals.
@@ -320,6 +1467,25 @@ fn handle_authority_message(
                     "[pci-manager] mediation channel established generation {}",
                     manager_generation
                 );
+            } else if bytes == pci_hotplug::HOTPLUG_EVENTS_LABEL {
+                // ACPI Manager restarts create a fresh private channel pair.
+                // Replace the old endpoint in-place so this PCI Manager can
+                // continue serving the same authority generation without ever
+                // consuming events from the dead ACPI generation.
+                if authority.hotplug_events.is_some() {
+                    authority.hotplug_queue = hotplug::HotplugEventQueue::new();
+                    authority.deferred_hotplug = None;
+                    println!(
+                        "[pci-manager] ACPI hotplug event channel replaced generation {}",
+                        manager_generation
+                    );
+                } else {
+                    println!(
+                        "[pci-manager] ACPI hotplug event channel established generation {}",
+                        manager_generation
+                    );
+                }
+                authority.hotplug_events = Some(Channel::from_handle(handle));
             } else if bytes == pci_manager::IOMMU_VMO_LABEL {
                 accept_iommu_vmo(bootstrap, handle, authority, manager_generation);
             } else if bytes == pci_manager::ROOT_TABLE_VMO_LABEL {
@@ -381,6 +1547,28 @@ fn handle_authority_message(
                     return reject_authority(bootstrap, authority, manager_generation);
                 }
                 authority.legacy_ioport = Some(IoPort::from_handle(handle));
+                return true;
+            }
+            if bytes == pci_hotplug::HOTPLUG_EVENTS_LABEL {
+                if authority.hotplug_events.is_some() {
+                    // The bootstrap sender is DriverManager, so a second
+                    // endpoint means the ACPI side was rebuilt. Drop all
+                    // queued events from the old endpoint before accepting the
+                    // replacement; otherwise a stale Notify could be applied
+                    // after the new ACPI generation is live.
+                    authority.hotplug_queue = hotplug::HotplugEventQueue::new();
+                    authority.deferred_hotplug = None;
+                    println!(
+                        "[pci-manager] ACPI hotplug event channel replaced generation {}",
+                        manager_generation
+                    );
+                } else {
+                    println!(
+                        "[pci-manager] ACPI hotplug event channel retained generation {}",
+                        manager_generation
+                    );
+                }
+                authority.hotplug_events = Some(Channel::from_handle(handle));
                 return true;
             }
             if bytes == pci_manager::HMCF_VMO_LABEL {
@@ -1413,6 +2601,20 @@ fn finish_write_authority(
     manager_generation: u64,
     declared_count: u32,
 ) {
+    fn drain_deferred_hotplug(
+        bootstrap: &Channel,
+        authority: &mut ConfigAuthority,
+        manager_generation: u64,
+    ) {
+        let Some(event) = authority.deferred_hotplug.take() else {
+            return;
+        };
+        if !authority.hotplug_queue.push(event) {
+            println!("[pci-manager] deferred hotplug event dropped: queue full");
+            return;
+        }
+        let _ = poll_hotplug_events(bootstrap, authority, manager_generation);
+    }
     if authority.writable {
         return;
     }
@@ -1430,6 +2632,7 @@ fn finish_write_authority(
                 bootstrap,
                 Message::write_authority_ready(manager_generation, 1),
             );
+            drain_deferred_hotplug(bootstrap, authority, manager_generation);
         } else {
             authority.writable = false;
         }
@@ -1487,6 +2690,7 @@ fn finish_write_authority(
                 bootstrap,
                 Message::write_authority_ready(manager_generation, mapped as u32),
             );
+            drain_deferred_hotplug(bootstrap, authority, manager_generation);
         } else {
             authority.writable = false;
         }
@@ -1780,10 +2984,18 @@ fn run_live_bar_inventory_and_planner(
         }
     };
 
-    let plan = match resource_planner::plan_firmware_preserving(
+    let mut hotplug_ports = Vec::new();
+    for node in snapshot.nodes() {
+        if matches!(node.function.kind, FunctionKind::PciBridge { .. }) {
+            hotplug_ports.push(node.function.address);
+        }
+    }
+    let plan = match resource_planner::plan_with_hotplug_reserves(
         &snapshot,
         &apertures,
         &effective_validation,
+        &hotplug_ports,
+        resource_planner::HotplugReservePolicy::STANDARD_PCIE_SLOT,
     ) {
         Ok(plan) => plan,
         Err(err) => {
@@ -1949,8 +3161,13 @@ fn establish_device_leases(
                 device_id: info.device_id,
                 generation: info.generation,
                 handle,
+                hotplug_dma_slot: None,
             });
         }
+    }
+
+    if authority.hotplug_coordinator.is_none() {
+        seed_hotplug_coordinator(authority);
     }
 
     if !authority.binding_published {
@@ -1960,6 +3177,44 @@ fn establish_device_leases(
         } else {
             publish_zero_bindings_if_needed(bootstrap, authority, manager_generation);
         }
+    }
+}
+
+fn seed_hotplug_coordinator(authority: &mut ConfigAuthority) {
+    let Some(plan) = authority.resource_plan.as_ref() else {
+        return;
+    };
+    let mut bridge_ranges = Vec::new();
+    for reserve in plan.bus_reserves() {
+        bridge_ranges.push((
+            reserve.bridge,
+            reserve.secondary_bus,
+            reserve.reserved_subordinate_bus,
+        ));
+    }
+    let mut initial_leases = Vec::new();
+    for lease in &authority.leases {
+        initial_leases.push((
+            lease.address,
+            RelocationClass::Fixed,
+            DmaIsolation::Trusted,
+            None,
+        ));
+    }
+    match hotplug::HotplugCoordinator::from_boot_plan(&bridge_ranges, plan, &initial_leases) {
+        Ok(coordinator) => {
+            println!(
+                "[pci-manager] hotplug coordinator ready bridges={} active_leases={} reserved_bars={}",
+                bridge_ranges.len(),
+                coordinator.active_lease_count(),
+                coordinator.active_resource_count()
+            );
+            authority.hotplug_coordinator = Some(coordinator);
+        }
+        Err(error) => println!(
+            "[pci-manager] hotplug coordinator unavailable; insertion fail-closed: {:?}",
+            error
+        ),
     }
 }
 

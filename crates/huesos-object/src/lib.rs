@@ -12,6 +12,7 @@ extern crate alloc;
 mod acpi_broker;
 mod channel;
 mod device_lease;
+mod dma_pool;
 mod handle;
 mod interrupt;
 mod irq_guard;
@@ -49,6 +50,9 @@ pub use channel::{
 pub use device_lease::{
     set_iommu_lease_hooks, DeviceLease, DeviceLeaseError, DeviceLeaseSnapshot, DeviceLeaseState,
     IommuBindDmaFn, IommuLeaseHooks, IommuTeardownFn, PORT_PACKET_DEVICE_GONE,
+};
+pub use dma_pool::{
+    dynamic_slot_range_owned, dma_pool_range_owned, range_overlaps_dynamic_area, set_boot_dma_pool,
 };
 pub use futex::{FutexNode, FutexTable};
 pub use handle::{Handle, HandleTable, HandleTableError, HandleValue, Rights, INVALID_HANDLE};

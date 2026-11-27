@@ -66,6 +66,12 @@ pub const IOMMU_VMO_LABEL: &[u8] = b"pci-iommu-vmo";
 /// Label carrying the immutable `HPIN` PCI inventory VMO from PCI Manager to
 /// DriverManager (Stage D.3).
 pub const INVENTORY_VMO_LABEL: &[u8] = b"pci-inventory-vmo";
+/// Plain 32-byte `storage_boot::StorageBootInfo` payload sent to PCI Manager
+/// before live hotplug allocation. It contains metadata only; DMA authority
+/// still comes from a lease-bound `DmaPool` handle.
+pub const STORAGE_BOOT_INFO_LABEL: &[u8] = b"pci-storage-boot";
+/// Payload size for the storage metadata handoff.
+pub const STORAGE_BOOT_INFO_BYTES: usize = 32;
 
 /// Configuration override: serve configuration reads through the
 /// legacy CF8/CFC mechanism (#1) even though ECAM authority is mapped.

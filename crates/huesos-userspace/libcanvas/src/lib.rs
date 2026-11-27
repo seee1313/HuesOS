@@ -89,6 +89,7 @@ pub mod job;
 pub mod manifest;
 pub mod memory;
 pub mod pci_config;
+pub mod pci_hotplug;
 pub mod pci_mediation;
 pub mod port;
 pub mod process;

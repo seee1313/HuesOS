@@ -127,6 +127,7 @@ pub extern "C" fn _start() -> ! {
     let acpi_tables = Vmo::take_init_acpi_tables();
     let storage_boot_info = Vmo::take_init_storage_boot_info();
     let acpi_broker = libcanvas::Handle::take_init_acpi_broker();
+    let acpi_sci_irq = libcanvas::Handle::take_init_acpi_sci_irq();
     init_logln!(logger, "[init] hello from ring3 userspace, via libcanvas");
 
     let (config, storage_off) = load_config(&mut logger, &bootfs);
@@ -231,6 +232,7 @@ pub extern "C" fn _start() -> ! {
         send_acpi_tables_vmo(&mut logger, channel, &acpi_tables);
         ui.step(b"storage", 15);
         send_acpi_broker(&mut logger, channel, acpi_broker);
+        send_acpi_sci_irq(&mut logger, channel, acpi_sci_irq);
         ui.step(b"storage", 20);
         send_manifest_grants(
             &mut logger,
@@ -550,6 +552,20 @@ fn send_acpi_broker(logger: &mut InitLogger, dm_bootstrap: &Channel, broker: lib
     }
 }
 
+fn send_acpi_sci_irq(logger: &mut InitLogger, dm_bootstrap: &Channel, irq: libcanvas::Handle) {
+    match dm_bootstrap.write_handle(b"acpi-sci-irq", irq) {
+        Ok(()) => init_logln!(logger, "[init] transferred firmware SCI IRQ resource"),
+        Err((error, _handle)) => {
+            init_logln!(
+                logger,
+                "[init] firmware SCI IRQ resource unavailable: {}",
+                error.as_str()
+            );
+            let _ = dm_bootstrap.write(b"acpi-sci-unavailable");
+        }
+    }
+}
+
 fn send_storage_boot_info_vmo(logger: &mut InitLogger, dm_bootstrap: &Channel, storage: &Vmo) {
     let duplicate = storage.duplicate(
         libcanvas::rights::READ | libcanvas::rights::DUPLICATE | libcanvas::rights::TRANSFER,
@@ -781,22 +797,14 @@ fn send_boot_dma_pool_grant(
         return false;
     }
 
-    const NVME_DMA_LEN: u64 = 64 * 1024 * 1024;
-    const NET_DMA_OFFSET: u64 = 64 * 1024 * 1024;
-    const NET_DMA_LEN: u64 = 4 * 1024 * 1024;
-    const WLAN_DMA_OFFSET: u64 = 68 * 1024 * 1024;
-    const WLAN_DMA_LEN: u64 = 4 * 1024 * 1024;
-    const XHCI_DMA_OFFSET: u64 = 72 * 1024 * 1024;
-    const XHCI_DMA_LEN: u64 = 4 * 1024 * 1024;
-
     // Carve isolated `[64..68 MiB)` (`net-service`), `[68..72 MiB)` (`wlan-service`),
     // and `[72..76 MiB)` (`driver-host-xhci`) regardless of `init.storage=off` so
     // networking, Wi-Fi, USB HID, and USB BOT work on Live ISO / ramdisk boots too.
-    if info.dma_pool.len >= NET_DMA_OFFSET + NET_DMA_LEN {
+    if info.dma_pool.len >= storage_boot::NET_DMA_OFFSET + storage_boot::NET_DMA_LEN {
         let net_grant = ResourceGrant {
             kind: kind::DMA_POOL,
-            base: info.dma_pool.base + NET_DMA_OFFSET,
-            len: NET_DMA_LEN,
+            base: info.dma_pool.base + storage_boot::NET_DMA_OFFSET,
+            len: storage_boot::NET_DMA_LEN,
             exclusive: true,
         };
         if let Ok(res) = Resource::create(
@@ -824,11 +832,11 @@ fn send_boot_dma_pool_grant(
         }
     }
 
-    if info.dma_pool.len >= WLAN_DMA_OFFSET + WLAN_DMA_LEN {
+    if info.dma_pool.len >= storage_boot::WLAN_DMA_OFFSET + storage_boot::WLAN_DMA_LEN {
         let wlan_grant = ResourceGrant {
             kind: kind::DMA_POOL,
-            base: info.dma_pool.base + WLAN_DMA_OFFSET,
-            len: WLAN_DMA_LEN,
+            base: info.dma_pool.base + storage_boot::WLAN_DMA_OFFSET,
+            len: storage_boot::WLAN_DMA_LEN,
             exclusive: true,
         };
         if let Ok(res) = Resource::create(
@@ -856,11 +864,11 @@ fn send_boot_dma_pool_grant(
         }
     }
 
-    if info.dma_pool.len >= XHCI_DMA_OFFSET + XHCI_DMA_LEN {
+    if info.dma_pool.len >= storage_boot::XHCI_DMA_OFFSET + storage_boot::XHCI_DMA_LEN {
         let xhci_grant = ResourceGrant {
             kind: kind::DMA_POOL,
-            base: info.dma_pool.base + XHCI_DMA_OFFSET,
-            len: XHCI_DMA_LEN,
+            base: info.dma_pool.base + storage_boot::XHCI_DMA_OFFSET,
+            len: storage_boot::XHCI_DMA_LEN,
             exclusive: true,
         };
         if let Ok(res) = Resource::create(
@@ -892,10 +900,10 @@ fn send_boot_dma_pool_grant(
         return false;
     }
 
-    let nvme_len = info.dma_pool.len.min(NVME_DMA_LEN);
+    let nvme_len = info.dma_pool.len.min(storage_boot::NVME_DMA_LEN);
     let grant = ResourceGrant {
         kind: kind::DMA_POOL,
-        base: info.dma_pool.base,
+        base: info.dma_pool.base + storage_boot::NVME_DMA_OFFSET,
         len: nvme_len,
         exclusive: true,
     };

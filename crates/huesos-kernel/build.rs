@@ -94,6 +94,18 @@ fn main() {
         &[],
         &[],
     );
+    let pci_hotplug_test = if boot_selftest {
+        Some(build_userspace_program(
+            &userspace_root,
+            "pci-hotplug-test",
+            "huesos-pci-hotplug-test",
+            profile,
+            &[],
+            &[],
+        ))
+    } else {
+        None
+    };
     let hxfs_service = build_userspace_program(
         &userspace_root,
         "hxfs-service",
@@ -136,6 +148,9 @@ fn main() {
     }
     if acpi_budget_smoke {
         driver_manager_features.push("acpi-restart-budget-smoke");
+    }
+    if boot_selftest {
+        driver_manager_features.push("hotplug-test");
     }
     if key_broker_features
         .split(',')
@@ -330,6 +345,7 @@ fn main() {
             ld_pe: &ld_pe,
             libcanvas_so: &libcanvas_so,
             win64_dir: &win64_dir,
+            pci_hotplug_test: pci_hotplug_test.as_deref(),
             smoke_plugin_so: smoke_plugin_so.as_deref(),
             boot_selftest,
         },
@@ -473,6 +489,7 @@ fn track_userspace_inputs(userspace_root: &Path) {
         "wlan-service",
         "acpi-manager",
         "pci-manager",
+        "pci-hotplug-test",
         "shutdown-broker",
         "key-broker",
         "terminal",
@@ -1110,6 +1127,7 @@ struct BootfsInputs<'a> {
     ld_pe: &'a Path,
     libcanvas_so: &'a Path,
     win64_dir: &'a Path,
+    pci_hotplug_test: Option<&'a Path>,
     smoke_plugin_so: Option<&'a Path>,
     boot_selftest: bool,
 }
@@ -1527,6 +1545,12 @@ fn build_bootfs_image(manifest_dir: &Path, inputs: BootfsInputs<'_>) -> PathBuf 
         },
     ];
     if inputs.boot_selftest {
+        if let Some(test_binary) = inputs.pci_hotplug_test {
+            files.push(BootFsFile {
+                path: "/services/pci-hotplug-test.elf",
+                data: read_build_input(test_binary, "pci-hotplug-test ELF"),
+            });
+        }
         files.push(BootFsFile {
             path: "/bin/std-smoke.elf",
             data: read_build_input(&inputs.coreutils_dir.join("std-smoke"), "std-smoke ELF"),

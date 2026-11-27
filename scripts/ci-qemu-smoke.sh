@@ -168,6 +168,8 @@ required=(
     '[driver-manager] retained HPCI:'
     '[driver-manager] ACPI manager ready generation'
     '[driver-manager] ACPI namespace initialized generation'
+    '[driver-manager] launched ring-3 PCI hotplug syscall-98 test'
+    '[driver-manager] pci-hotplug-test: syscall=98 event=40 bytes bdf=00:00.0 status=ok'
     '[acpi-manager] published HIOM'
     '[driver-manager] retained HIOM:'
     '[driver-manager] forwarded HIOM IOMMU snapshot to PCI manager'

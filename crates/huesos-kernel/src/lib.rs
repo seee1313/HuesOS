@@ -135,6 +135,16 @@ pub unsafe fn kmain(boot_info: BootInfo) -> ! {
     huesos_arch::init_paging(phys_offset);
 
     let boot_dma_pool = init::reserve_boot_dma_pool();
+    if let Some(pool) = boot_dma_pool {
+        if !huesos_object::set_boot_dma_pool(pool.base, pool.len) {
+            use core::fmt::Write;
+            let mut writer = huesos_arch::serial::SerialWriter;
+            let _ = writeln!(
+                writer,
+                "[storage] kernel DMA ownership registration failed; DmaPool minting disabled"
+            );
+        }
+    }
 
     // W^X hardening sweep for the kernel image: stamp NO_EXECUTE on
     // every kernel .rodata / .data / .bss / .limine_requests page so
@@ -485,6 +495,11 @@ fn spawn_init_process(
             bytes,
         ) {
             dbg("[init] installed immutable ACPI table archive VMO\n");
+            if install_acpi_sci_irq_capability(&spawned.process, &allowed_irqs) {
+                dbg("[init] installed firmware SCI IRQ resource\n");
+            } else {
+                dbg("[init] firmware SCI IRQ resource unavailable; ACPI hotplug stays disabled\n");
+            }
             if install_acpi_broker(
                 &spawned.process,
                 acpi_snapshot_id,
@@ -994,6 +1009,38 @@ fn install_immutable_vmo(
     if process
         .handles
         .insert_at(slot, Handle::new(koid, rights))
+        .is_err()
+    {
+        huesos_object::unregister_object(koid);
+        return false;
+    }
+    true
+}
+
+fn install_acpi_sci_irq_capability(
+    process: &huesos_object::Process,
+    allowed_irqs: &[u32],
+) -> bool {
+    use huesos_object::{Handle, KernelObject, Resource, ResourceKind, Rights};
+
+    let Some(gsi) = boot::acpi_policy::fadt_sci_irq() else {
+        return false;
+    };
+    if !allowed_irqs.contains(&gsi) {
+        return false;
+    }
+    let Ok(resource) = Resource::try_create_exclusive(ResourceKind::Irq, u64::from(gsi), 1)
+    else {
+        return false;
+    };
+    let koid = resource.koid();
+    let rights = Rights::READ | Rights::DUPLICATE | Rights::TRANSFER;
+    if process
+        .handles
+        .insert_at(
+            huesos_abi::INIT_ACPI_SCI_IRQ_HANDLE,
+            Handle::new(koid, rights),
+        )
         .is_err()
     {
         huesos_object::unregister_object(koid);

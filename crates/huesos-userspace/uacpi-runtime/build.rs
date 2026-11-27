@@ -58,5 +58,6 @@ fn main() {
     println!("cargo:rerun-if-changed=../../../third_party/uacpi/include");
     println!("cargo:rerun-if-changed=../../../third_party/uacpi/UPSTREAM");
     println!("cargo:rerun-if-changed=src/host_stubs.c");
+    println!("cargo:rerun-if-changed=src/hotplug.h");
     println!("cargo:rerun-if-changed=src/uacpi_shim.c");
 }

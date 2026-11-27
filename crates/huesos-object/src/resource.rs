@@ -174,6 +174,30 @@ impl Resource {
         exclusive: bool,
         lease_binding: Option<(Koid, u64)>,
     ) -> Result<Arc<Self>, ResourceError> {
+        if let Some((lease_koid, generation)) = lease_binding {
+            let Some(lease_object) = crate::lookup_object(lease_koid) else {
+                return Err(ResourceError::Conflict);
+            };
+            let Some(lease) = lease_object.downcast_ref::<crate::DeviceLease>() else {
+                return Err(ResourceError::Conflict);
+            };
+            return lease.with_active_generation(generation, || {
+                Self::try_create_active(kind, base, len, exclusive, lease_binding)
+            });
+        }
+        Self::try_create_active(kind, base, len, exclusive, lease_binding)
+    }
+
+    /// Construct and publish a resource while the bound lease's lifecycle
+    /// lock is held. This keeps the dynamic-slot claim and registry commit in
+    /// the same generation transaction as revoke/drop.
+    fn try_create_active(
+        kind: ResourceKind,
+        base: u64,
+        len: u64,
+        exclusive: bool,
+        lease_binding: Option<(Koid, u64)>,
+    ) -> Result<Arc<Self>, ResourceError> {
         // Half-open range validation. `len == 0` describes an empty
         // range and is meaningless as a capability; wrap-past-u64::MAX
         // means the range does not exist in any linear address space.
@@ -183,6 +207,31 @@ impl Resource {
         if base.checked_add(len).is_none() {
             return Err(ResourceError::InvalidRange);
         }
+
+        // A lease-bound DmaPool is a dynamic hotplug capability, not a
+        // userspace allocation request. Claim one exact kernel-owned slice
+        // before publishing the Resource so two concurrent lease mint calls
+        // cannot race through a userspace bitmap. Static boot DmaPool grants
+        // are unbound and remain on the trusted init path below. The enclosing
+        // lease transaction holds the lifecycle lock until the registry commit
+        // completes, so revoke cannot release the claim between these steps.
+        let dynamic_dma_binding = match (kind, lease_binding) {
+            (ResourceKind::DmaPool, Some((lease_koid, generation))) => {
+                // The caller already checked the boot reservation at the
+                // syscall boundary; this second check keeps the object-layer
+                // constructor safe for any future in-kernel caller too.
+                if !crate::dma_pool::claim_dynamic_slot(
+                    lease_koid,
+                    generation,
+                    base,
+                    len,
+                ) {
+                    return Err(ResourceError::Conflict);
+                }
+                Some((lease_koid, generation))
+            }
+            _ => None,
+        };
 
         // Overlap check under the single registry lock via the private
         // `try_reserve_resource_range` helper: it walks the registry
@@ -198,8 +247,15 @@ impl Resource {
             exclusive,
             lease_binding,
         });
-        crate::registry::try_register_resource_locked(resource.clone())?;
-        Ok(resource)
+        match crate::registry::try_register_resource_locked(resource.clone()) {
+            Ok(()) => Ok(resource),
+            Err(error) => {
+                if let Some((lease_koid, generation)) = dynamic_dma_binding {
+                    crate::dma_pool::release_dynamic_slot(lease_koid, generation, base, len);
+                }
+                Err(error)
+            }
+        }
     }
 
     /// Optional `(lease_koid, lease_generation)` binding when minted via

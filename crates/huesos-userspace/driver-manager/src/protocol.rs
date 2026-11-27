@@ -48,6 +48,14 @@ pub const RESOURCE_TRANSFER_COMPLETE: &str = "resource:transfer-complete";
 pub const ACPI_TABLES_VMO: &str = "acpi-tables-vmo";
 /// Init passes the unique deny-by-default ACPI broker capability.
 pub const ACPI_BROKER: &str = "acpi-broker";
+/// Init passes the validated FADT SCI `Irq` resource.
+pub const ACPI_SCI_IRQ: &str = "acpi-sci-irq";
+/// DriverManager passes the SCI resource to the isolated ACPI manager.
+pub const ACPI_MANAGER_SCI_IRQ: &str = "acpi-sci-irq";
+/// Init/DriverManager uses this marker when no validated FADT SCI exists.
+pub const ACPI_SCI_UNAVAILABLE: &str = "acpi-sci-unavailable";
+/// Private ACPI Notify events are sent from `acpi-manager` to `pci-manager`.
+pub const ACPI_MANAGER_HOTPLUG_EVENTS: &str = "pci-hotplug-events";
 /// Init delegates the unique KeyBroker generation-grant channel.
 pub const KEY_BROKER_MANAGER: &str = "key-broker:manager-channel";
 /// Init delegates the unique `PciConfigMint` authority (AP-8). DriverManager
