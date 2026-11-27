@@ -9,9 +9,7 @@
 #![no_main]
 
 use core::panic::PanicInfo;
-use huesos_abi::pci_hotplug::{
-    HotplugWireEvent, HOTPLUG_TEST_CHANNEL_LABEL, NOTIFY_BUS_CHECK,
-};
+use huesos_abi::pci_hotplug::{HotplugWireEvent, HOTPLUG_TEST_CHANNEL_LABEL, NOTIFY_BUS_CHECK};
 use libcanvas::{Channel, ErrorCode};
 
 #[unsafe(no_mangle)]
@@ -48,10 +46,7 @@ pub extern "C" fn _start() -> ! {
             Err(ErrorCode::ShouldWait) | Err(ErrorCode::TimedOut) => {}
             Err(error) => {
                 let _ = bootstrap.write(b"syscall=98 bootstrap status=error");
-                libcanvas::println!(
-                    "[pci-hotplug-test] bootstrap failed: {}",
-                    error.as_str()
-                );
+                libcanvas::println!("[pci-hotplug-test] bootstrap failed: {}", error.as_str());
                 libcanvas::process::exit(97);
             }
         }

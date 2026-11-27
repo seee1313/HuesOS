@@ -38,8 +38,7 @@ struct DynamicSlotOwner {
 }
 
 static BOOT_DMA_POOL: IrqSafeMutex<Option<BootDmaPoolRange>> = IrqSafeMutex::new(None);
-static HOTPLUG_DMA_SLOT_OWNERS:
-    IrqSafeMutex<[Option<DynamicSlotOwner>; HOTPLUG_DMA_SLOT_COUNT]> =
+static HOTPLUG_DMA_SLOT_OWNERS: IrqSafeMutex<[Option<DynamicSlotOwner>; HOTPLUG_DMA_SLOT_COUNT]> =
     IrqSafeMutex::new([const { None }; HOTPLUG_DMA_SLOT_COUNT]);
 
 /// Register the boot DMA reservation exactly once.
@@ -69,7 +68,10 @@ pub fn set_boot_dma_pool(base: u64, len: u64) -> bool {
     if slot.is_some() {
         return false;
     }
-    *slot = Some(BootDmaPoolRange { base, len: end - base });
+    *slot = Some(BootDmaPoolRange {
+        base,
+        len: end - base,
+    });
     true
 }
 
@@ -128,18 +130,13 @@ pub fn range_overlaps_dynamic_area(base: u64, len: u64) -> bool {
     let Some(dynamic_base) = pool.base.checked_add(HOTPLUG_DMA_OFFSET) else {
         return false;
     };
-    let Some(dynamic_len) = HOTPLUG_DMA_SLOT_LEN
-        .checked_mul(HOTPLUG_DMA_SLOT_COUNT as u64)
-    else {
+    let Some(dynamic_len) = HOTPLUG_DMA_SLOT_LEN.checked_mul(HOTPLUG_DMA_SLOT_COUNT as u64) else {
         return false;
     };
     let Some(dynamic_end) = dynamic_base.checked_add(dynamic_len) else {
         return false;
     };
-    base >= pool.base
-        && end <= pool_end
-        && base < dynamic_end
-        && dynamic_base < end
+    base >= pool.base && end <= pool_end && base < dynamic_end && dynamic_base < end
 }
 
 /// Claim the exact dynamic slice for a lease generation.
@@ -150,12 +147,7 @@ pub fn range_overlaps_dynamic_area(base: u64, len: u64) -> bool {
 /// registered and remains owned by the lease until that generation is revoked
 /// or dropped; closing the resource handle alone must not make a still-bound
 /// IOMMU range reusable. Callers must release it if later registration fails.
-pub(crate) fn claim_dynamic_slot(
-    lease_koid: Koid,
-    generation: u64,
-    base: u64,
-    len: u64,
-) -> bool {
+pub(crate) fn claim_dynamic_slot(lease_koid: Koid, generation: u64, base: u64, len: u64) -> bool {
     if !lease_koid.is_valid()
         || generation == 0
         || !dma_pool_range_owned(base, len)
@@ -180,12 +172,7 @@ pub(crate) fn claim_dynamic_slot(
 /// Release one exact dynamic slice if it is still owned by this lease
 /// generation. The owner comparison makes late cleanup from an old resource
 /// harmless after the slot has already been reused by a replacement lease.
-pub(crate) fn release_dynamic_slot(
-    lease_koid: Koid,
-    generation: u64,
-    base: u64,
-    len: u64,
-) {
+pub(crate) fn release_dynamic_slot(lease_koid: Koid, generation: u64, base: u64, len: u64) {
     let Some(index) = dynamic_slot_index(base).filter(|_| len == HOTPLUG_DMA_SLOT_LEN) else {
         return;
     };

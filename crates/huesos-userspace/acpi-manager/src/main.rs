@@ -230,7 +230,10 @@ pub extern "C" fn _start() -> ! {
     }
 
     if let Err(err) = huesos_uacpi_runtime::namespace::install_hotplug_notify() {
-        println!("[acpi-manager] ACPI Notify handler installation failed: {:?}", err);
+        println!(
+            "[acpi-manager] ACPI Notify handler installation failed: {:?}",
+            err
+        );
         send_failure(
             &bootstrap,
             generation,

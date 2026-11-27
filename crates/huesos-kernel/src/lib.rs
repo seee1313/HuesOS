@@ -1017,10 +1017,7 @@ fn install_immutable_vmo(
     true
 }
 
-fn install_acpi_sci_irq_capability(
-    process: &huesos_object::Process,
-    allowed_irqs: &[u32],
-) -> bool {
+fn install_acpi_sci_irq_capability(process: &huesos_object::Process, allowed_irqs: &[u32]) -> bool {
     use huesos_object::{Handle, KernelObject, Resource, ResourceKind, Rights};
 
     let Some(gsi) = boot::acpi_policy::fadt_sci_irq() else {
@@ -1029,8 +1026,7 @@ fn install_acpi_sci_irq_capability(
     if !allowed_irqs.contains(&gsi) {
         return false;
     }
-    let Ok(resource) = Resource::try_create_exclusive(ResourceKind::Irq, u64::from(gsi), 1)
-    else {
+    let Ok(resource) = Resource::try_create_exclusive(ResourceKind::Irq, u64::from(gsi), 1) else {
         return false;
     };
     let koid = resource.koid();

@@ -1865,10 +1865,9 @@ impl DriverManager {
                 self.schedule_acpi_manager_restart();
                 return;
             };
-            if let Err((error, _sci)) = bootstrap.write_handle(
-                protocol::ACPI_MANAGER_SCI_IRQ.as_bytes(),
-                sci,
-            ) {
+            if let Err((error, _sci)) =
+                bootstrap.write_handle(protocol::ACPI_MANAGER_SCI_IRQ.as_bytes(), sci)
+            {
                 println!(
                     "[driver-manager] failed to transfer FADT SCI resource: {}",
                     error.as_str()
@@ -4080,12 +4079,14 @@ impl DriverManager {
                     );
                     return;
                 }
-                let valid_lease = libcanvas::device_lease::query(&lease).ok().is_some_and(|info| {
-                    info.revoked == 0
-                        && info.device_id == message.device_id
-                        && info.generation == message.lease_generation
-                        && info.pci_address_packed == message.bdf
-                });
+                let valid_lease = libcanvas::device_lease::query(&lease)
+                    .ok()
+                    .is_some_and(|info| {
+                        info.revoked == 0
+                            && info.device_id == message.device_id
+                            && info.generation == message.lease_generation
+                            && info.pci_address_packed == message.bdf
+                    });
                 if !valid_lease {
                     drop(lease);
                     Self::send_hotplug_response_on(
@@ -4125,8 +4126,7 @@ impl DriverManager {
                 self.hotplug_pending[slot] = Some(PendingHotplug::new(message, lease));
                 println!(
                     "[driver-manager] hotplug bind request accepted device=0x{:x} generation={}",
-                    message.device_id,
-                    message.lease_generation
+                    message.device_id, message.lease_generation
                 );
             }
             pci_hotplug::HotplugHandoffOp::BindResource => {
@@ -4179,12 +4179,13 @@ impl DriverManager {
                     }
                     return;
                 };
-                let invalid_resource = self.hotplug_pending[slot]
-                    .as_ref()
-                    .is_none_or(|pending| {
-                        pending.resources[resource_index].handle.is_some()
-                            || message.resource_base.checked_add(message.resource_len).is_none()
-                    });
+                let invalid_resource = self.hotplug_pending[slot].as_ref().is_none_or(|pending| {
+                    pending.resources[resource_index].handle.is_some()
+                        || message
+                            .resource_base
+                            .checked_add(message.resource_len)
+                            .is_none()
+                });
                 if invalid_resource {
                     drop(handle);
                     if !self.reject_pending_for_message(
@@ -4362,11 +4363,7 @@ impl DriverManager {
     fn launch_hotplug_host(&mut self, channel: &Channel, mut pending: PendingHotplug) {
         let request = pending.request;
         let Some(host_slot) = self.hotplug_hosts.iter().position(Option::is_none) else {
-            self.reject_pending_hotplug(
-                channel,
-                pending,
-                pci_hotplug::HotplugHandoffStatus::Busy,
-            );
+            self.reject_pending_hotplug(channel, pending, pci_hotplug::HotplugHandoffStatus::Busy);
             return;
         };
         let attach_ok = match (pending.lease.as_ref(), pending.resources[2].handle.as_ref()) {
@@ -4437,11 +4434,11 @@ impl DriverManager {
             );
             return;
         };
-        let Some(lease_ro) = pending
-            .lease
-            .as_ref()
-            .and_then(|lease| lease.duplicate(libcanvas::rights::READ | libcanvas::rights::TRANSFER).ok())
-        else {
+        let Some(lease_ro) = pending.lease.as_ref().and_then(|lease| {
+            lease
+                .duplicate(libcanvas::rights::READ | libcanvas::rights::TRANSFER)
+                .ok()
+        }) else {
             let _ = process.terminate(-1);
             self.reject_pending_hotplug(
                 channel,
@@ -4464,7 +4461,12 @@ impl DriverManager {
         for resource_index in 0..pending.resources.len() {
             let (kind, base, len, exclusive) = {
                 let resource = &pending.resources[resource_index];
-                (resource.kind, resource.base, resource.len, resource.exclusive)
+                (
+                    resource.kind,
+                    resource.base,
+                    resource.len,
+                    resource.exclusive,
+                )
             };
             let Some(handle) = pending.resources[resource_index].handle.take() else {
                 let _ = process.terminate(-1);
@@ -4508,7 +4510,10 @@ impl DriverManager {
                 }
             }
         }
-        if child.write(protocol::RESOURCE_TRANSFER_COMPLETE.as_bytes()).is_err() {
+        if child
+            .write(protocol::RESOURCE_TRANSFER_COMPLETE.as_bytes())
+            .is_err()
+        {
             let _ = process.terminate(-1);
             self.reject_pending_hotplug(
                 channel,
@@ -4642,7 +4647,9 @@ impl DriverManager {
                         // lease/resource is cleaned up by the bounded restart
                         // path instead of being stranded in FIFO state.
                         drop(handle);
-                        println!("[driver-manager] malformed PCI hotplug handoff; restarting generation");
+                        println!(
+                            "[driver-manager] malformed PCI hotplug handoff; restarting generation"
+                        );
                         self.schedule_pci_manager_restart();
                         return;
                     } else if label == pci_manager::DEVICE_LEASE_RO_LABEL {
@@ -4715,7 +4722,9 @@ impl DriverManager {
                     if length == pci_hotplug::HANDOFF_MESSAGE_BYTES
                         && bytes[..4] == pci_hotplug::HANDOFF_MAGIC.to_le_bytes()
                     {
-                        println!("[driver-manager] malformed PCI hotplug handoff; restarting generation");
+                        println!(
+                            "[driver-manager] malformed PCI hotplug handoff; restarting generation"
+                        );
                         self.schedule_pci_manager_restart();
                         return;
                     }

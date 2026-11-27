@@ -696,11 +696,7 @@ impl HotplugHandoff {
     }
 
     /// Construct a response for a previously received handoff request.
-    pub const fn response(
-        request: Self,
-        status: HotplugHandoffStatus,
-        process_koid: u64,
-    ) -> Self {
+    pub const fn response(request: Self, status: HotplugHandoffStatus, process_koid: u64) -> Self {
         let mut response = Self::control(
             match request.op {
                 HotplugHandoffOp::RemoveRequest | HotplugHandoffOp::RemoveResponse => {
@@ -746,23 +742,18 @@ impl HotplugHandoff {
         }
         let magic = u32::from_le_bytes(bytes[0..4].try_into().ok()?);
         let version = u16::from_le_bytes(bytes[4..6].try_into().ok()?);
-        let op = HotplugHandoffOp::from_raw(u16::from_le_bytes(
-            bytes[6..8].try_into().ok()?,
-        ))?;
+        let op = HotplugHandoffOp::from_raw(u16::from_le_bytes(bytes[6..8].try_into().ok()?))?;
         let manager_generation = u64::from_le_bytes(bytes[8..16].try_into().ok()?);
         let device_id = u64::from_le_bytes(bytes[16..24].try_into().ok()?);
         let lease_generation = u64::from_le_bytes(bytes[24..32].try_into().ok()?);
         let bdf = u64::from_le_bytes(bytes[32..40].try_into().ok()?);
-        let driver = HotplugDriverKind::from_raw(u32::from_le_bytes(
-            bytes[40..44].try_into().ok()?,
-        ))?;
-        let status = HotplugHandoffStatus::from_raw(u32::from_le_bytes(
-            bytes[44..48].try_into().ok()?,
-        ))?;
+        let driver =
+            HotplugDriverKind::from_raw(u32::from_le_bytes(bytes[40..44].try_into().ok()?))?;
+        let status =
+            HotplugHandoffStatus::from_raw(u32::from_le_bytes(bytes[44..48].try_into().ok()?))?;
         let process_koid = u64::from_le_bytes(bytes[48..56].try_into().ok()?);
-        let resource_kind = HotplugResourceKind::from_raw(u32::from_le_bytes(
-            bytes[56..60].try_into().ok()?,
-        ))?;
+        let resource_kind =
+            HotplugResourceKind::from_raw(u32::from_le_bytes(bytes[56..60].try_into().ok()?))?;
         let exclusive = u32::from_le_bytes(bytes[60..64].try_into().ok()?);
         let resource_base = u64::from_le_bytes(bytes[64..72].try_into().ok()?);
         let resource_len = u64::from_le_bytes(bytes[72..80].try_into().ok()?);
@@ -777,10 +768,14 @@ impl HotplugHandoff {
             || device_id == 0
             || lease_generation == 0
             || unpack_pci_address(bdf).is_none()
-            || (matches!(op, HotplugHandoffOp::BindRequest | HotplugHandoffOp::RemoveRequest)
-                && status != HotplugHandoffStatus::Ok)
-            || (!matches!(op, HotplugHandoffOp::BindResponse | HotplugHandoffOp::RemoveResponse)
-                && process_koid != 0)
+            || (matches!(
+                op,
+                HotplugHandoffOp::BindRequest | HotplugHandoffOp::RemoveRequest
+            ) && status != HotplugHandoffStatus::Ok)
+            || (!matches!(
+                op,
+                HotplugHandoffOp::BindResponse | HotplugHandoffOp::RemoveResponse
+            ) && process_koid != 0)
             || (matches!(
                 op,
                 HotplugHandoffOp::BindResource | HotplugHandoffOp::BindComplete
@@ -832,9 +827,18 @@ mod tests {
 
     #[test]
     fn notify_map_is_total_and_fail_closed() {
-        assert_eq!(acpi_notify_kind(0x00), Some(HotplugNotifyKind::RescanSubtree));
-        assert_eq!(acpi_notify_kind(0x01), Some(HotplugNotifyKind::RescanSubtree));
-        assert_eq!(acpi_notify_kind(0x03), Some(HotplugNotifyKind::OrderlyEject));
+        assert_eq!(
+            acpi_notify_kind(0x00),
+            Some(HotplugNotifyKind::RescanSubtree)
+        );
+        assert_eq!(
+            acpi_notify_kind(0x01),
+            Some(HotplugNotifyKind::RescanSubtree)
+        );
+        assert_eq!(
+            acpi_notify_kind(0x03),
+            Some(HotplugNotifyKind::OrderlyEject)
+        );
         assert_eq!(
             acpi_notify_kind(0x80),
             Some(HotplugNotifyKind::RescanSubtree)
@@ -861,9 +865,15 @@ mod tests {
         let eject = HotplugWireEvent::function_eject(0, 2, 1, 0, NOTIFY_EJECT_REQUEST);
         assert_eq!(HotplugWireEvent::decode(&eject.encode()), Some(eject));
         let bridge_eject = HotplugWireEvent::bridge_port_eject(0, 0, 0x16, 0, 0x81);
-        assert_eq!(HotplugWireEvent::decode(&bridge_eject.encode()), Some(bridge_eject));
+        assert_eq!(
+            HotplugWireEvent::decode(&bridge_eject.encode()),
+            Some(bridge_eject)
+        );
         let root_surprise = HotplugWireEvent::root_surprise_removal(7, 0x82);
-        assert_eq!(HotplugWireEvent::decode(&root_surprise.encode()), Some(root_surprise));
+        assert_eq!(
+            HotplugWireEvent::decode(&root_surprise.encode()),
+            Some(root_surprise)
+        );
         let surprise = HotplugWireEvent::function_surprise_removal(0, 2, 1, 0, 0x82);
         assert_eq!(HotplugWireEvent::decode(&surprise.encode()), Some(surprise));
     }

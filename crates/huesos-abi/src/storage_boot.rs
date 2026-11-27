@@ -146,8 +146,7 @@ pub fn decode(bytes: &[u8]) -> Option<StorageBootInfo> {
         len: read_u64(bytes, 24)?,
     };
     let has_pool = (info.flags & FLAG_DMA_POOL_PRESENT) != 0;
-    if has_pool
-        != info.dma_pool.is_present()
+    if has_pool != info.dma_pool.is_present()
         || (!has_pool && info.dma_pool.base != 0)
         || (has_pool && info.dma_pool.len != BOOT_DMA_POOL_LEN)
         || (has_pool && info.dma_pool.base >= (1u64 << 32))
@@ -159,11 +158,7 @@ pub fn decode(bytes: &[u8]) -> Option<StorageBootInfo> {
                 .is_none_or(|end| end > (1u64 << 32)))
         || (info.dma_pool.base & 0xFFF) != 0
         || (info.dma_pool.len != 0 && (info.dma_pool.len & 0xFFF) != 0)
-        || info
-            .dma_pool
-            .base
-            .checked_add(info.dma_pool.len)
-            .is_none()
+        || info.dma_pool.base.checked_add(info.dma_pool.len).is_none()
     {
         return None;
     }
@@ -322,7 +317,10 @@ mod tests {
         let mut bytes = [0u8; MAX_ENCODED_BYTES];
         let info = StorageBootInfo {
             flags: FLAG_DMA_POOL_PRESENT,
-            dma_pool: DmaPoolInfo { base: 0x1000, len: 0 },
+            dma_pool: DmaPoolInfo {
+                base: 0x1000,
+                len: 0,
+            },
         };
         let Some(len) = encode(&info, &mut bytes) else {
             assert!(false, "encode must fit fixed buffer");

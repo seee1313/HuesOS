@@ -220,12 +220,7 @@ impl Resource {
                 // The caller already checked the boot reservation at the
                 // syscall boundary; this second check keeps the object-layer
                 // constructor safe for any future in-kernel caller too.
-                if !crate::dma_pool::claim_dynamic_slot(
-                    lease_koid,
-                    generation,
-                    base,
-                    len,
-                ) {
+                if !crate::dma_pool::claim_dynamic_slot(lease_koid, generation, base, len) {
                     return Err(ResourceError::Conflict);
                 }
                 Some((lease_koid, generation))

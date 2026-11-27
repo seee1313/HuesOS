@@ -224,10 +224,7 @@ pub fn uninstall_irq(gsi: u32) -> Result<(), ()> {
 
 /// Rust half of the C `uacpi_kernel_install_interrupt_handler` bridge.
 #[unsafe(no_mangle)]
-pub extern "C" fn hues_uacpi_irq_install(
-    irq: u32,
-    out_irq_handle: *mut *mut c_void,
-) -> i32 {
+pub extern "C" fn hues_uacpi_irq_install(irq: u32, out_irq_handle: *mut *mut c_void) -> i32 {
     if out_irq_handle.is_null() {
         return UACPI_STATUS_INVALID_ARGUMENT;
     }
@@ -240,7 +237,10 @@ pub extern "C" fn hues_uacpi_irq_install(
         store_scalar(out_irq_handle, core::ptr::null_mut());
         return UACPI_STATUS_DENIED;
     }
-    let Some(token) = usize::try_from(irq).ok().and_then(|value| value.checked_add(1)) else {
+    let Some(token) = usize::try_from(irq)
+        .ok()
+        .and_then(|value| value.checked_add(1))
+    else {
         let _ = uninstall_irq(irq);
         let _ = crate::broker::authorize_remove_interrupt(irq);
         store_scalar(out_irq_handle, core::ptr::null_mut());

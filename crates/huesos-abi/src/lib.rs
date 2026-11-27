@@ -63,6 +63,8 @@ pub mod storage_boot;
 pub mod pci;
 /// PCI Manager bootstrap and lifecycle control protocol.
 pub mod pci_config;
+/// ACPI Notify/PCI hotplug event wire format and the Stage M.2 trigger ABI.
+pub mod pci_hotplug;
 /// Immutable zero-bus-traffic PCI inventory VMO wire format (`HPIN`, Stage D.3).
 pub mod pci_inventory;
 /// Immutable IOMMU firmware discovery VMO wire format (`HIOM`, Stage N.1 / N.3).
@@ -73,8 +75,6 @@ pub mod pci_lease;
 pub mod pci_manager;
 /// Dedicated ACPI ↔ PCI configuration read mediation protocol (AP-10).
 pub mod pci_mediation;
-/// ACPI Notify/PCI hotplug event wire format and the Stage M.2 trigger ABI.
-pub mod pci_hotplug;
 /// Zero-bus-traffic USB 3.x (`xHCI`) inventory VMO wire format (`HUSB` v1).
 pub mod usb;
 

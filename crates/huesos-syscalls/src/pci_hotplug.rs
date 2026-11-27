@@ -6,7 +6,7 @@
 //! peer to `pci-manager`; a test process can therefore exercise the complete
 //! userspace path without a cmdline-only shortcut or a kernel PCI rescan.
 
-use huesos_abi::{ErrorCode, HandleValue, pci_hotplug::PciHotplugTriggerArgs};
+use huesos_abi::{pci_hotplug::PciHotplugTriggerArgs, ErrorCode, HandleValue};
 
 use crate::{channel, user_memory, SyscallResult};
 
@@ -21,7 +21,9 @@ pub(crate) fn sys_pci_hotplug_trigger(args: *const PciHotplugTriggerArgs) -> Sys
         return Err(ErrorCode::InvalidArgs);
     }
 
-    let channel_bytes = raw.get(0..core::mem::size_of::<HandleValue>()).ok_or(ErrorCode::InvalidArgs)?;
+    let channel_bytes = raw
+        .get(0..core::mem::size_of::<HandleValue>())
+        .ok_or(ErrorCode::InvalidArgs)?;
     let channel = u32::from_le_bytes(
         channel_bytes
             .try_into()
@@ -32,8 +34,8 @@ pub(crate) fn sys_pci_hotplug_trigger(args: *const PciHotplugTriggerArgs) -> Sys
         return Err(ErrorCode::InvalidArgs);
     }
     let event = raw.get(8..).ok_or(ErrorCode::InvalidArgs)?;
-    let decoded = huesos_abi::pci_hotplug::HotplugWireEvent::decode(event)
-        .ok_or(ErrorCode::InvalidArgs)?;
+    let decoded =
+        huesos_abi::pci_hotplug::HotplugWireEvent::decode(event).ok_or(ErrorCode::InvalidArgs)?;
     // A trigger may use either the standard ACPI bus/device check or one of
     // the PCIe presence/eject values. The raw value must still agree with the
     // bounded classification carried by the event.

@@ -192,10 +192,7 @@ pub(crate) fn sys_channel_write(
 /// Send bytes already copied into kernel memory through a caller-owned channel
 /// without exposing a second user-memory copy path. Used by bounded kernel
 /// adapters such as the ring-3 hotplug trigger.
-pub(crate) fn sys_channel_write_kernel_bytes(
-    handle: HandleValue,
-    bytes: &[u8],
-) -> SyscallResult {
+pub(crate) fn sys_channel_write_kernel_bytes(handle: HandleValue, bytes: &[u8]) -> SyscallResult {
     if bytes.len() > user_memory::MAX_CHANNEL_BYTES {
         return Err(ErrorCode::InvalidArgs);
     }
@@ -208,8 +205,8 @@ pub(crate) fn sys_channel_write_kernel_bytes(
     let ch = obj
         .downcast_ref::<huesos_object::Channel>()
         .ok_or(ErrorCode::WrongType)?;
-    let message = huesos_object::ChannelMessage::inline(bytes, &[])
-        .ok_or(ErrorCode::InvalidArgs)?;
+    let message =
+        huesos_object::ChannelMessage::inline(bytes, &[]).ok_or(ErrorCode::InvalidArgs)?;
     match ch.send(message) {
         Ok(()) => Ok(0),
         Err(error) => {

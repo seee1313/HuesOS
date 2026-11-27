@@ -660,18 +660,16 @@ impl HotplugCoordinator {
         // may still be `Configured` while the supervisor is waiting for its
         // binding decision; that state is removed directly after the same
         // command-disable transaction, without inventing a quiesce ACK.
-        let removal_generation = if matches!(
-            prior_state,
-            LeaseState::DriverStarting | LeaseState::Online
-        ) {
-            self.active_slots[pos]
-                .policy
-                .apply(revoked_gen, LeaseEvent::DriverQuiesced)
-                .map_err(HotplugError::Lease)?
-                .generation
-        } else {
-            self.active_slots[pos].policy.generation()
-        };
+        let removal_generation =
+            if matches!(prior_state, LeaseState::DriverStarting | LeaseState::Online) {
+                self.active_slots[pos]
+                    .policy
+                    .apply(revoked_gen, LeaseEvent::DriverQuiesced)
+                    .map_err(HotplugError::Lease)?
+                    .generation
+            } else {
+                self.active_slots[pos].policy.generation()
+            };
 
         // Disable I/O, Memory Space, and Bus Master in PCI Command register.
         let cur_cmd = transport
@@ -1068,7 +1066,12 @@ mod tests {
         let Ok(mut coord) = HotplugCoordinator::from_boot_plan(
             &[(bridge, 1, 4)],
             &plan,
-            &[(nvme, RelocationClass::Fixed, DmaIsolation::Trusted, Some(100))],
+            &[(
+                nvme,
+                RelocationClass::Fixed,
+                DmaIsolation::Trusted,
+                Some(100),
+            )],
         ) else {
             assert!(false);
             return;

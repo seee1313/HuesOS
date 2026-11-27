@@ -52,7 +52,7 @@ pub use device_lease::{
     IommuBindDmaFn, IommuLeaseHooks, IommuTeardownFn, PORT_PACKET_DEVICE_GONE,
 };
 pub use dma_pool::{
-    dynamic_slot_range_owned, dma_pool_range_owned, range_overlaps_dynamic_area, set_boot_dma_pool,
+    dma_pool_range_owned, dynamic_slot_range_owned, range_overlaps_dynamic_area, set_boot_dma_pool,
 };
 pub use futex::{FutexNode, FutexTable};
 pub use handle::{Handle, HandleTable, HandleTableError, HandleValue, Rights, INVALID_HANDLE};
