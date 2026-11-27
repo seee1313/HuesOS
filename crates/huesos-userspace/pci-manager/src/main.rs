@@ -1259,7 +1259,7 @@ fn remove_hotplug_scope(
     // Disable/revoke children before their parent bridge. This is required
     // for orderly bridge/root removal and also keeps surprise removal's
     // service withdrawal deterministic.
-    addresses.sort_by(|left, right| right.0.cmp(&left.0));
+    addresses.sort_by_key(|&(depth, _)| core::cmp::Reverse(depth));
     let mut removed = 0usize;
     for (_, address) in addresses {
         if remove_hotplug_device(
@@ -1330,7 +1330,7 @@ fn remove_hotplug_device(
         let lease = &authority.leases[index];
         libcanvas::device_lease::query(&lease.handle)
             .ok()
-            .map_or(false, |info| {
+            .is_some_and(|info| {
                 info.revoked != 0
                     || libcanvas::device_lease::revoke(
                         &lease.handle,
