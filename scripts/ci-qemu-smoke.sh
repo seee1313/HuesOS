@@ -95,11 +95,20 @@ if [[ -n "${HUESOS_SMOKE_NVME:-}" ]]; then
     )
 fi
 
+snd_args=()
+if [[ "${HUESOS_NO_SND:-0}" != "1" ]] && qemu-system-x86_64 -device help 2>/dev/null | grep -q '"virtio-snd-pci"'; then
+    snd_args=(
+        -audiodev "none,id=snd0"
+        -device "virtio-snd-pci,audiodev=snd0"
+    )
+fi
+
 set +e
 timeout "${timeout_seconds}s" qemu-system-x86_64 \
     -machine q35 -cpu qemu64 -smp "$cpus" -m 512M \
     -bios third_party/ovmf/OVMF.fd -cdrom build/huesos.iso \
     "${nvme_args[@]}" \
+    "${snd_args[@]}" \
     -netdev user,id=n0 \
     -device virtio-net-pci,netdev=n0,disable-legacy=off,disable-modern=on \
     -display none -serial "file:$log" \
@@ -242,6 +251,9 @@ required+=(
     '[hsh] PE64 win-crt-smoke.exe OK'
     '[hsh] wlanctl scan + WPA2 connect OK'
     '[hsh] @caps(net=ro,wlan=ro) enforcement OK'
+    '[hsh] btctl SSP + SDP + btsnoop OK'
+    '[hsh] audioctl A2DP + HARB VMO aplay OK'
+    '[hsh] @caps(btl=ro,audio=ro) enforcement OK'
     '[hsh] df usage OK'
     '[terminal] keyboard service online, starting /bin/hsh.elf session'
     '[init] FrameDraw duplicate self-check OK'

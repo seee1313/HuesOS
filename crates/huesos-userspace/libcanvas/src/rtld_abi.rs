@@ -152,6 +152,10 @@ pub struct ProcessBootstrapInfo {
     pub net_service_ch: u32,
     /// Capability handle for `wlan-service` channel (`INVALID_HANDLE` if absent).
     pub wlan_service_ch: u32,
+    /// Capability handle for `btl-service` (`Plan 9 /net/btl`) channel (`INVALID_HANDLE` if absent).
+    pub btl_service_ch: u32,
+    /// Capability handle for `audio-service` (`/dev/audio`) channel (`INVALID_HANDLE` if absent).
+    pub audio_service_ch: u32,
     /// Target PE32+ `.exe` VMO handle when launching `/lib/ld-pe.so` (`INVALID_HANDLE` otherwise).
     pub pe_vmo: u32,
     /// Self root VMAR handle retained exclusively for `/lib/ld-pe.so` (`INVALID_HANDLE` otherwise).

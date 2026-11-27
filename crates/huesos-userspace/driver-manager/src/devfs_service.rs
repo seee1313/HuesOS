@@ -10,7 +10,7 @@ use crate::volume_service::VolumeManagerService;
 use libcanvas::{println, Channel, ErrorCode};
 
 const MAX_DEVFS_CLIENTS: usize = 4;
-const LISTING: &[u8] = b"/dev\n/dev/nvme0\n/dev/nvme0/ns1\n/dev/block\n/dev/block/system\n/dev/block/usb0\n/dev/input\n/dev/input/keyboard0\n/dev/input/mouse0\n/dev/fb0\n/dev/drivers\n/dev/drivers/nvme-host\n/dev/drivers/xhci-host\n";
+const LISTING: &[u8] = b"/dev\n/dev/nvme0\n/dev/nvme0/ns1\n/dev/block\n/dev/block/system\n/dev/block/usb0\n/dev/input\n/dev/input/keyboard0\n/dev/input/mouse0\n/dev/audio\n/dev/audio/pcm\n/dev/audio/ctl\n/dev/audio/status\n/dev/fb0\n/dev/drivers\n/dev/drivers/nvme-host\n/dev/drivers/xhci-host\n/dev/drivers/snd-host\n";
 
 /// DriverManager-owned DevFS service.
 pub struct DevFsService {
@@ -194,9 +194,13 @@ impl DevFsService {
         }
         if request == b"OPEN /dev/input/keyboard0"
             || request == b"OPEN /dev/input/mouse0"
+            || request == b"OPEN /dev/audio/pcm"
+            || request == b"OPEN /dev/audio/ctl"
+            || request == b"OPEN /dev/audio/status"
             || request == b"OPEN /dev/fb0"
             || request == b"OPEN /dev/drivers/nvme-host"
             || request == b"OPEN /dev/drivers/xhci-host"
+            || request == b"OPEN /dev/drivers/snd-host"
         {
             self.write(index, b"err:devfs-not-supported\n");
             return;

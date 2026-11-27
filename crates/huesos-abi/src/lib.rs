@@ -44,6 +44,12 @@ pub mod net;
 /// Production Wi-Fi (`10ec:c821` RTL8821CE) service wire protocol.
 pub mod wlan;
 
+/// Plan 9 `/net/btl` Bluetooth Classic transport (`HCI` + `L2CAP` + `SDP`) wire protocol.
+pub mod btl;
+
+/// Multi-sink `audio-service` (`/dev/audio`) & `VirtIO-Sound` (`driver-host-snd`) wire protocol.
+pub mod audio;
+
 /// Immutable ACPI table-archive decoding and physical-address index.
 ///
 /// Used by both the kernel archive builder and the Ring-3 `acpi-manager` to

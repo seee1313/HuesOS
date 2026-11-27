@@ -44,6 +44,14 @@ if [[ -n "${HUESOS_NVME_IMAGE:-}" || "${HUESOS_NO_NVME:-0}" != "1" ]]; then
     )
 fi
 
+snd_args=()
+if [[ "${HUESOS_NO_SND:-0}" != "1" ]] && qemu-system-x86_64 -device help 2>/dev/null | grep -q '"virtio-snd-pci"'; then
+    snd_args=(
+        -audiodev "none,id=snd0"
+        -device "virtio-snd-pci,audiodev=snd0"
+    )
+fi
+
 exec qemu-system-x86_64 \
     -machine q35 \
     -cpu qemu64 \
@@ -52,6 +60,7 @@ exec qemu-system-x86_64 \
     -bios "$OVMF" \
     -cdrom "$ISO" \
     "${disk_args[@]}" \
+    "${snd_args[@]}" \
     -netdev user,id=n0 \
     -device virtio-net-pci,netdev=n0,disable-legacy=off,disable-modern=on \
     -serial stdio \

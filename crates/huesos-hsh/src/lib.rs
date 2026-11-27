@@ -17,8 +17,8 @@ pub mod parser;
 pub mod value;
 
 pub use ast::{
-    BootfsAccess, CapsSpec, ChainOp, CmpOp, DirGrant, FbAccess, HxfsAccess, NetAccess, Stmt,
-    WlanAccess,
+    AudioAccess, BootfsAccess, BtlAccess, CapsSpec, ChainOp, CmpOp, DirGrant, FbAccess, HxfsAccess,
+    NetAccess, Stmt, WlanAccess,
 };
 pub use eval::{
     EvalAction, EvalResult, ExecOutcome, HostPathKind, PipelineCommand, ShellEnv, ShellHost,
@@ -323,29 +323,61 @@ mod tests {
                 | huesos_abi::auxv::caps_mask::NET_RW
                 | huesos_abi::auxv::caps_mask::WLAN_RO
                 | huesos_abi::auxv::caps_mask::WLAN_ADMIN
+                | huesos_abi::auxv::caps_mask::BTL_RO
+                | huesos_abi::auxv::caps_mask::BTL_RW
+                | huesos_abi::auxv::caps_mask::BTL_ADMIN
+                | huesos_abi::auxv::caps_mask::AUDIO_RO
+                | huesos_abi::auxv::caps_mask::AUDIO_RW
+                | huesos_abi::auxv::caps_mask::AUDIO_ADMIN
         );
     }
 
     #[test]
     fn test_caps_net_and_wlan_attenuation() {
-        let Ok(ro) = CapsSpec::parse("hxfs=none, bootfs=none, fb=none, net=ro, wlan=ro") else {
-            assert!(false, "parse net=ro, wlan=ro");
+        let Ok(ro) = CapsSpec::parse(
+            "hxfs=none, bootfs=none, fb=none, net=ro, wlan=ro, btl=ro, audio=ro",
+        ) else {
+            assert!(false, "parse net=ro, wlan=ro, btl=ro, audio=ro");
             return;
         };
         assert_eq!(ro.net, NetAccess::ReadOnly);
         assert_eq!(ro.wlan, WlanAccess::ReadOnly);
+        assert_eq!(ro.btl, BtlAccess::ReadOnly);
+        assert_eq!(ro.audio, AudioAccess::ReadOnly);
         assert_eq!(
             ro.to_caps_mask(),
-            huesos_abi::auxv::caps_mask::NET_RO | huesos_abi::auxv::caps_mask::WLAN_RO
+            huesos_abi::auxv::caps_mask::NET_RO
+                | huesos_abi::auxv::caps_mask::WLAN_RO
+                | huesos_abi::auxv::caps_mask::BTL_RO
+                | huesos_abi::auxv::caps_mask::AUDIO_RO
         );
 
-        let Ok(none) = CapsSpec::parse("hxfs=none, bootfs=none, fb=none, net=none, wlan=none")
-        else {
-            assert!(false, "parse net=none, wlan=none");
+        let Ok(rw) = CapsSpec::parse(
+            "hxfs=none, bootfs=none, fb=none, net=none, wlan=none, btl=rw, audio=rw",
+        ) else {
+            assert!(false, "parse btl=rw, audio=rw");
+            return;
+        };
+        assert_eq!(rw.btl, BtlAccess::ReadWrite);
+        assert_eq!(rw.audio, AudioAccess::ReadWrite);
+        assert_eq!(
+            rw.to_caps_mask(),
+            huesos_abi::auxv::caps_mask::BTL_RO
+                | huesos_abi::auxv::caps_mask::BTL_RW
+                | huesos_abi::auxv::caps_mask::AUDIO_RO
+                | huesos_abi::auxv::caps_mask::AUDIO_RW
+        );
+
+        let Ok(none) = CapsSpec::parse(
+            "hxfs=none, bootfs=none, fb=none, net=none, wlan=none, btl=none, audio=none",
+        ) else {
+            assert!(false, "parse net=none, wlan=none, btl=none, audio=none");
             return;
         };
         assert_eq!(none.net, NetAccess::None);
         assert_eq!(none.wlan, WlanAccess::None);
+        assert_eq!(none.btl, BtlAccess::None);
+        assert_eq!(none.audio, AudioAccess::None);
         assert_eq!(none.to_caps_mask(), 0);
     }
 

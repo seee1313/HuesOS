@@ -191,6 +191,18 @@ path = "src/bin/netctl.rs"
 name = "wlanctl"
 path = "src/bin/wlanctl.rs"
 
+[[bin]]
+name = "btctl"
+path = "src/bin/btctl.rs"
+
+[[bin]]
+name = "audioctl"
+path = "src/bin/audioctl.rs"
+
+[[bin]]
+name = "aplay"
+path = "src/bin/aplay.rs"
+
 [dependencies]
 libcanvas = { path = "../libcanvas", default-features = false, features = ["dyn-client"] }
 huesos-abi = { path = "../../huesos-abi" }

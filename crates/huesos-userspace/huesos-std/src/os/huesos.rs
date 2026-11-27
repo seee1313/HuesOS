@@ -50,6 +50,10 @@ pub enum Capability {
     Bootfs,
     /// The driver registry.
     Registry,
+    /// Plan 9 `/net/btl` Bluetooth Classic transport service.
+    BtlService,
+    /// Multi-stream `HARB` SPSC mixer + `VirtIO-Sound` / `A2DP` audio service.
+    AudioService,
 }
 
 impl Capability {
@@ -65,6 +69,8 @@ impl Capability {
             Capability::FrameDraw => CapKind::FrameDraw,
             Capability::Bootfs => CapKind::BootfsRo,
             Capability::Registry => CapKind::Registry,
+            Capability::BtlService => CapKind::BtlService,
+            Capability::AudioService => CapKind::AudioService,
         })
     }
 
@@ -80,6 +86,8 @@ impl Capability {
             Capability::FrameDraw => "fb",
             Capability::Bootfs => "bootfs",
             Capability::Registry => "registry",
+            Capability::BtlService => "btl",
+            Capability::AudioService => "audio",
         }
     }
 }

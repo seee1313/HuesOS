@@ -26,8 +26,12 @@ pub const WLAN_DMA_LEN: u64 = 4 * 1024 * 1024;
 pub const XHCI_DMA_OFFSET: u64 = WLAN_DMA_OFFSET + WLAN_DMA_LEN;
 /// Size of the fixed xHCI DMA window.
 pub const XHCI_DMA_LEN: u64 = 4 * 1024 * 1024;
+/// Offset of the fixed VirtIO-Sound (`driver-host-snd`) DMA window.
+pub const AUDIO_DMA_OFFSET: u64 = XHCI_DMA_OFFSET + XHCI_DMA_LEN;
+/// Size of the fixed VirtIO-Sound (`driver-host-snd`) DMA window.
+pub const AUDIO_DMA_LEN: u64 = 4 * 1024 * 1024;
 /// Length of the fixed boot-device portion before live hotplug slices.
-pub const STATIC_DMA_POOL_LEN: u64 = XHCI_DMA_OFFSET + XHCI_DMA_LEN;
+pub const STATIC_DMA_POOL_LEN: u64 = AUDIO_DMA_OFFSET + AUDIO_DMA_LEN;
 /// Fixed offset of the live hotplug area inside the boot DMA pool.
 pub const HOTPLUG_DMA_OFFSET: u64 = STATIC_DMA_POOL_LEN;
 /// Size of one live hotplug DMA slice.
@@ -289,9 +293,10 @@ mod tests {
         assert_eq!(NET_DMA_OFFSET, NVME_DMA_LEN);
         assert_eq!(WLAN_DMA_OFFSET, NET_DMA_OFFSET + NET_DMA_LEN);
         assert_eq!(XHCI_DMA_OFFSET, WLAN_DMA_OFFSET + WLAN_DMA_LEN);
-        assert_eq!(STATIC_DMA_POOL_LEN, 76 * 1024 * 1024);
+        assert_eq!(AUDIO_DMA_OFFSET, XHCI_DMA_OFFSET + XHCI_DMA_LEN);
+        assert_eq!(STATIC_DMA_POOL_LEN, 80 * 1024 * 1024);
         assert_eq!(HOTPLUG_DMA_OFFSET, STATIC_DMA_POOL_LEN);
-        assert_eq!(BOOT_DMA_POOL_LEN, 92 * 1024 * 1024);
+        assert_eq!(BOOT_DMA_POOL_LEN, 96 * 1024 * 1024);
         assert_eq!(
             BOOT_DMA_POOL_LEN,
             STATIC_DMA_POOL_LEN + HOTPLUG_DMA_SLOT_LEN * HOTPLUG_DMA_SLOT_COUNT as u64

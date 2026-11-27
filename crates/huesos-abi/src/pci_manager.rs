@@ -57,6 +57,13 @@ pub const DEVICE_LEASE_XHCI_RO_LABEL: &[u8] = b"pci-lease-ro:xhci";
 /// TRANSFER`) for `driver-host-xhci` so `DriverManager` attaches its `DmaPool`
 /// into the hardware IOMMU domain and revokes on exit.
 pub const DEVICE_LEASE_XHCI_RW_LABEL: &[u8] = b"pci-lease-rw:xhci";
+/// Label carrying the read-only `DeviceLease` handle (`READ | TRANSFER`) for
+/// `driver-host-snd` (`VirtIO-Sound` `1af4:1059`).
+pub const DEVICE_LEASE_SND_RO_LABEL: &[u8] = b"pci-lease-ro:snd";
+/// Label carrying the supervisor-only `DeviceLease` handle (`READ | WRITE |
+/// TRANSFER`) for `driver-host-snd` so `DriverManager` attaches its `DmaPool`
+/// into the hardware IOMMU domain and revokes on exit.
+pub const DEVICE_LEASE_SND_RW_LABEL: &[u8] = b"pci-lease-rw:snd";
 /// Label carrying a narrow lease-bound `Resource` handle (`Mmio`, `IoPort`,
 /// `Irq`, or `DmaPool`) minted via `DeviceLeaseMintResource` (AP-21).
 pub const LEASE_RESOURCE_LABEL: &[u8] = b"pci-lease-res";

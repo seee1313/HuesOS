@@ -20,8 +20,8 @@ use core::sync::atomic::{fence, AtomicU64, Ordering};
 
 use huesos_abi::vmar_flags;
 use huesos_abi::wlan::{
-    self, MacPolicyMode, RegDomainCode, WlanBssInfo, WlanOp, WlanProfileSummary, WlanSecurity,
-    WlanStateCode, WlanStatus, WlanStatusSnapshot, MAX_SSID_LEN,
+    self, BtCoexProfile, MacPolicyMode, RegDomainCode, WlanBssInfo, WlanOp, WlanProfileSummary,
+    WlanSecurity, WlanStateCode, WlanStatus, WlanStatusSnapshot, MAX_SSID_LEN,
 };
 use huesos_ieee80211::{
     build_assoc_request_for_bss, build_assoc_response, build_auth_frame,
@@ -272,6 +272,7 @@ trait WlanHal {
     fn clear_ccmp_key(&mut self, slot: u8);
     fn tx_mpdu(&mut self, now_ms: u64, mpdu: &[u8]) -> bool;
     fn poll_rx_mpdu(&mut self) -> Option<(i8, Vec<u8>)>;
+    fn set_bt_coex_profile(&mut self, _profile: BtCoexProfile) {}
 }
 
 struct PcieBarMmio {
@@ -538,6 +539,11 @@ impl WlanHal for Rtw88Hal {
             Some(&mut c2h),
         )?;
         Some((rssi, self.rx_scratch[..n].to_vec()))
+    }
+    fn set_bt_coex_profile(&mut self, profile: BtCoexProfile) {
+        if self.hw.initialized {
+            self.hw.set_bt_coex_profile(&mut self.mmio, profile as u8);
+        }
     }
 }
 
@@ -2288,6 +2294,7 @@ pub extern "C" fn _start() -> ! {
     let mut pci_id_meta: Option<(u32, u16)> = None; // (vendor_device_packed, bdf_packed)
     let mut init_hxfs_ch: Option<Channel> = None;
     let mut init_uplink_ch: Option<Channel> = None;
+    let mut init_btl_coex_ch: Option<Channel> = None;
 
     let mut label_buf = [0u8; 128];
     for _ in 0..256 {
@@ -2308,6 +2315,10 @@ pub extern "C" fn _start() -> ! {
                 } else if msg == "uplink:net" {
                     if let Some(h) = handle_opt {
                         init_uplink_ch = Some(Channel::from_handle(h));
+                    }
+                } else if msg == "coex:btl" {
+                    if let Some(h) = handle_opt {
+                        init_btl_coex_ch = Some(Channel::from_handle(h));
                     }
                 } else if let Some(rest) = msg.strip_prefix("resource:wlan-service:") {
                     let mut parts = rest.split(':');
@@ -2504,6 +2515,12 @@ pub extern "C" fn _start() -> ! {
     let _ = bootstrap.write(b"service:wlan:ready");
 
     let mut clients: Vec<Option<WlanClientConn>> = Vec::with_capacity(16);
+    if let Some(coex_ch) = init_btl_coex_ch {
+        clients.push(Some(WlanClientConn {
+            ch: coex_ch,
+            admin: true,
+        }));
+    }
     let mut active_until_ms = 0u64;
 
     loop {
@@ -2524,7 +2541,7 @@ pub extern "C" fn _start() -> ! {
                     did_ipc = true;
                     let tag = &bmsg[..n];
                     let is_ro = tag == b"wlan-client:ro";
-                    if tag == b"wlan-client" || is_ro {
+                    if tag == b"wlan-client" || is_ro || tag == b"coex:btl" {
                         let conn = WlanClientConn {
                             ch: Channel::from_handle(h),
                             admin: !is_ro,
@@ -2818,6 +2835,21 @@ pub extern "C" fn _start() -> ! {
                     rt.autoconnect = payload.first().copied().unwrap_or(1) != 0;
                     let mut rep = [0u8; 8];
                     wlan::write_header(&mut rep, WlanOp::SetAutoconnect, WlanStatus::Ok);
+                    if let Some(c) = clients[idx].as_ref() {
+                        let _ = c.ch.write(&rep);
+                    }
+                }
+                WlanOp::SetBtCoexProfile => {
+                    let st = if let Some(profile) =
+                        payload.first().copied().and_then(BtCoexProfile::from_raw)
+                    {
+                        rt.hal.set_bt_coex_profile(profile);
+                        WlanStatus::Ok
+                    } else {
+                        WlanStatus::InvalidRequest
+                    };
+                    let mut rep = [0u8; 8];
+                    wlan::write_header(&mut rep, WlanOp::SetBtCoexProfile, st);
                     if let Some(c) = clients[idx].as_ref() {
                         let _ = c.ch.write(&rep);
                     }

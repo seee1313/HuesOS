@@ -183,6 +183,41 @@ impl ScudoHeap {
         })
     }
 
+    /// Safely initialise the single process-wide [`ScudoHeap`] instance.
+    ///
+    /// Enforces via a one-shot atomic claim that at most one `'static ScudoHeap`
+    /// in the address space can own [`HeapWindow`], while [`HeapLock`] serialises
+    /// concurrent callers.
+    pub fn init_process_heap(&'static self) -> bool {
+        static CLAIMED: core::sync::atomic::AtomicBool =
+            core::sync::atomic::AtomicBool::new(false);
+        if self.is_initialised() {
+            return true;
+        }
+        if CLAIMED
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return self.is_initialised();
+        }
+        let cookie = match memory::random_u64() {
+            Ok(value) if value != 0 => value,
+            _ => return false,
+        };
+        self.inner.with(|slot| {
+            if slot.is_some() {
+                return true;
+            }
+            match Allocator::new(HeapWindow::new(), cookie) {
+                Ok(allocator) => {
+                    *slot = Some(allocator);
+                    true
+                }
+                Err(_) => false,
+            }
+        })
+    }
+
     /// Whether [`Self::init`] has run successfully.
     pub fn is_initialised(&self) -> bool {
         self.inner.with(|slot| slot.is_some())

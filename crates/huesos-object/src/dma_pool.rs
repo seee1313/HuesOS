@@ -49,7 +49,7 @@ static HOTPLUG_DMA_SLOT_OWNERS: IrqSafeMutex<[Option<DynamicSlotOwner>; HOTPLUG_
 pub fn set_boot_dma_pool(base: u64, len: u64) -> bool {
     // The layout is an ABI contract, not a hint supplied by userspace. Keep
     // the kernel ownership root identical to the boot allocator's canonical
-    // 92 MiB reservation and below the 32-bit DMA aperture.
+    // 96 MiB reservation and below the 32-bit DMA aperture.
     if len != huesos_abi::storage_boot::BOOT_DMA_POOL_LEN
         || base == 0
         || base >= (1u64 << 32)

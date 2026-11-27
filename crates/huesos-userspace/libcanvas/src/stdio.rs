@@ -40,6 +40,10 @@ pub enum CapKind {
     PeVmo = 11,
     /// Self root VMAR passed to `/lib/ld-pe.so` for mapping `.exe`/`.dll` sections.
     PeSelfVmar = 12,
+    /// `btl-service` (`Plan 9 /net/btl`) capability channel (`AT_HUESOS_BTL_SERVICE`).
+    BtlService = 13,
+    /// `audio-service` (`/dev/audio`) capability channel (`AT_HUESOS_AUDIO_SERVICE`).
+    AudioService = 14,
 }
 
 #[cfg(not(feature = "dyn-client"))]
@@ -71,6 +75,8 @@ mod imp {
     static REGISTRY_CH: AtomicU32 = AtomicU32::new(INVALID_HANDLE);
     static NET_SERVICE_CH: AtomicU32 = AtomicU32::new(INVALID_HANDLE);
     static WLAN_SERVICE_CH: AtomicU32 = AtomicU32::new(INVALID_HANDLE);
+    static BTL_SERVICE_CH: AtomicU32 = AtomicU32::new(INVALID_HANDLE);
+    static AUDIO_SERVICE_CH: AtomicU32 = AtomicU32::new(INVALID_HANDLE);
     static PE_VMO_H: AtomicU32 = AtomicU32::new(INVALID_HANDLE);
     static PE_SELF_VMAR_H: AtomicU32 = AtomicU32::new(INVALID_HANDLE);
     static PE_OFFSET: AtomicU64 = AtomicU64::new(0);
@@ -96,6 +102,8 @@ mod imp {
             CapKind::Registry => &REGISTRY_CH,
             CapKind::NetService => &NET_SERVICE_CH,
             CapKind::WlanService => &WLAN_SERVICE_CH,
+            CapKind::BtlService => &BTL_SERVICE_CH,
+            CapKind::AudioService => &AUDIO_SERVICE_CH,
             CapKind::PeVmo => &PE_VMO_H,
             CapKind::PeSelfVmar => &PE_SELF_VMAR_H,
         }
@@ -116,6 +124,8 @@ mod imp {
         REGISTRY_CH.store(info.registry_ch, Ordering::Release);
         NET_SERVICE_CH.store(info.net_service_ch, Ordering::Release);
         WLAN_SERVICE_CH.store(info.wlan_service_ch, Ordering::Release);
+        BTL_SERVICE_CH.store(info.btl_service_ch, Ordering::Release);
+        AUDIO_SERVICE_CH.store(info.audio_service_ch, Ordering::Release);
         PE_VMO_H.store(info.pe_vmo, Ordering::Release);
         PE_SELF_VMAR_H.store(info.pe_self_vmar, Ordering::Release);
         PE_OFFSET.store(info.pe_offset, Ordering::Release);

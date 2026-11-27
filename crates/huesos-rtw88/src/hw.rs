@@ -1825,6 +1825,27 @@ impl Rtl8821ceHw {
         self.coex_set_ant_path_8821c(mmio, false);
     }
 
+    /// Reprogram `RTL8821CE` hardware 3-wire PTA slot arbitration (`REG_BT_COEX_TABLE0/1`),
+    /// TDMA slot duration (`REG_BT_TDMA_TIME`), and Scoreboard (`REG_WIFI_BT_INFO`) for
+    /// shared-antenna 2.4 GHz Wi-Fi + Bluetooth coexistence (`rtw8821c.c:table_sant_8821c`).
+    pub fn set_bt_coex_profile<M: Rtw88Mmio>(&self, mmio: &mut M, profile: u8) {
+        let (tbl0, tbl1, tdma_slots, scbd): (u32, u32, u8, u16) = match profile {
+            // `Off`: Wi-Fi full priority (`table_sant_8821c[0]`)
+            0 => (0xFFFF_FFFF, 0xFFFF_FFFF, 0x05, (1u16 << 15) | 0x0001),
+            // `BtInquiryPair`: yield shared 2.4 GHz slots to BT Inquiry/Page/SSP (`table_sant_8821c[1]`)
+            2 => (0x5555_5555, 0x5555_5555, 0x14, (1u16 << 15) | 0x0007),
+            // `BtA2dpStreaming`: protect real-time A2DP SBC media ACL slots (`table_sant_8821c[8]`)
+            3 => (0x5A5A_5AAA, 0x5A5A_5AAA, 0x10, (1u16 << 15) | 0x000B),
+            // `BtIdle` (default): balanced WL + BT page-scan (`table_sant_8821c[4]`)
+            _ => (0x5A5A_5A5A, 0x5A5A_5A5A, 0x08, (1u16 << 15) | 0x0003),
+        };
+        mmio.write32(REG_BT_COEX_TABLE0, tbl0);
+        mmio.write32(REG_BT_COEX_TABLE1, tbl1);
+        let tdma = (mmio.read8(REG_BT_TDMA_TIME) & !0x3F) | (tdma_slots & 0x3F);
+        mmio.write8(REG_BT_TDMA_TIME, tdma);
+        mmio.write16(REG_WIFI_BT_INFO, scbd);
+    }
+
     /// Program external M.2 DPDT/SPDT antenna switch & `LTE_COEX_CTRL` GNT lines
     /// for 2.4 GHz (`COEX_SET_ANT_2G`) or 5 GHz (`COEX_SET_ANT_5G`), strictly
     /// following `rtw8821c_coex_cfg_rfe_type` + `rtw8821c_coex_cfg_ant_switch`.

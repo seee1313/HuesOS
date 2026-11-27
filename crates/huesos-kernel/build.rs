@@ -94,6 +94,14 @@ fn main() {
         &[],
         &[],
     );
+    let snd_driver_host = build_userspace_program(
+        &userspace_root,
+        "driver-host-snd",
+        "huesos-driver-host-snd",
+        profile,
+        &[],
+        &[],
+    );
     let pci_hotplug_test = if boot_selftest {
         Some(build_userspace_program(
             &userspace_root,
@@ -134,6 +142,22 @@ fn main() {
         profile,
         &[],
         wlan_service_args,
+    );
+    let btl_service = build_userspace_program(
+        &userspace_root,
+        "btl-service",
+        "huesos-btl-service",
+        profile,
+        &[],
+        &[],
+    );
+    let audio_service = build_userspace_program(
+        &userspace_root,
+        "audio-service",
+        "huesos-audio-service",
+        profile,
+        &[],
+        &[],
     );
     println!("cargo:rerun-if-env-changed=HUESOS_ACPI_RESTART_SMOKE");
     println!("cargo:rerun-if-env-changed=HUESOS_ACPI_BUDGET_SMOKE");
@@ -330,9 +354,12 @@ fn main() {
             input_driver_host: &input_driver_host,
             nvme_driver_host: &nvme_driver_host,
             xhci_driver_host: &xhci_driver_host,
+            snd_driver_host: &snd_driver_host,
             hxfs_service: &hxfs_service,
             net_service: &net_service,
             wlan_service: &wlan_service,
+            btl_service: &btl_service,
+            audio_service: &audio_service,
             acpi_manager: &acpi_manager,
             pci_manager: &pci_manager,
             shutdown_broker: &shutdown_broker,
@@ -484,9 +511,12 @@ fn track_userspace_inputs(userspace_root: &Path) {
         "driver-host-input",
         "driver-host-nvme",
         "driver-host-xhci",
+        "driver-host-snd",
         "hxfs-service",
         "net-service",
         "wlan-service",
+        "btl-service",
+        "audio-service",
         "acpi-manager",
         "pci-manager",
         "pci-hotplug-test",
@@ -581,6 +611,10 @@ fn track_userspace_inputs(userspace_root: &Path) {
         userspace_root.join("x86_64-huesos-pe64.json").display()
     );
     println!("cargo:rerun-if-changed=../../third_party/firmware/rtw88/rtw8821c_fw.bin");
+    println!("cargo:rerun-if-changed=../../third_party/firmware/rtl_bt/rtl8821c_fw.bin");
+    println!("cargo:rerun-if-changed=../../third_party/firmware/rtl_bt/rtl8821c_config.bin");
+    println!("cargo:rerun-if-changed=../huesos-bt/src");
+    println!("cargo:rerun-if-changed=../huesos-audio/src");
     println!(
         "cargo:rerun-if-changed={}",
         userspace_root.join("libcanvas").join("src").display()
@@ -1112,9 +1146,12 @@ struct BootfsInputs<'a> {
     input_driver_host: &'a Path,
     nvme_driver_host: &'a Path,
     xhci_driver_host: &'a Path,
+    snd_driver_host: &'a Path,
     hxfs_service: &'a Path,
     net_service: &'a Path,
     wlan_service: &'a Path,
+    btl_service: &'a Path,
+    audio_service: &'a Path,
     acpi_manager: &'a Path,
     pci_manager: &'a Path,
     shutdown_broker: &'a Path,
@@ -1256,6 +1293,10 @@ fn build_bootfs_image(manifest_dir: &Path, inputs: BootfsInputs<'_>) -> PathBuf 
             data: read_build_input(inputs.xhci_driver_host, "xHCI DriverHost ELF"),
         },
         BootFsFile {
+            path: "/drivers/driver-host-snd.elf",
+            data: read_build_input(inputs.snd_driver_host, "VirtIO-Sound DriverHost ELF"),
+        },
+        BootFsFile {
             path: "/services/hxfs.elf",
             data: read_build_input(inputs.hxfs_service, "Hxfs service ELF"),
         },
@@ -1266,6 +1307,14 @@ fn build_bootfs_image(manifest_dir: &Path, inputs: BootfsInputs<'_>) -> PathBuf 
         BootFsFile {
             path: "/services/wlan.elf",
             data: read_build_input(inputs.wlan_service, "wlan-service ELF"),
+        },
+        BootFsFile {
+            path: "/services/btl.elf",
+            data: read_build_input(inputs.btl_service, "btl-service ELF"),
+        },
+        BootFsFile {
+            path: "/services/audio.elf",
+            data: read_build_input(inputs.audio_service, "audio-service ELF"),
         },
         BootFsFile {
             path: "/services/acpi-manager.elf",
@@ -1476,6 +1525,18 @@ fn build_bootfs_image(manifest_dir: &Path, inputs: BootfsInputs<'_>) -> PathBuf 
             data: read_build_input(&inputs.coreutils_dir.join("wlanctl"), "wlanctl ELF"),
         },
         BootFsFile {
+            path: "/bin/btctl.elf",
+            data: read_build_input(&inputs.coreutils_dir.join("btctl"), "btctl ELF"),
+        },
+        BootFsFile {
+            path: "/bin/audioctl.elf",
+            data: read_build_input(&inputs.coreutils_dir.join("audioctl"), "audioctl ELF"),
+        },
+        BootFsFile {
+            path: "/bin/aplay.elf",
+            data: read_build_input(&inputs.coreutils_dir.join("aplay"), "aplay ELF"),
+        },
+        BootFsFile {
             path: "/lib/ld-huesos.so",
             data: read_build_input(inputs.ld_huesos, "ld-huesos.so"),
         },
@@ -1527,6 +1588,20 @@ fn build_bootfs_image(manifest_dir: &Path, inputs: BootfsInputs<'_>) -> PathBuf 
             data: read_build_input(
                 &manifest_dir.join("../../third_party/firmware/rtw88/rtw8821c_fw.bin"),
                 "Realtek RTL8821CE firmware",
+            ),
+        },
+        BootFsFile {
+            path: "/lib/firmware/rtl_bt/rtl8821c_fw.bin",
+            data: read_build_input(
+                &manifest_dir.join("../../third_party/firmware/rtl_bt/rtl8821c_fw.bin"),
+                "Realtek RTL8821CE Bluetooth firmware",
+            ),
+        },
+        BootFsFile {
+            path: "/lib/firmware/rtl_bt/rtl8821c_config.bin",
+            data: read_build_input(
+                &manifest_dir.join("../../third_party/firmware/rtl_bt/rtl8821c_config.bin"),
+                "Realtek RTL8821CE Bluetooth config",
             ),
         },
         BootFsFile {

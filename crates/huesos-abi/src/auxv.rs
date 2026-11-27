@@ -68,6 +68,12 @@ pub const AT_HUESOS_NET_SERVICE: u64 = 0x100f;
 /// HuesOS extension: non-zero when a `wlan-service` `Channel` handle was
 /// queued on bootstrap (`LD_BOOTSTRAP_WLAN_SERVICE_LABEL`).
 pub const AT_HUESOS_WLAN_SERVICE: u64 = 0x1010;
+/// HuesOS extension: non-zero when a `btl-service` (`Plan 9 /net/btl`) `Channel`
+/// handle was queued on bootstrap (`LD_BOOTSTRAP_BTL_SERVICE_LABEL`).
+pub const AT_HUESOS_BTL_SERVICE: u64 = 0x1011;
+/// HuesOS extension: non-zero when an `audio-service` (`/dev/audio`) `Channel`
+/// handle was queued on bootstrap (`LD_BOOTSTRAP_AUDIO_SERVICE_LABEL`).
+pub const AT_HUESOS_AUDIO_SERVICE: u64 = 0x1012;
 
 /// Bootstrap channel label carrying the child's own root VMAR handle to
 /// `ld-huesos.so` (closed by the dynamic linker before entering the app).
@@ -99,6 +105,10 @@ pub const LD_BOOTSTRAP_PE_VMO_LABEL: &[u8] = b"huesos:ld:pe-vmo";
 pub const LD_BOOTSTRAP_NET_SERVICE_LABEL: &[u8] = b"huesos:ld:net-service";
 /// Bootstrap channel label carrying the child's `wlan-service` `Channel`.
 pub const LD_BOOTSTRAP_WLAN_SERVICE_LABEL: &[u8] = b"huesos:ld:wlan-service";
+/// Bootstrap channel label carrying the child's `btl-service` (`Plan 9 /net/btl`) `Channel`.
+pub const LD_BOOTSTRAP_BTL_SERVICE_LABEL: &[u8] = b"huesos:ld:btl-service";
+/// Bootstrap channel label carrying the child's `audio-service` `Channel`.
+pub const LD_BOOTSTRAP_AUDIO_SERVICE_LABEL: &[u8] = b"huesos:ld:audio-service";
 
 /// Capability bitmask carried in `AT_HUESOS_CAPS_MASK`.
 pub mod caps_mask {
@@ -126,6 +136,18 @@ pub mod caps_mask {
     pub const WLAN_RO: u64 = 1 << 10;
     /// Application may scan, connect, run SoftAP, and update Wi-Fi regulatory/MAC policy.
     pub const WLAN_ADMIN: u64 = 1 << 11;
+    /// Application may read `/net/btl` status, peers, non-secret key tags, SDP, and snoop.
+    pub const BTL_RO: u64 = 1 << 12;
+    /// Application may open L2CAP channels and issue SDP queries over `/net/btl`.
+    pub const BTL_RW: u64 = 1 << 13;
+    /// Application may scan, pair, connect, disconnect, and manage `/net/btl` radio state.
+    pub const BTL_ADMIN: u64 = 1 << 14;
+    /// Application may read `/dev/audio` status and sink telemetry.
+    pub const AUDIO_RO: u64 = 1 << 15;
+    /// Application may open SPSC PCM playback streams on `/dev/audio`.
+    pub const AUDIO_RW: u64 = 1 << 16;
+    /// Application may change master volume, mute, sink routing (`auto`/`mirror`), and A2DP link.
+    pub const AUDIO_ADMIN: u64 = 1 << 17;
     /// Full default interactive shell capability set.
     pub const ALL_DEFAULT: u64 = BOOTFS_RO
         | HXFS_RO
@@ -137,7 +159,13 @@ pub mod caps_mask {
         | NET_RO
         | NET_RW
         | WLAN_RO
-        | WLAN_ADMIN;
+        | WLAN_ADMIN
+        | BTL_RO
+        | BTL_RW
+        | BTL_ADMIN
+        | AUDIO_RO
+        | AUDIO_RW
+        | AUDIO_ADMIN;
 }
 
 /// Default interpreter path expected in `PT_INTERP`.

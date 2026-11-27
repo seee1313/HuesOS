@@ -3,10 +3,18 @@
 #![no_std]
 #![no_main]
 
+extern crate alloc;
+
+mod sound;
+
 use core::cell::UnsafeCell;
 use core::panic::PanicInfo;
 use libcanvas::framebuffer::Canvas;
+use libcanvas::heap::ScudoHeap;
 use libcanvas::{Channel, ErrorCode, Handle, Vmo};
+
+#[global_allocator]
+static ALLOCATOR: ScudoHeap = ScudoHeap;
 
 const DOOM_WIDTH: usize = 640;
 const DOOM_HEIGHT: usize = 400;
@@ -96,13 +104,13 @@ pub extern "C" fn _start() -> ! {
 }
 
 extern "C" fn doom_main() -> ! {
-    libcanvas::println!("[doom] HuesOS DoomGeneric starting (Freedoom Phase 1)");
+    libcanvas::heap::HEAP.init_process_heap();
+    libcanvas::println!("[doom] HuesOS DoomGeneric starting (Freedoom Phase 1 + SFX/OPL2)");
     let arg0 = c"doom".as_ptr() as *mut u8;
     let arg1 = c"-iwad".as_ptr() as *mut u8;
     let arg2 = c"freedoom1.wad".as_ptr() as *mut u8;
-    let arg3 = c"-nosound".as_ptr() as *mut u8;
-    let mut argv = [arg0, arg1, arg2, arg3];
-    // SAFETY: argv points to four NUL-terminated static strings and remains
+    let mut argv = [arg0, arg1, arg2];
+    // SAFETY: argv points to three NUL-terminated static strings and remains
     // valid for DoomGeneric's process lifetime.
     unsafe { doomgeneric_Create(argv.len() as i32, argv.as_mut_ptr()) };
     loop {
@@ -129,6 +137,9 @@ pub extern "C" fn DG_Init() {
         match bootstrap.read_optional_handle(&mut message) {
             Ok((n, Some(handle))) if &message[..n] == b"keyboard" => {
                 STATE.with(|state| state.keyboard = Some(Channel::from_handle(handle)));
+            }
+            Ok((n, Some(handle))) if &message[..n] == b"audio" => {
+                sound::attach_audio_channel(Channel::from_handle(handle));
             }
             Ok((n, Some(handle))) if &message[..n] == b"framedraw" => {
                 frame_draw = Some(handle);
@@ -316,6 +327,7 @@ pub extern "C" fn DG_DrawFrame() {
         }
         let _ = canvas.present_at(state.output_x, state.output_y);
     });
+    sound::pump();
 }
 
 #[unsafe(no_mangle)]

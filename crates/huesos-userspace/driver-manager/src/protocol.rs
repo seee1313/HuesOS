@@ -229,3 +229,52 @@ pub const QUERY_USB_VMO: &str = "query:usb:vmo";
 pub const USB_INVENTORY_VMO_REPLY: &str = "service:usb:inventory-vmo";
 /// DriverManager replies when no `HUSB` USB inventory VMO is published.
 pub const USB_INVENTORY_UNAVAILABLE: &str = "err:usb-inventory-unavailable";
+/// xHCI DriverHost USB Wireless Bluetooth HCI bridge is online.
+pub const USB_BT_READY: &str = "service:bt:usb:ready";
+/// DriverManager attaches `btl-service` to `driver-host-xhci`'s USB-BT bridge.
+pub const ATTACH_USB_BT_CLIENT: &str = "bt-hci-client";
+
+/// `VirtIO-Sound` (`driver-host-snd`) reported ready.
+pub const SND_HOST_READY: &str = "driver-host:snd:ready";
+/// `VirtIO-Sound` (`driver-host-snd`) started without hardware.
+pub const SND_HOST_DEGRADED: &str = "driver-host:snd:degraded";
+/// DriverManager attaches `audio-service` to `driver-host-snd`.
+pub const ATTACH_SND_CLIENT: &str = "snd-client";
+
+/// Client asks DriverManager to open an admin (`btl=admin`) `/net/btl` channel.
+pub const OPEN_BTL: &str = "open:btl";
+/// Client asks DriverManager to open an L2CAP/SDP (`btl=rw`) `/net/btl` channel.
+pub const OPEN_BTL_RW: &str = "open:btl:rw";
+/// Client asks DriverManager to open a read-only (`btl=ro`) `/net/btl` channel.
+pub const OPEN_BTL_RO: &str = "open:btl:ro";
+/// DriverManager responds with a `btl-service` channel.
+pub const BTL_CHANNEL: &str = "service:btl:channel";
+/// `btl-service` is not currently available.
+pub const BTL_UNAVAILABLE: &str = "err:btl-unavailable";
+/// DriverManager attaches an admin client channel to `btl-service`.
+pub const ATTACH_BTL_CLIENT: &str = "btl-client";
+/// DriverManager attaches an L2CAP/SDP (`rw`) client channel to `btl-service`.
+pub const ATTACH_BTL_CLIENT_RW: &str = "btl-client:rw";
+/// DriverManager attaches a read-only (`ro`) client channel to `btl-service`.
+pub const ATTACH_BTL_CLIENT_RO: &str = "btl-client:ro";
+/// `btl-service` reported ready.
+pub const BTL_READY: &str = "service:btl:ready";
+
+/// Client asks DriverManager to open an admin (`audio=admin`) `audio-service` channel.
+pub const OPEN_AUDIO: &str = "open:audio";
+/// Client asks DriverManager to open a stream playback (`audio=rw`) `audio-service` channel.
+pub const OPEN_AUDIO_RW: &str = "open:audio:rw";
+/// Client asks DriverManager to open a read-only (`audio=ro`) `audio-service` channel.
+pub const OPEN_AUDIO_RO: &str = "open:audio:ro";
+/// DriverManager responds with an `audio-service` channel.
+pub const AUDIO_CHANNEL: &str = "service:audio:channel";
+/// `audio-service` is not currently available.
+pub const AUDIO_UNAVAILABLE: &str = "err:audio-unavailable";
+/// DriverManager attaches an admin client channel to `audio-service`.
+pub const ATTACH_AUDIO_CLIENT: &str = "audio-client";
+/// DriverManager attaches a playback (`rw`) client channel to `audio-service`.
+pub const ATTACH_AUDIO_CLIENT_RW: &str = "audio-client:rw";
+/// DriverManager attaches a read-only (`ro`) client channel to `audio-service`.
+pub const ATTACH_AUDIO_CLIENT_RO: &str = "audio-client:ro";
+/// `audio-service` reported ready.
+pub const AUDIO_READY: &str = "service:audio:ready";

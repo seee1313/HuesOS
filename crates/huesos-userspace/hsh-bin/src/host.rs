@@ -14,8 +14,8 @@ use huesos_abi::auxv::caps_mask;
 use huesos_abi::hxfs::rights as hxfs_rights;
 use huesos_abi::term_ipc::{hsh_to_term, put_u16, term_to_hsh, MAX_WRITE_CHUNK};
 use huesos_hsh::{
-    CapsSpec, ExecOutcome, FbAccess, HostPathKind, HxfsAccess, NetAccess, PipelineCommand,
-    ShellHost, Table, Value, WlanAccess,
+    AudioAccess, BtlAccess, CapsSpec, ExecOutcome, FbAccess, HostPathKind, HxfsAccess, NetAccess,
+    PipelineCommand, ShellHost, Table, Value, WlanAccess,
 };
 use libcanvas::process::{spawn_elf_from_vmo_with_caps, Process, SpawnCaps};
 use libcanvas::{wait_any, Channel, ErrorCode, Handle, Hxfs, Signals, Vmo, WaitItem};
@@ -108,10 +108,14 @@ pub struct HshHost {
     pub block_dev: Option<Channel>,
     pub net_svc: Option<Channel>,
     pub wlan_svc: Option<Channel>,
+    pub btl_svc: Option<Channel>,
+    pub audio_svc: Option<Channel>,
     block_unavailable: bool,
     hxfs_unavailable: bool,
     net_unavailable: bool,
     wlan_unavailable: bool,
+    btl_unavailable: bool,
+    audio_unavailable: bool,
     pub bootfs: Option<Vmo>,
     pub frame_draw: Option<Handle>,
     pub pwd: String,
@@ -269,6 +273,8 @@ fn command_uses_query_channel(resolved: &str) -> bool {
             | "btop"
             | "netctl"
             | "wlanctl"
+            | "btctl"
+            | "audioctl"
             | "df"
             | "lsblk"
             | "fdisk"
@@ -286,6 +292,25 @@ fn arg_touches_usb_mount(arg: &str) -> bool {
         || arg == "/dev/usb0"
 }
 
+fn arg_touches_net_vfs(arg: &str) -> bool {
+    arg == "/net"
+        || (arg.starts_with("/net/")
+            && !arg.starts_with("/net/btl")
+            && !arg.starts_with("/net/wlan"))
+}
+
+fn arg_touches_wlan_vfs(arg: &str) -> bool {
+    arg == "/net" || arg == "/net/wlan" || arg.starts_with("/net/wlan/")
+}
+
+fn arg_touches_btl_vfs(arg: &str) -> bool {
+    arg == "/net" || arg == "/net/btl" || arg.starts_with("/net/btl/")
+}
+
+fn arg_touches_audio_vfs(arg: &str) -> bool {
+    arg == "/dev" || arg == "/dev/audio" || arg.starts_with("/dev/audio/")
+}
+
 fn command_uses_net_service(resolved: &str) -> bool {
     let base = resolved.rsplit('/').next().unwrap_or(resolved);
     let stem = strip_exec_ext(base);
@@ -300,7 +325,25 @@ fn command_uses_wlan_service(resolved: &str) -> bool {
     let stem = strip_exec_ext(base);
     matches!(
         stem,
-        "wlanctl" | "netctl" | "btop" | "hsh" | "std_smoke" | "std-smoke"
+        "wlanctl" | "netctl" | "btctl" | "btop" | "hsh" | "std_smoke" | "std-smoke"
+    )
+}
+
+fn command_uses_btl_service(resolved: &str) -> bool {
+    let base = resolved.rsplit('/').next().unwrap_or(resolved);
+    let stem = strip_exec_ext(base);
+    matches!(
+        stem,
+        "btctl" | "audioctl" | "netctl" | "btop" | "hsh" | "std_smoke" | "std-smoke"
+    )
+}
+
+fn command_uses_audio_service(resolved: &str) -> bool {
+    let base = resolved.rsplit('/').next().unwrap_or(resolved);
+    let stem = strip_exec_ext(base);
+    matches!(
+        stem,
+        "audioctl" | "aplay" | "btctl" | "btop" | "hsh" | "std_smoke" | "std-smoke"
     )
 }
 
@@ -342,10 +385,14 @@ impl HshHost {
             block_dev,
             net_svc: None,
             wlan_svc: None,
+            btl_svc: None,
+            audio_svc: None,
             block_unavailable: false,
             hxfs_unavailable: false,
             net_unavailable: false,
             wlan_unavailable: false,
+            btl_unavailable: false,
+            audio_unavailable: false,
             bootfs,
             frame_draw,
             pwd: String::from("/"),
@@ -373,6 +420,11 @@ impl HshHost {
     pub fn set_net_wlan_caps(&mut self, net_svc: Option<Channel>, wlan_svc: Option<Channel>) {
         self.net_svc = net_svc;
         self.wlan_svc = wlan_svc;
+    }
+
+    pub fn set_btl_audio_caps(&mut self, btl_svc: Option<Channel>, audio_svc: Option<Channel>) {
+        self.btl_svc = btl_svc;
+        self.audio_svc = audio_svc;
     }
 
     pub fn caps_summary(&mut self) -> String {
@@ -656,6 +708,76 @@ impl HshHost {
         }
     }
 
+    pub(crate) fn open_btl_fresh(&mut self, read_only: bool) -> Option<Channel> {
+        let req: &[u8] = if read_only {
+            b"open:btl:ro"
+        } else {
+            b"open:btl"
+        };
+        if !self.btl_unavailable {
+            if let Some(reg) = self.registry.as_ref() {
+                self.drain_registry();
+                if reg.write(req).is_ok() {
+                    let mut buf = [0u8; 64];
+                    for _ in 0..HANDSHAKE_READS {
+                        match reg.read_optional_handle_timeout(&mut buf, HANDSHAKE_WAIT_TICKS) {
+                            Ok((n, Some(handle))) if &buf[..n] == b"service:btl:channel" => {
+                                return Some(Channel::from_handle(handle));
+                            }
+                            Ok((n, None)) if buf[..n].starts_with(b"err:btl") => {
+                                break;
+                            }
+                            Ok((_n, Some(handle))) => drop(handle),
+                            Ok((_n, None)) => {}
+                            Err(ErrorCode::ShouldWait) | Err(ErrorCode::TimedOut) => {}
+                            Err(_) => break,
+                        }
+                    }
+                }
+            }
+        }
+        if read_only {
+            None
+        } else {
+            self.btl_svc.as_ref().and_then(|ch| ch.duplicate().ok())
+        }
+    }
+
+    pub(crate) fn open_audio_fresh(&mut self, read_only: bool) -> Option<Channel> {
+        let req: &[u8] = if read_only {
+            b"open:audio:ro"
+        } else {
+            b"open:audio"
+        };
+        if !self.audio_unavailable {
+            if let Some(reg) = self.registry.as_ref() {
+                self.drain_registry();
+                if reg.write(req).is_ok() {
+                    let mut buf = [0u8; 64];
+                    for _ in 0..HANDSHAKE_READS {
+                        match reg.read_optional_handle_timeout(&mut buf, HANDSHAKE_WAIT_TICKS) {
+                            Ok((n, Some(handle))) if &buf[..n] == b"service:audio:channel" => {
+                                return Some(Channel::from_handle(handle));
+                            }
+                            Ok((n, None)) if buf[..n].starts_with(b"err:audio") => {
+                                break;
+                            }
+                            Ok((_n, Some(handle))) => drop(handle),
+                            Ok((_n, None)) => {}
+                            Err(ErrorCode::ShouldWait) | Err(ErrorCode::TimedOut) => {}
+                            Err(_) => break,
+                        }
+                    }
+                }
+            }
+        }
+        if read_only {
+            None
+        } else {
+            self.audio_svc.as_ref().and_then(|ch| ch.duplicate().ok())
+        }
+    }
+
     pub fn iter_bootfs_entries(&self) -> Vec<(String, u64, u64)> {
         let mut entries = Vec::new();
         let Some(vmo) = self.bootfs.as_ref() else {
@@ -868,6 +990,8 @@ impl HshHost {
             "curl",
             "netctl",
             "wlanctl",
+            "btctl",
+            "audioctl",
             "win-hello",
             "win-threads",
             "win-bench",
@@ -2699,12 +2823,12 @@ impl ShellHost for HshHost {
                 "  pipes: | where <col> <op> <val> | select <cols> | sort [--desc] [col] | head [n] | tail [n] | count | grep <pat>\n",
                 "  jobs:  command & | jobs | fg [%job] | wait [%job|koid] | kill <%job|koid>\n",
                 "  lang:  let x = ...; x = $((x + 1)); if/elif/else; while ... { break; continue }; for x in [...]; fn f(a) { ... }\n",
-                "  caps:  @caps(hxfs=none|ro|rw, bootfs=ro|none, fb=none|ro, net=none|ro|rw, wlan=none|ro|admin, dir=/sub:ro) <cmd>\n",
-                "  apps:  doom | snake [hard] | btop | wlanctl | nano <file> | font <cozette|tty|compact> | shutdown\n",
+                "  caps:  @caps(hxfs=none|ro|rw, bootfs=ro|none, fb=none|ro, net=none|ro|rw, wlan=none|ro|admin, btl=none|ro|rw|admin, audio=none|ro|rw|admin, dir=/sub:ro) <cmd>\n",
+                "  apps:  doom | snake [hard] | btop | wlanctl | btctl | audioctl | aplay <wav> | nano <file> | font <cozette|tty|compact> | shutdown\n",
                 "external /bin/*.{elf,exe} utilities:\n",
                 "  ls | cat | stat | touch | mkdir | rm | mv | cp | ln | chmod | readlink | write | find | grep | head | tail | wc | sort | uniq\n",
                 "  seq | tee | basename | dirname | sha256sum | tar | hexdump | dd | df | du | lsblk | fdisk | mkfs | fsck | hxfs | ps | schedctl | pci | acpi | sleep\n",
-                "  ping | curl | netctl | wlanctl"
+                "  ping | curl | netctl | wlanctl | btctl | audioctl | aplay"
             )),
             "pwd" => ExecOutcome::ok_text(self.pwd.clone()),
             "cd" => {
@@ -2780,6 +2904,20 @@ impl ShellHost for HshHost {
 
     fn write_file(&mut self, path: &str, data: &[u8], append: bool) -> Result<(), String> {
         let abs = self.normalize_path(path);
+        if abs.starts_with("/net/btl/") || abs.starts_with("/dev/audio/") {
+            let mut args = Vec::with_capacity(2);
+            if append {
+                args.push(String::from("-a"));
+            }
+            args.push(abs.clone());
+            let val = Value::Bytes(data.to_vec());
+            let out = self.spawn_external(None, "tee", &args, Some(&val), true, false);
+            return if out.status == 0 {
+                Ok(())
+            } else {
+                Err(format!("write '{abs}' failed (status={})", out.status))
+            };
+        }
         if let Some(rel) = split_usb0_rel(&abs) {
             return self.usb_write_file(&rel, data, append);
         }
@@ -2815,6 +2953,14 @@ impl ShellHost for HshHost {
 
     fn read_file(&mut self, path: &str) -> Result<Vec<u8>, String> {
         let abs = self.normalize_path(path);
+        if abs.starts_with("/net/btl/") || abs.starts_with("/dev/audio/") {
+            let out = self.spawn_external(None, "cat", &[abs.clone()], None, true, false);
+            return if out.status == 0 {
+                Ok(out.value.render_text().into_bytes())
+            } else {
+                Err(format!("read '{abs}' failed (status={})", out.status))
+            };
+        }
         if let Some(rel) = split_usb0_rel(&abs) {
             return self.usb_read_file(&rel);
         }

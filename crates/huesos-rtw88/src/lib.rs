@@ -1028,5 +1028,13 @@ mod tests {
         let mut desc = [0xFFu8; RTW_TX_DESC_SIZE];
         hw::build_full_tx_desc(64, 16, hw::DESC_RATE1M, true, false, 0, 1, 0, &mut desc);
         assert_eq!(&desc[28..32], &[0, 0, 0, 0]);
+
+        // Verify dynamic BT-Coex PTA profile switching (`Off` -> `InquiryPair` -> `A2DP` -> `Idle`)
+        hw.set_bt_coex_profile(&mut bar2, 2);
+        assert_eq!(bar2.read32(0x06C0), 0x5555_5555);
+        hw.set_bt_coex_profile(&mut bar2, 3);
+        assert_eq!(bar2.read32(0x06C0), 0x5A5A_5AAA);
+        hw.set_bt_coex_profile(&mut bar2, 0);
+        assert_eq!(bar2.read32(0x06C0), 0xFFFF_FFFF);
     }
 }

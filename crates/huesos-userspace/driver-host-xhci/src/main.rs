@@ -26,6 +26,7 @@ use huesos_abi::block::{
     completion_data, AsyncBlockInfo, AsyncBlockOp, AsyncBlockRequest, AsyncBlockStatus,
     ASYNC_INFO_RESPONSE_BYTES,
 };
+use huesos_abi::btl::{UsbBtOp, USB_BT_MAGIC, VERSION as USB_BT_VERSION};
 use huesos_abi::pci_iommu::IommuMode;
 use huesos_abi::pci_manager::DEVICE_LEASE_XHCI_RO_LABEL;
 use huesos_abi::rights;
@@ -324,7 +325,9 @@ struct DriverRuntime {
     executor: Executor<8, 256, UserBackend>,
     input: InputChannels,
     block_clients: [Option<BlockClient>; MAX_BLOCK_CLIENTS],
+    bt_client: Option<Channel>,
     bot_announced: bool,
+    bt_announced: bool,
 }
 
 #[unsafe(no_mangle)]
@@ -427,7 +430,9 @@ fn bring_up(boot: &XhciBootstrap) -> Result<DriverRuntime, &'static str> {
         executor: Executor::new_with(backend),
         input: InputChannels::new(),
         block_clients: [const { None }; MAX_BLOCK_CLIENTS],
+        bt_client: None,
         bot_announced: false,
+        bt_announced: false,
     };
 
     XhciController::init_in_place(
@@ -494,6 +499,10 @@ impl DriverRuntime {
                 self.bot_announced = true;
                 let _ = bootstrap.write(b"service:block:usb:ready");
             }
+            if !self.bt_announced && ctrl.first_bt_hci_info().is_some() {
+                self.bt_announced = true;
+                let _ = bootstrap.write(b"service:bt:usb:ready");
+            }
         }
 
         let mut c_idx = 0usize;
@@ -501,18 +510,23 @@ impl DriverRuntime {
             self.poll_block_client(c_idx);
             c_idx += 1;
         }
+        self.poll_bt_client();
 
         publish_husb_if_needed(bootstrap, self);
     }
 
     fn wait_until_active(&self, bootstrap: &Channel, gone_port: Option<&Port>, timeout_ticks: u64) {
-        let mut items = [WaitItem::new(0, Signals::NONE, 0); 14];
+        let mut items = [WaitItem::new(0, Signals::NONE, 0); 15];
         let sig = Signals::READABLE | Signals::PEER_CLOSED;
         items[0] = WaitItem::new(bootstrap.handle().raw(), sig, 0);
         items[1] = WaitItem::new(self.irq.port.handle().raw(), Signals::READABLE, 1);
         let mut count = 2usize;
         if let Some(gp) = gone_port {
             items[count] = WaitItem::new(gp.handle().raw(), Signals::READABLE, 2);
+            count += 1;
+        }
+        if let Some(bt_ch) = self.bt_client.as_ref() {
+            items[count] = WaitItem::new(bt_ch.handle().raw(), sig, 3);
             count += 1;
         }
         for client in self.block_clients.iter().flatten() {
@@ -542,6 +556,10 @@ impl DriverRuntime {
                 Ok((n, Some(handle))) if &buf[..n] == b"block:usb-client" => {
                     self.attach_block_client(Channel::from_handle(handle));
                 }
+                Ok((n, Some(handle))) if &buf[..n] == b"bt-hci-client" => {
+                    self.bt_client = Some(Channel::from_handle(handle));
+                    println!("[driver-host:xhci] attached Bluetooth HCI bridge client");
+                }
                 Ok((_n, Some(handle))) => drop(handle),
                 Ok((n, None)) if &buf[..n] == b"usb:refresh-vmo" => {
                     if let Some(ctrl) = self.ctrl.as_ref() {
@@ -562,6 +580,140 @@ impl DriverRuntime {
         };
         *slot = Some(BlockClient::new(channel));
         println!("[driver-host:xhci] attached USB BOT block client");
+    }
+
+    fn poll_bt_client(&mut self) {
+        let mut req = [0u8; 1040];
+        let mut budget = 0usize;
+        while budget < 16 {
+            budget += 1;
+            let Some(ch) = self.bt_client.as_ref() else {
+                return;
+            };
+            match ch.read_into(&mut req) {
+                Ok(n) => {
+                    if n < 8 {
+                        continue;
+                    }
+                    let magic = u32::from_le_bytes([req[0], req[1], req[2], req[3]]);
+                    let ver = u16::from_le_bytes([req[4], req[5]]);
+                    if magic != USB_BT_MAGIC || ver != USB_BT_VERSION {
+                        continue;
+                    }
+                    let Some(op) = UsbBtOp::from_raw(req[6]) else {
+                        continue;
+                    };
+                    match op {
+                        UsbBtOp::QueryInfo => {
+                            let mut rep = [0u8; 16];
+                            rep[0..4].copy_from_slice(&USB_BT_MAGIC.to_le_bytes());
+                            rep[4..6].copy_from_slice(&USB_BT_VERSION.to_le_bytes());
+                            rep[6] = UsbBtOp::QueryInfo as u8;
+                            if let Some(ctrl) = self.ctrl.as_ref() {
+                                if let Some((_sid, vid, pid, is_rtk)) = ctrl.first_bt_hci_info() {
+                                    rep[7] = 0;
+                                    rep[8] = 1;
+                                    rep[9] = u8::from(is_rtk);
+                                    rep[10..12].copy_from_slice(&vid.to_le_bytes());
+                                    rep[12..14].copy_from_slice(&pid.to_le_bytes());
+                                    rep[14..16].copy_from_slice(&ctrl.bt_rx_queued().to_le_bytes());
+                                } else {
+                                    rep[7] = 1;
+                                }
+                            } else {
+                                rep[7] = 1;
+                            }
+                            if let Some(ch_out) = self.bt_client.as_ref() {
+                                let _ = ch_out.write(&rep);
+                            }
+                        }
+                        UsbBtOp::SendHciCmd => {
+                            let mut rep = [0u8; 8];
+                            rep[0..4].copy_from_slice(&USB_BT_MAGIC.to_le_bytes());
+                            rep[4..6].copy_from_slice(&USB_BT_VERSION.to_le_bytes());
+                            rep[6] = UsbBtOp::SendHciCmd as u8;
+                            let status = if let Some(ctrl) = self.ctrl.as_ref() {
+                                if let Some((sid, _, _, _)) = ctrl.first_bt_hci_info() {
+                                    let irq_ref = &self.irq;
+                                    if ctrl
+                                        .execute_bt_hci_cmd(sid, &req[8..n], &mut self.input, || {
+                                            irq_ref.wait_brief(1)
+                                        })
+                                        .is_ok()
+                                    {
+                                        0
+                                    } else {
+                                        2
+                                    }
+                                } else {
+                                    1
+                                }
+                            } else {
+                                1
+                            };
+                            rep[7] = status;
+                            if let Some(ch_out) = self.bt_client.as_ref() {
+                                let _ = ch_out.write(&rep);
+                            }
+                        }
+                        UsbBtOp::SendHciAcl => {
+                            let mut rep = [0u8; 8];
+                            rep[0..4].copy_from_slice(&USB_BT_MAGIC.to_le_bytes());
+                            rep[4..6].copy_from_slice(&USB_BT_VERSION.to_le_bytes());
+                            rep[6] = UsbBtOp::SendHciAcl as u8;
+                            let status = if let Some(ctrl) = self.ctrl.as_ref() {
+                                if let Some((sid, _, _, _)) = ctrl.first_bt_hci_info() {
+                                    let irq_ref = &self.irq;
+                                    if ctrl
+                                        .execute_bt_hci_acl(sid, &req[8..n], &mut self.input, || {
+                                            irq_ref.wait_brief(1)
+                                        })
+                                        .is_ok()
+                                    {
+                                        0
+                                    } else {
+                                        2
+                                    }
+                                } else {
+                                    1
+                                }
+                            } else {
+                                1
+                            };
+                            rep[7] = status;
+                            if let Some(ch_out) = self.bt_client.as_ref() {
+                                let _ = ch_out.write(&rep);
+                            }
+                        }
+                        UsbBtOp::PollRx => {
+                            let mut rep = [0u8; 1064];
+                            rep[0..4].copy_from_slice(&USB_BT_MAGIC.to_le_bytes());
+                            rep[4..6].copy_from_slice(&USB_BT_VERSION.to_le_bytes());
+                            rep[6] = UsbBtOp::PollRx as u8;
+                            let mut out_len = 8usize;
+                            if let Some(ctrl) = self.ctrl.as_ref() {
+                                let _ = ctrl.pump_events(&mut self.input);
+                                if let Some(pkt_len) = ctrl.bt_pop_rx(&mut rep[8..]) {
+                                    out_len = 8 + pkt_len;
+                                }
+                                rep[7] = 0;
+                            } else {
+                                rep[7] = 1;
+                            }
+                            if let Some(ch_out) = self.bt_client.as_ref() {
+                                let _ = ch_out.write(&rep[..out_len]);
+                            }
+                        }
+                    }
+                }
+                Err(ErrorCode::ShouldWait) | Err(ErrorCode::TimedOut) => return,
+                Err(ErrorCode::PeerClosed) => {
+                    self.bt_client = None;
+                    return;
+                }
+                Err(_) => return,
+            }
+        }
     }
 
     fn poll_block_client(&mut self, index: usize) {

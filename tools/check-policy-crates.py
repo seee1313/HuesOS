@@ -25,6 +25,8 @@ POLICY_CRATES = {
     "huesos-handlemove": "HANDLE_TRANSFER.md",
     "huesos-quota": "QUOTAS.md",
     "huesos-sched": "SCHEDULER_V2.md",
+    "huesos-bt": "AUDIO_AND_BTL.md",
+    "huesos-audio": "AUDIO_AND_BTL.md",
 }
 
 

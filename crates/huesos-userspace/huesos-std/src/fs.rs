@@ -136,6 +136,7 @@ fn walk_scoped_parent<'a>(
 enum FileInner {
     Hxfs(HxfsFile),
     UsbFat { rel_path: String },
+    Synth(crate::vfs_synth::SynthFile),
 }
 
 fn usb_mount_available() -> bool {
@@ -144,6 +145,9 @@ fn usb_mount_available() -> bool {
 
 fn open_file(path: &str, create: bool) -> Result<FileInner> {
     let normalized = path::normalize(path);
+    if crate::vfs_synth::is_synth_path(&normalized) {
+        return crate::vfs_synth::open_file(&normalized).map(FileInner::Synth);
+    }
     if usb_mount_available() {
         if normalized == "/mnt" {
             return Err(Error::new(ErrorKind::InvalidInput));
@@ -247,6 +251,7 @@ impl File {
         match &self.inner {
             FileInner::Hxfs(file) => file.size().map_err(Error::from),
             FileInner::UsbFat { rel_path } => crate::usb_fat::file_size(rel_path),
+            FileInner::Synth(synth) => Ok(synth.size()),
         }
     }
 
@@ -257,7 +262,7 @@ impl File {
 
     /// Read at the cursor and advance it.
     pub fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
-        let read = match &self.inner {
+        let read = match &mut self.inner {
             FileInner::Hxfs(file) => {
                 let data = file.read_at(self.position, buf).map_err(Error::from)?;
                 data.len()
@@ -265,6 +270,7 @@ impl File {
             FileInner::UsbFat { rel_path } => {
                 crate::usb_fat::read_at(rel_path, self.position, buf)?
             }
+            FileInner::Synth(synth) => synth.read_at(self.position, buf)?,
         };
         self.position += read as u64;
         Ok(read)
@@ -272,7 +278,7 @@ impl File {
 
     /// Write at the cursor and advance it.
     pub fn write(&mut self, buf: &[u8]) -> Result<usize> {
-        let written = match &self.inner {
+        let written = match &mut self.inner {
             FileInner::Hxfs(file) => {
                 let cap = buf.len().min(huesos_abi::hxfs::HXFS_MAX_INLINE_WRITE_BYTES);
                 file.write_at(self.position, &buf[..cap])
@@ -281,6 +287,7 @@ impl File {
             FileInner::UsbFat { rel_path } => {
                 crate::usb_fat::write_at(rel_path, self.position, buf)?
             }
+            FileInner::Synth(synth) => synth.write(buf)?,
         };
         self.position += written as u64;
         Ok(written)
@@ -309,9 +316,10 @@ impl File {
     /// length", so growing a file leaves the new region zero-filled and the
     /// cursor where it was, which is what `dd seek=` and `hexdump -s` need.
     pub fn set_len(&mut self, size: u64) -> Result<()> {
-        match &self.inner {
+        match &mut self.inner {
             FileInner::Hxfs(file) => file.truncate(size).map_err(Error::from)?,
             FileInner::UsbFat { rel_path } => crate::usb_fat::truncate(rel_path, size)?,
+            FileInner::Synth(synth) => synth.truncate()?,
         }
         self.position = self.position.min(size);
         Ok(())
@@ -327,6 +335,7 @@ impl File {
         match &self.inner {
             FileInner::Hxfs(file) => file.fsync().map_err(Error::from),
             FileInner::UsbFat { .. } => crate::usb_fat::flush(),
+            FileInner::Synth(synth) => synth.fsync(),
         }
     }
 }
@@ -513,6 +522,9 @@ pub fn symlink_metadata(path: &str) -> Result<Metadata> {
 
 fn metadata_inner(path: &str, follow_final: bool) -> Result<Metadata> {
     let normalized = path::normalize(path);
+    if crate::vfs_synth::is_synth_path(&normalized) {
+        return crate::vfs_synth::metadata(&normalized);
+    }
     if usb_mount_available() {
         if normalized == "/mnt" {
             return Ok(Metadata {
@@ -629,6 +641,9 @@ impl CreatedDir {
 /// List a directory.
 pub fn list(path: &str) -> Result<Vec<Entry>> {
     let normalized = path::normalize(path);
+    if crate::vfs_synth::is_synth_path(&normalized) {
+        return crate::vfs_synth::list(&normalized);
+    }
     if usb_mount_available() {
         if normalized == "/mnt" {
             let mut out = Vec::new();

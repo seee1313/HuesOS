@@ -28,11 +28,14 @@ pub const USB_FLAG_MSI_ACTIVE: u8 = 1 << 1;
 pub const USB_FLAG_BIOS_HANDOFF_DONE: u8 = 1 << 2;
 /// At least one USB Mass Storage Bulk-Only (`BOT`) block device is online.
 pub const USB_FLAG_BOT_ONLINE: u8 = 1 << 3;
+/// At least one USB Wireless Bluetooth HCI (`0xE0/0x01/0x01` / `RTL8821CE`) radio is online.
+pub const USB_FLAG_BT_HCI_ONLINE: u8 = 1 << 4;
 /// Known v1 header flag mask.
 pub const USB_FLAGS_V1: u8 = USB_FLAG_IOMMU_ISOLATED
     | USB_FLAG_MSI_ACTIVE
     | USB_FLAG_BIOS_HANDOFF_DONE
-    | USB_FLAG_BOT_ONLINE;
+    | USB_FLAG_BOT_ONLINE
+    | USB_FLAG_BT_HCI_ONLINE;
 
 /// Maximum sanitized ASCII manufacturer string bytes stored per device.
 pub const MAX_MANUFACTURER_LEN: usize = 32;
@@ -105,6 +108,8 @@ pub enum UsbDeviceRole {
     MassStorageBot = 4,
     /// Composite multi-interface USB device with multiple active bindings.
     Composite = 5,
+    /// USB Wireless Bluetooth HCI controller (`0xE0/0x01/0x01` or Realtek `RTL8821CE` USB-BT).
+    BluetoothHci = 6,
 }
 
 impl UsbDeviceRole {
@@ -117,6 +122,7 @@ impl UsbDeviceRole {
             3 => Some(Self::HidMouse),
             4 => Some(Self::MassStorageBot),
             5 => Some(Self::Composite),
+            6 => Some(Self::BluetoothHci),
             _ => None,
         }
     }
@@ -130,6 +136,7 @@ impl UsbDeviceRole {
             Self::HidMouse => "usb-hid-mouse",
             Self::MassStorageBot => "usb-storage-bot",
             Self::Composite => "usb-composite",
+            Self::BluetoothHci => "usb-bt-hci",
         }
     }
 }

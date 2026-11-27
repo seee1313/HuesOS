@@ -37,6 +37,7 @@ fn main() {
         .flag("-fPIC")
         .flag("-mno-red-zone")
         .define("NORMALUNIX", None)
+        .define("FEATURE_SOUND", None)
         .define("DOOMGENERIC_RESX", "640")
         .define("DOOMGENERIC_RESY", "400")
         .warnings(false);
@@ -44,12 +45,14 @@ fn main() {
         build.file(doom.join(source));
     }
     build.file(root.join("c/hues_libc.c"));
+    build.file(root.join("c/hues_sound.c"));
     build.compile("doomgeneric_huesos");
 
     for source in &sources {
         println!("cargo:rerun-if-changed={}", doom.join(source).display());
     }
     println!("cargo:rerun-if-changed=c/hues_libc.c");
+    println!("cargo:rerun-if-changed=c/hues_sound.c");
     println!("cargo:rerun-if-changed=c/include");
     println!("cargo:rerun-if-changed=src/main.rs");
 }

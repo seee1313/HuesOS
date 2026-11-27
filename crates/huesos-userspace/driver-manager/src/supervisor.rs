@@ -130,12 +130,29 @@ pub struct DriverManager {
     xhci_generation: u64,
     xhci_failed: bool,
     xhci_ready: bool,
+    snd_host: Option<ManagedHost>,
+    snd_generation: u64,
+    snd_failed: bool,
+    snd_ready: bool,
+    btl_service: Option<ManagedHost>,
+    btl_generation: u64,
+    btl_failed: bool,
+    btl_ready: bool,
+    audio_service: Option<ManagedHost>,
+    audio_generation: u64,
+    audio_failed: bool,
+    audio_ready: bool,
     usb_inventory_vmo: Option<Vmo>,
     active_keyboard_tx: Option<Channel>,
     ps2_kbd_rx: Option<Channel>,
     usb_kbd_rx: Option<Channel>,
     net_wlan_bridged: bool,
     wlan_hxfs_attached: bool,
+    xhci_btl_bridged: bool,
+    btl_wlan_coex_bridged: bool,
+    btl_hxfs_attached: bool,
+    snd_audio_bridged: bool,
+    audio_btl_bridged: bool,
     pci_bindings_settled: bool,
     /// Unique generation-grant authority delegated by init.
     key_broker: Option<Channel>,
@@ -293,6 +310,8 @@ pub struct DriverManager {
     wlan_lease_rw: Option<Handle>,
     xhci_lease_ro: Option<Handle>,
     xhci_lease_rw: Option<Handle>,
+    snd_lease_ro: Option<Handle>,
+    snd_lease_rw: Option<Handle>,
     nvme_boot_driver: Option<BootDriverSpec>,
     /// Resource handles received from init but not yet forwarded to
     /// their target drivers. Indexed implicitly by driver name via a
@@ -517,12 +536,29 @@ impl DriverManager {
             xhci_generation: 0,
             xhci_failed: false,
             xhci_ready: false,
+            snd_host: None,
+            snd_generation: 0,
+            snd_failed: false,
+            snd_ready: false,
+            btl_service: None,
+            btl_generation: 0,
+            btl_failed: false,
+            btl_ready: false,
+            audio_service: None,
+            audio_generation: 0,
+            audio_failed: false,
+            audio_ready: false,
             usb_inventory_vmo: None,
             active_keyboard_tx: None,
             ps2_kbd_rx: None,
             usb_kbd_rx: None,
             net_wlan_bridged: false,
             wlan_hxfs_attached: false,
+            xhci_btl_bridged: false,
+            btl_wlan_coex_bridged: false,
+            btl_hxfs_attached: false,
+            snd_audio_bridged: false,
+            audio_btl_bridged: false,
             pci_bindings_settled: false,
             key_broker: None,
             hxfs_generation: 0,
@@ -601,6 +637,8 @@ impl DriverManager {
             wlan_lease_rw: None,
             xhci_lease_ro: None,
             xhci_lease_rw: None,
+            snd_lease_ro: None,
+            snd_lease_rw: None,
             nvme_boot_driver: None,
             pending_resources: [const { PendingResources::empty() }; 16],
             pending_resource_count: 0,
@@ -666,6 +704,9 @@ impl DriverManager {
         self.try_start_net_service();
         self.try_start_wlan_service();
         self.try_start_xhci_host();
+        self.try_start_snd_host();
+        self.try_start_btl_service();
+        self.try_start_audio_service();
     }
 
     fn record_resource_handle(&mut self, label: &[u8], handle: Handle) {
@@ -994,6 +1035,9 @@ impl DriverManager {
             self.try_start_net_service();
             self.try_start_wlan_service();
             self.try_start_xhci_host();
+            self.try_start_snd_host();
+            self.try_start_btl_service();
+            self.try_start_audio_service();
             self.blobfs.poll(
                 &mut self.volume,
                 self.nvme_host.as_ref().map(|host| &host.bootstrap),
@@ -1009,11 +1053,14 @@ impl DriverManager {
             );
             self.poll_input_host();
             self.poll_xhci_host();
+            self.poll_snd_host();
             self.poll_keyboard_mux();
             self.poll_nvme_host();
             self.poll_hxfs_service();
             self.poll_net_service();
             self.poll_wlan_service();
+            self.poll_btl_service();
+            self.poll_audio_service();
             self.probe_package_resolving();
             self.poll_acpi_manager();
             self.try_start_acpi_manager();
@@ -1054,11 +1101,14 @@ impl DriverManager {
         push_ch(self.nvme_host.as_ref().map(|h| &h.bootstrap));
         push_ch(self.input_host.as_ref().map(|h| &h.bootstrap));
         push_ch(self.xhci_host.as_ref().map(|h| &h.bootstrap));
+        push_ch(self.snd_host.as_ref().map(|h| &h.bootstrap));
         push_ch(self.ps2_kbd_rx.as_ref());
         push_ch(self.usb_kbd_rx.as_ref());
         push_ch(self.hxfs_service.as_ref().map(|h| &h.bootstrap));
         push_ch(self.net_service.as_ref().map(|h| &h.bootstrap));
         push_ch(self.wlan_service.as_ref().map(|h| &h.bootstrap));
+        push_ch(self.btl_service.as_ref().map(|h| &h.bootstrap));
+        push_ch(self.audio_service.as_ref().map(|h| &h.bootstrap));
         push_ch(self.hxfs_client.as_ref());
         for slot in &self.query_channels {
             push_ch(slot.as_ref());
@@ -1325,6 +1375,7 @@ impl DriverManager {
         self.wlan_service = Some(ManagedHost { process, bootstrap });
         self.maybe_bridge_net_and_wlan();
         self.maybe_attach_wlan_hxfs();
+        self.maybe_bridge_btl_and_wlan_coex();
     }
 
     fn try_start_xhci_host(&mut self) {
@@ -1371,6 +1422,291 @@ impl DriverManager {
         self.xhci_host = Some(ManagedHost { process, bootstrap });
         if self.active_keyboard_tx.is_some() {
             self.attach_usb_keyboard_stream();
+        }
+        self.maybe_bridge_xhci_and_btl();
+    }
+
+    fn try_start_snd_host(&mut self) {
+        if self.snd_host.is_some()
+            || self.snd_failed
+            || !self.bootfs_loaded
+            || !self.pci_bindings_settled
+            || self.snd_lease_ro.is_none()
+            || !self.driver_grants_ready(b"driver-host-snd")
+        {
+            return;
+        }
+        let Some(bootfs) = self.fs.bootfs() else {
+            return;
+        };
+        let Ok(Some(entry)) = bootfs.get_entry("/drivers/driver-host-snd.elf") else {
+            println!("[driver-manager] driver-host-snd ELF missing from BOOTFS");
+            self.snd_failed = true;
+            return;
+        };
+        let Some(bootfs_vmo) = self.fs.vmo() else {
+            return;
+        };
+        let Ok((process, bootstrap)) = libcanvas::process::spawn_elf_from_vmo_with_stack(
+            "driver-host-snd",
+            bootfs_vmo,
+            entry.offset,
+            entry.len,
+            huesos_abi::USER_STACK_HXFS_SIZE,
+        ) else {
+            println!("[driver-manager] failed to launch driver-host-snd");
+            self.snd_failed = true;
+            return;
+        };
+        self.snd_generation = self.snd_generation.saturating_add(1);
+        if let Some(ro_lease) = self.snd_lease_ro.take() {
+            let _ = bootstrap.write_handle(pci_manager::DEVICE_LEASE_SND_RO_LABEL, ro_lease);
+        }
+        self.forward_pending_resources("driver-host-snd", &bootstrap, &process);
+        println!(
+            "[driver-manager] launched driver-host-snd gen={}",
+            self.snd_generation
+        );
+        self.snd_host = Some(ManagedHost { process, bootstrap });
+        self.maybe_bridge_snd_and_audio();
+    }
+
+    fn try_start_btl_service(&mut self) {
+        if self.btl_service.is_some()
+            || self.btl_failed
+            || !self.bootfs_loaded
+            || !self.pci_bindings_settled
+        {
+            return;
+        }
+        if (self.xhci_lease_ro.is_some() || self.xhci_host.is_some())
+            && !self.xhci_ready
+            && !self.xhci_failed
+        {
+            return;
+        }
+        let Some(bootfs) = self.fs.bootfs() else {
+            return;
+        };
+        let Ok(Some(entry)) = bootfs.get_entry("/services/btl.elf") else {
+            println!("[driver-manager] btl-service ELF missing from BOOTFS");
+            self.btl_failed = true;
+            return;
+        };
+        let Some(bootfs_vmo) = self.fs.vmo() else {
+            return;
+        };
+        let Ok((process, bootstrap)) = libcanvas::process::spawn_elf_from_vmo_with_stack(
+            "btl-service",
+            bootfs_vmo,
+            entry.offset,
+            entry.len,
+            huesos_abi::USER_STACK_HXFS_SIZE,
+        ) else {
+            println!("[driver-manager] failed to launch btl-service");
+            self.btl_failed = true;
+            return;
+        };
+        if let Ok(ro_bootfs) = bootfs_vmo.duplicate(
+            huesos_abi::rights::READ | huesos_abi::rights::DUPLICATE | huesos_abi::rights::TRANSFER,
+        ) {
+            let _ =
+                bootstrap.write_handle(protocol::BOOTFS_VMO.as_bytes(), ro_bootfs.into_handle());
+        }
+        self.btl_generation = self.btl_generation.saturating_add(1);
+        println!(
+            "[driver-manager] launched btl-service gen={}",
+            self.btl_generation
+        );
+        self.btl_service = Some(ManagedHost { process, bootstrap });
+        self.maybe_bridge_xhci_and_btl();
+        self.maybe_bridge_btl_and_wlan_coex();
+        self.maybe_attach_btl_hxfs();
+        self.maybe_bridge_audio_and_btl();
+    }
+
+    fn try_start_audio_service(&mut self) {
+        if self.audio_service.is_some()
+            || self.audio_failed
+            || !self.bootfs_loaded
+            || !self.pci_bindings_settled
+        {
+            return;
+        }
+        if (self.snd_lease_ro.is_some() || self.snd_host.is_some())
+            && !self.snd_ready
+            && !self.snd_failed
+        {
+            return;
+        }
+        if self.btl_service.is_none() && !self.btl_failed {
+            return;
+        }
+        let Some(bootfs) = self.fs.bootfs() else {
+            return;
+        };
+        let Ok(Some(entry)) = bootfs.get_entry("/services/audio.elf") else {
+            println!("[driver-manager] audio-service ELF missing from BOOTFS");
+            self.audio_failed = true;
+            return;
+        };
+        let Some(bootfs_vmo) = self.fs.vmo() else {
+            return;
+        };
+        let Ok((process, bootstrap)) = libcanvas::process::spawn_elf_from_vmo_with_stack(
+            "audio-service",
+            bootfs_vmo,
+            entry.offset,
+            entry.len,
+            huesos_abi::USER_STACK_HXFS_SIZE,
+        ) else {
+            println!("[driver-manager] failed to launch audio-service");
+            self.audio_failed = true;
+            return;
+        };
+        self.audio_generation = self.audio_generation.saturating_add(1);
+        println!(
+            "[driver-manager] launched audio-service gen={}",
+            self.audio_generation
+        );
+        self.audio_service = Some(ManagedHost { process, bootstrap });
+        self.maybe_bridge_snd_and_audio();
+        self.maybe_bridge_audio_and_btl();
+    }
+
+    fn maybe_bridge_xhci_and_btl(&mut self) {
+        if self.xhci_btl_bridged {
+            return;
+        }
+        let (Some(xhci), Some(btl)) = (self.xhci_host.as_ref(), self.btl_service.as_ref()) else {
+            return;
+        };
+        let Ok((xhci_end, btl_end)) = Channel::pair() else {
+            return;
+        };
+        if xhci
+            .bootstrap
+            .write_handle(
+                protocol::ATTACH_USB_BT_CLIENT.as_bytes(),
+                xhci_end.into_handle(),
+            )
+            .is_ok()
+            && btl
+                .bootstrap
+                .write_handle(b"usb-bt-hci", btl_end.into_handle())
+                .is_ok()
+        {
+            self.xhci_btl_bridged = true;
+            println!("[driver-manager] bridged driver-host-xhci <-> btl-service USB-HCI");
+        }
+    }
+
+    fn maybe_bridge_btl_and_wlan_coex(&mut self) {
+        if self.btl_wlan_coex_bridged {
+            return;
+        }
+        let (Some(wlan), Some(btl)) = (self.wlan_service.as_ref(), self.btl_service.as_ref())
+        else {
+            return;
+        };
+        let Ok((wlan_end, btl_end)) = Channel::pair() else {
+            return;
+        };
+        if wlan
+            .bootstrap
+            .write_handle(b"coex:btl", wlan_end.into_handle())
+            .is_ok()
+            && btl
+                .bootstrap
+                .write_handle(b"coex:wlan", btl_end.into_handle())
+                .is_ok()
+        {
+            self.btl_wlan_coex_bridged = true;
+            println!("[driver-manager] bridged btl-service <-> wlan-service 2.4 GHz PTA coex");
+        }
+    }
+
+    fn maybe_attach_btl_hxfs(&mut self) {
+        if self.btl_hxfs_attached || !self.hxfs_ready {
+            return;
+        }
+        let (Some(hxfs), Some(btl)) = (self.hxfs_service.as_ref(), self.btl_service.as_ref())
+        else {
+            return;
+        };
+        let Ok((client_end, server_end)) = Channel::pair() else {
+            return;
+        };
+        if hxfs
+            .bootstrap
+            .write_handle(
+                protocol::ATTACH_HXFS_CLIENT.as_bytes(),
+                server_end.into_handle(),
+            )
+            .is_ok()
+            && btl
+                .bootstrap
+                .write_handle(b"hxfs:client", client_end.into_handle())
+                .is_ok()
+        {
+            self.btl_hxfs_attached = true;
+            println!("[driver-manager] attached HxFS persistence channel to btl-service");
+        }
+    }
+
+    fn maybe_bridge_snd_and_audio(&mut self) {
+        if self.snd_audio_bridged {
+            return;
+        }
+        let (Some(snd), Some(audio)) = (self.snd_host.as_ref(), self.audio_service.as_ref())
+        else {
+            return;
+        };
+        let Ok((snd_end, audio_end)) = Channel::pair() else {
+            return;
+        };
+        if snd
+            .bootstrap
+            .write_handle(
+                protocol::ATTACH_SND_CLIENT.as_bytes(),
+                snd_end.into_handle(),
+            )
+            .is_ok()
+            && audio
+                .bootstrap
+                .write_handle(b"snd-driver", audio_end.into_handle())
+                .is_ok()
+        {
+            self.snd_audio_bridged = true;
+            println!("[driver-manager] bridged driver-host-snd <-> audio-service HSND");
+        }
+    }
+
+    fn maybe_bridge_audio_and_btl(&mut self) {
+        if self.audio_btl_bridged {
+            return;
+        }
+        let (Some(btl), Some(audio)) = (self.btl_service.as_ref(), self.audio_service.as_ref())
+        else {
+            return;
+        };
+        let Ok((btl_end, audio_end)) = Channel::pair() else {
+            return;
+        };
+        if btl
+            .bootstrap
+            .write_handle(
+                protocol::ATTACH_BTL_CLIENT.as_bytes(),
+                btl_end.into_handle(),
+            )
+            .is_ok()
+            && audio
+                .bootstrap
+                .write_handle(b"btl-transport", audio_end.into_handle())
+                .is_ok()
+        {
+            self.audio_btl_bridged = true;
+            println!("[driver-manager] bridged audio-service <-> btl-service /net/btl L2CAP");
         }
     }
 
@@ -1714,6 +2050,9 @@ impl DriverManager {
             self.pci_bindings_settled = true;
             self.try_start_net_service();
             self.try_start_wlan_service();
+            self.try_start_snd_host();
+            self.try_start_btl_service();
+            self.try_start_audio_service();
             return;
         }
         println!(
@@ -2131,6 +2470,7 @@ impl DriverManager {
             "net-service" => self.net_lease_rw.as_ref(),
             "wlan-service" => self.wlan_lease_rw.as_ref(),
             "driver-host-xhci" => self.xhci_lease_rw.as_ref(),
+            "driver-host-snd" => self.snd_lease_rw.as_ref(),
             _ => None,
         };
         let Some(lease_rw) = lease_slot else {
@@ -2161,6 +2501,7 @@ impl DriverManager {
             "net-service" => self.net_lease_rw.take(),
             "wlan-service" => self.wlan_lease_rw.take(),
             "driver-host-xhci" => self.xhci_lease_rw.take(),
+            "driver-host-snd" => self.snd_lease_rw.take(),
             _ => None,
         };
         let Some(lease_rw) = lease_opt else {
@@ -2372,6 +2713,24 @@ impl DriverManager {
                 }
                 Ok(n) if &buf[..n] == protocol::OPEN_WLAN_RO.as_bytes() => {
                     self.open_wlan_service(true);
+                }
+                Ok(n) if &buf[..n] == protocol::OPEN_BTL.as_bytes() => {
+                    self.open_btl_service(protocol::ATTACH_BTL_CLIENT.as_bytes());
+                }
+                Ok(n) if &buf[..n] == protocol::OPEN_BTL_RW.as_bytes() => {
+                    self.open_btl_service(protocol::ATTACH_BTL_CLIENT_RW.as_bytes());
+                }
+                Ok(n) if &buf[..n] == protocol::OPEN_BTL_RO.as_bytes() => {
+                    self.open_btl_service(protocol::ATTACH_BTL_CLIENT_RO.as_bytes());
+                }
+                Ok(n) if &buf[..n] == protocol::OPEN_AUDIO.as_bytes() => {
+                    self.open_audio_service(protocol::ATTACH_AUDIO_CLIENT.as_bytes());
+                }
+                Ok(n) if &buf[..n] == protocol::OPEN_AUDIO_RW.as_bytes() => {
+                    self.open_audio_service(protocol::ATTACH_AUDIO_CLIENT_RW.as_bytes());
+                }
+                Ok(n) if &buf[..n] == protocol::OPEN_AUDIO_RO.as_bytes() => {
+                    self.open_audio_service(protocol::ATTACH_AUDIO_CLIENT_RO.as_bytes());
                 }
                 Ok(n) if &buf[..n] == protocol::QUERY_PCI.as_bytes() => {
                     if let Some(reg) = self.registry_channel.as_ref() {
@@ -3012,6 +3371,96 @@ impl DriverManager {
         );
     }
 
+    fn open_btl_service_on(
+        btl_service: Option<&ManagedHost>,
+        btl_failed: bool,
+        reply_ch: &Channel,
+        attach_lbl: &[u8],
+    ) {
+        if btl_failed {
+            let _ = reply_ch.write(protocol::BTL_UNAVAILABLE.as_bytes());
+            return;
+        }
+        let Some(btl) = btl_service else {
+            let _ = reply_ch.write(protocol::BTL_UNAVAILABLE.as_bytes());
+            return;
+        };
+        match Channel::pair() {
+            Ok((client_end, server_end)) => {
+                if btl
+                    .bootstrap
+                    .write_handle(attach_lbl, server_end.into_handle())
+                    .is_err()
+                {
+                    let _ = reply_ch.write(protocol::BTL_UNAVAILABLE.as_bytes());
+                    return;
+                }
+                let _ = reply_ch
+                    .write_handle(protocol::BTL_CHANNEL.as_bytes(), client_end.into_handle());
+            }
+            Err(_) => {
+                let _ = reply_ch.write(protocol::BTL_UNAVAILABLE.as_bytes());
+            }
+        }
+    }
+
+    fn open_btl_service(&mut self, attach_lbl: &[u8]) {
+        let Some(registry) = self.registry_channel.as_ref() else {
+            return;
+        };
+        Self::open_btl_service_on(
+            self.btl_service.as_ref(),
+            self.btl_failed,
+            registry,
+            attach_lbl,
+        );
+    }
+
+    fn open_audio_service_on(
+        audio_service: Option<&ManagedHost>,
+        audio_failed: bool,
+        reply_ch: &Channel,
+        attach_lbl: &[u8],
+    ) {
+        if audio_failed {
+            let _ = reply_ch.write(protocol::AUDIO_UNAVAILABLE.as_bytes());
+            return;
+        }
+        let Some(audio) = audio_service else {
+            let _ = reply_ch.write(protocol::AUDIO_UNAVAILABLE.as_bytes());
+            return;
+        };
+        match Channel::pair() {
+            Ok((client_end, server_end)) => {
+                if audio
+                    .bootstrap
+                    .write_handle(attach_lbl, server_end.into_handle())
+                    .is_err()
+                {
+                    let _ = reply_ch.write(protocol::AUDIO_UNAVAILABLE.as_bytes());
+                    return;
+                }
+                let _ = reply_ch
+                    .write_handle(protocol::AUDIO_CHANNEL.as_bytes(), client_end.into_handle());
+            }
+            Err(_) => {
+                let _ = reply_ch.write(protocol::AUDIO_UNAVAILABLE.as_bytes());
+            }
+        }
+    }
+
+    fn open_audio_service(&mut self, attach_lbl: &[u8]) {
+        let Some(registry) = self.registry_channel.as_ref() else {
+            return;
+        };
+        Self::open_audio_service_on(
+            self.audio_service.as_ref(),
+            self.audio_failed,
+            registry,
+            attach_lbl,
+        );
+    }
+
     fn open_query_channel(&mut self) {
         if !self.query_channels.iter().any(|c| c.is_none()) {
             self.poll_query_channels();
@@ -3117,6 +3566,60 @@ impl DriverManager {
                                 self.wlan_failed,
                                 ch,
                                 true,
+                            );
+                            served = true;
+                        }
+                        Ok(n) if &buf[..n] == protocol::OPEN_BTL.as_bytes() => {
+                            Self::open_btl_service_on(
+                                self.btl_service.as_ref(),
+                                self.btl_failed,
+                                ch,
+                                protocol::ATTACH_BTL_CLIENT.as_bytes(),
+                            );
+                            served = true;
+                        }
+                        Ok(n) if &buf[..n] == protocol::OPEN_BTL_RW.as_bytes() => {
+                            Self::open_btl_service_on(
+                                self.btl_service.as_ref(),
+                                self.btl_failed,
+                                ch,
+                                protocol::ATTACH_BTL_CLIENT_RW.as_bytes(),
+                            );
+                            served = true;
+                        }
+                        Ok(n) if &buf[..n] == protocol::OPEN_BTL_RO.as_bytes() => {
+                            Self::open_btl_service_on(
+                                self.btl_service.as_ref(),
+                                self.btl_failed,
+                                ch,
+                                protocol::ATTACH_BTL_CLIENT_RO.as_bytes(),
+                            );
+                            served = true;
+                        }
+                        Ok(n) if &buf[..n] == protocol::OPEN_AUDIO.as_bytes() => {
+                            Self::open_audio_service_on(
+                                self.audio_service.as_ref(),
+                                self.audio_failed,
+                                ch,
+                                protocol::ATTACH_AUDIO_CLIENT.as_bytes(),
+                            );
+                            served = true;
+                        }
+                        Ok(n) if &buf[..n] == protocol::OPEN_AUDIO_RW.as_bytes() => {
+                            Self::open_audio_service_on(
+                                self.audio_service.as_ref(),
+                                self.audio_failed,
+                                ch,
+                                protocol::ATTACH_AUDIO_CLIENT_RW.as_bytes(),
+                            );
+                            served = true;
+                        }
+                        Ok(n) if &buf[..n] == protocol::OPEN_AUDIO_RO.as_bytes() => {
+                            Self::open_audio_service_on(
+                                self.audio_service.as_ref(),
+                                self.audio_failed,
+                                ch,
+                                protocol::ATTACH_AUDIO_CLIENT_RO.as_bytes(),
                             );
                             served = true;
                         }
@@ -3512,6 +4015,51 @@ impl DriverManager {
                 self.xhci_generation
             );
         }
+        if let Some(h) = self.snd_host.as_ref() {
+            let _ = writeln!(
+                out,
+                "{:#x}\tdriver-host-snd\t{}\t{}\t0",
+                h.process.koid().unwrap_or(0),
+                if self.snd_ready {
+                    "online"
+                } else if self.snd_failed {
+                    "failed"
+                } else {
+                    "starting"
+                },
+                self.snd_generation
+            );
+        }
+        if let Some(h) = self.btl_service.as_ref() {
+            let _ = writeln!(
+                out,
+                "{:#x}\tbtl-service\t{}\t{}\t0",
+                h.process.koid().unwrap_or(0),
+                if self.btl_ready {
+                    "online"
+                } else if self.btl_failed {
+                    "failed"
+                } else {
+                    "starting"
+                },
+                self.btl_generation
+            );
+        }
+        if let Some(h) = self.audio_service.as_ref() {
+            let _ = writeln!(
+                out,
+                "{:#x}\taudio-service\t{}\t{}\t0",
+                h.process.koid().unwrap_or(0),
+                if self.audio_ready {
+                    "online"
+                } else if self.audio_failed {
+                    "failed"
+                } else {
+                    "starting"
+                },
+                self.audio_generation
+            );
+        }
         let _ = registry.write(out.as_bytes());
     }
 
@@ -3736,6 +4284,9 @@ impl DriverManager {
                     } else if msg == protocol::BLOCK_USB_READY.as_bytes() {
                         self.registry.mark_online("block:usb");
                         println!("[driver-manager] USB BOT BlockDevice service online");
+                    } else if msg == protocol::USB_BT_READY.as_bytes() {
+                        self.registry.mark_online("bt:usb");
+                        println!("[driver-manager] USB Wireless Bluetooth HCI bridge online");
                     } else if msg == protocol::USB_BRINGUP_FAILED.as_bytes()
                         || msg == protocol::USB_MISSING_RESOURCES.as_bytes()
                         || msg == protocol::USB_DEVICE_GONE.as_bytes()
@@ -3867,6 +4418,7 @@ impl DriverManager {
                     self.storage_milestone(100);
                     self.attach_own_hxfs_client();
                     self.maybe_attach_wlan_hxfs();
+                    self.maybe_attach_btl_hxfs();
                     #[cfg(feature = "key-broker-fail-smoke")]
                     self.probe_key_broker_fail_closed();
                     return;
@@ -3969,6 +4521,140 @@ impl DriverManager {
                     self.revoke_driver_lease("wlan-service");
                     self.wlan_failed = true;
                     self.wlan_ready = false;
+                    return;
+                }
+            }
+        }
+    }
+
+    fn poll_snd_host(&mut self) {
+        let Some(host) = self.snd_host.take() else {
+            return;
+        };
+        let mut buf = [0u8; 64];
+        let mut budget = POLL_BUDGET_PER_TICK;
+        loop {
+            let Some(rem) = budget.checked_sub(1) else {
+                self.snd_host = Some(host);
+                return;
+            };
+            budget = rem;
+            match host.bootstrap.read_into(&mut buf) {
+                Ok(n) if &buf[..n] == protocol::SND_HOST_READY.as_bytes() => {
+                    println!("[driver-manager] driver-host-snd reported ready");
+                    self.snd_ready = true;
+                    self.snd_failed = false;
+                    self.registry.mark_online("audio:snd");
+                    self.snd_host = Some(host);
+                    self.maybe_bridge_snd_and_audio();
+                    self.try_start_audio_service();
+                    return;
+                }
+                Ok(n) if &buf[..n] == protocol::SND_HOST_DEGRADED.as_bytes() => {
+                    println!("[driver-manager] driver-host-snd reported degraded");
+                    self.snd_ready = false;
+                    self.snd_failed = true;
+                    self.snd_host = Some(host);
+                    self.try_start_audio_service();
+                    return;
+                }
+                Ok(_) => {}
+                Err(ErrorCode::ShouldWait) | Err(ErrorCode::TimedOut) => {
+                    self.snd_host = Some(host);
+                    return;
+                }
+                Err(err) => {
+                    println!(
+                        "[driver-manager] driver-host-snd channel closed: {}",
+                        err.as_str()
+                    );
+                    self.registry.mark_failed("audio:snd");
+                    self.revoke_driver_lease("driver-host-snd");
+                    self.snd_failed = true;
+                    self.snd_ready = false;
+                    return;
+                }
+            }
+        }
+    }
+
+    fn poll_btl_service(&mut self) {
+        let Some(host) = self.btl_service.take() else {
+            return;
+        };
+        let mut buf = [0u8; 64];
+        let mut budget = POLL_BUDGET_PER_TICK;
+        loop {
+            let Some(rem) = budget.checked_sub(1) else {
+                self.btl_service = Some(host);
+                return;
+            };
+            budget = rem;
+            match host.bootstrap.read_into(&mut buf) {
+                Ok(n) if &buf[..n] == protocol::BTL_READY.as_bytes() => {
+                    println!("[driver-manager] btl-service reported ready");
+                    self.btl_ready = true;
+                    self.btl_failed = false;
+                    self.btl_service = Some(host);
+                    self.maybe_bridge_xhci_and_btl();
+                    self.maybe_bridge_btl_and_wlan_coex();
+                    self.maybe_attach_btl_hxfs();
+                    self.maybe_bridge_audio_and_btl();
+                    self.try_start_audio_service();
+                    return;
+                }
+                Ok(_) => {}
+                Err(ErrorCode::ShouldWait) | Err(ErrorCode::TimedOut) => {
+                    self.btl_service = Some(host);
+                    return;
+                }
+                Err(err) => {
+                    println!(
+                        "[driver-manager] btl-service channel closed: {}",
+                        err.as_str()
+                    );
+                    self.btl_failed = true;
+                    self.btl_ready = false;
+                    return;
+                }
+            }
+        }
+    }
+
+    fn poll_audio_service(&mut self) {
+        let Some(host) = self.audio_service.take() else {
+            return;
+        };
+        let mut buf = [0u8; 64];
+        let mut budget = POLL_BUDGET_PER_TICK;
+        loop {
+            let Some(rem) = budget.checked_sub(1) else {
+                self.audio_service = Some(host);
+                return;
+            };
+            budget = rem;
+            match host.bootstrap.read_into(&mut buf) {
+                Ok(n) if &buf[..n] == protocol::AUDIO_READY.as_bytes() => {
+                    println!("[driver-manager] audio-service reported ready");
+                    self.audio_ready = true;
+                    self.audio_failed = false;
+                    self.audio_service = Some(host);
+                    self.maybe_bridge_snd_and_audio();
+                    self.maybe_bridge_audio_and_btl();
+                    return;
+                }
+                Ok(_) => {}
+                Err(ErrorCode::ShouldWait) | Err(ErrorCode::TimedOut) => {
+                    self.audio_service = Some(host);
+                    return;
+                }
+                Err(err) => {
+                    println!(
+                        "[driver-manager] audio-service channel closed: {}",
+                        err.as_str()
+                    );
+                    self.audio_failed = true;
+                    self.audio_ready = false;
                     return;
                 }
             }
@@ -4694,6 +5380,18 @@ impl DriverManager {
                     } else if label == pci_manager::DEVICE_LEASE_XHCI_RW_LABEL {
                         if libcanvas::device_lease::query(&handle).is_ok() {
                             self.xhci_lease_rw = Some(handle);
+                        } else {
+                            drop(handle);
+                        }
+                    } else if label == pci_manager::DEVICE_LEASE_SND_RO_LABEL {
+                        if libcanvas::device_lease::query(&handle).is_ok() {
+                            self.snd_lease_ro = Some(handle);
+                        } else {
+                            drop(handle);
+                        }
+                    } else if label == pci_manager::DEVICE_LEASE_SND_RW_LABEL {
+                        if libcanvas::device_lease::query(&handle).is_ok() {
+                            self.snd_lease_rw = Some(handle);
                         } else {
                             drop(handle);
                         }
