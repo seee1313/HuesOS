@@ -14,11 +14,12 @@ an Ed25519-signed **HBI v2.2** boot image module.
 
 1. **Minimal Kernel** — Firmware AML execution (`acpi-manager`), PCI/PCIe
    enumeration and BAR/IRQ allocation (`pci-manager`), storage (`driver-host-nvme`,
-   `hxfs-service`, `key-broker`), networking (`net-service`, `wlan-service`),
-   dynamic linkers (`ld-huesos`, `ld-pe`), and the shell (`hsh`) all run in
-   isolated Ring-3 processes. Only memory management, scheduling, IPC, IRQ/GSI
-   routing, capability enforcement, and the bounds-checked framebuffer/panic
-   blitter live in Ring 0.
+   `hxfs-service`, `key-broker`), USB 3.x (`driver-host-xhci`), networking
+   (`net-service`, `wlan-service`), dynamic linkers (`ld-huesos`, `ld-pe`), and
+   the shell (`hsh`) all run in isolated Ring-3 processes. Only memory
+   management, scheduling, IPC, IRQ/GSI routing, hardware IOMMU page tables,
+   capability enforcement, and the bounds-checked framebuffer/panic blitter live
+   in Ring 0.
 2. **Capability-Based Security** — Kernel objects are named only through
    per-process handles carrying monotonic `Rights`. There is no global kernel
    VFS or ambient root UID.
@@ -29,11 +30,11 @@ an Ed25519-signed **HBI v2.2** boot image module.
    entry point (with `huesos-std` layered safely on top for `/bin` utilities,
    and `PeHostApi` inside `ld-pe` bridging native Win64 DLLs).
 5. **Policy Crates Forbidding `unsafe`** — Complex decision engines (`huesos-sched`,
-   `huesos-pci`, `huesos-iommu`, `huesos-lifecycle`, `huesos-proclife`, `huesos-handlemove`,
-   `huesos-waitset`, `huesos-extable`, `huesos-ioapic`, `huesos-quota`,
-   `huesos-net`, `huesos-tls`, `huesos-ieee80211`, `huesos-wpa`, `huesos-rtw88`,
-   `huesos-pe`, `huesos-hsh`) are standalone `#![no_std]`, `#![forbid(unsafe_code)]`
-   host-tested crates.
+   `huesos-pci`, `huesos-iommu`, `huesos-usb`, `huesos-fat`, `huesos-lifecycle`,
+   `huesos-proclife`, `huesos-handlemove`, `huesos-waitset`, `huesos-extable`,
+   `huesos-ioapic`, `huesos-quota`, `huesos-net`, `huesos-tls`,
+   `huesos-ieee80211`, `huesos-wpa`, `huesos-rtw88`, `huesos-pe`, `huesos-hsh`)
+   are standalone `#![no_std]`, `#![forbid(unsafe_code)]` host-tested crates.
 
 ## Crate Structure
 
@@ -44,7 +45,7 @@ boot/kernel:   huesos-boot, huesos-kernel, huesos-arch, huesos-hal,
 sched/policy:  huesos-sched, huesos-lifecycle, huesos-proclife,
                huesos-handlemove, huesos-waitset, huesos-extable,
                huesos-ioapic, huesos-iommu, huesos-quota, hues-async
-acpi/pci/hw:   huesos-uacpi, huesos-pci, huesos-tpm, huesos-nvme
+acpi/pci/hw:   huesos-uacpi, huesos-pci, huesos-usb, huesos-tpm, huesos-nvme
 storage:       huesos-hxfs, huesos-hxfs-proto, huesos-blobfs,
                huesos-gpt, huesos-fat
 net/wlan/tls:  huesos-net, huesos-tls, huesos-ieee80211,
@@ -52,11 +53,12 @@ net/wlan/tls:  huesos-net, huesos-tls, huesos-ieee80211,
 loaders/shell: huesos-elf, huesos-pe, huesos-scudo, huesos-hsh
 fuzzing:       huesos-decoder-fuzz, huesos-scudo-fuzz
 userspace:     libcanvas, huesos-std, init, driver-manager,
-               acpi-manager, uacpi-runtime, pci-manager,
-               driver-host-input, driver-host-nvme, hxfs-service,
-               key-broker, shutdown-broker, net-service, wlan-service,
-               ld-huesos, ld-pe, win64-runtime, terminal, hsh-bin,
-               coreutils (45 /bin tools), fdisk, doom, fault-probe
+               acpi-manager, uacpi-runtime, pci-manager, pci-hotplug-test,
+               driver-host-input, driver-host-nvme, driver-host-xhci,
+               hxfs-service, key-broker, shutdown-broker,
+               net-service, wlan-service, ld-huesos, ld-pe, win64-runtime,
+               terminal, hsh-bin, coreutils (46 binaries), fdisk, doom,
+               fault-probe
 ```
 
 ## Boot Flow
@@ -81,16 +83,17 @@ userspace:     libcanvas, huesos-std, init, driver-manager,
    parity), initializes per-CPU GDT/TSS/IDT/`STAR`/`LSTAR`/`SFMASK`/SIMD/scheduler,
    and gates AP execution on `APS_MAY_RUN`.
 7. Verifies the HBI v2.2 Ed25519 signature, builds the immutable ACPI archive v2,
-   initializes Intel VT-d hardware DMA translation ([IOMMU_VTD.md](IOMMU_VTD.md))
-   when firmware publishes a valid `DMAR` table (falling back fail-closed to
-   `Trusted` mode otherwise), creates `init`'s bootstrap handles (`BOOTFS` VMO,
-   `FrameDraw`, `SystemControl`, `AcpiBroker`, `PciConfigMint`,
-   `DeviceLeaseAuthority`, `VolumeKey`), releases APs, and enters Ring 3
-   `huesos-init`.
+   initializes Intel VT-d (`DMAR`) or AMD-Vi (`IVRS`) hardware DMA translation
+   ([IOMMU_VTD.md](IOMMU_VTD.md)) when firmware publishes a valid IOMMU table
+   (falling back fail-closed to `Trusted` mode otherwise), creates `init`'s
+   bootstrap handles (`BOOTFS` VMO, `FrameDraw`, `SystemControl`, `AcpiBroker`,
+   `PciConfigMint`, `DeviceLeaseAuthority`, FADT SCI `Irq`, `VolumeKey`),
+   releases APs, and enters Ring 3 `huesos-init`.
 8. **`init` → `driver-manager` cascade**:
-   - `driver-manager` supervises `acpi-manager` (`HMCF`, `HPCI` v2, `HIOM` v1),
-     `pci-manager` (sole PCI config executor + `HPIN` v1 inventory), `key-broker`,
-     `driver-host-input`, `driver-host-nvme`, `hxfs-service`, `net-service`, and
+   - `driver-manager` supervises `acpi-manager` (`HMCF`, `HPCI` v2, `HIOM` v1,
+     `SCI -> GPE -> Notify` hotplug events), `pci-manager` (sole PCI config
+     executor + `HPIN` v1 inventory), `key-broker`, `driver-host-input`,
+     `driver-host-nvme`, `driver-host-xhci`, `hxfs-service`, `net-service`, and
      `wlan-service`.
    - `init` launches `shutdown-broker` and `/bin/terminal.elf`, which spawns
      `/bin/hsh.elf` ([SHELL_AND_STD.md](SHELL_AND_STD.md)).
@@ -137,7 +140,7 @@ two-counter `RefAccount` lifecycle ([OBJECT_LIFECYCLE.md](OBJECT_LIFECYCLE.md)):
 
 ## Syscall Boundary
 
-Canonical syscall numbers (`..=95`) live in `huesos_abi::Syscall`. Major groups:
+Canonical syscall numbers (`..=98`) live in `huesos_abi::Syscall`. Major groups:
 
 - **Memory & address spaces:** `VmoCreate`, `VmoRead`, `VmoWrite`, `VmoSetSize`,
   `VmarMap`, `VmarUnmap`, `VmarProtect`, `VmarCreateChild`, `VmarHeapExtend`.
@@ -150,11 +153,12 @@ Canonical syscall numbers (`..=95`) live in `huesos_abi::Syscall`. Major groups:
   `ThreadCreate`, `ThreadStart`, `ThreadSetGsBase`, `ThreadGetGsBase`,
   `SchedSetPolicy`, `JobDefault`, `JobCreate`, `JobSetLimits`, `JobBindQuotaPort`.
 - **Hardware & platform capabilities:** `ResourceCreate`, `PciConfigMint`,
-  `DeviceLeaseCreate`, `DeviceLeaseRevoke`, `AcpiBrokerOp`, `InterruptCreate`,
-  `InterruptBind`, `InterruptAck`, `FramebufferInfo`, `FramebufferBlit`.
+  `DeviceLeaseCreate`, `DeviceLeaseAttachDma`, `DeviceLeaseRevoke`,
+  `PciHotplugTrigger`, `AcpiBrokerOp`, `InterruptCreate`, `InterruptBind`,
+  `InterruptAck`, `FramebufferInfo`, `FramebufferBlit`.
 - **Observability & clocks:** `ClockGetMonotonic`, `ClockGetMonotonicNs`,
-  `SystemCpuCount`, `SystemSchedStats`, `SystemTaskQuery`, `HandleGetKoid`,
-  `ObserveRead`, `KnobGet`/`KnobSet`, `HardHalt`.
+  `SystemCpuCount`, `SystemSchedStats`, `SystemTaskQuery`, `SystemIommuStatus`,
+  `HandleGetKoid`, `ObserveRead`, `KnobGet`/`KnobSet`, `HardHalt`.
 
 Every pointer-bearing syscall validates lower-half bounds and page-table flags
 under the process memory lock and copies via recoverable `.ex_table` routines
@@ -162,10 +166,12 @@ under the process memory lock and copies via recoverable `.ex_table` routines
 
 ## Subsystems in Ring 3
 
-- **ACPI & PCI/PCIe:** [ACPI_RING3.md](ACPI_RING3.md),
+- **ACPI, PCI/PCIe & IOMMU:** [ACPI_RING3.md](ACPI_RING3.md),
   [PCI_MANAGER_ARCHITECTURE.md](PCI_MANAGER_ARCHITECTURE.md),
-  [PCI_PRODUCTION_ROADMAP.md](PCI_PRODUCTION_ROADMAP.md).
-- **NVMe & `HxFS v7`:** [NVME.md](NVME.md), [HXFS_DESIGN.md](HXFS_DESIGN.md),
+  [PCI_PRODUCTION_ROADMAP.md](PCI_PRODUCTION_ROADMAP.md),
+  [IOMMU_VTD.md](IOMMU_VTD.md).
+- **USB 3.x (`xHCI`) & Storage (`NVMe`, `HxFS v7`):** [USB_XHCI.md](USB_XHCI.md),
+  [NVME.md](NVME.md), [HXFS_DESIGN.md](HXFS_DESIGN.md),
   [KEY_BROKER.md](KEY_BROKER.md), [STORAGE_PRODUCTION_GATE.md](STORAGE_PRODUCTION_GATE.md).
 - **Networking, 802.11 Wi-Fi & TLS 1.3:** [NETWORKING.md](NETWORKING.md).
 - **Static/Dynamic ELF & Win64 PE32+ Loaders:** [EXECUTABLE_LOADERS.md](EXECUTABLE_LOADERS.md).

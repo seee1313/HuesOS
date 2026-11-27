@@ -1,6 +1,6 @@
 # HuesOS PCI/PCIe Manager Architecture
 
-- **Status:** implemented on `main` for the `PCI Compatibility Profile` (`AP-0..AP-23`); hardware VT-d/AMD-Vi second-stage DMA domains (`Stage N.2`), live `QuiesceRemap` driver (`Stage M.2`), and bare-metal qualification (`Stage O`) remain open
+- **Status:** implemented on `main` for both the `PCI Compatibility Profile` and `PCI Isolated Profile` (`AP-0..AP-24`, `Stage N.2` Intel VT-d & AMD-Vi second-stage DMA domains in [IOMMU_VTD.md](IOMMU_VTD.md), and live `SCI -> GPE -> Notify` hotplug + dynamic DMA slots); live `QuiesceRemap` driver (`Stage M.2`), interrupt remapping (`Stage N.3`), and bare-metal qualification (`Stage O`) remain open
 - **Audience:** kernel, platform, DriverManager, and DriverHost maintainers
 - **Scope:** x86_64 PCI/PCIe discovery, configuration, resource ownership,
   DMA, interrupts, hotplug, and relocation
@@ -76,6 +76,15 @@ HuesOS does not copy any wire ABI from those systems.
 ---
 
 ## 2. Current state and migration boundary
+
+> **Migration status (`AP-22`..`AP-24`):** Stage J migration is complete on
+> `main`. The legacy kernel `0xCF8/0xCFC` bootstrap scan described below has
+> been deleted (`tools/check-kernel-no-pci.py`), `StorageBootInfo` v2 carries
+> only the canonical `BOOT_DMA_POOL_LEN = 92 MiB` physical reservation and
+> `storage_off` flag, and NVMe, `xHCI`, VirtIO-Net, and `rtw88` all bind
+> exclusively through `pci-manager` + `DeviceLease` + hardware VT-d/AMD-Vi
+> IOMMU domains. The historical transition criteria below are retained as
+> architectural context.
 
 The current production path is a bootstrap shim, not the target architecture:
 

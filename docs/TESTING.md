@@ -103,12 +103,12 @@ ranges are limited to ABI-bound rejection; fault recovery still needs QEMU.
 
 ## Static gates (`make audit-check`)
 
-Eight repository checks run before every PR and in CI. They exist because
+Nine repository checks run before every PR and in CI. They exist because
 each one encodes a rule that a reviewer had already failed to enforce by
 reading:
 
 ```bash
-make audit-check     # all eight
+make audit-check     # all nine
 make fmt-check       # the last one on its own
 ```
 
@@ -120,6 +120,7 @@ make fmt-check       # the last one on its own
 | `check-hues-async-noalloc.py` | `crates/hues-async/**` never allocates — no `alloc`, no heap collection, tests included |
 | `check-huesos-object-lock-policy.py` | no bare `spin::Mutex` outside `irq_guard.rs` |
 | `check-poll-budgets.py` | every channel-draining loop in a shared service is bounded (see below) |
+| `check-kernel-no-pci.py` | zero direct PCI scan or legacy storage-PCI boot shims may reappear in the kernel |
 | `check-doc-links.py` | every relative Markdown link in the README and `docs/` resolves to an existing workspace path |
 | `fmt-all.py --check` | formatting across the kernel workspace **and every standalone userspace crate**, which plain `cargo fmt --all` does not reach |
 
@@ -506,11 +507,12 @@ not a spec:
 
 | Job | What it runs |
 |-----|--------------|
-| `static-safety` | `make audit-check`, Clippy, the ordinary host suite, and `make test-hxfs-features` for the combined encryption + compression + Hxblob storage build |
-| `qemu-boot` | boot smoke across SMP 1/2/4/8 |
+| `static-safety` | `make audit-check`, Clippy, `cargo audit`, the ordinary host suite, `make test-hxfs-features`, `make image-check`, `make migration-check`, and `make bench-check` |
+| `qemu-boot` | boot smoke across debug/release SMP 1/2/4/8 (including Ring-3 `pci-hotplug-test` syscall-98 smoke) |
 | `qemu-ioapic-live` | QMP-injected PS/2 edge IRQ reaches a userspace Port on SMP2 |
+| `qemu-pci-mediation` | AP-10 dedicated ACPI ↔ PCI read mediation on both ECAM and forced-legacy `CF8/CFC` backends |
 | `qemu-acpi-restart` | AP-6 lifecycle gates: injected restart cascade (pre-ready, post-ready, stale heartbeat) and restart-budget exhaustion into degraded mode, both release SMP2 |
-| `qemu-nvme-boot` | base NVMe soak, mode 0 |
+| `qemu-nvme-boot` | base NVMe + GPT-partitioned `HxFS v7` soak, mode 0 |
 | `qemu-nvme-gcm-inject` | mode 1 |
 | `qemu-nvme-crc-inject` | mode 2 |
 | `qemu-nvme-no-tpm` | mode 6, debug **and** release |
@@ -521,6 +523,9 @@ not a spec:
 | `qemu-storage-off` | NVMe present, `init.storage=off`, image hash unchanged |
 | `qemu-extable-smoke` | recoverable-copy fixup path |
 | `qemu-irq-level-smoke` | raw-GSI level route masked/acknowledged/redelivered (`irq_test=1`) |
+| `qemu-iommu-vtd` | 3-leg Stage N.2 hardware IOMMU gate (`intel-iommu`, `amd-iommu`, and no-IOMMU `Trusted` fallback), debug **and** release |
+| `qemu-usb-xhci` | Ring-3 USB 3.x `xHCI` + Hub + QMP HID Keyboard/Mouse + BOT `/mnt/usb0` FAT32 R/W persistence under VT-d, debug **and** release |
+| `verified-boot-hardening` | `hbi-signature`, `smep-smap`, `key-broker-crash`, `tpm-sealed-key`, and `secure-boot` QEMU gates |
 
 `swtpm` and `swtpm-tools` are installed in every QEMU job, so the
 TPM-backed key path is exercised rather than silently skipped. Mode 6

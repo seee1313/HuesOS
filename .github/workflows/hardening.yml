@@ -15,7 +15,7 @@ concurrency:
 jobs:
   static-safety:
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Install Rust toolchain
@@ -27,27 +27,29 @@ jobs:
         run: make audit-check
       - name: Clippy
         env:
-          CARGO_BUILD_JOBS: "1"
+          CARGO_BUILD_JOBS: "2"
         run: make clippy
       - name: RustSec dependency audit
+        env:
+          CARGO_BUILD_JOBS: "2"
         run: |
           cargo install cargo-audit --locked --version 0.22.2
           cargo audit --deny warnings
       - name: Host tests
         env:
-          CARGO_BUILD_JOBS: "1"
+          CARGO_BUILD_JOBS: "2"
         run: make test
       - name: Hxfs production feature matrix
         env:
-          CARGO_BUILD_JOBS: "1"
+          CARGO_BUILD_JOBS: "2"
         run: make test-hxfs-features
       - name: HxFS current image write and remount gate
         env:
-          CARGO_BUILD_JOBS: "1"
+          CARGO_BUILD_JOBS: "2"
         run: make image-check
       - name: HxFS v6 to v7 migration gate
         env:
-          CARGO_BUILD_JOBS: "1"
+          CARGO_BUILD_JOBS: "2"
         run: make migration-check
       # Stage E.4: the deterministic half of the report must match the
       # committed baseline byte for byte; the timing half is compared
@@ -631,7 +633,7 @@ jobs:
           rustup toolchain install nightly-2026-03-01 --profile minimal \
             --component rust-src,llvm-tools-preview
           rustup default nightly-2026-03-01
-      - name: Extable smoke (synthetic recoverable-copy probe)
+      - name: IRQ level-route smoke (raw-GSI mask/ack/redelivery)
         env:
           CARGO_BUILD_JOBS: "1"
           ARTIFACT_DIR: ci-artifacts
@@ -645,11 +647,10 @@ jobs:
           if-no-files-found: warn
 
   qemu-iommu-vtd:
-    # Stage N.2: end-to-end Intel VT-d hardware IOMMU (`PCI Isolated Profile`)
-    # gate. Boots QEMU Q35 with `-device intel-iommu,intremap=off,caching-mode=on`,
-    # `-device edu,dma_mask=0xffffffffffffffff` (`iommu_test=1`), NVMe + HxFS,
-    # and modern VirtIO 1.0 (`iommu_platform=on`), then boots the same artifact
-    # without `intel-iommu` to prove fail-closed fallback to `Trusted` mode.
+    # Stage N.2: end-to-end Intel VT-d & AMD-Vi hardware IOMMU (`PCI Isolated
+    # Profile`) gate. Boots QEMU Q35 across `intel-iommu`, `amd-iommu`, and
+    # no-IOMMU `Trusted` fallback legs with `-device edu` (`iommu_test=1`),
+    # NVMe + HxFS, and modern VirtIO 1.0 (`iommu_platform=on`).
     runs-on: ubuntu-24.04
     timeout-minutes: 35
     strategy:
@@ -668,7 +669,7 @@ jobs:
           rustup toolchain install nightly-2026-03-01 --profile minimal \
             --component rust-src,llvm-tools-preview
           rustup default nightly-2026-03-01
-      - name: Intel VT-d hardware isolation + Trusted fallback QEMU smoke
+      - name: Intel VT-d + AMD-Vi hardware isolation + Trusted fallback QEMU smoke
         env:
           CARGO_BUILD_JOBS: "1"
           ARTIFACT_DIR: ci-artifacts

@@ -1,6 +1,6 @@
 # Ring-3 ACPI architecture
 
-- **Status:** implemented and active on `main` (`AP-1..AP-18`, `AP-23`); physical multi-platform bare-metal corpus qualification remains tracked in [PCI_PRODUCTION_ROADMAP.md](PCI_PRODUCTION_ROADMAP.md)
+- **Status:** implemented and active on `main` (`AP-1..AP-18`, `AP-23`, `AP-24` `SCI -> GPE -> Notify` PCI hotplug bridge); physical multi-platform bare-metal corpus qualification remains tracked in [PCI_PRODUCTION_ROADMAP.md](PCI_PRODUCTION_ROADMAP.md)
 - **Audience:** kernel, ACPI, PCI, DriverManager, and platform maintainers
 - **Scope:** x86_64 ACPI table ownership, AML execution, OperationRegions,
   PCI-root discovery, supervision, and failure containment
