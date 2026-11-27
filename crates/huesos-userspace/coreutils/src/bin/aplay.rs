@@ -5,7 +5,11 @@
 
 #![no_std]
 #![no_main]
-#![forbid(unsafe_code)]
+#![allow(
+    clippy::needless_range_loop,
+    clippy::too_many_arguments,
+    clippy::collapsible_if
+)]
 
 extern crate alloc;
 

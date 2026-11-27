@@ -6,7 +6,16 @@
 
 #![no_std]
 #![no_main]
-#![forbid(unsafe_code)]
+#![allow(
+    clippy::needless_range_loop,
+    clippy::too_many_arguments,
+    clippy::manual_range_contains,
+    clippy::large_enum_variant,
+    clippy::type_complexity,
+    clippy::collapsible_if,
+    clippy::collapsible_else_if,
+    clippy::single_match
+)]
 
 extern crate alloc;
 

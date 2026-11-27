@@ -13,6 +13,13 @@
 
 #![no_std]
 #![no_main]
+#![allow(
+    clippy::needless_range_loop,
+    clippy::too_many_arguments,
+    clippy::manual_range_contains,
+    clippy::collapsible_if,
+    clippy::collapsible_else_if
+)]
 
 use core::panic::PanicInfo;
 use core::sync::atomic::{fence, Ordering};

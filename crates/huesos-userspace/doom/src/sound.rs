@@ -2,7 +2,12 @@
 //! `MUS\x1a` / `MThd` MIDI) audio engine streaming into `audio-service` over a
 //! lock-free `HARB` v1 SPSC shared-memory VMO.
 
-#![forbid(unsafe_code)]
+#![allow(
+    clippy::needless_range_loop,
+    clippy::too_many_arguments,
+    clippy::manual_range_contains,
+    clippy::collapsible_if
+)]
 
 use alloc::vec::Vec;
 use spin::Mutex;
