@@ -8,7 +8,7 @@ name = "huesos-pci-hotplug-test"
 path = "src/main.rs"
 
 [dependencies]
-libcanvas = { path = "../libcanvas", default-features = false }
+libcanvas = { path = "../libcanvas" }
 huesos-abi = { path = "../../huesos-abi" }
 
 [profile.release]
