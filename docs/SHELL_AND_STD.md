@@ -1,7 +1,7 @@
 # Shell (`hsh`), `huesos-std`, and Userspace Utilities
 
 - **Status:** implemented and verified in host suites (`huesos-hsh`) and QEMU
-  (`hsh`, `/bin/std-smoke.elf`, 45 `coreutils` binaries, `fdisk`/`btop` TUIs)
+  (`hsh`, `/bin/std-smoke.elf`, 46 `coreutils` binaries, `fdisk`/`btop` TUIs)
 - **Related:** [USERSPACE.md](USERSPACE.md), [EXECUTABLE_LOADERS.md](EXECUTABLE_LOADERS.md),
   [NETWORKING.md](NETWORKING.md), [TERMINAL_RENDERING.md](TERMINAL_RENDERING.md)
 
@@ -32,7 +32,8 @@ HuesOS splits interactive userspace into three clean layers:
 - **`fs` & `path`:** `File`, `OpenOptions`, random-offset reads/writes,
   `truncate`, `readdir`, `mkdir`, `remove`, cross-directory `rename`, `symlink`,
   `read_link`, `chmod`/`set_mode`, `stat` / `lstat` (`O_NOFOLLOW`), and `stat_fs`
-  over `hxfs-service` (with transparent `/boot` `BOOTFS` fallback).
+  over `hxfs-service` (with transparent `/boot` `BOOTFS` fallback and `/mnt/usb0`
+  FAT16/FAT32 USB Mass Storage mounting via `huesos-fat`).
 - **`net`:** TCP/UDP/DNS/ICMP helpers over `net-service`.
 - **`thread` & `sync`:** user threads + `FutexWait`/`FutexWake`-backed `Mutex`,
   `Condvar`, and `Once`.
@@ -86,8 +87,9 @@ and `fb`. Denied handles are never transferred into the child's handle table.
 
 ## 3. Standalone utilities (`coreutils` & `fdisk`)
 
-All utilities live under `/bin/*.elf` in `BOOTFS` (45 binaries in
-`crates/huesos-userspace/coreutils/src/bin/` plus `/bin/fdisk.elf`):
+All utilities live under `/bin/*.elf` in `BOOTFS` (46 binaries in
+`crates/huesos-userspace/coreutils/src/bin/` — 45 user-facing `/bin` tools plus
+`boot-selftest` `/bin/std-smoke.elf` — alongside `/bin/fdisk.elf`):
 
 - **Filesystem & archives:** `ls`, `cat`, `cp`, `mv`, `rm`, `mkdir`, `ln`,
   `readlink`, `chmod`, `touch`, `write`, `stat`, `find`, `du`, `df`, `dd`,
@@ -106,6 +108,7 @@ All utilities live under `/bin/*.elf` in `BOOTFS` (45 binaries in
     `SystemSchedStats` and `SystemTaskQuery`;
   - `ps`, `schedctl` (Fair weight / CBS deadline policy & 256-CPU affinity),
     `pci` (default TSV + `-v` / `--bars` / `--iommu` over read-only `HPIN` v1 VMO),
+    `lsusb` (default TSV + `-v` over read-only `HUSB` v1 VMO + `--bot-smoke`),
     `acpi`.
 - **Networking & wireless:** `netctl`, `wlanctl`, `ping`, `curl` (HTTP/1.1 +
   TLS 1.3 HTTPS).

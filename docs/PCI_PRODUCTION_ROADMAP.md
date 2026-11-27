@@ -731,12 +731,20 @@ Exit criterion:
 
 # Stage K — Reserved-space hotplug
 
-Status: **COMPLETE (POLICY + BOOT SELF-CHECK IN AP-23; LIVE QEMU HOTPLUG PENDING O.1)**
+Status: **COMPLETE (POLICY IN AP-23 + LIVE SCI/NOTIFY/HANDOFF RUNTIME IN AP-24; 1,000-CYCLE QMP SOAK TRACKED IN STAGE O)**
 
 ## K.1 Event ingestion
 
 Consume ACPI/native hotplug events through a bounded queue and rescan only the
 affected root/subtree.
+
+Implemented in `AP-23`/`AP-24` (PRs #288, #293):
+- `INIT_ACPI_SCI_IRQ_HANDLE = 10` binds the FADT SCI GSI to Ring-3
+  `acpi-manager` (`SCI -> GPE -> Notify` bridge), forwarding 40-byte `HPHG` v1
+  wire events (`crates/huesos-abi/src/pci_hotplug.rs`) over the private
+  `pci-hotplug-events` channel into `pci-manager`'s `HotplugEventQueue`;
+- `Syscall::PciHotplugTrigger = 98` + `/services/pci-hotplug-test.elf` exercise
+  the live Ring-3 event path in `scripts/ci-qemu-smoke.sh`.
 
 Exit criterion:
 
@@ -746,6 +754,10 @@ Exit criterion:
 ## K.2 Insertion without relocation
 
 Use pre-reserved bus numbers/windows and allocate only the new subtree.
+
+Implemented in `AP-24` (PR #293): generation-bound live `DriverHost` handoff,
+rollback, restart cleanup, and kernel-owned `[76..92 MiB)` dynamic 4×4 MiB DMA
+slots inside `BOOT_DMA_POOL_LEN = 92 MiB` (`crates/huesos-object/src/dma_pool.rs`).
 
 Exit criterion:
 
@@ -949,14 +961,15 @@ PCI production-ready remains false while any of these are true:
 
 ---
 
-## 5. Completed `AP-0..AP-23` bring-up cascade
+## 5. Completed `AP-0..AP-24` bring-up cascade
 
-`PCI-1` through `PCI-9`, the complete `AP-0..AP-23` Ring-3 ACPI → PCI Manager
-implementation series, and `Stage N.2` Intel VT-d & AMD-Vi hardware DMA
+`PCI-1` through `PCI-9`, the `AP-0..AP-24` Ring-3 ACPI → PCI Manager + live
+hotplug implementation series, and `Stage N.2` Intel VT-d & AMD-Vi hardware DMA
 isolation are implemented. The remaining open work before
 `PCI production-ready = true` consists strictly of `Stage M.2` (first live
-`QuiesceRemap` DriverHost), live runtime Root Port hotplug wiring (`K.2`), and
-`Stage O` (long-haul and multi-platform bare-metal qualification).
+`QuiesceRemap` DriverHost), `Stage N.3` (interrupt remapping when required by a
+platform profile), and `Stage O` (1,000-cycle QMP Root-Port hotplug soak,
+24-hour mixed endurance, and multi-platform bare-metal qualification).
 
 ---
 
@@ -965,10 +978,10 @@ isolation are implemented. The remaining open work before
 | Track | Status | Evidence |
 |---|---|---|
 | A.1 Normative architecture | Complete | PCI + Ring-3 ACPI authority docs; AP execution plan |
-| A.2 ABI vocabulary | Complete | `HPCI` v2, `HMCF`, `HIOM`, `HPIN`, `pci_config`, `pci_mediation`, `pci_lease` ABIs + unit tests |
+| A.2 ABI vocabulary | Complete | `HPCI` v2, `HMCF`, `HIOM`, `HPIN`, `HPHG` v1, `pci_config`, `pci_mediation`, `pci_lease`, `pci_hotplug` ABIs + unit tests |
 | A.3 Migration map | Complete | Kernel PCI scan removed (`tools/check-kernel-no-pci.py`, AP-22) |
 | ACPI archive v2 | Complete | AP-1/AP-2 merged; Q35 v2 snapshot accepted in Ring 3 |
-| Full Ring-3 uACPI | Complete | AP-3..AP-15 + AP-18 (`_SEG`, `_BBN`, `_CRS`, `_PRT`, `_OSC`, `_PIC(IOAPIC)`) |
+| Full Ring-3 uACPI | Complete | AP-3..AP-15 + AP-18 + AP-24 (`_SEG`, `_BBN`, `_CRS`, `_PRT`, `_OSC`, `_PIC(IOAPIC)`, `SCI -> GPE -> Notify`) |
 | ACPI supervision | Complete | AP-6 restart/backoff/freeze + stale-snapshot drop (`HMCF`/`HPCI`/`HIOM`) |
 | B.1–B.4 Config transport & write policy | Complete | ECAM + forced CF8/CFC + RO→RW ECAM upgrade + named write classes/readback (`AP-17`) |
 | C.1–C.3 HMCF / HPCI / `_PRT` / `_OSC` | Complete | `AP-7`..`AP-15`, `AP-18` verified on QEMU Q35 ECAM & legacy |
@@ -976,10 +989,10 @@ isolation are implemented. The remaining open work before
 | E.1–E.2 Live BAR sizing & validator | Complete | `PCI-6` + `AP-19` non-Online decode-disabled BAR sizing & restoration |
 | F.1–F.3 Planner, rollback & hotplug reserves | Complete | `PCI-7`, `AP-19`, `AP-23` bottom-up bridge synthesis + `HotplugReservePolicy` |
 | G.1–G.3 `DeviceLease` & `DeviceGone` | Complete | `PCI-8` + `AP-20` kernel `DeviceLease` revocation & `PORT_PACKET_DEVICE_GONE` |
-| H.1–H.3 PCI Manager & driver binding | Complete | `AP-9`..`AP-22`, PRs #282/#283 (`nvme-host`, `net-service`, `wlan-service`) |
-| I.1–I.2 Interrupt transaction & DMA pools | Complete | `AP-21` MSI-X/MSI/INTx programming + `DmaPoolGrant` |
+| H.1–H.3 PCI Manager & driver binding | Complete | `AP-9`..`AP-22`, PRs #282/#283/#291 (`nvme-host`, `xhci-host`, `net-service`, `wlan-service`) |
+| I.1–I.2 Interrupt transaction & DMA pools | Complete | `AP-21` + `AP-24` MSI-X/MSI/INTx programming + `DmaPoolGrant` (`BOOT_DMA_POOL_LEN = 92 MiB`) |
 | J.1–J.3 NVMe migration & shim removal | Complete | `AP-22` (`1f83e29`); `tools/check-kernel-no-pci.py` CI gate |
-| K.1–K.3 Reserved-space hotplug | Complete (policy + boot self-check) | `huesos_pci::hotplug` 10,000-storm coalescing + 1,000-cycle add/remove leak/ABA suite (`AP-23`) |
+| K.1–K.3 Reserved-space hotplug | Complete (policy + runtime SCI/Notify/handoff) | `huesos_pci::hotplug` 10,000-storm coalescing + 1,000-cycle suite (`AP-23`) + live `HPHG` v1 / dynamic DMA slots / syscall-98 smoke (`AP-24`, PR #293) |
 | L.1–L.3 Restart rebalance & rollback | Complete (policy + fault injection) | `huesos_pci::rebalance` NVMe `Fixed` enforcement + 8-step rollback fault-injection suite (`AP-23`) |
 | M.1–M.2 Live `QuiesceRemap` | M.1 protocol complete; M.2 deferred | `QuiesceRemapSession` deadline-bounded state machine + 1,000-cycle suite (`AP-23`) |
 | N.1–N.3 IOMMU profile | Complete (Intel VT-d & AMD-Vi) | `huesos-iommu` + `vtd.rs`/`amd_vi.rs` per-lease IO page-table domains + 3-leg `scripts/ci-qemu-iommu-vtd-smoke.sh` (`intel-iommu` + `amd-iommu` + `Trusted` fallback) |

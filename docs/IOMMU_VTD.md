@@ -52,27 +52,31 @@ Following the microkernel policy-crate split enforced by
 
 ## Capability Lifecycle (`DeviceLease` ↔ `DmaPool`)
 
-- **Default-deny DMA:** Once `GCMD.TE = 1` is enabled at boot, every PCIe
-  requester covered by a `DRHD` unit has `ContextEntry.Present = 0` (except
-  firmware-mandated `RMRR` scopes) and cannot DMA to any physical RAM page.
+- **Default-deny DMA:** Once hardware translation is enabled at boot (`GCMD.TE = 1`
+  on VT-d or `IommuEn = 1` with `AmdViDte::blocked` on AMD-Vi), every PCIe
+  requester covered by an active IOMMU unit is blocked by default (except
+  firmware-mandated `RMRR`/`IVMD` scopes) and cannot DMA to any physical RAM page.
 - **Least-privilege attachment (`Syscall::DeviceLeaseAttachDma = 96` & `DeviceLeaseMintResource`):**
   Only `DriverManager` and `pci-manager` hold `WRITE` rights on a `DeviceLease`
-  handle; Ring-3 drivers (`driver-host-nvme`, `net-service`, `wlan-service`)
-  receive read-only `DeviceLease` duplicates (`READ | TRANSFER`) and cannot
-  widen their own IOMMU mappings. Before forwarding a `DmaPool` `Resource`
-  handle to a child driver, `DriverManager` calls `DeviceLeaseAttachDma`, which
-  maps strictly `[base, base + len)` (`IOVA == HPA`, `R | W`) into that
-  device's dedicated VT-d `DomainId` and flushes Context Cache + IOTLB.
+  handle; Ring-3 drivers (`driver-host-nvme`, `driver-host-xhci`, `net-service`,
+  `wlan-service`) receive read-only `DeviceLease` duplicates (`READ | TRANSFER`)
+  and cannot widen their own IOMMU mappings. Before forwarding a `DmaPool`
+  `Resource` handle to a child driver (from the static `[0..76 MiB)` boot slices
+  or the four `[76..92 MiB)` `(lease_koid, generation)`-claimed live hotplug
+  slices inside `BOOT_DMA_POOL_LEN = 92 MiB`), `DriverManager` calls
+  `DeviceLeaseAttachDma`, which maps strictly `[base, base + len)`
+  (`IOVA == HPA`, `R | W`) into that device's dedicated VT-d/AMD-Vi `DomainId`
+  and flushes the hardware Context/Device-Table cache and IOTLB.
 - **Synchronous revocation (`DeviceLease::revoke` & `Drop`):** Revoking a
-  `DeviceLease` (or dropping its last kernel reference) synchronously clears
-  `ContextEntry[devfn]`, flushes the `DRHD` Context Cache and Domain IOTLB, and
-  frees all second-stage page-table frames **before** `revoke()` returns or
-  delivers `PORT_PACKET_DEVICE_GONE`.
+  `DeviceLease` (or dropping its last kernel reference) synchronously clears the
+  VT-d `ContextEntry[devfn]` or resets the AMD-Vi `DTE` to `AmdViDte::blocked`,
+  flushes the hardware Context/DTE cache and Domain IOTLB (`COMPLETION_WAIT` on
+  AMD-Vi), releases any dynamic hotplug DMA slot, and frees all IO page-table
+  frames **before** `revoke()` returns or delivers `PORT_PACKET_DEVICE_GONE`.
 - **Honest telemetry (`Syscall::SystemIommuStatus = 97`):** `acpi-manager` and
   `pci-manager` report `IommuMode::Isolated` in `HIOM` v1, `HPIN` v1, and
-  `pci -v --iommu` **if and only if** kernel hardware translation (`GSTS.TES == 1`)
-  is genuinely active; platforms without an active hardware IOMMU honestly
-  report `Trusted`.
+  `pci -v --iommu` **if and only if** kernel hardware translation is genuinely
+  active; platforms without an active hardware IOMMU honestly report `Trusted`.
 
 ## Verification
 

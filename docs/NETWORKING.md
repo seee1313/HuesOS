@@ -22,7 +22,7 @@ delivered through `driver-manager`.
 | `crates/huesos-net` | `no_std` library | `#![forbid(unsafe_code)]` | Ethernet II, ARP neighbor cache + pending queue, IPv4, ICMPv4 Echo, UDP, DHCPv4 (`DISCOVER→OFFER→REQUEST→ACK`), RFC 1035 DNS stub resolver (pointer compression + TTL cache), RFC 793/6298 TCP |
 | `crates/huesos-ieee80211` | `no_std` library | `#![forbid(unsafe_code)]` | 802.11 MAC header/IE codec, LLC/SNAP framing, Beacon/Probe/Auth/Assoc Station Management Entity (SME) |
 | `crates/huesos-wpa` | `no_std` library | `#![forbid(unsafe_code)]` | WPA2-PSK (IEEE 802.11i/RSN): PBKDF2-HMAC-SHA1 (4096 iter), PRF-384 PTK derivation, RFC 3394 AES Key Wrap, 4-Way EAPOL handshake, AES-128-CCMP encryption/MIC + 48-bit PN replay protection |
-| `crates/huesos-rtw88` | `no_std` library | `#![forbid(unsafe_code)]` | Realtek `RTL8821CE` (`10ec:c821`) firmware parser (`/firmware/rtw8821c_fw.bin`), power-on sequence, MAC/BB/RF/TXAGC/RFE tables, 3-wire RF SPI, RX filter, and BT-PTA coexistence |
+| `crates/huesos-rtw88` | `no_std` library | `#![forbid(unsafe_code)]` | Realtek `RTL8821CE` (`10ec:c821`) firmware parser (`/lib/firmware/rtw88/rtw8821c_fw.bin`), power-on sequence, MAC/BB/RF/TXAGC/RFE tables, 3-wire RF SPI, RX filter, and BT-PTA coexistence |
 | `crates/huesos-tls` | `no_std` library | `#![forbid(unsafe_code)]` | RFC 8446 TLS 1.3 client (`TLS_AES_128_GCM_SHA256`, `TLS_AES_256_GCM_SHA384`, `TLS_CHACHA20_POLY1305_SHA256`, X25519 + P-256, `HelloRetryRequest`) + RFC 5280 X.509v3 chain validation |
 | `crates/huesos-abi::{net,wlan}` | Wire ABI | `#![forbid(unsafe_code)]` | Fixed-header Channel IPC messages for socket lifecycle, DNS/ICMP/DHCP control, Wi-Fi scan/connect/status, and `wlan-service ↔ net-service` frame bridging |
 | `crates/huesos-userspace/net-service` | `/services/net.elf` | Audited VirtIO MMIO/DMA | VirtIO 1.0 Modern (`1af4:1000` / `1af4:1041`) PCIe NIC driver, `huesos-net` TCP/IP stack owner, and dual-uplink bridge with `wlan-service` |
@@ -61,7 +61,7 @@ dependencies:
   KeyUsage checks, and RSA-PKCS#1v1.5 / RSA-PSS / ECDSA P-256/P-384 signature
   verification against the bundled Mozilla CA root store
   (`third_party/certs/ca-certificates.pem`, packaged in BOOTFS as
-  `/etc/ssl/certs/ca-certificates.pem`).
+  `/etc/ssl/certs.pem`).
 
 ---
 
@@ -92,7 +92,8 @@ dependencies:
 - **Simulated RF separation:** `VirtualRtw88Medium` in `huesos-rtw88` exists
   strictly behind `#[cfg(any(test, feature = "boot-selftest"))]` for deterministic
   WPA2/802.11 CI verification and is compiled out of production images.
-- **Hardware coverage:** VirtIO 1.0 Modern is verified in QEMU; Realtek
-  `RTL8821CE` register/firmware/WPA2 bring-up targets initial laptop silicon,
-  while broad Ethernet (`e1000e`/`igc`/`r8169`) and Wi-Fi chipset qualification
-  and Stage N.2 IOMMU DMA isolation remain open.
+- **Hardware coverage:** VirtIO 1.0 Modern (`VIRTIO_F_ACCESS_PLATFORM` under
+  Intel VT-d & AMD-Vi hardware IOMMU domains, [IOMMU_VTD.md](IOMMU_VTD.md)) is
+  verified in QEMU; Realtek `RTL8821CE` register/firmware/WPA2 bring-up targets
+  initial laptop silicon, while broad Ethernet (`e1000e`/`igc`/`r8169`) and
+  Wi-Fi chipset qualification remain open.

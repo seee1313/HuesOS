@@ -34,20 +34,22 @@ payload bytes...
 
 ## Current BOOTFS namespace layout
 
-- `/services/*` — `acpi-manager.elf`, `pci-manager.elf`, `hxfs-service.elf`,
-  `key-broker.elf`, `shutdown-broker.elf`, `net.elf`, `wlan.elf`
-- `/drivers/*` & `/manifests/*` — `input-host.elf`, `nvme-host.elf`, `.hdriver`
-  bootstrap manifests
+- `/services/*` — `acpi-manager.elf`, `pci-manager.elf`, `hxfs.elf`,
+  `shutdown-broker.elf`, `net.elf`, `wlan.elf` (plus `pci-hotplug-test.elf` in
+  `boot-selftest` builds)
+- `/drivers/*`, `/manifests/*` & `/storage/*` — `input-host.elf`,
+  `driver-host-nvme.elf`, `driver-host-xhci.elf`, `.hdriver` manifests,
+  `/storage/boot-drivers.manifest`, and `/manifests/bootfs.sha256`
 - `/lib/*` — `/lib/ld-huesos.so`, `/lib/libcanvas.so`, `/lib/ld-pe.so`, and
   native Win64 PE32+ system DLLs (`ntdll.dll`, `kernel32.dll`, `ucrtbase.dll`,
   `msvcrt.dll`, `ws2_32.dll`, `bcrypt.dll`, `bcryptprimitives.dll`,
   `advapi32.dll`; see [EXECUTABLE_LOADERS.md](EXECUTABLE_LOADERS.md))
 - `/bin/*` — `terminal.elf`, `hsh.elf`, `fdisk.elf`, `doom.elf`, and the 45
-  `coreutils` binaries (`ls`, `cat`, `grep`, `tar`, `pci`, `acpi`, `btop`,
-  `nano`, `netctl`, `wlanctl`, `ping`, `curl`, ...; see
-  [SHELL_AND_STD.md](SHELL_AND_STD.md))
-- `/firmware/*` — vendor firmware images such as `rtw8821c_fw.bin`
-- `/etc/ssl/certs/ca-certificates.pem` — Mozilla TLS 1.3 root CA bundle
+  user-facing `coreutils` binaries (`ls`, `cat`, `grep`, `tar`, `pci`, `lsusb`,
+  `acpi`, `btop`, `nano`, `netctl`, `wlanctl`, `ping`, `curl`, ..., plus
+  `/bin/std-smoke.elf` in `boot-selftest`; see [SHELL_AND_STD.md](SHELL_AND_STD.md))
+- `/lib/firmware/rtw88/rtw8821c_fw.bin` — Realtek `RTL8821CE` Wi-Fi firmware blob
+- `/etc/ssl/certs.pem` — Mozilla TLS 1.3 root CA bundle
 - `/data/freedoom1.wad` — Freedoom Phase 1 asset streamed via read-only VMO slice
 
 ## Access model

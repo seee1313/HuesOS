@@ -9,7 +9,7 @@ treating roadmaps as current feature claims.
 1. [BUILD.md](BUILD.md) — pinned toolchain, build profiles, ISO, and QEMU.
 2. [OPERATIONS.md](OPERATIONS.md) — runtime knobs, structured observations, and `STORAGE_OFF=1`.
 3. [USERSPACE.md](USERSPACE.md) — `huesos-std` vs `libcanvas` and capability rules.
-4. [SHELL_AND_STD.md](SHELL_AND_STD.md) — `hsh`, `@caps` attenuation, `huesos-std`, and the 45 `/bin` utilities & TUIs.
+4. [SHELL_AND_STD.md](SHELL_AND_STD.md) — `hsh`, `@caps` attenuation, `huesos-std`, and the 46 `coreutils` binaries & TUIs.
 5. [EXECUTABLE_LOADERS.md](EXECUTABLE_LOADERS.md) — static ELF64, `/lib/ld-huesos.so` dynamic linking, and native Win64 PE32+ (`/lib/ld-pe.so` + system DLLs).
 6. [TESTING.md](TESTING.md) — host, static-safety, sanitizer, QEMU, and hardware test gates.
 7. [HARDWARE.md](HARDWARE.md) — reported bare-metal smoke results and coverage limits.
